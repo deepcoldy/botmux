@@ -8,6 +8,43 @@ import { assertQuotaFallbackGraphAcyclic } from './quota-fallback.js';
 import { withFileLock } from '../utils/file-lock.js';
 import { assertCodexInstanceConfigWrite } from './codex-instance-config-guard.js';
 
+export type BotConfigInvariantError =
+  | 'codex_browser_requires_codex_app'
+  | 'codex_browser_config_conflict'
+  | 'existing_app_server_sandbox_conflict';
+
+function codexBrowserEnabled(entry: any): boolean {
+  return entry?.codexBrowser === true
+    || (entry?.codexBrowser && typeof entry.codexBrowser === 'object' && entry.codexBrowser.enabled === true);
+}
+
+/** Cross-field invariants shared by every bots.json read-modify-write path. */
+export function botConfigInvariantError(entry: any): BotConfigInvariantError | undefined {
+  if (!entry || typeof entry !== 'object') return undefined;
+  if (codexBrowserEnabled(entry)) {
+    if (entry.cliId !== 'codex-app') return 'codex_browser_requires_codex_app';
+    if (entry.existingAppServer || entry.sandbox === true || entry.readIsolation === true) {
+      return 'codex_browser_config_conflict';
+    }
+  }
+  if (entry.existingAppServer && (entry.sandbox === true || entry.readIsolation === true)) {
+    return 'existing_app_server_sandbox_conflict';
+  }
+  return undefined;
+}
+
+function assertChangedBotConfigInvariants(previous: any[], next: any[]): void {
+  for (let index = 0; index < next.length; index++) {
+    const entry = next[index];
+    const previousEntry = entry?.larkAppId
+      ? previous.find(candidate => candidate?.larkAppId === entry.larkAppId)
+      : previous[index];
+    if (previousEntry !== undefined && JSON.stringify(previousEntry) === JSON.stringify(entry)) continue;
+    const error = botConfigInvariantError(entry);
+    if (error) throw new Error(error);
+  }
+}
+
 export async function readRawConfig(path: string): Promise<any[]> {
   const raw = JSON.parse(await fsp.readFile(path, 'utf-8'));
   if (!Array.isArray(raw)) throw new Error(`Config file is not a JSON array: ${path}`);
@@ -18,6 +55,7 @@ export async function writeRawConfigAtomic(path: string, raw: any[]): Promise<vo
   let previous: any[] = [];
   try { previous = await readRawConfig(path); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
   assertCodexInstanceConfigWrite(previous, raw);
+  assertChangedBotConfigInvariants(previous, raw);
   // Validate the complete next generation, not the currently loaded registry.
   // Callers invoke this while holding the cross-process lock.
   assertQuotaFallbackGraphAcyclic(raw);
@@ -54,9 +92,15 @@ export async function rmwBotEntry<T>(
     const out = mutate(entry, raw);
     if (out && typeof out === 'object' && 'write' in (out as any)) {
       const wrap = out as { write: boolean; result: T };
-      if (wrap.write) await writeRawConfigAtomic(path, raw);
+      if (wrap.write) {
+        const invariantError = botConfigInvariantError(entry);
+        if (invariantError) return { ok: false, reason: invariantError };
+        await writeRawConfigAtomic(path, raw);
+      }
       return { ok: true, result: wrap.result };
     }
+    const invariantError = botConfigInvariantError(entry);
+    if (invariantError) return { ok: false, reason: invariantError };
     await writeRawConfigAtomic(path, raw);
     return { ok: true, result: out as T };
   });

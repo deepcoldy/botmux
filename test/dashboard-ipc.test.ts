@@ -1909,6 +1909,58 @@ describe('PUT /api/bot-card-prefs — Codex browser bridge', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('rejects reverse sandbox/read-isolation conflicts and clears browser config when switching Agent', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-codex-browser-reverse-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-codex-browser-reverse-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'codex-app',
+        codexBrowser: { enabled: true, family: 'edge', pluginRoot: '/tmp/codex-browser-plugin' },
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const sandbox = await fetch(`${base}/api/bot-sandbox`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: true }),
+      });
+      expect(sandbox.status).toBe(409);
+      expect(await sandbox.json()).toMatchObject({ error: 'codex_browser_config_conflict' });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).not.toHaveProperty('sandbox');
+
+      const readIsolation = await sandboxStore.persistBotReadIsolation(appId, true);
+      expect(readIsolation).toEqual({ ok: false, reason: 'codex_browser_config_conflict' });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).not.toHaveProperty('readIsolation');
+
+      const switchAgent = await fetch(`${base}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'claude-code', model: '' }),
+      });
+      expect(switchAgent.status).toBe(200);
+      expect(await switchAgent.json()).toMatchObject({ codexBrowserCleared: true });
+      const persisted = JSON.parse(readFileSync(configPath, 'utf8'))[0];
+      expect(persisted.cliId).toBe('claude-code');
+      expect(persisted).not.toHaveProperty('codexBrowser');
+      expect(getBot(appId).config.codexBrowser).toBeUndefined();
+      expect(() => loadBotConfigs()).not.toThrow();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('PUT /api/bot-card-prefs — two reply modes', () => {

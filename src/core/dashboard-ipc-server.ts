@@ -6426,7 +6426,11 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (Object.keys(patch).length === 0) return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
 
   const r = await cardPrefsStore.updateBotCardPrefs(cachedLarkAppId, patch);
-  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  if (!r.ok) {
+    const status = r.reason === 'codex_browser_config_conflict'
+      || r.reason === 'existing_app_server_sandbox_conflict' ? 409 : 400;
+    return jsonRes(res, status, { ok: false, error: r.reason });
+  }
   jsonRes(res, 200, { ok: true, ...r.prefs });
 });
 
@@ -6968,6 +6972,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // read-isolation toggle validates at enable time; changing the agent afterwards
     // is the other way a bot could end up configured-but-unenforceable.)
     let readIsolationCleared = false;
+    let codexBrowserCleared = false;
     const r = await rmwBotEntry<{
       error?: 'reasoning_effort_not_supported_by_model' | 'launch_mode_sandbox_conflict';
       nextReasoningEffort?: typeof reasoningEffort;
@@ -6993,6 +6998,10 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
         return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' } };
       }
       entry.cliId = selected.cliId;
+      if (selected.cliId !== 'codex-app' && entry.codexBrowser !== undefined) {
+        delete entry.codexBrowser;
+        codexBrowserCleared = true;
+      }
       if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
       else delete entry.wrapperCli;
       if (selected.cliLaunchMode) entry.cliLaunchMode = selected.cliLaunchMode;
@@ -7113,6 +7122,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     if (!supportsDshRuntime) bot.config.dshRuntime = undefined;
     else if (dshRuntimeFieldPresent) bot.config.dshRuntime = nextDshRuntime;
     if (readIsolationCleared) bot.config.readIsolation = false;
+    if (codexBrowserCleared) bot.config.codexBrowser = undefined;
     if (isRemoteCliId(selected.cliId)) {
       bot.config.backendType = selected.cliId as typeof bot.config.backendType;
     } else if (bot.config.backendType && isRemoteBackendType(bot.config.backendType)) {
@@ -7151,6 +7161,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       readIsolation: bot.config.readIsolation === true,
       readIsolationSupported: readIsolationEnforceableFor(bot.config),
       readIsolationCleared,
+      codexBrowserCleared,
       agentAvailable: availability.available,
       availabilityWarning,
       requiredCommand: availability.command,
@@ -7815,7 +7826,11 @@ ipcRoute('PUT', '/api/bot-sandbox', async (req, res) => {
   // restore; this toggle is intentionally next-session-only and cannot mutate
   // a live pane's profile.
   const r = await sandboxStore.updateBotSandbox(cachedLarkAppId, body.enabled === true);
-  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  if (!r.ok) {
+    const status = r.reason === 'codex_browser_config_conflict'
+      || r.reason === 'existing_app_server_sandbox_conflict' ? 409 : 400;
+    return jsonRes(res, status, { ok: false, error: r.reason });
+  }
   jsonRes(res, 200, { ok: true, sandbox: r.sandbox });
 });
 
@@ -7935,7 +7950,11 @@ ipcRoute('PUT', '/api/bot-read-isolation', async (req, res) => {
     // A crash at any point can only lead to a cold spawn under the old or new
     // durable policy; there is no owned pane to reattach.
     const r = await sandboxStore.updateBotReadIsolation(larkAppId, enable);
-    if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+    if (!r.ok) {
+      const status = r.reason === 'codex_browser_config_conflict'
+        || r.reason === 'existing_app_server_sandbox_conflict' ? 409 : 400;
+      return jsonRes(res, status, { ok: false, error: r.reason });
+    }
     jsonRes(res, 200, {
       ok: true,
       readIsolation: r.readIsolation,
