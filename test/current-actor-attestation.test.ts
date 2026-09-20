@@ -198,6 +198,35 @@ describe('daemon current actor attestation', () => {
     });
   });
 
+  it('rejects a peer rooted in another still-active session', async () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 91, 1, '901');
+    writeProc(procRoot, 100, 1, '1000');
+    writeProc(procRoot, 200, 91, '3000');
+    writeProc(procRoot, 201, 200, '3100');
+    const target = activeSession();
+    const other = activeSession();
+    other.session.sessionId = 's2';
+    other.worker = { pid: 91, killed: false };
+    delete other.localProcessAttestation.cliPid;
+    delete other.localProcessAttestation.cliProcStart;
+    other.localProcessAttestation.enginePid = 200;
+    other.localProcessAttestation.engineProcStart = '3000';
+    other.managedTurnOrigin.preexistingProcessIdentities = ['200:3000'];
+    const sessions = new Map([['s1', target], ['s2', other]]);
+    const resolveIdentity = vi.fn();
+
+    await expect(resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 201, procStart: '3100' },
+      findSession: id => sessions.get(id),
+      resolveIdentity,
+      procRoot,
+    })).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+    expect(resolveIdentity).not.toHaveBeenCalled();
+  });
+
   it('supports the RPC opening window before the viewer CLI PID exists', async () => {
     const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
     writeProc(procRoot, 90, 1, '900');

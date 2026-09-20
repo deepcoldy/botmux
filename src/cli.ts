@@ -6898,7 +6898,6 @@ async function detectAuthenticatedCurrentSession(): Promise<CurrentSession | nul
         callerOpenId: attested.callerOpenId,
         larkAppId: attested.larkAppId,
       };
-      void hostError;
     }
   }
   if (!provenance) return null;
@@ -14078,21 +14077,8 @@ async function cmdNativeSubagentRuntimeHook(): Promise<void> {
       });
       return;
     }
-    const data = JSON.parse(raw) as { ok?: unknown; invalidPolicy?: unknown; deny?: unknown; reason?: unknown; policy?: unknown };
+    const data = JSON.parse(raw) as { ok?: unknown; invalidPolicy?: unknown; policy?: unknown };
     if (data.ok !== true) return;
-    if (data.deny === true) {
-      nativeSubagentDiagnostic('daemon denied spawn for read-only continuation');
-      await writeNativeSubagentHookDirective({
-        hookSpecificOutput: {
-          hookEventName: 'PreToolUse',
-          permissionDecision: 'deny',
-          permissionDecisionReason: typeof data.reason === 'string'
-            ? data.reason
-            : 'Read-only continuation forbids subagents',
-        },
-      });
-      return;
-    }
     if (data.invalidPolicy === true) {
       nativeSubagentDiagnostic('daemon rejected invalid stored policy; allowing spawn');
       return;

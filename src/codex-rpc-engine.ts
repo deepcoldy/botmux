@@ -408,10 +408,7 @@ export class CodexRpcEngine {
       sandboxPolicy: { type: 'dangerFullAccess' },
     };
     params.clientUserMessageId = identity.turnId;
-    const ownerKey = this.ownerKey(identity);
-    try {
-      await this.request('turn/start', params, opts, undefined, identity);
-    } catch (err) { throw err; }
+    await this.request('turn/start', params, opts, undefined, identity);
     const nativeTurnId = this.takeNativeTurnId(identity);
     if (!nativeTurnId) throw new Error('turn/start ack did not bind a native turn id');
     return { nativeTurnId };

@@ -234,6 +234,11 @@ export function attestCurrentTurnLoopbackPeer(
     return null;
   }
   const preexistingProcessIdentities = new Set(processIdentities);
+  // The worker reports both roots over its private IPC channel. Binding each
+  // PID to its proc start time prevents PID reuse, while the descendant walk
+  // keeps a tool process inside this exact live turn instead of trusting uid.
+  // RPC tools can start before the viewer CLI exists, so the engine is an
+  // independent root rather than a fallback identity claim.
   const trustedRootPids = new Set([
     ...(cliPid !== undefined ? [cliPid] : []),
     ...(enginePid !== undefined ? [enginePid] : []),
