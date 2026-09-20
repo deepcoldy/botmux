@@ -2553,6 +2553,14 @@ describe('handleCommand', () => {
         LARK_APP_ID,
         'msg_001',
       );
+      const confirmCard = vi.mocked(deps.sessionReply).mock.calls
+        .map(c => c[1])
+        .find((content): content is string => typeof content === 'string' && content.includes('"tag":"table"'));
+      expect(confirmCard).toBeTruthy();
+      const confirmTable = JSON.parse(confirmCard as string).body.elements
+        .find((e: any) => e.tag === 'table');
+      expect(confirmTable.row_height).toBe('auto');
+      expect(confirmTable.row_max_height).toBe('300px');
     });
 
     it('`/close wt --yes` without a confirmation state never deletes even a clean worktree', async () => {
