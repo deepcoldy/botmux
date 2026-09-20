@@ -38,7 +38,8 @@ const action: FrozenCommandActionRecord = {
 describe('Frozen Command business cards', () => {
   it('shows metadata only in the command center', () => {
     const rendered = buildFrozenCommandCenterCard({
-      roleLabel: 'finance',
+      botLabel: '财务助手',
+      workingDirLabel: 'finance',
       rows: [{
         command: '日报',
         usage: '/日报 [天数]',
@@ -52,6 +53,9 @@ describe('Frozen Command business cards', () => {
       }],
     });
     expect(rendered).toContain('固化命令中心');
+    expect(rendered).toContain('当前机器人');
+    expect(rendered).toContain('财务助手');
+    expect(rendered).toContain('工作目录');
     expect(rendered).toContain('已废弃');
     expect(rendered).not.toContain('SELECT');
     expect(rendered).not.toContain('sql');

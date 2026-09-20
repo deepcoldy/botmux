@@ -147,6 +147,36 @@ export function frozenCommandFilePath(workingDir: string, rawCommand: string): s
   return join(resolve(workingDir), FROZEN_COMMAND_DIR, `${command}.yaml`);
 }
 
+/**
+ * Read only the declaration status from a command file without treating a
+ * tombstone as an executable definition. This is intentionally metadata-only:
+ * lifecycle authority still comes exclusively from the bot-scoped ledger.
+ */
+export function readFrozenCommandFileStatus(input: {
+  workingDir: string;
+  command: string;
+}): string | undefined {
+  const command = normalizeFrozenCommandName(input.command);
+  if (!command) return undefined;
+  const filePath = frozenCommandFilePath(input.workingDir, command);
+  if (!existsSync(filePath)) return undefined;
+  const stat = lstatSync(filePath);
+  if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 512 * 1024) return undefined;
+  try {
+    const realpath = assertCommandPathContained(input.workingDir, filePath);
+    const value = parseYaml(readFileSync(realpath, 'utf8'), {
+      strict: true,
+      uniqueKeys: true,
+      maxAliasCount: 0,
+    });
+    return isPlainObject(value) && typeof value.status === 'string'
+      ? value.status
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function assertCommandPathContained(workingDir: string, filePath: string): string {
   const root = realpathSync(resolve(workingDir));
   const actual = realpathSync(filePath);

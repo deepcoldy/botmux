@@ -26,13 +26,18 @@ function card(body: Record<string, unknown>): string {
 
 export function buildFrozenCommandCenterCard(input: {
   rows: readonly FrozenCommandCenterRow[];
-  roleLabel: string;
+  botLabel: string;
+  workingDirLabel: string;
 }): string {
   const elements: unknown[] = [{
     tag: 'div',
     text: {
       tag: 'lark_md',
-      content: `当前角色：**${escapeMd(input.roleLabel)}**\n只展示命令元数据，不展示 SQL。`,
+      content: [
+        `当前机器人：**${escapeMd(input.botLabel)}**`,
+        `工作目录：**${escapeMd(input.workingDirLabel)}**`,
+        '只展示命令元数据，不展示 SQL。',
+      ].join('\n'),
     },
   }, { tag: 'hr' }];
   if (input.rows.length === 0) {

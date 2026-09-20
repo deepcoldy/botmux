@@ -126,6 +126,7 @@ import {
   lookupFrozenCommand,
   normalizeFrozenCommandArguments,
   normalizeFrozenCommandName,
+  readFrozenCommandFileStatus,
   renderFrozenCommandSql,
   shouldFallbackFrozenCommand,
   userFacingFrozenCommandError,
@@ -7420,9 +7421,24 @@ function frozenCommandCenterRows(
   workingDir: string,
 ): FrozenCommandCenterRow[] {
   const rows = listFrozenCommandSnapshots(workingDir);
+  const lifecycleRecords = listFrozenCommandLifecycleRecords({
+    dataDir: config.session.dataDir,
+    targetBotId,
+    workingDir,
+  });
+  const lifecycleByCommand = new Map(lifecycleRecords.map(record => [record.command, record]));
   const seen = new Set<string>();
-  const result = rows.map((row): FrozenCommandCenterRow => {
+  const result = rows.flatMap((row): FrozenCommandCenterRow[] => {
     seen.add(row.command);
+    const currentRecord = lifecycleByCommand.get(row.command);
+    // A shared working directory may contain a tombstone owned by another
+    // bot's ledger. It is neither a current-bot command nor a candidate active
+    // definition, so do not surface it as "pending approval".
+    if (!currentRecord
+      && row.error
+      && readFrozenCommandFileStatus({ workingDir, command: row.command }) === 'retired') {
+      return [];
+    }
     const gate = evaluateFrozenCommandLifecycle({
       dataDir: config.session.dataDir,
       targetBotId,
@@ -7431,38 +7447,41 @@ function frozenCommandCenterRows(
       ...(row.snapshot ? { snapshot: row.snapshot } : {}),
     });
     if (gate.kind === 'retired') {
-      return {
+      return [{
         command: row.command,
         state: 'retired',
         reason: gate.record.tombstonePayload?.reason,
-      };
+      }];
     }
-    if (gate.kind === 'revoked') return { command: row.command, state: 'revoked' };
+    if (gate.kind === 'revoked') return [{ command: row.command, state: 'revoked' }];
     if (gate.kind === 'fail_closed') {
-      return {
+      const unapproved = !currentRecord && !!row.snapshot;
+      return [{
         command: row.command,
-        state: gate.record ? 'invalid' : 'unapproved',
-        reason: gate.reason,
-      };
+        state: unapproved ? 'unapproved' : 'invalid',
+        reason: unapproved
+          ? '尚未完成当前机器人批准，暂不可运行'
+          : '命令定义或状态异常，暂不可运行，请联系管理员',
+      }];
     }
     if (!row.snapshot || row.error) {
-      return { command: row.command, state: 'invalid', reason: row.error?.message ?? '定义不可用' };
+      return [{
+        command: row.command,
+        state: 'invalid',
+        reason: '命令定义或状态异常，暂不可运行，请联系管理员',
+      }];
     }
     const definition = row.snapshot.definition;
-    return {
+    return [{
       command: row.command,
       usage: frozenCommandUsage(definition),
       description: definition.description,
       datasource: definition.datasource,
       state: gate.kind === 'active' ? 'active' : 'unapproved',
-      ...(gate.kind === 'legacy' ? { reason: '尚未完成宿主批准，不能从命令中心运行' } : {}),
-    };
+      ...(gate.kind === 'legacy' ? { reason: '尚未完成当前机器人批准，暂不可运行' } : {}),
+    }];
   });
-  for (const record of listFrozenCommandLifecycleRecords({
-    dataDir: config.session.dataDir,
-    targetBotId,
-    workingDir,
-  })) {
+  for (const record of lifecycleRecords) {
     if (seen.has(record.command) || record.state === 'active') continue;
     result.push({
       command: record.command,
@@ -7587,7 +7606,11 @@ ipcRoute('POST', '/api/frozen-command-actions', async (req, res) => {
   }
   if (body.operation === 'list') {
     const rows = frozenCommandCenterRows(ds.larkAppId, workingDir);
-    const card = buildFrozenCommandCenterCard({ rows, roleLabel: basename(workingDir) || workingDir });
+    const card = buildFrozenCommandCenterCard({
+      rows,
+      botLabel: effectiveBotDisplayName(getBot(ds.larkAppId)),
+      workingDirLabel: basename(workingDir) || workingDir,
+    });
     const cardMessageId = await sessionReply(
       sessionAnchorId(ds), card, 'interactive', ds.larkAppId, body.originTurnId,
     );

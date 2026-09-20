@@ -478,6 +478,68 @@ describe('Frozen Command host-owned route → callback → Data MCP flow', () =>
     expect(mocks.runCalls).toBe(0);
   });
 
+  it('lists only current-bot commands and keeps parser details out of the business card', async () => {
+    const foreignCommand = '外部废弃命令';
+    const foreignFile = join(root, '.botmux', 'commands', `${foreignCommand}.yaml`);
+    writeFileSync(foreignFile, YAML
+      .replace('name: 宿主闭环', `name: ${foreignCommand}`)
+      .replace('description: 宿主闭环测试', 'description: 另一机器人的命令'));
+    const foreignActor = { openId: 'ou_foreign_actor', unionId: 'on_foreign_actor' };
+    const approve = modules.lifecycle.prepareFrozenCommandTransition({
+      dataDir,
+      targetBotId: 'cli_foreign_bot',
+      workingDir: root,
+      command: `/${foreignCommand}`,
+      action: 'approve',
+      actor: foreignActor,
+      reason: '另一机器人批准',
+    });
+    modules.lifecycle.confirmFrozenCommandTransition({
+      dataDir,
+      targetBotId: 'cli_foreign_bot',
+      token: approve.token,
+      actor: foreignActor,
+    });
+    const retire = modules.lifecycle.prepareFrozenCommandTransition({
+      dataDir,
+      targetBotId: 'cli_foreign_bot',
+      workingDir: root,
+      command: `/${foreignCommand}`,
+      action: 'retire',
+      actor: foreignActor,
+      reason: '另一机器人已废弃',
+    });
+    modules.lifecycle.confirmFrozenCommandTransition({
+      dataDir,
+      targetBotId: 'cli_foreign_bot',
+      token: retire.token,
+      actor: foreignActor,
+    });
+    writeFileSync(join(root, '.botmux', 'commands', '损坏命令.yaml'), `
+schemaVersion: 1
+status: active
+name: 损坏命令
+description: 不应暴露解析细节
+unexpectedInternalField: true
+`);
+
+    const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '查看固化命令' });
+    const response = await postHostIntent(ds, { operation: 'list' });
+    expect(response.statusCode).toBe(200);
+    const rendered = mocks.cardBodies.at(-1)!;
+    expect(rendered).toContain('/宿主闭环');
+    expect(rendered).not.toContain(`/${foreignCommand}`);
+    expect(rendered).toContain('/损坏命令');
+    expect(rendered).toContain('命令定义或状态异常');
+    expect(rendered).not.toContain('unexpectedInternalField');
+    expect(rendered).not.toContain('包含未知字段');
+    expect(rendered).toContain('当前机器人');
+    expect(rendered).toContain('Current Bot');
+    expect(rendered).toContain('工作目录');
+    expect(mocks.validateCalls).toBe(0);
+    expect(mocks.runCalls).toBe(0);
+  });
+
   it('keeps missing-capability callers untrusted unless they crossed host HMAC', async () => {
     const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '查看固化命令' });
     const response = await postUntrustedIntentWithoutCapability(ds);
