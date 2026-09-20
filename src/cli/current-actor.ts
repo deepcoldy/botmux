@@ -124,28 +124,38 @@ export function resolveBotmuxAncestorContext(
     if (!env) throw new CurrentActorError('current actor ancestor attestation failed');
     if (env.BOTMUX === '1') {
       const ipcPort = Number(env.BOTMUX_DAEMON_IPC_PORT);
-      if (!env.BOTMUX_SESSION_ID || !env.BOTMUX_LARK_APP_ID?.startsWith('cli_')
-        || !Number.isSafeInteger(ipcPort) || ipcPort < 1 || ipcPort > 65_535) {
-        throw new CurrentActorError('current actor ancestor attestation failed');
+      // Codex RPC tool shells intentionally inherit only a narrow BotMux env
+      // (normally BOTMUX_SESSION_ID). They are descendants, not routing
+      // authorities; keep walking until a complete worker/engine context is
+      // found. The daemon endpoint still proves the live CLI process and turn.
+      if (env.BOTMUX_SESSION_ID && env.BOTMUX_LARK_APP_ID?.startsWith('cli_')
+        && Number.isSafeInteger(ipcPort) && ipcPort >= 1 && ipcPort <= 65_535) {
+        contexts.push({
+          sessionId: env.BOTMUX_SESSION_ID,
+          larkAppId: env.BOTMUX_LARK_APP_ID,
+          ipcPort,
+        });
       }
-      contexts.push({
-        sessionId: env.BOTMUX_SESSION_ID,
-        larkAppId: env.BOTMUX_LARK_APP_ID,
-        ipcPort,
-      });
     }
     const parent = parentPid(pid, procRoot);
     if (!parent) break;
     pid = parent;
   }
-  if (contexts.length === 0 || contexts.some(context => (
-    context.sessionId !== contexts[0].sessionId
-    || context.larkAppId !== contexts[0].larkAppId
-    || context.ipcPort !== contexts[0].ipcPort
+  if (contexts.length === 0) {
+    throw new CurrentActorError('current actor ancestor attestation failed');
+  }
+  const nearest = contexts[0];
+  const sameSession = contexts.filter(context => context.sessionId === nearest.sessionId);
+  if (sameSession.some(context => (
+    context.larkAppId !== nearest.larkAppId
+    || context.ipcPort !== nearest.ipcPort
   ))) {
     throw new CurrentActorError('current actor ancestor attestation failed');
   }
-  return contexts[0];
+  // A daemon restarted from another managed session can legitimately retain
+  // that outer session id above the current worker. Select the nearest complete
+  // session; resolveCurrentActor then binds it to the live process marker.
+  return nearest;
 }
 
 function isCurrentActorDocument(value: unknown): value is CurrentActorDocument {
