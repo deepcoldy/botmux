@@ -2005,6 +2005,32 @@ describe('card behavior defaults', () => {
     expect(renderer.root.findByProps({ 'data-streaming-card-pin-toggle': 'bot-defaults' })).toBeTruthy();
   });
 
+  it('uses one CoT switch for thinking, tool calls, and tool results', async () => {
+    const putCardPref = vi.fn(async (patch: Record<string, boolean>) => ({
+      ok: true,
+      status: 200,
+      body: { ok: true, ...patch },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_cot' }, putCardPref,
+      }));
+    });
+
+    expect(renderer.root.findAllByProps({ 'data-action': 'toggle-cot' })).toHaveLength(1);
+    expect(renderer.root.findAllByProps({ 'data-action': 'toggle-thinking-card-tool-result' })).toHaveLength(0);
+
+    const toggle = renderer.root.findByProps({ 'data-action': 'toggle-cot' });
+    await act(async () => {
+      toggle.props.onChange({ currentTarget: { checked: false } });
+      await Promise.resolve();
+    });
+
+    expect(putCardPref).toHaveBeenCalledWith({ cotEnabled: false });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-cot' }).props.checked).toBe(false);
+  });
+
   it('persists live-card button visibility as a canonical hidden list', async () => {
     const putCardPref = vi.fn(async (patch: Record<string, unknown>) => ({
       ok: true,
@@ -2142,6 +2168,7 @@ describe('card behavior defaults', () => {
       'toggle-pin-streaming-card',
       'toggle-writable-link',
       'toggle-private-card',
+      'toggle-cot',
       'toggle-streaming-button-output',
       'toggle-streaming-button-terminal',
       'toggle-streaming-button-writeLink',
@@ -2175,7 +2202,7 @@ describe('card behavior defaults', () => {
       renderer.root.findByProps({ 'data-action': 'toggle-disable-streaming' }).props.onChange({ currentTarget: { checked: true } });
     });
 
-    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-pin-streaming-card', 'toggle-writable-link', 'toggle-private-card']) {
+    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-pin-streaming-card', 'toggle-writable-link', 'toggle-private-card', 'toggle-cot']) {
       expect(renderer.root.findByProps({ 'data-action': action }).props.disabled).toBe(true);
     }
     expect(renderer.root.findByProps({ id: 'bd-menu-usageDisplay' }).props.disabled).toBe(true);

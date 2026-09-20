@@ -769,8 +769,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     codexAppCleanInput: body.codexAppCleanInput,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
-    thinkingCard: body.thinkingCard,
-    thinkingCardToolResult: body.thinkingCardToolResult,
+    cotEnabled: body.cotEnabled,
     senderTag: body.senderTag,
     summaryMemory: body.summaryMemory,
     summaryMemoryPath: body.summaryMemoryPath,
@@ -4407,8 +4406,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
-  const [thinkingCard, setThinkingCard] = useState(bot.thinkingCard !== false);
-  const [thinkingCardToolResult, setThinkingCardToolResult] = useState(bot.thinkingCardToolResult !== false);
+  const [cotEnabled, setCotEnabled] = useState(bot.cotEnabled !== false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -4421,9 +4419,8 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setSilentReactions(bot.silentTurnReactions === true);
     setWritableLink(bot.writableTerminalLinkInCard === true);
     setPrivateCard(bot.privateCard === true);
-    setThinkingCard(bot.thinkingCard !== false);
-    setThinkingCardToolResult(bot.thinkingCardToolResult !== false);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.thinkingCard, bot.thinkingCardToolResult, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
+    setCotEnabled(bot.cotEnabled !== false);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.cotEnabled, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     setBusy(key);
@@ -4530,42 +4527,27 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
             <p role="status" data-card-pref-moot className="bd-card-mode-note">{tr('botDefaults.manualCardHint')}</p>
           </div>
           <ToggleRow
-            checked={thinkingCard}
+            checked={cotEnabled}
             disabled={busy !== null}
-            dataAction="toggle-thinking-card"
-            title={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCard' : 'botDefaults.replyCardTools')}
-            description={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardDescription' : 'botDefaults.replyCardToolsDescription')}
-            help={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardHelp' : 'botDefaults.replyCardToolsHelp')}
+            dataAction="toggle-cot"
+            title={tr(replyMode === 'legacy' ? 'botDefaults.cotEnabled' : 'botDefaults.replyCardTools')}
+            description={tr(replyMode === 'legacy' ? 'botDefaults.cotEnabledDescription' : 'botDefaults.replyCardToolsDescription')}
+            help={tr(replyMode === 'legacy' ? 'botDefaults.cotEnabledHelp' : 'botDefaults.replyCardToolsHelp')}
             onChange={checked => {
-              const previous = thinkingCard;
-              setThinkingCard(checked);
-              void savePatch({ thinkingCard: checked }, 'thinking', () => setThinkingCard(previous));
+              const previous = cotEnabled;
+              setCotEnabled(checked);
+              void savePatch({ cotEnabled: checked }, 'cot', () => setCotEnabled(previous));
             }}
           />
-          <div className="bd-card-dependent" data-thinking-card-options hidden={!thinkingCard}>
-            <ToggleRow
-              checked={thinkingCardToolResult}
-              disabled={busy !== null}
-              dataAction="toggle-thinking-card-tool-result"
-              title={tr('botDefaults.thinkingCardToolResult')}
-              description={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardToolResultDescription' : 'botDefaults.replyCardToolResultDescription')}
-              help={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardToolResultHelp' : 'botDefaults.replyCardToolResultHelp')}
-              onChange={checked => {
-                const previous = thinkingCardToolResult;
-                setThinkingCardToolResult(checked);
-                void savePatch({ thinkingCardToolResult: checked }, 'thinkingToolResult', () => setThinkingCardToolResult(previous));
-              }}
-            />
-          </div>
           {replyMode === 'legacy' && pinToggle}
           <QuietPresetSection
             tr={tr}
-            thinkingCard={thinkingCard}
+            cotEnabled={cotEnabled}
             silentReactions={silentReactions}
             disableStreaming={disableStreaming}
             putCardPref={putCardPref}
             onApplied={() => {
-              setThinkingCard(false);
+              setCotEnabled(false);
               setSilentReactions(true);
               setDisableStreaming(true);
             }}

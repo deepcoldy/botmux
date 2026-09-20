@@ -7867,7 +7867,7 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     vi.clearAllMocks();
     vi.mocked(canOperate).mockReturnValue(true);
     vi.mocked(setCotMode).mockResolvedValue({ ok: true, changed: true } as any);
-    botWith({ thinkingCard: true });
+    botWith({ cotEnabled: true });
   });
 
   it('rejects a non-operator: operator_only notice, no mode change', async () => {
@@ -7893,16 +7893,16 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     expect(setCotMode).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, false);
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
     expect(reply).toContain('已恢复');
-    expect(reply).not.toContain('thinkingCard on');
+    expect(reply).not.toContain('cotEnabled on');
   });
 
-  it('/cot on hints at the master switch when thinkingCard is explicitly off', async () => {
-    botWith({ thinkingCard: false });
+  it('/cot on hints at the master switch when cotEnabled is explicitly off', async () => {
+    botWith({ cotEnabled: false });
     const deps = makeDeps();
     await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot on', deps);
     expect(setCotMode).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, false);
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-    expect(reply).toContain('thinkingCard on');
+    expect(reply).toContain('cotEnabled on');
   });
 
   it('/cot on with an untouched config (default ON) confirms without the master-switch hint', async () => {
@@ -7911,7 +7911,7 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot on', deps);
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
     expect(reply).toContain('已恢复');
-    expect(reply).not.toContain('thinkingCard on');
+    expect(reply).not.toContain('cotEnabled on');
   });
 
   it('/cot status reports on / chat-muted / master-off states', async () => {
@@ -7919,26 +7919,13 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot', deps);
     expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('开启中');
 
-    botWith({ thinkingCard: true, noCotChats: [CHAT_ID] });
+    botWith({ cotEnabled: true, noCotChats: [CHAT_ID] });
     await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
     expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[1][1]).toContain('本群已关闭');
 
-    botWith({ thinkingCard: false });
+    botWith({ cotEnabled: false });
     await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
     expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[2][1]).toContain('总开关未开');
-    expect(setCotMode).not.toHaveBeenCalled();
-  });
-
-  it('/cot status appends the tool-output line only when thinkingCardToolResult is off', async () => {
-    const deps = makeDeps();
-    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
-    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).not.toContain('工具输出');
-
-    botWith({ thinkingCard: true, thinkingCardToolResult: false });
-    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
-    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[1][1] as string;
-    expect(reply).toContain('开启中');
-    expect(reply).toContain('工具输出：已关闭');
     expect(setCotMode).not.toHaveBeenCalled();
   });
 
@@ -7957,7 +7944,7 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
   });
 
   it('/cot show mid-turn: forces the session and renders the cached thinking immediately', async () => {
-    botWith({ thinkingCard: false }); // switches off — show overrides anyway
+    botWith({ cotEnabled: false }); // switches off — show overrides anyway
     const ds = makeDaemonSession();
     ds.lastThinkingUpdate = { entries: [{ kind: 'thinking', text: 'so far' }], turnId: 'om_turn9' };
     const deps = makeDeps(ds);
