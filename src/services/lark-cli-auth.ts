@@ -415,13 +415,42 @@ export async function completeLarkCliLogin(
   const raw = String((parsed?.error as Record<string, unknown> | undefined)?.message ?? stderr).trim();
   // "authorization_pending"-style messages are the normal not-scanned-yet case.
   if (/pending|not yet|waiting/i.test(raw)) return { state: 'pending' };
+  // A terminal failure (expired / denied / unknown code) never turns into a
+  // success by re-polling the same code: drop it so the next begin mints a
+  // fresh link instead of reusing a dead one until the TTL expires. A transient
+  // transport error costs one extra link, which the refusal hands over at once.
+  clearChallenge(openId);
   return { state: 'failed', detail: raw || undefined };
 }
 
 /** Absolute HOME directory to export for this person's lark-cli calls this turn,
- *  or null when they have no per-person login (caller denies / degrades). */
+ *  or null when they have no per-person login (caller denies). */
 export function larkCliHomeForTurn(openId: string | undefined): string | null {
   if (!openId) return null;
   try { return hasLarkCliHome(openId) ? larkCliHomeFor(openId) : null; }
   catch { return null; }
+}
+
+/**
+ * Resolve the acting HOME for THIS turn, polling a pending device login once.
+ *
+ * A browser approval writes nothing locally: only the `--device-code` poll
+ * lands the per-person token. Without this poll on the turn path, a person who
+ * tapped the link and (as instructed) retried the operation would be refused
+ * again until they guessed `/login done`. One poll per turn is the same shape
+ * bytedcli already uses; a still-pending or failed poll resolves to null (the
+ * caller refuses again with a fresh link) — it never manufactures a HOME, so
+ * someone who has not approved stays refused.
+ */
+export async function resolveLarkCliHomeForTurn(openId: string | undefined): Promise<string | null> {
+  if (!openId) return null;
+  try {
+    if (!hasLarkCliHome(openId) && pendingLarkCliChallenge(openId)) {
+      await completeLarkCliLogin(openId);
+    }
+    return hasLarkCliHome(openId) ? larkCliHomeFor(openId) : null;
+  } catch {
+    // A poll failure must not deny someone whose HOME is already on disk.
+    return hasLarkCliHome(openId) ? larkCliHomeFor(openId) : null;
+  }
 }

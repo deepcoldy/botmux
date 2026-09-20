@@ -15,7 +15,7 @@
  *
  * Run: npx vitest run --project unit test/lark-cli-auth.test.ts
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -27,6 +27,7 @@ import {
   clearLarkCliAuth,
   pendingLarkCliChallenge,
   larkCliHomeForTurn,
+  resolveLarkCliHomeForTurn,
   LARK_CLI_DEVICE_SCOPES,
   __setLarkCliHomeRootForTest,
   __setMachineHomeForTest,
@@ -282,6 +283,9 @@ describe('begin / complete device flow', () => {
     const failed = await completeLarkCliLogin(OPEN);
     expect(failed.state).toBe('failed');
     expect(failed.detail).toMatch(/expired/);
+    // A terminal failure drops the challenge so the next begin mints a fresh
+    // link instead of reusing the dead code until the TTL expires.
+    expect(pendingLarkCliChallenge(OPEN)).toBeNull();
   });
 
   it('fails without an in-progress challenge', async () => {
@@ -289,6 +293,79 @@ describe('begin / complete device flow', () => {
     const r = await completeLarkCliLogin(OPEN);
     expect(r.state).toBe('failed');
     expect(r.detail).toMatch(/start again/i);
+  });
+});
+
+describe('resolveLarkCliHomeForTurn — the turn-path poll (F-A)', () => {
+  it('returns an existing HOME without polling anything', async () => {
+    seedMachine();
+    simulateUserToken();
+    const runner = vi.fn(async () => ({ ok: true, stdout: '{}', stderr: '' }));
+    __setLarkCliRunnerForTest(runner);
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBe(larkCliHomeFor(OPEN));
+    expect(runner).not.toHaveBeenCalled();
+  });
+
+  it('returns null for no HOME and no challenge without spawning', async () => {
+    seedMachine();
+    const runner = vi.fn(async () => ({ ok: true, stdout: '{}', stderr: '' }));
+    __setLarkCliRunnerForTest(runner);
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBeNull();
+    expect(runner).not.toHaveBeenCalled();
+  });
+
+  it('polls a pending challenge once and resolves once the token lands', async () => {
+    seedMachine();
+    __setLarkCliRunnerForTest(async () => ({
+      ok: true, stdout: JSON.stringify({ verification_url: 'u', device_code: 'dc-turn' }), stderr: '',
+    }));
+    await beginLarkCliLogin(OPEN);
+    expect(pendingLarkCliChallenge(OPEN)?.deviceCode).toBe('dc-turn');
+
+    // The person approved in the browser; the poll is what lands the token —
+    // model that by having the runner itself write the per-person token file.
+    expect(hasLarkCliHome(OPEN)).toBe(false);
+    const runner = vi.fn(async () => {
+      simulateUserToken();
+      return { ok: true, stdout: JSON.stringify({ status: 'ok' }), stderr: '' };
+    });
+    __setLarkCliRunnerForTest(runner);
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBe(larkCliHomeFor(OPEN));
+    expect(runner).toHaveBeenCalledTimes(1);
+    expect(pendingLarkCliChallenge(OPEN)).toBeNull();
+  });
+
+  it('stays null (refusal) when the poll still says pending', async () => {
+    seedMachine();
+    __setLarkCliRunnerForTest(async () => ({
+      ok: true, stdout: JSON.stringify({ verification_url: 'u', device_code: 'dc-wait' }), stderr: '',
+    }));
+    await beginLarkCliLogin(OPEN);
+    __setLarkCliRunnerForTest(async () => ({ ok: true, stdout: JSON.stringify({ status: 'pending' }), stderr: '' }));
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBeNull();
+    // Challenge survives a pending poll so the shown link stays usable.
+    expect(pendingLarkCliChallenge(OPEN)?.deviceCode).toBe('dc-wait');
+  });
+
+  it('stays null after a terminal failure and clears the dead challenge', async () => {
+    seedMachine();
+    __setLarkCliRunnerForTest(async () => ({
+      ok: true, stdout: JSON.stringify({ verification_url: 'u', device_code: 'dc-dead' }), stderr: '',
+    }));
+    await beginLarkCliLogin(OPEN);
+    __setLarkCliRunnerForTest(async () => ({
+      ok: false, stdout: JSON.stringify({ error: { message: 'expired token' } }), stderr: '',
+    }));
+    expect(await resolveLarkCliHomeForTurn(OPEN)).toBeNull();
+    expect(pendingLarkCliChallenge(OPEN)).toBeNull();
+  });
+
+  it('returns null for an absent sender without spawning', async () => {
+    seedMachine();
+    const runner = vi.fn(async () => ({ ok: true, stdout: '{}', stderr: '' }));
+    __setLarkCliRunnerForTest(runner);
+    expect(await resolveLarkCliHomeForTurn(undefined)).toBeNull();
+    expect(runner).not.toHaveBeenCalled();
   });
 });
 

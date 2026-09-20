@@ -18,7 +18,7 @@ import { t } from '../i18n/index.js';
 import type { Locale } from '../i18n/index.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { beginBytedcliLogin, mintBytedcliJwts } from '../services/bytedcli-auth.js';
-import { larkCliHomeForTurn, beginLarkCliLogin } from '../services/lark-cli-auth.js';
+import { resolveLarkCliHomeForTurn, beginLarkCliLogin } from '../services/lark-cli-auth.js';
 import type { BotConfig } from '../bot-registry.js';
 import {
   triggerUserAuthApplies,
@@ -36,12 +36,12 @@ export interface ToolIdentityOutcome {
   tool: TriggerUserAuthTool;
   /**
    * - `user`: the sender's own credentials are in force.
-   * - `bot-identity`: nothing published; the tool runs as the bot where it can.
-   * - `needs-authorization`: nothing published AND the tool cannot degrade —
-   *   the sender must authorize before it will work.
+   * - `needs-authorization`: nothing published; the sender must authorize
+   *   before the tool will work. Neither governed tool degrades to a machine
+   *   identity anymore, so there is no other "allowed" outcome.
    * - `off`: the policy does not govern this tool; nothing was touched.
    */
-  state: 'user' | 'bot-identity' | 'needs-authorization' | 'off';
+  state: 'user' | 'needs-authorization' | 'off';
 }
 
 export interface PublishTurnIdentityArgs {
@@ -252,7 +252,11 @@ async function resolveIdentityFor(
     // inside that HOME — no token is injected into the environment, and the
     // acting identity is a directory isolated per sender (mirrors bytedcli).
     // No appId is passed: the HOME's own lark-cli config already names the app.
-    const home = larkCliHomeForTurn(senderOpenId);
+    //
+    // The resolver polls a pending device login once before deciding: a browser
+    // approval writes nothing locally, so without that poll "tap the link, then
+    // retry" could never succeed on the turn path.
+    const home = await resolveLarkCliHomeForTurn(senderOpenId);
     if (home) {
       return { tool: 'lark-cli', mode: 'user-home', home };
     }

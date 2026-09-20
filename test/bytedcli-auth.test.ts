@@ -89,6 +89,51 @@ describe('bytedcliHomeFor — the isolation boundary', () => {
   });
 });
 
+function writeBytedData(mod: Awaited<ReturnType<typeof fresh>>, openId: string, rel: string) {
+  const full = join(mod.bytedcliHomeFor(openId), '.local', 'share', 'bytedcli', rel);
+  mkdirSync(join(full, '..'), { recursive: true });
+  writeFileSync(full, '{}');
+}
+
+describe('hasBytedcliHome — a real credential, not a bare directory (F2)', () => {
+  it('is false for the bare HOME that runAsUser creates on every call', async () => {
+    const mod = await fresh();
+    mkdirSync(mod.bytedcliHomeFor(ALICE), { recursive: true });
+    expect(mod.hasBytedcliHome(ALICE)).toBe(false);
+  });
+
+  it('is false with only the blank-run boilerplate files', async () => {
+    const mod = await fresh();
+    writeBytedData(mod, ALICE, 'data/trace_optin.json');
+    writeBytedData(mod, ALICE, 'data/self_update_version.json');
+    mkdirSync(join(mod.bytedcliHomeFor(ALICE), 'logs'), { recursive: true });
+    mkdirSync(join(mod.bytedcliHomeFor(ALICE), 'traces'), { recursive: true });
+    expect(mod.hasBytedcliHome(ALICE)).toBe(false);
+  });
+
+  it('is true once the SSO token lands', async () => {
+    const mod = await fresh();
+    writeBytedData(mod, ALICE, 'token.json');
+    expect(mod.hasBytedcliHome(ALICE)).toBe(true);
+  });
+
+  it('accepts other-env tokens and browser-session files', async () => {
+    const modA = await fresh();
+    writeBytedData(modA, ALICE, 'token.tiktok.json');
+    expect(modA.hasBytedcliHome(ALICE)).toBe(true);
+    const modB = await fresh();
+    writeBytedData(modB, ALICE, 'sso_session.json');
+    expect(modB.hasBytedcliHome(ALICE)).toBe(true);
+  });
+
+  it('ignores unrelated json at the data root', async () => {
+    const mod = await fresh();
+    writeBytedData(mod, ALICE, 'pearl_sso_session.json');
+    writeBytedData(mod, ALICE, 'meego_auth.json');
+    expect(mod.hasBytedcliHome(ALICE)).toBe(false);
+  });
+});
+
 describe('login — device code, in two steps', () => {
   it('returns the authorization link and remembers the resume token', async () => {
     const mod = await fresh();
@@ -164,8 +209,14 @@ describe('login — device code, in two steps', () => {
 
 describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
   /** Stand in for a completed login: the HOME exists. */
+  // A completed login is what bytedcli actually writes: the SSO token at the
+  // bytedcli data root. A bare directory does NOT count (runAsUser creates it on
+  // every call) — hasBytedcliHome must not mistake a begin-created HOME for a
+  // login.
   function markLoggedIn(mod: { bytedcliHomeFor: (id: string) => string }, openId: string) {
-    mkdirSync(mod.bytedcliHomeFor(openId), { recursive: true });
+    const dataRoot = join(mod.bytedcliHomeFor(openId), '.local', 'share', 'bytedcli');
+    mkdirSync(dataRoot, { recursive: true });
+    writeFileSync(join(dataRoot, 'token.json'), '{"sso":"yes"}');
   }
 
   it('mints both JWTs for an authorized person', async () => {
@@ -187,6 +238,9 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
       stdout: envelope({ verification_uri_complete: 'https://cloud.example.com/a?state=s', complete_token: 'tok-1' }),
     }];
     await mod.beginBytedcliLogin(ALICE);
+    // A successful --complete makes bytedcli itself write the SSO token; the
+    // scripted runner cannot, so lay down what the real CLI would.
+    markLoggedIn(mod, ALICE);
     replies = [
       { code: 0, stdout: envelope({ status: 'ok' }) },
       { code: 0, stdout: 'cloud.jwt.value\n' },
@@ -257,6 +311,79 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
     ];
     expect((await mod.mintBytedcliJwts(ALICE))?.cloudJwt).toBe('jwt-1');
     expect((await mod.mintBytedcliJwts(ALICE))?.cloudJwt).toBe('jwt-2');
+  });
+});
+
+describe('mintBytedcliJwts — a pending login is best-effort, never a hard gate (F-B)', () => {
+  async function beginOnce(mod: Awaited<ReturnType<typeof fresh>>) {
+    replies = [{
+      code: 0,
+      stdout: envelope({ verification_uri_complete: 'https://cloud.example.com/a', complete_token: 'tok-1' }),
+    }];
+    await mod.beginBytedcliLogin(ALICE);
+  }
+
+  // The lockout this fixes: a transient blip auto-begins a challenge on the
+  // refusal path; the person IS authorized, and must keep working while nobody
+  // scans that link.
+  it('still mints JWTs when the completion poll is pending and a login exists', async () => {
+    const mod = await fresh();
+    await beginOnce(mod);
+    writeBytedData(mod, ALICE, 'token.json');
+    replies = [
+      { code: 0, stdout: envelope({ status: 'pending' }) },
+      { code: 0, stdout: 'cloud.jwt\n' },
+      { code: 0, stdout: 'code.jwt\n' },
+    ];
+    expect(await mod.mintBytedcliJwts(ALICE)).toEqual({ cloudJwt: 'cloud.jwt', codeJwt: 'code.jwt' });
+    expect(calls.slice(1).map(c => c.args)).toEqual([
+      ['auth', 'login', '--complete', 'tok-1', '--json'],
+      ['auth', 'get-bytecloud-jwt-token'],
+      ['auth', 'get-codebase-jwt-token'],
+    ]);
+    // Pending leaves the challenge in place so the link stays usable.
+    expect(mod.pendingBytedcliChallenge(ALICE)).toBe('tok-1');
+  });
+
+  it('still mints when the completion poll fails terminally, and drops the dead challenge', async () => {
+    const mod = await fresh();
+    await beginOnce(mod);
+    writeBytedData(mod, ALICE, 'token.json');
+    replies = [
+      { code: 1, stdout: envelope(null, 'error') + JSON.stringify({ error: { message: 'token expired' } }) + '\n' },
+      { code: 0, stdout: 'cloud.jwt\n' },
+      { code: 0, stdout: 'code.jwt\n' },
+    ];
+    // Build the failure envelope properly below instead of the concat above.
+    replies[0] = { code: 1, stdout: JSON.stringify({ status: 'error', data: null, error: { message: 'token expired' } }) + '\n' };
+    expect(await mod.mintBytedcliJwts(ALICE)).toEqual({ cloudJwt: 'cloud.jwt', codeJwt: 'code.jwt' });
+    expect(mod.pendingBytedcliChallenge(ALICE)).toBeNull();
+  });
+
+  it('refuses (no JWT read at all) when nobody ever authorized, challenge or not', async () => {
+    const mod = await fresh();
+    await beginOnce(mod);
+    replies = [{ code: 0, stdout: envelope({ status: 'pending' }) }];
+    expect(await mod.mintBytedcliJwts(ALICE)).toBeNull();
+    expect(calls.slice(1).map(c => c.args)).toEqual([
+      ['auth', 'login', '--complete', 'tok-1', '--json'],
+    ]);
+  });
+
+  it('recovers on the same challenge the moment the login lands', async () => {
+    const mod = await fresh();
+    await beginOnce(mod);
+    // Earlier turn: no login yet → nothing.
+    replies = [{ code: 0, stdout: envelope({ status: 'pending' }) }];
+    expect(await mod.mintBytedcliJwts(ALICE)).toBeNull();
+    // Person taps the link; the next turn completes AND mints.
+    writeBytedData(mod, ALICE, 'token.json');
+    replies = [
+      { code: 0, stdout: envelope({ status: 'ok' }) },
+      { code: 0, stdout: 'cloud.jwt\n' },
+      { code: 0, stdout: 'code.jwt\n' },
+    ];
+    expect(await mod.mintBytedcliJwts(ALICE)).toEqual({ cloudJwt: 'cloud.jwt', codeJwt: 'code.jwt' });
   });
 });
 

@@ -36,10 +36,14 @@ vi.mock('../src/services/bytedcli-auth.js', () => ({
   })),
 }));
 
-// lark-cli per-person HOME (device-code). No HOME in tests → identity null;
-// auto-begin is scripted so withholding never touches the real lark-cli/FS.
+// lark-cli per-person HOME (device-code). The turn resolver is scripted per
+// test; auto-begin is scripted so withholding never touches the real FS.
+const larkHomes = new Map<string, string>();
+const pendingChallenges = new Set<string>();
+const resolveLarkCliHomeForTurn = vi.fn(async (openId: string) => larkHomes.get(openId) ?? null);
 vi.mock('../src/services/lark-cli-auth.js', () => ({
-  larkCliHomeForTurn: vi.fn(() => null),
+  resolveLarkCliHomeForTurn: (openId: string) => resolveLarkCliHomeForTurn(openId),
+  pendingLarkCliChallenge: vi.fn((openId: string) => pendingChallenges.has(openId) ? { deviceCode: 'dc' } : null),
   beginLarkCliLogin: vi.fn(async () => ({ authUrl: 'https://example.com/lark-device' })),
 }));
 
@@ -57,6 +61,9 @@ beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'botmux-turn-identity-'));
   tokens.clear();
   bytedcliJwts.clear();
+  larkHomes.clear();
+  pendingChallenges.clear();
+  resolveLarkCliHomeForTurn.mockClear();
 });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
@@ -80,6 +87,42 @@ function publish(config: any, senderOpenId: string | undefined, turnId?: string)
 }
 
 const larkPath = () => sessionIdentityPath(dir, SESSION, 'lark-cli');
+
+describe('publishTurnCliIdentity — lark-cli per-person HOME (device flow)', () => {
+  it('publishes the per-person HOME as a user-home identity (no token injected)', async () => {
+    larkHomes.set(ALICE, '/homes/alice');
+    const outcomes = await publish(botConfig(), ALICE);
+    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('user');
+    const body = readFileSync(larkPath(), 'utf8');
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='user-home'");
+    expect(body).toContain("BOTMUX_IDENTITY_HOME='/homes/alice'");
+    expect(body).not.toContain('LARKSUITE_CLI_USER_ACCESS_TOKEN');
+  });
+
+  // F-A end to end at the decision layer: refusal while the link is pending,
+  // then the very next turn — after the person tapped — the resolver's poll
+  // lands the HOME and the identical retry runs as that person.
+  it('the retry after a tap runs as the person without /login done', async () => {
+    pendingChallenges.add(BOB);
+    const t1 = await publish(botConfig(), BOB);
+    expect(t1.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
+    expect(readFileSync(larkPath(), 'utf8')).toContain('https://example.com/lark-device');
+
+    // Approval landed between turns; the resolver poll now returns the HOME.
+    pendingChallenges.delete(BOB);
+    larkHomes.set(BOB, '/homes/bob');
+    const t2 = await publish(botConfig(), BOB);
+    expect(t2.find(o => o.tool === 'lark-cli')?.state).toBe('user');
+    expect(readFileSync(larkPath(), 'utf8')).toContain("BOTMUX_IDENTITY_MODE='user-home'");
+  });
+
+  it('keeps refusing while a challenge remains unresolved', async () => {
+    pendingChallenges.add(BOB);
+    const outcomes = await publish(botConfig(), BOB);
+    expect(outcomes.find(o => o.tool === 'lark-cli')?.state).toBe('needs-authorization');
+    expect(resolveLarkCliHomeForTurn).toHaveBeenCalledWith(BOB);
+  });
+});
 
 describe('publishTurnCliIdentity — the sender acts as themselves', () => {
   it('publishes the sender\'s own token', async () => {

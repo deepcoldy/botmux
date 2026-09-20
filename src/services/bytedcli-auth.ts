@@ -31,7 +31,7 @@
  * that link, the next retry completes the saved challenge before minting JWTs.
  */
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -67,9 +67,21 @@ export function bytedcliHomeFor(openId: string): string {
 }
 
 /** Whether this person has ever completed a bytedcli login here. Cheap enough
- *  to call per turn; says nothing about whether that login is still valid. */
+ *  to call per turn; says nothing about whether that login is still valid.
+ *
+ *  The bare HOME does NOT count: {@link runAsUser} mkdirs it on every call, so
+ *  a single (even failed) `--begin` would otherwise read as "authorized" until
+ *  the directory was manually removed. bytedcli writes the SSO credential at
+ *  the data root (`~/.local/share/bytedcli/token.json`, `token.<env>.json` for
+ *  other SSO environments, `sso_session*.json` for the browser-session flow);
+ *  only one of those proves a login happened. */
 export function hasBytedcliHome(openId: string): boolean {
-  try { return existsSync(bytedcliHomeFor(openId)); } catch { return false; }
+  try {
+    const dataRoot = join(bytedcliHomeFor(openId), '.local', 'share', 'bytedcli');
+    if (!existsSync(dataRoot)) return false;
+    return readdirSync(dataRoot).some(f =>
+      /^token(\.[a-z0-9-]+)?\.json$/.test(f) || /^sso_session(\.[a-z0-9-]+)?\.json$/.test(f));
+  } catch { return false; }
 }
 
 /** Forget one person's bytedcli authorization entirely. */
@@ -239,6 +251,9 @@ export async function completeBytedcliLogin(
   const data = env?.data as Record<string, unknown> | undefined;
   if (ok && data?.status === 'pending') return { state: 'pending' };
   if (ok) { clearChallenge(openId); return { state: 'authorized' }; }
+  // Terminal (not pending): re-polling the same token cannot succeed. Drop it so
+  // the next begin issues a fresh link instead of wedging on a dead token.
+  clearChallenge(openId);
   const detail = (env?.error as Record<string, unknown> | undefined)?.message;
   return {
     state: 'failed',
@@ -263,12 +278,19 @@ export interface BytedcliJwts {
  * If an automatic device login is pending, first try to complete it. This makes
  * "open the link, then retry" sufficient; `/login bytedcli done` remains a
  * compatibility path, not a required user step.
+ *
+ * The completion is BEST-EFFORT, never a gate: a still-pending (or just-failed)
+ * challenge says nothing about whether this person already has a valid login,
+ * and returning null here would lock an already-authorized person out — a
+ * single transient blip can auto-begin a challenge on the refusal path, and a
+ * non-authorized poll result must not then veto the perfectly good HOME below
+ * (which is also the only thing that can clear that state). So regardless of
+ * the poll outcome, fall through and let the HOME / JWT read be the authority.
  */
 export async function mintBytedcliJwts(openId: string): Promise<BytedcliJwts | null> {
   const challenge = pendingBytedcliChallenge(openId);
   if (challenge) {
-    const completed = await completeBytedcliLogin(openId, challenge);
-    if (completed.state !== 'authorized') return null;
+    await completeBytedcliLogin(openId, challenge);
   }
   if (!hasBytedcliHome(openId)) return null;
   const cloud = await runAsUser(openId, ['auth', 'get-bytecloud-jwt-token']);
