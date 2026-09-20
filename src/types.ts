@@ -1236,6 +1236,9 @@ export interface ScheduledTask {
    *  running as the bot. */
   ownerUnionId?: string;
   enabled: boolean;
+  /** Why an enabled task became disabled. Missing means a legacy/unknown
+   *  disable and is never enough to extend scheduled-turn authority. */
+  disabledReason?: 'once_completed' | 'manual';
   createdAt: string;
   lastRunAt?: string;
   nextRunAt?: string;

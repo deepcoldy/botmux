@@ -44,7 +44,10 @@ import {
   resolveSessionContext,
 } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
-import { resolveCurrentTurnProvenance } from './core/current-turn-provenance.js';
+import {
+  CurrentTurnProvenanceError,
+  resolveCurrentTurnProvenance,
+} from './core/current-turn-provenance.js';
 import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
 import { isHttpVirtualSession } from './core/types.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
@@ -6827,38 +6830,76 @@ async function detectAuthenticatedCurrentSession(): Promise<CurrentSession | nul
       envSessionId: process.env.BOTMUX_SESSION_ID,
     });
   } catch (hostError) {
-    // Linux bwrap deliberately hides the host PID namespace and shared marker
-    // directory. If this exact turn has a rotating managed-origin capability,
-    // exchange it for a daemon-written host proof instead of treating the
-    // absence of host ancestors as a detached call. A sandbox fixture/legacy
-    // session without that capability fails closed; a claimed BotMux session
-    // must never degrade to a standalone OWNERLESS task.
-    const isolated = readWorkflowSessionRelayContext({ env: process.env, dataDir });
-    if (!isolated?.originChannelId) throw hostError;
-    const attested = await attestManagedOrigin({
-      context: {
-        sessionId: isolated.sessionId,
-        channelId: isolated.originChannelId,
-        capability: isolated.capability,
-        dataDir,
-        ...(isolated.larkAppId ? { larkAppId: isolated.larkAppId } : {}),
-        ...(isolated.ipcPortFallback !== undefined
-          ? { ipcPortFallback: isolated.ipcPortFallback }
-          : {}),
-      },
-      resolveIpcPort: (appId) => {
-        try { return appId ? findDaemon(appId)?.ipcPort : undefined; }
-        catch { return undefined; }
-      },
-    });
-    if (!attested.callerOpenId || !attested.larkAppId) throw hostError;
-    provenance = {
-      sessionId: attested.sessionId,
-      turnId: attested.turnId,
-      callerOpenId: attested.callerOpenId,
-      larkAppId: attested.larkAppId,
-    };
-    void hostError;
+    // A one-shot is marked completed as soon as its model turn is dispatched,
+    // before that turn has finished. Only in that exact state may the daemon's
+    // live process/turn proof bridge the short authorization window. Historical
+    // turns, manual pauses and legacy disabled rows remain rejected.
+    if (hostError instanceof CurrentTurnProvenanceError
+      && hostError.scheduledTurnAuthError === 'task_disabled') {
+      const marker = findLiveAncestorSessionContext(
+        dataDir, process.ppid, process.env.BOTMUX_SESSION_ID,
+      );
+      const scheduledSession = marker?.sessionId
+        ? loadSessions().get(marker.sessionId)
+        : undefined;
+      if (marker?.turnId && scheduledSession?.larkAppId) {
+        const daemonPort = (() => {
+          try {
+            return findDaemon(scheduledSession.larkAppId)?.ipcPort
+              ?? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT);
+          } catch {
+            return resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT);
+          }
+        })();
+        if (daemonPort) {
+          const { resolveCurrentActor } = await import('./cli/current-actor.js');
+          await resolveCurrentActor({
+            ipcPort: daemonPort,
+            sessionId: marker.sessionId,
+            expectedScheduledTurnId: marker.turnId,
+          });
+          provenance = resolveCurrentTurnProvenance({
+            dataDir,
+            envSessionId: process.env.BOTMUX_SESSION_ID,
+            isScheduledTurnLive: turnId => turnId === marker.turnId,
+          });
+        }
+      }
+      if (!provenance) throw hostError;
+    } else {
+      // Linux bwrap deliberately hides the host PID namespace and shared marker
+      // directory. If this exact turn has a rotating managed-origin capability,
+      // exchange it for a daemon-written host proof instead of treating the
+      // absence of host ancestors as a detached call. A sandbox fixture/legacy
+      // session without that capability fails closed; a claimed BotMux session
+      // must never degrade to a standalone OWNERLESS task.
+      const isolated = readWorkflowSessionRelayContext({ env: process.env, dataDir });
+      if (!isolated?.originChannelId) throw hostError;
+      const attested = await attestManagedOrigin({
+        context: {
+          sessionId: isolated.sessionId,
+          channelId: isolated.originChannelId,
+          capability: isolated.capability,
+          dataDir,
+          ...(isolated.larkAppId ? { larkAppId: isolated.larkAppId } : {}),
+          ...(isolated.ipcPortFallback !== undefined
+            ? { ipcPortFallback: isolated.ipcPortFallback }
+            : {}),
+        },
+        resolveIpcPort: (appId) => {
+          try { return appId ? findDaemon(appId)?.ipcPort : undefined; }
+          catch { return undefined; }
+        },
+      });
+      if (!attested.callerOpenId || !attested.larkAppId) throw hostError;
+      provenance = {
+        sessionId: attested.sessionId,
+        turnId: attested.turnId,
+        callerOpenId: attested.callerOpenId,
+        larkAppId: attested.larkAppId,
+      };
+      void hostError;
+    }
   }
   if (!provenance) return null;
   const s = loadSessions().get(provenance.sessionId);

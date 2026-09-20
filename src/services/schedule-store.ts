@@ -368,6 +368,9 @@ function migrate(raw: any): ScheduledTask | null {
     ownerOpenId: raw.ownerOpenId,
     ownerUnionId: raw.ownerUnionId,
     enabled: raw.enabled !== false,
+    disabledReason: raw.disabledReason === 'once_completed' || raw.disabledReason === 'manual'
+      ? raw.disabledReason
+      : undefined,
     createdAt: raw.createdAt,
     lastRunAt: raw.lastRunAt,
     nextRunAt: raw.nextRunAt,
@@ -702,7 +705,7 @@ export function removeTask(id: string, appId?: string): boolean {
 export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
-    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastRunId' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
+    'enabled' | 'disabledReason' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastRunId' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
   >> & { chatIds?: readonly string[] | null },
   appId?: string,
 ): void {
@@ -725,6 +728,13 @@ export function updateTask(
         ? { ...ordinaryUpdates, deliver: 'origin' as const }
         : ordinaryUpdates,
     );
+    // Generic enable/disable writes are operator actions. Automatic one-shot
+    // completion is written directly by markRun below so the two states remain
+    // distinguishable for exact in-flight scheduled-turn authorization.
+    if (updates.enabled === true) delete task.disabledReason;
+    else if (updates.enabled === false && updates.disabledReason === undefined) {
+      task.disabledReason = 'manual';
+    }
     if (targets) {
       task.chatId = targets.chatId;
       if (targets.chatIds) task.chatIds = targets.chatIds;
@@ -832,6 +842,7 @@ export function markRun(
     // One-shot: disable after run. Otherwise next_run was already advanced by scheduler.
     if (task.parsed.kind === 'once') {
       task.enabled = false;
+      task.disabledReason = 'once_completed';
       task.nextRunAt = undefined;
     }
     return { result: undefined, changed: true };

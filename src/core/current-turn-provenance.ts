@@ -38,9 +38,15 @@ export interface CurrentTurnProvenance {
 }
 
 export class CurrentTurnProvenanceError extends Error {
-  constructor(message: string) {
+  readonly scheduledTurnAuthError?: import('./scheduled-turn-provenance.js').ScheduledTurnAuthError;
+
+  constructor(
+    message: string,
+    scheduledTurnAuthError?: import('./scheduled-turn-provenance.js').ScheduledTurnAuthError,
+  ) {
     super(message);
     this.name = 'CurrentTurnProvenanceError';
+    this.scheduledTurnAuthError = scheduledTurnAuthError;
   }
 }
 
@@ -78,6 +84,8 @@ export interface ResolveCurrentTurnProvenanceOptions {
   /** Inherited session id is only a stale/detached detector, never identity. */
   envSessionId?: string;
   startPid?: number;
+  /** Exact daemon-backed liveness proof for an auto-disabled one-shot. */
+  isScheduledTurnLive?: (turnId: string) => boolean;
 }
 
 /**
@@ -145,9 +153,14 @@ export function resolveCurrentTurnProvenance(
       sessionLarkAppId: session.larkAppId,
       sessionChatId: session.chatId,
       isOwnerAllowed: () => true,
+      ...(options.isScheduledTurnLive
+        ? { isScheduledTurnLive: options.isScheduledTurnLive }
+        : {}),
     });
     if ('error' in auth) {
-      throw new CurrentTurnProvenanceError(scheduledTurnAuthErrorMessage(auth.error));
+      throw new CurrentTurnProvenanceError(
+        scheduledTurnAuthErrorMessage(auth.error), auth.error,
+      );
     }
     let scheduledRootMessageId: string | undefined;
     if ((session.scope ?? 'thread') === 'thread') {

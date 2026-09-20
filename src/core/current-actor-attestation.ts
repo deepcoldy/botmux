@@ -6,6 +6,7 @@ import { CURRENT_ACTOR_SCHEMA, normalizeActorEmail, type CurrentActorDocument } 
 import { resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
 import { collectSessionLineagePids } from './preview-port-owner.js';
 import { larkTransportEnabled, type DaemonSession } from './types.js';
+import { parseScheduledTurnId } from './scheduled-turn-provenance.js';
 
 const TCP_ESTABLISHED_STATE = '01';
 
@@ -170,6 +171,7 @@ export interface CurrentTurnPeerAttestation {
   engineProcStart?: string;
   workerPid: number;
   workerProcStart: string;
+  expectedScheduledTurnId?: string;
   processIdentities: string[];
 }
 
@@ -178,6 +180,7 @@ export interface CurrentTurnPeerAttestationInput {
   peer: ProcessIdentity;
   findSession: (sessionId: string) => DaemonSession | undefined;
   procRoot?: string;
+  expectedScheduledTurnId?: string;
 }
 
 /**
@@ -204,6 +207,9 @@ export function attestCurrentTurnLoopbackPeer(
   const workerProcStart = workerPid ? readProcStart(workerPid, procRoot) : undefined;
   const callerOpenId = ds?.managedTurnOrigin?.callerOpenId;
   const capability = ds?.managedTurnOrigin?.capability;
+  const scheduledCaller = input.expectedScheduledTurnId
+    ? ds?.scheduledTurnCallers?.get(input.expectedScheduledTurnId)
+    : undefined;
   if (!ds || ds.session.status !== 'active'
     || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: ds.initConfig?.apiOnly })
     || !turnId || generation === undefined
@@ -218,6 +224,13 @@ export function attestCurrentTurnLoopbackPeer(
       && readProcStart(cliPid, procRoot) !== cliProcStart)
     || (enginePid !== undefined
       && readProcStart(enginePid, procRoot) !== engineProcStart)) {
+    return null;
+  }
+  if (input.expectedScheduledTurnId
+    && (!parseScheduledTurnId(input.expectedScheduledTurnId)
+      || turnId !== input.expectedScheduledTurnId
+      || !scheduledCaller
+      || scheduledCaller.requestUserOpenId !== callerOpenId)) {
     return null;
   }
   const preexistingProcessIdentities = new Set(processIdentities);
@@ -235,6 +248,9 @@ export function attestCurrentTurnLoopbackPeer(
   return {
     ds, turnId, generation, callerOpenId, capability,
     workerPid, workerProcStart, cliPid, cliProcStart, enginePid, engineProcStart,
+    ...(input.expectedScheduledTurnId
+      ? { expectedScheduledTurnId: input.expectedScheduledTurnId }
+      : {}),
     processIdentities: [...processIdentities],
   };
 }
@@ -255,6 +271,7 @@ export function currentTurnPeerAttestationStable(
     && again.workerProcStart === frozen.workerProcStart
     && again.enginePid === frozen.enginePid
     && again.engineProcStart === frozen.engineProcStart
+    && again.expectedScheduledTurnId === frozen.expectedScheduledTurnId
     && JSON.stringify(again.processIdentities) === JSON.stringify(frozen.processIdentities);
 }
 
@@ -265,11 +282,15 @@ export async function resolveDaemonCurrentActor(input: {
   findSession: (sessionId: string) => DaemonSession | undefined;
   resolveIdentity?: typeof resolveVerifiedUserIdentity;
   procRoot?: string;
+  expectedScheduledTurnId?: string;
 }): Promise<CurrentActorDaemonResult> {
   const procRoot = input.procRoot ?? '/proc';
   const attestInput = {
     sessionId: input.sessionId, peer: input.peer,
     findSession: input.findSession, procRoot,
+    ...(input.expectedScheduledTurnId
+      ? { expectedScheduledTurnId: input.expectedScheduledTurnId }
+      : {}),
   };
   const frozen = attestCurrentTurnLoopbackPeer(attestInput);
   if (!frozen) return { ok: false, error: 'current_actor_unverified' };

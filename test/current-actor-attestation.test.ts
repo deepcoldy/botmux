@@ -43,6 +43,21 @@ function activeSession(): any {
   };
 }
 
+const SCHEDULED_TURN_ID = 'schedule:abcdef12:12345678-1234-1234-1234-123456789abc';
+
+function activeScheduledSession(): any {
+  const ds = activeSession();
+  ds.managedTurnOrigin.turnId = SCHEDULED_TURN_ID;
+  ds.managedTurnOrigin.callerOpenId = 'ou_scheduler';
+  ds.scheduledTurnCallers = new Map([[SCHEDULED_TURN_ID, {
+    requestUserOpenId: 'ou_scheduler',
+    requestLarkAppId: 'cli_app',
+    source: 'schedule_creator',
+    taskId: 'abcdef12',
+  }]]);
+  return ds;
+}
+
 describe('daemon current actor attestation', () => {
   it('derives the HTTP client pid from the live kernel socket tuple', () => {
     const procRoot = mkdtempSync(join(tmpdir(), 'actor-peer-'));
@@ -91,6 +106,70 @@ describe('daemon current actor attestation', () => {
       document: { actor: { email: 'current.user@example.com' } },
     });
     expect(resolveIdentity).toHaveBeenCalledWith('cli_app', 'ou_current');
+  });
+
+  it('proves the exact scheduled turn against the live caller registry', async () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    writeProc(procRoot, 101, 100, '2000');
+    const ds = activeScheduledSession();
+
+    await expect(resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 101, procStart: '2000' },
+      findSession: () => ds,
+      resolveIdentity: async () => ({
+        openId: 'ou_scheduler', type: 'user' as const, email: 'scheduler@example.com',
+      }),
+      procRoot,
+      expectedScheduledTurnId: SCHEDULED_TURN_ID,
+    })).resolves.toMatchObject({ ok: true });
+  });
+
+  it('rejects a missing, different, or cleaned-up scheduled turn', async () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    const ds = activeScheduledSession();
+    const request = (expectedScheduledTurnId: string) => resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 100, procStart: '1000' },
+      findSession: () => ds,
+      resolveIdentity: async () => ({
+        openId: 'ou_scheduler', type: 'user' as const, email: 'scheduler@example.com',
+      }),
+      procRoot,
+      expectedScheduledTurnId,
+    });
+
+    await expect(request(
+      'schedule:abcdef12:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+    )).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+
+    ds.scheduledTurnCallers = undefined;
+    await expect(request(SCHEDULED_TURN_ID)).resolves.toEqual({
+      ok: false, error: 'current_actor_unverified',
+    });
+  });
+
+  it('rejects scheduled-turn registry cleanup during identity lookup', async () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    const ds = activeScheduledSession();
+
+    await expect(resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 100, procStart: '1000' },
+      findSession: () => ds,
+      resolveIdentity: async () => {
+        ds.scheduledTurnCallers = undefined;
+        return { openId: 'ou_scheduler', type: 'user' as const, email: 'scheduler@example.com' };
+      },
+      procRoot,
+      expectedScheduledTurnId: SCHEDULED_TURN_ID,
+    })).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
   });
 
   it('binds an RPC tool descendant to the independently attested engine root', async () => {

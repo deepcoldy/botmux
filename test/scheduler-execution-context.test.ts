@@ -55,10 +55,13 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import {
+  disableTask,
+  enableTask,
   removeTask,
   runNow,
   runTaskNow,
   setExecuteCallback,
+  setEnabled,
   startScheduler,
   stopScheduler,
   type ScheduleExecutionContext,
@@ -104,6 +107,28 @@ afterEach(() => {
 });
 
 describe('scheduler execution context', () => {
+  it('marks operator disable and clears the reason on enable', () => {
+    expect(disableTask(task.id)).toBe(true);
+    expect(mocks.updateTask).toHaveBeenCalledWith(task.id, {
+      enabled: false, disabledReason: 'manual',
+    });
+
+    expect(enableTask(task.id)).toBe(true);
+    expect(mocks.updateTask).toHaveBeenCalledWith(task.id, expect.objectContaining({
+      enabled: true, disabledReason: undefined,
+    }));
+  });
+
+  it('lets an explicit pause override auto-completed provenance', () => {
+    mocks.getTask.mockReturnValue({
+      ...task, enabled: false, disabledReason: 'once_completed',
+    });
+    expect(setEnabled(task.id, false)).toEqual({ ok: true });
+    expect(mocks.updateTask).toHaveBeenCalledWith(task.id, {
+      enabled: false, disabledReason: 'manual',
+    });
+  });
+
   it('marks direct Dashboard runs with one UUID context and matching start time', async () => {
     let received: ScheduleExecutionContext | undefined;
     setExecuteCallback(async (_task, context) => { received = context; });

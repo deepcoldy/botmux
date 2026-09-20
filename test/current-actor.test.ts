@@ -135,6 +135,31 @@ describe('current actor client contract', () => {
     );
   });
 
+  it('asks the daemon to prove an exact scheduled turn when requested', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      schema: CURRENT_ACTOR_SCHEMA,
+      status: 'verified',
+      actor: { email: 'current.user@example.com' },
+    }), { status: 200 }));
+    const scheduledTurnId = 'schedule:abcdef12:12345678-1234-1234-1234-123456789abc';
+
+    await resolveCurrentActor({
+      ipcPort: 7951,
+      sessionId: 'sess-1',
+      expectedScheduledTurnId: scheduledTurnId,
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'http://127.0.0.1:7951/api/current-actor',
+      expect.objectContaining({
+        body: JSON.stringify({
+          sessionId: 'sess-1', expectedScheduledTurnId: scheduledTurnId,
+        }),
+      }),
+    );
+  });
+
   it.each([
     [{ schema: 'botmux.current-actor.v1', status: 'verified', actor: { email: 'x@example.com' } }],
     [{ schema: CURRENT_ACTOR_SCHEMA, status: 'verified', actor: { email: 'X@example.com' } }],

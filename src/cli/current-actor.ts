@@ -16,6 +16,9 @@ export interface CurrentActorDocument {
 export interface ResolveCurrentActorOptions {
   ipcPort: number;
   sessionId: string;
+  /** When set, the daemon must also prove this exact scheduled turn remains
+   *  registered as in-flight before returning the actor document. */
+  expectedScheduledTurnId?: string;
   fetchImpl?: typeof fetch;
 }
 
@@ -194,7 +197,12 @@ export async function resolveCurrentActor(
       {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sessionId: options.sessionId }),
+        body: JSON.stringify({
+          sessionId: options.sessionId,
+          ...(options.expectedScheduledTurnId
+            ? { expectedScheduledTurnId: options.expectedScheduledTurnId }
+            : {}),
+        }),
         signal: AbortSignal.timeout(5_000),
       },
     );

@@ -834,14 +834,16 @@ export function enableTask(id: string): boolean {
   const task = scheduleStore.getTask(id);
   if (!task) return false;
   const next = computeNextRun(task.parsed);
-  scheduleStore.updateTask(id, { enabled: true, nextRunAt: next ?? undefined });
+  scheduleStore.updateTask(id, {
+    enabled: true, disabledReason: undefined, nextRunAt: next ?? undefined,
+  });
   return true;
 }
 
 export function disableTask(id: string): boolean {
   const task = scheduleStore.getTask(id);
   if (!task) return false;
-  scheduleStore.updateTask(id, { enabled: false });
+  scheduleStore.updateTask(id, { enabled: false, disabledReason: 'manual' });
   return true;
 }
 
@@ -916,12 +918,15 @@ export function runNow(id: string): { ok: boolean; error?: string } {
 export function setEnabled(id: string, enabled: boolean): { ok: boolean; error?: string } {
   const task = scheduleStore.getTask(id);
   if (!task) return { ok: false, error: 'not_found' };
-  if (task.enabled === enabled) return { ok: true }; // no-op
+  if (task.enabled === enabled
+    && (enabled || task.disabledReason === 'manual')) return { ok: true };
   if (enabled) {
     const next = computeNextRun(task.parsed);
-    scheduleStore.updateTask(id, { enabled: true, nextRunAt: next ?? undefined });
+    scheduleStore.updateTask(id, {
+      enabled: true, disabledReason: undefined, nextRunAt: next ?? undefined,
+    });
   } else {
-    scheduleStore.updateTask(id, { enabled: false });
+    scheduleStore.updateTask(id, { enabled: false, disabledReason: 'manual' });
   }
   dashboardEventBus.publish({
     type: 'schedule.updated',

@@ -6634,6 +6634,7 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
           if (!hasAllowlist) return true;
           return getDashboardAdminOpenIds(larkAppId).includes(ownerOpenId);
         },
+        isScheduledTurnLive: turnId => ds?.scheduledTurnCallers?.has(turnId) === true,
       });
       if (!decision.ok) {
         return jsonRes(res, decision.status, {
