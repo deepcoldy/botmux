@@ -30,6 +30,7 @@ import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, symlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync, chmodSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
+import { readAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname, basename, resolve } from 'node:path';
 import { homedir, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -6863,13 +6864,48 @@ async function detectAuthenticatedCurrentSession(): Promise<CurrentSession | nul
   const s = loadSessions().get(provenance.sessionId);
   if (!s || s.status !== 'active') return null;
   if (provenance.larkAppId !== s.larkAppId) return null;
-  // The persisted union_id belongs to the session owner. Only attach it when
-  // the authenticated caller for THIS exact turn is that same owner; another
-  // allowed participant in a shared session must not inherit the owner's user
-  // identity. Scheduled child creation passes because its provenance resolves
-  // back to the already-verified task creator.
-  if (!s.ownerOpenId || provenance.callerOpenId !== s.ownerOpenId) {
-    throw new Error('current turn caller does not match the session owner');
+  // The current-turn provenance authenticates the human who actually invoked
+  // this command. A persisted session owner is useful when present, but older
+  // bot/schedule-created sessions can legitimately be ownerless. In that case
+  // bind the task to the authenticated caller only when the bot's live
+  // resolved allowlist still admits them. Never copy another session owner's
+  // union_id onto the caller.
+  let ownerUnionId: string | undefined;
+  if (s.ownerOpenId) {
+    if (provenance.callerOpenId !== s.ownerOpenId) {
+      throw new Error('current turn caller does not match the session owner');
+    }
+    ownerUnionId = s.ownerUnionId;
+  } else {
+    // `botmux schedule ...` runs in a short-lived CLI process whose in-memory
+    // daemon registry is intentionally not initialized. Reconstruct the same
+    // fail-closed allowlist view from durable config + its last-known-good
+    // raw-entry resolution cache instead of calling getBot().
+    const configuredBot = loadBotsJson().find(bot => bot?.larkAppId === s.larkAppId);
+    if (!configuredBot) {
+      throw new Error(`cannot load bot config for ${s.larkAppId}`);
+    }
+    const allowedRaw: string[] = Array.isArray(configuredBot.allowedUsers)
+      ? configuredBot.allowedUsers.filter((entry: unknown): entry is string => typeof entry === 'string')
+      : [];
+    const cache = readAllowedUsersResolveCache(dataDir, s.larkAppId);
+    const resolvedAllowedUsers = new Set(
+      allowedRaw
+        .map((entry: string) => entry.startsWith('ou_') ? entry : cache[entry])
+        .filter((entry): entry is string => typeof entry === 'string' && entry.startsWith('ou_')),
+    );
+    if (!resolvedAllowedUsers.has(provenance.callerOpenId)) {
+      throw new Error('current turn caller is not an allowed bot operator');
+    }
+    const matches = [...new Set(
+      allowedRaw
+        .filter((entry: string) => entry.startsWith('on_'))
+        .filter((entry: string) => cache[entry] === provenance.callerOpenId),
+    )];
+    if (matches.length !== 1) {
+      throw new Error('cannot resolve the current turn caller union_id');
+    }
+    ownerUnionId = matches[0];
   }
   return {
     sessionId: s.sessionId,
@@ -6880,8 +6916,8 @@ async function detectAuthenticatedCurrentSession(): Promise<CurrentSession | nul
     larkAppId: s.larkAppId,
     chatType: s.chatType,
     scope: s.scope,
-    ownerOpenId: s.ownerOpenId,
-    ownerUnionId: s.ownerUnionId,
+    ownerOpenId: provenance.callerOpenId,
+    ownerUnionId,
   };
 }
 

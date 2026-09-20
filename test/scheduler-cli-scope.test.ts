@@ -7,10 +7,13 @@ describe('schedule CLI session scope propagation', () => {
   it('resolves the requested/current execution position into scheduler.addTask', () => {
     expect(cliSource).toContain("scope?: 'thread' | 'chat';");
     expect(cliSource).toMatch(/function detectCurrentSession[\s\S]*?scope: s\.scope,/);
-    expect(cliSource).toMatch(/async function detectAuthenticatedCurrentSession[\s\S]*?resolveCurrentTurnProvenance[\s\S]*?attestManagedOrigin[\s\S]*?provenance\.callerOpenId !== s\.ownerOpenId[\s\S]*?ownerUnionId: s\.ownerUnionId,/);
+    expect(cliSource).toMatch(/async function detectAuthenticatedCurrentSession[\s\S]*?resolveCurrentTurnProvenance[\s\S]*?attestManagedOrigin[\s\S]*?provenance\.callerOpenId !== s\.ownerOpenId[\s\S]*?loadBotsJson\(\)\.find[\s\S]*?readAllowedUsersResolveCache[\s\S]*?resolvedAllowedUsers\.has\(provenance\.callerOpenId\)[\s\S]*?ownerOpenId: provenance\.callerOpenId,[\s\S]*?ownerUnionId,/);
     expect(cliSource).toMatch(/const fresh = await detectAuthenticatedCurrentSession\(\)[\s\S]*?schedule creator provenance changed before write/);
     expect(cliSource).toMatch(/turnId: provenance\.turnId,[\s\S]*?fresh\.turnId !== authenticatedCur\.turnId/);
     expect(cliSource).toContain('current turn caller does not match the session owner');
+    expect(cliSource).toContain('cannot load bot config for');
+    expect(cliSource).toContain('current turn caller is not an allowed bot operator');
+    expect(cliSource).toContain('cannot resolve the current turn caller union_id');
     expect(cliSource).toMatch(/const executionPosition: 'top-level' \| 'topic' \| 'new-topic' =[\s\S]*?cur\?\.scope/);
     // Group/topic_group sessions default to top-level (never pin results to the
     // topic the schedule was created in — e.g. an adopted one); only p2p keeps
