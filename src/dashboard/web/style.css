@@ -4878,47 +4878,32 @@ td code,
   justify-content: center;
 }
 
-.plugin-global-setting {
-  min-height: 64px;
-  margin: 0;
-  padding: 12px 18px;
-  align-items: center;
-  border-bottom: 1px solid var(--border-soft);
-  background: color-mix(in srgb, var(--accent) 4%, var(--surface));
-}
-
-.plugin-global-setting-copy {
-  min-width: 0;
-  flex: 1;
-  display: grid;
-  gap: 3px;
-}
-
-.plugin-global-setting-copy strong {
-  font-size: 13px;
-  line-height: 1.35;
-}
-
-.plugin-global-setting-copy small {
-  color: var(--muted);
-  font-size: 11px;
-  line-height: 1.4;
-}
-
-.plugin-global-setting input:focus-visible + .switch {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
-.plugin-card-summary {
+.plugin-management-page .plugin-card-summary {
+  width: 100%;
   min-height: 52px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 14px;
   padding: 10px 18px;
+  appearance: none;
+  border: 0;
   border-bottom: 1px solid var(--border-soft);
+  border-radius: 0;
   background: color-mix(in srgb, var(--surface-muted) 38%, transparent);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.plugin-management-page .plugin-card-summary:hover {
+  background: color-mix(in srgb, var(--accent) 5%, var(--surface-muted));
+}
+
+.plugin-management-page .plugin-card-summary:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 .plugin-capability-summary {
@@ -4960,13 +4945,6 @@ td code,
   min-width: 0;
 }
 
-.plugin-settings-pending {
-  padding: 14px 18px;
-  border-bottom: 1px solid var(--border-soft);
-  color: var(--muted);
-  font-size: 12px;
-}
-
 .plugin-enable-panel {
   display: grid;
   gap: 10px;
@@ -4998,6 +4976,27 @@ td code,
   color: var(--muted);
   font-size: 11px;
   line-height: 1.45;
+}
+
+.plugin-global-toggle {
+  flex: none;
+  margin: 0;
+  padding: 0;
+  align-items: center;
+  gap: 9px;
+  cursor: pointer;
+}
+
+.plugin-global-toggle > span:last-child {
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.plugin-global-toggle input:focus-visible + .switch {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .plugin-enable-panel-head > span {
@@ -5545,7 +5544,7 @@ td code,
     justify-content: flex-start;
   }
 
-  .plugin-card-summary {
+  .plugin-management-page .plugin-card-summary {
     display: grid;
   }
 
@@ -5560,11 +5559,11 @@ td code,
 
   .plugin-enable-panel-head {
     display: grid;
-    gap: 5px;
+    gap: 10px;
   }
 
-  .plugin-enable-panel-head > span {
-    padding-top: 0;
+  .plugin-global-toggle {
+    justify-self: start;
   }
 
   .plugin-info-row {
