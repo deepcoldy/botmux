@@ -889,6 +889,8 @@ export const messages: Record<string, string> = {
   'xpi.send.as_marked_suggestion': '已按「留给当前任务」标记：等对方确认后再决定是否采纳。',
   'xpi.send.as_needed_hint': '若这条消息正赶上对方任务在跑，不会打断。需要马上单独做或留给对方时：\n  botmux send --as independent   # 另开任务\n  botmux send --as suggestion    # 留给当前任务',
   'xpi.timeout.unclassified': '未选择处理方式，消息未执行；可重新发送，或 botmux send --as independent。',
+  'xpi.terminal.dropped': '未送达的消息：turn {turnId}，开头「{excerpt}」',
+  'xpi.terminal.dropped_turn_only': '未送达的消息：turn {turnId}',
   'xpi.timeout.still_busy': '原任务仍在执行，且未选择后续处理；消息未执行。可重新发送，或 botmux send --as independent。',
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────

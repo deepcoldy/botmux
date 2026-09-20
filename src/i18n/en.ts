@@ -892,6 +892,8 @@ export const messages: Record<string, string> = {
   'xpi.send.as_marked_suggestion': 'Marked as “leave it for the current task”: the other party will decide whether to take it.',
   'xpi.send.as_needed_hint': 'If this message lands while another member\'s task is running, it will not interrupt them. To choose now:\n  botmux send --as independent   # start a new task\n  botmux send --as suggestion    # leave it for the current task',
   'xpi.timeout.unclassified': 'No choice was made, so the message was not executed. Resend it, or run botmux send --as independent.',
+  'xpi.terminal.dropped': 'Not delivered: turn {turnId}, starting "{excerpt}"',
+  'xpi.terminal.dropped_turn_only': 'Not delivered: turn {turnId}',
   'xpi.timeout.still_busy': 'The original task is still running and no follow-up was chosen, so the message was not executed. Resend it, or run botmux send --as independent.',
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────

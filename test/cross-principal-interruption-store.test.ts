@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   continueCrossPrincipalOwnerWait,
+  crossPrincipalDroppedMessageDigest,
   crossPrincipalInterruptionId,
   crossPrincipalOwnerWaitDisposition,
   markCrossPrincipalSuggestionWaiting,
@@ -116,5 +117,49 @@ describe('cross-principal interruption durable identity', () => {
     continueCrossPrincipalOwnerWait(record, 20_000, 10_000);
     expect(record.ownerWaitDeadlineAt).toBe(30_000);
     expect(record.waitDecisionRound).toBe(1);
+  });
+});
+
+describe('dropped cross-principal message digest', () => {
+  function staged(text: string) {
+    return stageCrossPrincipalInterruptionRecord({
+      session: session(),
+      ownerTurnId: 'om_a',
+      owner,
+      proposer,
+      message: {
+        turnId: 'om_b_1',
+        text,
+        userPrompt: text,
+        createdAt: '2026-09-09T00:01:00.000Z',
+      },
+    }).record;
+  }
+
+  it('names the message by the turn the proposer already knows', () => {
+    const digest = crossPrincipalDroppedMessageDigest(staged('the input'));
+    expect(digest).toEqual({ turnId: 'om_b_1', excerpt: 'the input' });
+  });
+
+  it('collapses newlines so the excerpt stays on one line of the notice', () => {
+    const digest = crossPrincipalDroppedMessageDigest(staged('line one\n\n  line two'));
+    expect(digest?.excerpt).toBe('line one line two');
+  });
+
+  it('truncates only past the limit, so short messages are quoted whole', () => {
+    const long = 'x'.repeat(61);
+    const atLimit = 'y'.repeat(60);
+    expect(crossPrincipalDroppedMessageDigest(staged(long))?.excerpt).toBe(`${'x'.repeat(60)}…`);
+    expect(crossPrincipalDroppedMessageDigest(staged(atLimit))?.excerpt).toBe(atLimit);
+  });
+
+  it('yields an empty excerpt for a whitespace-only body, so the caller can drop the quote', () => {
+    expect(crossPrincipalDroppedMessageDigest(staged('   \n\t '))?.excerpt).toBe('');
+  });
+
+  it('returns undefined when the record carries no message, so the notice is left unchanged', () => {
+    const record = staged('only one');
+    record.messages = [];
+    expect(crossPrincipalDroppedMessageDigest(record)).toBeUndefined();
   });
 });

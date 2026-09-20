@@ -222,6 +222,7 @@ import { sessionConfiguredRuntimeDisplayName } from './core/cli-runtime-display.
 import { isLocalCliOpenReady } from './services/local-cli-opener.js';
 import { RECEIVED_REACTION_EMOJI_TYPE, SUBSTITUTE_RECEIVED_REACTION_EMOJI_TYPE } from './core/pending-response.js';
 import { t as tr, botLocale, localeForBot } from './i18n/index.js';
+import type { Locale } from './i18n/types.js';
 import { createCliAdapterSync } from './adapters/cli/registry.js';
 import {
   initWorkerPool,
@@ -366,6 +367,7 @@ import {
   continueCrossPrincipalOwnerWait,
   crossPrincipalOwnerWaitDisposition,
   markCrossPrincipalSuggestionWaiting,
+  crossPrincipalDroppedMessageDigest,
   stageCrossPrincipalInterruptionRecord,
 } from './core/cross-principal-interruption-store.js';
 import {
@@ -18601,6 +18603,24 @@ async function stageCrossPrincipalInterruption(args: {
   return true;
 }
 
+/** Appends the dropped message's identity to a terminal notice, so the
+ * proposer knows exactly which message to resend. Returns `text` unchanged
+ * when the record carries no message. */
+function withDroppedMessageIdentity(
+  text: string,
+  record: CrossPrincipalInterruption,
+  loc: Locale,
+): string {
+  const digest = crossPrincipalDroppedMessageDigest(record);
+  if (!digest) return text;
+  // A whitespace-only or attachment-only body leaves no excerpt. The turn id
+  // alone still names the message, and beats rendering an empty quote.
+  const line = digest.excerpt
+    ? tr('xpi.terminal.dropped', { turnId: digest.turnId, excerpt: digest.excerpt }, loc)
+    : tr('xpi.terminal.dropped_turn_only', { turnId: digest.turnId }, loc);
+  return `${text}\n${line}`;
+}
+
 async function notifyCrossPrincipalTerminal(
   ds: DaemonSession,
   record: CrossPrincipalInterruption,
@@ -19057,7 +19077,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
       if (record.proposer.senderType === 'bot') {
         if (record.botClassifyDeadlineAt && Date.now() >= record.botClassifyDeadlineAt) {
           removeCrossPrincipalRecord(ds, record.id);
-          await notifyCrossPrincipalTerminal(ds, record, tr('xpi.timeout.unclassified', undefined, loc));
+          await notifyCrossPrincipalTerminal(ds, record, withDroppedMessageIdentity(tr('xpi.timeout.unclassified', undefined, loc), record, loc));
           return;
         }
         if (!record.botClassifyDeadlineAt) {
@@ -19096,7 +19116,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
       if (!current) return;
       if (choice && await applyCrossPrincipalProposerChoice(ds, current, choice)) return;
       removeCrossPrincipalRecord(ds, record.id);
-      await notifyCrossPrincipalTerminal(ds, record, tr('xpi.timeout.unclassified', undefined, loc));
+      await notifyCrossPrincipalTerminal(ds, record, withDroppedMessageIdentity(tr('xpi.timeout.unclassified', undefined, loc), record, loc));
       return;
     }
 
@@ -19129,7 +19149,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
         if (record.proposer.senderType === 'bot') {
           if ((record.waitDecisionRound ?? 0) > 0) {
             removeCrossPrincipalRecord(ds, record.id);
-            await notifyCrossPrincipalTerminal(ds, record, tr('xpi.timeout.still_busy', undefined, loc));
+            await notifyCrossPrincipalTerminal(ds, record, withDroppedMessageIdentity(tr('xpi.timeout.still_busy', undefined, loc), record, loc));
             return;
           }
           await sessionReply(
@@ -19167,7 +19187,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
         await notifyCrossPrincipalTerminal(
           ds,
           record,
-          tr('xpi.timeout.still_busy', undefined, loc),
+          withDroppedMessageIdentity(tr('xpi.timeout.still_busy', undefined, loc), record, loc),
         );
         return;
       }
