@@ -56,6 +56,29 @@ describe('CodexAppCotCollector', () => {
     })).toEqual([{ kind: 'tool_result', id: 'p1', result: '✗' }]);
   });
 
+  it('bounds the complete tool result after adding its status prefix', () => {
+    const collector = new CodexAppCotCollector();
+    const [entry] = collector.observe('item/completed', {
+      item: {
+        id: 'c1',
+        type: 'commandExecution',
+        status: 'completed',
+        exitCode: 0,
+        durationMs: 1_240,
+        aggregatedOutput: 'x'.repeat(1_200),
+      },
+    });
+
+    expect(entry).toMatchObject({ kind: 'tool_result', id: 'c1' });
+    if (entry.kind !== 'tool_result') throw new Error('expected tool_result');
+    expect(entry.result).toHaveLength(1_200);
+    expect(entry.result).toMatch(/\u2026$/);
+    expect(normalizeCodexAppCotMarker({ turnId: 'om_1', entries: [entry] })).toEqual({
+      turnId: 'om_1',
+      entries: [entry],
+    });
+  });
+
   it('does not turn the final answer into a thinking node', () => {
     const collector = new CodexAppCotCollector();
     expect(collector.observe('item/completed', {

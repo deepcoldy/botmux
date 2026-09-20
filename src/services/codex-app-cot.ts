@@ -100,7 +100,11 @@ function toolResult(item: Record<string, unknown>): CotEntry | undefined {
   const output = compactToolOutput(
     item.aggregatedOutput ?? item.result ?? item.contentItems ?? item.output ?? item.error,
   );
-  return { kind: 'tool_result', id, result: output ? `${status}\n${output}` : status };
+  return {
+    kind: 'tool_result',
+    id,
+    result: bounded(output ? `${status}\n${output}` : status, TOOL_RESULT_MAX_CHARS),
+  };
 }
 
 function completedReasoningText(item: Record<string, unknown>): string {
