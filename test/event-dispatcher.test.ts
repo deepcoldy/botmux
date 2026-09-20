@@ -9138,3 +9138,247 @@ describe('im.message.receive_v1 — 免@ 斜杠命令 commandTriggers', () => {
     }));
   });
 });
+
+// ─── im.message.updated_v1：编辑消息补 @ ────────────────────────────────────
+describe('im.message.updated_v1 — 编辑消息补 @（延迟首次 @）', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    handlers = makeHandlers();
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockGetChatMode.mockReset().mockResolvedValue('group');
+    // 路由形态钉死成「顶层 @ → 新话题（thread-scope, anchor=messageId）」，
+    // 与 5194 那个 describe 同构，便于精确断言。
+    setupBotState({
+      allowedUsers: [USER_OPEN_ID],
+      regularGroupReplyMode: 'new-topic',
+    });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  // 编辑事件 payload 不带新正文/mentions（第三方实测字段不可靠），只给 message_id。
+  function makeUpdatedEvent(messageId: string, eventId: string, chatId = 'chat-edit') {
+    return {
+      event_id: eventId,
+      message: { message_id: messageId, chat_id: chatId },
+    };
+  }
+
+  // im.message.get 回读条目：REST 形态（mentions.id 裸字符串、正文在 body.content）。
+  function makeReadbackItem(opts: {
+    messageId: string;
+    chatId?: string;
+    text?: string;
+    /** 模拟飞书「修改」富文本编辑器：text 被 <p> 段落包裹。 */
+    wrapP?: boolean;
+    mentioned?: boolean;
+    senderOpenId?: string;
+    senderType?: string;
+    rootId?: string;
+    threadId?: string;
+  }) {
+    const rawText = opts.text ?? (opts.mentioned ? '@BotA 帮我修一下' : '帮我修一下');
+    return {
+      message_id: opts.messageId,
+      root_id: opts.rootId,
+      thread_id: opts.threadId,
+      chat_id: opts.chatId ?? 'chat-edit',
+      msg_type: 'text',
+      body: { content: JSON.stringify({ text: opts.wrapP ? `<p>${rawText}</p>` : rawText }) },
+      mentions: opts.mentioned
+        ? [{ key: '@_bot_a', name: 'BotA', id: MY_OPEN_ID, id_type: 'open_id' }]
+        : undefined,
+      sender: {
+        id: opts.senderOpenId ?? USER_OPEN_ID,
+        id_type: 'open_id',
+        sender_type: opts.senderType ?? 'user',
+      },
+    };
+  }
+
+  it('事件本身不带 mentions → 回读到补了 @ 的权威消息 → 触发一次新话题', async () => {
+    const messageId = 'om_edit_add_mention';
+    mockGetMessageDetail.mockResolvedValueOnce({ items: [makeReadbackItem({ messageId, mentioned: true })] });
+
+    await capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-edit-1'));
+    await flushEventWork();
+
+    expect(mockGetMessageDetail).toHaveBeenCalledWith(MY_APP_ID, messageId, { userCardContent: false });
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(
+      expect.objectContaining({ sender: expect.objectContaining({ sender_type: 'user' }) }),
+      expect.objectContaining({
+        scope: 'thread',
+        anchor: messageId,
+        messageId,
+        larkAppId: MY_APP_ID,
+      }),
+    );
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  // 飞书「修改」富文本编辑器会把 text 正文存成 <p> 包裹；必须还原，否则字面 HTML
+  // 漏给 CLI，且编辑补 @ 的斜杠命令会因 <p>/solve 前缀判定失效。
+  it('回读到 <p> 包裹的编辑正文 → 解包成纯文本再派发', async () => {
+    const messageId = 'om_edit_p_wrapper';
+    mockGetMessageDetail.mockResolvedValueOnce({
+      items: [makeReadbackItem({ messageId, mentioned: true, text: '@BotA 你好', wrapP: true })],
+    });
+
+    await capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-edit-p'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: expect.objectContaining({ content: JSON.stringify({ text: '@BotA 你好' }) }),
+      }),
+      expect.anything(),
+    );
+  });
+
+  it('多段 <p> → 按换行连接；正文里夹带的裸 <p> 字样不误伤', async () => {
+    const messageId = 'om_edit_p_multi';
+    mockGetMessageDetail.mockResolvedValueOnce({
+      items: [makeReadbackItem({ messageId, mentioned: true, text: '@BotA 第一段</p><p>第二段', wrapP: true })],
+    });
+
+    await capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-edit-p2'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(
+      expect.objectContaining({
+        message: expect.objectContaining({ content: JSON.stringify({ text: '@BotA 第一段\n第二段' }) }),
+      }),
+      expect.anything(),
+    );
+
+    // 正文只是恰好提到 <p> 字样、整体不是段落包裹 → 原样保留。
+    const rawId = 'om_edit_p_literal';
+    mockGetMessageDetail.mockResolvedValueOnce({
+      items: [makeReadbackItem({ messageId: rawId, mentioned: true, text: '@BotA 标签是 <p> 不是 <div>' })],
+    });
+    await capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(rawId, 'evt-edit-p3'));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        message: expect.objectContaining({ content: JSON.stringify({ text: '@BotA 标签是 <p> 不是 <div>' }) }),
+      }),
+      expect.anything(),
+    );
+  });
+
+  it('该消息原本就 @ 过（receive 路径已触发）→ 编辑不再重复触发', async () => {
+    const messageId = 'om_already_mentioned';
+    // 首次到达就是一条 @ 消息（WS 形态）。
+    const original = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA 帮我修一下' }),
+      messageId,
+      chatId: 'chat-edit',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    await capturedHandlers['im.message.receive_v1'](original);
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+
+    // 用户随后编辑这条消息（哪怕内容仍 @），必须被 triggered 幂等挡住。
+    mockGetMessageDetail.mockResolvedValueOnce({ items: [makeReadbackItem({ messageId, mentioned: true })] });
+    await capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-edit-after-at'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+  });
+
+  it('编辑补 @ 触发后再次编辑（新 event_id、同 message_id）→ 仍只触发一次', async () => {
+    const messageId = 'om_edit_twice';
+    mockGetMessageDetail.mockResolvedValue({ items: [makeReadbackItem({ messageId, mentioned: true })] });
+
+    await capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-edit-a'));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+
+    await capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-edit-b'));
+    await flushEventWork();
+
+    expect(mockGetMessageDetail).toHaveBeenCalledTimes(2);
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+  });
+
+  it('回读后仍未 @ 本 bot → 忽略', async () => {
+    const messageId = 'om_edit_no_mention';
+    mockGetMessageDetail.mockResolvedValueOnce({ items: [makeReadbackItem({ messageId, mentioned: false })] });
+
+    await capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-edit-no-at'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('同一事件被飞书重投（event_id 相同）→ 投递层去重，只处理一次', async () => {
+    const messageId = 'om_edit_redeliver';
+    mockGetMessageDetail.mockResolvedValueOnce({ items: [makeReadbackItem({ messageId, mentioned: true })] });
+    const event = makeUpdatedEvent(messageId, 'evt-edit-same');
+
+    await capturedHandlers['im.message.updated_v1'](event);
+    await capturedHandlers['im.message.updated_v1'](event);
+    await flushEventWork();
+
+    expect(mockGetMessageDetail).toHaveBeenCalledOnce();
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+  });
+
+  it('bot/app 编辑自己的消息（含卡片刷新）→ 不当任务触发', async () => {
+    const messageId = 'om_edit_by_bot';
+    mockGetMessageDetail.mockResolvedValueOnce({
+      items: [makeReadbackItem({ messageId, mentioned: true, senderOpenId: OTHER_BOT_OPEN_ID, senderType: 'app' })],
+    });
+
+    await capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-edit-bot'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('回读接口失败 / 回读无内容 / 事件缺 message_id → 安全降级为不触发、不抛错', async () => {
+    mockGetMessageDetail.mockRejectedValueOnce(new Error('boom'));
+    await capturedHandlers['im.message.updated_v1'](makeUpdatedEvent('om_edit_readfail', 'evt-edit-readfail'));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+    mockGetMessageDetail.mockResolvedValueOnce({ items: [] });
+    await capturedHandlers['im.message.updated_v1'](makeUpdatedEvent('om_edit_empty', 'evt-edit-empty'));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+
+    const callsBefore = mockGetMessageDetail.mock.calls.length;
+    await capturedHandlers['im.message.updated_v1']({ event_id: 'evt-edit-noid', message: {} });
+    await flushEventWork();
+    expect(mockGetMessageDetail).toHaveBeenCalledTimes(callsBefore);
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('话题内消息编辑补 @ → 复用完整路由，续到已有话题会话', async () => {
+    const messageId = 'om_edit_in_thread';
+    const rootId = 'om_thread_root';
+    mockGetMessageDetail.mockResolvedValueOnce({
+      items: [makeReadbackItem({ messageId, mentioned: true, rootId, threadId: rootId })],
+    });
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === rootId);
+
+    await capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-edit-thread'));
+    await flushEventWork();
+
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ scope: 'thread', anchor: rootId, messageId }),
+    );
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+});
