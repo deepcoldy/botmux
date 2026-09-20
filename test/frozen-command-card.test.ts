@@ -98,4 +98,17 @@ describe('Frozen Command business cards', () => {
       header: { template: 'grey' },
     });
   });
+
+  it('does not expose internal error codes in failed status cards', () => {
+    const rendered = buildFrozenCommandActionStatusCard({
+      ...action,
+      status: 'failed',
+      errorCode: 'data_mcp_not_enabled',
+    });
+    expect(rendered).toMatchObject({
+      header: { template: 'red', title: { content: '执行失败' } },
+      body: { elements: [{ text: { content: expect.stringContaining('查询未完成') } }] },
+    });
+    expect(JSON.stringify(rendered)).not.toContain('data_mcp_not_enabled');
+  });
 });

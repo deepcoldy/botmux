@@ -163,7 +163,11 @@ export function buildFrozenCommandActionStatusCard(
         ? { title: '确认已过期', template: 'grey', text: '本次确认已过期，请重新发起。' }
         : action.errorCode === 'user_cancelled'
           ? { title: '已取消', template: 'grey', text: `/${action.command} 未执行查询。` }
-        : { title: '执行失败', template: 'red', text: `/${action.command} 未完成${action.errorCode ? `（${action.errorCode}）` : ''}。请重新发起。` };
+        : {
+            title: '执行失败',
+            template: 'red',
+            text: `/${action.command} 查询未完成，请重新发起；如持续失败请联系管理员。`,
+          };
   return {
     schema: '2.0',
     header: { title: { tag: 'plain_text', content: state.title }, template: state.template },
