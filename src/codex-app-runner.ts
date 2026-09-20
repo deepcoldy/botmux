@@ -1241,6 +1241,11 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
   if (msg.method === 'turn/completed') {
     const nativeTurn = params.turn ?? {};
     const completedId = typeof notificationTurnId === 'string' ? notificationTurnId : undefined;
+    if (completedId && browserBroker) {
+      void browserBroker.handleTurnEnded(completedId).catch(error => {
+        writeLine(`[codex-app] browser turn-ended hook failed: ${asError(error).message}`);
+      });
+    }
     if (completedId && nativeActiveTurnId === completedId) nativeActiveTurnId = undefined;
     const turn = activeTurn;
     if (!turn) {
