@@ -13249,6 +13249,96 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
   }
 }
 
+async function postFrozenCommandIntent(body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const larkAppId = body.larkAppId as string;
+  const daemon = findDaemon(larkAppId);
+  if (!daemon) throw new Error(`botmux freeze: 找不到 daemon (larkAppId=${larkAppId})`);
+  const requestBody = { ...body };
+  if (typeof requestBody.originCapability !== 'string') {
+    const claim = readManagedOriginCapability(
+      resolveDataDir(),
+      typeof requestBody.sessionId === 'string' ? requestBody.sessionId : undefined,
+      process.env.BOTMUX_SEND_RELAY,
+      process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+    );
+    if (claim) requestBody.originCapability = claim.capability;
+  }
+  const init = {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(requestBody),
+  } satisfies RequestInit;
+  let hostSecret: string | undefined;
+  if (!process.env.BOTMUX_SEND_RELAY) {
+    try { hostSecret = loadDaemonIpcSecret(); } catch { /* isolated CLI uses marker auth */ }
+  }
+  const response = hostSecret
+    ? await fetchDaemonIpc(daemon.ipcPort, '/api/frozen-command-actions', init, hostSecret)
+    : await loopbackFetch(`http://127.0.0.1:${daemon.ipcPort}/api/frozen-command-actions`, init);
+  const text = await response.text();
+  let parsed: Record<string, unknown>;
+  try { parsed = JSON.parse(text) as Record<string, unknown>; }
+  catch { throw new Error(`botmux freeze: daemon 返回非 JSON (${response.status})`); }
+  if (!response.ok) {
+    throw new Error(`botmux freeze: ${String(parsed.error ?? response.status)}${parsed.detail ? `：${String(parsed.detail)}` : ''}`);
+  }
+  return parsed;
+}
+
+function frozenRawArgs(parts: string[]): string {
+  return parts.map(part => (/\s|["'\\]/u.test(part) ? JSON.stringify(part) : part)).join(' ');
+}
+
+async function cmdFreeze(rest: string[]): Promise<void> {
+  const sub = rest[0] ?? '';
+  if (sub !== 'list' && sub !== 'run') {
+    console.error('用法: botmux freeze list | botmux freeze run /<命令> [参数...]');
+    process.exitCode = 2;
+    return;
+  }
+  const sessionId = process.env.BOTMUX_SESSION_ID;
+  const larkAppId = process.env.BOTMUX_LARK_APP_ID;
+  if (!sessionId || !larkAppId) {
+    console.error('botmux freeze: 只能在 botmux 管理的当前真人消息轮次中使用');
+    process.exitCode = 2;
+    return;
+  }
+  if (process.env.BOTMUX_WORKFLOW === '1') {
+    console.error('botmux freeze: workflow 子任务不能发起真人查询确认');
+    process.exitCode = 2;
+    return;
+  }
+  if (sub === 'run' && !rest[1]) {
+    console.error('用法: botmux freeze run /<命令> [参数...]');
+    process.exitCode = 2;
+    return;
+  }
+  const origin = resolveSessionContext(resolveDataDir(), sessionId);
+  const capability = readManagedOriginCapability(
+    resolveDataDir(),
+    sessionId,
+    process.env.BOTMUX_SEND_RELAY,
+    process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+  )?.capability;
+  try {
+    const result = await postFrozenCommandIntent({
+      sessionId,
+      larkAppId,
+      operation: sub,
+      ...(sub === 'run' ? { command: rest[1], rawArgs: frozenRawArgs(rest.slice(2)) } : {}),
+      ...(origin?.turnId ? { originTurnId: origin.turnId } : {}),
+      ...(origin?.dispatchAttempt !== undefined
+        ? { originDispatchAttempt: origin.dispatchAttempt }
+        : {}),
+      ...(capability ? { originCapability: capability } : {}),
+    });
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 3;
+  }
+}
+
 async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   // Workflow-subagent safety gate (same posture as cmdSend): a CLI running
   // inside a workflow subagent (Slice F) must not surface chat UI. Workflow
@@ -15984,6 +16074,10 @@ switch (command) {
     const { normalizeAskDispatch } = await import('./core/ask-args.js');
     const { sub, rest } = normalizeAskDispatch(process.argv.slice(3));
     await cmdAsk(sub, rest);
+    break;
+  }
+  case 'freeze': {
+    await cmdFreeze(process.argv.slice(3));
     break;
   }
   case 'skill': {

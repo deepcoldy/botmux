@@ -120,9 +120,12 @@ import { migrateOverloadAlertAtStartup } from './services/overload-alert-migrati
 import {
   buildFrozenCommandFallbackPrompt,
   executeFrozenCommand,
+  FrozenCommandError,
   frozenCommandUsage,
   listFrozenCommandSnapshots,
   lookupFrozenCommand,
+  normalizeFrozenCommandArguments,
+  normalizeFrozenCommandName,
   renderFrozenCommandSql,
   shouldFallbackFrozenCommand,
   userFacingFrozenCommandError,
@@ -135,6 +138,24 @@ import {
   reconcileFrozenCommandLifecycleAtStartup,
   type FrozenCommandLifecycleAction,
 } from './services/frozen-command-lifecycle.js';
+import {
+  bindFrozenCommandActionCard,
+  claimFrozenCommandAction,
+  createFrozenCommandAction,
+  expirePendingFrozenCommandAction,
+  expireInterruptedFrozenCommandActions,
+  getFrozenCommandAction,
+  settleFrozenCommandAction,
+  type FrozenCommandActionRecord,
+} from './services/frozen-command-action.js';
+import {
+  buildFrozenCommandActionStatusCard,
+  buildFrozenCommandCenterCard,
+  buildFrozenCommandPreviewCard,
+  FROZEN_COMMAND_ACTION_CANCEL,
+  FROZEN_COMMAND_ACTION_CONFIRM,
+  type FrozenCommandCenterRow,
+} from './im/lark/frozen-command-card.js';
 import * as messageQueue from './services/message-queue.js';
 import { emitHookEvent, emitHookEventLocal, evaluatePromptGate, HOOK_EVENTS, type HookEvent } from './services/hook-runner.js';
 import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.js';
@@ -476,7 +497,7 @@ import {
   type PersistentBackendType,
 } from './core/persistent-backend.js';
 import type { PersistentBackendTarget } from './adapters/backend/types.js';
-import { handleCardAction, runAutoWorktreeCommit } from './im/lark/card-handler.js';
+import { handleCardAction, resolveCardOperatorUnionId, runAutoWorktreeCommit } from './im/lark/card-handler.js';
 import { createPluginCardActionGateway } from './core/plugins/card-actions/gateway.js';
 import { setIssueActivate } from './im/lark/issue-command-deps.js';
 import { startIssueOutboxPump } from './services/issue-outbox-pump.js';
@@ -599,7 +620,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, getGroupStats, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, getGroupStats, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canTalk, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, normalizeDocNativeWatchSubscription, putDocSubscription, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
@@ -6407,12 +6428,189 @@ const handleCodexNotifierCardAction = createCodexNotifierCardActionHandler({
   logError: message => logger.error(message),
 });
 
+async function deliverFrozenCommandActionResult(
+  action: FrozenCommandActionRecord,
+  content: string,
+): Promise<void> {
+  if (action.scope === 'thread') {
+    await sessionReply(action.rootMessageId, content, 'text', action.targetBotId);
+  } else {
+    await sendMessage(action.targetBotId, action.chatId, content, 'text');
+  }
+}
+
+async function patchFrozenCommandActionCard(action: FrozenCommandActionRecord): Promise<void> {
+  if (!action.cardMessageId) return;
+  await updateMessage(
+    action.targetBotId,
+    action.cardMessageId,
+    JSON.stringify(buildFrozenCommandActionStatusCard(action)),
+  );
+}
+
+async function executeClaimedFrozenCommandAction(action: FrozenCommandActionRecord): Promise<void> {
+  let queryId: string | undefined;
+  try {
+    const lookup = lookupFrozenCommand({ workingDir: action.workingDir, command: action.command });
+    if (lookup.kind !== 'found') throw new FrozenCommandError('definition_unavailable', '命令定义已不可用');
+    const lifecycle = evaluateFrozenCommandLifecycle({
+      dataDir: config.session.dataDir,
+      targetBotId: action.targetBotId,
+      workingDir: action.workingDir,
+      command: action.command,
+      snapshot: lookup.snapshot,
+    });
+    if (lifecycle.kind !== 'active'
+      || lifecycle.record.stateRevisionId !== action.revisionId
+      || lifecycle.record.specHash !== action.specHash) {
+      throw new FrozenCommandError('command_revision_changed', '命令版本已变化，请重新发起');
+    }
+    const normalized = normalizeFrozenCommandArguments({
+      definition: lookup.snapshot.definition,
+      rawArgs: action.rawArgs,
+    }).args;
+    if (JSON.stringify(normalized) !== JSON.stringify(action.normalizedArgs)
+      || (lookup.snapshot.definition.datasource ?? '') !== (action.datasource ?? '')) {
+      throw new FrozenCommandError('command_preview_changed', '命令参数或数据源已变化，请重新发起');
+    }
+    const result = await executeFrozenCommand({
+      definition: lookup.snapshot.definition,
+      rawArgs: action.rawArgs,
+      targetLarkAppId: action.targetBotId,
+      botConfig: getBot(action.targetBotId).config,
+      trustedCaller: {
+        requestUserOpenId: action.actorOpenId,
+        requestUserUnionId: action.actorUnionId,
+        requestLarkAppId: action.targetBotId,
+        senderType: 'user',
+      },
+      turnId: `frozen-action:${action.id}`,
+      dataDir: config.session.dataDir,
+    });
+    queryId = result.queryId;
+    if (!queryId) throw new FrozenCommandError('query_id_missing', '查询完成状态缺少 query_id，已按失败留档');
+    const settled = settleFrozenCommandAction({
+      dataDir: config.session.dataDir,
+      id: action.id,
+      status: 'completed',
+      queryId,
+    });
+    if (!settled) throw new Error('action_settlement_conflict');
+    const completed = getFrozenCommandAction(config.session.dataDir, action.id);
+    if (!completed) throw new Error('action_record_missing_after_completion');
+    await Promise.allSettled([
+      patchFrozenCommandActionCard(completed),
+      deliverFrozenCommandActionResult(completed, result.text),
+    ]);
+  } catch (error) {
+    const errorCode = error instanceof FrozenCommandError ? error.code : 'execution_failed';
+    const settled = settleFrozenCommandAction({
+      dataDir: config.session.dataDir,
+      id: action.id,
+      status: 'failed',
+      ...(queryId ? { queryId } : {}),
+      errorCode,
+    });
+    const failed = getFrozenCommandAction(config.session.dataDir, action.id)
+      ?? { ...action, status: 'failed' as const, errorCode };
+    logger.warn(`[frozen-action:${action.id}] failed: ${error instanceof Error ? error.message : String(error)}`);
+    if (settled) {
+      await Promise.allSettled([
+        patchFrozenCommandActionCard(failed),
+        deliverFrozenCommandActionResult(
+          failed,
+          `固化命令执行失败：${userFacingFrozenCommandError(error)}（不会回退模型）`,
+        ),
+      ]);
+    }
+  }
+}
+
+async function handleFrozenCommandCardAction(
+  data: CardActionData,
+  larkAppId: string,
+): Promise<Record<string, unknown>> {
+  const value = data.action?.value;
+  const actionKind = value?.action;
+  const id = value?.transition_id;
+  const nonce = value?.nonce;
+  const cardMessageId = data.context?.open_message_id ?? data.open_message_id;
+  if ((actionKind !== FROZEN_COMMAND_ACTION_CONFIRM && actionKind !== FROZEN_COMMAND_ACTION_CANCEL)
+    || !id || !nonce || !cardMessageId) {
+    return { toast: { type: 'error', content: '确认卡信息不完整，请重新发起' } };
+  }
+  const pending = getFrozenCommandAction(config.session.dataDir, id);
+  if (!pending || pending.targetBotId !== larkAppId) {
+    return { toast: { type: 'error', content: '确认已失效，请重新发起' } };
+  }
+  const actualChatId = await getMessageChatId(larkAppId, cardMessageId);
+  if (!actualChatId || actualChatId !== pending.chatId) {
+    return { toast: { type: 'error', content: '确认卡位置校验失败' } };
+  }
+  const operator = await resolveCardOperatorUnionId(data, larkAppId);
+  if (!operator.openId || !operator.unionId
+    || operator.openId !== pending.actorOpenId
+    || operator.unionId !== pending.actorUnionId
+    || !canTalk(larkAppId, pending.chatId, operator.openId, undefined, operator.unionId, pending.chatType)) {
+    return { toast: { type: 'error', content: '仅原消息的同一真人且仍有查询权限时可以确认' } };
+  }
+  const claimed = claimFrozenCommandAction({
+    dataDir: config.session.dataDir,
+    id,
+    nonce,
+    targetBotId: larkAppId,
+    cardMessageId,
+    chatId: actualChatId,
+    actorOpenId: operator.openId,
+    actorUnionId: operator.unionId,
+    callbackEventId: data.event_id ?? data.header?.event_id ?? data.event?.event_id ?? data.uuid,
+  });
+  if (claimed.kind === 'rejected') {
+    return { toast: { type: 'error', content: '确认卡绑定校验失败' } };
+  }
+  if (claimed.kind === 'expired') {
+    return { card: { type: 'raw', data: buildFrozenCommandActionStatusCard(claimed.record) } };
+  }
+  if (claimed.kind === 'already') {
+    return {
+      card: { type: 'raw', data: buildFrozenCommandActionStatusCard(claimed.record) },
+      toast: { type: 'info', content: claimed.record.status === 'executing' ? '正在处理中' : '该操作已经结算' },
+    };
+  }
+  if (actionKind === FROZEN_COMMAND_ACTION_CANCEL) {
+    settleFrozenCommandAction({
+      dataDir: config.session.dataDir,
+      id,
+      status: 'failed',
+      errorCode: 'user_cancelled',
+    });
+    const cancelled = getFrozenCommandAction(config.session.dataDir, id)
+      ?? { ...claimed.record, status: 'failed' as const, errorCode: 'user_cancelled' };
+    return {
+      card: { type: 'raw', data: buildFrozenCommandActionStatusCard(cancelled) },
+      toast: { type: 'info', content: '已取消，本次未执行查询' },
+    };
+  }
+  // Claim is durably executing before the callback ACK. Detached work never
+  // retries after restart; an interrupted row is terminalized at next boot.
+  setImmediate(() => {
+    void executeClaimedFrozenCommandAction(claimed.record).catch(error => {
+      logger.error(`[frozen-action:${claimed.record.id}] detached failure: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  });
+  return {
+    card: { type: 'raw', data: buildFrozenCommandActionStatusCard(claimed.record) },
+    toast: { type: 'info', content: '已确认，正在执行一次查询' },
+  };
+}
+
 const cardDeps: CardHandlerDeps = {
   activeSessions,
   sessionReply,
   lastRepoScan,
   vcMeetingCardAction: (data, appId) => handleVcMeetingCardAction(data, appId),
   codexNotifierCardAction: (data, appId) => handleCodexNotifierCardAction(data, appId),
+  frozenCommandCardAction: (data, appId) => handleFrozenCommandCardAction(data, appId),
   v3GateDeps: {
     driveRun: (runId) => v3GateRunner.driveDetached(runId),
     // 审批权限：复用 canOperate（话题 owner / allowedUsers / oncall）。无 binding（corrupt /
@@ -7214,6 +7412,279 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
     },
   );
 }
+
+function frozenCommandCenterRows(
+  targetBotId: string,
+  workingDir: string,
+): FrozenCommandCenterRow[] {
+  const rows = listFrozenCommandSnapshots(workingDir);
+  const seen = new Set<string>();
+  const result = rows.map((row): FrozenCommandCenterRow => {
+    seen.add(row.command);
+    const gate = evaluateFrozenCommandLifecycle({
+      dataDir: config.session.dataDir,
+      targetBotId,
+      workingDir,
+      command: row.command,
+      ...(row.snapshot ? { snapshot: row.snapshot } : {}),
+    });
+    if (gate.kind === 'retired') {
+      return {
+        command: row.command,
+        state: 'retired',
+        reason: gate.record.tombstonePayload?.reason,
+      };
+    }
+    if (gate.kind === 'revoked') return { command: row.command, state: 'revoked' };
+    if (gate.kind === 'fail_closed') {
+      return {
+        command: row.command,
+        state: gate.record ? 'invalid' : 'unapproved',
+        reason: gate.reason,
+      };
+    }
+    if (!row.snapshot || row.error) {
+      return { command: row.command, state: 'invalid', reason: row.error?.message ?? '定义不可用' };
+    }
+    const definition = row.snapshot.definition;
+    return {
+      command: row.command,
+      usage: frozenCommandUsage(definition),
+      description: definition.description,
+      datasource: definition.datasource,
+      state: gate.kind === 'active' ? 'active' : 'unapproved',
+      ...(gate.kind === 'legacy' ? { reason: '尚未完成宿主批准，不能从命令中心运行' } : {}),
+    };
+  });
+  for (const record of listFrozenCommandLifecycleRecords({
+    dataDir: config.session.dataDir,
+    targetBotId,
+    workingDir,
+  })) {
+    if (seen.has(record.command) || record.state === 'active') continue;
+    result.push({
+      command: record.command,
+      state: record.state,
+      ...(record.tombstonePayload?.reason ? { reason: record.tombstonePayload.reason } : {}),
+    });
+  }
+  return result.sort((left, right) => left.command.localeCompare(right.command, 'zh-CN'));
+}
+
+interface FrozenCommandIntentBody {
+  sessionId: string;
+  larkAppId: string;
+  operation: 'list' | 'run';
+  command?: string;
+  rawArgs?: string;
+  originTurnId: string;
+  originDispatchAttempt: number;
+  originCapability: string;
+}
+
+function parseFrozenCommandIntentBody(raw: unknown): FrozenCommandIntentBody | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)
+    || !Object.keys(raw as Record<string, unknown>).every(key => new Set([
+    'sessionId', 'larkAppId', 'operation', 'command', 'rawArgs',
+    'originTurnId', 'originDispatchAttempt', 'originCapability',
+    ]).has(key))
+    || ['__proto__', 'prototype', 'constructor'].some(key => Object.hasOwn(raw, key))) return undefined;
+  const value = raw as Record<string, unknown>;
+  if (typeof value.sessionId !== 'string'
+    || typeof value.larkAppId !== 'string'
+    || (value.operation !== 'list' && value.operation !== 'run')
+    || typeof value.originTurnId !== 'string'
+    || !Number.isSafeInteger(value.originDispatchAttempt)
+    || Number(value.originDispatchAttempt) <= 0
+    || typeof value.originCapability !== 'string') return undefined;
+  if (value.operation === 'run'
+    && (typeof value.command !== 'string' || typeof value.rawArgs !== 'string')) return undefined;
+  return value as unknown as FrozenCommandIntentBody;
+}
+
+export const __testOnly_parseFrozenCommandIntentBody = parseFrozenCommandIntentBody;
+
+// `botmux freeze list|run` is a model-facing intent transport, not an
+// authorization surface. The daemon binds it to the exact current human turn
+// and creates a host-owned card action; model-provided identity/chat fields are
+// rejected by the exact-key parser above.
+ipcRoute('POST', '/api/frozen-command-actions', async (req, res) => {
+  let raw: unknown;
+  try { raw = await readJsonBody<unknown>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const body = parseFrozenCommandIntentBody(raw);
+  if (!body) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
+  const ds = findActiveBySessionId(body.sessionId);
+  const verified = authorizeSessionScopedIpc({
+    // Even a host-HMAC request must present the rotating turn capability. A
+    // model subprocess may be on the host; host locality is not user consent.
+    trustedHost: false,
+    sessionExists: !!ds,
+    receiverSession: !!ds?.session.vcMeetingReceiver,
+    allowReceiver: false,
+    sessionId: body.sessionId,
+    liveOrigin: ds?.managedTurnOrigin,
+    claimedCapability: body.originCapability,
+    claimedTurnId: body.originTurnId,
+    claimedDispatchAttempt: body.originDispatchAttempt,
+  });
+  if (!verified.ok || !ds) {
+    return jsonRes(res, 403, { ok: false, error: verified.ok ? 'session_not_found' : verified.error });
+  }
+  if (body.larkAppId !== ds.larkAppId
+    || ds.managedTurnOrigin?.turnId !== body.originTurnId
+    || ds.managedTurnOrigin.dispatchAttempt !== body.originDispatchAttempt) {
+    return jsonRes(res, 403, { ok: false, error: 'origin_identity_mismatch' });
+  }
+  const origin = ds.activeInteractiveTurn;
+  const actor = origin?.caller;
+  if (!origin
+    || origin.turnId !== body.originTurnId
+    || !origin.sourceContentHash
+    || actor?.senderType !== 'user'
+    || actor.source !== undefined
+    || actor.requestLarkAppId !== ds.larkAppId
+    || !actor.requestUserOpenId?.startsWith('ou_')
+    || !actor.requestUserUnionId?.startsWith('on_')
+    || ds.managedTurnOrigin.callerOpenId !== actor.requestUserOpenId) {
+    return jsonRes(res, 403, { ok: false, error: 'trusted_human_required' });
+  }
+  const configuredDir = ds.workingDir ?? ds.session.workingDir;
+  if (!configuredDir) return jsonRes(res, 409, { ok: false, error: 'working_dir_missing' });
+  let workingDir: string;
+  try { workingDir = realpathSync(configuredDir); }
+  catch { return jsonRes(res, 409, { ok: false, error: 'working_dir_unavailable' }); }
+  const hasTransport = larkTransportEnabled({
+    chatId: ds.chatId,
+    apiOnly: getBot(ds.larkAppId).config.apiOnly,
+  });
+  if (!hasTransport) {
+    return jsonRes(res, 200, {
+      ok: true,
+      status: 'awaiting_input',
+      interaction: 'lark_confirmation_required',
+      operation: body.operation,
+    });
+  }
+  if (body.operation === 'list') {
+    const rows = frozenCommandCenterRows(ds.larkAppId, workingDir);
+    const card = buildFrozenCommandCenterCard({ rows, roleLabel: basename(workingDir) || workingDir });
+    const cardMessageId = await sessionReply(
+      sessionAnchorId(ds), card, 'interactive', ds.larkAppId, body.originTurnId,
+    );
+    return jsonRes(res, 200, {
+      ok: true,
+      status: 'presented',
+      operation: 'list',
+      cardMessageId,
+      commandCount: rows.length,
+    });
+  }
+  const normalizedCommand = normalizeFrozenCommandName(body.command!);
+  if (!normalizedCommand) return jsonRes(res, 400, { ok: false, error: 'invalid_command_name' });
+  const exactMatches = listFrozenCommandSnapshots(workingDir)
+    .filter(row => row.command === normalizedCommand);
+  if (exactMatches.length !== 1) {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: exactMatches.length === 0 ? 'command_not_found' : 'command_ambiguous',
+    });
+  }
+  const lookup = lookupFrozenCommand({ workingDir, command: normalizedCommand });
+  if (lookup.kind !== 'found') {
+    return jsonRes(res, 409, { ok: false, error: lookup.kind === 'invalid' ? lookup.error.code : 'command_not_found' });
+  }
+  const lifecycle = evaluateFrozenCommandLifecycle({
+    dataDir: config.session.dataDir,
+    targetBotId: ds.larkAppId,
+    workingDir,
+    command: normalizedCommand,
+    snapshot: lookup.snapshot,
+  });
+  if (lifecycle.kind !== 'active' || !lifecycle.record.specHash) {
+    return jsonRes(res, 409, { ok: false, error: `command_${lifecycle.kind}` });
+  }
+  let normalizedArgs;
+  try {
+    normalizedArgs = normalizeFrozenCommandArguments({
+      definition: lookup.snapshot.definition,
+      rawArgs: body.rawArgs!,
+    }).args;
+  } catch (error) {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: error instanceof FrozenCommandError ? error.code : 'parameter_invalid',
+      detail: userFacingFrozenCommandError(error),
+    });
+  }
+  const created = createFrozenCommandAction(config.session.dataDir, {
+    targetBotId: ds.larkAppId,
+    chatId: ds.chatId,
+    chatType: ds.chatType,
+    rootMessageId: sessionAnchorId(ds),
+    scope: ds.scope,
+    sessionId: ds.session.sessionId,
+    turnId: body.originTurnId,
+    dispatchAttempt: body.originDispatchAttempt,
+    workingDir,
+    sourceMessageId: body.originTurnId,
+    sourceContentHash: origin.sourceContentHash,
+    intentSchemaVersion: 'botmux.frozen-command-intent.v1',
+    parserVersion: 'frozen-command-args.v1',
+    actorOpenId: actor.requestUserOpenId,
+    actorUnionId: actor.requestUserUnionId,
+    command: normalizedCommand,
+    rawArgs: body.rawArgs!,
+    normalizedArgs,
+    datasource: lookup.snapshot.definition.datasource,
+    specHash: lifecycle.record.specHash,
+    revisionId: lifecycle.record.stateRevisionId,
+  });
+  const card = buildFrozenCommandPreviewCard({
+    action: created.record,
+    nonce: created.nonce,
+    initiatorLabel: '当前消息发送者（本人）',
+  });
+  let cardMessageId: string;
+  try {
+    cardMessageId = await sessionReply(
+      sessionAnchorId(ds), card, 'interactive', ds.larkAppId, body.originTurnId,
+    );
+  } catch (error) {
+    expirePendingFrozenCommandAction({
+      dataDir: config.session.dataDir,
+      id: created.record.id,
+      errorCode: 'card_post_failed',
+    });
+    throw error;
+  }
+  if (!bindFrozenCommandActionCard(config.session.dataDir, created.record.id, cardMessageId)) {
+    expirePendingFrozenCommandAction({
+      dataDir: config.session.dataDir,
+      id: created.record.id,
+      errorCode: 'card_binding_failed',
+    });
+    const expired = getFrozenCommandAction(config.session.dataDir, created.record.id);
+    if (expired) {
+      await updateMessage(
+        ds.larkAppId,
+        cardMessageId,
+        JSON.stringify(buildFrozenCommandActionStatusCard(expired)),
+      ).catch(error => {
+        logger.warn(`[frozen-action:${created.record.id}] failed to expire unbound card: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }
+    return jsonRes(res, 409, { ok: false, error: 'card_binding_failed' });
+  }
+  return jsonRes(res, 200, {
+    ok: true,
+    status: 'awaiting_input',
+    operation: 'run',
+    transitionId: created.record.id,
+    cardMessageId,
+    expiresAt: created.record.expiresAt,
+  });
+});
 
 // ─── botmux ask v0.1.7 IPC route ─────────────────────────────────────────────
 //
@@ -18243,6 +18714,9 @@ function setActiveInteractiveTurn(
     turnId,
     caller: { ...caller },
     ...(userPrompt?.trim() ? { userPrompt } : {}),
+    ...(userPrompt !== undefined
+      ? { sourceContentHash: createHash('sha256').update(userPrompt).digest('hex') }
+      : {}),
     ...(controller ? { controller } : {}),
   };
   ensureAutomaticTaskContinuationLease(ds);
@@ -19200,7 +19674,7 @@ async function driveNextXpiSharedCwdTurn(
     // already accepted the turn: SQLITE_BUSY at that boundary could leave the
     // record durable, let this retry settle behind the live lease, and dispatch
     // the same turn again after the lease is later released.
-    setActiveInteractiveTurn(ds, next.record.turnId, next.record.caller);
+    setActiveInteractiveTurn(ds, next.record.turnId, next.record.caller, next.record.userPrompt);
     beginNewTurn(ds, next.record.userPrompt, next.record.turnId);
     rememberLastCliInput(ds, next.record.userPrompt, next.record.cliInput);
     return true;
@@ -19321,7 +19795,7 @@ function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableB
   }
   rememberLastCliInput(ds, userPrompt, input);
   if (turnId && trustedCaller) {
-    setActiveInteractiveTurn(ds, turnId, trustedCaller);
+    setActiveInteractiveTurn(ds, turnId, trustedCaller, ds.pendingCodexAppText ?? userPrompt);
   }
   ds.pendingTurnId = undefined;
   // A no-project pendingRepo fallback enters forkWorker with `session.queued`
@@ -27023,6 +27497,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   }
   registerBot(cfg);
   selfDaemonLarkAppId = cfg.larkAppId;
+  const interruptedFrozenActions = expireInterruptedFrozenCommandActions(config.session.dataDir, cfg.larkAppId);
+  if (interruptedFrozenActions > 0) {
+    logger.warn(`[frozen-command] marked ${interruptedFrozenActions} interrupted action(s) failed; none were replayed`);
+  }
   const frozenReconcile = reconcileFrozenCommandLifecycleAtStartup({
     dataDir: config.session.dataDir,
     targetBotId: cfg.larkAppId,

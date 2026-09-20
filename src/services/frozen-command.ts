@@ -98,6 +98,13 @@ export interface FrozenCommandExecutionResult {
   referenceDate: string;
   text: string;
   truncated: boolean;
+  queryId?: string;
+}
+
+export interface FrozenCommandNormalizedArgument {
+  name: string;
+  label: string;
+  value: string;
 }
 
 export type FrozenCommandLookup =
@@ -446,7 +453,11 @@ function tokenizeArguments(rawArgs: string): string[] {
   return result;
 }
 
-function encodeParameter(parameter: FrozenCommandParameter, supplied: string | undefined, referenceDate: string): string {
+function resolveParameter(
+  parameter: FrozenCommandParameter,
+  supplied: string | undefined,
+  referenceDate: string,
+): { sql: string; display: string } {
   const value = supplied ?? parameter.default;
   if (value === undefined) throw new FrozenCommandError('parameter_required', `缺少参数：${parameter.label ?? parameter.name}`);
   if (parameter.type === 'integer') {
@@ -458,14 +469,17 @@ function encodeParameter(parameter: FrozenCommandParameter, supplied: string | u
     if (!Number.isSafeInteger(parsed) || parsed < parameter.min || parsed > parameter.max) {
       throw new FrozenCommandError('parameter_integer_out_of_range', `${parameter.label ?? parameter.name} 必须在 ${parameter.min}～${parameter.max} 之间`);
     }
-    return String(parsed);
+    return { sql: String(parsed), display: String(parsed) };
   }
   if (parameter.type === 'enum') {
     const matched = parameter.values.find(candidate => String(candidate) === String(value));
     if (matched === undefined) {
       throw new FrozenCommandError('parameter_invalid_enum', `${parameter.label ?? parameter.name} 只能是：${parameter.values.join('、')}`);
     }
-    return typeof matched === 'number' ? String(matched) : sqlString(matched);
+    return {
+      sql: typeof matched === 'number' ? String(matched) : sqlString(matched),
+      display: String(matched),
+    };
   }
   const resolved = resolveDate(String(value), referenceDate);
   const day = epochDay(resolved);
@@ -475,7 +489,46 @@ function encodeParameter(parameter: FrozenCommandParameter, supplied: string | u
   if (parameter.max && day > epochDay(resolveDate(parameter.max, referenceDate))) {
     throw new FrozenCommandError('parameter_date_out_of_range', `${parameter.label ?? parameter.name} 晚于允许范围`);
   }
-  return sqlString(resolved);
+  return { sql: sqlString(resolved), display: resolved };
+}
+
+function resolveFrozenCommandArguments(input: {
+  definition: FrozenCommandDefinition;
+  rawArgs: string;
+  now?: Date;
+}): {
+  referenceDate: string;
+  encoded: Map<string, string>;
+  normalized: FrozenCommandNormalizedArgument[];
+} {
+  const values = tokenizeArguments(input.rawArgs);
+  if (values.length > input.definition.params.length) {
+    throw new FrozenCommandError('parameter_too_many', `参数过多。用法：${frozenCommandUsage(input.definition)}`);
+  }
+  const referenceDate = referenceDateFor(input.definition.timezone, input.now ?? new Date());
+  const encoded = new Map<string, string>();
+  const normalized = input.definition.params.map((parameter, index) => {
+    const resolved = resolveParameter(parameter, values[index], referenceDate);
+    encoded.set(parameter.name, resolved.sql);
+    return {
+      name: parameter.name,
+      label: parameter.label ?? parameter.name,
+      value: resolved.display,
+    };
+  });
+  return { referenceDate, encoded, normalized };
+}
+
+/** Parse and normalize with the exact same host-owned parser used by SQL
+ * rendering. This is safe to show in confirmation cards and never contains
+ * SQL template bytes. */
+export function normalizeFrozenCommandArguments(input: {
+  definition: FrozenCommandDefinition;
+  rawArgs: string;
+  now?: Date;
+}): { referenceDate: string; args: FrozenCommandNormalizedArgument[] } {
+  const resolved = resolveFrozenCommandArguments(input);
+  return { referenceDate: resolved.referenceDate, args: resolved.normalized };
 }
 
 export function renderFrozenCommandSql(input: {
@@ -483,17 +536,9 @@ export function renderFrozenCommandSql(input: {
   rawArgs: string;
   now?: Date;
 }): { sql: string; referenceDate: string } {
-  const values = tokenizeArguments(input.rawArgs);
-  if (values.length > input.definition.params.length) {
-    throw new FrozenCommandError('parameter_too_many', `参数过多。用法：${frozenCommandUsage(input.definition)}`);
-  }
-  const referenceDate = referenceDateFor(input.definition.timezone, input.now ?? new Date());
-  const encoded = new Map<string, string>();
-  input.definition.params.forEach((parameter, index) => {
-    encoded.set(parameter.name, encodeParameter(parameter, values[index], referenceDate));
-  });
-  const sql = input.definition.sql.replace(PLACEHOLDER_RE, (_full, name: string) => encoded.get(name)!);
-  return { sql, referenceDate };
+  const resolved = resolveFrozenCommandArguments(input);
+  const sql = input.definition.sql.replace(PLACEHOLDER_RE, (_full, name: string) => resolved.encoded.get(name)!);
+  return { sql, referenceDate: resolved.referenceDate };
 }
 
 function redactSqlFields(value: unknown): unknown {
@@ -663,6 +708,7 @@ export async function executeFrozenCommand(input: {
       },
     }, undefined, { signal: controller.signal, maxTotalTimeout: timeoutMs }) as Record<string, unknown>;
     if (runResult.isError === true) downstreamFailure('run', runResult);
+    const queryId = findKey(runResult, 'query_id');
     const raw = frozenCommandResultText(runResult) || '查询完成，但没有可展示的结果。';
     const decorated = `${input.definition.output.prefix ?? ''}${raw}${input.definition.output.suffix ?? ''}`;
     const truncated = decorated.length > input.definition.output.maxChars;
@@ -673,6 +719,7 @@ export async function executeFrozenCommand(input: {
         ? `${decorated.slice(0, input.definition.output.maxChars)}\n\n（结果已截断）`
         : decorated,
       truncated,
+      ...(queryId ? { queryId } : {}),
     };
   } catch (error) {
     if (error instanceof FrozenCommandError) throw error;

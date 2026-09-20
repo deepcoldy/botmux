@@ -825,6 +825,10 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // forge readiness or an ask for that session.
   if (method === 'POST' && pathname === '/api/session-ready') return true;
   if (method === 'POST' && pathname === '/api/asks') return true;
+  // Natural-language Frozen Command actions are authenticated by the same
+  // rotating per-turn capability, then rebound to the daemon-owned actor
+  // snapshot. The handler never trusts caller-selected bot/chat/identity.
+  if (method === 'POST' && pathname === '/api/frozen-command-actions') return true;
   // botmux slash / botmux role switch（角色切换）/ botmux delete（关闭自身）：合法调用方
   // 是会话内的 CLI 自身，沙箱 / 读隔离下读不到 host secret。handler 内验证
   // 该会话的 rotating per-turn

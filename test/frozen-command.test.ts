@@ -12,6 +12,7 @@ import {
   lookupFrozenCommand,
   isTransientDataMcpFailure,
   normalizeFrozenCommandName,
+  normalizeFrozenCommandArguments,
   renderFrozenCommandSql,
   shouldFallbackFrozenCommand,
   userFacingFrozenCommandError,
@@ -72,6 +73,9 @@ describe('Frozen Commands definition and positional UX', () => {
     expect(frozenCommandUsage(definition)).toBe('/泰国上账 [天数]');
     expect(renderFrozenCommandSql({ definition, rawArgs: '' }).sql).toContain('today() - 7');
     expect(renderFrozenCommandSql({ definition, rawArgs: '30' }).sql).toContain('today() - 30');
+    expect(normalizeFrozenCommandArguments({ definition, rawArgs: '30' }).args).toEqual([
+      { name: 'days', label: '天数', value: '30' },
+    ]);
   });
 
   it('rejects range explosions before Data MCP is called', () => {
