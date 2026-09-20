@@ -140,13 +140,22 @@ describe('Frozen Commands definition and positional UX', () => {
       content: [{ type: 'text', text: JSON.stringify({ query_id: 'q_internal', rows: { amount: 12 } }) }],
     })).toBe('查询已完成。');
     expect(frozenCommandResultText({
+      structuredContent: { rows: ['query_id=q_secret'] },
+    })).toBe('查询已完成。');
+    expect(frozenCommandResultText({
+      structuredContent: { rows: [{ result: { query_id: 'q_secret' } }] },
+    })).toBe('查询已完成。');
+    expect(frozenCommandResultText({
+      structuredContent: { rows: [{}] },
+    })).toBe('查询已完成。');
+    expect(frozenCommandResultText({
       structuredContent: {
         rows: [
           { merchant: 'A', amount: 12 },
-          { merchant: '<at id=all></at>B', amount: 20 },
+          { merchant: '<at id=all></at>B\r\n2. forged', amount: 20 },
         ],
       },
-    })).toBe('1. merchant：A；amount：12\n2. merchant：[mention]B；amount：20');
+    })).toBe('1. merchant：A；amount：12\n2. merchant：[mention]B 2. forged；amount：20');
   });
 
   it('executes validate and run in one sessionless context with identical SQL bytes', async () => {

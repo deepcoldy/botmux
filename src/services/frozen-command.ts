@@ -608,6 +608,7 @@ export function frozenCommandResultText(result: Record<string, unknown>): string
     .replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[mention]')
     .replace(/<at\b[^>]*\/?>/gi, '[mention]')
     .replace(/<\/at>/gi, '')
+    .replace(/[\t\r\n\u2028\u2029]+/g, ' ')
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '�');
   const candidates: unknown[] = [result.structuredContent];
   for (const item of Array.isArray(result.content) ? result.content : []) {
@@ -617,12 +618,22 @@ export function frozenCommandResultText(result: Record<string, unknown>): string
   }
   candidates.push(result);
   const payload = candidates.find(candidate => isPlainObject(candidate)
-    && (Array.isArray(candidate.rows) || Array.isArray(candidate.data)));
+    && (Object.hasOwn(candidate, 'rows') || Object.hasOwn(candidate, 'data')));
   if (!isPlainObject(payload)) return '查询已完成。';
 
-  const rawRows = Array.isArray(payload.rows) ? payload.rows : payload.data;
-  if (!Array.isArray(rawRows) || rawRows.length === 0) return '查询完成，未找到符合条件的数据。';
-  const rows: Array<Record<string, unknown>> = rawRows.map(row => isPlainObject(row) ? row : { '结果': row });
+  const rawRows = Object.hasOwn(payload, 'rows') ? payload.rows : payload.data;
+  if (!Array.isArray(rawRows)) return '查询已完成。';
+  if (rawRows.length === 0) return '查询完成，未找到符合条件的数据。';
+  if (rawRows.some(row => !isPlainObject(row))) return '查询已完成。';
+  const rows = rawRows as Array<Record<string, unknown>>;
+  if (rows.some(row => Object.keys(row).length === 0)) return '查询已完成。';
+  const isDisplayScalar = (value: unknown): boolean => value === null
+    || value === undefined
+    || typeof value === 'string'
+    || typeof value === 'number'
+    || typeof value === 'boolean'
+    || typeof value === 'bigint';
+  if (rows.some(row => Object.values(row).some(value => !isDisplayScalar(value)))) return '查询已完成。';
   const columnLabels = new Map<string, string>();
   if (Array.isArray(payload.columns)) {
     for (const column of payload.columns) {
@@ -639,7 +650,7 @@ export function frozenCommandResultText(result: Record<string, unknown>): string
     if (value === null || value === undefined) return '—';
     if (typeof value === 'string') return safeText(value);
     if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
-    try { return safeText(JSON.stringify(value)); } catch { return safeText(String(value)); }
+    return '—';
   };
   if (rows.length === 1 && keys.length === 1) return formatValue(rows[0]![keys[0]!]);
   const renderRow = (row: Record<string, unknown>): string => keys
