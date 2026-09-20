@@ -3706,24 +3706,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
               </label>
             ))}
           </div>
-          <div className="bd-row">
-            <label>
-              <span>{tr('botDefaults.triggerUserAuthFallback')}</span>
-              <select
-                data-input="triggerUserAuthFallback"
-                value={fallback}
-                disabled={busy}
-                onChange={event => void save({
-                  enabled: true,
-                  tools,
-                  fallback: event.currentTarget.value as 'bot-identity' | 'none',
-                })}
-              >
-                <option value="bot-identity">{tr('botDefaults.triggerUserAuthFallbackBot')}</option>
-                <option value="none">{tr('botDefaults.triggerUserAuthFallbackNone')}</option>
-              </select>
-            </label>
-          </div>
+          <p className="bd-section-note">{tr('botDefaults.triggerUserAuthFallbackNote')}</p>
           {tools.includes('bytedcli') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
           ) : null}
