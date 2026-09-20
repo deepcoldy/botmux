@@ -55,12 +55,6 @@ const CRASH_DASHBOARD = `
 process.exit(1);
 `;
 
-const GRACEFUL_DASHBOARD = `
-// A dashboard that exits 90 (the graceful sentinel) on its own after a beat —
-// the supervisor must NOT restart it (operator-initiated shutdown semantics).
-setTimeout(() => process.exit(90), 100);
-`;
-
 describe('dashboard launcher — wiring (pure, no HOME)', () => {
   it('resolveDashboardSpec is a dashboard-entry member named botmux-dashboard, no bot index', () => {
     const spec = resolveDashboardSpec();

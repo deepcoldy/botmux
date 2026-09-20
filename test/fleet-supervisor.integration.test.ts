@@ -168,30 +168,41 @@ describe('FleetSupervisor (live, integration)', () => {
 
   it('relaunches a live daemon that exits 90 after an EXTERNAL SIGTERM (pkill-like)', async () => {
     // Faithful repro of the recorded incident: an outsider signals the daemon
-    // directly (no stopAll, no stop-bot); the daemon finishes its graceful
-    // SIGTERM handler and exits 90. The supervisor did not request it → the
+    // directly (no stopAll, no stop-bot); the daemon's installed SIGTERM
+    // handler runs and it exits 90. The supervisor did not request it → the
     // member must come back, not retire itself.
     const root = tmp();
     const statePath = join(root, 'fleet.json');
+    // The fixture writes this beat immediately AFTER registering its SIGTERM
+    // handler, and we wait for THAT rather than for the supervisor's online
+    // row. The supervisor persists status=online the instant spawn() returns —
+    // before the child executes any JS, hence before its handler is installed.
+    // Signalling at that instant lands pre-handler, so the child dies by the
+    // default SIGTERM action (code=null, signal=SIGTERM): a shape the OLD code
+    // already crash-restarted, which let this test stay green even with the
+    // bug restored (it covered nothing of the 90 path). With this ready gate
+    // the signal is guaranteed to be handled; measured on both node and bun,
+    // the child then exits with code 90 (bun's file bootstrap is just slower).
+    const readyBeat = join(root, 'sigterm-handler-ready.txt');
+    const SIGTERM_READY = `
+process.on('SIGTERM', () => process.exit(90));
+require('fs').writeFileSync(${JSON.stringify(readyBeat)}, 'ready');
+setInterval(() => {}, 1000);
+`;
     const sup = new FleetSupervisor({
-      statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root,
+      statePath, distDir: fakeDist(root, SIGTERM_READY), daemonEnv: {}, cwd: root,
       policy: { maxRestarts: 10, restartDelayMs: 20 }, log: () => {},
     });
     sup.start([bots[0]]);
-    let firstPid = 0;
-    const online = await waitFor(() => {
-      const p = readFleetState(statePath)?.procs[0];
-      if (p && p.status === 'online' && p.pid > 1) { firstPid = p.pid; return true; }
-      return false;
-    });
-    expect(online).toBe(true);
+    const ready = await waitFor(() => existsSync(readyBeat), 10_000);
+    expect(ready).toBe(true);
+    const firstPid = readFleetState(statePath)?.procs[0]?.pid ?? 0;
     expect(firstPid).toBeGreaterThan(1);
 
     process.kill(firstPid, 'SIGTERM'); // exactly what `pkill -f index-daemon.js` does
 
-    // Under node the child's SIGTERM handler exits 90 (the sentinel shape from
-    // the recorded incident); under bun the child may die with signal=SIGTERM.
-    // EITHER shape must self-heal when the supervisor did not request the stop.
+    // The installed handler ran → code 90 with no supervisor-initiated stop;
+    // that unsolicited sentinel must self-heal (a fresh pid, restart counted).
     const healed = await waitFor(() => {
       const p = readFleetState(statePath)?.procs[0];
       return !!p && p.status === 'online' && p.pid !== firstPid && p.pid > 1 && p.restarts >= 1;
