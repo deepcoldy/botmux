@@ -426,6 +426,7 @@ export function ipcRoute(method: string, path: string, handler: Handler): void {
 export async function __testOnly_dispatchFrozenCommandActionRoute(
   req: IncomingMessage,
   res: ServerResponse,
+  options: { trustedHost?: boolean } = {},
 ): Promise<boolean> {
   const method = 'POST';
   const pathname = '/api/frozen-command-actions';
@@ -438,7 +439,12 @@ export async function __testOnly_dispatchFrozenCommandActionRoute(
     route.keys.forEach((key, keyIndex) => {
       params[key] = decodeURIComponent(match[keyIndex + 1] ?? '');
     });
-    await route.handler(req, res, params);
+    if (options.trustedHost) trustedHostRequests.add(req);
+    try {
+      await route.handler(req, res, params);
+    } finally {
+      if (options.trustedHost) trustedHostRequests.delete(req);
+    }
     return true;
   }
   return false;

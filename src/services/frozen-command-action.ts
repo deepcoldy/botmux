@@ -20,6 +20,7 @@ export interface FrozenCommandActionRecord {
   scope: 'thread' | 'chat';
   sessionId: string;
   turnId: string;
+  /** Positive for managed dispatches; zero denotes an ordinary human IM turn. */
   dispatchAttempt: number;
   workingDir: string;
   sourceMessageId: string;

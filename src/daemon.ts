@@ -7480,8 +7480,8 @@ interface FrozenCommandIntentBody {
   command?: string;
   rawArgs?: string;
   originTurnId: string;
-  originDispatchAttempt: number;
-  originCapability: string;
+  originDispatchAttempt?: number;
+  originCapability?: string;
 }
 
 function parseFrozenCommandIntentBody(raw: unknown): FrozenCommandIntentBody | undefined {
@@ -7496,9 +7496,12 @@ function parseFrozenCommandIntentBody(raw: unknown): FrozenCommandIntentBody | u
     || typeof value.larkAppId !== 'string'
     || (value.operation !== 'list' && value.operation !== 'run')
     || typeof value.originTurnId !== 'string'
-    || !Number.isSafeInteger(value.originDispatchAttempt)
-    || Number(value.originDispatchAttempt) <= 0
-    || typeof value.originCapability !== 'string') return undefined;
+    || value.originTurnId.length === 0
+    || (value.originDispatchAttempt !== undefined
+      && (!Number.isSafeInteger(value.originDispatchAttempt)
+        || Number(value.originDispatchAttempt) <= 0))
+    || (value.originCapability !== undefined
+      && typeof value.originCapability !== 'string')) return undefined;
   if (value.operation === 'run'
     && (typeof value.command !== 'string' || typeof value.rawArgs !== 'string')) return undefined;
   return value as unknown as FrozenCommandIntentBody;
@@ -7517,10 +7520,14 @@ ipcRoute('POST', '/api/frozen-command-actions', async (req, res) => {
   const body = parseFrozenCommandIntentBody(raw);
   if (!body) return jsonRes(res, 400, { ok: false, error: 'bad_request' });
   const ds = findActiveBySessionId(body.sessionId);
+  const trustedHost = isTrustedHostIpcRequest(req);
   const verified = authorizeSessionScopedIpc({
-    // Even a host-HMAC request must present the rotating turn capability. A
-    // model subprocess may be on the host; host locality is not user consent.
-    trustedHost: false,
+    // Read-isolated callers prove the exact live turn with the rotating
+    // capability. Host tool runners may be outside the CLI process tree and
+    // have no origin channel; HMAC authenticates the host transport, while the
+    // explicit checks below still bind the request to both authoritative live
+    // turn snapshots. The model never supplies actor/chat identity.
+    trustedHost,
     sessionExists: !!ds,
     receiverSession: !!ds?.session.vcMeetingReceiver,
     allowReceiver: false,
@@ -7533,11 +7540,21 @@ ipcRoute('POST', '/api/frozen-command-actions', async (req, res) => {
   if (!verified.ok || !ds) {
     return jsonRes(res, 403, { ok: false, error: verified.ok ? 'session_not_found' : verified.error });
   }
-  if (body.larkAppId !== ds.larkAppId
-    || ds.managedTurnOrigin?.turnId !== body.originTurnId
-    || ds.managedTurnOrigin.dispatchAttempt !== body.originDispatchAttempt) {
+  const liveOrigin = ds.managedTurnOrigin;
+  if (!liveOrigin
+    || body.larkAppId !== ds.larkAppId
+    || liveOrigin.turnId !== body.originTurnId
+    || (!trustedHost
+      && liveOrigin.dispatchAttempt !== body.originDispatchAttempt)
+    || (trustedHost
+      && body.originDispatchAttempt !== undefined
+      && liveOrigin.dispatchAttempt !== body.originDispatchAttempt)) {
     return jsonRes(res, 403, { ok: false, error: 'origin_identity_mismatch' });
   }
+  // Ordinary human IM turns intentionally have no managed dispatch attempt;
+  // positive attempts belong to managed/bot dispatches. Persist zero as the
+  // explicit human-turn sentinel so the action audit never invents an attempt.
+  const boundDispatchAttempt = liveOrigin.dispatchAttempt ?? 0;
   const origin = ds.activeInteractiveTurn;
   const actor = origin?.caller;
   if (!origin
@@ -7548,7 +7565,7 @@ ipcRoute('POST', '/api/frozen-command-actions', async (req, res) => {
     || actor.requestLarkAppId !== ds.larkAppId
     || !actor.requestUserOpenId?.startsWith('ou_')
     || !actor.requestUserUnionId?.startsWith('on_')
-    || ds.managedTurnOrigin.callerOpenId !== actor.requestUserOpenId) {
+    || liveOrigin.callerOpenId !== actor.requestUserOpenId) {
     return jsonRes(res, 403, { ok: false, error: 'trusted_human_required' });
   }
   const configuredDir = ds.workingDir ?? ds.session.workingDir;
@@ -7627,7 +7644,7 @@ ipcRoute('POST', '/api/frozen-command-actions', async (req, res) => {
     scope: ds.scope,
     sessionId: ds.session.sessionId,
     turnId: body.originTurnId,
-    dispatchAttempt: body.originDispatchAttempt,
+    dispatchAttempt: boundDispatchAttempt,
     workingDir,
     sourceMessageId: body.originTurnId,
     sourceContentHash: origin.sourceContentHash,

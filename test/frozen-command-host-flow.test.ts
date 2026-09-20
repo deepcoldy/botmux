@@ -339,6 +339,47 @@ async function postIntent(ds: any, rawArgs = '11') {
   return res;
 }
 
+async function postHostIntent(
+  ds: any,
+  input: { operation?: 'list' | 'run'; rawArgs?: string; turnId?: string } = {},
+) {
+  const operation = input.operation ?? 'run';
+  const body = {
+    sessionId: ds.session.sessionId,
+    larkAppId: APP,
+    operation,
+    ...(operation === 'run'
+      ? { command: COMMAND, rawArgs: input.rawArgs ?? '11' }
+      : {}),
+    originTurnId: input.turnId ?? ds.managedTurnOrigin.turnId,
+  };
+  const req = Readable.from([JSON.stringify(body)]) as unknown as IncomingMessage;
+  const res = new JsonResponse();
+  const found = await modules.ipc.__testOnly_dispatchFrozenCommandActionRoute(
+    req,
+    res as unknown as ServerResponse,
+    { trustedHost: true },
+  );
+  expect(found).toBe(true);
+  return res;
+}
+
+async function postUntrustedIntentWithoutCapability(ds: any) {
+  const req = Readable.from([JSON.stringify({
+    sessionId: ds.session.sessionId,
+    larkAppId: APP,
+    operation: 'list',
+    originTurnId: ds.managedTurnOrigin.turnId,
+  })]) as unknown as IncomingMessage;
+  const res = new JsonResponse();
+  const found = await modules.ipc.__testOnly_dispatchFrozenCommandActionRoute(
+    req,
+    res as unknown as ServerResponse,
+  );
+  expect(found).toBe(true);
+  return res;
+}
+
 function latestPreviewAction(): { action: string; transition_id: string; nonce: string } {
   const parsed = JSON.parse(mocks.cardBodies.at(-1)!) as any;
   return parsed.body.elements.find((element: any) => element.tag === 'action').actions[0].value;
@@ -416,7 +457,7 @@ beforeEach(async () => {
     token: pending.token,
     actor: { openId: ACTOR_OPEN_ID, unionId: ACTOR_UNION_ID },
   });
-});
+}, 30_000);
 
 afterEach(() => {
   modules?.daemon.__testOnly_activeSessions.clear();
@@ -426,6 +467,56 @@ afterEach(() => {
 });
 
 describe('Frozen Command host-owned route → callback → Data MCP flow', () => {
+  it('allows a trusted host tool runner to list using the exact active turn without a capability file', async () => {
+    const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '查看固化命令' });
+    const response = await postHostIntent(ds, { operation: 'list' });
+    expect(response.statusCode).toBe(200);
+    expect(response.payload).toMatchObject({ status: 'presented', operation: 'list' });
+    expect(mocks.cardBodies).toHaveLength(1);
+    expect(mocks.cardBodies[0]).not.toContain('SELECT');
+    expect(mocks.validateCalls).toBe(0);
+    expect(mocks.runCalls).toBe(0);
+  });
+
+  it('keeps missing-capability callers untrusted unless they crossed host HMAC', async () => {
+    const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '查看固化命令' });
+    const response = await postUntrustedIntentWithoutCapability(ds);
+    expect(response.statusCode).toBe(403);
+    expect(mocks.cardBodies).toHaveLength(0);
+    expect(mocks.validateCalls).toBe(0);
+    expect(mocks.runCalls).toBe(0);
+  });
+
+  it('rejects a trusted host request whose turn id is stale', async () => {
+    const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '查看固化命令' });
+    const response = await postHostIntent(ds, { operation: 'list', turnId: 'om_stale_turn' });
+    expect(response.statusCode).toBe(403);
+    expect(response.payload).toMatchObject({ ok: false, error: 'origin_identity_mismatch' });
+    expect(mocks.cardBodies).toHaveLength(0);
+    expect(mocks.validateCalls).toBe(0);
+    expect(mocks.runCalls).toBe(0);
+  });
+
+  it('binds a trusted host run to the live actor and still requires the actor callback', async () => {
+    const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '运行命令' });
+    delete ds.managedTurnOrigin.dispatchAttempt;
+    const response = await postHostIntent(ds);
+    expect(response.statusCode).toBe(200);
+    expect(response.payload).toMatchObject({ status: 'awaiting_input', operation: 'run' });
+    const value = latestPreviewAction();
+
+    await modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP);
+    const completed = await waitForStatus(value.transition_id, 'completed');
+    expect(completed).toMatchObject({
+      actorOpenId: ACTOR_OPEN_ID,
+      actorUnionId: ACTOR_UNION_ID,
+      dispatchAttempt: 0,
+      queryId: 'q_host_flow',
+    });
+    expect(mocks.validateCalls).toBe(1);
+    expect(mocks.runCalls).toBe(1);
+  });
+
   it.each([
     ['new-topic', 'pty', '@_bot 运行 /宿主闭环 11', '@Current Bot 运行 /宿主闭环 11'],
     ['existing-thread', 'tmux', '运行 /宿主闭环 11 @_bot', '运行 /宿主闭环 11 @Current Bot'],

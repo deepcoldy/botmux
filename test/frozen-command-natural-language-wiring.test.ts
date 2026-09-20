@@ -7,15 +7,17 @@ const ipc = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.m
 const skill = readFileSync(new URL('../src/skills/definitions.ts', import.meta.url), 'utf8');
 
 describe('Frozen Command natural-language P0a wiring', () => {
-  it('requires rotating turn authority and a daemon-owned human snapshot', () => {
+  it('requires capability or host HMAC plus an exact daemon-owned human turn snapshot', () => {
     const route = daemon.slice(
       daemon.indexOf("ipcRoute('POST', '/api/frozen-command-actions'"),
       daemon.indexOf('// ─── botmux ask v0.1.7 IPC route'),
     );
-    expect(route).toContain('trustedHost: false');
+    expect(route).toContain('const trustedHost = isTrustedHostIpcRequest(req)');
+    expect(route).toContain('trustedHost,');
+    expect(route).toContain('liveOrigin.turnId !== body.originTurnId');
     expect(route).toContain("actor?.senderType !== 'user'");
     expect(route).toContain('origin.sourceContentHash');
-    expect(route).toContain('ds.managedTurnOrigin.callerOpenId');
+    expect(route).toContain('liveOrigin.callerOpenId');
     expect(route).not.toContain('lastCallerOpenId');
     expect(route).toContain("status: 'awaiting_input'");
   });
@@ -24,6 +26,7 @@ describe('Frozen Command natural-language P0a wiring', () => {
     expect(cli).toContain("case 'freeze'");
     expect(cli).toContain("postFrozenCommandIntent");
     expect(cli).toContain("'/api/frozen-command-actions'");
+    expect(cli).toContain('origin?.turnId ?? process.env.BOTMUX_TURN_ID');
     expect(ipc).toContain("pathname === '/api/frozen-command-actions'");
   });
 

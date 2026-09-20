@@ -13314,6 +13314,22 @@ async function cmdFreeze(rest: string[]): Promise<void> {
     return;
   }
   const origin = resolveSessionContext(resolveDataDir(), sessionId);
+  // Tool runners such as Codex app-server may execute commands outside the
+  // long-lived CLI process tree. In that shape the worker marker is not an
+  // ancestor of this short-lived process, while BOTMUX_TURN_ID is injected for
+  // the exact tool turn. The daemon still compares it with both live turn
+  // snapshots, so a stale spawn-time value fails closed.
+  const originTurnId = origin?.turnId ?? process.env.BOTMUX_TURN_ID;
+  const envDispatchAttempt = Number(process.env.BOTMUX_DISPATCH_ATTEMPT);
+  const originDispatchAttempt = origin?.dispatchAttempt
+    ?? (Number.isSafeInteger(envDispatchAttempt) && envDispatchAttempt > 0
+      ? envDispatchAttempt
+      : undefined);
+  if (!originTurnId) {
+    console.error('botmux freeze: 当前工具进程未绑定真人消息轮次，请在原话题重新发送请求');
+    process.exitCode = 2;
+    return;
+  }
   const capability = readManagedOriginCapability(
     resolveDataDir(),
     sessionId,
@@ -13326,9 +13342,9 @@ async function cmdFreeze(rest: string[]): Promise<void> {
       larkAppId,
       operation: sub,
       ...(sub === 'run' ? { command: rest[1], rawArgs: frozenRawArgs(rest.slice(2)) } : {}),
-      ...(origin?.turnId ? { originTurnId: origin.turnId } : {}),
-      ...(origin?.dispatchAttempt !== undefined
-        ? { originDispatchAttempt: origin.dispatchAttempt }
+      originTurnId,
+      ...(originDispatchAttempt !== undefined
+        ? { originDispatchAttempt }
         : {}),
       ...(capability ? { originCapability: capability } : {}),
     });
