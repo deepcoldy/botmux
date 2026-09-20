@@ -3211,11 +3211,12 @@ function activeTurnBlocks(input: {
  * `markStarted()` consult `mayControlActiveTurn` on their own, so a delivered
  * cross-principal turn would still fail them — and `markActiveTurnStarted`
  * turns that into a thrown `turn authority mismatch before CLI write`. With the
- * feature off there is no principal gate to honour, so the incoming turn simply
- * takes the tuple over, which is what pre-#1348 code did by overwriting
- * `currentBotmuxTurnId` outright. Taking over (rather than leaving the stale
- * tuple in place) keeps the tuple describing the turn that is really writing,
- * which is what the MCP gateway signs with and the sandbox relay publishes.
+ * feature off there is no principal gate to honour, so the incoming message
+ * takes over the TURN ENVELOPE, which is what pre-#1348 code did by overwriting
+ * `currentBotmuxTurnId` outright. It must not take over the authenticated
+ * caller: the disabled-mode product contract merges B's interruption into A's
+ * active work and keeps tool calls running as A. The MCP gateway therefore sees
+ * B's turnId/dispatchAttempt paired with A's frozen caller/controller.
  *
  * Returns false only when the authority refuses even after the takeover, which
  * cannot happen for a turnId-bearing identity — the callers keep their existing
@@ -3225,11 +3226,11 @@ function adoptActiveTurnWhenIsolationOff(identity: TurnAuthorityIdentity): boole
   if (identity.queueAfterActiveTurn) return false;
   if (crossPrincipalIsolationOn()) return false;
   const active = activeTurnAuthority.snapshot();
-  activeTurnAuthority.clear();
-  if (!activeTurnAuthority.reserve(identity)) return false;
+  if (!activeTurnAuthority.adoptEnvelopePreservingPrincipal(identity)) return false;
   log(
     `Adopted turn ${identity.turnId?.slice(0, 12) ?? '-'} over turn `
-    + `${active?.turnId?.slice(0, 12) ?? '-'} (cross-principal isolation disabled)`,
+    + `${active?.turnId?.slice(0, 12) ?? '-'} while preserving the active caller `
+    + `(cross-principal isolation disabled)`,
   );
   return true;
 }

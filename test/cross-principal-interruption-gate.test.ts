@@ -113,6 +113,37 @@ describe('XPI switch — accessor (config file + env override)', () => {
   });
 });
 
+describe('XPI control-notice loop guard wiring', () => {
+  it('consumes authenticated legacy control notices before auto-create or generic staging', () => {
+    const parseAt = daemonSource.indexOf("threadTrustedCaller?.senderType === 'bot'");
+    const consumeAt = daemonSource.indexOf('consumed XPI control notice');
+    const autoCreateAt = daemonSource.indexOf('if (!ds) {', consumeAt);
+    const stageGateAt = daemonSource.indexOf('if (config.crossPrincipalInterruption', autoCreateAt);
+    expect(parseAt).toBeGreaterThan(0);
+    expect(consumeAt).toBeGreaterThan(parseAt);
+    expect(autoCreateAt).toBeGreaterThan(consumeAt);
+    expect(stageGateAt).toBeGreaterThan(autoCreateAt);
+  });
+
+  it('cleans strict persisted session rows as well as active sessions when disabled', () => {
+    const start = daemonSource.indexOf('function cancelAllCrossPrincipalInterruptionsForFeatureDisable(): number {');
+    expect(start).toBeGreaterThan(0);
+    const body = daemonSource.slice(start, daemonSource.indexOf('\n}\n', start));
+    expect(body).not.toContain('config.crossPrincipalInterruption');
+    expect(body).toContain('activeSessions.values()');
+    expect(body).toContain('sessionStore.listSessionsStrict()');
+    expect(body).toContain('cancelledSessionIds.has(session.sessionId)');
+    expect(body).toContain('sessionStore.updateSession(session)');
+  });
+
+  it('sweeps persisted XPI records on an OFF daemon boot before IPC binds', () => {
+    const bootSweepAt = daemonSource.indexOf('cancelAllCrossPrincipalInterruptionsForFeatureDisable();');
+    const ipcBindAt = daemonSource.indexOf('const ipcHandle = await startIpcServer');
+    expect(bootSweepAt).toBeGreaterThan(0);
+    expect(ipcBindAt).toBeGreaterThan(bootSweepAt);
+  });
+});
+
 describe('XPI switch — agent-facing `--as` guidance', () => {
   afterEach(() => { delete process.env.BOTMUX_XPI_ENABLED; });
 
@@ -216,12 +247,16 @@ describe('XPI switch — worker.ts authority gates (source-pinned)', () => {
     const start = workerSource.indexOf('function adoptActiveTurnWhenIsolationOff(');
     const body = workerSource.slice(start, workerSource.indexOf('\n}\n', start));
     const gate = body.indexOf('if (crossPrincipalIsolationOn()) return false;');
+    // Master's queueAfterActiveTurn FIFO gate must stay ahead of both the XPI
+    // gate and #1456's principal-preserving adoption; clear()+reserve() is gone.
     const fifoGate = body.indexOf('if (identity.queueAfterActiveTurn) return false;');
+    const adopt = body.indexOf('activeTurnAuthority.adoptEnvelopePreservingPrincipal(identity)');
     const clear = body.indexOf('activeTurnAuthority.clear()');
     expect(gate).toBeGreaterThanOrEqual(0);
     expect(fifoGate).toBeGreaterThanOrEqual(0);
-    expect(clear).toBeGreaterThan(fifoGate);
-    expect(clear).toBeGreaterThan(gate);
+    expect(fifoGate).toBeLessThan(gate);
+    expect(adopt).toBeGreaterThan(gate);
+    expect(clear).toBe(-1);
   });
 });
 
@@ -249,17 +284,54 @@ describe('XPI switch — adoption semantics against the real authority', () => {
     expect(authority.markStarted({ turnId: 'turn-b', caller: B })).toBe(false);
   });
 
-  it('clear-then-reserve hands the tuple to the turn that is really writing', () => {
-    // The shape adoptActiveTurnWhenIsolationOff performs. The resulting
-    // identity is what the MCP gateway signs and the sandbox relay publishes,
-    // so it must describe B, not the stale A.
+  it('hands the envelope to B while keeping A as the trusted tool caller', () => {
+    // Disabled isolation merges B's input into A's in-flight work. Reply/turn
+    // attribution follows B's envelope, while the MCP gateway must keep signing
+    // tools as A per the disabled-mode product contract.
     const authority = new ActiveTurnAuthority();
-    authority.reserve({ turnId: 'turn-a', caller: A });
-    authority.clear();
-    expect(authority.reserve({ turnId: 'turn-b', caller: B })).toBe(true);
-    expect(authority.markStarted({ turnId: 'turn-b', caller: B })).toBe(true);
-    expect(authority.identity()).toEqual({ turnId: 'turn-b', caller: B });
+    const controllerA = {
+      ...A,
+      requestUserOpenId: 'ou_controller_a',
+      requestUserUnionId: 'on_controller_a',
+    };
+    authority.reserve({ turnId: 'turn-a', caller: A, controller: controllerA });
+    expect(authority.adoptEnvelopePreservingPrincipal({
+      turnId: 'turn-b',
+      dispatchAttempt: 2,
+      caller: B,
+      controller: B,
+    }, 123)).toBe(true);
+    expect(authority.markStarted({
+      turnId: 'turn-b',
+      dispatchAttempt: 2,
+      caller: B,
+    })).toBe(true);
+    expect(authority.identity()).toEqual({
+      turnId: 'turn-b',
+      dispatchAttempt: 2,
+      caller: A,
+      controller: controllerA,
+    });
     expect(authority.snapshot()?.started).toBe(true);
+  });
+
+  it('falls back to the incoming principal only when no active principal exists', () => {
+    const authority = new ActiveTurnAuthority();
+
+    expect(authority.adoptEnvelopePreservingPrincipal({
+      turnId: 'turn-b',
+      caller: B,
+      controller: B,
+    }, 456)).toBe(true);
+    expect(authority.identity()).toEqual({
+      turnId: 'turn-b',
+      caller: B,
+      controller: B,
+    });
+    expect(authority.snapshot()).toMatchObject({
+      started: false,
+      reservedAtMs: 456,
+    });
   });
 });
 

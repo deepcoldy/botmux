@@ -207,6 +207,47 @@ describe('applySettingsWrite happy paths', () => {
     expect(deps.mergeDashboardConfig).toHaveBeenCalledWith({ hideCodexRateLimitModelNudge: enabled });
   });
 
+  it('terminalises daemon queues only after persisting XPI=false', async () => {
+    const calls: string[] = [];
+    const deps = makeDeps({
+      mergeDashboardConfig: vi.fn((patch) => {
+        calls.push(`persist:${String(patch.crossPrincipalInterruption)}`);
+        return patch;
+      }),
+      disableCrossPrincipalInterruptionOnAllDaemons: vi.fn(async () => {
+        calls.push('disable-runtime');
+      }),
+    });
+    const r = await applySettingsWrite({ crossPrincipalInterruption: false }, deps);
+    expect(r.ok).toBe(true);
+    expect(calls).toEqual(['persist:false', 'disable-runtime']);
+  });
+
+  it('does not run disable cleanup when XPI is enabled or unrelated settings change', async () => {
+    const disable = vi.fn(async () => undefined);
+    const deps = makeDeps({ disableCrossPrincipalInterruptionOnAllDaemons: disable });
+    expect((await applySettingsWrite({ crossPrincipalInterruption: true }, deps)).ok).toBe(true);
+    expect((await applySettingsWrite({ publicReadOnly: true }, deps)).ok).toBe(true);
+    expect(disable).not.toHaveBeenCalled();
+  });
+
+  it('does not claim success when runtime XPI cleanup fails after persistence', async () => {
+    const calls: string[] = [];
+    const deps = makeDeps({
+      mergeDashboardConfig: vi.fn((patch) => {
+        calls.push(`persist:${String(patch.crossPrincipalInterruption)}`);
+        return patch;
+      }),
+      disableCrossPrincipalInterruptionOnAllDaemons: vi.fn(async () => {
+        calls.push('disable-runtime');
+        throw new Error('daemon cleanup incomplete');
+      }),
+    });
+    await expect(applySettingsWrite({ crossPrincipalInterruption: false }, deps))
+      .rejects.toThrow('daemon cleanup incomplete');
+    expect(calls).toEqual(['persist:false', 'disable-runtime']);
+  });
+
   it('rejects malformed model-nudge settings without writing', async () => {
     const deps = makeDeps();
     const result = await applySettingsWrite({ hideCodexRateLimitModelNudge: 'false' }, deps);

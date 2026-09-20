@@ -369,7 +369,19 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
   const elements: Array<Record<string, unknown>> = [metaDiv];
 
   if (status) {
-    // 已 settle：展示状态摘要，无可交互组件
+    // 已 settle：保留原问题内容，再展示状态摘要。审批卡若在点击后
+    // 只留下「已选择」，审批人就无法回看自己批准了什么。
+    elements.push({ tag: 'hr' });
+    for (let i = 0; i < ask.questions.length; i++) {
+      const q = ask.questions[i]!;
+      elements.push({
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeMd(truncate(q.prompt, 512, locale))}`,
+        },
+      });
+    }
     elements.push({ tag: 'hr' });
     elements.push({
       tag: 'div',
@@ -639,7 +651,16 @@ function templateForResult(result: AskResult): string {
 }
 
 function approverSummary(ask: PendingAsk, locale?: Locale): string {
-  if (ask.answererOpenId) return `<at id=${ask.answererOpenId}></at>`;
+  if (ask.answererOpenId) {
+    // XPI can resolve this id from union_id in another app. It is valid for the
+    // broker's callback authorization, but embedding it as an at/person card
+    // resource can make Lark reject the whole card with 230099. Keep ordinary
+    // same-app asks unchanged; only the three XPI origins use a neutral label.
+    if (ask.originKind?.startsWith('host_cross_principal_')) {
+      return t('card.ask.answerable_designated_member', undefined, locale);
+    }
+    return `<at id=${ask.answererOpenId}></at>`;
+  }
   // 答复权限 = canTalk：谁能在该群跟 bot 说话谁就能答。卡片统一显示「本群可对话成员」，
   // 不再按 open_id 列名单（鉴权在 broker 点击时按 canTalk 判定）。
   return t('card.ask.answerable_talk_members', undefined, locale);

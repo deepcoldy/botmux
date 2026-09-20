@@ -392,6 +392,10 @@ export interface DaemonSession {
   activeInteractiveTurn?: {
     turnId: string;
     caller: import('../types.js').TrustedCaller;
+    /** Business prompt before daemon-owned quote/application wrappers. Kept
+     * only in memory so an approved XPI suggestion can replay the owner's
+     * actual request instead of duplicating transport context. */
+    userPrompt?: string;
     /** Stable authenticated task/session owner, when distinct from the caller
      * that happened to start the current CLI turn. */
     controller?: import('../types.js').TrustedCaller;

@@ -292,6 +292,14 @@ export function setSupervisorShutdownHandler(
 ): void {
   supervisorShutdownRegistration = registration;
 }
+
+let crossPrincipalInterruptionDisableHandler: (() => number | Promise<number>) | null = null;
+/** Daemon-owned runtime cleanup for the persisted XPI feature switch. */
+export function setCrossPrincipalInterruptionDisableHandler(
+  handler: (() => number | Promise<number>) | null,
+): void {
+  crossPrincipalInterruptionDisableHandler = handler;
+}
 import {
   composeRowFromActive,
   composeRowFromClosed,
@@ -7956,6 +7964,22 @@ ipcRoute('POST', '/api/locale/reload', async (_req, res) => {
   }
 
   jsonRes(res, 200, { ok: true, defaultLocale: resolvedDefault, botLang });
+});
+
+// The Dashboard persists crossPrincipalInterruption=false before calling this
+// endpoint. Runtime cleanup is intentionally daemon-owned because only the
+// daemon can clear its in-memory timers and atomically terminalise its session
+// rows. A missing handler fails closed instead of claiming cleanup succeeded.
+ipcRoute('POST', '/api/xpi/disable', async (_req, res) => {
+  if (!crossPrincipalInterruptionDisableHandler) {
+    return jsonRes(res, 503, { ok: false, error: 'xpi_disable_handler_unavailable' });
+  }
+  try {
+    const cancelled = await crossPrincipalInterruptionDisableHandler();
+    jsonRes(res, 200, { ok: true, cancelled });
+  } catch (err: any) {
+    jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });
+  }
 });
 
 // Hot-reload the current daemon's per-bot config from bots.json after another

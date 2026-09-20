@@ -1470,6 +1470,9 @@ describe('configured serial group input', () => {
 });
 
 describe('confirmation delivery failure', () => {
+  // #1456 made the durable XPI driver run only while the XPI switch is on
+  // (OFF sweeps staged records); these helper-retry cases exercise that driver.
+  beforeEach(() => { vi.stubEnv('BOTMUX_XPI_ENABLED', 'true'); });
   for (const stage of ['classification', 'owner', 'wait'] as const) {
     it(`retains ${stage} input durably, backs off, and retries with a new ask identity`, async () => {
       const { ds, owner, other } = await collaborativeSession();
@@ -1510,6 +1513,7 @@ describe('confirmation delivery failure', () => {
 });
 
 it('recovers a thrown dispatcher failure and accepts the displayed suggestion label', async () => {
+  vi.stubEnv('BOTMUX_XPI_ENABLED', 'true');
   const { ds, owner, other } = await collaborativeSession();
   const { record } = modules.interruptions.stageCrossPrincipalInterruptionRecord({
     session: ds.session, ownerTurnId: 'om_owner_active', owner, proposer: other,
@@ -1530,6 +1534,7 @@ it('recovers a thrown dispatcher failure and accepts the displayed suggestion la
 });
 
 it('does not resurrect a removed input when its outstanding card fails', async () => {
+  vi.stubEnv('BOTMUX_XPI_ENABLED', 'true');
   const { ds, owner, other } = await collaborativeSession();
   modules.interruptions.stageCrossPrincipalInterruptionRecord({
     session: ds.session, ownerTurnId: 'om_owner_active', owner, proposer: other,
@@ -1538,6 +1543,10 @@ it('does not resurrect a removed input when its outstanding card fails', async (
   let fail!: (result: any) => void;
   mocks.registerHostAsk.mockReset().mockImplementation(() => new Promise(resolve => { fail = resolve; }));
   const pending = modules.daemon.__testOnly_driveCrossPrincipalInterruptions(ds);
+  // Let the driver reach the (mocked) outstanding ask before the record is
+  // removed externally; the ask call itself stays pending.
+  await vi.waitFor(() => expect(mocks.registerHostAsk).toHaveBeenCalledTimes(1));
+  expect(typeof fail).toBe('function');
   ds.session.crossPrincipalInterruptions = undefined;
   fail({ kind: 'invalidated', reason: 'closed', selected: null, by: null, comment: null, timedOut: false });
   await pending;

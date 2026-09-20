@@ -1604,6 +1604,58 @@ export async function uploadFile(larkAppId: string, filePath: string, opts?: { d
  */
 export type EntryResolveStatus = 'resolved' | 'transient' | 'definitive';
 
+export type TargetAppOpenIdResolution =
+  | { status: 'resolved'; openId: string }
+  | { status: 'transient' }
+  | { status: 'definitive' };
+
+function maskedIdentityForLog(value: string): string {
+  if (value.length <= 12) return `${value.slice(0, 3)}...`;
+  return `${value.slice(0, 6)}...${value.slice(-4)}`;
+}
+
+/**
+ * Resolve a human union_id into the open_id issued by the target bot app.
+ *
+ * XPI choice cards must use this boundary instead of reusing the inbound
+ * event's open_id: open_id is app-scoped, while a cross-app interruption may
+ * have been observed through another app.  The caller receives only a stable
+ * result class; logs deliberately keep both identities masked.
+ */
+export async function resolveTargetAppOpenId(
+  larkAppId: string,
+  unionId: string,
+): Promise<TargetAppOpenIdResolution> {
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(unionId)}`, {
+      user_id_type: 'union_id',
+    });
+    const openId = res?.data?.user?.open_id;
+    if (res?.code === 0 && typeof openId === 'string' && openId.startsWith('ou_')) {
+      logger.info(
+        `[target-app-identity] resolved union=${maskedIdentityForLog(unionId)} `
+        + `open=${maskedIdentityForLog(openId)} app=${larkAppId}`,
+      );
+      return { status: 'resolved', openId };
+    }
+    const definitive = res?.code === 0 || !!classifyContactErrorCode(res?.code);
+    logger.warn(
+      `[target-app-identity] ${definitive ? 'definitive' : 'transient'} miss `
+      + `union=${maskedIdentityForLog(unionId)} app=${larkAppId} code=${String(res?.code ?? 'unknown')}`,
+    );
+    return { status: definitive ? 'definitive' : 'transient' };
+  } catch (err) {
+    const code = getLarkErrorCode(err);
+    const definitive = !!classifyContactErrorCode(code);
+    logger.warn(
+      `[target-app-identity] ${definitive ? 'definitive' : 'transient'} error `
+      + `union=${maskedIdentityForLog(unionId)} app=${larkAppId} code=${String(code ?? 'unknown')}`,
+    );
+    return { status: definitive ? 'definitive' : 'transient' };
+  }
+}
+
 export async function resolveAllowedUsersWithMap(
   larkAppId: string, raw: string[],
 ): Promise<{ resolved: string[]; map: Map<string, string>; errored?: boolean; entryStatus: Map<string, EntryResolveStatus> }> {

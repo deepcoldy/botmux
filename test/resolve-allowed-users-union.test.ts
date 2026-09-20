@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { resolveAllowedUsersWithMap } from '../src/im/lark/client.js';
+import { resolveAllowedUsersWithMap, resolveTargetAppOpenId } from '../src/im/lark/client.js';
 import { applyAllowedUsersResolve } from '../src/utils/allowed-users-apply.js';
 import { registerBot } from '../src/bot-registry.js';
 import { logger } from '../src/utils/logger.js';
@@ -86,6 +86,33 @@ describe('resolveAllowedUsersWithMap — on_ union_id entries (PR#72 lockout fix
     expect(map.get('ou_other_app')).toBe('ou_other_app');
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('open_id ou_other_app belongs to another app'));
     warn.mockRestore();
+  });
+});
+
+describe('resolveTargetAppOpenId — XPI cross-app human identity', () => {
+  it('returns the open_id issued by the receiving bot app', async () => {
+    stubClient(async ({ path, params }: any) => {
+      expect(path.user_id).toBe('on_cross_app_human');
+      expect(params.user_id_type).toBe('union_id');
+      return { code: 0, data: { user: { open_id: 'ou_target_app_human' } } };
+    });
+
+    await expect(resolveTargetAppOpenId(APP, 'on_cross_app_human')).resolves.toEqual({
+      status: 'resolved',
+      openId: 'ou_target_app_human',
+    });
+  });
+
+  it('separates definitive visibility misses from transient failures', async () => {
+    stubClient(async () => ({ code: 41050, msg: 'not visible' }));
+    await expect(resolveTargetAppOpenId(APP, 'on_hidden_human')).resolves.toEqual({
+      status: 'definitive',
+    });
+
+    stubClient(async () => ({ code: 500, msg: 'temporary' }));
+    await expect(resolveTargetAppOpenId(APP, 'on_flaky_human')).resolves.toEqual({
+      status: 'transient',
+    });
   });
 });
 

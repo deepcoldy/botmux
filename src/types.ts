@@ -343,6 +343,15 @@ export interface Session {
    * independently-created session.
    */
   crossPrincipalInterruptions?: CrossPrincipalInterruption[];
+  /** Bounded audit trail for staged XPI messages that were made permanently
+   * non-runnable when the feature was disabled. Keeping these outside the
+   * active queue prevents restart/re-enable from resurrecting old work while
+   * preserving an inspectable terminal reason. */
+  crossPrincipalInterruptionCancellations?: CrossPrincipalInterruptionCancellation[];
+  /** Bounded audit trail for human-alert delivery failures. These records are
+   * deliberately separate from the XPI queue so a failed alert can never
+   * resurrect or re-run the original message. */
+  crossPrincipalInterruptionDeliveryAudits?: CrossPrincipalInterruptionDeliveryAudit[];
   /**
    * Narrow XPI fallback coordination for an independent child that could not
    * obtain an isolated worktree and therefore shares its source session's cwd.
@@ -920,26 +929,28 @@ export interface CrossPrincipalInterruption {
   confirmationRetryAt?: number;
   ownerTurnId: string;
   owner: TrustedCaller;
+  /** Business prompt of the active owner turn, captured before daemon-owned
+   * quote/application wrappers. Required to replay the original task after
+   * the owner approves B's suggestion. */
+  ownerUserPrompt?: string;
   proposer: TrustedCaller;
   phase:
     | 'awaiting_classification'
     | 'awaiting_owner'
     | 'owner_approved'
     | 'preparing_independent'
-    | 'independent_queued';
-  /** Legacy field retained for restore compatibility. New records start the
+    | 'independent_queued'
+    | 'terminal_notice_pending';
+  /** Legacy field retained for restore compatibility. Human records start the
    *  classification clock only after the classification card is delivered.
    *
    *  Read-only for current builds: `staleLegacyXpiDetail` treats an elapsed
    *  value as a tripwire and quarantines the session, so nothing may write it.
-   *  A bot proposer's classification countdown lives in
-   *  {@link botClassifyDeadlineAt}. */
+   *  Bot proposers now classify before send and do not write this field. */
   classificationDeadlineAt?: number;
-  /** Deadline for a *bot* proposer to answer the classification notice with
-   *  `botmux send --as …`. Bots get a plain-text notice instead of a card, so
-   *  this clock is owned by the daemon rather than the ask broker. Distinct
-   *  from {@link classificationDeadlineAt}: an elapsed value here is ordinary
-   *  expiry that the driver cleans up, never a restore tripwire. */
+  /** Legacy deadline from builds that published bot classification notices.
+   * Current builds require `botmux send --as …` before send and terminalise an
+   * unclassified legacy record without emitting another bot-directed message. */
   botClassifyDeadlineAt?: number;
   /** Separate bound for waiting until the active owner turn finishes. This is
    *  not the owner's confirmation timeout. */
@@ -950,6 +961,15 @@ export interface CrossPrincipalInterruption {
   /** Legacy field retained for restore compatibility. New owner-confirmation
    *  clocks are owned by the ask broker and start after card delivery. */
   ownerDeadlineAt?: number;
+  /** Restart-safe bounded retry state for target-app human identity lookup. */
+  identityResolutionRetry?: {
+    role: 'owner' | 'proposer';
+    attempts: number;
+  };
+  /** Durable terminal outcome retained until its human notification is
+   * delivered, or until the bounded outer retry budget is exhausted. */
+  terminalNoticeText?: string;
+  terminalNoticeAttempts?: number;
   messages: CrossPrincipalInterruptionMessage[];
   independentRootMessageId?: string;
   independentChildSessionId?: string;
@@ -957,6 +977,26 @@ export interface CrossPrincipalInterruption {
   /** Present only when this XPI independent child fell back to the source cwd.
    * It does not claim that non-XPI writers to the same directory participate. */
   xpiSharedCwdAdmissionGroupId?: string;
+}
+
+export interface CrossPrincipalInterruptionDeliveryAudit {
+  version: 1;
+  id: string;
+  event: 'delivery_failed' | 'delivery_recovered' | 'delivery_exhausted';
+  channel: 'group' | 'topic';
+  attempts: number;
+  reason: string;
+  at: string;
+}
+
+export interface CrossPrincipalInterruptionCancellation {
+  version: 1;
+  id: string;
+  ownerTurnId: string;
+  proposer: TrustedCaller;
+  messageTurnIds: string[];
+  cancelledAt: string;
+  reason: 'feature_disabled';
 }
 
 export interface XpiSharedCwdAdmissionLease {

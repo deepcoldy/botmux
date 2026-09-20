@@ -124,6 +124,26 @@ describe('buildAskCard', () => {
     expect(text).toContain('继续发布');
   });
 
+  it('XPI 指定答复人只用于点击鉴权，不作为 at/person 资源写进卡片', () => {
+    const text = buildAskCard(makePending({
+      answererOpenId: 'ou_cross_app_answerer',
+      originKind: 'host_cross_principal_owner',
+    }));
+
+    expect(text).toContain('指定成员（仅本人可操作）');
+    expect(text).not.toContain('ou_cross_app_answerer');
+    expect(text).not.toContain('<at');
+  });
+
+  it('普通同 app 指定答复人仍显示具体成员', () => {
+    const text = buildAskCard(makePending({ answererOpenId: 'ou_same_app_answerer' }));
+
+    // Master keeps the complete <at> mention atomic (escaping the id underscores
+    // invalidates the card); same-app asks still render the concrete mention.
+    expect(text).toContain('<at id=ou_same_app_answerer></at>');
+    expect(text).not.toContain('指定成员（仅本人可操作）');
+  });
+
   it('未 settle 卡片：含自定义回复提示（直接在话题里回复）', () => {
     const text = buildAskCard(makePending());
     expect(text).toContain('直接在话题');
@@ -164,7 +184,7 @@ describe('buildAskCard', () => {
 
   it('settled 态（answered）：渲染答案摘要、无可点组件', () => {
     const ask = makePending({
-      questions: [{ prompt: 'q', multiSelect: false, options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }] }],
+      questions: [{ prompt: '审批内容：补充回归测试', multiSelect: false, options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }] }],
     });
     const json = JSON.parse(buildAskCard(ask, {
       kind: 'answered',
@@ -178,6 +198,8 @@ describe('buildAskCard', () => {
     expect(json.header.template).toBe('green');
     // 答案摘要包含"已选择"文字
     expect(text).toContain('已选择');
+    // 终态仍保留原问题，让审批人能回看自己批准的内容。
+    expect(text).toContain('审批内容：补充回归测试');
     // 选中标签"是"出现在卡片中
     expect(text).toContain('是');
     // 不含任何 action 动作（无可交互组件）

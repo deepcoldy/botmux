@@ -49,6 +49,7 @@ import {
   managementUpgradeOrigin,
 } from './dashboard/control-csrf.js';
 import { DaemonRegistry, botsRosterSignature } from './dashboard/registry.js';
+import { fanoutCrossPrincipalInterruptionDisable } from './dashboard/xpi-disable-fanout.js';
 import { Aggregator, subscribeDaemon } from './dashboard/aggregator.js';
 import { reconcileDaemonSnapshot } from './dashboard/daemon-reconcile.js';
 import { createSessionPresentationCoordinator } from './dashboard/session-presentation.js';
@@ -1681,7 +1682,18 @@ async function reloadLocaleOnAllDaemons(): Promise<void> {
     fetchDaemonIpc(d.ipcPort, '/api/locale/reload', { method: 'POST' }).catch(() => undefined),
   ));
 }
-const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(resolveDashboardSettings, reloadLocaleOnAllDaemons);
+async function disableCrossPrincipalInterruptionOnAllDaemons(): Promise<void> {
+  await fanoutCrossPrincipalInterruptionDisable(
+    registry.list(),
+    fetchDaemonIpc,
+    message => logger.warn(message),
+  );
+}
+const settingsWriteApplierDeps = defaultSettingsWriteApplierDeps(
+  resolveDashboardSettings,
+  reloadLocaleOnAllDaemons,
+  disableCrossPrincipalInterruptionOnAllDaemons,
+);
 settingsWriteApplierDeps.validateCodexNotifierTargetBotAppId = validateCodexNotifierTargetBotAppId;
 settingsWriteApplierDeps.validateHostOverloadAlertTargetBotAppId = validateHostOverloadAlertTargetBotAppId;
 

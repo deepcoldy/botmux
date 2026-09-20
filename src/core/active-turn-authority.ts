@@ -120,6 +120,43 @@ export class ActiveTurnAuthority {
     return true;
   }
 
+  /**
+   * Replace only the active turn envelope while retaining the authenticated
+   * principal that opened the in-flight turn. This is the compatibility path
+   * for cross-principal type-ahead when isolation is disabled: the incoming
+   * message owns reply/turn attribution, but tools must continue to run as the
+   * principal whose work is already executing.
+   *
+   * The caller decides whether this policy is allowed. Enforcing paths must
+   * continue to use reserve()/markStarted(), which reject a different caller.
+   */
+  adoptEnvelopePreservingPrincipal(
+    identity: TurnAuthorityIdentity,
+    nowMs = Date.now(),
+  ): boolean {
+    if (!identity.turnId) return false;
+    const active = this.active;
+    this.active = Object.freeze({
+      turnId: identity.turnId,
+      ...(identity.dispatchAttempt !== undefined
+        ? { dispatchAttempt: identity.dispatchAttempt }
+        : {}),
+      ...(active?.caller
+        ? { caller: active.caller }
+        : identity.caller
+        ? { caller: frozenCaller(identity.caller) }
+        : {}),
+      ...(active?.controller
+        ? { controller: active.controller }
+        : identity.controller
+        ? { controller: frozenCaller(identity.controller) }
+        : {}),
+      started: false,
+      reservedAtMs: nowMs,
+    });
+    return true;
+  }
+
   /** Mark the reserved tuple as having crossed the literal CLI submission edge. */
   markStarted(identity: TurnAuthorityIdentity): boolean {
     if (!this.active) return false;
