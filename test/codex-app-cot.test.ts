@@ -11,6 +11,28 @@ describe('CodexAppCotCollector', () => {
     ]);
   });
 
+  it('streams complete public-summary sentences and emits only the remainder on completion', () => {
+    const collector = new CodexAppCotCollector();
+    expect(collector.observe('item/reasoning/summaryTextDelta', { itemId: 'r1', delta: '先检查工程' })).toEqual([]);
+    expect(collector.observe('item/reasoning/summaryTextDelta', { itemId: 'r1', delta: '结构。接下来读取入口' })).toEqual([
+      { kind: 'thinking', text: '先检查工程结构。' },
+    ]);
+    expect(collector.observe('item/completed', {
+      item: { id: 'r1', type: 'reasoning', summary: ['先检查工程结构。接下来读取入口文件'] },
+    })).toEqual([{ kind: 'thinking', text: '接下来读取入口文件' }]);
+  });
+
+  it('streams commentary only after its public phase is known', () => {
+    const collector = new CodexAppCotCollector();
+    collector.observe('item/started', { item: { id: 'm1', type: 'agentMessage', phase: 'commentary', text: '' } });
+    expect(collector.observe('item/agentMessage/delta', { itemId: 'm1', delta: '正在读取。后续' })).toEqual([
+      { kind: 'thinking', text: '正在读取。' },
+    ]);
+    expect(collector.observe('item/completed', {
+      item: { id: 'm1', type: 'agentMessage', phase: 'commentary', text: '正在读取。后续处理' },
+    })).toEqual([{ kind: 'thinking', text: '后续处理' }]);
+  });
+
   it('maps commentary and tool lifecycle notifications in display order', () => {
     const collector = new CodexAppCotCollector();
     expect(collector.observe('item/completed', {
@@ -20,8 +42,18 @@ describe('CodexAppCotCollector', () => {
       item: { id: 'c1', type: 'commandExecution', command: 'rg --files' },
     })).toEqual([{ kind: 'tool_call', id: 'c1', name: 'shell', args: '{"command":"rg --files"}' }]);
     expect(collector.observe('item/completed', {
-      item: { id: 'c1', type: 'commandExecution', aggregatedOutput: 'README.md\nsrc/index.ts' },
-    })).toEqual([{ kind: 'tool_result', id: 'c1', result: 'README.md\nsrc/index.ts' }]);
+      item: { id: 'c1', type: 'commandExecution', status: 'completed', exitCode: 0, durationMs: 1_240, aggregatedOutput: 'README.md\nsrc/index.ts' },
+    })).toEqual([{ kind: 'tool_result', id: 'c1', result: '✓ 1.2s\nREADME.md\nsrc/index.ts' }]);
+  });
+
+  it('renders file changes as a write operation with a concise path subject', () => {
+    const collector = new CodexAppCotCollector();
+    expect(collector.observe('item/started', {
+      item: { id: 'p1', type: 'fileChange', changes: [{ path: 'src/main.ts', diff: 'large diff' }] },
+    })).toEqual([{ kind: 'tool_call', id: 'p1', name: 'apply_patch', args: '{"path":"src/main.ts"}' }]);
+    expect(collector.observe('item/completed', {
+      item: { id: 'p1', type: 'fileChange', status: 'failed' },
+    })).toEqual([{ kind: 'tool_result', id: 'p1', result: '✗' }]);
   });
 
   it('does not turn the final answer into a thinking node', () => {

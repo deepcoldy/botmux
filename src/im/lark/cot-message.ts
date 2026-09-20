@@ -396,7 +396,7 @@ function reasoningId(state: CotState, index: number): string {
  *  MCP-style names without a per-CLI table. */
 function toolMeta(name: string): { icon: string; labelKey: string } {
   const n = name.toLowerCase();
-  if (n.includes('bash') || n.includes('shell') || n.includes('command')) return { icon: 'bash', labelKey: 'cot.tool.bash' };
+  if (n.includes('bash') || n.includes('shell') || n.includes('command') || /(^|[^a-z])exec([^a-z]|$)/.test(n)) return { icon: 'bash', labelKey: 'cot.tool.bash' };
   if (n.includes('write') || n.includes('edit') || n.includes('patch')) return { icon: 'write', labelKey: 'cot.tool.write' };
   if (n.includes('read') || n.includes('notebook')) return { icon: 'read', labelKey: 'cot.tool.read' };
   if (n.includes('grep') || n.includes('glob') || n.includes('search') || n.includes('fetch')) return { icon: 'search', labelKey: 'cot.tool.search' };
