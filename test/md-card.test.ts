@@ -276,6 +276,9 @@ describe('buildCardBodyElements', () => {
     // component default is only 124px, which still clips dense cells.
     expect(table.row_max_height).toBe('300px');
     expect(table.header_style.lines).toBeGreaterThanOrEqual(2);
+    // The full cell content survives into the row data; wrapping is the
+    // renderer's job, not a reason to clip at build time.
+    expect(table.rows[0].c0).toBe(longCell);
   });
 
   it('table flanked by prose → prose, table, prose are separate elements', () => {

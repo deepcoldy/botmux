@@ -16,7 +16,23 @@
 /** 自适应行高下的单格最大高度；飞书允许 32px–999px，约可容纳十余行正文。 */
 export const TABLE_ROW_MAX_HEIGHT = '300px';
 
-/** 统一灰底表头；`lines: 2` 让长表头换行展示而不是单行省略。 */
+/**
+ * 自适应行高片段（不含表头样式，供需要自定义 `header_style` 的表格复用）：
+ * `{ tag: 'table', ...TABLE_AUTO_ROW_HEIGHT, header_style: <自定义>, … }`
+ */
+export const TABLE_AUTO_ROW_HEIGHT = Object.freeze({
+  row_height: 'auto' as const,
+  row_max_height: TABLE_ROW_MAX_HEIGHT,
+});
+
+/**
+ * 统一灰底表头。
+ *
+ * `lines` 取 2 而非常见的「表头列名单行」约定，是**有意偏离**：管道表格的
+ * 表头直接来自模型输出，列名可能是完整短句，钉成 1 行长表头同样会被省略号
+ * 截断；两行足以容纳绝大多数列名。后人若想改回 1，请确认所有 table 构建点
+ * 的表头都是受控短列名。
+ */
 export const TABLE_HEADER_STYLE = Object.freeze({
   text_align: 'left' as const,
   text_size: 'normal' as const,
@@ -31,7 +47,6 @@ export const TABLE_HEADER_STYLE = Object.freeze({
  * `{ tag: 'table', page_size, ...TABLE_AUTO_ROW_STYLE, columns, rows }`
  */
 export const TABLE_AUTO_ROW_STYLE = Object.freeze({
-  row_height: 'auto' as const,
-  row_max_height: TABLE_ROW_MAX_HEIGHT,
+  ...TABLE_AUTO_ROW_HEIGHT,
   header_style: TABLE_HEADER_STYLE,
 });
