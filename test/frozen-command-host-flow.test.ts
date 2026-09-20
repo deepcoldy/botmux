@@ -21,6 +21,16 @@ const mocks = vi.hoisted(() => ({
   updateMessage: vi.fn(async () => undefined),
   getMessageChatId: vi.fn(async () => 'oc_host_flow'),
   getChatMode: vi.fn(async () => 'group' as const),
+  getChatNameAndMode: vi.fn(async () => ({ name: 'Host Flow', mode: 'topic' as const })),
+  forkWorker: vi.fn(() => true),
+  downloadResources: vi.fn(async () => ({ attachments: [], needLogin: false })),
+  getAvailableBots: vi.fn(async () => [] as any[]),
+  resolveInboundAudio: vi.fn(async () => ({ kind: 'not_audio' as const })),
+  resolveSender: vi.fn(async (_appId: string, openId?: string, senderType?: string) => (
+    openId
+      ? { openId, unionId: ACTOR_UNION_ID, type: senderType === 'app' || senderType === 'bot' ? 'bot' as const : 'user' as const }
+      : undefined
+  )),
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
@@ -44,7 +54,32 @@ vi.mock('../src/im/lark/client.js', async () => {
     updateMessage: mocks.updateMessage,
     getMessageChatId: mocks.getMessageChatId,
     getChatMode: mocks.getChatMode,
+    getChatNameAndMode: mocks.getChatNameAndMode,
   };
+});
+
+vi.mock('../src/core/worker-pool.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/worker-pool.js');
+  return { ...actual, forkWorker: (...args: any[]) => mocks.forkWorker(...args) };
+});
+
+vi.mock('../src/core/session-manager.js', async () => {
+  const actual = await vi.importActual<any>('../src/core/session-manager.js');
+  return {
+    ...actual,
+    downloadResources: (...args: any[]) => mocks.downloadResources(...args),
+    getAvailableBots: (...args: any[]) => mocks.getAvailableBots(...args),
+  };
+});
+
+vi.mock('../src/im/lark/audio-transcribe.js', async () => {
+  const actual = await vi.importActual<any>('../src/im/lark/audio-transcribe.js');
+  return { ...actual, resolveInboundAudio: (...args: any[]) => mocks.resolveInboundAudio(...args) };
+});
+
+vi.mock('../src/im/lark/identity-cache.js', async () => {
+  const actual = await vi.importActual<any>('../src/im/lark/identity-cache.js');
+  return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
 });
 
 vi.mock('../src/core/plugins/mcp/gateway.js', () => ({
@@ -126,15 +161,15 @@ let dataDir = '';
 let modules: Loaded;
 
 async function loadModules() {
-  const [daemon, registry, lifecycle, actionStore, ipc, types, workerPool] = await Promise.all([
-    import('../src/daemon.js'),
-    import('../src/bot-registry.js'),
-    import('../src/services/frozen-command-lifecycle.js'),
-    import('../src/services/frozen-command-action.js'),
-    import('../src/core/dashboard-ipc-server.js'),
-    import('../src/core/types.js'),
-    import('../src/core/worker-pool.js'),
-  ]);
+  // Import daemon first so its worker-pool dependency resolves through the
+  // Vitest mock before the test asks for the worker-pool module itself.
+  const daemon = await import('../src/daemon.js');
+  const registry = await import('../src/bot-registry.js');
+  const lifecycle = await import('../src/services/frozen-command-lifecycle.js');
+  const actionStore = await import('../src/services/frozen-command-action.js');
+  const ipc = await import('../src/core/dashboard-ipc-server.js');
+  const types = await import('../src/core/types.js');
+  const workerPool = await import('../src/core/worker-pool.js');
   return { daemon, registry, lifecycle, actionStore, ipc, types, workerPool };
 }
 
@@ -148,7 +183,7 @@ function makeSession(input: {
   sourceText: string;
   actorOpenId?: string;
   actorUnionId?: string;
-  senderType?: 'user' | 'bot';
+  senderType?: 'user' | 'bot' | 'unknown';
 }) {
   const turnId = `om_${input.scope}_${input.backendType}_${Math.random().toString(36).slice(2)}`;
   const sessionId = `sess_${input.scope}_${input.backendType}_${Math.random().toString(36).slice(2)}`;
@@ -188,9 +223,89 @@ function makeSession(input: {
     requestUserOpenId: actorOpenId,
     requestUserUnionId: actorUnionId,
     requestLarkAppId: APP,
-    senderType: input.senderType ?? 'user',
+    ...(input.senderType === 'unknown'
+      ? {}
+      : { senderType: input.senderType ?? 'user' }),
   }, input.sourceText);
   modules.daemon.__testOnly_activeSessions.set(modules.types.sessionKey(rootMessageId, APP), ds);
+  return ds;
+}
+
+function ingressEvent(messageId: string, text: string, rootId?: string): any {
+  return {
+    sender: {
+      sender_id: { open_id: ACTOR_OPEN_ID, union_id: ACTOR_UNION_ID },
+      sender_type: 'user',
+    },
+    message: {
+      message_id: messageId,
+      root_id: rootId,
+      chat_id: CHAT,
+      message_type: 'text',
+      content: JSON.stringify({ text }),
+      mentions: [{
+        key: '@_bot',
+        name: 'Current Bot',
+        id: { open_id: 'ou_host_bot' },
+      }],
+      create_time: String(Date.now()),
+    },
+  };
+}
+
+function ingressContext(messageId: string, anchor: string): any {
+  return {
+    chatId: CHAT,
+    messageId,
+    chatType: 'group' as const,
+    scope: 'thread' as const,
+    anchor,
+    larkAppId: APP,
+  };
+}
+
+function armManagedOrigin(ds: any): void {
+  ds.managedTurnOrigin = {
+    capability: CAPABILITY,
+    turnId: ds.activeInteractiveTurn.turnId,
+    dispatchAttempt: 1,
+    callerOpenId: ACTOR_OPEN_ID,
+  };
+}
+
+async function ingressNewTopic(backendType: 'pty' | 'tmux', rawText: string): Promise<any> {
+  const messageId = `om_ingress_new_${Math.random().toString(36).slice(2)}`;
+  const bot = modules.registry.getBot(APP);
+  bot.config.backendType = backendType;
+  await modules.daemon.__testOnly_handleNewTopic(
+    ingressEvent(messageId, rawText),
+    ingressContext(messageId, messageId),
+  );
+  const ds = modules.daemon.__testOnly_activeSessions.get(modules.types.sessionKey(messageId, APP));
+  expect(ds).toBeDefined();
+  armManagedOrigin(ds);
+  return ds;
+}
+
+async function ingressExistingThread(backendType: 'pty' | 'tmux', rawText: string): Promise<any> {
+  const rootMessageId = `om_ingress_root_${Math.random().toString(36).slice(2)}`;
+  const bot = modules.registry.getBot(APP);
+  bot.config.backendType = backendType;
+  await modules.daemon.__testOnly_handleNewTopic(
+    ingressEvent(rootMessageId, '初始化宿主闭环会话'),
+    ingressContext(rootMessageId, rootMessageId),
+  );
+  const ds = modules.daemon.__testOnly_activeSessions.get(modules.types.sessionKey(rootMessageId, APP));
+  expect(ds).toBeDefined();
+  ds.activeInteractiveTurn = undefined;
+  ds.worker = { killed: false, send: vi.fn(() => true) };
+  const messageId = `om_ingress_reply_${Math.random().toString(36).slice(2)}`;
+  await modules.daemon.__testOnly_handleThreadReply(
+    ingressEvent(messageId, rawText, rootMessageId),
+    ingressContext(messageId, rootMessageId),
+  );
+  expect(ds.activeInteractiveTurn?.turnId).toBe(messageId);
+  armManagedOrigin(ds);
   return ds;
 }
 
@@ -217,8 +332,8 @@ async function postIntent(ds: any, rawArgs = '11') {
   };
   const req = Readable.from([JSON.stringify(body)]) as unknown as IncomingMessage;
   const res = new JsonResponse();
-  const found = await modules.ipc.__testOnly_dispatchIpcRoute(
-    'POST', '/api/frozen-command-actions', req, res as unknown as ServerResponse,
+  const found = await modules.ipc.__testOnly_dispatchFrozenCommandActionRoute(
+    req, res as unknown as ServerResponse,
   );
   expect(found).toBe(true);
   return res;
@@ -260,6 +375,11 @@ beforeEach(async () => {
   mocks.cardBodies.length = 0;
   mocks.getMessageChatId.mockResolvedValue(CHAT);
   mocks.getChatMode.mockResolvedValue('group');
+  mocks.getChatNameAndMode.mockResolvedValue({ name: 'Host Flow', mode: 'topic' });
+  mocks.forkWorker.mockReturnValue(true);
+  mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
+  mocks.getAvailableBots.mockResolvedValue([]);
+  mocks.resolveInboundAudio.mockResolvedValue({ kind: 'not_audio' });
   root = mkdtempSync(join(tmpdir(), 'botmux-frozen-host-flow-'));
   dataDir = join(root, 'data');
   process.env.SESSION_DATA_DIR = dataDir;
@@ -268,14 +388,19 @@ beforeEach(async () => {
   modules = await loadModules();
   modules.daemon.__testOnly_activeSessions.clear();
   modules.workerPool.setActiveSessionsRegistry(modules.daemon.__testOnly_activeSessions);
-  modules.registry.registerBot({
+  const bot = modules.registry.registerBot({
     larkAppId: APP,
     larkAppSecret: 'secret',
     cliId: 'codex',
     backendType: 'tmux',
     plugins: ['data-mcp'],
     allowedUsers: [ACTOR_OPEN_ID],
+    workingDir: root,
+    oncallChats: [{ chatId: CHAT, workingDir: root }],
   });
+  bot.botOpenId = 'ou_host_bot';
+  bot.botName = 'Current Bot';
+  bot.resolvedAllowedUsers = [ACTOR_OPEN_ID];
   const pending = modules.lifecycle.prepareFrozenCommandTransition({
     dataDir,
     targetBotId: APP,
@@ -302,10 +427,27 @@ afterEach(() => {
 
 describe('Frozen Command host-owned route → callback → Data MCP flow', () => {
   it.each([
-    ['thread', 'pty', '@Current Bot 运行 /宿主闭环 11'],
-    ['chat', 'tmux', '运行 /宿主闭环 11 @Current Bot'],
-  ] as const)('binds the exact human for %s/%s ingress including bot mentions', async (scope, backendType, sourceText) => {
-    const ds = makeSession({ scope, backendType, sourceText });
+    ['new-topic', 'pty', '@_bot 运行 /宿主闭环 11', '@Current Bot 运行 /宿主闭环 11'],
+    ['existing-thread', 'tmux', '运行 /宿主闭环 11 @_bot', '运行 /宿主闭环 11 @Current Bot'],
+  ] as const)('binds the exact human through real %s/%s ingress including bot mentions', async (
+    ingress,
+    backendType,
+    rawText,
+    normalizedText,
+  ) => {
+    const ds = ingress === 'new-topic'
+      ? await ingressNewTopic(backendType, rawText)
+      : await ingressExistingThread(backendType, rawText);
+    expect(modules.registry.getBot(APP).config.backendType).toBe(backendType);
+    expect(ds.activeInteractiveTurn).toMatchObject({
+      caller: {
+        requestUserOpenId: ACTOR_OPEN_ID,
+        requestUserUnionId: ACTOR_UNION_ID,
+        requestLarkAppId: APP,
+        senderType: 'user',
+      },
+      sourceContentHash: hash(normalizedText),
+    });
     const response = await postIntent(ds);
     expect(response.statusCode).toBe(200);
     expect(response.payload).toMatchObject({ status: 'awaiting_input', operation: 'run' });
@@ -317,7 +459,7 @@ describe('Frozen Command host-owned route → callback → Data MCP flow', () =>
     expect(completed).toMatchObject({
       actorOpenId: ACTOR_OPEN_ID,
       actorUnionId: ACTOR_UNION_ID,
-      sourceContentHash: hash(sourceText),
+      sourceContentHash: hash(normalizedText),
       queryId: 'q_host_flow',
     });
     expect(mocks.validateCalls).toBe(1);
@@ -341,12 +483,34 @@ describe('Frozen Command host-owned route → callback → Data MCP flow', () =>
     expect(mocks.runCalls).toBe(0);
   });
 
+  it.each([
+    ['bot', 'bot'],
+    ['unknown', 'unknown'],
+  ] as const)('rejects a %s active turn in the creation route before card or Data MCP', async (
+    _label,
+    senderType,
+  ) => {
+    const ds = makeSession({
+      scope: 'thread',
+      backendType: 'tmux',
+      sourceText: '运行命令',
+      senderType,
+    });
+    const response = await postIntent(ds);
+    expect(response.statusCode).toBe(403);
+    expect(response.payload).toMatchObject({ ok: false, error: 'trusted_human_required' });
+    expect(mocks.cardBodies).toHaveLength(0);
+    expect(mocks.validateCalls).toBe(0);
+    expect(mocks.runCalls).toBe(0);
+  });
+
   it('rechecks current canTalk so a revoked actor cannot use an old card', async () => {
     const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '运行命令' });
     expect((await postIntent(ds)).statusCode).toBe(200);
     const value = latestPreviewAction();
     const bot = modules.registry.getBot(APP);
     bot.resolvedAllowedUsers = [];
+    bot.config.oncallChats = [];
     const result = await modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP);
     expect(result).toMatchObject({ toast: { type: 'error' } });
     expect(modules.actionStore.getFrozenCommandAction(dataDir, value.transition_id)?.status).toBe('pending');

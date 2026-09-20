@@ -418,19 +418,20 @@ export function ipcRoute(method: string, path: string, handler: Handler): void {
   routes.push({ method: method.toUpperCase(), pattern, keys, handler });
 }
 
-/** Test seam for exercising the exact registered daemon handler without
- * opening a loopback server. Production authorization that lives inside the
- * handler (for example rotating turn capabilities) is still executed; only
- * the outer HTTP listener and host-HMAC gate are bypassed. */
-export async function __testOnly_dispatchIpcRoute(
-  method: string,
-  pathname: string,
+/** Narrow test seam for the Frozen Command action route. Production
+ * authorization inside the registered handler (including rotating turn
+ * capabilities) still executes; only the outer loopback/HMAC listener is
+ * bypassed. Keeping the path fixed prevents tests from using this as a generic
+ * authorization bypass for unrelated dashboard routes. */
+export async function __testOnly_dispatchFrozenCommandActionRoute(
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<boolean> {
+  const method = 'POST';
+  const pathname = '/api/frozen-command-actions';
   for (let index = routes.length - 1; index >= 0; index -= 1) {
     const route = routes[index];
-    if (!route || route.method !== method.toUpperCase()) continue;
+    if (!route || route.method !== method) continue;
     const match = route.pattern.exec(pathname);
     if (!match) continue;
     const params: Record<string, string> = {};
