@@ -382,7 +382,9 @@ async function postUntrustedIntentWithoutCapability(ds: any) {
 
 function latestPreviewAction(): { action: string; transition_id: string; nonce: string } {
   const parsed = JSON.parse(mocks.cardBodies.at(-1)!) as any;
-  return parsed.body.elements.find((element: any) => element.tag === 'action').actions[0].value;
+  const row = parsed.body.elements.find((element: any) => element.tag === 'column_set');
+  const button = row.columns[0].elements.find((element: any) => element.tag === 'button');
+  return button.behaviors.find((behavior: any) => behavior.type === 'callback').value;
 }
 
 function callbackData(

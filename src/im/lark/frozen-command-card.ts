@@ -111,25 +111,41 @@ export function buildFrozenCommandPreviewCard(input: {
           ].join('\n'),
         },
       }, {
-        tag: 'action',
-        actions: [{
-          tag: 'button',
-          type: 'primary',
-          text: { tag: 'plain_text', content: '确认运行' },
-          value: {
-            action: FROZEN_COMMAND_ACTION_CONFIRM,
-            transition_id: input.action.id,
-            nonce: input.nonce,
-          },
+        tag: 'column_set',
+        flex_mode: 'flow',
+        horizontal_spacing: '8px',
+        columns: [{
+          tag: 'column',
+          width: 'auto',
+          elements: [{
+            tag: 'button',
+            type: 'primary',
+            text: { tag: 'plain_text', content: '确认运行' },
+            behaviors: [{
+              type: 'callback',
+              value: {
+                action: FROZEN_COMMAND_ACTION_CONFIRM,
+                transition_id: input.action.id,
+                nonce: input.nonce,
+              },
+            }],
+          }],
         }, {
-          tag: 'button',
-          type: 'default',
-          text: { tag: 'plain_text', content: '取消' },
-          value: {
-            action: FROZEN_COMMAND_ACTION_CANCEL,
-            transition_id: input.action.id,
-            nonce: input.nonce,
-          },
+          tag: 'column',
+          width: 'auto',
+          elements: [{
+            tag: 'button',
+            type: 'default',
+            text: { tag: 'plain_text', content: '取消' },
+            behaviors: [{
+              type: 'callback',
+              value: {
+                action: FROZEN_COMMAND_ACTION_CANCEL,
+                transition_id: input.action.id,
+                nonce: input.nonce,
+              },
+            }],
+          }],
         }],
       }],
     },

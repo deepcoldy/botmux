@@ -61,13 +61,19 @@ describe('Frozen Command business cards', () => {
     expect(rendered).not.toContain('sql');
   });
 
-  it('puts only opaque action id and nonce in callback values', () => {
+  it('uses Card 2.0 buttons and puts only opaque action id and nonce in callback values', () => {
     const parsed = JSON.parse(buildFrozenCommandPreviewCard({
       action,
       nonce: 'nonce-1',
       initiatorLabel: '本人',
     })) as any;
-    const values = parsed.body.elements[1].actions.map((button: any) => button.value);
+    expect(parsed.schema).toBe('2.0');
+    expect(parsed.body.elements.some((element: any) => element.tag === 'action')).toBe(false);
+    const buttonRow = parsed.body.elements[1];
+    expect(buttonRow).toMatchObject({ tag: 'column_set', flex_mode: 'flow' });
+    const buttons = buttonRow.columns.map((column: any) => column.elements[0]);
+    expect(buttons.every((button: any) => button.tag === 'button' && button.value === undefined)).toBe(true);
+    const values = buttons.map((button: any) => button.behaviors[0].value);
     expect(values).toEqual([
       { action: 'frozen_command_run_confirm', transition_id: 'action-id', nonce: 'nonce-1' },
       { action: 'frozen_command_run_cancel', transition_id: 'action-id', nonce: 'nonce-1' },
