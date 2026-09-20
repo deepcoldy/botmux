@@ -624,7 +624,7 @@ function findKey(value: unknown, key: string, depth = 0): string | undefined {
   return undefined;
 }
 
-function planIdFromResult(result: Record<string, unknown>): string {
+function keyFromToolResult(result: Record<string, unknown>, key: string): string | undefined {
   const candidates: unknown[] = [result.structuredContent, result];
   for (const item of Array.isArray(result.content) ? result.content : []) {
     if (isPlainObject(item) && item.type === 'text' && typeof item.text === 'string') {
@@ -632,9 +632,15 @@ function planIdFromResult(result: Record<string, unknown>): string {
     }
   }
   for (const candidate of candidates) {
-    const found = findKey(candidate, 'query_plan_id');
+    const found = findKey(candidate, key);
     if (found) return found;
   }
+  return undefined;
+}
+
+function planIdFromResult(result: Record<string, unknown>): string {
+  const found = keyFromToolResult(result, 'query_plan_id');
+  if (found) return found;
   throw new FrozenCommandError('query_plan_missing', 'Data MCP 未返回 query_plan_id');
 }
 
@@ -738,7 +744,7 @@ export async function executeFrozenCommand(input: {
       },
     }, undefined, { signal: controller.signal, maxTotalTimeout: timeoutMs }) as Record<string, unknown>;
     if (runResult.isError === true) downstreamFailure('run', runResult);
-    const queryId = findKey(runResult, 'query_id');
+    const queryId = keyFromToolResult(runResult, 'query_id');
     const raw = frozenCommandResultText(runResult) || '查询完成，但没有可展示的结果。';
     const decorated = `${input.definition.output.prefix ?? ''}${raw}${input.definition.output.suffix ?? ''}`;
     const truncated = decorated.length > input.definition.output.maxChars;

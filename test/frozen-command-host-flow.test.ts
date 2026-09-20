@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   validateCalls: 0,
   runCalls: 0,
+  runResultShape: 'text' as 'top-level' | 'structured' | 'text' | 'malformed' | 'missing',
   cardBodies: [] as string[],
   replyMessage: vi.fn(async (_app: string, _anchor: string, body: string) => {
     mocks.cardBodies.push(body);
@@ -116,8 +117,29 @@ vi.mock('@modelcontextprotocol/sdk/client/index.js', () => ({
       }
       if (input.name === 'run_query_for_user') {
         mocks.runCalls += 1;
+        if (mocks.runResultShape === 'top-level') {
+          return {
+            query_id: 'q_host_flow',
+            content: [{ type: 'text', text: JSON.stringify({ status: 'success', rows: [{ probe_value: 22 }] }) }],
+          };
+        }
+        if (mocks.runResultShape === 'structured') {
+          return {
+            structuredContent: { status: 'success', query_id: 'q_host_flow', rows: [{ probe_value: 22 }] },
+            content: [{ type: 'text', text: JSON.stringify({ status: 'success', rows: [{ probe_value: 22 }] }) }],
+          };
+        }
+        if (mocks.runResultShape === 'malformed') {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ status: 'success', query_id: 42, rows: [{ probe_value: 22 }] }) }],
+          };
+        }
+        if (mocks.runResultShape === 'missing') {
+          return {
+            content: [{ type: 'text', text: JSON.stringify({ status: 'success', rows: [{ probe_value: 22 }] }) }],
+          };
+        }
         return {
-          query_id: 'q_host_flow',
           content: [{
             type: 'text',
             text: JSON.stringify({ status: 'success', query_id: 'q_host_flow', rows: [{ probe_value: 22 }] }),
@@ -415,6 +437,7 @@ beforeEach(async () => {
   vi.clearAllMocks();
   mocks.validateCalls = 0;
   mocks.runCalls = 0;
+  mocks.runResultShape = 'text';
   mocks.cardBodies.length = 0;
   mocks.getMessageChatId.mockResolvedValue(CHAT);
   mocks.getChatMode.mockResolvedValue('group');
@@ -469,6 +492,45 @@ afterEach(() => {
 });
 
 describe('Frozen Command host-owned route → callback → Data MCP flow', () => {
+  it.each([
+    ['top-level', 'top-level'],
+    ['structuredContent', 'structured'],
+    ['content[].text JSON', 'text'],
+  ] as const)('persists query_id from the %s MCP result shape', async (_label, shape) => {
+    mocks.runResultShape = shape;
+    const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '运行命令' });
+    expect((await postHostIntent(ds)).statusCode).toBe(200);
+    const value = latestPreviewAction();
+
+    await modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP);
+    const completed = await waitForStatus(value.transition_id, 'completed');
+    expect(completed.queryId).toBe('q_host_flow');
+    expect(mocks.validateCalls).toBe(1);
+    expect(mocks.runCalls).toBe(1);
+  });
+
+  it.each([
+    ['malformed', 'malformed'],
+    ['missing', 'missing'],
+  ] as const)('fails closed for a %s query_id without replay or model fallback', async (_label, shape) => {
+    mocks.runResultShape = shape;
+    const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '运行命令' });
+    expect((await postHostIntent(ds)).statusCode).toBe(200);
+    const value = latestPreviewAction();
+
+    await modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP);
+    const failed = await waitForStatus(value.transition_id, 'failed');
+    expect(failed).toMatchObject({ errorCode: 'query_id_missing' });
+    expect(failed.queryId).toBeUndefined();
+    expect(mocks.validateCalls).toBe(1);
+    expect(mocks.runCalls).toBe(1);
+    expect(mocks.cardBodies.at(-1)).toContain('不会回退模型');
+
+    await modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP);
+    expect(mocks.validateCalls).toBe(1);
+    expect(mocks.runCalls).toBe(1);
+  });
+
   it('allows a trusted host tool runner to list using the exact active turn without a capability file', async () => {
     const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '查看固化命令' });
     const response = await postHostIntent(ds, { operation: 'list' });
