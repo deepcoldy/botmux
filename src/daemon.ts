@@ -366,6 +366,7 @@ import {
   continueCrossPrincipalOwnerWait,
   crossPrincipalOwnerWaitDisposition,
   markCrossPrincipalSuggestionWaiting,
+  noteCrossPrincipalProposer,
   stageCrossPrincipalInterruptionRecord,
 } from './core/cross-principal-interruption-store.js';
 import {
@@ -18576,6 +18577,27 @@ async function stageCrossPrincipalInterruption(args: {
   const loc = localeForBot(ds.larkAppId);
   const proposerOpenId = proposer.requestUserOpenId;
   if (proposer.senderType === 'bot') {
+    // Bot↔bot auto-reply circuit breaker. A bot proposer that did not classify
+    // via `--as` still gets @-mentioned by the notice below; a bot running with
+    // `mentionMode: always` auto-replies to that notice, which is itself a fresh
+    // cross-principal interruption, and the two bots ping-pong forever. After
+    // enough consecutive bot proposers we mark the record loop-suppressed: it
+    // stays staged durably, but we skip the @-mention notice and let the drive
+    // loop resolve it silently, so the storm dies. A human proposer resets the
+    // counter (below), so this never affects people.
+    const loopGuard = noteCrossPrincipalProposer(ds.session, proposer);
+    if (loopGuard.suppressAckPrompt) {
+      staged.record.loopSuppressed = true;
+      staged.record.botClassifyDeadlineAt = Date.now() + CROSS_PRINCIPAL_CONFIRM_TIMEOUT_MS;
+      persistCrossPrincipalQueue(ds);
+      logger.warn(
+        `[${tag(ds)}] cross-principal bot↔bot loop breaker tripped `
+        + `(consecutive bot interruptions=${loopGuard.consecutiveBotInterruptions}); staging silently `
+        + `proposer=${proposerOpenId ?? 'unknown'} turn=${message.turnId.slice(0, 12)}`,
+      );
+      scheduleCrossPrincipalOwnerWait(ds, staged.record.botClassifyDeadlineAt);
+      return true;
+    }
     if (proposerOpenId) {
       void sessionReply(
         sessionAnchorId(ds),
@@ -18590,6 +18612,10 @@ async function stageCrossPrincipalInterruption(args: {
     scheduleCrossPrincipalOwnerWait(ds, staged.record.botClassifyDeadlineAt);
     return true;
   }
+  // A human proposer clears every bot's loop tally: a person choosing to keep
+  // messaging is never the runaway loop the breaker targets, and their turn is
+  // the natural signal that the room is sane again.
+  noteCrossPrincipalProposer(ds.session, proposer);
   void sessionReply(
     sessionAnchorId(ds),
     crossPrincipalStagedNotice(proposerOpenId, loc),
@@ -19047,6 +19073,19 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
       return;
     }
     if (record.phase === 'awaiting_classification') {
+      // Bot↔bot loop breaker: this record was staged past the consecutive-bot
+      // threshold. Resolve it silently — no classification notice, no @-mention
+      // terminal — so we never re-poke the looping bot proposer. The message is
+      // dropped (not executed); a human can always resend it, which resets the
+      // counter and restores the normal notice flow.
+      if (record.loopSuppressed) {
+        removeCrossPrincipalRecord(ds, record.id);
+        logger.warn(
+          `[${tag(ds)}] cross-principal record resolved silently by bot↔bot loop breaker `
+          + `turn=${record.messages[0]?.turnId?.slice(0, 12) ?? '?'}`,
+        );
+        return;
+      }
       const loc = localeForBot(ds.larkAppId);
       const proposerId = record.proposer.requestUserOpenId;
       if (!proposerId) {
