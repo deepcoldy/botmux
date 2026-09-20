@@ -418,6 +418,31 @@ export function ipcRoute(method: string, path: string, handler: Handler): void {
   routes.push({ method: method.toUpperCase(), pattern, keys, handler });
 }
 
+/** Test seam for exercising the exact registered daemon handler without
+ * opening a loopback server. Production authorization that lives inside the
+ * handler (for example rotating turn capabilities) is still executed; only
+ * the outer HTTP listener and host-HMAC gate are bypassed. */
+export async function __testOnly_dispatchIpcRoute(
+  method: string,
+  pathname: string,
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<boolean> {
+  for (let index = routes.length - 1; index >= 0; index -= 1) {
+    const route = routes[index];
+    if (!route || route.method !== method.toUpperCase()) continue;
+    const match = route.pattern.exec(pathname);
+    if (!match) continue;
+    const params: Record<string, string> = {};
+    route.keys.forEach((key, keyIndex) => {
+      params[key] = decodeURIComponent(match[keyIndex + 1] ?? '');
+    });
+    await route.handler(req, res, params);
+    return true;
+  }
+  return false;
+}
+
 export function jsonRes(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(JSON.stringify(body));

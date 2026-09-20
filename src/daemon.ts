@@ -6604,6 +6604,8 @@ async function handleFrozenCommandCardAction(
   };
 }
 
+export const __testOnly_handleFrozenCommandCardAction = handleFrozenCommandCardAction;
+
 const cardDeps: CardHandlerDeps = {
   activeSessions,
   sessionReply,
@@ -18946,6 +18948,7 @@ function onPrincipalLaneWorkerExit(ds: DaemonSession, workerGeneration: number):
 }
 
 export const __testOnly_onPrincipalLaneWorkerExit = onPrincipalLaneWorkerExit;
+export const __testOnly_setActiveInteractiveTurn = setActiveInteractiveTurn;
 
 type XpiSharedCwdTurnAdmission =
   | { kind: 'unmanaged' }
