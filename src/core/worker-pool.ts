@@ -12209,9 +12209,19 @@ function currentTurnProcessIdentities(
   ds: DaemonSession,
   turnId: string | undefined,
 ): string[] | undefined {
-  return turnId && ds.localProcessAttestation?.cliPid
-    ? snapshotProcessIdentities(ds.localProcessAttestation.cliPid)
-    : undefined;
+  if (!turnId || !ds.localProcessAttestation) return undefined;
+  const roots = [
+    ds.localProcessAttestation.cliPid,
+    ds.localProcessAttestation.enginePid,
+  ].filter((pid): pid is number => pid !== undefined);
+  if (roots.length === 0) return undefined;
+  const identities = new Set<string>();
+  for (const root of roots) {
+    const snapshot = snapshotProcessIdentities(root);
+    if (!snapshot) return undefined;
+    for (const identity of snapshot) identities.add(identity);
+  }
+  return [...identities].sort();
 }
 
 function setupWorkerHandlers(
@@ -12583,6 +12593,10 @@ function setupWorkerHandlers(
           credentialIsolated: msg.credentialIsolated,
           ...(msg.cliPid !== undefined ? { cliPid: msg.cliPid } : {}),
           ...(msg.cliProcStart !== undefined ? { cliProcStart: msg.cliProcStart } : {}),
+          ...(msg.enginePid !== undefined ? { enginePid: msg.enginePid } : {}),
+          ...(msg.engineProcStart !== undefined
+            ? { engineProcStart: msg.engineProcStart }
+            : {}),
           ...(ds.workerGeneration !== undefined
             ? { workerGeneration: ds.workerGeneration }
             : {}),

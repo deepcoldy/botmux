@@ -131,14 +131,14 @@ export function resolveLoopbackPeerProcesses(input: {
 
 function peerBelongsToCurrentTurn(input: {
   peer: ProcessIdentity;
-  cliPid: number;
+  trustedRootPids: ReadonlySet<number>;
   procRoot: string;
   preexistingProcessIdentities: ReadonlySet<string>;
 }): boolean {
   if (input.procRoot === '/proc' && process.platform !== 'linux') return false;
   let pid = input.peer.pid;
   for (let depth = 0; depth < 32 && pid > 1; depth++) {
-    if (pid === input.cliPid) return true;
+    if (input.trustedRootPids.has(pid)) return true;
     try {
       const raw = readFileSync(join(input.procRoot, String(pid), 'stat'), 'utf8');
       const fields = raw.slice(raw.lastIndexOf(')') + 2).trim().split(/\s+/);
@@ -164,8 +164,10 @@ export interface CurrentTurnPeerAttestation {
   generation: number;
   callerOpenId: string;
   capability: string;
-  cliPid: number;
-  cliProcStart: string;
+  cliPid?: number;
+  cliProcStart?: string;
+  enginePid?: number;
+  engineProcStart?: string;
   workerPid: number;
   workerProcStart: string;
   processIdentities: string[];
@@ -195,6 +197,8 @@ export function attestCurrentTurnLoopbackPeer(
   const attestation = ds?.localProcessAttestation;
   const cliPid = attestation?.cliPid;
   const cliProcStart = attestation?.cliProcStart;
+  const enginePid = attestation?.enginePid;
+  const engineProcStart = attestation?.engineProcStart;
   const processIdentities = ds?.managedTurnOrigin?.preexistingProcessIdentities;
   const workerPid = ds?.worker?.pid;
   const workerProcStart = workerPid ? readProcStart(workerPid, procRoot) : undefined;
@@ -205,22 +209,32 @@ export function attestCurrentTurnLoopbackPeer(
     || !turnId || generation === undefined
     || !workerPid || !workerProcStart || ds.worker?.killed === true
     || attestation?.workerGeneration !== generation
-    || !cliPid || !cliProcStart
+    || ((cliPid === undefined) !== (cliProcStart === undefined))
+    || ((enginePid === undefined) !== (engineProcStart === undefined))
+    || (cliPid === undefined && enginePid === undefined)
     || !processIdentities || processIdentities.length === 0
     || !callerOpenId?.startsWith('ou_') || !capability
-    || readProcStart(cliPid, procRoot) !== cliProcStart) {
+    || (cliPid !== undefined
+      && readProcStart(cliPid, procRoot) !== cliProcStart)
+    || (enginePid !== undefined
+      && readProcStart(enginePid, procRoot) !== engineProcStart)) {
     return null;
   }
+  const preexistingProcessIdentities = new Set(processIdentities);
+  const trustedRootPids = new Set([
+    ...(cliPid !== undefined ? [cliPid] : []),
+    ...(enginePid !== undefined ? [enginePid] : []),
+  ]);
   if (!peerBelongsToCurrentTurn({
-      peer: input.peer, cliPid, procRoot,
-      preexistingProcessIdentities: new Set(processIdentities),
+      peer: input.peer, trustedRootPids, procRoot,
+      preexistingProcessIdentities,
     })
     || readProcStart(input.peer.pid, procRoot) !== input.peer.procStart) {
     return null;
   }
   return {
     ds, turnId, generation, callerOpenId, capability,
-    cliPid, cliProcStart, workerPid, workerProcStart,
+    workerPid, workerProcStart, cliPid, cliProcStart, enginePid, engineProcStart,
     processIdentities: [...processIdentities],
   };
 }
@@ -239,6 +253,8 @@ export function currentTurnPeerAttestationStable(
     && again.capability === frozen.capability && again.cliPid === frozen.cliPid
     && again.cliProcStart === frozen.cliProcStart && again.workerPid === frozen.workerPid
     && again.workerProcStart === frozen.workerProcStart
+    && again.enginePid === frozen.enginePid
+    && again.engineProcStart === frozen.engineProcStart
     && JSON.stringify(again.processIdentities) === JSON.stringify(frozen.processIdentities);
 }
 

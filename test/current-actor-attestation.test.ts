@@ -93,6 +93,77 @@ describe('daemon current actor attestation', () => {
     expect(resolveIdentity).toHaveBeenCalledWith('cli_app', 'ou_current');
   });
 
+  it('binds an RPC tool descendant to the independently attested engine root', async () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    writeProc(procRoot, 200, 90, '3000');
+    writeProc(procRoot, 201, 200, '3100');
+    const ds = activeSession();
+    ds.localProcessAttestation.enginePid = 200;
+    ds.localProcessAttestation.engineProcStart = '3000';
+    ds.managedTurnOrigin.preexistingProcessIdentities = ['100:1000', '200:3000'];
+    const resolveIdentity = vi.fn(async () => ({
+      openId: 'ou_current', type: 'user' as const, email: 'current@example.com',
+    }));
+
+    await expect(resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 201, procStart: '3100' },
+      findSession: () => ds,
+      resolveIdentity,
+      procRoot,
+    })).resolves.toMatchObject({
+      ok: true,
+      document: { actor: { email: 'current@example.com' } },
+    });
+  });
+
+  it('supports the RPC opening window before the viewer CLI PID exists', async () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 200, 90, '3000');
+    writeProc(procRoot, 201, 200, '3100');
+    const ds = activeSession();
+    delete ds.localProcessAttestation.cliPid;
+    delete ds.localProcessAttestation.cliProcStart;
+    ds.localProcessAttestation.enginePid = 200;
+    ds.localProcessAttestation.engineProcStart = '3000';
+    ds.managedTurnOrigin.preexistingProcessIdentities = ['200:3000'];
+
+    await expect(resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 201, procStart: '3100' },
+      findSession: () => ds,
+      resolveIdentity: async () => ({
+        openId: 'ou_current', type: 'user' as const, email: 'current@example.com',
+      }),
+      procRoot,
+    })).resolves.toMatchObject({ ok: true });
+  });
+
+  it('rejects an RPC engine PID whose process identity is stale', async () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    writeProc(procRoot, 200, 90, 'reused');
+    writeProc(procRoot, 201, 200, '3100');
+    const ds = activeSession();
+    ds.localProcessAttestation.enginePid = 200;
+    ds.localProcessAttestation.engineProcStart = 'original';
+    ds.managedTurnOrigin.preexistingProcessIdentities = ['100:1000', '200:original'];
+    const resolveIdentity = vi.fn();
+
+    await expect(resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 201, procStart: '3100' },
+      findSession: () => ds,
+      resolveIdentity,
+      procRoot,
+    })).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+    expect(resolveIdentity).not.toHaveBeenCalled();
+  });
+
   it('rejects a same-uid process outside the attested CLI lineage', async () => {
     const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
     writeProc(procRoot, 90, 1, '900');

@@ -75,6 +75,8 @@ export interface DaemonSession {
     credentialIsolated: boolean;
     cliPid?: number;
     cliProcStart?: string;
+    enginePid?: number;
+    engineProcStart?: string;
     workerGeneration?: number;
   };
   /** Monotonic within one daemon boot. Captured by durable delivery receipts

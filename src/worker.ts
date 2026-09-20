@@ -1344,6 +1344,10 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // Mark its pid before the first turn so `botmux send` resolves the current
     // per-turn identity instead of falling back to a stale/session-only env.
     enginePidMarker = registerRpcEnginePidMarker(engine.appServerPid);
+    // The opening turn can start executing tools before the remote viewer TUI
+    // exists. Publish the independently attested engine root immediately so
+    // current-actor remains available during that narrow startup window.
+    publishLocalProcessAttestation(undefined, engine.appServerPid);
     const threadId = wantResume ? await engine.resumeThread(cfg.cliSessionId!) : await engine.startThread();
     assertRpcEngagementCurrent();
     let outcome: EngageOutcome = wantResume ? 'resumed' : 'accepted';
@@ -20118,14 +20122,20 @@ function rejectOrdinaryImTurn(
   });
 }
 
-function publishLocalProcessAttestation(cliPid?: number): void {
+function publishLocalProcessAttestation(
+  cliPid?: number,
+  enginePid = codexRpcEngine?.appServerPid,
+): void {
   const cliProcStart = cliPid ? readProcessStartIdentity(cliPid) : undefined;
+  const engineProcStart = enginePid ? readProcessStartIdentity(enginePid) : undefined;
   send({
     type: 'local_process_attestation',
     backendType: effectiveBackendType,
     credentialIsolated: currentCliCredentialIsolated,
     ...(cliPid ? { cliPid } : {}),
     ...(cliProcStart ? { cliProcStart } : {}),
+    ...(enginePid ? { enginePid } : {}),
+    ...(engineProcStart ? { engineProcStart } : {}),
   });
   // IPC preserves order: the daemon records this exact CLI pid/generation
   // before it snapshots the current turn's pre-existing descendants. This is

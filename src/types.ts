@@ -1691,6 +1691,10 @@ export type WorkerToDaemon =
       credentialIsolated: boolean;
       cliPid?: number;
       cliProcStart?: string;
+      /** RPC app-server root. Tool subprocesses are descendants of this
+       * sibling rather than of the viewer CLI. */
+      enginePid?: number;
+      engineProcStart?: string;
     }
   | {
       type: 'queued_activation_submitted';
