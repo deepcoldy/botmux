@@ -92,16 +92,61 @@ describe('Frozen Commands definition and positional UX', () => {
     expect(listed[0]?.snapshot?.definition.description).toContain('泰国');
   });
 
-  it('redacts SQL-bearing fields from Data MCP results before replying', () => {
+  it('renders only business rows from Data MCP results before replying', () => {
     const displayed = frozenCommandResultText({
       content: [{
         type: 'text',
-        text: JSON.stringify({ status: 'ok', sql: 'SELECT secret FROM t', data: [{ amount: 12 }] }),
+        text: JSON.stringify({
+          status: 'success',
+          query_id: 'q_internal',
+          datasource: 'tchouse-c',
+          sql: 'SELECT secret FROM t',
+          columns: [{ name: 'amount', description: '金额', type: 'UInt64' }],
+          rows: [{ amount: 12 }],
+          execution_ms: 106,
+          sql_account_binding: { account_bound: true },
+          repair_chain_id: 'repair_internal',
+          query_plan_execution_mode: 'single',
+        }),
       }],
     });
+    expect(displayed).toBe('12');
+    expect(displayed).not.toContain('q_internal');
+    expect(displayed).not.toContain('tchouse-c');
     expect(displayed).not.toContain('SELECT secret');
-    expect(displayed).toContain('"amount": 12');
-    expect(displayed).toContain('[已隐藏]');
+    expect(displayed).not.toContain('execution_ms');
+    expect(displayed).not.toContain('account_bound');
+    expect(displayed).not.toContain('repair_internal');
+    expect(displayed).not.toContain('query_plan');
+  });
+
+  it('uses column descriptions for multi-value rows and handles empty results', () => {
+    expect(frozenCommandResultText({
+      structuredContent: {
+        columns: [
+          { name: 'merchant_name', description: '商户' },
+          { name: 'amount', description: '金额' },
+        ],
+        rows: [{ merchant_name: 'A', amount: 12 }],
+      },
+    })).toBe('商户：A；金额：12');
+    expect(frozenCommandResultText({
+      content: [{ type: 'text', text: JSON.stringify({ status: 'success', rows: [] }) }],
+    })).toBe('查询完成，未找到符合条件的数据。');
+    expect(frozenCommandResultText({
+      content: [{ type: 'text', text: 'opaque internal response' }],
+    })).toBe('查询已完成。');
+    expect(frozenCommandResultText({
+      content: [{ type: 'text', text: JSON.stringify({ query_id: 'q_internal', rows: { amount: 12 } }) }],
+    })).toBe('查询已完成。');
+    expect(frozenCommandResultText({
+      structuredContent: {
+        rows: [
+          { merchant: 'A', amount: 12 },
+          { merchant: '<at id=all></at>B', amount: 20 },
+        ],
+      },
+    })).toBe('1. merchant：A；amount：12\n2. merchant：[mention]B；amount：20');
   });
 
   it('executes validate and run in one sessionless context with identical SQL bytes', async () => {
@@ -141,7 +186,8 @@ describe('Frozen Commands definition and positional UX', () => {
     });
 
     expect(result.renderedSql).toContain('today() - 30');
-    expect(result.text).toContain('"amount": 12');
+    expect(result.text).toContain('12');
+    expect(result.text).not.toContain('amount');
     expect(result.text).not.toContain('SELECT sum');
   });
 
@@ -218,6 +264,9 @@ describe('Frozen Commands definition and positional UX', () => {
     expect(userFacingFrozenCommandError(
       new FrozenCommandError('data_mcp_validate_failed', 'bad near SELECT secret FROM t'),
     )).not.toContain('SELECT secret');
+    expect(userFacingFrozenCommandError(
+      new FrozenCommandError('data_mcp_validate_failed', 'bad near SELECT secret FROM t'),
+    )).not.toContain('data_mcp_validate_failed');
   });
 
   it('rejects a command definition symlink instead of escaping the role directory', () => {

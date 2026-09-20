@@ -158,7 +158,7 @@ export function buildFrozenCommandActionStatusCard(
   const state = action.status === 'executing'
     ? { title: '正在执行', template: 'blue', text: '请求已受理，请勿重复点击。查询结果会发送到原会话。' }
     : action.status === 'completed'
-      ? { title: '执行完成', template: 'green', text: `/${action.command} 已完成${action.queryId ? `（query_id: ${action.queryId}）` : ''}。` }
+      ? { title: '执行完成', template: 'green', text: `/${action.command} 已完成。` }
       : action.status === 'expired'
         ? { title: '确认已过期', template: 'grey', text: '本次确认已过期，请重新发起。' }
         : action.errorCode === 'user_cancelled'

@@ -88,9 +88,12 @@ describe('Frozen Command business cards', () => {
     expect(buildFrozenCommandActionStatusCard({ ...action, status: 'executing' })).toMatchObject({
       header: { template: 'blue' },
     });
-    expect(buildFrozenCommandActionStatusCard({ ...action, status: 'completed', queryId: 'q_1' })).toMatchObject({
+    const completed = buildFrozenCommandActionStatusCard({ ...action, status: 'completed', queryId: 'q_1' });
+    expect(completed).toMatchObject({
       header: { template: 'green' },
     });
+    expect(JSON.stringify(completed)).not.toContain('q_1');
+    expect(JSON.stringify(completed)).not.toContain('query_id');
     expect(buildFrozenCommandActionStatusCard({ ...action, status: 'expired' })).toMatchObject({
       header: { template: 'grey' },
     });

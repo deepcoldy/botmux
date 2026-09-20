@@ -604,7 +604,49 @@ function textFromToolResult(result: Record<string, unknown>, hideSql = false): s
 }
 
 export function frozenCommandResultText(result: Record<string, unknown>): string {
-  return textFromToolResult(result, true);
+  const safeText = (value: string): string => value
+    .replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[mention]')
+    .replace(/<at\b[^>]*\/?>/gi, '[mention]')
+    .replace(/<\/at>/gi, '')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '�');
+  const candidates: unknown[] = [result.structuredContent];
+  for (const item of Array.isArray(result.content) ? result.content : []) {
+    if (isPlainObject(item) && item.type === 'text' && typeof item.text === 'string') {
+      try { candidates.push(JSON.parse(item.text)); } catch { /* non-JSON tool text is never echoed */ }
+    }
+  }
+  candidates.push(result);
+  const payload = candidates.find(candidate => isPlainObject(candidate)
+    && (Array.isArray(candidate.rows) || Array.isArray(candidate.data)));
+  if (!isPlainObject(payload)) return '查询已完成。';
+
+  const rawRows = Array.isArray(payload.rows) ? payload.rows : payload.data;
+  if (!Array.isArray(rawRows) || rawRows.length === 0) return '查询完成，未找到符合条件的数据。';
+  const rows: Array<Record<string, unknown>> = rawRows.map(row => isPlainObject(row) ? row : { '结果': row });
+  const columnLabels = new Map<string, string>();
+  if (Array.isArray(payload.columns)) {
+    for (const column of payload.columns) {
+      if (!isPlainObject(column) || typeof column.name !== 'string' || !column.name) continue;
+      const description = typeof column.description === 'string' ? column.description.trim() : '';
+      columnLabels.set(column.name, safeText(description || column.name));
+    }
+  }
+  const keys = [...new Set([
+    ...columnLabels.keys(),
+    ...rows.flatMap(row => Object.keys(row)),
+  ])].filter(key => rows.some(row => Object.hasOwn(row, key)));
+  const formatValue = (value: unknown): string => {
+    if (value === null || value === undefined) return '—';
+    if (typeof value === 'string') return safeText(value);
+    if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
+    try { return safeText(JSON.stringify(value)); } catch { return safeText(String(value)); }
+  };
+  if (rows.length === 1 && keys.length === 1) return formatValue(rows[0]![keys[0]!]);
+  const renderRow = (row: Record<string, unknown>): string => keys
+    .map(key => `${columnLabels.get(key) ?? safeText(key)}：${formatValue(row[key])}`)
+    .join('；');
+  if (rows.length === 1) return renderRow(rows[0]!);
+  return rows.map((row, index) => `${index + 1}. ${renderRow(row)}`).join('\n');
 }
 
 function findKey(value: unknown, key: string, depth = 0): string | undefined {
@@ -790,7 +832,7 @@ export function userFacingFrozenCommandError(error: unknown): string {
   if (/^(?:parameter_|definition_|untrusted_caller$|data_mcp_not_enabled$|execution_timeout$|query_plan_ambiguous$)/.test(error.code)) {
     return error.message;
   }
-  return `数据服务未完成查询（${error.code}），请稍后重试或联系维护方。`;
+  return '数据服务未完成查询，请稍后重试或联系维护方。';
 }
 
 export function buildFrozenCommandFallbackPrompt(input: {
