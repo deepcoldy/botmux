@@ -65,6 +65,7 @@ import {
   isManagedActivationStartingAtIndex,
   registerBot,
   getBot,
+  canManageFrozenCommands,
   getAllBots,
   getConfiguredOwnerOpenId,
   getOwnerOpenId,
@@ -5577,7 +5578,6 @@ async function routeFrozenCommand(input: {
   turnId: string;
   senderOpenId?: string;
   senderUnionId?: string;
-  operatorTrustUnionId?: string;
   senderIsBot?: boolean;
   mentions?: readonly LarkMention[];
   reply: (rootId: string, content: string, msgType?: string, larkAppId?: string) => Promise<string>;
@@ -5646,7 +5646,7 @@ async function routeFrozenCommand(input: {
     if (confirmMatch) {
       try {
         if (input.senderIsBot !== false) throw new Error('只有身份明确的真人消息可以确认固化命令状态变更');
-        if (!canOperate(input.larkAppId, input.chatId, input.senderOpenId, input.operatorTrustUnionId)) {
+        if (!canManageFrozenCommands(input.larkAppId, input.senderUnionId)) {
           throw new Error('当前用户无权确认固化命令状态变更');
         }
         const record = confirmFrozenCommandTransition({
@@ -5682,7 +5682,7 @@ async function routeFrozenCommand(input: {
     if (transition) {
       try {
         if (input.senderIsBot !== false) throw new Error('只有身份明确的真人消息可以发起固化命令状态变更');
-        if (!canOperate(input.larkAppId, input.chatId, input.senderOpenId, input.operatorTrustUnionId)) {
+        if (!canManageFrozenCommands(input.larkAppId, input.senderUnionId)) {
           throw new Error('当前用户无权发起固化命令状态变更');
         }
         const prepared = prepareFrozenCommandTransition({
@@ -6537,8 +6537,11 @@ async function handleFrozenCommandCardAction(
       return { toast: { type: 'error', content: '状态变更确认卡位置校验失败' } };
     }
     const operator = await resolveCardOperatorUnionId(data, larkAppId);
-    if (!operator.openId || !operator.unionId
-      || !canOperate(larkAppId, actualChatId, operator.openId, operator.unionId)) {
+    if (!operator.openId || !operator.unionId) {
+      return { toast: { type: 'error', content: '无法确认当前操作者身份' } };
+    }
+    if (actionKind === FROZEN_COMMAND_LIFECYCLE_CONFIRM
+      && !canManageFrozenCommands(larkAppId, operator.unionId)) {
       return { toast: { type: 'error', content: '仅发起操作的同一真人且仍有管理权限时可以确认' } };
     }
     try {
@@ -7695,7 +7698,7 @@ ipcRoute('POST', '/api/frozen-command-actions', async (req, res) => {
     });
   }
   if (body.operation !== 'run') {
-    if (!canOperate(ds.larkAppId, ds.chatId, actor.requestUserOpenId, actor.requestUserUnionId)) {
+    if (!canManageFrozenCommands(ds.larkAppId, actor.requestUserUnionId)) {
       return jsonRes(res, 403, { ok: false, error: 'operation_not_allowed' });
     }
     const action: FrozenCommandLifecycleAction = body.operation;
@@ -22671,7 +22674,6 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
         turnId: parsed.messageId,
         senderOpenId,
         senderUnionId,
-        operatorTrustUnionId: teamTrustUnionId,
         senderIsBot: senderIsBotTriState(parsed.senderType, isForeignBotSender),
         mentions: parsed.mentions,
         reply: invocationDeps.sessionReply,
@@ -24851,7 +24853,6 @@ async function handleThreadReplyAdmitted(
         turnId: parsed.messageId,
         senderOpenId: threadSenderOpenId,
         senderUnionId: threadSenderUnionId,
-        operatorTrustUnionId: threadTeamTrustUnionId,
         senderIsBot: senderIsBotTriState(parsed.senderType, isForeignBot),
         mentions: parsed.mentions,
         reply: invocationDeps.sessionReply,

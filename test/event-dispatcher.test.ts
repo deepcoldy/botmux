@@ -5724,6 +5724,7 @@ describe('managed Agent clone owner boundary', () => {
       larkAppSecret: 'source-secret',
       cliId: 'codex',
       allowedUsers: ['ou_source_owner', 'ou_stale_coowner'],
+      frozenCommandAdmins: ['on_source_admin'],
       name: 'source-proc',
       ...Object.fromEntries(instanceKeys.map(key => [key, { source: key }])),
     };
@@ -5741,6 +5742,7 @@ describe('managed Agent clone owner boundary', () => {
       allowedUsers: normalized?.split(','),
     });
     expect(target.allowedUsers).toEqual(['on_human_owner']);
+    expect(target).not.toHaveProperty('frozenCommandAdmins');
     for (const key of CLONE_EXCLUDED_KEYS) expect(target).not.toHaveProperty(key);
     // 行为配置仍照常克隆（否则「全删掉」也能让上面那条断言通过）。
     expect(target.cliId).toBe('codex');

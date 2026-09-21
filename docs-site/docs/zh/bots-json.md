@@ -209,6 +209,7 @@ Dashboard 保存后无需重启 daemon。模型、思考强度分别选择“继
 |------|------|
 | `ownerOpenId` | 显式指定该 bot 的主管理员 `ou_xxx`。它只有在仍存在于 `allowedUsers` 的解析结果中时才参与运行时权限判定；被移除或解析失败后权限会跟随解析出的 allowlist，原始值仅用于解析失败时的 DM 兜底。未指定时默认取解析出的首个 `ou_xxx` 用户。当配置了多位管理员时，群内授权申请卡会优先 @ 当前群内的管理员（避免 ping 群外人员） |
 | `allowedUsers` | 操作权名单。推荐使用**完整邮箱**、手机号或 `on_xxx`；`ou_xxx` 只能用于签发它的同一应用，禁止跨 Bot 复制。配了 `allowedChatGroups` 时至少要有一个作为 owner |
+| `frozenCommandAdmins` | 可创建、更新、废弃、恢复或彻底撤销共享固化命令的 `union_id`（仅接受 `on_xxx`）。缺省或空数组表示无人可变更，不能用 `allowedUsers` 代替。该权限按 Bot 判定，但命令文件按工作目录共享：多个 Bot 共用目录时，任一 Bot 的固化命令管理员都能影响同一批文件；其它 Bot 会因 specHash 不匹配而 fail-closed（可能拒绝服务，但不会静默执行被改写内容） |
 | `allowedChatGroups` | 可对话群（`oc_xxx`）。群内任何成员可对话（仅 `canTalk`），敏感操作仍由 `allowedUsers` 控制 |
 | `p2pOpen` | `true` 时允许飞书应用可用范围内的任何用户私聊该 bot（仅 `canTalk`）；群聊不受影响，敏感操作仍只认 `allowedUsers`。建议始终同时配置至少一个 `allowedUsers` owner |
 | `oncallChats` | oncall 绑定，`[{ "chatId": "oc_xxx", "workingDir": "~/projects/foo" }]`。见 [oncall](/oncall) |

@@ -952,6 +952,17 @@ function normalizeStringList(raw: unknown): string[] {
     .map((p) => p.trim());
 }
 
+function normalizeFrozenCommandAdmins(raw: unknown, path: string): string[] | undefined {
+  if (raw === undefined) return undefined;
+  const admins = normalizeStrictStringList(raw, path);
+  for (let index = 0; index < admins.length; index += 1) {
+    if (!admins[index]!.startsWith('on_')) {
+      strictConfigError(`${path}[${index}]`, 'must be a tenant-stable union_id beginning with on_');
+    }
+  }
+  return admins.length > 0 ? admins : undefined;
+}
+
 function normalizeSummaryRange(raw: unknown): SummaryRangeConfig | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const entry = raw as Record<string, unknown>;
@@ -1718,6 +1729,19 @@ export interface BotConfig {
   workingDir?: string;
   workingDirs?: string[];
   allowedUsers?: string[];
+  /**
+   * Tenant-stable union_ids allowed to create, update, retire, restore, or
+   * revoke shared Frozen Commands. This is deliberately separate from
+   * allowedUsers/canOperate: an open bot may allow everyone to talk, while
+   * shared command mutations must remain fail-closed. Missing/empty means
+   * nobody can mutate shared Frozen Commands through this bot.
+   *
+   * The command files remain working-directory scoped. If multiple bots share
+   * one working directory, an admin of any one of those bots can still change
+   * the shared bytes. Other bots' independent specHash ledgers then fail
+   * closed (availability loss, not silent execution of the changed content).
+   */
+  frozenCommandAdmins?: string[];
   /**
    * 黑名单（纯增量「否决腿」，与 allowedUsers 白名单独立）：原始条目形态与
    * allowedUsers 完全一致（邮箱 / 手机号 / on_ / ou_ 混写），daemon 启动期复用
@@ -2496,6 +2520,15 @@ export function registerBot(cfg: BotConfig): BotState {
   }
   bots.set(cfg.larkAppId, state);
   return state;
+}
+
+/** Strict, tenant-stable authority gate for shared Frozen Command mutations. */
+export function canManageFrozenCommands(
+  larkAppId: string,
+  senderUnionId: string | undefined,
+): boolean {
+  if (!senderUnionId?.startsWith('on_')) return false;
+  return (getBot(larkAppId).config.frozenCommandAdmins ?? []).includes(senderUnionId);
 }
 
 /** Publish the persisted native-subagent policy and its diagnostic metadata as
@@ -3745,6 +3778,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       workingDir: workingDirs?.[0] ?? entry.workingDir,
       workingDirs,
       allowedUsers: entry.allowedUsers,
+      frozenCommandAdmins: normalizeFrozenCommandAdmins(
+        entry.frozenCommandAdmins,
+        `Bot config [${i}].frozenCommandAdmins`,
+      ),
       // 与 allowedUsers 同款原始条目（邮箱/手机/on_/ou_），daemon 启动期复用同一套
       // 解析缓存换成本 app open_id；非数组 / 空归一为 undefined，保持 bots.json 干净。
       blockedUsers: Array.isArray(entry.blockedUsers)

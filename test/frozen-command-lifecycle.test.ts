@@ -183,6 +183,26 @@ describe('Frozen Command lifecycle ledger', () => {
     })).toThrowError(/不存在|不属于/);
   });
 
+  it('rejects a repeated confirmation after the first click consumes the token', () => {
+    const input = setup();
+    const pending = prepare(input, 'retire');
+
+    const retired = confirmFrozenCommandTransition({
+      dataDir: input.dataDir,
+      targetBotId: BOT,
+      token: pending.token,
+      actor: ACTOR,
+    });
+    expect(retired.state).toBe('retired');
+
+    expect(() => confirmFrozenCommandTransition({
+      dataDir: input.dataDir,
+      targetBotId: BOT,
+      token: pending.token,
+      actor: ACTOR,
+    })).toThrowError(/不存在|不属于/);
+  });
+
   it('requires the same real actor to confirm and leaves the active file untouched on denial', () => {
     const input = setup();
     const pending = prepare(input, 'retire');

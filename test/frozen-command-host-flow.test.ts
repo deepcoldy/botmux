@@ -482,6 +482,7 @@ beforeEach(async () => {
     backendType: 'tmux',
     plugins: ['data-mcp'],
     allowedUsers: [ACTOR_OPEN_ID],
+    frozenCommandAdmins: [ACTOR_UNION_ID],
     workingDir: root,
     oncallChats: [{ chatId: CHAT, workingDir: root }],
   });
@@ -649,6 +650,46 @@ unexpectedInternalField: true
     expect(rendered).toContain('工作目录');
     expect(mocks.validateCalls).toBe(0);
     expect(mocks.runCalls).toBe(0);
+  });
+
+  it('fails closed at lifecycle proposal when frozenCommandAdmins is absent', async () => {
+    const bot = modules.registry.getBot(APP);
+    const candidate = YAML.replace('SELECT {{value}} * 2', 'SELECT {{value}} * 4');
+    const file = join(root, '.botmux', 'commands', '宿主闭环.yaml');
+    const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '更新固化命令' });
+
+    bot.config.frozenCommandAdmins = undefined;
+    const deniedProposal = await postHostIntent(ds, {
+      operation: 'approve',
+      reason: '无管理员配置时拒绝',
+      definitionYaml: candidate,
+    });
+    expect(deniedProposal.statusCode).toBe(403);
+    expect(deniedProposal.payload).toMatchObject({ ok: false, error: 'operation_not_allowed' });
+    expect(mocks.cardBodies).toHaveLength(0);
+    expect(readFileSync(file, 'utf8')).toBe(YAML);
+  });
+
+  it('rechecks frozenCommandAdmins at card confirmation and fails closed after revocation', async () => {
+    const bot = modules.registry.getBot(APP);
+    const candidate = YAML.replace('SELECT {{value}} * 2', 'SELECT {{value}} * 4');
+    const file = join(root, '.botmux', 'commands', '宿主闭环.yaml');
+    const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '更新固化命令' });
+    bot.config.frozenCommandAdmins = [ACTOR_UNION_ID];
+    const prepared = await postHostIntent(ds, {
+      operation: 'approve',
+      reason: '确认前撤销管理员权限',
+      definitionYaml: candidate,
+    });
+    expect(prepared.statusCode).toBe(200);
+    const value = latestLifecycleAction();
+
+    bot.config.frozenCommandAdmins = [];
+    const deniedConfirmation = await modules.daemon.__testOnly_handleFrozenCommandCardAction(
+      callbackData(value), APP,
+    );
+    expect(deniedConfirmation).toMatchObject({ toast: { type: 'error' } });
+    expect(readFileSync(file, 'utf8')).toBe(YAML);
   });
 
   it('stages a model-proposed update and publishes it only after the same human clicks once', async () => {
