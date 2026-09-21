@@ -1346,7 +1346,7 @@ export function compileToBwrap(policy: FsPolicy, opts: CompileBwrapOpts): BwrapC
 // ───────────────────────────── legacy config migration ───────────────────────
 
 export interface LegacySandboxFields {
-  sandbox?: boolean;
+  sandbox?: boolean | 'off' | 'oncall' | 'scratch';
   readIsolation?: boolean;
   sandboxReadonlyPaths?: readonly string[];
   sandboxHidePaths?: readonly string[];
@@ -1371,7 +1371,10 @@ export function migrateLegacySandboxFields(entry: LegacySandboxFields & { sandbo
     || (entry.sandboxReadonlyPaths?.length ?? 0) > 0
     || (entry.sandboxHidePaths?.length ?? 0) > 0
     || (entry.readDenyExtraPaths?.length ?? 0) > 0;
-  const sandbox = entry.sandbox === true || entry.readIsolation === true;
+  const sandbox = entry.sandbox === true
+    || entry.sandbox === 'oncall'
+    || entry.sandbox === 'scratch'
+    || entry.readIsolation === true;
   if (!hasLegacy) return null; // plain `sandbox: true` needs no path migration
   const readOnly = [...(entry.sandboxReadonlyPaths ?? [])];
   const deny = [...(entry.sandboxHidePaths ?? []), ...(entry.readDenyExtraPaths ?? [])];

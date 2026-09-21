@@ -138,7 +138,7 @@ export function codexRpcEligible(cfg: InitCfg, runtime: CodexRpcRuntimeGates = {
   return (
     cfg.codexRpcInput === true && RPC_CAPABLE_CLIS.has(cfg.cliId) &&
     cfg.backendType === 'tmux' &&
-    cfg.adoptMode !== true && cfg.readIsolation !== true && cfg.sandbox !== true && runtime.sandboxForced !== true &&
+    cfg.adoptMode !== true && cfg.readIsolation !== true && cfg.sandbox !== true && cfg.sandbox !== 'oncall' && cfg.sandbox !== 'scratch' && runtime.sandboxForced !== true &&
     cfg.disableCliBypass !== true &&
     !cfg.startupCommands?.length &&
     !cfg.wrapperCli && runtimeExecutableEligible &&

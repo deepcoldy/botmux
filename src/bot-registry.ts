@@ -3,6 +3,11 @@ import { normalizeCodexInstancePool, registerCodexInstanceBot, clearCodexInstanc
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { underReadIsolation } from './adapters/cli/read-isolation.js';
+import {
+  normalizeSandboxMode,
+  normalizeScratchStorage,
+  type SandboxMode,
+} from './adapters/cli/sandbox-mode.js';
 import type { BackendType } from './adapters/backend/types.js';
 import { normalizeMojoConfig, type MojoConfig } from './adapters/backend/mojo-types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
@@ -1615,13 +1620,37 @@ export interface BotConfig {
    */
   triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig;
   /**
-   * Run this bot's CLI inside a per-session file sandbox (unified three-tier
-   * whitelist, deny-by-default; Linux bwrap + macOS Seatbelt with identical
-   * semantics — see adapters/cli/fs-policy.ts). The agent can read/write the
-   * project + its own BOT_HOME, read the system toolchain baseline, and touch
-   * NOTHING else. Env BOTMUX_SANDBOX=1 forces it on regardless (testing).
+   * Local file sandbox selection.
+   *   true/"oncall" — per-session deny-by-default three-tier whitelist
+   *     (Linux bwrap + macOS Seatbelt, identical semantics; see
+   *     adapters/cli/fs-policy.ts): the agent can read/write the project + its
+   *     own BOT_HOME, read the system toolchain baseline, and touch NOTHING
+   *     else. For sharing a bot with semi-trusted users.
+   *   "scratch" — Linux-only full-root COW overlay: the agent reads the whole
+   *     real filesystem natively but every write goes to a per-session
+   *     throwaway upper and never reaches the host. No confidentiality
+   *     boundary; for the owner's own disposable experiments. See
+   *     docs/design/2026-09-21-sandbox-scratch-mode.md.
+   *   false/"off"/missing — no local file isolation.
+   * Env BOTMUX_SANDBOX=1 forces oncall, BOTMUX_SANDBOX=scratch forces scratch
+   * (testing/global).
    */
-  sandbox?: boolean;
+  sandbox?: boolean | 'oncall' | 'scratch' | 'off';
+  /**
+   * Scratch-mode upper storage (ignored by the other modes). "tmpfs" (default):
+   * the upper lives in RAM and dies with the machine; "disk": it survives a
+   * daemon restart for cold resume and is deleted when the session ends.
+   */
+  scratchStorage?: 'tmpfs' | 'disk';
+  /** Cap for the tmpfs upper in MB (tmpfs storage only). 0/missing = kernel
+   *  default (~half of RAM). */
+  scratchTmpfsSizeMb?: number;
+  /**
+   * Extra paths hidden inside a scratch sandbox ON TOP OF the full-root view
+   * (mode-000 masks). The fixed transport-credential masks are always applied
+   * and needn't be listed. Only meaningful with sandbox: "scratch".
+   */
+  scratchDenyPaths?: string[];
   /**
    * User增量 three-tier path lists layered ON TOP of the baseline preset
    * (never replacing it). Deepest matching rule wins, so nested black/white
@@ -3304,13 +3333,39 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     if (cliRuntime && entry.cliPathOverride !== cliRuntime.executable) {
       throw new Error(`Bot config [${i}]: cliPathOverride must exactly match cliRuntime.executable`);
     }
+    // Resolve the sandbox tri-state ONCE (throws on a typo'd mode — never
+    // silently unsandboxed); every check/project site below uses this value.
+    let sandboxMode: SandboxMode = 'off';
+    try {
+      sandboxMode = normalizeSandboxMode(entry.sandbox);
+    } catch (e) {
+      throw new Error(`Bot config [${i}]: ${(e as Error).message}`);
+    }
+    const scratchStorage = entry.scratchStorage !== undefined
+      ? normalizeScratchStorage(entry.scratchStorage)
+      : undefined;
+    if (scratchStorage !== undefined) {
+      try {
+        if (typeof scratchStorage === 'string' && scratchStorage !== 'tmpfs' && scratchStorage !== 'disk') {
+          throw new Error(`invalid scratchStorage: ${JSON.stringify(entry.scratchStorage)}`);
+        }
+      } catch (e) {
+        throw new Error(`Bot config [${i}]: ${(e as Error).message}`);
+      }
+    }
+    const scratchTmpfsSizeMb = typeof entry.scratchTmpfsSizeMb === 'number'
+      && Number.isFinite(entry.scratchTmpfsSizeMb)
+      && entry.scratchTmpfsSizeMb > 0
+      ? Math.floor(entry.scratchTmpfsSizeMb)
+      : undefined;
+    const scratchDenyPaths = normalizeStringList(entry.scratchDenyPaths);
     validateCliLaunchModeConfig({
       cliId: entryCliId,
       cliLaunchMode,
       wrapperCli: entry.wrapperCli,
       cliRuntime: entry.cliRuntime,
       cliPathOverride: entry.cliPathOverride,
-      sandbox: entry.sandbox,
+      sandbox: sandboxMode,
       readIsolation: entry.readIsolation,
     }, `Bot config [${i}]`);
     const existingAppServer = normalizeExistingAppServerConfig(
@@ -3337,7 +3392,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (existingAppServer) {
         throw new Error(`Bot config [${i}]: codexBrowser cannot be combined with existingAppServer`);
       }
-      if (entry.sandbox === true || entry.readIsolation === true) {
+      if (sandboxMode !== 'off' || entry.readIsolation === true) {
         throw new Error(`Bot config [${i}]: codexBrowser cannot be combined with sandbox or readIsolation`);
       }
     }
@@ -3351,7 +3406,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()) {
         throw new Error(`Bot config [${i}]: existingAppServer cannot be combined with wrapperCli`);
       }
-      if (entry.sandbox === true || entry.readIsolation === true) {
+      if (sandboxMode !== 'off' || entry.readIsolation === true) {
         throw new Error(`Bot config [${i}]: existingAppServer cannot be combined with sandbox or readIsolation`);
       }
     }
@@ -3710,7 +3765,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       codexAuthSync: entry.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
       codexInstancePool,
       ...(triggerUserAuth ? { triggerUserAuth } : {}),
-      sandbox: entry.sandbox === true,
+      // Wire representation stays backwards compatible: oncall = legacy `true`;
+      // only scratch is a string; off serializes as false.
+      sandbox: sandboxMode === 'oncall' ? true : sandboxMode === 'scratch' ? 'scratch' : false,
+      scratchStorage,
+      scratchTmpfsSizeMb,
+      scratchDenyPaths,
       sandboxPaths: entry.sandboxPaths && typeof entry.sandboxPaths === 'object' && !Array.isArray(entry.sandboxPaths)
         ? {
             readWrite: normalizeStringList(entry.sandboxPaths.readWrite),

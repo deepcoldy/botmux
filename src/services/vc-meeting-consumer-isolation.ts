@@ -31,11 +31,11 @@ export type VcMeetingConsumerIsolationResult =
  *    to either turn sandbox off (informed) or move to a Linux pty/tmux backend.
  */
 export function evaluateVcMeetingConsumerIsolation(input: {
-  sandbox: boolean | undefined;
+  sandbox: boolean | 'off' | 'oncall' | 'scratch' | undefined;
   platform: NodeJS.Platform;
   backendType: BackendType;
 }): VcMeetingConsumerIsolationResult {
-  if (input.sandbox !== true) {
+  if (input.sandbox === false || input.sandbox === 'off' || input.sandbox === undefined) {
     // Plan B: no sandbox requested → allowed, but not isolated.
     return { ok: true, isolated: false };
   }

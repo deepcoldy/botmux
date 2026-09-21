@@ -1,6 +1,67 @@
-# 文件沙盒（oncall 安全共享）
+# 文件沙盒（oncall 白名单 + scratch 一次性）
 
-把某个 bot 的 CLI 会话关进一个**按会话隔离的文件沙盒**，让你能把机器人放心分享给半受信任的人（oncall）：对方只能操作 agent + 一份项目副本，**碰不到你磁盘上的真实文件、密钥、别的会话数据**。
+BotMux 有**两种正交的文件沙盒**，一个开关三档：
+
+| 模式 | 目标 | 可读 | 写 | 平台 |
+|---|---|---|---|---|
+| `off` | — | 全部 | 直达宿主 | 全 |
+| `oncall`（缺省沙盒） | **保密**：分享给半受信任的人 | deny-by-default 白名单 | 白名单内直达宿主、即时落盘 | Linux + macOS |
+| `scratch`（2026-09 新增） | **完整可弃**：owner 自己的一次性草稿环境 | 整个真实文件系统 | 全部进 COW upper，**宿主永不变**，会话结束即弃 | **仅 Linux** |
+
+> scratch **不防恶意载荷**（agent 仍能读到磁盘上的密钥并经网络外发）；它防的是「写污染」——破坏性/试验性操作不影响真实机器。需要保密时用 oncall。
+
+## 三模式的配置
+
+- dashboard：bot 默认设置面板「文件沙盒」三选一分段控件（关闭 / oncall / scratch），scratch 下可选存储（内存即焚 / 磁盘可跨重启续跑）。
+- `bots.json`：`"sandbox": true`（=oncall，向后兼容）、`"sandbox": "oncall"`、`"sandbox": "scratch"`、省略/`false`/`"off"`。
+- 环境变量：`BOTMUX_SANDBOX=1`（=oncall，向后兼容）、`BOTMUX_SANDBOX=scratch`；未识别取值**报错拒绝启动**（绝不静默关沙盒）。
+
+scratch 专属字段（均可选）：
+
+```json
+{
+  "sandbox": "scratch",
+  "scratchStorage": "tmpfs",
+  "scratchTmpfsSizeMb": 0,
+  "scratchDenyPaths": []
+}
+```
+
+- `scratchStorage`：`tmpfs`（默认，upper 在内存，关盒/重启即焚）或 `disk`（upper 落盘，daemon 重启可冷恢复续跑，会话结束时删除）。
+- `scratchTmpfsSizeMb`：tmpfs 容量上限（0=内核默认 ≈ 半内存）；大构建可调大或用 disk。
+- `scratchDenyPaths`：在「读全盘」之上额外遮罩的路径（mode-000 空源，同 oncall deny 编译）。botmux 自身传输凭证（bots.json 及 sidecar、dashboard secret、每会话沙盒树）**固定遮罩不可配开**；`~/.ssh`/`~/.aws` 不遮（git ssh/云 CLI 要用），需要时自行加。
+
+## scratch 工作原理（已在 live 机实测）
+
+```
+host 侧（spawn 前，root 用内核 mount；非 root 用 fuse-overlayfs）:
+  tmpfs 模式: mount -t tmpfs <slot>                          # 独立超级块
+              mount -t overlay lowerdir=/ upper=<slot>/upper work=<slot>/work <dataDir>/sandboxes/<sid>/root
+  disk  模式: mount -t overlay lowerdir=/ upper=<sRoot>/upper work=<sRoot>/work <…>/root
+bwrap:
+  --bind <merged> /            # 容器根 = 全根 COW 视图
+  新鲜 /proc /dev /tmp /run /var/tmp /dev/shm
+  deny masks（固定凭证集 + scratchDenyPaths）
+  outbox /run/sbxbin shim / MCP socket 等穿透 bind（与 oncall 同一套）
+  -- <cli>
+```
+
+关键事实：
+
+1. **子挂载点递归 overlay**：`lowerdir=/` 时 overlayfs **不递归**挂载点（独立数据盘如 `/data00`、bind mount 在 merged 里会变空目录）。scratch 会枚举所有相关子挂载、各挂一层自己的 overlay 再 bind 进主 merged；无法 overlay 的子挂载只读透传，workingDir 落在其上时**硬失败**（绝不把真实项目读写穿透给宿主）。
+2. **宿主零写入**：容器内写任何路径（含 `/etc`、`$HOME`、项目）都 copy-up；host 侧只在 `<merged>/…` 可见，真实路径逐项无变化。探针：`node scripts/scratch-sandbox-probe.mjs [--disk]`，真 CLI 端到端：`node scripts/scratch-real-cli-probe.mjs [--codex]`。
+3. **daemon 侧读改写**：CLI 在容器里写的 transcript/rollout/events，宿主真实路径看不到，daemon/worker 统一从 `<merged>/<绝对路径>` 读（`scratchHostView`；transcript-resolver 按会话冻结的 scratch 状态自动 remap，unmount 时自然 ENOENT，**不回退读宿主真实路径**）。worker 是每会话进程，CODEX_HOME/TRAE_HOME 在进程内重指 merged、对容器子进程经 `--setenv/--unsetenv` 强制保持原生路径。
+4. **resume**：活 pane（tmux 等）reattach 只重接 outbox watcher，绝不重挂；disk 模式重启后用同一 upper/work 重挂可冷恢复（实测数据完整）；tmpfs 模式机器重启后 upper 消亡，会话标记不可恢复，提示开新会话（不伪造新 upper）。
+5. **生命周期**：正常关闭/sweep 按「子 bind → 子 overlay → 主 overlay → tmpfs 槽」逆序卸载并删目录；daemon 启动与周期 reconciler 调 `sweepOrphanScratchSandboxes`，/proc cmdline 活进程守卫 + 60s grace（沿用 oncall sweep 的事故教训）。
+6. 非 root：自动走 `fuse-overlayfs`（需 /dev/fuse），storage 强制为 disk 语义；依赖缺失自动装失败则**报错不裸跑**。
+
+scratch 与 oncall 共用：`botmux send` outbox 中转（凭证不进沙盒）、seccomp nice 隔离判据、owner env 冻结、proxy/CA env、shim/trusted 命令穿透 bind。互斥项与 oncall 相同（riff 远端、forge-traex、codexBrowser、existingAppServer、Codex instance routing、codexAuthSync: isolated、legacy readIsolation）。
+
+---
+
+# oncall 模式（fs-policy 白名单）详述
+
+把某个 bot 的 CLI 会话关进一个**按会话隔离的文件沙盒**，让你能把机器人放心分享给半受信任的人（oncall）：对方只能操作 agent + 白名单内的项目/数据，**碰不到你磁盘上的真实密钥、别的会话数据**。
 
 > 调研与威胁模型见 [`sandbox-oncall-research-20260605.md`](./sandbox-oncall-research-20260605.md)。
 > 当前 scope = **只隔离文件**（Linux）。网络**不**隔离（`npm install` / `git fetch` 照常）；不防内核级容器逃逸——面向半受信任用户，不是面向恶意攻击者。

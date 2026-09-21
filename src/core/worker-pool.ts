@@ -1,3 +1,4 @@
+import { sandboxBoolValue, normalizeSandboxMode, normalizeScratchStorage } from '../adapters/cli/sandbox-mode.js';
 /**
  * Worker pool — manages forking, killing, and lifecycle of worker processes.
  * Extracted from daemon.ts for modularity.
@@ -328,7 +329,7 @@ function daemonCardLocalHomeLinkMode(ds: DaemonSession): LocalHomeLinkMode {
   // while restoring sessions that do not yet have an initConfig.
   const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
   return (backendType !== undefined && isRemoteBackendType(backendType))
-    || ds.session.sandbox === true
+    || (ds.session.sandbox === true || ds.session.sandbox === 'scratch')
     || ds.initConfig?.readIsolation === true
     || sandboxEnabled()
     ? 'lexical'
@@ -11429,7 +11430,7 @@ export function forkWorker(
         + 'use /adopt to select a Codex App conversation first',
       );
     }
-    if (ds.session.sandbox === true || botCfg.readIsolation === true) {
+    if ((ds.session.sandbox === true || ds.session.sandbox === 'scratch') || botCfg.readIsolation === true) {
       throw new Error(
         'existing Codex App Server attachment cannot run under sandbox/readIsolation; '
         + 'the external app-server would remain outside that boundary',
@@ -11542,13 +11543,24 @@ export function forkWorker(
   // decision predates the sandbox feature → stays NOT sandboxed.
   if (ds.session.sandbox === undefined) {
     if (!resume) {
-      ds.session.sandbox = botCfg.sandbox === true;
+      {
+        const resolved = botCfg.readIsolation === true ? 'oncall' : normalizeSandboxMode(botCfg.sandbox);
+        ds.session.sandbox = resolved === 'scratch' ? 'scratch' : resolved === 'oncall' ? true : false;
+      }
       ds.session.sandboxPaths = botCfg.sandboxPaths;
       ds.session.sandboxHidePaths = botCfg.sandboxHidePaths ?? [];
       ds.session.sandboxReadonlyPaths = botCfg.sandboxReadonlyPaths ?? [];
       ds.session.sandboxNetwork = botCfg.sandboxNetwork !== false;
+      if (ds.session.sandbox === 'scratch') {
+        ds.session.sandboxScratch = {
+          storage: normalizeScratchStorage(botCfg.scratchStorage),
+          ...(botCfg.scratchTmpfsSizeMb ? { tmpfsSizeMb: botCfg.scratchTmpfsSizeMb } : {}),
+          ...(botCfg.scratchDenyPaths?.length ? { denyPaths: botCfg.scratchDenyPaths } : {}),
+          network: botCfg.sandboxNetwork !== false,
+        };
+      }
     } else {
-      ds.session.sandbox = false;
+      ds.session.sandbox = 'off';
       ds.session.sandboxHidePaths = [];
       ds.session.sandboxReadonlyPaths = [];
       ds.session.sandboxNetwork = true;
@@ -11981,7 +11993,14 @@ export function forkWorker(
     replyStyle: botCfg.replyStyle,
     // Use the decision recorded on the session (above), NOT the live bot flag, so
     // historical sessions never get retroactively sandboxed on restart.
-    sandbox: ds.session.sandbox === true,
+    sandbox: ds.session.sandbox === true
+      ? true
+      : ds.session.sandbox === 'scratch'
+        ? 'scratch'
+        : undefined,
+    scratchStorage: ds.session.sandboxScratch?.storage ?? botCfg.scratchStorage,
+    scratchTmpfsSizeMb: ds.session.sandboxScratch?.tmpfsSizeMb ?? botCfg.scratchTmpfsSizeMb,
+    scratchDenyPaths: ds.session.sandboxScratch?.denyPaths ?? botCfg.scratchDenyPaths,
     sandboxPaths: ds.session.sandboxPaths ?? botCfg.sandboxPaths,
     sandboxHidePaths: ds.session.sandboxHidePaths ?? [],
     sandboxReadonlyPaths: ds.session.sandboxReadonlyPaths ?? [],
@@ -16999,10 +17018,10 @@ export function reserveWorkerGeneration(ds: DaemonSession): number {
  * a fresh CLI, which the sandbox wraps normally.
  */
 export function adoptSandboxBlocked(
-  botCfg: { sandbox?: boolean; readIsolation?: boolean; apiOnly?: boolean },
-  session?: { sandbox?: boolean; chatId?: string },
+  botCfg: { sandbox?: boolean | 'off' | 'oncall' | 'scratch'; readIsolation?: boolean; apiOnly?: boolean },
+  session?: { sandbox?: boolean | 'off' | 'oncall' | 'scratch'; chatId?: string },
 ): boolean {
-  return botCfg.sandbox === true
+  return sandboxBoolValue(botCfg.sandbox)
     || botCfg.readIsolation === true
     // A core-only (apiOnly) bot — or a session on a synthetic HTTP virtual chat —
     // must NOT adopt-observe a pre-existing external CLI: that CLI runs fully
@@ -17011,7 +17030,7 @@ export function adoptSandboxBlocked(
     // no-transport turn. Convert to cold-start instead (same as sandbox adopt).
     || botCfg.apiOnly === true
     || isHttpVirtualSession(session?.chatId)
-    || session?.sandbox === true
+    || sandboxBoolValue(session?.sandbox)
     || sandboxEnabled();
 }
 

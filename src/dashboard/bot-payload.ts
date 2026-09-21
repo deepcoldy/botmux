@@ -125,7 +125,14 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     // Private Bot Defaults payload only. Keep the persisted shape sparse and
     // drop malformed hand edits field-by-field before they reach form state.
     replyStyle: normalizeSparseReplyStyleConfig(j?.replyStyle).config ?? null,
-    sandbox: j?.sandbox === true,
+    sandbox: j?.sandbox === true || j?.sandbox === 'oncall' || j?.sandbox === 'scratch',
+    sandboxMode: j?.sandboxMode === 'off' || j?.sandboxMode === 'oncall' || j?.sandboxMode === 'scratch'
+      ? j.sandboxMode
+      : (j?.sandbox === 'scratch' ? 'scratch' : j?.sandbox === true || j?.sandbox === 'oncall' ? 'oncall' : 'off'),
+    scratchStorage: j?.scratchStorage === 'disk' || j?.scratchStorage === 'tmpfs' ? j.scratchStorage : null,
+    scratchTmpfsSizeMb: typeof j?.scratchTmpfsSizeMb === 'number' ? j.scratchTmpfsSizeMb : null,
+    scratchDenyPaths: Array.isArray(j?.scratchDenyPaths) ? j.scratchDenyPaths.filter((x: unknown) => typeof x === 'string') : null,
+    scratchSupported: j?.scratchSupported === true,
     sandboxPaths: (j?.sandboxPaths && typeof j.sandboxPaths === 'object' && !Array.isArray(j.sandboxPaths))
       ? {
           readWrite: Array.isArray(j.sandboxPaths.readWrite) ? j.sandboxPaths.readWrite.filter((x: unknown) => typeof x === 'string') : [],

@@ -8,6 +8,8 @@ import { expandHome } from '../core/working-dir.js';
 import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId } from './codex-transcript.js';
 import { codexHome as configuredCodexHome } from './codex-paths.js';
 import { getSession } from './session-store.js';
+import { config } from '../config.js';
+import { scratchMergedRootFor, scratchViewPath } from './scratch-host-view.js';
 import { cocoEventsPathForSession } from './coco-transcript.js';
 import { findCursorTranscriptByChatId } from './cursor-transcript.js';
 import { findTraexRolloutBySessionId, findTraexSessionIdByBotmuxSessionId } from './traex-transcript.js';
@@ -275,20 +277,54 @@ export function cliSupportsNativeUsage(cliId: string | undefined): boolean {
   return !!cliId && USAGE_RESOLVABLE_CLI_IDS.has(cliId);
 }
 
+const foundWrap = (found: string | null | undefined, v: (p: string) => string): string | null =>
+  found ? v(found) : null;
+
+/** Scratch sessions write CLI transcripts inside the per-session merged
+ *  overlay; the host-global roots (~/.claude, ~/.codex, …) only hold the
+ *  lower (pre-session) files. Returns the merged root for a frozen scratch
+ *  session, else undefined (real-host paths apply). */
+function sessionScratchViewRoot(q: TranscriptPathQuery): string | undefined {
+  // Fail OPEN to host paths when the session record can't be read (a mocked /
+  // unavailable store in tests, a transient read error): such a session can't
+  // be proven scratch. Real scratch sessions always have a live record.
+  let session;
+  try { session = getSession(q.sessionId); } catch { return undefined; }
+  if (session?.sandbox !== 'scratch') return undefined;
+  try {
+    return scratchMergedRootFor(config.session.dataDir, q.sessionId);
+  } catch {
+    return undefined;
+  }
+}
+
 export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTranscriptPath | null {
   const sid = q.cliSessionId || q.sessionId;
+  // Scratch: every host-derived root below is read through the per-session
+  // merged overlay. Never read the real lower transcript for a scratch
+  // session (it belongs to a different/pre-session state).
+  const svRoot = sessionScratchViewRoot(q);
+  const v = (hostPath: string): string => scratchViewPath(svRoot, hostPath);
   switch (q.cliId) {
     case 'claude-code': {
-      const path = claudeJsonlWithBotHomeFallback(sid, q, join(homedir(), '.claude'));
+      const homeRoot = v(join(homedir(), '.claude'));
+      const path = svRoot
+        ? (q.cwd ? getClaudeSessionJsonlPath(sid, q.cwd, homeRoot) : null)
+        : claudeJsonlWithBotHomeFallback(sid, q, join(homedir(), '.claude'));
       return path ? { path, kind: 'claude' } : null;
     }
     case 'aiden': {
-      const path = claudeJsonlWithBotHomeFallback(sid, q, join(homedir(), '.claude'));
+      const homeRoot = v(join(homedir(), '.claude'));
+      const path = svRoot
+        ? (q.cwd ? getClaudeSessionJsonlPath(sid, q.cwd, homeRoot) : null)
+        : claudeJsonlWithBotHomeFallback(sid, q, join(homedir(), '.claude'));
       return path ? { path, kind: 'claude' } : null;
     }
     case 'seed':
     case 'relay': {
-      const path = claudeJsonlWithBotHomeFallback(sid, q, claudeForkDataDir(q.cliId));
+      const path = svRoot
+        ? (q.cwd ? getClaudeSessionJsonlPath(sid, q.cwd, v(claudeForkDataDir(q.cliId))) : null)
+        : claudeJsonlWithBotHomeFallback(sid, q, claudeForkDataDir(q.cliId));
       return path ? { path, kind: 'claude' } : null;
     }
     case 'codex': {
@@ -303,8 +339,10 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       // absolute path is part of the cache key so changing it cannot reuse a
       // rollout discovered under a previous root.
       const globalCodexHome = resolve(configuredCodexHome());
-      const globalPath = codexRolloutInHome(q, globalCodexHome, false);
-      const botHomeDir = botHomeCliDataDir(q.larkAppId, 'codex');
+      const globalPath = codexRolloutInHome(q, svRoot ? v(globalCodexHome) : globalCodexHome, false);
+      // Scratch uses the NATIVE codex home (no BOT_HOME redirect); scanning a
+      // host-real BOT_HOME could only surface a stale rollout, so skip it.
+      const botHomeDir = svRoot ? null : botHomeCliDataDir(q.larkAppId, 'codex');
       const resolvedBotHomeDir = botHomeDir ? resolve(botHomeDir) : null;
       const botHomeRollout = resolvedBotHomeDir
         ? codexRolloutInHome(q, resolvedBotHomeDir, true)
@@ -323,11 +361,12 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       return path ? { path, kind: 'codex' } : null;
     }
     case 'coco': {
-      const path = cocoEventsPathForSession(sid);
+      const found = cocoEventsPathForSession(sid);
+      const path = found ? v(found) : null;
       return path ? { path, kind: 'coco' } : null;
     }
     case 'cursor': {
-      const path = cachedTranscriptPathLookup(`cursor:${sid}`, null, () => findCursorTranscriptByChatId(sid) ?? null, { retryMiss: q.fresh });
+      const path = cachedTranscriptPathLookup(`cursor:${sid}`, null, () => foundWrap(findCursorTranscriptByChatId(sid), v), { retryMiss: q.fresh });
       return path ? { path, kind: 'cursor' } : null;
     }
     case 'traex': {
@@ -336,7 +375,7 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
           ? undefined
           : findTraexSessionIdByBotmuxSessionId(q.sessionId);
         const traexSid = q.cliSessionId || mappedSid || q.sessionId;
-        return findTraexRolloutBySessionId(traexSid) ?? null;
+        return foundWrap(findTraexRolloutBySessionId(traexSid), v);
       }, { retryMiss: q.fresh });
       return path ? { path, kind: 'traex' } : null;
     }
@@ -344,13 +383,13 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       const path = cachedTranscriptPathLookup(
         `grok:${sid}:${q.cwd ?? ''}`,
         null,
-        () => findGrokUpdatesBySessionId(sid, q.cwd) ?? null,
+        () => foundWrap(findGrokUpdatesBySessionId(sid, q.cwd), v),
         { retryMiss: q.fresh },
       );
       return path ? { path, kind: 'grok' } : null;
     }
     case 'pi': {
-      const path = cachedTranscriptPathLookup(`pi:${sid}:${q.cwd ?? ''}`, null, () => findPiTranscriptBySessionId(sid, q.cwd) ?? null, { retryMiss: q.fresh });
+      const path = cachedTranscriptPathLookup(`pi:${sid}:${q.cwd ?? ''}`, null, () => foundWrap(findPiTranscriptBySessionId(sid, q.cwd), v), { retryMiss: q.fresh });
       return path ? { path, kind: 'pi' } : null;
     }
     case 'antigravity': {
@@ -359,7 +398,8 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       // directly). Conservative charset rules out traversal / separators, and
       // existsSync keeps the null-when-absent contract the other branches honor.
       if (!q.cliSessionId || !/^[A-Za-z0-9._-]+$/.test(q.cliSessionId)) return null;
-      const p = join(homedir(), '.gemini', 'antigravity-cli', 'brain', q.cliSessionId, '.system_generated', 'logs', 'transcript.jsonl');
+      const pReal = join(homedir(), '.gemini', 'antigravity-cli', 'brain', q.cliSessionId, '.system_generated', 'logs', 'transcript.jsonl');
+      const p = v(pReal);
       return existsSync(p) ? { path: p, kind: 'antigravity' } : null;
     }
     default:
