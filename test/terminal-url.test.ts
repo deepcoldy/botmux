@@ -9,19 +9,19 @@ vi.mock('../src/platform/devbox-dashboard-export.js', () => ({
   devboxDashboardBaseUrl: vi.fn(() => null),
 }));
 
-// Partial mock: platformMachineBaseUrl is stubbed (no real platform.json on the
+// Partial mock: platformTerminalBaseUrl is stubbed (no real platform.json on the
 // test box should leak in), but publicReverseProxyBaseUrl stays REAL — the
 // BOTMUX_PUBLIC_URL suite below drives it through process.env per test.
 vi.mock('../src/platform/binding.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/platform/binding.js')>();
   return {
     ...actual,
-    platformMachineBaseUrl: vi.fn(() => null),
+    platformTerminalBaseUrl: vi.fn(() => null),
   };
 });
 
 import { isRemoteAccessEnabled } from '../src/global-config.js';
-import { platformMachineBaseUrl } from '../src/platform/binding.js';
+import { platformTerminalBaseUrl } from '../src/platform/binding.js';
 import { devboxDashboardBaseUrl } from '../src/platform/devbox-dashboard-export.js';
 
 import {
@@ -55,7 +55,7 @@ afterAll(() => {
 describe('buildTerminalUrl', () => {
   beforeEach(() => {
     vi.mocked(isRemoteAccessEnabled).mockReturnValue(false);
-    vi.mocked(platformMachineBaseUrl).mockReturnValue(null);
+    vi.mocked(platformTerminalBaseUrl).mockReturnValue(null);
     vi.mocked(devboxDashboardBaseUrl).mockReturnValue(null);
     setTerminalProxyPort(8801);
   });
@@ -86,22 +86,22 @@ describe('buildTerminalUrl — platform remote access', () => {
   beforeEach(() => {
     setTerminalProxyPort(8801);
     vi.mocked(isRemoteAccessEnabled).mockReturnValue(true);
-    vi.mocked(platformMachineBaseUrl).mockReturnValue('https://m-machine.botmux.example');
+    vi.mocked(platformTerminalBaseUrl).mockReturnValue('https://t-machine.botmux.example');
   });
 
   afterEach(() => {
     vi.mocked(isRemoteAccessEnabled).mockReturnValue(false);
-    vi.mocked(platformMachineBaseUrl).mockReturnValue(null);
+    vi.mocked(platformTerminalBaseUrl).mockReturnValue(null);
     resetTerminalProxy();
   });
 
-  it('keeps public platform links read-only', () => {
-    expect(buildTerminalUrl(ds)).toBe('https://m-machine.botmux.example/s/sess-123?viewToken=vtok');
+  it('uses the platform terminal subdomain for public read-only links', () => {
+    expect(buildTerminalUrl(ds)).toBe('https://t-machine.botmux.example/s/sess-123?viewToken=vtok');
   });
 
   it('preserves the private write token on platform links', () => {
     expect(buildTerminalUrl(ds, { write: true })).toBe(
-      'https://m-machine.botmux.example/s/sess-123?token=wtok',
+      'https://t-machine.botmux.example/s/sess-123?token=wtok',
     );
   });
 });

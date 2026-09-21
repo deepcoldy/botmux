@@ -51,10 +51,38 @@ function fakeDist(root: string, body: string): string {
 }
 
 const STAY = `
-console.log('daemon pid=' + process.pid + ' idx=' + process.env.BOTMUX_BOT_INDEX);
 process.on('SIGTERM', () => process.exit(90));
 setInterval(() => {}, 1000);
+console.log('daemon pid=' + process.pid + ' idx=' + process.env.BOTMUX_BOT_INDEX);
 `;
+
+// A PID exists before exec/runtime initialization has finished. In particular,
+// sampling a legacy command line that early can see the pre-exec process on
+// Linux. Wait for the fixture's post-initialization stdout marker instead.
+async function spawnReadyOrphan(args: string[]): Promise<ChildProcess> {
+  const child = spawn(process.execPath, args, { stdio: ['ignore', 'pipe', 'ignore'] });
+  hostProcs.push(child);
+  await new Promise<void>((resolve, reject) => {
+    let output = '';
+    const timer = setTimeout(() => finish(new Error('orphan fixture did not become ready')), 5000);
+    const onData = (data: Buffer) => {
+      output += data.toString();
+      if (output.includes('daemon pid=')) finish();
+    };
+    const onExit = () => finish(new Error('orphan fixture exited before ready'));
+    const finish = (error?: Error) => {
+      clearTimeout(timer);
+      child.stdout!.off('data', onData);
+      child.off('error', finish);
+      child.off('exit', onExit);
+      if (error) reject(error); else resolve();
+    };
+    child.stdout!.on('data', onData);
+    child.once('error', finish);
+    child.once('exit', onExit);
+  });
+  return child;
+}
 
 const bots: FleetBotSpec[] = [
   { name: 'botmux-0', appId: 'cli_a', botIndex: 0 },
@@ -140,25 +168,105 @@ describe('FleetSupervisor (live, integration)', () => {
     await sup.stopAll();
   });
 
-  it('does NOT restart a child that exits 90 (graceful)', async () => {
+  it('restarts a child that exits 90 WITHOUT a supervisor-initiated stop (unsolicited sentinel self-heals)', async () => {
+    // Regression: 90 is a PRIVATE graceful handshake, not proof that THIS
+    // supervisor requested the stop. A stray signal from outside the
+    // supervision tree (observed twice on this box: `pkill -f index-daemon.js`
+    // run as unrelated probe cleanup retired all 55 production daemons, each
+    // exiting 90 cleanly) must not permanently retire the member — the only
+    // sanctioned graceful stops are stopAll and stop-bot, tested separately.
     const root = tmp();
     const statePath = join(root, 'fleet.json');
-    const GRACEFUL = `console.log('bye'); process.exit(90);`;
+    const beats = join(root, 'launches.txt');
+    const UNSOLICITED_90 = `require('fs').appendFileSync(${JSON.stringify(beats)}, 'x'); process.exit(90);`;
     const sup = new FleetSupervisor({
-      statePath, distDir: fakeDist(root, GRACEFUL), daemonEnv: {}, cwd: root,
-      policy: { maxRestarts: 10, restartDelayMs: 50 }, log: () => {},
+      statePath, distDir: fakeDist(root, UNSOLICITED_90), daemonEnv: {}, cwd: root,
+      policy: { maxRestarts: 10, restartDelayMs: 20 }, log: () => {},
     });
     sup.start([bots[0]]);
-    // it exits 90 right away → should end up 'stopped', restarts stays 0
-    const stopped = await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'stopped');
-    expect(stopped).toBe(true);
-    await delay(300); // give any (wrong) restart a chance to happen
+    // exits 90 right away with no stop request → relaunched at least once more
+    const relaunched = await waitFor(() =>
+      existsSync(beats) && readFileSync(beats, 'utf-8').length >= 2);
+    expect(relaunched).toBe(true);
+    expect(await waitFor(() => (readFleetState(statePath)?.procs[0]?.restarts ?? 0) >= 1)).toBe(true);
+
+    await sup.stopAll();
+    await delay(100); // let the tight crash-loop settle before the tmp dir is removed
+  });
+
+  it('relaunches a live daemon that exits 90 after an EXTERNAL SIGTERM (pkill-like)', async () => {
+    // Faithful repro of the recorded incident: an outsider signals the daemon
+    // directly (no stopAll, no stop-bot); the daemon's installed SIGTERM
+    // handler runs and it exits 90. The supervisor did not request it → the
+    // member must come back, not retire itself.
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    // The fixture writes this beat immediately AFTER registering its SIGTERM
+    // handler, and we wait for THAT rather than for the supervisor's online
+    // row. The supervisor persists status=online the instant spawn() returns —
+    // before the child executes any JS, hence before its handler is installed.
+    // Signalling at that instant lands pre-handler, so the child dies by the
+    // default SIGTERM action (code=null, signal=SIGTERM): a shape the OLD code
+    // already crash-restarted, which let this test stay green even with the
+    // bug restored (it covered nothing of the 90 path). With this ready gate
+    // the signal is guaranteed to be handled; measured on both node and bun,
+    // the child then exits with code 90 (bun's file bootstrap is just slower).
+    const readyBeat = join(root, 'sigterm-handler-ready.txt');
+    const SIGTERM_READY = `
+process.on('SIGTERM', () => process.exit(90));
+require('fs').writeFileSync(${JSON.stringify(readyBeat)}, 'ready');
+setInterval(() => {}, 1000);
+`;
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, SIGTERM_READY), daemonEnv: {}, cwd: root,
+      policy: { maxRestarts: 10, restartDelayMs: 20 }, log: () => {},
+    });
+    sup.start([bots[0]]);
+    const ready = await waitFor(() => existsSync(readyBeat), 10_000);
+    expect(ready).toBe(true);
+    const firstPid = readFleetState(statePath)?.procs[0]?.pid ?? 0;
+    expect(firstPid).toBeGreaterThan(1);
+
+    process.kill(firstPid, 'SIGTERM'); // exactly what `pkill -f index-daemon.js` does
+
+    // The installed handler ran → code 90 with no supervisor-initiated stop;
+    // that unsolicited sentinel must self-heal (a fresh pid, restart counted).
+    const healed = await waitFor(() => {
+      const p = readFleetState(statePath)?.procs[0];
+      return !!p && p.status === 'online' && p.pid !== firstPid && p.pid > 1 && p.restarts >= 1;
+    });
+    expect(healed).toBe(true);
+
+    await sup.stopAll();
+    await delay(100); // let any in-flight crash-loop respawn settle before rmSync
+  });
+
+  it('keeps a stop-bot member stopped even though it exits 90 (the sanctioned graceful path)', async () => {
+    const root = tmp();
+    const statePath = join(root, 'fleet.json');
+    const sup = new FleetSupervisor({
+      statePath, distDir: fakeDist(root, STAY), daemonEnv: {}, cwd: root,
+      policy: { maxRestarts: 10, restartDelayMs: 20 }, log: () => {},
+    });
+    sup.start([bots[0]]);
+    const online = await waitFor(() => {
+      const p = readFleetState(statePath)?.procs[0];
+      return !!p && p.status === 'online' && p.pid > 1;
+    });
+    expect(online).toBe(true);
+    const stoppedPid = readFleetState(statePath)!.procs[0].pid;
+
+    // The supervisor itself requests the stop → the 90 sentinel is honoured.
+    await sup.stopOneBot('botmux-0');
     const p = readFleetState(statePath)!.procs[0];
     expect(p.status).toBe('stopped');
     expect(p.restarts).toBe(0);
-    expect(p.lastExitCode).toBe(90);
-
-    await sup.stopAll();
+    expect(pidAlive(stoppedPid)).toBe(false);
+    await delay(300); // give any (wrong) restart a chance to happen
+    const after = readFleetState(statePath)!.procs[0];
+    expect(after.status).toBe('stopped');
+    expect(after.pid).toBe(0);
+    expect(after.restarts).toBe(0);
   });
 
   it('parks a proc errored after exceeding max_restarts', async () => {
@@ -390,9 +498,7 @@ describe('FleetSupervisor (live, integration)', () => {
     const statePath = join(root, 'fleet.json');
     // Orphan daemon from the "previous" supervisor generation (still alive).
     const distDir = fakeDist(root, STAY);
-    const orphan = spawn(process.execPath, [join(distDir, 'index-daemon.js')], { stdio: 'ignore' });
-    killLater(orphan.pid!);
-    await waitFor(() => pidAlive(orphan.pid!));
+    const orphan = await spawnReadyOrphan([join(distDir, 'index-daemon.js')]);
     // State records it online, under a prior (now-dead) supervisor pid.
     mutateFleetState(statePath, () => ({
       supervisorPid: 999_999, supervisorStartedAt: 'T-prior',
@@ -406,23 +512,25 @@ describe('FleetSupervisor (live, integration)', () => {
     }));
 
     const sup = new FleetSupervisor({ statePath, distDir, daemonEnv: {}, cwd: root, log: () => {} });
-    sup.start([bots[0]]); // takeover
-    // The orphan must be reclaimed: a NEW owned child is spawned (different pid),
-    // and the supervisor holds a live handle (so its loop won't drain → no self-exit).
-    const reclaimed = await waitFor(() => {
-      const p = readFleetState(statePath)?.procs[0];
-      return !!p && p.status === 'online' && p.pid !== orphan.pid && p.pid > 1 && pidAlive(p.pid);
-    });
-    expect(reclaimed).toBe(true);
-    const newPid = readFleetState(statePath)!.procs[0].pid;
-    killLater(newPid);
-    expect(newPid).not.toBe(orphan.pid);
-    // The old orphan was SIGTERM'd (it was a plain `setInterval` with no SIGTERM
-    // handler, so it dies) — no longer running unsupervised.
-    await waitFor(() => !pidAlive(orphan.pid!));
-    expect(pidAlive(orphan.pid!)).toBe(false);
-
-    await sup.stopAll();
+    try {
+      sup.start([bots[0]]); // takeover
+      // The orphan must be reclaimed: a NEW owned child is spawned (different pid),
+      // and the supervisor holds a live handle (so its loop won't drain → no self-exit).
+      const reclaimed = await waitFor(() => {
+        const p = readFleetState(statePath)?.procs[0];
+        return !!p && p.status === 'online' && p.pid !== orphan.pid && p.pid > 1 && pidAlive(p.pid);
+      });
+      expect(reclaimed).toBe(true);
+      const newPid = readFleetState(statePath)!.procs[0].pid;
+      killLater(newPid);
+      expect(newPid).not.toBe(orphan.pid);
+      // The initialized fixture handles SIGTERM and exits; it must no longer
+      // run unsupervised.
+      await waitFor(() => !pidAlive(orphan.pid!));
+      expect(pidAlive(orphan.pid!)).toBe(false);
+    } finally {
+      await sup.stopAll();
+    }
   });
 
   it('reclaims a built-in orphan after switching to another checkout path', async () => {
@@ -430,9 +538,7 @@ describe('FleetSupervisor (live, integration)', () => {
     const statePath = join(root, 'fleet.json');
     const oldDist = fakeDist(join(root, 'old-checkout'), STAY);
     const newDist = fakeDist(join(root, 'new-checkout'), STAY);
-    const orphan = spawn(process.execPath, [join(oldDist, 'index-daemon.js')], { stdio: 'ignore' });
-    killLater(orphan.pid!);
-    await waitFor(() => pidAlive(orphan.pid!));
+    const orphan = await spawnReadyOrphan([join(oldDist, 'index-daemon.js')]);
     mutateFleetState(statePath, () => ({
       supervisorPid: 999_999, supervisorStartedAt: 'T-prior',
       procs: [{
@@ -443,15 +549,18 @@ describe('FleetSupervisor (live, integration)', () => {
     }));
 
     const sup = new FleetSupervisor({ statePath, distDir: newDist, daemonEnv: {}, cwd: root, log: () => {} });
-    sup.start([bots[0]]);
-    const reclaimed = await waitFor(() => {
-      const p = readFleetState(statePath)?.procs[0];
-      return !!p && p.status === 'online' && p.pid !== orphan.pid && p.pid > 1 && pidAlive(p.pid);
-    });
-    expect(reclaimed).toBe(true);
-    expect(await waitFor(() => !pidAlive(orphan.pid!))).toBe(true);
-    killLater(readFleetState(statePath)?.procs[0]?.pid);
-    await sup.stopAll();
+    try {
+      sup.start([bots[0]]);
+      const reclaimed = await waitFor(() => {
+        const p = readFleetState(statePath)?.procs[0];
+        return !!p && p.status === 'online' && p.pid !== orphan.pid && p.pid > 1 && pidAlive(p.pid);
+      });
+      expect(reclaimed).toBe(true);
+      expect(await waitFor(() => !pidAlive(orphan.pid!))).toBe(true);
+      killLater(readFleetState(statePath)?.procs[0]?.pid);
+    } finally {
+      await sup.stopAll();
+    }
   });
 
   it('trusts a persisted birth identity even when the old command has no current role marker', async () => {
@@ -714,25 +823,6 @@ describe('FleetSupervisor (live, integration)', () => {
     // And the restart tally really moved (not just a coincidental double spawn).
     expect(await waitFor(() => (readFleetState(statePath)?.procs[0]?.restarts ?? 0) >= 1)).toBe(true);
     killLater(readFleetState(statePath)?.procs[0]?.pid);
-    await sup.stopAll();
-  });
-
-  it('still honours exit 90 as graceful for our OWN members (no leak)', async () => {
-    // The mirror of the spec above: refusing the sentinel must apply ONLY to
-    // external members. A bot daemon exiting 90 is still a clean shutdown and
-    // must NOT be restarted.
-    const root = tmp();
-    const statePath = join(root, 'fleet.json');
-    const sup = new FleetSupervisor({
-      statePath, distDir: fakeDist(root, 'process.exit(90);'), daemonEnv: {}, cwd: root,
-      policy: { maxRestarts: 3, restartDelayMs: 40 }, log: () => {},
-    });
-    sup.start([{ name: 'botmux-0', appId: 'cli_a', botIndex: 0 }]);
-    expect(await waitFor(() => readFleetState(statePath)?.procs[0]?.status === 'stopped')).toBe(true);
-    await delay(300);   // give a (wrong) restart time to show up
-    const p = readFleetState(statePath)!.procs[0];
-    expect(p.status).toBe('stopped');
-    expect(p.restarts).toBe(0);
     await sup.stopAll();
   });
 

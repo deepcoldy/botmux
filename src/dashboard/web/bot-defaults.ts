@@ -13,6 +13,7 @@ export type CliOption = {
   available?: boolean;
   command?: string;
   availabilityReason?: string;
+  cliLaunchMode?: 'forge-traex';
   /** 静态模型候选（后端精选列表；不支持模型的 CLI 为 []）。live 探测结果走 /api/cli-options/models。 */
   modelChoices?: readonly string[];
 };
@@ -68,6 +69,7 @@ export type BotDefaultsRow = {
   /** Legacy path-only executable override, returned only by private Bot Defaults APIs. */
   cliPathOverride?: string | null;
   wrapperCli?: string | null;
+  cliLaunchMode?: 'forge-traex' | null;
   model?: string;
   modelBackendVariant?: 'standard' | 'max' | null;
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
@@ -107,6 +109,7 @@ export type BotDefaultsRow = {
   /** Whether the unified file sandbox ALSO applies cross-bot read isolation for
    *  this bot's sessions — true when the CLI (claude/codex) + platform (macOS/Linux)
    *  + no wrapper can enforce it. Drives the capability label under the toggle. */
+  readIsolation?: boolean;
   readIsolationSupported?: boolean;
   backendType?: string | null;
   usageDisplay?: 'streaming' | 'footer' | 'off';
@@ -147,10 +150,18 @@ export type BotDefaultsRow = {
   p2pMode?: string;
   /** #794: per-turn 上下文注入方式。'auto' = 支持的 CLI 走 hook 注入；缺省/'off' = 内联。 */
   envelopeInjection?: 'auto' | 'off' | null;
+  /** 最终回复投递方式的**生效值**（显式配置，否则按 CLI 缺省）。'transcript' = daemon
+   *  从 CLI 转写自动取最终回复，模型不再被要求 botmux send；'send' = 模型自己 botmux send。 */
+  replyDelivery?: 'send' | 'transcript' | null;
+  /** 当前 cliId 的缺省投递方式；目前统一为 'send'。 */
+  replyDeliveryDefault?: 'send' | 'transcript';
+  /** 当前 cliId 是否有转写采集通道（claude-code / 结构化转写白名单）；false 时开关禁用。 */
+  replyDeliverySupported?: boolean;
   regularGroupReplyMode?: string;
   regularGroupMentionMode?: string;
   substituteMode?: BotSubstituteMode | null;
   feedback?: FeedbackPolicyLayer | null;
+  oncallGroup?: import('../../services/oncall-group-policy.js').OncallGroupPolicy | null;
   docSubscribeDefaultMode?: string;
   maxLiveWorkers?: number | null;
   logicalSessionCount?: number;
@@ -173,6 +184,8 @@ export type BotDefaultsRow = {
   autoStartOnGroupJoinSeed?: string;
   /** 内置默认 seed 文案（按 bot locale），供留空时 placeholder 展示。 */
   autoStartOnGroupJoinSeedDefault?: string;
+  groupJoinCommandEnabled?: boolean;
+  groupJoinCommand?: string;
   autoStartOnNewTopic?: boolean;
   autoGrantRequestCards?: boolean;
   restrictGrantCommands?: boolean;

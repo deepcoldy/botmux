@@ -5832,6 +5832,27 @@ describe('forkWorker session agent config freeze', () => {
     }));
   });
 
+  it('records Forge x TraeX launch mode on fresh sessions and sends it to the worker', () => {
+    vi.mocked(getBot).mockReturnValueOnce(defaultBot({
+      cliId: 'traex',
+      wrapperCli: undefined,
+      cliLaunchMode: 'forge-traex',
+    }));
+    const ds = makeDs();
+
+    forkWorker(ds, 'hello', false);
+
+    expect(ds.session.cliId).toBe('traex');
+    expect(ds.session.cliLaunchMode).toBe('forge-traex');
+    expect(ds.session.agentFrozen).toBe(true);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'init',
+      cliId: 'traex',
+      cliLaunchMode: 'forge-traex',
+    }));
+  });
+
   it('fills wrapper on fresh sessions that already stamped cliId', () => {
     const ds = makeDs();
     ds.session.cliId = 'codex' as any;

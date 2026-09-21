@@ -7,6 +7,7 @@ import { spawnSyncTsScript } from './helpers/ts-runner.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
 import { buildTurnReplyCard } from '../src/im/lark/turn-reply-card.js';
+import { OncallGroupStore } from '../src/services/oncall-group-store.js';
 
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
 const key = { larkAppId: 'cli_test', sessionId: 'sid_reply', turnId: 'om_turn' };
@@ -15,7 +16,7 @@ const presentation = { showProcess: true, showToolResults: true, canStop: true }
 describe('real CLI send into a running reply card', () => {
   it.each<{
     cliId: string; args: string[]; senderIsBot: boolean | undefined; merged: boolean;
-    sandbox?: boolean; sandboxEnv?: NodeJS.ProcessEnv; reserveCard?: boolean;
+    sandbox?: boolean; sandboxEnv?: NodeJS.ProcessEnv; reserveCard?: boolean; oncall?: boolean;
   }>([
     { cliId: 'claude-code', args: ['--mention-back'], senderIsBot: false, merged: true },
     { cliId: 'codex', args: ['--mention-back'], senderIsBot: false, merged: true },
@@ -29,7 +30,10 @@ describe('real CLI send into a running reply card', () => {
     { cliId: 'claude-code', args: ['--no-mention'], senderIsBot: false, merged: false, sandboxEnv: { BOTMUX_READ_ISOLATION: '1' } },
     { cliId: 'codex', args: ['--no-mention'], senderIsBot: false, merged: false, sandboxEnv: { BOTMUX_SANDBOX: '1' } },
     { cliId: 'claude-code', args: ['--no-mention'], senderIsBot: false, merged: false, sandbox: true, reserveCard: false },
-  ])('$cliId $args senderIsBot=$senderIsBot merged=$merged sandbox=$sandbox env=$sandboxEnv reserved=$reserveCard', async ({ cliId, args, senderIsBot, merged, sandbox, sandboxEnv, reserveCard = true }) => {
+    { cliId: 'claude-code', args: ['--no-mention'], senderIsBot: false, merged: true, oncall: true },
+    { cliId: 'codex', args: ['--no-mention'], senderIsBot: false, merged: true, oncall: true },
+    { cliId: 'claude-code', args: ['--mention', 'ou_other'], senderIsBot: false, merged: false, oncall: true },
+  ])('$cliId $args senderIsBot=$senderIsBot merged=$merged sandbox=$sandbox env=$sandboxEnv reserved=$reserveCard oncall=$oncall', async ({ cliId, args, senderIsBot, merged, sandbox, sandboxEnv, reserveCard = true, oncall = false }) => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-send-reply-'));
     const dataDir = join(root, 'data');
     try {
@@ -39,6 +43,7 @@ describe('real CLI send into a running reply card', () => {
       }));
       writeFileSync(join(root, 'bots.json'), JSON.stringify([{
         larkAppId: key.larkAppId, larkAppSecret: 'test-secret', cliId, replyCardMode: 'unified',
+        oncallGroup: { enabled: oncall, chatIds: ['oc_test'] },
       }]));
       seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
         ...key, status: 'active', cliId, sandbox, chatId: 'oc_test', rootMessageId: 'om_root',
@@ -68,6 +73,10 @@ describe('real CLI send into a running reply card', () => {
       const requests = String(result.stdout).split('\n').filter(line => line.startsWith('CAPTURE_REPLY='))
         .map(line => JSON.parse(line.slice('CAPTURE_REPLY='.length)));
       expect(requests).toHaveLength(1);
+      expect(requests[0].body.content.includes('oncall_group_create')).toBe(oncall);
+      const oncallSource = new OncallGroupStore(dataDir).findSource(key.larkAppId, merged ? 'om_original_card' : 'om_separate_message');
+      if (oncall) expect(oncallSource).toMatchObject({ chatId: 'oc_test', questionId: key.turnId, answer: 'Hello! 这是完整答复。' });
+      else expect(oncallSource).toBeUndefined();
       if (merged) {
         expect(requests[0]).toMatchObject({ method: 'PATCH', path: '/open-apis/im/v1/messages/om_original_card' });
         expect(requests[0].body.content).toContain('Hello! 这是完整答复。');
@@ -76,6 +85,7 @@ describe('real CLI send into a running reply card', () => {
         expect(store.read(key)).toMatchObject({ messageId: 'om_original_card', finalDelivered: true, phase: 'completed' });
         expect(store.read(key)?.lastCard).toContain('README.md');
         expect(store.read(key)?.lastCard).not.toContain('本轮没有提供最终答复');
+        expect(store.read(key)?.lastCard?.includes('oncall_group_create')).toBe(oncall);
         const markers = readFileSync(join(dataDir, 'turn-sends', `${key.sessionId}.jsonl`), 'utf8');
         expect(JSON.parse(markers.trim())).toMatchObject({ messageId: 'om_original_card', replyCardResponseKind: 'final' });
       } else {

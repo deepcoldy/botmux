@@ -228,8 +228,10 @@ export const DASHBOARD_PROCESS_NAME = 'botmux-dashboard';
 
 /**
  * The dashboard's fleet spec. The dashboard is supervised exactly like a bot
- * daemon (crash-restart, graceful-exit code 90 → no restart, max_restarts park),
- * but runs the `dashboard` entry (index-dashboard.ts) instead of a bot daemon,
+ * daemon (crash-restart; the 90 graceful sentinel is honoured ONLY when this
+ * supervisor itself requested the stop via stopAll/stop-bot — an unsolicited
+ * 90 or an outside signal crash-restarts instead; max_restarts parks), but
+ * runs the `dashboard` entry (index-dashboard.ts) instead of a bot daemon,
  * carries no bot index/appId, and logs to dashboard-{out,err}.log. This is what
  * replaces the old unconditional `apps.push({ name: 'botmux-dashboard', … })` in
  * pm2's ecosystemConfig — the dashboard was always a fleet app under pm2, so it

@@ -251,6 +251,31 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 |-------|-------------|
 | `senderTag` | Boolean, default `true` (on). Whether each turn forwarded to the CLI carries a `<sender type="user\|bot" open_id="ou_…" name="…" email="…" />` tag naming who spoke. Only an explicit `false` is persisted and disables it; absent or `true` both keep injecting, leaving the prompt byte-for-byte identical to historical behavior |
 | `thinkingCardToolResult` | Boolean, default `true` (on). Whether tool nodes in the native thinking bubble (bot-level master switch `thinkingCard`, default on) carry the command output / file content code block. `false` keeps only thinking paragraphs and tool node titles (tool · command / path) and degrades the result to a single `✓ Done` line (a tool node only leaves the “running” state once a result event arrives, so the event cannot simply be dropped), matching Claude Code's own UI; toggle via `/botconfig set thinkingCardToolResult off` or the dashboard card sub-switch, effective immediately |
+| `replyDelivery` | `"transcript"` or `"send"`; **every CLI defaults to `send`** (matching upstream behaviour), and `transcript` must be turned on explicitly. How the final reply reaches Feishu: `transcript` = the daemon takes the last assistant text of the turn from the CLI transcript and posts it as the final reply card, and the system prompt no longer mentions `botmux send`; `send` = the model must run `botmux send` itself (historical behavior). An explicit `"send"` is the only way to put claude-code back on the old behavior; both `send` and `transcript` are persisted, `unset` returns to the CLI default |
+
+### `replyDelivery: "transcript"`
+
+`claude-code` defaults to `transcript`; the other supported CLIs need it set explicitly. Once active it changes three things for that bot's sessions:
+
+1. **The system prompt never mentions `botmux send`**: the intro becomes "your final assistant message is automatically forwarded back to Lark by botmux — just answer directly"; the heredoc rule, the @ decision gate, the attachment usage and the `<identity>` rule "collaboration requires `botmux send --mention`" are all dropped, leaving only `botmux history` / `botmux bots list` and the `BOTMUX_NOTHING_TO_SEND` silence sentinel. For the cases that genuinely need `botmux send` (attachments, cross-bot @) the model can discover the built-in skill (`botmux-send` under `--plugin-dir`) on its own;
+2. **The per-turn `<botmux_reminder>` is no longer injected** (one less reminder block per prompt);
+3. **Solo sessions are unwrapped**: in a DM, or a plain 1:1 group whose only participants are the owner and this bot, each turn drops the `<user_message>` wrapper and the `<sender/>` tag, so the model sees bare text. Topic groups, multi-member groups, and turns spoken by anyone other than the owner never count as solo; wrapper and tag stay as before.
+
+Supported CLIs: `claude-code`, plus the structured-transcript bridge CLIs `codex` / `traex` / `coco` / `hermes` / `mtr` / `pi` / `oh-my-pi` / `ebsd` / `grok`. Other CLIs (e.g. `cursor`, `gemini`) have no transcript capture, so both `/botconfig set` and the dashboard reject the value (`reply_delivery_unsupported`); if the field is already persisted and `cli` is later switched to an unsupported CLI, the runtime falls back to `send` (one warn in the log) rather than losing replies.
+
+Hot-updatable by the owner / `allowedUsers` via `/botconfig`:
+
+```text
+/botconfig set replyDelivery transcript   # enable explicitly on the other supported CLIs
+/botconfig set replyDelivery send         # put claude-code back on the old behavior (model runs botmux send itself)
+/botconfig unset replyDelivery            # back to the CLI default
+```
+
+- **Two activation points**: the per-turn envelope (reminder / wrapper / `<sender/>`) applies from the next turn; the system prompt is injected at spawn time, so a running session needs `/restart` to pick up the new value, while new sessions use it directly.
+- **Observability cost**: the bare-text shape of a solo session has no `<user_message>` / `<sender>` structure, so `/adopt` no longer recognizes such sessions as botmux's own (the same class of cost as `senderTag: false`).
+- The dashboard "Reply Delivery → Transcript reply mode" toggle saves this field; it is disabled with an explanation when the current CLI does not support it.
+
+### `senderTag: false`
 
 With it off the model cannot see speaker identity: in a multi-person chat it cannot tell participants apart or address them by name. Useful for a CLI whose model copies the tag into its reply body (e.g. cursor — see the `<sender_note>` anti-echo hint, which disappears together with the tag), or when you do not want per-message identity written into the CLI transcript.
 
@@ -281,6 +306,8 @@ Or write it directly into the bot's config:
 | `autoStartOnGroupJoin` | When `true`, the bot starts working automatically when added to a new group containing at least one `allowedUsers` member (no @ needed). Requires subscribing the `im.chat.member.bot.added_v1` event for this app in the Lark admin console |
 | `autoStartOnGroupJoinPrompt` | Paired with the above: the first-round prompt for proactive start; if empty / blank, opens with an empty message and lets the bot read the group context itself. Meaningless when `autoStartOnGroupJoin` is off |
 | `autoStartOnNewTopic` | When `true`, the first message of every new topic in a topic group starts working automatically without an @ (no effect in plain groups). Defaults to passive (only @ triggers) |
+| `groupJoinCommandEnabled` | When `true` and `groupJoinCommand` is non-empty, the bot runs that command on this host whenever it is added to **any** chat — no session, no model. Independent of `autoStartOnGroupJoin` (no `allowedUsers` membership requirement). Also requires the `im.chat.member.bot.added_v1` event. Editable in Dashboard → Bot defaults → Auto-start |
+| `groupJoinCommand` | The command to run on join. Same execution contract as [Hooks](./hooks.md): no shell (use `bash -c '…'` for pipes/redirects), minimal environment (no app secret); stdin is JSON `{event:"chat.bot_added", larkAppId, chatId, operatorOpenId, emittedAt}`, plus `BOTMUX_JOIN_CHAT_ID` / `BOTMUX_JOIN_LARK_APP_ID` / `BOTMUX_JOIN_OPERATOR_OPEN_ID` env vars; the process group is killed after 10 minutes |
 
 ## Group message listener
 

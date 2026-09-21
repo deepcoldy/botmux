@@ -590,6 +590,14 @@ describe('sessionAgentConfig — /cli snapshot model wiring', () => {
     expect(cfg.modelBackendVariant).toBeUndefined();
   });
 
+  it('freezes Forge x TraeX launch mode from bot config', () => {
+    const ds = makeSourceDs({ cliId: 'traex', agentFrozen: false });
+    const cfg = sessionAgentConfig(ds, { cliId: 'traex', cliLaunchMode: 'forge-traex' });
+    expect(cfg.cliLaunchMode).toBe('forge-traex');
+    expect(ds.session.cliLaunchMode).toBe('forge-traex');
+    expect(ds.session.agentFrozen).toBe(true);
+  });
+
   it('repairs a stale backend variant from a frozen non-TraeX session', () => {
     const ds = makeSourceDs({
       cliId: 'codex',

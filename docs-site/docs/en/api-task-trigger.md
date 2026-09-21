@@ -124,6 +124,7 @@ Calls go through the dashboard (default `http://<daemon-host>:7891`), authentica
 | `waitForFinalOutput` | strict boolean | Sync mode. `kind:"turn"` only; combined with `asyncReturnSessionId` → 400 |
 | `asyncReturnSessionId` | strict boolean | Async mode |
 | `dryRun` | strict boolean | Render without dispatching, see §5.4 |
+| `steer` | strict boolean | Authorize native in-flight `turn/steer` (codex-app only), see §5.5. Mutually exclusive with `dryRun` → 400 |
 | `timeoutMs` | `[1000, 300000]` | Sync wait cap, default `120000`. Out of range → 400 |
 | `idempotencyKey` | non-empty ≤200 chars | Fresh-session idempotency, see §7.1 |
 | `turnIdempotencyKey` | non-empty ≤200 chars | Follow-up-turn idempotency, see §7.2. Mutually exclusive with the above |
@@ -291,6 +292,25 @@ With `options.dryRun=true` nothing is created and nothing is dispatched:
 `promptPreview` is the **exact prompt that would be fed to the model** (truncated past 4000 chars with `\n...[truncated]` appended). `message` distinguishes the two landing shapes: an existing session gives `would inject into existing session`, otherwise `would create or deliver a new session turn`.
 
 > Note: `dry_run` is an **`action`, not an error code**. The error-code enum does contain a `dry_run` value, but nothing ever emits it.
+
+### 5.5 `steer`: inject a follow-up into the running turn (codex-app native `turn/steer`)
+
+`options.steer=true` authorizes the daemon to merge a new message INTO the currently active codex-app turn instead of queueing it as a serial follow-up — useful for headless callers that want to adjust a task while it is still running ("also handle X", "stop that and do Y").
+
+It is a **best-effort authorization, not a guarantee**:
+
+- **Fresh turn**: pass it on the first request too. The opening turn is marked steerable; the codex `canSteer` contract requires BOTH the root and the follow-up head to be explicitly authorized.
+- **Follow-up while a turn is live**: the runner injects the message into the active turn via native `turn/steer`. If injection is not possible at that instant (no active turn / turn already closing / review or compaction turn / worker cold-starting), the request **silently degrades to an ordinary queued follow-up** — acceptance never fails because of `steer` alone.
+- **Non-codex-app CLIs**: the flag is a no-op; the existing type-ahead queue semantics apply.
+
+The response echoes `steer: true` only when the request was actually accepted for dispatch (not on an idempotent reuse). The echo confirms the daemon carried the authorization — it does NOT mean a `turn/steer` RPC was already admitted by the runner.
+
+**Result attribution for a merged group.** When several steered messages merge, codex produces ONE merged final for the whole group: earlier members receive an empty `steer_superseded` marker and only the newest trigger owns the real final + token usage. The daemon makes every earlier HTTP member resolve with the SAME merged content:
+
+- `http_async`: the parked member's `trigger-result` eventually reports `completed` with the merged `output.content` and **no `usage`** (usage is recorded against the newest trigger only). The park relation is also persisted, so a daemon restart in the merge window resolves the parked member by walking to the group's terminal record.
+- `http_wait`: the parked sync request resolves with the merged content as soon as the real final lands. Wait mode remains in-memory only (its existing contract); if the daemon restarts mid-group the parked wait simply hits its own timeout.
+
+`steer` is mutually exclusive with `dryRun` (there is no dispatch to steer into) → 400 `bad_request`. It adds no route or capability: `/api/trigger` stays the loopback, drive-your-own-turn surface, and steering only ever injects into the SAME tenant's own turn.
 
 ---
 

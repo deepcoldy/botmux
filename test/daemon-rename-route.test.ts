@@ -729,6 +729,85 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(activeSessions.has(sessionKey('om_new_2', APP))).toBe(true);
   });
 
+  // The pre-created record is a REAL session: every later turn in this topic
+  // routes into it and forks a CLI from it. Historically only `/repo` resolved a
+  // pinned dir here, so a session born from any other session-needing daemon
+  // command carried NO workingDir and silently ignored the bot's
+  // defaultWorkingDir / the chat's oncall binding for the rest of its life.
+  it.each([
+    ['new topic', false],
+    ['thread reply', true],
+  ] as const)('%s: `/status` pins the bot default workingDir on the pre-created session', async (_label, reply) => {
+    const defaultDir = makeRepoFixtureDir();
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: defaultDir,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const rootId = reply ? 'om_wd_root' : 'om_wd_new';
+    const messageId = reply ? 'om_wd_reply' : rootId;
+    const data = makeEventData(messageId, '/status', reply ? rootId : undefined);
+
+    if (reply) await handleThreadReply(data, makeCtx(rootId, messageId));
+    else await handleNewTopic(data, makeCtx(rootId, messageId));
+
+    const ds = activeSessions.get(sessionKey(rootId, APP));
+    expect(ds).toBeDefined();
+    expect(ds!.workingDir).toBe(defaultDir);
+    expect(ds!.session.workingDir).toBe(defaultDir);
+    // Inheriting the dir must NOT turn a non-`/repo` command into a repo picker:
+    // these commands fork no CLI of their own.
+    expect(ds!.pendingRepo).toBeFalsy();
+  });
+
+  // Auto-worktree bots: `defaultWorkingDir` is a worktree BASE, and the ordinary
+  // spawn paths answer it with pendingRepo + a detached worktree build. A daemon
+  // command must not start that build on the user's behalf, and pinning the base
+  // dir instead would run every later turn of this session inside the SHARED
+  // repo — exactly the isolation the flag buys. So it stays unpinned.
+  it.each([
+    ['new topic', false],
+    ['thread reply', true],
+  ] as const)('%s: `/status` does NOT pin the auto-worktree base dir', async (_label, reply) => {
+    const baseDir = makeRepoFixtureDir();
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: baseDir,
+      defaultWorkingDirAutoWorktree: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const rootId = reply ? 'om_wt_root' : 'om_wt_new';
+    const messageId = reply ? 'om_wt_reply' : rootId;
+    const data = makeEventData(messageId, '/status', reply ? rootId : undefined);
+
+    if (reply) await handleThreadReply(data, makeCtx(rootId, messageId));
+    else await handleNewTopic(data, makeCtx(rootId, messageId));
+
+    const ds = activeSessions.get(sessionKey(rootId, APP));
+    expect(ds).toBeDefined();
+    expect(ds!.workingDir).toBeUndefined();
+    expect(ds!.session.workingDir).toBeUndefined();
+    expect(mocks.runAutoWorktreeCommit).not.toHaveBeenCalled();
+  });
+
+  // Guard the other half: with nothing configured there is no dir to pin, and
+  // the session must keep the "unset = follow the bot default at fork time"
+  // shape rather than being pinned to some fallback here.
+  it('control: `/status` with no bot default leaves the session unpinned', async () => {
+    await handleNewTopic(makeEventData('om_wd_none', '/status'), makeCtx('om_wd_none', 'om_wd_none'));
+
+    const ds = activeSessions.get(sessionKey('om_wd_none', APP));
+    expect(ds).toBeDefined();
+    expect(ds!.workingDir).toBeUndefined();
+    expect(ds!.session.workingDir).toBeUndefined();
+  });
+
   it.each([
     ['new topic', false],
     ['thread reply', true],

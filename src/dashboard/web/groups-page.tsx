@@ -1,3 +1,4 @@
+import { GroupSerialInputRow } from './group-serial-input.js';
 import { GroupDefaultModelsRow } from './group-default-models.js';
 import { describeCloseResidual } from '../../core/close-residual.js';
 import {
@@ -1733,6 +1734,18 @@ export function ManageDialog(props: {
       <fieldset>
         <legend>{tr('grantAdmin.sectionTitle')}</legend>
         <MemberAccessSection chat={chat} members={inChat} disabled={!available} tr={tr} />
+      </fieldset>
+
+      <fieldset>
+        <legend>{tr('groups.serialInput')}</legend>
+        <p><small>{tr('groups.serialInputHelp')}</small></p>
+        {inChat.map(member => <GroupSerialInputRow
+          key={`${chat.chatId}-${member.larkAppId}`}
+          chatId={chat.chatId} appId={member.larkAppId}
+          botName={member.botName ?? member.larkAppId}
+          enabled={member.serialInput === true} disabled={!available}
+          onSaved={() => props.onReloadGroups({ force: true })}
+        />)}
       </fieldset>
 
       <fieldset>

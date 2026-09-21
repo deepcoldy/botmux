@@ -238,6 +238,60 @@ describe('applyBotConfigEdits', () => {
     expect(out.wrapperCli).toBe('aiden x claude');
   });
 
+  it('sets Forge x TraeX launch mode and clears stale wrapperCli', () => {
+    const out = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'traex',
+      wrapperCli: 'old wrapper',
+    }, {
+      cliChoice: 'traex',
+      cliLaunchMode: 'forge-traex',
+    });
+
+    expect(out.cliId).toBe('traex');
+    expect(out.cliLaunchMode).toBe('forge-traex');
+    expect(out.wrapperCli).toBeUndefined();
+  });
+
+  it('clears Forge x TraeX launch mode when switching to a plain launch', () => {
+    const out = applyBotConfigEdits({
+      larkAppId: 'app',
+      larkAppSecret: 'secret',
+      cliId: 'traex',
+      cliLaunchMode: 'forge-traex',
+    }, {
+      cliChoice: 'traex',
+      cliLaunchMode: null,
+    });
+
+    expect(out.cliId).toBe('traex');
+    expect(out.cliLaunchMode).toBeUndefined();
+  });
+
+  it('rejects unsupported Forge x TraeX config combinations', () => {
+    const base = { larkAppId: 'app', larkAppSecret: 'secret', cliId: 'traex' };
+    expect(() => applyBotConfigEdits(base, {
+      cliChoice: 'codex',
+      cliLaunchMode: 'forge-traex',
+    })).toThrow(/supported only for cliId "traex"/);
+    expect(() => applyBotConfigEdits({
+      ...base,
+      wrapperCli: 'aiden x traex',
+      cliLaunchMode: 'forge-traex',
+    }, {})).toThrow(/cannot be combined with wrapperCli/);
+    expect(() => applyBotConfigEdits({
+      ...base,
+      cliPathOverride: '/opt/traex',
+      cliLaunchMode: 'forge-traex',
+    }, {})).toThrow(/cannot be combined with cliPathOverride/);
+    expect(() => applyBotConfigEdits({
+      ...base,
+      sandbox: true,
+      cliLaunchMode: 'forge-traex',
+    }, {})).toThrow(/sandbox or readIsolation/);
+  });
+
   it('sets and normalizes cliRuntime with an equal downgrade path shadow', () => {
     const out = applyBotConfigEdits({
       larkAppId: 'app',

@@ -25,10 +25,11 @@ import {
   type FleetProcessIdentityRuntime,
 } from './fleet-process-identity.js';
 import {
-  decideOnExit,
+  decideCrashExit,
   freshProc,
   planStart,
   DEFAULT_RESTART_POLICY,
+  FLEET_GRACEFUL_EXIT_CODE,
   type FleetProcState,
   type RestartPolicy,
   type ChildExit,
@@ -533,18 +534,23 @@ export class FleetSupervisor {
       this.markStopped(spec.name, exit, 'stopped');
       return;
     }
-    // An external member does not get the 90-is-graceful sentinel: it is not our
-    // code and may use 90 as an ordinary failure code, in which case honouring it
-    // would silently retire the service instead of restarting it (see
-    // isGracefulExit). Operator stops are already handled above via explicitStop,
-    // which does not depend on the exit code at all.
-    const decision = decideOnExit({ restarts: current?.restarts ?? 0 }, exit, this.policy, !spec.external);
+    // The 90 sentinel is honoured ONLY for stops this supervisor itself
+    // requested — the two guards above (stopping / explicitStop) are the sole
+    // record of that intent. A 90 reaching here is therefore an UNSOLICITED
+    // graceful exit: a signal from outside the supervision tree (recorded
+    // twice on this box: an unrelated shell ran `pkill -f index-daemon.js` as
+    // probe cleanup and retired the entire 55-daemon fleet for hours, because
+    // every daemon exited 90 and was trusted at its word), a hand-typed
+    // `kill -TERM <pid>`, and so on. Refuse the sentinel in that case and
+    // self-heal exactly like a crash; an operator who genuinely wants a daemon
+    // to stay down uses `botmux stop-bot` (explicitStop). External members
+    // already refused it for the same reason — 90 is our private handshake, not
+    // proof that a stop was requested through the sanctioned channel.
+    const unsolicited = exit.code === FLEET_GRACEFUL_EXIT_CODE && exit.signal === null;
+    // Graceful ('stop') was already consumed by the stopping / explicitStop
+    // guards above this point, so this path only ever decides restart vs park.
+    const decision = decideCrashExit({ restarts: current?.restarts ?? 0 }, this.policy);
 
-    if (decision.action === 'stop') {
-      this.log(`${spec.name} exited cleanly (graceful); not restarting`);
-      this.markStopped(spec.name, exit, 'stopped');
-      return;
-    }
     if (decision.action === 'park') {
       this.log(`${spec.name} exceeded max_restarts (${decision.atRestarts}); parking errored`);
       this.markStopped(spec.name, exit, 'errored');
@@ -556,7 +562,12 @@ export class FleetSupervisor {
       if (p) { p.restarts = decision.nextRestarts; p.status = 'launching'; p.pid = 0; p.lastExitCode = exit.code; }
       return cur;
     });
-    this.log(`${spec.name} crashed (code=${exit.code} signal=${exit.signal}); restart ${decision.nextRestarts}/${this.policy.maxRestarts} in ${this.policy.restartDelayMs}ms`);
+    this.log(
+      unsolicited
+        ? `${spec.name} exited graceful sentinel (${FLEET_GRACEFUL_EXIT_CODE}) WITHOUT a supervisor-initiated stop `
+          + `(likely an external signal, e.g. pkill/kill -TERM); restarting instead of retiring`
+        : `${spec.name} crashed (code=${exit.code} signal=${exit.signal}); restart ${decision.nextRestarts}/${this.policy.maxRestarts} in ${this.policy.restartDelayMs}ms`,
+    );
     // The restart timer MUST keep the event loop alive: when the crashed child
     // was the supervisor's only live handle, an unref'd timer would let the loop
     // drain and the supervisor would exit mid-backoff — never respawning the bot

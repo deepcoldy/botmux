@@ -5,7 +5,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, setExactChatGrantHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, __testOnly_resetManagedOriginRuntimeAuthState, __testOnly_setNativeSubagentRuntimeNonceStore, type IpcServerHandle,
+import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, setExactChatGrantHandler, setCrossPrincipalInterruptionDisableHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, __testOnly_resetManagedOriginRuntimeAuthState, __testOnly_setNativeSubagentRuntimeNonceStore, type IpcServerHandle,
   __testOnly_agentSwitchBeforePreCloseVerify,
 } from '../src/core/dashboard-ipc-server.js';
 import { rmwBotEntry } from '../src/services/config-store.js';
@@ -198,6 +198,7 @@ afterEach(async () => {
   __testOnly_resetManagedOriginRuntimeAuthState();
   resetAskBrokerForTest();
   setExactChatGrantHandler(null);
+  setCrossPrincipalInterruptionDisableHandler(null);
   clearMessageListenerRunPreviewStore();
 });
 
@@ -1946,6 +1947,136 @@ describe('PUT /api/bot-card-prefs — streaming card buttons', () => {
     } finally {
       if (handle) await handle.close();
       handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
+  async function withBot(cliId: string, run: (base: string, configPath: string, appId: string) => Promise<void>): Promise<void> {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-reply-delivery-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = `test-reply-delivery-${cliId}`;
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      await run(`http://127.0.0.1:${handle.port}`, configPath, appId);
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+  const put = (base: string, replyDelivery: unknown) => fetch(`${base}/api/bot-reply-delivery`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ replyDelivery }),
+  });
+  const persisted = (configPath: string) => JSON.parse(readFileSync(configPath, 'utf-8'))[0];
+
+  it('claude-code: GET 生效值缺省 send（不随 CLI 翻转），PUT transcript / send 都落盘，PUT 空串 unset 回缺省', async () => {
+    await withBot('claude-code', async (base, configPath, appId) => {
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'send', replyDeliverySupported: true });
+      expect('replyDelivery' in persisted(configPath)).toBe(false);
+
+      // transcript：opt-in，显式落盘。
+      const on = await put(base, 'transcript');
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, replyDelivery: 'transcript', replyDeliveryDefault: 'send' });
+      expect(persisted(configPath).replyDelivery).toBe('transcript');
+      expect(getBot(appId).config.replyDelivery).toBe('transcript');
+      const afterOn = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(afterOn).toMatchObject({ replyDelivery: 'transcript', replyDeliveryDefault: 'send', replyDeliverySupported: true });
+
+      // send：显式退回也落盘（与缺省同值，但意图是钉住，不靠缺省兜）。
+      const off = await put(base, 'send');
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, replyDelivery: 'send' });
+      expect(persisted(configPath).replyDelivery).toBe('send');
+      expect(getBot(appId).config.replyDelivery).toBe('send');
+
+      // '' / 未知值删 key，回缺省 send。
+      const cleared = await put(base, '');
+      expect(cleared.status).toBe(200);
+      expect(await cleared.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'send' });
+      expect('replyDelivery' in persisted(configPath)).toBe(false);
+      expect(getBot(appId).config.replyDelivery).toBeUndefined();
+    });
+  });
+
+  it('cursor: GET 缺省 send/unsupported，PUT transcript 4xx reply_delivery_unsupported 且不落盘，PUT send 落盘', async () => {
+    await withBot('cursor', async (base, configPath, appId) => {
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial).toMatchObject({ replyDelivery: 'send', replyDeliveryDefault: 'send', replyDeliverySupported: false });
+
+      const rejected = await put(base, 'transcript');
+      expect(rejected.status).toBe(400);
+      expect(await rejected.json()).toMatchObject({ ok: false, error: 'reply_delivery_unsupported' });
+      expect('replyDelivery' in persisted(configPath)).toBe(false);
+      expect(getBot(appId).config.replyDelivery).toBeUndefined();
+
+      // send 在不支持的 CLI 上仍可写，同样显式落盘。
+      const send = await put(base, 'send');
+      expect(send.status).toBe(200);
+      expect(await send.json()).toMatchObject({ ok: true, replyDelivery: 'send', replyDeliveryDefault: 'send' });
+      expect(persisted(configPath).replyDelivery).toBe('send');
+    });
+  });
+
+  it('bad JSON body → 400 bad_json', async () => {
+    await withBot('claude-code', async (base) => {
+      const res = await fetch(`${base}/api/bot-reply-delivery`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: '{not json',
+      });
+      expect(res.status).toBe(400);
+      expect(await res.json()).toMatchObject({ ok: false, error: 'bad_json' });
+    });
+  });
+});
+
+describe('PUT /api/bot-card-prefs — 入群执行命令', () => {
+  it('persists toggle + command, rejects an unparsable command', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-join-cmd-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-join-cmd-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    let handle: Awaited<ReturnType<typeof startIpcServer>> | null = null;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'claude-code' }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+      const put = (body: unknown) => fetch(`${base}/api/bot-card-prefs`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+
+      const ok = await put({ groupJoinCommand: 'bash /opt/on-join.sh', groupJoinCommandEnabled: true });
+      expect(ok.status).toBe(200);
+      expect(await ok.json()).toMatchObject({ ok: true, groupJoinCommandEnabled: true, groupJoinCommand: 'bash /opt/on-join.sh' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({ groupJoinCommandEnabled: true, groupJoinCommand: 'bash /opt/on-join.sh' });
+
+      const get = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(get).toMatchObject({ groupJoinCommandEnabled: true, groupJoinCommand: 'bash /opt/on-join.sh' });
+
+      const bad = await put({ groupJoinCommand: 'bash "unterminated' });
+      expect(bad.status).toBe(400);
+      expect(await bad.json()).toMatchObject({ ok: false, error: 'invalid_group_join_command' });
+      expect(getBot(appId).config.groupJoinCommand).toBe('bash /opt/on-join.sh');
+    } finally {
+      if (handle) await handle.close();
       if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = prevBotsConfig;
       rmSync(dir, { recursive: true, force: true });
@@ -6408,6 +6539,25 @@ describe('POST /api/locale/reload', () => {
   });
 });
 
+describe('POST /api/xpi/disable', () => {
+  it('runs daemon-owned cancellation and reports the count', async () => {
+    const cancel = vi.fn(async () => 4);
+    setCrossPrincipalInterruptionDisableHandler(cancel);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/xpi/disable`, { method: 'POST' });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ ok: true, cancelled: 4 });
+    expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it('fails closed when the daemon did not register a cancellation handler', async () => {
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    const res = await fetch(`http://127.0.0.1:${handle.port}/api/xpi/disable`, { method: 'POST' });
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ ok: false, error: 'xpi_disable_handler_unavailable' });
+  });
+});
+
 describe('PUT /api/bot-skills', () => {
   it('rejects invalid non-null policy instead of clearing skills', async () => {
     const appId = 'test-skill-policy-app';
@@ -6430,6 +6580,37 @@ describe('PUT /api/bot-skills', () => {
 
     expect(res.status).toBe(400);
     expect(await res.json()).toMatchObject({ ok: false, error: 'invalid_policy' });
+  });
+});
+
+describe('PUT /api/bot-oncall-group', () => {
+  it('saves scoped button settings while preserving feedback and rejects malformed input', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-oncall-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-oncall-app';
+    const previous = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      const feedback = { enabled: true, allowReselect: true };
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'secret', cliId: 'codex', feedback }]));
+      loadBotConfigs().forEach((bot: any) => registerBot(bot));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const put = (oncallGroup: unknown) => fetch(`http://127.0.0.1:${handle!.port}/api/bot-oncall-group`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ oncallGroup }),
+      });
+      const response = await put({ enabled: true, chatIds: ['oc_test'] });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ oncallGroup: { enabled: true, chatIds: ['oc_test'] } });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).toMatchObject({ feedback, oncallGroup: { enabled: true, chatIds: ['oc_test'] } });
+      expect((await put({ enabled: 'yes' })).status).toBe(400);
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].oncallGroup.enabled).toBe(true);
+      expect((await put({ enabled: false, chatIds: ['oc_test'] })).status).toBe(200);
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).toMatchObject({ feedback, oncallGroup: { enabled: false, chatIds: ['oc_test'] } });
+    } finally {
+      if (previous === undefined) delete process.env.BOTS_CONFIG; else process.env.BOTS_CONFIG = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -6480,6 +6661,113 @@ describe('PUT /api/bot-substitute-mode', () => {
 });
 
 describe('PUT /api/bot-agent', () => {
+  it('rejects switching a sandboxed bot to Forge x TraeX', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-forge-sandbox-conflict-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-forge-sandbox-conflict-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'traex',
+        sandbox: true,
+      }], null, 2));
+      loadBotConfigs().forEach((config: any) => registerBot(config));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'forge-x-traex', model: 'GPT-5.6-Sol' }),
+      });
+
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: 'launch_mode_sandbox_conflict' });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).toMatchObject({
+        cliId: 'traex',
+        sandbox: true,
+      });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].cliLaunchMode).toBeUndefined();
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects switching a read-isolated bot to Forge x TraeX instead of clearing readIsolation', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-forge-read-isolation-conflict-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-forge-read-isolation-conflict-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'traex',
+        readIsolation: true,
+      }], null, 2));
+      loadBotConfigs().forEach((config: any) => registerBot(config));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'forge-x-traex', model: 'GPT-5.6-Sol' }),
+      });
+
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: 'launch_mode_sandbox_conflict' });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0]).toMatchObject({
+        cliId: 'traex',
+        readIsolation: true,
+      });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].cliLaunchMode).toBeUndefined();
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects enabling sandbox for an existing Forge x TraeX bot', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-forge-enable-sandbox-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-forge-enable-sandbox-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'traex',
+        cliLaunchMode: 'forge-traex',
+      }], null, 2));
+      loadBotConfigs().forEach((config: any) => registerBot(config));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/bot-sandbox`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ enabled: true }),
+      });
+
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: 'launch_mode_sandbox_conflict' });
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].sandbox).toBeUndefined();
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('preserves an invalid policy marker when an old client omits the field', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-native-subagent-invalid-preserve-'));
     const configPath = join(dir, 'bots.json');
@@ -8150,6 +8438,7 @@ describe('GET /api/groups (Phase B)', () => {
       chatId: 'oc_1',
       name: 'team',
       oncallChat: null,
+      serialInput: false,
       firstSeenAt: null,
       hasRole: false,
       hasMessageListener: false,
@@ -8187,6 +8476,7 @@ describe('GET /api/groups (Phase B)', () => {
         name: 'master off',
         agentCliId: 'codex',
         oncallChat: null,
+        serialInput: false,
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
@@ -8230,6 +8520,7 @@ describe('GET /api/groups (Phase B)', () => {
         name: 'master off chat off',
         agentCliId: 'codex',
         oncallChat: null,
+        serialInput: false,
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
@@ -8263,6 +8554,7 @@ describe('GET /api/groups (Phase B)', () => {
         chatId: 'oc_config_missing',
         name: 'config missing',
         oncallChat: null,
+        serialInput: false,
         firstSeenAt: null,
         hasRole: false,
         hasMessageListener: false,
@@ -8309,6 +8601,7 @@ describe('GET /api/groups (Phase B)', () => {
           name: 'master off',
           agentCliId: 'codex',
           oncallChat: null,
+          serialInput: false,
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
@@ -8322,6 +8615,7 @@ describe('GET /api/groups (Phase B)', () => {
           name: 'chat off',
           agentCliId: 'codex',
           oncallChat: null,
+          serialInput: false,
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
@@ -8335,6 +8629,7 @@ describe('GET /api/groups (Phase B)', () => {
           name: 'chat on',
           agentCliId: 'codex',
           oncallChat: null,
+          serialInput: false,
           firstSeenAt: null,
           hasRole: false,
           hasMessageListener: false,
@@ -9628,7 +9923,7 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
     if (handle) { await handle.close(); handle = null; }
   });
 
-  it('allowlists ONLY trigger/trigger-result/insight (no HMAC), everything else still 401', async () => {
+  it('allowlists trigger/trigger-result/insight/exact-interrupt (no HMAC), everything else still 401', async () => {
     setIpcAuthSecret(TEST_IPC_SECRET);
     setLarkAppId('local_smoke');
     handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
@@ -9641,6 +9936,8 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
     expect(tr.status).not.toBe(401);
     const ins = await fetch(`${base}/api/sessions/nope/insight?detail=conversation`);
     expect(ins.status).not.toBe(401);
+    const interrupt = await fetch(`${base}/api/sessions/nope/turns/trg/interrupt`, { method: 'POST' });
+    expect(interrupt.status).not.toBe(401);
     // NOT allowlisted (no auth header) → 401.
     expect((await fetch(`${base}/api/sessions`)).status).toBe(401);
     expect((await fetch(`${base}/api/asks/pending`)).status).toBe(401);
@@ -9812,6 +10109,41 @@ describe('group default model configuration', () => {
       expect(readFileSync(configPath, 'utf8')).toBe(before);
       expect((await put({})).status).toBe(200);
       expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].groupDefaultModels).toBeUndefined();
+    } finally {
+      if (previous === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('group serial input configuration', () => {
+  it('validates, saves, reads back and clears the exact group on the current bot', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'group-serial-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const previous = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{ larkAppId: 'app-serial', larkAppSecret: 'test', cliId: 'codex' }]));
+      loadBotConfigs().forEach(c => registerBot(c));
+      setLarkAppId('app-serial');
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const put = (body: unknown) => fetch(`http://127.0.0.1:${handle!.port}/api/group-serial-input/oc_model`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+      const list = vi.spyOn(groupsStore, 'listChats').mockResolvedValue([{ chatId: 'oc_model', name: 'Example', chatMode: 'topic' }] as any);
+      const read = async () => (await (await fetch(`http://127.0.0.1:${handle!.port}/api/groups`)).json()).chats[0].serialInput;
+      expect(await read()).toBe(false);
+      expect((await put({ enabled: true })).status).toBe(200);
+      expect(await read()).toBe(true);
+      expect(getBot('app-serial').config.groupSerialInput?.oc_model).toBe(true);
+      const before = readFileSync(configPath, 'utf8');
+      for (const body of [null, {}, { enabled: 'false' }, []]) expect((await put(body)).status).toBe(400);
+      expect(readFileSync(configPath, 'utf8')).toBe(before);
+      expect((await put({ enabled: false })).status).toBe(200);
+      expect(await read()).toBe(false);
+      expect(JSON.parse(readFileSync(configPath, 'utf8'))[0].groupSerialInput.oc_model).toBe(false);
+      list.mockRestore();
     } finally {
       if (previous === undefined) delete process.env.BOTS_CONFIG;
       else process.env.BOTS_CONFIG = previous;

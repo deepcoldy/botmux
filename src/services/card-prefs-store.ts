@@ -95,6 +95,10 @@ export interface BotCardPrefs {
   autoStartOnGroupJoinSeed: string;
   /** 主动开工 — 场景②: auto-start on every new topic in a topic group. */
   autoStartOnNewTopic: boolean;
+  /** 主动开工 — 入群执行命令开关（不经 LLM，见 BotConfig.groupJoinCommandEnabled）。 */
+  groupJoinCommandEnabled: boolean;
+  /** 主动开工 — 入群执行的命令（'' = 未配置）。 */
+  groupJoinCommand: string;
   /** Per-bot DEFAULT regular-group session mode (chat | chat-topic | new-topic | shared). */
   regularGroupReplyMode: ChatReplyMode;
   /** Per-bot 4-tier @-requirement policy for regular groups (default 'always'). */
@@ -131,6 +135,8 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnGroupJoinPrompt: typeof c.autoStartOnGroupJoinPrompt === 'string' ? c.autoStartOnGroupJoinPrompt : '',
       autoStartOnGroupJoinSeed: typeof c.autoStartOnGroupJoinSeed === 'string' ? c.autoStartOnGroupJoinSeed : '',
       autoStartOnNewTopic: c.autoStartOnNewTopic === true,
+      groupJoinCommandEnabled: c.groupJoinCommandEnabled === true,
+      groupJoinCommand: typeof c.groupJoinCommand === 'string' ? c.groupJoinCommand : '',
       regularGroupReplyMode: c.regularGroupReplyMode ?? 'chat-topic',
       regularGroupMentionMode: c.regularGroupMentionMode === 'topic' || c.regularGroupMentionMode === 'never' || c.regularGroupMentionMode === 'ambient'
         ? c.regularGroupMentionMode : 'always',
@@ -158,6 +164,8 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       autoStartOnGroupJoinPrompt: '',
       autoStartOnGroupJoinSeed: '',
       autoStartOnNewTopic: false,
+      groupJoinCommandEnabled: false,
+      groupJoinCommand: '',
       regularGroupReplyMode: 'chat-topic',
       regularGroupMentionMode: 'always',
       docSubscribeDefaultMode: 'mention-only',
@@ -272,6 +280,8 @@ async function updateBotCardPrefsInternal(
     applyStr(entry, 'autoStartOnGroupJoinPrompt', patch.autoStartOnGroupJoinPrompt);
     applyStr(entry, 'autoStartOnGroupJoinSeed', patch.autoStartOnGroupJoinSeed);
     apply(entry, 'autoStartOnNewTopic', patch.autoStartOnNewTopic);
+    apply(entry, 'groupJoinCommandEnabled', patch.groupJoinCommandEnabled);
+    applyStr(entry, 'groupJoinCommand', patch.groupJoinCommand?.trim());
     applyMode(entry, 'regularGroupReplyMode', patch.regularGroupReplyMode);
     applyMention(entry, 'regularGroupMentionMode', patch.regularGroupMentionMode);
     applyDocMode(entry, 'docSubscribeDefaultMode', patch.docSubscribeDefaultMode);
@@ -298,6 +308,8 @@ async function updateBotCardPrefsInternal(
         autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' ? entry.autoStartOnGroupJoinPrompt : '',
         autoStartOnGroupJoinSeed: typeof entry.autoStartOnGroupJoinSeed === 'string' ? entry.autoStartOnGroupJoinSeed : '',
         autoStartOnNewTopic: entry.autoStartOnNewTopic === true,
+        groupJoinCommandEnabled: entry.groupJoinCommandEnabled === true,
+        groupJoinCommand: typeof entry.groupJoinCommand === 'string' ? entry.groupJoinCommand : '',
         regularGroupReplyMode: (entry.regularGroupReplyMode === 'chat' || entry.regularGroupReplyMode === 'new-topic' || entry.regularGroupReplyMode === 'shared')
           ? entry.regularGroupReplyMode
           : 'chat-topic',
@@ -374,6 +386,12 @@ async function updateBotCardPrefsInternal(
   if (patch.autoStartOnNewTopic !== undefined) {
     bot.config.autoStartOnNewTopic = patch.autoStartOnNewTopic || undefined;
   }
+  if (patch.groupJoinCommandEnabled !== undefined) {
+    bot.config.groupJoinCommandEnabled = patch.groupJoinCommandEnabled || undefined;
+  }
+  if (patch.groupJoinCommand !== undefined) {
+    bot.config.groupJoinCommand = patch.groupJoinCommand.trim() || undefined;
+  }
   if (patch.regularGroupReplyMode !== undefined) {
     bot.config.regularGroupReplyMode = (patch.regularGroupReplyMode === 'chat' || patch.regularGroupReplyMode === 'new-topic' || patch.regularGroupReplyMode === 'shared')
       ? patch.regularGroupReplyMode
@@ -409,6 +427,7 @@ async function updateBotCardPrefsInternal(
     `senderTag=${r.result.senderTag} ` +
     `overloadAlert=${r.result.overloadAlert} ` +
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +
+    `groupJoinCommandEnabled=${r.result.groupJoinCommandEnabled} groupJoinCommand.len=${r.result.groupJoinCommand.length} ` +
     `regularGroupReplyMode=${r.result.regularGroupReplyMode} regularGroupMentionMode=${r.result.regularGroupMentionMode} ` +
     `botToBotSameDir=${r.result.botToBotSameDir} docSubscribeDefaultMode=${r.result.docSubscribeDefaultMode} ` +
     `summaryMemory=${r.result.summaryMemory} summaryMemoryPath=${r.result.summaryMemoryPath} ` +

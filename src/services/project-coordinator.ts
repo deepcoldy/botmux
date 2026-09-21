@@ -299,6 +299,7 @@ export class ProjectCoordinator {
         current.focus = '项目已完成';
         current.blockers = [];
         current.remaining = '无';
+        delete current.nextMilestone;
         const milestone = boundedText(action.milestone, 300, '项目完成');
         current.milestones.push({ content: milestone, createdAt: now });
       } else if (action.action === 'resume') {

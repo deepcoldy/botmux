@@ -362,3 +362,16 @@ describe('resetPreservingPendingCliInputs', () => {
     expect(pending.map(item => item.content)).toEqual(['queued', 'reset-added']);
   });
 });
+
+it('keeps collaborative messages separate even from the same sender', () => {
+  const trustedCaller = { requestUserOpenId: 'ou_a', requestLarkAppId: 'app', senderType: 'user' as const };
+  for (const flags of [[true, false], [false, true], [true, true]]) {
+    const tail = { content: 'first', turnId: 'a', trustedCaller,
+      ...(flags[0] ? { queueAfterActiveTurn: true as const } : {}) };
+    const next = { content: 'second', turnId: 'b', trustedCaller,
+      ...(flags[1] ? { queueAfterActiveTurn: true as const } : {}) };
+    expect(mergeQueuedCliInput([tail], next)).toBe(false);
+    expect(tail.content).toBe('first');
+    expect(tail.turnId).toBe('a');
+  }
+});

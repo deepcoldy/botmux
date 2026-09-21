@@ -15,6 +15,7 @@
 import type { BackendType } from './types.js';
 import { buildBotmuxEnvAssignments } from './tmux-backend.js';
 import { buildWrappedLaunch } from '../../setup/cli-selection.js';
+import { buildForgeTraexLaunch, type CliLaunchMode } from '../../core/cli-launch-mode.js';
 
 /** POSIX 单引号转义，安全用于 bash 粘贴。 */
 function shq(value: string): string {
@@ -36,11 +37,16 @@ export function selectReproduceLaunch(input: {
   baseBin: string;
   baseArgs: string[];
   wrapperCli?: string;
+  cliLaunchMode?: CliLaunchMode;
   sandboxOn: boolean;
   binResolver?: (bin: string) => string;
   ttadkModel?: string;
 }): { bin: string; args: string[] } {
-  const { baseBin, baseArgs, wrapperCli, sandboxOn } = input;
+  const { baseBin, baseArgs, wrapperCli, cliLaunchMode, sandboxOn } = input;
+  if (cliLaunchMode === 'forge-traex' && !sandboxOn) {
+    const launch = buildForgeTraexLaunch(baseArgs, input.binResolver ?? ((b) => b));
+    return { bin: launch.bin, args: launch.args };
+  }
   if (wrapperCli && wrapperCli.trim() && !sandboxOn) {
     const launch = buildWrappedLaunch(
       wrapperCli,

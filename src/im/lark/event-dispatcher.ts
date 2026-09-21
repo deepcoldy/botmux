@@ -11,14 +11,16 @@ import { join } from 'node:path';
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
 import { getChatInfo, getChatMode, getCachedChatMode, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { listChats } from '../../services/groups-store.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseSlashCommandInvocation, resolvePassthroughCommands } from '../../core/command-handler.js';
-import { isTopicHeader, parseTopicHeader } from '../../core/topic-header.js';
+import { isTopicHeader, parseTopicHeader, parseTopicHeaderWithLifecycleAliases } from '../../core/topic-header.js';
 import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { resolveNonsupportMessage, stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, type MentionIdentity } from './message-parser.js';
+import { emitHookEvent, runGroupJoinCommand } from '../../services/hook-runner.js';
 import { commandPrecedesMentions } from './mention-targets.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
@@ -2415,6 +2417,7 @@ function listenerRoutingContext(input: {
   chatType: 'group' | 'p2p';
   larkAppId: string;
 }): PendingForwardTopicPayload {
+  const replyInChat = input.match.replyMode === 'chat';
   return {
     data: input.data,
     ctx: {
@@ -2422,8 +2425,9 @@ function listenerRoutingContext(input: {
       messageId: input.messageId,
       chatType: input.chatType,
       larkAppId: input.larkAppId,
-      scope: 'thread',
-      anchor: input.messageId,
+      scope: replyInChat ? 'chat' : 'thread',
+      anchor: replyInChat ? input.chatId : input.messageId,
+      regularGroupTopLevel: replyInChat,
       messageListener: input.match,
     },
     ownsSession: false,
@@ -2448,9 +2452,20 @@ const MESSAGE_LISTENER_BACKFILL_PAGE_SIZE = Math.min(50, Math.max(
 ));
 
 function enabledMessageListenerChatIds(bot: BotState): string[] {
-  return Object.entries(bot.config.messageListeners ?? {})
+  // Global listeners potentially apply to every joined group. The polling
+  // backfill needs concrete chat ids, so callers provide the configured
+  // exception set here; joined chats without an exception are still covered by
+  // realtime delivery and are discovered by the dashboard group list.
+  const customChatIds = Object.entries(bot.config.groupMessageListenerOverrides ?? {})
+    .filter(([, override]) => override?.mode === 'custom' && override.listener.enabled === true && !!override.listener.prompt?.trim())
+    .map(([chatId]) => chatId);
+  // Keep legacy-only configurations pollable during the rolling migration.
+  // bot-registry exposes this compatibility view specifically for callers that
+  // have not yet been converted to groupMessageListenerOverrides.
+  const legacyChatIds = Object.entries(bot.config.messageListeners ?? {})
     .filter(([, listener]) => listener?.enabled === true && !!listener.prompt?.trim())
     .map(([chatId]) => chatId);
+  return [...new Set([...customChatIds, ...legacyChatIds])];
 }
 
 function messageCreateTimeMs(message: any): number | undefined {
@@ -2617,7 +2632,20 @@ async function dispatchPolledMessageListenerMatch(input: {
 
 async function pollMessageListenersOnce(larkAppId: string, handlers: EventHandlers, now = Date.now()): Promise<void> {
   const bot = getBot(larkAppId);
-  const chatIds = enabledMessageListenerChatIds(bot);
+  const configuredChatIds = enabledMessageListenerChatIds(bot);
+  let chatIds = configuredChatIds;
+  if (bot.config.globalMessageListener?.enabled) {
+    try {
+      chatIds = [...new Set([...(await listChats(larkAppId)).map(chat => chat.chatId), ...configuredChatIds])];
+    } catch (error) {
+      // A transient roster failure must not suppress custom/legacy listener
+      // backfill for the whole 30s pass. Realtime delivery stays unaffected.
+      logger.warn(
+        `[message-listener:${larkAppId}] list joined chats failed; polling configured listener chats only: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
   if (chatIds.length === 0) return;
 
   const cutoff = now - MESSAGE_LISTENER_BACKFILL_WINDOW_MS;
@@ -2709,6 +2737,9 @@ export interface EventHandlers {
   handleCardAction: (data: any, larkAppId: string) => Promise<any>;
   handleNewTopic: (data: any, ctx: RoutingContext) => Promise<void>;
   handleThreadReply: (data: any, ctx: RoutingContext) => Promise<void>;
+  /** Validate a syntactically valid topic header before routing mutates scope.
+   * The daemon supplies the same semantic resolver used by handleNewTopic. */
+  validateTopicHeader?: (header: import('../../core/topic-header.js').TopicHeader, larkAppId: string) => boolean;
   /** 主动开工 — 场景①: fired when this bot is added to a chat
    *  (`im.chat.member.bot.added_v1`). The daemon decides whether to auto-start
    *  based on the bot's `autoStartOnGroupJoin` toggle + allowedUser membership.
@@ -2863,15 +2894,17 @@ export function maybeApplyForceTopicOverride(
   message: any,
   messageId: string,
   larkAppId: string,
+  validateTopicHeader?: (header: import('../../core/topic-header.js').TopicHeader, larkAppId: string) => boolean,
 ): boolean {
   if (routing.scope !== 'chat') return false;
   const rawText = extractMessageTextForRouting(message);
   if (!rawText) return false;
   const stripped = stripHeaderMentions(rawText, message, larkAppId);
-  // 指令头（`[标题] /t …`）与裸 `/t` 走同一条判定。只认**解析成功**的头部：写错了的
-  // 头部要留在原地被拒绝（回一句用法错误），不能先把 scope 改成新话题——那已经是副作用。
-  // 这里只需要 yes/no，所以沿用按位置剥前导 @ 即可；daemon 侧会按身份重新精确解析。
-  if (!isTopicHeader(parseTopicHeader(stripped))) return false;
+  // 指令头（`[标题] /t …`）与生命周期别名 `/th` `/tw` 走同一条判定。语法与
+  // 完整规格都校验成功后才能翻 scope；否则错误必须留在原 chat 中，不能先产生
+  // 新话题副作用。
+  const header = parseTopicHeaderWithLifecycleAliases(stripped);
+  if (!isTopicHeader(header) || (validateTopicHeader && !validateTopicHeader(header, larkAppId))) return false;
   routing.scope = 'thread';
   routing.anchor = messageId;
   // 把「这条路由是 `/t` 翻出来的」记在 ctx 上，让下游 handler 能对**它自己没做过的
@@ -2956,7 +2989,7 @@ async function maybeFoldMentionedRegularGroupThreadToChat(input: {
   if (threadId.startsWith('omt_') && resolveRegularGroupMode(larkAppId, chatId) === 'chat-topic') return undefined;
   const rawText = extractMessageTextForRouting(message);
   if (rawText) {
-    if (isTopicHeader(parseTopicHeader(stripHeaderMentions(rawText, message, larkAppId)))) return undefined;
+    if (isTopicHeader(parseTopicHeaderWithLifecycleAliases(stripHeaderMentions(rawText, message, larkAppId)))) return undefined;
   }
 
   // In a regular group, `chat` and `shared` both mean "use the group's one
@@ -3758,6 +3791,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const chatType = (message.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
       const messageId = message.message_id;
 
+
       // Bot-originated messages — bots historically only post inside threads
       // (their own thread replies). With chat-scope sessions a bot can also
       // post top-level (its first reply in a chat-scope group), so we still
@@ -3964,7 +3998,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // brand-new {thread, messageId} anchor. forceTopicApplied also suppresses
         // the shared-topic fold below — a `/t` seed wins over shared, same
         // precedence as the human path.
-        const forcedTopic = maybeApplyForceTopicOverride(ctx, message, messageId, larkAppId);
+        const forcedTopic = maybeApplyForceTopicOverride(ctx, message, messageId, larkAppId, handlers.validateTopicHeader);
         if (forcedTopic) {
           logger.info(`[/t] Force-topic override (bot sender): msg=${messageId.substring(0, 12)} → thread-scope, anchor=msg`);
         }
@@ -4141,9 +4175,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           })
         : undefined;
       if (messageListener) {
-        routing.scope = 'thread';
-        routing.anchor = messageId;
-        routingSource = 'topic-chat';
+        routing.scope = messageListener.replyMode === 'chat' ? 'chat' : 'thread';
+        routing.anchor = messageListener.replyMode === 'chat' ? chatId : messageId;
+        routingSource = messageListener.replyMode === 'chat' ? 'regular-group-chat' : 'topic-chat';
         replyRootId = undefined;
         logger.info(
           `[message-listener:${larkAppId}] matched chat=${chatId.substring(0, 12)} ` +
@@ -4302,7 +4336,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // /t / /topic in 普通群: flip routing to thread-scope so the bot's
       // first reply seeds a fresh Lark thread, even if a chat-scope session
       // is currently active in this chat.
-      const forceTopicApplied = substituteTrigger ? false : maybeApplyForceTopicOverride(routing, message, messageId, larkAppId);
+      const forceTopicApplied = substituteTrigger
+        ? false
+        : maybeApplyForceTopicOverride(routing, message, messageId, larkAppId, handlers.validateTopicHeader);
       if (forceTopicApplied) {
         logger.info(`[/t] Force-topic override: msg=${messageId.substring(0, 12)} → thread-scope, anchor=msg`);
       }
@@ -4857,6 +4893,24 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const operatorOpenId: string | undefined = data?.operator_id?.open_id;
         if (!chatId) return;
         logger.info(`[auto-start:入群] bot added to chat=${chatId.substring(0, 12)} by ${String(operatorOpenId ?? '?').substring(0, 12)}`);
+        // chat.bot_added 观察钩子：拉群信号（应急群自动化的触发点之一）。
+        // 放在 scheduleAckSafeEvent 的去重 claim 之后，重推不会重复发射。
+        try {
+          emitHookEvent('chat.bot_added', { larkAppId, chatId, operatorOpenId });
+        } catch (err) {
+          logger.debug(`[hooks:${larkAppId}] chat.bot_added emit failed: ${err}`);
+        }
+        // 主动开工 — 入群执行命令（bots.json groupJoinCommand，不经 CLI/LLM）。
+        // 不受 autoStartOnGroupJoin / allowedUser 在群闸约束，两者独立。
+        try {
+          const joinCfg = getBot(larkAppId).config;
+          const joinCommand = joinCfg.groupJoinCommand?.trim();
+          if (joinCfg.groupJoinCommandEnabled === true && joinCommand) {
+            runGroupJoinCommand(joinCommand, { larkAppId, chatId, operatorOpenId });
+          }
+        } catch (err) {
+          logger.warn(`[group-join-command:${larkAppId}] skipped: ${err}`);
+        }
         // 进群先自动拉 owner（不受任何开工开关影响，失败仅日志）：bot 应始终
         // 处于 owner 可见的群里。放在 handleBotAdded 之前，让 autoStart 的
         // D7「群内需有 allowedUser」闸能吃到刚拉进来的 owner。
@@ -5010,7 +5064,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       .finally(() => { listenerPollInFlight = false; });
   }, MESSAGE_LISTENER_POLL_INTERVAL_MS);
   listenerPollTimer.unref();
-  const hasListenerBackfill = enabledMessageListenerChatIds(getBot(larkAppId)).length > 0;
+  const hasListenerBackfill = getBot(larkAppId).config.globalMessageListener?.enabled === true
+    || enabledMessageListenerChatIds(getBot(larkAppId)).length > 0;
   if (hasListenerBackfill) {
     setTimeout(() => {
       if (listenerPollInFlight) return;
@@ -5021,7 +5076,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
     }, 2_000).unref();
     logger.info(
       `[message-listener:${larkAppId}] polling backfill enabled interval=${MESSAGE_LISTENER_POLL_INTERVAL_MS}ms ` +
-      `window=${MESSAGE_LISTENER_BACKFILL_WINDOW_MS}ms chats=${enabledMessageListenerChatIds(getBot(larkAppId)).length}`,
+      `window=${MESSAGE_LISTENER_BACKFILL_WINDOW_MS}ms mode=${getBot(larkAppId).config.globalMessageListener?.enabled === true ? 'global' : 'overrides'}`,
     );
   }
 

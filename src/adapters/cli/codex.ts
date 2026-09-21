@@ -24,14 +24,20 @@ function restoredCodexHistoryReady(history: string): boolean {
   const restored = /^\s*Earlier messages are available\s*—\s*press ctrl \+ t to view the full transcript[ \t]*(?:\r?\n|$)/.test(history);
   const banner = history.match(/^\s*╭[^\r\n]*╮\r?\n[\s\S]*?╰[^\r\n]*╯/)?.[0];
   const initialized = !!banner && banner.includes('>_ OpenAI Codex') && CODEX_STARTUP_READY_PATTERN.test(banner);
-  if (!restored && !initialized) return false;
   const lines = history.trimEnd().split(/\r?\n/);
   const fromBottom = [...lines].reverse().findIndex(line => /^\s*›(?:\s|$)/.test(line));
   if (fromBottom < 0) return false;
   const prompt = lines.length - 1 - fromBottom;
   if (!/^\s*›\s*(?:Ask Codex to do anything)?\s*$/.test(lines[prompt])) return false;
   const footer = lines.slice(prompt + 1).filter(line => line.trim());
-  if (footer.length !== 1 || !/^\s*\S[^\r\n]* · (?:\/|~)\S* · Ready(?: · [^\r\n]*)?$/.test(footer[0])) return false;
+  if (footer.length !== 1) return false;
+  const restoredReady = (restored || initialized)
+    && /^\s*\S[^\r\n]* · (?:\/|~)\S* · Ready(?: · [^\r\n]*)?$/.test(footer[0]!);
+  // Codex 0.154 can resume straight into the composer without repainting the
+  // banner or restoration marker. Its bottom Context footer is the positive
+  // initialization evidence in that layout; the loading skeleton never has it.
+  const contextReady = /^\s*\S[^\r\n]* · Context \d+% (?:left|used)(?: · [^\r\n]*)?$/.test(footer[0]!);
+  if (!restoredReady && !contextReady) return false;
   // History has no viewport bounds: never guess how far above the composer a
   // loading/status row can be. Conflicting evidence remains conservatively held.
   return !/(?:model|directory):\s*loading\b|Resuming session|esc to interrupt|Queued for capacity/i.test(history);

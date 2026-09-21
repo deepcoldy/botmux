@@ -169,10 +169,11 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
     ? JSON.parse(record.finalCard) as ReturnType<typeof createReplyCard>
     : createReplyCard([]);
   if (record.overflowMessageId) {
-    // Keep the canonical footer and feedback controls. Full original content
+    // Keep the canonical footer and action controls. Full original content
     // is in the native attachment; a visible notice always accompanies it.
     card.body.elements = card.body.elements.filter(element =>
-      element.element_id === 'botmux_reply_footer' || element.element_id === 'botmux_feedback');
+      element.element_id === 'botmux_reply_footer' || element.element_id === 'botmux_feedback'
+      || element.element_id === 'botmux_oncall_group');
     card.body.elements.unshift({ tag: 'markdown', content: en
       ? 'The full answer is included in this turn’s **Markdown attachment**.'
       : '完整答复较长，已作为本轮的 **Markdown 附件**发送，请查看附件。' });

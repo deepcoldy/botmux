@@ -430,6 +430,38 @@ describe('parseBotConfigsFromText — brand', () => {
     }]))).toThrow(/cannot be combined with wrapperCli/);
   });
 
+  it('accepts Forge x TraeX only as a plain TraeX launch mode', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'forge-traex-app',
+      larkAppSecret: 's',
+      cliId: 'traex',
+      cliLaunchMode: 'forge-traex',
+    }]));
+    expect(cfg.cliId).toBe('traex');
+    expect(cfg.cliLaunchMode).toBe('forge-traex');
+
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'forge-wrong-cli-app',
+      larkAppSecret: 's',
+      cliId: 'codex',
+      cliLaunchMode: 'forge-traex',
+    }]))).toThrow(/supported only for cliId "traex"/);
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'forge-wrapper-app',
+      larkAppSecret: 's',
+      cliId: 'traex',
+      wrapperCli: 'aiden x traex',
+      cliLaunchMode: 'forge-traex',
+    }]))).toThrow(/cannot be combined with wrapperCli/);
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'forge-sandbox-app',
+      larkAppSecret: 's',
+      cliId: 'traex',
+      cliLaunchMode: 'forge-traex',
+      readIsolation: true,
+    }]))).toThrow(/sandbox or readIsolation/);
+  });
+
   it('accepts existingAppServer on a Codex App bot but rejects unrelated CLIs', () => {
     const endpoint = 'unix:///home/testuser/.codex/app-server-control/app-server-control.sock';
     const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([{

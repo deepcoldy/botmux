@@ -1,6 +1,6 @@
 import { config } from '../config.js';
 import { formatUrlHost } from './dashboard-url.js';
-import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
+import { platformTerminalBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
 import { isRemoteAccessEnabled } from '../global-config.js';
 import { devboxDashboardBaseUrl } from '../platform/devbox-dashboard-export.js';
 
@@ -81,8 +81,8 @@ export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean
   // stay reachable: Web终端=日志页常驻，操作链接=AIO Sandbox。
   if (ds.riffAccessUrl && opts.write) return ds.riffAccessUrl;
   // When 远程访问 is enabled AND this daemon is bound to the central platform AND
-  // the local terminal proxy is up, route terminal links through the machine
-  // subdomain (`https://m-<machineId>.<platformHost>/s/<sessionId>`). The platform
+  // the local terminal proxy is up, route terminal links through the terminal
+  // subdomain (`https://t-<machineId>.<platformHost>/s/<sessionId>`). The platform
   // reverse-proxies that subdomain to this daemon's dashboard, which in turn
   // proxies `/s/*` to the local terminal proxy — so terminals are reachable
   // centrally with no `:port`. Platform owner login grants write access, and an
@@ -93,7 +93,7 @@ export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean
   // to a self-hosted reverse proxy base (`BOTMUX_PUBLIC_URL`, same front-door
   // `/s/<id>` form), then to the local proxy/worker port.
   if (proxyReady) {
-    const platformBase = isRemoteAccessEnabled() ? platformMachineBaseUrl() : null;
+    const platformBase = isRemoteAccessEnabled() ? platformTerminalBaseUrl() : null;
     if (platformBase) {
       const base = `${platformBase}/s/${ds.session.sessionId}`;
       return opts.write

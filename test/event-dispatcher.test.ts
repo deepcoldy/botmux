@@ -50,6 +50,15 @@ vi.mock('../src/utils/atomic-write.js', () => ({
   atomicWriteFileSync: (...args: any[]) => mockWriteFileSync(...args),
 }));
 
+// chat.bot_added 观察钩子的发射断言口。真实现是 fire-and-forget 且无 hooks 配置时
+// 为 no-op；mock 掉让断言直接看发射参数（client.ts 的 emitHookEvent 引用也走这个
+// mock，本文件不覆盖其行为）。
+const { emitHookEventMock, runGroupJoinCommandMock } = vi.hoisted(() => ({ emitHookEventMock: vi.fn(), runGroupJoinCommandMock: vi.fn() }));
+vi.mock('../src/services/hook-runner.js', () => ({
+  emitHookEvent: (...args: unknown[]) => emitHookEventMock(...args),
+  runGroupJoinCommand: (...args: unknown[]) => runGroupJoinCommandMock(...args),
+}));
+
 const mockGetBot = vi.fn();
 const mockGetAllBots = vi.fn(() => []);
 const mockGetBotOpenId = vi.fn((larkAppId: string) => mockGetBot(larkAppId)?.botOpenId as string | undefined);
@@ -894,12 +903,14 @@ function setupBotState(opts?: {
   onChatModeConverted: ReturnType<typeof vi.fn>;
   resolveReplyThreadAlias: ReturnType<typeof vi.fn>;
   chatSessionAnsweredRootAtTopLevel: ReturnType<typeof vi.fn>;
+  validateTopicHeader: ReturnType<typeof vi.fn>;
   handleVcMeetingPush: ReturnType<typeof vi.fn>;
 } {
   return {
     handleCardAction: vi.fn(async () => undefined),
     handleNewTopic: vi.fn(async () => {}),
     handleThreadReply: vi.fn(async () => {}),
+    validateTopicHeader: vi.fn(() => true),
     handleVcMeetingPush: vi.fn(async () => {}),
     isSessionOwner: vi.fn(() => false),
     resolveReplyThreadAlias: vi.fn(() => null),
@@ -2633,6 +2644,74 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(routing).toEqual({ scope: 'thread', anchor: 'om_inbound', forceTopicApplied: true });
   });
 
+  it('/th 与 /tw 生命周期别名在路由层翻成新话题（普通群 @bot /th 不再落进 chat-scope）', () => {
+    setupBotState({ botOpenId: MY_OPEN_ID });
+    // 真实事故形态：普通群里「@bot /th @另一个bot 正文」被当普通消息，/th 失效。
+    const withMention = {
+      content: JSON.stringify({ text: '/th @_user_1 看下这个' }),
+      mentions: [{ key: '@_user_1', name: 'Worker Claude Pro', id: { openId: OTHER_BOT_OPEN_ID }, id_type: 'open_id' }],
+    };
+    const r1 = { scope: 'chat' as const, anchor: 'oc_chat' };
+    expect(maybeApplyForceTopicOverride(r1, withMention, 'om_th', MY_APP_ID)).toBe(true);
+    expect(r1).toEqual({ scope: 'thread', anchor: 'om_th', forceTopicApplied: true });
+
+    // /tw 同样翻 scope（worktree 模式由 daemon 单独推导，不把 worktree 注入正文）。
+    const tw = { content: JSON.stringify({ text: '/tw 修复登录' }), mentions: [] };
+    const r2 = { scope: 'chat' as const, anchor: 'oc_chat' };
+    expect(maybeApplyForceTopicOverride(r2, tw, 'om_tw', MY_APP_ID)).toBe(true);
+    expect(r2).toEqual({ scope: 'thread', anchor: 'om_tw', forceTopicApplied: true });
+  });
+
+  it('/th /tw 归一与 daemon 同源：不把 here/worktree 注入正文，指令头仍按原词 fail-closed', () => {
+    setupBotState({ botOpenId: MY_OPEN_ID });
+    // Codex CR (#1385)：旧实现把 /th 归一成 `/t here /model`，parseTopicHeader 把 here
+    // 当 prompt、漏掉 /model 缺参数而误翻 scope。daemon 是把别名仅归一成 `/t`（余下
+    // 原样）再判 missing_arg。故缺参数的 /model /effort 必须不翻 scope，错误留在原地。
+    for (const text of ['/th /model', '/tw /model', '/th /effort', '/tw /effort']) {
+      const routing = { scope: 'chat' as const, anchor: 'oc_chat' };
+      expect(maybeApplyForceTopicOverride(routing, { content: JSON.stringify({ text }), mentions: [] }, 'om_bad', MY_APP_ID)).toBe(false);
+      expect(routing).toEqual({ scope: 'chat', anchor: 'oc_chat' });
+    }
+
+    // /model 显式给值是合法指令头，/tw 也应翻 scope（worktree 模式由 daemon 单独推导，
+    // 不进正文，故 directive 仍被正常解析）。
+    const modelVal = { content: JSON.stringify({ text: '/tw /model gpt-5 做点事' }), mentions: [] };
+    const r1 = { scope: 'chat' as const, anchor: 'oc_chat' };
+    expect(maybeApplyForceTopicOverride(r1, modelVal, 'om_m', MY_APP_ID)).toBe(true);
+    expect(r1).toEqual({ scope: 'thread', anchor: 'om_m', forceTopicApplied: true });
+
+    // /repo 允许裸形式：/tw /repo 合法并翻 scope。
+    const bareRepo = { content: JSON.stringify({ text: '/tw /repo' }), mentions: [] };
+    const r2 = { scope: 'chat' as const, anchor: 'oc_chat' };
+    expect(maybeApplyForceTopicOverride(r2, bareRepo, 'om_repo', MY_APP_ID)).toBe(true);
+    expect(r2).toEqual({ scope: 'thread', anchor: 'om_repo', forceTopicApplied: true });
+  });
+
+  it('/th /tw 完整规格语义校验失败时不翻 scope', () => {
+    setupBotState({ botOpenId: MY_OPEN_ID });
+    for (const text of ['/tw /repo does-not-exist task', '/th /model unsupported task']) {
+      const routing = { scope: 'chat' as const, anchor: 'oc_chat' };
+      expect(maybeApplyForceTopicOverride(
+        routing,
+        { content: JSON.stringify({ text }), mentions: [] },
+        'om_invalid',
+        MY_APP_ID,
+        () => false,
+      )).toBe(false);
+      expect(routing).toEqual({ scope: 'chat', anchor: 'oc_chat' });
+    }
+  });
+
+  it('/th /tw 必须是行首完整 token，正文里提到 /the 或 /two 不触发翻话题', () => {
+    setupBotState({ botOpenId: MY_OPEN_ID });
+    for (const text of ['请看 /the 文档', '/two issues', '前缀 /th 不在行首']) {
+      const message = { content: JSON.stringify({ text }), mentions: [] };
+      const routing = { scope: 'chat' as const, anchor: 'oc_chat' };
+      expect(maybeApplyForceTopicOverride(routing, message, 'om_x', MY_APP_ID)).toBe(false);
+      expect(routing).toEqual({ scope: 'chat', anchor: 'oc_chat' });
+    }
+  });
+
   it('still drops an unknown-peer bot on the /topic alias too (alias must not bypass either)', async () => {
     // /t 和 /topic 走同一条 parseTopicHeader，别让别名成为绕过 vetting 的后门。
     setupBotState({ allowedUsers: ['ou_owner'] });  // 受限态：gate 生效
@@ -3257,6 +3336,37 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       larkAppId: MY_APP_ID,
     }));
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('/th /tw inside a native topic stay thread-scoped like /t instead of folding into chat scope', async () => {
+    setupBotState({ chatReplyModes: { 'chat-alias-topic': 'shared' }, allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    mockListChatBotMembers.mockResolvedValue([{ openId: MY_OPEN_ID, name: 'BotA' }]);
+    for (const [index, alias] of ['/th inspect', '/tw inspect'].entries()) {
+      handlers.handleThreadReply.mockClear();
+      handlers.handleNewTopic.mockClear();
+      const rootId = `alias-topic-root-${index}`;
+      const event = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: `@BotA ${alias}` }),
+        rootId,
+        threadId: `omt_alias_topic_${index}`,
+        messageId: `alias-topic-message-${index}`,
+        chatId: 'chat-alias-topic',
+        chatType: 'group',
+        mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      });
+      handlers.isSessionOwner.mockReturnValue(false);
+
+      await capturedHandlers['im.message.receive_v1'](event);
+      await flushEventWork();
+
+      expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+        scope: 'thread',
+        anchor: rootId,
+      }));
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    }
   });
 
   it('keeps thread-scope when root_id+thread_id are set and a thread session DOES exist', async () => {
@@ -5583,6 +5693,8 @@ describe('managed Agent clone owner boundary', () => {
       'name',
       'displayName',
       'messageListeners',
+      'globalMessageListener',
+      'groupMessageListenerOverrides',
       'oncallChats',
       'defaultOncallAutoboundChats',
       'allowedChatGroups',
@@ -5637,6 +5749,27 @@ describe('managed Agent clone owner boundary', () => {
     setupBotState({ configAllowedUsers: target.allowedUsers, allowedUsers: [USER_OPEN_ID] });
     expect(canOperate(MY_APP_ID, 'chat-A', USER_OPEN_ID)).toBe(true);
     expect(canOperate(MY_APP_ID, 'chat-A', 'ou_source_owner')).toBe(false);
+  });
+
+  it('never copies global or per-chat listener rules into a new Bot', () => {
+    const source = {
+      larkAppId: 'cli_source',
+      cliId: 'codex',
+      globalMessageListener: { enabled: true, prompt: '监听源 Bot 所在的群' },
+      groupMessageListenerOverrides: {
+        oc_source_custom: { mode: 'custom', listener: { enabled: true, prompt: '只监听源群' } },
+        oc_source_disabled: { mode: 'disabled' },
+      },
+      messageListeners: {
+        oc_source_legacy: { enabled: true, prompt: '旧监听' },
+      },
+    };
+    const target = cloneBotConfig(source, { larkAppId: 'cli_target', larkAppSecret: 'target-secret' });
+
+    expect(target).not.toHaveProperty('globalMessageListener');
+    expect(target).not.toHaveProperty('groupMessageListenerOverrides');
+    expect(target).not.toHaveProperty('messageListeners');
+    expect(target).toMatchObject({ larkAppId: 'cli_target', cliId: 'codex' });
   });
 
   it('never carries a source-app identity into the cloned bot', () => {
@@ -9548,4 +9681,76 @@ describe('im.message.updated_v1 — 编辑消息补 @（延迟首次 @）', () =
     );
   });
 
+});
+
+describe('chat.bot_added observer hook', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    emitHookEventMock.mockClear();
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    handlers = makeHandlers();
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('group');
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    markForwardFollowupsSessionsReady(MY_APP_ID);
+  });
+
+  // 拉群信号钩子（应急群自动化的触发点）：bot 被拉进群即发射，早于 owner 自动邀请
+  // 与 autoStart 判定；payload 只带 chatId + operatorOpenId，去重由 scheduleAckSafeEvent
+  // 的 event claim 保证（重推不重复发射）。
+  it('fires once when the bot is added to a chat', async () => {
+    const event = {
+      chat_id: 'chat-emergency-1',
+      operator_id: { open_id: USER_OPEN_ID },
+    };
+    capturedHandlers['im.chat.member.bot.added_v1'](event);
+    await flushEventWork();
+
+    const calls = emitHookEventMock.mock.calls.filter(c => c[0] === 'chat.bot_added');
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1]).toMatchObject({
+      larkAppId: MY_APP_ID,
+      chatId: 'chat-emergency-1',
+      operatorOpenId: USER_OPEN_ID,
+    });
+
+    // 同一事件重推（同 event claim key）不再发射。
+    capturedHandlers['im.chat.member.bot.added_v1'](event);
+    await flushEventWork();
+    expect(emitHookEventMock.mock.calls.filter(c => c[0] === 'chat.bot_added')).toHaveLength(1);
+  });
+
+  it('runs the per-bot group-join command once when enabled, independent of autoStart', async () => {
+    runGroupJoinCommandMock.mockClear();
+    const state = setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    Object.assign(state.config, { groupJoinCommandEnabled: true, groupJoinCommand: ' bash /opt/on-join.sh ' });
+    const event = { chat_id: 'chat-emergency-2', operator_id: { open_id: USER_OPEN_ID } };
+    capturedHandlers['im.chat.member.bot.added_v1'](event);
+    await flushEventWork();
+    expect(runGroupJoinCommandMock).toHaveBeenCalledTimes(1);
+    expect(runGroupJoinCommandMock).toHaveBeenCalledWith('bash /opt/on-join.sh', {
+      larkAppId: MY_APP_ID, chatId: 'chat-emergency-2', operatorOpenId: USER_OPEN_ID,
+    });
+
+    capturedHandlers['im.chat.member.bot.added_v1'](event);
+    await flushEventWork();
+    expect(runGroupJoinCommandMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not run the group-join command when disabled or blank', async () => {
+    runGroupJoinCommandMock.mockClear();
+    const state = setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    Object.assign(state.config, { groupJoinCommandEnabled: false, groupJoinCommand: 'bash /opt/on-join.sh' });
+    capturedHandlers['im.chat.member.bot.added_v1']({ chat_id: 'chat-off', operator_id: { open_id: USER_OPEN_ID } });
+    await flushEventWork();
+    Object.assign(state.config, { groupJoinCommandEnabled: true, groupJoinCommand: '   ' });
+    capturedHandlers['im.chat.member.bot.added_v1']({ chat_id: 'chat-blank', operator_id: { open_id: USER_OPEN_ID } });
+    await flushEventWork();
+    expect(runGroupJoinCommandMock).not.toHaveBeenCalled();
+  });
 });

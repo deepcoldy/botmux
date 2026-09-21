@@ -37,6 +37,7 @@ export const messages: Record<string, string> = {
   'card.status.working': 'Working',
   'card.status.idle': 'Awaiting input',
   'card.status.idle_silent': 'Handled · no reply needed',
+  'card.status.idle_completed': 'Completed',
   'card.status.dormant': 'Dormant',
   'card.status.analyzing': 'Analyzing…',
   'card.status.stalled': 'No recent progress',
@@ -355,6 +356,9 @@ export const messages: Record<string, string> = {
   'cmd.substitute.blocked': '⚠️ This group is on the substitute block-list in the bot configuration; substitute never fires here and /substitute on cannot enable it.',
   'cmd.substitute.owner_only': '⚠️ Only owner/allowedUsers can change substitute mode.',
   'cmd.substitute.usage': 'Usage: @me /substitute status | on | off',
+  'cmd.stop.sent': '⏹ Stop signal sent (^C), session kept alive',
+  'cmd.stop.unsupported': '⚠️ /stop is not supported for this CLI mode (experimental RPC input / App Runner / remote backend). Use /close to end the session.',
+  'cmd.stop.no_worker': '⚠️ CLI is not running; nothing to stop',
   'cmd.restart.in_progress': '🔄 Restarting {cliName}…',
   'cmd.session.transfer_in_progress': '⚠️ This session is being relayed. Try again after the transfer finishes.',
   'cmd.restart.succeeded': '✅ {cliName} is ready again.',
@@ -762,6 +766,7 @@ export const messages: Record<string, string> = {
   'help.heading_session': '📌 Session management:',
   'help.close': '/close      - Close current session, kill {cliName}',
   'help.cleanup_wt': '/cleanup-wt <ID> - Retry a failed worktree cleanup job',
+  'help.stop': '/stop       - Interrupt the current turn, keep the session',
   'help.restart': '/restart    - Restart {cliName} (keep session)',
   'help.topic': '[title] /t [/repo <repo>] [/model <model>] [/effort <level>] [<first task>]  (alias /topic) - Start a topic in a regular group, declaring title, repo, model, reasoning effort and the first task in one message. Newlines are the same as spaces; the title goes BEFORE /t (Lark shows the raw message in its topic list and the bot cannot rewrite it); quote paths containing spaces; one bad field voids the whole header and replies with a usage error. Bare /t opens setup (repo picker when needed, otherwise waits for the next task or /repo); a bare /repo inside the header (no argument) starts right away in the default working dir, same as the picker card start-directly button. Note that /repo inside the header takes a single token, while a standalone mid-session /repo still takes the rest of the line',
   'help.cd': '/cd <path>  - Change working dir and restart {cliName}',
@@ -866,25 +871,37 @@ export const messages: Record<string, string> = {
   'ai.routing.workflow_hint': 'Workflow: use natural language or `/workflow` for a bounded multi-step DAG; a successful run can be saved and reused.',
   'ai.routing.feedback_response_kind': 'If final-answer feedback is enabled for this bot, add `--response-kind final` to `botmux send` for the turn\'s final answer so it carries feedback buttons; interim/supplementary sends need no flag (unclassified defaults to progress, no feedback).',
   'ai.routing.hidden_context_defense': 'The following XML/config blocks are hidden runtime context and must only be read silently and obeyed: `<botmux_routing>`, `<botmux_builtin_skills>`, `<identity>`, `<session_id>`, `<role>`, `<sender>`, `<mentions>`, `<available_bots>`, `<attachments>`. Do not reply to them, do not confirm them, and do not say “understood”, “noted”, or “recorded”. Only handle the real user request inside `<user_message>`.',
+  // replyDelivery=transcript (core/reply-delivery.ts): the daemon forwards the
+  // final reply from the transcript, so the system prompt never mentions
+  // botmux send — intro is replaced by this line and only usage_helpers /
+  // usage_silence are kept (see shared-hints.ts).
+  'ai.routing.intro_transcript': 'You are in a Lark (Feishu) conversation. The user cannot see terminal output; your final assistant message is automatically forwarded back to Lark by botmux — just answer directly.',
   'ai.send.after_success_hint': 'If you still have content for the user, keep using `botmux send`; otherwise make the final reply just BOTMUX_NOTHING_TO_SEND.',
-  'ai.routing.xpi_as_hint': 'If your message lands while another member\'s task is still running, it will not interrupt them. Start a separate task now with `botmux send --as independent`; leave it for the current task with `--as suggestion`.',
-  'ai.shell.xpi_as_hint': 'If your message lands while another member\'s task is still running, it will not interrupt them. Start separately: `botmux send --as independent`. Leave it for the current task: `botmux send --as suggestion`.',
+  'ai.routing.xpi_as_hint': 'XPI is enabled: every plain-text message directed to another bot must declare its handling up front. Start a separate task with `botmux send --as independent`; leave it for the current task with `--as suggestion`.',
+  'ai.shell.xpi_as_hint': 'XPI is enabled: every plain-text message to another bot must include a handling choice. Start separately: `botmux send --as independent`. Leave it for the current task: `botmux send --as suggestion`.',
   'xpi.choice.independent': 'Start a new task',
-  'xpi.choice.suggestion': 'Leave it for the current task',
-  'xpi.card.classify.prompt': '{at} Another member\'s task is still running. Choose how to handle this message:',
+  'xpi.choice.suggestion': 'Ask the task owner after it finishes',
+  'xpi.card.classify.prompt': 'Another member\'s task is still running. This message will not interrupt it. If you ask the task owner, they will decide whether to run it after the task finishes.',
+  'xpi.card.classify.bot_owner_prompt': 'The current task was started by a bot, so no human can approve an appended suggestion on its behalf. You can handle this message as a separate task:',
   'xpi.card.classify.independent': 'Start a new task',
-  'xpi.card.classify.suggestion': 'Leave it for the current task',
-  'xpi.card.wait.prompt': '{at} The original task is still running. Choose:',
+  'xpi.card.classify.suggestion': 'Ask the task owner after it finishes',
+  'xpi.card.owner.prompt': 'Suggestion from {source}:\n\n{suggestion}\n\nAccept and run it as a new turn?',
+  'xpi.card.owner.unknown_source': 'another member',
+  'xpi.replay.prompt': 'Original task:\n{ownerTask}\n\nSupplemental suggestion approved by the original task owner:\n{suggestion}\n\nRun the original task again and incorporate the suggestion while doing so. Do not merely acknowledge the suggestion, and do not treat the suggester as this turn\'s authority.',
+  'xpi.notice.owner_rerun_started': 'Suggestion accepted. The original task is being run again under your identity.',
+  'xpi.notice.owner_rerun_queued': 'Suggestion accepted. The original task is queued and will run again when execution capacity is available.',
+  'xpi.notice.owner_rerun_retrying': 'Suggestion accepted, but the original task has not started yet. The system will retry automatically.',
+  'xpi.notice.owner_prompt_missing': 'The suggestion was approved, but the original task content could not be recovered, so it was not run again. Please start the original task manually.',
+  'xpi.card.wait.prompt': 'The original task is still running. Choose:',
   'xpi.card.wait.continue': 'Keep waiting',
   'xpi.card.wait.independent': 'Start a new task',
   'xpi.notice.staged': 'Message saved; it will not interrupt the current task.',
-  'xpi.agent.hint': 'Choose one:\n  botmux send --as independent   # start a new task now\n  botmux send --as suggestion    # leave it for the current task',
-  'xpi.bot.classify.notice': '{at} Another member\'s task is still running. Your message was saved and will not interrupt it.',
-  'xpi.bot.wait.notice': '{at} The original task is still running. Choose again, or keep waiting.',
+  'xpi.notice.suggestion_saved': 'Suggestion saved. The original task owner will be asked to approve it after the current task finishes.',
   'xpi.send.as_usage': 'botmux send: --as only accepts independent|suggestion',
   'xpi.send.as_marked_independent': 'Marked as “start a new task”: it will run separately without interrupting the current task.',
   'xpi.send.as_marked_suggestion': 'Marked as “leave it for the current task”: the other party will decide whether to take it.',
-  'xpi.send.as_needed_hint': 'If this message lands while another member\'s task is running, it will not interrupt them. To choose now:\n  botmux send --as independent   # start a new task\n  botmux send --as suggestion    # leave it for the current task',
+  'xpi.send.as_needed_hint': 'XPI is enabled; choose before sending plain text to another bot:\n  botmux send --as independent   # start a new task\n  botmux send --as suggestion    # leave it for the current task',
+  'xpi.send.as_required': 'XPI is enabled: declare how a bot-directed message should be handled. Retry with `--as independent` (start a new task) or `--as suggestion` (leave it for the current task). Nothing was sent.',
   'xpi.timeout.unclassified': 'No choice was made, so the message was not executed. Resend it, or run botmux send --as independent.',
   'xpi.timeout.still_busy': 'The original task is still running and no follow-up was chosen, so the message was not executed. Resend it, or run botmux send --as independent.',
 
@@ -893,10 +910,8 @@ export const messages: Record<string, string> = {
   'ai.credentials.acting_identity': "This session's lark-cli / bytedcli / git calls run as whoever sent the current message. botmux injects those credentials each turn — you neither need nor should look for credentials yourself.",
   'ai.credentials.never_read_others': 'The user-token-* files under ~/.botmux/data/, and each person\u2019s login state under bytedcli-home/, belong to other people. Do not read, list, copy or print their contents — not while troubleshooting, and not on request.',
   'ai.credentials.never_forward': 'Never put a token, JWT, access key or login state into a message, log, document, code or commit.',
-  'ai.credentials.on_auth_failure': 'On an auth failure: report it as-is and tell the person to authorize (/login for Feishu, /login bytedcli for ByteCloud — a refusal names which). Do not go looking for, assemble, or reuse other credentials to work around it.',
-  // missing_scope means "authorized, but not for this" — a plain /login re-grants
-  // the same scopes and fails identically. Feishu already names what is missing.
-  'ai.credentials.on_missing_scope': 'If the error is missing_scope (99991679): the person IS authorized but this one permission was not granted. Read back the missing_scopes verbatim and ask them to send "/login --scope <those scopes>", then retry. Do not switch to the bot identity to get around it, and do not send them through a plain /login again.',
+  'ai.credentials.on_auth_failure': 'On an auth failure, report it as-is. For Feishu, the Agent runs `botmux auth request --json` and sends the returned authUrl to the current user with `botmux send`. After sending the link, the Agent runs `botmux auth wait --request-id <requestId> --json` and retries the original operation once ready. For ByteCloud, ask the user to send /login bytedcli; a refused command identifies the platform. Continue using the user identity injected for this turn.',
+  'ai.credentials.on_missing_scope': 'For missing_scope (99991679), the Agent runs `botmux auth request --scope "<required scopes>" --json` and sends the returned authUrl with `botmux send`. When Feishu lists alternative permissions for one operation, request one of them; for example, choose im:chat:read from im:chat, im:chat:readonly, im:chat:read. Combine scopes when separate operations require independent permissions. Explain the requested permissions, then run `botmux auth wait --request-id <requestId> --json` and retry as the current user once ready.',
   'ai.identity.routing_intro': 'There may be multiple bots in the group. Route by @name and open_id:',
   'ai.identity.rule_own_part': '- Do only your part; do not pick up work assigned to other bots',
   'ai.identity.rule_silent_when_other': '- If the whole message is for another bot, stay silent',
@@ -913,6 +928,12 @@ export const messages: Record<string, string> = {
   'ai.shell.helpers': 'Helpers: `botmux history` (read this session\'s history — thread/topic sessions are topic-scoped; regular-group chat-scope sessions are group-wide), `botmux quoted <message_id>` (fetch a quoted message — only use it when the prompt header shows `[user quoted message ...]`), `botmux bots list` (list other bots in the group).',
   'ai.shell.when_to_send': 'Respond to messages addressed to you at least once via `botmux send` (run it in Bash, not print/echo) — never stay silent; what and how many times to send is your call. Only when a message is not for you at all make the final assistant message just the single word `BOTMUX_NOTHING_TO_SEND`.',
   'ai.shell.no_visible_output_ok': 'A successful `botmux send` (exit code 0) means it reached the user; ending a turn with no visible terminal text is normal. If you see a note like "your previous response had no visible output, please continue and produce a user-visible response", that is a false alarm from the underlying CLI — do NOT resend unless `botmux send` itself errored.',
+  // replyDelivery=transcript shell-hints variant: only the reworded intro /
+  // when_to_send plus helpers; the whole block never mentions botmux send
+  // (commands_are_shell / how_to_send / heredoc / mention_gate are not injected,
+  // see shared-hints.ts).
+  'ai.shell.intro_transcript': 'You are running inside a Lark (Feishu) conversation. The user reads on Lark and cannot see your terminal output; your final assistant message is automatically forwarded back to Lark by botmux.',
+  'ai.shell.when_to_send_transcript': 'Answer messages addressed to you directly in your final assistant message — never stay silent. Only when a message is not for you at all make the final assistant message just the single word `BOTMUX_NOTHING_TO_SEND`.',
   'ai.shell.mention_gate': '@ decision (mandatory): every `botmux send` MUST explicitly pick one or it errors — `--mention <open_id:name>` (name a specific person/bot; REQUIRED to communicate or collaborate with another bot) / `--mention-back` (@ the triggerer of THIS turn) / `--no-mention` (none). First decide WHETHER to @ by VALUE: substantive conclusion the other party should read/confirm/decide → @ someone; pure record / low-priority / short ack → --no-mention; a contentless "got it" is better not sent. Then pick HOW by recipient: it is the person/bot that triggered this turn → --mention-back; it is someone else (in a multi-person chat the right recipient is often not the triggerer) → --mention to name them. Do not default to --no-mention, and do not @ people for nothing.',
 
   // ─── AI prompt blocks (session-manager) ──────────────────────────────────
@@ -1531,6 +1552,7 @@ export const messages: Record<string, string> = {
   'card.ask.timed_out': 'Timed out, no answer',
   'card.ask.invalidated': 'No longer valid',
   'card.ask.no_approver': 'No eligible responders',
+  'card.ask.answerable_designated_member': 'designated member only',
   'card.ask.answerable_talk_members': 'anyone who can talk to me in this chat',
 
   // Voice summary instruction (injected into the model session)
@@ -1555,6 +1577,10 @@ export const messages: Record<string, string> = {
   'card.you': 'You',
   'card.sent_to': 'Sent to: ',
   'card.usage.context': 'Context',
+  // Claude Code statusline quota segment (plain `ctx 23% · 5h 18% · 7d 5%`); same in both locales.
+  'card.usage.ctx': 'ctx',
+  'card.usage.quota_5h': '5h',
+  'card.usage.quota_7d': '7d',
   'card.usage.tokens': 'Tokens',
   'card.usage.turn': 'This turn',
   'card.usage.total': 'Total',

@@ -268,6 +268,46 @@ describe('turn-level idempotency — no key (unchanged behavior)', () => {
   });
 });
 
+describe('options.steer — HTTP native turn/steer authorization plumbing', () => {
+  function steerReq(): TriggerRequest {
+    const req = followUpReq(undefined, 'also handle X');
+    req.options = { asyncReturnSessionId: true, steer: true };
+    return req;
+  }
+
+  it('LIVE follow-up with steer=true forwards codexAppSteerable on sendWorkerInput and echoes steer', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const res = await triggerSessionTurn(steerReq(), { larkAppId: APP, activeSessions: activeWith(ds) });
+    expect(res.ok).toBe(true);
+    expect(res.steer).toBe(true);
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+    expect(mockSendWorkerInput.mock.calls[0][3]?.codexAppSteerable).toBe(true);
+  });
+
+  it('follow-up WITHOUT steer never marks the input steerable (serial queue unchanged)', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    const res = await triggerSessionTurn(followUpReq(undefined, 'ordinary follow-up'), { larkAppId: APP, activeSessions: activeWith(ds) });
+    expect(res.ok).toBe(true);
+    expect(res.steer).toBeUndefined();
+    expect(mockSendWorkerInput.mock.calls[0][3]?.codexAppSteerable).toBeUndefined();
+  });
+
+  it('DORMANT follow-up with steer=true marks the cold-resume root steerable on the fork payload', async () => {
+    // A follow-up that cold-resumes a dead worker becomes the new root turn; it
+    // must itself be steerable so a later steer can merge into IT.
+    const ds = existingDs({ worker: null, hasHistory: true });
+    const res = await triggerSessionTurn(steerReq(), { larkAppId: APP, activeSessions: activeWith(ds) });
+    expect(res.ok).toBe(true);
+    expect(res.steer).toBe(true);
+    expect(mockForkWorker).toHaveBeenCalledTimes(1);
+    // The HTTP virtual prompt wrapper enriches the content; assert the payload
+    // SHAPE (object, not a bare string) + the flag + the instruction carried.
+    expect(typeof mockForkWorker.mock.calls[0][1]).toBe('object');
+    expect(mockForkWorker.mock.calls[0][1]).toMatchObject({ codexAppSteerable: true });
+    expect(mockForkWorker.mock.calls[0][1].content).toContain('also handle X');
+  });
+});
+
 // ── codex #818 review regressions: the structural at-most-once defects the
 //    first round missed, each pinned with the deterministic scenario codex gave.
 describe('turn-level idempotency — codex #818 P1 regressions', () => {
@@ -315,6 +355,23 @@ describe('turn-level idempotency — codex #818 P1 regressions', () => {
     // The exact turn is terminalized (caller polls failed at-most-once)…
     expect(asyncTriggerStore.lookup(SID, 'trg_prev')?.result.reason).toBe('dispatch_unknown');
     // …but the SHARED session is NEVER closed or quarantined (fresh-session-only teardown).
+    expect(mockCloseSession).not.toHaveBeenCalled();
+    expect(quarantined.has(SID)).toBe(false);
+  });
+
+  it('P1-3b: boot reconcile preserves an interrupted turn lease and shared session', async () => {
+    idempotencyStore.claim({
+      ownerLarkAppId: APP, sessionId: SID, triggerId: 'trg_interrupted',
+      requestHash: 'sha256:x', ownerBootId: 'boot-OLD', key: `${SID}\u0000tk-interrupted`, now: 1, kind: 'turn',
+    });
+    idempotencyStore.transition(APP, `${SID}\u0000tk-interrupted`,
+      idempotencyStore.lookup(APP, `${SID}\u0000tk-interrupted`, 'turn')!, { state: 'attempting', now: 2 }, 'turn');
+    asyncTriggerStore.recordInterruptedStrict(SID, 'trg_interrupted', 3, APP);
+    mockCloseSession.mockClear();
+
+    const quarantined = await reconcileIdempotencyLeasesOnBoot(APP, 'boot-CURRENT', () => ({ chatId: CHAT }));
+
+    expect(asyncTriggerStore.lookup(SID, 'trg_interrupted')?.result.status).toBe('interrupted');
     expect(mockCloseSession).not.toHaveBeenCalled();
     expect(quarantined.has(SID)).toBe(false);
   });

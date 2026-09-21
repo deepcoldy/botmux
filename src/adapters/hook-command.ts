@@ -117,6 +117,17 @@ export function userPromptHookCommand(): string {
 }
 
 /**
+ * 构造 Claude Code `statusLine.command` 的 shell 命令字符串 → `botmux statusline`。
+ * 与 sessionReadyHookCommand 同策略，但写进**进程级** `--settings`（不写全局：全局只能
+ * 有一个 statusLine，写进去会覆盖用户自己的；被 wrapperCli 剥掉时卡片省略即可）。
+ * 子进程靠继承的 BOTMUX_SESSION_ID 定位落盘目录、靠 BOTMUX_STATUSLINE_CHAIN 转发
+ * 用户原有的 statusline 命令；缺 env 时静默 exit 0。
+ */
+export function statuslineHookCommand(): string {
+  return renderShellCommand(undefined, 'statusline');
+}
+
+/**
  * Construct the process-scoped TraeCode `spawn_agent` runtime-policy hook.
  * The stable daemon-written wrapper lets a long-lived pane pick up the current
  * Node or standalone build instead of retaining a checkout-local entrypoint.

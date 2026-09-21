@@ -21,6 +21,7 @@ import {
   brandFooterSegment,
   cardUsageFooterSegment,
   cardUsageRuntimeSegment,
+  contextOverCompactThreshold,
   createReplyCard,
   DEFAULT_BRAND_LABEL,
   extractFirstReplyCardHeading,
@@ -1528,5 +1529,102 @@ describe('buildContextualReplyCard footer brand', () => {
     })).body.elements;
     expect(els.some((e: any) => e.element_id === 'botmux_reply_footer')).toBe(false);
     expect(JSON.stringify(els)).not.toContain('botmux');
+  });
+});
+
+describe('cardUsageFooterSegment — Claude Code statusline quota (ctx / 5h / 7d)', () => {
+  it('footer renders the plain-percentage form `ctx 23% · 5h 18% · 7d 5%` (no bars, no absolutes, no resets_at)', () => {
+    const seg = cardUsageFooterSegment(
+      {
+        context: null,
+        tokens: null,
+        quota: { contextPercent: 23, fiveHourPercent: 18, fiveHourResetsAtMs: 1_788_000_000_000, sevenDayPercent: 5, sevenDayResetsAtMs: 1_788_086_400_000 },
+      },
+      'zh',
+    );
+    expect(seg).toBe('ctx 23% · 5h 18% · 7d 5%');
+    // en 同值（纯文本标签两语言一致）
+    expect(cardUsageFooterSegment(
+      { context: null, tokens: null, quota: { contextPercent: 23, fiveHourPercent: 18, sevenDayPercent: 5 } },
+      'en',
+    )).toBe('ctx 23% · 5h 18% · 7d 5%');
+  });
+
+  it('quota overrides the transcript absolute form even when context tokens are present', () => {
+    // Claude Code 的 transcript 有 usedTokens 但没有窗口；statusline 有百分比 → 只渲染 ctx N%。
+    const seg = cardUsageFooterSegment(
+      { context: { usedTokens: 159_861 }, tokens: { in: 1, out: 2 }, quota: { contextPercent: 23, fiveHourPercent: 18, sevenDayPercent: 5 } },
+      'zh',
+    );
+    expect(seg).toBe('ctx 23% · 5h 18% · 7d 5%');
+    expect(seg).not.toContain('159.9K');
+    expect(seg).not.toContain('上下文');
+  });
+
+  it('omits 7d when only 5h is known; omits ctx when the statusline gave no context percent', () => {
+    expect(cardUsageFooterSegment(
+      { context: null, tokens: null, quota: { contextPercent: 23, fiveHourPercent: 18 } },
+      'zh',
+    )).toBe('ctx 23% · 5h 18%');
+    // 无 contextPercent（例如窗口已滚动只剩重置时间）→ 落回 transcript 绝对值分支
+    expect(cardUsageFooterSegment(
+      { context: { usedTokens: 159_861, windowTokens: 258_400, percentUsed: 62 }, tokens: null, quota: { sevenDayPercent: 5 } },
+      'zh',
+    )).toBe('ctx 62% · 7d 5%');
+    expect(cardUsageFooterSegment(
+      { context: { usedTokens: 159_861 }, tokens: null, quota: { sevenDayPercent: 5 } },
+      'zh',
+    )).toBe('上下文 159.9K · 7d 5%');
+    // quota 里一个可渲染字段都没有 → 与无 quota 相同
+    expect(cardUsageFooterSegment(
+      { context: null, tokens: null, quota: { fiveHourResetsAtMs: 1_788_000_000_000 } },
+      'zh',
+    )).toBeNull();
+  });
+
+  it('quota null / absent renders byte-identically to today', () => {
+    const base = { context: { usedTokens: 80_700, windowTokens: 258_400, percentUsed: 31 }, tokens: { in: 1_400_000, out: 7_800 } };
+    const today = cardUsageFooterSegment(base, 'zh');
+    expect(today).toBe('上下文 80.7K/258.4K (31%)');
+    expect(cardUsageFooterSegment({ ...base, quota: null }, 'zh')).toBe(today);
+    expect(cardUsageFooterSegment({ ...base, quota: undefined }, 'zh')).toBe(today);
+    const todayStreaming = cardUsageFooterSegment(base, 'zh', 'streaming');
+    expect(todayStreaming).toBe('上下文 80.7K/258.4K (31%) · 累计 ↑1.4M ↓7.8K');
+    expect(cardUsageFooterSegment({ ...base, quota: null }, 'zh', 'streaming')).toBe(todayStreaming);
+    // 卡片级：footer 元素逐字节相同
+    const cardWithout = buildMarkdownCard('hello', undefined, '', 'zh', undefined, 'filesystem', base);
+    const cardWithNull = buildMarkdownCard('hello', undefined, '', 'zh', undefined, 'filesystem', { ...base, quota: null });
+    expect(cardWithNull).toBe(cardWithout);
+  });
+
+  it('streaming variant keeps the three quota segments and appends 本轮 / 累计', () => {
+    const seg = cardUsageFooterSegment(
+      {
+        context: { usedTokens: 159_861 },
+        tokens: { in: 1_400_000, out: 7_800 },
+        turnTokens: { in: 5_000, out: 1_200 },
+        quota: { contextPercent: 23, fiveHourPercent: 18, sevenDayPercent: 5 },
+      },
+      'zh',
+      'streaming',
+    );
+    expect(seg).toBe('ctx 23% · 5h 18% · 7d 5% · 本轮 ↑5K ↓1.2K · 累计 ↑1.4M ↓7.8K');
+  });
+
+  it('compact hint fires from quota.contextPercent (transcript has no window)', () => {
+    const usage = { context: { usedTokens: 159_861 }, tokens: null, quota: { contextPercent: 91, fiveHourPercent: 18 } };
+    expect(contextOverCompactThreshold(usage, 90)).toBe(true);
+    expect(contextOverCompactThreshold(usage, 95)).toBe(false);
+    expect(cardUsageFooterSegment(usage, 'zh', 'streaming', { compactHintThreshold: 90 }))
+      .toBe('ctx 91% · 建议压缩 · 5h 18%');
+    expect(cardUsageFooterSegment(usage, 'zh', 'streaming', { compactHintThreshold: 95 }))
+      .toBe('ctx 91% · 5h 18%');
+  });
+
+  it('rounds and clamps quota percentages like the context percentage', () => {
+    expect(cardUsageFooterSegment(
+      { context: null, tokens: null, quota: { contextPercent: 23.6, fiveHourPercent: 140, sevenDayPercent: -1 } },
+      'zh',
+    )).toBe('ctx 24% · 5h 100%');
   });
 });

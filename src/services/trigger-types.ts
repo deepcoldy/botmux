@@ -75,6 +75,31 @@ export interface TriggerRequest {
     /** Per-turn reasoning effort. Same
      *  fresh-spawn-only semantics as `model`. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+    /** Authorize in-flight STEER for this turn (codex-app native `turn/steer`).
+     *
+     * Best-effort by construction — admission is decided inside the live runner
+     * (active turn present, steering window open, CLI supports it), so trigger
+     * ACCEPTANCE never fails for steer alone:
+     *  - On a FRESH turn it marks the opening root steerable; without a steerable
+     *    root a later follow-up can only queue serially (codex canSteer contract
+     *    requires BOTH the root and the follow-up head authorized).
+     *  - On an existing-session follow-up with a live active codex-app turn, the
+     *    runner injects the message INTO the active turn via turn/steer instead of
+     *    queueing it behind the turn.
+     *  - When no steerable turn is active (idle / already closing / dormant
+     *    worker / a non-codex CLI), it degrades to an ordinary queued follow-up.
+     *    Other CLIs keep their usual type-ahead queue behaviour.
+     *
+     * Result attribution for a merged steer group: codex emits ONE merged final
+     * for the group. The LAST accepted steer (the newest triggerId) owns that
+     * real final; every earlier member completes with the SAME content (no
+     * usage) once the group's real final lands, so polling any member's
+     * trigger-result resolves with the merged answer.
+     *
+     * Security posture is unchanged: POST /api/trigger is already the
+     * drive-my-own-turn surface (core-only loopback); steer authorizes mid-turn
+     * injection into the SAME tenant's turn, never a cross-session capability. */
+    steer?: boolean;
   };
 }
 
@@ -100,14 +125,15 @@ export type TriggerErrorCode =
   | 'no_output'
   | 'workflow_trigger_not_implemented';
 
-/** Four-state async lifecycle for `GET /api/sessions/:id/trigger-result`.
+/** Async lifecycle for `GET /api/sessions/:id/trigger-result`.
  *  Programmatic callers (task runners) branch on this instead of ok/action:
  *  - running:   turn still in flight — keep polling
  *  - completed: final output captured (see output.content)
  *  - failed:    session terminated without a captured output (soft terminal —
  *               may be a genuine failure OR a caller-initiated close/cancel)
+ *  - interrupted: caller stopped this exact turn; its session remains usable
  *  - not_found: no session record on disk (never existed / invalid id) */
-export type AsyncTriggerState = 'running' | 'completed' | 'failed' | 'not_found';
+export type AsyncTriggerState = 'running' | 'completed' | 'failed' | 'interrupted' | 'not_found';
 
 export interface TriggerResponse {
   ok: boolean;
@@ -154,6 +180,11 @@ export interface TriggerResponse {
   /** Echo of the caller's `options.turnIdempotencyKey`, when one was supplied
    *  (follow-up async turn on an existing session). */
   turnIdempotencyKey?: string;
+  /** Echo of `options.steer === true` on a request that was accepted for
+   *  dispatch. Actual native admission is best-effort inside the runner (see the
+   *  option's contract); this only confirms the daemon carried the
+   *  authorization, not that a turn/steer RPC has already been accepted. */
+  steer?: true;
   /** Inbound-webhook duplicate-delivery suppression outcome (webhook edge only;
    *  unrelated to the daemon-side `idempotencyKey` lease above).
    *  - `accepted`  — first delivery under this key; it was dispatched.
@@ -204,10 +235,16 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   // different runtime branch — which, for an idempotency turn, could skip the
   // reserved→attempting barrier and break at-most-once. Reject non-booleans so
   // the two layers can never diverge (codex #776 round-4).
-  for (const flag of ['waitForFinalOutput', 'asyncReturnSessionId', 'dryRun'] as const) {
+  for (const flag of ['waitForFinalOutput', 'asyncReturnSessionId', 'dryRun', 'steer'] as const) {
     if (options[flag] !== undefined && typeof options[flag] !== 'boolean') {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: `options.${flag} must be a boolean` } };
     }
+  }
+  // Steer authorizes mid-turn injection into a real dispatch — a dry run never
+  // dispatches, so the combination is meaningless (and would make fixture
+  // responses advertise an authorization the daemon did not act on).
+  if (options.steer === true && options.dryRun === true) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.steer is not supported with options.dryRun' } };
   }
   const waitForFinalOutput = options.waitForFinalOutput === true;
   const asyncReturnSessionId = options.asyncReturnSessionId === true;

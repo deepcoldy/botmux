@@ -194,3 +194,22 @@ describe('ActiveTurnAuthority', () => {
     }
   });
 });
+
+for (const caller of [humanA, { ...humanA, requestUserOpenId: 'ou_b', requestUserUnionId: 'on_b' }]) {
+  it(`serializes collaborative turns from ${caller.requestUserOpenId} without changing the active sender`, () => {
+    const authority = new ActiveTurnAuthority();
+    const first = { turnId: 'a', caller: humanA };
+    const next = { turnId: 'b', caller, queueAfterActiveTurn: true as const };
+    authority.reserve(first);
+    authority.markStarted(first);
+    expect(authority.blocks(next)).toBe(true);
+    expect(authority.reserve(next)).toBe(false);
+    expect(authority.markStarted(next)).toBe(false);
+    expect(authority.identity()).toEqual(first);
+    authority.releaseExact(first);
+    expect(authority.blocks(next)).toBe(false);
+    expect(authority.reserve(next)).toBe(true);
+    expect(authority.markStarted(next)).toBe(true);
+    expect(authority.identity()).toEqual({ turnId: 'b', caller });
+  });
+}
