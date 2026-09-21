@@ -641,7 +641,7 @@ function PluginCapabilitySummary(props: {
       aria-controls={props.detailsId}
       onClick={props.onToggle}
     >
-      <div className="plugin-capability-summary" aria-label="插件能力摘要">
+      <span className="plugin-capability-summary" aria-label="插件能力摘要">
         {capabilities.map(item => (
           <span className="plugin-capability-chip" key={item.label}><strong>{item.count}</strong>{item.label}</span>
         ))}
@@ -651,7 +651,7 @@ function PluginCapabilitySummary(props: {
           </span>
         ) : null}
         {capabilities.length === 0 && !props.plugin.service ? <span className="plugin-muted">未声明扩展能力</span> : null}
-      </div>
+      </span>
       <span className="plugin-scope-summary">
         {props.globalEnabled
           ? `全部 ${props.botCount} 个 Bot`
