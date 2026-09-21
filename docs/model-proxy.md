@@ -11,7 +11,7 @@ Botmux 通过模型透明代理模式，为 Bot 接入更多专业能力提供�
 | OpenAI JavaScript SDK → 公共入口 → Codex | 文本、函数调用、调用 ID 与工具结果回填；真实 CLI + 本机合成 provider，原生工具列表为空 |
 | OpenAI JavaScript SDK → 公共入口 → Claude Code | 同上；原生工具仅保留内部 JSON 序列化用的 StructuredOutput |
 | OCR v1.12.3 → 公共入口 → Claude Code | 未修改发布源码的 macOS 构建版执行合成仓库 review；规划、文件工具往返、1/1 文件覆盖，工具失败为 0 |
-| OCR v1.12.3 → 公共入口 → Codex | 尚未打通：OCR 发送 `max_completion_tokens`，当前 Codex 路径没有已验证的对应生成上限控制，返回 400 |
+| OCR v1.12.3 → 公共入口 → Codex | 原生配置 `extra_body` 将输出上限设为 null 后，真实 CLI + 合成 provider 完成规划、文件工具往返及 1/1 文件覆盖；正整数上限仍返回 400 |
 | 公共入口 → 专用身份 → 真实订阅 | 本次未验收；需要已有授权且符合准入要求的专用原生登录。此前执行层的真实订阅测试不能代替本入口验收 |
 
 合成 provider 返回预设输出，用于验证协议、原生 CLI 约束和客户端行为，不证明真实模型的评审质量。OCR 本次无候选评论，因此没有覆盖候选评论复核阶段；领域集成、完整 MR 对比与生产切换属于后续集成验收。
@@ -73,6 +73,24 @@ console.log(result.choices[0].message.content);
 
 未修改 OCR 的原生 API 模式可配置 `OCR_LLM_URL=http://127.0.0.1:8788/v1`、`OCR_LLM_TOKEN` 和 `OCR_LLM_MODEL=review-model`；协议选择 `OCR_LLM_PROTOCOL=openai`。无需推理 wrapper。当前包含输出预算的 OCR 路径仅在上表列出的 CLI 和测试范围内验证。
 
+OCR v1.12.3 默认发送正整数 `max_completion_tokens`。接入 Codex 时，若调用方接受不显式指定输出上限，可通过 OCR 自身的配置覆盖该字段。以下是独立 OCR 配置目录中 `~/.opencodereview/config.json` 的完整 `llm` 块示例（替换访问凭据和模型别名）：
+
+```json
+{
+  "llm": {
+    "url": "http://127.0.0.1:8788/v1",
+    "auth_token": "<proxy-client-token>",
+    "model": "review-model",
+    "protocol": "openai",
+    "extra_body": { "max_completion_tokens": null }
+  }
+}
+```
+
+也可用 OCR 原生的 `ocr config set llm.<字段> <值>` 写入这些配置，例如 `ocr config set llm.extra_body '{"max_completion_tokens":null}'`。此方式应使用独立 OCR 配置，且不设置会优先选用另一条配置路径的 `OCR_LLM_URL` / `OCR_LLM_TOKEN` / `OCR_LLM_MODEL`；仅在已有环境变量配置旁补 `llm.extra_body` 不会生效。使用命名 provider 的调用方应在实际选中的 provider 条目里设置 `extra_body`。
+
+这里的 null 表示调用方未指定该上限，保留原生 CLI / 模型的默认限制，**不代表无限输出或费用上限**。需要严格输出预算的调用方不能用 null 绕过要求；Codex 正整数上限仍未适配，必须返回 `max_completion_tokens_unsupported`。
+
 ## 协议子集与语义边界
 
 只提供 `GET /v1/models` 和非流式 `POST /v1/chat/completions`，均要求 `Authorization: Bearer <token>`。模型发现仅返回该凭据获准使用的别名，不暴露 Bot 身份和凭据目录。暂不提供 Responses、Embeddings、图像、音频或 CORS 浏览器接口。
@@ -87,12 +105,14 @@ console.log(result.choices[0].message.content);
 | `parallel_tool_calls` | false 时最多返回一个建议；默认允许最多 16 个 |
 | `response_format` | text、json_object，或下述 schema 子集的 json_schema；校验 content 中的 JSON，不改写工具参数 |
 | `stream` / `n` | 仅省略、`stream:false`、`n:1` |
-| `max_completion_tokens` | 仅 Claude 路径：传给原生 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`，已验证 1、4096 与 OCR 的 16384 传入真实原生请求；其他路径明确拒绝 |
+| `max_completion_tokens` | 省略或 null 均不指定上限，不生成 `maxOutputTokens`；1–128000 的整数仅 Claude 路径支持，传给原生 `CLAUDE_CODE_MAX_OUTPUT_TOKENS`，其他路径明确拒绝；非法值返回 400 |
 | 其他参数 | 400 `unsupported_or_invalid_parameter`，包括 temperature、top_p、max_tokens、seed、stop、logprobs 和未知扩展；不会静默忽略 |
 
 **角色和工具通过统一的文本序列化层传给 CLI，再从结构化输出恢复响应。** 角色顺序和工具关联得到保留，但不是原生消息角色与 function calling 的无损透传；CLI 的内部提示、序列化和重试会影响推理行为。这是有明确子集的协议兼容，不承诺与直接模型 API 的推理语义完全等价。
 
 工具参数的 JSON Schema 支持 `type`（含类型数组）、`properties`、`required`、布尔 `additionalProperties`、`items`、标量 `enum`、`description`、`title`、数值上下界、字符串长度和数组长度。可选字段保持可选，省略 `additionalProperties` 保持开放对象含义；不补默认值。`$ref`、组合 schema、正则等未实现关键字直接报错。原生输出 schema 只约束响应信封，参数放在 JSON 字符串中，再用原始 schema 独立校验，避免把原生“全部属性必填”的限制强加给客户端。
+
+[OpenAI Chat Completions 官方协议](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)将 `max_completion_tokens` 定义为可选 number 或 null；[官方 SDK 类型](https://github.com/openai/openai-node/blob/master/src/resources/chat/completions/completions.ts)也允许 null。Botmux 在入口将 null 规范化为省略，因此两者生成相同的执行请求，可复用同一幂等键；正整数不会被转换或忽略。
 
 输出上限作用于 Claude 原生生成请求，**不是整个 CLI 调用的总消耗上限**：序列化信封也占输出，CLI 可能内部重试。不能据此承诺与直接模型 API 相同的可见内容 token 数或费用上限。不会将事后字符串截断伪装成生成预算。不能完整生成有效结果时返回错误，不伪造 `finish_reason:length`。
 
