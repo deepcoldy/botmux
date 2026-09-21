@@ -35,8 +35,7 @@ export interface DispatchLaunchTargetDependencies {
   resolveChatType(chatId: string): Promise<'group' | 'p2p' | undefined>;
   capacityAvailable(): boolean;
   resolveSourceOpenId(chatId: string, sourceLarkAppId: string): Promise<string>;
-  /** Authorize the target-app-scoped source bot identity only. */
-  authorizeTalk(chatId: string, sourceOpenId: string): {
+  authorizeTalk(chatId: string, sourceOpenId: string, callerUnionId?: string): {
     allowed: boolean;
     reason: string;
     quotaKey?: string;

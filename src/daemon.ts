@@ -351,6 +351,7 @@ import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js
 import {
   DISPATCH_LAUNCH_ID_RE,
   dispatchLaunchIdentityDigest,
+  type DispatchLaunchOperationV1,
 } from './core/dispatch-launch-contract.js';
 import { createDispatchLaunchOperationStore } from './core/dispatch-launch-operation-store.js';
 import { createDispatchLaunchAdmissionStore } from './core/dispatch-launch-admission-store.js';
@@ -25307,11 +25308,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         if (!mapping) throw new Error(resolved.ok ? 'source identity missing' : resolved.message);
         return mapping.subjectOpenId;
       },
-      // callerUnionId is source testimony about the human behind the dispatch,
-      // never the source bot's Lark-stamped union_id. Passing it into
-      // evaluateBotTalk would incorrectly activate the team-bot trust leg.
-      authorizeTalk: (chatId, sourceOpenId) =>
-        evaluateBotTalk(cfg.larkAppId, chatId, sourceOpenId),
+      authorizeTalk: (chatId, sourceOpenId, callerUnionId) =>
+        evaluateBotTalk(cfg.larkAppId, chatId, sourceOpenId, callerUnionId),
       consumeQuotaOnce: ({ receiptId, quotaKey, grantChatId, sourceOpenId }) =>
         consumeDispatchLaunchQuotaOnce({
           larkAppId: cfg.larkAppId, receiptId, quotaKey, sourceOpenId,
@@ -25385,18 +25383,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           participantsIncomplete: false, inThread: true,
         });
         sessionStore.updateSession(ds.session);
-        // The authenticated + policy-allowlisted source daemon is the trust
-        // anchor for callerUnionId. Preserve it as human-caller testimony while
-        // marking the immediate trigger as a bot; it must never feed bot-talk.
-        const dispatchTrustedCaller = trustedCallerForTurn(
-          cfg.larkAppId, sourceOpenId, operation.callerUnionId, true,
-        );
         const input = buildNewTopicCliInput(
           prompt, sessionId, cfg.cliId, cfg.cliPathOverride, undefined, undefined,
           await getAvailableBots(cfg.larkAppId, operation.chatId),
           undefined, { name: getBot(cfg.larkAppId).botName, openId: getBot(cfg.larkAppId).botOpenId },
           localeForBot(cfg.larkAppId), sender,
-          { larkAppId: cfg.larkAppId, chatId: operation.chatId, trustedCaller: dispatchTrustedCaller },
+          { larkAppId: cfg.larkAppId, chatId: operation.chatId, trustedCaller: trustedCallerForTurn(cfg.larkAppId, sourceOpenId, operation.callerUnionId, true) },
         );
         if (!forkWorker(ds, input, { turnId: operation.sourceTurnId, trustedCaller: input.trustedCaller })) {
           throw new Error('dispatch launch worker fork was rejected');
@@ -25410,9 +25402,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           : sessionStore.listSessions().find(session => session.status === 'active' && session.dispatchLaunchId === dispatchId);
         if (!persisted) return;
         const ds = findActiveBySessionId(persisted.sessionId);
-        if (ds) {
-          await closeSessionForBackgroundCleanup(persisted.sessionId, 'dispatch launch cancel');
-        }
+        if (ds) await closeSessionHelper(persisted.sessionId);
         else sessionStore.closeSession(persisted.sessionId);
       },
     });

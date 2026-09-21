@@ -167,11 +167,6 @@ const CONSUMERS: Record<string, Rule> = {
     why: 'Document-comment admission rollback has no direct user surface; the '
       + 'background wrapper logs refused cleanup and any remote residual.',
   },
-  'daemon.ts::cancelSession::closeSessionForBackgroundCleanup': {
-    category: 'background',
-    why: 'Authenticated dispatch-launch cancel has no direct UI surface; the '
-      + 'background wrapper logs any refusal or residual remote session.',
-  },
   'daemon.ts::failCloseIdempotentTurnIfConvergenceWriteFailed::runIdempotencyFailClose': {
     category: 'background',
     why: 'Typed consumer: refusal never claims fail-closed, residual uses the '

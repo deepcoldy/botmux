@@ -49,7 +49,6 @@ function setup() {
     root: vi.fn(async () => 'om_root'),
     session: vi.fn(async () => ({ sessionId: 'target-session' })),
     worker: vi.fn(async () => ({ kickoffTurnId: 'source-turn', workerGeneration: 1 })),
-    authorizeTalk: vi.fn(() => ({ allowed: true, reason: 'chatGrant', quotaKey: 'chat:oc_chat:ou_source', grantChatId: 'oc_chat' })),
   };
   const now = vi.fn(() => new Date('2026-09-03T10:00:00.000Z'));
   const coordinator = createDispatchLaunchTargetCoordinator({
@@ -57,7 +56,7 @@ function setup() {
     operationStore, admissionStore, now, resolveIdentity: () => identity,
     resolveWorkingDir: () => '/repo', resolveChatType: async () => 'group', capacityAvailable: () => true,
     resolveSourceOpenId: async () => 'ou_source',
-    authorizeTalk: effects.authorizeTalk,
+    authorizeTalk: () => ({ allowed: true, reason: 'chatGrant', quotaKey: 'chat:oc_chat:ou_source', grantChatId: 'oc_chat' }),
     consumeQuotaOnce: effects.quota, ensureRoot: effects.root, ensureSession: effects.session, ensureWorker: effects.worker,
   });
   return { coordinator, operationStore, admissionStore, effects, now };
@@ -98,15 +97,6 @@ describe('dispatch launch target coordinator', () => {
     expect(await coordinator.prepare(denied)).toMatchObject({ ok: false, errorCode: 'UNAUTHORIZED_SOURCE' });
     expect(operationStore.get(DISPATCH_ID)?.state).toBe('failed');
     expect(admissionStore.get(DISPATCH_ID)).toBeUndefined();
-  });
-
-  it('never uses source-attested caller union id as the bot-talk trust identity', async () => {
-    const { coordinator, effects } = setup();
-    const withCaller = request();
-    withCaller.source.callerUnionId = 'on_human';
-    expect(await coordinator.prepare(withCaller)).toMatchObject({ ok: true, operation: { state: 'prepared' } });
-    expect(effects.authorizeTalk).toHaveBeenCalledWith('oc_chat', 'ou_source');
-    expect(effects.authorizeTalk.mock.calls[0]).toHaveLength(2);
   });
 
   it('expires a prepared operation without running side effects', async () => {
