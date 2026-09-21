@@ -15,7 +15,7 @@
 | --- | --- |
 | `src/services/session-observe.ts` | canonical 类型 + `normalizeSessionRow`（schemaVersion=1）。纯函数，任何 CLI/TS 调用都必须过它。|
 | `src/services/session-observe-fetch.ts` | 薄 façade：`fetchObserveSnapshot` / `fetchObserveSession`。使用 `fetchDaemonIpc`（HMAC loopback）；探针失败不回退缓存。|
-| `src/cli/observe-command.ts` | `botmux observe` 子命令（`--session`/`--lark-app`/`--include-raw`/`--jsonl`/`--timeout-ms`）。|
+| `src/cli/observe-command.ts` | `botmux observe` 子命令（`--session`/`--lark-app`/`--include-raw`/`--json`/`--timeout-ms`）。|
 | `src/cli.ts` | 在 top-level `switch (command)` 中注册 `case 'observe'`。|
 | `test/session-observe.test.ts` | 13 用例：normalizer 覆盖 working/idle/starting/dormant/closed/queued/unknown status/attention/adopt/no-phase/probe not_found/cliId=unknown/includeRaw。|
 | `test/session-observe-fetch.test.ts` | 11 用例：mock discover + fetch，覆盖 pty/tmux + 至少两种 CLI adapter、unauthorized、超时=unreachable、malformed body、多 daemon、not_found、daemon_offline、无 larkAppId 时的 fan-out。|
@@ -82,8 +82,6 @@ botmux observe --lark-app cli_agent
 # 单会话（不带 larkAppId 会 fan-out 到所有 daemon）
 botmux observe --session s_alpha_1 --include-raw
 
-# jsonl 便于流式消费
-botmux observe --jsonl
 ```
 ```ts
 import { fetchObserveSnapshot, fetchObserveSession } from 'botmux/services/session-observe-fetch';
