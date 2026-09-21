@@ -1121,6 +1121,55 @@ describe('executeScheduledTask — chat-scope regular-group mode', () => {
     expect(ds.currentReplyTarget).toMatchObject({ rootMessageId: 'om_banner_123', turnId });
   });
 
+  it('flat mode freezes a plain target for a fresh chat-scope scheduled turn', async () => {
+    (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode = 'chat';
+    const active = new Map<string, DaemonSession>();
+
+    await executeScheduledTask(baseTask({ scope: 'chat', chatType: 'group' }), active, refreshCliVersion);
+
+    const ds = active.get(sessionKey(CHAT, APP))!;
+    const turnId = forkedTurnId();
+    expect(ds.scope).toBe('chat');
+    expect(ds.session.turnReplyContexts?.[turnId]?.target).toEqual({ mode: 'plain', chatId: CHAT });
+    expect(ds.session.replyTargets?.[turnId]).toBeDefined();
+    expect(ds.session.replyTargets?.[turnId]?.rootMessageId).toBeUndefined();
+    expect(ds.currentReplyTarget).toBeUndefined();
+  });
+
+  it('flat mode replaces a stale reply destination when reusing a live chat session', async () => {
+    (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode = 'chat';
+    const session: Session = {
+      sessionId: 'sess-flat-live', chatId: CHAT, rootMessageId: CHAT, title: 'flat live',
+      status: 'active', createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+      scope: 'chat',
+      currentReplyTarget: {
+        rootMessageId: 'om_stale_human_turn',
+        turnId: 'om_stale_human_turn',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      },
+    };
+    store.set(session.sessionId, session);
+    const existing: DaemonSession = {
+      session,
+      worker: { killed: false, send: vi.fn() } as any,
+      workerPort: 1234, workerToken: 'tok',
+      larkAppId: APP, chatId: CHAT, chatType: 'group', scope: 'chat',
+      spawnedAt: 0, cliVersion: 'test-cli-v1', lastMessageAt: 0,
+      hasHistory: true, workingDir: '/tmp', lastScreenStatus: 'idle',
+      currentReplyTarget: session.currentReplyTarget,
+    };
+    const active = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), existing]]);
+
+    await executeScheduledTask(baseTask({ scope: 'chat', chatType: 'group' }), active, refreshCliVersion);
+
+    expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+    const turnId = sendWorkerInputMock.mock.calls[0][2];
+    expect(session.turnReplyContexts?.[turnId]?.target).toEqual({ mode: 'plain', chatId: CHAT });
+    expect(session.replyTargets?.[turnId]?.rootMessageId).toBeUndefined();
+    expect(existing.currentReplyTarget).toBeUndefined();
+    expect(session.currentReplyTarget).toBeUndefined();
+  });
+
   it('a topic group uses the top-level banner as its thread anchor', async () => {
     getChatModeMock.mockResolvedValue('topic');
     const active = new Map<string, DaemonSession>();

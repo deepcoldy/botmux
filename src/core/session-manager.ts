@@ -4290,8 +4290,16 @@ export async function executeScheduledTask(
           existing.session.deferredScheduleRun.turnId = scheduledTurnId;
           sessionStore.updateSession(existing.session);
         }
-        if (sharedTopicRootId) {
-          beginReplyTargetTurn(existing, sharedTopicRootId, scheduledTurnId);
+        if (scope === 'chat' && anchor === task.chatId) {
+          // Every chat-scope schedule fire needs an immutable per-turn target,
+          // including flat/top-level mode where there is deliberately no root
+          // message. Without this rootless record, botmux send falls back to
+          // the session's previous human turn and can bury the scheduled result
+          // under an unrelated old reply. Shared mode supplies the fresh banner
+          // root; flat and silent top-level mode freeze a plain chat target.
+          beginReplyTargetTurn(existing, sharedTopicRootId, scheduledTurnId, undefined, {
+            inThread: false,
+          });
           sessionStore.updateSession(existing.session);
         }
         const input = buildFollowUpCliInput(firePrompt, existing.session.sessionId, {
@@ -4416,8 +4424,13 @@ export async function executeScheduledTask(
       // resume of this session (see resolveSessionLaunchModel).
       ...(modelOverride.model ? { spawnModelOverride: modelOverride.model } : {}),
     };
-    if (sharedTopicRootId) {
-      beginReplyTargetTurn(ds, sharedTopicRootId, scheduledTurnId);
+    if (runtimeScope === 'chat' && anchor === task.chatId) {
+      // Mirror the continuation path above for a newly-created chat session.
+      // Deferred new-topic/task runs use a virtual anchor and must retain their
+      // own materialization flow, so the real-chat anchor check excludes them.
+      beginReplyTargetTurn(ds, sharedTopicRootId, scheduledTurnId, undefined, {
+        inThread: false,
+      });
       sessionStore.updateSession(ds.session);
     }
     ensureSessionWhiteboard(ds);
