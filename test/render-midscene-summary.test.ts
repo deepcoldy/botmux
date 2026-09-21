@@ -44,4 +44,39 @@ describe('Midscene CI summary', () => {
     expect(markdown).toContain('Static Midscene validation passed');
     expect(markdown).not.toContain('#artifacts');
   });
+
+  it('keeps every unavailable Feishu case visible next to real results', () => {
+    const markdown = renderSummary({
+      artifactName: 'botmux-midscene-report',
+      testOutcome: 'success',
+      feishuOutcome: 'skipped',
+      skippedCases: ['Aiden basic bot flow', 'Streaming card lifecycle'],
+      summary: {
+        status: 'success',
+        durationMs: 2500,
+        summary: { total: 1, passed: 1, failed: 0, notRun: 0 },
+        projects: [
+          {
+            name: 'dashboard-smoke',
+            cases: [
+              {
+                name: 'Navigate the core read-only Dashboard pages',
+                status: 'success',
+                attempts: [{}],
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(markdown).toContain('Botmux × Midscene · passed with skips');
+    expect(markdown).toContain('1/3 cases passed · 0 failed · 2 skipped');
+    expect(markdown).toContain(
+      '| ⏭️ Aiden basic bot flow | feishu-browser | skipped | 0 |',
+    );
+    expect(markdown).toContain(
+      '| ⏭️ Streaming card lifecycle | feishu-browser | skipped | 0 |',
+    );
+  });
 });

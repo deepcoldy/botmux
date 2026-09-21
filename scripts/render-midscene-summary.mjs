@@ -4,6 +4,7 @@ import { appendFile, readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
+import { parse as parseYaml } from 'yaml';
 
 function parseArguments(argv) {
   const options = {};
@@ -48,6 +49,24 @@ async function findSummaries(root) {
   return matches.sort();
 }
 
+async function findYamlCases(root) {
+  const cases = [];
+  async function visit(directory) {
+    for (const entry of await readdir(directory, { withFileTypes: true })) {
+      const candidate = path.join(directory, entry.name);
+      if (entry.isDirectory()) await visit(candidate);
+      else if (entry.isFile() && /\.ya?ml$/i.test(entry.name)) {
+        const document = parseYaml(await readFile(candidate, 'utf8'));
+        for (const testCase of document?.cases ?? []) {
+          if (typeof testCase?.name === 'string') cases.push(testCase.name);
+        }
+      }
+    }
+  }
+  await visit(root);
+  return cases;
+}
+
 function cell(value) {
   return String(value ?? '')
     .replaceAll('|', '\\|')
@@ -67,18 +86,29 @@ export function renderSummary({
   runUrl,
   pagesUrl,
   feishuOutcome,
+  skippedCases = [],
 }) {
   const counts = summary?.summary;
-  const cases = (summary?.projects ?? []).flatMap((project) =>
+  const nativeCases = (summary?.projects ?? []).flatMap((project) =>
     (project.cases ?? []).map((testCase) => ({
       ...testCase,
       project: project.name,
     })),
   );
+  const skipped = skippedCases.map((name) => ({
+    name,
+    project: 'feishu-browser',
+    status: 'skipped',
+    attempts: [],
+  }));
+  const cases = [...nativeCases, ...skipped];
   const reportAvailable = Boolean(summary);
+  const total = (counts?.total ?? 0) + skipped.length;
   const status =
     testOutcome === 'success' && summary?.status === 'success'
-      ? 'passed'
+      ? skipped.length > 0
+        ? 'passed with skips'
+        : 'passed'
       : testOutcome === 'skipped'
         ? 'live cases skipped'
         : testOutcome === 'not-run'
@@ -89,7 +119,7 @@ export function renderSummary({
     `## Botmux × Midscene · ${status}`,
     '',
     reportAvailable
-      ? `**${counts.passed}/${counts.total} cases passed · ${counts.failed} failed · ${counts.notRun} not run**`
+      ? `**${counts.passed}/${total} cases passed · ${counts.failed} failed · ${skipped.length} skipped · ${counts.notRun} not run**`
       : testOutcome === 'skipped'
         ? '**Static Midscene validation passed.** Live Feishu browser cases were skipped because their repository secrets are unavailable.'
         : '**No Midscene result was produced.** The job stopped before the test runner started.',
@@ -123,7 +153,12 @@ export function renderSummary({
       '| Case | Project | Status | Attempts |',
       '|:--|:--|:--|--:|',
       ...cases.map((testCase) => {
-        const icon = testCase.status === 'success' ? '✅' : '❌';
+        const icon =
+          testCase.status === 'success'
+            ? '✅'
+            : testCase.status === 'skipped'
+              ? '⏭️'
+              : '❌';
         const attempts = testCase.attempts?.length ?? 0;
         return `| ${icon} ${cell(testCase.name)} | ${cell(testCase.project)} | ${cell(testCase.status)} | ${attempts} |`;
       }),
@@ -150,6 +185,10 @@ async function main() {
     repository && runId
       ? `https://github.com/${repository}/actions/runs/${runId}`
       : null;
+  const skippedCases =
+    options['feishu-outcome'] === 'skipped' && options['skipped-cases-dir']
+      ? await findYamlCases(options['skipped-cases-dir'])
+      : [];
   const markdown = renderSummary({
     summary,
     artifactName: required(options, 'artifact-name'),
@@ -157,6 +196,7 @@ async function main() {
     runUrl,
     pagesUrl: options['pages-url'],
     feishuOutcome: options['feishu-outcome'],
+    skippedCases,
   });
   await appendFile(required(options, 'output'), markdown);
 }
