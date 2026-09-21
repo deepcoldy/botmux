@@ -3,6 +3,7 @@
 import { appendFile, readdir, readFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 
 function parseArguments(argv) {
   const options = {};
@@ -138,7 +139,10 @@ async function main() {
   await appendFile(required(options, 'output'), markdown);
 }
 
-if (import.meta.url === new URL(process.argv[1], 'file:').href) {
+if (
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+) {
   main().catch((error) => {
     process.stderr.write(`${error.stack ?? error.message}\n`);
     process.exitCode = 1;

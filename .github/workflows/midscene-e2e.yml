@@ -109,6 +109,8 @@ jobs:
             --artifact-name midscene-feishu-report \
             --test-outcome "$outcome" \
             --output "$GITHUB_STEP_SUMMARY"
+          test -s "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Midscene report
         if: always() && !cancelled() && steps.live_config.outputs.ready == 'true'
