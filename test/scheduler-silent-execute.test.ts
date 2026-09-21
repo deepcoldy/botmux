@@ -728,6 +728,34 @@ describe('executeScheduledTask — fresh-topic execution', () => {
     expect(new Set([...active.values()].map(ds => ds.session.deferredScheduleRun?.routingAnchor)).size).toBe(2);
   });
 
+  it.each(['new-topic', 'task'] as const)(
+    'keeps a silent %s run deferred instead of freezing a flat chat target',
+    async (executionPosition) => {
+      const active = new Map<string, DaemonSession>();
+
+      await executeScheduledTask(baseTask({ executionPosition, silent: true }), active, refreshCliVersion);
+
+      expect(sendMessageMock).not.toHaveBeenCalled();
+      expect(replyMessageMock).not.toHaveBeenCalled();
+      expect(active.size).toBe(1);
+      const [ds] = [...active.values()];
+      const turnId = forkedTurnId();
+      expect(ds.session.deferredScheduleRun).toMatchObject({
+        taskId: 'task0001',
+        turnId,
+      });
+      expect(ds.session.deferredScheduleRun?.routingAnchor).toMatch(
+        executionPosition === 'task'
+          ? /^schedule-task:task0001$/
+          : /^schedule-run:task0001:[^:]+$/,
+      );
+      expect(ds.session.rootMessageId).toBe(ds.session.deferredScheduleRun?.routingAnchor);
+      expect(ds.session.turnReplyContexts?.[turnId]).toBeUndefined();
+      expect(ds.session.replyTargets?.[turnId]).toBeUndefined();
+      expect(ds.currentReplyTarget).toBeUndefined();
+    },
+  );
+
   it('thread task without a real root safely degrades to silent chat scope', async () => {
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(baseTask({ scope: 'thread', silent: true }), active, refreshCliVersion);
@@ -789,6 +817,10 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
     // during turn 1 must not steal materialization ownership (turn equality).
     expect(ds.session.deferredScheduleRun?.turnId).toBe(secondTurn);
     expect(ds.session.deferredScheduleRun?.routingAnchor).toBe(taskAnchor);
+    expect(ds.session.turnReplyContexts?.[firstTurn]).toBeUndefined();
+    expect(ds.session.turnReplyContexts?.[secondTurn]).toBeUndefined();
+    expect(ds.session.replyTargets?.[firstTurn]).toBeUndefined();
+    expect(ds.session.replyTargets?.[secondTurn]).toBeUndefined();
     expect(ds.silentScheduledTurns?.has(secondTurn)).toBe(true);
   });
 
