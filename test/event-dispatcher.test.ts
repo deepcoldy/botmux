@@ -7440,6 +7440,29 @@ describe('card.action.trigger — ack-safe slow handlers', () => {
     );
   });
 
+  it('keeps a warning toast in the ACK while patching a deferred card', async () => {
+    const toast = { type: 'warning', content: 'feedback changed' };
+    handlers.handleCardAction.mockResolvedValue({
+      toast,
+      deferredCard: { type: 'raw', data: { type: 'latest-feedback-card' } },
+    });
+
+    const result = await capturedHandlers['card.action.trigger']({
+      action: { value: { action: 'feedback_submit', result: 'incomplete' } },
+      operator: { open_id: USER_OPEN_ID },
+      context: { open_message_id: 'om_feedback_stale' },
+    });
+
+    expect(result).toEqual({ toast });
+    expect(mockUpdateMessage).not.toHaveBeenCalled();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(mockUpdateMessage).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'om_feedback_stale',
+      JSON.stringify({ type: 'latest-feedback-card' }),
+    );
+  });
+
   it('runs a fresh publisher after ACK without returning or patching a captured card', async () => {
     const afterAck = vi.fn(async () => {});
     handlers.handleCardAction.mockResolvedValue({ afterAck });

@@ -162,17 +162,29 @@ export async function handleSkillFeedbackCardAction(data: CardActionData, larkAp
   if (expectedFeedbackId !== undefined && (typeof expectedFeedbackId !== 'string' || !expectedFeedbackId)) {
     return { toast: { type: 'error', content: '反馈状态无效，请刷新后重试' } };
   }
-  const recorded = deps.store.recordFeedback({
-    platform: 'lark', platformAppId: larkAppId, platformMessageId, operatorSubjectId, result, semantic: selectedButton?.semantic, reasonKey, comment,
-    expectedFeedbackId: expectedFeedbackId ?? null,
-    callbackKey: callbackKey({
-      platformMessageId, operatorSubjectId, action, result, reasonKey, comment,
-      expectedFeedbackId: expectedFeedbackId ?? null,
-    }),
-  });
-  const renderedCard = renderFeedbackCard(baseCard, delivery.policy, recorded.feedback);
-  if (action === 'feedback_submit' && recorded.feedback.semantic === 'negative') {
-    return { deferredCard: { type: 'raw', data: renderedCard } };
+  let recorded: ReturnType<SkillFeedbackStore['recordFeedback']>;
+  try {
+    recorded = deps.store.recordFeedback({
+      platform: 'lark', platformAppId: larkAppId, platformMessageId, operatorSubjectId, result, semantic: selectedButton?.semantic, reasonKey, comment,
+      expectedFeedbackId,
+      callbackKey: callbackKey({
+        platformMessageId, operatorSubjectId, action, result, reasonKey, comment,
+        expectedFeedbackId,
+      }),
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message === 'feedback_version_mismatch') {
+      return { toast: { type: 'error', content: '反馈状态已失效，请刷新后重试' } };
+    }
+    throw error;
   }
-  return { card: { type: 'raw', data: renderedCard } };
+  const renderedCard = renderFeedbackCard(baseCard, delivery.policy, recorded.feedback);
+  const toast = recorded.status === 'stale'
+    ? { type: 'warning', content: '反馈状态已更新，请基于最新卡片重试' }
+    : undefined;
+  const renderedSemantic = delivery.policy.buttons.find(item => item.key === recorded.feedback.result)?.semantic;
+  if (action === 'feedback_submit' && renderedSemantic === 'negative') {
+    return { ...(toast ? { toast } : {}), deferredCard: { type: 'raw', data: renderedCard } };
+  }
+  return { ...(toast ? { toast } : {}), card: { type: 'raw', data: renderedCard } };
 }
