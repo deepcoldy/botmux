@@ -87,4 +87,74 @@ describe('fork topic presentation', () => {
       const result = await prepareForkTopic('safe task\nnext line', { ...message('{}'), rawPostContent: raw }, deps());
       expect(result.content).toEqual([[{ tag: 'text', text: 'safe task' }], [{ tag: 'text', text: 'next line' }]]);
     });
+
+  it('plain-text fallback strips uploaded image placeholders by ordinal while keeping file text and failed placeholders', async () => {
+    // Inline file node makes taskRows bail out → plain-text fallback path.
+    const post = { content: [
+      [{ tag: 'text', text: '/fork 请分析这份资料' }],
+      [{ tag: 'file', file_key: 'fk1', file_name: 'spec.pdf' }],
+      [{ tag: 'img', image_key: 'ik1' }],
+      [{ tag: 'img', image_key: 'ik2' }],
+    ] };
+    const msg = message(JSON.stringify(post));
+    const taskText = '请分析这份资料\n[文件 1: spec.pdf]\n[图片 1]\n[图片 2]';
+    const io = deps();
+    io.download.mockResolvedValue({ attachments: [
+      { type: 'file' as const, name: 'spec.pdf', path: '/tmp/spec.pdf' },
+      { type: 'image' as const, name: 'ik1.jpg', path: '/tmp/ik1.jpg' },
+    ] });
+    io.upload.mockResolvedValue('up1');
+    const result = await prepareForkTopic(taskText, msg, io);
+    const text = result.content.flatMap(row => row.filter(n => n.tag === 'text').map(n => n.text ?? '')).join('|');
+    expect(text).not.toContain('[图片 1]');       // successful image placeholder removed
+    expect(text).toContain('[图片 2]');           // failed image placeholder kept
+    expect(text).toContain('[文件 1: spec.pdf]'); // file placeholder is never stripped
+    expect(result.content.flat().filter(n => n.tag === 'img')).toEqual([{ tag: 'img', image_key: 'up1' }]);
+    expect(result.attachments.map(a => a.name).sort()).toEqual(['ik1.jpg', 'spec.pdf']);
+    expect(result.title).toBe('请分析这份资料');
+  });
+
+  it('plain-text fallback bounds ordinal matching so image 1 does not consume [图片 12]', async () => {
+    const keys = Array.from({ length: 12 }, (_, i) => `ik${i + 1}`);
+    const post = { content: [
+      [{ tag: 'text', text: '/fork 汇总' }],
+      ...keys.map(k => [{ tag: 'img', image_key: k }]),
+      // Unsupported node forces the plain-text fallback even with all images present.
+      [{ tag: 'code_block', language: 'ts', text: 'x' }],
+    ] };
+    const msg = message(JSON.stringify(post));
+    const taskText = ['汇总', ...keys.map((_, i) => `[图片 ${i + 1}]`)].join('\n');
+    const io = deps();
+    io.download.mockResolvedValue({ attachments: [
+      { type: 'image' as const, name: 'ik1.jpg', path: '/tmp/ik1.jpg' },
+    ] });
+    io.upload.mockResolvedValue('up1');
+    const result = await prepareForkTopic(taskText, msg, io);
+    const text = result.content.flatMap(row => row.filter(n => n.tag === 'text').map(n => n.text ?? '')).join('|');
+    expect(text).not.toContain('[图片 1]');
+    expect(text).toContain('[图片 12]');
+    expect(text).toContain('[图片 2]');
+    expect(result.content.flat().filter(n => n.tag === 'img')).toEqual([{ tag: 'img', image_key: 'up1' }]);
+  });
+
+  it('plain-text fallback strips every occurrence of a duplicated in-body image but appends one node', async () => {
+    const post = { content: [
+      [{ tag: 'text', text: '/fork 看图' }],
+      // Same image_key twice collapses to one resource/ordinal, rendered as [图片 1] twice.
+      [{ tag: 'img', image_key: 'ikdup' }],
+      [{ tag: 'img', image_key: 'ikdup' }],
+      [{ tag: 'code_block', language: 'ts', text: 'x' }],
+    ] };
+    const msg = message(JSON.stringify(post));
+    const io = deps();
+    io.download.mockResolvedValue({ attachments: [
+      { type: 'image' as const, name: 'ikdup.jpg', path: '/tmp/ikdup.jpg' },
+    ] });
+    const result = await prepareForkTopic('看图\n[图片 1]\n[图片 1]', msg, io);
+    const text = result.content.flatMap(row => row.filter(n => n.tag === 'text').map(n => n.text ?? '')).join('|');
+    expect(text).not.toContain('[图片 1]');
+    expect(result.content.flat().filter(n => n.tag === 'img'))
+      .toEqual([{ tag: 'img', image_key: 'img_owned_by_bot' }]);
+    expect(result.title).toBe('看图');
+  });
 });

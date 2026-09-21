@@ -72,12 +72,32 @@ export async function prepareForkTopic(
   } else {
     // Preserve the complete task, including newlines, when rich input is absent
     // or unrecognised. Never truncate instructions to fit a topic title.
-    content = taskText.split(/\r?\n/).map(text => [{ tag: 'text', text: text || ' ' }]);
-    for (const imageKey of images.values()) content.push([{ tag: 'img', image_key: imageKey }]);
+    // Re-uploaded images are appended as real img nodes below, so drop their
+    // `[图片 N]` text placeholders (matched by the image ordinal, independent of
+    // the file counter) or the same picture is shown twice. Failed
+    // downloads/uploads keep the placeholder and get no node; file placeholders
+    // stay as text because only images are rendered as nodes.
+    let fallbackText = taskText;
+    const uploadedImageKeys: string[] = [];
+    let imageOrdinal = 0;
+    for (const resource of resources.filter(r => r.type === 'image')) {
+      imageOrdinal += 1;
+      const uploadedKey = images.get(resource.key);
+      if (!uploadedKey) continue;
+      uploadedImageKeys.push(uploadedKey);
+      // Global replacement: a duplicated in-body image shares one key and one
+      // ordinal, so every occurrence of its placeholder goes with that node.
+      // The trailing boundary keeps ordinal 1 from matching `[图片 12]`;
+      // an optional `: alt` suffix is tolerated.
+      const placeholder = new RegExp(`\\[图片\\s*${imageOrdinal}\\s*(?::[^\\]]*)?\\]`, 'g');
+      fallbackText = fallbackText.replace(placeholder, '');
+    }
+    content = fallbackText.split(/\r?\n/).map(text => [{ tag: 'text', text: text || ' ' }]);
+    for (const imageKey of uploadedImageKeys) content.push([{ tag: 'img', image_key: imageKey }]);
   }
   const summary = (richRows ?? content).map(row => row.filter(n => n.tag === 'text' || n.tag === 'a')
     .map(n => n.text ?? '').join(' ').replace(/https?:\/\/\S+/gi, '')
-    .replace(/\[(?:图片|文件)\s*\d+\]/g, '').replace(/\s+/g, ' ').trim()).find(Boolean);
+    .replace(/\[(?:图片|文件)\s*\d+[^\]]*\]/g, '').replace(/\s+/g, ' ').trim()).find(Boolean);
   const chars = Array.from(summary || deps.fallbackTitle);
   const title = chars.length > 60 ? `${chars.slice(0, 59).join('')}…` : chars.join('');
   return { title, content, attachments };
