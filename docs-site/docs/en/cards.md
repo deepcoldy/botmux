@@ -17,7 +17,7 @@ botmux's "presence" in Lark has four independently switched layers:
 | Layer | What it is | How to turn it off |
 |-------|------------|--------------------|
 | **Streaming status card** | The per-turn live-screenshot card (the main subject of this page) | Bot-level `disableStreamingCard`, or `/card off` for this chat |
-| **Thinking bubble (CoT)** | Intermediate narration / thinking messages while the CLI works | Bot-level `thinkingCard: false`, or `/cot off` for this chat; `/cot show` reveals one round on demand |
+| **Thinking bubble (CoT)** | Intermediate narration / thinking messages while the CLI works | Bot-level `cotEnabled: false`, or `/cot off` for this chat; `/cot show` reveals one round on demand |
 | **✋ → ✅ reactions** | Progress reactions on **your triggering message**: ✋ when accepted, flipped to ✅ when the worker goes idle | Bot-level `silentTurnReactions: true` |
 | **Proactive CLI messages** | Rich-text / image messages the agent sends via `botmux send` | No switch — sent on demand (see below) |
 
@@ -28,7 +28,7 @@ Reactions and streaming cards are **mutually exclusive per turn**: the ✋→✅
 | Display layer | Bot-level default (Bot config / Dashboard **Bot Defaults**) | Per-chat override (in-group slash command) | Default |
 |---------------|-------------------------------------------------------------|--------------------------------------------|---------|
 | Streaming status card | `disableStreamingCard` | `/card off` / `/card on` (writes `noCardChats`); bare `/card` summons one immediately; `/card pin …` controls pinning | On |
-| Thinking bubble | `thinkingCard` | `/cot off` / `/cot on` (writes `noCotChats`); `/cot show` reveals one round; bare `/cot` shows status | On |
+| Thinking bubble | `cotEnabled` | `/cot off` / `/cot on` (writes `noCotChats`); `/cot show` reveals one round; bare `/cot` shows status | On |
 | ✋ → ✅ reactions | `silentTurnReactions` | No per-chat command | Card-off chats get reactions automatically; `silentTurnReactions: true` silences even those |
 | Card controls | `hiddenStreamingCardButtons` (choose which buttons to hide) | — | All shown |
 | Card pinning | `pinStreamingCard` (default off) | `/card pin off｜on｜status` | Off |
@@ -37,7 +37,7 @@ A per-chat override wins over the bot-level default and affects only that chat.
 
 **`/card` and `/cot` are admin-only (`allowedUsers`, canOperate)**, status subcommands included. The reason: Lark cards have no "show different views per person" capability — these switches are bot-level / chat-wide, so one change alters what **everyone in the group** sees; guests (talk access, no operate rights) get an "authorized users only" notice.
 
-**Quiet preset** (Dashboard **Bot Defaults** page, new in this batch): one click performs a **one-time linked write** — `thinkingCard:false` + `silentTurnReactions:true` + `disableStreamingCard:true` — for groups that only want the conclusion, quietly. It is **not a persistent binding**: it simply writes those three existing switches to the values above once and shows a toast; turning the preset off later does **not** revert the three values, so re-enable each switch manually if you want it back.
+**Quiet preset** (Dashboard **Bot Defaults** page, new in this batch): one click performs a **one-time linked write** — `cotEnabled:false` + `silentTurnReactions:true` + `disableStreamingCard:true` — for groups that only want the conclusion, quietly. It is **not a persistent binding**: it simply writes those three existing switches to the values above once and shows a toast; turning the preset off later does **not** revert the three values, so re-enable each switch manually if you want it back.
 
 ## Pinning The Current Live Card
 

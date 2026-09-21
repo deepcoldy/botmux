@@ -28,14 +28,24 @@ it('public HTTP routes to the configured dedicated Bot through real authenticate
   const token = 'synthetic-token-for-model-proxy-ipc-test';
   proxy = await startModelProxy({ config, clients: proxyClients(config, { SYNTHETIC_TOKEN: token }), backend: bot => ipcInvocationBackend(bot, '/synthetic-data-dir') });
   const call = (extra = {}) => fetch(`http://127.0.0.1:${proxy!.port}/v1/chat/completions`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', 'idempotency-key': 'ipc-round' }, body: JSON.stringify({ model: 'review', messages: [{ role: 'user', content: 'hello' }], ...extra }) });
-  const first = await call(); expect(first.status).toBe(200);
+  const first = await call({ max_completion_tokens: null }); expect(first.status).toBe(200);
   const response = await first.json() as any;
   expect(response.choices[0].message.content).toBe('hello'); expect(response.model).toBe('review');
   expect(response.botmux.configured_model).toBe('native-model');
   expect(await (await call()).json()).toEqual(response);
   expect((await call({ messages: [{ role: 'user', content: 'changed' }] })).status).toBe(409);
-  expect((await call({ max_completion_tokens: 4096 })).status).toBe(400);
+  for (const limit of [1, 4096, 128_000]) {
+    const rejected = await call({ max_completion_tokens: limit });
+    expect(rejected.status).toBe(400);
+    expect(await rejected.json()).toMatchObject({ error: { code: 'max_completion_tokens_unsupported' } });
+  }
+  for (const limit of [0, -1, 1.5, 128_001, '4096', false, {}, []]) {
+    const rejected = await call({ max_completion_tokens: limit });
+    expect(rejected.status).toBe(400);
+    expect(await rejected.json()).toMatchObject({ error: { code: 'unsupported_or_invalid_parameter' } });
+  }
   expect(runCodexInvocation).toHaveBeenCalledTimes(1);
+  expect(vi.mocked(runCodexInvocation).mock.calls[0][0]).not.toHaveProperty('maxOutputTokens');
   expect(vi.mocked(runCodexInvocation).mock.calls[0][1].ownerOpenId).toBeUndefined();
   expect(vi.mocked(runCodexInvocation).mock.calls[0][1].authHome).toContain('proxy_fixture');
 });

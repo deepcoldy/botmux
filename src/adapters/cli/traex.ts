@@ -264,6 +264,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       // Keep trigger-user identity wrappers available in tool shells. Set only
       // the requested keys, without inheriting the entire worker environment.
       for (const [key, value] of Object.entries(shellSubprocessEnv ?? {})) {
+        if (value === undefined) continue;
         baseArgs.push('-c', `shell_environment_policy.set.${key}=${JSON.stringify(value)}`);
       }
       if (model && model.trim()) baseArgs.push('--model', model.trim());

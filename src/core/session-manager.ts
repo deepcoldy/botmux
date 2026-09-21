@@ -803,7 +803,7 @@ function renderChatContextBlock(chatContext?: ChatContext): string {
 /**
  * Whether this bot injects the `<sender>` tag. Default ON: an unreadable bot
  * (getBot throws for an unknown appId) or an absent key both mean "inject",
- * matching `thinkingCard`'s convention — only an explicit `false` disables, so
+ * matching `cotEnabled`'s convention — only an explicit `false` disables, so
  * a config-read failure can never silently strip per-turn attribution.
  */
 function senderTagEnabled(larkAppId: string): boolean {

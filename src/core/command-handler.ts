@@ -22,6 +22,7 @@ import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { isRemoteBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { isRemoteCliId } from './remote-cli-ids.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
+import { TABLE_AUTO_ROW_STYLE } from '../im/lark/table-style.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { handleProjectGroupRoles } from './dashboard-command/groups.js';
 import { handleGroupSessionsCommand } from './group-sessions-command.js';
@@ -429,11 +430,7 @@ function buildCloseWorktreeConfirmCard(args: {
     {
       tag: 'table',
       page_size: 10,
-      row_height: 'low',
-      header_style: {
-        text_align: 'left', text_size: 'normal', background_style: 'grey',
-        text_color: 'default', bold: true, lines: 1,
-      },
+      ...TABLE_AUTO_ROW_STYLE,
       columns: [
         { name: 'bot', display_name: t('cmd.close.worktree_col_bot', undefined, loc), data_type: 'text', width: '140px' },
         { name: 'task', display_name: t('cmd.close.worktree_col_task', undefined, loc), data_type: 'text', width: 'auto' },
@@ -1586,7 +1583,7 @@ export async function handleCardCommand(
  *
  * off    -> suppress the thinking bubble for this chat (add to noCotChats).
  * on     -> restore it for this chat (remove from noCotChats); hints when the
- *           bot-level master switch (`thinkingCard`) is off, since the bubble
+ *           bot-level master switch (`cotEnabled`) is off, since the bubble
  *           won't appear until that is enabled too.
  * show   -> one-shot peek while the switches are off: force the bubble for the
  *           current turn (rendered immediately with everything accumulated so
@@ -1615,7 +1612,7 @@ export async function handleCotCommand(
   const sub = content.replace(/^\/cot\s*/i, '').trim().toLowerCase();
   // Master switch defaults ON — only an explicit false means disabled.
   const masterOn = (() => {
-    try { return getBot(larkAppId).config.thinkingCard !== false; } catch { return false; }
+    try { return getBot(larkAppId).config.cotEnabled !== false; } catch { return false; }
   })();
 
   if (sub === 'off') {
@@ -1643,7 +1640,7 @@ export async function handleCotCommand(
       if (replyCardModeFor(ds, ds.lastThinkingUpdate.turnId) !== 'legacy') {
         const update = ds.lastThinkingUpdate;
         await updateTurnReplyCard(ds, update.turnId, {
-          kind: 'tools', tools: publicReplyCardTools(update.entries, getBot(larkAppId).config.thinkingCardToolResult !== false),
+          kind: 'tools', tools: publicReplyCardTools(update.entries, true),
           activity: publicReplyCardActivity(update.entries),
         }, (body, type, uuid) => deps.sessionReply(rootId, body, type, larkAppId, update.turnId, { uuid }),
         { dispatchAttempt: update.dispatchAttempt, forceVisible: true });
@@ -1663,17 +1660,12 @@ export async function handleCotCommand(
     const chatOff = (() => {
       try { return !!getBot(larkAppId).config.noCotChats?.includes(chatId); } catch { return false; }
     })();
-    // 工具输出子开关是 bot 级（/botconfig set thinkingCardToolResult），这里只读
-    // 展示、不提供 /cot 子命令——避免和群级 on/off 混淆。默认开时不加行。
-    const toolResultOff = (() => {
-      try { return getBot(larkAppId).config.thinkingCardToolResult === false; } catch { return false; }
-    })();
     const status = !masterOn
       ? t('cmd.cot.status_master_off', undefined, loc)
       : chatOff
         ? t('cmd.cot.status_chat_off', undefined, loc)
         : t('cmd.cot.status_on', undefined, loc);
-    await reply(toolResultOff ? `${status}\n${t('cmd.cot.status_result_off', undefined, loc)}` : status);
+    await reply(status);
     return;
   }
 

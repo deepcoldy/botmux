@@ -122,6 +122,7 @@ function makeDs(over?: Partial<DaemonSession>): DaemonSession {
     scope: 'chat',
     workerPort: 8080,
     workerToken: 'tok_secret',
+    streamCardId: 'om_stream_card',
     pendingSubstituteControlCard: true,
     ...over,
   } as DaemonSession;

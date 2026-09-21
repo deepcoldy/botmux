@@ -263,6 +263,7 @@ import type {
   TrustedCaller,
   VcMeetingImTurnOrigin,
 } from './types.js';
+import { normalizeCodexAppCotMarker } from './services/codex-app-cot.js';
 import { t, setDefaultLocale } from './i18n/index.js';
 import { registerPromptOverrideResolver } from './skills/effective-builtins.js';
 import { TerminalRenderer } from './utils/terminal-renderer.js';
@@ -10051,6 +10052,21 @@ async function handleTrustedCodexAppMarker(
     return true;
   }
 
+  if (kind === 'thinking' && lastInitConfig?.cliId === 'codex-app') {
+    const marker = normalizeCodexAppCotMarker(payload);
+    if (!marker) {
+      rejectCodexAppControlMarker('invalid signed thinking marker');
+      return false;
+    }
+    const turn = codexAppTurnDispatchQueue.findByTurnId(marker.turnId);
+    if (!turn) {
+      log(`${cliName()} dropped thinking marker for unknown turn ${marker.turnId.substring(0, 12)}`);
+      return true;
+    }
+    observeCotEntries(marker.entries, turn);
+    return true;
+  }
+
   // master added lifecycle/steer markers. In the merged world codex-app reaches
   // this handler over the signed socket (PR #597 moved it off terminal OSC), so
   // the branch lives here rather than in handleAppRunnerOscMarker. These events
@@ -15130,10 +15146,16 @@ async function spawnCli(
   // Shim paths and the identity-file locator must reach the tool shell together.
   // Use cfg.sessionId, not the native CLI resume id: the daemon publishes the
   // identity under the Botmux session id. No credential is passed here.
-  const identityShellEnv: Record<string, string> = {};
+  const identityShellEnv: Record<string, string> = {
+    BOTMUX_SESSION_ID: cfg.sessionId,
+    BOTMUX_CHAT_ID: cfg.chatId,
+    BOTMUX_LARK_APP_ID: cfg.larkAppId,
+    BOTMUX_SESSION_SCOPE: cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat',
+  };
+  if (cfg.chatType) identityShellEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
+  if (cfg.rootMessageId?.startsWith('om_')) identityShellEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
   if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {
     const dir = sessionIdentityBinDir(process.env.SESSION_DATA_DIR, cfg.sessionId);
-    identityShellEnv.BOTMUX_SESSION_ID = cfg.sessionId;
     identityShellEnv.SESSION_DATA_DIR = process.env.SESSION_DATA_DIR;
     identityShellEnv.BOTMUX_IDENTITY_BIN = dir;
     identityShellEnv.ZDOTDIR = join(dir, 'shell');

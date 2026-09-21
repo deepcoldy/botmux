@@ -82,3 +82,11 @@ Still stuck? Check manually (usually local-side):
 - **Network**: the long-lived WebSocket can't get out (corporate network / proxy / firewall) → the agent will see the connection errors in the logs.
 
 After confirming, run `botmux restart`. See [FAQ / Troubleshooting](/en/faq) for more.
+
+### Adding an @ mention by editing does not trigger the bot?
+
+Editing a message that has not yet triggered the bot to add an @ mention requires the optional `im.message.updated_v1` subscription with long-connection delivery. Missing this event does not affect ordinary new messages.
+
+At startup, botmux uses an existing Feishu Open Platform login session to add this event to an existing long-connection configuration. It does not switch delivery modes, change permissions, or publish an app version. Logs reporting a successful update request or a configuration readback do not verify the published version or actual event delivery. After adding the subscription to a production app, inspect the pending changes in the Open Platform and publish a version, then test by adding an @ mention to a message that has not previously triggered the bot.
+
+If the sender relies on team membership for chat access, edited messages also require a contact lookup to recover the sender's `union_id`. The app needs contact read permissions (the default permission manifest includes `contact:user.id:readonly`), and the sender must be within its visibility scope. If permission is missing or the lookup fails, botmux uses only the original message author's `open_id` under the existing access rules; team membership alone cannot grant access. It never borrows the editor's identity.

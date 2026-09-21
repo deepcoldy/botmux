@@ -105,13 +105,13 @@ describe('card-prefs store — 主动开工 fields', () => {
   });
 
   it('persists reply mode through registry reload without changing other card preferences', async () => {
-    writeConfig({ thinkingCard: false, pinStreamingCard: true, noCardChats: ['oc_quiet'] });
+    writeConfig({ cotEnabled: false, pinStreamingCard: true, noCardChats: ['oc_quiet'] });
     const { registry, store } = await freshModules();
     registry.loadBotConfigs().forEach(c => registry.registerBot(c));
     expect((await store.updateBotCardPrefs('app_default', { replyCardMode: 'unified' })).ok).toBe(true);
     expect(store.getBotCardPrefs('app_default').replyCardMode).toBe('unified');
     expect(registry.loadBotConfigs()[0].replyCardMode).toBe('unified');
-    expect(readConfig()).toMatchObject({ thinkingCard: false, pinStreamingCard: true, noCardChats: ['oc_quiet'] });
+    expect(readConfig()).toMatchObject({ cotEnabled: false, pinStreamingCard: true, noCardChats: ['oc_quiet'] });
     await store.updateBotCardPrefs('app_default', { replyCardMode: 'legacy' });
     expect(readConfig().replyCardMode).toBeUndefined();
   });
@@ -121,7 +121,7 @@ describe('card-prefs store — 主动开工 fields', () => {
     const { registry, store } = await freshModules();
     registry.loadBotConfigs().forEach(c => registry.registerBot(c));
     expect(store.getBotCardPrefs('app_default')).toMatchObject({ replyCardMode: 'unified', disableStreamingCard: true });
-    await store.updateBotCardPrefs('app_default', { thinkingCard: false });
+    await store.updateBotCardPrefs('app_default', { cotEnabled: false });
     expect(readConfig()).toMatchObject({ replyCardMode: 'unified', disableStreamingCard: true });
     await store.updateBotCardPrefs('app_default', { replyCardMode: 'unified' });
     expect(store.getBotCardPrefs('app_default').disableStreamingCard).toBe(true);

@@ -313,7 +313,7 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
   });
 
   it('scheduleCardPatch is a defense-in-depth no-op for no-transport sessions', () => {
-    const block = region(workerPoolSource, 'export function scheduleCardPatch(', 'if (streamingCardDisabled(ds, turnId)) return;');
+    const block = region(workerPoolSource, 'export function scheduleCardPatch(', 'if (streamingCardDisabled(ds, turnId)) return false;');
     expect(block).toContain('larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })');
   });
 

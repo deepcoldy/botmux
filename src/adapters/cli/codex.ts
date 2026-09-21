@@ -259,7 +259,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         ...(!disableCliBypass && bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : []),
         '--no-alt-screen',
         '-c',
-        `shell_environment_policy.set.BOTMUX_SESSION_ID=${JSON.stringify(sessionId)}`,
+        `shell_environment_policy.set.BOTMUX_SESSION_ID=${JSON.stringify(shellSubprocessEnv?.BOTMUX_SESSION_ID ?? sessionId)}`,
         // A botmux session cannot safely interact with Codex's startup update
         // picker: the first queued Lark message can be consumed by the menu.
         // Treat botmux as the runtime manager for every launch (sandboxed or
@@ -303,6 +303,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       // these keys, while inherit would hand every shell command the whole
       // worker environment, which is a much wider surface for a narrower need.
       for (const [key, value] of Object.entries(shellSubprocessEnv ?? {})) {
+        if (key === 'BOTMUX_SESSION_ID' || value === undefined) continue;
         baseArgs.push('-c', `shell_environment_policy.set.${key}=${JSON.stringify(value)}`);
       }
       if (model && model.trim()) {

@@ -1,4 +1,5 @@
 import { threadAppLink, type Brand } from './lark-hosts.js';
+import { TABLE_AUTO_ROW_HEIGHT } from './table-style.js';
 import {
   projectRemainingSummary,
   type ProjectGroupState,
@@ -330,7 +331,7 @@ function statusDashboardBody(context: TemplateBodyContext): Array<Record<string,
         { data_type: 'markdown', name: 'wf', display_name: '子任务', horizontal_align: 'left', width: 'auto' },
         { data_type: 'markdown', name: 'status', display_name: '状态 / 话题', horizontal_align: 'left', width: 'auto' },
       ],
-      rows: workstreamRows(project, brand), row_height: 'auto',
+      rows: workstreamRows(project, brand), ...TABLE_AUTO_ROW_HEIGHT,
       header_style: { text_align: 'left', background_style: 'blue-50', text_color: 'blue', bold: true },
       page_size: Math.min(10, project.workstreams.length), margin: '8px 0px 0px 0px',
     });

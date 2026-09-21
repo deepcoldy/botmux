@@ -3493,6 +3493,45 @@ ipcRoute('GET', '/api/sessions/:sessionId/trigger-result', (req, res, params) =>
   jsonRes(res, result.ok ? 200 : 400, result);
 });
 
+ipcRoute('POST', '/api/sessions/:sessionId/trigger-result/supersede', async (req, res, params) => {
+  const session = findOwnedSessionRecord(params.sessionId);
+  if (!session || !cachedLarkAppId || session.larkAppId !== cachedLarkAppId) {
+    return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  }
+  let body: Record<string, unknown>;
+  try { body = await readJsonBody<Record<string, unknown>>(req, 4_096); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const predecessorTriggerId = typeof body.predecessorTriggerId === 'string' ? body.predecessorTriggerId.trim() : '';
+  const successorTriggerId = typeof body.successorTriggerId === 'string' ? body.successorTriggerId.trim() : '';
+  if (!predecessorTriggerId || !successorTriggerId || predecessorTriggerId === successorTriggerId) {
+    return jsonRes(res, 400, { ok: false, error: 'distinct_trigger_ids_required' });
+  }
+  try {
+    const outcome = asyncTriggerStore.supersedePendingTriggerByCompletedSuccessorStrict(
+      params.sessionId,
+      predecessorTriggerId,
+      successorTriggerId,
+      Date.now(),
+      cachedLarkAppId,
+    );
+    if (outcome === 'superseded' || outcome === 'already_superseded') {
+      const results = findActiveBySessionId(params.sessionId)?.asyncTriggerResults;
+      if (results?.get(predecessorTriggerId)?.status === 'pending') results.delete(predecessorTriggerId);
+      return jsonRes(res, 200, {
+        ok: true,
+        state: 'superseded',
+        alreadyTerminal: outcome === 'already_superseded',
+        predecessorTriggerId,
+        successorTriggerId,
+      });
+    }
+    return jsonRes(res, 409, { ok: false, error: outcome, predecessorTriggerId, successorTriggerId });
+  } catch (error) {
+    logger.warn(`[async-trigger] exact supersession failed session=${params.sessionId.slice(0, 8)}: ${error}`);
+    return jsonRes(res, 409, { ok: false, error: 'trigger_supersession_rejected' });
+  }
+});
+
 // 会话 insight：只读解析本会话的 transcript，产出动作 span / 失败聚合 / 规则建议
 // （SafeInsightReport）。底层 services/insight 已做 fail-closed 脱敏投影——raw 命令
 // 与输出永不进结构。detail=summary 只返聚合+建议（/insight 卡片、抽屉概览用）；
@@ -6150,8 +6189,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     codexAppCleanInput: cardPrefs.codexAppCleanInput,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     privateCard: cardPrefs.privateCard,
-    thinkingCard: cardPrefs.thinkingCard,
-    thinkingCardToolResult: cardPrefs.thinkingCardToolResult,
+    cotEnabled: cardPrefs.cotEnabled,
     senderTag: cardPrefs.senderTag,
     overloadAlert: cardPrefs.overloadAlert,
     botToBotSameDir: cardPrefs.botToBotSameDir,
@@ -6282,8 +6320,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   let body: {
     usageDisplay?: unknown;
     replyCardMode?: unknown;
-    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; thinkingCard?: unknown;
-    thinkingCardToolResult?: unknown;
+    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; cotEnabled?: unknown;
     botToBotSameDir?: unknown;
     autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown;
     groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
@@ -6297,8 +6334,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   const patch: {
     usageDisplay?: UsageDisplayMode;
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
-    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; thinkingCard?: boolean;
-    thinkingCardToolResult?: boolean;
+    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; cotEnabled?: boolean;
     botToBotSameDir?: boolean;
     autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean;
     groupJoinCommandEnabled?: boolean; groupJoinCommand?: string;
@@ -6325,8 +6361,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (typeof body.codexAppCleanInput === 'boolean') patch.codexAppCleanInput = body.codexAppCleanInput;
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
-  if (typeof body.thinkingCard === 'boolean') patch.thinkingCard = body.thinkingCard;
-  if (typeof body.thinkingCardToolResult === 'boolean') patch.thinkingCardToolResult = body.thinkingCardToolResult;
+  if (typeof body.cotEnabled === 'boolean') patch.cotEnabled = body.cotEnabled;
   if (typeof body.senderTag === 'boolean') patch.senderTag = body.senderTag;
   if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
   if (typeof body.summaryMemory === 'boolean') patch.summaryMemory = body.summaryMemory;

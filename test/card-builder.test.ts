@@ -386,6 +386,25 @@ describe('buildSlashListCard', () => {
     expect(markdown).toContain('Forge \\*Codex\\* \\<at id=all\\>\\</at\\>');
     expect(markdown).not.toContain('<at id=all></at>');
   });
+
+  it('renders discovered commands in an auto-height table', () => {
+    const card = parse(buildSlashListCard({
+      cliName: 'codex',
+      builtin: [],
+      custom: [],
+      discovered: [{ name: 'review', description: 'review the current diff' }],
+      workingDir: '/workspace',
+      mcpServers: [],
+      discoverySupported: true,
+    }, 'en'));
+
+    const table = card.body.elements.find((element: any) => element.tag === 'table');
+    expect(table).toBeTruthy();
+    expect(table.row_height).toBe('auto');
+    expect(table.row_max_height).toBe('300px');
+    expect(table.header_style.lines).toBeGreaterThanOrEqual(2);
+    expect(table.rows).toEqual([{ cmd: '`review`', desc: 'review the current diff' }]);
+  });
 });
 
 describe('buildConfigCard', () => {
@@ -533,6 +552,8 @@ describe('buildForkPanelCard', () => {
     ], 'en'));
     const table = card.body.elements.find((element: any) => element.tag === 'table');
 
+    expect(table.row_height).toBe('auto');
+    expect(table.row_max_height).toBe('300px');
     expect(table.rows).toEqual([
       {
         instruction: 'investigate cleanup',

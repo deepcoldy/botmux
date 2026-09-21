@@ -3839,15 +3839,28 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
         );
+        logger.info(`[${tag(ds)}] Display mode → ${next}`);
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
             logger.debug(`[${tag(ds)}] Failed to migrate clicked legacy card: ${err}`),
           );
-        } else {
-          scheduleCardPatch(ds, cardJson);
+          try { return JSON.parse(cardJson); } catch { /* fall through */ }
+        } else if (!scheduleCardPatch(ds, cardJson)) {
+          // The queue can decline when live cards are disabled for this turn or
+          // transport/card identity is unavailable. In that case the callback
+          // must carry the rebuilt card so the clicked card still updates.
+          try { return JSON.parse(cardJson); } catch { /* fall through */ }
+          return;
         }
-        logger.info(`[${tag(ds)}] Display mode → ${next}`);
-        try { return JSON.parse(cardJson); } catch { /* fall through */ }
+        // The queue accepted this update. Returning the same card here would
+        // make Lark apply a second, synchronous update outside that queue; an
+        // older in-flight PATCH could then land after it and restore stale state.
+        return {
+          toast: {
+            type: 'info',
+            content: t('toast.action_received_bg', undefined, localeForBot(ds.larkAppId)),
+          },
+        };
       }
       logger.info(`[${tag(ds)}] Display mode → ${next}`);
       return;
