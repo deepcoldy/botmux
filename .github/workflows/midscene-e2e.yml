@@ -193,7 +193,10 @@ jobs:
   deploy-report:
     name: Publish Midscene HTML report
     needs: midscene-report
-    if: always() && !cancelled() && needs.midscene-report.outputs.pages-ready == 'true'
+    # The github-pages environment accepts branch refs, not pull-request merge
+    # refs. PR runs still upload the complete report artifact and Pages payload;
+    # a workflow_dispatch run on the validated branch publishes the same report.
+    if: always() && !cancelled() && github.event_name == 'workflow_dispatch' && needs.midscene-report.outputs.pages-ready == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
