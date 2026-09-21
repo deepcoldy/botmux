@@ -7,43 +7,12 @@ import { getLoadedConfigPath } from '../bot-registry.js';
 import { assertQuotaFallbackGraphAcyclic } from './quota-fallback.js';
 import { withFileLock } from '../utils/file-lock.js';
 import { assertCodexInstanceConfigWrite } from './codex-instance-config-guard.js';
-
-export type BotConfigInvariantError =
-  | 'codex_browser_requires_codex_app'
-  | 'codex_browser_config_conflict'
-  | 'existing_app_server_sandbox_conflict';
-
-function codexBrowserEnabled(entry: any): boolean {
-  return entry?.codexBrowser === true
-    || (entry?.codexBrowser && typeof entry.codexBrowser === 'object' && entry.codexBrowser.enabled === true);
-}
-
-/** Cross-field invariants shared by every bots.json read-modify-write path. */
-export function botConfigInvariantError(entry: any): BotConfigInvariantError | undefined {
-  if (!entry || typeof entry !== 'object') return undefined;
-  if (codexBrowserEnabled(entry)) {
-    if (entry.cliId !== 'codex-app') return 'codex_browser_requires_codex_app';
-    if (entry.existingAppServer || entry.sandbox === true || entry.readIsolation === true) {
-      return 'codex_browser_config_conflict';
-    }
-  }
-  if (entry.existingAppServer && (entry.sandbox === true || entry.readIsolation === true)) {
-    return 'existing_app_server_sandbox_conflict';
-  }
-  return undefined;
-}
-
-function assertChangedBotConfigInvariants(previous: any[], next: any[]): void {
-  for (let index = 0; index < next.length; index++) {
-    const entry = next[index];
-    const previousEntry = entry?.larkAppId
-      ? previous.find(candidate => candidate?.larkAppId === entry.larkAppId)
-      : previous[index];
-    if (previousEntry !== undefined && JSON.stringify(previousEntry) === JSON.stringify(entry)) continue;
-    const error = botConfigInvariantError(entry);
-    if (error) throw new Error(error);
-  }
-}
+import {
+  assertChangedBotConfigInvariants,
+  botConfigInvariantError,
+} from './bot-config-invariants.js';
+export { botConfigInvariantError } from './bot-config-invariants.js';
+export type { BotConfigInvariantError } from './bot-config-invariants.js';
 
 export async function readRawConfig(path: string): Promise<any[]> {
   const raw = JSON.parse(await fsp.readFile(path, 'utf-8'));
