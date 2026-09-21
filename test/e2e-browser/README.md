@@ -3,7 +3,9 @@
 The existing Feishu browser scenarios are executed by `@midscene/test`. Their
 Playwright and Midscene Web assertions remain in the original `*.e2e.ts` files;
 the YAML cases provide native Midscene Test selection, retries, summaries, and
-unified reports without changing the product behavior under test.
+unified reports without changing the product behavior under test. Visible UI
+operations use `aiAct`; `aiWaitFor` and `aiAssert` describe observable results,
+while deterministic browser operations remain in TypeScript helpers.
 
 ## Run
 
@@ -20,13 +22,13 @@ The command writes each run below `midscene_run/runs/<run-id>/`. Use
 
 ## GitHub Actions
 
-The `Midscene E2E` workflow always validates the suite configuration, custom
-node, and 17-case registry. When the live-test secrets are available, it also
-runs the same 17 scenarios, uploads the native HTML report and runner data as
-the `midscene-feishu-report` artifact, and writes the case results to the
-workflow Summary page even when a scenario fails. Without those secrets, the
-Summary explicitly records that the live cases were skipped while static
-validation still gates the change.
+The `Midscene E2E` workflow always runs the credential-free Dashboard project,
+uploads the complete native report data as the `botmux-midscene-report`
+artifact, publishes the HTML report to GitHub Pages, and writes the real case
+result to the workflow Summary page. When the live-test secrets are available,
+the same workflow also runs these 17 Feishu scenarios. Without those secrets,
+only the Feishu project is skipped; the Dashboard Midscene run and its report
+are still required.
 
 Configure these repository secrets before running the workflow:
 

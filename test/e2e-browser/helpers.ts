@@ -517,9 +517,8 @@ export async function waitForCodexSideResponse(
 export async function scrollThreadToBottom(
   agent: PlaywrightAgent,
 ): Promise<void> {
-  await agent.aiScroll(
-    '主内容区（页面右侧大块、宽版非窄侧栏）当前正在显示的测试话题',
-    { direction: 'down', scrollType: 'untilBottom' },
+  await agent.aiAct(
+    '滚动主内容区（页面右侧大块、宽版非窄侧栏）当前正在显示的测试话题到底部，显示最新回复和回复输入框',
   );
 }
 

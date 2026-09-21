@@ -60,7 +60,14 @@ function duration(value) {
   return `${(value / 1000).toFixed(1)} s`;
 }
 
-export function renderSummary({ summary, artifactName, testOutcome, runUrl }) {
+export function renderSummary({
+  summary,
+  artifactName,
+  testOutcome,
+  runUrl,
+  pagesUrl,
+  feishuOutcome,
+}) {
   const counts = summary?.summary;
   const cases = (summary?.projects ?? []).flatMap((project) =>
     (project.cases ?? []).map((testCase) => ({
@@ -96,6 +103,19 @@ export function renderSummary({ summary, artifactName, testOutcome, runUrl }) {
     );
   } else if (reportAvailable) {
     lines.push(`Artifact: ${artifactName}`, '');
+  }
+
+  if (reportAvailable && pagesUrl) {
+    lines.push(`[Open the published Midscene HTML report](${pagesUrl})`, '');
+  }
+
+  if (feishuOutcome === 'skipped') {
+    lines.push(
+      '> The credential-free Dashboard project ran normally. The separate Feishu live project was skipped because its URL or authenticated storage state is unavailable.',
+      '',
+    );
+  } else if (feishuOutcome) {
+    lines.push(`Feishu live project: **${cell(feishuOutcome)}**.`, '');
   }
 
   if (cases.length > 0) {
@@ -135,6 +155,8 @@ async function main() {
     artifactName: required(options, 'artifact-name'),
     testOutcome: required(options, 'test-outcome'),
     runUrl,
+    pagesUrl: options['pages-url'],
+    feishuOutcome: options['feishu-outcome'],
   });
   await appendFile(required(options, 'output'), markdown);
 }

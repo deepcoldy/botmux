@@ -1,0 +1,33 @@
+cases:
+  - name: Navigate the core read-only Dashboard pages
+    tags: [dashboard, smoke]
+    steps:
+      - aiAssert:
+          prompt: The Botmux Dashboard has loaded. The left navigation contains Workbench, Session Control, and Monitor, the main area shows the Workbench overview, and a bot named Midscene Smoke Bot is visible.
+          message: The Dashboard workbench or fixture bot is missing
+          $:
+            timeout: 60_000
+      - aiAct:
+          prompt: Click Session Control in the left navigation.
+          $:
+            timeout: 60_000
+      - aiAssert:
+          prompt: The current page is Botmux Session Control. It contains a session-related heading, filters, or an empty state instead of the Workbench overview.
+          message: Session Control did not open
+          $:
+            timeout: 60_000
+      - aiAct:
+          prompt: Click Monitor in the left navigation.
+          $:
+            timeout: 60_000
+      - aiAssert:
+          prompt: The current page is the Botmux Monitor and contains runtime health, resource pressure, or session pressure information.
+          message: Monitor did not open
+          $:
+            timeout: 60_000
+
+afterAll:
+  - recordToReport:
+      title: Botmux Dashboard smoke test
+      options:
+        content: The real Dashboard bundle displayed the Workbench, Session Control, and Monitor pages and allowed navigation between them.

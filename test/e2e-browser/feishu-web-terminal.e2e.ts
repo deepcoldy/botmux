@@ -75,7 +75,7 @@ describe('feishu web terminal', () => {
     await showStreamingOutput(agent, page);
 
     // Scroll down in thread panel to reveal card buttons below expanded content
-    await agent.aiScroll(undefined, { direction: 'down', scrollType: 'untilBottom' });
+    await agent.aiAct('滚动当前话题详情面板到底部，显示流式卡片下方的操作按钮');
     await page.waitForTimeout(1000);
 
     // Open terminal: listen for popup OR navigation simultaneously

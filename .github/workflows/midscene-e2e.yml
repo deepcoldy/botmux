@@ -7,9 +7,13 @@ on:
       - ".github/workflows/midscene-e2e.yml"
       - "package.json"
       - "bun.lock"
+      - "scripts/prepare-midscene-pages.mjs"
       - "scripts/render-midscene-summary.mjs"
       - "scripts/run-e2e.ts"
+      - "src/dashboard/**"
+      - "src/index-dashboard.ts"
       - "test/e2e-browser/**"
+      - "test/midscene/**"
 
 permissions:
   contents: read
@@ -19,14 +23,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  feishu-browser:
-    name: Feishu browser scenarios
-    # GitHub does not expose repository secrets to pull requests from forks.
-    # Run this job on same-repository branches, including validation PRs in a
-    # contributor's fork, and use workflow_dispatch for later reruns.
+  midscene-report:
+    name: Run Midscene and build report
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      pages: write
+    outputs:
+      pages-ready: ${{ steps.pages_payload.outcome == 'success' }}
     env:
       CI: "true"
       FEISHU_TEST_GROUP_URL: ${{ secrets.FEISHU_TEST_GROUP_URL }}
@@ -36,6 +42,7 @@ jobs:
       MIDSCENE_MODEL_NAME: ${{ secrets.MIDSCENE_MODEL_NAME }}
       MIDSCENE_MODEL_BASE_URL: ${{ secrets.MIDSCENE_MODEL_BASE_URL }}
       MIDSCENE_MODEL_FAMILY: ${{ secrets.MIDSCENE_MODEL_FAMILY }}
+      NODE_OPTIONS: "--dns-result-order=ipv4first --no-network-family-autoselection"
 
     steps:
       - uses: actions/checkout@v6
@@ -48,28 +55,64 @@ jobs:
         with:
           bun-version: 1.4.2
 
+      - name: Require Midscene model configuration
+        run: |
+          test -n "$MIDSCENE_MODEL_API_KEY"
+          test -n "$MIDSCENE_MODEL_NAME"
+          test -n "$MIDSCENE_MODEL_BASE_URL"
+          test -n "$MIDSCENE_MODEL_FAMILY"
+
+      - name: Check Midscene model connectivity
+        run: |
+          node --input-type=module <<'NODE'
+          const baseUrl = process.env.MIDSCENE_MODEL_BASE_URL.replace(/\/+$/, '');
+          const response = await fetch(`${baseUrl}/chat/completions`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${process.env.MIDSCENE_MODEL_API_KEY}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              model: process.env.MIDSCENE_MODEL_NAME,
+              messages: [{ role: 'user', content: 'Reply OK.' }],
+              max_tokens: 1,
+            }),
+            signal: AbortSignal.timeout(90_000),
+          });
+          if (!response.ok) {
+            throw new Error(`Model preflight returned HTTP ${response.status}`);
+          }
+          await response.arrayBuffer();
+          NODE
+
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Validate Midscene suite
+      - name: Validate Midscene projects
         run: |
           bun run test:midscene:typecheck
           bun run test:midscene:nodes
           bun run test -- test/midscene-suite.test.ts
 
-      - name: Detect live-test configuration
-        id: live_config
+      - name: Install Chromium
+        run: bun x playwright install --with-deps chromium
+
+      - name: Build Botmux
+        run: bun run build
+
+      - name: Run Dashboard Midscene project
+        id: dashboard_midscene
+        env:
+          MIDSCENE_RUN_DIR: ${{ github.workspace }}/midscene_run/dashboard
+        run: bun run test:midscene
+
+      - name: Detect Feishu live-test configuration
+        id: feishu_config
+        if: always() && !cancelled()
         env:
           FEISHU_STORAGE_STATE_BASE64: ${{ secrets.FEISHU_STORAGE_STATE_BASE64 }}
         run: |
-          required=(
-            FEISHU_TEST_GROUP_URL
-            FEISHU_STORAGE_STATE_BASE64
-            MIDSCENE_MODEL_API_KEY
-            MIDSCENE_MODEL_NAME
-            MIDSCENE_MODEL_BASE_URL
-            MIDSCENE_MODEL_FAMILY
-          )
+          required=(FEISHU_TEST_GROUP_URL FEISHU_STORAGE_STATE_BASE64)
           missing=()
           for name in "${required[@]}"; do
             if [[ -z ${!name:-} ]]; then
@@ -78,47 +121,91 @@ jobs:
           done
           if (( ${#missing[@]} > 0 )); then
             echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "Live Feishu cases skipped; unavailable Actions secrets: ${missing[*]}"
+            echo "Feishu live cases skipped; unavailable Actions secrets: ${missing[*]}"
             exit 0
           fi
           printf '%s' "$FEISHU_STORAGE_STATE_BASE64" | base64 --decode > storageState.json
           node -e "const fs=require('node:fs'); const value=JSON.parse(fs.readFileSync('storageState.json','utf8')); if (!Array.isArray(value.cookies)) throw new Error('FEISHU_STORAGE_STATE_BASE64 is not a Playwright storage state')"
           echo "ready=true" >> "$GITHUB_OUTPUT"
 
-      - name: Install Chromium
-        if: steps.live_config.outputs.ready == 'true'
-        run: bun x playwright install --with-deps chromium
+      - name: Run migrated Feishu Midscene project
+        id: feishu_midscene
+        if: always() && !cancelled() && steps.dashboard_midscene.outcome == 'success' && steps.feishu_config.outputs.ready == 'true'
+        env:
+          MIDSCENE_RUN_DIR: ${{ github.workspace }}/midscene_run/feishu
+        run: bun run test:midscene:feishu
 
-      - name: Run migrated Midscene scenarios
-        id: midscene
-        if: steps.live_config.outputs.ready == 'true'
-        run: bun run test:e2e-browser
+      - name: Configure GitHub Pages
+        id: pages
+        if: always() && !cancelled()
+        uses: actions/configure-pages@v6
 
       - name: Write Midscene run summary
         if: always() && !cancelled()
         env:
-          TEST_OUTCOME: ${{ steps.midscene.outcome }}
-          LIVE_READY: ${{ steps.live_config.outputs.ready }}
+          TEST_OUTCOME: ${{ steps.dashboard_midscene.outcome }}
+          FEISHU_READY: ${{ steps.feishu_config.outputs.ready }}
+          FEISHU_OUTCOME: ${{ steps.feishu_midscene.outcome }}
+          PAGES_BASE_URL: ${{ steps.pages.outputs.base_url }}
         run: |
-          outcome="${TEST_OUTCOME:-not-run}"
-          if [[ "$LIVE_READY" != "true" ]]; then
-            outcome="skipped"
+          feishu_outcome="${FEISHU_OUTCOME:-not-run}"
+          if [[ "$FEISHU_READY" != "true" ]]; then
+            feishu_outcome="skipped"
           fi
           node scripts/render-midscene-summary.mjs \
-            --results midscene_run \
-            --artifact-name midscene-feishu-report \
-            --test-outcome "$outcome" \
+            --results midscene_run/dashboard/results \
+            --artifact-name botmux-midscene-report \
+            --test-outcome "${TEST_OUTCOME:-not-run}" \
+            --feishu-outcome "$feishu_outcome" \
+            --pages-url "$PAGES_BASE_URL" \
             --output "$GITHUB_STEP_SUMMARY"
           test -s "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload Midscene report
-        if: always() && !cancelled() && steps.live_config.outputs.ready == 'true'
+      - name: Upload complete Midscene report data
+        if: always() && !cancelled()
         uses: actions/upload-artifact@v7
         with:
-          name: midscene-feishu-report
+          name: botmux-midscene-report
           path: |
             midscene_run/
+            test/midscene/midscene_run/
             test/e2e-browser/midscene_run/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 7
+          overwrite: true
+
+      - name: Prepare native Midscene HTML report for Pages
+        if: always() && !cancelled()
+        run: |
+          node scripts/prepare-midscene-pages.mjs \
+            --report-root test/midscene/midscene_run/report \
+            --output "$RUNNER_TEMP/midscene-pages"
+
+      - name: Upload GitHub Pages report
+        id: pages_payload
+        if: always() && !cancelled()
+        uses: actions/upload-pages-artifact@v5
+        with:
+          name: botmux-midscene-pages-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/midscene-pages
+
+  deploy-report:
+    name: Publish Midscene HTML report
+    needs: midscene-report
+    if: always() && !cancelled() && needs.midscene-report.outputs.pages-ready == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy Midscene report
+        id: deployment
+        uses: actions/deploy-pages@v5
+        with:
+          artifact_name: botmux-midscene-pages-${{ github.run_attempt }}
