@@ -132,6 +132,7 @@ import {
   userFacingFrozenCommandError,
 } from './services/frozen-command.js';
 import {
+  cancelFrozenCommandTransition,
   confirmFrozenCommandTransition,
   evaluateFrozenCommandLifecycle,
   listFrozenCommandLifecycleRecords,
@@ -152,9 +153,13 @@ import {
 import {
   buildFrozenCommandActionStatusCard,
   buildFrozenCommandCenterCard,
+  buildFrozenCommandLifecyclePreviewCard,
+  buildFrozenCommandLifecycleStatusCard,
   buildFrozenCommandPreviewCard,
   FROZEN_COMMAND_ACTION_CANCEL,
   FROZEN_COMMAND_ACTION_CONFIRM,
+  FROZEN_COMMAND_LIFECYCLE_CANCEL,
+  FROZEN_COMMAND_LIFECYCLE_CONFIRM,
   type FrozenCommandCenterRow,
 } from './im/lark/frozen-command-card.js';
 import * as messageQueue from './services/message-queue.js';
@@ -5690,25 +5695,13 @@ async function routeFrozenCommand(input: {
           reason: transition.reason,
           replacement: transition.replacement,
         });
-        const actionLabel = prepared.action === 'approve'
-          ? '批准'
-          : prepared.action === 'retire'
-            ? '废弃'
-            : prepared.action === 'restore'
-              ? '恢复'
-              : '彻底撤销';
         await input.reply(
           input.anchor,
-          [
-            `即将${actionLabel} /${prepared.command}。`,
-            `原因：${prepared.reason}`,
-            ...(prepared.replacement ? [`替代命令：${prepared.replacement}`] : []),
-            ...(prepared.specHash ? [`定义 hash：${prepared.specHash}`] : []),
-            ...(prepared.expectedRevisionId ? [`当前 revision：${prepared.expectedRevisionId}`] : []),
-            `确认有效期至 ${prepared.expiresAt}。`,
-            `请由同一真人发送：/freeze confirm ${prepared.token}`,
-          ].join('\n'),
-          'text',
+          buildFrozenCommandLifecyclePreviewCard({
+            transition: prepared,
+            workingDirLabel: basename(input.workingDir) || input.workingDir,
+          }),
+          'interactive',
           input.larkAppId,
         );
       } catch (error) {
@@ -6533,6 +6526,67 @@ async function handleFrozenCommandCardAction(
 ): Promise<Record<string, unknown>> {
   const value = data.action?.value;
   const actionKind = value?.action;
+  if (actionKind === FROZEN_COMMAND_LIFECYCLE_CONFIRM || actionKind === FROZEN_COMMAND_LIFECYCLE_CANCEL) {
+    const token = value?.transition_token;
+    const cardMessageId = data.context?.open_message_id ?? data.open_message_id;
+    if (!token || !cardMessageId) {
+      return { toast: { type: 'error', content: '状态变更确认卡信息不完整，请重新发起' } };
+    }
+    const actualChatId = await getMessageChatId(larkAppId, cardMessageId);
+    if (!actualChatId) {
+      return { toast: { type: 'error', content: '状态变更确认卡位置校验失败' } };
+    }
+    const operator = await resolveCardOperatorUnionId(data, larkAppId);
+    if (!operator.openId || !operator.unionId
+      || !canOperate(larkAppId, actualChatId, operator.openId, operator.unionId)) {
+      return { toast: { type: 'error', content: '仅发起操作的同一真人且仍有管理权限时可以确认' } };
+    }
+    try {
+      if (actionKind === FROZEN_COMMAND_LIFECYCLE_CANCEL) {
+        const cancelled = cancelFrozenCommandTransition({
+          dataDir: config.session.dataDir,
+          targetBotId: larkAppId,
+          token,
+          actor: { openId: operator.openId, unionId: operator.unionId },
+        });
+        return {
+          card: {
+            type: 'raw',
+            data: buildFrozenCommandLifecycleStatusCard({
+              command: cancelled.command,
+              action: cancelled.action,
+              status: 'cancelled',
+            }),
+          },
+          toast: { type: 'info', content: '已取消，本次未变更固化命令' },
+        };
+      }
+      const record = confirmFrozenCommandTransition({
+        dataDir: config.session.dataDir,
+        targetBotId: larkAppId,
+        token,
+        actor: { openId: operator.openId, unionId: operator.unionId },
+      });
+      return {
+        card: {
+          type: 'raw',
+          data: buildFrozenCommandLifecycleStatusCard({
+            command: record.command,
+            action: record.confirmedAction ?? 'approve',
+            status: 'confirmed',
+          }),
+        },
+        toast: { type: 'success', content: '固化命令状态已更新' },
+      };
+    } catch (error) {
+      return {
+        toast: {
+          type: 'error',
+          content: `状态变更失败：${error instanceof Error ? error.message : String(error)}`,
+        },
+      };
+    }
+  }
   const id = value?.transition_id;
   const nonce = value?.nonce;
   const cardMessageId = data.context?.open_message_id ?? data.open_message_id;
@@ -7495,9 +7549,12 @@ function frozenCommandCenterRows(
 interface FrozenCommandIntentBody {
   sessionId: string;
   larkAppId: string;
-  operation: 'list' | 'run';
+  operation: 'list' | 'run' | 'approve' | 'retire' | 'restore' | 'revoke';
   command?: string;
   rawArgs?: string;
+  reason?: string;
+  replacement?: string;
+  definitionYaml?: string;
   originTurnId: string;
   originDispatchAttempt?: number;
   originCapability?: string;
@@ -7506,14 +7563,16 @@ interface FrozenCommandIntentBody {
 function parseFrozenCommandIntentBody(raw: unknown): FrozenCommandIntentBody | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)
     || !Object.keys(raw as Record<string, unknown>).every(key => new Set([
-    'sessionId', 'larkAppId', 'operation', 'command', 'rawArgs',
-    'originTurnId', 'originDispatchAttempt', 'originCapability',
+      'sessionId', 'larkAppId', 'operation', 'command', 'rawArgs',
+      'reason', 'replacement', 'definitionYaml',
+      'originTurnId', 'originDispatchAttempt', 'originCapability',
     ]).has(key))
     || ['__proto__', 'prototype', 'constructor'].some(key => Object.hasOwn(raw, key))) return undefined;
   const value = raw as Record<string, unknown>;
+  const lifecycleOperations = new Set(['approve', 'retire', 'restore', 'revoke']);
   if (typeof value.sessionId !== 'string'
     || typeof value.larkAppId !== 'string'
-    || (value.operation !== 'list' && value.operation !== 'run')
+    || (value.operation !== 'list' && value.operation !== 'run' && !lifecycleOperations.has(String(value.operation)))
     || typeof value.originTurnId !== 'string'
     || value.originTurnId.length === 0
     || (value.originDispatchAttempt !== undefined
@@ -7523,6 +7582,19 @@ function parseFrozenCommandIntentBody(raw: unknown): FrozenCommandIntentBody | u
       && typeof value.originCapability !== 'string')) return undefined;
   if (value.operation === 'run'
     && (typeof value.command !== 'string' || typeof value.rawArgs !== 'string')) return undefined;
+  if (value.operation === 'list'
+    && [value.command, value.rawArgs, value.reason, value.replacement, value.definitionYaml]
+      .some(item => item !== undefined)) return undefined;
+  if (value.operation === 'run'
+    && [value.reason, value.replacement, value.definitionYaml].some(item => item !== undefined)) return undefined;
+  if (lifecycleOperations.has(String(value.operation))
+    && (typeof value.command !== 'string'
+      || typeof value.reason !== 'string'
+      || value.rawArgs !== undefined
+      || (value.replacement !== undefined && typeof value.replacement !== 'string')
+      || (value.definitionYaml !== undefined && typeof value.definitionYaml !== 'string')
+      || (value.operation === 'approve' && typeof value.definitionYaml !== 'string')
+      || (value.operation !== 'approve' && value.definitionYaml !== undefined))) return undefined;
   return value as unknown as FrozenCommandIntentBody;
 }
 
@@ -7620,6 +7692,49 @@ ipcRoute('POST', '/api/frozen-command-actions', async (req, res) => {
       operation: 'list',
       cardMessageId,
       commandCount: rows.length,
+    });
+  }
+  if (body.operation !== 'run') {
+    if (!canOperate(ds.larkAppId, ds.chatId, actor.requestUserOpenId, actor.requestUserUnionId)) {
+      return jsonRes(res, 403, { ok: false, error: 'operation_not_allowed' });
+    }
+    const action: FrozenCommandLifecycleAction = body.operation;
+    let prepared;
+    try {
+      prepared = prepareFrozenCommandTransition({
+        dataDir: config.session.dataDir,
+        targetBotId: ds.larkAppId,
+        workingDir,
+        command: body.command!,
+        action,
+        actor: {
+          openId: actor.requestUserOpenId,
+          unionId: actor.requestUserUnionId,
+        },
+        reason: body.reason!,
+        ...(body.replacement ? { replacement: body.replacement } : {}),
+        ...(body.definitionYaml ? { candidateYaml: body.definitionYaml } : {}),
+      });
+    } catch (error) {
+      return jsonRes(res, 409, {
+        ok: false,
+        error: error instanceof FrozenCommandError ? error.code : 'transition_prepare_failed',
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    }
+    const card = buildFrozenCommandLifecyclePreviewCard({
+      transition: prepared,
+      workingDirLabel: basename(workingDir) || workingDir,
+    });
+    const cardMessageId = await sessionReply(
+      sessionAnchorId(ds), card, 'interactive', ds.larkAppId, body.originTurnId,
+    );
+    return jsonRes(res, 200, {
+      ok: true,
+      status: 'awaiting_input',
+      operation: body.operation,
+      cardMessageId,
+      expiresAt: prepared.expiresAt,
     });
   }
   const normalizedCommand = normalizeFrozenCommandName(body.command!);

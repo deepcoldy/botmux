@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { lookupFrozenCommand } from '../src/services/frozen-command.js';
 import {
+  cancelFrozenCommandTransition,
   confirmFrozenCommandTransition,
   evaluateFrozenCommandLifecycle,
   listFrozenCommandLifecycleAudit,
@@ -60,6 +61,128 @@ afterEach(() => {
 });
 
 describe('Frozen Command lifecycle ledger', () => {
+  it('creates the live command directory only after candidate confirmation', () => {
+    const root = join(tmpdir(), `botmux-frozen-create-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    roots.push(root);
+    mkdirSync(root, { recursive: true });
+    const dataDir = join(root, 'data');
+    const pending = prepareFrozenCommandTransition({
+      dataDir,
+      targetBotId: BOT,
+      workingDir: root,
+      command: '/生命周期测试',
+      action: 'approve',
+      actor: ACTOR,
+      reason: '创建新命令',
+      candidateYaml: ACTIVE,
+    });
+    const file = join(root, '.botmux', 'commands', '生命周期测试.yaml');
+    expect(() => readFileSync(file, 'utf8')).toThrow();
+    confirmFrozenCommandTransition({ dataDir, targetBotId: BOT, token: pending.token, actor: ACTOR });
+    expect(readFileSync(file, 'utf8')).toBe(ACTIVE);
+  });
+
+  it('rejects a candidate when the command directory escapes through a symlink', () => {
+    if (process.platform === 'win32') return;
+    const root = join(tmpdir(), `botmux-frozen-contained-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    const outside = join(tmpdir(), `botmux-frozen-outside-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    roots.push(root, outside);
+    mkdirSync(join(root, '.botmux'), { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    symlinkSync(outside, join(root, '.botmux', 'commands'));
+    expect(() => prepareFrozenCommandTransition({
+      dataDir: join(root, 'data'),
+      targetBotId: BOT,
+      workingDir: root,
+      command: '/生命周期测试',
+      action: 'approve',
+      actor: ACTOR,
+      reason: '越界候选',
+      candidateYaml: ACTIVE,
+    })).toThrowError(/越出当前工作目录/);
+  });
+
+  it('stages an update without touching the approved file until the same human confirms', () => {
+    const input = setup();
+    const first = prepareFrozenCommandTransition({
+      dataDir: input.dataDir,
+      targetBotId: BOT,
+      workingDir: input.root,
+      command: '/生命周期测试',
+      action: 'approve',
+      actor: ACTOR,
+      reason: '批准初版',
+    });
+    const initial = confirmFrozenCommandTransition({
+      dataDir: input.dataDir,
+      targetBotId: BOT,
+      token: first.token,
+      actor: ACTOR,
+    });
+    const candidate = ACTIVE.replace('SELECT {{value}} AS probe_value', 'SELECT {{value}} + 1 AS probe_value');
+    const pending = prepareFrozenCommandTransition({
+      dataDir: input.dataDir,
+      targetBotId: BOT,
+      workingDir: input.root,
+      command: '/生命周期测试',
+      action: 'approve',
+      actor: ACTOR,
+      reason: '更新口径',
+      candidateYaml: candidate,
+    });
+
+    expect(pending.expectedRevisionId).toBe(initial.stateRevisionId);
+    expect(pending.previousSpecHash).toBe(initial.specHash);
+    expect(pending.specHash).not.toBe(initial.specHash);
+    expect(readFileSync(input.file, 'utf8')).toBe(ACTIVE);
+
+    expect(() => confirmFrozenCommandTransition({
+      dataDir: input.dataDir,
+      targetBotId: BOT,
+      token: pending.token,
+      actor: { openId: 'ou_other', unionId: 'on_other' },
+    })).toThrowError(/同一真人/);
+    expect(readFileSync(input.file, 'utf8')).toBe(ACTIVE);
+
+    const updated = confirmFrozenCommandTransition({
+      dataDir: input.dataDir,
+      targetBotId: BOT,
+      token: pending.token,
+      actor: ACTOR,
+    });
+    expect(updated.state).toBe('active');
+    expect(readFileSync(input.file, 'utf8')).toBe(candidate);
+  });
+
+  it('cancels a staged update without changing the current command and consumes the token', () => {
+    const input = setup();
+    const pending = prepareFrozenCommandTransition({
+      dataDir: input.dataDir,
+      targetBotId: BOT,
+      workingDir: input.root,
+      command: '/生命周期测试',
+      action: 'approve',
+      actor: ACTOR,
+      reason: '候选更新',
+      candidateYaml: ACTIVE.replace('SELECT {{value}}', 'SELECT {{value}} + 2'),
+    });
+
+    const cancelled = cancelFrozenCommandTransition({
+      dataDir: input.dataDir,
+      targetBotId: BOT,
+      token: pending.token,
+      actor: ACTOR,
+    });
+    expect(cancelled).toMatchObject({ command: '生命周期测试', action: 'approve' });
+    expect(readFileSync(input.file, 'utf8')).toBe(ACTIVE);
+    expect(() => confirmFrozenCommandTransition({
+      dataDir: input.dataDir,
+      targetBotId: BOT,
+      token: pending.token,
+      actor: ACTOR,
+    })).toThrowError(/不存在|不属于/);
+  });
+
   it('requires the same real actor to confirm and leaves the active file untouched on denial', () => {
     const input = setup();
     const pending = prepare(input, 'retire');

@@ -8,7 +8,7 @@ import {
   realpathSync,
   unlinkSync,
 } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import {
@@ -16,6 +16,7 @@ import {
   frozenCommandFilePath,
   loadFrozenCommandSnapshot,
   normalizeFrozenCommandName,
+  parseFrozenCommandCandidate,
   type FrozenCommandSnapshot,
 } from './frozen-command.js';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from './sqlite-compat.js';
@@ -66,6 +67,7 @@ export interface FrozenCommandPreparedTransition {
   reason: string;
   replacement?: string;
   specHash?: string;
+  previousSpecHash?: string;
   expectedRevisionId?: string;
 }
 
@@ -107,6 +109,7 @@ CREATE TABLE IF NOT EXISTS pending_transitions (
   replacement TEXT,
   expected_spec_hash TEXT,
   expected_revision_id TEXT,
+  candidate_yaml TEXT,
   expires_at TEXT NOT NULL,
   created_at TEXT NOT NULL
 );
@@ -129,6 +132,20 @@ CREATE TABLE IF NOT EXISTS command_audit (
 );
 CREATE INDEX IF NOT EXISTS idx_pending_expiry ON pending_transitions(expires_at);
 `;
+
+function ensureSchemaColumns(db: DatabaseSyncLike): void {
+  const columns = db.prepare('PRAGMA table_info(pending_transitions)').all() as Array<{ name: string }>;
+  if (!columns.some(column => column.name === 'candidate_yaml')) {
+    try {
+      db.exec('ALTER TABLE pending_transitions ADD COLUMN candidate_yaml TEXT;');
+    } catch (error) {
+      // Several bot daemons share this host ledger and can cross the same
+      // migration edge. Suppress only the proven "another daemon won" case.
+      const after = db.prepare('PRAGMA table_info(pending_transitions)').all() as Array<{ name: string }>;
+      if (!after.some(column => column.name === 'candidate_yaml')) throw error;
+    }
+  }
+}
 
 function sha256(value: string): string {
   return createHash('sha256').update(value).digest('hex');
@@ -166,12 +183,21 @@ function actorId(actor: FrozenCommandActor): string | undefined {
 function commandKey(workingDir: string, rawCommand: string): { command: string; commandPath: string } {
   const command = normalizeFrozenCommandName(rawCommand);
   if (!command) throw new FrozenCommandError('invalid_command_name', `非法指令名：${rawCommand}`);
-  const filePath = frozenCommandFilePath(workingDir, command);
+  const workingRoot = realpathSync(resolve(workingDir));
+  const filePath = frozenCommandFilePath(workingRoot, command);
   let commandPath = resolve(filePath);
   try { commandPath = realpathSync(filePath); }
   catch {
     try { commandPath = join(realpathSync(dirname(filePath)), command + '.yaml'); }
-    catch { /* The definition loader will report an invalid/missing directory. */ }
+    catch {
+      try {
+        commandPath = join(realpathSync(dirname(dirname(filePath))), 'commands', command + '.yaml');
+      } catch { /* A new .botmux tree remains rooted under the canonical working root. */ }
+    }
+  }
+  const rel = relative(workingRoot, commandPath);
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel) || resolve(commandPath) === workingRoot) {
+    throw new FrozenCommandError('definition_file_invalid', '指令定义越出当前工作目录');
   }
   return { command, commandPath };
 }
@@ -203,6 +229,7 @@ function withDb<T>(dataDir: string, operation: (db: DatabaseSyncLike) => T): T {
     db.exec('PRAGMA journal_mode = WAL;');
     db.exec('PRAGMA synchronous = FULL;');
     db.exec(SCHEMA);
+    ensureSchemaColumns(db);
     return operation(db);
   } finally {
     db.close();
@@ -430,6 +457,9 @@ export function prepareFrozenCommandTransition(input: {
   actor: FrozenCommandActor;
   reason: string;
   replacement?: string;
+  /** Candidate source for create/update. When present, it is validated and
+   * stored in the host ledger but is not written live until confirmation. */
+  candidateYaml?: string;
   now?: Date;
 }): FrozenCommandPreparedTransition {
   const id = actorId(input.actor);
@@ -444,13 +474,21 @@ export function prepareFrozenCommandTransition(input: {
   const token = randomBytes(18).toString('base64url');
   const expiresAt = new Date(now.getTime() + CONFIRM_TTL_MS).toISOString();
   let preparedSpecHash: string | undefined;
+  let previousSpecHash: string | undefined;
   let expectedRevisionId: string | undefined;
   withDb(input.dataDir, db => transaction(db, () => {
     const current = selectRecord(db, input.targetBotId, key.commandPath, key.command);
+    previousSpecHash = current?.specHash;
     expectedRevisionId = current?.stateRevisionId;
     let expectedSpecHash: string | undefined;
     if (input.action === 'approve') {
-      const snapshot = loadFrozenCommandSnapshot({ workingDir: input.workingDir, command: key.command });
+      const snapshot = input.candidateYaml === undefined
+        ? loadFrozenCommandSnapshot({ workingDir: input.workingDir, command: key.command })
+        : parseFrozenCommandCandidate({
+            workingDir: input.workingDir,
+            command: key.command,
+            raw: input.candidateYaml,
+          });
       if (!snapshot) throw new FrozenCommandError('definition_missing', `未找到 /${key.command}`);
       expectedSpecHash = frozenCommandSpecHash(snapshot);
       preparedSpecHash = expectedSpecHash;
@@ -485,11 +523,12 @@ export function prepareFrozenCommandTransition(input: {
     db.prepare('DELETE FROM pending_transitions WHERE expires_at <= ?').run(now.toISOString());
     db.prepare(`INSERT INTO pending_transitions (
       token_hash,target_bot_id,command_path,command,action,actor_id,actor_open_id,actor_union_id,
-      reason,replacement,expected_spec_hash,expected_revision_id,expires_at,created_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      reason,replacement,expected_spec_hash,expected_revision_id,candidate_yaml,expires_at,created_at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       sha256(token), input.targetBotId, key.commandPath, key.command, input.action, id,
       input.actor.openId ?? null, input.actor.unionId ?? null, reason, replacement ?? null,
-      expectedSpecHash ?? null, current?.stateRevisionId ?? null, expiresAt, now.toISOString(),
+      expectedSpecHash ?? null, current?.stateRevisionId ?? null, input.candidateYaml ?? null,
+      expiresAt, now.toISOString(),
     );
   }));
   return {
@@ -500,6 +539,7 @@ export function prepareFrozenCommandTransition(input: {
     reason,
     ...(replacement ? { replacement } : {}),
     ...(preparedSpecHash ? { specHash: preparedSpecHash } : {}),
+    ...(previousSpecHash ? { previousSpecHash } : {}),
     ...(expectedRevisionId ? { expectedRevisionId } : {}),
   };
 }
@@ -517,6 +557,7 @@ interface PendingRow {
   replacement: string | null;
   expected_spec_hash: string | null;
   expected_revision_id: string | null;
+  candidate_yaml: string | null;
   expires_at: string;
 }
 
@@ -557,10 +598,14 @@ export function confirmFrozenCommandTransition(input: {
       if (current?.state === 'retired' || current?.state === 'revoked') {
         throw new FrozenCommandError('transition_invalid_state', `/${pending.command} 当前为 ${current.state}`);
       }
-      const snapshot = loadFrozenCommandSnapshot({
-        workingDir: dirname(dirname(dirname(pending.command_path))),
-        command: pending.command,
-      });
+      const workingDir = dirname(dirname(dirname(pending.command_path)));
+      const snapshot = pending.candidate_yaml === null
+        ? loadFrozenCommandSnapshot({ workingDir, command: pending.command })
+        : parseFrozenCommandCandidate({
+            workingDir,
+            command: pending.command,
+            raw: pending.candidate_yaml,
+          });
       if (!snapshot) throw new FrozenCommandError('definition_missing', '待批准命令已不存在');
       sourceYaml = snapshot.raw;
       specHash = frozenCommandSpecHash(snapshot);
@@ -659,8 +704,57 @@ export function confirmFrozenCommandTransition(input: {
   }));
   // State + audit commit first. A crash or write failure leaves a more
   // restrictive durable state; the next lookup/restart lazily reconciles it.
-  reconcileRecord(record);
+  if (record.confirmedAction === 'approve' && record.sourceYaml) {
+    // Candidate approvals commit authority first, then publish the exact bytes.
+    // A write failure therefore leaves the command fail-closed rather than
+    // executable without a matching audit revision.
+    mkdirSync(dirname(record.commandPath), { recursive: true, mode: 0o700 });
+    atomicWriteFileSync(record.commandPath, record.sourceYaml, {
+      mode: 0o600,
+      durable: true,
+      followTargetSymlink: false,
+    });
+  } else {
+    reconcileRecord(record);
+  }
   return record;
+}
+
+export function cancelFrozenCommandTransition(input: {
+  dataDir: string;
+  targetBotId: string;
+  token: string;
+  actor: FrozenCommandActor;
+  now?: Date;
+}): FrozenCommandPreparedTransition {
+  const id = actorId(input.actor);
+  if (!id) throw new FrozenCommandError('transition_actor_untrusted', '只有发起确认的真人可以取消状态变更');
+  const now = input.now ?? new Date();
+  return withDb(input.dataDir, db => transaction(db, () => {
+    const pending = db.prepare('SELECT * FROM pending_transitions WHERE token_hash = ?')
+      .get(sha256(input.token)) as PendingRow | undefined;
+    if (!pending || pending.target_bot_id !== input.targetBotId) {
+      throw new FrozenCommandError('transition_confirmation_invalid', '确认已失效，请重新发起');
+    }
+    if (pending.actor_id !== id) {
+      throw new FrozenCommandError('transition_confirmation_actor_mismatch', '必须由发起变更的同一真人取消');
+    }
+    if (Date.parse(pending.expires_at) <= now.getTime()) {
+      db.prepare('DELETE FROM pending_transitions WHERE token_hash = ?').run(pending.token_hash);
+      throw new FrozenCommandError('transition_confirmation_expired', '确认已过期，请重新发起');
+    }
+    db.prepare('DELETE FROM pending_transitions WHERE token_hash = ?').run(pending.token_hash);
+    return {
+      token: input.token,
+      expiresAt: pending.expires_at,
+      command: pending.command,
+      action: pending.action,
+      reason: pending.reason,
+      ...(pending.replacement ? { replacement: pending.replacement } : {}),
+      ...(pending.expected_spec_hash ? { specHash: pending.expected_spec_hash } : {}),
+      ...(pending.expected_revision_id ? { expectedRevisionId: pending.expected_revision_id } : {}),
+    };
+  }));
 }
 
 export function listFrozenCommandLifecycleAudit(input: {

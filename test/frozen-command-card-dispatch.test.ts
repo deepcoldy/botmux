@@ -11,7 +11,12 @@ function deps(handler: NonNullable<CardHandlerDeps['frozenCommandCardAction']>):
 }
 
 describe('Frozen Command card dispatch', () => {
-  it.each(['frozen_command_run_confirm', 'frozen_command_run_cancel'])(
+  it.each([
+    'frozen_command_run_confirm',
+    'frozen_command_run_cancel',
+    'frozen_command_lifecycle_confirm',
+    'frozen_command_lifecycle_cancel',
+  ])(
     'routes %s to the host-owned handler without requiring a live session',
     async (action) => {
       const handler = vi.fn(async () => ({ toast: { type: 'info', content: 'ok' } }));

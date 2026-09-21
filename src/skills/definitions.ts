@@ -187,7 +187,7 @@ botmux session rename "排障｜支付链路超时"
 
 const FROZEN_COMMAND_SKILL = `---
 name: botmux-freeze
-description: 把已经跑通并由用户确认正确的数据查询固化成当前角色目录下的斜杠命令。用户说“把刚才这个固化成 /xxx”“安装固定查询”“freeze command”或要求修改/覆盖已有固化命令时触发。必须从本话题实际成功的工具调用录制，不得重新猜 SQL；确认卡不展示 SQL。
+description: 把已经跑通并由用户确认正确的数据查询固化成当前角色目录下的斜杠命令，也负责修改和废弃。用户说“把刚才这个固化成 /xxx”“安装固定查询”“freeze command”、要求修改/覆盖或废弃已有命令时触发。必须从本话题实际成功的工具调用录制，不得重新猜 SQL；确认卡不展示 SQL。
 ---
 
 # botmux-freeze — 固化已跑通的数据查询
@@ -199,10 +199,10 @@ description: 把已经跑通并由用户确认正确的数据查询固化成当�
 1. 只从本话题最近一次与用户所指业务问题对应的**实际成功工具调用**提取 SQL、datasource 和样例结果；不得让模型重新生成一段 SQL 代替录制。
 2. 用户永远不需要看到 SQL。确认卡、回复、错误信息都只展示业务说明、用法、样例结果和作用域。
 3. SQL 中会变化的业务输入必须参数化；例如“最近 7 天”应录为整数参数 \`days\`，默认 7，并设置合理 min/max。参数只能替换值，不能让用户提供 SQL 片段、表名、列名或任意字符串。
-4. 命令文件只写到当前工作目录的 \`.botmux/commands/<命令名>.yaml\`。命令属于当前角色/目录，不跨目录查找。
-5. 安装或覆盖前必须用 \`botmux ask buttons\` 展示并确认。选项为：确认安装、改名、取消。卡片展示：命令名、位置参数用法、默认值、业务说明、刚才的样例结果、当前目录/角色；不展示 SQL。
-6. 用户选“改名”时让用户给出新名称，然后重新展示确认卡。选“取消”不得写文件。
-7. 覆盖同名命令时必须在确认卡明确写“将覆盖已有命令”。
+4. 草稿只写到当前工作目录的 \`.botmux/frozen-command-drafts/<命令名>.yaml\`；**不要直接写** \`.botmux/commands/\`。命令属于当前角色/目录，不跨目录查找。
+5. 创建或修改只调用一次 \`botmux freeze apply\`，由宿主展示专用确认卡。用户只需点一次“确认创建/确认更新”；不要再让用户手工发送 \`/freeze approve\` 或 \`/freeze confirm\`，也不要叠加 \`botmux ask buttons\` 做第二次确认。
+6. 用户取消或确认过期时，宿主不会改动当前生效版本。修改场景下旧版本必须一直可用到确认成功。
+7. 覆盖同名命令时，专用确认卡必须明确展示“更新”以及旧/新定义 hash 摘要。
 8. 身份字段不得写入 SQL 模板；调用者身份由 BotMux Gateway metadata 注入。
 
 ## YAML 格式
@@ -242,11 +242,11 @@ onError: fallback_llm
 1. 从结构化工具记录提取最近一次成功的 validate/run SQL 原文、datasource 和样例结果。
 2. 将常量中真正需要用户每次调整的值替换为 \`{{param}}\`；固定业务口径（例如国家=泰国）保持常量。
 3. 明确参数类型、顺序、默认值和上下界；确保 SQL 显式有 LIMIT/分区范围。
-4. 检查当前目录是否已有同名 YAML。
-5. 用 \`botmux ask buttons\` 发确认卡并等待选择；卡片只放业务可读信息和样例结果。
-6. 确认后原子写入 YAML；写完重新读取并核对 name、参数和 SQL 原文字节。不要执行查询作为安装副作用。
-7. 让同一真人发送 \`/freeze approve /<命令> --reason 安装或更新原因\`，再按宿主返回的一次性确认码发送 \`/freeze confirm <确认码>\`。带 \`status: active\` 的新定义在宿主批准并记录 spec hash 前会 fail-closed。
-8. 宿主确认批准后回复：\`已安装，试试 /<命令> <示例参数>\`。
+4. 检查当前目录是否已有同名已生效命令，用于区分创建和更新；不要覆盖它。
+5. 将候选 YAML 写到 \`.botmux/frozen-command-drafts/<命令名>.yaml\`，重新读取并核对 name、参数和 SQL 原文字节。不要执行查询作为安装副作用。
+6. 调用 \`botmux freeze apply /<命令> --file ".botmux/frozen-command-drafts/<命令名>.yaml" --reason "<安装或更新原因>"\`。宿主会冻结候选字节、定义 hash、目标 Bot、当前工作目录、真人身份和当前 revision，并展示一次性确认卡。
+7. 工具返回 \`awaiting_input\` 只表示确认卡已发送。此时停止操作，提示用户在卡片上确认；不要代替用户点击，也不要再发送任何 approve/confirm 命令。草稿可在卡片成功发出后清理，清理草稿不影响宿主已冻结的候选内容。
+8. 用户点击确认后，宿主原子发布候选版本并写审计；点击取消或超时则不改动当前生效版本。
 
 管理操作由宿主直接处理：
 
@@ -262,14 +262,22 @@ onError: fallback_llm
 
 该命令只向宿主提交候选意图。宿主会重新解析命令名和参数，并给原消息真人发送查询确认卡；在真人点击前不会调用 Data MCP。工具返回 \`awaiting_input\` 只表示卡片已发出，绝不表示查询已执行或成功。不要模糊猜测命令名，不要代替用户确认，也不要用 \`botmux ask\` 绕过专用确认卡。
 
-P0a 不提供新增、覆盖、废弃、恢复、revoke 或 purge 的自然语言接口；这些操作仍使用下方斜杠管理命令。
+创建、修改、废弃的自然语言入口：
+
+- 创建/修改按上面的草稿流程调用 \`botmux freeze apply\`。
+- 用户明确要求废弃唯一、精确命名的命令时，调用 \`botmux freeze rm /<命令> --reason "<原因>" [--replacement /<替代命令>]\`，然后让用户在专用卡片上确认。
+- 恢复与彻底撤销分别调用 \`botmux freeze restore\` / \`botmux freeze purge\`，同样只由用户点击一次专用卡片。
+- 这些工具只提交候选变更；返回 \`awaiting_input\` 不代表变更已经生效。
+
+下列斜杠命令只保留给管理员排障/兼容，不作为业务人员主流程：
 
 - \`/freeze list\`：列出当前目录命令与用法。
 - \`/freeze list --all\`：同时列出已废弃/撤销的命令。
-- \`/freeze approve /<命令> --reason <原因>\`：批准新装或覆盖后的精确 spec hash；仍需同一真人二次确认。
-- \`/freeze rm /<命令> --reason <原因> [--replacement /<替代命令>]\`：发起废弃；宿主返回一次性确认码，必须由同一真人在十分钟内发送 \`/freeze confirm <确认码>\`。废弃只写 tombstone，不直接删除，因此后续同名调用会明确拒绝且不会落入模型。
-- \`/freeze restore /<命令> --reason <原因>\`：发起恢复；仍需同一真人二次确认，并生成新 revision，不能复用旧确认。
-- \`/freeze purge /<命令> --reason <原因>\`：对已废弃命令发起不可逆撤销；确认后先提交 revoked 审计再删除 tombstone。删除后同名调用仍由账本 fail-closed，不回退模型。
+- \`/freeze approve /<命令> --reason <原因>\`：兼容已直接写入 live 目录的旧流程，宿主改为返回一次性确认卡。
+- \`/freeze rm /<命令> --reason <原因> [--replacement /<替代命令>]\`：发起废弃并返回一次性确认卡。废弃只写 tombstone，不直接删除，因此后续同名调用会明确拒绝且不会落入模型。
+- \`/freeze restore /<命令> --reason <原因>\`：发起恢复并返回一次性确认卡，确认后生成新 revision。
+- \`/freeze purge /<命令> --reason <原因>\`：对已废弃命令发起不可逆撤销；确认后先提交 revoked 审计再删除 tombstone。
+- \`/freeze confirm <确认码>\`：仅供管理员排障旧卡，不向业务人员展示确认码。
 - 修改口径：重新跑通查询，再按本流程固化并覆盖旧文件。
 - 定时执行：让真人在飞书里直接发送 \`/schedule <规则>，执行 /<命令> [参数]\`。不要代替用户执行 \`botmux schedule add\`；后者不会记录创建人的可信 union_id，Data MCP 会按 fail-closed 拒绝。
 `;

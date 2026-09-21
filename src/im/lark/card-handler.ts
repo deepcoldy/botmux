@@ -1499,7 +1499,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   }
 
   if (
-    (value?.action === 'frozen_command_run_confirm' || value?.action === 'frozen_command_run_cancel')
+    (value?.action === 'frozen_command_run_confirm'
+      || value?.action === 'frozen_command_run_cancel'
+      || value?.action === 'frozen_command_lifecycle_confirm'
+      || value?.action === 'frozen_command_lifecycle_cancel')
     && larkAppId
   ) {
     if (!deps.frozenCommandCardAction) {

@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import {
   buildFrozenCommandActionStatusCard,
   buildFrozenCommandCenterCard,
+  buildFrozenCommandLifecyclePreviewCard,
+  buildFrozenCommandLifecycleStatusCard,
   buildFrozenCommandPreviewCard,
 } from '../src/im/lark/frozen-command-card.js';
 import type { FrozenCommandActionRecord } from '../src/services/frozen-command-action.js';
@@ -113,5 +115,55 @@ describe('Frozen Command business cards', () => {
       body: { elements: [{ text: { content: expect.stringContaining('查询未完成') } }] },
     });
     expect(JSON.stringify(rendered)).not.toContain('data_mcp_not_enabled');
+  });
+
+  it('renders a one-click lifecycle card with only an opaque token in callbacks', () => {
+    const parsed = JSON.parse(buildFrozenCommandLifecyclePreviewCard({
+      transition: {
+        token: 'opaque-token',
+        expiresAt: '2026-09-21T12:00:00.000Z',
+        command: '日报',
+        action: 'approve',
+        reason: '更新经营口径',
+        specHash: 'b'.repeat(64),
+        previousSpecHash: 'a'.repeat(64),
+        expectedRevisionId: 'revision-old',
+      },
+      workingDirLabel: 'finance',
+    })) as any;
+    expect(parsed.header).toMatchObject({ template: 'orange', title: { content: '确认更新固化命令' } });
+    expect(JSON.stringify(parsed)).toContain('aaaaaaaaaaaa');
+    expect(JSON.stringify(parsed)).toContain('bbbbbbbbbbbb');
+    const buttons = parsed.body.elements[1].columns.map((column: any) => column.elements[0]);
+    expect(buttons.map((button: any) => button.behaviors[0].value)).toEqual([
+      { action: 'frozen_command_lifecycle_confirm', transition_token: 'opaque-token' },
+      { action: 'frozen_command_lifecycle_cancel', transition_token: 'opaque-token' },
+    ]);
+    const values = JSON.stringify(buttons.map((button: any) => button.behaviors[0].value));
+    expect(values).not.toContain('日报');
+    expect(values).not.toContain('finance');
+    expect(values).not.toContain('revision-old');
+  });
+
+  it('uses a danger card for retirement and freezes terminal lifecycle cards', () => {
+    const parsed = JSON.parse(buildFrozenCommandLifecyclePreviewCard({
+      transition: {
+        token: 'retire-token',
+        expiresAt: '2026-09-21T12:00:00.000Z',
+        command: '旧日报',
+        action: 'retire',
+        reason: '口径迁移',
+        replacement: '/新日报',
+      },
+      workingDirLabel: 'finance',
+    })) as any;
+    expect(parsed.header.template).toBe('red');
+    expect(parsed.body.elements[1].columns[0].elements[0].type).toBe('danger');
+    expect(buildFrozenCommandLifecycleStatusCard({
+      command: '旧日报', action: 'retire', status: 'confirmed',
+    })).toMatchObject({ header: { template: 'green' } });
+    expect(buildFrozenCommandLifecycleStatusCard({
+      command: '旧日报', action: 'retire', status: 'cancelled',
+    })).toMatchObject({ header: { template: 'grey' } });
   });
 });

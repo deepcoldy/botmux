@@ -414,6 +414,31 @@ export function loadFrozenCommandSnapshot(input: { workingDir: string; command: 
   return { filePath, realpath, raw, definition: parseDefinition(raw, command) };
 }
 
+/** Parse a not-yet-installed definition for the host-owned lifecycle flow.
+ *
+ * The candidate is deliberately validated without writing it to the live
+ * command directory. This lets create/update present one authoritative card
+ * and keeps the currently approved command usable until the human confirms.
+ */
+export function parseFrozenCommandCandidate(input: {
+  workingDir: string;
+  command: string;
+  raw: string;
+}): FrozenCommandSnapshot {
+  const command = normalizeFrozenCommandName(input.command);
+  if (!command) throw new FrozenCommandError('invalid_command_name', `非法指令名：${input.command}`);
+  if (Buffer.byteLength(input.raw, 'utf8') > 512 * 1024) {
+    throw new FrozenCommandError('definition_file_invalid', '指令定义必须小于 512 KiB');
+  }
+  const filePath = frozenCommandFilePath(input.workingDir, command);
+  return {
+    filePath,
+    realpath: resolve(filePath),
+    raw: input.raw,
+    definition: parseDefinition(input.raw, command),
+  };
+}
+
 export function lookupFrozenCommand(input: { workingDir: string; command: string }): FrozenCommandLookup {
   const command = normalizeFrozenCommandName(input.command) ?? input.command.replace(/^\//, '');
   if (!normalizeFrozenCommandName(command)) return { kind: 'missing', command };

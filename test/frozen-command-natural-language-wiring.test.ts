@@ -37,11 +37,17 @@ describe('Frozen Command natural-language P0a wiring', () => {
     expect(skill).toContain('绝不表示查询已执行或成功');
   });
 
-  it('does not expose lifecycle mutation verbs through the new CLI command', () => {
+  it('routes lifecycle candidates through the same exact-turn host boundary and one-click card', () => {
     const command = cli.slice(cli.indexOf('async function cmdFreeze'), cli.indexOf('async function cmdAsk'));
-    expect(command).toContain("sub !== 'list' && sub !== 'run'");
-    expect(command).not.toContain("'retire'");
-    expect(command).not.toContain("'purge'");
-    expect(command).not.toContain("'restore'");
+    expect(command).toContain("sub === 'apply'");
+    expect(command).toContain("? 'approve'");
+    expect(command).toContain("? 'retire'");
+    expect(command).toContain("? 'restore'");
+    expect(command).toContain("? 'revoke'");
+    expect(command).toContain('definitionYaml');
+    expect(skill).toContain('不要再让用户手工发送');
+    expect(skill).toContain('botmux freeze apply');
+    expect(skill).toContain('botmux freeze rm');
+    expect(skill).toContain('点击取消或超时则不改动当前生效版本');
   });
 });

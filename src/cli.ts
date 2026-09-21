@@ -13291,8 +13291,17 @@ function frozenRawArgs(parts: string[]): string {
 
 async function cmdFreeze(rest: string[]): Promise<void> {
   const sub = rest[0] ?? '';
-  if (sub !== 'list' && sub !== 'run') {
-    console.error('用法: botmux freeze list | botmux freeze run /<命令> [参数...]');
+  const lifecycleOperation = sub === 'apply'
+    ? 'approve'
+    : sub === 'rm'
+      ? 'retire'
+      : sub === 'restore'
+        ? 'restore'
+        : sub === 'purge'
+          ? 'revoke'
+          : undefined;
+  if (sub !== 'list' && sub !== 'run' && !lifecycleOperation) {
+    console.error('用法: botmux freeze list | run /<命令> [参数...] | apply /<命令> --file <草稿> --reason <原因> | rm|restore|purge /<命令> --reason <原因>');
     process.exitCode = 2;
     return;
   }
@@ -13308,7 +13317,7 @@ async function cmdFreeze(rest: string[]): Promise<void> {
     process.exitCode = 2;
     return;
   }
-  if (sub === 'run' && !rest[1]) {
+  if ((sub === 'run' || lifecycleOperation) && !rest[1]) {
     console.error('用法: botmux freeze run /<命令> [参数...]');
     process.exitCode = 2;
     return;
@@ -13337,11 +13346,49 @@ async function cmdFreeze(rest: string[]): Promise<void> {
     process.env.BOTMUX_ORIGIN_CHANNEL_ID,
   )?.capability;
   try {
+    let lifecycleFields: Record<string, unknown> = {};
+    if (lifecycleOperation) {
+      const flagValue = (flag: string): string | undefined => {
+        const index = rest.indexOf(flag);
+        if (index < 0) return undefined;
+        const values: string[] = [];
+        for (let cursor = index + 1; cursor < rest.length && !rest[cursor]!.startsWith('--'); cursor += 1) {
+          values.push(rest[cursor]!);
+        }
+        return values.join(' ').trim() || undefined;
+      };
+      const reason = flagValue('--reason');
+      const replacement = flagValue('--replacement');
+      const definitionFile = flagValue('--file');
+      if (!reason || (lifecycleOperation === 'approve' && !definitionFile)) {
+        throw new Error(lifecycleOperation === 'approve'
+          ? 'botmux freeze apply: 必须提供 --file <草稿> 和 --reason <原因>'
+          : `botmux freeze ${sub}: 必须提供 --reason <原因>`);
+      }
+      if (lifecycleOperation !== 'retire' && replacement) {
+        throw new Error('--replacement 仅可用于 rm');
+      }
+      let definitionYaml: string | undefined;
+      if (definitionFile) {
+        const stat = statSync(definitionFile);
+        if (!stat.isFile() || stat.size > 512 * 1024) {
+          throw new Error('固化命令草稿必须是小于 512 KiB 的普通文件');
+        }
+        definitionYaml = readFileSync(definitionFile, 'utf8');
+      }
+      lifecycleFields = {
+        command: rest[1],
+        reason,
+        ...(replacement ? { replacement } : {}),
+        ...(definitionYaml !== undefined ? { definitionYaml } : {}),
+      };
+    }
     const result = await postFrozenCommandIntent({
       sessionId,
       larkAppId,
-      operation: sub,
+      operation: lifecycleOperation ?? sub,
       ...(sub === 'run' ? { command: rest[1], rawArgs: frozenRawArgs(rest.slice(2)) } : {}),
+      ...lifecycleFields,
       originTurnId,
       ...(originDispatchAttempt !== undefined
         ? { originDispatchAttempt }

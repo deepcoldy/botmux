@@ -363,7 +363,14 @@ async function postIntent(ds: any, rawArgs = '11') {
 
 async function postHostIntent(
   ds: any,
-  input: { operation?: 'list' | 'run'; rawArgs?: string; turnId?: string } = {},
+  input: {
+    operation?: 'list' | 'run' | 'approve' | 'retire' | 'restore' | 'revoke';
+    rawArgs?: string;
+    turnId?: string;
+    reason?: string;
+    replacement?: string;
+    definitionYaml?: string;
+  } = {},
 ) {
   const operation = input.operation ?? 'run';
   const body = {
@@ -372,7 +379,14 @@ async function postHostIntent(
     operation,
     ...(operation === 'run'
       ? { command: COMMAND, rawArgs: input.rawArgs ?? '11' }
-      : {}),
+      : operation === 'list'
+        ? {}
+        : {
+            command: COMMAND,
+            reason: input.reason ?? '宿主状态变更测试',
+            ...(input.replacement ? { replacement: input.replacement } : {}),
+            ...(input.definitionYaml ? { definitionYaml: input.definitionYaml } : {}),
+          }),
     originTurnId: input.turnId ?? ds.managedTurnOrigin.turnId,
   };
   const req = Readable.from([JSON.stringify(body)]) as unknown as IncomingMessage;
@@ -409,8 +423,15 @@ function latestPreviewAction(): { action: string; transition_id: string; nonce: 
   return button.behaviors.find((behavior: any) => behavior.type === 'callback').value;
 }
 
+function latestLifecycleAction(): { action: string; transition_token: string } {
+  const parsed = JSON.parse(mocks.cardBodies.at(-1)!) as any;
+  const row = parsed.body.elements.find((element: any) => element.tag === 'column_set');
+  const button = row.columns[0].elements.find((element: any) => element.tag === 'button');
+  return button.behaviors.find((behavior: any) => behavior.type === 'callback').value;
+}
+
 function callbackData(
-  value: { action: string; transition_id: string; nonce: string },
+  value: { action: string; transition_id?: string; nonce?: string; transition_token?: string },
   operator: { open_id?: string; union_id?: string } = {
     open_id: ACTOR_OPEN_ID,
     union_id: ACTOR_UNION_ID,
@@ -492,6 +513,32 @@ afterEach(() => {
 });
 
 describe('Frozen Command host-owned route → callback → Data MCP flow', () => {
+  it('parses lifecycle intent with an exact operation-specific shape', () => {
+    const base = {
+      sessionId: 'sess',
+      larkAppId: APP,
+      originTurnId: 'om_turn',
+    };
+    expect(modules.daemon.__testOnly_parseFrozenCommandIntentBody({
+      ...base,
+      operation: 'approve',
+      command: COMMAND,
+      reason: '创建命令',
+      definitionYaml: YAML,
+    })).toMatchObject({ operation: 'approve', command: COMMAND });
+    expect(modules.daemon.__testOnly_parseFrozenCommandIntentBody({
+      ...base,
+      operation: 'approve',
+      command: COMMAND,
+      reason: '缺少候选内容',
+    })).toBeUndefined();
+    expect(modules.daemon.__testOnly_parseFrozenCommandIntentBody({
+      ...base,
+      operation: 'list',
+      definitionYaml: YAML,
+    })).toBeUndefined();
+  });
+
   it.each([
     ['top-level', 'top-level'],
     ['structuredContent', 'structured'],
@@ -602,6 +649,65 @@ unexpectedInternalField: true
     expect(rendered).toContain('工作目录');
     expect(mocks.validateCalls).toBe(0);
     expect(mocks.runCalls).toBe(0);
+  });
+
+  it('stages a model-proposed update and publishes it only after the same human clicks once', async () => {
+    const candidate = YAML.replace('SELECT {{value}} * 2', 'SELECT {{value}} * 3');
+    const file = join(root, '.botmux', 'commands', '宿主闭环.yaml');
+    const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '更新固化命令' });
+    const response = await postHostIntent(ds, {
+      operation: 'approve',
+      reason: '更新宿主闭环口径',
+      definitionYaml: candidate,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.payload).toMatchObject({ status: 'awaiting_input', operation: 'approve' });
+    expect(readFileSync(file, 'utf8')).toBe(YAML);
+    expect(mocks.cardBodies.at(-1)).toContain('确认更新固化命令');
+    expect(mocks.cardBodies.at(-1)).not.toContain('SELECT');
+    const value = latestLifecycleAction();
+
+    const denied = await modules.daemon.__testOnly_handleFrozenCommandCardAction(
+      callbackData(value, { open_id: 'ou_other', union_id: 'on_other' }), APP,
+    );
+    expect(denied).toMatchObject({ toast: { type: 'error' } });
+    expect(readFileSync(file, 'utf8')).toBe(YAML);
+
+    const confirmed = await modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP);
+    expect(confirmed).toMatchObject({ card: { data: { header: { template: 'green' } } } });
+    expect(readFileSync(file, 'utf8')).toBe(candidate);
+    expect(modules.lifecycle.evaluateFrozenCommandLifecycle({
+      dataDir,
+      targetBotId: APP,
+      workingDir: root,
+      command: COMMAND,
+    }).kind).toBe('active');
+  });
+
+  it('cancels a natural-language retirement without changing the active command', async () => {
+    const file = join(root, '.botmux', 'commands', '宿主闭环.yaml');
+    const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '废弃固化命令' });
+    const response = await postHostIntent(ds, {
+      operation: 'retire',
+      reason: '改用新口径',
+      replacement: '/新宿主闭环',
+    });
+    expect(response.statusCode).toBe(200);
+    expect(mocks.cardBodies.at(-1)).toContain('确认废弃固化命令');
+    const parsed = JSON.parse(mocks.cardBodies.at(-1)!) as any;
+    const row = parsed.body.elements.find((element: any) => element.tag === 'column_set');
+    const cancel = row.columns[1].elements[0].behaviors[0].value;
+
+    const cancelled = await modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(cancel), APP);
+    expect(cancelled).toMatchObject({ card: { data: { header: { template: 'grey' } } } });
+    expect(readFileSync(file, 'utf8')).toBe(YAML);
+    expect(modules.lifecycle.evaluateFrozenCommandLifecycle({
+      dataDir,
+      targetBotId: APP,
+      workingDir: root,
+      command: COMMAND,
+    }).kind).toBe('active');
   });
 
   it('keeps missing-capability callers untrusted unless they crossed host HMAC', async () => {

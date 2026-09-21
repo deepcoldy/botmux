@@ -22,6 +22,16 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 let tmpRoot = '';
 
+function lifecycleCardToken(content: string): string | undefined {
+  try {
+    const parsed = JSON.parse(content) as any;
+    const row = parsed.body?.elements?.find((element: any) => element.tag === 'column_set');
+    return row?.columns?.[0]?.elements?.[0]?.behaviors?.[0]?.value?.transition_token;
+  } catch {
+    return undefined;
+  }
+}
+
 function tempDir(name: string): string {
   const dir = join(tmpRoot, name);
   mkdirSync(dir, { recursive: true });
@@ -104,7 +114,7 @@ onError: fallback_llm
       cmd: '/freeze',
       commandContent: '/freeze rm /生命周期测试 --reason 口径迁移 --replacement /新命令',
     });
-    const token = /\/freeze confirm ([A-Za-z0-9_-]+)/u.exec(replies.at(-1)!)?.[1];
+    const token = lifecycleCardToken(replies.at(-1)!);
     expect(token).toBeTruthy();
     await daemon.__testOnly_routeFrozenCommand({
       ...base,
@@ -175,7 +185,7 @@ onError: fail
       cmd: '/freeze', commandContent: '/freeze rm /权限测试 --reason 合法废弃',
       senderOpenId: 'ou_owner', senderIsBot: false,
     });
-    const token = /\/freeze confirm ([A-Za-z0-9_-]+)/u.exec(replies.at(-1)!)?.[1];
+    const token = lifecycleCardToken(replies.at(-1)!);
     expect(token).toBeTruthy();
 
     // Authorization is checked again at confirmation time. A once-authorized
