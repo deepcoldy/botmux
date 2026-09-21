@@ -1,10 +1,11 @@
 #!/usr/bin/env tsx
 /**
- * 包装 vitest e2e 运行：为每一次 run 生成独立 run-id，设置 MIDSCENE_RUN_DIR
- * 让 midscene 把 report/log/cache/screenshots 全部写进
- * midscene_run/runs/<run-id>/，方便 dashboard 按批次聚合。
+ * Run the migrated Feishu scenarios with Midscene Test. Each invocation gets
+ * an isolated result directory so the report dashboard can group historical
+ * runs without mixing logs, screenshots, or HTML reports.
  */
 import { spawn } from 'node:child_process';
+import { sweepOrphanSchedTasks } from '../test/e2e-browser/schedule-cleanup.js';
 
 const ts = new Date()
   .toISOString()
@@ -14,14 +15,23 @@ const ts = new Date()
 
 const runDir = `midscene_run/runs/${ts}`;
 process.env.MIDSCENE_RUN_DIR = runDir;
-// 让 vitest globalSetup 识别当前是 e2e 模式，触发遗留 schedule 任务清扫。
-process.env.BOTMUX_E2E = '1';
 
 console.log(`[run-e2e] MIDSCENE_RUN_DIR=${runDir}`);
 
+try {
+  const removed = await sweepOrphanSchedTasks(1);
+  if (removed.length > 0) {
+    console.warn(
+      `[run-e2e] swept ${removed.length} orphan schedule task(s): ${removed.join(', ')}`,
+    );
+  }
+} catch (error) {
+  console.warn(`[run-e2e] schedule sweep skipped: ${(error as Error).message}`);
+}
+
 const child = spawn(
-  'vitest',
-  ['run', 'test/e2e-browser/', ...process.argv.slice(2)],
+  'midscene-test',
+  ['test/e2e-browser', '--result-dir', runDir, ...process.argv.slice(2)],
   { stdio: 'inherit', env: process.env, shell: false }
 );
 

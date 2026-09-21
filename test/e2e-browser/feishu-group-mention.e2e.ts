@@ -5,7 +5,7 @@
  *  1. No @mention → no bot responds at all
  *  2. @mention a specific bot → only that bot responds
  */
-import { describe, it, beforeAll, afterAll } from 'vitest';
+import { describe, it, beforeAll, afterAll } from './midscene-suite.js';
 import type { Browser, Page, BrowserContext } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
 import { existsSync } from 'node:fs';

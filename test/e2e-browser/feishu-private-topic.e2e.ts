@@ -7,7 +7,7 @@
  *
  * This serves as the control test for feishu-group-topic.e2e.ts.
  */
-import { describe, it, beforeAll, afterAll } from 'vitest';
+import { describe, it, beforeAll, afterAll } from './midscene-suite.js';
 import type { Browser, Page, BrowserContext } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
 import { existsSync } from 'node:fs';
@@ -54,7 +54,7 @@ describe('private chat topic reply mode', () => {
     await browser?.close();
   });
 
-  it('bot uses topic replies (话题回复) in private chat', async () => {
+  it('bot uses topic replies in a private chat', async () => {
     const msg = testMessage('private-topic');
     await sendMessage(agent, msg);
 

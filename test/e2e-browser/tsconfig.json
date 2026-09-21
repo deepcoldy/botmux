@@ -8,8 +8,7 @@
     "sourceMap": false
   },
   "include": [
-    "midscene.config.ts",
-    "../helpers/ts-runner.ts"
+    "*.ts"
   ],
   "exclude": [
     "../../node_modules",
