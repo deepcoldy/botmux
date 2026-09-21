@@ -28,7 +28,7 @@ describe('public conversation contract', () => {
     const result = toInvocation(parseChatRequest({ ...chat, max_completion_tokens }), { bot: 'fixture', model: 'native', deadlineMs: 5000 }, 'r1');
     expect(result.maxOutputTokens).toBe(max_completion_tokens);
   });
-  it.each([0, -1, 1.5, 128_001, '4096', 'null', false, {}, []])('rejects invalid output limits: %j', max_completion_tokens => {
+  it.each([[0], [-1], [1.5], [128_001], ['4096'], ['null'], [false], [{}], [[]]])('rejects invalid output limits: %j', max_completion_tokens => {
     expect(() => parseChatRequest({ ...chat, max_completion_tokens })).toThrow('unsupported_or_invalid_parameter');
   });
   it('preserves message order, roles and optional tool properties without normalizing the schema', () => {
