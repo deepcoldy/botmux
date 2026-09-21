@@ -2253,6 +2253,7 @@ describe('ensureAppEventSubscriptions — startup repair without setup or publis
   function fixture(options: {
     appEvents?: string[];
     eventMode?: number | null;
+    readbackEventMode?: number | null;
     updateNoop?: boolean;
     failRead?: boolean;
     failUpdate?: boolean;
@@ -2277,7 +2278,9 @@ describe('ensureAppEventSubscriptions — startup repair without setup or publis
           return Response.json({ code: 1, msg: 'event read rejected' });
         }
         return Response.json({ code: 0, data: {
-          eventMode: options.eventMode === undefined ? LONG_CONNECTION_EVENT_MODE : options.eventMode,
+          eventMode: readCount > 1 && options.readbackEventMode !== undefined
+            ? options.readbackEventMode
+            : options.eventMode === undefined ? LONG_CONNECTION_EVENT_MODE : options.eventMode,
           appEvents: [...appEvents],
           userEvents: ['vc.meeting.participant_meeting_joined_v1'],
         } });
@@ -2300,7 +2303,7 @@ describe('ensureAppEventSubscriptions — startup repair without setup or publis
 
   it('adds only requested missing app events and never reads or commits an existing draft', async () => {
     const { run, calls, appEvents } = fixture();
-    expect(await run()).toMatchObject({ ok: true, missingEvents: [], eventModeReady: true });
+    expect(await run()).toMatchObject({ ok: true, missingEvents: [], eventModeReady: true, updateSubmitted: true });
     expect(calls).toEqual([
       { path: eventPath, body: { needEventDetail: true } },
       { path: updatePath, body: {
@@ -2318,29 +2321,40 @@ describe('ensureAppEventSubscriptions — startup repair without setup or publis
 
   it('does not write when the requested events are already subscribed', async () => {
     const { run, calls } = fixture({ appEvents: [receiveEvent, editedEvent] });
-    expect(await run()).toMatchObject({ ok: true, missingEvents: [], eventModeReady: true });
+    expect(await run()).toMatchObject({ ok: true, missingEvents: [], eventModeReady: true, updateSubmitted: false });
     expect(calls.map(call => call.path)).toEqual([eventPath]);
   });
 
-  it.each([0, null])('does not switch or write when the current event mode is %s', async (eventMode) => {
-    const { run, calls } = fixture({ eventMode });
-    expect(await run()).toMatchObject({ ok: true, missingEvents: [editedEvent], eventModeReady: false });
+  it.each([
+    { eventMode: 0, appEvents: [receiveEvent], missingEvents: [editedEvent] },
+    { eventMode: null, appEvents: [receiveEvent], missingEvents: [editedEvent] },
+    { eventMode: 0, appEvents: [receiveEvent, editedEvent], missingEvents: [] },
+    { eventMode: null, appEvents: [receiveEvent, editedEvent], missingEvents: [] },
+  ])('does not switch or write when the current event mode is $eventMode and missing events are $missingEvents', async ({ eventMode, appEvents, missingEvents }) => {
+    const { run, calls } = fixture({ eventMode, appEvents });
+    expect(await run()).toMatchObject({ ok: true, missingEvents, eventModeReady: false, updateSubmitted: false });
     expect(calls.map(call => call.path)).toEqual([eventPath]);
   });
 
   it('reports the actual missing events when the update response succeeds without persisting', async () => {
     const { run, calls } = fixture({ updateNoop: true });
-    expect(await run()).toMatchObject({ ok: true, missingEvents: [editedEvent], eventModeReady: true });
+    expect(await run()).toMatchObject({ ok: true, missingEvents: [editedEvent], eventModeReady: true, updateSubmitted: true });
+    expect(calls.map(call => call.path)).toEqual([eventPath, updatePath, eventPath]);
+  });
+
+  it('reports a changed event mode on readback without losing the successful update submission', async () => {
+    const { run, calls } = fixture({ readbackEventMode: 0 });
+    expect(await run()).toMatchObject({ ok: true, missingEvents: [], eventModeReady: false, updateSubmitted: true });
     expect(calls.map(call => call.path)).toEqual([eventPath, updatePath, eventPath]);
   });
 
   it.each([
-    { failRead: true, expectedCalls: [eventPath], error: 'event read rejected' },
-    { failUpdate: true, expectedCalls: [eventPath, updatePath], error: 'event update rejected' },
-    { failReadback: true, expectedCalls: [eventPath, updatePath, eventPath], error: 'event read rejected' },
-  ])('returns an explicit failure after a rejected API call: $error', async ({ expectedCalls, error, ...options }) => {
+    { failRead: true, expectedCalls: [eventPath], error: 'event read rejected', updateSubmitted: false },
+    { failUpdate: true, expectedCalls: [eventPath, updatePath], error: 'event update rejected', updateSubmitted: false },
+    { failReadback: true, expectedCalls: [eventPath, updatePath, eventPath], error: 'event read rejected', updateSubmitted: true },
+  ])('returns an explicit failure after a rejected API call: $error', async ({ expectedCalls, error, updateSubmitted, ...options }) => {
     const { run, calls } = fixture(options);
-    expect(await run()).toMatchObject({ ok: false, reason: 'api_error', message: expect.stringContaining(error) });
+    expect(await run()).toMatchObject({ ok: false, reason: 'api_error', message: expect.stringContaining(error), updateSubmitted });
     expect(calls.map(call => call.path)).toEqual(expectedCalls);
   });
 
@@ -2350,7 +2364,7 @@ describe('ensureAppEventSubscriptions — startup repair without setup or publis
     expect(await ensureAppEventSubscriptions(appId, [editedEvent], {
       sessionFilePath: sessionFile,
       fetchImpl: fetchImpl as typeof fetch,
-    })).toMatchObject({ ok: false, reason: 'invalid_session' });
+    })).toMatchObject({ ok: false, reason: 'invalid_session', updateSubmitted: false });
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
@@ -2361,7 +2375,7 @@ describe('ensureAppEventSubscriptions — startup repair without setup or publis
     expect(await ensureAppEventSubscriptions(appId, [editedEvent], {
       sessionFilePath: sessionFile,
       fetchImpl: fetchImpl as typeof fetch,
-    })).toMatchObject({ ok: false, reason: 'invalid_session' });
+    })).toMatchObject({ ok: false, reason: 'invalid_session', updateSubmitted: false });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
     expect(String(fetchImpl.mock.calls[0]?.[0])).toBe('https://ask.feishu.cn/');
   });

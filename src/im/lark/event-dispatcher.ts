@@ -859,7 +859,7 @@ export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promis
 /**
  * Startup only adds the missing edit event over the cached Feishu web session.
  * Never run full setup here: it changes scopes and can publish unrelated drafts.
- * Readback must confirm both the subscription and existing long-connection mode.
+ * Readback checks configured events and mode, not the published version or delivery.
  * Failure only disables edit-to-@, so log without sending an admin DM per bot.
  */
 export async function ensureMessageUpdatedEventSubscribed(larkAppId: string): Promise<void> {
@@ -867,21 +867,33 @@ export async function ensureMessageUpdatedEventSubscribed(larkAppId: string): Pr
   if (normalizeBrand(bot.config.brand) !== 'feishu') return;
   try {
     const result = await ensureAppEventSubscriptions(larkAppId, [MESSAGE_UPDATED_EVENT]);
+    const updateStatus = result.updateSubmitted ? '更新请求已成功返回' : '无成功返回的更新请求';
     if (!result.ok) {
       logger.info(
-        `[${larkAppId}] im.message.updated_v1 订阅检查未完成（${result.reason}）：编辑消息补 @ 功能未确认；` +
-        `请检查开放平台登录态和事件订阅配置。`,
+        `[${larkAppId}] im.message.updated_v1 配置检查未完成（${result.reason}，${updateStatus}）：` +
+        `请检查开放平台登录态和事件订阅配置；发布生效及实际推送未验证。`,
       );
       return;
     }
     if (!result.eventModeReady || result.missingEvents.length > 0) {
       logger.info(
-        `[${larkAppId}] im.message.updated_v1 订阅回读未就绪（longConnection=${result.eventModeReady}, ` +
-        `missing=${result.missingEvents.join(',')}）：请在开放平台手动确认，不影响正常消息。`,
+        `[${larkAppId}] im.message.updated_v1 配置回读不完整（longConnection=${result.eventModeReady}, ` +
+        `missing=${result.missingEvents.join(',')}，${updateStatus}）：请在开放平台检查事件和长连接配置；` +
+        `发布生效及实际推送未验证，不影响正常消息。`,
       );
       return;
     }
-    logger.info(`[${larkAppId}] im.message.updated_v1 长连接订阅已确认`);
+    if (result.updateSubmitted) {
+      logger.info(
+        `[${larkAppId}] im.message.updated_v1 更新请求已成功返回，配置回读包含事件且为长连接；` +
+        `启动流程不会自动发布，请在开放平台检查并发布应用版本；发布生效及实际推送未验证。`,
+      );
+    } else {
+      logger.info(
+        `[${larkAppId}] im.message.updated_v1 已有配置包含事件且为长连接，本次未更新；` +
+        `发布生效及实际推送未验证，编辑补 @ 无响应时请检查已发布版本的事件订阅。`,
+      );
+    }
   } catch (err: any) {
     logger.debug(`[${larkAppId}] message-updated event subscription check errored: ${err?.message ?? err}`);
   }

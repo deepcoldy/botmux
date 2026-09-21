@@ -2463,6 +2463,11 @@ export type AppEventSubscriptionProbeResult =
   | { ok: true; missingEvents: string[]; eventModeReady: boolean; sessionFile?: string }
   | { ok: false; reason: string; message: string; sessionFile?: string };
 
+export type AppEventSubscriptionEnsureResult = AppEventSubscriptionProbeResult & {
+  /** Whether event/update returned success, not whether it persisted or was published. */
+  updateSubmitted: boolean;
+};
+
 export async function probeAppEventSubscriptions(
   appId: string,
   eventNames: readonly string[],
@@ -2500,28 +2505,30 @@ export async function probeAppEventSubscriptions(
  * Add only the requested missing app events using the cached Web session.
  * Startup repair must not switch transport modes or publish an existing draft:
  * the event subscription endpoint is the only write allowed here.
+ * Readback describes configuration only; it does not verify publication or delivery.
  */
 export async function ensureAppEventSubscriptions(
   appId: string,
   eventNames: readonly string[],
   options: Pick<FeishuWebSessionOptions, 'sessionFilePath' | 'fetchImpl'> = {},
-): Promise<AppEventSubscriptionProbeResult> {
+): Promise<AppEventSubscriptionEnsureResult> {
   const prepared = await prepareFeishuWebSession({
     ...options,
     disableQrLogin: true,
     disableBytedcliFallback: true,
   });
   if (!prepared.ok) {
-    return { ok: false, reason: prepared.reason, message: prepared.message, sessionFile: prepared.sessionFile };
+    return { ok: false, reason: prepared.reason, message: prepared.message, sessionFile: prepared.sessionFile, updateSubmitted: false };
   }
   const clientResult = await createOpenPlatformApiClient(prepared.cookies, { fetchImpl: options.fetchImpl });
   if (!clientResult.ok) {
-    return { ok: false, reason: clientResult.reason, message: clientResult.message, sessionFile: prepared.sessionFile };
+    return { ok: false, reason: clientResult.reason, message: clientResult.message, sessionFile: prepared.sessionFile, updateSubmitted: false };
   }
   const readEventState = async () => extractOpenPlatformEventState(
     await clientResult.client.postJson(`/developers/v1/event/${appId}`, { needEventDetail: true }),
   );
   const missingEvents = (state: OpenPlatformEventState) => eventNames.filter(name => !state.events.includes(name));
+  let updateSubmitted = false;
   try {
     let eventState = await readEventState();
     const missing = missingEvents(eventState);
@@ -2530,7 +2537,8 @@ export async function ensureAppEventSubscriptions(
         `/developers/v1/event/update/${appId}`,
         buildEventSubscriptionPayload(appId, eventState.eventMode, missing, []),
       );
-      // A successful API response does not prove the subscription took effect.
+      updateSubmitted = true;
+      // A successful update may not persist; read back the configured events and mode.
       eventState = await readEventState();
     }
     return {
@@ -2538,9 +2546,10 @@ export async function ensureAppEventSubscriptions(
       missingEvents: missingEvents(eventState),
       eventModeReady: eventState.eventMode === LONG_CONNECTION_EVENT_MODE,
       sessionFile: prepared.sessionFile,
+      updateSubmitted,
     };
   } catch (err) {
-    return { ok: false, reason: 'api_error', message: `补齐事件订阅失败: ${safeErrorMessage(err)}`, sessionFile: prepared.sessionFile };
+    return { ok: false, reason: 'api_error', message: `补齐事件订阅失败: ${safeErrorMessage(err)}`, sessionFile: prepared.sessionFile, updateSubmitted };
   }
 }
 
