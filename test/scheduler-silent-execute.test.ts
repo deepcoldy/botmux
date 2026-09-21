@@ -30,6 +30,7 @@ import {
   confirmFrozenCommandTransition,
   prepareFrozenCommandTransition,
 } from '../src/services/frozen-command-lifecycle.js';
+import { logger } from '../src/utils/logger.js';
 
 // ── in-memory session store ──────────────────────────────────────────────
 const store = new Map<string, Session>();
@@ -424,8 +425,9 @@ describe('executeScheduledTask — silent thread fire', () => {
     }
   });
 
-  it('intercepts silent frozen schedules instead of passing the literal to a model', async () => {
+  it('suppresses a successful unconditional frozen-command result for a silent schedule', async () => {
     const fixture = installScheduledFrozenFixture(SCHEDULED_FROZEN_YAML);
+    const logSpy = vi.spyOn(logger, 'info');
     try {
       await executeScheduledTask(baseTask({
         prompt: '/泰国上账 30',
@@ -439,8 +441,69 @@ describe('executeScheduledTask — silent thread fire', () => {
 
       expect(forkWorkerMock).not.toHaveBeenCalled();
       expect(sendWorkerInputMock).not.toHaveBeenCalled();
-      expect(replyMessageMock).toHaveBeenCalledTimes(1);
-      expect(replyMessageMock.mock.calls[0]?.[2]).toBe('12');
+      expect(replyMessageMock).not.toHaveBeenCalled();
+      expect(sendMessageMock).not.toHaveBeenCalled();
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('"suppressed":"success_output"'));
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('"command":"/泰国上账"'));
+    } finally {
+      logSpy.mockRestore();
+      fixture.restore();
+    }
+  });
+
+  it('suppresses the normal branch of conditional output for a silent schedule', async () => {
+    const fixture = installScheduledFrozenFixture(`${SCHEDULED_FROZEN_YAML}
+output:
+  maxChars: 20000
+  when: "{{q.amount}} > 20"
+  handoff:
+    prompt: "金额异常，请分析"
+    data: "{{q.rows}}"
+    maxRows: 50
+  else:
+    text: "今日正常，合计 {{q.amount}}"
+`);
+    try {
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账 30', workingDir: fixture.root,
+        rootMessageId: ROOT, scope: 'thread', silent: true,
+        ownerOpenId: 'ou_test', ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(replyMessageMock).not.toHaveBeenCalled();
+      expect(sendMessageMock).not.toHaveBeenCalled();
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+      expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    } finally {
+      fixture.restore();
+    }
+  });
+
+  it('hands an abnormal conditional result to a session even when the schedule is silent', async () => {
+    const fixture = installScheduledFrozenFixture(`${SCHEDULED_FROZEN_YAML}
+output:
+  maxChars: 20000
+  when: "{{q.amount}} > 10"
+  handoff:
+    prompt: "金额异常，请分析"
+    data: "{{q.rows}}"
+    maxRows: 50
+  else:
+    text: "今日正常，合计 {{q.amount}}"
+`);
+    try {
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账 30', workingDir: fixture.root,
+        rootMessageId: ROOT, scope: 'thread', silent: true,
+        ownerOpenId: 'ou_test', ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+      expect(sendWorkerInputMock).not.toHaveBeenCalled();
+      expect(forkedCliInput()).toContain('金额异常，请分析');
+      expect(forkedCliInput()).toContain('"amount":12');
+      expect(forkedCliInput()).toContain('静默执行');
+      expect(replyMessageMock).not.toHaveBeenCalled();
     } finally {
       fixture.restore();
     }

@@ -4155,6 +4155,17 @@ export async function executeScheduledTask(
         });
         const output = resolveFrozenCommandScheduledOutput(definition, result);
         if (output.kind === 'deliver') {
+          if (silent) {
+            logger.info(`[scheduler] ${JSON.stringify({
+              event: 'frozen_command_output_suppressed',
+              task_id: task.id,
+              task_name: task.name,
+              command: `/${frozenInvocation[1]!}`,
+              suppressed: 'success_output',
+              reason: 'silent_schedule',
+            })}`);
+            return;
+          }
           await deliver(output.text);
           return;
         }
