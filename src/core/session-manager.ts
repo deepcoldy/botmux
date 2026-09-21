@@ -2234,7 +2234,7 @@ export async function restoreActiveSessions(
   // in this boot must never be mislabeled as interrupted by the old process.
   const interruptedReadonlyContinuationLeaseIds = new Map(active.flatMap(session => {
     const continuation = session.readonlyTaskContinuation;
-    return continuation?.status === 'active'
+    return continuation?.status === 'active' && continuation.startMode !== 'explicit'
       ? [[session.sessionId, continuation.leaseId] as const]
       : [];
   }));

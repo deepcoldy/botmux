@@ -594,6 +594,39 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     );
   });
 
+  it('keeps an explicit restored lease on the ordinary attachment path', async () => {
+    const s = makeActivePersistentSession('om_explicit_continuation_restart');
+    s.readonlyTaskContinuation = {
+      leaseId: 'readonly-explicit',
+      logicalTurnId: 'om_original',
+      currentTurnId: 'om_original',
+      currentWorkerGeneration: 7,
+      createdAt: Date.now() - 10_000,
+      expiresAt: Date.now() + 60_000,
+      maxContinuations: 6,
+      continuationsStarted: 0,
+      authorizationMode: 'inherited',
+      startMode: 'explicit',
+      trustedCaller: {
+        requestUserOpenId: 'ou_owner',
+        requestLarkAppId: 'app_test',
+        senderType: 'user',
+      },
+      status: 'active',
+    };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(markReadonlyTaskContinuationInterruptedByRestart).not.toHaveBeenCalled();
+    expect(ensureReadonlyTaskContinuationAttached).toHaveBeenCalledWith(
+      expect.objectContaining({ session: expect.objectContaining({ sessionId: s.sessionId }) }),
+    );
+  });
+
   it('finishes a durable prepared Mojo close without registering or re-cancelling', async () => {
     const s = makeActivePersistentSession('om_mojo_prepared_recovery');
     s.backendType = 'mojo';
