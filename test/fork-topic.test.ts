@@ -89,15 +89,18 @@ describe('fork topic presentation', () => {
     });
 
   it('plain-text fallback strips uploaded image placeholders by ordinal while keeping file text and failed placeholders', async () => {
-    // Inline file node makes taskRows bail out → plain-text fallback path.
+    // An inline file node (here on the first line) makes taskRows bail out →
+    // the plain-text fallback path. taskText is taken from the real renderer
+    // so `[文件 1: spec.pdf]` shares the first line and also exercises title
+    // compression (the widened title placeholder regex).
     const post = { content: [
-      [{ tag: 'text', text: '/fork 请分析这份资料' }],
-      [{ tag: 'file', file_key: 'fk1', file_name: 'spec.pdf' }],
+      [{ tag: 'text', text: '/fork 请分析这份资料' }, { tag: 'file', file_key: 'fk1', file_name: 'spec.pdf' }],
       [{ tag: 'img', image_key: 'ik1' }],
       [{ tag: 'img', image_key: 'ik2' }],
     ] };
     const msg = message(JSON.stringify(post));
-    const taskText = '请分析这份资料\n[文件 1: spec.pdf]\n[图片 1]\n[图片 2]';
+    const taskText = msg.content.replace(/^\/fork\s*/i, '').trim();
+    expect(taskText).toBe('请分析这份资料[文件 1: spec.pdf]\n[图片 1]\n[图片 2]');
     const io = deps();
     io.download.mockResolvedValue({ attachments: [
       { type: 'file' as const, name: 'spec.pdf', path: '/tmp/spec.pdf' },
@@ -108,9 +111,11 @@ describe('fork topic presentation', () => {
     const text = result.content.flatMap(row => row.filter(n => n.tag === 'text').map(n => n.text ?? '')).join('|');
     expect(text).not.toContain('[图片 1]');       // successful image placeholder removed
     expect(text).toContain('[图片 2]');           // failed image placeholder kept
-    expect(text).toContain('[文件 1: spec.pdf]'); // file placeholder is never stripped
+    expect(text).toContain('[文件 1: spec.pdf]'); // file placeholder is never stripped from the body
     expect(result.content.flat().filter(n => n.tag === 'img')).toEqual([{ tag: 'img', image_key: 'up1' }]);
     expect(result.attachments.map(a => a.name).sort()).toEqual(['ik1.jpg', 'spec.pdf']);
+    // Title compression must drop the suffixed file placeholder too (would
+    // survive the narrow /\[(?:图片|文件)\s*\d+\]/ regex).
     expect(result.title).toBe('请分析这份资料');
   });
 
