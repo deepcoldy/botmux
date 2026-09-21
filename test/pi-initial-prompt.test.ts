@@ -2,6 +2,9 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import { resolveBunExecutable, spawnSyncTsEval } from './helpers/ts-runner.js';
 import { shouldQueueInitialPrompt } from '../src/codex-rpc-lifecycle.js';
 import { createPiAdapter } from '../src/adapters/cli/pi.js';
 import {
@@ -86,7 +89,7 @@ describe('Pi initial prompt @file delivery', () => {
       expect(result.deferredInput?.content).toBe(PI_INITIAL_PROMPT_COMMAND);
       expect(result.deferredInput?.additionalArgs).toEqual([
         '--extension',
-        expect.stringMatching(/pi-initial-prompt-extension\.(?:js|ts)$/),
+        join(result.readonlyRoot!, 'pi-initial-prompt-extension.mjs'),
       ]);
       expect(result.deferredInput?.env).toEqual({
         [PI_INITIAL_PROMPT_FILE_ENV]: result.filePath,
@@ -99,7 +102,10 @@ describe('Pi initial prompt @file delivery', () => {
       });
       expect(adapterPrepared.initialPrompt).toMatch(/^@.+\.prompt\.md$/);
       expect(adapterPrepared.readonlyRoots).toEqual([dirname(adapterPrepared.cleanupPaths![0]!)]);
-      expect(adapterPrepared.cleanupPaths).toHaveLength(1);
+      expect(adapterPrepared.cleanupPaths).toEqual([
+        join(adapterPrepared.readonlyRoots![0], 'initial.prompt.md'),
+        join(adapterPrepared.readonlyRoots![0], 'pi-initial-prompt-extension.mjs'),
+      ]);
       expect(adapterPrepared.cleanupDirs).toEqual(adapterPrepared.readonlyRoots);
       expect(adapterPrepared.deferredInput?.content).toBe(PI_INITIAL_PROMPT_COMMAND);
 
@@ -165,6 +171,52 @@ describe('Pi initial prompt @file delivery', () => {
 });
 
 describe('Pi deferred initial prompt extension', () => {
+  it('loads and delivers from a minified standalone binary in a separate process', () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux pi compiled-'));
+    try {
+      const entry = join(dataDir, 'entry.ts');
+      const binary = join(dataDir, 'prepare-prompt');
+      const modulePath = fileURLToPath(new URL('../src/adapters/cli/pi-initial-prompt.ts', import.meta.url));
+      writeFileSync(entry, `
+        import { preparePiInitialPromptArg } from ${JSON.stringify(modulePath)};
+        console.log(JSON.stringify(preparePiInitialPromptArg({
+          prompt: 'hello\\n完整首条消息', sessionId: 'compiled', sessionDataDir: process.argv[2],
+        })));
+      `);
+      const build = spawnSync(resolveBunExecutable()!, [
+        'build', '--compile', '--minify', entry, '--outfile', binary,
+      ], { encoding: 'utf8' });
+      expect(build.status, build.stderr).toBe(0);
+      const run = spawnSync(binary, [dataDir], { cwd: dataDir, encoding: 'utf8' });
+      expect(run.status, run.stderr).toBe(0);
+      const prepared = JSON.parse(run.stdout);
+      const extensionPath = prepared.deferredInput.additionalArgs[1];
+      const child = spawnSyncTsEval(`
+        const { default: register } = await import(${JSON.stringify(pathToFileURL(extensionPath).href)});
+        let handler;
+        const sent = [];
+        register({
+          registerCommand(name, command) {
+            if (name !== 'botmux-initial-prompt') throw new Error('wrong command');
+            handler = command.handler;
+          },
+          sendUserMessage(content, options) { sent.push({ content, options }); },
+        });
+        await handler('', { isIdle: () => false, ui: { notify: () => {} } });
+        if (process.env.BOTMUX_PI_INITIAL_PROMPT_FILE) throw new Error('not consumed');
+        await handler('', { isIdle: () => true, ui: { notify: () => {} } });
+        console.log(JSON.stringify(sent));
+      `, { cwd: dataDir, encoding: 'utf8', env: { ...process.env, ...prepared.deferredInput.env } });
+      expect(child.status, String(child.stderr)).toBe(0);
+      expect(JSON.parse(String(child.stdout))).toEqual([
+        { content: 'hello\n完整首条消息', options: { deliverAs: 'followUp' } },
+      ]);
+      expect(dirname(extensionPath)).toBe(prepared.readonlyRoot);
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('loads the worker-selected file and submits it as one native user message', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-pi-extension-'));
     const filePath = join(dataDir, 'initial.prompt.md');
