@@ -10,6 +10,20 @@ import {
   reasoningEffortsForCliModel,
 } from '../src/services/codex-reasoning-effort.js';
 
+describe('Kimi managed K3 reasoning efforts', () => {
+  it('accepts only the native K3 levels on managed K3 model aliases', () => {
+    expect(isConfigurableReasoningCliId('kimi')).toBe(true);
+    for (const model of ['kimi-code/k3', 'kimi-code/k3-256k']) {
+      expect(reasoningEffortsForCliModel('kimi', model)).toEqual(['low', 'high', 'max']);
+      expect(cliModelSupportsReasoningEffort('kimi', model, 'max')).toBe(true);
+      expect(cliModelSupportsReasoningEffort('kimi', model, 'medium')).toBe(false);
+    }
+    for (const model of [undefined, 'custom-provider/model', 'kimi-code/kimi-for-coding-highspeed']) {
+      expect(reasoningEffortsForCliModel('kimi', model)).toEqual([]);
+    }
+  });
+});
+
 describe('Codex model-aware reasoning efforts', () => {
   it('exposes six levels only for sol and terra', () => {
     expect(codexReasoningEffortsForModel('gpt-5.6-sol')).toContain('ultra');

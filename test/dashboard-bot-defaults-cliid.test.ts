@@ -118,6 +118,7 @@ describe('Codex-compatible runtime editor', () => {
       { id: 'claude-code', label: 'Claude' },
       { id: 'codex', label: 'Codex' },
       { id: 'traex', label: 'traex' },
+      { id: 'kimi', label: 'Kimi' },
       { id: 'forge-x-traex', label: 'Forge x TraeX', cliLaunchMode: 'forge-traex' as const },
       { id: 'ttadk-x-codex', label: 'Codex via TTADK' },
     ],
@@ -205,6 +206,31 @@ describe('Codex-compatible runtime editor', () => {
       expect(requests).toEqual([{ cliId: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'ultra' }]);
     } finally {
       (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('shows, saves and reloads the configured Kimi effort without inventing a CLI default', async () => {
+    const previousFetch = globalThis.fetch;
+    const saved: unknown[] = [];
+    globalThis.fetch = vi.fn(async (_url, init) => {
+      if (!init?.body) return new Response(JSON.stringify({ models: [], source: 'static' }));
+      const body = JSON.parse(String(init.body));
+      saved.push(body);
+      return new Response(JSON.stringify({ ok: true, ...body, selectionKey: 'kimi' }));
+    });
+    try {
+      const { root, patchBot } = renderAgent({ cliId: 'kimi', model: 'kimi-code/k3-256k' });
+      const picker = root.findByProps({ dataInput: 'agentReasoningEffort' });
+      expect(picker.props.value).toBe('');
+      expect(picker.props.options.map((o: { value: string }) => o.value)).toEqual(['', 'low', 'high', 'max']);
+      act(() => picker.props.onChange('max'));
+      await act(async () => { await root.findByProps({ 'data-action': 'save-agent' }).props.onClick(); });
+      expect(saved).toEqual([{ cliId: 'kimi', model: 'kimi-code/k3-256k', reasoningEffort: 'max' }]);
+      expect(patchBot).toHaveBeenCalledWith('cli_runtime', expect.objectContaining({ reasoningEffort: 'max' }));
+      const reloaded = renderAgent({ cliId: 'kimi', model: 'kimi-code/k3-256k', reasoningEffort: 'max' });
+      expect(reloaded.root.findByProps({ dataInput: 'agentReasoningEffort' }).props.value).toBe('max');
+    } finally {
+      globalThis.fetch = previousFetch;
     }
   });
 
