@@ -80,6 +80,7 @@ const mockListChatMessages = vi.fn(async () => [] as any[]);
 const mockListChatMessagesUntil = vi.fn(async () => [] as any[]);
 const mockListThreadMessages = vi.fn(async () => [] as any[]);
 const mockGetMessageDetail = vi.fn(async () => ({ items: [] as any[] }));
+const mockResolveUnionIdFromOpenId = vi.fn(async () => null as string | null);
 // 默认所有 open_id 都判为「非真人」（bot）→ 保持既有用例「全部登记」的预期；
 // 需要模拟真人的用例用 mockResolvedValueOnce(true)。
 const mockIsHumanOpenId = vi.fn(async () => false);
@@ -96,6 +97,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   replyMessage: (...args: any[]) => mockReplyMessage(...args),
   updateMessage: (...args: any[]) => mockUpdateMessage(...args),
   getMessageDetail: (...args: any[]) => mockGetMessageDetail(...args),
+  resolveUnionIdFromOpenId: (...args: any[]) => mockResolveUnionIdFromOpenId(...args),
   isHumanOpenId: (...args: any[]) => mockIsHumanOpenId(...args),
   listChatMessages: (...args: any[]) => mockListChatMessages(...args),
   listChatMessagesUntil: (...args: any[]) => mockListChatMessagesUntil(...args),
@@ -189,6 +191,7 @@ beforeEach(() => {
   mockResolveCurrentChatBotOpenIds.mockReset().mockResolvedValue({ ok: false, error: 'live_membership_unavailable', message: 'default_no_resolution' });
   mockListThreadMessages.mockReset().mockResolvedValue([]);
   mockGetMessageDetail.mockReset().mockResolvedValue({ items: [] });
+  mockResolveUnionIdFromOpenId.mockReset().mockResolvedValue(null);
   mockIsSubstituteEnabledForChat.mockReset().mockReturnValue(true);
   // Generic tests should not accidentally enter the sole-user免@ path. Tests
   // that exercise 1v1 behavior opt in explicitly, so execution order cannot
@@ -9148,6 +9151,7 @@ describe('im.message.updated_v1 — 编辑消息补 @（延迟首次 @）', () =
     __resetAnchorQueues();
     __resetEventClaimsForTest();
     _resetGrantPending();
+    mockExistsSync.mockReturnValue(true);
     handlers = makeHandlers();
     mockFindOncallChat.mockReturnValue(undefined);
     mockGetChatMode.mockReset().mockResolvedValue('group');
@@ -9381,4 +9385,167 @@ describe('im.message.updated_v1 — 编辑消息补 @（延迟首次 @）', () =
     );
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
+
+  it('repeated edit while first dispatch is pending must not enqueue twice', async () => {
+    const messageId = 'om_edit_edit_inflight';
+    let finish!: () => void;
+    const pending = new Promise<void>(resolve => { finish = resolve; });
+    handlers.handleNewTopic.mockImplementationOnce(() => pending);
+    mockGetMessageDetail.mockResolvedValue({ items: [makeReadbackItem({ messageId, mentioned: true })] });
+    await capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-pending-edit-a'));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    await capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-pending-edit-b'));
+    await flushEventWork();
+    finish();
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+  });
+
+  it('edit while original receive dispatch is pending must not enqueue twice', async () => {
+    const messageId = 'om_edit_receive_inflight';
+    let finish!: () => void;
+    const pending = new Promise<void>(resolve => { finish = resolve; });
+    handlers.handleNewTopic.mockImplementationOnce(() => pending);
+    const original = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID, content: JSON.stringify({ text: '@BotA task' }),
+      messageId, chatId: 'chat-edit', chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    await capturedHandlers['im.message.receive_v1'](original);
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    mockGetMessageDetail.mockResolvedValue({ items: [makeReadbackItem({ messageId, mentioned: true })] });
+    await capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-pending-original'));
+    await flushEventWork();
+    finish();
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+  });
+
+  it('edit should retain platform team member talk eligibility', async () => {
+    const unionId = 'on_edit_member';
+    mockResolveUnionIdFromOpenId.mockResolvedValue(unionId);
+    setupBotState({ allowedUsers: ['ou_other_owner'], regularGroupReplyMode: 'new-topic', autoGrantRequestCards: false });
+    mockReadFileSync.mockImplementation((path: any) => String(path).endsWith('platform-team-sync.json')
+      ? JSON.stringify({ rev: 'edit-rev', teams: [{ teamId: 'team-edit', groupChatIds: [], bots: [{ appId: MY_APP_ID }], memberUnionIds: [unionId] }] })
+      : '[]');
+    expect(canTalk(MY_APP_ID, 'chat-edit', USER_OPEN_ID, undefined, unionId, 'group')).toBe(true);
+    expect(canOperate(MY_APP_ID, 'chat-edit', USER_OPEN_ID)).toBe(false);
+    const original = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID, content: JSON.stringify({ text: '@BotA task' }),
+      messageId: 'om_edit_team_receive', chatId: 'chat-edit', chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    Object.assign(original.sender.sender_id, { union_id: unionId });
+    await capturedHandlers['im.message.receive_v1'](original);
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    handlers.handleNewTopic.mockClear();
+    const messageId = 'om_edit_team_edit';
+    mockGetMessageDetail.mockResolvedValue({ items: [makeReadbackItem({ messageId, mentioned: true })] });
+    await capturedHandlers['im.message.updated_v1']({ ...makeUpdatedEvent(messageId, 'evt-team-edit'), operator: { operator_id: { open_id: 'ou_different_operator' } } });
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    expect(mockResolveUnionIdFromOpenId).toHaveBeenCalledWith(MY_APP_ID, USER_OPEN_ID);
+    expect(canOperate(MY_APP_ID, 'chat-edit', USER_OPEN_ID)).toBe(false);
+  });
+
+  it('dedupes concurrent edits that cross chatless and chat ingress lanes before canonical dispatch', async () => {
+    const messageId = 'om_edit_cross_lane';
+    let finish!: () => void;
+    const pending = new Promise<void>(resolve => { finish = resolve; });
+    const beforeSessionTurn = vi.fn(async () => { await pending; });
+    handlers.beforeSessionTurn = beforeSessionTurn;
+    mockGetMessageDetail.mockResolvedValue({ items: [makeReadbackItem({ messageId, mentioned: true })] });
+    capturedHandlers['im.message.updated_v1']({ event_id: 'evt-cross-chatless', message: { message_id: messageId } });
+    capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-cross-chat'));
+    try {
+      await flushEventWork();
+      expect(beforeSessionTurn).toHaveBeenCalledTimes(2);
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    } finally {
+      finish();
+      await flushEventWork();
+    }
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+  });
+
+  it('reserves a message while waiting behind another turn on the same anchor', async () => {
+    const rootId = 'om_busy_thread';
+    const messageId = 'om_edit_waiting';
+    let finish!: () => void;
+    const pending = new Promise<void>(resolve => { finish = resolve; });
+    handlers.isSessionOwner.mockReturnValue(true);
+    handlers.handleThreadReply.mockImplementationOnce(() => pending);
+    capturedHandlers['im.message.receive_v1'](makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID, content: JSON.stringify({ text: '@BotA task' }),
+      messageId: 'om_other_busy_turn', rootId, chatId: 'chat-edit',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    }));
+    mockGetMessageDetail.mockResolvedValue({ items: [makeReadbackItem({ messageId, mentioned: true, rootId, threadId: rootId })] });
+    try {
+      await flushEventWork();
+      capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-waiting-a'));
+      await flushEventWork();
+      capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-waiting-b'));
+      await flushEventWork();
+      expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
+    } finally {
+      finish();
+      await flushEventWork();
+    }
+    expect(handlers.handleThreadReply).toHaveBeenCalledTimes(2);
+    expect(handlers.handleThreadReply.mock.calls.map(call => call[1].messageId)).toEqual(['om_other_busy_turn', messageId]);
+  });
+
+  it.each([false, true])('releases a failed dispatch only when it was not admitted (admitted=%s)', async (admitted) => {
+    const messageId = `om_edit_failure_${admitted}`;
+    handlers.handleNewTopic.mockImplementationOnce(async (_data, ctx) => {
+      ctx.ingressAdmission = { admitted };
+      throw new Error('dispatch or presentation failed');
+    });
+    mockGetMessageDetail.mockResolvedValue({ items: [makeReadbackItem({ messageId, mentioned: true })] });
+    capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-failure-a'));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-failure-b'));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(admitted ? 1 : 2);
+  });
+
+  it('does not consume the trigger when permission rejects an edit', async () => {
+    const messageId = 'om_edit_granted_later';
+    setupBotState({ allowedUsers: ['ou_other_owner'], regularGroupReplyMode: 'new-topic', autoGrantRequestCards: false });
+    mockGetMessageDetail.mockResolvedValue({ items: [makeReadbackItem({ messageId, mentioned: true })] });
+    capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-before-grant'));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupReplyMode: 'new-topic' });
+    capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-after-grant'));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+  });
+
+  it('keeps team-only access denied on union lookup failure and permits a later successful lookup', async () => {
+    const unionId = 'on_team_lookup';
+    const messageId = 'om_edit_union_retry';
+    setupBotState({ allowedUsers: ['ou_other_owner'], regularGroupReplyMode: 'new-topic', autoGrantRequestCards: false });
+    mockReadFileSync.mockImplementation((path: any) => String(path).endsWith('platform-team-sync.json')
+      ? JSON.stringify({ rev: 'rev-union-retry', teams: [{ teamId: 'team-union', bots: [{ appId: MY_APP_ID }], memberUnionIds: [unionId] }] })
+      : '[]');
+    mockGetMessageDetail.mockResolvedValue({ items: [makeReadbackItem({ messageId, mentioned: true })] });
+    capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-union-unavailable'));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    mockResolveUnionIdFromOpenId.mockResolvedValue(unionId);
+    capturedHandlers['im.message.updated_v1'](makeUpdatedEvent(messageId, 'evt-union-available'));
+    await flushEventWork();
+    expect(mockResolveUnionIdFromOpenId).toHaveBeenLastCalledWith(MY_APP_ID, USER_OPEN_ID);
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(
+      expect.objectContaining({ sender: expect.objectContaining({ sender_id: { open_id: USER_OPEN_ID, union_id: unionId } }) }),
+      expect.anything(),
+    );
+  });
+
 });

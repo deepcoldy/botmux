@@ -10,7 +10,7 @@ import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
-import { getChatInfo, getChatMode, getCachedChatMode, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { getChatInfo, getChatMode, getCachedChatMode, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
@@ -39,7 +39,7 @@ import {
   buildEventSubDeepLink,
   buildScopeDeepLink,
 } from '../../setup/verify-permissions.js';
-import { automateOpenPlatformSetup, MESSAGE_UPDATED_EVENT, probeAppEventSubscriptions, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest, inspectUnderReviewConfigHints } from '../../setup/open-platform-automation.js';
+import { automateOpenPlatformSetup, MESSAGE_UPDATED_EVENT, ensureAppEventSubscriptions, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest, inspectUnderReviewConfigHints } from '../../setup/open-platform-automation.js';
 import { type Brand, larkHosts, normalizeBrand } from './lark-hosts.js';
 import { tryHandleGrantCommand } from './grant-command.js';
 import { tryHandleInviteCommand } from './invite-command.js';
@@ -855,46 +855,31 @@ export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promis
 }
 
 /**
- * Startup: ensure this bot is subscribed to im.message.updated_v1 so editing a
- * message to add an @mention can trigger a task. Check-first best-effort, mirroring
- * the VC event ensure: a read-only probe over the cached Feishu web session, then
- * the full automation (which incrementally adds just the missing event) only when
- * needed. Unlike the VC gate this is a pure enhancement (missing subscription only
- * means "edit-to-@ doesn't fire"; normal messaging is unaffected), so on failure we
- * log and never DM the admin — the feature fleet is large and a DM per bot would be
- * pure noise. Users can still subscribe manually or via `botmux setup`.
+ * Startup only adds the missing edit event over the cached Feishu web session.
+ * Never run full setup here: it changes scopes and can publish unrelated drafts.
+ * Readback must confirm both the subscription and existing long-connection mode.
+ * Failure only disables edit-to-@, so log without sending an admin DM per bot.
  */
 export async function ensureMessageUpdatedEventSubscribed(larkAppId: string): Promise<void> {
   const bot = getBot(larkAppId);
-  const brand = normalizeBrand(bot.config.brand);
-  if (brand !== 'feishu') return;
+  if (normalizeBrand(bot.config.brand) !== 'feishu') return;
   try {
-    const probe = await probeAppEventSubscriptions(larkAppId, [MESSAGE_UPDATED_EVENT]);
-    if (!probe.ok) {
-      // 无缓存 web session / 过期 / 网络错误 —— 静默降级到 info，不弹二维码也不 DM。
+    const result = await ensureAppEventSubscriptions(larkAppId, [MESSAGE_UPDATED_EVENT]);
+    if (!result.ok) {
       logger.info(
-        `[${larkAppId}] im.message.updated_v1 订阅检查跳过（${probe.reason}）：编辑消息补 @ 功能不可用；` +
-        `如需启用，运行 \`botmux setup\` 刷新开放平台登录态后重启。`,
+        `[${larkAppId}] im.message.updated_v1 订阅检查未完成（${result.reason}）：编辑消息补 @ 功能未确认；` +
+        `请检查开放平台登录态和事件订阅配置。`,
       );
       return;
     }
-    if (probe.missingEvents.length === 0) return;
-    logger.info(`[${larkAppId}] im.message.updated_v1 未订阅，经开放平台自动补订阅...`);
-    const result = await automateOpenPlatformSetup({
-      appId: bot.config.larkAppId,
-      brand,
-      maxWaitMs: 60_000,
-      disableQrLogin: true,
-      onStatus: (msg) => logger.info(`[${larkAppId}] message-updated-event-autoconfig: ${msg}`),
-      onQrCode: () => {
-        logger.warn(`[${larkAppId}] message-updated-event-autoconfig: cached Feishu web session expired; run \`botmux setup\` to refresh, then restart.`);
-      },
-    });
-    if (result.ok) {
-      logger.info(`[${larkAppId}] im.message.updated_v1 自动订阅完成（version ${result.versionId ?? 'n/a'}）`);
-    } else {
-      logger.info(`[${larkAppId}] im.message.updated_v1 自动补订阅未完成（${result.reason}）：编辑消息补 @ 暂不可用，不影响正常消息。`);
+    if (!result.eventModeReady || result.missingEvents.length > 0) {
+      logger.info(
+        `[${larkAppId}] im.message.updated_v1 订阅回读未就绪（longConnection=${result.eventModeReady}, ` +
+        `missing=${result.missingEvents.join(',')}）：请在开放平台手动确认，不影响正常消息。`,
+      );
+      return;
     }
+    logger.info(`[${larkAppId}] im.message.updated_v1 长连接订阅已确认`);
   } catch (err: any) {
     logger.debug(`[${larkAppId}] message-updated event subscription check errored: ${err?.message ?? err}`);
   }
@@ -1188,6 +1173,7 @@ export function __resetEventClaimsForTest(): void {
   _resetSeenMessagesForTest();
   // 同清「已触发任务」记录，避免编辑事件幂等在用例间串状态。
   _resetTriggeredMessagesForTest();
+  pendingMessageTriggers.clear();
 }
 
 export async function getGroupStats(larkAppId: string, chatId: string): Promise<{ userCount: number; botCount: number }> {
@@ -2556,24 +2542,50 @@ function larkReceiveEventFromHistoryMessage(message: any, chatId: string): any {
   };
 }
 
+// Reserve before joining the canonical anchor queue. The raw routing lane is
+// released as soon as work is enqueued, so completion records alone leave a gap
+// for another edit (or receive/edit crossing different ingress lanes).
+const pendingMessageTriggers = new Set<string>();
+
+function messageTriggerKey(larkAppId: string, messageId: string): string {
+  return `${larkAppId}:${messageId}`;
+}
+
+function isMessageTriggerClaimed(larkAppId: string, messageId: string): boolean {
+  return hasTriggeredMessage(larkAppId, messageId)
+    || pendingMessageTriggers.has(messageTriggerKey(larkAppId, messageId));
+}
+
 async function dispatchHumanMessageViaHandlers(
   larkAppId: string,
   handlers: EventHandlers,
   payload: PendingForwardTopicPayload,
   capMs?: number,
 ): Promise<void> {
-  await serializeByAnchor(payload.ctx.anchor, () => {
-    const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId) ?? payload.ownsSession;
-    return ownsSession
-      ? handlers.handleThreadReply(payload.data, payload.ctx)
-      : handlers.handleNewTopic(payload.data, payload.ctx);
-  }, capMs);
-  // 消息已真正进入任务派发（过了权限/@ 闸、完成路由）。记进 triggered-message-store：
-  // 之后同 message_id 的 im.message.updated_v1（用户编辑消息）不得再触发一遍。
-  // 放在成功派发之后——被 grant 卡 / 权限闸挡回的消息不标记，用户事后补 @ 仍可触发
-  //（授权通过后 replay 或编辑事件都会走到这里再标记）。
-  if (payload.ctx?.messageId) {
-    markMessageTriggered(payload.ctx.larkAppId ?? larkAppId, payload.ctx.messageId);
+  const appId = payload.ctx.larkAppId ?? larkAppId;
+  const messageId = payload.ctx.messageId;
+  if (messageId && isMessageTriggerClaimed(appId, messageId)) {
+    logger.debug(`[message-trigger:${appId}] duplicate dispatch ignored msg=${messageId.substring(0, 12)}`);
+    return;
+  }
+  const key = messageId ? messageTriggerKey(appId, messageId) : undefined;
+  if (key) pendingMessageTriggers.add(key);
+  let completed = false;
+  try {
+    await serializeByAnchor(payload.ctx.anchor, () => {
+      const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId) ?? payload.ownsSession;
+      return ownsSession
+        ? handlers.handleThreadReply(payload.data, payload.ctx)
+        : handlers.handleNewTopic(payload.data, payload.ctx);
+    }, capMs);
+    completed = true;
+  } finally {
+    // A pre-admission failure can be retried by a later edit. Once admitted,
+    // even a subsequent presentation error must not allow the task to run again.
+    if (messageId && (completed || payload.ctx.ingressAdmission?.admitted)) {
+      markMessageTriggered(appId, messageId);
+    }
+    if (key) pendingMessageTriggers.delete(key);
   }
 }
 
@@ -4785,8 +4797,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       }
 
       // 已触发过任务（原消息本就 @、p2p、免@ 策略等）→ 不因编辑再触发一遍。
-      if (hasTriggeredMessage(larkAppId, messageId)) {
-        logger.info(`[message-updated:${larkAppId}] 消息已触发过任务，忽略编辑补 @ msg=${messageId.substring(0, 12)}`);
+      if (isMessageTriggerClaimed(larkAppId, messageId)) {
+        logger.info(`[message-updated:${larkAppId}] 消息已派发或正在排队，忽略编辑补 @ msg=${messageId.substring(0, 12)}`);
         return;
       }
       // 正处在 never/ambient 的 topic 种子延迟队列里：它马上会以原快照派发，
@@ -4807,6 +4819,14 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       if (data.message.chat_type !== 'p2p' && data.message.chat_id) {
         const mode = await getChatMode(larkAppId, data.message.chat_id);
         if (mode === 'p2p') data.message.chat_type = 'p2p';
+      }
+      // Message REST rows carry open_id only. Resolve this actual sender in the
+      // receiving app's identity domain so teamMember talk authorization has the
+      // same union_id as receive_v1. Never borrow the edit operator's identity.
+      const senderOpenId = data.sender?.sender_id?.open_id;
+      if (senderOpenId) {
+        const unionId = await resolveUnionIdFromOpenId(larkAppId, senderOpenId);
+        if (unionId) data.sender.sender_id.union_id = unionId;
       }
       // 复用完整消息处理链路：权限/@ 闸、mention 策略、路由、会话派发全部与新消息一致。
       await processMessageEvent(data);

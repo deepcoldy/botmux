@@ -14,6 +14,7 @@ import {
   BOT_BASELINE_CALLBACKS,
   BOT_OPTIONAL_APP_EVENTS,
   LONG_CONNECTION_EVENT_MODE,
+  MESSAGE_UPDATED_EVENT,
   VC_MEETING_APP_EVENTS,
   VC_MEETING_USER_EVENTS,
   BOTMUX_REDIRECT_URL,
@@ -28,6 +29,7 @@ import {
   collectBotmuxRedirectUrls,
   createFeishuOpenPlatformApp,
   createOpenPlatformApiClient,
+  ensureAppEventSubscriptions,
   extractOpenPlatformCsrfToken,
   extractOpenPlatformPrivileges,
   extractOpenPlatformRedirectUrls,
@@ -2238,6 +2240,130 @@ describe('createFeishuOpenPlatformApp', () => {
     // 应用已建成但发版失败:带 appId 供调用方兜底/提示(手动恢复路径)
     expect(result).toMatchObject({ ok: false, reason: 'api_error', appId: 'cli_created' });
     expect(calls.filter(p => p === '/developers/v1/app_version/create/cli_created')).toHaveLength(1);
+  });
+});
+
+describe('ensureAppEventSubscriptions — startup repair without setup or publishing', () => {
+  const appId = 'cli_repair';
+  const receiveEvent = 'im.message.receive_v1';
+  const editedEvent = MESSAGE_UPDATED_EVENT;
+  const eventPath = `/developers/v1/event/${appId}`;
+  const updatePath = `/developers/v1/event/update/${appId}`;
+
+  function fixture(options: {
+    appEvents?: string[];
+    eventMode?: number | null;
+    updateNoop?: boolean;
+    failRead?: boolean;
+    failUpdate?: boolean;
+    failReadback?: boolean;
+  } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-event-repair-'));
+    const sessionFile = join(dir, 'feishu-session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const appEvents = [...(options.appEvents ?? [receiveEvent])];
+    const calls: Array<{ path: string; body: unknown }> = [];
+    let readCount = 0;
+    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const href = String(url);
+      if (href === 'https://ask.feishu.cn/') return new Response('ask home');
+      if (href === 'https://open.feishu.cn/app') return new Response(openPlatformPage());
+      const path = new URL(href).pathname;
+      const body = JSON.parse(String(init?.body));
+      calls.push({ path, body });
+      if (path === eventPath) {
+        readCount += 1;
+        if (options.failRead || (options.failReadback && readCount > 1)) {
+          return Response.json({ code: 1, msg: 'event read rejected' });
+        }
+        return Response.json({ code: 0, data: {
+          eventMode: options.eventMode === undefined ? LONG_CONNECTION_EVENT_MODE : options.eventMode,
+          appEvents: [...appEvents],
+          userEvents: ['vc.meeting.participant_meeting_joined_v1'],
+        } });
+      }
+      if (path === updatePath) {
+        if (options.failUpdate) return Response.json({ code: 1, msg: 'event update rejected' });
+        if (!options.updateNoop) appEvents.push(...body.appEvents);
+        return Response.json({ code: 0 });
+      }
+      // Existing unrelated drafts must remain untouched even when repairing events.
+      if (path === `/developers/v1/app_version/list/${appId}`) {
+        return Response.json({ code: 0, data: { versions: [{ versionId: 'existing-draft', status: 0 }] } });
+      }
+      throw new Error(`Unexpected setup or publishing request: ${path}`);
+    }) as typeof fetch;
+    const run = (events: readonly string[] = [receiveEvent, editedEvent]) =>
+      ensureAppEventSubscriptions(appId, events, { sessionFilePath: sessionFile, fetchImpl });
+    return { run, calls, appEvents };
+  }
+
+  it('adds only requested missing app events and never reads or commits an existing draft', async () => {
+    const { run, calls, appEvents } = fixture();
+    expect(await run()).toMatchObject({ ok: true, missingEvents: [], eventModeReady: true });
+    expect(calls).toEqual([
+      { path: eventPath, body: { needEventDetail: true } },
+      { path: updatePath, body: {
+        clientId: appId,
+        operation: 'add',
+        events: [],
+        appEvents: [editedEvent],
+        userEvents: [],
+        eventMode: LONG_CONNECTION_EVENT_MODE,
+      } },
+      { path: eventPath, body: { needEventDetail: true } },
+    ]);
+    expect(appEvents).toEqual([receiveEvent, editedEvent]);
+  });
+
+  it('does not write when the requested events are already subscribed', async () => {
+    const { run, calls } = fixture({ appEvents: [receiveEvent, editedEvent] });
+    expect(await run()).toMatchObject({ ok: true, missingEvents: [], eventModeReady: true });
+    expect(calls.map(call => call.path)).toEqual([eventPath]);
+  });
+
+  it.each([0, null])('does not switch or write when the current event mode is %s', async (eventMode) => {
+    const { run, calls } = fixture({ eventMode });
+    expect(await run()).toMatchObject({ ok: true, missingEvents: [editedEvent], eventModeReady: false });
+    expect(calls.map(call => call.path)).toEqual([eventPath]);
+  });
+
+  it('reports the actual missing events when the update response succeeds without persisting', async () => {
+    const { run, calls } = fixture({ updateNoop: true });
+    expect(await run()).toMatchObject({ ok: true, missingEvents: [editedEvent], eventModeReady: true });
+    expect(calls.map(call => call.path)).toEqual([eventPath, updatePath, eventPath]);
+  });
+
+  it.each([
+    { failRead: true, expectedCalls: [eventPath], error: 'event read rejected' },
+    { failUpdate: true, expectedCalls: [eventPath, updatePath], error: 'event update rejected' },
+    { failReadback: true, expectedCalls: [eventPath, updatePath, eventPath], error: 'event read rejected' },
+  ])('returns an explicit failure after a rejected API call: $error', async ({ expectedCalls, error, ...options }) => {
+    const { run, calls } = fixture(options);
+    expect(await run()).toMatchObject({ ok: false, reason: 'api_error', message: expect.stringContaining(error) });
+    expect(calls.map(call => call.path)).toEqual(expectedCalls);
+  });
+
+  it('does not start QR login or fallback when no cached session exists', async () => {
+    const sessionFile = join(mkdtempSync(join(tmpdir(), 'botmux-event-repair-nosession-')), 'missing.json');
+    const fetchImpl = vi.fn(async () => { throw new Error('must not fetch without cached login'); });
+    expect(await ensureAppEventSubscriptions(appId, [editedEvent], {
+      sessionFilePath: sessionFile,
+      fetchImpl: fetchImpl as typeof fetch,
+    })).toMatchObject({ ok: false, reason: 'invalid_session' });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('returns the login failure without QR or API writes when the cached session is invalid', async () => {
+    const sessionFile = join(mkdtempSync(join(tmpdir(), 'botmux-event-repair-invalid-')), 'session.json');
+    writeStoredCookiesToSessionFile(sessionFile, [cookie()]);
+    const fetchImpl = vi.fn(async (_url: string | URL | Request) => new Response('unauthorized', { status: 401 }));
+    expect(await ensureAppEventSubscriptions(appId, [editedEvent], {
+      sessionFilePath: sessionFile,
+      fetchImpl: fetchImpl as typeof fetch,
+    })).toMatchObject({ ok: false, reason: 'invalid_session' });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(String(fetchImpl.mock.calls[0]?.[0])).toBe('https://ask.feishu.cn/');
   });
 });
 
