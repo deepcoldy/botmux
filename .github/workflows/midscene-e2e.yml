@@ -57,7 +57,8 @@ jobs:
           bun run test:midscene:nodes
           bun run test -- test/midscene-suite.test.ts
 
-      - name: Require live-test configuration
+      - name: Detect live-test configuration
+        id: live_config
         env:
           FEISHU_STORAGE_STATE_BASE64: ${{ secrets.FEISHU_STORAGE_STATE_BASE64 }}
         run: |
@@ -76,32 +77,41 @@ jobs:
             fi
           done
           if (( ${#missing[@]} > 0 )); then
-            echo "Missing required Actions secrets: ${missing[*]}" >&2
-            exit 1
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Live Feishu cases skipped; unavailable Actions secrets: ${missing[*]}"
+            exit 0
           fi
           printf '%s' "$FEISHU_STORAGE_STATE_BASE64" | base64 --decode > storageState.json
           node -e "const fs=require('node:fs'); const value=JSON.parse(fs.readFileSync('storageState.json','utf8')); if (!Array.isArray(value.cookies)) throw new Error('FEISHU_STORAGE_STATE_BASE64 is not a Playwright storage state')"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
 
       - name: Install Chromium
+        if: steps.live_config.outputs.ready == 'true'
         run: bun x playwright install --with-deps chromium
 
       - name: Run migrated Midscene scenarios
         id: midscene
+        if: steps.live_config.outputs.ready == 'true'
         run: bun run test:e2e-browser
 
       - name: Write Midscene run summary
         if: always() && !cancelled()
         env:
           TEST_OUTCOME: ${{ steps.midscene.outcome }}
+          LIVE_READY: ${{ steps.live_config.outputs.ready }}
         run: |
+          outcome="${TEST_OUTCOME:-not-run}"
+          if [[ "$LIVE_READY" != "true" ]]; then
+            outcome="skipped"
+          fi
           node scripts/render-midscene-summary.mjs \
             --results midscene_run \
             --artifact-name midscene-feishu-report \
-            --test-outcome "${TEST_OUTCOME:-not-run}" \
+            --test-outcome "$outcome" \
             --output "$GITHUB_STEP_SUMMARY"
 
       - name: Upload Midscene report
-        if: always() && !cancelled()
+        if: always() && !cancelled() && steps.live_config.outputs.ready == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: midscene-feishu-report

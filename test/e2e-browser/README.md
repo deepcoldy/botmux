@@ -20,10 +20,13 @@ The command writes each run below `midscene_run/runs/<run-id>/`. Use
 
 ## GitHub Actions
 
-The `Midscene E2E` workflow runs these same 17 scenarios on same-repository
-branches. It uploads the native HTML report and runner data as the
-`midscene-feishu-report` artifact, and writes the case results to the workflow
-Summary page even when a scenario fails.
+The `Midscene E2E` workflow always validates the suite configuration, custom
+node, and 17-case registry. When the live-test secrets are available, it also
+runs the same 17 scenarios, uploads the native HTML report and runner data as
+the `midscene-feishu-report` artifact, and writes the case results to the
+workflow Summary page even when a scenario fails. Without those secrets, the
+Summary explicitly records that the live cases were skipped while static
+validation still gates the change.
 
 Configure these repository secrets before running the workflow:
 

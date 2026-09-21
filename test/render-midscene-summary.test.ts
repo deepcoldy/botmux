@@ -31,4 +31,17 @@ describe('Midscene CI summary', () => {
       'https://github.com/quanru/botmux/actions/runs/42#artifacts',
     );
   });
+
+  it('labels unavailable live credentials as skipped without a report link', () => {
+    const markdown = renderSummary({
+      artifactName: 'midscene-feishu-report',
+      testOutcome: 'skipped',
+      runUrl: 'https://github.com/quanru/botmux/actions/runs/43',
+      summary: null,
+    });
+
+    expect(markdown).toContain('Botmux × Midscene · live cases skipped');
+    expect(markdown).toContain('Static Midscene validation passed');
+    expect(markdown).not.toContain('#artifacts');
+  });
 });

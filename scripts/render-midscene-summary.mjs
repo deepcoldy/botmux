@@ -71,25 +71,29 @@ export function renderSummary({ summary, artifactName, testOutcome, runUrl }) {
   const status =
     testOutcome === 'success' && summary?.status === 'success'
       ? 'passed'
-      : testOutcome === 'not-run'
-        ? 'not run'
-        : 'failed';
+      : testOutcome === 'skipped'
+        ? 'live cases skipped'
+        : testOutcome === 'not-run'
+          ? 'not run'
+          : 'failed';
   const artifactUrl = runUrl ? `${runUrl}#artifacts` : null;
   const lines = [
     `## Botmux × Midscene · ${status}`,
     '',
     reportAvailable
       ? `**${counts.passed}/${counts.total} cases passed · ${counts.failed} failed · ${counts.notRun} not run**`
-      : '**No Midscene result was produced.** The job stopped before the test runner started.',
+      : testOutcome === 'skipped'
+        ? '**Static Midscene validation passed.** Live Feishu browser cases were skipped because their repository secrets are unavailable.'
+        : '**No Midscene result was produced.** The job stopped before the test runner started.',
     '',
   ];
 
-  if (artifactUrl) {
+  if (reportAvailable && artifactUrl) {
     lines.push(
       `[Download the native Midscene HTML report and runner data (${artifactName})](${artifactUrl})`,
       '',
     );
-  } else {
+  } else if (reportAvailable) {
     lines.push(`Artifact: ${artifactName}`, '');
   }
 
