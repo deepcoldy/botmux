@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { generateKeyPairSync } from 'node:crypto';
-import { CodexAppCotCollector, normalizeCodexAppCotMarker } from '../src/services/codex-app-cot.js';
 import {
+  CodexAppCotCollector,
+  normalizeCodexAppCotMarker,
+  prepareCodexAppCotMarker,
+} from '../src/services/codex-app-cot.js';
+import {
+  CODEX_APP_CONTROL_COT_PAYLOAD_MAX_BYTES,
   CodexAppControlLineDecoder,
   encodeCodexAppSignedControlMarker,
 } from '../src/utils/codex-app-control.js';
@@ -104,6 +109,35 @@ describe('CodexAppCotCollector', () => {
     );
     const decoded = new CodexAppControlLineDecoder().push(Buffer.from(`${line}\n`));
     expect(decoded).toEqual({ lines: [line], droppedMalformed: false });
+  });
+
+  it.each([
+    ['quotes', '"'.repeat(2_000)],
+    ['backslashes', '\\'.repeat(2_000)],
+    ['mixed escaped text', `${'思"\\'.repeat(600)}${'x'.repeat(200)}`],
+  ])('fits long %s using the serialized JSON payload budget', (_label, text) => {
+    const collector = new CodexAppCotCollector();
+    const entries = collector.observe('item/completed', {
+      item: { id: 'r1', type: 'reasoning', summary: [text] },
+    });
+    const marker = prepareCodexAppCotMarker(`om_${'x'.repeat(32)}`, entries);
+    expect(marker).toBeDefined();
+    expect(Buffer.byteLength(JSON.stringify(marker), 'utf8'))
+      .toBeLessThanOrEqual(CODEX_APP_CONTROL_COT_PAYLOAD_MAX_BYTES);
+    expect(normalizeCodexAppCotMarker(marker)).toEqual(marker);
+
+    const { privateKey } = generateKeyPairSync('ed25519');
+    const line = encodeCodexAppSignedControlMarker(
+      privateKey,
+      '00000000-0000-4000-8000-000000000000',
+      'g'.repeat(43),
+      'c'.repeat(43),
+      1,
+      'thinking',
+      marker!,
+    );
+    expect(new CodexAppControlLineDecoder().push(Buffer.from(`${line}\n`)))
+      .toEqual({ lines: [line], droppedMalformed: false });
   });
 
   it('bounds UTF-8 MCP tool names and arguments before validation', () => {

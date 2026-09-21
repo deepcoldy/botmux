@@ -1,4 +1,5 @@
 import type { CotEntry } from '../types.js';
+import { CODEX_APP_CONTROL_COT_PAYLOAD_MAX_BYTES } from '../utils/codex-app-control.js';
 
 const THINKING_MAX_CHARS = 2_000;
 const TOOL_ARGS_MAX_CHARS = 600;
@@ -7,7 +8,6 @@ const THINKING_MAX_BYTES = 2_200;
 const TOOL_ARGS_MAX_BYTES = 600;
 const TOOL_RESULT_MAX_BYTES = 1_200;
 const TOOL_NAME_MAX_BYTES = 120;
-const COT_MARKER_PAYLOAD_MAX_BYTES = 3_000;
 const STREAM_CHUNK_TARGET_CHARS = 120;
 
 function bounded(value: unknown, max: number): string {
@@ -264,6 +264,58 @@ export interface CodexAppCotMarker {
   entries: CotEntry[];
 }
 
+function payloadBytes(payload: CodexAppCotMarker): number {
+  return Buffer.byteLength(JSON.stringify(payload), 'utf8');
+}
+
+function fitEntryTextToPayload(
+  payload: CodexAppCotMarker,
+  entry: CotEntry,
+  key: 'text' | 'args' | 'result',
+): boolean {
+  const original = (entry as unknown as Record<string, unknown>)[key];
+  if (typeof original !== 'string' || !original) return false;
+  const characters = [...original];
+  let low = 0;
+  let high = characters.length;
+  let best = '';
+  while (low <= high) {
+    const count = Math.floor((low + high) / 2);
+    const candidate = count === characters.length
+      ? original
+      : `${characters.slice(0, count).join('')}…`;
+    (entry as unknown as Record<string, unknown>)[key] = candidate;
+    if (payloadBytes(payload) <= CODEX_APP_CONTROL_COT_PAYLOAD_MAX_BYTES) {
+      best = candidate;
+      low = count + 1;
+    } else {
+      high = count - 1;
+    }
+  }
+  (entry as unknown as Record<string, unknown>)[key] = best;
+  return Boolean(best);
+}
+
+/**
+ * Final producer-side boundary: fit the exact JSON payload that will be signed,
+ * including JSON escaping and the real turn id, to the worker's shared budget.
+ */
+export function prepareCodexAppCotMarker(turnId: string, entries: CotEntry[]): CodexAppCotMarker | undefined {
+  const payload: CodexAppCotMarker = {
+    turnId,
+    entries: entries.map(entry => ({ ...entry })),
+  };
+  if (payloadBytes(payload) > CODEX_APP_CONTROL_COT_PAYLOAD_MAX_BYTES) {
+    for (let index = payload.entries.length - 1; index >= 0; index--) {
+      const entry = payload.entries[index];
+      const key = entry.kind === 'thinking' ? 'text' : entry.kind === 'tool_call' ? 'args' : 'result';
+      fitEntryTextToPayload(payload, entry, key);
+      if (payloadBytes(payload) <= CODEX_APP_CONTROL_COT_PAYLOAD_MAX_BYTES) break;
+    }
+  }
+  return normalizeCodexAppCotMarker(payload);
+}
+
 /** Strictly validate the signed runner payload before it reaches Feishu. */
 export function normalizeCodexAppCotMarker(payload: unknown): CodexAppCotMarker | undefined {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return undefined;
@@ -271,7 +323,7 @@ export function normalizeCodexAppCotMarker(payload: unknown): CodexAppCotMarker 
   if (Object.keys(record).some(key => key !== 'turnId' && key !== 'entries')) return undefined;
   if (typeof record.turnId !== 'string' || record.turnId.length === 0 || record.turnId.length > 512) return undefined;
   if (!Array.isArray(record.entries) || record.entries.length === 0 || record.entries.length > 8) return undefined;
-  if (Buffer.byteLength(JSON.stringify(record), 'utf8') > COT_MARKER_PAYLOAD_MAX_BYTES) return undefined;
+  if (Buffer.byteLength(JSON.stringify(record), 'utf8') > CODEX_APP_CONTROL_COT_PAYLOAD_MAX_BYTES) return undefined;
   const entries: CotEntry[] = [];
   for (const entry of record.entries) {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return undefined;

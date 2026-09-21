@@ -40,7 +40,7 @@ import {
   type DynamicToolCallParams,
 } from './services/codex-browser-broker.js';
 import type { CodexBrowserFamily } from './core/codex-browser-config.js';
-import { CodexAppCotCollector } from './services/codex-app-cot.js';
+import { CodexAppCotCollector, prepareCodexAppCotMarker } from './services/codex-app-cot.js';
 
 type JsonObject = Record<string, any>;
 
@@ -1399,7 +1399,8 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
   const cotEntries = cotCollector.observe(msg.method, params);
   const cotTurnId = turn.accepted?.at(-1)?.replyTurnId;
   if (cotTurnId && cotEntries.length > 0) {
-    emitMarker('thinking', { turnId: cotTurnId, entries: cotEntries });
+    const marker = prepareCodexAppCotMarker(cotTurnId, cotEntries);
+    if (marker) emitMarker('thinking', marker);
   }
 
   if (msg.method === 'item/started') {
