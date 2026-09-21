@@ -382,7 +382,9 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   //    (BOTS_CONFIG is the TOP of the registry precedence chain — a stale value
   //    silently redirects the child to a foreign registry).
   'BOTS_CONFIG',
+  'BOTMUX_ROUTING_ANCHOR',
   'BOTMUX_ROOT_MESSAGE_ID',
+  'BOTMUX_SESSION_SCOPE',
   // Session owner (standard name; `__OWNER_OPEN_ID` above is the legacy
   // channel). Custom CLI wrappers read it for per-user permission isolation.
   'BOTMUX_OWNER_OPEN_ID',
@@ -506,10 +508,11 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   'BOTMUX_SESSION_ID',
   'BOTMUX_CHAT_ID',
   'BOTMUX_CHAT_TYPE',
+  'BOTMUX_ROUTING_ANCHOR',
   'BOTMUX_ROOT_MESSAGE_ID',
   'BOTMUX_TURN_ID',
   'BOTMUX_DISPATCH_ATTEMPT',
-  // thread|chat scope, computed per session from rootMessageId (worker.ts).
+  // Explicit thread|chat scope frozen by the daemon; never inferred from an id.
   'BOTMUX_SESSION_SCOPE',
   // Daemon-authenticated session owner, both channels (applySessionOwnerEnv).
   'BOTMUX_OWNER_OPEN_ID',

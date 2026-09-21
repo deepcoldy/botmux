@@ -39,6 +39,55 @@ let resolveGroupDefaultModels: ((chatId: string) => Session['groupDefaultModels'
 let sqliteBootstrapAllowed = true;
 let loadFailure: Error | undefined;
 
+/** Optional metadata that must exist on a newly-created row from its first
+ * durable insert. Extending the existing intent object keeps every positional
+ * createSession caller source-compatible. */
+export interface CreateSessionIntent {
+  source?: SessionCreationSource;
+  inherit?: Session;
+  oneShot?: Session['oneShot'];
+  /** Trusted in-process initializer for fields that must share the first row
+   * insert (for example the opening turn's frozen reply context). */
+  initialize?: (session: Session) => void;
+}
+
+function oneShotRoutingIdentity(oneShot: NonNullable<Session['oneShot']>): string {
+  return JSON.stringify({
+    version: oneShot.version,
+    mode: oneShot.mode,
+    routingAnchor: oneShot.routingAnchor,
+    visibleLaneKey: oneShot.visibleLaneKey,
+    visibleRoute: oneShot.visibleRoute,
+    createdAt: oneShot.createdAt,
+    turnId: oneShot.turn.turnId,
+  });
+}
+
+function assertValidOneShotInitialization(
+  session: Session,
+  expectedIdentity: string | undefined,
+): void {
+  if (expectedIdentity === undefined) {
+    if (session.oneShot !== undefined) {
+      throw new Error('Session initializer cannot add one-shot metadata');
+    }
+    return;
+  }
+  if (!session.oneShot || oneShotRoutingIdentity(session.oneShot) !== expectedIdentity) {
+    throw new Error('Session initializer cannot change one-shot routing identity');
+  }
+  if (session.oneShot.turn.dispatchAttempt !== undefined
+      && (!Number.isSafeInteger(session.oneShot.turn.dispatchAttempt)
+        || session.oneShot.turn.dispatchAttempt < 1)) {
+    throw new Error('One-shot dispatchAttempt must be a positive safe integer');
+  }
+  if (session.oneShot.turn.workerGeneration !== undefined
+      && (!Number.isSafeInteger(session.oneShot.turn.workerGeneration)
+        || session.oneShot.turn.workerGeneration < 1)) {
+    throw new Error('One-shot workerGeneration must be a positive safe integer');
+  }
+}
+
 /**
  * The compatibility reader deliberately exposes an empty projection after a
  * read/parse failure. Destructive callers must use the strict API below so an
@@ -457,10 +506,12 @@ function sessionStatusText(value: unknown): string {
   return typeof status === 'string' ? status : '';
 }
 
-let testOnlyBeforeRowPersist: ((sessionId: string) => void) | undefined;
+let testOnlyBeforeRowPersist: ((sessionId: string, row: Session) => void) | undefined;
 /** Failure injection for the SQLite row write (the JSON engine was injectable
  *  through a node:fs mock; the sqlite-compat handle bypasses node:fs). */
-export function __testOnly_setBeforeRowPersist(hook: ((sessionId: string) => void) | undefined): void {
+export function __testOnly_setBeforeRowPersist(
+  hook: ((sessionId: string, row: Session) => void) | undefined,
+): void {
   testOnlyBeforeRowPersist = hook;
 }
 
@@ -1735,10 +1786,20 @@ function persistRow(session: Session): void {
       new Error(`session store ${getDbPath()} is not attached`),
     );
   }
-  testOnlyBeforeRowPersist?.(session.sessionId);
   const existing = ownStore.selectRow.get(session.sessionId) as { row: string } | undefined;
   if (existing) {
     const durable = JSON.parse(existing.row) as Session;
+    if (durable.oneShot) {
+      if (session.oneShot
+          && oneShotRoutingIdentity(session.oneShot) !== oneShotRoutingIdentity(durable.oneShot)) {
+        throw new Error('One-shot routing identity is immutable');
+      }
+      // Carry the complete durable record through a legacy whole-row writer so
+      // older code cannot erase the routing identity merely by omitting it.
+      if (!session.oneShot) session = { ...session, oneShot: durable.oneShot };
+    } else if (session.oneShot) {
+      throw new Error('One-shot metadata must be present in the first session insert');
+    }
     if (durable.cliInstanceBinding) {
       if (session.cliInstanceBinding && JSON.stringify(session.cliInstanceBinding) !== JSON.stringify(durable.cliInstanceBinding)) {
         throw new Error('Codex instance binding is immutable');
@@ -1750,6 +1811,7 @@ function persistRow(session: Session): void {
         wrapperCli: durable.wrapperCli, cliLaunchMode: durable.cliLaunchMode, agentFrozen: durable.agentFrozen };
     }
   }
+  testOnlyBeforeRowPersist?.(session.sessionId, structuredClone(session));
   const json = JSON.stringify(session);
   if (existing?.row === json) return;
   // Compare-and-set across the read/merge/write boundary. An offline writer
@@ -1766,7 +1828,7 @@ function buildNewSession(
   title: string,
   chatType?: 'group' | 'p2p',
   scope?: 'thread' | 'chat',
-  intent: { source?: SessionCreationSource; inherit?: Session } = {},
+  intent: CreateSessionIntent = {},
 ): Session {
   const bot = configuredCodexInstanceBot(currentAppId);
   const source = intent.source ?? 'other';
@@ -1786,11 +1848,24 @@ function buildNewSession(
     createdAt: new Date().toISOString(),
     creationSource: source,
     ...initial,
+    ...(intent.oneShot ? { oneShot: structuredClone(intent.oneShot) } : {}),
   };
   if (chatType !== 'p2p' && scope !== 'chat') {
     const models = resolveGroupDefaultModels?.(chatId);
     if (models && Object.keys(models).length) session.groupDefaultModels = structuredClone(models);
   }
+  const immutableSessionId = session.sessionId;
+  const immutableOneShotIdentity = session.oneShot
+    ? oneShotRoutingIdentity(session.oneShot)
+    : undefined;
+  intent.initialize?.(session);
+  if (session.sessionId !== immutableSessionId) {
+    throw new Error('Session initializer cannot change sessionId');
+  }
+  if (session.status !== 'active') {
+    throw new Error('Session initializer cannot change initial status');
+  }
+  assertValidOneShotInitialization(session, immutableOneShotIdentity);
   return session;
 }
 
@@ -1800,7 +1875,7 @@ export function createSession(
   title: string,
   chatType?: 'group' | 'p2p',
   scope?: 'thread' | 'chat',
-  intent: { source?: SessionCreationSource; inherit?: Session } = {},
+  intent: CreateSessionIntent = {},
 ): Session {
   loadForWrite();
   const session = buildNewSession(chatId, rootMessageId, title, chatType, scope, intent);
@@ -1825,7 +1900,11 @@ export function createSessionWithOwnedMutation<T>(
     title: string;
     chatType?: 'group' | 'p2p';
     scope?: 'thread' | 'chat';
-    intent?: { source?: SessionCreationSource; inherit?: Session };
+    intent?: CreateSessionIntent;
+    /** Initial one-shot metadata, persisted before the new row is observable. */
+    oneShot?: Session['oneShot'];
+    /** Trusted initializer applied before the new row's first insert. */
+    initialize?: (session: Session) => void;
     ownedSessionIds: readonly string[];
     /** Fail fast with SessionStoreBusyError instead of blocking the daemon's
      * event loop behind the connection's normal busy_timeout. */
@@ -1848,8 +1927,14 @@ export function createSessionWithOwnedMutation<T>(
     args.title,
     args.chatType,
     args.scope,
-    args.intent,
+    args.oneShot || args.initialize
+      ? { ...args.intent, oneShot: args.oneShot ?? args.intent?.oneShot, initialize: args.initialize ?? args.intent?.initialize }
+      : args.intent,
   );
+  const createdSessionId = created.sessionId;
+  const createdOneShotIdentity = created.oneShot
+    ? oneShotRoutingIdentity(created.oneShot)
+    : undefined;
   const fresh = new Map<string, Session>();
   let result!: T;
   runOwnedWriteTransaction(store, args.nonblocking === true, () => {
@@ -1859,6 +1944,13 @@ export function createSessionWithOwnedMutation<T>(
       fresh.set(sessionId, structuredClone(JSON.parse(hit.row) as Session));
     }
     result = mutate(fresh, created);
+    if (created.sessionId !== createdSessionId) {
+      throw new Error('Atomic session creation cannot change sessionId');
+    }
+    if (created.status !== 'active') {
+      throw new Error('Atomic session creation cannot change initial status');
+    }
+    assertValidOneShotInitialization(created, createdOneShotIdentity);
     for (const row of fresh.values()) persistRow(row);
     persistRow(created);
   });
@@ -2546,7 +2638,7 @@ export function persistActiveRemoteLineageExact(
       const next = applyChecksAndBuildNext(hit ? JSON.parse(hit.row) as Session : undefined);
       const json = JSON.stringify(next);
       if (json !== hit!.row) {
-        testOnlyBeforeRowPersist?.(sessionId);
+        testOnlyBeforeRowPersist?.(sessionId, structuredClone(next));
         db.prepare('UPDATE sessions SET status = ?, row = ? WHERE session_id = ?')
           .run(sessionStatusText(next), json, sessionId);
       }

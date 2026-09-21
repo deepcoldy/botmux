@@ -15,7 +15,7 @@ import { listChats } from '../../services/groups-store.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
-import { parseSlashCommandInvocation, resolvePassthroughCommands } from '../../core/command-handler.js';
+import { DAEMON_COMMANDS, parseSlashCommandInvocation, resolvePassthroughCommands } from '../../core/command-handler.js';
 import { isTopicHeader, parseTopicHeader, parseTopicHeaderWithLifecycleAliases } from '../../core/topic-header.js';
 import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
@@ -2359,6 +2359,27 @@ export interface RoutingContext {
    *  DM message id — resource downloads and merge-forward expansion must keep
    *  using it (the resource keys belong to the source message, PR review P1). */
   replyAnchorMessageId?: string;
+  /**
+   * Per-message ordinary-session dispatch identity. This is intentionally
+   * separate from `anchor`: the latter remains the user-visible Lark route,
+   * while `routingAnchor` gives the daemon a collision-proof, single-message
+   * session identity. The visible route is snapshotted and frozen before the
+   * dedicated callback so later routing mutations cannot change where this
+   * one-shot turn is allowed to reply.
+   */
+  ordinaryOneShot?: Readonly<{
+    physicalMessageId: string;
+    routingAnchor: string;
+    visibleLaneKey: string;
+    visibleRoute: Readonly<{
+      chatId: string;
+      chatType: 'group' | 'p2p';
+      scope: 'thread' | 'chat';
+      rootMessageId: string;
+      replyRootId?: string;
+      regularGroupTopLevel?: boolean;
+    }>;
+  }>;
   larkAppId: string;
   /** 本轮 inbound 的接纳阶段标记，由 daemon 的普通消息入口初始化、各接纳点翻转。
    *  必须是共享 mutable box 而非布尔字段：reroute 交接会浅拷贝 ctx
@@ -2367,6 +2388,83 @@ export interface RoutingContext {
    *  重发——本轮已进 durable queue / worker，重发会让同一任务再次入队执行。 */
   ingressAdmission?: { admitted: boolean };
 }
+
+type OrdinaryOneShotRouting = NonNullable<RoutingContext['ordinaryOneShot']>;
+
+/** Build the immutable split between a one-shot's internal identity and the
+ * legacy Lark route where its output remains visible. The leading NUL reserves
+ * these namespaces from user/provider ids without ever changing `ctx.anchor`. */
+function ordinaryOneShotRouting(ctx: RoutingContext): OrdinaryOneShotRouting {
+  const effectiveDestination = ctx.replyRootId
+    ?? (ctx.scope === 'thread' ? ctx.anchor : ctx.chatId);
+  const visibleRoute: OrdinaryOneShotRouting['visibleRoute'] = Object.freeze({
+    chatId: ctx.chatId,
+    chatType: ctx.chatType,
+    scope: ctx.scope,
+    rootMessageId: ctx.anchor,
+    ...(ctx.replyRootId !== undefined ? { replyRootId: ctx.replyRootId } : {}),
+    ...(ctx.regularGroupTopLevel !== undefined
+      ? { regularGroupTopLevel: ctx.regularGroupTopLevel }
+      : {}),
+  });
+  return Object.freeze({
+    physicalMessageId: ctx.messageId,
+    routingAnchor: `\0ordinary-one-shot:${ctx.larkAppId}:${ctx.messageId}`,
+    visibleLaneKey: `\0ordinary-visible:${ctx.larkAppId}:${ctx.chatId}:${ctx.scope}:${effectiveDestination}`,
+    visibleRoute,
+  });
+}
+
+function isOrdinaryOneShotTurn(input: {
+  ctx: RoutingContext;
+  senderType: unknown;
+  senderOpenId: string | undefined;
+  isRecognizedSlashCommand: boolean;
+  beforeSessionTurnRerouted: boolean;
+  sessionGroupBirthCandidate: boolean;
+  autoStartSpecialPath: boolean;
+  forwardFollowupPath: boolean;
+}): boolean {
+  const { ctx } = input;
+  const cfg = getBot(ctx.larkAppId).config;
+  if (cfg.ordinarySessionMode !== 'per_message' || cfg.cliId !== 'traex') return false;
+  // Fail closed on authorship. A peer recorded in the bot cross-reference does
+  // not become a human merely because a malformed/replayed event says `user`.
+  if (input.senderType !== 'user' || !input.senderOpenId
+      || isKnownPeerBot(config.session.dataDir, ctx.larkAppId, input.senderOpenId)) return false;
+  if (input.isRecognizedSlashCommand || input.beforeSessionTurnRerouted
+      || input.sessionGroupBirthCandidate || input.autoStartSpecialPath || input.forwardFollowupPath) return false;
+  return ctx.forceTopicApplied !== true
+    && ctx.promptOverride === undefined
+    && ctx.summaryCommand === undefined
+    && ctx.commandTrigger === undefined
+    && ctx.messageListener === undefined
+    && ctx.substituteTrigger === undefined
+    && ctx.forwardSeedData === undefined
+    && ctx.sessionGroupBirth !== true
+    && ctx.replyAnchorMessageId === undefined
+    && ctx.vcMeetingImTurnOrigin === undefined
+    && ctx.vcMeetingContextLifecycle === undefined
+    && ctx.vcMeetingContextMayLag === undefined;
+}
+
+function ordinaryOneShotErrorForLog(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  return raw.slice(0, 500).replace(/[\u0000-\u001f\u007f]/g, char => {
+    if (char === '\n' || char === '\r' || char === '\t') return ' ';
+    return `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`;
+  });
+}
+
+/** Commands consumed before generic daemon/CLI slash routing. Most are already
+ * returned from processMessageEvent before one-shot classification; keeping the
+ * complete documented set here makes the recognized-command boundary explicit
+ * and covers daemon-only rewrites such as /workflow and /template. */
+const PREROUTING_SLASH_COMMANDS = new Set([
+  '/reply-mode', '/substitute', '/grant', '/revoke', '/introduce', '/invite',
+  '/summary', '/t', '/topic', '/th', '/tw', '/workflow', '/template',
+  '/tabs', '/tab', '/mention-mode',
+]);
 
 interface PendingForwardTopicPayload {
   data: any;
@@ -2645,6 +2743,10 @@ export interface EventHandlers {
   handleCardAction: (data: any, larkAppId: string) => Promise<any>;
   handleNewTopic: (data: any, ctx: RoutingContext) => Promise<void>;
   handleThreadReply: (data: any, ctx: RoutingContext) => Promise<void>;
+  /** Dispatch a human-authored ordinary turn into its own one-shot session.
+   * The daemon owns visible-lane serialization through terminal settlement and
+   * close; the dispatcher must call this directly, outside serializeByAnchor. */
+  handleOrdinaryOneShot?: (data: any, ctx: RoutingContext) => Promise<void>;
   /** Validate a syntactically valid topic header before routing mutates scope.
    * The daemon supplies the same semantic resolver used by handleNewTopic. */
   validateTopicHeader?: (header: import('../../core/topic-header.js').TopicHeader, larkAppId: string) => boolean;
@@ -4327,6 +4429,10 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const triggeredCommand = isControlCommand
         ? parseSlashCommandInvocation(strippedRoutingText)?.cmd
         : undefined;
+      const isRecognizedSlashCommand = !!triggeredCommand
+        && (DAEMON_COMMANDS.has(triggeredCommand)
+          || resolvePassthroughCommands(larkAppId).has(triggeredCommand)
+          || PREROUTING_SLASH_COMMANDS.has(triggeredCommand));
       // 命令是不是排在所有 @ 之前 —— 用来区分 @ 的两种位置（两者的
       // mentionsAnotherMember 都为 true，光看那个布尔值分不出来）：
       //   `@张三 /solve 看看`  → 先点名再下命令，是把活儿交给张三 → 让路
@@ -4338,6 +4444,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const commandLeadsMessage = commandPrecedesMentions(message);
       let pairedForwardSeed;
       let stalePendingSeed;
+      let autoStartSpecialPath = false;
       // Require isAllowed before pairing: a root-linked clarification from a
       // sender who was /revoked within the grace window must not consume the
       // seed from the buffer or overwrite the durable paired record. The seed
@@ -4538,6 +4645,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
               logger.debug(`Ignoring group message not addressed to bot: ${messageId}`);
               return;
             }
+            autoStartSpecialPath = true;
             logger.info(`[auto-start:新话题] ${chatId.substring(0, 12)} 新话题免@自动开工 msg=${messageId.substring(0, 12)}`);
           }
         }
@@ -4575,10 +4683,16 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         messageListener,
         forwardSeedData: pairedForwardSeed?.payload.data,
       };
+      let beforeSessionTurnRerouted = false;
       if (explicitlyMentionedThisBot) {
+        const anchorBeforeHook = ctx.anchor;
         const before = await handlers.beforeSessionTurn?.(data, ctx, { senderOpenId, explicitlyMentionedThisBot });
         if (before?.block) return;
-        if (before?.anchorOverride) ctx.anchor = before.anchorOverride;
+        if (before?.anchorOverride) {
+          beforeSessionTurnRerouted = true;
+          ctx.anchor = before.anchorOverride;
+        }
+        beforeSessionTurnRerouted ||= ctx.anchor !== anchorBeforeHook;
         ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? ownsSession;
       }
       const payload = { data, ctx, ownsSession } satisfies PendingForwardTopicPayload;
@@ -4649,6 +4763,43 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           void dispatchHumanMessage(payload)
             .catch(err => logger.error(`Error handling message event: ${err}`));
         }).catch(err => logger.error(`Error awaiting restored sessions for stale seed: ${err}`));
+        return;
+      }
+
+      // Re-read ownership after every async routing hook/hold decision for the
+      // legacy fallback. Per-message ordinary mode deliberately ignores this
+      // value: even a reply in an established visible thread gets a fresh
+      // one-shot execution identity.
+      ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? ownsSession;
+      payload.ownsSession = ownsSession;
+      const ordinaryOneShot = isOrdinaryOneShotTurn({
+        ctx,
+        senderType,
+        senderOpenId,
+        isRecognizedSlashCommand,
+        beforeSessionTurnRerouted,
+        sessionGroupBirthCandidate: chatType === 'p2p'
+          && getBot(larkAppId).config.p2pMode === 'group'
+          && ctx.scope === 'thread'
+          && ctx.anchor === messageId
+          && !message.thread_id
+          && !isControlCommand,
+        autoStartSpecialPath,
+        forwardFollowupPath: !!pairedForwardSeed || !!stalePendingSeed || shouldDelayTopicSeed,
+      });
+      if (ordinaryOneShot) {
+        if (!handlers.handleOrdinaryOneShot) {
+          logger.error(
+            `[ordinary-one-shot] per_message enabled but no handler is registered `
+            + `app=${larkAppId} msg=${messageId.substring(0, 12)}`,
+          );
+          return;
+        }
+        ctx.ordinaryOneShot = ordinaryOneShotRouting(ctx);
+        void handlers.handleOrdinaryOneShot(data, ctx)
+          .catch(err => logger.error(
+            `Error handling ordinary one-shot message event: ${ordinaryOneShotErrorForLog(err)}`,
+          ));
         return;
       }
 

@@ -4206,6 +4206,126 @@ describe('Codex App clean-input feature gate', () => {
   });
 });
 
+describe('ordinary per-message worker lifecycle', () => {
+  const turnId = 'om_one_shot_turn';
+  const dispatchAttempt = 7;
+  const routingAnchor = '\0ordinary-one-shot:app_test:om_one_shot_turn';
+
+  function makeOneShotDs(overrides?: Partial<DaemonSession>): DaemonSession {
+    const ds = makeDs({
+      scope: 'thread',
+      currentReplyTarget: {
+        rootMessageId: 'om_mutable_later_target',
+        turnId: 'om_later_turn',
+        updatedAt: '2026-05-27T00:01:00.000Z',
+      },
+      ...overrides,
+    });
+    ds.session.rootMessageId = 'om_visible_root';
+    ds.session.scope = 'thread';
+    ds.session.oneShot = {
+      version: 1,
+      mode: 'ordinary_per_message',
+      routingAnchor,
+      visibleLaneKey: '\0ordinary-visible:app_test:oc_chat:thread:om_visible_root',
+      visibleRoute: {
+        chatId: 'oc_chat',
+        chatType: 'group',
+        scope: 'thread',
+        rootMessageId: 'om_visible_root',
+        replyRootId: 'om_frozen_quote_target',
+      },
+      createdAt: '2026-05-27T00:00:00.000Z',
+      turn: { turnId, dispatchAttempt },
+    };
+    ds.session.turnReplyContexts = {
+      [turnId]: { target: { mode: 'quote', rootMessageId: 'om_frozen_quote_target' } },
+    };
+    return ds;
+  }
+
+  it('starts only the exact frozen turn and sends its explicit route contract', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex', codexRpcInput: true }));
+    const ds = makeOneShotDs();
+
+    expect(forkWorker(ds, 'one-shot prompt', {
+      resume: false,
+      turnId,
+      dispatchAttempt,
+    })).toBe(true);
+
+    const init = vi.mocked((ds.worker as any).send).mock.calls[0][0];
+    expect(init).toEqual(expect.objectContaining({
+      type: 'init',
+      routingAnchor,
+      scope: 'thread',
+      rootMessageId: 'om_visible_root',
+      turnId,
+      replyTurnId: turnId,
+      dispatchAttempt,
+      replyTarget: { mode: 'quote', rootMessageId: 'om_frozen_quote_target' },
+      resume: false,
+      codexRpcInput: true,
+      disableCrossSessionMemories: true,
+    }));
+    expect(init.routingAnchor).not.toBe(init.rootMessageId);
+    expect(ds.session.oneShot?.turn.workerGeneration).toBe(1);
+    expect(ds.workerGeneration).toBe(1);
+    expect(ds.session.workerGeneration).toBe(1);
+  });
+
+  it.each([
+    ['resume', { resume: true, turnId, dispatchAttempt }, false, false],
+    ['wrong turn', { resume: false, turnId: 'om_wrong_turn', dispatchAttempt }, false, false],
+    ['wrong attempt', { resume: false, turnId, dispatchAttempt: dispatchAttempt + 1 }, false, false],
+    ['missing frozen context', { resume: false, turnId, dispatchAttempt }, true, false],
+    ['live worker', { resume: false, turnId, dispatchAttempt }, false, true],
+  ] as const)('refuses %s before spawning a one-shot worker', (_case, options, removeContext, liveWorker) => {
+    const ds = makeOneShotDs(liveWorker ? { worker: makeFakeWorker() } : undefined);
+    if (removeContext) delete ds.session.turnReplyContexts;
+    const admissions: string[] = [];
+
+    expect(forkWorker(ds, 'must not run', options, {
+      onAdmission: admission => admissions.push(admission),
+    })).toBe(false);
+
+    expect(admissions).toEqual(['rejected']);
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+
+  it('does not derive memory-disable launch wiring for non-TraeX one-shot sessions', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex' }));
+    const ds = makeOneShotDs();
+
+    expect(forkWorker(ds, 'one-shot prompt', {
+      resume: false,
+      turnId,
+      dispatchAttempt,
+    })).toBe(true);
+
+    const init = vi.mocked((ds.worker as any).send).mock.calls[0][0];
+    expect(init).not.toHaveProperty('disableCrossSessionMemories');
+  });
+
+  it.each([
+    ['fork', { pendingForkSession: true }],
+    ['external app-server', { existingAppServerEndpoint: 'unix:///tmp/app-server.sock', cliSessionId: 'thread-1' }],
+    ['adopt', { adoptedFrom: { sessionId: 'external' } }],
+  ] as const)('refuses %s lifecycle before deriving memory-disable wiring', (_case, sessionPatch) => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeOneShotDs();
+    Object.assign(ds.session, sessionPatch);
+
+    expect(forkWorker(ds, 'must not run', {
+      resume: false,
+      turnId,
+      dispatchAttempt,
+    })).toBe(false);
+
+    expect(forkMock).not.toHaveBeenCalled();
+  });
+});
+
 describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', () => {
   // A tmux-adopted claude-code session whose bridge worker has exited. When a
   // new Lark turn arrives, the daemon's worker-null branch now routes adopt
@@ -4227,6 +4347,30 @@ describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', ()
       },
     });
   }
+
+  it('rejects adopt-forking an ordinary per-message session', () => {
+    const ds = makeAdoptDs();
+    ds.session.oneShot = {
+      version: 1,
+      mode: 'ordinary_per_message',
+      routingAnchor: '\0ordinary-one-shot:app_test:om_adopt_one_shot',
+      visibleLaneKey: '\0ordinary-visible:app_test:oc_chat:thread:om_root',
+      visibleRoute: {
+        chatId: 'oc_chat',
+        chatType: 'group',
+        scope: 'thread',
+        rootMessageId: 'om_root',
+      },
+      createdAt: '2026-05-27T00:00:00.000Z',
+      turn: { turnId: 'om_adopt_one_shot', dispatchAttempt: 1 },
+    };
+
+    expect(forkAdoptWorker(ds, {
+      prompt: '<bridge>must not run</bridge>',
+      turnId: 'om_adopt_one_shot',
+    })).toBe('rejected');
+    expect(forkMock).not.toHaveBeenCalled();
+  });
 
   it('forwards the re-fork prompt + turnId into the adopt init (not dropped)', () => {
     const ds = makeAdoptDs();

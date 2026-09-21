@@ -5,6 +5,7 @@ import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexRpcEngine } from '../src/codex-rpc-engine.js';
+import { TRAEX_DISABLE_CROSS_SESSION_MEMORY_CONFIG } from '../src/adapters/cli/traex.js';
 
 const isAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 
@@ -87,6 +88,36 @@ describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', ()
       await engine.start();
       expect(launches[0]?.args).not.toContain('features.multi_agent=false');
       expect(launches[0]?.args).not.toContain('features.multi_agent_v2=false');
+    } finally {
+      engine.stop();
+    }
+  }, 20_000);
+
+  it('passes TraeX memory-disable config overrides to the model-owning app-server', async () => {
+    const launches: Array<{ args: string[] }> = [];
+    const engine = makeEngine({
+      appServerFeatures: ['default_mode_request_user_input'],
+      appServerConfig: [
+        'hooks.PreToolUse=[{matcher="spawn_agent",hooks=[]}]',
+        ...TRAEX_DISABLE_CROSS_SESSION_MEMORY_CONFIG,
+      ],
+    }, {
+      spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess {
+        launches.push({ args: [...args] });
+        return spawn(command, args, options);
+      },
+    });
+    try {
+      await engine.start();
+      expect(launches[0]?.args).toEqual([
+        'app-server',
+        '--enable', 'default_mode_request_user_input',
+        '-c', 'hooks.PreToolUse=[{matcher="spawn_agent",hooks=[]}]',
+        '-c', 'memories.use_memories=false',
+        '-c', 'memories.generate_memories=false',
+        '--listen', engine.wsUrl,
+      ]);
+      expect(launches[0]?.args).not.toContain('--disable');
     } finally {
       engine.stop();
     }

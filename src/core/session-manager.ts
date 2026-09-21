@@ -1218,6 +1218,9 @@ type NewTopicOpts = {
   chatContext?: ChatContext;
   turnId?: string;
   sessionBackendType?: BackendType;
+  /** One-shot ordinary messages are intentionally context-isolated: do not
+   * inject persisted group/team role or summary-memory content. */
+  suppressPersistedContext?: boolean;
   /** replyDelivery=transcript 且本轮是 solo 会话（daemon 算好的 ds.soloSession）：
    *  去掉 <user_message> 壳与 sender/attachments/mentions 块，改用裸文本 +
    *  `[附件]`/`[@提及]` 行（buildBridgeInputContent）。send 模式下忽略。 */
@@ -1317,13 +1320,17 @@ function buildNewTopicBlocks(
     ].join('\n');
   }
 
-  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId);
+  const roleBlock = opts?.suppressPersistedContext
+    ? ''
+    : renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId);
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport,
     replyDelivery,
   });
-  const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId);
+  const summaryMemoryBlock = opts?.suppressPersistedContext
+    ? ''
+    : renderSummaryMemoryBlock(opts?.larkAppId);
   const chatContextPolicyBlock = renderChatContextPolicyBlock(opts?.chatContext, locale);
   const chatContextBlock = renderChatContextBlock(opts?.chatContext);
 
@@ -1470,6 +1477,8 @@ export function buildNewTopicCliInput(
     turnId?: string;
     /** 会话冻结的后端类型，用于 hook 模式判定（远端后端无本地 hook 进程）。 */
     sessionBackendType?: BackendType;
+    /** See NewTopicOpts.suppressPersistedContext. Defaults false. */
+    suppressPersistedContext?: boolean;
   },
 ): CliTurnPayload {
   // hook 注入模式（#794 后续）：opening 也走 sidecar——whiteboard/sender/mentions
@@ -1511,13 +1520,17 @@ export function buildNewTopicCliInput(
   if (cliId !== 'codex-app' || (followUps && followUps.length > 0 && !opts?.codexAppFollowUps)) {
     return { content, ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}) };
   }
-  const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId);
+  const roleBlock = opts?.suppressPersistedContext
+    ? ''
+    : renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId);
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport: sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
     replyDelivery: replyDeliveryFor(opts?.larkAppId, cliId),
   });
-  const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId);
+  const summaryMemoryBlock = opts?.suppressPersistedContext
+    ? ''
+    : renderSummaryMemoryBlock(opts?.larkAppId);
   const senderBlock = renderSenderTag(sender, opts?.larkAppId);
   const substitutePolicyBlock = renderSubstitutePolicy(opts?.substituteTrigger);
   const substituteTargetBlock = renderSubstituteTarget(opts?.substituteTrigger);
@@ -3327,6 +3340,8 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
  *                          a fresh thread session); refuse rather than clobber
  *   - 'adopt_unsupported' — adopt sessions are torn down by /close and have
  *                          no resume semantics
+ *   - 'one_shot_unsupported' — ordinary per-message sessions are terminal
+ *                          records; every new message must create a new row
  *   - 'deferred_unmaterialized' — a silent fresh-topic run finished without
  *                          publishing, so it has no conversation to resume
  *   - 'resume_cancelled' — a concurrent close won while resume was committing
@@ -3335,10 +3350,13 @@ export async function resumeSession(
   sessionId: string,
   activeSessions: Map<string, DaemonSession>,
 ): Promise<{ ok: true; ds: DaemonSession }
-| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled'; activeSessionId?: string }> {
+| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'one_shot_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled'; activeSessionId?: string }> {
   let session = sessionStore.getSession(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
+  if (session.oneShot?.mode === 'ordinary_per_message') {
+    return { ok: false, error: 'one_shot_unsupported' };
+  }
 
   // Plan B: a VC meeting agent is an ordinary chat-scope session, so a closed one
   // resumes into its normal (chatId, appId) slot like any chat session — the old
@@ -3373,6 +3391,9 @@ export async function resumeSession(
   const latest = sessionStore.getSession(sessionId);
   if (!latest) return { ok: false as const, error: 'not_found' as const };
   if (latest.status !== 'closed') return { ok: false as const, error: 'not_closed' as const };
+  if (latest.oneShot?.mode === 'ordinary_per_message') {
+    return { ok: false as const, error: 'one_shot_unsupported' as const };
+  }
   if (latest.deferredScheduleRun
     && !readDeferredTopicBinding(config.session.dataDir, latest.sessionId)) {
     return { ok: false as const, error: 'deferred_unmaterialized' as const };

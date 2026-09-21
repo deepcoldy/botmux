@@ -1,6 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { resolveHiddenStreamingCardButtons } from '../src/im/lark/streaming-card-buttons.js';
+import type { Session } from '../src/types.js';
 
 function buildStreamingCardCallSites(source: string): string[] {
   const sites: string[] = [];
@@ -32,8 +34,28 @@ describe('streaming-card button policy wiring', () => {
       const source = readFileSync(resolve(rel), 'utf8');
       const sites = buildStreamingCardCallSites(source);
       expect(sites.length).toBeGreaterThan(0);
-      const missing = sites.filter(s => !s.includes('resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config)'));
+      const missing = sites.filter(s => !s.includes(
+        'resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session)',
+      ));
       expect(missing).toEqual([]);
     });
   }
+
+  it('forces close hidden for ordinary one-shot cards while preserving bot policy', () => {
+    const session = {
+      oneShot: { mode: 'ordinary_per_message' },
+    } as Pick<Session, 'oneShot'>;
+
+    expect(resolveHiddenStreamingCardButtons(
+      { hiddenStreamingCardButtons: ['terminal', 'terminal', 'unknown'] },
+      session,
+    )).toEqual(['terminal', 'close']);
+  });
+
+  it('does not alter the configured card policy for reusable sessions', () => {
+    expect(resolveHiddenStreamingCardButtons(
+      { hiddenStreamingCardButtons: ['terminal'] },
+      {} as Pick<Session, 'oneShot'>,
+    )).toEqual(['terminal']);
+  });
 });

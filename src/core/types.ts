@@ -766,6 +766,8 @@ export function claimCurrentRepoCard(ds: DaemonSession, cardMessageId: string | 
  *  sessions, rootMessageId for thread-scope. Used to compute `sessionKey()` at
  *  storage and lookup time. */
 export function sessionAnchorId(ds: DaemonSession): string {
+  const oneShotAnchor = ds.session.oneShot?.routingAnchor;
+  if (oneShotAnchor) return oneShotAnchor;
   const deferredAnchor = ds.session.deferredScheduleRun?.routingAnchor;
   if (deferredAnchor) return deferredAnchor;
   return ds.scope === 'chat' ? ds.chatId : ds.session.rootMessageId;
@@ -775,9 +777,10 @@ export function sessionAnchorId(ds: DaemonSession): string {
  * a DaemonSession. Deferred schedule runs are isolated even though their
  * visible delivery surface is a chat. */
 export function storedSessionAnchorId(
-  session: Pick<Session, 'scope' | 'chatId' | 'rootMessageId' | 'deferredScheduleRun'>,
+  session: Pick<Session, 'scope' | 'chatId' | 'rootMessageId' | 'deferredScheduleRun' | 'oneShot'>,
 ): string {
-  return session.deferredScheduleRun?.routingAnchor
+  return session.oneShot?.routingAnchor
+    ?? session.deferredScheduleRun?.routingAnchor
     ?? (session.scope === 'chat' ? session.chatId : session.rootMessageId);
 }
 

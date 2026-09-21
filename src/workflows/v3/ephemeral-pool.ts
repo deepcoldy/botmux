@@ -232,12 +232,17 @@ async function runNodeImpl(
   // permission isolation (BOTMUX_OWNER_OPEN_ID is daemon-authenticated at run
   // birth — a CLI child cannot forge it).  Standalone/dev runs keep synthetic
   // values and get no owner env at all.
+  const chatId = req.chatBinding?.chatId ?? `v3-chat-${req.runId}`;
+  const rootMessageId = req.chatBinding?.rootMessageId ?? `v3-root-${req.attemptId}`;
+  const scope = req.chatBinding?.rootMessageId ? 'thread' as const : 'chat' as const;
   const init = {
     type: 'init' as const,
     sessionId,
-    chatId: req.chatBinding?.chatId ?? `v3-chat-${req.runId}`,
+    chatId,
     ...(req.chatBinding?.chatType ? { chatType: req.chatBinding.chatType } : {}),
-    rootMessageId: req.chatBinding?.rootMessageId ?? `v3-root-${req.attemptId}`,
+    routingAnchor: scope === 'chat' ? chatId : rootMessageId,
+    scope,
+    rootMessageId,
     ...(req.chatBinding?.ownerOpenId ? { ownerOpenId: req.chatBinding.ownerOpenId } : {}),
     workingDir: cwd,
     cliId: req.botSnapshot.cliId,

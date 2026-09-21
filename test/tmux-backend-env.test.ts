@@ -90,6 +90,16 @@ describe('buildBotmuxEnvAssignments() — CA bundle', () => {
 });
 
 describe('buildBotmuxEnvAssignments()', () => {
+  it('forwards the routing anchor and session scope into the tmux pane', () => {
+    const out = buildBotmuxEnvAssignments({
+      BOTMUX_ROUTING_ANCHOR: 'om_anchor',
+      BOTMUX_SESSION_SCOPE: 'thread',
+    });
+
+    expect(out).toContain('BOTMUX_ROUTING_ANCHOR=om_anchor');
+    expect(out).toContain('BOTMUX_SESSION_SCOPE=thread');
+  });
+
   it('forwards only the daemon-side keys; bare LARK_APP_* are NOT forwarded', () => {
     const out = buildBotmuxEnvAssignments({
       // Bare creds must never reach the child — the worker redacts them

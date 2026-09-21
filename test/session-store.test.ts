@@ -219,6 +219,45 @@ describe('mutateOwnedSessionsAtomically()', () => {
 });
 
 describe('createSessionWithOwnedMutation()', () => {
+  it('persists initialized child metadata in the atomic child insert', () => {
+    const parent = createSession('chat-a', 'root-a', 'parent');
+    const oneShot = {
+      version: 1 as const,
+      mode: 'ordinary_per_message' as const,
+      routingAnchor: 'oneshot:app:om_child',
+      visibleLaneKey: 'thread:om_visible',
+      visibleRoute: { chatId: 'chat-a', scope: 'thread' as const, rootMessageId: 'om_visible' },
+      createdAt: '2026-09-21T01:02:03.000Z',
+      turn: { turnId: 'om_child' },
+    };
+    let firstChildInsert: Record<string, any> | undefined;
+    __testOnly_setBeforeRowPersist((_sessionId, row) => {
+      if (row.oneShot) firstChildInsert = row;
+    });
+
+    const created = createSessionWithOwnedMutation({
+      chatId: 'chat-a',
+      rootMessageId: 'om_visible',
+      title: 'child',
+      scope: 'thread',
+      oneShot,
+      initialize: child => {
+        child.turnReplyContexts = {
+          om_child: { target: { mode: 'thread', rootMessageId: 'om_visible' } },
+        };
+      },
+      ownedSessionIds: [parent.sessionId],
+    }, () => undefined);
+
+    expect(firstChildInsert).toEqual(readPersistedRows(tempDir)[created.session.sessionId]);
+    expect(firstChildInsert).toMatchObject({
+      oneShot,
+      turnReplyContexts: {
+        om_child: { target: { mode: 'thread', rootMessageId: 'om_visible' } },
+      },
+    });
+  });
+
   it('publishes the child and parent-side authority in one commit', () => {
     const parent = createSession('chat-a', 'root-a', 'parent');
     const created = createSessionWithOwnedMutation({
@@ -511,6 +550,121 @@ describe('createSession()', () => {
     const data = readPersistedRows(tempDir);
     expect(data[session.sessionId]).toBeDefined();
     expect(data[session.sessionId].title).toBe('Persisted');
+  });
+
+  it('persists complete one-shot routing and lifecycle metadata in the first insert', () => {
+    const oneShot = {
+      version: 1 as const,
+      mode: 'ordinary_per_message' as const,
+      routingAnchor: 'oneshot:app:om_turn_1',
+      visibleLaneKey: 'thread:om_visible_root',
+      visibleRoute: {
+        chatId: 'oc_group',
+        chatType: 'group' as const,
+        scope: 'thread' as const,
+        rootMessageId: 'om_visible_root',
+        replyRootId: 'om_visible_root',
+      },
+      createdAt: '2026-09-21T01:02:03.000Z',
+      turn: { turnId: 'om_turn_1', dispatchAttempt: 1, workerGeneration: 4 },
+      retirement: {
+        version: 1 as const,
+        turnId: 'om_turn_1',
+        dispatchAttempt: 1,
+        workerGeneration: 4,
+        phase: 'armed' as const,
+        delivery: { state: 'pending' as const },
+        updatedAt: '2026-09-21T01:02:03.000Z',
+      },
+    };
+    const openingReplyContext = {
+      target: { mode: 'thread' as const, rootMessageId: 'om_visible_root' },
+      quoteTargetId: 'om_turn_1',
+      replyTargetSenderOpenId: 'ou_sender',
+    };
+    let rowAtFirstPersist: Record<string, any> | undefined;
+    __testOnly_setBeforeRowPersist((sessionId, row) => {
+      const store = new DatabaseSync(join(tempDir, 'sessions.db'));
+      try {
+        const hit = store.prepare('SELECT row FROM sessions WHERE session_id = ?')
+          .get(sessionId) as { row: string } | undefined;
+        expect(hit).toBeUndefined();
+      } finally {
+        store.close();
+      }
+      if (row.oneShot) rowAtFirstPersist = row;
+    });
+
+    const session = createSession(
+      'oc_group',
+      'om_visible_root',
+      'One shot',
+      'group',
+      'thread',
+      {
+        source: 'ordinary-feishu',
+        oneShot,
+        initialize: created => {
+          created.turnReplyContexts = { om_turn_1: openingReplyContext };
+        },
+      },
+    );
+    const firstPersistedRow = readPersistedRows(tempDir)[session.sessionId];
+
+    expect(firstPersistedRow).toMatchObject({
+      chatId: 'oc_group',
+      rootMessageId: 'om_visible_root',
+      scope: 'thread',
+      oneShot,
+      turnReplyContexts: { om_turn_1: openingReplyContext },
+    });
+    expect(rowAtFirstPersist).toEqual(firstPersistedRow);
+    expect(getOwnedSession(session.sessionId)?.oneShot).toEqual(oneShot);
+  });
+
+  it('rejects initializers that rewrite one-shot identity before insertion', () => {
+    const oneShot = {
+      version: 1 as const,
+      mode: 'ordinary_per_message' as const,
+      routingAnchor: 'oneshot:app:om_turn_1',
+      visibleLaneKey: 'thread:om_root',
+      visibleRoute: { chatId: 'oc_group', scope: 'thread' as const, rootMessageId: 'om_root' },
+      createdAt: '2026-09-21T01:02:03.000Z',
+      turn: { turnId: 'om_turn_1' },
+    };
+
+    expect(() => createSession('oc_group', 'om_root', 'Invalid', 'group', 'thread', {
+      source: 'ordinary-feishu',
+      oneShot,
+      initialize: created => { created.oneShot!.routingAnchor = 'rewritten'; },
+    })).toThrow('Session initializer cannot change one-shot routing identity');
+    expect(listSessionsStrict()).toEqual([]);
+  });
+
+  it('does not allow a legacy initializer to opt into one-shot metadata', () => {
+    expect(() => createSession('oc_group', 'om_root', 'Invalid', 'group', 'thread', {
+      source: 'ordinary-feishu',
+      initialize: created => {
+        created.oneShot = {
+          version: 1,
+          mode: 'ordinary_per_message',
+          routingAnchor: 'oneshot:app:om_turn',
+          visibleLaneKey: 'thread:om_root',
+          visibleRoute: { chatId: 'oc_group', scope: 'thread', rootMessageId: 'om_root' },
+          createdAt: '2026-09-21T01:02:03.000Z',
+          turn: { turnId: 'om_turn' },
+        };
+      },
+    })).toThrow('Session initializer cannot add one-shot metadata');
+    expect(listSessionsStrict()).toEqual([]);
+  });
+
+  it('keeps legacy createSession rows free of one-shot metadata', () => {
+    const session = createSession('chat1', 'root1', 'Legacy', 'group', 'thread');
+    const persisted = readPersistedRows(tempDir)[session.sessionId];
+
+    expect(session).not.toHaveProperty('oneShot');
+    expect(persisted).not.toHaveProperty('oneShot');
   });
 
   it('should default chatType to undefined when not provided', () => {

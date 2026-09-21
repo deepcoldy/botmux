@@ -428,7 +428,10 @@ import {
   type HookInstallConfig,
 } from './adapters/hook-installer.js';
 import { hookCommandFor, nativeSubagentRuntimeHookCommand } from './adapters/hook-command.js';
-import { traexNativeSubagentHookConfig } from './adapters/cli/traex.js';
+import {
+  TRAEX_DISABLE_CROSS_SESSION_MEMORY_CONFIG,
+  traexNativeSubagentHookConfig,
+} from './adapters/cli/traex.js';
 import { findOnlineDaemon, parseDaemonIpcPort } from './utils/daemon-discovery.js';
 import { fetchDaemonIpc } from './core/daemon-ipc-auth.js';
 import { withCodexAppContext } from './utils/codex-app-context.js';
@@ -1275,8 +1278,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     if (cfg.chatType) engineEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
     else delete engineEnv.BOTMUX_CHAT_TYPE;
     engineEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
-    engineEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
-    engineEnv.BOTMUX_SESSION_SCOPE = cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat';
+    applyInitRoutingEnv(engineEnv, cfg);
     // The app-server owns model execution in RPC mode. Its MCP gateway child
     // must inherit the trusted host socket just like a native CLI process does.
     if (sessionMcpGatewayHost) {
@@ -1300,7 +1302,10 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
       model: cfg.model, modelBackendVariant: cfg.modelBackendVariant, reasoningEffort: cfg.reasoningEffort, log: (m: string) => log(m),
       appServerFeatures: cfg.cliId === 'traex' ? ['default_mode_request_user_input'] : undefined,
       appServerConfig: cfg.cliId === 'traex'
-        ? [traexNativeSubagentHookConfig(nativeSubagentRuntimeHookCommand())]
+        ? [
+          traexNativeSubagentHookConfig(nativeSubagentRuntimeHookCommand()),
+          ...(cfg.disableCrossSessionMemories ? TRAEX_DISABLE_CROSS_SESSION_MEMORY_CONFIG : []),
+        ]
         : undefined,
       readonlyContinuationHardened: readonlyContinuationEnabled,
       onRequestUserInput: cfg.cliId === 'traex'
@@ -2283,6 +2288,20 @@ function ensureZellijAttachConfig(): string {
 let sessionId = '';
 let lastInitConfig: Extract<DaemonToWorker, { type: 'init' }> | null = null;
 
+/** Apply the daemon's explicit route tuple to every process that can invoke
+ * botmux routing helpers. Identifier shape is never routing authority. */
+function applyInitRoutingEnv(
+  env: NodeJS.ProcessEnv | Record<string, string>,
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+): void {
+  if (cfg.routingAnchor) env.BOTMUX_ROUTING_ANCHOR = cfg.routingAnchor;
+  else delete env.BOTMUX_ROUTING_ANCHOR;
+  env.BOTMUX_SESSION_SCOPE = cfg.scope
+    ?? (cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat');
+  if (cfg.rootMessageId) env.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
+  else delete env.BOTMUX_ROOT_MESSAGE_ID;
+}
+
 /** 本会话最终回复的投递方式。daemon 在 init 上冻结（core/reply-delivery.ts），
  *  抑制闸据此判断 final 是「兜底」还是「投递通道」。读不到一律 'send'——
  *  fail-closed 等于历史行为。 */
@@ -2336,6 +2355,7 @@ let codexUpgradeInspectionBlock: string | undefined;
 let codexRuntimeObservedGeneration = -1;
 
 function codexUpgradeBlocked(): string | undefined {
+  if (lastInitConfig?.replyTarget) return 'ordinary per-message worker cannot be restarted';
   if (!lastInitConfig || !backend || !isPromptReady || awaitingFirstPrompt) return 'waiting for a ready session';
   if (lastInitConfig.adoptMode || lastInitConfig.existingAppServerEndpoint) return 'externally owned session';
   if (lastInitConfig.wrapperCli?.trim()) return 'a configured CLI wrapper controls the runtime';
@@ -5100,7 +5120,22 @@ function readSendMarkers(): BridgeSendMarker[] {
   }
 }
 
+/** One-shot workers may observe an old or concurrent marker in the same file
+ * and time window. Only their immutable init tuple is allowed to influence
+ * suppression or retirement. Legacy reusable sessions retain window matching. */
+function sendMarkersForTurn(
+  markers: readonly BridgeSendMarker[],
+  turnId: string,
+  dispatchAttempt: number | undefined,
+): readonly BridgeSendMarker[] {
+  if (!lastInitConfig?.replyTarget) return markers;
+  return markers.filter(marker =>
+    marker.turnId === turnId && marker.dispatchAttempt === dispatchAttempt);
+}
+
 function explicitReplyMarkerForTurnWindow(
+  turnId: string,
+  dispatchAttempt: number | undefined,
   turn: { markTimeMs: number | undefined; isLocal: boolean | undefined },
   nextBoundaryMs: number | undefined,
   markers: readonly BridgeSendMarker[],
@@ -5110,7 +5145,9 @@ function explicitReplyMarkerForTurnWindow(
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
   const inWindow = markers.filter(marker => marker.sentAtMs >= lower && marker.sentAtMs < upper
-    && (marker.replyCardResponseKind === undefined || marker.replyCardResponseKind === 'final'));
+    && (marker.replyCardResponseKind === undefined || marker.replyCardResponseKind === 'final')
+    && (!lastInitConfig?.replyTarget
+      || (marker.turnId === turnId && marker.dispatchAttempt === dispatchAttempt)));
   return inWindow.at(-1);
 }
 
@@ -5122,6 +5159,7 @@ function notifyExplicitReplyObserved(
   send({
     type: 'explicit_reply_observed',
     turnId,
+    ...(marker.dispatchAttempt !== undefined ? { dispatchAttempt: marker.dispatchAttempt } : {}),
     ...(marker.messageId ? { messageId: marker.messageId } : {}),
     ...(marker.responseKind ? { responseKind: marker.responseKind } : {}),
   });
@@ -5175,7 +5213,9 @@ function deliverMojoTurnFinal(text: string): void {
   // adoptMode is structurally impossible for mojo (no pane to adopt); passing
   // the real flag keeps this call identical in shape to the other gate callers.
   const adoptMode = lastInitConfig?.adoptMode === true;
-  const markers = adoptMode ? [] : readSendMarkers();
+  const markers = adoptMode
+    ? []
+    : sendMarkersForTurn(readSendMarkers(), turnId, dispatchAttempt);
   const gateInput = {
     markTimeMs: mark?.markTimeMs,
     isLocal: false,
@@ -5191,7 +5231,7 @@ function deliverMojoTurnFinal(text: string): void {
     // deliberately swallowed.
     notifyExplicitReplyObserved(
       turnId,
-      explicitReplyMarkerForTurnWindow(gateInput, undefined, markers, adoptMode),
+      explicitReplyMarkerForTurnWindow(turnId, dispatchAttempt, gateInput, undefined, markers, adoptMode),
     );
     return;
   }
@@ -6444,7 +6484,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
   // still-unready turn. The latter caps the LAST ready turn's window —
   // without it, a model that's still mid-tool-use for turn N+1 could leak
   // a send credit into turn N's window via shouldSuppressBridgeEmit.
-  const markers = adoptMode ? [] : readSendMarkers();
+  const allMarkers = adoptMode ? [] : readSendMarkers();
   const remainingPending = bridgeQueue.peek();
   const nextPendingMarkTimeMs = remainingPending.length > 0 ? remainingPending[0].markTimeMs : undefined;
   const cache = new Map<string, ReturnType<typeof drainTranscript>>();
@@ -6454,6 +6494,7 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
   const nothingToSendTurns = new Set<(typeof ready)[number]>();
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
+    const markers = sendMarkersForTurn(allMarkers, turn.turnId, turn.dispatchAttempt);
     // Claude API-error text is execution metadata, not a model answer. The
     // structured terminal below owns retry/attention; never leak the raw
     // provider error through transcript fallback (regardless of send markers).
@@ -6502,7 +6543,9 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
       }
       notifyExplicitReplyObserved(
         turn.turnId,
-        explicitReplyMarkerForTurnWindow(gateInput, nextBoundaryMs, markers, adoptMode),
+        explicitReplyMarkerForTurnWindow(
+          turn.turnId, turn.dispatchAttempt, gateInput, nextBoundaryMs, markers, adoptMode,
+        ),
       );
       continue;
     }
@@ -8120,7 +8163,7 @@ function emitReadyCodexTurns(): void {
   // Adopt mode: model is the user's external Codex, no botmux send to
   // gate against — every assistant turn (Lark-driven OR locally typed)
   // should reach the thread. Skip marker IO entirely.
-  const markers = terminalAdoptMode ? [] : readSendMarkers();
+  const allMarkers = terminalAdoptMode ? [] : readSendMarkers();
   const remaining = codexBridgeQueue.peek();
   // Only a STARTED pending turn can bound the last ready turn's send window.
   // An unstarted turn hasn't been dequeued yet (its user event hasn't landed),
@@ -8135,6 +8178,7 @@ function emitReadyCodexTurns(): void {
     : undefined;
   for (let i = 0; i < ready.length; i++) {
     const turn = ready[i];
+    const markers = sendMarkersForTurn(allMarkers, turn.turnId, turn.dispatchAttempt);
     // A shared App Server session still owns the BotMux remote TUI, so its
     // Lark-originated turns retain normal send-marker deduplication. Only a
     // turn synthesized from Codex App input is external/local: that side has
@@ -8200,7 +8244,9 @@ function emitReadyCodexTurns(): void {
       }
       notifyExplicitReplyObserved(
         turn.turnId,
-        explicitReplyMarkerForTurnWindow(gateInput, nextBoundaryMs, markers, adoptMode),
+        explicitReplyMarkerForTurnWindow(
+          turn.turnId, turn.dispatchAttempt, gateInput, nextBoundaryMs, markers, adoptMode,
+        ),
       );
       continue;
     }
@@ -10350,7 +10396,9 @@ async function handleTrustedCodexAppMarker(
       suppressDelivery = true;
     }
     if (deliverableContent && startedAtMs !== undefined) {
-      const suppressMarkers = readSendMarkers();
+      const suppressMarkers = sendMarkersForTurn(
+        readSendMarkers(), turnId, dispatchAttempt,
+      );
       // Pass the RAW finalContent (not the pre-stripped deliverableContent) as
       // finalText: shouldSuppressBridgeEmit needs to SEE the trailing sentinel to
       // apply the "already sent this turn + sentinel terminator → suppress
@@ -10378,7 +10426,9 @@ async function handleTrustedCodexAppMarker(
         // replied — so without this the preview shows "running" forever (F3).
         notifyExplicitReplyObserved(
           turnId,
-          explicitReplyMarkerForTurnWindow(gateInput, completedAtMs + 5_001, suppressMarkers, false),
+          explicitReplyMarkerForTurnWindow(
+            turnId, dispatchAttempt, gateInput, completedAtMs + 5_001, suppressMarkers, false,
+          ),
         );
       }
     }
@@ -13701,6 +13751,15 @@ async function spawnCli(
     ? 'dsh-tui'
     : cfg.cliId as CliId;
   cliAdapter = createCliAdapterSync(effectiveCliId, cfg.cliPathOverride);
+  if (cfg.disableCrossSessionMemories
+    && (effectiveCliId !== 'traex'
+      || !cfg.replyTarget
+      || cfg.resume !== false
+      || cfg.forkSession
+      || cfg.adoptMode
+      || cfg.existingAppServerEndpoint)) {
+    throw new Error('disableCrossSessionMemories requires a fresh TraeX one-shot worker');
+  }
   const cardActionCapabilities = pluginCardActionCapabilitiesEnv(cfg);
   // backendType trust-but-verify + HARD GATE (PTY 退役): an explicit per-bot
   // config (or BACKEND_TYPE env override) bypasses config.ts's default, so the
@@ -13934,14 +13993,9 @@ async function spawnCli(
     // Feishu. Thread the flag so the reconstructed config keeps the boundary.
     if (cfg.apiOnly) sessionEnv.BOTMUX_API_ONLY = '1';
     if (cfg.feedback) sessionEnv.BOTMUX_FEEDBACK_POLICY = JSON.stringify(cfg.feedback);
-    // Session scope for `botmux send` inside the sandbox. Thread sessions
-    // anchor on a real om_ message (reply_in_thread); chat-scope sessions use
-    // the chat id as anchor (sessionAnchorId), which is NOT a message id —
-    // passing it as BOTMUX_ROOT_MESSAGE_ID would break reply threading, so
-    // only forward real message ids and tell the sandbox the scope explicitly.
-    const rootIsMessage = cfg.rootMessageId?.startsWith('om_') === true;
-    sessionEnv.BOTMUX_SESSION_SCOPE = rootIsMessage ? 'thread' : 'chat';
-    if (rootIsMessage) sessionEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
+    // Preserve the daemon-frozen internal anchor, visible root, and exact scope
+    // independently across the remote boundary.
+    applyInitRoutingEnv(sessionEnv, cfg);
     if (cfg.turnId) sessionEnv.BOTMUX_TURN_ID = cfg.turnId;
     if (cfg.deferredScheduleRun) {
       sessionEnv.BOTMUX_DEFERRED_SCHEDULE_TASK_ID = cfg.deferredScheduleRun.taskId;
@@ -15213,6 +15267,7 @@ async function spawnCli(
     nativeSubagentRuntimeHookCommand: cfg.cliId === 'traex' && !remoteWsUrl
       ? nativeSubagentRuntimeHookCommand()
       : undefined,
+    disableCrossSessionMemories: cfg.disableCrossSessionMemories === true,
   });
   // Pi's deferred long-first-prompt command is implemented by a session-scoped
   // extension. Keep its launch args across owned process restarts while the
@@ -15501,7 +15556,7 @@ async function spawnCli(
   // never less. Mirrors what the riff path already does via mergedEnv.
   if (cfg.apiOnly) childEnv.BOTMUX_API_ONLY = '1';
   else delete childEnv.BOTMUX_API_ONLY;
-  childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
+  applyInitRoutingEnv(childEnv, cfg);
   applySessionOwnerEnv(childEnv, cfg.ownerOpenId);
   // This bot's resolved brandLabel template, injected so a SANDBOXED `botmux
   // send` renders the role-name footer without reading bots.json (deny-by-
@@ -17852,6 +17907,15 @@ async function restartCliProcess(
   reason: string,
   opts: { immediate?: boolean; preservePending?: boolean; skipRestartBudget?: boolean } = {},
 ): Promise<void> {
+  if (lastInitConfig?.replyTarget) {
+    log(`Refused restart for ordinary per-message worker (${reason})`);
+    await sendFatalWorkerErrorAndExit(
+      new Error(`ordinary per-message worker cannot restart: ${reason}`),
+      lastInitConfig.turnId,
+      lastInitConfig.dispatchAttempt,
+    );
+    return;
+  }
   if (codexAutoUpgrade) {
     codexAutoUpgrade.reject?.(new Error(reason));
     return;
@@ -20029,9 +20093,23 @@ function emitTurnTerminal(
 }
 
 function workerIpcPayload(msg: WorkerToDaemon): WorkerToDaemon {
-  return msg.type === 'final_output' && sessionId
-    ? { ...msg, sessionId }
-    : msg;
+  if (msg.type !== 'final_output' || !sessionId) return msg;
+  const cfg = lastInitConfig;
+  if (!cfg?.replyTarget) return { ...msg, sessionId };
+  // A frozen reply target marks an ordinary one-shot init. Bind every final
+  // emitted by any backend to that one exact turn/attempt and fail closed on a
+  // stale transcript watcher or synthetic local-turn result.
+  if (!cfg.turnId
+    || cfg.replyTurnId !== cfg.turnId
+    || msg.turnId !== cfg.turnId
+    || msg.dispatchAttempt !== cfg.dispatchAttempt) {
+    throw new Error(
+      `ordinary per-message final_output route mismatch `
+      + `(turn=${msg.turnId}, expected=${cfg.turnId ?? '-'}, `
+      + `attempt=${msg.dispatchAttempt ?? '-'}, expectedAttempt=${cfg.dispatchAttempt ?? '-'})`,
+    );
+  }
+  return { ...msg, sessionId, replyTurnId: cfg.replyTurnId };
 }
 
 function send(msg: WorkerToDaemon): void {
@@ -20207,6 +20285,34 @@ process.on('message', async (raw: unknown) => {
   switch (msg.type) {
     case 'init': {
       const initStartedAtMs = Date.now();
+      const ordinaryPerMessageInit = msg.replyTarget !== undefined
+        || msg.disableCrossSessionMemories === true;
+      if (ordinaryPerMessageInit
+        && (!msg.routingAnchor
+          || (msg.scope !== 'thread' && msg.scope !== 'chat')
+          || !msg.rootMessageId)) {
+        throw new Error(
+          'ordinary per-message worker init requires explicit routingAnchor, scope, and visible rootMessageId',
+        );
+      }
+      if (msg.replyTarget
+        && (!msg.turnId
+          || msg.replyTurnId !== msg.turnId
+          || msg.resume !== false
+          || msg.forkSession
+          || msg.adoptMode
+          || msg.existingAppServerEndpoint)) {
+        throw new Error('ordinary per-message worker init has an invalid turn or lifecycle mode');
+      }
+      if (msg.disableCrossSessionMemories
+        && (msg.cliId !== 'traex'
+          || !msg.replyTarget
+          || msg.resume !== false
+          || msg.forkSession
+          || msg.adoptMode
+          || msg.existingAppServerEndpoint)) {
+        throw new Error('disableCrossSessionMemories init requires a fresh TraeX one-shot worker');
+      }
       const ordinaryImTurnId = !msg.adoptMode
         && msg.dispatchAttempt === undefined
         && !!msg.prompt
@@ -20645,7 +20751,9 @@ process.on('message', async (raw: unknown) => {
           // A fast initial turn can complete via `botmux send` before Herdr
           // reports idle and this ready IPC is emitted. Tell the daemon not to
           // post a stale Starting card after the final reply is already visible.
-          replyAlreadySent: readSendMarkers().some(marker => marker.sentAtMs >= initStartedAtMs),
+          replyAlreadySent: sendMarkersForTurn(
+            readSendMarkers(), currentBotmuxTurnId ?? '', currentBotmuxDispatchAttempt,
+          ).some(marker => marker.sentAtMs >= initStartedAtMs),
           turnId: currentBotmuxTurnId,
           dispatchAttempt: currentBotmuxDispatchAttempt,
         });
@@ -20671,6 +20779,14 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'message': {
+      if (lastInitConfig?.replyTarget) {
+        rejectOrdinaryImTurn(
+          msg.turnId ?? lastInitConfig.turnId ?? 'unknown',
+          'ordinary_per_message_worker_is_not_reusable',
+          { rejectedBeforeAdmission: true },
+        );
+        break;
+      }
       // 每轮消息都捎带 daemon 侧当前解析出的模型，覆盖 respawn 快照——理由与
       // restart 那条通道相同，但这里管的是**崩溃 park 后由消息触发的恢复重启**：
       // 那条路在 worker 内部直接 `{...lastInitConfig, resume:true}` 起 CLI，没有
@@ -20924,6 +21040,13 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'restart': {
+      if (lastInitConfig?.replyTarget) {
+        log('Refused restart for ordinary per-message worker');
+        if (msg.attemptId) {
+          send({ type: 'restart_result', attemptId: msg.attemptId, status: 'failed', category: 'spawn_failed' });
+        }
+        break;
+      }
       if (codexAutoUpgrade?.stage === 'failed') {
         codexAutoUpgrade = undefined;
         cliRestartInProgress = false;
@@ -21497,6 +21620,10 @@ process.on('message', async (raw: unknown) => {
     }
 
     case 'detach_for_transfer': {
+      if (lastInitConfig?.replyTarget) {
+        log('Refused transfer detach for ordinary per-message worker');
+        break;
+      }
       log('Transfer detach requested');
       stopScreenshotLoop();
       // Transfer keeps the logical session alive. The daemon starts its

@@ -213,6 +213,37 @@ describe('transferSession', () => {
     expect(ds.chatId).toBe('oc_source');
   });
 
+  it('refuses an active ordinary one-shot session before detach or mutation', async () => {
+    const ds = makeDs();
+    ds.session.oneShot = {
+      version: 1,
+      mode: 'ordinary_per_message',
+      routingAnchor: 'om_source_root',
+      visibleLaneKey: 'one-shot:om_source_root',
+      visibleRoute: {
+        chatId: 'oc_source',
+        chatType: 'group',
+        scope: 'thread',
+        rootMessageId: 'om_source_root',
+      },
+      createdAt: new Date().toISOString(),
+      turn: { turnId: 'turn-one-shot' },
+    };
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);
+    const beforeSession = structuredClone(ds.session);
+
+    const result = await callTransfer(ds.session.sessionId, 'oc_target', 'om_target_root');
+
+    expect(result).toEqual({ ok: false, error: 'one_shot_unsupported' });
+    expect(detachWorkerSpy).not.toHaveBeenCalled();
+    expect(forkWorkerSpy).not.toHaveBeenCalled();
+    expect(sessionStore.updateSession).not.toHaveBeenCalled();
+    expect(ds.session).toEqual(beforeSession);
+    expect(ds.chatId).toBe('oc_source');
+    expect(registry.get(sessionKey('om_source_root', 'cli_app_test'))).toBe(ds);
+    expect(registry.has(sessionKey('oc_target', 'cli_app_test'))).toBe(false);
+  });
+
   it('DM flat target (p2p, chat scope): rewrites chatType to p2p and anchors on the DM chatId', async () => {
     const ds = makeDs();  // thread-scope source in oc_source
     registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);

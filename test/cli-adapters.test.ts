@@ -2881,6 +2881,34 @@ describe('readyPattern', () => {
 });
 
 describe('traex automation trust flags', () => {
+  it('adds exact memory-disable config overrides only when requested', () => {
+    const args = createTraexAdapter('/bin/traex').buildArgs({
+      sessionId: 'traex-one-shot',
+      resume: false,
+      disableCrossSessionMemories: true,
+    });
+    const useIdx = args.indexOf('memories.use_memories=false');
+    const generateIdx = args.indexOf('memories.generate_memories=false');
+    expect(useIdx).toBeGreaterThan(0);
+    expect(generateIdx).toBeGreaterThan(useIdx);
+    expect(args[useIdx - 1]).toBe('-c');
+    expect(args[generateIdx - 1]).toBe('-c');
+    expect(args).not.toContain('--disable');
+  });
+
+  it('leaves normal TraeX launches and other CLIs memory config untouched', () => {
+    expect(createTraexAdapter('/bin/traex').buildArgs({
+      sessionId: 'traex-normal',
+      resume: false,
+    }).join(' ')).not.toContain('memories');
+
+    expect(createCodexAdapter('/bin/codex').buildArgs({
+      sessionId: 'codex-normal',
+      resume: false,
+      disableCrossSessionMemories: true,
+    }).join(' ')).not.toContain('memories');
+  });
+
   it('injects an explicit TraeX backend variant as a process config', () => {
     const args = createTraexAdapter('/bin/traex').buildArgs({
       sessionId: 'traex-variant',

@@ -6408,6 +6408,8 @@ async function cmdResume(): Promise<void> {
     console.error('❌ daemon 中找不到该会话（可能已被清理）。');
   } else if (errCode === 'adopt_unsupported') {
     console.error('❌ adopt 接管会话不支持 resume。');
+  } else if (errCode === 'one_shot_unsupported') {
+    console.error('❌ 单消息会话不能 resume；请发送一条完整的新指令以启动全新会话。');
   } else if (errCode === 'deferred_unmaterialized') {
     console.error('❌ 该静默定时轮次未创建话题，隐藏会话只保留审计记录，不能 resume。');
   } else if (errCode === 'resume_cancelled') {

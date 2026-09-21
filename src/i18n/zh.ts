@@ -1014,6 +1014,7 @@ export const messages: Record<string, string> = {
   'card.action.resume_anchor_occupied': '⚠️ 当前话题已有新会话{detail}，无法恢复旧会话。',
   'card.action.resume_anchor_holder': '（占用者：{short}）',
   'card.action.resume_adopt_unsupported': '⚠️ adopt 接管会话不支持 resume。',
+  'card.action.resume_one_shot_unsupported': '⚠️ 单消息会话不能 resume。请发送一条完整的新指令以启动全新会话。',
   'card.action.resume_deferred_unmaterialized': '⚠️ 该静默定时轮次未创建话题，隐藏会话只保留审计记录，无法恢复。',
   'card.action.resume_cancelled': '⚠️ 恢复过程中会话被关闭，本次恢复已取消。',
   'card.action.disconnected': '⏏ 已断开，原 CLI 会话不受影响',

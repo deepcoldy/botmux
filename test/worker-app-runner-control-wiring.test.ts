@@ -344,7 +344,9 @@ describe('worker app-runner control-channel wiring', () => {
     // against the FIFO-attributed turnId (before the final_output IPC).
     const suppressBlock = marker.slice(suppressIdx, suppressIdx + 900);
     expect(suppressBlock).toMatch(/notifyExplicitReplyObserved\(\s*turnId/);
-    expect(suppressBlock).toContain('explicitReplyMarkerForTurnWindow(gateInput');
+    expect(suppressBlock).toMatch(
+      /explicitReplyMarkerForTurnWindow\(\s*turnId, dispatchAttempt, gateInput/,
+    );
     // The notify precedes the suppressed final_output forward (suppressDelivery).
     const notifyIdx = marker.indexOf('notifyExplicitReplyObserved(', suppressIdx);
     const suppressedFinalIdx = marker.indexOf('suppressDelivery: true', suppressIdx);

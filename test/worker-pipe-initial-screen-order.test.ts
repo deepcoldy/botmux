@@ -15,7 +15,11 @@ describe('worker pipe initial screen ordering', () => {
       poolSource.indexOf("case 'cli_session_id':", poolSource.indexOf("case 'ready':")),
     );
 
-    expect(readyPayload).toContain('replyAlreadySent: readSendMarkers().some');
+    expect(readyPayload).toContain('replyAlreadySent: sendMarkersForTurn(');
+    expect(readyPayload).toContain(
+      "readSendMarkers(), currentBotmuxTurnId ?? '', currentBotmuxDispatchAttempt,",
+    );
+    expect(readyPayload).toContain(').some(marker => marker.sentAtMs >= initStartedAtMs)');
     expect(readyHandler).toContain('if (msg.replyAlreadySent)');
     expect(readyHandler.indexOf('if (msg.replyAlreadySent)')).toBeLessThan(
       readyHandler.indexOf('ds.streamCardId = CARD_POSTING_SENTINEL'),

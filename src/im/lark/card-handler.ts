@@ -3105,6 +3105,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           await sessionReply(rootId, t('card.action.resume_anchor_occupied', { detail }, locDsResume));
         } else if (result.error === 'adopt_unsupported') {
           await sessionReply(rootId, t('card.action.resume_adopt_unsupported', undefined, locDsResume));
+        } else if (result.error === 'one_shot_unsupported') {
+          await sessionReply(rootId, t('card.action.resume_one_shot_unsupported', undefined, locDsResume));
         } else if (result.error === 'deferred_unmaterialized') {
           await sessionReply(rootId, t('card.action.resume_deferred_unmaterialized', undefined, locDsResume));
         } else if (result.error === 'resume_cancelled') {
@@ -3227,7 +3229,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           codexServiceTierBadge(sessionCliId(ds), ds.codexServiceTier),
           idleCardLabel(ds),
           dshRuntimeForSession(ds),
-          resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
         );
         scheduleCardPatch(ds, cardJson);
       }
@@ -3741,7 +3743,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               idleCardLabel(ds),
               dshRuntimeForSession(ds),
-              resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+              resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
             );
             updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
               logger.debug(`[${tag(ds)}] Failed to migrate unknown frozen card: ${err}`),
@@ -3790,7 +3792,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           effectiveCliId === 'codex' ? frozen.codexServiceTierBadge : undefined,
           frozenIdleLabel(frozen),
           dshRuntimeForSession(ds),
-          resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
         );
         updateMessage(ds.larkAppId, frozen.messageId, cardJson).catch(err =>
           logger.debug(`[${tag(ds)}] Failed to migrate frozen card: ${err}`),
@@ -3837,7 +3839,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
           idleCardLabel(ds),
           dshRuntimeForSession(ds),
-          resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -3909,7 +3911,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
           idleCardLabel(ds),
           dshRuntimeForSession(ds),
-          resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
         );
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
@@ -3987,7 +3989,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
           idleCardLabel(ds),
           dshRuntimeForSession(ds),
-          resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
         );
         return {
           toast: { type: 'success', content: t('card.action.stop_sent', { cliName: sessionCliDisplayName(ds) }, locDs) },
@@ -4080,7 +4082,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
           idleCardLabel(ds),
           dshRuntimeForSession(ds),
-          resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
         );
         try { return JSON.parse(cardJson); } catch { /* fall through */ }
       }
