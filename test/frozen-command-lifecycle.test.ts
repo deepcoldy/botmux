@@ -87,6 +87,35 @@ describe('Frozen Command lifecycle ledger', () => {
     expect(readFileSync(file, 'utf8')).toBe(ACTIVE);
   });
 
+  it('rejects creation when a same-name definition appears on disk before confirmation', () => {
+    const root = join(tmpdir(), `botmux-frozen-create-race-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    roots.push(root);
+    mkdirSync(root, { recursive: true });
+    const dataDir = join(root, 'data');
+    const pending = prepareFrozenCommandTransition({
+      dataDir,
+      targetBotId: BOT,
+      workingDir: root,
+      command: '/生命周期测试',
+      action: 'approve',
+      actor: ACTOR,
+      reason: '创建新命令',
+      candidateYaml: ACTIVE,
+    });
+    const file = join(root, '.botmux', 'commands', '生命周期测试.yaml');
+    const unexpected = ACTIVE.replace('SELECT {{value}} AS probe_value', 'SELECT 999 AS probe_value');
+    mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
+    writeFileSync(file, unexpected);
+
+    expect(() => confirmFrozenCommandTransition({
+      dataDir,
+      targetBotId: BOT,
+      token: pending.token,
+      actor: ACTOR,
+    })).toThrowError(/同名命令在确认前已出现/);
+    expect(readFileSync(file, 'utf8')).toBe(unexpected);
+  });
+
   it('backfills an existing ledger owner from the earliest approval audit', () => {
     const root = join(tmpdir(), `botmux-frozen-owner-migration-${process.pid}-${Math.random().toString(36).slice(2)}`);
     roots.push(root);

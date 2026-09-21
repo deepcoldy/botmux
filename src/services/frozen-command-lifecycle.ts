@@ -658,6 +658,9 @@ export function confirmFrozenCommandTransition(input: {
     if (pending.requires_admin === 1 && !input.actorIsAdmin) {
       throw new FrozenCommandError('transition_admin_required', '管理员权限已失效，请重新发起');
     }
+    // Defense in depth: actor_id + requires_admin already protect today's
+    // flow, but keep this owner check local to confirmation so a future
+    // proposal/refactor cannot accidentally turn the click path fail-open.
     if (current?.ownerUnionId && current.ownerUnionId !== ownerActor && !input.actorIsAdmin) {
       throw new FrozenCommandError('transition_owner_mismatch', '只有命令 owner 或固化命令管理员可以确认变更');
     }
