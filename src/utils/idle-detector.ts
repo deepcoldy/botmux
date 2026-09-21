@@ -319,6 +319,19 @@ export class IdleDetector {
     return this.startupPending && !this.startupComplete;
   }
 
+  /** Lift the startup veto WITHOUT any readiness evidence and WITHOUT firing an
+   *  idle edge. Last-resort escape hatch for the worker's first-prompt hard
+   *  timeout: after the full budget the CLI has shown neither a loaded banner
+   *  nor a recognizable restored composer, and the queued first message would
+   *  otherwise stay held for the lifetime of the session. Unlike fireIdle()
+   *  this does not synthesize a turn boundary — it only stops isStartupPending()
+   *  from vetoing the flush the worker has already decided to force. */
+  forceStartupComplete(): void {
+    this.startupComplete = true;
+    this.startupPending = false;
+    this.startupTail = '';
+  }
+
   /** Positive initialization evidence, retained across resync/turn resets. */
   isStartupComplete(): boolean {
     return this.startupComplete;

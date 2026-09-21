@@ -237,6 +237,46 @@ describe('codex 启动闸：worker 侧接线', () => {
   it('复查节奏受首轮硬上限约束', () => {
     expect(source).toMatch(/const FIRST_PROMPT_STARTUP_RECHECK_MS = [\d_]+;/);
   });
+
+  it('复查循环也跑非快照后端的恢复历史判据（tmux/PTY resume 补偿）', () => {
+    // 缺陷：observeRestoredStartupHistory() 只对 ZmxBackend 生效，tmux/PTY 恢复
+    // 后若 CLI 直接画进已恢复的 composer（不重绘横幅），banner 判据与 ZMX 专属
+    // 的历史判据都解不开闸。修复：复查循环里对非快照后端也跑同一条(有护栏的)
+    // 历史判据，读渲染后的权威视口。
+    const start = source.indexOf('const releaseFirstPromptTimeout');
+    const body = source.slice(start, source.indexOf('\n  };\n', start));
+    expect(body).toContain('observeRestoredStartupHistoryOnScreen()');
+
+    const fn = source.slice(
+      source.indexOf('function observeRestoredStartupHistoryOnScreen'),
+      source.indexOf('\n}\n', source.indexOf('function observeRestoredStartupHistoryOnScreen')),
+    );
+    // 只对非快照后端生效（ZMX 走 per-chunk 的 observeRestoredStartupHistory）。
+    expect(fn).toContain('backend instanceof ZmxBackend) return false');
+    // 读渲染后的视口，不是 backend.captureCurrentScreen()——避免每次复查都
+    // shell 出一次 tmux capture-pane，且排除 scrollback 里的陈旧证据。
+    expect(fn).toContain("renderer?.rawSnapshot({ preserveFormatting: true })");
+    expect(fn).not.toContain('backend.captureCurrentScreen()');
+    // 复用适配器自带的(带 loading/busy/queued/draft/picker 护栏的)历史判据。
+    expect(fn).toContain('idleDetector?.observeStartupHistory(');
+  });
+
+  it('硬上限到点仍 pending 时强制解闸并落到正常 flush 路径，绝不永久扣留', () => {
+    // 旧实现：预算耗尽后只打一条 WARN 就 return，排队消息在整个会话生命周期
+    // 被静默扣住。修复：强制解开启动闸（forceStartupComplete），继续走下方
+    // shouldReleaseFirstPromptTimeout → flush 路径，把「永远」收敛成「≤90s」。
+    const start = source.indexOf('const releaseFirstPromptTimeout');
+    const body = source.slice(start, source.indexOf('\n  };\n', start));
+    expect(body).toContain('idleDetector?.forceStartupComplete()');
+    // 旧的死路措辞不能再留——它意味着 return 且不 flush。
+    expect(body).not.toContain('queued input stays held');
+    // 强制解闸这一支不能自己 return：必须落到下方 shouldReleaseFirstPromptTimeout
+    // 的正常 release/flush 路径。
+    const forceIdx = body.indexOf('forceStartupComplete()');
+    const nextRelease = body.indexOf('shouldReleaseFirstPromptTimeout', forceIdx);
+    expect(nextRelease).toBeGreaterThan(forceIdx);
+    expect(body.slice(forceIdx, nextRelease)).not.toContain('return;');
+  });
 });
 
 describe('Codex restored ZMX history startup evidence', () => {

@@ -8553,12 +8553,42 @@ function observeStartupBannerOnScreen(): boolean {
 
 /** ZMX's complete cached history can carry a restoration header that no
  * synthetic renderer viewport retains. Both resync and append-only captures
- * update this cache before notifying us; neither path may strand startup. */
+ * update this cache before notifying us; neither path may strand startup.
+ *
+ * ZMX-only: its `captureCurrentScreen()` returns a cheap in-memory snapshot
+ * cache, so calling it on every PTY chunk is free. Byte-stream backends
+ * (tmux/PTY) whose `captureCurrentScreen()` shells out must NOT be polled
+ * per-chunk here — they run the same history predicate on the bounded
+ * first-prompt recheck schedule via observeRestoredStartupHistoryOnScreen(). */
 function observeRestoredStartupHistory(): void {
   if (!awaitingFirstPrompt || !(backend instanceof ZmxBackend)) return;
   if (!idleDetector?.observeStartupHistory(backend.captureCurrentScreen())) return;
   log(`${cliName()} restored history observed; releasing the startup hold`);
   if (cliAdapter?.supportsTypeAhead) void flushPending();
+}
+
+/** Backend-agnostic restore-history compensation for the first-prompt recheck
+ * loop. A resumed CLI (e.g. Codex `resume`) can paint straight into a restored
+ * composer without ever repainting the loaded banner, so neither feed()'s
+ * banner match nor observeStartupScreen() can lift the startup veto. The
+ * adapter's own startupReadyFromHistory() predicate recognizes that restored
+ * composer (guarded against loading/busy/queued/draft/picker screens), but the
+ * ZMX path above only ran it for snapshot backends. Run it here against the
+ * authoritative rendered viewport so tmux/PTY resume clears the hold too.
+ *
+ * Reads the renderer, NOT backend.captureCurrentScreen(): the rendered snapshot
+ * is the same viewport the banner path already trusts, avoids a per-recheck
+ * tmux capture-pane shell-out, and — critically — excludes scrollback, so a
+ * stale `esc to interrupt` / restoration marker far above the composer cannot
+ * be misread as current readiness. No-op for adapters without the predicate. */
+function observeRestoredStartupHistoryOnScreen(): boolean {
+  if (!awaitingFirstPrompt || backend instanceof ZmxBackend) return false;
+  let screen = '';
+  try { screen = renderer?.rawSnapshot({ preserveFormatting: true }) ?? ''; } catch { return false; }
+  if (!screen || idleDetector?.observeStartupHistory(screen) !== true) return false;
+  log(`${cliName()} restored composer observed on screen; releasing the startup hold`);
+  if (cliAdapter?.supportsTypeAhead) void flushPending();
+  return true;
 }
 
 /** 当前渲染画面是否有提示符（renderer 尚未就绪时按「没有」处理，等下一轮）。 */
@@ -17577,10 +17607,18 @@ async function spawnCli(
     if (idleDetector?.isStartupPending()) {
       observeStartupBannerOnScreen();
     }
+    // Banner match above only recognizes a freshly loaded banner. A resumed CLI
+    // can paint straight into a restored composer with no banner repaint; the
+    // adapter's guarded history predicate recognizes that layout. ZMX runs it
+    // per-chunk (cheap snapshot cache); byte-stream backends (tmux/PTY) run it
+    // here, on the bounded recheck schedule, against the rendered viewport.
     if (idleDetector?.isStartupPending()) {
-      log(`First prompt timeout — ${cliName()} still initializing; keeping input queued`);
+      observeRestoredStartupHistoryOnScreen();
+    }
+    if (idleDetector?.isStartupPending()) {
       const remainingMs = Math.max(0, FIRST_PROMPT_HARD_TIMEOUT_MS - elapsedMs);
       if (remainingMs > 0) {
+        log(`First prompt timeout — ${cliName()} still initializing; keeping input queued`);
         const waitMs = Math.min(FIRST_PROMPT_STARTUP_RECHECK_MS, remainingMs);
         const nextElapsedMs = elapsedMs + waitMs;
         const startupTimer = setTimeout(
@@ -17588,10 +17626,18 @@ async function spawnCli(
           waitMs,
         );
         startupTimer.unref?.();
-      } else {
-        log(`WARN ${cliName()} never reported an initialized banner within the first-prompt budget; queued input stays held`);
+        return;
       }
-      return;
+      // Hard cap reached with startup still pending. The CLI showed neither a
+      // loaded banner nor a recognizable restored composer within the full
+      // budget, but the queued first message must not hang for the session's
+      // lifetime (the old code logged and returned here, stranding it forever).
+      // Force the startup veto open and fall through to the normal release/flush
+      // path below — the same "we've waited long enough" semantics the readyPattern
+      // branch already applies at this cap. Type-ahead adapters (Codex) then flush
+      // into the parked composer; a genuinely dead CLI surfaces via its own exit.
+      log(`WARN ${cliName()} never reported an initialized banner within the first-prompt budget; forcing startup hold release and flushing queued input`);
+      idleDetector?.forceStartupComplete();
     }
     if (!shouldReleaseFirstPromptTimeout({
       deferFirstPromptTimeoutUntilReady: cliAdapter?.deferFirstPromptTimeoutUntilReady === true,

@@ -10,6 +10,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { IdleDetector } from '../src/utils/idle-detector.js';
 import type { CliAdapter } from '../src/adapters/cli/types.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
+import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
@@ -1365,6 +1366,63 @@ describe('IdleDetector: fireIdle()', () => {
 });
 
 // ─── CoCo readyPattern variants (regression: Trae CLI 0.120.31) ──────────
+
+describe('IdleDetector: forceStartupComplete()', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  /** Drive startupPending=true with the real codex loading banner. */
+  const loadingBanner = '│ model:       loading │\n│ directory:   loading │';
+
+  it('lifts the startup veto so isStartupPending() flips to false', () => {
+    const detector = new IdleDetector(createCodexAdapter('/bin/codex'));
+    detector.feed(loadingBanner);
+    expect(detector.isStartupPending()).toBe(true);
+
+    detector.forceStartupComplete();
+    expect(detector.isStartupPending()).toBe(false);
+    expect(detector.isStartupComplete()).toBe(true);
+    detector.dispose();
+  });
+
+  it('does NOT fire an idle edge (only the veto is lifted, not a turn boundary)', () => {
+    const detector = new IdleDetector(createCodexAdapter('/bin/codex'));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+    detector.feed(loadingBanner);
+
+    detector.forceStartupComplete();
+    // Unlike fireIdle(), forcing completion must never synthesize idle: the
+    // worker's flush path drives delivery, and a false idle here would publish
+    // a bogus prompt_ready mid-boot.
+    expect(cb).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(90_000);
+    expect(cb).not.toHaveBeenCalled();
+    detector.dispose();
+  });
+
+  it('is monotonic: a later loading banner cannot re-arm the veto', () => {
+    const detector = new IdleDetector(createCodexAdapter('/bin/codex'));
+    detector.feed(loadingBanner);
+    detector.forceStartupComplete();
+
+    detector.feed(loadingBanner);
+    expect(detector.isStartupPending()).toBe(false);
+    expect(detector.isStartupComplete()).toBe(true);
+    detector.dispose();
+  });
+
+  it('startup completion evidence survives a per-turn reset()', () => {
+    const detector = new IdleDetector(createCodexAdapter('/bin/codex'));
+    detector.feed(loadingBanner);
+    detector.forceStartupComplete();
+
+    detector.reset();
+    expect(detector.isStartupComplete()).toBe(true);
+    expect(detector.isStartupPending()).toBe(false);
+    detector.dispose();
+  });
+});
 
 describe('IdleDetector: CoCo readyPattern compatibility', () => {
   beforeEach(() => { vi.useFakeTimers(); });
