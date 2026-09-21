@@ -6,6 +6,7 @@ export const TASK_CONTINUATION_CONNECTION_CODE = 'codex_connection_failed';
 export const TASK_CONTINUATION_UPSTREAM_CODE = 'codex_upstream_error';
 export const TASK_CONTINUATION_ENGINE_DEAD_CODE = 'rpc_engine_dead';
 export const TASK_CONTINUATION_CLI_EXIT_CODE = 'cli_exit';
+export const TASK_CONTINUATION_DAEMON_RESTART_CODE = 'daemon_restart';
 
 export const READONLY_TASK_CONTINUATION_PROMPT = [
   '[BOTMUX_CONTINUATION]',
@@ -136,6 +137,18 @@ export interface StartReadonlyTaskContinuationInput {
   maxContinuations?: number;
 }
 
+export interface AttachReadonlyTaskContinuationOptions {
+  /** The durable row came from an earlier daemon process. An active automatic
+   * original turn has no safe replay proof across that boundary. */
+  activeTurnInterrupted?: boolean;
+}
+
+export function readonlyTaskContinuationNeedsRestartAttention(
+  state: ReadonlyTaskContinuationState | undefined,
+): boolean {
+  return state?.status === 'active' && state.startMode !== 'explicit';
+}
+
 type AttachedContinuation = {
   session: ReadonlyTaskContinuationSession;
   coordinator: ReadonlyTaskContinuationCoordinator<any>;
@@ -162,6 +175,20 @@ function validInheritedUser(value: unknown): value is TrustedCaller {
   return caller.senderType === 'user'
     && caller.source === undefined
     && caller.taskId === undefined;
+}
+
+function configuredTtlMs(state: ReadonlyTaskContinuationState): number {
+  return Math.min(
+    Math.max(1, state.expiresAt - state.createdAt),
+    READONLY_TASK_CONTINUATION_MAX_TTL_MS,
+  );
+}
+
+function automaticOriginalTurn(state: ReadonlyTaskContinuationState): boolean {
+  return state.startMode !== 'explicit'
+    && state.currentTurnId === state.logicalTurnId
+    && state.currentDispatchAttempt === undefined
+    && state.continuationsStarted === 0;
 }
 
 export type ReadonlyContinuationOutput =
@@ -207,6 +234,7 @@ function readonlyTaskContinuationAwaitsUserError(errorCode: string | undefined):
   return [
     TASK_CONTINUATION_ENGINE_DEAD_CODE,
     TASK_CONTINUATION_CLI_EXIT_CODE,
+    TASK_CONTINUATION_DAEMON_RESTART_CODE,
   ].includes(errorCode ?? '');
 }
 
@@ -314,15 +342,6 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
       }
       return;
     }
-    if (isLiveStatus(this.state.status) && this.now() >= this.state.expiresAt) {
-      this.warnOnce({
-        ...this.state,
-        status: 'expired',
-        nextAttemptAt: undefined,
-        lastErrorCode: 'readonly_continuation_expired',
-      });
-      return;
-    }
     // Older builds persisted runtime/CLI crashes as backoff. Those terminals
     // cannot prove which external side effects completed, so never restore
     // their timer into a write-capable replay after an upgrade.
@@ -335,8 +354,18 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
       });
       return;
     }
+    if (isLiveStatus(this.state.status) && this.now() >= this.state.expiresAt
+      && !automaticOriginalTurn(this.state)) {
+      this.warnOnce({
+        ...this.state,
+        status: 'expired',
+        nextAttemptAt: undefined,
+        lastErrorCode: 'readonly_continuation_expired',
+      });
+      return;
+    }
     if (this.state.status === 'backoff') this.armBackoff();
-    else if (this.state.status === 'active') this.armExpiry();
+    else if (this.state.status === 'active' && !automaticOriginalTurn(this.state)) this.armExpiry();
   }
 
   start(input: StartReadonlyTaskContinuationInput): ReadonlyTaskContinuationState {
@@ -400,7 +429,7 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
         : {}),
       status: 'active',
     });
-    this.armExpiry();
+    if (started.startMode === 'explicit') this.armExpiry();
     return started;
   }
 
@@ -667,9 +696,16 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
       };
       try { return this.commit(cancelled); } catch { this.retain(cancelled); return cancelled; }
     }
-    if (this.now() >= current.expiresAt) {
-      const expired = {
+    let recoverable = current;
+    if (automaticOriginalTurn(current)) {
+      recoverable = {
         ...current,
+        expiresAt: this.now() + configuredTtlMs(current),
+      };
+    }
+    if (this.now() >= recoverable.expiresAt) {
+      const expired = {
+        ...recoverable,
         status: 'expired' as const,
         nextAttemptAt: undefined,
         lastErrorCode: 'readonly_continuation_expired',
@@ -677,9 +713,9 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
       this.warnOnce(expired);
       return this.state ?? expired;
     }
-    if (current.continuationsStarted >= current.maxContinuations) {
+    if (recoverable.continuationsStarted >= recoverable.maxContinuations) {
       const exhausted = {
-        ...current,
+        ...recoverable,
         status: 'exhausted' as const,
         nextAttemptAt: undefined,
         lastErrorCode: 'readonly_continuation_exhausted',
@@ -690,9 +726,9 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
     let next: ReadonlyTaskContinuationState;
     try {
       next = this.commit({
-        ...current,
+        ...recoverable,
         status: 'backoff',
-        nextAttemptAt: this.now() + this.nextDelayMs(current),
+        nextAttemptAt: this.now() + this.nextDelayMs(recoverable),
       });
     } catch {
       return this.retainFailed(current, 'readonly_continuation_backoff_persist_failed');
@@ -948,6 +984,7 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
 export function attachReadonlyTaskContinuation<TTimer>(
   session: ReadonlyTaskContinuationSession,
   deps: ReadonlyTaskContinuationDeps<TTimer>,
+  options: AttachReadonlyTaskContinuationOptions = {},
 ): void {
   if (attachedContinuations.get(session.sessionId)?.session === session) return;
   disposeReadonlyTaskContinuation(session);
@@ -999,7 +1036,19 @@ export function attachReadonlyTaskContinuation<TTimer>(
     dispose: () => coordinator.dispose(),
   });
   const restored = session.readonlyTaskContinuation;
-  if (restored) coordinator.restore(restored);
+  if (restored) {
+    if (options.activeTurnInterrupted
+      && readonlyTaskContinuationNeedsRestartAttention(restored)) {
+      coordinator.restore({
+        ...restored,
+        status: 'backoff',
+        nextAttemptAt: undefined,
+        lastErrorCode: TASK_CONTINUATION_DAEMON_RESTART_CODE,
+      });
+    } else {
+      coordinator.restore(restored);
+    }
+  }
 }
 
 export function startReadonlyTaskContinuation(

@@ -105,6 +105,115 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
     expect(enqueue).not.toHaveBeenCalled();
   });
 
+  it('does not expire an automatic lease while its original turn is still running', () => {
+    const timers: Array<{ delayMs: number; run: () => void }> = [];
+    let now = 1_000;
+    const warn = vi.fn();
+    const coordinator = new ReadonlyTaskContinuationCoordinator({
+      schedule: (delayMs, run) => { timers.push({ delayMs, run }); return run; },
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue: vi.fn(() => 1),
+      warn,
+      enabled: () => true,
+      now: () => now,
+    });
+
+    const automatic = coordinator.start({
+      turnId: 'om_original',
+      workerGeneration: 1,
+      authorizationMode: 'inherited',
+      startMode: 'automatic',
+      trustedCaller: TRUSTED_CALLER,
+      ttlMs: 30_000,
+    });
+
+    expect(automatic).toMatchObject({ status: 'active', expiresAt: 31_000 });
+    expect(timers).toHaveLength(0);
+    now = 60_000;
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('starts the automatic recovery TTL at the first allowlisted interruption', () => {
+    const timers: Array<{ delayMs: number; run: () => void }> = [];
+    let now = 1_000;
+    const persist = vi.fn();
+    const coordinator = new ReadonlyTaskContinuationCoordinator({
+      schedule: (delayMs, run) => { timers.push({ delayMs, run }); return run; },
+      cancel: vi.fn(),
+      persist,
+      enqueue: vi.fn(() => 1),
+      warn: vi.fn(),
+      enabled: () => true,
+      now: () => now,
+      delayMs: 1_000,
+    });
+    const automatic = coordinator.start({
+      turnId: 'om_original',
+      workerGeneration: 1,
+      authorizationMode: 'inherited',
+      startMode: 'automatic',
+      trustedCaller: TRUSTED_CALLER,
+      ttlMs: 30_000,
+    });
+
+    now = 60_000;
+    expect(coordinator.onTerminal(automatic, {
+      turnId: 'om_original',
+      status: 'failed',
+      errorCode: TASK_CONTINUATION_RATE_LIMIT_CODE,
+      workerGeneration: 1,
+    })).toMatchObject({
+      status: 'backoff',
+      expiresAt: 90_000,
+      continuationsStarted: 0,
+    });
+    expect(timers.at(-1)?.delayMs).toBe(15_000);
+    expect(persist).toHaveBeenLastCalledWith(expect.objectContaining({
+      status: 'backoff',
+      expiresAt: 90_000,
+    }));
+  });
+
+  it('still expires an automatic lease after its recovery window starts', () => {
+    const timers: Array<{ delayMs: number; run: () => void }> = [];
+    let now = 1_000;
+    const warn = vi.fn();
+    const coordinator = new ReadonlyTaskContinuationCoordinator({
+      schedule: (delayMs, run) => { timers.push({ delayMs, run }); return run; },
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue: vi.fn(() => 1),
+      warn,
+      enabled: () => true,
+      now: () => now,
+      delayMs: 1_000,
+    });
+    const automatic = coordinator.start({
+      turnId: 'om_original',
+      workerGeneration: 1,
+      authorizationMode: 'inherited',
+      startMode: 'automatic',
+      trustedCaller: TRUSTED_CALLER,
+      ttlMs: 5_000,
+    });
+
+    now = 60_000;
+    coordinator.onTerminal(automatic, {
+      turnId: 'om_original',
+      status: 'failed',
+      errorCode: TASK_CONTINUATION_CONNECTION_CODE,
+      workerGeneration: 1,
+    });
+    now = 65_000;
+    timers.at(-1)!.run();
+
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'expired',
+      lastErrorCode: 'readonly_continuation_expired',
+    }));
+  });
+
   it('settles a persisted lease without a start mode fail-closed on normal completion', () => {
     const enqueue = vi.fn(() => 7);
     const coordinator = new ReadonlyTaskContinuationCoordinator({
@@ -666,6 +775,96 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
       lastErrorCode: 'readonly_continuation_expired',
     }));
     expect(warn).toHaveBeenCalledOnce();
+  });
+
+  it('marks a daemon-restored active turn awaiting user instead of delaying until TTL expiry', () => {
+    const warn = vi.fn();
+    const persist = vi.fn();
+    const session: ReadonlyTaskContinuationSession = {
+      sessionId: 'session',
+      readonlyTaskContinuation: state({
+        startMode: 'automatic',
+        expiresAt: 61_000,
+      }),
+    };
+
+    attachReadonlyTaskContinuation(session, {
+      schedule: (_delayMs, run) => run,
+      cancel: vi.fn(),
+      persist,
+      enqueue: vi.fn(() => 1),
+      warn,
+      enabled: () => true,
+      now: () => 2_000,
+    }, { activeTurnInterrupted: true });
+
+    expect(session.readonlyTaskContinuation).toMatchObject({
+      status: 'awaiting_user',
+      lastErrorCode: 'daemon_restart',
+      pendingWarning: { startedAt: 2_000, deliveryAttempts: 0 },
+    });
+    expect(persist).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'awaiting_user',
+      lastErrorCode: 'daemon_restart',
+    }));
+  });
+
+  it('marks a daemon-restored synthetic turn awaiting user without replaying it', () => {
+    const warn = vi.fn();
+    const enqueue = vi.fn(() => 1);
+    const session: ReadonlyTaskContinuationSession = {
+      sessionId: 'session',
+      readonlyTaskContinuation: state({
+        startMode: 'automatic',
+        currentTurnId: 'bmx-continuation-before-restart',
+        currentDispatchAttempt: 1,
+        continuationsStarted: 1,
+      }),
+    };
+
+    attachReadonlyTaskContinuation(session, {
+      schedule: (_delayMs, run) => run,
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue,
+      warn,
+      enabled: () => true,
+      now: () => 2_000,
+    }, { activeTurnInterrupted: true });
+
+    expect(session.readonlyTaskContinuation).toMatchObject({
+      status: 'awaiting_user',
+      currentTurnId: 'bmx-continuation-before-restart',
+      continuationsStarted: 1,
+      lastErrorCode: 'daemon_restart',
+    });
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledOnce();
+  });
+
+  it('keeps an explicit active lease unchanged across daemon restore', () => {
+    const warn = vi.fn();
+    const timers: Array<() => void> = [];
+    const explicit = state({ startMode: 'explicit' });
+    const session: ReadonlyTaskContinuationSession = {
+      sessionId: 'session',
+      readonlyTaskContinuation: explicit,
+    };
+
+    attachReadonlyTaskContinuation(session, {
+      schedule: (_delayMs, run) => { timers.push(run); return run; },
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue: vi.fn(() => 1),
+      warn,
+      enabled: () => true,
+      now: () => 2_000,
+    }, { activeTurnInterrupted: true });
+
+    expect(session.readonlyTaskContinuation).toEqual(explicit);
+    expect(timers).toHaveLength(1);
+    expect(warn).not.toHaveBeenCalled();
   });
 
   it('fails closed without crashing when activation persistence fails after enqueue', () => {

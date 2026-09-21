@@ -585,6 +585,7 @@ import {
   handleReadonlyTaskContinuationTerminal,
   parseReadonlyContinuationOutput,
   readonlyTaskContinuationHandlesTerminal,
+  readonlyTaskContinuationNeedsRestartAttention,
   startReadonlyTaskContinuation,
   type ReadonlyTaskContinuationDispatch,
   type ReadonlyTaskContinuationState,
@@ -1841,6 +1842,8 @@ function readonlyTaskContinuationWarning(
     ? '租约已过期'
     : state.status === 'exhausted'
       ? `达到最大续跑次数 ${state.maxContinuations}`
+      : state.lastErrorCode === 'daemon_restart'
+        ? 'BotMux 服务重启，无法确认中断前的操作是否完成'
       : state.lastErrorCode ?? '续跑交接失败';
   return `⚠️ 长程任务自动续跑已停止（${reason}）。请检查过程账本和 Web 终端后，再决定是否继续。`;
 }
@@ -2004,6 +2007,7 @@ function deliverReadonlyTaskContinuationWarningPending(
 export function ensureReadonlyTaskContinuationAttached(
   ds: DaemonSession,
   botCfg = getBot(ds.larkAppId).config,
+  options: { activeTurnInterrupted?: boolean } = {},
 ): boolean {
   const current = ds.session.readonlyTaskContinuation;
   // A kill switch stops every new automatic dispatch, but it must not hide a
@@ -2123,8 +2127,18 @@ export function ensureReadonlyTaskContinuationAttached(
     warn: state => {
       deliverReadonlyTaskContinuationWarningPending(ds, state);
     },
-  });
+  }, options);
   return true;
+}
+
+export function markReadonlyTaskContinuationInterruptedByRestart(
+  ds: DaemonSession,
+  restoredLeaseId: string,
+): boolean {
+  const current = ds.session.readonlyTaskContinuation;
+  if (current?.leaseId !== restoredLeaseId
+    || !readonlyTaskContinuationNeedsRestartAttention(current)) return false;
+  return ensureReadonlyTaskContinuationAttached(ds, undefined, { activeTurnInterrupted: true });
 }
 
 function sessionRuntimeDisplayName(

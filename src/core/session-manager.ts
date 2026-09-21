@@ -13,7 +13,7 @@ import * as scheduleStore from '../services/schedule-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
@@ -2229,6 +2229,15 @@ export async function restoreActiveSessions(
     // that close failed.
     .filter(s => !quarantinedSessionIds.has(s.sessionId))
     .sort((a, b) => restorePriority(b) - restorePriority(a));
+  // Snapshot the exact leases inherited from the previous daemon before any
+  // restore await lets live ingress mutate a registered session. A lease born
+  // in this boot must never be mislabeled as interrupted by the old process.
+  const interruptedReadonlyContinuationLeaseIds = new Map(active.flatMap(session => {
+    const continuation = session.readonlyTaskContinuation;
+    return continuation?.status === 'active'
+      ? [[session.sessionId, continuation.leaseId] as const]
+      : [];
+  }));
 
   // LOAD-BEARING ORDER: validate and contain the narrow XPI shared-cwd state
   // before stale-pid sweeping, backend probes, registration, card recovery, or
@@ -3024,7 +3033,11 @@ export async function restoreActiveSessions(
   for (const ds of restoredByThisInvocation) {
     if (!stillOwnsRestoreRegistration(ds)) continue;
     ensureOrdinaryTurnRecoveryAttached(ds);
-    ensureReadonlyTaskContinuationAttached(ds);
+    const restoredLeaseId = interruptedReadonlyContinuationLeaseIds.get(ds.session.sessionId);
+    if (!restoredLeaseId
+      || !markReadonlyTaskContinuationInterruptedByRestart(ds, restoredLeaseId)) {
+      ensureReadonlyTaskContinuationAttached(ds);
+    }
   }
 
   // Persistent backends: auto-fork workers for sessions whose backing session
