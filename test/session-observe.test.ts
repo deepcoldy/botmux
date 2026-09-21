@@ -95,15 +95,16 @@ describe('session-observe normalizer', () => {
     expect(observe.parkedOrSuspended).toBe(false);
   });
 
-  it('projects a queued (待办) row as idle turn with queued=true', () => {
+  it('projects a queued (待办) row as not running and parked', () => {
     const observe = normalizeSessionRow(
       makeRow({ status: 'idle', queued: true, pendingRepo: true }),
       { observedAt: OBSERVED_AT },
     );
-    expect(observe.liveness).toBe('alive');
+    expect(observe.liveness).toBe('not_running');
     expect(observe.turn).toBe('idle');
     expect(observe.queued).toBe(true);
     expect(observe.pendingRepo).toBe(true);
+    expect(observe.parkedOrSuspended).toBe(true);
   });
 
   it('emits queued="unknown" and turn="unknown" for unrecognized status', () => {

@@ -94,11 +94,21 @@ function probeFrom(status: ObserveProbeStatus, daemon: OnlineDaemonInfo, error?:
   return probe;
 }
 
-async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  return await Promise.race<T>([
-    p,
-    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`daemon_ipc_timeout_${ms}ms`)), ms).unref?.()),
-  ]);
+async function withTimeout<T>(operation: (signal: AbortSignal) => Promise<T>, ms: number): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error(`daemon_ipc_timeout_${ms}ms`));
+    }, ms);
+    timer.unref?.();
+  });
+  try {
+    return await Promise.race([operation(controller.signal), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function classifyHttpStatus(status: number): ObserveProbeStatus {
@@ -176,8 +186,10 @@ async function probeDaemonList(
   };
 
   try {
-    const res = await withTimeout(
-      ctx.fetch(ctx.daemon.ipcPort, '/api/sessions', { method: 'GET' }, ctx.secret),
+    const { res, body } = await withTimeout(async signal => {
+      const res = await ctx.fetch(ctx.daemon.ipcPort, '/api/sessions', { method: 'GET', signal }, ctx.secret);
+      return { res, body: res.ok ? await readJson(res) : undefined };
+    },
       ctx.timeoutMs,
     );
     if (!res.ok) {
@@ -185,7 +197,6 @@ async function probeDaemonList(
       envelopeBase.probe = probeFrom(status, ctx.daemon, `HTTP ${res.status}`);
       return envelopeBase;
     }
-    const body = await readJson(res);
     const rows = extractSessionRows(body);
     if (!rows) {
       envelopeBase.probe = probeFrom('unreachable', ctx.daemon, 'malformed_body');
@@ -248,17 +259,17 @@ export async function fetchObserveSession(
     });
   }
 
-  let lastFailure: ObserveProbe | undefined;
-  for (const daemon of targets) {
+  const outcomes = await Promise.all(targets.map(async daemon => {
     const ctx: DaemonProbeContext = { daemon, fetch: fetchFn, secret, timeoutMs };
-    const outcome = await probeDaemonSession(ctx, sessionId, observedAt, includeRaw);
-    if (outcome.kind === 'ok') return outcome.session;
-    if (outcome.kind === 'not_found') { lastFailure = outcome.probe; continue; }
-    lastFailure = outcome.probe;
-    if (options.larkAppId) break; // do not fan out when scoped to a single app
-  }
+    return await probeDaemonSession(ctx, sessionId, observedAt, includeRaw);
+  }));
+  const hit = outcomes.find((outcome): outcome is Extract<SessionProbeOutcome, { kind: 'ok' }> => (
+    outcome.kind === 'ok'
+  ));
+  if (hit) return hit.session;
+  const lastFailure = outcomes.at(-1);
 
-  return synthesizeMissingSession(sessionId, observedAt, lastFailure ?? {
+  return synthesizeMissingSession(sessionId, observedAt, lastFailure?.probe ?? {
     status: 'not_found',
     source: 'daemon-ipc',
   });
@@ -277,8 +288,15 @@ async function probeDaemonSession(
 ): Promise<SessionProbeOutcome> {
   const encoded = encodeURIComponent(sessionId);
   try {
-    const res = await withTimeout(
-      ctx.fetch(ctx.daemon.ipcPort, `/api/sessions/${encoded}`, { method: 'GET' }, ctx.secret),
+    const { res, body } = await withTimeout(async signal => {
+      const res = await ctx.fetch(
+        ctx.daemon.ipcPort,
+        `/api/sessions/${encoded}`,
+        { method: 'GET', signal },
+        ctx.secret,
+      );
+      return { res, body: res.ok ? await readJson(res) : undefined };
+    },
       ctx.timeoutMs,
     );
     if (res.status === 404) {
@@ -287,7 +305,6 @@ async function probeDaemonSession(
     if (!res.ok) {
       return { kind: 'error', probe: probeFrom(classifyHttpStatus(res.status), ctx.daemon, `HTTP ${res.status}`) };
     }
-    const body = await readJson(res);
     const row = extractSessionRow(body);
     if (!row) return { kind: 'error', probe: probeFrom('unreachable', ctx.daemon, 'malformed_body') };
     return {

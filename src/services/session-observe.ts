@@ -146,7 +146,7 @@ export function normalizeSessionRow(
 
   const liveness: ObserveLiveness = closed
     ? 'closed'
-    : dormant
+    : dormant || queued === true
       ? 'not_running'
       : status && ROW_TURN_STATUSES.has(status as ObserveTurn)
         ? 'alive'
@@ -199,7 +199,7 @@ export function normalizeSessionRow(
     turn,
     phase: 'unknown',
     queued,
-    parkedOrSuspended: dormant,
+    parkedOrSuspended: dormant || queued === true,
     closed,
   };
 

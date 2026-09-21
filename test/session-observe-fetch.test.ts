@@ -95,7 +95,7 @@ describe('fetchObserveSnapshot', () => {
     expect(envelope.probe.status).toBe('ok');
     expect(envelope.sessions.map(s => [s.identity.sessionId, s.liveness, s.turn, s.queued])).toEqual([
       ['s_alpha_1', 'alive', 'working', false],
-      ['s_alpha_2', 'alive', 'idle', true],
+      ['s_alpha_2', 'not_running', 'idle', true],
       ['s_alpha_3', 'not_running', 'unknown', false],
       ['s_alpha_4', 'closed', 'unknown', false],
     ]);
@@ -148,6 +148,31 @@ describe('fetchObserveSnapshot', () => {
     expect(env.probe.status).toBe('unreachable');
     expect(env.probe.error).toMatch(/timeout/);
     expect(env.sessions).toEqual([]);
+  });
+
+  it('times out while reading a stalled response body', async () => {
+    let cancelled = false;
+    const fetch: DaemonIpcFetch = async (_port, _path, init) => {
+      const body = new ReadableStream({
+        start(controller) {
+          init?.signal?.addEventListener('abort', () => {
+            cancelled = true;
+            controller.error(new Error('aborted'));
+          });
+        },
+      });
+      return new Response(body, { status: 200 });
+    };
+    const snapshot = await fetchObserveSnapshot({
+      now: () => OBSERVED_AT,
+      secret: 'test',
+      discover: () => [makeDaemon()],
+      fetch,
+      timeoutMs: 10,
+    });
+    expect(snapshot.daemons[0]!.probe.status).toBe('unreachable');
+    expect(snapshot.daemons[0]!.probe.error).toMatch(/timeout/);
+    expect(cancelled).toBe(true);
   });
 
   it('rejects a malformed body as unreachable rather than inferring structure', async () => {
@@ -251,6 +276,29 @@ describe('fetchObserveSession', () => {
     expect(session.identity.sessionId).toBe('s_beta_1');
     expect(session.probe.status).toBe('ok');
     expect(session.turn).toBe('working');
+  });
+
+  it('fans out concurrently while selecting the first discovered hit', async () => {
+    const alpha = makeDaemon();
+    const beta = makeDaemon({ larkAppId: 'cli_app_beta', ipcPort: 4311 });
+    let releaseAlpha!: () => void;
+    const betaStarted = new Promise<void>(resolve => { releaseAlpha = resolve; });
+    const fetch: DaemonIpcFetch = async (port) => {
+      if (port === alpha.ipcPort) {
+        await betaStarted;
+        return jsonResponse({ session: baseRow({ sessionId: 's_target', larkAppId: 'cli_app_alpha' }) });
+      }
+      releaseAlpha();
+      return jsonResponse({ session: baseRow({ sessionId: 's_target', larkAppId: 'cli_app_beta' }) });
+    };
+    const session = await fetchObserveSession('s_target', {
+      now: () => OBSERVED_AT,
+      secret: 'test',
+      discover: () => [alpha, beta],
+      fetch,
+      timeoutMs: 50,
+    });
+    expect(session.identity.larkAppId).toBe('cli_app_alpha');
   });
 
   it('does not fall back to cached data on unauthorized', async () => {
