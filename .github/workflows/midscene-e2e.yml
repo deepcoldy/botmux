@@ -1,0 +1,113 @@
+name: Midscene E2E
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/midscene-e2e.yml"
+      - "package.json"
+      - "bun.lock"
+      - "scripts/render-midscene-summary.mjs"
+      - "scripts/run-e2e.ts"
+      - "test/e2e-browser/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: midscene-e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  feishu-browser:
+    name: Feishu browser scenarios
+    # GitHub does not expose repository secrets to pull requests from forks.
+    # Run this job on same-repository branches, including validation PRs in a
+    # contributor's fork, and use workflow_dispatch for later reruns.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      CI: "true"
+      FEISHU_TEST_GROUP_URL: ${{ secrets.FEISHU_TEST_GROUP_URL }}
+      FEISHU_TEST_GROUP_CHAT_NAME: ${{ secrets.FEISHU_TEST_GROUP_CHAT_NAME }}
+      FEISHU_TEST_TOPIC_GROUP_NAME: ${{ secrets.FEISHU_TEST_TOPIC_GROUP_NAME }}
+      MIDSCENE_MODEL_API_KEY: ${{ secrets.MIDSCENE_MODEL_API_KEY }}
+      MIDSCENE_MODEL_NAME: ${{ secrets.MIDSCENE_MODEL_NAME }}
+      MIDSCENE_MODEL_BASE_URL: ${{ secrets.MIDSCENE_MODEL_BASE_URL }}
+      MIDSCENE_MODEL_FAMILY: ${{ secrets.MIDSCENE_MODEL_FAMILY }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Validate Midscene suite
+        run: |
+          bun run test:midscene:typecheck
+          bun run test:midscene:nodes
+          bun run test -- test/midscene-suite.test.ts
+
+      - name: Require live-test configuration
+        env:
+          FEISHU_STORAGE_STATE_BASE64: ${{ secrets.FEISHU_STORAGE_STATE_BASE64 }}
+        run: |
+          required=(
+            FEISHU_TEST_GROUP_URL
+            FEISHU_STORAGE_STATE_BASE64
+            MIDSCENE_MODEL_API_KEY
+            MIDSCENE_MODEL_NAME
+            MIDSCENE_MODEL_BASE_URL
+            MIDSCENE_MODEL_FAMILY
+          )
+          missing=()
+          for name in "${required[@]}"; do
+            if [[ -z ${!name:-} ]]; then
+              missing+=("$name")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "Missing required Actions secrets: ${missing[*]}" >&2
+            exit 1
+          fi
+          printf '%s' "$FEISHU_STORAGE_STATE_BASE64" | base64 --decode > storageState.json
+          node -e "const fs=require('node:fs'); const value=JSON.parse(fs.readFileSync('storageState.json','utf8')); if (!Array.isArray(value.cookies)) throw new Error('FEISHU_STORAGE_STATE_BASE64 is not a Playwright storage state')"
+
+      - name: Install Chromium
+        run: bun x playwright install --with-deps chromium
+
+      - name: Run migrated Midscene scenarios
+        id: midscene
+        run: bun run test:e2e-browser
+
+      - name: Write Midscene run summary
+        if: always() && !cancelled()
+        env:
+          TEST_OUTCOME: ${{ steps.midscene.outcome }}
+        run: |
+          node scripts/render-midscene-summary.mjs \
+            --results midscene_run \
+            --artifact-name midscene-feishu-report \
+            --test-outcome "${TEST_OUTCOME:-not-run}" \
+            --output "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Midscene report
+        if: always() && !cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: midscene-feishu-report
+          path: |
+            midscene_run/
+            test/e2e-browser/midscene_run/
+          if-no-files-found: warn
+          retention-days: 7
+
