@@ -25514,6 +25514,7 @@ dialog.onboarding-dialog .onboarding-menu .sect-sort-pop {
   left: 0;
   width: 100%;
   min-width: 100%;
+  overscroll-behavior-y: auto;
   transform: none;
 }
 
