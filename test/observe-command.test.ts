@@ -11,6 +11,7 @@ describe('botmux observe arguments', () => {
     ['--lark-app-id', 'cli_app_1'],
     ['--app', 'cli_app_1'],
     ['--jsonl'],
+    ['--timeout-ms', '10'],
   ])('rejects removed argument %s', async (...args) => {
     const stderr = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
 

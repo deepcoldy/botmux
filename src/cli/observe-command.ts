@@ -2,7 +2,7 @@
 //
 // Shape (v1):
 //   botmux observe [--session <id>] [--lark-app <appId>] [--include-raw]
-//                  [--timeout-ms <n>] [--json]
+//                  [--json]
 //
 // The command shells out to `fetchObserveSnapshot` / `fetchObserveSession`,
 // which reuse the daemon HMAC loopback IPC. It never talks to backends, tmux,
@@ -25,7 +25,6 @@ interface ParsedArgs {
   sessionId?: string;
   larkAppId?: string;
   includeRaw: boolean;
-  timeoutMs?: number;
   help: boolean;
 }
 
@@ -50,12 +49,6 @@ function parseArgs(argv: string[]): { ok: true; args: ParsedArgs } | { ok: false
       continue;
     }
     if (raw?.startsWith('--lark-app=')) { args.larkAppId = raw.slice('--lark-app='.length); continue; }
-    if (raw === '--timeout-ms') {
-      const v = Number(argv[++i]);
-      if (!Number.isFinite(v) || v <= 0) return { ok: false, error: `--timeout-ms 需要正整数` };
-      args.timeoutMs = v;
-      continue;
-    }
     return { ok: false, error: `未知参数：${raw}` };
   }
   return { ok: true, args };
@@ -68,7 +61,6 @@ const HELP_TEXT = `botmux observe — 读取 daemon 实时 SessionRow 投影（v
   botmux observe --session <id>        # 单个会话
   botmux observe --lark-app <appId>    # 仅指定 daemon
   botmux observe --include-raw         # 附加原始 SessionRow 供诊断
-  botmux observe --timeout-ms 3000     # 每次 IPC 请求的超时（默认 5000ms）
 
 字段（v1 canonical）：
   identity/cli/backend, liveness (alive|not_running|closed|unknown),
@@ -94,14 +86,14 @@ export async function runObserveCommand(argv: string[]): Promise<number> {
     process.stdout.write(HELP_TEXT);
     return 0;
   }
-  const { sessionId, larkAppId, includeRaw, timeoutMs } = parsed.args;
+  const { sessionId, larkAppId, includeRaw } = parsed.args;
   try {
     if (sessionId) {
-      const session = await fetchObserveSession(sessionId, { larkAppId, includeRaw, timeoutMs });
+      const session = await fetchObserveSession(sessionId, { larkAppId, includeRaw });
       process.stdout.write(`${JSON.stringify(session, null, 2)}\n`);
       return isFailureProbe(session.probe.status) ? 1 : 0;
     }
-    const snapshot = await fetchObserveSnapshot({ larkAppId, includeRaw, timeoutMs });
+    const snapshot = await fetchObserveSnapshot({ larkAppId, includeRaw });
     process.stdout.write(`${JSON.stringify(snapshot, null, 2)}\n`);
     const anyFailure = snapshot.daemons.some(d => isFailureProbe(d.probe.status));
     return anyFailure ? 1 : 0;

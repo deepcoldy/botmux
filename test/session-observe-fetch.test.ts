@@ -11,7 +11,7 @@ import {
   fetchObserveSession,
   fetchObserveSnapshot,
   type DaemonIpcFetch,
-} from '../src/services/session-observe-fetch.js';
+} from '../src/services/session-observe-fetch-internal.js';
 import type { OnlineDaemonInfo } from '../src/utils/daemon-discovery.js';
 import type { RawSessionRow } from '../src/services/session-observe.js';
 

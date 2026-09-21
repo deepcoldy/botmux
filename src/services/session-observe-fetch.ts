@@ -32,11 +32,7 @@ import {
   type RawSessionRow,
 } from './session-observe.js';
 
-/** Options shared by every façade entry point.
- *
- *  `now` and `secret` are injected here to keep the façade pure — callers or
- *  tests can pin the observation clock and supply a stub secret without going
- *  through the on-disk `~/.botmux/.dashboard-secret` file. */
+/** Product-facing query options shared by every façade entry point. */
 export interface ObserveFetchOptions {
   /** Restrict to a single daemon by its Lark app id; otherwise every online
    *  daemon is probed and its envelope aggregated. */
@@ -46,27 +42,23 @@ export interface ObserveFetchOptions {
   /** Include the raw SessionRow beneath `session.raw` for diagnostics. Off by
    *  default because callers typically consume only the canonical fields. */
   includeRaw?: boolean;
-  /** Injected clock for deterministic tests. */
-  now?: () => number;
-  /** Injected secret; skips reading `~/.botmux/.dashboard-secret`. */
-  secret?: string;
-  /** Override the descriptor directory (mirrors listOnlineDaemons signature). */
-  dataDir?: string;
-  /** Override the IPC transport for tests. Defaults to `fetchDaemonIpc`. */
-  fetch?: DaemonIpcFetch;
-  /** Override the discovery for tests. Defaults to `listOnlineDaemons`. */
-  discover?: (dataDir?: string) => OnlineDaemonInfo[];
-  /** Per-request timeout in ms; default 5s. Rejection surfaces as `unreachable`. */
-  timeoutMs?: number;
 }
 
-/** Wire-level daemon IPC fetch signature — same as `fetchDaemonIpc`. */
-export type DaemonIpcFetch = (
+type DaemonIpcFetch = (
   port: number,
   path: string,
   init?: RequestInit,
   secret?: string,
 ) => Promise<Response>;
+
+interface ObserveFetchDependencies {
+  now?: () => number;
+  secret?: string;
+  dataDir?: string;
+  fetch?: DaemonIpcFetch;
+  discover?: (dataDir?: string) => OnlineDaemonInfo[];
+  timeoutMs?: number;
+}
 
 interface DaemonProbeContext {
   daemon: OnlineDaemonInfo;
@@ -77,12 +69,12 @@ interface DaemonProbeContext {
 
 const DEFAULT_TIMEOUT_MS = 5_000;
 
-function nowFn(options: ObserveFetchOptions): () => number {
-  return options.now ?? Date.now;
+function nowFn(dependencies: ObserveFetchDependencies): () => number {
+  return dependencies.now ?? Date.now;
 }
 
-function loadSecretSafely(options: ObserveFetchOptions): string | undefined {
-  if (typeof options.secret === 'string') return options.secret;
+function loadSecretSafely(dependencies: ObserveFetchDependencies): string | undefined {
+  if (typeof dependencies.secret === 'string') return dependencies.secret;
   try { return loadDaemonIpcSecret(); }
   catch { return undefined; }
 }
@@ -129,17 +121,21 @@ async function readJson(res: Response): Promise<unknown> {
  * larkAppId is provided). One envelope per daemon; each envelope carries its
  * own probe outcome so a partial failure never contaminates other daemons.
  */
-export async function fetchObserveSnapshot(options: ObserveFetchOptions = {}): Promise<ObserveSnapshot> {
-  const now = nowFn(options);
+export function fetchObserveSnapshot(options?: ObserveFetchOptions): Promise<ObserveSnapshot>;
+export async function fetchObserveSnapshot(
+  options: ObserveFetchOptions = {},
+  dependencies: ObserveFetchDependencies = {},
+): Promise<ObserveSnapshot> {
+  const now = nowFn(dependencies);
   const observedAt = now();
-  const discover = options.discover ?? listOnlineDaemons;
-  const fetchFn = options.fetch ?? (fetchDaemonIpc as DaemonIpcFetch);
-  const secret = loadSecretSafely(options);
-  const timeoutMs = Number.isFinite(options.timeoutMs) && (options.timeoutMs ?? 0) > 0
-    ? Number(options.timeoutMs)
+  const discover = dependencies.discover ?? listOnlineDaemons;
+  const fetchFn = dependencies.fetch ?? (fetchDaemonIpc as DaemonIpcFetch);
+  const secret = loadSecretSafely(dependencies);
+  const timeoutMs = Number.isFinite(dependencies.timeoutMs) && (dependencies.timeoutMs ?? 0) > 0
+    ? Number(dependencies.timeoutMs)
     : DEFAULT_TIMEOUT_MS;
 
-  const online = discover(options.dataDir);
+  const online = discover(dependencies.dataDir);
   const targets = options.larkAppId
     ? online.filter(d => d.larkAppId === options.larkAppId)
     : online;
@@ -226,21 +222,26 @@ function extractSessionRows(body: unknown): RawSessionRow[] | undefined {
  *  the first `ok` hit). Returns an ObserveSession whose probe reflects the
  *  outcome; a `not_found` result still populates identity.sessionId so
  *  Firstmate can attach it to the right task without re-deriving. */
+export function fetchObserveSession(
+  sessionId: string,
+  options?: ObserveFetchOptions,
+): Promise<ObserveSession>;
 export async function fetchObserveSession(
   sessionId: string,
   options: ObserveFetchOptions = {},
+  dependencies: ObserveFetchDependencies = {},
 ): Promise<ObserveSession> {
-  const now = nowFn(options);
+  const now = nowFn(dependencies);
   const observedAt = now();
-  const discover = options.discover ?? listOnlineDaemons;
-  const fetchFn = options.fetch ?? (fetchDaemonIpc as DaemonIpcFetch);
-  const secret = loadSecretSafely(options);
-  const timeoutMs = Number.isFinite(options.timeoutMs) && (options.timeoutMs ?? 0) > 0
-    ? Number(options.timeoutMs)
+  const discover = dependencies.discover ?? listOnlineDaemons;
+  const fetchFn = dependencies.fetch ?? (fetchDaemonIpc as DaemonIpcFetch);
+  const secret = loadSecretSafely(dependencies);
+  const timeoutMs = Number.isFinite(dependencies.timeoutMs) && (dependencies.timeoutMs ?? 0) > 0
+    ? Number(dependencies.timeoutMs)
     : DEFAULT_TIMEOUT_MS;
   const includeRaw = options.includeRaw === true;
 
-  const online = discover(options.dataDir);
+  const online = discover(dependencies.dataDir);
   const targets = options.larkAppId
     ? online.filter(d => d.larkAppId === options.larkAppId)
     : online;

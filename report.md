@@ -8,17 +8,17 @@
 - 探针失败绝不回退旧缓存；出问题时 envelope 直接给出 `probe.status !== 'ok'` + 空 sessions。
 - `phase` 一律为 `'unknown'`，不再企图从 idle-detector 反推 thinking/tool/input。
 - `queued` 严格是 `boolean | 'unknown'`；`pendingRepo` 单列，未与 queue 合并。
-- `dormant` 映射到 `liveness = 'not_running'`（保留 `rawStatus`），不冒充 `dead`；无法证死的一律 `unknown`。
+- `dormant` 与 `queued=true` 映射到 `liveness = 'not_running'`（保留 `rawStatus`），不把尚未启动或已停驻的 worker 冒充为存活；无法判断的一律 `unknown`。
 
 ## 文件清单
 | 路径 | 作用 |
 | --- | --- |
 | `src/services/session-observe.ts` | canonical 类型 + `normalizeSessionRow`（schemaVersion=1）。纯函数，任何 CLI/TS 调用都必须过它。|
 | `src/services/session-observe-fetch.ts` | 薄 façade：`fetchObserveSnapshot` / `fetchObserveSession`。使用 `fetchDaemonIpc`（HMAC loopback）；探针失败不回退缓存。|
-| `src/cli/observe-command.ts` | `botmux observe` 子命令（`--session`/`--lark-app`/`--include-raw`/`--json`/`--timeout-ms`）。|
+| `src/cli/observe-command.ts` | `botmux observe` 子命令（`--session`/`--lark-app`/`--include-raw`/`--json`）。|
 | `src/cli.ts` | 在 top-level `switch (command)` 中注册 `case 'observe'`。|
 | `test/session-observe.test.ts` | 13 用例：normalizer 覆盖 working/idle/starting/dormant/closed/queued/unknown status/attention/adopt/no-phase/probe not_found/cliId=unknown/includeRaw。|
-| `test/session-observe-fetch.test.ts` | 11 用例：mock discover + fetch，覆盖 pty/tmux + 至少两种 CLI adapter、unauthorized、超时=unreachable、malformed body、多 daemon、not_found、daemon_offline、无 larkAppId 时的 fan-out。|
+| `test/session-observe-fetch.test.ts` | 13 用例：通过 internal seam 注入 discover + fetch，覆盖 pty/tmux + 至少两种 CLI adapter、unauthorized、请求与响应体超时、malformed body、多 daemon、not_found、daemon_offline、并发 fan-out。|
 
 ## 契约（v1）
 ### `ObserveSession`
@@ -27,27 +27,27 @@
 - `identity`：`sessionId`、`larkAppId`、`chatId`、`chatType`、`rootMessageId`、`scope`、`threadId`、`botName`、`feishuChatLink`、`feishuThreadLink`（daemon 已回填）。
 - `cli`：`id/runtimeId/runtimeDisplayName/version/instanceId`。`cliId === 'unknown'` 归一化为缺失。
 - `backend`：`type/sessionName/adopted/workerPid/adoptCliPid`。
-- `liveness`：`alive`（daemon status 属于 working/idle/starting/analyzing/limited/stalled/interrupted） `|` `not_running`（dormant，包括 suspend/park 与无 live worker 的 persisted-active）`|` `closed` `|` `unknown`（daemon 无法给出可识别 status）。
+- `liveness`：`alive`（非 queued 且 daemon status 属于 working/idle/starting/analyzing/limited/stalled/interrupted） `|` `not_running`（dormant 或 queued=true）`|` `closed` `|` `unknown`（daemon 无法给出可识别 status）。
 - `turn`：`working|idle|starting|analyzing|limited|stalled|interrupted|unknown`；`closed`/`dormant`/`queued=true` 全部收敛到确定值（closed/dormant → `unknown`，queued=true → `idle` 匹配 daemon 内 composeRowFromActive 语义）。
 - `phase`：**恒为 `'unknown'`**。
 - `queued`：`boolean | 'unknown'`；`pendingRepo?` 单列布尔。
 - `attention?`：仅当 `kind/reason/at` 三字段齐全时暴露。
 - `lastActivityAt?` / `workingDirectory?` / `tuiPromptActive?`：直接取 SessionRow。
-- `parkedOrSuspended`：`status === 'dormant'`。
+- `parkedOrSuspended`：`status === 'dormant'` 或 `queued === true`。
 - `closed`：`status === 'closed'`。
 - `rawStatus`：原始 SessionRow.status。诊断用。
 - `raw?`：`includeRaw:true` 时挂载整行 SessionRow。
 
 ### 顶层结构
-- `fetchObserveSnapshot({larkAppId?, includeRaw?, timeoutMs?, ...})` → `ObserveSnapshot { daemons: ObserveDaemonEnvelope[] }`。每个 daemon 独立一个 envelope，故 A 挂 B 不受影响。指定 `larkAppId` 且该 daemon 离线 → 一个 `daemon_offline` envelope。
-- `fetchObserveSession(sessionId, {larkAppId?, ...})` → `ObserveSession`；无 `larkAppId` 时会在所有在线 daemon 上并发/顺序探测第一次 `ok`；全部 `not_found`/失败时返回带 identity 的合成对象，`probe` 记录最后一次失败。
+- `fetchObserveSnapshot({larkAppId?, includeRaw?})` → `ObserveSnapshot { daemons: ObserveDaemonEnvelope[] }`。每个 daemon 独立一个 envelope，故 A 挂 B 不受影响。指定 `larkAppId` 且该 daemon 离线 → 一个 `daemon_offline` envelope。
+- `fetchObserveSession(sessionId, {larkAppId?, includeRaw?})` → `ObserveSession`；无 `larkAppId` 时并发探测所有在线 daemon，并按 discovery 顺序选择第一个 `ok`；全部 `not_found`/失败时返回带 identity 的合成对象，`probe` 记录失败。
 
 ## 复用矩阵（Captain 要求的对照）
 | 字段 | 事实源 | 实时/缓存语义 | 失败行为 |
 | --- | --- | --- | --- |
 | `identity.*` | 存储层 + daemon 补齐（feishuChatLink 等） | 半持久身份；不会因未探到进程消失 | envelope.probe 非 ok 时 identity 仅保留调用方传入的 sessionId |
 | `cli.*` / `backend.*` | daemon 内 DaemonSession（active）或 SessionStore（persisted） | daemon 已认定的持久属性 | probe 失败时缺失 |
-| `liveness` | daemon `SessionRow.status` 分类：working…interrupted→alive；dormant→not_running；closed→closed；其它→unknown | 实时：daemon 每次 compose 时按内存 pid liveness + activeSessions 决定 | probe 失败时 `unknown`，不套旧缓存 |
+| `liveness` | daemon `SessionRow.status` 与 queued 分类：queued→not_running；否则 working…interrupted→alive；dormant→not_running；closed→closed；其它→unknown | 实时：daemon 每次 compose 时按内存 pid liveness + activeSessions 决定 | probe 失败时 `unknown`，不套旧缓存 |
 | `turn` | 同 SessionRow.status；`queued=true` 覆盖为 idle | 实时 | 未知/失败时 `unknown` |
 | `phase` | —— | **总是 unknown**，不再从 idle-detector 反推 | 保持 unknown |
 | `queued` | `SessionRow.queued`（daemon 计算） | 实时 bool | 缺失或非 bool 时 `'unknown'` |
@@ -55,7 +55,7 @@
 | `lastActivityAt` | `SessionRow.lastMessageAt` | 历史事实 | 缺失时省略 |
 | `workingDirectory` | `SessionRow.workingDir` | 半持久 | 缺失时省略 |
 | `attention` | `SessionRow.agentAttention` | 实时 | 三字段任一缺失即省略 |
-| `parkedOrSuspended` / `closed` | 派生自 `SessionRow.status` | 实时 | probe 非 ok 时按合成对象默认 `false` |
+| `parkedOrSuspended` / `closed` | 前者派生自 dormant 或 queued，后者派生自 closed | 实时 | probe 非 ok 时按合成对象默认 `false` |
 | `rawStatus` | `SessionRow.status` 原样 | 诊断字段 | probe 非 ok 时省略 |
 
 ## 未覆盖 / 仍是 unknown 的能力
@@ -66,7 +66,7 @@
 
 ## 验证证据
 - `bun run build` 通过（tsc + dashboard 前端）。
-- `./node_modules/.bin/vitest run --project unit test/session-observe.test.ts test/session-observe-fetch.test.ts` → 24/24 passed（13 normalizer + 11 façade behavior）。
+- `bun test test/session-observe.test.ts test/session-observe-fetch.test.ts` → 26/26 passed（13 normalizer + 13 façade behavior）。
 - `bun run test`（全量单测）**在同一工作树、切换到未修改的 master 时的失败集与包含本次改动时完全一致**：`session-store-sqlite-poisoned-recovery`（期望 `bunVersion==='1.4.2'`，本机 1.4.0）、`worker-codex-app-turn-routing.integration`、`schedule-store-dashboard-watch`、`statusline-cli`、`session-store-sqlite-bun-import`、`plugin-mcp-sandbox`、`sandbox-session-data-dir`、`native-subagent-runtime-hook` 等。这些失败与 observe seam 无关（对照 stash 前后同一 vitest 输出）。故不视为本任务回归；不修复不属于任务范围。
 - `botmux observe --help` 在编译产物上返回正确 usage。
 - 未启动/重启 live daemon；未合并 PR；未推 tag。
