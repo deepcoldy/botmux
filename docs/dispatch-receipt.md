@@ -25,6 +25,37 @@
 
 `null` 仅表示本次没有拿到可用标识，不证明话题不存在。调用方可稍后只读查询 `threadRootId`，不要为了取 ID 再次 dispatch。通过沙盒 relay 调用时，JSON 由宿主 CLI 产生并透传；宿主 CLI 未更新时仍可能没有新字段。
 
+## Worker launch spec
+
+新话题、单 Worker 派发可附带 `--model <catalog-id>` 和
+`--reasoning-effort <low|medium|high|xhigh|max|ultra>`。目标必须由唯一的
+`--bot-app` 指定；`--repo` 场景还要同时提供同一个 Worker 的 `--bot` open_id，
+继续复用既有 `/repo` operate 授权路径。launch spec 不能与 `--into` 同用。
+
+Botmux 在创建 seed 前用目标 Bot 的实际 CLI 读取实时 model catalog，并复用既有
+launch-model 与 reasoning compatibility 校验。catalog 不可读、模型不存在、强度不兼容、
+目标不唯一时均拒绝且不会创建 topic、授权或发送消息。
+
+成功回执额外包含：
+
+```json
+{
+  "requestedLaunch": { "model": "gpt-6-astra", "reasoningEffort": "high" },
+  "effectiveRuntime": { "model": "gpt-6-astra", "reasoningEffort": "high", "observed": false }
+}
+```
+
+`observed: false` 表示这是启动前已验证并冻结的有效规格。目标 Worker 启动后，
+`GET /api/sessions/:sessionId`（以及 sessions 只读列表）返回相同的
+`requestedLaunch`，并把 `effectiveRuntime.observed` 置为 `true`，同时携带 Worker
+实际上报的 model、reasoning effort、generation 和观测时间。调用方应等到
+`observed: true` 且 requested/effective 匹配后再发送业务 brief。
+
+绑定键是 exact `targetLarkAppId + chatId + rootMessageId`，有 10 分钟首次消费窗口；
+重复登记同一规格幂等，不同规格冲突，绑定一旦归属 session 后不能被另一 session 消费。
+规格随 session 行持久化，因此 daemon 重启、Worker crash/restart 和 Bot 默认变更都不会
+改变该 session 的 model/effort。
+
 ## 使用
 
 返回示意（只列关联字段）：

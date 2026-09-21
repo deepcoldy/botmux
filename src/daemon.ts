@@ -306,6 +306,7 @@ import {
 } from './core/dispatch-report-binding.js';
 import { recordDispatchRegistryEntry } from './core/dispatch-registry.js';
 import { initialDispatchLifecycle } from './core/dispatch-lifecycle.js';
+import { applyDispatchLaunchBinding, registerDispatchLaunchBinding } from './core/dispatch-launch-binding.js';
 import { projectCoordinator } from './services/project-coordinator-runtime.js';
 import {
   addProjectWorkerIfNeeded,
@@ -6475,6 +6476,12 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
       .map(item => item.trim()).filter(Boolean).slice(0, 64)
     : [];
   const targetAppIds = stringArray(body?.targetAppIds);
+  const requestedLaunch = body?.requestedLaunch as any;
+  const effectiveRuntime = body?.effectiveRuntime as any;
+  if ((requestedLaunch !== undefined || effectiveRuntime !== undefined)
+      && (targetAppIds.length !== 1 || !requestedLaunch || !effectiveRuntime)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_dispatch_launch_spec' });
+  }
   const groupMode = readGroupCollaborationMode(config.session.dataDir, ds.chatId);
   const dispatchPolicy = evaluateProjectDispatchPolicy({
     config: groupMode,
@@ -6498,7 +6505,13 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
       detail: error instanceof Error ? error.message : String(error),
     });
   }
-
+  if (requestedLaunch && effectiveRuntime) {
+    registerDispatchLaunchBinding(config.session.dataDir, {
+      version: 1, targetLarkAppId: targetAppIds[0]!, chatId: targetChatId,
+      rootMessageId: dispatchRoot, requested: requestedLaunch, effective: effectiveRuntime,
+      createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+    });
+  }
   const bindingSecret = loadOrCreateDashboardSecret(
     dispatchReportBindingSecretPath(config.session.dataDir),
   );
@@ -23192,6 +23205,7 @@ async function handleThreadReplyAdmitted(
         session.lastMessageAt = new Date(now).toISOString();
         session.scope = scope;
         fillNativeTopicId(session, scope, parsed.threadId);
+        applyDispatchLaunchBinding(config.session.dataDir, session, larkAppId);
         // Twin of the new-topic pre-create block above: resolve the pinned dir
         // for EVERY session-needing daemon command, not just `/repo`, and skip
         // the pin when it would have meant auto-worktree. Same reasoning — this
@@ -23820,6 +23834,7 @@ async function handleThreadReplyAdmitted(
     if (parsed.senderType === 'user' && !isForeignBot) stampHumanActivity(session, now);
     session.scope = scope;
     fillNativeTopicId(session, scope, parsed.threadId);
+    applyDispatchLaunchBinding(config.session.dataDir, session, larkAppId);
     const groupChatName = await groupChatNamePromise;
     if (groupChatName) session.chatDisplayName = groupChatName;
     session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(
@@ -26447,10 +26462,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         if (rootOwners.length > 0) throw new Error('dispatch launch root is already owned');
         const admission = admissionStore.get(operation.dispatchId);
         if (!admission) throw new Error('dispatch launch admission is missing');
+        if (!('effectiveOverride' in operation) || !operation.effectiveOverride) {
+          throw new Error('dispatch launch operation has no prepared override');
+        }
         const session = sessionStore.createDispatchLaunchSession({
           dispatchId: operation.dispatchId, chatId: operation.chatId, rootMessageId,
           title: operation.kickoff.payload.title, chatType: admission.chatType ?? 'group',
           workingDir: admission.workingDir, larkAppId: cfg.larkAppId,
+          requestedOverride: operation.requestedOverride,
+          effectiveOverride: operation.effectiveOverride,
+          createdAt: operation.createdAt,
+          expiresAt: operation.expiresAt,
         });
         session.queued = true;
         session.queuedPrompt = operation.kickoff.payload.brief;

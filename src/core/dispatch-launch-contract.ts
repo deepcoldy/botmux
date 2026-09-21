@@ -179,6 +179,38 @@ export interface DispatchLaunchProofV1 {
   };
 }
 
+export interface DispatchLaunchRuntimeObservationV1 {
+  model: string;
+  reasoningEffort?: CodexReasoningEffort;
+  observed: boolean;
+  workerGeneration?: number;
+  observedAt?: string;
+}
+
+export function dispatchLaunchInspection(operation: DispatchLaunchOperationV1): {
+  dispatchId: string;
+  state: DispatchLaunchOperationState;
+  requestedLaunch: DispatchLaunchRequestedOverride;
+  effectiveRuntime?: DispatchLaunchRuntimeObservationV1;
+} {
+  const effective = 'effectiveOverride' in operation ? operation.effectiveOverride : undefined;
+  const observed = operation.state === 'succeeded' ? operation.proof.runtimeObserved : undefined;
+  return {
+    dispatchId: operation.dispatchId,
+    state: operation.state,
+    requestedLaunch: operation.requestedOverride,
+    ...(observed ? {
+      effectiveRuntime: {
+        model: observed.model,
+        ...(observed.reasoningEffort ? { reasoningEffort: observed.reasoningEffort } : {}),
+        observed: true,
+        workerGeneration: observed.workerGeneration,
+        observedAt: observed.observedAt,
+      },
+    } : effective ? { effectiveRuntime: { ...effective, observed: false } } : {}),
+  };
+}
+
 export const DISPATCH_LAUNCH_OPERATION_STATES = [
   'created',
   'preparing',

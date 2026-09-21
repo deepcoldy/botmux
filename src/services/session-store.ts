@@ -1886,6 +1886,10 @@ export function createDispatchLaunchSession(input: {
   chatType: 'group' | 'p2p';
   workingDir: string;
   larkAppId: string;
+  requestedOverride: import('../core/dispatch-launch-contract.js').DispatchLaunchRequestedOverride;
+  effectiveOverride: import('../core/dispatch-launch-contract.js').DispatchLaunchEffectiveOverride;
+  createdAt: string;
+  expiresAt: string;
 }): Session {
   loadForWrite();
   const session: Session = {
@@ -1893,6 +1897,11 @@ export function createDispatchLaunchSession(input: {
     chatType: input.chatType, rootMessageId: input.rootMessageId, scope: 'thread',
     title: input.title, status: 'active', createdAt: new Date().toISOString(),
     workingDir: input.workingDir, larkAppId: input.larkAppId,
+    dispatchLaunchSpec: {
+      version: 1, targetLarkAppId: input.larkAppId, chatId: input.chatId,
+      rootMessageId: input.rootMessageId, requested: input.requestedOverride,
+      effective: input.effectiveOverride, createdAt: input.createdAt, expiresAt: input.expiresAt,
+    },
   };
   sessions.set(session.sessionId, session);
   persistRow(session);

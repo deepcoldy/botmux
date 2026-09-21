@@ -51,6 +51,25 @@ function makeDs(): DaemonSession {
 }
 
 describe('dashboard SessionRow status projection', () => {
+  it('exposes dispatch requested launch and observed runtime separately', () => {
+    const ds = makeDs();
+    ds.session.dispatchLaunchSpec = {
+      version: 1, targetLarkAppId: 'cli_app', chatId: 'oc_chat', rootMessageId: 'om_root',
+      requested: { model: 'gpt-6-astra', reasoningEffort: 'high' },
+      effective: { model: 'gpt-6-astra', reasoningEffort: 'high' },
+      createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    };
+    expect(composeRowFromActive(ds)).toMatchObject({
+      requestedLaunch: { model: 'gpt-6-astra', reasoningEffort: 'high' },
+      effectiveRuntime: { model: 'gpt-6-astra', reasoningEffort: 'high', observed: false },
+    });
+    ds.session.dispatchLaunchSpec.effectiveRuntime = {
+      model: 'gpt-6-astra', reasoningEffort: 'high', workerGeneration: 2,
+      observedAt: '2026-09-21T01:00:00.000Z',
+    };
+    expect(composeRowFromActive(ds).effectiveRuntime).toMatchObject({ observed: true, workerGeneration: 2 });
+  });
+
   it('projects working (not starting) during a long first turn once the worker initialized', () => {
     // Regression: meeting-agent sessions are fed a transcript delivery right at
     // spawn, so the CLI runs a minutes-long first turn before its first idle

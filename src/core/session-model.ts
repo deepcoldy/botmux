@@ -10,6 +10,7 @@ export type LaunchModelSession = {
     scope?: 'thread' | 'chat';
     chatType?: 'group' | 'p2p';
     adoptedFrom?: unknown;
+    dispatchLaunchSpec?: { effective: { model: string } };
   };
   spawnModelOverride?: string;
 };
@@ -60,6 +61,7 @@ export function resolveSessionLaunchModel(
   ds: LaunchModelSession,
   botCfg?: LaunchModelBotConfig,
 ): string | undefined {
+  if (ds.session.dispatchLaunchSpec) return ds.session.dispatchLaunchSpec.effective.model;
   if (ds.spawnModelOverride) return ds.spawnModelOverride;
   const cliId = ds.session.cliId ?? botCfg?.cliId;
   const groupModel = resolveSessionGroupSettings(ds, cliId).model;

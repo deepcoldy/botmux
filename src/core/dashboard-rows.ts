@@ -31,6 +31,11 @@ export interface SessionRow extends SessionMessagePreview {
   larkAppId: string;
   botName: string;
   cliId: CliId | 'unknown';
+  requestedLaunch?: NonNullable<Session['dispatchLaunchSpec']>['requested'];
+  effectiveRuntime?: {
+    model: string; reasoningEffort?: string; observed: boolean;
+    workerGeneration?: number; observedAt?: string;
+  };
   /** Concrete distribution identity frozen on the session. Older path-only
    * sessions expose a basename-derived legacy identity. */
   runtimeId?: string;
@@ -252,6 +257,12 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     larkAppId: ds.larkAppId,
     botName: cachedBotName,
     cliId: ds.session.cliId ?? 'unknown',
+    ...(ds.session.dispatchLaunchSpec ? {
+      requestedLaunch: ds.session.dispatchLaunchSpec.requested,
+      effectiveRuntime: ds.session.dispatchLaunchSpec.effectiveRuntime
+        ? { ...ds.session.dispatchLaunchSpec.effectiveRuntime, observed: true }
+        : { ...ds.session.dispatchLaunchSpec.effective, observed: false },
+    } : {}),
     cliInstanceId: ds.session.cliInstanceBinding?.instanceId ?? undefined,
     cliInstanceSource: ds.session.cliInstanceBinding?.source,
     creationSource: ds.session.creationSource,
@@ -325,6 +336,12 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
     cliId: s.cliId ?? 'unknown',
+    ...(s.dispatchLaunchSpec ? {
+      requestedLaunch: s.dispatchLaunchSpec.requested,
+      effectiveRuntime: s.dispatchLaunchSpec.effectiveRuntime
+        ? { ...s.dispatchLaunchSpec.effectiveRuntime, observed: true }
+        : { ...s.dispatchLaunchSpec.effective, observed: false },
+    } : {}),
     cliInstanceId: s.cliInstanceBinding?.instanceId ?? undefined,
     cliInstanceSource: s.cliInstanceBinding?.source,
     creationSource: s.creationSource,
@@ -376,6 +393,12 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
     cliId: s.cliId ?? 'unknown',
+    ...(s.dispatchLaunchSpec ? {
+      requestedLaunch: s.dispatchLaunchSpec.requested,
+      effectiveRuntime: s.dispatchLaunchSpec.effectiveRuntime
+        ? { ...s.dispatchLaunchSpec.effectiveRuntime, observed: true }
+        : { ...s.dispatchLaunchSpec.effective, observed: false },
+    } : {}),
     cliInstanceId: s.cliInstanceBinding?.instanceId ?? undefined,
     cliInstanceSource: s.cliInstanceBinding?.source,
     creationSource: s.creationSource,
