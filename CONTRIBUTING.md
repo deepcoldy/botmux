@@ -32,6 +32,22 @@ bun run daemon:logs
 > (see `InstallKind` in `src/utils/install-diagnostics.ts`), so don't "convert"
 > those to bun.
 
+## Midscene Dashboard E2E
+
+The declarative Midscene Test suite lives in `test/midscene/`. It starts the
+real Dashboard bundle against isolated synthetic Botmux data, then verifies the
+main read-only pages through a Playwright-backed Midscene agent.
+
+Provide the four `MIDSCENE_MODEL_*` variables shown in `.env.example`, then run:
+
+```bash
+bun run test:midscene:typecheck
+bun run test:midscene
+```
+
+The suite does not use the developer's real `~/.botmux` directory. Replayable
+HTML reports are written below the gitignored `midscene_run/report/` directory.
+
 ## Architecture
 
 ```

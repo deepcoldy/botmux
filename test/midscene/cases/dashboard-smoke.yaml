@@ -1,0 +1,33 @@
+cases:
+  - name: 浏览 Dashboard 的核心只读页面
+    tags: [smoke]
+    steps:
+      - aiAssert:
+          prompt: Botmux Dashboard 已经加载完成。左侧导航中能看到工作台、会话控制和监控看板，主区域显示工作台概览，并能看到名为 Midscene Smoke Bot 的机器人。
+          message: Dashboard 工作台或测试机器人没有正确显示
+          $:
+            timeout: 60_000
+      - aiAct:
+          prompt: 点击左侧导航中的“会话控制”。
+          $:
+            timeout: 60_000
+      - aiAssert:
+          prompt: 当前是 Botmux 的会话控制页面。页面包含会话相关的标题、筛选或空状态，而不是工作台概览。
+          message: 没有进入会话控制页面
+          $:
+            timeout: 60_000
+      - aiAct:
+          prompt: 点击左侧导航中的“监控看板”。
+          $:
+            timeout: 60_000
+      - aiAssert:
+          prompt: 当前页面是 Botmux 的监控看板，并展示运行健康、资源压力或会话压力等运行状态区域。
+          message: 没有进入监控看板页面
+          $:
+            timeout: 60_000
+
+afterAll:
+  - recordToReport:
+      title: Botmux Dashboard Midscene 冒烟测试
+      options:
+        content: 已通过真实 Dashboard bundle 验证工作台、会话控制与监控看板的可见性和导航。
