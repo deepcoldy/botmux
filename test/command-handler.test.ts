@@ -326,6 +326,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
     return { attemptId: 'attempt-test', joined: false };
   }),
   isSessionTransferring: vi.fn(() => false),
+  sendWorkerSessionInput: vi.fn(() => true),
   // /close routes the「会话已关闭」card through this: ephemeral (visible-to-you)
   // when the chat supports it, else the visible reply fallback. The stub just
   // invokes the fallback so the existing card-shape assertions (on sessionReply)
@@ -547,7 +548,7 @@ vi.mock('../src/im/lark/cot-message.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, cliHasNoRawPassthroughSurface, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, parseTopicHeader, isTopicHeader, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, cliHasNoRawPassthroughSurface, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, parseTopicHeader, isTopicHeader, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
 import { setChatStreamingCardPin } from '../src/services/pin-streaming-card-mode-store.js';
 import { setCotMode } from '../src/services/cot-mode-store.js';
@@ -564,7 +565,7 @@ import { sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { LarkMessage, Session } from '../src/types.js';
-import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins } from '../src/core/worker-pool.js';
+import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolSession, killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, forkSession, isForkCapableSession, getCurrentCliVersion, deliverEphemeralOrReply, deliverWritableTerminalCardTo, requestSessionRestart, sendWorkerSessionInput, withActiveSessionKeyLock, postFreshStreamingCard, reconcileBotStreamingCardPins } from '../src/core/worker-pool.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
@@ -730,7 +731,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/cleanup-wt', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/project', '/group', '/g', '/relay', '/quote', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/sessions', '/vc-auth', '/issue', '/cli'];
+    const expected = ['/close', '/cleanup-wt', '/stop', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/project', '/group', '/g', '/relay', '/quote', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/sessions', '/vc-auth', '/issue', '/cli'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -767,7 +768,7 @@ describe('DAEMON_COMMANDS set', () => {
     // bot 发送方和 `/t /tabs ...` 会建出 phantom session 后静默失效。
     // /fork 与 /issue 仍是一等 daemon 命令；/subscribe-lark-doc 保持原本的
     // 按文件 API 订阅命令语义，不做别名。
-    expect(DAEMON_COMMANDS.size).toBe(40);
+    expect(DAEMON_COMMANDS.size).toBe(41);
     expect(DAEMON_COMMANDS.has('/tabs')).toBe(false);
     expect(DAEMON_COMMANDS.has('/tab')).toBe(false);
   });
@@ -1047,7 +1048,15 @@ describe('SESSIONLESS_DAEMON_COMMANDS set', () => {
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/repo')).toBe(false);
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/cd')).toBe(false);
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/close')).toBe(false);
+    expect(SESSIONLESS_DAEMON_COMMANDS.has('/stop')).toBe(false);
     expect(SESSIONLESS_DAEMON_COMMANDS.has('/card')).toBe(false);
+  });
+});
+
+describe('EXISTING_SESSION_ONLY_DAEMON_COMMANDS set', () => {
+  it('keeps /stop existing-session-only so it cannot create a phantom command session', () => {
+    expect(EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has('/stop')).toBe(true);
+    expect(DAEMON_COMMANDS.has('/stop')).toBe(true);
   });
 });
 
@@ -2544,6 +2553,14 @@ describe('handleCommand', () => {
         LARK_APP_ID,
         'msg_001',
       );
+      const confirmCard = vi.mocked(deps.sessionReply).mock.calls
+        .map(c => c[1])
+        .find((content): content is string => typeof content === 'string' && content.includes('"tag":"table"'));
+      expect(confirmCard).toBeTruthy();
+      const confirmTable = JSON.parse(confirmCard as string).body.elements
+        .find((e: any) => e.tag === 'table');
+      expect(confirmTable.row_height).toBe('auto');
+      expect(confirmTable.row_max_height).toBe('300px');
     });
 
     it('`/close wt --yes` without a confirmation state never deletes even a clean worktree', async () => {
@@ -3105,6 +3122,64 @@ describe('handleCommand', () => {
       expect(deps.sessionReply).toHaveBeenCalledWith(
         ROOT_ID,
         expect.stringContaining('没有活跃的会话'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+  });
+
+  // ─── /stop ──────────────────────────────────────────────────────────────
+
+  describe('/stop', () => {
+    it('sends ctrl-c through the session input channel and keeps the session alive', async () => {
+      const ds = makeDaemonSession({
+        worker: { killed: false, send: vi.fn() } as any,
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/stop', ROOT_ID, makeLarkMessage('/stop'), deps, LARK_APP_ID);
+
+      expect(sendWorkerSessionInput).toHaveBeenCalledWith(ds, { type: 'term_action', key: 'ctrlc' });
+      expect(closeSession).not.toHaveBeenCalled();
+      expect(requestSessionRestart).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('已发送停止信号'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    it('does not treat /stop without a session as a normal prompt', async () => {
+      const deps = makeDeps();
+
+      await handleCommand('/stop', ROOT_ID, makeLarkMessage('/stop'), deps, LARK_APP_ID);
+
+      expect(sendWorkerSessionInput).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('没有活跃的会话'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    it('refuses CLI modes without a local PTY input channel', async () => {
+      const ds = makeDaemonSession({
+        worker: { killed: false, send: vi.fn() } as any,
+        session: makeSession({ cliId: 'codex-app' as any }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/stop', ROOT_ID, makeLarkMessage('/stop'), deps, LARK_APP_ID);
+
+      expect(sendWorkerSessionInput).not.toHaveBeenCalled();
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('不支持 /stop'),
         undefined,
         LARK_APP_ID,
         'msg_001',
@@ -7800,7 +7875,7 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     vi.clearAllMocks();
     vi.mocked(canOperate).mockReturnValue(true);
     vi.mocked(setCotMode).mockResolvedValue({ ok: true, changed: true } as any);
-    botWith({ thinkingCard: true });
+    botWith({ cotEnabled: true });
   });
 
   it('rejects a non-operator: operator_only notice, no mode change', async () => {
@@ -7826,16 +7901,16 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     expect(setCotMode).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, false);
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
     expect(reply).toContain('已恢复');
-    expect(reply).not.toContain('thinkingCard on');
+    expect(reply).not.toContain('cotEnabled on');
   });
 
-  it('/cot on hints at the master switch when thinkingCard is explicitly off', async () => {
-    botWith({ thinkingCard: false });
+  it('/cot on hints at the master switch when cotEnabled is explicitly off', async () => {
+    botWith({ cotEnabled: false });
     const deps = makeDeps();
     await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot on', deps);
     expect(setCotMode).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, false);
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-    expect(reply).toContain('thinkingCard on');
+    expect(reply).toContain('cotEnabled on');
   });
 
   it('/cot on with an untouched config (default ON) confirms without the master-switch hint', async () => {
@@ -7844,7 +7919,7 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot on', deps);
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
     expect(reply).toContain('已恢复');
-    expect(reply).not.toContain('thinkingCard on');
+    expect(reply).not.toContain('cotEnabled on');
   });
 
   it('/cot status reports on / chat-muted / master-off states', async () => {
@@ -7852,26 +7927,13 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot', deps);
     expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('开启中');
 
-    botWith({ thinkingCard: true, noCotChats: [CHAT_ID] });
+    botWith({ cotEnabled: true, noCotChats: [CHAT_ID] });
     await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
     expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[1][1]).toContain('本群已关闭');
 
-    botWith({ thinkingCard: false });
+    botWith({ cotEnabled: false });
     await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
     expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[2][1]).toContain('总开关未开');
-    expect(setCotMode).not.toHaveBeenCalled();
-  });
-
-  it('/cot status appends the tool-output line only when thinkingCardToolResult is off', async () => {
-    const deps = makeDeps();
-    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
-    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).not.toContain('工具输出');
-
-    botWith({ thinkingCard: true, thinkingCardToolResult: false });
-    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
-    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[1][1] as string;
-    expect(reply).toContain('开启中');
-    expect(reply).toContain('工具输出：已关闭');
     expect(setCotMode).not.toHaveBeenCalled();
   });
 
@@ -7890,7 +7952,7 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
   });
 
   it('/cot show mid-turn: forces the session and renders the cached thinking immediately', async () => {
-    botWith({ thinkingCard: false }); // switches off — show overrides anyway
+    botWith({ cotEnabled: false }); // switches off — show overrides anyway
     const ds = makeDaemonSession();
     ds.lastThinkingUpdate = { entries: [{ kind: 'thinking', text: 'so far' }], turnId: 'om_turn9' };
     const deps = makeDeps(ds);

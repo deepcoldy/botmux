@@ -13,6 +13,51 @@ import { discoverRolloutSessions } from '../../services/resumable-session-discov
 import { delay, scaleMs } from '../../utils/timing.js';
 
 const CODEX_ACTIVE_BUSY_PATTERN = /Working[^\r\n]{0,160}esc to interrupt/i;
+const CODEX_STARTUP_READY_PATTERN = /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/;
+
+/** ZMX resume can replace the entire banner with restored history; warm worker
+ * reattach can leave the original loaded banner far above the viewport. Either
+ * native header plus a bottom empty composer + explicit Ready footer proves
+ * initialization without guessing the PTY's current viewport geometry.
+ * Do not use a prompt/footer found in the middle of scrollback as evidence. */
+function restoredCodexHistoryReady(history: string): boolean {
+  const restored = /^\s*Earlier messages are available\s*—\s*press ctrl \+ t to view the full transcript[ \t]*(?:\r?\n|$)/.test(history);
+  const banner = history.match(/^\s*╭[^\r\n]*╮\r?\n[\s\S]*?╰[^\r\n]*╯/)?.[0];
+  const initialized = !!banner && banner.includes('>_ OpenAI Codex') && CODEX_STARTUP_READY_PATTERN.test(banner);
+  const lines = history.trimEnd().split(/\r?\n/);
+  const fromBottom = [...lines].reverse().findIndex(line => /^\s*›(?:\s|$)/.test(line));
+  if (fromBottom < 0) return false;
+  const prompt = lines.length - 1 - fromBottom;
+  if (!/^\s*›\s*(?:Ask Codex to do anything)?\s*$/.test(lines[prompt])) return false;
+  const footer = lines.slice(prompt + 1).filter(line => line.trim());
+  if (footer.length !== 1) return false;
+  const restoredReady = (restored || initialized)
+    && /^\s*\S[^\r\n]* · (?:\/|~)\S* · Ready(?: · [^\r\n]*)?$/.test(footer[0]!);
+  // Codex 0.154 can resume straight into the composer without repainting the
+  // banner or restoration marker. Its bottom Context footer is the positive
+  // initialization evidence in that layout; the loading skeleton never has it.
+  const contextReady = /^\s*\S[^\r\n]* · Context \d+% (?:left|used)(?: · [^\r\n]*)?$/.test(footer[0]!);
+  if (!restoredReady && !contextReady) return false;
+  // History has no viewport bounds: never guess how far above the composer a
+  // loading/status row can be. Conflicting evidence remains conservatively held.
+  return !/(?:model|directory):\s*loading\b|Resuming session|esc to interrupt|Queued for capacity/i.test(history);
+}
+
+/** Only the current viewport is meaningful here: stripping the PTY stream
+ * leaves erased loading screens and old transcript prompts in the text. */
+function resumedCodexPromptReady(screen: string): boolean {
+  if (/(?:model|directory):\s*loading\b|Resuming session|esc to interrupt|Queued for capacity/i.test(screen)) return false;
+  const lines = screen.trimEnd().split('\n');
+  const fromBottom = [...lines].reverse().findIndex(line => /^\s*›(?:\s|$)/.test(line));
+  if (fromBottom < 0) return false;
+  const prompt = lines.length - 1 - fromBottom;
+  if (!/^\s*›\s*(?:Ask Codex to do anything)?\s*$/.test(lines[prompt])) return false;
+  // The composer must be the bottom input surface, followed only by its
+  // initialized model/path footer. Pickers, review dialogs and history alone
+  // cannot satisfy this shape. Do not depend on a particular model name.
+  const footer = lines.slice(prompt + 1).filter(line => line.trim());
+  return footer.length === 1 && /^\s*\S[^\n]* · (?:\/|~)\S*/.test(footer[0]);
+}
 
 /** Global submit log — Codex appends one JSON line here on every successful
  *  user submit across all sessions. Far better than the per-session rollout
@@ -230,7 +275,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         ...(!disableCliBypass && bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : []),
         '--no-alt-screen',
         '-c',
-        `shell_environment_policy.set.BOTMUX_SESSION_ID=${JSON.stringify(sessionId)}`,
+        `shell_environment_policy.set.BOTMUX_SESSION_ID=${JSON.stringify(shellSubprocessEnv?.BOTMUX_SESSION_ID ?? sessionId)}`,
         // A botmux session cannot safely interact with Codex's startup update
         // picker: the first queued Lark message can be consumed by the menu.
         // Treat botmux as the runtime manager for every launch (sandboxed or
@@ -274,6 +319,7 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       // these keys, while inherit would hand every shell command the whole
       // worker environment, which is a much wider surface for a narrower need.
       for (const [key, value] of Object.entries(shellSubprocessEnv ?? {})) {
+        if (key === 'BOTMUX_SESSION_ID' || value === undefined) continue;
         baseArgs.push('-c', `shell_environment_policy.set.${key}=${JSON.stringify(value)}`);
       }
       if (model && model.trim()) {
@@ -449,7 +495,12 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     // models/paths. The footer can already show a model during loading. Match
     // cell boundaries, not literal newlines: PTY redraws also move the cursor.
     startupPendingPattern: /│[ \t]+(?:model|directory):[ \t]+loading\b/,
-    startupReadyPattern: /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/,
+    startupReadyPattern: CODEX_STARTUP_READY_PATTERN,
+    startupReadyFromHistory: restoredCodexHistoryReady,
+    startupResume: {
+      historyPattern: /Earlier messages are available\s*—\s*press ctrl \+ t to view the full transcript/,
+      isReady: resumedCodexPromptReady,
+    },
     // Codex cold starts can exceed the worker's 15s soft first-prompt timeout.
     // Wait for the real composer marker so the bare-shell guard does not treat
     // a still-loading zsh wrapper as a failed launch.

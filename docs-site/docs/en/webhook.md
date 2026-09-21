@@ -19,6 +19,19 @@ curl -X POST 'http://<lan-ip>:7891/webhook/conn_xxx/<token>' \
 
 Run this command and the bot is triggered in the group you chose, reading this JSON event.
 
+## Network prerequisites
+
+The connector HTTP endpoint is served by the Dashboard process (default port `7891`, the `<lan-ip>:7891` in the example above). **The caller must be able to reach that address from its own network:**
+
+- Intranet IPs and `m-` internal machine domains are reachable only inside the corporate intranet. Internal systems such as same-datacenter monitoring or intranet CI can call them directly.
+- A public sender (external SaaS, public CI / monitoring) cannot reach an intranet address directly, so the deployment must provide a public entry point, in one of two common ways:
+  1. **Public reverse proxy / gateway**: front the Dashboard listening port (default `7891`) with an HTTPS gateway, and set `BOTMUX_PUBLIC_URL` to that external base URL (see [environment variables](/en/env)) so the links Dashboard generates use that domain.
+  2. **Corporate network egress**: expose the Dashboard port to the caller's network through the Service Mesh HTTP Egress / egress gateway.
+
+This is a deployment-side prerequisite: botmux does **not** bundle a NAT-traversal tunnel, so public reachability must be provided by your own gateway / ops chain. Note that Feishu group messages themselves arrive over a long-lived connection and do not require the Dashboard to be publicly reachable; the requirement here applies only to external systems calling a connector.
+
+> Connectors currently deliver at group granularity (fixed group / request-specified / new group each time). **Session-anchor isolation** — each connector owning one fixed topic session so separate connectors never share context — is planned for a later release and is not supported in the current version.
+
 ## Verification method
 
 Chosen per connector, with two tiers:

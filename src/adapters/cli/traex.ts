@@ -228,7 +228,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, reasoningEffort, modelBackendVariant, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, remoteWsUrl, remoteThreadId, shellSubprocessEnv, nativeSubagentRuntimeHookCommand }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, modelBackendVariant, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, remoteWsUrl, remoteThreadId, shellSubprocessEnv, nativeSubagentRuntimeHookCommand }) {
       // TraeX shares Codex's low-quota picker and notice setting. Disable it
       // per process so a message-submit Enter cannot confirm a model switch.
       const modelNudgeArgs = hideRateLimitModelNudge
@@ -264,6 +264,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
       // Keep trigger-user identity wrappers available in tool shells. Set only
       // the requested keys, without inheriting the entire worker environment.
       for (const [key, value] of Object.entries(shellSubprocessEnv ?? {})) {
+        if (value === undefined) continue;
         baseArgs.push('-c', `shell_environment_policy.set.${key}=${JSON.stringify(value)}`);
       }
       if (model && model.trim()) baseArgs.push('--model', model.trim());
@@ -277,7 +278,11 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
 
       const traeSessionId = resumeSessionId ?? findTraexSessionIdByBotmuxSessionId(sessionId);
       if (!traeSessionId) return baseArgs;
-      return ['resume', ...baseArgs, traeSessionId];
+      // Session fork: TraeX exposes the same native subcommand shape as Codex
+      // (`traecli fork <id>`). It mints a new thread while leaving the source
+      // untouched. The worker sets forkSession only for a fork child's first
+      // spawn; later restarts use ordinary resume against the child's new id.
+      return [forkSession ? 'fork' : 'resume', ...baseArgs, traeSessionId];
     },
 
     buildResumeCommand({ sessionId, cliSessionId }) {
@@ -422,6 +427,18 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     // exclude numbered selector rows; otherwise botmux flushes the first prompt
     // into the advisory instead of TRAE's real composer.
     readyPattern: /(?:^|[\n\r])\s*[›❯](?!\s*\d+\.)|\d+% left/,
+    // Skeleton composer gate, same cells and regexes as Codex (fork). Real
+    // PTY samples from traex 0.205.1-alpha.3 (node-pty + xterm-headless):
+    // the 0.6s frame already draws the `❯ Ask TraeCode CLI …` line and the
+    // `100% context left` bar (both match readyPattern above) while the banner
+    // cell is still `model:     loading` (directory already resolved); the
+    // 1.5s frame has both `model:` and `directory:` cells resolved. The ready
+    // banner on 0.201.1-alpha.6 has the identical two-cell shape. The `›` and
+    // 2s of silence therefore do not prove submit readiness on cold start.
+    // deferFirstPromptTimeoutUntilReady is already set below, so the worker's
+    // first-prompt timeouts wait for this gate without worker-side changes.
+    startupPendingPattern: /│[ \t]+(?:model|directory):[ \t]+loading\b/,
+    startupReadyPattern: /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/,
     systemHints: BOTMUX_SHELL_HINTS,
     // TRAE 0.200+ shares Codex's type-ahead behaviour: input submitted while
     // a turn is running is parked and merged into the active turn.

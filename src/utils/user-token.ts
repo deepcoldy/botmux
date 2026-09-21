@@ -430,6 +430,136 @@ const DEFAULT_SCOPES = [
   ...DOC_READ_OAUTH_SCOPES,
 ].join(' ');
 
+type UserAuthorizationPollResult =
+  | { status: 'pending' }
+  | { status: 'ready'; token: string }
+  | { status: 'failed'; error: string };
+
+export async function requestUserAuthorization(
+  appId: string,
+  appSecret: string,
+  brand: Brand,
+  extraScopes: string[],
+  openId: string,
+  isCurrent: () => boolean,
+): Promise<{
+  authUrl: string;
+  expiresIn: number;
+  scopes: string[];
+  poll: () => Promise<UserAuthorizationPollResult>;
+}> {
+  if (!isUsableOpenId(openId) || !isCurrent()) throw new Error('authorization_origin_changed');
+  const scopes = [...new Set([...DEFAULT_SCOPES.split(' '), ...extraScopes])];
+  const response = await fetch(`${larkHosts(brand).accounts}/oauth/v1/device_authorization`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      Authorization: `Basic ${Buffer.from(`${appId}:${appSecret}`).toString('base64')}`,
+    },
+    body: new URLSearchParams({ client_id: appId, scope: scopes.join(' ') }),
+    signal: AbortSignal.timeout(8_000),
+  });
+  const device = await response.json() as {
+    device_code?: string;
+    verification_uri_complete?: string;
+    expires_in?: number;
+    interval?: number;
+    error?: string;
+  };
+  if (!response.ok || device.error) throw new Error('device_authorization_failed');
+  if (!device.device_code || !device.verification_uri_complete
+    || !Number.isFinite(device.expires_in) || device.expires_in! <= 0) {
+    throw new Error('invalid_device_authorization_response');
+  }
+  if (!isCurrent()) throw new Error('authorization_origin_changed');
+  const deviceCode = device.device_code;
+  const expiresIn = Math.min(device.expires_in!, 300);
+  const expiresAt = Date.now() + expiresIn * 1_000;
+  let intervalMs = (Number.isFinite(device.interval) && device.interval! >= 1 ? device.interval! : 5) * 1_000;
+  let nextPollAt = Date.now() + intervalMs;
+  let inFlight: Promise<UserAuthorizationPollResult> | undefined;
+  let terminal: UserAuthorizationPollResult | undefined;
+
+  const pollOnce = async (): Promise<UserAuthorizationPollResult> => {
+    nextPollAt = Date.now() + intervalMs;
+    const signal = AbortSignal.timeout(Math.max(1, Math.min(8_000, expiresAt - Date.now())));
+    try {
+      const tokenResponse = await fetch(`${larkHosts(brand).openApi}/open-apis/authen/v2/oauth/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+          grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+          device_code: deviceCode,
+          client_id: appId,
+          client_secret: appSecret,
+        }),
+        signal,
+      });
+      const data = await tokenResponse.json() as TokenResponse;
+      if (!isCurrent()) return { status: 'failed', error: 'authorization_origin_changed' };
+      if (Date.now() >= expiresAt) return { status: 'failed', error: 'expired_token' };
+      if (data.error === 'authorization_pending') return { status: 'pending' };
+      if (data.error === 'slow_down') {
+        intervalMs += 5_000;
+        nextPollAt = Date.now() + intervalMs;
+        return { status: 'pending' };
+      }
+      if (data.error === 'access_denied') return { status: 'failed', error: 'access_denied' };
+      if (data.error === 'expired_token' || data.error === 'invalid_grant') {
+        return { status: 'failed', error: 'expired_token' };
+      }
+      if (!tokenResponse.ok || data.error || !data.access_token
+        || !Number.isFinite(data.expires_in) || data.expires_in <= 0) {
+        return { status: 'failed', error: 'authorization_token_failed' };
+      }
+      const granted = new Set((data.scope ?? '').split(/\s+/));
+      if (!scopes.every(scope => granted.has(scope))) return { status: 'failed', error: 'authorization_scope_missing' };
+      const authorized = await fetchAuthorizedUser(data.access_token, brand, signal);
+      if (signal.aborted) return { status: 'failed', error: 'authorization_timeout' };
+      if (!authorized.ok) return { status: 'failed', error: 'authorization_identity_unverified' };
+      if (authorized.openId !== openId) return { status: 'failed', error: 'authorization_user_mismatch' };
+      if (!isCurrent()) return { status: 'failed', error: 'authorization_origin_changed' };
+      if (Date.now() >= expiresAt) return { status: 'failed', error: 'expired_token' };
+      const now = Date.now();
+      saveTokenForApp({
+        access_token: data.access_token,
+        refresh_token: data.refresh_token,
+        token_type: data.token_type,
+        expires_at: new Date(now + data.expires_in * 1_000).toISOString(),
+        refresh_expires_at: data.refresh_token_expires_in > 0
+          ? new Date(now + data.refresh_token_expires_in * 1_000).toISOString()
+          : '',
+        scope: data.scope,
+        appId,
+        brand,
+        openId,
+        ...(authorized.userName ? { userName: authorized.userName } : {}),
+      }, appId, openId);
+      return { status: 'ready', token: data.access_token };
+    } catch {
+      return { status: 'failed', error: signal.aborted ? 'authorization_timeout' : 'authorization_failed' };
+    }
+  };
+
+  return {
+    authUrl: device.verification_uri_complete,
+    expiresIn,
+    scopes,
+    poll: () => {
+      if (!isCurrent()) return Promise.resolve({ status: 'failed', error: 'authorization_origin_changed' });
+      if (terminal) return Promise.resolve(terminal);
+      if (inFlight) return inFlight;
+      if (Date.now() >= expiresAt) return Promise.resolve({ status: 'failed', error: 'expired_token' });
+      if (Date.now() < nextPollAt) return Promise.resolve({ status: 'pending' });
+      inFlight = pollOnce().then(result => {
+        if (result.status !== 'pending') terminal = result;
+        return result;
+      }).finally(() => { inFlight = undefined; });
+      return inFlight;
+    },
+  };
+}
+
 /**
  * 飞书文档订阅入口（/subscribe-lark-doc）专用的额外 OAuth scope。**不进**全局
  * DEFAULT_SCOPES —— 否则所有 bot 的通用 /login（图片下载用）都会请求这些 scope，
@@ -602,10 +732,12 @@ type AuthorizedUser =
 async function fetchAuthorizedUser(
   accessToken: string,
   brand: Brand,
+  signal?: AbortSignal,
 ): Promise<AuthorizedUser> {
   try {
     const res = await fetch(`${larkHosts(brand).openApi}/open-apis/authen/v1/user_info`, {
       headers: { Authorization: `Bearer ${accessToken}` },
+      ...(signal ? { signal } : {}),
     });
     if (!res.ok) return { ok: false, reason: `user_info HTTP ${res.status}` };
     const body = await res.json() as { code?: number; msg?: string; data?: { open_id?: string; name?: string } };

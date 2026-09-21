@@ -176,10 +176,21 @@ function classifyRenameChatError(code: unknown): 'permission_denied' | 'lark_api
 }
 
 /**
+ * Feishu chat topology chosen at CREATION time. It is fixed for the chat's
+ * lifetime through this API — it is NOT the same as `group_message_type`
+ * (a normal group can opt into threaded messages while staying `group`).
+ * `p2p` is not creatable here (it is a direct message, not a group).
+ */
+export type ChatMode = 'group' | 'topic';
+
+/**
  * Create a brand-new chat with `bot_id_list` as initial bot members.  The
  * `creatorLarkAppId` bot becomes the chat's owner and an implicit member; the
  * other bots in `botIds` are added in the same call.  Used by the dashboard's
  * "Create new group" flow.
+ *
+ * `chatMode: 'topic'` creates a 话题群 (every top-level message starts its own
+ * thread). Omit it to keep Feishu's default, a 普通群.
  *
  * Returns the new chatId on success.  Throws on any non-zero Lark response so
  * the route can surface a real error.  We deliberately don't soften failures
@@ -188,7 +199,7 @@ function classifyRenameChatError(code: unknown): 'permission_denied' | 'lark_api
  */
 export async function createChat(
   creatorLarkAppId: string,
-  opts: { name?: string; botIds: string[]; userIds?: string[] },
+  opts: { name?: string; botIds: string[]; userIds?: string[]; chatMode?: ChatMode },
 ): Promise<{ chatId: string; invalidBotIds: string[]; invalidUserIds: string[] }> {
   const client = getBotClient(creatorLarkAppId);
   // Filter out the creator from bot_id_list — Lark errors if the inviter
@@ -199,6 +210,10 @@ export async function createChat(
   if (opts.name) data.name = opts.name;
   if (otherBots.length > 0) data.bot_id_list = otherBots;
   if (userIds.length > 0) data.user_id_list = userIds;
+  // Only send chat_mode when the caller explicitly chose one: an omitted field
+  // keeps Feishu's default ('group') and avoids pinning behavior that a future
+  // API default might change.
+  if (opts.chatMode) data.chat_mode = opts.chatMode;
   const params: Record<string, unknown> = {};
   if (userIds.length > 0) params.user_id_type = 'open_id';
   const res: any = await (client as any).im.v1.chat.create({ data, params });

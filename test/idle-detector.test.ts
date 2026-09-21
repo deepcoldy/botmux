@@ -26,6 +26,7 @@ function makeCli(opts: {
   staticBusyPattern?: RegExp;
   staticBusyClearPattern?: RegExp;
   readyPattern?: RegExp;
+  firstPromptQuiescenceMs?: number;
 } = {}): CliAdapter {
   return {
     id: 'test-cli',
@@ -38,6 +39,7 @@ function makeCli(opts: {
     staticBusyPattern: opts.staticBusyPattern,
     staticBusyClearPattern: opts.staticBusyClearPattern,
     readyPattern: opts.readyPattern,
+    firstPromptQuiescenceMs: opts.firstPromptQuiescenceMs,
     systemHints: [],
     altScreen: false,
   };
@@ -1405,6 +1407,94 @@ describe('IdleDetector: CoCo readyPattern compatibility', () => {
     detector.feed('█ ◆ ◆ █  Try Codebase Copilot');
     vi.advanceTimersByTime(2500);
     expect(cb).toHaveBeenCalledTimes(0);
+    detector.dispose();
+  });
+});
+
+// ─── first-prompt extended quiescence (OpenCode-style adapters) ───────────
+
+describe('IdleDetector: first-prompt extended quiescence', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it('uses the longer window only before this process has ever gone idle', () => {
+    const detector = new IdleDetector(makeCli({ firstPromptQuiescenceMs: 4_000 }));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    detector.feed('hello world');
+    vi.advanceTimersByTime(2_000);
+    expect(cb).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(2_000);
+    expect(cb).toHaveBeenCalledTimes(1);
+
+    // Later cycles use the normal 2s quiescence. reset() synthesizes a recent
+    // spinner timestamp, so the spinner guard adds 1.2s on top; idle landing at
+    // 3.2s (< the 4s extended window) proves the long window did not recur.
+    detector.reset();
+    detector.feed('second output');
+    vi.advanceTimersByTime(2_000);
+    expect(cb).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(1_200);
+    expect(cb).toHaveBeenCalledTimes(2);
+    detector.dispose();
+  });
+
+  it('defaults to the normal 2s window when the field is absent', () => {
+    const detector = new IdleDetector(makeCli());
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    detector.feed('hello world');
+    vi.advanceTimersByTime(2_000);
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('does not change adapters that define readyPattern', () => {
+    const detector = new IdleDetector(makeCli({
+      readyPattern: /READY>/,
+      firstPromptQuiescenceMs: 4_000,
+    }));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    // Strategy 2 still early-returns until readyPattern is seen.
+    detector.feed('still booting...');
+    vi.advanceTimersByTime(10_000);
+    expect(cb).not.toHaveBeenCalled();
+
+    detector.feed('READY>');
+    vi.advanceTimersByTime(2_000);
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it.each([1_000, 2_000])('falls back to 2s when the field is %s (not greater than the default)', (value) => {
+    const detector = new IdleDetector(makeCli({ firstPromptQuiescenceMs: value }));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    detector.feed('hello world');
+    vi.advanceTimersByTime(2_000);
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('still honors the spinner guard inside the extended first window', () => {
+    // 2.5s is long enough to select the extended window but short enough that
+    // the 3s spinner guard is still live when the quiescence check runs.
+    const detector = new IdleDetector(makeCli({ firstPromptQuiescenceMs: 2_500 }));
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    detector.feed('loading ⠋');
+    vi.advanceTimersByTime(2_500);
+    expect(cb).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(699);
+    expect(cb).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    expect(cb).toHaveBeenCalledTimes(1);
     detector.dispose();
   });
 });

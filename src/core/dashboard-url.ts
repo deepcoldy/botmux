@@ -1,5 +1,6 @@
 import {
   platformMachineBaseUrl,
+  platformTerminalBaseUrl,
   publicReverseProxyBaseUrl,
   readPlatformBinding,
 } from '../platform/binding.js';
@@ -223,6 +224,11 @@ function platformCentralBaseUrl(): string | null {
   return isRemoteAccessEnabled() ? platformMachineBaseUrl() : null;
 }
 
+/** The central-platform terminal surface (`t-<machineId>...`) only, or null. */
+function platformCentralTerminalBaseUrl(): string | null {
+  return isRemoteAccessEnabled() ? platformTerminalBaseUrl() : null;
+}
+
 /**
  * The remote bases that merely FORWARD to this dashboard: a self-hosted reverse
  * proxy (`BOTMUX_PUBLIC_URL`) and the Devbox short link. Reachable from outside,
@@ -283,7 +289,7 @@ export function buildV3RunDetailUrl(runId: string, opts: { host: string; port: n
  * Build a deep link to a v3 run's live terminal page (the mobile-friendly
  * `getTerminalHtml` view), used by the progress card's「终端」button.
  *
- * On the central HTTPS platform the same-origin `/s/<sessionId>` reverse proxy
+ * On the central HTTPS platform the terminal-subdomain `/s/<sessionId>` reverse proxy
  * reaches the worker; on a self-hosted LAN box the worker's own `webPort` is
  * used directly (mirrors `buildSessionTerminalUrl`). Both forms carry the
  * worker's per-boot read capability. Returns null when that capability is
@@ -295,7 +301,7 @@ export function buildV3TerminalUrl(
 ): string | null {
   if (!opts.viewToken) return null;
   const capability = `?viewToken=${encodeURIComponent(opts.viewToken)}`;
-  const base = remotePublicBase();
+  const base = platformCentralTerminalBaseUrl() ?? nonPlatformRemoteBase();
   if (base) return `${base}/s/${encodeURIComponent(sessionId)}/${capability}`;
   if (!opts.webPort || opts.webPort <= 0) return null;
   return `http://${formatUrlHost(String(opts.host))}:${opts.webPort}/${capability}`;

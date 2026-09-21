@@ -56,6 +56,7 @@ describe('redactChildEnv()', () => {
     const out = redactChildEnv({
       LARK_APP_ID: 'cli_bot',
       LARK_APP_SECRET: 'secret',
+      ONCALL_SERVICE_SECRET: 'oncall-secret',
       CLAUDECODE: '1',
       KEEP: 'v',
       PATH: '/usr/bin',
@@ -67,6 +68,8 @@ describe('redactChildEnv()', () => {
     // just falsy value.
     expect('LARK_APP_ID' in out).toBe(false);
     expect('LARK_APP_SECRET' in out).toBe(false);
+    expect('ONCALL_SERVICE_SECRET' in out).toBe(false);
+    expect(REDACTED_CHILD_ENV_KEYS).toContain('ONCALL_SERVICE_SECRET');
     expect('CLAUDECODE' in out).toBe(false);
     // Unrelated vars pass through untouched.
     expect(out.KEEP).toBe('v');
@@ -553,6 +556,8 @@ describe('scrubSessionTurnMarkerEnv()', () => {
       'BOTMUX_LARK_APP_ID',
       'BOTMUX_SESSION_SCOPE',
       'BOTMUX_SEND_RELAY',
+      // per-session shadowed user statusLine command (worker-computed from cwd)
+      'BOTMUX_STATUSLINE_CHAIN',
     ]) {
       expect(SESSION_TURN_MARKER_ENV_KEYS, key).toContain(key);
     }
@@ -762,6 +767,10 @@ describe('BOTMUX_INJECTED_ENV_KEYS carries the read-isolation markers', () => {
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_REPLY_STYLE');
     expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES');
     expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES');
+    // `botmux statusline` runs inside the pane and needs the worker-computed chain
+    // command; without transport it would silently drop the user's own statusLine.
+    expect(BOTMUX_INJECTED_ENV_KEYS).toContain('BOTMUX_STATUSLINE_CHAIN');
+    expect(SESSION_TURN_MARKER_ENV_KEYS).toContain('BOTMUX_STATUSLINE_CHAIN');
   });
 
   it('keeps SSL_CERT_FILE OUT of the injected list and in its own CA-bundle list', () => {

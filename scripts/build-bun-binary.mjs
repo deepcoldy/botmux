@@ -215,9 +215,9 @@ async function buildOne({ target, out }) {
   const { platform, arch } = targetToPlatformArch(target);
   const { ptyNode, spawnHelper } = resolveNodePtyNative(platform, arch);
 
-  const entry = join(REPO_ROOT, 'dist', 'cli.js');
+  const entry = join(REPO_ROOT, 'dist', 'standalone-entry.js');
   if (!existsSync(entry)) {
-    throw new Error('dist/cli.js missing — run `bun run build` first (this bundles from dist/, it does not run tsc).');
+    throw new Error('dist/standalone-entry.js missing — run `bun run build` first (this bundles from dist/, it does not run tsc).');
   }
 
   const outfile = out ?? join(REPO_ROOT, 'dist-bin', target ? target.replace(/^bun-/, 'botmux-') : 'botmux');

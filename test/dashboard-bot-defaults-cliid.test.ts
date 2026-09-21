@@ -118,6 +118,8 @@ describe('Codex-compatible runtime editor', () => {
       { id: 'claude-code', label: 'Claude' },
       { id: 'codex', label: 'Codex' },
       { id: 'traex', label: 'traex' },
+      { id: 'kimi', label: 'Kimi' },
+      { id: 'forge-x-traex', label: 'Forge x TraeX', cliLaunchMode: 'forge-traex' as const },
       { id: 'ttadk-x-codex', label: 'Codex via TTADK' },
     ],
     ttadkModelDefault: 'glm-5.1',
@@ -204,6 +206,31 @@ describe('Codex-compatible runtime editor', () => {
       expect(requests).toEqual([{ cliId: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'ultra' }]);
     } finally {
       (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('shows, saves and reloads the configured Kimi effort without inventing a CLI default', async () => {
+    const previousFetch = globalThis.fetch;
+    const saved: unknown[] = [];
+    globalThis.fetch = vi.fn(async (_url, init) => {
+      if (!init?.body) return new Response(JSON.stringify({ models: [], source: 'static' }));
+      const body = JSON.parse(String(init.body));
+      saved.push(body);
+      return new Response(JSON.stringify({ ok: true, ...body, selectionKey: 'kimi' }));
+    });
+    try {
+      const { root, patchBot } = renderAgent({ cliId: 'kimi', model: 'kimi-code/k3-256k' });
+      const picker = root.findByProps({ dataInput: 'agentReasoningEffort' });
+      expect(picker.props.value).toBe('');
+      expect(picker.props.options.map((o: { value: string }) => o.value)).toEqual(['', 'low', 'high', 'max']);
+      act(() => picker.props.onChange('max'));
+      await act(async () => { await root.findByProps({ 'data-action': 'save-agent' }).props.onClick(); });
+      expect(saved).toEqual([{ cliId: 'kimi', model: 'kimi-code/k3-256k', reasoningEffort: 'max' }]);
+      expect(patchBot).toHaveBeenCalledWith('cli_runtime', expect.objectContaining({ reasoningEffort: 'max' }));
+      const reloaded = renderAgent({ cliId: 'kimi', model: 'kimi-code/k3-256k', reasoningEffort: 'max' });
+      expect(reloaded.root.findByProps({ dataInput: 'agentReasoningEffort' }).props.value).toBe('max');
+    } finally {
+      globalThis.fetch = previousFetch;
     }
   });
 
@@ -463,6 +490,60 @@ describe('Codex-compatible runtime editor', () => {
 
       const codex = renderAgent({ cliId: 'codex', model: 'gpt-5.6-sol' });
       expect(codex.root.findAllByProps({ dataInput: 'agentModelBackendVariant' })).toHaveLength(0);
+    } finally {
+      (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('treats Forge x TraeX as TraeX for backend variant and native subagent settings', async () => {
+    const previousFetch = globalThis.fetch;
+    const requests: any[] = [];
+    (globalThis as any).fetch = vi.fn(async (_url: string, init?: any) => {
+      if (String(_url).includes('/api/cli-options/models')) {
+        return { ok: true, status: 200, json: async () => ({ models: [], source: 'static' }) } as any;
+      }
+      const body = JSON.parse(init?.body ?? '{}');
+      requests.push(body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ...body,
+          ok: true,
+          cliId: 'traex',
+          cliLaunchMode: 'forge-traex',
+          selectionKey: 'forge-x-traex',
+          nativeSubagentRuntime: body.nativeSubagentRuntime ?? null,
+        }),
+      } as any;
+    });
+    try {
+      const { root } = renderAgent({
+        cliId: 'traex',
+        cliLaunchMode: 'forge-traex',
+        agentSelectionKey: 'forge-x-traex',
+        model: 'GPT-5.6-Terra',
+        reasoningEffort: 'xhigh',
+        modelBackendVariant: 'max',
+      });
+
+      const variant = root.findByProps({ dataInput: 'agentModelBackendVariant' });
+      expect(variant.props.value).toBe('max');
+      expect(root.findAllByProps({ 'data-native-subagent-runtime': '' })).toHaveLength(1);
+
+      act(() => variant.props.onChange('standard'));
+      act(() => root.findByProps({ dataInput: 'nativeSubagentModelMode' }).props.onChange('custom'));
+      act(() => root.findByProps({ 'data-input': 'nativeSubagentModel' }).props.onChange({ currentTarget: { value: 'GPT-5.6-Sol' } }));
+      await act(async () => {
+        root.findByProps({ 'data-action': 'save-agent' }).props.onClick();
+        await Promise.resolve();
+      });
+
+      expect(requests[0]).toMatchObject({
+        cliId: 'forge-x-traex',
+        modelBackendVariant: 'standard',
+        nativeSubagentRuntime: { model: { mode: 'custom', value: 'GPT-5.6-Sol' } },
+      });
     } finally {
       (globalThis as any).fetch = previousFetch;
     }
@@ -1950,6 +2031,32 @@ describe('card behavior defaults', () => {
     expect(renderer.root.findByProps({ 'data-streaming-card-pin-toggle': 'bot-defaults' })).toBeTruthy();
   });
 
+  it('uses one CoT switch for thinking, tool calls, and tool results', async () => {
+    const putCardPref = vi.fn(async (patch: Record<string, boolean>) => ({
+      ok: true,
+      status: 200,
+      body: { ok: true, ...patch },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_cot' }, putCardPref,
+      }));
+    });
+
+    expect(renderer.root.findAllByProps({ 'data-action': 'toggle-cot' })).toHaveLength(1);
+    expect(renderer.root.findAllByProps({ 'data-action': 'toggle-thinking-card-tool-result' })).toHaveLength(0);
+
+    const toggle = renderer.root.findByProps({ 'data-action': 'toggle-cot' });
+    await act(async () => {
+      toggle.props.onChange({ currentTarget: { checked: false } });
+      await Promise.resolve();
+    });
+
+    expect(putCardPref).toHaveBeenCalledWith({ cotEnabled: false });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-cot' }).props.checked).toBe(false);
+  });
+
   it('persists live-card button visibility as a canonical hidden list', async () => {
     const putCardPref = vi.fn(async (patch: Record<string, unknown>) => ({
       ok: true,
@@ -2087,6 +2194,7 @@ describe('card behavior defaults', () => {
       'toggle-pin-streaming-card',
       'toggle-writable-link',
       'toggle-private-card',
+      'toggle-cot',
       'toggle-streaming-button-output',
       'toggle-streaming-button-terminal',
       'toggle-streaming-button-writeLink',
@@ -2120,7 +2228,7 @@ describe('card behavior defaults', () => {
       renderer.root.findByProps({ 'data-action': 'toggle-disable-streaming' }).props.onChange({ currentTarget: { checked: true } });
     });
 
-    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-pin-streaming-card', 'toggle-writable-link', 'toggle-private-card']) {
+    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-pin-streaming-card', 'toggle-writable-link', 'toggle-private-card', 'toggle-cot']) {
       expect(renderer.root.findByProps({ 'data-action': action }).props.disabled).toBe(true);
     }
     expect(renderer.root.findByProps({ id: 'bd-menu-usageDisplay' }).props.disabled).toBe(true);

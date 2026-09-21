@@ -14,6 +14,7 @@ export interface GroupMemberBot extends GroupBot {
   agentCliId?: string;
   agentModel?: string;
   agentReasoningEffort?: string;
+  serialInput?: boolean;
   defaultModels?: import('../../core/group-default-models.js').GroupDefaultModels;
   oncallChat?: { workingDir?: string } | null;
 }

@@ -101,6 +101,7 @@ vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
     config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
     resolvedAllowedUsers: [],
+    resolvedBlockedUsers: [],
     botOpenId: 'ou_bot',
   })),
   getAllBots: vi.fn(() => []),
@@ -347,7 +348,7 @@ describe('Card integration: full event flow', () => {
       expect(ds.cardPatchInFlight).toBe(true);
 
       // Step 2: while PATCH is in-flight, user clicks toggle
-      await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT), deps, APP_ID);
+      const callbackResult = await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT), deps, APP_ID);
       await flush();
 
       // Toggle should NOT have sent another PATCH — it should be queued
@@ -355,6 +356,12 @@ describe('Card integration: full event flow', () => {
       expect(ds.displayMode).toBe('screenshot');
       expect(ds.pendingCardJson).toBeTruthy();
       expect(parseCard(ds.pendingCardJson!).expanded).toBe(true);
+      // The callback only acknowledges the click. Returning a raw card here
+      // would let Lark update it synchronously outside scheduleCardPatch and
+      // allow the older in-flight PATCH to overwrite the expanded state.
+      expect(callbackResult).toEqual({
+        toast: { type: 'info', content: '操作已收到，后台处理中' },
+      });
 
       // Step 3: in-flight PATCH completes → queued toggle PATCH flushes
       fakeLark.resolveCall('updateMessage', 0);
@@ -711,6 +718,7 @@ describe('Card integration: full event flow', () => {
       vi.mocked(botRegMod.getBot).mockReturnValue({
         config: { larkAppId: APP_ID, cliId: 'claude-code', privateCard: true, allowedUsers: ['ou_owner'] },
         resolvedAllowedUsers: ['ou_owner'],
+        resolvedBlockedUsers: [],
         botOpenId: 'ou_bot',
       } as any);
       try {
@@ -745,6 +753,7 @@ describe('Card integration: full event flow', () => {
         vi.mocked(botRegMod.getBot).mockReturnValue({
           config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
           resolvedAllowedUsers: [],
+          resolvedBlockedUsers: [],
           botOpenId: 'ou_bot',
         } as any);
       }
@@ -760,6 +769,7 @@ describe('Card integration: full event flow', () => {
       vi.mocked(botRegMod.getBot).mockReturnValue({
         config: { larkAppId: APP_ID, cliId: 'claude-code', privateCard: false, allowedUsers: ['ou_owner'] },
         resolvedAllowedUsers: ['ou_owner'],
+        resolvedBlockedUsers: [],
         botOpenId: 'ou_bot',
       } as any);
       try {
@@ -793,6 +803,7 @@ describe('Card integration: full event flow', () => {
         vi.mocked(botRegMod.getBot).mockReturnValue({
           config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
           resolvedAllowedUsers: [],
+          resolvedBlockedUsers: [],
           botOpenId: 'ou_bot',
         } as any);
       }
@@ -865,6 +876,7 @@ describe('Card integration: full event flow', () => {
       vi.mocked(botRegMod.getAllBots).mockReturnValueOnce([{
         config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedChatGroups: ['oc_team'] } as any,
         resolvedAllowedUsers: [],
+        resolvedBlockedUsers: [],
         botOpenId: 'ou_bot',
       } as any]);
 
@@ -893,6 +905,7 @@ describe('Card integration: full event flow', () => {
       vi.mocked(botRegMod.getAllBots).mockReturnValueOnce([{
         config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', globalGrants: ['ou_peer'] } as any,
         resolvedAllowedUsers: [],
+        resolvedBlockedUsers: [],
         botOpenId: 'ou_bot',
       } as any]);
 
@@ -921,6 +934,7 @@ describe('Card integration: full event flow', () => {
       vi.mocked(botRegMod.getAllBots).mockReturnValueOnce([{
         config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', p2pOpen: true } as any,
         resolvedAllowedUsers: [],
+        resolvedBlockedUsers: [],
         botOpenId: 'ou_bot',
       } as any]);
 
@@ -950,6 +964,7 @@ describe('Card integration: full event flow', () => {
         // config.allowedUsers 是原始配置（hasAllowlist 据此判定）；resolvedAllowedUsers 是解析结果。
         config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', allowedUsers: ['ou_other_user'] } as any,
         resolvedAllowedUsers: ['ou_other_user'],
+        resolvedBlockedUsers: [],
         botOpenId: 'ou_bot',
       } as any);
 
@@ -1255,6 +1270,35 @@ describe('Card integration: full event flow', () => {
       expect(fakeLark.patches).toHaveLength(0);
     });
 
+    it('returns the rebuilt card when a substitute turn declines the PATCH queue', async () => {
+      const cardId = 'om_substitute_card';
+      const ds = makeDaemonSession({
+        streamCardId: cardId,
+        displayMode: 'hidden',
+        currentReplyTarget: {
+          rootMessageId: 'om_substitute_trigger',
+          turnId: 'om_substitute_turn',
+          updatedAt: new Date().toISOString(),
+          substitute: true,
+        },
+      });
+      const sessions = new Map<string, DaemonSession>();
+      sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
+      const deps = makeDeps(sessions);
+
+      const result = await handleCardAction(
+        makeToggleEvent(ROOT_ID, NONCE_CURRENT, 'ou_user', cardId),
+        deps,
+        APP_ID,
+      );
+      await flush();
+
+      expect(ds.displayMode).toBe('screenshot');
+      expect(fakeLark.patches).toHaveLength(0);
+      expect(ds.pendingCardJson).toBeUndefined();
+      expect(result).toMatchObject({ type: 'streaming', expanded: true });
+    });
+
     it('close / toggle on a non-existent session return a failure toast; restart stays a silent no-op', async () => {
       const sessions = new Map<string, DaemonSession>();
       const deps = makeDeps(sessions);
@@ -1352,14 +1396,14 @@ describe('Card integration: full event flow', () => {
       sessions.set(sessionKey(ROOT_ID, APP_ID), ds);
       const deps = makeDeps(sessions);
 
-      // Toggle returns the rebuilt card body (see card-handler.ts:337).
       const result = await handleCardAction(makeToggleEvent(ROOT_ID, NONCE_CURRENT), deps, APP_ID);
       await flush();
 
       // The handler must propagate adoptMode so the rebuilt card keeps
       // the `⏏ 断开` button — `❌ 关闭会话` would tear down the user's CLI.
-      expect(result).toBeDefined();
-      expect((result as any).adoptMode).toBe(true);
+      expect(result).toMatchObject({ toast: { type: 'info' } });
+      expect(fakeLark.patches).toHaveLength(1);
+      expect(parseCard(fakeLark.patches[0].args[2]).adoptMode).toBe(true);
     });
 
     it('term_action on adopt session returns a card with adoptMode=true', async () => {

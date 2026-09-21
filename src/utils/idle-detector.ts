@@ -47,6 +47,11 @@ export class IdleDetector {
   private lastSpinnerAt = 0;
   private quiescenceTimer: ReturnType<typeof setTimeout> | null = null;
   private isIdle = false;
+  /** One-shot latch: true forever after this IdleDetector instance publishes
+   *  its first idle (screen or external). Gates the opt-in extended
+   *  first-prompt quiescence and intentionally survives reset() — one
+   *  IdleDetector exists per spawn, so "first" happens only once. */
+  private firstIdlePublished = false;
   private idleCallback: ((source: IdleEvidenceSource) => void) | null = null;
   private busyCallback: (() => void) | null = null;
   private completionPattern: RegExp | undefined;
@@ -58,9 +63,13 @@ export class IdleDetector {
   private readySeen = false;
   private startupPendingPattern: RegExp | undefined;
   private startupReadyPattern: RegExp | undefined;
+  private firstPromptQuiescenceMs: number | undefined;
+  private startupReadyFromHistory: CliAdapter['startupReadyFromHistory'];
   private startupTail = '';
   private startupPending = false;
   private startupComplete = false;
+  private startupResume: CliAdapter['startupResume'];
+  private startupHistorySeen = false;
   /** Pre-idle latch for static busy screens (capacity queue). Set from PTY
    *  chunks carrying explicit static-busy evidence (scanned across chunks
    *  via the rolling tail); suppresses screen-derived idle until a chunk
@@ -72,7 +81,7 @@ export class IdleDetector {
    *  and must not re-set the latch. -1 = no clear recorded. */
   private staticBusyClearTailPos = -1;
 
-  constructor(cli: CliAdapter) {
+  constructor(cli: CliAdapter, private readonly captureStartupScreen?: () => string) {
     this.completionPattern = cli.completionPattern;
     this.idleToBusyPattern = cli.idleToBusyPattern;
     this.staticBusyPattern = cli.staticBusyPattern;
@@ -80,6 +89,9 @@ export class IdleDetector {
     this.readyPattern = cli.readyPattern;
     this.startupPendingPattern = cli.startupPendingPattern;
     this.startupReadyPattern = cli.startupReadyPattern;
+    this.startupResume = cli.startupResume;
+    this.firstPromptQuiescenceMs = cli.firstPromptQuiescenceMs;
+    this.startupReadyFromHistory = cli.startupReadyFromHistory;
   }
 
   onIdle(cb: (source: IdleEvidenceSource) => void): void {
@@ -129,6 +141,7 @@ export class IdleDetector {
       // leave escape fragments inside the word and miss the startup hold.
       const rawStartup = this.startupTail + data;
       const startup = this.stripAnsi(rawStartup);
+      if (this.startupResume?.historyPattern.test(startup)) this.startupHistorySeen = true;
       const pendingAt = lastMatchIndex(this.startupPendingPattern, startup);
       const readyAt = this.startupReadyPattern
         ? lastMatchIndex(this.startupReadyPattern, startup)
@@ -138,9 +151,7 @@ export class IdleDetector {
       // banner after the actual loaded banner. Treat that exactly like two
       // feeds: once fully initialized, later text cannot re-arm startup.
       if (readyAt >= 0) {
-        this.startupComplete = true;
-        this.startupPending = false;
-        this.startupTail = '';
+        this.markStartupComplete();
       } else {
         if (pendingAt >= 0) this.startupPending = true;
         // Keep split banner evidence without retaining startup output
@@ -247,7 +258,19 @@ export class IdleDetector {
     if (this.readyPattern && !this.readySeen) return;
 
     this.clearTimer();
-    this.quiescenceTimer = setTimeout(() => this.quiescenceCheck(), QUIESCENCE_MS);
+    // Adapters without a prompt anchor (Bubble Tea TUIs such as OpenCode) can
+    // still be booting when the default 2s quiet window expires; an opt-in
+    // longer window applies only before THIS process's first idle. It buys a
+    // couple more cold-start cycles but changes no readiness criterion: the
+    // startup hold, spinner guard and static-busy latch all still apply, and
+    // the completion branch above keeps its fixed 500ms.
+    const quiescenceMs = !this.firstIdlePublished
+      && !this.readyPattern
+      && typeof this.firstPromptQuiescenceMs === 'number'
+      && this.firstPromptQuiescenceMs > QUIESCENCE_MS
+      ? this.firstPromptQuiescenceMs
+      : QUIESCENCE_MS;
+    this.quiescenceTimer = setTimeout(() => this.quiescenceCheck(), quiescenceMs);
   }
 
   reset(): void {
@@ -287,15 +310,82 @@ export class IdleDetector {
     if (this.isIdle) return;
     // Actual transcript completion proves the session initialized, even if
     // its loaded banner was omitted or the operator customized the footer.
-    this.startupComplete = true;
-    this.startupPending = false;
-    this.startupTail = '';
+    this.markStartupComplete();
     this.markIdle('external');
   }
 
   /** Shared by the worker's screen-ready and hard-timeout write paths. */
   isStartupPending(): boolean {
     return this.startupPending && !this.startupComplete;
+  }
+
+  /** Initialization is not a synthetic turn completion. */
+  private markStartupComplete(): void {
+    this.startupComplete = true;
+    this.startupPending = false;
+    this.startupTail = '';
+    this.startupHistorySeen = false;
+  }
+
+  /** Positive initialization evidence, retained across resync/turn resets. */
+  isStartupComplete(): boolean {
+    return this.startupComplete;
+  }
+
+  /**
+   * Startup-banner evidence read from an authoritative screen snapshot.
+   *
+   * feed() is the only other source of that evidence, and on a snapshot-based
+   * backend it cannot carry it: ZMX's screen source is `zmx history`, which
+   * returns the current screen instead of an append-only byte stream. Only a
+   * snapshot that extends the previous one is published as PTY data; an
+   * in-place repaint — exactly what `model: loading` → `model: <real>` is — is
+   * published as a screen resync, which deliberately never reaches feed(). The
+   * startup hold could therefore never be released on that backend and queued
+   * input was held for the lifetime of the session.
+   *
+   * Deliberately narrower than feed(): it touches ONLY the startup latch, never
+   * outputTail / readySeen / spinner / quiescence state, and it neither arms
+   * nor fires a timer. Initialization allows the worker's existing type-ahead
+   * path, but does not prove idle: readyPattern plus quiescence still gate that
+   * independently. It does lift a veto: a quiescence check that
+   * fed data had already armed, and that isStartupPending() was rejecting, can
+   * complete afterwards. That is the point of the hold, not a bypass of it —
+   * the evidence behind that check still came from feed().
+   *
+   * Unlike feed(), ready does NOT win unconditionally here. A snapshot carries
+   * spatial order, and history includes scrollback: an initialized banner left
+   * above the viewport by an earlier CLI generation must not release a hold
+   * that the live banner still reports as loading. The lower banner wins.
+   *
+   * Returns true only on the transition that completes startup (for logging).
+   */
+  observeStartupScreen(screen: string): boolean {
+    if (this.startupComplete || !this.startupPendingPattern) return false;
+    const text = this.stripAnsi(screen);
+    const pendingAt = lastMatchIndex(this.startupPendingPattern, text);
+    const readyAt = this.startupReadyPattern
+      ? lastMatchIndex(this.startupReadyPattern, text)
+      : -1;
+    if (readyAt >= 0 && readyAt > pendingAt) {
+      this.startupComplete = true;
+      this.startupPending = false;
+      this.startupTail = '';
+      return true;
+    }
+    if (pendingAt >= 0) this.startupPending = true;
+    return false;
+  }
+
+  /** Full snapshot evidence, separate from feed(): history must never seed
+   * readySeen, quiescence, or a synthetic turn completion. Also handles warm
+   * reattach, where this detector has never observed the loading banner. */
+  observeStartupHistory(history: string): boolean {
+    if (this.startupComplete || !this.startupReadyFromHistory?.(this.stripAnsi(history))) return false;
+    this.startupComplete = true;
+    this.startupPending = false;
+    this.startupTail = '';
+    return true;
   }
 
   dispose(): void {
@@ -310,7 +400,13 @@ export class IdleDetector {
   private quiescenceCheck(): void {
     this.quiescenceTimer = null;
     if (this.isIdle) return;
-    if (this.isStartupPending()) return;
+    if (this.isStartupPending()) {
+      if (!this.startupHistorySeen || !this.startupResume || !this.captureStartupScreen) return;
+      let screen: string;
+      try { screen = this.captureStartupScreen(); } catch { return; }
+      if (!this.startupResume.isReady(screen)) return;
+      this.markStartupComplete();
+    }
     // Explicit static-busy evidence (capacity queue): the screen is not
     // quiescing into a prompt — it is parked on a queue notice. Do not mark
     // idle and do not re-arm: the latch clears on the composer redraw, whose
@@ -329,6 +425,9 @@ export class IdleDetector {
 
   private markIdle(source: IdleEvidenceSource): void {
     this.isIdle = true;
+    // One-shot, permanent for this spawn: reset()/resetReadyEvidence() do not
+    // clear it, so the extended first-prompt window never applies twice.
+    this.firstIdlePublished = true;
     // Arm before the callback: markPromptReady may synchronously flush queued
     // botmux input and call reset(), which must win and disarm this edge.
     this.busyTransitionArmed = true;

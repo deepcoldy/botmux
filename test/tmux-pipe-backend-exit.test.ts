@@ -47,7 +47,7 @@ let wrapperDir: string;
 const announcedFifoPaths = new Set<string>();
 
 /** Run the fixture; resolve with how it ended. `timedOut` means it wedged. */
-type FixtureMode = 'real' | 'nowake' | 'paneexit' | 'full' | 'spawnfail' | 'unlinked' | 'emfile' | 'directexit' | 'wakefail' | 'drain';
+type FixtureMode = 'real' | 'nowake' | 'paneexit' | 'full' | 'spawnfail' | 'unlinked' | 'emfile' | 'directexit' | 'wakefail' | 'drain' | 'reuse';
 
 async function runFixture(mode: FixtureMode): Promise<{
   timedOut: boolean;
@@ -147,6 +147,16 @@ afterAll(() => {
 });
 
 describe('TmuxPipeBackend fifo teardown', () => {
+  it('does not close a new fd after an in-flight reader is torn down', async () => {
+    const r = await runFixture('reuse');
+
+    expect(r.stdout).toContain('TEARDOWN');
+    expect(r.stdout).toContain('REPLACEMENT_FDS_INTACT');
+    expect(r.stdout).toContain('LEAKED_READERS=0 FIFO_LEFT=false');
+    expect(r.timedOut).toBe(false);
+    expect(r.code).toBe(0);
+  }, EXIT_TIMEOUT_MS + 15_000);
+
   it('lets the event loop drain after kill() without process.exit()', async () => {
     const r = await runFixture('drain');
 

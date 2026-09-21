@@ -15,6 +15,7 @@ const getBotMock = vi.fn();
 // A fake Lark client whose calls would resolve — so if the gate DIDN'T fire, the
 // primitive would "succeed" and the test's rejects.toThrow would fail.
 const fakeClient = {
+  request: vi.fn(async () => ({ code: 0 })),
   im: {
     v1: {
       message: { create: vi.fn(async () => ({ code: 0, data: { message_id: 'om_x' } })), patch: vi.fn(async () => ({ code: 0 })) },
@@ -57,6 +58,7 @@ import {
   sendMessage, replyMessage, updateMessage, deleteMessage,
   pinMessage, unpinMessage,
   resolveCardKitId, updateCardStreamingSettings, updateCardStreamElementContent, patchCardStreamElement,
+  urgentMessage,
   addReaction, removeReaction, sendUserMessage, sendEphemeralCard,
   deleteEphemeralCard, uploadImage, uploadFile,
   LarkTransportDisabledError,
@@ -76,6 +78,7 @@ describe('assertLarkTransport — bot-level outbound gate', () => {
     getBotMock.mockReturnValue(bot(true));
     await expect(sendMessage(APIONLY, 'oc', 'hi')).rejects.toBeInstanceOf(LarkTransportDisabledError);
     await expect(replyMessage(APIONLY, 'om', 'hi')).rejects.toBeInstanceOf(LarkTransportDisabledError);
+    await expect(urgentMessage(APIONLY, 'om', ['ou_x'])).rejects.toBeInstanceOf(LarkTransportDisabledError);
     await expect(updateMessage(APIONLY, 'om', '{}')).rejects.toBeInstanceOf(LarkTransportDisabledError);
     await expect(resolveCardKitId(APIONLY, 'om')).rejects.toBeInstanceOf(LarkTransportDisabledError);
     await expect(updateCardStreamingSettings(APIONLY, 'card', {

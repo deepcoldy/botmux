@@ -94,6 +94,7 @@ const MANAGE_ROUTES = [
   'bot-defaults',
   'skills',
   'customization',
+  'message-listeners',
   'plugins',
   'team',
   'connectors',
@@ -138,6 +139,7 @@ const NAV_ITEMS: NavItem[] = [
     ),
   },
   { id: 'roles', href: '#/roles', labelKey: 'nav.roles', manage: true, icon: <><path d="M8 1.8l5.2 2v3.4c0 3.4-2.2 5.9-5.2 7-3-1.1-5.2-3.6-5.2-7V3.8z" /><path d="M5.8 8l1.6 1.6 2.8-3" /></> },
+  { id: 'message-listeners', href: '#/message-listeners', labelKey: 'nav.messageListeners', manage: true, icon: <><circle cx="8" cy="8" r="5.5" /><path d="M8 4.7v3.7l2.4 1.5" /></> },
   {
     id: 'monitoring',
     href: '#/monitoring',
@@ -185,7 +187,7 @@ const NAV_ITEMS: NavItem[] = [
 const NAV_GROUPS: Array<{ id: string; labelKey: string; items: string[] }> = [
   { id: 'overview', labelKey: 'nav.group.overview', items: ['overview'] },
   { id: 'collab', labelKey: 'nav.group.collab', items: ['sessions', 'agent-workbench', 'groups', 'schedules', 'workflows', 'office'] },
-  { id: 'workforce', labelKey: 'nav.group.workforce', items: ['roles', 'skills', 'customization', 'bot-defaults'] },
+  { id: 'workforce', labelKey: 'nav.group.workforce', items: ['roles', 'skills', 'customization', 'message-listeners', 'bot-defaults'] },
   { id: 'analytics', labelKey: 'nav.group.analytics', items: ['monitoring', 'insights', 'feedback'] },
   { id: 'manage', labelKey: 'nav.group.manage', items: ['connectors', 'team', 'plugins', 'whiteboards', 'settings'] },
 ];

@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   buildBotFromAddFlags,
@@ -224,8 +225,24 @@ describe('buildBotFromAddFlags', () => {
     expect(editInputFromFlags({ cli: 'traecli' })).toEqual({
       cliChoice: 'traex',
       wrapperCli: null,
+      cliLaunchMode: null,
       cliRuntime: null,
     });
+  });
+
+  it('builds Forge x TraeX as TraeX plus a first-class launch mode', () => {
+    const bot = buildBotFromAddFlags({ ...REQUIRED, cli: 'forge-x-traex' });
+    expect(bot.cliId).toBe('traex');
+    expect(bot.cliLaunchMode).toBe('forge-traex');
+    expect(bot.wrapperCli).toBeUndefined();
+  });
+
+  it('rejects combining Forge x TraeX with an explicit wrapper in add', () => {
+    expect(() => buildBotFromAddFlags({
+      ...REQUIRED,
+      cli: 'forge-x-traex',
+      wrapperCli: 'aiden x traex',
+    })).toThrow(/不能与 --wrapper-cli 同时使用/);
   });
 
   it('builds a Codex-compatible runtime from --cli-runtime JSON', () => {
@@ -317,10 +334,22 @@ describe('editInputFromFlags', () => {
   });
 
   it('clears wrapperCli when switching to a plain cli, keeps it for gateway keys', () => {
-    expect(editInputFromFlags({ cli: 'codex' })).toEqual({ cliChoice: 'codex', wrapperCli: null, cliRuntime: null });
+    expect(editInputFromFlags({ cli: 'codex' })).toEqual({
+      cliChoice: 'codex',
+      wrapperCli: null,
+      cliLaunchMode: null,
+      cliRuntime: null,
+    });
     expect(editInputFromFlags({ cli: 'ttadk-x-codex' })).toEqual({
       cliChoice: 'codex',
       wrapperCli: 'ttadk codex',
+      cliLaunchMode: null,
+      cliRuntime: null,
+    });
+    expect(editInputFromFlags({ cli: 'forge-x-traex' })).toEqual({
+      cliChoice: 'traex',
+      wrapperCli: null,
+      cliLaunchMode: 'forge-traex',
       cliRuntime: null,
     });
   });
@@ -329,8 +358,16 @@ describe('editInputFromFlags', () => {
     expect(editInputFromFlags({ cli: 'codex', wrapperCli: 'cjadk codex' })).toEqual({
       cliChoice: 'codex',
       wrapperCli: 'cjadk codex',
+      cliLaunchMode: null,
       cliRuntime: null,
     });
+  });
+
+  it('rejects combining Forge x TraeX with an explicit wrapper in edit', () => {
+    expect(() => editInputFromFlags({
+      cli: 'forge-x-traex',
+      wrapperCli: 'aiden x traex',
+    })).toThrow(/不能与 --wrapper-cli 同时使用/);
   });
 
   it('passes tri-state clears through and rejects brand on edit', () => {
@@ -369,6 +406,55 @@ describe('editInputFromFlags', () => {
     expect(updated.cliId).toBe('claude-code');
     expect(updated.cliRuntime).toBeUndefined();
     expect(updated.cliPathOverride).toBeUndefined();
+  });
+
+  it('clears a stored Forge launch mode when an edit switches back to plain TraeX', () => {
+    const base = {
+      larkAppId: 'cli_x',
+      larkAppSecret: 's',
+      cliId: 'traex',
+      cliLaunchMode: 'forge-traex' as const,
+    };
+    const updated = applyBotConfigEdits(base, editInputFromFlags({ cli: 'traex' }));
+    expect(updated.cliId).toBe('traex');
+    expect(updated.cliLaunchMode).toBeUndefined();
+  });
+
+  it('clears a stale legacy cliPathOverride when switching to Forge x TraeX', () => {
+    const base = {
+      larkAppId: 'cli_x',
+      larkAppSecret: 's',
+      cliId: 'traex',
+      cliPathOverride: '/opt/legacy/traex',
+    };
+    const updated = applyBotConfigEdits(base, editInputFromFlags({ cli: 'forge-x-traex' }));
+    expect(updated.cliId).toBe('traex');
+    expect(updated.cliLaunchMode).toBe('forge-traex');
+    expect(updated.cliPathOverride).toBeUndefined();
+  });
+});
+
+describe('interactive setup edit launch mode wiring', () => {
+  it('preserves and writes cliLaunchMode through the CLI picker path', () => {
+    const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
+    const start = source.indexOf('const currentKey = selectionKeyForBot');
+    const end = source.indexOf('// selKey 为 null', start);
+    const pickerBlock = source.slice(start, end);
+
+    expect(pickerBlock).toContain("selectionKeyForBot(bot.cliId ?? 'claude-code', bot.wrapperCli, bot.cliLaunchMode)");
+    expect(pickerBlock).toContain('input.cliLaunchMode = sel.cliLaunchMode ?? null;');
+    expect(pickerBlock).toContain('input.cliRuntime = null;');
+  });
+
+  it('treats cliLaunchMode as a scripted setup edit launch change', () => {
+    const source = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
+    const start = source.indexOf('const agentLaunchChanged = hasAgentLaunchConfigChanged');
+    const end = source.indexOf('// Missing Agent dependencies', start);
+    const changeBlock = source.slice(start, end);
+
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(changeBlock).toContain('cliLaunchMode: original.cliLaunchMode');
+    expect(changeBlock).toContain('cliLaunchMode: edited.cliLaunchMode');
   });
 });
 

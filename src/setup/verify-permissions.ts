@@ -92,6 +92,13 @@ export const BOTMUX_REQUIRED_SCOPES: RequiredScope[] = [
   { name: 'im:feed_group_v1:write', desc: '创建飞书会话标签并将新群加入标签', critical: false },
   { name: 'im:chat.tabs:read', desc: '读取飞书群标签页（/tabs、botmux tabs）', critical: false },
   { name: 'im:chat.tabs:write_only', desc: '管理飞书群标签页（/tabs、botmux tabs）', critical: false },
+  // `botmux send --urgent[=app|sms|phone]`. Keep these non-critical: ordinary
+  // messaging must continue when a tenant declines disruptive/quota-bearing
+  // Buzz channels. New apps import them from the default manifest; existing
+  // apps are silently topped up from the cached Open Platform session.
+  { name: 'im:message.urgent', desc: '应用内加急消息', critical: false },
+  { name: 'im:message.urgent:sms', desc: '短信加急消息（消耗租户额度）', critical: false },
+  { name: 'im:message.urgent:phone', desc: '电话加急消息（消耗租户额度）', critical: false },
   { name: 'application:application:self_manage', desc: '应用自查 (免审批)', critical: false },
 ];
 

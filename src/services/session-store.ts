@@ -9,6 +9,7 @@ import { cleanupMaterializedDashboardImages } from '../core/dashboard-images.js'
 import { getSessionTokenUsage } from '../core/cost-calculator.js';
 import { deleteFrozenCards } from './frozen-card-store.js';
 import { removePromptContextDir } from './prompt-context-store.js';
+import { removeStatuslineDir } from './statusline-snapshot.js';
 import {
   applySessionRowCommand,
   type HostSessionCommand,
@@ -1746,7 +1747,7 @@ function persistRow(session: Session): void {
       // complete routing identity rather than letting them erase one field.
       session = { ...session, cliInstanceBinding: durable.cliInstanceBinding, creationSource: durable.creationSource,
         cliId: durable.cliId, cliRuntime: durable.cliRuntime, cliPathOverride: durable.cliPathOverride,
-        wrapperCli: durable.wrapperCli, agentFrozen: durable.agentFrozen };
+        wrapperCli: durable.wrapperCli, cliLaunchMode: durable.cliLaunchMode, agentFrozen: durable.agentFrozen };
     }
   }
   const json = JSON.stringify(session);
@@ -1772,7 +1773,7 @@ function buildNewSession(
   const initial = intent.inherit ? {
     cliInstanceBinding: intent.inherit.cliInstanceBinding,
     cliId: intent.inherit.cliId, cliRuntime: intent.inherit.cliRuntime, cliPathOverride: intent.inherit.cliPathOverride,
-    wrapperCli: intent.inherit.wrapperCli, agentFrozen: intent.inherit.agentFrozen, creationSource: 'fork' as const,
+    wrapperCli: intent.inherit.wrapperCli, cliLaunchMode: intent.inherit.cliLaunchMode, agentFrozen: intent.inherit.agentFrozen, creationSource: 'fork' as const,
   } : bot ? newSessionCodexInstanceState(bot, source) : {};
   const session: Session = {
     sessionId: randomUUID(),
@@ -2347,6 +2348,8 @@ export function closeSession(
     // #794: per-turn hook sidecar 与 turn-sends 同生命周期，关会话一并清掉，
     // 否则 prompt-ctx/<sid>/ 成为孤儿目录（24h TTL 兜底但 daemon 长命会累积）。
     removePromptContextDir(sessionId);
+    // Claude statusline 快照目录同生命周期（best-effort，内部吞错）。
+    removeStatuslineDir(config.session.dataDir, sessionId);
     deleteFrozenCards(sessionId);
     logger.info(`Closed session ${sessionId}`);
   }

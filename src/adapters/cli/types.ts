@@ -174,6 +174,16 @@ export interface CliAdapter {
      *  has such a knob declare these keys; the rest ignore the field, since for
      *  them a plain child inherits the environment anyway. */
     shellSubprocessEnv?: Record<string, string>;
+    /** Per-bot `replyDelivery` frozen for this session (core/reply-delivery.ts).
+     *  'transcript' → injectsSessionContext adapters reword the routing block:
+     *  the final assistant message is auto-forwarded by the daemon, so `botmux
+     *  send` is only for mid-turn pushes / attachments / cross-bot @. Omitted or
+     *  'send' → today's text byte-for-byte. `noTransport` takes precedence. */
+    replyDelivery?: 'send' | 'transcript';
+    /** transcript-only: this session is a solo chat (owner + this bot). Drops
+     *  the identity routing_rules (no other bot to route to). Ignored for
+     *  'send'. */
+    solo?: boolean;
     /** UI / response language for prompts injected into the CLI (e.g. zh / en). */
     locale?: import('../../i18n/index.js').Locale;
     /** Optional model name from BotConfig.model. Adapters whose CLI accepts a
@@ -493,6 +503,28 @@ export interface CliAdapter {
    * It survives per-turn resets and is retired once per IdleDetector/spawn. */
   readonly startupPendingPattern?: RegExp;
   readonly startupReadyPattern?: RegExp;
+  /** Resume can replace the loading banner with restored history. After this
+   * marker, a quiet authoritative viewport may prove initialization instead. */
+  readonly startupResume?: {
+    historyPattern: RegExp;
+    isReady: (screen: string) => boolean;
+  };
+  /** Optional positive initialization evidence from a complete backend history
+   * snapshot. Must reject stale prompts, loading, dialogs, and unsent drafts.
+   * This only releases startup type-ahead; it never proves an idle/turn boundary. */
+  readonly startupReadyFromHistory?: (history: string) => boolean;
+
+  /**
+   * Longer PTY-silence window used ONLY before this CLI process's FIRST idle
+   * (per IdleDetector instance; per-turn reset() does not restore it). Intended
+   * for adapters with readyPattern===undefined whose Bubble Tea style TUI can
+   * still be booting after the default 2s quiet window (OpenCode): the first
+   * queued message then waits this long before being pasted; every later cycle
+   * uses the normal quiescence. Ignored for adapters that define readyPattern
+   * (their prompt anchor gates quiescence already). The worker's first-prompt
+   * soft/hard timeouts remain the outer bound.
+   */
+  readonly firstPromptQuiescenceMs?: number;
 
   /** When true, the adapter injects a `SessionStart` hook that calls
    *  `botmux session-ready` once the CLI's input box is genuinely rendered —

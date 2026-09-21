@@ -22,6 +22,7 @@ import {
 } from '../../services/grant-policy.js';
 import { STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
 import type { StreamingCardButtonId } from './streaming-card-buttons.js';
+import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -602,15 +603,7 @@ export function buildForkPanelCard(
       elements: [{
         tag: 'table',
         page_size: 10,
-        row_height: 'low',
-        header_style: {
-          text_align: 'left',
-          text_size: 'normal',
-          background_style: 'grey',
-          text_color: 'default',
-          bold: true,
-          lines: 1,
-        },
+        ...TABLE_AUTO_ROW_STYLE,
         columns: [
           { name: 'instruction', display_name: t('card.fork_panel.col_instruction', undefined, locale), data_type: 'text', width: 'auto' },
           { name: 'status', display_name: t('card.fork_panel.col_status', undefined, locale), data_type: 'text', width: '90px' },
@@ -696,15 +689,7 @@ export function buildSlashListCard(
     elements.push({
       tag: 'table',
       page_size: 10,
-      row_height: 'low',
-      header_style: {
-        text_align: 'left',
-        text_size: 'normal',
-        background_style: 'grey',
-        text_color: 'default',
-        bold: true,
-        lines: 1,
-      },
+      ...TABLE_AUTO_ROW_STYLE,
       columns: [
         { name: 'cmd', display_name: t('slashlist.col_cmd', undefined, locale), data_type: 'lark_md', width: '200px' },
         { name: 'desc', display_name: t('slashlist.col_desc', undefined, locale), data_type: 'text', width: 'auto' },
@@ -851,16 +836,45 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
  *  card limit, leaving room for JSON escaping + the card's structural overhead. */
 const PRIVATE_SNAPSHOT_TEXT_MAX = 50_000;
 
+/** idle 状态下卡头的替代标签：
+ *  - 'silent'：本轮判定无需回复（worker terminal outputDisposition 'nothing_to_send'）；
+ *  - 'completed'：transcript 模式下最终回复卡已投递成功。
+ *  只对 idle 生效，其它状态一律忽略。 */
+export type IdleCardLabel = 'silent' | 'completed';
+
+/** 兼容旧调用：布尔 `true` 等价于 'silent'。 */
+function normalizeIdleLabel(v: boolean | IdleCardLabel | undefined): IdleCardLabel | undefined {
+  if (v === true) return 'silent';
+  if (v === 'silent' || v === 'completed') return v;
+  return undefined;
+}
+
+/** 冻结卡（FrozenCard）回读 idle 标签：新字段 `idleLabel` 优先；旧盘只有
+ *  `silentIdle: true` 时按 'silent' 处理。结构化参数，避免 card-builder 反向依赖 core。 */
+export function frozenIdleLabel(fc: { idleLabel?: IdleCardLabel; silentIdle?: boolean }): IdleCardLabel | undefined {
+  return fc.idleLabel ?? (fc.silentIdle ? 'silent' : undefined);
+}
+
 /** Header status label for a streaming/snapshot card. Shared by the live card
  *  and the private snapshot so the two never drift. */
-function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, silentIdle?: boolean): string {
+function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, idleLabel?: boolean | IdleCardLabel): string {
   switch (status) {
     case 'starting': return t('card.status.starting', undefined, locale);
     case 'working': return t('card.status.working', undefined, locale);
-    // silentIdle: the turn completed as DELIBERATE silence (bare
+    // idleLabel 'silent': the turn completed as DELIBERATE silence (bare
     // nothing-to-send sentinel). Plain 「等待输入」 here is indistinguishable
     // from a hung session; say "handled, judged no reply needed" instead.
-    case 'idle': return t(silentIdle ? 'card.status.idle_silent' : 'card.status.idle', undefined, locale);
+    // 'completed': transcript 模式下最终回复卡已投递，卡头改「已完成」。
+    case 'idle': {
+      const label = normalizeIdleLabel(idleLabel);
+      return t(
+        label === 'completed' ? 'card.status.idle_completed'
+          : label === 'silent' ? 'card.status.idle_silent'
+            : 'card.status.idle',
+        undefined,
+        locale,
+      );
+    }
     case 'analyzing': return t('card.status.analyzing', undefined, locale);
     case 'stalled': return t('card.status.stalled', undefined, locale);
     case 'limited': return usageLimit?.retryReady
@@ -962,7 +976,8 @@ export function buildStreamingCard(
   usage?: CardUsageSnapshot,
   runtimeDisplayName?: string,
   serviceTierBadge?: string,
-  silentIdle?: boolean,
+  /** idle 卡头替代标签；布尔 `true` 兼容旧调用（= 'silent'）。见 {@link IdleCardLabel}。 */
+  silentIdle?: boolean | IdleCardLabel,
   /** Live per-bot `dshRuntime`. Only meaningful for cliId 'dsh': 'tui' means the
    *  worker spawns the PTY-driven dsh-tui adapter (a real interactive TUI that
    *  accepts a raw /compact), so the compact button must stay visible. Omitted ⇒

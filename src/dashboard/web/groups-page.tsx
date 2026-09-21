@@ -1,3 +1,4 @@
+import { GroupSerialInputRow } from './group-serial-input.js';
 import { GroupDefaultModelsRow } from './group-default-models.js';
 import { describeCloseResidual } from '../../core/close-residual.js';
 import {
@@ -23,6 +24,7 @@ import {
   type ProjectProgressCardTemplateId,
 } from './groups-api.js';
 import { StreamingCardPinToggle } from './streaming-card-pin-toggle.js';
+import { MemberAccessSection } from './member-access-section.js';
 import { botOrbStyle, chatAvatarUrlFor } from './ui.js';
 import { copyText } from './clipboard.js';
 import { toast } from './toast.js';
@@ -1727,6 +1729,23 @@ export function ManageDialog(props: {
             onSaved={() => props.onReloadGroups({ force: true })}
           />
         ))}
+      </fieldset>
+
+      <fieldset>
+        <legend>{tr('grantAdmin.sectionTitle')}</legend>
+        <MemberAccessSection chat={chat} members={inChat} disabled={!available} tr={tr} />
+      </fieldset>
+
+      <fieldset>
+        <legend>{tr('groups.serialInput')}</legend>
+        <p><small>{tr('groups.serialInputHelp')}</small></p>
+        {inChat.map(member => <GroupSerialInputRow
+          key={`${chat.chatId}-${member.larkAppId}`}
+          chatId={chat.chatId} appId={member.larkAppId}
+          botName={member.botName ?? member.larkAppId}
+          enabled={member.serialInput === true} disabled={!available}
+          onSaved={() => props.onReloadGroups({ force: true })}
+        />)}
       </fieldset>
 
       <fieldset>

@@ -14,9 +14,10 @@
  * The catch the type-ahead case must respect: parking only works once the TUI
  * is actually up. During STARTUP (and tmux re-attach) the input box doesn't
  * exist yet, so a write is silently dropped — this is exactly how dispatch's
- * brief reached Codex ~6s before its first idle and never landed. `awaitingFirstPrompt`
- * is the worker's "hasn't reached ready even once" flag; while it's true we must
- * QUEUE even type-ahead messages and let `markPromptReady()`'s flush deliver them.
+ * brief reached Codex ~6s before its first idle and never landed. A first ready
+ * or explicit initialized-banner evidence must prove the TUI has booted. The
+ * latter survives screen resyncs and lets later arrivals use type-ahead even
+ * before the first idle; absence of a loading banner is not sufficient proof.
  */
 export function shouldWriteNow(state: {
   /** CLI is idle, waiting for input. */
@@ -27,13 +28,15 @@ export function shouldWriteNow(state: {
   supportsTypeAhead: boolean;
   /** True until the CLI has reached its first ready state (boot / re-attach window). */
   awaitingFirstPrompt: boolean;
+  /** Positive initialization evidence for this CLI generation, not an idle signal. */
+  startupComplete?: boolean;
   /** A stale Codex App runner must not receive normal or type-ahead input. */
   holdForRunnerReload?: boolean;
 }): boolean {
   if (state.holdForRunnerReload) return false;
   if (state.isPromptReady || state.isFlushing) return true;
   // Type-ahead is only safe after the TUI has booted at least once.
-  return state.supportsTypeAhead && !state.awaitingFirstPrompt;
+  return state.supportsTypeAhead && (!state.awaitingFirstPrompt || state.startupComplete === true);
 }
 
 /**

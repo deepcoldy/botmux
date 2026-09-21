@@ -434,6 +434,35 @@ describe('trigger request contract', () => {
     // Generic sources keep rawText inside the JSON envelope (escaped), unchanged behavior.
     expect(prompt).toContain('"rawText": "line one\\nline two"');
   });
+
+  it('accepts options.steer on a fresh dryRun=false turn and on an existing-session follow-up', () => {
+    const fresh = request();
+    fresh.options = { asyncReturnSessionId: true, idempotencyKey: 'k-1', steer: true };
+    delete (fresh.target as any).chatId;
+    expect(validateTriggerRequest(fresh).ok).toBe(true);
+
+    const followUp = request();
+    followUp.target = { kind: 'turn', botId: 'app1', sessionId: 'session-1' };
+    followUp.instruction = 'also do X';
+    followUp.options = { asyncReturnSessionId: true, turnIdempotencyKey: 't-1', steer: true };
+    expect(validateTriggerRequest(followUp).ok).toBe(true);
+  });
+
+  it('rejects a non-boolean options.steer', () => {
+    const bad = request() as any;
+    bad.options = { dryRun: true, steer: 'yes' };
+    const v = validateTriggerRequest(bad);
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.body.error).toContain('options.steer');
+  });
+
+  it('rejects options.steer combined with dryRun (no dispatch to steer into)', () => {
+    const bad = request();
+    bad.options = { dryRun: true, steer: true };
+    const v = validateTriggerRequest(bad);
+    expect(v.ok).toBe(false);
+    if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
+  });
 });
 
 describe('dispatchTriggerRequest', () => {

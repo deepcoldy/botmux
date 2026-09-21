@@ -228,7 +228,7 @@ describe('processCommentEvent 的接线点（源码形状）', () => {
     return src.slice(start, end);
   }
 
-  const region = regionBetween('async function processCommentEvent', 'const LARK_WS_PROXY_ENV_KEYS');
+  const region = regionBetween('async function processCommentEvent', 'export function startLarkEventDispatcher');
 
   it('三个该打的丢弃点都接上了：拉不到评论 / 触发回复不在回复里 / 纯 @bot 无正文', () => {
     expect(region.match(/await markCommentEventDropped\(/g) ?? []).toHaveLength(3);

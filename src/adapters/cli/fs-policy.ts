@@ -901,6 +901,13 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // worker PRE-CREATES this file before spawn so it survives the existence
   // filter and bwrap can bind it (bwrap cannot bind a nonexistent source).
   if (ctx.sessionId) push([`${sd}/turn-sends/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
+  // statusline: `botmux statusline` (Claude's statusLine.command, run INSIDE the
+  // sandbox) atomically writes `statusline/<sessionId>/latest.json`. Atomic
+  // write = tmp + rename in the parent dir, so a single-file grant (as for
+  // turn-sends) cannot work — grant the per-session DIRECTORY instead. Still
+  // session-scoped: sibling sessions' dirs are not exposed. The worker
+  // pre-creates the dir so bwrap has a bind source.
+  if (ctx.sessionId) push([`${sd}/statusline/${ctx.sessionId}`], 'readWrite', 'internal');
   // (schedules: stored PER BOT inside each BOT_HOME — the owner's dir is
   // already readWrite above and siblings' stores are denied by construction,
   // so the old shared data/schedules.json grant (and the cross-bot task-prompt
@@ -1013,6 +1020,8 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
       `${ctx.sessionDataDir}/bin`,
     ], 'readOnly', 'internal');
     if (ctx.sessionId) push([`${ctx.sessionDataDir}/turn-sends/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
+    // statusline snapshot dir (see the larkTransport branch for why a dir, not a file).
+    if (ctx.sessionId) push([`${ctx.sessionDataDir}/statusline/${ctx.sessionId}`], 'readWrite', 'internal');
     // NOTE: dashboard-daemons (sibling IPC port table) and .dashboard-secret/-token
     // are deliberately NOT re-allowed — a no-transport turn has no business
     // reaching sibling daemons, and the secret is the escalation vector.

@@ -43,4 +43,8 @@ describe('reserved daemon command tables', () => {
   it('keeps /quote existing-session-only (guards the ghost-session regression)', () => {
     expect(EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has('/quote')).toBe(true);
   });
+
+  it('keeps /stop existing-session-only so it never starts a command session', () => {
+    expect(EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has('/stop')).toBe(true);
+  });
 });

@@ -28,11 +28,13 @@ Check these in order (PersonalAgent comes configured correctly by default; norma
 
 ### B. Others can't use it / auth card
 
-botmux has two permission layers (see [permissions](#how-are-permissions-divided-who-can-operate-it)): **talk permission** (who can ask) and **operate permission** (who can `/cd` `/restart` / tap buttons). By default only the owner has talk permission, so others get refused / see an auth card.
+botmux has two permission layers (the full layer model is in [Permissions & Access](/en/permissions); quick reference below in [How are permissions divided](#how-are-permissions-divided-who-can-operate-it)): **talk permission** (who can ask) and **operate permission** (who can `/cd` `/restart` / tap buttons). By default only people on the `allowedUsers` list have talk permission, so others get refused / see an auth card. **Being added to a group does not authorize any member.**
 
-- **Let a whole group use it**: give the bot `allowedChatGroups` (everyone in that group can talk), or authorize a specific group with `/grant`.
-- **Group @ policy** (must-@ vs no-@): multi-person groups require @ by default; no-@-in-topic / no-@-whole-group can be configured in the group @ policy. Note a 1-on-1 "you + 1 bot" group is @-free already.
+- **Let a whole group use it**: send bare `@bot /grant` in the group (writes `allowedChatGroups`; everyone takes effect immediately, no quota), or use **authorize the whole group in one click** in Dashboard **Groups → Manage**; no need to add people one by one.
+- **Trial access for specific people**: `@bot /grant @someone` opens a card defaulting to 3 messages / 1 hour, with quota and duration adjustable on the card; the Dashboard group-member modal also supports multi-select **batch grant** (up to 50).
+- **Group @ policy** (must-@ vs no-@): multi-person groups require @ by default; `/mention-mode topic|never|ambient` changes it, and the four modes plus the 8 no-@ exceptions are explained in [Mention Policy](/en/mention-mode). A 1-on-1 "you + 1 bot" group is @-free already.
 - **On-call scenario** (a new group per ticket, everyone asks @-free): see [On-Call Mode](/en/oncall).
+- **Block someone**: Dashboard **Bot Config → `blockedUsers`** — denied globally in groups and DMs, with no more request cards.
 
 ### C. Terminal has output but nothing sent to Lark
 
@@ -95,7 +97,27 @@ It keeps running, and there is **currently no idle-TTL automatic reclamation**. 
 
 ## How are permissions divided? Who can operate it?
 
-Three layers: `allowedChatGroups` / `globalGrants` grant **conversation rights** (everyone in the group can ask); `allowedUsers` grants **operation rights** (only the owner can `/cd`, `/restart`, `/close`, click buttons). When `allowedChatGroups` is configured, `allowedUsers` must have at least one owner.
+Quick reference: `allowedUsers` grants **operate rights** (owner and admins — `/cd`, `/restart`, `/close`, card buttons, and changing `/card`, `/cot`, `/mention-mode`); `allowedChatGroups` (bare `/grant`, whole group, no quota), on-call (whole group, always allowed + directory bound), and `chatGrants` / `globalGrants` (per person, default 3 messages / 1 hour) grant **talk rights**; `blockedUsers` is the global deny that precedes every allow leg. Layers, quotas, expiry, and request cards are fully documented in [Permissions & Access](/en/permissions).
+
+## How do I let the whole group use it without authorizing people one by one?
+
+Send bare `@bot /grant` (equivalent to `/grant all`) in the group: it adds the group to `allowedChatGroups` in one step, so everyone in the group can talk immediately, with no quota and no expiry; new members take effect automatically and leaving the group revokes access. Revoke with bare `/revoke`. In a topic group it is keyed by the `oc_` group and covers all its topics. Dashboard **Groups → Manage** also has **authorize the whole group in one click**. It grants talk only; operate rights remain with `allowedUsers`.
+
+## How do I give someone just a 3-message trial?
+
+`@bot /grant @someone` — the grant card defaults to **3 messages / 1 hour** per person. To set the count directly use `@bot /grant @someone 20`; both duration and quota are editable on the card (1 hour / 8 hours / 1 day / 7 days / permanent; leave the quota blank for unlimited).
+
+## What's the difference between on-call and bare `/grant`?
+
+Both grant talk only (never operate) and neither is quota-limited. The difference is the directory: `/oncall bind <dir>` also anchors the group to a working directory, so new topics skip repository picking and start immediately; bare `/grant` only opens talk and binds no directory. Use on-call for duty Q&A, and `/grant` when the group just needs to ask in topics whose repo is already chosen.
+
+## Why must I @ the bot in a group? Can it answer without an @?
+
+In the default `always` mode, regular groups respond only to explicit @-mentions, which prevents bots from answering over each other in multi-bot / multi-person groups. Send `/mention-mode` in the group to change it: `topic` (no @ inside its own topics), `never` (no @ group-wide), `ambient` (no @, but yields when someone else is named). Changing it requires operate rights and works in regular groups only; 8 further no-@ exceptions exist (1-person-1-bot groups, the message listener, and more) — see [Mention Policy](/en/mention-mode).
+
+## Can I forbid people from adding this bot to groups?
+
+"Who can add the bot to a group" is controlled on the **Lark platform side** (app availability scope / who can add bots); botmux has no such switch and cannot fake one. Two things the bot side can do: ① turn off **Auto-start when added to a new group** (`autoStartOnGroupJoin`, Dashboard **Bot Defaults → Proactive Start** — and that gate itself still requires an authorized user in the group); ② keep the bot restricted — **being added is not authorization**, so a non-listed member @-mentioning it is blocked and the owner gets a request card instead. Whether the owner is auto-invited into new groups is controlled by `autoInviteOwnerOnGroupAdd` in `bots.json` (on by default).
 
 ## Can I ask a follow-up / interrupt a running session?
 

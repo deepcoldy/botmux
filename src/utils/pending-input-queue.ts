@@ -1,7 +1,13 @@
-import type { CodexAppTurnInput, TrustedCaller, VcMeetingImTurnOrigin } from '../types.js';
+import type {
+  CodexAppTurnInput,
+  ReadonlyContinuationDispatchMarker,
+  TrustedCaller,
+  VcMeetingImTurnOrigin,
+} from '../types.js';
 import { sameTrustedPrincipal } from '../core/active-turn-authority.js';
 
 export interface PendingCliInput {
+  queueAfterActiveTurn?: true;
   content: string;
   /** The real user turn represented by `content` when delivery uses a short
    * adapter command. Transcript bridges fingerprint this value, while the PTY
@@ -45,6 +51,7 @@ export interface PendingCliInput {
    *  session is NOT dropped (codex #776 round-8). The worker's CLI-exit carry
    *  predicate and pending-drop both honor it. */
   noReplay?: boolean;
+  readonlyContinuation?: ReadonlyContinuationDispatchMarker;
 }
 
 /**
@@ -100,14 +107,16 @@ export function mergeQueuedCliInput(
   // must likewise start its own turn). Structured Codex App turns also carry
   // per-message attribution/context, so concatenating only their visible text
   // would drop or mis-attach the sidecar.
-  if (tail.dispatchAttempt !== undefined || next.dispatchAttempt !== undefined
+  if (tail.queueAfterActiveTurn || next.queueAfterActiveTurn
+    || tail.dispatchAttempt !== undefined || next.dispatchAttempt !== undefined
     || tail.codexAppDispatchId || next.codexAppDispatchId
     || tail.queuedActivationToken || next.queuedActivationToken
     || tail.vcMeetingImTurnOrigin || next.vcMeetingImTurnOrigin
     || tail.codexAppInput || next.codexAppInput
     || tail.nativeSessionTitle || next.nativeSessionTitle
     || tail.nativeSessionTitlePrompt || next.nativeSessionTitlePrompt
-    || tail.logicalContent || next.logicalContent) return false;
+    || tail.logicalContent || next.logicalContent
+    || tail.readonlyContinuation || next.readonlyContinuation) return false;
   // Caller attribution is part of the logical envelope. Older code merged two
   // queued messages and kept only the later turnId while silently retaining no
   // trustworthy sender boundary. New Lark turns carry trustedCaller; unknown

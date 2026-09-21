@@ -44,9 +44,12 @@ export interface ScheduleCardTaskInput {
    *  when missing. */
   botName?: string;
   chatId?: string;
+  /** Effective target chats as projected by the daemon (single-chat tasks omit
+   *  the array). The dedicated-task position is limited to one group. */
+  chatIds?: readonly string[];
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
-  executionPosition?: 'top-level' | 'topic' | 'new-topic';
+  executionPosition?: 'top-level' | 'topic' | 'new-topic' | 'task';
   topicTitle?: string;
   /** ISO of the next scheduled run (precomputed by caller). */
   nextRunAt?: string;
@@ -64,7 +67,7 @@ export interface ScheduleCardTaskInput {
 
 export type ScheduleKind = ParsedSchedule['kind'];
 export type ScheduleDelivery = 'origin' | 'local' | 'new-topic';
-export type ScheduleExecutionPlacement = 'chat' | 'thread' | 'new-topic' | 'local';
+export type ScheduleExecutionPlacement = 'chat' | 'thread' | 'new-topic' | 'task' | 'local';
 export type ScheduleKindChip = ScheduleKind | 'all';
 
 export interface ScheduleFilterQuery extends PaginationParams {
@@ -215,6 +218,9 @@ export function resolveScheduleExecutionPlacement(
 ): ScheduleExecutionPlacement {
   if (task.deliver === 'local') return 'local';
   if (task.executionPosition === 'new-topic' || (!task.executionPosition && task.deliver === 'new-topic')) return 'new-topic';
+  // A dedicated per-task topic: before its first fire there is no root yet
+  // ('task' placement); once the root is written back it is an ordinary thread.
+  if (task.executionPosition === 'task') return task.rootMessageId ? 'thread' : 'task';
   if (task.executionPosition === 'topic') return task.rootMessageId ? 'thread' : 'chat';
   if (task.executionPosition === 'top-level') return 'chat';
   if (task.scope === 'chat') return 'chat';
@@ -223,13 +229,22 @@ export function resolveScheduleExecutionPlacement(
 
 export function computeDeliveryButtonAvailability(
   task: ScheduleCardTaskInput,
-  target: 'top-level' | 'topic' | 'new-topic',
+  target: 'top-level' | 'topic' | 'new-topic' | 'task',
 ): ButtonState {
   if (task.deliver === 'local') {
     return { enabled: false, reasonKey: 'schedules.action.delivery.local' };
   }
+  if (target === 'task' && (task.chatIds?.length ?? 1) > 1) {
+    return { enabled: false, reasonKey: 'schedules.action.delivery.taskMultiChat' };
+  }
   const placement = resolveScheduleExecutionPlacement(task);
-  const current = placement === 'thread' ? 'topic' : placement === 'new-topic' ? 'new-topic' : 'top-level';
+  const current = placement === 'thread'
+    ? 'topic'
+    : placement === 'new-topic'
+      ? 'new-topic'
+      : placement === 'task'
+        ? 'task'
+        : 'top-level';
   if (target === 'topic' && !task.rootMessageId) {
     return { enabled: false, reasonKey: 'schedules.action.delivery.topicRootRequired' };
   }
@@ -240,18 +255,26 @@ export function computeDeliveryButtonAvailability(
         ? 'schedules.action.delivery.alreadyOrigin'
         : target === 'top-level'
           ? 'schedules.action.delivery.alreadyTopLevel'
-          : 'schedules.action.delivery.alreadyNewTopic',
+          : target === 'task'
+            ? 'schedules.action.delivery.alreadyTask'
+            : 'schedules.action.delivery.alreadyNewTopic',
     };
   }
   return { enabled: true };
 }
 
-export function nextScheduleExecutionPosition(task: ScheduleCardTaskInput): 'top-level' | 'topic' | 'new-topic' {
+export function nextScheduleExecutionPosition(
+  task: ScheduleCardTaskInput,
+): 'top-level' | 'topic' | 'new-topic' | 'task' {
   const placement = resolveScheduleExecutionPlacement(task);
   if (placement === 'thread') return 'top-level';
-  // Leaving a fresh topic parks at top level — never cycle back into a
-  // retained root, which may belong to the adopted topic the task was born in.
-  if (placement === 'new-topic') return 'top-level';
+  // New cycle step: a fresh-topic task can settle into its own dedicated
+  // topic instead of parking at top level.
+  if (placement === 'new-topic') return 'task';
+  // The dedicated position parks back at top level. It must never cycle into
+  // a retained root, which may belong to the adopted topic the task was born
+  // in; ordinary chat placement moves on to the fresh-topic step.
+  if (placement === 'task') return 'top-level';
   return 'new-topic';
 }
 

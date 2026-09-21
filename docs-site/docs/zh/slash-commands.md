@@ -12,16 +12,18 @@
 | `/cd <路径>` | 切换工作目录并重启 CLI 进程 |
 | `/status` | 查看会话信息（运行时间、终端地址等） |
 | `/retry` | 重试最近一个失败或被中断的 turn（10s 冷却） |
+| `/stop` | 中断当前 turn，保留会话；等价于流式卡片里的「停止」按钮 |
 | `/restart` | 重启 CLI 进程（保留 session 上下文） |
 | `/close` | 关闭会话并发送可恢复卡片（含 CLI 自身 resume 命令） |
 | `/cleanup-wt <ID>` | worktree 最终删除失败后重试已持久化的清理任务；删除前会重新校验权限、活动会话、worktree 身份和安全状态 |
-| `/fork <任务>` | 继承当前会话的完整上下文，在同一话题群新建并行子话题；源会话原样继续（仅 Claude 系 / Codex 终端模式） |
+| `/fork <任务>` | 继承当前会话的完整上下文，在同一话题群新建并行子话题；源会话原样继续（Claude 系 / Codex 或 TraeX 终端模式） |
 | `/forklist` | 重发当前会话的分身任务面板，显示运行/结束状态和子话题链接 |
 | `/fork --create <群名>` | 不建子话题，改为把当前会话分身到一个新建群 |
 | `/rename <标题>` | 重命名当前 Botmux 会话，并同步运行中的 Codex/Claude 原生会话名 |
-| `/fork --create <新群名>` | 把当前空闲会话分身到一个新建群，源会话原样保留继续（仅 Claude 系 / Codex 终端模式；需在源会话所在话题内发起） |
-| `/card` | 手动召唤当前会话的流式卡片（关流式时也能召唤并恢复实时刷新；私密卡片模式下改发仅授权人可见的静态快照）。`/card off`、`/card on` 控制本群是否出流式卡；`/card pin off`、`/card pin on`、`/card pin status` 控制当前群的流式卡片置顶开关 |
-| `/cot` | 思考过程消息开关：`/cot off` 关闭本群的思考气泡，`/cot on` 恢复，`/cot show` 在开关关闭时临时召唤一次当前回合的思考气泡，`/cot status` 查看状态（bot 级总开关 `thinkingCard` 默认 on；支持 claude-code / codex / traex） |
+| `/fork --create <新群名>` | 把当前空闲会话分身到一个新建群，源会话原样保留继续（Claude 系 / Codex 或 TraeX 终端模式；Hybrid RPC / 外部 app-server 会话不支持；需在源会话内发起） |
+| `/card` | 手动召唤当前会话的流式卡片（关流式时也能召唤并恢复实时刷新；私密卡片模式下改发仅授权人可见的静态快照）。`/card off`、`/card on` 控制本群是否出流式卡；`/card pin off`、`/card pin on`、`/card pin status` 控制当前群的流式卡片置顶开关。仅 `allowedUsers` 可执行（开关影响全群，飞书没有按人视图） |
+| `/cot` | CoT 开关：`/cot off` 关闭本群的思考与工具过程，`/cot on` 恢复，`/cot show` 在开关关闭时临时展示一次当前回合，`/cot status` 查看状态（bot 级总开关 `cotEnabled` 默认 on；支持 claude-code / codex / traex）。仅 `allowedUsers` 可执行 |
+| `/mention-mode [always\|topic\|never\|ambient\|status]` | 普通群的 @ 策略：什么时候可以不 @ 也回应。查询需对话权、修改需操作权；**仅普通群可设**（私聊/话题群/会话群会被拒绝）。四模式语义与 8 个免 @ 例外见 [@ 策略](/mention-mode) |
 | `/term` | 获取当前会话的「可操作终端」（带写权限）链接，私密发给 owner（群内仅你可见，话题/单聊回退私信，不在群里暴露） |
 | `/quote` | 弹出本群话题选择卡，选一个就把那个话题的聊天记录读进当前会话。补的是飞书本身的缺口——飞书的「引用」只能引单条消息，没有「引用整个话题」的入口。读完只回一句确认（多少条、时间跨度、主题），等你下一条指令 |
 | `/quote <指令>` | 同上，但选完话题直接执行你的指令，省一个来回。话题内容仍然会被明确标注为「资料而不是指令」注入 |
@@ -102,6 +104,13 @@ botmux 日常运维
 群级设置会覆盖 dashboard「Bot 配置 → 普通群模式」的默认值。
 
 `/substitute [status|on|off]` —— 查看或切换当前群的**替身模式**开关（修改需 owner）。
+
+## 📢 @ 策略（`/mention-mode`，仅普通群）
+
+`/mention-mode always|topic|never|ambient` 切换本群策略，`/mention-mode status`（或不带参数）查看。仅普通群可设：私聊天然不需要 @，话题群与 `/group` 会话群会被拒绝。查询只要对话权，修改需操作权（`allowedUsers`）。
+
+- `always`：必须 @ 才回应（默认）；`topic`：本 bot 自有话题内回复免 @；`never`：全群免 @；`ambient`：免 @，但消息明确 @ 了其他人/bot 时让路。
+- 免 @ 不等于免权限，且仍有 8 个免 @ 例外（话题内回复、替身、消息监听器等）——完整语义见 [@ 策略](/mention-mode)。
 
 ## 📑 群标签页
 
@@ -192,13 +201,15 @@ CLI 会从当前 `BOTMUX_SESSION_ID` 自动确定 bot 和群；脱离当前会�
 
 `/oncall bind <path>` · `/oncall unbind` · `/oncall status`
 
-## 🔑 使用授权（owner 专用）
+## 🔑 使用授权（owner / 管理员）
 
 | 命令 | 说明 |
 |------|------|
-| `@机器人 /grant @某人` | 授权对方在本群对话；`/grant`（不带人）则授权**本群所有成员**对话 |
-| `@机器人 /revoke @某人` | 撤销对方本群对话权；`/revoke`（不带人）撤销整群授权 |
+| `@机器人 /grant`（或 `/grant all`） | 授权**本群所有成员**对话（写入 `allowedChatGroups`，无额度无期限；话题群按 `oc_` 群生效、覆盖全部话题）；裸 `/revoke` 收回 |
+| `@机器人 /grant @某人 [N]` | 发卡给指定成员授权**本群对话**，默认每人 3 条 / 1 小时，卡上可选 1 小时 / 8 小时 / 1 天 / 7 天 / 永久与额度（留空不限）；owner 主动发起的卡还可「全局授权对话」。`@机器人 /revoke @某人` 一并撤销本群访客授权、全局访客授权；若对方同时在 `allowedUsers` 名单里也会移除（撤 owner 本人或撤到再无管理员会被拒绝，回执注明作用域） |
 | `/vc-auth @成员` | 会议监听中临时授权本场指令源；`/vc-auth revoke @成员` 撤销；`/vc-auth list` 查看 |
+
+分层、额度、授权申请卡与黑名单详见 [权限与授权](/permissions)。注意：**把 bot 拉进群不等于授权**，限制态 bot 仍只接受名单成员。
 
 ## ⚙️ 远程改配置 & 技能（owner 专用）
 

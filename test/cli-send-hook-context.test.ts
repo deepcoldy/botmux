@@ -164,6 +164,12 @@ describe('cmdSend hook context wiring', () => {
     expect(cliSource).toMatch(/mentions\.push\(\{ open_id: replyTargetSenderOpenId, name: '' \}\)/);
   });
 
+  it('lets explicit recipients replace the implicit reply target in quote and footer routing', () => {
+    expect(cliSource).toContain('shouldSuppressImplicitReplyTarget({');
+    expect(cliSource).toContain('if (suppressImplicitReplyTarget) effectiveQuoteTargetId = undefined');
+    expect(cliSource).toContain('hasExplicitMention: mentions.length > 0');
+  });
+
   it('gates the legacy global quote-sender fallback on NO currentTurnId — an exact-turn miss never borrows the advanced global slot (#750 cross-turn guard)', () => {
     // The reply-target sender chain is: VC → #597 frozen dispatch → exact
     // turnReplyTarget.senderOpenId → (ONLY when no currentTurnId) legacy global
@@ -570,7 +576,7 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend.indexOf('const exactOriginDispatch = (() => {'))
       .toBeLessThan(cmdSend.indexOf("const { synthesizeVoiceOpus }"));
     expect(cmdSend.indexOf("exactOriginDispatch?.deliverySink === 'http_wait'"))
-      .toBeLessThan(cmdSend.indexOf("const { sendMessage, replyMessage, uploadImage, uploadFile"));
+      .toBeLessThan(cmdSend.indexOf("const { sendMessage, replyMessage"));
   });
 
   it('validates the exact document text path before reading content or invoking TTS/uploads', () => {
@@ -654,7 +660,7 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('if (!noMention && !isSlashSend && !vcMeetingManagedSendOrigin)');
     expect(cmdSend).toContain('if (!sendTopLevel && !vcMeetingManagedSendOrigin)');
     expect(cmdSend.indexOf('const managedPayloadError = managedVcSendPayloadError({'))
-      .toBeLessThan(cmdSend.indexOf("const { sendMessage, replyMessage, uploadImage, uploadFile"));
+      .toBeLessThan(cmdSend.indexOf("const { sendMessage, replyMessage"));
     expect(cmdSend.indexOf('const managedPayloadError = managedVcSendPayloadError({'))
       .toBeLessThan(cmdSend.indexOf("const { synthesizeVoiceOpus }"));
     expect(cmdSend.indexOf('const managedRenderedPayloadError = managedVcSendPayloadError({'))
@@ -704,6 +710,10 @@ describe('cmdSend hook context wiring', () => {
     // Turn-completion recording is gated on the response KIND, not on the
     // feedback policy — feedback off must still produce a correlatable record.
     expect(cmdSend).toContain("if (effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
+    const oncallIndex = cmdSend.indexOf('recordOncallGroupDelivery(resolveDataDir()');
+    const completionIndex = cmdSend.indexOf("if (effectiveResponseKind === 'final' && !customCard && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
+    expect(oncallIndex).toBeGreaterThan(primarySend);
+    expect(oncallIndex).toBeLessThan(completionIndex);
     // The feedback control (policy + card snapshot) rides along only when a
     // policy actually applies; the record itself is unconditional.
     expect(cmdSend).toContain('const carriesFeedbackControl = !!feedbackPolicy;');

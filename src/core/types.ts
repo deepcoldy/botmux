@@ -39,6 +39,9 @@ export interface FrozenCard {
   /** Whether this historical turn deliberately completed with no reply. The
    *  value belongs to this frozen card, not to the session's latest turn. */
   silentIdle?: boolean;
+  /** 冻结时的 idle 卡头标签：'silent' = 判定无需回复；'completed' = transcript
+   *  模式下最终回复卡已投递。新写入以此为准，`silentIdle` 仅为读旧盘保留。 */
+  idleLabel?: 'silent' | 'completed';
 }
 
 /** Resolve effective display mode for a frozen card.
@@ -77,6 +80,19 @@ export interface DaemonSession {
   /** Monotonic within one daemon boot. Captured by durable delivery receipts
    *  so a terminal/exit from a replaced worker cannot settle a newer attempt. */
   workerGeneration?: number;
+  /** In-memory proof emitted by this exact worker + TraeX RPC generation. */
+  readonlyContinuationRpcProof?: {
+    workerGeneration: number;
+    rpcGeneration: string;
+    checkedAt: number;
+  };
+  /** Exact live synthetic turn whose hook-level native subagent requests must
+   * be denied. Derived only from trusted worker IPC for the current generation. */
+  readonlyContinuationTurnOrigin?: {
+    workerGeneration: number;
+    turnId: string;
+    dispatchAttempt: number;
+  };
   larkAppId: string;
   chatId: string;
   chatType: 'group' | 'p2p';    // p2p chats need reply_in_thread to create topics
@@ -315,7 +331,7 @@ export interface DaemonSession {
   streamingCardForced?: boolean;
   /** One-shot override for the native CoT (thinking process) message: when
    *  true, the bubble renders for the current/next turn even if the chat is
-   *  in `noCotChats` or the bot-level `thinkingCard` switch is off. Flipped on
+   *  in `noCotChats` or the bot-level `cotEnabled` switch is off. Flipped on
    *  by `/cot show`; auto-cleared when that turn settles (turn_terminal), so
    *  it is a single peek, not a toggle. In-memory only. */
   cotForced?: boolean;
@@ -352,6 +368,10 @@ export interface DaemonSession {
    *  silence" from "stuck". Cleared by every new-turn entry point
    *  (beginNewTurn and both worker-exited re-fork branches). In-memory only. */
   silentIdleTurnId?: string;
+  /** transcript 模式（replyDelivery=transcript）下最终回复卡已投递成功的轮次：
+   *  idle 时卡头显示「已完成」而非「等待输入」。清理点与 `silentIdleTurnId`
+   *  完全一致（每个新轮次入口）。内存态，不落盘。 */
+  completedIdleTurnId?: string;
   /** turnId of the most recently STARTED turn (beginNewTurn and both
    *  worker-exited re-fork branches). Lineage anchor for `silentIdleTurnId`: a
    *  turn_terminal that lands after a NEWER turn already opened — the normal
@@ -372,6 +392,10 @@ export interface DaemonSession {
   activeInteractiveTurn?: {
     turnId: string;
     caller: import('../types.js').TrustedCaller;
+    /** Business prompt before daemon-owned quote/application wrappers. Kept
+     * only in memory so an approved XPI suggestion can replay the owner's
+     * actual request instead of duplicating transport context. */
+    userPrompt?: string;
     /** Stable authenticated task/session owner, when distinct from the caller
      * that happened to start the current CLI turn. */
     controller?: import('../types.js').TrustedCaller;
@@ -396,6 +420,11 @@ export interface DaemonSession {
     approved?: boolean;
   }>;
   crossPrincipalSuggestionConfirming?: boolean;
+  /** replyDelivery=transcript 下本轮是否 solo 会话（只有 owner 与本 bot：私聊，或
+   *  仅 owner + 本 bot 的普通群）。solo 时逐轮信封去壳：裸文本、无 <sender/>。
+   *  daemon 在构建 CLI 输入前按轮重算（resolveSoloSessionForTurn）；send 模式恒为
+   *  false 且不发额外 API。内存态，不持久化——重启后首轮重算即可。 */
+  soloSession?: boolean;
   /** Dedupe guard: turnIds whose silent-turn auto receipt was already posted
    *  (dispatchAttempt replays must not double-post). A bounded FIFO Set, not a
    *  single slot: replays can interleave with other turns (A₁ → B → A₂), and a
@@ -502,13 +531,14 @@ export interface DaemonSession {
    *  `latestAsyncTriggerId`; callers that need exact-match semantics can also
    *  pass the triggerId returned by the initial async activation response. */
   asyncTriggerResults?: Map<string, {
-    status: 'pending' | 'completed' | 'failed';
+    status: 'pending' | 'completed' | 'failed' | 'interrupted';
     createdAt: number;
     completedAt?: number;
     failedAt?: number;
     content?: string;
     errorCode?: 'trigger_failed';
     terminalErrorCode?: string;
+    interruptedAt?: number;
     usage?: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreateTokens: number };
   }>;
   latestAsyncTriggerId?: string;

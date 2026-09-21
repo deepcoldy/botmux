@@ -187,6 +187,19 @@ export class MessageWithdrawnError extends Error {
 }
 
 /**
+ * Thrown when a message has passed Lark's 14-day edit window and can never be
+ * PATCHed again (Lark code 230031). Unlike 230011 the message still exists —
+ * only updates are rejected permanently, so callers must stop retrying and post
+ * a fresh message rather than treating it as a transient failure.
+ */
+export class MessageUpdateExpiredError extends Error {
+  constructor(messageId: string) {
+    super(`Message ${messageId} can no longer be updated (past Lark's edit window)`);
+    this.name = 'MessageUpdateExpiredError';
+  }
+}
+
+/**
  * Re-exported from bot-registry (defined there to avoid an import cycle with
  * getBotClient). apiOnly bots throw this on any Feishu client request.
  */
@@ -232,6 +245,7 @@ function getLarkErrorCode(err: any): number | undefined {
 }
 
 const LARK_CODE_MESSAGE_WITHDRAWN = 230011;
+const LARK_CODE_MESSAGE_UPDATE_EXPIRED = 230031;
 // Capability cache for the undocumented `/members/bots` endpoint. It prevents
 // repeated hits while the tenant/gateway cannot serve the API, but per-request
 // business errors (bad chat id, permission denial) must not poison other chats.
@@ -397,6 +411,40 @@ export async function replyMessage(
       });
     return replyId;
   });
+}
+
+export type MessageUrgentMode = 'app' | 'sms' | 'phone';
+
+/**
+ * Buzz one or more users about a message sent by this bot.
+ *
+ * `app` is the ordinary in-app Buzz. SMS/phone use separate endpoints, scopes,
+ * and tenant quota. Callers should therefore require an explicit mode for the
+ * latter two and must not retry the primary message when this follow-up fails.
+ */
+export async function urgentMessage(
+  larkAppId: string,
+  messageId: string,
+  userOpenIds: string[],
+  mode: MessageUrgentMode = 'app',
+  requestOptions?: LarkRequestOptions,
+): Promise<void> {
+  assertLarkTransport(larkAppId, 'urgentMessage');
+  const recipients = [...new Set(userOpenIds.map(id => id.trim()).filter(Boolean))];
+  if (recipients.length === 0) throw new Error('Urgent message requires at least one user open_id');
+
+  const c = getBotClient(larkAppId);
+  const res: any = await (c as any).request({
+    method: 'PATCH',
+    url: `/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/urgent_${mode}`,
+    params: { user_id_type: 'open_id' },
+    data: { user_id_list: recipients },
+    ...larkRequestDeadline(requestOptions),
+  });
+  if (res?.code !== 0 && res?.code !== undefined) {
+    throw new Error(`Failed to urgent message (${mode}): ${res.msg ?? ''} (code: ${res.code})`);
+  }
+  logger.info(`Urgent ${mode} sent for message ${messageId} to ${recipients.length} user(s)`);
 }
 
 export async function addReaction(larkAppId: string, messageId: string, emojiType: string): Promise<string> {
@@ -652,8 +700,14 @@ export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ 
   };
 }
 
+export interface ChatUserMember {
+  openId: string;
+  name?: string;
+}
+
 /**
- * List the open_ids of a chat's (user) members, paginating until exhausted.
+ * List a chat's user members with app-scoped open_ids and optional display
+ * names, paginating until exhausted. Names support exact unique mention lookup.
  * Used by the 主动开工 场景① gate to check whether any of the bot's allowedUsers
  * is a member of a chat the bot was just added to. Open_ids are app-scoped, so
  * the result is only comparable against the SAME bot's resolvedAllowedUsers.
@@ -666,9 +720,9 @@ export async function getChatInfo(larkAppId: string, chatId: string): Promise<{ 
  * truncated list would make members past the cap look like "not in the chat"
  * (wrong-answer fail-open), so a truncation is surfaced as an error instead.
  */
-export async function listChatMemberOpenIds(larkAppId: string, chatId: string): Promise<string[]> {
+export async function listChatUserMembers(larkAppId: string, chatId: string): Promise<ChatUserMember[]> {
   const c = getBotClient(larkAppId);
-  const openIds: string[] = [];
+  const members: ChatUserMember[] = [];
   let pageToken: string | undefined;
   let truncated = false;
   // Hard page cap as a runaway guard (100 members/page × 20 = 2000 members).
@@ -681,7 +735,10 @@ export async function listChatMemberOpenIds(larkAppId: string, chatId: string): 
     }
     for (const it of (res.data?.items ?? [])) {
       const id = it?.member_id;
-      if (typeof id === 'string' && id) openIds.push(id);
+      if (typeof id === 'string' && id) {
+        const name = typeof it?.name === 'string' && it.name.trim() ? it.name.trim() : undefined;
+        members.push({ openId: id, ...(name ? { name } : {}) });
+      }
     }
     if (!res.data?.has_more || !res.data?.page_token) break;
     pageToken = res.data.page_token;
@@ -695,7 +752,11 @@ export async function listChatMemberOpenIds(larkAppId: string, chatId: string): 
       `Refusing to return an incomplete list (would misjudge members past the cap as "not in chat").`,
     );
   }
-  return openIds;
+  return members;
+}
+
+export async function listChatMemberOpenIds(larkAppId: string, chatId: string): Promise<string[]> {
+  return (await listChatUserMembers(larkAppId, chatId)).map(member => member.openId);
 }
 
 /**
@@ -1139,13 +1200,18 @@ export async function updateMessage(larkAppId: string, messageId: string, cardJs
         data: { content: stampBotmuxCallbackMarkers(cardJson) },
       });
     } catch (err: any) {
-      if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
+      const code = getLarkErrorCode(err);
+      if (code === LARK_CODE_MESSAGE_WITHDRAWN) {
         throw new MessageWithdrawnError(messageId);
+      }
+      if (code === LARK_CODE_MESSAGE_UPDATE_EXPIRED) {
+        throw new MessageUpdateExpiredError(messageId);
       }
       throw err;
     }
     if (res.code !== 0) {
       if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
+      if (res.code === LARK_CODE_MESSAGE_UPDATE_EXPIRED) throw new MessageUpdateExpiredError(messageId);
       throw new Error(`Failed to update message: ${res.msg} (code: ${res.code})`);
     }
   });
@@ -1537,6 +1603,58 @@ export async function uploadFile(larkAppId: string, filePath: string, opts?: { d
  *                   entry is genuinely gone and MUST NOT be revived from cache.
  */
 export type EntryResolveStatus = 'resolved' | 'transient' | 'definitive';
+
+export type TargetAppOpenIdResolution =
+  | { status: 'resolved'; openId: string }
+  | { status: 'transient' }
+  | { status: 'definitive' };
+
+function maskedIdentityForLog(value: string): string {
+  if (value.length <= 12) return `${value.slice(0, 3)}...`;
+  return `${value.slice(0, 6)}...${value.slice(-4)}`;
+}
+
+/**
+ * Resolve a human union_id into the open_id issued by the target bot app.
+ *
+ * XPI choice cards must use this boundary instead of reusing the inbound
+ * event's open_id: open_id is app-scoped, while a cross-app interruption may
+ * have been observed through another app.  The caller receives only a stable
+ * result class; logs deliberately keep both identities masked.
+ */
+export async function resolveTargetAppOpenId(
+  larkAppId: string,
+  unionId: string,
+): Promise<TargetAppOpenIdResolution> {
+  try {
+    const c = getBotClient(larkAppId);
+    const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(unionId)}`, {
+      user_id_type: 'union_id',
+    });
+    const openId = res?.data?.user?.open_id;
+    if (res?.code === 0 && typeof openId === 'string' && openId.startsWith('ou_')) {
+      logger.info(
+        `[target-app-identity] resolved union=${maskedIdentityForLog(unionId)} `
+        + `open=${maskedIdentityForLog(openId)} app=${larkAppId}`,
+      );
+      return { status: 'resolved', openId };
+    }
+    const definitive = res?.code === 0 || !!classifyContactErrorCode(res?.code);
+    logger.warn(
+      `[target-app-identity] ${definitive ? 'definitive' : 'transient'} miss `
+      + `union=${maskedIdentityForLog(unionId)} app=${larkAppId} code=${String(res?.code ?? 'unknown')}`,
+    );
+    return { status: definitive ? 'definitive' : 'transient' };
+  } catch (err) {
+    const code = getLarkErrorCode(err);
+    const definitive = !!classifyContactErrorCode(code);
+    logger.warn(
+      `[target-app-identity] ${definitive ? 'definitive' : 'transient'} error `
+      + `union=${maskedIdentityForLog(unionId)} app=${larkAppId} code=${String(code ?? 'unknown')}`,
+    );
+    return { status: definitive ? 'definitive' : 'transient' };
+  }
+}
 
 export async function resolveAllowedUsersWithMap(
   larkAppId: string, raw: string[],

@@ -69,6 +69,7 @@ export interface MessageListenerData {
     includeKeywords?: string[];
     matchMode?: 'any' | 'all';
   };
+  replyPolicy?: { mode?: 'thread' | 'chat'; sessionMode?: 'per_message' };
 }
 
 export interface MessageListenerPreviewItem {

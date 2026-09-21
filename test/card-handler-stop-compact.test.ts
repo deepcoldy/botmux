@@ -94,6 +94,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   withActiveSessionKeyLock: vi.fn(async (_map: any, _key: string, action: () => any) => action()),
   buildStreamingCardJson: vi.fn(),
   silentIdleCardFlag: vi.fn(() => false),
+  idleCardLabel: vi.fn(() => undefined),
   dshRuntimeForSession: vi.fn(() => undefined),
 }));
 

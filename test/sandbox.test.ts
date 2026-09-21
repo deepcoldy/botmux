@@ -316,6 +316,19 @@ describe('validateRelayRequest', () => {
     }
   });
 
+  it('allows only validated urgent modes through the sandbox relay', () => {
+    for (const flag of ['--urgent', '--urgent=app', '--urgent=sms', '--urgent=phone']) {
+      expect(validateRelayRequest({
+        contentFile: 'c.content',
+        flags: [flag, '--mention-back'],
+      })).toMatchObject({ ok: true, value: { flags: [flag, '--mention-back'] } });
+    }
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--urgent=all'],
+    })).toMatchObject({ ok: false, error: 'flag not allowed: --urgent=all' });
+  });
+
   it('accepts a custom card file as a plain outbox basename', () => {
     const r = validateRelayRequest({
       contentFile: 'c.content',

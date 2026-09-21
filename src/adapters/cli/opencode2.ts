@@ -136,6 +136,10 @@ export function createOpenCode2Adapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,
     readyPattern: undefined,
+    // Bubble Tea has no reliable prompt anchor: require 4s of silence before
+    // the FIRST paste so cold start / resume→fresh cannot type into a booting
+    // TUI; later cycles return to the normal 2s window.
+    firstPromptQuiescenceMs: 4_000,
     busyPattern: undefined,
     isSessionBusy({ sessionId, cliSessionId }) {
       const sid = isOpenCodeSessionId(cliSessionId)

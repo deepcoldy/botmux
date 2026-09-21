@@ -1023,7 +1023,7 @@ export interface RelayRequest {
 // (--chat-id/--into/--top-level), and --session-id are NOT allowlisted:
 // content/attachments come from validated outbox files, and session-id is
 // forced by the worker.
-const RELAY_FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash']);
+const RELAY_FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent']);
 const RELAY_FLAGS_VAL = new Set([
   '--mention',
   '--quote',
@@ -1128,6 +1128,7 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       flags.push(f, v); i++; continue;
     }
     if (RELAY_FLAGS_NOVAL.has(f)) { flags.push(f); continue; }
+    if (/^--urgent=(app|sms|phone)$/.test(f)) { flags.push(f); continue; }
     if (RELAY_FLAGS_VAL.has(f)) {
       const v = rawFlags[i + 1];
       if (typeof v !== 'string') return { ok: false, error: `flag ${f} needs a string value` };

@@ -20,7 +20,9 @@ import { scanProjects, scanMultipleProjects, describeProjectDir } from '../servi
 import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeFor, removeRepoWorktree, withWorktreeTargetLock, worktreeRootFor, worktreeSafetyStatus } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { isRemoteBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
+import { isRemoteCliId } from './remote-cli-ids.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
+import { TABLE_AUTO_ROW_STYLE } from '../im/lark/table-style.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { handleProjectGroupRoles } from './dashboard-command/groups.js';
 import { handleGroupSessionsCommand } from './group-sessions-command.js';
@@ -35,7 +37,7 @@ import { logger } from '../utils/logger.js';
 import { replyCardModeFor, updateTurnReplyCard } from './turn-reply-card.js';
 import { publicReplyCardActivity, publicReplyCardTools } from '../im/lark/turn-reply-card.js';
 import { scheduleTimeZone } from '../utils/timezone.js';
-import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring, sendWorkerInput, type WorkerSessionReplyOptions } from './worker-pool.js';
+import { killWorker, teardownAuthoritativePersistentBackingBeforeClose, suspendWorker, forkWorker, forkAdoptWorker, adoptSandboxBlocked, getCurrentCliVersion, postFreshStreamingCard, postPrivateSnapshotCard, resolvePrivateCardAudience, deliverEphemeralOrReply, deliverWritableTerminalCardTo, closeSession as closeWorkerPoolSession, withActiveSessionKeyLock, requestSessionRestart, isSessionTransferring, sendWorkerInput, sendWorkerSessionInput, type WorkerSessionReplyOptions } from './worker-pool.js';
 import {
   expandHome,
   getSessionWorkingDir,
@@ -178,7 +180,7 @@ export function formatSlashGroupName(name: string, prefix = ''): string {
  * worker:null session just to handle it, polluting the dashboard. (Same class
  * of fix as the `/card` / `/term` special cases in daemon.ts.)
  */
-export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/rename', '/fork', '/forklist', '/quote']);
+export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/stop', '/rename', '/fork', '/forklist', '/quote']);
 
 function cliSelectionSnapshot(cliId: CliId): SessionCliLaunchSnapshotV1 {
   const runtime = snapshotCliRuntime(resolveCliRuntime({
@@ -193,6 +195,7 @@ function cliSelectionSnapshot(cliId: CliId): SessionCliLaunchSnapshotV1 {
     cliRuntime: runtime ?? null,
     cliPathOverride: runtime?.source === 'configured' || runtime?.source === 'legacy-path' ? runtime.executable : null,
     wrapperCli: null,
+    cliLaunchMode: null,
     model: null,
     reasoningEffort: null,
     modelBackendVariant: null,
@@ -427,11 +430,7 @@ function buildCloseWorktreeConfirmCard(args: {
     {
       tag: 'table',
       page_size: 10,
-      row_height: 'low',
-      header_style: {
-        text_align: 'left', text_size: 'normal', background_style: 'grey',
-        text_color: 'default', bold: true, lines: 1,
-      },
+      ...TABLE_AUTO_ROW_STYLE,
       columns: [
         { name: 'bot', display_name: t('cmd.close.worktree_col_bot', undefined, loc), data_type: 'text', width: '140px' },
         { name: 'task', display_name: t('cmd.close.worktree_col_task', undefined, loc), data_type: 'text', width: 'auto' },
@@ -1076,10 +1075,11 @@ async function handleScheduleCommand(
     const { executionPosition: requestedPosition, silent, prompt: schedPrompt } = scheduler.extractScheduleModifiers(parsed.prompt);
     // Default to group top-level: a schedule created inside a topic (including
     // an adopted one) must not pin its results to that topic. NL 路径的
-    // extractScheduleModifiers 只有 top-level/new-topic 关键词，没有 topic
-    // 修饰符；topic 执行只能经 CLI --topic 或 Dashboard 表单显式指定。
+    // extractScheduleModifiers 只有 top-level/new-topic/task（独立话题/专属
+    // 话题）关键词，没有 topic 修饰符；topic 执行只能经 CLI --topic 或
+    // Dashboard 表单显式指定。
     const executionPosition = (requestedPosition ?? 'top-level') as ScheduleExecutionPosition;
-    const taskScope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
+    const taskScope: 'thread' | 'chat' = executionPosition === 'topic' || executionPosition === 'task' ? 'thread' : 'chat';
     const schedName = schedPrompt !== parsed.prompt
       ? (schedPrompt.length > 20 ? schedPrompt.slice(0, 20) + '...' : schedPrompt)
       : parsed.name;
@@ -1125,9 +1125,11 @@ async function handleScheduleCommand(
     const positionNote = '\n' + t(
       executionPosition === 'new-topic'
         ? 'schedule.deliver_new_topic'
-        : executionPosition === 'top-level'
-          ? 'schedule.position_top_level'
-          : 'schedule.position_topic',
+        : executionPosition === 'task'
+          ? 'schedulePos.positionNote'
+          : executionPosition === 'top-level'
+            ? 'schedule.position_top_level'
+            : 'schedule.position_topic',
       undefined,
       loc,
     );
@@ -1581,7 +1583,7 @@ export async function handleCardCommand(
  *
  * off    -> suppress the thinking bubble for this chat (add to noCotChats).
  * on     -> restore it for this chat (remove from noCotChats); hints when the
- *           bot-level master switch (`thinkingCard`) is off, since the bubble
+ *           bot-level master switch (`cotEnabled`) is off, since the bubble
  *           won't appear until that is enabled too.
  * show   -> one-shot peek while the switches are off: force the bubble for the
  *           current turn (rendered immediately with everything accumulated so
@@ -1610,7 +1612,7 @@ export async function handleCotCommand(
   const sub = content.replace(/^\/cot\s*/i, '').trim().toLowerCase();
   // Master switch defaults ON — only an explicit false means disabled.
   const masterOn = (() => {
-    try { return getBot(larkAppId).config.thinkingCard !== false; } catch { return false; }
+    try { return getBot(larkAppId).config.cotEnabled !== false; } catch { return false; }
   })();
 
   if (sub === 'off') {
@@ -1638,7 +1640,7 @@ export async function handleCotCommand(
       if (replyCardModeFor(ds, ds.lastThinkingUpdate.turnId) !== 'legacy') {
         const update = ds.lastThinkingUpdate;
         await updateTurnReplyCard(ds, update.turnId, {
-          kind: 'tools', tools: publicReplyCardTools(update.entries, getBot(larkAppId).config.thinkingCardToolResult !== false),
+          kind: 'tools', tools: publicReplyCardTools(update.entries, true),
           activity: publicReplyCardActivity(update.entries),
         }, (body, type, uuid) => deps.sessionReply(rootId, body, type, larkAppId, update.turnId, { uuid }),
         { dispatchAttempt: update.dispatchAttempt, forceVisible: true });
@@ -1658,17 +1660,12 @@ export async function handleCotCommand(
     const chatOff = (() => {
       try { return !!getBot(larkAppId).config.noCotChats?.includes(chatId); } catch { return false; }
     })();
-    // 工具输出子开关是 bot 级（/botconfig set thinkingCardToolResult），这里只读
-    // 展示、不提供 /cot 子命令——避免和群级 on/off 混淆。默认开时不加行。
-    const toolResultOff = (() => {
-      try { return getBot(larkAppId).config.thinkingCardToolResult === false; } catch { return false; }
-    })();
     const status = !masterOn
       ? t('cmd.cot.status_master_off', undefined, loc)
       : chatOff
         ? t('cmd.cot.status_chat_off', undefined, loc)
         : t('cmd.cot.status_on', undefined, loc);
-    await reply(toolResultOff ? `${status}\n${t('cmd.cot.status_result_off', undefined, loc)}` : status);
+    await reply(status);
     return;
   }
 
@@ -2348,6 +2345,30 @@ export async function handleCommand(
         } else {
           await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
         }
+        break;
+      }
+
+      case '/stop': {
+        if (!ds) {
+          await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
+          break;
+        }
+        if (isSessionTransferring(ds)) {
+          await sessionReply(rootId, t('cmd.session.transfer_in_progress', undefined, loc));
+          break;
+        }
+        const effectiveCliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+        if (ds.initConfig?.codexRpcInput === true || effectiveCliId === 'codex-app' || isRemoteCliId(effectiveCliId) || isRemoteBackendSession(ds)) {
+          await sessionReply(rootId, t('cmd.stop.unsupported', undefined, loc));
+          break;
+        }
+        if (!ds.worker || ds.worker.killed) {
+          await sessionReply(rootId, t('cmd.stop.no_worker', undefined, loc));
+          break;
+        }
+        sendWorkerSessionInput(ds, { type: 'term_action', key: 'ctrlc' });
+        logger.info(`[${logTag}] /stop: ^C sent (session kept alive)`);
+        await sessionReply(rootId, t('cmd.stop.sent', { cliName: sessionCliDisplayName(ds) }, loc));
         break;
       }
 
@@ -5346,6 +5367,7 @@ export async function handleCommand(
           t('help.heading_session', undefined, loc),
           t('help.close', { cliName }, loc),
           t('help.cleanup_wt', undefined, loc),
+          t('help.stop', { cliName }, loc),
           t('help.restart', { cliName }, loc),
           t('help.topic', undefined, loc),
           t('help.cd', { cliName }, loc),
@@ -5615,6 +5637,7 @@ export async function startCodexAppThreadSession(
       delete current.session.cliRuntime;
       delete current.session.cliPathOverride;
       delete current.session.wrapperCli;
+      delete current.session.cliLaunchMode;
       delete current.session.model;
       delete current.session.reasoningEffort;
       delete current.session.agentFrozen;

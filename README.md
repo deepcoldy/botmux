@@ -168,6 +168,10 @@ botmux 不重新实现记忆、上下文管理、工具调用、权限体系—�
 
 自助建群服务可通过应用与群绑定的签名，为普通群声明默认 `ambient` 模式：无需 @ 即可对话，只 @ 其他成员时保持安静。功能默认关闭，群级显式设置优先，现有对话与操作权限仍然生效。配置、注册表协议和缓存限制见 [可信群默认模式](docs/signed-chat-defaults.md)。
 
+## 接入自带任务流程的专业能力
+
+外部应用可使用实验版[模型透明代理模式](docs/model-proxy.md)：通过有鉴权的本机 Chat Completions 入口复用 CLI 模型能力，调用方继续管理上下文、工具执行和任务流程。[OpenCodeReview（OCR）](https://github.com/alibaba/open-code-review) 等应用可通过模型 SDK 接入；当前兼容字段、原生 CLI 验证范围及专用身份要求见文档。底层[受约束执行接口](docs/constrained-invocations.md)提供任务查询、取消、幂等和进程回收。
+
 ## 文档 · 社区 · 贡献
 
 - 📖 **完整文档**（命令 / 配置 / 最佳实践 / 排错）：**<https://deepcoldy.github.io/botmux/>**

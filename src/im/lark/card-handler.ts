@@ -15,7 +15,7 @@ import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
 import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
 import { isBotAdmin } from './grant-owner.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard } from './card-builder.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard, frozenIdleLabel } from './card-builder.js';
 import { codexServiceTierBadge } from '../../services/codex-service-tier.js';
 import {
   findConfigField,
@@ -98,7 +98,7 @@ import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
-import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, silentIdleCardFlag, dshRuntimeForSession, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
+import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, canCommitStreamingCardPublication, continuePublishedStreamingCardPinChain, idleCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -207,7 +207,7 @@ export interface CardActionData {
     input_value?: unknown;
     form_value?: Record<string, unknown>;  // V2 form input values
   };
-  context?: { open_message_id?: string; [key: string]: unknown };
+  context?: { open_message_id?: string; open_chat_id?: string; [key: string]: unknown };
   open_message_id?: string;
 }
 
@@ -1449,6 +1449,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
 
   if (isAskCardAction(value?.action)) {
     return handleAskCardAction(data, { larkAppId });
+  }
+
+  if (value?.action === 'oncall_group_create' && larkAppId) {
+    const { handleOncallGroupAction } = await import('./oncall-group.js');
+    return handleOncallGroupAction(data, larkAppId);
   }
 
   if (['feedback_submit', 'feedback_reason', 'feedback_comment', 'skill_feedback_submit'].includes(value?.action ?? '') && larkAppId) {
@@ -3220,7 +3225,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, sessionCliId(ds)),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(sessionCliId(ds), ds.codexServiceTier),
-          silentIdleCardFlag(ds),
+          idleCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
         );
@@ -3734,7 +3739,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
               getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
               sessionRuntimeDisplayName(ds),
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-              silentIdleCardFlag(ds),
+              idleCardLabel(ds),
               dshRuntimeForSession(ds),
               resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
             );
@@ -3783,7 +3788,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           effectiveCliId === 'codex' ? frozen.codexServiceTierBadge : undefined,
-          frozen.silentIdle === true,
+          frozenIdleLabel(frozen),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
         );
@@ -3830,19 +3835,32 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-          silentIdleCardFlag(ds),
+          idleCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
         );
+        logger.info(`[${tag(ds)}] Display mode → ${next}`);
         if (cardMessageId && cardMessageId !== ds.streamCardId) {
           updateMessage(ds.larkAppId, cardMessageId, cardJson).catch(err =>
             logger.debug(`[${tag(ds)}] Failed to migrate clicked legacy card: ${err}`),
           );
-        } else {
-          scheduleCardPatch(ds, cardJson);
+          try { return JSON.parse(cardJson); } catch { /* fall through */ }
+        } else if (!scheduleCardPatch(ds, cardJson)) {
+          // The queue can decline when live cards are disabled for this turn or
+          // transport/card identity is unavailable. In that case the callback
+          // must carry the rebuilt card so the clicked card still updates.
+          try { return JSON.parse(cardJson); } catch { /* fall through */ }
+          return;
         }
-        logger.info(`[${tag(ds)}] Display mode → ${next}`);
-        try { return JSON.parse(cardJson); } catch { /* fall through */ }
+        // The queue accepted this update. Returning the same card here would
+        // make Lark apply a second, synchronous update outside that queue; an
+        // older in-flight PATCH could then land after it and restore stale state.
+        return {
+          toast: {
+            type: 'info',
+            content: t('toast.action_received_bg', undefined, localeForBot(ds.larkAppId)),
+          },
+        };
       }
       logger.info(`[${tag(ds)}] Display mode → ${next}`);
       return;
@@ -3902,7 +3920,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-          silentIdleCardFlag(ds),
+          idleCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
         );
@@ -3980,7 +3998,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-          silentIdleCardFlag(ds),
+          idleCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
         );
@@ -4073,7 +4091,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           getDaemonStreamingCardUsageSnapshot(ds, effectiveCliId),
           sessionRuntimeDisplayName(ds),
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
-          silentIdleCardFlag(ds),
+          idleCardLabel(ds),
           dshRuntimeForSession(ds),
           resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
         );

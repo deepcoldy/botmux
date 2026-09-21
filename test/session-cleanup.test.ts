@@ -3,7 +3,9 @@ import {
   IDLE_CLEANUP_HOUR_OPTIONS,
   cleanupIdleSessions,
   idleCleanupCutoffMs,
+  isDormantCleanupCandidate,
   parseIdleCleanupHours,
+  selectCleanupCandidates,
   selectIdleCleanupCandidates,
 } from '../src/dashboard/session-cleanup.js';
 
@@ -146,8 +148,6 @@ describe('dashboard idle session cleanup selection', () => {
       results: [],
     });
   });
-
-
   it('counts a residual close separately from a clean one', () => {
     // An idle/workerless mojo row can carry a parked lineage, so this path really
     // does produce residuals. Folding them into `closed` reports "closed N,
@@ -169,6 +169,69 @@ describe('dashboard idle session cleanup selection', () => {
       expect(r.closed).toBe(2);
       expect(r.failed).toBe(0);
       expect(r.residual).toBe(1);
+    });
+  });
+
+  describe('dormant (workerless) cleanup candidates', () => {
+    const dormant = (id: string, patch: Record<string, unknown> = {}) =>
+      row(id, { status: 'dormant', lastMessageAt: NOW - 48 * hour, ...patch });
+
+    it('selects a dormant row older than the threshold with no terminal port', () => {
+      expect(isDormantCleanupCandidate(dormant('old-dormant'), 24, NOW)).toBe(true);
+    });
+
+    it('rejects a dormant row newer than the threshold', () => {
+      expect(isDormantCleanupCandidate(dormant('new-dormant', { lastMessageAt: NOW - 2 * hour }), 24, NOW)).toBe(false);
+    });
+
+    it('rejects a dormant row that still advertises a live terminal port', () => {
+      expect(isDormantCleanupCandidate(dormant('with-port', { webPort: 41235 }), 24, NOW)).toBe(false);
+    });
+
+    it('rejects dormant rows that are locked or carry pending work / attention', () => {
+      expect(isDormantCleanupCandidate(dormant('locked', { locked: true }), 24, NOW)).toBe(false);
+      expect(isDormantCleanupCandidate(dormant('pending-repo', { pendingRepo: true }), 24, NOW)).toBe(false);
+      expect(isDormantCleanupCandidate(dormant('tui-prompt', { tuiPromptActive: true }), 24, NOW)).toBe(false);
+      expect(isDormantCleanupCandidate(
+        dormant('agent-attention', { agentAttention: { kind: 'blocked', reason: 'needs input', at: NOW - 48 * hour } }),
+        24, NOW,
+      )).toBe(false);
+    });
+
+    it('splits idle and dormant rows in the categorized selector', () => {
+      const selected = selectCleanupCandidates([
+        row('old-idle'),
+        dormant('old-dormant'),
+        row('new-idle', { lastMessageAt: NOW - 2 * hour }),
+        dormant('dormant-with-port', { webPort: 41235 }),
+        row('working', { status: 'working', lastMessageAt: NOW - 48 * hour }),
+      ], 24, NOW);
+
+      expect(selected.idle.map(s => s.sessionId)).toEqual(['old-idle']);
+      expect(selected.dormant.map(s => s.sessionId)).toEqual(['old-dormant']);
+    });
+
+    it('closes the union of idle and dormant candidates row by row', async () => {
+      const closed: string[] = [];
+      const result = await cleanupIdleSessions([
+        row('old-idle'),
+        dormant('old-dormant'),
+        dormant('dormant-fails'),
+        dormant('dormant-with-port', { webPort: 41235 }),
+        row('working', { status: 'working', lastMessageAt: NOW - 48 * hour }),
+      ], 24, async (candidate) => {
+        if (candidate.sessionId === 'dormant-fails') {
+          return { sessionId: candidate.sessionId, ok: false, error: 'close_failed' };
+        }
+        closed.push(candidate.sessionId);
+        return { sessionId: candidate.sessionId, ok: true };
+      }, NOW);
+
+      expect(closed).toEqual(['old-idle', 'old-dormant']);
+      expect(result.matched).toBe(3);
+      expect(result.closed).toBe(2);
+      expect(result.failed).toBe(1);
+      expect(result.results.map(r => r.sessionId)).toEqual(['old-idle', 'old-dormant', 'dormant-fails']);
     });
   });
 });

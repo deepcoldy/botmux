@@ -87,4 +87,17 @@ describe('worker interrupt action integration', () => {
     const start = workerSource.indexOf("case 'term_action':");
     expect(workerSource.slice(start, start + 160)).toContain('await handleTermAction(msg.key)');
   });
+
+  it('rejects viewer/RPC Codex modes before any PTY control key is sent', () => {
+    const start = workerSource.indexOf('async function handleExactTurnInterrupt');
+    const end = workerSource.indexOf('/** Key name → ANSI escape sequence', start);
+    expect(start).toBeGreaterThanOrEqual(0);
+    const region = workerSource.slice(start, end);
+    const unsupported = region.indexOf("reason: 'unsupported'");
+    const controlWrite = region.indexOf("sendCriticalControlKey('ctrlc'");
+    expect(region).toContain("lastInitConfig?.cliId === 'codex-app'");
+    expect(region).toContain('lastInitConfig?.codexRpcInput === true');
+    expect(unsupported).toBeGreaterThanOrEqual(0);
+    expect(controlWrite).toBeGreaterThan(unsupported);
+  });
 });

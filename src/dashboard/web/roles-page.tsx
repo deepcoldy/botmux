@@ -94,12 +94,12 @@ function sameStringList(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((value, index) => value === b[index]);
 }
 
-type FlashState = { text: string; isError?: boolean; id: number } | null;
+export type FlashState = { text: string; isError?: boolean; id: number } | null;
 type ApplyStatus =
   | { kind: 'idle' }
   | { kind: 'text'; text: string }
   | { kind: 'results'; preview: boolean; results: RoleProfileApplyResult[] };
-type ListenerPreviewStatus =
+export type ListenerPreviewStatus =
   | { kind: 'idle' }
   | { kind: 'loading'; mode: 'preview' | 'run' }
   | { kind: 'result'; response: MessageListenerPreviewResponse; mode: 'preview' | 'run' }
@@ -119,7 +119,7 @@ const DEFAULT_LISTENER: MessageListenerData = {
   },
 };
 
-function cloneListener(listener: MessageListenerData | null | undefined): MessageListenerData {
+export function cloneListener(listener: MessageListenerData | null | undefined): MessageListenerData {
   // Mirror the backend storage default: persisted configs OMIT `mode` when it
   // equals 'all_except_excluded' (see message-listener-store sanitize +
   // bot-registry normalize), so an ABSENT mode means all_except_excluded, NOT
@@ -147,6 +147,7 @@ function cloneListener(listener: MessageListenerData | null | undefined): Messag
       includeMsgTypes: [...(listener?.messagePolicy?.includeMsgTypes ?? DEFAULT_LISTENER.messagePolicy?.includeMsgTypes ?? [])],
       scope: 'top_level',
     },
+    replyPolicy: { mode: listener?.replyPolicy?.mode === 'chat' ? 'chat' : 'thread', sessionMode: 'per_message' },
     ...(listener?.contentPolicy ? {
       contentPolicy: {
         ...(listener.contentPolicy.includeKeywords ? { includeKeywords: [...listener.contentPolicy.includeKeywords] } : {}),
@@ -757,6 +758,7 @@ function RolesPage(props: { tab: RolesTab }) {
         scope: 'top_level',
       },
       ...(contentPolicy ? { contentPolicy } : {}),
+      replyPolicy: { mode: editingListener.replyPolicy?.mode === 'chat' ? 'chat' : 'thread', sessionMode: 'per_message' },
     };
   }
 
@@ -1146,14 +1148,6 @@ function RolesPage(props: { tab: RolesTab }) {
                   onClick={() => setGroupEditorSection('role')}
                 >
                   {tr('roles.roleTab')}
-                </button>
-                <button
-                  type="button"
-                  className={groupEditorSection === 'listener' ? 'active' : ''}
-                  aria-pressed={groupEditorSection === 'listener'}
-                  onClick={() => setGroupEditorSection('listener')}
-                >
-                  {tr('roles.listenerTab')}
                 </button>
               </div>
               {groupEditorSection === 'role' ? (
@@ -1546,7 +1540,7 @@ function GroupProfileStatus(props: {
   );
 }
 
-function MessageListenerEditor(props: {
+export function MessageListenerEditor(props: {
   listener: MessageListenerData;
   members: GroupMemberDisplay[];
   memberById: Map<string, GroupMemberDisplay>;
@@ -1556,6 +1550,7 @@ function MessageListenerEditor(props: {
   flash: FlashState;
   previewLimit: number;
   previewStatus: ListenerPreviewStatus;
+  previewScope?: string;
   tr: Translator;
   onPatch(patch: Partial<MessageListenerData>): void;
   onSenderPolicyPatch(patch: NonNullable<MessageListenerData['senderPolicy']>): void;
@@ -1700,6 +1695,19 @@ function MessageListenerEditor(props: {
           />
         </label>
       </div>
+      <div className="roles-listener-reply-placement">
+        <label className="roles-listener-field" style={{ maxWidth: 320 }}>
+          <span className="roles-field-label">{tr('roles.listenerReplyPlacement')}</span>
+          <select
+            value={listener.replyPolicy?.mode === 'chat' ? 'chat' : 'thread'}
+            onChange={ev => props.onPatch({ replyPolicy: { mode: ev.currentTarget.value === 'chat' ? 'chat' : 'thread', sessionMode: 'per_message' } })}
+          >
+            <option value="thread">{tr('roles.listenerReplyPlacementThread')}</option>
+            <option value="chat">{tr('roles.listenerReplyPlacementChat')}</option>
+          </select>
+        </label>
+        <small className="roles-listener-reply-placement-help">{tr('roles.listenerReplyPlacementHelp')}</small>
+      </div>
       <div className="roles-listener-policy-row">
         <div className="roles-listener-policy">
           <div className="roles-field-label">{tr('roles.listenerSenderTypes')}</div>
@@ -1814,7 +1822,7 @@ function MessageListenerEditor(props: {
         </span>
         <Flash flash={props.flash} />
       </div>
-      <div className="roles-listener-preview-panel">
+      <div className="roles-listener-preview-panel" data-listener-preview-scope={props.previewScope}>
         <div className="roles-listener-preview-head">
           <div>
             <div className="roles-profile-section-title">{tr('roles.listenerPreviewTitle')}</div>

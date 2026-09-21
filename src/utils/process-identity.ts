@@ -56,6 +56,24 @@ export function readProcessStartIdentity(pid: number): string | undefined {
     }
     return undefined;
   }
+  if (process.platform === 'win32') {
+    try {
+      const started = execFileSync('powershell.exe', [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `$p = Get-CimInstance Win32_Process -Filter \"ProcessId = ${pid}\"; `
+          + 'if ($p) { $p.CreationDate.ToUniversalTime().Ticks }',
+      ], {
+        encoding: 'utf-8',
+        timeout: 2_000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      return started || undefined;
+    } catch {
+      return undefined;
+    }
+  }
   const ps = systemPsBin();
   if (!ps) return undefined;
   try {

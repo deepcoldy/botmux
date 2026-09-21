@@ -3,12 +3,14 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   create: vi.fn(),
   reply: vi.fn(),
+  request: vi.fn(),
   emitHookEvent: vi.fn(),
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
   getBotClient: () => ({
     im: { v1: { message: { create: mocks.create, reply: mocks.reply } } },
+    request: mocks.request,
   }),
   getAllBots: () => [],
   getBot: vi.fn(),
@@ -20,12 +22,13 @@ vi.mock('../src/services/hook-runner.js', () => ({
   emitHookEvent: mocks.emitHookEvent,
 }));
 
-import { replyMessage, sendMessage } from '../src/im/lark/client.js';
+import { replyMessage, sendMessage, urgentMessage } from '../src/im/lark/client.js';
 
 describe('Lark outbound hook provider replay suppression', () => {
   beforeEach(() => {
     mocks.create.mockReset().mockResolvedValue({ code: 0, data: { message_id: 'om_send' } });
     mocks.reply.mockReset().mockResolvedValue({ code: 0, data: { message_id: 'om_reply' } });
+    mocks.request.mockReset().mockResolvedValue({ code: 0 });
     mocks.emitHookEvent.mockReset();
   });
 
@@ -100,5 +103,17 @@ describe('Lark outbound hook provider replay suppression', () => {
     )).resolves.toBe('om_send');
     expect(beforeHook).toHaveBeenCalledOnce();
     expect(mocks.emitHookEvent).not.toHaveBeenCalled();
+  });
+
+  it('sends each Buzz mode through the matching PATCH endpoint', async () => {
+    for (const mode of ['app', 'sms', 'phone'] as const) {
+      await urgentMessage('app', 'om_send', ['ou_user', 'ou_user'], mode);
+      expect(mocks.request).toHaveBeenLastCalledWith({
+        method: 'PATCH',
+        url: `/open-apis/im/v1/messages/om_send/urgent_${mode}`,
+        params: { user_id_type: 'open_id' },
+        data: { user_id_list: ['ou_user'] },
+      });
+    }
   });
 });

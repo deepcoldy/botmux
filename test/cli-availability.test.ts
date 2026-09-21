@@ -36,6 +36,7 @@ describe('CLI launch availability', () => {
     expect(hasAgentLaunchConfigChanged(current, { ...current, cliId: 'claude-code' })).toBe(true);
     expect(hasAgentLaunchConfigChanged(current, { ...current, cliPathOverride: '/usr/bin/codex' })).toBe(true);
     expect(hasAgentLaunchConfigChanged(current, { ...current, wrapperCli: 'ttadk codex' })).toBe(true);
+    expect(hasAgentLaunchConfigChanged(current, { ...current, cliLaunchMode: 'forge-traex' })).toBe(true);
   });
 
   it('keeps PATH-only checks shell-free by avoiding adapter resolvedBin getters', () => {
@@ -95,6 +96,53 @@ describe('CLI launch availability', () => {
       available: false,
       command: '/definitely/missing/mircli',
     });
+  });
+
+  it('requires both traex and forge for Forge x TraeX launch mode', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-cli-availability-'));
+    try {
+      const forge = executable(dir, 'forge');
+      executable(dir, 'traex');
+      process.env.PATH = dir;
+
+      expect(checkCliAvailability({
+        cliId: 'traex',
+        cliLaunchMode: 'forge-traex',
+      }, { shellFallback: false })).toMatchObject({
+        available: true,
+        command: 'forge',
+        resolvedPath: forge,
+      });
+
+      rmSync(forge);
+      const missingForge = checkCliAvailability({
+        cliId: 'traex',
+        cliLaunchMode: 'forge-traex',
+      }, { shellFallback: false });
+      expect(missingForge).toMatchObject({ available: false, command: 'forge' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('runs forge doctor when shell fallback checks are enabled', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-cli-availability-'));
+    try {
+      executable(dir, 'traex');
+      const forge = join(dir, 'forge');
+      writeFileSync(forge, '#!/bin/sh\nif [ "$1" = doctor ]; then exit 7; fi\nexit 0\n');
+      chmodSync(forge, 0o755);
+      process.env.PATH = dir;
+
+      const result = checkCliAvailability({
+        cliId: 'traex',
+        cliLaunchMode: 'forge-traex',
+      });
+      expect(result.available).toBe(false);
+      expect(result.reason).toContain('forge doctor 检查失败');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('does not require a local executable for API-backed agents', () => {

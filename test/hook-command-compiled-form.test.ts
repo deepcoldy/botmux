@@ -39,6 +39,7 @@ import {
   hookCommandFor,
   nativeSubagentRuntimeHookCommand,
   sessionReadyHookCommand,
+  statuslineHookCommand,
   userPromptHookCommand,
 } from '../src/adapters/hook-command.js';
 
@@ -58,6 +59,7 @@ describe('hook-command — compiled binary form', () => {
       hookCommandFor('claude-code'),
       sessionReadyHookCommand(),
       userPromptHookCommand(),
+      statuslineHookCommand(),
       nativeSubagentRuntimeHookCommand(),
       ...hookCommandParts('claude-code').args,
       hookCommandParts('claude-code').cmd,
@@ -77,6 +79,8 @@ describe('hook-command — compiled binary form', () => {
     expect(hookCommandFor('claude-code')).toBe(`"${process.execPath}" hook claude-code`);
     expect(sessionReadyHookCommand()).toBe(`"${process.execPath}" session-ready`);
     expect(userPromptHookCommand()).toBe(`"${process.execPath}" user-prompt-hook`);
+    // statusLine.command 走进程级 --settings，同样由 Claude 经 shell 执行。
+    expect(statuslineHookCommand()).toBe(`"${process.execPath}" statusline`);
     expect(nativeSubagentRuntimeHookCommand()).toMatch(
       /^".+[/\\]\.botmux[/\\]bin[/\\]botmux-native-subagent-runtime-hook(?:\.cmd)?"$/,
     );
@@ -135,6 +139,7 @@ describe('hook-command — Node form stays byte-identical', () => {
     const script = hookCommandParts('x').args[0];
     expect(sessionReadyHookCommand()).toBe(`"${process.execPath}" "${script}" session-ready`);
     expect(userPromptHookCommand()).toBe(`"${process.execPath}" "${script}" user-prompt-hook`);
+    expect(statuslineHookCommand()).toBe(`"${process.execPath}" "${script}" statusline`);
     expect(nativeSubagentRuntimeHookCommand()).toMatch(
       /^".+[/\\]\.botmux[/\\]bin[/\\]botmux-native-subagent-runtime-hook(?:\.cmd)?"$/,
     );
