@@ -134,7 +134,7 @@ onError: fallback_llm
     expect(replies.at(-1)).toContain('/新命令');
   });
 
-  it('requires an explicit frozen-command admin at both prepare and confirm', async () => {
+  it('uses admin only to claim a legacy command, then lets its owner manage it', async () => {
     const { botRegistry, daemon } = await loadFreshModules();
     const workingDir = tempDir('frozen-lifecycle-auth');
     mkdirSync(join(workingDir, '.botmux', 'commands'), { recursive: true });
@@ -171,7 +171,7 @@ onError: fail
       cmd: '/freeze', commandContent: '/freeze rm /权限测试 --reason 越权尝试',
       senderOpenId: 'ou_owner', senderIsBot: false,
     });
-    expect(replies.at(-1)).toContain('无权发起');
+    expect(replies.at(-1)).toContain('管理员接管');
     expect(replies.at(-1)).not.toContain('/freeze confirm');
 
     for (const senderIsBot of [true, undefined]) {
@@ -184,25 +184,36 @@ onError: fail
     }
 
     await route({
-      cmd: '/freeze', commandContent: '/freeze rm /权限测试 --reason 合法废弃',
+      cmd: '/freeze', commandContent: '/freeze approve /权限测试 --reason 接管历史命令',
       senderOpenId: 'ou_owner', senderUnionId: 'on_owner', senderIsBot: false,
     });
-    const token = lifecycleCardToken(replies.at(-1)!);
-    expect(token).toBeTruthy();
+    const claimToken = lifecycleCardToken(replies.at(-1)!);
+    expect(claimToken).toBeTruthy();
+    await route({
+      cmd: '/freeze', commandContent: `/freeze confirm ${claimToken}`,
+      senderOpenId: 'ou_owner', senderUnionId: 'on_owner', senderIsBot: false,
+    });
+    expect(replies.at(-1)).toContain('已批准');
 
-    // Authorization is checked again at confirmation time. A once-authorized
-    // token cannot outlive a permission revocation.
+    // Ownership survives removal from the break-glass admin list.
     bot.config.frozenCommandAdmins = [];
     await route({
-      cmd: '/freeze', commandContent: `/freeze confirm ${token}`,
+      cmd: '/freeze', commandContent: '/freeze rm /权限测试 --reason owner 合法废弃',
+      senderOpenId: 'ou_other', senderUnionId: 'on_other', senderIsBot: false,
+    });
+    expect(replies.at(-1)).toContain('owner');
+    expect(replies.at(-1)).not.toContain('/freeze confirm');
+
+    await route({
+      cmd: '/freeze', commandContent: '/freeze rm /权限测试 --reason owner 合法废弃',
       senderOpenId: 'ou_owner', senderUnionId: 'on_owner', senderIsBot: false,
     });
-    expect(replies.at(-1)).toContain('无权确认');
+    const retireToken = lifecycleCardToken(replies.at(-1)!);
+    expect(retireToken).toBeTruthy();
     expect(readFileSync(definitionPath, 'utf8')).not.toContain('status: retired');
 
-    bot.config.frozenCommandAdmins = ['on_owner'];
     await route({
-      cmd: '/freeze', commandContent: `/freeze confirm ${token}`,
+      cmd: '/freeze', commandContent: `/freeze confirm ${retireToken}`,
       senderOpenId: 'ou_owner', senderUnionId: 'on_owner', senderIsBot: false,
     });
     expect(replies.at(-1)).toContain('已废弃');

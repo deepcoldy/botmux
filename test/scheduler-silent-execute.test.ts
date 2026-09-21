@@ -603,10 +603,13 @@ onError: fallback_llm
         command: '/泰国上账',
         action: 'retire',
         actor,
+        actorIsAdmin: true,
         reason: '改用新命令',
         replacement: '/新命令',
       });
-      confirmFrozenCommandTransition({ dataDir, targetBotId: APP, token: pending.token, actor });
+      confirmFrozenCommandTransition({
+        dataDir, targetBotId: APP, token: pending.token, actor, actorIsAdmin: true,
+      });
 
       await executeScheduledTask(baseTask({
         prompt: '/泰国上账',

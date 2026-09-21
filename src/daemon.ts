@@ -5646,14 +5646,12 @@ async function routeFrozenCommand(input: {
     if (confirmMatch) {
       try {
         if (input.senderIsBot !== false) throw new Error('只有身份明确的真人消息可以确认固化命令状态变更');
-        if (!canManageFrozenCommands(input.larkAppId, input.senderUnionId)) {
-          throw new Error('当前用户无权确认固化命令状态变更');
-        }
         const record = confirmFrozenCommandTransition({
           dataDir: config.session.dataDir,
           targetBotId: input.larkAppId,
           token: confirmMatch[1]!,
           actor: { openId: input.senderOpenId, unionId: input.senderUnionId },
+          actorIsAdmin: canManageFrozenCommands(input.larkAppId, input.senderUnionId),
         });
         const status = record.confirmedAction === 'approve'
           ? '已批准'
@@ -5682,9 +5680,6 @@ async function routeFrozenCommand(input: {
     if (transition) {
       try {
         if (input.senderIsBot !== false) throw new Error('只有身份明确的真人消息可以发起固化命令状态变更');
-        if (!canManageFrozenCommands(input.larkAppId, input.senderUnionId)) {
-          throw new Error('当前用户无权发起固化命令状态变更');
-        }
         const prepared = prepareFrozenCommandTransition({
           dataDir: config.session.dataDir,
           targetBotId: input.larkAppId,
@@ -5692,6 +5687,7 @@ async function routeFrozenCommand(input: {
           command: transition.command,
           action: transition.action,
           actor: { openId: input.senderOpenId, unionId: input.senderUnionId },
+          actorIsAdmin: canManageFrozenCommands(input.larkAppId, input.senderUnionId),
           reason: transition.reason,
           replacement: transition.replacement,
         });
@@ -6540,10 +6536,6 @@ async function handleFrozenCommandCardAction(
     if (!operator.openId || !operator.unionId) {
       return { toast: { type: 'error', content: '无法确认当前操作者身份' } };
     }
-    if (actionKind === FROZEN_COMMAND_LIFECYCLE_CONFIRM
-      && !canManageFrozenCommands(larkAppId, operator.unionId)) {
-      return { toast: { type: 'error', content: '仅发起操作的同一真人且仍有管理权限时可以确认' } };
-    }
     try {
       if (actionKind === FROZEN_COMMAND_LIFECYCLE_CANCEL) {
         const cancelled = cancelFrozenCommandTransition({
@@ -6569,6 +6561,7 @@ async function handleFrozenCommandCardAction(
         targetBotId: larkAppId,
         token,
         actor: { openId: operator.openId, unionId: operator.unionId },
+        actorIsAdmin: canManageFrozenCommands(larkAppId, operator.unionId),
       });
       return {
         card: {
@@ -7698,9 +7691,6 @@ ipcRoute('POST', '/api/frozen-command-actions', async (req, res) => {
     });
   }
   if (body.operation !== 'run') {
-    if (!canManageFrozenCommands(ds.larkAppId, actor.requestUserUnionId)) {
-      return jsonRes(res, 403, { ok: false, error: 'operation_not_allowed' });
-    }
     const action: FrozenCommandLifecycleAction = body.operation;
     let prepared;
     try {
@@ -7714,12 +7704,16 @@ ipcRoute('POST', '/api/frozen-command-actions', async (req, res) => {
           openId: actor.requestUserOpenId,
           unionId: actor.requestUserUnionId,
         },
+        actorIsAdmin: canManageFrozenCommands(ds.larkAppId, actor.requestUserUnionId),
         reason: body.reason!,
         ...(body.replacement ? { replacement: body.replacement } : {}),
         ...(body.definitionYaml ? { candidateYaml: body.definitionYaml } : {}),
       });
     } catch (error) {
-      return jsonRes(res, 409, {
+      const permissionDenied = error instanceof FrozenCommandError
+        && ['transition_owner_mismatch', 'transition_owner_missing', 'transition_admin_required']
+          .includes(error.code);
+      return jsonRes(res, permissionDenied ? 403 : 409, {
         ok: false,
         error: error instanceof FrozenCommandError ? error.code : 'transition_prepare_failed',
         detail: error instanceof Error ? error.message : String(error),

@@ -43,6 +43,8 @@ export interface FrozenCommandLifecycleRecord {
   commandPath: string;
   command: string;
   state: FrozenCommandLifecycleState;
+  /** Tenant-stable identity of the human who first confirmed creation. */
+  ownerUnionId?: string;
   specHash?: string;
   stateRevisionId: string;
   tombstonePayload?: FrozenCommandTombstonePayload;
@@ -88,6 +90,7 @@ CREATE TABLE IF NOT EXISTS command_lifecycle (
   command_path TEXT NOT NULL,
   command TEXT NOT NULL,
   state TEXT NOT NULL CHECK(state IN ('active','retired','revoked')),
+  owner_union_id TEXT,
   spec_hash TEXT,
   state_revision_id TEXT NOT NULL,
   tombstone_payload_json TEXT,
@@ -105,6 +108,8 @@ CREATE TABLE IF NOT EXISTS pending_transitions (
   actor_id TEXT NOT NULL,
   actor_open_id TEXT,
   actor_union_id TEXT,
+  owner_union_id TEXT NOT NULL,
+  requires_admin INTEGER NOT NULL DEFAULT 0,
   reason TEXT NOT NULL,
   replacement TEXT,
   expected_spec_hash TEXT,
@@ -124,6 +129,7 @@ CREATE TABLE IF NOT EXISTS command_audit (
   next_state TEXT NOT NULL,
   actor_open_id TEXT,
   actor_union_id TEXT,
+  owner_union_id TEXT,
   reason TEXT NOT NULL,
   replacement TEXT,
   spec_hash TEXT,
@@ -134,17 +140,37 @@ CREATE INDEX IF NOT EXISTS idx_pending_expiry ON pending_transitions(expires_at)
 `;
 
 function ensureSchemaColumns(db: DatabaseSyncLike): void {
-  const columns = db.prepare('PRAGMA table_info(pending_transitions)').all() as Array<{ name: string }>;
-  if (!columns.some(column => column.name === 'candidate_yaml')) {
+  function addColumn(table: string, column: string, definition: string): void {
+    const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    if (columns.some(item => item.name === column)) return;
     try {
-      db.exec('ALTER TABLE pending_transitions ADD COLUMN candidate_yaml TEXT;');
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`);
     } catch (error) {
       // Several bot daemons share this host ledger and can cross the same
       // migration edge. Suppress only the proven "another daemon won" case.
-      const after = db.prepare('PRAGMA table_info(pending_transitions)').all() as Array<{ name: string }>;
-      if (!after.some(column => column.name === 'candidate_yaml')) throw error;
+      const after = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      if (!after.some(item => item.name === column)) throw error;
     }
   }
+  addColumn('pending_transitions', 'candidate_yaml', 'TEXT');
+  addColumn('command_lifecycle', 'owner_union_id', 'TEXT');
+  addColumn('pending_transitions', 'owner_union_id', 'TEXT');
+  addColumn('pending_transitions', 'requires_admin', 'INTEGER NOT NULL DEFAULT 0');
+  addColumn('command_audit', 'owner_union_id', 'TEXT');
+
+  // The audit actor on the first successful approval is the best available
+  // creator identity for ledgers written before per-command ownership existed.
+  db.exec(`UPDATE command_lifecycle
+    SET owner_union_id = (
+      SELECT actor_union_id FROM command_audit
+      WHERE command_audit.target_bot_id = command_lifecycle.target_bot_id
+        AND command_audit.command_path = command_lifecycle.command_path
+        AND command_audit.command = command_lifecycle.command
+        AND command_audit.action = 'approve'
+        AND command_audit.actor_union_id LIKE 'on_%'
+      ORDER BY command_audit.at ASC LIMIT 1
+    )
+    WHERE owner_union_id IS NULL;`);
 }
 
 function sha256(value: string): string {
@@ -178,6 +204,17 @@ export function frozenCommandTombstoneHash(payload: FrozenCommandTombstonePayloa
 
 function actorId(actor: FrozenCommandActor): string | undefined {
   return actor.unionId?.trim() || actor.openId?.trim() || undefined;
+}
+
+function actorUnionId(actor: FrozenCommandActor): string {
+  const unionId = actor.unionId?.trim();
+  if (!unionId?.startsWith('on_')) {
+    throw new FrozenCommandError(
+      'transition_actor_untrusted',
+      '只有可验证 union_id 的真人可以变更固化命令状态',
+    );
+  }
+  return unionId;
 }
 
 function commandKey(workingDir: string, rawCommand: string): { command: string; commandPath: string } {
@@ -256,6 +293,7 @@ interface LifecycleRow {
   command_path: string;
   command: string;
   state: FrozenCommandLifecycleState;
+  owner_union_id: string | null;
   spec_hash: string | null;
   state_revision_id: string;
   tombstone_payload_json: string | null;
@@ -275,6 +313,7 @@ function parseRecord(row: LifecycleRow): FrozenCommandLifecycleRecord {
     commandPath: row.command_path,
     command: row.command,
     state: row.state,
+    ...(row.owner_union_id ? { ownerUnionId: row.owner_union_id } : {}),
     ...(row.spec_hash ? { specHash: row.spec_hash } : {}),
     stateRevisionId: row.state_revision_id,
     ...(tombstonePayload ? { tombstonePayload } : {}),
@@ -455,6 +494,8 @@ export function prepareFrozenCommandTransition(input: {
   command: string;
   action: FrozenCommandLifecycleAction;
   actor: FrozenCommandActor;
+  /** Fresh per-Bot break-glass authority. Owners do not need this. */
+  actorIsAdmin?: boolean;
   reason: string;
   replacement?: string;
   /** Candidate source for create/update. When present, it is validated and
@@ -462,8 +503,8 @@ export function prepareFrozenCommandTransition(input: {
   candidateYaml?: string;
   now?: Date;
 }): FrozenCommandPreparedTransition {
-  const id = actorId(input.actor);
-  if (!id) throw new FrozenCommandError('transition_actor_untrusted', '只有可验证的真人身份可以变更固化命令状态');
+  const ownerActor = actorUnionId(input.actor);
+  const id = actorId(input.actor)!;
   const key = commandKey(input.workingDir, input.command);
   const now = input.now ?? new Date();
   const reason = normalizeReason(input.reason);
@@ -478,6 +519,23 @@ export function prepareFrozenCommandTransition(input: {
   let expectedRevisionId: string | undefined;
   withDb(input.dataDir, db => transaction(db, () => {
     const current = selectRecord(db, input.targetBotId, key.commandPath, key.command);
+    const definitionExists = existsSync(key.commandPath);
+    const requiresAdmin = input.action === 'revoke' || (current?.ownerUnionId
+      ? current.ownerUnionId !== ownerActor
+      : current !== undefined || definitionExists);
+    if (requiresAdmin && !input.actorIsAdmin) {
+      throw new FrozenCommandError(
+        input.action === 'revoke'
+          ? 'transition_admin_required'
+          : current?.ownerUnionId ? 'transition_owner_mismatch' : 'transition_owner_missing',
+        input.action === 'revoke'
+          ? `/${key.command} 的彻底撤销只能由固化命令管理员执行`
+          : current?.ownerUnionId
+            ? `只有 /${key.command} 的 owner 或固化命令管理员可以变更该命令`
+            : `/${key.command} 尚无可验证 owner，只能由固化命令管理员接管`,
+      );
+    }
+    const ownerUnionId = current?.ownerUnionId ?? ownerActor;
     previousSpecHash = current?.specHash;
     expectedRevisionId = current?.stateRevisionId;
     let expectedSpecHash: string | undefined;
@@ -523,10 +581,12 @@ export function prepareFrozenCommandTransition(input: {
     db.prepare('DELETE FROM pending_transitions WHERE expires_at <= ?').run(now.toISOString());
     db.prepare(`INSERT INTO pending_transitions (
       token_hash,target_bot_id,command_path,command,action,actor_id,actor_open_id,actor_union_id,
-      reason,replacement,expected_spec_hash,expected_revision_id,candidate_yaml,expires_at,created_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      owner_union_id,requires_admin,reason,replacement,expected_spec_hash,expected_revision_id,
+      candidate_yaml,expires_at,created_at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       sha256(token), input.targetBotId, key.commandPath, key.command, input.action, id,
-      input.actor.openId ?? null, input.actor.unionId ?? null, reason, replacement ?? null,
+      input.actor.openId ?? null, ownerActor, ownerUnionId, requiresAdmin ? 1 : 0,
+      reason, replacement ?? null,
       expectedSpecHash ?? null, current?.stateRevisionId ?? null, input.candidateYaml ?? null,
       expiresAt, now.toISOString(),
     );
@@ -553,6 +613,8 @@ interface PendingRow {
   actor_id: string;
   actor_open_id: string | null;
   actor_union_id: string | null;
+  owner_union_id: string | null;
+  requires_admin: number;
   reason: string;
   replacement: string | null;
   expected_spec_hash: string | null;
@@ -566,10 +628,12 @@ export function confirmFrozenCommandTransition(input: {
   targetBotId: string;
   token: string;
   actor: FrozenCommandActor;
+  /** Re-read at click time; required only for admin overrides/legacy claims. */
+  actorIsAdmin?: boolean;
   now?: Date;
 }): FrozenCommandLifecycleRecord {
-  const id = actorId(input.actor);
-  if (!id) throw new FrozenCommandError('transition_actor_untrusted', '只有发起确认的真人可以执行状态变更');
+  const ownerActor = actorUnionId(input.actor);
+  const id = actorId(input.actor)!;
   const now = input.now ?? new Date();
   const record = withDb(input.dataDir, db => transaction(db, () => {
     const pending = db.prepare('SELECT * FROM pending_transitions WHERE token_hash = ?')
@@ -580,6 +644,9 @@ export function confirmFrozenCommandTransition(input: {
     if (pending.actor_id !== id) {
       throw new FrozenCommandError('transition_confirmation_actor_mismatch', '必须由发起变更的同一真人确认');
     }
+    if (!pending.owner_union_id?.startsWith('on_')) {
+      throw new FrozenCommandError('transition_stale', '旧版确认卡缺少 owner 绑定，请重新发起');
+    }
     if (Date.parse(pending.expires_at) <= now.getTime()) {
       db.prepare('DELETE FROM pending_transitions WHERE token_hash = ?').run(pending.token_hash);
       throw new FrozenCommandError('transition_confirmation_expired', '确认已过期，请重新发起');
@@ -587,6 +654,18 @@ export function confirmFrozenCommandTransition(input: {
     const current = selectRecord(db, pending.target_bot_id, pending.command_path, pending.command);
     if ((pending.expected_revision_id ?? null) !== (current?.stateRevisionId ?? null)) {
       throw new FrozenCommandError('transition_stale', '命令状态在确认前已变化，请重新发起');
+    }
+    if (pending.requires_admin === 1 && !input.actorIsAdmin) {
+      throw new FrozenCommandError('transition_admin_required', '管理员权限已失效，请重新发起');
+    }
+    if (current?.ownerUnionId && current.ownerUnionId !== ownerActor && !input.actorIsAdmin) {
+      throw new FrozenCommandError('transition_owner_mismatch', '只有命令 owner 或固化命令管理员可以确认变更');
+    }
+    if (current?.ownerUnionId && current.ownerUnionId !== pending.owner_union_id) {
+      throw new FrozenCommandError('transition_stale', '命令 owner 在确认前已变化，请重新发起');
+    }
+    if (!current && pending.requires_admin === 0 && existsSync(pending.command_path)) {
+      throw new FrozenCommandError('transition_stale', '同名命令在确认前已出现，请重新发起');
     }
     const revisionId = randomUUID();
     let nextState: FrozenCommandLifecycleState;
@@ -676,24 +755,27 @@ export function confirmFrozenCommandTransition(input: {
     }
     if (!specHash || !HASH_RE.test(specHash)) throw new FrozenCommandError('lifecycle_hash_invalid', '命令定义 hash 缺失');
     db.prepare(`INSERT INTO command_lifecycle (
-      target_bot_id,command_path,command,state,spec_hash,state_revision_id,
+      target_bot_id,command_path,command,state,owner_union_id,spec_hash,state_revision_id,
       tombstone_payload_json,tombstone_hash,source_yaml,updated_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?)
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(target_bot_id,command_path,command) DO UPDATE SET
-      state=excluded.state,spec_hash=excluded.spec_hash,state_revision_id=excluded.state_revision_id,
+      state=excluded.state,owner_union_id=excluded.owner_union_id,
+      spec_hash=excluded.spec_hash,state_revision_id=excluded.state_revision_id,
       tombstone_payload_json=excluded.tombstone_payload_json,tombstone_hash=excluded.tombstone_hash,
       source_yaml=excluded.source_yaml,updated_at=excluded.updated_at`).run(
-      pending.target_bot_id, pending.command_path, pending.command, nextState, specHash, revisionId,
+      pending.target_bot_id, pending.command_path, pending.command, nextState,
+      pending.owner_union_id, specHash, revisionId,
       tombstonePayload ? JSON.stringify(tombstonePayload) : null, tombstoneHash ?? null,
       sourceYaml ?? null, now.toISOString(),
     );
     db.prepare(`INSERT INTO command_audit (
       revision_id,target_bot_id,command_path,command,action,prior_state,next_state,
-      parent_revision_id,actor_open_id,actor_union_id,reason,replacement,spec_hash,tombstone_hash,at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      parent_revision_id,actor_open_id,actor_union_id,owner_union_id,
+      reason,replacement,spec_hash,tombstone_hash,at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       revisionId, pending.target_bot_id, pending.command_path, pending.command, pending.action,
       current?.state ?? 'legacy', nextState, current?.stateRevisionId ?? null,
-      pending.actor_open_id, pending.actor_union_id,
+      pending.actor_open_id, pending.actor_union_id, pending.owner_union_id,
       pending.reason, pending.replacement, specHash, tombstoneHash ?? null, now.toISOString(),
     );
     db.prepare('DELETE FROM pending_transitions WHERE token_hash = ?').run(pending.token_hash);

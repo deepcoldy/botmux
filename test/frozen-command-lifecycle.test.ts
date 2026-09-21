@@ -8,6 +8,7 @@ import {
   confirmFrozenCommandTransition,
   evaluateFrozenCommandLifecycle,
   listFrozenCommandLifecycleAudit,
+  listFrozenCommandLifecycleRecords,
   prepareFrozenCommandTransition,
   reconcileFrozenCommandLifecycleAtStartup,
 } from '../src/services/frozen-command-lifecycle.js';
@@ -51,6 +52,7 @@ function prepare(input: ReturnType<typeof setup>, action: 'retire' | 'restore' |
     command: '/生命周期测试',
     action,
     actor: ACTOR,
+    actorIsAdmin: true,
     reason: action === 'retire' ? '口径已迁移' : action === 'restore' ? '误操作恢复' : '合规清理',
     replacement: action === 'retire' ? '/新命令' : undefined,
   });
@@ -78,8 +80,40 @@ describe('Frozen Command lifecycle ledger', () => {
     });
     const file = join(root, '.botmux', 'commands', '生命周期测试.yaml');
     expect(() => readFileSync(file, 'utf8')).toThrow();
-    confirmFrozenCommandTransition({ dataDir, targetBotId: BOT, token: pending.token, actor: ACTOR });
+    const created = confirmFrozenCommandTransition({
+      dataDir, targetBotId: BOT, token: pending.token, actor: ACTOR,
+    });
+    expect(created.ownerUnionId).toBe(ACTOR.unionId);
     expect(readFileSync(file, 'utf8')).toBe(ACTIVE);
+  });
+
+  it('backfills an existing ledger owner from the earliest approval audit', () => {
+    const root = join(tmpdir(), `botmux-frozen-owner-migration-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    roots.push(root);
+    mkdirSync(root, { recursive: true });
+    const dataDir = join(root, 'data');
+    const pending = prepareFrozenCommandTransition({
+      dataDir,
+      targetBotId: BOT,
+      workingDir: root,
+      command: '/生命周期测试',
+      action: 'approve',
+      actor: ACTOR,
+      reason: '创建待迁移命令',
+      candidateYaml: ACTIVE,
+    });
+    confirmFrozenCommandTransition({ dataDir, targetBotId: BOT, token: pending.token, actor: ACTOR });
+
+    const db = openDatabaseSyncOrThrow(join(dataDir, 'frozen-commands', 'approvals.sqlite'));
+    try {
+      db.prepare('UPDATE command_lifecycle SET owner_union_id = NULL').run();
+      db.prepare('UPDATE command_audit SET owner_union_id = NULL').run();
+    } finally {
+      db.close();
+    }
+
+    const [migrated] = listFrozenCommandLifecycleRecords({ dataDir, targetBotId: BOT, workingDir: root });
+    expect(migrated?.ownerUnionId).toBe(ACTOR.unionId);
   });
 
   it('rejects a candidate when the command directory escapes through a symlink', () => {
@@ -97,6 +131,7 @@ describe('Frozen Command lifecycle ledger', () => {
       command: '/生命周期测试',
       action: 'approve',
       actor: ACTOR,
+      actorIsAdmin: true,
       reason: '越界候选',
       candidateYaml: ACTIVE,
     })).toThrowError(/越出当前工作目录/);
@@ -111,6 +146,7 @@ describe('Frozen Command lifecycle ledger', () => {
       command: '/生命周期测试',
       action: 'approve',
       actor: ACTOR,
+      actorIsAdmin: true,
       reason: '批准初版',
     });
     const initial = confirmFrozenCommandTransition({
@@ -118,6 +154,7 @@ describe('Frozen Command lifecycle ledger', () => {
       targetBotId: BOT,
       token: first.token,
       actor: ACTOR,
+      actorIsAdmin: true,
     });
     const candidate = ACTIVE.replace('SELECT {{value}} AS probe_value', 'SELECT {{value}} + 1 AS probe_value');
     const pending = prepareFrozenCommandTransition({
@@ -150,8 +187,98 @@ describe('Frozen Command lifecycle ledger', () => {
       token: pending.token,
       actor: ACTOR,
     });
+    expect(updated.ownerUnionId).toBe(ACTOR.unionId);
     expect(updated.state).toBe('active');
     expect(readFileSync(input.file, 'utf8')).toBe(candidate);
+  });
+
+  it('blocks a non-owner but lets an admin override without transferring ownership', () => {
+    const root = join(tmpdir(), `botmux-frozen-owner-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    roots.push(root);
+    mkdirSync(root, { recursive: true });
+    const dataDir = join(root, 'data');
+    const create = prepareFrozenCommandTransition({
+      dataDir,
+      targetBotId: BOT,
+      workingDir: root,
+      command: '/生命周期测试',
+      action: 'approve',
+      actor: ACTOR,
+      reason: 'owner 创建',
+      candidateYaml: ACTIVE,
+    });
+    confirmFrozenCommandTransition({ dataDir, targetBotId: BOT, token: create.token, actor: ACTOR });
+    const other = { openId: 'ou_other', unionId: 'on_other' };
+    const candidate = ACTIVE.replace('SELECT {{value}}', 'SELECT {{value}} + 9');
+
+    expect(() => prepareFrozenCommandTransition({
+      dataDir,
+      targetBotId: BOT,
+      workingDir: root,
+      command: '/生命周期测试',
+      action: 'approve',
+      actor: other,
+      reason: '越权覆盖',
+      candidateYaml: candidate,
+    })).toThrowError(/owner/);
+
+    const override = prepareFrozenCommandTransition({
+      dataDir,
+      targetBotId: BOT,
+      workingDir: root,
+      command: '/生命周期测试',
+      action: 'approve',
+      actor: other,
+      actorIsAdmin: true,
+      reason: '管理员纠正',
+      candidateYaml: candidate,
+    });
+    const updated = confirmFrozenCommandTransition({
+      dataDir,
+      targetBotId: BOT,
+      token: override.token,
+      actor: other,
+      actorIsAdmin: true,
+    });
+    expect(updated.ownerUnionId).toBe(ACTOR.unionId);
+  });
+
+  it('reserves irreversible revoke for an admin even when the actor is the owner', () => {
+    const root = join(tmpdir(), `botmux-frozen-owner-revoke-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    roots.push(root);
+    mkdirSync(root, { recursive: true });
+    const dataDir = join(root, 'data');
+    const create = prepareFrozenCommandTransition({
+      dataDir,
+      targetBotId: BOT,
+      workingDir: root,
+      command: '/生命周期测试',
+      action: 'approve',
+      actor: ACTOR,
+      reason: 'owner 创建',
+      candidateYaml: ACTIVE,
+    });
+    confirmFrozenCommandTransition({ dataDir, targetBotId: BOT, token: create.token, actor: ACTOR });
+    const retire = prepareFrozenCommandTransition({
+      dataDir,
+      targetBotId: BOT,
+      workingDir: root,
+      command: '/生命周期测试',
+      action: 'retire',
+      actor: ACTOR,
+      reason: 'owner 废弃',
+    });
+    confirmFrozenCommandTransition({ dataDir, targetBotId: BOT, token: retire.token, actor: ACTOR });
+
+    expect(() => prepareFrozenCommandTransition({
+      dataDir,
+      targetBotId: BOT,
+      workingDir: root,
+      command: '/生命周期测试',
+      action: 'revoke',
+      actor: ACTOR,
+      reason: 'owner 尝试彻底撤销',
+    })).toThrowError(/管理员/);
   });
 
   it('cancels a staged update without changing the current command and consumes the token', () => {
@@ -163,6 +290,7 @@ describe('Frozen Command lifecycle ledger', () => {
       command: '/生命周期测试',
       action: 'approve',
       actor: ACTOR,
+      actorIsAdmin: true,
       reason: '候选更新',
       candidateYaml: ACTIVE.replace('SELECT {{value}}', 'SELECT {{value}} + 2'),
     });
@@ -172,6 +300,7 @@ describe('Frozen Command lifecycle ledger', () => {
       targetBotId: BOT,
       token: pending.token,
       actor: ACTOR,
+      actorIsAdmin: true,
     });
     expect(cancelled).toMatchObject({ command: '生命周期测试', action: 'approve' });
     expect(readFileSync(input.file, 'utf8')).toBe(ACTIVE);
@@ -180,6 +309,7 @@ describe('Frozen Command lifecycle ledger', () => {
       targetBotId: BOT,
       token: pending.token,
       actor: ACTOR,
+      actorIsAdmin: true,
     })).toThrowError(/不存在|不属于/);
   });
 
@@ -192,6 +322,7 @@ describe('Frozen Command lifecycle ledger', () => {
       targetBotId: BOT,
       token: pending.token,
       actor: ACTOR,
+      actorIsAdmin: true,
     });
     expect(retired.state).toBe('retired');
 
@@ -200,6 +331,7 @@ describe('Frozen Command lifecycle ledger', () => {
       targetBotId: BOT,
       token: pending.token,
       actor: ACTOR,
+      actorIsAdmin: true,
     })).toThrowError(/不存在|不属于/);
   });
 
@@ -225,6 +357,7 @@ describe('Frozen Command lifecycle ledger', () => {
       targetBotId: BOT,
       token: pending.token,
       actor: ACTOR,
+      actorIsAdmin: true,
     })).toThrowError(/确认前已变化/);
     expect(readFileSync(input.file, 'utf8')).toContain('+ 1');
   });
@@ -238,6 +371,7 @@ describe('Frozen Command lifecycle ledger', () => {
       command: '/生命周期测试',
       action: 'approve',
       actor: ACTOR,
+      actorIsAdmin: true,
       reason: '批准 A',
     });
     const approved = confirmFrozenCommandTransition({
@@ -245,6 +379,7 @@ describe('Frozen Command lifecycle ledger', () => {
       targetBotId: BOT,
       token: approval.token,
       actor: ACTOR,
+      actorIsAdmin: true,
     });
     expect(approved.state).toBe('active');
     expect(approved.sourceYaml).toBe(ACTIVE);
@@ -294,6 +429,7 @@ describe('Frozen Command lifecycle ledger', () => {
       command: '/生命周期测试',
       action: 'approve',
       actor: ACTOR,
+      actorIsAdmin: true,
       reason: '批准新定义',
     });
     const approved = confirmFrozenCommandTransition({
@@ -301,6 +437,7 @@ describe('Frozen Command lifecycle ledger', () => {
       targetBotId: BOT,
       token: pending.token,
       actor: ACTOR,
+      actorIsAdmin: true,
     });
     expect(approved.state).toBe('active');
     expect(evaluateFrozenCommandLifecycle({
@@ -327,6 +464,7 @@ describe('Frozen Command lifecycle ledger', () => {
       targetBotId: BOT,
       token: pending.token,
       actor: ACTOR,
+      actorIsAdmin: true,
     });
 
     expect(record.state).toBe('retired');
@@ -363,6 +501,7 @@ describe('Frozen Command lifecycle ledger', () => {
       targetBotId: BOT,
       token: pending.token,
       actor: ACTOR,
+      actorIsAdmin: true,
     });
     // Simulate a crash after the DB commit but before the tombstone rename.
     writeFileSync(input.file, ACTIVE);
@@ -380,6 +519,7 @@ describe('Frozen Command lifecycle ledger', () => {
       targetBotId: BOT,
       token: pending.token,
       actor: ACTOR,
+      actorIsAdmin: true,
     });
     writeFileSync(input.file, ACTIVE.replace('SELECT {{value}}', 'SELECT {{value}} + 100'));
 
@@ -397,7 +537,7 @@ describe('Frozen Command lifecycle ledger', () => {
   it('detects tombstone payload tampering instead of trusting copied hash fields', () => {
     const input = setup();
     const pending = prepare(input, 'retire');
-    confirmFrozenCommandTransition({ dataDir: input.dataDir, targetBotId: BOT, token: pending.token, actor: ACTOR });
+    confirmFrozenCommandTransition({ dataDir: input.dataDir, targetBotId: BOT, token: pending.token, actor: ACTOR, actorIsAdmin: true });
     writeFileSync(input.file, readFileSync(input.file, 'utf8').replace('口径已迁移', '伪造原因'));
 
     const gate = evaluateFrozenCommandLifecycle({
@@ -414,13 +554,14 @@ describe('Frozen Command lifecycle ledger', () => {
   it('restores only through a new confirmation and verifies the approved spec hash', () => {
     const input = setup();
     let pending = prepare(input, 'retire');
-    confirmFrozenCommandTransition({ dataDir: input.dataDir, targetBotId: BOT, token: pending.token, actor: ACTOR });
+    confirmFrozenCommandTransition({ dataDir: input.dataDir, targetBotId: BOT, token: pending.token, actor: ACTOR, actorIsAdmin: true });
     pending = prepare(input, 'restore');
     const restored = confirmFrozenCommandTransition({
       dataDir: input.dataDir,
       targetBotId: BOT,
       token: pending.token,
       actor: ACTOR,
+      actorIsAdmin: true,
     });
 
     expect(restored.state).toBe('active');
@@ -440,13 +581,14 @@ describe('Frozen Command lifecycle ledger', () => {
   it('revokes DB-first, removes the tombstone, and remains fail-closed after deletion', () => {
     const input = setup();
     let pending = prepare(input, 'retire');
-    confirmFrozenCommandTransition({ dataDir: input.dataDir, targetBotId: BOT, token: pending.token, actor: ACTOR });
+    confirmFrozenCommandTransition({ dataDir: input.dataDir, targetBotId: BOT, token: pending.token, actor: ACTOR, actorIsAdmin: true });
     pending = prepare(input, 'revoke');
     const revoked = confirmFrozenCommandTransition({
       dataDir: input.dataDir,
       targetBotId: BOT,
       token: pending.token,
       actor: ACTOR,
+      actorIsAdmin: true,
     });
 
     expect(revoked.state).toBe('revoked');

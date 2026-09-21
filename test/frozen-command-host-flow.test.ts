@@ -370,6 +370,7 @@ async function postHostIntent(
     reason?: string;
     replacement?: string;
     definitionYaml?: string;
+    command?: string;
   } = {},
 ) {
   const operation = input.operation ?? 'run';
@@ -382,7 +383,7 @@ async function postHostIntent(
       : operation === 'list'
         ? {}
         : {
-            command: COMMAND,
+            command: input.command ?? COMMAND,
             reason: input.reason ?? '宿主状态变更测试',
             ...(input.replacement ? { replacement: input.replacement } : {}),
             ...(input.definitionYaml ? { definitionYaml: input.definitionYaml } : {}),
@@ -496,6 +497,7 @@ beforeEach(async () => {
     command: COMMAND,
     action: 'approve',
     actor: { openId: ACTOR_OPEN_ID, unionId: ACTOR_UNION_ID },
+    actorIsAdmin: true,
     reason: '宿主闭环测试批准',
   });
   modules.lifecycle.confirmFrozenCommandTransition({
@@ -503,6 +505,7 @@ beforeEach(async () => {
     targetBotId: APP,
     token: pending.token,
     actor: { openId: ACTOR_OPEN_ID, unionId: ACTOR_UNION_ID },
+    actorIsAdmin: true,
   });
 }, 30_000);
 
@@ -604,6 +607,7 @@ describe('Frozen Command host-owned route → callback → Data MCP flow', () =>
       command: `/${foreignCommand}`,
       action: 'approve',
       actor: foreignActor,
+      actorIsAdmin: true,
       reason: '另一机器人批准',
     });
     modules.lifecycle.confirmFrozenCommandTransition({
@@ -611,6 +615,7 @@ describe('Frozen Command host-owned route → callback → Data MCP flow', () =>
       targetBotId: 'cli_foreign_bot',
       token: approve.token,
       actor: foreignActor,
+      actorIsAdmin: true,
     });
     const retire = modules.lifecycle.prepareFrozenCommandTransition({
       dataDir,
@@ -652,34 +657,69 @@ unexpectedInternalField: true
     expect(mocks.runCalls).toBe(0);
   });
 
-  it('fails closed at lifecycle proposal when frozenCommandAdmins is absent', async () => {
+  it('lets the recorded owner update without frozenCommandAdmins', async () => {
     const bot = modules.registry.getBot(APP);
     const candidate = YAML.replace('SELECT {{value}} * 2', 'SELECT {{value}} * 4');
     const file = join(root, '.botmux', 'commands', '宿主闭环.yaml');
     const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '更新固化命令' });
 
     bot.config.frozenCommandAdmins = undefined;
-    const deniedProposal = await postHostIntent(ds, {
+    const proposal = await postHostIntent(ds, {
       operation: 'approve',
-      reason: '无管理员配置时拒绝',
+      reason: 'owner 自助更新',
       definitionYaml: candidate,
     });
-    expect(deniedProposal.statusCode).toBe(403);
-    expect(deniedProposal.payload).toMatchObject({ ok: false, error: 'operation_not_allowed' });
-    expect(mocks.cardBodies).toHaveLength(0);
+    expect(proposal.statusCode).toBe(200);
+    expect(proposal.payload).toMatchObject({ status: 'awaiting_input', operation: 'approve' });
     expect(readFileSync(file, 'utf8')).toBe(YAML);
+    const confirmed = await modules.daemon.__testOnly_handleFrozenCommandCardAction(
+      callbackData(latestLifecycleAction()), APP,
+    );
+    expect(confirmed).toMatchObject({ toast: { type: 'success' } });
+    expect(readFileSync(file, 'utf8')).toBe(candidate);
   });
 
-  it('rechecks frozenCommandAdmins at card confirmation and fails closed after revocation', async () => {
+  it('rechecks admin override at card confirmation after the command owner differs', async () => {
     const bot = modules.registry.getBot(APP);
-    const candidate = YAML.replace('SELECT {{value}} * 2', 'SELECT {{value}} * 4');
-    const file = join(root, '.botmux', 'commands', '宿主闭环.yaml');
+    const otherCommand = '他人命令';
+    const otherOwner = { openId: 'ou_other_owner', unionId: 'on_other_owner' };
+    const initialYaml = YAML.replaceAll('宿主闭环', otherCommand);
+    const candidate = initialYaml.replace('SELECT {{value}} * 2', 'SELECT {{value}} * 4');
+    const file = join(root, '.botmux', 'commands', `${otherCommand}.yaml`);
+    const creation = modules.lifecycle.prepareFrozenCommandTransition({
+      dataDir,
+      targetBotId: APP,
+      workingDir: root,
+      command: `/${otherCommand}`,
+      action: 'approve',
+      actor: otherOwner,
+      reason: '创建他人命令',
+      candidateYaml: initialYaml,
+    });
+    modules.lifecycle.confirmFrozenCommandTransition({
+      dataDir,
+      targetBotId: APP,
+      token: creation.token,
+      actor: otherOwner,
+    });
     const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '更新固化命令' });
+    bot.config.frozenCommandAdmins = [];
+    const deniedProposal = await postHostIntent(ds, {
+      operation: 'approve',
+      reason: '非 owner 越权覆盖',
+      definitionYaml: candidate,
+      command: `/${otherCommand}`,
+    });
+    expect(deniedProposal.statusCode).toBe(403);
+    expect(deniedProposal.payload).toMatchObject({ error: 'transition_owner_mismatch' });
+    expect(readFileSync(file, 'utf8')).toBe(initialYaml);
+
     bot.config.frozenCommandAdmins = [ACTOR_UNION_ID];
     const prepared = await postHostIntent(ds, {
       operation: 'approve',
       reason: '确认前撤销管理员权限',
       definitionYaml: candidate,
+      command: `/${otherCommand}`,
     });
     expect(prepared.statusCode).toBe(200);
     const value = latestLifecycleAction();
@@ -689,7 +729,7 @@ unexpectedInternalField: true
       callbackData(value), APP,
     );
     expect(deniedConfirmation).toMatchObject({ toast: { type: 'error' } });
-    expect(readFileSync(file, 'utf8')).toBe(YAML);
+    expect(readFileSync(file, 'utf8')).toBe(initialYaml);
   });
 
   it('stages a model-proposed update and publishes it only after the same human clicks once', async () => {

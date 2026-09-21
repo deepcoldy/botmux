@@ -1730,11 +1730,13 @@ export interface BotConfig {
   workingDirs?: string[];
   allowedUsers?: string[];
   /**
-   * Tenant-stable union_ids allowed to create, update, retire, restore, or
-   * revoke shared Frozen Commands. This is deliberately separate from
-   * allowedUsers/canOperate: an open bot may allow everyone to talk, while
-   * shared command mutations must remain fail-closed. Missing/empty means
-   * nobody can mutate shared Frozen Commands through this bot.
+   * Tenant-stable union_ids with break-glass authority over every Frozen
+   * Command owned by this Bot. The human who confirms a command's initial
+   * creation becomes that command's owner and can update/retire/restore it
+   * without appearing here. Admins may permanently revoke a command, override
+   * another owner's command, or adopt a legacy command whose creator cannot
+   * be recovered. Missing/empty disables only those overrides; it does not
+   * prevent owner self-service.
    *
    * The command files remain working-directory scoped. If multiple bots share
    * one working directory, an admin of any one of those bots can still change
