@@ -1558,6 +1558,81 @@ describe('XPI human terminal alert delivery', () => {
     };
   }
 
+  it('does not send XPI outcomes for an already closed session', async () => {
+    const ds = seedThreadSession('om_alert_closed', 'seeded');
+    ds.session.status = 'closed';
+
+    await expect(notifyCrossPrincipalTerminal(ds, seedAlertRecord(ds), '未选择处理方式')).resolves.toBe(false);
+
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.resolveTargetAppOpenId).not.toHaveBeenCalled();
+  });
+
+  it('stops an XPI outcome when the session closes during identity resolution', async () => {
+    const ds = seedThreadSession('om_alert_close_lookup', 'seeded');
+    let resolveIdentity!: (result: { status: 'resolved'; openId: string }) => void;
+    mocks.resolveTargetAppOpenId.mockImplementationOnce(() => new Promise(resolve => { resolveIdentity = resolve; }));
+    const sending = notifyCrossPrincipalTerminal(ds, seedAlertRecord(ds), '未选择处理方式');
+    expect(mocks.resolveTargetAppOpenId).toHaveBeenCalledOnce();
+
+    ds.session.status = 'closed';
+    resolveIdentity({ status: 'resolved', openId: 'ou_target_proposer' });
+
+    await expect(sending).resolves.toBe(false);
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('stops XPI transport retries when the session closes during retry backoff', async () => {
+    vi.useFakeTimers();
+    const ds = seedThreadSession('om_alert_close_retry', 'seeded');
+    mocks.replyMessage.mockRejectedValueOnce(new Error('temporary failure'));
+    try {
+      const sending = notifyCrossPrincipalTerminal(ds, seedAlertRecord(ds), '未选择处理方式');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mocks.replyMessage).toHaveBeenCalledOnce();
+      ds.session.status = 'closed';
+
+      await vi.advanceTimersByTimeAsync(1_500);
+      await expect(sending).resolves.toBe(false);
+
+      expect(mocks.replyMessage).toHaveBeenCalledOnce();
+      expect(mocks.sendMessage).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not reschedule or persist an XPI terminal cycle after close during delivery', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const ds = seedThreadSession('om_alert_close_cycle', 'seeded');
+    const record = seedAlertRecord(ds);
+    record.phase = 'terminal_notice_pending';
+    record.terminalNoticeText = '未选择处理方式';
+    ds.session.crossPrincipalInterruptions = [record];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    mocks.replyMessage.mockImplementationOnce(async () => {
+      ds.session.status = 'closed';
+      ds.session.crossPrincipalInterruptions = undefined;
+      mocks.updateSession.mockClear();
+      throw new Error('delivery interrupted by close');
+    });
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+
+      expect(mocks.replyMessage).toHaveBeenCalledOnce();
+      expect(mocks.updateSession).not.toHaveBeenCalled();
+      expect(ds.crossPrincipalWaitTimer).toBeUndefined();
+      expect(ds.crossPrincipalInterruptionDriving).toBe(false);
+    } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+  });
+
   it('records delivery_failed for three failures and then delivery_exhausted', async () => {
     const ds = seedThreadSession('om_alert_retry', 'seeded');
     const record = seedAlertRecord(ds);

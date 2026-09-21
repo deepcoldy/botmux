@@ -723,6 +723,23 @@ describe('write health gate', () => {
 });
 
 describe('closeSession()', () => {
+  it.each(['active', 'closed'] as const)('cancels staged XPI work when closing a %s session', (status) => {
+    const session = createSession('chat-xpi-close', 'root-xpi-close', 'Cancel protocol work');
+    session.status = status;
+    session.crossPrincipalInterruptions = [{
+      version: 1, id: 'xpi_pending', ownerTurnId: 'om_owner', phase: 'awaiting_classification',
+      owner: { requestUserOpenId: 'ou_owner', senderType: 'user' },
+      proposer: { requestUserOpenId: 'ou_peer', senderType: 'bot' }, messages: [],
+    }];
+    updateSession(session);
+
+    closeSession(session.sessionId);
+    init();
+
+    expect(getSession(session.sessionId)?.status).toBe('closed');
+    expect(getSession(session.sessionId)?.crossPrincipalInterruptions).toBeUndefined();
+  });
+
   it('should set status to closed and add closedAt timestamp', () => {
     const session = createSession('chat1', 'root1', 'To Close');
     closeSession(session.sessionId);

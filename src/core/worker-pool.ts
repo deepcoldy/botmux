@@ -7292,6 +7292,9 @@ export async function closeSession(
     if (ds) {
       ds.session.status = 'closed';
       ds.session.closedAt = after?.closedAt ?? ds.session.closedAt;
+      ds.session.crossPrincipalInterruptions = undefined;
+      clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
       // 活对象与 store 里的行未必是同一个引用；durable close 只清了后者。
       takeSessionPreviewTarget(ds.session);
       // Sync the parking back from the store's committed row. Only reached after a
@@ -7336,6 +7339,9 @@ export async function closeSession(
     // those continuations from re-forking the closed session after its await.
     ds.session.status = 'closed';
     ds.session.closedAt ??= new Date().toISOString();
+    ds.session.crossPrincipalInterruptions = undefined;
+    clearTimeout(ds.crossPrincipalWaitTimer);
+    ds.crossPrincipalWaitTimer = undefined;
     killedLive = true;
     if (!ds.exitEventEmitted) {
       ds.exitEventEmitted = true;
