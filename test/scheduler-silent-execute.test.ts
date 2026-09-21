@@ -232,6 +232,52 @@ function baseTask(overrides: Partial<ScheduledTask>): ScheduledTask {
   };
 }
 
+function installScheduledFrozenFixture(yaml: string): { root: string; restore: () => void } {
+  const root = mkdtempSync(join(tmpdir(), 'botmux-scheduled-frozen-'));
+  const previousDataDir = config.session.dataDir;
+  const previousPlugins = (BOT.config as any).plugins;
+  const home = join(root, 'home');
+  const source = join(root, 'plugin');
+  mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
+  mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
+  writeFileSync(join(root, '.botmux', 'commands', '泰国上账.yaml'), yaml);
+  writeFileSync(join(source, 'package.json'), JSON.stringify({
+    name: '@botmux-ai/plugin-data-mcp', version: '0.1.0', type: 'module',
+    keywords: ['botmux-plugin'], botmux: { schemaVersion: 1, id: 'data-mcp' },
+  }));
+  writeFileSync(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({
+    transport: 'stdio',
+    command: [process.execPath, resolve('test/fixtures/plugin-mcp-server.mjs'), 'data'],
+  }));
+  vi.stubEnv('HOME', home);
+  vi.stubEnv('SESSION_DATA_DIR', join(home, '.botmux', 'data'));
+  config.session.dataDir = join(home, '.botmux', 'data');
+  (BOT.config as any).plugins = ['data-mcp'];
+  installLocalPlugin(source);
+  return {
+    root,
+    restore: () => {
+      config.session.dataDir = previousDataDir;
+      (BOT.config as any).plugins = previousPlugins;
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
+const SCHEDULED_FROZEN_YAML = `
+schemaVersion: 1
+name: 泰国上账
+description: 查询泰国最近 N 天的上账金额
+params:
+  - name: days
+    type: integer
+    min: 1
+    max: 90
+    default: 7
+sql: SELECT sum(amount) FROM bills WHERE dt >= today() - {{days}} LIMIT 100
+`;
+
 function forkedCliInput(): string {
   const arg = forkWorkerMock.mock.calls[0][1];
   return typeof arg === 'string' ? arg : arg.content;
@@ -339,43 +385,11 @@ describe('executeScheduledTask — silent thread fire', () => {
   });
 
   it('runs an installed frozen command directly as the native schedule creator', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'botmux-scheduled-frozen-'));
-    const previousDataDir = config.session.dataDir;
-    const previousPlugins = (BOT.config as any).plugins;
+    const fixture = installScheduledFrozenFixture(SCHEDULED_FROZEN_YAML);
     try {
-      const home = join(root, 'home');
-      const source = join(root, 'plugin');
-      mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
-      mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
-      writeFileSync(join(root, '.botmux', 'commands', '泰国上账.yaml'), `
-schemaVersion: 1
-name: 泰国上账
-description: 查询泰国最近 N 天的上账金额
-params:
-  - name: days
-    type: integer
-    min: 1
-    max: 90
-    default: 7
-sql: SELECT sum(amount) FROM bills WHERE dt >= today() - {{days}} LIMIT 100
-`);
-      writeFileSync(join(source, 'package.json'), JSON.stringify({
-        name: '@botmux-ai/plugin-data-mcp', version: '0.1.0', type: 'module',
-        keywords: ['botmux-plugin'], botmux: { schemaVersion: 1, id: 'data-mcp' },
-      }));
-      writeFileSync(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({
-        transport: 'stdio',
-        command: [process.execPath, resolve('test/fixtures/plugin-mcp-server.mjs'), 'data'],
-      }));
-      vi.stubEnv('HOME', home);
-      vi.stubEnv('SESSION_DATA_DIR', join(home, '.botmux', 'data'));
-      config.session.dataDir = join(home, '.botmux', 'data');
-      (BOT.config as any).plugins = ['data-mcp'];
-      installLocalPlugin(source);
-
       await executeScheduledTask(baseTask({
         prompt: '/泰国上账 30',
-        workingDir: root,
+        workingDir: fixture.root,
         rootMessageId: ROOT,
         scope: 'thread',
         ownerOpenId: 'ou_test',
@@ -384,13 +398,122 @@ sql: SELECT sum(amount) FROM bills WHERE dt >= today() - {{days}} LIMIT 100
 
       expect(forkWorkerMock).not.toHaveBeenCalled();
       const resultReply = replyMessageMock.mock.calls.at(-1)?.[2];
-      expect(resultReply).toContain('"amount": 12');
+      expect(resultReply).toBe('12');
       expect(resultReply).not.toContain('SELECT sum');
     } finally {
-      config.session.dataDir = previousDataDir;
-      (BOT.config as any).plugins = previousPlugins;
-      vi.unstubAllEnvs();
-      rmSync(root, { recursive: true, force: true });
+      fixture.restore();
+    }
+  });
+
+  it('fails ownerless CLI-created frozen schedules closed without starting a CLI', async () => {
+    const fixture = installScheduledFrozenFixture(SCHEDULED_FROZEN_YAML);
+    try {
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账 30',
+        workingDir: fixture.root,
+        rootMessageId: ROOT,
+        scope: 'thread',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+      expect(sendWorkerInputMock).not.toHaveBeenCalled();
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).toContain('无法确认调用者身份');
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).not.toContain('命令不存在');
+    } finally {
+      fixture.restore();
+    }
+  });
+
+  it('intercepts silent frozen schedules instead of passing the literal to a model', async () => {
+    const fixture = installScheduledFrozenFixture(SCHEDULED_FROZEN_YAML);
+    try {
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账 30',
+        workingDir: fixture.root,
+        rootMessageId: ROOT,
+        scope: 'thread',
+        silent: true,
+        ownerOpenId: 'ou_test',
+        ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+      expect(sendWorkerInputMock).not.toHaveBeenCalled();
+      expect(replyMessageMock).toHaveBeenCalledTimes(1);
+      expect(replyMessageMock.mock.calls[0]?.[2]).toBe('12');
+    } finally {
+      fixture.restore();
+    }
+  });
+
+  it('uses conditional output as an exclusive deliver-or-handoff switch', async () => {
+    const yaml = `${SCHEDULED_FROZEN_YAML}
+output:
+  maxChars: 20000
+  when: "{{q.amount}} > 20"
+  handoff:
+    prompt: "金额异常，请分析"
+    data: "{{q.rows}}"
+    maxRows: 50
+  else:
+    text: "今日正常，合计 {{q.amount}}"
+`;
+    const fixture = installScheduledFrozenFixture(yaml);
+    try {
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账 30', workingDir: fixture.root,
+        rootMessageId: ROOT, scope: 'thread', ownerOpenId: 'ou_test', ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).toBe('今日正常，合计 12');
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+      expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    } finally {
+      fixture.restore();
+    }
+
+    const handoffFixture = installScheduledFrozenFixture(yaml.replace('> 20', '> 10'));
+    try {
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账 30', workingDir: handoffFixture.root,
+        rootMessageId: ROOT, scope: 'thread', ownerOpenId: 'ou_test', ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+      expect(sendWorkerInputMock).not.toHaveBeenCalled();
+      expect(forkedCliInput()).toContain('金额异常，请分析');
+      expect(forkedCliInput()).toContain('"amount":12');
+      expect(replyMessageMock.mock.calls.some(call => call[2] === '12')).toBe(false);
+    } finally {
+      handoffFixture.restore();
+    }
+  });
+
+  it('fails a broken condition closed without choosing either output branch or starting a CLI', async () => {
+    const fixture = installScheduledFrozenFixture(`${SCHEDULED_FROZEN_YAML}
+output:
+  maxChars: 20000
+  when: "{{q.missing}} > 0"
+  handoff:
+    prompt: "异常分析"
+    maxRows: 50
+  else:
+    text: "正常"
+`);
+    try {
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账 30', workingDir: fixture.root,
+        rootMessageId: ROOT, scope: 'thread', ownerOpenId: 'ou_test', ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+      expect(sendWorkerInputMock).not.toHaveBeenCalled();
+      const failure = replyMessageMock.mock.calls.at(-1)?.[2] as string;
+      expect(failure).toContain('固化命令执行失败');
+      expect(failure).not.toContain('正常');
+      expect(failure).not.toContain('异常分析');
+    } finally {
+      fixture.restore();
     }
   });
 

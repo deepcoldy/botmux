@@ -6,6 +6,7 @@ import { installLocalPlugin } from '../src/core/plugins/install.js';
 import {
   FrozenCommandError,
   executeFrozenCommand,
+  evaluateFrozenCommandOutputCondition,
   frozenCommandUsage,
   frozenCommandResultText,
   listFrozenCommandSnapshots,
@@ -14,6 +15,7 @@ import {
   normalizeFrozenCommandName,
   normalizeFrozenCommandArguments,
   renderFrozenCommandSql,
+  resolveFrozenCommandScheduledOutput,
   shouldFallbackFrozenCommand,
   userFacingFrozenCommandError,
 } from '../src/services/frozen-command.js';
@@ -118,6 +120,92 @@ describe('Frozen Commands definition and positional UX', () => {
     expect(displayed).not.toContain('account_bound');
     expect(displayed).not.toContain('repair_internal');
     expect(displayed).not.toContain('query_plan');
+  });
+
+  it('evaluates conditional output fail-closed and marks handoff truncation explicitly', () => {
+    const conditional = BASE.replace(
+      '  prefix: "查询结果：\\n"\n  maxChars: 20000',
+      `  maxChars: 20000
+  when: "{{q.max_drop}} > 0.2"
+  handoff:
+    prompt: "以下数据出现异常，请分析原因"
+    data: "{{q.rows}}"
+    maxRows: 1
+  else:
+    text: "今日正常，合计 {{q.total}}"`,
+    );
+    const { definition } = fixture(conditional);
+    const result = {
+      renderedSql: 'SELECT 1',
+      referenceDate: '2026-09-21',
+      text: '原始结果',
+      truncated: false,
+      businessResult: {
+        rows: [
+          { max_drop: 0.3, total: 120, country: 'TH' },
+          { max_drop: 0.1, total: 80, country: 'SG' },
+        ],
+        totalRows: 2,
+      },
+    };
+    expect(evaluateFrozenCommandOutputCondition(definition.output.when!, result)).toBe(true);
+    const handoff = resolveFrozenCommandScheduledOutput(definition, result);
+    expect(handoff.kind).toBe('handoff');
+    if (handoff.kind === 'handoff') {
+      expect(handoff.prompt).toContain('以下数据出现异常');
+      expect(handoff.prompt).toContain('"country":"TH"');
+      expect(handoff.prompt).not.toContain('"country":"SG"');
+      expect(handoff.prompt).toContain('共 2 行，已截断为前 1 行');
+    }
+    const charLimited = resolveFrozenCommandScheduledOutput({
+      ...definition,
+      output: { ...definition.output, maxChars: 100 },
+    }, {
+      ...result,
+      businessResult: {
+        rows: [
+          { max_drop: 0.3, total: 120, country: 'X'.repeat(500) },
+          { max_drop: 0.1, total: 80, country: 'SG' },
+        ],
+        totalRows: 2,
+      },
+    });
+    expect(charLimited.kind).toBe('handoff');
+    if (charLimited.kind === 'handoff') {
+      expect(charLimited.prompt).toContain('共 2 行，已截断为前 1 行');
+      expect(charLimited.prompt).toContain('字符上限');
+    }
+
+    const normal = resolveFrozenCommandScheduledOutput(definition, {
+      ...result,
+      businessResult: { rows: [{ max_drop: 0.1, total: 120 }], totalRows: 1 },
+    });
+    expect(normal).toEqual({ kind: 'deliver', text: '今日正常，合计 120' });
+
+    expect(() => resolveFrozenCommandScheduledOutput(definition, {
+      ...result,
+      businessResult: { rows: [{ total: 120 }], totalRows: 1 },
+    })).toThrowError(/q\.max_drop/);
+    expect(() => resolveFrozenCommandScheduledOutput(definition, {
+      ...result,
+      businessResult: undefined,
+    })).toThrowError(/结果缺失或格式异常/);
+    expect(() => evaluateFrozenCommandOutputCondition('not-an-expression', result))
+      .toThrowError(/条件表达式/);
+  });
+
+  it('rejects incomplete conditional output definitions', () => {
+    const partial = BASE.replace(
+      '  maxChars: 20000',
+      '  maxChars: 20000\n  when: "{{q.amount}} > 10"',
+    );
+    const root = join(tmpdir(), `botmux-frozen-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    dirs.push(root);
+    mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
+    writeFileSync(join(root, '.botmux', 'commands', '泰国上账.yaml'), partial);
+    const lookup = lookupFrozenCommand({ workingDir: root, command: '/泰国上账' });
+    expect(lookup.kind).toBe('invalid');
+    if (lookup.kind === 'invalid') expect(lookup.error.code).toBe('definition_invalid_output');
   });
 
   it('uses column descriptions for multi-value rows and handles empty results', () => {

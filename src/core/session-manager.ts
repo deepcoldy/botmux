@@ -101,11 +101,9 @@ import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
 import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
 import { readGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
 import {
-  buildFrozenCommandFallbackPrompt,
   executeFrozenCommand,
   lookupFrozenCommand,
-  renderFrozenCommandSql,
-  shouldFallbackFrozenCommand,
+  resolveFrozenCommandScheduledOutput,
   userFacingFrozenCommandError,
 } from '../services/frozen-command.js';
 import { evaluateFrozenCommandLifecycle } from '../services/frozen-command-lifecycle.js';
@@ -4100,16 +4098,13 @@ export async function executeScheduledTask(
     }
   }
 
-  // A native /schedule may point directly at an installed Frozen Command.
-  // Execute it under the task creator's trusted identity without opening a
-  // model/CLI session. Ownerless/CLI-created schedules have no trusted caller
-  // and therefore fail closed in executeFrozenCommand. Silent schedules keep
-  // their existing model semantics because host execution cannot infer the
-  // prompt's conditional-delivery intent.
-  let frozenFallbackPrompt: string | undefined;
-  const frozenInvocation = !silent && additionalPrompt === undefined
-    ? /^\/([^\s]+)(?:\s+([\s\S]*))?$/u.exec(task.prompt.trim())
-    : null;
+  // Scheduled prompts bypass inbound Lark command parsing, so intercept an
+  // installed Frozen Command here before any CLI/session path. This applies to
+  // loud and silent tasks alike. Missing creator identity and every execution
+  // or conditional-output error fail closed: a frozen command literal must
+  // never fall through to the model as an ordinary prompt.
+  let frozenHandoffPrompt: string | undefined;
+  const frozenInvocation = /^\/([^\s]+)(?:\s+([\s\S]*))?$/u.exec(task.prompt.trim());
   if (frozenInvocation) {
     const lifecycle = evaluateFrozenCommandLifecycle({
       dataDir: config.session.dataDir,
@@ -4147,9 +4142,7 @@ export async function executeScheduledTask(
       const definition = lookup.snapshot.definition;
       const rawArgs = frozenInvocation[2] ?? '';
       const invocationNow = new Date();
-      let renderedSql: string | undefined;
       try {
-        renderedSql = renderFrozenCommandSql({ definition, rawArgs, now: invocationNow }).sql;
         const result = await executeFrozenCommand({
           definition,
           rawArgs,
@@ -4160,20 +4153,15 @@ export async function executeScheduledTask(
           dataDir: config.session.dataDir,
           now: invocationNow,
         });
-        await deliver(result.text);
-        return;
-      } catch (error) {
-        if (renderedSql && shouldFallbackFrozenCommand(definition, error)) {
-          frozenFallbackPrompt = buildFrozenCommandFallbackPrompt({
-            definition,
-            rawArgs,
-            renderedSql,
-            reason: error instanceof Error ? error.message : String(error),
-          });
-        } else {
-          await deliver(`固化命令执行失败：${userFacingFrozenCommandError(error)}`);
+        const output = resolveFrozenCommandScheduledOutput(definition, result);
+        if (output.kind === 'deliver') {
+          await deliver(output.text);
           return;
         }
+        frozenHandoffPrompt = output.prompt;
+      } catch (error) {
+        await deliver(`固化命令执行失败：${userFacingFrozenCommandError(error)}`);
+        return;
       }
     }
   }
@@ -4183,9 +4171,10 @@ export async function executeScheduledTask(
   // A Bash precondition may provide per-fire context. Keep the durable task and
   // Dashboard-facing lastUserPrompt unchanged; lastCliInput still records the
   // exact input sent to the model through the ordinary session lifecycle.
+  const scheduledPrompt = frozenHandoffPrompt ?? task.prompt;
   const effectivePrompt = additionalPrompt === undefined
-    ? (frozenFallbackPrompt ?? task.prompt)
-    : `${task.prompt}\n\n${additionalPrompt}`;
+    ? scheduledPrompt
+    : `${scheduledPrompt}\n\n${additionalPrompt}`;
   const firePrompt = silent
     ? `${buildSilentScheduleHint(task.name, localeForBot(larkAppId))}\n\n${effectivePrompt}`
     : effectivePrompt;

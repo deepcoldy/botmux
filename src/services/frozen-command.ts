@@ -82,6 +82,15 @@ export interface FrozenCommandDefinition {
     prefix?: string;
     suffix?: string;
     maxChars: number;
+    when?: string;
+    handoff?: {
+      prompt: string;
+      data: string;
+      maxRows: number;
+    };
+    else?: {
+      text: string;
+    };
   };
   onError: 'fallback_llm' | 'fail';
 }
@@ -99,7 +108,15 @@ export interface FrozenCommandExecutionResult {
   text: string;
   truncated: boolean;
   queryId?: string;
+  businessResult?: {
+    rows: Array<Record<string, string | number | boolean | bigint | null | undefined>>;
+    totalRows: number;
+  };
 }
+
+export type FrozenCommandScheduledOutput =
+  | { kind: 'deliver'; text: string }
+  | { kind: 'handoff'; prompt: string };
 
 export interface FrozenCommandNormalizedArgument {
   name: string;
@@ -316,15 +333,45 @@ function parseDefinition(raw: string, command: string): FrozenCommandDefinition 
   let output: FrozenCommandDefinition['output'] = { maxChars: DEFAULT_MAX_OUTPUT_CHARS };
   if (value.output !== undefined) {
     if (!isPlainObject(value.output)) throw new FrozenCommandError('definition_invalid_output', 'output 必须是对象');
-    onlyKeys(value.output, ['prefix', 'suffix', 'maxChars'], 'output');
+    onlyKeys(value.output, ['prefix', 'suffix', 'maxChars', 'when', 'handoff', 'else'], 'output');
     const maxChars = value.output.maxChars ?? DEFAULT_MAX_OUTPUT_CHARS;
     if (!Number.isInteger(maxChars) || (maxChars as number) < 100 || (maxChars as number) > 100_000) {
       throw new FrozenCommandError('definition_invalid_output', 'output.maxChars 必须在 100-100000 之间');
+    }
+    const hasConditionalField = value.output.when !== undefined
+      || value.output.handoff !== undefined
+      || value.output.else !== undefined;
+    let conditional: Pick<FrozenCommandDefinition['output'], 'when' | 'handoff' | 'else'> = {};
+    if (hasConditionalField) {
+      const when = nonBlank(value.output.when, 'output.when', 1_000).trim();
+      if (!isPlainObject(value.output.handoff)) {
+        throw new FrozenCommandError('definition_invalid_output', 'output.handoff 必须是对象');
+      }
+      onlyKeys(value.output.handoff, ['prompt', 'data', 'maxRows'], 'output.handoff');
+      const prompt = nonBlank(value.output.handoff.prompt, 'output.handoff.prompt', 10_000);
+      const data = value.output.handoff.data === undefined
+        ? '{{q.rows}}'
+        : nonBlank(value.output.handoff.data, 'output.handoff.data', 10_000);
+      const maxRows = value.output.handoff.maxRows ?? 50;
+      if (!Number.isInteger(maxRows) || (maxRows as number) < 1 || (maxRows as number) > 1_000) {
+        throw new FrozenCommandError('definition_invalid_output', 'output.handoff.maxRows 必须在 1-1000 之间');
+      }
+      if (!isPlainObject(value.output.else)) {
+        throw new FrozenCommandError('definition_invalid_output', 'output.else 必须是对象');
+      }
+      onlyKeys(value.output.else, ['text'], 'output.else');
+      const elseText = nonBlank(value.output.else.text, 'output.else.text', 10_000);
+      conditional = {
+        when,
+        handoff: { prompt, data, maxRows: maxRows as number },
+        else: { text: elseText },
+      };
     }
     output = {
       maxChars: maxChars as number,
       ...(typeof value.output.prefix === 'string' ? { prefix: value.output.prefix } : {}),
       ...(typeof value.output.suffix === 'string' ? { suffix: value.output.suffix } : {}),
+      ...conditional,
     };
   }
   const datasource = typeof value.datasource === 'string' && value.datasource.trim()
@@ -603,13 +650,21 @@ function textFromToolResult(result: Record<string, unknown>, hideSql = false): s
   return JSON.stringify(hideSql ? redactSqlFields(result.structuredContent) : result.structuredContent, null, 2);
 }
 
-export function frozenCommandResultText(result: Record<string, unknown>): string {
-  const safeText = (value: string): string => value
+type FrozenBusinessScalar = string | number | boolean | bigint | null | undefined;
+type FrozenBusinessResult = {
+  rows: Array<Record<string, FrozenBusinessScalar>>;
+  totalRows: number;
+  columnLabels: Map<string, string>;
+};
+
+const safeBusinessText = (value: string): string => value
     .replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[mention]')
     .replace(/<at\b[^>]*\/?>/gi, '[mention]')
     .replace(/<\/at>/gi, '')
     .replace(/[\t\r\n\u2028\u2029]+/g, ' ')
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '�');
+
+function frozenBusinessResult(result: Record<string, unknown>): FrozenBusinessResult | undefined {
   const candidates: unknown[] = [result.structuredContent];
   for (const item of Array.isArray(result.content) ? result.content : []) {
     if (isPlainObject(item) && item.type === 'text' && typeof item.text === 'string') {
@@ -619,45 +674,177 @@ export function frozenCommandResultText(result: Record<string, unknown>): string
   candidates.push(result);
   const payload = candidates.find(candidate => isPlainObject(candidate)
     && (Object.hasOwn(candidate, 'rows') || Object.hasOwn(candidate, 'data')));
-  if (!isPlainObject(payload)) return '查询已完成。';
+  if (!isPlainObject(payload)) return undefined;
 
   const rawRows = Object.hasOwn(payload, 'rows') ? payload.rows : payload.data;
-  if (!Array.isArray(rawRows)) return '查询已完成。';
-  if (rawRows.length === 0) return '查询完成，未找到符合条件的数据。';
-  if (rawRows.some(row => !isPlainObject(row))) return '查询已完成。';
+  if (!Array.isArray(rawRows)) return undefined;
+  if (rawRows.some(row => !isPlainObject(row))) return undefined;
   const rows = rawRows as Array<Record<string, unknown>>;
-  if (rows.some(row => Object.keys(row).length === 0)) return '查询已完成。';
+  if (rows.some(row => Object.keys(row).length === 0)) return undefined;
   const isDisplayScalar = (value: unknown): boolean => value === null
     || value === undefined
     || typeof value === 'string'
     || typeof value === 'number'
     || typeof value === 'boolean'
     || typeof value === 'bigint';
-  if (rows.some(row => Object.values(row).some(value => !isDisplayScalar(value)))) return '查询已完成。';
+  if (rows.some(row => Object.values(row).some(value => !isDisplayScalar(value)))) return undefined;
   const columnLabels = new Map<string, string>();
   if (Array.isArray(payload.columns)) {
     for (const column of payload.columns) {
       if (!isPlainObject(column) || typeof column.name !== 'string' || !column.name) continue;
       const description = typeof column.description === 'string' ? column.description.trim() : '';
-      columnLabels.set(column.name, safeText(description || column.name));
+      columnLabels.set(column.name, safeBusinessText(description || column.name));
     }
   }
+  const declaredTotal = payload.row_count;
+  const totalRows = Number.isSafeInteger(declaredTotal) && (declaredTotal as number) >= rows.length
+    ? declaredTotal as number
+    : rows.length;
+  return {
+    rows: rows.map(row => ({ ...row })) as Array<Record<string, FrozenBusinessScalar>>,
+    totalRows,
+    columnLabels,
+  };
+}
+
+export function frozenCommandResultText(result: Record<string, unknown>): string {
+  const business = frozenBusinessResult(result);
+  if (!business) return '查询已完成。';
+  const { rows, columnLabels } = business;
+  if (rows.length === 0) return '查询完成，未找到符合条件的数据。';
   const keys = [...new Set([
     ...columnLabels.keys(),
     ...rows.flatMap(row => Object.keys(row)),
   ])].filter(key => rows.some(row => Object.hasOwn(row, key)));
   const formatValue = (value: unknown): string => {
     if (value === null || value === undefined) return '—';
-    if (typeof value === 'string') return safeText(value);
+    if (typeof value === 'string') return safeBusinessText(value);
     if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
     return '—';
   };
   if (rows.length === 1 && keys.length === 1) return formatValue(rows[0]![keys[0]!]);
   const renderRow = (row: Record<string, unknown>): string => keys
-    .map(key => `${columnLabels.get(key) ?? safeText(key)}：${formatValue(row[key])}`)
+    .map(key => `${columnLabels.get(key) ?? safeBusinessText(key)}：${formatValue(row[key])}`)
     .join('；');
   if (rows.length === 1) return renderRow(rows[0]!);
   return rows.map((row, index) => `${index + 1}. ${renderRow(row)}`).join('\n');
+}
+
+function frozenOutputContext(result: FrozenCommandExecutionResult): Record<string, unknown> {
+  const business = result.businessResult;
+  if (!business) {
+    throw new FrozenCommandError('conditional_output_data_invalid', '查询结果缺失或格式异常，无法判断条件');
+  }
+  const first = business.rows[0] ?? {};
+  return {
+    ...first,
+    rows: business.rows,
+    data: business.rows,
+    row_count: business.totalRows,
+  };
+}
+
+function contextValue(context: Record<string, unknown>, path: string): unknown {
+  const parts = path.split('.');
+  let current: unknown = context;
+  for (const part of parts) {
+    if (!isPlainObject(current) || !Object.hasOwn(current, part)) {
+      throw new FrozenCommandError('conditional_output_value_missing', `条件引用了不存在的字段：q.${path}`);
+    }
+    current = current[part];
+  }
+  return current;
+}
+
+function parseConditionLiteral(raw: string): string | number | boolean | null {
+  const text = raw.trim();
+  if (/^-?(?:0|[1-9]\d*)(?:\.\d+)?$/.test(text)) {
+    const number = Number(text);
+    if (Number.isFinite(number)) return number;
+  }
+  if (text === 'true') return true;
+  if (text === 'false') return false;
+  if (text === 'null') return null;
+  if ((text.startsWith('"') && text.endsWith('"')) || (text.startsWith("'") && text.endsWith("'"))) {
+    if (text.startsWith('"')) {
+      try { return JSON.parse(text) as string; } catch { /* report below */ }
+    } else {
+      return text.slice(1, -1).replace(/\\'/g, "'").replace(/\\\\/g, '\\');
+    }
+  }
+  throw new FrozenCommandError('conditional_output_invalid_literal', `条件比较值不合法：${text}`);
+}
+
+export function evaluateFrozenCommandOutputCondition(
+  expression: string,
+  result: FrozenCommandExecutionResult,
+): boolean {
+  const match = /^\s*\{\{\s*q\.([A-Za-z_][A-Za-z0-9_.]*)\s*\}\}\s*(>=|<=|===|!==|==|!=|>|<)\s*(.*?)\s*$/.exec(expression);
+  if (!match) {
+    throw new FrozenCommandError('conditional_output_invalid_expression', '条件表达式格式不合法');
+  }
+  const left = contextValue(frozenOutputContext(result), match[1]!);
+  const right = parseConditionLiteral(match[3]!);
+  const operator = match[2]!;
+  if (operator === '==' || operator === '===') return left === right;
+  if (operator === '!=' || operator === '!==') return left !== right;
+  if (typeof left !== 'number' || !Number.isFinite(left) || typeof right !== 'number') {
+    throw new FrozenCommandError('conditional_output_type_mismatch', '大小比较只支持有限数值');
+  }
+  if (operator === '>') return left > right;
+  if (operator === '>=') return left >= right;
+  if (operator === '<') return left < right;
+  return left <= right;
+}
+
+function renderFrozenOutputTemplate(template: string, context: Record<string, unknown>): string {
+  return template.replace(/\{\{\s*q\.([A-Za-z_][A-Za-z0-9_.]*)\s*\}\}/g, (_full, path: string) => {
+    const value = contextValue(context, path);
+    if (typeof value === 'string') return safeBusinessText(value);
+    if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
+    if (value === null || value === undefined) return '—';
+    return JSON.stringify(value, (_key, child) => typeof child === 'bigint' ? child.toString() : child);
+  });
+}
+
+function truncateFrozenOutput(text: string, maxChars: number): string {
+  return text.length > maxChars
+    ? `${text.slice(0, maxChars)}\n\n（结果已截断）`
+    : text;
+}
+
+function truncateFrozenHandoff(body: string, notice: string, maxChars: number): string {
+  const full = `${body}${notice}`;
+  if (full.length <= maxChars) return full;
+  const limitNotice = '\n\n（注入内容同时达到字符上限）';
+  const reserved = `${notice}${limitNotice}`;
+  const keep = Math.max(0, maxChars - reserved.length);
+  return `${body.slice(0, keep)}${reserved}`;
+}
+
+export function resolveFrozenCommandScheduledOutput(
+  definition: FrozenCommandDefinition,
+  result: FrozenCommandExecutionResult,
+): FrozenCommandScheduledOutput {
+  const { when, handoff, else: elseOutput } = definition.output;
+  if (!when || !handoff || !elseOutput) return { kind: 'deliver', text: result.text };
+  const context = frozenOutputContext(result);
+  if (!evaluateFrozenCommandOutputCondition(when, result)) {
+    const text = `${definition.output.prefix ?? ''}${renderFrozenOutputTemplate(elseOutput.text, context)}${definition.output.suffix ?? ''}`;
+    return { kind: 'deliver', text: truncateFrozenOutput(text, definition.output.maxChars) };
+  }
+  const business = result.businessResult!;
+  const limitedRows = business.rows.slice(0, handoff.maxRows);
+  const handoffContext = { ...context, rows: limitedRows, data: limitedRows };
+  const prompt = renderFrozenOutputTemplate(handoff.prompt, handoffContext);
+  const data = renderFrozenOutputTemplate(handoff.data, handoffContext);
+  const truncation = business.totalRows > limitedRows.length
+    ? `\n\n共 ${business.totalRows} 行，已截断为前 ${limitedRows.length} 行。`
+    : `\n\n共 ${business.totalRows} 行。`;
+  return {
+    kind: 'handoff',
+    prompt: truncateFrozenHandoff(`${prompt}\n\n数据：\n${data}`, truncation, definition.output.maxChars),
+  };
 }
 
 function findKey(value: unknown, key: string, depth = 0): string | undefined {
@@ -798,17 +985,19 @@ export async function executeFrozenCommand(input: {
     }, undefined, { signal: controller.signal, maxTotalTimeout: timeoutMs }) as Record<string, unknown>;
     if (runResult.isError === true) downstreamFailure('run', runResult);
     const queryId = keyFromToolResult(runResult, 'query_id');
+    const businessResult = frozenBusinessResult(runResult);
     const raw = frozenCommandResultText(runResult) || '查询完成，但没有可展示的结果。';
     const decorated = `${input.definition.output.prefix ?? ''}${raw}${input.definition.output.suffix ?? ''}`;
     const truncated = decorated.length > input.definition.output.maxChars;
     return {
       renderedSql,
       referenceDate: rendered.referenceDate,
-      text: truncated
-        ? `${decorated.slice(0, input.definition.output.maxChars)}\n\n（结果已截断）`
-        : decorated,
+      text: truncateFrozenOutput(decorated, input.definition.output.maxChars),
       truncated,
       ...(queryId ? { queryId } : {}),
+      ...(businessResult
+        ? { businessResult: { rows: businessResult.rows, totalRows: businessResult.totalRows } }
+        : {}),
     };
   } catch (error) {
     if (error instanceof FrozenCommandError) throw error;
