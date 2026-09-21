@@ -287,6 +287,78 @@ describe('ReadonlyTaskContinuationCoordinator', () => {
     },
   );
 
+  it.each([TASK_CONTINUATION_ENGINE_DEAD_CODE, TASK_CONTINUATION_CLI_EXIT_CODE])(
+    'migrates the persisted ambiguous backoff %s to awaiting user without replay',
+    errorCode => {
+      const schedule = vi.fn((_delayMs, run) => run);
+      const enqueue = vi.fn(() => 1);
+      const persist = vi.fn();
+      const warn = vi.fn();
+      const coordinator = new ReadonlyTaskContinuationCoordinator({
+        schedule,
+        cancel: vi.fn(),
+        persist,
+        enqueue,
+        warn,
+        enabled: () => true,
+        now: () => 2_000,
+      });
+
+      coordinator.restore(state({
+        status: 'backoff',
+        nextAttemptAt: 3_000,
+        lastErrorCode: errorCode,
+      }));
+
+      expect(schedule).not.toHaveBeenCalled();
+      expect(enqueue).not.toHaveBeenCalled();
+      expect(persist).toHaveBeenCalledOnce();
+      expect(persist).toHaveBeenCalledWith(expect.objectContaining({
+        status: 'awaiting_user',
+        nextAttemptAt: undefined,
+        lastErrorCode: errorCode,
+        pendingWarning: expect.objectContaining({ deliveryAttempts: 0 }),
+      }));
+      expect(warn).toHaveBeenCalledWith(expect.objectContaining({
+        status: 'awaiting_user',
+        lastErrorCode: errorCode,
+      }));
+    },
+  );
+
+  it.each([
+    READONLY_TASK_CONTINUATION_OUTPUT_LIMIT_CODE,
+    TASK_CONTINUATION_RATE_LIMIT_CODE,
+    TASK_CONTINUATION_CONNECTION_CODE,
+    TASK_CONTINUATION_UPSTREAM_CODE,
+  ])('restores the allowlisted persisted backoff %s', errorCode => {
+    const timers: Array<() => void> = [];
+    const enqueue = vi.fn(() => 2);
+    const coordinator = new ReadonlyTaskContinuationCoordinator({
+      schedule: (_delayMs, run) => { timers.push(run); return run; },
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue,
+      warn: vi.fn(),
+      enabled: () => true,
+      now: () => 2_000,
+      randomId: () => 'restored',
+    });
+
+    coordinator.restore(state({
+      status: 'backoff',
+      nextAttemptAt: 3_000,
+      lastErrorCode: errorCode,
+    }));
+    timers.at(-1)!();
+
+    expect(enqueue).toHaveBeenCalledOnce();
+    expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({
+      turnId: 'bmx-continuation-restored',
+      continuation: 1,
+    }));
+  });
+
   it('fails closed for an ambiguous interrupted turn with unknown side effects', () => {
     const coordinator = new ReadonlyTaskContinuationCoordinator({
       schedule: (_delayMs, run) => run,

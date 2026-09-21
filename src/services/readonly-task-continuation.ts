@@ -203,13 +203,18 @@ export function readonlyTaskContinuationRecoversTerminal(
   ].includes(terminal.errorCode ?? '');
 }
 
+function readonlyTaskContinuationAwaitsUserError(errorCode: string | undefined): boolean {
+  return [
+    TASK_CONTINUATION_ENGINE_DEAD_CODE,
+    TASK_CONTINUATION_CLI_EXIT_CODE,
+  ].includes(errorCode ?? '');
+}
+
 function readonlyTaskContinuationAwaitsUserTerminal(
   terminal: ReadonlyTaskContinuationTerminal,
 ): boolean {
-  return terminal.status === 'ambiguous' && [
-    TASK_CONTINUATION_ENGINE_DEAD_CODE,
-    TASK_CONTINUATION_CLI_EXIT_CODE,
-  ].includes(terminal.errorCode ?? '');
+  return terminal.status === 'ambiguous'
+    && readonlyTaskContinuationAwaitsUserError(terminal.errorCode);
 }
 
 /** A deliberately narrow task lease. It never infers completion from prose:
@@ -315,6 +320,18 @@ export class ReadonlyTaskContinuationCoordinator<TTimer = unknown> {
         status: 'expired',
         nextAttemptAt: undefined,
         lastErrorCode: 'readonly_continuation_expired',
+      });
+      return;
+    }
+    // Older builds persisted runtime/CLI crashes as backoff. Those terminals
+    // cannot prove which external side effects completed, so never restore
+    // their timer into a write-capable replay after an upgrade.
+    if (this.state.status === 'backoff'
+      && readonlyTaskContinuationAwaitsUserError(this.state.lastErrorCode)) {
+      this.warnOnce({
+        ...this.state,
+        status: 'awaiting_user',
+        nextAttemptAt: undefined,
       });
       return;
     }
