@@ -30,7 +30,8 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
 import { resolveCliRuntime, runtimeInstallationKey, snapshotCliRuntime } from '../adapters/cli/runtime.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
-import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, uploadFile, UserTokenMissingError } from '../im/lark/client.js';
+import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, uploadFile, uploadImage, UserTokenMissingError } from '../im/lark/client.js';
+import { prepareForkTopic } from '../im/lark/fork-topic.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
@@ -45,6 +46,7 @@ import {
   getProjectScanDirs,
   rememberLastCliInput,
   buildNewTopicCliInput,
+  downloadResources,
   ensureSessionWhiteboard,
   getAvailableBots,
   resumeSession,
@@ -5913,8 +5915,6 @@ export async function startForkSubtopicSession(
   const parentSession = parentDs.session;
   const chatId = parentDs.chatId;
   const brand = normalizeBrand(botCfg.brand);
-  const taskTitle = taskText.split(/\r?\n/).map(line => line.trim()).find(Boolean)?.slice(0, 60)
-    ?? taskText.slice(0, 60);
   const senderIsBot = message.senderType === 'app' || message.senderType === 'bot';
   const triggerSender: ResolvedSender = {
     openId: message.senderId,
@@ -5949,11 +5949,18 @@ export async function startForkSubtopicSession(
       ? threadAppLink(chatId, parentThreadId, brand)
       : chatAppLink(chatId, brand);
 
+    const presentation = await prepareForkTopic(taskText, message, {
+      download: resources => downloadResources(appId, message.messageId, resources, message.senderId),
+      upload: path => uploadImage(appId, path),
+      imageUnavailable: t('cmd.fork.image_unavailable', undefined, loc),
+      fallbackTitle: t('cmd.fork.task_title', undefined, loc),
+    });
+    const childTitle = `${t('cmd.fork.badge', undefined, loc)} ${presentation.title}`;
     const localeKey = loc === 'en' ? 'en_us' : 'zh_cn';
     const seedPost = JSON.stringify({
       [localeKey]: {
-        title: `${t('cmd.fork.badge', undefined, loc)} ${taskText.replace(/\s*\n+\s*/g, ' ').slice(0, 300)}`,
-        content: [[
+        title: childTitle,
+        content: [...presentation.content, [
           ...(senderIsBot ? [] : [{ tag: 'at', user_id: message.senderId }]),
           {
             tag: 'text',
@@ -5981,7 +5988,7 @@ export async function startForkSubtopicSession(
       'group',
       'thread',
       {
-        childTitle: `${t('cmd.fork.badge', undefined, loc)} ${taskTitle}`,
+        childTitle,
         forkTaskText: taskText,
         larkThreadId: childThreadId,
         turnId: message.messageId,
@@ -5992,7 +5999,7 @@ export async function startForkSubtopicSession(
           childSessionId,
           childCliId,
           parentSession.cliLaunchSnapshot?.cliPathOverride ?? parentSession.cliPathOverride ?? botCfg.cliPathOverride,
-          undefined,
+          presentation.attachments,
           undefined,
           availableBots,
           undefined,

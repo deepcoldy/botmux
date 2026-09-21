@@ -270,6 +270,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   },
   deleteMessage: vi.fn(async () => true),
   sendMessage: vi.fn(async () => 'card-msg-id'),
+  uploadImage: vi.fn(async () => 'img_uploaded'),
   // /relay picker replies land anchored at the invocation message / 话题 via
   // replyMessage (reply-at-invocation), not sessionReply. Args mirror the
   // real signature: (appId, messageId, content, msgType, replyInThread).
@@ -378,6 +379,7 @@ vi.mock('../src/core/session-manager.js', () => ({
   // Dynamically imported by the /repo pending-launch path (bare /repo + repo selection).
   buildNewTopicPrompt: vi.fn((prompt: string) => `WRAPPED:${prompt}`),
   buildNewTopicCliInput: vi.fn((prompt: string) => ({ content: `WRAPPED:${prompt}` })),
+  downloadResources: vi.fn(async () => ({ attachments: [], needLogin: false })),
   ensureSessionWhiteboard: vi.fn((ds: any) => { ds.session.whiteboardId = 'wb_test'; }),
   getAvailableBots: vi.fn(async () => []),
   resumeSession: vi.fn(),
@@ -1755,6 +1757,33 @@ describe('handleCommand', () => {
   });
 
   describe('/fork sub-topic', () => {
+    it.each(['codex', 'claude-code'] as const)('passes post images into the %s first turn and renders them in the root', async cliId => {
+      const { downloadResources } = await import('../src/core/session-manager.js');
+      const attachments = [{ type: 'image' as const, path: '/tmp/fork-image.jpg', name: 'img_source.jpg' }];
+      vi.mocked(downloadResources).mockResolvedValueOnce({ attachments, needLogin: false });
+      const ds = makeDaemonSession({ scope: 'thread', session: makeSession({ cliId, scope: 'thread' }) });
+      const task = '检查图片 https://example.com/docs [图片 1]';
+      const result = await startForkSubtopicSession(task, ds, makeLarkMessage(`/fork ${task}`, {
+        msgType: 'post',
+        threadId: 'omt_parent',
+        rawPostContent: JSON.stringify({ content: [
+          [{ tag: 'text', text: '/fork 检查图片 ' }, { tag: 'a', text: '设计文档', href: 'https://example.com/docs' }],
+          [{ tag: 'img', image_key: 'img_source' }],
+        ] }),
+      }), LARK_APP_ID);
+      expect(result.ok).toBe(true);
+      const seed = JSON.parse(vi.mocked(sendMessage).mock.calls[0][2]).zh_cn;
+      expect(seed.title).toBe('[分身] 检查图片 设计文档');
+      expect(seed.content[1]).toEqual([{ tag: 'img', image_key: 'img_uploaded' }]);
+      expect(seed.content.at(-1).at(-1).href).toContain('omt_parent');
+      expect(downloadResources).toHaveBeenLastCalledWith(LARK_APP_ID, 'msg_001',
+        [{ type: 'image', key: 'img_source', name: 'img_source.jpg' }], 'ou_sender');
+      const options = vi.mocked(forkSession).mock.calls[0][5]!;
+      options.buildInitialPrompt?.('child-sess-1');
+      expect(vi.mocked(buildNewTopicCliInput).mock.calls.at(-1)?.[4]).toEqual(attachments);
+      expect(options.forkTaskText).toBe(task);
+    });
+
     it('creates a child topic and forwards the multiline task as the first fork turn', async () => {
       const ds = makeDaemonSession({
         scope: 'thread',

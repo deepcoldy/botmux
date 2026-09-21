@@ -547,6 +547,7 @@ export function parseEventMessage(
     senderUnionId: sender.sender_id?.union_id,
     senderType: sender.sender_type,
     msgType: message.message_type,
+    ...(message.message_type === 'post' ? { rawPostContent: message.content } : {}),
     content: extractTextContent(message.message_type, message.content, message.mentions, numberer),
     createTime: message.create_time,
     mentions,
@@ -570,6 +571,7 @@ export function parseApiMessage(msg: any, numberer?: ImgNumberer): LarkMessage {
     senderType: msg.sender?.sender_type ?? 'unknown',
     ...(senderName ? { senderName } : {}),
     msgType,
+    ...(msgType === 'post' ? { rawPostContent: rawContent } : {}),
     content: extractTextContent(msgType, normalizeApiMessageContent(msgType, rawContent), undefined, numberer),
     createTime: msg.create_time ?? '',
   };
