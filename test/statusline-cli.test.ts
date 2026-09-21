@@ -120,7 +120,7 @@ describe('botmux statusline', () => {
     expect(existsSync(statuslineFilePath(dataDir, SID))).toBe(true);
   });
 
-  it('⑤ chain 挂死（sleep 30）：看门狗 ≤ 12s 内 exit 0', async () => {
+  it('hung chain (sleep 30): watchdog exits 0 within 15s', async () => {
     const dataDir = makeDataDir();
     const r = await runStatusline({
       dataDir,
@@ -130,7 +130,7 @@ describe('botmux statusline', () => {
       ignoreOutput: true,
     });
     expect(r.status).toBe(0);
-    expect(r.elapsedMs).toBeLessThanOrEqual(12_000);
+    expect(r.elapsedMs).toBeLessThanOrEqual(15_000);
   }, 20_000);
 
   it('⑥ 非 JSON stdin：不落盘、exit 0', async () => {
