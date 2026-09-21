@@ -5,6 +5,12 @@ import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
 import type { CodexReasoningEffort } from '../services/codex-reasoning-effort.js';
 import type { Session } from '../types.js';
+import {
+  dispatchLaunchPolicyDigest,
+  effectiveOverrideSchema,
+  requestedOverrideSchema,
+  type DispatchLaunchPolicyV1,
+} from './dispatch-launch-contract.js';
 
 export interface DispatchLaunchSelection {
   requested: { model?: string; reasoningEffort?: CodexReasoningEffort };
@@ -19,6 +25,8 @@ export interface DispatchLaunchBinding extends DispatchLaunchSelection {
   createdAt: string;
   expiresAt: string;
   sessionId?: string;
+  /** Frozen digest of the target policy that authorised this binding. */
+  policyDigest?: string;
 }
 
 type BindingFile = { version: 1; bindings: Record<string, DispatchLaunchBinding> };
@@ -49,25 +57,33 @@ function write(path: string, value: BindingFile): void {
   });
 }
 
-/** Register once; an exact replay is a no-op and a changed tuple fails closed. */
+/** Register once; an exact replay is a no-op and a changed tuple fails closed.
+ *  The `requested` / `effective` fields are schema-parsed at the boundary so a
+ *  malformed enum, extra key or missing model can never reach the on-disk store
+ *  (nor, via applyDispatchLaunchBinding, the codex argv). */
 export function registerDispatchLaunchBinding(
   dataDir: string,
   binding: DispatchLaunchBinding,
 ): DispatchLaunchBinding {
+  const validated: DispatchLaunchBinding = {
+    ...binding,
+    requested: requestedOverrideSchema.parse(binding.requested),
+    effective: effectiveOverrideSchema.parse(binding.effective),
+  };
   const path = dispatchLaunchBindingsPath(dataDir);
   return withFileLockSync(path, () => {
     const file = read(path);
-    const bindingKey = key(binding);
+    const bindingKey = key(validated);
     const existing = file.bindings[bindingKey];
     if (existing) {
-      const same = JSON.stringify(existing.requested) === JSON.stringify(binding.requested)
-        && JSON.stringify(existing.effective) === JSON.stringify(binding.effective);
+      const same = JSON.stringify(existing.requested) === JSON.stringify(validated.requested)
+        && JSON.stringify(existing.effective) === JSON.stringify(validated.effective);
       if (!same) throw new Error('dispatch launch binding conflicts with an existing launch spec');
       return existing;
     }
-    file.bindings[bindingKey] = binding;
+    file.bindings[bindingKey] = validated;
     write(path, file);
-    return binding;
+    return validated;
   });
 }
 
@@ -97,6 +113,7 @@ export function applyDispatchLaunchBinding(
   dataDir: string,
   session: Session,
   targetLarkAppId: string,
+  targetPolicy?: DispatchLaunchPolicyV1,
 ): DispatchLaunchBinding | null {
   const binding = bindDispatchLaunchToSession(dataDir, {
     targetLarkAppId,
@@ -105,6 +122,16 @@ export function applyDispatchLaunchBinding(
     sessionId: session.sessionId,
   });
   if (!binding) return null;
+  // Digest comparison is the target-side fail-closed gate promised by the PR
+  // contract ("target end is authoritative"): the source stamps the policy
+  // digest at register time, and if the target policy has drifted since then
+  // (rotated allow-lists, disabled, or removed entirely) we refuse to activate
+  // the binding — mirrors the direct-IPC coordinator's POLICY_CHANGED behaviour.
+  const expected = binding.policyDigest;
+  const current = targetPolicy ? dispatchLaunchPolicyDigest(targetPolicy) : undefined;
+  if (expected !== undefined && expected !== current) {
+    return null;
+  }
   session.dispatchLaunchSpec = {
     version: 1,
     targetLarkAppId: binding.targetLarkAppId,

@@ -32,8 +32,12 @@ export interface SessionRow extends SessionMessagePreview {
   botName: string;
   cliId: CliId | 'unknown';
   requestedLaunch?: NonNullable<Session['dispatchLaunchSpec']>['requested'];
+  /** Only populated once the worker has actually observed the runtime (i.e. the
+   *  session carries dispatchLaunchSpec.effectiveRuntime). No synthetic
+   *  "requested-as-effective" fallback: consumers that need pre-observation
+   *  intent must read requestedLaunch. */
   effectiveRuntime?: {
-    model: string; reasoningEffort?: string; observed: boolean;
+    model: string; reasoningEffort?: string;
     workerGeneration?: number; observedAt?: string;
   };
   /** Concrete distribution identity frozen on the session. Older path-only
@@ -259,9 +263,9 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     cliId: ds.session.cliId ?? 'unknown',
     ...(ds.session.dispatchLaunchSpec ? {
       requestedLaunch: ds.session.dispatchLaunchSpec.requested,
-      effectiveRuntime: ds.session.dispatchLaunchSpec.effectiveRuntime
-        ? { ...ds.session.dispatchLaunchSpec.effectiveRuntime, observed: true }
-        : { ...ds.session.dispatchLaunchSpec.effective, observed: false },
+      ...(ds.session.dispatchLaunchSpec.effectiveRuntime
+        ? { effectiveRuntime: ds.session.dispatchLaunchSpec.effectiveRuntime }
+        : {}),
     } : {}),
     cliInstanceId: ds.session.cliInstanceBinding?.instanceId ?? undefined,
     cliInstanceSource: ds.session.cliInstanceBinding?.source,
@@ -338,9 +342,9 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     cliId: s.cliId ?? 'unknown',
     ...(s.dispatchLaunchSpec ? {
       requestedLaunch: s.dispatchLaunchSpec.requested,
-      effectiveRuntime: s.dispatchLaunchSpec.effectiveRuntime
-        ? { ...s.dispatchLaunchSpec.effectiveRuntime, observed: true }
-        : { ...s.dispatchLaunchSpec.effective, observed: false },
+      ...(s.dispatchLaunchSpec.effectiveRuntime
+        ? { effectiveRuntime: s.dispatchLaunchSpec.effectiveRuntime }
+        : {}),
     } : {}),
     cliInstanceId: s.cliInstanceBinding?.instanceId ?? undefined,
     cliInstanceSource: s.cliInstanceBinding?.source,
@@ -395,9 +399,9 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     cliId: s.cliId ?? 'unknown',
     ...(s.dispatchLaunchSpec ? {
       requestedLaunch: s.dispatchLaunchSpec.requested,
-      effectiveRuntime: s.dispatchLaunchSpec.effectiveRuntime
-        ? { ...s.dispatchLaunchSpec.effectiveRuntime, observed: true }
-        : { ...s.dispatchLaunchSpec.effective, observed: false },
+      ...(s.dispatchLaunchSpec.effectiveRuntime
+        ? { effectiveRuntime: s.dispatchLaunchSpec.effectiveRuntime }
+        : {}),
     } : {}),
     cliInstanceId: s.cliInstanceBinding?.instanceId ?? undefined,
     cliInstanceSource: s.cliInstanceBinding?.source,

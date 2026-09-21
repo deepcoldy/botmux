@@ -366,6 +366,9 @@ import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js
 import {
   DISPATCH_LAUNCH_ID_RE,
   dispatchLaunchIdentityDigest,
+  effectiveOverrideSchema,
+  evaluateDispatchLaunchPolicy,
+  requestedOverrideSchema,
 } from './core/dispatch-launch-contract.js';
 import { createDispatchLaunchOperationStore } from './core/dispatch-launch-operation-store.js';
 import { createDispatchLaunchAdmissionStore } from './core/dispatch-launch-admission-store.js';
@@ -6476,11 +6479,26 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
       .map(item => item.trim()).filter(Boolean).slice(0, 64)
     : [];
   const targetAppIds = stringArray(body?.targetAppIds);
-  const requestedLaunch = body?.requestedLaunch as any;
-  const effectiveRuntime = body?.effectiveRuntime as any;
-  if ((requestedLaunch !== undefined || effectiveRuntime !== undefined)
-      && (targetAppIds.length !== 1 || !requestedLaunch || !effectiveRuntime)) {
-    return jsonRes(res, 400, { ok: false, error: 'invalid_dispatch_launch_spec' });
+  const rawRequestedLaunch = body?.requestedLaunch;
+  const rawEffectiveRuntime = body?.effectiveRuntime;
+  const hasLaunchSpec = rawRequestedLaunch !== undefined || rawEffectiveRuntime !== undefined;
+  // Zod-parse both sides at the daemon boundary so a malformed enum, extra key,
+  // or missing model can never reach on-disk bindings — nor (via
+  // applyDispatchLaunchBinding) the codex `-c model_reasoning_effort=` argv.
+  // The classic `--repo` path used to trust `as any` truthiness only.
+  let requestedLaunch: import('./core/dispatch-launch-contract.js').DispatchLaunchRequestedOverride | undefined;
+  let effectiveRuntime: import('./core/dispatch-launch-contract.js').DispatchLaunchEffectiveOverride | undefined;
+  if (hasLaunchSpec) {
+    if (targetAppIds.length !== 1 || rawRequestedLaunch === undefined || rawEffectiveRuntime === undefined) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_dispatch_launch_spec' });
+    }
+    const requestedParsed = requestedOverrideSchema.safeParse(rawRequestedLaunch);
+    const effectiveParsed = effectiveOverrideSchema.safeParse(rawEffectiveRuntime);
+    if (!requestedParsed.success || !effectiveParsed.success) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_dispatch_launch_spec' });
+    }
+    requestedLaunch = requestedParsed.data;
+    effectiveRuntime = effectiveParsed.data;
   }
   const groupMode = readGroupCollaborationMode(config.session.dataDir, ds.chatId);
   const dispatchPolicy = evaluateProjectDispatchPolicy({
@@ -6494,6 +6512,31 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     existingDispatch: false,
   });
   if (!dispatchPolicy.ok) return jsonRes(res, 403, dispatchPolicy);
+
+  // The classic `--repo` path is now subject to the same target-authoritative
+  // dispatch launch policy that gates the direct-IPC coordinator: when a launch
+  // spec is present, the target's policy is the authority — a missing/disabled
+  // policy, or a spec that fails the enum/allow-list, must fail closed so
+  // untrusted requested strings never enter the on-disk binding or codex argv.
+  let policyDigest: string | undefined;
+  if (hasLaunchSpec && effectiveRuntime) {
+    const targetAppId = targetAppIds[0]!;
+    const targetBotCfg = getAllBots().find(bot => bot.config.larkAppId === targetAppId)?.config;
+    const evaluation = evaluateDispatchLaunchPolicy({
+      policy: targetBotCfg?.dispatchLaunchPolicy,
+      sourceLarkAppId: ds.larkAppId,
+      effective: effectiveRuntime,
+    });
+    if (!evaluation.ok) {
+      return jsonRes(res, 403, {
+        ok: false,
+        error: 'dispatch_launch_policy_denied',
+        errorCode: evaluation.errorCode,
+        message: evaluation.message,
+      });
+    }
+    policyDigest = evaluation.policyDigest;
+  }
 
   let dispatchRoot: string;
   try {
@@ -6510,6 +6553,7 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
       version: 1, targetLarkAppId: targetAppIds[0]!, chatId: targetChatId,
       rootMessageId: dispatchRoot, requested: requestedLaunch, effective: effectiveRuntime,
       createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+      ...(policyDigest !== undefined ? { policyDigest } : {}),
     });
   }
   const bindingSecret = loadOrCreateDashboardSecret(
@@ -23205,7 +23249,12 @@ async function handleThreadReplyAdmitted(
         session.lastMessageAt = new Date(now).toISOString();
         session.scope = scope;
         fillNativeTopicId(session, scope, parsed.threadId);
-        applyDispatchLaunchBinding(config.session.dataDir, session, larkAppId);
+        applyDispatchLaunchBinding(
+          config.session.dataDir,
+          session,
+          larkAppId,
+          getBot(larkAppId).config.dispatchLaunchPolicy,
+        );
         // Twin of the new-topic pre-create block above: resolve the pinned dir
         // for EVERY session-needing daemon command, not just `/repo`, and skip
         // the pin when it would have meant auto-worktree. Same reasoning — this
@@ -23834,7 +23883,12 @@ async function handleThreadReplyAdmitted(
     if (parsed.senderType === 'user' && !isForeignBot) stampHumanActivity(session, now);
     session.scope = scope;
     fillNativeTopicId(session, scope, parsed.threadId);
-    applyDispatchLaunchBinding(config.session.dataDir, session, larkAppId);
+    applyDispatchLaunchBinding(
+      config.session.dataDir,
+      session,
+      larkAppId,
+      getBot(larkAppId).config.dispatchLaunchPolicy,
+    );
     const groupChatName = await groupChatNamePromise;
     if (groupChatName) session.chatDisplayName = groupChatName;
     session.nativeSessionTitle = buildBotmuxLarkNativeSessionTitle(

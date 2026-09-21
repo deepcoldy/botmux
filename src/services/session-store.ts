@@ -1897,6 +1897,7 @@ export function createDispatchLaunchSession(input: {
     chatType: input.chatType, rootMessageId: input.rootMessageId, scope: 'thread',
     title: input.title, status: 'active', createdAt: new Date().toISOString(),
     workingDir: input.workingDir, larkAppId: input.larkAppId,
+    reasoningEffort: input.effectiveOverride.reasoningEffort,
     dispatchLaunchSpec: {
       version: 1, targetLarkAppId: input.larkAppId, chatId: input.chatId,
       rootMessageId: input.rootMessageId, requested: input.requestedOverride,

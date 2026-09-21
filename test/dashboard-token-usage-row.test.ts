@@ -59,15 +59,21 @@ describe('dashboard SessionRow status projection', () => {
       effective: { model: 'gpt-6-astra', reasoningEffort: 'high' },
       createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(),
     };
-    expect(composeRowFromActive(ds)).toMatchObject({
+    // Pre-observation: only the requested intent is exposed; there is no
+    // "synthesised" effective runtime until the worker actually observed one.
+    const beforeObserved = composeRowFromActive(ds);
+    expect(beforeObserved).toMatchObject({
       requestedLaunch: { model: 'gpt-6-astra', reasoningEffort: 'high' },
-      effectiveRuntime: { model: 'gpt-6-astra', reasoningEffort: 'high', observed: false },
     });
+    expect(beforeObserved.effectiveRuntime).toBeUndefined();
     ds.session.dispatchLaunchSpec.effectiveRuntime = {
       model: 'gpt-6-astra', reasoningEffort: 'high', workerGeneration: 2,
       observedAt: '2026-09-21T01:00:00.000Z',
     };
-    expect(composeRowFromActive(ds).effectiveRuntime).toMatchObject({ observed: true, workerGeneration: 2 });
+    expect(composeRowFromActive(ds).effectiveRuntime).toEqual({
+      model: 'gpt-6-astra', reasoningEffort: 'high', workerGeneration: 2,
+      observedAt: '2026-09-21T01:00:00.000Z',
+    });
   });
 
   it('projects working (not starting) during a long first turn once the worker initialized', () => {

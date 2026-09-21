@@ -5072,9 +5072,9 @@ async function cmdList(): Promise<void> {
         ...session,
         ...(session.dispatchLaunchSpec ? {
           requestedLaunch: session.dispatchLaunchSpec.requested,
-          effectiveRuntime: session.dispatchLaunchSpec.effectiveRuntime
-            ? { ...session.dispatchLaunchSpec.effectiveRuntime, observed: true }
-            : { ...session.dispatchLaunchSpec.effective, observed: false },
+          ...(session.dispatchLaunchSpec.effectiveRuntime ? {
+            effectiveRuntime: session.dispatchLaunchSpec.effectiveRuntime,
+          } : {}),
         } : {}),
       })),
     }));
@@ -12105,7 +12105,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       targetLarkAppId: target.appId,
       chatId: targetChatId,
       kickoff: canonicalizeDispatchLaunchKickoff({
-        title: title.trim(), brief: standby ? '等待后续业务任务。' : brief,
+        title: title.trim(), brief,
         ...(target.role ? { role: target.role } : {}),
         sourceDisplay: appId, targetLarkAppId: target.appId,
       }),
@@ -12118,21 +12118,42 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       targetDaemon,
       now: () => new Date(),
     });
-    const prepared = await coordinator.prepare(request);
+    // validateRequestAuthority throws plain Error (not DispatchLaunchFailure)
+    // when the target daemon does not advertise IPC v1 or is behind a stale
+    // findDaemon lookup. Convert to a human-readable exit instead of letting
+    // the stack trace bubble out of the CLI.
+    let prepared: Awaited<ReturnType<typeof coordinator.prepare>>;
+    try {
+      prepared = await coordinator.prepare(request);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`DISPATCH_LAUNCH_UNAVAILABLE: ${message}`);
+      process.exit(1);
+    }
     if (!prepared.ok) {
       console.error(`${prepared.errorCode}: ${prepared.message}`);
       process.exit(1);
     }
-    const started = await coordinator.start(dispatchId);
+    let started: Awaited<ReturnType<typeof coordinator.start>>;
+    try {
+      started = await coordinator.start(dispatchId);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`DISPATCH_LAUNCH_UNAVAILABLE: ${message}`);
+      process.exit(1);
+    }
     if (!started.ok) {
       console.error(`${started.errorCode}: ${started.message}`);
       process.exit(1);
     }
     const operation = started.operation;
+    // Direct-IPC dispatch requires !repo; --standby was rejected above when it
+    // arrived without --repo. So `standby` is provably false in this branch —
+    // do not compute `!standby` / `standby ? ...` here.
     console.log(JSON.stringify({
       success: operation.state === 'awaiting_proof' || operation.state === 'succeeded',
-      taskSent: !standby,
-      mode: standby ? 'standby' : 'dispatch',
+      taskSent: true,
+      mode: 'dispatch',
       sourceSessionId: sid,
       targetAppIds: [target.appId],
       threadRootId: 'rootMessageId' in operation ? operation.rootMessageId : null,
@@ -12236,7 +12257,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         owners: bots.map(bot => bot.name ?? bot.openId),
         ...(requestedLaunch && effectiveRuntime ? {
           requestedLaunch,
-          effectiveRuntime: { ...effectiveRuntime, observed: false },
+          effectiveRuntime,
         } : {}),
       },
     });
@@ -12341,7 +12362,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       projectSynced,
       ...(requestedLaunch && effectiveRuntime ? {
         requestedLaunch,
-        effectiveRuntime: { ...effectiveRuntime, observed: false },
+        effectiveRuntime,
       } : {}),
       ...(acceptance ? {
         accepted,

@@ -182,18 +182,23 @@ export interface DispatchLaunchProofV1 {
 export interface DispatchLaunchRuntimeObservationV1 {
   model: string;
   reasoningEffort?: CodexReasoningEffort;
-  observed: boolean;
   workerGeneration?: number;
   observedAt?: string;
 }
 
+/** Read-only projection of the operation for the source-side CLI receipt.
+ *  The CLI returns immediately after `start`, so it never queries the target
+ *  runtime — `effectiveRuntime` is therefore only present after a real
+ *  runtime observation (proof or session projection). Callers that want the
+ *  "observed" side must poll the target daemon (dashboard sessions API);
+ *  the CLI receipt intentionally omits the field when nothing has been
+ *  observed yet, rather than returning a permanently-false shape. */
 export function dispatchLaunchInspection(operation: DispatchLaunchOperationV1): {
   dispatchId: string;
   state: DispatchLaunchOperationState;
   requestedLaunch: DispatchLaunchRequestedOverride;
   effectiveRuntime?: DispatchLaunchRuntimeObservationV1;
 } {
-  const effective = 'effectiveOverride' in operation ? operation.effectiveOverride : undefined;
   const observed = operation.state === 'succeeded' ? operation.proof.runtimeObserved : undefined;
   return {
     dispatchId: operation.dispatchId,
@@ -203,11 +208,10 @@ export function dispatchLaunchInspection(operation: DispatchLaunchOperationV1): 
       effectiveRuntime: {
         model: observed.model,
         ...(observed.reasoningEffort ? { reasoningEffort: observed.reasoningEffort } : {}),
-        observed: true,
         workerGeneration: observed.workerGeneration,
         observedAt: observed.observedAt,
       },
-    } : effective ? { effectiveRuntime: { ...effective, observed: false } } : {}),
+    } : {}),
   };
 }
 
@@ -355,7 +359,7 @@ const timestampSchema = z.string().datetime({ offset: true });
 const reasoningEffortSchema = z.enum(CODEX_REASONING_EFFORTS);
 const modelSchema = controlledString(DISPATCH_LAUNCH_CONTROL_LIMITS.modelChars);
 
-const requestedOverrideSchema = z.object({
+export const requestedOverrideSchema = z.object({
   model: modelSchema.optional(),
   reasoningEffort: reasoningEffortSchema.optional(),
 }).strict().refine(
@@ -363,7 +367,7 @@ const requestedOverrideSchema = z.object({
   'at least one launch override is required',
 );
 
-const effectiveOverrideSchema = z.object({
+export const effectiveOverrideSchema = z.object({
   model: modelSchema,
   reasoningEffort: reasoningEffortSchema.optional(),
 }).strict();

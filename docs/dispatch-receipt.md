@@ -41,15 +41,17 @@ launch-model 与 reasoning compatibility 校验。catalog 不可读、模型不�
 ```json
 {
   "requestedLaunch": { "model": "gpt-6-astra", "reasoningEffort": "high" },
-  "effectiveRuntime": { "model": "gpt-6-astra", "reasoningEffort": "high", "observed": false }
+  "effectiveRuntime": { "model": "gpt-6-astra", "reasoningEffort": "high" }
 }
 ```
 
-`observed: false` 表示这是启动前已验证并冻结的有效规格。目标 Worker 启动后，
-`GET /api/sessions/:sessionId`（以及 sessions 只读列表）返回相同的
-`requestedLaunch`，并把 `effectiveRuntime.observed` 置为 `true`，同时携带 Worker
-实际上报的 model、reasoning effort、generation 和观测时间。调用方应等到
-`observed: true` 且 requested/effective 匹配后再发送业务 brief。
+`requestedLaunch` 是调用方在派发时请求的规格，`effectiveRuntime` 是目标端 policy
+校验后冻结、随 session 持久化并会真实喂给 Worker 启动参数的最终值；调用方应据此
+判断请求是否被降级或改写。CLI 回执只反映"启动前已冻结"的意图，本身不代表 Worker
+已经把它落进了运行时。要确认 Worker 真正在跑的 model/effort，需要向目标 daemon
+的 `GET /api/sessions/:sessionId`（或 sessions 只读列表）二次查询，该接口只有在
+Worker 上报真实观测后才会返回带 `workerGeneration` / `observedAt` 的
+`effectiveRuntime`（未观测时该字段直接缺省，不再回退成 requested 的镜像）。
 
 绑定键是 exact `targetLarkAppId + chatId + rootMessageId`，有 10 分钟首次消费窗口；
 重复登记同一规格幂等，不同规格冲突，绑定一旦归属 session 后不能被另一 session 消费。
