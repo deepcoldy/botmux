@@ -31,16 +31,17 @@ scratch 专属字段（均可选）：
 - `scratchTmpfsSizeMb`：tmpfs 容量上限（0=内核默认 ≈ 半内存）；大构建可调大或用 disk。
 - `scratchDenyPaths`：在「读全盘」之上额外遮罩的路径（mode-000 空源，同 oncall deny 编译）。botmux 自身传输凭证（bots.json 及 sidecar、dashboard secret、每会话沙盒树）**固定遮罩不可配开**；`~/.ssh`/`~/.aws` 不遮（git ssh/云 CLI 要用），需要时自行加。
 
-### macOS 实现（APFS clonefile，与 Linux 的语义差异）
+### macOS 实现（APFS clonefile 软链农场 + Seatbelt，与 Linux 的语义差异）
 
-macOS 没有 per-process 挂载命名空间、Seatbelt 也没有「写重定向」原语，所以 scratch 在 mac 上是另一套机制，目标体验一致：
+macOS 没有 per-process 挂载命名空间、Seatbelt 也没有「写重定向」原语。最初尝试整份克隆 \$HOME，在真机（日常 319 万文件账号）上被否：TCC 保护树（Containers/Application Support/CloudDocs）让 `cp` 确定非零退出，`clonefileat(2)` 在 iCloud 在线占位文件上无限挂起。最终用**软链农场 + 选择性 clonefile**：
 
-- 会话开始用 `cp -cR`（APFS clonefile）**克隆 \$HOME**；项目在 \$HOME 外时再克隆项目目录。clonefile 是写时复制：**克隆瞬间零数据块占用**（无论 HOME 多大），会话期间只有被 CLI 实际修改的块（4KB 粒度）占空间，结束删副本全部归还。
-- 子进程 `HOME` 指向克隆副本，`TMPDIR` 指向每会话私有临时目录；Seatbelt profile 先全局 `(deny file-write*)`，再只放行克隆树 / 私有 TMPDIR / 真实 outbox。读取全程放开（保留原生 \~/.claude、\~/.codex 登录态、工具链零配置）。
-- **与 Linux 的唯一语义差**：系统位置（`/etc`、`/opt/homebrew` 等）的写**直接被拒绝（EPERM）而不是进副本**——mac 无法对系统路径做 per-process COW。HOME/dotfile 改造、项目内任意写、npm/pip 装到用户目录、临时文件都正常且即焚；系统级 brew install 做不了。
-- 跨卷不克隆：源（HOME/项目）必须与 botmux data 目录在**同一 APFS 卷**，否则 fail-closed 报错（绝不静默退化成整份字节拷贝）；克隆后用 statfs 空闲块差值校验确实走了 clonefile（`cp -cR` 对特殊文件会静默回退字节拷贝，>128MB 漂移判失败）。
-- 没有 tmpfs/disk 之分（APFS COW 本身即「只占改动量」，由文件系统/swap 管理）；`scratchStorage` 在 mac 上接受但忽略。
-- 真机验收脚本（在 Mac 上跑）：`node scripts/scratch-sandbox-darwin-probe.mjs`（克隆零占盘、副本写宿主零泄漏、系统写被拒、outbox 穿透、清理）。
+- 克隆 HOME 里每个顶层条目默认是一条指向真实文件的**符号链接**（读取原生、零拷贝；TCC/iCloud 树永不遍历，挂死/权限问题从根上消失）。
+- 只有 CLI 要写的状态做**真实 clonefile 副本**（`cp -c` 无 -p，COW：拷贝零数据块，只占改动）：所有顶层点目录（`.claude`/`.codex`/`.trae`/`.config`/`.cache`/`.npm`/…）和顶层 dotfile（含每次更新的 `.claude.json`）；**botmux 凭证根（\$HOME/.botmux 等）例外，保持软链**，靠 profile 对真实路径的 read+write deny 封口（Seatbelt 按软链解析后的真实路径匹配，11 种 symlink/hardlink 变体真机验证有效，硬链接也被 clonefile 切断）。非点目录（Desktop/Documents/Library）是软链，读原生、写被拒。
+- 项目在 \$HOME 外时单独 clonefile 项目目录；跨 APFS 卷 fail-closed（dev 比对，绝不退化成字节拷贝）；每次 `cp` 有 5 分钟超时（云占位挂死不拖垮 worker）+ 按子树逻辑大小校验真 COW（异常大量占盘判失败）。
+- 子进程 `HOME` 指克隆农场，`TMPDIR` 指每会话私有临时；Seatbelt 先全局 `(deny file-write*)`，放行克隆树/私有 tmp/真实 outbox，再放行 Foundation/cfprefsd 无视 HOME 硬写的主机缓存（/private/tmp、/private/var/tmp、/private/var/folders、~/Library/{Caches,Application Support,Logs}），**凭证 read+write deny 放最后保证最终匹配生效**。
+- **与 Linux 的语义差**：① 系统位置（/etc、brew）写直接 EPERM 不进副本；② `~/Library` 与 /private/var/folders 这类经系统守护进程（cfprefsd/Foundation，走 mach 不经文件策略）落盘的缓存/日志/偏好**可能出现在真机**——不属于即焚保证，其中 claude CLI 的 per-project MCP 流量日志（~/Library/Caches/claude-cli-nodejs，含 sessionId/cwd）已专门加最终 write-deny（claude 对该 EPERM 无感知，真机验证不崩）；需要更强保密用 oncall。
+- cleanup 先 `chflags nouchg` + `chmod -RN` 去 flags/ACL 再删（克隆不复制 ACL/flags，残根基本只含软链）；chdirInSandbox 持久化进 meta，reattach 不退化。
+- `scratchStorage` 在 mac 上接受但忽略（APFS COW 本身只占改动量）。真机验收：`node scripts/scratch-sandbox-darwin-probe.mjs`（建议再跑一次真 claude E2E）。
 
 ## scratch 工作原理（已在 live 机实测）
 
