@@ -73,10 +73,37 @@ describe('Midscene CI summary', () => {
     expect(markdown).toContain('Botmux × Midscene · passed with skips');
     expect(markdown).toContain('1/3 cases passed · 0 failed · 2 skipped');
     expect(markdown).toContain(
-      '| ⏭️ Aiden basic bot flow | feishu-browser | skipped | 0 |',
+      '| ⏭️ Aiden basic bot flow | — | feishu-browser | skipped | 0 |',
     );
     expect(markdown).toContain(
-      '| ⏭️ Streaming card lifecycle | feishu-browser | skipped | 0 |',
+      '| ⏭️ Streaming card lifecycle | — | feishu-browser | skipped | 0 |',
     );
+  });
+
+  it('links each executed case to its published step and screenshot', () => {
+    const markdown = renderSummary({
+      artifactName: 'botmux-midscene-report',
+      testOutcome: 'success',
+      pagesUrl: 'https://deepcoldy.github.io/botmux-midscene/pr-1512/',
+      evidenceCases: [{
+        name: 'Dashboard smoke',
+        project: 'dashboard-smoke',
+        reportPath: 'dashboard/index.html',
+        previewPath: 'previews/dashboard.jpg',
+        stepId: 'attempt:steps:6',
+      }],
+      summary: {
+        status: 'success',
+        durationMs: 1000,
+        summary: { total: 1, passed: 1, failed: 0, notRun: 0 },
+        projects: [{
+          name: 'dashboard-smoke',
+          cases: [{ name: 'Dashboard smoke', status: 'success', attempts: [{}] }],
+        }],
+      },
+    });
+
+    expect(markdown).toContain('dashboard/index.html#runner-step=attempt%3Asteps%3A6');
+    expect(markdown).toContain('previews/dashboard.jpg');
   });
 });

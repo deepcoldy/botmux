@@ -5,6 +5,7 @@ import path from 'node:path';
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { parse as parseYaml } from 'yaml';
+import { reportCases, testRunDump } from './midscene-report-evidence.mjs';
 
 function parseArguments(argv) {
   const options = {};
@@ -28,14 +29,18 @@ function required(options, name) {
 async function findReportIndexes(root) {
   const matches = [];
   async function visit(directory) {
-    for (const entry of await readdir(directory, { withFileTypes: true })) {
+    let entries = [];
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === 'ENOENT') return;
+      throw error;
+    }
+    for (const entry of entries) {
       const candidate = path.join(directory, entry.name);
       if (entry.isDirectory()) await visit(candidate);
       else if (entry.isFile() && entry.name === 'index.html') {
-        matches.push({
-          file: candidate,
-          modifiedAt: (await stat(candidate)).mtimeMs,
-        });
+        matches.push({ file: candidate, modifiedAt: (await stat(candidate)).mtimeMs });
       }
     }
   }
@@ -65,7 +70,12 @@ function escapeHtml(value) {
     .replaceAll("'", '&#39;');
 }
 
-async function readSkippedCases(root) {
+function formatDuration(value) {
+  if (!Number.isFinite(value)) return '—';
+  return value < 1000 ? `${value} ms` : `${(value / 1000).toFixed(1)} s`;
+}
+
+async function readYamlCases(root) {
   const files = await findFiles(root, (name) => /\.ya?ml$/i.test(name));
   const cases = [];
   for (const file of files.sort()) {
@@ -77,16 +87,52 @@ async function readSkippedCases(root) {
   return cases;
 }
 
-function landingPage({ passedCases, skippedCases }) {
-  const rows = [
-    ...passedCases.map(
-      (name) => `<tr><td>✅</td><td>${escapeHtml(name)}</td><td>dashboard-smoke</td><td><strong>passed</strong></td></tr>`,
-    ),
-    ...skippedCases.map(
-      (name) => `<tr><td>⏭️</td><td>${escapeHtml(name)}</td><td>feishu-browser</td><td>skipped</td></tr>`,
-    ),
-  ].join('\n');
-  const total = passedCases.length + skippedCases.length;
+async function loadProjectReport({ reportRoot, projectName, output, slug }) {
+  for (const report of await findReportIndexes(reportRoot)) {
+    const html = await readFile(report.file, 'utf8');
+    const run = testRunDump(html);
+    if (!run?.projects?.some((project) => project.name === projectName)) continue;
+    const cases = await reportCases(run, projectName, { html, reportFile: report.file });
+    await cp(path.dirname(report.file), path.join(output, slug), { recursive: true });
+    await mkdir(path.join(output, 'previews'), { recursive: true });
+    for (const testCase of cases) {
+      if (!testCase.previewFile || !testCase.screenshot) continue;
+      await writeFile(
+        path.join(output, 'previews', testCase.previewFile),
+        testCase.screenshot.bytes,
+      );
+    }
+    return cases.map(({ screenshot, previewFile, ...testCase }) => ({
+      ...testCase,
+      reportPath: `${slug}/index.html`,
+      previewPath: previewFile ? `previews/${previewFile}` : null,
+    }));
+  }
+  throw new Error(`No Midscene Test report found for project ${projectName}`);
+}
+
+function caseTarget(testCase) {
+  if (!testCase.reportPath) return null;
+  return testCase.stepId
+    ? `${testCase.reportPath}#${new URLSearchParams({ 'runner-step': testCase.stepId })}`
+    : testCase.reportPath;
+}
+
+function landingPage(cases) {
+  const passed = cases.filter((testCase) => testCase.status === 'success').length;
+  const failed = cases.filter((testCase) => testCase.status === 'failed').length;
+  const skipped = cases.filter((testCase) => testCase.status === 'skipped').length;
+  const rows = cases.map((testCase) => {
+    const icon = testCase.status === 'success' ? '✅' : testCase.status === 'skipped' ? '⏭️' : '❌';
+    const target = caseTarget(testCase);
+    const name = target
+      ? `<a href="${escapeHtml(target)}">${escapeHtml(testCase.name)}</a>`
+      : escapeHtml(testCase.name);
+    const preview = testCase.previewPath && target
+      ? `<a href="${escapeHtml(target)}"><img src="${escapeHtml(testCase.previewPath)}" alt="${escapeHtml(testCase.name)} screenshot" loading="lazy"></a>`
+      : '<span class="unavailable">Not available</span>';
+    return `<tr><td>${icon}</td><td>${name}</td><td>${escapeHtml(testCase.project)}</td><td>${escapeHtml(testCase.status)}</td><td>${formatDuration(testCase.durationMs)}</td><td>${preview}</td></tr>`;
+  }).join('\n');
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -96,76 +142,71 @@ function landingPage({ passedCases, skippedCases }) {
   <style>
     :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
     body { margin: 0; background: #0b0d13; color: #e8eaf2; }
-    main { width: min(1100px, calc(100% - 40px)); margin: 48px auto; }
-    h1 { margin-bottom: 8px; }
-    .summary { color: #aeb4c6; margin-bottom: 28px; }
-    a { color: #9d8cff; }
-    table { width: 100%; border-collapse: collapse; background: #131722; border: 1px solid #2b3142; border-radius: 12px; overflow: hidden; }
-    th, td { padding: 12px 14px; border-bottom: 1px solid #2b3142; text-align: left; }
+    main { width: min(1280px, calc(100% - 40px)); margin: 48px auto; }
+    .summary, .unavailable { color: #aeb4c6; }
+    a { color: #a99bff; }
+    table { width: 100%; border-collapse: collapse; background: #131722; border: 1px solid #2b3142; }
+    th, td { padding: 12px 14px; border-bottom: 1px solid #2b3142; text-align: left; vertical-align: top; }
     th { color: #aeb4c6; font-size: 13px; text-transform: uppercase; }
-    tr:last-child td { border-bottom: 0; }
-    .report-link { display: inline-block; margin: 0 0 24px; padding: 10px 14px; border: 1px solid #7466d9; border-radius: 8px; text-decoration: none; }
+    img { width: 260px; max-height: 160px; object-fit: cover; border-radius: 8px; border: 1px solid #343b50; }
   </style>
 </head>
-<body>
-  <main>
-    <h1>Botmux × Midscene · passed with skips</h1>
-    <p class="summary"><strong>${passedCases.length}/${total} cases passed</strong> · 0 failed · ${skippedCases.length} skipped</p>
-    <a class="report-link" href="dashboard/">Open the native Dashboard Midscene report</a>
-    <table>
-      <thead><tr><th></th><th>Case</th><th>Project</th><th>Status</th></tr></thead>
-      <tbody>${rows}</tbody>
-    </table>
-  </main>
-</body>
-</html>
-`;
+<body><main>
+  <h1>Botmux × Midscene</h1>
+  <p class="summary"><strong>${passed}/${cases.length} cases passed</strong> · ${failed} failed · ${skipped} skipped</p>
+  <table>
+    <thead><tr><th></th><th>Case</th><th>Project</th><th>Status</th><th>Duration</th><th>Node screenshot</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>
+</main></body>
+</html>`;
 }
 
 export async function prepareMidscenePages(options) {
-  const reportRoot = required(options, 'report-root');
-  const resultsRoot = required(options, 'results-root');
+  const dashboardKey = 'dashboard-report-root' in options ? 'dashboard-report-root' : 'report-root';
+  const dashboardReportRoot = required(options, dashboardKey);
   const skippedCasesDir = required(options, 'skipped-cases-dir');
   const output = required(options, 'output');
-  const reports = await findReportIndexes(reportRoot);
-  if (reports.length === 0) {
-    throw new Error(`No Midscene Test index.html found below ${reportRoot}`);
-  }
+  await mkdir(output, { recursive: true });
 
-  const summaries = await findFiles(resultsRoot, (name) => name === 'summary.json');
-  if (summaries.length !== 1) {
-    throw new Error(`Expected one Dashboard summary.json, found ${summaries.length}`);
-  }
-  const summary = JSON.parse(await readFile(summaries[0], 'utf8'));
-  const passedCases = (summary.projects ?? []).flatMap((project) =>
-    (project.cases ?? [])
-      .filter((testCase) => testCase.status === 'success')
-      .map((testCase) => testCase.name),
-  );
-  const skippedCases = await readSkippedCases(skippedCasesDir);
-  if (passedCases.length === 0 || skippedCases.length === 0) {
-    throw new Error('Pages report requires passed Dashboard and skipped Feishu cases');
-  }
-
-  await mkdir(path.join(output, 'dashboard'), { recursive: true });
-  await cp(path.dirname(reports[0].file), path.join(output, 'dashboard'), {
-    recursive: true,
+  const cases = await loadProjectReport({
+    reportRoot: dashboardReportRoot,
+    projectName: 'dashboard-smoke',
+    output,
+    slug: 'dashboard',
   });
-  await writeFile(
-    path.join(output, 'index.html'),
-    landingPage({ passedCases, skippedCases }),
-  );
-  process.stdout.write(`Prepared ${reports[0].file} for GitHub Pages.\n`);
+
+  if (options['feishu-outcome'] === 'skipped' || !options['feishu-report-root']) {
+    cases.push(...(await readYamlCases(skippedCasesDir)).map((name) => ({
+      name,
+      project: 'feishu-browser',
+      status: 'skipped',
+      attempts: 0,
+      reportPath: null,
+      previewPath: null,
+      stepId: null,
+    })));
+  } else {
+    cases.push(...await loadProjectReport({
+      reportRoot: path.resolve(options['feishu-report-root']),
+      projectName: 'feishu-browser',
+      output,
+      slug: 'feishu',
+    }));
+  }
+
+  const manifest = { schemaVersion: 1, cases };
+  await writeFile(path.join(output, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+  await writeFile(path.join(output, 'index.html'), landingPage(cases));
+  process.stdout.write(`Prepared ${cases.length} Midscene cases for publication.\n`);
+  return manifest;
 }
 
 async function main() {
   await prepareMidscenePages(parseArguments(process.argv.slice(2)));
 }
 
-if (
-  process.argv[1] &&
-  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
-) {
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch((error) => {
     process.stderr.write(`${error.stack ?? error.message}\n`);
     process.exitCode = 1;

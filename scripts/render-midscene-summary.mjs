@@ -67,6 +67,26 @@ async function findYamlCases(root) {
   return cases;
 }
 
+function mergeSummaries(summaries) {
+  const available = summaries.filter(Boolean);
+  if (available.length === 0) return null;
+  const countKeys = [
+    'total', 'passed', 'failed', 'notRun', 'filtered',
+    'collectionErrors', 'documentFailures', 'projectFailures',
+  ];
+  return {
+    status: available.every((summary) => summary.status === 'success') ? 'success' : 'failed',
+    durationMs: available.reduce((total, summary) => total + (summary.durationMs ?? 0), 0),
+    summary: Object.fromEntries(
+      countKeys.map((key) => [
+        key,
+        available.reduce((total, summary) => total + (summary.summary?.[key] ?? 0), 0),
+      ]),
+    ),
+    projects: available.flatMap((summary) => summary.projects ?? []),
+  };
+}
+
 function cell(value) {
   return String(value ?? '')
     .replaceAll('|', '\\|')
@@ -79,6 +99,19 @@ function duration(value) {
   return `${(value / 1000).toFixed(1)} s`;
 }
 
+function normalizedBaseUrl(value) {
+  const url = new URL(value);
+  if (!url.pathname.endsWith('/')) url.pathname += '/';
+  return url;
+}
+
+function publishedUrl(baseUrl, relativePath, stepId) {
+  if (!baseUrl || !relativePath) return null;
+  const url = new URL(relativePath, normalizedBaseUrl(baseUrl));
+  if (stepId) url.hash = new URLSearchParams({ 'runner-step': stepId }).toString();
+  return url.href;
+}
+
 export function renderSummary({
   summary,
   artifactName,
@@ -87,6 +120,7 @@ export function renderSummary({
   pagesUrl,
   feishuOutcome,
   skippedCases = [],
+  evidenceCases = [],
 }) {
   const counts = summary?.summary;
   const nativeCases = (summary?.projects ?? []).flatMap((project) =>
@@ -115,6 +149,9 @@ export function renderSummary({
           ? 'not run'
           : 'failed';
   const artifactUrl = runUrl ? `${runUrl}#artifacts` : null;
+  const evidence = new Map(
+    evidenceCases.map((testCase) => [`${testCase.project}\0${testCase.name}`, testCase]),
+  );
   const lines = [
     `## Botmux × Midscene · ${status}`,
     '',
@@ -150,8 +187,8 @@ export function renderSummary({
 
   if (cases.length > 0) {
     lines.push(
-      '| Case | Project | Status | Attempts |',
-      '|:--|:--|:--|--:|',
+      '| Case | Evidence | Project | Status | Attempts |',
+      '|:--|:--|:--|:--|--:|',
       ...cases.map((testCase) => {
         const icon =
           testCase.status === 'success'
@@ -160,7 +197,23 @@ export function renderSummary({
               ? '⏭️'
               : '❌';
         const attempts = testCase.attempts?.length ?? 0;
-        return `| ${icon} ${cell(testCase.name)} | ${cell(testCase.project)} | ${cell(testCase.status)} | ${attempts} |`;
+        const caseEvidence = evidence.get(`${testCase.project}\0${testCase.name}`);
+        const target = publishedUrl(
+          pagesUrl,
+          caseEvidence?.reportPath,
+          caseEvidence?.stepId,
+        );
+        const preview = publishedUrl(pagesUrl, caseEvidence?.previewPath);
+        const fallback = !target && testCase.status !== 'skipped' ? artifactUrl : null;
+        const caseLabel = target || fallback
+          ? `[${cell(testCase.name)}](${target ?? fallback})`
+          : cell(testCase.name);
+        const evidenceCell = preview && target
+          ? `[![${cell(testCase.name)}](${preview})](${target})`
+          : fallback
+            ? `[report artifact](${fallback})`
+            : '—';
+        return `| ${icon} ${caseLabel} | ${evidenceCell} | ${cell(testCase.project)} | ${cell(testCase.status)} | ${attempts} |`;
       }),
       '',
       `Run duration: ${duration(summary.durationMs)}.`,
@@ -179,6 +232,14 @@ async function main() {
   const summary = latest
     ? JSON.parse(await readFile(latest, 'utf8'))
     : null;
+  const feishuFiles = options['feishu-results']
+    ? await findSummaries(options['feishu-results'])
+    : [];
+  const feishuLatest = feishuFiles.at(-1);
+  const combinedSummary = mergeSummaries([
+    summary,
+    feishuLatest ? JSON.parse(await readFile(feishuLatest, 'utf8')) : null,
+  ]);
   const repository = process.env.GITHUB_REPOSITORY;
   const runId = process.env.GITHUB_RUN_ID;
   const runUrl =
@@ -189,14 +250,18 @@ async function main() {
     options['feishu-outcome'] === 'skipped' && options['skipped-cases-dir']
       ? await findYamlCases(options['skipped-cases-dir'])
       : [];
+  const siteManifest = options['site-manifest']
+    ? JSON.parse(await readFile(options['site-manifest'], 'utf8'))
+    : null;
   const markdown = renderSummary({
-    summary,
+    summary: combinedSummary,
     artifactName: required(options, 'artifact-name'),
     testOutcome: required(options, 'test-outcome'),
     runUrl,
     pagesUrl: options['pages-url'],
     feishuOutcome: options['feishu-outcome'],
     skippedCases,
+    evidenceCases: siteManifest?.cases ?? [],
   });
   await appendFile(required(options, 'output'), markdown);
 }

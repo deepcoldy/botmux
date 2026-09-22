@@ -20,3 +20,16 @@ written below the gitignored `midscene_run/` directory.
 
 The credential-dependent Feishu browser scenarios remain in
 `test/e2e-browser/` and run through `bun run test:midscene:feishu`.
+
+## CI credentials and reports
+
+Repository CI requires `FEISHU_TEST_GROUP_URL` plus an authenticated Playwright
+storage state. Because a complete Feishu state can exceed GitHub's secret size
+limit, store `gzip -c storageState.json | base64` as
+`FEISHU_STORAGE_STATE_GZIP_BASE64`. The legacy uncompressed
+`FEISHU_STORAGE_STATE_BASE64` value remains supported when it fits.
+
+The workflow publishes a case-level evidence site under
+`https://deepcoldy.github.io/botmux-midscene/`. Every executed case links to
+its exact native Midscene step and includes the screenshot used by that node.
+The same links and thumbnails are written to the GitHub Actions Summary.

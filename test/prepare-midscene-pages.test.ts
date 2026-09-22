@@ -22,7 +22,37 @@ describe('Midscene Pages report', () => {
       mkdir(resultsRoot, { recursive: true }),
       mkdir(casesRoot, { recursive: true }),
     ]);
-    await writeFile(join(reportRoot, 'index.html'), '<title>Native report</title>');
+    await writeFile(join(reportRoot, 'index.html'), `
+      <title>Native report</title>
+      <script type="midscene_test_run_dump">${JSON.stringify({
+        projects: [{
+          name: 'dashboard-smoke',
+          documents: [{
+            cases: [{
+              caseId: 'dashboard-case',
+              name: 'Navigate the core read-only Dashboard pages',
+              status: 'success',
+              attempts: [{
+                status: 'success',
+                durationMs: 1250,
+                steps: [{
+                  id: 'attempt:steps:0',
+                  status: 'success',
+                  agentDetails: [{ executionId: 'execution-1' }],
+                }],
+              }],
+            }],
+          }],
+        }],
+      })}</script>
+      <script type="midscene_web_dump">${JSON.stringify({
+        executions: [{
+          id: 'execution-1',
+          tasks: [{ uiContext: { screenshot: { id: 'screenshot-1' } } }],
+        }],
+      })}</script>
+      <script type="midscene-image" data-id="screenshot-1">data:image/png;base64,iVBORw0KGgo=</script>
+    `);
     await writeFile(
       join(resultsRoot, 'summary.json'),
       JSON.stringify({
@@ -55,7 +85,9 @@ describe('Midscene Pages report', () => {
     expect(landing).toContain('2 skipped');
     expect(landing).toContain('Aiden basic bot flow');
     expect(landing).toContain('Streaming card lifecycle');
-    expect(landing).toContain('href="dashboard/"');
+    expect(landing).toContain('Node screenshot');
+    expect(landing).toContain('previews/case-preview-dashboard-smoke-dashboard-case.png');
+    expect(landing).toContain('href="dashboard/index.html#runner-step=');
     await expect(readFile(join(output, 'dashboard', 'index.html'), 'utf8')).resolves.toContain(
       'Native report',
     );
