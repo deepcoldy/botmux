@@ -380,12 +380,20 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
   const subMounts: { mountpoint: string; kind: 'overlay' | 'ro' }[] = [];
   if (!isMountpoint(merged)) {
     if (storage === 'tmpfs') {
+      // A RECORDED tmpfs session whose overlay/slot is gone means the machine
+      // rebooted and the in-RAM upper died with it. The meta is still on disk,
+      // but mounting a brand-new empty slot would silently fabricate a fresh
+      // COW view while keeping the old session identity — violating the
+      // documented "unrecoverable, start a new session" contract. Refuse.
+      // (A genuinely fresh session has existing === null and mounts normally.)
+      if (existing) {
+        console.error(`[scratch-sandbox] tmpfs upper for recorded session ${opts.sessionId} is gone (machine reboot wiped it) — refusing to fabricate a fresh COW view; start a new session`);
+        return null;
+      }
       if (!mountSlot(slot!, opts.tmpfsSizeMb)) return null;
-    } else if (existing && slot && !isMountpoint(slot)) {
-      // Recorded tmpfs session whose slot vanished (machine reboot).
-      console.error(`[scratch-sandbox] tmpfs upper for session ${opts.sessionId} is gone (machine reboot?) — scratch session is unrecoverable, start a new session`);
-      return null;
     }
+    // disk: a cold resume normally arrives here (overlay unmounted at the last
+    // process exit; upper/work persist on disk and are cleanly re-mounted).
     const mounted = mountOverlay({
       lower: '/', upper, work, merged,
       // disk upper under lower=/ fails the kernel overlapping-layer check on

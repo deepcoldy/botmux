@@ -75,10 +75,10 @@ bwrap（包 CLI 进程，与 v3 同一注入点）:
 ```json
 {
   "sandbox": "scratch",
-  "scratchStorage": "tmpfs",       // "tmpfs"(默认;内存,关盒即焚) | "disk"(upper 落盘,支持 daemon 重启续跑,会话结束删除)
-  "scratchTmpfsSizeMb": 0,         // 0=内核默认(≈半内存);大构建可调
-  "scratchNetwork": true,          // 缺省 true 保留网络;false 加 --unshare-net
-  "scratchDenyPaths": []           // 可选额外遮罩(绝对路径,mode-000 mask,同 oncall deny 编译)
+  "scratchStorage": "tmpfs",       // Linux: "tmpfs"(默认;内存,关盒即焚) | "disk"(upper 落盘,支持 daemon 重启续跑)。macOS 接受但忽略(APFS COW 本身只占改动量)
+  "scratchTmpfsSizeMb": 0,         // Linux tmpfs: 0=内核默认(≈半内存);大构建可调
+  "sandboxNetwork": true,          // 复用 oncall 字段;缺省 true 保留网络,false 加 --unshare-net(Linux)/Seatbelt deny network
+  "scratchDenyPaths": []           // 可选额外遮罩路径(绝对路径;Linux 走 bwrap deny mask,mac 走 Seatbelt 真实路径封口)
 }
 ```
 

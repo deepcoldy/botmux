@@ -377,6 +377,7 @@ import {
   prepareMacScratchSandbox,
   attachMacScratchSession,
 } from './adapters/backend/scratch-sandbox-darwin.js';
+import { enumerateScratchSecretPaths } from './adapters/backend/scratch-credentials.js';
 import { resolveSandboxMode } from './adapters/cli/sandbox-mode.js';
 import { registerScratchView, scratchViewPath, scratchLinuxMappings, type ScratchPathMapping } from './services/scratch-host-view.js';
 import {
@@ -16432,17 +16433,19 @@ async function spawnCli(
       botmuxHome: scratchCanonical(configuredBotmuxHome),
       defaultBotmuxHome: scratchCanonical(defaultBotmuxHome),
     });
-    const reservedNames: string[] = [];
-    for (const root of [...new Set([defaultBotmuxHome, configuredBotmuxHome])]) {
-      try {
-        for (const name of readdirSync(root)) {
-          if (isCredentialIsolationReservedBasename(name)) reservedNames.push(scratchCanonical(join(root, name)));
-        }
-      } catch { /* absent authority root */ }
-    }
+    // Complete transport-credential mask. NOT just device files: enumerate
+    // bots.json + sidecars, dashboard secret, per-bot send-cred.json, webhook
+    // keys, external BOTS_CONFIG and the shared lark-cli keystore from the
+    // on-disk layout — a hand-built list once drifted and left bots.json
+    // readable inside scratch (PR #1513 review).
+    const scratchSecretPaths = enumerateScratchSecretPaths({
+      botmuxHomes: [...new Set([defaultBotmuxHome, configuredBotmuxHome])].map(scratchCanonical),
+      dataDirs: [scratchDataDir].map(scratchCanonical),
+      botsConfigPath: cfg.loadedBotsConfigPath ? scratchCanonical(cfg.loadedBotsConfigPath) : undefined,
+    });
     const scratchDeny = [...new Set<string>([
       ...credentialRules.denyPaths.map(scratchCanonical),
-      ...reservedNames,
+      ...scratchSecretPaths,
       join(scratchCanonical(scratchDataDir), 'sandboxes', cfg.sessionId),
       ...(cfg.scratchDenyPaths ?? [])
         .filter((p): p is string => typeof p === 'string' && !!p)

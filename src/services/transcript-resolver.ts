@@ -338,22 +338,31 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
   switch (q.cliId) {
     case 'claude-code': {
       const homeRoot = v(join(homedir(), '.claude'));
+      // cwd must be remapped too: on macOS Claude runs with the CLONE path as
+      // cwd and keys its project dir by that slug; passing the host cwd here
+      // yields a slug that never matches. (Linux identity-maps, so v() is a
+      // no-op there.)
+      const scratchCwd = svMappings && q.cwd ? v(q.cwd) : q.cwd;
+      const sq: TranscriptPathQuery = scratchCwd === q.cwd ? q : { ...q, cwd: scratchCwd };
       const path = svMappings
-        ? (q.cwd ? getClaudeSessionJsonlPath(sid, q.cwd, homeRoot) : null)
-        : claudeJsonlWithBotHomeFallback(sid, q, join(homedir(), '.claude'));
+        ? (scratchCwd ? getClaudeSessionJsonlPath(sid, scratchCwd, homeRoot) : null)
+        : claudeJsonlWithBotHomeFallback(sid, sq, join(homedir(), '.claude'));
       return path ? { path, kind: 'claude' } : null;
     }
     case 'aiden': {
       const homeRoot = v(join(homedir(), '.claude'));
+      const scratchCwd = svMappings && q.cwd ? v(q.cwd) : q.cwd;
+      const sq: TranscriptPathQuery = scratchCwd === q.cwd ? q : { ...q, cwd: scratchCwd };
       const path = svMappings
-        ? (q.cwd ? getClaudeSessionJsonlPath(sid, q.cwd, homeRoot) : null)
-        : claudeJsonlWithBotHomeFallback(sid, q, join(homedir(), '.claude'));
+        ? (scratchCwd ? getClaudeSessionJsonlPath(sid, scratchCwd, homeRoot) : null)
+        : claudeJsonlWithBotHomeFallback(sid, sq, join(homedir(), '.claude'));
       return path ? { path, kind: 'claude' } : null;
     }
     case 'seed':
     case 'relay': {
+      const scratchCwd = svMappings && q.cwd ? v(q.cwd) : q.cwd;
       const path = svMappings
-        ? (q.cwd ? getClaudeSessionJsonlPath(sid, q.cwd, v(claudeForkDataDir(q.cliId))) : null)
+        ? (scratchCwd ? getClaudeSessionJsonlPath(sid, scratchCwd, v(claudeForkDataDir(q.cliId))) : null)
         : claudeJsonlWithBotHomeFallback(sid, q, claudeForkDataDir(q.cliId));
       return path ? { path, kind: 'claude' } : null;
     }

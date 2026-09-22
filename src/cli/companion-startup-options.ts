@@ -5,7 +5,11 @@ import {
 
 export interface CompanionStartupBot {
   larkAppId?: string;
-  sandbox?: boolean;
+  // oncall-only: the companion binding exists to run a credential-isolated
+  // codex/traex. scratch (write-integrity COW) is explicitly NOT accepted —
+  // it does not mask credentials, so the companion's confidentiality premise
+  // would not hold.
+  sandbox?: boolean | 'oncall';
   cliId?: string;
 }
 

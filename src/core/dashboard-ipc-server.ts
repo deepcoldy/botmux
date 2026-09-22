@@ -58,6 +58,7 @@ import { createGroupWithBots, transferGroupOwner } from '../services/group-creat
 import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
+import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
 import * as backendTypeStore from '../services/backend-type-store.js';
 import { setGroupSerialInput } from '../services/group-serial-input-store.js';
 import { parseGroupSerialInput } from './group-serial-input.js';
@@ -6407,7 +6408,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
       if (config.cliId !== 'codex-app') {
         return jsonRes(res, 400, { ok: false, error: 'codex_browser_requires_codex_app' });
       }
-      if (config.existingAppServer || config.sandbox === true || config.readIsolation === true) {
+      if (config.existingAppServer || sandboxBoolValue(config.sandbox) || config.readIsolation === true) {
         return jsonRes(res, 409, { ok: false, error: 'codex_browser_config_conflict' });
       }
     }
@@ -7021,7 +7022,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       nextModelBackendVariant?: 'standard' | 'max';
       nextNativeSubagentRuntimeState?: NativeSubagentRuntimeConfigState;
     }>(larkAppId, (entry) => {
-      if (selected.cliLaunchMode && (entry.sandbox === true || entry.readIsolation === true)) {
+      if (selected.cliLaunchMode && (sandboxBoolValue(entry.sandbox) || entry.readIsolation === true)) {
         return { write: false, result: { error: 'launch_mode_sandbox_conflict' } };
       }
       const storedModelBackendVariant = entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max'
