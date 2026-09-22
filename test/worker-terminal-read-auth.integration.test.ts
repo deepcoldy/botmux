@@ -8,7 +8,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from './helpers/node-ws.js';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
-import { deriveTerminalWriteToken } from '../src/core/terminal-write-auth.js';
+import {
+  deriveTerminalCardViewToken,
+  deriveTerminalWriteToken,
+} from '../src/core/terminal-write-auth.js';
 import {
   deriveWorkerViewGeneration,
   issueTerminalControlGrant,
@@ -183,6 +186,7 @@ setInterval(() => {}, 1_000);
       prompt: '',
       larkAppId: 'app_terminal_auth',
       larkAppSecret: 'secret',
+      terminalCardEpoch: 'terminal-auth-card-epoch',
     };
     child.send(init);
     const ready = await waitForReady(child, logs);
@@ -192,6 +196,9 @@ setInterval(() => {}, 1_000);
     // session expiry and worker restarts all left it valid forever).
     expect(ready.viewToken).toBeTruthy();
     expect(ready.viewToken).not.toBe(retiredStableViewToken(secret, sessionId));
+    expect(ready.cardViewToken).toBe(
+      deriveTerminalCardViewToken(secret, sessionId, 'terminal-auth-card-epoch'),
+    );
     // The operate/write link must still be the stable HMAC (not a random boot
     // token), so an already-issued 「操作链接」survives a worker restart that
     // re-runs init → refreshTerminalWriteToken → ready (P1-6: write-capability
@@ -201,12 +208,17 @@ setInterval(() => {}, 1_000);
 
     const scanner = await fetch(`${base}/`);
     expect(scanner.status).toBe(403);
-    expect(await scanner.text()).toBe('Forbidden');
+    expect(await scanner.text()).toContain('终端链接已失效');
 
     const view = await fetch(`${base}/?viewToken=${encodeURIComponent(ready.viewToken!)}`);
     expect(view.status).toBe(200);
     const viewHtml = await view.text();
     expect(viewHtml).toContain('var hasToken=false');
+    const cardView = await fetch(
+      `${base}/?viewToken=${encodeURIComponent(ready.cardViewToken!)}`,
+    );
+    expect(cardView.status).toBe(200);
+    expect(await cardView.text()).toContain('var hasToken=false');
     // The browser must carry the view capability into its WS connection too.
     expect(viewHtml).toContain("base+'/'+location.search");
     // 无平台提示头时按本地只读渲染（readonly 横幅，不是 SSO 登录引导）。
@@ -386,7 +398,9 @@ setInterval(() => {}, 1_000);
     expect(written).toContain(Buffer.from('WRITE_OK\n').toString('hex'));
     writeWs.close();
 
+    const childExit = new Promise<void>(resolvePromise => child.once('exit', () => resolvePromise()));
     child.send({ type: 'close' } satisfies DaemonToWorker);
+    await childExit;
   }, 25_000);
 
   // P1-5 第二轮：view grant 只有「经中央前门」才算数。之前的实现里，view-link 返回的
@@ -493,16 +507,18 @@ setInterval(() => {}, 1_000);
       headers: centralForwardHeaders(secret, wrongGeneration),
     })).status).toBe(403);
 
-    // 7) 飞书卡片那条链路（worker 每 boot 明文 token）语义不变，仍然直连可读——
-    //    收紧的只是签名 grant，不是所有只读入口。
+    // 7) Worker 每 boot 的内部 token 仍然直连可读——收紧的只是签名 grant，
+    //    不是所有只读入口。
     expect((await fetch(`${base}/?viewToken=${encodeURIComponent(boot)}`)).status).toBe(200);
 
+    const childExit = new Promise<void>(resolvePromise => child.once('exit', () => resolvePromise()));
     child.send({ type: 'close' } satisfies DaemonToWorker);
+    await childExit;
   }, 25_000);
 
-  // P1-5 回归矩阵的收尾一格：worker 重启后，重启前发出的一切读 token（旧稳定
-  // HMAC、上一代 boot token）全部失效；而显式写能力（操作链接）跨重启存活不变。
-  it('a worker restart invalidates every prior read capability while the operate link survives', async () => {
+  // P1-5 回归矩阵的收尾一格：worker 重启后，上一代 boot token 与中央 grant
+  // 失效；卡片 token 在同一 session 生命周期内保持稳定；操作链接也继续存活。
+  it('a worker restart invalidates boot grants while the card link and operate link survive', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-terminal-restart-'));
     tempDirs.add(root);
     const dataDir = join(root, 'session');
@@ -532,8 +548,11 @@ setInterval(() => {}, 1_000);
       prompt: '',
       larkAppId: 'app_terminal_restart',
       larkAppSecret: 'secret',
+      terminalCardEpoch: 'terminal-card-lifecycle-1',
     };
-    const spawnWorker = async (): Promise<{ child: ChildProcess; ready: Extract<WorkerToDaemon, { type: 'ready' }> }> => {
+    const spawnWorker = async (
+      message: DaemonToWorker = init,
+    ): Promise<{ child: ChildProcess; ready: Extract<WorkerToDaemon, { type: 'ready' }> }> => {
       const logs: string[] = [];
       const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
         cwd: resolve('.'),
@@ -550,12 +569,16 @@ setInterval(() => {}, 1_000);
       children.add(child);
       child.stdout?.on('data', chunk => logs.push(chunk.toString()));
       child.stderr?.on('data', chunk => logs.push(chunk.toString()));
-      child.send(init);
+      child.send(message);
       return { child, ready: await waitForReady(child, logs) };
     };
 
     const first = await spawnWorker();
     const firstViewToken = first.ready.viewToken!;
+    const firstCardViewToken = first.ready.cardViewToken!;
+    expect(firstCardViewToken).toBe(
+      deriveTerminalCardViewToken(secret, sessionId, 'terminal-card-lifecycle-1'),
+    );
     expect(first.ready.token).toBe(deriveTerminalWriteToken(secret, sessionId));
     // 重启前中央签发的一条 view capability（含会签）。它在这一代是好使的。
     const firstGenerationCapability = centralViewCapability(secret, sessionId, firstViewToken, {
@@ -568,19 +591,21 @@ setInterval(() => {}, 1_000);
     );
     expect(beforeRestart.status).toBe(200);
     const firstExit = new Promise<void>(resolvePromise => first.child.once('exit', () => resolvePromise()));
-    first.child.kill('SIGKILL');
+    first.child.send({ type: 'close' } satisfies DaemonToWorker);
     await firstExit;
 
     const second = await spawnWorker();
     // 新一代 boot token 与上一代不同；写 token 稳定不变。
     expect(second.ready.viewToken).toBeTruthy();
     expect(second.ready.viewToken).not.toBe(firstViewToken);
+    expect(second.ready.cardViewToken).toBe(firstCardViewToken);
     expect(second.ready.token).toBe(first.ready.token);
 
     const base = `http://127.0.0.1:${second.ready.port}`;
     // 重启前的读能力（上一代 boot token、退役的稳定 HMAC）全部 403。
     expect((await fetch(`${base}/?viewToken=${encodeURIComponent(firstViewToken)}`)).status).toBe(403);
     expect((await fetch(`${base}/?viewToken=${encodeURIComponent(retiredStableViewToken(secret, sessionId))}`)).status).toBe(403);
+    expect((await fetch(`${base}/?viewToken=${encodeURIComponent(firstCardViewToken)}`)).status).toBe(200);
     // P1-5：重启前签发的中央 view capability 也一起死掉——同一把 .dashboard-secret
     // 仍在，签名和有效期都还成立，但它钉的 generation 属于上一代 worker，且会签也不
     // 会让它复活。旧 grant 跨 worker restart 继续读终端的路就此封死。
@@ -605,7 +630,26 @@ setInterval(() => {}, 1_000);
     expect(write.status).toBe(200);
     expect(await write.text()).toContain('var hasToken=true');
 
+    const secondExit = new Promise<void>(resolvePromise => second.child.once('exit', () => resolvePromise()));
     second.child.send({ type: 'close' } satisfies DaemonToWorker);
+    await secondExit;
+
+    const third = await spawnWorker({
+      ...init,
+      terminalCardEpoch: 'terminal-card-lifecycle-2',
+    });
+    expect(third.ready.cardViewToken).not.toBe(firstCardViewToken);
+    const thirdBase = `http://127.0.0.1:${third.ready.port}`;
+    expect((await fetch(
+      `${thirdBase}/?viewToken=${encodeURIComponent(firstCardViewToken)}`,
+    )).status).toBe(403);
+    expect((await fetch(
+      `${thirdBase}/?viewToken=${encodeURIComponent(third.ready.cardViewToken!)}`,
+    )).status).toBe(200);
+
+    const thirdExit = new Promise<void>(resolvePromise => third.child.once('exit', () => resolvePromise()));
+    third.child.send({ type: 'close' } satisfies DaemonToWorker);
+    await thirdExit;
   }, 45_000);
 
   // ── P1-3：握手前放行 ≠ 登记那一刻仍然有效 ────────────────────────────────────
@@ -773,6 +817,8 @@ setInterval(() => {}, 1_000);
       centralForwardHeaders(secret, currentGeneration),
     )).toContain('101 Switching Protocols');
 
+    const childExit = new Promise<void>(resolvePromise => child.once('exit', () => resolvePromise()));
     child.send({ type: 'close' } satisfies DaemonToWorker);
+    await childExit;
   }, 90_000);
 });

@@ -1,5 +1,6 @@
 import { createServer, connect as netConnect, type Server, type Socket } from 'node:net';
 import { logger } from '../utils/logger.js';
+import { terminalStatusHtml, type TerminalStatusKind } from './terminal-status-page.js';
 
 /**
  * Single fixed reverse-proxy port per daemon. Each session's xterm.js web
@@ -38,6 +39,15 @@ export interface TerminalProxyOptions {
    * session. Returns undefined when there's nothing to wake. Slow path only.
    */
   ensureWorkerPort?: (sessionId: string) => Promise<number | undefined>;
+  /** Describe why a worker port is unavailable so the browser receives a
+   * useful terminal state instead of an undifferentiated 502 body. */
+  resolveSessionState?: (sessionId: string) =>
+    'starting' | 'closed' | 'not-found' | 'unavailable';
+  /** Validate a card/write capability before revealing session state. */
+  authorizeStatusPage?: (
+    sessionId: string,
+    capability: { viewToken?: string; token?: string },
+  ) => boolean;
   /** Max upward port probes when `port` is taken (EADDRINUSE). Default 20; 0 disables. */
   maxProbe?: number;
 }
@@ -92,6 +102,35 @@ function writeHttpError(sock: Socket, status: number, reason: string, body: stri
     '\r\n' +
     body;
   try { sock.end(payload); } catch { /* client already gone */ }
+}
+
+function writeStatusPage(sock: Socket, status: number, reason: string, kind: TerminalStatusKind): void {
+  const body = terminalStatusHtml(kind);
+  const payload =
+    `HTTP/1.1 ${status} ${reason}\r\n` +
+    'content-type: text/html; charset=utf-8\r\n' +
+    'cache-control: no-store\r\n' +
+    'referrer-policy: no-referrer\r\n' +
+    (kind === 'starting' ? 'retry-after: 2\r\n' : '') +
+    `content-length: ${Buffer.byteLength(body)}\r\n` +
+    'connection: close\r\n' +
+    '\r\n' +
+    body;
+  try { sock.end(payload); } catch { /* client already gone */ }
+}
+
+function requestCapability(rest: string): { viewToken?: string; token?: string } {
+  try {
+    const url = new URL(rest, 'http://terminal.local');
+    const viewToken = url.searchParams.get('viewToken') || undefined;
+    const token = url.searchParams.get('token') || undefined;
+    return {
+      ...(viewToken ? { viewToken } : {}),
+      ...(token ? { token } : {}),
+    };
+  } catch {
+    return {};
+  }
 }
 
 export function startTerminalProxy(opts: TerminalProxyOptions): Promise<TerminalProxyHandle> {
@@ -165,7 +204,26 @@ export function startTerminalProxy(opts: TerminalProxyOptions): Promise<Terminal
 
       resolvePortMaybeWake(parsed.sessionId).then((port) => {
         if (!port) {
-          writeHttpError(client, 502, 'Bad Gateway', 'session not running');
+          if (!opts.resolveSessionState) {
+            writeHttpError(client, 502, 'Bad Gateway', 'session not running');
+            return;
+          }
+          const state = opts.resolveSessionState?.(parsed.sessionId) ?? 'unavailable';
+          const authorized = opts.authorizeStatusPage?.(
+            parsed.sessionId,
+            requestCapability(parsed.rest),
+          ) ?? true;
+          if (!authorized && state !== 'not-found') {
+            writeStatusPage(client, 403, 'Forbidden', 'forbidden');
+          } else if (state === 'closed') {
+            writeStatusPage(client, 410, 'Gone', 'closed');
+          } else if (state === 'not-found') {
+            writeStatusPage(client, 404, 'Not Found', 'not-found');
+          } else if (state === 'starting') {
+            writeStatusPage(client, 503, 'Service Unavailable', 'starting');
+          } else {
+            writeStatusPage(client, 503, 'Service Unavailable', 'unavailable');
+          }
           return;
         }
 

@@ -68,6 +68,10 @@ export interface DaemonSession {
   /** Independent read-only xterm capability. Optional for hydrated/legacy
    * sessions; live workers publish it with their ready event. */
   workerViewToken?: string | null;
+  /** Read-only capability placed in long-lived Lark cards. Unlike
+   * workerViewToken it remains stable across worker replacement within the
+   * same logical session lifecycle. */
+  workerCardViewToken?: string | null;
   /** Latest process identity reported over the trusted worker IPC channel.
    * Used to quiesce legacy unconfined CLIs before device credentials exist. */
   localProcessAttestation?: {

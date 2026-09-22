@@ -25,6 +25,7 @@ interface TerminalUrlSession {
   workerPort: number | null;
   workerToken: string | null;
   workerViewToken?: string | null;
+  workerCardViewToken?: string | null;
   /** Riff AIO Sandbox web terminal link — when present, buildTerminalUrl
    *  returns this directly instead of building a local/proxy URL. */
   riffAccessUrl?: string;
@@ -74,7 +75,10 @@ function withCapability(base: string, name: 'token' | 'viewToken', value: string
   return value ? `${base}?${name}=${encodeURIComponent(value)}` : base;
 }
 
-export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean } = {}): string {
+export function buildTerminalUrl(
+  ds: TerminalUrlSession,
+  opts: { write?: boolean; viewScope?: 'card' | 'worker' } = {},
+): string {
   // Riff backend: the AIO Sandbox link is the OPERATE entry — served via
   // 「获取操作链接」/ write links only (opts.write). The read-only
   // 「打开 Web 终端」keeps the local worker terminal (task log view), so both
@@ -92,13 +96,16 @@ export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean
   // When 远程访问 is off the platform base is null and we fall through — first
   // to a self-hosted reverse proxy base (`BOTMUX_PUBLIC_URL`, same front-door
   // `/s/<id>` form), then to the local proxy/worker port.
+  const readToken = opts.viewScope === 'worker'
+    ? ds.workerViewToken
+    : (ds.workerCardViewToken ?? ds.workerViewToken);
   if (proxyReady) {
     const platformBase = isRemoteAccessEnabled() ? platformTerminalBaseUrl() : null;
     if (platformBase) {
       const base = `${platformBase}/s/${ds.session.sessionId}`;
       return opts.write
         ? withCapability(base, 'token', ds.workerToken)
-        : withCapability(base, 'viewToken', ds.workerViewToken);
+        : withCapability(base, 'viewToken', readToken);
     }
     // 自建反代（BOTMUX_PUBLIC_URL）：走 dashboard 前门 `/s/<id>`，无 per-bot 端口、
     // 对所有 bot 通。这里没有平台 SSO 兜底，故写链接必须像本地分支一样保留 token，
@@ -108,7 +115,7 @@ export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean
       const url = `${publicBase}/s/${ds.session.sessionId}`;
       return opts.write
         ? withCapability(url, 'token', ds.workerToken)
-        : withCapability(url, 'viewToken', ds.workerViewToken);
+        : withCapability(url, 'viewToken', readToken);
     }
     // Merlin Devbox 私有短链：同样走 dashboard 前门 `/s/<id>`，所以隧道对应的是
     // dashboard 端口——不传 port，由 devboxDashboardBaseUrl() 按 `.dashboard-port`
@@ -118,7 +125,7 @@ export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean
       const url = `${devboxBase}/s/${ds.session.sessionId}`;
       return opts.write
         ? withCapability(url, 'token', ds.workerToken)
-        : withCapability(url, 'viewToken', ds.workerViewToken);
+        : withCapability(url, 'viewToken', readToken);
     }
   }
   const base = proxyReady
@@ -126,5 +133,5 @@ export function buildTerminalUrl(ds: TerminalUrlSession, opts: { write?: boolean
     : `http://${formatUrlHost(config.web.externalHost)}:${ds.workerPort ?? ds.session.webPort}`;
   return opts.write
     ? withCapability(base, 'token', ds.workerToken)
-    : withCapability(base, 'viewToken', ds.workerViewToken);
+    : withCapability(base, 'viewToken', readToken);
 }

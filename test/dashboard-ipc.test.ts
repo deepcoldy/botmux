@@ -5080,6 +5080,7 @@ describe('GET /api/sessions/:sessionId/view-link', () => {
       workerPort: 4321,
       workerToken: 'secret-tok',
       workerViewToken: 'boot-view-token',
+      workerCardViewToken: 'card-view-token',
     } as any);
     handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
     const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/s2/view-link`, { headers: tokenAuthHeaders() });
@@ -10299,6 +10300,7 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
       workerPort: 4321,
       workerToken: 'write-tok',
       workerViewToken: 'view-cap-abc',
+      workerCardViewToken: 'card-view-cap-abc',
       asyncTriggerResults: new Map(),
     } as any);
     handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true, coreOnlyPublicRoutes: true });
@@ -10309,6 +10311,7 @@ describe('core-only public routes + readiness barrier (behavioral)', () => {
       expect(typeof body.readOnlyUrl).toBe('string');
       // Carries the read capability inline, NOT the write token.
       expect(body.readOnlyUrl).toContain('viewToken=view-cap-abc');
+      expect(body.readOnlyUrl).not.toContain('card-view-cap-abc');
       expect(body.readOnlyUrl).not.toContain('write-tok');
       expect(body.viewToken).toBe('view-cap-abc');
     } finally {

@@ -83,6 +83,7 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
       workerPort: 4100,
       workerToken: 'write',
       workerViewToken: 'view',
+      workerCardViewToken: 'card-view',
       managedTurnOrigin: { capability: 'cap' },
       initConfig: { backendType },
     } as unknown as DaemonSession;
@@ -167,6 +168,8 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
       'remote_shutdown_commit',
     ]);
     expect(f.ds.worker).toBeNull();
+    expect(f.ds.workerViewToken).toBeNull();
+    expect(f.ds.workerCardViewToken).toBeNull();
   });
 
   it('retains only the ambiguous session fence and restores an unrelated prepared peer', async () => {

@@ -2891,7 +2891,7 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
   // inline; the write token is never included. Closed/restored sessions have no
   // live worker terminal, so no stale URL is ever advertised.
   if (process.env.BOTMUX_CORE_ONLY === '1' && ds && ds.workerPort && ds.workerViewToken) {
-    resolved.readOnlyUrl = buildTerminalUrl(ds);
+    resolved.readOnlyUrl = buildTerminalUrl(ds, { viewScope: 'worker' });
     resolved.viewToken = ds.workerViewToken;
   }
   return resolved;
@@ -3724,8 +3724,8 @@ ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
 /**
  * Read-only twin of write-link: the base capability URL the Feishu card's
  * 「打开 Web 终端」button also hands out (viewToken, never the write token).
- * The viewToken here is the worker's PER-BOOT card token — it dies with the
- * worker generation and is deliberately not bound to any dashboard auth
+ * The viewToken here is the worker's PER-BOOT token — it dies with the worker
+ * generation and is deliberately not bound to any dashboard auth
  * session. The central dashboard therefore REPLACES it with a short-lived
  * signed read grant bound to the requesting identity before answering its own
  * /api/sessions/:id/view-link (P1-5); this loopback-HMAC route never reaches a
@@ -3743,7 +3743,7 @@ ipcRoute('GET', '/api/sessions/:sessionId/view-link', (req, res, params) => {
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   const port = ds.workerPort ?? ds.session.webPort;
   if (!port || !ds.workerViewToken) return jsonRes(res, 409, { ok: false, error: 'terminal_unavailable' });
-  jsonRes(res, 200, { ok: true, url: buildTerminalUrl(ds) });
+  jsonRes(res, 200, { ok: true, url: buildTerminalUrl(ds, { viewScope: 'worker' }) });
 });
 
 /**

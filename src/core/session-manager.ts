@@ -3493,6 +3493,11 @@ export async function resumeSession(
   const reactivated = sessionStore.reactivateClosedSession(sessionId);
   if (!reactivated.ok) return reactivated;
   session = reactivated.session;
+  // A resumed closed session starts a new terminal-access lifecycle. Rotate
+  // the card epoch before registration so links from the previous lifecycle
+  // remain revoked even though the logical sessionId is reused.
+  session.terminalCardEpoch = randomUUID();
+  sessionStore.updateSession(session);
 
   // Same reason as in restoreActiveSessions: freeze the mojo control plane BEFORE
   // this row is registered, so it can never be woken or cancelled while still

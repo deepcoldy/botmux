@@ -67,21 +67,36 @@ export interface TerminalAccessDecision {
   platformReadonly: boolean;
 }
 
-// NOTE(P1-5): the stable read capability (`deriveTerminalViewToken`, HMAC of
-// secret+sessionId) was deliberately REMOVED. A stable view token could never
-// be revoked: an H5 viewer who fetched it once kept terminal read access after
-// logout/expiry, and a worker restart re-derived the very same value. Read
-// access is now either
-//   • the worker's per-boot random `viewToken` (Feishu card links — dies with
-//     the worker generation), or
+// NOTE(P1-5): the old unversioned stable read capability
+// (`deriveTerminalViewToken`, HMAC of secret+sessionId) remains retired. It
+// could never be revoked. Read access is now either
+//   • the worker's per-boot random `viewToken` (pins dashboard grants to one
+//     worker generation), or
 //   • a short-lived signed read grant carried in `?viewToken=` (dashboard
 //     view-link API — bound to sessionId + authSessionId + expiresAt, plus
 //     `audience: central` and the worker's boot generation; the worker accepts
 //     it only when the central front proxy countersigned the hop, so a raw
-//     copied URL dialled straight at the worker/daemon port cannot spend it).
+//     copied URL dialled straight at the worker/daemon port cannot spend it), or
+//   • an epoch-bound Lark-card capability. Its random epoch is persisted on the
+//     Session, survives worker replacement, and rotates when a closed session is
+//     resumed. This gives old live-card links continuity without reviving the
+//     irrevocable secret+sessionId capability.
 // Every previously issued stable view token therefore fails on new workers.
 // The WRITE capability below intentionally stays stable — an explicitly issued
 // 「操作链接」 is an independent capability that must survive restarts.
+
+export function deriveTerminalCardViewToken(
+  secret: string,
+  sessionId: string,
+  epoch: string,
+): string {
+  return createHmac('sha256', secret)
+    .update('botmux-terminal-card-view-v1\0')
+    .update(sessionId)
+    .update('\0')
+    .update(epoch)
+    .digest('base64url');
+}
 
 /**
  * Derive a stable WRITE (operate) capability for one session. Uses a DISTINCT

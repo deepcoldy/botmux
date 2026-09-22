@@ -18,6 +18,7 @@ import { createHmac } from 'node:crypto';
 import { describe, it, expect } from 'vitest';
 import * as terminalWriteAuth from '../src/core/terminal-write-auth.js';
 import {
+  deriveTerminalCardViewToken,
   deriveTerminalWriteToken,
   resolveTerminalAccess,
   resolveTerminalAccessForRequest,
@@ -99,6 +100,18 @@ describe('terminal write capability', () => {
     // token — old view links must stay read-dead, not become operate links.
     expect(deriveTerminalWriteToken('host-secret', 'session-a'))
       .not.toBe(retiredStableViewToken('host-secret', 'session-a'));
+  });
+});
+
+describe('terminal card view capability', () => {
+  it('is stable within one epoch and rotates across session lifecycles', () => {
+    const first = deriveTerminalCardViewToken('host-secret', 'session-a', 'epoch-1');
+    expect(first).toBe(deriveTerminalCardViewToken('host-secret', 'session-a', 'epoch-1'));
+    expect(first).not.toBe(deriveTerminalCardViewToken('host-secret', 'session-a', 'epoch-2'));
+    expect(first).not.toBe(deriveTerminalCardViewToken('host-secret', 'session-b', 'epoch-1'));
+    expect(first).not.toBe(deriveTerminalCardViewToken('other-secret', 'session-a', 'epoch-1'));
+    expect(first).not.toBe(deriveTerminalWriteToken('host-secret', 'session-a'));
+    expect(first).not.toBe(retiredStableViewToken('host-secret', 'session-a'));
   });
 });
 

@@ -635,6 +635,10 @@ export interface Session {
    * accepted so daemon restarts and replacement workers invalidate receipts
    * emitted by an earlier lifetime. */
   workerGeneration?: number;
+  /** Random revocation epoch for the read-only terminal link embedded in the
+   * live Lark card. Stable across worker replacement, rotated when a closed
+   * session is resumed so an old card never regains access to a new lifecycle. */
+  terminalCardEpoch?: string;
   /** True once a substitute-mode control card has been DM'd to the owner(s). Persisted to avoid re-sends on worker restart or daemon recovery. */
   substituteControlCardSent?: boolean;
   /** Bounded exact destination captured at inbound turn start. Codex App copies
@@ -1589,7 +1593,11 @@ type DaemonToWorkerBase =
 
 export type DaemonToWorker = DaemonToWorkerBase extends infer Message
   ? Message extends { type: 'init' }
-    ? Message & { feedback?: import('./services/feedback-policy.js').FeedbackPolicy; cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1 }
+    ? Message & {
+        feedback?: import('./services/feedback-policy.js').FeedbackPolicy;
+        cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1;
+        terminalCardEpoch?: string;
+      }
     : Message
   : never;
 
@@ -1660,10 +1668,12 @@ export type WorkerToDaemon =
        * backend intentionally has no raw-terminal Web UI capability. */
       port: number;
       token: string;
-      /** PER-BOOT random read capability (P1-5): card links minted from it die
-       * with this worker generation, and the dashboard view-link API replaces
-       * it with a short-lived auth-bound grant instead of handing it out. */
+      /** PER-BOOT random read capability (P1-5). The dashboard view-link API
+       * binds its short-lived grants to this worker generation. */
       viewToken?: string;
+      /** Session-lifecycle read capability embedded in Lark cards. It survives
+       * worker replacement but rotates when a closed session is resumed. */
+      cardViewToken?: string;
       spawnCommand?: string;
       replyAlreadySent?: boolean;
       turnId?: string;
