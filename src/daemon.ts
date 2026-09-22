@@ -27101,6 +27101,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         ownerOpenId: resolvePrimaryOwnerOpenId(cfg.larkAppId),
         dashboardUrl: dash.url,
         dashboardLocalUrl: dash.localUrl,
+        notifyOnRestart: readGlobalConfig().maintenance?.notifyOnRestart !== false,
         sendCard: (openId, card) => sendUserMessage(cfg.larkAppId, openId, card, 'interactive').then(() => undefined),
         log: (m) => logger.info(`[restart-report] ${m}`),
       });

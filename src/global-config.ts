@@ -240,6 +240,9 @@ export interface MaintenanceConfig {
    *  its own — reuses autoUpdate's time, fires only when there's a pending
    *  update. */
   autoRestart?: MaintenanceToggle;
+  /** Whether an intentional restart sends the owner a restart report DM.
+   *  Missing preserves the legacy behavior (enabled). */
+  notifyOnRestart?: boolean;
 }
 
 export interface MaintenanceTask {
@@ -378,8 +381,8 @@ function readMaintenanceToggle(raw: unknown): MaintenanceToggle | undefined {
 }
 
 /** Validate a maintenance patch from the dashboard PUT. Type-strict on enabled
- *  (both keys) and on autoUpdate's time. autoRestart is a toggle — any `time`
- *  on it is ignored (it reuses autoUpdate's schedule). */
+ *  (both task keys), autoUpdate's time, and notifyOnRestart. autoRestart is a
+ *  toggle — any `time` on it is ignored (it reuses autoUpdate's schedule). */
 export function parseMaintenancePatch(
   body: unknown,
 ): { ok: true; patch: MaintenanceConfig } | { ok: false; error: string } {
@@ -412,6 +415,10 @@ export function parseMaintenancePatch(
     }
     patch.autoRestart = toggle;
   }
+  if ('notifyOnRestart' in b) {
+    if (typeof b.notifyOnRestart !== 'boolean') return { ok: false, error: 'invalid_notify_on_restart' };
+    patch.notifyOnRestart = b.notifyOnRestart;
+  }
   if (Object.keys(patch).length === 0) return { ok: false, error: 'empty' };
   return { ok: true, patch };
 }
@@ -424,6 +431,7 @@ function readMaintenance(raw: unknown): MaintenanceConfig | undefined {
   if (au) out.autoUpdate = au;
   const ar = readMaintenanceToggle(m.autoRestart);
   if (ar) out.autoRestart = ar;
+  if (typeof m.notifyOnRestart === 'boolean') out.notifyOnRestart = m.notifyOnRestart;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 

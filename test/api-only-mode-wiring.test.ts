@@ -924,6 +924,7 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(block).toContain('startMaintenance();');
     expect(block).toContain('startCliRuntimeUpdateMonitor(');
     expect(block).toContain('sendRestartReportIfPending(');
+    expect(block).toContain('notifyOnRestart: readGlobalConfig().maintenance?.notifyOnRestart !== false,');
   });
 
   it('P1(3rd round): core-only does NOT write shared-HOME .data-dir breadcrumb or ~/.botmux/bin wrapper', () => {
