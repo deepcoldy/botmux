@@ -1,10 +1,12 @@
-import type { ObserveFetchOptions } from './session-observe-fetch.js';
 import {
   fetchObserveSessionImplementation,
   fetchObserveSnapshotImplementation,
   type ObserveFetchDependencies,
+  type ObserveFetchQuery,
 } from './session-observe-fetch-implementation.js';
 import type { ObserveSession, ObserveSnapshot } from './session-observe.js';
+
+export type ObserveFetchOptions = ObserveFetchQuery;
 
 export type DaemonIpcFetch = (
   port: number,

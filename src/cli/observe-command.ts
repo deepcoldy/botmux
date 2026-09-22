@@ -5,8 +5,8 @@
 //
 // The command shells out to `fetchObserveSnapshot` / `fetchObserveSession`,
 // which reuse the daemon HMAC loopback IPC. It never talks to backends, tmux,
-// or persistent stores directly — the same "single fact source" invariant
-// enforced by the TS façade.
+// or persistent stores directly — the daemon has already composed the
+// canonical SessionRow that this CLI is a stdout shim over.
 //
 // Exit codes:
 //   0  every probe returned `ok` (or session-level `not_found`, which is a
@@ -17,7 +17,7 @@
 import {
   fetchObserveSession,
   fetchObserveSnapshot,
-} from '../services/session-observe-fetch.js';
+} from '../services/session-observe-fetch-internal.js';
 import type { ObserveProbeStatus } from '../services/session-observe.js';
 
 interface ParsedArgs {

@@ -135,82 +135,13 @@ describe('package.json — lockfile safety and packaging', () => {
       expect(paths, `${entry} must not ship: it imports node-pty, which is not a dependency`).not.toContain(entry);
     }
     expect(paths.filter(p => p.startsWith('dist/'))).toEqual([]);
-    expect(paths.filter(p => p.startsWith('public-api/')).sort()).toEqual([
-      'public-api/session-observe-fetch.d.ts',
-      'public-api/session-observe-fetch.js',
-      'public-api/session-observe-fetch.js.map',
-      'public-api/session-observe.d.ts',
-      'public-api/session-observe.js',
-      'public-api/session-observe.js.map',
-    ]);
-    expect(manifest.exports).toEqual({
-      './services/session-observe': {
-        types: './public-api/session-observe.d.ts',
-        import: './public-api/session-observe.js',
-      },
-      './services/session-observe-fetch': {
-        types: './public-api/session-observe-fetch.d.ts',
-        import: './public-api/session-observe-fetch.js',
-      },
-    });
+    expect(paths.filter(p => p.startsWith('public-api/'))).toEqual([]);
+    expect(manifest.exports).toBeUndefined();
     // The pm2 ecosystem file names dist/index-daemon.js as its `script`. Nothing in
     // the source tree reads it (the supervisor replaced pm2), so its only remaining
     // effect is telling a human to start the broken form by hand.
     expect(paths).not.toContain('ecosystem.config.cjs');
   });
-
-  it('the packed public observe subpaths load and type-check for consumers', () => {
-    const root = tmp();
-    const packed = spawnSync('npm', [
-      'pack', '--ignore-scripts', '--json', '--pack-destination', root,
-    ], { encoding: 'utf-8', cwd: resolve('.'), timeout: 120_000 });
-    expect(packed.error, `npm pack failed to run: ${packed.error?.message}`).toBeUndefined();
-    expect(packed.status, `npm pack exited ${packed.status}: ${packed.stderr}`).toBe(0);
-    const report = parseNpmPackJson(packed.stdout) as Array<{ filename: string }>;
-    const consumer = join(root, 'consumer');
-    mkdirSync(consumer, { recursive: true });
-    writeFileSync(join(consumer, 'package.json'), JSON.stringify({
-      private: true,
-      type: 'module',
-      dependencies: {
-        botmux: `file:../${report[0]!.filename}`,
-        typescript: '5.9.3',
-      },
-    }));
-    const installed = spawnSync('npm', [
-      'install', '--ignore-scripts', '--no-audit', '--no-fund',
-    ], { cwd: consumer, encoding: 'utf-8', timeout: 120_000 });
-    expect(installed.error, `consumer npm install failed to run: ${installed.error?.message}`).toBeUndefined();
-    expect(installed.status, `${installed.stdout}\n${installed.stderr}`).toBe(0);
-
-    const loaded = spawnSync(NODE_BIN, ['--input-type=module', '-e', `
-      const schema = await import('botmux/services/session-observe');
-      const fetcher = await import('botmux/services/session-observe-fetch');
-      if (typeof schema.normalizeSessionRow !== 'function') process.exit(2);
-      if (typeof fetcher.fetchObserveSnapshot !== 'function') process.exit(3);
-      if (typeof fetcher.fetchObserveSession !== 'function') process.exit(4);
-    `], { cwd: consumer, encoding: 'utf-8' });
-    expect(loaded.status, loaded.stderr).toBe(0);
-
-    writeFileSync(join(consumer, 'consumer.ts'), `
-      import { normalizeSessionRow, type ObserveSession } from 'botmux/services/session-observe';
-      import { fetchObserveSession, type ObserveFetchOptions } from 'botmux/services/session-observe-fetch';
-      const options: ObserveFetchOptions = { larkAppId: 'cli_app', includeRaw: false };
-      const normalized: ObserveSession = normalizeSessionRow(
-        { sessionId: 'session' },
-        { observedAt: 1 },
-      );
-      const fetched: Promise<ObserveSession> = fetchObserveSession('session', options);
-      void normalized;
-      void fetched;
-    `);
-    const typed = spawnSync(NODE_BIN, [join(consumer, 'node_modules', 'typescript', 'bin', 'tsc'),
-      '--noEmit', '--strict', '--skipLibCheck', '--target', 'ES2022',
-      '--module', 'NodeNext', '--moduleResolution', 'NodeNext',
-      join(consumer, 'consumer.ts'),
-    ], { cwd: consumer, encoding: 'utf-8' });
-    expect(typed.status, `${typed.stdout}\n${typed.stderr}`).toBe(0);
-  }, 120_000);
 
   it('parseNpmPackReport() reads both npm-major shapes of `npm pack --json`', () => {
     const files = [{ path: 'package.json', size: 1, mode: 420 }];

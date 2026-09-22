@@ -5,7 +5,7 @@ import {
   type RawSessionRow,
 } from '../src/services/session-observe.js';
 import type { ObserveSession } from '../src/services/session-observe.js';
-import type { ObserveFetchOptions } from '../src/services/session-observe-fetch.js';
+import type { ObserveFetchOptions } from '../src/services/session-observe-fetch-internal.js';
 
 expectTypeOf<ObserveSession['backend']['adopted']>().toEqualTypeOf<boolean | 'unknown'>();
 expectTypeOf<ObserveSession['parkedOrSuspended']>().toEqualTypeOf<boolean | 'unknown'>();

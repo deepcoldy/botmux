@@ -17,7 +17,7 @@ const packageJson = JSON.parse(await readFile(resolve(repoRoot, 'package.json'),
 if (packageJson?.name !== 'botmux') {
   throw new Error(`refusing to clean unrecognized repository root: ${repoRoot}`);
 }
-for (const name of ['dist', 'public-api']) {
+for (const name of ['dist']) {
   const outputDir = resolve(repoRoot, name);
   if (basename(outputDir) !== name) {
     throw new Error(`refusing to clean unexpected build directory: ${outputDir}`);
