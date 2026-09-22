@@ -545,6 +545,49 @@ describe('Frozen Command host-owned route → callback → Data MCP flow', () =>
     })).toBeUndefined();
   });
 
+  it('executes an exact natural-language command in a new topic without creating a CLI session or card', async () => {
+    const messageId = `om_direct_new_${Math.random().toString(36).slice(2)}`;
+    await modules.daemon.__testOnly_handleNewTopic(
+      ingressEvent(messageId, '@_bot 运行 /宿主闭环 11'),
+      ingressContext(messageId, messageId),
+    );
+
+    expect(modules.daemon.__testOnly_activeSessions.get(modules.types.sessionKey(messageId, APP))).toBeUndefined();
+    expect(mocks.validateCalls).toBe(1);
+    expect(mocks.runCalls).toBe(1);
+    expect(mocks.cardBodies).toHaveLength(1);
+    expect(mocks.cardBodies[0]).toContain('真实链路：');
+    expect(mocks.cardBodies[0]).not.toContain('确认执行');
+  });
+
+  it('executes an exact natural-language command in an existing thread once without forwarding to the CLI', async () => {
+    const rootMessageId = `om_direct_root_${Math.random().toString(36).slice(2)}`;
+    await modules.daemon.__testOnly_handleNewTopic(
+      ingressEvent(rootMessageId, '初始化宿主闭环会话'),
+      ingressContext(rootMessageId, rootMessageId),
+    );
+    const ds = modules.daemon.__testOnly_activeSessions.get(modules.types.sessionKey(rootMessageId, APP));
+    expect(ds).toBeDefined();
+    const workerSend = vi.fn(() => true);
+    ds.worker = { killed: false, send: workerSend };
+    mocks.cardBodies.length = 0;
+    mocks.validateCalls = 0;
+    mocks.runCalls = 0;
+
+    const messageId = `om_direct_reply_${Math.random().toString(36).slice(2)}`;
+    await modules.daemon.__testOnly_handleThreadReply(
+      ingressEvent(messageId, '运行 /宿主闭环 11 @_bot', rootMessageId),
+      ingressContext(messageId, rootMessageId),
+    );
+
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(mocks.validateCalls).toBe(1);
+    expect(mocks.runCalls).toBe(1);
+    expect(mocks.cardBodies).toHaveLength(1);
+    expect(mocks.cardBodies[0]).toContain('真实链路：');
+    expect(mocks.cardBodies[0]).not.toContain('确认执行');
+  });
+
   it.each([
     ['top-level', 'top-level'],
     ['structuredContent', 'structured'],
@@ -836,8 +879,8 @@ unexpectedInternalField: true
   });
 
   it.each([
-    ['new-topic', 'pty', '@_bot 运行 /宿主闭环 11', '@Current Bot 运行 /宿主闭环 11'],
-    ['existing-thread', 'tmux', '运行 /宿主闭环 11 @_bot', '运行 /宿主闭环 11 @Current Bot'],
+    ['new-topic', 'pty', '@_bot 请运行固化命令 /宿主闭环，参数 11', '@Current Bot 请运行固化命令 /宿主闭环，参数 11'],
+    ['existing-thread', 'tmux', '请运行固化命令 /宿主闭环，参数 11 @_bot', '请运行固化命令 /宿主闭环，参数 11 @Current Bot'],
   ] as const)('binds the exact human through real %s/%s ingress including bot mentions', async (
     ingress,
     backendType,

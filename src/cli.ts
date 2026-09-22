@@ -13305,6 +13305,11 @@ async function cmdFreeze(rest: string[]): Promise<void> {
     process.exitCode = 2;
     return;
   }
+  if (sub === 'run') {
+    console.error('botmux freeze run 已停用：运行已安装命令时，请让用户直接发送“/命令 参数”或“运行 /命令 参数”；宿主会直接执行且不再发送确认卡');
+    process.exitCode = 2;
+    return;
+  }
   const sessionId = process.env.BOTMUX_SESSION_ID;
   const larkAppId = process.env.BOTMUX_LARK_APP_ID;
   if (!sessionId || !larkAppId) {

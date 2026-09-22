@@ -30,6 +30,32 @@ import {
 export const DATA_MCP_PLUGIN_ID = 'data-mcp';
 export const FROZEN_COMMAND_DIR = join('.botmux', 'commands');
 
+export interface NaturalLanguageFrozenCommandInvocation {
+  cmd: string;
+  commandContent: string;
+}
+
+/**
+ * Parse only an exact, single-line user instruction to run an installed
+ * frozen command. Keeping this grammar deliberately narrow lets the host
+ * bypass the model without mistaking numbered examples, pasted checklists, or
+ * prose that merely mentions `/command` for an execution request.
+ */
+export function parseNaturalLanguageFrozenCommandInvocation(
+  content: string,
+): NaturalLanguageFrozenCommandInvocation | undefined {
+  const trimmed = content.trim();
+  if (!trimmed || /\r|\n/u.test(trimmed)) return undefined;
+  const match = /^(?:运行|执行|run)\s+(\/[\p{L}\p{N}_-]+)(?![\p{L}\p{N}_\/-])(?:\s+([\s\S]+?))?[。！!]?$/iu.exec(trimmed);
+  if (!match) return undefined;
+  const cmd = match[1]!.toLowerCase();
+  const rawArgs = (match[2] ?? '').trim();
+  return {
+    cmd,
+    commandContent: rawArgs ? `${cmd} ${rawArgs}` : cmd,
+  };
+}
+
 const COMMAND_NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N}_-]{0,63}$/u;
 const PARAM_NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 const PLACEHOLDER_RE = /\{\{\s*([A-Za-z][A-Za-z0-9_]*)\s*\}\}/g;

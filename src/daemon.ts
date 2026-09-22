@@ -127,6 +127,7 @@ import {
   lookupFrozenCommand,
   normalizeFrozenCommandArguments,
   normalizeFrozenCommandName,
+  parseNaturalLanguageFrozenCommandInvocation,
   readFrozenCommandFileStatus,
   renderFrozenCommandSql,
   shouldFallbackFrozenCommand,
@@ -22681,6 +22682,37 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // ordinary message handling — the peer bot can still talk, it just can't drive
   // /clear /model /close … into this bot. Human senders are never gated here.
   const senderIsBotForSlashGate = isBotSenderType || isForeignBotSender;
+  const naturalFrozenInvocation = senderIsBotForSlashGate
+    ? undefined
+    : parseNaturalLanguageFrozenCommandInvocation(stripBotMentions(
+        cmdContent,
+        followupMentions,
+        { botOpenId: getBot(larkAppId).botOpenId, larkAppId },
+      ));
+  if (naturalFrozenInvocation) {
+    const pinnedWorkingDir = resolveFrozenCommandWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
+    const frozen = await routeFrozenCommand({
+      ...naturalFrozenInvocation,
+      workingDir: pinnedWorkingDir,
+      larkAppId,
+      chatId,
+      chatType,
+      anchor,
+      turnId: parsed.messageId,
+      senderOpenId,
+      senderUnionId,
+      senderIsBot: false,
+      mentions: parsed.mentions,
+      reply: commandDepsForInvocation({
+        scope,
+        chatId,
+        anchor,
+        messageId: parsed.messageId,
+        replyRootId,
+      }).sessionReply,
+    });
+    if (frozen.kind === 'handled') return;
+  }
   const invocation = (senderIsBotForSlashGate && !botAcceptsSlashFromBots(larkAppId))
     ? null
     : parseSlashCommandInvocation(cmdContent);
@@ -24849,6 +24881,47 @@ async function handleThreadReplyAdmitted(
   // acceptSlashFromBots gate (mirror of the new-topic path): a bot sender's
   // slash is only routed as a command when this bot opts in (default on); when
   // off it falls through to ordinary message handling. Human senders unaffected.
+  const naturalFrozenInvocation = ctx.messageListener || isBotSenderType || isForeignBot
+    ? undefined
+    : parseNaturalLanguageFrozenCommandInvocation(stripBotMentions(
+        cmdContent,
+        parsed.mentions,
+        { botOpenId: getBot(larkAppId).botOpenId, larkAppId },
+      ));
+  if (naturalFrozenInvocation) {
+    const existingDs = activeSessions.get(sessionKey(anchor, larkAppId));
+    const effectiveThreadChatId = existingDs?.chatId ?? threadChatId;
+    const frozenWorkingDir = existingDs
+      ? getSessionWorkingDir(existingDs)
+      : resolveFrozenCommandWorkingDir({
+          scope,
+          anchor,
+          chatId: effectiveThreadChatId,
+          chatType: ctxChatType,
+          larkAppId,
+        });
+    const frozen = await routeFrozenCommand({
+      ...naturalFrozenInvocation,
+      workingDir: frozenWorkingDir,
+      larkAppId,
+      chatId: effectiveThreadChatId,
+      chatType: ctxChatType,
+      anchor,
+      turnId: parsed.messageId,
+      senderOpenId: threadSenderOpenId,
+      senderUnionId: threadSenderUnionId,
+      senderIsBot: false,
+      mentions: parsed.mentions,
+      reply: commandDepsForInvocation({
+        scope,
+        chatId: ctxChatId,
+        anchor,
+        messageId: parsed.messageId,
+        replyRootId,
+      }).sessionReply,
+    });
+    if (frozen.kind === 'handled') return;
+  }
   const invocation = ctx.messageListener
     ? null
     : ((isBotSenderType || isForeignBot) && !botAcceptsSlashFromBots(larkAppId))

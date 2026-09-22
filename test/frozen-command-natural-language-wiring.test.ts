@@ -31,11 +31,12 @@ describe('Frozen Command natural-language P0a wiring', () => {
     expect(ipc).toContain("pathname === '/api/frozen-command-actions'");
   });
 
-  it('teaches the model to submit candidates and never claim execution before click', () => {
+  it('keeps listing model-assisted while installed-command execution stays host-direct', () => {
     expect(skill).toContain('botmux freeze list');
-    expect(skill).toContain('botmux freeze run');
-    expect(skill).toContain('只向宿主提交候选意图');
-    expect(skill).toContain('绝不表示查询已执行或成功');
+    expect(skill).toContain('运行已安装的固化命令由宿主直达');
+    expect(skill).toContain('不要**调用 \\`botmux freeze run\\`');
+    expect(cli).toContain('botmux freeze run 已停用');
+    expect(guidance).toContain('Never call `botmux freeze run`');
   });
 
   it('routes lifecycle candidates through the same exact-turn host boundary and one-click card', () => {

@@ -16,6 +16,7 @@ const NATURAL_LANGUAGE_FREEZE_INTENT = [
   ...EXPLICIT_FREEZE_INTENT,
   ...POSSIBLE_SLASH_COMMAND_LIFECYCLE,
   /(?:有哪些|列出|查看|打开).{0,20}固化命令/iu,
+  /^(?:运行|执行|run)\s+\/[\p{L}\p{N}_-]+/iu,
 ];
 
 const LIFECYCLE_OPERATION =
@@ -34,6 +35,7 @@ export function frozenCommandSkillHintForMessage(content: string): string | unde
     '<botmux_capability_hint name="botmux-freeze">',
     'This request matches the host-owned frozen-command lifecycle. Before acting, run `botmux skill show botmux-freeze` and follow it exactly.',
     'Creation/update/retire/restore/revoke must use `botmux freeze ...` so the host emits the single authoritative lifecycle card. Do not use `botmux ask` for this confirmation.',
+    'Running an installed command is host-owned and confirmation-free. Never call `botmux freeze run`; ask the user to send the exact `/command args` form if this turn was not intercepted by the host.',
     '</botmux_capability_hint>',
   ].join('\n');
 }

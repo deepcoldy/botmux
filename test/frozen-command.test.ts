@@ -14,6 +14,7 @@ import {
   isTransientDataMcpFailure,
   normalizeFrozenCommandName,
   normalizeFrozenCommandArguments,
+  parseNaturalLanguageFrozenCommandInvocation,
   renderFrozenCommandSql,
   resolveFrozenCommandScheduledOutput,
   shouldFallbackFrozenCommand,
@@ -66,6 +67,24 @@ onError: fallback_llm
 `;
 
 describe('Frozen Commands definition and positional UX', () => {
+  it('parses only exact single-line natural-language run requests', () => {
+    expect(parseNaturalLanguageFrozenCommandInvocation('运行 /泰国上账 30')).toEqual({
+      cmd: '/泰国上账',
+      commandContent: '/泰国上账 30',
+    });
+    expect(parseNaturalLanguageFrozenCommandInvocation('执行 /泰国上账 30。')).toEqual({
+      cmd: '/泰国上账',
+      commandContent: '/泰国上账 30',
+    });
+    expect(parseNaturalLanguageFrozenCommandInvocation('run /report 7')).toEqual({
+      cmd: '/report',
+      commandContent: '/report 7',
+    });
+    expect(parseNaturalLanguageFrozenCommandInvocation('1. /泰国上账 30')).toBeUndefined();
+    expect(parseNaturalLanguageFrozenCommandInvocation('示例：运行 /泰国上账 30')).toBeUndefined();
+    expect(parseNaturalLanguageFrozenCommandInvocation('运行 /泰国上账 30\n- 另一个步骤')).toBeUndefined();
+    expect(parseNaturalLanguageFrozenCommandInvocation('运行 /api/users')).toBeUndefined();
+  });
   it('accepts a Chinese command name and normalizes NFKC safely', () => {
     expect(normalizeFrozenCommandName('/泰国上账')).toBe('泰国上账');
     expect(normalizeFrozenCommandName('/ＴＥＳＴ')).toBe('test');
