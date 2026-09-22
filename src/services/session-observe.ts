@@ -124,6 +124,12 @@ const ROW_TURN_STATUSES = new Set<ObserveTurn>([
   'interrupted',
 ]);
 
+const ROW_RUNTIME_STATUSES = new Set<string>([
+  ...ROW_TURN_STATUSES,
+  'dormant',
+  'closed',
+]);
+
 /**
  * Normalize a raw daemon SessionRow (whatever shape `GET /api/sessions` emits)
  * into the canonical ObserveSession. Never inspects live processes, backends,
@@ -142,14 +148,15 @@ export function normalizeSessionRow(
   const probe = options.probe ?? { status: 'ok', source: 'daemon-ipc' };
   const hasRuntimeFacts = probe.status === 'ok';
   const status = typeof row.status === 'string' ? row.status : undefined;
-  const closed = hasRuntimeFacts ? status === 'closed' : 'unknown';
+  const hasKnownStatus = hasRuntimeFacts && status !== undefined && ROW_RUNTIME_STATUSES.has(status);
+  const closed: ObserveBoolean = hasKnownStatus ? status === 'closed' : 'unknown';
   const dormant = status === 'dormant';
   const queuedFlag = row.queued;
   const queued: ObserveQueued = hasRuntimeFacts && typeof queuedFlag === 'boolean' ? queuedFlag : 'unknown';
 
   const liveness: ObserveLiveness = !hasRuntimeFacts
     ? 'unknown'
-    : closed
+    : closed === true
     ? 'closed'
     : dormant || queued === true
       ? 'not_running'
@@ -157,7 +164,7 @@ export function normalizeSessionRow(
         ? 'alive'
         : 'unknown';
 
-  const turn: ObserveTurn = !hasRuntimeFacts || closed || dormant
+  const turn: ObserveTurn = !hasRuntimeFacts || closed === true || dormant
     ? 'unknown'
     : queued === true
       ? 'idle'
@@ -186,7 +193,7 @@ export function normalizeSessionRow(
   if (typeof row.cliInstanceId === 'string' && row.cliInstanceId) cli.instanceId = row.cliInstanceId;
 
   const backend: ObserveSession['backend'] = {
-    adopted: hasRuntimeFacts ? row.adopt === true : 'unknown',
+    adopted: hasRuntimeFacts && typeof row.adopt === 'boolean' ? row.adopt : 'unknown',
   };
   if (typeof row.backendType === 'string' && row.backendType) backend.type = row.backendType;
   if (typeof row.backendSessionName === 'string' && row.backendSessionName) {
@@ -206,7 +213,7 @@ export function normalizeSessionRow(
     turn,
     phase: 'unknown',
     queued,
-    parkedOrSuspended: hasRuntimeFacts ? dormant || queued === true : 'unknown',
+    parkedOrSuspended: hasKnownStatus ? dormant || queued === true : 'unknown',
     closed,
   };
 

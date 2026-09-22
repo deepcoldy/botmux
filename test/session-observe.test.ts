@@ -116,12 +116,25 @@ describe('session-observe normalizer', () => {
 
   it('emits queued="unknown" and turn="unknown" for unrecognized status', () => {
     const observe = normalizeSessionRow(
-      makeRow({ status: 'weirdo' as unknown as string, queued: undefined }),
+      makeRow({ status: 'weirdo' as unknown as string, queued: undefined, adopt: undefined }),
       { observedAt: OBSERVED_AT },
     );
     expect(observe.liveness).toBe('unknown');
     expect(observe.turn).toBe('unknown');
     expect(observe.queued).toBe('unknown');
+    expect(observe.closed).toBe('unknown');
+    expect(observe.parkedOrSuspended).toBe('unknown');
+    expect(observe.backend.adopted).toBe('unknown');
+  });
+
+  it('keeps boolean facts unknown when a successful row omits their evidence', () => {
+    const observe = normalizeSessionRow(
+      { sessionId: 's_partial' },
+      { observedAt: OBSERVED_AT },
+    );
+    expect(observe.closed).toBe('unknown');
+    expect(observe.parkedOrSuspended).toBe('unknown');
+    expect(observe.backend.adopted).toBe('unknown');
   });
 
   it('carries agentAttention / tuiPromptActive / workingDir / lastActivityAt through', () => {
