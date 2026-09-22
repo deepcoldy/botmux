@@ -142,6 +142,16 @@ function sessionThreadLink(
   return threadAppLink(session.chatId, session.larkThreadId, brand);
 }
 
+// The native Lark topic id is a durable identity fact for thread-scope sessions.
+// Row producers publish it so downstream normalizers (observe façade included)
+// can surface `identity.threadId` without re-deriving the validation rule.
+function sessionThreadId(
+  session: Pick<Session, 'scope' | 'larkThreadId'>,
+): string | undefined {
+  if (session.scope !== 'thread' || !isNativeTopicId(session.larkThreadId)) return undefined;
+  return session.larkThreadId;
+}
+
 function sessionFeishuChatLink(session: Pick<Session, 'chatId' | 'headless'>, brand: Brand): string {
   if (session.headless && !session.headless.boundChatId) return '';
   return session.headless?.boundChatId
@@ -247,6 +257,7 @@ function maybeSessionTokenUsage(
 export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptions): SessionRow {
   const brand = getBotBrand(ds.larkAppId);
   const topicLink = sessionThreadLink(ds.session, brand);
+  const topicId = sessionThreadId(ds.session);
   return {
     sessionId: ds.session.sessionId,
     larkAppId: ds.larkAppId,
@@ -303,6 +314,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     hasHistory: ds.hasHistory,
     feishuChatLink: sessionFeishuChatLink(ds.session, brand),
     ...(topicLink ? { feishuThreadLink: topicLink } : {}),
+    ...(topicId ? { threadId: topicId } : {}),
     pendingRepo: !!ds.pendingRepo,
     queued: !!ds.session.queued,
     tuiPromptActive: !!ds.tuiPromptCardId,
@@ -320,6 +332,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
 export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): SessionRow {
   const brand = getBotBrand(s.larkAppId ?? '');
   const topicLink = sessionThreadLink(s, brand);
+  const topicId = sessionThreadId(s);
   return {
     sessionId: s.sessionId,
     larkAppId: s.larkAppId ?? '',
@@ -355,6 +368,7 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     previewTarget: safeSessionPreviewTarget(s.previewTarget),
     feishuChatLink: sessionFeishuChatLink(s, brand),
     ...(topicLink ? { feishuThreadLink: topicLink } : {}),
+    ...(topicId ? { threadId: topicId } : {}),
     tokenUsage: maybeSessionTokenUsage(s, undefined, opts, { usePersistedSnapshot: true }),
     ...buildSessionMessagePreview(s),
   };
@@ -371,6 +385,7 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
 export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOptions): SessionRow {
   const brand = getBotBrand(s.larkAppId ?? '');
   const topicLink = sessionThreadLink(s, brand);
+  const topicId = sessionThreadId(s);
   return {
     sessionId: s.sessionId,
     larkAppId: s.larkAppId ?? '',
@@ -404,6 +419,7 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     webPort: null,
     feishuChatLink: sessionFeishuChatLink(s, brand),
     ...(topicLink ? { feishuThreadLink: topicLink } : {}),
+    ...(topicId ? { threadId: topicId } : {}),
     queued: !!s.queued,
     hasHistory: !!(s.cliId || s.lastCliInput || s.backendType || s.adoptedFrom),
     quarantined: !!s.restoreQuarantinedAt,

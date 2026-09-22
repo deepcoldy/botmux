@@ -201,7 +201,7 @@ describe('session-observe normalizer', () => {
     expect(observe.identity.sessionId).toBe('s_missing');
   });
 
-  it('hides stale runtime fields when the probe is unauthorized', () => {
+  it('hides realtime state but retains durable identity when the probe is unauthorized', () => {
     const observe = normalizeSessionRow(
       makeRow({
         status: 'working',
@@ -212,6 +212,8 @@ describe('session-observe normalizer', () => {
         pendingRepo: true,
         tuiPromptActive: true,
         agentAttention: { kind: 'blocked', reason: 'stale', at: OBSERVED_AT - 1_000 },
+        backendSessionName: 'bot-x-s_1',
+        threadId: 'omt_thread_a',
       }),
       {
         observedAt: OBSERVED_AT,
@@ -220,25 +222,62 @@ describe('session-observe normalizer', () => {
       },
     );
     expect(observe.identity.sessionId).toBe('s_1');
+    expect(observe.identity.threadId).toBe('omt_thread_a');
     expect(observe.lastActivityAt).toBe(OBSERVED_AT - 5_000);
+    // realtime facts must be unknown/absent
     expect(observe.liveness).toBe('unknown');
     expect(observe.turn).toBe('unknown');
     expect(observe.queued).toBe('unknown');
     expect(observe.closed).toBe('unknown');
     expect(observe.parkedOrSuspended).toBe('unknown');
     expect(observe.backend.adopted).toBe('unknown');
-    expect(observe.cli).toEqual({});
-    expect(observe.backend.type).toBeUndefined();
-    expect(observe.backend.sessionName).toBeUndefined();
     expect(observe.backend.workerPid).toBeUndefined();
     expect(observe.backend.adoptCliPid).toBeUndefined();
     expect(observe.pendingRepo).toBeUndefined();
     expect(observe.tuiPromptActive).toBeUndefined();
     expect(observe.attention).toBeUndefined();
-    expect(observe.workingDirectory).toBeUndefined();
     expect(observe.rawStatus).toBeUndefined();
     expect(observe.raw).toBeUndefined();
+    // durable identity/history must survive probe failure
+    expect(observe.cli.id).toBe('codex');
+    expect(observe.cli.runtimeId).toBe('codex');
+    expect(observe.cli.runtimeDisplayName).toBe('Codex');
+    expect(observe.cli.version).toBe('1.0.0');
+    expect(observe.backend.type).toBe('pty');
+    expect(observe.backend.sessionName).toBe('bot-x-s_1');
+    expect(observe.workingDirectory).toBe('/tmp/repo');
   });
+
+  it.each(['unauthorized', 'unreachable', 'not_found', 'daemon_offline'] as const)(
+    'retains durable identity for probe=%s while realtime fields become unknown',
+    status => {
+      const observe = normalizeSessionRow(
+        makeRow({
+          status: 'working',
+          workerPid: 1,
+          adopt: true,
+          adoptCliPid: 2,
+          backendSessionName: 'bot-x-s_1',
+        }),
+        {
+          observedAt: OBSERVED_AT,
+          probe: { status, source: 'daemon-ipc' },
+        },
+      );
+      // Realtime always erased under non-ok probe.
+      expect(observe.liveness).toBe('unknown');
+      expect(observe.turn).toBe('unknown');
+      expect(observe.backend.adopted).toBe('unknown');
+      expect(observe.backend.workerPid).toBeUndefined();
+      expect(observe.backend.adoptCliPid).toBeUndefined();
+      // Durable identity/history preserved regardless of the failure reason.
+      expect(observe.cli.id).toBe('codex');
+      expect(observe.cli.runtimeId).toBe('codex');
+      expect(observe.backend.type).toBe('pty');
+      expect(observe.backend.sessionName).toBe('bot-x-s_1');
+      expect(observe.workingDirectory).toBe('/tmp/repo');
+    },
+  );
 
   it('does not treat cliId="unknown" as a real cli identity', () => {
     const observe = normalizeSessionRow(

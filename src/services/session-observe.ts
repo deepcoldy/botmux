@@ -184,21 +184,29 @@ export function normalizeSessionRow(
   if (typeof row.feishuThreadLink === 'string' && row.feishuThreadLink) identity.feishuThreadLink = row.feishuThreadLink;
 
   const cli: ObserveSession['cli'] = {};
-  if (hasRuntimeFacts && typeof row.cliId === 'string' && row.cliId && row.cliId !== 'unknown') cli.id = row.cliId;
-  if (hasRuntimeFacts && typeof row.runtimeId === 'string' && row.runtimeId) cli.runtimeId = row.runtimeId;
-  if (hasRuntimeFacts && typeof row.runtimeDisplayName === 'string' && row.runtimeDisplayName) {
+  // Durable CLI identity is a persisted fact stamped at spawn time. It stays
+  // meaningful even when the daemon probe fails (unauthorized/unreachable/
+  // not_found/daemon_offline) — masking it would erase identity we can still
+  // prove. Only truly realtime status (workerPid, adoption liveness) is gated
+  // behind hasRuntimeFacts below.
+  if (typeof row.cliId === 'string' && row.cliId && row.cliId !== 'unknown') cli.id = row.cliId;
+  if (typeof row.runtimeId === 'string' && row.runtimeId) cli.runtimeId = row.runtimeId;
+  if (typeof row.runtimeDisplayName === 'string' && row.runtimeDisplayName) {
     cli.runtimeDisplayName = row.runtimeDisplayName;
   }
-  if (hasRuntimeFacts && typeof row.cliVersion === 'string' && row.cliVersion) cli.version = row.cliVersion;
-  if (hasRuntimeFacts && typeof row.cliInstanceId === 'string' && row.cliInstanceId) cli.instanceId = row.cliInstanceId;
+  if (typeof row.cliVersion === 'string' && row.cliVersion) cli.version = row.cliVersion;
+  if (typeof row.cliInstanceId === 'string' && row.cliInstanceId) cli.instanceId = row.cliInstanceId;
 
   const backend: ObserveSession['backend'] = {
     adopted: hasRuntimeFacts && typeof row.adopt === 'boolean' ? row.adopt : 'unknown',
   };
-  if (hasRuntimeFacts && typeof row.backendType === 'string' && row.backendType) backend.type = row.backendType;
-  if (hasRuntimeFacts && typeof row.backendSessionName === 'string' && row.backendSessionName) {
+  // backend.type and backend.sessionName are durable identity: they identify
+  // the persisted host multiplexer the session is bound to, not its liveness.
+  if (typeof row.backendType === 'string' && row.backendType) backend.type = row.backendType;
+  if (typeof row.backendSessionName === 'string' && row.backendSessionName) {
     backend.sessionName = row.backendSessionName;
   }
+  // workerPid / adoptCliPid describe an actively running process — realtime.
   if (hasRuntimeFacts && typeof row.workerPid === 'number' && Number.isFinite(row.workerPid)) {
     backend.workerPid = row.workerPid;
   }
@@ -232,7 +240,10 @@ export function normalizeSessionRow(
   if (typeof row.lastMessageAt === 'number' && row.lastMessageAt > 0) {
     observe.lastActivityAt = row.lastMessageAt;
   }
-  if (hasRuntimeFacts && typeof row.workingDir === 'string' && row.workingDir) {
+  // workingDirectory is the session's spawn-time workspace path — durable
+  // identity/history that outlives probe failure. Keep it visible so probe
+  // errors do not erase the fact of where this session lives on disk.
+  if (typeof row.workingDir === 'string' && row.workingDir) {
     observe.workingDirectory = row.workingDir;
   }
   if (hasRuntimeFacts && status) observe.rawStatus = status;
