@@ -6,12 +6,19 @@ import {
 import {
   scratchMergedRootFor,
   scratchViewPath,
+  scratchViewPathSingle,
+  scratchLinuxMappings,
   registerScratchView,
   registeredScratchView,
   clearScratchView,
+  persistedScratchMappings,
+  type ScratchPathMapping,
 } from '../src/services/scratch-host-view.js';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
-describe('scratch host-view path mapping', () => {
+describe('Linux scratch host-view mapping', () => {
   const merged = '/var/lib/botmux/data/sandboxes/sid-1/root';
 
   it('prefixes an absolute host path with the merged root', () => {
@@ -29,26 +36,86 @@ describe('scratch host-view path mapping', () => {
   });
 
   it('derives the merged root deterministically from dataDir + sid', () => {
-    expect(scratchMergedRootFor('/data', 'sid'))
-      .toBe('/data/sandboxes/sid/root');
+    expect(scratchMergedRootFor('/data', 'sid')).toBe('/data/sandboxes/sid/root');
   });
 
-  it('returns the input unchanged without a merged root (non-scratch sessions)', () => {
+  it('builds the single full-root linux mapping', () => {
+    expect(scratchLinuxMappings(merged)).toEqual([{ from: '/', to: merged }]);
+  });
+});
+
+describe('multi-mapping scratchViewPath (Linux + macOS)', () => {
+  const merged = '/data/sandboxes/s/root';
+
+  it('returns the input unchanged without mappings / for relative input', () => {
     expect(scratchViewPath(undefined, '/root/x')).toBe('/root/x');
-    expect(scratchViewPath('/m', 'rel')).toBe('rel');
+    expect(scratchViewPath([], '/root/x')).toBe('/root/x');
+    expect(scratchViewPath(scratchLinuxMappings(merged), 'rel')).toBe('rel');
   });
 
-  it('maps through a given merged root', () => {
-    expect(scratchViewPath('/m', '/root/x')).toBe('/m/root/x');
+  it('maps through the linux full-root mapping', () => {
+    expect(scratchViewPath(scratchLinuxMappings(merged), '/root/x')).toBe(`${merged}/root/x`);
   });
 
-  it('tracks the per-session live view registry', () => {
+  it('maps HOME and a nested project clone independently (macOS shape)', () => {
+    const maps: ScratchPathMapping[] = [
+      { from: '/Users/u', to: '/data/sandboxes/s/clone/home/__Users_u' },
+      { from: '/Volumes/proj', to: '/data/sandboxes/s/clone/work/__Volumes_proj' },
+    ];
+    expect(scratchViewPath(maps, '/Users/u/.codex/s.jsonl'))
+      .toBe('/data/sandboxes/s/clone/home/__Users_u/.codex/s.jsonl');
+    expect(scratchViewPath(maps, '/Volumes/proj/app/main.go'))
+      .toBe('/data/sandboxes/s/clone/work/__Volumes_proj/app/main.go');
+    // Uncovered system path is returned unchanged (read-only, not cloned).
+    expect(scratchViewPath(maps, '/etc/hostname')).toBe('/etc/hostname');
+  });
+
+  it('lets a deeper mapping win over a shallower one regardless of order', () => {
+    const maps: ScratchPathMapping[] = [
+      { from: '/Volumes/proj', to: '/clone/proj' },
+      { from: '/Users/u', to: '/clone/home' },
+    ];
+    expect(scratchViewPath([...maps].reverse(), '/Users/u/.zshrc')).toBe('/clone/home/.zshrc');
+  });
+
+  it('single-root helper matches the multi-mapping result', () => {
+    expect(scratchViewPathSingle(merged, '/root/x')).toBe(`${merged}/root/x`);
+    expect(scratchViewPathSingle(undefined, '/root/x')).toBe('/root/x');
+  });
+});
+
+describe('live view registry', () => {
+  it('tracks mappings per session and ignores empty input', () => {
+    const maps = scratchLinuxMappings('/m/root');
     expect(registeredScratchView('sid-reg')).toBeUndefined();
-    registerScratchView('sid-reg', '/m/root');
-    expect(registeredScratchView('sid-reg')).toBe('/m/root');
-    registerScratchView('sid-reg', undefined); // no-op on undefined
-    expect(registeredScratchView('sid-reg')).toBe('/m/root');
+    registerScratchView('sid-reg', maps);
+    expect(registeredScratchView('sid-reg')).toEqual(maps);
+    registerScratchView('sid-reg', undefined);
+    registerScratchView('sid-reg', []);
+    expect(registeredScratchView('sid-reg')).toEqual(maps);
     clearScratchView('sid-reg');
     expect(registeredScratchView('sid-reg')).toBeUndefined();
+  });
+});
+
+describe('persistedScratchMappings (cross-process meta)', () => {
+  it('reads the mappings array from scratch.json and rejects garbage entries', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'scratch-meta-'));
+    const sid = 'sid-meta';
+    const tree = join(dir, 'sandboxes', sid);
+    mkdirSync(tree, { recursive: true });
+    writeFileSync(join(tree, 'scratch.json'), JSON.stringify({
+      mappings: [
+        { from: '/Users/u', to: join(tree, 'clone', 'home') },
+        { from: 'relative/bad', to: '/x' },
+        { from: '/p', to: 'notabs' },
+        'junk',
+      ],
+    }));
+    expect(persistedScratchMappings(dir, sid)).toEqual([
+      { from: '/Users/u', to: join(tree, 'clone', 'home') },
+    ]);
+    expect(persistedScratchMappings(dir, 'nope')).toBeUndefined();
+    rmSync(dir, { recursive: true, force: true });
   });
 });

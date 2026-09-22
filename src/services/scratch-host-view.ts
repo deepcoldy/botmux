@@ -2,50 +2,116 @@
  * Scratch host-view registry: where the daemon/worker reads files a
  * scratch-sandboxed CLI wrote.
  *
- * A scratch container mounts the host-side merged overlay at `/`, so a file
- * the CLI sees at `/abs/path` physically lands at `<mergedHostPath>/abs/path`
- * on the host. The merged root is fully derivable
- * (`<dataDir>/sandboxes/<sessionId>/root`), and when the overlay is NOT mounted
- * that directory is simply EMPTY — reads remapped into it return ENOENT, which
- * is the correct "session not resumed" signal. Readers must therefore remap
- * for any frozen scratch session and NEVER fall back to the real host path
- * (that would surface stale data or another session's files).
+ * Two platform mechanisms, one mapping model:
+ *  - Linux full-root overlay: ONE mapping `'/' → <sessionRoot>/root`; the
+ *    container mounts the host-side merged tree at `/`, so `/x` maps to
+ *    `<merged>/x`.
+ *  - macOS APFS clonefile: the clone lives in normal host directories and the
+ *    child's HOME (and chdir) are POINTED at the clone, so mappings are
+ *    `$HOME → <clone>/home` and (when the project lies outside $HOME)
+ *    `<cwd> → <clone>/work`.
+ *
+ * When no mapping covers a path the ORIGINAL path is returned — callers that
+ * don't know the session's mode can call this unconditionally. Readers must
+ * NEVER fall back to a real host path for a path a mapping covered but
+ * currently absent (unmounted/deleted clone): that would surface stale data.
  */
 import { isAbsolute, join } from 'node:path';
+import { existsSync, readFileSync } from 'node:fs';
 
-/** sessionId → host-side merged root (worker process registry). */
-const liveViews = new Map<string, string>();
-
-/** Record the live merged root for a scratch session (worker spawn/reattach). */
-export function registerScratchView(sessionId: string, mergedHostPath: string | undefined): void {
-  if (!mergedHostPath) return;
-  liveViews.set(sessionId, mergedHostPath);
+export interface ScratchPathMapping {
+  /** Host-side real prefix (absolute, canonical). */
+  from: string;
+  /** Clone/merged-tree prefix holding the sandboxed copy. */
+  to: string;
 }
 
-/** Drop the registry entry at teardown. Does NOT unmount (cleanup does that). */
+/** sessionId → live mappings (worker process registry). */
+const liveViews = new Map<string, ScratchPathMapping[]>();
+
+/** Record the live mappings for a scratch session (worker spawn/reattach). */
+export function registerScratchView(sessionId: string, mappings: ScratchPathMapping[] | undefined): void {
+  if (!mappings || mappings.length === 0) return;
+  // Deepest `from` first so a nested project mapping wins over the HOME one.
+  liveViews.set(sessionId, [...mappings].sort((a, b) => b.from.length - a.from.length));
+}
+
+/** Drop the registry entry at teardown. */
 export function clearScratchView(sessionId: string): void {
   liveViews.delete(sessionId);
 }
 
-/** The registered live merged root in THIS process, if any. */
-export function registeredScratchView(sessionId: string): string | undefined {
+/** The registered live mappings in THIS process, if any. */
+export function registeredScratchView(sessionId: string): ScratchPathMapping[] | undefined {
   return liveViews.get(sessionId);
 }
 
-/** Deterministic merged root for a session given its data dir. */
+/** Deterministic Linux merged root for a session given its data dir. */
 export function scratchMergedRootFor(dataDir: string, sessionId: string): string {
   return join(dataDir, 'sandboxes', sessionId, 'root');
 }
 
-/**
- * Resolve a host absolute path through a scratch session's merged tree.
- * Returns the ORIGINAL path when mergedRoot is undefined, so callers that
- * don't know the session's mode can call this unconditionally.
- */
+/** Linux convenience: the single full-root mapping. */
+export function scratchLinuxMappings(mergedRoot: string): ScratchPathMapping[] {
+  return [{ from: '/', to: mergedRoot }];
+}
+
+function prefixMatch(realPrefix: string, p: string): boolean {
+  if (realPrefix === '/') return true;
+  if (p === realPrefix) return true;
+  return p.startsWith(realPrefix.endsWith('/') ? realPrefix : `${realPrefix}/`);
+}
+
+/** Resolve one host absolute path through the first mapping covering it.
+ *  Returns the input unchanged when uncovered/relative. */
 export function scratchViewPath(
-  mergedRoot: string | undefined,
+  mappings: ScratchPathMapping[] | undefined,
   hostAbsPath: string,
 ): string {
-  if (!mergedRoot || !isAbsolute(hostAbsPath)) return hostAbsPath;
-  return join(mergedRoot, hostAbsPath);
+  if (!mappings || !isAbsolute(hostAbsPath)) return hostAbsPath;
+  for (const m of mappings) {
+    if (prefixMatch(m.from, hostAbsPath)) {
+      const rest = m.from === '/' ? hostAbsPath : hostAbsPath.slice(m.from.length);
+      return join(m.to, rest);
+    }
+  }
+  return hostAbsPath;
+}
+
+/** Back-compat single-root helper (probe/early call sites). */
+export function scratchViewPathSingle(mergedRoot: string | undefined, hostAbsPath: string): string {
+  if (!mergedRoot) return hostAbsPath;
+  return scratchViewPath(scratchLinuxMappings(mergedRoot), hostAbsPath);
+}
+
+/**
+ * Load the persisted scratch mappings for a session from its per-session meta
+ * (works in BOTH processes: worker and daemon). Returns undefined for a
+ * non-scratch session or a missing/unreadable meta.
+ *
+ * The meta file lives at `<dataDir>/sandboxes/<sid>/scratch.json` (written by
+ * the macOS/backend module; the Linux module writes the same shape with one
+ * `'/'` mapping derived from `merged`).
+ */
+export function persistedScratchMappings(dataDir: string, sessionId: string): ScratchPathMapping[] | undefined {
+  const metaPath = join(dataDir, 'sandboxes', sessionId, 'scratch.json');
+  try {
+    const m = JSON.parse(readFileSync(metaPath, 'utf8')) as { mappings?: unknown };
+    if (Array.isArray(m.mappings)) {
+      const out = m.mappings
+        .filter((x): x is ScratchPathMapping => !!x && typeof x === 'object'
+          && typeof (x as ScratchPathMapping).from === 'string'
+          && typeof (x as ScratchPathMapping).to === 'string'
+          && isAbsolute((x as ScratchPathMapping).from)
+          && isAbsolute((x as ScratchPathMapping).to))
+        .sort((a, b) => b.from.length - a.from.length);
+      if (out.length) return out;
+    }
+  } catch { /* not a scratch session */ }
+  return undefined;
+}
+
+/** Whether a scratch session's clone/merged tree currently exists on disk. */
+export function scratchViewPresent(dataDir: string, sessionId: string): boolean {
+  return existsSync(join(dataDir, 'sandboxes', sessionId));
 }

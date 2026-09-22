@@ -9,7 +9,7 @@ import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId } from
 import { codexHome as configuredCodexHome } from './codex-paths.js';
 import { getSession } from './session-store.js';
 import { config } from '../config.js';
-import { scratchMergedRootFor, scratchViewPath } from './scratch-host-view.js';
+import { scratchViewPath, persistedScratchMappings, type ScratchPathMapping } from './scratch-host-view.js';
 import { cocoEventsPathForSession } from './coco-transcript.js';
 import { findCursorTranscriptByChatId } from './cursor-transcript.js';
 import { findTraexRolloutBySessionId, findTraexSessionIdByBotmuxSessionId } from './traex-transcript.js';
@@ -284,15 +284,19 @@ const foundWrap = (found: string | null | undefined, v: (p: string) => string): 
  *  overlay; the host-global roots (~/.claude, ~/.codex, …) only hold the
  *  lower (pre-session) files. Returns the merged root for a frozen scratch
  *  session, else undefined (real-host paths apply). */
-function sessionScratchViewRoot(q: TranscriptPathQuery): string | undefined {
-  // Fail OPEN to host paths when the session record can't be read (a mocked /
-  // unavailable store in tests, a transient read error): such a session can't
-  // be proven scratch. Real scratch sessions always have a live record.
+/**
+ * Loads the scratch path MAPPINGS for a frozen scratch session — one
+ * full-root entry on Linux (`/ → merged`), HOME (+project) clone entries on
+ * macOS. Returns undefined for a non-scratch / unreadable session (callers
+ * then use real-host paths — fail open). Never falls back to real paths for a
+ * covered-but-absent clone: the mapping still rewrites and reads get ENOENT.
+ */
+function sessionScratchMappings(q: TranscriptPathQuery): ScratchPathMapping[] | undefined {
   let session;
   try { session = getSession(q.sessionId); } catch { return undefined; }
   if (session?.sandbox !== 'scratch') return undefined;
   try {
-    return scratchMergedRootFor(config.session.dataDir, q.sessionId);
+    return persistedScratchMappings(config.session.dataDir, q.sessionId);
   } catch {
     return undefined;
   }
@@ -301,28 +305,28 @@ function sessionScratchViewRoot(q: TranscriptPathQuery): string | undefined {
 export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTranscriptPath | null {
   const sid = q.cliSessionId || q.sessionId;
   // Scratch: every host-derived root below is read through the per-session
-  // merged overlay. Never read the real lower transcript for a scratch
-  // session (it belongs to a different/pre-session state).
-  const svRoot = sessionScratchViewRoot(q);
-  const v = (hostPath: string): string => scratchViewPath(svRoot, hostPath);
+  // merged overlay (Linux) or clone tree (macOS). Never read the real lower
+  // transcript for a scratch session (it belongs to a different state).
+  const svMappings = sessionScratchMappings(q);
+  const v = (hostPath: string): string => scratchViewPath(svMappings, hostPath);
   switch (q.cliId) {
     case 'claude-code': {
       const homeRoot = v(join(homedir(), '.claude'));
-      const path = svRoot
+      const path = svMappings
         ? (q.cwd ? getClaudeSessionJsonlPath(sid, q.cwd, homeRoot) : null)
         : claudeJsonlWithBotHomeFallback(sid, q, join(homedir(), '.claude'));
       return path ? { path, kind: 'claude' } : null;
     }
     case 'aiden': {
       const homeRoot = v(join(homedir(), '.claude'));
-      const path = svRoot
+      const path = svMappings
         ? (q.cwd ? getClaudeSessionJsonlPath(sid, q.cwd, homeRoot) : null)
         : claudeJsonlWithBotHomeFallback(sid, q, join(homedir(), '.claude'));
       return path ? { path, kind: 'claude' } : null;
     }
     case 'seed':
     case 'relay': {
-      const path = svRoot
+      const path = svMappings
         ? (q.cwd ? getClaudeSessionJsonlPath(sid, q.cwd, v(claudeForkDataDir(q.cliId))) : null)
         : claudeJsonlWithBotHomeFallback(sid, q, claudeForkDataDir(q.cliId));
       return path ? { path, kind: 'claude' } : null;
@@ -339,10 +343,10 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       // absolute path is part of the cache key so changing it cannot reuse a
       // rollout discovered under a previous root.
       const globalCodexHome = resolve(configuredCodexHome());
-      const globalPath = codexRolloutInHome(q, svRoot ? v(globalCodexHome) : globalCodexHome, false);
+      const globalPath = codexRolloutInHome(q, svMappings ? v(globalCodexHome) : globalCodexHome, false);
       // Scratch uses the NATIVE codex home (no BOT_HOME redirect); scanning a
       // host-real BOT_HOME could only surface a stale rollout, so skip it.
-      const botHomeDir = svRoot ? null : botHomeCliDataDir(q.larkAppId, 'codex');
+      const botHomeDir = svMappings ? null : botHomeCliDataDir(q.larkAppId, 'codex');
       const resolvedBotHomeDir = botHomeDir ? resolve(botHomeDir) : null;
       const botHomeRollout = resolvedBotHomeDir
         ? codexRolloutInHome(q, resolvedBotHomeDir, true)

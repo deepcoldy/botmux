@@ -373,8 +373,12 @@ import {
   scratchHostView,
   type ScratchStorage,
 } from './adapters/backend/scratch-sandbox.js';
+import {
+  prepareMacScratchSandbox,
+  attachMacScratchSession,
+} from './adapters/backend/scratch-sandbox-darwin.js';
 import { resolveSandboxMode } from './adapters/cli/sandbox-mode.js';
-import { registerScratchView, clearScratchView, scratchViewPath, scratchMergedRootFor } from './services/scratch-host-view.js';
+import { registerScratchView, scratchViewPath, scratchLinuxMappings, type ScratchPathMapping } from './services/scratch-host-view.js';
 import {
   DEVICE_AUTHORITY_DIRECTORY,
   DEVICE_CREDENTIAL_FILE,
@@ -14175,8 +14179,8 @@ async function spawnCli(
   }
   const scratchRequested = sandboxMode === 'scratch';
   const sandboxRequested = sandboxMode !== 'off';
-  if (scratchRequested && process.platform !== 'linux') {
-    throw new Error('sandbox "scratch" is supported only on Linux (macOS has no filesystem COW primitive) — use "oncall" or turn the sandbox off');
+  if (scratchRequested && process.platform !== 'linux' && process.platform !== 'darwin') {
+    throw new Error('sandbox "scratch" is supported only on Linux (full-root COW overlay) and macOS (APFS clonefile); use "oncall" or turn the sandbox off');
   }
   if (scratchRequested && cfg.readIsolation === true) {
     throw new Error('sandbox "scratch" cannot be combined with the legacy readIsolation flag');
@@ -16391,8 +16395,19 @@ async function spawnCli(
   // The CLI sees the whole real fs; every write copy-ups into a throwaway
   // upper. No FsPolicy, no BOT_HOME redirect (native CLI data dirs), but the
   // same outbox relay / seccomp marker / credential masks. Host-side readers of
-  // CLI-written files must go through scratchHostView(mergedHostPath, …).
+  // CLI-written files must go through the scratch path mappings (Linux merged
+  // root, macOS clone trees).
   let scratchMergedHost: string | undefined;
+  let scratchMappings: import('./services/scratch-host-view.js').ScratchPathMapping[] | undefined;
+  /** The clone HOME the worker points its own transcript readers at (both
+   *  platforms; on Linux equals scratchMergedHost + real $HOME). */
+  let scratchHostHome: string | undefined;
+  /** In-sandbox cwd: on macOS the clone path (project key differs from host);
+   *  undefined on Linux where the in-container cwd path == the host path. */
+  let scratchChdirInSandbox: string | undefined;
+  /** NATIVE host codex/trae home for the prepare-time child env force. */
+  let scratchNativeCodexHome: string | undefined;
+  let scratchNativeTraeHome: string | undefined;
   if (scratchRequested) {
     const scratchDataDir = process.env.SESSION_DATA_DIR;
     if (!scratchDataDir) {
@@ -16434,24 +16449,81 @@ async function spawnCli(
         .map(p => scratchCanonical(p.replace(/^~(?=\/|$)/, scratchHome))),
     ])];
 
+    scratchNativeCodexHome = nativeCodexHome;
+    scratchNativeTraeHome = nativeTraeHome;
+
     if (willReattachPersistent) {
-      // Live pane across a daemon restart: the overlay + pane survive in the
-      // host namespaces; only re-wire the outbox watcher. Never remount here.
-      const att = attachScratchSession({ sessionId: cfg.sessionId, dataDir: scratchDataDir });
-      if (att) {
-        if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
-        sandboxCleanup = att.cleanup;
-        sandboxRelayOutbox = att.outbox;
-        scratchMergedHost = att.mergedHostPath;
-        sandboxStopWatcher = startOutboxWatcher(
-          att.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
-        );
-        publishSandboxRelayCapability();
-        log(`Scratch REATTACH (${cfg.cliId}): live pane kept, outbox=${att.outbox}`);
+      // Live pane across a daemon restart: the overlay/clone + pane survive;
+      // only re-wire the outbox watcher. Never remount/re-clone here.
+      if (process.platform === 'darwin') {
+        const att = attachMacScratchSession({ sessionId: cfg.sessionId, dataDir: scratchDataDir });
+        if (att) {
+          if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+          sandboxCleanup = att.cleanup;
+          sandboxRelayOutbox = att.outbox;
+          scratchMappings = att.mappings;
+          scratchHostHome = att.clonedHome;
+          scratchChdirInSandbox = att.chdirInSandbox;
+          sandboxStopWatcher = startOutboxWatcher(
+            att.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
+          );
+          publishSandboxRelayCapability();
+          log(`Scratch(mac) REATTACH (${cfg.cliId}): live pane kept, outbox=${att.outbox}`);
+        } else {
+          log(`Scratch(mac) REATTACH (${cfg.cliId}): no clone found — reattaching live pane as-is`);
+        }
       } else {
-        log(`Scratch REATTACH (${cfg.cliId}): no scratch tree found — reattaching live pane as-is`);
+        const att = attachScratchSession({ sessionId: cfg.sessionId, dataDir: scratchDataDir });
+        if (att) {
+          if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+          sandboxCleanup = att.cleanup;
+          sandboxRelayOutbox = att.outbox;
+          scratchMergedHost = att.mergedHostPath;
+          scratchMappings = scratchLinuxMappings(att.mergedHostPath);
+          scratchHostHome = scratchHostView(att.mergedHostPath, scratchHome);
+          sandboxStopWatcher = startOutboxWatcher(
+            att.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
+          );
+          publishSandboxRelayCapability();
+          log(`Scratch REATTACH (${cfg.cliId}): live pane kept, outbox=${att.outbox}`);
+        } else {
+          log(`Scratch REATTACH (${cfg.cliId}): no scratch tree found — reattaching live pane as-is`);
+        }
       }
+    } else if (process.platform === 'darwin') {
+      // ── macOS: APFS clonefile COW clone + Seatbelt ──
+      const sbx = prepareMacScratchSandbox({
+        sessionId: cfg.sessionId,
+        dataDir: scratchDataDir,
+        chdir: cfg.workingDir,
+        home: scratchHome,
+        cliBin: cliAdapter.resolvedBin,
+        cliArgs: args,
+        denyPaths: scratchDeny,
+        mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
+        net: cfg.sandboxNetwork !== false,
+      });
+      if (!sbx) {
+        throw new Error('scratch sandbox (macOS) could not be established (clonefile/Seatbelt setup failed; check same-volume and free space) — aborting, never bare-running');
+      }
+      spawnBin = sbx.bin;
+      spawnArgs = sbx.args;
+      Object.assign(childEnv, sbx.env);
+      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
+      sandboxCleanup = sbx.cleanup;
+      sandboxRelayOutbox = sbx.outbox;
+      scratchMappings = sbx.mappings;
+      scratchHostHome = sbx.clonedHome;
+      scratchChdirInSandbox = sbx.chdirInSandbox;
+      spawnCwd = sbx.chdirInSandbox;
+      sandboxStopWatcher = startOutboxWatcher(
+        sbx.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
+      );
+      publishSandboxRelayCapability();
+      log(`Sandbox ON (${cfg.cliId}, scratch APFS clone): home=${sbx.clonedHome} outbox=${sbx.outbox}`);
     } else {
+      // ── Linux: full-root COW overlay ──
       const storage: ScratchStorage = cfg.scratchStorage === 'disk' ? 'disk' : 'tmpfs';
       const sbx = prepareScratchSandbox({
         sessionId: cfg.sessionId,
@@ -16479,6 +16551,8 @@ async function spawnCli(
       sandboxCleanup = sbx.cleanup;
       sandboxRelayOutbox = sbx.outbox;
       scratchMergedHost = sbx.mergedHostPath;
+      scratchMappings = scratchLinuxMappings(sbx.mergedHostPath);
+      scratchHostHome = scratchHostView(sbx.mergedHostPath, scratchHome);
       sandboxStopWatcher = startOutboxWatcher(
         sbx.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
       );
@@ -16486,19 +16560,19 @@ async function spawnCli(
       log(`Sandbox ON (${cfg.cliId}, scratch full-root COW, ${storage}): merged=${sbx.mergedHostPath} outbox=${sbx.outbox}`);
     }
     // Host-side reads of CLI-written files (transcript bridge, rollouts, cwd
-    // products) resolve through the merged tree for the rest of this spawn.
-    registerScratchView(cfg.sessionId, scratchMergedHost);
-    if (scratchMergedHost) {
+    // products) resolve through the scratch mappings for this spawn.
+    registerScratchView(cfg.sessionId, scratchMappings);
+    if (scratchMappings && scratchHostHome) {
       // The worker is a PER-SESSION process, so repointing these env vars here
       // only affects THIS session's transcript finders (codex/traex honor them
-      // dynamically). The fresh sandboxed child got the NATIVE paths forced back
-      // via childEnvForce (see prepare call); a reattached live pane already
-      // carries its original (native) env and needs no override either.
-      const mergedHome = (hostPath: string): string => scratchHostView(scratchMergedHost!, hostPath);
-      process.env.CODEX_HOME = mergedHome(nativeCodexHome);
-      process.env.TRAE_HOME = mergedHome(nativeTraeHome ?? join(homedir(), '.trae'));
+      // dynamically). The sandboxed child got its OWN values: on Linux the
+      // native homes forced back via childEnvForce; on macOS the prepare module
+      // sets HOME (and we derive the cloned codex/trae homes below).
+      const hostView = (hostPath: string): string => scratchViewPath(scratchMappings, hostPath);
+      process.env.CODEX_HOME = hostView(scratchNativeCodexHome!);
+      process.env.TRAE_HOME = hostView(scratchNativeTraeHome ?? join(homedir(), '.trae'));
       // CLAUDE_CONFIG_DIR is deliberately NOT set: the claude bridge receives
-      // the remapped data dir explicitly at scratchClaudeDataDir below.
+      // the remapped data dir explicitly at the bridge site below.
     }
   }
 
@@ -17310,13 +17384,16 @@ async function spawnCli(
     const claudeBridgeSessionId = effectiveCliSessionId ?? effectiveAdapterSessionId;
     // Scratch: Claude writes into its NATIVE ~/.claude inside the COW view; the
     // host-side bridge tails the same subtree THROUGH the merged root.
-    const bridgeClaudeDataDir = scratchMergedHost
-      ? scratchHostView(scratchMergedHost, claudeDataDir)
+    const bridgeClaudeDataDir = scratchMappings
+      ? scratchViewPath(scratchMappings, claudeDataDir)
       : claudeDataDir;
-    const claudeJsonl = claudeJsonlPathForSession(claudeBridgeSessionId, cfg.workingDir, bridgeClaudeDataDir);
+    // On macOS the clone cwd is a different path and Claude keys its project
+    // dir by the realpath of ITS cwd; Linux keeps the identical path.
+    const bridgeCwd = scratchChdirInSandbox ?? cfg.workingDir;
+    const claudeJsonl = claudeJsonlPathForSession(claudeBridgeSessionId, bridgeCwd, bridgeClaudeDataDir);
     startBridgeWatcher(claudeJsonl, {
       cliPid: cliPid ?? undefined,
-      cliCwd: cfg.workingDir,
+      cliCwd: bridgeCwd,
       mode: effectiveResume ? 'baseline-existing' : 'fresh-empty',
       dataDir: bridgeClaudeDataDir,
     });

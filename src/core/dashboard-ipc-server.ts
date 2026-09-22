@@ -6207,7 +6207,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     scratchStorage: (() => { try { return getBot(cachedLarkAppId).config.scratchStorage ?? null; } catch { return null; } })(),
     scratchTmpfsSizeMb: (() => { try { return getBot(cachedLarkAppId).config.scratchTmpfsSizeMb ?? null; } catch { return null; } })(),
     scratchDenyPaths: (() => { try { return getBot(cachedLarkAppId).config.scratchDenyPaths ?? null; } catch { return null; } })(),
-    scratchSupported: process.platform === 'linux',
+    scratchSupported: process.platform === 'linux' || process.platform === 'darwin',
     codexAuthSync,
     sandboxPaths: sandboxStore.getBotSandboxPaths(cachedLarkAppId) ?? null,
     readIsolation: sandboxStore.getBotReadIsolation(cachedLarkAppId),
@@ -7896,11 +7896,11 @@ ipcRoute('PUT', '/api/bot-sandbox', async (req, res) => {
   } else {
     mode = body.enabled === true ? 'oncall' : 'off';
   }
-  if (mode === 'scratch' && process.platform !== 'linux') {
+  if (mode === 'scratch' && process.platform !== 'linux' && process.platform !== 'darwin') {
     return jsonRes(res, 400, {
       ok: false,
-      error: 'scratch_linux_only',
-      message: 'scratch 沙盒仅支持 Linux（macOS 内核无 COW 原语），请用 oncall 模式。',
+      error: 'scratch_platform_unsupported',
+      message: 'scratch 沙盒仅支持 Linux 与 macOS。',
     });
   }
   if (mode !== 'off') {

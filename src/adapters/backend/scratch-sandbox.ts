@@ -105,6 +105,9 @@ export interface ScratchMeta {
   slot?: string;
   /** Submounts wrapped with their own overlay (for restart-time teardown). */
   subs?: { mountpoint: string }[];
+  /** Host-path → merged-tree view mappings for daemon-side transcript reads.
+   *  Linux always has the single full-root mapping `'/' → merged`. */
+  mappings?: { from: string; to: string }[];
   createdAt: number;
   /** Optional tmpfs size cap (MB), tmpfs storage only. */
   tmpfsSizeMb?: number;
@@ -460,7 +463,7 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
   const meta: ScratchMeta = existing
     // Re-mount (disk cold resume): keep identity/createdAt but refresh the
     // submount set — the machine may have gained/lost mounts since.
-    ? { ...existing, subs: currentOverlaySubs }
+    ? { ...existing, subs: currentOverlaySubs, mappings: [{ from: '/', to: merged }] }
     : {
       v: 1,
       sid: opts.sessionId,
@@ -468,6 +471,7 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
       lower: '/',
       merged, upper, work, slot,
       subs: currentOverlaySubs,
+      mappings: [{ from: '/', to: merged }],
       createdAt: Date.now(),
       tmpfsSizeMb: storage === 'tmpfs' ? opts.tmpfsSizeMb : undefined,
     };

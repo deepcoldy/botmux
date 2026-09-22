@@ -6,7 +6,7 @@ BotMux 有**两种正交的文件沙盒**，一个开关三档：
 |---|---|---|---|---|
 | `off` | — | 全部 | 直达宿主 | 全 |
 | `oncall`（缺省沙盒） | **保密**：分享给半受信任的人 | deny-by-default 白名单 | 白名单内直达宿主、即时落盘 | Linux + macOS |
-| `scratch`（2026-09 新增） | **完整可弃**：owner 自己的一次性草稿环境 | 整个真实文件系统 | 全部进 COW upper，**宿主永不变**，会话结束即弃 | **仅 Linux** |
+| `scratch`（2026-09 新增） | **完整可弃**：owner 自己的一次性草稿环境 | 整个真实文件系统 | Linux：全部进 COW upper 宿主永不变；mac：$HOME/项目写进 APFS 克隆副本，系统路径只读 | Linux + macOS |
 
 > scratch **不防恶意载荷**（agent 仍能读到磁盘上的密钥并经网络外发）；它防的是「写污染」——破坏性/试验性操作不影响真实机器。需要保密时用 oncall。
 
@@ -30,6 +30,17 @@ scratch 专属字段（均可选）：
 - `scratchStorage`：`tmpfs`（默认，upper 在内存，关盒/重启即焚）或 `disk`（upper 落盘，daemon 重启可冷恢复续跑，会话结束时删除）。
 - `scratchTmpfsSizeMb`：tmpfs 容量上限（0=内核默认 ≈ 半内存）；大构建可调大或用 disk。
 - `scratchDenyPaths`：在「读全盘」之上额外遮罩的路径（mode-000 空源，同 oncall deny 编译）。botmux 自身传输凭证（bots.json 及 sidecar、dashboard secret、每会话沙盒树）**固定遮罩不可配开**；`~/.ssh`/`~/.aws` 不遮（git ssh/云 CLI 要用），需要时自行加。
+
+### macOS 实现（APFS clonefile，与 Linux 的语义差异）
+
+macOS 没有 per-process 挂载命名空间、Seatbelt 也没有「写重定向」原语，所以 scratch 在 mac 上是另一套机制，目标体验一致：
+
+- 会话开始用 `cp -cR`（APFS clonefile）**克隆 \$HOME**；项目在 \$HOME 外时再克隆项目目录。clonefile 是写时复制：**克隆瞬间零数据块占用**（无论 HOME 多大），会话期间只有被 CLI 实际修改的块（4KB 粒度）占空间，结束删副本全部归还。
+- 子进程 `HOME` 指向克隆副本，`TMPDIR` 指向每会话私有临时目录；Seatbelt profile 先全局 `(deny file-write*)`，再只放行克隆树 / 私有 TMPDIR / 真实 outbox。读取全程放开（保留原生 \~/.claude、\~/.codex 登录态、工具链零配置）。
+- **与 Linux 的唯一语义差**：系统位置（`/etc`、`/opt/homebrew` 等）的写**直接被拒绝（EPERM）而不是进副本**——mac 无法对系统路径做 per-process COW。HOME/dotfile 改造、项目内任意写、npm/pip 装到用户目录、临时文件都正常且即焚；系统级 brew install 做不了。
+- 跨卷不克隆：源（HOME/项目）必须与 botmux data 目录在**同一 APFS 卷**，否则 fail-closed 报错（绝不静默退化成整份字节拷贝）；克隆后用 statfs 空闲块差值校验确实走了 clonefile（`cp -cR` 对特殊文件会静默回退字节拷贝，>128MB 漂移判失败）。
+- 没有 tmpfs/disk 之分（APFS COW 本身即「只占改动量」，由文件系统/swap 管理）；`scratchStorage` 在 mac 上接受但忽略。
+- 真机验收脚本（在 Mac 上跑）：`node scripts/scratch-sandbox-darwin-probe.mjs`（克隆零占盘、副本写宿主零泄漏、系统写被拒、outbox 穿透、清理）。
 
 ## scratch 工作原理（已在 live 机实测）
 
