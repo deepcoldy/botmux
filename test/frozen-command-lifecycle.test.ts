@@ -18,16 +18,18 @@ const roots: string[] = [];
 const BOT = 'cli_lifecycle_test';
 const ACTOR = { openId: 'ou_user', unionId: 'on_user' };
 const ACTIVE = `
-schemaVersion: 1
+schemaVersion: 2
 name: 生命周期测试
 description: 生命周期测试命令
+executor: builtin.data-mcp.readonly
 params:
   - name: value
     type: integer
     min: 1
     max: 90
     default: 7
-sql: SELECT {{value}} AS probe_value
+input:
+  sql: SELECT {{value}} AS probe_value
 output:
   prefix: "result: "
   maxChars: 20000
@@ -443,7 +445,7 @@ describe('Frozen Command lifecycle ledger', () => {
 
   it('fails closed for explicit active definitions until their exact spec hash is approved', () => {
     const input = setup();
-    writeFileSync(input.file, ACTIVE.replace('schemaVersion: 1', 'schemaVersion: 1\nstatus: active'));
+    writeFileSync(input.file, ACTIVE.replace('schemaVersion: 2', 'schemaVersion: 2\nstatus: active'));
     expect(evaluateFrozenCommandLifecycle({
       dataDir: input.dataDir,
       targetBotId: BOT,
@@ -594,6 +596,8 @@ describe('Frozen Command lifecycle ledger', () => {
     });
 
     expect(restored.state).toBe('active');
+    expect(restored.executorRevision).toBe(pending.executorRevision);
+    expect(restored.executorRevision).toMatch(/^[a-f0-9]{64}$/);
     expect(readFileSync(input.file, 'utf8')).toBe(ACTIVE);
     const lookup = lookupFrozenCommand({ workingDir: input.root, command: '/生命周期测试' });
     expect(lookup.kind).toBe('found');

@@ -187,33 +187,33 @@ botmux session rename "排障｜支付链路超时"
 
 const FROZEN_COMMAND_SKILL = `---
 name: botmux-freeze
-description: 把已经跑通并由用户确认正确的数据查询固化成当前角色目录下的斜杠命令，也负责修改和废弃。用户说“把刚才这个固化成 /xxx”“安装固定查询”“freeze command”、要求修改/覆盖或废弃已有命令时触发。必须从本话题实际成功的工具调用录制，不得重新猜 SQL；确认卡不展示 SQL。
+description: 把已经跑通并由用户确认正确的查询或白名单执行器调用固化成当前角色目录下的斜杠命令，也负责修改和废弃。用户说“把刚才这个固化成 /xxx”“安装固定查询”“freeze command”、要求修改/覆盖或废弃已有命令时触发。数据查询必须从本话题实际成功的工具调用录制，不得重新猜 SQL；确认卡不展示 SQL。
 ---
 
-# botmux-freeze — 固化已跑通的数据查询
+# botmux-freeze — 固化已跑通的查询或白名单能力
 
-仅用于已经在本话题里通过 Data MCP 成功执行、且用户确认结果正确的查询。不要把探索性问题、失败查询或需要临场判断的任务固化。
+用于已经在本话题里通过 Data MCP 成功执行、且用户确认结果正确的查询，或管理员已经登记到执行器白名单中的稳定只读能力。不要把探索性问题、失败调用或需要临场判断的任务固化。
 
 ## 不变量
 
-1. 只从本话题最近一次与用户所指业务问题对应的**实际成功工具调用**提取 SQL、datasource 和样例结果；不得让模型重新生成一段 SQL 代替录制。
+1. Data MCP 查询只从本话题最近一次与用户所指业务问题对应的**实际成功工具调用**提取 SQL、datasource 和样例结果；不得让模型重新生成一段 SQL 代替录制。通用能力只能引用管理员白名单中真实存在的 executor id，不能生成或修改执行器白名单。
 2. 用户永远不需要看到 SQL。确认卡、回复、错误信息都只展示业务说明、用法、样例结果和作用域。
 3. SQL 中会变化的业务输入必须参数化；例如“最近 7 天”应录为整数参数 \`days\`，默认 7，并设置合理 min/max。参数只能替换值，不能让用户提供 SQL 片段、表名、列名或任意字符串。
 4. 草稿只写到当前工作目录的 \`.botmux/frozen-command-drafts/<命令名>.yaml\`；**不要直接写** \`.botmux/commands/\`。命令属于当前角色/目录，不跨目录查找。
 5. 创建或修改只调用一次 \`botmux freeze apply\`，由宿主展示专用确认卡。用户只需点一次“确认创建/确认更新”；不要再让用户手工发送 \`/freeze approve\` 或 \`/freeze confirm\`，也不要叠加 \`botmux ask buttons\` 做第二次确认。
 6. 用户取消或确认过期时，宿主不会改动当前生效版本。修改场景下旧版本必须一直可用到确认成功。
 7. 覆盖同名命令时，专用确认卡必须明确展示“更新”以及旧/新定义 hash 摘要。
-8. 身份字段不得写入 SQL 模板；调用者身份由 BotMux Gateway metadata 注入。
+8. 身份字段不得写入 SQL 模板；Data MCP 调用者身份由 BotMux Gateway metadata 注入。通用执行器只允许使用其白名单声明接受的系统上下文来源。
 
 ## YAML 格式
 
 \`\`\`yaml
-schemaVersion: 1
+schemaVersion: 2
 status: active
 name: 泰国上账
 description: 查询泰国最近 N 天的上账金额（USD）
 timezone: Asia/Bangkok
-datasource: optional-datasource
+executor: builtin.data-mcp.readonly
 params:
   - name: days
     label: 天数
@@ -221,8 +221,10 @@ params:
     min: 1
     max: 90
     default: 7
-sql: |-
-  SELECT ... WHERE dt >= today() - {{days}} LIMIT 100
+input:
+  datasource: optional-datasource
+  sql: |-
+    SELECT ... WHERE dt >= today() - {{days}} LIMIT 100
 output:
   prefix: "近 N 天泰国上账：\\n"
   maxChars: 20000
@@ -231,6 +233,7 @@ onError: fallback_llm
 
 支持的参数类型：
 
+- \`string\`：通用执行器可用，必须有 maxLength，可选 pattern；只有执行器白名单明确接受 \`param\` 来源时才能传入。
 - \`integer\`：必须有 min/max，可有 default；渲染为数字字面量。
 - \`enum\`：必须列出 values，可有 default；字符串由执行器做 SQL 字面量编码。
 - \`date\`：值为 \`YYYY-MM-DD\` 或定义期默认 \`today±N\`；渲染为 SQL 日期字符串。
@@ -239,7 +242,7 @@ onError: fallback_llm
 
 ## 安装步骤
 
-1. 从结构化工具记录提取最近一次成功的 validate/run SQL 原文、datasource 和样例结果。
+1. Data MCP 场景从结构化工具记录提取最近一次成功的 validate/run SQL 原文、datasource 和样例结果；其它场景先确认目标 executor 已由管理员登记，且本次 input 只使用其允许的字段和来源。
 2. 将常量中真正需要用户每次调整的值替换为 \`{{param}}\`；固定业务口径（例如国家=泰国）保持常量。
 3. 明确参数类型、顺序、默认值和上下界；确保 SQL 显式有 LIMIT/分区范围。
 4. 检查当前目录是否已有同名已生效命令，用于区分创建和更新；不要覆盖它。

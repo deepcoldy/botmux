@@ -42,9 +42,10 @@ afterEach(() => {
 });
 
 const BASE = `
-schemaVersion: 1
+schemaVersion: 2
 name: 泰国上账
 description: 查询泰国最近 N 天的上账金额
+executor: builtin.data-mcp.readonly
 timezone: Asia/Bangkok
 params:
   - name: days
@@ -53,10 +54,11 @@ params:
     min: 1
     max: 90
     default: 7
-sql: |-
-  SELECT sum(amount) FROM bills
-  WHERE country = 'TH' AND dt >= today() - {{days}}
-  LIMIT 100
+input:
+  sql: |-
+    SELECT sum(amount) FROM bills
+    WHERE country = 'TH' AND dt >= today() - {{days}}
+    LIMIT 100
 output:
   prefix: "查询结果：\\n"
   maxChars: 20000
@@ -68,6 +70,22 @@ describe('Frozen Commands definition and positional UX', () => {
     expect(normalizeFrozenCommandName('/泰国上账')).toBe('泰国上账');
     expect(normalizeFrozenCommandName('/ＴＥＳＴ')).toBe('test');
     expect(normalizeFrozenCommandName('../泰国上账')).toBeUndefined();
+  });
+
+  it('rejects legacy schemaVersion 1 command definitions', () => {
+    const root = join(tmpdir(), `botmux-frozen-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    dirs.push(root);
+    mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
+    writeFileSync(
+      join(root, '.botmux', 'commands', '泰国上账.yaml'),
+      BASE.replace('schemaVersion: 2', 'schemaVersion: 1'),
+    );
+    const result = lookupFrozenCommand({ workingDir: root, command: '/泰国上账' });
+    expect(result.kind).toBe('invalid');
+    if (result.kind === 'invalid') {
+      expect(result.error.code).toBe('definition_version_unsupported');
+      expect(result.error.message).toContain('仅支持 schemaVersion=2');
+    }
   });
 
   it('renders the documented positional parameter and default', () => {
@@ -271,7 +289,7 @@ describe('Frozen Commands definition and positional UX', () => {
       definition,
       rawArgs: '30',
       targetLarkAppId: 'cli_test',
-      botConfig: { plugins: ['data-mcp'] },
+      botConfig: { plugins: ['data-mcp'], larkAppId: 'cli_test', larkAppSecret: 'test-secret' },
       trustedCaller: {
         requestUserOpenId: 'ou_test',
         requestUserUnionId: 'on_test',
@@ -294,7 +312,7 @@ describe('Frozen Commands definition and positional UX', () => {
       definition,
       rawArgs: '',
       targetLarkAppId: 'cli_test',
-      botConfig: { plugins: ['data-mcp'] },
+      botConfig: { plugins: ['data-mcp'], larkAppId: 'cli_test', larkAppSecret: 'test-secret' },
       trustedCaller: undefined,
       turnId: 'schedule:ownerless',
       dataDir: join(root, 'data'),
@@ -329,7 +347,7 @@ describe('Frozen Commands definition and positional UX', () => {
       definition,
       rawArgs: '',
       targetLarkAppId: 'cli_test',
-      botConfig: { plugins: ['data-mcp'] },
+      botConfig: { plugins: ['data-mcp'], larkAppId: 'cli_test', larkAppSecret: 'test-secret' },
       trustedCaller: {
         requestUserOpenId: 'ou_test',
         requestUserUnionId: 'on_test',

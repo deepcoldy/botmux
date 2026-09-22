@@ -84,11 +84,13 @@ describe('resolvePinnedWorkingDir', () => {
     const workingDir = tempDir('frozen-lifecycle-route');
     mkdirSync(join(workingDir, '.botmux', 'commands'), { recursive: true });
     writeFileSync(join(workingDir, '.botmux', 'commands', '生命周期测试.yaml'), `
-schemaVersion: 1
+schemaVersion: 2
 name: 生命周期测试
 description: route lifecycle test
+executor: builtin.data-mcp.readonly
 params: []
-sql: SELECT 1
+input:
+  sql: SELECT 1
 onError: fallback_llm
 `);
     botRegistry.registerBot({
@@ -140,11 +142,13 @@ onError: fallback_llm
     mkdirSync(join(workingDir, '.botmux', 'commands'), { recursive: true });
     const definitionPath = join(workingDir, '.botmux', 'commands', '权限测试.yaml');
     writeFileSync(definitionPath, `
-schemaVersion: 1
+schemaVersion: 2
 name: 权限测试
 description: lifecycle authorization test
+executor: builtin.data-mcp.readonly
 params: []
-sql: SELECT 1
+input:
+  sql: SELECT 1
 onError: fail
 `);
     const bot = botRegistry.registerBot({

@@ -13,6 +13,8 @@ import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import {
   FrozenCommandError,
+  frozenCommandExecutorBinaryDigest,
+  frozenCommandExecutorRevision,
   frozenCommandFilePath,
   loadFrozenCommandSnapshot,
   normalizeFrozenCommandName,
@@ -20,6 +22,7 @@ import {
   type FrozenCommandSnapshot,
 } from './frozen-command.js';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from './sqlite-compat.js';
+import { logger } from '../utils/logger.js';
 
 export type FrozenCommandLifecycleState = 'active' | 'retired' | 'revoked';
 export type FrozenCommandLifecycleAction = 'approve' | 'retire' | 'restore' | 'revoke';
@@ -46,6 +49,8 @@ export interface FrozenCommandLifecycleRecord {
   /** Tenant-stable identity of the human who first confirmed creation. */
   ownerUnionId?: string;
   specHash?: string;
+  executorRevision?: string;
+  executorBinaryDigest?: string;
   stateRevisionId: string;
   tombstonePayload?: FrozenCommandTombstonePayload;
   tombstoneHash?: string;
@@ -69,6 +74,7 @@ export interface FrozenCommandPreparedTransition {
   reason: string;
   replacement?: string;
   specHash?: string;
+  executorRevision?: string;
   previousSpecHash?: string;
   expectedRevisionId?: string;
 }
@@ -77,6 +83,7 @@ const DB_DIR = 'frozen-commands';
 const DB_NAME = 'approvals.sqlite';
 const CONFIRM_TTL_MS = 10 * 60_000;
 const HASH_RE = /^[a-f0-9]{64}$/;
+const warnedBinaryDrifts = new Set<string>();
 
 export interface FrozenCommandReconcileResult {
   inspected: number;
@@ -92,6 +99,8 @@ CREATE TABLE IF NOT EXISTS command_lifecycle (
   state TEXT NOT NULL CHECK(state IN ('active','retired','revoked')),
   owner_union_id TEXT,
   spec_hash TEXT,
+  executor_revision TEXT,
+  executor_binary_digest TEXT,
   state_revision_id TEXT NOT NULL,
   tombstone_payload_json TEXT,
   tombstone_hash TEXT,
@@ -113,6 +122,7 @@ CREATE TABLE IF NOT EXISTS pending_transitions (
   reason TEXT NOT NULL,
   replacement TEXT,
   expected_spec_hash TEXT,
+  expected_executor_revision TEXT,
   expected_revision_id TEXT,
   candidate_yaml TEXT,
   expires_at TEXT NOT NULL,
@@ -133,6 +143,8 @@ CREATE TABLE IF NOT EXISTS command_audit (
   reason TEXT NOT NULL,
   replacement TEXT,
   spec_hash TEXT,
+  executor_revision TEXT,
+  executor_binary_digest TEXT,
   tombstone_hash TEXT,
   at TEXT NOT NULL
 );
@@ -154,9 +166,14 @@ function ensureSchemaColumns(db: DatabaseSyncLike): void {
   }
   addColumn('pending_transitions', 'candidate_yaml', 'TEXT');
   addColumn('command_lifecycle', 'owner_union_id', 'TEXT');
+  addColumn('command_lifecycle', 'executor_revision', 'TEXT');
+  addColumn('command_lifecycle', 'executor_binary_digest', 'TEXT');
   addColumn('pending_transitions', 'owner_union_id', 'TEXT');
   addColumn('pending_transitions', 'requires_admin', 'INTEGER NOT NULL DEFAULT 0');
+  addColumn('pending_transitions', 'expected_executor_revision', 'TEXT');
   addColumn('command_audit', 'owner_union_id', 'TEXT');
+  addColumn('command_audit', 'executor_revision', 'TEXT');
+  addColumn('command_audit', 'executor_binary_digest', 'TEXT');
 
   // The audit actor on the first successful approval is the best available
   // creator identity for ledgers written before per-command ownership existed.
@@ -295,6 +312,8 @@ interface LifecycleRow {
   state: FrozenCommandLifecycleState;
   owner_union_id: string | null;
   spec_hash: string | null;
+  executor_revision: string | null;
+  executor_binary_digest: string | null;
   state_revision_id: string;
   tombstone_payload_json: string | null;
   tombstone_hash: string | null;
@@ -315,6 +334,8 @@ function parseRecord(row: LifecycleRow): FrozenCommandLifecycleRecord {
     state: row.state,
     ...(row.owner_union_id ? { ownerUnionId: row.owner_union_id } : {}),
     ...(row.spec_hash ? { specHash: row.spec_hash } : {}),
+    ...(row.executor_revision ? { executorRevision: row.executor_revision } : {}),
+    ...(row.executor_binary_digest ? { executorBinaryDigest: row.executor_binary_digest } : {}),
     stateRevisionId: row.state_revision_id,
     ...(tombstonePayload ? { tombstonePayload } : {}),
     ...(row.tombstone_hash ? { tombstoneHash: row.tombstone_hash } : {}),
@@ -464,6 +485,25 @@ export function evaluateFrozenCommandLifecycle(input: {
     if (!record.specHash || record.specHash !== actual) {
       return { kind: 'fail_closed', reason: '命令定义与已批准版本不一致', record };
     }
+    const currentExecutorRevision = frozenCommandExecutorRevision(snapshot.definition);
+    if (!record.executorRevision || record.executorRevision !== currentExecutorRevision) {
+      return { kind: 'fail_closed', reason: '执行器配置或脚本与已批准版本不一致，必须重新确认', record };
+    }
+    const currentBinaryDigest = frozenCommandExecutorBinaryDigest(snapshot.definition);
+    if (record.executorBinaryDigest && currentBinaryDigest
+      && record.executorBinaryDigest !== currentBinaryDigest) {
+      const warningKey = `${record.targetBotId}:${record.commandPath}:${record.command}:${currentBinaryDigest}`;
+      if (!warnedBinaryDrifts.has(warningKey)) {
+        warnedBinaryDrifts.add(warningKey);
+        logger.warn('[frozen-command] third-party executor binary drift detected; execution remains allowed by scheme B', {
+          target_bot_id: record.targetBotId,
+          command: record.command,
+          executor_id: snapshot.definition.executor,
+          approved_binary_digest: record.executorBinaryDigest,
+          current_binary_digest: currentBinaryDigest,
+        });
+      }
+    }
     return { kind: 'active', record };
   } catch (error) {
     return {
@@ -515,6 +555,7 @@ export function prepareFrozenCommandTransition(input: {
   const token = randomBytes(18).toString('base64url');
   const expiresAt = new Date(now.getTime() + CONFIRM_TTL_MS).toISOString();
   let preparedSpecHash: string | undefined;
+  let preparedExecutorRevision: string | undefined;
   let previousSpecHash: string | undefined;
   let expectedRevisionId: string | undefined;
   withDb(input.dataDir, db => transaction(db, () => {
@@ -549,6 +590,7 @@ export function prepareFrozenCommandTransition(input: {
           });
       if (!snapshot) throw new FrozenCommandError('definition_missing', `未找到 /${key.command}`);
       expectedSpecHash = frozenCommandSpecHash(snapshot);
+      preparedExecutorRevision = frozenCommandExecutorRevision(snapshot.definition);
       preparedSpecHash = expectedSpecHash;
       if (current?.state === 'retired' || current?.state === 'revoked') {
         throw new FrozenCommandError('transition_invalid_state', `/${key.command} 当前为 ${current.state}，必须走 restore 而不是 approve`);
@@ -557,6 +599,7 @@ export function prepareFrozenCommandTransition(input: {
       const snapshot = loadFrozenCommandSnapshot({ workingDir: input.workingDir, command: key.command });
       if (!snapshot) throw new FrozenCommandError('definition_missing', `未找到 /${key.command}`);
       expectedSpecHash = frozenCommandSpecHash(snapshot);
+      preparedExecutorRevision = frozenCommandExecutorRevision(snapshot.definition);
       if (current?.state === 'active') {
         if (!current.specHash || !current.sourceYaml) {
           throw new FrozenCommandError('lifecycle_store_corrupt', '已批准命令缺少原始定义或 hash');
@@ -573,8 +616,17 @@ export function prepareFrozenCommandTransition(input: {
       if (current?.state === 'retired' || current?.state === 'revoked') {
         throw new FrozenCommandError('transition_invalid_state', `/${key.command} 当前为 ${current.state}，不能废弃`);
       }
-    } else if (input.action === 'restore' && current?.state !== 'retired') {
-      throw new FrozenCommandError('transition_invalid_state', `/${key.command} 不是 retired 状态`);
+    } else if (input.action === 'restore') {
+      if (current?.state !== 'retired' || !current.sourceYaml || !current.specHash) {
+        throw new FrozenCommandError('transition_invalid_state', `/${key.command} 不是 retired 状态或恢复资料不完整`);
+      }
+      const snapshot = parseFrozenCommandCandidate({
+        workingDir: input.workingDir,
+        command: key.command,
+        raw: current.sourceYaml,
+      });
+      preparedSpecHash = current.specHash;
+      preparedExecutorRevision = frozenCommandExecutorRevision(snapshot.definition);
     } else if (input.action === 'revoke' && current?.state !== 'retired') {
       throw new FrozenCommandError('transition_invalid_state', `/${key.command} 必须先 retired 才能彻底撤销`);
     }
@@ -582,12 +634,13 @@ export function prepareFrozenCommandTransition(input: {
     db.prepare(`INSERT INTO pending_transitions (
       token_hash,target_bot_id,command_path,command,action,actor_id,actor_open_id,actor_union_id,
       owner_union_id,requires_admin,reason,replacement,expected_spec_hash,expected_revision_id,
-      candidate_yaml,expires_at,created_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      expected_executor_revision,candidate_yaml,expires_at,created_at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       sha256(token), input.targetBotId, key.commandPath, key.command, input.action, id,
       input.actor.openId ?? null, ownerActor, ownerUnionId, requiresAdmin ? 1 : 0,
       reason, replacement ?? null,
-      expectedSpecHash ?? null, current?.stateRevisionId ?? null, input.candidateYaml ?? null,
+      expectedSpecHash ?? null, current?.stateRevisionId ?? null, preparedExecutorRevision ?? current?.executorRevision ?? null,
+      input.candidateYaml ?? null,
       expiresAt, now.toISOString(),
     );
   }));
@@ -599,6 +652,7 @@ export function prepareFrozenCommandTransition(input: {
     reason,
     ...(replacement ? { replacement } : {}),
     ...(preparedSpecHash ? { specHash: preparedSpecHash } : {}),
+    ...(preparedExecutorRevision ? { executorRevision: preparedExecutorRevision } : {}),
     ...(previousSpecHash ? { previousSpecHash } : {}),
     ...(expectedRevisionId ? { expectedRevisionId } : {}),
   };
@@ -618,6 +672,7 @@ interface PendingRow {
   reason: string;
   replacement: string | null;
   expected_spec_hash: string | null;
+  expected_executor_revision: string | null;
   expected_revision_id: string | null;
   candidate_yaml: string | null;
   expires_at: string;
@@ -673,6 +728,8 @@ export function confirmFrozenCommandTransition(input: {
     const revisionId = randomUUID();
     let nextState: FrozenCommandLifecycleState;
     let specHash = current?.specHash;
+    let executorRevision = current?.executorRevision;
+    let executorBinaryDigest = current?.executorBinaryDigest;
     let sourceYaml = current?.sourceYaml;
     let tombstonePayload: FrozenCommandTombstonePayload | undefined;
     let tombstoneHash: string | undefined;
@@ -694,6 +751,11 @@ export function confirmFrozenCommandTransition(input: {
       if (specHash !== pending.expected_spec_hash) {
         throw new FrozenCommandError('transition_stale', '命令定义在确认前已变化，请重新发起批准');
       }
+      executorRevision = frozenCommandExecutorRevision(snapshot.definition);
+      if (executorRevision !== pending.expected_executor_revision) {
+        throw new FrozenCommandError('transition_stale', '执行器配置或脚本在确认前已变化，请重新发起批准');
+      }
+      executorBinaryDigest = frozenCommandExecutorBinaryDigest(snapshot.definition);
       nextState = 'active';
       tombstonePayload = undefined;
       tombstoneHash = undefined;
@@ -711,8 +773,13 @@ export function confirmFrozenCommandTransition(input: {
       const diskYaml = readFileSync(pending.command_path, 'utf8');
       if (!snapshot) throw new FrozenCommandError('definition_missing', '待废弃命令已不存在');
       const diskSpecHash = frozenCommandSpecHash(snapshot);
+      const diskExecutorRevision = frozenCommandExecutorRevision(snapshot.definition);
+      const diskExecutorBinaryDigest = frozenCommandExecutorBinaryDigest(snapshot.definition);
       if (diskSpecHash !== pending.expected_spec_hash) {
         throw new FrozenCommandError('transition_stale', '命令定义在确认前已变化，请重新发起废弃');
+      }
+      if (diskExecutorRevision !== pending.expected_executor_revision) {
+        throw new FrozenCommandError('transition_stale', '执行器配置或脚本在确认前已变化，请重新发起废弃');
       }
       if (current?.state === 'active') {
         if (!current.specHash || !current.sourceYaml || diskSpecHash !== current.specHash) {
@@ -726,9 +793,13 @@ export function confirmFrozenCommandTransition(input: {
         // not silently become the source restored by a later transition.
         sourceYaml = current.sourceYaml;
         specHash = current.specHash;
+        executorRevision = current.executorRevision;
+        executorBinaryDigest = current.executorBinaryDigest;
       } else {
         sourceYaml = diskYaml;
         specHash = diskSpecHash;
+        executorRevision = diskExecutorRevision;
+        executorBinaryDigest = diskExecutorBinaryDigest;
       }
       tombstonePayload = {
         status: 'retired',
@@ -744,6 +815,16 @@ export function confirmFrozenCommandTransition(input: {
       if (current?.state !== 'retired' || !current.sourceYaml || !current.specHash) {
         throw new FrozenCommandError('transition_invalid_state', '只有完整的 retired 记录可以恢复');
       }
+      const snapshot = parseFrozenCommandCandidate({
+        workingDir: dirname(dirname(dirname(pending.command_path))),
+        command: pending.command,
+        raw: current.sourceYaml,
+      });
+      executorRevision = frozenCommandExecutorRevision(snapshot.definition);
+      if (executorRevision !== pending.expected_executor_revision) {
+        throw new FrozenCommandError('transition_stale', '执行器配置或脚本在确认前已变化，请重新发起恢复');
+      }
+      executorBinaryDigest = frozenCommandExecutorBinaryDigest(snapshot.definition);
       nextState = 'active';
       tombstonePayload = undefined;
       tombstoneHash = undefined;
@@ -757,29 +838,32 @@ export function confirmFrozenCommandTransition(input: {
       sourceYaml = undefined;
     }
     if (!specHash || !HASH_RE.test(specHash)) throw new FrozenCommandError('lifecycle_hash_invalid', '命令定义 hash 缺失');
+    if (!executorRevision || !HASH_RE.test(executorRevision)) throw new FrozenCommandError('lifecycle_hash_invalid', '执行器 revision 缺失');
     db.prepare(`INSERT INTO command_lifecycle (
-      target_bot_id,command_path,command,state,owner_union_id,spec_hash,state_revision_id,
+      target_bot_id,command_path,command,state,owner_union_id,spec_hash,executor_revision,executor_binary_digest,state_revision_id,
       tombstone_payload_json,tombstone_hash,source_yaml,updated_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(target_bot_id,command_path,command) DO UPDATE SET
       state=excluded.state,owner_union_id=excluded.owner_union_id,
-      spec_hash=excluded.spec_hash,state_revision_id=excluded.state_revision_id,
+      spec_hash=excluded.spec_hash,executor_revision=excluded.executor_revision,
+      executor_binary_digest=excluded.executor_binary_digest,state_revision_id=excluded.state_revision_id,
       tombstone_payload_json=excluded.tombstone_payload_json,tombstone_hash=excluded.tombstone_hash,
       source_yaml=excluded.source_yaml,updated_at=excluded.updated_at`).run(
       pending.target_bot_id, pending.command_path, pending.command, nextState,
-      pending.owner_union_id, specHash, revisionId,
+      pending.owner_union_id, specHash, executorRevision, executorBinaryDigest ?? null, revisionId,
       tombstonePayload ? JSON.stringify(tombstonePayload) : null, tombstoneHash ?? null,
       sourceYaml ?? null, now.toISOString(),
     );
     db.prepare(`INSERT INTO command_audit (
       revision_id,target_bot_id,command_path,command,action,prior_state,next_state,
       parent_revision_id,actor_open_id,actor_union_id,owner_union_id,
-      reason,replacement,spec_hash,tombstone_hash,at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      reason,replacement,spec_hash,executor_revision,executor_binary_digest,tombstone_hash,at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       revisionId, pending.target_bot_id, pending.command_path, pending.command, pending.action,
       current?.state ?? 'legacy', nextState, current?.stateRevisionId ?? null,
       pending.actor_open_id, pending.actor_union_id, pending.owner_union_id,
-      pending.reason, pending.replacement, specHash, tombstoneHash ?? null, now.toISOString(),
+      pending.reason, pending.replacement, specHash, executorRevision, executorBinaryDigest ?? null,
+      tombstoneHash ?? null, now.toISOString(),
     );
     db.prepare('DELETE FROM pending_transitions WHERE token_hash = ?').run(pending.token_hash);
     return {
@@ -837,6 +921,7 @@ export function cancelFrozenCommandTransition(input: {
       reason: pending.reason,
       ...(pending.replacement ? { replacement: pending.replacement } : {}),
       ...(pending.expected_spec_hash ? { specHash: pending.expected_spec_hash } : {}),
+      ...(pending.expected_executor_revision ? { executorRevision: pending.expected_executor_revision } : {}),
       ...(pending.expected_revision_id ? { expectedRevisionId: pending.expected_revision_id } : {}),
     };
   }));

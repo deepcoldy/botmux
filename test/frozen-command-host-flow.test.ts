@@ -158,11 +158,11 @@ const ACTOR_UNION_ID = 'on_host_actor';
 const CAPABILITY = 'ab'.repeat(32);
 const COMMAND = '/宿主闭环';
 const YAML = `
-schemaVersion: 1
+schemaVersion: 2
 status: active
 name: 宿主闭环
 description: 宿主闭环测试
-datasource: tchouse-c
+executor: builtin.data-mcp.readonly
 params:
   - name: value
     label: 测试数字
@@ -170,7 +170,9 @@ params:
     min: 1
     max: 90
     default: 7
-sql: SELECT {{value}} * 2 AS probe_value
+input:
+  datasource: tchouse-c
+  sql: SELECT {{value}} * 2 AS probe_value
 output:
   prefix: "真实链路："
   maxChars: 20000
@@ -633,10 +635,13 @@ describe('Frozen Command host-owned route → callback → Data MCP flow', () =>
       actor: foreignActor,
     });
     writeFileSync(join(root, '.botmux', 'commands', '损坏命令.yaml'), `
-schemaVersion: 1
+schemaVersion: 2
 status: active
 name: 损坏命令
 description: 不应暴露解析细节
+executor: builtin.data-mcp.readonly
+input:
+  sql: SELECT 1
 unexpectedInternalField: true
 `);
 

@@ -33,6 +33,8 @@ export interface FrozenCommandActionRecord {
   rawArgs: string;
   normalizedArgs: Array<{ name: string; label: string; value: string }>;
   datasource?: string;
+  executorId: string;
+  executorRevision: string;
   specHash: string;
   revisionId: string;
   cardMessageId?: string;
@@ -84,6 +86,8 @@ CREATE TABLE IF NOT EXISTS command_actions (
   raw_args TEXT NOT NULL,
   normalized_args_json TEXT NOT NULL,
   datasource TEXT,
+  executor_id TEXT,
+  executor_revision TEXT,
   spec_hash TEXT NOT NULL,
   revision_id TEXT NOT NULL,
   card_message_id TEXT,
@@ -120,6 +124,8 @@ interface ActionRow {
   raw_args: string;
   normalized_args_json: string;
   datasource: string | null;
+  executor_id: string | null;
+  executor_revision: string | null;
   spec_hash: string;
   revision_id: string;
   card_message_id: string | null;
@@ -162,6 +168,10 @@ function withDb<T>(dataDir: string, operation: (db: DatabaseSyncLike) => T): T {
     db.exec('PRAGMA journal_mode = WAL;');
     db.exec('PRAGMA synchronous = FULL;');
     db.exec(SCHEMA);
+    const columns = db.prepare('PRAGMA table_info(command_actions)').all() as Array<{ name: string }>;
+    const names = new Set(columns.map(column => column.name));
+    if (!names.has('executor_id')) db.exec('ALTER TABLE command_actions ADD COLUMN executor_id TEXT;');
+    if (!names.has('executor_revision')) db.exec('ALTER TABLE command_actions ADD COLUMN executor_revision TEXT;');
     return operation(db);
   } finally {
     db.close();
@@ -212,6 +222,8 @@ function parseRow(row: ActionRow): FrozenCommandActionRecord {
     rawArgs: row.raw_args,
     normalizedArgs,
     ...(row.datasource ? { datasource: row.datasource } : {}),
+    executorId: row.executor_id ?? 'builtin.data-mcp.readonly',
+    executorRevision: row.executor_revision ?? '',
     specHash: row.spec_hash,
     revisionId: row.revision_id,
     ...(row.card_message_id ? { cardMessageId: row.card_message_id } : {}),
@@ -244,14 +256,15 @@ export function createFrozenCommandAction(
       session_id,turn_id,dispatch_attempt,working_dir,source_message_id,source_content_hash,
       intent_schema_version,parser_version,
       actor_open_id,actor_union_id,command,raw_args,normalized_args_json,datasource,
-      spec_hash,revision_id,created_at,expires_at,updated_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      executor_id,executor_revision,spec_hash,revision_id,created_at,expires_at,updated_at
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       id, sha256(nonce), 'pending', input.targetBotId, input.chatId, input.chatType,
       input.rootMessageId, input.scope, input.sessionId, input.turnId,
       input.dispatchAttempt, input.workingDir, input.sourceMessageId,
       input.sourceContentHash, input.intentSchemaVersion, input.parserVersion,
       input.actorOpenId, input.actorUnionId, input.command,
       input.rawArgs, JSON.stringify(input.normalizedArgs), input.datasource ?? null,
+      input.executorId, input.executorRevision,
       input.specHash, input.revisionId, createdAt, expiresAt, createdAt,
     );
   }));
@@ -279,6 +292,8 @@ export function createFrozenCommandAction(
       rawArgs: input.rawArgs,
       normalizedArgs: input.normalizedArgs,
       ...(input.datasource ? { datasource: input.datasource } : {}),
+      executorId: input.executorId,
+      executorRevision: input.executorRevision,
       specHash: input.specHash,
       revisionId: input.revisionId,
       createdAt,

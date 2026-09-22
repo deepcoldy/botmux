@@ -45,6 +45,8 @@ function create(dataDir: string, now = new Date('2026-09-20T00:00:00.000Z')) {
     rawArgs: '7',
     normalizedArgs: [{ name: 'days', label: '天数', value: '7' }],
     datasource: 'warehouse',
+    executorId: 'builtin.data-mcp.readonly',
+    executorRevision: 'c'.repeat(64),
     specHash: 'b'.repeat(64),
     revisionId: 'revision-1',
     ttlMs: 60_000,

@@ -627,7 +627,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, getGroupStats, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canTalk, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, getGroupStats, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canTalk, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, normalizeDocNativeWatchSubscription, putDocSubscription, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
@@ -5574,6 +5574,7 @@ async function routeFrozenCommand(input: {
   workingDir: string | undefined;
   larkAppId: string;
   chatId?: string;
+  chatType?: 'group' | 'p2p' | 'topic_group';
   anchor: string;
   turnId: string;
   senderOpenId?: string;
@@ -5766,7 +5767,9 @@ async function routeFrozenCommand(input: {
   const invocationNow = new Date();
   let renderedSql: string | undefined;
   try {
-    renderedSql = renderFrozenCommandSql({ definition, rawArgs, now: invocationNow }).sql;
+    if (definition.executor === 'builtin.data-mcp.readonly') {
+      renderedSql = renderFrozenCommandSql({ definition, rawArgs, now: invocationNow }).sql;
+    }
     const result = await executeFrozenCommand({
       definition,
       rawArgs,
@@ -5781,6 +5784,22 @@ async function routeFrozenCommand(input: {
       turnId: input.turnId,
       dataDir: config.session.dataDir,
       now: invocationNow,
+      workingDir: input.workingDir,
+      context: {
+        caller: { open_id: input.senderOpenId, union_id: input.senderUnionId },
+        chat: { id: input.chatId, type: input.chatType },
+        message: { id: input.turnId },
+      },
+      expectedExecutorRevision: lifecycle.kind === 'active' ? lifecycle.record.executorRevision : undefined,
+      audit: {
+        source: 'direct',
+        ...(lifecycle.kind === 'active' && lifecycle.record.specHash
+          ? { specHash: lifecycle.record.specHash }
+          : {}),
+        ...(lifecycle.kind === 'active'
+          ? { stateRevisionId: lifecycle.record.stateRevisionId }
+          : {}),
+      },
     });
     await input.reply(input.anchor, result.text, 'text', input.larkAppId);
     return { kind: 'handled' };
@@ -6452,7 +6471,9 @@ async function executeClaimedFrozenCommandAction(action: FrozenCommandActionReco
     });
     if (lifecycle.kind !== 'active'
       || lifecycle.record.stateRevisionId !== action.revisionId
-      || lifecycle.record.specHash !== action.specHash) {
+      || lifecycle.record.specHash !== action.specHash
+      || lifecycle.record.executorRevision !== action.executorRevision
+      || lookup.snapshot.definition.executor !== action.executorId) {
       throw new FrozenCommandError('command_revision_changed', '命令版本已变化，请重新发起');
     }
     const normalized = normalizeFrozenCommandArguments({
@@ -6460,7 +6481,9 @@ async function executeClaimedFrozenCommandAction(action: FrozenCommandActionReco
       rawArgs: action.rawArgs,
     }).args;
     if (JSON.stringify(normalized) !== JSON.stringify(action.normalizedArgs)
-      || (lookup.snapshot.definition.datasource ?? '') !== (action.datasource ?? '')) {
+      || (typeof lookup.snapshot.definition.input.datasource === 'string'
+        ? lookup.snapshot.definition.input.datasource
+        : '') !== (action.datasource ?? '')) {
       throw new FrozenCommandError('command_preview_changed', '命令参数或数据源已变化，请重新发起');
     }
     const result = await executeFrozenCommand({
@@ -6476,9 +6499,23 @@ async function executeClaimedFrozenCommandAction(action: FrozenCommandActionReco
       },
       turnId: `frozen-action:${action.id}`,
       dataDir: config.session.dataDir,
+      workingDir: action.workingDir,
+      context: {
+        caller: { open_id: action.actorOpenId, union_id: action.actorUnionId },
+        chat: { id: action.chatId, type: action.chatType },
+        message: { id: action.sourceMessageId },
+      },
+      expectedExecutorRevision: lifecycle.record.executorRevision,
+      audit: {
+        source: 'confirmed',
+        specHash: action.specHash,
+        stateRevisionId: action.revisionId,
+      },
     });
     queryId = result.queryId;
-    if (!queryId) throw new FrozenCommandError('query_id_missing', '查询完成状态缺少 query_id，已按失败留档');
+    if (lookup.snapshot.definition.executor === 'builtin.data-mcp.readonly' && !queryId) {
+      throw new FrozenCommandError('query_id_missing', '查询完成状态缺少 query_id，已按失败留档');
+    }
     const settled = settleFrozenCommandAction({
       dataDir: config.session.dataDir,
       id: action.id,
@@ -7526,7 +7563,8 @@ function frozenCommandCenterRows(
       command: row.command,
       usage: frozenCommandUsage(definition),
       description: definition.description,
-      datasource: definition.datasource,
+      executor: definition.executor,
+      datasource: typeof definition.input.datasource === 'string' ? definition.input.datasource : undefined,
       state: gate.kind === 'active' ? 'active' : 'unapproved',
       ...(gate.kind === 'legacy' ? { reason: '尚未完成当前机器人批准，暂不可运行' } : {}),
     }];
@@ -7755,7 +7793,7 @@ ipcRoute('POST', '/api/frozen-command-actions', async (req, res) => {
     command: normalizedCommand,
     snapshot: lookup.snapshot,
   });
-  if (lifecycle.kind !== 'active' || !lifecycle.record.specHash) {
+  if (lifecycle.kind !== 'active' || !lifecycle.record.specHash || !lifecycle.record.executorRevision) {
     return jsonRes(res, 409, { ok: false, error: `command_${lifecycle.kind}` });
   }
   let normalizedArgs;
@@ -7790,7 +7828,11 @@ ipcRoute('POST', '/api/frozen-command-actions', async (req, res) => {
     command: normalizedCommand,
     rawArgs: body.rawArgs!,
     normalizedArgs,
-    datasource: lookup.snapshot.definition.datasource,
+    datasource: typeof lookup.snapshot.definition.input.datasource === 'string'
+      ? lookup.snapshot.definition.input.datasource
+      : undefined,
+    executorId: lookup.snapshot.definition.executor,
+    executorRevision: lifecycle.record.executorRevision!,
     specHash: lifecycle.record.specHash,
     revisionId: lifecycle.record.stateRevisionId,
   });
@@ -22664,6 +22706,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
         workingDir: pinnedWorkingDir,
         larkAppId,
         chatId,
+        chatType,
         anchor,
         turnId: parsed.messageId,
         senderOpenId,
@@ -24843,6 +24886,7 @@ async function handleThreadReplyAdmitted(
         workingDir: frozenWorkingDir,
         larkAppId,
         chatId: effectiveThreadChatId,
+        chatType: ctxChatType,
         anchor,
         turnId: parsed.messageId,
         senderOpenId: threadSenderOpenId,

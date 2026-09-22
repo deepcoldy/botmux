@@ -267,16 +267,18 @@ function installScheduledFrozenFixture(yaml: string): { root: string; restore: (
 }
 
 const SCHEDULED_FROZEN_YAML = `
-schemaVersion: 1
+schemaVersion: 2
 name: 泰国上账
 description: 查询泰国最近 N 天的上账金额
+executor: builtin.data-mcp.readonly
 params:
   - name: days
     type: integer
     min: 1
     max: 90
     default: 7
-sql: SELECT sum(amount) FROM bills WHERE dt >= today() - {{days}} LIMIT 100
+input:
+  sql: SELECT sum(amount) FROM bills WHERE dt >= today() - {{days}} LIMIT 100
 `;
 
 function forkedCliInput(): string {
@@ -587,11 +589,13 @@ output:
       const dataDir = join(root, 'data');
       mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
       writeFileSync(join(root, '.botmux', 'commands', '泰国上账.yaml'), `
-schemaVersion: 1
+schemaVersion: 2
 name: 泰国上账
 description: 即将废弃的命令
+executor: builtin.data-mcp.readonly
 params: []
-sql: SELECT 1
+input:
+  sql: SELECT 1
 onError: fallback_llm
 `);
       config.session.dataDir = dataDir;

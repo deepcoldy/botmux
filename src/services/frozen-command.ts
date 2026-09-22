@@ -15,6 +15,17 @@ import { resolveEffectivePluginIds } from '../core/plugins/effective.js';
 import { PluginMcpGateway } from '../core/plugins/mcp/gateway.js';
 import { readGlobalConfig } from '../global-config.js';
 import type { TrustedCaller } from '../types.js';
+import { logger } from '../utils/logger.js';
+import {
+  BUILTIN_DATA_MCP_EXECUTOR_ID,
+  BUILTIN_DATA_MCP_EXECUTOR_REVISION,
+  commandExecutorBinaryDigest,
+  CommandExecutorError,
+  resolveCommandExecutor,
+  runProcessCommandExecutor,
+  type ExecutorArgumentSource,
+  type ResolvedExecutorInput,
+} from './command-executors.js';
 
 export const DATA_MCP_PLUGIN_ID = 'data-mcp';
 export const FROZEN_COMMAND_DIR = join('.botmux', 'commands');
@@ -22,6 +33,8 @@ export const FROZEN_COMMAND_DIR = join('.botmux', 'commands');
 const COMMAND_NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N}_-]{0,63}$/u;
 const PARAM_NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 const PLACEHOLDER_RE = /\{\{\s*([A-Za-z][A-Za-z0-9_]*)\s*\}\}/g;
+const INPUT_PLACEHOLDER_RE = /^\{\{\s*((?:caller\.(?:open_id|union_id|name)|chat\.(?:id|type)|message\.id|today|now)|[A-Za-z][A-Za-z0-9_]*)\s*\}\}$/;
+const OUTPUT_PLACEHOLDER_RE = /\{\{\s*result\.([A-Za-z_][A-Za-z0-9_.]*)\s*\}\}/g;
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const RELATIVE_DATE_RE = /^today(?:([+-])(\d{1,4}))?$/;
 const DEFAULT_TIMEZONE = 'Asia/Shanghai';
@@ -67,18 +80,28 @@ interface DateParameter {
   default?: string;
 }
 
-export type FrozenCommandParameter = IntegerParameter | EnumParameter | DateParameter;
+interface StringParameter {
+  name: string;
+  label?: string;
+  type: 'string';
+  pattern?: string;
+  maxLength: number;
+  default?: string;
+}
+
+export type FrozenCommandParameter = IntegerParameter | EnumParameter | DateParameter | StringParameter;
 
 export interface FrozenCommandDefinition {
-  schemaVersion: 1;
+  schemaVersion: 2;
   status: 'active';
   name: string;
   description: string;
   timezone: string;
-  datasource?: string;
-  sql: string;
+  executor: string;
+  input: Record<string, string | number | boolean>;
   params: FrozenCommandParameter[];
   output: {
+    text?: string;
     prefix?: string;
     suffix?: string;
     maxChars: number;
@@ -103,10 +126,14 @@ export interface FrozenCommandSnapshot {
 }
 
 export interface FrozenCommandExecutionResult {
-  renderedSql: string;
+  renderedSql?: string;
   referenceDate: string;
   text: string;
   truncated: boolean;
+  executorId: string;
+  executorRevision?: string;
+  executionId?: string;
+  projectedResult?: Record<string, unknown>;
   queryId?: string;
   businessResult?: {
     rows: Array<Record<string, string | number | boolean | bigint | null | undefined>>;
@@ -124,10 +151,58 @@ export interface FrozenCommandNormalizedArgument {
   value: string;
 }
 
+export interface FrozenCommandExecutionContext {
+  caller?: {
+    open_id?: string;
+    union_id?: string;
+    name?: string;
+  };
+  chat?: {
+    id?: string;
+    type?: string;
+  };
+  message?: {
+    id?: string;
+  };
+}
+
+export interface FrozenCommandExecutionAuditContext {
+  source: 'direct' | 'confirmed' | 'schedule';
+  specHash?: string;
+  stateRevisionId?: string;
+  taskId?: string;
+}
+
 export type FrozenCommandLookup =
   | { kind: 'missing'; command: string }
   | { kind: 'invalid'; command: string; error: FrozenCommandError }
   | { kind: 'found'; snapshot: FrozenCommandSnapshot };
+
+export function frozenCommandExecutorRevision(definition: FrozenCommandDefinition): string {
+  if (definition.executor === BUILTIN_DATA_MCP_EXECUTOR_ID) return BUILTIN_DATA_MCP_EXECUTOR_REVISION;
+  try {
+    return resolveCommandExecutor(definition.executor).revision;
+  } catch (error) {
+    if (error instanceof CommandExecutorError) throw new FrozenCommandError(error.code, error.message);
+    throw error;
+  }
+}
+
+/** Third-party executable content is deliberately not part of the blocking
+ * executor revision. This digest is an approval-time baseline for drift alerts
+ * under isolation scheme B; scripts remain covered by the blocking artifact
+ * digests inside executorRevision. */
+export function frozenCommandExecutorBinaryDigest(definition: FrozenCommandDefinition): string | undefined {
+  if (definition.executor === BUILTIN_DATA_MCP_EXECUTOR_ID) return undefined;
+  try {
+    return commandExecutorBinaryDigest(resolveCommandExecutor(definition.executor));
+  } catch (error) {
+    if (error instanceof CommandExecutorError) {
+      throw new FrozenCommandError(error.code, error.message);
+    }
+    throw error;
+  }
+}
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -216,7 +291,7 @@ function parseParameter(value: unknown, index: number): FrozenCommandParameter {
   if (!isPlainObject(value)) {
     throw new FrozenCommandError('definition_invalid_parameter', `params[${index}] 必须是对象`);
   }
-  onlyKeys(value, ['name', 'label', 'type', 'default', 'min', 'max', 'values'], `params[${index}]`);
+  onlyKeys(value, ['name', 'label', 'type', 'default', 'min', 'max', 'values', 'pattern', 'maxLength'], `params[${index}]`);
   const name = nonBlank(value.name, `params[${index}].name`, 64).trim();
   if (!PARAM_NAME_RE.test(name)) {
     throw new FrozenCommandError('definition_invalid_parameter', `非法参数名：${name}`);
@@ -279,6 +354,31 @@ function parseParameter(value: unknown, index: number): FrozenCommandParameter {
       ...(value.default === undefined ? {} : { default: value.default as string }),
     };
   }
+  if (value.type === 'string') {
+    const maxLength = value.maxLength === undefined ? 1_000 : value.maxLength;
+    if (!Number.isSafeInteger(maxLength) || (maxLength as number) < 1 || (maxLength as number) > 10_000) {
+      throw new FrozenCommandError('definition_invalid_parameter', `${name}: maxLength 必须在 1-10000 之间`);
+    }
+    if (value.pattern !== undefined) {
+      if (typeof value.pattern !== 'string' || value.pattern.length > 2_000) {
+        throw new FrozenCommandError('definition_invalid_parameter', `${name}: pattern 不合法`);
+      }
+      try { new RegExp(value.pattern, 'u'); } catch {
+        throw new FrozenCommandError('definition_invalid_parameter', `${name}: pattern 不是有效正则`);
+      }
+    }
+    if (value.default !== undefined && typeof value.default !== 'string') {
+      throw new FrozenCommandError('definition_invalid_parameter', `${name}: default 必须是字符串`);
+    }
+    return {
+      name,
+      ...(label ? { label } : {}),
+      type: 'string',
+      maxLength: maxLength as number,
+      ...(value.pattern === undefined ? {} : { pattern: value.pattern as string }),
+      ...(value.default === undefined ? {} : { default: value.default as string }),
+    };
+  }
   throw new FrozenCommandError('definition_invalid_parameter', `${name}: 不支持参数类型 ${String(value.type)}`);
 }
 
@@ -291,11 +391,14 @@ function parseDefinition(raw: string, command: string): FrozenCommandDefinition 
   }
   if (!isPlainObject(value)) throw new FrozenCommandError('definition_invalid', '指令定义必须是对象');
   onlyKeys(value, [
-    'schemaVersion', 'status', 'name', 'description', 'timezone', 'datasource', 'sql', 'params',
+    'schemaVersion', 'status', 'name', 'description', 'timezone', 'executor', 'input', 'params',
     'output', 'onError', 'createdAt', 'createdBy', 'updatedAt', 'updatedBy',
   ], 'definition');
-  if (value.schemaVersion !== undefined && value.schemaVersion !== 1) {
-    throw new FrozenCommandError('definition_version_unsupported', `不支持 schemaVersion=${String(value.schemaVersion)}`);
+  if (value.schemaVersion !== 2) {
+    throw new FrozenCommandError(
+      'definition_version_unsupported',
+      `仅支持 schemaVersion=2；当前为 ${String(value.schemaVersion ?? '未声明')}，请先迁移旧命令`,
+    );
   }
   if (value.status !== undefined && value.status !== 'active') {
     throw new FrozenCommandError('definition_inactive', `命令定义状态不是 active：${String(value.status)}`);
@@ -309,10 +412,21 @@ function parseDefinition(raw: string, command: string): FrozenCommandDefinition 
     ? value.timezone.trim()
     : DEFAULT_TIMEZONE;
   if (!isTimezone(timezone)) throw new FrozenCommandError('definition_invalid_timezone', `非法时区：${timezone}`);
-  const sql = nonBlank(value.sql, 'sql', 200_000);
-  if (/\{\{\s*(?:sender|chat|message)\./i.test(sql)) {
-    throw new FrozenCommandError('definition_identity_in_sql', 'SQL 模板禁止使用身份变量；调用者身份只能走 Gateway metadata');
+  const executor = nonBlank(value.executor, 'executor', 128).trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(executor)) {
+    throw new FrozenCommandError('definition_invalid_executor', 'executor id 格式不合法');
   }
+  if (!isPlainObject(value.input)) throw new FrozenCommandError('definition_invalid_input', 'input 必须是对象');
+  if (Object.keys(value.input).length === 0 || Object.keys(value.input).length > 32) {
+    throw new FrozenCommandError('definition_invalid_input', 'input 必须有 1-32 个字段');
+  }
+  const commandInput = Object.fromEntries(Object.entries(value.input).map(([key, candidate]) => {
+    if (!PARAM_NAME_RE.test(key)) throw new FrozenCommandError('definition_invalid_input', `非法 input 字段：${key}`);
+    if (!['string', 'number', 'boolean'].includes(typeof candidate) || (typeof candidate === 'string' && candidate.includes('\0'))) {
+      throw new FrozenCommandError('definition_invalid_input', `input.${key} 只能是字符串、数值或布尔值`);
+    }
+    return [key, candidate as string | number | boolean];
+  }));
   const paramsRaw = value.params ?? [];
   if (!Array.isArray(paramsRaw) || paramsRaw.length > 32) {
     throw new FrozenCommandError('definition_invalid_parameters', 'params 必须是最多 32 项的数组');
@@ -321,19 +435,43 @@ function parseDefinition(raw: string, command: string): FrozenCommandDefinition 
   if (new Set(params.map(param => param.name)).size !== params.length) {
     throw new FrozenCommandError('definition_duplicate_parameter', '参数名不能重复');
   }
-  const placeholders = [...sql.matchAll(PLACEHOLDER_RE)].map(match => match[1]!);
   const declared = new Set(params.map(param => param.name));
-  const unknown = [...new Set(placeholders.filter(name => !declared.has(name)))];
-  if (unknown.length > 0) throw new FrozenCommandError('definition_unknown_placeholder', `SQL 使用了未声明参数：${unknown.join(', ')}`);
-  const unused = params.filter(param => !placeholders.includes(param.name));
-  if (unused.length > 0) throw new FrozenCommandError('definition_unused_parameter', `参数未在 SQL 中使用：${unused.map(item => item.name).join(', ')}`);
-  if (/\{\{|\}\}/.test(sql.replace(PLACEHOLDER_RE, ''))) {
-    throw new FrozenCommandError('definition_invalid_placeholder', 'SQL 模板包含无法识别的占位符');
+  let referencedParams: string[] = [];
+  if (executor === BUILTIN_DATA_MCP_EXECUTOR_ID) {
+    onlyKeys(commandInput, ['sql', 'datasource'], 'input');
+    const sql = nonBlank(commandInput.sql, 'input.sql', 200_000);
+    if (/\{\{\s*(?:caller|chat|message)\./i.test(sql)) {
+      throw new FrozenCommandError('definition_identity_in_sql', 'SQL 模板禁止使用身份变量；调用者身份只能走 Gateway metadata');
+    }
+    referencedParams = [...sql.matchAll(PLACEHOLDER_RE)].map(match => match[1]!);
+    const unknown = [...new Set(referencedParams.filter(name => !declared.has(name)))];
+    if (unknown.length > 0) throw new FrozenCommandError('definition_unknown_placeholder', `SQL 使用了未声明参数：${unknown.join(', ')}`);
+    if (/\{\{|\}\}/.test(sql.replace(PLACEHOLDER_RE, ''))) {
+      throw new FrozenCommandError('definition_invalid_placeholder', 'SQL 模板包含无法识别的占位符');
+    }
+    if (commandInput.datasource !== undefined
+      && (typeof commandInput.datasource !== 'string' || !/^[A-Za-z0-9._-]+$/.test(commandInput.datasource))) {
+      throw new FrozenCommandError('definition_invalid_datasource', 'input.datasource 格式不合法');
+    }
+  } else {
+    for (const [key, candidate] of Object.entries(commandInput)) {
+      if (typeof candidate !== 'string' || !candidate.includes('{{')) continue;
+      const match = INPUT_PLACEHOLDER_RE.exec(candidate);
+      if (!match) throw new FrozenCommandError('definition_invalid_placeholder', `input.${key} 变量必须独占整个值，且 key 必须在封闭集合中`);
+      const placeholder = match[1]!;
+      if (!placeholder.includes('.') && placeholder !== 'today' && placeholder !== 'now') {
+        referencedParams.push(placeholder);
+      }
+    }
+    const unknown = [...new Set(referencedParams.filter(name => !declared.has(name)))];
+    if (unknown.length > 0) throw new FrozenCommandError('definition_unknown_placeholder', `input 使用了未声明参数：${unknown.join(', ')}`);
   }
+  const unused = params.filter(param => !referencedParams.includes(param.name));
+  if (unused.length > 0) throw new FrozenCommandError('definition_unused_parameter', `参数未在 input 中使用：${unused.map(item => item.name).join(', ')}`);
   let output: FrozenCommandDefinition['output'] = { maxChars: DEFAULT_MAX_OUTPUT_CHARS };
   if (value.output !== undefined) {
     if (!isPlainObject(value.output)) throw new FrozenCommandError('definition_invalid_output', 'output 必须是对象');
-    onlyKeys(value.output, ['prefix', 'suffix', 'maxChars', 'when', 'handoff', 'else'], 'output');
+    onlyKeys(value.output, ['text', 'prefix', 'suffix', 'maxChars', 'when', 'handoff', 'else'], 'output');
     const maxChars = value.output.maxChars ?? DEFAULT_MAX_OUTPUT_CHARS;
     if (!Number.isInteger(maxChars) || (maxChars as number) < 100 || (maxChars as number) > 100_000) {
       throw new FrozenCommandError('definition_invalid_output', 'output.maxChars 必须在 100-100000 之间');
@@ -369,28 +507,26 @@ function parseDefinition(raw: string, command: string): FrozenCommandDefinition 
     }
     output = {
       maxChars: maxChars as number,
+      ...(typeof value.output.text === 'string' ? { text: value.output.text } : {}),
       ...(typeof value.output.prefix === 'string' ? { prefix: value.output.prefix } : {}),
       ...(typeof value.output.suffix === 'string' ? { suffix: value.output.suffix } : {}),
       ...conditional,
     };
   }
-  const datasource = typeof value.datasource === 'string' && value.datasource.trim()
-    ? value.datasource.trim()
-    : undefined;
-  if (datasource && !/^[A-Za-z0-9._-]+$/.test(datasource)) {
-    throw new FrozenCommandError('definition_invalid_datasource', 'datasource 格式不合法');
+  if (executor !== BUILTIN_DATA_MCP_EXECUTOR_ID && !output.text) {
+    throw new FrozenCommandError('definition_invalid_output', 'process/script 命令必须声明 output.text');
   }
   if (value.onError !== undefined && value.onError !== 'fallback_llm' && value.onError !== 'fail') {
     throw new FrozenCommandError('definition_invalid_on_error', 'onError 只能是 fallback_llm 或 fail');
   }
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     status: 'active',
     name,
     description,
     timezone,
-    ...(datasource ? { datasource } : {}),
-    sql,
+    executor,
+    input: commandInput,
     params,
     output,
     onError: value.onError === 'fail' ? 'fail' : 'fallback_llm',
@@ -559,7 +695,7 @@ function resolveParameter(
   parameter: FrozenCommandParameter,
   supplied: string | undefined,
   referenceDate: string,
-): { sql: string; display: string } {
+): { sql: string; display: string; value: string | number } {
   const value = supplied ?? parameter.default;
   if (value === undefined) throw new FrozenCommandError('parameter_required', `缺少参数：${parameter.label ?? parameter.name}`);
   if (parameter.type === 'integer') {
@@ -571,7 +707,7 @@ function resolveParameter(
     if (!Number.isSafeInteger(parsed) || parsed < parameter.min || parsed > parameter.max) {
       throw new FrozenCommandError('parameter_integer_out_of_range', `${parameter.label ?? parameter.name} 必须在 ${parameter.min}～${parameter.max} 之间`);
     }
-    return { sql: String(parsed), display: String(parsed) };
+    return { sql: String(parsed), display: String(parsed), value: parsed };
   }
   if (parameter.type === 'enum') {
     const matched = parameter.values.find(candidate => String(candidate) === String(value));
@@ -581,7 +717,18 @@ function resolveParameter(
     return {
       sql: typeof matched === 'number' ? String(matched) : sqlString(matched),
       display: String(matched),
+      value: matched,
     };
+  }
+  if (parameter.type === 'string') {
+    const text = String(value);
+    if (text.length > parameter.maxLength || text.includes('\0')) {
+      throw new FrozenCommandError('parameter_invalid_string', `${parameter.label ?? parameter.name} 超过长度上限`);
+    }
+    if (parameter.pattern && !new RegExp(parameter.pattern, 'u').test(text)) {
+      throw new FrozenCommandError('parameter_invalid_string', `${parameter.label ?? parameter.name} 不符合格式约束`);
+    }
+    return { sql: sqlString(text), display: text, value: text };
   }
   const resolved = resolveDate(String(value), referenceDate);
   const day = epochDay(resolved);
@@ -591,7 +738,7 @@ function resolveParameter(
   if (parameter.max && day > epochDay(resolveDate(parameter.max, referenceDate))) {
     throw new FrozenCommandError('parameter_date_out_of_range', `${parameter.label ?? parameter.name} 晚于允许范围`);
   }
-  return { sql: sqlString(resolved), display: resolved };
+  return { sql: sqlString(resolved), display: resolved, value: resolved };
 }
 
 function resolveFrozenCommandArguments(input: {
@@ -601,6 +748,7 @@ function resolveFrozenCommandArguments(input: {
 }): {
   referenceDate: string;
   encoded: Map<string, string>;
+  values: Map<string, string | number>;
   normalized: FrozenCommandNormalizedArgument[];
 } {
   const values = tokenizeArguments(input.rawArgs);
@@ -609,16 +757,18 @@ function resolveFrozenCommandArguments(input: {
   }
   const referenceDate = referenceDateFor(input.definition.timezone, input.now ?? new Date());
   const encoded = new Map<string, string>();
+  const resolvedValues = new Map<string, string | number>();
   const normalized = input.definition.params.map((parameter, index) => {
     const resolved = resolveParameter(parameter, values[index], referenceDate);
     encoded.set(parameter.name, resolved.sql);
+    resolvedValues.set(parameter.name, resolved.value);
     return {
       name: parameter.name,
       label: parameter.label ?? parameter.name,
       value: resolved.display,
     };
   });
-  return { referenceDate, encoded, normalized };
+  return { referenceDate, encoded, values: resolvedValues, normalized };
 }
 
 /** Parse and normalize with the exact same host-owned parser used by SQL
@@ -638,8 +788,13 @@ export function renderFrozenCommandSql(input: {
   rawArgs: string;
   now?: Date;
 }): { sql: string; referenceDate: string } {
+  if (input.definition.executor !== BUILTIN_DATA_MCP_EXECUTOR_ID) {
+    throw new FrozenCommandError('definition_executor_mismatch', '仅 Data MCP 内建执行器可以渲染 SQL');
+  }
   const resolved = resolveFrozenCommandArguments(input);
-  const sql = input.definition.sql.replace(PLACEHOLDER_RE, (_full, name: string) => resolved.encoded.get(name)!);
+  const template = input.definition.input.sql;
+  if (typeof template !== 'string') throw new FrozenCommandError('definition_invalid_input', 'input.sql 缺失');
+  const sql = template.replace(PLACEHOLDER_RE, (_full, name: string) => resolved.encoded.get(name)!);
   return { sql, referenceDate: resolved.referenceDate };
 }
 
@@ -832,6 +987,102 @@ function renderFrozenOutputTemplate(template: string, context: Record<string, un
   });
 }
 
+function renderProcessOutputTemplate(template: string, projected: Record<string, unknown>): string {
+  return template.replace(OUTPUT_PLACEHOLDER_RE, (_full, path: string) => {
+    const value = contextValue(projected, path);
+    if (typeof value === 'string') return safeBusinessText(value);
+    if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
+    if (value === null || value === undefined) return '—';
+    return JSON.stringify(value, (_key, child) => typeof child === 'bigint' ? child.toString() : child);
+  });
+}
+
+function processBusinessResult(
+  projected: Record<string, unknown>,
+  container?: string,
+): FrozenCommandExecutionResult['businessResult'] {
+  const candidate = container === undefined
+    ? Object.values(projected).find(Array.isArray)
+    : contextValue(projected, container);
+  if (Array.isArray(candidate) && candidate.every(isPlainObject)) {
+    return {
+      rows: candidate as Array<Record<string, string | number | boolean | bigint | null | undefined>>,
+      totalRows: candidate.length,
+    };
+  }
+  return {
+    rows: [projected as Record<string, string | number | boolean | bigint | null | undefined>],
+    totalRows: 1,
+  };
+}
+
+function processContextMap(input: {
+  trustedCaller: TrustedCaller;
+  context?: FrozenCommandExecutionContext;
+  referenceDate: string;
+  now: Date;
+}): Record<string, string | undefined> {
+  if ((input.context?.caller?.open_id
+      && input.context.caller.open_id !== input.trustedCaller.requestUserOpenId)
+    || (input.context?.caller?.union_id
+      && input.context.caller.union_id !== input.trustedCaller.requestUserUnionId)) {
+    throw new FrozenCommandError('context_identity_mismatch', '执行上下文身份与可信调用者不一致，已拒绝执行');
+  }
+  return {
+    'caller.open_id': input.trustedCaller.requestUserOpenId,
+    'caller.union_id': input.trustedCaller.requestUserUnionId,
+    'caller.name': input.context?.caller?.name,
+    'chat.id': input.context?.chat?.id,
+    'chat.type': input.context?.chat?.type,
+    'message.id': input.context?.message?.id,
+    today: input.referenceDate,
+    now: input.now.toISOString(),
+  };
+}
+
+function resolveProcessInput(input: {
+  definition: FrozenCommandDefinition;
+  rawArgs: string;
+  trustedCaller: TrustedCaller;
+  context?: FrozenCommandExecutionContext;
+  now: Date;
+}): { values: Record<string, ResolvedExecutorInput>; referenceDate: string } {
+  const resolved = resolveFrozenCommandArguments({
+    definition: input.definition,
+    rawArgs: input.rawArgs,
+    now: input.now,
+  });
+  const context = processContextMap({
+    trustedCaller: input.trustedCaller,
+    context: input.context,
+    referenceDate: resolved.referenceDate,
+    now: input.now,
+  });
+  const values: Record<string, ResolvedExecutorInput> = {};
+  for (const [name, configured] of Object.entries(input.definition.input)) {
+    if (typeof configured === 'string') {
+      const placeholder = INPUT_PLACEHOLDER_RE.exec(configured);
+      if (placeholder) {
+        const key = placeholder[1]!;
+        if (key.includes('.') || key === 'today' || key === 'now') {
+          const value = context[key];
+          if (value === undefined || value === '') {
+            throw new FrozenCommandError('context_value_missing', `执行上下文缺少 ${key}，已拒绝执行`);
+          }
+          values[name] = { value, source: `context:${key}` as ExecutorArgumentSource };
+        } else {
+          const value = resolved.values.get(key);
+          if (value === undefined) throw new FrozenCommandError('parameter_required', `缺少参数：${key}`);
+          values[name] = { value, source: 'param' };
+        }
+        continue;
+      }
+    }
+    values[name] = { value: configured as string | number, source: 'literal' };
+  }
+  return { values, referenceDate: resolved.referenceDate };
+}
+
 function truncateFrozenOutput(text: string, maxChars: number): string {
   return text.length > maxChars
     ? `${text.slice(0, maxChars)}\n\n（结果已截断）`
@@ -935,25 +1186,174 @@ function downstreamFailure(stage: 'validate' | 'run', result: Record<string, unk
   );
 }
 
+function frozenCommandAuditRecord(input: {
+  input: {
+    definition: FrozenCommandDefinition;
+    rawArgs: string;
+    targetLarkAppId: string;
+    trustedCaller: TrustedCaller | undefined;
+    turnId: string;
+    now?: Date;
+    audit?: FrozenCommandExecutionAuditContext;
+  };
+  executionId: string;
+  executorRevision: string;
+  status: 'completed' | 'failed';
+  startedAt: number;
+  stdoutBytes?: number;
+  truncated?: boolean;
+  exitCode?: number;
+  signal?: NodeJS.Signals | null;
+  errorCode?: string;
+}): Record<string, unknown> {
+  let normalizedParams: Array<{ name: string; type: string; value: '[REDACTED]' }> = [];
+  try {
+    const normalized = normalizeFrozenCommandArguments({
+      definition: input.input.definition,
+      rawArgs: input.input.rawArgs,
+      now: input.input.now,
+    }).args;
+    normalizedParams = normalized.map(item => ({
+      name: item.name,
+      type: input.input.definition.params.find(param => param.name === item.name)?.type ?? 'unknown',
+      value: '[REDACTED]',
+    }));
+  } catch {
+    // Invalid arguments still need an audit row; never let audit formatting
+    // replace the actual parser error.
+  }
+  return {
+    event: 'frozen_command_execution',
+    execution_id: input.executionId,
+    status: input.status,
+    target_bot_id: input.input.targetLarkAppId,
+    command: input.input.definition.name,
+    executor_id: input.input.definition.executor,
+    executor_revision: input.executorRevision,
+    spec_hash: input.input.audit?.specHash,
+    state_revision_id: input.input.audit?.stateRevisionId,
+    source: input.input.audit?.source ?? 'direct',
+    task_id: input.input.audit?.taskId ?? input.input.trustedCaller?.taskId,
+    caller_open_id: input.input.trustedCaller?.requestUserOpenId,
+    caller_union_id: input.input.trustedCaller?.requestUserUnionId,
+    turn_id: input.input.turnId,
+    normalized_params: normalizedParams,
+    isolation_mode: 'none',
+    duration_ms: Math.max(0, Date.now() - input.startedAt),
+    stdout_bytes: input.stdoutBytes,
+    truncated: input.truncated ?? false,
+    exit_code: input.exitCode,
+    signal: input.signal,
+    error_code: input.errorCode,
+  };
+}
+
 export async function executeFrozenCommand(input: {
   definition: FrozenCommandDefinition;
   rawArgs: string;
   targetLarkAppId: string;
-  botConfig: Pick<BotConfig, 'plugins'>;
+  botConfig: Pick<BotConfig, 'plugins' | 'larkAppId' | 'larkAppSecret'>;
   trustedCaller: TrustedCaller | undefined;
   turnId: string;
   dataDir: string;
   now?: Date;
   timeoutMs?: number;
+  workingDir?: string;
+  context?: FrozenCommandExecutionContext;
+  expectedExecutorRevision?: string;
+  audit?: FrozenCommandExecutionAuditContext;
 }): Promise<FrozenCommandExecutionResult> {
-  if (!input.trustedCaller) {
+  if (!input.trustedCaller
+    || (input.trustedCaller.senderType !== 'user' && input.trustedCaller.source !== 'schedule_creator')) {
     throw new FrozenCommandError('untrusted_caller', '无法确认调用者身份，已拒绝执行');
+  }
+  if (input.botConfig.larkAppId !== input.targetLarkAppId) {
+    throw new FrozenCommandError('executor_identity_mismatch', '目标 Bot 与执行身份不一致，已拒绝执行');
+  }
+  const now = input.now ?? new Date();
+  const executionId = randomUUID();
+  const startedAt = Date.now();
+  const currentExecutorRevision = frozenCommandExecutorRevision(input.definition);
+  if (input.expectedExecutorRevision && input.expectedExecutorRevision !== currentExecutorRevision) {
+    throw new FrozenCommandError('executor_revision_changed', '执行器配置或脚本已变化，命令必须重新确认');
+  }
+  if (input.definition.executor !== BUILTIN_DATA_MCP_EXECUTOR_ID) {
+    try {
+      const executor = resolveCommandExecutor(input.definition.executor);
+      const scheduled = input.trustedCaller.source === 'schedule_creator';
+      if (scheduled && !executor.policy.schedulable) {
+        throw new CommandExecutorError('executor_schedule_denied', `执行器 ${executor.id} 不允许用于定时任务`);
+      }
+      if (input.definition.output.when && !executor.policy.allowHandoff) {
+        throw new CommandExecutorError('executor_handoff_denied', `执行器 ${executor.id} 不允许把结果交给模型`);
+      }
+      const resolved = resolveProcessInput({
+        definition: input.definition,
+        rawArgs: input.rawArgs,
+        trustedCaller: input.trustedCaller,
+        context: input.context,
+        now,
+      });
+      const executed = await runProcessCommandExecutor({
+        executor,
+        values: resolved.values,
+        botConfig: input.botConfig,
+        workingDir: input.workingDir,
+        executionId,
+      });
+      const template = input.definition.output.text!;
+      if (/\{\{|\}\}/.test(template.replace(OUTPUT_PLACEHOLDER_RE, ''))) {
+        throw new FrozenCommandError('definition_invalid_output', 'output.text 包含无法识别的占位符');
+      }
+      const raw = renderProcessOutputTemplate(template, executed.projected);
+      const decorated = `${input.definition.output.prefix ?? ''}${raw}${input.definition.output.suffix ?? ''}`;
+      logger.info('[frozen-command:audit]', frozenCommandAuditRecord({
+        input,
+        executionId,
+        executorRevision: currentExecutorRevision,
+        status: 'completed',
+        startedAt,
+        stdoutBytes: executed.stdoutBytes,
+        truncated: executed.truncated || decorated.length > input.definition.output.maxChars,
+        exitCode: executed.exitCode,
+        signal: executed.signal,
+      }));
+      return {
+        referenceDate: resolved.referenceDate,
+        text: truncateFrozenOutput(decorated, input.definition.output.maxChars),
+        truncated: decorated.length > input.definition.output.maxChars,
+        executorId: executor.id,
+        executorRevision: currentExecutorRevision,
+        executionId: executed.executionId,
+        projectedResult: executed.projected,
+        businessResult: processBusinessResult(
+          executed.projected,
+          'container' in executor.output ? executor.output.container : undefined,
+        ),
+      };
+    } catch (error) {
+      logger.warn('[frozen-command:audit]', frozenCommandAuditRecord({
+        input,
+        executionId,
+        executorRevision: currentExecutorRevision,
+        status: 'failed',
+        startedAt,
+        errorCode: error instanceof CommandExecutorError || error instanceof FrozenCommandError
+          ? error.code
+          : 'execution_failed',
+      }));
+      if (error instanceof FrozenCommandError) throw error;
+      if (error instanceof CommandExecutorError) {
+        throw new FrozenCommandError(error.code, error.message, undefined, false);
+      }
+      throw error;
+    }
   }
   const pluginIds = resolveEffectivePluginIds(input.botConfig, readGlobalConfig());
   if (!pluginIds.includes(DATA_MCP_PLUGIN_ID)) {
     throw new FrozenCommandError('data_mcp_not_enabled', '当前角色未启用数据查询能力');
   }
-  const rendered = renderFrozenCommandSql({ definition: input.definition, rawArgs: input.rawArgs, now: input.now });
+  const rendered = renderFrozenCommandSql({ definition: input.definition, rawArgs: input.rawArgs, now });
   const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -965,7 +1365,7 @@ export async function executeFrozenCommand(input: {
     ...process.env,
     SESSION_DATA_DIR: input.dataDir,
     BOTMUX_SESSION_ID: undefined,
-    BOTMUX_EXECUTION_ID: randomUUID(),
+    BOTMUX_EXECUTION_ID: executionId,
   }, {
     trustedTurnIdentity: () => ({ caller: input.trustedCaller, turnId: input.turnId }),
   });
@@ -983,7 +1383,7 @@ export async function executeFrozenCommand(input: {
       name: validate,
       arguments: {
         sql: renderedSql,
-        ...(input.definition.datasource ? { datasource: input.definition.datasource } : {}),
+        ...(typeof input.definition.input.datasource === 'string' ? { datasource: input.definition.input.datasource } : {}),
         execution_mode: 'single',
       },
     }, undefined, { signal: controller.signal, maxTotalTimeout: timeoutMs }) as Record<string, unknown>;
@@ -1005,7 +1405,7 @@ export async function executeFrozenCommand(input: {
       arguments: {
         sql: renderedSql,
         query_plan_id: queryPlanId,
-        ...(input.definition.datasource ? { datasource: input.definition.datasource } : {}),
+        ...(typeof input.definition.input.datasource === 'string' ? { datasource: input.definition.input.datasource } : {}),
       },
     }, undefined, { signal: controller.signal, maxTotalTimeout: timeoutMs }) as Record<string, unknown>;
     if (runResult.isError === true) downstreamFailure('run', runResult);
@@ -1014,17 +1414,35 @@ export async function executeFrozenCommand(input: {
     const raw = frozenCommandResultText(runResult) || '查询完成，但没有可展示的结果。';
     const decorated = `${input.definition.output.prefix ?? ''}${raw}${input.definition.output.suffix ?? ''}`;
     const truncated = decorated.length > input.definition.output.maxChars;
+    logger.info('[frozen-command:audit]', frozenCommandAuditRecord({
+      input,
+      executionId,
+      executorRevision: currentExecutorRevision,
+      status: 'completed',
+      startedAt,
+      truncated,
+    }));
     return {
       renderedSql,
       referenceDate: rendered.referenceDate,
       text: truncateFrozenOutput(decorated, input.definition.output.maxChars),
       truncated,
+      executorId: BUILTIN_DATA_MCP_EXECUTOR_ID,
+      executorRevision: currentExecutorRevision,
       ...(queryId ? { queryId } : {}),
       ...(businessResult
         ? { businessResult: { rows: businessResult.rows, totalRows: businessResult.totalRows } }
         : {}),
     };
   } catch (error) {
+    logger.warn('[frozen-command:audit]', frozenCommandAuditRecord({
+      input,
+      executionId,
+      executorRevision: currentExecutorRevision,
+      status: 'failed',
+      startedAt,
+      errorCode: error instanceof FrozenCommandError ? error.code : 'data_mcp_unavailable',
+    }));
     if (error instanceof FrozenCommandError) throw error;
     if (controller.signal.aborted) {
       throw new FrozenCommandError('execution_timeout', '固化查询超时', undefined, true);
@@ -1054,7 +1472,7 @@ export function shouldFallbackFrozenCommand(
 
 export function userFacingFrozenCommandError(error: unknown): string {
   if (!(error instanceof FrozenCommandError)) return '数据服务调用失败，请稍后重试。';
-  if (/^(?:parameter_|definition_|untrusted_caller$|data_mcp_not_enabled$|execution_timeout$|query_plan_ambiguous$)/.test(error.code)) {
+  if (/^(?:parameter_|definition_|executor_|context_value_missing$|untrusted_caller$|data_mcp_not_enabled$|execution_timeout$|query_plan_ambiguous$)/.test(error.code)) {
     return error.message;
   }
   return '数据服务未完成查询，请稍后重试或联系维护方。';

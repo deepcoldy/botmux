@@ -4152,6 +4152,28 @@ export async function executeScheduledTask(
           turnId: scheduledTurnId,
           dataDir: config.session.dataDir,
           now: invocationNow,
+          workingDir: task.workingDir,
+          context: {
+            caller: {
+              open_id: scheduledTrustedCaller?.requestUserOpenId,
+              union_id: scheduledTrustedCaller?.requestUserUnionId,
+            },
+            chat: { id: task.chatId, type: task.chatType },
+            message: { id: scheduledTurnId },
+          },
+          expectedExecutorRevision: lifecycle.kind === 'active'
+            ? lifecycle.record.executorRevision
+            : undefined,
+          audit: {
+            source: 'schedule',
+            taskId: task.id,
+            ...(lifecycle.kind === 'active' && lifecycle.record.specHash
+              ? { specHash: lifecycle.record.specHash }
+              : {}),
+            ...(lifecycle.kind === 'active'
+              ? { stateRevisionId: lifecycle.record.stateRevisionId }
+              : {}),
+          },
         });
         const output = resolveFrozenCommandScheduledOutput(definition, result);
         if (output.kind === 'deliver') {

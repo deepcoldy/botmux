@@ -13,6 +13,7 @@ export interface FrozenCommandCenterRow {
   command: string;
   usage?: string;
   description?: string;
+  executor?: string;
   datasource?: string;
   state: 'active' | 'retired' | 'revoked' | 'invalid' | 'unapproved';
   reason?: string;
@@ -42,7 +43,7 @@ export function buildFrozenCommandCenterCard(input: {
       content: [
         `当前机器人：**${escapeMd(input.botLabel)}**`,
         `工作目录：**${escapeMd(input.workingDirLabel)}**`,
-        '只展示命令元数据，不展示 SQL。',
+        '只展示命令元数据，不展示 SQL 或敏感输入。',
       ].join('\n'),
     },
   }, { tag: 'hr' }];
@@ -70,7 +71,8 @@ export function buildFrozenCommandCenterCard(input: {
             `**/${escapeMd(row.command)}** · ${status}`,
             row.description ? escapeMd(row.description) : undefined,
             row.usage ? `用法：${escapeMd(row.usage)}` : undefined,
-            `数据源：${escapeMd(row.datasource ?? '默认数据源')}`,
+            row.executor ? `执行器：${escapeMd(row.executor)}` : undefined,
+            row.datasource ? `数据源：${escapeMd(row.datasource)}` : undefined,
             row.reason ? `说明：${escapeMd(row.reason)}` : undefined,
           ].filter(Boolean).join('\n'),
         },
@@ -81,7 +83,7 @@ export function buildFrozenCommandCenterCard(input: {
     tag: 'div',
     text: {
       tag: 'lark_md',
-      content: '需要执行时直接说“运行 /命令 参数”。系统会先展示确认卡，不会直接查数。',
+      content: '需要执行时直接说“运行 /命令 参数”。系统会先展示操作确认卡，不会直接执行。',
     },
   });
   return card({
@@ -110,10 +112,13 @@ export function buildFrozenCommandPreviewCard(input: {
           content: [
             `命令：**/${escapeMd(input.action.command)}**`,
             `参数：\n${args}`,
-            `数据源：**${escapeMd(input.action.datasource ?? '默认数据源')}**`,
+            `执行器：**${escapeMd(input.action.executorId)}**`,
+            ...(input.action.datasource ? [`数据源：**${escapeMd(input.action.datasource)}**`] : []),
             `发起人：${escapeMd(input.initiatorLabel)}`,
             '',
-            '确认后将以你的真实账号权限执行一次查询；SQL 不会在卡片中展示。',
+            input.action.executorId === 'builtin.data-mcp.readonly'
+              ? '确认后将以你的真实账号权限执行一次查询；SQL 不会在卡片中展示。'
+              : '确认后将运行一次已批准的只读白名单能力。确认卡是本次操作确认，不是额外授权；身份与权限仍由执行路径校验。',
           ].join('\n'),
         },
       }, {
@@ -172,7 +177,7 @@ export function buildFrozenCommandActionStatusCard(
         : {
             title: '执行失败',
             template: 'red',
-            text: `/${action.command} 查询未完成，请重新发起；如持续失败请联系管理员。`,
+            text: `/${action.command} 执行未完成，请重新发起；如持续失败请联系管理员。`,
           };
   return {
     schema: '2.0',
