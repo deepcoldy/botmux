@@ -98,3 +98,58 @@ const s: ObserveSession = await fetchObserveSession(sessionId, { larkAppId });
 - 未新增 `session list --json`：既有 `botmux session list --json` 只列 headless automation session（`src/cli/session-command.ts` 中的定义），不覆盖普通 SessionRow；沿用它的 JSON 会让语义更混乱，所以另开 `observe` 子命令。
 - 未把 `composeDashboardSessionRows` 或 IPC 路由改成"公共契约"：那两者仍是 daemon-internal（含 dashboard-only 字段、鉴权 host-only），公开只能通过 façade 转译。
 - 未实现 park/close 主动接口：明确列入"后续 Botmux 补充"，本任务只观察不控制。
+
+## 交付路径变更纪要（2026-09-22）
+### Captain 决定：放弃 no-mistakes，直接 rebase master
+- 背景：no-mistakes pipeline 上一轮 push 后 PR `#1499` 的 GitHub `bun-test` 一直失败，根因是 `test/worker-kimi-effort.integration.test.ts` 依赖 vitest-only `expect.poll`，在 bun 腿下 `expect.poll is not a function`。同一问题已在 master `#1510`（commit `773ff53b`）用 runner-agnostic 15s deadline loop + AST 守卫（`test/bun-runner-selectors.test.ts`）修好；分支只是没吸收。
+- Captain 明确指令：停止 no-mistakes，改在同一 task/worktree/PR 上把分支 rebase 到最新 `origin/master`；不合并 PR，不裸 force-push，只允许精确 `--force-with-lease=<branch>:<old-remote-sha>`；任何 custody 未释放、远端漂移、lease 不匹配或冲突不明立即停下。
+- 保留的原任务范围（未变）：本次交付仍是 observe seam v1 契约，本节仅记录交付路径重整；未新增/修改产品接口，未夹带无关改动。
+
+### 执行过程与证据
+1. **释放 pipeline custody**
+   - `no-mistakes axi abort --run 01M33KT67C8HYAAMEAQ4BRPDP1` → `aborted=true, run_status=cancelled`；随后 `01M31N3MA9P3XSVKM6735ZA5B1` 自启为 watch，再次 abort → `cancelled`。
+   - `no-mistakes axi status` 复核：`run.status=cancelled`、无 `active_steps`、无 `awaiting_agent`；outcome=cancelled。
+2. **fetch + 记录 SHA + 建可恢复锚点（仅本地 refs，未动分支/未 push）**
+   - `git fetch origin master` + `git fetch fork fm/botmux-worker-runtime-observe`。
+   - fetch 后 SHA（`ls-remote` 复核一致）：
+     - local HEAD = `25fc3ccc1e511f9fd91814b3efcf453980596060`
+     - fork PR head = `5fdf116f91149dc83fd502aac900798b01aad6c0`（lease 基线）
+     - origin/master = `6ab79c78020f1eda362592dd0c558c2b0b8773fc`（含 `#1510` = `773ff53b`）
+   - 恢复锚点（`git update-ref`）：
+     - `refs/heads/recovery/botmux-worker-runtime-observe-local-25fc3ccc-prerebase` → `25fc3ccc…`
+     - `refs/heads/recovery/botmux-worker-runtime-observe-fork-5fdf116f-prerebase` → `5fdf116f…`
+     - `refs/heads/recovery/botmux-worker-runtime-observe-origin-master-6ab79c78-prerebase` → `6ab79c78…`
+     - 保留既有 `refs/heads/recovery/botmux-worker-runtime-observe-dcfe08f6` → `dcfe08f6…`
+3. **对齐 authoritative + rebase master**
+   - `git reset --hard 5fdf116f…`（把本地分支精确对齐 PR authoritative head，含 pipeline 已推 fix commits）。
+   - `git rebase 6ab79c78…`（14/14 commits replay 成功，**无冲突**）。
+   - rebase 后 HEAD = `fd043325d6158fc634cb65457b4175553d73b7ab`；`git status --porcelain` 空。
+   - `git diff --shortstat 5fdf116f…fd043325` = `4 files changed, 224 insertions(+), 10 deletions(-)`，差异全部来自 rebase 吸收进来的 master 提交：
+     - `src/services/bridge-fallback-gate.ts` + `test/bridge-fallback-gate.test.ts`（master 侧新增）
+     - `test/bun-runner-selectors.test.ts`（`#1510` 引入的 AST 守卫）
+     - `test/worker-kimi-effort.integration.test.ts`（`#1510` 把 vitest-only `expect.poll` 改为 runner-agnostic 15s deadline loop）
+   - observe 相关文件未在 rebase 中被触动；未恢复被 `#1494` 取代的 statusline 提交。
+4. **本地验证（vitest + bun test）**
+   - `bun run build` 通过（tsc 主 build / scripts / test-mocks / dashboard 全部 OK；`public-api/session-observe*.js` 与其 `.map` 产物在位；`[build-audit]`、`[audit-embed]` 无告警）。
+   - `bun run test -- --run` 目标集：`session-observe.test.ts` (16) / `session-observe-fetch.test.ts` (15) / `observe-command.test.ts` (7) / `observe-command.integration.test.ts` (1) / `zellij-observe-backend.test.ts` (15) / `observed-bots-store.test.ts` (16) / `bridge-fallback-gate.test.ts` (90) / `bun-runner-selectors.test.ts` (40) / `npm-binary-distribution.test.ts` (37) → **9 files / 237 tests passed，用时 12.66s**。含消费者 runtime import + 独立 type-resolution 用例 `"the packed public observe subpaths load and type-check for consumers"` 与完整 dist 排除守卫 `"the PUBLISHED tarball ships no runnable Node form"`。
+   - 原 CI 失败路径复现：`bun test test/worker-kimi-effort.integration.test.ts` → 1 pass / 0 fail（1.85s），`expect.poll` 不再报错；`bun test test/bun-runner-selectors.test.ts` → 40 pass / 0 fail（3.98s）。
+5. **精确 force-with-lease 推送 + 复核**
+   - push 前 `git ls-remote fork` 再次核验 remote head = `5fdf116f…`（lease 基线未漂移）。
+   - `git push fork fm/botmux-worker-runtime-observe --force-with-lease=fm/botmux-worker-runtime-observe:5fdf116f91149dc83fd502aac900798b01aad6c0`
+   - 推送输出：`+ 5fdf116f...fd043325 fm/botmux-worker-runtime-observe -> fm/botmux-worker-runtime-observe (forced update)`。
+   - `git ls-remote fork` 复核 = `fd043325…`；`gh pr view 1499` `headRefOid` = `fd043325…`。
+6. **PR #1499 GitHub CI 终态（run `35696121680`）**
+   - 状态：`status=completed`、`conclusion=success`。
+   - 9 check 全部 SUCCESS：`build`、`test (1/3)`、`test (2/3)`、`test (3/3)`、`bun-test`（原失败项，现绿）、`bun-binary`、`bun-binary-musl`、`bun-binary-darwin`、`test`（require-every-shard）。
+   - PR 元数据：`state=OPEN`，`isDraft=false`（rebase 完成后 GitHub 侧因新 push 触发 status 更新为 Ready），`mergeable=MERGEABLE`，`mergeStateStatus=BLOCKED`（`reviewDecision=REVIEW_REQUIRED`，等待人工 review），未合并、未 tag。
+
+### 最终快照
+- PR: <https://github.com/deepcoldy/botmux/pull/1499>
+- authoritative head: `fd043325d6158fc634cb65457b4175553d73b7ab`（fork/PR 一致）
+- base: `deepcoldy/botmux:master @ 6ab79c78020f1eda362592dd0c558c2b0b8773fc`（含 `#1510` `773ff53b`）
+- CI run: <https://github.com/deepcoldy/botmux/actions/runs/35696121680> — 全 SUCCESS
+- 未运行 no-mistakes、未合并 PR、未裸 force-push、未夹带无关改动。
+
+### 已识别但不修的旁路（后续可提独立 PR，不属本任务范围）
+- 维护者旧评论中的 `refusing to mark PR ready: intent skipped` seam 缺陷：no-mistakes 在 `--only push,pr` 场景下会把已 Ready 的 PR 降为 Draft，再因 `intent skipped` 拒绝提升，且无跨 run same-head evidence reuse seam。这次是通过 rebase + 精确 force-with-lease 绕开该 seam，最终 PR 恢复为 Ready 由 GitHub 侧根据新 head 与 review 需求驱动。
+- 若后续需要 CLI/TS 消费者观测更细的 `phase` / `queue count` / `parkReason`，仍需 Botmux 侧新增 durable 事实源；本 seam 已保留 schema 扩展空间。
