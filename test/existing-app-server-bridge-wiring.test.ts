@@ -38,6 +38,9 @@ describe('existing Codex App Server bridge wiring', () => {
       'const adoptMode = terminalAdoptMode\n'
       + '      || (sharedAppServerBridge && turn.isLocal === true);',
     );
-    expect(emit).toContain('const markers = terminalAdoptMode ? [] : readSendMarkers();');
+    expect(emit).toContain('const allMarkers = terminalAdoptMode ? [] : readSendMarkers();');
+    expect(emit).toContain(
+      'const markers = sendMarkersForTurn(allMarkers, turn.turnId, turn.dispatchAttempt);',
+    );
   });
 });

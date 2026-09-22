@@ -1,3 +1,5 @@
+import type { Session } from '../../types.js';
+
 export const STREAMING_CARD_BUTTON_IDS = [
   'output',
   'terminal',
@@ -32,8 +34,18 @@ export function normalizeHiddenStreamingCardButtons(value: unknown): StreamingCa
 
 export function resolveHiddenStreamingCardButtons(
   config: { hiddenStreamingCardButtons?: unknown },
+  session?: Pick<Session, 'oneShot'>,
 ): StreamingCardButtonId[] {
-  return normalizeHiddenStreamingCardButtons(config.hiddenStreamingCardButtons) ?? [];
+  const configured = normalizeHiddenStreamingCardButtons(config.hiddenStreamingCardButtons) ?? [];
+  if (session?.oneShot?.mode !== 'ordinary_per_message') return configured;
+
+  // An ordinary one-shot retires itself only after terminal output and visible
+  // delivery have settled. A card close callback would race that authoritative
+  // lifecycle, so force the existing v2 button policy to omit it on every card
+  // render while preserving all other per-bot choices.
+  const hidden = new Set<StreamingCardButtonId>(configured);
+  hidden.add('close');
+  return STREAMING_CARD_BUTTON_IDS.filter(id => hidden.has(id));
 }
 
 /** `/botconfig set hiddenStreamingCardButtons output,terminal,...` parser. */

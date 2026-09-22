@@ -171,6 +171,30 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
     expect(mocks.sendMessage).not.toHaveBeenCalled();
   });
 
+  it('honors a frozen quote target before interpreting a synthetic one-shot anchor', async () => {
+    const ds = seedSharedSession({ rootMessageId: 'om_topic_b', turnId: 'turn-b', updatedAt: NOW });
+    activeSessions.delete(sessionKey(CHAT, APP));
+    ds.session.oneShot = {
+      version: 1,
+      mode: 'ordinary_per_message',
+      routingAnchor: 'ordinary-one-shot-v1:route:' + 'a'.repeat(64),
+      visibleLaneKey: 'ordinary-one-shot-v1:visible-lane:' + 'b'.repeat(64),
+      visibleRoute: { chatId: CHAT, scope: 'chat', rootMessageId: 'om_original' },
+      createdAt: NOW,
+      turn: { turnId: 'turn-a' },
+    };
+    activeSessions.set(activeSessionKey(ds), ds);
+
+    await sessionReply(ds.session.oneShot.routingAnchor, 'quoted', 'text', APP, 'turn-a', {
+      replyTarget: { mode: 'quote', rootMessageId: 'om_exact_quote' },
+    });
+
+    expect(mocks.replyMessage).toHaveBeenCalledWith(
+      APP, 'om_exact_quote', 'quoted', 'text', false, undefined, expect.anything(),
+    );
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
   it('plain chat session (no fold-back anchor) keeps replying flat to the chat top-level', async () => {
     seedSharedSession(undefined);
     await sessionReply(CHAT, 'hello', 'text', APP);

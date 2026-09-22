@@ -187,6 +187,34 @@ describe('Codex App clean prompt sidecar', () => {
     expect(followUp.codexAppInput?.additionalContext?.botmux_role.value).toContain('只能把 docs/incident-summary.md 当排查参考');
   });
 
+  it('suppresses persisted role and summary context when explicitly requested', () => {
+    registerBot({
+      larkAppId: 'isolated-one-shot-prompt',
+      larkAppSecret: 's',
+      cliId: 'codex-app',
+      summaryMemory: true,
+      summaryMemoryPath: 'docs/private-summary.md',
+    });
+
+    const built = buildNewTopicCliInput(
+      'only this event',
+      'sid-isolated-one-shot',
+      'codex-app',
+      undefined, undefined, undefined, undefined, undefined, undefined, 'zh', undefined,
+      {
+        larkAppId: 'isolated-one-shot-prompt',
+        chatId: 'chat-isolated-one-shot',
+        suppressPersistedContext: true,
+      },
+    );
+
+    expect(built.content).toContain('only this event');
+    expect(built.content).not.toContain('<summary_memory>');
+    expect(built.content).not.toContain('docs/private-summary.md');
+    expect(built.content).not.toContain('<application_role>');
+    expect(built.codexAppInput?.additionalContext?.botmux_role).toBeUndefined();
+  });
+
   it('allows an absolute summary memory path in the prompt contract', () => {
     registerBot({
       larkAppId: 'summary-memory-absolute-path',

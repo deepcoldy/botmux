@@ -237,6 +237,9 @@ export interface CliAdapter {
     /** TraeCode only: process-scoped PreToolUse command for native spawn_agent.
      *  The worker supplies this for every managed model-owning Trae process. */
     nativeSubagentRuntimeHookCommand?: string;
+    /** TraeCode only: disable cross-session memory read/write for this process
+     *  without mutating user global config. Other adapters ignore it. */
+    disableCrossSessionMemories?: boolean;
     /** This bot's own `env` from bots.json (already sanitized by the worker).
      *  The same vars always reach the CLI as process env (pane injectEnv), but
      *  for CLIs whose SETTINGS-file `env` map is applied ON TOP of inherited

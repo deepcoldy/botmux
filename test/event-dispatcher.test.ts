@@ -11,7 +11,7 @@
  * Run:  pnpm vitest run test/event-dispatcher.test.ts
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { createHmac } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import * as Lark from '@larksuiteoapi/node-sdk';
 
 // ─── Mock external modules ──────────────────────────────────────────────────
@@ -160,7 +160,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
-import { __pollMessageListenersOnceForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, maybeApplyForceTopicOverride, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { __pollMessageListenersOnceForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, maybeApplyForceTopicOverride, mentionsAnotherMember, markForwardFollowupsSessionsReady, ordinaryOneShotRoutingAnchor, ordinaryOneShotVisibleLaneKey, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 import {
   VC_BOT_MEETING_ACTIVITY_EVENT,
   VC_BOT_MEETING_ENDED_EVENT,
@@ -176,7 +176,7 @@ import { __resetPeerCrossRefCacheForTest } from '../src/services/peer-cross-ref-
 import { CLONE_EXCLUDED_KEYS, cloneBotConfig, cloneOwnerEntries } from '../src/setup/bot-config-editor.js';
 import { normalizeManagedOwnerEntries } from '../src/setup/owner-identity.js';
 import { createPluginCardActionGateway } from '../src/core/plugins/card-actions/gateway.js';
-import { spawnTsScript } from './helpers/ts-runner.js';
+import { spawnSyncTsEval, spawnTsScript } from './helpers/ts-runner.js';
 import { resolve } from 'node:path';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -818,6 +818,7 @@ async function flushEventWork() {
 }
 
 function setupBotState(opts?: {
+  cliId?: string;
   botOpenId?: string | undefined;
   chatGrants?: Record<string, string[]>;
   globalGrants?: string[];
@@ -840,11 +841,12 @@ function setupBotState(opts?: {
 	  commandTriggers?: { enabled: boolean; commands: Array<{ cmd: string; prompt?: string }>; chats?: string[]; excludedChats?: string[] };
 	  chatReplyModes?: Record<string, 'chat' | 'new-topic' | 'shared' | 'chat-topic'>;
 	  chatMentionModes?: Record<string, 'always' | 'topic' | 'never' | 'ambient'>;
-	  p2pMode?: 'thread' | 'chat';
+	  p2pMode?: 'thread' | 'chat' | 'group';
 	  summaryRange?: { limit?: number; sinceHours?: number };
 	  summaryMemory?: boolean;
 	  summaryMemoryPath?: string;
 	  cardActionAckTimeoutMs?: number;
+  ordinarySessionMode?: 'per_message';
 	  substituteMode?: {
 	    enabled: boolean;
 	    targets: Array<{ openId?: string; userId?: string; unionId?: string; name?: string }>;
@@ -859,7 +861,7 @@ function setupBotState(opts?: {
     config: {
       larkAppId: MY_APP_ID,
       larkAppSecret: 'secret',
-      cliId: 'claude-code',
+      cliId: opts?.cliId ?? 'claude-code',
       // 生产里 config.allowedUsers 是原始配置（启动后 resolvedAllowedUsers 才是解析结果）。
       // 默认镜像, 单测可用 configAllowedUsers 单独构造「配了但解析为空」的 fail-closed 场景。
       allowedUsers: opts?.configAllowedUsers ?? opts?.allowedUsers,
@@ -883,6 +885,7 @@ function setupBotState(opts?: {
 	      summaryMemory: opts?.summaryMemory,
 	      summaryMemoryPath: opts?.summaryMemoryPath,
 	      cardActionAckTimeoutMs: opts?.cardActionAckTimeoutMs,
+	      ordinarySessionMode: opts?.ordinarySessionMode,
 	      substituteMode: opts?.substituteMode,
 	    },
     botOpenId: opts && 'botOpenId' in opts ? opts.botOpenId : MY_OPEN_ID,
@@ -898,6 +901,7 @@ function setupBotState(opts?: {
 	function makeHandlers(): EventHandlers & {
   handleNewTopic: ReturnType<typeof vi.fn>;
   handleThreadReply: ReturnType<typeof vi.fn>;
+  handleOrdinaryOneShot: ReturnType<typeof vi.fn>;
   handleCardAction: ReturnType<typeof vi.fn>;
   isSessionOwner: ReturnType<typeof vi.fn>;
   onChatModeConverted: ReturnType<typeof vi.fn>;
@@ -910,6 +914,7 @@ function setupBotState(opts?: {
     handleCardAction: vi.fn(async () => undefined),
     handleNewTopic: vi.fn(async () => {}),
     handleThreadReply: vi.fn(async () => {}),
+    handleOrdinaryOneShot: vi.fn(async () => {}),
     validateTopicHeader: vi.fn(() => true),
     handleVcMeetingPush: vi.fn(async () => {}),
     isSessionOwner: vi.fn(() => false),
@@ -997,6 +1002,399 @@ function makeUserMessageEvent(opts: {
     },
   };
 }
+
+describe('im.message.receive_v1 — ordinary per-message sessions', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  function ordinaryEvent(opts: {
+    messageId: string;
+    content?: string;
+    messageType?: string;
+    rootId?: string;
+    threadId?: string | null;
+    chatId?: string;
+    chatType?: string;
+    mentions?: TestMention[];
+  }) {
+    return makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: opts.content ?? JSON.stringify({ text: '@BotA investigate this' }),
+      messageId: opts.messageId,
+      rootId: opts.rootId,
+      threadId: opts.threadId,
+      chatId: opts.chatId ?? 'chat-ordinary-one-shot',
+      chatType: opts.chatType ?? 'group',
+      messageType: opts.messageType,
+      mentions: opts.mentions ?? [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+  }
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('topic');
+    setupBotState({
+      cliId: 'traex',
+      ordinarySessionMode: 'per_message',
+      allowedUsers: [USER_OPEN_ID],
+    });
+    handlers = makeHandlers();
+    handlers.isSessionOwner.mockReturnValue(false);
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it('builds domain-separated, collision-safe printable identities that are spawn-safe', () => {
+    const first = ordinaryOneShotRoutingAnchor('synthetic-app-a', 'synthetic-message-a');
+    const repeated = ordinaryOneShotRoutingAnchor('synthetic-app-a', 'synthetic-message-a');
+    const nextMessage = ordinaryOneShotRoutingAnchor('synthetic-app-a', 'synthetic-message-b');
+    const nextApp = ordinaryOneShotRoutingAnchor('synthetic-app-b', 'synthetic-message-a');
+    const ambiguousLeft = ordinaryOneShotRoutingAnchor('synthetic:app-a', 'synthetic-message-a');
+    const ambiguousRight = ordinaryOneShotRoutingAnchor('synthetic', 'app-a:synthetic-message-a');
+    const lane = ordinaryOneShotVisibleLaneKey(
+      'synthetic-app-a', 'synthetic-chat-a', 'thread', 'synthetic-destination-a',
+    );
+    const repeatedLane = ordinaryOneShotVisibleLaneKey(
+      'synthetic-app-a', 'synthetic-chat-a', 'thread', 'synthetic-destination-a',
+    );
+    const changedLanes = [
+      ordinaryOneShotVisibleLaneKey(
+        'synthetic-app-b', 'synthetic-chat-a', 'thread', 'synthetic-destination-a',
+      ),
+      ordinaryOneShotVisibleLaneKey(
+        'synthetic-app-a', 'synthetic-chat-b', 'thread', 'synthetic-destination-a',
+      ),
+      ordinaryOneShotVisibleLaneKey(
+        'synthetic-app-a', 'synthetic-chat-a', 'chat', 'synthetic-destination-a',
+      ),
+      ordinaryOneShotVisibleLaneKey(
+        'synthetic-app-a', 'synthetic-chat-a', 'thread', 'synthetic-destination-b',
+      ),
+    ];
+
+    expect(first).toBe(repeated);
+    expect(new Set([first, nextMessage, nextApp]).size).toBe(3);
+    expect(ambiguousLeft).not.toBe(ambiguousRight);
+    expect(first).toBe(`ordinary-one-shot-v1:route:${createHash('sha256')
+      .update(JSON.stringify(['route', 'synthetic-app-a', 'synthetic-message-a']), 'utf8')
+      .digest('hex')}`);
+    expect(first).toMatch(/^ordinary-one-shot-v1:route:[0-9a-f]{64}$/);
+    expect(first).not.toMatch(/[\u0000-\u001f\u007f]/);
+    expect(first).not.toContain('synthetic-app-a');
+    expect(first).not.toContain('synthetic-message-a');
+    expect(lane).toBe(repeatedLane);
+    expect(new Set([lane, ...changedLanes]).size).toBe(5);
+    expect(lane).toBe(`ordinary-one-shot-v1:visible-lane:${createHash('sha256')
+      .update(JSON.stringify([
+        'visible-lane',
+        'synthetic-app-a',
+        'synthetic-chat-a',
+        'thread',
+        'synthetic-destination-a',
+      ]), 'utf8')
+      .digest('hex')}`);
+    expect(lane).toMatch(/^ordinary-one-shot-v1:visible-lane:[0-9a-f]{64}$/);
+    expect(lane).not.toMatch(/[\u0000-\u001f\u007f]/);
+    for (const sourceId of [
+      'synthetic-app-a',
+      'synthetic-chat-a',
+      'synthetic-destination-a',
+    ]) {
+      expect(lane).not.toContain(sourceId);
+    }
+    expect(lane).not.toBe(first);
+
+    const spawned = spawnSyncTsEval(
+      'process.stdout.write(process.env.BOTMUX_ROUTING_ANCHOR ?? "")',
+      {
+        env: { BOTMUX_ROUTING_ANCHOR: first },
+        encoding: 'utf8',
+      },
+    );
+    expect(spawned.error).toBeUndefined();
+    expect(spawned.status).toBe(0);
+    expect(String(spawned.stdout)).toBe(first);
+  });
+
+  it('gives same-thread replies distinct execution anchors and one shared visible lane', async () => {
+    const first = ordinaryEvent({
+      messageId: 'msg-one-shot-a',
+      rootId: 'root-one-shot-thread',
+      threadId: 'root-one-shot-thread',
+    });
+    const second = ordinaryEvent({
+      messageId: 'msg-one-shot-b',
+      rootId: 'root-one-shot-thread',
+      threadId: 'root-one-shot-thread',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](first);
+    await capturedHandlers['im.message.receive_v1'](second);
+    await flushEventWork();
+
+    expect(handlers.handleOrdinaryOneShot).toHaveBeenCalledTimes(2);
+    const firstCtx = handlers.handleOrdinaryOneShot.mock.calls[0]![1] as any;
+    const secondCtx = handlers.handleOrdinaryOneShot.mock.calls[1]![1] as any;
+    expect(firstCtx.anchor).toBe('root-one-shot-thread');
+    expect(secondCtx.anchor).toBe('root-one-shot-thread');
+    expect(firstCtx.ordinaryOneShot).toEqual({
+      physicalMessageId: 'msg-one-shot-a',
+      routingAnchor: ordinaryOneShotRoutingAnchor(MY_APP_ID, 'msg-one-shot-a'),
+      visibleLaneKey: ordinaryOneShotVisibleLaneKey(
+        MY_APP_ID, 'chat-ordinary-one-shot', 'thread', 'root-one-shot-thread',
+      ),
+      visibleRoute: {
+        chatId: 'chat-ordinary-one-shot',
+        chatType: 'group',
+        scope: 'thread',
+        rootMessageId: 'root-one-shot-thread',
+        regularGroupTopLevel: false,
+      },
+    });
+    expect(secondCtx.ordinaryOneShot.routingAnchor)
+      .toBe(ordinaryOneShotRoutingAnchor(MY_APP_ID, 'msg-one-shot-b'));
+    expect(secondCtx.ordinaryOneShot.visibleLaneKey)
+      .toBe(firstCtx.ordinaryOneShot.visibleLaneKey);
+    expect(Object.isFrozen(firstCtx.ordinaryOneShot)).toBe(true);
+    expect(Object.isFrozen(firstCtx.ordinaryOneShot.visibleRoute)).toBe(true);
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('routes a reply one-shot even when the visible thread has a canonical owner', async () => {
+    handlers.isSessionOwner.mockImplementation(anchor => anchor === 'root-owned-one-shot');
+    const event = ordinaryEvent({
+      messageId: 'msg-owned-one-shot',
+      rootId: 'root-owned-one-shot',
+      threadId: 'root-owned-one-shot',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleOrdinaryOneShot).toHaveBeenCalledWith(event, expect.objectContaining({
+      anchor: 'root-owned-one-shot',
+      ordinaryOneShot: expect.objectContaining({
+        routingAnchor: ordinaryOneShotRoutingAnchor(MY_APP_ID, 'msg-owned-one-shot'),
+      }),
+    }));
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('treats unknown slash text and merge_forward as ordinary one-shot input', async () => {
+    const unknownSlash = ordinaryEvent({
+      messageId: 'msg-unknown-slash',
+      content: JSON.stringify({ text: '@BotA /not-a-botmux-command please explain' }),
+    });
+    const mergeForward = ordinaryEvent({
+      messageId: 'msg-merge-forward-one-shot',
+      messageType: 'merge_forward',
+      content: JSON.stringify({ title: 'forwarded bundle' }),
+    });
+
+    await capturedHandlers['im.message.receive_v1'](unknownSlash);
+    await capturedHandlers['im.message.receive_v1'](mergeForward);
+    await flushEventWork();
+
+    expect(handlers.handleOrdinaryOneShot).toHaveBeenCalledWith(unknownSlash, expect.anything());
+    expect(handlers.handleOrdinaryOneShot).toHaveBeenCalledWith(mergeForward, expect.anything());
+  });
+
+  it('routes an unknown slash one-shot in p2p group mode but preserves a real birth candidate', async () => {
+    setupBotState({
+      cliId: 'traex',
+      ordinarySessionMode: 'per_message',
+      p2pMode: 'group',
+      allowedUsers: [USER_OPEN_ID],
+    });
+    const unknownSlash = ordinaryEvent({
+      messageId: 'msg-p2p-group-unknown-slash',
+      chatId: 'chat-p2p-group-one-shot',
+      chatType: 'p2p',
+      threadId: null,
+      content: JSON.stringify({ text: '/not-a-botmux-command explain this' }),
+      mentions: [],
+    });
+    const birthCandidate = ordinaryEvent({
+      messageId: 'msg-p2p-group-birth-candidate',
+      chatId: 'chat-p2p-group-one-shot',
+      chatType: 'p2p',
+      threadId: null,
+      content: JSON.stringify({ text: 'start a dedicated session group' }),
+      mentions: [],
+    });
+
+    await capturedHandlers['im.message.receive_v1'](unknownSlash);
+    await capturedHandlers['im.message.receive_v1'](birthCandidate);
+    await flushEventWork();
+
+    expect(handlers.handleOrdinaryOneShot).toHaveBeenCalledTimes(1);
+    expect(handlers.handleOrdinaryOneShot).toHaveBeenCalledWith(unknownSlash, expect.objectContaining({
+      anchor: 'msg-p2p-group-unknown-slash',
+      scope: 'thread',
+    }));
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(birthCandidate, expect.objectContaining({
+      anchor: 'msg-p2p-group-birth-candidate',
+      scope: 'thread',
+    }));
+  });
+
+  it('keeps recognized daemon, passthrough, and daemon-rewritten slash commands on the legacy path', async () => {
+    const daemonCommand = ordinaryEvent({
+      messageId: 'msg-daemon-command',
+      content: JSON.stringify({ text: '@BotA /status' }),
+    });
+    const passthroughCommand = ordinaryEvent({
+      messageId: 'msg-passthrough-command',
+      content: JSON.stringify({ text: '@BotA /model' }),
+    });
+    const workflowCommand = ordinaryEvent({
+      messageId: 'msg-workflow-command',
+      content: JSON.stringify({ text: '@BotA /workflow new inspect the rollout' }),
+    });
+    const retiredTemplateCommand = ordinaryEvent({
+      messageId: 'msg-template-command',
+      content: JSON.stringify({ text: '@BotA /template run old' }),
+    });
+
+    await capturedHandlers['im.message.receive_v1'](daemonCommand);
+    await capturedHandlers['im.message.receive_v1'](passthroughCommand);
+    await capturedHandlers['im.message.receive_v1'](workflowCommand);
+    await capturedHandlers['im.message.receive_v1'](retiredTemplateCommand);
+    await flushEventWork();
+
+    expect(handlers.handleOrdinaryOneShot).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(daemonCommand, expect.anything());
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(passthroughCommand, expect.anything());
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(workflowCommand, expect.anything());
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(retiredTemplateCommand, expect.anything());
+  });
+
+  it('preserves legacy routing when ordinarySessionMode is absent', async () => {
+    setupBotState({ cliId: 'traex', allowedUsers: [USER_OPEN_ID] });
+    const event = ordinaryEvent({
+      messageId: 'msg-legacy-default',
+      rootId: 'root-legacy-default',
+      threadId: 'root-legacy-default',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleOrdinaryOneShot).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      anchor: 'root-legacy-default',
+      scope: 'thread',
+    }));
+    expect(handlers.handleNewTopic.mock.calls[0]![1]).not.toHaveProperty('ordinaryOneShot');
+  });
+
+  it('fails closed when per-message mode is enabled without its callback', async () => {
+    const noOneShotHandlers = makeHandlers();
+    delete (noOneShotHandlers as Partial<EventHandlers>).handleOrdinaryOneShot;
+    capturedHandlers = {};
+    startLarkEventDispatcher(MY_APP_ID, 'secret', noOneShotHandlers);
+    const event = ordinaryEvent({ messageId: 'msg-missing-one-shot-handler' });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(noOneShotHandlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(noOneShotHandlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(logger.error).toHaveBeenCalledWith(expect.stringContaining(
+      'per_message enabled but no handler is registered',
+    ));
+  });
+
+  it('revalidates after beforeSessionTurn and keeps an anchor override on the legacy path', async () => {
+    handlers.beforeSessionTurn = vi.fn(async () => ({ anchorOverride: 'vc-receiver-session' }));
+    handlers.isSessionOwner.mockImplementation(anchor => anchor === 'vc-receiver-session');
+    const event = ordinaryEvent({
+      messageId: 'msg-before-turn-reroute',
+      rootId: 'root-before-turn-reroute',
+      threadId: 'root-before-turn-reroute',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(handlers.handleOrdinaryOneShot).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      anchor: 'vc-receiver-session',
+    }));
+  });
+
+  it('keeps listener, substitute, and auto-start special paths out of one-shot routing', async () => {
+    setupBotState({
+      cliId: 'traex',
+      ordinarySessionMode: 'per_message',
+      allowedUsers: [USER_OPEN_ID],
+      messageListeners: {
+        'chat-one-shot-listener': {
+          enabled: true,
+          prompt: 'listener prompt',
+          senderPolicy: {
+            mode: 'include_only',
+            includeSenderOpenIds: [USER_OPEN_ID],
+            includeSenderTypes: ['user'],
+          },
+          messagePolicy: { includeMsgTypes: ['text'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+      },
+      substituteMode: {
+        enabled: true,
+        targets: [{ userId: 'u_one_shot_substitute', name: 'Sub Person' }],
+      },
+    });
+    const listener = ordinaryEvent({
+      messageId: 'msg-one-shot-listener',
+      chatId: 'chat-one-shot-listener',
+      mentions: [],
+      content: JSON.stringify({ text: 'listener input' }),
+    });
+    const substitute = ordinaryEvent({
+      messageId: 'msg-one-shot-substitute',
+      chatId: 'chat-one-shot-substitute',
+      mentions: [{ key: '@_sub', name: 'Sub Person', id: { user_id: 'u_one_shot_substitute' } }],
+      content: JSON.stringify({ text: '@Sub Person take this' }),
+    });
+
+    await capturedHandlers['im.message.receive_v1'](listener);
+    await capturedHandlers['im.message.receive_v1'](substitute);
+    await flushEventWork();
+
+    expect(handlers.handleOrdinaryOneShot).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(listener, expect.objectContaining({
+      messageListener: expect.any(Object),
+    }));
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(substitute, expect.objectContaining({
+      substituteTrigger: expect.any(Object),
+    }));
+
+    setupBotState({
+      cliId: 'traex',
+      ordinarySessionMode: 'per_message',
+      allowedUsers: ['ou_someone_else'],
+      autoStartOnNewTopic: true,
+    });
+    const autoStart = ordinaryEvent({
+      messageId: 'msg-one-shot-auto-start',
+      chatId: 'chat-one-shot-auto-start',
+      mentions: [],
+      content: JSON.stringify({ text: 'topic auto-start input' }),
+    });
+    await capturedHandlers['im.message.receive_v1'](autoStart);
+    await flushEventWork();
+
+    expect(handlers.handleOrdinaryOneShot).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(autoStart, expect.objectContaining({
+      anchor: 'msg-one-shot-auto-start',
+    }));
+  });
+});
 
 function makeHistoryMessage(opts: {
   senderOpenId?: string;

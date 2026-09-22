@@ -788,6 +788,14 @@ export interface WorkerSessionReplyOptions {
   meetingTopicKey?: VcMeetingListenerTopicKey;
 }
 
+type OneShotRetirementDeliveryEvidence =
+  | {
+      kind: 'delivery';
+      source: 'automatic_final' | 'explicit_final' | 'terminal_notice' | 'nothing_to_send';
+      messageId?: string;
+    }
+  | { kind: 'delivery_uncertain'; reason: string };
+
 export interface WorkerPoolCallbacks {
   sessionReply: (
     rootId: string,
@@ -822,6 +830,30 @@ export interface WorkerPoolCallbacks {
     ds: DaemonSession,
     terminal: Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
     context: { workerGeneration: number },
+  ) => void | Promise<void>;
+  /** Durably arm an ordinary per-message lifetime after its worker generation
+   * has been reserved, but before any child process can start. Synchronous by
+   * design: a persistence failure must abort the fork. */
+  onOneShotRetirementArm?: (
+    ds: DaemonSession,
+    context: {
+      sessionId: string;
+      workerGeneration: number;
+      turnId: string;
+      dispatchAttempt?: number;
+    },
+  ) => void;
+  /** Report only definitive visible-delivery outcomes for the exact one-shot
+   * tuple. Transient attempts never cross this seam. */
+  onOneShotRetirementDelivery?: (
+    ds: DaemonSession,
+    context: {
+      sessionId: string;
+      workerGeneration: number;
+      turnId: string;
+      dispatchAttempt?: number;
+      evidence: OneShotRetirementDeliveryEvidence;
+    },
   ) => void | Promise<void>;
   /** Worker-authoritative deterministic rejection handoff. Returning true
    * means the daemon durably took ownership, so the original delivery record
@@ -1119,7 +1151,7 @@ function scheduleLocalCliOpenReadinessPatch(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     idleCardLabel(ds),
     dshRuntimeForSession(ds),
-    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1175,7 +1207,7 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     idleCardLabel(ds),
     dshRuntimeForSession(ds),
-    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1302,7 +1334,7 @@ function scheduleCodexServiceTierPatch(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     idleCardLabel(ds),
     dshRuntimeForSession(ds),
-    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1383,7 +1415,7 @@ export function refreshStreamingCardUsage(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     idleCardLabel(ds),
     dshRuntimeForSession(ds),
-    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -1468,7 +1500,7 @@ export function scheduleRiffAccessUrlPatch(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     idleCardLabel(ds),
     dshRuntimeForSession(ds),
-    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -2534,7 +2566,7 @@ function scheduleUsageLimitCardPatch(ds: DaemonSession): void {
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     idleCardLabel(ds),
     dshRuntimeForSession(ds),
-    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
   );
   scheduleCardPatch(ds, cardJson);
 }
@@ -3621,7 +3653,7 @@ function reconcilePostedStartingCard(ds: DaemonSession, turnId: string | undefin
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     idleCardLabel(ds),
     dshRuntimeForSession(ds),
-    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
   );
   scheduleCardPatch(ds, cardJson, turnId);
 }
@@ -3713,7 +3745,7 @@ async function postTurnStartingStatusCard(
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     idleCardLabel(ds),
     dshRuntimeForSession(ds),
-    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
   );
 
   ds.streamCardNonce = nonce;
@@ -3854,7 +3886,7 @@ export async function postFreshStreamingCard(
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     idleCardLabel(ds),
     dshRuntimeForSession(ds),
-    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
   );
   ds.streamCardId = CARD_POSTING_SENTINEL;
   const ownsPost = (): boolean =>
@@ -6924,10 +6956,6 @@ function clearAllDocCommentTurnState(ds: DaemonSession | undefined, stored: Sess
   if (stored && stored !== ds?.session) stored.docCommentTargets = undefined;
 }
 
-function sessionAnchorForStoredRow(session: Session): string {
-  return session.scope === 'chat' ? session.chatId : session.rootMessageId;
-}
-
 function isLegacyApiDocSubscription(managedBy: 'subscribe-lark-doc' | 'watch-comment' | undefined): boolean {
   return managedBy === undefined || managedBy === 'subscribe-lark-doc';
 }
@@ -7013,7 +7041,7 @@ export function buildStreamingCardJson(ds: DaemonSession, status?: StreamStatus)
     codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
     idleCardLabel(ds),
     dshRuntimeForSession(ds),
-    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+    resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
   );
 }
 
@@ -7448,7 +7476,7 @@ export async function closeSession(
       }
     }
 
-    const anchor = ds ? sessionAnchorId(ds) : stored ? sessionAnchorForStoredRow(stored) : undefined;
+    const anchor = ds ? sessionAnchorId(ds) : stored ? storedSessionAnchorId(stored) : undefined;
     let subs: ReturnType<typeof listDocSubscriptionsForSession> = [];
     try {
       if (anchor) {
@@ -8028,6 +8056,36 @@ function ordinaryImDeliveryKey(ds: DaemonSession, turnId: string, workerGenerati
   return `${ds.session.sessionId}:${workerGeneration}:${turnId}`;
 }
 
+/** Route daemon-owned delivery diagnostics through the same immutable target
+ * as the originating turn. A one-shot's synthetic anchor is process identity,
+ * never a provider message id. */
+function ordinaryImDeliveryReplyOptions(record: OrdinaryImDelivery): WorkerSessionReplyOptions | undefined {
+  const oneShot = record.ds.session.oneShot;
+  if (oneShot?.mode !== 'ordinary_per_message' || oneShot.turn.turnId !== record.turnId) {
+    return undefined;
+  }
+  const frozen = record.ds.session.turnReplyContexts?.[record.turnId];
+  if (!frozen) return undefined;
+  return { replyTarget: frozen.target };
+}
+
+/** Keep the legacy five-argument call shape, but require an exact frozen
+ * target before a one-shot diagnostic may leave the daemon. */
+function sendOrdinaryImDeliveryNotice(record: OrdinaryImDelivery, content: string): Promise<string> {
+  const replyOptions = ordinaryImDeliveryReplyOptions(record);
+  if (record.ds.session.oneShot?.mode === 'ordinary_per_message') {
+    if (!replyOptions) {
+      return Promise.reject(new Error('ordinary per-message delivery notice has no exact frozen target'));
+    }
+    return requireCallbacks().sessionReply(
+      sessionAnchorId(record.ds), content, 'text', record.ds.larkAppId, record.turnId, replyOptions,
+    );
+  }
+  return requireCallbacks().sessionReply(
+    sessionAnchorId(record.ds), content, 'text', record.ds.larkAppId, record.turnId,
+  );
+}
+
 function clearOrdinaryImDelivery(record: OrdinaryImDelivery): void {
   if (record.timer) clearTimeout(record.timer);
   record.timer = undefined;
@@ -8071,12 +8129,8 @@ function failOrdinaryImDelivery(
   // supersedes the pre-Plan-B `vcMeetingReceiver` blanket check.)
   if (isMeetingDrivenTurn(record.ds, record.turnId) || isSilentScheduledTurn(record.ds, record.turnId)) return;
   const loc = botLocale(getBot(record.ds.larkAppId).config);
-  void requireCallbacks().sessionReply(
-    sessionAnchorId(record.ds),
-    tr(messageKey, { turnId: record.turnId.substring(0, 16) }, loc),
-    'text',
-    record.ds.larkAppId,
-    record.turnId,
+  void sendOrdinaryImDeliveryNotice(
+    record, tr(messageKey, { turnId: record.turnId.substring(0, 16) }, loc),
   ).catch(err => logger.error(
     `[${tag(record.ds)}] Failed to report ordinary IM worker delivery failure: `
     + `${err instanceof Error ? err.message : String(err)}`,
@@ -8107,20 +8161,29 @@ function delayOrdinaryImDelivery(record: OrdinaryImDelivery): void {
     ? 'worker.input_commit_delayed'
     : 'worker.input_delivery_delayed';
   if (replyCardModeFor(record.ds, record.turnId) !== 'legacy') {
+    const replyOptions = ordinaryImDeliveryReplyOptions(record);
+    if (record.ds.session.oneShot?.mode === 'ordinary_per_message' && !replyOptions) {
+      logger.error(
+        `[${tag(record.ds)}] Suppressed ordinary one-shot reply-card delivery wait `
+        + `without an exact frozen target turn=${record.turnId.substring(0, 16)}`,
+      );
+      return;
+    }
     // The turn card already represents queued/working state. A slow worker
     // receipt must not create a second message (or expose progress in final-only).
     void updateTurnReplyCard(record.ds, record.turnId, { kind: 'refresh' },
       (body, type, uuid) => requireCallbacks().sessionReply(
-        sessionAnchorId(record.ds), body, type, record.ds.larkAppId, record.turnId, { uuid },
+        sessionAnchorId(record.ds),
+        body,
+        type,
+        record.ds.larkAppId,
+        record.turnId,
+        replyOptions ? { uuid, ...replyOptions } : { uuid },
       )).catch(err => logger.warn(`[${tag(record.ds)}] reply-card delivery wait: ${err.message}`));
     return;
   }
-  void requireCallbacks().sessionReply(
-    sessionAnchorId(record.ds),
-    tr(messageKey, { turnId: record.turnId.substring(0, 16) }, loc),
-    'text',
-    record.ds.larkAppId,
-    record.turnId,
+  void sendOrdinaryImDeliveryNotice(
+    record, tr(messageKey, { turnId: record.turnId.substring(0, 16) }, loc),
   ).catch(err => logger.error(
     `[${tag(record.ds)}] Failed to report delayed ordinary IM worker delivery: `
     + `${err instanceof Error ? err.message : String(err)}`,
@@ -8776,6 +8839,9 @@ export async function transferSession(
   }
   const ds = findActiveBySessionId(sessionId);
   if (!ds || ds.session.status !== 'active') return { ok: false, error: 'session_not_active' };
+  if (ds.session.oneShot?.mode === 'ordinary_per_message') {
+    return { ok: false, error: 'one_shot_unsupported' };
+  }
   const sourceSession = ds.session;
   const sourceLifecycleIdentity = JSON.stringify({
     sessionId: sourceSession.sessionId,
@@ -9227,6 +9293,9 @@ export async function forkSession(
   }
   const ds = findActiveBySessionId(sessionId);
   if (!ds) return { ok: false, error: 'session_not_active' };
+  if (ds.session.oneShot?.mode === 'ordinary_per_message') {
+    return { ok: false, error: 'one_shot_unsupported' };
+  }
 
   // ── Capability gate: only byte-level-forkable backends (§ design doc §4) ──
   if (!isForkCapableSession(ds)) return { ok: false, error: 'fork_unsupported_backend' };
@@ -9996,6 +10065,16 @@ export function sendWorkerInput(
     trustedCaller?: TrustedCaller;
   } = {},
 ): boolean {
+  // A per-message session owns only its init turn. Reject before queue, title,
+  // reply-context, or accepted-dispatch mutation; the worker has a matching
+  // defense-in-depth guard in case an older daemon sends a second input.
+  if (ds.session.oneShot?.mode === 'ordinary_per_message') {
+    logger.warn(
+      `[${tag(ds)}] Refused follow-up input for ordinary per-message session `
+      + `(turn=${turnId ?? '-'})`,
+    );
+    return false;
+  }
   const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
   if (remoteRetirementPhase) {
     const remoteBackend = (ds.initConfig?.backendType ?? ds.session.backendType) === 'mojo'
@@ -10761,6 +10840,42 @@ export function forkWorker(
     opts.onAdmission?.(admission);
   };
   const gatedPrompt = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
+  const requestedTurnId = typeof resumeOrTurnId === 'string'
+    ? resumeOrTurnId
+    : typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+      ? resumeOrTurnId.turnId
+      : undefined;
+  const requestedDispatchAttempt = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+    ? resumeOrTurnId.dispatchAttempt
+    : undefined;
+  const requestedResume = typeof resumeOrTurnId === 'object' && resumeOrTurnId !== null
+    ? resumeOrTurnId.resume === true
+    : typeof resumeOrTurnId === 'boolean'
+      ? resumeOrTurnId
+      : false;
+  const requestedOneShot = ds.session.oneShot?.mode === 'ordinary_per_message'
+    ? ds.session.oneShot
+    : undefined;
+  // Fail before every generic reroute/defer/recovery branch. A one-shot may
+  // start only from its explicit current-turn init below; it must never be
+  // buffered into a transfer/retirement tail or reused as a live worker.
+  if (requestedOneShot
+      && ((!!ds.worker && !ds.worker.killed)
+        || requestedResume
+        || requestedTurnId !== requestedOneShot.turn.turnId
+        || requestedDispatchAttempt !== requestedOneShot.turn.dispatchAttempt
+        || ds.session.pendingForkSession === true
+        || ds.adoptedFrom !== undefined
+        || ds.session.adoptedFrom !== undefined
+        || ds.session.existingAppServerEndpoint !== undefined)) {
+    logger.warn(
+      `[${tag(ds)}] Refused invalid ordinary per-message worker request `
+      + `(turn=${requestedTurnId ?? '-'}, attempt=${requestedDispatchAttempt ?? '-'}, `
+      + `resume=${requestedResume})`,
+    );
+    reportAdmission('rejected');
+    return false;
+  }
   const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
   if (remoteRetirementPhase) {
     // A close/shutdown coordinator owns this exact remote generation. Never
@@ -10926,6 +11041,45 @@ export function forkWorker(
     resume = ds.session.queuedActivationResume;
   }
 
+  // An ordinary per-message row owns exactly one immutable turn. Validate its
+  // complete execution identity before any generation reservation, session
+  // mutation, or child-process side effect. visibleRoute is durable audit data,
+  // never authority for quote-vs-thread delivery; only the exact frozen turn
+  // context may supply that target.
+  const oneShot = ds.session.oneShot?.mode === 'ordinary_per_message'
+    ? ds.session.oneShot
+    : undefined;
+  let oneShotReplyTarget: FrozenSessionReplyTarget | undefined;
+  if (oneShot) {
+    const expectedTurnId = oneShot.turn.turnId;
+    const expectedAttempt = oneShot.turn.dispatchAttempt;
+    const frozenContext = ds.session.turnReplyContexts?.[expectedTurnId];
+    if (!expectedTurnId
+      || sessionAnchorId(ds) !== oneShot.routingAnchor
+      || initTurnId !== expectedTurnId
+      || resume
+      || ds.session.pendingForkSession === true
+      || ds.session.existingAppServerEndpoint !== undefined
+      || ds.adoptedFrom !== undefined
+      || ds.session.adoptedFrom !== undefined
+      || (!!ds.worker && !ds.worker.killed)
+      || expectedAttempt !== initDispatchAttempt
+      || !frozenContext) {
+      logger.error(
+        `[${tag(ds)}] Refused invalid ordinary per-message worker init `
+        + `(expectedTurn=${expectedTurnId || '-'}, initTurn=${initTurnId ?? '-'}, `
+        + `expectedAttempt=${expectedAttempt ?? '-'}, initAttempt=${initDispatchAttempt ?? '-'}, `
+        + `resume=${resume}, fork=${ds.session.pendingForkSession === true}, `
+        + `adopt=${ds.adoptedFrom !== undefined}, frozen=${!!frozenContext})`,
+      );
+      reportAdmission('rejected');
+      return false;
+    }
+    oneShotReplyTarget = Object.freeze({
+      ...frozenReplyContextForTurn(ds, expectedTurnId).target,
+    }) as FrozenSessionReplyTarget;
+  }
+
   // Central double-fork guard. A live worker with durable ownership must never
   // be killed and replaced: empty reforks are rejected, while a real follow-up
   // is appended through the existing worker's ordinary durable FIFO. Keep this
@@ -11005,7 +11159,9 @@ export function forkWorker(
       'text',
       ds.larkAppId,
       fallbackTurnId(ds, initTurnId),
-      ds.session.vcMeetingReceiver ? { sourceSessionId: ds.session.sessionId } : undefined,
+      ds.session.vcMeetingReceiver
+        ? { sourceSessionId: ds.session.sessionId, ...(oneShotReplyTarget ? { replyTarget: oneShotReplyTarget } : {}) }
+        : oneShotReplyTarget ? { replyTarget: oneShotReplyTarget } : undefined,
     ).catch(error => logger.error(
       `[${tag(ds)}] Failed to report blocked worker admission: `
       + `${error instanceof Error ? error.message : String(error)}`,
@@ -11051,6 +11207,11 @@ export function forkWorker(
     // Never let later cold-resume/restart policy demote it into a new local
     // Codex session.
     resume = true;
+  }
+  if (oneShot && resume) {
+    logger.error(`[${tag(ds)}] Refused ordinary per-message worker init after resume resolution`);
+    reportAdmission('rejected');
+    return false;
   }
   // A bare /repo placeholder (and a non-Codex empty group-join setup) owns no
   // model turn. Starting its CLI with an empty prompt must not mint a queued
@@ -11110,6 +11271,12 @@ export function forkWorker(
   const initReplyContext = prompt.length > 0
     ? frozenReplyContextForTurn(ds, initReplyTurnId)
     : undefined;
+  if (oneShot
+    && (initReplyTurnId !== oneShot.turn.turnId
+      || initReplyContext?.target === undefined
+      || replyTargetKey(initReplyContext.target) !== replyTargetKey(oneShotReplyTarget!))) {
+    throw new Error('ordinary per-message reply turn/target changed before worker init');
+  }
 
   // A fork() whose cwd no longer exists emits an unhandled 'error' (spawn
   // ENOENT) that crashes the WHOLE daemon (→ pm2 crash-loop). Fall back to
@@ -11173,6 +11340,28 @@ export function forkWorker(
   // a successful reservation immediately invalidates any late old-worker ACK.
   const workerGeneration = reserveWorkerGeneration(ds);
   onWorkerGenerationReserved?.(workerGeneration);
+  if (oneShot) {
+    const stampedGeneration = oneShot.turn.workerGeneration;
+    if (stampedGeneration !== undefined && stampedGeneration !== workerGeneration) {
+      throw new Error(
+        `ordinary per-message worker generation mismatch `
+        + `(expected ${stampedGeneration}, reserved ${workerGeneration})`,
+      );
+    }
+    if (cb.onOneShotRetirementArm) {
+      cb.onOneShotRetirementArm(ds, {
+        sessionId: ds.session.sessionId,
+        workerGeneration,
+        turnId: oneShot.turn.turnId,
+        ...(oneShot.turn.dispatchAttempt !== undefined
+          ? { dispatchAttempt: oneShot.turn.dispatchAttempt }
+          : {}),
+      });
+    } else if (stampedGeneration === undefined) {
+      oneShot.turn.workerGeneration = workerGeneration;
+      sessionStore.updateSession(ds.session);
+    }
+  }
 
   // Guard against double-fork: if a worker is already running, kill it first
   if (ds.worker && !ds.worker.killed) {
@@ -11204,6 +11393,7 @@ export function forkWorker(
   if (!isSharedAdoptSession(ds)) reclaimParkedCrashDiagnostic(ds);
 
   agentCfg = sessionAgentConfig(ds, botCfg);
+  const disableCrossSessionMemories = oneShot !== undefined && agentCfg.cliId === 'traex';
   if (!initTurnId && prompt.length > 0 && agentCfg.cliId === 'codex-app') {
     initAttributionTurnId = `codex-app-dispatch-${randomUUID()}`;
   }
@@ -11499,8 +11689,8 @@ export function forkWorker(
       // A meeting-driven turn (listener_thread delivery) that DOES surface must
       // still attribute to the meeting session so the send policy resolves it.
       forkErrorMeetingDriven
-        ? { sourceSessionId: ds.session.sessionId }
-        : undefined,
+        ? { sourceSessionId: ds.session.sessionId, ...(oneShotReplyTarget ? { replyTarget: oneShotReplyTarget } : {}) }
+        : oneShotReplyTarget ? { replyTarget: oneShotReplyTarget } : undefined,
     ).catch(replyErr => logger.error(`[${t}] Failed to deliver worker fork error to Lark: ${replyErr}`));
   });
 
@@ -11537,7 +11727,10 @@ export function forkWorker(
     sessionId: ds.session.sessionId,
     chatId: ds.chatId,
     chatType: ds.chatType,
-    rootMessageId: sessionAnchorId(ds),
+    routingAnchor: sessionAnchorId(ds),
+    scope: ds.scope,
+    rootMessageId: ds.session.rootMessageId,
+    ...(oneShotReplyTarget ? { replyTarget: oneShotReplyTarget } : {}),
     workingDir: cwd,
     cliId: agentCfg.cliId,
     cliRuntime: agentCfg.cliRuntime,
@@ -11654,6 +11847,7 @@ export function forkWorker(
     // the worker clears the marker + persists the child's own new id, so a
     // later refork resumes the child normally (pendingForkSession=false).
     forkSession: ds.session.pendingForkSession === true,
+    ...(disableCrossSessionMemories ? { disableCrossSessionMemories: true } : {}),
     cliSessionId: ds.session.cliSessionId,
     ownerOpenId: ds.ownerOpenId,
     webPort: ds.session.webPort,
@@ -12047,6 +12241,16 @@ function setupWorkerHandlers(
   const handlerSession = ds.session;
   const handlerAnchor = sessionAnchorId(ds);
   const handlerLarkAppId = ds.larkAppId;
+  const oneShotTurn = handlerSession.oneShot?.mode === 'ordinary_per_message'
+    ? handlerSession.oneShot.turn
+    : undefined;
+  const oneShotReplyTarget = oneShotTurn
+    && ds.initConfig?.replyTurnId === oneShotTurn.turnId
+    && ds.initConfig.turnId === oneShotTurn.turnId
+    && ds.initConfig.dispatchAttempt === oneShotTurn.dispatchAttempt
+    && ds.initConfig.replyTarget
+    ? ds.initConfig.replyTarget
+    : undefined;
   const ownsWorkerSession = (): boolean =>
     ds.worker === worker
     && ds.workerGeneration === workerGeneration
@@ -12061,6 +12265,39 @@ function setupWorkerHandlers(
     );
   const ownsLifecycleMutation = (): boolean =>
     ownsWorkerSession() && !isSessionTransferring(ds);
+  const reportOneShotDelivery = async (
+    turnId: string,
+    dispatchAttempt: number | undefined,
+    evidence: OneShotRetirementDeliveryEvidence,
+  ): Promise<void> => {
+    if (!oneShotTurn) return;
+    if (turnId !== oneShotTurn.turnId
+      || dispatchAttempt !== oneShotTurn.dispatchAttempt
+      || workerGeneration !== oneShotTurn.workerGeneration) {
+      logger.warn(
+        `[${t}] Ignored one-shot delivery evidence outside frozen turn tuple `
+        + `(turn=${turnId}, attempt=${dispatchAttempt ?? '-'}, generation=${workerGeneration})`,
+      );
+      return;
+    }
+    try {
+      await cb.onOneShotRetirementDelivery?.(ds, {
+        sessionId: ds.session.sessionId,
+        workerGeneration,
+        turnId,
+        ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+        evidence,
+      });
+    } catch (error) {
+      // The visible send has already happened at success call sites. Do not
+      // retry it merely because retirement persistence failed; leaving the row
+      // active is the fail-closed outcome and boot reconciliation can inspect it.
+      logger.error(
+        `[${t}] Failed to persist one-shot delivery evidence for ${turnId.substring(0, 8)}: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  };
   // A new worker generation is starting. As a backstop, invalidate any
   // stuck-warning card posted by the previous generation — explicit kill/suspend/
   // exit paths should already have done this, but fork/refork/takeover paths
@@ -12086,16 +12323,32 @@ function setupWorkerHandlers(
     msgType?: string,
     turnId?: string,
     opts?: Omit<WorkerSessionReplyOptions, 'sourceSessionId'>,
-  ) => cb.sessionReply(
-    sessionAnchorId(ds),
-    content,
-    msgType,
-    ds.larkAppId,
-    fallbackTurnId(ds, turnId),
-    ds.session.vcMeetingReceiver
-      ? { ...opts, sourceSessionId: ds.session.sessionId }
-      : opts,
-  );
+  ) => {
+    const effectiveTurnId = fallbackTurnId(ds, turnId);
+    if (oneShotTurn
+      && (effectiveTurnId !== oneShotTurn.turnId
+        || !oneShotReplyTarget
+        || ds.workerGeneration !== oneShotTurn.workerGeneration)) {
+      logger.warn(
+        `[${t}] Dropped ordinary per-message auxiliary output outside frozen turn tuple `
+        + `(turn=${effectiveTurnId ?? '-'}, expected=${oneShotTurn.turnId})`,
+      );
+      return Promise.reject(new Error('ordinary per-message reply route mismatch'));
+    }
+    const replyOpts = oneShotReplyTarget
+      ? { ...opts, replyTarget: oneShotReplyTarget }
+      : opts;
+    return cb.sessionReply(
+      sessionAnchorId(ds),
+      content,
+      msgType,
+      ds.larkAppId,
+      effectiveTurnId,
+      ds.session.vcMeetingReceiver
+        ? { ...replyOpts, sourceSessionId: ds.session.sessionId }
+        : replyOpts,
+    );
+  };
   const ordinaryManagedSuppression = (
     turnId?: string,
     dispatchAttempt?: number,
@@ -12619,7 +12872,7 @@ function setupWorkerHandlers(
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               idleCardLabel(ds),
               dshRuntimeForSession(ds),
-              resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+              resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
             );
             await updateMessage(ds.larkAppId, restoredCardId, streamCardJson);
             if (!ownsLifecycleMutation()) break;
@@ -12729,7 +12982,7 @@ function setupWorkerHandlers(
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             idleCardLabel(ds),
             dshRuntimeForSession(ds),
-            resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+            resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
           );
           const postedCardId = await scopedReply(
             streamCardJson, 'interactive', cardReplyTarget.turnId,
@@ -13369,7 +13622,7 @@ function setupWorkerHandlers(
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             idleCardLabel(ds),
             dshRuntimeForSession(ds),
-            resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+            resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
           );
           // Mark POST in-flight so subsequent screen_updates are dropped,
           // not POSTed as duplicate cards.
@@ -13484,7 +13737,7 @@ function setupWorkerHandlers(
             codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
             idleCardLabel(ds),
             dshRuntimeForSession(ds),
-            resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+            resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
           );
           scheduleCardPatch(ds, cardJson, msg.turnId);
           // Keep the live usage climbing during a long working phase; stop once
@@ -13561,7 +13814,7 @@ function setupWorkerHandlers(
           codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
           idleCardLabel(ds),
           dshRuntimeForSession(ds),
-          resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+          resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
         );
         scheduleCardPatch(ds, cardJson);
         break;
@@ -13992,7 +14245,7 @@ function setupWorkerHandlers(
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               idleCardLabel(ds),
               dshRuntimeForSession(ds),
-              resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+              resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -14067,7 +14320,7 @@ function setupWorkerHandlers(
               codexServiceTierBadge(effectiveCliId, ds.codexServiceTier),
               idleCardLabel(ds),
               dshRuntimeForSession(ds),
-              resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+              resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
             );
             scheduleCardPatch(ds, frozenCard);
           }
@@ -14315,6 +14568,19 @@ function setupWorkerHandlers(
             sessionId: ds.session.sessionId,
             replyMessageId: msg.messageId,
           });
+        }
+        if (msg.responseKind === 'final') {
+          // Keep the legacy continuation path synchronous. The one-shot hook
+          // may persist/close asynchronously, but non-one-shot markers must not
+          // acquire an artificial microtask boundary before their existing
+          // bookkeeping below.
+          if (oneShotTurn) {
+            await reportOneShotDelivery(msg.turnId, msg.dispatchAttempt, {
+              kind: 'delivery',
+              source: 'explicit_final',
+              messageId: msg.messageId,
+            });
+          }
         }
         const continuation = ds.session.readonlyTaskContinuation;
         if (msg.responseKind === 'final'
@@ -14569,7 +14835,7 @@ function setupWorkerHandlers(
             turnId: msg.turnId,
           });
           try {
-            await scopedReply(
+            const messageId = await scopedReply(
               buildSessionTurnFailedCard(ds, {
                 status: msg.status === 'ambiguous' ? 'ambiguous' : 'failed',
                 ...(msg.errorCode !== undefined ? { errorCode: msg.errorCode } : {}),
@@ -14578,7 +14844,16 @@ function setupWorkerHandlers(
               'interactive',
               msg.turnId,
             );
+            await reportOneShotDelivery(msg.turnId, msg.dispatchAttempt, {
+              kind: 'delivery',
+              source: 'terminal_notice',
+              messageId,
+            });
           } catch (err) {
+            await reportOneShotDelivery(msg.turnId, msg.dispatchAttempt, {
+              kind: 'delivery_uncertain',
+              reason: 'terminal_notice_delivery_failed',
+            });
             logger.error(
               `[${t}] Failed to deliver turn failure card: `
               + `${err instanceof Error ? err.message : String(err)}`,
@@ -14663,18 +14938,39 @@ function setupWorkerHandlers(
             // release on failure so a later replay can still close the loop.
             posted.add(msg.turnId);
             trimOldest(posted, SILENT_RECEIPT_DEDUPE_MAX);
-            void scopedReply(
-              tr('worker.silent_turn_receipt', undefined, localeForBot(ds.larkAppId)),
-              'text',
-              msg.turnId,
-              { uuid: silentTurnReceiptUuid(ds.session.sessionId, msg.turnId) },
-            ).catch(err => {
+            try {
+              const messageId = await scopedReply(
+                tr('worker.silent_turn_receipt', undefined, localeForBot(ds.larkAppId)),
+                'text',
+                msg.turnId,
+                { uuid: silentTurnReceiptUuid(ds.session.sessionId, msg.turnId) },
+              );
+              await reportOneShotDelivery(msg.turnId, msg.dispatchAttempt, {
+                kind: 'delivery',
+                source: 'terminal_notice',
+                messageId,
+              });
+            } catch (err) {
               // Nothing reached the thread: drop the claim AND restore the
               // (already consumed) origin record, so a dispatchAttempt replay
               // retries instead of losing the closure for good.
               posted.delete(msg.turnId);
               recordTurnExplicitMention(ds, msg.turnId, true);
+              await reportOneShotDelivery(msg.turnId, msg.dispatchAttempt, {
+                kind: 'delivery_uncertain',
+                reason: 'nothing_to_send_notice_delivery_failed',
+              });
               logger.warn(`[${t}] Failed to post silent-turn receipt for ${msg.turnId.substring(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+            }
+          } else if (!receiptSuppressed && !explicitMention) {
+            // This is an authoritative no-notice policy decision: the exact
+            // completed turn was not an explicit @ dispatch and therefore owes
+            // no visible silence receipt. Keep it separate from the terminal
+            // evidence so a required receipt can never be skipped by closing
+            // the session in the daemon callback above.
+            await reportOneShotDelivery(msg.turnId, msg.dispatchAttempt, {
+              kind: 'delivery',
+              source: 'nothing_to_send',
             });
           }
         }
@@ -14961,6 +15257,22 @@ function setupWorkerHandlers(
       }
 
       case 'final_output': {
+        const oneShotFinal = ds.session.oneShot?.mode === 'ordinary_per_message'
+          ? ds.session.oneShot.turn
+          : undefined;
+        if (oneShotFinal
+          && (msg.turnId !== oneShotFinal.turnId
+            || msg.replyTurnId !== oneShotFinal.turnId
+            || msg.dispatchAttempt !== oneShotFinal.dispatchAttempt
+            || workerGeneration !== oneShotFinal.workerGeneration
+            || !oneShotReplyTarget)) {
+          logger.warn(
+            `[${t}] Dropped ordinary per-message final_output outside frozen turn tuple `
+            + `(turn=${msg.turnId}, replyTurn=${msg.replyTurnId ?? '-'}, `
+            + `attempt=${msg.dispatchAttempt ?? '-'}, generation=${workerGeneration})`,
+          );
+          break;
+        }
         const continuation = ds.session.readonlyTaskContinuation;
         const exactReadonlyFinal = continuation
           && ['active', 'backoff'].includes(continuation.status)
@@ -15123,21 +15435,24 @@ function setupWorkerHandlers(
                 );
               }
               const alreadyDelivered = ds.lastBridgeEmittedUuid === finalOutputDedupeKey(ds, msg);
-              const owned = deliverySuppressed || !msg.content.trim() || alreadyDelivered
-                ? true
-                : await new Promise<boolean>(resolve => {
+              const delivery = deliverySuppressed || !msg.content.trim() || alreadyDelivered
+                ? { owned: true as const }
+                : await new Promise<{ owned: boolean; messageId?: string }>(resolve => {
                     deliverFinalOutput(
                       ds,
                       msg,
                       t,
                       0,
-                      resolve,
+                      (owned, messageId) => resolve({
+                        owned,
+                        ...(messageId ? { messageId } : {}),
+                      }),
                       () => ds.worker === worker
                         && ds.session.sessionId === msg.sessionId,
                       preview.settledEntry.replyTarget,
                     );
                   });
-              if (!owned) return false;
+              if (!delivery.owned) return false;
 
               // Re-read after the asynchronous external delivery. A concurrent
               // replacement may already have committed this signed sequence;
@@ -15192,6 +15507,13 @@ function setupWorkerHandlers(
                 // pop and cumulative runner ACK boundary. Only after this write
                 // may the worker acknowledge final-end to the runner.
                 sessionStore.updateSession(ds.session);
+                if (oneShotFinal && delivery.messageId) {
+                  await reportOneShotDelivery(msg.turnId, msg.dispatchAttempt, {
+                    kind: 'delivery',
+                    source: msg.turnFailed === true ? 'terminal_notice' : 'automatic_final',
+                    messageId: delivery.messageId,
+                  });
+                }
                 return true;
               } catch (err) {
                 ds.session.codexAppDispatchLedger = priorLedger;
@@ -15272,6 +15594,11 @@ function setupWorkerHandlers(
           0,
           undefined,
           ownsLifecycleMutation,
+          oneShotReplyTarget,
+          undefined,
+          oneShotFinal
+            ? outcome => reportOneShotDelivery(msg.turnId, msg.dispatchAttempt, outcome)
+            : undefined,
         );
         break;
       }
@@ -15836,6 +16163,7 @@ function deliverFinalOutput(
   isStillOwned: () => boolean = () => true,
   frozenReplyTarget?: FrozenSessionReplyTarget,
   frozenUsage?: CardUsageSnapshot,
+  onOneShotDelivery?: (evidence: OneShotRetirementDeliveryEvidence) => void | Promise<void>,
 ): void {
   if (!isStillOwned()) {
     onComplete?.(false);
@@ -16280,6 +16608,11 @@ function deliverFinalOutput(
           `[${t}] VC listener fallback replayed existing provider result `
           + `(turn ${msg.turnId.substring(0, 8)})`,
         );
+        await onOneShotDelivery?.({
+          kind: 'delivery',
+          source: msg.turnFailed === true ? 'terminal_notice' : 'automatic_final',
+          messageId: preparedListenerReply.messageId,
+        });
         onComplete?.(true, preparedListenerReply.messageId);
         return;
       }
@@ -16360,6 +16693,15 @@ function deliverFinalOutput(
           explicit ? explicit.feedback?.requesterSubjectId : feedbackRequesterSubjectId,
           getBot(ds.larkAppId).config.feedbackWebhooks?.destinations, t, explicit ? messageId : undefined);
       }
+      await onOneShotDelivery?.({
+        kind: 'delivery',
+        source: msg.turnFailed === true
+          ? 'terminal_notice'
+          : explicit
+            ? 'explicit_final'
+            : 'automatic_final',
+        messageId,
+      });
       onComplete?.(true, messageId);
     } catch (err: any) {
       if (!isStillOwned()) { onComplete?.(false); return; }
@@ -16396,11 +16738,17 @@ function deliverFinalOutput(
         }
         // Don't commit the dedup marker — leave room for any future
         // retransmit (e.g. daemon restart that re-fires the IPC).
+        await onOneShotDelivery?.({
+          kind: 'delivery_uncertain',
+          reason: 'automatic_final_retry_exhausted',
+        });
         onComplete?.(false);
         return;
       }
       logger.warn(`[${t}] Bridge final_output attempt ${next} failed (${err.message}); retrying in ${FINAL_OUTPUT_RETRY_BACKOFF_MS[next]}ms`);
-      deliverFinalOutput(ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage);
+      deliverFinalOutput(
+        ds, msg, t, next, onComplete, isStillOwned, frozenReplyTarget, cardUsage, onOneShotDelivery,
+      );
     }
   }, FINAL_OUTPUT_RETRY_BACKOFF_MS[attempt] ?? 0);
 }
@@ -16497,6 +16845,10 @@ export function forkAdoptWorker(
   },
 ): 'accepted' | 'rejected' {
   if (ds.session.cliInstanceBinding) throw new Error('External adoption cannot carry a Codex instance binding');
+  if (ds.session.oneShot?.mode === 'ordinary_per_message') {
+    logger.warn(`[${tag(ds)}] Adopt worker fork refused for ordinary per-message session`);
+    return 'rejected';
+  }
   if (isSessionTransferring(ds)) {
     logger.warn(`[${tag(ds)}] Adopt worker fork refused during routing transfer`);
     return 'rejected';
@@ -16584,7 +16936,7 @@ export function forkAdoptWorker(
   });
   const startupState: WorkerStartupState = { ready: false, failureNotified: false };
   const adoptedCliId = adopted.cliId ?? 'claude-code';
-  let initMsg!: DaemonToWorker;
+  let initMsg!: Extract<DaemonToWorker, { type: 'init' }>;
 
   try {
   // A fork-level failure emits 'error'; without a handler it crashes the daemon.
@@ -16687,7 +17039,9 @@ export function forkAdoptWorker(
     sessionId: ds.session.sessionId,
     chatId: ds.chatId,
     chatType: ds.chatType,
-    rootMessageId: sessionAnchorId(ds),
+    routingAnchor: sessionAnchorId(ds),
+    scope: ds.scope,
+    rootMessageId: ds.session.rootMessageId,
     workingDir: adopted.cwd,
     cliId: adoptedCliId,
     cliRuntime: agentCfg.cliRuntime,

@@ -12,10 +12,67 @@ describe('TRAE worker structured-bridge wiring', () => {
     expect(envSetup).toContain('engineEnv.BOTMUX_SESSION_ID = cfg.sessionId;');
     expect(envSetup).toContain('engineEnv.BOTMUX_CHAT_ID = cfg.chatId;');
     expect(envSetup).toContain('engineEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;');
-    expect(envSetup).toContain('engineEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;');
-    expect(envSetup).toContain("engineEnv.BOTMUX_SESSION_SCOPE = cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat';");
+    expect(envSetup).toContain('applyInitRoutingEnv(engineEnv, cfg);');
     expect(envSetup).toContain('applySessionOwnerEnv(engineEnv, cfg.ownerOpenId);');
     expect(envSetup).not.toContain('BOTMUX_LARK_APP_SECRET');
+  });
+
+  it('threads one-shot memory disabling into both TraeX direct and RPC app-server launch config', () => {
+    const rpcStart = workerSource.indexOf('engine = new CodexRpcEngine({');
+    const rpcEnd = workerSource.indexOf('readonlyContinuationHardened:', rpcStart);
+    const rpcConfig = workerSource.slice(rpcStart, rpcEnd);
+    expect(rpcConfig).toContain('TRAEX_DISABLE_CROSS_SESSION_MEMORY_CONFIG');
+    expect(rpcConfig).toContain('cfg.disableCrossSessionMemories');
+    expect(rpcConfig).toContain('traexNativeSubagentHookConfig(nativeSubagentRuntimeHookCommand())');
+
+    const buildArgsStart = workerSource.indexOf('const args = cliAdapter.buildArgs({');
+    const buildArgsEnd = workerSource.indexOf('});', buildArgsStart);
+    const buildArgs = workerSource.slice(buildArgsStart, buildArgsEnd);
+    expect(buildArgs).toContain('disableCrossSessionMemories: cfg.disableCrossSessionMemories === true');
+  });
+
+  it('prefers the daemon-provided route tuple while retaining legacy init fallbacks', () => {
+    const start = workerSource.indexOf('function applyInitRoutingEnv');
+    const end = workerSource.indexOf('\n}', start);
+    const helper = workerSource.slice(start, end);
+
+    expect(helper).toContain('if (cfg.routingAnchor) env.BOTMUX_ROUTING_ANCHOR = cfg.routingAnchor;');
+    expect(helper).toContain('env.BOTMUX_SESSION_SCOPE = cfg.scope');
+    expect(helper).toContain("cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat'");
+    expect(helper).toContain('if (cfg.rootMessageId) env.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;');
+  });
+
+  it('uses only the exact one-shot turn tuple for send suppression and explicit-reply evidence', () => {
+    const filterStart = workerSource.indexOf('function sendMarkersForTurn');
+    const filterEnd = workerSource.indexOf('function explicitReplyMarkerForTurnWindow', filterStart);
+    const filter = workerSource.slice(filterStart, filterEnd);
+    const markerStart = workerSource.indexOf('function explicitReplyMarkerForTurnWindow');
+    const markerEnd = workerSource.indexOf('function notifyExplicitReplyObserved', markerStart);
+    const marker = workerSource.slice(markerStart, markerEnd);
+
+    expect(filter).toContain('if (!lastInitConfig?.replyTarget) return markers;');
+    expect(filter).toContain('marker.turnId === turnId && marker.dispatchAttempt === dispatchAttempt');
+    expect(marker).toContain('marker.turnId === turnId && marker.dispatchAttempt === dispatchAttempt');
+  });
+
+  it('fails closed on every one-shot worker restart, reuse, and transfer route', () => {
+    expect(workerSource).toContain(
+      "if (lastInitConfig?.replyTarget) return 'ordinary per-message worker cannot be restarted';",
+    );
+    const internalRestartStart = workerSource.indexOf('async function restartCliProcess(');
+    const internalRestartEnd = workerSource.indexOf('\n}', internalRestartStart);
+    expect(workerSource.slice(internalRestartStart, internalRestartEnd))
+      .toContain('ordinary per-message worker cannot restart: \${reason}');
+
+    const messageStart = workerSource.indexOf("case 'message': {");
+    const restartStart = workerSource.indexOf("case 'restart': {", messageStart);
+    const transferStart = workerSource.indexOf("case 'detach_for_transfer':", restartStart);
+    expect(workerSource.slice(messageStart, restartStart))
+      .toContain('ordinary_per_message_worker_is_not_reusable');
+    expect(workerSource.slice(restartStart, transferStart))
+      .toContain('Refused restart for ordinary per-message worker');
+    expect(workerSource.slice(transferStart, transferStart + 500))
+      .toContain('Refused transfer detach for ordinary per-message worker');
   });
 
   it('dispatches TRAE rollouts to the dedicated task_complete reader', () => {

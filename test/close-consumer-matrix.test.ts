@@ -167,6 +167,12 @@ const CONSUMERS: Record<string, Rule> = {
     why: 'Document-comment admission rollback has no direct user surface; the '
       + 'background wrapper logs refused cleanup and any remote residual.',
   },
+  'daemon.ts::handleOrdinaryOneShot::closeSessionForBackgroundCleanup': {
+    category: 'background',
+    why: 'Pre-admission one-shot rollback inspects the typed result and re-reserves '
+      + 'the visible lane on refusal or residual; thrown cleanup is logged and also '
+      + 'retains a reservation.',
+  },
   'daemon.ts::failCloseIdempotentTurnIfConvergenceWriteFailed::runIdempotencyFailClose': {
     category: 'background',
     why: 'Typed consumer: refusal never claims fail-closed, residual uses the '

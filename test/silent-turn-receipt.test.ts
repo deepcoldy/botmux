@@ -123,6 +123,46 @@ function makeDs(): DaemonSession {
   return ds;
 }
 
+function makeOneShotDs(turnId: string, dispatchAttempt?: number): DaemonSession {
+  const ds = makeDs();
+  ds.scope = 'thread';
+  ds.session.scope = 'thread';
+  ds.session.oneShot = {
+    version: 1,
+    mode: 'ordinary_per_message',
+    routingAnchor: `one-shot:${turnId}`,
+    visibleLaneKey: 'lane:oc_chat:om_root',
+    visibleRoute: {
+      chatId: 'oc_chat',
+      chatType: 'group',
+      scope: 'thread',
+      rootMessageId: 'om_root',
+    },
+    createdAt: new Date().toISOString(),
+    turn: { turnId, dispatchAttempt, workerGeneration: 1 },
+  };
+  ds.initConfig = {
+    type: 'init',
+    sessionId: ds.session.sessionId,
+    chatId: ds.chatId,
+    chatType: ds.chatType,
+    routingAnchor: ds.session.oneShot.routingAnchor,
+    scope: 'thread',
+    rootMessageId: 'om_root',
+    replyTarget: { mode: 'thread', rootMessageId: 'om_root' },
+    workingDir: '/tmp',
+    cliId: 'codex',
+    backendType: 'pty',
+    prompt: 'test',
+    larkAppId: ds.larkAppId,
+    larkAppSecret: 'secret',
+    turnId,
+    replyTurnId: turnId,
+    ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+  };
+  return ds;
+}
+
 function terminalMsg(
   turnId: string,
   extra: Partial<Extract<WorkerToDaemon, { type: 'turn_terminal' }>> = {},
@@ -173,6 +213,113 @@ describe('deliberate-silence closure (turn_terminal nothing_to_send)', () => {
     expect(firstOpts?.uuid?.length).toBeLessThanOrEqual(50);
     // The per-turn mention record is consumed.
     expect(ds.turnExplicitMentions?.has('om_turn_at')).toBe(false);
+  });
+
+  it('one-shot waits for the required visible receipt before reporting delivery', async () => {
+    const turnId = 'om_one_shot_silent';
+    const ds = makeOneShotDs(turnId, 1);
+    const order: string[] = [];
+    let releaseReceipt!: (messageId: string) => void;
+    const receipt = new Promise<string>(resolve => { releaseReceipt = resolve; });
+    const sessionReply = vi.fn(async () => {
+      order.push('receipt:start');
+      const messageId = await receipt;
+      order.push('receipt:committed');
+      return messageId;
+    });
+    const onTurnTerminal = vi.fn(async () => { order.push('terminal'); });
+    const onOneShotRetirementDelivery = vi.fn(async (_session, context) => {
+      order.push(`delivery:${context.evidence.kind === 'delivery' ? context.evidence.source : 'uncertain'}`);
+    });
+    initWorkerPool({
+      sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1,
+      closeSession: vi.fn(), onTurnTerminal, onOneShotRetirementDelivery,
+    });
+    recordTurnExplicitMention(ds, turnId, true);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg(turnId, {
+      outputDisposition: 'nothing_to_send', dispatchAttempt: 1,
+    }));
+
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
+    expect(onTurnTerminal).toHaveBeenCalledTimes(1);
+    expect(onOneShotRetirementDelivery).not.toHaveBeenCalled();
+    expect(order).toEqual(['terminal', 'receipt:start']);
+
+    releaseReceipt('om_silence_receipt');
+    await vi.waitFor(() => expect(onOneShotRetirementDelivery).toHaveBeenCalledTimes(1));
+    expect(onOneShotRetirementDelivery).toHaveBeenCalledWith(ds, {
+      sessionId: ds.session.sessionId, workerGeneration: 1, turnId, dispatchAttempt: 1,
+      evidence: { kind: 'delivery', source: 'terminal_notice', messageId: 'om_silence_receipt' },
+    });
+    expect(order).toEqual([
+      'terminal', 'receipt:start', 'receipt:committed', 'delivery:terminal_notice',
+    ]);
+  });
+
+  it('one-shot reports uncertainty when the required receipt fails', async () => {
+    const turnId = 'om_one_shot_silent_failed';
+    const ds = makeOneShotDs(turnId);
+    const onOneShotRetirementDelivery = vi.fn(async () => {});
+    initWorkerPool({
+      sessionReply: vi.fn(async () => { throw new Error('commit unknown'); }),
+      getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1,
+      closeSession: vi.fn(), onTurnTerminal: vi.fn(async () => {}),
+      onOneShotRetirementDelivery,
+    });
+    recordTurnExplicitMention(ds, turnId, true);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg(turnId, {
+      outputDisposition: 'nothing_to_send',
+    }));
+
+    await vi.waitFor(() => expect(onOneShotRetirementDelivery).toHaveBeenCalledWith(ds, {
+      sessionId: ds.session.sessionId, workerGeneration: 1, turnId,
+      evidence: {
+        kind: 'delivery_uncertain', reason: 'nothing_to_send_notice_delivery_failed',
+      },
+    }));
+  });
+
+  it('one-shot records authoritative no-notice policy but not suppressed silence', async () => {
+    const noNoticeTurn = 'om_one_shot_no_notice';
+    const noNotice = makeOneShotDs(noNoticeTurn);
+    const noNoticeDelivery = vi.fn(async () => {});
+    initWorkerPool({
+      sessionReply: sessionReplyMock, getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1, closeSession: vi.fn(), onTurnTerminal: vi.fn(async () => {}),
+      onOneShotRetirementDelivery: noNoticeDelivery,
+    });
+    __testOnly_setupWorkerHandlers(noNotice, noNotice.worker as any);
+    (noNotice.worker as any).emit('message', terminalMsg(noNoticeTurn, {
+      outputDisposition: 'nothing_to_send',
+    }));
+    await vi.waitFor(() => expect(noNoticeDelivery).toHaveBeenCalledWith(noNotice, {
+      sessionId: noNotice.session.sessionId, workerGeneration: 1, turnId: noNoticeTurn,
+      evidence: { kind: 'delivery', source: 'nothing_to_send' },
+    }));
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+
+    const suppressedTurn = 'om_one_shot_suppressed';
+    const suppressed = makeOneShotDs(suppressedTurn, 1);
+    suppressed.suppressedFinalOutputTurns = new Map([[suppressedTurn, 1]]);
+    const suppressedDelivery = vi.fn(async () => {});
+    initWorkerPool({
+      sessionReply: sessionReplyMock, getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1, closeSession: vi.fn(), onTurnTerminal: vi.fn(async () => {}),
+      onOneShotRetirementDelivery: suppressedDelivery,
+    });
+    recordTurnExplicitMention(suppressed, suppressedTurn, true);
+    __testOnly_setupWorkerHandlers(suppressed, suppressed.worker as any);
+    (suppressed.worker as any).emit('message', terminalMsg(suppressedTurn, {
+      outputDisposition: 'nothing_to_send', dispatchAttempt: 1,
+    }));
+    await new Promise(resolve => setTimeout(resolve, 20));
+
+    expect(suppressedDelivery).not.toHaveBeenCalled();
+    expect(sessionReplyMock).not.toHaveBeenCalled();
   });
 
   it('silent turn WITHOUT explicit @: marks the card flag but posts no receipt', async () => {

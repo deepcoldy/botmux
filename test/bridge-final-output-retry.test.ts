@@ -197,6 +197,55 @@ function makeDs(): DaemonSession {
   };
 }
 
+function makeOneShotCodexAppDs(turnId = 'turn-one-shot'): DaemonSession {
+  const ds = makeDs();
+  ds.adoptedFrom = undefined;
+  ds.scope = 'thread';
+  ds.session.scope = 'thread';
+  ds.session.cliId = 'codex-app';
+  ds.session.oneShot = {
+    version: 1,
+    mode: 'ordinary_per_message',
+    routingAnchor: `one-shot:${turnId}`,
+    visibleLaneKey: 'lane:oc_chat:om_root',
+    visibleRoute: {
+      chatId: ds.chatId,
+      chatType: ds.chatType,
+      scope: 'thread',
+      rootMessageId: ds.session.rootMessageId,
+    },
+    createdAt: new Date().toISOString(),
+    turn: { turnId, workerGeneration: 1 },
+  };
+  ds.initConfig = {
+    type: 'init',
+    sessionId: ds.session.sessionId,
+    chatId: ds.chatId,
+    chatType: ds.chatType,
+    routingAnchor: ds.session.oneShot.routingAnchor,
+    scope: 'thread',
+    rootMessageId: ds.session.rootMessageId,
+    replyTarget: { mode: 'thread', rootMessageId: ds.session.rootMessageId },
+    workingDir: '/tmp',
+    cliId: 'codex-app',
+    backendType: 'pty',
+    prompt: 'test',
+    larkAppId: ds.larkAppId,
+    larkAppSecret: 'secret',
+    turnId,
+    replyTurnId: turnId,
+  };
+  ds.session.codexAppDispatchLedger = [{
+    dispatchId: 'dispatch-one-shot',
+    turnId,
+    state: 'prepared',
+    content: 'question',
+    deliverySink: 'lark',
+    replyTarget: { mode: 'thread', rootMessageId: ds.session.rootMessageId },
+  }];
+  return ds;
+}
+
 function makeHermesDs(): DaemonSession {
   const ds = makeDs();
   ds.session.cliId = 'hermes';
@@ -928,6 +977,87 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       'ca_dispatch-2',
     ]);
     expect(sessionReply.mock.calls[0][5]).not.toHaveProperty('suppressHook');
+  });
+
+  it('reports a Codex App one-shot final only after its FIFO commit is durable', async () => {
+    const order: string[] = [];
+    const sessionReply = vi.fn(async () => {
+      order.push('delivery');
+      return 'om_one_shot_answer';
+    });
+    const onOneShotRetirementDelivery = vi.fn(async () => { order.push('evidence'); });
+    initWorkerPool({
+      sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1,
+      closeSession: vi.fn(), onOneShotRetirementDelivery,
+    });
+    const ds = makeOneShotCodexAppDs();
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    updateSessionMock.mockClear();
+    updateSessionMock.mockImplementationOnce(() => {
+      expect(ds.session.codexAppDispatchLedger).toEqual([]);
+      order.push('commit');
+    });
+
+    (ds.worker as any).emit('message', {
+      type: 'final_output',
+      sessionId: ds.session.sessionId,
+      content: 'one-shot answer',
+      lastUuid: 'one-shot-uuid',
+      turnId: 'turn-one-shot',
+      replyTurnId: 'turn-one-shot',
+      codexAppSettlement: {
+        requestId: 'settle-one-shot', generation: 'generation-one-shot',
+        seq: 1, dispatchId: 'dispatch-one-shot',
+      },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.waitFor(() => expect(onOneShotRetirementDelivery).toHaveBeenCalledTimes(1));
+    expect(order).toEqual(['delivery', 'commit', 'evidence']);
+    expect(onOneShotRetirementDelivery).toHaveBeenCalledWith(ds, {
+      sessionId: ds.session.sessionId,
+      workerGeneration: 1,
+      turnId: 'turn-one-shot',
+      evidence: {
+        kind: 'delivery', source: 'automatic_final', messageId: 'om_one_shot_answer',
+      },
+    });
+  });
+
+  it('does not report a Codex App one-shot final when its FIFO commit fails', async () => {
+    const sessionReply = vi.fn(async () => 'om_one_shot_answer');
+    const onOneShotRetirementDelivery = vi.fn(async () => {});
+    initWorkerPool({
+      sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1,
+      closeSession: vi.fn(), onOneShotRetirementDelivery,
+    });
+    const ds = makeOneShotCodexAppDs();
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    updateSessionMock.mockClear();
+    updateSessionMock.mockImplementationOnce(() => { throw new Error('disk unavailable'); });
+
+    (ds.worker as any).emit('message', {
+      type: 'final_output',
+      sessionId: ds.session.sessionId,
+      content: 'one-shot answer',
+      lastUuid: 'one-shot-uuid',
+      turnId: 'turn-one-shot',
+      replyTurnId: 'turn-one-shot',
+      codexAppSettlement: {
+        requestId: 'settle-one-shot-failed', generation: 'generation-one-shot',
+        seq: 1, dispatchId: 'dispatch-one-shot',
+      },
+    } satisfies Extract<WorkerToDaemon, { type: 'final_output' }>);
+
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.waitFor(() => expect((ds.worker as any).send).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'codex_app_dispatch_persisted', requestId: 'settle-one-shot-failed', ok: false,
+      }),
+    ));
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(onOneShotRetirementDelivery).not.toHaveBeenCalled();
+    expect(ds.session.codexAppDispatchLedger?.[0]?.dispatchId).toBe('dispatch-one-shot');
   });
 
   it('routes sequential Codex App settlements through each ledger-frozen shared-chat root', async () => {

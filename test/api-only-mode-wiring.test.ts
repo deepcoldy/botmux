@@ -853,7 +853,7 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(entrySource).not.toContain('if (!process.env.BOTMUX_WORKER_HTTP_HOST');
   });
 
-  it('stamps the turn sender type onto the trusted caller at both IM entry points', () => {
+  it('stamps the turn sender type onto the trusted caller at every IM entry point', () => {
     // A bot's turn carries a perfectly valid union_id (its own), so a consumer
     // cannot tell "a person asked" from "a bot triggered itself" unless the host
     // says which it was. Both inbound paths must therefore pass it — a missed
@@ -866,7 +866,7 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // bot as `'user'`, i.e. it vouches for a bot turn as a person.
     const trustedCallerArgs = [...daemonSource.matchAll(/trustedCallerForTurn\(([^;]*?)\);/g)]
       .map(m => m[1].split(',').map(part => part.trim()));
-    expect(trustedCallerArgs.length).toBe(2);
+    expect(trustedCallerArgs.length).toBe(3);
     for (const args of trustedCallerArgs) {
       expect(args.length).toBeGreaterThanOrEqual(4);
       const senderTypeArg = args.slice(3).join(', ');

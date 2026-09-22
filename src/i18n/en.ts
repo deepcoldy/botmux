@@ -1038,6 +1038,7 @@ export const messages: Record<string, string> = {
   'card.action.resume_anchor_occupied': '⚠️ This topic already has a newer session{detail}; cannot resume the older one.',
   'card.action.resume_anchor_holder': ' (holder: {short})',
   'card.action.resume_adopt_unsupported': '⚠️ Adopted sessions cannot be resumed.',
+  'card.action.resume_one_shot_unsupported': '⚠️ Per-message sessions cannot be resumed. Send a complete new instruction to start a fresh session.',
   'card.action.resume_deferred_unmaterialized': '⚠️ This silent scheduled run never created a topic. Its hidden session is audit-only and cannot be resumed.',
   'card.action.resume_cancelled': '⚠️ The session was closed while resume was committing; resume was cancelled.',
   'card.action.disconnected': '⏏ Disconnected. The original CLI is untouched.',

@@ -1396,6 +1396,11 @@ export interface BotConfig {
   larkAppId: string;
   larkAppSecret: string;
   /**
+   * Give each accepted ordinary message its own internal session. Missing
+   * preserves the established conversation-scoped session reuse behavior.
+   */
+  ordinarySessionMode?: 'per_message';
+  /**
    * Core-only / headless 模式：该 bot 纯 HTTP 控制 API 驱动（trigger →
    * spawn → CLI → trigger-result），**不连接任何飞书**——boot 时跳过
    * open_id 探测、required-scope 校验、WSClient 事件订阅，也不投递飞书消息
@@ -3815,6 +3820,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 'group' are meaningful and persist; 'chat' (and anything else)
       // normalizes to undefined so bots.json stays clean.
       p2pMode: entry.p2pMode === 'thread' ? 'thread' : entry.p2pMode === 'group' ? 'group' : undefined,
+      // Exact opt-in only: typos, alternate casing, booleans, and every other
+      // value stay off so a malformed config cannot change session lifetime.
+      ordinarySessionMode: entry.ordinarySessionMode === 'per_message' ? 'per_message' : undefined,
       sessionGroup: entry.sessionGroup && typeof entry.sessionGroup === 'object'
         ? entry.sessionGroup as SessionGroupConfig
         : undefined,

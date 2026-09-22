@@ -311,6 +311,21 @@ describe('bot-registry grant additions', () => {
     expect(cfgs[3].p2pMode).toBeUndefined();
   });
 
+  it('parses ordinarySessionMode only as the exact per_message opt-in', () => {
+    const cfgs = parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'os1', larkAppSecret: 's', ordinarySessionMode: 'per_message' },
+      { larkAppId: 'os2', larkAppSecret: 's' },
+      { larkAppId: 'os3', larkAppSecret: 's', ordinarySessionMode: 'thread' },
+      { larkAppId: 'os4', larkAppSecret: 's', ordinarySessionMode: 'PER_MESSAGE' },
+      { larkAppId: 'os5', larkAppSecret: 's', ordinarySessionMode: true },
+      { larkAppId: 'os6', larkAppSecret: 's', ordinarySessionMode: null },
+    ]));
+
+    expect(cfgs.map(config => config.ordinarySessionMode)).toEqual([
+      'per_message', undefined, undefined, undefined, undefined, undefined,
+    ]);
+  });
+
   it('parses summaryRange and preserves explicit unlimited settings', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([
       { larkAppId: 'sr1', larkAppSecret: 's', summaryRange: { limit: 0, sinceHours: 0 } },

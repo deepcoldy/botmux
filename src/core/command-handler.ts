@@ -3962,6 +3962,8 @@ export async function handleCommand(
               await sessionReply(rootId, t('card.action.resume_anchor_occupied', { detail }, loc));
             } else if (result.error === 'adopt_unsupported') {
               await sessionReply(rootId, t('card.action.resume_adopt_unsupported', undefined, loc));
+            } else if (result.error === 'one_shot_unsupported') {
+              await sessionReply(rootId, t('card.action.resume_one_shot_unsupported', undefined, loc));
             } else if (result.error === 'deferred_unmaterialized') {
               await sessionReply(rootId, t('card.action.resume_deferred_unmaterialized', undefined, loc));
             } else if (result.error === 'resume_cancelled') {

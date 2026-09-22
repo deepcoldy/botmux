@@ -209,6 +209,15 @@ const TRAEX_STATIC_BUSY_PATTERN = new RegExp(
  *  model-catalog-json.js 共享；旧名 re-export 保持既有引用（含测试）可用。 */
 export { parseDebugModelsJson as parseTraexModelsJson };
 
+export const TRAEX_DISABLE_CROSS_SESSION_MEMORY_CONFIG = [
+  'memories.use_memories=false',
+  'memories.generate_memories=false',
+] as const;
+
+export function traexDisableCrossSessionMemoryArgs(): string[] {
+  return TRAEX_DISABLE_CROSS_SESSION_MEMORY_CONFIG.flatMap(value => ['-c', value]);
+}
+
 export function createTraexAdapter(pathOverride?: string): CliAdapter {
   const rawBin = pathOverride ?? 'traex';
   let cachedBin: string | undefined;
@@ -228,11 +237,14 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     sandboxReadonlyPaths: () => [...TRAE_MIGRATION_DONE_MARKERS],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, modelBackendVariant, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, remoteWsUrl, remoteThreadId, shellSubprocessEnv, nativeSubagentRuntimeHookCommand }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, workingDir, model, reasoningEffort, modelBackendVariant, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, remoteWsUrl, remoteThreadId, shellSubprocessEnv, nativeSubagentRuntimeHookCommand, disableCrossSessionMemories }) {
       // TraeX shares Codex's low-quota picker and notice setting. Disable it
       // per process so a message-submit Enter cannot confirm a model switch.
       const modelNudgeArgs = hideRateLimitModelNudge
         ? ['-c', 'notice.hide_rate_limit_model_nudge=true']
+        : [];
+      const memoryArgs = disableCrossSessionMemories
+        ? traexDisableCrossSessionMemoryArgs()
         : [];
       // Hybrid RPC input mode (codex-family): attach the TUI to the botmux-owned
       // app-server thread; input flows via JSON-RPC (see codex-rpc-engine + worker)
@@ -259,6 +271,7 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
         ] : []),
         '--no-alt-screen',
         ...modelNudgeArgs,
+        ...memoryArgs,
         ...goalEnvConfigArgs(),
       ];
       // Keep trigger-user identity wrappers available in tool shells. Set only

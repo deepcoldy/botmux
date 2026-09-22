@@ -97,6 +97,14 @@ import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescript
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
 import { shouldRecordFailedTurn, buildFailedTurnRecord } from './services/failed-turn-retry.js';
+import {
+  armOneShotRetirement,
+  closeOneShotRetirementIfReady,
+  reconcileOneShotRetirementsOnBoot,
+  recordOneShotRetirementEvidence,
+  type OneShotRetirementEvidence,
+  type OneShotRetirementTuple,
+} from './services/one-shot-retirement.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
 import * as scheduleStore from './services/schedule-store.js';
@@ -213,7 +221,7 @@ import { hasPendingSessionTurns, runSessionTurn } from './core/session-turn-queu
 import { buildTerminalUrl, setTerminalProxyPort, setTerminalExternalPort } from './core/terminal-url.js';
 import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-proxy.js';
 import type { CliId } from './adapters/cli/types.js';
-import { runtimeInstallationKey } from './adapters/cli/runtime.js';
+import { resolveCliRuntime, runtimeInstallationKey, runtimePathOverride, snapshotCliRuntime } from './adapters/cli/runtime.js';
 import * as scheduler from './core/scheduler.js';
 import { scanProjects, scanMultipleProjects } from './services/project-scanner.js';
 import { buildQuotaExhaustedCard, buildRepoSelectCard, buildStreamingCard, getCliDisplayName } from './im/lark/card-builder.js';
@@ -559,7 +567,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, getGroupStats, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, getGroupStats, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, ordinaryOneShotVisibleLaneKey, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, normalizeDocNativeWatchSubscription, putDocSubscription, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
@@ -782,6 +790,162 @@ import { loopbackFetch } from './core/loopback-fetch.js';
 // ─── State ───────────────────────────────────────────────────────────────────
 
 const activeSessions = new Map<string, DaemonSession>();
+
+/**
+ * A visible Lark destination may have several independent one-shot execution
+ * identities, but only one may own that visible lane at a time.  The promise
+ * kept here is deliberately completed by the authoritative close callback, not
+ * when ingress returns, so the lane spans worker execution and final delivery.
+ */
+type OrdinaryOneShotLaneLease = {
+  sessionId: string;
+  release: () => void;
+  closed: Promise<void>;
+};
+
+// More than one unresolved durable row can exist for a lane after an older
+// buggy/overlapping daemon. Keep every exact-session reservation: closing one
+// must never make the lane look free while another ambiguous owner remains.
+const ordinaryOneShotLaneLeases = new Map<string, Map<string, OrdinaryOneShotLaneLease>>();
+
+function makeOrdinaryOneShotLaneLease(sessionId: string): OrdinaryOneShotLaneLease {
+  let release!: () => void;
+  const closed = new Promise<void>(resolve => { release = resolve; });
+  return { sessionId, release, closed };
+}
+
+function reserveOrdinaryOneShotLane(
+  visibleLaneKey: string,
+  sessionId: string,
+): OrdinaryOneShotLaneLease {
+  let lane = ordinaryOneShotLaneLeases.get(visibleLaneKey);
+  if (!lane) {
+    lane = new Map();
+    ordinaryOneShotLaneLeases.set(visibleLaneKey, lane);
+  }
+  const existing = lane.get(sessionId);
+  if (existing) return existing;
+  const lease = makeOrdinaryOneShotLaneLease(sessionId);
+  lane.set(sessionId, lease);
+  return lease;
+}
+
+function ordinaryOneShotLaneBlockers(visibleLaneKey: string): Promise<void>[] {
+  return [...(ordinaryOneShotLaneLeases.get(visibleLaneKey)?.values() ?? [])]
+    .map(lease => lease.closed);
+}
+
+/** Return every visible-lane identity that must remain occupied for a durable
+ * one-shot row. Older releases persisted a leading-NUL key; current ingress
+ * uses the printable hashed identity, which can be reconstructed from the
+ * frozen visible route without trusting or rewriting the legacy key. */
+function ordinaryOneShotVisibleLaneAliases(
+  rawOneShot: unknown,
+  larkAppId: string,
+): string[] {
+  if (!rawOneShot || typeof rawOneShot !== 'object' || Array.isArray(rawOneShot)) return [];
+  const oneShot = rawOneShot as { visibleLaneKey?: unknown; visibleRoute?: unknown };
+  const aliases: string[] = [];
+  if (typeof oneShot.visibleLaneKey === 'string' && oneShot.visibleLaneKey.length > 0) {
+    aliases.push(oneShot.visibleLaneKey);
+  }
+
+  const rawRoute = oneShot.visibleRoute;
+  if (!rawRoute || typeof rawRoute !== 'object' || Array.isArray(rawRoute)) return aliases;
+  const route = rawRoute as {
+    chatId?: unknown;
+    scope?: unknown;
+    rootMessageId?: unknown;
+    replyRootId?: unknown;
+  };
+  if (typeof larkAppId !== 'string' || larkAppId.length === 0
+      || typeof route.chatId !== 'string' || route.chatId.length === 0
+      || (route.scope !== 'thread' && route.scope !== 'chat')) return aliases;
+  const fallbackDestination = route.scope === 'thread'
+    ? route.rootMessageId
+    : route.chatId;
+  const effectiveDestination = route.replyRootId ?? fallbackDestination;
+  if (typeof effectiveDestination !== 'string' || effectiveDestination.length === 0) return aliases;
+
+  const canonical = ordinaryOneShotVisibleLaneKey(
+    larkAppId, route.chatId, route.scope, effectiveDestination,
+  );
+  if (!aliases.includes(canonical)) aliases.push(canonical);
+  return aliases;
+}
+
+function releaseOrdinaryOneShotLane(closed: Session): void {
+  const oneShot = closed.oneShot;
+  if (closed.status !== 'closed' || oneShot?.mode !== 'ordinary_per_message') return;
+  // A boot reservation may occupy both the persisted legacy key and its
+  // canonical alias. Release every reservation for this exact durable session
+  // identity so ownerless legacy rows and malformed close snapshots cannot
+  // strand one half of the alias pair.
+  for (const [visibleLaneKey, lane] of ordinaryOneShotLaneLeases) {
+    const lease = lane.get(closed.sessionId);
+    if (!lease) continue;
+    lane.delete(closed.sessionId);
+    if (lane.size === 0) ordinaryOneShotLaneLeases.delete(visibleLaneKey);
+    lease.release();
+  }
+}
+
+/** Reserve every valid visible lane before reconciliation mutates or excludes
+ * rows. Ownerless rows fail closed too: this daemon cannot prove they belong
+ * elsewhere, while a foreign explicit owner is handled by that app daemon. */
+function reserveOrdinaryOneShotLanesOnBoot(
+  sessions: readonly Session[],
+  larkAppId: string,
+): void {
+  for (const session of sessions) {
+    if (session.status !== 'active') continue;
+    const owner = session.larkAppId;
+    if (typeof owner === 'string' && owner.length > 0 && owner !== larkAppId) continue;
+    for (const visibleLaneKey of ordinaryOneShotVisibleLaneAliases(session.oneShot, larkAppId)) {
+      reserveOrdinaryOneShotLane(visibleLaneKey, session.sessionId);
+    }
+  }
+}
+
+function assertOrdinaryOneShotStartupOccupancy(
+  cfg: Pick<BotConfig, 'ordinarySessionMode'>,
+  occupancyState: sessionStore.OccupancyClaimResult | 'error',
+): void {
+  if (cfg.ordinarySessionMode === 'per_message' && occupancyState !== 'held') {
+    throw new Error(
+      `ordinary per-message daemon requires exclusive session-store occupancy `
+      + `(claim=${occupancyState})`,
+    );
+  }
+}
+
+function claimOrdinaryOneShotStartupOccupancy(
+  cfg: Pick<BotConfig, 'ordinarySessionMode'>,
+  claim: () => sessionStore.OccupancyClaimResult,
+): sessionStore.OccupancyClaimResult | 'error' | undefined {
+  if (cfg.ordinarySessionMode !== 'per_message') return undefined;
+  let state: sessionStore.OccupancyClaimResult | 'error';
+  try { state = claim(); } catch { state = 'error'; }
+  assertOrdinaryOneShotStartupOccupancy(cfg, state);
+  return state;
+}
+
+export const __testOnly_ordinaryOneShotLanes = {
+  reserveFromBoot: reserveOrdinaryOneShotLanesOnBoot,
+  blockedSessionIds: (visibleLaneKey: string) =>
+    [...(ordinaryOneShotLaneLeases.get(visibleLaneKey)?.keys() ?? [])],
+  releaseClosed: releaseOrdinaryOneShotLane,
+  reset: () => {
+    for (const lane of ordinaryOneShotLaneLeases.values()) {
+      for (const lease of lane.values()) lease.release();
+    }
+    ordinaryOneShotLaneLeases.clear();
+  },
+};
+export const __testOnly_assertOrdinaryOneShotStartupOccupancy =
+  assertOrdinaryOneShotStartupOccupancy;
+export const __testOnly_claimOrdinaryOneShotStartupOccupancy =
+  claimOrdinaryOneShotStartupOccupancy;
 /** False until restoreActiveSessions() finishes. During the startup window the
  *  IPC server is already listening but activeSessions is empty, so a reconnecting
  *  ask hook would fail session lookup and get a 403 origin_unproven — which the
@@ -789,6 +953,62 @@ const activeSessions = new Map<string, DaemonSession>();
  *  (codex P1-2). While false, /api/asks returns a retryable 503 for unknown
  *  sessions instead, so the reconnecting hook keeps waiting through the restore. */
 let sessionsRestored = false;
+
+function oneShotRetirementTuple(
+  session: Session,
+  context: { workerGeneration: number; turnId: string; dispatchAttempt?: number },
+): OneShotRetirementTuple {
+  return {
+    sessionId: session.sessionId,
+    workerGeneration: context.workerGeneration,
+    turnId: context.turnId,
+    ...(context.dispatchAttempt !== undefined
+      ? { dispatchAttempt: context.dispatchAttempt }
+      : {}),
+  };
+}
+
+async function closeJoinedOneShotRetirement(
+  session: Session,
+  tuple: OneShotRetirementTuple,
+): Promise<void> {
+  const result = await closeOneShotRetirementIfReady(session, tuple, {
+    persist: row => sessionStore.updateSession(row),
+    close: closeSessionForBackgroundCleanup,
+  });
+  if (result.outcome === 'close_refused') {
+    logger.error(
+      `[one-shot] authoritative close refused session=${tuple.sessionId.slice(0, 8)} `
+      + `turn=${tuple.turnId.slice(0, 12)} generation=${tuple.workerGeneration}`,
+    );
+  } else if (result.outcome === 'stale' || result.outcome === 'conflict') {
+    logger.error(
+      `[one-shot] close rejected ${result.outcome} session=${tuple.sessionId.slice(0, 8)} `
+      + `turn=${tuple.turnId.slice(0, 12)} generation=${tuple.workerGeneration} `
+      + `reason=${result.reason ?? 'unknown'}`,
+    );
+  }
+}
+
+async function recordAndCloseOneShotRetirement(
+  session: Session,
+  tuple: OneShotRetirementTuple,
+  evidence: OneShotRetirementEvidence,
+): Promise<void> {
+  const observation = recordOneShotRetirementEvidence(session, tuple, evidence, {
+    persist: row => sessionStore.updateSession(row),
+  });
+  if (observation.outcome === 'not_one_shot') return;
+  if (observation.outcome === 'stale' || observation.outcome === 'conflict') {
+    logger.error(
+      `[one-shot] evidence rejected ${observation.outcome} session=${tuple.sessionId.slice(0, 8)} `
+      + `turn=${tuple.turnId.slice(0, 12)} generation=${tuple.workerGeneration} `
+      + `kind=${evidence.kind} reason=${observation.reason}`,
+    );
+    return;
+  }
+  await closeJoinedOneShotRetirement(session, tuple);
+}
 
 function scheduleRestoredStreamingCardPinRecovery(larkAppId: string): void {
   queueMicrotask(() => {
@@ -3873,6 +4093,19 @@ async function sessionReply(
     ? replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext, outboundOptions)
     : replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext);
 
+  // A frozen quote target is valid in either chat- or thread-scoped sessions.
+  // Handle it before anchor-shape routing: ordinary per-message sessions use a
+  // synthetic execution anchor that must never be sent to the provider API.
+  if (opts?.replyTarget?.mode === 'quote') {
+    return replyWithHookPolicy(
+      opts.replyTarget.rootMessageId,
+      content,
+      msgType,
+      false,
+      opts.uuid,
+    );
+  }
+
   // Chat-scope: post a plain message to the chat. No reply_in_thread → keeps
   // the conversation flat in 普通群. The card layer carries chatId in its button
   // values, so handleCardAction routes back via sessionKey(chatId).
@@ -5152,7 +5385,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
       // (「已处理 · 判定无需回复」/ transcript 模式「已完成」), not a misleading 「等待输入」.
       previousIdleLabel,
       dshRuntimeForSession(ds),
-      resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
+      resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config, ds.session),
     );
     scheduleCardPatch(ds, frozenCard);
 
@@ -17168,6 +17401,7 @@ export const __testOnly_resolvePinnedWorkingDir = resolvePinnedWorkingDir;
 // which unit tests calling handleCommand directly can never catch.
 export const __testOnly_handleNewTopic = (data: any, ctx: RoutingContext): Promise<void> => handleNewTopic(data, ctx);
 export const __testOnly_handleThreadReply = (data: any, ctx: RoutingContext): Promise<void> => handleThreadReply(data, ctx);
+export const __testOnly_handleOrdinaryOneShot = (data: any, ctx: RoutingContext): Promise<void> => handleOrdinaryOneShot(data, ctx);
 export const __testOnly_computeCodexAppSteerable = computeCodexAppSteerable;
 
 type NewDaemonSessionClaim =
@@ -20576,6 +20810,324 @@ async function handleNewTopic(data: any, ctx: RoutingContext): Promise<void> {
     ctx.larkAppId,
     () => handleNewTopicAdmitted(data, ctx),
   ).catch(err => notifyOrdinaryIngressFailure(ctx, err));
+}
+
+/**
+ * Start one fresh TraeX session for exactly one ordinary physical Lark event.
+ * The visible-lane lock deliberately remains held after worker admission; the
+ * authoritative close callback releases its transferred lease.
+ */
+async function handleOrdinaryOneShot(data: any, ctx: RoutingContext): Promise<void> {
+  const requested = ctx.ordinaryOneShot;
+  if (!requested) return;
+  ctx.ingressAdmission ??= { admitted: false };
+
+  await withActiveSessionKeyLock(activeSessions, requested.visibleLaneKey, async () => {
+    // A boot-reconciled row can be deliberately excluded from activeSessions
+    // while its worker/delivery fate remains uncertain. Its durable reservation
+    // is therefore a stronger blocker than the ordinary routing registry.
+    const existingLaneBlockers = ordinaryOneShotLaneBlockers(requested.visibleLaneKey);
+    if (existingLaneBlockers.length > 0) await Promise.all(existingLaneBlockers);
+
+    // Classification happened in the dispatcher, but config and the context can
+    // change while this event waits behind the preceding visible-lane owner.
+    const botCfg = getBot(ctx.larkAppId).config;
+    if (botCfg.ordinarySessionMode !== 'per_message' || botCfg.cliId !== 'traex') return;
+    if (ctx.ordinaryOneShot !== requested
+      || requested.physicalMessageId !== ctx.messageId
+      || requested.visibleRoute.chatId !== ctx.chatId
+      || requested.visibleRoute.chatType !== ctx.chatType
+      || requested.visibleRoute.scope !== ctx.scope
+      || requested.visibleRoute.rootMessageId !== ctx.anchor
+      || requested.visibleRoute.replyRootId !== ctx.replyRootId) return;
+
+    const configuredCwd = effectiveDefaultWorkingDir(botCfg);
+    if (!configuredCwd) {
+      throw new Error('ordinary per-message mode requires a configured default working directory');
+    }
+    const cwd = validateWorkingDir(configuredCwd, localeForBot(ctx.larkAppId));
+    if (!cwd.ok) throw new Error(cwd.error);
+
+    const senderOpenId = data?.sender?.sender_id?.open_id as string | undefined;
+    const senderUnionId = data?.sender?.sender_id?.union_id as string | undefined;
+    const isForeignBotSender = senderOpenId
+      ? isKnownPeerBot(config.session.dataDir, ctx.larkAppId, senderOpenId)
+      : false;
+    if (data?.sender?.sender_type !== 'user' || !senderOpenId
+      || isForeignBotSender
+      || data?.message?.message_id !== requested.physicalMessageId) return;
+
+    const replyTarget = requested.visibleRoute.scope === 'chat'
+      ? requested.visibleRoute.replyRootId
+        ? { mode: 'thread' as const, rootMessageId: requested.visibleRoute.replyRootId }
+        : { mode: 'plain' as const, chatId: requested.visibleRoute.chatId }
+      : { mode: 'thread' as const, rootMessageId: requested.visibleRoute.rootMessageId };
+
+    const numberer = createImgNumberer();
+    await resolveNonsupportMessage(data, ctx.larkAppId);
+    const { parsed, resources } = parseEventMessage(data, numberer);
+    if (parsed.messageId !== requested.physicalMessageId) return;
+    if (parsed.msgType === 'merge_forward') {
+      const expanded = await expandMergeForward(
+        ctx.larkAppId,
+        requested.physicalMessageId,
+        parsed,
+        numberer,
+      );
+      resources.push(...expanded.extraResources);
+    }
+    if (parsed.msgType === 'audio') {
+      const audio = await resolveInboundAudio(
+        ctx.larkAppId,
+        requested.physicalMessageId,
+        parsed.msgType,
+        data.message?.content ?? '',
+        parsed.content,
+        text => replyMessage(ctx.larkAppId, requested.physicalMessageId, text, 'text'),
+        parsed.senderId,
+      );
+      if (audio.kind === 'failed') return;
+      if (audio.kind === 'transcribed') parsed.content = audio.text;
+    }
+    learnFromMentions(ctx.larkAppId, parsed.mentions);
+
+    const allowed = await enforceMessageQuotaForCliInput(
+      ctx.larkAppId,
+      ctx.chatId,
+      senderOpenId,
+      requested.physicalMessageId,
+      requested.routingAnchor,
+      undefined,
+      senderUnionId,
+      ctx.chatType,
+      false,
+      {
+        promptContent: parsed.content,
+        promptAttachments: resources.map(resource => ({ type: resource.type, name: resource.name })),
+      },
+    );
+    if (!allowed) return;
+
+    const { attachments, needLogin } = await downloadResources(
+      ctx.larkAppId,
+      requested.physicalMessageId,
+      resources,
+      senderOpenId,
+    );
+    if (needLogin) {
+      await sessionReply(
+        requested.visibleRoute.scope === 'thread'
+          ? requested.visibleRoute.rootMessageId
+          : requested.visibleRoute.chatId,
+        tr('daemon.download_failed_need_login', undefined, localeForBot(ctx.larkAppId)),
+        'text',
+        ctx.larkAppId,
+        undefined,
+        { replyTarget },
+      );
+    }
+    const sender = await resolveSender(
+      ctx.larkAppId,
+      senderOpenId,
+      parsed.senderType,
+      { messageId: requested.physicalMessageId },
+    );
+    const now = new Date();
+    const nowIso = now.toISOString();
+    const oneShot: NonNullable<Session['oneShot']> = {
+      version: 1,
+      mode: 'ordinary_per_message',
+      routingAnchor: requested.routingAnchor,
+      visibleLaneKey: requested.visibleLaneKey,
+      visibleRoute: {
+        chatId: requested.visibleRoute.chatId,
+        chatType: requested.visibleRoute.chatType,
+        scope: requested.visibleRoute.scope,
+        rootMessageId: requested.visibleRoute.rootMessageId,
+        ...(requested.visibleRoute.replyRootId
+          ? { replyRootId: requested.visibleRoute.replyRootId }
+          : {}),
+      },
+      createdAt: nowIso,
+      turn: { turnId: requested.physicalMessageId },
+    };
+    const runtime = snapshotCliRuntime(resolveCliRuntime({
+      cliId: botCfg.cliId,
+      cliRuntime: botCfg.cliRuntime,
+      cliPathOverride: botCfg.cliRuntime ? undefined : botCfg.cliPathOverride,
+      context: 'ordinary one-shot cliRuntime',
+    }));
+    let session: Session | undefined;
+    let ds: DaemonSession | undefined;
+    let lease: OrdinaryOneShotLaneLease | undefined;
+    let admitted = false;
+    let registered = false;
+    try {
+      session = sessionStore.createSession(
+        ctx.chatId,
+        requested.visibleRoute.rootMessageId,
+        parsed.content.trim().substring(0, 50),
+        ctx.chatType,
+        ctx.scope,
+        {
+          source: 'ordinary-feishu',
+          oneShot,
+          initialize(row) {
+            row.larkAppId = ctx.larkAppId;
+            row.ownerOpenId = senderOpenId;
+            row.ownerUnionId = senderUnionId;
+            row.creatorOpenId = senderOpenId;
+            row.lastCallerOpenId = senderOpenId;
+            row.quoteTargetId = requested.physicalMessageId;
+            row.quoteTargetSenderOpenId = senderOpenId;
+            row.quoteTargetSenderIsBot = false;
+            row.lastMessageAt = nowIso;
+            row.lastHumanMessageAt = nowIso;
+            row.workingDir = cwd.resolvedPath;
+            row.cliId = 'traex';
+            row.cliRuntime = runtime;
+            row.cliPathOverride = runtimePathOverride(runtime) ?? botCfg.cliPathOverride;
+            row.wrapperCli = botCfg.wrapperCli;
+            row.cliLaunchMode = botCfg.cliLaunchMode;
+            row.reasoningEffort = botCfg.reasoningEffort;
+            row.modelBackendVariant = botCfg.modelBackendVariant;
+            row.agentFrozen = true;
+            row.backendType = resolvePairedSpawnBackendType(
+              'traex', undefined, botCfg.backendType, config.daemon.backendType,
+            );
+            row.sandbox = botCfg.sandbox === true;
+            row.sandboxPaths = botCfg.sandboxPaths;
+            row.sandboxHidePaths = botCfg.sandboxHidePaths ?? [];
+            row.sandboxReadonlyPaths = botCfg.sandboxReadonlyPaths ?? [];
+            row.sandboxNetwork = botCfg.sandboxNetwork !== false;
+            row.turnReplyContexts = {
+              [requested.physicalMessageId]: {
+                target: replyTarget,
+                quoteTargetId: requested.physicalMessageId,
+                replyTargetSenderOpenId: senderOpenId,
+                replyTargetSenderIsBot: false,
+                ...(ctx.scope === 'chat' ? { inThread: !!parsed.threadId } : {}),
+              },
+            };
+            row.replyTargets = {
+              [requested.physicalMessageId]: {
+                updatedAt: nowIso,
+                senderOpenId,
+                participants: [{ openId: senderOpenId, ...(sender?.name ? { name: sender.name } : {}), isBot: false }],
+                ...(ctx.scope === 'chat' && requested.visibleRoute.replyRootId
+                  ? { rootMessageId: requested.visibleRoute.replyRootId }
+                  : {}),
+              },
+            };
+            row.currentReplyTarget = ctx.scope === 'chat' && requested.visibleRoute.replyRootId
+              ? { rootMessageId: requested.visibleRoute.replyRootId, turnId: requested.physicalMessageId, updatedAt: nowIso }
+              : undefined;
+          },
+        },
+      );
+      ds = {
+        session,
+        worker: null,
+        workerPort: null,
+        workerToken: null,
+        larkAppId: ctx.larkAppId,
+        chatId: ctx.chatId,
+        chatType: ctx.chatType,
+        scope: ctx.scope,
+        spawnedAt: now.getTime(),
+        cliVersion: cliVersionCache.get(cliRuntimeVersionKey(botCfg))?.version ?? 'unknown',
+        lastMessageAt: now.getTime(),
+        lastHumanMessageAt: now.getTime(),
+        hasHistory: false,
+        workingDir: cwd.resolvedPath,
+        ownerOpenId: senderOpenId,
+        currentTurnTitle: session.title,
+      };
+      const routeKey = activeSessionKey(ds);
+      if (routeKey !== sessionKey(requested.routingAnchor, ctx.larkAppId)
+        || activeSessions.has(routeKey)) {
+        throw new Error('ordinary one-shot routing anchor collision');
+      }
+      activeSessions.set(routeKey, ds);
+      registered = true;
+      // Publish the visible-lane owner before forkWorker can reserve a worker
+      // generation, spawn a child, or synchronously emit a lifecycle callback.
+      lease = reserveOrdinaryOneShotLane(requested.visibleLaneKey, session.sessionId);
+
+      const cliInput = buildNewTopicCliInput(
+        parsed.content,
+        session.sessionId,
+        'traex',
+        session.cliPathOverride,
+        attachments.length > 0 ? attachments : undefined,
+        parsed.mentions,
+        undefined,
+        undefined,
+        { name: getBot(ctx.larkAppId).botName, openId: getBot(ctx.larkAppId).botOpenId },
+        localeForBot(ctx.larkAppId),
+        sender,
+        {
+          larkAppId: ctx.larkAppId,
+          chatId: ctx.chatId,
+          codexAppText: parsed.content,
+          trustedCaller: trustedCallerForTurn(
+            ctx.larkAppId,
+            senderOpenId,
+            senderUnionId,
+            senderIsBotTriState(parsed.senderType, isForeignBotSender),
+          ),
+          turnId: requested.physicalMessageId,
+          sessionBackendType: session.backendType,
+          suppressPersistedContext: true,
+        },
+      );
+      let admission: WorkerForkAdmission | undefined;
+      const forked = forkWorker(
+        ds,
+        cliInput,
+        { resume: false, turnId: requested.physicalMessageId },
+        {
+          onAdmission: outcome => {
+            admission = outcome;
+            if (outcome === 'accepted') {
+              admitted = true;
+              markIngressAdmitted(ctx);
+            }
+          },
+        },
+      );
+      if (!forked || admission !== 'accepted') {
+        throw new Error(`ordinary one-shot worker admission ${admission ?? 'missing'}`);
+      }
+      await lease.closed;
+    } catch (error) {
+      if (!admitted && session?.status === 'active') {
+        try {
+          if (registered) {
+            const result = await closeSessionForBackgroundCleanup(
+              session.sessionId,
+              'ordinary one-shot pre-admission cleanup',
+            );
+            // A residual means some execution authority could not be proven
+            // gone. The close callback may already have released the old lease,
+            // so immediately replace it while the visible-lane lock is held.
+            if (!result.ok || result.outcome !== 'closed') {
+              lease = reserveOrdinaryOneShotLane(requested.visibleLaneKey, session.sessionId);
+            }
+          } else {
+            sessionStore.closeSession(session.sessionId);
+          }
+        } catch (cleanupError) {
+          lease = reserveOrdinaryOneShotLane(requested.visibleLaneKey, session.sessionId);
+          logger.error(
+            `[one-shot] pre-admission cleanup failed session=${session.sessionId.slice(0, 8)}: `
+            + `${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+          );
+        }
+      }
+      throw error;
+    }
+  });
 }
 
 /**
@@ -25452,6 +26004,77 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     logger.warn(`[tmux] failed to scrub server-global env key(s): ${tmuxEnvScrub.failed.join(', ')}`);
   }
 
+  // Auto-migrate legacy sandbox fields (readIsolation / sandboxHidePaths /
+  // sandboxReadonlyPaths / readDenyExtraPaths → sandbox + sandboxPaths) BEFORE
+  // loading, so the parsed configs below already carry the new model. Writes
+  // new fields, keeps old ones (downgrade = zero-op), backs up once. Idempotent.
+  // SKIP in core-only (codex P1-2): this reads + backs-up + rewrites the on-disk
+  // fleet bots.json. A headless core-only service must never touch an ambient
+  // host fleet config — its identity is a synthesized in-memory apiOnly bot.
+  if (process.env.BOTMUX_CORE_ONLY !== '1') {
+    await migrateSandboxConfigAtStartup();
+  }
+
+  // Load the assigned bot (one daemon per bot)
+  let botConfigs = loadBotConfigs();
+  const idx = botIndex ?? 0;
+  let cfg = botIndex === undefined
+    ? botConfigs[idx]
+    : loadBotConfigAtIndex(idx);
+  if (!cfg) {
+    throw new Error(`Invalid BOTMUX_BOT_INDEX=${idx}, only ${botConfigs.length} active bot(s) configured`);
+  }
+  if (botIndex !== undefined) {
+    // During managed activation PM2 may report this process online before it
+    // is allowed to register a bot or receive traffic. The dashboard clears
+    // the exact startup marker only after it has re-read the PM2 receipt ACK.
+    await waitForManagedActivationCommit(idx, cfg.larkAppId);
+    botConfigs = loadBotConfigs();
+    cfg = loadBotConfigAtIndex(idx);
+  }
+  // 这里曾经有一次「给本 bot 播种默认会议角色预设」的启动写盘。已退役：角色预设
+  // 改成全 fleet 共享目录 + 读路径内置默认（services/vc-meeting-shared-consumer-
+  // catalog.ts），没有任何 bot 还需要自己那份 per-bot 拷贝。退役的两个理由：
+  //   1. 播种出来的 per-bot `consumerProfiles` 会永久遮蔽共享目录——操作者在
+  //      Dashboard 改共享预设，被播种过的 bot 完全不跟随；
+  //   2. 那次写盘还会把「另一个 bot」的 appId 焊进预设（旧的换人兜底），正是
+  //      「拉 A 进会却把 B 拉进监听群」的源头。
+  // 现在启动路径对 VC 预设零写盘，fleet 里几十个 daemon 同时启动也不再有写竞争。
+  const selectedAppId = cfg.larkAppId;
+  // A bootstrap failure is not authority to keep an earlier in-memory config.
+  // Every explicit PM2 daemon must prove its same raw slot and App identity
+  // immediately before registerBot, regardless of the bootstrap result.
+  if (botIndex !== undefined) {
+    cfg = reloadExactDaemonBotConfig(idx, selectedAppId, loadBotConfigAtIndex);
+  }
+  registerBot(cfg);
+  sessionStore.init(cfg.larkAppId, {
+    groupDefaultModels: chatId => getBot(cfg.larkAppId).config.groupDefaultModels?.[chatId],
+    occupancy: { bootId: getDaemonBootId(), pid: process.pid },
+  });
+  // One-shot visible-lane ownership is process-local. Prove this process is the
+  // sole app-store owner immediately after the first strict load, before any
+  // reconciliation mutation, timer/watcher, descriptor/IPC publication,
+  // active-session restore, or Lark ingress. If the explicit claim itself
+  // fails after load claimed the row, release that tentative ownership.
+  const oneShotBootSnapshot = sessionStore.listSessionsStrict();
+  let oneShotStartupOccupancyState: sessionStore.OccupancyClaimResult | 'error' | undefined;
+  try {
+    oneShotStartupOccupancyState = claimOrdinaryOneShotStartupOccupancy(
+      cfg,
+      () => sessionStore.claimOccupancyLease({ bootId: getDaemonBootId(), pid: process.pid }),
+    );
+  } catch (error) {
+    try { sessionStore.releaseOccupancyLease({ bootId: getDaemonBootId() }); } catch { /* best effort */ }
+    throw error;
+  }
+
+  selfDaemonLarkAppId = cfg.larkAppId;
+  // Host-executed schedule conditions are authority material. Create and
+  // validate their 0700 root before any restored worker can receive a sandbox
+  // policy; a symlink/corrupt root aborts startup instead of exposing scripts.
+  ensureSchedulePreconditionRoot(config.session.dataDir);
+
   // ─── 成本/预算接线 ─────────────────────────────────────────────────────
   // pricingResolver：把 larkAppId 解析成 bot 的定价配置（bots.json pricing 块
   // → 内置表）。recordSink：每条正 delta 记录落盘后，累计到预算跟踪器，
@@ -25499,68 +26122,6 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     }
     return anchorKey;
   });
-
-  // Issue Board 发件箱后台泵 + 启动解卡。
-  //
-  // 各处回写失败时都写着「行留在 outbox 里，pump 会接着重投」——在这之前没有任何东西会
-  // 重投，那句话是假的。后果不是晚同步：in_progress 那次写只要失败一次，5 分钟后平台就把
-  // 任务打成 needs_attention(claim_activate_timeout)，而那是单向门，群里的活直接废掉。
-  // 同时启动时把卡在 inflight 的行退回待发，否则崩溃一次就永久堵死该 binding 的串行队列。
-  startIssueOutboxPump({ dataDir: config.session.dataDir });
-
-  // 首次启动时后台尝试安装 CJK 字体（Debian/Ubuntu），避免截图中文显示豆腐块。
-  // 不阻塞：首张截图可能仍是豆腐块，装完重启 daemon 即可正常。
-  ensureCjkFontsInstalled();
-
-  // Auto-migrate legacy sandbox fields (readIsolation / sandboxHidePaths /
-  // sandboxReadonlyPaths / readDenyExtraPaths → sandbox + sandboxPaths) BEFORE
-  // loading, so the parsed configs below already carry the new model. Writes
-  // new fields, keeps old ones (downgrade = zero-op), backs up once. Idempotent.
-  // SKIP in core-only (codex P1-2): this reads + backs-up + rewrites the on-disk
-  // fleet bots.json. A headless core-only service must never touch an ambient
-  // host fleet config — its identity is a synthesized in-memory apiOnly bot.
-  if (process.env.BOTMUX_CORE_ONLY !== '1') {
-    await migrateSandboxConfigAtStartup();
-  }
-
-  // Load the assigned bot (one daemon per bot)
-  let botConfigs = loadBotConfigs();
-  const idx = botIndex ?? 0;
-  let cfg = botIndex === undefined
-    ? botConfigs[idx]
-    : loadBotConfigAtIndex(idx);
-  if (!cfg) {
-    throw new Error(`Invalid BOTMUX_BOT_INDEX=${idx}, only ${botConfigs.length} active bot(s) configured`);
-  }
-  if (botIndex !== undefined) {
-    // During managed activation PM2 may report this process online before it
-    // is allowed to register a bot or receive traffic. The dashboard clears
-    // the exact startup marker only after it has re-read the PM2 receipt ACK.
-    await waitForManagedActivationCommit(idx, cfg.larkAppId);
-    botConfigs = loadBotConfigs();
-    cfg = loadBotConfigAtIndex(idx);
-  }
-  // 这里曾经有一次「给本 bot 播种默认会议角色预设」的启动写盘。已退役：角色预设
-  // 改成全 fleet 共享目录 + 读路径内置默认（services/vc-meeting-shared-consumer-
-  // catalog.ts），没有任何 bot 还需要自己那份 per-bot 拷贝。退役的两个理由：
-  //   1. 播种出来的 per-bot `consumerProfiles` 会永久遮蔽共享目录——操作者在
-  //      Dashboard 改共享预设，被播种过的 bot 完全不跟随；
-  //   2. 那次写盘还会把「另一个 bot」的 appId 焊进预设（旧的换人兜底），正是
-  //      「拉 A 进会却把 B 拉进监听群」的源头。
-  // 现在启动路径对 VC 预设零写盘，fleet 里几十个 daemon 同时启动也不再有写竞争。
-  const selectedAppId = cfg.larkAppId;
-  // A bootstrap failure is not authority to keep an earlier in-memory config.
-  // Every explicit PM2 daemon must prove its same raw slot and App identity
-  // immediately before registerBot, regardless of the bootstrap result.
-  if (botIndex !== undefined) {
-    cfg = reloadExactDaemonBotConfig(idx, selectedAppId, loadBotConfigAtIndex);
-  }
-  registerBot(cfg);
-  selfDaemonLarkAppId = cfg.larkAppId;
-  // Host-executed schedule conditions are authority material. Create and
-  // validate their 0700 root before any restored worker can receive a sandbox
-  // policy; a symlink/corrupt root aborts startup instead of exposing scripts.
-  ensureSchedulePreconditionRoot(config.session.dataDir);
   // The final-answer feedback subsystem is OPTIONAL: a bot with feedback
   // disabled still opens the shared feedback DB here for turn-completion
   // indexing, but a bootstrap failure (shared-dataDir lock storm, corruption,
@@ -25639,10 +26200,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // hook 适配 adopt"不成立。这里幂等、best-effort，不阻塞启动。
   try { ensureCliEnv(cfg.cliId, cfg.cliPathOverride); }
   catch (err) { logger.warn(`[hook] startup ensureCliEnv failed for ${cfg.cliId}: ${err instanceof Error ? err.message : String(err)}`); }
-  sessionStore.init(cfg.larkAppId, {
-    groupDefaultModels: chatId => getBot(cfg.larkAppId).config.groupDefaultModels?.[chatId],
-    occupancy: { bootId: getDaemonBootId(), pid: process.pid },
-  });
+  // Start background/runtime side effects only after per-message mode has
+  // proved exclusive app-store ownership. A displaced/error boot exits above
+  // without leaving timers, watchers, PID files, descriptors, or listeners.
+  // Issue Board 发件箱后台泵 + 启动解卡。
+  //
+  // 各处回写失败时都写着「行留在 outbox 里，pump 会接着重投」——在这之前没有任何东西会
+  // 重投，那句话是假的。后果不是晚同步：in_progress 那次写只要失败一次，5 分钟后平台就把
+  // 任务打成 needs_attention(claim_activate_timeout)，而那是单向门，群里的活直接废掉。
+  // 同时启动时把卡在 inflight 的行退回待发，否则崩溃一次就永久堵死该 binding 的串行队列。
+  startIssueOutboxPump({ dataDir: config.session.dataDir });
+
+  // 首次启动时后台尝试安装 CJK 字体（Debian/Ubuntu），避免截图中文显示豆腐块。
+  // 不阻塞：首张截图可能仍是豆腐块，装完重启 daemon 即可正常。
+  ensureCjkFontsInstalled();
   chatFirstSeenStore.init(cfg.larkAppId);
   initSessionGroups(cfg.larkAppId);
   const ambiguousOnBoot = reconcileVcMeetingDeliveriesOnBoot(
@@ -25926,6 +26497,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     getSessionWorkingDir,
     getActiveCount,
     prepareRawInputTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),
+    onOneShotRetirementArm(ds, context) {
+      const observation = armOneShotRetirement(
+        ds.session,
+        oneShotRetirementTuple(ds.session, context),
+        { persist: row => sessionStore.updateSession(row) },
+      );
+      if (observation.outcome === 'stale' || observation.outcome === 'conflict') {
+        throw new Error(`one-shot retirement arm rejected: ${observation.reason}`);
+      }
+    },
+    async onOneShotRetirementDelivery(ds, context) {
+      await recordAndCloseOneShotRetirement(
+        ds.session,
+        oneShotRetirementTuple(ds.session, context),
+        context.evidence,
+      );
+    },
     closeSession(ds: DaemonSession): Promise<boolean> {
       // Route through the dashboard-aware helper so session.exited / session.update
       // events fire for withdrawn-message / crash / adopt-exit teardown paths too,
@@ -26006,6 +26594,26 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       });
     },
     async onTurnTerminal(ds, terminal, context) {
+      await recordAndCloseOneShotRetirement(
+        ds.session,
+        oneShotRetirementTuple(ds.session, {
+          workerGeneration: context.workerGeneration,
+          turnId: terminal.turnId,
+          ...(terminal.dispatchAttempt !== undefined
+            ? { dispatchAttempt: terminal.dispatchAttempt }
+            : {}),
+        }),
+        {
+          kind: 'terminal',
+          status: terminal.status,
+          ...(terminal.outputDisposition !== undefined
+            ? { outputDisposition: terminal.outputDisposition }
+            : {}),
+          ...(terminal.completedAtMs !== undefined
+            ? { completedAtMs: terminal.completedAtMs }
+            : {}),
+        },
+      );
       // Release only the exact XPI shared-cwd admission. Route/principal
       // authority below has its own lifecycle and is deliberately independent.
       onXpiSharedCwdTurnTerminal(ds, terminal, context);
@@ -26144,7 +26752,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         );
       }
     },
-    onSessionClosed: finalizeClosedXpiSharedCwdMember,
+    async onSessionClosed(closed, context) {
+      await finalizeClosedXpiSharedCwdMember(closed, context);
+      // This callback runs only after the authoritative close transition.
+      // Release an ordinary one-shot lane by exact durable session identity;
+      // stale/foreign or uncertain lifecycle callbacks cannot release it.
+      releaseOrdinaryOneShotLane(closed);
+    },
     onReceiverResetReady(_ds, context) {
       acknowledgeVcMeetingReceiverRecovery(vcMeetingReceiverRecoveryKey(
         context.sessionId,
@@ -26171,6 +26785,49 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   setActiveSessionsRegistry(activeSessions);
   registerPinStreamingCardChangeHandler(reconcileBotStreamingCardPins);
 
+  // A crash can land after joined evidence was durably marked ready/closing
+  // but before authoritative close completed. Re-drive those exact tuples
+  // before any active row is restored or any IPC ingress is bound. Refused,
+  // conflicting, or otherwise uncertain exact-owner rows are durably
+  // quarantined and excluded from this boot's restore snapshot. Foreign and
+  // ownerless rows are excluded without mutation to avoid a cross-daemon write
+  // race. A required quarantine write failure aborts startup.
+  let oneShotRetirementExcludedSessionIds: Set<string>;
+  try {
+    reserveOrdinaryOneShotLanesOnBoot(oneShotBootSnapshot, cfg.larkAppId);
+    const reconciliation = await reconcileOneShotRetirementsOnBoot(
+      oneShotBootSnapshot,
+      {
+        ownerLarkAppId: cfg.larkAppId,
+        persist: row => sessionStore.updateSession(row),
+        read: sessionId => sessionStore.getSessionFresh(sessionId),
+        close: closeSessionForBackgroundCleanup,
+      },
+    );
+    oneShotRetirementExcludedSessionIds = new Set([
+      ...reconciliation.closedSessionIds,
+      ...reconciliation.quarantinedSessionIds,
+    ]);
+    for (const [sessionId, reason] of reconciliation.quarantineReasons) {
+      logger.error(
+        `[one-shot] boot reconciliation quarantined session=${sessionId.slice(0, 8)} `
+        + `reason=${reason}`,
+      );
+    }
+    if (reconciliation.closedSessionIds.size > 0) {
+      logger.info(
+        `[one-shot] boot reconciliation closed `
+        + `${reconciliation.closedSessionIds.size} joined session(s)`,
+      );
+    }
+  } catch (err) {
+    logger.error(
+      `[one-shot] boot reconciliation failed to contain active rows; aborting startup: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    throw err instanceof Error ? err : new Error(String(err));
+  }
+
   // Idempotency boot reconcile — MUST run before startIpcServer binds (a normal
   // fleet has no core-only readiness gate, so a live /api/trigger could otherwise
   // interleave with the sweep and have its fresh lease mistaken for stale) and is
@@ -26190,6 +26847,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   let idempotencyQuarantinedSessionIds: Set<string>;
   try {
     idempotencyQuarantinedSessionIds = await reconcileIdempotencyLeasesOnBoot(cfg.larkAppId, getDaemonBootId());
+    for (const sessionId of oneShotRetirementExcludedSessionIds) {
+      idempotencyQuarantinedSessionIds.add(sessionId);
+    }
   } catch (err) {
     logger.error(`[idempotency] boot reconcile failed to converge — aborting bot startup (fail-closed): ${err instanceof Error ? err.message : err}`);
     throw err instanceof Error ? err : new Error(String(err));
@@ -26299,7 +26959,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   desc.lastHeartbeat = Date.now();
   writeDaemonDescriptor(desc);
   sessionStore.listSessions();
-  let occupancyState: sessionStore.OccupancyClaimResult | 'error' | undefined;
+  let occupancyState: sessionStore.OccupancyClaimResult | 'error' | undefined =
+    oneShotStartupOccupancyState;
   const claimOccupancy = (): void => {
     let next: typeof occupancyState;
     try {
@@ -26321,6 +26982,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     occupancyState = next;
   };
   claimOccupancy();
+  // Per-message lanes are process-local. They are safe only when exactly this
+  // daemon owns the app-scoped session store; abort before restore or any Lark
+  // dispatcher can receive ingress if another live same-app daemon owns it.
+  assertOrdinaryOneShotStartupOccupancy(cfg, occupancyState ?? 'error');
   const descriptorHeartbeat = setInterval(() => {
     desc.lastHeartbeat = Date.now();
     try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
@@ -26659,6 +27324,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         () => cardActionPluginGateway.dispatch(data, appId),
       ),
       handleNewTopic: (data, ctx) => handleNewTopic(data, ctx),
+      handleOrdinaryOneShot: (data, ctx) => handleOrdinaryOneShot(data, ctx),
       handleThreadReply: (data, ctx) => handleThreadReply(data, ctx),
       validateTopicHeader: (header, appId) => resolveTopicSpec(header, {
         botCfg: getBot(appId).config,

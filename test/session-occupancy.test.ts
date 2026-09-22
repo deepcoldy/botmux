@@ -244,6 +244,28 @@ describe('load() claims occupancy in the same IMMEDIATE transaction', () => {
     expect(readOccupancyLeaseFromDisk(tempDir, 'appA')).toMatchObject({ bootId: 'boot-successor', ownerPid: 99 });
   });
 
+  it('reports held after taking over a dead or expired predecessor lease', () => {
+    seedPersistedSessionRows(tempDir, 'appA', { s1: row('s1', { larkAppId: 'appA' }) });
+    seedOccupancyLease(tempDir, 'appA', {
+      ownerPid: deadPid(),
+      bootId: 'boot-dead',
+      leaseUntil: Date.now() + 60_000,
+    });
+    init('appA', { occupancy: { bootId: 'boot-successor', pid: 99 } });
+    listSessions();
+    expect(claimOccupancyLease({ bootId: 'boot-successor', pid: 99 })).toBe('held');
+
+    seedOccupancyLease(tempDir, 'appA', {
+      ownerPid: process.pid,
+      bootId: 'boot-expired',
+      leaseUntil: Date.now() - 1,
+    });
+    expect(claimOccupancyLease({ bootId: 'boot-successor', pid: 99 })).toBe('held');
+    expect(readOccupancyLeaseFromDisk(tempDir, 'appA')).toMatchObject({
+      bootId: 'boot-successor', ownerPid: 99,
+    });
+  });
+
   it('a claim that cannot be written does not fail the load — rows load, the error is logged, the tick retries', () => {
     seedPersistedSessionRows(tempDir, 'appA', { s1: row('s1', { larkAppId: 'appA' }) });
     const path = sessionStorePath(tempDir, 'appA');

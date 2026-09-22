@@ -270,6 +270,38 @@ describe('resumeSession', () => {
       if (!r.ok) expect(r.error).toBe('adopt_unsupported');
     });
 
+    it('returns one_shot_unsupported without reactivating a closed per-message session', async () => {
+      const oneShot = {
+        version: 1 as const,
+        mode: 'ordinary_per_message' as const,
+        routingAnchor: 'ordinary-one-shot-v1:route:' + 'e'.repeat(64),
+        visibleLaneKey: 'ordinary-one-shot-v1:visible-lane:' + 'f'.repeat(64),
+        visibleRoute: {
+          chatId: 'oc_chat1',
+          chatType: 'group' as const,
+          scope: 'thread' as const,
+          rootMessageId: 'om_root1',
+        },
+        createdAt: '2026-09-21T00:00:00.000Z',
+        turn: { turnId: 'om_one_shot' },
+      };
+      const s = sessionStore.createSession(
+        'oc_chat1',
+        'om_root1',
+        'One shot',
+        'group',
+        'thread',
+        { oneShot },
+      );
+      sessionStore.closeSession(s.sessionId);
+
+      const r = await resumeSession(s.sessionId, new Map());
+
+      expect(r).toEqual({ ok: false, error: 'one_shot_unsupported' });
+      expect(sessionStore.getSession(s.sessionId)?.status).toBe('closed');
+      expect(sessionStore.getSession(s.sessionId)?.oneShot).toEqual(oneShot);
+    });
+
     it('Plan B: a closed meeting-agent session resumes as an ordinary chat session (no vc_receiver_managed refusal)', async () => {
       // Under Plan B a meeting agent is an ordinary chat-scope session, so a
       // closed one is resumable like any chat session — the vc_receiver_managed

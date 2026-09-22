@@ -510,6 +510,20 @@ describe('scrubInvokerTerminalEnv()', () => {
 });
 
 describe('scrubSessionTurnMarkerEnv()', () => {
+  it('removes the routing anchor and session scope with the other turn markers', () => {
+    const env: NodeJS.ProcessEnv = {
+      BOTMUX_ROUTING_ANCHOR: 'om_anchor',
+      BOTMUX_SESSION_SCOPE: 'thread',
+      KEEP: 'v',
+    };
+
+    scrubSessionTurnMarkerEnv(env);
+
+    expect(env).not.toHaveProperty('BOTMUX_ROUTING_ANCHOR');
+    expect(env).not.toHaveProperty('BOTMUX_SESSION_SCOPE');
+    expect(env.KEEP).toBe('v');
+  });
+
   it('removes turn-scoped session identity, leaving documented ambient config alone', () => {
     const env: NodeJS.ProcessEnv = {
       ...Object.fromEntries(SESSION_TURN_MARKER_ENV_KEYS.map((key) => [key, 'stale-turn'])),
