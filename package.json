@@ -3,9 +3,20 @@
   "version": "0.0.0",
   "description": "Bridge between IM platforms and AI coding CLIs \u2014 one topic, one CLI session with live streaming",
   "type": "module",
+  "exports": {
+    "./services/session-observe": {
+      "types": "./dist/services/session-observe.d.ts",
+      "import": "./dist/services/session-observe.js"
+    },
+    "./services/session-observe-fetch": {
+      "types": "./dist/services/session-observe-fetch.d.ts",
+      "import": "./dist/services/session-observe-fetch.js"
+    }
+  },
   "files": [
     "scripts/postinstall-bin.mjs",
     "scripts/install-path-entry.mjs",
+    "dist",
     "README.md",
     "README.en.md",
     "LICENSE"

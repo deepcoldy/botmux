@@ -1,6 +1,6 @@
 // Canonical worker/session observe projection.
 //
-// Firstmate consumes this shape as the single, machine-readable fact source
+// External consumers use this shape as the single, machine-readable fact source
 // about a botmux session's runtime. Every consumer, CLI or in-process TS,
 // resolves through the same normalizer so that no downstream code re-derives
 // liveness/turn/phase/queued from raw SessionRow fields.
@@ -41,6 +41,7 @@ export type ObserveTurn =
 export type ObservePhase = 'unknown';
 
 export type ObserveQueued = boolean | 'unknown';
+export type ObserveBoolean = boolean | 'unknown';
 
 export type ObserveProbeStatus =
   | 'ok'
@@ -82,7 +83,7 @@ export interface ObserveSession {
   backend: {
     type?: string;
     sessionName?: string;
-    adopted: boolean;
+    adopted: ObserveBoolean;
     workerPid?: number;
     adoptCliPid?: number;
   };
@@ -95,8 +96,8 @@ export interface ObserveSession {
   attention?: { kind: string; reason: string; at: number };
   lastActivityAt?: number;
   workingDirectory?: string;
-  parkedOrSuspended: boolean;
-  closed: boolean;
+  parkedOrSuspended: ObserveBoolean;
+  closed: ObserveBoolean;
   rawStatus?: string;
   raw?: unknown;
 }

@@ -1,9 +1,9 @@
-import type { OnlineDaemonInfo } from '../utils/daemon-discovery.js';
+import type { ObserveFetchOptions } from './session-observe-fetch.js';
 import {
-  fetchObserveSession as fetchObserveSessionPublic,
-  fetchObserveSnapshot as fetchObserveSnapshotPublic,
-  type ObserveFetchOptions,
-} from './session-observe-fetch.js';
+  fetchObserveSessionImplementation,
+  fetchObserveSnapshotImplementation,
+  type ObserveFetchDependencies,
+} from './session-observe-fetch-implementation.js';
 import type { ObserveSession, ObserveSnapshot } from './session-observe.js';
 
 export type DaemonIpcFetch = (
@@ -13,26 +13,13 @@ export type DaemonIpcFetch = (
   secret?: string,
 ) => Promise<Response>;
 
-interface ObserveFetchDependencies {
-  now?: () => number;
-  secret?: string;
-  dataDir?: string;
-  fetch?: DaemonIpcFetch;
-  discover?: (dataDir?: string) => OnlineDaemonInfo[];
-  timeoutMs?: number;
-}
-
 export type InternalObserveFetchOptions = ObserveFetchOptions & ObserveFetchDependencies;
 
 export function fetchObserveSnapshot(
   options: InternalObserveFetchOptions = {},
 ): Promise<ObserveSnapshot> {
   const { larkAppId, includeRaw, ...dependencies } = options;
-  const implementation = fetchObserveSnapshotPublic as unknown as (
-    options: ObserveFetchOptions,
-    dependencies: ObserveFetchDependencies,
-  ) => Promise<ObserveSnapshot>;
-  return implementation({ larkAppId, includeRaw }, dependencies);
+  return fetchObserveSnapshotImplementation({ larkAppId, includeRaw }, dependencies);
 }
 
 export function fetchObserveSession(
@@ -40,10 +27,5 @@ export function fetchObserveSession(
   options: InternalObserveFetchOptions = {},
 ): Promise<ObserveSession> {
   const { larkAppId, includeRaw, ...dependencies } = options;
-  const implementation = fetchObserveSessionPublic as unknown as (
-    sessionId: string,
-    options: ObserveFetchOptions,
-    dependencies: ObserveFetchDependencies,
-  ) => Promise<ObserveSession>;
-  return implementation(sessionId, { larkAppId, includeRaw }, dependencies);
+  return fetchObserveSessionImplementation(sessionId, { larkAppId, includeRaw }, dependencies);
 }

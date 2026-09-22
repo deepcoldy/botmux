@@ -1,9 +1,16 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, expectTypeOf, it } from 'vitest';
 import {
   OBSERVE_SCHEMA_VERSION,
   normalizeSessionRow,
   type RawSessionRow,
 } from '../src/services/session-observe.js';
+import type { ObserveSession } from '../src/services/session-observe.js';
+import type { ObserveFetchOptions } from '../src/services/session-observe-fetch.js';
+
+expectTypeOf<ObserveSession['backend']['adopted']>().toEqualTypeOf<boolean | 'unknown'>();
+expectTypeOf<ObserveSession['parkedOrSuspended']>().toEqualTypeOf<boolean | 'unknown'>();
+expectTypeOf<ObserveSession['closed']>().toEqualTypeOf<boolean | 'unknown'>();
+expectTypeOf<keyof ObserveFetchOptions>().toEqualTypeOf<'larkAppId' | 'includeRaw'>();
 
 const OBSERVED_AT = 1_700_000_000_000;
 

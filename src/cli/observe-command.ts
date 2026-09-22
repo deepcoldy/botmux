@@ -2,7 +2,6 @@
 //
 // Shape (v1):
 //   botmux observe [--session <id>] [--lark-app <appId>] [--include-raw]
-//                  [--json]
 //
 // The command shells out to `fetchObserveSnapshot` / `fetchObserveSession`,
 // which reuse the daemon HMAC loopback IPC. It never talks to backends, tmux,
@@ -34,7 +33,6 @@ function parseArgs(argv: string[]): { ok: true; args: ParsedArgs } | { ok: false
     const raw = argv[i];
     if (raw === '--help' || raw === '-h') { args.help = true; continue; }
     if (raw === '--include-raw') { args.includeRaw = true; continue; }
-    if (raw === '--json') continue;
     if (raw === '--session') {
       const v = argv[++i];
       if (!v) return { ok: false, error: `${raw} 需要一个值` };

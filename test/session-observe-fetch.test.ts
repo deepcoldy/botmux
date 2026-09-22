@@ -245,6 +245,9 @@ describe('fetchObserveSession', () => {
     expect(session.turn).toBe('unknown');
     expect(session.phase).toBe('unknown');
     expect(session.queued).toBe('unknown');
+    expect(session.backend.adopted).toBe('unknown');
+    expect(session.parkedOrSuspended).toBe('unknown');
+    expect(session.closed).toBe('unknown');
   });
 
   it('surfaces daemon_offline when the specified app is not online', async () => {
@@ -257,6 +260,9 @@ describe('fetchObserveSession', () => {
     });
     expect(session.probe).toEqual({ status: 'daemon_offline', source: 'daemon-ipc', larkAppId: 'cli_missing' });
     expect(session.identity.sessionId).toBe('s_x');
+    expect(session.backend.adopted).toBe('unknown');
+    expect(session.parkedOrSuspended).toBe('unknown');
+    expect(session.closed).toBe('unknown');
   });
 
   it('fans out and returns the first ok hit across daemons when no larkAppId is provided', async () => {
@@ -313,6 +319,9 @@ describe('fetchObserveSession', () => {
     expect(session.probe.status).toBe('unauthorized');
     expect(session.identity.sessionId).toBe('s_a');
     expect(session.liveness).toBe('unknown');
+    expect(session.backend.adopted).toBe('unknown');
+    expect(session.parkedOrSuspended).toBe('unknown');
+    expect(session.closed).toBe('unknown');
   });
 
   it.each([
