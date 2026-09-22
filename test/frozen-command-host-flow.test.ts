@@ -560,6 +560,46 @@ describe('Frozen Command host-owned route → callback → Data MCP flow', () =>
     expect(mocks.cardBodies[0]).not.toContain('确认执行');
   });
 
+  it('rejects a valid command definition that the current bot has not approved', async () => {
+    const command = '未批准';
+    writeFileSync(
+      join(root, '.botmux', 'commands', `${command}.yaml`),
+      YAML
+        .replace('status: active\n', '')
+        .replaceAll('宿主闭环', command),
+    );
+    const messageId = `om_unapproved_${Math.random().toString(36).slice(2)}`;
+
+    await modules.daemon.__testOnly_handleNewTopic(
+      ingressEvent(messageId, `@_bot /${command} 11`),
+      ingressContext(messageId, messageId),
+    );
+
+    expect(modules.daemon.__testOnly_activeSessions.get(modules.types.sessionKey(messageId, APP))).toBeUndefined();
+    expect(mocks.validateCalls).toBe(0);
+    expect(mocks.runCalls).toBe(0);
+    expect(mocks.cardBodies.at(-1)).toContain('尚未完成当前机器人批准');
+    expect(mocks.cardBodies.every(body => !body.includes('真实链路：'))).toBe(true);
+  });
+
+  it('returns a stable public error when an approved definition drifts', async () => {
+    writeFileSync(
+      join(root, '.botmux', 'commands', '宿主闭环.yaml'),
+      YAML.replace('SELECT {{value}} * 2', 'SELECT {{value}} * 3'),
+    );
+    const messageId = `om_drifted_${Math.random().toString(36).slice(2)}`;
+
+    await modules.daemon.__testOnly_handleNewTopic(
+      ingressEvent(messageId, '@_bot /宿主闭环 11'),
+      ingressContext(messageId, messageId),
+    );
+
+    expect(mocks.validateCalls).toBe(0);
+    expect(mocks.runCalls).toBe(0);
+    expect(mocks.cardBodies.at(-1)).toContain('固化命令状态异常，已拒绝执行');
+    expect(mocks.cardBodies.at(-1)).not.toContain('定义与已批准版本不一致');
+  });
+
   it('executes an exact natural-language command in an existing thread once without forwarding to the CLI', async () => {
     const rootMessageId = `om_direct_root_${Math.random().toString(36).slice(2)}`;
     await modules.daemon.__testOnly_handleNewTopic(
@@ -628,6 +668,22 @@ describe('Frozen Command host-owned route → callback → Data MCP flow', () =>
     expect(mocks.validateCalls).toBe(0);
     expect(mocks.runCalls).toBe(0);
     expect(mocks.cardBodies.every(body => !body.includes('真实链路：'))).toBe(true);
+  });
+
+  it('does not let a bot sender enumerate frozen commands', async () => {
+    const messageId = `om_bot_list_${Math.random().toString(36).slice(2)}`;
+    const event = ingressEvent(messageId, '@_bot /freeze list');
+    event.sender.sender_type = 'bot';
+
+    await modules.daemon.__testOnly_handleNewTopic(
+      event,
+      ingressContext(messageId, messageId),
+    );
+
+    expect(mocks.cardBodies.at(-1)).toContain('只有身份明确的真人消息可以查看固化命令');
+    expect(mocks.cardBodies.at(-1)).not.toContain('/宿主闭环');
+    expect(mocks.validateCalls).toBe(0);
+    expect(mocks.runCalls).toBe(0);
   });
 
   it.each([

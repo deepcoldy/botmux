@@ -247,9 +247,9 @@ const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { s
 writeFileSync(${JSON.stringify(childPidFile)}, String(child.pid));
 setInterval(() => {}, 1000);
 `);
-    // Leave enough time for the nested process to publish its PID even when
-    // this file runs alongside the daemon/scheduler suites on a busy host.
-    writeFileSync(fixture.registry, readFileSync(fixture.registry, 'utf8').replace('timeoutMs: 5000', 'timeoutMs: 500'));
+    // Leave enough time for the nested process to publish its PID on loaded CI
+    // hosts while still proving that the detached process group is killed.
+    writeFileSync(fixture.registry, readFileSync(fixture.registry, 'utf8').replace('timeoutMs: 5000', 'timeoutMs: 3000'));
     const executor = loadCommandExecutorRegistry(fixture.registry).executors.get('test.echo')!;
     await expect(runProcessCommandExecutor({
       executor,

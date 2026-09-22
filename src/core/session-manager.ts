@@ -4142,7 +4142,7 @@ export async function executeScheduledTask(
       return;
     }
     if (lifecycle.kind === 'fail_closed') {
-      await deliver(`固化命令状态异常，已拒绝执行：${lifecycle.reason}`);
+      await deliver('固化命令状态异常，已拒绝执行。请联系维护方检查批准记录。');
       return;
     }
     if (lookup.kind === 'invalid') {
@@ -4150,6 +4150,10 @@ export async function executeScheduledTask(
       return;
     }
     if (lookup.kind === 'found') {
+      if (lifecycle.kind !== 'active') {
+        await deliver('固化命令尚未完成当前机器人批准，已拒绝执行。请先由管理员接管并批准。');
+        return;
+      }
       const definition = lookup.snapshot.definition;
       const rawArgs = frozenInvocation[2] ?? '';
       const invocationNow = new Date();
@@ -4172,18 +4176,14 @@ export async function executeScheduledTask(
             chat: { id: task.chatId, type: task.chatType },
             message: { id: scheduledTurnId },
           },
-          expectedExecutorRevision: lifecycle.kind === 'active'
-            ? lifecycle.record.executorRevision
-            : undefined,
+          expectedExecutorRevision: lifecycle.record.executorRevision,
           audit: {
             source: 'schedule',
             taskId: task.id,
-            ...(lifecycle.kind === 'active' && lifecycle.record.specHash
+            ...(lifecycle.record.specHash
               ? { specHash: lifecycle.record.specHash }
               : {}),
-            ...(lifecycle.kind === 'active'
-              ? { stateRevisionId: lifecycle.record.stateRevisionId }
-              : {}),
+            stateRevisionId: lifecycle.record.stateRevisionId,
           },
         });
         const output = resolveFrozenCommandScheduledOutput(definition, result);

@@ -279,6 +279,7 @@ onError: fallback_llm
 - \`/freeze confirm <确认码>\`：仅供管理员排障旧卡，不向业务人员展示确认码。
 - 修改口径：重新跑通查询，再按本流程固化并覆盖旧文件。
 - 定时执行：让真人在飞书里直接发送 \`/schedule <规则>，执行 /<命令> [参数]\`。不要代替用户执行 \`botmux schedule add\`；后者不会记录创建人的可信 union_id，Data MCP 会按 fail-closed 拒绝。
+- 静默定时只抑制任务开始横幅和正常成功结果；身份缺失、未批准、已废弃或执行失败等异常仍会主动通知，不能把 \`--silent\` 当成吞掉错误。
 `;
 
 const HISTORY_SKILL = `---

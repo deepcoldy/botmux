@@ -5604,6 +5604,15 @@ async function routeFrozenCommand(input: {
       larkAppId: input.larkAppId,
     }).trim();
     if (args === 'list' || args === 'list --all') {
+      if (input.senderIsBot !== false) {
+        await input.reply(
+          input.anchor,
+          '只有身份明确的真人消息可以查看固化命令。',
+          'text',
+          input.larkAppId,
+        );
+        return { kind: 'handled' };
+      }
       const showRetired = args.endsWith('--all');
       const rows = listFrozenCommandSnapshots(input.workingDir);
       const listedCommands = new Set(rows.map(row => row.command));
@@ -5748,7 +5757,12 @@ async function routeFrozenCommand(input: {
     return { kind: 'handled' };
   }
   if (lifecycle.kind === 'fail_closed') {
-    await input.reply(input.anchor, `固化命令状态异常，已拒绝执行：${lifecycle.reason}`, 'text', input.larkAppId);
+    await input.reply(
+      input.anchor,
+      '固化命令状态异常，已拒绝执行。请联系维护方检查批准记录。',
+      'text',
+      input.larkAppId,
+    );
     return { kind: 'handled' };
   }
 
@@ -5756,6 +5770,15 @@ async function routeFrozenCommand(input: {
   if (lookup.kind === 'missing') return { kind: 'not_found' };
   if (lookup.kind === 'invalid') {
     await input.reply(input.anchor, `固化命令暂不可用：${lookup.error.message}`, 'text', input.larkAppId);
+    return { kind: 'handled' };
+  }
+  if (lifecycle.kind !== 'active') {
+    await input.reply(
+      input.anchor,
+      '固化命令尚未完成当前机器人批准，已拒绝执行。请先由管理员接管并批准。',
+      'text',
+      input.larkAppId,
+    );
     return { kind: 'handled' };
   }
 
@@ -5791,15 +5814,13 @@ async function routeFrozenCommand(input: {
         chat: { id: input.chatId, type: input.chatType },
         message: { id: input.turnId },
       },
-      expectedExecutorRevision: lifecycle.kind === 'active' ? lifecycle.record.executorRevision : undefined,
+      expectedExecutorRevision: lifecycle.record.executorRevision,
       audit: {
         source: 'direct',
-        ...(lifecycle.kind === 'active' && lifecycle.record.specHash
+        ...(lifecycle.record.specHash
           ? { specHash: lifecycle.record.specHash }
           : {}),
-        ...(lifecycle.kind === 'active'
-          ? { stateRevisionId: lifecycle.record.stateRevisionId }
-          : {}),
+        stateRevisionId: lifecycle.record.stateRevisionId,
       },
     });
     await input.reply(input.anchor, result.text, 'text', input.larkAppId);

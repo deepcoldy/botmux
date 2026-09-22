@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSyncTsScript } from './helpers/ts-runner.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
+import { frozenCommandSkillHintForMessage } from '../src/core/frozen-command-guidance.js';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
 const roots: string[] = [];
@@ -14,6 +15,11 @@ afterEach(() => {
 });
 
 describe('frozen-command generic ask guard', () => {
+  it('does not inject the lifecycle hint for an ordinary filesystem operation', () => {
+    expect(frozenCommandSkillHintForMessage('删除 /tmp 目录下的缓存文件')).toBeUndefined();
+    expect(frozenCommandSkillHintForMessage('删除固化命令 /旧命令')).toContain('botmux-freeze');
+  });
+
   it('rejects lifecycle confirmation before contacting the daemon', () => {
     const result = spawnSyncTsScript(
       join(repoRoot, 'src', 'cli.ts'),

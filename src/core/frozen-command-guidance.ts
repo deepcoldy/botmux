@@ -7,14 +7,8 @@ const EXPLICIT_FREEZE_INTENT = [
   /(?:freeze|frozen)\s+command/iu,
 ];
 
-const POSSIBLE_SLASH_COMMAND_LIFECYCLE = [
-  /(?:安装|创建|新增|修改|更新|覆盖|废弃|停用|恢复|撤销|删除).{0,30}(?<![\p{L}\p{N}_\/-])\/[\p{L}\p{N}_-]+(?![\p{L}\p{N}_\/-])/iu,
-  /(?<![\p{L}\p{N}_\/-])\/[\p{L}\p{N}_-]+(?![\p{L}\p{N}_\/-]).{0,30}(?:安装|创建|新增|修改|更新|覆盖|废弃|停用|恢复|撤销|删除)/iu,
-];
-
 const NATURAL_LANGUAGE_FREEZE_INTENT = [
   ...EXPLICIT_FREEZE_INTENT,
-  ...POSSIBLE_SLASH_COMMAND_LIFECYCLE,
   /(?:有哪些|列出|查看|打开).{0,20}固化命令/iu,
   /^(?:运行|执行|run)\s+\/[\p{L}\p{N}_-]+/iu,
 ];

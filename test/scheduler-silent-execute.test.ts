@@ -233,7 +233,10 @@ function baseTask(overrides: Partial<ScheduledTask>): ScheduledTask {
   };
 }
 
-function installScheduledFrozenFixture(yaml: string): { root: string; restore: () => void } {
+function installScheduledFrozenFixture(
+  yaml: string,
+  options: { approve?: boolean } = {},
+): { root: string; restore: () => void } {
   const root = mkdtempSync(join(tmpdir(), 'botmux-scheduled-frozen-'));
   const previousDataDir = config.session.dataDir;
   const previousPlugins = (BOT.config as any).plugins;
@@ -255,6 +258,26 @@ function installScheduledFrozenFixture(yaml: string): { root: string; restore: (
   config.session.dataDir = join(home, '.botmux', 'data');
   (BOT.config as any).plugins = ['data-mcp'];
   installLocalPlugin(source);
+  if (options.approve !== false) {
+    const actor = { openId: 'ou_test', unionId: 'on_test' };
+    const pending = prepareFrozenCommandTransition({
+      dataDir: config.session.dataDir,
+      targetBotId: APP,
+      workingDir: root,
+      command: '/泰国上账',
+      action: 'approve',
+      actor,
+      actorIsAdmin: true,
+      reason: '定时固化命令测试批准',
+    });
+    confirmFrozenCommandTransition({
+      dataDir: config.session.dataDir,
+      targetBotId: APP,
+      token: pending.token,
+      actor,
+      actorIsAdmin: true,
+    });
+  }
   return {
     root,
     restore: () => {
@@ -403,6 +426,55 @@ describe('executeScheduledTask — silent thread fire', () => {
       const resultReply = replyMessageMock.mock.calls.at(-1)?.[2];
       expect(resultReply).toBe('12');
       expect(resultReply).not.toContain('SELECT sum');
+    } finally {
+      fixture.restore();
+    }
+  });
+
+  it('rejects an unapproved frozen command even for a silent schedule', async () => {
+    const fixture = installScheduledFrozenFixture(SCHEDULED_FROZEN_YAML, { approve: false });
+    try {
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账 30',
+        workingDir: fixture.root,
+        rootMessageId: ROOT,
+        scope: 'thread',
+        silent: true,
+        ownerOpenId: 'ou_test',
+        ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+      expect(sendWorkerInputMock).not.toHaveBeenCalled();
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).toContain('尚未完成当前机器人批准');
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).not.toContain('SELECT sum');
+    } finally {
+      fixture.restore();
+    }
+  });
+
+  it('reports a stable public error when an approved scheduled command drifts', async () => {
+    const fixture = installScheduledFrozenFixture(SCHEDULED_FROZEN_YAML);
+    try {
+      writeFileSync(
+        join(fixture.root, '.botmux', 'commands', '泰国上账.yaml'),
+        SCHEDULED_FROZEN_YAML.replace('SELECT sum(amount)', 'SELECT avg(amount)'),
+      );
+
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账 30',
+        workingDir: fixture.root,
+        rootMessageId: ROOT,
+        scope: 'thread',
+        silent: true,
+        ownerOpenId: 'ou_test',
+        ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+      expect(sendWorkerInputMock).not.toHaveBeenCalled();
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).toContain('固化命令状态异常，已拒绝执行');
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).not.toContain('定义与已批准版本不一致');
     } finally {
       fixture.restore();
     }

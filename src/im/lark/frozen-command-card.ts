@@ -83,7 +83,7 @@ export function buildFrozenCommandCenterCard(input: {
     tag: 'div',
     text: {
       tag: 'lark_md',
-      content: '需要执行时直接说“运行 /命令 参数”。系统会先展示操作确认卡，不会直接执行。',
+      content: '需要执行时直接发送“/命令 参数”或“运行 /命令 参数”。系统会直接执行，不再展示运行确认卡。',
     },
   });
   return card({

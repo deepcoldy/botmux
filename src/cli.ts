@@ -130,6 +130,7 @@ import { withFileLock, withFileLockSync, FileLockTimeoutError } from './utils/fi
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional, hasFlagOrEq, unknownFlags } from './cli/arg-utils.js';
+import { frozenCommandLifecycleFlagValue } from './cli/frozen-command-args.js';
 import { parseDispatchArgs } from './cli/dispatch-args.js';
 import { isColdResumeDormant, isRealManagedSession, sessionListDisposition } from './cli/session-list-liveness.js';
 import {
@@ -13353,18 +13354,9 @@ async function cmdFreeze(rest: string[]): Promise<void> {
   try {
     let lifecycleFields: Record<string, unknown> = {};
     if (lifecycleOperation) {
-      const flagValue = (flag: string): string | undefined => {
-        const index = rest.indexOf(flag);
-        if (index < 0) return undefined;
-        const values: string[] = [];
-        for (let cursor = index + 1; cursor < rest.length && !rest[cursor]!.startsWith('--'); cursor += 1) {
-          values.push(rest[cursor]!);
-        }
-        return values.join(' ').trim() || undefined;
-      };
-      const reason = flagValue('--reason');
-      const replacement = flagValue('--replacement');
-      const definitionFile = flagValue('--file');
+      const reason = frozenCommandLifecycleFlagValue(rest, '--reason');
+      const replacement = frozenCommandLifecycleFlagValue(rest, '--replacement');
+      const definitionFile = frozenCommandLifecycleFlagValue(rest, '--file');
       if (!reason || (lifecycleOperation === 'approve' && !definitionFile)) {
         throw new Error(lifecycleOperation === 'approve'
           ? 'botmux freeze apply: 必须提供 --file <草稿> 和 --reason <原因>'

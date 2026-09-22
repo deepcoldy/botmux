@@ -884,14 +884,18 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     }
   });
 
-  it('passes tenant-stable actor identity into frozen-command routing on both new-topic and thread paths', () => {
+  it('passes tenant-stable actor identity into all frozen-command routing paths', () => {
     const routes = [...daemonSource.matchAll(/const frozen = await routeFrozenCommand\(\{([\s\S]*?)\n\s*\}\);/gu)]
       .map(match => match[1]);
-    expect(routes).toHaveLength(2);
+    expect(routes).toHaveLength(4);
     expect(routes[0]).toContain('chatId,');
     expect(routes[0]).toContain('senderUnionId,');
-    expect(routes[1]).toContain('chatId: effectiveThreadChatId,');
-    expect(routes[1]).toContain('senderUnionId: threadSenderUnionId,');
+    expect(routes[1]).toContain('chatId,');
+    expect(routes[1]).toContain('senderUnionId,');
+    expect(routes[2]).toContain('chatId: effectiveThreadChatId,');
+    expect(routes[2]).toContain('senderUnionId: threadSenderUnionId,');
+    expect(routes[3]).toContain('chatId: effectiveThreadChatId,');
+    expect(routes[3]).toContain('senderUnionId: threadSenderUnionId,');
     expect(daemonSource).toContain(
       'actorIsAdmin: canManageFrozenCommands(input.larkAppId, input.senderUnionId),',
     );

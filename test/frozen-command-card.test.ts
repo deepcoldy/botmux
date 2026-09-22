@@ -61,6 +61,8 @@ describe('Frozen Command business cards', () => {
     expect(rendered).toContain('财务助手');
     expect(rendered).toContain('工作目录');
     expect(rendered).toContain('已废弃');
+    expect(rendered).toContain('系统会直接执行，不再展示运行确认卡');
+    expect(rendered).not.toContain('系统会先展示操作确认卡');
     expect(rendered).not.toContain('SELECT');
     expect(rendered).not.toContain('sql');
   });
