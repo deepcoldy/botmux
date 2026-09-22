@@ -37,8 +37,6 @@ export interface ObserveFetchOptions {
   /** Restrict to a single daemon by its Lark app id; otherwise every online
    *  daemon is probed and its envelope aggregated. */
   larkAppId?: string;
-  /** Optional session id filter for single-session lookups. */
-  sessionId?: string;
   /** Include the raw SessionRow beneath `session.raw` for diagnostics. Off by
    *  default because callers typically consume only the canonical fields. */
   includeRaw?: boolean;
@@ -268,9 +266,20 @@ export async function fetchObserveSession(
     outcome.kind === 'ok'
   ));
   if (hit) return hit.session;
-  const lastFailure = outcomes.at(-1);
+  const failures = outcomes.filter((outcome): outcome is Exclude<SessionProbeOutcome, { kind: 'ok' }> => (
+    outcome.kind !== 'ok'
+  ));
+  const failurePrecedence: ObserveProbeStatus[] = [
+    'unauthorized',
+    'unreachable',
+    'not_found',
+    'daemon_offline',
+  ];
+  const selectedFailure = failurePrecedence
+    .map(status => failures.filter(outcome => outcome.probe.status === status).at(-1))
+    .find((outcome): outcome is Exclude<SessionProbeOutcome, { kind: 'ok' }> => outcome !== undefined);
 
-  return synthesizeMissingSession(sessionId, observedAt, lastFailure?.probe ?? {
+  return synthesizeMissingSession(sessionId, observedAt, selectedFailure?.probe ?? {
     status: 'not_found',
     source: 'daemon-ipc',
   });

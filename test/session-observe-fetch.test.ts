@@ -314,4 +314,29 @@ describe('fetchObserveSession', () => {
     expect(session.identity.sessionId).toBe('s_a');
     expect(session.liveness).toBe('unknown');
   });
+
+  it.each([
+    { order: 'unauthorized then not_found', statuses: [401, 404] },
+    { order: 'not_found then unauthorized', statuses: [404, 401] },
+  ])('prioritizes unauthorized over not_found regardless of daemon order: $order', async ({ statuses }) => {
+    const daemons = [
+      makeDaemon({ larkAppId: 'cli_app_alpha', ipcPort: 4310 }),
+      makeDaemon({ larkAppId: 'cli_app_beta', ipcPort: 4311 }),
+    ];
+    const fetch: DaemonIpcFetch = async port => {
+      const status = statuses[port - 4310]!;
+      return new Response(status === 401 ? 'unauthorized' : JSON.stringify({ error: 'not_found' }), { status });
+    };
+
+    const session = await fetchObserveSession('s_mixed_miss', {
+      now: () => OBSERVED_AT,
+      secret: 'test',
+      discover: () => daemons,
+      fetch,
+    });
+
+    expect(session.identity.sessionId).toBe('s_mixed_miss');
+    expect(session.probe.status).toBe('unauthorized');
+    expect(session.liveness).toBe('unknown');
+  });
 });

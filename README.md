@@ -79,6 +79,8 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 
 更多：[角色与团队](https://deepcoldy.github.io/botmux/roles) · [文件沙盒](https://deepcoldy.github.io/botmux/sandbox) · [Dashboard 管控面](https://deepcoldy.github.io/botmux/dashboard) · [tmux 会话常驻](https://deepcoldy.github.io/botmux/tmux) · [飞书会议智能体（效果展示）](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg)。
 
+运维或集成方可用 `botmux observe [--session <id>] [--lark-app <appId>] [--include-raw]` 读取 daemon 实时发布的 canonical worker/session JSON。探针失败会明确返回 `unknown`/probe outcome，不读取旧缓存。
+
 ## 支持的 CLI / Agent
 
 `bots.json` 里用 `cliId` 一键切换。**20+ 适配器**，覆盖本地 CLI（进程隔离，`tmux attach` 可直连）和 API / 云 Agent（如 Mira、riff——通过 API / 远端接入，非本地进程；mojo 为 API 驱动、默认在宿主机执行工具，可配 cloud: true 走云沙箱）。代表项：

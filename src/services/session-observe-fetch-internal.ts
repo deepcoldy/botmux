@@ -27,19 +27,19 @@ export type InternalObserveFetchOptions = ObserveFetchOptions & ObserveFetchDepe
 export function fetchObserveSnapshot(
   options: InternalObserveFetchOptions = {},
 ): Promise<ObserveSnapshot> {
-  const { larkAppId, sessionId, includeRaw, ...dependencies } = options;
+  const { larkAppId, includeRaw, ...dependencies } = options;
   const implementation = fetchObserveSnapshotPublic as unknown as (
     options: ObserveFetchOptions,
     dependencies: ObserveFetchDependencies,
   ) => Promise<ObserveSnapshot>;
-  return implementation({ larkAppId, sessionId, includeRaw }, dependencies);
+  return implementation({ larkAppId, includeRaw }, dependencies);
 }
 
 export function fetchObserveSession(
   sessionId: string,
   options: InternalObserveFetchOptions = {},
 ): Promise<ObserveSession> {
-  const { larkAppId, sessionId: _sessionId, includeRaw, ...dependencies } = options;
+  const { larkAppId, includeRaw, ...dependencies } = options;
   const implementation = fetchObserveSessionPublic as unknown as (
     sessionId: string,
     options: ObserveFetchOptions,

@@ -18,7 +18,7 @@
 | `src/cli/observe-command.ts` | `botmux observe` 子命令（`--session`/`--lark-app`/`--include-raw`/`--json`）。|
 | `src/cli.ts` | 在 top-level `switch (command)` 中注册 `case 'observe'`。|
 | `test/session-observe.test.ts` | 13 用例：normalizer 覆盖 working/idle/starting/dormant/closed/queued/unknown status/attention/adopt/no-phase/probe not_found/cliId=unknown/includeRaw。|
-| `test/session-observe-fetch.test.ts` | 13 用例：通过 internal seam 注入 discover + fetch，覆盖 pty/tmux + 至少两种 CLI adapter、unauthorized、请求与响应体超时、malformed body、多 daemon、not_found、daemon_offline、并发 fan-out。|
+| `test/session-observe-fetch.test.ts` | 15 用例：通过 internal seam 注入 discover + fetch，覆盖 pty/tmux + 至少两种 CLI adapter、unauthorized、请求与响应体超时、malformed body、多 daemon、not_found、daemon_offline、并发 fan-out 与混合失败优先级。|
 
 ## 契约（v1）
 ### `ObserveSession`
@@ -40,7 +40,7 @@
 
 ### 顶层结构
 - `fetchObserveSnapshot({larkAppId?, includeRaw?})` → `ObserveSnapshot { daemons: ObserveDaemonEnvelope[] }`。每个 daemon 独立一个 envelope，故 A 挂 B 不受影响。指定 `larkAppId` 且该 daemon 离线 → 一个 `daemon_offline` envelope。
-- `fetchObserveSession(sessionId, {larkAppId?, includeRaw?})` → `ObserveSession`；无 `larkAppId` 时并发探测所有在线 daemon，并按 discovery 顺序选择第一个 `ok`；全部 `not_found`/失败时返回带 identity 的合成对象，`probe` 记录失败。
+- `fetchObserveSession(sessionId, {larkAppId?, includeRaw?})` → `ObserveSession`；无 `larkAppId` 时并发探测所有在线 daemon，并按 discovery 顺序选择第一个 `ok`；全未命中时按 `unauthorized > unreachable > not_found > daemon_offline` 选择失败，返回带 identity 的合成对象。snapshot options 不接受 `sessionId`，避免静默无效的查询参数。
 
 ## 复用矩阵（Captain 要求的对照）
 | 字段 | 事实源 | 实时/缓存语义 | 失败行为 |
@@ -66,7 +66,7 @@
 
 ## 验证证据
 - `bun run build` 通过（tsc + dashboard 前端）。
-- `bun test test/session-observe.test.ts test/session-observe-fetch.test.ts` → 26/26 passed（13 normalizer + 13 façade behavior）。
+- `bun test test/session-observe.test.ts test/session-observe-fetch.test.ts` → 28/28 passed（13 normalizer + 15 façade behavior）。
 - `bun run test`（全量单测）**在同一工作树、切换到未修改的 master 时的失败集与包含本次改动时完全一致**：`session-store-sqlite-poisoned-recovery`（期望 `bunVersion==='1.4.2'`，本机 1.4.0）、`worker-codex-app-turn-routing.integration`、`schedule-store-dashboard-watch`、`statusline-cli`、`session-store-sqlite-bun-import`、`plugin-mcp-sandbox`、`sandbox-session-data-dir`、`native-subagent-runtime-hook` 等。这些失败与 observe seam 无关（对照 stash 前后同一 vitest 输出）。故不视为本任务回归；不修复不属于任务范围。
 - `botmux observe --help` 在编译产物上返回正确 usage。
 - 未启动/重启 live daemon；未合并 PR；未推 tag。
