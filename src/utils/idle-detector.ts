@@ -68,6 +68,8 @@ export class IdleDetector {
   private startupTail = '';
   private startupPending = false;
   private startupComplete = false;
+  private startupResume: CliAdapter['startupResume'];
+  private startupHistorySeen = false;
   /** Pre-idle latch for static busy screens (capacity queue). Set from PTY
    *  chunks carrying explicit static-busy evidence (scanned across chunks
    *  via the rolling tail); suppresses screen-derived idle until a chunk
@@ -79,7 +81,7 @@ export class IdleDetector {
    *  and must not re-set the latch. -1 = no clear recorded. */
   private staticBusyClearTailPos = -1;
 
-  constructor(cli: CliAdapter) {
+  constructor(cli: CliAdapter, private readonly captureStartupScreen?: () => string) {
     this.completionPattern = cli.completionPattern;
     this.idleToBusyPattern = cli.idleToBusyPattern;
     this.staticBusyPattern = cli.staticBusyPattern;
@@ -87,6 +89,7 @@ export class IdleDetector {
     this.readyPattern = cli.readyPattern;
     this.startupPendingPattern = cli.startupPendingPattern;
     this.startupReadyPattern = cli.startupReadyPattern;
+    this.startupResume = cli.startupResume;
     this.firstPromptQuiescenceMs = cli.firstPromptQuiescenceMs;
     this.startupReadyFromHistory = cli.startupReadyFromHistory;
   }
@@ -138,6 +141,7 @@ export class IdleDetector {
       // leave escape fragments inside the word and miss the startup hold.
       const rawStartup = this.startupTail + data;
       const startup = this.stripAnsi(rawStartup);
+      if (this.startupResume?.historyPattern.test(startup)) this.startupHistorySeen = true;
       const pendingAt = lastMatchIndex(this.startupPendingPattern, startup);
       const readyAt = this.startupReadyPattern
         ? lastMatchIndex(this.startupReadyPattern, startup)
@@ -147,9 +151,7 @@ export class IdleDetector {
       // banner after the actual loaded banner. Treat that exactly like two
       // feeds: once fully initialized, later text cannot re-arm startup.
       if (readyAt >= 0) {
-        this.startupComplete = true;
-        this.startupPending = false;
-        this.startupTail = '';
+        this.markStartupComplete();
       } else {
         if (pendingAt >= 0) this.startupPending = true;
         // Keep split banner evidence without retaining startup output
@@ -308,15 +310,21 @@ export class IdleDetector {
     if (this.isIdle) return;
     // Actual transcript completion proves the session initialized, even if
     // its loaded banner was omitted or the operator customized the footer.
-    this.startupComplete = true;
-    this.startupPending = false;
-    this.startupTail = '';
+    this.markStartupComplete();
     this.markIdle('external');
   }
 
   /** Shared by the worker's screen-ready and hard-timeout write paths. */
   isStartupPending(): boolean {
     return this.startupPending && !this.startupComplete;
+  }
+
+  /** Initialization is not a synthetic turn completion. */
+  private markStartupComplete(): void {
+    this.startupComplete = true;
+    this.startupPending = false;
+    this.startupTail = '';
+    this.startupHistorySeen = false;
   }
 
   /** Positive initialization evidence, retained across resync/turn resets. */
@@ -392,7 +400,13 @@ export class IdleDetector {
   private quiescenceCheck(): void {
     this.quiescenceTimer = null;
     if (this.isIdle) return;
-    if (this.isStartupPending()) return;
+    if (this.isStartupPending()) {
+      if (!this.startupHistorySeen || !this.startupResume || !this.captureStartupScreen) return;
+      let screen: string;
+      try { screen = this.captureStartupScreen(); } catch { return; }
+      if (!this.startupResume.isReady(screen)) return;
+      this.markStartupComplete();
+    }
     // Explicit static-busy evidence (capacity queue): the screen is not
     // quiescing into a prompt — it is parked on a queue notice. Do not mark
     // idle and do not re-arm: the latch clears on the composer redraw, whose

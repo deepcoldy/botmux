@@ -135,6 +135,22 @@ export interface LarkCliIdentity extends TurnBound {
   userAccessToken: string;
 }
 
+/**
+ * Run lark-cli as a person by pointing HOME at their own lark-cli HOME.
+ *
+ * The device-code (QR) identity: the person scanned once, lark-cli stored their
+ * token under this HOME, and the wrapper only exports HOME for the call. No
+ * token passes through the environment — unlike {@link LarkCliIdentity}, which
+ * injects a token the daemon obtained. The exported HOME is scoped to this one
+ * exec, so the parent CLI and every other tool keep the machine's HOME.
+ */
+export interface LarkCliHomeIdentity extends TurnBound {
+  tool: 'lark-cli';
+  mode: 'user-home';
+  /** Absolute per-person HOME the child lark-cli sees. */
+  home: string;
+}
+
 export interface BytedCliIdentity extends TurnBound {
   tool: 'bytedcli';
   cloudJwt: string;
@@ -174,7 +190,7 @@ export interface DeniedIdentity extends TurnBound {
   message: string;
 }
 
-export type CliIdentity = LarkCliIdentity | BytedCliIdentity | BotIdentity | DeniedIdentity;
+export type CliIdentity = LarkCliIdentity | LarkCliHomeIdentity | BytedCliIdentity | BotIdentity | DeniedIdentity;
 
 /** Exit code for a command refused for want of authorization. Distinct from the
  *  tool's own failures so callers can tell "not allowed" from "did not work".
@@ -188,6 +204,9 @@ const DENY_MSG_VAR = 'BOTMUX_IDENTITY_DENY_MSG';
 /** The turn these credentials belong to; compared against the worker's live
  *  turn file before they may be used. */
 const TURN_VAR = 'BOTMUX_IDENTITY_TURN';
+/** Per-person HOME for the device-code lark-cli identity. Scoped to the child
+ *  exec only — the wrapper sets it inline, never inheriting a parent value. */
+const HOME_VAR = 'BOTMUX_IDENTITY_HOME';
 
 /**
  * Values must survive `.` (source) in `/bin/sh` unchanged.
@@ -216,6 +235,11 @@ export function renderIdentityEnv(identity: CliIdentity): string {
       ['LARKSUITE_CLI_APP_ID', identity.appId],
       ['LARKSUITE_CLI_APP_SECRET', identity.appSecret],
     );
+  } else if ('mode' in identity && identity.mode === 'user-home') {
+    // Device-code identity: the child lark-cli resolves config/creds from this
+    // HOME. HOME is exported (not APP_ID/TOKEN), so no credential text is in the
+    // identity file at all.
+    pairs.push([MODE_VAR, 'user-home'], [HOME_VAR, identity.home]);
   } else if (identity.tool === 'lark-cli') {
     pairs.push(
       [MODE_VAR, 'user'],
@@ -383,6 +407,19 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     '  user|bot)',
     `    export ${exportKeys}`,
     '    ;;',
+    '  user-home)',
+    // Device-code identity. HOME is scoped to THIS exec only: assign it inline
+    // to the lark-cli process rather than `export`-ing, so a sibling command or
+    // a later exec in the same shell keeps the machine HOME. The directory is
+    // validated: an empty/missing HOME would make lark-cli fall back to the
+    // operator's on-disk login, which is precisely the wrong person.
+    `    if [ -z "$${HOME_VAR}" ] || [ ! -d "$${HOME_VAR}" ]; then`,
+    `      printf '%s\\n' 'botmux: ${tool} 的按人身份目录缺失，命令未执行。请重新发送 /login 完成授权后重试。' >&2`,
+    `      exit ${IDENTITY_DENIED_EXIT_CODE}`,
+    '    fi',
+    `    unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR}`,
+    `    HOME="$${HOME_VAR}" exec ${shellSingleQuote(realBinaryPath)} "$@"`,
+    '    ;;',
     '  turn-mismatch)',
     `    printf '%s\\n' 'botmux: 这条命令属于上一轮对话，而凭证已经切换到新消息的发起人；为避免用错人的权限，命令未执行。' >&2`,
     `    printf '%s\\n' 'botmux: 请等当前这轮结束后重试，或由本轮发起人重新发起该操作。' >&2`,
@@ -399,7 +436,7 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     `    exit ${IDENTITY_DENIED_EXIT_CODE}`,
     '    ;;',
     'esac',
-    `unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR}`,
+    `unset ${MODE_VAR} ${DENY_MSG_VAR} ${TURN_VAR} ${HOME_VAR}`,
     `exec ${shellSingleQuote(realBinaryPath)} "$@"`,
     '',
   ].join('\n');

@@ -824,6 +824,30 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
+  it('restores same-named ZMX targets from their individual persisted directories', async () => {
+    const first = makeActivePersistentSession('om_zmx_directory_a', 'zmx');
+    const second = makeActivePersistentSession('om_zmx_directory_b', 'zmx');
+    first.persistentBackendTarget = { backendType: 'zmx', sessionName: 'bmx-same', socketDir: '/tmp/restore-a' };
+    second.persistentBackendTarget = { backendType: 'zmx', sessionName: 'bmx-same', socketDir: '/tmp/restore-b' };
+    sessionStore.updateSession(first);
+    sessionStore.updateSession(second);
+    const snapshot = (env?: NodeJS.ProcessEnv) => ({
+      ok: true as const, sessions: env?.ZMX_DIR === '/tmp/restore-a' ? ['bmx-same'] : [],
+      unhealthySessions: [], raw: '',
+    });
+    vi.mocked(ZmxBackend.probeSessions).mockImplementationOnce(snapshot).mockImplementationOnce(snapshot);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(ZmxBackend.probeSessions).toHaveBeenCalledTimes(2);
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(forkWorker).toHaveBeenCalledWith(expect.objectContaining({ session: expect.objectContaining({ sessionId: first.sessionId }) }), '', true);
+    expect(sessionStore.getSession(second.sessionId)!.status).toBe('active');
+    expect(closeSession).not.toHaveBeenCalled();
+  });
+
   it('classifies multiple ZMX restore rows from one full-list snapshot', async () => {
     const first = makeActivePersistentSession('om_zmx_batch_1', 'zmx');
     const second = makeActivePersistentSession('om_zmx_batch_2', 'zmx');

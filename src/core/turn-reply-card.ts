@@ -178,7 +178,7 @@ export async function flushTurnReplyTools(ds: DaemonSession, turnId: string, dis
   const cfg = getBot(ds.larkAppId).config;
   const visible = ds.cotForced || replyCardPresentation(cfg, ds.chatId).showProcess;
   const work = updateTurnReplyCard(ds, turnId, {
-    kind: 'tools', tools: visible ? publicReplyCardTools(next.msg.entries, cfg.thinkingCardToolResult !== false) : [],
+    kind: 'tools', tools: visible ? publicReplyCardTools(next.msg.entries, true) : [],
     activity: visible ? publicReplyCardActivity(next.msg.entries) : [],
   }, next.send, { dispatchAttempt, owns: next.owns }).then(() => undefined);
   let running = toolFlushes.get(ds);

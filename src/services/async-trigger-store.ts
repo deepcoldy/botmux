@@ -284,6 +284,67 @@ export function recordSteerParked(
   });
 }
 
+export type SupersedePendingTriggerOutcome =
+  | 'superseded'
+  | 'already_superseded'
+  | 'predecessor_steer_parked'
+  | 'predecessor_not_pending'
+  | 'successor_not_completed';
+
+/**
+ * Terminalize one exact pending trigger only when one exact successor trigger in
+ * the same session is durably completed. The caller owns proof of the external
+ * causal link (for example a handoff receipt's predecessorReceiptFile); this
+ * store deliberately never infers causality from timestamps or trigger order.
+ * Later authoritative worker completion or terminal failure may replace this
+ * marker through the normal completed-wins persistence contract.
+ */
+export function supersedePendingTriggerByCompletedSuccessorStrict(
+  sessionId: string,
+  predecessorTriggerId: string,
+  successorTriggerId: string,
+  supersededAt: number,
+  ownerLarkAppId: string,
+): SupersedePendingTriggerOutcome {
+  if (!ownerLarkAppId) throw new Error('supersedePendingTriggerByCompletedSuccessorStrict requires ownerLarkAppId');
+  if (!predecessorTriggerId || !successorTriggerId || predecessorTriggerId === successorTriggerId) {
+    throw new Error('supersedePendingTriggerByCompletedSuccessorStrict requires distinct trigger ids');
+  }
+  ensureDir();
+  return withFileLockSync(getFilePath(sessionId), () => {
+    const file = loadStrict(sessionId);
+    if (file.ownerLarkAppId && file.ownerLarkAppId !== ownerLarkAppId) {
+      throw new Error(`supersedePendingTriggerByCompletedSuccessorStrict owner mismatch: file owned by ${file.ownerLarkAppId}, caller ${ownerLarkAppId}`);
+    }
+    const predecessor = file.results[predecessorTriggerId];
+    const successor = file.results[successorTriggerId];
+    if (!isValidPersistedResult(successor) || successor.status !== 'completed') return 'successor_not_completed';
+    if (predecessor?.status === 'failed'
+      && predecessor.reason === 'turn_terminal'
+      && predecessor.terminalErrorCode === `superseded_by_completed_successor:${successorTriggerId}`) {
+      return 'already_superseded';
+    }
+    // Steer owns the parked member's final result, including after a restart.
+    if (predecessor?.status === 'pending' && predecessor.steerParkedBy) {
+      return 'predecessor_steer_parked';
+    }
+    const replaceableAmbiguousFailure = predecessor?.status === 'failed'
+      && predecessor.reason === 'dispatch_unknown';
+    if (predecessor?.status !== 'pending' && !replaceableAmbiguousFailure) return 'predecessor_not_pending';
+    file.ownerLarkAppId = ownerLarkAppId;
+    file.results[predecessorTriggerId] = {
+      status: 'failed',
+      createdAt: predecessor.createdAt,
+      failedAt: supersededAt,
+      errorCode: 'trigger_failed',
+      reason: 'turn_terminal',
+      terminalErrorCode: `superseded_by_completed_successor:${successorTriggerId}`,
+    };
+    saveStrict(sessionId, file);
+    return 'superseded';
+  });
+}
+
 /**
  * Record a durable `failed` async outcome (STRICT). This is the authoritative
  * terminal state the idempotency reconcile/barrier writes for a

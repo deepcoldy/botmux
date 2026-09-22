@@ -14,6 +14,7 @@ import { TmuxPipeBackend } from './tmux-pipe-backend.js';
 import { ZellijBackend } from './zellij-backend.js';
 import { ZmxBackend } from './zmx-backend.js';
 import { classifyTmuxProbeFailure } from '../../setup/ensure-tmux.js';
+import { resolveZmxSocketDir, zmxEnv } from '../../setup/ensure-zmx.js';
 import type { BackendType, PersistentBackendTarget, SessionBackend } from './types.js';
 
 const MANAGED_HERDR_AGENT_PREFIX = 'botmux-';
@@ -332,14 +333,18 @@ export function selectSessionBackend(opts: {
   }
 
   if (opts.backendType === 'zmx') {
-    const sessionName = ZmxBackend.sessionName(opts.sessionId);
-    const reattach = opts.hasExistingSession ?? ZmxBackend.hasSession(sessionName);
+    const recorded = opts.persistentBackendTarget?.backendType === 'zmx'
+      ? opts.persistentBackendTarget : undefined;
+    const sessionName = recorded?.sessionName ?? ZmxBackend.sessionName(opts.sessionId);
+    const socketDir = recorded?.socketDir ?? resolveZmxSocketDir();
+    const reattach = opts.hasExistingSession ?? ZmxBackend.hasSession(sessionName, zmxEnv(process.env, socketDir));
     return {
       backend: new ZmxBackend(sessionName, {
         ownsSession: true,
         isReattach: reattach,
         sessionId: opts.sessionId,
         recoveryStateDir: opts.zmxRecoveryStateDir,
+        socketDir,
       }),
       isTmuxMode: false,
       // ZMX is observed out-of-band (`zmx tail`) and driven independently
@@ -348,7 +353,7 @@ export function selectSessionBackend(opts: {
       isPipeMode: true,
       isZellijMode: false,
       persistentSessionName: sessionName,
-      persistentBackendTarget: { backendType: 'zmx', sessionName },
+      persistentBackendTarget: { backendType: 'zmx', sessionName, socketDir },
       isReattach: reattach,
     };
   }

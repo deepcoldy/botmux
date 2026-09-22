@@ -276,8 +276,8 @@ function buildManagedAttachCommand(ds: DaemonSession): LocalCliOpenResult {
     }
     return { ok: true, command: `herdr session attach ${shellQuote(target.sessionName)}` };
   }
-  if (backendType === 'zmx') {
-    const socketEnv = ['ZMX_DIR', 'XDG_RUNTIME_DIR', 'TMPDIR']
+  if (target.backendType === 'zmx') {
+    const socketEnv = (target.socketDir === undefined ? ['ZMX_DIR', 'XDG_RUNTIME_DIR', 'TMPDIR'] : [])
       .flatMap((key) => process.env[key] ? [`export ${key}=${shellQuote(process.env[key]!)}`] : []);
     const prelude = [
       'unset ZMX_SESSION ZMX_SESSION_PREFIX',
@@ -289,6 +289,7 @@ function buildManagedAttachCommand(ds: DaemonSession): LocalCliOpenResult {
       '__zmx-attach-managed',
       shellQuote(target.sessionName),
       shellQuote(ds.session.sessionId),
+      ...(target.socketDir !== undefined ? [shellQuote(target.socketDir)] : []),
     ].join(' ');
     return {
       ok: true,

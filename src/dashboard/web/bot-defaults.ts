@@ -120,14 +120,12 @@ export type BotDefaultsRow = {
   pinStreamingCard?: boolean;
   silentTurnReactions?: boolean;
   codexAppCleanInput?: boolean;
+  codexBrowser?: boolean;
   writableTerminalLinkInCard?: boolean;
   privateCard?: boolean;
   /** Bot-level master switch for the native CoT (thinking process) message.
    *  Default ON — only an explicit false means disabled. */
-  thinkingCard?: boolean;
-  /** 思考气泡是否附带工具输出代码块。默认 ON —— 只有显式 false 表示关闭；
-   *  thinkingCard 关闭时无意义。 */
-  thinkingCardToolResult?: boolean;
+  cotEnabled?: boolean;
   /** Whether each turn carries the `<sender>` speaker tag. Default ON — only an
    *  explicit false means the tag is suppressed. */
   senderTag?: boolean;
@@ -179,6 +177,8 @@ export type BotDefaultsRow = {
   launchShell?: string;
   env?: string;
   riff?: Record<string, unknown> | null;
+  /** 被动入群时自动把 owner 拉进群。缺省 ON —— 只有显式 false 表示关闭。 */
+  autoInviteOwnerOnGroupAdd?: boolean;
   autoStartOnGroupJoin?: boolean;
   autoStartOnGroupJoinPrompt?: string;
   autoStartOnGroupJoinSeed?: string;

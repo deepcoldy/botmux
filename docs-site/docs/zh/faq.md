@@ -117,7 +117,7 @@ botmux 权限分两层（完整分层见 [权限与授权](/permissions)，速�
 
 ## 能禁止别人把这个 bot 拉进群吗？
 
-「谁能把机器人加进群」由**飞书平台侧**控制（应用可用范围 / 群机器人添加权限），botmux 没有、也伪造不了这个开关。bot 侧能做的两件事：① Dashboard「Bot 默认 → 主动开工」关掉「**被拉进新群自动开工**」（`autoStartOnGroupJoin`，且该闸本身还要求群里有授权用户）；② 保持限制态——**拉群不等于授权**，非名单成员 @ 它会被拦并弹申请卡给 owner。是否自动把 owner 拉进新群由 `bots.json` 的 `autoInviteOwnerOnGroupAdd`（默认开）控制。
+「谁能把机器人加进群」由**飞书平台侧**控制（应用可用范围 / 群机器人添加权限），botmux 没有、也伪造不了这个开关。bot 侧能做的两件事：① Dashboard「Bot 默认 → 主动开工」关掉「**被拉进新群自动开工**」（`autoStartOnGroupJoin`，且该闸本身还要求群里有授权用户）；② 保持限制态——**拉群不等于授权**，非名单成员 @ 它会被拦并弹申请卡给 owner。是否自动把 owner 拉进新群由 `autoInviteOwnerOnGroupAdd` 控制（默认开）：可在 Dashboard「Bot 默认 → 主动开工」关、飞书 `/botconfig set autoInviteOwnerOnGroupAdd off` 关，也可写 `bots.json`；关闭适用于告警/oncall 平台批量把 bot 拉进事件群、不想打扰 owner 的场景。
 
 ## 运行中的会话能临时追问 / 打断吗？
 

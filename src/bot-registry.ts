@@ -1976,15 +1976,10 @@ export interface BotConfig {
    * Requires a transcript-backed CLI (claude-code and codex today); other
    * CLIs simply never emit the thinking channel. Per-chat opt-out via
    * {@link noCotChats} (`/cot off`).
-   */
-  thinkingCard?: boolean;
-  /** 思考气泡是否附带工具输出（TOOL_CALL_RESULT 代码块）。默认 ON（缺省 =
-   *  开；只有显式 false 持久化）。off 时气泡只保留思考段落与工具节点标题
-   *  （工具名 · 命令/路径），与 Claude Code 自身界面一致。子开关：
-   *  {@link thinkingCard} 关闭时无意义。 */
-  thinkingCardToolResult?: boolean;
+  */
+  cotEnabled?: boolean;
   /** chat_id list: chats where the CoT (thinking process) message is suppressed
-   *  even when {@link thinkingCard} is on. Written by `/cot off|on`. */
+   *  even when {@link cotEnabled} is on. Written by `/cot off|on`. */
   noCotChats?: string[];
   /**
    * When true, suppress the lightweight GoGoGo → DONE message reactions used as
@@ -2104,7 +2099,8 @@ export interface BotConfig {
    * 进群自动拉 owner。Default (undefined) = ON：本 bot 被加进任何群时，自动把
    * 自己的 owner（resolvedAllowedUsers 首个 ou_ 用户）拉进群——bot 应始终处于
    *  owner 可见的群里（不打黑工）。显式 false 关闭（如告警/oncall 类 bot 被
-   * 平台批量拉进大量事件群、不想打扰 owner 的场景）。仅 bots.json 文件配置。
+   * 平台批量拉进大量事件群、不想打扰 owner 的场景）。可在 Dashboard Bot
+   * Defaults 或飞书 /botconfig 配置；仅作用于被动入群，团队建群/federation 不读此开关。
    */
   autoInviteOwnerOnGroupAdd?: boolean;
   /**
@@ -3799,10 +3795,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
-      thinkingCard: entry.thinkingCard === false ? false : undefined,
-      // 同 thinkingCard 约定：缺省 = 开，只有显式 false 有意义。
-      thinkingCardToolResult: entry.thinkingCardToolResult === false ? false : undefined,
-      // Default ON, same convention as thinkingCard: an absent key means the
+      cotEnabled: entry.cotEnabled === false ? false : undefined,
+      // Default ON, same convention as cotEnabled: an absent key means the
       // <sender> tag is injected, so existing prompts are unchanged.
       senderTag: entry.senderTag === false ? false : undefined,
       noPinStreamingCardChats: Array.isArray(entry.noPinStreamingCardChats)

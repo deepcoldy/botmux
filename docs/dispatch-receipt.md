@@ -43,3 +43,18 @@
 ## 验证边界
 
 `test/dispatch-thread-id.test.ts` 执行真实 `cmdDispatch` 与消息详情查询函数，替换外部网络、存储和 daemon IPC；覆盖 normal/topic、新建/待命/追加、旧字段完整对比、异常与空值、请求超时取消、发送失败及接单超时。它不是线上群聊或客户端链接点击验证。
+
+## 精确终止被后继取代的交接
+
+已验证因果关系的调用方可通过需要认证的 IPC 端点
+`POST /api/sessions/:sessionId/trigger-result/supersede` 提交
+`predecessorTriggerId` 与 `successorTriggerId`。二者必须不同、属于该机器人拥有的同一会话，后继必须有完整的持久完成证据。
+
+成功返回 `200`、`state=superseded`；重复提交返回 `alreadyTerminal=true`。
+后继未完成或前驱不可替换返回 `409`。后续查询前驱会得到 `failed`，不会误报为业务成功。
+带 `steerParkedBy` 的 pending 前驱返回 `409 / predecessor_steer_parked`，原记录与指针保持不变，最终结果由 steer 链解析；重启后仍可获取合并完成结果。
+后来的真实 worker 完成或终止证据仍可按原有规则覆盖该标记。端点不在 core-only 的免认证列表中。
+
+工具子进程显式收到 `BOTMUX_SESSION_ID`、`BOTMUX_CHAT_ID`、`BOTMUX_LARK_APP_ID` 和
+`BOTMUX_SESSION_SCOPE`（`chat` 或 `thread`）；有话题根消息时另带 `BOTMUX_ROOT_MESSAGE_ID`，
+已知群类型时另带 `BOTMUX_CHAT_TYPE`。这些是路由标识，不包含凭证，也不证明交接之间存在因果关系。

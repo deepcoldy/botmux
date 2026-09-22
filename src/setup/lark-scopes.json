@@ -6,6 +6,8 @@
       "application:bot.menu:write",
       "audio_video_ai:meeting_assistance",
       "auth:user_access_token:read",
+      "base:app:create",
+      "bitable:app",
       "board:whiteboard:node:create",
       "board:whiteboard:node:delete",
       "board:whiteboard:node:read",
@@ -171,6 +173,8 @@
       "wiki:wiki:readonly"
     ],
     "user": [
+      "base:app:create",
+      "bitable:app",
       "board:whiteboard:node:create",
       "board:whiteboard:node:delete",
       "board:whiteboard:node:read",

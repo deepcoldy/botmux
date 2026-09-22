@@ -32,6 +32,7 @@ import {
   recordCompleted,
   recordFailedStrict,
   recordTerminalFailureStrict,
+  supersedePendingTriggerByCompletedSuccessorStrict,
   recordInterruptedStrict,
   lookup,
   lookupStrict,
@@ -105,6 +106,126 @@ describe('recordCompleted', () => {
     const got = lookup('sess1');
     expect(got?.result.status).toBe('completed');
     expect(got?.result.content).toBe('survives restart');
+  });
+
+  it('does not infer that an older pending trigger is superseded by time order', () => {
+    recordPending('sess1', 'trg_old', 1000, 'cli_test');
+    recordPending('sess1', 'trg_new', 2000, 'cli_test');
+    recordCompleted('sess1', 'trg_new', 'done', 3000, 'cli_test');
+
+    expect(lookup('sess1', 'trg_old')?.result.status).toBe('pending');
+    expect(lookup('sess1', 'trg_new')?.result).toMatchObject({
+      status: 'completed',
+      content: 'done',
+    });
+  });
+});
+
+describe('supersedePendingTriggerByCompletedSuccessorStrict', () => {
+  it('preserves an interrupted predecessor and rejects an interrupted successor as completion proof', () => {
+    recordPending('sess1', 'interrupted', 1000, 'cli_test');
+    recordInterruptedStrict('sess1', 'interrupted', 1500, 'cli_test');
+    recordPending('sess1', 'pending', 1000, 'cli_test');
+    recordCompleted('sess1', 'completed', 'done', 2000, 'cli_test');
+    const filePath = join(tempDir, 'async-triggers', 'sess1.json');
+    const before = readFileSync(filePath, 'utf8');
+
+    expect(supersedePendingTriggerByCompletedSuccessorStrict(
+      'sess1', 'interrupted', 'completed', 3000, 'cli_test',
+    )).toBe('predecessor_not_pending');
+    expect(supersedePendingTriggerByCompletedSuccessorStrict(
+      'sess1', 'pending', 'interrupted', 3000, 'cli_test',
+    )).toBe('successor_not_completed');
+    expect(readFileSync(filePath, 'utf8')).toBe(before);
+  });
+
+  it('preserves parked steer members and their restart chain while ordinary pending triggers supersede', () => {
+    recordPending('sess1', 'parked', 1000, 'cli_test');
+    recordPending('sess1', 'ordinary', 1100, 'cli_test');
+    recordSteerParked('sess1', 'parked', 'successor', 1200, 'cli_test');
+    recordCompleted('sess1', 'successor', 'merged answer', 2000, 'cli_test');
+    const filePath = join(tempDir, 'async-triggers', 'sess1.json');
+    const before = readFileSync(filePath, 'utf8');
+
+    expect(supersedePendingTriggerByCompletedSuccessorStrict(
+      'sess1', 'parked', 'successor', 3000, 'cli_test',
+    )).toBe('predecessor_steer_parked');
+    expect(readFileSync(filePath, 'utf8')).toBe(before);
+    expect(lookup('sess1', 'parked')?.result).toMatchObject({
+      status: 'pending', steerParkedBy: 'successor', createdAt: 1000,
+    });
+    expect(followSteerParkedChain('sess1', 'parked')?.result).toMatchObject({
+      status: 'completed', content: 'merged answer', completedAt: 2000,
+    });
+    expect(supersedePendingTriggerByCompletedSuccessorStrict(
+      'sess1', 'ordinary', 'successor', 3000, 'cli_test',
+    )).toBe('superseded');
+    expect(supersedePendingTriggerByCompletedSuccessorStrict(
+      'sess1', 'ordinary', 'successor', 4000, 'cli_test',
+    )).toBe('already_superseded');
+  });
+
+  it('terminalizes only an explicitly named pending predecessor', () => {
+    recordPending('sess1', 'trg_old', 1000, 'cli_test');
+    recordPending('sess1', 'trg_unrelated', 1500, 'cli_test');
+    recordPending('sess1', 'trg_new', 2000, 'cli_test');
+    recordCompleted('sess1', 'trg_new', 'done', 3000, 'cli_test');
+
+    expect(supersedePendingTriggerByCompletedSuccessorStrict(
+      'sess1', 'trg_old', 'trg_new', 4000, 'cli_test',
+    )).toBe('superseded');
+    expect(lookup('sess1', 'trg_old')?.result).toMatchObject({
+      status: 'failed',
+      reason: 'turn_terminal',
+      terminalErrorCode: 'superseded_by_completed_successor:trg_new',
+    });
+    expect(lookup('sess1', 'trg_unrelated')?.result.status).toBe('pending');
+  });
+
+  it('requires the exact successor to be completed', () => {
+    recordPending('sess1', 'trg_old', 1000, 'cli_test');
+    recordPending('sess1', 'trg_new', 2000, 'cli_test');
+    expect(supersedePendingTriggerByCompletedSuccessorStrict(
+      'sess1', 'trg_old', 'trg_new', 3000, 'cli_test',
+    )).toBe('successor_not_completed');
+    expect(lookup('sess1', 'trg_old')?.result.status).toBe('pending');
+  });
+
+  it('rejects a corrupted completed successor without completion evidence', () => {
+    recordPending('sess1', 'trg_old', 1000, 'cli_test');
+    writeFileSync(join(tempDir, 'async-triggers', 'sess1.json'), JSON.stringify({
+      ownerLarkAppId: 'cli_test',
+      results: { trg_old: { status: 'pending', createdAt: 1000 }, trg_new: { status: 'completed', createdAt: 2000 } },
+    }));
+    expect(supersedePendingTriggerByCompletedSuccessorStrict('sess1', 'trg_old', 'trg_new', 3000, 'cli_test'))
+      .toBe('successor_not_completed');
+    expect(lookup('sess1', 'trg_old')?.result.status).toBe('pending');
+  });
+
+  it('is idempotent for the same explicit successor', () => {
+    recordPending('sess1', 'trg_old', 1000, 'cli_test');
+    recordCompleted('sess1', 'trg_new', 'done', 2000, 'cli_test');
+    expect(supersedePendingTriggerByCompletedSuccessorStrict(
+      'sess1', 'trg_old', 'trg_new', 3000, 'cli_test',
+    )).toBe('superseded');
+    expect(supersedePendingTriggerByCompletedSuccessorStrict(
+      'sess1', 'trg_old', 'trg_new', 4000, 'cli_test',
+    )).toBe('already_superseded');
+  });
+
+  it('upgrades an ambiguous dispatch failure when the exact successor proves completion', () => {
+    recordPending('sess1', 'trg_old', 1000, 'cli_test');
+    recordFailedStrict('sess1', 'trg_old', 1500, 'cli_test');
+    recordCompleted('sess1', 'trg_new', 'done', 2000, 'cli_test');
+
+    expect(supersedePendingTriggerByCompletedSuccessorStrict(
+      'sess1', 'trg_old', 'trg_new', 3000, 'cli_test',
+    )).toBe('superseded');
+    expect(lookup('sess1', 'trg_old')?.result).toMatchObject({
+      status: 'failed',
+      reason: 'turn_terminal',
+      terminalErrorCode: 'superseded_by_completed_successor:trg_new',
+    });
   });
 });
 

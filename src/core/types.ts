@@ -331,7 +331,7 @@ export interface DaemonSession {
   streamingCardForced?: boolean;
   /** One-shot override for the native CoT (thinking process) message: when
    *  true, the bubble renders for the current/next turn even if the chat is
-   *  in `noCotChats` or the bot-level `thinkingCard` switch is off. Flipped on
+   *  in `noCotChats` or the bot-level `cotEnabled` switch is off. Flipped on
    *  by `/cot show`; auto-cleared when that turn settles (turn_terminal), so
    *  it is a single peek, not a toggle. In-memory only. */
   cotForced?: boolean;

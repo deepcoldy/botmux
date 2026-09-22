@@ -567,7 +567,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, getGroupStats, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, ordinaryOneShotVisibleLaneKey, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, getGroupStats, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, ordinaryOneShotVisibleLaneKey, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, ensureMessageUpdatedEventSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, normalizeDocNativeWatchSubscription, putDocSubscription, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
@@ -3950,8 +3950,9 @@ export async function noteTurnReceived(
 }
 
 /**
- * Publish the acting CLI identity for one turn, and tell the sender when they
- * need to authorize.
+ * Publish the acting CLI identity for one turn. A missing bytedcli identity
+ * also prepares a direct device-login link inside the wrapper refusal, so the
+ * agent can surface it only if that tool is actually invoked.
  *
  * The sender comes from the daemon's own per-turn record (`replyTargets`, via
  * {@link pickTurnReplyTarget}), falling back to the session's last caller. Both
@@ -4006,10 +4007,10 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
   // refused) it stayed silent.
   //
   // The refusal already carries this. The wrapper prints, on stderr, which tool
-  // was refused and which command authorizes it — at the moment of the refusal,
-  // for that tool only, every time it happens. That is strictly better
-  // information than a guess made a second earlier, so the guess is gone rather
-  // than being made narrower.
+  // was refused and how to authorize it — including a direct ByteCloud login
+  // link when bytedcli can start one automatically — at the moment of the
+  // refusal, for that tool only. That is strictly better information than a
+  // pre-turn guess, so the chat notice stays absent.
 }
 
 async function sessionReply(
@@ -27295,6 +27296,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       // bots via vcMeetingAgentConfigActive.
       ensureVcMeetingEventsSubscribed(cfg.larkAppId).catch(err => {
         logger.debug(`[${cfg.larkAppId}] VC event subscription check failed: ${err?.message ?? err}`);
+      });
+      // Ensure im.message.updated_v1 is subscribed so a user can trigger a task
+      // by editing a previously-un-@ed message to add the @mention. Check-first
+      // best-effort (cached web session, incremental add); never blocks boot.
+      ensureMessageUpdatedEventSubscribed(cfg.larkAppId).catch(err => {
+        logger.debug(`[${cfg.larkAppId}] message-updated event subscription check failed: ${err?.message ?? err}`);
       });
     }
 

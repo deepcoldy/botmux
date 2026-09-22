@@ -92,7 +92,7 @@ function selectedAgentCliId(cliKey: string): string {
 
 function reasoningCatalogKey(cliKey: string): string | undefined {
   const cliId = selectedAgentCliId(cliKey);
-  if (cliId === 'grok' || cliId === 'traex' || cliId === 'claude-code') return cliId;
+  if (cliId === 'grok' || cliId === 'traex' || cliId === 'claude-code' || cliId === 'kimi') return cliId;
   if (cliId === 'codex' || cliId === 'codex-app') return 'codex';
   return undefined;
 }
@@ -767,14 +767,15 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     pinStreamingCard: body.pinStreamingCard,
     silentTurnReactions: body.silentTurnReactions,
     codexAppCleanInput: body.codexAppCleanInput,
+    codexBrowser: body.codexBrowser,
     writableTerminalLinkInCard: body.writableTerminalLinkInCard,
     privateCard: body.privateCard,
-    thinkingCard: body.thinkingCard,
-    thinkingCardToolResult: body.thinkingCardToolResult,
+    cotEnabled: body.cotEnabled,
     senderTag: body.senderTag,
     summaryMemory: body.summaryMemory,
     summaryMemoryPath: body.summaryMemoryPath,
     botToBotSameDir: body.botToBotSameDir,
+    autoInviteOwnerOnGroupAdd: body.autoInviteOwnerOnGroupAdd,
     autoStartOnGroupJoin: body.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: body.autoStartOnGroupJoinPrompt,
     autoStartOnGroupJoinSeed: body.autoStartOnGroupJoinSeed,
@@ -3462,6 +3463,7 @@ function workingDirState(bot: BotDefaultsRow): { mode: 'off' | 'default' | 'onca
 export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const { bot, putCardPref } = props;
+  const [inviteOwner, setInviteOwner] = useState(bot.autoInviteOwnerOnGroupAdd !== false);
   const [onJoin, setOnJoin] = useState(bot.autoStartOnGroupJoin === true);
   const [onTopic, setOnTopic] = useState(bot.autoStartOnNewTopic === true);
   const [prompt, setPrompt] = useState(typeof bot.autoStartOnGroupJoinPrompt === 'string' ? bot.autoStartOnGroupJoinPrompt : '');
@@ -3475,6 +3477,7 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
   const [busy, setBusy] = useState<string | null>(null);
 
   useEffect(() => {
+    setInviteOwner(bot.autoInviteOwnerOnGroupAdd !== false);
     setOnJoin(bot.autoStartOnGroupJoin === true);
     setOnTopic(bot.autoStartOnNewTopic === true);
     setPrompt(typeof bot.autoStartOnGroupJoinPrompt === 'string' ? bot.autoStartOnGroupJoinPrompt : '');
@@ -3483,6 +3486,7 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
     setJoinCmd(typeof bot.groupJoinCommand === 'string' ? bot.groupJoinCommand : '');
   }, [
     bot.larkAppId,
+    bot.autoInviteOwnerOnGroupAdd,
     bot.autoStartOnGroupJoin,
     bot.autoStartOnGroupJoinPrompt,
     bot.autoStartOnGroupJoinSeed,
@@ -3509,6 +3513,17 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
   return (
     <div className="bd-subsection">
       <h4 className="bd-subsection-title">{tr('botDefaults.sectionAutoStart')}</h4>
+      <ToggleRow
+        checked={inviteOwner}
+        disabled={busy === 'inviteOwner'}
+        dataAction="toggle-invite-owner"
+        title={tr('botDefaults.autoInviteOwnerOnGroupAdd')}
+        help={tr('botDefaults.autoInviteOwnerOnGroupAddHelp')}
+        onChange={checked => {
+          setInviteOwner(checked);
+          void savePatch({ autoInviteOwnerOnGroupAdd: checked }, 'inviteOwner');
+        }}
+      />
       <ToggleRow
         checked={onJoin}
         disabled={busy === 'join'}
@@ -3706,24 +3721,7 @@ function TriggerUserAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot
               </label>
             ))}
           </div>
-          <div className="bd-row">
-            <label>
-              <span>{tr('botDefaults.triggerUserAuthFallback')}</span>
-              <select
-                data-input="triggerUserAuthFallback"
-                value={fallback}
-                disabled={busy}
-                onChange={event => void save({
-                  enabled: true,
-                  tools,
-                  fallback: event.currentTarget.value as 'bot-identity' | 'none',
-                })}
-              >
-                <option value="bot-identity">{tr('botDefaults.triggerUserAuthFallbackBot')}</option>
-                <option value="none">{tr('botDefaults.triggerUserAuthFallbackNone')}</option>
-              </select>
-            </label>
-          </div>
+          <p className="bd-section-note">{tr('botDefaults.triggerUserAuthFallbackNote')}</p>
           {tools.includes('bytedcli') ? (
             <p className="bd-section-note">{tr('botDefaults.triggerUserAuthBytedcliNote')}</p>
           ) : null}
@@ -4407,8 +4405,7 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
   const [silentReactions, setSilentReactions] = useState(bot.silentTurnReactions === true);
   const [writableLink, setWritableLink] = useState(bot.writableTerminalLinkInCard === true);
   const [privateCard, setPrivateCard] = useState(bot.privateCard === true);
-  const [thinkingCard, setThinkingCard] = useState(bot.thinkingCard !== false);
-  const [thinkingCardToolResult, setThinkingCardToolResult] = useState(bot.thinkingCardToolResult !== false);
+  const [cotEnabled, setCotEnabled] = useState(bot.cotEnabled !== false);
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -4421,9 +4418,8 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
     setSilentReactions(bot.silentTurnReactions === true);
     setWritableLink(bot.writableTerminalLinkInCard === true);
     setPrivateCard(bot.privateCard === true);
-    setThinkingCard(bot.thinkingCard !== false);
-    setThinkingCardToolResult(bot.thinkingCardToolResult !== false);
-  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.thinkingCard, bot.thinkingCardToolResult, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
+    setCotEnabled(bot.cotEnabled !== false);
+  }, [bot.replyCardMode, bot.disableStreamingCard, bot.hiddenStreamingCardButtons, bot.pinStreamingCard, bot.privateCard, bot.cotEnabled, bot.usageDisplay, bot.silentTurnReactions, bot.writableTerminalLinkInCard]);
 
   async function savePatch(patch: CardPrefPatch, key: string, rollback?: () => void): Promise<void> {
     setBusy(key);
@@ -4530,42 +4526,27 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
             <p role="status" data-card-pref-moot className="bd-card-mode-note">{tr('botDefaults.manualCardHint')}</p>
           </div>
           <ToggleRow
-            checked={thinkingCard}
+            checked={cotEnabled}
             disabled={busy !== null}
-            dataAction="toggle-thinking-card"
-            title={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCard' : 'botDefaults.replyCardTools')}
-            description={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardDescription' : 'botDefaults.replyCardToolsDescription')}
-            help={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardHelp' : 'botDefaults.replyCardToolsHelp')}
+            dataAction="toggle-cot"
+            title={tr(replyMode === 'legacy' ? 'botDefaults.cotEnabled' : 'botDefaults.replyCardTools')}
+            description={tr(replyMode === 'legacy' ? 'botDefaults.cotEnabledDescription' : 'botDefaults.replyCardToolsDescription')}
+            help={tr(replyMode === 'legacy' ? 'botDefaults.cotEnabledHelp' : 'botDefaults.replyCardToolsHelp')}
             onChange={checked => {
-              const previous = thinkingCard;
-              setThinkingCard(checked);
-              void savePatch({ thinkingCard: checked }, 'thinking', () => setThinkingCard(previous));
+              const previous = cotEnabled;
+              setCotEnabled(checked);
+              void savePatch({ cotEnabled: checked }, 'cot', () => setCotEnabled(previous));
             }}
           />
-          <div className="bd-card-dependent" data-thinking-card-options hidden={!thinkingCard}>
-            <ToggleRow
-              checked={thinkingCardToolResult}
-              disabled={busy !== null}
-              dataAction="toggle-thinking-card-tool-result"
-              title={tr('botDefaults.thinkingCardToolResult')}
-              description={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardToolResultDescription' : 'botDefaults.replyCardToolResultDescription')}
-              help={tr(replyMode === 'legacy' ? 'botDefaults.thinkingCardToolResultHelp' : 'botDefaults.replyCardToolResultHelp')}
-              onChange={checked => {
-                const previous = thinkingCardToolResult;
-                setThinkingCardToolResult(checked);
-                void savePatch({ thinkingCardToolResult: checked }, 'thinkingToolResult', () => setThinkingCardToolResult(previous));
-              }}
-            />
-          </div>
           {replyMode === 'legacy' && pinToggle}
           <QuietPresetSection
             tr={tr}
-            thinkingCard={thinkingCard}
+            cotEnabled={cotEnabled}
             silentReactions={silentReactions}
             disableStreaming={disableStreaming}
             putCardPref={putCardPref}
             onApplied={() => {
-              setThinkingCard(false);
+              setCotEnabled(false);
               setSilentReactions(true);
               setDisableStreaming(true);
             }}
@@ -4679,15 +4660,17 @@ export function CardBehaviorSection(props: { bot: BotDefaultsRow; putCardPref(pa
 export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const [cleanInput, setCleanInput] = useState(props.bot.codexAppCleanInput === true);
+  const [browserEnabled, setBrowserEnabled] = useState(props.bot.codexBrowser === true);
   const [status, setStatus] = useState<StatusMessage>(null);
-  const [busy, setBusy] = useState(false);
+  const [busy, setBusy] = useState<'clean-input' | 'browser' | null>(null);
 
   useEffect(() => setCleanInput(props.bot.codexAppCleanInput === true), [props.bot.codexAppCleanInput]);
+  useEffect(() => setBrowserEnabled(props.bot.codexBrowser === true), [props.bot.codexBrowser]);
 
-  async function save(checked: boolean): Promise<void> {
+  async function saveCleanInput(checked: boolean): Promise<void> {
     const previous = cleanInput;
     setCleanInput(checked);
-    setBusy(true);
+    setBusy('clean-input');
     setStatus(null);
     try {
       const res = await props.putCardPref({ codexAppCleanInput: checked });
@@ -4701,7 +4684,28 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
       setCleanInput(previous);
       setStatus({ text: `✗ ${caughtErrorText(e)}` });
     } finally {
-      setBusy(false);
+      setBusy(null);
+    }
+  }
+
+  async function saveBrowser(checked: boolean): Promise<void> {
+    const previous = browserEnabled;
+    setBrowserEnabled(checked);
+    setBusy('browser');
+    setStatus(null);
+    try {
+      const res = await props.putCardPref({ codexBrowser: checked });
+      if (res.ok) {
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setBrowserEnabled(previous);
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setBrowserEnabled(previous);
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(null);
     }
   }
 
@@ -4710,13 +4714,23 @@ export function CodexAppDisplaySection(props: { bot: BotDefaultsRow; putCardPref
       <h3 className="bd-section-title">{tr('botDefaults.sectionCodexAppDisplay')}</h3>
       <ToggleRow
         checked={cleanInput}
-        disabled={busy}
+        disabled={busy !== null}
         dataAction="toggle-codex-app-clean-input"
         title={tr('botDefaults.codexAppCleanInput')}
         help={tr('botDefaults.codexAppCleanInputHelp')}
-        onChange={checked => void save(checked)}
+        onChange={checked => void saveCleanInput(checked)}
       />
       <small className="bd-section-note">{tr('botDefaults.codexAppCleanInputCompat')}</small>
+      <ToggleRow
+        checked={browserEnabled}
+        disabled={busy !== null}
+        dataAction="toggle-codex-browser"
+        title={tr('botDefaults.codexBrowser')}
+        description={tr('botDefaults.codexBrowserDescription')}
+        help={tr('botDefaults.codexBrowserHelp')}
+        onChange={checked => void saveBrowser(checked)}
+      />
+      <small className="bd-section-note">{tr('botDefaults.codexBrowserRestartNote')}</small>
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-codex-app-clean-input-status': '' }} />
       </div>

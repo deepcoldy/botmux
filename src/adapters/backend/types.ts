@@ -9,7 +9,9 @@ export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff' |
  * untouched on restore/close paths that run without a live worker.
  */
 export type PersistentBackendTarget =
-  | { backendType: 'tmux' | 'zellij' | 'zmx'; sessionName: string }
+  | { backendType: 'tmux' | 'zellij'; sessionName: string }
+  // New ZMX targets freeze the native socket directory; older rows may omit it.
+  | { backendType: 'zmx'; sessionName: string; socketDir?: string }
   | { backendType: 'herdr'; sessionName: string; agentName?: string };
 
 /**

@@ -104,6 +104,14 @@ vi.mock('../src/services/bytedcli-auth.js', () => ({
   pendingBytedcliChallenge: vi.fn(() => null),
 }));
 
+// lark-cli per-person HOME auth likewise shells out; script the verdicts.
+vi.mock('../src/services/lark-cli-auth.js', () => ({
+  beginLarkCliLogin: vi.fn(async () => ({ authUrl: 'https://lark.example.com/device' })),
+  completeLarkCliLogin: vi.fn(async () => ({ state: 'failed' as const, detail: 'no active login — please start again' })),
+  pendingLarkCliChallenge: vi.fn(() => null),
+  hasLarkCliHome: vi.fn(() => false),
+}));
+
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn((id: string = 'app-1') => ({
     botName: id === 'app-2' ? 'Codex' : 'Claude',
@@ -270,6 +278,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   },
   deleteMessage: vi.fn(async () => true),
   sendMessage: vi.fn(async () => 'card-msg-id'),
+  uploadImage: vi.fn(async () => 'img_uploaded'),
   // /relay picker replies land anchored at the invocation message / 话题 via
   // replyMessage (reply-at-invocation), not sessionReply. Args mirror the
   // real signature: (appId, messageId, content, msgType, replyInThread).
@@ -378,6 +387,7 @@ vi.mock('../src/core/session-manager.js', () => ({
   // Dynamically imported by the /repo pending-launch path (bare /repo + repo selection).
   buildNewTopicPrompt: vi.fn((prompt: string) => `WRAPPED:${prompt}`),
   buildNewTopicCliInput: vi.fn((prompt: string) => ({ content: `WRAPPED:${prompt}` })),
+  downloadResources: vi.fn(async () => ({ attachments: [], needLogin: false })),
   ensureSessionWhiteboard: vi.fn((ds: any) => { ds.session.whiteboardId = 'wb_test'; }),
   getAvailableBots: vi.fn(async () => []),
   resumeSession: vi.fn(),
@@ -418,6 +428,7 @@ vi.mock('../src/utils/user-token.js', () => ({
   getTokenStatus: vi.fn(() => 'User token: active'),
   resolveUserToken: vi.fn(async () => null),
   listAuthorizedUsers: vi.fn(() => []),
+  isUsableOpenId: (x: unknown) => typeof x === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(x),
   resolveOAuthRedirectUri: vi.fn(() => 'http://127.0.0.1:9768/callback'),
   DOC_COMMENT_OAUTH_SCOPES: ['docs:document.comment:read'],
   FEED_GROUP_OAUTH_SCOPES: ['im:feed_group'],
@@ -585,6 +596,7 @@ import { getAllBots, getBot, findOncallChat, effectiveDefaultWorkingDir } from '
 import { t } from '../src/i18n/index.js';
 import { parseTriggerUserAuthConfig } from '../src/services/trigger-user-auth.js';
 import { hasBytedcliHome, beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge } from '../src/services/bytedcli-auth.js';
+import { hasLarkCliHome, beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge } from '../src/services/lark-cli-auth.js';
 import { isKnownLarkUserScope } from '../src/utils/lark-scope-catalog.js';
 import { generateAuthUrl, getTokenStatus, resolveUserToken, resolveOAuthRedirectUri, listAuthorizedUsers, DOC_COMMENT_OAUTH_SCOPES } from '../src/utils/user-token.js';
 import { DocSubscriptionPermissionError, resolveDocFile, subscribeDocFile, unsubscribeDocFile } from '../src/im/lark/doc-comment.js';
@@ -1755,6 +1767,33 @@ describe('handleCommand', () => {
   });
 
   describe('/fork sub-topic', () => {
+    it.each(['codex', 'claude-code'] as const)('passes post images into the %s first turn and renders them in the root', async cliId => {
+      const { downloadResources } = await import('../src/core/session-manager.js');
+      const attachments = [{ type: 'image' as const, path: '/tmp/fork-image.jpg', name: 'img_source.jpg' }];
+      vi.mocked(downloadResources).mockResolvedValueOnce({ attachments, needLogin: false });
+      const ds = makeDaemonSession({ scope: 'thread', session: makeSession({ cliId, scope: 'thread' }) });
+      const task = '检查图片 https://example.com/docs [图片 1]';
+      const result = await startForkSubtopicSession(task, ds, makeLarkMessage(`/fork ${task}`, {
+        msgType: 'post',
+        threadId: 'omt_parent',
+        rawPostContent: JSON.stringify({ content: [
+          [{ tag: 'text', text: '/fork 检查图片 ' }, { tag: 'a', text: '设计文档', href: 'https://example.com/docs' }],
+          [{ tag: 'img', image_key: 'img_source' }],
+        ] }),
+      }), LARK_APP_ID);
+      expect(result.ok).toBe(true);
+      const seed = JSON.parse(vi.mocked(sendMessage).mock.calls[0][2]).zh_cn;
+      expect(seed.title).toBe('[分身] 检查图片 设计文档');
+      expect(seed.content[1]).toEqual([{ tag: 'img', image_key: 'img_uploaded' }]);
+      expect(seed.content.at(-1).at(-1).href).toContain('omt_parent');
+      expect(downloadResources).toHaveBeenLastCalledWith(LARK_APP_ID, 'msg_001',
+        [{ type: 'image', key: 'img_source', name: 'img_source.jpg' }], 'ou_sender');
+      const options = vi.mocked(forkSession).mock.calls[0][5]!;
+      options.buildInitialPrompt?.('child-sess-1');
+      expect(vi.mocked(buildNewTopicCliInput).mock.calls.at(-1)?.[4]).toEqual(attachments);
+      expect(options.forkTaskText).toBe(task);
+    });
+
     it('creates a child topic and forwards the multiline task as the first fork turn', async () => {
       const ds = makeDaemonSession({
         scope: 'thread',
@@ -2553,6 +2592,14 @@ describe('handleCommand', () => {
         LARK_APP_ID,
         'msg_001',
       );
+      const confirmCard = vi.mocked(deps.sessionReply).mock.calls
+        .map(c => c[1])
+        .find((content): content is string => typeof content === 'string' && content.includes('"tag":"table"'));
+      expect(confirmCard).toBeTruthy();
+      const confirmTable = JSON.parse(confirmCard as string).body.elements
+        .find((e: any) => e.tag === 'table');
+      expect(confirmTable.row_height).toBe('auto');
+      expect(confirmTable.row_max_height).toBe('300px');
     });
 
     it('`/close wt --yes` without a confirmation state never deletes even a clean worktree', async () => {
@@ -3287,11 +3334,28 @@ describe('handleCommand', () => {
         expect(text).toContain('lark-cli: 以「孙晓雪」的身份调用');
       });
 
-      it('tells an unauthorized sender what the fallback is and how to change it', async () => {
+      // F-C: a person who authorized through the per-person device-code HOME
+      // (no legacy user-token row) must still read as authorized in /status.
+      it('counts a per-person lark-cli HOME as authorized even with no legacy token', async () => {
+        vi.mocked(hasLarkCliHome).mockReturnValue(true);
+        try {
+          vi.mocked(listAuthorizedUsers).mockReturnValue([]);
+          const text = await statusText(statusWith({ enabled: true, tools: ['lark-cli'] }, false));
+          expect(text).toContain('lark-cli: 以你自己的身份调用');
+          expect(text).not.toContain('你未授权');
+        } finally {
+          vi.mocked(hasLarkCliHome).mockReturnValue(false);
+        }
+      });
+
+      it('tells an unauthorized sender the call is refused (never "as the bot")', async () => {
         const text = await statusText(statusWith({ enabled: true, tools: ['lark-cli'] }, false));
         expect(text).toContain('lark-cli: 你未授权');
-        expect(text).toContain('bot 身份');
-        expect(text).toContain('/login');
+        // lark-cli no longer degrades to the bot's own identity: claiming the
+        // call would run as the bot here would contradict the actual refusal.
+        expect(text).not.toContain('bot 身份');
+        expect(text).toContain('命令会被拒绝');
+        expect(text).toContain('授权链接');
       });
 
       it('warns that the command will be refused under fallback: none', async () => {
@@ -3311,7 +3375,7 @@ describe('handleCommand', () => {
         );
         expect(text).toContain('lark-cli: 以「孙晓雪」的身份调用');
         expect(text).toContain('bytedcli: 你未授权');
-        expect(text).toContain('/login bytedcli');
+        expect(text).toContain('首次调用被拒时会自动返回登录链接');
       });
 
       it('reports bytedcli as authorized once that person has logged in', async () => {
@@ -3320,6 +3384,35 @@ describe('handleCommand', () => {
           statusWith({ enabled: true, tools: ['bytedcli'] }, false),
         );
         expect(text).toContain('bytedcli: 以你自己的身份调用');
+      });
+
+      it('does not call a merely pending device login authorized when there is no HOME', async () => {
+        vi.mocked(hasBytedcliHome).mockReturnValue(false);
+        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-pending');
+        try {
+          const text = await statusText(
+            statusWith({ enabled: true, tools: ['bytedcli'] }, false),
+          );
+          expect(text).toContain('bytedcli: 你未授权');
+          expect(text).toContain('首次调用被拒时会自动返回登录链接');
+        } finally {
+          vi.mocked(pendingBytedcliChallenge).mockReturnValue(null);
+        }
+      });
+
+      // With the soft-gate mint, a pending challenge never vetoes an existing
+      // login — status must keep saying "authorized" while a fresh link is open.
+      it('still reports authorized with a pending challenge atop an existing HOME', async () => {
+        vi.mocked(hasBytedcliHome).mockReturnValue(true);
+        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-pending');
+        try {
+          const text = await statusText(
+            statusWith({ enabled: true, tools: ['bytedcli'] }, false),
+          );
+          expect(text).toContain('bytedcli: 以你自己的身份调用');
+        } finally {
+          vi.mocked(pendingBytedcliChallenge).mockReturnValue(null);
+        }
       });
     });
   });
@@ -5462,6 +5555,117 @@ describe('handleCommand', () => {
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli done'), deps, LARK_APP_ID);
 
         expect(pendingBytedcliChallenge).toHaveBeenCalledWith('ou_sender');
+      });
+    });
+
+    describe('/login done — both providers are independent', () => {
+      // F-D: an already-lark-authorized person with a pending ByteCloud login
+      // used to be swallowed by the lark branch and get "no active login".
+      it('completes a pending bytedcli login while reporting lark already authorized', async () => {
+        vi.mocked(pendingLarkCliChallenge).mockReturnValue(null);
+        vi.mocked(hasLarkCliHome).mockReturnValue(true);
+        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
+        vi.mocked(completeBytedcliLogin).mockResolvedValue({ state: 'authorized' });
+        try {
+          const deps = makeDeps(makeDaemonSession());
+          await handleCommand('/login', ROOT_ID, makeLarkMessage('/login done'), deps, LARK_APP_ID);
+
+          expect(completeLarkCliLogin).not.toHaveBeenCalled();
+          expect(completeBytedcliLogin).toHaveBeenCalledWith('ou_sender', 'tok-1');
+          const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+          expect(text).toContain(t('cmd.login.lark_status_yes', undefined, 'zh'));
+          expect(text).toContain(t('cmd.login.bytedcli_ok', undefined, 'zh'));
+        } finally {
+          vi.mocked(pendingLarkCliChallenge).mockReturnValue(null);
+          vi.mocked(hasLarkCliHome).mockReturnValue(false);
+          vi.mocked(pendingBytedcliChallenge).mockReturnValue(null);
+          vi.mocked(completeBytedcliLogin).mockResolvedValue({ state: 'authorized' });
+        }
+      });
+
+      it('completes pending challenges for BOTH providers in one reply', async () => {
+        vi.mocked(pendingLarkCliChallenge).mockReturnValue({ deviceCode: 'dc-1', authUrl: 'https://lark/x', createdAt: Date.now() });
+        vi.mocked(completeLarkCliLogin).mockResolvedValue({ state: 'authorized' });
+        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
+        vi.mocked(completeBytedcliLogin).mockResolvedValue({ state: 'authorized' });
+        try {
+          const deps = makeDeps(makeDaemonSession());
+          await handleCommand('/login', ROOT_ID, makeLarkMessage('/login done'), deps, LARK_APP_ID);
+
+          expect(completeLarkCliLogin).toHaveBeenCalledWith('ou_sender');
+          expect(completeBytedcliLogin).toHaveBeenCalledWith('ou_sender', 'tok-1');
+          const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+          expect(text).toContain(t('cmd.login.lark_ok', undefined, 'zh'));
+          expect(text).toContain(t('cmd.login.bytedcli_ok', undefined, 'zh'));
+        } finally {
+          vi.mocked(pendingLarkCliChallenge).mockReturnValue(null);
+          vi.mocked(completeLarkCliLogin).mockResolvedValue({ state: 'failed', detail: 'no active login — please start again' });
+          vi.mocked(pendingBytedcliChallenge).mockReturnValue(null);
+          vi.mocked(completeBytedcliLogin).mockResolvedValue({ state: 'authorized' });
+        }
+      });
+
+      it('reports both sides already authorized with no pending challenge', async () => {
+        vi.mocked(hasLarkCliHome).mockReturnValue(true);
+        vi.mocked(hasBytedcliHome).mockReturnValue(true);
+        try {
+          const deps = makeDeps(makeDaemonSession());
+          await handleCommand('/login', ROOT_ID, makeLarkMessage('/login done'), deps, LARK_APP_ID);
+
+          expect(completeLarkCliLogin).not.toHaveBeenCalled();
+          expect(completeBytedcliLogin).not.toHaveBeenCalled();
+          const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+          expect(text).toContain(t('cmd.login.lark_status_yes', undefined, 'zh'));
+          expect(text).toContain(t('cmd.login.bytedcli_status_yes', undefined, 'zh'));
+        } finally {
+          vi.mocked(hasLarkCliHome).mockReturnValue(false);
+          vi.mocked(hasBytedcliHome).mockReturnValue(false);
+        }
+      });
+
+      it('points at the begin commands when neither side has anything pending', async () => {
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login done'), deps, LARK_APP_ID);
+
+        const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+        expect(text).toContain(t('cmd.login.no_challenge', undefined, 'zh'));
+      });
+    });
+
+    describe('/login lark device-flow reply', () => {
+      // F-E: the begin reply must say what to do after the tap. With the turn
+      // path now completing pending logins, retrying just works — say so, and
+      // still mention /login done as an explicit confirmation path.
+      it('includes the post-authorization step after the link', async () => {
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login lark'), deps, LARK_APP_ID);
+
+        const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+        expect(text).toContain('https://lark.example.com/device');
+        expect(text).toContain(t('cmd.login.lark_step2', undefined, 'zh'));
+        expect(text).toContain('重试');
+      });
+
+      it('sends the same device reply for bare /login on a governed bot', async () => {
+        const prevGetBot = vi.mocked(getBot).getMockImplementation();
+        vi.mocked(getBot).mockImplementation((() => ({
+          botName: 'Claude',
+          config: {
+            larkAppId: 'app-1', larkAppSecret: 'secret-1', cliId: 'claude-code' as const,
+            workingDir: '~/projects', workingDirs: ['~/projects'],
+            triggerUserAuth: parseTriggerUserAuthConfig({ enabled: true, tools: ['lark-cli'] }) ?? undefined,
+          },
+        })) as any);
+        try {
+          const deps = makeDeps(makeDaemonSession());
+          await handleCommand('/login', ROOT_ID, makeLarkMessage('/login'), deps, LARK_APP_ID);
+
+          const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+          expect(text).toContain(t('cmd.login.lark_title', undefined, 'zh'));
+          expect(text).toContain(t('cmd.login.lark_step2', undefined, 'zh'));
+        } finally {
+          if (prevGetBot) vi.mocked(getBot).mockImplementation(prevGetBot as any);
+        }
       });
     });
 
@@ -7867,7 +8071,7 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     vi.clearAllMocks();
     vi.mocked(canOperate).mockReturnValue(true);
     vi.mocked(setCotMode).mockResolvedValue({ ok: true, changed: true } as any);
-    botWith({ thinkingCard: true });
+    botWith({ cotEnabled: true });
   });
 
   it('rejects a non-operator: operator_only notice, no mode change', async () => {
@@ -7893,16 +8097,16 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     expect(setCotMode).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, false);
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
     expect(reply).toContain('已恢复');
-    expect(reply).not.toContain('thinkingCard on');
+    expect(reply).not.toContain('cotEnabled on');
   });
 
-  it('/cot on hints at the master switch when thinkingCard is explicitly off', async () => {
-    botWith({ thinkingCard: false });
+  it('/cot on hints at the master switch when cotEnabled is explicitly off', async () => {
+    botWith({ cotEnabled: false });
     const deps = makeDeps();
     await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot on', deps);
     expect(setCotMode).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, false);
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
-    expect(reply).toContain('thinkingCard on');
+    expect(reply).toContain('cotEnabled on');
   });
 
   it('/cot on with an untouched config (default ON) confirms without the master-switch hint', async () => {
@@ -7911,7 +8115,7 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot on', deps);
     const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
     expect(reply).toContain('已恢复');
-    expect(reply).not.toContain('thinkingCard on');
+    expect(reply).not.toContain('cotEnabled on');
   });
 
   it('/cot status reports on / chat-muted / master-off states', async () => {
@@ -7919,26 +8123,13 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot', deps);
     expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('开启中');
 
-    botWith({ thinkingCard: true, noCotChats: [CHAT_ID] });
+    botWith({ cotEnabled: true, noCotChats: [CHAT_ID] });
     await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
     expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[1][1]).toContain('本群已关闭');
 
-    botWith({ thinkingCard: false });
+    botWith({ cotEnabled: false });
     await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
     expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[2][1]).toContain('总开关未开');
-    expect(setCotMode).not.toHaveBeenCalled();
-  });
-
-  it('/cot status appends the tool-output line only when thinkingCardToolResult is off', async () => {
-    const deps = makeDeps();
-    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
-    expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).not.toContain('工具输出');
-
-    botWith({ thinkingCard: true, thinkingCardToolResult: false });
-    await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot status', deps);
-    const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[1][1] as string;
-    expect(reply).toContain('开启中');
-    expect(reply).toContain('工具输出：已关闭');
     expect(setCotMode).not.toHaveBeenCalled();
   });
 
@@ -7957,7 +8148,7 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
   });
 
   it('/cot show mid-turn: forces the session and renders the cached thinking immediately', async () => {
-    botWith({ thinkingCard: false }); // switches off — show overrides anyway
+    botWith({ cotEnabled: false }); // switches off — show overrides anyway
     const ds = makeDaemonSession();
     ds.lastThinkingUpdate = { entries: [{ kind: 'thinking', text: 'so far' }], turnId: 'om_turn9' };
     const deps = makeDeps(ds);

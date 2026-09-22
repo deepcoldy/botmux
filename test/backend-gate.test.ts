@@ -102,7 +102,7 @@ describe('decideBackendGate (PTY 退役 hard gate)', () => {
 
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
-    expect(gate.indexOf('probeZmxVersion()')).toBeLessThan(gate.indexOf('probeOwnedZmxSession('));
+    expect(gate.indexOf('probeZmxRuntime(')).toBeLessThan(gate.indexOf('probeOwnedZmxSession('));
     expect(gate).toContain("resolvedZmxSessionProbe = 'unknown'");
     expect(gate).toContain('hasExistingSession = false');
     // ZMX must NOT opt into the indeterminate-existence exemption: an unproven

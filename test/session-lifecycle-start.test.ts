@@ -505,6 +505,47 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     expect(sessionReply).not.toHaveBeenCalled();
   });
 
+  it.each([
+    { cliId: 'codex', codexRpcInput: false, waitMs: 90_000 },
+    { cliId: 'codex', codexRpcInput: true, waitMs: 2_000 },
+    { cliId: 'claude-code', codexRpcInput: false, waitMs: 2_000 },
+  ])('uses the commit deadline for $cliId rpc=$codexRpcInput without extending duplicate receipts', async ({ cliId, codexRpcInput, waitMs }) => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId, codexRpcInput }));
+    const sessionReply = vi.fn(async () => 'om_delayed');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'hello', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
+    await Promise.resolve();
+    expect(ds.initConfig?.cliId).toBe(cliId);
+    expect(ds.initConfig?.codexRpcInput === true).toBe(codexRpcInput);
+    sessionReply.mockClear();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+
+    expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    await vi.advanceTimersByTimeAsync(waitMs - 1);
+    expect(sessionReply).not.toHaveBeenCalled();
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply.mock.calls[0]?.[1]).toContain('Worker 已收到这条消息');
+    const businessSends = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message' && message?.turnId === 'om_business');
+    expect(businessSends).toHaveLength(1);
+  });
+
   it('settles tracking when the exact live worker generation commits the turn', async () => {
     vi.useFakeTimers();
     const sessionReply = vi.fn(async () => 'om_reply');
@@ -528,7 +569,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
     worker.emit('message', { type: 'turn_input_committed', turnId: 'om_business' });
-    await vi.advanceTimersByTimeAsync(5_000);
+    await vi.advanceTimersByTimeAsync(90_001);
 
     const businessSends = vi.mocked(worker.send).mock.calls
       .map(call => call[0])
@@ -561,7 +602,9 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
     await vi.advanceTimersByTimeAsync(1_500);
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
-    await vi.advanceTimersByTimeAsync(500);
+    await vi.advanceTimersByTimeAsync(88_499);
+    expect(sessionReply).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
     await Promise.resolve();
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
@@ -601,7 +644,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     expect(sessionReply.mock.calls[0]?.[1]).toContain('消息已进入 Worker 的 IPC 队列');
 
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
-    await vi.advanceTimersByTimeAsync(2_100);
+    await vi.advanceTimersByTimeAsync(90_000);
 
     expect(sessionReply).toHaveBeenCalledTimes(1);
   });
@@ -628,7 +671,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
 
     expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
-    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.advanceTimersByTimeAsync(90_000);
     expect(sessionReply).toHaveBeenCalledTimes(1);
 
     worker.emit('message', { type: 'turn_input_committed', turnId: 'om_business' });
@@ -660,7 +703,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
 
     expect(sendWorkerInput(ds, 'business turn', 'om_business')).toBe(true);
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
-    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.advanceTimersByTimeAsync(90_000);
 
     worker.emit('message', {
       type: 'turn_input_rejected',
@@ -1323,7 +1366,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
 
     expect(sendWorkerInput(ds, 'commit delayed', 'om_commit_delayed')).toBe(true);
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_commit_delayed' });
-    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.advanceTimersByTimeAsync(90_000);
 
     vi.mocked(worker.send).mockImplementation(() => true);
     expect(sendWorkerInput(ds, 'delivery failed', 'om_delivery_failed')).toBe(true);
@@ -1459,7 +1502,9 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     forkWorker(ds, 'cold start', 'om_kickoff');
     const worker = forkMock.mock.results.at(-1)!.value;
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_kickoff' });
-    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.advanceTimersByTimeAsync(89_999);
+    expect(sessionReply).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
 
     const initSends = vi.mocked(worker.send).mock.calls
       .map(call => call[0])

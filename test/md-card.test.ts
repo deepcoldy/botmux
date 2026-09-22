@@ -259,6 +259,28 @@ describe('buildCardBodyElements', () => {
     ]);
   });
 
+  it('native table auto-sizes wrapped rows instead of single-line ellipsis clipping', () => {
+    // Regression: row_height was hardcoded to 'low', pinning every row to one
+    // line so any cell whose text wrapped was truncated with an ellipsis.
+    const longCell = 'one '.repeat(40).trim();
+    const input = [
+      '| A rather long header that itself needs to wrap | B |',
+      '| --- | --- |',
+      `| ${longCell} | b1 |`,
+    ].join('\n');
+    const out = buildCardBodyElements(input);
+    const table = out.find(e => e.tag === 'table');
+    expect(table).toBeTruthy();
+    expect(table.row_height).toBe('auto');
+    // Feishu caps auto rows at 32px–999px; without an explicit cap the
+    // component default is only 124px, which still clips dense cells.
+    expect(table.row_max_height).toBe('300px');
+    expect(table.header_style.lines).toBeGreaterThanOrEqual(2);
+    // The full cell content survives into the row data; wrapping is the
+    // renderer's job, not a reason to clip at build time.
+    expect(table.rows[0].c0).toBe(longCell);
+  });
+
   it('table flanked by prose → prose, table, prose are separate elements', () => {
     const input = [
       'before',

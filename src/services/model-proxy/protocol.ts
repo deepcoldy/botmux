@@ -26,7 +26,9 @@ const requestSchema = z.object({
     z.object({ type: z.literal('text') }).strict(), z.object({ type: z.literal('json_object') }).strict(),
     z.object({ type: z.literal('json_schema'), json_schema: z.object({ name, description: z.string().optional(), strict: z.boolean().optional(), schema: z.record(z.unknown()) }).strict() }).strict(),
   ]).optional(),
-  max_completion_tokens: z.number().int().min(1).max(128_000).optional(),
+  // Chat Completions accepts null as unspecified; normalize before capability
+  // checks and prompt serialization so null/omitted also share idempotency.
+  max_completion_tokens: z.number().int().min(1).max(128_000).nullish().transform(value => value ?? undefined),
 }).strict();
 export type ChatRequest = z.infer<typeof requestSchema>;
 export interface ModelRoute { bot: string; model: string; reasoningEffort?: InvocationRequest['reasoningEffort']; deadlineMs: number }

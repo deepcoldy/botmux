@@ -8,7 +8,7 @@
  * 落盘与转发互不影响：chain 失败不影响落盘，落盘失败不影响转发。
  */
 import { type ChildProcess } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -44,7 +44,7 @@ interface RunOpts {
   ignoreOutput?: boolean;
 }
 
-function runStatusline(opts: RunOpts): Promise<{ status: number | null; stdout: Buffer; stderr: string; elapsedMs: number }> {
+function runStatusline(opts: RunOpts): Promise<{ status: number | null; stdout: Buffer; stderr: string; finishedAtMs: number }> {
   return new Promise((resolve, reject) => {
     const env: NodeJS.ProcessEnv = { ...process.env, SESSION_DATA_DIR: opts.dataDir, ...opts.extraEnv };
     delete env.BOTMUX_SESSION_ID;
@@ -52,7 +52,6 @@ function runStatusline(opts: RunOpts): Promise<{ status: number | null; stdout: 
     delete env.BOTMUX_WORKFLOW;
     if (opts.sessionId) env.BOTMUX_SESSION_ID = opts.sessionId;
     if (opts.chain) env.BOTMUX_STATUSLINE_CHAIN = opts.chain;
-    const started = Date.now();
     const child = spawnTsScript(
       CLI_PATH,
       ['statusline'],
@@ -64,7 +63,7 @@ function runStatusline(opts: RunOpts): Promise<{ status: number | null; stdout: 
     child.stderr?.setEncoding('utf8');
     child.stderr?.on('data', (chunk: string) => { stderr += chunk; });
     child.once('error', reject);
-    child.once('close', status => resolve({ status, stdout: Buffer.concat(out), stderr, elapsedMs: Date.now() - started }));
+    child.once('close', status => resolve({ status, stdout: Buffer.concat(out), stderr, finishedAtMs: Date.now() }));
     child.stdin!.end(opts.stdin);
   });
 }
@@ -120,17 +119,22 @@ describe('botmux statusline', () => {
     expect(existsSync(statuslineFilePath(dataDir, SID))).toBe(true);
   });
 
-  it('⑤ chain 挂死（sleep 30）：看门狗 ≤ 12s 内 exit 0', async () => {
+  it('⑤ chain 挂死（sleep 30）：从 chain 启动起看门狗 ≤ 12s 内 exit 0', async () => {
     const dataDir = makeDataDir();
+    const startedFile = join(dataDir, 'chain-started');
     const r = await runStatusline({
       dataDir,
       sessionId: SID,
-      chain: 'sleep 30',
+      chain: 'printf started > "$BOTMUX_STATUSLINE_CHAIN_STARTED_FILE"; exec sleep 30',
+      extraEnv: { BOTMUX_STATUSLINE_CHAIN_STARTED_FILE: startedFile },
       stdin: Buffer.from(JSON.stringify(PAYLOAD)),
       ignoreOutput: true,
     });
     expect(r.status).toBe(0);
-    expect(r.elapsedMs).toBeLessThanOrEqual(12_000);
+    // The 10s watchdog starts when the chain is spawned, after CLI/tsx startup.
+    // Measuring from the parent spawn adds unrelated startup contention in CI.
+    expect(existsSync(startedFile)).toBe(true);
+    expect(r.finishedAtMs - statSync(startedFile).mtimeMs).toBeLessThanOrEqual(12_000);
   }, 20_000);
 
   it('⑥ 非 JSON stdin：不落盘、exit 0', async () => {

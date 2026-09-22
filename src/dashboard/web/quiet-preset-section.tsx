@@ -14,18 +14,18 @@ type JsonResponse = { ok: boolean; status: number; body: any };
  */
 export function QuietPresetSection(props: {
   tr: Tr;
-  thinkingCard: boolean;
+  cotEnabled: boolean;
   silentReactions: boolean;
   disableStreaming: boolean;
   putCardPref(patch: {
-    thinkingCard: boolean;
+    cotEnabled: boolean;
     silentTurnReactions: boolean;
     disableStreamingCard: boolean;
   }): Promise<JsonResponse>;
   onApplied(): void;
 }) {
   const { tr } = props;
-  const derived = props.thinkingCard === false
+  const derived = props.cotEnabled === false
     && props.silentReactions === true
     && props.disableStreaming === true;
   const [on, setOn] = useState(derived);
@@ -46,7 +46,7 @@ export function QuietPresetSection(props: {
     setOn(true);
     try {
       const res = await props.putCardPref({
-        thinkingCard: false,
+        cotEnabled: false,
         silentTurnReactions: true,
         disableStreamingCard: true,
       });
