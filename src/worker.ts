@@ -11088,19 +11088,24 @@ function readPaneLeafComm(observedBackend: SessionBackend | null = backend): str
   return comm;
 }
 
-function tmuxSessionHasTargetCli(sessionName: string): boolean {
+function tmuxSessionHasTargetCli(
+  sessionName: string,
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+): boolean {
   const pid = TmuxBackend.sessionChildPid(sessionName);
-  if (!cfg) return false;
   return tmuxPaneHasTargetCli(pid, cfg.cliId as CliId, cfg.cliPathOverride);
 }
 
-function decideWorkflowTmuxReattach(sessionName: string): boolean {
+function decideWorkflowTmuxReattach(
+  sessionName: string,
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+): boolean {
   const sessionExists = TmuxBackend.hasSession(sessionName);
   if (!isWorkflowWorker()) return sessionExists;
   const decision = decideTmuxReattach({
     workflowWorker: true,
     sessionExists,
-    targetCliAlive: tmuxSessionHasTargetCli(sessionName),
+    targetCliAlive: tmuxSessionHasTargetCli(sessionName, cfg),
   });
   if (!decision.reattach && decision.cleanupStale) {
     log(`Workflow tmux session ${sessionName} is not reusable: ${decision.reason}; killing stale backing session before fresh spawn`);
@@ -13842,7 +13847,10 @@ async function spawnCli(
     let hasExistingSession = false;
     let existingSessionUnknown = false;
     if (effectiveBackend === 'tmux') {
-      resolvedTmuxHasReusableSession = decideWorkflowTmuxReattach(TmuxBackend.sessionName(cfg.sessionId));
+      resolvedTmuxHasReusableSession = decideWorkflowTmuxReattach(
+        TmuxBackend.sessionName(cfg.sessionId),
+        cfg,
+      );
       hasExistingSession = resolvedTmuxHasReusableSession;
       if (!hasExistingSession) {
         const probe = probeTmuxFunctionalWithRetry();
