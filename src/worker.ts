@@ -16438,19 +16438,23 @@ async function spawnCli(
     // keys, external BOTS_CONFIG and the shared lark-cli keystore from the
     // on-disk layout — a hand-built list once drifted and left bots.json
     // readable inside scratch (PR #1513 review).
-    const scratchSecretPaths = enumerateScratchSecretPaths({
+    const scratchSecrets = enumerateScratchSecretPaths({
       botmuxHomes: [...new Set([defaultBotmuxHome, configuredBotmuxHome])].map(scratchCanonical),
       dataDirs: [scratchDataDir].map(scratchCanonical),
       botsConfigPath: cfg.loadedBotsConfigPath ? scratchCanonical(cfg.loadedBotsConfigPath) : undefined,
+      sessionId: cfg.sessionId,
     });
     const scratchDeny = [...new Set<string>([
       ...credentialRules.denyPaths.map(scratchCanonical),
-      ...scratchSecretPaths,
+      ...scratchSecrets.denyPaths,
       join(scratchCanonical(scratchDataDir), 'sandboxes', cfg.sessionId),
       ...(cfg.scratchDenyPaths ?? [])
         .filter((p): p is string => typeof p === 'string' && !!p)
         .map(p => scratchCanonical(p.replace(/^~(?=\/|$)/, scratchHome))),
     ])];
+    // This session's own trigger-user identity files (under the sealed
+    // cli-identity dir) must stay readable for the governed CLI / relay.
+    const scratchReadOnlyCarves = scratchSecrets.readOnlyCarvePaths.map(scratchCanonical);
 
     scratchNativeCodexHome = nativeCodexHome;
     scratchNativeTraeHome = nativeTraeHome;
@@ -16542,6 +16546,7 @@ async function spawnCli(
         shimBindTargets: [defaultGatewayEntry().command],
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
         childEnvForce: { CODEX_HOME: nativeCodexHome, TRAE_HOME: nativeTraeHome },
+        readOnlyCarvePaths: scratchReadOnlyCarves,
       });
       if (!sbx) {
         throw new Error('scratch sandbox requested but could not be established (overlay/bwrap setup failed, or the tmpfs upper was lost in a reboot) — start a new session; never bare-running');

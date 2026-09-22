@@ -14,7 +14,7 @@ import {
   persistedScratchMappings,
   type ScratchPathMapping,
 } from '../src/services/scratch-host-view.js';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -117,5 +117,30 @@ describe('persistedScratchMappings (cross-process meta)', () => {
     ]);
     expect(persistedScratchMappings(dir, 'nope')).toBeUndefined();
     rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe('scratchViewPath canonicalises symlink-aliased input (mac /tmp → /private/tmp)', () => {
+  it('maps a path given via a symlink alias when it exists on disk', () => {
+    // /tmp is a symlink to /private/tmp on macOS (and often Linux too). Build
+    // a mapping from the REAL path; the caller hands in the alias.
+    const maps: ScratchPathMapping[] = [
+      { from: '/private/tmp/work', to: '/clone/work' },
+    ];
+    // Only assert when this host actually has the /tmp → /private/tmp alias.
+    let realTmp: string;
+    try { realTmp = realpathSync('/tmp'); } catch { realTmp = '/tmp'; }
+    if (realTmp !== '/tmp') {
+      const aliasWork = join('/tmp', 'work', 'x');
+      const got = scratchViewPath(maps, aliasWork);
+      expect(got).toBe(join('/clone/work', 'x'));
+    }
+  });
+
+  it('falls back to the original path when canonicalisation cannot resolve', () => {
+    const maps: ScratchPathMapping[] = [{ from: '/home/u', to: '/clone/home' }];
+    // A definitely-nonexistent path uncovered by any mapping returns as-is.
+    const p = '/some/missing/path/that/does/not/exist';
+    expect(scratchViewPath(maps, p)).toBe(p);
   });
 });

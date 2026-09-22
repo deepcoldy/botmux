@@ -16,8 +16,8 @@
  * NEVER fall back to a real host path for a path a mapping covered but
  * currently absent (unmounted/deleted clone): that would surface stale data.
  */
-import { isAbsolute, join } from 'node:path';
-import { existsSync, readFileSync } from 'node:fs';
+import { isAbsolute, join, resolve } from 'node:path';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 
 export interface ScratchPathMapping {
   /** Host-side real prefix (absolute, canonical). */
@@ -63,15 +63,26 @@ function prefixMatch(realPrefix: string, p: string): boolean {
 }
 
 /** Resolve one host absolute path through the first mapping covering it.
- *  Returns the input unchanged when uncovered/relative. */
+ *  Returns the input unchanged when uncovered/relative.
+ *
+ * The lookup path is canonicalised with realpath before prefix matching when
+ * it EXISTS: mapping `from`s are realpath-normalised, so a caller passing a
+ * symlink alias (/var/... vs /private/var/..., /tmp vs /private/tmp) would
+ * otherwise miss every mapping and fall back to the real host path (a macOS
+ * scratch cost-card bug found on a real Mac: projects under /tmp). A
+ * non-existent path can't be realpath'd, so it falls back to lexical resolve. */
 export function scratchViewPath(
   mappings: ScratchPathMapping[] | undefined,
   hostAbsPath: string,
 ): string {
   if (!mappings || !isAbsolute(hostAbsPath)) return hostAbsPath;
+  let canon = hostAbsPath;
+  try { canon = realpathSync(hostAbsPath); } catch {
+    try { canon = resolve(hostAbsPath); } catch { /* keep lexical */ }
+  }
   for (const m of mappings) {
-    if (prefixMatch(m.from, hostAbsPath)) {
-      const rest = m.from === '/' ? hostAbsPath : hostAbsPath.slice(m.from.length);
+    if (prefixMatch(m.from, canon)) {
+      const rest = m.from === '/' ? canon : canon.slice(m.from.length);
       return join(m.to, rest);
     }
   }

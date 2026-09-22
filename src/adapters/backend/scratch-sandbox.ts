@@ -322,6 +322,13 @@ export interface PrepareScratchOpts {
   /** Absolute `botmux` command paths to overlay with the relay shim. */
   shimBindTargets?: readonly string[];
   mcpGatewaySocketPath?: string;
+  /** Host paths that must be READABLE inside the sandbox even though they live
+   *  under a denied directory (e.g. this session's own trigger-user identity
+   *  files under the otherwise-sealed cli-identity/ dir). Bound READ-ONLY. */
+  readOnlyCarvePaths?: readonly string[];
+  /** Host paths that must be READ+WRITABLE inside even under a denied dir
+   *  (the outbox is handled internally; reserved for future carve-outs). */
+  writableCarvePaths?: readonly string[];
   /** Env keys the WORKER may repoint at the host-side merged tree for its own
    *  transcript reads (CODEX_HOME / TRAE_HOME). The container child must keep
    *  seeing the NATIVE path (the merged host path does not exist inside the
@@ -592,6 +599,39 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
       return fail('mcp-socket-setup');
     }
   }
+  // Read-only carve-outs under denied directories (this session's own
+  // trigger-user identity files under the sealed cli-identity dir).
+  //
+  // bwrap cannot create a nested mountpoint under a read-only masked dir
+  // ("Can't create file ... Read-only file system"), so for each denied
+  // DIRECTORY that hosts ro-carve files we re-mount it as a fresh tmpfs (the
+  // earlier empty-dir mask is overlaid, hiding all sibling files), bind the
+  // individual read-only files into it, then remount the dir read-only.
+  // (Same shape as the writable outbox carve, but the contents are ro.)
+  const roCarveByDir = new Map<string, string[]>();
+  for (const raw of opts.readOnlyCarvePaths ?? []) {
+    const p = canonical(raw);
+    if (!isAbsolute(p) || !existsSync(p)) continue;
+    const dir = dirname(p);
+    if (!roCarveByDir.has(dir)) roCarveByDir.set(dir, []);
+    roCarveByDir.get(dir)!.push(p);
+  }
+  // Emit tmpfs for each masked parent dir that needs ro carves. These must
+  // land AFTER the deny masks (later mount wins) — they do, this block runs
+  // after the deny-mask loop above.
+  for (const [dir, files] of roCarveByDir) {
+    // Only when the dir itself (or an ancestor) is denied does the tmpfs
+    // replacement make sense; otherwise a plain ro-bind works.
+    const denied = denies.some(d => d === dir);
+    if (denied) {
+      args.push('--tmpfs', dir);
+      remountRo.push(dir);
+    }
+    for (const f of files) {
+      args.push('--ro-bind', f, f);
+    }
+  }
+
   // fnm/nvm/volta bin farms under /run get masked by the fresh /run tmpfs.
   args.push(...reexposeRunBinArgs([opts.cliBin, process.execPath]));
 

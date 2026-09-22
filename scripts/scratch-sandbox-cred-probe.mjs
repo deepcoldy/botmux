@@ -41,6 +41,9 @@ mkdirSync(join(homedir(), '.lark-cli'), { recursive: true });
 mkdirSync(join(homedir(), '.local', 'share', 'lark-cli'), { recursive: true });
 mkdirSync(join(dataDir, 'vc-meeting-daemon-auth'), { recursive: true });
 mkdirSync(join(dataDir, 'bytedcli-home', 'ou-someone'), { recursive: true });
+mkdirSync(join(dataDir, 'cli-identity'), { recursive: true });
+const OWN_ENV = join(dataDir, 'cli-identity', `${sid}.lark-cli.env`);
+const OTHER_ENV = join(dataDir, 'cli-identity', 'session-OTHER.lark-cli.env');
 const BOTS = join(botmuxHome, 'bots.json');
 const SECRET = join(botmuxHome, '.dashboard-secret');
 const SIDECAR = `${BOTS}.bak-1`;
@@ -59,17 +62,22 @@ writeFileSync(WEBHOOK, 'SECRET-webhook-key');
 writeFileSync(USER_TOKEN, JSON.stringify({ access_token: 'SECRET-user-access-token' }));
 writeFileSync(VC_TOKEN, '57-SECRET-vcda');
 writeFileSync(BYTEDCLI_LOGIN, JSON.stringify({ openId: 'SECRET-bytedcli-login' }));
+writeFileSync(OWN_ENV, "TOKEN='SECRET-own-session-token'");
+writeFileSync(OTHER_ENV, "TOKEN='SECRET-other-person-token'");
 writeFileSync(join(LARK_STORE_REAL, 'master.key'), 'SECRET-real-lark-master');
 const larkMarker = join(LARK_STORE, '.cred-probe-marker');
 let larkStoreProbeable = false;
 try { writeFileSync(larkMarker, 'SECRET-larkstore'); larkStoreProbeable = true; } catch { /* TCC */ }
 
 try {
-  const denyPaths = enumerateScratchSecretPaths({
+  const secretSet = enumerateScratchSecretPaths({
     botmuxHomes: [botmuxHome],
     dataDirs: [dataDir],
     botsConfigPath: BOTS,
+    sessionId: sid,
   });
+  const denyPaths = secretSet.denyPaths;
+  const roCarves = secretSet.readOnlyCarvePaths;
   check('enumerator found bots.json', denyPaths.includes(BOTS));
   check('enumerator found bots.json sidecar', denyPaths.includes(SIDECAR));
   check('enumerator found dashboard secret', denyPaths.includes(SECRET));
@@ -78,6 +86,9 @@ try {
   check('enumerator found per-person user-token', denyPaths.includes(USER_TOKEN));
   check('enumerator found vc daemon auth dir', denyPaths.includes(join(dataDir, 'vc-meeting-daemon-auth')));
   check('enumerator found bytedcli-home dir', denyPaths.includes(join(dataDir, 'bytedcli-home')));
+  check('enumerator sealed cli-identity dir', denyPaths.includes(join(dataDir, 'cli-identity')));
+  check('enumerator carved OWN session identity read-only', roCarves.includes(OWN_ENV));
+  check('enumerator did NOT carve other session identity', !roCarves.includes(OTHER_ENV));
   check('enumerator found legacy ~/.lark-cli store', denyPaths.includes(LARK_STORE));
   check('enumerator found REAL ~/.local/share/lark-cli store', denyPaths.includes(LARK_STORE_REAL));
 
@@ -90,6 +101,7 @@ try {
     cliBin: '/bin/sh',
     cliArgs: ['-c', 'true'],
     denyPaths,
+    readOnlyCarvePaths: roCarves,
   });
   check('prepare ok', !!sbx);
   if (!sbx) process.exit(1);
@@ -113,6 +125,10 @@ try {
   check('per-person user access token hidden', secretHidden(USER_TOKEN, 'user-access-token'));
   check('vc daemon auth token hidden (dir mask)', secretHidden(VC_TOKEN, 'SECRET-vcda'));
   check('bytedcli login hidden (dir mask)', secretHidden(BYTEDCLI_LOGIN, 'SECRET-bytedcli-login'));
+  check('OTHER session trigger-user token hidden', secretHidden(OTHER_ENV, 'SECRET-other-person-token'));
+  // own session identity must remain readable (governed CLI / botmux send sources it)
+  const ownOut = readInside(OWN_ENV);
+  check('OWN session identity still readable (ro carve)', ownOut.includes('SECRET-own-session-token'), ownOut.trim().slice(0, 50));
   check('REAL lark-cli master.key hidden', secretHidden(join(LARK_STORE_REAL, 'master.key'), 'real-lark-master'));
   if (larkStoreProbeable) check('shared lark-cli store hidden', secretHidden(larkMarker, 'larkstore'));
 

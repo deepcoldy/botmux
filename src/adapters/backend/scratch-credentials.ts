@@ -30,11 +30,27 @@ import { resolveLarkCliLinuxStoreDir } from '../cli/fs-policy.js';
 export interface ScratchSecretInput {
   /** All botmux authority homes (~/.botmux + custom BOTMUX_HOME variants). */
   botmuxHomes: readonly string[];
-  /** Session data dirs (webhook secrets live here). */
+  /** Session data dirs (webhook secrets + per-person tokens live here). */
   dataDirs: readonly string[];
   /** Resolved loaded BOTS_CONFIG path (may live outside any botmux home). */
   botsConfigPath?: string;
+  /** Current session id, for the cli-identity per-session carve-out: the
+   *  whole cli-identity/ directory is sealed (it holds every concurrent
+   *  session's plaintext trigger-user tokens), but THIS session's own
+   *  <sid>.<tool>.env/.bin/.turn files are returned as read-only carve paths
+   *  (the governed CLI + `botmux send` need them). */
+  sessionId?: string;
 }
+
+export interface ScratchSecrets {
+  /** Paths denied read+write in the sandbox. */
+  denyPaths: string[];
+  /** Paths re-opened READ-ONLY inside an otherwise denied dir. */
+  readOnlyCarvePaths: string[];
+}
+
+const CLI_IDENTITY_BASENAMES = ['lark-cli.env', 'bytedcli.env', 'bin', 'turn'];
+const CLI_IDENTITY_DIR = 'cli-identity';
 
 function isFileOrLink(p: string): boolean {
   try { return !lstatSync(p).isDirectory(); } catch { return false; }
@@ -43,8 +59,9 @@ function isDir(p: string): boolean {
   try { return lstatSync(p).isDirectory(); } catch { return false; }
 }
 
-export function enumerateScratchSecretPaths(input: ScratchSecretInput): string[] {
+export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchSecrets {
   const out = new Set<string>();
+  const readOnlyCarve = new Set<string>();
   const addFile = (p: string | undefined): void => {
     if (p && isFileOrLink(p)) out.add(p);
   };
@@ -112,6 +129,23 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): string[]
       const p = join(dataDir, secretDir);
       if (isDir(p)) out.add(p);
     }
+
+    // Trigger-user CLI identity dir: holds EVERY concurrent session's
+    // plaintext user access tokens, one file set per session. Seal the whole
+    // directory (so one scratch turn can't read another person's token), then
+    // carve back READ-ONLY exactly this session's own files the governed CLI
+    // / `botmux send` wrapper sources at runtime. Mirrors fs-policy's
+    // per-session grants; never grant the parent.
+    const cliIdentityDir = join(dataDir, CLI_IDENTITY_DIR);
+    if (isDir(cliIdentityDir)) {
+      out.add(cliIdentityDir);
+      if (input.sessionId) {
+        for (const suffix of CLI_IDENTITY_BASENAMES) {
+          const own = join(cliIdentityDir, `${input.sessionId}.${suffix}`);
+          if (existsSync(own)) readOnlyCarve.add(own);
+        }
+      }
+    }
   }
 
   // Shared lark-cli keystore(s) holding every app's encrypted appsecret + the
@@ -128,5 +162,11 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): string[]
     if (existsSync(p)) out.add(p);
   }
 
-  return [...out];
+  return { denyPaths: [...out], readOnlyCarvePaths: [...readOnlyCarve] };
+}
+
+/** Back-compat flat list (deny + ro-carve are all "secret-adjacent"); used by
+ *  callers that only need the full denied set. */
+export function enumerateScratchSecretPathList(input: ScratchSecretInput): string[] {
+  return enumerateScratchSecretPaths(input).denyPaths;
 }
