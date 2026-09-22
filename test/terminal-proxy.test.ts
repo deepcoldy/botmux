@@ -357,12 +357,13 @@ describe('terminal proxy — on-demand wake (ensureWorkerPort)', () => {
     expect(res.status).toBe(502);
   });
 
-  it('renders an auto-retrying status page while an authorized session is starting', async () => {
+  it('renders a localized static page while an authorized session is starting', async () => {
     proxy = await startTerminalProxy({
       port: 0, host: '127.0.0.1',
       resolvePort: () => undefined,
       ensureWorkerPort: async () => undefined,
       resolveSessionState: () => 'starting',
+      resolveStatusPageLocale: () => 'en',
       authorizeStatusPage: (_sessionId, capability) => capability.viewToken === 'card-view',
     });
     const res = await fetch(
@@ -370,11 +371,12 @@ describe('terminal proxy — on-demand wake (ensureWorkerPort)', () => {
     );
     expect(res.status).toBe(503);
     expect(res.headers.get('content-type')).toContain('text/html');
-    expect(res.headers.get('retry-after')).toBe('2');
+    expect(res.headers.get('retry-after')).toBeNull();
     const html = await res.text();
-    expect(html).toContain('终端正在启动');
-    expect(html).toContain('location.reload()');
-    expect(html).toContain('启动时间较长，请稍后刷新页面或从最新卡片重新打开 Web 终端。');
+    expect(html).toContain('Terminal is starting');
+    expect(html).toContain('<html lang="en">');
+    expect(html).toContain('Refresh this page later or reopen the Web Terminal from the latest card.');
+    expect(html).not.toContain('location.reload');
     expect(html).not.toContain('<button');
   });
 

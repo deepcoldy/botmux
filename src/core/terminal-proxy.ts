@@ -1,4 +1,5 @@
 import { createServer, connect as netConnect, type Server, type Socket } from 'node:net';
+import type { Locale } from '../i18n/index.js';
 import { logger } from '../utils/logger.js';
 import { terminalStatusHtml, type TerminalStatusKind } from './terminal-status-page.js';
 
@@ -43,6 +44,8 @@ export interface TerminalProxyOptions {
    * useful terminal state instead of an undifferentiated 502 body. */
   resolveSessionState?: (sessionId: string) =>
     'starting' | 'closed' | 'not-found' | 'unavailable';
+  /** Resolve the owning bot's locale for daemon-rendered status pages. */
+  resolveStatusPageLocale?: (sessionId: string) => Locale | undefined;
   /** Validate a card/write capability before revealing session state. */
   authorizeStatusPage?: (
     sessionId: string,
@@ -104,14 +107,19 @@ function writeHttpError(sock: Socket, status: number, reason: string, body: stri
   try { sock.end(payload); } catch { /* client already gone */ }
 }
 
-function writeStatusPage(sock: Socket, status: number, reason: string, kind: TerminalStatusKind): void {
-  const body = terminalStatusHtml(kind);
+function writeStatusPage(
+  sock: Socket,
+  status: number,
+  reason: string,
+  kind: TerminalStatusKind,
+  locale?: Locale,
+): void {
+  const body = terminalStatusHtml(kind, locale);
   const payload =
     `HTTP/1.1 ${status} ${reason}\r\n` +
     'content-type: text/html; charset=utf-8\r\n' +
     'cache-control: no-store\r\n' +
     'referrer-policy: no-referrer\r\n' +
-    (kind === 'starting' ? 'retry-after: 2\r\n' : '') +
     `content-length: ${Buffer.byteLength(body)}\r\n` +
     'connection: close\r\n' +
     '\r\n' +
@@ -209,20 +217,21 @@ export function startTerminalProxy(opts: TerminalProxyOptions): Promise<Terminal
             return;
           }
           const state = opts.resolveSessionState?.(parsed.sessionId) ?? 'unavailable';
+          const locale = opts.resolveStatusPageLocale?.(parsed.sessionId);
           const authorized = opts.authorizeStatusPage?.(
             parsed.sessionId,
             requestCapability(parsed.rest),
           ) ?? true;
           if (!authorized && state !== 'not-found') {
-            writeStatusPage(client, 403, 'Forbidden', 'forbidden');
+            writeStatusPage(client, 403, 'Forbidden', 'forbidden', locale);
           } else if (state === 'closed') {
-            writeStatusPage(client, 410, 'Gone', 'closed');
+            writeStatusPage(client, 410, 'Gone', 'closed', locale);
           } else if (state === 'not-found') {
-            writeStatusPage(client, 404, 'Not Found', 'not-found');
+            writeStatusPage(client, 404, 'Not Found', 'not-found', locale);
           } else if (state === 'starting') {
-            writeStatusPage(client, 503, 'Service Unavailable', 'starting');
+            writeStatusPage(client, 503, 'Service Unavailable', 'starting', locale);
           } else {
-            writeStatusPage(client, 503, 'Service Unavailable', 'unavailable');
+            writeStatusPage(client, 503, 'Service Unavailable', 'unavailable', locale);
           }
           return;
         }

@@ -1,6 +1,18 @@
 /** English translations — mirrors the keys defined in `zh.ts`. */
 export const messages: Record<string, string> = {
   'worker.steer_accepted': 'Got it — guidance accepted',
+  // ─── Terminal status pages ───────────────────────────────────────────────
+  'terminal.status.starting.title': 'Terminal is starting',
+  'terminal.status.starting.detail': 'Restoring this session\'s terminal connection. Refresh this page later or reopen the Web Terminal from the latest card.',
+  'terminal.status.closed.title': 'This session is closed',
+  'terminal.status.closed.detail': 'This session has ended, so its terminal can no longer be viewed.',
+  'terminal.status.not_found.title': 'Session not found',
+  'terminal.status.not_found.detail': 'This terminal link is invalid, or the session has been deleted.',
+  'terminal.status.forbidden.title': 'Terminal link expired',
+  'terminal.status.forbidden.detail': 'Return to Lark and reopen the Web Terminal from this session\'s latest card.',
+  'terminal.status.unavailable.title': 'Terminal unavailable',
+  'terminal.status.unavailable.detail': 'The session still exists, but its terminal service cannot be restored right now.',
+
   // ─── Card buttons ────────────────────────────────────────────────────────
   'card.btn.open_terminal': '🖥️ Open Web Terminal',
   'card.btn.open_writable_terminal': '🖥️ Open Writable Web Terminal',

@@ -212,11 +212,7 @@ import { stagePendingRepoSetup, persistPendingRepoCardMessageId } from './core/p
 import { hasPendingSessionTurns, runSessionTurn } from './core/session-turn-queue.js';
 import { buildTerminalUrl, setTerminalProxyPort, setTerminalExternalPort } from './core/terminal-url.js';
 import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-proxy.js';
-import {
-  deriveTerminalCardViewToken,
-  deriveTerminalWriteToken,
-  safeTerminalTokenEqual,
-} from './core/terminal-write-auth.js';
+import { authorizeTerminalStatusPage } from './core/terminal-write-auth.js';
 import type { CliId } from './adapters/cli/types.js';
 import { runtimeInstallationKey } from './adapters/cli/runtime.js';
 import * as scheduler from './core/scheduler.js';
@@ -26406,6 +26402,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         if (!stored) return 'not-found';
         return stored.status === 'closed' ? 'closed' : 'starting';
       },
+      resolveStatusPageLocale: (sessionId) => {
+        for (const ds of activeSessions.values()) {
+          if (ds.session.sessionId === sessionId) return localeForBot(ds.larkAppId);
+        }
+        return localeForBot(sessionStore.getOwnedSession(sessionId)?.larkAppId);
+      },
       authorizeStatusPage: (sessionId, capability) => {
         let live: DaemonSession | undefined;
         for (const ds of activeSessions.values()) {
@@ -26415,24 +26417,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           }
         }
         const session = live?.session ?? sessionStore.getOwnedSession(sessionId);
-        if (!session) return false;
-        if (capability.token && safeTerminalTokenEqual(
-          capability.token,
-          deriveTerminalWriteToken(terminalCapabilitySecret, sessionId),
-        )) return true;
-        if (!capability.viewToken) return false;
-        if (live?.workerViewToken
-          && safeTerminalTokenEqual(capability.viewToken, live.workerViewToken)) return true;
-        if (live?.workerCardViewToken
-          && safeTerminalTokenEqual(capability.viewToken, live.workerCardViewToken)) return true;
-        return !!session.terminalCardEpoch && safeTerminalTokenEqual(
-          capability.viewToken,
-          deriveTerminalCardViewToken(
-            terminalCapabilitySecret,
-            sessionId,
-            session.terminalCardEpoch,
-          ),
-        );
+        return authorizeTerminalStatusPage({
+          secret: terminalCapabilitySecret,
+          sessionId,
+          session,
+          live,
+          capability,
+        });
       },
     });
     // Only mark the proxy live after a successful bind — buildTerminalUrl then

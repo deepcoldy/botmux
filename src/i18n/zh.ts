@@ -4,6 +4,18 @@
  */
 export const messages: Record<string, string> = {
   'worker.steer_accepted': '收到，引导成功',
+  // ─── Terminal status pages ───────────────────────────────────────────────
+  'terminal.status.starting.title': '终端正在启动',
+  'terminal.status.starting.detail': '正在恢复该会话的终端连接，请稍后刷新页面或从最新卡片重新打开 Web 终端。',
+  'terminal.status.closed.title': '该会话已关闭',
+  'terminal.status.closed.detail': '会话已经结束，终端内容无法继续查看。',
+  'terminal.status.not_found.title': '找不到该会话',
+  'terminal.status.not_found.detail': '终端链接无效，或者对应会话已经被删除。',
+  'terminal.status.forbidden.title': '终端链接已失效',
+  'terminal.status.forbidden.detail': '请返回飞书，从该会话的最新卡片重新打开 Web 终端。',
+  'terminal.status.unavailable.title': '终端暂不可用',
+  'terminal.status.unavailable.detail': '会话仍然存在，但终端服务当前无法恢复。',
+
   // ─── Card buttons ────────────────────────────────────────────────────────
   'card.btn.open_terminal': '🖥️ 打开 Web 终端',
   'card.btn.open_writable_terminal': '🖥️ 打开可操作 Web 终端',

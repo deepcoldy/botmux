@@ -187,6 +187,7 @@ setInterval(() => {}, 1_000);
       larkAppId: 'app_terminal_auth',
       larkAppSecret: 'secret',
       terminalCardEpoch: 'terminal-auth-card-epoch',
+      locale: 'en',
     };
     child.send(init);
     const ready = await waitForReady(child, logs);
@@ -208,7 +209,10 @@ setInterval(() => {}, 1_000);
 
     const scanner = await fetch(`${base}/`);
     expect(scanner.status).toBe(403);
-    expect(await scanner.text()).toContain('终端链接已失效');
+    const scannerHtml = await scanner.text();
+    expect(scannerHtml).toContain('Terminal link expired');
+    expect(scannerHtml).toContain('<html lang="en">');
+    expect(scannerHtml).not.toMatch(/[\u3400-\u9fff]/);
 
     const view = await fetch(`${base}/?viewToken=${encodeURIComponent(ready.viewToken!)}`);
     expect(view.status).toBe(200);

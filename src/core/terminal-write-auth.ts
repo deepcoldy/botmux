@@ -119,6 +119,43 @@ export function deriveTerminalWriteToken(secret: string, sessionId: string): str
     .digest('base64url');
 }
 
+export interface TerminalStatusPageAuthorizationInput {
+  secret: string;
+  sessionId: string;
+  session: { terminalCardEpoch?: string } | undefined;
+  live: {
+    workerViewToken?: string | null;
+    workerCardViewToken?: string | null;
+  } | undefined;
+  capability: { viewToken?: string; token?: string };
+}
+
+/**
+ * Authorize a daemon-rendered terminal status page without depending on daemon
+ * maps or storage. Unknown sessions fail closed here; the proxy separately
+ * allows its state === 'not-found' response so callers cannot turn a missing
+ * capability into a misleading 403 for an ID that does not exist.
+ */
+export function authorizeTerminalStatusPage(
+  input: TerminalStatusPageAuthorizationInput,
+): boolean {
+  const { secret, sessionId, session, live, capability } = input;
+  if (!session) return false;
+  if (capability.token && safeTerminalTokenEqual(
+    capability.token,
+    deriveTerminalWriteToken(secret, sessionId),
+  )) return true;
+  if (!capability.viewToken) return false;
+  if (live?.workerViewToken
+    && safeTerminalTokenEqual(capability.viewToken, live.workerViewToken)) return true;
+  if (live?.workerCardViewToken
+    && safeTerminalTokenEqual(capability.viewToken, live.workerCardViewToken)) return true;
+  return !!session.terminalCardEpoch && safeTerminalTokenEqual(
+    capability.viewToken,
+    deriveTerminalCardViewToken(secret, sessionId, session.terminalCardEpoch),
+  );
+}
+
 export function resolveTerminalWrite(
   { role, tokenMatches, platformBound, platformProxied }: TerminalWriteInput,
 ): { hasWrite: boolean; platformReadonly: boolean } {

@@ -1,3 +1,5 @@
+import { getDefaultLocale, t, type Locale } from '../i18n/index.js';
+
 export type TerminalStatusKind =
   | 'starting'
   | 'closed'
@@ -7,66 +9,51 @@ export type TerminalStatusKind =
 
 interface TerminalStatusCopy {
   code: string;
-  title: string;
-  detail: string;
-  retry: boolean;
+  titleKey: string;
+  detailKey: string;
 }
 
 const STATUS_COPY: Record<TerminalStatusKind, TerminalStatusCopy> = {
   starting: {
     code: 'STARTING',
-    title: '终端正在启动',
-    detail: '正在恢复该会话的终端连接，页面会自动重试。',
-    retry: true,
+    titleKey: 'terminal.status.starting.title',
+    detailKey: 'terminal.status.starting.detail',
   },
   closed: {
     code: 'SESSION CLOSED',
-    title: '该会话已关闭',
-    detail: '会话已经结束，终端内容无法继续查看。',
-    retry: false,
+    titleKey: 'terminal.status.closed.title',
+    detailKey: 'terminal.status.closed.detail',
   },
   'not-found': {
     code: 'NOT FOUND',
-    title: '找不到该会话',
-    detail: '终端链接无效，或者对应会话已经被删除。',
-    retry: false,
+    titleKey: 'terminal.status.not_found.title',
+    detailKey: 'terminal.status.not_found.detail',
   },
   forbidden: {
     code: 'LINK EXPIRED',
-    title: '终端链接已失效',
-    detail: '请返回飞书，从该会话的最新卡片重新打开 Web 终端。',
-    retry: false,
+    titleKey: 'terminal.status.forbidden.title',
+    detailKey: 'terminal.status.forbidden.detail',
   },
   unavailable: {
     code: 'UNAVAILABLE',
-    title: '终端暂不可用',
-    detail: '会话仍然存在，但终端服务当前无法恢复。',
-    retry: false,
+    titleKey: 'terminal.status.unavailable.title',
+    detailKey: 'terminal.status.unavailable.detail',
   },
 };
 
-export function terminalStatusHtml(kind: TerminalStatusKind): string {
-  const copy = STATUS_COPY[kind];
-  const retryScript = copy.retry
-    ? `<script>
-const key='botmux-terminal-retry:'+location.pathname;
-const count=Number(sessionStorage.getItem(key)||'0');
-if(count<20){
-  sessionStorage.setItem(key,String(count+1));
-  setTimeout(()=>location.reload(),2000);
-}else{
-  document.getElementById('retry-note').textContent='启动时间较长，请稍后刷新页面或从最新卡片重新打开 Web 终端。';
-}
-</script>`
-    : '';
+export function terminalStatusHtml(kind: TerminalStatusKind, requestedLocale?: Locale): string {
+  const definition = STATUS_COPY[kind];
+  const locale = requestedLocale ?? getDefaultLocale();
+  const title = t(definition.titleKey, undefined, locale);
+  const detail = t(definition.detailKey, undefined, locale);
 
   return `<!doctype html>
-<html lang="zh-CN">
+<html lang="${locale === 'en' ? 'en' : 'zh-CN'}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<title>${copy.title} - Botmux Terminal</title>
+<title>${title} - Botmux Terminal</title>
 <style>
 :root{color-scheme:light dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 *{box-sizing:border-box}
@@ -87,11 +74,10 @@ p{margin:0;color:#646a73;font-size:15px;line-height:1.7}
 <main>
   <div class="brand">BOTMUX TERMINAL</div>
   <div class="rule"></div>
-  <div class="code">${copy.code}</div>
-  <h1>${copy.title}</h1>
-  <p id="retry-note">${copy.detail}</p>
+  <div class="code">${definition.code}</div>
+  <h1>${title}</h1>
+  <p>${detail}</p>
 </main>
-${retryScript}
 </body>
 </html>`;
 }
