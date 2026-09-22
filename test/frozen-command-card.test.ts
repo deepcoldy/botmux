@@ -30,6 +30,8 @@ const action: FrozenCommandActionRecord = {
   rawArgs: '7',
   normalizedArgs: [{ name: 'days', label: '天数', value: '7' }],
   datasource: 'warehouse',
+  executorId: 'builtin.data-mcp.readonly',
+  executorRevision: 'builtin-data-mcp-v1',
   specHash: 'b'.repeat(64),
   revisionId: 'revision',
   createdAt: '2026-09-20T00:00:00.000Z',
@@ -112,7 +114,7 @@ describe('Frozen Command business cards', () => {
     });
     expect(rendered).toMatchObject({
       header: { template: 'red', title: { content: '执行失败' } },
-      body: { elements: [{ text: { content: expect.stringContaining('查询未完成') } }] },
+      body: { elements: [{ text: { content: expect.stringContaining('执行未完成') } }] },
     });
     expect(JSON.stringify(rendered)).not.toContain('data_mcp_not_enabled');
   });
