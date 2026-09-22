@@ -686,6 +686,52 @@ describe('Frozen Command host-owned route → callback → Data MCP flow', () =>
     expect(mocks.runCalls).toBe(0);
   });
 
+  it('does not let a bot sender initiate a frozen-command lifecycle transition', async () => {
+    const messageId = `om_bot_transition_${Math.random().toString(36).slice(2)}`;
+    const event = ingressEvent(
+      messageId,
+      '@_bot /freeze rm /宿主闭环 --reason 机器人不得发起状态变更',
+    );
+    event.sender.sender_type = 'bot';
+
+    await modules.daemon.__testOnly_handleNewTopic(
+      event,
+      ingressContext(messageId, messageId),
+    );
+
+    expect(mocks.cardBodies.at(-1)).toContain('只有身份明确的真人消息可以发起固化命令状态变更');
+    expect(mocks.cardBodies.at(-1)).not.toContain('确认废弃');
+  });
+
+  it('does not let a bot sender confirm a frozen-command lifecycle transition', async () => {
+    const pending = modules.lifecycle.prepareFrozenCommandTransition({
+      dataDir,
+      targetBotId: APP,
+      workingDir: root,
+      command: COMMAND,
+      action: 'retire',
+      actor: { openId: ACTOR_OPEN_ID, unionId: ACTOR_UNION_ID },
+      actorIsAdmin: true,
+      reason: '验证机器人不能确认状态变更',
+    });
+    const messageId = `om_bot_confirm_${Math.random().toString(36).slice(2)}`;
+    const event = ingressEvent(messageId, `@_bot /freeze confirm ${pending.token}`);
+    event.sender.sender_type = 'bot';
+
+    await modules.daemon.__testOnly_handleNewTopic(
+      event,
+      ingressContext(messageId, messageId),
+    );
+
+    expect(mocks.cardBodies.at(-1)).toContain('只有身份明确的真人消息可以确认固化命令状态变更');
+    expect(modules.lifecycle.evaluateFrozenCommandLifecycle({
+      dataDir,
+      targetBotId: APP,
+      workingDir: root,
+      command: COMMAND,
+    }).kind).toBe('active');
+  });
+
   it.each([
     ['top-level', 'top-level'],
     ['structuredContent', 'structured'],
