@@ -15,8 +15,8 @@ import { ZellijBackend } from './zellij-backend.js';
 import { ZmxBackend } from './zmx-backend.js';
 import { classifyTmuxProbeFailure } from '../../setup/ensure-tmux.js';
 import { resolveZmxSocketDir, zmxEnv } from '../../setup/ensure-zmx.js';
-import { isBareShellComm } from '../../core/session-discovery.js';
 import type { BackendType, PersistentBackendTarget, SessionBackend } from './types.js';
+export { decideTmuxReattach } from './tmux-reattach-decision.js';
 
 const MANAGED_HERDR_AGENT_PREFIX = 'botmux-';
 const MANAGED_HERDR_AGENT_TOKEN_LENGTH = 25;
@@ -178,25 +178,6 @@ export function decideBackendGate(opts: {
   if (opts.existingSessionUnknown) return { action: 'spawn' };
   if (opts.available) return { action: 'spawn' };
   return { action: 'gate', reason: `${opts.requested} 后端在本机不可用` };
-}
-
-export type TmuxReattachDecision =
-  | { reattach: true }
-  | { reattach: false; cleanupStale: boolean; reason?: string };
-
-export function decideTmuxReattach(opts: {
-  workflowWorker: boolean;
-  sessionExists: boolean;
-  paneLeafComm?: string;
-}): TmuxReattachDecision {
-  if (!opts.sessionExists) return { reattach: false, cleanupStale: false };
-  if (!opts.workflowWorker) return { reattach: true };
-  if (!isBareShellComm(opts.paneLeafComm)) return { reattach: true };
-  return {
-    reattach: false,
-    cleanupStale: true,
-    reason: `workflow tmux pane is a bare shell (${opts.paneLeafComm})`,
-  };
 }
 
 /** User-facing card shown when {@link decideBackendGate} gates a session. */

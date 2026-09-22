@@ -67,27 +67,27 @@ describe('decideTmuxReattach', () => {
     expect(decideTmuxReattach({
       workflowWorker: false,
       sessionExists: true,
-      paneLeafComm: 'zsh',
+      targetCliAlive: false,
     })).toEqual({ reattach: true });
   });
 
-  it('reattaches workflow workers only when the existing pane is not a bare shell', () => {
+  it('reattaches workflow workers only when the target Agent CLI is proven alive', () => {
     expect(decideTmuxReattach({
       workflowWorker: true,
       sessionExists: true,
-      paneLeafComm: 'codex',
+      targetCliAlive: true,
     })).toEqual({ reattach: true });
   });
 
-  it('rejects a workflow reattach to a stale shell husk so /goal cannot be injected into zsh', () => {
+  it('rejects a workflow reattach without a live target Agent so /goal cannot reach a husk', () => {
     expect(decideTmuxReattach({
       workflowWorker: true,
       sessionExists: true,
-      paneLeafComm: 'zsh',
+      targetCliAlive: false,
     })).toEqual({
       reattach: false,
       cleanupStale: true,
-      reason: 'workflow tmux pane is a bare shell (zsh)',
+      reason: 'workflow tmux pane has no live target Agent CLI',
     });
   });
 
@@ -95,7 +95,7 @@ describe('decideTmuxReattach', () => {
     expect(decideTmuxReattach({
       workflowWorker: true,
       sessionExists: false,
-      paneLeafComm: 'codex',
+      targetCliAlive: true,
     })).toEqual({ reattach: false, cleanupStale: false });
   });
 });

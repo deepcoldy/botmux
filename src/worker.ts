@@ -345,6 +345,7 @@ import {
   retireSupersededRecordedHerdrTarget,
   selectSessionBackend,
 } from './adapters/backend/session-backend-selector.js';
+import { tmuxPaneHasTargetCli } from './adapters/backend/tmux-reattach-decision.js';
 import { buildReproduceCommand, selectReproduceLaunch } from './adapters/backend/reproduce-command.js';
 import {
   deriveRiffReposFromDirs,
@@ -11087,20 +11088,19 @@ function readPaneLeafComm(observedBackend: SessionBackend | null = backend): str
   return comm;
 }
 
-function readTmuxSessionLeafComm(sessionName: string): string | undefined {
+function tmuxSessionHasTargetCli(sessionName: string): boolean {
   const pid = TmuxBackend.sessionChildPid(sessionName);
-  if (!pid) return undefined;
-  return readComm(pid);
+  if (!cfg) return false;
+  return tmuxPaneHasTargetCli(pid, cfg.cliId as CliId, cfg.cliPathOverride);
 }
 
 function decideWorkflowTmuxReattach(sessionName: string): boolean {
   const sessionExists = TmuxBackend.hasSession(sessionName);
   if (!isWorkflowWorker()) return sessionExists;
-  const comm = readTmuxSessionLeafComm(sessionName);
   const decision = decideTmuxReattach({
     workflowWorker: true,
     sessionExists,
-    paneLeafComm: comm,
+    targetCliAlive: tmuxSessionHasTargetCli(sessionName),
   });
   if (!decision.reattach && decision.cleanupStale) {
     log(`Workflow tmux session ${sessionName} is not reusable: ${decision.reason}; killing stale backing session before fresh spawn`);
