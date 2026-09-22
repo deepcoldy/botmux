@@ -38,8 +38,11 @@ it.skipIf(spawnSync('tmux', ['-V']).status !== 0)('Kimi effort reaches its pane 
           workingDir: data, cliId: 'kimi', cliPathOverride: fixture, backendType: 'tmux', prompt: '',
           launchShell: '/bin/bash', model: 'kimi-code/k3-256k', reasoningEffort, env: botEnv,
           larkAppId: 'test', larkAppSecret: 'test', apiOnly: true });
-        await expect.poll(() => existsSync(output), { timeout: 15000 }).toBe(true)
-          .catch(error => { throw new Error(`${error}\n${logs}`); });
+        const deadline = Date.now() + 15000;
+        while (!existsSync(output) && Date.now() < deadline) {
+          await new Promise(resolveWait => setTimeout(resolveWait, 50));
+        }
+        expect(existsSync(output), logs).toBe(true);
         expect(readFileSync(output, 'utf8'), logs).toBe(expected);
       } finally {
         if (child.connected) child.send!({ type: 'close' });
