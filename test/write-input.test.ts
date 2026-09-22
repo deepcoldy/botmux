@@ -1496,6 +1496,8 @@ describe('codex writeInput submission confirmation', () => {
       'check_for_update_on_startup=false',
       '-c',
       'notice.hide_rate_limit_model_nudge=true',
+      '-c',
+      'projects={"/repo/root"={trust_level="trusted"}}',
       '-C',
       '/repo/root',
     ]);

@@ -816,6 +816,8 @@ describe('codex buildArgs', () => {
       'check_for_update_on_startup=false',
       '-c',
       'notice.hide_rate_limit_model_nudge=true',
+      '-c',
+      'projects={"/repo/root"={trust_level="trusted"}}',
       '-C',
       '/repo/root',
     ]);
@@ -831,11 +833,68 @@ describe('codex buildArgs', () => {
       'check_for_update_on_startup=false',
       '-c',
       'notice.hide_rate_limit_model_nudge=true',
+      '-c',
+      'projects={"/repo/root"={trust_level="trusted"}}',
       '-C',
       '/repo/root',
     ]);
     // a restricted bot must not silently gain hook trust either
     expect(args).not.toContain('--dangerously-bypass-hook-trust');
+  });
+
+  it('pre-trusts the session cwd via a process-level projects override', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/srv/app' });
+    const idx = args.indexOf('projects={"/srv/app"={trust_level="trusted"}}');
+    expect(idx).toBeGreaterThan(0);
+    expect(args[idx - 1]).toBe('-c');
+  });
+
+  it('emits no projects trust override when workingDir is absent', () => {
+    const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
+    expect(args.some(a => a.startsWith('projects='))).toBe(false);
+  });
+
+  it('omits the cwd trust override on a true resume (cwd is not pinned with -C)', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-4', resume: true, resumeSessionId: 'codex-sess-1', workingDir: '/srv/app',
+    });
+    expect(args.some(a => a.startsWith('projects='))).toBe(false);
+    expect(args).not.toContain('-C');
+  });
+
+  it('omits the cwd trust override on fork (same resumed cwd semantics as resume)', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-4', resume: true, resumeSessionId: 'codex-sess-1',
+      forkSession: true, workingDir: '/srv/app',
+    });
+    expect(args.some(a => a.startsWith('projects='))).toBe(false);
+    expect(args).not.toContain('-C');
+  });
+
+  it('never sends the projects trust override to the --remote app-server viewer', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-rpc', resume: true, workingDir: '/srv/app',
+      remoteWsUrl: 'ws://127.0.0.1:9931', remoteThreadId: 'thread-abc',
+    });
+    expect(args.some(a => a.startsWith('projects='))).toBe(false);
+  });
+
+  it('uses inline-table TOML with a quoted key so dotted cwd paths cannot split the key', () => {
+    // Dotted-key spelling projects."/a/b".trust_level breaks when the cwd itself
+    // contains dots (e.g. versioned release dirs). The inline table keeps the
+    // whole path inside one quoted TOML string.
+    const args = adapter.buildArgs({
+      sessionId: 'sess-4', resume: false, workingDir: '/opt/app-1.2.3/work',
+    });
+    const override = args.find(a => a.startsWith('projects='));
+    expect(override).toBe('projects={"/opt/app-1.2.3/work"={trust_level="trusted"}}');
+  });
+
+  it('TOML-escapes quotes inside the cwd rather than breaking the inline table', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-4', resume: false, workingDir: '/weird"dir',
+    });
+    expect(args).toContain('projects={"/weird\\"dir"={trust_level="trusted"}}');
   });
 
   it('always disables the startup update picker for botmux-managed launches', () => {

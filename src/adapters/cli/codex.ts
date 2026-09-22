@@ -15,6 +15,43 @@ import { delay, scaleMs } from '../../utils/timing.js';
 const CODEX_ACTIVE_BUSY_PATTERN = /Working[^\r\n]{0,160}esc to interrupt/i;
 const CODEX_STARTUP_READY_PATTERN = /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/;
 
+/**
+ * Pre-trust the session cwd so Codex's startup folder-trust screen never
+ * renders (its option wording has already changed once upstream — "Yes,
+ * continue" → "Trust and continue" (npm 0.156-alpha.1; source first at
+ * 0.155-alpha.4, see #1519) — and may change again; matching the text is
+ * inherently reactive, while the persisted decision makes the dialog
+ * structurally unreachable).
+ *
+ * Codex stores folder trust in config.toml's `projects` table; the TUI skips
+ * the onboarding trust step when `active_project.trust_level == "trusted"`.
+ * We inject it as a PROCESS-LEVEL `-c` override (never written to the user's
+ * config), expressed as an inline TOML table. Inline-table form is mandatory:
+ * the dotted-key spelling `projects."/a/b".trust_level=…` does NOT take effect
+ * via `-c` on standalone codex 0.153/0.157 at all — verified to leave the
+ * project untrusted even for dot-free paths, so it is not just the quoted-key
+ * dotted-segmentation corner case; the quoted table key in
+ * `projects={"<cwd>"={trust_level="trusted"}}` is the reliably-accepted form
+ * for any path spelling. TOML tables deep-merge with the loaded config, so
+ * existing trusted projects are preserved. Trust becoming effective is
+ * observable on every tested version as the `codex exec` sandbox default
+ * moving read-only → workspace-write (standalone codex 0.144.6 / 0.153.4 /
+ * 0.157-alpha); note the interactive TUI trust screen itself only exists on
+ * ≥0.156 in current builds, so dialog-suppression is directly demonstrated
+ * there.
+ *
+ * Plain owned TUI fresh launches only (the caller attaches the result to `-C`
+ * args): `--remote` viewers run against an app-server whose trust is decided
+ * host-side and never reach this helper; adopt panes are user-owned and are not
+ * spawned through this path; real resume/fork reuse the original session's
+ * already-persisted trust decision.
+ */
+function codexCwdTrustOverrideArgs(workingDir?: string): string[] {
+  if (!workingDir) return [];
+  return ['-c', `projects={${JSON.stringify(workingDir)}={trust_level="trusted"}}`];
+}
+
+
 /** ZMX resume can replace the entire banner with restored history; warm worker
  * reattach can leave the original loaded banner far above the viewport. Either
  * native header plus a bottom empty composer + explicit Ready footer proves
@@ -338,8 +375,16 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       // worker.ts (only when sandboxRequested), so off-sandbox spawns keep the
       // lexical path — realpath'ing here unconditionally would desync codex's cwd
       // semantics vs the worker's lexical bridge/state tracking.
+      //
+      // Pre-trust the cwd we are about to pin (see codexCwdTrustOverrideArgs).
+      // Only on FRESH launches: a real `resume`/`fork` below runs without -C in
+      // the thread's original directory, whose trust decision was already
+      // persisted when that session first started — injecting trust for a cwd we
+      // are not pinning would be meaningless; the worker's text-matching Enter
+      // stays the fail-safe for any untrusted resume cwd.
+      const cwdTrustArgs = codexCwdTrustOverrideArgs(workingDir);
       const freshArgs = workingDir
-        ? [...baseArgs, '-C', workingDir]
+        ? [...baseArgs, ...cwdTrustArgs, '-C', workingDir]
         : baseArgs;
       const codexSessionId = resume
         ? resumeSessionId ?? latestCodexSessionForBotmuxSession(sessionId)

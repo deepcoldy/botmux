@@ -610,6 +610,13 @@ describe('codex adapter × aiden wrapper (regression for commit 10d3e61)', () =>
     expect(out.args).toContain('--no-alt-screen');
   });
 
+  it('aiden x codex strips the cwd trust preseed -c (aiden rejects passthrough config)', () => {
+    const args = codex.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo' });
+    expect(args.join(' ')).toContain('projects={"/repo"={trust_level="trusted"}}');
+    const out = buildWrappedLaunch('aiden x codex', args);
+    expect(out.args.some(a => a.startsWith('projects='))).toBe(false);
+  });
+
   // Cross-CLI guard: any aiden `aiden x <cli>` wrapper must drop a botmux-injected
   // `-c shell_environment_policy.set.BOTMUX_*` override, so a future adapter that
   // mirrors Codex's injection cannot re-break aiden launches. ttadk keeps it
@@ -662,6 +669,16 @@ describe('codex adapter × cjadk wrapper (cjadk -c/--command collision)', () => 
     expect(findConfigOverride(out.args, '-c')).toBeUndefined();
     expect(findConfigOverride(out.args, '--config')).toBe('shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"');
     expect(out.args).toContain('codex-uuid');        // resume target survives
+  });
+
+  it('cjadk codex forwards the cwd trust preseed through --config on a fresh launch', () => {
+    const args = codex.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo' });
+    const out = buildWrappedLaunch('cjadk codex', args);
+    expect(out.args).toContain('--config');
+    expect(out.args).toContain('projects={"/repo"={trust_level="trusted"}}');
+    // It must ride --config, never a bare -c (cjadk --command collision).
+    const idx = out.args.indexOf('projects={"/repo"={trust_level="trusted"}}');
+    expect(out.args[idx - 1]).toBe('--config');
   });
 });
 

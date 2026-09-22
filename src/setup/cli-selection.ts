@@ -321,8 +321,15 @@ function isBotmuxCodexConfigValue(value: string | undefined): boolean {
     // 同属 botmux 注入的进程级 config 覆盖，须与上面的更新检查一并被 wrapper 识别，
     // 否则 aiden 网关会拒收裸 `-c` 直接启动失败。
     || value === 'notice.hide_rate_limit_model_nudge=true'
+    // codex 适配器对 fresh 启动注入的 cwd 信任预置（projects 内联表，见
+    // codex.ts codexCwdTrustOverrideArgs）。aiden 网关拒收裸 `-c` → 剥掉（信任弹窗
+    // 退回 worker 的文案识别兜底）；cjadk 改写成 --config 透传给真 codex 继续生效。
+    || BOTMUX_CODEX_CWD_TRUST_RE.test(value)
   );
 }
+
+/** 匹配 codex 适配器注入的 cwd 信任预置值：projects={"<任意路径>"={trust_level="trusted"}}。 */
+const BOTMUX_CODEX_CWD_TRUST_RE = /^projects=\{"(?:[^"\\]|\\.)*"=\{trust_level="trusted"\}\}$/;
 
 /**
  * 剥掉 aiden x claude 拒收的 `--settings`（含其值），支持 `--settings <v>` 与
