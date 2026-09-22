@@ -88,8 +88,8 @@
     "@napi-rs/canvas": "^0.1.65"
   },
   "devDependencies": {
-    "@midscene/test": "1.13.0",
-    "@midscene/web": "1.13.0",
+    "@midscene/test": "1.13.1",
+    "@midscene/web": "1.13.1",
     "@playwright/test": "^1.58.2",
     "@types/markdown-it": "^14.1.2",
     "@types/node": "^22.0.0",
