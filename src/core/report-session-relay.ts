@@ -18,11 +18,40 @@ export interface ReportSessionRelaySessionView {
   replyTargets?: Record<string, { rootMessageId?: string; turnId?: string }>;
 }
 
+export interface ReportSessionRelayTargetView {
+  sessionId: string;
+  larkAppId: string;
+  chatId?: string;
+  scope?: 'thread' | 'chat';
+  status?: string;
+}
+
+export type ReportSessionRelayFallbackDecision =
+  | {
+      ok: true;
+      target: { sessionId: string; larkAppId: string };
+      reason: 'original_session_closed' | 'original_session_not_found';
+      originalChatId: string;
+    }
+  | {
+      ok: false;
+      error:
+        | 'fallback_not_applicable'
+        | 'original_chat_unproven'
+        | 'original_session_not_closed'
+        | 'fallback_target_unavailable'
+        | 'fallback_target_ambiguous';
+      originalChatId?: string;
+      candidateCount?: number;
+    };
+
 export type ReportSessionRelayDecision =
   | {
       ok: true;
       source: { sessionId: string; larkAppId: string };
       target: { sessionId: string; larkAppId: string };
+      targetChatId?: string;
+      targetScope?: 'thread' | 'chat';
       dispatchRoot: string;
       sourceName: string;
       content: string;
@@ -134,6 +163,8 @@ export function authorizeReportSessionRelayRequest(input: {
       sessionId: resolved.binding.targetSessionId,
       larkAppId: resolved.binding.targetLarkAppId,
     },
+    ...(resolved.binding.targetChatId ? { targetChatId: resolved.binding.targetChatId } : {}),
+    ...(resolved.binding.targetScope ? { targetScope: resolved.binding.targetScope } : {}),
     dispatchRoot,
     sourceName: resolved.binding.sourceName,
     content,
@@ -146,9 +177,71 @@ export function authorizeReportSessionRelayRequest(input: {
   };
 }
 
+export function isReportRelayOriginalSessionUnavailable(input: {
+  status: number;
+  body: unknown;
+}): boolean {
+  if (input.status !== 404) return false;
+  if (!input.body || typeof input.body !== 'object' || Array.isArray(input.body)) return false;
+  return (input.body as Record<string, unknown>).errorCode === 'session_not_found';
+}
+
+export function resolveReportRelayFallbackTarget(input: {
+  originalTarget: { sessionId: string; larkAppId: string; chatId?: string; scope?: 'thread' | 'chat' };
+  originalSession?: ReportSessionRelayTargetView;
+  sessions: readonly ReportSessionRelayTargetView[];
+}): ReportSessionRelayFallbackDecision {
+  const original = input.originalSession;
+  if (original && original.sessionId !== input.originalTarget.sessionId) {
+    return { ok: false, error: 'fallback_not_applicable' };
+  }
+  if (original && original.status !== 'closed') {
+    return { ok: false, error: 'original_session_not_closed' };
+  }
+
+  const originalChatId = original?.chatId ?? input.originalTarget.chatId;
+  if (!originalChatId || !/^oc_[A-Za-z0-9_-]{1,128}$/.test(originalChatId)) {
+    return { ok: false, error: 'original_chat_unproven' };
+  }
+
+  const candidates = input.sessions.filter(session =>
+    session.larkAppId === input.originalTarget.larkAppId
+    && session.sessionId !== input.originalTarget.sessionId
+    && session.chatId === originalChatId
+    && session.scope === 'chat'
+    && session.status === 'active',
+  );
+  if (candidates.length === 0) {
+    return {
+      ok: false,
+      error: 'fallback_target_unavailable',
+      originalChatId,
+      candidateCount: 0,
+    };
+  }
+  if (candidates.length > 1) {
+    return {
+      ok: false,
+      error: 'fallback_target_ambiguous',
+      originalChatId,
+      candidateCount: candidates.length,
+    };
+  }
+  return {
+    ok: true,
+    target: {
+      sessionId: candidates[0]!.sessionId,
+      larkAppId: candidates[0]!.larkAppId,
+    },
+    reason: original ? 'original_session_closed' : 'original_session_not_found',
+    originalChatId,
+  };
+}
+
 export function buildOrchestratorReportTrigger(
   decision: Extract<ReportSessionRelayDecision, { ok: true }>,
   meta: { requestId: string; receivedAt: string },
+  target = decision.target,
 ): Record<string, unknown> {
   return {
     source: {
@@ -159,8 +252,8 @@ export function buildOrchestratorReportTrigger(
     },
     target: {
       kind: 'turn',
-      botId: decision.target.larkAppId,
-      sessionId: decision.target.sessionId,
+      botId: target.larkAppId,
+      sessionId: target.sessionId,
     },
     envelope: {
       format: 'botmux-report/v1',

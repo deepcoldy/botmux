@@ -4,8 +4,10 @@ import { describe, expect, it } from 'vitest';
 import {
   authorizeReportSessionRelayRequest,
   buildOrchestratorReportTrigger,
+  isReportRelayOriginalSessionUnavailable,
   REPORT_SESSION_RELAY_MAX_BYTES,
   REPORT_SESSION_RELAY_ROUTE,
+  resolveReportRelayFallbackTarget,
   type ReportSessionRelaySessionView,
 } from '../src/core/report-session-relay.js';
 import { createDispatchReportBinding } from '../src/core/dispatch-report-binding.js';
@@ -238,6 +240,111 @@ describe('report session relay authorization', () => {
         originCapability: CAPABILITY, status: 'done',
       },
     })).toEqual({ ok: false, status: 400, error: 'bad_project_status' });
+  });
+});
+
+describe('report session relay fallback target', () => {
+  const originalTarget = {
+    larkAppId: 'cli_orchestrator',
+    sessionId: 'session-orchestrator',
+    chatId: 'oc_original',
+    scope: 'chat' as const,
+  };
+  const originalClosed = {
+    ...originalTarget,
+    status: 'closed',
+  };
+  const successor = {
+    larkAppId: 'cli_orchestrator',
+    sessionId: 'session-current',
+    chatId: 'oc_original',
+    scope: 'chat' as const,
+    status: 'active',
+  };
+
+  it('recognizes only the typed active-session-not-found trigger result as fallback eligible', () => {
+    expect(isReportRelayOriginalSessionUnavailable({
+      status: 404,
+      body: { ok: false, errorCode: 'session_not_found', error: 'active session not found: session-orchestrator' },
+    })).toBe(true);
+    expect(isReportRelayOriginalSessionUnavailable({
+      status: 504,
+      body: { ok: false, errorCode: 'wait_timeout', triggerId: 'trg_1' },
+    })).toBe(false);
+    expect(isReportRelayOriginalSessionUnavailable({
+      status: 500,
+      body: { ok: false, errorCode: 'trigger_failed', error: 'active session not found: session-orchestrator' },
+    })).toBe(false);
+    expect(isReportRelayOriginalSessionUnavailable({
+      status: 404,
+      body: { ok: false, error: 'active session not found: session-orchestrator' },
+    })).toBe(false);
+  });
+
+  it('selects the unique current chat-scope session for the original bot and chat', () => {
+    expect(resolveReportRelayFallbackTarget({
+      originalTarget,
+      originalSession: originalClosed,
+      sessions: [
+        successor,
+        { ...successor, sessionId: 'wrong-bot', larkAppId: 'cli_other' },
+        { ...successor, sessionId: 'wrong-chat', chatId: 'oc_other' },
+        { ...successor, sessionId: 'wrong-scope', scope: 'thread' },
+        { ...originalClosed },
+      ],
+    })).toEqual({
+      ok: true,
+      target: { larkAppId: 'cli_orchestrator', sessionId: 'session-current' },
+      reason: 'original_session_closed',
+      originalChatId: 'oc_original',
+    });
+  });
+
+  it('can use the signed original chat when the original session row is missing', () => {
+    expect(resolveReportRelayFallbackTarget({
+      originalTarget,
+      sessions: [successor],
+    })).toEqual({
+      ok: true,
+      target: { larkAppId: 'cli_orchestrator', sessionId: 'session-current' },
+      reason: 'original_session_not_found',
+      originalChatId: 'oc_original',
+    });
+  });
+
+  it('fails closed when original chat identity is unavailable or original row is not closed', () => {
+    expect(resolveReportRelayFallbackTarget({
+      originalTarget: { larkAppId: 'cli_orchestrator', sessionId: 'session-orchestrator' },
+      sessions: [successor],
+    })).toEqual({ ok: false, error: 'original_chat_unproven' });
+    expect(resolveReportRelayFallbackTarget({
+      originalTarget,
+      originalSession: { ...originalClosed, status: 'active' },
+      sessions: [successor],
+    })).toEqual({ ok: false, error: 'original_session_not_closed' });
+  });
+
+  it('fails closed with no or multiple same-chat successors', () => {
+    expect(resolveReportRelayFallbackTarget({
+      originalTarget,
+      originalSession: originalClosed,
+      sessions: [],
+    })).toEqual({
+      ok: false,
+      error: 'fallback_target_unavailable',
+      originalChatId: 'oc_original',
+      candidateCount: 0,
+    });
+    expect(resolveReportRelayFallbackTarget({
+      originalTarget,
+      originalSession: originalClosed,
+      sessions: [successor, { ...successor, sessionId: 'session-current-2' }],
+    })).toEqual({
+      ok: false,
+      error: 'fallback_target_ambiguous',
+      originalChatId: 'oc_original',
+      candidateCount: 2,
+    });
   });
 });
 

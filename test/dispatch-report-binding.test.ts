@@ -12,6 +12,8 @@ function binding(dispatchRoot = 'om_seed') {
     dispatchRoot,
     targetLarkAppId: 'cli_orchestrator',
     targetSessionId: 'session-orchestrator',
+    targetChatId: 'oc_orchestrator',
+    targetScope: 'chat',
     sourceName: '支付页修复',
     issuedAt: '2026-08-10T00:00:00.000Z',
   });
@@ -34,6 +36,8 @@ describe('dispatch report binding', () => {
       binding: {
         targetLarkAppId: 'cli_orchestrator',
         targetSessionId: 'session-orchestrator',
+        targetChatId: 'oc_orchestrator',
+        targetScope: 'chat',
       },
     });
   });
