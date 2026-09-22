@@ -184,23 +184,27 @@ export function normalizeSessionRow(
   if (typeof row.feishuThreadLink === 'string' && row.feishuThreadLink) identity.feishuThreadLink = row.feishuThreadLink;
 
   const cli: ObserveSession['cli'] = {};
-  if (typeof row.cliId === 'string' && row.cliId && row.cliId !== 'unknown') cli.id = row.cliId;
-  if (typeof row.runtimeId === 'string' && row.runtimeId) cli.runtimeId = row.runtimeId;
-  if (typeof row.runtimeDisplayName === 'string' && row.runtimeDisplayName) {
+  if (hasRuntimeFacts && typeof row.cliId === 'string' && row.cliId && row.cliId !== 'unknown') cli.id = row.cliId;
+  if (hasRuntimeFacts && typeof row.runtimeId === 'string' && row.runtimeId) cli.runtimeId = row.runtimeId;
+  if (hasRuntimeFacts && typeof row.runtimeDisplayName === 'string' && row.runtimeDisplayName) {
     cli.runtimeDisplayName = row.runtimeDisplayName;
   }
-  if (typeof row.cliVersion === 'string' && row.cliVersion) cli.version = row.cliVersion;
-  if (typeof row.cliInstanceId === 'string' && row.cliInstanceId) cli.instanceId = row.cliInstanceId;
+  if (hasRuntimeFacts && typeof row.cliVersion === 'string' && row.cliVersion) cli.version = row.cliVersion;
+  if (hasRuntimeFacts && typeof row.cliInstanceId === 'string' && row.cliInstanceId) cli.instanceId = row.cliInstanceId;
 
   const backend: ObserveSession['backend'] = {
     adopted: hasRuntimeFacts && typeof row.adopt === 'boolean' ? row.adopt : 'unknown',
   };
-  if (typeof row.backendType === 'string' && row.backendType) backend.type = row.backendType;
-  if (typeof row.backendSessionName === 'string' && row.backendSessionName) {
+  if (hasRuntimeFacts && typeof row.backendType === 'string' && row.backendType) backend.type = row.backendType;
+  if (hasRuntimeFacts && typeof row.backendSessionName === 'string' && row.backendSessionName) {
     backend.sessionName = row.backendSessionName;
   }
-  if (typeof row.workerPid === 'number' && Number.isFinite(row.workerPid)) backend.workerPid = row.workerPid;
-  if (typeof row.adoptCliPid === 'number' && Number.isFinite(row.adoptCliPid)) backend.adoptCliPid = row.adoptCliPid;
+  if (hasRuntimeFacts && typeof row.workerPid === 'number' && Number.isFinite(row.workerPid)) {
+    backend.workerPid = row.workerPid;
+  }
+  if (hasRuntimeFacts && typeof row.adoptCliPid === 'number' && Number.isFinite(row.adoptCliPid)) {
+    backend.adoptCliPid = row.adoptCliPid;
+  }
 
   const observe: ObserveSession = {
     schemaVersion: OBSERVE_SCHEMA_VERSION,
@@ -213,13 +217,13 @@ export function normalizeSessionRow(
     turn,
     phase: 'unknown',
     queued,
-    parkedOrSuspended: hasKnownStatus ? dormant || queued === true : 'unknown',
+    parkedOrSuspended: queued === true ? true : hasKnownStatus ? dormant : 'unknown',
     closed,
   };
 
-  if (typeof row.pendingRepo === 'boolean') observe.pendingRepo = row.pendingRepo;
-  if (typeof row.tuiPromptActive === 'boolean') observe.tuiPromptActive = row.tuiPromptActive;
-  if (row.agentAttention && typeof row.agentAttention === 'object') {
+  if (hasRuntimeFacts && typeof row.pendingRepo === 'boolean') observe.pendingRepo = row.pendingRepo;
+  if (hasRuntimeFacts && typeof row.tuiPromptActive === 'boolean') observe.tuiPromptActive = row.tuiPromptActive;
+  if (hasRuntimeFacts && row.agentAttention && typeof row.agentAttention === 'object') {
     const att = row.agentAttention as { kind?: unknown; reason?: unknown; at?: unknown };
     if (typeof att.kind === 'string' && typeof att.reason === 'string' && typeof att.at === 'number') {
       observe.attention = { kind: att.kind, reason: att.reason, at: att.at };
@@ -228,9 +232,11 @@ export function normalizeSessionRow(
   if (typeof row.lastMessageAt === 'number' && row.lastMessageAt > 0) {
     observe.lastActivityAt = row.lastMessageAt;
   }
-  if (typeof row.workingDir === 'string' && row.workingDir) observe.workingDirectory = row.workingDir;
-  if (status) observe.rawStatus = status;
-  if (options.includeRaw) observe.raw = row;
+  if (hasRuntimeFacts && typeof row.workingDir === 'string' && row.workingDir) {
+    observe.workingDirectory = row.workingDir;
+  }
+  if (hasRuntimeFacts && status) observe.rawStatus = status;
+  if (hasRuntimeFacts && options.includeRaw) observe.raw = row;
 
   return observe;
 }

@@ -19,7 +19,7 @@
 | `src/services/session-observe-fetch-internal.ts` | 测试 seam：集中提供 discover/fetch/clock 等依赖注入，不由 npm subpath 导出。|
 | `src/cli/observe-command.ts` | `botmux observe` 子命令（`--session`/`--lark-app`/`--include-raw`，固定输出 canonical JSON）。|
 | `src/cli.ts` | 在 top-level `switch (command)` 中注册 `case 'observe'`。|
-| `test/session-observe.test.ts` | 13 用例：normalizer 覆盖 working/idle/starting/dormant/closed/queued/unknown status/attention/adopt/no-phase/probe not_found/cliId=unknown/includeRaw。|
+| `test/session-observe.test.ts` | 16 用例：normalizer 覆盖 working/idle/starting/dormant/closed/queued/unknown status/partial row/attention/adopt/no-phase/probe failure/cliId=unknown/includeRaw。|
 | `test/session-observe-fetch.test.ts` | 15 用例：通过 internal seam 注入 discover + fetch，覆盖 pty/tmux + 至少两种 CLI adapter、unauthorized、请求与响应体超时、malformed body、多 daemon、not_found、daemon_offline、并发 fan-out 与混合失败优先级。|
 
 ## 契约（v1）
@@ -35,8 +35,8 @@
 - `queued`：`boolean | 'unknown'`；`pendingRepo?` 单列布尔。
 - `attention?`：仅当 `kind/reason/at` 三字段齐全时暴露。
 - `lastActivityAt?` / `workingDirectory?` / `tuiPromptActive?`：直接取 SessionRow。
-- `parkedOrSuspended`：有实时 row 时为 `status === 'dormant'` 或 `queued === true`；探针失败时为 `'unknown'`。
-- `closed`：有实时 row 时为 `status === 'closed'`；探针失败时为 `'unknown'`。
+- `parkedOrSuspended`：`queued === true` 或已识别的 `status === 'dormant'` 时为 `true`；已识别 status 的其它情况为 `false`；status 缺失/未知且 queue 不能证明停驻时为 `'unknown'`。
+- `closed`：仅已识别的 SessionRow status 可推导布尔值；status 缺失/未知或探针失败时为 `'unknown'`。
 - `rawStatus`：原始 SessionRow.status。诊断用。
 - `raw?`：`includeRaw:true` 时挂载整行 SessionRow。
 
@@ -53,11 +53,11 @@
 | `turn` | 同 SessionRow.status；`queued=true` 覆盖为 idle | 实时 | 未知/失败时 `unknown` |
 | `phase` | —— | **总是 unknown**，不再从 idle-detector 反推 | 保持 unknown |
 | `queued` | `SessionRow.queued`（daemon 计算） | 实时 bool | 缺失或非 bool 时 `'unknown'` |
-| `pendingRepo` | `SessionRow.pendingRepo` | 实时 | 缺失时省略 |
+| `pendingRepo` | `SessionRow.pendingRepo` | 实时 | 缺失或 probe 非 ok 时省略 |
 | `lastActivityAt` | `SessionRow.lastMessageAt` | 历史事实 | 缺失时省略 |
-| `workingDirectory` | `SessionRow.workingDir` | 半持久 | 缺失时省略 |
-| `attention` | `SessionRow.agentAttention` | 实时 | 三字段任一缺失即省略 |
-| `parkedOrSuspended` / `closed` | 前者派生自 dormant 或 queued，后者派生自 closed | 实时 | probe 非 ok 时均为 `'unknown'` |
+| `workingDirectory` | `SessionRow.workingDir` | 半持久 | 缺失或 probe 非 ok 时省略 |
+| `attention` | `SessionRow.agentAttention` | 实时 | 三字段任一缺失或 probe 非 ok 时省略 |
+| `parkedOrSuspended` / `closed` | 前者优先采用 queued=true，否则依赖已识别 status；后者仅依赖已识别 status | 实时 | status 未知或 probe 非 ok 时不能推导的值为 `'unknown'` |
 | `rawStatus` | `SessionRow.status` 原样 | 诊断字段 | probe 非 ok 时省略 |
 
 ## 未覆盖 / 仍是 unknown 的能力
@@ -67,7 +67,7 @@
 4. **未在 registry 里的 daemon**：`listOnlineDaemons` 已按 `DAEMON_HEARTBEAT_STALE_MS` (90s) 排除。descriptor 尚在但 heartbeat 陈旧 → `daemon_offline`。
 
 ## 验证证据
-- `bun test test/session-observe.test.ts test/session-observe-fetch.test.ts test/observe-command.test.ts test/observe-command.integration.test.ts` → 36/36 passed（13 normalizer + 15 façade behavior + 7 CLI 参数 + 1 真实 HMAC IPC）。
+- `bun test test/session-observe.test.ts test/session-observe-fetch.test.ts test/observe-command.test.ts test/observe-command.integration.test.ts` → 39/39 passed（16 normalizer + 15 façade behavior + 7 CLI 参数 + 1 真实 HMAC IPC）。
 - 本 review worktree 缺少 `node_modules`，`bun run build` 在 `tsc: command not found` 处停止；仓库约束禁止在 worktree 内安装依赖，完整声明生成与发布包检查留给后续 build gate。
 - `bun run test`（全量单测）**在同一工作树、切换到未修改的 master 时的失败集与包含本次改动时完全一致**：`session-store-sqlite-poisoned-recovery`（期望 `bunVersion==='1.4.2'`，本机 1.4.0）、`worker-codex-app-turn-routing.integration`、`schedule-store-dashboard-watch`、`statusline-cli`、`session-store-sqlite-bun-import`、`plugin-mcp-sandbox`、`sandbox-session-data-dir`、`native-subagent-runtime-hook` 等。这些失败与 observe seam 无关（对照 stash 前后同一 vitest 输出）。故不视为本任务回归；不修复不属于任务范围。
 - `botmux observe --help` 在编译产物上返回正确 usage。

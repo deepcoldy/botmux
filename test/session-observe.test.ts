@@ -127,6 +127,17 @@ describe('session-observe normalizer', () => {
     expect(observe.backend.adopted).toBe('unknown');
   });
 
+  it('uses positive queue evidence even when status is unrecognized', () => {
+    const observe = normalizeSessionRow(
+      makeRow({ status: 'paused', queued: true }),
+      { observedAt: OBSERVED_AT },
+    );
+    expect(observe.queued).toBe(true);
+    expect(observe.liveness).toBe('not_running');
+    expect(observe.parkedOrSuspended).toBe(true);
+    expect(observe.closed).toBe('unknown');
+  });
+
   it('keeps boolean facts unknown when a successful row omits their evidence', () => {
     const observe = normalizeSessionRow(
       { sessionId: 's_partial' },
@@ -188,6 +199,45 @@ describe('session-observe normalizer', () => {
     expect(observe.closed).toBe('unknown');
     expect(observe.probe).toEqual({ status: 'not_found', source: 'daemon-ipc', larkAppId: 'cli_app_1' });
     expect(observe.identity.sessionId).toBe('s_missing');
+  });
+
+  it('hides stale runtime fields when the probe is unauthorized', () => {
+    const observe = normalizeSessionRow(
+      makeRow({
+        status: 'working',
+        queued: true,
+        workerPid: 123,
+        adopt: true,
+        adoptCliPid: 456,
+        pendingRepo: true,
+        tuiPromptActive: true,
+        agentAttention: { kind: 'blocked', reason: 'stale', at: OBSERVED_AT - 1_000 },
+      }),
+      {
+        observedAt: OBSERVED_AT,
+        probe: { status: 'unauthorized', source: 'daemon-ipc' },
+        includeRaw: true,
+      },
+    );
+    expect(observe.identity.sessionId).toBe('s_1');
+    expect(observe.lastActivityAt).toBe(OBSERVED_AT - 5_000);
+    expect(observe.liveness).toBe('unknown');
+    expect(observe.turn).toBe('unknown');
+    expect(observe.queued).toBe('unknown');
+    expect(observe.closed).toBe('unknown');
+    expect(observe.parkedOrSuspended).toBe('unknown');
+    expect(observe.backend.adopted).toBe('unknown');
+    expect(observe.cli).toEqual({});
+    expect(observe.backend.type).toBeUndefined();
+    expect(observe.backend.sessionName).toBeUndefined();
+    expect(observe.backend.workerPid).toBeUndefined();
+    expect(observe.backend.adoptCliPid).toBeUndefined();
+    expect(observe.pendingRepo).toBeUndefined();
+    expect(observe.tuiPromptActive).toBeUndefined();
+    expect(observe.attention).toBeUndefined();
+    expect(observe.workingDirectory).toBeUndefined();
+    expect(observe.rawStatus).toBeUndefined();
+    expect(observe.raw).toBeUndefined();
   });
 
   it('does not treat cliId="unknown" as a real cli identity', () => {
