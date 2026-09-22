@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 import {
   authorizeReportSessionRelayRequest,
   buildOrchestratorReportTrigger,
+  deliverReportSessionRelay,
   isReportRelayOriginalSessionUnavailable,
   REPORT_SESSION_RELAY_MAX_BYTES,
   REPORT_SESSION_RELAY_ROUTE,
@@ -259,7 +260,9 @@ describe('report session relay fallback target', () => {
     sessionId: 'session-current',
     chatId: 'oc_original',
     scope: 'chat' as const,
-    status: 'active',
+    // This is the real /api/sessions shape for a live main session. The API
+    // exposes runtime state, never the persisted literal `active`.
+    status: 'idle',
   };
 
   it('recognizes only the typed active-session-not-found trigger result as fallback eligible', () => {
@@ -344,6 +347,78 @@ describe('report session relay fallback target', () => {
       error: 'fallback_target_ambiguous',
       originalChatId: 'oc_original',
       candidateCount: 2,
+    });
+  });
+
+  it('does not treat closed, dormant, or malformed rows as active successors', () => {
+    for (const status of ['closed', 'dormant', undefined]) {
+      expect(resolveReportRelayFallbackTarget({
+        originalTarget,
+        originalSession: originalClosed,
+        sessions: [{ ...successor, status }],
+      })).toEqual({
+        ok: false,
+        error: 'fallback_target_unavailable',
+        originalChatId: 'oc_original',
+        candidateCount: 0,
+      });
+    }
+  });
+});
+
+describe('report session relay delivery', () => {
+  it('tries the signed original first, then retries once with unchanged provenance', async () => {
+    const authorized = authorize({
+      registry: {
+        om_dispatch: {
+          reportBinding: createDispatchReportBinding(BINDING_SECRET, {
+            dispatchRoot: 'om_dispatch',
+            targetLarkAppId: 'cli_orchestrator',
+            targetSessionId: 'session-orchestrator',
+            targetChatId: 'oc_original',
+            targetScope: 'chat',
+            sourceName: '指标页修复',
+            issuedAt: '2026-08-07T07:00:00.000Z',
+          }),
+        },
+      },
+    });
+    expect(authorized.ok).toBe(true);
+    if (!authorized.ok) return;
+    const calls: Array<{ path: string; body?: any }> = [];
+    let triggerCount = 0;
+    const delivered = await deliverReportSessionRelay({
+      decision: authorized,
+      triggerMeta: { requestId: 'report:1', receivedAt: '2026-08-07T07:00:00.000Z' },
+      fetchTarget: async (path, init) => {
+        calls.push({ path, ...(typeof init.body === 'string' ? { body: JSON.parse(init.body) } : {}) });
+        if (path === '/api/sessions') {
+          return {
+            ok: true, status: 200, json: async () => ({ sessions: [{
+              sessionId: 'session-current', larkAppId: 'cli_orchestrator',
+              chatId: 'oc_original', scope: 'chat', status: 'idle',
+            }] }),
+          };
+        }
+        triggerCount += 1;
+        return triggerCount === 1
+          ? { ok: false, status: 404, json: async () => ({ errorCode: 'session_not_found' }) }
+          : { ok: true, status: 202, json: async () => ({ ok: true }) };
+      },
+      postProjectUpdate: async target => ({ projectSynced: target.sessionId === 'session-current' }),
+    });
+
+    expect(calls.map(call => call.path)).toEqual(['/api/trigger', '/api/sessions', '/api/trigger']);
+    expect(calls[0]!.body.target.sessionId).toBe('session-orchestrator');
+    expect(calls[2]!.body.target.sessionId).toBe('session-current');
+    expect(calls[2]!.body.envelope).toEqual(calls[0]!.body.envelope);
+    expect(delivered).toMatchObject({
+      status: 202,
+      body: {
+        reportTarget: { sessionId: 'session-current', larkAppId: 'cli_orchestrator' },
+        originalReportTarget: { sessionId: 'session-orchestrator', larkAppId: 'cli_orchestrator' },
+        projectSynced: true,
+      },
     });
   });
 });
