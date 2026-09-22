@@ -228,7 +228,7 @@ jobs:
     needs: midscene-report
     # Failed cases are exactly when the published screenshots and native replay
     # are most useful, so publish whenever the producer reached artifact upload.
-    if: always() && !cancelled() && needs.midscene-report.result != 'cancelled'
+    if: always() && !cancelled() && needs.midscene-report.result != 'cancelled' && needs.midscene-report.result != 'skipped'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
