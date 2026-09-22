@@ -1,6 +1,7 @@
 import { describe, expect, it, afterEach } from 'vitest';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { resolveNodeExecutable } from './helpers/ts-runner.js';
@@ -8,6 +9,11 @@ import { detectGlobalInstallManager } from '../src/utils/global-install.js';
 import { parseNpmPackJson } from '../scripts/parse-npm-pack-json.mjs';
 
 const NODE_BIN = resolveNodeExecutable() ?? process.execPath;
+
+function resolveTypeScriptCompiler(): string {
+  return process.env.BOTMUX_TEST_TSC_PATH
+    ?? createRequire(import.meta.url).resolve('typescript/bin/tsc');
+}
 
 /**
  * `npm pack --dry-run --json` changed its top-level shape across npm majors:
@@ -157,6 +163,52 @@ describe('package.json — lockfile safety and packaging', () => {
     // the source tree reads it (the supervisor replaced pm2), so its only remaining
     // effect is telling a human to start the broken form by hand.
     expect(paths).not.toContain('ecosystem.config.cjs');
+  });
+
+  it('the packed public observe subpaths load and type-check for consumers', () => {
+    const root = tmp();
+    const packed = spawnSync('npm', [
+      'pack', '--ignore-scripts', '--json', '--pack-destination', root,
+    ], { encoding: 'utf-8', cwd: resolve('.'), timeout: 120_000 });
+    expect(packed.error, `npm pack failed to run: ${packed.error?.message}`).toBeUndefined();
+    expect(packed.status, `npm pack exited ${packed.status}: ${packed.stderr}`).toBe(0);
+    const report = parseNpmPackJson(packed.stdout) as Array<{ filename: string }>;
+    const tarball = join(root, report[0]!.filename);
+    const extracted = spawnSync('tar', ['-xzf', tarball, '-C', root], { encoding: 'utf-8' });
+    expect(extracted.status, extracted.stderr).toBe(0);
+
+    const consumer = join(root, 'consumer');
+    mkdirSync(join(consumer, 'node_modules'), { recursive: true });
+    symlinkSync(join(root, 'package'), join(consumer, 'node_modules', 'botmux'), 'dir');
+    writeFileSync(join(consumer, 'package.json'), JSON.stringify({ type: 'module' }));
+
+    const loaded = spawnSync(NODE_BIN, ['--input-type=module', '-e', `
+      const schema = await import('botmux/services/session-observe');
+      const fetcher = await import('botmux/services/session-observe-fetch');
+      if (typeof schema.normalizeSessionRow !== 'function') process.exit(2);
+      if (typeof fetcher.fetchObserveSnapshot !== 'function') process.exit(3);
+      if (typeof fetcher.fetchObserveSession !== 'function') process.exit(4);
+    `], { cwd: consumer, encoding: 'utf-8' });
+    expect(loaded.status, loaded.stderr).toBe(0);
+
+    writeFileSync(join(consumer, 'consumer.ts'), `
+      import { normalizeSessionRow, type ObserveSession } from 'botmux/services/session-observe';
+      import { fetchObserveSession, type ObserveFetchOptions } from 'botmux/services/session-observe-fetch';
+      const options: ObserveFetchOptions = { larkAppId: 'cli_app', includeRaw: false };
+      const normalized: ObserveSession = normalizeSessionRow(
+        { sessionId: 'session' },
+        { observedAt: 1 },
+      );
+      const fetched: Promise<ObserveSession> = fetchObserveSession('session', options);
+      void normalized;
+      void fetched;
+    `);
+    const typed = spawnSync(NODE_BIN, [resolveTypeScriptCompiler(),
+      '--noEmit', '--strict', '--skipLibCheck', '--target', 'ES2022',
+      '--module', 'NodeNext', '--moduleResolution', 'NodeNext',
+      join(consumer, 'consumer.ts'),
+    ], { cwd: consumer, encoding: 'utf-8' });
+    expect(typed.status, `${typed.stdout}\n${typed.stderr}`).toBe(0);
   });
 
   it('parseNpmPackReport() reads both npm-major shapes of `npm pack --json`', () => {
