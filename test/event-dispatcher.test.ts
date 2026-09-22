@@ -9049,6 +9049,19 @@ describe('im.message.receive_v1 — 免@ 斜杠命令 commandTriggers', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
+  // `/freeze` 由 daemon 的独立 lifecycle 路由处理，不属于 DAEMON_COMMANDS；仍必须
+  // 被保留分类挡在免@入口外，避免手改 bots.json 后在多 bot 群里变成无目标广播。
+  it('fails closed on /freeze smuggled into the no-mention whitelist', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/freeze' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/freeze list'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
   it('fails closed on a reserved passthrough command', async () => {
     setup({ enabled: true, commands: [{ cmd: '/clear' }] });
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);

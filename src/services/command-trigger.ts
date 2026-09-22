@@ -22,13 +22,21 @@
 import { getBot, type CommandTriggerCommand, type CommandTriggerConfig } from '../bot-registry.js';
 import { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS } from '../core/passthrough-commands.js';
 
-export type ReservedCommandKind = 'daemon' | 'passthrough' | 'force-topic';
+export type ReservedCommandKind = 'daemon' | 'passthrough' | 'force-topic' | 'frozen-command';
 
 /**
  * 路由元命令：`parseTopicHeader` 在命令表之前拦截，不在 DAEMON_COMMANDS
  * 里，所以必须单列，否则 `/t` 会成为一个可配置的免@ 命令并强制开新话题。
  */
 const FORCE_TOPIC_COMMANDS = new Set(['/t', '/topic']);
+
+/**
+ * 固化命令生命周期入口：daemon 在通用命令表之前单独路由，不能加入
+ * DAEMON_COMMANDS。否则 canTalkDaemonCommands 会错误接受一个实际绕过其通用权限
+ * 闸的条目，形成无效且误导的配置面。这里单列只用于禁止 commandTriggers 免 @，
+ * 不改变 lifecycle 自己的 owner/admin 授权。
+ */
+const FROZEN_COMMANDS = new Set(['/freeze']);
 
 /**
  * 该命令是否属于 botmux 保留命令（→ 必须 @ 才能触发）。
@@ -49,6 +57,7 @@ export function reservedCommandKind(
   const c = cmd.trim().toLowerCase();
   if (DAEMON_COMMANDS.has(c)) return 'daemon';
   if (FORCE_TOPIC_COMMANDS.has(c)) return 'force-topic';
+  if (FROZEN_COMMANDS.has(c)) return 'frozen-command';
   if (PASSTHROUGH_COMMANDS.has(c) || extraPassthrough?.has(c)) return 'passthrough';
   return null;
 }
