@@ -274,8 +274,8 @@ describe('resumeSession', () => {
       const oneShot = {
         version: 1 as const,
         mode: 'ordinary_per_message' as const,
-        routingAnchor: '\0ordinary-one-shot:app_test:om_one_shot',
-        visibleLaneKey: '\0ordinary-visible:app_test:oc_chat1:thread:om_root1',
+        routingAnchor: 'ordinary-one-shot-v1:route:' + 'e'.repeat(64),
+        visibleLaneKey: 'ordinary-one-shot-v1:visible-lane:' + 'f'.repeat(64),
         visibleRoute: {
           chatId: 'oc_chat1',
           chatType: 'group' as const,

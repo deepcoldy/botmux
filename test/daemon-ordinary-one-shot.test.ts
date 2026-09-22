@@ -103,6 +103,7 @@ vi.mock('../src/im/lark/client.js', async () => {
 
 import { registerBot } from '../src/bot-registry.js';
 import { sessionKey } from '../src/core/types.js';
+import { ordinaryOneShotVisibleLaneKey } from '../src/im/lark/event-dispatcher.js';
 import {
   __testOnly_activeSessions as activeSessions,
   __testOnly_handleOrdinaryOneShot as handleOrdinaryOneShot,
@@ -114,7 +115,8 @@ const APP = 'ordinary_one_shot_app';
 const CHAT = 'oc_one_shot_chat';
 const OWNER = 'ou_owner';
 const ROOT = 'om_visible_root';
-const LANE = `\0ordinary-visible:${APP}:${CHAT}:chat:${ROOT}`;
+const LEGACY_LANE = `\0ordinary-visible:${APP}:${CHAT}:chat:${ROOT}`;
+const LANE = ordinaryOneShotVisibleLaneKey(APP, CHAT, 'chat', ROOT);
 
 function makeData(messageId: string, content: string): any {
   return {
@@ -370,6 +372,79 @@ describe('ordinary per-message daemon handler', () => {
     };
     oneShotLanes.reserveFromBoot([sameApp, ownerless, foreign] as any, APP);
     expect(oneShotLanes.blockedSessionIds(LANE)).toEqual(['boot-same', 'boot-ownerless']);
+  });
+
+  it('blocks the canonical visible lane for an active legacy NUL-key boot row', async () => {
+    const legacy = {
+      sessionId: 'boot-legacy-blocker',
+      status: 'active',
+      larkAppId: APP,
+      oneShot: {
+        version: 1,
+        mode: 'ordinary_per_message',
+        routingAnchor: `\0ordinary-one-shot:${APP}:om_legacy_active`,
+        visibleLaneKey: LEGACY_LANE,
+        visibleRoute: {
+          chatId: CHAT,
+          chatType: 'group',
+          scope: 'chat',
+          rootMessageId: ROOT,
+          replyRootId: ROOT,
+        },
+        createdAt: new Date().toISOString(),
+        turn: { turnId: 'om_legacy_active' },
+      },
+    };
+    oneShotLanes.reserveFromBoot([legacy] as any, APP);
+
+    expect(oneShotLanes.blockedSessionIds(LEGACY_LANE)).toEqual([legacy.sessionId]);
+    expect(oneShotLanes.blockedSessionIds(LANE)).toEqual([legacy.sessionId]);
+
+    mocks.forkWorker.mockImplementation((_ds: any, _input: any, _start: any, hooks: any) => {
+      hooks?.onAdmission?.('accepted');
+      return true;
+    });
+    const ctx = makeCtx('om_after_upgrade');
+    const handling = handleOrdinaryOneShot(makeData('om_after_upgrade', 'wait for legacy'), ctx);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(ctx.ingressAdmission).toEqual({ admitted: false });
+
+    releaseClosedSession(legacy);
+    await vi.waitFor(() => expect(mocks.forkWorker).toHaveBeenCalledTimes(1));
+    const admitted = (mocks.forkWorker.mock.calls[0] as any[])[0].session;
+    releaseClosedSession(admitted);
+    await expect(handling).resolves.toBeUndefined();
+  });
+
+  it('releases both raw legacy and canonical boot aliases on authoritative close', () => {
+    const legacy = {
+      sessionId: 'boot-legacy-close',
+      status: 'active',
+      larkAppId: APP,
+      oneShot: {
+        version: 1,
+        mode: 'ordinary_per_message',
+        routingAnchor: `\0ordinary-one-shot:${APP}:om_legacy_close`,
+        visibleLaneKey: LEGACY_LANE,
+        visibleRoute: {
+          chatId: CHAT,
+          chatType: 'group',
+          scope: 'chat',
+          rootMessageId: ROOT,
+          replyRootId: ROOT,
+        },
+        createdAt: new Date().toISOString(),
+        turn: { turnId: 'om_legacy_close' },
+      },
+    };
+    oneShotLanes.reserveFromBoot([legacy] as any, APP);
+
+    releaseClosedSession(legacy);
+
+    expect(oneShotLanes.blockedSessionIds(LEGACY_LANE)).toEqual([]);
+    expect(oneShotLanes.blockedSessionIds(LANE)).toEqual([]);
   });
 
   it.each(['displaced', 'unavailable'] as const)(

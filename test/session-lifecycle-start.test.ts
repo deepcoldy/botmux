@@ -225,6 +225,7 @@ import {
 import type { DaemonSession } from '../src/core/types.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { getBot } from '../src/bot-registry.js';
+import { logger } from '../src/utils/logger.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
 import { retireCodexAppDispatchAfterBackingMissing } from '../src/utils/codex-app-dispatch-ledger.js';
 import { mkdtempSync, rmSync, symlinkSync } from 'node:fs';
@@ -4209,7 +4210,9 @@ describe('Codex App clean-input feature gate', () => {
 describe('ordinary per-message worker lifecycle', () => {
   const turnId = 'om_one_shot_turn';
   const dispatchAttempt = 7;
-  const routingAnchor = '\0ordinary-one-shot:app_test:om_one_shot_turn';
+  const routingAnchor = 'ordinary-one-shot-v1:route:' + 'a'.repeat(64);
+  const visibleLaneKey = 'ordinary-one-shot-v1:visible-lane:' + 'b'.repeat(64);
+  const frozenReplyTarget = { mode: 'thread' as const, rootMessageId: 'om_visible_root' };
 
   function makeOneShotDs(overrides?: Partial<DaemonSession>): DaemonSession {
     const ds = makeDs({
@@ -4227,19 +4230,18 @@ describe('ordinary per-message worker lifecycle', () => {
       version: 1,
       mode: 'ordinary_per_message',
       routingAnchor,
-      visibleLaneKey: '\0ordinary-visible:app_test:oc_chat:thread:om_visible_root',
+      visibleLaneKey,
       visibleRoute: {
         chatId: 'oc_chat',
         chatType: 'group',
         scope: 'thread',
         rootMessageId: 'om_visible_root',
-        replyRootId: 'om_frozen_quote_target',
       },
       createdAt: '2026-05-27T00:00:00.000Z',
       turn: { turnId, dispatchAttempt },
     };
     ds.session.turnReplyContexts = {
-      [turnId]: { target: { mode: 'quote', rootMessageId: 'om_frozen_quote_target' } },
+      [turnId]: { target: frozenReplyTarget },
     };
     return ds;
   }
@@ -4263,7 +4265,7 @@ describe('ordinary per-message worker lifecycle', () => {
       turnId,
       replyTurnId: turnId,
       dispatchAttempt,
-      replyTarget: { mode: 'quote', rootMessageId: 'om_frozen_quote_target' },
+      replyTarget: frozenReplyTarget,
       resume: false,
       codexRpcInput: true,
       disableCrossSessionMemories: true,
@@ -4272,6 +4274,81 @@ describe('ordinary per-message worker lifecycle', () => {
     expect(ds.session.oneShot?.turn.workerGeneration).toBe(1);
     expect(ds.workerGeneration).toBe(1);
     expect(ds.session.workerGeneration).toBe(1);
+  });
+
+  it('routes delayed and failed delivery notices through the exact frozen one-shot target', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const sessionReply = vi.fn(async () => 'synthetic-notice');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeOneShotDs();
+    delete ds.session.oneShot!.turn.dispatchAttempt;
+    const worker = makeFakeWorker();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+    forkMock.mockReturnValueOnce(worker);
+
+    expect(forkWorker(ds, 'one-shot prompt', { resume: false, turnId })).toBe(true);
+    worker.emit('message', { type: 'ready', port: 3456, token: 'synthetic-token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    worker.emit('exit', 1, null);
+    await Promise.resolve();
+
+    const deliveryNotices = sessionReply.mock.calls.filter(call => call[4] === turnId);
+    expect(deliveryNotices).toHaveLength(2);
+    for (const call of deliveryNotices) {
+      expect(call[0]).toBe(routingAnchor);
+      expect(call[5]).toEqual({
+        replyTarget: frozenReplyTarget,
+      });
+    }
+  });
+
+  it('fails closed when a rich-card delay loses the exact frozen one-shot target', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({
+      cliId: 'codex',
+      replyCardMode: 'unified',
+    }));
+    const sessionReply = vi.fn(async () => 'synthetic-notice');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeOneShotDs();
+    delete ds.session.oneShot!.turn.dispatchAttempt;
+    const worker = makeFakeWorker();
+    vi.mocked(worker.send).mockImplementation((_message: any, callback?: (err?: Error | null) => void) => {
+      callback?.(null);
+      return true;
+    });
+    forkMock.mockReturnValueOnce(worker);
+
+    expect(forkWorker(ds, 'one-shot prompt', { resume: false, turnId })).toBe(true);
+    worker.emit('message', { type: 'ready', port: 3456, token: 'synthetic-token' });
+    await Promise.resolve();
+    sessionReply.mockClear();
+    delete ds.session.turnReplyContexts;
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    await Promise.resolve();
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(logger.error).toHaveBeenCalledWith(expect.stringContaining(
+      'Suppressed ordinary one-shot reply-card delivery wait without an exact frozen target',
+    ));
   });
 
   it.each([
@@ -4353,8 +4430,8 @@ describe('adopt worker re-fork forwards the incoming turn (PR#293 issue #3)', ()
     ds.session.oneShot = {
       version: 1,
       mode: 'ordinary_per_message',
-      routingAnchor: '\0ordinary-one-shot:app_test:om_adopt_one_shot',
-      visibleLaneKey: '\0ordinary-visible:app_test:oc_chat:thread:om_root',
+      routingAnchor: 'ordinary-one-shot-v1:route:' + 'c'.repeat(64),
+      visibleLaneKey: 'ordinary-one-shot-v1:visible-lane:' + 'd'.repeat(64),
       visibleRoute: {
         chatId: 'oc_chat',
         chatType: 'group',

@@ -11,7 +11,7 @@
  * Run:  pnpm vitest run test/event-dispatcher.test.ts
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { createHmac } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import * as Lark from '@larksuiteoapi/node-sdk';
 
 // ─── Mock external modules ──────────────────────────────────────────────────
@@ -158,7 +158,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 // ─── Imports (must be after mocks) ──────────────────────────────────────────
 
 import { __resetAnchorQueues } from '../src/utils/anchor-serializer.js';
-import { __pollMessageListenersOnceForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, maybeApplyForceTopicOverride, mentionsAnotherMember, markForwardFollowupsSessionsReady, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
+import { __pollMessageListenersOnceForTest, __resetEventClaimsForTest, __resetChatStatsForTest, canOperate, canTalk, decideRouting, ensureBotOpenId, isBotMentioned, maybeApplyForceTopicOverride, mentionsAnotherMember, markForwardFollowupsSessionsReady, ordinaryOneShotRoutingAnchor, ordinaryOneShotVisibleLaneKey, rawMessageIngressAnchor, startLarkEventDispatcher, writeBotInfoFile, type EventHandlers } from '../src/im/lark/event-dispatcher.js';
 import {
   VC_BOT_MEETING_ACTIVITY_EVENT,
   VC_BOT_MEETING_ENDED_EVENT,
@@ -174,7 +174,7 @@ import { __resetPeerCrossRefCacheForTest } from '../src/services/peer-cross-ref-
 import { CLONE_EXCLUDED_KEYS, cloneBotConfig, cloneOwnerEntries } from '../src/setup/bot-config-editor.js';
 import { normalizeManagedOwnerEntries } from '../src/setup/owner-identity.js';
 import { createPluginCardActionGateway } from '../src/core/plugins/card-actions/gateway.js';
-import { spawnTsScript } from './helpers/ts-runner.js';
+import { spawnSyncTsEval, spawnTsScript } from './helpers/ts-runner.js';
 import { resolve } from 'node:path';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -1043,6 +1043,78 @@ describe('im.message.receive_v1 — ordinary per-message sessions', () => {
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
   });
 
+  it('builds domain-separated, collision-safe printable identities that are spawn-safe', () => {
+    const first = ordinaryOneShotRoutingAnchor('synthetic-app-a', 'synthetic-message-a');
+    const repeated = ordinaryOneShotRoutingAnchor('synthetic-app-a', 'synthetic-message-a');
+    const nextMessage = ordinaryOneShotRoutingAnchor('synthetic-app-a', 'synthetic-message-b');
+    const nextApp = ordinaryOneShotRoutingAnchor('synthetic-app-b', 'synthetic-message-a');
+    const ambiguousLeft = ordinaryOneShotRoutingAnchor('synthetic:app-a', 'synthetic-message-a');
+    const ambiguousRight = ordinaryOneShotRoutingAnchor('synthetic', 'app-a:synthetic-message-a');
+    const lane = ordinaryOneShotVisibleLaneKey(
+      'synthetic-app-a', 'synthetic-chat-a', 'thread', 'synthetic-destination-a',
+    );
+    const repeatedLane = ordinaryOneShotVisibleLaneKey(
+      'synthetic-app-a', 'synthetic-chat-a', 'thread', 'synthetic-destination-a',
+    );
+    const changedLanes = [
+      ordinaryOneShotVisibleLaneKey(
+        'synthetic-app-b', 'synthetic-chat-a', 'thread', 'synthetic-destination-a',
+      ),
+      ordinaryOneShotVisibleLaneKey(
+        'synthetic-app-a', 'synthetic-chat-b', 'thread', 'synthetic-destination-a',
+      ),
+      ordinaryOneShotVisibleLaneKey(
+        'synthetic-app-a', 'synthetic-chat-a', 'chat', 'synthetic-destination-a',
+      ),
+      ordinaryOneShotVisibleLaneKey(
+        'synthetic-app-a', 'synthetic-chat-a', 'thread', 'synthetic-destination-b',
+      ),
+    ];
+
+    expect(first).toBe(repeated);
+    expect(new Set([first, nextMessage, nextApp]).size).toBe(3);
+    expect(ambiguousLeft).not.toBe(ambiguousRight);
+    expect(first).toBe(`ordinary-one-shot-v1:route:${createHash('sha256')
+      .update(JSON.stringify(['route', 'synthetic-app-a', 'synthetic-message-a']), 'utf8')
+      .digest('hex')}`);
+    expect(first).toMatch(/^ordinary-one-shot-v1:route:[0-9a-f]{64}$/);
+    expect(first).not.toMatch(/[\u0000-\u001f\u007f]/);
+    expect(first).not.toContain('synthetic-app-a');
+    expect(first).not.toContain('synthetic-message-a');
+    expect(lane).toBe(repeatedLane);
+    expect(new Set([lane, ...changedLanes]).size).toBe(5);
+    expect(lane).toBe(`ordinary-one-shot-v1:visible-lane:${createHash('sha256')
+      .update(JSON.stringify([
+        'visible-lane',
+        'synthetic-app-a',
+        'synthetic-chat-a',
+        'thread',
+        'synthetic-destination-a',
+      ]), 'utf8')
+      .digest('hex')}`);
+    expect(lane).toMatch(/^ordinary-one-shot-v1:visible-lane:[0-9a-f]{64}$/);
+    expect(lane).not.toMatch(/[\u0000-\u001f\u007f]/);
+    for (const sourceId of [
+      'synthetic-app-a',
+      'synthetic-chat-a',
+      'synthetic-destination-a',
+    ]) {
+      expect(lane).not.toContain(sourceId);
+    }
+    expect(lane).not.toBe(first);
+
+    const spawned = spawnSyncTsEval(
+      'process.stdout.write(process.env.BOTMUX_ROUTING_ANCHOR ?? "")',
+      {
+        env: { BOTMUX_ROUTING_ANCHOR: first },
+        encoding: 'utf8',
+      },
+    );
+    expect(spawned.error).toBeUndefined();
+    expect(spawned.status).toBe(0);
+    expect(String(spawned.stdout)).toBe(first);
+  });
+
   it('gives same-thread replies distinct execution anchors and one shared visible lane', async () => {
     const first = ordinaryEvent({
       messageId: 'msg-one-shot-a',
@@ -1066,8 +1138,10 @@ describe('im.message.receive_v1 — ordinary per-message sessions', () => {
     expect(secondCtx.anchor).toBe('root-one-shot-thread');
     expect(firstCtx.ordinaryOneShot).toEqual({
       physicalMessageId: 'msg-one-shot-a',
-      routingAnchor: `\0ordinary-one-shot:${MY_APP_ID}:msg-one-shot-a`,
-      visibleLaneKey: `\0ordinary-visible:${MY_APP_ID}:chat-ordinary-one-shot:thread:root-one-shot-thread`,
+      routingAnchor: ordinaryOneShotRoutingAnchor(MY_APP_ID, 'msg-one-shot-a'),
+      visibleLaneKey: ordinaryOneShotVisibleLaneKey(
+        MY_APP_ID, 'chat-ordinary-one-shot', 'thread', 'root-one-shot-thread',
+      ),
       visibleRoute: {
         chatId: 'chat-ordinary-one-shot',
         chatType: 'group',
@@ -1077,7 +1151,7 @@ describe('im.message.receive_v1 — ordinary per-message sessions', () => {
       },
     });
     expect(secondCtx.ordinaryOneShot.routingAnchor)
-      .toBe(`\0ordinary-one-shot:${MY_APP_ID}:msg-one-shot-b`);
+      .toBe(ordinaryOneShotRoutingAnchor(MY_APP_ID, 'msg-one-shot-b'));
     expect(secondCtx.ordinaryOneShot.visibleLaneKey)
       .toBe(firstCtx.ordinaryOneShot.visibleLaneKey);
     expect(Object.isFrozen(firstCtx.ordinaryOneShot)).toBe(true);
@@ -1100,7 +1174,7 @@ describe('im.message.receive_v1 — ordinary per-message sessions', () => {
     expect(handlers.handleOrdinaryOneShot).toHaveBeenCalledWith(event, expect.objectContaining({
       anchor: 'root-owned-one-shot',
       ordinaryOneShot: expect.objectContaining({
-        routingAnchor: `\0ordinary-one-shot:${MY_APP_ID}:msg-owned-one-shot`,
+        routingAnchor: ordinaryOneShotRoutingAnchor(MY_APP_ID, 'msg-owned-one-shot'),
       }),
     }));
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();

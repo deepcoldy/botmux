@@ -8051,6 +8051,36 @@ function ordinaryImDeliveryKey(ds: DaemonSession, turnId: string, workerGenerati
   return `${ds.session.sessionId}:${workerGeneration}:${turnId}`;
 }
 
+/** Route daemon-owned delivery diagnostics through the same immutable target
+ * as the originating turn. A one-shot's synthetic anchor is process identity,
+ * never a provider message id. */
+function ordinaryImDeliveryReplyOptions(record: OrdinaryImDelivery): WorkerSessionReplyOptions | undefined {
+  const oneShot = record.ds.session.oneShot;
+  if (oneShot?.mode !== 'ordinary_per_message' || oneShot.turn.turnId !== record.turnId) {
+    return undefined;
+  }
+  const frozen = record.ds.session.turnReplyContexts?.[record.turnId];
+  if (!frozen) return undefined;
+  return { replyTarget: frozen.target };
+}
+
+/** Keep the legacy five-argument call shape, but require an exact frozen
+ * target before a one-shot diagnostic may leave the daemon. */
+function sendOrdinaryImDeliveryNotice(record: OrdinaryImDelivery, content: string): Promise<string> {
+  const replyOptions = ordinaryImDeliveryReplyOptions(record);
+  if (record.ds.session.oneShot?.mode === 'ordinary_per_message') {
+    if (!replyOptions) {
+      return Promise.reject(new Error('ordinary per-message delivery notice has no exact frozen target'));
+    }
+    return requireCallbacks().sessionReply(
+      sessionAnchorId(record.ds), content, 'text', record.ds.larkAppId, record.turnId, replyOptions,
+    );
+  }
+  return requireCallbacks().sessionReply(
+    sessionAnchorId(record.ds), content, 'text', record.ds.larkAppId, record.turnId,
+  );
+}
+
 function clearOrdinaryImDelivery(record: OrdinaryImDelivery): void {
   if (record.timer) clearTimeout(record.timer);
   record.timer = undefined;
@@ -8094,12 +8124,8 @@ function failOrdinaryImDelivery(
   // supersedes the pre-Plan-B `vcMeetingReceiver` blanket check.)
   if (isMeetingDrivenTurn(record.ds, record.turnId) || isSilentScheduledTurn(record.ds, record.turnId)) return;
   const loc = botLocale(getBot(record.ds.larkAppId).config);
-  void requireCallbacks().sessionReply(
-    sessionAnchorId(record.ds),
-    tr(messageKey, { turnId: record.turnId.substring(0, 16) }, loc),
-    'text',
-    record.ds.larkAppId,
-    record.turnId,
+  void sendOrdinaryImDeliveryNotice(
+    record, tr(messageKey, { turnId: record.turnId.substring(0, 16) }, loc),
   ).catch(err => logger.error(
     `[${tag(record.ds)}] Failed to report ordinary IM worker delivery failure: `
     + `${err instanceof Error ? err.message : String(err)}`,
@@ -8130,20 +8156,29 @@ function delayOrdinaryImDelivery(record: OrdinaryImDelivery): void {
     ? 'worker.input_commit_delayed'
     : 'worker.input_delivery_delayed';
   if (replyCardModeFor(record.ds, record.turnId) !== 'legacy') {
+    const replyOptions = ordinaryImDeliveryReplyOptions(record);
+    if (record.ds.session.oneShot?.mode === 'ordinary_per_message' && !replyOptions) {
+      logger.error(
+        `[${tag(record.ds)}] Suppressed ordinary one-shot reply-card delivery wait `
+        + `without an exact frozen target turn=${record.turnId.substring(0, 16)}`,
+      );
+      return;
+    }
     // The turn card already represents queued/working state. A slow worker
     // receipt must not create a second message (or expose progress in final-only).
     void updateTurnReplyCard(record.ds, record.turnId, { kind: 'refresh' },
       (body, type, uuid) => requireCallbacks().sessionReply(
-        sessionAnchorId(record.ds), body, type, record.ds.larkAppId, record.turnId, { uuid },
+        sessionAnchorId(record.ds),
+        body,
+        type,
+        record.ds.larkAppId,
+        record.turnId,
+        replyOptions ? { uuid, ...replyOptions } : { uuid },
       )).catch(err => logger.warn(`[${tag(record.ds)}] reply-card delivery wait: ${err.message}`));
     return;
   }
-  void requireCallbacks().sessionReply(
-    sessionAnchorId(record.ds),
-    tr(messageKey, { turnId: record.turnId.substring(0, 16) }, loc),
-    'text',
-    record.ds.larkAppId,
-    record.turnId,
+  void sendOrdinaryImDeliveryNotice(
+    record, tr(messageKey, { turnId: record.turnId.substring(0, 16) }, loc),
   ).catch(err => logger.error(
     `[${tag(record.ds)}] Failed to report delayed ordinary IM worker delivery: `
     + `${err instanceof Error ? err.message : String(err)}`,

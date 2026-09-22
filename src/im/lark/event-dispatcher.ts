@@ -4,6 +4,7 @@
  * Extracted from daemon.ts for modularity.
  */
 import * as Lark from '@larksuiteoapi/node-sdk';
+import { createHash } from 'node:crypto';
 import { startLarkConnection } from './transport/connection.js';
 import { readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
@@ -2391,9 +2392,32 @@ export interface RoutingContext {
 
 type OrdinaryOneShotRouting = NonNullable<RoutingContext['ordinaryOneShot']>;
 
+/** Hash an ordered tuple into a printable, versioned internal namespace.
+ * JSON encoding is injective for string tuples, unlike delimiter joining. */
+function ordinaryOneShotIdentity(domain: 'route' | 'visible-lane', parts: readonly string[]): string {
+  const digest = createHash('sha256')
+    .update(JSON.stringify([domain, ...parts]), 'utf8')
+    .digest('hex');
+  return `ordinary-one-shot-v1:${domain}:${digest}`;
+}
+
+export function ordinaryOneShotRoutingAnchor(larkAppId: string, messageId: string): string {
+  return ordinaryOneShotIdentity('route', [larkAppId, messageId]);
+}
+
+export function ordinaryOneShotVisibleLaneKey(
+  larkAppId: string,
+  chatId: string,
+  scope: 'thread' | 'chat',
+  effectiveDestination: string,
+): string {
+  return ordinaryOneShotIdentity('visible-lane', [larkAppId, chatId, scope, effectiveDestination]);
+}
+
 /** Build the immutable split between a one-shot's internal identity and the
- * legacy Lark route where its output remains visible. The leading NUL reserves
- * these namespaces from user/provider ids without ever changing `ctx.anchor`. */
+ * legacy Lark route where its output remains visible. The domain-separated
+ * digest reserves the namespace from provider ids without changing
+ * `ctx.anchor` or exposing the private ids in the internal anchor. */
 function ordinaryOneShotRouting(ctx: RoutingContext): OrdinaryOneShotRouting {
   const effectiveDestination = ctx.replyRootId
     ?? (ctx.scope === 'thread' ? ctx.anchor : ctx.chatId);
@@ -2409,8 +2433,10 @@ function ordinaryOneShotRouting(ctx: RoutingContext): OrdinaryOneShotRouting {
   });
   return Object.freeze({
     physicalMessageId: ctx.messageId,
-    routingAnchor: `\0ordinary-one-shot:${ctx.larkAppId}:${ctx.messageId}`,
-    visibleLaneKey: `\0ordinary-visible:${ctx.larkAppId}:${ctx.chatId}:${ctx.scope}:${effectiveDestination}`,
+    routingAnchor: ordinaryOneShotRoutingAnchor(ctx.larkAppId, ctx.messageId),
+    visibleLaneKey: ordinaryOneShotVisibleLaneKey(
+      ctx.larkAppId, ctx.chatId, ctx.scope, effectiveDestination,
+    ),
     visibleRoute,
   });
 }

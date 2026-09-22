@@ -567,7 +567,7 @@ function republishResolvedAllowedUsers(larkAppId: string, resolved: string[]): v
   try { writeDaemonDescriptor(desc); } catch { /* best effort */ }
 }
 let vcMeetingTerminalReconciler: VcMeetingTerminalReconciler | undefined;
-import { isBotMentioned, getGroupStats, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
+import { isBotMentioned, getGroupStats, probeBotOpenId, startLarkEventDispatcher, markForwardFollowupsSessionsReady, writeBotInfoFile, canOperate, canRunDaemonCommand, evaluateTalk, evaluateBotTalk, evaluateAskAnswerTalk, askCustomReplyCandidate, grantCommandRestriction, isKnownPeerBot, ordinaryOneShotVisibleLaneKey, resolveSiblingBotNameByUnionId, checkRequiredScopes, ensureVcMeetingEventsSubscribed, type RoutingContext, type TalkEvaluation, type DocCommentContext, type EventHandlers } from './im/lark/event-dispatcher.js';
 import { commitDocCommentPollCursor, docCommentThreadAnchor, getDocSubscription, isDocNativeWatchSubscription, listAllDocSubscriptions, listDocSubscriptionsForSession, normalizeDocNativeWatchSubscription, putDocSubscription, removeDocSubscription, settleDocCommentWsDelivery, type DocSubscription } from './services/doc-subs-store.js';
 import { BOT_REPLY_SENTINEL, subscribeDocFile, unsubscribeDocFile, addCommentReaction, removeCommentReaction, hasBotSentinel, isBotAuthoredReply, listDocComments } from './im/lark/doc-comment.js';
 import { learnFromMentions, resolveSender, flushIdentityCacheSync, type ResolvedSender } from './im/lark/identity-cache.js';
@@ -835,15 +835,59 @@ function ordinaryOneShotLaneBlockers(visibleLaneKey: string): Promise<void>[] {
     .map(lease => lease.closed);
 }
 
+/** Return every visible-lane identity that must remain occupied for a durable
+ * one-shot row. Older releases persisted a leading-NUL key; current ingress
+ * uses the printable hashed identity, which can be reconstructed from the
+ * frozen visible route without trusting or rewriting the legacy key. */
+function ordinaryOneShotVisibleLaneAliases(
+  rawOneShot: unknown,
+  larkAppId: string,
+): string[] {
+  if (!rawOneShot || typeof rawOneShot !== 'object' || Array.isArray(rawOneShot)) return [];
+  const oneShot = rawOneShot as { visibleLaneKey?: unknown; visibleRoute?: unknown };
+  const aliases: string[] = [];
+  if (typeof oneShot.visibleLaneKey === 'string' && oneShot.visibleLaneKey.length > 0) {
+    aliases.push(oneShot.visibleLaneKey);
+  }
+
+  const rawRoute = oneShot.visibleRoute;
+  if (!rawRoute || typeof rawRoute !== 'object' || Array.isArray(rawRoute)) return aliases;
+  const route = rawRoute as {
+    chatId?: unknown;
+    scope?: unknown;
+    rootMessageId?: unknown;
+    replyRootId?: unknown;
+  };
+  if (typeof larkAppId !== 'string' || larkAppId.length === 0
+      || typeof route.chatId !== 'string' || route.chatId.length === 0
+      || (route.scope !== 'thread' && route.scope !== 'chat')) return aliases;
+  const fallbackDestination = route.scope === 'thread'
+    ? route.rootMessageId
+    : route.chatId;
+  const effectiveDestination = route.replyRootId ?? fallbackDestination;
+  if (typeof effectiveDestination !== 'string' || effectiveDestination.length === 0) return aliases;
+
+  const canonical = ordinaryOneShotVisibleLaneKey(
+    larkAppId, route.chatId, route.scope, effectiveDestination,
+  );
+  if (!aliases.includes(canonical)) aliases.push(canonical);
+  return aliases;
+}
+
 function releaseOrdinaryOneShotLane(closed: Session): void {
   const oneShot = closed.oneShot;
   if (closed.status !== 'closed' || oneShot?.mode !== 'ordinary_per_message') return;
-  const lane = ordinaryOneShotLaneLeases.get(oneShot.visibleLaneKey);
-  const lease = lane?.get(closed.sessionId);
-  if (!lane || !lease) return;
-  lane.delete(closed.sessionId);
-  if (lane.size === 0) ordinaryOneShotLaneLeases.delete(oneShot.visibleLaneKey);
-  lease.release();
+  // A boot reservation may occupy both the persisted legacy key and its
+  // canonical alias. Release every reservation for this exact durable session
+  // identity so ownerless legacy rows and malformed close snapshots cannot
+  // strand one half of the alias pair.
+  for (const [visibleLaneKey, lane] of ordinaryOneShotLaneLeases) {
+    const lease = lane.get(closed.sessionId);
+    if (!lease) continue;
+    lane.delete(closed.sessionId);
+    if (lane.size === 0) ordinaryOneShotLaneLeases.delete(visibleLaneKey);
+    lease.release();
+  }
 }
 
 /** Reserve every valid visible lane before reconciliation mutates or excludes
@@ -857,11 +901,9 @@ function reserveOrdinaryOneShotLanesOnBoot(
     if (session.status !== 'active') continue;
     const owner = session.larkAppId;
     if (typeof owner === 'string' && owner.length > 0 && owner !== larkAppId) continue;
-    const rawOneShot: unknown = session.oneShot;
-    if (!rawOneShot || typeof rawOneShot !== 'object' || Array.isArray(rawOneShot)) continue;
-    const visibleLaneKey = (rawOneShot as { visibleLaneKey?: unknown }).visibleLaneKey;
-    if (typeof visibleLaneKey !== 'string' || visibleLaneKey.length === 0) continue;
-    reserveOrdinaryOneShotLane(visibleLaneKey, session.sessionId);
+    for (const visibleLaneKey of ordinaryOneShotVisibleLaneAliases(session.oneShot, larkAppId)) {
+      reserveOrdinaryOneShotLane(visibleLaneKey, session.sessionId);
+    }
   }
 }
 
@@ -4049,6 +4091,19 @@ async function sessionReply(
   ): Promise<string> => outboundOptions
     ? replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext, outboundOptions)
     : replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext);
+
+  // A frozen quote target is valid in either chat- or thread-scoped sessions.
+  // Handle it before anchor-shape routing: ordinary per-message sessions use a
+  // synthetic execution anchor that must never be sent to the provider API.
+  if (opts?.replyTarget?.mode === 'quote') {
+    return replyWithHookPolicy(
+      opts.replyTarget.rootMessageId,
+      content,
+      msgType,
+      false,
+      opts.uuid,
+    );
+  }
 
   // Chat-scope: post a plain message to the chat. No reply_in_thread → keeps
   // the conversation flat in 普通群. The card layer carries chatId in its button

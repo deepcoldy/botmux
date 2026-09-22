@@ -90,14 +90,19 @@ describe('buildBotmuxEnvAssignments() — CA bundle', () => {
 });
 
 describe('buildBotmuxEnvAssignments()', () => {
-  it('forwards the routing anchor and session scope into the tmux pane', () => {
+  it('forwards the printable routing tuple into the tmux pane', () => {
+    const routingAnchor = 'ordinary-one-shot-v1:route:' + 'a'.repeat(64);
     const out = buildBotmuxEnvAssignments({
-      BOTMUX_ROUTING_ANCHOR: 'om_anchor',
+      BOTMUX_ROUTING_ANCHOR: routingAnchor,
+      BOTMUX_ROOT_MESSAGE_ID: 'om_visible_root',
       BOTMUX_SESSION_SCOPE: 'thread',
     });
 
-    expect(out).toContain('BOTMUX_ROUTING_ANCHOR=om_anchor');
-    expect(out).toContain('BOTMUX_SESSION_SCOPE=thread');
+    expect(out).toEqual([
+      `BOTMUX_ROUTING_ANCHOR=${routingAnchor}`,
+      'BOTMUX_ROOT_MESSAGE_ID=om_visible_root',
+      'BOTMUX_SESSION_SCOPE=thread',
+    ]);
   });
 
   it('forwards only the daemon-side keys; bare LARK_APP_* are NOT forwarded', () => {
@@ -992,6 +997,40 @@ describe('shell wrapper end-to-end (the contract spawn() builds)', () => {
       expect(lines).toContain('BOTMUX_LARK_APP_ID=fresh');
       expect(lines).toContain('SESSION_DATA_DIR=fresh-dir');
       expect(lines).not.toContain('BOTMUX_LARK_APP_ID=stale');
+    },
+  );
+
+  it.skipIf(!hasEnvBin)(
+    'carries the worker-frozen printable routing tuple through the persistent-backend wrapper',
+    () => {
+      const routingAnchor = 'ordinary-one-shot-v1:route:' + 'a'.repeat(64);
+      const envAssignments = buildBotmuxEnvAssignments({
+        BOTMUX_ROUTING_ANCHOR: routingAnchor,
+        BOTMUX_ROOT_MESSAGE_ID: 'om_visible_root',
+        BOTMUX_SESSION_SCOPE: 'thread',
+      });
+      const result = spawnSync(
+        '/bin/sh',
+        ['-c', SCRIPT, '_', tmpdir(), ...envAssignments, '/usr/bin/env'],
+        {
+          encoding: 'utf-8',
+          env: {
+            BOTMUX_ROUTING_ANCHOR: 'stale-route',
+            BOTMUX_ROOT_MESSAGE_ID: 'om_stale_root',
+            BOTMUX_SESSION_SCOPE: 'chat',
+            PATH: '/usr/bin:/bin',
+          },
+        },
+      );
+
+      expect(result.status).toBe(0);
+      const childEnv = result.stdout.split('\n');
+      expect(childEnv).toContain(`BOTMUX_ROUTING_ANCHOR=${routingAnchor}`);
+      expect(childEnv).toContain('BOTMUX_ROOT_MESSAGE_ID=om_visible_root');
+      expect(childEnv).toContain('BOTMUX_SESSION_SCOPE=thread');
+      expect(childEnv).not.toContain('BOTMUX_ROUTING_ANCHOR=stale-route');
+      expect(childEnv).not.toContain('BOTMUX_ROOT_MESSAGE_ID=om_stale_root');
+      expect(childEnv).not.toContain('BOTMUX_SESSION_SCOPE=chat');
     },
   );
 
