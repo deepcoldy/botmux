@@ -5,6 +5,17 @@ import type { WorkerConfig } from '../global-config.js';
 
 export const DEFAULT_MIN_AVAILABLE_MEMORY_BYTES = 4 * 1024 ** 3;
 export const DEFAULT_MIN_AVAILABLE_MEMORY_FRACTION = 0.25;
+/** Upper bound for the fraction-derived default reserve. The reserve only has
+ *  to cover spawning ONE worker — production measurement of ~200 live CLI
+ *  workers showed RSS p99 ≈ 0.43 GiB / max ≈ 0.57 GiB, so the 4 GiB floor
+ *  already leaves ~7x headroom and the fraction must not grow with host
+ *  capacity. Without this cap a 248 GiB host demanded ~62 GiB free to start a
+ *  single worker, rejecting spawns at 60 GiB available with zero PSI stall.
+ *  On the host path this makes the default reserve uniformly 4 GiB; the
+ *  fraction still scales small finite cgroup-v2 limits (e.g. an 8 GiB limit
+ *  reserves 2 GiB). The live PSI gate (maxMemoryFullAvg10) remains the signal
+ *  for genuine host-wide contention. */
+export const DEFAULT_MIN_AVAILABLE_MEMORY_CAP_BYTES = 4 * 1024 ** 3;
 export const DEFAULT_MAX_MEMORY_FULL_AVG10 = 20;
 /**
  * Edge-of-rejection band for worker admission: when available memory is below
@@ -351,9 +362,17 @@ export function resolveWorkerPressurePolicy(
   totalMemoryBytes: number,
   totalMemorySource: HostMemoryPressure['totalMemorySource'] = 'host',
 ): ResolvedWorkerPressurePolicy {
+  // With the cap equal to the host floor, the host reserve is uniformly the
+  // 4 GiB spawn-cost floor. The fraction only still scales the reserve for
+  // small finite cgroup-v2 limits. See the cap constant for the production
+  // incident that an uncapped fraction caused.
+  const fractionalReserve = Math.min(
+    DEFAULT_MIN_AVAILABLE_MEMORY_CAP_BYTES,
+    Math.max(1, Math.ceil(totalMemoryBytes * DEFAULT_MIN_AVAILABLE_MEMORY_FRACTION)),
+  );
   const defaultReserve = totalMemorySource === 'cgroup-v2'
-    ? Math.max(1, Math.ceil(totalMemoryBytes * DEFAULT_MIN_AVAILABLE_MEMORY_FRACTION))
-    : Math.max(DEFAULT_MIN_AVAILABLE_MEMORY_BYTES, Math.ceil(totalMemoryBytes * DEFAULT_MIN_AVAILABLE_MEMORY_FRACTION));
+    ? fractionalReserve
+    : Math.max(DEFAULT_MIN_AVAILABLE_MEMORY_BYTES, fractionalReserve);
   return {
     memoryAdmissionEnabled: config?.memoryAdmissionEnabled !== false,
     minAvailableMemoryBytes: config?.minAvailableMemoryBytes ?? defaultReserve,

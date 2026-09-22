@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   checkWorkerAdmission,
   DEFAULT_MAX_MEMORY_FULL_AVG10,
+  DEFAULT_MIN_AVAILABLE_MEMORY_BYTES,
+  DEFAULT_MIN_AVAILABLE_MEMORY_CAP_BYTES,
   evaluateWorkerAdmission,
   readHostMemoryPressure,
   resolveWorkerPressurePolicy,
@@ -187,7 +189,7 @@ describe('worker memory admission', () => {
       memoryFullAvg10Source: 'host',
     }));
     expect(normal.allowed).toBe(true);
-    expect(normal.policy.minAvailableMemoryBytes).toBe(8 * GIB);
+    expect(normal.policy.minAvailableMemoryBytes).toBe(4 * GIB);
     expect(normal.policy.maxMemoryFullAvg10).toBe(DEFAULT_MAX_MEMORY_FULL_AVG10);
 
     expect(evaluateWorkerAdmission(hostPressure({
@@ -202,6 +204,71 @@ describe('worker memory admission', () => {
       memoryFullAvg10: 35,
       memoryFullAvg10Source: 'host',
     })).allowed).toBe(false);
+  });
+
+  it('caps the default reserve at the 4 GiB spawn-cost floor instead of scaling with host capacity', () => {
+    // The cap must never drift below the host floor, or the host Math.max leg
+    // would silently revive a sub-floor fractional reserve.
+    expect(DEFAULT_MIN_AVAILABLE_MEMORY_CAP_BYTES).toBeGreaterThanOrEqual(DEFAULT_MIN_AVAILABLE_MEMORY_BYTES);
+    // host: max(4 GiB floor, min(4 GiB cap, 25% of total)) — uniformly 4 GiB
+    for (const [totalGiB, expectedGiB] of [
+      [8, 4], [16, 4], [32, 4], [64, 4], [248, 4],
+    ] as const) {
+      expect(
+        resolveWorkerPressurePolicy(undefined, totalGiB * GIB, 'host').minAvailableMemoryBytes,
+      ).toBe(expectedGiB * GIB);
+    }
+    // cgroup-v2: min(4 GiB cap, 25% of the finite limit) with no host floor
+    for (const [totalGiB, expectedGiB] of [
+      [8, 2], [16, 4], [32, 4], [64, 4], [248, 4],
+    ] as const) {
+      expect(
+        resolveWorkerPressurePolicy(undefined, totalGiB * GIB, 'cgroup-v2').minAvailableMemoryBytes,
+      ).toBe(expectedGiB * GIB);
+    }
+  });
+
+  it('admits a worker with tens of GiB free on a huge host while PSI stays healthy', () => {
+    // Production incident: 247.5 GiB host, 60.1 GiB available, PSI full avg10
+    // at 0% was reported as "Memory pressure is critical" because the uncapped
+    // 25% reserve demanded 61.9 GiB.
+    const decision = evaluateWorkerAdmission(hostPressure({
+      totalMemoryBytes: 248 * GIB,
+      availableMemoryBytes: Math.round(60.1 * GIB),
+      availableMemorySource: 'host',
+      memoryFullAvg10: 0,
+      memoryFullAvg10Source: 'host',
+    }));
+    expect(decision.policy.minAvailableMemoryBytes).toBe(4 * GIB);
+    expect(decision.allowed).toBe(true);
+    expect(decision.reasons).toEqual([]);
+
+    // The byte backstop still bites when the huge host is genuinely drained.
+    const drained = evaluateWorkerAdmission(hostPressure({
+      totalMemoryBytes: 248 * GIB,
+      availableMemoryBytes: 3 * GIB,
+      availableMemorySource: 'host',
+      memoryFullAvg10: 0,
+      memoryFullAvg10Source: 'host',
+    }));
+    expect(drained.allowed).toBe(false);
+    expect(drained.reasons).toEqual([
+      'available memory 3.0 GiB is below the reserved 4.0 GiB',
+    ]);
+
+    // Real contention is PSI's job: with the capped reserve met, full avg10 at
+    // the limit still blocks independently of total/available bytes.
+    const stalled = evaluateWorkerAdmission(hostPressure({
+      totalMemoryBytes: 248 * GIB,
+      availableMemoryBytes: 60 * GIB,
+      availableMemorySource: 'host',
+      memoryFullAvg10: 25,
+      memoryFullAvg10Source: 'host',
+    }));
+    expect(stalled.allowed).toBe(false);
+    expect(stalled.reasons).toEqual([
+      'memory full PSI avg10 25.00% reached 20.00%',
+    ]);
   });
 
   it('honours policy overrides without changing any resident-worker ceiling', () => {
@@ -353,8 +420,10 @@ describe('tierWorkerAdmission (allowed / marginal / hard)', () => {
   });
 
   it('marginal tier is reachable through a cgroup-v2 fixture', () => {
-    // 40 GiB cgroup → default reserve 10 GiB → floor 9 GiB; current 30.5 GiB
-    // (no inactive file) leaves 9.5 GiB available, PSI calm → marginal.
+    // 40 GiB cgroup → capped default reserve 4 GiB → marginal floor 3.6 GiB;
+    // current 36.25 GiB (no inactive file) leaves 3.75 GiB available, PSI
+    // calm → marginal. The reserve is capped at 4 GiB (large-host fix); before
+    // the cap it was 25% × 40 = 10 GiB and this fixture used current 30.5 GiB.
     const decision = checkWorkerAdmission(undefined, {
       platform: 'linux',
       totalMemoryBytes: 64 * GIB,
@@ -362,7 +431,7 @@ describe('tierWorkerAdmission (allowed / marginal / hard)', () => {
         '/proc/self/cgroup': '0::/docker/demo\n',
         '/proc/self/mountinfo': '29 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n',
         '/sys/fs/cgroup/docker/demo/memory.max': String(40 * GIB),
-        '/sys/fs/cgroup/docker/demo/memory.current': String(30.5 * GIB),
+        '/sys/fs/cgroup/docker/demo/memory.current': String(36.25 * GIB),
         '/sys/fs/cgroup/docker/demo/memory.stat': 'inactive_file 0\n',
         '/sys/fs/cgroup/docker/demo/memory.pressure': 'full avg10=2.00 avg60=0.00 avg300=0.00 total=0\n',
         '/sys/fs/cgroup/docker/memory.max': 'max\n',
