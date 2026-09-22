@@ -10,6 +10,8 @@ import { fetchDaemonIpc, loadDaemonIpcSecret } from '../core/daemon-ipc-auth.js'
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { loadAllSessionsSnapshot } from './session-store.js';
 import { applySessionCommandAsHost } from './session-command-host.js';
+import { formatStoreHoldMessage, formatUnmigratedMessage } from './session-store-copy.js';
+import { knownBotAppIds } from './known-bot-app-ids.js';
 
 export type WhiteboardScope = 'chat' | 'project' | 'custom';
 
@@ -441,6 +443,7 @@ const UNBIND_IPC_TIMEOUT_MS = 5_000;
  *  visible but unusable (writing behind its live cache is not allowed), or the
  *  row was gone by the time the write ran. */
 type UnbindOutcome = 'cleared' | 'already_changed' | 'unresolved';
+type UnbindResult = { status: UnbindOutcome; reason?: string };
 
 /**
  * Clear one session's binding to a board that is being deleted.
@@ -459,7 +462,7 @@ async function unbindSessionWhiteboard(
   session: SessionWhiteboardRef,
   boardId: string,
   dataDir: string,
-): Promise<UnbindOutcome> {
+): Promise<UnbindResult> {
   const larkAppId = session.larkAppId;
   if (larkAppId) {
     try {
@@ -476,12 +479,12 @@ async function unbindSessionWhiteboard(
           },
           loadDaemonIpcSecret(),
         );
-        // 409 is the daemon reporting a different binding — authoritative, and
-        // not something the offline path should try to overrule.
-        if (res.status === 409) return 'already_changed';
-        if (res.ok) return 'cleared';
+        // Any HTTP answer is terminal — the daemon is alive and authoritative.
+        if (res.status === 409) return { status: 'already_changed' };
+        if (res.ok) return { status: 'cleared' };
+        return { status: 'unresolved' };
       }
-    } catch { /* fall through: the re-probe below decides whether we may write */ }
+    } catch { /* connection failed: the re-probe below decides whether we may write */ }
   }
   const published = applySessionCommandAsHost(
     { sessionId: session.sessionId, ...(larkAppId ? { larkAppId } : {}) },
@@ -489,13 +492,16 @@ async function unbindSessionWhiteboard(
     { dataDir },
   );
   switch (published.outcome) {
-    case 'applied': return 'cleared';
-    // The fresh row no longer points at this board (or already dropped it).
+    case 'applied': return { status: 'cleared' };
     case 'noop':
-    case 'refused': return 'already_changed';
+    case 'refused': return { status: 'already_changed' };
     case 'owned':
+      return { status: 'unresolved', reason: formatStoreHoldMessage(published.heldBy) };
+    case 'unmigrated':
+      return { status: 'unresolved', reason: formatUnmigratedMessage() };
     case 'missing':
-    case 'contended': return 'unresolved';
+    case 'contended':
+      return { status: 'unresolved' };
   }
 }
 
@@ -509,23 +515,28 @@ async function unbindSessionWhiteboard(
  */
 async function clearSessionWhiteboardRefs(
   id: string,
-): Promise<{ cleared: number; unresolved: number }> {
+): Promise<{ cleared: number; unresolved: number; reasons: string[] }> {
   const dataDir = config.session.dataDir;
-  let snapshot: Map<string, SessionWhiteboardRef>;
+  let snapshot: ReturnType<typeof loadAllSessionsSnapshot>;
   try {
-    snapshot = loadAllSessionsSnapshot({ dataDir }) as unknown as Map<string, SessionWhiteboardRef>;
-  } catch { return { cleared: 0, unresolved: 0 }; }
+    snapshot = loadAllSessionsSnapshot({ dataDir, knownAppIds: knownBotAppIds({ dataDir }) });
+  } catch { return { cleared: 0, unresolved: 0, reasons: [] }; }
+  const reasons: string[] = [];
+  if (snapshot.unmigratedAppIds.length > 0) {
+    reasons.push(formatUnmigratedMessage());
+  }
   let cleared = 0;
   let unresolved = 0;
   for (const session of snapshot.values()) {
     if (session?.whiteboardId !== id) continue;
-    let outcome: UnbindOutcome;
-    try { outcome = await unbindSessionWhiteboard(session, id, dataDir); }
-    catch { outcome = 'unresolved'; }
-    if (outcome === 'cleared') cleared++;
-    else if (outcome === 'unresolved') unresolved++;
+    let result: UnbindResult;
+    try { result = await unbindSessionWhiteboard(session as unknown as SessionWhiteboardRef, id, dataDir); }
+    catch { result = { status: 'unresolved' }; }
+    if (result.reason && !reasons.includes(result.reason)) reasons.push(result.reason);
+    if (result.status === 'cleared') cleared++;
+    else if (result.status === 'unresolved') unresolved++;
   }
-  return { cleared, unresolved };
+  return { cleared, unresolved, reasons };
 }
 
 /**
@@ -538,7 +549,7 @@ async function clearSessionWhiteboardRefs(
  */
 export async function deleteWhiteboard(
   id: string,
-): Promise<{ ok: true; id: string; clearedSessions: number; unresolvedSessions: number }> {
+): Promise<{ ok: true; id: string; clearedSessions: number; unresolvedSessions: number; reasons?: string[] }> {
   const clean = safeId(id);
   withIndexLock(() => {
     const index = readIndex();
@@ -558,8 +569,14 @@ export async function deleteWhiteboard(
   });
   // Outside the index lock: unbinding awaits daemon IPC, and the lock is
   // synchronous. Nothing here reads the index.
-  const { cleared, unresolved } = await clearSessionWhiteboardRefs(clean);
-  return { ok: true, id: clean, clearedSessions: cleared, unresolvedSessions: unresolved };
+  const { cleared, unresolved, reasons } = await clearSessionWhiteboardRefs(clean);
+  return {
+    ok: true,
+    id: clean,
+    clearedSessions: cleared,
+    unresolvedSessions: unresolved,
+    ...(reasons.length > 0 ? { reasons } : {}),
+  };
 }
 
 export function whiteboardPath(id: string): { dir: string; board: string; log: string; meta: string } {
