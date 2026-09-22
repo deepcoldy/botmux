@@ -114,9 +114,9 @@ describe('session-observe normalizer', () => {
     expect(observe.parkedOrSuspended).toBe(true);
   });
 
-  it('emits queued="unknown" and turn="unknown" for unrecognized status', () => {
+  it('keeps runtime facts unknown for a future unrecognized status', () => {
     const observe = normalizeSessionRow(
-      makeRow({ status: 'weirdo' as unknown as string, queued: undefined, adopt: undefined }),
+      makeRow({ status: 'paused', queued: undefined, adopt: undefined }),
       { observedAt: OBSERVED_AT },
     );
     expect(observe.liveness).toBe('unknown');
