@@ -7913,13 +7913,9 @@ ipcRoute('PUT', '/api/bot-sandbox', async (req, res) => {
           message: 'Forge x TraeX 暂不支持文件沙盒。',
         });
       }
-      if (cfg.codexBrowser || cfg.existingAppServer) {
-        return jsonRes(res, 400, {
-          ok: false,
-          error: 'sandbox_feature_conflict',
-          message: '文件沙盒不能与 codexBrowser / existingAppServer 同时启用。',
-        });
-      }
+      // codexBrowser / existingAppServer conflicts are enforced by the shared
+      // bot-config invariants on the bots.json WRITE below, which return the
+      // canonical 409 reason (same contract as the legacy boolean toggle).
     } catch { /* Let the store return the canonical config error below. */ }
   }
 

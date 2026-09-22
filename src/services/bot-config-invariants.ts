@@ -8,16 +8,22 @@ function codexBrowserEnabled(entry: any): boolean {
     || (entry?.codexBrowser && typeof entry.codexBrowser === 'object' && entry.codexBrowser.enabled === true);
 }
 
+/** Any local sandbox mode engaged (legacy boolean true or the tri-state
+ *  oncall/scratch strings — a false/"off" string is not active). */
+function sandboxEngaged(entry: any): boolean {
+  return entry?.sandbox === true || entry?.sandbox === 'oncall' || entry?.sandbox === 'scratch';
+}
+
 /** Cross-field invariants shared by every bots.json writer. */
 export function botConfigInvariantError(entry: any): BotConfigInvariantError | undefined {
   if (!entry || typeof entry !== 'object') return undefined;
   if (codexBrowserEnabled(entry)) {
     if (entry.cliId !== 'codex-app') return 'codex_browser_requires_codex_app';
-    if (entry.existingAppServer || entry.sandbox === true || entry.readIsolation === true) {
+    if (entry.existingAppServer || sandboxEngaged(entry) || entry.readIsolation === true) {
       return 'codex_browser_config_conflict';
     }
   }
-  if (entry.existingAppServer && (entry.sandbox === true || entry.readIsolation === true)) {
+  if (entry.existingAppServer && (sandboxEngaged(entry) || entry.readIsolation === true)) {
     return 'existing_app_server_sandbox_conflict';
   }
   return undefined;
