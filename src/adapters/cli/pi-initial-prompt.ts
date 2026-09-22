@@ -1,9 +1,10 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import registerBotmuxInitialPromptExtension, {
+import {
   PI_INITIAL_PROMPT_COMMAND,
   PI_INITIAL_PROMPT_FILE_ENV,
 } from './pi-initial-prompt-extension.js';
+import { PI_INITIAL_PROMPT_EXTENSION_SOURCE } from './pi-initial-prompt-extension-data.js';
 
 export const PI_INITIAL_PROMPT_ARG_BYTE_LIMIT = 4096;
 
@@ -67,7 +68,7 @@ export function preparePiInitialPromptArg(opts: {
   writeFileSync(filePath, opts.prompt, { encoding: 'utf8', mode: 0o600 });
   // Pi 是独立进程，必须使用真实磁盘文件，不能传 Bun 内部的 /$bunfs 路径。
   const extensionPath = join(dir, 'pi-initial-prompt-extension.mjs');
-  writeFileSync(extensionPath, `export default ${registerBotmuxInitialPromptExtension.toString()};\n`, {
+  writeFileSync(extensionPath, PI_INITIAL_PROMPT_EXTENSION_SOURCE, {
     encoding: 'utf8', mode: 0o600,
   });
   return {
