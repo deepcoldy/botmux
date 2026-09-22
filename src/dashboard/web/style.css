@@ -25204,6 +25204,463 @@ dialog select[multiple]:hover:not(:disabled) {
   z-index: 1300;
 }
 
+/* 下拉选项的第二行说明（hint）：标题单行省略，副文案可折行，整块按钮变高、
+   圆角从胶囊改成方角卡片，避免两行文案挤在胶囊里。 */
+.sect-sort-pop button:has(.sect-sort-option) {
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: center;
+  gap: 3px;
+  min-height: 0;
+  padding-top: 8px;
+  padding-bottom: 8px;
+  border-radius: var(--radius-md);
+  white-space: normal;
+}
+
+.sect-sort-pop button .sect-sort-option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  min-width: 0;
+  text-align: left;
+}
+
+.sect-sort-pop button .sect-sort-option-title {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sect-sort-pop button .sect-sort-option-hint {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.35;
+  white-space: normal;
+}
+
+.sect-sort-pop button[aria-current="true"] .sect-sort-option-hint {
+  color: color-mix(in srgb, var(--accent-strong) 72%, var(--muted));
+}
+
+/* 下拉弹层内的预览面板（如会话模式示意图）：钉在弹层底部不随选项滚走，
+   与顶部的 .sect-sort-search 对称地吃掉弹层 6px padding。 */
+.sect-sort-pop .sect-sort-preview {
+  position: sticky;
+  bottom: -6px;
+  z-index: 1;
+  width: calc(100% + 12px);
+  margin: 2px -6px -6px;
+  padding: 8px 10px 10px;
+  border-top: 1px solid var(--border-soft);
+  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+  background: var(--surface);
+  background-clip: padding-box;
+}
+
+/* 带预览面板时弹层需要更高：三条选项 + 一张图约 420px，280px 会把图压扁。 */
+.bot-defaults-page .bd-field-menu .sect-sort-pop:has(.sect-sort-preview) {
+  gap: 3px;
+  max-height: min(640px, 82vh, var(--dropdown-popover-space, 100vh));
+}
+
+/* ═══ 模式示意图（mode-diagrams.tsx） ═══
+   用 DOM 画的迷你飞书聊天窗：右气泡=人发的消息，左气泡=机器人回复，
+   带色底板（lane）= 一个独立 CLI 会话，话题框=飞书话题。
+   全部走 design token，深浅色主题自动跟随。 */
+.bd-md-diagram {
+  margin: 0;
+  min-width: 0;
+}
+
+.bd-md-stage {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 9px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: var(--surface-muted);
+}
+
+.bd-md-caption-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 7px;
+}
+
+.bd-md-caption {
+  flex: 1;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.45;
+}
+
+.bd-md-token {
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border-radius: var(--radius-full);
+  background: var(--surface-muted);
+  color: var(--muted);
+  font-size: 9.5px;
+  font-weight: 700;
+  line-height: 1.5;
+}
+
+.bd-md-frame {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-raised);
+}
+
+.bd-md-framebar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 25px;
+  padding: 0 9px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--surface-hover);
+}
+
+.bd-md-frame-title {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bd-md-frame-badge {
+  margin-left: auto;
+  flex-shrink: 0;
+  padding: 1px 7px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface));
+  color: var(--accent-strong);
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.bd-md-framebody {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 7px;
+}
+
+/* 迷你头像：13px 圆点叠放 */
+.bd-md-avatars {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.bd-md-avatars .bd-md-av + .bd-md-av {
+  margin-left: -5px;
+}
+
+.bd-md-av {
+  display: inline-block;
+  width: 13px;
+  height: 13px;
+  border: 1.5px solid var(--surface-hover);
+  border-radius: 50%;
+}
+
+.bd-md-av-user {
+  background: var(--info);
+}
+
+.bd-md-av-bot {
+  background: var(--accent);
+}
+
+.bd-md-av-other {
+  background: var(--warning);
+}
+
+/* 气泡 */
+.bd-md-bubble-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+}
+
+.bd-md-bubble {
+  max-width: 78%;
+  padding: 3px 8px;
+  border-radius: 9px;
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.bd-md-bubble-r {
+  justify-content: flex-end;
+}
+
+.bd-md-bubble-r .bd-md-bubble {
+  background: var(--accent);
+  color: var(--on-accent);
+  border-bottom-right-radius: 3px;
+}
+
+.bd-md-bubble-l .bd-md-bubble {
+  border: 1px solid var(--border-soft);
+  border-bottom-left-radius: 3px;
+  background: var(--surface-muted);
+  color: var(--text);
+}
+
+.bd-md-bubble-l .bd-md-bubble-av {
+  width: 11px;
+  height: 11px;
+  border-width: 1px;
+}
+
+/* 会话底板：同一块 = 同一个 CLI 会话 */
+.bd-md-lane {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 5px 7px 6px;
+  border: 1px solid color-mix(in srgb, var(--md-tone) 30%, var(--border-soft));
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--md-tone) 9%, transparent);
+}
+
+.bd-md-lane-tag,
+.bd-md-topic-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  width: fit-content;
+  color: color-mix(in srgb, var(--md-tone) 80%, var(--text) 20%);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.bd-md-lane-tag::before,
+.bd-md-topic-tag::before {
+  content: '';
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--md-tone);
+}
+
+.bd-md-lane-body {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+/* 飞书话题框：相对 lane 缩进 + 左侧 tone 色条 */
+.bd-md-topic {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-left: 12px;
+  padding: 5px 7px 6px;
+  border: 1px solid color-mix(in srgb, var(--md-tone) 30%, var(--border-soft));
+  border-left: 3px solid var(--md-tone);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--md-tone) 11%, transparent);
+}
+
+/* fused：话题被折进外层会话 —— 虚线、无独立底色，视觉上"并入" */
+.bd-md-topic-fused {
+  margin-left: 6px;
+  border-style: dashed;
+  border-left-style: dashed;
+  background: transparent;
+}
+
+.bd-md-topic-body {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.bd-md-topic-row {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.bd-md-topic-compact .bd-md-bubble {
+  max-width: 100%;
+}
+
+.bd-md-tone-a { --md-tone: var(--accent); }
+.bd-md-tone-b { --md-tone: var(--success); }
+.bd-md-tone-c { --md-tone: var(--info); }
+
+/* 沉默标记 */
+.bd-md-silent-row {
+  display: flex;
+  justify-content: center;
+}
+
+.bd-md-silent {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 9px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-full);
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.4;
+}
+
+.bd-md-silent-icon {
+  font-size: 10px;
+  opacity: .8;
+}
+
+/* 私聊 group 模式：DM → 多个专属群 */
+.bd-md-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+}
+
+.bd-md-split > * {
+  min-width: 0;
+}
+
+.bd-md-split-arrow {
+  color: var(--border-strong);
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.bd-md-session-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.bd-md-session-group {
+  padding: 6px 7px;
+  border: 1px solid color-mix(in srgb, var(--md-tone) 30%, var(--border-soft));
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--md-tone) 9%, transparent);
+}
+
+.bd-md-session-group-head {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-bottom: 5px;
+  color: var(--text);
+  font-size: 9.5px;
+  font-weight: 700;
+}
+
+.bd-md-session-group-head .bd-md-av {
+  border-color: var(--surface-raised);
+}
+
+/* 工作目录模式：纵向流程 */
+.bd-md-flow {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+}
+
+.bd-md-node {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  background: var(--surface-raised);
+}
+
+.bd-md-node-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  border-radius: 7px;
+  background: var(--surface-muted);
+  font-size: 12px;
+}
+
+.bd-md-node-text {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px 8px;
+  min-width: 0;
+  flex: 1;
+}
+
+.bd-md-node-title {
+  color: var(--text);
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.bd-md-node-sub {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 9.5px;
+  line-height: 1.35;
+}
+
+.bd-md-node-badges {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-left: auto;
+}
+
+.bd-md-node-badge {
+  padding: 1px 7px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 13%, var(--surface));
+  color: var(--accent-strong);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+
+.bd-md-node-avatars {
+  margin-left: auto;
+}
+
+.bd-md-node-avatars .bd-md-av {
+  border-color: var(--surface-raised);
+}
+
+.bd-md-flow-arrow {
+  align-self: center;
+  color: var(--border-strong);
+  font-size: 11px;
+  line-height: 1.3;
+}
+
 /* Reply-style overrides stay compact but explicit: every semantic layout gets
    the same color + tri-state tag controls, with custom text revealed in place. */
 .bot-defaults-page .bd-reply-style-basics {

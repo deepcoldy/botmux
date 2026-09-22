@@ -42,6 +42,12 @@ import {
 import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
+import {
+  MentionModeDiagram,
+  P2pModeDiagram,
+  RegularGroupModeDiagram,
+  WorkingDirModeDiagram,
+} from './mode-diagrams.js';
 import { store } from './store.js';
 import { toast } from './toast.js';
 import type { RoleInjectMode } from './roles.js';
@@ -479,6 +485,7 @@ function FieldTitle(props: { children: ReactNode; help?: ReactNode }) {
 type DropdownFieldOption<T extends string> = {
   value: T;
   label: ReactNode;
+  hint?: ReactNode;
   disabled?: boolean;
 };
 
@@ -491,6 +498,10 @@ export function DropdownField<T extends string>(props: {
   className?: string;
   searchable?: boolean;
   onChange(value: T): void;
+  onOptionPreview?(value: T): void;
+  onPreviewEnd?(): void;
+  /** Sticky panel rendered inside the open popup (e.g. a mode diagram). */
+  preview?: ReactNode;
 }) {
   const tr = useT();
   return (
@@ -507,6 +518,9 @@ export function DropdownField<T extends string>(props: {
         searchPlaceholder={props.searchable ? tr('common.dropdownSearch') : undefined}
         searchEmptyLabel={props.searchable ? tr('common.dropdownSearchEmpty') : undefined}
         onChange={props.onChange}
+        onOptionPreview={props.onOptionPreview}
+        onPreviewEnd={props.onPreviewEnd}
+        preview={props.preview}
       />
       <input type="hidden" data-input={props.dataInput} value={props.value} readOnly />
     </>
@@ -3362,6 +3376,7 @@ function WorkingDirSection(props: {
   const { bot, patchBot } = props;
   const initial = workingDirState(bot);
   const [mode, setMode] = useState(initial.mode);
+  const [previewMode, setPreviewMode] = useState<'off' | 'default' | 'oncall' | null>(null);
   const [workingDir, setWorkingDir] = useState(initial.workingDir);
   const [autoWorktree, setAutoWorktree] = useState(bot.defaultWorkingDirAutoWorktree === true);
   const [status, setStatus] = useState<StatusMessage>(null);
@@ -3413,9 +3428,9 @@ function WorkingDirSection(props: {
   }
 
   const modeOptions: DropdownFieldOption<'off' | 'default' | 'oncall'>[] = [
-    { value: 'off', label: tr('botDefaults.workingDirModeOff') },
-    { value: 'default', label: tr('botDefaults.workingDirModeDefault') },
-    { value: 'oncall', label: tr('botDefaults.workingDirModeOncall') },
+    { value: 'off', label: tr('botDefaults.workingDirModeOff'), hint: tr('botDefaults.workingDirModeOffHint') },
+    { value: 'default', label: tr('botDefaults.workingDirModeDefault'), hint: tr('botDefaults.workingDirModeDefaultHint') },
+    { value: 'oncall', label: tr('botDefaults.workingDirModeOncall'), hint: tr('botDefaults.workingDirModeOncallHint') },
   ];
 
   return (
@@ -3431,6 +3446,9 @@ function WorkingDirSection(props: {
             disabled={busy}
             options={modeOptions}
             onChange={next => setMode(next as 'off' | 'default' | 'oncall')}
+            onOptionPreview={next => setPreviewMode(next as 'off' | 'default' | 'oncall')}
+            onPreviewEnd={() => setPreviewMode(null)}
+            preview={<WorkingDirModeDiagram mode={previewMode ?? mode} />}
           />
         </div>
       </div>
@@ -4118,13 +4136,13 @@ function SandboxPathsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   );
 }
 
-const BACKEND_TYPE_OPTIONS: Array<{ value: string; labelKey: string }> = [
-  { value: '', labelKey: 'botDefaults.backendAuto' },
-  { value: 'tmux', labelKey: 'botDefaults.backendTmux' },
-  { value: 'herdr', labelKey: 'botDefaults.backendHerdr' },
-  { value: 'zellij', labelKey: 'botDefaults.backendZellij' },
-  { value: 'zmx', labelKey: 'botDefaults.backendZmx' },
-  { value: 'pty', labelKey: 'botDefaults.backendPty' },
+const BACKEND_TYPE_OPTIONS: Array<{ value: string; labelKey: string; hintKey: string }> = [
+  { value: '', labelKey: 'botDefaults.backendAuto', hintKey: 'botDefaults.backendAutoHint' },
+  { value: 'tmux', labelKey: 'botDefaults.backendTmux', hintKey: 'botDefaults.backendTmuxHint' },
+  { value: 'herdr', labelKey: 'botDefaults.backendHerdr', hintKey: 'botDefaults.backendHerdrHint' },
+  { value: 'zellij', labelKey: 'botDefaults.backendZellij', hintKey: 'botDefaults.backendZellijHint' },
+  { value: 'zmx', labelKey: 'botDefaults.backendZmx', hintKey: 'botDefaults.backendZmxHint' },
+  { value: 'pty', labelKey: 'botDefaults.backendPty', hintKey: 'botDefaults.backendPtyHint' },
 ];
 
 function BackendTypeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
@@ -4136,7 +4154,10 @@ function BackendTypeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) 
 
   useEffect(() => setValue(typeof bot.backendType === 'string' ? bot.backendType : ''), [bot.backendType]);
 
-  const options = useMemo(() => BACKEND_TYPE_OPTIONS.map(o => ({ value: o.value, label: tr(o.labelKey) })), [tr]);
+  const options = useMemo(
+    () => BACKEND_TYPE_OPTIONS.map(o => ({ value: o.value, label: tr(o.labelKey), hint: tr(o.hintKey) })),
+    [tr],
+  );
 
   async function save(next: string): Promise<void> {
     const prev = value;
@@ -5081,6 +5102,9 @@ function SessionModeSection(props: {
   const [regular, setRegular] = useState(regularGroupMode(props.bot));
   const [mention, setMention] = useState(mentionMode(props.bot));
   const [docMode, setDocMode] = useState(props.bot.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only');
+  const [p2pPreview, setP2pPreview] = useState<'thread' | 'chat' | 'group' | null>(null);
+  const [regularPreview, setRegularPreview] = useState<string | null>(null);
+  const [mentionPreview, setMentionPreview] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [p2pStatus, setP2pStatus] = useState<StatusMessage>(null);
   const [regularStatus, setRegularStatus] = useState<StatusMessage>(null);
@@ -5133,25 +5157,25 @@ function SessionModeSection(props: {
   }
 
   const p2pOptions: DropdownFieldOption<'thread' | 'chat' | 'group'>[] = [
-    { value: 'thread', label: tr('botDefaults.p2pThread') },
-    { value: 'chat', label: tr('botDefaults.p2pChat') },
-    { value: 'group', label: tr('botDefaults.p2pGroup') },
+    { value: 'chat', label: tr('botDefaults.p2pChat'), hint: tr('botDefaults.p2pChatHint') },
+    { value: 'thread', label: tr('botDefaults.p2pThread'), hint: tr('botDefaults.p2pThreadHint') },
+    { value: 'group', label: tr('botDefaults.p2pGroup'), hint: tr('botDefaults.p2pGroupHint') },
   ];
   const regularOptions: DropdownFieldOption<string>[] = [
-    { value: 'chat', label: tr('botDefaults.regularGroupModeChat') },
-    { value: 'chat-topic', label: tr('botDefaults.regularGroupModeChatTopic') },
-    { value: 'new-topic', label: tr('botDefaults.regularGroupModeNewTopic') },
-    { value: 'shared', label: tr('botDefaults.regularGroupModeShared') },
+    { value: 'chat-topic', label: tr('botDefaults.regularGroupModeChatTopic'), hint: tr('botDefaults.regularGroupModeChatTopicHint') },
+    { value: 'chat', label: tr('botDefaults.regularGroupModeChat'), hint: tr('botDefaults.regularGroupModeChatHint') },
+    { value: 'new-topic', label: tr('botDefaults.regularGroupModeNewTopic'), hint: tr('botDefaults.regularGroupModeNewTopicHint') },
+    { value: 'shared', label: tr('botDefaults.regularGroupModeShared'), hint: tr('botDefaults.regularGroupModeSharedHint') },
   ];
   const mentionOptions: DropdownFieldOption<string>[] = [
-    { value: 'always', label: tr('botDefaults.mentionModeAlways') },
-    { value: 'topic', label: tr('botDefaults.mentionModeTopic') },
-    { value: 'never', label: tr('botDefaults.mentionModeNever') },
-    { value: 'ambient', label: tr('botDefaults.mentionModeAmbient') },
+    { value: 'always', label: tr('botDefaults.mentionModeAlways'), hint: tr('botDefaults.mentionModeAlwaysHint') },
+    { value: 'topic', label: tr('botDefaults.mentionModeTopic'), hint: tr('botDefaults.mentionModeTopicHint') },
+    { value: 'never', label: tr('botDefaults.mentionModeNever'), hint: tr('botDefaults.mentionModeNeverHint') },
+    { value: 'ambient', label: tr('botDefaults.mentionModeAmbient'), hint: tr('botDefaults.mentionModeAmbientHint') },
   ];
   const docOptions: DropdownFieldOption<string>[] = [
-    { value: 'mention-only', label: tr('botDefaults.docSubscribeModeMention') },
-    { value: 'all', label: tr('botDefaults.docSubscribeModeAll') },
+    { value: 'mention-only', label: tr('botDefaults.docSubscribeModeMention'), hint: tr('botDefaults.docSubscribeModeMentionHint') },
+    { value: 'all', label: tr('botDefaults.docSubscribeModeAll'), hint: tr('botDefaults.docSubscribeModeAllHint') },
   ];
 
   return (
@@ -5160,13 +5184,16 @@ function SessionModeSection(props: {
       <div className="bd-row">
         <div className="bd-field">
           <FieldTitle help={tr('botDefaults.p2pHelp')}>{tr('botDefaults.p2pMode')}</FieldTitle>
-          <DropdownField
+          <DropdownField<'thread' | 'chat' | 'group'>
             dataInput="p2pMode"
             ariaLabel={tr('botDefaults.p2pMode')}
             value={p2p}
             disabled={busy === 'p2p'}
             options={p2pOptions}
             onChange={next => void saveP2p(next)}
+            onOptionPreview={setP2pPreview}
+            onPreviewEnd={() => setP2pPreview(null)}
+            preview={<P2pModeDiagram mode={p2pPreview ?? p2p} />}
           />
         </div>
         <div className="actions"><StatusSpan status={p2pStatus} attr={{ 'data-p2p-status': '' }} /></div>
@@ -5185,6 +5212,9 @@ function SessionModeSection(props: {
               setRegular(next);
               void saveCardMode('regular', { regularGroupReplyMode: next }, setRegularStatus);
             }}
+            onOptionPreview={setRegularPreview}
+            onPreviewEnd={() => setRegularPreview(null)}
+            preview={<RegularGroupModeDiagram mode={(regularPreview ?? regular) as 'chat' | 'chat-topic' | 'new-topic' | 'shared'} />}
           />
         </div>
         <div className="actions"><StatusSpan status={regularStatus} attr={{ 'data-regular-group-status': '' }} /></div>
@@ -5202,6 +5232,9 @@ function SessionModeSection(props: {
               setMention(next);
               void saveCardMode('mention', { regularGroupMentionMode: next }, setMentionStatus);
             }}
+            onOptionPreview={setMentionPreview}
+            onPreviewEnd={() => setMentionPreview(null)}
+            preview={<MentionModeDiagram mode={(mentionPreview ?? mention) as 'always' | 'topic' | 'never' | 'ambient'} />}
           />
         </div>
         <div className="actions"><StatusSpan status={mentionStatus} attr={{ 'data-mention-mode-status': '' }} /></div>
