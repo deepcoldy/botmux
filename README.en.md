@@ -79,8 +79,6 @@ Then DM the bot, or run `botmux dashboard` to create a group, and start chatting
 
 More: [Roles & teams](https://deepcoldy.github.io/botmux/en/roles) · [File sandbox](https://deepcoldy.github.io/botmux/en/sandbox) · [Dashboard](https://deepcoldy.github.io/botmux/en/dashboard) · [tmux persistence](https://deepcoldy.github.io/botmux/en/tmux) · [VC meeting agent (showcase)](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg).
 
-Operators and integrations can run `botmux observe [--session <id>] [--lark-app <appId>] [--include-raw]` to read canonical worker/session JSON published live by the daemon. Probe failures remain explicit `unknown`/probe outcomes and never fall back to stale cache data.
-
 ## Supported CLIs & Agents
 
 Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (process-isolated, reachable via `tmux attach`) and API / cloud agents (e.g. Mira, riff — reached over API / remote, not a local process; mojo is API-driven but executes tools on the bot host by default, set cloud: true for the remote sandbox). Representative ones:
