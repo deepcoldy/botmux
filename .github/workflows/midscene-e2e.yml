@@ -137,7 +137,7 @@ jobs:
 
       - name: Configure GitHub Pages
         id: pages
-        if: always() && !cancelled()
+        if: always() && !cancelled() && github.event_name == 'workflow_dispatch'
         uses: actions/configure-pages@v6
 
       - name: Write Midscene run summary
