@@ -374,6 +374,8 @@ describe('terminal proxy — on-demand wake (ensureWorkerPort)', () => {
     const html = await res.text();
     expect(html).toContain('终端正在启动');
     expect(html).toContain('location.reload()');
+    expect(html).toContain('启动时间较长，请稍后刷新页面或从最新卡片重新打开 Web 终端。');
+    expect(html).not.toContain('<button');
   });
 
   it('renders a terminal-closed page only for an authorized card capability', async () => {
@@ -388,7 +390,9 @@ describe('terminal proxy — on-demand wake (ensureWorkerPort)', () => {
       `http://127.0.0.1:${proxy.port}/s/closed/?viewToken=card-view`,
     );
     expect(closed.status).toBe(410);
-    expect(await closed.text()).toContain('该会话已关闭');
+    const closedHtml = await closed.text();
+    expect(closedHtml).toContain('该会话已关闭');
+    expect(closedHtml).not.toContain('<button');
 
     const stale = await fetch(
       `http://127.0.0.1:${proxy.port}/s/closed/?viewToken=stale`,

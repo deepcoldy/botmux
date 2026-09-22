@@ -55,13 +55,10 @@ if(count<20){
   sessionStorage.setItem(key,String(count+1));
   setTimeout(()=>location.reload(),2000);
 }else{
-  document.getElementById('retry-note').textContent='启动时间较长，请稍后手动重试。';
+  document.getElementById('retry-note').textContent='启动时间较长，请稍后刷新页面或从最新卡片重新打开 Web 终端。';
 }
 </script>`
     : '';
-  const retryAction = copy.retry
-    ? '<button type="button" onclick="location.reload()">立即重试</button>'
-    : '<button type="button" onclick="history.back()">返回上一页</button>';
 
   return `<!doctype html>
 <html lang="zh-CN">
@@ -80,14 +77,9 @@ main{width:min(520px,calc(100% - 40px));padding:40px 0}
 .code{font:600 12px ui-monospace,SFMono-Regular,Menlo,monospace;color:#646a73}
 h1{margin:8px 0 12px;font-size:30px;line-height:1.25;letter-spacing:0}
 p{margin:0;color:#646a73;font-size:15px;line-height:1.7}
-.actions{display:flex;gap:12px;margin-top:28px}
-button{min-height:40px;padding:0 18px;border:1px solid #c9cdd4;border-radius:6px;background:#fff;color:#1f2329;font:inherit;font-size:14px;font-weight:600;cursor:pointer}
-button:hover{border-color:#1456d9;color:#1456d9}
 @media(prefers-color-scheme:dark){
   body{background:#171719;color:#f2f3f5}
   .brand{color:#4e83fd}.rule{background:#4e83fd}.code,p{color:#a6a7ab}
-  button{background:#242426;color:#f2f3f5;border-color:#505052}
-  button:hover{border-color:#4e83fd;color:#8babff}
 }
 </style>
 </head>
@@ -98,7 +90,6 @@ button:hover{border-color:#1456d9;color:#1456d9}
   <div class="code">${copy.code}</div>
   <h1>${copy.title}</h1>
   <p id="retry-note">${copy.detail}</p>
-  <div class="actions">${retryAction}</div>
 </main>
 ${retryScript}
 </body>
