@@ -1,7 +1,6 @@
 import { describe, expect, it, afterEach } from 'vitest';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { resolveNodeExecutable } from './helpers/ts-runner.js';
@@ -9,11 +8,6 @@ import { detectGlobalInstallManager } from '../src/utils/global-install.js';
 import { parseNpmPackJson } from '../scripts/parse-npm-pack-json.mjs';
 
 const NODE_BIN = resolveNodeExecutable() ?? process.execPath;
-
-function resolveTypeScriptCompiler(): string {
-  return process.env.BOTMUX_TEST_TSC_PATH
-    ?? createRequire(import.meta.url).resolve('typescript/bin/tsc');
-}
 
 /**
  * `npm pack --dry-run --json` changed its top-level shape across npm majors:
@@ -173,14 +167,21 @@ describe('package.json — lockfile safety and packaging', () => {
     expect(packed.error, `npm pack failed to run: ${packed.error?.message}`).toBeUndefined();
     expect(packed.status, `npm pack exited ${packed.status}: ${packed.stderr}`).toBe(0);
     const report = parseNpmPackJson(packed.stdout) as Array<{ filename: string }>;
-    const tarball = join(root, report[0]!.filename);
-    const extracted = spawnSync('tar', ['-xzf', tarball, '-C', root], { encoding: 'utf-8' });
-    expect(extracted.status, extracted.stderr).toBe(0);
-
     const consumer = join(root, 'consumer');
-    mkdirSync(join(consumer, 'node_modules'), { recursive: true });
-    symlinkSync(join(root, 'package'), join(consumer, 'node_modules', 'botmux'), 'dir');
-    writeFileSync(join(consumer, 'package.json'), JSON.stringify({ type: 'module' }));
+    mkdirSync(consumer, { recursive: true });
+    writeFileSync(join(consumer, 'package.json'), JSON.stringify({
+      private: true,
+      type: 'module',
+      dependencies: {
+        botmux: `file:../${report[0]!.filename}`,
+        typescript: '5.9.3',
+      },
+    }));
+    const installed = spawnSync('npm', [
+      'install', '--ignore-scripts', '--no-audit', '--no-fund',
+    ], { cwd: consumer, encoding: 'utf-8', timeout: 120_000 });
+    expect(installed.error, `consumer npm install failed to run: ${installed.error?.message}`).toBeUndefined();
+    expect(installed.status, `${installed.stdout}\n${installed.stderr}`).toBe(0);
 
     const loaded = spawnSync(NODE_BIN, ['--input-type=module', '-e', `
       const schema = await import('botmux/services/session-observe');
@@ -203,13 +204,13 @@ describe('package.json — lockfile safety and packaging', () => {
       void normalized;
       void fetched;
     `);
-    const typed = spawnSync(NODE_BIN, [resolveTypeScriptCompiler(),
+    const typed = spawnSync(NODE_BIN, [join(consumer, 'node_modules', 'typescript', 'bin', 'tsc'),
       '--noEmit', '--strict', '--skipLibCheck', '--target', 'ES2022',
       '--module', 'NodeNext', '--moduleResolution', 'NodeNext',
       join(consumer, 'consumer.ts'),
     ], { cwd: consumer, encoding: 'utf-8' });
     expect(typed.status, `${typed.stdout}\n${typed.stderr}`).toBe(0);
-  });
+  }, 120_000);
 
   it('parseNpmPackReport() reads both npm-major shapes of `npm pack --json`', () => {
     const files = [{ path: 'package.json', size: 1, mode: 420 }];
