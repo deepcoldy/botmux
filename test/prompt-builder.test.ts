@@ -171,6 +171,18 @@ describe('buildNewTopicPrompt', () => {
     expect(routing).not.toContain('&amp;lt;');
   });
 
+  it('puts the Cursor background-task note inside <botmux_routing> for cursor only (#1504)', () => {
+    const cursor = buildNewTopicPrompt('hello', SESSION_ID, 'cursor');
+    const routing = cursor.slice(cursor.indexOf('<botmux_routing>'), cursor.indexOf('</botmux_routing>'));
+    expect(routing).toContain('后台任务');
+    expect(routing).toContain('Briefly inform the user about the task result');
+    expect(routing).toContain('不是飞书用户的新消息');
+
+    const codex = buildNewTopicPrompt('hello', SESSION_ID, 'codex');
+    expect(codex).not.toContain('Briefly inform the user about the task result');
+    expect(codex).not.toContain('后台任务');
+  });
+
   it('gives Hermes the standard botmux-send routing hints like other structured-bridge CLIs', () => {
     // #365 previously steered Hermes AWAY from `botmux send` (reverse guidance)
     // as a redundant belt-and-braces on top of the real dedup fix

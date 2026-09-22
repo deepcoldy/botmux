@@ -134,12 +134,25 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
       }
       await delay(200);
       emitEnter();
-      // While Cursor is running a turn, the first Enter parks the text in its
-      // "follow-ups" panel ("enter steer"). A second Enter promotes that item
-      // into the active agent turn. At an idle empty composer the extra Enter
-      // is a no-op, so use the same sequence for serial and type-ahead writes.
-      await delay(200);
-      emitEnter();
+      // Exactly ONE Enter. Idle composer → submits. Busy turn → Cursor parks
+      // the text in its "follow-ups" panel as a QUEUED item, which it submits
+      // by itself as the next turn the moment the current turn ends (verified
+      // on cursor-agent 2026.09.18; the TUI's `chat.queued` processing does
+      // exactly that). That is the same serial queue semantics the worker
+      // already relies on for Claude Code type-ahead.
+      //
+      // Do NOT press Enter a second time (#996 did, #1504 is the fallout):
+      //   - on a queued item, Enter means "steer" — inject into the ACTIVE
+      //     turn. If a shell tool is running, Cursor detaches it into a
+      //     background task; when that task later completes Cursor injects a
+      //     synthetic user turn ("Briefly inform the user about the task
+      //     result…") with no Lark message behind it, and the model dutifully
+      //     `botmux send`s again → the "auto-continue after final" symptom.
+      //   - the second Enter races the follow-ups panel re-render (long
+      //     multi-line prompts, loaded hosts). When it is lost the item sits
+      //     at "enter steer" and the worker believes it was delivered.
+      // A single Enter has no half-state: either it submitted, or the item is
+      // queued and Cursor flushes it at the turn boundary.
     },
 
     completionPattern: undefined,

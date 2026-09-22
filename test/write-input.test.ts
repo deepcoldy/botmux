@@ -727,18 +727,24 @@ describe('writeInput: edge cases', () => {
     expect(pty.sendSpecialKeys).toHaveBeenCalledWith('Enter');
   });
 
-  it('cursor: submits then activates the follow-up steer action in tmux', async () => {
+  // #1504 regression: exactly ONE Enter per write. A second Enter on a
+  // queued follow-up is Cursor's "steer" — it detaches a running shell tool
+  // into a background task whose completion later makes Cursor inject a
+  // synthetic "Briefly inform the user about the task result…" turn (the
+  // "auto-continue after final" symptom), and it races the follow-ups panel
+  // re-render (lost Enter → message parked at "enter steer"). Cursor submits a
+  // queued follow-up by itself at the turn boundary, so one Enter is enough.
+  it('cursor: submits with a single Enter in tmux (no follow-up steer)', async () => {
     vi.useFakeTimers();
     try {
       const adapter = createCursorAdapter('/bin/cursor-agent');
       const pty = makeTmuxPty();
-      const write = adapter.writeInput(pty, 'steer this turn');
+      const write = adapter.writeInput(pty, 'queue this turn');
       await flushFakeTimers();
       await write;
 
-      expect(pty.sendText).toHaveBeenCalledWith('steer this turn');
+      expect(pty.sendText).toHaveBeenCalledWith('queue this turn');
       expect(pty.sendSpecialKeys.mock.calls).toEqual([
-        ['Enter'],
         ['Enter'],
       ]);
     } finally {
@@ -746,20 +752,37 @@ describe('writeInput: edge cases', () => {
     }
   });
 
-  it('cursor: submits then activates follow-up steering in raw PTY mode', async () => {
+  it('cursor: submits with a single Enter in raw PTY mode (no follow-up steer)', async () => {
     vi.useFakeTimers();
     try {
       const adapter = createCursorAdapter('/bin/cursor-agent');
       const pty = makeRawPty();
-      const write = adapter.writeInput(pty, 'steer raw turn');
+      const write = adapter.writeInput(pty, 'queue raw turn');
       await flushFakeTimers();
       await write;
 
       expect(pty.write.mock.calls.map(c => c[0])).toEqual([
-        'steer raw turn',
-        '\r',
+        'queue raw turn',
         '\r',
       ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('cursor: a multi-line type-ahead message still ends with exactly one Enter', async () => {
+    vi.useFakeTimers();
+    try {
+      const adapter = createCursorAdapter('/bin/cursor-agent');
+      const pty = makeTmuxPty();
+      const write = adapter.writeInput(pty, '<botmux_routing>\nline two\n</botmux_routing>');
+      await flushFakeTimers();
+      await write;
+
+      // Soft newlines are C-j; the only Enter is the final submit.
+      expect(pty.sendSpecialKeys.mock.calls.filter(c => c[0] === 'Enter')).toHaveLength(1);
+      expect(pty.sendSpecialKeys.mock.calls.filter(c => c[0] === 'C-j')).toHaveLength(2);
+      expect(pty.sendSpecialKeys.mock.calls[pty.sendSpecialKeys.mock.calls.length - 1]).toEqual(['Enter']);
     } finally {
       vi.useRealTimers();
     }

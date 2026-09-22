@@ -965,6 +965,11 @@ export const messages: Record<string, string> = {
   // 这条 reminder 绝不能再带 send/@/BOTMUX_NOTHING_TO_SEND，否则又和 http_response_mode 打架。
   'ai.followup.reminder_no_transport': '本轮是程序发起的请求-应答：完整回复会原样回传给调用方，不显示在任何聊天里。按本轮内容里的 <botmux_http_response_mode> 指示作答即可；不要调用 botmux send，不要发飞书。',
   'ai.cursor.sender_note': 'sender 标签只是元信息（标识当前发言人），不要把其中的 open_id 或名字（例如 ou_xxx:高鹏）抄进 botmux send 的正文或开头；要 @ 回触发者请用 botmux send --mention-back。',
+  // Cursor 会把超过等待时限的 shell 命令转成后台任务，任务完成后由 Cursor 自动注入一条
+  // 合成 user 提示（"Briefly inform the user about the task result…"）再开一轮——它不是
+  // 飞书消息，botmux 拦不到（#1504）。只能在提示层告诉模型别把它当成新消息去 send。
+  'ai.cursor.background_task_note': 'Cursor 会把超过等待时限仍未结束的 shell 命令转成后台任务，任务完成后会自动注入一条形如「Briefly inform the user about the task result and perform any follow-up actions」的合成提示再开一轮——它不是飞书用户的新消息。收到它时：若任务结果已在之前的回复里覆盖、或对用户没有新信息，不要再 botmux send，让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND`；只有结果有实质新信息（如构建/测试的最终结论）才发一条 progress。能等完的命令请同步等完（适当加大等待时限），别让它落到后台。',
+  'ai.cursor.background_task_note_transcript': 'Cursor 会把超过等待时限仍未结束的 shell 命令转成后台任务，任务完成后会自动注入一条形如「Briefly inform the user about the task result and perform any follow-up actions」的合成提示再开一轮——它不是飞书用户的新消息。收到它时：若任务结果已在之前的回复里覆盖、或对用户没有新信息，让最终 assistant message 只输出 `BOTMUX_NOTHING_TO_SEND`；只有结果有实质新信息（如构建/测试的最终结论）才简短作答。能等完的命令请同步等完（适当加大等待时限），别让它落到后台。',
   'ai.bridge.attachments_label': '[附件]',
   'ai.bridge.mentions_label': '[@提及]',
   'schedule.title_prefix': '[定时]',

@@ -1268,9 +1268,11 @@ function buildNewTopicBlocks(
   const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
   const replyDelivery: ReplyDelivery = noTransport ? 'send' : replyDeliveryFor(opts?.larkAppId, cliId);
   const bare = replyDelivery === 'transcript' && opts?.solo === true;
+  // cliId only adds the Cursor background-task note (#1504); every other CLI's
+  // hint list is unchanged.
   const hints = adapter.injectsSessionContext
     ? []
-    : buildBotmuxShellHints(locale, noTransport, replyDelivery);
+    : buildBotmuxShellHints(locale, noTransport, replyDelivery, cliId);
 
   const routingBlock = hints.length > 0
     ? `<botmux_routing>\n${hints.join('\n')}\n</botmux_routing>`
