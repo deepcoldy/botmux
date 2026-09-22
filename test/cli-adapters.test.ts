@@ -467,15 +467,32 @@ describe('mimocode adapter', () => {
   const adapter = createMiMoCodeAdapter('/usr/bin/mimo');
 
   it('uses the MiMoCode executable and isolated state roots', () => {
-    expect(adapter.id).toBe('mimocode');
-    expect(adapter.resolvedBin).toBe('/usr/bin/mimo');
-    expect(adapter.authPaths).toEqual([
-      '~/.config/mimocode',
-      '~/.local/share/mimocode',
-      '~/.local/state/mimocode',
-      '~/.cache/mimocode',
-    ]);
-    expect(adapter.skillsDir).toBe('~/.config/mimocode/skills');
+    // 断言字面 `~` 默认路径时必须 hermetic：全局单测 setup（fence-home-env）会把
+    // 已存在的 XDG_* 重定向到临时 HOME（CI 预置了 XDG_CONFIG_HOME），在 describe
+    // 顶层构造会让 config 路径变成绝对路径。这里显式清空四个 XDG 变量再构造。
+    const xdgKeys = ['XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME'];
+    const previous: Record<string, string | undefined> = {};
+    for (const k of xdgKeys) {
+      previous[k] = process.env[k];
+      delete process.env[k];
+    }
+    try {
+      const defaultAdapter = createMiMoCodeAdapter('/usr/bin/mimo');
+      expect(defaultAdapter.id).toBe('mimocode');
+      expect(defaultAdapter.resolvedBin).toBe('/usr/bin/mimo');
+      expect(defaultAdapter.authPaths).toEqual([
+        '~/.config/mimocode',
+        '~/.local/share/mimocode',
+        '~/.local/state/mimocode',
+        '~/.cache/mimocode',
+      ]);
+      expect(defaultAdapter.skillsDir).toBe('~/.config/mimocode/skills');
+    } finally {
+      for (const k of xdgKeys) {
+        if (previous[k] === undefined) delete process.env[k];
+        else process.env[k] = previous[k]!;
+      }
+    }
   });
 
   it('reuses the OpenCode-compatible prompt and model argument shape', () => {
