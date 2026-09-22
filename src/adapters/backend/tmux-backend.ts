@@ -148,6 +148,21 @@ export class TmuxBackend implements SessionBackend {
     return TmuxBackend.probeSession(name) === 'exists';
   }
 
+  static sessionChildPid(name: string): number | null {
+    try {
+      const out = execFileSync('tmux', ['display-message', '-p', '-t', name, '#{pane_pid}'], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 3000,
+        env: tmuxEnv(),
+      }).toString().trim();
+      const pid = Number(out);
+      return Number.isInteger(pid) && pid > 0 ? pid : null;
+    } catch {
+      return null;
+    }
+  }
+
   static assertInstanceIdentity(name: string, expected: string): void {
     const probe = TmuxBackend.probeSession(name);
     if (probe === 'missing') return;

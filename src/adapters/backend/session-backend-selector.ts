@@ -15,6 +15,7 @@ import { ZellijBackend } from './zellij-backend.js';
 import { ZmxBackend } from './zmx-backend.js';
 import { classifyTmuxProbeFailure } from '../../setup/ensure-tmux.js';
 import { resolveZmxSocketDir, zmxEnv } from '../../setup/ensure-zmx.js';
+import { isBareShellComm } from '../../core/session-discovery.js';
 import type { BackendType, PersistentBackendTarget, SessionBackend } from './types.js';
 
 const MANAGED_HERDR_AGENT_PREFIX = 'botmux-';
@@ -179,6 +180,25 @@ export function decideBackendGate(opts: {
   return { action: 'gate', reason: `${opts.requested} 后端在本机不可用` };
 }
 
+export type TmuxReattachDecision =
+  | { reattach: true }
+  | { reattach: false; cleanupStale: boolean; reason?: string };
+
+export function decideTmuxReattach(opts: {
+  workflowWorker: boolean;
+  sessionExists: boolean;
+  paneLeafComm?: string;
+}): TmuxReattachDecision {
+  if (!opts.sessionExists) return { reattach: false, cleanupStale: false };
+  if (!opts.workflowWorker) return { reattach: true };
+  if (!isBareShellComm(opts.paneLeafComm)) return { reattach: true };
+  return {
+    reattach: false,
+    cleanupStale: true,
+    reason: `workflow tmux pane is a bare shell (${opts.paneLeafComm})`,
+  };
+}
+
 /** User-facing card shown when {@link decideBackendGate} gates a session. */
 export function backendGateUserMessage(backend: BackendType, reason: string): string {
   // tmux is installed but the daemon's runtime (container seccomp/sandbox)
@@ -303,6 +323,7 @@ export function selectSessionBackend(opts: {
   reuseRecordedHerdrTarget?: boolean;
   persistentBackendTarget?: PersistentBackendTarget;
   hasExistingSession?: boolean;
+  hasExistingTmuxSession?: boolean;
   /** Host-persistent journal for fail-closed ZMX composer recovery. */
   zmxRecoveryStateDir?: string;
 }): SelectedSessionBackend {
@@ -537,7 +558,8 @@ export function selectSessionBackend(opts: {
   }
 
   const sessionName = TmuxBackend.sessionName(opts.sessionId);
-  if (TmuxBackend.hasSession(sessionName)) {
+  const tmuxReattach = opts.hasExistingTmuxSession ?? TmuxBackend.hasSession(sessionName);
+  if (tmuxReattach) {
     return {
       backend: new TmuxPipeBackend(sessionName, { ownsSession: true, isReattach: true }),
       isTmuxMode: true,
