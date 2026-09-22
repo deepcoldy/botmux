@@ -2399,6 +2399,7 @@ export function reactivateClosedSession(
   next.queuedActivationTailNextOrder = undefined;
   next.pendingRepoSetup = undefined;
   next.previewTarget = undefined;
+  next.crossPrincipalInterruptions = undefined;
   next.mojoCloseJournal = undefined;
   next.tokenUsage = undefined;
 

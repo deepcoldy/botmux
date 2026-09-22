@@ -1194,6 +1194,32 @@ describe('closeSession()', () => {
 });
 
 describe('reactivateClosedSession()', () => {
+  it.each(['awaiting_classification', 'terminal_notice_pending'] as const)(
+    'does not revive %s XPI work left on a legacy closed row', (phase) => {
+      const session = createSession('chat-xpi-resume', 'root-xpi-resume', 'Legacy Closed XPI');
+      closeSession(session.sessionId);
+      // Older builds persisted this queue on close; resume skips applyClose.
+      const legacy = getSession(session.sessionId)!;
+      legacy.crossPrincipalInterruptions = [{
+        version: 1, id: 'xpi_legacy', ownerTurnId: 'om_owner', phase,
+        owner: { requestUserOpenId: 'ou_owner', senderType: 'user' },
+        proposer: { requestUserOpenId: 'ou_peer', senderType: 'user' },
+        messages: [{ turnId: 'om_legacy', text: 'legacy input', userPrompt: 'legacy input', createdAt: legacy.createdAt }],
+      }];
+      updateSession(legacy);
+      init();
+
+      const result = reactivateClosedSession(session.sessionId);
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.session.crossPrincipalInterruptions).toBeUndefined();
+
+      init();
+      const reloaded = getSession(session.sessionId)!;
+      expect(reloaded.status).toBe('active');
+      expect(reloaded.crossPrincipalInterruptions).toBeUndefined();
+    },
+  );
+
   it('sanitizes queued/setup state left on a legacy closed row', () => {
     const session = createSession('chat1', 'root1', 'Legacy Closed Queue');
     closeSession(session.sessionId);
