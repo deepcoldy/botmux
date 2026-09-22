@@ -588,6 +588,48 @@ describe('Frozen Command host-owned route → callback → Data MCP flow', () =>
     expect(mocks.cardBodies[0]).not.toContain('确认执行');
   });
 
+  it('does not route a bot-authored natural-language command through the host in a new topic', async () => {
+    const messageId = `om_direct_bot_new_${Math.random().toString(36).slice(2)}`;
+    const event = ingressEvent(messageId, '@_bot 运行 /宿主闭环 11');
+    event.sender.sender_type = 'bot';
+
+    await modules.daemon.__testOnly_handleNewTopic(
+      event,
+      ingressContext(messageId, messageId),
+    );
+
+    expect(mocks.validateCalls).toBe(0);
+    expect(mocks.runCalls).toBe(0);
+    expect(mocks.cardBodies.every(body => !body.includes('真实链路：'))).toBe(true);
+  });
+
+  it('does not route a bot-authored natural-language command through the host in an existing thread', async () => {
+    const rootMessageId = `om_direct_bot_root_${Math.random().toString(36).slice(2)}`;
+    await modules.daemon.__testOnly_handleNewTopic(
+      ingressEvent(rootMessageId, '初始化宿主闭环会话'),
+      ingressContext(rootMessageId, rootMessageId),
+    );
+    const ds = modules.daemon.__testOnly_activeSessions.get(modules.types.sessionKey(rootMessageId, APP));
+    expect(ds).toBeDefined();
+    ds.activeInteractiveTurn = undefined;
+    ds.worker = { killed: false, send: vi.fn(() => true) };
+    mocks.cardBodies.length = 0;
+    mocks.validateCalls = 0;
+    mocks.runCalls = 0;
+
+    const messageId = `om_direct_bot_reply_${Math.random().toString(36).slice(2)}`;
+    const event = ingressEvent(messageId, '运行 /宿主闭环 11 @_bot', rootMessageId);
+    event.sender.sender_type = 'bot';
+    await modules.daemon.__testOnly_handleThreadReply(
+      event,
+      ingressContext(messageId, rootMessageId),
+    );
+
+    expect(mocks.validateCalls).toBe(0);
+    expect(mocks.runCalls).toBe(0);
+    expect(mocks.cardBodies.every(body => !body.includes('真实链路：'))).toBe(true);
+  });
+
   it.each([
     ['top-level', 'top-level'],
     ['structuredContent', 'structured'],
