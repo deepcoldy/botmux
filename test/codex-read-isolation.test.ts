@@ -7,7 +7,10 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 
-vi.mock('node:child_process', () => ({ execSync: vi.fn(() => '') }));
+vi.mock('node:child_process', () => ({
+  execFile: vi.fn(),
+  execSync: vi.fn(() => ''),
+}));
 
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 

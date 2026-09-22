@@ -181,6 +181,9 @@ vi.mock('../src/services/session-store.js', () => ({
   findActiveSessionsByWorkingDir: vi.fn(() => []),
   findActiveSessionsByWorkingDirStrict: vi.fn(() => []),
   getOwnedSession: vi.fn(() => undefined),
+  resolvePrincipalLaneForIngress: vi.fn(() => ({ status: 'missing' })),
+  hydratePrincipalLaneForIngress: vi.fn(async () => ({ status: 'missing', reason: 'lane_missing' })),
+  retirePrincipalLane: vi.fn(() => ({ status: 'retired' })),
   listSessions: vi.fn(() => []),
   collectBotmuxSessionIdentities: vi.fn(() => new Set<string>()),
 }));
@@ -669,6 +672,19 @@ function closeWorktreeState(
   })).digest('hex');
 }
 
+function laneCloseState(
+  safetyFingerprint = 'lane-clean',
+  invokerOpenId = 'ou_sender',
+): string {
+  return createHash('sha256').update(JSON.stringify({
+    sessionId: 'lane-session-b',
+    worktreeDir: resolve('/home/testuser/project-wt-principal'),
+    siblingSessionIds: [],
+    safetyFingerprint,
+    invokerOpenId,
+  })).digest('hex');
+}
+
 function makeDaemonSession(overrides: Partial<DaemonSession> = {}): DaemonSession {
   return {
     session: makeSession(),
@@ -743,7 +759,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/cleanup-wt', '/stop', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/project', '/group', '/g', '/relay', '/quote', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/sessions', '/vc-auth', '/issue', '/cli'];
+    const expected = ['/close', '/cleanup-wt', '/lane', '/stop', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/project', '/group', '/g', '/relay', '/quote', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/sessions', '/vc-auth', '/issue', '/cli'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -780,7 +796,7 @@ describe('DAEMON_COMMANDS set', () => {
     // bot 发送方和 `/t /tabs ...` 会建出 phantom session 后静默失效。
     // /fork 与 /issue 仍是一等 daemon 命令；/subscribe-lark-doc 保持原本的
     // 按文件 API 订阅命令语义，不做别名。
-    expect(DAEMON_COMMANDS.size).toBe(41);
+    expect(DAEMON_COMMANDS.size).toBe(42);
     expect(DAEMON_COMMANDS.has('/tabs')).toBe(false);
     expect(DAEMON_COMMANDS.has('/tab')).toBe(false);
   });
@@ -1069,6 +1085,11 @@ describe('EXISTING_SESSION_ONLY_DAEMON_COMMANDS set', () => {
   it('keeps /stop existing-session-only so it cannot create a phantom command session', () => {
     expect(EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has('/stop')).toBe(true);
     expect(DAEMON_COMMANDS.has('/stop')).toBe(true);
+  });
+
+  it('keeps /lane existing-session-only so status and cleanup never create a phantom session', () => {
+    expect(EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has('/lane')).toBe(true);
+    expect(DAEMON_COMMANDS.has('/lane')).toBe(true);
   });
 });
 
@@ -2260,6 +2281,219 @@ describe('handleCommand', () => {
   });
 
   // ─── /close ─────────────────────────────────────────────────────────────
+
+  describe('/lane', () => {
+    function mockShadowLane() {
+      const laneSession = makeSession({
+        sessionId: 'lane-session-b',
+        workingDir: '/home/testuser/project-wt-principal',
+        principalLane: {
+          version: 1,
+          laneId: 'lane-b',
+          sourceSessionId: 'sess-001',
+          principalKey: 'user:union:on_b',
+          principal: { senderType: 'user', kind: 'union', unionId: 'on_b' },
+          routingAnchor: 'principal-lane:lane-b',
+          displayTarget: { scope: 'chat', larkAppId: LARK_APP_ID, chatId: CHAT_ID },
+          workspaceEpoch: 1,
+          phase: 'active',
+          revision: 1,
+          createdAt: '2026-09-22T00:00:00.000Z',
+          updatedAt: '2026-09-22T00:00:00.000Z',
+        },
+      });
+      const worktree = {
+        version: 1,
+        materializationId: 'materialization-b',
+        sourceSessionId: 'sess-001',
+        laneId: 'lane-b',
+        sessionId: laneSession.sessionId,
+        principalKey: 'user:union:on_b',
+        workspaceEpoch: 1,
+        sourceCanonicalCwd: '/home/testuser/project',
+        sourceRepoRoot: '/home/testuser/project',
+        sourceGitCommonDir: '/home/testuser/project/.git',
+        sourceRelativeCwd: '',
+        worktreeRoot: '/home/testuser/project-wt-principal',
+        worktreeGitCommonDir: '/home/testuser/project/.git',
+        workingDir: '/home/testuser/project-wt-principal',
+        branch: 'wt/principal-lane-b',
+        baseRef: 'HEAD',
+        phase: 'ready',
+        revision: 1,
+        createdAt: '2026-09-22T00:00:00.000Z',
+        updatedAt: '2026-09-22T00:00:00.000Z',
+      };
+      vi.mocked(sessionStore.resolvePrincipalLaneForIngress).mockReturnValueOnce({
+        status: 'ready', laneId: 'lane-b', routingAnchor: 'principal-lane:lane-b',
+      } as never);
+      vi.mocked(sessionStore.hydratePrincipalLaneForIngress).mockResolvedValueOnce({
+        status: 'ready',
+        source: {},
+        lane: laneSession.principalLane,
+        session: laneSession,
+        runtimeRoutingAnchor: 'principal-lane:lane-b',
+        worktree,
+      } as never);
+      return { laneSession, worktree };
+    }
+
+    it('reports the caller lane branch, worktree and publication state', async () => {
+      mockShadowLane();
+      vi.mocked(worktreeSafetyStatus).mockResolvedValueOnce({
+        dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 2,
+        unpushedCommits: ['abc change'], fingerprint: 'lane-clean',
+      });
+      const deps = makeDeps(makeDaemonSession());
+
+      await handleCommand('/lane', ROOT_ID, makeLarkMessage('/lane status'), deps, LARK_APP_ID);
+
+      const reply = vi.mocked(deps.sessionReply).mock.calls[0]?.[1] as string;
+      expect(reply).toContain('wt/principal-lane-b');
+      expect(reply).toContain('/home/testuser/project-wt-principal');
+      expect(reply).toContain('未推送提交：2');
+    });
+
+    it('refuses close before confirmation when the lane has uncommitted files', async () => {
+      mockShadowLane();
+      vi.mocked(worktreeSafetyStatus).mockResolvedValueOnce({
+        dirty: true, dirtyCount: 1, dirtyFiles: ['src/dirty.ts'], ahead: 0,
+        unpushedCommits: [], fingerprint: 'lane-dirty',
+      });
+      const deps = makeDeps(makeDaemonSession());
+
+      await handleCommand('/lane', ROOT_ID, makeLarkMessage('/lane close'), deps, LARK_APP_ID);
+
+      const reply = vi.mocked(deps.sessionReply).mock.calls[0]?.[1] as string;
+      expect(reply).toContain('拒绝关闭');
+      expect(reply).toContain('src/dirty.ts');
+      expect(pushWorktreeBranch).not.toHaveBeenCalled();
+      expect(closeWorkerPoolSession).not.toHaveBeenCalled();
+    });
+
+    it('publishes committed work, retires routing, then reclaims the worktree', async () => {
+      const { laneSession } = mockShadowLane();
+      const beforePush = {
+        dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 1,
+        unpushedCommits: ['abc change'], fingerprint: 'lane-before-push',
+      };
+      const published = {
+        dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 0,
+        unpushedCommits: [], fingerprint: 'lane-published',
+      };
+      vi.mocked(worktreeSafetyStatus)
+        .mockResolvedValueOnce(beforePush)
+        .mockResolvedValueOnce(beforePush)
+        .mockResolvedValueOnce(published)
+        .mockResolvedValueOnce(published)
+        .mockResolvedValueOnce(published);
+      vi.mocked(sessionStore.retirePrincipalLane)
+        .mockReturnValueOnce({ status: 'ready' } as never)
+        .mockReturnValueOnce({ status: 'retired' } as never);
+      const deps = makeDeps(makeDaemonSession());
+      deps.activeSessions.set('lane-runtime', makeDaemonSession({ session: laneSession }));
+
+      await handleCommand(
+        '/lane',
+        ROOT_ID,
+        makeLarkMessage(`/lane close --yes --state=${laneCloseState('lane-before-push')}`),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(pushWorktreeBranch).toHaveBeenCalledWith(
+        '/home/testuser/project-wt-principal',
+        'wt/principal-lane-b',
+      );
+      expect(closeWorkerPoolSession).toHaveBeenCalledWith('lane-session-b');
+      expect(sessionStore.retirePrincipalLane).toHaveBeenNthCalledWith(1, expect.objectContaining({ dryRun: true }));
+      expect(sessionStore.retirePrincipalLane).toHaveBeenNthCalledWith(2, expect.not.objectContaining({ dryRun: true }));
+      expect(removeRepoWorktree).toHaveBeenCalledWith(
+        '/home/testuser/project',
+        '/home/testuser/project-wt-principal',
+      );
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('已关闭'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    it('preserves routing and worktree when worker close leaves a residual', async () => {
+      const { laneSession } = mockShadowLane();
+      const clean = {
+        dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 0,
+        unpushedCommits: [], fingerprint: 'lane-clean',
+      };
+      vi.mocked(worktreeSafetyStatus)
+        .mockResolvedValueOnce(clean)
+        .mockResolvedValueOnce(clean);
+      vi.mocked(sessionStore.retirePrincipalLane).mockReturnValueOnce({ status: 'ready' } as never);
+      vi.mocked(closeWorkerPoolSession).mockResolvedValueOnce({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'local_subtree_boundary_unproven' },
+        alreadyClosed: false,
+        known: true,
+      } as never);
+      const deps = makeDeps(makeDaemonSession());
+      deps.activeSessions.set('lane-runtime', makeDaemonSession({ session: laneSession }));
+
+      await handleCommand(
+        '/lane',
+        ROOT_ID,
+        makeLarkMessage(`/lane close --yes --state=${laneCloseState()}`),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(sessionStore.retirePrincipalLane).toHaveBeenCalledTimes(1);
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      expect(vi.mocked(deps.sessionReply).mock.calls[0]?.[1]).toContain('运行时残留');
+    });
+
+    it('preserves routing and worktree when a clean commit appears while close waits', async () => {
+      const { laneSession } = mockShadowLane();
+      const beforePush = {
+        dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 1,
+        unpushedCommits: ['abc change'], fingerprint: 'lane-before-push',
+      };
+      const published = {
+        dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 0,
+        unpushedCommits: [], fingerprint: 'lane-published',
+      };
+      const committedDuringClose = {
+        dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 1,
+        unpushedCommits: ['def late change'], fingerprint: 'lane-late-commit',
+      };
+      vi.mocked(worktreeSafetyStatus)
+        .mockResolvedValueOnce(beforePush)
+        .mockResolvedValueOnce(beforePush)
+        .mockResolvedValueOnce(published)
+        .mockResolvedValueOnce(committedDuringClose);
+      vi.mocked(sessionStore.retirePrincipalLane).mockReturnValueOnce({ status: 'ready' } as never);
+      const deps = makeDeps(makeDaemonSession());
+      deps.activeSessions.set('lane-runtime', makeDaemonSession({ session: laneSession }));
+
+      await handleCommand(
+        '/lane',
+        ROOT_ID,
+        makeLarkMessage(`/lane close --yes --state=${laneCloseState('lane-before-push')}`),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(pushWorktreeBranch).toHaveBeenCalledTimes(1);
+      expect(closeWorkerPoolSession).toHaveBeenCalledWith('lane-session-b');
+      expect(sessionStore.retirePrincipalLane).toHaveBeenCalledTimes(1);
+      expect(sessionStore.retirePrincipalLane).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true }));
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      expect(vi.mocked(deps.sessionReply).mock.calls[0]?.[1]).toContain('关闭期间');
+      expect(vi.mocked(deps.sessionReply).mock.calls[0]?.[1]).toContain('路由与 worktree 均已保留');
+    });
+  });
 
   describe('/close', () => {
     it('treats an existing App Server adopt as a BotMux-only disconnect', async () => {

@@ -36,6 +36,9 @@ export interface CreateRepoWorktreeOptions {
   worktreePath?: string;
   /** Reuse an existing linked worktree at `worktreePath` instead of failing. */
   reuseExisting?: boolean;
+  /** Keep an explicit deterministic branch local even if a same-named remote
+   * ref exists. Used for host-owned isolation identities, not user branches. */
+  ignoreRemoteBranch?: boolean;
 }
 
 async function git(args: string[], cwd: string, timeoutMs = 10_000): Promise<string> {
@@ -284,7 +287,7 @@ async function createRepoWorktreeUnlocked(
     return { path: wtPath, branch, baseRef: branch };
   }
 
-  if (opts.branch?.trim()) {
+  if (opts.branch?.trim() && !opts.ignoreRemoteBranch) {
     try {
       await git(['fetch', 'origin', branch], repo, 30_000);
     } catch (e) {
@@ -335,6 +338,9 @@ export async function createRepoWorktreeAndCommit<T>(
 ): Promise<{ creation: WorktreeCreation; result: T }> {
   const run = async () => {
     const creation = await createRepoWorktreeUnlocked(repoPath, opts);
+    if (opts.ignoreRemoteBranch) {
+      await tryGit(['branch', '--unset-upstream'], creation.path, 5_000);
+    }
     return { creation, result: await commit(creation) };
   };
   return opts.reuseExisting && opts.worktreePath
@@ -346,13 +352,16 @@ export async function createRepoWorktree(
   repoPath: string,
   opts: CreateRepoWorktreeOptions = {},
 ): Promise<WorktreeCreation> {
-  if (!opts.reuseExisting || !opts.worktreePath) {
-    return createRepoWorktreeUnlocked(repoPath, opts);
-  }
-  return withWorktreeTargetLock(
-    opts.worktreePath,
-    () => createRepoWorktreeUnlocked(repoPath, opts),
-  );
+  const run = async () => {
+    const creation = await createRepoWorktreeUnlocked(repoPath, opts);
+    if (opts.ignoreRemoteBranch) {
+      await tryGit(['branch', '--unset-upstream'], creation.path, 5_000);
+    }
+    return creation;
+  };
+  return !opts.reuseExisting || !opts.worktreePath
+    ? run()
+    : withWorktreeTargetLock(opts.worktreePath, run);
 }
 
 

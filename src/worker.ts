@@ -5109,31 +5109,32 @@ function readSendMarkers(): BridgeSendMarker[] {
   }
 }
 
-function explicitReplyMarkerForTurnWindow(
+function attributableExplicitReplyMarkersForTurnWindow(
+  turnId: string,
   turn: { markTimeMs: number | undefined; isLocal: boolean | undefined },
   nextBoundaryMs: number | undefined,
   markers: readonly BridgeSendMarker[],
   adoptMode: boolean,
-): BridgeSendMarker | undefined {
-  if (adoptMode || turn.isLocal || turn.markTimeMs === undefined) return undefined;
+): BridgeSendMarker[] {
+  if (adoptMode || turn.isLocal || turn.markTimeMs === undefined) return [];
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
-  const inWindow = markers.filter(marker => marker.sentAtMs >= lower && marker.sentAtMs < upper
-    && (marker.replyCardResponseKind === undefined || marker.replyCardResponseKind === 'final'));
-  return inWindow.at(-1);
+  return markers.filter(marker => marker.sentAtMs >= lower && marker.sentAtMs < upper
+    && marker.turnId === turnId);
 }
 
-function notifyExplicitReplyObserved(
+function notifyExplicitRepliesObserved(
   turnId: string,
-  marker: BridgeSendMarker | undefined,
+  markers: readonly BridgeSendMarker[],
 ): void {
-  if (!marker) return;
-  send({
-    type: 'explicit_reply_observed',
-    turnId,
-    ...(marker.messageId ? { messageId: marker.messageId } : {}),
-    ...(marker.responseKind ? { responseKind: marker.responseKind } : {}),
-  });
+  for (const marker of markers) {
+    send({
+      type: 'explicit_reply_observed',
+      turnId,
+      ...(marker.messageId ? { messageId: marker.messageId } : {}),
+      ...(marker.responseKind ? { responseKind: marker.responseKind } : {}),
+    });
+  }
 }
 
 // ─── Mojo final-answer bridge ───────────────────────────────────────────────
@@ -5190,6 +5191,10 @@ function deliverMojoTurnFinal(text: string): void {
     isLocal: false,
     finalText: text,
   };
+  notifyExplicitRepliesObserved(
+    turnId,
+    attributableExplicitReplyMarkersForTurnWindow(turnId, gateInput, undefined, markers, adoptMode),
+  );
   if (shouldSuppressBridgeEmit(gateInput, undefined, markers, adoptMode, replyDeliveryMode())) {
     log(
       `Mojo final bridge suppressed for turn ${turnId.substring(0, 12)} `
@@ -5198,10 +5203,6 @@ function deliverMojoTurnFinal(text: string): void {
     // Same as the structured bridge: an explicit send IS this turn's reply, so
     // tell observers rather than leaving them waiting on a final that the gate
     // deliberately swallowed.
-    notifyExplicitReplyObserved(
-      turnId,
-      explicitReplyMarkerForTurnWindow(gateInput, undefined, markers, adoptMode),
-    );
     return;
   }
   // Strip a trailing sentinel line: "prose + sentinel" with no send is the
@@ -6494,6 +6495,12 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     const lastUuid = turn.assistantUuids[turn.assistantUuids.length - 1];
 
     const gateInput = { markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, finalText: assistantText };
+    notifyExplicitRepliesObserved(
+      turn.turnId,
+      attributableExplicitReplyMarkersForTurnWindow(
+        turn.turnId, gateInput, nextBoundaryMs, markers, adoptMode,
+      ),
+    );
     if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
       // Completed turn whose output went out via `botmux send` (or deliberate
       // silence) — see the codex bridge's twin for why this must arm here.
@@ -6509,10 +6516,6 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
       if (!adoptMode && isBridgeNothingToSendFinal(assistantText)) {
         nothingToSendTurns.add(turn);
       }
-      notifyExplicitReplyObserved(
-        turn.turnId,
-        explicitReplyMarkerForTurnWindow(gateInput, nextBoundaryMs, markers, adoptMode),
-      );
       continue;
     }
 
@@ -8191,6 +8194,12 @@ function emitReadyCodexTurns(): void {
     // the most common success path of all. failed/ambiguous stay a no-op via
     // bridgeTurnOutcome, so a limit refusal never reads as success.
     const turnOutcome = bridgeTurnOutcome(turn);
+    notifyExplicitRepliesObserved(
+      turn.turnId,
+      attributableExplicitReplyMarkersForTurnWindow(
+        turn.turnId, gateInput, nextBoundaryMs, markers, adoptMode,
+      ),
+    );
     if (!content || shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
       usageLimitTracker.noteTurnCompleted(turnOutcome);
     }
@@ -8207,10 +8216,6 @@ function emitReadyCodexTurns(): void {
       if (!adoptMode && isBridgeNothingToSendFinal(turn.finalText)) {
         nothingToSendTurns.add(turn);
       }
-      notifyExplicitReplyObserved(
-        turn.turnId,
-        explicitReplyMarkerForTurnWindow(gateInput, nextBoundaryMs, markers, adoptMode),
-      );
       continue;
     }
     // NON-ADOPT only: strip a trailing sentinel line so the literal token never
@@ -10437,6 +10442,12 @@ async function handleTrustedCodexAppMarker(
       // be invisible and a longer-than-send narration would leak (same class as
       // the transcript-path bug this fixes).
       const gateInput = { markTimeMs: startedAtMs, isLocal: false, finalText: finalContent };
+      notifyExplicitRepliesObserved(
+        turnId,
+        attributableExplicitReplyMarkersForTurnWindow(
+          turnId, gateInput, completedAtMs + 5_001, suppressMarkers, false,
+        ),
+      );
       suppressDelivery = suppressDelivery || shouldSuppressBridgeEmit(
         gateInput,
         completedAtMs + 5_001,
@@ -10453,10 +10464,6 @@ async function handleTrustedCodexAppMarker(
         // suppressDelivery:true, which the daemon short-circuits WITHOUT calling
         // deliverFinalOutput — the only site that otherwise marks run-preview
         // replied — so without this the preview shows "running" forever (F3).
-        notifyExplicitReplyObserved(
-          turnId,
-          explicitReplyMarkerForTurnWindow(gateInput, completedAtMs + 5_001, suppressMarkers, false),
-        );
       }
     }
 

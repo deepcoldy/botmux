@@ -2353,6 +2353,9 @@ export interface RoutingContext {
    *  replace it with a daemon-owned synthetic anchor for a dedicated receiver
    *  session; the visible chatId/scope remain unchanged. */
   anchor: string;
+  /** Daemon-only validated principal-lane registry key. Never derived from the
+   * event and never used as a Lark destination. */
+  runtimeRoutingAnchor?: string;
   /** The inbound message was sent at the top level of a regular group. This
    * remains true in `new-topic` mode even though its conversational route was
    * rewritten to a fresh thread, allowing sessionless group UI to stay flat. */
@@ -2602,6 +2605,13 @@ async function dispatchHumanMessageViaHandlers(
   if (key) pendingMessageTriggers.add(key);
   let completed = false;
   try {
+    const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId)
+      ?? payload.ownsSession;
+    if (handlers.handlePrincipalLaneMessage
+        && await handlers.handlePrincipalLaneMessage(payload.data, payload.ctx, ownsSession)) {
+      completed = true;
+      return;
+    }
     await serializeByAnchor(payload.ctx.anchor, () => {
       const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId) ?? payload.ownsSession;
       return ownsSession
@@ -2618,6 +2628,8 @@ async function dispatchHumanMessageViaHandlers(
     if (key) pendingMessageTriggers.delete(key);
   }
 }
+
+export const __testOnly_dispatchHumanMessageViaHandlers = dispatchHumanMessageViaHandlers;
 
 async function dispatchPolledMessageListenerMatch(input: {
   larkAppId: string;
@@ -2755,6 +2767,14 @@ export interface EventHandlers {
   /** Validate a syntactically valid topic header before routing mutates scope.
    * The daemon supplies the same semantic resolver used by handleNewTopic. */
   validateTopicHeader?: (header: import('../../core/topic-header.js').TopicHeader, larkAppId: string) => boolean;
+  /** Optional live principal-lane adapter. It runs after dispatcher trust and
+   * message-shape gates but before the legacy chat-anchor serializer. Returning
+   * false preserves the legacy path byte-for-byte. */
+  handlePrincipalLaneMessage?: (
+    data: any,
+    ctx: RoutingContext,
+    ownsSession: boolean,
+  ) => Promise<boolean>;
   /** 主动开工 — 场景①: fired when this bot is added to a chat
    *  (`im.chat.member.bot.added_v1`). The daemon decides whether to auto-start
    *  based on the bot's `autoStartOnGroupJoin` toggle + allowedUser membership.
