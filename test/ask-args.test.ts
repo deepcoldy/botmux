@@ -15,6 +15,7 @@ import {
   parseAskOptions,
   parseAskTimeoutSeconds,
 } from '../src/core/ask-args.js';
+import { rejectsFrozenCommandLifecycleAsk } from '../src/core/frozen-command-guidance.js';
 
 describe('parseAskOptions', () => {
   it('parses bare keys with key==label', () => {
@@ -163,6 +164,40 @@ describe('normalizeAskDispatch', () => {
     const bare = normalizeAskDispatch(['--options', 'yes,no', 'p']);
     const explicit = normalizeAskDispatch(['buttons', '--options', 'yes,no', 'p']);
     expect(bare.rest).toEqual(explicit.rest);
+  });
+});
+
+describe('rejectsFrozenCommandLifecycleAsk', () => {
+  it('rejects the generic confirmation shape that caused duplicate approval cards', () => {
+    expect(rejectsFrozenCommandLifecycleAsk(
+      '确认安装固化命令 /近30天注册且激活商户数 吗？',
+      [
+        { key: 'confirm', label: '确认安装' },
+        { key: 'cancel', label: '取消' },
+      ],
+    )).toBe(true);
+  });
+
+  it('rejects update and retirement approvals in English and Chinese', () => {
+    expect(rejectsFrozenCommandLifecycleAsk(
+      '是否确认更新这个固定查询？',
+      [{ key: 'yes', label: '继续' }, { key: 'no', label: '取消' }],
+    )).toBe(true);
+    expect(rejectsFrozenCommandLifecycleAsk(
+      'Approve update of this frozen command?',
+      [{ key: 'approve', label: 'Approve' }, { key: 'cancel', label: 'Cancel' }],
+    )).toBe(true);
+  });
+
+  it('does not block ordinary questions or non-lifecycle discussions', () => {
+    expect(rejectsFrozenCommandLifecycleAsk(
+      '确认发布普通报告吗？',
+      [{ key: 'confirm', label: '确认' }, { key: 'cancel', label: '取消' }],
+    )).toBe(false);
+    expect(rejectsFrozenCommandLifecycleAsk(
+      '你是否了解固化命令？',
+      [{ key: 'yes', label: '了解' }, { key: 'no', label: '不了解' }],
+    )).toBe(false);
   });
 });
 

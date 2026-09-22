@@ -20,6 +20,7 @@ import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { buildBotmuxShellHints, buildCredentialBoundaryBlock } from '../adapters/cli/shared-hints.js';
 import { effectiveReplyDelivery, type ReplyDelivery } from './reply-delivery.js';
+import { frozenCommandSkillHintForMessage } from './frozen-command-guidance.js';
 import {
   resolveSkillInjectionModeForApp,
   builtinSkillEntries,
@@ -1258,7 +1259,7 @@ type NewTopicOpts = {
   selfMention?: { name?: string | null; openId?: string | null };
 };
 
-type NewTopicBlockKey = 'routing' | 'skill' | 'identity' | 'credentials' | 'sessionId' | 'role'
+type NewTopicBlockKey = 'routing' | 'skill' | 'capability' | 'identity' | 'credentials' | 'sessionId' | 'role'
   | 'summaryMemory' | 'whiteboard' | 'chatContextPolicy' | 'chatContext'
   | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments'
   | 'mentions' | 'availableBots';
@@ -1357,6 +1358,9 @@ function buildNewTopicBlocks(
     locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, locale);
+  const frozenCommandHint = frozenCommandSkillHintForMessage(
+    [userMessage, ...(followUps ?? [])].join('\n\n'),
+  );
   const chatContextPolicyBlock = renderChatContextPolicyBlock(opts?.chatContext, locale);
   const chatContextBlock = renderChatContextBlock(opts?.chatContext);
 
@@ -1415,6 +1419,7 @@ function buildNewTopicBlocks(
   }
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
   if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
+  if (frozenCommandHint) blocks.push({ key: 'capability', text: frozenCommandHint });
   if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
   if (chatContextPolicyBlock) blocks.push({ key: 'chatContextPolicy', text: chatContextPolicyBlock });
   if (chatContextBlock) blocks.push({ key: 'chatContext', text: chatContextBlock });
@@ -1556,6 +1561,9 @@ export function buildNewTopicCliInput(
     locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, locale);
+  const frozenCommandHint = frozenCommandSkillHintForMessage(
+    [userMessage, ...(followUps ?? [])].join('\n\n'),
+  );
   const senderBlock = renderSenderTag(sender, opts?.larkAppId);
   const substitutePolicyBlock = renderSubstitutePolicy(opts?.substituteTrigger);
   const substituteTargetBlock = renderSubstituteTarget(opts?.substituteTrigger);
@@ -1569,7 +1577,7 @@ export function buildNewTopicCliInput(
     ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     codexAppInput: buildCodexAppTurnInput({
       text: [opts?.codexAppText ?? userMessage, ...(opts?.codexAppFollowUps ?? [])].join('\n\n'),
-      roleBlock: [roleBlock, summaryMemoryBlock].filter(Boolean).join('\n\n'),
+      roleBlock: [roleBlock, summaryMemoryBlock, frozenCommandHint].filter(Boolean).join('\n\n'),
       whiteboardBlock,
       senderBlock,
       substitutePolicyBlock,
@@ -1592,7 +1600,7 @@ export function buildNewTopicCliInput(
  * Mirrors buildNewTopicPrompt structure but for subsequent messages.
  * Session ID is omitted for adopt mode and CLIs with injectsSessionContext.
  */
-type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'reminder' | 'whiteboard' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
+type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'capability' | 'reminder' | 'whiteboard' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
 
 /**
  * 按既有顺序构造 follow-up 的各个块。inline 模式直接 join；hook 模式
@@ -1653,6 +1661,7 @@ function buildFollowUpBlocks(
     locale: opts?.locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, opts?.locale);
+  const frozenCommandHint = frozenCommandSkillHintForMessage(content);
   const skipSessionId = opts?.isAdoptMode || (opts?.cliId
     ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
     : false);
@@ -1665,6 +1674,7 @@ function buildFollowUpBlocks(
   if (!skipSessionId) blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
   if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
+  if (frozenCommandHint) blocks.push({ key: 'capability', text: frozenCommandHint });
   // transcript：不注入 reminder（判定同样落在 KEY 选择层，hook 模式的 sidecar 自然为空
   // → buildFollowUpCliInput 回退 inline 且不写 sidecar）。
   if (opts?.cliId !== 'mira' && !transcript) {
@@ -1897,6 +1907,7 @@ export function buildFollowUpCliInput(
     locale: opts.locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts.larkAppId, opts.locale);
+  const frozenCommandHint = frozenCommandSkillHintForMessage(content);
   const senderBlock = renderSenderTag(opts.sender, opts.larkAppId);
   const substitutePolicyBlock = renderSubstitutePolicy(opts.substituteTrigger);
   const substituteTargetBlock = renderSubstituteTarget(opts.substituteTrigger);
@@ -1907,7 +1918,7 @@ export function buildFollowUpCliInput(
     ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     codexAppInput: buildCodexAppTurnInput({
       text: opts.codexAppText ?? content,
-      roleBlock: [roleBlock, summaryMemoryBlock].filter(Boolean).join('\n\n'),
+      roleBlock: [roleBlock, summaryMemoryBlock, frozenCommandHint].filter(Boolean).join('\n\n'),
       whiteboardBlock,
       senderBlock,
       substitutePolicyBlock,

@@ -5,6 +5,7 @@ const daemon = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8'
 const cli = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
 const ipc = readFileSync(new URL('../src/core/dashboard-ipc-server.ts', import.meta.url), 'utf8');
 const skill = readFileSync(new URL('../src/skills/definitions.ts', import.meta.url), 'utf8');
+const guidance = readFileSync(new URL('../src/core/frozen-command-guidance.ts', import.meta.url), 'utf8');
 
 describe('Frozen Command natural-language P0a wiring', () => {
   it('requires capability or host HMAC plus an exact daemon-owned human turn snapshot', () => {
@@ -49,5 +50,11 @@ describe('Frozen Command natural-language P0a wiring', () => {
     expect(skill).toContain('botmux freeze apply');
     expect(skill).toContain('botmux freeze rm');
     expect(skill).toContain('点击取消或超时则不改动当前生效版本');
+  });
+
+  it('prevents a generic ask card from replacing the host lifecycle confirmation', () => {
+    expect(cli).toContain('rejectsFrozenCommandLifecycleAsk(prompt, options)');
+    expect(cli).toContain('不要用通用 ask 代替生命周期确认');
+    expect(guidance).toContain('Do not use `botmux ask` for this confirmation');
   });
 });

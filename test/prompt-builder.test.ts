@@ -128,6 +128,23 @@ describe('buildNewTopicPrompt', () => {
     expect(prompt).toContain(`<session_id>${SESSION_ID}</session_id>`);
   });
 
+  it('injects the one-click frozen-command lifecycle hint on a matching opening turn', () => {
+    const prompt = buildNewTopicPrompt(
+      '把刚才这个固化成 /近30天注册且激活商户数',
+      SESSION_ID,
+      'codex',
+    );
+    expect(prompt).toContain('<botmux_capability_hint name="botmux-freeze">');
+    expect(prompt).toContain('botmux skill show botmux-freeze');
+    expect(prompt).toContain('Do not use `botmux ask`');
+    expect(prompt.indexOf('<botmux_capability_hint')).toBeLessThan(prompt.indexOf('<user_message>'));
+  });
+
+  it('does not inject the frozen-command hint on unrelated opening turns', () => {
+    expect(buildNewTopicPrompt('帮我解释一下查询结果', SESSION_ID, 'codex'))
+      .not.toContain('<botmux_capability_hint name="botmux-freeze">');
+  });
+
   it('delivers ebsd diagnosis text inside a non-command service envelope', () => {
     const prompt = buildNewTopicPrompt(
       '诊断这个卷',
@@ -400,6 +417,17 @@ describe('buildFollowUpContent', () => {
   it('should include <session_id> in normal mode', () => {
     const content = buildFollowUpContent('hello', SESSION_ID);
     expect(content).toContain(`<session_id>${SESSION_ID}</session_id>`);
+  });
+
+  it('refreshes the frozen-command lifecycle hint inside an existing session', () => {
+    const content = buildFollowUpContent(
+      '把这个固化为 /近30天注册且激活商户数',
+      SESSION_ID,
+      { cliId: 'codex' },
+    );
+    expect(content).toContain('<botmux_capability_hint name="botmux-freeze">');
+    expect(content).toContain('host emits the single authoritative lifecycle card');
+    expect(content.indexOf('<botmux_capability_hint')).toBeLessThan(content.indexOf('<user_message>'));
   });
 
   it('should include <session_id> when isAdoptMode is false', () => {

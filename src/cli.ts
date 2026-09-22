@@ -13431,6 +13431,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
 
   const { findMissingAskEnv, parseAskOptions, parseAskTimeoutSeconds, AskArgsError } =
     await import('./core/ask-args.js');
+  const { rejectsFrozenCommandLifecycleAsk } = await import('./core/frozen-command-guidance.js');
   type AskJsonOutput = import('./core/ask-types.js').AskJsonOutput;
   const { toLegacySelected, isCustomReply } = await import('./core/ask-types.js');
 
@@ -13466,6 +13467,14 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   if (!prompt) {
     console.error(
       'botmux ask: 缺少 prompt。用法: botmux ask buttons --options "yes,no" "继续发版吗？"',
+    );
+    process.exit(2);
+  }
+  if (rejectsFrozenCommandLifecycleAsk(prompt, options)) {
+    console.error(
+      'botmux ask: 固化命令的创建、更新和生命周期操作必须使用宿主专用确认卡。' +
+        ' 请先运行 `botmux skill show botmux-freeze`，再按说明使用 `botmux freeze apply|rm|restore|purge`；' +
+        ' 不要用通用 ask 代替生命周期确认。',
     );
     process.exit(2);
   }
