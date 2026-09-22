@@ -189,6 +189,20 @@ describe('rejectsFrozenCommandLifecycleAsk', () => {
     )).toBe(true);
   });
 
+  it.each([
+    '把刚才的查询固化成 /泰国上账，确认吗？',
+    '是否确认安装 /泰国上账 这个命令？',
+    '确认把刚才这个固化为 /泰国上账？',
+    '要把 /泰国上账 废弃吗？',
+    'Confirm creating frozen command /thai?',
+    'Confirm updating frozen command /thai?',
+  ])('rejects natural lifecycle wording: %s', prompt => {
+    expect(rejectsFrozenCommandLifecycleAsk(
+      prompt,
+      [{ key: 'yes', label: '确认' }, { key: 'no', label: '取消' }],
+    )).toBe(true);
+  });
+
   it('does not block ordinary questions or non-lifecycle discussions', () => {
     expect(rejectsFrozenCommandLifecycleAsk(
       '确认发布普通报告吗？',
@@ -197,6 +211,10 @@ describe('rejectsFrozenCommandLifecycleAsk', () => {
     expect(rejectsFrozenCommandLifecycleAsk(
       '你是否了解固化命令？',
       [{ key: 'yes', label: '了解' }, { key: 'no', label: '不了解' }],
+    )).toBe(false);
+    expect(rejectsFrozenCommandLifecycleAsk(
+      '确认更新 /api/users 接口吗？',
+      [{ key: 'yes', label: '确认' }, { key: 'no', label: '取消' }],
     )).toBe(false);
   });
 });

@@ -160,6 +160,34 @@ describe('Codex App clean prompt sidecar', () => {
     expect(built.codexAppInput?.additionalContext?.botmux_attachments.value).toContain('/tmp/readme.md');
   });
 
+  it('injects the frozen-command capability hint into a Codex App opening turn', () => {
+    const built = buildNewTopicCliInput(
+      '把刚才的查询固化成 /泰国上账',
+      'sid-frozen-opening',
+      'codex-app',
+    );
+
+    expect(built.codexAppInput?.text).toBe('把刚才的查询固化成 /泰国上账');
+    expect(built.codexAppInput?.additionalContext?.botmux_role.value)
+      .toContain('<botmux_capability_hint name="botmux-freeze">');
+    expect(built.codexAppInput?.additionalContext?.botmux_role.value)
+      .toContain('Do not use `botmux ask`');
+  });
+
+  it('injects the frozen-command capability hint into a Codex App follow-up', () => {
+    const built = buildFollowUpCliInput(
+      '确认把刚才这个固化为 /泰国上账',
+      'sid-frozen-follow-up',
+      { cliId: 'codex-app' },
+    );
+
+    expect(built.codexAppInput?.text).toBe('确认把刚才这个固化为 /泰国上账');
+    expect(built.codexAppInput?.additionalContext?.botmux_role.value)
+      .toContain('<botmux_capability_hint name="botmux-freeze">');
+    expect(built.codexAppInput?.additionalContext?.botmux_role.value)
+      .toContain('single authoritative lifecycle card');
+  });
+
   it('injects conservative summary.md reuse rules when summary memory is enabled', () => {
     registerBot({
       larkAppId: 'summary-memory-prompt',
