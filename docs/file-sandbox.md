@@ -38,7 +38,8 @@ macOS 没有 per-process 挂载命名空间、Seatbelt 也没有「写重定向�
 - 克隆 HOME 里每个顶层条目默认是一条指向真实文件的**符号链接**（读取原生、零拷贝；TCC/iCloud 树永不遍历，挂死/权限问题从根上消失）。
 - 克隆采用**策展制 + 主动降级**（真机 145 万文件点目录实测后定的，避免一个 ~/.gitlog 100 万文件拖 20 分钟）：
   - **核心 CLI 状态目录必需克隆**（失败 fail-closed）：`.claude`/`.codex`/`.trae`/`.trae-cn`/`.claude-runtime` + 顶层 dotfile（含每次更新的 `.claude.json`）+ 工作项目本身；
-  - 其它点目录（`.npm`/`.bun`/`.cache`/`.cargo`/`.config`/大体积历史目录等）**尽力克隆**：`cp -c` 45 秒超时、TCC 拒绝（如 `.Trash`）或任何失败 → 自动**降级成软链并对真实路径加 write-deny**（读原生但写 EPERM，绝不静默写穿真机）；
+  - 仅 `.config`/`.local` 两个用户配置目录做**短超时（20s）尽力克隆**，超时/TCC 失败同样降级软链+write-deny；
+  - **其它点目录（`.npm`/`.bun`/`.cache`/`.cargo`/`.gradle`/`.konan`/大体积历史目录如 `.gitlog` 等）默认直接软链 + write-seal**（读原生、写 EPERM，CLI 多会自愈重下/重建），不克隆——真机实测这些是几十万文件级、克隆它们就是分钟级 spawn 的主体；需要让某个缓存目录也即焚可后续加配置；
   - 非点目录（Desktop/Documents/Library/Containers…）与 `.Trash` 一律软链 + write 封口；
   - 凭证根（\$HOME/.botmux、自定义 BOTMUX_HOME、HOME 下的 data 父目录、用户 deny 命中的顶层目录）**永不克隆**，保持软链。
 - 封口用**三段规则序**（Seatbelt 最后匹配生效，真机 9/9 验证）：① 凭证根先 read+write 广封；② 再重开本会话克隆树/tmp/outbox/shim 的 read+write（所以 dataDir 在 ~/.botmux/data 下也能工作）；③ 文件级凭证（bots.json、sidecar、dashboard secret）read+write 与降级子树/`~/Library/Caches/claude-cli-nodejs` 的 write-deny 放最后。symlink 写操作按解析后真实路径匹配（11 种 symlink/hardlink 变体 + 子进程现造链接真机全拦，硬链接也被 clonefile 切断）。

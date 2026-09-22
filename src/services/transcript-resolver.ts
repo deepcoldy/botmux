@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import type { CliId } from '../adapters/cli/types.js';
@@ -84,6 +84,23 @@ function realCwd(cwd: string): string {
   try { return realpathSync(expanded); } catch { return resolve(expanded); }
 }
 
+/** Claude truncates a long (over 200-char) project slug and appends an opaque
+ *  6-char hash suffix (custom algorithm, non-reproducible). For a KNOWN
+ *  session id locate the jsonl by globbing the truncated project prefix plus
+ *  the session UUID file name — collision-free regardless of the hash. */
+function findClaudeJsonlByGlob(projectsDir: string, slug: string, sessionId: string): string | null {
+  if (slug.length <= 200) return null;
+  const prefix = slug.slice(0, 200);
+  let entries: string[];
+  try { entries = readdirSync(projectsDir); } catch { return null; }
+  const target = `${sessionId}.jsonl`;
+  const hits = entries
+    .filter(name => name === prefix || name.startsWith(`${prefix}-`))
+    .map(name => join(projectsDir, name, target))
+    .filter(p => existsSync(p));
+  return hits.length === 1 ? hits[0]! : null;
+}
+
 export function getClaudeSessionJsonlPath(
   sessionId: string,
   cwd: string,
@@ -100,13 +117,22 @@ export function getClaudeSessionJsonlPath(
   const projectsDir = join(dataDir, 'projects');
   const projectDir = join(projectsDir, projectKey);
   const jsonlPath = join(projectDir, `${sessionId}.jsonl`);
-  if (!opts?.noFollow) return existsSync(jsonlPath) ? jsonlPath : null;
-  return isDirectoryNoFollow(dataDir)
+  if (!opts?.noFollow) {
+    if (existsSync(jsonlPath)) return jsonlPath;
+    return findClaudeJsonlByGlob(projectsDir, projectKey, sessionId);
+  }
+  if (isDirectoryNoFollow(dataDir)
     && isDirectoryNoFollow(projectsDir)
     && isDirectoryNoFollow(projectDir)
-    && regularFileMtime(jsonlPath) !== null
-    ? jsonlPath
-    : null;
+    && regularFileMtime(jsonlPath) !== null) {
+    return jsonlPath;
+  }
+  // Long-slug truncated project dir: regularFileMtime on the exact path misses.
+  if (isDirectoryNoFollow(projectsDir)) {
+    const globbed = findClaudeJsonlByGlob(projectsDir, projectKey, sessionId);
+    if (globbed && regularFileMtime(globbed) !== null) return globbed;
+  }
+  return null;
 }
 
 /** Resolve a Claude-family fork's (seed / relay) data root EXACTLY as the worker

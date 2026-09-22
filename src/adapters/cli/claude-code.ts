@@ -91,6 +91,28 @@ export function claudeJsonlPathForSession(sessionId: string, cwd: string, dataDi
   return join(dataDir, 'projects', projectHash, `${sessionId}.jsonl`);
 }
 
+/** Resolve the actual jsonl path, handling Claude's long-cwd truncation: for a
+ *  >200-char slug the project dir is `slug[0:200]-<opaque6>`, so glob by the
+ *  session UUID (collision-free) instead of guessing the hash. Returns the
+ *  exact slug path when it exists (normal case), the unique glob hit for long
+ *  slugs, or null when absent/ambiguous. */
+export function resolveClaudeJsonlPath(sessionId: string, cwd: string, dataDir: string = DEFAULT_CLAUDE_DATA_DIR): string | null {
+  const exact = claudeJsonlPathForSession(sessionId, cwd, dataDir);
+  if (existsSync(exact)) return exact;
+  const projectHash = realpathCwd(cwd).replace(/[^A-Za-z0-9-]/g, '-');
+  if (projectHash.length <= 200) return null;
+  const projectsDir = join(dataDir, 'projects');
+  const target = `${sessionId}.jsonl`;
+  let entries: string[];
+  try { entries = readdirSync(projectsDir); } catch { return null; }
+  const prefix = projectHash.slice(0, 200);
+  const hits = entries
+    .filter(name => name === projectHash || name.startsWith(`${prefix}-`))
+    .map(name => join(projectsDir, name, target))
+    .filter(p => existsSync(p));
+  return hits.length === 1 ? hits[0]! : null;
+}
+
 /** The `<dataDir>/projects/<cwd-hash>` dir holding this cwd's transcripts (and its
  *  `memory/` subdir). Read isolation ALLOWs this back in under the whole-process
  *  Seatbelt wrapper — the projects tree is denied, then the bot's OWN project dir

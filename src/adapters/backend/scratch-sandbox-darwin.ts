@@ -58,9 +58,9 @@ import type { ScratchPathMapping } from '../../services/scratch-host-view.js';
 export type ScratchStorage = 'disk';
 
 /** Max time a single clonefile subtree copy may take. Core CLI dirs get the
- *  full budget; best-effort dot-dirs get a shorter one before degrading. */
+ *  full budget; best-effort config dirs get a short one before degrading. */
 const CLONE_TIMEOUT_CORE_MS = 5 * 60_000;
-const CLONE_TIMEOUT_BESTEFFORT_MS = 45_000;
+const CLONE_TIMEOUT_BESTEFFORT_MS = 20_000;
 
 /** CLI state dirs cloned REQUIRED (fail-closed): sessions/auth/config of the
  *  supported CLIs must be writable COW for scratch to function. */
@@ -70,6 +70,17 @@ const CORE_CLONE_HOME_DIRS = new Set([
   '.trae',
   '.trae-cn',
   '.claude-runtime',
+]);
+
+/** User-config dirs cloned BEST-EFFORT (bounded; degrade to a write-sealed
+ *  symlink on timeout/TCC). Caches/package managers/toolchains are NOT here
+ *  — on a real dev account they hold hundreds of thousands of files (cargo
+ *  registry, gradle/konan caches, bun/npm cache) and dominate spawn time;
+ *  CLIs tolerate their writes failing (they re-download/rebuild) far better
+ *  than a 7-minute session start, so they default to sealed symlinks. */
+const BEST_EFFORT_CLONE_DIRS = new Set([
+  '.config',
+  '.local',
 ]);
 
 /** Top-level dot-dirs NEVER cloned (TCC-protected / virtual / guaranteed
@@ -381,9 +392,19 @@ export function prepareMacScratchSandbox(opts: PrepareMacScratchOpts): MacScratc
         symlinkEntry(realEntry, linkInClone);
         degradedWriteDeny.add(realEntry);
       } else if (name.startsWith('.')) {
-        // Core CLI state dirs = required; other dot-dirs best-effort (bounded,
-        // degrade to sealed symlink on TCC/timeout instead of failing spawn).
-        cloneOrDegrade(realEntry, linkInClone, CORE_CLONE_HOME_DIRS.has(name) ? 'core' : 'besteffort');
+        // Core CLI state dirs = required (fail-closed); a couple of user-config
+        // dirs = bounded best-effort; ALL OTHER dot-dirs (caches, package
+        // managers, toolchains, history trees) are read-native symlinks with a
+        // write seal — cloning them on a real account costs minutes and huge
+        // metadata for no isolation benefit.
+        if (CORE_CLONE_HOME_DIRS.has(name)) {
+          cloneOrDegrade(realEntry, linkInClone, 'core');
+        } else if (BEST_EFFORT_CLONE_DIRS.has(name)) {
+          cloneOrDegrade(realEntry, linkInClone, 'besteffort');
+        } else {
+          symlinkEntry(realEntry, linkInClone);
+          degradedWriteDeny.add(realEntry);
+        }
       } else {
         // Non-dot dirs (Library/Documents/Desktop…): read-native, write sealed.
         symlinkEntry(realEntry, linkInClone);
