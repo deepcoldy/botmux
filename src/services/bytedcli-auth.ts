@@ -26,10 +26,12 @@
  * it internally; a person is only interrupted when the 3-week login really ends.
  *
  * So: nothing in this module holds a credential. It holds a path, and shells
- * out to `bytedcli` with `HOME` set to it.
+ * out to `bytedcli` with `HOME` set to it. When a governed call finds no usable
+ * login, Botmux starts the device flow automatically; after the person opens
+ * that link, the next retry completes the saved challenge before minting JWTs.
  */
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -65,9 +67,21 @@ export function bytedcliHomeFor(openId: string): string {
 }
 
 /** Whether this person has ever completed a bytedcli login here. Cheap enough
- *  to call per turn; says nothing about whether that login is still valid. */
+ *  to call per turn; says nothing about whether that login is still valid.
+ *
+ *  The bare HOME does NOT count: {@link runAsUser} mkdirs it on every call, so
+ *  a single (even failed) `--begin` would otherwise read as "authorized" until
+ *  the directory was manually removed. bytedcli writes the SSO credential at
+ *  the data root (`~/.local/share/bytedcli/token.json`, `token.<env>.json` for
+ *  other SSO environments, `sso_session*.json` for the browser-session flow);
+ *  only one of those proves a login happened. */
 export function hasBytedcliHome(openId: string): boolean {
-  try { return existsSync(bytedcliHomeFor(openId)); } catch { return false; }
+  try {
+    const dataRoot = join(bytedcliHomeFor(openId), '.local', 'share', 'bytedcli');
+    if (!existsSync(dataRoot)) return false;
+    return readdirSync(dataRoot).some(f =>
+      /^token(\.[a-z0-9-]+)?\.json$/.test(f) || /^sso_session(\.[a-z0-9-]+)?\.json$/.test(f));
+  } catch { return false; }
 }
 
 /** Forget one person's bytedcli authorization entirely. */
@@ -148,21 +162,28 @@ function challengePath(openId: string): string {
 /** The resume token from this person's in-progress login, if it is still
  *  usable. ByteCloud gives the challenge about an hour; we expire slightly
  *  earlier so a token we hand back is not rejected the moment it is used. */
-export function pendingBytedcliChallenge(openId: string): string | null {
+function pendingBytedcliLogin(openId: string): BytedcliLoginChallenge | null {
   try {
     const raw = JSON.parse(readFileSync(challengePath(openId), 'utf8')) as
-      { token?: unknown; createdAt?: unknown };
+      { token?: unknown; authUrl?: unknown; createdAt?: unknown };
     if (typeof raw.token !== 'string' || typeof raw.createdAt !== 'number') return null;
     if (Date.now() - raw.createdAt > CHALLENGE_TTL_MS) return null;
-    return raw.token;
+    return {
+      completeToken: raw.token,
+      authUrl: typeof raw.authUrl === 'string' ? raw.authUrl : '',
+    };
   } catch { return null; }
 }
 
-function saveChallenge(openId: string, token: string): void {
+export function pendingBytedcliChallenge(openId: string): string | null {
+  return pendingBytedcliLogin(openId)?.completeToken ?? null;
+}
+
+function saveChallenge(openId: string, token: string, authUrl: string): void {
   try {
     atomicWriteFileSync(
       challengePath(openId),
-      JSON.stringify({ token, createdAt: Date.now() }),
+      JSON.stringify({ token, authUrl, createdAt: Date.now() }),
       { mode: 0o600 },
     );
   } catch (e) {
@@ -184,13 +205,17 @@ export interface BytedcliLoginChallenge {
 }
 
 /**
- * Start a login for one person and return the link to send them.
+ * Start a login for one person and return the link to send them. An unfinished,
+ * still-valid challenge is reused so repeated turns do not create new links.
  *
  * Non-blocking (`--begin`): the CLI returns immediately with a resume token
  * instead of holding a terminal open waiting for a scan, which is the only
  * shape that works when the person authorizing is on the other side of a chat.
  */
 export async function beginBytedcliLogin(openId: string): Promise<BytedcliLoginChallenge | null> {
+  const pending = pendingBytedcliLogin(openId);
+  if (pending?.authUrl) return pending;
+
   const { ok, stdout, stderr } = await runAsUser(openId, ['auth', 'login', '--begin', '--json']);
   const env = parseEnvelope(stdout);
   const data = env?.data as Record<string, unknown> | undefined;
@@ -202,7 +227,7 @@ export async function beginBytedcliLogin(openId: string): Promise<BytedcliLoginC
     logger.warn(`[bytedcli-auth] could not start a login: ${stderr.trim() || stdout.trim() || 'no output'}`);
     return null;
   }
-  saveChallenge(openId, completeToken);
+  saveChallenge(openId, completeToken, authUrl);
   return { authUrl, completeToken };
 }
 
@@ -226,6 +251,9 @@ export async function completeBytedcliLogin(
   const data = env?.data as Record<string, unknown> | undefined;
   if (ok && data?.status === 'pending') return { state: 'pending' };
   if (ok) { clearChallenge(openId); return { state: 'authorized' }; }
+  // Terminal (not pending): re-polling the same token cannot succeed. Drop it so
+  // the next begin issues a fresh link instead of wedging on a dead token.
+  clearChallenge(openId);
   const detail = (env?.error as Record<string, unknown> | undefined)?.message;
   return {
     state: 'failed',
@@ -247,10 +275,23 @@ export interface BytedcliJwts {
  * internally when it is expiring, so asking each time is what keeps a person
  * from being sent back to a QR code every couple of hours.
  *
- * Returns null when the person's login has ended (or never happened), which the
- * caller turns into the ordinary "authorize, then retry" refusal.
+ * If an automatic device login is pending, first try to complete it. This makes
+ * "open the link, then retry" sufficient; `/login bytedcli done` remains a
+ * compatibility path, not a required user step.
+ *
+ * The completion is BEST-EFFORT, never a gate: a still-pending (or just-failed)
+ * challenge says nothing about whether this person already has a valid login,
+ * and returning null here would lock an already-authorized person out — a
+ * single transient blip can auto-begin a challenge on the refusal path, and a
+ * non-authorized poll result must not then veto the perfectly good HOME below
+ * (which is also the only thing that can clear that state). So regardless of
+ * the poll outcome, fall through and let the HOME / JWT read be the authority.
  */
 export async function mintBytedcliJwts(openId: string): Promise<BytedcliJwts | null> {
+  const challenge = pendingBytedcliChallenge(openId);
+  if (challenge) {
+    await completeBytedcliLogin(openId, challenge);
+  }
   if (!hasBytedcliHome(openId)) return null;
   const cloud = await runAsUser(openId, ['auth', 'get-bytecloud-jwt-token']);
   const cloudJwt = cloud.stdout.trim();

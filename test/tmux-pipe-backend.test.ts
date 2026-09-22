@@ -50,12 +50,16 @@ vi.mock('node:fs', () => {
       };
     }),
     unlinkSync: vi.fn(),
+    // openSync returns fake descriptors, so teardown must never write/close
+    // those numbers in the real test process.
+    closeSync: vi.fn(),
+    writeSync: vi.fn(),
     constants: actual.constants,
   };
 });
 
 import { execSync, execFileSync, spawnSync } from 'node:child_process';
-import { unlinkSync, createReadStream } from 'node:fs';
+import { unlinkSync, createReadStream, openSync, closeSync, writeSync } from 'node:fs';
 import {
   TmuxPipeBackend,
   normaliseCaptureLineEndings,
@@ -74,6 +78,9 @@ const mockedExecSync = vi.mocked(execSync);
 const mockedExecFileSync = vi.mocked(execFileSync);
 const mockedSpawnSync = vi.mocked(spawnSync);
 const mockedUnlinkSync = vi.mocked(unlinkSync);
+const mockedOpenSync = vi.mocked(openSync);
+const mockedCloseSync = vi.mocked(closeSync);
+const mockedWriteSync = vi.mocked(writeSync);
 
 type FakeShell = {
   readonly dir: string;
@@ -125,6 +132,9 @@ beforeEach(() => {
   mockedExecFileSync.mockReset();
   mockedSpawnSync.mockReset();
   mockedUnlinkSync.mockReset();
+  mockedOpenSync.mockReset().mockReturnValue(7);
+  mockedCloseSync.mockReset();
+  mockedWriteSync.mockReset();
   mockedExecSync.mockReturnValue(Buffer.from('') as any);
   mockedSpawnSync.mockReturnValue(bufferSpawnResult({ status: 0 }));
   resetTmuxVersionCacheForTests();
@@ -1259,6 +1269,37 @@ describe('TmuxPipeBackend.onData', () => {
     const joined = received.join('');
     expect(joined).toBe('┌─┐');
     expect(joined).not.toContain('�');
+  });
+});
+
+describe('TmuxPipeBackend fifo fd ownership', () => {
+  it('closes only the wake fd after handing the read fd to ReadStream', () => {
+    mockedOpenSync.mockReturnValueOnce(71).mockReturnValueOnce(72);
+    const be = new TmuxPipeBackend('0:2.0');
+    be.spawn('', [], spawnOpts());
+    const stream = vi.mocked(createReadStream).mock.results.at(-1)!.value;
+
+    be.kill();
+    be.kill();
+
+    expect(stream.destroy).toHaveBeenCalledTimes(1);
+    expect(mockedWriteSync.mock.calls).toEqual([[72, '\0']]);
+    expect(mockedCloseSync.mock.calls).toEqual([[72]]);
+  });
+
+  it('closes the read fd itself if acquiring the wake fd fails before stream creation', () => {
+    mockedOpenSync.mockReturnValueOnce(71).mockImplementationOnce(() => {
+      throw Object.assign(new Error('EMFILE: too many open files'), { code: 'EMFILE' });
+    });
+    vi.mocked(createReadStream).mockClear();
+    const be = new TmuxPipeBackend('0:2.0');
+
+    expect(() => be.spawn('', [], spawnOpts())).toThrow(/EMFILE/);
+
+    expect(createReadStream).not.toHaveBeenCalled();
+    expect(mockedCloseSync.mock.calls).toEqual([[71]]);
+    expect(mockedWriteSync).not.toHaveBeenCalled();
+    expect(mockedUnlinkSync).toHaveBeenCalledWith(expect.stringMatching(/botmux-pipe-.*\.fifo/));
   });
 });
 

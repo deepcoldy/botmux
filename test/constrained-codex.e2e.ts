@@ -1,6 +1,7 @@
 import { afterEach, expect, it } from 'vitest';
 import { createServer, type Server } from 'node:http';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runIsolatedCodex, isolatedCatalog, isolatedInvocationEnv } from '../src/services/constrained-invocation/codex-runtime.js';
@@ -10,6 +11,7 @@ import type { InvocationRequest } from '../src/services/constrained-invocation/c
 
 // Opt-in real Codex, fake provider, synthetic input, no auth and no IM traffic.
 const executable = process.env.BOTMUX_CONSTRAINED_CODEX;
+const ocrPath = process.env.BOTMUX_MODEL_PROXY_OCR;
 const roots: string[] = [];
 const servers: Server[] = [];
 afterEach(async () => {
@@ -180,3 +182,71 @@ it.skipIf(!executable || !process.env.BOTMUX_MODEL_PROXY_OPENAI_SDK)('ordinary S
     expect(last.usage).toBeNull(); expect(last.botmux.native_invocation_usage).toMatchObject({ inputTokens: 10, outputTokens: 5 });
   } finally { await proxy.close(); await service.close(); }
 });
+
+it.skipIf(!executable || !ocrPath)('OCR native config sends a null budget through the public proxy to Codex', async () => {
+  const { InvocationService } = await import('../src/services/constrained-invocation/service.js');
+  const { proxyConfigSchema, proxyClients } = await import('../src/services/model-proxy/config.js');
+  const { startModelProxy } = await import('../src/services/model-proxy/server.js');
+  const chats: any[] = []; const invocations: InvocationRequest[] = []; const wire: any[] = [];
+  const h = await harness(body => {
+    const text = body.input.flatMap((m: any) => m.content ?? []).find((c: any) => c.text?.includes('CHAT_REQUEST_JSON:\n'))?.text;
+    const chat = JSON.parse(text.split('CHAT_REQUEST_JSON:\n')[1]); chats.push(chat);
+    if (JSON.stringify(chat.messages.filter((m: any) => m.role === 'system')).includes('task planning')) {
+      return assistant({ content: 'Summary: Review the synthetic arithmetic module.\n\nIssues\n\n1. [low] Verify addition.\n   → file_read math.ts — inspect the module', tool_calls: [] });
+    }
+    if (!chat.tools?.length) return assistant({ content: '[]', tool_calls: [] });
+    return assistant({ content: '', tool_calls: chat.messages.some((m: any) => m.role === 'tool')
+      ? [{ name: 'task_done', arguments: '{"state":"DONE"}' }]
+      : [{ name: 'file_read', arguments: '{"file_path":"math.ts"}' }] });
+  });
+  const service = new InvocationService({ directory: join(h.root, 'records'), run: (request, signal) => {
+    invocations.push(request); return h.run(request.prompt, signal);
+  } });
+  const config = proxyConfigSchema.parse({ port: 0, models: { reasoner: { bot: 'fixture', model: 'gpt-5.5', deadlineMs: 15000 } }, clients: [{ id: 'ocr', tokenEnv: 'FIXTURE_TOKEN', models: ['reasoner'] }] });
+  const token = 'synthetic-ocr-codex-token-at-least-32';
+  const proxy = await startModelProxy({ config, clients: proxyClients(config, { FIXTURE_TOKEN: token }), backend: () => ({ capabilities: async () => ({ supported: true, maxOutputTokens: false }), start: async request => service.start(request), get: async id => service.get(id)!, cancel: id => service.cancel(id) }) });
+  // Observe the actual HTTP body before request parsing/normalization.
+  proxy.server.on('request', req => {
+    const chunks: Buffer[] = [];
+    req.on('data', c => chunks.push(Buffer.from(c)));
+    req.on('end', () => wire.push(JSON.parse(Buffer.concat(chunks).toString())));
+  });
+  try {
+    const repo = join(h.root, 'review-repo'); const home = join(h.root, 'ocr-home');
+    mkdirSync(repo); mkdirSync(home); mkdirSync(join(home, '.opencodereview'));
+    execFileSync('git', ['init', '-q', repo]);
+    execFileSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-qm', 'Synthetic baseline'], { cwd: repo });
+    writeFileSync(join(repo, 'math.ts'), 'export function add(left: number, right: number): number {\n  return left + right;\n}\n' + Array.from({ length: 65 }, (_, i) => `export const fixture${i} = ${i};`).join('\n') + '\n');
+    const env = { PATH: process.env.PATH, HOME: home, NO_PROXY: '127.0.0.1' };
+    // Use OCR's own configuration API; its released source and loop are unchanged.
+    // OCR_LLM_* would take precedence over this block and omit its extra_body.
+    for (const [key, value] of Object.entries({
+      'llm.url': `http://127.0.0.1:${proxy.port}/v1`, 'llm.auth_token': token,
+      'llm.model': 'reasoner', 'llm.protocol': 'openai', 'llm.extra_body': '{"max_completion_tokens":null}',
+    })) execFileSync(ocrPath!, ['config', 'set', key, value], { cwd: repo, env, timeout: 10000 });
+    const resultPath = join(h.root, 'review.json');
+    const result = await new Promise<{ code: number | null; stderr: string }>((resolve, reject) => {
+      const child = spawn(ocrPath!, ['review', '--repo', repo, '--audience', 'agent', '--format', 'json', '--concurrency', '1', '--timeout', '2', '--output', resultPath], { cwd: repo, env });
+      let stderr = ''; const timer = setTimeout(() => child.kill('SIGKILL'), 90000);
+      child.stdout.resume(); child.stderr.on('data', c => stderr += c);
+      child.once('error', e => { clearTimeout(timer); reject(e); });
+      child.once('close', code => { clearTimeout(timer); resolve({ code, stderr }); });
+    });
+    expect(result.code, result.stderr + '\n' + JSON.stringify({ wireLimits: wire.map(r => r.max_completion_tokens), accepted: invocations.length })).toBe(0);
+    const report = JSON.parse(readFileSync(resultPath, 'utf8'));
+    expect(report.status).toBe('complete');
+    expect(report.tool_calls.failure).toBe(0);
+    expect(report.tool_calls.by_tool.file_read).toBe(1);
+    expect(report.manifest.coverage.selected.map((v: any) => v.path)).toEqual(['math.ts']);
+    expect(report.manifest.coverage.completed).toEqual(report.manifest.coverage.selected);
+    expect(report.manifest.coverage.failed).toEqual([]); expect(report.manifest.coverage.waived).toEqual([]);
+    expect(wire.length).toBeGreaterThan(0);
+    expect(wire.every(r => Object.hasOwn(r, 'max_completion_tokens') && r.max_completion_tokens === null)).toBe(true);
+    expect(invocations).toHaveLength(wire.length);
+    expect(invocations.every(r => !Object.hasOwn(r, 'maxOutputTokens'))).toBe(true);
+    expect(chats.some(c => JSON.stringify(c.messages).includes('task planning'))).toBe(true);
+    expect(chats.some(c => c.messages.some((m: any) => m.role === 'tool' && m.content.includes('return left + right')))).toBe(true);
+    expect(h.requests.every(r => r.tools.length === 0)).toBe(true);
+    if (process.env.BOTMUX_MODEL_PROXY_CODEX_OCR_EVIDENCE) writeFileSync(process.env.BOTMUX_MODEL_PROXY_CODEX_OCR_EVIDENCE, JSON.stringify({ report, wire, invocations, nativeTools: h.requests.map(r => r.tools) }, null, 2));
+  } finally { await proxy.close(); await service.close(); }
+}, 120000);

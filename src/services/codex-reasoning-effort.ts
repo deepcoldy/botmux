@@ -72,7 +72,7 @@ export function isBackendVariantCliId(cliId: string | undefined): boolean {
 
 export function isConfigurableReasoningCliId(cliId: string | undefined): boolean {
   return isCodexReasoningCliId(cliId) || cliId === 'grok' || isBackendVariantCliId(cliId)
-    || cliId === 'claude-code';
+    || cliId === 'claude-code' || cliId === 'kimi';
 }
 
 export function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {
@@ -113,6 +113,11 @@ export function reasoningEffortsForCliModel(
   if (cliId === 'traex') return traexReasoningEffortsForModel(model);
   if (isCodexReasoningCliId(cliId)) return codexReasoningEffortsForModel(model);
   if (cliId === 'claude-code') return claudeReasoningEffortsForModel(model);
+  if (cliId === 'kimi') {
+    // Kimi 的 effort 环境变量只作用于 kimi provider，不猜测自定义别名的能力。
+    return model?.trim() === 'kimi-code/k3' || model?.trim() === 'kimi-code/k3-256k'
+      ? ['low', 'high', 'max'] : [];
+  }
   return [];
 }
 

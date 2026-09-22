@@ -18,6 +18,19 @@ const done = (output: unknown): InvocationResult => ({ requestId: 'r1', state: '
 const proposal = { content: '', tool_calls: [{ name: 'add', arguments: '{"x":42}' }] };
 
 describe('public conversation contract', () => {
+  it.each([undefined, null])('leaves native output limits unspecified for %s', max_completion_tokens => {
+    const route = { bot: 'fixture', model: 'native', deadlineMs: 5000 };
+    const result = toInvocation(parseChatRequest({ ...chat, max_completion_tokens }), route, 'r1');
+    expect(result).not.toHaveProperty('maxOutputTokens');
+    expect(result).toEqual(toInvocation(parseChatRequest(chat), route, 'r1'));
+  });
+  it.each([1, 4096, 128_000])('preserves a positive native output limit: %s', max_completion_tokens => {
+    const result = toInvocation(parseChatRequest({ ...chat, max_completion_tokens }), { bot: 'fixture', model: 'native', deadlineMs: 5000 }, 'r1');
+    expect(result.maxOutputTokens).toBe(max_completion_tokens);
+  });
+  it.each([[0], [-1], [1.5], [128_001], ['4096'], ['null'], [false], [{}], [[]]])('rejects invalid output limits: %j', max_completion_tokens => {
+    expect(() => parseChatRequest({ ...chat, max_completion_tokens })).toThrow('unsupported_or_invalid_parameter');
+  });
   it('preserves message order, roles and optional tool properties without normalizing the schema', () => {
     const parsed = parseChatRequest(chat);
     const request = toInvocation(parsed, { bot: 'fixture', model: 'native', deadlineMs: 5000 }, 'r1');
@@ -91,6 +104,7 @@ it('deduplicates concurrent and completed requests and rejects a changed body', 
   expect(results.every(r => r.status === 200)).toBe(true);
   const bodies = await Promise.all(results.map(r => r.json())); expect(bodies[0]).toEqual(bodies[1]);
   expect(await (await h.request(chat, headers)).json()).toEqual(bodies[0]);
+  expect(await (await h.request({ ...chat, max_completion_tokens: null }, headers)).json()).toEqual(bodies[0]);
   expect((await h.request({ ...chat, messages: [{ role: 'user', content: 'different' }] }, headers)).status).toBe(409);
   expect(h.starts).toBe(1);
 });

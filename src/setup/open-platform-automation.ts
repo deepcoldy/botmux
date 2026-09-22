@@ -42,6 +42,9 @@ export const BOT_BASELINE_APP_EVENTS = [
   'im.message.reaction.deleted_v1',
 ] as const;
 
+/** 消息编辑事件名（用户「修改」已发送消息时推送）。 */
+export const MESSAGE_UPDATED_EVENT = 'im.message.updated_v1';
+
 /**
  * Best-effort app events: subscribed alongside the baseline but NEVER part of
  * the fail-closed verification (missingBaselineEvents / MANAGED_VERIFIED_EVENT_COUNT).
@@ -53,6 +56,12 @@ export const BOT_BASELINE_APP_EVENTS = [
 export const BOT_OPTIONAL_APP_EVENTS = [
   'im.chat.member.user.added_v1',
   'im.chat.member.user.deleted_v1',
+  // 消息编辑（修改已发送消息，典型场景：发出时没 @ bot，编辑补 @ 后期望触发任务）。
+  // 放 OPTIONAL 而非 BASELINE：① dispatcher 对缺订阅天然静默降级（只是编辑补 @ 不生效，
+  // 不影响收消息主链路）；② 不增加 MANAGED_VERIFIED_EVENT_COUNT，避免把存量 bot 已落账
+  // 的 managed activation 校验打回。新建 bot 会随清单一起订阅；存量 bot 由启动时的
+  // ensureMessageUpdatedEventSubscribed 经缓存开放平台登录态增量补订阅。
+  MESSAGE_UPDATED_EVENT,
 ] as const;
 
 /** 缺了它 daemon 完全收不到消息——回读确认失败时整个自动配置 fail-closed。 */
@@ -2439,22 +2448,31 @@ export async function createOpenPlatformAppWithClient(
   }
 }
 
-/**
- * Read-only probe: are this app's VC meeting events (vc.bot.meeting_* +
- * participant_meeting_joined) subscribed, and is event mode the long connection?
- * Uses ONLY the cached Feishu Web session (disableQrLogin) and never publishes a
- * version — so it is safe to call at daemon startup. The caller decides whether
- * to run the full (publishing) automateOpenPlatformSetup based on the result:
- * only when events are actually missing / mode is wrong.
- */
 export type VcMeetingEventProbeResult =
   | { ok: true; missingVcEvents: string[]; eventModeReady: boolean; sessionFile?: string }
   | { ok: false; reason: string; message: string; sessionFile?: string };
 
-export async function probeVcMeetingEventSubscription(
+/**
+ * Read-only probe: which of `eventNames` are missing from this app's event
+ * subscription, and is event mode the long connection? Uses ONLY the cached
+ * Feishu Web session (disableQrLogin) and never publishes a version — safe to
+ * call at daemon startup. The caller decides whether to run the full
+ * (publishing) automateOpenPlatformSetup based on the result.
+ */
+export type AppEventSubscriptionProbeResult =
+  | { ok: true; missingEvents: string[]; eventModeReady: boolean; sessionFile?: string }
+  | { ok: false; reason: string; message: string; sessionFile?: string };
+
+export type AppEventSubscriptionEnsureResult = AppEventSubscriptionProbeResult & {
+  /** Whether event/update returned success, not whether it persisted or was published. */
+  updateSubmitted: boolean;
+};
+
+export async function probeAppEventSubscriptions(
   appId: string,
+  eventNames: readonly string[],
   options: Pick<FeishuWebSessionOptions, 'sessionFilePath' | 'fetchImpl'> = {},
-): Promise<VcMeetingEventProbeResult> {
+): Promise<AppEventSubscriptionProbeResult> {
   const prepared = await prepareFeishuWebSession({
     ...options,
     disableQrLogin: true,
@@ -2474,13 +2492,79 @@ export async function probeVcMeetingEventSubscription(
     const has = (name: string) => eventState.events.includes(name);
     return {
       ok: true,
-      missingVcEvents: VC_MEETING_BOT_EVENTS.filter(name => !has(name)),
+      missingEvents: eventNames.filter(name => !has(name)),
       eventModeReady: eventState.eventMode === LONG_CONNECTION_EVENT_MODE,
       sessionFile: prepared.sessionFile,
     };
   } catch (err: any) {
     return { ok: false, reason: 'api_error', message: `读取事件订阅失败: ${safeErrorMessage(err)}`, sessionFile: prepared.sessionFile };
   }
+}
+
+/**
+ * Add only the requested missing app events using the cached Web session.
+ * Startup repair must not switch transport modes or publish an existing draft:
+ * the event subscription endpoint is the only write allowed here.
+ * Readback describes configuration only; it does not verify publication or delivery.
+ */
+export async function ensureAppEventSubscriptions(
+  appId: string,
+  eventNames: readonly string[],
+  options: Pick<FeishuWebSessionOptions, 'sessionFilePath' | 'fetchImpl'> = {},
+): Promise<AppEventSubscriptionEnsureResult> {
+  const prepared = await prepareFeishuWebSession({
+    ...options,
+    disableQrLogin: true,
+    disableBytedcliFallback: true,
+  });
+  if (!prepared.ok) {
+    return { ok: false, reason: prepared.reason, message: prepared.message, sessionFile: prepared.sessionFile, updateSubmitted: false };
+  }
+  const clientResult = await createOpenPlatformApiClient(prepared.cookies, { fetchImpl: options.fetchImpl });
+  if (!clientResult.ok) {
+    return { ok: false, reason: clientResult.reason, message: clientResult.message, sessionFile: prepared.sessionFile, updateSubmitted: false };
+  }
+  const readEventState = async () => extractOpenPlatformEventState(
+    await clientResult.client.postJson(`/developers/v1/event/${appId}`, { needEventDetail: true }),
+  );
+  const missingEvents = (state: OpenPlatformEventState) => eventNames.filter(name => !state.events.includes(name));
+  let updateSubmitted = false;
+  try {
+    let eventState = await readEventState();
+    const missing = missingEvents(eventState);
+    if (eventState.eventMode === LONG_CONNECTION_EVENT_MODE && missing.length > 0) {
+      await clientResult.client.postJson(
+        `/developers/v1/event/update/${appId}`,
+        buildEventSubscriptionPayload(appId, eventState.eventMode, missing, []),
+      );
+      updateSubmitted = true;
+      // A successful update may not persist; read back the configured events and mode.
+      eventState = await readEventState();
+    }
+    return {
+      ok: true,
+      missingEvents: missingEvents(eventState),
+      eventModeReady: eventState.eventMode === LONG_CONNECTION_EVENT_MODE,
+      sessionFile: prepared.sessionFile,
+      updateSubmitted,
+    };
+  } catch (err) {
+    return { ok: false, reason: 'api_error', message: `补齐事件订阅失败: ${safeErrorMessage(err)}`, sessionFile: prepared.sessionFile, updateSubmitted };
+  }
+}
+
+export async function probeVcMeetingEventSubscription(
+  appId: string,
+  options: Pick<FeishuWebSessionOptions, 'sessionFilePath' | 'fetchImpl'> = {},
+): Promise<VcMeetingEventProbeResult> {
+  const probed = await probeAppEventSubscriptions(appId, VC_MEETING_BOT_EVENTS, options);
+  if (!probed.ok) return probed;
+  return {
+    ok: true,
+    missingVcEvents: probed.missingEvents,
+    eventModeReady: probed.eventModeReady,
+    sessionFile: probed.sessionFile,
+  };
 }
 
 /**

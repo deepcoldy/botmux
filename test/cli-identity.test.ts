@@ -59,6 +59,15 @@ describe('renderIdentityEnv', () => {
     expect(() => renderIdentityEnv({ tool: 'bytedcli', cloudJwt: 'a\nb' }))
       .toThrow(/line break/);
   });
+
+  it('user-home identity exports HOME, never a token or app secret', () => {
+    const body = renderIdentityEnv({ tool: 'lark-cli', mode: 'user-home', home: '/p/ab/cd' });
+    expect(body).toContain("BOTMUX_IDENTITY_MODE='user-home'");
+    expect(body).toContain("BOTMUX_IDENTITY_HOME='/p/ab/cd'");
+    // No credential text at all: not the token, and not an app secret.
+    expect(body).not.toContain('LARKSUITE_CLI_USER_ACCESS_TOKEN');
+    expect(body).not.toContain('LARKSUITE_CLI_APP_SECRET');
+  });
 });
 
 // A token is opaque: whatever bytes the provider issued must arrive at the tool
@@ -348,6 +357,40 @@ describe('renderIdentityWrapper', () => {
 
     const out = runWrapper(wrapperPath, { SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION }, ['im', '+send']);
     expect(out).toBe('cli_app|u-tok|im +send');
+  });
+
+  it('user-home identity runs the tool with HOME pointed at the person dir', () => {
+    const personHome = join(dir, 'ph');
+    mkdirSync(personHome, { recursive: true });
+    // Stub reports the HOME it saw; proves the wrapper redirects it for this exec.
+    const homeTool = join(dir, 'real-home.sh');
+    writeFileSync(homeTool, '#!/bin/sh\nprintf "%s|%s" "$HOME" "$*"\n');
+    chmodSync(homeTool, 0o755);
+    const wrapperPath = join(dir, 'lark-cli-home');
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', homeTool));
+    writeSessionIdentity(dir, SESSION, { tool: 'lark-cli', mode: 'user-home', home: personHome });
+    writeFileSync(join(dir, `${SESSION}.turn`), 'turn-h\n');
+
+    const out = runWrapper(wrapperPath, {
+      SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, HOME: '/the/machine/home',
+    }, ['docs', '+fetch']);
+    expect(out).toBe(`${personHome}|docs +fetch`);
+  });
+
+  it('user-home identity refuses when the person HOME does not exist (never falls back)', () => {
+    const homeTool = join(dir, 'real-missing.sh');
+    writeFileSync(homeTool, '#!/bin/sh\necho RAN_WITH_WRONG_HOME\n');
+    chmodSync(homeTool, 0o755);
+    const wrapperPath = join(dir, 'lark-cli-missing');
+    writeFileSync(wrapperPath, renderIdentityWrapper('lark-cli', homeTool));
+    writeSessionIdentity(dir, SESSION, { tool: 'lark-cli', mode: 'user-home', home: join(dir, 'does-not-exist') });
+    writeFileSync(join(dir, `${SESSION}.turn`), 'turn-h2\n');
+
+    const { status, stderr } = runDenied(wrapperPath, {
+      SESSION_DATA_DIR: dir, BOTMUX_SESSION_ID: SESSION, HOME: '/the/machine/home',
+    });
+    expect(status).toBe(IDENTITY_DENIED_EXIT_CODE);
+    expect(stderr).toContain('身份目录');
   });
 
   // The regression this whole wrapper exists to prevent. Running the tool with

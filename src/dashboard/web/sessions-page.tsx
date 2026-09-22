@@ -537,8 +537,8 @@ function CopyButton(props: { value: string }): React.JSX.Element {
     <button
       type="button"
       data-copy={props.value}
-      onClick={() => {
-        void copyText(props.value, t('sessions.copy')).then(didCopy => {
+      onClick={(event) => {
+        void copyText(props.value, t('sessions.copy'), event.currentTarget).then(didCopy => {
           if (!didCopy) return;
           setCopied(true);
           window.setTimeout(() => setCopied(false), 800);

@@ -12,7 +12,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const request = vi.fn();
 vi.mock('../src/bot-registry.js', () => ({
-  getBot: vi.fn(() => ({ config: { thinkingCard: true } })),
+  getBot: vi.fn(() => ({ config: { cotEnabled: true } })),
   getBotClient: vi.fn(() => ({ request })),
 }));
 
@@ -63,7 +63,7 @@ beforeEach(() => {
     }
     return { code: 0, data: {} };
   });
-  vi.mocked(getBot).mockClear().mockReturnValue({ config: { thinkingCard: true } } as any);
+  vi.mocked(getBot).mockClear().mockReturnValue({ config: { cotEnabled: true } } as any);
   rmSync(orphanDir, { recursive: true, force: true });
 });
 
@@ -569,27 +569,6 @@ describe('handleCotThinkingUpdate', () => {
     expect(body.language).toBe('typescript');
   });
 
-  it('thinkingCardToolResult=false swaps the result body for a minimal marker (never drops it)', async () => {
-    const ds = makeDs();
-    vi.mocked(getBot).mockReturnValue({ config: { thinkingCard: true, thinkingCardToolResult: false } } as any);
-    handleCotThinkingUpdate(ds, upd([
-      think('check'),
-      { kind: 'tool_call', id: 'R1', name: 'Bash', args: '{"command":"ls"}' },
-      { kind: 'tool_result', id: 'R1', result: 'file-a' },
-    ]));
-    await flush();
-    const types = pushedEvents().map(e => e.type);
-    expect(types).toContain('TOOL_CALL_START');
-    expect(types).toContain('TOOL_CALL_ARGS');
-    expect(types).toContain('TOOL_CALL_END');
-    // RESULT 必须仍在：TOOL_CALL_END 之后节点处于「执行中」，只有 RESULT 让它落定。
-    const result = pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT')!;
-    expect(result.content.toolCallId).toBe('R1');
-    expect(JSON.parse(result.content.content)).toEqual({ type: 'text', text: '✓ 已完成' });
-    // 但真实输出不再出现在气泡里。
-    expect(JSON.stringify(pushedEvents())).not.toContain('file-a');
-  });
-
   it('an empty tool result is also closed with the marker rather than left pending', async () => {
     const ds = makeDs();
     handleCotThinkingUpdate(ds, upd([
@@ -600,32 +579,6 @@ describe('handleCotThinkingUpdate', () => {
     const result = pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT')!;
     expect(result.content.toolCallId).toBe('E1');
     expect(JSON.parse(result.content.content)).toEqual({ type: 'text', text: '✓ 已完成' });
-  });
-
-  it('absent thinkingCardToolResult means ON; turning it off mid-turn affects the next batch', async () => {
-    const ds = makeDs();
-    vi.mocked(getBot).mockReturnValue({ config: {} } as any);
-    const first = [
-      { kind: 'tool_call', id: 'R1', name: 'Bash', args: '{"command":"ls"}' },
-      { kind: 'tool_result', id: 'R1', result: 'file-a' },
-    ];
-    handleCotThinkingUpdate(ds, upd(first));
-    await flush();
-    const results = () => pushedEvents().filter(e => e.type === 'TOOL_CALL_RESULT')
-      .map(e => [e.content.toolCallId, JSON.parse(e.content.content).type]);
-    expect(results()).toEqual([['R1', 'code']]);
-    // 配置改为关闭：累积列表追加的第二批仍带 RESULT（否则节点停在「执行中」），
-    // 但内容退化成完成标记而不是输出代码块。
-    vi.mocked(getBot).mockReturnValue({ config: { thinkingCardToolResult: false } } as any);
-    handleCotThinkingUpdate(ds, upd([
-      ...first,
-      { kind: 'tool_call', id: 'R2', name: 'Bash', args: '{"command":"pwd"}' },
-      { kind: 'tool_result', id: 'R2', result: '/root' },
-    ]));
-    await flush();
-    expect(results()).toEqual([['R1', 'code'], ['R2', 'text']]);
-    expect(JSON.stringify(pushedEvents())).not.toContain('/root');
-    expect(pushedEvents().filter(e => e.type === 'TOOL_CALL_START').map(e => e.content.toolCallId)).toEqual(['R1', 'R2']);
   });
 
   it('coalesces bursts to the latest entry list (single in-flight pump)', async () => {
@@ -664,9 +617,9 @@ describe('handleCotThinkingUpdate', () => {
 
   it('does nothing when explicitly disabled or apiOnly; absent config means ON (default)', () => {
     const ds = makeDs();
-    vi.mocked(getBot).mockReturnValue({ config: { thinkingCard: false } } as any);
+    vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: false } } as any);
     expect(handleCotThinkingUpdate(ds, upd([think('x')]))).toBe(false);
-    vi.mocked(getBot).mockReturnValue({ config: { thinkingCard: true, apiOnly: true } } as any);
+    vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: true, apiOnly: true } } as any);
     expect(handleCotThinkingUpdate(ds, upd([think('x')]))).toBe(false);
     expect(request).not.toHaveBeenCalled();
     // Default ON: a bot that never touched the field streams CoT.
@@ -677,7 +630,7 @@ describe('handleCotThinkingUpdate', () => {
   it('cotForced (/cot show) overrides both switches for the session, but never apiOnly', () => {
     const ds = makeDs();
     ds.cotForced = true;
-    vi.mocked(getBot).mockReturnValue({ config: { thinkingCard: false, noCotChats: ['oc_chat1'] } } as any);
+    vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: false, noCotChats: ['oc_chat1'] } } as any);
     expect(handleCotThinkingUpdate(ds, upd([think('x')]))).toBe(true);
     vi.mocked(getBot).mockReturnValue({ config: { apiOnly: true } } as any);
     expect(handleCotThinkingUpdate(ds, upd([think('x')]))).toBe(false);
@@ -685,7 +638,7 @@ describe('handleCotThinkingUpdate', () => {
 
   it('does nothing when the chat is muted via noCotChats (/cot off)', () => {
     const ds = makeDs();
-    vi.mocked(getBot).mockReturnValue({ config: { thinkingCard: true, noCotChats: ['oc_chat1'] } } as any);
+    vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: true, noCotChats: ['oc_chat1'] } } as any);
     expect(handleCotThinkingUpdate(ds, upd([think('x')]))).toBe(false);
     expect(request).not.toHaveBeenCalled();
     // A different chat with the same bot config stays enabled.

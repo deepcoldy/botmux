@@ -30,10 +30,11 @@ afterEach(() => {
 });
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-async function waitFor(fn: () => boolean, timeoutMs = 8_000): Promise<boolean> {
+async function waitFor<T>(fn: () => T, timeoutMs = 8_000): Promise<T> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    if (fn()) return true;
+    const result = fn();
+    if (result) return result;
     await delay(50);
   }
   return fn();
@@ -64,7 +65,7 @@ describe('quota fallback process boundaries', () => {
     expect(resolveFleetBotsFromEntries(cyclicBots()).map(bot => bot.appId)).toEqual(['cli_safebot']);
   });
 
-  it('supervisor cold boot brings up the dashboard while skipping cyclic bot daemons', async () => {
+  it('supervisor cold boot starts a dashboard process while skipping cyclic bot daemons', async () => {
     const home = tmp();
     const configDir = join(home, '.botmux');
     mkdirSync(configDir, { recursive: true });
@@ -83,15 +84,17 @@ describe('quota fallback process boundaries', () => {
     });
     try {
       const statePath = join(configDir, 'fleet-state.json');
-      const dashboardOnline = await waitFor(() => {
-        if (!existsSync(statePath)) return false;
+      const state = await waitFor(() => {
+        if (!existsSync(statePath)) return null;
         const state = JSON.parse(readFileSync(statePath, 'utf8'));
         return state.procs.length === 1
           && state.procs[0].name === 'botmux-dashboard'
-          && state.procs[0].status === 'online';
+          && state.procs[0].status === 'online' ? state : null;
       });
-      expect(dashboardOnline).toBe(true);
-      const state = JSON.parse(readFileSync(statePath, 'utf8'));
+      // 'online' records a spawn, not Dashboard readiness. Assert the observed
+      // snapshot: a child exit can move the on-disk state to 'launching' before
+      // a second read, even though this cold-boot observation succeeded.
+      expect(state).not.toBeNull();
       expect(state.procs.map((proc: any) => proc.name)).toEqual(['botmux-dashboard']);
       expect(state.procs[0].status).toBe('online');
     } finally {

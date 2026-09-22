@@ -300,14 +300,8 @@ export class TmuxPipeBackend implements SessionBackend {
   private readonly paneTarget: string;
   private readonly fifoPath: string;
   private readStream: fs.ReadStream | null = null;
-  /** Read end of the fifo, kept so teardown can close it explicitly.
-   *  `createReadStream(..., { autoClose: false })` never closes it for us. */
+  /** Read end of the fifo. Once created, ReadStream alone owns its close. */
   private fifoFd: number | null = null;
-  /** Set once teardownFifoReader() has run, so the reader's own EBADF-on-close
-   *  (see the 'error' handler) is recognised as expected teardown noise. Not
-   *  `exited`: the spawn-failure path tears the reader down without ever
-   *  marking the backend exited. */
-  private fifoTornDown = false;
   /** Write end, opened at spawn() and held for the lifetime of the reader.
    *  Teardown writes one byte here to unblock the parked read (see
    *  teardownFifoReader). Acquired UP FRONT on purpose: opening it at teardown
@@ -470,7 +464,7 @@ export class TmuxPipeBackend implements SessionBackend {
       try { fs.unlinkSync(this.fifoPath); } catch { /* best effort */ }
       throw err;
     }
-    this.readStream = fs.createReadStream('', { fd, autoClose: false, highWaterMark: 64 * 1024 });
+    this.readStream = fs.createReadStream('', { fd, autoClose: true, highWaterMark: 64 * 1024 });
     // From here on a parked read can wedge process exit, so make this reader
     // reachable from the exit hook even if nothing ever calls kill().
     installFifoExitHook();
@@ -490,12 +484,6 @@ export class TmuxPipeBackend implements SessionBackend {
       }
     });
     this.readStream.on('error', (err: any) => {
-      // Teardown noise, not a fault: destroy() closes the read fd itself when
-      // no read is in flight (despite autoClose:false), so our own backstop
-      // close races it and the stream reports EBADF on a reader we are
-      // deliberately dismantling. Logging it would put a scary line in every
-      // worker's stderr on every normal close.
-      if (this.fifoTornDown && err?.code === 'EBADF') return;
       // Errors are best-effort logged via the worker's stderr (we can't
       // pull a logger in a backend without circular imports). Don't fire
       // exit — the user's CLI is still alive, we just lost realtime view.
@@ -1068,18 +1056,13 @@ export class TmuxPipeBackend implements SessionBackend {
 
   private teardownFifoReader(): void {
     liveFifoReaders.delete(this);
-    this.fifoTornDown = true;
-    if (this.readStream) {
-      const stream = this.readStream as fs.ReadStream & { close?: () => void; unref?: () => void };
-      this.readStream = null;
-      // Bun's ReadStream has close() and no unref() (verified bun 1.4.0).
-      // bun test waits for open handles after the last case; destroy()+unref
-      // is a no-op there and left test/tmux-startup-storm-recovery.test.ts
-      // wedged until the 720s FILE_WALL after both cases had already passed.
-      try { stream.close?.(); } catch { /* already closed */ }
-      try { stream.destroy(); } catch { /* already closed */ }
-      try { stream.unref?.(); } catch { /* not a handle anymore */ }
-    }
+    // destroy() stops delivery now and closes the fd after any in-flight read
+    // finishes. Never closeSync that fd as well: its number can be reused by
+    // the next spawn before the stream's queued close runs (Bun and Node).
+    const stream = this.readStream;
+    this.readStream = null;
+    this.fifoFd = null;
+    stream?.destroy();
     if (this.fifoWakeFd !== null) {
       // EAGAIN (pipe full) is fine: a full pipe means the read already has data
       // to return, so it is not parked. Any other error is equally non-fatal —
@@ -1087,18 +1070,6 @@ export class TmuxPipeBackend implements SessionBackend {
       try { fs.writeSync(this.fifoWakeFd, '\0'); } catch { /* already unblocked */ }
       try { fs.closeSync(this.fifoWakeFd); } catch { /* already closed */ }
       this.fifoWakeFd = null;
-    }
-    if (this.fifoFd !== null) {
-      // Closing the read fd is nominally ours (autoClose:false), but destroy()
-      // DOES close it itself when no read is in flight — verified: after a
-      // synchronous destroy() the fd is already EBADF. So this close is a
-      // best-effort backstop for the in-flight case, and EBADF here is the
-      // normal, expected outcome rather than a fault. Clear the field first so
-      // a late 'error' handler re-entering teardown cannot close it twice (by
-      // then the number could name a freshly-opened unrelated file).
-      const fd = this.fifoFd;
-      this.fifoFd = null;
-      try { fs.closeSync(fd); } catch { /* stream already closed it */ }
     }
     try { fs.unlinkSync(this.fifoPath); } catch { /* already gone */ }
   }

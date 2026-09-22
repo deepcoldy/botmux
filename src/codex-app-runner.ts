@@ -40,6 +40,7 @@ import {
   type DynamicToolCallParams,
 } from './services/codex-browser-broker.js';
 import type { CodexBrowserFamily } from './core/codex-browser-config.js';
+import { CodexAppCotCollector, prepareCodexAppCotMarker } from './services/codex-app-cot.js';
 
 type JsonObject = Record<string, any>;
 
@@ -169,6 +170,7 @@ interface QueuedInput {
 }
 
 const output = new RunnerControlWriter();
+const cotCollector = new CodexAppCotCollector();
 const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 const RECONCILIATION_TIMEOUT_MS = 5_000;
 const RECONCILIATION_PAGE_LIMIT = 3;
@@ -869,6 +871,7 @@ function detectedCodexVersion(): CodexVersion | undefined {
 }
 
 function makeTurn(clientUserMessageId: string | undefined, requestKind: 'start' | 'steer'): ActiveTurn {
+  cotCollector.reset();
   let resolveDone!: () => void;
   const done = new Promise<void>(resolve => { resolveDone = resolve; });
   return {
@@ -1238,6 +1241,11 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
   if (msg.method === 'turn/completed') {
     const nativeTurn = params.turn ?? {};
     const completedId = typeof notificationTurnId === 'string' ? notificationTurnId : undefined;
+    if (completedId && browserBroker) {
+      void browserBroker.handleTurnEnded(completedId).catch(error => {
+        writeLine(`[codex-app] browser turn-ended hook failed: ${asError(error).message}`);
+      });
+    }
     if (completedId && nativeActiveTurnId === completedId) nativeActiveTurnId = undefined;
     const turn = activeTurn;
     if (!turn) {
@@ -1391,6 +1399,13 @@ function handleNotification(msg: JsonObject, replayedAfterResponse = false): voi
   // 90s liveness window is being refreshed by the same progress markers.
   if (turn.keepPendingDeadlineAtMs !== undefined) {
     turn.keepPendingDeadlineAtMs = Date.now() + keepPendingTimeoutMs();
+  }
+
+  const cotEntries = cotCollector.observe(msg.method, params);
+  const cotTurnId = turn.accepted?.at(-1)?.replyTurnId;
+  if (cotTurnId && cotEntries.length > 0) {
+    const marker = prepareCodexAppCotMarker(cotTurnId, cotEntries);
+    if (marker) emitMarker('thinking', marker);
   }
 
   if (msg.method === 'item/started') {

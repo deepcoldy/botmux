@@ -118,6 +118,7 @@ describe('Codex-compatible runtime editor', () => {
       { id: 'claude-code', label: 'Claude' },
       { id: 'codex', label: 'Codex' },
       { id: 'traex', label: 'traex' },
+      { id: 'kimi', label: 'Kimi' },
       { id: 'forge-x-traex', label: 'Forge x TraeX', cliLaunchMode: 'forge-traex' as const },
       { id: 'ttadk-x-codex', label: 'Codex via TTADK' },
     ],
@@ -205,6 +206,31 @@ describe('Codex-compatible runtime editor', () => {
       expect(requests).toEqual([{ cliId: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'ultra' }]);
     } finally {
       (globalThis as any).fetch = previousFetch;
+    }
+  });
+
+  it('shows, saves and reloads the configured Kimi effort without inventing a CLI default', async () => {
+    const previousFetch = globalThis.fetch;
+    const saved: unknown[] = [];
+    globalThis.fetch = vi.fn(async (_url, init) => {
+      if (!init?.body) return new Response(JSON.stringify({ models: [], source: 'static' }));
+      const body = JSON.parse(String(init.body));
+      saved.push(body);
+      return new Response(JSON.stringify({ ok: true, ...body, selectionKey: 'kimi' }));
+    });
+    try {
+      const { root, patchBot } = renderAgent({ cliId: 'kimi', model: 'kimi-code/k3-256k' });
+      const picker = root.findByProps({ dataInput: 'agentReasoningEffort' });
+      expect(picker.props.value).toBe('');
+      expect(picker.props.options.map((o: { value: string }) => o.value)).toEqual(['', 'low', 'high', 'max']);
+      act(() => picker.props.onChange('max'));
+      await act(async () => { await root.findByProps({ 'data-action': 'save-agent' }).props.onClick(); });
+      expect(saved).toEqual([{ cliId: 'kimi', model: 'kimi-code/k3-256k', reasoningEffort: 'max' }]);
+      expect(patchBot).toHaveBeenCalledWith('cli_runtime', expect.objectContaining({ reasoningEffort: 'max' }));
+      const reloaded = renderAgent({ cliId: 'kimi', model: 'kimi-code/k3-256k', reasoningEffort: 'max' });
+      expect(reloaded.root.findByProps({ dataInput: 'agentReasoningEffort' }).props.value).toBe('max');
+    } finally {
+      globalThis.fetch = previousFetch;
     }
   });
 
@@ -1844,6 +1870,7 @@ describe('Codex App history switch', () => {
 
     expect(agentRenderer.root.findByProps({ className: 'hint-warn' }).children.join('')).toContain('codex');
     expect(displayRenderer.root.findByProps({ 'data-action': 'toggle-codex-app-clean-input' }).props.checked).toBe(false);
+    expect(displayRenderer.root.findByProps({ 'data-action': 'toggle-codex-browser' }).props.checked).toBe(false);
   });
 
   it('renders a real default-off Codex App history switch and persists the opt-in', async () => {
@@ -1897,6 +1924,32 @@ describe('Codex App history switch', () => {
     expect(renderer.root.findByProps({ 'data-action': 'toggle-codex-app-clean-input' }).props.checked).toBe(false);
     expect(renderer.root.findByProps({ 'data-codex-app-clean-input-status': '' }).children.join(''))
       .toContain('write_failed');
+  });
+
+  it('renders and persists the default-off Codex browser bridge switch', async () => {
+    const putCardPref = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      body: { ok: true, codexBrowser: true },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CodexAppDisplaySection, {
+        bot: { larkAppId: 'cli_codex_browser', cliId: 'codex-app' },
+        putCardPref,
+      }));
+    });
+
+    const toggle = renderer.root.findByProps({ 'data-action': 'toggle-codex-browser' });
+    expect(toggle.props.checked).toBe(false);
+    expect(JSON.stringify(renderer.toJSON())).toContain('浏览器桥接');
+
+    await act(async () => {
+      toggle.props.onChange({ currentTarget: { checked: true } });
+      await Promise.resolve();
+    });
+    expect(putCardPref).toHaveBeenCalledWith({ codexBrowser: true });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-codex-browser' }).props.checked).toBe(true);
   });
 });
 
@@ -2003,6 +2056,32 @@ describe('card behavior defaults', () => {
 
     expect(renderer.root.findByProps({ 'data-action': 'toggle-pin-streaming-card' }).props.checked).toBe(false);
     expect(renderer.root.findByProps({ 'data-streaming-card-pin-toggle': 'bot-defaults' })).toBeTruthy();
+  });
+
+  it('uses one CoT switch for thinking, tool calls, and tool results', async () => {
+    const putCardPref = vi.fn(async (patch: Record<string, boolean>) => ({
+      ok: true,
+      status: 200,
+      body: { ok: true, ...patch },
+    }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(CardBehaviorSection, {
+        bot: { larkAppId: 'cli_cot' }, putCardPref,
+      }));
+    });
+
+    expect(renderer.root.findAllByProps({ 'data-action': 'toggle-cot' })).toHaveLength(1);
+    expect(renderer.root.findAllByProps({ 'data-action': 'toggle-thinking-card-tool-result' })).toHaveLength(0);
+
+    const toggle = renderer.root.findByProps({ 'data-action': 'toggle-cot' });
+    await act(async () => {
+      toggle.props.onChange({ currentTarget: { checked: false } });
+      await Promise.resolve();
+    });
+
+    expect(putCardPref).toHaveBeenCalledWith({ cotEnabled: false });
+    expect(renderer.root.findByProps({ 'data-action': 'toggle-cot' }).props.checked).toBe(false);
   });
 
   it('persists live-card button visibility as a canonical hidden list', async () => {
@@ -2142,6 +2221,7 @@ describe('card behavior defaults', () => {
       'toggle-pin-streaming-card',
       'toggle-writable-link',
       'toggle-private-card',
+      'toggle-cot',
       'toggle-streaming-button-output',
       'toggle-streaming-button-terminal',
       'toggle-streaming-button-writeLink',
@@ -2175,7 +2255,7 @@ describe('card behavior defaults', () => {
       renderer.root.findByProps({ 'data-action': 'toggle-disable-streaming' }).props.onChange({ currentTarget: { checked: true } });
     });
 
-    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-pin-streaming-card', 'toggle-writable-link', 'toggle-private-card']) {
+    for (const action of ['toggle-disable-streaming', 'toggle-silent-reactions', 'toggle-pin-streaming-card', 'toggle-writable-link', 'toggle-private-card', 'toggle-cot']) {
       expect(renderer.root.findByProps({ 'data-action': action }).props.disabled).toBe(true);
     }
     expect(renderer.root.findByProps({ id: 'bd-menu-usageDisplay' }).props.disabled).toBe(true);

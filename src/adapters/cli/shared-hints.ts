@@ -194,6 +194,7 @@ export function buildCredentialBoundaryBlock(locale?: Locale): string {
     line('ai.credentials.never_read_others'),
     line('ai.credentials.never_forward'),
     line('ai.credentials.on_auth_failure'),
+    line('ai.credentials.on_auth_link'),
     line('ai.credentials.on_missing_scope'),
     '</botmux_credentials>',
   ].join('\n');

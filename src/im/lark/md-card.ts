@@ -36,6 +36,7 @@ import { buildFeedbackElement } from './skill-feedback-card.js';
 import type { FeedbackPolicy } from '../../services/feedback-policy.js';
 import type { StatuslineQuota } from '../../services/statusline-snapshot.js';
 import type { ReplyCardHeader } from './reply-card-style.js';
+import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
 
 export { REPLY_CARD_FOOTER_MARKER } from './reply-card-footer-signature.js';
 
@@ -782,15 +783,7 @@ function buildTableFromTokens(tokens: Token[]): any | null {
   return {
     tag: 'table',
     page_size: Math.min(10, Math.max(1, rows.length || 1)),
-    row_height: 'low',
-    header_style: {
-      text_align: 'left',
-      text_size: 'normal',
-      background_style: 'grey',
-      text_color: 'default',
-      bold: true,
-      lines: 1,
-    },
+    ...TABLE_AUTO_ROW_STYLE,
     columns,
     rows,
   };

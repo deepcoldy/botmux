@@ -17,7 +17,7 @@ async function settle(times = 3): Promise<void> {
 }
 
 function renderSection(overrides?: Partial<{
-  thinkingCard: boolean;
+  cotEnabled: boolean;
   silentReactions: boolean;
   disableStreaming: boolean;
 }>) {
@@ -26,7 +26,7 @@ function renderSection(overrides?: Partial<{
   let renderer!: TestRenderer.ReactTestRenderer;
   const props = {
     tr,
-    thinkingCard: true,
+    cotEnabled: true,
     silentReactions: false,
     disableStreaming: false,
     putCardPref,
@@ -58,7 +58,7 @@ describe('QuietPresetSection', () => {
 
   it('starts on (details visible) when all three current values already match', () => {
     const { renderer, putCardPref } = renderSection({
-      thinkingCard: false,
+      cotEnabled: false,
       silentReactions: true,
       disableStreaming: true,
     });
@@ -78,7 +78,7 @@ describe('QuietPresetSection', () => {
     expect(putCardPref).toHaveBeenCalledTimes(1);
     const patch = putCardPref.mock.calls[0]![0];
     expect(patch).toEqual({
-      thinkingCard: false,
+      cotEnabled: false,
       silentTurnReactions: true,
       disableStreamingCard: true,
     });
@@ -90,7 +90,7 @@ describe('QuietPresetSection', () => {
     await act(async () => {
       renderer.update(React.createElement(QuietPresetSection, {
         ...props,
-        thinkingCard: false,
+        cotEnabled: false,
         silentReactions: true,
         disableStreaming: true,
       }));
@@ -102,7 +102,7 @@ describe('QuietPresetSection', () => {
 
   it('auto-flips off after an original toggle is edited (derived false), with no new write', async () => {
     const { renderer, putCardPref, props } = renderSection({
-      thinkingCard: false,
+      cotEnabled: false,
       silentReactions: true,
       disableStreaming: true,
     });
@@ -110,7 +110,7 @@ describe('QuietPresetSection', () => {
 
     // User edits the thinking-card toggle directly on the parent.
     await act(async () => {
-      renderer.update(React.createElement(QuietPresetSection, { ...props, thinkingCard: true }));
+      renderer.update(React.createElement(QuietPresetSection, { ...props, cotEnabled: true }));
     });
     await settle();
 
@@ -121,7 +121,7 @@ describe('QuietPresetSection', () => {
 
   it('OFF sends zero write requests and keeps switch values untouched', async () => {
     const { renderer, putCardPref, onApplied } = renderSection({
-      thinkingCard: false,
+      cotEnabled: false,
       silentReactions: true,
       disableStreaming: true,
     });

@@ -18,7 +18,7 @@ import {
 // worker.ts is a process entrypoint: execute its actual environment-assembly
 // block without starting a worker, rather than recreating that block in a fixture.
 const worker = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
-const start = worker.indexOf('const identityShellEnv: Record<string, string> = {};');
+const start = worker.indexOf('const identityShellEnv: Record<string, string> = {');
 const end = worker.indexOf('const args = cliAdapter.buildArgs({', start);
 if (start < 0 || end <= start) throw new Error('Cannot locate worker identity environment assembly');
 const assembly = ts.transpileModule(worker.slice(start, end), {
@@ -29,7 +29,7 @@ const assemble = new Function('cfg', 'process', 'sessionIdentityBinDir', 'join',
 
 function workerShellEnv(sessionDataDir: string | undefined, enabled = true, tools = ['bytedcli']): Record<string, string> {
   return assemble(
-    { sessionId: 'botmux-session', triggerUserAuth: { enabled, tools } },
+    { sessionId: 'botmux-session', chatId: 'oc_chat', larkAppId: 'cli_app', triggerUserAuth: { enabled, tools } },
     { env: sessionDataDir === undefined ? {} : { SESSION_DATA_DIR: sessionDataDir } },
     sessionIdentityBinDir, join, GIT_ASKPASS_BASENAME, 'native-session',
   );
@@ -45,11 +45,13 @@ function shellOverrides(args: string[]): Record<string, string> {
   }));
 }
 
+const routingEnv = { BOTMUX_SESSION_ID: 'botmux-session', BOTMUX_CHAT_ID: 'oc_chat', BOTMUX_LARK_APP_ID: 'cli_app', BOTMUX_SESSION_SCOPE: 'chat' };
+
 describe('worker trigger-user shell contract', () => {
   it('uses the credential file identity, not the native CLI resume identity', () => {
     const dataDir = '/tmp/data "quoted"';
     expect(workerShellEnv(dataDir)).toEqual({
-      BOTMUX_SESSION_ID: 'botmux-session',
+      ...routingEnv,
       SESSION_DATA_DIR: dataDir,
       BOTMUX_IDENTITY_BIN: sessionIdentityBinDir(dataDir, 'botmux-session'),
       ZDOTDIR: join(sessionIdentityBinDir(dataDir, 'botmux-session'), 'shell'),
@@ -58,9 +60,9 @@ describe('worker trigger-user shell contract', () => {
     });
   });
 
-  it('does not request an environment when trigger-user auth is off or has no data root', () => {
-    expect(workerShellEnv('/tmp/data', false)).toEqual({});
-    expect(workerShellEnv(undefined)).toEqual({});
+  it('retains routing without identity wrappers when auth is off or has no data root', () => {
+    expect(workerShellEnv('/tmp/data', false)).toEqual(routingEnv);
+    expect(workerShellEnv(undefined)).toEqual(routingEnv);
   });
 
   it('does not request git askpass for lark-only authentication', () => {
@@ -72,6 +74,16 @@ describe.each([
   ['traex', createTraexAdapter],
   ['codex', createCodexAdapter],
 ] as const)('%s explicit identity environment', (_name, createAdapter) => {
+  it('emits each routing override once and skips undefined config values', () => {
+    const args = createAdapter('/bin/cli').buildArgs({
+      sessionId: 'native-session',
+      shellSubprocessEnv: { ...routingEnv, UNSET: undefined } as unknown as Record<string, string>,
+    });
+    expect(args.filter(arg => arg.startsWith('shell_environment_policy.set.BOTMUX_SESSION_ID='))).toHaveLength(1);
+    expect(shellOverrides(args)).toMatchObject(routingEnv);
+    expect(shellOverrides(args)).not.toHaveProperty('UNSET');
+  });
+
   it.each([false, true])('runs the real wrapper without inherited identity variables, resume=%s', (resume) => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-shell-env-'));
     try {

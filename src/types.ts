@@ -1141,6 +1141,8 @@ export interface LarkMessage {
   senderName?: string;
   msgType: string;
   content: string;
+  /** Original post JSON for lossless /fork topic presentation. */
+  rawPostContent?: string;
   createTime: string;
   attachments?: LarkAttachment[];
   mentions?: LarkMention[];

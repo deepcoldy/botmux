@@ -129,6 +129,32 @@ describe.sequential('CodexBrowserBroker', () => {
     expect(fake.modules.setupBrowserRuntime).toHaveBeenCalledTimes(2);
   });
 
+  it('bridges app-server turn completion into the browser runtime hook', async () => {
+    const fake = fakeModules();
+    const turnEnded = vi.fn(async () => {});
+    fake.modules.setupBrowserRuntime = vi.fn(async () => {
+      (globalThis as any).nodeRepl.addTurnEndedHandler({
+        timeoutMs: 4_000,
+        run: turnEnded,
+      });
+      return { browsers: { get: vi.fn(async () => fake.browser) } };
+    });
+    broker = new CodexBrowserBroker({
+      sessionId: 'session-turn-ended',
+      family: 'chrome',
+      modules: fake.modules,
+    });
+
+    expect((await broker.handleToolCall(call({ operation: 'list_tabs' }))).success).toBe(true);
+    await broker.handleTurnEnded('turn-1');
+
+    expect(turnEnded).toHaveBeenCalledOnce();
+    expect(turnEnded).toHaveBeenCalledWith({
+      session_id: 'session-turn-ended',
+      turn_id: 'turn-1',
+    });
+  });
+
   it('supports bounded accessibility actions without arbitrary JavaScript', async () => {
     const fake = fakeModules();
     broker = new CodexBrowserBroker({

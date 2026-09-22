@@ -8,8 +8,9 @@ import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, type BotConfig } from '../bot-registry.js';
-import { unauthorizedOutcomeFor, triggerUserAuthApplies } from '../services/trigger-user-auth.js';
+import { triggerUserAuthApplies } from '../services/trigger-user-auth.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
+import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from './close-residual.js';
@@ -22,6 +23,7 @@ import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
 import { isRemoteBackendSession, resolvePairedSpawnBackendType } from './persistent-backend.js';
 import { isRemoteCliId } from './remote-cli-ids.js';
 import { buildRepoSelectCard, buildAdoptSelectCard, buildCodexAppThreadSelectCard, buildSlashListCard, getCliDisplayName, buildConfigCard, buildForkPanelCard, buildAdoptBlockedCard } from '../im/lark/card-builder.js';
+import { TABLE_AUTO_ROW_STYLE } from '../im/lark/table-style.js';
 import { handleDashboardCommand } from './dashboard-command/index.js';
 import { handleProjectGroupRoles } from './dashboard-command/groups.js';
 import { handleGroupSessionsCommand } from './group-sessions-command.js';
@@ -29,7 +31,8 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
 import { resolveCliRuntime, runtimeInstallationKey, snapshotCliRuntime } from '../adapters/cli/runtime.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
-import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, uploadFile, UserTokenMissingError } from '../im/lark/client.js';
+import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, uploadFile, uploadImage, UserTokenMissingError } from '../im/lark/client.js';
+import { prepareForkTopic } from '../im/lark/fork-topic.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
 import { logger } from '../utils/logger.js';
@@ -44,6 +47,7 @@ import {
   getProjectScanDirs,
   rememberLastCliInput,
   buildNewTopicCliInput,
+  downloadResources,
   ensureSessionWhiteboard,
   getAvailableBots,
   resumeSession,
@@ -429,11 +433,7 @@ function buildCloseWorktreeConfirmCard(args: {
     {
       tag: 'table',
       page_size: 10,
-      row_height: 'low',
-      header_style: {
-        text_align: 'left', text_size: 'normal', background_style: 'grey',
-        text_color: 'default', bold: true, lines: 1,
-      },
+      ...TABLE_AUTO_ROW_STYLE,
       columns: [
         { name: 'bot', display_name: t('cmd.close.worktree_col_bot', undefined, loc), data_type: 'text', width: '140px' },
         { name: 'task', display_name: t('cmd.close.worktree_col_task', undefined, loc), data_type: 'text', width: 'auto' },
@@ -1284,27 +1284,35 @@ function triggerUserAuthStatusLines(
   const policy = botCfg.triggerUserAuth;
   if (!policy?.enabled || !policy.tools.length) return [];
   const brand = normalizeBrand(botCfg.brand);
-  const larkAuthorized = senderOpenId
+  // lark-cli acts as the person via either the new per-person device-code HOME
+  // or a legacy bot-app OAuth token. Both must count (and /login status reads the
+  // same two sources), or someone who authorized through the device flow would
+  // be told here they had not. The legacy lookup also supplies a display name.
+  const legacyLarkUser = senderOpenId
     ? listAuthorizedUsers(botCfg.larkAppId, brand).find(u => u.openId === senderOpenId)
     : undefined;
-  const botFallback = unauthorizedOutcomeFor(policy, 'lark-cli') !== 'fail';
+  const larkAuthorized = senderOpenId !== undefined
+    && (hasLarkCliHome(senderOpenId) || !!legacyLarkUser);
 
   const lines = ['Trigger-user auth: 已开启'];
   for (const tool of policy.tools) {
     lines.push(`  ${tool}: ${
       tool === 'lark-cli'
         ? larkAuthorized
-          ? `以${larkAuthorized.userName ? `「${larkAuthorized.userName}」` : '你'}的身份调用`
-          : botFallback
-            ? '你未授权 —— 当前以 bot 身份调用，发 /login 可改为用你自己的权限'
-            : '你未授权 —— 命令会被拒绝，发 /login 授权后重试'
+          ? `以${legacyLarkUser?.userName ? `「${legacyLarkUser.userName}」` : '你自己'}的身份调用`
+          // lark-cli no longer degrades to the bot's own identity: an
+          // unauthorized call is refused, and the refusal carries a ready
+          // device-code link. Saying "running as the bot" here would describe a
+          // fallback that the turn path does not have.
+          : '你未授权 —— 命令会被拒绝；首次被拒时会自动返回授权链接，点开后重试即可'
         // ByteCloud is a separate identity provider, so this is a genuinely
         // different verdict from the Lark line above — the same person can be
-        // authorized for one and not the other. There is no bot identity to
-        // degrade to here, so unauthorized always means the command is refused.
+        // authorized for one and refused by the other. There is no bot identity
+        // to degrade to here either; the mint path tries the existing HOME even
+        // while a fresh challenge is pending, so the verdict is just HOME/no.
         : hasBytedcliHome(senderOpenId ?? '')
           ? '以你自己的身份调用'
-          : '你未授权 —— 命令会被拒绝，发 /login bytedcli 授权后重试'
+          : '你未授权 —— 首次调用被拒时会自动返回登录链接'
     }`);
   }
   return lines;
@@ -1586,7 +1594,7 @@ export async function handleCardCommand(
  *
  * off    -> suppress the thinking bubble for this chat (add to noCotChats).
  * on     -> restore it for this chat (remove from noCotChats); hints when the
- *           bot-level master switch (`thinkingCard`) is off, since the bubble
+ *           bot-level master switch (`cotEnabled`) is off, since the bubble
  *           won't appear until that is enabled too.
  * show   -> one-shot peek while the switches are off: force the bubble for the
  *           current turn (rendered immediately with everything accumulated so
@@ -1615,7 +1623,7 @@ export async function handleCotCommand(
   const sub = content.replace(/^\/cot\s*/i, '').trim().toLowerCase();
   // Master switch defaults ON — only an explicit false means disabled.
   const masterOn = (() => {
-    try { return getBot(larkAppId).config.thinkingCard !== false; } catch { return false; }
+    try { return getBot(larkAppId).config.cotEnabled !== false; } catch { return false; }
   })();
 
   if (sub === 'off') {
@@ -1643,7 +1651,7 @@ export async function handleCotCommand(
       if (replyCardModeFor(ds, ds.lastThinkingUpdate.turnId) !== 'legacy') {
         const update = ds.lastThinkingUpdate;
         await updateTurnReplyCard(ds, update.turnId, {
-          kind: 'tools', tools: publicReplyCardTools(update.entries, getBot(larkAppId).config.thinkingCardToolResult !== false),
+          kind: 'tools', tools: publicReplyCardTools(update.entries, true),
           activity: publicReplyCardActivity(update.entries),
         }, (body, type, uuid) => deps.sessionReply(rootId, body, type, larkAppId, update.turnId, { uuid }),
         { dispatchAttempt: update.dispatchAttempt, forceVisible: true });
@@ -1663,17 +1671,12 @@ export async function handleCotCommand(
     const chatOff = (() => {
       try { return !!getBot(larkAppId).config.noCotChats?.includes(chatId); } catch { return false; }
     })();
-    // 工具输出子开关是 bot 级（/botconfig set thinkingCardToolResult），这里只读
-    // 展示、不提供 /cot 子命令——避免和群级 on/off 混淆。默认开时不加行。
-    const toolResultOff = (() => {
-      try { return getBot(larkAppId).config.thinkingCardToolResult === false; } catch { return false; }
-    })();
     const status = !masterOn
       ? t('cmd.cot.status_master_off', undefined, loc)
       : chatOff
         ? t('cmd.cot.status_chat_off', undefined, loc)
         : t('cmd.cot.status_on', undefined, loc);
-    await reply(toolResultOff ? `${status}\n${t('cmd.cot.status_result_off', undefined, loc)}` : status);
+    await reply(status);
     return;
   }
 
@@ -3333,20 +3336,107 @@ export async function handleCommand(
         // 都在用最后授权那个人的权限。回调仍会用 user_info 复核真实授权人。
         const loginOpenId = message.senderId;
         if (subCmd === 'status' || subCmd === '状态') {
-          // 按人查：报「你自己」授权了没。别人的授权状态与你无关，也不该让你看见。
-          const lines = [getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId)];
-          // ByteCloud 是另一个身份提供方，飞书授权了不代表这边也授权了。只在这个
-          // bot 真的会用 bytedcli 时才多说一行，否则是噪音。
+          // Per-person status lines, only for governed tools.
+          const lines: string[] = [];
+          if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
+            lines.push(t(hasLarkCliHome(loginOpenId) ? 'cmd.login.lark_status_yes' : 'cmd.login.lark_status_no', undefined, loc));
+          }
+          // ByteCloud 是另一个身份提供方，飞书授权了不代表这边也授权了。
           if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli')) {
             lines.push(t(
-              hasBytedcliHome(loginOpenId)
+              hasBytedcliHome(loginOpenId) && !pendingBytedcliChallenge(loginOpenId)
                 ? 'cmd.login.bytedcli_status_yes'
                 : 'cmd.login.bytedcli_status_no',
               undefined,
               loc,
             ));
           }
+          // Legacy bot-app OAuth status when lark-cli is not governed by the
+          // per-person device-code flow.
+          if (!lines.length) lines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
           await sessionReply(rootId, lines.join('\n'));
+          break;
+        }
+
+        // `/login done` / `完成` —— finish any device-code login in progress.
+        // lark-cli and ByteCloud are independent providers: a person commonly
+        // has a challenge for one while already authorized (or pending) for the
+        // other, so each side is handled on its own merits instead of the first
+        // matching side suppressing the other.
+        if (subCmd === 'done' || subCmd === '完成') {
+          const doneLines: string[] = [];
+          const larkPending = pendingLarkCliChallenge(loginOpenId);
+          if (larkPending) {
+            const { state, detail } = await completeLarkCliLogin(loginOpenId);
+            doneLines.push(state === 'authorized'
+              ? t('cmd.login.lark_ok', undefined, loc)
+              : state === 'pending'
+                ? t('cmd.login.lark_pending', undefined, loc)
+                : t('cmd.login.lark_failed', { detail: detail ?? 'unknown' }, loc));
+          } else if (hasLarkCliHome(loginOpenId)) {
+            doneLines.push(t('cmd.login.lark_status_yes', undefined, loc));
+          }
+          const bytedPending = pendingBytedcliChallenge(loginOpenId);
+          if (bytedPending) {
+            const { state, detail } = await completeBytedcliLogin(loginOpenId, bytedPending);
+            doneLines.push(state === 'authorized'
+              ? t('cmd.login.bytedcli_ok', undefined, loc)
+              : state === 'pending'
+                ? t('cmd.login.bytedcli_pending', undefined, loc)
+                : t('cmd.login.bytedcli_failed', { detail: detail ?? 'unknown' }, loc));
+          } else if (hasBytedcliHome(loginOpenId)) {
+            doneLines.push(t('cmd.login.bytedcli_status_yes', undefined, loc));
+          }
+          if (!doneLines.length) doneLines.push(t('cmd.login.no_challenge', undefined, loc));
+          await sessionReply(rootId, doneLines.join('\n'));
+          break;
+        }
+
+        // `/login lark` — lark-cli device-code (QR) authorization against the
+        // provisioned per-person issuer app. Non-blocking: returns a verify URL.
+        if (subCmd === 'lark' || subCmd.startsWith('lark ')) {
+          if (loginOpenId) {
+            const started = await beginLarkCliLogin(loginOpenId);
+            if (!started) {
+              await sessionReply(rootId, t('cmd.login.lark_begin_failed', { detail: 'lark-cli has no provisioned issuer app on the server' }, loc));
+              break;
+            }
+            await sessionReply(rootId, [
+              t('cmd.login.lark_title', undefined, loc),
+              '',
+              t('cmd.login.lark_step1', undefined, loc),
+              started.authUrl,
+              '',
+              t('cmd.login.lark_step2', undefined, loc),
+              '',
+              t('cmd.login.lark_note', undefined, loc),
+            ].join('\n'));
+          } else {
+            await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc));
+          }
+          break;
+        }
+
+        // When trigger-user auth governs lark-cli, the bare `/login` goes through
+        // the device-code flow (per-person HOME), not the per-bot web OAuth.
+        const larkDeviceOn = triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli');
+        if (larkDeviceOn && subCmd === '') {
+          if (loginOpenId) {
+            const started = await beginLarkCliLogin(loginOpenId);
+            if (!started) {
+              await sessionReply(rootId, t('cmd.login.lark_begin_failed', { detail: 'no provisioned issuer app' }, loc));
+              break;
+            }
+            await sessionReply(rootId, [
+              t('cmd.login.lark_title', undefined, loc), '',
+              t('cmd.login.lark_step1', undefined, loc),
+              started.authUrl, '',
+              t('cmd.login.lark_step2', undefined, loc), '',
+              t('cmd.login.lark_note', undefined, loc),
+            ].join('\n'));
+          } else {
+            await sessionReply(rootId, t('cmd.login.no_credentials', undefined, loc));
+          }
           break;
         }
 
@@ -5921,8 +6011,6 @@ export async function startForkSubtopicSession(
   const parentSession = parentDs.session;
   const chatId = parentDs.chatId;
   const brand = normalizeBrand(botCfg.brand);
-  const taskTitle = taskText.split(/\r?\n/).map(line => line.trim()).find(Boolean)?.slice(0, 60)
-    ?? taskText.slice(0, 60);
   const senderIsBot = message.senderType === 'app' || message.senderType === 'bot';
   const triggerSender: ResolvedSender = {
     openId: message.senderId,
@@ -5957,11 +6045,18 @@ export async function startForkSubtopicSession(
       ? threadAppLink(chatId, parentThreadId, brand)
       : chatAppLink(chatId, brand);
 
+    const presentation = await prepareForkTopic(taskText, message, {
+      download: resources => downloadResources(appId, message.messageId, resources, message.senderId),
+      upload: path => uploadImage(appId, path),
+      imageUnavailable: t('cmd.fork.image_unavailable', undefined, loc),
+      fallbackTitle: t('cmd.fork.task_title', undefined, loc),
+    });
+    const childTitle = `${t('cmd.fork.badge', undefined, loc)} ${presentation.title}`;
     const localeKey = loc === 'en' ? 'en_us' : 'zh_cn';
     const seedPost = JSON.stringify({
       [localeKey]: {
-        title: `${t('cmd.fork.badge', undefined, loc)} ${taskText.replace(/\s*\n+\s*/g, ' ').slice(0, 300)}`,
-        content: [[
+        title: childTitle,
+        content: [...presentation.content, [
           ...(senderIsBot ? [] : [{ tag: 'at', user_id: message.senderId }]),
           {
             tag: 'text',
@@ -5989,7 +6084,7 @@ export async function startForkSubtopicSession(
       'group',
       'thread',
       {
-        childTitle: `${t('cmd.fork.badge', undefined, loc)} ${taskTitle}`,
+        childTitle,
         forkTaskText: taskText,
         larkThreadId: childThreadId,
         turnId: message.messageId,
@@ -6000,7 +6095,7 @@ export async function startForkSubtopicSession(
           childSessionId,
           childCliId,
           parentSession.cliLaunchSnapshot?.cliPathOverride ?? parentSession.cliPathOverride ?? botCfg.cliPathOverride,
-          undefined,
+          presentation.attachments,
           undefined,
           availableBots,
           undefined,

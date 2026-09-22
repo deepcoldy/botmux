@@ -9,6 +9,8 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, dirname, extname, resolve, relative, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { handlePluginSettingsRequest } from './core/plugins/dashboard-settings.js';
+import { createConfigApi } from './core/plugins/runtime.js';
 import { createHmac, randomBytes } from 'node:crypto';
 import { logger } from './utils/logger.js';
 import { isStandaloneBinary } from './core/self-spawn.js';
@@ -2549,6 +2551,19 @@ async function handlePluginManagementApi(
 ): Promise<boolean> {
   if (req.method === 'GET' && url.pathname === '/api/plugins') {
     return pluginJson(res, 200, await listDashboardPluginsPayload());
+  }
+
+  const settingsMatch = url.pathname.match(/^\/api\/plugins\/([^/]+)\/settings$/);
+  if (settingsMatch) {
+    return handlePluginSettingsRequest(req, res, settingsMatch[1], {
+      isInstalled: pluginId => {
+        const record = requireInstalledPlugin(pluginId);
+        return !!record && dashboardEntriesForRecord(record).length > 0;
+      },
+      resolveEntry: pluginId => resolvePluginPath(pluginRuntimeDir(pluginId), 'server/settings.js'),
+      createConfig: createConfigApi,
+      readBody: readJsonBody,
+    });
   }
 
   let match = url.pathname.match(/^\/api\/plugins\/([^/]+)\/pin$/);
@@ -5784,6 +5799,22 @@ const server = createServer(async (req, res) => {
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
       const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/trigger-result${url.search ?? ''}`, { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/trigger-result\/supersede$/))) {
+      const sid = decodeURIComponent(m[1]);
+      const owner = aggregator.ownerOf(sid);
+      if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const upstream = await proxyToDaemon(owner, `/api/sessions/${sid}/trigger-result/supersede`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: Buffer.concat(chunks).toString('utf8'),
+      });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
       return;

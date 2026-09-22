@@ -17,7 +17,7 @@ Dashboard → 机器人默认设置 → 卡片 → **回答展示方式**提供�
 
 旧版 `final-only` 配置会兼容为“动态单卡、独立状态卡关闭”，不再作为独立模式提供。新轮次持续更新答复卡；升级前已经接受的轮次保留原投递状态，以便恢复。
 
-- 执行中显示状态、耗时和当前步骤；“展示执行过程”按接收顺序保留 CLI 已输出的思考文本或摘要、工具调用、公开进度与问答记录，结束后折叠。沿用 `thinkingCard`、`thinkingCardToolResult`、`/cot`，无需增加开关。关闭执行过程后，公开进度和问答记录仍保留；CLI 未输出的内部思考无法展示。
+- 执行中显示状态、耗时和当前步骤；“展示执行过程”按接收顺序保留 CLI 已输出的思考文本或摘要、工具调用、公开进度与问答记录，结束后折叠。统一由 `cotEnabled` 与群级 `/cot` 控制。关闭执行过程后，公开进度和问答记录仍保留；CLI 未输出的内部思考无法展示。
 - 状态以 💭 处理中、✅ 已完成、❌ 执行失败等图标区分；工具调用按命令、读写、搜索等类型显示图标，完成的工具保留 ✓ 标记。过程默认收在带 📋 图标、调用次数和浅灰背景的折叠区中。
 - 执行过程没有固定条数或独立字节配额，整卡未超限时完整展示。按[飞书卡片更新接口](https://open.feishu.cn/document/server-docs/im-v1/message-card/patch)的 30 KB 限制计算整卡发送体积（含 JSON 转义和回调信息），超限时才截断过程，并优先保留最终答复和待回答问题。工具与文字各保留最近记录，出现省略时明确提示并标明已展示的工具数；仅过程超限不会额外发送附件。本地已接收的记录不因展示截断而删除，不提供额外的完整过程页面。
 - 答复卡使用飞书的 `width_mode: fill`，宽度随聊天窗口自适应。飞书还提供默认宽度（桌面端上限 600px）和紧凑宽度（400px），没有按文字长度自动收缩的卡片宽度选项；这些是客户端宽度模式，不是任意像素宽度。参见[飞书卡片 JSON 2.0 配置](https://open.feishu.cn/document/feishu-cards/card-json-v2-structure)。
@@ -50,7 +50,7 @@ botmux 在飞书里的「存在感」分四层，各自独立开关：
 | 层 | 是什么 | 关闭方式 |
 |----|--------|----------|
 | **流式状态卡** | 每轮一张、实时截图刷新的主卡片（本文主体） | bot 级 `disableStreamingCard`，或本群 `/card off` |
-| **思考气泡（CoT）** | CLI 工作过程中的中间叙述 / 思考消息 | bot 级 `thinkingCard: false`，或本群 `/cot off`；`/cot show` 临时看一次 |
+| **思考气泡（CoT）** | CLI 工作过程中的中间叙述 / 思考消息 | bot 级 `cotEnabled: false`，或本群 `/cot off`；`/cot show` 临时看一次 |
 | **✋ → ✅ 反应** | 落在你**触发消息**上的进度反应：受理时 ✋、空闲时翻 ✅ | bot 级 `silentTurnReactions: true` |
 | **CLI 主动消息** | agent 通过 `botmux send` 主动发的富文本 / 图文消息 | 无开关，按需发送（见下） |
 
@@ -61,7 +61,7 @@ botmux 在飞书里的「存在感」分四层，各自独立开关：
 | 显示层 | bot 级默认（Bot 配置 / Dashboard「Bot 默认」） | 本群覆盖（群内斜杠命令） | 默认 |
 |--------|-----------------------------------------------|--------------------------|------|
 | 流式状态卡 | `disableStreamingCard` | `/card off` / `/card on`（写入 `noCardChats`）；裸 `/card` 立即召唤一张；`/card pin …` 控制置顶 | 开 |
-| 思考气泡 | `thinkingCard` | `/cot off` / `/cot on`（写入 `noCotChats`）；`/cot show` 临时看一次；`/cot`（不带参数）查状态 | 开 |
+| 思考气泡 | `cotEnabled` | `/cot off` / `/cot on`（写入 `noCotChats`）；`/cot show` 临时看一次；`/cot`（不带参数）查状态 | 开 |
 | ✋ → ✅ 反应 | `silentTurnReactions` | 无按群命令 | 关卡的群自动有反应；`silentTurnReactions: true` 后连反应也静默 |
 | 卡面控件 | `hiddenStreamingCardButtons`（选定要藏起的按钮） | — | 全部显示 |
 | 卡片置顶 | `pinStreamingCard`（默认关） | `/card pin off｜on｜status` | 关 |
@@ -70,7 +70,7 @@ botmux 在飞书里的「存在感」分四层，各自独立开关：
 
 **`/card`、`/cot` 只有管理员（`allowedUsers`，canOperate）能执行**，查询类子命令也一样。原因：飞书卡片没有「按人显示不同视图」的能力，这些开关是 bot 级 / 群级的，一改**全群所有人**看到的界面都变，因此只交给管理员；访客（有对话权、无操作权）执行会收到「仅授权用户可用」提示。
 
-**精简预设**（Dashboard「Bot 默认」页，本批次新增）：一键做**一次联动写入**——`thinkingCard:false` + `silentTurnReactions:true` + `disableStreamingCard:true`，适合只想安静看结论的群。注意它**不是持续绑定**：本质是把这三个已有开关一次性写成上述值并 toast 提示；之后关掉预设**不会**把三个值回改，想恢复哪一项就手动开哪一项。
+**精简预设**（Dashboard「Bot 默认」页，本批次新增）：一键做**一次联动写入**——`cotEnabled:false` + `silentTurnReactions:true` + `disableStreamingCard:true`，适合只想安静看结论的群。注意它**不是持续绑定**：本质是把这三个已有开关一次性写成上述值并 toast 提示；之后关掉预设**不会**把三个值回改，想恢复哪一项就手动开哪一项。
 
 ## 置顶当前实时卡片
 

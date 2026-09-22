@@ -24,10 +24,13 @@ describe('dashboard plugin pin UI', () => {
   });
 
   it('separates global enablement from per-Bot additions', () => {
-    expect(pluginPage).toContain('function PluginGlobalSetting(');
-    expect(pluginPage).toContain('<strong>全局启用</strong>');
+    expect(pluginPage).not.toContain('function PluginGlobalSetting(');
     expect(pluginPage).toContain('function PluginBotSettings(');
-    expect(pluginPage).toContain('!enabledGlobal && !globalTogglePending');
+    expect(pluginPage).toContain('className="toggle-row plugin-global-toggle"');
+    expect(pluginPage).toContain('<span>为所有 Bot 启用</span>');
+    expect(pluginPage).toContain('checked={props.globalEnabled}');
+    expect(pluginPage).toContain("onChange={event => props.onToggle('global', event.currentTarget.checked)}");
+    expect(pluginPage).toContain('props.globalEnabled ? (');
     expect(pluginPage).toContain('plugin-enable-list');
     expect(pluginPage).toContain('bots.map(bot =>');
     expect(pluginPage).toContain('onChange={event => props.onToggle(props.scope, event.currentTarget.checked)}');
@@ -36,7 +39,8 @@ describe('dashboard plugin pin UI', () => {
     expect(pluginPage).not.toContain('独立设置');
     expect(pluginPage).not.toContain('data-plugin-scope');
     expect(pluginPage).not.toContain('配置范围');
-    expect(css).toContain('.plugin-global-setting');
+    expect(css).not.toContain('.plugin-global-setting');
+    expect(css).toContain('.plugin-global-toggle');
     expect(css).toContain('.plugin-enable-panel');
     expect(css).toMatch(/\.plugin-enable-list \.plugin-enable-row\s*\{[^}]*padding:\s*11px 24px/s);
     expect(dashboard).toContain('onlineByAppId.get(bot.larkAppId)?.botName');
@@ -50,6 +54,9 @@ describe('dashboard plugin pin UI', () => {
     expect(pluginPage).toContain('data-plugin-expand={plugin.id}');
     expect(pluginPage).toContain("expanded ? '收起详情' : '展开详情'");
     expect(pluginPage).toContain('function PluginCapabilitySummary(');
+    expect(pluginPage).toContain('className="plugin-card-summary"');
+    expect(pluginPage).toContain('aria-expanded={props.expanded}');
+    expect(pluginPage).toContain('onClick={props.onToggle}');
     expect(pluginPage).toContain("className={`bd-card plugin-card${expanded ? ' is-expanded' : ' is-collapsed'}`}");
     expect(pluginPage).toContain('{expanded ? (');
     expect(css).toContain('.plugin-card-summary');

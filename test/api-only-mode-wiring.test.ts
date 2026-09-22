@@ -313,7 +313,7 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
   });
 
   it('scheduleCardPatch is a defense-in-depth no-op for no-transport sessions', () => {
-    const block = region(workerPoolSource, 'export function scheduleCardPatch(', 'if (streamingCardDisabled(ds, turnId)) return;');
+    const block = region(workerPoolSource, 'export function scheduleCardPatch(', 'if (streamingCardDisabled(ds, turnId)) return false;');
     expect(block).toContain('larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })');
   });
 
@@ -706,15 +706,15 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
     // CRITICAL: must NOT name-only kill — an isolated/MCP herdr agent lives on the
     // SHARED host session `botmux`, so a name-only killPersistentSession('herdr',
     // 'botmux') would tear down every bot's agent. Mirror the migration effects:
-    // target helper for herdr's agent scope, frozen-PID path for ZMX identity.
+    // target helper for herdr's agent scope, frozen PID + socket dir for ZMX identity.
     const teardown = region(commitBlock,
       'const teardownTarget = selectedBackend.persistentBackendTarget;', 'Condition #2:');
     // Dispatches on the pure, behaviorally-tested policy (read-isolation.test.ts).
     expect(teardown).toContain('persistentTeardownKillKind({');
     expect(teardown).toContain('killPersistentBackendTarget(teardownTarget!, cfg.sessionId)');
     expect(teardown).toContain('probePersistentBackendTarget(teardownTarget!)');
-    expect(teardown).toContain('ZmxBackend.killManagedSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid)');
-    expect(teardown).toContain('probeOwnedZmxSession(persistentSessionName, cfg.sessionId).probe');
+    expect(teardown).toContain('ZmxBackend.killManagedSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid, zmxEnv(process.env, resolvedZmxSocketDir))');
+    expect(teardown).toContain('probeOwnedZmxSession(persistentSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe');
     expect(teardown).toContain("postKill !== 'missing'");
     expect(teardown).toContain('pending proof retained');
 
