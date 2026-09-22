@@ -1,8 +1,8 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { readPidFile, waitForPidFile } from './helpers/pid-file.js';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { killFixturePid, readPidFile, waitForPidFile } from './helpers/pid-file.js';
 
 let dir: string;
 let file: string;
@@ -29,4 +29,17 @@ describe('PID fixture readiness', () => {
     expect(readPidFile(file)).toBeUndefined();
     await expect(waitForPidFile(file, 0)).rejects.toThrow('Timed out');
   });
+
+  it.each([0, 1, -1, 2.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1])(
+    'never signals an unsafe fixture PID %s',
+    pid => {
+      const kill = vi.spyOn(process, 'kill').mockImplementation(() => true);
+      try {
+        expect(killFixturePid(pid)).toBe(false);
+        expect(kill).not.toHaveBeenCalled();
+      } finally {
+        kill.mockRestore();
+      }
+    },
+  );
 });

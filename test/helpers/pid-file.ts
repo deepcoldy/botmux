@@ -25,3 +25,10 @@ export async function waitForPidFile(path: string, timeoutMs = 8_000): Promise<n
   } while (true);
   throw new Error(`Timed out waiting for a complete positive PID in ${path}`);
 }
+
+/** Best-effort fixture cleanup that can never signal init or a process group. */
+export function killFixturePid(pid: number, signal: NodeJS.Signals = 'SIGKILL'): boolean {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return false;
+  try { return process.kill(pid, signal); }
+  catch { return false; }
+}
