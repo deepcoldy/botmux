@@ -139,13 +139,17 @@ export function normalizeSessionRow(
   row: RawSessionRow,
   options: { observedAt: number; probe?: ObserveProbe; includeRaw?: boolean },
 ): ObserveSession {
+  const probe = options.probe ?? { status: 'ok', source: 'daemon-ipc' };
+  const hasRuntimeFacts = probe.status === 'ok';
   const status = typeof row.status === 'string' ? row.status : undefined;
-  const closed = status === 'closed';
+  const closed = hasRuntimeFacts ? status === 'closed' : 'unknown';
   const dormant = status === 'dormant';
   const queuedFlag = row.queued;
-  const queued: ObserveQueued = typeof queuedFlag === 'boolean' ? queuedFlag : 'unknown';
+  const queued: ObserveQueued = hasRuntimeFacts && typeof queuedFlag === 'boolean' ? queuedFlag : 'unknown';
 
-  const liveness: ObserveLiveness = closed
+  const liveness: ObserveLiveness = !hasRuntimeFacts
+    ? 'unknown'
+    : closed
     ? 'closed'
     : dormant || queued === true
       ? 'not_running'
@@ -153,7 +157,7 @@ export function normalizeSessionRow(
         ? 'alive'
         : 'unknown';
 
-  const turn: ObserveTurn = closed || dormant
+  const turn: ObserveTurn = !hasRuntimeFacts || closed || dormant
     ? 'unknown'
     : queued === true
       ? 'idle'
@@ -181,7 +185,9 @@ export function normalizeSessionRow(
   if (typeof row.cliVersion === 'string' && row.cliVersion) cli.version = row.cliVersion;
   if (typeof row.cliInstanceId === 'string' && row.cliInstanceId) cli.instanceId = row.cliInstanceId;
 
-  const backend: ObserveSession['backend'] = { adopted: row.adopt === true };
+  const backend: ObserveSession['backend'] = {
+    adopted: hasRuntimeFacts ? row.adopt === true : 'unknown',
+  };
   if (typeof row.backendType === 'string' && row.backendType) backend.type = row.backendType;
   if (typeof row.backendSessionName === 'string' && row.backendSessionName) {
     backend.sessionName = row.backendSessionName;
@@ -192,7 +198,7 @@ export function normalizeSessionRow(
   const observe: ObserveSession = {
     schemaVersion: OBSERVE_SCHEMA_VERSION,
     observedAt: options.observedAt,
-    probe: options.probe ?? { status: 'ok', source: 'daemon-ipc' },
+    probe,
     identity,
     cli,
     backend,
@@ -200,7 +206,7 @@ export function normalizeSessionRow(
     turn,
     phase: 'unknown',
     queued,
-    parkedOrSuspended: dormant || queued === true,
+    parkedOrSuspended: hasRuntimeFacts ? dormant || queued === true : 'unknown',
     closed,
   };
 

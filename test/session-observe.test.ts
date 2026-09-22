@@ -161,7 +161,7 @@ describe('session-observe normalizer', () => {
 
   it('honors caller-provided probe status (e.g. not_found for session-level miss)', () => {
     const observe = normalizeSessionRow(
-      { sessionId: 's_missing' },
+      { sessionId: 's_missing', status: 'working', queued: false, adopt: true },
       {
         observedAt: OBSERVED_AT,
         probe: { status: 'not_found', source: 'daemon-ipc', larkAppId: 'cli_app_1' },
@@ -170,6 +170,9 @@ describe('session-observe normalizer', () => {
     expect(observe.liveness).toBe('unknown');
     expect(observe.turn).toBe('unknown');
     expect(observe.queued).toBe('unknown');
+    expect(observe.backend.adopted).toBe('unknown');
+    expect(observe.parkedOrSuspended).toBe('unknown');
+    expect(observe.closed).toBe('unknown');
     expect(observe.probe).toEqual({ status: 'not_found', source: 'daemon-ipc', larkAppId: 'cli_app_1' });
     expect(observe.identity.sessionId).toBe('s_missing');
   });

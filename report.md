@@ -92,7 +92,7 @@ import type { ObserveSession } from 'botmux/services/session-observe';
 const snap = await fetchObserveSnapshot({ larkAppId });
 const s: ObserveSession = await fetchObserveSession(sessionId, { larkAppId });
 ```
-以上两个稳定 subpath 由 npm 包显式导出，并随包发布对应 JavaScript、类型声明和 source map。
+以上两个稳定 subpath 由 npm 包显式导出，并随包发布 `public-api/` 下独立 bundle、类型声明和 source map；完整 `dist/` 继续排除在 tarball 外。
 
 ## 边界与放弃项
 - 未新增 `session list --json`：既有 `botmux session list --json` 只列 headless automation session（`src/cli/session-command.ts` 中的定义），不覆盖普通 SessionRow；沿用它的 JSON 会让语义更混乱，所以另开 `observe` 子命令。

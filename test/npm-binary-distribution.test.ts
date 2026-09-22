@@ -135,6 +135,24 @@ describe('package.json — lockfile safety and packaging', () => {
       expect(paths, `${entry} must not ship: it imports node-pty, which is not a dependency`).not.toContain(entry);
     }
     expect(paths.filter(p => p.startsWith('dist/'))).toEqual([]);
+    expect(paths.filter(p => p.startsWith('public-api/')).sort()).toEqual([
+      'public-api/session-observe-fetch.d.ts',
+      'public-api/session-observe-fetch.js',
+      'public-api/session-observe-fetch.js.map',
+      'public-api/session-observe.d.ts',
+      'public-api/session-observe.js',
+      'public-api/session-observe.js.map',
+    ]);
+    expect(manifest.exports).toEqual({
+      './services/session-observe': {
+        types: './public-api/session-observe.d.ts',
+        import: './public-api/session-observe.js',
+      },
+      './services/session-observe-fetch': {
+        types: './public-api/session-observe-fetch.d.ts',
+        import: './public-api/session-observe-fetch.js',
+      },
+    });
     // The pm2 ecosystem file names dist/index-daemon.js as its `script`. Nothing in
     // the source tree reads it (the supervisor replaced pm2), so its only remaining
     // effect is telling a human to start the broken form by hand.

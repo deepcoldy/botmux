@@ -5,18 +5,18 @@
   "type": "module",
   "exports": {
     "./services/session-observe": {
-      "types": "./dist/services/session-observe.d.ts",
-      "import": "./dist/services/session-observe.js"
+      "types": "./public-api/session-observe.d.ts",
+      "import": "./public-api/session-observe.js"
     },
     "./services/session-observe-fetch": {
-      "types": "./dist/services/session-observe-fetch.d.ts",
-      "import": "./dist/services/session-observe-fetch.js"
+      "types": "./public-api/session-observe-fetch.d.ts",
+      "import": "./public-api/session-observe-fetch.js"
     }
   },
   "files": [
     "scripts/postinstall-bin.mjs",
     "scripts/install-path-entry.mjs",
-    "dist",
+    "public-api",
     "README.md",
     "README.en.md",
     "LICENSE"
@@ -26,7 +26,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "bun run audit:domains && node scripts/generate-app-icon-data.mjs && node scripts/clean-dist.mjs && tsc && bun run typecheck:scripts && bun run typecheck:test-mocks && node scripts/generate-runtime-build-id.mjs && cp src/setup/lark-scopes.json dist/setup/ && bun run dashboard:bundle && chmod +x dist/cli.js && node scripts/audit-dist.mjs && node scripts/audit-embedded-assets.mjs --require-dist",
+    "build": "bun run audit:domains && node scripts/generate-app-icon-data.mjs && node scripts/clean-dist.mjs && tsc && node scripts/build-observe-public-api.mjs && bun run typecheck:scripts && bun run typecheck:test-mocks && node scripts/generate-runtime-build-id.mjs && cp src/setup/lark-scopes.json dist/setup/ && bun run dashboard:bundle && chmod +x dist/cli.js && node scripts/audit-dist.mjs && node scripts/audit-embedded-assets.mjs --require-dist",
     "verify:binary": "bun scripts/verify-binary.mjs",
     "typecheck:scripts": "tsc -p tsconfig.scripts.json",
     "typecheck:test-mocks": "tsc -p tsconfig.test-mocks.json",
@@ -70,6 +70,7 @@
     "desktop:pack": "bun run desktop:pack:local",
     "desktop:pack:local": "node scripts/desktop-pack-local.mjs",
     "prepublishOnly": "npm run build",
+    "prepack": "node scripts/build-observe-public-api.mjs",
     "postinstall": "node scripts/postinstall-bin.mjs",
     "prepare": "git config core.hooksPath scripts/git-hooks 2>/dev/null || true"
   },
