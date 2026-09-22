@@ -34,6 +34,10 @@ export function applyCompanionStartupOptions(input: {
   }
   input.validateSecret(secretFile);
   const matches = input.bots.filter(bot => bot.larkAppId === botAppId);
+  // Runtime deliberately checks the legacy boolean ONLY (not the declared
+  // union above): a scratch bot persists the STRING 'scratch', which is
+  // truthy-but-not-true and therefore correctly rejected here — scratch has no
+  // credential boundary, so it can't be a companion-isolated codex/traex.
   if (matches.length !== 1 || matches[0].sandbox !== true
     || (matches[0].cliId !== 'codex' && matches[0].cliId !== 'traex')) {
     // Deliberately omit the selected app id and all config details: this is a

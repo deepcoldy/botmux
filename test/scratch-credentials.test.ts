@@ -10,6 +10,7 @@ afterEach(() => rmSync(root, { recursive: true, force: true }));
 
 const home = () => join(root, 'home');
 const data = () => join(home(), 'data');
+const larkData = () => join(root, 'larkdata');
 const app = 'app1';
 
 function layout() {
@@ -21,6 +22,20 @@ function layout() {
   writeFileSync(join(home(), 'bots', app, 'send-cred.json'), '{}');
   writeFileSync(join(data(), 'webhook-master.key'), 'k');
   writeFileSync(join(data(), 'webhook-secrets.json'), '{}');
+  // per-person OAuth user tokens (dynamic appId/openId names)
+  writeFileSync(join(data(), 'user-token-cli_x-ou_person1.json'), '{}');
+  writeFileSync(join(data(), 'user-token-cli_x.json'), '{}'); // legacy per-app
+  writeFileSync(join(data(), 'user-token.json'), '{}');         // legacy global
+  writeFileSync(join(data(), 'notes.txt'), 'not a token');      // non-secret
+  // per-person secret dirs
+  mkdirSync(join(data(), 'vc-meeting-daemon-auth'), { recursive: true });
+  writeFileSync(join(data(), 'vc-meeting-daemon-auth', '57'), 't');
+  mkdirSync(join(data(), 'bytedcli-home', 'ou_p'), { recursive: true });
+  writeFileSync(join(data(), 'bytedcli-home', 'ou_p', 'login.json'), '{}');
+  // REAL Linux lark-cli keystore: point LARKSUITE_CLI_DATA_DIR under root so
+  // the test never writes into the runner's real ~/.local/share.
+  mkdirSync(join(larkData(), 'lark-cli'), { recursive: true });
+  writeFileSync(join(larkData(), 'lark-cli', 'master.key'), 'm');
   // non-secret siblings that must NOT be blanket-enumerated
   mkdirSync(join(home(), 'bin'), { recursive: true });
   writeFileSync(join(home(), 'bin', 'botmux'), '#!/bin/sh');
@@ -30,6 +45,7 @@ function layout() {
 describe('enumerateScratchSecretPaths', () => {
   it('enumerates all transport-credential classes but not ordinary dirs/files', () => {
     layout();
+    process.env.LARKSUITE_CLI_DATA_DIR = larkData();
     const got = new Set(enumerateScratchSecretPaths({
       botmuxHomes: [home()],
       dataDirs: [data()],
@@ -41,10 +57,21 @@ describe('enumerateScratchSecretPaths', () => {
     expect(got.has(join(home(), 'bots', app, 'send-cred.json'))).toBe(true);
     expect(got.has(join(data(), 'webhook-master.key'))).toBe(true);
     expect(got.has(join(data(), 'webhook-secrets.json'))).toBe(true);
+    // per-person user tokens matched by prefix, plus all legacy names
+    expect(got.has(join(data(), 'user-token-cli_x-ou_person1.json'))).toBe(true);
+    expect(got.has(join(data(), 'user-token-cli_x.json'))).toBe(true);
+    expect(got.has(join(data(), 'user-token.json'))).toBe(true);
+    expect(got.has(join(data(), 'notes.txt'))).toBe(false);
+    // per-person secret dirs enclosed wholesale
+    expect(got.has(join(data(), 'vc-meeting-daemon-auth'))).toBe(true);
+    expect(got.has(join(data(), 'bytedcli-home'))).toBe(true);
+    // real Linux lark-cli keystore ($LARKSUITE_CLI_DATA_DIR/lark-cli)
+    expect(got.has(join(larkData(), 'lark-cli'))).toBe(true);
     // ordinary top-level dir/file are NOT secrets
     expect(got.has(join(home(), 'bin'))).toBe(false);
     expect(got.has(join(home(), 'bin', 'botmux'))).toBe(false);
     expect(got.has(join(data(), 'schedules'))).toBe(false);
+    delete process.env.LARKSUITE_CLI_DATA_DIR;
   });
 
   it('adds external BOTS_CONFIG sidecar siblings outside the botmux home', () => {
@@ -60,10 +87,16 @@ describe('enumerateScratchSecretPaths', () => {
     expect(got).not.toContain(join(root, 'elsewhere', 'unrelated.txt'));
   });
 
-  it('skips absent paths and tolerates missing homes', () => {
-    // nothing laid out
+  it('skips absent botmux paths but still masks a real host lark-cli keystore', () => {
+    // No fake botmux home/data laid out. The enumerator returns at most the
+    // HOST's own lark-cli keystores (a real secret it must never un-mask),
+    // never anything from the absent fake homes.
     const got = enumerateScratchSecretPaths({ botmuxHomes: [home(), join(root, 'nope')], dataDirs: [data()] });
-    expect(got).toEqual([]);
+    for (const p of got) {
+      expect(p.startsWith(home())).toBe(false);
+      expect(p.startsWith(join(root, 'nope'))).toBe(false);
+      expect(p.includes('lark-cli')).toBe(true); // only host lark-cli stores
+    }
   });
 
   it('encloses the per-bot secret without exposing the whole bots dir', () => {

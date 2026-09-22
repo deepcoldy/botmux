@@ -55,7 +55,8 @@ import {
 import { PROXY_ENV_KEYS, CA_BUNDLE_ENV_KEYS } from '../../utils/child-env.js';
 import type { ScratchPathMapping } from '../../services/scratch-host-view.js';
 
-export type ScratchStorage = 'disk';
+export type ScratchStorage = 'disk'; // macOS: always APFS-COW-backed; the Linux
+// module's same-named type is 'tmpfs' | 'disk'. Config accepts either string.
 
 /** Max time a single clonefile subtree copy may take. Core CLI dirs get the
  *  full budget; best-effort config dirs get a short one before degrading. */

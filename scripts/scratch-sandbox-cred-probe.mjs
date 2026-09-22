@@ -38,17 +38,28 @@ const sid = `probe-cred-${process.pid}-${Date.now()}`;
 mkdirSync(join(botmuxHome, 'bots', appId), { recursive: true });
 mkdirSync(dataDir, { recursive: true });
 mkdirSync(join(homedir(), '.lark-cli'), { recursive: true });
+mkdirSync(join(homedir(), '.local', 'share', 'lark-cli'), { recursive: true });
+mkdirSync(join(dataDir, 'vc-meeting-daemon-auth'), { recursive: true });
+mkdirSync(join(dataDir, 'bytedcli-home', 'ou-someone'), { recursive: true });
 const BOTS = join(botmuxHome, 'bots.json');
 const SECRET = join(botmuxHome, '.dashboard-secret');
 const SIDECAR = `${BOTS}.bak-1`;
 const SEND_CRED = join(botmuxHome, 'bots', appId, 'send-cred.json');
 const WEBHOOK = join(dataDir, 'webhook-master.key');
 const LARK_STORE = join(homedir(), '.lark-cli');
+const LARK_STORE_REAL = join(homedir(), '.local', 'share', 'lark-cli');
+const USER_TOKEN = join(dataDir, `user-token-cli_x-${'ou'.repeat(8)}.json`);
+const VC_TOKEN = join(dataDir, 'vc-meeting-daemon-auth', '57');
+const BYTEDCLI_LOGIN = join(dataDir, 'bytedcli-home', 'ou-someone', 'login.json');
 writeFileSync(BOTS, JSON.stringify([{ larkAppId: appId, larkAppSecret: 'SECRET-appsecret-XYZ' }]));
 writeFileSync(SIDECAR, 'OLD-SECRET-sidecar');
 writeFileSync(SECRET, 'SECRET-dashboard-hmac-123');
 writeFileSync(SEND_CRED, JSON.stringify({ sendSecret: 'SECRET-sendcred-ABC' }));
 writeFileSync(WEBHOOK, 'SECRET-webhook-key');
+writeFileSync(USER_TOKEN, JSON.stringify({ access_token: 'SECRET-user-access-token' }));
+writeFileSync(VC_TOKEN, '57-SECRET-vcda');
+writeFileSync(BYTEDCLI_LOGIN, JSON.stringify({ openId: 'SECRET-bytedcli-login' }));
+writeFileSync(join(LARK_STORE_REAL, 'master.key'), 'SECRET-real-lark-master');
 const larkMarker = join(LARK_STORE, '.cred-probe-marker');
 let larkStoreProbeable = false;
 try { writeFileSync(larkMarker, 'SECRET-larkstore'); larkStoreProbeable = true; } catch { /* TCC */ }
@@ -64,7 +75,11 @@ try {
   check('enumerator found dashboard secret', denyPaths.includes(SECRET));
   check('enumerator found per-bot send-cred.json', denyPaths.includes(SEND_CRED));
   check('enumerator found webhook key', denyPaths.includes(WEBHOOK));
-  check('enumerator found shared lark-cli store', denyPaths.includes(LARK_STORE));
+  check('enumerator found per-person user-token', denyPaths.includes(USER_TOKEN));
+  check('enumerator found vc daemon auth dir', denyPaths.includes(join(dataDir, 'vc-meeting-daemon-auth')));
+  check('enumerator found bytedcli-home dir', denyPaths.includes(join(dataDir, 'bytedcli-home')));
+  check('enumerator found legacy ~/.lark-cli store', denyPaths.includes(LARK_STORE));
+  check('enumerator found REAL ~/.local/share/lark-cli store', denyPaths.includes(LARK_STORE_REAL));
 
   const sbx = prepareScratchSandbox({
     sessionId: sid,
@@ -95,6 +110,10 @@ try {
   check('dashboard secret hidden', secretHidden(SECRET, 'dashboard-hmac'));
   check('per-bot send-cred.json hidden', secretHidden(SEND_CRED, 'sendcred-ABC'));
   check('webhook key hidden', secretHidden(WEBHOOK, 'webhook-key'));
+  check('per-person user access token hidden', secretHidden(USER_TOKEN, 'user-access-token'));
+  check('vc daemon auth token hidden (dir mask)', secretHidden(VC_TOKEN, 'SECRET-vcda'));
+  check('bytedcli login hidden (dir mask)', secretHidden(BYTEDCLI_LOGIN, 'SECRET-bytedcli-login'));
+  check('REAL lark-cli master.key hidden', secretHidden(join(LARK_STORE_REAL, 'master.key'), 'real-lark-master'));
   if (larkStoreProbeable) check('shared lark-cli store hidden', secretHidden(larkMarker, 'larkstore'));
 
   // Non-secret system file still readable (read-all posture intact).

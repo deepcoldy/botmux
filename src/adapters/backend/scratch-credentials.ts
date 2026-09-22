@@ -25,6 +25,7 @@
 import { existsSync, lstatSync, readdirSync } from 'node:fs';
 import { join, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
+import { resolveLarkCliLinuxStoreDir } from '../cli/fs-policy.js';
 
 export interface ScratchSecretInput {
   /** All botmux authority homes (~/.botmux + custom BOTMUX_HOME variants). */
@@ -90,13 +91,42 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): string[]
     addFile(join(dataDir, 'webhook-secrets.json'));
     addFile(join(dataDir, 'feedback-webhook-secrets.json'));
     addFile(join(dataDir, 'master.key'));
+
+    // Per-PERSON OAuth User Access Tokens. Named dynamically
+    // (user-token-<appId>-<openId>.json, legacy user-token-<appId>.json /
+    // user-token.json), so scan the data-dir top level by prefix rather than
+    // a fixed list — an agent reading another person's token is the exact
+    // boundary tokenStoreProtection describes.
+    try {
+      for (const name of readdirSync(dataDir)) {
+        if (name === 'user-token.json' || name.startsWith('user-token-')) {
+          addFile(join(dataDir, name));
+        }
+      }
+    } catch { /* */ }
+
+    // Per-person secret subdirectories (whole dirs): VC daemon auth tokens
+    // and each person's bytedcli login HOME. The CLI never needs these inside
+    // a scratch turn (they are daemon-side / per-owner).
+    for (const secretDir of ['vc-meeting-daemon-auth', 'bytedcli-home']) {
+      const p = join(dataDir, secretDir);
+      if (isDir(p)) out.add(p);
+    }
   }
 
-  // Shared lark-cli keystore (cross-app appsecret_*.enc). The per-bot store
-  // (~/.lark-cli-bots/<appId>) is deliberately NOT included — it is the bot's
-  // own isolated login the sandboxed lark-cli is allowed to use.
-  const sharedLarkStore = join(homedir(), '.lark-cli');
-  if (existsSync(sharedLarkStore)) out.add(sharedLarkStore);
+  // Shared lark-cli keystore(s) holding every app's encrypted appsecret + the
+  // master.key that decrypts them. On Linux the REAL store is
+  // ~/.local/share/lark-cli (or $LARKSUITE_CLI_DATA_DIR/lark-cli) — NOT
+  // ~/.lark-cli (a separate legacy form). Mask every form that exists; missing
+  // ones are dropped. (macOS uses ~/Library/Application Support/lark-cli,
+  // handled by the darwin module's authority-root seal.)
+  const larkStoreCandidates = new Set<string>([
+    join(homedir(), '.lark-cli'),
+    resolveLarkCliLinuxStoreDir(process.env.LARKSUITE_CLI_DATA_DIR, homedir()),
+  ]);
+  for (const p of larkStoreCandidates) {
+    if (existsSync(p)) out.add(p);
+  }
 
   return [...out];
 }
