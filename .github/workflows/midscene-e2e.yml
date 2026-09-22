@@ -28,7 +28,7 @@ jobs:
     name: Run Midscene and build report
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    timeout-minutes: 330
     permissions:
       contents: read
     outputs:
@@ -108,7 +108,9 @@ jobs:
           bun run test -- test/midscene-suite.test.ts
 
       - name: Install Chromium
-        run: bun x playwright install --with-deps chromium
+        run: |
+          bun x playwright install --with-deps chromium
+          sudo apt-get install -y fonts-noto-cjk
 
       - name: Build Botmux
         run: bun run build
@@ -146,6 +148,7 @@ jobs:
 
       - name: Run migrated Feishu Midscene project
         id: feishu_midscene
+        timeout-minutes: 300
         # The credential-free smoke case and the authenticated Feishu suite are
         # independent report producers. A failure in either must not hide the
         # other suite's evidence.

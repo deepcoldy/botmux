@@ -191,15 +191,15 @@ async function loadSuites(moduleName: string): Promise<RegisteredSuite[]> {
 export async function runFeishuScenario(scenario: FeishuScenario): Promise<void> {
   const { suite, test } = await resolveScenario(scenario);
 
-  let setupCompleted = false;
   try {
     for (const hook of suite.beforeAll) await hook();
-    setupCompleted = true;
     await test.run();
   } finally {
-    if (setupCompleted) {
-      for (const hook of [...suite.afterAll].reverse()) await hook();
-    }
+    // Match test-runner teardown semantics: a partially completed beforeAll may
+    // already have created a browser, context, page, or agent. Always execute
+    // cleanup so a setup failure cannot leave Chromium handles alive and keep
+    // the Midscene CLI process running after it has printed the final summary.
+    for (const hook of [...suite.afterAll].reverse()) await hook();
   }
 }
 
