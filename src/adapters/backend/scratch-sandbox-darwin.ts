@@ -42,7 +42,6 @@ import {
   statSync,
   lstatSync,
   realpathSync,
-  statfsSync,
   symlinkSync,
   readlinkSync,
 } from 'node:fs';
@@ -58,8 +57,26 @@ import type { ScratchPathMapping } from '../../services/scratch-host-view.js';
 
 export type ScratchStorage = 'disk';
 
-/** Max time a single clonefile subtree copy may take. */
-const CLONE_TIMEOUT_MS = 5 * 60_000;
+/** Max time a single clonefile subtree copy may take. Core CLI dirs get the
+ *  full budget; best-effort dot-dirs get a shorter one before degrading. */
+const CLONE_TIMEOUT_CORE_MS = 5 * 60_000;
+const CLONE_TIMEOUT_BESTEFFORT_MS = 45_000;
+
+/** CLI state dirs cloned REQUIRED (fail-closed): sessions/auth/config of the
+ *  supported CLIs must be writable COW for scratch to function. */
+const CORE_CLONE_HOME_DIRS = new Set([
+  '.claude',
+  '.codex',
+  '.trae',
+  '.trae-cn',
+  '.claude-runtime',
+]);
+
+/** Top-level dot-dirs NEVER cloned (TCC-protected / virtual / guaranteed
+ *  useless to a CLI): symlinked and write-sealed. */
+const NEVER_CLONE_HOME_DIRS = new Set([
+  '.Trash',
+]);
 
 export interface MacScratchSandboxSpawn {
   bin: string;
@@ -88,12 +105,6 @@ interface MacScratchMeta {
 
 const META_NAME = 'scratch.json';
 
-/** Subtrees under $HOME replaced with real clonefile copies (CLI state the
- *  session is allowed to mutate; everything else stays a read passthrough).
- *  In practice EVERY top-level dot-directory is cloned (dev state: .npm,
- *  .bun, .local, .config, .cache, .cargo, …) EXCEPT the botmux authority
- *  roots, which stay symlinks sealed by real-path denies (so a cloned copy
- *  can never carry bots.json into the sandbox). */
 function canonical(p: string): string {
   try { return realpathSync(p); } catch { return resolve(p); }
 }
@@ -103,13 +114,13 @@ function sameVolume(a: string, b: string): boolean {
 }
 
 /** `cp -c src dst` (APFS clonefile). Never -p (would copy ACL/uchg/flags that
- *  later block cleanup). Bounded timeout so a stuck clone (cloud placeholder)
- *  fails the spawn instead of hanging the worker forever. */
-function clonePath(src: string, dst: string): boolean {
+ *  later block cleanup). Bounded timeout so a stuck/oversized subtree fails
+ *  fast and the caller can degrade it to a symlink instead of hanging. */
+function clonePath(src: string, dst: string, timeoutMs: number): boolean {
   try { mkdirSync(dirname(dst), { recursive: true }); } catch { /* */ }
   const r = spawnSync('/bin/cp', ['-cR', src, dst], {
     stdio: 'pipe',
-    timeout: CLONE_TIMEOUT_MS,
+    timeout: timeoutMs,
   });
   if (r.error) {
     console.error(`[scratch-darwin] cp -c timed out/errored (${src}): ${r.error.message}`);
@@ -122,15 +133,6 @@ function clonePath(src: string, dst: string): boolean {
   return existsSync(dst);
 }
 
-/** Logical size in bytes of a subtree (du -sk); null on failure. Used to sanity
- *  check the copy really was COW (disk consumed must not approach source size). */
-function logicalSizeKb(path: string): number | null {
-  const r = spawnSync('/usr/bin/du', ['-sk', path], { stdio: ['ignore', 'pipe', 'ignore'], timeout: 30_000 });
-  if (r.status !== 0) return null;
-  const kb = parseInt(r.stdout.toString().trim().split(/\s+/)[0] ?? '', 10);
-  return Number.isFinite(kb) ? kb : null;
-}
-
 function has(cmd: string): boolean {
   return spawnSync('/bin/sh', ['-c', `command -v ${cmd}`], { stdio: 'ignore' }).status === 0;
 }
@@ -139,13 +141,29 @@ function escSb(p: string): string {
   return p.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 }
 
-/** Pure Seatbelt profile builder (unit-tested on Linux CI). */
+/** Pure Seatbelt profile builder (unit-tested on Linux CI).
+ *
+ * Rule ordering (last match wins in Seatbelt):
+ *  1. global `(deny file-write*)` + system/host-cache grants
+ *  2. authorityRootDenies — broad READ+write seal over botmux secret roots
+ *     (~/.botmux …). Emitted before the scratch-tree re-open so that when the
+ *     session tree lives UNDER a sealed root (default dataDir=~/.botmux/data)
+ *     the deeper grant below can carve it back out.
+ *  3. writable — the session clone trees / tmp / outbox / shim (re-open)
+ *  4. mcp socket literal grants
+ *  5. fileDenyPaths — file/subtree credential denies + symlink-degraded
+ *     subtree write-denies + user denies, emitted LAST so they always win. */
 export function buildMacScratchProfile(input: {
-  /** Clone trees + scratch tmp/outbox granted read+write. */
+  /** Scratch trees granted read+write (clone trees, session tmp/outbox/shim). */
   writable: readonly string[];
-  /** REAL host paths denied read AND write (credentials; also seals reads
-   *  reached via the symlink farm). Emitted LAST so they win. */
-  realDenyPaths?: readonly string[];
+  /** Secret/authority roots sealed READ+write before the scratch re-open. */
+  authorityRootDenies?: readonly string[];
+  /** Final file/subtree denies (read+write for secrets; write-only callers
+   *  should be pre-suffixed via the input shape below if needed). */
+  fileDenyPaths?: readonly string[];
+  /** Final WRITE-only denies (subtrees degraded from clone to symlink must be
+   *  read-native but never writable, so writes can't silently reach the host). */
+  fileWriteDenyPaths?: readonly string[];
   /** REAL host cache areas granted write (Foundation/cfprefsd ignore HOME). */
   hostWritable?: readonly string[];
   mcpSocket?: string;
@@ -166,23 +184,33 @@ export function buildMacScratchProfile(input: {
     '(allow iokit-open)',
   ];
   // Host-real temp/cache areas some frameworks hard-code (independent of
-  // $HOME/TMPDIR). Grant before the final deny block.
+  // $HOME/TMPDIR).
   for (const w of input.hostWritable ?? []) {
     lines.push(`(allow file-write* (subpath "${escSb(w)}"))`);
   }
-  // The scratch clone trees + private tmp + outbox.
-  for (const w of input.writable) {
+  // Stage 2: broad secret-root seal (read+write).
+  for (const root of input.authorityRootDenies ?? []) {
+    if (!root || !isAbsolute(root)) continue;
+    lines.push(`(deny file-read* (subpath "${escSb(root)}"))`);
+    lines.push(`(deny file-write* (subpath "${escSb(root)}"))`);
+  }
+  // Stage 3: re-open the session scratch trees (deeper than a sealed root).
+  for (const w of input.writable ?? []) {
+    lines.push(`(allow file-read* (subpath "${escSb(w)}"))`);
     lines.push(`(allow file-write* (subpath "${escSb(w)}"))`);
   }
   if (input.mcpSocket) {
     lines.push(`(allow file-write* (literal "${escSb(input.mcpSocket)}"))`);
     lines.push(`(allow file-read* (literal "${escSb(input.mcpSocket)}"))`);
   }
-  // Credential denies LAST — they must win over any broader grant and they
-  // also block reads followed through the symlink farm.
-  for (const raw of input.realDenyPaths ?? []) {
+  // Stage 5: final denies win over everything above.
+  for (const raw of input.fileDenyPaths ?? []) {
     if (typeof raw !== 'string' || !raw || !isAbsolute(raw)) continue;
     lines.push(`(deny file-read* (subpath "${escSb(raw)}"))`);
+    lines.push(`(deny file-write* (subpath "${escSb(raw)}"))`);
+  }
+  for (const raw of input.fileWriteDenyPaths ?? []) {
+    if (typeof raw !== 'string' || !raw || !isAbsolute(raw)) continue;
     lines.push(`(deny file-write* (subpath "${escSb(raw)}"))`);
   }
   if (!input.net) lines.push('(deny network*)');
@@ -236,11 +264,13 @@ export function prepareMacScratchSandbox(opts: PrepareMacScratchOpts): MacScratc
   const cleanup = (): void => {
     if (cleanedUp) return;
     cleanedUp = true;
-    // Clones contain symlinks (deleted without touching targets) plus clonefile
-    // copies. Strip flags/ACLs defensively first (a cloned file could carry
-    // uchg/ACL), then remove.
+    // Clones hold clonefile copies (no -p, but mode bits are preserved: a 555
+    // dir would defeat rm) and symlinks. Strip flags, ACLs AND add user-write
+    // recursively before deleting — otherwise read-only subtrees leak as
+    // residuals (sweep/teardown share this function).
     spawnSync('/usr/sbin/chflags', ['-R', 'nouchg,noschg', cloneRoot], { stdio: 'ignore' });
     spawnSync('/bin/chmod', ['-RN', cloneRoot], { stdio: 'ignore' });
+    spawnSync('/bin/chmod', ['-R', 'u+w', cloneRoot], { stdio: 'ignore' });
     try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* best effort */ }
   };
   const fail = (where: string): null => {
@@ -258,23 +288,38 @@ export function prepareMacScratchSandbox(opts: PrepareMacScratchOpts): MacScratc
     return fail('home-read');
   }
 
-  // Botmux authority roots (bots.json, dashboard secret, BOT_HOMEs) must stay
-  // symlinks so the real-path read denies below actually reach them — a
-  // clonefile copy would carry the secrets into the sandbox.
+  // Secret/authority roots. Computed HERE from first principles (NOT trusted
+  // from the worker's deny list, which may not enumerate bots.json):
+  //  - standard botmux home ~/.botmux and any custom BOTMUX_HOME envs
+  //  - the data dir when it lives under $HOME (session trees are carved back
+  //    out by the deeper session grant in the profile)
+  // Each is sealed READ+write as an authority root in the profile; the farm
+  // entry stays a symlink (never cloned, so no secret copy exists).
   const authorityRoots = new Set<string>();
+  const addAuthority = (p: string | undefined): void => {
+    if (!p) return;
+    const c = canonical(p);
+    if (c === homeReal || !c.startsWith(homeReal.endsWith(sep) ? homeReal : `${homeReal}${sep}`)) return;
+    authorityRoots.add(c);
+  };
+  addAuthority(join(homeReal, '.botmux'));
+  addAuthority(process.env.BOTMUX_HOME);
+  addAuthority(process.env.BOTMUX_BOT_HOME);
+  addAuthority(process.env.BOTMUX_DATA_HOME);
+  if (dataDir.startsWith(homeReal)) {
+    // Seal only the botmux DATA parent that holds config/credentials, never the
+    // session root itself (which must stay writable).
+    addAuthority(dirname(dataDir));
+  }
+  // Extra top-level homes named by the caller's deny paths (e.g. ~/.ssh).
   for (const p of opts.denyPaths ?? []) {
     if (typeof p !== 'string' || !p) continue;
-    // Each credential file; walk up to the first directory INSIDE $HOME.
     let cur = canonical(p);
     while (dirname(cur) !== homeReal && cur !== dirname(cur) && cur.startsWith(homeReal)) cur = dirname(cur);
     if (dirname(cur) === homeReal) authorityRoots.add(cur);
   }
-  // Also always protect the data dir's botmux home derived from the standard
-  // location (~/.botmux) regardless of which files surfaced in denyPaths.
-  authorityRoots.add(join(homeReal, '.botmux'));
 
-  // Project may live INSIDE home: collect its relative path so the farm copies
-  // that leaf as a real clone instead of leaving a symlink.
+  // Project inside HOME → relative path + materialised ancestor dirs.
   const cwdInsideHome = cwdReal === homeReal || cwdReal.startsWith(homeReal.endsWith(sep) ? homeReal : `${homeReal}${sep}`);
   const cwdRel = cwdInsideHome ? relative(homeReal, cwdReal) : null;
   const cwdAncestorDirs = new Set<string>();
@@ -287,10 +332,26 @@ export function prepareMacScratchSandbox(opts: PrepareMacScratchOpts): MacScratc
     }
   }
 
-  const clonedSubtrees: { src: string; dst: string; logicalKb: number | null }[] = [];
+  // Subtrees that had to DEGRADE from clone → symlink (TCC denial, timeout,
+  // size cap). They stay read-native but get a final WRITE-only deny so agent
+  // writes can't silently land on the real host.
+  const degradedWriteDeny = new Set<string>();
+  const failedCore: string[] = [];
 
   const symlinkEntry = (target: string, link: string): void => {
     try { symlinkSync(target, link); } catch { /* already materialised */ }
+  };
+
+  /** Clone a subtree; on failure degrade to a symlink + write-seal. When
+   *  `required` (core CLI dirs / the project leaf) failure is fatal. */
+  const cloneOrDegrade = (src: string, dst: string, kind: 'core' | 'besteffort'): void => {
+    const timeout = kind === 'core' ? CLONE_TIMEOUT_CORE_MS : CLONE_TIMEOUT_BESTEFFORT_MS;
+    if (clonePath(src, dst, timeout)) return;
+    // Fallback to a read-native symlink, sealed against writes.
+    try { rmSync(dst, { recursive: true, force: true }); } catch { /* */ }
+    symlinkEntry(src, dst);
+    degradedWriteDeny.add(src);
+    if (kind === 'core') failedCore.push(src);
   };
 
   for (const ent of homeEntries) {
@@ -300,7 +361,6 @@ export function prepareMacScratchSandbox(opts: PrepareMacScratchOpts): MacScratc
     const isProjectAncestor = cwdAncestorDirs.has(name);
 
     if (isProjectAncestor && ent.isDirectory()) {
-      // Materialise a real (sparse) dir so the cloned project leaf lands in it.
       mkdirSync(linkInClone, { recursive: true });
       continue;
     }
@@ -313,57 +373,48 @@ export function prepareMacScratchSandbox(opts: PrepareMacScratchOpts): MacScratc
     }
 
     if (ent.isDirectory()) {
-      // All dot-directories = real clonefile copies (CLI dev state; bounded,
-      // no TCC/iCloud trees live there) EXCEPT botmux authority roots which
-      // stay symlinks sealed by real-path read denies. Non-dot dirs (Library,
-      // Documents, Desktop, …) are symlinks: native reads, writes denied — the
-      // TCC/cloud trees are never traversed.
-      if (name.startsWith('.') && !authorityRoots.has(realEntry)) {
-        clonedSubtrees.push({ src: realEntry, dst: linkInClone, logicalKb: logicalSizeKb(realEntry) });
-      } else {
+      if (authorityRoots.has(realEntry)) {
+        // Credential root: symlink + real-path seal (read+write in profile).
         symlinkEntry(realEntry, linkInClone);
+      } else if (NEVER_CLONE_HOME_DIRS.has(name)) {
+        // Known TCC/virtual: read-native symlink, write-sealed.
+        symlinkEntry(realEntry, linkInClone);
+        degradedWriteDeny.add(realEntry);
+      } else if (name.startsWith('.')) {
+        // Core CLI state dirs = required; other dot-dirs best-effort (bounded,
+        // degrade to sealed symlink on TCC/timeout instead of failing spawn).
+        cloneOrDegrade(realEntry, linkInClone, CORE_CLONE_HOME_DIRS.has(name) ? 'core' : 'besteffort');
+      } else {
+        // Non-dot dirs (Library/Documents/Desktop…): read-native, write sealed.
+        symlinkEntry(realEntry, linkInClone);
+        degradedWriteDeny.add(realEntry);
       }
       continue;
     }
 
     if (ent.isFile()) {
-      // Dotfiles (.claude.json, .zshrc, .gitconfig, .npmrc — Claude rewrites
-      // .claude.json every run) cloned for throwaway edits; others passthrough.
+      // Dotfiles (.claude.json/.zshrc/.gitconfig — Claude rewrites .claude.json
+      // every run) are tiny: required clone. Non-dot files pass through.
       if (name.startsWith('.')) {
-        clonedSubtrees.push({ src: realEntry, dst: linkInClone, logicalKb: null });
+        cloneOrDegrade(realEntry, linkInClone, 'core');
       } else {
         symlinkEntry(realEntry, linkInClone);
       }
     }
   }
 
-  // Project leaf nested under HOME (e.g. ~/iserver/proj).
+  // Project leaf nested under HOME — required clone.
   if (cwdRel) {
     const leaf = join(homeCloneRoot, cwdRel);
-    if (!existsSync(leaf)) {
-      clonedSubtrees.push({ src: cwdReal, dst: leaf, logicalKb: logicalSizeKb(cwdReal) });
-    }
+    if (!existsSync(leaf)) cloneOrDegrade(cwdReal, leaf, 'core');
   }
 
-  // Run the bounded clonefile copies.
-  for (const c of clonedSubtrees) {
-    const freeBefore = statfsSafe(c.src)?.bavail;
-    if (!clonePath(c.src, c.dst)) return fail(`clone:${basename(c.src)}`);
-    // COW guard: a byte-copy fallback consumes ~source size; clonefile consumes
-    // ~nothing. Reject when consumed approaches the subtree's logical size.
-    if (freeBefore !== undefined && c.logicalKb !== null) {
-      const after = statfsSafe(c.src);
-      if (after) {
-        const consumedBytes = (freeBefore - after.bavail) * after.bsize;
-        if (consumedBytes > c.logicalKb * 1024 * 1.25 && consumedBytes > 64 * 1024 * 1024) {
-          console.error(`[scratch-darwin] clone of ${c.src} consumed ${(consumedBytes / 1024 / 1024).toFixed(0)}MB ≈ byte copy (cross-device/special file fallback); refusing.`);
-          return fail('clone-not-cow');
-        }
-      }
-    }
+  if (failedCore.length > 0) {
+    console.error(`[scratch-darwin] required CLI state/project clone failed: ${failedCore.join(', ')}`);
+    return fail('core-clone');
   }
 
-  // ── 2. Project outside HOME → separate bounded clone ───────────────────────
+  // ── 2. Project outside HOME → required bounded clone ───────────────────────
   let work: { real: string; cloned: string } | null = null;
   let chdirInSandbox: string;
   if (cwdInsideHome) {
@@ -374,15 +425,8 @@ export function prepareMacScratchSandbox(opts: PrepareMacScratchOpts): MacScratc
       return fail('work-cross-volume');
     }
     const clonedWork = join(workCloneRoot, relative('/', cwdReal).split(sep).join('__'));
-    const srcKb = logicalSizeKb(cwdReal);
-    const freeBefore = statfsSafe(cwdReal)?.bavail;
-    if (!clonePath(cwdReal, clonedWork)) return fail('work-clone');
-    const after = statfsSafe(cwdReal);
-    if (freeBefore !== undefined && srcKb !== null && after
-      && (freeBefore - after.bavail) * after.bsize > srcKb * 1024 * 1.25
-      && (freeBefore - after.bavail) * after.bsize > 64 * 1024 * 1024) {
-      return fail('work-clone-not-cow');
-    }
+    cloneOrDegrade(cwdReal, clonedWork, 'core');
+    if (failedCore.length > 0) return fail('work-clone');
     work = { real: cwdReal, cloned: clonedWork };
     chdirInSandbox = clonedWork;
   }
@@ -426,11 +470,10 @@ export function prepareMacScratchSandbox(opts: PrepareMacScratchOpts): MacScratc
   for (const k of CA_BUNDLE_ENV_KEYS) { const v = process.env[k]; if (typeof v === 'string' && v) env[k] = v; }
 
   // ── 5. Seatbelt profile ─────────────────────────────────────────────────────
-  // NEVER deny the session root here (Linux does; on macOS the clone trees and
-  // outbox live under it) — the credential denies are real-host paths.
-  const realDeny = (opts.denyPaths ?? [])
-    .filter((p): p is string => typeof p === 'string' && !!p && isAbsolute(p))
-    .filter(p => !p.startsWith(sessionRoot + sep) && p !== sessionRoot);
+  // Three-stage sealing (empirically validated on Mac): secret/authority roots
+  // are broadly sealed BEFORE the session re-open; the session trees are
+  // granted AFTER (so a session dir under ~/.botmux/data still works); the
+  // individual credential files + symlink-degraded subtrees deny LAST.
   const hostWritable = [
     '/private/tmp',
     '/private/var/tmp',
@@ -439,19 +482,27 @@ export function prepareMacScratchSandbox(opts: PrepareMacScratchOpts): MacScratc
     join(homeReal, 'Library', 'Application Support'),
     join(homeReal, 'Library', 'Logs'),
   ];
-  // Claude CLI writes per-project MCP traffic logs (sessionId/cwd/tool flow)
-  // into a real host cache subtree — the most visible "scratch session leaked
-  // onto the host" trace. Empirically Claude ignores the EPERM here, so deny
-  // it LAST (after the broad Caches allow) to keep sessions off the host.
-  const extraRealDeny = [
-    join(homeReal, 'Library', 'Caches', 'claude-cli-nodejs'),
-  ];
+  // Claude CLI per-project MCP traffic logs (sessionId/cwd/tool flow) in the
+  // real host cache: deny WRITE after the broad Caches grant — Claude ignores
+  // the EPERM (validated on Mac), keeps scratch sessions off the host cache.
+  const claudeMcpCache = join(homeReal, 'Library', 'Caches', 'claude-cli-nodejs');
+  // File-level caller-supplied denies outside the authority roots / session
+  // tree (the sessionRoot is NOT denied on macOS: clones/outbox live under it).
+  const callerFileDenies = (opts.denyPaths ?? [])
+    .filter((p): p is string => typeof p === 'string' && !!p && isAbsolute(p))
+    .map(p => canonical(p))
+    .filter(p => !p.startsWith(sessionRoot + sep) && p !== sessionRoot)
+    .filter(p => ![...authorityRoots].some(root => p === root || p.startsWith(root.endsWith(sep) ? root : `${root}${sep}`)));
+
   const profilePath = join(sessionRoot, 'scratch.sb');
   const lines = buildMacScratchProfile({
     net: opts.net !== false,
-    writable: [homeCloneRoot, workCloneRoot, tmp, outbox],
+    authorityRootDenies: [...authorityRoots].sort((a, b) => b.length - a.length),
+    writable: [homeCloneRoot, workCloneRoot, tmp, outbox, shimBin],
     hostWritable,
-    realDenyPaths: [...realDeny, ...extraRealDeny],
+    fileDenyPaths: [...new Set([...callerFileDenies])],
+    fileWriteDenyPaths: [...degradedWriteDeny, claudeMcpCache]
+      .filter(p => !authorityRoots.has(p)),
     mcpSocket: sandboxMcpSocket,
   });
   writeFileSync(profilePath, lines.join('\n') + '\n', { mode: 0o600 });
@@ -488,9 +539,6 @@ export function prepareMacScratchSandbox(opts: PrepareMacScratchOpts): MacScratc
 }
 
 
-function statfsSafe(path: string): { bavail: number; bsize: number } | null {
-  try { const s = statfsSync(path); return { bavail: s.bavail, bsize: s.bsize }; } catch { return null; }
-}
 
 export function attachMacScratchSession(opts: { sessionId: string; dataDir: string }): {
   outbox: string;
@@ -520,8 +568,11 @@ export function attachMacScratchSession(opts: { sessionId: string; dataDir: stri
 export function teardownMacScratchSession(sessionId: string, dataDirInput: string): void {
   if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) return;
   const sessionRoot = join(canonical(dataDirInput), 'sandboxes', sessionId);
-  spawnSync('/usr/sbin/chflags', ['-R', 'nouchg,noschg', join(sessionRoot, 'clone')], { stdio: 'ignore' });
-  spawnSync('/bin/chmod', ['-RN', join(sessionRoot, 'clone')], { stdio: 'ignore' });
+  const cloneRoot = join(sessionRoot, 'clone');
+  spawnSync('/usr/sbin/chflags', ['-R', 'nouchg,noschg', cloneRoot], { stdio: 'ignore' });
+  spawnSync('/bin/chmod', ['-RN', cloneRoot], { stdio: 'ignore' });
+  // Read-only (555) cloned dirs need a user-write bit or rm fails EACCES.
+  spawnSync('/bin/chmod', ['-R', 'u+w', cloneRoot], { stdio: 'ignore' });
   try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
 }
 

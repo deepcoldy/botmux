@@ -36,7 +36,14 @@ scratch 专属字段（均可选）：
 macOS 没有 per-process 挂载命名空间、Seatbelt 也没有「写重定向」原语。最初尝试整份克隆 \$HOME，在真机（日常 319 万文件账号）上被否：TCC 保护树（Containers/Application Support/CloudDocs）让 `cp` 确定非零退出，`clonefileat(2)` 在 iCloud 在线占位文件上无限挂起。最终用**软链农场 + 选择性 clonefile**：
 
 - 克隆 HOME 里每个顶层条目默认是一条指向真实文件的**符号链接**（读取原生、零拷贝；TCC/iCloud 树永不遍历，挂死/权限问题从根上消失）。
-- 只有 CLI 要写的状态做**真实 clonefile 副本**（`cp -c` 无 -p，COW：拷贝零数据块，只占改动）：所有顶层点目录（`.claude`/`.codex`/`.trae`/`.config`/`.cache`/`.npm`/…）和顶层 dotfile（含每次更新的 `.claude.json`）；**botmux 凭证根（\$HOME/.botmux 等）例外，保持软链**，靠 profile 对真实路径的 read+write deny 封口（Seatbelt 按软链解析后的真实路径匹配，11 种 symlink/hardlink 变体真机验证有效，硬链接也被 clonefile 切断）。非点目录（Desktop/Documents/Library）是软链，读原生、写被拒。
+- 克隆采用**策展制 + 主动降级**（真机 145 万文件点目录实测后定的，避免一个 ~/.gitlog 100 万文件拖 20 分钟）：
+  - **核心 CLI 状态目录必需克隆**（失败 fail-closed）：`.claude`/`.codex`/`.trae`/`.trae-cn`/`.claude-runtime` + 顶层 dotfile（含每次更新的 `.claude.json`）+ 工作项目本身；
+  - 其它点目录（`.npm`/`.bun`/`.cache`/`.cargo`/`.config`/大体积历史目录等）**尽力克隆**：`cp -c` 45 秒超时、TCC 拒绝（如 `.Trash`）或任何失败 → 自动**降级成软链并对真实路径加 write-deny**（读原生但写 EPERM，绝不静默写穿真机）；
+  - 非点目录（Desktop/Documents/Library/Containers…）与 `.Trash` 一律软链 + write 封口；
+  - 凭证根（\$HOME/.botmux、自定义 BOTMUX_HOME、HOME 下的 data 父目录、用户 deny 命中的顶层目录）**永不克隆**，保持软链。
+- 封口用**三段规则序**（Seatbelt 最后匹配生效，真机 9/9 验证）：① 凭证根先 read+write 广封；② 再重开本会话克隆树/tmp/outbox/shim 的 read+write（所以 dataDir 在 ~/.botmux/data 下也能工作）；③ 文件级凭证（bots.json、sidecar、dashboard secret）read+write 与降级子树/`~/Library/Caches/claude-cli-nodejs` 的 write-deny 放最后。symlink 写操作按解析后真实路径匹配（11 种 symlink/hardlink 变体 + 子进程现造链接真机全拦，硬链接也被 clonefile 切断）。
+- 不再用 statfs 空闲块差值做「是否真 COW」校验（忙主机上正常磁盘活动会误报）：同卷 dev 比对 + `cp` 非零退出已足够，同卷 regular file 上 clonefile 不存在静默字节拷贝。
+- cleanup/teardown 先 `chflags nouchg,noschg` + `chmod -RN`（去 flags/ACL）+ **`chmod -R u+w`**（克隆保留源 555 目录的只读位，不加写位 rm 会 EACCES 留残根）再删。
 - 项目在 \$HOME 外时单独 clonefile 项目目录；跨 APFS 卷 fail-closed（dev 比对，绝不退化成字节拷贝）；每次 `cp` 有 5 分钟超时（云占位挂死不拖垮 worker）+ 按子树逻辑大小校验真 COW（异常大量占盘判失败）。
 - 子进程 `HOME` 指克隆农场，`TMPDIR` 指每会话私有临时；Seatbelt 先全局 `(deny file-write*)`，放行克隆树/私有 tmp/真实 outbox，再放行 Foundation/cfprefsd 无视 HOME 硬写的主机缓存（/private/tmp、/private/var/tmp、/private/var/folders、~/Library/{Caches,Application Support,Logs}），**凭证 read+write deny 放最后保证最终匹配生效**。
 - **与 Linux 的语义差**：① 系统位置（/etc、brew）写直接 EPERM 不进副本；② `~/Library` 与 /private/var/folders 这类经系统守护进程（cfprefsd/Foundation，走 mach 不经文件策略）落盘的缓存/日志/偏好**可能出现在真机**——不属于即焚保证，其中 claude CLI 的 per-project MCP 流量日志（~/Library/Caches/claude-cli-nodejs，含 sessionId/cwd）已专门加最终 write-deny（claude 对该 EPERM 无感知，真机验证不崩）；需要更强保密用 oncall。
