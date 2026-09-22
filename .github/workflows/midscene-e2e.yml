@@ -146,7 +146,10 @@ jobs:
 
       - name: Run migrated Feishu Midscene project
         id: feishu_midscene
-        if: always() && !cancelled() && steps.dashboard_midscene.outcome == 'success' && steps.feishu_config.outputs.ready == 'true'
+        # The credential-free smoke case and the authenticated Feishu suite are
+        # independent report producers. A failure in either must not hide the
+        # other suite's evidence.
+        if: always() && !cancelled() && steps.feishu_config.outputs.ready == 'true'
         env:
           MIDSCENE_RUN_DIR: ${{ github.workspace }}/midscene_run/feishu
         run: bun run test:midscene:feishu
@@ -223,7 +226,9 @@ jobs:
   deploy-report:
     name: Publish Midscene HTML report
     needs: midscene-report
-    if: always() && !cancelled() && needs.midscene-report.result == 'success'
+    # Failed cases are exactly when the published screenshots and native replay
+    # are most useful, so publish whenever the producer reached artifact upload.
+    if: always() && !cancelled() && needs.midscene-report.result != 'cancelled'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
