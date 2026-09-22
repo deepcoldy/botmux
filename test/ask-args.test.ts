@@ -191,16 +191,23 @@ describe('rejectsFrozenCommandLifecycleAsk', () => {
 
   it.each([
     '把刚才的查询固化成 /泰国上账，确认吗？',
-    '是否确认安装 /泰国上账 这个命令？',
     '确认把刚才这个固化为 /泰国上账？',
-    '要把 /泰国上账 废弃吗？',
     'Confirm creating frozen command /thai?',
     'Confirm updating frozen command /thai?',
-  ])('rejects natural lifecycle wording: %s', prompt => {
+  ])('rejects explicit lifecycle wording: %s', prompt => {
     expect(rejectsFrozenCommandLifecycleAsk(
       prompt,
       [{ key: 'yes', label: '确认' }, { key: 'no', label: '取消' }],
     )).toBe(true);
+  });
+
+  it.each([
+    '是否确认安装 /泰国上账 这个命令？',
+    '要把 /泰国上账 废弃吗？',
+  ])('rejects ambiguous slash wording only for a known frozen command: %s', prompt => {
+    const options = [{ key: 'yes', label: '确认' }, { key: 'no', label: '取消' }];
+    expect(rejectsFrozenCommandLifecycleAsk(prompt, options)).toBe(false);
+    expect(rejectsFrozenCommandLifecycleAsk(prompt, options, new Set(['/泰国上账']))).toBe(true);
   });
 
   it('does not block ordinary questions or non-lifecycle discussions', () => {
@@ -216,6 +223,18 @@ describe('rejectsFrozenCommandLifecycleAsk', () => {
       '确认更新 /api/users 接口吗？',
       [{ key: 'yes', label: '确认' }, { key: 'no', label: '取消' }],
     )).toBe(false);
+    for (const prompt of [
+      '确认删除 /tmp 下的临时文件吗？',
+      '要不要新增 /schedule 定时任务？',
+      '是否创建 /release 分支？',
+      '要修改 /opt 的权限吗？',
+      '确认恢复 /data 目录的备份？',
+    ]) {
+      expect(rejectsFrozenCommandLifecycleAsk(
+        prompt,
+        [{ key: 'yes', label: '确认' }, { key: 'no', label: '取消' }],
+      )).toBe(false);
+    }
   });
 });
 

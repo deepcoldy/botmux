@@ -13431,7 +13431,8 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
 
   const { findMissingAskEnv, parseAskOptions, parseAskTimeoutSeconds, AskArgsError } =
     await import('./core/ask-args.js');
-  const { rejectsFrozenCommandLifecycleAsk } = await import('./core/frozen-command-guidance.js');
+  const { frozenCommandNamesInMessage, rejectsFrozenCommandLifecycleAsk } =
+    await import('./core/frozen-command-guidance.js');
   type AskJsonOutput = import('./core/ask-types.js').AskJsonOutput;
   const { toLegacySelected, isCustomReply } = await import('./core/ask-types.js');
 
@@ -13470,7 +13471,29 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     );
     process.exit(2);
   }
-  if (rejectsFrozenCommandLifecycleAsk(prompt, options)) {
+  const larkAppId = process.env.BOTMUX_LARK_APP_ID!;
+  const askSessionId = process.env.BOTMUX_SESSION_ID!;
+  const liveAskOrigin = resolveSessionContext(resolveDataDir(), askSessionId);
+  const knownFrozenCommands = new Set<string>();
+  const commandNames = frozenCommandNamesInMessage(prompt);
+  if (commandNames.length > 0) {
+    try {
+      const session = loadSessions().get(liveAskOrigin?.sessionId ?? askSessionId);
+      if (session?.workingDir) {
+        const { lookupFrozenCommand } = await import('./services/frozen-command.js');
+        for (const command of commandNames) {
+          if (lookupFrozenCommand({ workingDir: session.workingDir, command }).kind !== 'missing') {
+            knownFrozenCommands.add(command);
+          }
+        }
+      }
+    } catch {
+      // This guard is defense in depth, not the lifecycle authorization
+      // boundary. If session metadata is unavailable, retain only the strict
+      // explicit-wording check instead of breaking unrelated ask flows.
+    }
+  }
+  if (rejectsFrozenCommandLifecycleAsk(prompt, options, knownFrozenCommands)) {
     console.error(
       'botmux ask: 固化命令的创建、更新和生命周期操作必须使用宿主专用确认卡。' +
         ' 请先运行 `botmux skill show botmux-freeze`，再按说明使用 `botmux freeze apply|rm|restore|purge`；' +
@@ -13479,9 +13502,6 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     process.exit(2);
   }
 
-  const larkAppId = process.env.BOTMUX_LARK_APP_ID!;
-  const askSessionId = process.env.BOTMUX_SESSION_ID!;
-  const liveAskOrigin = resolveSessionContext(resolveDataDir(), askSessionId);
   const askRelayDir = process.env.BOTMUX_SEND_RELAY;
   const askOriginCapability = readManagedOriginCapability(
     resolveDataDir(),

@@ -53,7 +53,7 @@ describe('Frozen Command natural-language P0a wiring', () => {
   });
 
   it('prevents a generic ask card from replacing the host lifecycle confirmation', () => {
-    expect(cli).toContain('rejectsFrozenCommandLifecycleAsk(prompt, options)');
+    expect(cli).toContain('rejectsFrozenCommandLifecycleAsk(prompt, options, knownFrozenCommands)');
     expect(cli).toContain('不要用通用 ask 代替生命周期确认');
     expect(guidance).toContain('Do not use `botmux ask` for this confirmation');
   });
