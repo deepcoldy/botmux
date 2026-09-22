@@ -9818,10 +9818,11 @@ async function driveCocoPicker(navKeys: string[], needsReviewSubmit: boolean, co
 // ─── Trust Dialog Detection ──────────────────────────────────────────────────
 
 // Claude Code: "Yes, I trust this folder"
-// Codex:       "› 1. Yes, continue  2. No, quit" (ANSI cursor codes strip spaces from
-//               longer phrases like "Do you trust…", but "Yes, continue" survives intact
-//               in a single PTY chunk)
-const TRUST_DIALOG_PATTERN = /Yes, I trust this folder|Yes, continue/;
+// Codex:       older versions used "› 1. Yes, continue"; 0.155+ uses
+//               "› 1. Trust and continue". ANSI cursor codes strip spaces from
+//               longer phrases like "Do you trust…", but the option label survives
+//               intact in a single PTY chunk.
+const TRUST_DIALOG_PATTERN = /Yes, I trust this folder|Yes, continue|Trust and continue/;
 let trustHandled = false;
 const codexUpdateDialogGuard = new CodexUpdateDialogGuard();
 // Auto-confirm Claude Code's mid-session "Change effort level?" Yes/No dialog.
