@@ -258,7 +258,7 @@ describe('built-in botmux-bots skill (collaboration roster)', () => {
 });
 
 describe('built-in botmux-handoff skill', () => {
-  it('is registered and teaches the 5-part structured handoff', () => {
+  it('is registered and routes handoffs by lifecycle instead of bot count', () => {
     const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-handoff');
     expect(skill).toBeDefined();
     expect(skill!.content).toContain('交给谁');
@@ -270,19 +270,21 @@ describe('built-in botmux-handoff skill', () => {
     expect(skill!.content).toContain('mentionable');
     expect(skill!.content).toContain('/introduce');
     expect(skill!.content).toContain('botmux send --mention');
-    expect(skill!.content).toContain('单 bot 接力留在当前话题');
+    expect(skill!.content).toContain('按生命周期判断，不按 bot 数量判断');
+    expect(skill!.content).toContain('ASSIGN → READY → REVIEW → MERGE');
+    expect(skill!.content).toContain('一次性接力留在当前话题');
     expect(skill!.content).toContain('botmux dispatch --into');
-    expect(skill!.content).toContain('不要为单个接手者运行不带 `--into` 的 `botmux dispatch`');
+    expect(skill!.content).toContain('必须在 ASSIGN 前');
   });
 });
 
 describe('built-in botmux-orchestrate skill', () => {
-  it('keeps a single-specialist handoff in the current topic', () => {
+  it('does not use bot count as the topic boundary', () => {
     const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-orchestrate');
     expect(skill).toBeDefined();
-    expect(skill!.content).toContain('单个专项交给一个 bot');
+    expect(skill!.content).toContain('多轮生命周期');
     expect(skill!.content).toContain('botmux-handoff');
-    expect(skill!.content).toContain('留在当前话题');
+    expect(skill!.content).toContain('单 bot');
   });
 });
 

@@ -768,7 +768,7 @@ team scope 输出的 \`agents[]\` 每项：\`appId\`（拉群/补人就用它）
 
 const HANDOFF_SKILL = `---
 name: botmux-handoff
-description: 把当前任务交棒给团队里另一个机器人时使用（多机器人协作接力）。当你做完自己负责的部分、需要另一个机器人接手下一步，或用户说"交给X""让X接着做""@某bot继续""下一步谁谁来"时触发。单个目标 bot 或单个专项的接力默认保留在当前话题，不新建子项目话题；先用 botmux-bots 查花名册挑对象，再用结构化交接发给对方。
+description: 把当前任务交棒给团队里另一个机器人时使用（多机器人协作接力）。当你做完自己负责的部分、需要另一个机器人接手下一步，或用户说"交给X""让X接着做""@某bot继续""下一步谁谁来"时触发。话题粒度按是否有多轮往返判断：一次性接力留当前话题；有完整任务生命周期时，即使只有一个 bot 也先开独立话题。先用 botmux-bots 查花名册，再结构化交接。
 ---
 
 # botmux-handoff — 机器人接力交棒
@@ -784,10 +784,11 @@ description: 把当前任务交棒给团队里另一个机器人时使用（多�
 
 ## 话题规则
 
-- **单 bot 接力留在当前话题**：直接运行 \`botmux send --mention\`，不加 \`--top-level\`；BotMux 会把消息发回当前轮次所在话题。
-- 不要为单个接手者运行不带 \`--into\` 的 \`botmux dispatch\`：它会额外发一条顶层子项目消息、新建话题。
-- 如果必须使用稳定 App ID 和接单确认，使用 \`botmux dispatch --into <当前话题根消息id> --bot-app <larkAppId> ...\`，明确追加到当前话题。
-- 只有任务确实拆成多个独立子项目、需要并行跟踪和主 bot 汇总时，才使用 \`botmux-orchestrate\` 新开话题。
+- **按生命周期判断，不按 bot 数量判断**：一次性问答、单轮意见、状态同步或一次性接力留在当前话题；会进入 \`ASSIGN → READY → REVIEW → MERGE\` 多轮生命周期的新任务，哪怕只有一个 bot，也开独立话题。
+- 开独立话题是 Coordinator 的动作，必须在 ASSIGN 前完成。用 \`botmux dispatch\` 创建话题，再用 \`botmux send --into <threadRootId> --mention ...\` 完成首条确认；后续交接都留在该话题。
+- 话题标题带 TASK 名和 EPOCH，并与分支命名对齐，例如 \`e4 · drop-unreachable-failure-evidence\`。
+- 当前任务已有话题时，直接运行 \`botmux send --mention\`；需要稳定 App ID 和接单确认时，用 \`botmux dispatch --into <当前话题根消息id> --bot-app <larkAppId> ...\` 追加到该话题。
+- 多个 bot 分工、长期多话题协调并需要共享进度板时，使用 \`botmux-orchestrate\`；单 bot 的多轮任务不因此升级为长期编排，但仍需独立话题。
 
 ## 交接必须包含 5 要素
 
@@ -1384,7 +1385,7 @@ $${GOAL_ENV.INPUTS_PATH}
 
 const ORCHESTRATE_SKILL = `---
 name: botmux-orchestrate
-description: 多 bot 长期项目编排。仅当任务同时需要「多个 bot 分工」+「持续的 goal 群/多话题协调与进度板」+「主 bot 汇总验收」时触发，例如多组 coder/reviewer 并行推进。若只是一个有界 DAG、跑完即散、产出单一交付物，应使用 botmux-workflow；只把下一步或单个专项交给一个 bot 时，必须使用 botmux-handoff 留在当前话题，不得新建子项目话题。显式提到 botmux orchestrate / goal supervise / dispatch 派活时也使用。
+description: 多 bot 长期项目编排。仅当任务同时需要「多个 bot 分工」+「持续的 goal 群/多话题协调与进度板」+「主 bot 汇总验收」时触发，例如多组 coder/reviewer 并行推进。若只是一个有界 DAG、跑完即散、产出单一交付物，应使用 botmux-workflow；只把下一步或单个专项交给一个 bot 时使用 botmux-handoff，并按是否有多轮生命周期决定是否开独立话题。显式提到 botmux orchestrate / goal supervise / dispatch 派活时也使用。
 ---
 
 # botmux-orchestrate — 多 bot 多话题编排
@@ -1394,7 +1395,7 @@ description: 多 bot 长期项目编排。仅当任务同时需要「多个 bot 
 ## 适用 & 不适用
 - 适用：一个长期项目同时满足三个结构化判据：① **多个 bot 分工**处理基本独立的子项目；② 需要持续存在的 **goal 群/多话题协调**和共享进度板；③ 主 bot 要持续收件并做最终**验收**。
 - 不适用：一个**有界 DAG、跑完即散、只有一个交付物**的多步目标——使用 **botmux-workflow**。
-- 不适用：单步请求 / 普通改代码（直接做），或只需把下一步、单个专项交给一个 bot（用 botmux-handoff，留在当前话题）。
+- 不适用：单步请求 / 普通改代码（直接做），或只需把下一步、单个专项交给单 bot（用 botmux-handoff；一次性接力留当前话题，有多轮生命周期则单开话题）。
 
 ## 物理事实（先记牢）
 - **你和子 bot 之间没有直连**，只能靠飞书消息触发；**没有请求-响应关联**——子 bot 干完用 \`botmux report\` 把回报发回**你这条主编排话题**（不是在它自己的子话题里 @ 你——那条子话题没有你的会话，@ 会另起一个无上下文的新会话）。对你就是「话题里来了条新消息」，你被唤起（带完整上下文）后去读任务板拿结构化状态。
