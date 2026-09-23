@@ -12,7 +12,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { createServer, get, type Server } from 'node:http';
 import { connect, type Socket } from 'node:net';
-import { listenWithProbe } from '../src/utils/listen-with-probe.js';
+import { listenWithProbe, LISTEN_RELEASE_WEDGED_CODE } from '../src/utils/listen-with-probe.js';
 
 const open: Server[] = [];
 function mk(): Server { const s = createServer((_q, r) => r.end('ok')); open.push(s); return s; }
@@ -198,4 +198,130 @@ describe('listenWithProbe', () => {
       for (const sock of parked) sock.destroy();
     }
   }, 4000);
+
+  it('steps up past a parked client even when the http layer does not track it', async () => {
+    // Second 2026-09 wedge: closeAllConnections() was already in place and the
+    // dashboard STILL parked — one CLOSE-WAIT loopback socket the http layer never
+    // closed, no LISTEN, 29 minutes of silence. Whatever the runtime's bookkeeping
+    // misses, the probe must be able to tear down on its own: it keeps handles to
+    // every socket accepted while probing and destroys them itself on release.
+    // Simulate "the http layer can't see it" by making closeAllConnections a no-op.
+    const start = await reserveAdjacentPair();
+    const server = mk();
+    (server as unknown as { closeAllConnections: () => void }).closeAllConnections = () => { /* runtime blind spot */ };
+    const parked: Socket[] = [];
+
+    const verified: number[] = [];
+    const bound = await listenWithProbe({
+      server,
+      port: start,
+      host: '127.0.0.1',
+      maxProbe: 3,
+      releaseTimeoutMs: 500,
+      verifyBound: async (p) => {
+        verified.push(p);
+        if (verified.length > 1) return true;
+        await new Promise<void>((resolve) => {
+          const sock = connect(p, '127.0.0.1', () => {
+            sock.write('GET /__selfcheck HTTP/1.1\r\nHost: x\r\n\r\n');
+            parked.push(sock);
+            resolve();
+          });
+          sock.on('error', () => resolve());
+        });
+        return false;
+      },
+    });
+
+    try {
+      expect(verified[0]).toBe(start);
+      expect(bound).toBeGreaterThan(start);
+    } finally {
+      for (const sock of parked) sock.destroy();
+    }
+  }, 4000);
+
+  it('retries an unconfirmed verification and keeps the port instead of releasing it', async () => {
+    // "Nobody answered my self-check in time" is what a starved event loop looks
+    // like from inside the process, not evidence of a shadow. Releasing a port we
+    // own on that signal is the path that wedged the dashboard; the probe must
+    // retry and, if still unconfirmed, keep the bind — loudly.
+    const start = await reserveAdjacentPair();
+    const logs: string[] = [];
+    const verified: number[] = [];
+    const bound = await listenWithProbe({
+      server: mk(),
+      port: start,
+      host: '127.0.0.1',
+      verifyRetries: 2,
+      verifyRetryDelayMs: 10,
+      verifyBound: (p) => { verified.push(p); return 'unconfirmed'; },
+      log: m => logs.push(m),
+    });
+    expect(bound).toBe(start);                      // never stepped
+    expect(verified).toEqual([start, start, start]); // 1 + 2 retries, all on the same port
+    expect(logs.some(l => /unconfirmed.*retrying/.test(l))).toBe(true);
+    expect(logs.some(l => /still unconfirmed.*keeping the bind/.test(l))).toBe(true);
+  });
+
+  it('accepts the port as soon as a retry confirms it', async () => {
+    const start = await reserveAdjacentPair();
+    let calls = 0;
+    const bound = await listenWithProbe({
+      server: mk(),
+      port: start,
+      host: '127.0.0.1',
+      verifyRetryDelayMs: 10,
+      verifyBound: () => (++calls < 2 ? 'unconfirmed' : true),
+    });
+    expect(bound).toBe(start);
+    expect(calls).toBe(2);
+  });
+
+  it('treats a throwing verifier as unconfirmed, not as a shadow', async () => {
+    // The old code released the port on a verifier exception ("verify-failed").
+    // An exception means the check could not run; it says nothing about who owns
+    // the port, so it must follow the unconfirmed path (retry, then keep).
+    const start = await reserveAdjacentPair();
+    const bound = await listenWithProbe({
+      server: mk(),
+      port: start,
+      host: '127.0.0.1',
+      verifyRetries: 1,
+      verifyRetryDelayMs: 10,
+      verifyBound: () => { throw new Error('probe exploded'); },
+    });
+    expect(bound).toBe(start);
+  });
+
+  it('gives up with ERR_LISTEN_RELEASE_WEDGED instead of hanging when close() never completes', async () => {
+    // The failure the whole release path exists to make visible: server.close()
+    // parks forever. Force it by stubbing close() to never call back. The probe
+    // must reject with a distinct code within its bounded budget so the caller
+    // (dashboard.ts) can log and exit for a supervisor restart.
+    const start = await reserveAdjacentPair();
+    const server = mk();
+    const realClose = server.close.bind(server);
+    (server as unknown as { close: (cb?: () => void) => Server }).close = () => server; // swallow the callback
+    (server as unknown as { closeAllConnections: () => void }).closeAllConnections = () => { /* no-op */ };
+    const logs: string[] = [];
+    let err: NodeJS.ErrnoException | null = null;
+    const startedAt = Date.now();
+    await listenWithProbe({
+      server,
+      port: start,
+      host: '127.0.0.1',
+      releaseTimeoutMs: 100,
+      verifyBound: () => false,           // definitive shadow → release
+      log: m => logs.push(m),
+    }).catch(e => { err = e; });
+    const elapsed = Date.now() - startedAt;
+    expect(err).not.toBeNull();
+    expect(err!.code).toBe(LISTEN_RELEASE_WEDGED_CODE);
+    expect(elapsed).toBeLessThan(2000);   // bounded: 2 × releaseTimeoutMs, not forever
+    expect(logs.some(l => /release still pending/.test(l))).toBe(true);
+    expect(logs.some(l => /release wedged/.test(l))).toBe(true);
+    // Let afterEach actually close the listener we stubbed.
+    (server as unknown as { close: typeof realClose }).close = realClose;
+  });
 });
