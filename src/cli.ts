@@ -11179,10 +11179,10 @@ async function cmdSend(rest: string[]): Promise<void> {
     // (the ghosting shape). The injected prompt keeps a one-line sentinel note
     // only for the genuine never-send silence case (message addressed to another
     // bot). See services/bridge-fallback-gate.ts for the matching strip-and-forward gate.
-    console.error(unifiedReplyUsed && effectiveResponseKind !== 'final'
-      ? '进度已更新到本轮卡片。完成时请用 botmux send --response-kind final 发送完整答复。'
-      : t('ai.send.after_success_hint', undefined, localeForBot(appId)));
     const sendLocale = localeForBot(appId);
+    console.error(unifiedReplyUsed && effectiveResponseKind !== 'final'
+      ? t('ai.send.after_success_unified', undefined, sendLocale)
+      : t('ai.send.after_success_hint', undefined, sendLocale));
     if (asChoice) {
       console.error(t(
         asChoice === 'independent' ? 'xpi.send.as_marked_independent' : 'xpi.send.as_marked_suggestion',
