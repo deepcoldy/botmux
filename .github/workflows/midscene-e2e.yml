@@ -252,6 +252,15 @@ jobs:
           name: botmux-midscene-site
           path: ${{ runner.temp }}/midscene-site
 
+      - name: Verify evidence site is complete
+        run: |
+          # The prepare step can fail (e.g. an unreadable report) after copying
+          # a partial directory. Never publish a site without a landing page or
+          # manifest, otherwise the previous good report at this SITE_KEY is
+          # replaced by a broken, partial one.
+          test -f "$RUNNER_TEMP/midscene-site/index.html"
+          test -f "$RUNNER_TEMP/midscene-site/manifest.json"
+
       - name: Publish report under deepcoldy.github.io
         env:
           DEPLOY_KEY: ${{ secrets.PAGES_DEPLOY_KEY }}
