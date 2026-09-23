@@ -192,6 +192,13 @@ export function resolveReportRelayFallbackTarget(input: {
   originalSession?: ReportSessionRelayTargetView;
   sessions: readonly ReportSessionRelayTargetView[];
 }): ReportSessionRelayFallbackDecision {
+  if (input.originalTarget.scope === 'thread') {
+    return {
+      ok: false,
+      error: 'fallback_scope_unsupported',
+      ...(input.originalTarget.chatId ? { originalChatId: input.originalTarget.chatId } : {}),
+    };
+  }
   const original = input.originalSession;
   if (original && original.sessionId !== input.originalTarget.sessionId) {
     return { ok: false, error: 'fallback_not_applicable' };
@@ -204,14 +211,6 @@ export function resolveReportRelayFallbackTarget(input: {
   if (!originalChatId || !/^oc_[A-Za-z0-9_-]{1,128}$/.test(originalChatId)) {
     return { ok: false, error: 'original_chat_unproven' };
   }
-  // A thread-scope orchestration needs its rootMessageId to prove a semantic
-  // successor. With only a signed oc_* chat id we cannot distinguish the
-  // original topic's successor from another live topic or a meeting receiver,
-  // so thread→chat fallback stays fail-closed in this round.
-  if (input.originalTarget.scope === 'thread') {
-    return { ok: false, error: 'fallback_scope_unsupported', originalChatId };
-  }
-
   // Chat-scope fallback intentionally stays narrow but cannot yet exclude a VC
   // meeting receiver: /api/sessions does not project any receiver/meeting
   // marker, so a lone live chat row in the same app/chat may still be that
@@ -356,9 +355,9 @@ export async function deliverReportSessionRelay(input: {
         : undefined;
       return {
         sessionId: typeof session.sessionId === 'string' ? session.sessionId : '',
-        // Fallback only routes within the original app. Keep this defensive
-        // default so a partial /api/sessions projection cannot silently widen
-        // that boundary if the same-app filter ever regresses.
+        // Closed/dormant historical rows can miss larkAppId in /api/sessions.
+        // Preserve the signed target app for those rows so same-app fallback
+        // matching stays comparable with current behavior.
         larkAppId: typeof session.larkAppId === 'string' ? session.larkAppId : decision.target.larkAppId,
         chatId: typeof session.chatId === 'string' ? session.chatId : undefined,
         scope,

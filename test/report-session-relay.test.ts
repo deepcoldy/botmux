@@ -323,6 +323,18 @@ describe('report session relay fallback target', () => {
     });
   });
 
+  it('prioritizes scope rejection before original-session row validation', () => {
+    expect(resolveReportRelayFallbackTarget({
+      originalTarget: { ...originalTarget, scope: 'thread' },
+      originalSession: { ...originalClosed, scope: 'thread', status: 'active' },
+      sessions: [successor],
+    })).toEqual({
+      ok: false,
+      error: 'fallback_scope_unsupported',
+      originalChatId: 'oc_original',
+    });
+  });
+
   it('keeps legacy bindings without targetScope fallback-compatible', () => {
     expect(resolveReportRelayFallbackTarget({
       originalTarget: {
@@ -360,6 +372,14 @@ describe('report session relay fallback target', () => {
   it('fails closed when original chat identity is unavailable or original row is not closed', () => {
     expect(resolveReportRelayFallbackTarget({
       originalTarget: { larkAppId: 'cli_orchestrator', sessionId: 'session-orchestrator' },
+      sessions: [successor],
+    })).toEqual({ ok: false, error: 'original_chat_unproven' });
+    expect(resolveReportRelayFallbackTarget({
+      originalTarget: {
+        larkAppId: 'cli_orchestrator',
+        sessionId: 'session-orchestrator',
+        chatId: 'bad_chat',
+      },
       sessions: [successor],
     })).toEqual({ ok: false, error: 'original_chat_unproven' });
     expect(resolveReportRelayFallbackTarget({
@@ -414,6 +434,7 @@ describe('report session relay delivery', () => {
     { name: '500', response: { ok: false, status: 500, body: { ok: false, errorCode: 'trigger_failed' } } },
     { name: '504', response: { ok: false, status: 504, body: { ok: false, errorCode: 'wait_timeout', triggerId: 'trg_1' } } },
     { name: 'untyped 404', response: { ok: false, status: 404, body: { ok: false, error: 'active session not found: session-orchestrator' } } },
+    { name: 'other errorCode 404', response: { ok: false, status: 404, body: { ok: false, errorCode: 'not_authorized' } } },
   ])('passes through first-trigger $name failures without querying sessions or retrying', async ({ response }) => {
     const authorized = authorize();
     expect(authorized.ok).toBe(true);
@@ -448,6 +469,7 @@ describe('report session relay delivery', () => {
   it.each([
     { name: 'non-200 sessions', sessionsResponse: { ok: false, status: 500, body: { ok: false, error: 'backend_down' } } },
     { name: 'missing sessions array', sessionsResponse: { ok: true, status: 200, body: { ok: true } } },
+    { name: 'non-array sessions field', sessionsResponse: { ok: true, status: 200, body: { ok: true, sessions: {} } } },
     { name: 'array body', sessionsResponse: { ok: true, status: 200, body: [] } },
   ])('fails closed when fallback state is unavailable: $name', async ({ sessionsResponse }) => {
     const authorized = authorize({
