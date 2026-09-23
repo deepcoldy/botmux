@@ -4,6 +4,7 @@
  * session restoration, and scheduled task execution.
  */
 import { existsSync, statSync } from 'node:fs';
+import { normalizeImageAttachment, imageSequenceHint } from './attachment-image-format.js';
 import { randomUUID } from 'node:crypto';
 import { basename, dirname, join, resolve } from 'node:path';
 import { expandHome, validateWorkingDir } from './working-dir.js';
@@ -705,7 +706,14 @@ export async function downloadResources(larkAppId: string, messageId: string, re
       // attachment. They can see what they just posted, and the download is
       // attributed to them rather than to whoever happens to be logged in.
       await downloadMessageResource(larkAppId, resMessageId, res.key, res.type, savePath, senderOpenId);
-      attachments.push({ type: res.type, path: savePath, name: res.name });
+      const attachment: LarkAttachment = { type: res.type, path: savePath, name: res.name, resourceKey: res.key };
+      // Sniffing is best-effort: a successfully downloaded attachment must remain available.
+      try {
+        attachments.push(await normalizeImageAttachment(attachment));
+      } catch (err: any) {
+        logger.info(`Could not normalize image attachment ${res.key}: ${err.message}`);
+        attachments.push(attachment);
+      }
     } catch (err: any) {
       // Per-failure log stays at info to aid retries.
       logger.info(`Failed to download ${res.type} ${res.key}: ${err.message}`);
@@ -964,7 +972,10 @@ export function formatAttachmentsHint(attachments?: LarkAttachment[], locale?: L
   const items = attachments.map(a => {
     const tag = a.type === 'image' ? 'image' : 'file';
     const n = a.type === 'image' ? ++imgN : ++fileN;
-    return `  <${tag} n="${n}" path="${xmlEscape(a.path)}" />`;
+    const mime = a.mimeType ? ` mime_type="${xmlEscape(a.mimeType)}"` : '';
+    const sequenceHint = imageSequenceHint(a);
+    const hint = sequenceHint ? ` hint="${xmlEscape(sequenceHint)}"` : '';
+    return `  <${tag} n="${n}" path="${xmlEscape(a.path)}"${mime}${hint} />`;
   });
   return `<attachments hint="${xmlEscape(t('ai.attach.hint', undefined, locale))}">\n${items.join('\n')}\n</attachments>`;
 }

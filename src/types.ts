@@ -1077,6 +1077,8 @@ export interface SessionCliLaunchSnapshotV1 {
 }
 
 export interface LarkAttachment {
+  resourceKey?: string; // Stable provider key, independent of a normalized filename.
+  mimeType?: string;    // Detected from downloaded image bytes.
   type: 'image' | 'file';
   path: string;       // 本地文件绝对路径
   name: string;       // 文件名
