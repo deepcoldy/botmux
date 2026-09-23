@@ -22,6 +22,7 @@ export const modelOnlyAssessments: Readonly<Record<CliId, ModelOnlyAssessment>> 
   genius: { group: 'claude-print', status: 'verification_required', reason: 'fork_auth_and_protocol_unverified', detail: '使用 Genius 自己的凭证和状态目录；缺少原生程序，未验证 Claude 风格参数是否提供相同隔离保证。' },
   opencode: { group: 'policy-headless', status: 'implemented', reason: null, detail: 'run/json、pure 模式、全部工具拒绝，关闭标题与压缩子调用；原生合成服务测试通过。' },
   opencode2: { group: 'policy-headless', status: 'verification_required', reason: 'fork_protocol_unverified', detail: '仓库适配器明确使用 V2 插件、配置和服务接口；缺少 opencode2 原生程序，不能以 OpenCode 的测试替代。' },
+  mimocode: { group: 'policy-headless', status: 'verification_required', reason: 'fork_protocol_unverified', detail: 'OpenCode 1.x fork，会话存储、TUI 与插件与 V1 同构；缺少可运行的 mimo 原生程序，未验证 run/json、pure 模式与全部工具拒绝的模型-only 隔离，不能以 OpenCode 的测试替代。' },
   antigravity: { group: 'native-print', status: 'verification_required', reason: 'matching_native_executable_unavailable', detail: '仓库目标是 Agent CLI；本次找到的同名 agy 是编辑器启动器，无法验证目标 Agent 的 print 和工具隔离协议。' },
   mtr: { group: 'policy-headless', status: 'verification_required', reason: 'matching_native_executable_unavailable', detail: '仓库目标是 OpenCode 衍生 Agent；本次找到的同名 mtr 是网络诊断工具，缺少目标程序做原生验证。' },
   hermes: { group: 'native-print', status: 'verification_required', reason: 'native_runtime_unavailable', detail: '官方源码有单次调用和 toolsets 入口；未获得可运行的 Hermes 环境，空工具集、认证及 hooks 隔离未完成原生验证。' },

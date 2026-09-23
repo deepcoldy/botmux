@@ -8,6 +8,7 @@ import {
   selectCleanupCandidates,
   selectIdleCleanupCandidates,
 } from '../src/dashboard/session-cleanup.js';
+import { SESSION_CLEANUP_HOUR_OPTIONS } from '../src/global-config.js';
 
 const NOW = Date.UTC(2026, 5, 22, 12, 0, 0);
 const hour = 60 * 60 * 1000;
@@ -24,6 +25,7 @@ function row(id: string, patch: Record<string, unknown> = {}) {
 describe('dashboard idle session cleanup selection', () => {
   it('accepts only the supported cleanup thresholds', () => {
     expect(IDLE_CLEANUP_HOUR_OPTIONS).toEqual([24, 72, 168]);
+    expect(IDLE_CLEANUP_HOUR_OPTIONS).toEqual(SESSION_CLEANUP_HOUR_OPTIONS);
     expect(parseIdleCleanupHours(24)).toBe(24);
     expect(parseIdleCleanupHours('72')).toBe(72);
     expect(parseIdleCleanupHours('7d')).toBe(168);

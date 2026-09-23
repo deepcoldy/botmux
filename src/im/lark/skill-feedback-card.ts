@@ -5,7 +5,11 @@ import type { FeedbackPolicy } from '../../services/feedback-policy.js';
 import type { SkillFeedbackStore } from '../../services/skill-feedback-store.js';
 import { buildOncallGroupColumn } from './oncall-group.js';
 
-export interface FeedbackCardState { result?: string; reasonKey?: string; comment?: string }
+export interface FeedbackCardState { feedbackId?: string; result?: string; reasonKey?: string; comment?: string }
+
+function versionedValue(state: FeedbackCardState, value: Record<string, unknown>): Record<string, unknown> {
+  return state.feedbackId ? { ...value, expected_feedback_id: state.feedbackId } : value;
+}
 
 function button(text: string, style: string, value: Record<string, unknown>, disabled = false): Record<string, unknown> {
   return { tag: 'button', text: { tag: 'plain_text', content: text }, type: style, disabled, behaviors: [{ type: 'callback', value }] };
@@ -17,7 +21,7 @@ export function buildFeedbackElement(policy: FeedbackPolicy, state: FeedbackCard
     tag: 'column_set', element_id: 'botmux_feedback', flex_mode: 'none', horizontal_spacing: 'small',
     columns: policy.buttons.map(option => ({
       tag: 'column', width: 'auto', elements: [
-        button(option.label, option.style, { action: 'feedback_submit', result: option.key }, locked),
+        button(option.label, option.style, versionedValue(state, { action: 'feedback_submit', result: option.key }), locked),
       ],
     })),
   };
@@ -34,7 +38,7 @@ function feedbackStateElements(policy: FeedbackPolicy, state: FeedbackCardState)
   if (policy.negativeFollowup.reasons.length > 0) {
     elements.push({
       tag: 'column_set', element_id: 'botmux_feedback_reasons', flex_mode: 'none', horizontal_spacing: 'small',
-      columns: policy.negativeFollowup.reasons.map(reason => ({ tag: 'column', width: 'auto', elements: [button(state.reasonKey === reason.key ? `✓ ${reason.label}` : reason.label, state.reasonKey === reason.key ? 'primary' : 'default', { action: 'feedback_reason', reason_key: reason.key })] })),
+      columns: policy.negativeFollowup.reasons.map(reason => ({ tag: 'column', width: 'auto', elements: [button(state.reasonKey === reason.key ? `✓ ${reason.label}` : reason.label, state.reasonKey === reason.key ? 'primary' : 'default', versionedValue(state, { action: 'feedback_reason', reason_key: reason.key }))] })),
     });
   }
   if (policy.negativeFollowup.comment.enabled) {
@@ -42,7 +46,7 @@ function feedbackStateElements(policy: FeedbackPolicy, state: FeedbackCardState)
     else elements.push({
       tag: 'form', name: 'feedback_comment_form', element_id: 'botmux_feedback_comment', elements: [
         { tag: 'input', name: 'comment', input_type: 'multiline_text', rows: 3, max_rows: 8, auto_resize: true, width: 'fill', required: policy.negativeFollowup.comment.required, placeholder: { tag: 'plain_text', content: policy.negativeFollowup.comment.placeholder } },
-        { tag: 'button', name: 'feedback_comment_submit', text: { tag: 'plain_text', content: '提交补充' }, type: 'primary', action_type: 'form_submit', value: { action: 'feedback_comment' } },
+        { tag: 'button', name: 'feedback_comment_submit', text: { tag: 'plain_text', content: '提交补充' }, type: 'primary', action_type: 'form_submit', value: versionedValue(state, { action: 'feedback_comment' }) },
       ],
     });
   }
@@ -154,16 +158,33 @@ export async function handleSkillFeedbackCardAction(data: CardActionData, larkAp
     return { toast: { type: 'error', content: '反馈操作无效，请重试' } };
   }
   const selectedButton = delivery.policy.buttons.find(item => item.key === result);
-  const recorded = deps.store.recordFeedback({
-    platform: 'lark', platformAppId: larkAppId, platformMessageId, operatorSubjectId, result, semantic: selectedButton?.semantic, reasonKey, comment,
-    callbackKey: callbackKey({
-      platformMessageId, operatorSubjectId, action, result, reasonKey, comment,
-      previousFeedbackId: previous?.feedbackId,
-    }),
-  });
-  const renderedCard = renderFeedbackCard(baseCard, delivery.policy, recorded.feedback);
-  if (action === 'feedback_submit' && delivery.policy.buttons.find(option => option.key === result)?.semantic === 'negative') {
-    return { deferredCard: { type: 'raw', data: renderedCard } };
+  const expectedFeedbackId = data.action?.value?.expected_feedback_id;
+  if (expectedFeedbackId !== undefined && (typeof expectedFeedbackId !== 'string' || !expectedFeedbackId)) {
+    return { toast: { type: 'error', content: '反馈状态无效，请刷新后重试' } };
   }
-  return { card: { type: 'raw', data: renderedCard } };
+  let recorded: ReturnType<SkillFeedbackStore['recordFeedback']>;
+  try {
+    recorded = deps.store.recordFeedback({
+      platform: 'lark', platformAppId: larkAppId, platformMessageId, operatorSubjectId, result, semantic: selectedButton?.semantic, reasonKey, comment,
+      expectedFeedbackId,
+      callbackKey: callbackKey({
+        platformMessageId, operatorSubjectId, action, result, reasonKey, comment,
+        expectedFeedbackId,
+      }),
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message === 'feedback_version_mismatch') {
+      return { toast: { type: 'error', content: '反馈状态已失效，请刷新后重试' } };
+    }
+    throw error;
+  }
+  const renderedCard = renderFeedbackCard(baseCard, delivery.policy, recorded.feedback);
+  const toast = recorded.status === 'stale'
+    ? { type: 'warning', content: '反馈状态已更新，请基于最新卡片重试' }
+    : undefined;
+  const renderedSemantic = delivery.policy.buttons.find(item => item.key === recorded.feedback.result)?.semantic;
+  if (action === 'feedback_submit' && renderedSemantic === 'negative') {
+    return { ...(toast ? { toast } : {}), deferredCard: { type: 'raw', data: renderedCard } };
+  }
+  return { ...(toast ? { toast } : {}), card: { type: 'raw', data: renderedCard } };
 }

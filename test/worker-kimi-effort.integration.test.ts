@@ -38,11 +38,17 @@ it.skipIf(spawnSync('tmux', ['-V']).status !== 0)('Kimi effort reaches its pane 
           workingDir: data, cliId: 'kimi', cliPathOverride: fixture, backendType: 'tmux', prompt: '',
           launchShell: '/bin/bash', model: 'kimi-code/k3-256k', reasoningEffort, env: botEnv,
           larkAppId: 'test', larkAppSecret: 'test', apiOnly: true });
+        // Wait for the fake CLI to record the effort it was launched with. Deliberately
+        // a plain deadline loop, not `expect.poll`: that assertion is vitest-only and
+        // `bun test` runs this file's body on Bun, where it is undefined — the case died
+        // with `expect.poll is not a function` BEFORE reaching any assertion, so the
+        // `bun test` leg reported this file red while vitest stayed green. The loop is
+        // runner-independent and still appends the worker logs when it times out.
         const deadline = Date.now() + 15000;
         while (!existsSync(output) && Date.now() < deadline) {
-          await new Promise(resolveWait => setTimeout(resolveWait, 50));
+          await new Promise(resolve => setTimeout(resolve, 50));
         }
-        expect(existsSync(output), logs).toBe(true);
+        if (!existsSync(output)) throw new Error(`kimi never wrote its effort file within 15s\n${logs}`);
         expect(readFileSync(output, 'utf8'), logs).toBe(expected);
       } finally {
         if (child.connected) child.send!({ type: 'close' });

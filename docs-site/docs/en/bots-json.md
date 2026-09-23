@@ -302,6 +302,7 @@ Or write it directly into the bot's config:
 
 | Field | Description |
 |------|------|
+| `autoInviteOwnerOnGroupAdd` | On by default: when the bot is added to a new chat, its owner is automatically added to the same chat so the bot never ends up somewhere its owner cannot see; set `false` to turn it off (useful when an alert/on-call platform batch-adds the bot to incident chats). Applies only to the bot being passively added. Editable in Dashboard → Bot defaults → Proactive start or via `/botconfig set autoInviteOwnerOnGroupAdd off`; switching it back on clears the key to the default |
 | `autoStartOnGroupJoin` | When `true`, the bot starts working automatically when added to a new group containing at least one `allowedUsers` member (no @ needed). Requires subscribing the `im.chat.member.bot.added_v1` event for this app in the Lark admin console |
 | `autoStartOnGroupJoinPrompt` | Paired with the above: the first-round prompt for proactive start; if empty / blank, opens with an empty message and lets the bot read the group context itself. Meaningless when `autoStartOnGroupJoin` is off |
 | `autoStartOnNewTopic` | When `true`, the first message of every new topic in a topic group starts working automatically without an @ (no effect in plain groups). Defaults to passive (only @ triggers) |

@@ -558,7 +558,7 @@ export function codexTaskFailureCode(error: unknown): string {
   return CODEX_TASK_FAILED_ERROR_CODE;
 }
 
-/** Exact opt-in classifier used only by the TraeX read-only continuation
+/** Exact opt-in classifier used only by the TraeX task-continuation
  * path. Keeping it out of codexTaskFailureCode preserves every other CLI's
  * existing public error taxonomy. */
 export function isExactCodexOutputLimitError(error: unknown): boolean {

@@ -34,6 +34,7 @@ type ScheduleRow = Record<string, any> & {
   preconditionSource?: 'inline' | 'file';
   preconditionScript?: string;
   preconditionFilePath?: string;
+  lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
   model?: string;
   reasoningEffort?: string;
 };
@@ -1254,8 +1255,9 @@ function ScheduleRowCard(props: {
         <div className="schedule-actions">
           <ActionButton
             op="run"
-            label={tr('schedules.runNow')}
+            label={s.lastStatus === 'running' ? tr('schedules.running') : tr('schedules.runNow')}
             pending={props.pending === runKey}
+            disabled={s.lastStatus === 'running'}
             feedback={props.feedback[runKey] ?? null}
             onClick={() => props.onAction(s.id, 'run')}
           />
@@ -1628,6 +1630,7 @@ function ActionButton(props: {
   op: ScheduleAction;
   label: string;
   pending: boolean;
+  disabled?: boolean;
   feedback: ActionFeedback | null;
   onClick: () => void;
 }) {
@@ -1638,7 +1641,7 @@ function ActionButton(props: {
       type="button"
       className={`schedule-action-button${props.pending ? ' is-pending' : ''}${feedbackClass}`}
       data-op={props.op}
-      disabled={props.pending}
+      disabled={props.pending || props.disabled}
       onClick={props.onClick}
     >
       <span className="schedule-action-label">{actionLabel(props.op, props.label, props.pending, props.feedback, tr)}</span>

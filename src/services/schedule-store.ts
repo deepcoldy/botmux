@@ -73,7 +73,7 @@ export class IdempotencyConflictError extends Error {
  * Includes only the fields that callers control as task **input** (events
  * doc v0.1.2 §3.5 ScheduleCanonicalInput).  Excludes:
  *   - `creator*` (audit metadata, not input)
- *   - `enabled`, `nextRunAt`, `lastRunAt`, `lastStatus`, `lastError`,
+ *   - `enabled`, `nextRunAt`, `lastRunAt`, `lastStatus`, `lastRunId`, `lastError`,
  *     `lastDeliveryError` (runtime state, mutates over task lifetime)
  *   - `createdAt` (metadata)
  *   - `repeat.completed` (counter, mutates per run)
@@ -368,10 +368,14 @@ function migrate(raw: any): ScheduledTask | null {
     ownerOpenId: raw.ownerOpenId,
     ownerUnionId: raw.ownerUnionId,
     enabled: raw.enabled !== false,
+    disabledReason: raw.disabledReason === 'once_completed' || raw.disabledReason === 'manual'
+      ? raw.disabledReason
+      : undefined,
     createdAt: raw.createdAt,
     lastRunAt: raw.lastRunAt,
     nextRunAt: raw.nextRunAt,
     lastStatus: raw.lastStatus,
+    lastRunId: raw.lastRunId,
     lastError: raw.lastError,
     lastDeliveryError: raw.lastDeliveryError,
     repeat: raw.repeat,
@@ -701,7 +705,7 @@ export function removeTask(id: string, appId?: string): boolean {
 export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
-    'enabled' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
+    'enabled' | 'disabledReason' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastRunId' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
   >> & { chatIds?: readonly string[] | null },
   appId?: string,
 ): void {
@@ -724,6 +728,13 @@ export function updateTask(
         ? { ...ordinaryUpdates, deliver: 'origin' as const }
         : ordinaryUpdates,
     );
+    // Generic enable/disable writes are operator actions. Automatic one-shot
+    // completion is written directly by markRun below so the two states remain
+    // distinguishable for exact in-flight scheduled-turn authorization.
+    if (updates.enabled === true) delete task.disabledReason;
+    else if (updates.enabled === false && updates.disabledReason === undefined) {
+      task.disabledReason = 'manual';
+    }
     if (targets) {
       task.chatId = targets.chatId;
       if (targets.chatIds) task.chatIds = targets.chatIds;
@@ -733,11 +744,57 @@ export function updateTask(
   }, appId);
 }
 
+export type ScheduleRunClaimResult =
+  | { ok: true; task: ScheduledTask }
+  | { ok: false; error: 'not_found' | 'already_running' };
+
+/** Atomically claim a task for dispatch. The file lock makes this the single
+ * admission point shared by natural ticks and Dashboard run-now requests. */
+export function claimRun(
+  id: string,
+  claim: Pick<ScheduledTask, 'lastRunAt' | 'nextRunAt' | 'lastRunId'>,
+  appId?: string,
+): ScheduleRunClaimResult {
+  return mutateTasks<ScheduleRunClaimResult>(working => {
+    const task = working.get(id);
+    if (!task) return { result: { ok: false, error: 'not_found' } as const, changed: false };
+    if (task.lastStatus === 'running') {
+      return { result: { ok: false, error: 'already_running' } as const, changed: false };
+    }
+    Object.assign(task, claim, {
+      lastStatus: 'running' as const,
+      lastError: undefined,
+      lastDeliveryError: undefined,
+    });
+    return { result: { ok: true, task } as const, changed: true };
+  }, appId);
+}
+
+/** Atomically make a task due without re-arming one that is already running. */
+export function requestRunNow(
+  id: string,
+  nextRunAt = new Date().toISOString(),
+  appId?: string,
+): { ok: true } | { ok: false; error: 'not_found' | 'already_running' } {
+  return mutateTasks<{ ok: true } | { ok: false; error: 'not_found' | 'already_running' }>(working => {
+    const task = working.get(id);
+    if (!task) return { result: { ok: false, error: 'not_found' } as const, changed: false };
+    if (task.lastStatus === 'running') {
+      return { result: { ok: false, error: 'already_running' } as const, changed: false };
+    }
+    task.nextRunAt = nextRunAt;
+    return { result: { ok: true } as const, changed: true };
+  }, appId);
+}
+
 /** Record a skipped check without consuming a run or disabling a one-shot. */
-export function markSkipped(id: string, nextRunAt?: string): void {
+export function markSkipped(id: string, nextRunAt?: string, runId?: string): void {
   mutateTasks(working => {
     const task = working.get(id);
     if (!task) return { result: undefined, changed: false };
+    if (runId !== undefined && task.lastRunId !== runId) {
+      return { result: undefined, changed: false };
+    }
 
     task.lastRunAt = new Date().toISOString();
     task.lastStatus = 'skipped';
@@ -752,10 +809,19 @@ export function markSkipped(id: string, nextRunAt?: string): void {
  * Record a run outcome and auto-manage repeat counter.  If the task has a
  * finite repeat count and we've hit it, the task is removed.
  */
-export function markRun(id: string, success: boolean, error?: string, deliveryError?: string): void {
+export function markRun(
+  id: string,
+  success: boolean,
+  error?: string,
+  deliveryError?: string,
+  runId?: string,
+): void {
   const completedRepeat = mutateTasks(working => {
     const task = working.get(id);
     if (!task) return { result: undefined, changed: false };
+    if (runId !== undefined && task.lastRunId !== runId) {
+      return { result: undefined, changed: false };
+    }
 
     const now = new Date().toISOString();
     task.lastRunAt = now;
@@ -776,6 +842,7 @@ export function markRun(id: string, success: boolean, error?: string, deliveryEr
     // One-shot: disable after run. Otherwise next_run was already advanced by scheduler.
     if (task.parsed.kind === 'once') {
       task.enabled = false;
+      task.disabledReason = 'once_completed';
       task.nextRunAt = undefined;
     }
     return { result: undefined, changed: true };

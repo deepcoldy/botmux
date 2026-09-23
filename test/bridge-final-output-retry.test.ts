@@ -439,6 +439,41 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     }
   });
 
+  it('shows opt-in execution timing from the current final, never the next turn', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    const bot = getBot('app_test');
+    const ds = makeDs();
+    ds.currentTurnId = 'newer-queued-turn';
+    ds.turnReceivedAtMs = new Map([['turn-1', 1000], ['newer-queued-turn', 9000]]);
+    const msg = { ...finalOutputMsg(), durationMs: 23400, executionStartedAtMs: 4200 };
+
+    deliver(ds, msg, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply.mock.calls[0][1]).not.toContain('执行耗时');
+
+    bot.config.showReplyTiming = true;
+    ds.session.cliId = 'codex-app';
+    deliver(ds, { ...msg, durationMs: undefined, codexAppSettlement: {
+      requestId: 'req', generation: 'gen', seq: 1, dispatchId: 'dispatch', durationMs: 23400,
+    } }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply.mock.calls[1][1]).toContain('等待 3.2 秒');
+    expect(sessionReply.mock.calls[1][1]).toContain('执行耗时 23.4 秒');
+    expect(sessionReply.mock.calls[1][4]).toBe(msg.turnId);
+
+    ds.session.cliId = 'claude-code';
+    deliver(ds, { ...msg, durationMs: 1200 }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply.mock.calls[2][1]).toContain('执行耗时 1.2 秒');
+
+    deliver(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply.mock.calls[3][1]).not.toContain('执行耗时');
+    expect(sessionReply.mock.calls[3][1]).not.toContain('等待');
+  });
+
   it('commits dedup uuid only after a successful sessionReply', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     const closeSession = vi.fn();

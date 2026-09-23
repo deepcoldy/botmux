@@ -1,6 +1,18 @@
 /** English translations — mirrors the keys defined in `zh.ts`. */
 export const messages: Record<string, string> = {
   'worker.steer_accepted': 'Got it — guidance accepted',
+  // ─── Terminal status pages ───────────────────────────────────────────────
+  'terminal.status.starting.title': 'Terminal is starting',
+  'terminal.status.starting.detail': 'Restoring this session\'s terminal connection. Refresh this page later or reopen the Web Terminal from the latest card.',
+  'terminal.status.closed.title': 'This session is closed',
+  'terminal.status.closed.detail': 'This session has ended, so its terminal can no longer be viewed.',
+  'terminal.status.not_found.title': 'Session not found',
+  'terminal.status.not_found.detail': 'This terminal link is invalid, or the session has been deleted.',
+  'terminal.status.forbidden.title': 'Terminal link expired',
+  'terminal.status.forbidden.detail': 'Return to Lark and reopen the Web Terminal from this session\'s latest card.',
+  'terminal.status.unavailable.title': 'Terminal unavailable',
+  'terminal.status.unavailable.detail': 'The session still exists, but its terminal service cannot be restored right now.',
+
   // ─── Card buttons ────────────────────────────────────────────────────────
   'card.btn.open_terminal': '🖥️ Open Web Terminal',
   'card.btn.open_writable_terminal': '🖥️ Open Writable Web Terminal',
@@ -1149,7 +1161,6 @@ export const messages: Record<string, string> = {
   'setup.lark_perm_chat': '  - im:chat (group info)',
   'setup.lark_perm_user_base': '  - contact:user.base:readonly (user info)',
   'setup.lark_enable_events': 'Enable Event Subscription (WebSocket mode):',
-  'setup.supported_clis': 'Supported CLIs: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr  10) hermes  11) codex-app  12) mira  13) seed  14) traex  15) pi  16) copilot  17) oh-my-pi  18) relay',
   'setup.prompt_cli_choice': 'CLI adapter [1]: ',
   'setup.prompt_working_dir': 'Default working directory [~]: ',
   'setup.prompt_allowed_users': 'Allowed users (emails / mobiles / open_ids, comma-separated; empty = no restriction): ',
@@ -1593,6 +1604,8 @@ export const messages: Record<string, string> = {
 
   // Markdown / contextual reply card chrome
   'card.you': 'You',
+  'card.waiting_duration': 'Waiting {seconds}s',
+  'card.execution_duration': 'Execution time {seconds}s',
   'card.sent_to': 'Sent to: ',
   'card.usage.context': 'Context',
   // Claude Code statusline quota segment (plain `ctx 23% · 5h 18% · 7d 5%`); same in both locales.

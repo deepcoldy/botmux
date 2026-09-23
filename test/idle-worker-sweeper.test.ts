@@ -22,7 +22,10 @@ vi.mock('../src/utils/logger.js', () => ({
 import {
   sweepIdleWorkers,
   sweepIdleWorkersAfterTurnDrain,
+  reclaimIdleWorkersForAdmission,
+  reclaimIdleWorkersForAdmissionAfterTurnDrain,
   DEFAULT_MAX_LIVE_WORKERS,
+  ADMISSION_RECLAIM_MAX_SUSPEND,
 } from '../src/core/idle-worker-sweeper.js';
 import {
   __testOnly_resetBotTurnMutationGates,
@@ -329,5 +332,235 @@ describe('sweepIdleWorkers (per-bot count cap)', () => {
     releaseAdmission();
     await admission;
     await expect(withBotTurnAdmission(appId, async () => 'open')).resolves.toBe('open');
+  });
+});
+
+describe('sweepIdleWorkers (per-bot idle TTL)', () => {
+  beforeEach(() => {
+    __testOnly_resetBotTurnMutationGates();
+  });
+
+  const ttlMs = 30 * 60_000;
+
+  it('suspends an idle session past the TTL with reason idle_ttl even under the cap', () => {
+    const activeSessions = new Map<string, any>([
+      ['a', { ...ds('a', 'tmux', now - 60 * 60_000), idleSinceAt: now - 31 * 60_000 }],
+      ['b', { ...ds('b', 'herdr', now - 10 * 60_000), idleSinceAt: now - 5 * 60_000 }],
+    ]);
+
+    const suspended = sweepIdleWorkers(activeSessions, { maxLiveWorkers: 30, idleTtlMs: ttlMs, now });
+
+    expect(suspended).toEqual([{ sessionId: 'a', reason: 'idle_ttl' }]);
+    expect(activeSessions.get('a').worker).toBe(null);
+    expect(activeSessions.get('b').worker).not.toBe(null);
+  });
+
+  it('does not suspend when the TTL is not reached yet (boundary inclusive)', () => {
+    const activeSessions = new Map<string, any>([
+      // stamp exactly at now-ttl → idleSinceAt+ttl === now → due (inclusive).
+      ['due', { ...ds('due', 'tmux', now - 60 * 60_000), idleSinceAt: now - ttlMs }],
+      // 1ms short of the boundary → stays live.
+      ['soon', { ...ds('soon', 'herdr', now - 60 * 60_000), idleSinceAt: now - ttlMs + 1 }],
+    ]);
+
+    const suspended = sweepIdleWorkers(activeSessions, { idleTtlMs: ttlMs, now });
+
+    expect(suspended.map(s => s.sessionId)).toEqual(['due']);
+    expect(activeSessions.get('soon').worker).not.toBe(null);
+  });
+
+  it('does not TTL-suspend a session without an idleSinceAt stamp', () => {
+    const activeSessions = new Map<string, any>([
+      // lastScreenStatus idle but no stamp (e.g. restored after daemon restart).
+      ['a', ds('a', 'tmux', now - 24 * 60 * 60_000)],
+    ]);
+
+    const suspended = sweepIdleWorkers(activeSessions, { idleTtlMs: ttlMs, now });
+
+    expect(suspended).toEqual([]);
+    expect(activeSessions.get('a').worker).not.toBe(null);
+  });
+
+  it('does not TTL-suspend busy / adopt / non-resumable sessions even when stamp is old', () => {
+    const adopt = { ...ds('adopt', 'tmux', now - 24 * 60 * 60_000), idleSinceAt: now - 60 * 60_000, adoptedFrom: { x: 1 } };
+    const activeSessions = new Map<string, any>([
+      ['busy', { ...ds('busy', 'tmux', now - 24 * 60 * 60_000), lastScreenStatus: 'working', idleSinceAt: now - 60 * 60_000 }],
+      ['pty', { ...ds('pty', 'pty', now - 24 * 60 * 60_000), idleSinceAt: now - 60 * 60_000 }],
+      ['riff', { ...ds('riff', 'riff', now - 24 * 60 * 60_000), idleSinceAt: now - 60 * 60_000 }],
+      ['adopt', adopt],
+      ['ok', { ...ds('ok', 'zellij', now - 24 * 60 * 60_000), idleSinceAt: now - 31 * 60_000 }],
+    ]);
+
+    const suspended = sweepIdleWorkers(activeSessions, { idleTtlMs: ttlMs, now });
+
+    expect(suspended.map(s => s.sessionId)).toEqual(['ok']);
+    for (const id of ['busy', 'pty', 'riff', 'adopt']) {
+      expect(activeSessions.get(id).worker).not.toBe(null);
+    }
+  });
+
+  it('still applies the TTL when maxLiveWorkers is the ≤0 unlimited escape hatch', () => {
+    const activeSessions = new Map<string, any>([
+      ['a', { ...ds('a', 'tmux', now - 100 * 60_000), idleSinceAt: now - 31 * 60_000 }],
+      ['b', { ...ds('b', 'herdr', now - 50 * 60_000), idleSinceAt: now - 5 * 60_000 }],
+    ]);
+
+    const suspended = sweepIdleWorkers(activeSessions, { maxLiveWorkers: 0, idleTtlMs: ttlMs, now });
+
+    expect(suspended).toEqual([{ sessionId: 'a', reason: 'idle_ttl' }]);
+    expect(activeSessions.get('b').worker).not.toBe(null);
+  });
+
+  it('takes the UNION of cap victims and TTL victims in one LRU-ordered pass', () => {
+    // Five live, cap=3 → two over cap. TTL additionally expires 'ttlNew',
+    // which is NOT one of the two oldest: union must suspend 3 sessions and
+    // label each with its own reason.
+    const activeSessions = new Map<string, any>([
+      ['old1', { ...ds('old1', 'tmux', now - 100 * 60_000), idleSinceAt: now - 5 * 60_000 }],
+      ['old2', { ...ds('old2', 'herdr', now - 90 * 60_000), idleSinceAt: now - 5 * 60_000 }],
+      ['mid', { ...ds('mid', 'zellij', now - 80 * 60_000), idleSinceAt: now - 5 * 60_000 }],
+      ['ttlNew', { ...ds('ttlNew', 'tmux', now - 10 * 60_000), idleSinceAt: now - 45 * 60_000 }],
+      ['new', { ...ds('new', 'zmx', now - 5 * 60_000), idleSinceAt: now - 2 * 60_000 }],
+    ]);
+
+    const suspended = sweepIdleWorkers(activeSessions, { maxLiveWorkers: 3, idleTtlMs: ttlMs, now });
+
+    expect(suspended).toEqual([
+      { sessionId: 'old1', reason: 'live_worker_cap' },
+      { sessionId: 'old2', reason: 'live_worker_cap' },
+      { sessionId: 'ttlNew', reason: 'idle_ttl' },
+    ]);
+    expect(activeSessions.get('mid').worker).not.toBe(null);
+    expect(activeSessions.get('new').worker).not.toBe(null);
+  });
+
+  it('does not double-count a TTL victim that already brings the bot to the cap', () => {
+    // Two live, cap=1 → one over cap. The OLDEST is itself TTL-due: it must be
+    // suspended exactly once as idle_ttl, and the still-under-TTL second session
+    // must NOT be cap-suspended (the TTL suspension already reached the cap).
+    const activeSessions = new Map<string, any>([
+      ['old', { ...ds('old', 'tmux', now - 100 * 60_000), idleSinceAt: now - 40 * 60_000 }],
+      ['young', { ...ds('young', 'herdr', now - 50 * 60_000), idleSinceAt: now - 5 * 60_000 }],
+    ]);
+
+    const suspended = sweepIdleWorkers(activeSessions, { maxLiveWorkers: 1, idleTtlMs: ttlMs, now });
+
+    expect(suspended).toEqual([{ sessionId: 'old', reason: 'idle_ttl' }]);
+    expect(activeSessions.get('young').worker).not.toBe(null);
+  });
+
+  it('does nothing when TTL is configured but nobody is due (also under cap)', () => {
+    const activeSessions = new Map<string, any>([
+      ['a', { ...ds('a', 'tmux', now - 60 * 60_000), idleSinceAt: now - 5 * 60_000 }],
+      ['b', { ...ds('b', 'herdr', now - 40 * 60_000), idleSinceAt: now - 3 * 60_000 }],
+    ]);
+
+    expect(sweepIdleWorkers(activeSessions, { idleTtlMs: ttlMs, now })).toEqual([]);
+  });
+});
+
+describe('reclaimIdleWorkersForAdmission (marginal-admission rescue)', () => {
+  beforeEach(() => {
+    __testOnly_resetBotTurnMutationGates();
+  });
+
+  it('reclaims idle candidates regardless of any count cap, LRU first', () => {
+    // Six live, well under the default cap of 30 — the cap path does nothing,
+    // but admission rescue still reclaims the four oldest.
+    const entries: [string, any][] = [];
+    for (let i = 0; i < 6; i++) {
+      entries.push([`s${i}`, ds(`s${i}`, 'tmux', now - (60 - i) * 60_000)]);
+    }
+    const activeSessions = new Map<string, any>(entries);
+
+    const suspended = reclaimIdleWorkersForAdmission(activeSessions);
+
+    expect(suspended.map(s => s.sessionId)).toEqual(['s0', 's1', 's2', 's3']);
+    expect(suspended.every(s => s.reason === 'admission_memory')).toBe(true);
+    expect(ADMISSION_RECLAIM_MAX_SUSPEND).toBe(4);
+    for (const id of ['s0', 's1', 's2', 's3']) expect(activeSessions.get(id).worker).toBe(null);
+    for (const id of ['s4', 's5']) expect(activeSessions.get(id).worker).not.toBe(null);
+  });
+
+  it('respects a smaller injected maxSuspend and treats ≤0 as a no-op', () => {
+    const make = () => new Map<string, any>([
+      ['a', ds('a', 'tmux', now - 60 * 60_000)],
+      ['b', ds('b', 'tmux', now - 50 * 60_000)],
+    ]);
+    expect(reclaimIdleWorkersForAdmission(make(), { maxSuspend: 1 }).map(s => s.sessionId)).toEqual(['a']);
+    expect(reclaimIdleWorkersForAdmission(make(), { maxSuspend: 0 })).toEqual([]);
+  });
+
+  it('never reclaims adopt, busy, or non-resumable sessions', () => {
+    const adopt = { ...ds('adopt', 'tmux', now - 100 * 60_000), adoptedFrom: { x: 1 } };
+    const activeSessions = new Map<string, any>([
+      ['adopt', adopt],
+      ['busy', { ...ds('busy', 'tmux', now - 90 * 60_000), lastScreenStatus: 'working' }],
+      ['pty', ds('pty', 'pty', now - 80 * 60_000)],
+      ['ok', ds('ok', 'herdr', now - 70 * 60_000)],
+    ]);
+
+    const suspended = reclaimIdleWorkersForAdmission(activeSessions, { maxSuspend: 4 });
+
+    expect(suspended.map(s => s.sessionId)).toEqual(['ok']);
+    for (const id of ['adopt', 'busy', 'pty']) expect(activeSessions.get(id).worker).not.toBe(null);
+  });
+
+  it('returns [] when there are no reclaimable idle sessions', () => {
+    const activeSessions = new Map<string, any>([
+      ['busy', { ...ds('busy', 'tmux', now - 90 * 60_000), lastScreenStatus: 'working' }],
+    ]);
+    expect(reclaimIdleWorkersForAdmission(activeSessions)).toEqual([]);
+    expect(activeSessions.get('busy').worker).not.toBe(null);
+  });
+
+  it('never reclaims the rescue-initiating session, even when it is an idle candidate', () => {
+    // Five LRU-ordered idle candidates; s1 asks for the rescue. It must be
+    // skipped and reclaim must continue with the next four (still capped at 4).
+    const entries: [string, any][] = [];
+    for (let i = 0; i < 5; i++) {
+      entries.push([`s${i}`, ds(`s${i}`, 'tmux', now - (60 - i) * 60_000)]);
+    }
+    const activeSessions = new Map<string, any>(entries);
+
+    const suspended = reclaimIdleWorkersForAdmission(activeSessions, {
+      excludeSessionId: 's1',
+    });
+
+    expect(suspended.map(s => s.sessionId)).toEqual(['s0', 's2', 's3', 's4']);
+    expect(activeSessions.get('s1').worker).not.toBe(null);
+    for (const id of ['s0', 's2', 's3', 's4']) expect(activeSessions.get(id).worker).toBe(null);
+  });
+
+  it('gated wrapper reclaims inside an admission lease and skips on timeout', async () => {
+    const appId = 'cli_reclaim';
+    const activeSessions = new Map<string, any>([
+      ['a', ds('a', 'tmux', now - 90 * 60_000)],
+    ]);
+
+    await withBotTurnAdmission(appId, async () => {
+      const suspended = await reclaimIdleWorkersForAdmissionAfterTurnDrain(appId, activeSessions);
+      expect(suspended).toEqual([{ sessionId: 'a', reason: 'admission_memory' }]);
+      expect(activeSessions.get('a').worker).toBe(null);
+    });
+
+    // A wedged foreign admission → bounded skip, no suspension.
+    const blocked = new Map<string, any>([
+      ['b', ds('b', 'tmux', now - 90 * 60_000)],
+    ]);
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>(resolve => { started = resolve; });
+    const foreign = withBotTurnAdmission('cli_wedged_reclaim', async () => {
+      started();
+      await new Promise<void>(resolve => { release = resolve; });
+    });
+    await gate;
+    await expect(reclaimIdleWorkersForAdmissionAfterTurnDrain('cli_wedged_reclaim', blocked, {
+      mutationAcquireTimeoutMs: 5,
+    })).resolves.toEqual([]);
+    expect(blocked.get('b').worker).not.toBe(null);
+    release();
+    await foreign;
   });
 });

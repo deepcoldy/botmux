@@ -381,8 +381,8 @@ export interface Session {
   /** Crash-safe bounded recovery state for an ordinary Claude/Lark logical
    * turn. Timer ownership is runtime-only; this record re-arms it on restore. */
   ordinaryTurnRecovery?: import('./services/ordinary-turn-recovery.js').OrdinaryTurnRecoveryState;
-  /** Explicit opt-in lease for one read-only long-running task. Disabled
-   * globally unless BOTMUX_READONLY_CONTINUATION_ENABLED=true. */
+  /** Explicit opt-in lease for one authorization-inheriting long-running task.
+   * The field name is retained for persisted-state compatibility. */
   readonlyTaskContinuation?: import('./services/readonly-task-continuation.js').ReadonlyTaskContinuationState;
   /** Dashboard 看板视图的手动放置：列 id（backlog/todo/in_progress/in_review/done）。
    *  未设置时前端按运行状态推导默认列；一旦用户拖拽过就以此为准。 */
@@ -554,12 +554,7 @@ export interface Session {
   /** Best-effort human-readable chat name. Group sessions use the Lark group
    *  name when available; p2p sessions fall back to the initiating user name. */
   chatDisplayName?: string;
-  /** open_id of whoever created this session (the first sender), app-scoped to
-   *  this bot. UNLIKE ownerOpenId, this is set even for bot-started (foreign-bot)
-   *  sessions and is NEVER overwritten by later activity — so it stably points at
-   *  the dispatch orchestrator for `botmux report` even when there is no `/repo`
-   *  prime (foreign-bot auto-create nulls ownerOpenId) and the reply-chain
-   *  quoteTargetSenderOpenId has drifted to a peer reviewer. */
+  /** Immutable first sender, scoped to this bot and session; a user-created thread does not inherit its task's creator. */
   creatorOpenId?: string;
   /** Lark `union_id` of the session owner. Stable across apps within a tenant
    *  (unlike `ownerOpenId`, which is app-scoped: the same Lark user has a
@@ -635,6 +630,10 @@ export interface Session {
    * accepted so daemon restarts and replacement workers invalidate receipts
    * emitted by an earlier lifetime. */
   workerGeneration?: number;
+  /** Random revocation epoch for the read-only terminal link embedded in the
+   * live Lark card. Stable across worker replacement, rotated when a closed
+   * session is resumed so an old card never regains access to a new lifecycle. */
+  terminalCardEpoch?: string;
   /** True once a substitute-mode control card has been DM'd to the owner(s). Persisted to avoid re-sends on worker restart or daemon recovery. */
   substituteControlCardSent?: boolean;
   /** Bounded exact destination captured at inbound turn start. Codex App copies
@@ -1051,11 +1050,13 @@ export interface XpiSharedCwdQuarantine {
   noticePending: boolean;
 }
 
-/** Private daemon→worker capability stamp for one continuation dispatch. The
- * worker accepts it only on the exact RPC generation that produced the proof. */
-export interface ReadonlyContinuationDispatchMarker {
+/** Private daemon→worker marker for one authorization-inheriting continuation.
+ * It carries no authority: the synthetic turn runs through the same live RPC
+ * thread and runtime permission policy as the originating user turn. */
+export interface TaskContinuationDispatchMarker {
   leaseId: string;
   rpcGeneration: string;
+  authorizationMode: 'inherited';
 }
 
 export interface SessionCliLaunchSnapshotV1 {
@@ -1234,10 +1235,17 @@ export interface ScheduledTask {
    *  running as the bot. */
   ownerUnionId?: string;
   enabled: boolean;
+  /** Why an enabled task became disabled. Missing means a legacy/unknown
+   *  disable and is never enough to extend scheduled-turn authority. */
+  disabledReason?: 'once_completed' | 'manual';
   createdAt: string;
   lastRunAt?: string;
   nextRunAt?: string;
-  lastStatus?: 'ok' | 'error' | 'skipped';
+  /** Durable state of the most recently claimed run. `running` is written
+   *  before asynchronous dispatch and settled only by the matching run id. */
+  lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
+  /** Scheduler-generated identity for the run represented by lastStatus. */
+  lastRunId?: string;
   lastError?: string;
   lastDeliveryError?: string;
   /** Repeat counter — times=null means forever; times>0 auto-removes after N runs */
@@ -1489,7 +1497,7 @@ type DaemonToWorkerBase =
    *  the next message, with no restart IPC to refresh the snapshot. Same
    *  three-state contract (undefined = not carried → keep snapshot; null = launch
    *  with no model). It never affects the CLI already running. */
-  | { type: 'message'; queueAfterActiveTurn?: true; content: string; codexAppInput?: CodexAppTurnInput; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; readonlyContinuation?: ReadonlyContinuationDispatchMarker }
+  | { type: 'message'; queueAfterActiveTurn?: true; content: string; codexAppInput?: CodexAppTurnInput; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; codexAppDispatchId?: string; codexAppSteerable?: true; queuedActivationToken?: string; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; rerouteEnvelope?: CrossPrincipalInterruptionMessage; atMostOnce?: true; mojoLivePatch?: MojoLivePatch; model?: string | null; taskContinuation?: TaskContinuationDispatchMarker }
   | { type: 'codex_app_dispatch_persisted'; requestId: string; ok: boolean; error?: string }
   /** Literal slash-command passthrough. `followUpContent` rides along so the
    *  worker enqueues it strictly AFTER the slash command's Enter — two separate
@@ -1580,7 +1588,11 @@ type DaemonToWorkerBase =
 
 export type DaemonToWorker = DaemonToWorkerBase extends infer Message
   ? Message extends { type: 'init' }
-    ? Message & { feedback?: import('./services/feedback-policy.js').FeedbackPolicy; cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1 }
+    ? Message & {
+        feedback?: import('./services/feedback-policy.js').FeedbackPolicy;
+        cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1;
+        terminalCardEpoch?: string;
+      }
     : Message
   : never;
 
@@ -1651,10 +1663,12 @@ export type WorkerToDaemon =
        * backend intentionally has no raw-terminal Web UI capability. */
       port: number;
       token: string;
-      /** PER-BOOT random read capability (P1-5): card links minted from it die
-       * with this worker generation, and the dashboard view-link API replaces
-       * it with a short-lived auth-bound grant instead of handing it out. */
+      /** PER-BOOT random read capability (P1-5). The dashboard view-link API
+       * binds its short-lived grants to this worker generation. */
       viewToken?: string;
+      /** Session-lifecycle read capability embedded in Lark cards. It survives
+       * worker replacement but rotates when a closed session is resumed. */
+      cardViewToken?: string;
       spawnCommand?: string;
       replyAlreadySent?: boolean;
       turnId?: string;
@@ -1685,6 +1699,10 @@ export type WorkerToDaemon =
       credentialIsolated: boolean;
       cliPid?: number;
       cliProcStart?: string;
+      /** RPC app-server root. Tool subprocesses are descendants of this
+       * sibling rather than of the viewer CLI. */
+      enginePid?: number;
+      engineProcStart?: string;
     }
   | {
       type: 'queued_activation_submitted';
@@ -1734,11 +1752,10 @@ export type WorkerToDaemon =
    * read bridge send markers or emit transcript fallback for this session. */
   | { type: 'session_close_ready'; sessionId: string }
   | {
-      type: 'readonly_continuation_rpc_status';
+      type: 'task_continuation_rpc_status';
       sessionId: string;
       rpcGeneration: string;
       eligible: boolean;
-      reason?: string;
     }
   | { type: 'prompt_ready' }
   | { type: 'cli_runtime_version'; version: string }
@@ -1794,7 +1811,7 @@ export type WorkerToDaemon =
       dispatchAttempt: number;
       disposition: 'queued_removed' | 'cli_fenced';
     }
-  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number; readonlyContinuation?: true }
+  | { type: 'managed_turn_origin'; sessionId: string; capability: string; policyCapability?: string; originChannelId?: string; turnId?: string; dispatchAttempt?: number }
   /** An in-worker CLI restart rotates the managed-send authority without
    * replacing the Node worker. Carry the old token so the daemon can revoke
    * exactly that generation and ignore a delayed revoke after the next turn
@@ -1823,6 +1840,10 @@ export type WorkerToDaemon =
       lastUuid: string;
       turnId: string;
       replyTurnId?: string;
+      /** Measured native execution time for this exact turn/attempt, excluding queueing. */
+      durationMs?: number;
+      /** Literal CLI input time, from the same execution window as durationMs. */
+      executionStartedAtMs?: number;
       /** Durable receiver attempt attribution. Final output suppression is
        *  attempt-scoped so a late attempt-N event cannot affect attempt N+1. */
       dispatchAttempt?: number;

@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { delimiter } from 'node:path';
 
 import {
   CLI_SELECT_OPTIONS,
@@ -9,6 +10,7 @@ import {
   selectionKeyForBot,
   stripSettingsArgs,
   stripWrapperUnsafeArgs,
+  rewriteAidenCodexArgs,
   buildWrappedLaunch,
   parseWrapperCli,
   decorateResumeForWrapper,
@@ -314,6 +316,36 @@ describe('stripWrapperUnsafeArgs', () => {
   });
 });
 
+describe('rewriteAidenCodexArgs', () => {
+  it('rewrites Botmux reasoning config to Aiden native syntax', () => {
+    expect(rewriteAidenCodexArgs([
+      '--model', 'deepseek-v4-pro',
+      '-c', 'model_reasoning_effort="high"',
+    ])).toEqual({
+      reasoningEffort: 'high',
+      forwardedArgs: ['--model', 'deepseek-v4-pro'],
+    });
+  });
+
+  it.each(['max', 'ultra'] as const)('preserves the %s reasoning level for the shim', (effort) => {
+    expect(rewriteAidenCodexArgs(['-c', `model_reasoning_effort="${effort}"`, '--model', 'm']))
+      .toEqual({ reasoningEffort: effort, forwardedArgs: ['--model', 'm'] });
+  });
+
+  it('removes the Aiden-incompatible config even when no shim is available', () => {
+    const out = buildWrappedLaunch('aiden x codex', [
+      '-c', 'model_reasoning_effort="ultra"', '--model', 'm',
+    ]);
+    expect(out.args).toEqual(['x', 'codex', '--model', 'm']);
+    expect(out.env).toBeUndefined();
+  });
+
+  it('does not rewrite arbitrary user config values', () => {
+    expect(rewriteAidenCodexArgs(['-c', 'model_provider="custom"']))
+      .toEqual({ reasoningEffort: undefined, forwardedArgs: ['-c', 'model_provider="custom"'] });
+  });
+});
+
 describe('parseWrapperCli', () => {
   it('splits on whitespace and drops blanks', () => {
     expect(parseWrapperCli('  aiden   x claude ')).toEqual(['aiden', 'x', 'claude']);
@@ -381,9 +413,19 @@ describe('buildWrappedLaunch', () => {
     expect(out.args).toEqual(['x', 'codex', '--no-alt-screen']);
   });
 
-  it('does not strip a user-supplied -c that is not a botmux override (aiden x codex)', () => {
-    const out = buildWrappedLaunch('aiden x codex', ['-c', 'model_reasoning_effort="high"', '--model', 'm']);
-    expect(out.args).toEqual(['x', 'codex', '-c', 'model_reasoning_effort="high"', '--model', 'm']);
+  it('rewrites the Codex adapter reasoning config for aiden x codex', () => {
+    const out = buildWrappedLaunch(
+      'aiden x codex',
+      ['-c', 'model_reasoning_effort="high"', '--model', 'm'],
+      (bin) => `/resolved/${bin}`,
+      { childPath: '/child/bin', aidenCodexShimDir: '/botmux/scripts/aiden-codex-shim' },
+    );
+    expect(out.args).toEqual(['x', 'codex', '--model', 'm']);
+    expect(out.env).toMatchObject({
+      PATH: `/botmux/scripts/aiden-codex-shim${delimiter}/child/bin`,
+      BOTMUX_AIDEN_CODEX_REAL_BIN: '/resolved/codex',
+      BOTMUX_AIDEN_CODEX_REASONING_EFFORT: 'high',
+    });
   });
 
   // Regression: aiden's launcher injects codex's --dangerously-bypass-hook-trust itself,

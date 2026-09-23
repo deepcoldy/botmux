@@ -25,6 +25,10 @@ import {
   setGlobalLocale,
   writeCodexNotifierConfig,
   writeHostOverloadAlertConfig,
+  SESSION_CLEANUP_HOUR_OPTIONS,
+  SESSION_CLEANUP_MIN_INTERVAL_MINUTES,
+  type SessionCleanupGlobalConfig,
+  type SessionCleanupHours,
 } from '../global-config.js';
 import {
   installCodexNotifierHook,
@@ -106,6 +110,13 @@ export interface ResolvedDashboardSettingsView {
   remoteAccess?: boolean;
   /** Machine-wide v3 Workflow feature switch. Default ON. */
   workflow: { enabled: boolean };
+  /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
+   *  生效值（含默认回退），供设置页回显。 */
+  sessionCleanup: {
+    enabled: boolean;
+    olderThanHours: SessionCleanupHours;
+    intervalMinutes: number;
+  };
   /** OAuth 授权回跳基址（`<base>/oauth/callback`），null/absent = 未配置。 */
   oauthRedirectBase?: string | null;
   /** Configured schedule-task timezone override (IANA), or null/absent when
@@ -253,6 +264,10 @@ export type ApplySettingsWriteError =
   | 'invalid_vcMeetingAgent_listenerBotAppId'
   | 'invalid_workflow'
   | 'invalid_workflow_enabled'
+  | 'invalid_sessionCleanup'
+  | 'invalid_sessionCleanup_enabled'
+  | 'invalid_sessionCleanup_olderThanHours'
+  | 'invalid_sessionCleanup_intervalMinutes'
   | 'invalid_scheduleTimeZone'
   | 'invalid_oauthRedirectBase'
   | 'invalid_whiteboard'
@@ -624,6 +639,47 @@ export async function applySettingsWrite(
     // Merge over existing so a future sibling key in the workflow block survives.
     const current = deps.readGlobalConfig().workflow ?? {};
     deps.mergeGlobalConfig({ workflow: { ...current, enabled: wf.enabled } });
+    touched = true;
+  }
+
+  if ('sessionCleanup' in obj) {
+    const raw = obj.sessionCleanup;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, error: 'invalid_sessionCleanup' };
+    }
+    const sc = raw as Record<string, unknown>;
+    // Merge over the validated existing block so a partial patch (e.g. just the
+    // toggle) keeps the other supported fields.
+    const next: SessionCleanupGlobalConfig = { ...(deps.readGlobalConfig().sessionCleanup ?? {}) };
+    if ('enabled' in sc) {
+      if (typeof sc.enabled !== 'boolean') {
+        return { ok: false, error: 'invalid_sessionCleanup_enabled' };
+      }
+      next.enabled = sc.enabled;
+    }
+    if ('olderThanHours' in sc) {
+      if (
+        typeof sc.olderThanHours !== 'number'
+        || !(SESSION_CLEANUP_HOUR_OPTIONS as readonly number[]).includes(sc.olderThanHours)
+      ) {
+        return { ok: false, error: 'invalid_sessionCleanup_olderThanHours' };
+      }
+      next.olderThanHours = sc.olderThanHours as SessionCleanupHours;
+    }
+    if ('intervalMinutes' in sc) {
+      if (
+        typeof sc.intervalMinutes !== 'number'
+        || !Number.isFinite(sc.intervalMinutes)
+        || sc.intervalMinutes < SESSION_CLEANUP_MIN_INTERVAL_MINUTES
+      ) {
+        return { ok: false, error: 'invalid_sessionCleanup_intervalMinutes' };
+      }
+      next.intervalMinutes = Math.floor(sc.intervalMinutes);
+    }
+    if (!('enabled' in sc) && !('olderThanHours' in sc) && !('intervalMinutes' in sc)) {
+      return { ok: false, error: 'invalid_sessionCleanup' };
+    }
+    deps.mergeGlobalConfig({ sessionCleanup: next });
     touched = true;
   }
 

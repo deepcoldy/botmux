@@ -165,7 +165,7 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
       return {
         initialPrompt: prepared.initialPromptArg,
         readonlyRoots: prepared.readonlyRoot ? [prepared.readonlyRoot] : undefined,
-        cleanupPaths: prepared.filePath ? [prepared.filePath] : undefined,
+        cleanupPaths: prepared.filePath ? [prepared.filePath, prepared.extensionPath!] : undefined,
         cleanupDirs: prepared.cleanupDir ? [prepared.cleanupDir] : undefined,
         deferredInput: prepared.deferredInput,
       };

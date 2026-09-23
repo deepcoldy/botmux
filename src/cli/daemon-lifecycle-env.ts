@@ -59,9 +59,9 @@ export const DAEMON_ENV_KEYS = [
   // keeps them on the deterministic resolveDaemonEnv snapshot semantics.
   'BOTMUX_DASHBOARD_CONTROL_AUDIT_PATH',
   'BOTMUX_DASHBOARD_TERMINAL_CONTROL_TTL_MS',
-  // Machine-wide emergency brake for the opt-in read-only task continuation
-  // lease. Missing/empty means OFF; the daemon re-checks it before every
-  // continuation, so a restart with false cancels restored backoff leases.
+  // Machine-wide rollout switch and emergency brake for automatic task continuation. The
+  // old read-only key remains a compatibility alias during rollout.
+  'BOTMUX_TASK_CONTINUATION_ENABLED',
   'BOTMUX_READONLY_CONTINUATION_ENABLED',
   // Merlin Devbox auto-export switch (platform/devbox-dashboard-export.ts).
   // The dashboard resolves it (dashboard-url / control-csrf run there), so it

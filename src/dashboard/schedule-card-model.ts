@@ -55,7 +55,7 @@ export interface ScheduleCardTaskInput {
   nextRunAt?: string;
   /** ISO of the last completed run. */
   lastRunAt?: string;
-  lastStatus?: 'ok' | 'error' | 'skipped';
+  lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
   /** Repeat counter shape mirrors `ScheduledTask.repeat` (`src/types.ts:212`):
    *  `times === null` ⇒ forever; finite `times` ⇒ auto-removes after N runs.
    *  `completed` counts how many runs have fired. */
@@ -133,7 +133,7 @@ export interface ScheduleDetailDto {
   nextRuns: string[];
   nextRunAt?: string;
   lastRunAt?: string;
-  lastStatus?: 'ok' | 'error' | 'skipped';
+  lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
   errorIndicator: boolean;
   /** Passthrough of `ScheduledTask.repeat`. */
   repeat?: { times: number | null; completed: number };
@@ -194,15 +194,18 @@ function formatLastRun(lastRunAt: string | undefined, nowMs: number): string {
 
 /** Compute UI availability for the 3 schedule action buttons (pure). */
 export function computeButtonAvailability(task: ScheduleCardTaskInput): ScheduleActionMatrix {
+  const runNow = task.lastStatus === 'running'
+    ? { enabled: false, reasonKey: 'schedules.action.run.alreadyRunning' }
+    : { enabled: true };
   if (task.enabled) {
     return {
-      runNow: { enabled: true },
+      runNow,
       pause: { enabled: true },
       resume: { enabled: false, reasonKey: 'schedules.action.resume.alreadyEnabled' },
     };
   }
   return {
-    runNow: { enabled: true },
+    runNow,
     pause: { enabled: false, reasonKey: 'schedules.action.pause.alreadyPaused' },
     resume: { enabled: true },
   };

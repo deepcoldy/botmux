@@ -1100,6 +1100,15 @@ describe('buildMarkdownCard', () => {
 });
 
 describe('buildReplyCardFooter', () => {
+  it('keeps timing-only footers identifiable and omits invalid timing', () => {
+    const footer = buildReplyCardFooter({ brand: '', executionDurationMs: 0, locale: 'en' });
+    expect(footer?.content).toContain('Execution time 0.0s');
+    expect(footer?.element.element_id).toBe('botmux_reply_footer');
+    expect(buildReplyCardFooter({ brand: '', executionDurationMs: -1 })).toBeNull();
+    expect(buildReplyCardFooter({ brand: '', executionDurationMs: Number.NaN })).toBeNull();
+    expect(buildReplyCardFooter({ brand: '', executionDurationMs: Number.POSITIVE_INFINITY })).toBeNull();
+  });
+
   it('centralizes brand, usage, and ordered recipients for every reply-card path', () => {
     const footer = buildReplyCardFooter({
       brand: 'Acme',

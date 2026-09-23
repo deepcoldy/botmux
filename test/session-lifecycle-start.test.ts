@@ -8,12 +8,14 @@ const {
   execSyncMock,
   checkWorkerAdmissionMock,
   standaloneBinaryMock,
+  tmuxProbeMock,
 } = vi.hoisted(() => ({
   emitHookEventMock: vi.fn(),
   forkMock: vi.fn(),
   execSyncMock: vi.fn(),
   checkWorkerAdmissionMock: vi.fn(),
   standaloneBinaryMock: vi.fn(() => false),
+  tmuxProbeMock: vi.fn(() => 'exists' as const),
 }));
 
 vi.mock('node:child_process', async (importOriginal) => {
@@ -37,10 +39,14 @@ vi.mock('../src/core/self-spawn.js', async (importOriginal) => {
   };
 });
 
-vi.mock('../src/core/worker-budget.js', () => ({
-  checkWorkerAdmission: (...args: unknown[]) => checkWorkerAdmissionMock(...args),
-  formatMemoryBytes: (bytes: number) => `${(bytes / 1024 ** 3).toFixed(1)} GiB`,
-}));
+vi.mock('../src/core/worker-budget.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/core/worker-budget.js')>();
+  return {
+    ...actual,
+    checkWorkerAdmission: (...args: unknown[]) => checkWorkerAdmissionMock(...args),
+    formatMemoryBytes: actual.formatMemoryBytes,
+  };
+});
 
 vi.mock('../src/im/lark/client.js', () => {
   class MessageWithdrawnError extends Error {
@@ -163,7 +169,10 @@ vi.mock('../src/adapters/cli/claude-code.js', () => ({
 }));
 
 vi.mock('../src/adapters/backend/tmux-backend.js', () => ({
-  TmuxBackend: class {},
+  TmuxBackend: class {
+    static sessionName(sessionId: string) { return `bmx-${sessionId.slice(0, 8)}`; }
+    static probeSession(...args: unknown[]) { return tmuxProbeMock(...args); }
+  },
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -203,6 +212,7 @@ import {
   getDaemonBootId,
   initWorkerPool,
   ensureReadonlyTaskContinuationAttached,
+  ensureAutomaticTaskContinuationLease,
   promoteQueuedActivationTail,
   restartCounts,
   sendWorkerInput,
@@ -210,6 +220,8 @@ import {
   suspendWorker,
 } from '../src/core/worker-pool.js';
 import {
+  awaitReadonlyTaskContinuationUser,
+  cancelReadonlyTaskContinuationExplicit,
   disposeReadonlyTaskContinuation,
   startReadonlyTaskContinuation,
 } from '../src/services/readonly-task-continuation.js';
@@ -223,6 +235,7 @@ import {
   readManagedOriginCapability,
 } from '../src/core/managed-origin-capability.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { activeSessionKey } from '../src/core/types.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { getBot } from '../src/bot-registry.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
@@ -291,9 +304,11 @@ function defaultBot(overrides: Record<string, unknown> = {}) {
 beforeEach(() => {
   vi.useRealTimers();
   vi.clearAllMocks();
+  delete process.env.BOTMUX_TASK_CONTINUATION_ENABLED;
   delete process.env.BOTMUX_READONLY_CONTINUATION_ENABLED;
   vi.mocked(sessionStore.updateSession).mockImplementation(() => undefined);
   vi.mocked(sessionStore.updateSessionPid).mockImplementation(() => undefined);
+  tmuxProbeMock.mockReturnValue('exists');
   __testOnly_resetOrdinaryImDeliveries();
   vi.mocked(getBot).mockImplementation(() => defaultBot());
   __testOnly_resetSessionLifecycleHooks();
@@ -305,6 +320,7 @@ beforeEach(() => {
     reasons: [],
     pressure: { totalMemoryBytes: 32 * 1024 ** 3, warnings: [] },
     policy: {
+      memoryAdmissionEnabled: true,
       minAvailableMemoryBytes: 8 * 1024 ** 3,
       maxMemoryFullAvg10: 20,
       minAvailableMemorySource: 'default',
@@ -321,6 +337,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  delete process.env.BOTMUX_TASK_CONTINUATION_ENABLED;
   delete process.env.BOTMUX_READONLY_CONTINUATION_ENABLED;
   disposeReadonlyTaskContinuation({ sessionId: 'sid-start-test' });
   setActiveSessionsRegistry(undefined);
@@ -436,6 +453,344 @@ describe('host memory pressure worker admission', () => {
       resetDeviceIsolationActivationForTest();
     }
   });
+
+  // Marginal band (memory-only rejection within 10% of the reserve): the fork
+  // is synchronously deferred, idle workers are reclaimed, and after a short
+  // wait admission is re-checked exactly once. These tests pin the forkWorker
+  // glue: prompt preservation, coalescing, generation guard, rejection and the
+  // device-freeze re-entry interaction.
+  const marginalDecision = {
+    allowed: false,
+    reasons: ['available memory 7.5 GiB is below the reserved 8.0 GiB'],
+    pressure: {
+      totalMemoryBytes: 32 * 1024 ** 3,
+      availableMemoryBytes: 7.5 * 1024 ** 3,
+      warnings: [],
+    },
+    policy: {
+      memoryAdmissionEnabled: true,
+      minAvailableMemoryBytes: 8 * 1024 ** 3,
+      maxMemoryFullAvg10: 20,
+      minAvailableMemorySource: 'default',
+      maxMemoryFullAvg10Source: 'default',
+    },
+  };
+
+  it('reclaims, retries once after the wait, and re-forks with the original prompt', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    checkWorkerAdmissionMock.mockReturnValueOnce(marginalDecision as any);
+    const ds = makeDs();
+    const registry = new Map<string, DaemonSession>([[activeSessionKey(ds), ds]]);
+    setActiveSessionsRegistry(registry);
+    const admissions: string[] = [];
+
+    expect(forkWorker(ds, 'marginal prompt', 'om_marginal', {
+      onAdmission: admission => admissions.push(admission),
+    })).toBe(true);
+    expect(admissions).toEqual(['deferred']);
+    expect(forkMock).not.toHaveBeenCalled();
+
+    // Let the reclaim (mutation gate + candidate scan) settle, then pass the
+    // 2s re-check wait. The second admission read resolves allowed.
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(forkMock).toHaveBeenCalledTimes(1);
+    expect(admissions).toEqual(['deferred', 'accepted']);
+    expect(sessionReply).not.toHaveBeenCalled();
+
+    const worker = forkMock.mock.results[0]!.value;
+    worker.emit('message', { type: 'worker_ipc_ready' });
+    expect(vi.mocked(worker.send).mock.calls.at(-1)?.[0]).toMatchObject({
+      type: 'init',
+      prompt: 'marginal prompt',
+      turnId: 'om_marginal',
+    });
+  });
+
+  it('coalesces two concurrent marginal forks: one spawn, second input routed into it', async () => {
+    vi.useFakeTimers();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    // Both synchronous forks read marginal (the retry re-check is the third
+    // read and resolves allowed via the default mock); they must coalesce.
+    checkWorkerAdmissionMock.mockReturnValueOnce(marginalDecision as any);
+    checkWorkerAdmissionMock.mockReturnValueOnce(marginalDecision as any);
+    const ds = makeDs();
+    setActiveSessionsRegistry(new Map<string, DaemonSession>([[activeSessionKey(ds), ds]]));
+    const admissions: string[] = [];
+    const onAdmission = (admission: string) => admissions.push(admission);
+
+    expect(forkWorker(ds, 'first prompt', 'om_first', { onAdmission })).toBe(true);
+    expect(forkWorker(ds, 'second prompt', { turnId: 'om_second', atMostOnce: true }, { onAdmission })).toBe(true);
+    expect(forkMock).not.toHaveBeenCalled();
+
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(forkMock).toHaveBeenCalledTimes(1);
+    expect(admissions).toEqual(['deferred', 'deferred', 'accepted', 'accepted']);
+    // Coalescing means exactly ONE re-check: the two synchronous fork reads +
+    // one retry re-read + one recursive fork read = 4 admission evaluations.
+    expect(checkWorkerAdmissionMock.mock.calls).toHaveLength(4);
+
+    const worker = forkMock.mock.results[0]!.value;
+    worker.emit('message', { type: 'worker_ipc_ready' });
+    const sent = vi.mocked(worker.send).mock.calls.map(call => call[0]);
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: 'init',
+      prompt: 'first prompt',
+      turnId: 'om_first',
+    }));
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: 'message',
+      content: 'second prompt',
+      atMostOnce: true,
+    }));
+  });
+
+  it('keeps a coalesced grouped fork in the leased queue instead of routing without a slot', async () => {
+    vi.useFakeTimers();
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    checkWorkerAdmissionMock.mockReturnValueOnce(marginalDecision as any);
+    checkWorkerAdmissionMock.mockReturnValueOnce(marginalDecision as any);
+    const ds = makeDs();
+    ds.session.xpiSharedCwdAdmissionGroupId = 'xpi:coalesce-group';
+    setActiveSessionsRegistry(new Map<string, DaemonSession>([[activeSessionKey(ds), ds]]));
+    const admissions: string[] = [];
+    const onAdmission = (admission: string) => admissions.push(admission);
+
+    const firstOpts: Record<string, unknown> = { onAdmission };
+    const secondOpts: Record<string, unknown> = { onAdmission };
+    forkWorker(ds, 'group first', 'om_group_first', firstOpts);
+    forkWorker(ds, 'group second', { turnId: 'om_group_second', atMostOnce: true }, secondOpts);
+    // Both calls entered the marginal async path; the out-flag is the XPI call
+    // sites' only way to distinguish that deferral from freeze/transfer gates.
+    expect(firstOpts.marginalReclaimScheduled).toBe(true);
+    expect(secondOpts.marginalReclaimScheduled).toBe(true);
+
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    // Leading waiter re-forks (accepted); the coalesced waiter stays deferred:
+    // its daemon call site already persisted it in the XPI queue, which must
+    // perform the single leased dispatch. Routing here would bypass the lease.
+    expect(forkMock).toHaveBeenCalledTimes(1);
+    expect(admissions).toEqual(['deferred', 'deferred', 'accepted', 'deferred']);
+
+    const worker = forkMock.mock.results[0]!.value;
+    worker.emit('message', { type: 'worker_ipc_ready' });
+    const sent = vi.mocked(worker.send).mock.calls.map(call => call[0]);
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: 'init',
+      prompt: 'group first',
+    }));
+    expect(sent.some(message => message.type === 'message' && message.content === 'group second')).toBe(false);
+  });
+
+  it('stays silent when the session is superseded while the rescue is waiting', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    const registry = new Map<string, DaemonSession>([[activeSessionKey(ds), ds]]);
+    setActiveSessionsRegistry(registry);
+    const replacement = makeDs();
+    let swapped = false;
+    checkWorkerAdmissionMock
+      .mockReturnValueOnce(marginalDecision as any)
+      // The re-check runs AFTER the wait: swap the registry entry then.
+      .mockImplementationOnce(() => {
+        swapped = true;
+        registry.set(activeSessionKey(ds), replacement);
+        return {
+          allowed: true,
+          reasons: [],
+          pressure: { totalMemoryBytes: 32 * 1024 ** 3, warnings: [] },
+          policy: {
+            minAvailableMemoryBytes: 8 * 1024 ** 3,
+            maxMemoryFullAvg10: 20,
+            minAvailableMemorySource: 'default',
+            maxMemoryFullAvg10Source: 'default',
+          },
+        };
+      });
+    const admissions: string[] = [];
+
+    forkWorker(ds, 'superseded prompt', 'om_old', {
+      onAdmission: admission => admissions.push(admission),
+    });
+
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(admissions).toEqual(['deferred']);
+    // The guard runs DURING the re-check, not via an unrelated early return:
+    // the swap side effect proves the retry actually reached its re-read.
+    expect(swapped).toBe(true);
+  });
+
+  it('rejects with the blocked notice when the single re-check is still marginal', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_blocked');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    checkWorkerAdmissionMock.mockReturnValueOnce(marginalDecision as any);
+    const ds = makeDs();
+    setActiveSessionsRegistry(new Map<string, DaemonSession>([[activeSessionKey(ds), ds]]));
+    const admissions: string[] = [];
+
+    expect(forkWorker(ds, 'still blocked', 'om_blocked_turn', {
+      onAdmission: admission => admissions.push(admission),
+    })).toBe(true);
+    expect(admissions).toEqual(['deferred']);
+
+    // The re-check still reads marginal.
+    checkWorkerAdmissionMock.mockReturnValueOnce(marginalDecision as any);
+
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(admissions).toEqual(['deferred', 'rejected']);
+    // Fork read + exactly one re-check read; the rejection came from the retry,
+    // not from reclassifying the synchronous decision as hard.
+    expect(checkWorkerAdmissionMock.mock.calls).toHaveLength(2);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringMatching(/memory pressure.*retry/i),
+      'text',
+      'app_test',
+      'om_blocked_turn',
+      undefined,
+    );
+  });
+
+  it('queues behind a device freeze activated during the wait and forks after release', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    checkWorkerAdmissionMock.mockReturnValueOnce(marginalDecision as any);
+    const ds = makeDs();
+    setActiveSessionsRegistry(new Map<string, DaemonSession>([[activeSessionKey(ds), ds]]));
+
+    // A normal fork enters the async reclaim path; a freeze activated DURING
+    // the wait must queue the re-entrant fork and replay it on release.
+    expect(forkWorker(ds, 'freeze racing prompt', 'om_freeze_race')).toBe(true);
+    expect(forkMock).not.toHaveBeenCalled();
+
+    await Promise.resolve();
+    resetDeviceIsolationActivationForTest();
+    acquireDeviceIsolationFreeze({
+      nonce: 'n'.repeat(32),
+      inventoryGeneration: 'g1',
+      leaseIdFactory: () => 'lease-marginal',
+    });
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    // Re-check passed, but the freeze activated during the wait queues the
+    // re-entrant fork instead of dropping it.
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(sessionReply).not.toHaveBeenCalled();
+
+    // Freeze release replays the deferred spawn on the next setImmediate tick.
+    // Switch back to real timers FIRST: under fake timers that tick is queued
+    // by Sinon and discarded when the fake clock is torn down.
+    vi.useRealTimers();
+    releaseDeviceIsolationFreeze({ nonce: 'n'.repeat(32), leaseId: 'lease-marginal' });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(forkMock).toHaveBeenCalledTimes(1);
+
+    const worker = forkMock.mock.results[0]!.value;
+    worker.emit('message', { type: 'worker_ipc_ready' });
+    expect(vi.mocked(worker.send).mock.calls.at(-1)?.[0]).toMatchObject({
+      type: 'init',
+      prompt: 'freeze racing prompt',
+      turnId: 'om_freeze_race',
+    });
+    resetDeviceIsolationActivationForTest();
+  });
+
+  it('keeps the synchronous rejection for callers opting out of deferral even when marginal', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_blocked');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    checkWorkerAdmissionMock.mockReturnValue(marginalDecision as any);
+    const ds = makeDs();
+    setActiveSessionsRegistry(new Map<string, DaemonSession>([[activeSessionKey(ds), ds]]));
+    const admissions: string[] = [];
+
+    // The doc-comment live delivery passes false: its provider only preserves
+    // the redelivery while the rejection is synchronous, so the marginal band
+    // must not divert it into the async reclaim path.
+    const forkOpts: Record<string, unknown> = {
+      deferDuringDeviceIsolation: false,
+      onAdmission: (admission: string) => admissions.push(admission),
+    };
+    expect(forkWorker(ds, 'doc comment prompt', { turnId: 'om_doc_blocked' }, forkOpts)).toBe(true);
+    // Opting out skips the marginal block entirely, so the async-path out-flag
+    // must not be set either.
+    expect(forkOpts.marginalReclaimScheduled).toBeUndefined();
+
+    // Exactly one synchronous admission read, one immediate rejection; no
+    // reclaim wait or re-check is scheduled.
+    expect(checkWorkerAdmissionMock.mock.calls).toHaveLength(1);
+    expect(admissions).toEqual(['rejected']);
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringMatching(/memory pressure.*retry/i),
+      'text',
+      'app_test',
+      'om_doc_blocked',
+      undefined,
+    );
+
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(checkWorkerAdmissionMock.mock.calls).toHaveLength(1);
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(admissions).toEqual(['rejected']);
+  });
 });
 
 describe('ordinary IM worker receipt acknowledgement', () => {
@@ -457,7 +812,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
       { type: 'worker_ipc_probe' },
     ]);
 
-    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.advanceTimersByTimeAsync(5_000);
     expect(sessionReply).not.toHaveBeenCalled();
     expect(vi.mocked(worker.send).mock.calls).toHaveLength(1);
 
@@ -471,7 +826,7 @@ describe('ordinary IM worker receipt acknowledgement', () => {
 
     worker.emit('message', { type: 'turn_input_received', turnId: 'om_business' });
     worker.emit('message', { type: 'turn_input_committed', turnId: 'om_business' });
-    await vi.advanceTimersByTimeAsync(5_000);
+    await vi.advanceTimersByTimeAsync(10_000);
     expect(sessionReply).not.toHaveBeenCalled();
   });
 
@@ -1516,17 +1871,24 @@ describe('ordinary IM worker receipt acknowledgement', () => {
   });
 });
 
-describe('TraeX opt-in read-only task continuation', () => {
-  function startTraexLease() {
+describe('TraeX task continuation', () => {
+  const trustedCaller = {
+    requestUserOpenId: 'ou_owner',
+    requestUserUnionId: 'on_owner',
+    requestLarkAppId: 'app_test',
+    senderType: 'user' as const,
+  };
+
+  function startTraexLease(botOverrides: Record<string, unknown> = {}) {
     vi.useFakeTimers();
-    process.env.BOTMUX_READONLY_CONTINUATION_ENABLED = 'true';
-    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex', ...botOverrides }));
     const ds = makeDs();
     forkWorker(ds, 'original task', 'om_original');
     const worker = forkMock.mock.results.at(-1)!.value;
     ds.workerReady = true;
     worker.emit('message', {
-      type: 'readonly_continuation_rpc_status',
+      type: 'task_continuation_rpc_status',
       sessionId: ds.session.sessionId,
       rpcGeneration: 'rpc-proof',
       eligible: true,
@@ -1534,11 +1896,335 @@ describe('TraeX opt-in read-only task continuation', () => {
     expect(startReadonlyTaskContinuation(ds.session, {
       turnId: 'om_original',
       workerGeneration: ds.workerGeneration!,
+      authorizationMode: 'inherited',
+      startMode: 'explicit',
+      trustedCaller,
       ttlMs: 60_000,
       maxContinuations: 2,
     })).toMatchObject({ status: 'active', continuationsStarted: 0 });
     return { ds, worker };
   }
+
+  it('automatically arms an admitted user turn when RPC proof arrives afterwards', () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId: 'om_original' };
+
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      logicalTurnId: 'om_original',
+      currentTurnId: 'om_original',
+      currentWorkerGeneration: ds.workerGeneration,
+      status: 'active',
+      authorizationMode: 'inherited',
+      startMode: 'automatic',
+      trustedCaller,
+    });
+  });
+
+  it('settles an automatically armed normal completion after a default progress reply', async () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'ordinary question', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId: 'om_original' };
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+    worker.emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: 'om_original',
+      messageId: 'om_progress_reply',
+      responseKind: 'progress',
+    });
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'completed',
+    });
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      logicalTurnId: 'om_original',
+      currentTurnId: 'om_original',
+      startMode: 'automatic',
+      status: 'completed',
+      continuationsStarted: 0,
+    });
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(0);
+  });
+
+  it('automatically arms when turn authority arrives after RPC proof', () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+    expect(ds.session.readonlyTaskContinuation).toBeUndefined();
+
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId: 'om_original' };
+    expect(ensureAutomaticTaskContinuationLease(ds)).toBe(true);
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      logicalTurnId: 'om_original',
+      status: 'active',
+    });
+  });
+
+  it('automatically arms when the live managed-turn proof is the last proof to arrive', () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+    expect(ds.session.readonlyTaskContinuation).toBeUndefined();
+
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'capability',
+      turnId: 'om_original',
+    });
+
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      logicalTurnId: 'om_original',
+      status: 'active',
+    });
+  });
+
+  it('automatically continues an allowlisted rate limit without an explicit start call', async () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId: 'om_original' };
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'failed',
+      errorCode: 'codex_rate_limited',
+    });
+    await Promise.resolve();
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'backoff',
+      lastErrorCode: 'codex_rate_limited',
+      continuationsStarted: 0,
+    });
+
+    ds.workerReady = true;
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(1);
+  });
+
+  it('does not silently re-arm a turn after explicit cancellation', () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId: 'om_original' };
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+    expect(cancelReadonlyTaskContinuationExplicit(ds.session, 'om_original'))
+      .toMatchObject({ status: 'cancelled' });
+
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof-repeat',
+      eligible: true,
+    });
+
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      logicalTurnId: 'om_original',
+      status: 'cancelled',
+    });
+  });
+
+  it('does not silently re-arm a turn after it starts awaiting user input', () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId: 'om_original' };
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+    expect(awaitReadonlyTaskContinuationUser(ds.session, 'om_original'))
+      .toMatchObject({ status: 'awaiting_user' });
+
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof-repeat',
+      eligible: true,
+    });
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'capability-repeat',
+      turnId: 'om_original',
+    });
+
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      logicalTurnId: 'om_original',
+      status: 'awaiting_user',
+    });
+  });
+
+  it.each([
+    ['bot caller', 'om_original', { ...trustedCaller, senderType: 'bot' as const }],
+    ['synthetic turn', 'bmx-synthetic', trustedCaller],
+  ])('does not automatically arm an ineligible %s', (_label, turnId, caller) => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', turnId);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.activeInteractiveTurn = { turnId, caller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId };
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+
+    expect(ds.session.readonlyTaskContinuation).toBeUndefined();
+  });
+
+  it.each([
+    ['shared/adopt session', { adoptedFrom: { sessionId: 'external' } }, undefined],
+    ['VC receiver', {}, {
+      vcMeetingReceiver: { listenerAppId: 'app', meetingId: 'm', memberId: 'u', memberEpoch: 1 },
+    }],
+    ['deferred schedule', {}, { deferredScheduleRun: { turnId: 'schedule-turn' } }],
+    ['external topicless trigger', {}, { externalTriggerTopicless: true }],
+  ])('does not automatically arm an ineligible %s', (_label, daemonShape, sessionShape) => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    Object.assign(ds, daemonShape);
+    if (sessionShape) Object.assign(ds.session, sessionShape);
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId: 'om_original' };
+
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+
+    expect(ds.session.readonlyTaskContinuation).toBeUndefined();
+  });
+
+  it('fails closed without dispatch when automatic lease persistence fails', () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId: 'om_original' };
+    vi.mocked(sessionStore.updateSession).mockImplementationOnce(() => {
+      throw new Error('session store unavailable');
+    });
+
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+
+    expect(ds.session.readonlyTaskContinuation).toBeUndefined();
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(0);
+  });
+
+  it('does not automatically arm without the rollout switch or the current RPC proof', () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId: 'om_original' };
+
+    expect(ensureAutomaticTaskContinuationLease(ds)).toBe(false);
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    expect(ensureAutomaticTaskContinuationLease(ds)).toBe(false);
+    expect(ds.session.readonlyTaskContinuation).toBeUndefined();
+  });
 
   it('continues a completed turn and the exact output-limit failure without replaying the task', async () => {
     const { ds, worker } = startTraexLease();
@@ -1556,9 +2242,9 @@ describe('TraeX opt-in read-only task continuation', () => {
     const first = vi.mocked(worker.send).mock.calls
       .map(call => call[0])
       .find(message => message?.type === 'message'
-        && message?.turnId?.startsWith('bmx-readonly-'));
+        && message?.turnId?.startsWith('bmx-continuation-'));
     expect(first).toEqual(expect.objectContaining({
-      content: expect.stringContaining('[BOTMUX_READONLY_CONTINUATION]'),
+      content: expect.stringContaining('[BOTMUX_CONTINUATION]'),
     }));
     expect(first.content).not.toContain('original task');
 
@@ -1576,7 +2262,7 @@ describe('TraeX opt-in read-only task continuation', () => {
     const continuations = vi.mocked(worker.send).mock.calls
       .map(call => call[0])
       .filter(message => message?.type === 'message'
-        && message?.turnId?.startsWith('bmx-readonly-'));
+        && message?.turnId?.startsWith('bmx-continuation-'));
     expect(continuations).toHaveLength(2);
     expect(ds.session.readonlyTaskContinuation).toMatchObject({
       status: 'active',
@@ -1600,7 +2286,7 @@ describe('TraeX opt-in read-only task continuation', () => {
     const first = vi.mocked(worker.send).mock.calls
       .map(call => call[0])
       .find(message => message?.type === 'message'
-        && message?.turnId?.startsWith('bmx-readonly-'));
+        && message?.turnId?.startsWith('bmx-continuation-'));
     expect(first).toEqual(expect.objectContaining({ dispatchAttempt: 1 }));
 
     worker.emit('message', {
@@ -1636,7 +2322,7 @@ describe('TraeX opt-in read-only task continuation', () => {
     const continuations = vi.mocked(worker.send).mock.calls
       .map(call => call[0])
       .filter(message => message?.type === 'message'
-        && message?.turnId?.startsWith('bmx-readonly-'));
+        && message?.turnId?.startsWith('bmx-continuation-'));
     expect(continuations).toHaveLength(2);
     expect(ds.session.readonlyTaskContinuation).toMatchObject({
       status: 'active',
@@ -1679,7 +2365,7 @@ describe('TraeX opt-in read-only task continuation', () => {
     const continuations = vi.mocked(worker.send).mock.calls
       .map(call => call[0])
       .filter(message => message?.type === 'message'
-        && message?.turnId?.startsWith('bmx-readonly-'));
+        && message?.turnId?.startsWith('bmx-continuation-'));
     expect(continuations).toHaveLength(1);
     expect(ds.session.readonlyTaskContinuation).toMatchObject({
       status: 'active',
@@ -1690,7 +2376,7 @@ describe('TraeX opt-in read-only task continuation', () => {
 
   it('keeps an overdue restored backoff waiting for the live worker RPC proof', async () => {
     vi.useFakeTimers();
-    process.env.BOTMUX_READONLY_CONTINUATION_ENABLED = 'true';
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
     const now = Date.now();
     const ds = makeDs();
@@ -1705,6 +2391,8 @@ describe('TraeX opt-in read-only task continuation', () => {
       expiresAt: now + 60_000,
       maxContinuations: 2,
       continuationsStarted: 0,
+      authorizationMode: 'inherited',
+      trustedCaller,
       status: 'backoff',
       nextAttemptAt: now - 1,
     };
@@ -1719,11 +2407,11 @@ describe('TraeX opt-in read-only task continuation', () => {
     });
     expect(vi.mocked(worker.send).mock.calls
       .map(call => call[0])
-      .filter(message => message?.turnId?.startsWith('bmx-readonly-'))).toHaveLength(0);
+      .filter(message => message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(0);
 
     worker.emit('message', { type: 'ready', port: 3456, token: 'token' });
     worker.emit('message', {
-      type: 'readonly_continuation_rpc_status',
+      type: 'task_continuation_rpc_status',
       sessionId: ds.session.sessionId,
       rpcGeneration: 'rpc-proof-after-restore',
       eligible: true,
@@ -1734,14 +2422,16 @@ describe('TraeX opt-in read-only task continuation', () => {
     const continuations = vi.mocked(worker.send).mock.calls
       .map(call => call[0])
       .filter(message => message?.type === 'message'
-        && message?.turnId?.startsWith('bmx-readonly-'));
+        && message?.turnId?.startsWith('bmx-continuation-'));
     expect(continuations).toHaveLength(1);
     expect(continuations[0]).toEqual(expect.objectContaining({
       dispatchAttempt: 1,
-      readonlyContinuation: {
+      taskContinuation: {
         leaseId: 'readonly-cold-backoff',
         rpcGeneration: 'rpc-proof-after-restore',
+        authorizationMode: 'inherited',
       },
+      trustedCaller,
     }));
     expect(ds.session.readonlyTaskContinuation).toMatchObject({
       status: 'active',
@@ -1749,14 +2439,48 @@ describe('TraeX opt-in read-only task continuation', () => {
       currentTurnId: continuations[0].turnId,
       currentWorkerGeneration: 8,
     });
+    expect(ds.activeInteractiveTurn).toEqual({
+      turnId: continuations[0].turnId,
+      caller: trustedCaller,
+    });
 
     await vi.advanceTimersByTimeAsync(5_000);
     expect(vi.mocked(worker.send).mock.calls
       .map(call => call[0])
-      .filter(message => message?.turnId?.startsWith('bmx-readonly-'))).toHaveLength(1);
+      .filter(message => message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(1);
   });
 
-  it('does not continue another failure code', async () => {
+  it('binds managed current-actor provenance to the inherited continuation caller', async () => {
+    const { ds, worker } = startTraexLease();
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'completed',
+    });
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    const continuation = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .find(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-continuation-'));
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'continuation-live-capability',
+      turnId: continuation.turnId,
+      dispatchAttempt: continuation.dispatchAttempt,
+    });
+
+    expect(ds.managedTurnOrigin).toMatchObject({
+      turnId: continuation.turnId,
+      dispatchAttempt: continuation.dispatchAttempt,
+      callerOpenId: trustedCaller.requestUserOpenId,
+    });
+  });
+
+  it('continues a transient connection failure with bounded backoff', async () => {
     const { ds, worker } = startTraexLease();
     worker.emit('message', {
       type: 'turn_terminal',
@@ -1769,12 +2493,206 @@ describe('TraeX opt-in read-only task continuation', () => {
     await vi.advanceTimersByTimeAsync(5_000);
 
     expect(ds.session.readonlyTaskContinuation).toMatchObject({
-      status: 'failed',
+      status: 'active',
       lastErrorCode: 'codex_connection_failed',
+      continuationsStarted: 1,
     });
     expect(vi.mocked(worker.send).mock.calls
       .map(call => call[0])
-      .filter(message => message?.turnId?.startsWith('bmx-readonly-'))).toHaveLength(0);
+      .filter(message => message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(1);
+  });
+
+  it('awaits user when the original turn CLI exits without a dispatch attempt', async () => {
+    const { ds, worker } = startTraexLease();
+
+    worker.emit('message', {
+      type: 'claude_exit',
+      code: 17,
+      signal: null,
+      turnId: 'om_original',
+    });
+    await Promise.resolve();
+
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'awaiting_user',
+      currentTurnId: 'om_original',
+      continuationsStarted: 0,
+      lastErrorCode: 'cli_exit',
+    });
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'restart',
+      reason: 'cli_crash',
+    }));
+
+    worker.emit('message', { type: 'ready', port: 3456, token: 'replacement' });
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof-after-cli-exit',
+      eligible: true,
+    });
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(0);
+  });
+
+  it('does not replace a crashed PTY worker while awaiting user', async () => {
+    const { ds, worker } = startTraexLease({ backendType: 'pty' });
+
+    worker.emit('exit', 9, null);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'awaiting_user',
+      currentTurnId: 'om_original',
+      continuationsStarted: 0,
+      lastErrorCode: 'cli_exit',
+    });
+    expect(forkMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(0);
+  });
+
+  it('does not replace a crashed tmux worker while awaiting user', async () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex', backendType: 'tmux' }));
+    const ds = makeDs();
+    forkWorker(ds, 'original task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    ds.workerReady = true;
+    ds.activeInteractiveTurn = { turnId: 'om_original', caller: trustedCaller };
+    ds.managedTurnOrigin = { capability: 'capability', turnId: 'om_original' };
+    worker.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'rpc-proof',
+      eligible: true,
+    });
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'active',
+      startMode: 'automatic',
+    });
+    tmuxProbeMock.mockReturnValue('missing');
+
+    worker.emit('exit', 9, null);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'awaiting_user',
+      currentTurnId: 'om_original',
+      continuationsStarted: 0,
+      lastErrorCode: 'cli_exit',
+    });
+    expect(forkMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('awaits user after a synthetic continuation ends ambiguously', async () => {
+    const { ds, worker } = startTraexLease({ backendType: 'pty' });
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'completed',
+    });
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'active',
+      continuationsStarted: 1,
+    });
+
+    const first = ds.session.readonlyTaskContinuation!;
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: first.currentTurnId,
+      dispatchAttempt: first.currentDispatchAttempt,
+      status: 'ambiguous',
+      errorCode: 'cli_exit',
+    });
+    worker.emit('exit', 9, null);
+    await Promise.resolve();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    const firstWorkerContinuations = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-continuation-'));
+    expect(firstWorkerContinuations).toHaveLength(1);
+    expect(forkMock).toHaveBeenCalledTimes(1);
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'awaiting_user',
+      continuationsStarted: 1,
+      lastErrorCode: 'cli_exit',
+    });
+  });
+
+  it.each(['exists', 'unknown'] as const)(
+    'fails visibly instead of replaying when a crashed worker leaves the persistent backend %s',
+    async probe => {
+      const { ds, worker } = startTraexLease({ backendType: 'tmux' });
+      tmuxProbeMock.mockReturnValue(probe);
+
+      worker.emit('exit', 9, null);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(ds.session.readonlyTaskContinuation).toMatchObject({
+        status: 'failed',
+        currentTurnId: 'om_original',
+        continuationsStarted: 0,
+        lastErrorCode: 'continuation_worker_exit_backend_unverified',
+      });
+      expect(forkMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('ignores a delayed exit from a replaced worker generation', async () => {
+    vi.useFakeTimers();
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex', backendType: 'pty' }));
+    const ds = makeDs();
+    forkWorker(ds, 'first', 'om_first');
+    const staleWorker = forkMock.mock.results.at(-1)!.value;
+    forkWorker(ds, 'replacement', { resume: true, turnId: 'om_replacement' });
+    const replacement = forkMock.mock.results.at(-1)!.value;
+    ds.workerReady = true;
+    replacement.emit('message', {
+      type: 'task_continuation_rpc_status',
+      sessionId: ds.session.sessionId,
+      rpcGeneration: 'replacement-proof',
+      eligible: true,
+    });
+    expect(startReadonlyTaskContinuation(ds.session, {
+      turnId: 'om_replacement',
+      workerGeneration: ds.workerGeneration!,
+      authorizationMode: 'inherited',
+      trustedCaller,
+      ttlMs: 60_000,
+      maxContinuations: 2,
+    })).toMatchObject({ status: 'active' });
+
+    staleWorker.emit('exit', 9, null);
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(ds.worker).toBe(replacement);
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'active',
+      currentTurnId: 'om_replacement',
+      continuationsStarted: 0,
+    });
+    expect(forkMock).toHaveBeenCalledTimes(2);
   });
 
   it('settles an original turn only on an explicit final send marker', async () => {
@@ -1826,7 +2744,7 @@ describe('TraeX opt-in read-only task continuation', () => {
     const continuation = vi.mocked(worker.send).mock.calls
       .map(call => call[0])
       .find(message => message?.type === 'message'
-        && message?.turnId?.startsWith('bmx-readonly-'));
+        && message?.turnId?.startsWith('bmx-continuation-'));
     expect(continuation).toEqual(expect.objectContaining({ dispatchAttempt: 1 }));
     expect(ds.session.readonlyTaskContinuation).toMatchObject({
       status: 'active',
@@ -1880,7 +2798,7 @@ describe('TraeX opt-in read-only task continuation', () => {
     });
     expect(vi.mocked(worker.send).mock.calls
       .map(call => call[0])
-      .filter(message => message?.turnId?.startsWith('bmx-readonly-'))).toHaveLength(0);
+      .filter(message => message?.turnId?.startsWith('bmx-continuation-'))).toHaveLength(0);
   });
 
   it('settles a synthetic continuation only for the exact dispatch attempt', async () => {
@@ -1905,7 +2823,7 @@ describe('TraeX opt-in read-only task continuation', () => {
     const continuation = vi.mocked(worker.send).mock.calls
       .map(call => call[0])
       .find(message => message?.type === 'message'
-        && message?.turnId?.startsWith('bmx-readonly-'));
+        && message?.turnId?.startsWith('bmx-continuation-'));
     worker.emit('message', {
       type: 'final_output',
       sessionId: ds.session.sessionId,
@@ -1945,7 +2863,7 @@ describe('TraeX opt-in read-only task continuation', () => {
   });
 
   it('replays one recent persisted daemon-owned delivery after daemon restore', async () => {
-    process.env.BOTMUX_READONLY_CONTINUATION_ENABLED = 'true';
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
     const sessionReply = vi.fn(async () => 'om_recovered_final');
     initWorkerPool({
@@ -1960,13 +2878,15 @@ describe('TraeX opt-in read-only task continuation', () => {
     ds.session.readonlyTaskContinuation = {
       leaseId: 'readonly-restored',
       logicalTurnId: 'om_original',
-      currentTurnId: 'bmx-readonly-restored',
+      currentTurnId: 'bmx-continuation-restored',
       currentDispatchAttempt: 2,
       currentWorkerGeneration: 7,
       createdAt: Date.now() - 10_000,
       expiresAt: Date.now() + 60_000,
       maxContinuations: 3,
       continuationsStarted: 2,
+      authorizationMode: 'inherited',
+      trustedCaller,
       status: 'delivering',
       pendingDelivery: {
         kind: 'completed',
@@ -1990,7 +2910,7 @@ describe('TraeX opt-in read-only task continuation', () => {
 
   it('keeps a rejected warning pending and replays it with one stable UUID after restore', async () => {
     vi.useFakeTimers();
-    process.env.BOTMUX_READONLY_CONTINUATION_ENABLED = 'true';
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
     let reject = true;
     const sessionReply = vi.fn(async () => {
@@ -2008,7 +2928,7 @@ describe('TraeX opt-in read-only task continuation', () => {
     ds.session.readonlyTaskContinuation = {
       leaseId: 'readonly-warning-restored',
       logicalTurnId: 'om_original',
-      currentTurnId: 'bmx-readonly-failed',
+      currentTurnId: 'bmx-continuation-failed',
       currentDispatchAttempt: 2,
       currentWorkerGeneration: 7,
       createdAt: Date.now() - 10_000,
@@ -2048,7 +2968,7 @@ describe('TraeX opt-in read-only task continuation', () => {
   });
 
   it('expires a stale warning outbox without replaying it and restores dashboard attention', () => {
-    process.env.BOTMUX_READONLY_CONTINUATION_ENABLED = 'true';
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
     const sessionReply = vi.fn(async () => 'om_unexpected');
     initWorkerPool({
@@ -2062,7 +2982,7 @@ describe('TraeX opt-in read-only task continuation', () => {
     ds.session.readonlyTaskContinuation = {
       leaseId: 'readonly-warning-expired',
       logicalTurnId: 'om_original',
-      currentTurnId: 'bmx-readonly-failed',
+      currentTurnId: 'bmx-continuation-failed',
       currentDispatchAttempt: 2,
       currentWorkerGeneration: 7,
       createdAt: Date.now() - 60 * 60_000,
@@ -2104,7 +3024,7 @@ describe('TraeX opt-in read-only task continuation', () => {
     ds.session.readonlyTaskContinuation = {
       leaseId: 'readonly-warning-disabled',
       logicalTurnId: 'om_original',
-      currentTurnId: 'bmx-readonly-failed',
+      currentTurnId: 'bmx-continuation-failed',
       currentDispatchAttempt: 1,
       currentWorkerGeneration: 7,
       createdAt: Date.now() - 10_000,
@@ -2130,12 +3050,14 @@ describe('TraeX opt-in read-only task continuation', () => {
   });
 
   it('cancels a restored live lease when the feature becomes ineligible', () => {
-    process.env.BOTMUX_READONLY_CONTINUATION_ENABLED = 'true';
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
     const ds = makeDs();
     expect(ensureReadonlyTaskContinuationAttached(ds)).toBe(true);
     startReadonlyTaskContinuation(ds.session, {
       turnId: 'om_original', workerGeneration: ds.workerGeneration ?? 1,
+      authorizationMode: 'inherited',
+      trustedCaller,
     });
 
     vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex' }));
@@ -2161,7 +3083,7 @@ describe('TraeX opt-in read-only task continuation', () => {
     }],
     ['no Lark transport', defaultBot({ cliId: 'traex' }), { chatId: 'http_async_test' }],
   ])('does not attach for %s sessions', (_label, bot, shape) => {
-    process.env.BOTMUX_READONLY_CONTINUATION_ENABLED = 'true';
+    process.env.BOTMUX_TASK_CONTINUATION_ENABLED = 'true';
     vi.mocked(getBot).mockImplementation(() => bot as any);
     const { session: sessionShape, ...daemonShape } = shape as any;
     const ds = makeDs(daemonShape);
@@ -2170,6 +3092,8 @@ describe('TraeX opt-in read-only task continuation', () => {
     expect(ensureReadonlyTaskContinuationAttached(ds)).toBe(false);
     expect(startReadonlyTaskContinuation(ds.session, {
       turnId: 'om_original', workerGeneration: ds.workerGeneration ?? 1,
+      authorizationMode: 'inherited',
+      trustedCaller,
     })).toBeUndefined();
   });
 
@@ -3359,6 +4283,29 @@ describe('Codex App clean-input feature gate', () => {
     }));
     expect(ds.session.codexAppDispatchLedger?.map(entry => entry.turnId))
       .toEqual(['turn-old', 'turn-next']);
+  });
+
+  it('defers a grouped non-empty double-fork instead of routing it without the lease', () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'codex-app', codexAppCleanInput: true }));
+    const worker = makeFakeWorker();
+    const ds = makeDs({ worker });
+    ds.session.cliId = 'codex-app';
+    ds.session.xpiSharedCwdAdmissionGroupId = 'xpi:double-fork-group';
+    ds.session.codexAppDispatchLedger = [
+      { dispatchId: 'old', turnId: 'turn-old', state: 'prepared', content: 'old' },
+    ];
+    const admissions: string[] = [];
+
+    forkWorker(ds, { content: 'next' }, { turnId: 'om_group_follower' }, {
+      onAdmission: admission => admissions.push(admission),
+    });
+
+    // The grouped turn is already owned by the leased journal; routing it into
+    // the live worker would run two group members' CLIs in the same cwd.
+    expect(forkMock).not.toHaveBeenCalled();
+    expect(worker.send).not.toHaveBeenCalled();
+    expect(worker.kill).not.toHaveBeenCalled();
+    expect(admissions).toEqual(['deferred']);
   });
 
   it('stages a non-Codex double-fork behind a tokened activation without live IPC', () => {
@@ -5006,6 +5953,128 @@ describe('blocker #3: forkAdoptWorker refuses sandbox-enabled bots', () => {
 });
 
 describe('managed turn authority worker generations', () => {
+  const scheduledCaller = {
+    requestUserOpenId: 'ou_schedule_owner',
+    requestUserUnionId: 'on_schedule_owner',
+    requestLarkAppId: 'app_test',
+    source: 'schedule_creator' as const,
+    taskId: 'feedbeef',
+  };
+  const scheduledTurnId = 'schedule:feedbeef:11111111-2222-3333-4444-555555555555';
+
+  beforeEach(() => {
+    scheduledTasksForProvenance.set('feedbeef', {
+      id: 'feedbeef',
+      ownerOpenId: scheduledCaller.requestUserOpenId,
+      ownerUnionId: scheduledCaller.requestUserUnionId,
+      larkAppId: scheduledCaller.requestLarkAppId,
+      creatorLarkAppId: scheduledCaller.requestLarkAppId,
+      enabled: true,
+    });
+  });
+
+  afterEach(() => {
+    scheduledTasksForProvenance.delete('feedbeef');
+  });
+
+  it('keeps a fresh scheduled turn bound across repeated managed-origin publications', async () => {
+    const ds = makeDs();
+    forkWorker(ds, { content: 'scheduled', trustedCaller: scheduledCaller }, scheduledTurnId);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(ds.scheduledTurnCallers?.get(scheduledTurnId)).toEqual(scheduledCaller);
+
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'scheduled-capability',
+      turnId: scheduledTurnId,
+    });
+
+    expect(ds.managedTurnOrigin).toMatchObject({
+      turnId: scheduledTurnId,
+      callerOpenId: scheduledCaller.requestUserOpenId,
+    });
+    expect(ds.scheduledTurnCallers?.get(scheduledTurnId)).toEqual(scheduledCaller);
+
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'scheduled-capability-with-pid',
+      turnId: scheduledTurnId,
+    });
+
+    expect(ds.managedTurnOrigin).toMatchObject({
+      capability: 'scheduled-capability-with-pid',
+      turnId: scheduledTurnId,
+      callerOpenId: scheduledCaller.requestUserOpenId,
+    });
+    expect(ds.scheduledTurnCallers?.get(scheduledTurnId)).toEqual(scheduledCaller);
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: scheduledTurnId,
+      status: 'completed',
+    });
+    await Promise.resolve();
+    expect(ds.scheduledTurnCallers).toBeUndefined();
+  });
+
+  it('does not bind a scheduled creator to a different worker turn', () => {
+    const ds = makeDs();
+    forkWorker(ds, { content: 'scheduled', trustedCaller: scheduledCaller }, scheduledTurnId);
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'different-capability',
+      turnId: 'schedule:feedbeef:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+    });
+
+    expect(ds.managedTurnOrigin?.callerOpenId).toBeUndefined();
+    expect(ds.scheduledTurnCallers?.get(scheduledTurnId)).toEqual(scheduledCaller);
+  });
+
+  it('rejects a forged scheduled creator that differs from the task record', () => {
+    const ds = makeDs();
+    forkWorker(ds, {
+      content: 'scheduled',
+      trustedCaller: { ...scheduledCaller, requestUserOpenId: 'ou_forged' },
+    }, scheduledTurnId);
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', {
+      type: 'managed_turn_origin',
+      sessionId: ds.session.sessionId,
+      capability: 'forged-capability',
+      turnId: scheduledTurnId,
+    });
+
+    expect(ds.managedTurnOrigin?.callerOpenId).toBeUndefined();
+    expect(ds.scheduledTurnCallers).toBeUndefined();
+  });
+
+  it('binds a live injected scheduled turn and clears the pending identity on terminal', async () => {
+    const ds = makeDs();
+    forkWorker(ds, 'ordinary opening', false);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(sendWorkerInput(ds, 'scheduled', scheduledTurnId, {
+      trustedCaller: scheduledCaller,
+    })).toBe(true);
+    expect(ds.scheduledTurnCallers?.get(scheduledTurnId)).toEqual(scheduledCaller);
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: scheduledTurnId,
+      status: 'completed',
+    });
+    await Promise.resolve();
+
+    expect(ds.scheduledTurnCallers).toBeUndefined();
+  });
+
   it('keeps policy authority but invalidates live authority across claude_exit auto-restart', async () => {
     const ds = makeDs({
       activeInteractiveTurn: {

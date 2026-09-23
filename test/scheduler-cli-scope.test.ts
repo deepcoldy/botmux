@@ -7,6 +7,13 @@ describe('schedule CLI session scope propagation', () => {
   it('resolves the requested/current execution position into scheduler.addTask', () => {
     expect(cliSource).toContain("scope?: 'thread' | 'chat';");
     expect(cliSource).toMatch(/function detectCurrentSession[\s\S]*?scope: s\.scope,/);
+    expect(cliSource).toMatch(/async function detectAuthenticatedCurrentSession[\s\S]*?resolveCurrentTurnProvenance[\s\S]*?attestManagedOrigin[\s\S]*?provenance\.callerOpenId !== s\.ownerOpenId[\s\S]*?loadBotsJson\(\)\.find[\s\S]*?readAllowedUsersResolveCache[\s\S]*?resolvedAllowedUsers\.has\(provenance\.callerOpenId\)[\s\S]*?ownerOpenId: provenance\.callerOpenId,[\s\S]*?ownerUnionId,/);
+    expect(cliSource).toMatch(/const fresh = await detectAuthenticatedCurrentSession\(\)[\s\S]*?schedule creator provenance changed before write/);
+    expect(cliSource).toMatch(/turnId: provenance\.turnId,[\s\S]*?fresh\.turnId !== authenticatedCur\.turnId/);
+    expect(cliSource).toContain('current turn caller does not match the session owner');
+    expect(cliSource).toContain('cannot load bot config for');
+    expect(cliSource).toContain('current turn caller is not an allowed bot operator');
+    expect(cliSource).toContain('cannot resolve the current turn caller union_id');
     expect(cliSource).toMatch(/const executionPosition: 'top-level' \| 'topic' \| 'new-topic' =[\s\S]*?cur\?\.scope/);
     // Group/topic_group sessions default to top-level (never pin results to the
     // topic the schedule was created in — e.g. an adopted one); only p2p keeps
@@ -15,6 +22,9 @@ describe('schedule CLI session scope propagation', () => {
     expect(cliSource).toMatch(/rootMessageId: executionPosition === 'topic' \? rootMessageId : undefined/);
     expect(cliSource).toMatch(/const scope: 'thread' \| 'chat' = executionPosition === 'topic'/);
     expect(cliSource).toMatch(/task = scheduler\.addTask\(\{[\s\S]*?\bscope,[\s\S]*?\bexecutionPosition,[\s\S]*?\btopicTitle,[\s\S]*?\}\);/);
+    expect(cliSource).toMatch(/task = scheduler\.addTask\(\{[\s\S]*?ownerOpenId: authenticatedCur && authenticatedCur\.larkAppId === larkAppId[\s\S]*?authenticatedCur\.ownerOpenId[\s\S]*?ownerUnionId: authenticatedCur && authenticatedCur\.larkAppId === larkAppId[\s\S]*?authenticatedCur\.ownerUnionId/);
+    expect(cliSource).not.toMatch(/ownerOpenId: process\.env\.BOTMUX_OWNER_OPEN_ID/);
+    expect(cliSource).not.toMatch(/ownerUnionId: cur\?\.ownerUnionId/);
     expect(cliSource).not.toContain('--new-topic 与 --silent 不能同时使用');
     expect(cliSource).toMatch(/const silent = rest\.includes\('--silent'\)[\s\S]*?executionPosition[\s\S]*?scheduler\.addTask/);
   });
@@ -42,5 +52,11 @@ describe('schedule CLI session scope propagation', () => {
     // The receipt must state the fresh-spawn-only limit rather than let it be
     // discovered weeks later at fire time.
     expect(cliSource).toMatch(/executionPosition === 'new-topic'[\s\S]*?模型每次生效[\s\S]*?仅在本任务新建会话的那次执行生效/);
+  });
+
+  it('accepts only an explicit 8-hex --id and forwards it to scheduler.addTask', () => {
+    expect(cliSource).toMatch(/const explicitTaskId = argValue\(rest, '--id'\)/);
+    expect(cliSource).toMatch(/explicitTaskId !== undefined && !\/\^\[0-9a-f\]\{8\}\$\/\.test\(explicitTaskId\)/);
+    expect(cliSource).toMatch(/task = scheduler\.addTask\(\{[\s\S]*?id: explicitTaskId,[\s\S]*?\bname,/);
   });
 });

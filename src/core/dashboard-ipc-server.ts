@@ -1054,6 +1054,8 @@ async function handleManagedOriginAttestation(
         channelId: origin.originChannelId,
         sessionId,
         turnId: liveTurnId,
+        ...(origin.callerOpenId ? { callerOpenId: origin.callerOpenId } : {}),
+        larkAppId: ds.larkAppId,
         ...(origin.dispatchAttempt !== undefined
           ? { dispatchAttempt: origin.dispatchAttempt }
           : {}),
@@ -1093,7 +1095,7 @@ ipcRoute('POST', MANAGED_ORIGIN_ATTEST_ROUTE, async (req, res) => {
 });
 
 ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
-  let body: { sessionId?: unknown };
+  let body: { sessionId?: unknown; expectedScheduledTurnId?: unknown };
   try {
     body = await readBoundedJsonBody(req, 1_024, 1_000);
   } catch (err) {
@@ -1109,6 +1111,10 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
   const sessionId = typeof body.sessionId === 'string' && body.sessionId.length <= 256
     ? body.sessionId
     : '';
+  const expectedScheduledTurnId = typeof body.expectedScheduledTurnId === 'string'
+    && body.expectedScheduledTurnId.length <= 256
+    ? body.expectedScheduledTurnId
+    : undefined;
   const peer = resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress,
     remotePort: req.socket.remotePort,
@@ -1125,6 +1131,7 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
     sessionId,
     peer: peer.peer,
     findSession: findActiveBySessionId,
+    ...(expectedScheduledTurnId ? { expectedScheduledTurnId } : {}),
   });
   return result.ok
     ? jsonRes(res, 200, result.document)
@@ -1630,18 +1637,6 @@ ipcRoute('POST', '/api/sessions/:sessionId/native-subagent-runtime', async (req,
     };
   }
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-  const readonlyOrigin = ds.readonlyContinuationTurnOrigin;
-  if (readonlyOrigin
-    && readonlyOrigin.workerGeneration === ds.workerGeneration
-    && ds.managedTurnOrigin?.turnId === readonlyOrigin.turnId
-    && ds.managedTurnOrigin.dispatchAttempt === readonlyOrigin.dispatchAttempt) {
-    return nativeSubagentRuntimeJsonRes({
-      req, res, sessionId: params.sessionId, status: 200,
-      body: { ok: true, deny: true, reason: 'read-only continuation forbids subagents' },
-      ...responseAuth,
-    });
-  }
-
   let runtimeState;
   try { runtimeState = getBot(ds.larkAppId).nativeSubagentRuntimeState; }
   catch { return jsonRes(res, 404, { ok: false, error: 'bot_not_found' }); }
@@ -2484,13 +2479,13 @@ ipcRoute('POST', '/api/project-groups/:chatId/refresh-card', async (_req, res, p
   }
 });
 
-/** Explicit control plane for one read-only long-running task lease. The
+/** Explicit control plane for one authorization-inheriting long-running task lease. The
  * rotating current-turn capability binds every action to the calling session
  * and turn; the daemon owns all persisted state and timers. */
 ipcRoute('POST', '/api/sessions/:sessionId/continuation', async (req, res, params) => {
   type ContinuationRequestBody = {
     action?: unknown;
-    readonly?: unknown;
+    readonly?: unknown; // accepted as a deprecated compatibility hint
     ttlMs?: unknown;
     maxContinuations?: unknown;
   } & Record<string, unknown>;
@@ -2505,14 +2500,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/continuation', async (req, res, param
     return jsonRes(res, 409, { ok: false, error: 'active_turn_required' });
   }
   if (!ensureReadonlyTaskContinuationAttached(ds)) {
-    return jsonRes(res, 409, { ok: false, error: 'readonly_continuation_unavailable' });
+    return jsonRes(res, 409, { ok: false, error: 'continuation_unavailable' });
   }
   try {
     let state;
     if (body.action === 'start') {
-      if (body.readonly !== true) {
-        return jsonRes(res, 400, { ok: false, error: 'readonly_required' });
-      }
       if (!turnId.startsWith('om_') || ds.managedTurnOrigin?.dispatchAttempt !== undefined) {
         return jsonRes(res, 409, { ok: false, error: 'ordinary_user_turn_required' });
       }
@@ -2527,17 +2519,29 @@ ipcRoute('POST', '/api/sessions/:sessionId/continuation', async (req, res, param
         return jsonRes(res, 400, { ok: false, error: 'invalid_max_continuations' });
       }
       const generation = ds.workerGeneration;
-      const proof = ds.readonlyContinuationRpcProof;
+      const proof = ds.taskContinuationRpcProof;
+      const inheritedAuthority = ds.activeInteractiveTurn;
+      if (!inheritedAuthority || inheritedAuthority.turnId !== turnId
+        || inheritedAuthority.caller.requestLarkAppId !== ds.larkAppId
+        || inheritedAuthority.caller.senderType !== 'user') {
+        return jsonRes(res, 409, { ok: false, error: 'continuation_authority_required' });
+      }
       if (!ds.worker || ds.worker.killed || ds.worker.connected === false
         || ds.workerReady !== true
         || !Number.isSafeInteger(generation) || (generation ?? 0) <= 0
         || ds.session.workerGeneration !== generation
         || proof?.workerGeneration !== generation) {
-        return jsonRes(res, 409, { ok: false, error: 'readonly_rpc_proof_required' });
+        return jsonRes(res, 409, { ok: false, error: 'continuation_rpc_required' });
       }
       state = startReadonlyTaskContinuation(ds.session, {
         turnId,
         workerGeneration: generation!,
+        authorizationMode: 'inherited',
+        startMode: 'explicit',
+        trustedCaller: inheritedAuthority.caller,
+        ...(inheritedAuthority.controller
+          ? { trustedController: inheritedAuthority.controller }
+          : {}),
         ...(typeof body.ttlMs === 'number' ? { ttlMs: body.ttlMs } : {}),
         ...(typeof body.maxContinuations === 'number'
           ? { maxContinuations: body.maxContinuations }
@@ -2887,7 +2891,7 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
   // inline; the write token is never included. Closed/restored sessions have no
   // live worker terminal, so no stale URL is ever advertised.
   if (process.env.BOTMUX_CORE_ONLY === '1' && ds && ds.workerPort && ds.workerViewToken) {
-    resolved.readOnlyUrl = buildTerminalUrl(ds);
+    resolved.readOnlyUrl = buildTerminalUrl(ds, { viewScope: 'worker' });
     resolved.viewToken = ds.workerViewToken;
   }
   return resolved;
@@ -3720,8 +3724,8 @@ ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
 /**
  * Read-only twin of write-link: the base capability URL the Feishu card's
  * 「打开 Web 终端」button also hands out (viewToken, never the write token).
- * The viewToken here is the worker's PER-BOOT card token — it dies with the
- * worker generation and is deliberately not bound to any dashboard auth
+ * The viewToken here is the worker's PER-BOOT token — it dies with the worker
+ * generation and is deliberately not bound to any dashboard auth
  * session. The central dashboard therefore REPLACES it with a short-lived
  * signed read grant bound to the requesting identity before answering its own
  * /api/sessions/:id/view-link (P1-5); this loopback-HMAC route never reaches a
@@ -3739,7 +3743,7 @@ ipcRoute('GET', '/api/sessions/:sessionId/view-link', (req, res, params) => {
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   const port = ds.workerPort ?? ds.session.webPort;
   if (!port || !ds.workerViewToken) return jsonRes(res, 409, { ok: false, error: 'terminal_unavailable' });
-  jsonRes(res, 200, { ok: true, url: buildTerminalUrl(ds) });
+  jsonRes(res, 200, { ok: true, url: buildTerminalUrl(ds, { viewScope: 'worker' }) });
 });
 
 /**
@@ -4231,7 +4235,7 @@ export interface ScheduleRow {
   createdAt: string;
   lastRunAt?: string;
   nextRunAt?: string;
-  lastStatus?: 'ok' | 'error' | 'skipped';
+  lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
   lastError?: string;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
@@ -4705,6 +4709,19 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
   // a clear lastError, which is the pre-existing behavior for CLI-created
   // tasks. Adding a flaky gate here would block valid creates.
   try {
+    const ownerOpenId = getOwnerOpenId(cachedLarkAppId);
+    let ownerUnionId: string | undefined;
+    if (ownerOpenId) {
+      const deploymentOwnerUnionId = getDeploymentIdentity(config.session.dataDir).ownerUnionId;
+      const bot = getBot(cachedLarkAppId);
+      // The deployment identity is tenant-stable, but it is authoritative for
+      // this app only after the live allowlist resolution maps that exact
+      // union_id back to the same open_id selected as owner.
+      if (deploymentOwnerUnionId
+        && bot.rawAllowedUserResolution.get(deploymentOwnerUnionId) === ownerOpenId) {
+        ownerUnionId = deploymentOwnerUnionId;
+      }
+    }
     const task = createTaskWithOptionalPrecondition({
       name,
       schedule,
@@ -4724,7 +4741,8 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       // Stamp the bot owner as creator: dashboard is local + token-protected,
       // and the daemon re-checks the owner is still allowed at every run
       // mutation (scheduled-turn-provenance).
-      ownerOpenId: getOwnerOpenId(cachedLarkAppId),
+      ownerOpenId,
+      ownerUnionId,
       deliver,
       silent,
       followActive: followActive || undefined,
@@ -6075,11 +6093,14 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     agentSelectionKey = selectionKeyForBot(cliId, wrapperCli ?? undefined, cliLaunchMode ?? undefined);
   } catch { /* no registered bot */ }
   let maxLiveWorkers: number | null = null;
+  let idleSuspendMinutes: number | null = null;
   let sessionOwnerReminder = DEFAULT_SESSION_OWNER_REMINDER;
   try {
     const botConfig = getBot(cachedLarkAppId).config;
     const m = botConfig.maxLiveWorkers;
     if (typeof m === 'number' && Number.isInteger(m) && m > 0) maxLiveWorkers = m;
+    const ttl = botConfig.idleSuspendMinutes;
+    if (typeof ttl === 'number' && Number.isInteger(ttl) && ttl > 0) idleSuspendMinutes = ttl;
     sessionOwnerReminder = botConfig.sessionOwnerReminder ?? DEFAULT_SESSION_OWNER_REMINDER;
   } catch { /* default unlimited */ }
   let logicalSessionCount = 0;
@@ -6194,6 +6215,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     senderTag: cardPrefs.senderTag,
     overloadAlert: cardPrefs.overloadAlert,
     botToBotSameDir: cardPrefs.botToBotSameDir,
+    autoInviteOwnerOnGroupAdd: cardPrefs.autoInviteOwnerOnGroupAdd,
     autoStartOnGroupJoin: cardPrefs.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: cardPrefs.autoStartOnGroupJoinPrompt,
     autoStartOnGroupJoinSeed: cardPrefs.autoStartOnGroupJoinSeed,
@@ -6231,6 +6253,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     // value when this bot has no explicit override (prompt/global/off).
     skillInjectionDefault: globalBuiltinSkillInjectionDefault(),
     maxLiveWorkers,
+    idleSuspendMinutes,
     sessionOwnerReminder,
     logicalSessionCount,
     residentSessionCount,
@@ -6323,7 +6346,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     replyCardMode?: unknown;
     disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; cotEnabled?: unknown;
     botToBotSameDir?: unknown;
-    autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown;
+    autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown; autoInviteOwnerOnGroupAdd?: unknown;
     groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
     overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
@@ -6337,7 +6360,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
     disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; cotEnabled?: boolean;
     botToBotSameDir?: boolean;
-    autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean;
+    autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean; autoInviteOwnerOnGroupAdd?: boolean;
     groupJoinCommandEnabled?: boolean; groupJoinCommand?: string;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
@@ -6379,6 +6402,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
   if (typeof body.summaryMemory === 'boolean') patch.summaryMemory = body.summaryMemory;
   if (typeof body.summaryMemoryPath === 'string') patch.summaryMemoryPath = body.summaryMemoryPath;
+  if (typeof body.autoInviteOwnerOnGroupAdd === 'boolean') patch.autoInviteOwnerOnGroupAdd = body.autoInviteOwnerOnGroupAdd;
   if (typeof body.autoStartOnGroupJoin === 'boolean') patch.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
   if (typeof body.autoStartOnGroupJoinPrompt === 'string') patch.autoStartOnGroupJoinPrompt = body.autoStartOnGroupJoinPrompt;
   if (typeof body.autoStartOnGroupJoinSeed === 'string') {
@@ -7749,6 +7773,35 @@ ipcRoute('PUT', '/api/bot-max-live-workers', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, maxLiveWorkers: value });
+});
+
+// Per-bot 空闲会话自动休眠超时 idleSuspendMinutes。Body `{ idleSuspendMinutes: number | null }`:
+//   • 正整数（分钟）→ 会话持续空闲超过该时长即休眠回收内存，与数量上限互不影响
+//   • null          → 清除（关闭空闲 TTL，默认行为，仅受数量上限约束）
+// 同样走 applyConfigField；sweeper 每分钟实时读 bot.config.idleSuspendMinutes，免重启生效。
+ipcRoute('PUT', '/api/bot-idle-suspend-minutes', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let raw: unknown;
+  try { raw = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
+  }
+  const body = raw as { idleSuspendMinutes?: unknown };
+  const spec = findConfigField('idleSuspendMinutes');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+
+  let value: number | null;
+  if (body.idleSuspendMinutes === null || body.idleSuspendMinutes === undefined) {
+    value = null;
+  } else {
+    const c = coerceConfigValue(spec, body.idleSuspendMinutes);
+    if (!c.ok || typeof c.value !== 'number') return jsonRes(res, 400, { ok: false, error: 'invalid_number' });
+    value = c.value;
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, idleSuspendMinutes: value });
 });
 
 ipcRoute('PUT', '/api/bot-session-owner-reminder', async (req, res) => {

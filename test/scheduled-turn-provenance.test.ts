@@ -122,6 +122,73 @@ describe('authorizeScheduledTurn', () => {
     expect(call()).toEqual({ error: 'task_disabled' });
   });
 
+  it('allows only the exact live turn of an auto-completed one-shot', () => {
+    writeTask({
+      enabled: false,
+      disabledReason: 'once_completed',
+      parsed: { kind: 'once', runAt: '2026-09-20T03:00:00.000Z', display: 'once' },
+    });
+    expect(authorizeScheduledTurn({
+      turnId: TURN_ID,
+      dataDir,
+      sessionLarkAppId: appId,
+      sessionChatId: chatId,
+      isOwnerAllowed: allow,
+      isScheduledTurnLive: turnId => turnId === TURN_ID,
+    })).toMatchObject({ ownerOpenId: owner, taskLarkAppId: appId });
+  });
+
+  it('rejects an auto-completed one-shot after its exact turn is no longer live', () => {
+    writeTask({
+      enabled: false,
+      disabledReason: 'once_completed',
+      parsed: { kind: 'once', runAt: '2026-09-20T03:00:00.000Z', display: 'once' },
+    });
+    expect(authorizeScheduledTurn({
+      turnId: TURN_ID,
+      dataDir,
+      sessionLarkAppId: appId,
+      sessionChatId: chatId,
+      isOwnerAllowed: allow,
+      isScheduledTurnLive: () => false,
+    })).toEqual({ error: 'task_disabled' });
+  });
+
+  it('rejects manual and legacy disabled tasks even when a turn is reported live', () => {
+    for (const disabledReason of ['manual', undefined] as const) {
+      writeTask({
+        enabled: false,
+        disabledReason,
+        parsed: { kind: 'once', runAt: '2026-09-20T03:00:00.000Z', display: 'once' },
+      });
+      expect(authorizeScheduledTurn({
+        turnId: TURN_ID,
+        dataDir,
+        sessionLarkAppId: appId,
+        sessionChatId: chatId,
+        isOwnerAllowed: allow,
+        isScheduledTurnLive: () => true,
+      })).toEqual({ error: 'task_disabled' });
+    }
+  });
+
+  it('rejects a different historical turn of the same one-shot task', () => {
+    writeTask({
+      enabled: false,
+      disabledReason: 'once_completed',
+      parsed: { kind: 'once', runAt: '2026-09-20T03:00:00.000Z', display: 'once' },
+    });
+    const historicalTurn = `schedule:${TASK_ID}:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee`;
+    expect(authorizeScheduledTurn({
+      turnId: historicalTurn,
+      dataDir,
+      sessionLarkAppId: appId,
+      sessionChatId: chatId,
+      isOwnerAllowed: allow,
+      isScheduledTurnLive: turnId => turnId === TURN_ID,
+    })).toEqual({ error: 'task_disabled' });
+  });
+
   it('rejects a task without ownerOpenId (legacy task cannot run workflows)', () => {
     writeTask({ ownerOpenId: undefined });
     expect(call()).toEqual({ error: 'task_owner_missing' });

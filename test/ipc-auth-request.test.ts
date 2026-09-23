@@ -1,3 +1,4 @@
+import { spawn, type ChildProcess } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { startIpcServer, setIpcAuthSecret, type IpcServerHandle } from '../src/core/dashboard-ipc-server.js';
 import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
@@ -195,6 +196,7 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
   let ipc: IpcServerHandle;
   let session: any;
   let poll: ReturnType<typeof vi.fn>;
+  let unrelatedProcess: ChildProcess | undefined;
 
   function hostSession(): any {
     const start = readProcessStartIdentity(process.pid);
@@ -230,6 +232,8 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
   });
 
   afterEach(async () => {
+    unrelatedProcess?.kill();
+    unrelatedProcess = undefined;
     await ipc.close();
     setIpcAuthSecret(null);
     vi.restoreAllMocks();
@@ -251,6 +255,37 @@ describe.skipIf(process.platform !== 'linux')('agent authorization over a manage
     expect(tokens.requestUserAuthorization).toHaveBeenCalledWith(
       'cli_test', 'test-secret', 'feishu', ['im:chat:read'], 'ou_host', expect.any(Function),
     );
+  });
+
+  it('authorizes an RPC client through the independently attested engine root', async () => {
+    const enginePid = process.ppid;
+    const engineProcStart = readProcessStartIdentity(enginePid);
+    delete session.localProcessAttestation.cliPid;
+    delete session.localProcessAttestation.cliProcStart;
+    session.localProcessAttestation.enginePid = enginePid;
+    session.localProcessAttestation.engineProcStart = engineProcStart;
+    session.managedTurnOrigin.preexistingProcessIdentities = [`${enginePid}:${engineProcStart}`];
+
+    const response = await hostPost('auth-request');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ ok: true, authUrl: AUTH_URL });
+  });
+
+  it('refuses a live engine identity outside the calling process lineage', async () => {
+    unrelatedProcess = spawn('/bin/sleep', ['60'], { stdio: 'ignore' });
+    const enginePid = unrelatedProcess.pid;
+    expect(enginePid).toBeTypeOf('number');
+    const engineProcStart = readProcessStartIdentity(enginePid!);
+    delete session.localProcessAttestation.cliPid;
+    delete session.localProcessAttestation.cliProcStart;
+    session.localProcessAttestation.enginePid = enginePid;
+    session.localProcessAttestation.engineProcStart = engineProcStart;
+    session.managedTurnOrigin.preexistingProcessIdentities = [`${enginePid}:${engineProcStart}`];
+
+    const response = await hostPost('auth-request');
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({ ok: false, error: 'current_actor_unverified' });
+    expect(tokens.requestUserAuthorization).not.toHaveBeenCalled();
   });
 
   it('refuses when the live turn lineage no longer contains the calling process', async () => {

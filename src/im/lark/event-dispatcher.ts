@@ -1143,7 +1143,7 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
         void patchTimedOutCardActionResult(larkAppId, data, result)
           .catch(err => logger.warn(`Failed to patch deferred card action result: ${err}`));
       }, 0);
-      return {};
+      return result.toast ? { toast: result.toast } : {};
     })
     .catch(err => {
       logger.error(`Error handling card action: ${err}`);

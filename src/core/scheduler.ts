@@ -107,7 +107,11 @@ function cleanupIfTaskWasAutoRemoved(task: ScheduledTask): void {
   if (!scheduleStore.getTask(task.id)) cleanupRemovedTaskSidecars(task);
 }
 
-function recordDispatchOutcome(task: ScheduledTask, outcome: ScheduledTaskPreconditionOutcome | void): void {
+function recordDispatchOutcome(
+  task: ScheduledTask,
+  context: ScheduleExecutionContext,
+  outcome: ScheduledTaskPreconditionOutcome | void,
+): void {
   const status = outcome === 'skipped' ? 'skipped' : 'ok';
   if (status === 'skipped') {
     let nextRunAt: string | undefined;
@@ -118,9 +122,9 @@ function recordDispatchOutcome(task: ScheduledTask, outcome: ScheduledTaskPrecon
       const retryAt = Date.now() + TICK_INTERVAL_MS;
       nextRunAt = new Date(scheduledAt ? Math.max(retryAt, Date.parse(scheduledAt)) : retryAt).toISOString();
     }
-    scheduleStore.markSkipped(task.id, nextRunAt);
+    scheduleStore.markSkipped(task.id, nextRunAt, context.runId);
   } else {
-    scheduleStore.markRun(task.id, true);
+    scheduleStore.markRun(task.id, true, undefined, undefined, context.runId);
     cleanupIfTaskWasAutoRemoved(task);
   }
   dashboardEventBus.publish({
@@ -542,25 +546,30 @@ async function tick(): Promise<void> {
       }
     }
 
-    // At-most-once: advance next_run BEFORE execution so crash mid-run doesn't re-fire
-    if (task.parsed.kind !== 'once') {
-      const newNext = computeNextRun(task.parsed, new Date(now).toISOString());
-      if (newNext) scheduleStore.updateTask(task.id, { nextRunAt: newNext });
-    }
-
-    // Execute
-    logger.info(`[scheduler] Task "${task.name}" (${task.id}) triggered (kind=${task.parsed.kind})`);
     const executionContext = createExecutionContext('scheduler');
-    scheduleStore.updateTask(task.id, { lastRunAt: executionContext.startedAt });
+    // Claim every due run before dispatch. Recurring tasks advance to their next
+    // occurrence; one-shots persist lastRunAt and clear nextRunAt, so another
+    // scheduler tick (or a daemon restart) cannot dispatch the same run while
+    // its asynchronous model turn is still in flight. A precondition skip
+    // explicitly restores a one-shot retry time in recordDispatchOutcome().
+    const newNext = computeNextRun(task.parsed, executionContext.startedAt);
+    const claim = scheduleStore.claimRun(task.id, {
+      lastRunAt: executionContext.startedAt,
+      nextRunAt: newNext ?? undefined,
+      lastRunId: executionContext.runId,
+    });
+    if (!claim.ok) continue;
+    const claimedTask = claim.task;
+    logger.info(`[scheduler] Task "${claimedTask.name}" (${claimedTask.id}) triggered (kind=${claimedTask.parsed.kind})`);
 
     if (executeCallback) {
-      const taskId = task.id;
-      executeCallback(task, executionContext)
-        .then(outcome => recordDispatchOutcome(task, outcome))
+      const taskId = claimedTask.id;
+      executeCallback(claimedTask, executionContext)
+        .then(outcome => recordDispatchOutcome(claimedTask, executionContext, outcome))
         .catch(err => {
-          logger.error(`[scheduler] Task "${task.name}" failed: ${err.message}`);
-          scheduleStore.markRun(taskId, false, err.message);
-          cleanupIfTaskWasAutoRemoved(task);
+          logger.error(`[scheduler] Task "${claimedTask.name}" failed: ${err.message}`);
+          scheduleStore.markRun(taskId, false, err.message, undefined, executionContext.runId);
+          cleanupIfTaskWasAutoRemoved(claimedTask);
           dashboardEventBus.publish({
             type: 'schedule.fired',
             body: {
@@ -570,8 +579,16 @@ async function tick(): Promise<void> {
               error: err instanceof Error ? err.message : String(err),
             },
           });
-          emitScheduleFiredHook(task, 'error', err);
+          emitScheduleFiredHook(claimedTask, 'error', err);
         });
+    } else {
+      scheduleStore.markRun(
+        claimedTask.id,
+        false,
+        'scheduler execute callback is not initialised',
+        undefined,
+        executionContext.runId,
+      );
     }
   }
 }
@@ -611,6 +628,17 @@ function applyCronRealign(updates: Array<{ id: string; nextRunAt: string }>): vo
 // ─── Public API ─────────────────────────────────────────────────────────────
 
 export function startScheduler(): void {
+  const startupTasks = scheduleStore.listTasks();
+  for (const task of startupTasks) {
+    if (!taskBelongsToThisDaemon(task) || task.lastStatus !== 'running') continue;
+    scheduleStore.markRun(
+      task.id,
+      false,
+      'schedule run interrupted by daemon restart',
+      undefined,
+      task.lastRunId,
+    );
+  }
   const tasks = scheduleStore.listTasks();
   const enabled = tasks.filter(t => t.enabled);
   logger.info(`[scheduler] Starting with ${enabled.length}/${tasks.length} enabled tasks (tick every ${TICK_INTERVAL_MS/1000}s)`);
@@ -806,14 +834,16 @@ export function enableTask(id: string): boolean {
   const task = scheduleStore.getTask(id);
   if (!task) return false;
   const next = computeNextRun(task.parsed);
-  scheduleStore.updateTask(id, { enabled: true, nextRunAt: next ?? undefined });
+  scheduleStore.updateTask(id, {
+    enabled: true, disabledReason: undefined, nextRunAt: next ?? undefined,
+  });
   return true;
 }
 
 export function disableTask(id: string): boolean {
   const task = scheduleStore.getTask(id);
   if (!task) return false;
-  scheduleStore.updateTask(id, { enabled: false });
+  scheduleStore.updateTask(id, { enabled: false, disabledReason: 'manual' });
   return true;
 }
 
@@ -824,8 +854,9 @@ export function runTaskNow(id: string): boolean {
   // (< 30s) will pick it up.  Previously we invoked executeCallback inline,
   // which was wrong in multi-bot setups — the callback on this daemon may
   // not even be the right bot for this task.
+  const requested = scheduleStore.requestRunNow(id);
+  if (!requested.ok) return false;
   logger.info(`[scheduler] Marked "${task.name}" (${task.id}) for immediate run`);
-  scheduleStore.updateTask(id, { nextRunAt: new Date().toISOString() });
   return true;
 }
 
@@ -853,24 +884,27 @@ export function runNow(id: string): { ok: boolean; error?: string } {
   // re-fire the same task while this manual run is still in flight.
   const executionContext = createExecutionContext('dashboard');
   const next = computeNextRun(task.parsed, executionContext.startedAt);
-  scheduleStore.updateTask(id, {
+  const claim = scheduleStore.claimRun(id, {
     lastRunAt: executionContext.startedAt,
     nextRunAt: next ?? undefined,
+    lastRunId: executionContext.runId,
   });
+  if (!claim.ok) return claim;
+  const claimedTask = claim.task;
   // Don't block the caller — fire on next tick. `Promise.resolve().then`
   // coerces a synchronous throw from executeCallback into a rejection so the
   // error path always runs and we don't leak a 500 to the IPC client.
-  void Promise.resolve().then(() => executeCallback!(task, executionContext)).then(
-    outcome => recordDispatchOutcome(task, outcome),
+  void Promise.resolve().then(() => executeCallback!(claimedTask, executionContext)).then(
+    outcome => recordDispatchOutcome(claimedTask, executionContext, outcome),
     err => {
       const msg = err instanceof Error ? err.message : String(err);
-      scheduleStore.markRun(task.id, false, msg);
-      cleanupIfTaskWasAutoRemoved(task);
+      scheduleStore.markRun(claimedTask.id, false, msg, undefined, executionContext.runId);
+      cleanupIfTaskWasAutoRemoved(claimedTask);
       dashboardEventBus.publish({
         type: 'schedule.fired',
         body: { id, runAt: Date.now(), status: 'error', error: msg },
       });
-      emitScheduleFiredHook(task, 'error', err);
+      emitScheduleFiredHook(claimedTask, 'error', err);
     },
   );
   return { ok: true };
@@ -884,12 +918,15 @@ export function runNow(id: string): { ok: boolean; error?: string } {
 export function setEnabled(id: string, enabled: boolean): { ok: boolean; error?: string } {
   const task = scheduleStore.getTask(id);
   if (!task) return { ok: false, error: 'not_found' };
-  if (task.enabled === enabled) return { ok: true }; // no-op
+  if (task.enabled === enabled
+    && (enabled || task.disabledReason === 'manual')) return { ok: true };
   if (enabled) {
     const next = computeNextRun(task.parsed);
-    scheduleStore.updateTask(id, { enabled: true, nextRunAt: next ?? undefined });
+    scheduleStore.updateTask(id, {
+      enabled: true, disabledReason: undefined, nextRunAt: next ?? undefined,
+    });
   } else {
-    scheduleStore.updateTask(id, { enabled: false });
+    scheduleStore.updateTask(id, { enabled: false, disabledReason: 'manual' });
   }
   dashboardEventBus.publish({
     type: 'schedule.updated',

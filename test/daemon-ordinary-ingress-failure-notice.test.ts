@@ -175,6 +175,7 @@ import {
   __testOnly_handleNewTopic as handleNewTopic,
   __testOnly_handleThreadReply as handleThreadReply,
   __testOnly_driveCrossPrincipalInterruptions as driveCrossPrincipalInterruptions,
+  __testOnly_forkReservedInitialSession as forkReservedInitialSession,
   __testOnly_notifyCrossPrincipalTerminal as notifyCrossPrincipalTerminal,
   __testOnly_notifyOrdinaryIngressFailure as notifyOrdinaryIngressFailure,
   __testOnly_resolveXpiHumanOpenId as resolveXpiHumanOpenId,
@@ -1168,6 +1169,256 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
       else process.env.BOTMUX_XPI_ENABLED = previousXpi;
     }
   });
+
+  it('enqueues an approved grouped replay once when its cold fork is marginally deferred', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const ds = seedThreadSession('om_thread_owner_replay_marginal', 'seeded') as any;
+    // Active, lease-free coordinator row so the cold-fork busy precheck passes
+    // and dispatch reaches the fork boundary.
+    const coordinator = {
+      sessionId: 'sess-xpi-coord-marginal',
+      chatId: 'oc_coord_marginal',
+      rootMessageId: 'om_coord_marginal',
+      title: 'coordinator',
+      status: 'active' as const,
+      createdAt: NOW,
+      chatType: 'group' as const,
+      larkAppId: APP,
+      xpiSharedCwdAdmissionGroupId: 'xpi:marginal-replay',
+      xpiSharedCwdAdmissionCoordinatorSessionId: 'sess-xpi-coord-marginal',
+    };
+    mocks.sessions.set(coordinator.sessionId, coordinator);
+    Object.assign(ds.session, {
+      larkAppId: APP,
+      xpiSharedCwdAdmissionGroupId: 'xpi:marginal-replay',
+      xpiSharedCwdAdmissionCoordinatorSessionId: coordinator.sessionId,
+    });
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    const owner = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      requestUserUnionId: 'on_owner',
+      senderType: 'user' as const,
+    };
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_marginalaaaaaaaaaaaaaa',
+      ownerTurnId: 'owner-turn',
+      owner,
+      ownerUserPrompt: 'original owner task',
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_proposer',
+        requestUserUnionId: 'on_proposer',
+        senderType: 'user' as const,
+      },
+      phase: 'owner_approved',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'approved advice',
+        userPrompt: 'approved advice',
+        createdAt: NOW,
+      }],
+    }];
+    // Marginal admission: the fork is accepted synchronously, but the group
+    // slot closure never fires (it only runs on the asynchronous re-entry).
+    mocks.forkWorker.mockImplementationOnce((_ds: any, _input: any, _turn: any, forkOpts: any) => {
+      forkOpts.marginalReclaimScheduled = true;
+      return true;
+    });
+
+    await driveCrossPrincipalInterruptions(ds);
+
+    // Asserted immediately after the synchronous dispatch leg: the turn must be
+    // durably queued and the record removed without waiting for any owner-wait
+    // timer (asserting only after a timer advance would also pass on the old
+    // retry-and-redrive behaviour).
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(ds.session.xpiSharedCwdQueuedTurns).toEqual([
+      expect.objectContaining({
+        turnId: 'xpi_marginalaaaaaaaaaaaaaa:approved',
+        dispatchState: 'queued',
+      }),
+    ]);
+    expect(ds.activeInteractiveTurn).toBeUndefined();
+    if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+    else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+  });
+
+  it('keeps the owner-wait retry when a grouped cold fork is hard-blocked rather than marginal', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    vi.useFakeTimers();
+    const ds = seedThreadSession('om_thread_owner_replay_hard', 'seeded') as any;
+    const coordinator = {
+      sessionId: 'sess-xpi-coord-hard',
+      chatId: 'oc_coord_hard',
+      rootMessageId: 'om_coord_hard',
+      title: 'coordinator',
+      status: 'active' as const,
+      createdAt: NOW,
+      chatType: 'group' as const,
+      larkAppId: APP,
+      xpiSharedCwdAdmissionGroupId: 'xpi:hard-replay',
+      xpiSharedCwdAdmissionCoordinatorSessionId: 'sess-xpi-coord-hard',
+    };
+    mocks.sessions.set(coordinator.sessionId, coordinator);
+    Object.assign(ds.session, {
+      larkAppId: APP,
+      xpiSharedCwdAdmissionGroupId: 'xpi:hard-replay',
+      xpiSharedCwdAdmissionCoordinatorSessionId: coordinator.sessionId,
+    });
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    const owner = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      requestUserUnionId: 'on_owner',
+      senderType: 'user' as const,
+    };
+    ds.session.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_hardblockaaaaaaaaaaa',
+      ownerTurnId: 'owner-turn',
+      owner,
+      ownerUserPrompt: 'original owner task',
+      proposer: {
+        requestLarkAppId: 'foreign-app-observer',
+        requestUserOpenId: 'ou_foreign_proposer',
+        requestUserUnionId: 'on_proposer',
+        senderType: 'user' as const,
+      },
+      phase: 'owner_approved',
+      messages: [{
+        turnId: 'proposer-turn',
+        text: 'approved advice',
+        userPrompt: 'approved advice',
+        createdAt: NOW,
+      }],
+    }];
+    // Synchronous refusal with the same boolean shape as marginal (hard memory
+    // block / retirement fence): accepted=true, closure unfired, but NO
+    // marginalReclaimScheduled out-flag. No re-entry is coming.
+    mocks.forkWorker
+      .mockImplementationOnce(() => true)
+      .mockImplementation(() => true);
+
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+
+      // The record is retained and nothing is parked in the lease journal; the
+      // owner-wait timer owns the retry.
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+      expect(ds.session.crossPrincipalInterruptions?.map((r: any) => r.id))
+        .toEqual(['xpi_hardblockaaaaaaaaaaa']);
+      expect(ds.session.xpiSharedCwdQueuedTurns ?? []).toEqual([]);
+      expect(ds.crossPrincipalWaitTimer).toBeTruthy();
+
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      // The retained record re-drove and forked a second time, still without
+      // journaling the turn (a third owner-wait is now pending).
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(2);
+      expect(ds.session.crossPrincipalInterruptions?.map((r: any) => r.id))
+        .toEqual(['xpi_hardblockaaaaaaaaaaa']);
+      expect(ds.session.xpiSharedCwdQueuedTurns ?? []).toEqual([]);
+    } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      ds.crossPrincipalWaitTimer = undefined;
+      vi.useRealTimers();
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+  });
+
+  it('persists a grouped opening into the leased queue when its cold fork is marginally deferred', async () => {
+    const ds = seedThreadSession('om_thread_group_opening_marginal', 'seeded') as any;
+    const coordinator = {
+      sessionId: 'sess-xpi-coord-opening',
+      chatId: 'oc_coord_opening',
+      rootMessageId: 'om_coord_opening',
+      title: 'coordinator',
+      status: 'active' as const,
+      createdAt: NOW,
+      chatType: 'group' as const,
+      larkAppId: APP,
+      xpiSharedCwdAdmissionGroupId: 'xpi:marginal-opening',
+      xpiSharedCwdAdmissionCoordinatorSessionId: 'sess-xpi-coord-opening',
+    };
+    mocks.sessions.set(coordinator.sessionId, coordinator);
+    Object.assign(ds.session, {
+      larkAppId: APP,
+      xpiSharedCwdAdmissionGroupId: 'xpi:marginal-opening',
+      xpiSharedCwdAdmissionCoordinatorSessionId: coordinator.sessionId,
+    });
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    ds.pendingPrompt = 'grouped opening task';
+    ds.pendingTurnId = 'om_group_opening';
+    const trustedCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    // Marginal admission: synchronous fork accepted without firing the group
+    // slot closure.
+    mocks.forkWorker.mockImplementationOnce((_ds: any, _input: any, _turn: any, forkOpts: any) => {
+      forkOpts.marginalReclaimScheduled = true;
+      return true;
+    });
+
+    const started = forkReservedInitialSession(ds, [], trustedCaller);
+
+    expect(started).toBe(false);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(ds.session.xpiSharedCwdQueuedTurns).toEqual([
+      expect.objectContaining({ turnId: 'om_group_opening', dispatchState: 'queued' }),
+    ]);
+    expect(ds.pendingTurnId).toBeUndefined();
+    expect(ds.initialStartPending).toBe(false);
+  });
+
+  it('retains a grouped opening buffers when its cold fork is synchronously refused outside marginal', () => {
+    const ds = seedThreadSession('om_thread_group_opening_hard', 'seeded') as any;
+    const coordinator = {
+      sessionId: 'sess-xpi-coord-opening-hard',
+      chatId: 'oc_coord_opening_hard',
+      rootMessageId: 'om_coord_opening_hard',
+      title: 'coordinator',
+      status: 'active' as const,
+      createdAt: NOW,
+      chatType: 'group' as const,
+      larkAppId: APP,
+      xpiSharedCwdAdmissionGroupId: 'xpi:hard-opening',
+      xpiSharedCwdAdmissionCoordinatorSessionId: 'sess-xpi-coord-opening-hard',
+    };
+    mocks.sessions.set(coordinator.sessionId, coordinator);
+    Object.assign(ds.session, {
+      larkAppId: APP,
+      xpiSharedCwdAdmissionGroupId: 'xpi:hard-opening',
+      xpiSharedCwdAdmissionCoordinatorSessionId: coordinator.sessionId,
+    });
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    ds.pendingPrompt = 'grouped opening task';
+    ds.pendingTurnId = 'om_group_opening_hard';
+    const trustedCaller = {
+      requestLarkAppId: APP,
+      requestUserOpenId: OWNER,
+      senderType: 'user' as const,
+    };
+    // Hard refusal with the marginal boolean shape but no marginal out-flag.
+    mocks.forkWorker.mockImplementationOnce(() => true);
+
+    const started = forkReservedInitialSession(ds, [], trustedCaller);
+
+    expect(started).toBe(false);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    // Nothing is parked in the journal; the opening buffers stay for the
+    // existing inbound/release retry paths.
+    expect(ds.session.xpiSharedCwdQueuedTurns ?? []).toEqual([]);
+    expect(ds.pendingTurnId).toBe('om_group_opening_hard');
+    expect(ds.pendingPrompt).toBe('grouped opening task');
+  });
 });
 
 describe('XPI cross-app human classification identity', () => {
@@ -1557,6 +1808,81 @@ describe('XPI human terminal alert delivery', () => {
       }],
     };
   }
+
+  it('does not send XPI outcomes for an already closed session', async () => {
+    const ds = seedThreadSession('om_alert_closed', 'seeded');
+    ds.session.status = 'closed';
+
+    await expect(notifyCrossPrincipalTerminal(ds, seedAlertRecord(ds), '未选择处理方式')).resolves.toBe(false);
+
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.resolveTargetAppOpenId).not.toHaveBeenCalled();
+  });
+
+  it('stops an XPI outcome when the session closes during identity resolution', async () => {
+    const ds = seedThreadSession('om_alert_close_lookup', 'seeded');
+    let resolveIdentity!: (result: { status: 'resolved'; openId: string }) => void;
+    mocks.resolveTargetAppOpenId.mockImplementationOnce(() => new Promise(resolve => { resolveIdentity = resolve; }));
+    const sending = notifyCrossPrincipalTerminal(ds, seedAlertRecord(ds), '未选择处理方式');
+    expect(mocks.resolveTargetAppOpenId).toHaveBeenCalledOnce();
+
+    ds.session.status = 'closed';
+    resolveIdentity({ status: 'resolved', openId: 'ou_target_proposer' });
+
+    await expect(sending).resolves.toBe(false);
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('stops XPI transport retries when the session closes during retry backoff', async () => {
+    vi.useFakeTimers();
+    const ds = seedThreadSession('om_alert_close_retry', 'seeded');
+    mocks.replyMessage.mockRejectedValueOnce(new Error('temporary failure'));
+    try {
+      const sending = notifyCrossPrincipalTerminal(ds, seedAlertRecord(ds), '未选择处理方式');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mocks.replyMessage).toHaveBeenCalledOnce();
+      ds.session.status = 'closed';
+
+      await vi.advanceTimersByTimeAsync(1_500);
+      await expect(sending).resolves.toBe(false);
+
+      expect(mocks.replyMessage).toHaveBeenCalledOnce();
+      expect(mocks.sendMessage).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not reschedule or persist an XPI terminal cycle after close during delivery', async () => {
+    const previousXpi = process.env.BOTMUX_XPI_ENABLED;
+    process.env.BOTMUX_XPI_ENABLED = 'true';
+    const ds = seedThreadSession('om_alert_close_cycle', 'seeded');
+    const record = seedAlertRecord(ds);
+    record.phase = 'terminal_notice_pending';
+    record.terminalNoticeText = '未选择处理方式';
+    ds.session.crossPrincipalInterruptions = [record];
+    mocks.sessions.set(ds.session.sessionId, ds.session);
+    mocks.replyMessage.mockImplementationOnce(async () => {
+      ds.session.status = 'closed';
+      ds.session.crossPrincipalInterruptions = undefined;
+      mocks.updateSession.mockClear();
+      throw new Error('delivery interrupted by close');
+    });
+    try {
+      await driveCrossPrincipalInterruptions(ds);
+
+      expect(mocks.replyMessage).toHaveBeenCalledOnce();
+      expect(mocks.updateSession).not.toHaveBeenCalled();
+      expect(ds.crossPrincipalWaitTimer).toBeUndefined();
+      expect(ds.crossPrincipalInterruptionDriving).toBe(false);
+    } finally {
+      if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    }
+  });
 
   it('records delivery_failed for three failures and then delivery_exhausted', async () => {
     const ds = seedThreadSession('om_alert_retry', 'seeded');

@@ -41,15 +41,33 @@ describe('current actor client contract', () => {
     });
   });
 
-  it.skipIf(process.platform !== 'linux')('rejects conflicting BotMux ancestors', () => {
+  it.skipIf(process.platform !== 'linux')('rejects conflicting routing for the same BotMux session', () => {
     const root = mkdtempSync(join(tmpdir(), 'actor-env-'));
     writeProcEnv(root, 20, 10, {
       BOTMUX: '1', BOTMUX_SESSION_ID: 's1', BOTMUX_LARK_APP_ID: 'cli_app', BOTMUX_DAEMON_IPC_PORT: '7951',
     });
     writeProcEnv(root, 10, 1, {
-      BOTMUX: '1', BOTMUX_SESSION_ID: 's2', BOTMUX_LARK_APP_ID: 'cli_app', BOTMUX_DAEMON_IPC_PORT: '7951',
+      BOTMUX: '1', BOTMUX_SESSION_ID: 's1', BOTMUX_LARK_APP_ID: 'cli_other', BOTMUX_DAEMON_IPC_PORT: '7951',
     });
     expect(() => resolveBotmuxAncestorContext(20, root)).toThrow(CurrentActorError);
+  });
+
+  it.skipIf(process.platform !== 'linux')('skips a narrow tool shell and ignores an outer daemon session', () => {
+    const root = mkdtempSync(join(tmpdir(), 'actor-env-'));
+    writeProcEnv(root, 30, 20, {
+      BOTMUX: '1', BOTMUX_SESSION_ID: 's-current',
+    });
+    writeProcEnv(root, 20, 10, {
+      BOTMUX: '1', BOTMUX_SESSION_ID: 's-current', BOTMUX_LARK_APP_ID: 'cli_current',
+      BOTMUX_DAEMON_IPC_PORT: '7951',
+    });
+    writeProcEnv(root, 10, 1, {
+      BOTMUX: '1', BOTMUX_SESSION_ID: 's-daemon-parent', BOTMUX_LARK_APP_ID: 'cli_current',
+      BOTMUX_DAEMON_IPC_PORT: '7951',
+    });
+    expect(resolveBotmuxAncestorContext(30, root)).toEqual({
+      sessionId: 's-current', larkAppId: 'cli_current', ipcPort: 7951,
+    });
   });
 
   it.skipIf(process.platform !== 'linux')('stops before a shared tmux server with stale BotMux routing', () => {
@@ -78,7 +96,7 @@ describe('current actor client contract', () => {
       BOTMUX: '1', BOTMUX_SESSION_ID: 's1', BOTMUX_LARK_APP_ID: 'cli_app', BOTMUX_DAEMON_IPC_PORT: '7951',
     });
     writeProcEnv(root, 10, 1, {
-      BOTMUX: '1', BOTMUX_SESSION_ID: 's2', BOTMUX_LARK_APP_ID: 'cli_app', BOTMUX_DAEMON_IPC_PORT: '7951',
+      BOTMUX: '1', BOTMUX_SESSION_ID: 's1', BOTMUX_LARK_APP_ID: 'cli_other', BOTMUX_DAEMON_IPC_PORT: '7951',
     }, { comm: 'tmux: server', exe: '/tmp/not-tmux' });
 
     expect(() => resolveBotmuxAncestorContext(20, root)).toThrow(CurrentActorError);
@@ -114,6 +132,31 @@ describe('current actor client contract', () => {
     expect(fetchImpl).toHaveBeenCalledWith(
       'http://127.0.0.1:7951/api/current-actor',
       expect.objectContaining({ method: 'POST', body: JSON.stringify({ sessionId: 'sess-1' }) }),
+    );
+  });
+
+  it('asks the daemon to prove an exact scheduled turn when requested', async () => {
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
+      schema: CURRENT_ACTOR_SCHEMA,
+      status: 'verified',
+      actor: { email: 'current.user@example.com' },
+    }), { status: 200 }));
+    const scheduledTurnId = 'schedule:abcdef12:12345678-1234-1234-1234-123456789abc';
+
+    await resolveCurrentActor({
+      ipcPort: 7951,
+      sessionId: 'sess-1',
+      expectedScheduledTurnId: scheduledTurnId,
+      fetchImpl: fetchImpl as typeof fetch,
+    });
+
+    expect(fetchImpl).toHaveBeenCalledWith(
+      'http://127.0.0.1:7951/api/current-actor',
+      expect.objectContaining({
+        body: JSON.stringify({
+          sessionId: 'sess-1', expectedScheduledTurnId: scheduledTurnId,
+        }),
+      }),
     );
   });
 

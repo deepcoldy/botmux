@@ -212,6 +212,7 @@ import { stagePendingRepoSetup, persistPendingRepoCardMessageId } from './core/p
 import { hasPendingSessionTurns, runSessionTurn } from './core/session-turn-queue.js';
 import { buildTerminalUrl, setTerminalProxyPort, setTerminalExternalPort } from './core/terminal-url.js';
 import { startTerminalProxy, type TerminalProxyHandle } from './core/terminal-proxy.js';
+import { authorizeTerminalStatusPage } from './core/terminal-write-auth.js';
 import type { CliId } from './adapters/cli/types.js';
 import { runtimeInstallationKey } from './adapters/cli/runtime.js';
 import * as scheduler from './core/scheduler.js';
@@ -267,12 +268,14 @@ import {
   snapshotCodexAppFinalSettlements,
   codexAppFinalSettlementCount,
   type WorkerSessionReplyOptions,
+  type ForkWorkerOptions,
   migrateMojoSessionIdentities,
   mojoLivePatchForSession,
   idleCardLabel,
   dshRuntimeForSession,
   recordTurnExplicitMention,
   pruneSteerFanoutState,
+  ensureAutomaticTaskContinuationLease,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler } from './core/dashboard-ipc-server.js';
@@ -3668,6 +3671,13 @@ export async function noteTurnReceived(
   _turnId?: string,
   receivedReactionEmoji?: string,
 ): Promise<void> {
+  if (getBot(ds.larkAppId).config.showReplyTiming === true) {
+    const turnId = _turnId ?? triggerMessageId;
+    const received = ds.turnReceivedAtMs ??= new Map();
+    if (!received.has(turnId)) received.set(turnId, Date.now());
+    // Keep recent timestamps for delivery retries; unknown/evicted turns omit waiting time.
+    if (received.size > 512) received.delete(received.keys().next().value!);
+  }
   // Trigger-user CLI auth: publish (or withhold) the acting identity for THIS
   // turn. This is the per-message acceptance point — every inbound turn passes
   // through here before reaching the worker — so it is the one place that can
@@ -6633,6 +6643,7 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
           if (!hasAllowlist) return true;
           return getDashboardAdminOpenIds(larkAppId).includes(ownerOpenId);
         },
+        isScheduledTurnLive: turnId => ds?.scheduledTurnCallers?.has(turnId) === true,
       });
       if (!decision.ok) {
         return jsonRes(res, decision.status, {
@@ -17647,6 +17658,7 @@ function setActiveInteractiveTurn(
     ...(userPrompt?.trim() ? { userPrompt } : {}),
     ...(controller ? { controller } : {}),
   };
+  ensureAutomaticTaskContinuationLease(ds);
 }
 
 type XpiSharedCwdTurnAdmission =
@@ -18151,23 +18163,28 @@ function forkXpiSharedCwdTurn(
     onWorkerGenerationReserved: (workerGeneration: number) => void;
   },
   forkAdopt: typeof forkAdoptWorker = forkAdoptWorker,
-): boolean {
+): { accepted: boolean; marginalReclaim: boolean } {
   if (ds.adoptedFrom) {
-    return forkAdopt(ds, {
-      prompt: args.cliInput.content,
-      turnId: args.turnId,
-      atMostOnce: true,
-      trustedCaller: args.caller,
-      onWorkerGenerationReserved: args.onWorkerGenerationReserved,
-    }) === 'accepted';
+    return {
+      accepted: forkAdopt(ds, {
+        prompt: args.cliInput.content,
+        turnId: args.turnId,
+        atMostOnce: true,
+        trustedCaller: args.caller,
+        onWorkerGenerationReserved: args.onWorkerGenerationReserved,
+      }) === 'accepted',
+      marginalReclaim: false,
+    };
   }
-  return forkWorker(ds, args.cliInput, {
+  const admissionOpts: ForkWorkerOptions = {};
+  const accepted = forkWorker(ds, args.cliInput, {
     resume: args.resume,
     turnId: args.turnId,
     atMostOnce: true,
     trustedCaller: args.caller,
     onWorkerGenerationReserved: args.onWorkerGenerationReserved,
-  });
+  }, admissionOpts);
+  return { accepted, marginalReclaim: admissionOpts.marginalReclaimScheduled === true };
 }
 
 async function driveNextXpiSharedCwdTurn(
@@ -18276,7 +18293,7 @@ async function driveNextXpiSharedCwdTurn(
         trustedCaller: next.record.caller,
       });
     } else {
-      accepted = forkXpiSharedCwdTurn(ds, {
+      const forkOutcome = forkXpiSharedCwdTurn(ds, {
         cliInput: next.record.cliInput,
         resume: next.record.resume,
         turnId: next.record.turnId,
@@ -18296,6 +18313,7 @@ async function driveNextXpiSharedCwdTurn(
           }
         },
       }, dependencies.forkAdoptWorker);
+      accepted = forkOutcome.accepted;
     }
     if (!accepted || admission.kind !== 'acquired') {
       rollbackXpiSharedCwdAdmission(ds, admission, next.record.turnId);
@@ -18334,6 +18352,7 @@ async function driveNextXpiSharedCwdTurn(
 }
 
 export const __testOnly_driveNextXpiSharedCwdTurn = driveNextXpiSharedCwdTurn;
+export const __testOnly_forkReservedInitialSession = forkReservedInitialSession;
 
 /** Fork an ordinary opening turn and release its route reservation. There is
  * deliberately no await between the final buffered-input snapshot, fork, and
@@ -18366,6 +18385,7 @@ function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableB
     }
   }
   let accepted = false;
+  const admissionOpts: ForkWorkerOptions = {};
   try {
     accepted = forkWorker(ds, input, turnId ? {
       turnId,
@@ -18390,13 +18410,38 @@ function forkReservedInitialSession(ds: DaemonSession, availableBots: AvailableB
             },
           }
         : {}),
-    } : false);
+    } : false, admissionOpts);
   } catch (error) {
     if (turnId) rollbackXpiSharedCwdAdmission(ds, admission, turnId);
     throw error;
   }
-  if (!accepted || (ds.session.xpiSharedCwdAdmissionGroupId && !xpiAdmissionAcquired)) {
+  if (!accepted) {
     if (turnId) rollbackXpiSharedCwdAdmission(ds, admission, turnId);
+    return false;
+  }
+  if (ds.session.xpiSharedCwdAdmissionGroupId && !xpiAdmissionAcquired) {
+    if (turnId) rollbackXpiSharedCwdAdmission(ds, admission, turnId);
+    // Non-marginal synchronous refusal (hard block/retirement/freeze/transfer)
+    // has no asynchronous re-entry: keep the opening buffers so the existing
+    // retry paths can fork again, matching the pre-marginal behaviour.
+    if (!admissionOpts.marginalReclaimScheduled) return false;
+    // Marginal admission deferred the fork synchronously; the group slot is
+    // claimed only on the asynchronous re-entry. Persist the opening like the
+    // busy path so the leased queue still dispatches it if the reserved
+    // session is superseded during the reclaim wait.
+    if (turnId && trustedCaller) {
+      queueXpiSharedCwdTurn({
+        ds,
+        turnId,
+        caller: trustedCaller,
+        userPrompt,
+        cliInput: input,
+        resume: false,
+      });
+    }
+    ds.pendingTurnId = undefined;
+    ds.initialStartPending = false;
+    clearInitialStartBuffers(ds);
     return false;
   }
   rememberLastCliInput(ds, userPrompt, input);
@@ -18785,10 +18830,12 @@ async function stageCrossPrincipalInterruption(args: {
   message: CrossPrincipalInterruptionMessage;
 }): Promise<boolean> {
   const { ds, ownerTurnId, owner, proposer } = args;
+  if (ds.session.status !== 'active') return true;
   const { message, choice } = sanitizeCrossPrincipalMessage(args.message);
   if (await trySettleCrossPrincipalProposerChoice(ds, proposer, args.message.text, args.message.mentions)) {
     return true;
   }
+  if (ds.session.status !== 'active') return true;
   const staged = stageCrossPrincipalInterruptionRecord({
     session: ds.session,
     ownerTurnId,
@@ -18835,6 +18882,7 @@ async function notifyCrossPrincipalProposer(
   text: string,
   discriminator: string,
 ): Promise<boolean> {
+  if (ds.session.status !== 'active') return false;
   if (record.proposer.senderType === 'bot') {
     logger.info(
       `[${tag(ds)}] XPI bot outcome kept on control/audit plane `
@@ -18843,6 +18891,7 @@ async function notifyCrossPrincipalProposer(
     return true;
   }
   const proposer = await resolveXpiHumanOpenId(ds, record.proposer, 'proposer');
+  if (ds.session.status !== 'active') return false;
   if (proposer.status !== 'resolved') {
     logger.warn(
       `[${tag(ds)}] XPI proposer outcome not delivered: identity=${proposer.status} `
@@ -18898,6 +18947,7 @@ async function notifyCrossPrincipalTerminal(
   record: CrossPrincipalInterruption,
   text: string,
 ): Promise<boolean> {
+  if (ds.session.status !== 'active') return false;
   // A bot sender gets protocol/CLI feedback and local audit only. Publishing
   // --as/appId/turn diagnostics into the shared topic is not actionable for a
   // human observer and caused the noisy notices seen in live R10.
@@ -18910,6 +18960,7 @@ async function notifyCrossPrincipalTerminal(
   }
 
   const proposer = await resolveXpiHumanOpenId(ds, record.proposer, 'proposer');
+  if (ds.session.status !== 'active') return false;
   const recipients = proposer.status === 'resolved' ? [proposer.openId] : [];
   const channel: CrossPrincipalInterruptionDeliveryAudit['channel'] =
     ds.scope === 'thread' ? 'topic' : 'group';
@@ -18930,6 +18981,7 @@ async function notifyCrossPrincipalTerminal(
   for (let attempt = 1; attempt <= XPI_TERMINAL_ALERT_MAX_ATTEMPTS; attempt += 1) {
     const delay = XPI_TERMINAL_ALERT_RETRY_DELAYS_MS[attempt - 1] ?? 1_000;
     if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
+    if (ds.session.status !== 'active') return false;
     try {
       const deliveredMessageId = await sessionReply(
         sessionAnchorId(ds),
@@ -18945,6 +18997,7 @@ async function notifyCrossPrincipalTerminal(
       }
       return true;
     } catch (error) {
+      if (ds.session.status !== 'active') return false;
       failures += 1;
       const detail = error instanceof Error ? error.message : String(error);
       recordCrossPrincipalDeliveryAudit(ds, record, 'delivery_failed', channel, attempt, detail);
@@ -18967,6 +19020,7 @@ async function settleCrossPrincipalTerminal(
   record: CrossPrincipalInterruption,
   text: string,
 ): Promise<void> {
+  if (ds.session.status !== 'active') return;
   if (record.phase !== 'terminal_notice_pending') {
     record.phase = 'terminal_notice_pending';
     record.terminalNoticeText = text;
@@ -18993,6 +19047,7 @@ async function settleCrossPrincipalTerminal(
     );
     logger.warn(`[${tag(ds)}] XPI terminal notice cycle failed record=${record.id}: ${detail}`);
   }
+  if (ds.session.status !== 'active') return;
   if (delivered) {
     removeCrossPrincipalRecord(ds, record.id);
     return;
@@ -19025,6 +19080,7 @@ async function notifyCrossPrincipalOwnerLifecycle(
   text: string,
   discriminator: string,
 ): Promise<boolean> {
+  if (ds.session.status !== 'active') return false;
   if (record.owner.senderType === 'bot') {
     logger.info(
       `[${tag(ds)}] XPI owner lifecycle kept on control/audit plane `
@@ -19033,6 +19089,7 @@ async function notifyCrossPrincipalOwnerLifecycle(
     return true;
   }
   const owner = await resolveXpiHumanOpenId(ds, record.owner, 'owner');
+  if (ds.session.status !== 'active') return false;
   if (owner.status !== 'resolved') {
     logger.warn(
       `[${tag(ds)}] XPI owner lifecycle not delivered: identity=${owner.status} `
@@ -19134,6 +19191,7 @@ async function dispatchApprovedCrossPrincipalSuggestion(
     inThread: record.messages[0]?.inThread,
   });
   let accepted = false;
+  let marginalReclaim = false;
   let admission: XpiSharedCwdTurnAdmission = { kind: 'unmanaged' };
   if (ds.worker && !ds.worker.killed) {
     admission = admitLiveXpiSharedCwdTurn({
@@ -19167,7 +19225,7 @@ async function dispatchApprovedCrossPrincipalSuggestion(
       await notifyApprovedCrossPrincipalDispatch(ds, record, 'queued');
       return true;
     }
-    accepted = forkXpiSharedCwdTurn(ds, {
+    const forkOutcome = forkXpiSharedCwdTurn(ds, {
       cliInput,
       resume: ds.hasHistory,
       turnId,
@@ -19188,12 +19246,44 @@ async function dispatchApprovedCrossPrincipalSuggestion(
         }
       },
     });
+    accepted = forkOutcome.accepted;
+    marginalReclaim = forkOutcome.marginalReclaim;
   }
-  if (!accepted || (ds.session.xpiSharedCwdAdmissionGroupId && admission.kind !== 'acquired')) {
+  if (!accepted) {
     rollbackXpiSharedCwdAdmission(ds, admission, turnId);
     await notifyApprovedCrossPrincipalDispatch(ds, record, 'retrying');
     scheduleCrossPrincipalOwnerWait(ds, Date.now() + 5_000);
     return false;
+  }
+  if (ds.session.xpiSharedCwdAdmissionGroupId && admission.kind !== 'acquired') {
+    if (!marginalReclaim) {
+      // A synchronous refusal other than marginal deferral (hard memory block,
+      // retirement fence, device freeze/transfer gate): no asynchronous
+      // re-entry will claim the slot, so keep the record and the owner-wait
+      // retry. Queueing here would park the turn in a journal no release event
+      // drives, and the hard-block notice already asks the owner to resend.
+      rollbackXpiSharedCwdAdmission(ds, admission, turnId);
+      await notifyApprovedCrossPrincipalDispatch(ds, record, 'retrying');
+      scheduleCrossPrincipalOwnerWait(ds, Date.now() + 5_000);
+      return false;
+    }
+    // Marginal memory admission accepted the fork synchronously but the group
+    // slot is only claimed on the asynchronous re-entry (the reclaim callback
+    // routes around this closure). Enqueue like the busy path so the leased
+    // queue performs the single dispatch; keeping the record for the owner wait
+    // would re-enter on a live worker and execute this non-om_ turn twice
+    // (worker-side turn dedupe does not cover `<recordId>:approved`).
+    queueXpiSharedCwdTurn({
+      ds,
+      turnId,
+      caller: record.owner,
+      userPrompt: prompt,
+      cliInput,
+      resume: ds.hasHistory,
+    });
+    removeCrossPrincipalRecord(ds, record.id);
+    await notifyApprovedCrossPrincipalDispatch(ds, record, 'queued');
+    return true;
   }
   setActiveInteractiveTurn(ds, turnId, record.owner, ownerTask);
   beginNewTurn(ds, ownerTask, turnId);
@@ -19537,6 +19627,8 @@ async function prepareIndependentCrossPrincipalSession(
 
 function scheduleCrossPrincipalOwnerWait(ds: DaemonSession, deadlineAt: number): void {
   clearTimeout(ds.crossPrincipalWaitTimer);
+  ds.crossPrincipalWaitTimer = undefined;
+  if (ds.session.status !== 'active') return;
   const delay = Math.max(1, deadlineAt - Date.now());
   ds.crossPrincipalWaitTimer = setTimeout(() => {
     ds.crossPrincipalWaitTimer = undefined;
@@ -19550,6 +19642,7 @@ async function askCrossPrincipalConfirmation(
   record: CrossPrincipalInterruption,
   input: Parameters<typeof registerHostAsk>[0],
 ): Promise<Awaited<ReturnType<typeof registerHostAsk>> | undefined> {
+  if (ds.session.status !== 'active') return undefined;
   if (record.confirmationRetryAt && record.confirmationRetryAt > Date.now()) {
     scheduleCrossPrincipalOwnerWait(ds, record.confirmationRetryAt);
     return undefined;
@@ -19846,7 +19939,7 @@ async function driveCrossPrincipalInterruptions(ds: DaemonSession): Promise<void
     // were already durable. Continue only when the head actually changed; a
     // same-head wait/ask must remain parked until its own event fires.
     const next = ds.session.crossPrincipalInterruptions?.[0];
-    if (next && next.id !== record.id) {
+    if (ds.session.status === 'active' && next && next.id !== record.id) {
       queueMicrotask(() => { void driveCrossPrincipalInterruptions(ds); });
     }
   }
@@ -25853,16 +25946,23 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     liveSessionCapSweepPending = true;
     void (async () => {
       try {
-        const maxLiveWorkers = getBot(cfg.larkAppId).config.maxLiveWorkers;
+        const liveBotConfig = getBot(cfg.larkAppId).config;
+        const maxLiveWorkers = liveBotConfig.maxLiveWorkers;
+        const idleTtlMs = typeof liveBotConfig.idleSuspendMinutes === 'number'
+          && liveBotConfig.idleSuspendMinutes > 0
+          ? liveBotConfig.idleSuspendMinutes * 60_000
+          : undefined;
         const suspended = await sweepIdleWorkersAfterTurnDrain(
           cfg.larkAppId,
           activeSessions,
-          { maxLiveWorkers },
+          { maxLiveWorkers, idleTtlMs },
         );
         if (suspended.length > 0) {
+          const ttlCount = suspended.filter(entry => entry.reason === 'idle_ttl').length;
           logger.info(
-            `[idle-worker-sweeper] suspended ${suspended.length} session(s) over per-bot cap `
-            + `${maxLiveWorkers ?? DEFAULT_MAX_LIVE_WORKERS} source=${source}`,
+            `[idle-worker-sweeper] suspended ${suspended.length} session(s) `
+            + `[idle_ttl=${ttlCount}, live_worker_cap=${suspended.length - ttlCount}; `
+            + `cap-limit=${maxLiveWorkers ?? DEFAULT_MAX_LIVE_WORKERS}] source=${source}`,
           );
         }
       } catch (err) {
@@ -26237,7 +26337,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // host networking for model egress and can also dial 127.0.0.1. Require the
   // host-only shared secret on every daemon IPC route except the tiny
   // capability-gated receiver/readiness apertures in dashboard-ipc-server.
-  loadOrCreateDashboardSecret(
+  const terminalCapabilitySecret = loadOrCreateDashboardSecret(
     join(homedir(), '.botmux', '.dashboard-secret'),
   );
   // Create the dispatch-binding key before any credential-only child spawns.
@@ -26372,6 +26472,38 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             }
           }
           return undefined;
+        });
+      },
+      resolveSessionState: (sessionId) => {
+        for (const ds of activeSessions.values()) {
+          if (ds.session.sessionId !== sessionId) continue;
+          return sessionSupportsWebTerminal(ds) ? 'starting' : 'unavailable';
+        }
+        const stored = sessionStore.getOwnedSession(sessionId);
+        if (!stored) return 'not-found';
+        return stored.status === 'closed' ? 'closed' : 'starting';
+      },
+      resolveStatusPageLocale: (sessionId) => {
+        for (const ds of activeSessions.values()) {
+          if (ds.session.sessionId === sessionId) return localeForBot(ds.larkAppId);
+        }
+        return localeForBot(sessionStore.getOwnedSession(sessionId)?.larkAppId);
+      },
+      authorizeStatusPage: (sessionId, capability) => {
+        let live: DaemonSession | undefined;
+        for (const ds of activeSessions.values()) {
+          if (ds.session.sessionId === sessionId) {
+            live = ds;
+            break;
+          }
+        }
+        const session = live?.session ?? sessionStore.getOwnedSession(sessionId);
+        return authorizeTerminalStatusPage({
+          secret: terminalCapabilitySecret,
+          sessionId,
+          session,
+          live,
+          capability,
         });
       },
     });
@@ -27101,6 +27233,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         ownerOpenId: resolvePrimaryOwnerOpenId(cfg.larkAppId),
         dashboardUrl: dash.url,
         dashboardLocalUrl: dash.localUrl,
+        notifyOnRestart: readGlobalConfig().maintenance?.notifyOnRestart !== false,
         sendCard: (openId, card) => sendUserMessage(cfg.larkAppId, openId, card, 'interactive').then(() => undefined),
         log: (m) => logger.info(`[restart-report] ${m}`),
       });
@@ -27485,6 +27618,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           ds.workerPort = null;
           ds.workerToken = null;
           ds.workerViewToken = null;
+          ds.workerCardViewToken = null;
           ds.managedTurnOrigin = undefined;
         } else {
           killWorker(ds);

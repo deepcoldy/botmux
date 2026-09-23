@@ -89,6 +89,7 @@ describe('bot-config store', () => {
     expect(keys).toContain('silentTurnReactions');
     expect(keys).toContain('codexAppCleanInput');
     expect(keys).toContain('feedback');
+    expect(keys).toContain('showReplyTiming');
     expect(keys).toContain('cardActionAckTimeoutMs');
   });
 
@@ -445,6 +446,13 @@ describe('bot-config store', () => {
     await store.applyConfigField('app_default', spec, false);
     expect(readConfig().disableStreamingCard).toBeUndefined();
     expect(registry.getBot('app_default').config.disableStreamingCard).toBeUndefined();
+
+    const timing = store.findConfigField('showReplyTiming')!;
+    await store.applyConfigField('app_default', timing, true);
+    expect(registry.getBot('app_default').config.showReplyTiming).toBe(true);
+    expect(registry.loadBotConfigs()[0].showReplyTiming).toBe(true);
+    await store.applyConfigField('app_default', timing, false);
+    expect(readConfig().showReplyTiming).toBeUndefined();
   });
 
   it('sets and unsets hidden streaming-card buttons through /botconfig', async () => {
@@ -683,6 +691,30 @@ describe('bot-config store', () => {
     expect(r2.ok).toBe(true);
     expect(readConfig().maxLiveWorkers).toBeUndefined();
     expect(registry.getBot('app_default').config.maxLiveWorkers).toBeUndefined();
+  });
+
+  it('idleSuspendMinutes is an immediate clearable number field that round-trips', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('idleSuspendMinutes')!;
+    expect(spec).toMatchObject({ kind: 'number', effect: 'immediate', clearable: true });
+
+    // Coerce layer: positive integers only (0/negative/fraction/garbage rejected).
+    expect(store.coerceConfigValue(spec, 30)).toEqual({ ok: true, value: 30 });
+    expect(store.coerceConfigValue(spec, '45')).toEqual({ ok: true, value: 45 });
+    expect(store.coerceConfigValue(spec, 0)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, -1)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, 1.5)).toEqual({ ok: false, reason: 'invalid_number' });
+    expect(store.coerceConfigValue(spec, 'abc')).toEqual({ ok: false, reason: 'invalid_number' });
+
+    const set = await store.applyConfigField('app_default', spec, 20);
+    expect(set).toMatchObject({ ok: true, effect: 'immediate' });
+    expect(readConfig().idleSuspendMinutes).toBe(20);
+    expect(registry.getBot('app_default').config.idleSuspendMinutes).toBe(20);
+
+    const clear = await store.applyConfigField('app_default', spec, null);
+    expect(clear.ok).toBe(true);
+    expect(readConfig().idleSuspendMinutes).toBeUndefined();
+    expect(registry.getBot('app_default').config.idleSuspendMinutes).toBeUndefined();
   });
 
   it('cardActionAckTimeoutMs enforces its range and hot-updates the registered Bot', async () => {

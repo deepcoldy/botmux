@@ -270,6 +270,29 @@ describe('parseBotConfigsFromText — brand', () => {
     }
   });
 
+  it('keeps a positive-integer idleSuspendMinutes TTL', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's', idleSuspendMinutes: 30 },
+    ]));
+    expect(cfg.idleSuspendMinutes).toBe(30);
+  });
+
+  it('leaves idleSuspendMinutes undefined (TTL disabled) when unset', () => {
+    const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'a', larkAppSecret: 's' },
+    ]));
+    expect(cfg.idleSuspendMinutes).toBeUndefined();
+  });
+
+  it('drops 0 / negative / fractional / non-numeric idleSuspendMinutes to undefined', () => {
+    for (const bad of [0, -10, 2.5, '30', null] as const) {
+      const [cfg] = mod.parseBotConfigsFromText(JSON.stringify([
+        { larkAppId: 'a', larkAppSecret: 's', idleSuspendMinutes: bad },
+      ]));
+      expect(cfg.idleSuspendMinutes).toBeUndefined();
+    }
+  });
+
   // allowArbitraryMention is a SAFETY switch (gates whether an agent may @
   // arbitrary group members via email). Default MUST be off, and only a literal
   // boolean `true` may turn it on — a mutation that flips normalization to

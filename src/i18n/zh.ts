@@ -4,6 +4,18 @@
  */
 export const messages: Record<string, string> = {
   'worker.steer_accepted': '收到，引导成功',
+  // ─── Terminal status pages ───────────────────────────────────────────────
+  'terminal.status.starting.title': '终端正在启动',
+  'terminal.status.starting.detail': '正在恢复该会话的终端连接，请稍后刷新页面或从最新卡片重新打开 Web 终端。',
+  'terminal.status.closed.title': '该会话已关闭',
+  'terminal.status.closed.detail': '会话已经结束，终端内容无法继续查看。',
+  'terminal.status.not_found.title': '找不到该会话',
+  'terminal.status.not_found.detail': '终端链接无效，或者对应会话已经被删除。',
+  'terminal.status.forbidden.title': '终端链接已失效',
+  'terminal.status.forbidden.detail': '请返回飞书，从该会话的最新卡片重新打开 Web 终端。',
+  'terminal.status.unavailable.title': '终端暂不可用',
+  'terminal.status.unavailable.detail': '会话仍然存在，但终端服务当前无法恢复。',
+
   // ─── Card buttons ────────────────────────────────────────────────────────
   'card.btn.open_terminal': '🖥️ 打开 Web 终端',
   'card.btn.open_writable_terminal': '🖥️ 打开可操作 Web 终端',
@@ -1145,7 +1157,6 @@ export const messages: Record<string, string> = {
   'setup.lark_perm_chat': '  - im:chat (群信息)',
   'setup.lark_perm_user_base': '  - contact:user.base:readonly (用户信息)',
   'setup.lark_enable_events': '启用事件订阅 (WebSocket 模式):',
-  'setup.supported_clis': '支持的 CLI: 1) claude-code  2) aiden  3) coco  4) codex  5) cursor  6) gemini  7) opencode  8) antigravity  9) mtr  10) hermes  11) codex-app  12) mira  13) seed  14) traex  15) pi  16) copilot  17) oh-my-pi  18) relay',
   'setup.prompt_cli_choice': 'CLI 适配器 [1]: ',
   'setup.prompt_working_dir': '默认工作目录 [~]: ',
   'setup.prompt_allowed_users': '允许的用户 (邮箱/手机号/open_id，逗号分隔，留空=不限制): ',
@@ -1589,6 +1600,8 @@ export const messages: Record<string, string> = {
 
   // Markdown / contextual reply card chrome
   'card.you': '你',
+  'card.waiting_duration': '等待 {seconds} 秒',
+  'card.execution_duration': '执行耗时 {seconds} 秒',
   'card.sent_to': '发送给：',
   'card.usage.context': '上下文',
   // Claude Code statusline 配额段（纯文本 `ctx 23% · 5h 18% · 7d 5%`），两语言同值。

@@ -12,7 +12,10 @@
  *
  * What this module authenticates:
  *   1. The turn id is a well-formed scheduled turn.
- *   2. The task still exists, is enabled, and carries a creator (ownerOpenId).
+ *   2. The task still exists and carries a creator (ownerOpenId). An enabled
+ *      task is accepted directly. A one-shot that the scheduler auto-disabled
+ *      after dispatch is accepted only while the daemon independently proves
+ *      this exact turn is still live. Manual/legacy disables stay denied.
  *   3. The session presenting the turn is bound to the task's target
  *      (larkAppId/chatId) — the task cannot authorize a workflow command in a
  *      session belonging to another chat/bot.
@@ -145,6 +148,8 @@ export function authorizeScheduledTurn(input: {
   sessionLarkAppId: string;
   sessionChatId: string;
   isOwnerAllowed: (larkAppId: string, ownerOpenId: string) => boolean;
+  /** Daemon-owned exact-turn liveness. Omit on paths that cannot prove it. */
+  isScheduledTurnLive?: (turnId: string) => boolean;
 }): ScheduledTurnAuth | { error: ScheduledTurnAuthError } {
   const taskId = parseScheduledTurnId(input.turnId);
   if (!taskId) return { error: 'task_not_found' };
@@ -152,7 +157,12 @@ export function authorizeScheduledTurn(input: {
 
   const task = readScheduledTaskForProvenance(input.dataDir, input.sessionLarkAppId, taskId);
   if (!task) return { error: 'task_not_found' };
-  if (task.enabled === false) return { error: 'task_disabled' };
+  if (task.enabled === false) {
+    const autoCompletedStillLive = task.parsed?.kind === 'once'
+      && task.disabledReason === 'once_completed'
+      && input.isScheduledTurnLive?.(input.turnId) === true;
+    if (!autoCompletedStillLive) return { error: 'task_disabled' };
+  }
 
   const ownerOpenId = typeof task.ownerOpenId === 'string' ? task.ownerOpenId.trim() : '';
   if (!ownerOpenId) return { error: 'task_owner_missing' };

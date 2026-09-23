@@ -20,6 +20,7 @@ import {
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { CLI_MODEL_CHOICES } from '../adapters/cli/model-choices.js';
 import type { CliAdapter, CliId } from '../adapters/cli/types.js';
+import { detectAidenCodexModels } from './aiden-model-catalog.js';
 
 export type ModelSource = 'static' | 'live';
 
@@ -32,6 +33,8 @@ export interface DetectModelsOptions {
   readonly now?: () => number;
   /** 适配器工厂注入，默认 createCliAdapterSync。 */
   readonly adapterFactory?: (cliId: CliId) => CliAdapter;
+  /** Aiden AIPROXY 探测器注入，默认调用 `aiden x models --codex --json`。 */
+  readonly aidenCodexDetector?: () => Promise<readonly string[] | null>;
 }
 
 // ─── 静态候选 ────────────────────────────────────────────────────────────────
@@ -52,6 +55,8 @@ export function staticModelChoices(key: string): readonly string[] {
     if (isTtadkWrapper(opt.wrapperCli)) {
       return ttadkAcceptsModel(opt.wrapperCli) ? [...TTADK_MODEL_SUGGESTIONS] : [];
     }
+    // Aiden 的可用模型由登录账号和 AIPROXY 动态决定，不能回退到原生 Codex 快照。
+    if (opt.key === 'aiden-x-codex') return [];
     return [...(CLI_MODEL_CHOICES[opt.cliId] ?? [])];
   } catch {
     return [];
@@ -96,9 +101,13 @@ async function detectModelsWith(
 
     const promise = (async (): Promise<readonly string[] | null> => {
       try {
-        const adapter = factory(opt.cliId);
-        // 适配器未声明 detectModels = 该 CLI 无法枚举模型 → null。
-        const models = adapter.detectModels ? await adapter.detectModels() : null;
+        const models = opt.key === 'aiden-x-codex'
+          ? await (opts?.aidenCodexDetector ?? detectAidenCodexModels)()
+          : await (async () => {
+            const adapter = factory(opt.cliId);
+            // 适配器未声明 detectModels = 该 CLI 无法枚举模型 → null。
+            return adapter.detectModels ? adapter.detectModels() : null;
+          })();
         // 只缓存非空成功结果；失败（null/空数组/异常）不缓存，下次调用重试。
         if (models && models.length > 0) {
           cache.set(opt.key, { at: now(), models: [...models] });

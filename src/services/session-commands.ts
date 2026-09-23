@@ -196,6 +196,13 @@ function applyClose(row: Session, command: SessionCloseCommand, now: Date): Sess
     changed = true;
   }
 
+  // Explicit close cancels staged protocol work, including legacy closed rows.
+  // Resuming the conversation must not replay its old cross-principal queue.
+  if (row.crossPrincipalInterruptions !== undefined) {
+    row.crossPrincipalInterruptions = undefined;
+    changed = true;
+  }
+
   if (command.clearMojoCloseJournal && row.mojoCloseJournal !== undefined) {
     row.mojoCloseJournal = undefined;
     changed = true;

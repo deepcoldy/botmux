@@ -35,7 +35,8 @@ import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
-import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
+import { createOpenCodeAdapter, isOpenCodeSessionId } from '../src/adapters/cli/opencode.js';
+import { createMiMoCodeAdapter } from '../src/adapters/cli/mimocode.js';
 import { createAntigravityAdapter } from '../src/adapters/cli/antigravity.js';
 import { createMtrAdapter, mtrSessionIdForBotmuxSession } from '../src/adapters/cli/mtr.js';
 import { GOAL_ENV } from '../src/workflows/v3/contract.js';
@@ -114,7 +115,7 @@ describe('lazy binary resolution', () => {
   // Direct CLI adapters resolve their actual executable lazily. Runner-backed
   // adapters (codex-app/mira) intentionally use process.execPath and are covered
   // by their own buildArgs tests below.
-  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'opencode2', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'ebsd', 'kimi', 'grok', 'kiro-cli', 'reasonix', 'dsh-tui'];
+  const DIRECT_CLI_IDS: CliId[] = ['claude-code', 'seed', 'aiden', 'coco', 'codex', 'cursor', 'gemini', 'genius', 'opencode', 'opencode2', 'mimocode', 'antigravity', 'mtr', 'hermes', 'traex', 'copilot', 'ebsd', 'kimi', 'grok', 'kiro-cli', 'reasonix', 'dsh-tui'];
 
   it.each(DIRECT_CLI_IDS)('"%s": construction does not probe; first resolvedBin read does', async (id) => {
     const { spawnSync } = await import('node:child_process');
@@ -459,6 +460,93 @@ describe('claude-code buildArgs', () => {
   it('surfaces curated model choices for setup', () => {
     expect(adapter.modelChoices).toContain('sonnet');
     expect(adapter.modelChoices).toContain('opus');
+  });
+});
+
+describe('mimocode adapter', () => {
+  const adapter = createMiMoCodeAdapter('/usr/bin/mimo');
+
+  it('uses the MiMoCode executable and isolated state roots', () => {
+    // 断言字面 `~` 默认路径时必须 hermetic：全局单测 setup（fence-home-env）会把
+    // 已存在的 XDG_* 重定向到临时 HOME（CI 预置了 XDG_CONFIG_HOME），在 describe
+    // 顶层构造会让 config 路径变成绝对路径。这里显式清空四个 XDG 变量再构造。
+    const xdgKeys = ['XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_CACHE_HOME'];
+    const previous: Record<string, string | undefined> = {};
+    for (const k of xdgKeys) {
+      previous[k] = process.env[k];
+      delete process.env[k];
+    }
+    try {
+      const defaultAdapter = createMiMoCodeAdapter('/usr/bin/mimo');
+      expect(defaultAdapter.id).toBe('mimocode');
+      expect(defaultAdapter.resolvedBin).toBe('/usr/bin/mimo');
+      expect(defaultAdapter.authPaths).toEqual([
+        '~/.config/mimocode',
+        '~/.local/share/mimocode',
+        '~/.local/state/mimocode',
+        '~/.cache/mimocode',
+      ]);
+      expect(defaultAdapter.skillsDir).toBe('~/.config/mimocode/skills');
+    } finally {
+      for (const k of xdgKeys) {
+        if (previous[k] === undefined) delete process.env[k];
+        else process.env[k] = previous[k]!;
+      }
+    }
+  });
+
+  it('reuses the OpenCode-compatible prompt and model argument shape', () => {
+    expect(adapter.buildArgs({
+      sessionId: 'ses_test',
+      resume: false,
+      initialPrompt: 'hello MiMoCode',
+      model: 'xiaomi/mimo-v2.5-pro',
+    })).toEqual([
+      '--trust',
+      '--model', 'xiaomi/mimo-v2.5-pro',
+      '--prompt', 'hello MiMoCode',
+    ]);
+    expect(adapter.buildResumeCommand?.({
+      sessionId: 'botmux-session',
+      cliSessionId: 'ses_native',
+    })).toBe('mimo -s ses_native');
+  });
+
+  it('accepts MiMoCode native session ids and follows XDG roots', () => {
+    expect(isOpenCodeSessionId('ses_-ffe5f83a176a5ffexg2lnkhTF')).toBe(true);
+
+    const previous = {
+      XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME,
+      XDG_DATA_HOME: process.env.XDG_DATA_HOME,
+      XDG_STATE_HOME: process.env.XDG_STATE_HOME,
+      XDG_CACHE_HOME: process.env.XDG_CACHE_HOME,
+    };
+    const root = mkdtempSync(join(tmpdir(), 'mimocode-xdg-'));
+    try {
+      process.env.XDG_CONFIG_HOME = join(root, 'config');
+      process.env.XDG_DATA_HOME = join(root, 'data');
+      process.env.XDG_STATE_HOME = join(root, 'state');
+      process.env.XDG_CACHE_HOME = join(root, 'cache');
+      const configured = createMiMoCodeAdapter('/usr/bin/mimo');
+      expect(configured.authPaths).toEqual([
+        join(root, 'config', 'mimocode'),
+        join(root, 'data', 'mimocode'),
+        join(root, 'state', 'mimocode'),
+        join(root, 'cache', 'mimocode'),
+      ]);
+      expect(configured.skillsDir).toBe(join(root, 'config', 'mimocode', 'skills'));
+      expect(configured.hookInstall?.configPath).toBe(join(root, 'config', 'mimocode', 'plugin', 'botmux-ask.js'));
+      expect(configured.buildArgs({ sessionId: 's', resume: true, resumeSessionId: 'ses_-ffe5f83a176a5ffexg2lnkhTF' })).toEqual([
+        '--trust',
+        '--session', 'ses_-ffe5f83a176a5ffexg2lnkhTF',
+      ]);
+    } finally {
+      for (const [name, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

@@ -43,6 +43,21 @@ function activeSession(): any {
   };
 }
 
+const SCHEDULED_TURN_ID = 'schedule:abcdef12:12345678-1234-1234-1234-123456789abc';
+
+function activeScheduledSession(): any {
+  const ds = activeSession();
+  ds.managedTurnOrigin.turnId = SCHEDULED_TURN_ID;
+  ds.managedTurnOrigin.callerOpenId = 'ou_scheduler';
+  ds.scheduledTurnCallers = new Map([[SCHEDULED_TURN_ID, {
+    requestUserOpenId: 'ou_scheduler',
+    requestLarkAppId: 'cli_app',
+    source: 'schedule_creator',
+    taskId: 'abcdef12',
+  }]]);
+  return ds;
+}
+
 describe('daemon current actor attestation', () => {
   it('derives the HTTP client pid from the live kernel socket tuple', () => {
     const procRoot = mkdtempSync(join(tmpdir(), 'actor-peer-'));
@@ -91,6 +106,170 @@ describe('daemon current actor attestation', () => {
       document: { actor: { email: 'current.user@example.com' } },
     });
     expect(resolveIdentity).toHaveBeenCalledWith('cli_app', 'ou_current');
+  });
+
+  it('proves the exact scheduled turn against the live caller registry', async () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    writeProc(procRoot, 101, 100, '2000');
+    const ds = activeScheduledSession();
+
+    await expect(resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 101, procStart: '2000' },
+      findSession: () => ds,
+      resolveIdentity: async () => ({
+        openId: 'ou_scheduler', type: 'user' as const, email: 'scheduler@example.com',
+      }),
+      procRoot,
+      expectedScheduledTurnId: SCHEDULED_TURN_ID,
+    })).resolves.toMatchObject({ ok: true });
+  });
+
+  it('rejects a missing, different, or cleaned-up scheduled turn', async () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    const ds = activeScheduledSession();
+    const request = (expectedScheduledTurnId: string) => resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 100, procStart: '1000' },
+      findSession: () => ds,
+      resolveIdentity: async () => ({
+        openId: 'ou_scheduler', type: 'user' as const, email: 'scheduler@example.com',
+      }),
+      procRoot,
+      expectedScheduledTurnId,
+    });
+
+    await expect(request(
+      'schedule:abcdef12:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+    )).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+
+    ds.scheduledTurnCallers = undefined;
+    await expect(request(SCHEDULED_TURN_ID)).resolves.toEqual({
+      ok: false, error: 'current_actor_unverified',
+    });
+  });
+
+  it('rejects scheduled-turn registry cleanup during identity lookup', async () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    const ds = activeScheduledSession();
+
+    await expect(resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 100, procStart: '1000' },
+      findSession: () => ds,
+      resolveIdentity: async () => {
+        ds.scheduledTurnCallers = undefined;
+        return { openId: 'ou_scheduler', type: 'user' as const, email: 'scheduler@example.com' };
+      },
+      procRoot,
+      expectedScheduledTurnId: SCHEDULED_TURN_ID,
+    })).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+  });
+
+  it('binds an RPC tool descendant to the independently attested engine root', async () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    writeProc(procRoot, 200, 90, '3000');
+    writeProc(procRoot, 201, 200, '3100');
+    const ds = activeSession();
+    ds.localProcessAttestation.enginePid = 200;
+    ds.localProcessAttestation.engineProcStart = '3000';
+    ds.managedTurnOrigin.preexistingProcessIdentities = ['100:1000', '200:3000'];
+    const resolveIdentity = vi.fn(async () => ({
+      openId: 'ou_current', type: 'user' as const, email: 'current@example.com',
+    }));
+
+    await expect(resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 201, procStart: '3100' },
+      findSession: () => ds,
+      resolveIdentity,
+      procRoot,
+    })).resolves.toMatchObject({
+      ok: true,
+      document: { actor: { email: 'current@example.com' } },
+    });
+  });
+
+  it('rejects a peer rooted in another still-active session', async () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 91, 1, '901');
+    writeProc(procRoot, 100, 1, '1000');
+    writeProc(procRoot, 200, 91, '3000');
+    writeProc(procRoot, 201, 200, '3100');
+    const target = activeSession();
+    const other = activeSession();
+    other.session.sessionId = 's2';
+    other.worker = { pid: 91, killed: false };
+    delete other.localProcessAttestation.cliPid;
+    delete other.localProcessAttestation.cliProcStart;
+    other.localProcessAttestation.enginePid = 200;
+    other.localProcessAttestation.engineProcStart = '3000';
+    other.managedTurnOrigin.preexistingProcessIdentities = ['200:3000'];
+    const sessions = new Map([['s1', target], ['s2', other]]);
+    const resolveIdentity = vi.fn();
+
+    await expect(resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 201, procStart: '3100' },
+      findSession: id => sessions.get(id),
+      resolveIdentity,
+      procRoot,
+    })).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+    expect(resolveIdentity).not.toHaveBeenCalled();
+  });
+
+  it('supports the RPC opening window before the viewer CLI PID exists', async () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 200, 90, '3000');
+    writeProc(procRoot, 201, 200, '3100');
+    const ds = activeSession();
+    delete ds.localProcessAttestation.cliPid;
+    delete ds.localProcessAttestation.cliProcStart;
+    ds.localProcessAttestation.enginePid = 200;
+    ds.localProcessAttestation.engineProcStart = '3000';
+    ds.managedTurnOrigin.preexistingProcessIdentities = ['200:3000'];
+
+    await expect(resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 201, procStart: '3100' },
+      findSession: () => ds,
+      resolveIdentity: async () => ({
+        openId: 'ou_current', type: 'user' as const, email: 'current@example.com',
+      }),
+      procRoot,
+    })).resolves.toMatchObject({ ok: true });
+  });
+
+  it('rejects an RPC engine PID whose process identity is stale', async () => {
+    const procRoot = mkdtempSync(join(tmpdir(), 'actor-proc-'));
+    writeProc(procRoot, 90, 1, '900');
+    writeProc(procRoot, 100, 1, '1000');
+    writeProc(procRoot, 200, 90, 'reused');
+    writeProc(procRoot, 201, 200, '3100');
+    const ds = activeSession();
+    ds.localProcessAttestation.enginePid = 200;
+    ds.localProcessAttestation.engineProcStart = 'original';
+    ds.managedTurnOrigin.preexistingProcessIdentities = ['100:1000', '200:original'];
+    const resolveIdentity = vi.fn();
+
+    await expect(resolveDaemonCurrentActor({
+      sessionId: 's1',
+      peer: { pid: 201, procStart: '3100' },
+      findSession: () => ds,
+      resolveIdentity,
+      procRoot,
+    })).resolves.toEqual({ ok: false, error: 'current_actor_unverified' });
+    expect(resolveIdentity).not.toHaveBeenCalled();
   });
 
   it('rejects a same-uid process outside the attested CLI lineage', async () => {

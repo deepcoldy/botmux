@@ -13,7 +13,7 @@ import * as scheduleStore from '../services/schedule-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
-import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
+import { forkWorker, sendWorkerInput, promoteQueuedActivationTail, forkAdoptWorker, adoptSandboxBlocked, killStalePids, sweepDeadPidMarkers, getCurrentCliVersion, restoreUsageLimitRuntimeState, setActiveSessionSafe, setActiveSessionIfActive, isDisposableCommandScratch, isRelayableRealSession, closeSession, getActiveSessionsRegistry, suspendWorker, withActiveSessionKeyLock, isSessionTransferring, deferUntilSessionTransferSettled, ensureOrdinaryTurnRecoveryAttached, ensureReadonlyTaskContinuationAttached, markReadonlyTaskContinuationInterruptedByRestart } from './worker-pool.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
@@ -2229,6 +2229,15 @@ export async function restoreActiveSessions(
     // that close failed.
     .filter(s => !quarantinedSessionIds.has(s.sessionId))
     .sort((a, b) => restorePriority(b) - restorePriority(a));
+  // Snapshot the exact leases inherited from the previous daemon before any
+  // restore await lets live ingress mutate a registered session. A lease born
+  // in this boot must never be mislabeled as interrupted by the old process.
+  const interruptedReadonlyContinuationLeaseIds = new Map(active.flatMap(session => {
+    const continuation = session.readonlyTaskContinuation;
+    return continuation?.status === 'active' && continuation.startMode !== 'explicit'
+      ? [[session.sessionId, continuation.leaseId] as const]
+      : [];
+  }));
 
   // LOAD-BEARING ORDER: validate and contain the narrow XPI shared-cwd state
   // before stale-pid sweeping, backend probes, registration, card recovery, or
@@ -3024,7 +3033,11 @@ export async function restoreActiveSessions(
   for (const ds of restoredByThisInvocation) {
     if (!stillOwnsRestoreRegistration(ds)) continue;
     ensureOrdinaryTurnRecoveryAttached(ds);
-    ensureReadonlyTaskContinuationAttached(ds);
+    const restoredLeaseId = interruptedReadonlyContinuationLeaseIds.get(ds.session.sessionId);
+    if (!restoredLeaseId
+      || !markReadonlyTaskContinuationInterruptedByRestart(ds, restoredLeaseId)) {
+      ensureReadonlyTaskContinuationAttached(ds);
+    }
   }
 
   // Persistent backends: auto-fork workers for sessions whose backing session
@@ -3480,6 +3493,11 @@ export async function resumeSession(
   const reactivated = sessionStore.reactivateClosedSession(sessionId);
   if (!reactivated.ok) return reactivated;
   session = reactivated.session;
+  // A resumed closed session starts a new terminal-access lifecycle. Rotate
+  // the card epoch before registration so links from the previous lifecycle
+  // remain revoked even though the logical sessionId is reused.
+  session.terminalCardEpoch = randomUUID();
+  sessionStore.updateSession(session);
 
   // Same reason as in restoreActiveSessions: freeze the mojo control plane BEFORE
   // this row is registered, so it can never be woken or cancelled while still
@@ -4123,6 +4141,14 @@ export async function executeScheduledTask(
     const now = Date.now();
     session.larkAppId = larkAppId;
     session.scope = runtimeScope;
+    if (scheduledTrustedCaller) {
+      // A fresh scheduled session is owned by the authenticated task creator.
+      // Persist both ids so an in-turn `botmux schedule add` can create a child
+      // task with the same tenant-stable identity instead of degrading to an
+      // ownerOpenId-only legacy task.
+      session.ownerOpenId = scheduledTrustedCaller.requestUserOpenId;
+      session.ownerUnionId = scheduledTrustedCaller.requestUserUnionId;
+    }
     if (deferredFreshTopic) {
       session.deferredScheduleRun = {
         taskId: task.id,

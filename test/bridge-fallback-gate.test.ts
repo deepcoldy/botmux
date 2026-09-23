@@ -361,6 +361,117 @@ describe('shouldSuppressBridgeEmit', () => {
     )).toBe(true);
   });
 
+  it('non-adopt: a non-unified --response-kind final marker suppresses a differing-length fallback (CN/EN double-post)', () => {
+    // The plain (non unified-reply) `botmux send --response-kind final` path
+    // writes only responseKind='final' (replyCardResponseKind is absent). The
+    // turn's answer was already delivered (e.g. Chinese); the transcription
+    // fallback carries a different-length summary (e.g. English). The length
+    // heuristic alone judged it uncovered and re-posted; the final marker now
+    // suppresses it directly.
+    const delivered = '这是已经发到飞书的最终答案正文。';
+    const fallback = 'This is the English final summary that the terminal transcription '
+      + 'fallback would post after the Chinese answer already went out through an '
+      + 'explicit final send, and it is materially longer than what was delivered.';
+    expect(normalise(delivered).length).not.toBe(normalise(fallback).length);
+    const marker: BridgeSendMarker = {
+      sentAtMs: 200,
+      responseKind: 'final',
+      contentLength: normalise(delivered).length,
+    };
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: fallback },
+      500,
+      [marker],
+      false,
+    )).toBe(true);
+  });
+
+  it('non-adopt: a progress / kind-less marker still defers to the length heuristic', () => {
+    const shortSend = 'Working on it.';
+    const longFinal = 'Here is the complete, substantive answer that is materially '
+      + 'longer than the short progress note I sent earlier, with real content '
+      + 'that clearly exceeds the material-longer threshold by a wide margin here.';
+    // Explicit progress kind: not a final delivery → no kind-based suppression.
+    const progressMarker: BridgeSendMarker = {
+      sentAtMs: 200,
+      responseKind: 'progress',
+      contentLength: normalise(shortSend).length,
+    };
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: longFinal },
+      500,
+      [progressMarker],
+      false,
+    )).toBe(false);
+    // Legacy marker with no responseKind at all behaves the same (unchanged).
+    const legacyMarker: BridgeSendMarker = {
+      sentAtMs: 200,
+      contentLength: normalise(shortSend).length,
+    };
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: longFinal },
+      500,
+      [legacyMarker],
+      false,
+    )).toBe(false);
+  });
+
+  it('non-adopt: managed-card final suppresses; managed-card progress/auxiliary does not', () => {
+    const fallback = 'A materially different and longer English summary text that the '
+      + 'terminal transcription fallback would otherwise double post onto the thread today.';
+    const finalCard: BridgeSendMarker = {
+      sentAtMs: 200,
+      responseKind: 'final',
+      replyCardResponseKind: 'final',
+      contentLength: 10,
+    };
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: fallback },
+      500,
+      [finalCard],
+      false,
+    )).toBe(true);
+    const progressCard: BridgeSendMarker = {
+      sentAtMs: 200,
+      responseKind: 'progress',
+      replyCardResponseKind: 'progress',
+      contentLength: 10,
+    };
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: fallback },
+      500,
+      [progressCard],
+      false,
+    )).toBe(false);
+  });
+
+  it('non-adopt: a final marker outside the turn window does not suppress by kind', () => {
+    const marker: BridgeSendMarker = { sentAtMs: 600, responseKind: 'final', contentLength: 5 };
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: 'some longer fallback text emitted here' },
+      500,
+      [marker],
+      false,
+    )).toBe(false);
+  });
+
+  it('transcript delivery: a non-unified final marker suppresses the fallback too', () => {
+    const delivered = '已经投递的最终答案。';
+    const fallback = 'A different-length English final summary under transcript delivery.';
+    const marker: BridgeSendMarker = {
+      sentAtMs: 200,
+      responseKind: 'final',
+      contentLength: normalise(delivered).length,
+    };
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: fallback },
+      500,
+      [marker],
+      false,
+      'transcript',
+    )).toBe(true);
+  });
+
   it('non-adopt: exact nothing-to-send sentinel suppresses without a send marker', () => {
     expect(shouldSuppressBridgeEmit(
       { ...turn(100), finalText: `  ${BRIDGE_NOTHING_TO_SEND_SENTINEL}\n` },

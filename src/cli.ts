@@ -30,6 +30,7 @@ import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, symlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync, chmodSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
 import { atomicWriteFileSync } from './utils/atomic-write.js';
+import { readAllowedUsersResolveCache } from './utils/allowed-users-cache.js';
 import { join, dirname, basename, resolve } from 'node:path';
 import { homedir, userInfo } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -43,10 +44,14 @@ import {
   resolveSessionContext,
 } from './core/session-marker.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
+import {
+  CurrentTurnProvenanceError,
+  resolveCurrentTurnProvenance,
+} from './core/current-turn-provenance.js';
 import { ENTRY_SUBCOMMANDS, entryForSubcommand, resolveEntrySpawn } from './core/self-spawn.js';
 import { isHttpVirtualSession } from './core/types.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, buildProjectDispatchSyncAction, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipient, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
+import { acceptedDispatchBotAppIds, activeConversationBotOpenIds, buildDispatchCompletionBrief, buildProjectDispatchSyncAction, parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, foldableChatSessionAppIds, offTopicSubBotTopic, resolveReportPlacement, resolveReportRecipientForSession, resolveSendTarget, threadRootForReachability } from './core/dispatch.js';
 import {
   persistDispatchLifecycle as persistDispatchLifecycleRecord,
   type DispatchAcceptanceState,
@@ -3739,6 +3744,7 @@ interface SessionData {
   webPort?: number;
   larkAppId?: string;
   ownerOpenId?: string;
+  ownerUnionId?: string;
   creatorOpenId?: string;
   lastCallerOpenId?: string;
   /** Chat-scope quote chain — see Session.quoteTargetId in types.ts. */
@@ -5458,7 +5464,7 @@ async function postSessionCliIpc(
 async function cmdContinuation(argv: string[]): Promise<void> {
   const action = argv[0] ?? '';
   if (!['start', 'await-user', 'cancel'].includes(action)) {
-    console.error('用法: botmux continuation start --readonly [--ttl-minutes N] [--max-continuations N] | await-user | cancel');
+    console.error('用法: botmux continuation start [--ttl-minutes N] [--max-continuations N] | await-user | cancel');
     process.exitCode = 2;
     return;
   }
@@ -5466,11 +5472,6 @@ async function cmdContinuation(argv: string[]): Promise<void> {
   if (!ctx?.sessionId || !ctx.turnId) {
     console.error('✗ continuation 只能由当前 BotMux 会话的活动轮次调用');
     process.exitCode = 1;
-    return;
-  }
-  if (action === 'start' && !argv.includes('--readonly')) {
-    console.error('✗ 第一阶段只支持显式 --readonly 的只读长程任务');
-    process.exitCode = 2;
     return;
   }
   const ttlRaw = argValue(argv, '--ttl-minutes');
@@ -5500,7 +5501,7 @@ async function cmdContinuation(argv: string[]): Promise<void> {
     action,
     originTurnId: ctx.turnId,
     ...(ctx.dispatchAttempt !== undefined ? { originDispatchAttempt: ctx.dispatchAttempt } : {}),
-    ...(action === 'start' ? { readonly: true } : {}),
+    ...(action === 'start' && argv.includes('--readonly') ? { readonly: true } : {}),
     ...(ttlMinutes !== undefined ? { ttlMs: Math.round(ttlMinutes * 60_000) } : {}),
     ...(maxContinuations !== undefined ? { maxContinuations } : {}),
   });
@@ -6609,9 +6610,10 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                    脱离进程树）；换代/关闭后需重新注册，远端 sandbox 后端不支持
   tabs list|add|update|remove|sort
                    查看和管理当前飞书群标签页；add 按 URL 幂等，适合后台自动化调用
-  continuation start --readonly
-                   （实验性）为当前 TraeX 普通会话显式开启一次只读长程任务续跑；
-                   可加 --ttl-minutes N / --max-continuations N，另有 await-user / cancel
+  continuation start
+                   （实验性）功能开关启用时，TraeX 普通用户轮默认自动开启授权继承续跑；
+                   start 可在取消后重新开启，并设置 --ttl-minutes N / --max-continuations N，
+                   另有 await-user / cancel
   autostart enable     注册开机自启（macOS launchd / Linux user systemd / Windows Task Scheduler，无需 sudo）
   autostart disable    注销开机自启
   autostart status     查看自启状态
@@ -6774,6 +6776,7 @@ function findAncestorSessionId(): string | null {
 
 interface CurrentSession {
   sessionId: string;
+  turnId?: string;
   chatId: string;
   rootMessageId: string;
   workingDir?: string;
@@ -6781,6 +6784,7 @@ interface CurrentSession {
   chatType?: 'group' | 'p2p';
   scope?: 'thread' | 'chat';
   ownerOpenId?: string;
+  ownerUnionId?: string;
 }
 
 /** Detect current session info from ancestor marker + session files. */
@@ -6799,6 +6803,161 @@ function detectCurrentSession(): CurrentSession | null {
     chatType: s.chatType,
     scope: s.scope,
     ownerOpenId: s.ownerOpenId,
+    ownerUnionId: s.ownerUnionId,
+  };
+}
+
+/**
+ * Resolve the session whose live CLI process is an authenticated ancestor.
+ *
+ * Routing commands may deliberately fall back to BOTMUX_SESSION_ID after a
+ * detached/background launch, but task creator identity is authority: it must
+ * never come from an environment-selected session row. Keep this lookup
+ * marker-only so changing BOTMUX_SESSION_ID cannot borrow another session's
+ * open_id/union_id.
+ */
+async function detectAuthenticatedCurrentSession(): Promise<CurrentSession | null> {
+  const dataDir = resolveDataDir();
+  let provenance: {
+    sessionId: string;
+    turnId: string;
+    callerOpenId: string;
+    larkAppId: string;
+  } | null = null;
+  try {
+    provenance = resolveCurrentTurnProvenance({
+      dataDir,
+      envSessionId: process.env.BOTMUX_SESSION_ID,
+    });
+  } catch (hostError) {
+    // A one-shot is marked completed as soon as its model turn is dispatched,
+    // before that turn has finished. Only in that exact state may the daemon's
+    // live process/turn proof bridge the short authorization window. Historical
+    // turns, manual pauses and legacy disabled rows remain rejected.
+    if (hostError instanceof CurrentTurnProvenanceError
+      && hostError.scheduledTurnAuthError === 'task_disabled') {
+      const marker = findLiveAncestorSessionContext(
+        dataDir, process.ppid, process.env.BOTMUX_SESSION_ID,
+      );
+      const scheduledSession = marker?.sessionId
+        ? loadSessions().get(marker.sessionId)
+        : undefined;
+      if (marker?.turnId && scheduledSession?.larkAppId) {
+        const daemonPort = (() => {
+          try {
+            return findDaemon(scheduledSession.larkAppId)?.ipcPort
+              ?? resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT);
+          } catch {
+            return resolveDaemonIpcPort(undefined, process.env.BOTMUX_DAEMON_IPC_PORT);
+          }
+        })();
+        if (daemonPort) {
+          const { resolveCurrentActor } = await import('./cli/current-actor.js');
+          await resolveCurrentActor({
+            ipcPort: daemonPort,
+            sessionId: marker.sessionId,
+            expectedScheduledTurnId: marker.turnId,
+          });
+          provenance = resolveCurrentTurnProvenance({
+            dataDir,
+            envSessionId: process.env.BOTMUX_SESSION_ID,
+            isScheduledTurnLive: turnId => turnId === marker.turnId,
+          });
+        }
+      }
+      if (!provenance) throw hostError;
+    } else {
+      // Linux bwrap deliberately hides the host PID namespace and shared marker
+      // directory. If this exact turn has a rotating managed-origin capability,
+      // exchange it for a daemon-written host proof instead of treating the
+      // absence of host ancestors as a detached call. A sandbox fixture/legacy
+      // session without that capability fails closed; a claimed BotMux session
+      // must never degrade to a standalone OWNERLESS task.
+      const isolated = readWorkflowSessionRelayContext({ env: process.env, dataDir });
+      if (!isolated?.originChannelId) throw hostError;
+      const attested = await attestManagedOrigin({
+        context: {
+          sessionId: isolated.sessionId,
+          channelId: isolated.originChannelId,
+          capability: isolated.capability,
+          dataDir,
+          ...(isolated.larkAppId ? { larkAppId: isolated.larkAppId } : {}),
+          ...(isolated.ipcPortFallback !== undefined
+            ? { ipcPortFallback: isolated.ipcPortFallback }
+            : {}),
+        },
+        resolveIpcPort: (appId) => {
+          try { return appId ? findDaemon(appId)?.ipcPort : undefined; }
+          catch { return undefined; }
+        },
+      });
+      if (!attested.callerOpenId || !attested.larkAppId) throw hostError;
+      provenance = {
+        sessionId: attested.sessionId,
+        turnId: attested.turnId,
+        callerOpenId: attested.callerOpenId,
+        larkAppId: attested.larkAppId,
+      };
+    }
+  }
+  if (!provenance) return null;
+  const s = loadSessions().get(provenance.sessionId);
+  if (!s || s.status !== 'active') return null;
+  if (provenance.larkAppId !== s.larkAppId) return null;
+  // The current-turn provenance authenticates the human who actually invoked
+  // this command. A persisted session owner is useful when present, but older
+  // bot/schedule-created sessions can legitimately be ownerless. In that case
+  // bind the task to the authenticated caller only when the bot's live
+  // resolved allowlist still admits them. Never copy another session owner's
+  // union_id onto the caller.
+  let ownerUnionId: string | undefined;
+  if (s.ownerOpenId) {
+    if (provenance.callerOpenId !== s.ownerOpenId) {
+      throw new Error('current turn caller does not match the session owner');
+    }
+    ownerUnionId = s.ownerUnionId;
+  } else {
+    // `botmux schedule ...` runs in a short-lived CLI process whose in-memory
+    // daemon registry is intentionally not initialized. Reconstruct the same
+    // fail-closed allowlist view from durable config + its last-known-good
+    // raw-entry resolution cache instead of calling getBot().
+    const configuredBot = loadBotsJson().find(bot => bot?.larkAppId === s.larkAppId);
+    if (!configuredBot) {
+      throw new Error(`cannot load bot config for ${s.larkAppId}`);
+    }
+    const allowedRaw: string[] = Array.isArray(configuredBot.allowedUsers)
+      ? configuredBot.allowedUsers.filter((entry: unknown): entry is string => typeof entry === 'string')
+      : [];
+    const cache = readAllowedUsersResolveCache(dataDir, s.larkAppId);
+    const resolvedAllowedUsers = new Set(
+      allowedRaw
+        .map((entry: string) => entry.startsWith('ou_') ? entry : cache[entry])
+        .filter((entry): entry is string => typeof entry === 'string' && entry.startsWith('ou_')),
+    );
+    if (!resolvedAllowedUsers.has(provenance.callerOpenId)) {
+      throw new Error('current turn caller is not an allowed bot operator');
+    }
+    const matches = [...new Set(
+      allowedRaw
+        .filter((entry: string) => entry.startsWith('on_'))
+        .filter((entry: string) => cache[entry] === provenance.callerOpenId),
+    )];
+    if (matches.length !== 1) {
+      throw new Error('cannot resolve the current turn caller union_id');
+    }
+    ownerUnionId = matches[0];
+  }
+  return {
+    sessionId: s.sessionId,
+    turnId: provenance.turnId,
+    chatId: s.chatId,
+    rootMessageId: s.rootMessageId,
+    workingDir: s.workingDir,
+    larkAppId: s.larkAppId,
+    chatType: s.chatType,
+    scope: s.scope,
+    ownerOpenId: provenance.callerOpenId,
+    ownerUnionId,
   };
 }
 
@@ -7292,7 +7451,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   if (sub === 'add') {
     const [rawSchedule, ...promptParts] = positionals(rest, ['--new-topic', '--top-level', '--topic', '--silent', '--follow-active']);
     if (!rawSchedule) {
-      console.error('用法: botmux schedule add <schedule> <prompt> [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--follow-active] [--lark-app-id APP] [--workdir DIR] [--silent] [--model ID] [--reasoning-effort LEVEL]');
+      console.error('用法: botmux schedule add <schedule> <prompt> [--id 8位小写十六进制] [--name NAME] [--chat-id CHAT] [--top-level | --topic --root-msg-id ROOT | --new-topic [--topic-title TITLE]] [--follow-active] [--lark-app-id APP] [--workdir DIR] [--silent] [--model ID] [--reasoning-effort LEVEL]');
       process.exit(1);
     }
     // prompt may come from positional or --prompt flag
@@ -7303,6 +7462,16 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     }
 
     const cur = detectCurrentSession();
+    let authenticatedCur = await detectAuthenticatedCurrentSession();
+    const explicitTaskId = argValue(rest, '--id');
+    if (rest.includes('--id') && !explicitTaskId) {
+      console.error('--id 需要一个 8 位小写十六进制任务 ID。');
+      process.exit(1);
+    }
+    if (explicitTaskId !== undefined && !/^[0-9a-f]{8}$/.test(explicitTaskId)) {
+      console.error('--id 只接受 8 位小写十六进制任务 ID。');
+      process.exit(1);
+    }
     const chatId = argValue(rest, '--chat-id') ?? cur?.chatId;
     const explicitRootMessageId = argValue(rest, '--root-msg-id');
     const rootMessageId = explicitRootMessageId
@@ -7399,7 +7568,24 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
 
     let task;
     try {
+      // Identity-bearing task fields are a write authority. Re-attest at the
+      // effect boundary so a turn rotation cannot carry an earlier proof into
+      // a later schedule write. If the first lookup was ownerless, do not
+      // opportunistically gain an identity at this later point.
+      if (authenticatedCur) {
+        const fresh = await detectAuthenticatedCurrentSession();
+        if (!fresh
+          || fresh.sessionId !== authenticatedCur.sessionId
+          || fresh.turnId !== authenticatedCur.turnId
+          || fresh.larkAppId !== authenticatedCur.larkAppId
+          || fresh.ownerOpenId !== authenticatedCur.ownerOpenId
+          || fresh.ownerUnionId !== authenticatedCur.ownerUnionId) {
+          throw new Error('schedule creator provenance changed before write');
+        }
+        authenticatedCur = fresh;
+      }
       task = scheduler.addTask({
+        id: explicitTaskId,
         name,
         schedule: rawSchedule,
         parsed,
@@ -7417,7 +7603,17 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         // Stamp the creator (sandboxed session owner) so the task's scheduled
         // turns can authenticate workflow commands as them. The daemon
         // re-checks the owner is still allowed at every run mutation.
-        ownerOpenId: process.env.BOTMUX_OWNER_OPEN_ID ?? cur?.ownerOpenId,
+        // Creator identity is authority-bearing. It comes only from the
+        // procStart-bound live ancestor marker, never BOTMUX_SESSION_ID or
+        // BOTMUX_OWNER_OPEN_ID environment fallbacks. The app equality guard
+        // prevents an authenticated session from lending app-scoped open_id to
+        // an explicitly selected different bot store.
+        ownerOpenId: authenticatedCur && authenticatedCur.larkAppId === larkAppId
+          ? authenticatedCur.ownerOpenId
+          : undefined,
+        ownerUnionId: authenticatedCur && authenticatedCur.larkAppId === larkAppId
+          ? authenticatedCur.ownerUnionId
+          : undefined,
         chatType: cur?.chatType === 'p2p' ? 'p2p' : 'topic_group',
         scope,
         executionPosition,
@@ -7511,7 +7707,13 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         let task = scheduleStore.getTask(id);
         if (!task && retargetIfElsewhere()) task = scheduleStore.getTask(id);
         if (!task) { console.error(`未找到任务 ${id}`); process.exit(1); }
-        scheduleStore.updateTask(id, { nextRunAt: new Date().toISOString() });
+        const requested = scheduleStore.requestRunNow(id);
+        if (!requested.ok) {
+          console.error(requested.error === 'already_running'
+            ? `任务 ${id} 正在运行，未重复触发`
+            : `未找到任务 ${id}`);
+          process.exit(1);
+        }
         console.log(`已标记任务 ${id} 下次 tick 立即执行（< 30s）`);
       }
       break;
@@ -12035,6 +12237,7 @@ async function cmdReport(rest: string[]): Promise<void> {
 
 用法:
   botmux report --content-file <path>
+  botmux report --recipient-root <om_source> --content-file <path>
   botmux report --into <om_root> --content-file <path>
   botmux report --top-level "子项目X 完成，产出在 …"
   botmux report --dispatch-root <om_seed> "子项目X 完成，产出在 …"
@@ -12043,7 +12246,10 @@ async function cmdReport(rest: string[]): Promise<void> {
 说明:
   1) 平台 Issue 领取群：本会话绑定了平台 issue 时，把 issue 推到「待验收」(in_review)。
      kickoff 里「完成后执行 botmux report」指的就是这条路径。
-  2) 交接 / 协作回报：接收者与消息落点独立解析——接收者仍是原 Reviewer / orchestrator；
+  2) 交接 / 协作回报：接收者与消息落点独立解析，默认按当前 creator → owner → quote sender 回退。
+     --recipient-root 从同应用、同群、严格更早且唯一的 active chat 根会话解析已知 peer 收件人；
+     当前会话须为 active thread（缺省 scope 按 thread），当前 creator 已是 peer 时保留它。
+     显式来源无效时在投递前失败，不回退；仅影响收件人，不改变落点或 dispatch relay。
      消息默认依次采用显式 --into / --top-level、dispatch 注册表、legacy dispatch 兼容回退、
      当前轮次位置，最后才回退到会话默认位置。
      当前轮次在群顶层就留在群顶层，在话题里就留在原话题；过期轮次的话题目标会被忽略。
@@ -12058,6 +12264,7 @@ async function cmdReport(rest: string[]): Promise<void> {
   --into <root_id>       显式发进指定话题（覆盖默认落点）
   --top-level            显式发到当前群顶层（覆盖默认落点）
   --dispatch-root <id>   dispatch 注入的精确 seed；优先且不命中时 fail closed
+  --recipient-root <id>  仅指定历史收件人来源根消息；校验失败不降级，不代替 --dispatch-root
   --status <状态>        同步子任务状态：pending|in_progress|blocked|completed|failed
   --progress <0-100>     同步子任务完成百分比
   --remaining <text>     同步该子任务待完成内容
@@ -12091,6 +12298,19 @@ async function cmdReport(rest: string[]): Promise<void> {
   const explicitDispatchRoot = argValue(rest, '--dispatch-root')?.trim();
   if (explicitDispatchRoot && !/^om_[A-Za-z0-9_-]{1,128}$/.test(explicitDispatchRoot)) {
     console.error('--dispatch-root 必须是有效的 om_ 消息 id。');
+    process.exit(1);
+  }
+  if (rest.filter(arg => arg === '--recipient-root' || arg.startsWith('--recipient-root=')).length > 1) {
+    console.error('--recipient-root 只能指定一次。');
+    process.exit(1);
+  }
+  if (flagPresentButValueMissing(rest, '--recipient-root')) {
+    console.error('--recipient-root 需要一个 om_ 消息 id。');
+    process.exit(1);
+  }
+  const recipientRoot = argValue(rest, '--recipient-root')?.trim();
+  if (recipientRoot !== undefined && !/^om_[A-Za-z0-9_-]{1,128}$/.test(recipientRoot)) {
+    console.error('--recipient-root 必须是有效的 om_ 消息 id。');
     process.exit(1);
   }
   const projectStatusRaw = argValue(rest, '--status')?.trim();
@@ -12148,6 +12368,22 @@ async function cmdReport(rest: string[]): Promise<void> {
   const s = sessions.get(sid);
   if (!s) { console.error(`未找到 session ${sid}`); process.exit(1); }
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
+
+  const { readPeerCrossRef } = await import('./services/peer-cross-ref-store.js');
+  let recipientResolution: ReturnType<typeof resolveReportRecipientForSession>;
+  try {
+    recipientResolution = resolveReportRecipientForSession({
+      session: s,
+      sessions: [...sessions.values()],
+      knownPeerBotOpenIds: recipientRoot === undefined
+        ? new Set<string>()
+        : knownBotOpenIdsFromCrossRef(readPeerCrossRef(resolveDataDir(), s.larkAppId)),
+      recipientRoot,
+    });
+  } catch (err: any) {
+    console.error(err.message);
+    process.exit(1);
+  }
 
   // ── Issue Board 交付：绑定了平台 issue 的领取群 → 推 in_review（待验收）────────
   // 优先于 dispatch 路径：领取群没有 creatorOpenId，走 dispatch 会硬失败。
@@ -12234,14 +12470,7 @@ async function cmdReport(rest: string[]): Promise<void> {
     }
   }
 
-  // Recipient and visible placement are independent. creatorOpenId remains the
-  // stable Reviewer/orchestrator identity; current-turn routing controls where
-  // an ordinary report appears.
-  const reportRecipient = resolveReportRecipient({
-    creatorOpenId: s.creatorOpenId,
-    ownerOpenId: s.ownerOpenId,
-    quoteTargetSenderOpenId: s.quoteTargetSenderOpenId,
-  });
+  const reportRecipient = recipientResolution.openId;
   const turnReplyTarget = pickTurnReplyTarget(s, currentTurnId);
   const validatedTurnReplyTarget = currentTurnId
     && turnReplyTarget?.turnId === currentTurnId
@@ -12366,7 +12595,7 @@ async function cmdReport(rest: string[]): Promise<void> {
         ? placement.target.chatId
         : placement.target.rootMessageId,
       orchestrator: reportRecipient,
-      recipient: { kind: 'mention', openId: reportRecipient },
+      recipient: { kind: 'mention', ...recipientResolution },
       viaRegistry: false,
       placementSource: placement.source,
       messageTarget,
@@ -13875,21 +14104,8 @@ async function cmdNativeSubagentRuntimeHook(): Promise<void> {
       });
       return;
     }
-    const data = JSON.parse(raw) as { ok?: unknown; invalidPolicy?: unknown; deny?: unknown; reason?: unknown; policy?: unknown };
+    const data = JSON.parse(raw) as { ok?: unknown; invalidPolicy?: unknown; policy?: unknown };
     if (data.ok !== true) return;
-    if (data.deny === true) {
-      nativeSubagentDiagnostic('daemon denied spawn for read-only continuation');
-      await writeNativeSubagentHookDirective({
-        hookSpecificOutput: {
-          hookEventName: 'PreToolUse',
-          permissionDecision: 'deny',
-          permissionDecisionReason: typeof data.reason === 'string'
-            ? data.reason
-            : 'Read-only continuation forbids subagents',
-        },
-      });
-      return;
-    }
     if (data.invalidPolicy === true) {
       nativeSubagentDiagnostic('daemon rejected invalid stored policy; allowing spawn');
       return;

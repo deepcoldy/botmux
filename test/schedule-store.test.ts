@@ -320,6 +320,16 @@ describe('schedule-store', () => {
       updateTask(task.id, { enabled: false });
       const updated = getTask(task.id);
       expect(updated!.enabled).toBe(false);
+      expect(updated!.disabledReason).toBe('manual');
+    });
+
+    it('clears the disable reason when a task is re-enabled', async () => {
+      const { createTask, updateTask, getTask } = await freshImport();
+      const task = createTask(TASK_PARAMS);
+      updateTask(task.id, { enabled: false });
+      updateTask(task.id, { enabled: true });
+      expect(getTask(task.id)).toMatchObject({ enabled: true });
+      expect(getTask(task.id)?.disabledReason).toBeUndefined();
     });
 
     it('should update lastRunAt', async () => {
@@ -474,7 +484,33 @@ describe('schedule-store', () => {
       const reloaded = store2.getTask(task.id);
       expect(reloaded).toBeDefined();
       expect(reloaded!.enabled).toBe(false);
+      expect(reloaded!.disabledReason).toBe('manual');
       expect(reloaded!.lastRunAt).toBe('2026-01-01T00:00:00.000Z');
+    });
+
+    it('persists a valid disable reason and drops unknown legacy values', async () => {
+      const store1 = await freshImport();
+      const task = store1.createTask(TASK_PARAMS);
+      store1.updateTask(task.id, { enabled: false, disabledReason: 'once_completed' });
+      expect((await freshImport()).getTask(task.id)?.disabledReason).toBe('once_completed');
+
+      const raw = JSON.parse(readFileSync(storeFp(), 'utf-8'));
+      raw[task.id].disabledReason = 'unknown';
+      writeFileSync(storeFp(), JSON.stringify(raw));
+      expect((await freshImport()).getTask(task.id)?.disabledReason).toBeUndefined();
+    });
+
+    it('marks one-shot completion separately from an operator pause', async () => {
+      const store = await freshImport();
+      const task = store.createTask({
+        ...TASK_PARAMS,
+        schedule: '2026-09-20T03:00:00.000Z',
+        parsed: { kind: 'once', runAt: '2026-09-20T03:00:00.000Z', display: 'once' },
+      });
+      store.markRun(task.id, true);
+      expect(store.getTask(task.id)).toMatchObject({
+        enabled: false, disabledReason: 'once_completed', lastStatus: 'ok',
+      });
     });
 
     // 每次 reload 都按 normalizeTask 的字段白名单重建任务对象，白名单漏一个字段就

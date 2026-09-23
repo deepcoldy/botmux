@@ -775,6 +775,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     summaryMemory: body.summaryMemory,
     summaryMemoryPath: body.summaryMemoryPath,
     botToBotSameDir: body.botToBotSameDir,
+    autoInviteOwnerOnGroupAdd: body.autoInviteOwnerOnGroupAdd,
     autoStartOnGroupJoin: body.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: body.autoStartOnGroupJoinPrompt,
     autoStartOnGroupJoinSeed: body.autoStartOnGroupJoinSeed,
@@ -3462,6 +3463,7 @@ function workingDirState(bot: BotDefaultsRow): { mode: 'off' | 'default' | 'onca
 export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patch: CardPrefPatch): Promise<JsonResponse> }) {
   const tr = useT();
   const { bot, putCardPref } = props;
+  const [inviteOwner, setInviteOwner] = useState(bot.autoInviteOwnerOnGroupAdd !== false);
   const [onJoin, setOnJoin] = useState(bot.autoStartOnGroupJoin === true);
   const [onTopic, setOnTopic] = useState(bot.autoStartOnNewTopic === true);
   const [prompt, setPrompt] = useState(typeof bot.autoStartOnGroupJoinPrompt === 'string' ? bot.autoStartOnGroupJoinPrompt : '');
@@ -3475,6 +3477,7 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
   const [busy, setBusy] = useState<string | null>(null);
 
   useEffect(() => {
+    setInviteOwner(bot.autoInviteOwnerOnGroupAdd !== false);
     setOnJoin(bot.autoStartOnGroupJoin === true);
     setOnTopic(bot.autoStartOnNewTopic === true);
     setPrompt(typeof bot.autoStartOnGroupJoinPrompt === 'string' ? bot.autoStartOnGroupJoinPrompt : '');
@@ -3483,6 +3486,7 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
     setJoinCmd(typeof bot.groupJoinCommand === 'string' ? bot.groupJoinCommand : '');
   }, [
     bot.larkAppId,
+    bot.autoInviteOwnerOnGroupAdd,
     bot.autoStartOnGroupJoin,
     bot.autoStartOnGroupJoinPrompt,
     bot.autoStartOnGroupJoinSeed,
@@ -3509,6 +3513,17 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
   return (
     <div className="bd-subsection">
       <h4 className="bd-subsection-title">{tr('botDefaults.sectionAutoStart')}</h4>
+      <ToggleRow
+        checked={inviteOwner}
+        disabled={busy === 'inviteOwner'}
+        dataAction="toggle-invite-owner"
+        title={tr('botDefaults.autoInviteOwnerOnGroupAdd')}
+        help={tr('botDefaults.autoInviteOwnerOnGroupAddHelp')}
+        onChange={checked => {
+          setInviteOwner(checked);
+          void savePatch({ autoInviteOwnerOnGroupAdd: checked }, 'inviteOwner');
+        }}
+      />
       <ToggleRow
         checked={onJoin}
         disabled={busy === 'join'}
@@ -6532,12 +6547,15 @@ function mentionMode(bot: BotDefaultsRow): string {
 function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const initial = typeof props.bot.maxLiveWorkers === 'number' ? props.bot.maxLiveWorkers : null;
+  const initialTtl = typeof props.bot.idleSuspendMinutes === 'number' ? props.bot.idleSuspendMinutes : null;
   const logical = Number.isFinite(props.bot.logicalSessionCount) ? Number(props.bot.logicalSessionCount) : 0;
   const resident = Number.isFinite(props.bot.residentSessionCount) ? Number(props.bot.residentSessionCount) : 0;
   const dormant = Number.isFinite(props.bot.dormantSessionCount) ? Number(props.bot.dormantSessionCount) : 0;
   const [cap, setCap] = useState<number | null>(initial);
   const effectiveCap = cap ?? 30;
   const [input, setInput] = useState(initial == null ? '' : String(initial));
+  const [ttl, setTtl] = useState<number | null>(initialTtl);
+  const [ttlInput, setTtlInput] = useState(initialTtl == null ? '' : String(initialTtl));
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
 
@@ -6546,6 +6564,12 @@ function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
     setCap(next);
     setInput(next == null ? '' : String(next));
   }, [props.bot.maxLiveWorkers]);
+
+  useEffect(() => {
+    const next = typeof props.bot.idleSuspendMinutes === 'number' ? props.bot.idleSuspendMinutes : null;
+    setTtl(next);
+    setTtlInput(next == null ? '' : String(next));
+  }, [props.bot.idleSuspendMinutes]);
 
   async function save(value: number | null): Promise<void> {
     setStatus(null);
@@ -6568,6 +6592,27 @@ function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
     }
   }
 
+  async function saveTtl(value: number | null): Promise<void> {
+    setStatus(null);
+    setBusy(true);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/idle-suspend-minutes`, { idleSuspendMinutes: value });
+      if (res.ok && res.body.ok) {
+        const next = typeof res.body.idleSuspendMinutes === 'number' ? res.body.idleSuspendMinutes : null;
+        setTtl(next);
+        setTtlInput(next == null ? '' : String(next));
+        props.patchBot(props.bot.larkAppId, { idleSuspendMinutes: next });
+        setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
+      } else {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+      }
+    } catch (e: any) {
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
   function saveInput(): void {
     const parsed = positiveIntegerOrNull(input);
     if (parsed === 'invalid') {
@@ -6575,6 +6620,15 @@ function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
       return;
     }
     void save(parsed);
+  }
+
+  function saveTtlInput(): void {
+    const parsed = positiveIntegerOrNull(ttlInput);
+    if (parsed === 'invalid') {
+      setStatus({ text: `✗ ${tr('botDefaults.idleSuspendMinutesInvalid')}` });
+      return;
+    }
+    void saveTtl(parsed);
   }
 
   return (
@@ -6593,9 +6647,20 @@ function SessionCapSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
           logical,
         })}</small>
       </div>
+      <div className="bd-row bd-quota">
+        <label>
+          <FieldTitle help={tr('botDefaults.idleSuspendMinutesHelp')}>{tr('botDefaults.idleSuspendMinutes')}</FieldTitle>
+          <input type="number" min={1} step={1} data-input="idleSuspendMinutes" placeholder={tr('botDefaults.idleSuspendMinutesPlaceholder')} value={ttlInput} disabled={busy} onChange={event => setTtlInput(event.currentTarget.value)} />
+        </label>
+        <small data-idle-ttl-state>{ttl == null
+          ? tr('botDefaults.idleSuspendMinutesStateDefault')
+          : tr('botDefaults.idleSuspendMinutesStateOn', { minutes: ttl })}</small>
+      </div>
       <div className="actions">
         <button type="button" className="primary" data-action="save-session-cap" disabled={busy} onClick={saveInput}>{tr('botDefaults.maxLiveWorkersSave')}</button>
         <button type="button" data-action="off-session-cap" disabled={busy} onClick={() => { setInput(''); void save(null); }}>{tr('botDefaults.maxLiveWorkersOff')}</button>
+        <button type="button" className="primary" data-action="save-idle-ttl" disabled={busy} onClick={saveTtlInput}>{tr('botDefaults.idleSuspendMinutesSave')}</button>
+        <button type="button" data-action="off-idle-ttl" disabled={busy} onClick={() => { setTtlInput(''); void saveTtl(null); }}>{tr('botDefaults.idleSuspendMinutesOff')}</button>
         <StatusSpan status={status} attr={{ 'data-session-cap-status': '' }} />
       </div>
     </section>

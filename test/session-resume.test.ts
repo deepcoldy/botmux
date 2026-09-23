@@ -388,6 +388,21 @@ describe('resumeSession', () => {
       expect(r.ok).toBe(true);
     });
 
+    it('rotates the terminal card epoch when a closed session is resumed', async () => {
+      const closed = makeClosedSession({ rootMessageId: 'om_terminal_epoch' });
+      closed.terminalCardEpoch = 'previous-lifecycle';
+      sessionStore.updateSession(closed);
+
+      const r = await resumeSession(closed.sessionId, new Map());
+      expect(r.ok).toBe(true);
+      if (r.ok) {
+        expect(r.ds.session.terminalCardEpoch).toBeTruthy();
+        expect(r.ds.session.terminalCardEpoch).not.toBe('previous-lifecycle');
+        expect(sessionStore.getSession(closed.sessionId)?.terminalCardEpoch)
+          .toBe(r.ds.session.terminalCardEpoch);
+      }
+    });
+
     // ── Scratch carve-out (王皓's resume-after-/relay bug) ────────────────────
 
     it('does NOT block on an in-memory daemon-command scratch — evicts it and resumes', async () => {

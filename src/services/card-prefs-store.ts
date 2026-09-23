@@ -85,6 +85,9 @@ export interface BotCardPrefs {
    *  already working, inherit that sibling's workingDir & skip the repo card.
    *  Default TRUE (unlike the others) — only an explicit false is persisted. */
   botToBotSameDir: boolean;
+  /** 被动入群（bot.added）时自动把 owner 拉进群。缺省 = 开；只有显式 false
+   *  持久化（同 thinkingCard 约定）。 */
+  autoInviteOwnerOnGroupAdd: boolean;
   /** 主动开工 — 场景①: auto-start when added to a new chat (see auto-start.ts). */
   autoStartOnGroupJoin: boolean;
   /** 主动开工 — 场景① optional pre-configured first-turn prompt ('' = none). */
@@ -129,6 +132,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       senderTag: c.senderTag !== false,
       overloadAlert: c.overloadAlert === true,
       botToBotSameDir: c.botToBotSameDir !== false,
+      autoInviteOwnerOnGroupAdd: c.autoInviteOwnerOnGroupAdd !== false,
       autoStartOnGroupJoin: c.autoStartOnGroupJoin === true,
       autoStartOnGroupJoinPrompt: typeof c.autoStartOnGroupJoinPrompt === 'string' ? c.autoStartOnGroupJoinPrompt : '',
       autoStartOnGroupJoinSeed: typeof c.autoStartOnGroupJoinSeed === 'string' ? c.autoStartOnGroupJoinSeed : '',
@@ -158,6 +162,7 @@ export function getBotCardPrefs(larkAppId: string): BotCardPrefs {
       senderTag: true,
       overloadAlert: false,
       botToBotSameDir: true,
+      autoInviteOwnerOnGroupAdd: true,
       autoStartOnGroupJoin: false,
       autoStartOnGroupJoinPrompt: '',
       autoStartOnGroupJoinSeed: '',
@@ -274,6 +279,7 @@ async function updateBotCardPrefsInternal(
     applyDefaultTrue(entry, 'senderTag', patch.senderTag);
     apply(entry, 'overloadAlert', patch.overloadAlert);
     applyDefaultTrue(entry, 'botToBotSameDir', patch.botToBotSameDir);
+    applyDefaultTrue(entry, 'autoInviteOwnerOnGroupAdd', patch.autoInviteOwnerOnGroupAdd);
     apply(entry, 'autoStartOnGroupJoin', patch.autoStartOnGroupJoin);
     applyStr(entry, 'autoStartOnGroupJoinPrompt', patch.autoStartOnGroupJoinPrompt);
     applyStr(entry, 'autoStartOnGroupJoinSeed', patch.autoStartOnGroupJoinSeed);
@@ -303,6 +309,7 @@ async function updateBotCardPrefsInternal(
         senderTag: entry.senderTag !== false,
         overloadAlert: entry.overloadAlert === true,
         botToBotSameDir: entry.botToBotSameDir !== false,
+        autoInviteOwnerOnGroupAdd: entry.autoInviteOwnerOnGroupAdd !== false,
         autoStartOnGroupJoin: entry.autoStartOnGroupJoin === true,
         autoStartOnGroupJoinPrompt: typeof entry.autoStartOnGroupJoinPrompt === 'string' ? entry.autoStartOnGroupJoinPrompt : '',
         autoStartOnGroupJoinSeed: typeof entry.autoStartOnGroupJoinSeed === 'string' ? entry.autoStartOnGroupJoinSeed : '',
@@ -374,6 +381,10 @@ async function updateBotCardPrefsInternal(
     // Default true: store false explicitly, clear (→ default on) when true.
     bot.config.botToBotSameDir = patch.botToBotSameDir === false ? false : undefined;
   }
+  if (patch.autoInviteOwnerOnGroupAdd !== undefined) {
+    // Default true: store false explicitly, clear (→ default on) when true.
+    bot.config.autoInviteOwnerOnGroupAdd = patch.autoInviteOwnerOnGroupAdd === false ? false : undefined;
+  }
   if (patch.autoStartOnGroupJoin !== undefined) {
     bot.config.autoStartOnGroupJoin = patch.autoStartOnGroupJoin || undefined;
   }
@@ -430,7 +441,7 @@ async function updateBotCardPrefsInternal(
     `autoStartOnGroupJoin=${r.result.autoStartOnGroupJoin} autoStartOnNewTopic=${r.result.autoStartOnNewTopic} ` +
     `groupJoinCommandEnabled=${r.result.groupJoinCommandEnabled} groupJoinCommand.len=${r.result.groupJoinCommand.length} ` +
     `regularGroupReplyMode=${r.result.regularGroupReplyMode} regularGroupMentionMode=${r.result.regularGroupMentionMode} ` +
-    `botToBotSameDir=${r.result.botToBotSameDir} docSubscribeDefaultMode=${r.result.docSubscribeDefaultMode} ` +
+    `botToBotSameDir=${r.result.botToBotSameDir} autoInviteOwnerOnGroupAdd=${r.result.autoInviteOwnerOnGroupAdd} docSubscribeDefaultMode=${r.result.docSubscribeDefaultMode} ` +
     `summaryMemory=${r.result.summaryMemory} summaryMemoryPath=${r.result.summaryMemoryPath} ` +
     `autoStartOnGroupJoinPrompt.len=${r.result.autoStartOnGroupJoinPrompt.length} ` +
     `autoStartOnGroupJoinSeed.len=${r.result.autoStartOnGroupJoinSeed.length}`,

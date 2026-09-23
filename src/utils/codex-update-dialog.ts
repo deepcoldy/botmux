@@ -1,6 +1,27 @@
 import { stripAnsiForLog } from './crash-log.js';
 
 export type CodexUpdateDialogAction = 'pass' | 'dismiss' | 'suppress';
+export type CodexUpdateDialogKey = 'Up' | 'Down' | 'Enter';
+
+/** Resolve a safe path from the currently selected row to a non-upgrade row.
+ * Returning no keys is fail-closed: the caller waits for a rendered snapshot
+ * instead of guessing where the selection cursor is. */
+export function codexUpdateDialogSafeKeys(data: string): CodexUpdateDialogKey[] | undefined {
+  const lines = stripAnsiForLog(data).replace(/\r/g, '\n').split('\n');
+  const options = lines.flatMap(line => {
+    const match = line.match(/^\s*([›>])?\s*(\d+)\.\s*(.+?)\s*$/);
+    if (!match) return [];
+    return [{ selected: !!match[1], number: Number(match[2]), label: match[3]! }];
+  });
+  const selected = options.find(option => option.selected);
+  const safe = selected && /^(?:skip|remind me later)\b/i.test(selected.label)
+    ? selected
+    : options.find(option => /^(?:skip|remind me later)\b/i.test(option.label));
+  if (!selected || !safe) return undefined;
+  if (selected.number === safe.number) return ['Enter'];
+  const direction: CodexUpdateDialogKey = selected.number < safe.number ? 'Down' : 'Up';
+  return [...Array(Math.abs(safe.number - selected.number)).fill(direction), 'Enter'];
+}
 
 /**
  * Detect Codex's startup update picker across PTY chunks.

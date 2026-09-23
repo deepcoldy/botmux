@@ -91,10 +91,6 @@ export interface CodexRpcEngineOpts {
   appServerFeatures?: string[];
   /** Generic process-scoped app-server config overrides. */
   appServerConfig?: string[];
-  /** Enable the daemon-owned read-only continuation protocol for this engine.
-   * Restrictions remain turn-scoped so ordinary turns in the same process keep
-   * their configured capabilities. */
-  readonlyContinuationHardened?: boolean;
   /** Bridge a native request_user_input server request to the host UI. */
   onRequestUserInput?: (params: unknown) => Promise<unknown>;
   /** Override the per-request JSON-RPC timeout (default REQUEST_TIMEOUT_MS).
@@ -124,13 +120,6 @@ const DEFAULT_DEPENDENCIES: CodexRpcEngineDependencies = {
 export interface CodexRpcTurnIdentity {
   turnId: string;
   dispatchAttempt?: number;
-  /** Daemon-only marker for the narrowly sandboxed continuation path. */
-  readonlyContinuation?: true;
-}
-
-export interface ReadonlyContinuationCapabilityCheck {
-  ok: boolean;
-  reason?: string;
 }
 
 export type CodexRpcTurnTerminalStatus =
@@ -191,10 +180,6 @@ export class CodexRpcEngine {
     turnIdentity?: CodexRpcTurnIdentity;
   }>();
   private readonly turnOwners = new Map<string, CodexRpcTurnIdentity>();
-  private readonly readonlyNativeTurns = new Set<string>();
-  private readonly pendingReadonlyTurnOwners = new Set<string>();
-  private readonly deferredPreResponseServerRequests = new Map<string, Json[]>();
-  private readonly interruptingReadonlyTurns = new Set<string>();
   private readonly nativeTurnByOwner = new Map<string, string>();
   private readonly terminalNativeTurns = new Set<string>();
   private readonly deferredUnownedTerminals = new Map<string, {
@@ -248,9 +233,7 @@ export class CodexRpcEngine {
     if (!this.terminalNativeTurns.has(nativeTurnId)) {
       this.turnOwners.set(nativeTurnId, { ...identity });
     }
-    if (identity.readonlyContinuation) this.readonlyNativeTurns.add(nativeTurnId);
     this.nativeTurnByOwner.set(ownerKey, nativeTurnId);
-    this.releaseDeferredPreResponseServerRequests(nativeTurnId);
     const deferred = this.deferredUnownedTerminals.get(nativeTurnId);
     if (deferred) {
       this.deferredUnownedTerminals.delete(nativeTurnId);
@@ -301,7 +284,6 @@ export class CodexRpcEngine {
         ...(errorCode ? { errorCode } : {}),
       });
     } catch { /* worker callback is best-effort; engine transport must continue */ }
-    this.readonlyNativeTurns.delete(nativeTurnId);
   }
 
   private emitAllTurnTerminals(
@@ -418,150 +400,18 @@ export class CodexRpcEngine {
     opts?: { timeoutMs?: number; fatalOnTimeout?: boolean },
   ): Promise<{ nativeTurnId: string }> {
     if (!this.threadId) throw new Error('sendTurn before startThread/resumeThread');
-    const readonlyContinuation = identity.readonlyContinuation === true;
     const params: Json = {
       threadId: this.threadId,
       input: [{ type: 'text', text: content, text_elements: [] }],
       cwd: this.opts.cwd,
       approvalPolicy: 'never',
-      sandboxPolicy: readonlyContinuation
-        ? { type: 'readOnly', networkAccess: false }
-        : { type: 'dangerFullAccess' },
-      ...(readonlyContinuation
-        ? {
-            environments: [],
-            runtimeWorkspaceRoots: [],
-            // TraeX capability selections are thread-sticky, not turn-local.
-            // Do not write `capabilities` here: disabling Skills/MCP for this
-            // synthetic turn would silently mutate later ordinary turns, and
-            // the protocol cannot read back an exact prior Skill selection.
-            // Eligibility proves MCP empty and Skills free of external tool
-            // dependencies; the turn-local sandbox and daemon hook enforce the
-            // remaining side-effect and native-subagent boundaries.
-          }
-        : {}),
+      sandboxPolicy: { type: 'dangerFullAccess' },
     };
     params.clientUserMessageId = identity.turnId;
-    const ownerKey = this.ownerKey(identity);
-    if (readonlyContinuation) this.pendingReadonlyTurnOwners.add(ownerKey);
-    try {
-      await this.request('turn/start', params, opts, undefined, identity);
-    } catch (err) {
-      if (readonlyContinuation) this.failClosedDeferredPreResponseServerRequests();
-      throw err;
-    } finally {
-      this.pendingReadonlyTurnOwners.delete(ownerKey);
-    }
+    await this.request('turn/start', params, opts, undefined, identity);
     const nativeTurnId = this.takeNativeTurnId(identity);
     if (!nativeTurnId) throw new Error('turn/start ack did not bind a native turn id');
     return { nativeTurnId };
-  }
-
-  /** Prove that this exact app-server generation exposes no provider-native
-   * external tool, configured MCP server, or enabled Skill that declares
-   * external tool dependencies. The turn sandbox does not constrain provider-
-   * hosted WebSearch/ImageGeneration, so those capabilities need an explicit
-   * fail-closed gate. Status/list is deliberately used only as a conservative
-   * inventory check: it cannot recover the thread's effective allowlist, and a
-   * currently disconnected or empty server can expose tools later, so any
-   * server record makes the continuation ineligible. */
-  async checkReadonlyContinuationCapabilities(): Promise<ReadonlyContinuationCapabilityCheck> {
-    if (!this.opts.readonlyContinuationHardened) {
-      return { ok: false, reason: 'readonly_continuation_runtime_not_hardened' };
-    }
-    if (!this.threadId) return { ok: false, reason: 'readonly_continuation_thread_unavailable' };
-    try {
-      const providerCapabilities = await this.request(
-        'modelProvider/capabilities/read',
-        {},
-        { timeoutMs: 10_000, fatalOnTimeout: false },
-      );
-      if (!providerCapabilities || typeof providerCapabilities !== 'object'
-        || typeof providerCapabilities.namespaceTools !== 'boolean'
-        || typeof providerCapabilities.webSearch !== 'boolean'
-        || typeof providerCapabilities.imageGeneration !== 'boolean'
-        || Object.values(providerCapabilities).some(value => typeof value !== 'boolean')) {
-        throw new Error('modelProvider/capabilities/read returned malformed data');
-      }
-      const unknownEnabledCapability = Object.entries(providerCapabilities).some(
-        ([name, enabled]) => !['namespaceTools', 'webSearch', 'imageGeneration'].includes(name)
-          && enabled === true,
-      );
-      if (providerCapabilities.webSearch === true
-        || providerCapabilities.imageGeneration === true
-        || unknownEnabledCapability) {
-        return { ok: false, reason: 'readonly_continuation_provider_external_capability' };
-      }
-
-      let cursor: string | undefined;
-      do {
-        const result = await this.request('mcpServerStatus/list', {
-          threadId: this.threadId,
-          detail: 'full',
-          limit: 100,
-          ...(cursor ? { cursor } : {}),
-        }, { timeoutMs: 10_000, fatalOnTimeout: false });
-        if (!result || !Array.isArray(result.data)) {
-          throw new Error('mcpServerStatus/list returned malformed data');
-        }
-        if (result.nextCursor !== undefined && result.nextCursor !== null
-          && typeof result.nextCursor !== 'string') {
-          throw new Error('mcpServerStatus/list returned malformed cursor');
-        }
-        const servers = result.data;
-        if (servers.length > 0) {
-          return { ok: false, reason: 'readonly_continuation_external_mcp_capability' };
-        }
-        cursor = typeof result?.nextCursor === 'string' && result.nextCursor
-          ? result.nextCursor
-          : undefined;
-      } while (cursor);
-
-      const skillResult = await this.request('skills/list', {
-        cwds: [this.opts.cwd],
-        forceReload: false,
-      }, { timeoutMs: 10_000, fatalOnTimeout: false });
-      if (!skillResult || !Array.isArray(skillResult.data)) {
-        throw new Error('skills/list returned malformed data');
-      }
-      const entries = skillResult.data;
-      for (const entry of entries) {
-        if (!entry || typeof entry !== 'object'
-          || typeof entry.cwd !== 'string'
-          || !Array.isArray(entry.errors)
-          || !Array.isArray(entry.skills)) {
-          throw new Error('skills/list returned malformed entry');
-        }
-        if (entry.errors.length > 0) {
-          throw new Error('skills/list reported discovery errors');
-        }
-        const skills = entry.skills;
-        for (const skill of skills) {
-          if (!skill || typeof skill !== 'object' || typeof skill.enabled !== 'boolean') {
-            throw new Error('skills/list returned malformed skill');
-          }
-          if (skill.dependencies !== undefined && skill.dependencies !== null
-            && (!Array.isArray(skill.dependencies.tools))) {
-            throw new Error('skills/list returned malformed dependencies');
-          }
-          const dependencies = skill.dependencies?.tools ?? [];
-          if (dependencies.some((dependency: unknown) => !dependency || typeof dependency !== 'object')) {
-            throw new Error('skills/list returned malformed tool dependency');
-          }
-          if (skill.enabled === true && dependencies.length > 0) {
-            return { ok: false, reason: 'readonly_continuation_skill_tool_dependency' };
-          }
-        }
-      }
-      return { ok: true };
-    } catch (error) {
-      this.log(
-        `[codex-rpc] read-only continuation capability proof failed: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-      return { ok: false, reason: 'readonly_continuation_capability_probe_failed' };
-    }
   }
 
   /** 首条用户消息落盘后设置线程名；失败不得拖垮仍在执行的模型 turn。 */
@@ -695,7 +545,6 @@ export class CodexRpcEngine {
     if (this.closed) return;
     this.closed = true;
     this.emitAllTurnTerminals('stopped', 'rpc_engine_stopped');
-    this.clearReadonlyOwnership();
     this.deferredUnownedTerminals.clear();
     try { this.ws?.close(); } catch { /* already gone */ }
     const pid = this.child?.pid;
@@ -909,78 +758,6 @@ export class CodexRpcEngine {
     return typeof value === 'string' && value ? value : undefined;
   }
 
-  private clearReadonlyOwnership(): void {
-    this.readonlyNativeTurns.clear();
-    this.pendingReadonlyTurnOwners.clear();
-    this.deferredPreResponseServerRequests.clear();
-    this.interruptingReadonlyTurns.clear();
-  }
-
-  private interruptReadonlyTurn(params: unknown, reason: string): void {
-    const nativeTurnId = this.serverRequestNativeTurnId(params);
-    const p = params && typeof params === 'object' ? params as Record<string, unknown> : {};
-    const threadId = typeof p.threadId === 'string' ? p.threadId : this.threadId;
-    if (!threadId || !nativeTurnId) {
-      this.failAll(new Error(`read-only continuation request lacked exact turn coordinates: ${reason}`));
-      return;
-    }
-    if (this.interruptingReadonlyTurns.has(nativeTurnId)) return;
-    this.interruptingReadonlyTurns.add(nativeTurnId);
-    this.request(
-      'turn/interrupt',
-      { threadId, turnId: nativeTurnId },
-      { timeoutMs: 10_000, fatalOnTimeout: false },
-    ).then(
-      () => this.log(`[codex-rpc] interrupted read-only continuation ${nativeTurnId}: ${reason}`),
-      err => this.failAll(new Error(
-        `read-only continuation interrupt failed: ${err instanceof Error ? err.message : String(err)}`,
-      )),
-    ).finally(() => this.interruptingReadonlyTurns.delete(nativeTurnId));
-  }
-
-  private handleReadonlyServerRequest(msg: Json): void {
-    const method = String(msg.method ?? '');
-    if (method === 'item/tool/requestUserInput') {
-      this.interruptReadonlyTurn(msg.params, method);
-      return;
-    }
-    if (method === 'item/commandExecution/requestApproval'
-      || method === 'item/fileChange/requestApproval') {
-      this.respond(msg.id, { decision: 'cancel' });
-    } else if (method === 'execCommandApproval' || method === 'applyPatchApproval') {
-      this.respond(msg.id, { decision: 'abort' });
-    } else if (method === 'mcpServer/elicitation/request') {
-      this.respond(msg.id, { action: 'cancel', content: null, _meta: null });
-    } else if (method === 'item/tool/call') {
-      this.respond(msg.id, { contentItems: [], success: false });
-    } else {
-      // Permission elevation and future server requests are not part of the
-      // reviewed read-only surface. Reject unknown protocol growth closed.
-      this.respondError(msg.id, `server request denied in read-only continuation: ${method}`);
-    }
-    this.interruptReadonlyTurn(msg.params, method);
-  }
-
-  private releaseDeferredPreResponseServerRequests(nativeTurnId: string): void {
-    const deferred = this.deferredPreResponseServerRequests.get(nativeTurnId);
-    if (!deferred) return;
-    this.deferredPreResponseServerRequests.delete(nativeTurnId);
-    for (const msg of deferred) {
-      if (this.readonlyNativeTurns.has(nativeTurnId)) this.handleReadonlyServerRequest(msg);
-      else this.handleOrdinaryServerRequest(msg);
-    }
-  }
-
-  private failClosedDeferredPreResponseServerRequests(): void {
-    for (const requests of this.deferredPreResponseServerRequests.values()) {
-      for (const msg of requests) {
-        this.respondError(msg.id, 'read-only continuation ownership could not be proven');
-        this.interruptReadonlyTurn(msg.params, 'turn/start ownership could not be proven');
-      }
-    }
-    this.deferredPreResponseServerRequests.clear();
-  }
-
   private handleOrdinaryServerRequest(msg: Json): void {
     if (msg.method === 'item/tool/requestUserInput' && this.opts.onRequestUserInput) {
       const requestParams = msg.params;
@@ -1028,22 +805,6 @@ export class CodexRpcEngine {
       return;
     }
     if (typeof msg.id === 'number' && typeof msg.method === 'string') {
-      const nativeTurnId = this.serverRequestNativeTurnId(msg.params);
-      if (nativeTurnId && this.readonlyNativeTurns.has(nativeTurnId)) {
-        this.handleReadonlyServerRequest(msg);
-        return;
-      }
-      if (this.pendingReadonlyTurnOwners.size > 0) {
-        if (!nativeTurnId) {
-          this.respondError(msg.id, 'read-only continuation request lacked exact turn id');
-          this.failAll(new Error('read-only continuation server request lacked exact turn id'));
-          return;
-        }
-        const deferred = this.deferredPreResponseServerRequests.get(nativeTurnId) ?? [];
-        deferred.push(msg);
-        this.deferredPreResponseServerRequests.set(nativeTurnId, deferred);
-        return;
-      }
       this.handleOrdinaryServerRequest(msg);
       return;
     }
@@ -1094,7 +855,6 @@ export class CodexRpcEngine {
     if (!this.closed && !this.deadNotified) {
       this.deadNotified = true;
       this.emitAllTurnTerminals('engine-dead', 'rpc_engine_dead');
-      this.clearReadonlyOwnership();
       try { this.opts.onDead?.(); } catch { /* best effort */ }
     }
   }

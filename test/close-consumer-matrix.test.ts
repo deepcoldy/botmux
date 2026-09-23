@@ -336,6 +336,10 @@ const RESPONSE_CONSUMERS: Record<string, ResponseRule> = {
     why: 'Idle cleanup close callback forwards residual separately from failures.',
     mustParse: true,
   },
+  'dashboard.ts::closeCandidate::close-route': {
+    why: 'Scheduled auto-cleanup forwards residual, counted apart from failures.',
+    mustParse: true,
+  },
   'dashboard/web/sessions-page.tsx::SessionsPage::close-route': {
     why: 'Web single + bulk close: residual alert, counted apart from failures.',
     mustParse: true,

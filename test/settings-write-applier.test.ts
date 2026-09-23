@@ -43,6 +43,7 @@ function makeDeps(overrides: Partial<SettingsWriteApplierDeps> = {}): SettingsWr
     },
     vcMeetingAgent: { enabled: true },
     workflow: { enabled: true },
+    sessionCleanup: { enabled: false, olderThanHours: 168, intervalMinutes: 60 },
     maintenance: {},
     localDevInstall: false,
   };
@@ -1121,5 +1122,70 @@ describe('applySettingsWrite — hostOverloadAlert', () => {
     }, deps);
     expect(r.ok).toBe(true);
     expect(deps.writeHostOverloadAlertConfig).toHaveBeenCalledWith({ enabled: false });
+  });
+});
+
+describe('applySettingsWrite sessionCleanup', () => {
+  it('writes a full sessionCleanup block', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({
+      sessionCleanup: { enabled: true, olderThanHours: 72, intervalMinutes: 30 },
+    }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({
+      sessionCleanup: { enabled: true, olderThanHours: 72, intervalMinutes: 30 },
+    });
+  });
+
+  it('merges a partial patch over the stored block (toggle only keeps threshold)', async () => {
+    const deps = makeDeps();
+    // Seed stored config with an existing block.
+    deps.mergeGlobalConfig({ sessionCleanup: { enabled: false, olderThanHours: 24, intervalMinutes: 15 } });
+    (deps.mergeGlobalConfig as ReturnType<typeof vi.fn>).mockClear();
+    const r = await applySettingsWrite({ sessionCleanup: { enabled: true } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({
+      sessionCleanup: { enabled: true, olderThanHours: 24, intervalMinutes: 15 },
+    });
+  });
+
+  it('rejects an unsupported olderThanHours', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ sessionCleanup: { olderThanHours: 12 } }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_sessionCleanup_olderThanHours' });
+    expect(deps.mergeGlobalConfig).not.toHaveBeenCalled();
+  });
+
+  it('rejects a sub-floor intervalMinutes', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ sessionCleanup: { intervalMinutes: 1 } }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_sessionCleanup_intervalMinutes' });
+  });
+
+  it('rejects a non-boolean enabled', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ sessionCleanup: { enabled: 'yes' } as never }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_sessionCleanup_enabled' });
+  });
+
+  it('rejects a non-object sessionCleanup', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ sessionCleanup: 'nope' as never }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_sessionCleanup' });
+  });
+
+  it('rejects an empty sessionCleanup patch', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ sessionCleanup: {} }, deps);
+    expect(r).toEqual({ ok: false, error: 'invalid_sessionCleanup' });
+  });
+
+  it('floors a fractional intervalMinutes', async () => {
+    const deps = makeDeps();
+    const r = await applySettingsWrite({ sessionCleanup: { intervalMinutes: 90.7 } }, deps);
+    expect(r.ok).toBe(true);
+    expect(deps.mergeGlobalConfig).toHaveBeenCalledWith({
+      sessionCleanup: { intervalMinutes: 90 },
+    });
   });
 });

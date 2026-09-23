@@ -129,6 +129,17 @@ describe('schedule-card-model · toScheduleRowDto', () => {
     expect(enabledRow.actions.pause.enabled).toBe(true);
     expect(enabledRow.actions.resume.enabled).toBe(false);
   });
+
+  it('disables run-now while the task has a durable running claim', () => {
+    const row = toScheduleRowDto(
+      makeTask({ lastStatus: 'running' }),
+      { nowMs: FIXED_NOW },
+    );
+    expect(row.actions.runNow).toEqual({
+      enabled: false,
+      reasonKey: 'schedules.action.run.alreadyRunning',
+    });
+  });
 });
 
 describe('schedule-card-model · toScheduleDetailDto', () => {
