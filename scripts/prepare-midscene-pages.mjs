@@ -87,28 +87,69 @@ async function readYamlCases(root) {
   return cases;
 }
 
-async function loadProjectReport({ reportRoot, projectName, output, slug }) {
-  for (const report of await findReportIndexes(reportRoot)) {
-    const html = await readFile(report.file, 'utf8');
-    const run = testRunDump(html);
-    if (!run?.projects?.some((project) => project.name === projectName)) continue;
-    const cases = await reportCases(run, projectName, { html, reportFile: report.file });
-    await cp(path.dirname(report.file), path.join(output, slug), { recursive: true });
-    await mkdir(path.join(output, 'previews'), { recursive: true });
-    for (const testCase of cases) {
-      if (!testCase.previewFile || !testCase.screenshot) continue;
-      await writeFile(
-        path.join(output, 'previews', testCase.previewFile),
-        testCase.screenshot.bytes,
-      );
-    }
-    return cases.map(({ screenshot, previewFile, ...testCase }) => ({
-      ...testCase,
-      reportPath: `${slug}/index.html`,
-      previewPath: previewFile ? `previews/${previewFile}` : null,
-    }));
+async function copyReportCandidate(candidate, { output, slug, nested = false }) {
+  const destination = nested
+    ? path.join(output, slug, candidate.key)
+    : path.join(output, slug);
+  await cp(path.dirname(candidate.file), destination, { recursive: true });
+  await mkdir(path.join(output, 'previews'), { recursive: true });
+  for (const testCase of candidate.cases) {
+    if (!testCase.previewFile || !testCase.screenshot) continue;
+    await writeFile(
+      path.join(output, 'previews', testCase.previewFile),
+      testCase.screenshot.bytes,
+    );
   }
-  throw new Error(`No Midscene Test report found for project ${projectName}`);
+  return candidate.cases.map(({ screenshot, previewFile, ...testCase }) => ({
+    ...testCase,
+    reportPath: nested
+      ? `${slug}/${candidate.key}/index.html`
+      : `${slug}/index.html`,
+    previewPath: previewFile ? `previews/${previewFile}` : null,
+  }));
+}
+
+async function loadProjectReport({ reportRoot, projectName, output, slug }) {
+  const candidates = [];
+  for (const report of await findReportIndexes(reportRoot)) {
+    try {
+      const html = await readFile(report.file, 'utf8');
+      const run = testRunDump(html);
+      if (!run?.projects?.some((project) => project.name === projectName)) continue;
+      const cases = await reportCases(run, projectName, { html, reportFile: report.file });
+      if (cases.length > 0) {
+        candidates.push({
+          ...report,
+          cases,
+          key: `run-${String(candidates.length + 1).padStart(3, '0')}`,
+        });
+      }
+    } catch (error) {
+      process.stderr.write(`Ignoring unreadable Midscene report ${report.file}: ${error.message}\n`);
+    }
+  }
+  if (candidates.length === 0) return [];
+
+  candidates.sort((left, right) =>
+    right.cases.length - left.cases.length || right.modifiedAt - left.modifiedAt,
+  );
+  const aggregate = candidates[0];
+  if (aggregate.cases.length > 1 || candidates.length === 1) {
+    return copyReportCandidate(aggregate, { output, slug });
+  }
+
+  const cases = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const copied = await copyReportCandidate(candidate, { output, slug, nested: true });
+    for (const testCase of copied) {
+      const key = `${testCase.project}\0${testCase.name}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      cases.push(testCase);
+    }
+  }
+  return cases;
 }
 
 function caseTarget(testCase) {
@@ -122,8 +163,15 @@ function landingPage(cases) {
   const passed = cases.filter((testCase) => testCase.status === 'success').length;
   const failed = cases.filter((testCase) => testCase.status === 'failed').length;
   const skipped = cases.filter((testCase) => testCase.status === 'skipped').length;
+  const notRun = cases.filter((testCase) => testCase.status === 'not-run').length;
   const rows = cases.map((testCase) => {
-    const icon = testCase.status === 'success' ? '✅' : testCase.status === 'skipped' ? '⏭️' : '❌';
+    const icon = testCase.status === 'success'
+      ? '✅'
+      : testCase.status === 'skipped'
+        ? '⏭️'
+        : testCase.status === 'not-run'
+          ? '⏸️'
+          : '❌';
     const target = caseTarget(testCase);
     const name = target
       ? `<a href="${escapeHtml(target)}">${escapeHtml(testCase.name)}</a>`
@@ -153,7 +201,7 @@ function landingPage(cases) {
 </head>
 <body><main>
   <h1>Botmux × Midscene</h1>
-  <p class="summary"><strong>${passed}/${cases.length} cases passed</strong> · ${failed} failed · ${skipped} skipped</p>
+  <p class="summary"><strong>${passed}/${cases.length} cases passed</strong> · ${failed} failed · ${skipped} skipped · ${notRun} not run</p>
   <table>
     <thead><tr><th></th><th>Case</th><th>Project</th><th>Status</th><th>Duration</th><th>Node screenshot</th></tr></thead>
     <tbody>${rows}</tbody>
@@ -176,8 +224,9 @@ export async function prepareMidscenePages(options) {
     slug: 'dashboard',
   });
 
+  const configuredFeishuCases = await readYamlCases(skippedCasesDir);
   if (options['feishu-outcome'] === 'skipped' || !options['feishu-report-root']) {
-    cases.push(...(await readYamlCases(skippedCasesDir)).map((name) => ({
+    cases.push(...configuredFeishuCases.map((name) => ({
       name,
       project: 'feishu-browser',
       status: 'skipped',
@@ -187,12 +236,25 @@ export async function prepareMidscenePages(options) {
       stepId: null,
     })));
   } else {
-    cases.push(...await loadProjectReport({
+    const reportedCases = await loadProjectReport({
       reportRoot: path.resolve(options['feishu-report-root']),
       projectName: 'feishu-browser',
       output,
       slug: 'feishu',
-    }));
+    });
+    cases.push(...reportedCases);
+    const reportedNames = new Set(reportedCases.map((testCase) => testCase.name));
+    cases.push(...configuredFeishuCases
+      .filter((name) => !reportedNames.has(name))
+      .map((name) => ({
+        name,
+        project: 'feishu-browser',
+        status: 'not-run',
+        attempts: 0,
+        reportPath: null,
+        previewPath: null,
+        stepId: null,
+      })));
   }
 
   const manifest = { schemaVersion: 1, cases };

@@ -92,4 +92,48 @@ describe('Midscene Pages report', () => {
       'Native report',
     );
   });
+
+  it('publishes partial per-case reports and marks unfinished cases as not run', async () => {
+    root = await mkdtemp(join(tmpdir(), 'botmux-midscene-partial-'));
+    const dashboardRoot = join(root, 'dashboard');
+    const feishuRoot = join(root, 'feishu', 'runs', 'attempt-1', 'report');
+    const casesRoot = join(root, 'cases');
+    const output = join(root, 'site');
+    await Promise.all([
+      mkdir(dashboardRoot, { recursive: true }),
+      mkdir(feishuRoot, { recursive: true }),
+      mkdir(casesRoot, { recursive: true }),
+    ]);
+    const report = (project: string, name: string) => `
+      <script type="midscene_test_run_dump">${JSON.stringify({
+        projects: [{
+          name: project,
+          documents: [{ cases: [{
+            caseId: name.toLowerCase().replaceAll(' ', '-'),
+            name,
+            status: 'failed',
+            attempts: [{ status: 'failed', durationMs: 100, steps: [] }],
+          }] }],
+        }],
+      })}</script>`;
+    await writeFile(join(dashboardRoot, 'index.html'), report('dashboard-smoke', 'Dashboard smoke'));
+    await writeFile(join(feishuRoot, 'index.html'), report('feishu-browser', 'Case one'));
+    await writeFile(join(casesRoot, 'feishu.yaml'), 'cases:\n  - name: Case one\n  - name: Case two\n');
+
+    const manifest = await prepareMidscenePages({
+      'dashboard-report-root': dashboardRoot,
+      'feishu-report-root': join(root, 'feishu'),
+      'feishu-outcome': 'failure',
+      'skipped-cases-dir': casesRoot,
+      output,
+    });
+
+    expect(manifest.cases).toEqual(expect.arrayContaining([
+      expect.objectContaining({ name: 'Case one', status: 'failed' }),
+      expect.objectContaining({ name: 'Case two', status: 'not-run' }),
+    ]));
+    await expect(readFile(join(output, 'feishu', 'index.html'), 'utf8')).resolves.toContain(
+      'Case one',
+    );
+  });
 });

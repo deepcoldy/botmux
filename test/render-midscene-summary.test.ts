@@ -106,4 +106,32 @@ describe('Midscene CI summary', () => {
     expect(markdown).toContain('dashboard/index.html#runner-step=attempt%3Asteps%3A6');
     expect(markdown).toContain('previews/dashboard.jpg');
   });
+
+  it('keeps partial evidence visible when a timed-out project has no summary', () => {
+    const markdown = renderSummary({
+      artifactName: 'botmux-midscene-report',
+      testOutcome: 'failure',
+      runUrl: 'https://github.com/deepcoldy/botmux/actions/runs/44',
+      pagesUrl: 'https://deepcoldy.github.io/botmux-midscene/pr-1512/',
+      evidenceCases: [
+        {
+          name: 'Completed case',
+          project: 'feishu-browser',
+          status: 'success',
+          reportPath: 'feishu/run-001/index.html',
+          previewPath: 'previews/completed.jpg',
+        },
+        {
+          name: 'Unfinished case',
+          project: 'feishu-browser',
+          status: 'not-run',
+        },
+      ],
+      summary: null,
+    });
+
+    expect(markdown).toContain('1/2 cases passed · 0 failed · 0 skipped · 1 not run');
+    expect(markdown).toContain('feishu/run-001/index.html');
+    expect(markdown).toContain('| ⏸️ [Unfinished case]');
+  });
 });

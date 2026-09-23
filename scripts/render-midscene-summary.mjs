@@ -135,9 +135,22 @@ export function renderSummary({
     status: 'skipped',
     attempts: [],
   }));
-  const cases = [...nativeCases, ...skipped];
-  const reportAvailable = Boolean(summary);
-  const total = (counts?.total ?? 0) + skipped.length;
+  const nativeCaseKeys = new Set([
+    ...nativeCases.map((testCase) => `${testCase.project}\0${testCase.name}`),
+    ...skipped.map((testCase) => `${testCase.project}\0${testCase.name}`),
+  ]);
+  const evidenceOnlyCases = evidenceCases
+    .filter((testCase) => !nativeCaseKeys.has(`${testCase.project}\0${testCase.name}`))
+    .map((testCase) => ({ ...testCase, attempts: [] }));
+  const cases = [...nativeCases, ...evidenceOnlyCases, ...skipped];
+  const reportAvailable = Boolean(summary || evidenceCases.length > 0);
+  const total = (counts?.total ?? 0) + skipped.length + evidenceOnlyCases.length;
+  const passed = (counts?.passed ?? 0)
+    + evidenceOnlyCases.filter((testCase) => testCase.status === 'success').length;
+  const failed = (counts?.failed ?? 0)
+    + evidenceOnlyCases.filter((testCase) => testCase.status === 'failed').length;
+  const notRun = (counts?.notRun ?? 0)
+    + evidenceOnlyCases.filter((testCase) => testCase.status === 'not-run').length;
   const status =
     testOutcome === 'success' && summary?.status === 'success'
       ? skipped.length > 0
@@ -156,7 +169,7 @@ export function renderSummary({
     `## Botmux × Midscene · ${status}`,
     '',
     reportAvailable
-      ? `**${counts.passed}/${total} cases passed · ${counts.failed} failed · ${skipped.length} skipped · ${counts.notRun} not run**`
+      ? `**${passed}/${total} cases passed · ${failed} failed · ${skipped.length} skipped · ${notRun} not run**`
       : testOutcome === 'skipped'
         ? '**Static Midscene validation passed.** Live Feishu browser cases were skipped because their repository secrets are unavailable.'
         : '**No Midscene result was produced.** The job stopped before the test runner started.',
@@ -195,7 +208,9 @@ export function renderSummary({
             ? '✅'
             : testCase.status === 'skipped'
               ? '⏭️'
-              : '❌';
+              : testCase.status === 'not-run'
+                ? '⏸️'
+                : '❌';
         const attempts = testCase.attempts?.length ?? 0;
         const caseEvidence = evidence.get(`${testCase.project}\0${testCase.name}`);
         const target = publishedUrl(
@@ -216,7 +231,7 @@ export function renderSummary({
         return `| ${icon} ${caseLabel} | ${evidenceCell} | ${cell(testCase.project)} | ${cell(testCase.status)} | ${attempts} |`;
       }),
       '',
-      `Run duration: ${duration(summary.durationMs)}.`,
+      `Run duration: ${duration(summary?.durationMs)}.`,
       '',
     );
   }

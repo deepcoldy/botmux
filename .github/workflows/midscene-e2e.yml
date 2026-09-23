@@ -2,6 +2,11 @@ name: Midscene E2E
 
 on:
   workflow_dispatch:
+    inputs:
+      report_site_key:
+        description: Published report directory (for example, pr-1512)
+        required: false
+        default: manual
   pull_request:
     paths:
       - ".github/workflows/midscene-e2e.yml"
@@ -42,6 +47,9 @@ jobs:
       MIDSCENE_MODEL_NAME: ${{ secrets.MIDSCENE_MODEL_NAME }}
       MIDSCENE_MODEL_BASE_URL: ${{ secrets.MIDSCENE_MODEL_BASE_URL }}
       MIDSCENE_MODEL_FAMILY: ${{ secrets.MIDSCENE_MODEL_FAMILY }}
+      MIDSCENE_MODEL_REASONING_ENABLED: ${{ secrets.MIDSCENE_MODEL_REASONING_ENABLED }}
+      MIDSCENE_MODEL_RETRY_COUNT: "3"
+      MIDSCENE_MODEL_RETRY_INTERVAL: "65000"
       NODE_OPTIONS: "--dns-result-order=ipv4first --no-network-family-autoselection"
 
     steps:
@@ -51,11 +59,12 @@ jobs:
         id: report_target
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          DISPATCH_SITE_KEY: ${{ inputs.report_site_key }}
         run: |
           if [[ -n "$PR_NUMBER" ]]; then
             site_key="pr-$PR_NUMBER"
           else
-            site_key="manual"
+            site_key="${DISPATCH_SITE_KEY:-manual}"
           fi
           echo "site-key=$site_key" >> "$GITHUB_OUTPUT"
           echo "site-url=https://deepcoldy.github.io/botmux-midscene/$site_key/" >> "$GITHUB_OUTPUT"
@@ -168,13 +177,13 @@ jobs:
             feishu_outcome="skipped"
           fi
           arguments=(
-            --dashboard-report-root test/midscene/midscene_run/report
+            --dashboard-report-root test/midscene/midscene_run
             --skipped-cases-dir test/e2e-browser/cases
             --feishu-outcome "$feishu_outcome"
             --output "$RUNNER_TEMP/midscene-site"
           )
           if [[ "$feishu_outcome" != "skipped" ]]; then
-            arguments+=(--feishu-report-root test/e2e-browser/midscene_run/report)
+            arguments+=(--feishu-report-root test/e2e-browser/midscene_run)
           fi
           node scripts/prepare-midscene-pages.mjs "${arguments[@]}"
 
