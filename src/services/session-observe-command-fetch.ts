@@ -6,8 +6,6 @@ import {
 } from './session-observe-fetch-implementation.js';
 import type { ObserveSession, ObserveSnapshot } from './session-observe.js';
 
-export type ObserveFetchOptions = ObserveFetchQuery;
-
 export type DaemonIpcFetch = (
   port: number,
   path: string,
@@ -15,10 +13,10 @@ export type DaemonIpcFetch = (
   secret?: string,
 ) => Promise<Response>;
 
-export type InternalObserveFetchOptions = ObserveFetchOptions & ObserveFetchDependencies;
+export type ObserveCommandFetchOptions = ObserveFetchQuery & ObserveFetchDependencies;
 
 export function fetchObserveSnapshot(
-  options: InternalObserveFetchOptions = {},
+  options: ObserveCommandFetchOptions = {},
 ): Promise<ObserveSnapshot> {
   const { larkAppId, includeRaw, ...dependencies } = options;
   return fetchObserveSnapshotImplementation({ larkAppId, includeRaw }, dependencies);
@@ -26,7 +24,7 @@ export function fetchObserveSnapshot(
 
 export function fetchObserveSession(
   sessionId: string,
-  options: InternalObserveFetchOptions = {},
+  options: ObserveCommandFetchOptions = {},
 ): Promise<ObserveSession> {
   const { larkAppId, includeRaw, ...dependencies } = options;
   return fetchObserveSessionImplementation(sessionId, { larkAppId, includeRaw }, dependencies);

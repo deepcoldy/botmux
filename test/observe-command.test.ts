@@ -27,6 +27,7 @@ describe('botmux observe arguments', () => {
     const help = String(stdout.mock.calls[0]?.[0]);
     expect(help).toContain('botmux observe --session <id>');
     expect(help).toContain('botmux observe --lark-app <appId>');
+    expect(help).toContain("queued/parkedOrSuspended/closed (boolean|'unknown')");
     expect(help).not.toContain('--jsonl');
     expect(help).not.toContain('--session-id');
     expect(help).not.toContain('--lark-app-id');

@@ -1,4 +1,4 @@
-// Behavior tests for the session-observe façade.
+// Behavior tests for the `botmux observe` command fetch adapter.
 //
 // These tests never hit a real daemon: `discover` and `fetch` are injected. The
 // tests pin `now` so the emitted `observedAt` is deterministic. Each case
@@ -11,7 +11,7 @@ import {
   fetchObserveSession,
   fetchObserveSnapshot,
   type DaemonIpcFetch,
-} from '../src/services/session-observe-fetch-internal.js';
+} from '../src/services/session-observe-command-fetch.js';
 import type { OnlineDaemonInfo } from '../src/utils/daemon-discovery.js';
 import type { RawSessionRow } from '../src/services/session-observe.js';
 

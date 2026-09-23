@@ -143,7 +143,7 @@ function sessionThreadLink(
 }
 
 // The native Lark topic id is a durable identity fact for thread-scope sessions.
-// Row producers publish it so downstream normalizers (observe façade included)
+// Row producers publish it so downstream normalizers (including botmux observe)
 // can surface `identity.threadId` without re-deriving the validation rule.
 function sessionThreadId(
   session: Pick<Session, 'scope' | 'larkThreadId'>,

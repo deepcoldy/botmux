@@ -5,12 +5,12 @@ import {
   type RawSessionRow,
 } from '../src/services/session-observe.js';
 import type { ObserveSession } from '../src/services/session-observe.js';
-import type { ObserveFetchOptions } from '../src/services/session-observe-fetch-internal.js';
+import type { ObserveFetchQuery } from '../src/services/session-observe-fetch-implementation.js';
 
 expectTypeOf<ObserveSession['backend']['adopted']>().toEqualTypeOf<boolean | 'unknown'>();
 expectTypeOf<ObserveSession['parkedOrSuspended']>().toEqualTypeOf<boolean | 'unknown'>();
 expectTypeOf<ObserveSession['closed']>().toEqualTypeOf<boolean | 'unknown'>();
-expectTypeOf<keyof ObserveFetchOptions>().toEqualTypeOf<'larkAppId' | 'includeRaw'>();
+expectTypeOf<keyof ObserveFetchQuery>().toEqualTypeOf<'larkAppId' | 'includeRaw'>();
 
 const OBSERVED_AT = 1_700_000_000_000;
 

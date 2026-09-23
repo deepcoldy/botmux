@@ -17,7 +17,7 @@
 import {
   fetchObserveSession,
   fetchObserveSnapshot,
-} from '../services/session-observe-fetch-internal.js';
+} from '../services/session-observe-command-fetch.js';
 import type { ObserveProbeStatus } from '../services/session-observe.js';
 
 interface ParsedArgs {
@@ -63,8 +63,8 @@ const HELP_TEXT = `botmux observe — 读取 daemon 实时 SessionRow 投影（v
 字段（v1 canonical）：
   identity/cli/backend, liveness (alive|not_running|closed|unknown),
   turn (working|idle|starting|analyzing|limited|stalled|interrupted|unknown),
-  phase (仅 'unknown'), queued (boolean|'unknown'), pendingRepo,
-  lastActivityAt, workingDirectory, parkedOrSuspended, closed, rawStatus.
+  phase (仅 'unknown'), queued/parkedOrSuspended/closed (boolean|'unknown'),
+  pendingRepo, lastActivityAt, workingDirectory, rawStatus.
   probe.status: ok|unauthorized|unreachable|not_found|daemon_offline。
 
 Probe 失败不回退旧缓存；phase 目前只报 unknown。

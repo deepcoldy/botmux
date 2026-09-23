@@ -1,9 +1,9 @@
 // Canonical worker/session observe projection.
 //
-// External consumers use this shape as the single, machine-readable fact source
-// about a botmux session's runtime. Every consumer, CLI or in-process TS,
-// resolves through the same normalizer so that no downstream code re-derives
-// liveness/turn/phase/queued from raw SessionRow fields.
+// The `botmux observe` CLI uses this shape as the single, machine-readable fact
+// source about a botmux session's runtime. CLI output resolves through the same
+// normalizer so command code does not re-derive liveness/turn/phase/queued from
+// raw SessionRow fields.
 //
 // The normalizer is pure: it takes a raw daemon `SessionRow` (from
 // GET /api/sessions{,/:id}) plus an observation timestamp and emits an
@@ -41,6 +41,9 @@ export type ObserveTurn =
 export type ObservePhase = 'unknown';
 
 export type ObserveQueued = boolean | 'unknown';
+/** JSON consumers must compare these with `=== true` / `=== false`; truthiness
+ *  treats the string `'unknown'` as true and turns unknown facts into false
+ *  positives. */
 export type ObserveBoolean = boolean | 'unknown';
 
 export type ObserveProbeStatus =
@@ -83,6 +86,7 @@ export interface ObserveSession {
   backend: {
     type?: string;
     sessionName?: string;
+    /** boolean | 'unknown'; use strict equality, never truthiness. */
     adopted: ObserveBoolean;
     workerPid?: number;
     adoptCliPid?: number;
@@ -96,7 +100,9 @@ export interface ObserveSession {
   attention?: { kind: string; reason: string; at: number };
   lastActivityAt?: number;
   workingDirectory?: string;
+  /** boolean | 'unknown'; use strict equality, never truthiness. */
   parkedOrSuspended: ObserveBoolean;
+  /** boolean | 'unknown'; use strict equality, never truthiness. */
   closed: ObserveBoolean;
   rawStatus?: string;
   raw?: unknown;
@@ -147,6 +153,9 @@ export function normalizeSessionRow(
 ): ObserveSession {
   const probe = options.probe ?? { status: 'ok', source: 'daemon-ipc' };
   const hasRuntimeFacts = probe.status === 'ok';
+  // Non-ok rows reach this normalizer only in defensive/test paths. Production
+  // fetch failures are emitted by synthesizeMissingSession(), so preserving
+  // durable identity here must not be read as a currently reachable failure row.
   const status = typeof row.status === 'string' ? row.status : undefined;
   const hasKnownStatus = hasRuntimeFacts && status !== undefined && ROW_RUNTIME_STATUSES.has(status);
   const closed: ObserveBoolean = hasKnownStatus ? status === 'closed' : 'unknown';

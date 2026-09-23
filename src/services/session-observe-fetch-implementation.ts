@@ -1,4 +1,4 @@
-// Thin CLI/TS façade for the canonical worker/session observe seam.
+// CLI fetch adapter for the canonical worker/session observe projection.
 //
 // Contract:
 // - Only source of runtime facts is the daemon loopback IPC (GET /api/sessions
@@ -9,9 +9,8 @@
 //   The envelope surfaces a non-`ok` probe status and an empty session list;
 //   for a session-specific probe, the returned ObserveSession carries the
 //   failure marker while emitting the identity we were asked to look up.
-// - `normalizeSessionRow` is imported by both this façade and any in-process
-//   TypeScript caller. The CLI is a stdout shim over the same function; there
-//   is no CLI-only re-derivation.
+// - `normalizeSessionRow` is shared by this adapter and the CLI stdout layer;
+//   there is no command-only re-derivation.
 
 import {
   fetchDaemonIpc,
@@ -32,7 +31,7 @@ import {
   type RawSessionRow,
 } from './session-observe.js';
 
-/** Product-facing query options shared by every façade entry point. */
+/** Query options accepted by the `botmux observe` command fetch path. */
 export interface ObserveFetchQuery {
   /** Restrict to a single daemon by its Lark app id; otherwise every online
    *  daemon is probed and its envelope aggregated. */
