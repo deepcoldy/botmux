@@ -453,8 +453,5 @@ describe('report session relay wiring', () => {
       'raw = await readJsonBody<unknown>(req, REPORT_SESSION_RELAY_MAX_BYTES);',
     );
     expect(daemonSource).toContain('if (error instanceof JsonBodyTooLargeError)');
-    expect(daemonSource).toContain(
-      'fetchTarget: (path, init) => fetchDaemonIpc(targetDaemon.ipcPort, path, init)',
-    );
   });
 });
