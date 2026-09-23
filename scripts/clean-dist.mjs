@@ -17,17 +17,17 @@ const packageJson = JSON.parse(await readFile(resolve(repoRoot, 'package.json'),
 if (packageJson?.name !== 'botmux') {
   throw new Error(`refusing to clean unrecognized repository root: ${repoRoot}`);
 }
-const outputDir = resolve(repoRoot, 'dist');
-if (basename(outputDir) !== 'dist') {
-  throw new Error(`refusing to clean unexpected build directory: ${outputDir}`);
+const distDir = resolve(repoRoot, 'dist');
+if (basename(distDir) !== 'dist') {
+  throw new Error(`refusing to clean unexpected build directory: ${distDir}`);
 }
 
 try {
-  const stat = await lstat(outputDir);
+  const stat = await lstat(distDir);
   if (stat.isSymbolicLink() || !stat.isDirectory()) {
-    throw new Error(`refusing to clean non-directory or symlink build output: ${outputDir}`);
+    throw new Error(`refusing to clean non-directory or symlink build output: ${distDir}`);
   }
-  await rm(outputDir, { recursive: true, force: false });
+  await rm(distDir, { recursive: true, force: false });
 } catch (err) {
   if (err?.code !== 'ENOENT') throw err;
 }
