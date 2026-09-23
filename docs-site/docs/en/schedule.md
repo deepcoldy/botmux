@@ -192,3 +192,17 @@ Supported CLIs are Codex, Claude Code, Grok and TraeX (the same gate as the trig
 ```
 
 > Execution behavior: the execution position determines the target first. With an explicit `--topic`, an active session in the target topic receives the prompt directly (no new worker); otherwise, a new worker starts in the task's saved working directory. Chat-top-level tasks select a session according to the bot/chat session mode. `--new-topic` uses a fresh session for every run; combined with `--silent`, it creates the topic only when the first `botmux send` needs to deliver content. A dedicated task topic creates the task's own topic on its first fire (a non-silent run posts a seed message anchored as the root; a silent run defers materialization to the first `botmux send`), and every later run is appended to that same session.
+
+## Update a prompt in place
+
+Use `update` to change an existing task without deleting and recreating it:
+
+```bash
+botmux schedule update <id> --prompt-file report-prompt.md
+# For short prompts, use exactly one of these two input options.
+botmux schedule update <id> --prompt "The complete replacement prompt"
+```
+
+Files are read as UTF-8 with line breaks preserved. Only the prompt changes: the task ID, schedule, enabled state, execution position and run history remain intact. Updating does not trigger a run. Already dispatched runs keep their original prompt; subsequent runs use the replacement. Input or authorization failures do not delete the task. Updates use the same locked atomic storage as other task operations.
+
+For ownerless topics created by scheduled tasks, the host daemon authorizes the current caller without exposing bot configuration or credentials to the sandbox. Upgrade the CLI and daemon together: an older daemon without this authorization capability is rejected explicitly, without deleting the task or bypassing verification.

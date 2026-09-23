@@ -1166,7 +1166,7 @@ export function updateTask(
     patch.nextRunAt = next ?? undefined;
   }
 
-  scheduleStore.updateTask(id, patch);
+  if (!scheduleStore.updateTask(id, patch)) return { ok: false, error: 'not_found' };
   const publishedPatch = { ...patch, ...eventPatch };
   if (options.deferEvent) return { ok: true, deferredEventPatch: publishedPatch };
   publishScheduleTaskUpdated(id, publishedPatch);

@@ -20,6 +20,7 @@ vi.mock('../src/services/schedule-store.js', () => ({
       Object.assign(t, updates);
       if ('chatIds' in updates && updates.chatIds === undefined) delete t.chatIds;
     }
+    return !!t;
   },
 }));
 

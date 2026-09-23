@@ -50,6 +50,6 @@ Session info is inferred automatically from ancestor-process markers, so the age
 | `botmux bots invite --chat <chatId> --team <id> --agent <appId>...` | Add same-team agents + their owners into a group you're already in (auto-adds the platform app first if absent) |
 | `botmux history [--limit N]` | Pull the session history (JSON) |
 | `botmux quoted <message_id>` | Pull a single quoted message (JSON) |
-| `botmux schedule add/list/remove/pause/resume/run` | Manage scheduled tasks |
+| `botmux schedule add/list/update/remove/pause/resume/run` | Manage scheduled tasks |
 | `botmux session rename "<title>"` | Rename the **current session's** botmux canonical title (the session is auto-detected; no `--session-id` or any way to target another session). Dashboard and the `/sessions` list update instantly, and the CLI-native session name is synced best-effort. The Lark group name and omt topic name are unchanged (no platform API for topic titles). Recommended shape "type \| subject", up to 200 characters |
 | `botmux chat rename <new group name> [--proactive]` | Rename the **Lark group that hosts the current session** (in a topic group this is the whole `oc_` group, visible across every topic and to every member). `--proactive` is for agent-initiated renames on a phase change, with a 10-minute debounce |

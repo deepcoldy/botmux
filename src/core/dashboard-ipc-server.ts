@@ -1,4 +1,6 @@
 // src/core/dashboard-ipc-server.ts
+import { authorizeOwnerlessScheduleCreator } from './schedule-creator-authorization.js';
+import { readAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { randomBytes } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -1043,6 +1045,16 @@ async function handleManagedOriginAttestation(
   if (outstanding >= MANAGED_ORIGIN_ATTEST_MAX_OUTSTANDING_PER_SESSION) {
     return jsonRes(res, 429, { ok: false, error: 'too_many_attestations' });
   }
+  // Credentials and the allowlist stay on the host. A proof carries only the
+  // authorization for this exact caller/turn, never a client-selected identity.
+  let scheduleBot;
+  try { scheduleBot = getBot(ds.larkAppId); } catch { /* unavailable => denied */ }
+  const scheduleCreator = authorizeOwnerlessScheduleCreator({
+    callerOpenId: origin.callerOpenId,
+    allowedUsers: scheduleBot?.config.allowedUsers,
+    resolvedAllowedUsers: scheduleBot?.resolvedAllowedUsers,
+    resolutionCache: readAllowedUsersResolveCache(config.session.dataDir, ds.larkAppId),
+  });
   let proofPath: string;
   try {
     proofPath = writeManagedOriginAttestationProof({
@@ -1054,6 +1066,7 @@ async function handleManagedOriginAttestation(
         channelId: origin.originChannelId,
         sessionId,
         turnId: liveTurnId,
+        scheduleCreator,
         ...(origin.callerOpenId ? { callerOpenId: origin.callerOpenId } : {}),
         larkAppId: ds.larkAppId,
         ...(origin.dispatchAttempt !== undefined

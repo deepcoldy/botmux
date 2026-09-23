@@ -1,3 +1,4 @@
+import { isScheduleCreatorAuthorization, type ScheduleCreatorAuthorization } from './schedule-creator-authorization.js';
 import { randomBytes } from 'node:crypto';
 import { loopbackFetchImpl } from './loopback-fetch.js';
 import {
@@ -36,6 +37,8 @@ export interface ManagedOriginAttestation {
   callerOpenId?: string;
   /** Daemon owning the live session; never taken from the child request body. */
   larkAppId?: string;
+  /** Optional for old daemons; only the protected proof can authorize a creator. */
+  scheduleCreator?: ScheduleCreatorAuthorization;
   dispatchAttempt?: number;
   requiresCodexAppLedger: boolean;
 }
@@ -163,6 +166,7 @@ function validateProof(input: {
     || (proof.larkAppId !== undefined
       && (typeof proof.larkAppId !== 'string'
         || !/^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(proof.larkAppId)))
+    || (proof.scheduleCreator !== undefined && !isScheduleCreatorAuthorization(proof.scheduleCreator))
     || typeof proof.issuedAtMs !== 'number' || !Number.isFinite(proof.issuedAtMs)
     || proof.issuedAtMs > input.nowMs + 1_000
     || input.nowMs - proof.issuedAtMs > MANAGED_ORIGIN_PROOF_TTL_MS
@@ -182,6 +186,7 @@ function validateProof(input: {
     turnId: proof.turnId,
     ...(typeof proof.callerOpenId === 'string' ? { callerOpenId: proof.callerOpenId } : {}),
     ...(typeof proof.larkAppId === 'string' ? { larkAppId: proof.larkAppId } : {}),
+    ...(isScheduleCreatorAuthorization(proof.scheduleCreator) ? { scheduleCreator: proof.scheduleCreator } : {}),
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
     requiresCodexAppLedger: proof.requiresCodexAppLedger,
   };
