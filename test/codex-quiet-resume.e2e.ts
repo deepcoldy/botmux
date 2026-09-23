@@ -137,6 +137,8 @@ base_url = "http://127.0.0.1:${address.port}/v1"
 wire_api = "responses"
 requires_openai_auth = false
 env_key = "BOTMUX_TEST_LOCAL_API_KEY"
+[projects.${JSON.stringify(workspace)}]
+trust_level = "trusted"
 `);
     const env = { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: directory, CODEX_HOME: codexHome, TERM: 'xterm-256color', BOTMUX_TEST_LOCAL_API_KEY: 'local-fixture-only' };
     const processes: ChildProcessWithoutNullStreams[] = [];

@@ -283,11 +283,15 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
         // here, so it cannot be confirmed by accident, but the modal still covers
         // the pane and confuses screen-state detection / manual inspection; keep
         // it suppressed like the startup update picker.
-        return ['--remote', remoteWsUrl, 'resume', '--no-alt-screen',
+        // Keep config overrides before the subcommand. A launcher may prepend
+        // its own -c (for example, a temporary model-provider proxy URL), and
+        // Codex 0.156 can lose that global override when another -c follows
+        // `resume`.
+        return ['--remote', remoteWsUrl, '--no-alt-screen',
           '-c', 'check_for_update_on_startup=false',
           ...modelNudgeArgs,
           ...(quietResume ? ['-c', 'tui.auto_recap=false'] : []),
-          remoteThreadId];
+          'resume', remoteThreadId];
       }
       // Read isolation for Codex is enforced by the worker's Seatbelt wrapper,
       // NOT by codex's own profile (codex 0.137 can't express a read blocklist).
@@ -393,10 +397,12 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       // into a NEW rollout + session id (session_meta records forked_from_id),
       // leaving the source rollout untouched. Unlike Claude, Codex has no
       // privilege-escalation guard on fork. Falls back to plain `resume` when we
-      // somehow lack a source id (nothing to fork from).
+      // somehow lack a source id (nothing to fork from). Keep every process-level
+      // override before the subcommand so a launcher's earlier -c remains active.
       const codexArgs = codexSessionId
-        ? [forkSession ? 'fork' : 'resume', ...baseArgs,
-          ...(quietResume && !forkSession ? ['-c', 'tui.auto_recap=false'] : []), codexSessionId]
+        ? [...baseArgs,
+          ...(quietResume && !forkSession ? ['-c', 'tui.auto_recap=false'] : []),
+          forkSession ? 'fork' : 'resume', codexSessionId]
         : freshArgs;
       return codexArgs;
     },
