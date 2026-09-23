@@ -63,4 +63,24 @@ describe('dispatch report binding', () => {
     })).toEqual({ ok: false, error: 'dispatch_binding_unproven' });
   });
 
+  it('rejects malformed target chat ids and invalid target scopes at signing time', () => {
+    expect(() => createDispatchReportBinding(SECRET, {
+      dispatchRoot: 'om_seed',
+      targetLarkAppId: 'cli_orchestrator',
+      targetSessionId: 'session-orchestrator',
+      targetChatId: 'bad_chat',
+      sourceName: '支付页修复',
+      issuedAt: '2026-08-10T00:00:00.000Z',
+    })).toThrow('invalid dispatch report target chat');
+    expect(() => createDispatchReportBinding(SECRET, {
+      dispatchRoot: 'om_seed',
+      targetLarkAppId: 'cli_orchestrator',
+      targetSessionId: 'session-orchestrator',
+      targetChatId: 'oc_orchestrator',
+      targetScope: 'topic' as 'chat',
+      sourceName: '支付页修复',
+      issuedAt: '2026-08-10T00:00:00.000Z',
+    })).toThrow('invalid dispatch report target scope');
+  });
+
 });

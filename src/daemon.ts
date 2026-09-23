@@ -6530,6 +6530,9 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
   ): Promise<{ projectSynced: boolean; projectSyncError?: string }> => {
     const projectDaemon = target.larkAppId === decision.target.larkAppId
       ? targetDaemon
+      // deliverReportSessionRelay only chooses same-app fallbacks today. Keep
+      // the lookup defensive so a future broader target still syncs against the
+      // actual landing daemon instead of assuming the original one.
       : findOnlineDaemon(target.larkAppId);
     if (!projectDaemon) return { projectSynced: false, projectSyncError: 'orchestrator_daemon_offline' };
     try {

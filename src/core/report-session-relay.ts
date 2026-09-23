@@ -39,6 +39,7 @@ export type ReportSessionRelayFallbackDecision =
         | 'fallback_not_applicable'
         | 'original_chat_unproven'
         | 'original_session_not_closed'
+        | 'fallback_scope_unsupported'
         | 'fallback_target_unavailable'
         | 'fallback_target_ambiguous';
       originalChatId?: string;
@@ -203,7 +204,19 @@ export function resolveReportRelayFallbackTarget(input: {
   if (!originalChatId || !/^oc_[A-Za-z0-9_-]{1,128}$/.test(originalChatId)) {
     return { ok: false, error: 'original_chat_unproven' };
   }
+  // A thread-scope orchestration needs its rootMessageId to prove a semantic
+  // successor. With only a signed oc_* chat id we cannot distinguish the
+  // original topic's successor from another live topic or a meeting receiver,
+  // so thread→chat fallback stays fail-closed in this round.
+  if (input.originalTarget.scope === 'thread') {
+    return { ok: false, error: 'fallback_scope_unsupported', originalChatId };
+  }
 
+  // Chat-scope fallback intentionally stays narrow but cannot yet exclude a VC
+  // meeting receiver: /api/sessions does not project any receiver/meeting
+  // marker, so a lone live chat row in the same app/chat may still be that
+  // receiver. The untrusted envelope prevents privilege escalation, but the
+  // receiver may still integrate the report and broadcast a status message.
   const candidates = input.sessions.filter(session =>
     session.larkAppId === input.originalTarget.larkAppId
     && session.sessionId !== input.originalTarget.sessionId
@@ -343,6 +356,9 @@ export async function deliverReportSessionRelay(input: {
         : undefined;
       return {
         sessionId: typeof session.sessionId === 'string' ? session.sessionId : '',
+        // Fallback only routes within the original app. Keep this defensive
+        // default so a partial /api/sessions projection cannot silently widen
+        // that boundary if the same-app filter ever regresses.
         larkAppId: typeof session.larkAppId === 'string' ? session.larkAppId : decision.target.larkAppId,
         chatId: typeof session.chatId === 'string' ? session.chatId : undefined,
         scope,

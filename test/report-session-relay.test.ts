@@ -282,6 +282,14 @@ describe('report session relay fallback target', () => {
       status: 404,
       body: { ok: false, error: 'active session not found: session-orchestrator' },
     })).toBe(false);
+    expect(isReportRelayOriginalSessionUnavailable({
+      status: 404,
+      body: [],
+    })).toBe(false);
+    expect(isReportRelayOriginalSessionUnavailable({
+      status: 404,
+      body: 'session_not_found',
+    })).toBe(false);
   });
 
   it('selects the unique current chat-scope session for the original bot and chat', () => {
@@ -295,6 +303,40 @@ describe('report session relay fallback target', () => {
         { ...successor, sessionId: 'wrong-scope', scope: 'thread' },
         { ...originalClosed },
       ],
+    })).toEqual({
+      ok: true,
+      target: { larkAppId: 'cli_orchestrator', sessionId: 'session-current' },
+      reason: 'original_session_closed',
+      originalChatId: 'oc_original',
+    });
+  });
+
+  it('rejects thread-scope bindings even when a unique same-chat fallback exists', () => {
+    expect(resolveReportRelayFallbackTarget({
+      originalTarget: { ...originalTarget, scope: 'thread' },
+      originalSession: { ...originalClosed, scope: 'thread' },
+      sessions: [successor],
+    })).toEqual({
+      ok: false,
+      error: 'fallback_scope_unsupported',
+      originalChatId: 'oc_original',
+    });
+  });
+
+  it('keeps legacy bindings without targetScope fallback-compatible', () => {
+    expect(resolveReportRelayFallbackTarget({
+      originalTarget: {
+        larkAppId: 'cli_orchestrator',
+        sessionId: 'session-orchestrator',
+        chatId: 'oc_original',
+      },
+      originalSession: {
+        larkAppId: 'cli_orchestrator',
+        sessionId: 'session-orchestrator',
+        chatId: 'oc_original',
+        status: 'closed',
+      },
+      sessions: [successor],
     })).toEqual({
       ok: true,
       target: { larkAppId: 'cli_orchestrator', sessionId: 'session-current' },
@@ -367,6 +409,95 @@ describe('report session relay fallback target', () => {
 });
 
 describe('report session relay delivery', () => {
+  it.each([
+    { name: '403', response: { ok: false, status: 403, body: { ok: false, errorCode: 'forbidden' } } },
+    { name: '500', response: { ok: false, status: 500, body: { ok: false, errorCode: 'trigger_failed' } } },
+    { name: '504', response: { ok: false, status: 504, body: { ok: false, errorCode: 'wait_timeout', triggerId: 'trg_1' } } },
+    { name: 'untyped 404', response: { ok: false, status: 404, body: { ok: false, error: 'active session not found: session-orchestrator' } } },
+  ])('passes through first-trigger $name failures without querying sessions or retrying', async ({ response }) => {
+    const authorized = authorize();
+    expect(authorized.ok).toBe(true);
+    if (!authorized.ok) return;
+
+    const calls: string[] = [];
+    const delivered = await deliverReportSessionRelay({
+      decision: authorized,
+      triggerMeta: { requestId: 'report:1', receivedAt: '2026-08-07T07:00:00.000Z' },
+      fetchTarget: async (path) => {
+        calls.push(path);
+        return {
+          ok: response.ok,
+          status: response.status,
+          json: async () => response.body,
+        };
+      },
+      postProjectUpdate: async () => ({ projectSynced: true }),
+    });
+
+    expect(calls).toEqual(['/api/trigger']);
+    expect(delivered).toEqual({
+      status: response.status,
+      body: {
+        ...response.body,
+        reportTarget: authorized.target,
+        projectSynced: false,
+      },
+    });
+  });
+
+  it.each([
+    { name: 'non-200 sessions', sessionsResponse: { ok: false, status: 500, body: { ok: false, error: 'backend_down' } } },
+    { name: 'missing sessions array', sessionsResponse: { ok: true, status: 200, body: { ok: true } } },
+    { name: 'array body', sessionsResponse: { ok: true, status: 200, body: [] } },
+  ])('fails closed when fallback state is unavailable: $name', async ({ sessionsResponse }) => {
+    const authorized = authorize({
+      registry: {
+        om_dispatch: {
+          reportBinding: createDispatchReportBinding(BINDING_SECRET, {
+            dispatchRoot: 'om_dispatch',
+            targetLarkAppId: 'cli_orchestrator',
+            targetSessionId: 'session-orchestrator',
+            targetChatId: 'oc_original',
+            targetScope: 'chat',
+            sourceName: '指标页修复',
+            issuedAt: '2026-08-07T07:00:00.000Z',
+          }),
+        },
+      },
+    });
+    expect(authorized.ok).toBe(true);
+    if (!authorized.ok) return;
+
+    const calls: string[] = [];
+    const delivered = await deliverReportSessionRelay({
+      decision: authorized,
+      triggerMeta: { requestId: 'report:1', receivedAt: '2026-08-07T07:00:00.000Z' },
+      fetchTarget: async (path) => {
+        calls.push(path);
+        if (path === '/api/trigger') {
+          return { ok: false, status: 404, json: async () => ({ errorCode: 'session_not_found' }) };
+        }
+        return {
+          ok: sessionsResponse.ok,
+          status: sessionsResponse.status,
+          json: async () => sessionsResponse.body,
+        };
+      },
+      postProjectUpdate: async () => ({ projectSynced: true }),
+    });
+
+    expect(calls).toEqual(['/api/trigger', '/api/sessions']);
+    expect(delivered).toEqual({
+      status: 502,
+      body: {
+        ok: false,
+        error: 'fallback_state_unavailable',
+        reportTarget: authorized.target,
+        projectSynced: false,
+      },
+    });
+  });
+
   it('tries the signed original first, then retries once with unchanged provenance', async () => {
     const authorized = authorize({
       registry: {
