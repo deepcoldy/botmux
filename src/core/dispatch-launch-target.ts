@@ -392,7 +392,13 @@ export function createDispatchLaunchTargetCoordinator(deps: DispatchLaunchTarget
     for (const receipt of deps.admissionStore.listAuthorized()) {
       try {
         const operation = deps.operationStore.get(receipt.dispatchId);
-        if (!operation || terminal(operation) || expired(operation, deps.now())) {
+        const staleLaunched = operation?.state === 'awaiting_proof'
+          && expired(operation, deps.now())
+          && deps.isLaunchSessionActive?.(operation) === false;
+        if (!operation
+            || terminal(operation)
+            || (operation.state !== 'awaiting_proof' && expired(operation, deps.now()))
+            || staleLaunched) {
           deps.admissionStore.release(receipt.dispatchId, deps.now().toISOString());
         }
       } catch (error) {

@@ -1,0 +1,21 @@
+
+test/dispatch-launch-binding-policy.test.ts:
+(pass) dispatch launch policy evaluation > rejects an absent policy [0.11ms]
+(pass) dispatch launch policy evaluation > rejects a disabled policy [1.44ms]
+(pass) dispatch launch policy evaluation > rejects an unauthorized source app [0.08ms]
+(pass) dispatch launch policy evaluation > rejects a model outside the allow-list [0.05ms]
+(pass) dispatch launch policy evaluation > rejects a reasoning effort outside the allow-list [0.05ms]
+(pass) dispatch launch policy evaluation > accepts allow-listed source+model+effort and produces a stable digest [0.82ms]
+(pass) registerDispatchLaunchBinding schema gate > rejects an unknown reasoning effort at the boundary [1.24ms]
+(pass) registerDispatchLaunchBinding schema gate > rejects a missing model on the effective side [0.22ms]
+(pass) registerDispatchLaunchBinding schema gate > rejects an extra key smuggled onto the effective override [0.13ms]
+(pass) applyDispatchLaunchBinding policy digest gate > applies when the target policy digest matches the frozen one [7.90ms]
+(pass) applyDispatchLaunchBinding policy digest gate > refuses to apply when the target policy digest has drifted [4.16ms]
+(pass) applyDispatchLaunchBinding policy digest gate > warns on a real policy mismatch but stays quiet when no binding exists [3.72ms]
+(pass) applyDispatchLaunchBinding policy digest gate > refuses to apply when the target policy is gone entirely [3.47ms]
+(pass) applyDispatchLaunchBinding policy digest gate > keeps legacy bindings without a policy digest compatible and quiet [3.50ms]
+
+ 14 pass
+ 0 fail
+ 32 expect() calls
+Ran 14 tests across 1 file. [132.00ms]

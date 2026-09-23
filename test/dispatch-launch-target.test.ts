@@ -197,10 +197,11 @@ describe('dispatch launch target coordinator', () => {
     isLaunchSessionActive.mockReturnValueOnce(true);
     await coordinator.recover();
     expect(operationStore.get(DISPATCH_ID)).toMatchObject({ state: 'awaiting_proof' });
-    expect(admissionStore.get(DISPATCH_ID)).toMatchObject({ state: 'released' });
+    expect(admissionStore.get(DISPATCH_ID)).toMatchObject({ state: 'authorized' });
 
     isLaunchSessionActive.mockReturnValue(false);
     await coordinator.recover();
     expect(operationStore.get(DISPATCH_ID)).toMatchObject({ state: 'delivery_unknown', errorCode: 'DELIVERY_UNKNOWN' });
+    expect(admissionStore.get(DISPATCH_ID)).toMatchObject({ state: 'released' });
   });
 });

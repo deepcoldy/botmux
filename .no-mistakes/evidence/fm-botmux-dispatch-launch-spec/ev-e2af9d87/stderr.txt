@@ -1,0 +1,27 @@
+
+test/dispatch-launch-contract.test.ts:
+(pass) dispatch launch canonical kickoff > normalizes newlines and produces stable canonical bytes [1.36ms]
+(pass) dispatch launch canonical kickoff > rejects empty, NUL-containing and oversized semantic fields [0.15ms]
+(pass) dispatch launch canonical kickoff > keeps a maximum legal prepare request below the IPC body limit [1.80ms]
+(pass) dispatch launch override and policy > requires a concrete model for every override [0.20ms]
+(pass) dispatch launch override and policy > does not guess an effort and rejects unsupported v1 harnesses or tuples [0.05ms]
+(pass) dispatch launch override and policy > normalizes policy deterministically and defaults to explicit deny decisions [1.37ms]
+(pass) dispatch launch versioned codecs > rejects unknown fields and canonical kickoff tampering [1.38ms]
+(pass) dispatch launch versioned codecs > rejects the removed succeeded/proof operation state [0.36ms]
+(pass) dispatch launch versioned codecs > rejects requested/effective drift, unsupported identity, and invalid generations [1.25ms]
+(pass) dispatch launch versioned codecs > enforces state-specific required and forbidden fields [1.32ms]
+(pass) dispatch launch versioned codecs > uses cross-app union identity and rejects app-scoped caller open ids [0.29ms]
+(pass) dispatch launch versioned codecs > rejects prepare payload tampering and target identity mismatch [0.23ms]
+(pass) dispatch launch versioned codecs > validates prepare target binding, admission settlement and fork provenance [0.46ms]
+
+test/dispatch-launch-store.test.ts:
+(pass) dispatch launch operation store > creates idempotently, persists CAS transitions, and separates pre-launch from launched operations [15.53ms]
+(pass) dispatch launch operation store > rejects owner, identity, illegal transition, stale state, and post-prepare tuple changes [7.90ms]
+(pass) dispatch launch operation store > fails closed when a persisted record is corrupt [2.19ms]
+(pass) dispatch launch admission store > authorizes and settles exactly once while preserving immutable identity [5.35ms]
+(pass) dispatch launch admission store > rejects foreign targets and dispatch-id reuse with different admission data [2.69ms]
+
+ 18 pass
+ 0 fail
+ 67 expect() calls
+Ran 18 tests across 2 files. [173.00ms]
