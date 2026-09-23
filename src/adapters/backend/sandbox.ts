@@ -675,6 +675,8 @@ export function prepareDirectSandbox(opts: {
   home: string;
   cliBin: string;
   cliArgs: string[];
+  /** Host-backed, per-session scratch directory already admitted by policy. */
+  tempDir?: string;
   /** Absolute Botmux command paths already persisted in CLI MCP configs.
    * Bind the worker-generated relay shim at those exact paths so a stale or
    * tampered host wrapper cannot replace the trusted gateway entry. */
@@ -860,6 +862,11 @@ export function prepareDirectSandbox(opts: {
     SESSION_DATA_DIR: dataDir,
     BOTMUX_SEND_RELAY: outbox,
     PATH: ['/run/sbxbin', ...canonicalExecDirs, process.env.PATH ?? ''].filter(Boolean).join(':'),
+    ...(opts.tempDir ? {
+      TMPDIR: opts.tempDir,
+      TMP: opts.tempDir,
+      TEMP: opts.tempDir,
+    } : {}),
   };
   if (process.env.BOTMUX_DAEMON_IPC_PORT) {
     env.BOTMUX_DAEMON_IPC_PORT = process.env.BOTMUX_DAEMON_IPC_PORT;

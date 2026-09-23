@@ -622,6 +622,11 @@ export const PROXY_ENV_KEYS = [
  *  buildBotmuxEnvAssignments instead. */
 export const CA_BUNDLE_ENV_KEYS = ['SSL_CERT_FILE'] as const;
 
+/** Session-scoped scratch path. Forwarded per pane like proxy variables: it
+ * must override shell/tmux ambient values, but must not delete a user's own
+ * TMPDIR from a shared tmux server. */
+export const SESSION_TEMP_ENV_KEYS = ['TMPDIR', 'TMP', 'TEMP'] as const;
+
 const TMUX_CLIENT_STRIP_KEYS: ReadonlySet<string> = new Set([
   ...BOTMUX_INJECTED_ENV_KEYS,
   ...REDACTED_CHILD_ENV_KEYS,
@@ -636,6 +641,9 @@ const TMUX_CLIENT_STRIP_KEYS: ReadonlySet<string> = new Set([
   // Same reasoning as the proxy keys: keep a daemon-side CA bundle out of the
   // shared server's global env, but never delete one the user set there.
   ...CA_BUNDLE_ENV_KEYS,
+  // Keep the daemon/session scratch path out of a newly-created shared tmux
+  // server. Each botmux pane receives its own values via env(1) instead.
+  ...SESSION_TEMP_ENV_KEYS,
 ]);
 
 const TMUX_SERVER_GLOBAL_SCRUB_KEYS: ReadonlySet<string> = new Set([

@@ -141,6 +141,18 @@ beforeEach(() => {
 });
 
 describe('TmuxPipeBackend.spawn', () => {
+  it.each([
+    { status: 1, stderr: Buffer.from('mkfifo: No space left on device') },
+    { status: null, error: new Error('spawn mkfifo ENOENT') },
+  ])('preserves FIFO creation failure before opening or subscribing', (failure) => {
+    mockedSpawnSync.mockReturnValueOnce(bufferSpawnResult(failure));
+    vi.mocked(openSync).mockClear();
+    const be = new TmuxPipeBackend('0:2.0');
+    expect(() => be.spawn('', [], spawnOpts())).toThrow(/Could not create tmux FIFO.*(No space left|ENOENT)/);
+    expect(openSync).not.toHaveBeenCalled();
+    expect(mockedExecSync.mock.calls.some(call => String(call[0]).includes('pipe-pane'))).toBe(false);
+  });
+
   it('mkfifo + opens read fd + issues tmux pipe-pane to that fifo', () => {
     const be = new TmuxPipeBackend('0:2.0');
     be.spawn('', [], spawnOpts());

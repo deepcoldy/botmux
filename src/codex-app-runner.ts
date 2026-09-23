@@ -360,6 +360,7 @@ class AppServerClient {
     this.child.on('exit', (code, signal) => {
       writeLine(`[codex-app] app-server exited (code=${code}, signal=${signal})`);
       const err = this.fatalError ?? new Error(`Codex app-server exited (code=${code}, signal=${signal})${this.lastStderr ? `\n${this.lastStderr}` : ''}`);
+      if (this.lastStderr) output.error(`[codex-app-server] exited with code=${code}, signal=${signal}; stderr tail:\n${this.lastStderr}\n`);
       this.failAll(err);
     });
   }
