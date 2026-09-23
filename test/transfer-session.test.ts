@@ -1158,7 +1158,16 @@ describe('transferSession', () => {
     expect(ds.session.status).toBe('closed');
     expect(registry.has(sourceKey)).toBe(false);
     expect(replacementFork).not.toHaveBeenCalled();
-    expect(updateMessageMock).not.toHaveBeenCalled();
+    // Explicit close freezes the original card; the cancelled transfer must
+    // neither replace it with a relocated card nor publish to the target chat.
+    expect(updateMessageMock).toHaveBeenCalledTimes(1);
+    expect(updateMessageMock).toHaveBeenCalledWith(
+      'cli_app_test',
+      'om_old_card',
+      expect.any(String),
+    );
+    const closedCard = JSON.parse(updateMessageMock.mock.calls[0][2]);
+    expect(closedCard.header.title.content).toContain('会话已关闭');
   });
 
   it('keeps a committed transfer successful when replacement fork and replay throw', async () => {
