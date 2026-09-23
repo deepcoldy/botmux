@@ -100,17 +100,36 @@ describe('botmux whiteboard CLI', () => {
     expect(read.stdout).toContain('current state from stdin');
 
     const post = runCli(['whiteboard', 'post', '--id', 'manual_board', '--to', 'bot-b'], 'handoff note\n');
-    expect(post.status).not.toBe(0);
-    expect(post.stderr).toContain('Unknown whiteboard command: post');
+    expect(post.status).toBe(0);
+    const posted = JSON.parse(post.stdout);
+    expect(posted.ok).toBe(true);
+    expect(posted.message).toMatchObject({ seq: 1, to: 'bot-b', body: 'handoff note' });
+    const log = runCli(['whiteboard', 'log', '--id', 'manual_board', '--json']);
+    expect(log.status).toBe(0);
+    expect(JSON.parse(log.stdout).messages.map((m: { body: string }) => m.body)).toContain('handoff note');
   });
 
-  it('seeds a new board with the Chinese 当前状态 template', () => {
+  it('seeds a new board with the shared-blackboard template', () => {
     const created = runCli(['whiteboard', 'create', '--id', 'template_board', '--title', '模板', '--lark-app-id', 'app1', '--chat-id', 'chat-tmpl', '--working-dir', join(home, 'tmpl-repo')]);
     expect(created.status).toBe(0);
     const read = runCli(['whiteboard', 'read', '--id', 'template_board']);
-    expect(read.stdout).toContain('# 当前状态');
-    expect(read.stdout).toContain('## 项目目标');
-    expect(read.stdout).toContain('## 下一步');
+    expect(read.stdout).toContain('项目共享白板');
+    expect(read.stdout).toContain('共享结论');
+    expect(read.stdout).toContain('各 Session 工作区');
+    expect(read.stdout).toContain('消息日志');
+  });
+
+  it('section writes only this session\'s block without clobbering others', () => {
+    runCli(['whiteboard', 'create', '--id', 'section_board', '--lark-app-id', 'app1', '--chat-id', 'chat-sec', '--working-dir', join(home, 'sec-repo')]);
+    const a = runCli(['whiteboard', 'section', '--id', 'section_board', '--session-id', 'sess-a'], '- a on X\n');
+    expect(a.status).toBe(0);
+    const b = runCli(['whiteboard', 'section', '--id', 'section_board', '--session-id', 'sess-b'], '- b on Y\n');
+    expect(b.status).toBe(0);
+    const read = runCli(['whiteboard', 'read', '--id', 'section_board']).stdout;
+    expect(read).toContain('## @session sess-a');
+    expect(read).toContain('- a on X');
+    expect(read).toContain('## @session sess-b');
+    expect(read).toContain('- b on Y');
   });
 
   it('requires --yes for overwrite', () => {

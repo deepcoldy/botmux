@@ -7229,6 +7229,16 @@ Commands:
                                changed since that version (CAS); exit 2 with a re-read hint
   write --yes [--id ID] ...    Force-overwrite board.md; --yes required. Also honors
                                --expected-updated-at when supplied
+  section [--id ID] [text...]  Replace ONLY this session's own block (## @session <id>) in
+                               the board, leaving every other session's block untouched.
+                               No whole-board rewrite, no CAS needed. Empty body removes it.
+  post [--id ID] [--kind K] [--to WHO] [text...]
+                               Append a message to the board's shared log (claim / yield /
+                               question / handoff / note …). Serialized append — never
+                               clobbers a concurrent writer. Use to coordinate with peers.
+  log [--id ID] [--since SEQ] [--limit N] [--json]
+                               Read the message log (what peers posted). --since to see only
+                               new messages past a seq cursor.
 
 Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
     return;
@@ -7294,16 +7304,16 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
   // earlier branches (help/status/enable/disable/list/current/create) already
   // returned. Reject unknown actions BEFORE computing an id — otherwise a typo
   // like `post` fell through to the misleading "No whiteboard id" error.
-  if (!['read', 'path', 'update', 'write'].includes(action)) {
+  if (!['read', 'path', 'update', 'write', 'section', 'post', 'log'].includes(action)) {
     console.error(`Unknown whiteboard command: ${action}`);
     process.exit(1);
   }
-  if (['read', 'update', 'write'].includes(action)) requireWhiteboardEnabled();
+  if (['read', 'update', 'write', 'section', 'post', 'log'].includes(action)) requireWhiteboardEnabled();
 
   const explicitId = argValue(rest, '--id');
   const ctx = currentWhiteboardContext(rest);
   let id = explicitId ?? ctx.session?.whiteboardId;
-  if (!id && whiteboardEnabled() && action === 'update') {
+  if (!id && whiteboardEnabled() && (action === 'update' || action === 'section' || action === 'post')) {
     const meta = ensureDefaultWhiteboard({ larkAppId: ctx.larkAppId, chatId: ctx.chatId, workingDir: ctx.workingDir, sessionId: ctx.sessionId });
     id = meta.id;
     if (ctx.session) {
@@ -7378,6 +7388,58 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
     } catch (e) {
       handleWhiteboardWriteError(e, id);
     }
+    return;
+  }
+  if (action === 'section') {
+    // Section write: replace ONLY this session's own block. Requires a session
+    // context to key the block on; falls back to an explicit --session-id.
+    const sessionId = ctx.sessionId ?? argValue(rest, '--session-id');
+    if (!sessionId) {
+      console.error('`whiteboard section` needs a session context. Run it inside a session, or pass --session-id.');
+      process.exit(2);
+    }
+    // Empty body is allowed here (removes the block), so don't reject blank.
+    const body = whiteboardContentFromArgs(rest, WHITEBOARD_BOOLEAN_FLAGS);
+    const { upsertWhiteboardSection } = await import('./services/whiteboard-store.js');
+    try {
+      const meta = upsertWhiteboardSection(id, sessionId, body, { actor: ctx.sessionId });
+      console.log(JSON.stringify({ ok: true, board: meta }, null, 2));
+    } catch (e) {
+      handleWhiteboardWriteError(e, id);
+    }
+    return;
+  }
+  if (action === 'post') {
+    const body = whiteboardContentFromArgs(rest, WHITEBOARD_BOOLEAN_FLAGS);
+    if (!body.trim()) {
+      console.error('Refusing to post an empty message. Pass text as args, pipe stdin, or use --content-file <path>.');
+      process.exit(2);
+    }
+    const { postWhiteboardMessage } = await import('./services/whiteboard-store.js');
+    try {
+      const message = postWhiteboardMessage(id, {
+        body,
+        kind: argValue(rest, '--kind'),
+        to: argValue(rest, '--to'),
+        actor: ctx.sessionId,
+      });
+      console.log(JSON.stringify({ ok: true, message }, null, 2));
+    } catch (e) {
+      handleWhiteboardWriteError(e, id);
+    }
+    return;
+  }
+  if (action === 'log') {
+    const sinceRaw = argValue(rest, '--since');
+    const limitRaw = argValue(rest, '--limit');
+    const sinceSeq = sinceRaw !== undefined ? Number(sinceRaw) : undefined;
+    const limit = limitRaw !== undefined ? Number(limitRaw) : undefined;
+    const { readWhiteboardLog } = await import('./services/whiteboard-store.js');
+    const messages = readWhiteboardLog(id, {
+      ...(Number.isFinite(sinceSeq) ? { sinceSeq } : {}),
+      ...(Number.isFinite(limit) ? { limit } : {}),
+    });
+    console.log(JSON.stringify({ id, messages }, null, 2));
     return;
   }
 
