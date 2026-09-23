@@ -206,12 +206,13 @@ async function loadModules() {
   // Vitest mock before the test asks for the worker-pool module itself.
   const daemon = await import('../src/daemon.js');
   const registry = await import('../src/bot-registry.js');
+  const frozenCommand = await import('../src/services/frozen-command.js');
   const lifecycle = await import('../src/services/frozen-command-lifecycle.js');
   const actionStore = await import('../src/services/frozen-command-action.js');
   const ipc = await import('../src/core/dashboard-ipc-server.js');
   const types = await import('../src/core/types.js');
   const workerPool = await import('../src/core/worker-pool.js');
-  return { daemon, registry, lifecycle, actionStore, ipc, types, workerPool };
+  return { daemon, registry, frozenCommand, lifecycle, actionStore, ipc, types, workerPool };
 }
 
 function hash(text: string): string {
@@ -222,18 +223,20 @@ function makeSession(input: {
   scope: 'thread' | 'chat';
   backendType: 'pty' | 'tmux';
   sourceText: string;
+  chatId?: string;
   actorOpenId?: string;
   actorUnionId?: string;
   senderType?: 'user' | 'bot' | 'unknown';
 }) {
   const turnId = `om_${input.scope}_${input.backendType}_${Math.random().toString(36).slice(2)}`;
   const sessionId = `sess_${input.scope}_${input.backendType}_${Math.random().toString(36).slice(2)}`;
-  const rootMessageId = input.scope === 'thread' ? `om_root_${sessionId}` : CHAT;
+  const chatId = input.chatId ?? CHAT;
+  const rootMessageId = input.scope === 'thread' ? `om_root_${sessionId}` : chatId;
   const actorOpenId = input.actorOpenId ?? ACTOR_OPEN_ID;
   const actorUnionId = input.actorUnionId ?? ACTOR_UNION_ID;
   const ds = {
     scope: input.scope,
-    chatId: CHAT,
+    chatId,
     chatType: 'group',
     larkAppId: APP,
     workingDir: root,
@@ -243,7 +246,7 @@ function makeSession(input: {
     session: {
       sessionId,
       rootMessageId,
-      chatId: CHAT,
+      chatId,
       chatType: 'group',
       scope: input.scope,
       cliId: 'codex',
@@ -485,6 +488,60 @@ async function postIntent(ds: any, rawArgs = '11') {
   return res;
 }
 
+function seedLegacyPendingRun(ds: any, rawArgs = '11'): {
+  action: string;
+  transition_id: string;
+  nonce: string;
+} {
+  const lifecycle = modules.lifecycle.evaluateFrozenCommandLifecycle({
+    dataDir,
+    targetBotId: APP,
+    workingDir: root,
+    command: COMMAND,
+  });
+  if (lifecycle.kind !== 'active') throw new Error(`expected active command, got ${lifecycle.kind}`);
+  const lookup = modules.frozenCommand.lookupFrozenCommand({ workingDir: root, command: COMMAND });
+  if (lookup.kind !== 'found') throw new Error(`expected installed command, got ${lookup.kind}`);
+  const normalizedArgs = modules.frozenCommand.normalizeFrozenCommandArguments({
+    definition: lookup.snapshot.definition,
+    rawArgs,
+  }).args;
+  const created = modules.actionStore.createFrozenCommandAction(dataDir, {
+    targetBotId: APP,
+    chatId: ds.chatId,
+    chatType: ds.chatType,
+    rootMessageId: ds.scope === 'thread' ? ds.session.rootMessageId : ds.chatId,
+    scope: ds.scope,
+    sessionId: ds.session.sessionId,
+    turnId: ds.activeInteractiveTurn.turnId,
+    dispatchAttempt: ds.managedTurnOrigin.dispatchAttempt ?? 0,
+    workingDir: root,
+    sourceMessageId: ds.activeInteractiveTurn.turnId,
+    sourceContentHash: ds.activeInteractiveTurn.sourceContentHash,
+    intentSchemaVersion: 'botmux.frozen-command-intent.v1',
+    parserVersion: 'frozen-command-args.v1',
+    actorOpenId: ds.activeInteractiveTurn.caller.requestUserOpenId,
+    actorUnionId: ds.activeInteractiveTurn.caller.requestUserUnionId,
+    command: COMMAND.slice(1),
+    rawArgs,
+    normalizedArgs,
+    datasource: typeof lookup.snapshot.definition.input.datasource === 'string'
+      ? lookup.snapshot.definition.input.datasource
+      : undefined,
+    executorId: lookup.snapshot.definition.executor,
+    executorRevision: lifecycle.record.executorRevision!,
+    specHash: lifecycle.record.specHash!,
+    revisionId: lifecycle.record.stateRevisionId,
+  });
+  expect(modules.actionStore.bindFrozenCommandActionCard(dataDir, created.record.id, 'om_card_1')).toBe(true);
+  mocks.getMessageChatId.mockResolvedValue(ds.chatId);
+  return {
+    action: 'frozen_command_run_confirm',
+    transition_id: created.record.id,
+    nonce: created.nonce,
+  };
+}
+
 async function postHostIntent(
   ds: any,
   input: {
@@ -539,13 +596,6 @@ async function postUntrustedIntentWithoutCapability(ds: any) {
   );
   expect(found).toBe(true);
   return res;
-}
-
-function latestPreviewAction(): { action: string; transition_id: string; nonce: string } {
-  const parsed = JSON.parse(mocks.cardBodies.at(-1)!) as any;
-  const row = parsed.body.elements.find((element: any) => element.tag === 'column_set');
-  const button = row.columns[0].elements.find((element: any) => element.tag === 'button');
-  return button.behaviors.find((behavior: any) => behavior.type === 'callback').value;
 }
 
 function latestLifecycleAction(): { action: string; transition_token: string } {
@@ -992,8 +1042,7 @@ describe('Frozen Command host-owned route → callback → Data MCP flow', () =>
   ] as const)('persists query_id from the %s MCP result shape', async (_label, shape) => {
     mocks.runResultShape = shape;
     const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '运行命令' });
-    expect((await postHostIntent(ds)).statusCode).toBe(200);
-    const value = latestPreviewAction();
+    const value = seedLegacyPendingRun(ds);
 
     await modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP);
     const completed = await waitForStatus(value.transition_id, 'completed');
@@ -1008,8 +1057,7 @@ describe('Frozen Command host-owned route → callback → Data MCP flow', () =>
   ] as const)('fails closed for a %s query_id without replay or model fallback', async (_label, shape) => {
     mocks.runResultShape = shape;
     const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '运行命令' });
-    expect((await postHostIntent(ds)).statusCode).toBe(200);
-    const value = latestPreviewAction();
+    const value = seedLegacyPendingRun(ds);
 
     await modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP);
     const failed = await waitForStatus(value.transition_id, 'failed');
@@ -1033,6 +1081,104 @@ describe('Frozen Command host-owned route → callback → Data MCP flow', () =>
     expect(mocks.cardBodies[0]).not.toContain('SELECT');
     expect(mocks.validateCalls).toBe(0);
     expect(mocks.runCalls).toBe(0);
+  });
+
+  it.each([
+    ['list', { operation: 'list' as const }],
+    ['apply', { operation: 'approve' as const, definitionYaml: YAML, reason: '授权访客不得创建命令' }],
+    ['rm', { operation: 'retire' as const, reason: '授权访客不得废弃命令' }],
+    ['run', { operation: 'run' as const, rawArgs: '11' }],
+  ])('rejects grant-only visitors at the host action endpoint for %s without posting a card', async (
+    _label,
+    request,
+  ) => {
+    enableGrantCommandRestriction();
+    const ds = makeSession({
+      scope: 'thread',
+      backendType: 'tmux',
+      sourceText: '固化命令宿主意图',
+      chatId: GRANT_CHAT,
+      actorOpenId: GRANT_GUEST_OPEN_ID,
+      actorUnionId: GRANT_GUEST_UNION_ID,
+    });
+    const response = await postHostIntent(ds, request);
+
+    expect(response.statusCode).toBe(403);
+    expect(response.payload).toMatchObject({ ok: false, error: 'grant_command_restricted' });
+    expect(mocks.cardBodies).toHaveLength(0);
+    expect(mocks.validateCalls).toBe(0);
+    expect(mocks.runCalls).toBe(0);
+  });
+
+  it('keeps the host action endpoint available to allowedUsers when grant commands are restricted', async () => {
+    enableGrantCommandRestriction();
+    const ds = makeSession({
+      scope: 'thread',
+      backendType: 'tmux',
+      sourceText: '查看固化命令',
+      chatId: GRANT_CHAT,
+    });
+    const response = await postHostIntent(ds, { operation: 'list' });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.payload).toMatchObject({ status: 'presented', operation: 'list' });
+    expect(mocks.cardBodies).toHaveLength(1);
+    expect(mocks.validateCalls).toBe(0);
+    expect(mocks.runCalls).toBe(0);
+  });
+
+  it('rejects a pre-fix grant-only run card when the visitor confirms it', async () => {
+    const ds = makeSession({
+      scope: 'thread',
+      backendType: 'tmux',
+      sourceText: '运行命令',
+      chatId: GRANT_CHAT,
+      actorOpenId: GRANT_GUEST_OPEN_ID,
+      actorUnionId: GRANT_GUEST_UNION_ID,
+    });
+    const value = seedLegacyPendingRun(ds);
+    enableGrantCommandRestriction();
+
+    const result = await modules.daemon.__testOnly_handleFrozenCommandCardAction(
+      callbackData(value, { open_id: GRANT_GUEST_OPEN_ID, union_id: GRANT_GUEST_UNION_ID }),
+      APP,
+    );
+
+    expect(result).toMatchObject({ toast: { type: 'error' } });
+    expect(modules.actionStore.getFrozenCommandAction(dataDir, value.transition_id)?.status).toBe('pending');
+    expect(mocks.validateCalls).toBe(0);
+    expect(mocks.runCalls).toBe(0);
+  });
+
+  it('rejects a pre-fix grant-only lifecycle card when the visitor confirms it', async () => {
+    const guestCommand = '访客旧卡';
+    const pending = modules.lifecycle.prepareFrozenCommandTransition({
+      dataDir,
+      targetBotId: APP,
+      workingDir: root,
+      command: `/${guestCommand}`,
+      action: 'approve',
+      actor: { openId: GRANT_GUEST_OPEN_ID, unionId: GRANT_GUEST_UNION_ID },
+      reason: '模拟修复前已发出的确认卡',
+      candidateYaml: YAML.replaceAll('宿主闭环', guestCommand),
+    });
+    enableGrantCommandRestriction();
+
+    const result = await modules.daemon.__testOnly_handleFrozenCommandCardAction(
+      callbackData(
+        { action: 'frozen_command_lifecycle_confirm', transition_token: pending.token },
+        { open_id: GRANT_GUEST_OPEN_ID, union_id: GRANT_GUEST_UNION_ID },
+      ),
+      APP,
+    );
+
+    expect(result).toMatchObject({ toast: { type: 'error' } });
+    expect(modules.lifecycle.evaluateFrozenCommandLifecycle({
+      dataDir,
+      targetBotId: APP,
+      workingDir: root,
+      command: `/${guestCommand}`,
+    }).kind).not.toBe('active');
   });
 
   it('lists only current-bot commands and keeps parser details out of the business card', async () => {
@@ -1255,13 +1401,10 @@ unexpectedInternalField: true
     expect(mocks.runCalls).toBe(0);
   });
 
-  it('binds a trusted host run to the live actor and still requires the actor callback', async () => {
+  it('keeps legacy run cards bound to the live actor and still requires the actor callback', async () => {
     const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '运行命令' });
     delete ds.managedTurnOrigin.dispatchAttempt;
-    const response = await postHostIntent(ds);
-    expect(response.statusCode).toBe(200);
-    expect(response.payload).toMatchObject({ status: 'awaiting_input', operation: 'run' });
-    const value = latestPreviewAction();
+    const value = seedLegacyPendingRun(ds);
 
     await modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP);
     const completed = await waitForStatus(value.transition_id, 'completed');
@@ -1297,11 +1440,7 @@ unexpectedInternalField: true
       },
       sourceContentHash: hash(normalizedText),
     });
-    const response = await postIntent(ds);
-    expect(response.statusCode).toBe(200);
-    expect(response.payload).toMatchObject({ status: 'awaiting_input', operation: 'run' });
-    const value = latestPreviewAction();
-    expect(mocks.cardBodies.at(-1)).not.toContain('SELECT');
+    const value = seedLegacyPendingRun(ds);
 
     await modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP);
     const completed = await waitForStatus(value.transition_id, 'completed');
@@ -1321,8 +1460,7 @@ unexpectedInternalField: true
     ['different human', { open_id: 'ou_other', union_id: 'on_other' }],
   ] as const)('rejects %s callback identity before Data MCP', async (_label, operator) => {
     const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '运行命令' });
-    expect((await postIntent(ds)).statusCode).toBe(200);
-    const value = latestPreviewAction();
+    const value = seedLegacyPendingRun(ds);
     const result = await modules.daemon.__testOnly_handleFrozenCommandCardAction(
       callbackData(value, operator), APP,
     );
@@ -1355,8 +1493,7 @@ unexpectedInternalField: true
 
   it('rechecks current canTalk so a revoked actor cannot use an old card', async () => {
     const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '运行命令' });
-    expect((await postIntent(ds)).statusCode).toBe(200);
-    const value = latestPreviewAction();
+    const value = seedLegacyPendingRun(ds);
     const bot = modules.registry.getBot(APP);
     bot.resolvedAllowedUsers = [];
     bot.config.oncallChats = [];
@@ -1367,11 +1504,11 @@ unexpectedInternalField: true
     expect(mocks.runCalls).toBe(0);
   });
 
-  it('rejects invalid parameters in the creation route with zero Data MCP calls', async () => {
+  it('rejects the retired host run operation before card or Data MCP calls', async () => {
     const ds = makeSession({ scope: 'chat', backendType: 'pty', sourceText: '运行命令' });
-    const response = await postIntent(ds, '0');
-    expect(response.statusCode).toBe(400);
-    expect(response.payload).toMatchObject({ ok: false, error: 'parameter_integer_out_of_range' });
+    const response = await postHostIntent(ds, { operation: 'run', rawArgs: '11' });
+    expect(response.statusCode).toBe(409);
+    expect(response.payload).toMatchObject({ ok: false, error: 'frozen_command_run_disabled' });
     expect(mocks.cardBodies).toHaveLength(0);
     expect(mocks.validateCalls).toBe(0);
     expect(mocks.runCalls).toBe(0);
@@ -1379,8 +1516,7 @@ unexpectedInternalField: true
 
   it('fails closed when an old card crosses definition hash and lifecycle revision', async () => {
     const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '运行命令' });
-    expect((await postIntent(ds)).statusCode).toBe(200);
-    const value = latestPreviewAction();
+    const value = seedLegacyPendingRun(ds);
     const file = join(root, '.botmux', 'commands', '宿主闭环.yaml');
     writeFileSync(file, readFileSync(file, 'utf8').replace('SELECT {{value}} * 2', 'SELECT {{value}} * 3'));
     const replacement = modules.lifecycle.prepareFrozenCommandTransition({
@@ -1408,8 +1544,7 @@ unexpectedInternalField: true
 
   it('uses DB CAS so concurrent double-clicks produce exactly one validate and one run', async () => {
     const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '运行命令' });
-    expect((await postIntent(ds)).statusCode).toBe(200);
-    const value = latestPreviewAction();
+    const value = seedLegacyPendingRun(ds);
     const [first, second] = await Promise.all([
       modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP),
       modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP),

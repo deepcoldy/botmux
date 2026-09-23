@@ -143,10 +143,7 @@ import {
   type FrozenCommandLifecycleAction,
 } from './services/frozen-command-lifecycle.js';
 import {
-  bindFrozenCommandActionCard,
   claimFrozenCommandAction,
-  createFrozenCommandAction,
-  expirePendingFrozenCommandAction,
   expireInterruptedFrozenCommandActions,
   getFrozenCommandAction,
   settleFrozenCommandAction,
@@ -157,7 +154,6 @@ import {
   buildFrozenCommandCenterCard,
   buildFrozenCommandLifecyclePreviewCard,
   buildFrozenCommandLifecycleStatusCard,
-  buildFrozenCommandPreviewCard,
   FROZEN_COMMAND_ACTION_CANCEL,
   FROZEN_COMMAND_ACTION_CONFIRM,
   FROZEN_COMMAND_LIFECYCLE_CANCEL,
@@ -6619,6 +6615,10 @@ async function handleFrozenCommandCardAction(
     if (!operator.openId || !operator.unionId) {
       return { toast: { type: 'error', content: '无法确认当前操作者身份' } };
     }
+    const restrictedText = grantRestrictedCommandText(larkAppId, actualChatId, operator.openId, '/freeze');
+    if (restrictedText) {
+      return { toast: { type: 'error', content: restrictedText } };
+    }
     try {
       if (actionKind === FROZEN_COMMAND_LIFECYCLE_CANCEL) {
         const cancelled = cancelFrozenCommandTransition({
@@ -6687,6 +6687,10 @@ async function handleFrozenCommandCardAction(
     || operator.unionId !== pending.actorUnionId
     || !canTalk(larkAppId, pending.chatId, operator.openId, undefined, operator.unionId, pending.chatType)) {
     return { toast: { type: 'error', content: '仅原消息的同一真人且仍有查询权限时可以确认' } };
+  }
+  const restrictedText = grantRestrictedCommandText(larkAppId, actualChatId, operator.openId, '/freeze');
+  if (restrictedText) {
+    return { toast: { type: 'error', content: restrictedText } };
   }
   const claimed = claimFrozenCommandAction({
     dataDir: config.session.dataDir,
@@ -7722,10 +7726,6 @@ ipcRoute('POST', '/api/frozen-command-actions', async (req, res) => {
       && liveOrigin.dispatchAttempt !== body.originDispatchAttempt)) {
     return jsonRes(res, 403, { ok: false, error: 'origin_identity_mismatch' });
   }
-  // Ordinary human IM turns intentionally have no managed dispatch attempt;
-  // positive attempts belong to managed/bot dispatches. Persist zero as the
-  // explicit human-turn sentinel so the action audit never invents an attempt.
-  const boundDispatchAttempt = liveOrigin.dispatchAttempt ?? 0;
   const origin = ds.activeInteractiveTurn;
   const actor = origin?.caller;
   if (!origin
@@ -7738,6 +7738,25 @@ ipcRoute('POST', '/api/frozen-command-actions', async (req, res) => {
     || !actor.requestUserUnionId?.startsWith('on_')
     || liveOrigin.callerOpenId !== actor.requestUserOpenId) {
     return jsonRes(res, 403, { ok: false, error: 'trusted_human_required' });
+  }
+  const restrictedText = grantRestrictedCommandText(
+    ds.larkAppId,
+    ds.chatId,
+    actor.requestUserOpenId,
+    '/freeze',
+  );
+  if (restrictedText) {
+    return jsonRes(res, 403, {
+      ok: false,
+      error: 'grant_command_restricted',
+      detail: restrictedText,
+    });
+  }
+  // `botmux freeze run` is intentionally disabled in the CLI. Keep the
+  // authoritative endpoint fail-closed as well so an old client or a direct
+  // host request cannot recreate the removed confirmation-and-replay path.
+  if (body.operation === 'run') {
+    return jsonRes(res, 409, { ok: false, error: 'frozen_command_run_disabled' });
   }
   const configuredDir = ds.workingDir ?? ds.session.workingDir;
   if (!configuredDir) return jsonRes(res, 409, { ok: false, error: 'working_dir_missing' });
@@ -7774,157 +7793,47 @@ ipcRoute('POST', '/api/frozen-command-actions', async (req, res) => {
       commandCount: rows.length,
     });
   }
-  if (body.operation !== 'run') {
-    const action: FrozenCommandLifecycleAction = body.operation;
-    let prepared;
-    try {
-      prepared = prepareFrozenCommandTransition({
-        dataDir: config.session.dataDir,
-        targetBotId: ds.larkAppId,
-        workingDir,
-        command: body.command!,
-        action,
-        actor: {
-          openId: actor.requestUserOpenId,
-          unionId: actor.requestUserUnionId,
-        },
-        actorIsAdmin: canManageFrozenCommands(ds.larkAppId, actor.requestUserUnionId),
-        reason: body.reason!,
-        ...(body.replacement ? { replacement: body.replacement } : {}),
-        ...(body.definitionYaml ? { candidateYaml: body.definitionYaml } : {}),
-      });
-    } catch (error) {
-      const permissionDenied = error instanceof FrozenCommandError
-        && ['transition_owner_mismatch', 'transition_owner_missing', 'transition_admin_required']
-          .includes(error.code);
-      return jsonRes(res, permissionDenied ? 403 : 409, {
-        ok: false,
-        error: error instanceof FrozenCommandError ? error.code : 'transition_prepare_failed',
-        detail: error instanceof Error ? error.message : String(error),
-      });
-    }
-    const card = buildFrozenCommandLifecyclePreviewCard({
-      transition: prepared,
-      workingDirLabel: basename(workingDir) || workingDir,
-    });
-    const cardMessageId = await sessionReply(
-      sessionAnchorId(ds), card, 'interactive', ds.larkAppId, body.originTurnId,
-    );
-    return jsonRes(res, 200, {
-      ok: true,
-      status: 'awaiting_input',
-      operation: body.operation,
-      cardMessageId,
-      expiresAt: prepared.expiresAt,
-    });
-  }
-  const normalizedCommand = normalizeFrozenCommandName(body.command!);
-  if (!normalizedCommand) return jsonRes(res, 400, { ok: false, error: 'invalid_command_name' });
-  const exactMatches = listFrozenCommandSnapshots(workingDir)
-    .filter(row => row.command === normalizedCommand);
-  if (exactMatches.length !== 1) {
-    return jsonRes(res, 409, {
-      ok: false,
-      error: exactMatches.length === 0 ? 'command_not_found' : 'command_ambiguous',
-    });
-  }
-  const lookup = lookupFrozenCommand({ workingDir, command: normalizedCommand });
-  if (lookup.kind !== 'found') {
-    return jsonRes(res, 409, { ok: false, error: lookup.kind === 'invalid' ? lookup.error.code : 'command_not_found' });
-  }
-  const lifecycle = evaluateFrozenCommandLifecycle({
-    dataDir: config.session.dataDir,
-    targetBotId: ds.larkAppId,
-    workingDir,
-    command: normalizedCommand,
-    snapshot: lookup.snapshot,
-  });
-  if (lifecycle.kind !== 'active' || !lifecycle.record.specHash || !lifecycle.record.executorRevision) {
-    return jsonRes(res, 409, { ok: false, error: `command_${lifecycle.kind}` });
-  }
-  let normalizedArgs;
+  const action: FrozenCommandLifecycleAction = body.operation;
+  let prepared;
   try {
-    normalizedArgs = normalizeFrozenCommandArguments({
-      definition: lookup.snapshot.definition,
-      rawArgs: body.rawArgs!,
-    }).args;
+    prepared = prepareFrozenCommandTransition({
+      dataDir: config.session.dataDir,
+      targetBotId: ds.larkAppId,
+      workingDir,
+      command: body.command!,
+      action,
+      actor: {
+        openId: actor.requestUserOpenId,
+        unionId: actor.requestUserUnionId,
+      },
+      actorIsAdmin: canManageFrozenCommands(ds.larkAppId, actor.requestUserUnionId),
+      reason: body.reason!,
+      ...(body.replacement ? { replacement: body.replacement } : {}),
+      ...(body.definitionYaml ? { candidateYaml: body.definitionYaml } : {}),
+    });
   } catch (error) {
-    return jsonRes(res, 400, {
+    const permissionDenied = error instanceof FrozenCommandError
+      && ['transition_owner_mismatch', 'transition_owner_missing', 'transition_admin_required']
+        .includes(error.code);
+    return jsonRes(res, permissionDenied ? 403 : 409, {
       ok: false,
-      error: error instanceof FrozenCommandError ? error.code : 'parameter_invalid',
-      detail: userFacingFrozenCommandError(error),
+      error: error instanceof FrozenCommandError ? error.code : 'transition_prepare_failed',
+      detail: error instanceof Error ? error.message : String(error),
     });
   }
-  const created = createFrozenCommandAction(config.session.dataDir, {
-    targetBotId: ds.larkAppId,
-    chatId: ds.chatId,
-    chatType: ds.chatType,
-    rootMessageId: sessionAnchorId(ds),
-    scope: ds.scope,
-    sessionId: ds.session.sessionId,
-    turnId: body.originTurnId,
-    dispatchAttempt: boundDispatchAttempt,
-    workingDir,
-    sourceMessageId: body.originTurnId,
-    sourceContentHash: origin.sourceContentHash,
-    intentSchemaVersion: 'botmux.frozen-command-intent.v1',
-    parserVersion: 'frozen-command-args.v1',
-    actorOpenId: actor.requestUserOpenId,
-    actorUnionId: actor.requestUserUnionId,
-    command: normalizedCommand,
-    rawArgs: body.rawArgs!,
-    normalizedArgs,
-    datasource: typeof lookup.snapshot.definition.input.datasource === 'string'
-      ? lookup.snapshot.definition.input.datasource
-      : undefined,
-    executorId: lookup.snapshot.definition.executor,
-    executorRevision: lifecycle.record.executorRevision!,
-    specHash: lifecycle.record.specHash,
-    revisionId: lifecycle.record.stateRevisionId,
+  const card = buildFrozenCommandLifecyclePreviewCard({
+    transition: prepared,
+    workingDirLabel: basename(workingDir) || workingDir,
   });
-  const card = buildFrozenCommandPreviewCard({
-    action: created.record,
-    nonce: created.nonce,
-    initiatorLabel: '当前消息发送者（本人）',
-  });
-  let cardMessageId: string;
-  try {
-    cardMessageId = await sessionReply(
-      sessionAnchorId(ds), card, 'interactive', ds.larkAppId, body.originTurnId,
-    );
-  } catch (error) {
-    expirePendingFrozenCommandAction({
-      dataDir: config.session.dataDir,
-      id: created.record.id,
-      errorCode: 'card_post_failed',
-    });
-    throw error;
-  }
-  if (!bindFrozenCommandActionCard(config.session.dataDir, created.record.id, cardMessageId)) {
-    expirePendingFrozenCommandAction({
-      dataDir: config.session.dataDir,
-      id: created.record.id,
-      errorCode: 'card_binding_failed',
-    });
-    const expired = getFrozenCommandAction(config.session.dataDir, created.record.id);
-    if (expired) {
-      await updateMessage(
-        ds.larkAppId,
-        cardMessageId,
-        JSON.stringify(buildFrozenCommandActionStatusCard(expired)),
-      ).catch(error => {
-        logger.warn(`[frozen-action:${created.record.id}] failed to expire unbound card: ${error instanceof Error ? error.message : String(error)}`);
-      });
-    }
-    return jsonRes(res, 409, { ok: false, error: 'card_binding_failed' });
-  }
+  const cardMessageId = await sessionReply(
+    sessionAnchorId(ds), card, 'interactive', ds.larkAppId, body.originTurnId,
+  );
   return jsonRes(res, 200, {
     ok: true,
     status: 'awaiting_input',
-    operation: 'run',
-    transitionId: created.record.id,
+    operation: body.operation,
     cardMessageId,
-    expiresAt: created.record.expiresAt,
+    expiresAt: prepared.expiresAt,
   });
 });
 
