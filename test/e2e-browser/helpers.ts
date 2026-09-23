@@ -129,7 +129,20 @@ export function createAgent(page: Page): PlaywrightAgent {
 /** Navigate to the messenger page and wait for it to load. */
 export async function navigateToMessenger(page: Page): Promise<void> {
   await page.goto(getMessengerUrl(), { waitUntil: 'domcontentloaded' });
-  await page.waitForTimeout(3000);
+  try {
+    await page.waitForFunction(
+      () =>
+        document.title.includes('消息 - 飞书') &&
+        document.body.innerText.includes('搜索') &&
+        document.body.innerText.includes('消息'),
+      null,
+      { timeout: 30_000 },
+    );
+  } catch {
+    throw new Error(
+      `Feishu Messenger did not finish loading (URL: ${page.url()}, title: ${await page.title()}). Check the saved account selection and authenticated browser state.`,
+    );
+  }
 }
 
 /**

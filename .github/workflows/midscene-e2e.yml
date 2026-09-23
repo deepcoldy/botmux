@@ -201,7 +201,7 @@ jobs:
           fi
           node scripts/render-midscene-summary.mjs \
             --results midscene_run/dashboard/results \
-            --feishu-results midscene_run/feishu/results \
+            --feishu-results midscene_run/runs \
             --site-manifest "$RUNNER_TEMP/midscene-site/manifest.json" \
             --artifact-name botmux-midscene-report \
             --test-outcome "${TEST_OUTCOME:-not-run}" \

@@ -7,6 +7,16 @@
 import { spawn } from 'node:child_process';
 import { sweepOrphanSchedTasks } from '../test/e2e-browser/schedule-cleanup.js';
 
+const groupUrl = process.env.FEISHU_TEST_GROUP_URL;
+if (groupUrl) {
+  const url = new URL(groupUrl);
+  if (/^\/next\/messenger\/?$/.test(url.pathname)) {
+    throw new Error(
+      'FEISHU_TEST_GROUP_URL points to Messenger home. Configure a direct link to the real Botmux test group containing the Feishu bots.',
+    );
+  }
+}
+
 const ts = new Date()
   .toISOString()
   .replace('T', '_')

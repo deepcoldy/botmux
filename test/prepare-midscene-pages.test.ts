@@ -117,7 +117,10 @@ describe('Midscene Pages report', () => {
         }],
       })}</script>`;
     await writeFile(join(dashboardRoot, 'index.html'), report('dashboard-smoke', 'Dashboard smoke'));
-    await writeFile(join(feishuRoot, 'index.html'), report('feishu-browser', 'Case one'));
+    await writeFile(
+      join(feishuRoot, 'midscene-e2e-20260923035539.html'),
+      report('feishu-browser', 'Case one'),
+    );
     await writeFile(join(casesRoot, 'feishu.yaml'), 'cases:\n  - name: Case one\n  - name: Case two\n');
 
     const manifest = await prepareMidscenePages({
@@ -132,7 +135,7 @@ describe('Midscene Pages report', () => {
       expect.objectContaining({ name: 'Case one', status: 'failed' }),
       expect.objectContaining({ name: 'Case two', status: 'not-run' }),
     ]));
-    await expect(readFile(join(output, 'feishu', 'index.html'), 'utf8')).resolves.toContain(
+    await expect(readFile(join(output, 'feishu', 'midscene-e2e-20260923035539.html'), 'utf8')).resolves.toContain(
       'Case one',
     );
   });

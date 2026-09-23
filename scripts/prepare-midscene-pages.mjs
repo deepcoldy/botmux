@@ -26,7 +26,7 @@ function required(options, name) {
   return path.resolve(value);
 }
 
-async function findReportIndexes(root) {
+async function findReportFiles(root) {
   const matches = [];
   async function visit(directory) {
     let entries = [];
@@ -39,7 +39,10 @@ async function findReportIndexes(root) {
     for (const entry of entries) {
       const candidate = path.join(directory, entry.name);
       if (entry.isDirectory()) await visit(candidate);
-      else if (entry.isFile() && entry.name === 'index.html') {
+      else if (entry.isFile() && (
+        entry.name === 'index.html' ||
+        /^midscene-e2e-.*\.html$/.test(entry.name)
+      )) {
         matches.push({ file: candidate, modifiedAt: (await stat(candidate)).mtimeMs });
       }
     }
@@ -103,15 +106,15 @@ async function copyReportCandidate(candidate, { output, slug, nested = false }) 
   return candidate.cases.map(({ screenshot, previewFile, ...testCase }) => ({
     ...testCase,
     reportPath: nested
-      ? `${slug}/${candidate.key}/index.html`
-      : `${slug}/index.html`,
+      ? `${slug}/${candidate.key}/${path.basename(candidate.file)}`
+      : `${slug}/${path.basename(candidate.file)}`,
     previewPath: previewFile ? `previews/${previewFile}` : null,
   }));
 }
 
 async function loadProjectReport({ reportRoot, projectName, output, slug }) {
   const candidates = [];
-  for (const report of await findReportIndexes(reportRoot)) {
+  for (const report of await findReportFiles(reportRoot)) {
     try {
       const html = await readFile(report.file, 'utf8');
       const run = testRunDump(html);

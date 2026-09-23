@@ -134,4 +134,23 @@ describe('Midscene CI summary', () => {
     expect(markdown).toContain('feishu/run-001/index.html');
     expect(markdown).toContain('| ⏸️ [Unfinished case]');
   });
+
+  it('does not call the run passed when the Feishu project fails before writing results', () => {
+    const markdown = renderSummary({
+      artifactName: 'botmux-midscene-report',
+      testOutcome: 'success',
+      feishuOutcome: 'failure',
+      summary: {
+        status: 'success',
+        durationMs: 1000,
+        summary: { total: 1, passed: 1, failed: 0, notRun: 0 },
+        projects: [{
+          name: 'dashboard-smoke',
+          cases: [{ name: 'Dashboard smoke', status: 'success', attempts: [{}] }],
+        }],
+      },
+    });
+
+    expect(markdown).toContain('Botmux × Midscene · failed');
+  });
 });

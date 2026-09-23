@@ -131,7 +131,7 @@ const SCENARIO_TARGETS: Record<FeishuScenario, ScenarioTarget> = {
 
 let collectingSuites: RegisteredSuite[] | undefined;
 let activeSuite: RegisteredSuite | undefined;
-const moduleSuites = new Map<string, RegisteredSuite[]>();
+let suiteLoadSequence = 0;
 
 export function describe(name: string, register: () => void): void {
   if (!collectingSuites) {
@@ -173,18 +173,19 @@ function requireActiveSuite(): RegisteredSuite {
 }
 
 async function loadSuites(moduleName: string): Promise<RegisteredSuite[]> {
-  const cached = moduleSuites.get(moduleName);
-  if (cached) return cached;
-
   const suites: RegisteredSuite[] = [];
   collectingSuites = suites;
   try {
-    await import(new URL(moduleName, import.meta.url).href);
+    // Each Midscene retry needs its own hook closures. A timed-out attempt may
+    // still be running its finally block when the runner starts the retry;
+    // reusing the module would let that cleanup close the new browser.
+    const moduleUrl = new URL(moduleName, import.meta.url);
+    moduleUrl.searchParams.set('suite-load', String(++suiteLoadSequence));
+    await import(moduleUrl.href);
   } finally {
     collectingSuites = undefined;
     activeSuite = undefined;
   }
-  moduleSuites.set(moduleName, suites);
   return suites;
 }
 

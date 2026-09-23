@@ -152,7 +152,9 @@ export function renderSummary({
   const notRun = (counts?.notRun ?? 0)
     + evidenceOnlyCases.filter((testCase) => testCase.status === 'not-run').length;
   const status =
-    testOutcome === 'success' && summary?.status === 'success'
+    testOutcome === 'success' &&
+    summary?.status === 'success' &&
+    (feishuOutcome === 'success' || feishuOutcome === 'skipped' || !feishuOutcome)
       ? skipped.length > 0
         ? 'passed with skips'
         : 'passed'
