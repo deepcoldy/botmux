@@ -53,6 +53,16 @@ function operation(state: DispatchLaunchOperationV1['state'] = 'created'): Dispa
     },
   };
   if (state === 'prepared' || state === 'starting') return admitted;
+  if (state === 'awaiting_proof') {
+    return {
+      ...admitted,
+      state,
+      rootMessageId: 'om_root',
+      targetSessionId: 'target-session',
+      kickoffTurnId: 'source-turn',
+      workerGeneration: 1,
+    };
+  }
   if (state === 'failed') return { ...admitted, state, errorCode: 'INTERNAL_ERROR' };
   throw new Error(`unsupported test state ${state}`);
 }
@@ -72,7 +82,7 @@ function receipt(): DispatchLaunchAdmissionReceiptV1 {
 }
 
 describe('dispatch launch operation store', () => {
-  it('creates idempotently, persists CAS transitions, and enumerates only recoverable operations', () => {
+  it('creates idempotently, persists CAS transitions, and separates pre-launch from launched operations', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dispatch-operation-'));
     const store = createDispatchLaunchOperationStore({ dataDir, ownerLarkAppId: 'cli_source' });
     expect(store.create(operation())).toMatchObject({ created: true });
@@ -80,11 +90,20 @@ describe('dispatch launch operation store', () => {
     const preparing = { ...operation(), state: 'preparing' as const, updatedAt: '2026-09-03T10:00:01.000Z' };
     store.transition({ dispatchId: DISPATCH_ID, expectedState: 'created', next: preparing });
     expect(store.listRecoverable()).toEqual([preparing]);
+    const prepared = { ...operation('prepared'), updatedAt: '2026-09-03T10:00:02.000Z' };
+    store.transition({ dispatchId: DISPATCH_ID, expectedState: 'preparing', next: prepared });
+    const starting = { ...operation('starting'), updatedAt: '2026-09-03T10:00:03.000Z' };
+    store.transition({ dispatchId: DISPATCH_ID, expectedState: 'prepared', next: starting });
+    const awaiting = { ...operation('awaiting_proof'), updatedAt: '2026-09-03T10:00:04.000Z' };
+    store.transition({ dispatchId: DISPATCH_ID, expectedState: 'starting', next: awaiting });
+    expect(store.listRecoverable()).toEqual([]);
+    expect(store.listAwaitingProof()).toEqual([awaiting]);
     const failed = {
-      ...preparing, state: 'failed' as const, errorCode: 'INTERNAL_ERROR' as const,
-      updatedAt: '2026-09-03T10:00:02.000Z',
+      ...awaiting,
+      state: 'failed' as const, errorCode: 'INTERNAL_ERROR' as const,
+      updatedAt: '2026-09-03T10:00:05.000Z',
     };
-    store.transition({ dispatchId: DISPATCH_ID, expectedState: 'preparing', next: failed });
+    store.transition({ dispatchId: DISPATCH_ID, expectedState: 'awaiting_proof', next: failed });
     expect(store.listRecoverable()).toEqual([]);
   });
 

@@ -365,7 +365,6 @@ import { fillNativeTopicId } from './core/native-topic-id.js';
 import { findOnlineDaemon, listOnlineDaemons } from './utils/daemon-discovery.js';
 import {
   DISPATCH_LAUNCH_ID_RE,
-  dispatchLaunchIdentityDigest,
   effectiveOverrideSchema,
   evaluateDispatchLaunchPolicy,
   requestedOverrideSchema,
@@ -26586,6 +26585,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         if (!ds.workerGeneration) throw new Error('dispatch launch worker generation was not reserved');
         return { kickoffTurnId: operation.sourceTurnId, workerGeneration: ds.workerGeneration };
       },
+      isLaunchSessionActive: (operation) => {
+        const session = sessionStore.listSessions().find(candidate =>
+          candidate.status === 'active'
+          && candidate.dispatchLaunchId === operation.dispatchId
+          && candidate.sessionId === operation.targetSessionId
+          && candidate.rootMessageId === operation.rootMessageId);
+        return !!session;
+      },
+      onRecoveryError: (dispatchId, error) => {
+        logger.error(`[dispatch-launch] recovery failed ${dispatchId}: ${error instanceof Error ? error.message : String(error)}`);
+      },
       cancelSession: async (dispatchId, sessionId) => {
         const persisted = sessionId
           ? sessionStore.getSession(sessionId)
@@ -27211,24 +27221,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   });
 
   // Recover target-owned launch operations only after the canonical session
-  // registry exists. Start is checkpointed, so re-entry resumes at the first
-  // missing effect; an expired prepared operation is terminalized instead.
+  // registry exists. Start is checkpointed, so re-entry resumes pre-launch
+  // operations at the first missing effect; launched `awaiting_proof` records
+  // are intentionally terminal for this v1 transport and runtime observation is
+  // projected through the Session row. Recovery also releases any authorized
+  // admission receipt whose operation expired or can no longer continue.
   if (dispatchLaunchTargetCoordinator && cfg.dispatchLaunchPolicy?.enabled === true) {
-    const operationStore = createDispatchLaunchOperationStore({
-      dataDir: config.session.dataDir, ownerLarkAppId: cfg.larkAppId,
-    });
-    for (const operation of operationStore.listRecoverable()) {
-      if (operation.state !== 'prepared' && operation.state !== 'starting') continue;
-      try {
-        const result = await dispatchLaunchTargetCoordinator.start({
-          schemaVersion: 1, protocol: 'v1', dispatchId: operation.dispatchId,
-          kickoffDigest: operation.kickoff.digest, policyDigest: operation.launchIdentity.policyDigest,
-          launchIdentityDigest: dispatchLaunchIdentityDigest(operation.launchIdentity),
-        });
-        if (!result.ok) logger.warn(`[dispatch-launch] recovery rejected ${operation.dispatchId}: ${result.errorCode}`);
-      } catch (error) {
-        logger.error(`[dispatch-launch] recovery failed ${operation.dispatchId}: ${error instanceof Error ? error.message : String(error)}`);
-      }
+    try {
+      await dispatchLaunchTargetCoordinator.recover();
+    } catch (error) {
+      logger.error(`[dispatch-launch] recovery failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 

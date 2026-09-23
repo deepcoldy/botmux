@@ -12151,7 +12151,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     // arrived without --repo. So `standby` is provably false in this branch —
     // do not compute `!standby` / `standby ? ...` here.
     console.log(JSON.stringify({
-      success: operation.state === 'awaiting_proof' || operation.state === 'succeeded',
+      success: operation.state === 'awaiting_proof',
       taskSent: true,
       mode: 'dispatch',
       sourceSessionId: sid,
@@ -12163,7 +12163,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       repo: repo ?? null,
       ...dispatchLaunchInspection(operation),
     }));
-    if (operation.state !== 'awaiting_proof' && operation.state !== 'succeeded') process.exitCode = 1;
+    if (operation.state !== 'awaiting_proof') process.exitCode = 1;
     return;
   }
   const intoBriefJson = intoRoot

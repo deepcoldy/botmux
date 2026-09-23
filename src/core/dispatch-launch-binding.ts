@@ -3,6 +3,7 @@ import { dirname, join } from 'node:path';
 
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
+import { logger } from '../utils/logger.js';
 import type { CodexReasoningEffort } from '../services/codex-reasoning-effort.js';
 import type { Session } from '../types.js';
 import {
@@ -130,6 +131,12 @@ export function applyDispatchLaunchBinding(
   const expected = binding.policyDigest;
   const current = targetPolicy ? dispatchLaunchPolicyDigest(targetPolicy) : undefined;
   if (expected !== undefined && expected !== current) {
+    logger.warn(
+      `[dispatch-launch] binding policy mismatch target=${binding.targetLarkAppId} `
+      + `chat=${binding.chatId} root=${binding.rootMessageId} session=${session.sessionId} `
+      + `reason=${current === undefined ? 'policy_missing' : 'policy_digest_mismatch'} `
+      + `expected=${expected} current=${current ?? 'missing'}`,
+    );
     return null;
   }
   session.dispatchLaunchSpec = {

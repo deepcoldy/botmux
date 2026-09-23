@@ -12,7 +12,7 @@ import {
 } from './dispatch-launch-contract.js';
 
 const TERMINAL_STATES = new Set<DispatchLaunchOperationState>([
-  'succeeded', 'failed', 'cancelled', 'delivery_unknown',
+  'failed', 'cancelled', 'delivery_unknown',
 ]);
 
 const ALLOWED_TRANSITIONS: Readonly<Record<DispatchLaunchOperationState, readonly DispatchLaunchOperationState[]>> = {
@@ -22,8 +22,7 @@ const ALLOWED_TRANSITIONS: Readonly<Record<DispatchLaunchOperationState, readonl
   // Same-state checkpoints durably publish root/session/generation one at a
   // time. They are what makes recovery safe at every external side-effect.
   starting: ['starting', 'awaiting_proof', 'failed', 'cancelled', 'delivery_unknown'],
-  awaiting_proof: ['succeeded', 'failed', 'cancelled', 'delivery_unknown'],
-  succeeded: [],
+  awaiting_proof: ['failed', 'cancelled', 'delivery_unknown'],
   failed: [],
   cancelled: [],
   delivery_unknown: [],
@@ -95,6 +94,7 @@ export interface DispatchLaunchOperationStore {
     next: DispatchLaunchOperationV1;
   }): DispatchLaunchOperationV1;
   listRecoverable(): DispatchLaunchOperationV1[];
+  listAwaitingProof(): Array<Extract<DispatchLaunchOperationV1, { state: 'awaiting_proof' }>>;
 }
 
 /** Durable, per-owner CAS store. A daemon must construct this only for its own app id. */
@@ -114,6 +114,20 @@ export function createDispatchLaunchOperationStore(input: {
     if (expectedOwner !== input.ownerLarkAppId) {
       throw new DispatchLaunchOperationConflictError('operation does not belong to this daemon');
     }
+  };
+  const listMatching = (
+    predicate: (operation: DispatchLaunchOperationV1) => boolean,
+  ): DispatchLaunchOperationV1[] => {
+    if (!existsSync(directory)) return [];
+    const operations: DispatchLaunchOperationV1[] = [];
+    for (const name of readdirSync(directory).sort()) {
+      if (!name.endsWith('.json')) continue;
+      const operation = readOperation(join(directory, name));
+      if (!operation) continue;
+      assertOwner(operation);
+      if (predicate(operation)) operations.push(operation);
+    }
+    return operations;
   };
 
   return {
@@ -174,16 +188,10 @@ export function createDispatchLaunchOperationStore(input: {
       });
     },
     listRecoverable() {
-      if (!existsSync(directory)) return [];
-      const operations: DispatchLaunchOperationV1[] = [];
-      for (const name of readdirSync(directory).sort()) {
-        if (!name.endsWith('.json')) continue;
-        const operation = readOperation(join(directory, name));
-        if (!operation) continue;
-        assertOwner(operation);
-        if (!TERMINAL_STATES.has(operation.state)) operations.push(operation);
-      }
-      return operations;
+      return listMatching(operation => !TERMINAL_STATES.has(operation.state) && operation.state !== 'awaiting_proof');
+    },
+    listAwaitingProof() {
+      return listMatching(operation => operation.state === 'awaiting_proof') as Array<Extract<DispatchLaunchOperationV1, { state: 'awaiting_proof' }>>;
     },
   };
 }

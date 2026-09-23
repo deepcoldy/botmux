@@ -36,7 +36,13 @@ Botmux 在创建 seed 前用目标 Bot 的实际 CLI 读取实时 model catalog�
 launch-model 与 reasoning compatibility 校验。catalog 不可读、模型不存在、强度不兼容、
 目标不唯一时均拒绝且不会创建 topic、授权或发送消息。
 
-成功回执额外包含：
+成功回执会按路径暴露不同层级的 launch 信息。经典 `--repo` 路径在发送 seed 时由
+来源 daemon 登记绑定；该登记 API 当前从来源 daemon 进程的 `getAllBots()` 读取目标
+Bot 的 `dispatchLaunchPolicy`，因此要求参与同一机器/部署的 source 与 target 使用一致的
+`bots.json`。直连 IPC 路径不依赖这个前提：policy 由目标 daemon 自己在
+`prepare/start` 阶段求值。
+
+经典 `--repo` 路径的 CLI 回执包含请求值和启动前冻结的有效值：
 
 ```json
 {
@@ -45,18 +51,36 @@ launch-model 与 reasoning compatibility 校验。catalog 不可读、模型不�
 }
 ```
 
-`requestedLaunch` 是调用方在派发时请求的规格，`effectiveRuntime` 是目标端 policy
-校验后冻结、随 session 持久化并会真实喂给 Worker 启动参数的最终值；调用方应据此
-判断请求是否被降级或改写。CLI 回执只反映"启动前已冻结"的意图，本身不代表 Worker
-已经把它落进了运行时。要确认 Worker 真正在跑的 model/effort，需要向目标 daemon
-的 `GET /api/sessions/:sessionId`（或 sessions 只读列表）二次查询，该接口只有在
-Worker 上报真实观测后才会返回带 `workerGeneration` / `observedAt` 的
-`effectiveRuntime`（未观测时该字段直接缺省，不再回退成 requested 的镜像）。
+直连 IPC 路径的 CLI 回执在 `awaiting_proof`（目标 daemon 已创建会话并启动 Worker）
+时只包含请求值和 operation 标识，不包含 `effectiveRuntime`：
+
+```json
+{
+  "dispatchId": "dl_0123456789abcdef0123456789abcdef",
+  "state": "awaiting_proof",
+  "requestedLaunch": { "model": "gpt-6-astra", "reasoningEffort": "high" }
+}
+```
+
+`requestedLaunch` 是调用方在派发时请求的规格。经典 `--repo` 回执中的
+`effectiveRuntime` 是目标 policy 校验后冻结、随 session 持久化并会真实喂给 Worker
+启动参数的最终值；它仍是启动前意图，不是运行时观测。直连 IPC 的即时回执不会合成这个
+字段，因为 CLI 在 `start` 后立即返回，不会再轮询目标 Worker。
+
+要确认 Worker 真正在跑的 model/effort，需要向目标 daemon 的
+`GET /api/sessions/:sessionId`（或 sessions 只读列表）二次查询。该接口只有在 Worker
+上报真实观测后才会返回带 `workerGeneration` / `observedAt` 的 `effectiveRuntime`
+（未观测时该字段直接缺省，不再回退成 requested 的镜像）。当前运行态观测依赖
+Worker 的 `active_runtime` IPC 事件；生产中只有 Codex 与 TraEx 的结构化 bridge 会发出
+该事件。dispatch-launch v1 自身只支持官方 Codex TUI，后续若扩展到其它 CLI，必须先补齐
+对应 bridge 的 `active_runtime` 上报，否则这个字段会保持缺省。
 
 绑定键是 exact `targetLarkAppId + chatId + rootMessageId`，有 10 分钟首次消费窗口；
 重复登记同一规格幂等，不同规格冲突，绑定一旦归属 session 后不能被另一 session 消费。
+带 `policyDigest` 的绑定会在目标 Bot 消费前重新比对当前 policy；digest 漂移或 policy
+缺失时拒绝应用并记录 warning。为兼容升级窗口，缺少 `policyDigest` 的旧绑定仍可消费。
 规格随 session 行持久化，因此 daemon 重启、Worker crash/restart 和 Bot 默认变更都不会
-改变该 session 的 model/effort。
+改变已成功绑定 session 的 model/effort。
 
 ## 使用
 

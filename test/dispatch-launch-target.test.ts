@@ -52,6 +52,7 @@ function setup() {
     authorizeTalk: vi.fn(() => ({ allowed: true, reason: 'chatGrant', quotaKey: 'chat:oc_chat:ou_source', grantChatId: 'oc_chat' })),
   };
   const now = vi.fn(() => new Date('2026-09-03T10:00:00.000Z'));
+  const isLaunchSessionActive = vi.fn(() => true);
   const coordinator = createDispatchLaunchTargetCoordinator({
     target: { larkAppId: 'cli_target', cliId: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'high', policy },
     operationStore, admissionStore, now, resolveIdentity: () => identity,
@@ -59,8 +60,9 @@ function setup() {
     resolveSourceOpenId: async () => 'ou_source',
     authorizeTalk: effects.authorizeTalk,
     consumeQuotaOnce: effects.quota, ensureRoot: effects.root, ensureSession: effects.session, ensureWorker: effects.worker,
+    isLaunchSessionActive,
   });
-  return { coordinator, operationStore, admissionStore, effects, now };
+  return { coordinator, operationStore, admissionStore, effects, now, isLaunchSessionActive };
 }
 
 describe('dispatch launch target coordinator', () => {
@@ -110,7 +112,7 @@ describe('dispatch launch target coordinator', () => {
   });
 
   it('expires a prepared operation without running side effects', async () => {
-    const { coordinator, effects, now } = setup();
+    const { coordinator, admissionStore, effects, now } = setup();
     const prepared = await coordinator.prepare(request('2026-09-03T10:01:00.000Z'));
     expect(prepared.ok).toBe(true);
     now.mockReturnValue(new Date('2026-09-03T10:02:00.000Z'));
@@ -120,6 +122,7 @@ describe('dispatch launch target coordinator', () => {
     });
     expect(started).toMatchObject({ ok: true, operation: { state: 'failed', errorCode: 'OPERATION_EXPIRED' } });
     expect(effects.root).not.toHaveBeenCalled();
+    expect(admissionStore.get(DISPATCH_ID)).toMatchObject({ state: 'released' });
   });
 
   it('recovers a crash between durable admission and prepared transition', async () => {
@@ -164,5 +167,40 @@ describe('dispatch launch target coordinator', () => {
     });
     expect(await coordinator.prepare(base)).toMatchObject({ ok: false, errorCode: 'OPERATION_CONFLICT' });
     expect(operationStore.get(DISPATCH_ID)).toMatchObject({ state: 'failed', errorCode: 'OPERATION_CONFLICT' });
+  });
+
+  it('retires only stale launched operations whose session is no longer active', async () => {
+    const { coordinator, operationStore, admissionStore, now, isLaunchSessionActive } = setup();
+    const base = request('2026-09-03T10:01:00.000Z');
+    const launched = {
+      schemaVersion: 1 as const, dispatchId: DISPATCH_ID, owner: 'target' as const,
+      sourceLarkAppId: 'cli_source', sourceSessionId: 'source-session', sourceTurnId: 'source-turn',
+      targetLarkAppId: 'cli_target', chatId: 'oc_chat', kickoff: base.kickoff,
+      requestedOverride: base.requestedOverride, createdAt: '2026-09-03T10:00:00.000Z',
+      updatedAt: '2026-09-03T10:00:10.000Z', expiresAt: base.expiresAt,
+      state: 'awaiting_proof' as const,
+      effectiveOverride: { model: 'gpt-5.6-sol', reasoningEffort: 'high' as const },
+      launchIdentity: identity, rootMessageId: 'om_root', targetSessionId: 'target-session',
+      kickoffTurnId: 'source-turn', workerGeneration: 1,
+    };
+    operationStore.create(launched);
+    admissionStore.authorize({
+      schemaVersion: 1, dispatchId: DISPATCH_ID, state: 'authorized', sourceLarkAppId: 'cli_source',
+      sourceSessionId: 'source-session', sourceTurnId: 'source-turn', sourceOpenId: 'ou_source',
+      chatType: 'group', talkReason: 'chatGrant', chatId: 'oc_chat', targetLarkAppId: 'cli_target',
+      policyDigest: identity.policyDigest, effectiveOverride: { model: 'gpt-5.6-sol', reasoningEffort: 'high' },
+      launchIdentity: identity, talkAuthorizationReceiptId: 'talk-receipt', quotaReceiptId: 'quota-receipt',
+      workingDir: '/repo', capacityReservationId: 'capacity-receipt', createdAt: '2026-09-03T10:00:00.000Z',
+    });
+
+    now.mockReturnValue(new Date('2026-09-03T10:02:00.000Z'));
+    isLaunchSessionActive.mockReturnValueOnce(true);
+    await coordinator.recover();
+    expect(operationStore.get(DISPATCH_ID)).toMatchObject({ state: 'awaiting_proof' });
+    expect(admissionStore.get(DISPATCH_ID)).toMatchObject({ state: 'released' });
+
+    isLaunchSessionActive.mockReturnValue(false);
+    await coordinator.recover();
+    expect(operationStore.get(DISPATCH_ID)).toMatchObject({ state: 'delivery_unknown', errorCode: 'DELIVERY_UNKNOWN' });
   });
 });

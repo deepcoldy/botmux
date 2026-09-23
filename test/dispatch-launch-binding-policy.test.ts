@@ -5,7 +5,7 @@
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   applyDispatchLaunchBinding,
@@ -17,6 +17,7 @@ import {
   evaluateDispatchLaunchPolicy,
   type DispatchLaunchPolicyV1,
 } from '../src/core/dispatch-launch-contract.js';
+import { logger } from '../src/utils/logger.js';
 import type { Session } from '../src/types.js';
 
 const basePolicy: DispatchLaunchPolicyV1 = {
@@ -164,22 +165,74 @@ describe('applyDispatchLaunchBinding policy digest gate', () => {
   });
 
   it('refuses to apply when the target policy digest has drifted', () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     const dir = mkdtempSync(join(tmpdir(), 'botmux-launch-'));
-    registerDispatchLaunchBinding(dir, goodBinding({
-      policyDigest: dispatchLaunchPolicyDigest(basePolicy),
-    }));
-    const drifted: DispatchLaunchPolicyV1 = {
-      ...basePolicy,
-      allowedModels: [...basePolicy.allowedModels, 'gpt-5.6-sol'],
-    };
-    expect(applyDispatchLaunchBinding(dir, session(), 'cli_target', drifted)).toBeNull();
+    try {
+      registerDispatchLaunchBinding(dir, goodBinding({
+        policyDigest: dispatchLaunchPolicyDigest(basePolicy),
+      }));
+      const drifted: DispatchLaunchPolicyV1 = {
+        ...basePolicy,
+        allowedModels: [...basePolicy.allowedModels, 'gpt-5.6-sol'],
+      };
+      expect(applyDispatchLaunchBinding(dir, session(), 'cli_target', drifted)).toBeNull();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('warns on a real policy mismatch but stays quiet when no binding exists', () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    try {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-launch-'));
+      expect(applyDispatchLaunchBinding(dir, session(), 'cli_target', basePolicy)).toBeNull();
+      expect(warn).not.toHaveBeenCalled();
+
+      registerDispatchLaunchBinding(dir, goodBinding({
+        policyDigest: dispatchLaunchPolicyDigest(basePolicy),
+      }));
+      const drifted: DispatchLaunchPolicyV1 = {
+        ...basePolicy,
+        allowedModels: [...basePolicy.allowedModels, 'gpt-5.6-sol'],
+      };
+      expect(applyDispatchLaunchBinding(dir, session(), 'cli_target', drifted)).toBeNull();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('policy_digest_mismatch'));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('target=cli_target'));
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('root=om_root'));
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('refuses to apply when the target policy is gone entirely', () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
     const dir = mkdtempSync(join(tmpdir(), 'botmux-launch-'));
-    registerDispatchLaunchBinding(dir, goodBinding({
-      policyDigest: dispatchLaunchPolicyDigest(basePolicy),
-    }));
-    expect(applyDispatchLaunchBinding(dir, session(), 'cli_target', undefined)).toBeNull();
+    try {
+      registerDispatchLaunchBinding(dir, goodBinding({
+        policyDigest: dispatchLaunchPolicyDigest(basePolicy),
+      }));
+      expect(applyDispatchLaunchBinding(dir, session(), 'cli_target', undefined)).toBeNull();
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('policy_missing'));
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('keeps legacy bindings without a policy digest compatible and quiet', () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+    try {
+      const dir = mkdtempSync(join(tmpdir(), 'botmux-launch-'));
+      const legacy = registerDispatchLaunchBinding(dir, goodBinding());
+      expect(legacy.policyDigest).toBeUndefined();
+      const s = session();
+      expect(applyDispatchLaunchBinding(dir, s, 'cli_target', undefined)).toMatchObject({
+        requested: { model: 'gpt-6-astra', reasoningEffort: 'high' },
+        effective: { model: 'gpt-6-astra', reasoningEffort: 'high' },
+      });
+      expect(s.reasoningEffort).toBe('high');
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

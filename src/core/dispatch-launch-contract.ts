@@ -58,9 +58,6 @@ export const DISPATCH_LAUNCH_ERROR_CODES = [
   'OPERATION_CONFLICT',
   'OPERATION_EXPIRED',
   'DELIVERY_UNKNOWN',
-  'INPUT_COMMIT_TIMEOUT',
-  'RUNTIME_NOT_PROVABLE',
-  'RUNTIME_MISMATCH',
   'CANCELLED',
   'INTERNAL_ERROR',
 ] as const;
@@ -164,54 +161,20 @@ export interface DispatchLaunchCancelRequestV1 {
   reason: string;
 }
 
-export interface DispatchLaunchTurnFactV1 {
-  sessionId: string;
-  kickoffTurnId: string;
-  workerGeneration: number;
-  observedAt: string;
-}
-
-export interface DispatchLaunchProofV1 {
-  inputCommitted: DispatchLaunchTurnFactV1;
-  runtimeObserved: DispatchLaunchTurnFactV1 & {
-    model: string;
-    reasoningEffort?: CodexReasoningEffort;
-  };
-}
-
-export interface DispatchLaunchRuntimeObservationV1 {
-  model: string;
-  reasoningEffort?: CodexReasoningEffort;
-  workerGeneration?: number;
-  observedAt?: string;
-}
-
 /** Read-only projection of the operation for the source-side CLI receipt.
  *  The CLI returns immediately after `start`, so it never queries the target
- *  runtime — `effectiveRuntime` is therefore only present after a real
- *  runtime observation (proof or session projection). Callers that want the
- *  "observed" side must poll the target daemon (dashboard sessions API);
- *  the CLI receipt intentionally omits the field when nothing has been
- *  observed yet, rather than returning a permanently-false shape. */
+ *  runtime. Callers that want the observed side must poll the target daemon's
+ *  session projection, which exposes `effectiveRuntime` only after the worker
+ *  has reported it. */
 export function dispatchLaunchInspection(operation: DispatchLaunchOperationV1): {
   dispatchId: string;
   state: DispatchLaunchOperationState;
   requestedLaunch: DispatchLaunchRequestedOverride;
-  effectiveRuntime?: DispatchLaunchRuntimeObservationV1;
 } {
-  const observed = operation.state === 'succeeded' ? operation.proof.runtimeObserved : undefined;
   return {
     dispatchId: operation.dispatchId,
     state: operation.state,
     requestedLaunch: operation.requestedOverride,
-    ...(observed ? {
-      effectiveRuntime: {
-        model: observed.model,
-        ...(observed.reasoningEffort ? { reasoningEffort: observed.reasoningEffort } : {}),
-        workerGeneration: observed.workerGeneration,
-        observedAt: observed.observedAt,
-      },
-    } : {}),
   };
 }
 
@@ -221,7 +184,6 @@ export const DISPATCH_LAUNCH_OPERATION_STATES = [
   'prepared',
   'starting',
   'awaiting_proof',
-  'succeeded',
   'failed',
   'cancelled',
   'delivery_unknown',
@@ -277,12 +239,8 @@ type DispatchLaunchLaunchedOperationV1 = DispatchLaunchOperationBaseV1 & {
 };
 
 type DispatchLaunchAwaitingProofOperationV1 = DispatchLaunchLaunchedOperationV1 & {
+  /** Launched terminal receipt. Runtime observation is exposed through sessions. */
   state: 'awaiting_proof';
-};
-
-type DispatchLaunchSucceededOperationV1 = DispatchLaunchLaunchedOperationV1 & {
-  state: 'succeeded';
-  proof: DispatchLaunchProofV1;
 };
 
 type DispatchLaunchUnsuccessfulOperationV1 = DispatchLaunchOperationBaseV1 & {
@@ -301,7 +259,6 @@ export type DispatchLaunchOperationV1 =
   | DispatchLaunchPreparedOperationV1
   | DispatchLaunchStartingOperationV1
   | DispatchLaunchAwaitingProofOperationV1
-  | DispatchLaunchSucceededOperationV1
   | DispatchLaunchUnsuccessfulOperationV1;
 
 export interface DispatchLaunchAdmissionReceiptV1 {
@@ -399,32 +356,6 @@ const launchIdentitySchema = z.object({
   botConfigDigest: digestSchema,
   policyDigest: digestSchema,
 }).strict();
-
-const turnFactSchema = z.object({
-  sessionId: identifierSchema,
-  kickoffTurnId: identifierSchema,
-  workerGeneration: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
-  observedAt: timestampSchema,
-}).strict();
-
-const proofSchema = z.object({
-  inputCommitted: turnFactSchema,
-  runtimeObserved: turnFactSchema.extend({
-    model: modelSchema,
-    reasoningEffort: reasoningEffortSchema.optional(),
-  }).strict(),
-}).strict().superRefine((value, context) => {
-  const left = value.inputCommitted;
-  const right = value.runtimeObserved;
-  if (left.sessionId !== right.sessionId
-      || left.kickoffTurnId !== right.kickoffTurnId
-      || left.workerGeneration !== right.workerGeneration) {
-    context.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: 'input and runtime proof must identify the same session, kickoff turn and worker generation',
-    });
-  }
-});
 
 export const DispatchLaunchPrepareRequestSchema = z.object({
   schemaVersion: z.literal(DISPATCH_LAUNCH_SCHEMA_VERSION),
@@ -544,14 +475,6 @@ const dispatchLaunchAwaitingProofSchema = z.object({
   ...dispatchLaunchRuntimeFieldsShape,
 }).strict();
 
-const dispatchLaunchSucceededSchema = z.object({
-  ...dispatchLaunchOperationBaseShape,
-  state: z.literal('succeeded'),
-  ...dispatchLaunchFieldsShape,
-  ...dispatchLaunchRuntimeFieldsShape,
-  proof: proofSchema,
-}).strict();
-
 const dispatchLaunchFailedSchema = z.object({
   ...dispatchLaunchOperationBaseShape,
   state: z.literal('failed'),
@@ -579,7 +502,6 @@ export const DispatchLaunchOperationSchema = z.discriminatedUnion('state', [
   dispatchLaunchPreparedSchema,
   dispatchLaunchStartingSchema,
   dispatchLaunchAwaitingProofSchema,
-  dispatchLaunchSucceededSchema,
   dispatchLaunchFailedSchema,
   dispatchLaunchCancelledSchema,
   dispatchLaunchDeliveryUnknownSchema,
@@ -841,17 +763,6 @@ export function parseDispatchLaunchOperation(raw: unknown): DispatchLaunchOperat
   if (Date.parse(parsed.expiresAt) <= Date.parse(parsed.createdAt)) {
     throw new Error('invalid dispatch launch operation: expiresAt must follow createdAt');
   }
-  if (parsed.state === 'succeeded') {
-    const fact = parsed.proof!.inputCommitted;
-    if (fact.sessionId !== parsed.targetSessionId
-        || fact.kickoffTurnId !== parsed.kickoffTurnId
-        || fact.workerGeneration !== parsed.workerGeneration) {
-      throw new Error('invalid dispatch launch operation: proof does not match operation launch identity');
-    }
-    if (!dispatchLaunchTupleEquivalent(parsed.proof!.runtimeObserved, parsed.effectiveOverride!)) {
-      throw new Error('invalid dispatch launch operation: runtime proof does not match effective override');
-    }
-  }
   const effectiveOverride = 'effectiveOverride' in parsed ? parsed.effectiveOverride : undefined;
   if (effectiveOverride !== undefined
       && !dispatchLaunchRequestedOverrideSatisfied(parsed.requestedOverride, effectiveOverride)) {
@@ -913,18 +824,6 @@ export function parseDispatchLaunchOverrideSnapshot(raw: unknown): DispatchLaunc
     raw,
     'dispatch launch override snapshot',
   );
-}
-
-/**
- * v1 recognizes no model aliases: equivalence is deliberately exact after
- * trimming. An adapter may add an explicit canonical alias table in PR 3.
- */
-export function dispatchLaunchTupleEquivalent(
-  observed: { model: string; reasoningEffort?: CodexReasoningEffort },
-  effective: DispatchLaunchEffectiveOverride,
-): boolean {
-  if (observed.model.trim() !== effective.model.trim()) return false;
-  return observed.reasoningEffort === effective.reasoningEffort;
 }
 
 export function dispatchLaunchRequestedOverrideSatisfied(

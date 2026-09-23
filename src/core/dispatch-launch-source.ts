@@ -38,7 +38,6 @@ export interface DispatchLaunchSourceCoordinator {
   prepare(request: DispatchLaunchPrepareRequestV1): Promise<{ ok: true; operation: DispatchLaunchOperationV1 } | DispatchLaunchFailure>;
   start(dispatchId: string): Promise<{ ok: true; operation: DispatchLaunchOperationV1 } | DispatchLaunchFailure>;
   query(dispatchId: string): Promise<{ ok: true; operation: DispatchLaunchOperationV1 } | DispatchLaunchFailure>;
-  recover(): Promise<void>;
 }
 
 export function createDispatchLaunchSourceCoordinator(deps: DispatchLaunchSourceDependencies): DispatchLaunchSourceCoordinator {
@@ -115,7 +114,7 @@ export function createDispatchLaunchSourceCoordinator(deps: DispatchLaunchSource
   const start = async (dispatchId: string) => {
     let operation = deps.store.get(dispatchId);
     if (!operation) return { ok: false as const, errorCode: 'OPERATION_NOT_FOUND' as const, message: 'operation does not exist' };
-    if (operation.state === 'awaiting_proof' || ['succeeded', 'failed', 'cancelled', 'delivery_unknown'].includes(operation.state)) {
+    if (operation.state === 'awaiting_proof' || ['failed', 'cancelled', 'delivery_unknown'].includes(operation.state)) {
       return { ok: true as const, operation };
     }
     if (operation.state !== 'prepared' && operation.state !== 'starting') {
@@ -152,20 +151,5 @@ export function createDispatchLaunchSourceCoordinator(deps: DispatchLaunchSource
     }) };
   };
 
-  const recover = async (): Promise<void> => {
-    for (const operation of deps.store.listRecoverable()) {
-      if (operation.state === 'created' || operation.state === 'preparing') {
-        await prepare({
-          schemaVersion: DISPATCH_LAUNCH_SCHEMA_VERSION, protocol: 'v1', dispatchId: operation.dispatchId,
-          source: { larkAppId: operation.sourceLarkAppId, sessionId: operation.sourceSessionId, turnId: operation.sourceTurnId,
-            ...(operation.callerUnionId ? { callerUnionId: operation.callerUnionId } : {}) },
-          targetLarkAppId: operation.targetLarkAppId, chatId: operation.chatId, kickoff: operation.kickoff,
-          requestedOverride: operation.requestedOverride, expiresAt: operation.expiresAt,
-        });
-      } else if (operation.state === 'prepared' || operation.state === 'starting') {
-        await start(operation.dispatchId);
-      }
-    }
-  };
-  return { create, prepare, start, query, recover };
+  return { create, prepare, start, query };
 }

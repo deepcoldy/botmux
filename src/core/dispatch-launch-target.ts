@@ -63,6 +63,8 @@ export interface DispatchLaunchTargetDependencies {
     sessionId: string;
     sourceOpenId: string;
   }): Promise<{ kickoffTurnId: string; workerGeneration: number }>;
+  isLaunchSessionActive?(operation: Extract<DispatchLaunchOperationV1, { state: 'awaiting_proof' }>): boolean;
+  onRecoveryError?(dispatchId: string, error: unknown): void;
   cancelSession?(dispatchId: string, sessionId?: string): Promise<void>;
 }
 
@@ -81,7 +83,11 @@ function fail(errorCode: DispatchLaunchFailure['errorCode'], message: string): D
 }
 
 function terminal(operation: DispatchLaunchOperationV1): boolean {
-  return ['succeeded', 'failed', 'cancelled', 'delivery_unknown'].includes(operation.state);
+  return ['failed', 'cancelled', 'delivery_unknown'].includes(operation.state);
+}
+
+function expired(operation: DispatchLaunchOperationV1, now: Date): boolean {
+  return Date.parse(operation.expiresAt) <= now.getTime();
 }
 
 function sameJson(left: unknown, right: unknown): boolean {
@@ -95,18 +101,32 @@ export function createDispatchLaunchTargetCoordinator(deps: DispatchLaunchTarget
     errorCode: DispatchLaunchFailure['errorCode'],
   ): DispatchLaunchOperationV1 => {
     if (terminal(operation)) return operation;
-    return deps.operationStore.transition({
+    const failed = deps.operationStore.transition({
       dispatchId: operation.dispatchId,
       expectedState: operation.state,
       next: { ...operation, state: errorCode === 'DELIVERY_UNKNOWN' ? 'delivery_unknown' : 'failed', errorCode, updatedAt: deps.now().toISOString() } as DispatchLaunchOperationV1,
     });
+    const admission = deps.admissionStore.get(operation.dispatchId);
+    if (admission?.state === 'authorized') {
+      deps.admissionStore.release(operation.dispatchId, deps.now().toISOString());
+    }
+    return failed;
   };
 
   const prepare = async (request: DispatchLaunchPrepareRequestV1): Promise<DispatchLaunchTargetResult> => {
     if (request.targetLarkAppId !== deps.target.larkAppId) return fail('BAD_REQUEST', 'target app id mismatch');
-    if (Date.parse(request.expiresAt) <= deps.now().getTime()) return fail('OPERATION_EXPIRED', 'operation has expired');
 
     const existing = deps.operationStore.get(request.dispatchId);
+    if (Date.parse(request.expiresAt) <= deps.now().getTime()) {
+      if (
+        existing
+        && !terminal(existing)
+        && (existing.state !== 'awaiting_proof' || deps.isLaunchSessionActive?.(existing) === false)
+      ) {
+        failOperation(existing, existing.state === 'awaiting_proof' ? 'DELIVERY_UNKNOWN' : 'OPERATION_EXPIRED');
+      }
+      return fail('OPERATION_EXPIRED', 'operation has expired');
+    }
     const initial: DispatchLaunchOperationV1 = {
       schemaVersion: DISPATCH_LAUNCH_OPERATION_SCHEMA_VERSION,
       dispatchId: request.dispatchId,
@@ -217,7 +237,7 @@ export function createDispatchLaunchTargetCoordinator(deps: DispatchLaunchTarget
     if (!operation) return fail('OPERATION_NOT_FOUND', 'operation does not exist');
     if (terminal(operation) || operation.state === 'awaiting_proof') return { ok: true, operation };
     if (operation.state !== 'prepared' && operation.state !== 'starting') return fail('OPERATION_CONFLICT', `operation is ${operation.state}`);
-    if (Date.parse(operation.expiresAt) <= deps.now().getTime()) {
+    if (expired(operation, deps.now())) {
       operation = failOperation(operation, 'OPERATION_EXPIRED');
       return { ok: true, operation };
     }
@@ -318,7 +338,70 @@ export function createDispatchLaunchTargetCoordinator(deps: DispatchLaunchTarget
     return { ok: true, operation: cancelled };
   };
 
-  return { prepare, start, cancel, query: (dispatchId: string) => deps.operationStore.get(dispatchId) };
+  const recover = async (): Promise<void> => {
+    for (const operation of deps.operationStore.listRecoverable()) {
+      try {
+        if (expired(operation, deps.now())) {
+          failOperation(operation, 'OPERATION_EXPIRED');
+          continue;
+        }
+        if (operation.state === 'created' || operation.state === 'preparing') {
+          const result = await prepare({
+            schemaVersion: 1,
+            protocol: 'v1',
+            dispatchId: operation.dispatchId,
+            source: {
+              larkAppId: operation.sourceLarkAppId,
+              sessionId: operation.sourceSessionId,
+              turnId: operation.sourceTurnId,
+              ...(operation.callerUnionId ? { callerUnionId: operation.callerUnionId } : {}),
+            },
+            targetLarkAppId: operation.targetLarkAppId,
+            chatId: operation.chatId,
+            kickoff: operation.kickoff,
+            requestedOverride: operation.requestedOverride,
+            expiresAt: operation.expiresAt,
+          });
+          if (!result.ok) deps.onRecoveryError?.(operation.dispatchId, result);
+        } else if (operation.state === 'prepared' || operation.state === 'starting') {
+          const result = await start({
+            schemaVersion: 1,
+            protocol: 'v1',
+            dispatchId: operation.dispatchId,
+            kickoffDigest: operation.kickoff.digest,
+            policyDigest: operation.launchIdentity.policyDigest,
+            launchIdentityDigest: dispatchLaunchIdentityDigest(operation.launchIdentity),
+          });
+          if (!result.ok) deps.onRecoveryError?.(operation.dispatchId, result);
+        }
+      } catch (error) {
+        deps.onRecoveryError?.(operation.dispatchId, error);
+      }
+    }
+
+    for (const operation of deps.operationStore.listAwaitingProof()) {
+      try {
+        if (deps.isLaunchSessionActive?.(operation) === false && expired(operation, deps.now())) {
+          failOperation(operation, 'DELIVERY_UNKNOWN');
+        }
+      } catch (error) {
+        deps.onRecoveryError?.(operation.dispatchId, error);
+      }
+    }
+
+    for (const receipt of deps.admissionStore.listAuthorized()) {
+      try {
+        const operation = deps.operationStore.get(receipt.dispatchId);
+        if (!operation || terminal(operation) || expired(operation, deps.now())) {
+          deps.admissionStore.release(receipt.dispatchId, deps.now().toISOString());
+        }
+      } catch (error) {
+        deps.onRecoveryError?.(receipt.dispatchId, error);
+      }
+    }
+  };
+
+  return { prepare, start, cancel, recover, query: (dispatchId: string) => deps.operationStore.get(dispatchId) };
 }
 
 export type DispatchLaunchTargetCoordinator = ReturnType<typeof createDispatchLaunchTargetCoordinator>;
