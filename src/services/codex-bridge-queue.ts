@@ -55,6 +55,10 @@ export const STRUCTURED_SUBMIT_START_GRACE_MS = 20_000;
  *  event can still claim the mark without allowing a silent write to wedge
  *  every later turn forever. */
 export const STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS = 20_000;
+/** Maximum time a task_started-only claim may wait for its fingerprinted user
+ *  record. Real Codex rollouts can delay that record for several minutes, but
+ *  a missing record must not make an uncorroborated claim permanently busy. */
+export const STRUCTURED_TASK_START_CORROBORATION_GRACE_MS = 10 * 60_000;
 /** Maximum time a worker may wait for an adapter/history verification call.
  *  This covers Codex/CoCo's in-band polling plus the 20s deferred recheck,
  *  while remaining bounded if an adapter promise or recheck is stranded. */
@@ -73,6 +77,13 @@ export interface CodexPendingTurn {
    *  turn. Kept separate from markTimeMs, whose max(worker mark, transcript)
    *  semantics intentionally serve the outbound-send suppression window. */
   transcriptStartTimeMs?: number;
+  /** Local observation time for a task_started-only provisional claim. Cleared
+   *  once the fingerprinted user record corroborates the claim. */
+  provisionalTaskStartedAtMs?: number;
+  /** Local observation time when a provisional task_started claim was rolled
+   *  back. While the mark remains unstarted, unmatched terminals are dropped
+   *  rather than buffered back onto it. */
+  taskStartedRollbackAtMs?: number;
   /** Wall-clock millis when an authoritative adapter/history check confirmed
    *  the submit. Unverified writes deliberately leave this unset. */
   submitConfirmedAtMs?: number;
@@ -158,14 +169,56 @@ export class CodexBridgeQueue {
     return !left || !right || left === right;
   }
 
+  private isProvisionalTaskStart(turn: CodexPendingTurn | null | undefined): boolean {
+    return !!turn
+      && turn.started
+      && turn.finalText === undefined
+      && turn.transcriptStartTimeMs === undefined
+      && turn.provisionalTaskStartedAtMs !== undefined;
+  }
+
+  private matchingProvisionalTaskStart(ev: CodexBridgeEvent): CodexPendingTurn | null {
+    if (!ev.sourceTurnId) return null;
+    return this.queue.find(turn => this.isProvisionalTaskStart(turn)
+      && turn.sourceTurnId === ev.sourceTurnId
+      && this.sourceSessionsCompatible(turn.sourceSessionId, ev.sourceSessionId)) ?? null;
+  }
+
+  private rollbackProvisionalTaskStart(turn: CodexPendingTurn, observedAtMs: number = this.now()): void {
+    if (!this.isProvisionalTaskStart(turn)) return;
+    turn.started = false;
+    turn.provisionalTaskStartedAtMs = undefined;
+    turn.taskStartedRollbackAtMs = observedAtMs;
+    turn.sourceSessionId = undefined;
+    turn.sourceTurnId = undefined;
+    turn.submitVerificationStartedAtMs = undefined;
+    if (turn.submitConfirmedAtMs !== undefined) {
+      turn.submitConfirmedAtMs = observedAtMs;
+      turn.unconfirmedAttributionStartedAtMs = undefined;
+    } else {
+      turn.unconfirmedAttributionStartedAtMs = observedAtMs;
+    }
+    if (this.collecting === turn) this.collecting = null;
+  }
+
+  private hasRolledBackTaskStart(): boolean {
+    return this.queue.some(turn => !turn.started
+      && turn.finalText === undefined
+      && turn.taskStartedRollbackAtMs !== undefined);
+  }
+
   private targetForNativeEvent(ev: CodexBridgeEvent): CodexPendingTurn | null {
-    if (!ev.sourceTurnId) return this.collecting;
+    if (!ev.sourceTurnId) {
+      return this.isProvisionalTaskStart(this.collecting) ? null : this.collecting;
+    }
     const exact = this.queue.find(turn => turn.started && turn.finalText === undefined
+      && !this.isProvisionalTaskStart(turn)
       && turn.sourceTurnId === ev.sourceTurnId
       && this.sourceSessionsCompatible(turn.sourceSessionId, ev.sourceSessionId));
     if (exact) return exact;
     const fallback = this.collecting;
     if (!fallback
+      || this.isProvisionalTaskStart(fallback)
       || fallback.sourceTurnId
       || !this.sourceSessionsCompatible(fallback.sourceSessionId, ev.sourceSessionId)
       // Native records for a legacy turn cannot precede that turn's user
@@ -259,6 +312,13 @@ export class CodexBridgeQueue {
   pruneExpiredPreStartHeads(nowMs: number = this.now()): CodexPendingTurn[] {
     const dropped: CodexPendingTurn[] = [];
     for (;;) {
+      const expiredProvisional = this.queue.find(turn => this.isProvisionalTaskStart(turn)
+        && nowMs - turn.provisionalTaskStartedAtMs!
+          > STRUCTURED_TASK_START_CORROBORATION_GRACE_MS);
+      if (expiredProvisional) {
+        this.rollbackProvisionalTaskStart(expiredProvisional, nowMs);
+        continue;
+      }
       // A long-running predecessor legitimately keeps later confirmed input in
       // the CLI's type-ahead queue. Its assistant_final refreshes the next head
       // from local observation time, so expiring anything before that boundary
@@ -416,10 +476,17 @@ export class CodexBridgeQueue {
    *  lease expires. Started turns return undefined because their eventual
    *  assistant_final is the authoritative re-drive. */
   preStartLeaseRemainingMs(nowMs: number = this.now()): number | undefined {
-    if (this.queue.some(turn => (turn.started || turn.rpcActive) && turn.finalText === undefined)) return undefined;
+    if (this.queue.some(turn => ((turn.started && !this.isProvisionalTaskStart(turn)) || turn.rpcActive)
+      && turn.finalText === undefined)) return undefined;
     const activeRemaining = this.queue.flatMap(candidate => {
-      if (candidate.started || candidate.finalText !== undefined) return [];
+      if (candidate.finalText !== undefined) return [];
       const leases: number[] = [];
+      if (this.isProvisionalTaskStart(candidate)) {
+        leases.push(STRUCTURED_TASK_START_CORROBORATION_GRACE_MS
+          - (nowMs - candidate.provisionalTaskStartedAtMs!));
+        return leases.filter(remaining => remaining >= 0);
+      }
+      if (candidate.started) return [];
       if (candidate.submitConfirmedAtMs !== undefined) {
         leases.push(STRUCTURED_SUBMIT_START_GRACE_MS - (nowMs - candidate.submitConfirmedAtMs));
       }
@@ -509,11 +576,19 @@ export class CodexBridgeQueue {
       // expire while Codex is demonstrably running the task.
       const active = this.collecting;
       if (active && active.finalText === undefined
-        && this.sourceSessionsCompatible(active.sourceSessionId, ev.sourceSessionId)
-        && (!active.sourceTurnId || !ev.sourceTurnId || active.sourceTurnId === ev.sourceTurnId)) {
-        if (!active.sourceSessionId && ev.sourceSessionId) active.sourceSessionId = ev.sourceSessionId;
-        if (!active.sourceTurnId && ev.sourceTurnId) active.sourceTurnId = ev.sourceTurnId;
-        return;
+        && this.sourceSessionsCompatible(active.sourceSessionId, ev.sourceSessionId)) {
+        if (active.sourceTurnId) {
+          if (!ev.sourceTurnId || active.sourceTurnId === ev.sourceTurnId) return;
+        } else {
+          // A native start cannot precede the user record of the same turn.
+          // Reject stale starts instead of binding them onto an id-less active
+          // turn and making its real terminal impossible to route.
+          if (active.transcriptStartTimeMs !== undefined
+            && ev.timestampMs < active.transcriptStartTimeMs) return;
+          if (ev.sourceTurnId) active.sourceTurnId = ev.sourceTurnId;
+          if (!active.sourceSessionId && ev.sourceSessionId) active.sourceSessionId = ev.sourceSessionId;
+          return;
+        }
       }
       const next = this.queue.find(turn => !turn.started && turn.finalText === undefined);
       if (!next) return;
@@ -523,6 +598,8 @@ export class CodexBridgeQueue {
       next.started = true;
       next.submitVerificationStartedAtMs = undefined;
       next.unconfirmedAttributionStartedAtMs = undefined;
+      next.provisionalTaskStartedAtMs = this.now();
+      next.taskStartedRollbackAtMs = undefined;
       next.sourceSessionId = ev.sourceSessionId;
       next.sourceTurnId = ev.sourceTurnId;
       next.markTimeMs = next.markTimeMs === undefined
@@ -549,24 +626,29 @@ export class CodexBridgeQueue {
       // collecting turn, treat it as corroborating metadata rather than a new
       // turn boundary. Preserve markTimeMs: in-turn botmux sends may have
       // landed after task_started but before this late user record.
-      if (this.collecting
-        && this.collecting.finalText === undefined
-        && this.collecting.transcriptStartTimeMs === undefined
-        && this.sourceSessionsCompatible(this.collecting.sourceSessionId, ev.sourceSessionId)) {
-        const collectingTooOld = this.collecting.markTimeMs !== undefined
-          && ev.timestampMs < this.collecting.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS;
-        const collectingFingerprintOk = !this.collecting.contentFingerprint
-          || normaliseForFingerprint(ev.text).includes(this.collecting.contentFingerprint);
+      const collecting = this.collecting;
+      const provisional = this.isProvisionalTaskStart(collecting)
+        && this.sourceSessionsCompatible(collecting?.sourceSessionId, ev.sourceSessionId)
+        ? collecting
+        : null;
+      if (provisional) {
+        const collectingTooOld = provisional.markTimeMs !== undefined
+          && ev.timestampMs < provisional.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS;
+        const collectingFingerprintOk = !provisional.contentFingerprint
+          || normaliseForFingerprint(ev.text).includes(provisional.contentFingerprint);
         if (!collectingTooOld && collectingFingerprintOk) {
-          this.collecting.transcriptStartTimeMs = ev.timestampMs;
-          if (!this.collecting.sourceSessionId && ev.sourceSessionId) {
-            this.collecting.sourceSessionId = ev.sourceSessionId;
+          provisional.transcriptStartTimeMs = ev.timestampMs;
+          provisional.provisionalTaskStartedAtMs = undefined;
+          provisional.taskStartedRollbackAtMs = undefined;
+          if (!provisional.sourceSessionId && ev.sourceSessionId) {
+            provisional.sourceSessionId = ev.sourceSessionId;
           }
-          if (!this.collecting.sourceTurnId && ev.sourceTurnId) {
-            this.collecting.sourceTurnId = ev.sourceTurnId;
+          if (!provisional.sourceTurnId && ev.sourceTurnId) {
+            provisional.sourceTurnId = ev.sourceTurnId;
           }
           return;
         }
+        if (!collectingTooOld) this.rollbackProvisionalTaskStart(provisional);
       }
       // Some providers mirror one native user turn in more than one record.
       // Once its stable id has started a pending turn, ignore any duplicate
@@ -605,6 +687,7 @@ export class CodexBridgeQueue {
       if ((willStartNext || willSynthLocal)
         && this.collecting
         && this.collecting.finalText === undefined
+        && !this.isProvisionalTaskStart(this.collecting)
         && !isDistinctNativeTurn
         && ev.preserveCollecting !== true) {
         const idx = this.queue.indexOf(this.collecting);
@@ -616,6 +699,8 @@ export class CodexBridgeQueue {
         next!.started = true;
         next!.submitVerificationStartedAtMs = undefined;
         next!.unconfirmedAttributionStartedAtMs = undefined;
+        next!.provisionalTaskStartedAtMs = undefined;
+        next!.taskStartedRollbackAtMs = undefined;
         next!.sourceSessionId = ev.sourceSessionId;
         next!.sourceTurnId = ev.sourceTurnId;
         next!.transcriptStartTimeMs = ev.timestampMs;
@@ -680,6 +765,14 @@ export class CodexBridgeQueue {
         this.rememberUnmatched(ev);
       }
     } else if (ev.kind === 'assistant_final') {
+      const provisional = this.matchingProvisionalTaskStart(ev);
+      if (provisional) {
+        // A terminal before fingerprint corroboration proves that this native
+        // turn must not settle the pending Lark mark. Roll back immediately;
+        // the terminal is intentionally not buffered onto another turn.
+        this.rollbackProvisionalTaskStart(provisional);
+        return;
+      }
       const target = this.targetForNativeEvent(ev);
       if (target) {
         if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
@@ -697,13 +790,20 @@ export class CodexBridgeQueue {
         // attribution-only lease expire while the predecessor was legitimately
         // running.
         this.refreshNextPreStartLease();
-      } else if (bufferUnmatched && !this.localTurnsEnabled) {
+      } else if (bufferUnmatched && !this.localTurnsEnabled && !this.hasRolledBackTaskStart()) {
         this.rememberUnmatched(ev);
       }
     } else if (ev.kind === 'turn_aborted') {
+      const provisional = this.matchingProvisionalTaskStart(ev);
+      if (provisional) {
+        this.rollbackProvisionalTaskStart(provisional);
+        return;
+      }
       const target = this.targetForNativeEvent(ev);
       if (!target) {
-        if (bufferUnmatched && !this.localTurnsEnabled) this.rememberUnmatched(ev);
+        if (bufferUnmatched && !this.localTurnsEnabled && !this.hasRolledBackTaskStart()) {
+          this.rememberUnmatched(ev);
+        }
         return;
       }
       if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
