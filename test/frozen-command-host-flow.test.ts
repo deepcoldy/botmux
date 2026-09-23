@@ -83,6 +83,20 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
   return { ...actual, resolveSender: (...args: any[]) => mocks.resolveSender(...args) };
 });
 
+vi.mock('../src/services/grant-store.js', async () => {
+  const actual = await vi.importActual<any>('../src/services/grant-store.js');
+  return {
+    ...actual,
+    consumeQuota: vi.fn(async () => ({
+      tracked: false,
+      allow: true,
+      exhausted: false,
+      used: 0,
+      limit: 0,
+    })),
+  };
+});
+
 vi.mock('../src/core/plugins/mcp/gateway.js', () => ({
   PluginMcpGateway: class {
     async connect() {}
@@ -153,8 +167,11 @@ vi.mock('@modelcontextprotocol/sdk/client/index.js', () => ({
 
 const APP = 'cli_frozen_host_flow';
 const CHAT = 'oc_host_flow';
+const GRANT_CHAT = 'oc_grant_only';
 const ACTOR_OPEN_ID = 'ou_host_actor';
 const ACTOR_UNION_ID = 'on_host_actor';
+const GRANT_GUEST_OPEN_ID = 'ou_grant_guest';
+const GRANT_GUEST_UNION_ID = 'on_grant_guest';
 const CAPABILITY = 'ab'.repeat(32);
 const COMMAND = '/宿主闭环';
 const YAML = `
@@ -255,16 +272,24 @@ function makeSession(input: {
   return ds;
 }
 
-function ingressEvent(messageId: string, text: string, rootId?: string): any {
+function ingressEvent(
+  messageId: string,
+  text: string,
+  rootId?: string,
+  input: { chatId?: string; openId?: string; unionId?: string } = {},
+): any {
   return {
     sender: {
-      sender_id: { open_id: ACTOR_OPEN_ID, union_id: ACTOR_UNION_ID },
+      sender_id: {
+        open_id: input.openId ?? ACTOR_OPEN_ID,
+        union_id: input.unionId ?? ACTOR_UNION_ID,
+      },
       sender_type: 'user',
     },
     message: {
       message_id: messageId,
       root_id: rootId,
-      chat_id: CHAT,
+      chat_id: input.chatId ?? CHAT,
       message_type: 'text',
       content: JSON.stringify({ text }),
       mentions: [{
@@ -277,15 +302,112 @@ function ingressEvent(messageId: string, text: string, rootId?: string): any {
   };
 }
 
-function ingressContext(messageId: string, anchor: string): any {
+function ingressContext(messageId: string, anchor: string, chatId = CHAT): any {
   return {
-    chatId: CHAT,
+    chatId,
     messageId,
     chatType: 'group' as const,
     scope: 'thread' as const,
     anchor,
     larkAppId: APP,
   };
+}
+
+function enableGrantCommandRestriction(chatId = GRANT_CHAT): void {
+  const bot = modules.registry.getBot(APP);
+  bot.config.restrictGrantCommands = true;
+  bot.config.chatGrants = { [chatId]: [GRANT_GUEST_OPEN_ID] };
+  mocks.getMessageChatId.mockResolvedValue(chatId);
+}
+
+function installApprovedCommand(command: string): void {
+  const name = command.replace(/^\//u, '');
+  writeFileSync(
+    join(root, '.botmux', 'commands', `${name}.yaml`),
+    YAML.replaceAll('宿主闭环', name),
+  );
+  const pending = modules.lifecycle.prepareFrozenCommandTransition({
+    dataDir,
+    targetBotId: APP,
+    workingDir: root,
+    command,
+    action: 'approve',
+    actor: { openId: ACTOR_OPEN_ID, unionId: ACTOR_UNION_ID },
+    actorIsAdmin: true,
+    reason: `批准 ${command} 用于授权闸测试`,
+  });
+  modules.lifecycle.confirmFrozenCommandTransition({
+    dataDir,
+    targetBotId: APP,
+    token: pending.token,
+    actor: { openId: ACTOR_OPEN_ID, unionId: ACTOR_UNION_ID },
+    actorIsAdmin: true,
+  });
+}
+
+function grantGuestEvent(messageId: string, text: string, rootId?: string): any {
+  return ingressEvent(messageId, text, rootId, {
+    chatId: GRANT_CHAT,
+    openId: GRANT_GUEST_OPEN_ID,
+    unionId: GRANT_GUEST_UNION_ID,
+  });
+}
+
+async function dispatchGrantGuestNewTopic(text: string): Promise<string> {
+  const messageId = `om_grant_new_${Math.random().toString(36).slice(2)}`;
+  await modules.daemon.__testOnly_handleNewTopic(
+    grantGuestEvent(messageId, text),
+    ingressContext(messageId, messageId, GRANT_CHAT),
+  );
+  return messageId;
+}
+
+async function dispatchGrantGuestExistingThread(text: string): Promise<{
+  rootMessageId: string;
+  workerSend: ReturnType<typeof vi.fn>;
+}> {
+  const rootMessageId = `om_grant_root_${Math.random().toString(36).slice(2)}`;
+  await modules.daemon.__testOnly_handleNewTopic(
+    ingressEvent(rootMessageId, '初始化授权访客测试会话', undefined, { chatId: GRANT_CHAT }),
+    ingressContext(rootMessageId, rootMessageId, GRANT_CHAT),
+  );
+  const ds = modules.daemon.__testOnly_activeSessions.get(modules.types.sessionKey(rootMessageId, APP));
+  expect(ds).toBeDefined();
+  ds.activeInteractiveTurn = undefined;
+  const workerSend = vi.fn(() => true);
+  ds.worker = { killed: false, send: workerSend };
+  mocks.cardBodies.length = 0;
+  mocks.validateCalls = 0;
+  mocks.runCalls = 0;
+
+  const messageId = `om_grant_reply_${Math.random().toString(36).slice(2)}`;
+  await modules.daemon.__testOnly_handleThreadReply(
+    grantGuestEvent(messageId, text, rootMessageId),
+    ingressContext(messageId, rootMessageId, GRANT_CHAT),
+  );
+  return { rootMessageId, workerSend };
+}
+
+async function routeGrantGuestCommand(commandContent: string, chatId = GRANT_CHAT): Promise<void> {
+  const cmd = commandContent.trim().split(/\s+/u)[0]!;
+  await modules.daemon.__testOnly_routeFrozenCommand({
+    cmd,
+    commandContent,
+    workingDir: root,
+    larkAppId: APP,
+    chatId,
+    chatType: 'group',
+    anchor: 'om_grant_route',
+    turnId: 'om_grant_route',
+    senderOpenId: GRANT_GUEST_OPEN_ID,
+    senderUnionId: GRANT_GUEST_UNION_ID,
+    senderIsBot: false,
+    mentions: [],
+    reply: async (_anchor: string, content: string) => {
+      mocks.cardBodies.push(content);
+      return `om_grant_card_${mocks.cardBodies.length}`;
+    },
+  });
 }
 
 function armManagedOrigin(ds: any): void {
@@ -487,6 +609,7 @@ beforeEach(async () => {
     allowedUsers: [ACTOR_OPEN_ID],
     frozenCommandAdmins: [ACTOR_UNION_ID],
     workingDir: root,
+    defaultWorkingDir: root,
     oncallChats: [{ chatId: CHAT, workingDir: root }],
   });
   bot.botOpenId = 'ou_host_bot';
@@ -626,6 +749,136 @@ describe('Frozen Command host-owned route → callback → Data MCP flow', () =>
     expect(mocks.cardBodies).toHaveLength(1);
     expect(mocks.cardBodies[0]).toContain('真实链路：');
     expect(mocks.cardBodies[0]).not.toContain('确认执行');
+  });
+
+  it('blocks a grant-only visitor natural-language command in a new topic before Data MCP', async () => {
+    enableGrantCommandRestriction();
+    installApprovedCommand('/report');
+
+    await dispatchGrantGuestNewTopic('@_bot 运行 /report 11');
+
+    expect(mocks.validateCalls).toBe(0);
+    expect(mocks.runCalls).toBe(0);
+    expect(mocks.cardBodies.at(-1)).toContain('当前授权仅允许普通对话');
+    expect(mocks.cardBodies.every(body => !body.includes('真实链路：'))).toBe(true);
+  });
+
+  it('blocks a grant-only visitor natural-language command in an existing thread before Data MCP', async () => {
+    enableGrantCommandRestriction();
+    installApprovedCommand('/report');
+
+    const { workerSend } = await dispatchGrantGuestExistingThread('运行 /report 11 @_bot');
+
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(mocks.validateCalls).toBe(0);
+    expect(mocks.runCalls).toBe(0);
+    expect(mocks.cardBodies.at(-1)).toContain('当前授权仅允许普通对话');
+    expect(mocks.cardBodies.every(body => !body.includes('真实链路：'))).toBe(true);
+  });
+
+  it('blocks a grant-only visitor direct non-ASCII command in a new topic before Data MCP', async () => {
+    enableGrantCommandRestriction();
+
+    await dispatchGrantGuestNewTopic('@_bot /宿主闭环 11');
+
+    expect(mocks.validateCalls).toBe(0);
+    expect(mocks.runCalls).toBe(0);
+    expect(mocks.cardBodies.at(-1)).toContain('当前授权仅允许普通对话');
+    expect(mocks.cardBodies.every(body => !body.includes('真实链路：'))).toBe(true);
+  });
+
+  it('blocks a grant-only visitor direct non-ASCII command in an existing thread before Data MCP', async () => {
+    enableGrantCommandRestriction();
+
+    const { workerSend } = await dispatchGrantGuestExistingThread('/宿主闭环 11 @_bot');
+
+    expect(workerSend).not.toHaveBeenCalled();
+    expect(mocks.validateCalls).toBe(0);
+    expect(mocks.runCalls).toBe(0);
+    expect(mocks.cardBodies.at(-1)).toContain('当前授权仅允许普通对话');
+    expect(mocks.cardBodies.every(body => !body.includes('真实链路：'))).toBe(true);
+  });
+
+  it.each([
+    ['/freeze list'],
+    ['/freeze rm /宿主闭环 --reason 访客不得发起状态变更'],
+    ['/freeze confirm abcdefghijklmnopqrstuvwx'],
+  ])('blocks a grant-only visitor across the host-owned %s command family', async (commandContent) => {
+    enableGrantCommandRestriction();
+
+    await routeGrantGuestCommand(commandContent);
+
+    expect(mocks.validateCalls).toBe(0);
+    expect(mocks.runCalls).toBe(0);
+    expect(mocks.cardBodies).toHaveLength(1);
+    expect(mocks.cardBodies[0]).toContain('当前授权仅允许普通对话');
+    expect(mocks.cardBodies[0]).not.toContain('/宿主闭环（revision');
+    expect(mocks.cardBodies[0]).not.toContain('确认废弃');
+  });
+
+  it('keeps an allowed user eligible for frozen-command direct execution when grant commands are restricted', async () => {
+    enableGrantCommandRestriction();
+    const messageId = `om_grant_owner_${Math.random().toString(36).slice(2)}`;
+
+    await modules.daemon.__testOnly_handleNewTopic(
+      ingressEvent(messageId, '@_bot 运行 /宿主闭环 11', undefined, { chatId: GRANT_CHAT }),
+      ingressContext(messageId, messageId, GRANT_CHAT),
+    );
+
+    expect(mocks.validateCalls).toBe(1);
+    expect(mocks.runCalls).toBe(1);
+    expect(mocks.cardBodies.at(-1)).toContain('真实链路：');
+  });
+
+  it('keeps an oncall chat member eligible for frozen-command direct execution when grant commands are restricted', async () => {
+    enableGrantCommandRestriction(CHAT);
+
+    await routeGrantGuestCommand('/宿主闭环 11', CHAT);
+
+    expect(mocks.validateCalls).toBe(1);
+    expect(mocks.runCalls).toBe(1);
+    expect(mocks.cardBodies.at(-1)).toContain('真实链路：');
+  });
+
+  it('keeps an allowed chat-group member eligible for frozen-command direct execution when grant commands are restricted', async () => {
+    enableGrantCommandRestriction();
+    modules.registry.getBot(APP).config.allowedChatGroups = [GRANT_CHAT];
+    const messageId = `om_grant_group_${Math.random().toString(36).slice(2)}`;
+
+    await modules.daemon.__testOnly_handleNewTopic(
+      grantGuestEvent(messageId, '@_bot 运行 /宿主闭环 11'),
+      ingressContext(messageId, messageId, GRANT_CHAT),
+    );
+
+    expect(mocks.validateCalls).toBe(1);
+    expect(mocks.runCalls).toBe(1);
+    expect(mocks.cardBodies.at(-1)).toContain('真实链路：');
+  });
+
+  it('lets a grant-only visitor unknown natural-language command fall through as ordinary conversation', async () => {
+    enableGrantCommandRestriction();
+    mocks.forkWorker.mockClear();
+
+    const messageId = await dispatchGrantGuestNewTopic('@_bot 运行 /不存在 11');
+
+    expect(mocks.validateCalls).toBe(0);
+    expect(mocks.runCalls).toBe(0);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(modules.daemon.__testOnly_activeSessions.get(modules.types.sessionKey(messageId, APP))).toBeDefined();
+    expect(mocks.cardBodies.every(body => !body.includes('当前授权仅允许普通对话'))).toBe(true);
+  });
+
+  it('does not mistake an unknown non-ASCII slash path for a restricted frozen command', async () => {
+    enableGrantCommandRestriction();
+    mocks.forkWorker.mockClear();
+
+    const messageId = await dispatchGrantGuestNewTopic('@_bot /资料目录 请帮我查看这里');
+
+    expect(mocks.validateCalls).toBe(0);
+    expect(mocks.runCalls).toBe(0);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(modules.daemon.__testOnly_activeSessions.get(modules.types.sessionKey(messageId, APP))).toBeDefined();
+    expect(mocks.cardBodies.every(body => !body.includes('当前授权仅允许普通对话'))).toBe(true);
   });
 
   it('does not route a bot-authored natural-language command through the host in a new topic', async () => {

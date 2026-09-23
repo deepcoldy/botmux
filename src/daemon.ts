@@ -5584,8 +5584,18 @@ async function routeFrozenCommand(input: {
   mentions?: readonly LarkMention[];
   reply: (rootId: string, content: string, msgType?: string, larkAppId?: string) => Promise<string>;
 }): Promise<FrozenCommandRouteResult> {
-  if (!input.workingDir) {
-    if (input.cmd === '/freeze') {
+  if (input.cmd === '/freeze') {
+    const restrictedText = grantRestrictedCommandText(
+      input.larkAppId,
+      input.chatId,
+      input.senderOpenId,
+      input.cmd,
+    );
+    if (restrictedText) {
+      await input.reply(input.anchor, restrictedText, 'text', input.larkAppId);
+      return { kind: 'handled' };
+    }
+    if (!input.workingDir) {
       await input.reply(
         input.anchor,
         '当前角色还没有可用的工作目录，无法管理固化命令。请先选择仓库或配置默认工作目录。',
@@ -5594,10 +5604,6 @@ async function routeFrozenCommand(input: {
       );
       return { kind: 'handled' };
     }
-    return { kind: 'not_found' };
-  }
-
-  if (input.cmd === '/freeze') {
     const self = getBot(input.larkAppId);
     const args = frozenCommandRawArgs(input.commandContent, input.mentions, {
       botOpenId: self.botOpenId,
@@ -5736,12 +5742,31 @@ async function routeFrozenCommand(input: {
     return { kind: 'not_found' };
   }
 
+  if (!input.workingDir) return { kind: 'not_found' };
+
   const lifecycle = evaluateFrozenCommandLifecycle({
     dataDir: config.session.dataDir,
     targetBotId: input.larkAppId,
     workingDir: input.workingDir,
     command: input.cmd,
   });
+  const lookup = lookupFrozenCommand({ workingDir: input.workingDir, command: input.cmd });
+  const knownWithoutDefinition = lifecycle.kind === 'retired'
+    || lifecycle.kind === 'revoked'
+    || (lifecycle.kind === 'fail_closed' && lifecycle.record !== undefined);
+  if (lookup.kind === 'missing' && !knownWithoutDefinition) return { kind: 'not_found' };
+
+  const restrictedText = grantRestrictedCommandText(
+    input.larkAppId,
+    input.chatId,
+    input.senderOpenId,
+    input.cmd,
+  );
+  if (restrictedText) {
+    await input.reply(input.anchor, restrictedText, 'text', input.larkAppId);
+    return { kind: 'handled' };
+  }
+
   if (lifecycle.kind === 'retired') {
     const payload = lifecycle.record.tombstonePayload;
     await input.reply(
@@ -5766,7 +5791,6 @@ async function routeFrozenCommand(input: {
     return { kind: 'handled' };
   }
 
-  const lookup = lookupFrozenCommand({ workingDir: input.workingDir, command: input.cmd });
   if (lookup.kind === 'missing') return { kind: 'not_found' };
   if (lookup.kind === 'invalid') {
     await input.reply(input.anchor, `固化命令暂不可用：${lookup.error.message}`, 'text', input.larkAppId);
