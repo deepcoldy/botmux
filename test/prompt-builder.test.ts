@@ -107,8 +107,9 @@ vi.mock('../src/core/worker-pool.js', () => ({
 
 // ─── Imports ──────────────────────────────────────────────────────────────
 
-import { buildNewTopicPrompt, buildFollowUpContent, buildReforkPrompt, renderSenderTag, renderCursorSenderNote, renderBufferedSenderBlock } from '../src/core/session-manager.js';
+import { buildNewTopicPrompt, buildNewTopicCliInput, buildFollowUpContent, buildFollowUpCliInput, buildReforkPrompt, renderSenderTag, renderCursorSenderNote, renderBufferedSenderBlock } from '../src/core/session-manager.js';
 import { config } from '../src/config.js';
+import { setBotLookup, setDefaultLocale } from '../src/i18n/index.js';
 import { BOTMUX_SHELL_HINTS, buildBotmuxShellHints, buildBotmuxSystemPromptText } from '../src/adapters/cli/shared-hints.js';
 import type { DaemonSession } from '../src/core/types.js';
 
@@ -1159,5 +1160,67 @@ describe('replyDelivery=transcript envelope', () => {
     expect(shelled).not.toContain('<botmux_reminder>');
     expect(shelled).toContain('<user_message>\n@Bot 继续\n</user_message>');
     expect(shelled).toContain('<sender ');
+  });
+});
+
+// ─── Locale fallback at the public builder entries ──────────────────────────
+//
+// 活 worker 普通续轮 / re-fork / XPI 重放 / 文档评论等调用点历史上只传
+// larkAppId、漏传 locale：首轮按 bot 配置语言渲染，续轮却回落进程默认，
+// 同一会话出现中英混排。三个 public builder 现在都在入口兜底
+// `opts.locale ?? localeForBot(larkAppId)`（与 buildRefork* 先例同构）。
+describe('builder locale fallback when the caller omits locale', () => {
+  const SID = 'locale-fallback-sid';
+  const enBot = (appId?: string) => (appId === 'en-app' ? { config: { lang: 'en' } } : undefined);
+  const zhBot = (appId?: string) => (appId === 'zh-app' ? { config: { lang: 'zh' } } : undefined);
+
+  afterEach(() => {
+    setBotLookup(undefined);
+    setDefaultLocale('zh');
+  });
+
+  it('follow-up content renders in the bot language instead of process default', () => {
+    setDefaultLocale('zh');
+    setBotLookup(enBot);
+    const content = buildFollowUpContent('hello', SID, { cliId: 'codex', larkAppId: 'en-app' });
+    expect(content).toContain('<botmux_reminder>Respond to messages addressed to you');
+    expect(content).not.toContain('发给你的消息');
+  });
+
+  it('buildFollowUpCliInput applies the same fallback (live-worker reply entry)', () => {
+    setDefaultLocale('zh');
+    setBotLookup(enBot);
+    const out = buildFollowUpCliInput('hello', SID, { cliId: 'codex', larkAppId: 'en-app' });
+    expect(out.content).toContain('Respond to messages addressed to you');
+  });
+
+  it('opening entry also falls back: whiteboard block for an en bot is English', () => {
+    setDefaultLocale('zh');
+    setBotLookup(enBot);
+    const out = buildNewTopicCliInput(
+      'hello', SID, 'codex',
+      undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, // locale deliberately omitted by the caller
+      undefined,
+      { larkAppId: 'en-app', whiteboardId: 'wb_en' },
+    );
+    expect(out.content).toContain('Local project context');
+    expect(out.content).not.toContain('本地项目上下文');
+  });
+
+  it('keeps the process default when the bot is unknown (no behavior change)', () => {
+    setDefaultLocale('zh');
+    setBotLookup(undefined);
+    const content = buildFollowUpContent('hello', SID, { cliId: 'codex', larkAppId: 'ghost-app' });
+    expect(content).toContain('发给你的消息');
+  });
+
+  it('still lets an explicit locale override the bot config', () => {
+    setDefaultLocale('zh');
+    setBotLookup(zhBot);
+    const content = buildFollowUpContent('hello', SID, {
+      cliId: 'codex', larkAppId: 'zh-app', locale: 'en',
+    });
+    expect(content).toContain('Respond to messages addressed to you');
   });
 });

@@ -1483,6 +1483,10 @@ export function buildNewTopicCliInput(
     sessionBackendType?: BackendType;
   },
 ): CliTurnPayload {
+  // 调用点漏传 locale 时回落该 bot 的 per-bot 语言（与 buildFollowUpCliInput /
+  // buildReforkCliInput 同一兜底）；bot 未配 lang 时 localeForBot 即进程默认，
+  // 与旧行为一致。否则首轮按 bot 语言、续轮回落进程默认会造成同会话语言混排。
+  locale = locale ?? localeForBot(opts?.larkAppId);
   // hook 注入模式（#794 后续）：opening 也走 sidecar——whiteboard/sender/mentions
   // 写入 per-turn sidecar，PTY 文本只剩用户正文（+ role/summaryMemory 等稳定上下文）。
   // 与 follow-up 同一套 sidecar/claim 机制；turnId 是 claim 的权威键，缺失或条件
@@ -1712,6 +1716,9 @@ export function buildFollowUpContent(
   sessionId: string,
   opts?: FollowUpOpts,
 ): string {
+  // 同 buildFollowUpCliInput 的 locale 兜底：public 入口自保，调用点漏传时
+  // 按该 bot 配置的语言渲染（buildRefork* 外层也有同构兜底）。
+  opts = opts ? { ...opts, locale: opts.locale ?? localeForBot(opts.larkAppId) } : opts;
   if (
     opts?.cliId
     && createCliAdapterSync(opts.cliId, opts.cliPathOverride).inputEnvelope === 'service-user'
@@ -1825,6 +1832,10 @@ export function buildFollowUpCliInput(
   sessionId: string,
   opts?: FollowUpOpts,
 ): CliTurnPayload {
+  // 兜底 locale：活 worker 普通续轮、worker-null re-fork、XPI 重放、文档评论等
+  // 调用点若漏传，首轮（buildNewTopicCliInput 已按 per-bot 语言渲染）与续轮就会
+  // 语言混排。统一在此按 bot 配置补齐；bot 未配 lang 时即进程默认，与旧行为一致。
+  opts = opts ? { ...opts, locale: opts.locale ?? localeForBot(opts.larkAppId) } : opts;
   // hook 注入模式（#794）：reminder/whiteboard 写入 per-turn sidecar，PTY 文本只保留
   // 其余块。超限或无条件时回退 inline（legacy 路径），行为与历史完全一致。
   // turnId 是 claim 的权威键：缺失时无法做 turn 绑定，回退 inline（避免 reminder 被

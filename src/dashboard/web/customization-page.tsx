@@ -49,8 +49,8 @@ interface CustomizationSnapshotPayload {
 }
 
 const FALLBACK_STAGES: StageMeta[] = [
-  { id: 'new', label: '会话开始', blurb: '新会话首轮注入的系统提示 / 开场 prompt，每个会话只发一次。' },
-  { id: 'followup', label: '每条新消息', blurb: '会话中每条后续消息都会注入的信封块与续轮提醒。' },
+  { id: 'new', label: '会话开始', blurb: '新会话首轮注入的系统提示 / 开场 prompt，每个会话只发一次。两套路径（系统提示 / Shell）覆盖全部 CLI。' },
+  { id: 'followup', label: '每条新消息', blurb: '会话中每条后续消息都会注入的信封块：续轮提醒、附件/提及、白板、记忆等。' },
   { id: 'send', label: '发送之后', blurb: '模型执行 botmux send 之后，在终端回显里读到的反馈文案。' },
 ];
 
@@ -705,7 +705,7 @@ const PAGE_CSS = `
 .cz-edit{margin-top:4px;}
 .cz-tokens{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:7px;}
 .cz-tokens-cap{font-size:11px;color:var(--faint);}
-.cz-token{border:1px solid var(--border);background:var(--surface-muted);color:var(--accent-strong);font-family:var(--mono);font-size:11px;border-radius:7px;padding:2px 9px;cursor:pointer;font-family:var(--mono);min-height:0;}
+.cz-token{border:1px solid var(--border);background:var(--surface-muted);color:var(--accent-strong);font-family:var(--mono);font-size:11px;border-radius:7px;padding:2px 9px;cursor:pointer;min-height:0;}
 .cz-token:hover{border-color:var(--accent);background:var(--accent-soft);}
 .cz-textarea{width:100%;background:var(--surface-muted);border:1px solid var(--border);border-radius:8px;padding:9px 11px;font-family:var(--mono);font-size:12px;line-height:1.6;color:var(--fg);resize:vertical;box-sizing:border-box;}
 .cz-textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft);}
