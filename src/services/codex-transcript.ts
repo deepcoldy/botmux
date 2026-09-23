@@ -4,8 +4,10 @@
  * Codex stores each session's full transcript at
  *   ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<cliSessionId>.jsonl
  * and creates the file lazily on the first user submit. The bridge fallback
- * cares about exactly two records:
+ * cares about three records:
  *
+ *   - native turn-start: `event_msg.payload` `task_started`, which can
+ *     precede the persisted user message by a long interval.
  *   - user turn-start: `response_item.payload` message role=user
  *     (input_text content). Stable across every codex version.
  *   - turn terminal: `event_msg.payload` `task_complete`, which carries the
@@ -205,6 +207,8 @@ export interface CodexBridgeEvent {
   timestampMs: number;
   /** Discriminator for the queue layer:
    *   - 'user' starts a pending Lark turn (fingerprint-matched)
+   *   - 'turn_started' is Codex's authoritative task_started edge; it starts
+   *     the pending head before the delayed response_item/user is persisted
    *   - 'assistant_final' closes the currently-collecting turn with output
    *   - 'turn_aborted' closes it without producing fallback output
    *   - 'turn_bind' adds a provider turn id to an already-started turn
@@ -212,7 +216,7 @@ export interface CodexBridgeEvent {
    *   - 'cot' is a cosmetic mid-turn record (reasoning / tool call / tool
    *     output) attributed to the collecting turn for the CoT message; it
    *     never starts or closes a turn */
-  kind: 'user' | 'assistant_final' | 'turn_aborted' | 'turn_bind' | 'cot';
+  kind: 'user' | 'turn_started' | 'assistant_final' | 'turn_aborted' | 'turn_bind' | 'cot';
   /** Concatenated text from the message's content blocks (input_text for
    *  user, output_text for assistant). Empty for 'cot' events. */
   text: string;
@@ -912,6 +916,23 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
     if (!p || typeof p !== 'object') continue;
     const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
     const timestampMs = Number.isFinite(ts) ? ts : Date.now();
+    // Codex can persist task_started well before the matching response_item
+    // user record (AGENTS/environment scaffolding may be written in between).
+    // Surface this authoritative lifecycle edge so the queue does not expire
+    // a real running turn merely because fingerprint evidence is late.
+    if (obj.type === 'event_msg'
+      && p.type === 'task_started'
+      && typeof p.turn_id === 'string'
+      && p.turn_id.length > 0) {
+      events.push({
+        uuid: `${path}:${lineStart}`,
+        timestampMs,
+        kind: 'turn_started',
+        text: '',
+        sourceTurnId: p.turn_id,
+      });
+      continue;
+    }
     // User turn-start: response_item message role=user. Stable across every
     // codex version, and the ONLY event the RPC rollout-match probe reads
     // (codex-rpc-lifecycle.rolloutUserTurnMatches), so it must stay a
@@ -958,6 +979,7 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
           terminalErrorCode: codexTaskFailureCode(p.error),
           terminalErrorSummary: safeFailureSummary(p.error),
         } : {}),
+        sourceTurnId: p.turn_id,
       });
       continue;
     }
@@ -975,6 +997,7 @@ export function drainCodexRollout(path: string, fromOffset: number): CodexDrainR
         text: '',
         terminalStatus: 'ambiguous',
         terminalErrorCode: codexAbortErrorCode(p.reason),
+        sourceTurnId: p.turn_id,
       });
       continue;
     }

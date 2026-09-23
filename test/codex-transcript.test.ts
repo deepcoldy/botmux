@@ -333,6 +333,27 @@ describe('drainCodexRollout', () => {
     expect(r.events[1].text).toBe('hi back');
   });
 
+  it('surfaces task_started before a delayed user record', () => {
+    writeFileSync(path,
+      ev({
+        timestamp: '2026-04-29T07:00:00.000Z',
+        type: 'event_msg',
+        payload: { type: 'task_started', turn_id: 'native-turn-1' },
+      })
+      + ev(userResponseItem('delayed prompt', '2026-04-29T07:01:40.000Z'))
+      + ev(assistantFinalResponseItem('done', '2026-04-29T07:02:00.000Z')));
+
+    expect(drainCodexRollout(path, 0).events).toEqual([
+      expect.objectContaining({ kind: 'turn_started', sourceTurnId: 'native-turn-1' }),
+      expect.objectContaining({ kind: 'user', text: 'delayed prompt' }),
+      expect.objectContaining({
+        kind: 'assistant_final',
+        text: 'done',
+        sourceTurnId: 'turn-2026-04-29T07:02:00.000Z',
+      }),
+    ]);
+  });
+
   it('skips developer role messages', () => {
     writeFileSync(path,
       ev({

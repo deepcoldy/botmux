@@ -15,6 +15,9 @@ function userEv(text: string, uuid?: string, ts = 0): CodexBridgeEvent {
 function asstEv(text: string, uuid?: string, ts = 0): CodexBridgeEvent {
   return { uuid: uuid ?? `a${++nextUuid}`, timestampMs: ts, kind: 'assistant_final', text };
 }
+function startedEv(sourceTurnId: string, uuid?: string, ts = 0): CodexBridgeEvent {
+  return { uuid: uuid ?? `s${++nextUuid}`, timestampMs: ts, kind: 'turn_started', text: '', sourceTurnId };
+}
 function abortEv(reason = 'interrupted', uuid?: string, ts = 0, sourceSessionId?: string): CodexBridgeEvent {
   return { uuid: uuid ?? `x${++nextUuid}`, timestampMs: ts, kind: 'turn_aborted', text: reason, sourceSessionId };
 }
@@ -214,6 +217,39 @@ describe('CodexBridgeQueue — cot observer (thinking timeline)', () => {
       expect.objectContaining({ turnId: 't1', started: true, sourceTurnId: 'native-1' }),
       expect.objectContaining({ turnId: 't2', started: false }),
     ]);
+  });
+
+  it('keeps a task_started turn attributable while its user record is delayed past the lease', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('late-user', 'prompt persisted late', now);
+    q.ingest([startedEv('native-late-user', 'start-late-user', now + 1)]);
+
+    now += STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS + 80_000;
+    expect(q.pruneExpiredPreStartHeads()).toEqual([]);
+    expect(q.hasBlockingTurn()).toBe(true);
+
+    q.ingest([userEv('prompt persisted late', 'user-late-user', now)]);
+    expect(q.peek()[0]).toMatchObject({
+      turnId: 'late-user',
+      started: true,
+      sourceTurnId: 'native-late-user',
+      transcriptStartTimeMs: now,
+      markTimeMs: 1_001,
+    });
+
+    q.ingest([{ ...asstEv('done', 'final-late-user', now + 1), sourceTurnId: 'native-late-user' }]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'late-user', finalText: 'done' }),
+    ]);
+  });
+
+  it('does not let a stale task_started replay claim a fresh pending turn', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('fresh', 'fresh prompt', 10_000);
+    q.ingest([startedEv('stale-native-turn', 'stale-start', 4_999)]);
+
+    expect(q.peek()[0]).toMatchObject({ turnId: 'fresh', started: false });
   });
 
   it('attributes cot events to the collecting turn and ignores them outside a turn', () => {

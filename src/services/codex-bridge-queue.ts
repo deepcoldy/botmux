@@ -502,6 +502,35 @@ export class CodexBridgeQueue {
       target.sourceTurnId = ev.sourceTurnId;
       return;
     }
+    if (ev.kind === 'turn_started') {
+      // task_started is an authoritative native lifecycle edge. When the
+      // fingerprinted response_item/user is delayed, bind and start the
+      // pending head now so its short pre-start attribution lease cannot
+      // expire while Codex is demonstrably running the task.
+      const active = this.collecting;
+      if (active && active.finalText === undefined
+        && this.sourceSessionsCompatible(active.sourceSessionId, ev.sourceSessionId)
+        && (!active.sourceTurnId || !ev.sourceTurnId || active.sourceTurnId === ev.sourceTurnId)) {
+        if (!active.sourceSessionId && ev.sourceSessionId) active.sourceSessionId = ev.sourceSessionId;
+        if (!active.sourceTurnId && ev.sourceTurnId) active.sourceTurnId = ev.sourceTurnId;
+        return;
+      }
+      const next = this.queue.find(turn => !turn.started && turn.finalText === undefined);
+      if (!next) return;
+      const tooOld = next.markTimeMs !== undefined
+        && ev.timestampMs < next.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS;
+      if (tooOld) return;
+      next.started = true;
+      next.submitVerificationStartedAtMs = undefined;
+      next.unconfirmedAttributionStartedAtMs = undefined;
+      next.sourceSessionId = ev.sourceSessionId;
+      next.sourceTurnId = ev.sourceTurnId;
+      next.markTimeMs = next.markTimeMs === undefined
+        ? ev.timestampMs
+        : Math.max(next.markTimeMs, ev.timestampMs);
+      this.collecting = next;
+      return;
+    }
     if (ev.kind === 'cot') {
       // Cosmetic thinking-timeline record. Only meaningful while a turn is
       // collecting; history replay / unmatched events are dropped (never
@@ -515,6 +544,30 @@ export class CodexBridgeQueue {
       return;
     }
     if (ev.kind === 'user') {
+      // task_started can precede the response_item/user by well over the
+      // pre-start lease. When that delayed record matches the already-started
+      // collecting turn, treat it as corroborating metadata rather than a new
+      // turn boundary. Preserve markTimeMs: in-turn botmux sends may have
+      // landed after task_started but before this late user record.
+      if (this.collecting
+        && this.collecting.finalText === undefined
+        && this.collecting.transcriptStartTimeMs === undefined
+        && this.sourceSessionsCompatible(this.collecting.sourceSessionId, ev.sourceSessionId)) {
+        const collectingTooOld = this.collecting.markTimeMs !== undefined
+          && ev.timestampMs < this.collecting.markTimeMs - UNMATCHED_REPLAY_WINDOW_MS;
+        const collectingFingerprintOk = !this.collecting.contentFingerprint
+          || normaliseForFingerprint(ev.text).includes(this.collecting.contentFingerprint);
+        if (!collectingTooOld && collectingFingerprintOk) {
+          this.collecting.transcriptStartTimeMs = ev.timestampMs;
+          if (!this.collecting.sourceSessionId && ev.sourceSessionId) {
+            this.collecting.sourceSessionId = ev.sourceSessionId;
+          }
+          if (!this.collecting.sourceTurnId && ev.sourceTurnId) {
+            this.collecting.sourceTurnId = ev.sourceTurnId;
+          }
+          return;
+        }
+      }
       // Some providers mirror one native user turn in more than one record.
       // Once its stable id has started a pending turn, ignore any duplicate
       // before considering HOL-drop or matching the next queued prompt.
