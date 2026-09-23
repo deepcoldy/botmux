@@ -30,6 +30,8 @@ import { join } from 'node:path';
 import * as tmuxBackend from '../src/adapters/backend/tmux-backend.js';
 import { PtyBackend } from '../src/adapters/backend/pty-backend.js';
 import { isBunRuntime } from './helpers/ts-runner.js';
+import { buildWrappedLaunch } from '../src/setup/cli-selection.js';
+import { installAidenCodexShim } from '../src/services/aiden-codex-shim.js';
 import {
   buildBotmuxEnvAssignments,
   buildDebugKeepShellScript,
@@ -43,6 +45,37 @@ import {
 } from '../src/adapters/backend/tmux-backend.js';
 
 type ShellKindUnderTest = 'bash' | 'zsh' | 'sh' | 'fish';
+
+describe('Aiden Codex pane launch', () => {
+  it.each(['high', 'max', 'ultra'])('carries %s through wrapper selection, pane env and the executable shim', (effort) => {
+    const dir = mkdtempSync(join(tmpdir(), 'aiden-pane-'));
+    try {
+      const realBin = join(dir, 'real codex');
+      writeFileSync(realBin, '#!/bin/sh\nprintf "%s\\n" "$@"\nprintf "shim-env=%s/%s\\n" "${BOTMUX_AIDEN_CODEX_REAL_BIN-unset}" "${BOTMUX_AIDEN_CODEX_REASONING_EFFORT-unset}"\n', { mode: 0o755 });
+      const shimDir = installAidenCodexShim(join(dir, 'shim'));
+      const launch = buildWrappedLaunch('aiden x codex', ['--model', 'gpt-5.6-sol', '-c', `model_reasoning_effort="${effort}"`], b => b, {
+        aidenCodexRealBin: realBin, aidenCodexShimDir: shimDir, childPath: '/usr/bin:/bin',
+      });
+      const result = spawnSync('/bin/sh', ['-c', shellWrapperScript(dir), '_', dir,
+        ...buildBotmuxEnvAssignments(launch.env), join(shimDir, 'codex'), '--model', 'gpt-5.6-sol'], {
+        encoding: 'utf8', env: { PATH: '/usr/bin:/bin', BOTMUX_AIDEN_CODEX_REAL_BIN: '/stale/codex', BOTMUX_AIDEN_CODEX_REASONING_EFFORT: 'low' },
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout.trim().split('\n')).toEqual(['-c', `model_reasoning_effort="${effort}"`, '--model', 'gpt-5.6-sol', 'shim-env=unset/unset']);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('clears stale shim settings for unrelated panes', () => {
+    const result = spawnSync('/bin/sh', ['-c', shellWrapperScript('/tmp'), '_', tmpdir(), '/bin/sh', '-c',
+      'printf "%s/%s" "${BOTMUX_AIDEN_CODEX_REAL_BIN-unset}" "${BOTMUX_AIDEN_CODEX_REASONING_EFFORT-unset}"'], {
+      encoding: 'utf8', env: { PATH: '/usr/bin:/bin', BOTMUX_AIDEN_CODEX_REAL_BIN: '/stale/codex', BOTMUX_AIDEN_CODEX_REASONING_EFFORT: 'low' },
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe('unset/unset');
+  });
+});
 type ShellWrapperScriptForKind = (binDir: string, kind?: ShellKindUnderTest) => string;
 type DebugKeepShellScriptForKind = (shellPath: string, binDir: string, kind?: ShellKindUnderTest) => string;
 

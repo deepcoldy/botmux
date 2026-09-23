@@ -347,6 +347,10 @@ export function scrubSessionCliHomeEnv(env: NodeJS.ProcessEnv): void {
 export const BOTMUX_INJECTED_ENV_KEYS = [
   '__OWNER_OPEN_ID',
   'BOTMUX',
+  // Per-launch Aiden Codex shim configuration. Forward only into the owning
+  // pane, and scrub stale values from shared terminal servers and login shells.
+  'BOTMUX_AIDEN_CODEX_REAL_BIN',
+  'BOTMUX_AIDEN_CODEX_REASONING_EFFORT',
   'SESSION_DATA_DIR',
   'IS_SANDBOX',
   // botmux ask/hooks use these to locate the daemon and route back to the

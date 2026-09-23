@@ -15017,9 +15017,8 @@ async function spawnCli(
         type: 'user_notify',
         turnId: currentBotmuxTurnId,
         message:
-          `⚠️  历史会话（${(cfg.cliSessionId ?? cfg.originalSessionId ?? cfg.sessionId).substring(0, 16)}…）` +
-          `无法恢复，已为你**新起一个干净会话**（原因：${reason}）。\n` +
-          `之前的上下文不会带到本轮，需要的话请简述背景。`,
+          `⚠️ 会话启动失败，正在尝试以新会话重新启动。\n` +
+          `这次重试不会恢复历史上下文；如需继续之前的任务，请补充背景。`,
       });
     }
     // Reset the counter so the fresh spawn gets a clean 2-attempt budget in
