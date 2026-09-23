@@ -836,8 +836,9 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // （在沙盒内）按内容指纹读回。worker 预创建目录以通过 existence-filter。
   if (ctx.sessionId) push([`${ctx.sessionDataDir}/prompt-ctx/${ctx.sessionId}`], 'readOnly', 'internal');
   // Trigger-user CLI identity (this session ONLY) — the wrapper on PATH sources
-  // `cli-identity/<sessionId>.<tool>.env` on every invocation, so a sandboxed
-  // session needs to READ exactly those files plus the wrapper scripts.
+  // `cli-identity/<sessionId>.bin/.data/<tool>.env` on every invocation. Bind
+  // the per-session directory, not each mutable file: atomic writes replace
+  // inodes, while a long-lived bwrap single-file bind keeps reading the old one.
   //
   // Granted per file/dir, never the `cli-identity/` parent: that directory holds
   // every concurrent session's files, each with a live user token belonging to a
@@ -849,16 +850,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // able to. Writable would let an agent publish its own identity and act as
   // anyone whose token it could name.
   if (ctx.sessionId && larkTransport) {
-    push([
-      `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.lark-cli.env`,
-      `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bytedcli.env`,
-      `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bin`,
-      // The turn the CLI is currently executing. The wrapper compares it against
-      // the turn stamped on the identity and refuses on a mismatch, so without
-      // this grant a sandboxed session reads nothing and every governed command
-      // fails — the deny is safe, but it is not the behavior we want.
-      `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.turn`,
-    ], 'readOnly', 'internal');
+    push([`${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bin`], 'readOnly', 'internal');
   }
   // Own per-bot lark-cli config (agent-facing lark-cli identity). Withheld from
   // a no-transport turn — it IS this bot's Feishu credential surface.

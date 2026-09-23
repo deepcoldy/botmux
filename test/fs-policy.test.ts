@@ -1731,31 +1731,31 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
 
 // Trigger-user CLI identity: the wrapper on PATH sources the per-session
 // identity file on every invocation, so a sandboxed session must be able to READ
-// exactly its own — and nothing else. The grant is per file, never the shared
-// `cli-identity/` parent, because that parent holds every concurrent session's
-// file and each one carries a live token belonging to a different person.
+// exactly its own — and nothing else. The grant is a per-session directory,
+// never the shared `cli-identity/` parent, because that parent holds every
+// concurrent session's live user token.
 describe('buildFsPolicy — trigger-user CLI identity', () => {
   const dataDir = '/Users/u/.botmux/data';
 
   it('grants this session\'s identity files read-only', () => {
     const p = buildFsPolicy(ctx({ sessionId: 'sess-mine' }));
     for (const tool of ['lark-cli', 'bytedcli']) {
-      expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.${tool}.env`).access)
+      expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin/.data/${tool}.env`).access)
         .toBe('readOnly');
     }
     expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin`).access).toBe('readOnly');
     // The wrapper also reads the turn the CLI is currently executing, to refuse
     // credentials that belong to a different turn. Without this grant a
     // sandboxed session reads nothing and every governed command is refused.
-    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.turn`).access).toBe('readOnly');
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin/.data/turn`).access).toBe('readOnly');
   });
 
   // The one that matters: session A must not be able to read session B's token.
   it('leaves another session\'s identity denied', () => {
     const p = buildFsPolicy(ctx({ sessionId: 'sess-mine' }));
-    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-other.lark-cli.env`).access)
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-other.bin/.data/lark-cli.env`).access)
       .not.toBe('readOnly');
-    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-other.turn`).access)
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-other.bin/.data/turn`).access)
       .not.toBe('readOnly');
     // Same for bytedcli: each person's login state lives in a private HOME, and
     // the daemon (not the sandboxed CLI) mints their JWTs, so the agent has no
@@ -1772,7 +1772,7 @@ describe('buildFsPolicy — trigger-user CLI identity', () => {
   // token it could name. The daemon writes; the CLI only reads.
   it('never grants write access to an identity file', () => {
     const p = buildFsPolicy(ctx({ sessionId: 'sess-mine' }));
-    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.lark-cli.env`).access)
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin/.data/lark-cli.env`).access)
       .not.toBe('readWrite');
   });
 
@@ -1781,7 +1781,7 @@ describe('buildFsPolicy — trigger-user CLI identity', () => {
   // to close.
   it('withholds the identity from a no-transport turn', () => {
     const p = buildFsPolicy(ctx({ sessionId: 'sess-mine', larkTransportEnabled: false }));
-    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.lark-cli.env`).access)
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin/.data/lark-cli.env`).access)
       .not.toBe('readOnly');
   });
 });

@@ -102,6 +102,7 @@ describe('writeSessionIdentity', () => {
     const path = writeSessionIdentity(dir, SESSION, { tool: 'lark-cli', appId: 'a', userAccessToken: 't' });
     expect(statSync(path).mode & 0o777).toBe(0o600);
     expect(statSync(join(dir, 'cli-identity')).mode & 0o777).toBe(0o700);
+    expect(statSync(join(dir, 'cli-identity', `${SESSION}.bin`, '.data')).mode & 0o777).toBe(0o700);
   });
 
   it('replaces rather than accumulates when the acting person changes', () => {

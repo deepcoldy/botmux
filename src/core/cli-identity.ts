@@ -43,6 +43,20 @@ export function sessionIdentityDir(sessionDataDir: string): string {
 }
 
 /**
+ * Mutable identity data for one session.
+ *
+ * Keep the env and active-turn files below the existing per-session wrapper
+ * directory instead of binding either file into the sandbox directly. Atomic
+ * writes replace a file inode; a long-lived bubblewrap single-file bind would
+ * otherwise keep reading the inode captured at spawn. Reusing the directory
+ * already mounted for wrappers also lets sessions created before an upgrade see
+ * this layout without rebuilding their persistent pane.
+ */
+export function sessionIdentityDataDir(sessionDataDir: string, sessionId: string): string {
+  return join(sessionIdentityBinDir(sessionDataDir, sessionId), '.data');
+}
+
+/**
  * Identity file for one tool in one session.
  *
  * Named by session id so concurrent sessions of the same bot — different people
@@ -53,7 +67,7 @@ export function sessionIdentityPath(
   sessionId: string,
   tool: TriggerUserAuthTool,
 ): string {
-  return join(sessionIdentityDir(sessionDataDir), `${assertSafeSegment(sessionId)}.${tool}.env`);
+  return join(sessionIdentityDataDir(sessionDataDir, sessionId), `${tool}.env`);
 }
 
 /**
@@ -68,7 +82,7 @@ export function sessionIdentityPath(
  * invocation, and parsing JSON there would mean spawning `jq`.
  */
 export function sessionActiveTurnPath(sessionDataDir: string, sessionId: string): string {
-  return join(sessionIdentityDir(sessionDataDir), `${assertSafeSegment(sessionId)}.turn`);
+  return join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turn');
 }
 
 /**
@@ -86,7 +100,7 @@ export function publishActiveTurn(
 ): void {
   const path = sessionActiveTurnPath(sessionDataDir, sessionId);
   try {
-    mkdirSync(sessionIdentityDir(sessionDataDir), { recursive: true, mode: 0o700 });
+    mkdirSync(sessionIdentityDataDir(sessionDataDir, sessionId), { recursive: true, mode: 0o700 });
     atomicWriteFileSync(path, `${turnId ?? ''}\n`, { mode: 0o600 });
   } catch { /* best-effort: a stale/absent turn file refuses, never misattributes */ }
 }
@@ -280,7 +294,7 @@ export function writeSessionIdentity(
   identity: CliIdentity,
 ): string {
   const path = sessionIdentityPath(sessionDataDir, sessionId, identity.tool);
-  mkdirSync(sessionIdentityDir(sessionDataDir), { recursive: true, mode: 0o700 });
+  mkdirSync(sessionIdentityDataDir(sessionDataDir, sessionId), { recursive: true, mode: 0o700 });
   atomicWriteFileSync(path, renderIdentityEnv(identity), { mode: 0o600 });
   return path;
 }
@@ -375,7 +389,7 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     `${MODE_VAR}=`,
     `${DENY_MSG_VAR}=`,
     'if [ -n "$SESSION_DATA_DIR" ] && [ -n "$BOTMUX_SESSION_ID" ]; then',
-    `  __botmux_cred="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.${tool}.env"`,
+    `  __botmux_cred="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.bin/.data/${tool}.env"`,
     '  if [ -f "$__botmux_cred" ]; then',
     '    . "$__botmux_cred"',
     '  fi',
@@ -388,7 +402,7 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     // running, so these are somebody else's.
     '__botmux_live=',
     'if [ -n "$SESSION_DATA_DIR" ] && [ -n "$BOTMUX_SESSION_ID" ]; then',
-    '  __botmux_turnf="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.turn"',
+    '  __botmux_turnf="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.bin/.data/turn"',
     '  if [ -f "$__botmux_turnf" ]; then',
     '    read -r __botmux_live < "$__botmux_turnf" || __botmux_live=',
     '  fi',
@@ -443,12 +457,12 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
 }
 
 /**
- * Create empty identity files so a sandboxed session can read them later.
+ * Create the per-session identity directory and empty files before sandbox
+ * spawn so a sandboxed session can read them later.
  *
- * The file sandbox existence-filters its allow list: a path that does not exist
- * at spawn is dropped, and a dropped path stays unreadable even once the daemon
- * publishes to it — the session would then run without the sender's identity,
- * silently. Creating the files up front keeps the grant intact.
+ * The file sandbox existence-filters its allow list: a directory that does not
+ * exist at spawn is dropped. Binding the directory (rather than its files) is
+ * also what makes later atomic rename updates visible to a persistent sandbox.
  *
  * Empty is the right initial content. No identity exists until the first turn
  * resolves one, and both the wrapper and a `.`-source treat an empty file the
@@ -462,7 +476,7 @@ export function ensureSessionIdentityPlaceholders(
   sessionId: string,
   tools: readonly TriggerUserAuthTool[],
 ): void {
-  mkdirSync(sessionIdentityDir(sessionDataDir), { recursive: true, mode: 0o700 });
+  mkdirSync(sessionIdentityDataDir(sessionDataDir, sessionId), { recursive: true, mode: 0o700 });
   const paths = [
     ...tools.map(tool => sessionIdentityPath(sessionDataDir, sessionId, tool)),
     // Same existence-filter reason: the wrapper reads the active turn on every
