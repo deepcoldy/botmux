@@ -325,3 +325,121 @@ describe('publishTurnCliIdentity — failures fail closed', () => {
     expect(readFileSync(larkPath(), 'utf8')).toContain('BOTMUX_IDENTITY_MODE=\'denied\'');
   });
 });
+
+describe('verified cross-bot delegation', () => {
+  const delegatedIdentity = {
+    targetOpenId: 'ou_alice_target', credentialOpenId: ALICE,
+    tools: ['lark-cli', 'bytedcli'] as ('lark-cli' | 'bytedcli')[], dispatchRoot: 'om_dispatch',
+  };
+  const delegated = (turnId = 'om_delegated', tools = delegatedIdentity.tools) => publishTurnCliIdentity({
+    botConfig: botConfig({ enabled: true, tools: ['lark-cli', 'bytedcli'] }), sessionDataDir: dir,
+    sessionId: SESSION, senderOpenId: 'ou_source_bot', turnId,
+    delegatedIdentity: { ...delegatedIdentity, tools },
+  });
+  it('uses original user login for CLI identities and stamps the target turn', async () => {
+    bytedcliJwts.set(ALICE, { cloudJwt: 'alice-cloud' });
+    bytedcliJwts.set('ou_source_bot', { cloudJwt: 'wrong-bot' });
+    larkHomes.set(ALICE, '/isolated/alice');
+    expect(await delegated()).toEqual([{ tool: 'lark-cli', state: 'user' }, { tool: 'bytedcli', state: 'user' }]);
+    expect(readFileSync(larkPath(), 'utf8')).toContain('/isolated/alice');
+    const env = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
+    expect(env).toContain('alice-cloud');
+    expect(env).toContain('om_delegated');
+    expect(env).not.toContain('wrong-bot');
+  });
+  it('rechecks authorization on retry and clears revoked credentials', async () => {
+    bytedcliJwts.set(ALICE, { cloudJwt: 'revocable' });
+    await delegated();
+    bytedcliJwts.delete(ALICE);
+    await delegated();
+    const env = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
+    expect(env).not.toContain('revocable');
+    expect(env).toContain('report --dispatch-root om_dispatch');
+    expect(env).toContain('Do not ask a bot to log in');
+  });
+  it('does not forward source-app OAuth as a target-app token', async () => {
+    tokens.set(`cli_source|${ALICE}`, 'source-oauth');
+    await delegated();
+    expect(readFileSync(larkPath(), 'utf8')).not.toContain('source-oauth');
+    tokens.set(`${APP}|ou_alice_target`, 'target-oauth');
+    await delegated();
+    expect(readFileSync(larkPath(), 'utf8')).toContain('target-oauth');
+  });
+  it('target cannot widen delegated tool permissions', async () => {
+    bytedcliJwts.set(ALICE, { cloudJwt: 'alice-cloud' });
+    larkHomes.set(ALICE, '/isolated/alice');
+    expect(await delegated('om_narrow', ['bytedcli'])).toEqual([
+      { tool: 'lark-cli', state: 'needs-authorization' }, { tool: 'bytedcli', state: 'user' },
+    ]);
+    expect(readFileSync(larkPath(), 'utf8')).not.toContain('/isolated/alice');
+  });
+  it('a later direct human turn uses that human and never inherits delegation', async () => {
+    bytedcliJwts.set(ALICE, { cloudJwt: 'alice-cloud' });
+    bytedcliJwts.set(BOB, { cloudJwt: 'bob-cloud' });
+    await delegated();
+    await publish(botConfig({ enabled: true, tools: ['bytedcli'] }), BOB, 'om_bob');
+    const env = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
+    expect(env).toContain('bob-cloud');
+    expect(env).not.toContain('alice-cloud');
+  });
+});
+
+describe('target daemon consumes signed message authority', () => {
+  async function targetHarness(options: { mapping?: 'resolved' | 'transient'; member?: boolean; talk?: boolean; scope?: 'chat' | 'thread' } = {}) {
+    const ts = (await import('typescript')).default;
+    const { deliverDispatchWithUser, resolveDispatchUser } = await import('../src/core/dispatch-user-delegation.js');
+    const { pickTurnReplyTarget } = await import('../src/core/reply-target.js');
+    const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
+    const code = ['dispatchUserForTurn', 'targetUserForDelegation', 'refreshTurnCliIdentity'].map(name => {
+      const fn = source.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name);
+      if (!fn) throw new Error('Missing production handler');
+      return ts.transpileModule(fn.getText(source), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+    }).join('\n');
+    const secret = 'target-test-secret';
+    await deliverDispatchWithUser({ dataDir: dir, secret, payload: {
+      sourceAppId: 'cli_source', sourceSessionId: 'source', sourceTurnId: 'om_human',
+      rootId: 'om_root', chatId: 'oc_chat', targetAppIds: [APP],
+      authority: { appId: 'cli_source', openId: ALICE, unionId: 'on_alice', tools: ['bytedcli'] },
+    }, send: async () => 'om_kickoff' });
+    const scope = options.scope ?? 'thread';
+    const ds: any = { larkAppId: APP, chatId: 'oc_chat', chatType: 'group', scope,
+      session: { sessionId: SESSION, rootMessageId: scope === 'thread' ? 'om_root' : 'om_shared',
+        replyTargets: { om_kickoff: { senderOpenId: 'ou_peer', rootMessageId: 'om_root', updatedAt: new Date().toISOString() } },
+      },
+    };
+    const resolveTargetAppOpenId = vi.fn(async () => options.mapping === 'transient'
+      ? { status: 'transient' } : { status: 'resolved', openId: 'ou_alice_target' });
+    const scopeValues = {
+      config: { session: { dataDir: dir } }, pickTurnReplyTarget, resolveDispatchUser,
+      getBot: () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'] }) }),
+      loadOrCreateDashboardSecret: () => secret, dispatchReportBindingSecretPath: () => '',
+      resolveTargetAppOpenId, evaluateTalk: () => ({ allowed: options.talk !== false }),
+      listChatMemberOpenIds: async () => options.member === false ? [] : ['ou_alice_target'],
+      publishTurnCliIdentity, localeForBot: () => 'en', logger: { warn: vi.fn() },
+    };
+    const run = new Function('scope', 'with (scope) { ' + code + '; return refreshTurnCliIdentity; }')(scopeValues);
+    return { ds, run: (turnId = 'om_kickoff') => run(ds, turnId), resolveTargetAppOpenId };
+  }
+  it.each(['chat', 'thread'] as const)('publishes original credentials after signed dispatch + cross-app resolution (%s)', async scope => {
+    const h = await targetHarness({ scope });
+    bytedcliJwts.set(ALICE, { cloudJwt: 'original-user' });
+    await h.run();
+    expect(h.resolveTargetAppOpenId).toHaveBeenCalledExactlyOnceWith(APP, 'on_alice');
+    expect(readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8')).toContain('original-user');
+  });
+  it.each([{ mapping: 'transient' as const }, { member: false }, { talk: false }])('denies identity when target cannot validate user %j', async options => {
+    const h = await targetHarness(options);
+    bytedcliJwts.set(ALICE, { cloudJwt: 'must-not-leak' });
+    await h.run();
+    const env = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
+    expect(env).not.toContain('must-not-leak');
+    expect(env).toContain('report --dispatch-root om_root');
+  });
+  it('never uses root binding for an unrelated later turn', async () => {
+    const h = await targetHarness();
+    bytedcliJwts.set(ALICE, { cloudJwt: 'must-not-leak' });
+    await h.run('om_unrelated');
+    expect(h.resolveTargetAppOpenId).not.toHaveBeenCalled();
+    expect(readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8')).not.toContain('must-not-leak');
+  });
+});

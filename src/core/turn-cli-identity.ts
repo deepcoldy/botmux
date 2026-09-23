@@ -44,12 +44,22 @@ export interface ToolIdentityOutcome {
   state: 'user' | 'needs-authorization' | 'off';
 }
 
+/** Created only by the daemon after verifying the signed dispatch and resolving
+ * its stable user identity in the receiving app. Never accepted from CLI input. */
+export interface DelegatedCliIdentity {
+  targetOpenId?: string;
+  credentialOpenId: string;
+  tools: TriggerUserAuthTool[];
+  dispatchRoot: string;
+}
+
 export interface PublishTurnIdentityArgs {
   botConfig: BotConfig;
   sessionDataDir: string;
   sessionId: string;
   /** The person who sent THIS turn. Absent for turns with no human sender. */
   senderOpenId: string | undefined;
+  delegatedIdentity?: DelegatedCliIdentity;
   /** For the stderr text the wrapper prints when a command is refused. */
   locale?: Locale;
   /**
@@ -80,7 +90,9 @@ export async function publishTurnCliIdentity(
       continue;
     }
     try {
-      outcomes.push(await publishOne(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId));
+      outcomes.push(args.delegatedIdentity
+        ? await publishDelegated(tool, args, args.delegatedIdentity)
+        : await publishOne(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId));
     } catch (e) {
       // Fail closed through the SAME policy as an ordinary missing token, so a
       // credential-store outage and "this person never authorized" cannot end
@@ -91,10 +103,50 @@ export async function publishTurnCliIdentity(
         `[trigger-user-auth] withheld ${tool} identity for session ${sessionId}: `
         + `${e instanceof Error ? e.message : String(e)}`,
       );
-      outcomes.push(await withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId));
+      outcomes.push(args.delegatedIdentity
+        ? denyDelegated(tool, args, args.delegatedIdentity)
+        : await withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId));
     }
   }
   return outcomes;
+}
+
+function denyDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs, user: DelegatedCliIdentity): ToolIdentityOutcome {
+  try {
+    writeSessionIdentity(args.sessionDataDir, args.sessionId, {
+      tool, mode: 'denied', ...(args.turnId ? { turnId: args.turnId } : {}),
+      message: `botmux: delegated ${tool} authorization unavailable for the requesting user. `
+        + `Report this blocker with botmux report --dispatch-root ${user.dispatchRoot}; `
+        + 'the source must ask the original human to authorize. Do not ask a bot to log in or use another identity.',
+    });
+  } catch {
+    clearSessionIdentity(args.sessionDataDir, args.sessionId, tool);
+  }
+  return { tool, state: 'needs-authorization' };
+}
+
+async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs, user: DelegatedCliIdentity): Promise<ToolIdentityOutcome> {
+  if (!user.tools.includes(tool)) return denyDelegated(tool, args, user);
+  let identity: CliIdentity | null = null;
+  if (tool === 'bytedcli') {
+    // Keep the issuer-scoped credential key; do not copy a source open_id into
+    // the target app or duplicate/extend the lifetime of the user's login.
+    const jwt = await mintBytedcliJwts(user.credentialOpenId);
+    if (jwt) identity = { tool, cloudJwt: jwt.cloudJwt, ...(jwt.codeJwt ? { codeJwt: jwt.codeJwt } : {}) };
+  } else {
+    const home = await resolveLarkCliHomeForTurn(user.credentialOpenId);
+    if (home) identity = { tool, mode: 'user-home', home };
+    else if (user.targetOpenId && args.botConfig.larkAppId && args.botConfig.larkAppSecret) {
+      // Legacy bot-app OAuth is application-bound: only a target-app token is
+      // valid here. A source-app OAuth token is never presented as a target one.
+      const token = await resolveUserToken(args.botConfig.larkAppId, args.botConfig.larkAppSecret,
+        normalizeBrand(args.botConfig.brand), user.targetOpenId);
+      if (token) identity = { tool, appId: args.botConfig.larkAppId, userAccessToken: token };
+    }
+  }
+  if (!identity) return denyDelegated(tool, args, user);
+  writeSessionIdentity(args.sessionDataDir, args.sessionId, { ...identity, ...(args.turnId ? { turnId: args.turnId } : {}) });
+  return { tool, state: 'user' };
 }
 
 async function publishOne(

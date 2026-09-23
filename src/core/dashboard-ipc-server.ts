@@ -11,6 +11,7 @@ import { UnsafeHostAuthorityFileError } from '../platform/secure-host-file.js';
 import { WORKFLOW_DAEMON_IPC_ROUTE_PREFIX } from '../workflows/v3/daemon-ipc-auth.js';
 import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-relay.js';
 import { REPORT_SESSION_RELAY_ROUTE } from './report-session-relay.js';
+import { DISPATCH_USER_DELIVERY_ROUTE } from './dispatch-user-delegation.js';
 import { DISPATCH_REPORT_REGISTER_ROUTE } from './dispatch-report-binding.js';
 import { listenWithProbe } from '../utils/listen-with-probe.js';
 import { dashboardSecretPath } from './dashboard-secret.js';
@@ -840,6 +841,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // root server-side, then lets the trusted daemon relay to the orchestrator.
   if (method === 'POST' && pathname === REPORT_SESSION_RELAY_ROUTE) return true;
   if (method === 'POST' && pathname === DISPATCH_REPORT_REGISTER_ROUTE) return true;
+  if (method === 'POST' && pathname === DISPATCH_USER_DELIVERY_ROUTE) return true;
   // macOS read-isolated `botmux send` presents a rotating worker capability;
   // the handler writes the authoritative tuple into a host-owned read-only
   // proof sidecar, so loopback response spoofing cannot confer authority.

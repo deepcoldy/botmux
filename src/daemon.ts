@@ -347,6 +347,8 @@ import {
   closeCliMismatchedSessionsForBot,
 } from './core/session-manager.js';
 import { publishTurnCliIdentity } from './core/turn-cli-identity.js';
+import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, DISPATCH_USER_DELIVERY_ROUTE } from './core/dispatch-user-delegation.js';
+import { resolveUnionIdFromOpenId } from './im/lark/client.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
   runIdempotencyFailClose,
@@ -3745,9 +3747,8 @@ export async function noteTurnReceived(
  * agent can surface it only if that tool is actually invoked.
  *
  * The sender comes from the daemon's own per-turn record (`replyTargets`, via
- * {@link pickTurnReplyTarget}), falling back to the session's last caller. Both
- * are daemon-owned: a worker contributes only a turn id and can never choose
- * which human that id denotes.
+ * {@link pickTurnReplyTarget}), or an exact-message signed dispatch delegation.
+ * Neither the session owner nor the last human sender is an identity fallback.
  *
  * The "please authorize" notice is sent at most once per session per tool. A
  * repeat on every turn would be noise, and the sender already has the link.
@@ -3763,27 +3764,62 @@ function prepareTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void
   return triggerUserAuthEnabledFor(ds) ? refreshTurnCliIdentity(ds, turnId) : undefined;
 }
 
+async function dispatchUserForTurn(ds: DaemonSession, turnId: string) {
+  const reply = pickTurnReplyTarget(ds.session, turnId);
+  if (!reply) return undefined;
+  return resolveDispatchUser({
+    dataDir: config.session.dataDir,
+    secret: loadOrCreateDashboardSecret(dispatchReportBindingSecretPath(config.session.dataDir)),
+    appId: ds.larkAppId, chatId: ds.chatId, turnId,
+    rootId: reply.rootMessageId ?? (ds.scope !== 'chat' ? ds.session.rootMessageId ?? undefined : undefined),
+  });
+}
+
+async function targetUserForDelegation(ds: DaemonSession, user: import('./core/dispatch-user-delegation.js').DispatchUserAuthority): Promise<string | undefined> {
+  const resolved = await resolveTargetAppOpenId(ds.larkAppId, user.unionId);
+  if (resolved.status !== 'resolved'
+    || !evaluateTalk(ds.larkAppId, ds.chatId, resolved.openId, user.unionId, undefined, ds.chatType).allowed) return;
+  // A delegated turn did not itself prove that the human belongs to this chat.
+  // Do not use allowedChatGroups' implicit membership assumption for them.
+  if (ds.chatType === 'group' && !(await listChatMemberOpenIds(ds.larkAppId, ds.chatId)).includes(resolved.openId)) return;
+  return resolved.openId;
+}
+
 async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
   let botConfig;
   try { botConfig = getBot(ds.larkAppId).config; } catch { return; }
   if (!botConfig.triggerUserAuth?.enabled) return;
 
-  // Strictly this turn's sender. NOT `lastCallerOpenId`: that is the last human
-  // who happened to talk to the session, and a turn with no sender of its own
-  // (scheduled run, hook, meeting event, bot-to-bot handoff) is exactly the case
-  // where borrowing them would run someone else's automation under their name,
-  // silently and with their permissions.
-  const senderOpenId = pickTurnReplyTarget(ds.session, turnId)?.senderOpenId;
-
+  const reply = pickTurnReplyTarget(ds.session, turnId);
+  let delegatedIdentity: import('./core/turn-cli-identity.js').DelegatedCliIdentity | undefined;
+  let delegationBlocked = false;
+  try {
+    const delegation = await dispatchUserForTurn(ds, turnId);
+    if (delegation) {
+      // Keep a denial tied to the originating task even if contact/membership
+      // lookup throws; never turn this back into "ask the peer bot to log in".
+      delegatedIdentity = {
+        credentialOpenId: delegation.authority.openId, tools: [], dispatchRoot: delegation.rootId,
+      };
+      const targetOpenId = await targetUserForDelegation(ds, delegation.authority);
+      if (targetOpenId) delegatedIdentity = {
+        ...delegatedIdentity, targetOpenId, tools: delegation.authority.tools,
+      };
+    }
+  } catch (error) {
+    delegationBlocked = true;
+    logger.warn(`[dispatch-user] identity unavailable for ${ds.session.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+  }
   await publishTurnCliIdentity({
     botConfig,
     sessionDataDir: config.session.dataDir,
     sessionId: ds.session.sessionId,
-    senderOpenId,
+    senderOpenId: delegationBlocked
+      || reply?.participants?.some(p => p.openId === reply.senderOpenId && p.isBot === true)
+      || (ds.session.quoteTargetId === turnId && ds.session.quoteTargetSenderIsBot === true)
+      ? undefined : reply?.senderOpenId,
+    ...(delegatedIdentity ? { delegatedIdentity } : {}),
     locale: localeForBot(ds.larkAppId),
-    // Stamped so the wrapper can tell these credentials apart from a later
-    // message's: acceptance here is not the same instant as the CLI starting
-    // this turn, and B's message can be accepted while A's turn still runs.
     turnId,
   });
 
@@ -6458,6 +6494,83 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
     }
   }
   return jsonRes(res, 201, { ok: true, dispatchRoot, projectSynced });
+});
+
+// All new dispatch kickoffs (including --into) go through the source daemon.
+// It observes the live caller itself and signs only the message it actually sends.
+ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
+  let body: any;
+  try { body = await readJsonBody(req, DISPATCH_REPORT_REGISTER_MAX_BYTES); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_dispatch_body' }); }
+  const ds = typeof body?.sessionId === 'string' ? findActiveBySessionId(body.sessionId) : undefined;
+  const verified = authorizeSessionScopedIpc({
+    trustedHost: isTrustedHostIpcRequest(req), sessionExists: !!ds,
+    receiverSession: !!ds?.session.vcMeetingReceiver, allowReceiver: false,
+    sessionId: typeof body?.sessionId === 'string' ? body.sessionId : '',
+    liveOrigin: ds?.managedTurnOrigin,
+    claimedCapability: body?.originCapability,
+    claimedTurnId: body?.originTurnId,
+    claimedDispatchAttempt: body?.originDispatchAttempt,
+  });
+  if (!verified.ok || !ds || ds.larkAppId !== selfDaemonLarkAppId) {
+    return jsonRes(res, 403, { ok: false, error: 'dispatch_origin_unproven' });
+  }
+  const rootId = body?.rootId;
+  const chatId = body?.chatId;
+  const targetAppIds = body?.targetAppIds;
+  if (typeof rootId !== 'string' || !/^om_[A-Za-z0-9_-]{1,128}$/.test(rootId)
+    || typeof chatId !== 'string' || !/^oc_[A-Za-z0-9_-]{1,128}$/.test(chatId)
+    || typeof body?.content !== 'string' || !body.content.trim()
+    || !Array.isArray(targetAppIds) || targetAppIds.length > 64
+    || targetAppIds.some((id: unknown) => typeof id !== 'string' || !/^cli_[A-Za-z0-9_-]{1,128}$/.test(id))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_dispatch_delivery' });
+  }
+  try {
+    // Never trust a caller-supplied chat/root pair to scope delegated access.
+    if (await getMessageChatId(ds.larkAppId, rootId) !== chatId) {
+      return jsonRes(res, 403, { ok: false, error: 'dispatch_chat_mismatch' });
+    }
+    const policy = evaluateProjectDispatchPolicy({
+      config: readGroupCollaborationMode(config.session.dataDir, ds.chatId),
+      sourceAppId: ds.larkAppId, sourceChatId: ds.chatId, targetChatId: chatId,
+      targetAppIds, hasLegacyBots: body.hasLegacyBots === true, title: '', existingDispatch: true,
+    });
+    if (!policy.ok) return jsonRes(res, 403, policy);
+    const bot = getBot(ds.larkAppId).config;
+    const turnId = ds.managedTurnOrigin?.turnId;
+    const active = ds.activeInteractiveTurn;
+    const inherited = turnId ? await dispatchUserForTurn(ds, turnId) : undefined;
+    if (inherited && !await targetUserForDelegation(ds, inherited.authority)) {
+      return jsonRes(res, 403, { ok: false, error: 'delegated_caller_not_allowed' });
+    }
+    const authority = turnId ? await authorityForDispatch({
+      sourceAppId: ds.larkAppId,
+      caller: active?.turnId === turnId ? active.caller
+        : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId)),
+      inherited: inherited?.authority,
+      tools: bot.triggerUserAuth?.enabled ? bot.triggerUserAuth.tools : [],
+      resolveUnionId: resolveUnionIdFromOpenId,
+    }) : undefined;
+    // Identity lookup may await the network. Do not send under a turn that was
+    // replaced while resolving it, nor silently borrow the session owner.
+    if (authority && ds.managedTurnOrigin?.turnId !== turnId) {
+      return jsonRes(res, 409, { ok: false, error: 'dispatch_turn_changed' });
+    }
+    const send = () => replyMessage(ds.larkAppId, rootId, body.content, 'post', true);
+    const messageId = authority && turnId && targetAppIds.length
+      ? await deliverDispatchWithUser({
+          dataDir: config.session.dataDir,
+          secret: loadOrCreateDashboardSecret(dispatchReportBindingSecretPath(config.session.dataDir)),
+          payload: {
+            sourceAppId: ds.larkAppId, sourceSessionId: ds.session.sessionId, sourceTurnId: turnId,
+            rootId, chatId, targetAppIds, authority,
+          }, send,
+        })
+      : await send();
+    return jsonRes(res, 200, { ok: true, messageId });
+  } catch (error) {
+    return jsonRes(res, 502, { ok: false, error: 'dispatch_delivery_failed', detail: error instanceof Error ? error.message : String(error) });
+  }
 });
 
 ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
