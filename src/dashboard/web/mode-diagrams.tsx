@@ -175,13 +175,26 @@ function ModeExampleDrawer<T extends string>(props: {
     const panel = panelRef.current;
     closeRef.current?.focus();
 
-    // 打开期间锁住背景滚动，并把 dashboard 主区标 inert，
+    // 打开期间锁住背景：body 不滚动；portal 挂载在 body 下，main 之外还有
+    // 顶栏/侧栏等框架，所以把「抽屉之外的整页框架」统一标 inert（排除抽屉自身），
     // 从 DOM 层杜绝 Tab 穿到背景（aria-modal 本身不做隔离）
-    const main = document.querySelector('main');
     const prevOverflow = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
-    main?.setAttribute('inert', '');
-    main?.setAttribute('aria-hidden', 'true');
+    // portal 挂在 body 下；它本身（.bd-example-layer）是 body 的直接子元素。
+    // 把 body 的其它直接子元素（顶栏/侧栏/main 等整页框架，都在这些容器内）
+    // 统一标 inert，抽屉自身所在容器排除——覆盖 main 外的框架。
+    const background = [...document.body.children].filter(
+      el => !el.classList?.contains('bd-example-layer'),
+    );
+    const savedAttrs = background.map(el => ({
+      el,
+      inert: el.hasAttribute('inert') ? el.getAttribute('inert') : null,
+      hidden: el.hasAttribute('aria-hidden') ? el.getAttribute('aria-hidden') : null,
+    }));
+    background.forEach(el => {
+      el.setAttribute('inert', '');
+      el.setAttribute('aria-hidden', 'true');
+    });
 
     function tabbables(): HTMLElement[] {
       if (!panel) return [];
@@ -206,14 +219,19 @@ function ModeExampleDrawer<T extends string>(props: {
       const first = seq[0];
       const last = seq[seq.length - 1];
       const active = document.activeElement as HTMLElement | null;
-      const inside = active && panel.contains(active);
+      // 方向键可能把焦点移到 tabIndex=-1 的 tab 上：此时焦点在面板内但不在
+      // 可 Tab 序列里，浏览器会继续向后找 → 穿出抽屉。统一兜底回 first/last。
+      if (!active || !seq.includes(active)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+        return;
+      }
       if (event.shiftKey) {
-        if (!inside || active === first) {
+        if (active === first) {
           event.preventDefault();
           last.focus();
         }
-      } else if (!inside || active === last) {
-        // 正向：在最后一项（或焦点本不在抽屉里，理论不会发生）时回到首项
+      } else if (active === last) {
         event.preventDefault();
         first.focus();
       }
@@ -223,8 +241,10 @@ function ModeExampleDrawer<T extends string>(props: {
     return () => {
       document.removeEventListener('keydown', onKey, true);
       document.body.style.overflow = prevOverflow;
-      main?.removeAttribute('inert');
-      main?.removeAttribute('aria-hidden');
+      savedAttrs.forEach(({ el, inert, hidden }) => {
+        if (inert === null) el.removeAttribute('inert'); else el.setAttribute('inert', inert);
+        if (hidden === null) el.removeAttribute('aria-hidden'); else el.setAttribute('aria-hidden', hidden);
+      });
       props.triggerRef.current?.focus();
     };
     // 只在挂载/卸载时跑：依赖 triggerRef（稳定 ref 对象），父组件 rerender 不重放焦点

@@ -17,29 +17,33 @@ vi.mock('react-dom', async () => {
 });
 
 const bodyStyle: Record<string, string> = {};
-const mainAttrs: Record<string, string> = {};
 type DocEvent = { key: string; shiftKey?: boolean; stopPropagation: () => void; preventDefault: () => void };
 const listeners: Record<string, Array<(e: DocEvent) => void>> = {};
+// body 直接子元素（模拟顶栏 / main 等整页框架）的属性记录
+const frame = {
+  attrs: new Map<string, string | null>(),
+  setAttribute(k: string, v: string) { this.attrs.set(k, v); },
+  removeAttribute(k: string) { this.attrs.delete(k); },
+  hasAttribute(k: string) { return this.attrs.has(k); },
+  getAttribute(k: string) { return this.attrs.get(k) ?? null; },
+};
 function resetDom(): void {
   for (const k of Object.keys(bodyStyle)) delete bodyStyle[k];
-  for (const k of Object.keys(mainAttrs)) delete mainAttrs[k];
+  frame.attrs.clear();
   for (const k of Object.keys(listeners)) delete listeners[k];
   (globalThis as Record<string, unknown>).__activeEl = null;
 }
 const makeDocument = () => ({
-  body: { style: bodyStyle },
+  body: {
+    style: bodyStyle,
+    children: [frame],
+  },
   addEventListener: (type: string, fn: (e: DocEvent) => void) => { (listeners[type] ??= []).push(fn); },
   removeEventListener: (type: string, fn: (e: DocEvent) => void) => {
     listeners[type] = (listeners[type] ?? []).filter(f => f !== fn);
   },
   getElementById: () => ({ focus: () => {} }),
-  querySelector: (sel: string) => {
-    if (sel !== 'main') return null;
-    return {
-      setAttribute: (k: string, v: string) => { mainAttrs[k] = v; },
-      removeAttribute: (k: string) => { delete mainAttrs[k]; },
-    };
-  },
+  querySelector: () => null,
   get activeElement() { return (globalThis as Record<string, unknown>).__activeEl as unknown; },
 });
 (globalThis as Record<string, unknown>).document = makeDocument();
@@ -185,25 +189,24 @@ describe('ModeOptionGroup example drawer', () => {
     expect(tabs[1].props.tabIndex).toBe(-1);
   });
 
-  it('locks scroll and marks background main inert while open, restores on close', () => {
+  it('locks scroll and marks the whole background frame inert while open, restores on close', () => {
     const root = render(React.createElement(ModeOptionGroup<string>, groupProps()));
     act(() => findByClass(root, 'bd-mode-example-trigger')[0].props.onClick());
     expect(bodyStyle.overflow).toBe('hidden');
-    expect(mainAttrs.inert).toBe('');
-    expect(mainAttrs['aria-hidden']).toBe('true');
+    expect(frame.getAttribute('inert')).toBe('');
+    expect(frame.getAttribute('aria-hidden')).toBe('true');
     act(() => {
       dispatch({ key: 'Escape', stopPropagation: () => {}, preventDefault: () => {} });
     });
     expect(bodyStyle.overflow).toBeUndefined();
-    expect(mainAttrs.inert).toBeUndefined();
+    expect(frame.hasAttribute('inert')).toBe(false);
   });
 
-  it('Tab trap filters by runtime tabIndex>=0 and wraps both directions (source assertion; verified by browser probe)', () => {
-    // react-test-renderer 不提供真实 DOM（panelRef.current 为 null），
-    // 原生 Tab 顺序由浏览器回归脚本验证；这里锁定实现要点防回退
+  it('Tab trap filters by runtime tabIndex>=0 and re-homes focus that is in the panel but off the Tab sequence (source)', () => {
+    // 边界：方向键可把焦点移到 tabIndex=-1 的 tab，此时焦点在面板内却不在
+    // 可 Tab 序列，浏览器会继续找而穿出抽屉。实现必须先判「不在 seq 中」统一兜底
     expect(diagrams).toContain('el.tabIndex >= 0');
-    expect(diagrams).toMatch(/if \(!inside \|\| active === first\)/);
-    expect(diagrams).toMatch(/if \(!inside \|\| active === last\)/);
+    expect(diagrams).toContain('!active || !seq.includes(active)');
   });
 
   it('does not steal focus on parent re-render while open (mount-once effect)', () => {
