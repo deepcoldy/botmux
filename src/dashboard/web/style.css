@@ -25250,20 +25250,29 @@ dialog select[multiple]:hover:not(:disabled) {
 /* ═══ 模式单选卡片（mode-diagrams.tsx） ═══
    卡片纵向三段：头部（图标+模式名+单选钮，同排对齐）→ 飞书截图预览
    （顶对齐、同排等高）→ 底部说明+场景标签。 */
+/* 外层命名容器：列数断点按容器（内容区）宽度判，而不是浏览器视口 */
+.bot-defaults-page .bd-mode-cards-wrap {
+  container-type: inline-size;
+  container-name: bd-mode-cards;
+}
+
 .bot-defaults-page .bd-mode-cards {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
   gap: 12px;
   margin-top: 8px;
-  align-items: start;
+  /* 同排卡片等高：卡片内部预览区 flex:1 吸收余量，底边与说明起点对齐；
+     单列时每卡自然高度，不写死整卡高度。 */
+  align-items: stretch;
 }
 
-/* 固定列数（如普通群四项固定两列），窄于约 600px 降为一列 */
+/* 固定列数（如普通群四项固定两列） */
 .bot-defaults-page .bd-mode-cards.is-fixed-cols {
   grid-template-columns: repeat(var(--bd-mode-cols, 2), minmax(0, 1fr));
 }
 
-@media (max-width: 620px) {
+/* 容器（不是视口）窄于约 620px 时降为一列——桌面带两侧栏时内容区可能已经很窄 */
+@container bd-mode-cards (max-width: 620px) {
   .bot-defaults-page .bd-mode-cards,
   .bot-defaults-page .bd-mode-cards.is-fixed-cols {
     grid-template-columns: minmax(0, 1fr);
@@ -25349,7 +25358,8 @@ dialog select[multiple]:hover:not(:disabled) {
   border: 5px solid var(--accent);
 }
 
-/* 中部截图：飞书固定浅灰底（中性，不随模式换"皮肤"），顶对齐、同排等高 */
+/* 中部截图：飞书固定浅灰底（中性，不随模式换"皮肤"），顶对齐、同排等高。
+   inline-size 容器：截图内部布局（如建群图横/竖排）按卡片实际宽度切换。 */
 .bot-defaults-page .bd-mode-mock {
   display: flex;
   flex-direction: column;
@@ -25360,6 +25370,8 @@ dialog select[multiple]:hover:not(:disabled) {
   border-radius: 8px;
   background: #f7f8fa;
   color-scheme: light;
+  container-type: inline-size;
+  container-name: bd-mode-mock;
 }
 
 .bot-defaults-page .bd-mode-foot {
@@ -25420,12 +25432,30 @@ dialog select[multiple]:hover:not(:disabled) {
   line-height: 1.4;
 }
 
-/* 私聊建群图保留横向 grid 布局（覆盖 .bd-mock 的 flex） */
+/* 私聊建群图：宽卡时横向 grid（DM → 两群），窄卡时纵向（DM 在上、箭头向下、两群在下） */
 .bot-defaults-page .bd-mock-dm-split {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 12px minmax(0, 1fr);
   align-items: center;
   gap: 5px;
+}
+
+/* 两张专属群卡之间始终留间隔 */
+.bot-defaults-page .bd-mock-sgroups {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* 卡片内宽不足 360px 时改纵向：DM 占满一行，下箭头转向，两群在下 */
+@container bd-mode-mock (max-width: 360px) {
+  .bot-defaults-page .bd-mock-dm-split {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 7px;
+  }
+  .bot-defaults-page .bd-mock-flow-h {
+    transform: rotate(90deg);
+  }
 }
 
 /* 工作目录流程图保留纵向 flex 专用布局 */
@@ -25628,12 +25658,14 @@ dialog select[multiple]:hover:not(:disabled) {
 
 .bot-defaults-page .bd-mock-ignored {
   align-self: center;
+  max-width: 96%;
   border: 1px dashed #c4cbd8;
-  border-radius: 999px;
-  padding: 1px 9px;
+  border-radius: 8px;
+  padding: 2px 9px;
   color: var(--m-muted);
   font-size: 10px;
-  white-space: nowrap;
+  line-height: 1.4;
+  text-align: center;
 }
 
 .bot-defaults-page .bd-mock-badge {
@@ -25808,6 +25840,7 @@ dialog select[multiple]:hover:not(:disabled) {
 
 .bot-defaults-page .bd-mock-repo-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   margin-top: 2px;
 }

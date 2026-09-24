@@ -24,6 +24,7 @@ import { t } from '../src/dashboard/web/ui.js';
 
 const page = readFileSync(new URL('../src/dashboard/web/bot-defaults-page.tsx', import.meta.url), 'utf8');
 const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.url), 'utf8');
+const diagrams = readFileSync(new URL('../src/dashboard/web/mode-diagrams.tsx', import.meta.url), 'utf8');
 
 function classes(node: ReactTestInstance): string[] {
   return typeof node.props.className === 'string' ? node.props.className.split(/\s+/) : [];
@@ -142,11 +143,19 @@ describe('mode mock screenshots', () => {
     const fork = render(React.createElement(RegularMock, { mode: 'new-topic' }));
     expect(findByClass(fork, 'bd-mock-topic-a')).toHaveLength(1);
     expect(findByClass(fork, 'bd-mock-topic-b')).toHaveLength(1);
-    // 共享：两话题同色（都是 A），外侧有「共用上下文」括线
+    // 共享：两话题同色（都是 A），外侧有「共用上下文」括线；
+    // 第一话题先交代 A、B，第二话题才能引用「上个话题的 A、B」证明跨话题记忆
     const shared = render(React.createElement(RegularMock, { mode: 'shared' }));
     expect(findByClass(shared, 'bd-mock-shared-brace')).toHaveLength(1);
     expect(findByClass(shared, 'bd-mock-topic-b')).toHaveLength(0);
     expect(findByClass(shared, 'bd-mock-ctx')[0].children.join('')).toContain('共用上下文');
+    const sharedText = shared.findAll(() => true)
+      .flatMap(n => Array.isArray(n.children)
+        ? n.children.filter((c): c is string => typeof c === 'string')
+        : [])
+      .join('');
+    expect(sharedText).toContain('A、B 两个用例失败');
+    expect(sharedText).toContain('上个话题的 A、B');
   });
 
   it('regular group messages are all left-aligned (Feishu group layout), unlike DM right bubbles', () => {
@@ -205,10 +214,21 @@ describe('bot defaults page wiring', () => {
 });
 
 describe('mode card / mock CSS', () => {
-  it('lays fixed-column cards out two-wide (one column on narrow screens), top aligned', () => {
+  it('lays fixed-column cards out two-wide (one column in narrow containers), same-row equal height', () => {
+    // 外层命名容器 + 容器查询断点（按内容区宽度，不是视口）
+    expect(diagrams).toContain("'bd-mode-cards-wrap'");
+    expect(css).toContain('container-name: bd-mode-cards');
     expect(css).toMatch(/\.bd-mode-cards\.is-fixed-cols\s*\{[^}]*repeat\(var\(--bd-mode-cols,\s*2\),\s*minmax\(0,\s*1fr\)\);/);
-    expect(css).toMatch(/@media \(max-width:\s*620px\)[^@]*grid-template-columns:\s*minmax\(0,\s*1fr\);/);
-    expect(css).toMatch(/\.bd-mode-cards\s*\{[^}]*align-items:\s*start;/);
+    expect(css).toMatch(/@container bd-mode-cards \(max-width:\s*620px\)[^@]*grid-template-columns:\s*minmax\(0,\s*1fr\);/);
+    // 同排等高：stretch（不是 start），卡片内预览区 flex:1 吸收余量
+    expect(css).toMatch(/\.bd-mode-cards\s*\{[^}]*align-items:\s*stretch;/);
+  });
+
+  it('switches the DM-to-groups mock to vertical in narrow cards and wraps repo buttons', () => {
+    // 截图区自身是 inline-size 查询容器，<360px 时建群图纵向
+    expect(css).toContain('container-name: bd-mode-mock');
+    expect(css).toMatch(/@container bd-mode-mock \(max-width:\s*360px\)[^@]*grid-template-columns:\s*minmax\(0,\s*1fr\);/);
+    expect(css).toMatch(/\.bd-mock-repo-actions\s*\{[^}]*flex-wrap:\s*wrap;/);
   });
 
   it('keeps mock screenshots on a fixed neutral Feishu light base, with color used only for context', () => {

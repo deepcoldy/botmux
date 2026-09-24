@@ -52,12 +52,15 @@ export function ModeCardPicker<T extends string>(props: {
 
   return (
     <div
-      className={cx('bd-mode-cards', props.columns ? 'is-fixed-cols' : undefined)}
-      style={props.columns ? { '--bd-mode-cols': String(props.columns) } as React.CSSProperties : undefined}
-      role="radiogroup"
-      aria-label={props.ariaLabel}
-      data-input={props.dataInput}
+      className={cx('bd-mode-cards-wrap')}
     >
+      <div
+        className={cx('bd-mode-cards', props.columns ? 'is-fixed-cols' : undefined)}
+        style={props.columns ? { '--bd-mode-cols': String(props.columns) } as React.CSSProperties : undefined}
+        role="radiogroup"
+        aria-label={props.ariaLabel}
+        data-input={props.dataInput}
+      >
       {props.options.map((option, index) => {
         const selected = option.value === props.value;
         return (
@@ -101,6 +104,7 @@ export function ModeCardPicker<T extends string>(props: {
           </div>
         );
       })}
+      </div>
     </div>
   );
 }
@@ -366,7 +370,7 @@ export function RegularMock(props: {
               <GroupBubble>{atBot} {tr('botDefaults.mock.atCi')}</GroupBubble>
             </PersonLine>
             <BotLine name={bot}>
-              <QuoteReply to={person} quoted={tr('botDefaults.mock.atCi')}>{tr('botDefaults.mock.ciResult')}</QuoteReply>
+              <QuoteReply to={person} quoted={tr('botDefaults.mock.atCi')}>{tr('botDefaults.mock.sharedAns1')}</QuoteReply>
             </BotLine>
             <ReplyTopicEntry />
           </TopicBox>
