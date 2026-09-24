@@ -414,19 +414,21 @@ export function P2pMock(props: { mode: 'chat' | 'thread' | 'group' }): React.JSX
 
   if (props.mode === 'group') {
     return (
-      <div className="bd-mock bd-mock-dm-split">
-        <div className="bd-mock-dm">
-          <div className="bd-mock-dm-title">{tr('botDefaults.mock.dmTitle')}</div>
-          <DmUserLine>{tr('botDefaults.mock.checkError')}</DmUserLine>
-        </div>
-        <span className="bd-mock-flow-h">→</span>
-        <div className="bd-mock-sgroups">
-          <div className="bd-mock-sgroup bd-mock-topic-a">
-            <span className="bd-mock-sgroup-name">{tr('botDefaults.mock.sgError')}</span>
-            <BotLine name={bot}><BotBubble>{tr('botDefaults.mock.onIt')}</BotBubble></BotLine>
+      <div className="bd-mock">
+        <div className="bd-mock-dm-split">
+          <div className="bd-mock-dm">
+            <div className="bd-mock-dm-title">{tr('botDefaults.mock.dmTitle')}</div>
+            <DmUserLine>{tr('botDefaults.mock.checkError')}</DmUserLine>
           </div>
-          <div className="bd-mock-sgroup bd-mock-topic-b">
-            <span className="bd-mock-sgroup-name">{tr('botDefaults.mock.sgTask')}</span>
+          <span className="bd-mock-flow-h">→</span>
+          <div className="bd-mock-sgroups">
+            <div className="bd-mock-sgroup bd-mock-topic-a">
+              <span className="bd-mock-sgroup-name">{tr('botDefaults.mock.sgError')}</span>
+              <BotLine name={bot}><BotBubble>{tr('botDefaults.mock.onIt')}</BotBubble></BotLine>
+            </div>
+            <div className="bd-mock-sgroup bd-mock-topic-b">
+              <span className="bd-mock-sgroup-name">{tr('botDefaults.mock.sgTask')}</span>
+            </div>
           </div>
         </div>
       </div>

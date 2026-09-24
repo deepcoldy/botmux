@@ -5240,10 +5240,8 @@ function SessionModeSection(props: {
 
   return (
     <section className="bd-section bd-session-mode-section">
-      <header className="bd-session-mode-head">
-        <h3 className="bd-section-title">{tr('botDefaults.sectionSessionMode')}</h3>
-        <p className="bd-session-mode-intro">{tr('botDefaults.sessionModeIntro')}</p>
-      </header>
+      <h3 className="bd-section-title">{tr('botDefaults.sectionSessionMode')}</h3>
+      <p className="bd-session-mode-intro">{tr('botDefaults.sessionModeIntro')}</p>
 
       <ModeOptionGroup<'thread' | 'chat' | 'group'>
         dataInput="p2pMode"

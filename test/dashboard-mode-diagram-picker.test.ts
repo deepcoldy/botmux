@@ -198,9 +198,24 @@ describe('page wiring and CSS', () => {
     expect(css).toMatch(/@media \(max-width:\s*720px\)[^@]*height:\s*90dvh;/);
   });
 
-  it('option name (15px/650) is visually stronger than the 12px/400 short line', () => {
-    expect(css).toMatch(/\.bd-mode-opt-name\s*\{[^}]*font-size:\s*15px;[^}]*font-weight:\s*650;/);
+  it('option name (13px/700, theme text color) is stronger than the 12px/400 short line', () => {
+    expect(css).toMatch(/\.bd-mode-opt-name\s*\{[^}]*color:\s*var\(--text\);[^}]*font-size:\s*13px;[^}]*font-weight:\s*700;/);
     expect(css).toMatch(/\.bd-mode-opt-short\s*\{[^}]*font-size:\s*12px;[^}]*font-weight:\s*400;/);
+  });
+
+  it('keeps titles at dashboard-standard sizes with no hardcoded dark text color', () => {
+    const start = css.indexOf('紧凑选项组');
+    const end = css.indexOf('高保真迷你飞书聊天', start);
+    const block = css.slice(start, end);
+    expect(block).not.toContain('font-size: 20px;');
+    expect(block).not.toMatch(/\.bd-mode-group-title\s*\{[^}]*font-size:\s*16px;/);
+    expect(block).not.toContain('#16181f');
+  });
+
+  it('dm-to-groups mock lives inside the query container (not on the container element itself)', () => {
+    // 回归：元素不能查询自身容器，否则 @container <360px 纵排永不生效
+    expect(diagrams).not.toContain('bd-mock bd-mock-dm-split');
+    expect(css).toMatch(/@container bd-mode-mock \(max-width:\s*360px\)/);
   });
 });
 
