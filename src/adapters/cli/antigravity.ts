@@ -4,8 +4,9 @@ import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { delay } from '../../utils/timing.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import type { CliAdapter, PtyHandle, SubmitRecheckResult } from './types.js';
 import { discoverAntigravitySessions } from '../../services/resumable-session-discovery.js';
+import { findAntigravityConversationId } from '../../services/antigravity-discovery.js';
 
 /**
  * Adapter for Google Antigravity CLI (`agy`).
@@ -141,7 +142,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.gemini/oauth_creds.json', '~/.gemini/antigravity-cli/antigravity-oauth-token'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ resume, resumeSessionId, disableCliBypass }) {
+    buildArgs({ resume, resumeSessionId, disableCliBypass, model, reasoningEffort }) {
       const args = disableCliBypass ? [] : ['--dangerously-skip-permissions'];
       // Resume: only when we have agy's own conversation UUID. We never
       // map botmux's sessionId here because agy generates its own id at
@@ -151,6 +152,12 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // racy when multiple botmux sessions run in parallel.
       if (resume && resumeSessionId) {
         args.push('--conversation', resumeSessionId);
+      }
+      if (model && typeof model === 'string' && model.trim()) {
+        args.push('--model', model.trim());
+      }
+      if (reasoningEffort && (reasoningEffort === 'low' || reasoningEffort === 'medium' || reasoningEffort === 'high')) {
+        args.push('--effort', reasoningEffort);
       }
       // NOTE: we deliberately do NOT pass `-i` / `--prompt-interactive`.
       // Despite the flag's existence in `agy --help`, empirical testing
@@ -251,13 +258,18 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // genuinely dropped Enter is recovered by the worker's deferred
       // recheck, not by a second Enter (same pattern as the grok adapter).
       if (await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 3_200)) {
-        return undefined;
+        const cliSessionId = findAntigravityConversationId({ pid: pty.cliPid, cwd: pty.cliCwd });
+        return cliSessionId ? { submitted: true, cliSessionId } : undefined;
       }
 
       // In-band budget exhausted. Hand the worker a recheck closure so a
       // slow agy (cold start, large initial prompt, network-bound auth)
       // can still resolve the warning before user-facing Lark notify.
-      const recheck = (): boolean => historyDeltaContains(HISTORY_PATH, baseByte, marker);
+      const recheck = (): SubmitRecheckResult => {
+        if (!historyDeltaContains(HISTORY_PATH, baseByte, marker)) return false;
+        const cliSessionId = findAntigravityConversationId({ pid: pty.cliPid, cwd: pty.cliCwd });
+        return cliSessionId ? { submitted: true, cliSessionId } : true;
+      };
       return { submitted: false, recheck };
     },
 

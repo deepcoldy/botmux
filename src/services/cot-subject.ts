@@ -16,8 +16,9 @@
  *  local_shell_call action；`description` / `prompt` 兜住没有路径或命令的子代理 /
  *  任务类调用。 */
 export const COT_SUBJECT_FIELDS = [
-  'command', 'cmd', 'file_path', 'path', 'pattern', 'query', 'url', 'skill', 'subject',
-  'description', 'prompt',
+  'command', 'cmd', 'CommandLine', 'file_path', 'path', 'TargetFile', 'AbsolutePath',
+  'pattern', 'query', 'url', 'Url', 'skill', 'subject',
+  'toolAction', 'toolSummary', 'description', 'prompt',
 ] as const;
 
 /** 标题里主题的显示上限：标题是气泡里单行不折行的文本，这是布局约束，不是数据约束。 */
