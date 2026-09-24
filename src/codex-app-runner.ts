@@ -331,9 +331,11 @@ class AppServerClient {
   private requestHandlers: Array<(msg: JsonObject) => boolean> = [];
   private lastStderr = '';
   private fatalError?: Error;
-  private closed = false;
 
-  get hasExited(): boolean { return this.closed; }
+  get hasExited(): boolean {
+    // 后代可能继续持有 stdio，进程退出不能等到 close 才识别。
+    return this.child.exitCode !== null || this.child.signalCode !== null;
+  }
 
   constructor(private readonly codexBin: string, private readonly cwd: string) {
     this.child = spawn(codexBin, ['app-server', '--listen', 'stdio://'], {
@@ -360,8 +362,6 @@ class AppServerClient {
       const err = this.fatalError ?? new Error(`Codex app-server exited (code=${code}, signal=${signal})${this.lastStderr ? `\n${this.lastStderr}` : ''}`);
       this.failAll(err);
     });
-    // 等 stdout 排空后才允许重连，避免丢掉退出前的 turn 生命周期事件。
-    this.child.on('close', () => { this.closed = true; });
   }
 
   onNotification(handler: (msg: JsonObject) => void): void {
@@ -2470,7 +2470,8 @@ function handleInput(data: Buffer): void {
 async function initializeAppServer(deadlineAtMs: number): Promise<void> {
   const current = new AppServerClient(args.codexBin, args.cwd);
   client = current;
-  current.onRequest(message => client === current && handleServerRequest(message));
+  // 旧代请求直接消费，不能落入默认回复并再次写入已退出的进程。
+  current.onRequest(message => client !== current || handleServerRequest(message));
   current.onNotification(message => {
     if (client === current) handleNotification(message);
   });
