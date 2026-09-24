@@ -484,9 +484,11 @@ import {
   CLAUDE_AUTH_OVERRIDE_ENV_KEYS,
   claudeAuthOverrideKeys,
   claudeAuthOverridesInSettingsLayers,
+  claudeStateAuthOverrides,
   planCredentialSource,
   readCredentialSource,
   readCredentialSourceStamp,
+  reconcileClaudeAccountState,
   writeCredentialSourceStamp,
   writeFileAtomic0600,
 } from './services/cli-credential-source.js';
@@ -14549,6 +14551,9 @@ async function spawnCli(
       for (const [name, raw] of Object.entries(credentialSourceFiles)) {
         writeFileAtomic0600(join(claudeDataDir, name), `${raw}\n`);
       }
+      // The per-bot .claude.json was seeded once from the global state: align
+      // its account identity with the source and drop any API-key login.
+      reconcileClaudeAccountState(join(claudeDataDir, '.claude.json'), credentialSourceDir!);
       // Post-condition, independent of the (best-effort) settings merge: no
       // auth override may remain where the CLI reads it.
       const overrides = [
@@ -14556,6 +14561,7 @@ async function spawnCli(
           userSettingsPath: join(claudeDataDir, 'settings.json'),
           workingDir: cfg.workingDir,
         }),
+        ...claudeStateAuthOverrides(join(claudeDataDir, '.claude.json')).map((k) => `.claude.json:${k}`),
         ...claudeAuthOverrideKeys(process.env).map((k) => `worker env:${k}`),
       ];
       if (overrides.length) {

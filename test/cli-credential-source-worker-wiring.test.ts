@@ -40,6 +40,10 @@ describe('credentialsSourceDir daemon → worker cold-spawn wiring', () => {
     expect(copyBlock).toContain("userSettingsPath: join(claudeDataDir, 'settings.json'),");
     expect(copyBlock).toContain('workingDir: cfg.workingDir,');
     expect(copyBlock).toContain('claudeAuthOverrideKeys(process.env)');
+    expect(copyBlock).toContain("reconcileClaudeAccountState(join(claudeDataDir, '.claude.json'), credentialSourceDir!)");
+    expect(copyBlock).toContain("claudeStateAuthOverrides(join(claudeDataDir, '.claude.json'))");
+    // Reconcile runs after the seed inside provisionIsolatedBotHome, and before the post-check.
+    expect(copyBlock.indexOf('reconcileClaudeAccountState(')).toBeLessThan(copyBlock.indexOf('const overrides = ['));
     expect(copyBlock).toMatch(/if \(overrides\.length\) \{\s*throw new Error/);
     expect(worker).toContain('...(claudeCredFromSource ? { inheritClaudeEnvExclude: CLAUDE_AUTH_OVERRIDE_ENV_KEYS } : {})');
     expect(worker).toContain('perBotEnv: cfg.env,');

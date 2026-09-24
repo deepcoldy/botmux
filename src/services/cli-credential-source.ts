@@ -209,16 +209,7 @@ export function readCredentialSource(sourceDir: string, family: CredentialSource
     const path = join(sourceDir, layout.subdir, name);
     let raw: string;
     try {
-      // O_NOFOLLOW + fstat on the SAME descriptor: a leaf symlink is refused
-      // and the bytes validated below are exactly the bytes copied (no
-      // stat→read swap window).
-      const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-      try {
-        if (!fstatSync(fd).isFile()) throw new Error('not a regular file');
-        raw = readFileSync(fd, 'utf-8').trim();
-      } finally {
-        closeSync(fd);
-      }
+      raw = readRegularFileNoFollow(path).trim();
     } catch (e) {
       throw new Error(`credential source ${path} is unreadable: ${(e as Error).message}`);
     }
@@ -227,6 +218,85 @@ export function readCredentialSource(sourceDir: string, family: CredentialSource
     out[name] = raw;
   }
   return out;
+}
+
+/** O_NOFOLLOW + fstat on the SAME descriptor: a leaf symlink is refused and
+ *  the bytes returned are exactly the bytes validated (no stat→read window). */
+function readRegularFileNoFollow(path: string): string {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    if (!fstatSync(fd).isFile()) throw new Error('not a regular file');
+    return readFileSync(fd, 'utf-8');
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Align the per-bot Claude state file (`<data root>/.claude.json`) with the
+ * source account. It is seeded ONCE from the global `~/.claude.json`, so a bot
+ * that ran before being pointed at account B still carries the shared
+ * account's `oauthAccount` (what `/status` shows) and possibly a
+ * `primaryApiKey` (an API-key login Claude would authenticate with).
+ *
+ *  - `<sourceDir>/claude/.claude.json` present → its `oauthAccount` replaces
+ *    ours (removed when it has none); it must be a readable regular JSON
+ *    object file, else throw.
+ *  - absent → `oauthAccount` is removed so Claude re-derives it from the
+ *    copied token.
+ *  - `primaryApiKey` is always removed.
+ * Everything else (projects/trust, mcpServers, UI flags) is kept. Written
+ * atomically 0600. Throws on any failure (caller fails the spawn closed).
+ */
+export function reconcileClaudeAccountState(statePath: string, sourceDir: string): void {
+  const layout = CREDENTIAL_SOURCE_LAYOUTS.claude;
+  const srcPath = join(sourceDir, layout.subdir, '.claude.json');
+  let srcAccount: unknown;
+  let srcRaw: string | undefined;
+  try {
+    srcRaw = readRegularFileNoFollow(srcPath);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw new Error(`credential source ${srcPath} is unreadable: ${(e as Error).message}`);
+    }
+  }
+  if (srcRaw !== undefined) {
+    const parsed = parseJsonObject(srcRaw);
+    if (!parsed) throw new Error(`credential source ${srcPath} is not a JSON object`);
+    srcAccount = parsed.oauthAccount;
+  }
+  let data: Record<string, unknown> = {};
+  try {
+    data = parseJsonObject(readRegularFileNoFollow(statePath)) ?? {};
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw new Error(`per-bot Claude state ${statePath} is unreadable: ${(e as Error).message}`);
+    }
+  }
+  if (srcAccount !== undefined && srcAccount !== null) data.oauthAccount = srcAccount;
+  else delete data.oauthAccount;
+  delete data.primaryApiKey;
+  writeFileAtomic0600(statePath, `${JSON.stringify(data, null, 2)}\n`);
+}
+
+function parseJsonObject(raw: string): Record<string, unknown> | null {
+  try {
+    const v = JSON.parse(raw) as unknown;
+    return v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+/** `primaryApiKey` in a Claude state file (an API-key login). */
+export function claudeStateAuthOverrides(statePath: string): string[] {
+  let raw: string;
+  try { raw = readFileSync(statePath, 'utf-8'); } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'ENOENT' ? [] : ['<unreadable>'];
+  }
+  const data = parseJsonObject(raw);
+  if (!data) return ['<unreadable>'];
+  return typeof data.primaryApiKey === 'string' && data.primaryApiKey ? ['primaryApiKey'] : [];
 }
 
 function assertClaudeOauthCredential(raw: string, path: string): void {

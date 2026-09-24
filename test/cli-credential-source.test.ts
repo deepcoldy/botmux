@@ -230,3 +230,76 @@ describe('fail-closed hardening (codex review round 2)', () => {
     expect(readdirSync(d).filter((n) => n.includes('.tmp-'))).toEqual([]);
   });
 });
+
+describe('reconcileClaudeAccountState', () => {
+  const setup = async (perBot: unknown, source: string | null) => {
+    const { reconcileClaudeAccountState } = await import('../src/services/cli-credential-source.js');
+    const src = account(null);
+    mkdirSync(join(src, 'claude'), { recursive: true });
+    if (source !== null) writeFileSync(join(src, 'claude', '.claude.json'), source);
+    const botDir = account(null);
+    const state = join(botDir, '.claude.json');
+    if (perBot !== undefined) writeFileSync(state, typeof perBot === 'string' ? perBot : JSON.stringify(perBot));
+    return { run: () => reconcileClaudeAccountState(state, src), state, src };
+  };
+  const read = async (p: string) => JSON.parse((await import('node:fs')).readFileSync(p, 'utf-8'));
+  const seeded = {
+    oauthAccount: { emailAddress: 'shared@a' }, primaryApiKey: 'sk-shared',
+    projects: { '/w': { hasTrustDialogAccepted: true } }, mcpServers: { g: {} }, hasCompletedOnboarding: true,
+  };
+
+  it('takes oauthAccount from the source state, drops primaryApiKey, keeps everything else', async () => {
+    const t = await setup(seeded, JSON.stringify({ oauthAccount: { emailAddress: 'b@b' }, projects: { '/src': {} } }));
+    t.run();
+    expect(await read(t.state)).toEqual({
+      oauthAccount: { emailAddress: 'b@b' },
+      projects: { '/w': { hasTrustDialogAccepted: true } }, mcpServers: { g: {} }, hasCompletedOnboarding: true,
+    });
+    const { lstatSync } = await import('node:fs');
+    expect(lstatSync(t.state).mode & 0o777).toBe(0o600);
+  });
+
+  it('removes the shared oauthAccount when the source has no state file or no account', async () => {
+    const a = await setup(seeded, null);
+    a.run();
+    expect(await read(a.state)).not.toHaveProperty('oauthAccount');
+    expect(await read(a.state)).not.toHaveProperty('primaryApiKey');
+    const b = await setup(seeded, JSON.stringify({ projects: {} }));
+    b.run();
+    expect(await read(b.state)).not.toHaveProperty('oauthAccount');
+  });
+
+  it('fails closed on an unusable source state file or per-bot state file', async () => {
+    await expect((await setup(seeded, '{bad')).run).toThrow(/not a JSON object/);
+    await expect((await setup(seeded, '[1]')).run).toThrow(/not a JSON object/);
+    const t = await setup(undefined, null);
+    mkdirSync(t.state); // present but not a regular file
+    expect(t.run).toThrow(/unreadable/);
+    const s1 = await setup(seeded, null);
+    mkdirSync(join(s1.src, 'claude', '.claude.json')); // source present but not a file
+    expect(s1.run).toThrow(/credential source .* is unreadable/);
+    const s2 = await setup(seeded, null);
+    const { symlinkSync } = await import('node:fs');
+    const other = join(s2.src, 'other.json');
+    writeFileSync(other, JSON.stringify({ oauthAccount: { emailAddress: 'x@x' } }));
+    symlinkSync(other, join(s2.src, 'claude', '.claude.json')); // leaf symlink refused
+    expect(s2.run).toThrow(/credential source .* is unreadable/);
+  });
+
+  it('creates the state when absent', async () => {
+    const t = await setup(undefined, JSON.stringify({ oauthAccount: { emailAddress: 'b@b' } }));
+    t.run();
+    expect(await read(t.state)).toEqual({ oauthAccount: { emailAddress: 'b@b' } });
+  });
+
+  it('claudeStateAuthOverrides flags an API-key login', async () => {
+    const { claudeStateAuthOverrides } = await import('../src/services/cli-credential-source.js');
+    const d = account(null);
+    const p = join(d, 's.json');
+    expect(claudeStateAuthOverrides(p)).toEqual([]);
+    writeFileSync(p, JSON.stringify({ primaryApiKey: 'sk' }));
+    expect(claudeStateAuthOverrides(p)).toEqual(['primaryApiKey']);
+    writeFileSync(p, 'nope');
+    expect(claudeStateAuthOverrides(p)).toEqual(['<unreadable>']);
+  });
+});
