@@ -25247,419 +25247,483 @@ dialog select[multiple]:hover:not(:disabled) {
   color: color-mix(in srgb, var(--accent-strong) 72%, var(--muted));
 }
 
-/* 下拉弹层内的预览面板（如会话模式示意图）：钉在弹层底部不随选项滚走，
-   与顶部的 .sect-sort-search 对称地吃掉弹层 6px padding。 */
-.sect-sort-pop .sect-sort-preview {
-  position: sticky;
-  bottom: -6px;
-  z-index: 1;
-  width: calc(100% + 12px);
-  margin: 2px -6px -6px;
-  padding: 8px 10px 10px;
-  border-top: 1px solid var(--border-soft);
-  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+/* ═══ 模式单选卡片（mode-diagrams.tsx） ═══
+   每个设置的候选项直接做成大卡片：上半部分是一张高保真迷你飞书聊天
+   截图（.bd-mock*，固定浅色、模拟飞书 App），下半部分是模式名、说明、
+   场景标签与单选钮。卡片外壳走 design token，深浅色主题自适应。 */
+.bot-defaults-page .bd-mode-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.bot-defaults-page .bd-mode-card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border: 1.5px solid var(--border);
+  border-radius: 12px;
   background: var(--surface);
-  background-clip: padding-box;
+  overflow: hidden;
+  cursor: pointer;
+  transition: border-color .12s ease, box-shadow .12s ease, background .12s ease;
 }
 
-/* 带预览面板时弹层需要更高：三条选项 + 一张图约 420px，280px 会把图压扁。 */
-.bot-defaults-page .bd-field-menu .sect-sort-pop:has(.sect-sort-preview) {
-  gap: 3px;
-  max-height: min(640px, 82vh, var(--dropdown-popover-space, 100vh));
+.bot-defaults-page .bd-mode-card:hover {
+  border-color: var(--border-strong);
 }
 
-/* ═══ 模式示意图（mode-diagrams.tsx） ═══
-   用 DOM 画的迷你飞书聊天窗：右气泡=人发的消息，左气泡=机器人回复，
-   带色底板（lane）= 一个独立 CLI 会话，话题框=飞书话题。
-   全部走 design token，深浅色主题自动跟随。 */
-.bd-md-diagram {
-  margin: 0;
-  min-width: 0;
+.bot-defaults-page .bd-mode-card.is-selected {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+  background: var(--accent-soft);
 }
 
-.bd-md-stage {
+.bot-defaults-page .bd-mode-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.bot-defaults-page .bd-mode-card[aria-disabled="true"] {
+  opacity: .55;
+  cursor: default;
+}
+
+/* ── 上半部分：迷你飞书截图（固定浅色，截图语义，不随暗色主题变） ── */
+.bot-defaults-page .bd-mode-mock {
+  --m-text: #1f2329;
+  --m-name: #646a73;
+  --m-muted: #8f959e;
+  --m-link: #3370ff;
+  --m-bubble: #d9e4f8;
+  --m-bot: #f4f5f7;
+  --m-card: #ffffff;
+  --m-card-border: #e3e8f0;
+  --m-topic-bg: #e9f0fb;
+  --m-topic-border: #d6e1f3;
+  --m-topic-bar: #93b0e6;
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 9px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-md);
-  background: var(--surface-muted);
+  justify-content: center;
+  gap: 7px;
+  min-height: 168px;
+  padding: 11px;
+  background: var(--m-tint);
+  color: var(--m-text);
+  font-size: 10.5px;
+  line-height: 1.4;
+  /* 固定浅色截图区：暗色主题里也保持飞书自己的配色 */
+  color-scheme: light;
 }
 
-.bd-md-caption-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  margin-top: 7px;
-}
+.bot-defaults-page .bd-mock-tone-a { --m-tint: #f3f7fd; --m-topic-bg: #e9f0fb; --m-topic-border: #d6e1f3; --m-topic-bar: #93b0e6; }
+.bot-defaults-page .bd-mock-tone-b { --m-tint: #edf3ff; --m-topic-bg: #e4ecfe; --m-topic-border: #d2ddf8; --m-topic-bar: #7b8ff0; }
+.bot-defaults-page .bd-mock-tone-c { --m-tint: #f1f6f4; --m-topic-bg: #e8f4ed; --m-topic-border: #d2e7db; --m-topic-bar: #5fb98d; }
+.bot-defaults-page .bd-mock-tone-d { --m-tint: #f6f2fd; --m-topic-bg: #efe7fc; --m-topic-border: #ddd2f4; --m-topic-bar: #a285e3; }
 
-.bd-md-caption {
-  flex: 1;
-  min-width: 0;
-  color: var(--muted);
-  font-size: 11px;
-  font-weight: 500;
-  line-height: 1.45;
-}
-
-.bd-md-token {
-  flex-shrink: 0;
-  padding: 1px 7px;
-  border-radius: var(--radius-full);
-  background: var(--surface-muted);
-  color: var(--muted);
-  font-size: 9.5px;
-  font-weight: 700;
-  line-height: 1.5;
-}
-
-.bd-md-frame {
-  overflow: hidden;
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  background: var(--surface-raised);
-}
-
-.bd-md-framebar {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  height: 25px;
-  padding: 0 9px;
-  border-bottom: 1px solid var(--border-soft);
-  background: var(--surface-hover);
-}
-
-.bd-md-frame-title {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--text);
-  font-size: 10px;
-  font-weight: 700;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.bd-md-frame-badge {
-  margin-left: auto;
-  flex-shrink: 0;
-  padding: 1px 7px;
-  border-radius: var(--radius-full);
-  background: color-mix(in srgb, var(--accent) 14%, var(--surface));
-  color: var(--accent-strong);
-  font-size: 9px;
-  font-weight: 700;
-}
-
-.bd-md-framebody {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  padding: 7px;
-}
-
-/* 迷你头像：13px 圆点叠放 */
-.bd-md-avatars {
-  display: inline-flex;
-  align-items: center;
-  flex-shrink: 0;
-}
-
-.bd-md-avatars .bd-md-av + .bd-md-av {
-  margin-left: -5px;
-}
-
-.bd-md-av {
-  display: inline-block;
-  width: 13px;
-  height: 13px;
-  border: 1.5px solid var(--surface-hover);
+.bot-defaults-page .bd-mock-av {
+  width: 20px;
+  height: 20px;
+  flex: none;
   border-radius: 50%;
 }
 
-.bd-md-av-user {
-  background: var(--info);
-}
-
-.bd-md-av-bot {
-  background: var(--accent);
-}
-
-.bd-md-av-other {
-  background: var(--warning);
-}
-
-/* 气泡 */
-.bd-md-bubble-row {
+.bot-defaults-page .bd-mock-personline,
+.bot-defaults-page .bd-mock-botline {
   display: flex;
-  align-items: flex-end;
+  align-items: flex-start;
+  gap: 6px;
+}
+
+.bot-defaults-page .bd-mock-personline.is-dim {
+  opacity: .62;
+}
+
+.bot-defaults-page .bd-mock-col {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
   gap: 4px;
+  min-width: 0;
+  flex: 1;
 }
 
-.bd-md-bubble {
-  max-width: 78%;
-  padding: 3px 8px;
-  border-radius: 9px;
-  font-size: 10px;
-  line-height: 1.35;
+/* 列内右气泡行占满整行，才能把蓝色气泡推到右边 */
+.bot-defaults-page .bd-mock-col .bd-mock-row-r {
+  width: 100%;
 }
 
-.bd-md-bubble-r {
+.bot-defaults-page .bd-mock-nameline {
+  color: var(--m-name);
+  font-size: 9.5px;
+  font-weight: 500;
+  line-height: 1.2;
+}
+
+.bot-defaults-page .bd-mock-row-r {
+  display: flex;
   justify-content: flex-end;
 }
 
-.bd-md-bubble-r .bd-md-bubble {
-  background: var(--accent);
-  color: var(--on-accent);
+.bot-defaults-page .bd-mock-bubble {
+  max-width: 92%;
+  padding: 4px 10px;
+  border-radius: 9px;
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.bot-defaults-page .bd-mock-bubble-r {
+  background: var(--m-bubble);
+  color: var(--m-text);
   border-bottom-right-radius: 3px;
 }
 
-.bd-md-bubble-l .bd-md-bubble {
-  border: 1px solid var(--border-soft);
+.bot-defaults-page .bd-mock-bubble-l {
+  background: var(--m-bot);
+  border: 1px solid var(--m-card-border);
   border-bottom-left-radius: 3px;
-  background: var(--surface-muted);
-  color: var(--text);
 }
 
-.bd-md-bubble-l .bd-md-bubble-av {
-  width: 11px;
-  height: 11px;
-  border-width: 1px;
+.bot-defaults-page .bd-mock-at {
+  color: var(--m-link);
+  font-weight: 500;
 }
 
-/* 会话底板：同一块 = 同一个 CLI 会话 */
-.bd-md-lane {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 5px 7px 6px;
-  border: 1px solid color-mix(in srgb, var(--md-tone) 30%, var(--border-soft));
-  border-radius: 7px;
-  background: color-mix(in srgb, var(--md-tone) 9%, transparent);
-}
-
-.bd-md-lane-tag,
-.bd-md-topic-tag {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  width: fit-content;
-  color: color-mix(in srgb, var(--md-tone) 80%, var(--text) 20%);
-  font-size: 9px;
-  font-weight: 700;
-  line-height: 1.3;
-}
-
-.bd-md-lane-tag::before,
-.bd-md-topic-tag::before {
-  content: '';
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--md-tone);
-}
-
-.bd-md-lane-body {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-
-/* 飞书话题框：相对 lane 缩进 + 左侧 tone 色条 */
-.bd-md-topic {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  margin-left: 12px;
-  padding: 5px 7px 6px;
-  border: 1px solid color-mix(in srgb, var(--md-tone) 30%, var(--border-soft));
-  border-left: 3px solid var(--md-tone);
-  border-radius: 6px;
-  background: color-mix(in srgb, var(--md-tone) 11%, transparent);
-}
-
-/* fused：话题被折进外层会话 —— 虚线、无独立底色，视觉上"并入" */
-.bd-md-topic-fused {
-  margin-left: 6px;
-  border-style: dashed;
-  border-left-style: dashed;
-  background: transparent;
-}
-
-.bd-md-topic-body {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-}
-
-.bd-md-topic-row {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 5px;
-}
-
-.bd-md-topic-compact .bd-md-bubble {
-  max-width: 100%;
-}
-
-.bd-md-tone-a { --md-tone: var(--accent); }
-.bd-md-tone-b { --md-tone: var(--success); }
-.bd-md-tone-c { --md-tone: var(--info); }
-
-/* 沉默标记 */
-.bd-md-silent-row {
-  display: flex;
-  justify-content: center;
-}
-
-.bd-md-silent {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 2px 9px;
-  border: 1px dashed var(--border-strong);
-  border-radius: var(--radius-full);
-  color: var(--muted);
-  font-size: 9px;
-  line-height: 1.4;
-}
-
-.bd-md-silent-icon {
-  font-size: 10px;
-  opacity: .8;
-}
-
-/* 私聊 group 模式：DM → 多个专属群 */
-.bd-md-split {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
-  align-items: center;
-  gap: 7px;
-}
-
-.bd-md-split > * {
-  min-width: 0;
-}
-
-.bd-md-split-arrow {
-  color: var(--border-strong);
-  font-size: 13px;
-  font-weight: 700;
-}
-
-.bd-md-session-groups {
+/* 飞书话题盒 */
+.bot-defaults-page .bd-mock-topic {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  margin-left: 9px;
+  padding: 7px 9px;
+  border: 1px solid var(--m-topic-border);
+  border-left: 3px solid var(--m-topic-bar);
+  border-radius: 8px;
+  background: var(--m-topic-bg);
 }
 
-.bd-md-session-group {
-  padding: 6px 7px;
-  border: 1px solid color-mix(in srgb, var(--md-tone) 30%, var(--border-soft));
-  border-radius: 7px;
-  background: color-mix(in srgb, var(--md-tone) 9%, transparent);
+.bot-defaults-page .bd-mock-topic.is-fused {
+  border-style: dashed;
+  border-left-style: solid;
 }
 
-.bd-md-session-group-head {
-  display: flex;
-  align-items: center;
-  gap: 5px;
-  margin-bottom: 5px;
-  color: var(--text);
-  font-size: 9.5px;
-  font-weight: 700;
-}
-
-.bd-md-session-group-head .bd-md-av {
-  border-color: var(--surface-raised);
-}
-
-/* 工作目录模式：纵向流程 */
-.bd-md-flow {
+/* 飞书「回复消息」引用条 */
+.bot-defaults-page .bd-mock-quote {
   display: flex;
   flex-direction: column;
-  align-items: stretch;
   gap: 2px;
+  padding: 4px 9px;
+  border-left: 3px solid #c4cbd8;
+  border-radius: 5px;
+  background: #f5f6f8;
 }
 
-.bd-md-node {
+.bot-defaults-page .bd-mock-quote-head {
+  color: var(--m-muted);
+  font-size: 9px;
+  line-height: 1.3;
+}
+
+.bot-defaults-page .bd-mock-quote-body {
+  color: var(--m-text);
+}
+
+.bot-defaults-page .bd-mock-reply-topic {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--m-muted);
+  font-size: 9.5px;
+}
+
+.bot-defaults-page .bd-mock-ignored {
+  align-self: center;
+  border: 1px dashed #c4cbd8;
+  border-radius: 999px;
+  padding: 1px 9px;
+  color: var(--m-muted);
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.bot-defaults-page .bd-mock-badge {
+  align-self: flex-end;
+  border-radius: 999px;
+  padding: 1px 9px;
+  background: #e4ecff;
+  color: var(--m-link);
+  font-size: 9px;
+  font-weight: 600;
+}
+
+/* 私聊 group 模式：DM → 两个专属群 */
+.bot-defaults-page .bd-mock-dm-split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 12px minmax(0, 1fr);
+  align-items: center;
+  gap: 5px;
+}
+
+.bot-defaults-page .bd-mock-dm,
+.bot-defaults-page .bd-mock-sgroup {
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid var(--m-card-border);
+  border-radius: 8px;
+  background: var(--m-card);
+}
+
+.bot-defaults-page .bd-mock-sgroup {
+  background: var(--m-topic-bg);
+  border-color: var(--m-topic-border);
+}
+
+.bot-defaults-page .bd-mock-dm-title,
+.bot-defaults-page .bd-mock-sgroup-name {
+  margin-bottom: 5px;
+  color: var(--m-text);
+  font-size: 9px;
+  font-weight: 600;
+}
+
+.bot-defaults-page .bd-mock-flow-h {
+  text-align: center;
+  color: #a8b0bd;
+  font-size: 11px;
+}
+
+/* 工作目录流程 / 选仓库卡 */
+.bot-defaults-page .bd-mock-flow {
+  gap: 5px;
+}
+
+.bot-defaults-page .bd-mock-step {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 10px;
-  border: 1px solid var(--border-soft);
-  border-radius: var(--radius-md);
-  background: var(--surface-raised);
+  padding: 8px 10px;
+  border: 1px solid var(--m-card-border);
+  border-radius: 8px;
+  background: var(--m-card);
 }
 
-.bd-md-node-icon {
+.bot-defaults-page .bd-mock-step-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 22px;
-  height: 22px;
-  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  flex: none;
   border-radius: 7px;
-  background: var(--surface-muted);
-  font-size: 12px;
+  background: #f3f5f8;
+  font-size: 13px;
 }
 
-.bd-md-node-text {
+.bot-defaults-page .bd-mock-step-text {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 3px 8px;
+  gap: 3px 6px;
   min-width: 0;
   flex: 1;
 }
 
-.bd-md-node-title {
-  color: var(--text);
-  font-size: 10.5px;
-  font-weight: 700;
-  line-height: 1.3;
+.bot-defaults-page .bd-mock-step-title {
+  font-weight: 600;
 }
 
-.bd-md-node-sub {
-  flex-basis: 100%;
-  color: var(--muted);
-  font-size: 9.5px;
-  line-height: 1.35;
-}
-
-.bd-md-node-badges {
+.bot-defaults-page .bd-mock-step-badges {
   display: inline-flex;
   flex-wrap: wrap;
   gap: 4px;
   margin-left: auto;
+  justify-content: flex-end;
 }
 
-.bd-md-node-badge {
+.bot-defaults-page .bd-mock-step-badge {
+  border-radius: 999px;
   padding: 1px 7px;
-  border-radius: var(--radius-full);
-  background: color-mix(in srgb, var(--accent) 13%, var(--surface));
-  color: var(--accent-strong);
+  background: #e7edfe;
+  color: var(--m-link);
   font-size: 9px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.bot-defaults-page .bd-mock-flow-v {
+  text-align: center;
+  color: #a8b0bd;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.bot-defaults-page .bd-mock-crowd {
+  display: flex;
+  align-items: center;
+  gap: 0;
+}
+
+.bot-defaults-page .bd-mock-crowd .bd-mock-av + .bd-mock-av {
+  margin-left: -6px;
+  border: 2px solid var(--m-card);
+  border-radius: 50%;
+}
+
+.bot-defaults-page .bd-mock-crowd-text {
+  margin-left: 8px;
+  color: var(--m-name);
+  font-size: 9.5px;
+}
+
+.bot-defaults-page .bd-mock-repo-card {
+  width: 100%;
+  padding: 9px 10px 10px;
+  border: 1px solid var(--m-card-border);
+  border-radius: 9px;
+  background: var(--m-card);
+  box-shadow: 0 2px 8px rgba(31, 42, 68, .06);
+}
+
+.bot-defaults-page .bd-mock-repo-head {
+  margin-bottom: 7px;
+  font-weight: 600;
+}
+
+.bot-defaults-page .bd-mock-repo-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 9px;
+  border: 1px solid var(--m-card-border);
+  border-radius: 7px;
+  margin-bottom: 6px;
+}
+
+.bot-defaults-page .bd-mock-repo-row.is-on {
+  border-color: #93b0ea;
+  background: #f2f6ff;
+}
+
+.bot-defaults-page .bd-mock-repo-radio {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  border: 1.5px solid #b8c0cc;
+  border-radius: 50%;
+}
+
+.bot-defaults-page .bd-mock-repo-row.is-on .bd-mock-repo-radio {
+  border: 3.5px solid var(--m-link);
+}
+
+.bot-defaults-page .bd-mock-repo-check {
+  margin-left: auto;
+  color: var(--m-link);
   font-weight: 700;
+}
+
+.bot-defaults-page .bd-mock-repo-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.bot-defaults-page .bd-mock-repo-btn {
+  padding: 4px 10px;
+  border: 1px solid var(--m-card-border);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--m-name);
+  font-size: 9.5px;
+  white-space: nowrap;
+}
+
+.bot-defaults-page .bd-mock-repo-btn.is-primary {
+  border-color: var(--m-link);
+  background: var(--m-link);
+  color: #fff;
+}
+
+/* ── 下半部分：名称 / 说明 / 标签 / 单选钮 ── */
+.bot-defaults-page .bd-mode-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 11px 12px 12px;
+}
+
+.bot-defaults-page .bd-mode-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.bot-defaults-page .bd-mode-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  flex: none;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.bot-defaults-page .bd-mode-icon svg {
+  width: 15px;
+  height: 15px;
+}
+
+.bot-defaults-page .bd-mode-name {
+  min-width: 0;
+  flex: 1;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.bot-defaults-page .bd-mode-radio {
+  width: 16px;
+  height: 16px;
+  flex: none;
+  border: 1.5px solid var(--border-strong);
+  border-radius: 50%;
+  transition: border-color .12s ease;
+}
+
+.bot-defaults-page .bd-mode-card.is-selected .bd-mode-radio {
+  border: 5px solid var(--accent);
+}
+
+.bot-defaults-page .bd-mode-desc {
+  min-height: 34px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 11.5px;
+  font-weight: 500;
+  line-height: 1.5;
+}
+
+.bot-defaults-page .bd-mode-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.bot-defaults-page .bd-mode-tag {
+  padding: 2px 9px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--muted);
+  font-size: 10.5px;
   line-height: 1.5;
   white-space: nowrap;
 }
 
-.bd-md-node-avatars {
-  margin-left: auto;
-}
-
-.bd-md-node-avatars .bd-md-av {
-  border-color: var(--surface-raised);
-}
-
-.bd-md-flow-arrow {
-  align-self: center;
-  color: var(--border-strong);
-  font-size: 11px;
-  line-height: 1.3;
-}
 
 /* Reply-style overrides stay compact but explicit: every semantic layout gets
    the same color + tri-state tag controls, with custom text revealed in place. */

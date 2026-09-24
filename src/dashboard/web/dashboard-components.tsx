@@ -399,18 +399,6 @@ type DropdownMenuProps<T extends string> = {
   searchPlaceholder?: string;
   /** Shown instead of options when the filter matches nothing. */
   searchEmptyLabel?: ReactNode;
-  /**
-   * Sticky panel pinned inside the open popup (e.g. a live diagram of the
-   * hovered option). Options scroll above it; the panel stays visible.
-   */
-  preview?: ReactNode;
-  /**
-   * Pointer-hover / keyboard-focus an option: "preview" it without selecting
-   * (e.g. a live diagram that follows the highlighted choice). `onPreviewEnd`
-   * fires when the popup closes so callers can snap back to the saved value.
-   */
-  onOptionPreview?: (value: T) => void;
-  onPreviewEnd?: () => void;
 };
 
 /**
@@ -577,7 +565,6 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
   // Keep the popup inside the viewport; see dropdownPlacement above.
   useLayoutEffect(() => {
     if (!open) return undefined;
-    const observed = popRef.current;
     const place = () => {
       const details = detailsRef.current;
       const pop = popRef.current;
@@ -620,15 +607,10 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
     window.addEventListener('resize', place);
     // Capture phase: the scroller is an ancestor (main), not window.
     window.addEventListener('scroll', place, true);
-    // A preview panel (mode diagram) can swap content while the popup stays
-    // open, changing its natural height — re-place on any content resize.
-    const ro = new ResizeObserver(place);
-    if (observed) ro.observe(observed);
     return () => {
       window.cancelAnimationFrame(frame);
       window.removeEventListener('resize', place);
       window.removeEventListener('scroll', place, true);
-      ro.disconnect();
     };
   }, [open, visibleOptions.length]);
 
@@ -662,13 +644,6 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
     // Third programmatic close path — keep it in sync too (see choose()).
     setOpen(false);
   }, [props.disabled]);
-
-  // Popup closed (choose / outside click / Escape / disable): any hover
-  // preview is stale — tell the caller to snap back to the saved value.
-  const onPreviewEnd = props.onPreviewEnd;
-  useEffect(() => {
-    if (!open) onPreviewEnd?.();
-  }, [open, onPreviewEnd]);
 
   const className = ['sect-sort-menu', props.disabled ? 'is-disabled' : '', props.className].filter(Boolean).join(' ');
 
@@ -731,12 +706,6 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
             disabled={option.disabled}
             aria-current={props.value === option.value ? 'true' : undefined}
             onClick={() => choose(option.value)}
-            onMouseEnter={() => {
-              if (!option.disabled) props.onOptionPreview?.(option.value);
-            }}
-            onFocus={() => {
-              if (!option.disabled) props.onOptionPreview?.(option.value);
-            }}
           >
             {option.hint ? (
               <span className="sect-sort-option">
@@ -749,16 +718,6 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
         {props.searchable && visibleOptions.length === 0
           ? <p className="sect-sort-empty">{props.searchEmptyLabel}</p>
           : null}
-        {props.preview ? (
-          <div
-            className="sect-sort-preview"
-            // The panel visualizes the hovered option; clicks inside must not
-            // be read as a choice, and focus must stay on the option buttons.
-            onMouseDown={event => event.preventDefault()}
-          >
-            {props.preview}
-          </div>
-        ) : null}
       </div>
     </details>
   );

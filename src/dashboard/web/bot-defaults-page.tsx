@@ -43,10 +43,13 @@ import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import {
-  MentionModeDiagram,
-  P2pModeDiagram,
-  RegularGroupModeDiagram,
-  WorkingDirModeDiagram,
+  MentionMock,
+  ModeCardPicker,
+  MODE_GLYPHS,
+  P2pMock,
+  RegularMock,
+  WorkingDirMock,
+  type ModeCardOption,
 } from './mode-diagrams.js';
 import { store } from './store.js';
 import { toast } from './toast.js';
@@ -498,10 +501,6 @@ export function DropdownField<T extends string>(props: {
   className?: string;
   searchable?: boolean;
   onChange(value: T): void;
-  onOptionPreview?(value: T): void;
-  onPreviewEnd?(): void;
-  /** Sticky panel rendered inside the open popup (e.g. a mode diagram). */
-  preview?: ReactNode;
 }) {
   const tr = useT();
   return (
@@ -518,9 +517,6 @@ export function DropdownField<T extends string>(props: {
         searchPlaceholder={props.searchable ? tr('common.dropdownSearch') : undefined}
         searchEmptyLabel={props.searchable ? tr('common.dropdownSearchEmpty') : undefined}
         onChange={props.onChange}
-        onOptionPreview={props.onOptionPreview}
-        onPreviewEnd={props.onPreviewEnd}
-        preview={props.preview}
       />
       <input type="hidden" data-input={props.dataInput} value={props.value} readOnly />
     </>
@@ -3376,7 +3372,6 @@ function WorkingDirSection(props: {
   const { bot, patchBot } = props;
   const initial = workingDirState(bot);
   const [mode, setMode] = useState(initial.mode);
-  const [previewMode, setPreviewMode] = useState<'off' | 'default' | 'oncall' | null>(null);
   const [workingDir, setWorkingDir] = useState(initial.workingDir);
   const [autoWorktree, setAutoWorktree] = useState(bot.defaultWorkingDirAutoWorktree === true);
   const [status, setStatus] = useState<StatusMessage>(null);
@@ -3427,10 +3422,25 @@ function WorkingDirSection(props: {
     }
   }
 
-  const modeOptions: DropdownFieldOption<'off' | 'default' | 'oncall'>[] = [
-    { value: 'off', label: tr('botDefaults.workingDirModeOff'), hint: tr('botDefaults.workingDirModeOffHint') },
-    { value: 'default', label: tr('botDefaults.workingDirModeDefault'), hint: tr('botDefaults.workingDirModeDefaultHint') },
-    { value: 'oncall', label: tr('botDefaults.workingDirModeOncall'), hint: tr('botDefaults.workingDirModeOncallHint') },
+  const modeOptions: ModeCardOption<'off' | 'default' | 'oncall'>[] = [
+    {
+      value: 'off', icon: MODE_GLYPHS.pickCard, name: tr('botDefaults.workingDirModeOff'),
+      description: tr('botDefaults.wdOffDesc'),
+      tags: [tr('botDefaults.wdOffTag1'), tr('botDefaults.wdOffTag2')],
+      mock: <WorkingDirMock mode="off" />,
+    },
+    {
+      value: 'default', icon: MODE_GLYPHS.pinFolder, name: tr('botDefaults.workingDirModeDefault'),
+      description: tr('botDefaults.wdDefaultDesc'),
+      tags: [tr('botDefaults.wdDefaultTag1'), tr('botDefaults.wdDefaultTag2')],
+      mock: <WorkingDirMock mode="default" />,
+    },
+    {
+      value: 'oncall', icon: MODE_GLYPHS.oncall, name: tr('botDefaults.workingDirModeOncall'),
+      description: tr('botDefaults.wdOncallDesc'),
+      tags: [tr('botDefaults.wdOncallTag1'), tr('botDefaults.wdOncallTag2')],
+      mock: <WorkingDirMock mode="oncall" />,
+    },
   ];
 
   return (
@@ -3439,16 +3449,13 @@ function WorkingDirSection(props: {
       <div className="bd-row">
         <div className="bd-field">
           <FieldTitle help={tr('botDefaults.workingDirModeHelp')}>{tr('botDefaults.workingDirMode')}</FieldTitle>
-          <DropdownField
+          <ModeCardPicker<'off' | 'default' | 'oncall'>
             dataInput="workingDirMode"
             ariaLabel={tr('botDefaults.workingDirMode')}
             value={mode}
             disabled={busy}
             options={modeOptions}
-            onChange={next => setMode(next as 'off' | 'default' | 'oncall')}
-            onOptionPreview={next => setPreviewMode(next as 'off' | 'default' | 'oncall')}
-            onPreviewEnd={() => setPreviewMode(null)}
-            preview={<WorkingDirModeDiagram mode={previewMode ?? mode} />}
+            onChange={next => setMode(next)}
           />
         </div>
       </div>
@@ -5102,9 +5109,6 @@ function SessionModeSection(props: {
   const [regular, setRegular] = useState(regularGroupMode(props.bot));
   const [mention, setMention] = useState(mentionMode(props.bot));
   const [docMode, setDocMode] = useState(props.bot.docSubscribeDefaultMode === 'all' ? 'all' : 'mention-only');
-  const [p2pPreview, setP2pPreview] = useState<'thread' | 'chat' | 'group' | null>(null);
-  const [regularPreview, setRegularPreview] = useState<string | null>(null);
-  const [mentionPreview, setMentionPreview] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [p2pStatus, setP2pStatus] = useState<StatusMessage>(null);
   const [regularStatus, setRegularStatus] = useState<StatusMessage>(null);
@@ -5156,22 +5160,77 @@ function SessionModeSection(props: {
     }
   }
 
-  const p2pOptions: DropdownFieldOption<'thread' | 'chat' | 'group'>[] = [
-    { value: 'chat', label: tr('botDefaults.p2pChat'), hint: tr('botDefaults.p2pChatHint') },
-    { value: 'thread', label: tr('botDefaults.p2pThread'), hint: tr('botDefaults.p2pThreadHint') },
-    { value: 'group', label: tr('botDefaults.p2pGroup'), hint: tr('botDefaults.p2pGroupHint') },
+  const tags2 = (k1: string, k2: string): string[] => [tr(k1), tr(k2)];
+  const tags3 = (k1: string, k2: string, k3: string): string[] => [tr(k1), tr(k2), tr(k3)];
+
+  const p2pOptions: ModeCardOption<'thread' | 'chat' | 'group'>[] = [
+    {
+      value: 'chat', icon: MODE_GLYPHS.continuous, name: tr('botDefaults.p2pChat'),
+      description: tr('botDefaults.p2pChatDesc'), tags: tags2('botDefaults.p2pChatTag1', 'botDefaults.p2pChatTag2'),
+      mock: <P2pMock mode="chat" />,
+    },
+    {
+      value: 'thread', icon: MODE_GLYPHS.separate, name: tr('botDefaults.p2pThread'),
+      description: tr('botDefaults.p2pThreadDesc'), tags: tags2('botDefaults.p2pThreadTag1', 'botDefaults.p2pThreadTag2'),
+      mock: <P2pMock mode="thread" />,
+    },
+    {
+      value: 'group', icon: MODE_GLYPHS.group, name: tr('botDefaults.p2pGroup'),
+      description: tr('botDefaults.p2pGroupDesc'), tags: tags2('botDefaults.p2pGroupTag1', 'botDefaults.p2pGroupTag2'),
+      mock: <P2pMock mode="group" />,
+    },
   ];
-  const regularOptions: DropdownFieldOption<string>[] = [
-    { value: 'chat-topic', label: tr('botDefaults.regularGroupModeChatTopic'), hint: tr('botDefaults.regularGroupModeChatTopicHint') },
-    { value: 'chat', label: tr('botDefaults.regularGroupModeChat'), hint: tr('botDefaults.regularGroupModeChatHint') },
-    { value: 'new-topic', label: tr('botDefaults.regularGroupModeNewTopic'), hint: tr('botDefaults.regularGroupModeNewTopicHint') },
-    { value: 'shared', label: tr('botDefaults.regularGroupModeShared'), hint: tr('botDefaults.regularGroupModeSharedHint') },
+  const regularOptions: ModeCardOption<string>[] = [
+    {
+      value: 'chat-topic', icon: MODE_GLYPHS.hybrid, name: tr('botDefaults.regularGroupModeChatTopic'),
+      description: tr('botDefaults.regularChatTopicDesc'),
+      tags: tags2('botDefaults.regularChatTopicTag1', 'botDefaults.regularChatTopicTag2'),
+      mock: <RegularMock mode="chat-topic" />,
+    },
+    {
+      value: 'new-topic', icon: MODE_GLYPHS.topic, name: tr('botDefaults.regularGroupModeNewTopic'),
+      description: tr('botDefaults.regularNewTopicDesc'),
+      tags: tags3('botDefaults.regularNewTopicTag1', 'botDefaults.regularNewTopicTag2', 'botDefaults.regularNewTopicTag3'),
+      mock: <RegularMock mode="new-topic" />,
+    },
+    {
+      value: 'chat', icon: MODE_GLYPHS.message, name: tr('botDefaults.regularGroupModeChat'),
+      description: tr('botDefaults.regularChatDesc'),
+      tags: tags3('botDefaults.regularChatTag1', 'botDefaults.regularChatTag2', 'botDefaults.regularChatTag3'),
+      mock: <RegularMock mode="chat" />,
+    },
+    {
+      value: 'shared', icon: MODE_GLYPHS.shared, name: tr('botDefaults.regularGroupModeShared'),
+      description: tr('botDefaults.regularSharedDesc'),
+      tags: tags2('botDefaults.regularSharedTag1', 'botDefaults.regularSharedTag2'),
+      mock: <RegularMock mode="shared" />,
+    },
   ];
-  const mentionOptions: DropdownFieldOption<string>[] = [
-    { value: 'always', label: tr('botDefaults.mentionModeAlways'), hint: tr('botDefaults.mentionModeAlwaysHint') },
-    { value: 'topic', label: tr('botDefaults.mentionModeTopic'), hint: tr('botDefaults.mentionModeTopicHint') },
-    { value: 'never', label: tr('botDefaults.mentionModeNever'), hint: tr('botDefaults.mentionModeNeverHint') },
-    { value: 'ambient', label: tr('botDefaults.mentionModeAmbient'), hint: tr('botDefaults.mentionModeAmbientHint') },
+  const mentionOptions: ModeCardOption<string>[] = [
+    {
+      value: 'always', icon: MODE_GLYPHS.at, name: tr('botDefaults.mentionModeAlways'),
+      description: tr('botDefaults.mentionAlwaysDesc'),
+      tags: tags2('botDefaults.mentionAlwaysTag1', 'botDefaults.mentionAlwaysTag2'),
+      mock: <MentionMock mode="always" />,
+    },
+    {
+      value: 'topic', icon: MODE_GLYPHS.inTopic, name: tr('botDefaults.mentionModeTopic'),
+      description: tr('botDefaults.mentionTopicDesc'),
+      tags: tags2('botDefaults.mentionTopicTag1', 'botDefaults.mentionTopicTag2'),
+      mock: <MentionMock mode="topic" />,
+    },
+    {
+      value: 'never', icon: MODE_GLYPHS.loud, name: tr('botDefaults.mentionModeNever'),
+      description: tr('botDefaults.mentionNeverDesc'),
+      tags: tags2('botDefaults.mentionNeverTag1', 'botDefaults.mentionNeverTag2'),
+      mock: <MentionMock mode="never" />,
+    },
+    {
+      value: 'ambient', icon: MODE_GLYPHS.yield, name: tr('botDefaults.mentionModeAmbient'),
+      description: tr('botDefaults.mentionAmbientDesc'),
+      tags: tags2('botDefaults.mentionAmbientTag1', 'botDefaults.mentionAmbientTag2'),
+      mock: <MentionMock mode="ambient" />,
+    },
   ];
   const docOptions: DropdownFieldOption<string>[] = [
     { value: 'mention-only', label: tr('botDefaults.docSubscribeModeMention'), hint: tr('botDefaults.docSubscribeModeMentionHint') },
@@ -5184,16 +5243,13 @@ function SessionModeSection(props: {
       <div className="bd-row">
         <div className="bd-field">
           <FieldTitle help={tr('botDefaults.p2pHelp')}>{tr('botDefaults.p2pMode')}</FieldTitle>
-          <DropdownField<'thread' | 'chat' | 'group'>
+          <ModeCardPicker<'thread' | 'chat' | 'group'>
             dataInput="p2pMode"
             ariaLabel={tr('botDefaults.p2pMode')}
             value={p2p}
             disabled={busy === 'p2p'}
             options={p2pOptions}
             onChange={next => void saveP2p(next)}
-            onOptionPreview={setP2pPreview}
-            onPreviewEnd={() => setP2pPreview(null)}
-            preview={<P2pModeDiagram mode={p2pPreview ?? p2p} />}
           />
         </div>
         <div className="actions"><StatusSpan status={p2pStatus} attr={{ 'data-p2p-status': '' }} /></div>
@@ -5202,7 +5258,7 @@ function SessionModeSection(props: {
       <div className="bd-row">
         <div className="bd-field">
           <FieldTitle help={tr('botDefaults.regularGroupModeHelp')}>{tr('botDefaults.regularGroupMode')}</FieldTitle>
-          <DropdownField
+          <ModeCardPicker
             dataInput="regularGroupMode"
             ariaLabel={tr('botDefaults.regularGroupMode')}
             value={regular}
@@ -5212,9 +5268,6 @@ function SessionModeSection(props: {
               setRegular(next);
               void saveCardMode('regular', { regularGroupReplyMode: next }, setRegularStatus);
             }}
-            onOptionPreview={setRegularPreview}
-            onPreviewEnd={() => setRegularPreview(null)}
-            preview={<RegularGroupModeDiagram mode={(regularPreview ?? regular) as 'chat' | 'chat-topic' | 'new-topic' | 'shared'} />}
           />
         </div>
         <div className="actions"><StatusSpan status={regularStatus} attr={{ 'data-regular-group-status': '' }} /></div>
@@ -5222,7 +5275,7 @@ function SessionModeSection(props: {
       <div className="bd-row">
         <div className="bd-field">
           <FieldTitle help={tr('botDefaults.mentionModeHelp')}>{tr('botDefaults.mentionMode')}</FieldTitle>
-          <DropdownField
+          <ModeCardPicker
             dataInput="regularGroupMentionMode"
             ariaLabel={tr('botDefaults.mentionMode')}
             value={mention}
@@ -5232,9 +5285,6 @@ function SessionModeSection(props: {
               setMention(next);
               void saveCardMode('mention', { regularGroupMentionMode: next }, setMentionStatus);
             }}
-            onOptionPreview={setMentionPreview}
-            onPreviewEnd={() => setMentionPreview(null)}
-            preview={<MentionModeDiagram mode={(mentionPreview ?? mention) as 'always' | 'topic' | 'never' | 'ambient'} />}
           />
         </div>
         <div className="actions"><StatusSpan status={mentionStatus} attr={{ 'data-mention-mode-status': '' }} /></div>
