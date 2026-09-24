@@ -44,9 +44,9 @@ import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
 import { createMirAdapter } from '../src/adapters/cli/mir.js';
 import { createTraexAdapter, traexNativeSubagentHookConfig } from '../src/adapters/cli/traex.js';
-import { createPiAdapter, buildPiArgs, piTurnBoundaryExtensionPath } from '../src/adapters/cli/pi.js';
+import { createPiAdapter, buildPiArgs, piTurnBoundaryExtensionPath, PI_PLUGIN_DIR, PI_BUILTIN_SKILLS_DIR } from '../src/adapters/cli/pi.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
-import { createOhMyPiAdapter, ompSessionDir } from '../src/adapters/cli/oh-my-pi.js';
+import { createOhMyPiAdapter, ompSessionDir, OMP_PLUGIN_DIR } from '../src/adapters/cli/oh-my-pi.js';
 import { assertEbsdPerBotEnv, createEbsdAdapter, ebsdBotmuxSessionDir } from '../src/adapters/cli/ebsd.js';
 import { createKimiAdapter } from '../src/adapters/cli/kimi.js';
 import { createGrokAdapter } from '../src/adapters/cli/grok.js';
@@ -1973,11 +1973,10 @@ describe('pi buildArgs', () => {
       nativeSessionTitle: '  [BotMux·Lark] Fix login flow  ',
       initialPrompt: 'hello pi',
     });
-    expect(args.slice(2)).toEqual([
-      '--session-id', 'sess-pi',
-      '--name', '[BotMux·Lark] Fix login flow',
-      'hello pi',
-    ]);
+    const nameIdx = args.indexOf('--name');
+    expect(nameIdx).toBeGreaterThanOrEqual(0);
+    expect(args[nameIdx + 1]).toBe('[BotMux·Lark] Fix login flow');
+    expect(args.at(-1)).toBe('hello pi');
     expect(adapter.buildSessionRenameCommand?.('Renamed in Botmux')).toBe('/name Renamed in Botmux');
   });
 
@@ -2022,14 +2021,53 @@ describe('pi buildArgs', () => {
       resume: false,
       model: 'custom/long-context-model',
     });
-    // Exact argv, minus the extension pair asserted by its own case above:
-    // keeps this case about the model flag while still proving nothing else
-    // crept into the launch line.
-    expect(args.slice(2)).toEqual([
-      '--session-id', 'sess-pi',
-      '--model', 'custom/long-context-model',
-    ]);
+    const modelIdx = args.indexOf('--model');
+    expect(modelIdx).toBeGreaterThanOrEqual(0);
+    expect(args[modelIdx + 1]).toBe('custom/long-context-model');
     expect(args[0]).toBe('--extension');
+  });
+
+  it('injects session context and builtin skills via --append-system-prompt and --skill', () => {
+    expect(adapter.injectsSessionContext).toBe(true);
+    expect(adapter.pluginDir).toBe(PI_PLUGIN_DIR);
+    expect(adapter.skillDelivery).toEqual({
+      nativeKind: 'skill-root',
+      supportsScopedSession: true,
+      supportsExclusive: false,
+    });
+
+    const args = adapter.buildArgs({
+      sessionId: 'sess-pi',
+      resume: false,
+      botName: 'TestBot',
+      botOpenId: 'ou_bot123',
+      initialPrompt: 'first message',
+    });
+
+    const skillIdx = args.indexOf('--skill');
+    expect(skillIdx).toBeGreaterThanOrEqual(0);
+    expect(args[skillIdx + 1]).toBe(PI_BUILTIN_SKILLS_DIR);
+
+    const promptIdx = args.indexOf('--append-system-prompt');
+    expect(promptIdx).toBeGreaterThanOrEqual(0);
+    expect(args[promptIdx + 1]).toContain('<botmux_routing>');
+    expect(args[promptIdx + 1]).toContain('TestBot');
+    expect(args[promptIdx + 1]).toContain('ou_bot123');
+
+    // Initial prompt must land at the very end
+    expect(args.at(-1)).toBe('first message');
+  });
+
+  it('mounts scoped session skills directory via --skill when skillPluginDir is provided', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-pi',
+      resume: false,
+      skillPluginDir: '/tmp/session-skills/skills',
+    });
+
+    const skillArgs = args.flatMap((arg, i) => arg === '--skill' ? [args[i + 1]] : []);
+    expect(skillArgs).toContain(PI_BUILTIN_SKILLS_DIR);
+    expect(skillArgs).toContain('/tmp/session-skills/skills');
   });
 });
 
@@ -2072,6 +2110,37 @@ describe('oh-my-pi buildArgs', () => {
   it('does not include --session-id (oh-my-pi has none)', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-omp', resume: false });
     expect(args).not.toContain('--session-id');
+  });
+
+  it('injects session context and builtin skills via --append-system-prompt and --plugin-dir', () => {
+    expect(adapter.injectsSessionContext).toBe(true);
+    expect(adapter.pluginDir).toBe(OMP_PLUGIN_DIR);
+    expect(adapter.skillDelivery).toEqual({
+      nativeKind: 'claude-plugin',
+      supportsScopedSession: true,
+      supportsExclusive: false,
+    });
+
+    const args = adapter.buildArgs({
+      sessionId: 'sess-omp',
+      resume: false,
+      botName: 'omp-bot',
+      botOpenId: 'ou_omp123',
+      locale: 'zh',
+      skillPluginDir: '/tmp/session-skills/claude-plugin',
+    });
+
+    const pluginIdx = args.indexOf('--plugin-dir');
+    expect(pluginIdx).toBeGreaterThanOrEqual(0);
+    expect(args[pluginIdx + 1]).toBe(OMP_PLUGIN_DIR);
+    const pluginArgs = args.flatMap((arg, i) => arg === '--plugin-dir' ? [args[i + 1]] : []);
+    expect(pluginArgs).toContain(OMP_PLUGIN_DIR);
+    expect(pluginArgs).toContain('/tmp/session-skills/claude-plugin');
+
+    const promptIdx = args.indexOf('--append-system-prompt');
+    expect(promptIdx).toBeGreaterThanOrEqual(0);
+    expect(args[promptIdx + 1]).toContain('omp-bot');
+    expect(args[promptIdx + 1]).toContain('ou_omp123');
   });
 
   it('rejects path-like session ids instead of escaping the managed OMP root', () => {
@@ -3200,6 +3269,16 @@ describe('systemHints', () => {
     expect(createMiraAdapter().modelChoices).toBeUndefined();
   });
 
+  it('pi has empty systemHints (uses --append-system-prompt instead)', () => {
+    expect(createPiAdapter('/bin/pi').systemHints).toEqual([]);
+    expect(createPiAdapter('/bin/pi').injectsSessionContext).toBe(true);
+  });
+
+  it('oh-my-pi has empty systemHints (uses --append-system-prompt instead)', () => {
+    expect(createOhMyPiAdapter('/bin/omp').systemHints).toEqual([]);
+    expect(createOhMyPiAdapter('/bin/omp').injectsSessionContext).toBe(true);
+  });
+
   const nonClaudeAdapters: Array<[string, () => CliAdapter]> = [
     ['aiden', () => createAidenAdapter('/bin/aiden')],
     ['coco', () => createCocoAdapter('/bin/coco')],
@@ -3209,7 +3288,6 @@ describe('systemHints', () => {
     ['antigravity', () => createAntigravityAdapter('/bin/agy')],
     ['mtr', () => createMtrAdapter('/bin/mtr')],
     ['hermes', () => createHermesAdapter('/bin/hermes')],
-    ['pi', () => createPiAdapter('/bin/pi')],
     ['copilot', () => createCopilotAdapter('/bin/copilot')],
     ['kiro-cli', () => createKiroCliAdapter('/bin/kiro-cli')],
     ['reasonix', () => createReasonixAdapter('/bin/reasonix')],

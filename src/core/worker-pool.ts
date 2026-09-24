@@ -4693,18 +4693,23 @@ export function ensureCliEnv(cliId: CliId, cliPathOverride?: string): void {
   if (report.warning) logger.warn(`[mcp-gateway] ${cliId}: ${report.warning}`);
 }
 
-/** The user's global skills dir that botmux must NOT pollute (Claude now injects
- *  its skills per-session via `--plugin-dir`). Single source of truth for the
- *  path so the early once-pass and the post-restore re-sweep stay in sync. */
+/** Global skills dirs that botmux must NOT pollute because those CLIs now inject
+ *  skills dynamically per-session (Claude via `--plugin-dir`, Pi via `--skill`).
+ *  Single source of truth for the paths so the early once-pass and the
+ *  post-restore re-sweep stay in sync. */
 const GLOBAL_CLAUDE_SKILLS_DIR = '~/.claude/skills';
+const GLOBAL_PI_SKILLS_DIR = '~/.pi/agent/skills';
+const GLOBAL_OMP_SKILLS_DIR = '~/.omp/agent/skills';
 
 /** Unconditionally sweep botmux-owned skills out of the user's global
- *  `~/.claude/skills`. botmux owns the `botmux-` namespace there and injects its
- *  skills per-session via `--plugin-dir`, so anything matching is a leak that
- *  would otherwise surface (and mis-fire) in the user's standalone `claude`.
+ *  `~/.claude/skills`, `~/.pi/agent/skills`, and `~/.omp/agent/skills`. botmux owns the `botmux-` namespace
+ *  there and injects its skills per-session dynamically, so anything matching is a
+ *  leak that would otherwise surface (and mis-fire) in the user's standalone CLI.
  *  Idempotent & best-effort — safe to call repeatedly. */
 export function sweepGlobalBotmuxSkills(): void {
   removeGlobalBotmuxSkills(GLOBAL_CLAUDE_SKILLS_DIR);
+  removeGlobalBotmuxSkills(GLOBAL_PI_SKILLS_DIR);
+  removeGlobalBotmuxSkills(GLOBAL_OMP_SKILLS_DIR);
 }
 
 let globalBotmuxSkillsCleaned = false;

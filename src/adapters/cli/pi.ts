@@ -1,11 +1,13 @@
 import { existsSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { resolveCommand } from './registry.js';
-import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
+import { buildBotmuxSystemPromptText } from './shared-hints.js';
 import { preparePiInitialPromptArg } from './pi-initial-prompt.js';
 import type { CliAdapter, PtyHandle } from './types.js';
+import { GOAL_ENV } from '../../workflows/v3/contract.js';
 
 import { delay } from '../../utils/timing.js';
 
@@ -37,6 +39,13 @@ export function piTurnBoundaryExtensionPath(): string | undefined {
   return undefined;
 }
 
+/** botmux ships its built-in skills for Pi here and injects it per-session via
+ *  `--skill` (see buildArgs). Kept out of the global `~/.pi/agent/skills` so a
+ *  standalone `pi` never surfaces (and mis-fires) them. Single source of truth
+ *  for both the adapter's `pluginDir` field and the spawn-time flag. */
+export const PI_PLUGIN_DIR = join(homedir(), '.botmux', 'pi-skills');
+export const PI_BUILTIN_SKILLS_DIR = join(PI_PLUGIN_DIR, 'skills');
+
 /** Launch argv for Pi. Split out from `buildArgs` so the extension-missing
  *  branch is reachable in a test: that branch only happens inside a compiled
  *  binary, which no test executes, and it is the branch whose regression kills
@@ -48,6 +57,9 @@ export function buildPiArgs(opts: {
   nativeSessionTitle?: string;
   model?: string;
   turnBoundaryExtension: string | undefined;
+  builtinSkillsDir?: string;
+  skillPluginDir?: string;
+  appendSystemPrompt?: string;
 }): string[] {
   const args: string[] = [];
   // Pi's `stopReason:"error"` is a PER-REQUEST failure that its agent loop
@@ -60,6 +72,9 @@ export function buildPiArgs(opts: {
   args.push('--session-id', opts.sessionId);
   if (opts.nativeSessionTitle?.trim()) args.push('--name', opts.nativeSessionTitle.trim());
   if (opts.model?.trim()) args.push('--model', opts.model.trim());
+  if (opts.builtinSkillsDir) args.push('--skill', opts.builtinSkillsDir);
+  if (opts.skillPluginDir) args.push('--skill', opts.skillPluginDir);
+  if (opts.appendSystemPrompt) args.push('--append-system-prompt', opts.appendSystemPrompt);
   // Pi's interactive mode processes positional initial messages after TUI
   // startup, avoiding stdin races while keeping the native TUI visible.
   if (opts.initialPrompt) args.push(opts.initialPrompt);
@@ -142,15 +157,45 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.pi/agent/auth.json'],
     resolvedBin: bin,
 
-    buildArgs({ sessionId, initialPrompt, nativeSessionTitle, model }) {
+    buildArgs({
+      sessionId,
+      initialPrompt,
+      nativeSessionTitle,
+      model,
+      botName,
+      botOpenId,
+      locale,
+      noTransport,
+      triggerUserAuth,
+      replyDelivery,
+      solo,
+      skillPluginDir,
+    }) {
+      const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
+      const appendSystemPrompt = buildBotmuxSystemPromptText({
+        locale,
+        botName,
+        botOpenId,
+        noTransport,
+        triggerUserAuth,
+        replyDelivery: effectiveReplyDelivery,
+        solo,
+      });
       return buildPiArgs({
         sessionId,
         initialPrompt,
         nativeSessionTitle,
         model,
         turnBoundaryExtension: piTurnBoundaryExtensionPath(),
+        builtinSkillsDir: PI_BUILTIN_SKILLS_DIR,
+        skillPluginDir,
+        appendSystemPrompt,
       });
     },
+
+    injectsSessionContext: true,
+    pluginDir: PI_PLUGIN_DIR,
+    skillDelivery: { nativeKind: 'skill-root', supportsScopedSession: true, supportsExclusive: false },
 
     buildResumeCommand({ sessionId }) {
       return `pi --session-id ${sessionId}`;
@@ -203,7 +248,7 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
     // custom-terminate turn has no on-disk boundary — see the header for why
     // that stronger promise is unsafe (and why type-ahead does not need it).
     supportsTypeAhead: true,
-    systemHints: BOTMUX_SHELL_HINTS,
+    systemHints: [],
     altScreen: true,
     skillsDir: '~/.pi/agent/skills',
   };

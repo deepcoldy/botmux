@@ -50,6 +50,14 @@ describe('ensurePluginSkills', () => {
   it('pluginDir 为 undefined：直接跳过，不报错', () => {
     expect(() => ensurePluginSkills('claude-code', undefined)).not.toThrow();
   });
+
+  it('supports pi cliId and installs builtin skills into skills/<name>/SKILL.md', () => {
+    ensurePluginSkills('pi', dir);
+    for (const skill of BUILTIN_SKILLS) {
+      const skillFile = join(dir, 'skills', skill.name, 'SKILL.md');
+      expect(existsSync(skillFile)).toBe(true);
+    }
+  });
 });
 
 describe('removeGlobalBotmuxSkills', () => {

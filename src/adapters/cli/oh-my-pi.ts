@@ -3,12 +3,15 @@ import { realpathSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { resolveCommand } from './registry.js';
-import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from '../backend/critical-control-key.js';
+import { GOAL_ENV } from '../../workflows/v3/contract.js';
+import { buildBotmuxSystemPromptText } from './shared-hints.js';
 
 import { findLatestJsonl } from '../../services/claude-transcript.js';
 import { delay } from '../../utils/timing.js';
+
+export const OMP_PLUGIN_DIR = join(homedir(), '.botmux', 'omp-plugin');
 
 const OMP_INPUT_CHUNK_CHARS = 512;
 const OMP_INPUT_CHUNK_NEWLINES = 9;
@@ -147,7 +150,21 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
     // as positional launch args: OMP deposits those in the TUI composer but
     // does not auto-submit them. Route prompts through writeInput, where botmux
     // controls the final submit key.
-    buildArgs({ sessionId, resume, model, workingDir, disableCliBypass }) {
+    buildArgs({
+      sessionId,
+      resume,
+      model,
+      workingDir,
+      disableCliBypass,
+      locale,
+      botName,
+      botOpenId,
+      replyDelivery,
+      triggerUserAuth,
+      noTransport,
+      solo,
+      skillPluginDir,
+    }) {
       const sessionDir = ompSessionDir(sessionId);
       const args = ['--no-title'];
       if (resume) {
@@ -160,8 +177,24 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
       }
       if (model?.trim()) args.push('--model', model.trim());
       if (workingDir) args.push('--cwd', workingDir);
+      args.push('--plugin-dir', OMP_PLUGIN_DIR);
+      if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
+      const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
+      args.push('--append-system-prompt', buildBotmuxSystemPromptText({
+        locale,
+        botName,
+        botOpenId,
+        noTransport,
+        triggerUserAuth,
+        replyDelivery: effectiveReplyDelivery,
+        solo,
+      }));
       return args;
     },
+
+    injectsSessionContext: true,
+    pluginDir: OMP_PLUGIN_DIR,
+    skillDelivery: { nativeKind: 'claude-plugin', supportsScopedSession: true, supportsExclusive: false },
 
     // OMP positional prompts are not an auto-submit channel; stdin injection is
     // the reliable path.
@@ -219,7 +252,7 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
     readyPattern: undefined,
     busyPattern: /Working(?:\.\.\.|…)/,
     supportsTypeAhead: true,
-    systemHints: BOTMUX_SHELL_HINTS,
+    systemHints: [],
     altScreen: true,
     skillsDir: '~/.omp/agent/skills',
   };
