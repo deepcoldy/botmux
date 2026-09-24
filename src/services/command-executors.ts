@@ -85,6 +85,22 @@ export interface CommandExecutorRegistry {
   executors: Map<string, ProcessCommandExecutor>;
 }
 
+export interface CommandExecutorAuthoringSchema {
+  id: string;
+  arguments: Array<{
+    name: string;
+    type: CommandExecutorArgument['type'];
+    required: boolean;
+    accepts: ExecutorArgumentSource[];
+    pattern?: string;
+    maxLength?: number;
+    min?: number;
+    max?: number;
+    values?: Array<string | number>;
+    default?: string | number;
+  }>;
+}
+
 export interface ResolvedExecutorInput {
   value: string | number;
   source: ExecutorArgumentSource;
@@ -425,6 +441,32 @@ export function resolveCommandExecutor(executorId: string): ProcessCommandExecut
   const executor = loadCommandExecutorRegistry().executors.get(executorId);
   if (!executor) throw new CommandExecutorError('executor_not_found', `执行器白名单中不存在：${executorId}`);
   return executor;
+}
+
+/**
+ * Model-safe, read-only authoring view. Deliberately excludes executable
+ * paths, fixed arguments, artifact paths/digests, output projection and
+ * registry location; callers receive only the public input contract needed to
+ * draft a compatible Frozen Command definition.
+ */
+export function listCommandExecutorAuthoringSchemas(): CommandExecutorAuthoringSchema[] {
+  return [...loadCommandExecutorRegistry().executors.values()]
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .map(executor => ({
+      id: executor.id,
+      arguments: Object.entries(executor.arguments).map(([name, argument]) => ({
+        name,
+        type: argument.type,
+        required: argument.required,
+        accepts: [...argument.accepts],
+        ...(argument.pattern === undefined ? {} : { pattern: argument.pattern }),
+        ...(argument.maxLength === undefined ? {} : { maxLength: argument.maxLength }),
+        ...(argument.min === undefined ? {} : { min: argument.min }),
+        ...(argument.max === undefined ? {} : { max: argument.max }),
+        ...(argument.values === undefined ? {} : { values: [...argument.values] }),
+        ...(argument.default === undefined ? {} : { default: argument.default }),
+      })),
+    }));
 }
 
 export function verifyCommandExecutorArtifacts(executor: ProcessCommandExecutor): void {

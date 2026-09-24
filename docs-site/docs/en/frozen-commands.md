@@ -9,12 +9,15 @@ Frozen commands turn a verified query or read-only script into a slash command. 
 - Permanent revocation requires the command to be retired first and always requires a `frozenCommandAdmins` administrator.
 - Create, update, retire, restore, and revoke operations all require a reason between 1 and 500 characters.
 - In a group chat, mention the target bot. This also applies to administrative commands such as `/freeze list`.
+- When a bot enables `restrictGrantCommands`, visitors who can chat only through `chatGrants` or `globalGrants` cannot use `/freeze` or installed frozen commands. The restriction also covers natural-language direct execution and non-ASCII command names. Owners, `allowedUsers`, on-call users, and full-chat members keep their existing permission behavior.
 
-Live definitions are stored in `<working-directory>/.botmux/commands/*.yaml`; drafts use `<working-directory>/.botmux/frozen-command-drafts/*.yaml`. These files may contain business SQL. The botmux source repository ignores both paths at its root; add the same rules to other working repositories. Copy sanitized definitions to a dedicated, access-controlled configuration repository if versioning is required.
+Live definitions are stored in `<working-directory>/.botmux/commands/*.yaml`; drafts use `<working-directory>/.botmux/frozen-command-drafts/*.yaml`. These files may contain business SQL. The botmux source repository ignores both paths at any directory depth; add the same rules to other working repositories. Copy sanitized definitions to a dedicated, access-controlled configuration repository if versioning is required.
 
 ## Administrator executor allowlist
 
 Data MCP queries use the built-in `builtin.data-mcp.readonly` executor. To freeze `lark-cli` or a custom script, an administrator must create `~/.botmux/command-executors.yaml`. If the file is absent, the registry is empty and every process/script command is disabled by default.
+
+During a trusted human turn, an agent may call `botmux freeze executors` for the read-only authoring contract. The response contains only executor ids and argument names, types, accepted sources, and constraints; it excludes executable paths, fixed arguments, and artifact paths/digests. Candidate definitions are checked against this complete contract before a confirmation card can be shown.
 
 Paths must be absolute canonical realpaths, not symlinks. Entry scripts listed in `scriptArtifacts` are hashed again before each run.
 
@@ -57,4 +60,4 @@ Security boundaries:
 
 ## Scheduling
 
-Ask the human to send `/schedule <rule>, run /<command> [args]` so the task stores a trusted creator identity. Silent schedules suppress normal successful output only; identity, approval-state, retirement, and execution errors are still delivered.
+Ask the human to send the canonical form `/schedule <rule> /<command> [args]` so the task stores a trusted creator identity. Creation verifies that the command exists, is approved, accepts the arguments, and is schedulable, then persists the exact `/command args` form. The older `, run /<command>` wording remains compatible for existing tasks. Silent schedules suppress normal successful output only; identity, approval-state, retirement, and execution errors are still delivered.

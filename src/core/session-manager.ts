@@ -104,6 +104,7 @@ import { readGroupCollaborationMode } from '../services/group-collaboration-mode
 import {
   executeFrozenCommand,
   lookupFrozenCommand,
+  parseScheduledFrozenCommandInvocation,
   resolveFrozenCommandScheduledOutput,
   userFacingFrozenCommandError,
 } from '../services/frozen-command.js';
@@ -4115,17 +4116,17 @@ export async function executeScheduledTask(
   // or conditional-output error fail closed: a frozen command literal must
   // never fall through to the model as an ordinary prompt.
   let frozenHandoffPrompt: string | undefined;
-  const frozenInvocation = /^\/([^\s]+)(?:\s+([\s\S]*))?$/u.exec(task.prompt.trim());
+  const frozenInvocation = parseScheduledFrozenCommandInvocation(task.prompt);
   if (frozenInvocation) {
     const lifecycle = evaluateFrozenCommandLifecycle({
       dataDir: config.session.dataDir,
       targetBotId: larkAppId,
       workingDir: task.workingDir,
-      command: `/${frozenInvocation[1]!}`,
+      command: frozenInvocation.cmd,
     });
     const lookup = lookupFrozenCommand({
       workingDir: task.workingDir,
-      command: `/${frozenInvocation[1]!}`,
+      command: frozenInvocation.cmd,
     });
     const deliver = async (text: string): Promise<void> => {
       const replyRoot = sharedTopicRootId ?? (anchor === task.chatId ? undefined : anchor);
@@ -4155,7 +4156,7 @@ export async function executeScheduledTask(
         return;
       }
       const definition = lookup.snapshot.definition;
-      const rawArgs = frozenInvocation[2] ?? '';
+      const rawArgs = frozenInvocation.commandContent.slice(frozenInvocation.cmd.length).trim();
       const invocationNow = new Date();
       try {
         const result = await executeFrozenCommand({
@@ -4193,7 +4194,7 @@ export async function executeScheduledTask(
               event: 'frozen_command_output_suppressed',
               task_id: task.id,
               task_name: task.name,
-              command: `/${frozenInvocation[1]!}`,
+              command: frozenInvocation.cmd,
               suppressed: 'success_output',
               reason: 'silent_schedule',
             })}`);

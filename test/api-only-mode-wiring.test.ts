@@ -866,8 +866,9 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // bot as `'user'`, i.e. it vouches for a bot turn as a person.
     const trustedCallerArgs = [...daemonSource.matchAll(/trustedCallerForTurn\(([^;]*?)\);/g)]
       .map(m => m[1].split(',').map(part => part.trim()));
-    // handleNewTopic, principal-lane live suggestion, and handleThreadReply.
-    expect(trustedCallerArgs.length).toBe(3);
+    // Frozen-command direct execution, handleNewTopic, principal-lane live
+    // suggestion, and handleThreadReply.
+    expect(trustedCallerArgs.length).toBe(4);
     for (const args of trustedCallerArgs) {
       expect(args.length).toBeGreaterThanOrEqual(4);
       const senderTypeArg = args.slice(3).join(', ');

@@ -431,6 +431,26 @@ describe('executeScheduledTask — silent thread fire', () => {
     }
   });
 
+  it('executes an existing task stored with the legacy comma-plus-run wording without starting a model', async () => {
+    const fixture = installScheduledFrozenFixture(SCHEDULED_FROZEN_YAML);
+    try {
+      await executeScheduledTask(baseTask({
+        prompt: '，执行 /泰国上账 30',
+        workingDir: fixture.root,
+        rootMessageId: ROOT,
+        scope: 'thread',
+        ownerOpenId: 'ou_test',
+        ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+      expect(sendWorkerInputMock).not.toHaveBeenCalled();
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).toBe('12');
+    } finally {
+      fixture.restore();
+    }
+  });
+
   it('rejects an unapproved frozen command even for a silent schedule', async () => {
     const fixture = installScheduledFrozenFixture(SCHEDULED_FROZEN_YAML, { approve: false });
     try {

@@ -56,6 +56,31 @@ export function parseNaturalLanguageFrozenCommandInvocation(
   };
 }
 
+/**
+ * Parse the exact prompt shape accepted by a scheduled Frozen Command.
+ *
+ * New tasks persist the canonical `/command args` form. The optional leading
+ * punctuation + run verb exists only to consume tasks created from the older
+ * documented `/schedule <rule>，执行 /command` wording. Keep this parser
+ * deliberately narrower than prose: scheduled prompts that discuss a command
+ * must continue through the normal model path instead of being executed.
+ */
+export function parseScheduledFrozenCommandInvocation(
+  content: string,
+): NaturalLanguageFrozenCommandInvocation | undefined {
+  const trimmed = content.trim();
+  if (!trimmed || /\r|\n/u.test(trimmed)) return undefined;
+  const direct = /^(\/[\p{L}\p{N}_-]+)(?![\p{L}\p{N}_\/-])(?:\s+([\s\S]+?))?$/u.exec(trimmed);
+  if (direct) {
+    const cmd = direct[1]!.toLowerCase();
+    const rawArgs = (direct[2] ?? '').trim();
+    return { cmd, commandContent: rawArgs ? `${cmd} ${rawArgs}` : cmd };
+  }
+  const compatibility = trimmed.replace(/^[,，、:：]\s*/u, '');
+  if (/(?:[\s,，]+(?:然后|并且|再)|[\s,，]+and\s+then\b)/iu.test(compatibility)) return undefined;
+  return parseNaturalLanguageFrozenCommandInvocation(compatibility);
+}
+
 const COMMAND_NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N}_-]{0,63}$/u;
 const PARAM_NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 const PLACEHOLDER_RE = /\{\{\s*([A-Za-z][A-Za-z0-9_]*)\s*\}\}/g;
@@ -207,8 +232,124 @@ export type FrozenCommandLookup =
 export function frozenCommandExecutorRevision(definition: FrozenCommandDefinition): string {
   if (definition.executor === BUILTIN_DATA_MCP_EXECUTOR_ID) return BUILTIN_DATA_MCP_EXECUTOR_REVISION;
   try {
-    return resolveCommandExecutor(definition.executor).revision;
+    const executor = resolveCommandExecutor(definition.executor);
+    assertFrozenCommandExecutorContract(definition, executor);
+    return executor.revision;
   } catch (error) {
+    if (error instanceof CommandExecutorError) throw new FrozenCommandError(error.code, error.message);
+    throw error;
+  }
+}
+
+function executorContractError(message: string): never {
+  throw new FrozenCommandError('definition_executor_contract', `命令定义与执行器参数契约不兼容：${message}`);
+}
+
+function assertLiteralExecutorValue(
+  name: string,
+  value: string | number | boolean,
+  schema: import('./command-executors.js').CommandExecutorArgument,
+): void {
+  if (schema.type === 'integer') {
+    if (!Number.isSafeInteger(value) || (value as number) < schema.min! || (value as number) > schema.max!) {
+      executorContractError(`input.${name} 必须是 ${schema.min}-${schema.max} 的整数`);
+    }
+    return;
+  }
+  if (schema.type === 'enum') {
+    if (!schema.values!.some(candidate => candidate === value)) {
+      executorContractError(`input.${name} 不在执行器允许枚举中`);
+    }
+    return;
+  }
+  if (typeof value !== 'string') executorContractError(`input.${name} 必须是字符串`);
+  if (value.length > schema.maxLength! || value.includes('\0')) {
+    executorContractError(`input.${name} 超过执行器长度上限 ${schema.maxLength}`);
+  }
+  if (schema.pattern && !new RegExp(schema.pattern, 'u').test(value)) {
+    executorContractError(`input.${name} 不符合执行器格式约束`);
+  }
+}
+
+function assertParameterExecutorContract(
+  inputName: string,
+  parameter: FrozenCommandParameter,
+  schema: import('./command-executors.js').CommandExecutorArgument,
+): void {
+  if (parameter.type === 'integer') {
+    if (schema.type !== 'integer') executorContractError(`input.${inputName} 的参数类型应为 integer`);
+    if (parameter.min < schema.min! || parameter.max > schema.max!) {
+      executorContractError(`input.${inputName} 的范围 ${parameter.min}-${parameter.max} 超出执行器 ${schema.min}-${schema.max}`);
+    }
+    return;
+  }
+  if (parameter.type === 'enum') {
+    if (schema.type !== 'enum') executorContractError(`input.${inputName} 的参数类型应为 enum`);
+    const unsupported = parameter.values.filter(value => !schema.values!.some(candidate => candidate === value));
+    if (unsupported.length > 0) executorContractError(`input.${inputName} 含执行器不接受的枚举值`);
+    return;
+  }
+  if (schema.type !== 'string') executorContractError(`input.${inputName} 的参数类型应为 string`);
+  const maxLength = parameter.type === 'date' ? 10 : parameter.maxLength;
+  if (maxLength > schema.maxLength!) {
+    executorContractError(`input.${inputName} 的长度上限 ${maxLength} 超出执行器 ${schema.maxLength}`);
+  }
+  if (schema.pattern) {
+    if (parameter.type === 'date') {
+      const pattern = new RegExp(schema.pattern, 'u');
+      if (!pattern.test('2000-01-01') || !pattern.test('2099-12-31')) {
+        executorContractError(`input.${inputName} 的 date 范围不满足执行器格式约束`);
+      }
+    } else if (parameter.pattern !== schema.pattern) {
+      executorContractError(`input.${inputName} 的 pattern 必须与执行器一致`);
+    }
+  }
+}
+
+/** Validate every possible command input before an approval/restore can be staged. */
+export function assertFrozenCommandExecutorContract(
+  definition: FrozenCommandDefinition,
+  executor = resolveCommandExecutor(definition.executor),
+): void {
+  const configured = new Set(Object.keys(definition.input));
+  const unknown = [...configured].filter(name => !Object.hasOwn(executor.arguments, name));
+  if (unknown.length > 0) executorContractError(`执行器不接受 input：${unknown.join(', ')}`);
+  for (const [name, schema] of Object.entries(executor.arguments)) {
+    if (!configured.has(name)) {
+      if (schema.required && schema.default === undefined) executorContractError(`缺少 required input：${name}`);
+      continue;
+    }
+    const value = definition.input[name]!;
+    const placeholder = typeof value === 'string' ? INPUT_PLACEHOLDER_RE.exec(value) : null;
+    if (!placeholder) {
+      if (!schema.accepts.includes('literal')) executorContractError(`input.${name} 不接受 literal 来源`);
+      assertLiteralExecutorValue(name, value, schema);
+      continue;
+    }
+    const sourceName = placeholder[1]!;
+    if (sourceName.includes('.') || sourceName === 'today' || sourceName === 'now') {
+      const source = `context:${sourceName}` as ExecutorArgumentSource;
+      if (!schema.accepts.includes(source)) executorContractError(`input.${name} 不接受 ${source} 来源`);
+      if (schema.type !== 'string') executorContractError(`input.${name} 的上下文值必须由 string 参数接收`);
+      continue;
+    }
+    if (!schema.accepts.includes('param')) executorContractError(`input.${name} 不接受 param 来源`);
+    const parameter = definition.params.find(item => item.name === sourceName);
+    if (!parameter) executorContractError(`input.${name} 引用了未声明参数 ${sourceName}`);
+    assertParameterExecutorContract(name, parameter, schema);
+  }
+}
+
+export function assertFrozenCommandSchedulable(definition: FrozenCommandDefinition): void {
+  if (definition.executor === BUILTIN_DATA_MCP_EXECUTOR_ID) return;
+  try {
+    const executor = resolveCommandExecutor(definition.executor);
+    assertFrozenCommandExecutorContract(definition, executor);
+    if (!executor.policy.schedulable) {
+      throw new FrozenCommandError('executor_schedule_denied', `执行器 ${executor.id} 不允许用于定时任务`);
+    }
+  } catch (error) {
+    if (error instanceof FrozenCommandError) throw error;
     if (error instanceof CommandExecutorError) throw new FrozenCommandError(error.code, error.message);
     throw error;
   }

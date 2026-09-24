@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -545,7 +545,7 @@ function seedLegacyPendingRun(ds: any, rawArgs = '11'): {
 async function postHostIntent(
   ds: any,
   input: {
-    operation?: 'list' | 'run' | 'approve' | 'retire' | 'restore' | 'revoke';
+    operation?: 'list' | 'executors' | 'run' | 'approve' | 'retire' | 'restore' | 'revoke';
     rawArgs?: string;
     turnId?: string;
     reason?: string;
@@ -561,7 +561,7 @@ async function postHostIntent(
     operation,
     ...(operation === 'run'
       ? { command: COMMAND, rawArgs: input.rawArgs ?? '11' }
-      : operation === 'list'
+      : operation === 'list' || operation === 'executors'
         ? {}
         : {
             command: input.command ?? COMMAND,
@@ -688,6 +688,7 @@ afterEach(() => {
   modules?.daemon.__testOnly_activeSessions.clear();
   modules?.workerPool.setActiveSessionsRegistry(undefined);
   delete process.env.SESSION_DATA_DIR;
+  delete process.env.BOTMUX_COMMAND_EXECUTORS_FILE;
   if (root) rmSync(root, { recursive: true, force: true });
 });
 
@@ -716,6 +717,48 @@ describe('Frozen Command host-owned route → callback → Data MCP flow', () =>
       operation: 'list',
       definitionYaml: YAML,
     })).toBeUndefined();
+    expect(modules.daemon.__testOnly_parseFrozenCommandIntentBody({
+      ...base,
+      operation: 'executors',
+    })).toMatchObject({ operation: 'executors' });
+  });
+
+  it('returns only safe executor authoring fields and does not create a card', async () => {
+    const script = join(root, 'safe-executor.mjs');
+    const registry = join(root, 'command-executors.yaml');
+    writeFileSync(script, 'console.log(JSON.stringify({value:"ok"}));\n');
+    const canonicalScript = realpathSync(script);
+    writeFileSync(registry, `
+schemaVersion: 1
+executors:
+  - id: test.safe
+    kind: script
+    executable: { realpath: ${JSON.stringify(process.execPath)} }
+    fixedArgs: [${JSON.stringify(canonicalScript)}]
+    scriptArtifacts: [${JSON.stringify(canonicalScript)}]
+    arguments:
+      value: { type: string, required: true, maxLength: 32, accepts: [param] }
+    policy: { risk: read, schedulable: true, allowHandoff: false, timeoutMs: 5000, maxOutputBytes: 65536 }
+    output: { format: json, exposeFields: [value] }
+`);
+    process.env.BOTMUX_COMMAND_EXECUTORS_FILE = registry;
+    const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '查看执行器参数契约' });
+    const response = await postHostIntent(ds, { operation: 'executors' });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.payload).toMatchObject({
+      status: 'listed',
+      operation: 'executors',
+      executors: [{
+        id: 'test.safe',
+        arguments: [{ name: 'value', type: 'string', required: true, maxLength: 32, accepts: ['param'] }],
+      }],
+    });
+    const serialized = JSON.stringify(response.payload);
+    for (const hidden of ['realpath', 'fixedArgs', 'scriptArtifacts', 'sha256', script]) {
+      expect(serialized).not.toContain(hidden);
+    }
+    expect(mocks.cardBodies).toHaveLength(0);
   });
 
   it('executes an exact natural-language command in a new topic without creating a CLI session or card', async () => {

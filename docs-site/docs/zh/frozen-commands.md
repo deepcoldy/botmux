@@ -9,12 +9,15 @@
 - 彻底撤销必须先废弃，且恒需 Bot 配置中的 `frozenCommandAdmins` 管理员执行。
 - 每次新建、更新、废弃、恢复和彻底撤销都必须提供 1～500 字原因。
 - 群聊中必须 @ 目标机器人；`/freeze list` 等管理命令也不例外。
+- Bot 启用 `restrictGrantCommands` 时，仅靠 `chatGrants` / `globalGrants` 获得普通对话权的访客不能使用 `/freeze` 管理入口或已安装命令；自然语言直达和非 ASCII 命令名同样受限。owner、`allowedUsers`、oncall 与整群成员按原权限模型执行。
 
-命令定义位于 `<工作目录>/.botmux/commands/*.yaml`，候选草稿位于 `<工作目录>/.botmux/frozen-command-drafts/*.yaml`。这两个目录可能包含业务 SQL；botmux 源码仓库已在根 `.gitignore` 中排除它们，其它业务仓库也应添加同样规则。如需版本化，应复制到经过脱敏和权限控制的专用配置仓。
+命令定义位于 `<工作目录>/.botmux/commands/*.yaml`，候选草稿位于 `<工作目录>/.botmux/frozen-command-drafts/*.yaml`。这两个目录可能包含业务 SQL；botmux 源码仓库会忽略任意子目录下的这两类路径，其它业务仓库也应添加同样规则。如需版本化，应复制到经过脱敏和权限控制的专用配置仓。
 
 ## 管理员执行器白名单
 
 Data MCP 查询使用宿主内建的 `builtin.data-mcp.readonly`，不需要登记外部执行器。要固化 `lark-cli` 或自有脚本，管理员必须先创建 `~/.botmux/command-executors.yaml`。文件不存在时注册表为空，所有 process/script 类固化命令默认不可用。
+
+Agent 可在当前真人消息轮次调用 `botmux freeze executors` 查看只读参数契约。返回内容只包含 executor id 与参数名、类型、来源和约束，不暴露可执行文件路径、固定参数或脚本制品路径/摘要。候选定义在弹出确认卡前会完整校验该契约；字段、必填项、类型、来源或约束不兼容时直接拒绝。
 
 下面是一个只读脚本执行器示例。路径必须是绝对 canonical realpath，不能是符号链接；`scriptArtifacts` 中的入口脚本会在每次执行前校验摘要。
 
@@ -59,4 +62,4 @@ executors:
 
 ## 定时执行
 
-让真人发送 `/schedule <规则>，执行 /<命令> [参数]`，以便任务保存可信创建者身份。静默任务只隐藏正常成功结果；身份缺失、命令未批准或已废弃、执行失败仍会通知。
+让真人发送 canonical 形式 `/schedule <规则> /<命令> [参数]`，以便任务保存可信创建者身份。宿主会在创建时确认命令真实存在、已批准、参数有效且允许定时执行，并把任务保存为精确的 `/命令 参数`；旧版文档中的 `，执行 /<命令>` 写法仍兼容已有任务。静默任务只隐藏正常成功结果；身份缺失、命令未批准或已废弃、执行失败仍会通知。

@@ -1,7 +1,7 @@
-import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { lookupFrozenCommand } from '../src/services/frozen-command.js';
 import {
   cancelFrozenCommandTransition,
@@ -61,10 +61,75 @@ function prepare(input: ReturnType<typeof setup>, action: 'retire' | 'restore' |
 }
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
 describe('Frozen Command lifecycle ledger', () => {
+  it('rejects an incompatible process executor contract before staging approval or restore', () => {
+    const root = join(tmpdir(), `botmux-frozen-contract-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    roots.push(root);
+    mkdirSync(root, { recursive: true });
+    const dataDir = join(root, 'data');
+    const script = join(root, 'executor.mjs');
+    const registry = join(root, 'executors.yaml');
+    writeFileSync(script, 'console.log(JSON.stringify({value:"ok"}));\n');
+    const canonicalScript = realpathSync(script);
+    const registryYaml = (maxLength: number) => `
+schemaVersion: 1
+executors:
+  - id: test.contract
+    kind: script
+    executable: { realpath: ${JSON.stringify(process.execPath)} }
+    fixedArgs: [${JSON.stringify(canonicalScript)}]
+    scriptArtifacts: [${JSON.stringify(canonicalScript)}]
+    arguments:
+      value:
+        type: string
+        required: true
+        maxLength: ${maxLength}
+        pattern: "^[a-z]+$"
+        accepts: [param]
+    policy: { risk: read, schedulable: true, allowHandoff: false, timeoutMs: 5000, maxOutputBytes: 65536 }
+    output: { format: json, exposeFields: [value] }
+`;
+    writeFileSync(registry, registryYaml(100));
+    vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', registry);
+    const candidate = `
+schemaVersion: 2
+name: contract
+description: contract test
+executor: test.contract
+params:
+  - { name: word, type: string, maxLength: 100, pattern: "^[a-z]+$" }
+input: { value: "{{word}}" }
+output: { text: "{{result.value}}" }
+onError: fail
+`;
+    writeFileSync(registry, registryYaml(32));
+    expect(() => prepareFrozenCommandTransition({
+      dataDir, targetBotId: BOT, workingDir: root, command: '/contract', action: 'approve',
+      actor: ACTOR, reason: 'reject incompatible approval', candidateYaml: candidate,
+    })).toThrowError(/长度上限 100.*执行器 32/);
+
+    writeFileSync(registry, registryYaml(100));
+    const approved = prepareFrozenCommandTransition({
+      dataDir, targetBotId: BOT, workingDir: root, command: '/contract', action: 'approve',
+      actor: ACTOR, reason: 'approve compatible definition', candidateYaml: candidate,
+    });
+    confirmFrozenCommandTransition({ dataDir, targetBotId: BOT, token: approved.token, actor: ACTOR });
+    const retired = prepareFrozenCommandTransition({
+      dataDir, targetBotId: BOT, workingDir: root, command: '/contract', action: 'retire',
+      actor: ACTOR, reason: 'retire before restore check',
+    });
+    confirmFrozenCommandTransition({ dataDir, targetBotId: BOT, token: retired.token, actor: ACTOR });
+    writeFileSync(registry, registryYaml(32));
+    expect(() => prepareFrozenCommandTransition({
+      dataDir, targetBotId: BOT, workingDir: root, command: '/contract', action: 'restore',
+      actor: ACTOR, reason: 'reject incompatible restore',
+    })).toThrowError(/长度上限 100.*执行器 32/);
+  });
+
   it('creates the live command directory only after candidate confirmation', () => {
     const root = join(tmpdir(), `botmux-frozen-create-${process.pid}-${Math.random().toString(36).slice(2)}`);
     roots.push(root);

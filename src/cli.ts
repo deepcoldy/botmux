@@ -13301,8 +13301,8 @@ async function cmdFreeze(rest: string[]): Promise<void> {
         : sub === 'purge'
           ? 'revoke'
           : undefined;
-  if (sub !== 'list' && sub !== 'run' && !lifecycleOperation) {
-    console.error('用法: botmux freeze list | run /<命令> [参数...] | apply /<命令> --file <草稿> --reason <原因> | rm|restore|purge /<命令> --reason <原因>');
+  if (sub !== 'list' && sub !== 'executors' && sub !== 'run' && !lifecycleOperation) {
+    console.error('用法: botmux freeze list | executors | run /<命令> [参数...] | apply /<命令> --file <草稿> --reason <原因> | rm|restore|purge /<命令> --reason <原因>');
     process.exitCode = 2;
     return;
   }

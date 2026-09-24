@@ -32,7 +32,7 @@ description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 bot
 2. **继续当前话题必须显式传 --topic** —— 群内省略执行位置会默认发到群顶层；在当前话题运行时可省略 --chat-id / --root-msg-id，由 botmux 推断话题锚点
 3. 创建后把 task id 和下次执行时间回显给用户
 4. 如果用户是在编程会话里顺手说"以后每天X点都这样做"，先问他：是否希望到点以后自动在当前话题里继续
-5. **已安装的固化查询是例外**：如果 prompt 是 \`/<固化命令> [参数]\`，不要代替用户执行 \`botmux schedule add\`。请让真人在飞书里直接发送原生 \`/schedule <规则>，执行 /<固化命令> [参数]\`；只有这个入口会记录任务创建人的可信 union_id。CLI 创建的任务没有这份身份，Data MCP 会按 fail-closed 拒绝。
+5. **已安装的固化查询是例外**：如果 prompt 是 \`/<固化命令> [参数]\`，不要代替用户执行 \`botmux schedule add\`。请让真人在飞书里直接发送 canonical 形式 \`/schedule <规则> /<固化命令> [参数]\`；只有这个入口会记录任务创建人的可信 union_id，并在创建时校验命令状态与参数。CLI 创建的任务没有这份身份，Data MCP 会按 fail-closed 拒绝。
 
 ## 支持的 schedule 格式
 
@@ -242,7 +242,7 @@ onError: fallback_llm
 
 ## 安装步骤
 
-1. Data MCP 场景从结构化工具记录提取最近一次成功的 validate/run SQL 原文、datasource 和样例结果；其它场景先确认目标 executor 已由管理员登记，且本次 input 只使用其允许的字段和来源。
+1. Data MCP 场景从结构化工具记录提取最近一次成功的 validate/run SQL 原文、datasource 和样例结果；其它场景先调用 \`botmux freeze executors\` 读取宿主提供的安全参数契约，再确认目标 executor 已登记且本次 input 满足其字段、必填项、类型、来源与约束。该命令不会返回 executable realpath、fixedArgs 或 scriptArtifacts 路径/摘要。
 2. 将常量中真正需要用户每次调整的值替换为 \`{{param}}\`；固定业务口径（例如国家=泰国）保持常量。
 3. 明确参数类型、顺序、默认值和上下界；确保 SQL 显式有 LIMIT/分区范围。
 4. 检查当前目录是否已有同名已生效命令，用于区分创建和更新；不要覆盖它。
@@ -278,7 +278,7 @@ onError: fallback_llm
 - \`/freeze purge /<命令> --reason <原因>\`：对已废弃命令发起不可逆撤销；确认后先提交 revoked 审计再删除 tombstone。
 - \`/freeze confirm <确认码>\`：仅供管理员排障旧卡，不向业务人员展示确认码。
 - 修改口径：重新跑通查询，再按本流程固化并覆盖旧文件。
-- 定时执行：让真人在飞书里直接发送 \`/schedule <规则>，执行 /<命令> [参数]\`。不要代替用户执行 \`botmux schedule add\`；后者不会记录创建人的可信 union_id，Data MCP 会按 fail-closed 拒绝。
+- 定时执行：让真人在飞书里直接发送 canonical 形式 \`/schedule <规则> /<命令> [参数]\`。不要代替用户执行 \`botmux schedule add\`；后者不会记录创建人的可信 union_id，Data MCP 会按 fail-closed 拒绝。
 - 静默定时只抑制任务开始横幅和正常成功结果；身份缺失、未批准、已废弃或执行失败等异常仍会主动通知，不能把 \`--silent\` 当成吞掉错误。
 `;
 

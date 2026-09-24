@@ -17,6 +17,15 @@ import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from 
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as scheduler from './scheduler.js';
+import {
+  assertFrozenCommandSchedulable,
+  FrozenCommandError,
+  lookupFrozenCommand,
+  normalizeFrozenCommandArguments,
+  parseScheduledFrozenCommandInvocation,
+  userFacingFrozenCommandError,
+} from '../services/frozen-command.js';
+import { evaluateFrozenCommandLifecycle } from '../services/frozen-command-lifecycle.js';
 import { scanProjects, scanMultipleProjects, describeProjectDir } from '../services/project-scanner.js';
 import { createRepoWorktree, pushWorktreeBranch, isLinkedWorktree, mainWorktreeFor, removeRepoWorktree, withWorktreeTargetLock, worktreeRootFor, worktreeSafetyStatus } from '../services/git-worktree.js';
 import { worktreeSlugFromContextAI } from '../services/worktree-slug-ai.js';
@@ -1075,7 +1084,49 @@ async function handleScheduleCommand(
     const workingDir = resolveScheduleWorkingDir(ds, chatId, larkAppId);
     const capturedScope: 'thread' | 'chat' = ds?.scope === 'chat' ? 'chat' : 'thread';
     const capturedRootMessageId = capturedScope === 'thread' ? rootId : undefined;
-    const { executionPosition: requestedPosition, silent, prompt: schedPrompt } = scheduler.extractScheduleModifiers(parsed.prompt);
+    const { executionPosition: requestedPosition, silent, prompt: extractedPrompt } = scheduler.extractScheduleModifiers(parsed.prompt);
+    let schedPrompt = extractedPrompt;
+    const frozenInvocation = parseScheduledFrozenCommandInvocation(extractedPrompt);
+    if (frozenInvocation) {
+      try {
+        if (!larkAppId) throw new FrozenCommandError('executor_identity_unavailable', '当前 Bot 身份不可用');
+        const lifecycle = evaluateFrozenCommandLifecycle({
+          dataDir: config.session.dataDir,
+          targetBotId: larkAppId,
+          workingDir,
+          command: frozenInvocation.cmd,
+        });
+        const lookup = lookupFrozenCommand({ workingDir, command: frozenInvocation.cmd });
+        if (lifecycle.kind !== 'active') {
+          throw new FrozenCommandError('definition_schedule_unavailable', lifecycle.kind === 'retired'
+            ? `固化命令 ${frozenInvocation.cmd} 已废弃`
+            : lifecycle.kind === 'revoked'
+              ? `固化命令 ${frozenInvocation.cmd} 已撤销`
+              : lifecycle.kind === 'fail_closed'
+                ? `固化命令 ${frozenInvocation.cmd} 状态异常，已拒绝创建定时任务`
+                : `固化命令 ${frozenInvocation.cmd} 尚未完成当前机器人批准`);
+        }
+        if (lookup.kind !== 'found') {
+          throw lookup.kind === 'invalid'
+            ? lookup.error
+            : new FrozenCommandError('definition_missing', `未找到固化命令 ${frozenInvocation.cmd}`);
+        }
+        assertFrozenCommandSchedulable(lookup.snapshot.definition);
+        normalizeFrozenCommandArguments({
+          definition: lookup.snapshot.definition,
+          rawArgs: frozenInvocation.commandContent.slice(frozenInvocation.cmd.length).trim(),
+        });
+        // Persist one canonical representation. The execution-side parser still
+        // accepts the older "，执行 /x" form for already-created tasks.
+        schedPrompt = frozenInvocation.commandContent;
+      } catch (error) {
+        await sessionReply(
+          rootId,
+          `固化命令定时任务创建失败：${userFacingFrozenCommandError(error)}`,
+        );
+        return;
+      }
+    }
     // Default to group top-level: a schedule created inside a topic (including
     // an adopted one) must not pin its results to that topic. NL 路径的
     // extractScheduleModifiers 只有 top-level/new-topic/task（独立话题/专属

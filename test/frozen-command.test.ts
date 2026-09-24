@@ -15,6 +15,7 @@ import {
   normalizeFrozenCommandName,
   normalizeFrozenCommandArguments,
   parseNaturalLanguageFrozenCommandInvocation,
+  parseScheduledFrozenCommandInvocation,
   renderFrozenCommandSql,
   resolveFrozenCommandScheduledOutput,
   shouldFallbackFrozenCommand,
@@ -84,6 +85,34 @@ describe('Frozen Commands definition and positional UX', () => {
     expect(parseNaturalLanguageFrozenCommandInvocation('示例：运行 /泰国上账 30')).toBeUndefined();
     expect(parseNaturalLanguageFrozenCommandInvocation('运行 /泰国上账 30\n- 另一个步骤')).toBeUndefined();
     expect(parseNaturalLanguageFrozenCommandInvocation('运行 /api/users')).toBeUndefined();
+  });
+
+  it('normalizes only exact scheduled frozen-command prompts', () => {
+    expect(parseScheduledFrozenCommandInvocation('/泰国上账 30')).toEqual({
+      cmd: '/泰国上账',
+      commandContent: '/泰国上账 30',
+    });
+    expect(parseScheduledFrozenCommandInvocation('，执行 /泰国上账 30')).toEqual({
+      cmd: '/泰国上账',
+      commandContent: '/泰国上账 30',
+    });
+    expect(parseScheduledFrozenCommandInvocation(', run /report 7')).toEqual({
+      cmd: '/report',
+      commandContent: '/report 7',
+    });
+    for (const prose of [
+      '1. 执行 /泰国上账 30',
+      '- 执行 /泰国上账 30',
+      '执行 /泰国上账 30\n再执行 /泰国上账 7',
+      '我们讨论一下怎么执行 /泰国上账 30',
+      '/usr/bin/foo',
+      '执行日报生成',
+      '请执行 /泰国上账 30',
+      '执行 /泰国上账 30 然后告诉我',
+      '，执行 /泰国上账 30，然后告诉我',
+    ]) {
+      expect(parseScheduledFrozenCommandInvocation(prose), prose).toBeUndefined();
+    }
   });
   it('accepts a Chinese command name and normalizes NFKC safely', () => {
     expect(normalizeFrozenCommandName('/泰国上账')).toBe('泰国上账');

@@ -133,6 +133,7 @@ import {
   shouldFallbackFrozenCommand,
   userFacingFrozenCommandError,
 } from './services/frozen-command.js';
+import { listCommandExecutorAuthoringSchemas } from './services/command-executors.js';
 import {
   cancelFrozenCommandTransition,
   confirmFrozenCommandTransition,
@@ -7633,7 +7634,7 @@ function frozenCommandCenterRows(
 interface FrozenCommandIntentBody {
   sessionId: string;
   larkAppId: string;
-  operation: 'list' | 'run' | 'approve' | 'retire' | 'restore' | 'revoke';
+  operation: 'list' | 'executors' | 'run' | 'approve' | 'retire' | 'restore' | 'revoke';
   command?: string;
   rawArgs?: string;
   reason?: string;
@@ -7656,7 +7657,7 @@ function parseFrozenCommandIntentBody(raw: unknown): FrozenCommandIntentBody | u
   const lifecycleOperations = new Set(['approve', 'retire', 'restore', 'revoke']);
   if (typeof value.sessionId !== 'string'
     || typeof value.larkAppId !== 'string'
-    || (value.operation !== 'list' && value.operation !== 'run' && !lifecycleOperations.has(String(value.operation)))
+    || (value.operation !== 'list' && value.operation !== 'executors' && value.operation !== 'run' && !lifecycleOperations.has(String(value.operation)))
     || typeof value.originTurnId !== 'string'
     || value.originTurnId.length === 0
     || (value.originDispatchAttempt !== undefined
@@ -7666,7 +7667,7 @@ function parseFrozenCommandIntentBody(raw: unknown): FrozenCommandIntentBody | u
       && typeof value.originCapability !== 'string')) return undefined;
   if (value.operation === 'run'
     && (typeof value.command !== 'string' || typeof value.rawArgs !== 'string')) return undefined;
-  if (value.operation === 'list'
+  if ((value.operation === 'list' || value.operation === 'executors')
     && [value.command, value.rawArgs, value.reason, value.replacement, value.definitionYaml]
       .some(item => item !== undefined)) return undefined;
   if (value.operation === 'run'
@@ -7757,6 +7758,27 @@ ipcRoute('POST', '/api/frozen-command-actions', async (req, res) => {
   // host request cannot recreate the removed confirmation-and-replay path.
   if (body.operation === 'run') {
     return jsonRes(res, 409, { ok: false, error: 'frozen_command_run_disabled' });
+  }
+  if (body.operation === 'executors') {
+    try {
+      return jsonRes(res, 200, {
+        ok: true,
+        status: 'listed',
+        operation: 'executors',
+        executors: listCommandExecutorAuthoringSchemas(),
+      });
+    } catch (error) {
+      return jsonRes(res, 409, {
+        ok: false,
+        error: error instanceof Error && 'code' in error
+          ? String((error as { code?: unknown }).code ?? 'executor_registry_invalid')
+          : 'executor_registry_invalid',
+        // Registry diagnostics can contain executable or artifact paths. Keep
+        // this model-facing endpoint opaque; administrators can inspect the
+        // daemon log and registry directly on the host.
+        detail: '执行器参数契约不可用，请联系管理员',
+      });
+    }
   }
   const configuredDir = ds.workingDir ?? ds.session.workingDir;
   if (!configuredDir) return jsonRes(res, 409, { ok: false, error: 'working_dir_missing' });

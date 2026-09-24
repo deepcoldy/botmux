@@ -5,11 +5,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   buildCommandExecutorArgv,
   commandExecutorBinaryDigest,
+  listCommandExecutorAuthoringSchemas,
   loadCommandExecutorRegistry,
   runProcessCommandExecutor,
 } from '../src/services/command-executors.js';
 import {
   executeFrozenCommand,
+  assertFrozenCommandExecutorContract,
   lookupFrozenCommand,
 } from '../src/services/frozen-command.js';
 
@@ -69,6 +71,7 @@ params:
   - name: word
     type: string
     maxLength: 50
+    pattern: "^[A-Za-z ]+$"
 input:
   value: "{{word}}"
 output:
@@ -84,6 +87,94 @@ afterEach(() => {
 });
 
 describe('generic frozen-command executors', () => {
+  it('exposes only the model-safe authoring contract', () => {
+    const fixture = setup();
+    vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', fixture.registry);
+    const [schema] = listCommandExecutorAuthoringSchemas();
+    expect(schema).toEqual({
+      id: 'test.echo',
+      arguments: [{
+        name: 'value',
+        type: 'string',
+        required: true,
+        accepts: ['param', 'context:caller.open_id'],
+        pattern: '^[A-Za-z ]+$',
+        maxLength: 50,
+      }],
+    });
+    const serialized = JSON.stringify(schema);
+    for (const secretField of ['realpath', 'fixedArgs', 'scriptArtifacts', 'sha256', fixture.script]) {
+      expect(serialized).not.toContain(secretField);
+    }
+  });
+
+  it('rejects every incompatible command-to-executor input contract before execution', () => {
+    const fixture = setup();
+    vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', fixture.registry);
+    const lookup = lookupFrozenCommand({ workingDir: fixture.commandRoot, command: '/回显' });
+    if (lookup.kind !== 'found') throw new Error(`unexpected lookup: ${lookup.kind}`);
+    const base = lookup.snapshot.definition;
+    const executor = loadCommandExecutorRegistry(fixture.registry).executors.get('test.echo')!;
+    const clone = () => structuredClone(base);
+
+    const unknown = clone();
+    unknown.input.other = 'literal';
+    expect(() => assertFrozenCommandExecutorContract(unknown, executor)).toThrowError(/不接受 input/);
+
+    const missing = clone();
+    delete missing.input.value;
+    expect(() => assertFrozenCommandExecutorContract(missing, executor)).toThrowError(/缺少 required input/);
+
+    const type = clone();
+    type.params[0] = { name: 'word', type: 'integer', min: 1, max: 10 };
+    expect(() => assertFrozenCommandExecutorContract(type, executor)).toThrowError(/类型应为 integer/);
+
+    const source = clone();
+    const literalOnly = structuredClone(executor);
+    literalOnly.arguments.value!.accepts = ['literal'];
+    expect(() => assertFrozenCommandExecutorContract(source, literalOnly)).toThrowError(/不接受 param 来源/);
+
+    const contextSource = clone();
+    contextSource.input.value = '{{caller.open_id}}';
+    const paramOnly = structuredClone(executor);
+    paramOnly.arguments.value!.accepts = ['param'];
+    expect(() => assertFrozenCommandExecutorContract(contextSource, paramOnly))
+      .toThrowError(/不接受 context:caller\.open_id 来源/);
+
+    const literalSource = clone();
+    literalSource.input.value = 'literal';
+    expect(() => assertFrozenCommandExecutorContract(literalSource, executor))
+      .toThrowError(/不接受 literal 来源/);
+
+    const length = clone();
+    length.params[0] = { name: 'word', type: 'string', maxLength: 100, pattern: '^[A-Za-z ]+$' };
+    expect(() => assertFrozenCommandExecutorContract(length, executor)).toThrowError(/长度上限 100/);
+
+    const pattern = clone();
+    pattern.params[0] = { name: 'word', type: 'string', maxLength: 50, pattern: '^.+$' };
+    expect(() => assertFrozenCommandExecutorContract(pattern, executor)).toThrowError(/pattern 必须与执行器一致/);
+
+    const integerDefinition = clone();
+    integerDefinition.input.value = '{{days}}';
+    integerDefinition.params = [{ name: 'days', type: 'integer', min: 1, max: 100 }];
+    const integerExecutor = structuredClone(executor);
+    integerExecutor.arguments.value = {
+      type: 'integer', required: true, min: 1, max: 32, accepts: ['param'],
+    };
+    expect(() => assertFrozenCommandExecutorContract(integerDefinition, integerExecutor))
+      .toThrowError(/范围 1-100 超出执行器 1-32/);
+
+    const enumDefinition = clone();
+    enumDefinition.input.value = '{{mode}}';
+    enumDefinition.params = [{ name: 'mode', type: 'enum', values: ['safe', 'unsafe'] }];
+    const enumExecutor = structuredClone(executor);
+    enumExecutor.arguments.value = {
+      type: 'enum', required: true, values: ['safe'], accepts: ['param'],
+    };
+    expect(() => assertFrozenCommandExecutorContract(enumDefinition, enumExecutor))
+      .toThrowError(/含执行器不接受的枚举值/);
+  });
+
   it('constructs argv tokens without shell splitting and projects flat JSON fields', async () => {
     const fixture = setup();
     const registry = loadCommandExecutorRegistry(fixture.registry);
