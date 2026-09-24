@@ -58,8 +58,8 @@ export async function minimaxSynthesizePcm(
   effects: VoiceProviderEffectOptions = {},
 ): Promise<Pcm> {
   const clean = text.trim();
-  if (!clean) throw new Error('No text was provided for speech synthesis.');
-  if (!cfg.apiKey) throw new Error('MiniMax TTS requires an API key.');
+  if (!clean) throw new Error('没有要合成的文字');
+  if (!cfg.apiKey) throw new Error('MiniMax TTS 配置不完整（需要 API key）。');
 
   const body = {
     model: cfg.model?.trim() || DEFAULT_MINIMAX_TTS_MODEL,
@@ -94,7 +94,7 @@ export async function minimaxSynthesizePcm(
     });
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
-      throw new Error(`MiniMax TTS HTTP ${res.status}: ${detail.slice(0, 200)}`);
+      throw new Error(`MiniMax TTS HTTP ${res.status}：${detail.slice(0, 200)}`);
     }
 
     const payload = await res.json() as MiniMaxTtsResponse;
@@ -102,22 +102,22 @@ export async function minimaxSynthesizePcm(
     if (statusCode !== 0) {
       const statusMessage = typeof payload.base_resp?.status_msg === 'string'
         ? payload.base_resp.status_msg
-        : 'unknown error';
-      throw new Error(`MiniMax TTS error ${String(statusCode)}: ${statusMessage}`);
+        : '未知错误';
+      throw new Error(`MiniMax TTS 接口错误 ${String(statusCode)}：${statusMessage}`);
     }
     if (payload.data?.status !== 2) {
-      throw new Error(`MiniMax TTS returned incomplete audio status ${String(payload.data?.status)}.`);
+      throw new Error(`MiniMax TTS 返回的音频状态不完整（status=${String(payload.data?.status)}）。`);
     }
     if (payload.extra_info?.audio_format !== undefined && payload.extra_info.audio_format !== 'pcm') {
-      throw new Error(`MiniMax TTS returned unexpected audio format ${String(payload.extra_info.audio_format)}.`);
+      throw new Error(`MiniMax TTS 返回了非预期的音频格式：${String(payload.extra_info.audio_format)}。`);
     }
 
     const audio = payload.data?.audio;
     if (typeof audio !== 'string' || audio.length === 0 || audio.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(audio)) {
-      throw new Error('MiniMax TTS returned invalid hex audio.');
+      throw new Error('MiniMax TTS 返回的音频数据非法（hex 解码失败）。');
     }
     const data = Buffer.from(audio, 'hex');
-    if (data.length === 0) throw new Error('MiniMax TTS returned empty audio.');
+    if (data.length === 0) throw new Error('MiniMax TTS 返回空音频');
 
     return {
       data,
@@ -125,7 +125,7 @@ export async function minimaxSynthesizePcm(
       channels: numericMetadata(payload.extra_info?.audio_channel, MINIMAX_PCM_CHANNELS),
     };
   } catch (error: any) {
-    if (error?.name === 'AbortError') throw new Error('MiniMax TTS synthesis timed out.');
+    if (error?.name === 'AbortError') throw new Error('MiniMax TTS 合成超时');
     throw error;
   } finally {
     clearTimeout(timer);

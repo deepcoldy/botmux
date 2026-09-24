@@ -3603,9 +3603,10 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       );
     }
 
-    // Preserve a structured per-bot voice override. Deep credential and ASR
-    // validation remains in the voice service; this parser only rejects an
-    // unknown engine and obviously malformed nested values.
+    // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai|minimax，
+    // 三类凭证为对象，speaker/rate 透传，asr 为对象）；非对象或 engine 非法 →
+    // undefined。深度校验（凭证是否可用 / asr 是否 enabled）在 resolveVoiceConfig
+    // / resolveAsrConfig 做，这里只挡明显垃圾（如 minimax.region 拼错）。
     let voice: VoiceConfig | undefined;
     const rawVoice = entry.voice;
     if (rawVoice && typeof rawVoice === 'object' && !Array.isArray(rawVoice)) {

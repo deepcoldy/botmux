@@ -379,6 +379,14 @@ function readVoice(raw: unknown): VoiceConfig | undefined {
   const engineOk = v.engine === 'sami' || v.engine === 'openai' || v.engine === 'minimax' || v.engine === undefined;
   if (!engineOk) return undefined;
   if (!v.sami && !v.openai && !v.minimax && !v.engine && !v.asr) return undefined;
+  // 与 bot-registry 的 per-bot 解析对齐：minimax.region 只接受 'cn'/'global'，
+  // 拼错/其它值一律删掉（适配器再兜底 global），避免脏值静默落到海外端点、还被
+  // `voice status` 原样显示。
+  const mm = v.minimax;
+  if (mm && typeof mm === 'object' && !Array.isArray(mm)) {
+    const r = (mm as Record<string, unknown>).region;
+    if (r !== 'cn' && r !== 'global') delete (mm as Record<string, unknown>).region;
+  }
   return v as VoiceConfig;
 }
 

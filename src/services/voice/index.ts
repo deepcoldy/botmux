@@ -47,7 +47,10 @@ function mergeVoice(base: VoiceConfig | undefined, over: VoiceConfig | undefined
 
 function hasUsableCreds(v: VoiceConfig | undefined): VoiceConfig | null {
   if (!v) return null;
-  const engine = v.engine ?? (v.sami ? 'sami' : v.openai ? 'openai' : v.minimax ? 'minimax' : undefined);
+  // 推断按「各引擎的关键凭证是否存在」而不是配置块是否存在——mergeVoice 会恒定
+  // 物化空的 sami/openai/minimax 块（truthy），若按块判断会永远短路成 sami。
+  const engine = v.engine
+    ?? (v.sami?.accessKey ? 'sami' : v.openai?.baseUrl ? 'openai' : v.minimax?.apiKey ? 'minimax' : undefined);
   if (!engine) return null;
   if (engine === 'sami') {
     const { accessKey, secretKey, appkey } = v.sami ?? {};
@@ -151,7 +154,7 @@ export async function synthesizeVoicePcmForMessage(
   effects: VoiceProviderEffectOptions = {},
 ): Promise<Pcm> {
   const cfg = resolveVoiceConfig(larkAppId);
-  if (!cfg) throw new Error('No usable voice engine is configured in config.json or bots.json.');
+  if (!cfg) throw new Error('未配置语音引擎：在 ~/.botmux/config.json 的 voice 块或 bots.json 里配置 SAMI / OpenAI 兼容 / MiniMax 引擎。');
   const spoken = toSpoken(text);
   if (!spoken) throw new Error('精简后没有可朗读的内容');
   const speaker = effectiveSpeaker(cfg);

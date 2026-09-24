@@ -15175,18 +15175,17 @@ async function cmdVoiceSetup(args: string[]): Promise<void> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
     console.log('🔊 配置语音总结（高级功能）。写入全局 ~/.botmux/config.json，重启后生效。\n');
-    console.log('Additional engine: [3] MiniMax');
-    const eng = (await ask(rl, '选择 TTS 引擎  [1] SAMI（需 AK/SK/appkey）  [2] OpenAI 兼容（自带 baseUrl/key）: ')).trim();
+    const eng = (await ask(rl, '选择 TTS 引擎  [1] SAMI（需 AK/SK/appkey）  [2] OpenAI 兼容（自带 baseUrl/key）  [3] MiniMax（自带 API key）: ')).trim();
     const voice: Record<string, any> = {};
     if (eng === '3' || /minimax/i.test(eng)) {
       voice.engine = 'minimax';
       const apiKey = (await ask(rl, 'MiniMax API key: ')).trim();
-      if (!apiKey) { console.error('MiniMax API key is required; no configuration was written.'); return; }
-      const regionAnswer = (await ask(rl, 'Region [1] Global [2] China (default 1): ')).trim();
+      if (!apiKey) { console.error('❌ MiniMax API key 必填，未写入。'); return; }
+      const regionAnswer = (await ask(rl, '接入区域  [1] 国际 api.minimax.io  [2] 国内 api.minimaxi.com（默认 1）: ')).trim();
       const region = regionAnswer === '2' || /^(cn|china)$/i.test(regionAnswer) ? 'cn' : 'global';
-      const model = (await ask(rl, `Model (default ${DEFAULT_MINIMAX_TTS_MODEL}): `)).trim() || DEFAULT_MINIMAX_TTS_MODEL;
+      const model = (await ask(rl, `模型 model（留空=默认 ${DEFAULT_MINIMAX_TTS_MODEL}）: `)).trim() || DEFAULT_MINIMAX_TTS_MODEL;
       voice.minimax = { apiKey, region, model };
-      const sp = (await ask(rl, `Voice id (default ${DEFAULT_MINIMAX_SPEAKER}): `)).trim();
+      const sp = (await ask(rl, `音色 voice id（留空=默认 ${DEFAULT_MINIMAX_SPEAKER}）: `)).trim();
       if (sp) voice.speaker = sp;
     } else if (eng === '2' || /openai/i.test(eng)) {
       voice.engine = 'openai';
