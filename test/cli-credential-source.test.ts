@@ -275,6 +275,8 @@ describe('reconcileClaudeAccountState', () => {
     const t = await setup(undefined, null);
     mkdirSync(t.state); // present but not a regular file
     expect(t.run).toThrow(/unreadable/);
+    const m = await setup('{broken', null);
+    expect(m.run).toThrow(/per-bot Claude state .* not a JSON object/);
     const s1 = await setup(seeded, null);
     mkdirSync(join(s1.src, 'claude', '.claude.json')); // source present but not a file
     expect(s1.run).toThrow(/credential source .* is unreadable/);

@@ -14533,60 +14533,79 @@ async function spawnCli(
     if (isClaudeFam) claudeDataDir = join(isolationBotHome, 'claude');
     // Provision the per-bot config dir (auth + onboarding/trust seed + hooks for claude;
     // auth/config copy for codex) so the CLI starts fully set up under the Seatbelt wrapper.
-    provisionIsolatedBotHome(
-      isolationBotHome,
-      cfg.workingDir,
-      isClaudeFam,
-      cfg.cliId,
-      cliAdapter.hookInstall,
-      cfg.codexAuthSync ?? 'shared',
-      log,
-      credentialSourceFiles !== undefined,
-    );
-    if (credentialSourceFiles && claudeDataDir) {
-      // Outside provisionIsolatedBotHome's best-effort catch on purpose: a
-      // failed copy must stop the spawn, not leave an older (possibly shared-
-      // account) credential in place. Atomic 0600 replace: never writes
-      // through a planted leaf symlink, never keeps a loose mode.
-      for (const [name, raw] of Object.entries(credentialSourceFiles)) {
-        writeFileAtomic0600(join(claudeDataDir, name), `${raw}\n`);
+    // Every writer of the per-bot data root runs inside one closure: in
+    // credential-source mode it is serialized per bot (sibling sessions share
+    // <BOT_HOME>/claude), so a concurrent spawn cannot re-install a stale
+    // snapshot (shared oauthAccount / primaryApiKey) after this one's
+    // reconcile, and the post-check below sees the final state.
+    const botHome = isolationBotHome;
+    const adapter = cliAdapter;
+    const provisionBotHome = (): void => {
+      provisionIsolatedBotHome(
+        botHome,
+        cfg.workingDir,
+        isClaudeFam,
+        cfg.cliId,
+        adapter.hookInstall,
+        cfg.codexAuthSync ?? 'shared',
+        log,
+        credentialSourceFiles !== undefined,
+      );
+      if (credentialSourceFiles && claudeDataDir) {
+        // Outside provisionIsolatedBotHome's best-effort catch on purpose: a
+        // failed copy must stop the spawn, not leave an older (possibly shared-
+        // account) credential in place. Atomic 0600 replace: never writes
+        // through a planted leaf symlink, never keeps a loose mode.
+        for (const [name, raw] of Object.entries(credentialSourceFiles)) {
+          writeFileAtomic0600(join(claudeDataDir, name), `${raw}\n`);
+        }
+        // The per-bot .claude.json was seeded once from the global state: align
+        // its account identity with the source and drop any API-key login.
+        reconcileClaudeAccountState(join(claudeDataDir, '.claude.json'), credentialSourceDir!);
       }
-      // The per-bot .claude.json was seeded once from the global state: align
-      // its account identity with the source and drop any API-key login.
-      reconcileClaudeAccountState(join(claudeDataDir, '.claude.json'), credentialSourceDir!);
-      // Post-condition, independent of the (best-effort) settings merge: no
-      // auth override may remain where the CLI reads it.
-      const overrides = [
-        ...claudeAuthOverridesInSettingsLayers({
-          userSettingsPath: join(claudeDataDir, 'settings.json'),
-          workingDir: cfg.workingDir,
-        }),
-        ...claudeStateAuthOverrides(join(claudeDataDir, '.claude.json')).map((k) => `.claude.json:${k}`),
-        ...claudeAuthOverrideKeys(process.env).map((k) => `worker env:${k}`),
-      ];
-      if (overrides.length) {
-        throw new Error(
-          `[credentials-source] refusing to start bot ${cfg.larkAppId}: auth overrides would bypass `
-          + `${credentialSourceDir}: ${overrides.join(', ')}`,
-        );
+      if (isClaudeFam && effectiveReadyHookInstall) {
+        effectiveReadyHookInstall = {
+          ...effectiveReadyHookInstall,
+          configPath: join(claudeDataDir!, 'settings.json'),
+        };
       }
-      log(`[credentials-source] copied ${Object.keys(credentialSourceFiles).join(', ')} from ${credentialSourceDir}`);
-    }
-    if (isClaudeFam && effectiveReadyHookInstall) {
-      effectiveReadyHookInstall = {
-        ...effectiveReadyHookInstall,
-        configPath: join(claudeDataDir!, 'settings.json'),
-      };
-    }
-    if (cliAdapter.mcpGateway) {
-      const isolatedConfigPath = isClaudeFam
-        ? join(claudeDataDir!, '.claude.json')
-        : join(isolationBotHome, 'codex', 'config.toml');
-      const report = ensureGatewayEntry({
-        id: cliAdapter.id,
-        mcpGateway: { ...cliAdapter.mcpGateway, configPath: isolatedConfigPath },
-      });
-      if (report.warning) log(`[mcp-gateway] WARN ${report.warning}`);
+      if (adapter.mcpGateway) {
+        const isolatedConfigPath = isClaudeFam
+          ? join(claudeDataDir!, '.claude.json')
+          : join(botHome, 'codex', 'config.toml');
+        const report = ensureGatewayEntry({
+          id: adapter.id,
+          mcpGateway: { ...adapter.mcpGateway, configPath: isolatedConfigPath },
+        });
+        if (report.warning) log(`[mcp-gateway] WARN ${report.warning}`);
+      }
+      if (credentialSourceFiles && claudeDataDir) {
+        // Post-condition, independent of the (best-effort) settings merge: no
+        // auth override may remain where the CLI reads it.
+        const overrides = [
+          ...claudeAuthOverridesInSettingsLayers({
+            userSettingsPath: join(claudeDataDir, 'settings.json'),
+            workingDir: cfg.workingDir,
+          }),
+          ...claudeStateAuthOverrides(join(claudeDataDir, '.claude.json')).map((k) => `.claude.json:${k}`),
+          ...claudeAuthOverrideKeys(process.env).map((k) => `worker env:${k}`),
+        ];
+        if (overrides.length) {
+          throw new Error(
+            `[credentials-source] refusing to start bot ${cfg.larkAppId}: auth overrides would bypass `
+            + `${credentialSourceDir}: ${overrides.join(', ')}`,
+          );
+        }
+        log(`[credentials-source] copied ${Object.keys(credentialSourceFiles).join(', ')} from ${credentialSourceDir}`);
+      }
+    };
+    if (credentialSourceFiles) {
+      // Lock lives in the worker data dir, outside the sandbox's reach.
+      const provisionLock = join(config.session.dataDir, 'credentials-source', `${cfg.larkAppId}.provision`);
+      mkdirSync(dirname(provisionLock), { recursive: true, mode: 0o700 });
+      withFileLockSync(provisionLock, provisionBotHome);
+    } else {
+      provisionBotHome();
     }
     if (!isClaudeFam) {
       isolatedCodexHome = join(isolationBotHome, 'codex');

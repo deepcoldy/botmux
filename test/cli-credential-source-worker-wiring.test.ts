@@ -49,6 +49,25 @@ describe('credentialsSourceDir daemon → worker cold-spawn wiring', () => {
     expect(worker).toContain('perBotEnv: cfg.env,');
   });
 
+  it('serializes every per-bot data-root writer and the post-check under one per-bot lock', () => {
+    const start = worker.indexOf('const provisionBotHome = (): void => {');
+    const end = worker.indexOf('withFileLockSync(provisionLock, provisionBotHome);', start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const body = worker.slice(start, end);
+    const order = [
+      'provisionIsolatedBotHome(',
+      'writeFileAtomic0600(join(claudeDataDir, name)',
+      'reconcileClaudeAccountState(',
+      'ensureGatewayEntry({',
+      'const overrides = [',
+    ].map((m) => body.indexOf(m));
+    expect(order.every((i) => i > -1)).toBe(true);
+    expect([...order].sort((x, y) => x - y)).toEqual(order);
+    expect(body).toContain("const provisionLock = join(config.session.dataDir, 'credentials-source', `${cfg.larkAppId}.provision`);");
+    expect(worker.slice(end - 400, end)).toContain('if (credentialSourceFiles) {');
+  });
+
   it('never reattaches a persistent pane launched with a different credential source', () => {
     const gate = worker.indexOf('const launchedWith = readCredentialSourceStamp(config.session.dataDir, cfg.sessionId);');
     expect(gate).toBeGreaterThan(-1);

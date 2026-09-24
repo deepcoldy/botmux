@@ -267,7 +267,9 @@ export function reconcileClaudeAccountState(statePath: string, sourceDir: string
   }
   let data: Record<string, unknown> = {};
   try {
-    data = parseJsonObject(readRegularFileNoFollow(statePath)) ?? {};
+    const parsed = parseJsonObject(readRegularFileNoFollow(statePath));
+    if (!parsed) throw new Error('not a JSON object');
+    data = parsed;
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
       throw new Error(`per-bot Claude state ${statePath} is unreadable: ${(e as Error).message}`);
