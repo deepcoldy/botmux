@@ -265,6 +265,63 @@ export async function transferChatOwner(
 }
 
 /**
+ * Add managers to a chat with bounded retries before failing.
+ * The calling bot must currently be the owner of the chat.
+ * Calls POST /open-apis/im/v1/chats/:chat_id/managers/add_managers
+ * Accepts open_id, union_id, or user_id.
+ */
+export async function addChatManagers(
+  ownerLarkAppId: string,
+  chatId: string,
+  managerIds: string[],
+  memberIdType: 'open_id' | 'union_id' | 'user_id' = 'open_id',
+  opts?: { maxRetries?: number; retryDelayMs?: number },
+): Promise<{ ok: true; addedManagers: string[] } | { ok: false; error: string }> {
+  const filtered = managerIds.filter(Boolean);
+  if (filtered.length === 0) return { ok: true, addedManagers: [] };
+  const client = getBotClient(ownerLarkAppId);
+  const maxRetries = opts?.maxRetries ?? 2;
+  const retryDelayMs = opts?.retryDelayMs ?? 500;
+  let lastError = 'unknown';
+
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    try {
+      const fn = (client as any).im?.v1?.chatManagers?.addManagers;
+      let res: any;
+      if (typeof fn === 'function') {
+        res = await (client as any).im.v1.chatManagers.addManagers({
+          path: { chat_id: chatId },
+          params: { member_id_type: memberIdType },
+          data: { manager_ids: filtered },
+        });
+      } else {
+        res = await (client as any).request({
+          method: 'POST',
+          url: `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/managers/add_managers`,
+          params: { member_id_type: memberIdType },
+          data: { manager_ids: filtered },
+        });
+      }
+      if (res.code === 0 || res.code === undefined) {
+        const added = Array.isArray(res.data?.chat_managers) ? res.data.chat_managers : filtered;
+        return { ok: true, addedManagers: added };
+      }
+      lastError = `${res.msg ?? 'unknown'} (code: ${res.code})`;
+    } catch (e: any) {
+      lastError = e?.message ?? String(e);
+    }
+    if (attempt <= maxRetries) {
+      logger.info(
+        `[groups-store] addChatManagers attempt ${attempt} failed for chat=${chatId.substring(0, 12)} (${lastError}); retrying...`,
+      );
+      await new Promise(r => setTimeout(r, retryDelayMs * attempt));
+    }
+  }
+
+  return { ok: false, error: lastError };
+}
+
+/**
  * Disband a chat the calling bot OWNS. Used by the session-group birth flow
  * to clean up an orphan group when the initiating user's invite was rejected
  * — the group can never serve as a conversation home, so leaving it behind

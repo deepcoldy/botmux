@@ -181,6 +181,8 @@ function createGroupResult(overrides: Record<string, unknown> = {}): any {
     invalidOwnerUnionIds: [],
     ownerTransferredTo: null,
     transferError: null,
+    managersAdded: [],
+    managerError: null,
     notifyMessageId: null,
     notifyError: null,
     shareLink: null,
@@ -317,5 +319,22 @@ describe('会话群出生：显式 sessionGroup.workingDir 模板目录', () => 
     expect(ds.chatId).toBe(BORN_GROUP);
     expect(ds.workingDir).toBe(tplDir);
     expect(mocks.runAutoWorktreeCommit).not.toHaveBeenCalled();
+  });
+});
+
+describe('会话群出生：自动赋予发起人群管理员权限', () => {
+  it('出生时自动将发起人设为群管理员（managerUserIds: [senderOpenId]）', async () => {
+    registerAppBot({
+      defaultWorkingDir: join(mocks.dataDir, 'default-dir'),
+      sessionGroup: { tag: { mode: 'off' }, avatar: 'off' },
+    });
+    mocks.createGroupWithBots.mockResolvedValue(createGroupResult({ managersAdded: [OWNER] }));
+
+    await handleNewTopic(dmEvent('帮我看下代码', 'om_mgr_auto'), dmCtx('om_mgr_auto'));
+
+    expect(mocks.createGroupWithBots).toHaveBeenCalledTimes(1);
+    const opts = mocks.createGroupWithBots.mock.calls[0][0];
+    expect(opts.managerUserIds).toEqual([OWNER]);
+    expect(opts.transferOwnerTo).toBeUndefined();
   });
 });

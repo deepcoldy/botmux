@@ -18,12 +18,13 @@
  * path may instead provide `transferOwnerUnionId`; this service resolves that
  * tenant-stable ID into the creator app's open_id before transfer.
  */
-import { createChat, transferChatOwner, getChatOwner, getChatShareLink, addUsersToChatByUnionId, addBotToChat } from './groups-store.js';
+import { createChat, transferChatOwner, getChatOwner, getChatShareLink, addUsersToChatByUnionId, addBotToChat, addChatManagers } from './groups-store.js';
 import type { ChatMode } from './groups-store.js';
 import { listChatBotMembers, resolveAllowedUsersWithMap, sendMessage } from '../im/lark/client.js';
 import { bindOncall } from './oncall-store.js';
 import { isValidRoleProfileId, readRoleProfileEntry } from './role-profile-store.js';
 import { writeRoleFile } from '../core/role-resolver.js';
+import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
 
 export interface CreateGroupOpts {
@@ -46,6 +47,8 @@ export interface CreateGroupOpts {
   transferOwnerUnionId?: string;
   transferOwnerTo?: string;
   notifyOwnerOpenId?: string;
+  /** Users to grant group manager permissions to. Added while the creator bot is owner. */
+  managerUserIds?: string[];
   /** Optional working directory to bind the newly created chat to oncall for
    *  every invited bot. The path is validated by callers; this service only
    *  persists the binding after chat.create succeeds. */
@@ -87,6 +90,8 @@ export interface CreateGroupResult {
   invalidOwnerUnionIds: string[];
   ownerTransferredTo: string | null;
   transferError: string | null;
+  managersAdded: string[];
+  managerError: string | null;
   notifyMessageId: string | null;
   notifyError: string | null;
   /** Shareable join link (others can click to *join*). null when the Lark
@@ -229,6 +234,27 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     }
   }
 
+  // Grant group manager role to specified users.
+  // Only the chat owner can add managers. If ownership was successfully transferred,
+  // the target user is already owner (so we exclude them). If ownership transfer
+  // was not requested or failed, the creator bot is still owner and can add managers
+  // (including the failed transferOwnerTo target as a graceful fallback).
+  let managersAdded: string[] = [];
+  let managerError: string | null = null;
+  const rawManagerIds = (opts.managerUserIds ?? []).map(id => id.trim()).filter(Boolean);
+  if (rawManagerIds.length > 0) {
+    const toAdd = rawManagerIds.filter(id => id !== ownerTransferredTo && !r.invalidUserIds.includes(id));
+    if (toAdd.length > 0) {
+      const mr = await addChatManagers(opts.creatorLarkAppId, r.chatId, toAdd);
+      if (mr.ok) {
+        managersAdded = mr.addedManagers;
+      } else {
+        managerError = mr.error;
+        logger.warn(`[group-creator] addChatManagers failed after retries for ${r.chatId.substring(0, 12)}: ${mr.error}`);
+      }
+    }
+  }
+
   const notifyOwnerOpenId = opts.notifyOwnerOpenId?.trim()
     || (transferOwnerUnionId ? transferOwnerTo : null);
   let notifyMessageId: string | null = null;
@@ -365,6 +391,8 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     invalidOwnerUnionIds,
     ownerTransferredTo,
     transferError,
+    managersAdded,
+    managerError,
     notifyMessageId,
     notifyError,
     shareLink,

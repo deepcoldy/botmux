@@ -3,7 +3,8 @@
  *
  * A top-level DM message normally seeds a DM thread session (p2pMode=thread
  * shape). Under p2pMode='group', handleNewTopic calls maybeBirthSessionGroup
- * FIRST: it creates a dedicated 1-user+1-bot chat (the bot keeps ownership),
+ * FIRST: it creates a dedicated 1-user+1-bot chat (the bot keeps ownership
+ * and grants the user chat manager permissions),
  * registers it in session-groups-store, posts an intro quote of the user's
  * message into the new group, sends a DM receipt linking the group, kicks off
  * the async AI title, and hands back a rewritten RoutingContext pointing at
@@ -139,8 +140,9 @@ export async function maybeBirthSessionGroup(
       larkAppIds: [larkAppId],
       name: placeholder,
       userOpenIds: [senderOpenId],
-      // Deliberately NO transferOwnerTo: the bot keeps chat ownership so it
-      // can rename (AI title) and later disband/archive session groups.
+      // The bot keeps chat ownership for AI title rename & lifecycle,
+      // and grants the initiating user chat manager permissions.
+      managerUserIds: [senderOpenId],
       bindWorkingDir: workingDir,
     });
     const newChatId = result.chatId;
@@ -229,7 +231,9 @@ export async function maybeBirthSessionGroup(
     logger.info(
       `[session-group] born chat=${newChatId.substring(0, 12)} for dm=${dmChatId.substring(0, 12)} ` +
       `msg=${messageId.substring(0, 12)} intro=${introMessageId?.substring(0, 12) ?? '-'} ` +
-      `name="${placeholder}" workingDir=${workingDir ?? '-'} origin=${originEv.reason}`,
+      `name="${placeholder}" workingDir=${workingDir ?? '-'} origin=${originEv.reason} ` +
+      `managerAdded=${result.managersAdded?.includes(senderOpenId) ? 'yes' : 'no'}` +
+      (result.managerError ? ` managerErr=${result.managerError}` : ''),
     );
 
     return {
