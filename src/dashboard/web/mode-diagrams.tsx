@@ -56,6 +56,7 @@ export function ModeOptionGroup<T extends string>(props: {
   const tr = useT();
   const [drawerOpen, setDrawerOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const gridRef = useRef<HTMLDivElement | null>(null);
   const wrapId = useId().replace(/:/g, '');
 
   return (
@@ -81,6 +82,7 @@ export function ModeOptionGroup<T extends string>(props: {
       </div>
       <div className="bd-mode-opts-wrap">
         <div
+          ref={gridRef}
           className="bd-mode-opt-grid"
           role="radiogroup"
           aria-label={props.groupName}
@@ -90,18 +92,33 @@ export function ModeOptionGroup<T extends string>(props: {
             '--bd-narrow-cols': String(props.narrowCols),
           } as React.CSSProperties}
         >
-          {props.options.map(option => {
+          {props.options.map((option, index) => {
             const selected = option.value === props.value;
+            function move(delta: number): void {
+              const target = (index + delta + props.options.length) % props.options.length;
+              gridRef.current?.querySelectorAll<HTMLButtonElement>('.bd-mode-opt')[target]?.focus();
+              props.onChange(props.options[target].value);
+            }
             return (
               <button
                 key={option.value}
                 type="button"
                 role="radio"
                 aria-checked={selected}
+                tabIndex={selected ? 0 : -1}
                 disabled={props.disabled}
                 className={cx('bd-mode-opt', selected && 'is-selected')}
                 data-value={option.value}
                 onClick={() => { if (!props.disabled) props.onChange(option.value); }}
+                onKeyDown={event => {
+                  if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
+                    event.preventDefault();
+                    move(1);
+                  } else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
+                    event.preventDefault();
+                    move(-1);
+                  }
+                }}
               >
                 <span className={cx('bd-mode-opt-radio', selected && 'is-on')} aria-hidden="true" />
                 <span className="bd-mode-opt-text">
@@ -144,17 +161,44 @@ function ModeExampleDrawer<T extends string>(props: {
   const tr = useT();
   const [preview, setPreview] = useState<T>(props.value);
   const closeRef = useRef<HTMLButtonElement | null>(null);
+  const panelRef = useRef<HTMLElement | null>(null);
   const current = props.options.find(o => o.value === props.value) ?? props.options[0];
   const viewing = props.options.find(o => o.value === preview) ?? current;
 
   useEffect(() => {
+    const panel = panelRef.current;
     closeRef.current?.focus();
+
+    function focusables(): HTMLElement[] {
+      if (!panel) return [];
+      return [...panel.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      )].filter(el => el.offsetParent !== null);
+    }
+
     function onKey(event: KeyboardEvent): void {
       if (event.key === 'Escape') {
         event.stopPropagation();
         props.onClose();
+        return;
+      }
+      // 焦点陷阱：Tab/Shift+Tab 在侧栏内循环，不穿到背景主页
+      if (event.key === 'Tab' && panel) {
+        const seq = focusables();
+        if (seq.length === 0) return;
+        const first = seq[0];
+        const last = seq[seq.length - 1];
+        const active = document.activeElement as HTMLElement | null;
+        if (event.shiftKey && (active === first || !panel.contains(active))) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && active === last) {
+          event.preventDefault();
+          first.focus();
+        }
       }
     }
+
     document.addEventListener('keydown', onKey, true);
     return () => {
       document.removeEventListener('keydown', onKey, true);
@@ -162,15 +206,31 @@ function ModeExampleDrawer<T extends string>(props: {
     };
   }, [props, props.triggerRef]);
 
+  function onTabKeyDown(event: React.KeyboardEvent, index: number): void {
+    // roving tabindex：左右（窄屏下也支持上下）在 tabs 间移动焦点
+    if (event.key !== 'ArrowRight' && event.key !== 'ArrowLeft' && event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+    event.preventDefault();
+    const vertical = event.key === 'ArrowDown' || event.key === 'ArrowUp';
+    const dir = event.key === 'ArrowRight' || event.key === 'ArrowDown' ? 1 : -1;
+    const target = (index + dir + props.options.length) % props.options.length;
+    panelRef.current?.querySelectorAll<HTMLButtonElement>('.bd-example-tab')[target]?.focus();
+    if (vertical) {
+      // 上下键只移焦点；左右键同时切预览（符合 tablist 惯例）
+      return;
+    }
+    setPreview(props.options[target].value);
+  }
+
   return createPortal(
     <div
       className="bd-example-layer bot-defaults-page"
       onMouseDown={event => { if (event.target === event.currentTarget) props.onClose(); }}
     >
       <aside
+        ref={panelRef}
         className="bd-example-panel"
         role="dialog"
-        aria-modal="false"
+        aria-modal="true"
         aria-label={props.title}
       >
         <header className="bd-example-head">
@@ -191,7 +251,7 @@ function ModeExampleDrawer<T extends string>(props: {
           </button>
         </header>
         <div className="bd-example-tabs" role="tablist" aria-label={viewing.name}>
-          {props.options.map(option => {
+          {props.options.map((option, index) => {
             const isCurrent = option.value === props.value;
             const isViewing = option.value === viewing.value;
             return (
@@ -199,9 +259,11 @@ function ModeExampleDrawer<T extends string>(props: {
                 key={option.value}
                 type="button"
                 role="tab"
+                tabIndex={isViewing ? 0 : -1}
                 aria-selected={isViewing}
                 className={cx('bd-example-tab', isViewing && 'is-viewing')}
                 onClick={() => setPreview(option.value)}
+                onKeyDown={event => onTabKeyDown(event, index)}
               >
                 {option.name}
                 {isCurrent ? <em className="bd-example-current">{tr('botDefaults.exampleCurrent')}</em> : null}

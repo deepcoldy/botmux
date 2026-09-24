@@ -25353,6 +25353,7 @@ dialog select[multiple]:hover:not(:disabled) {
 .bot-defaults-page .bd-mode-opt {
   display: flex;
   align-items: flex-start;
+  justify-content: flex-start;
   gap: 10px;
   padding: 10px 12px;
   border: 1.5px solid var(--border);
@@ -25481,6 +25482,7 @@ dialog select[multiple]:hover:not(:disabled) {
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  padding: 0;
   width: 34px;
   height: 34px;
   flex: none;
@@ -25499,6 +25501,7 @@ dialog select[multiple]:hover:not(:disabled) {
 .bot-defaults-page .bd-example-close svg {
   width: 18px;
   height: 18px;
+  flex: none;
 }
 
 .bot-defaults-page .bd-example-tabs {
@@ -25599,7 +25602,7 @@ dialog select[multiple]:hover:not(:disabled) {
 
 /* 窄屏：底部抽屉 ≤90dvh，保留头部与切换区可见 */
 @media (max-width: 720px) {
-  .bot-defaults-page .bd-example-layer {
+  .bd-example-layer.bot-defaults-page {
     align-items: flex-end;
   }
   .bot-defaults-page .bd-example-panel {

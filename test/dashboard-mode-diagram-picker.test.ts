@@ -38,7 +38,8 @@ const css = readFileSync(new URL('../src/dashboard/web/style.css', import.meta.u
 const diagrams = readFileSync(new URL('../src/dashboard/web/mode-diagrams.tsx', import.meta.url), 'utf8');
 
 function classes(node: ReactTestInstance): string[] {
-  return typeof node.props.className === 'string' ? node.props.className.split(/\s+/) : [];
+  const className = node.props && node.props.className;
+  return typeof className === 'string' ? className.split(/\s+/) : [];
 }
 
 function findByClass(root: ReactTestInstance, cls: string): ReactTestInstance[] {
@@ -148,6 +149,45 @@ describe('ModeOptionGroup example drawer', () => {
     });
     expect(findByClass(root, 'bd-example-panel')).toHaveLength(0);
   });
+
+  it('is a modal dialog with a roving-tabindex tablist (only viewing tab tabbable)', () => {
+    const root = render(React.createElement(ModeOptionGroup<string>, groupProps()));
+    act(() => findByClass(root, 'bd-mode-example-trigger')[0].props.onClick());
+    const panel = findByClass(root, 'bd-example-panel')[0];
+    expect(panel.props['aria-modal']).toBeTruthy();
+    const tabs = root.findAll(node => node.props.role === 'tab');
+    expect(tabs[0].props.tabIndex).toBe(0);
+    expect(tabs[1].props.tabIndex).toBe(-1);
+  });
+
+  it('arrow-right in the tablist moves focus/preview via a handled key event', () => {
+    const root = render(React.createElement(ModeOptionGroup<string>, groupProps()));
+    act(() => findByClass(root, 'bd-mode-example-trigger')[0].props.onClick());
+    const prevented = vi.fn();
+    act(() => root.findAll(node => node.props.role === 'tab')[0].props.onKeyDown({ key: 'ArrowRight', preventDefault: prevented }));
+    expect(prevented).toHaveBeenCalled();
+    const viewing = root.findAll(node => node.props.role === 'tab').find(x => classes(x).includes('is-viewing'));
+    expect(viewing?.props['aria-selected']).toBe(true);
+    expect(findByClass(root, 'bd-example-mock')[0].findByProps({ 'data-mock': '话题模式' })).toBeTruthy();
+  });
+});
+
+describe('ModeOptionGroup radio keyboard', () => {
+  it('roving tabindex on radios; arrow keys move focus and select', () => {
+    const onChange = vi.fn();
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(ModeOptionGroup<string>, groupProps({ onChange })));
+    });
+    const root = renderer.root;
+    const radios = () => root.findAll(node => node.props.role === 'radio');
+    expect(radios()[0].props.tabIndex).toBe(0);
+    expect(radios()[1].props.tabIndex).toBe(-1);
+    const prevented = vi.fn();
+    act(() => radios()[0].props.onKeyDown({ key: 'ArrowRight', preventDefault: prevented }));
+    expect(prevented).toHaveBeenCalled();
+    expect(onChange).toHaveBeenLastCalledWith('v1');
+  });
 });
 
 describe('mode mock screenshots', () => {
@@ -195,7 +235,15 @@ describe('page wiring and CSS', () => {
 
   it('example drawer is a 460px right rail on desktop and a <=90dvh bottom sheet on narrow screens', () => {
     expect(css).toMatch(/\.bd-example-panel\s*\{[^}]*width:\s*460px;/);
+    // 窄屏选择器必须命中「同一元素双 class」（layer 同时带 bot-defaults-page），不能用后代选择器
+    expect(css).toMatch(/@media \(max-width:\s*720px\)[^@]*\.bd-example-layer\.bot-defaults-page\s*\{[^}]*align-items:\s*flex-end;/);
     expect(css).toMatch(/@media \(max-width:\s*720px\)[^@]*height:\s*90dvh;/);
+  });
+
+  it('close button pads 0 with a non-shrinking SVG; option rows left-align content', () => {
+    expect(css).toMatch(/\.bd-example-close\s*\{[^}]*padding:\s*0;/);
+    expect(css).toMatch(/\.bd-example-close svg\s*\{[^}]*flex:\s*none;/);
+    expect(css).toMatch(/\.bd-mode-opt\s*\{[^}]*justify-content:\s*flex-start;/);
   });
 
   it('option name (13px/700, theme text color) is stronger than the 12px/400 short line', () => {
@@ -219,6 +267,8 @@ describe('page wiring and CSS', () => {
   });
 });
 
+// 不用 restoreAllMocks：它会恢复 vi.mock('react-dom') 的 createPortal，
+// 导致后续测试抽屉无法渲染。各测试局部 spy 自行清理即可。
 afterEach(() => {
-  vi.restoreAllMocks();
+  vi.clearAllMocks();
 });
