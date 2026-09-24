@@ -1574,7 +1574,6 @@ export const messages: Record<string, string> = {
   // ─── i18n coverage v2: shared fragments + cards + chat messages ───────────
   'common.operator': '操作人：{by}',
   'common.empty_paren': '（空）',
-  'common.truncated_short': '…（已截断）',
 
   // Ask card
   'card.ask.field.deadline': '截止',

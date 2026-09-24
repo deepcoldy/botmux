@@ -26,6 +26,7 @@ import {
   handleAskCardAction,
   parseFormSelections,
 } from '../src/im/lark/ask-card.js';
+import { getDefaultLocale, setDefaultLocale } from '../src/i18n/index.js';
 
 const mockedSubmitAsk = vi.mocked(submitAsk);
 
@@ -236,6 +237,83 @@ describe('buildAskCard', () => {
       timedOut: true,
     });
     expect(text).toContain('超时');
+  });
+
+  it('长问题正文（>512 字符）完整渲染，不附加截断标记', () => {
+    // 回归：ask 卡片曾对每个 q.prompt 做 512 字符截断（无飞书硬限制依据），
+    // 审批人会在信息不全的情况下点按钮。现在问题正文必须完整渲染。
+    const head = '线上 latency 涨了 30%，请确认下一步处理方案，详细背景如下：';
+    const tail = '【尾部关键信息：必须看到这段才能做出正确决定】';
+    const prompt = `${head}${'甲乙丙丁'.repeat(200)}${tail}`; // 800+ 字符，远超旧的 512 上限
+    expect(prompt.length).toBeGreaterThan(512);
+    const ask = makePending({
+      questions: [
+        { prompt, multiSelect: false, options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }] },
+      ],
+    });
+
+    const json = JSON.parse(buildAskCard(ask));
+    const blob = JSON.stringify(json);
+
+    // 旧逻辑截掉的尾部内容必须仍在卡片中
+    expect(blob).toContain(tail);
+    expect(blob).not.toContain('已截断');
+
+    // 完整正文原样落在问题 div（prompt 不含会被 escapeMd 转义的字符）
+    const questionDiv = json.elements.find(
+      (el: any) => el.tag === 'div' && typeof el.text?.content === 'string' && el.text.content.includes(head),
+    );
+    expect(questionDiv).toBeDefined();
+    expect(questionDiv.text.content).toBe(`**问题 1**\n${prompt}`);
+  });
+
+  it('多问卡片：每个长问题正文都完整渲染', () => {
+    const tailA = '【第一问尾部标记-AAA】';
+    const tailB = '【第二问尾部标记-BBB】';
+    const promptA = `第一问 ${'子丑寅卯'.repeat(200)} ${tailA}`;
+    const promptB = `第二问 ${'辰巳午未'.repeat(200)} ${tailB}`;
+    const ask = makePending({
+      questions: [
+        { prompt: promptA, multiSelect: false, options: [{ key: 'y', label: '是' }, { key: 'n', label: '否' }] },
+        { prompt: promptB, multiSelect: true, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }] },
+      ],
+    });
+
+    const json = JSON.parse(buildAskCard(ask));
+    const questionDivs = json.elements.filter(
+      (el: any) => el.tag === 'div' && typeof el.text?.content === 'string' && el.text.content.startsWith('**问题 '),
+    );
+    expect(questionDivs).toHaveLength(2);
+    expect(questionDivs[0].text.content).toBe(`**问题 1**\n${promptA}`);
+    expect(questionDivs[1].text.content).toBe(`**问题 2**\n${promptB}`);
+  });
+
+  it('英文 locale：长问题正文完整渲染，无 truncated 标记', () => {
+    const prevLocale = getDefaultLocale();
+    setDefaultLocale('en');
+    try {
+      const head = 'Production latency is up 30%, please confirm the next step. Full context: ';
+      const tail = ' TAIL MARKER: must be visible to make the right call';
+      const prompt = `${head}${'lorem ipsum '.repeat(100)}${tail}`;
+      expect(prompt.length).toBeGreaterThan(512);
+      const ask = makePending({
+        questions: [
+          { prompt, multiSelect: false, options: [{ key: 'y', label: 'Yes' }, { key: 'n', label: 'No' }] },
+        ],
+      });
+
+      const json = JSON.parse(buildAskCard(ask));
+      const blob = JSON.stringify(json);
+      expect(blob).toContain(tail);
+      expect(blob).not.toContain('(truncated)');
+      const questionDiv = json.elements.find(
+        (el: any) => el.tag === 'div' && typeof el.text?.content === 'string' && el.text.content.includes(head),
+      );
+      expect(questionDiv).toBeDefined();
+      expect(questionDiv.text.content).toBe(`**Question 1**\n${prompt}`);
+    } finally {
+      setDefaultLocale(prevLocale);
+    }
   });
 });
 
