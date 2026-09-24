@@ -461,7 +461,13 @@ export interface CliAdapter {
    * (e.g. OpenCode SQLite db). When true, suppresses premature idle detection
    * even if PTY output has quiesced.
    */
-  readonly isSessionBusy?: (opts: { sessionId: string; cliSessionId?: string }) => boolean;
+  readonly isSessionBusy?: (opts: {
+    sessionId: string;
+    cliSessionId?: string;
+    /** Only supplied for an authoritative current viewport. Adapters may use
+     * explicit terminal interruption evidence when native state omits it. */
+    getCurrentScreen?: () => string;
+  }) => boolean;
 
   /** Opt-in positive marker for an idle→working edge observed in PTY output.
    *  Kept separate from busyPattern because transcript/full-screen redraws may

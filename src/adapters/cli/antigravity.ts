@@ -132,6 +132,15 @@ async function waitForHistoryAppend(
   return historyDeltaContains(path, fromByte, marker);
 }
 
+/** Cancellation can leave the transcript at a tool result forever. Accept only
+ * the CLI's explicit interruption notice followed immediately by an EMPTY
+ * composer and its ready footer at the end of the current viewport. Old notices
+ * in scrollback, a newer prompt, or a running status must not release input. */
+export function isAntigravityInterruptedScreen(screen: string): boolean {
+  if (/esc to cancel/i.test(screen)) return false;
+  return /(?:^|\n)[ \t]*⎿[ \t]+Interrupted · What should Antigravity CLI do instead\?[ \t]*\n[ \t─━\r\n]*\n>[ \t]*\n[ \t─━\r\n]*\n\? for shortcuts[^\n]*(?:\n\s*)*$/.test(screen);
+}
+
 export function isAntigravityTranscriptBusy(transcriptPath: string): boolean {
   if (!existsSync(transcriptPath)) return false;
   try {
@@ -352,10 +361,14 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     completionPattern: undefined,
     readyPattern: /\? for shortcuts/,
     busyPattern: /esc to cancel/,
-    isSessionBusy({ cliSessionId }) {
+    isSessionBusy({ cliSessionId, getCurrentScreen }) {
       if (!cliSessionId) return false;
       const transcriptPath = join(homedir(), '.gemini', 'antigravity-cli', 'brain', cliSessionId, '.system_generated', 'logs', 'transcript.jsonl');
-      return isAntigravityTranscriptBusy(transcriptPath);
+      if (!isAntigravityTranscriptBusy(transcriptPath)) return false;
+      try {
+        if (getCurrentScreen && isAntigravityInterruptedScreen(getCurrentScreen())) return false;
+      } catch { /* Missing viewport is not evidence of cancellation. */ }
+      return true;
     },
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,

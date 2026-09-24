@@ -40,7 +40,7 @@ describe('worker app-runner control-channel wiring', () => {
     const safeRetryStart = flush.indexOf('const retryQueuedActivation =');
     const retryTransition = flush.indexOf("retryQueuedActivation ? 'retry' : 'cancel'", safeRetryStart);
     const requeue = flush.indexOf('requeueUnsubmittedQueuedActivation(item);', retryTransition);
-    const submittedAck = flush.indexOf("type: 'queued_activation_submitted'", retryTransition);
+    const submittedAck = flush.indexOf('acknowledgeQueuedActivation(item);', requeue);
     expect(safeRetryStart).toBeGreaterThan(writeIdx);
     expect(retryTransition).toBeGreaterThan(safeRetryStart);
     expect(requeue).toBeGreaterThan(retryTransition);
