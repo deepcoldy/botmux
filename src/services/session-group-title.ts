@@ -37,13 +37,14 @@ export const MAX_SESSION_GROUP_TITLE_ROUNDS = 3;
 
 /** Per-cliId one-shot print-mode argv template. `argv[0]` is replaced by
  *  `cliPathOverride` when configured. Prompt is appended as the last arg. */
-const ONE_SHOT_ARGV: Record<string, string[]> = {
+export const ONE_SHOT_ARGV: Record<string, string[]> = {
   'claude-code': ['claude', '-p'],
   codex: ['codex', 'exec', '--skip-git-repo-check'],
   // TRAE CLI is a codex fork — same exec surface and bare-answer stdout.
   traex: ['traex', 'exec', '--skip-git-repo-check'],
   opencode: ['opencode', 'run'],
   gemini: ['gemini', '-p'],
+  antigravity: ['agy', '-p'],
 };
 
 /** One in-flight title job per chat — birth and the heal-on-activity path
