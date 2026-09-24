@@ -331,6 +331,51 @@ describe('dashboard grant defaults', () => {
     expect(root.findByProps({ 'data-action': 'toggle-p2p-open' }).props.checked).toBe(true);
   });
 
+  it('saves the owner-DM forwarding toggle through the grant-prefs endpoint', async () => {
+    const requests: Array<{ url: string; body: any }> = [];
+    (globalThis as any).fetch = vi.fn(async (url: string, init?: any) => {
+      requests.push({ url, body: JSON.parse(init?.body ?? '{}') });
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          ok: true,
+          autoGrantRequestCards: true,
+          restrictGrantCommands: false,
+          p2pOpen: false,
+          grantRequestToOwnerDm: true,
+          grantDefaultDurationMs: null,
+          messageQuotaDefaultLimit: null,
+        }),
+      } as any;
+    });
+
+    const { root, patchBot } = renderGrantSection();
+    const toggle = root.findByProps({ 'data-action': 'toggle-grant-request-owner-dm' });
+    expect(toggle.props.checked).toBe(false);
+    await flushAction(() => toggle.props.onChange({ currentTarget: { checked: true } }));
+
+    expect(requests).toEqual([{ url: '/api/bots/app_grant/grant-prefs', body: { grantRequestToOwnerDm: true } }]);
+    expect(patchBot).toHaveBeenCalledWith('app_grant', expect.objectContaining({ grantRequestToOwnerDm: true }));
+    expect(root.findByProps({ 'data-action': 'toggle-grant-request-owner-dm' }).props.checked).toBe(true);
+  });
+
+  it('rolls the owner-DM forwarding toggle back when the save fails', async () => {
+    (globalThis as any).fetch = vi.fn(async () => ({
+      ok: false,
+      status: 500,
+      json: async () => ({ ok: false, error: 'write_failed' }),
+    } as any));
+
+    const { root } = renderGrantSection({ grantRequestToOwnerDm: true });
+    const toggle = root.findByProps({ 'data-action': 'toggle-grant-request-owner-dm' });
+    expect(toggle.props.checked).toBe(true);
+    await flushAction(() => toggle.props.onChange({ currentTarget: { checked: false } }));
+
+    expect(root.findByProps({ 'data-action': 'toggle-grant-request-owner-dm' }).props.checked).toBe(true);
+    expect(root.findByProps({ 'data-grant-status': '' }).children.join('')).toContain('write_failed');
+  });
+
   it('rolls the DM-open toggle back when the save fails', async () => {
     (globalThis as any).fetch = vi.fn(async () => ({
       ok: false,

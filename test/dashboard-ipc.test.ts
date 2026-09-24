@@ -2788,6 +2788,65 @@ describe('PUT /api/bot-grant-prefs — p2pOpen (私聊对话全开)', () => {
   });
 });
 
+describe('PUT /api/bot-grant-prefs — grantRequestToOwnerDm (申请卡转投 owner 私聊)', () => {
+  it('surfaces it in the Bot Defaults payload and persists explicit on/off', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-owner-dm-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-owner-dm-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+        allowedUsers: ['ou_owner'],
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${handle.port}`;
+
+      const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
+      expect(initial.grantRequestToOwnerDm).toBe(false);
+
+      const on = await fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ grantRequestToOwnerDm: true }),
+      });
+      expect(on.status).toBe(200);
+      expect(await on.json()).toMatchObject({ ok: true, grantRequestToOwnerDm: true });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].grantRequestToOwnerDm).toBe(true);
+      expect((await (await fetch(`${base}/api/bot-default-oncall`)).json()).grantRequestToOwnerDm).toBe(true);
+
+      const off = await fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ grantRequestToOwnerDm: false }),
+      });
+      expect(off.status).toBe(200);
+      expect(await off.json()).toMatchObject({ ok: true, grantRequestToOwnerDm: false });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].grantRequestToOwnerDm).toBeUndefined();
+
+      const bogus = await fetch(`${base}/api/bot-grant-prefs`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ grantRequestToOwnerDm: 'on' }),
+      });
+      expect(bogus.status).toBe(400);
+      expect(await bogus.json()).toMatchObject({ ok: false, error: 'no_valid_fields' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].grantRequestToOwnerDm).toBeUndefined();
+    } finally {
+      if (handle) await handle.close();
+      handle = null;
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('PUT/GET /api/message-listeners/:chatId — disabled draft persistence (Bug2: 二刷消失)', () => {
   it('persists a disabled listener that still has a prompt, and GET returns it after reload', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-listener-draft-'));
