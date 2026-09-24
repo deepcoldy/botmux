@@ -41,9 +41,10 @@ mkdirSync(join(homedir(), '.lark-cli'), { recursive: true });
 mkdirSync(join(homedir(), '.local', 'share', 'lark-cli'), { recursive: true });
 mkdirSync(join(dataDir, 'vc-meeting-daemon-auth'), { recursive: true });
 mkdirSync(join(dataDir, 'bytedcli-home', 'ou-someone'), { recursive: true });
-mkdirSync(join(dataDir, 'cli-identity'), { recursive: true });
-const OWN_ENV = join(dataDir, 'cli-identity', `${sid}.lark-cli.env`);
-const OTHER_ENV = join(dataDir, 'cli-identity', 'session-OTHER.lark-cli.env');
+mkdirSync(join(dataDir, 'cli-identity', `${sid}.bin`, '.data'), { recursive: true });
+mkdirSync(join(dataDir, 'cli-identity', 'session-OTHER.bin', '.data'), { recursive: true });
+const OWN_ENV = join(dataDir, 'cli-identity', `${sid}.bin`, '.data', 'lark-cli.env');
+const OTHER_ENV = join(dataDir, 'cli-identity', 'session-OTHER.bin', '.data', 'lark-cli.env');
 const BOTS = join(botmuxHome, 'bots.json');
 const SECRET = join(botmuxHome, '.dashboard-secret');
 const SIDECAR = `${BOTS}.bak-1`;
@@ -87,8 +88,8 @@ try {
   check('enumerator found vc daemon auth dir', denyPaths.includes(join(dataDir, 'vc-meeting-daemon-auth')));
   check('enumerator found bytedcli-home dir', denyPaths.includes(join(dataDir, 'bytedcli-home')));
   check('enumerator sealed cli-identity dir', denyPaths.includes(join(dataDir, 'cli-identity')));
-  check('enumerator carved OWN session identity read-only', roCarves.includes(OWN_ENV));
-  check('enumerator did NOT carve other session identity', !roCarves.includes(OTHER_ENV));
+  check('enumerator carved OWN session <sid>.bin dir read-only', roCarves.includes(join(dataDir, 'cli-identity', `${sid}.bin`)));
+  check('enumerator did NOT carve other session .bin dir', !roCarves.includes(join(dataDir, 'cli-identity', 'session-OTHER.bin')));
   check('enumerator found legacy ~/.lark-cli store', denyPaths.includes(LARK_STORE));
   check('enumerator found REAL ~/.local/share/lark-cli store', denyPaths.includes(LARK_STORE_REAL));
 

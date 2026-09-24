@@ -49,8 +49,18 @@ export interface ScratchSecrets {
   readOnlyCarvePaths: string[];
 }
 
-const CLI_IDENTITY_BASENAMES = ['lark-cli.env', 'bytedcli.env', 'bin', 'turn'];
+// Trigger-user CLI identity lives in ONE per-session directory
+// cli-identity/<sid>.bin/ (wrapper scripts) which also holds the credentials
+// under <sid>.bin/.data/<tool>.env + .data/turn (#1543 layout). Binding this
+// single DIRECTORY read-only (rather than individual env files) both:
+//  (a) seals every OTHER session's files (the cli-identity/ parent is denied),
+//  (b) avoids the bwrap single-file inode pin — atomicWrite renames the env
+//      files in place, and a directory bind resolves names live so a persistent
+//      tmux pane reads the refreshed identity each turn.
 const CLI_IDENTITY_DIR = 'cli-identity';
+function sessionIdentityDirName(sessionId: string): string {
+  return `${sessionId}.bin`;
+}
 
 function isFileOrLink(p: string): boolean {
   try { return !lstatSync(p).isDirectory(); } catch { return false; }
@@ -140,10 +150,8 @@ export function enumerateScratchSecretPaths(input: ScratchSecretInput): ScratchS
     if (isDir(cliIdentityDir)) {
       out.add(cliIdentityDir);
       if (input.sessionId) {
-        for (const suffix of CLI_IDENTITY_BASENAMES) {
-          const own = join(cliIdentityDir, `${input.sessionId}.${suffix}`);
-          if (existsSync(own)) readOnlyCarve.add(own);
-        }
+        const ownDir = join(cliIdentityDir, sessionIdentityDirName(input.sessionId));
+        if (existsSync(ownDir)) readOnlyCarve.add(ownDir);
       }
     }
   }

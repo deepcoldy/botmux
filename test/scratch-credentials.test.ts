@@ -32,11 +32,15 @@ function layout() {
   writeFileSync(join(data(), 'vc-meeting-daemon-auth', '57'), 't');
   mkdirSync(join(data(), 'bytedcli-home', 'ou_p'), { recursive: true });
   writeFileSync(join(data(), 'bytedcli-home', 'ou_p', 'login.json'), '{}');
-  // trigger-user identity: own session + another person's session
-  mkdirSync(join(data(), 'cli-identity'), { recursive: true });
-  for (const f of ['sess-1.lark-cli.env','sess-1.bytedcli.env','sess-1.bin','sess-1.turn','sess-OTHER.lark-cli.env']) {
-    writeFileSync(join(data(), 'cli-identity', f), 'x');
-  }
+  // trigger-user identity (#1543 layout): <sid>.bin/ wrapper dir containing
+  // .data/<tool>.env + turn; another person's session sits in a sibling .bin dir.
+  mkdirSync(join(data(), 'cli-identity', 'sess-1.bin', '.data'), { recursive: true });
+  writeFileSync(join(data(), 'cli-identity', 'sess-1.bin', 'lark-cli'), 'x');
+  writeFileSync(join(data(), 'cli-identity', 'sess-1.bin', '.data', 'lark-cli.env'), 'x');
+  writeFileSync(join(data(), 'cli-identity', 'sess-1.bin', '.data', 'bytedcli.env'), 'x');
+  writeFileSync(join(data(), 'cli-identity', 'sess-1.bin', '.data', 'turn'), 'x');
+  mkdirSync(join(data(), 'cli-identity', 'sess-OTHER.bin', '.data'), { recursive: true });
+  writeFileSync(join(data(), 'cli-identity', 'sess-OTHER.bin', '.data', 'lark-cli.env'), 'x');
   // REAL Linux lark-cli keystore: point LARKSUITE_CLI_DATA_DIR under root so
   // the test never writes into the runner's real ~/.local/share.
   mkdirSync(join(larkData(), 'lark-cli'), { recursive: true });
@@ -73,14 +77,11 @@ describe('enumerateScratchSecretPaths', () => {
     // per-person secret dirs enclosed wholesale
     expect(got.has(join(data(), 'vc-meeting-daemon-auth'))).toBe(true);
     expect(got.has(join(data(), 'bytedcli-home'))).toBe(true);
-    // cli-identity/ whole dir sealed, own session files carved read-only
+    // cli-identity/ whole dir sealed, own session's <sid>.bin/ dir carved ro
     expect(got.has(join(data(), 'cli-identity'))).toBe(true);
-    expect(carve.has(join(data(), 'cli-identity', 'sess-1.lark-cli.env'))).toBe(true);
-    expect(carve.has(join(data(), 'cli-identity', 'sess-1.bytedcli.env'))).toBe(true);
     expect(carve.has(join(data(), 'cli-identity', 'sess-1.bin'))).toBe(true);
-    expect(carve.has(join(data(), 'cli-identity', 'sess-1.turn'))).toBe(true);
-    // another session's identity file is NOT carved (stays under sealed dir)
-    expect(carve.has(join(data(), 'cli-identity', 'sess-OTHER.lark-cli.env'))).toBe(false);
+    // another session's .bin dir is NOT carved (stays under sealed parent)
+    expect(carve.has(join(data(), 'cli-identity', 'sess-OTHER.bin'))).toBe(false);
     // real Linux lark-cli keystore ($LARKSUITE_CLI_DATA_DIR/lark-cli)
     expect(got.has(join(larkData(), 'lark-cli'))).toBe(true);
     // ordinary top-level dir/file are NOT secrets
