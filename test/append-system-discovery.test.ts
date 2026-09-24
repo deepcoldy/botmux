@@ -302,5 +302,104 @@ describe('append-system-discovery', () => {
         rmSync(home, { recursive: true, force: true });
       }
     });
+
+    it('discovers CLAUDE_CONFIG_DIR when claude is not disabled', () => {
+      const cwd = mkdtempSync(join(tmpdir(), 'omp-disc-cwd-'));
+      const home = mkdtempSync(join(tmpdir(), 'omp-disc-home-'));
+      const claudeDir = mkdtempSync(join(tmpdir(), 'omp-claude-dir-'));
+      try {
+        writeFileSync(join(claudeDir, 'APPEND_SYSTEM.md'), 'CLAUDE_ACTIVE_RULES');
+
+        const result = discoverOmpAppendSystemPrompt({
+          cwd,
+          homeDir: home,
+          env: { CLAUDE_CONFIG_DIR: claudeDir },
+        });
+        expect(result).toBeDefined();
+        expect(result?.content).toBe('CLAUDE_ACTIVE_RULES');
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+        rmSync(home, { recursive: true, force: true });
+        rmSync(claudeDir, { recursive: true, force: true });
+      }
+    });
+
+    it('rejects CLAUDE_CONFIG_DIR when disabledProviders contains claude', () => {
+      const cwd = mkdtempSync(join(tmpdir(), 'omp-disc-cwd-'));
+      const home = mkdtempSync(join(tmpdir(), 'omp-disc-home-'));
+      const claudeDir = mkdtempSync(join(tmpdir(), 'omp-claude-dir-'));
+      try {
+        writeFileSync(join(claudeDir, 'APPEND_SYSTEM.md'), 'CLAUDE_ACTIVE_RULES');
+
+        const result = discoverOmpAppendSystemPrompt({
+          cwd,
+          homeDir: home,
+          env: { CLAUDE_CONFIG_DIR: claudeDir },
+          disabledProviders: ['claude'],
+        });
+        expect(result).toBeUndefined();
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+        rmSync(home, { recursive: true, force: true });
+        rmSync(claudeDir, { recursive: true, force: true });
+      }
+    });
+
+    it('rejects CLAUDE_CONFIG_DIR when settings.json contains disabledProviders: ["claude"]', () => {
+      const cwd = mkdtempSync(join(tmpdir(), 'omp-disc-cwd-'));
+      const home = mkdtempSync(join(tmpdir(), 'omp-disc-home-'));
+      const claudeDir = mkdtempSync(join(tmpdir(), 'omp-claude-dir-'));
+      try {
+        mkdirSync(join(home, '.omp'), { recursive: true });
+        writeFileSync(join(home, '.omp', 'settings.json'), JSON.stringify({ disabledProviders: ['claude'] }));
+        writeFileSync(join(claudeDir, 'APPEND_SYSTEM.md'), 'CLAUDE_ACTIVE_RULES');
+
+        const result = discoverOmpAppendSystemPrompt({
+          cwd,
+          homeDir: home,
+          env: { CLAUDE_CONFIG_DIR: claudeDir },
+        });
+        expect(result).toBeUndefined();
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+        rmSync(home, { recursive: true, force: true });
+        rmSync(claudeDir, { recursive: true, force: true });
+      }
+    });
+
+    it('discovers codex or gemini only when enabledProviders includes them', () => {
+      const cwd = mkdtempSync(join(tmpdir(), 'omp-disc-cwd-'));
+      const home = mkdtempSync(join(tmpdir(), 'omp-disc-home-'));
+      try {
+        mkdirSync(join(home, '.codex'), { recursive: true });
+        writeFileSync(join(home, '.codex', 'APPEND_SYSTEM.md'), 'CODEX_ACTIVE_RULES');
+
+        // Unenabled by default -> returns undefined
+        const unenabled = discoverOmpAppendSystemPrompt({ cwd, homeDir: home, env: { CLAUDE_CONFIG_DIR: '' } });
+        expect(unenabled).toBeUndefined();
+
+        // Enabled via enabledProviders in opts
+        const enabled = discoverOmpAppendSystemPrompt({
+          cwd,
+          homeDir: home,
+          enabledProviders: ['codex'],
+          env: { CLAUDE_CONFIG_DIR: '' },
+        });
+        expect(enabled?.content).toBe('CODEX_ACTIVE_RULES');
+
+        // Enabled via settings.json
+        mkdirSync(join(home, '.omp'), { recursive: true });
+        writeFileSync(join(home, '.omp', 'settings.json'), JSON.stringify({ enabledProviders: ['codex'] }));
+        const enabledViaSettings = discoverOmpAppendSystemPrompt({
+          cwd,
+          homeDir: home,
+          env: { CLAUDE_CONFIG_DIR: '' },
+        });
+        expect(enabledViaSettings?.content).toBe('CODEX_ACTIVE_RULES');
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+        rmSync(home, { recursive: true, force: true });
+      }
+    });
   });
 });

@@ -44,7 +44,7 @@ import { createHermesAdapter } from '../src/adapters/cli/hermes.js';
 import { createMiraAdapter } from '../src/adapters/cli/mira.js';
 import { createMirAdapter } from '../src/adapters/cli/mir.js';
 import { createTraexAdapter, traexNativeSubagentHookConfig } from '../src/adapters/cli/traex.js';
-import { createPiAdapter, buildPiArgs, piTurnBoundaryExtensionPath, PI_PLUGIN_DIR, PI_BUILTIN_SKILLS_DIR } from '../src/adapters/cli/pi.js';
+import { createPiAdapter, buildPiArgs, piTurnBoundaryExtensionPath, materializePiTurnBoundaryExtension, PI_PLUGIN_DIR, PI_BUILTIN_SKILLS_DIR } from '../src/adapters/cli/pi.js';
 import registerBotmuxTurnBoundaryExtension from '../src/adapters/cli/pi-turn-boundary-extension.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
 import { createOhMyPiAdapter, ompSessionDir, OMP_PLUGIN_DIR } from '../src/adapters/cli/oh-my-pi.js';
@@ -1992,7 +1992,7 @@ describe('pi buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-pi', resume: false });
     const flagIdx = args.indexOf('--extension');
     expect(flagIdx).toBeGreaterThanOrEqual(0);
-    expect(args[flagIdx + 1]).toMatch(/pi-turn-boundary-extension\.(?:js|ts)$/);
+    expect(args[flagIdx + 1]).toMatch(/pi-turn-boundary-extension\.(?:[cm]?js|ts)$/);
     // Absolute: Pi resolves a relative --extension against ITS cwd, which is
     // the user's workspace, not ours.
     expect(isAbsolute(args[flagIdx + 1])).toBe(true);
@@ -2014,6 +2014,13 @@ describe('pi buildArgs', () => {
     const args = buildPiArgs({ sessionId: 'sess-pi', turnBoundaryExtension: undefined });
     expect(args).not.toContain('--extension');
     expect(args).toEqual(['--session-id', 'sess-pi']);
+  });
+
+  it('materializes turn-boundary extension to ~/.botmux/pi-skills/extensions for compiled binaries', () => {
+    const extPath = materializePiTurnBoundaryExtension();
+    expect(extPath).toBeTruthy();
+    expect(existsSync(extPath!)).toBe(true);
+    expect(extPath!.endsWith('pi-turn-boundary-extension.js')).toBe(true);
   });
 
   it('pins the configured model instead of inheriting Pi defaults', () => {
@@ -2093,13 +2100,31 @@ describe('pi buildArgs', () => {
     }
   });
 
-  it('preserves native project trust and user APPEND_SYSTEM.md across all runtime trust scenarios', async () => {
-    const { DefaultResourceLoader } = await import('/root/.local/share/fnm/node-versions/v22.21.1/installation/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/resource-loader.js');
-    const { SettingsManager } = await import('/root/.local/share/fnm/node-versions/v22.21.1/installation/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/settings-manager.js');
-    const { ProjectTrustStore } = await import('/root/.local/share/fnm/node-versions/v22.21.1/installation/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/trust-manager.js');
-    const { resolveProjectTrusted } = await import('/root/.local/share/fnm/node-versions/v22.21.1/installation/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/project-trust.js');
-    const { ExtensionRunner } = await import('/root/.local/share/fnm/node-versions/v22.21.1/installation/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/runner.js');
-    const { buildSystemPrompt } = await import('/root/.local/share/fnm/node-versions/v22.21.1/installation/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/system-prompt.js');
+  it('falls back to --append-system-prompt when turnBoundaryExtension is undefined', () => {
+    const args = buildPiArgs({
+      sessionId: 'sess-pi',
+      turnBoundaryExtension: undefined,
+      appendSystemPrompt: ['<botmux_routing>fallback rules</botmux_routing>'],
+    });
+    expect(args).not.toContain('--extension');
+    expect(args).toContain('--append-system-prompt');
+    expect(args).toContain('<botmux_routing>fallback rules</botmux_routing>');
+  });
+
+  const defaultPiCoreCandidate = '/root/.local/share/fnm/node-versions/v22.21.1/installation/lib/node_modules/@earendil-works/pi-coding-agent/dist/core';
+  const piCoreDir = (process.env.PI_CODING_AGENT_CORE_DIR && existsSync(join(process.env.PI_CODING_AGENT_CORE_DIR, 'resource-loader.js')))
+    ? process.env.PI_CODING_AGENT_CORE_DIR
+    : (process.env.RUN_PI_INTEGRATION_TESTS === '1' && existsSync(join(defaultPiCoreCandidate, 'resource-loader.js')))
+      ? defaultPiCoreCandidate
+      : undefined;
+
+  it.skipIf(!piCoreDir)('preserves native project trust and user APPEND_SYSTEM.md across all runtime trust scenarios (opt-in integration)', async () => {
+    const { DefaultResourceLoader } = await import(join(piCoreDir!, 'resource-loader.js'));
+    const { SettingsManager } = await import(join(piCoreDir!, 'settings-manager.js'));
+    const { ProjectTrustStore } = await import(join(piCoreDir!, 'trust-manager.js'));
+    const { resolveProjectTrusted } = await import(join(piCoreDir!, 'project-trust.js'));
+    const { ExtensionRunner } = await import(join(piCoreDir!, 'extensions', 'runner.js'));
+    const { buildSystemPrompt } = await import(join(piCoreDir!, 'system-prompt.js'));
 
     const root = mkdtempSync(join(tmpdir(), 'pi-trust-scenarios-'));
     try {

@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, isAbsolute, join, resolve } from 'node:path';
 
 export interface DiscoveredAppendPrompt {
   readonly path: string;
@@ -205,6 +205,8 @@ export function discoverOmpAppendSystemPrompt(opts?: {
   configDir?: string;
   profile?: string;
   env?: NodeJS.ProcessEnv;
+  enabledProviders?: string[];
+  disabledProviders?: string[];
 }): DiscoveredAppendPrompt | undefined {
   const env = { ...process.env, ...opts?.env };
   const cwd = opts?.cwd ? resolve(opts.cwd) : process.cwd();
@@ -240,15 +242,68 @@ export function discoverOmpAppendSystemPrompt(opts?: {
   }
 
   // 3. Foreign user config directories (.claude, .codex, .gemini)
+  // Aligned with OMP's `isUserSourceEnabled`:
+  // - disabledProviders takes absolute precedence (returns false).
+  // - explicit enabledProviders (or wildcard '*' / 'all') enables the provider.
+  // - CLAUDE_CONFIG_DIR enables claude (unless claude is disabled).
+  // - otherwise foreign user source is opt-in and defaults to disabled.
+  const enabledProviders = new Set<string>();
+  const disabledProviders = new Set<string>();
+
+  if (opts?.enabledProviders) {
+    for (const p of opts.enabledProviders) enabledProviders.add(p.trim().toLowerCase());
+  }
+  if (opts?.disabledProviders) {
+    for (const p of opts.disabledProviders) disabledProviders.add(p.trim().toLowerCase());
+  }
+
+  const settingsCandidates = [
+    isAbsolute(configDir) ? join(configDir, 'settings.json') : join(home, configDir, 'settings.json'),
+    join(cwd, isAbsolute(configDir) ? '.omp' : configDir, 'settings.json'),
+  ];
+  for (const settingsFile of settingsCandidates) {
+    if (existsSync(settingsFile)) {
+      try {
+        const parsed = JSON.parse(readFileSync(settingsFile, 'utf-8'));
+        if (Array.isArray(parsed.enabledProviders)) {
+          for (const p of parsed.enabledProviders) {
+            if (typeof p === 'string') enabledProviders.add(p.trim().toLowerCase());
+          }
+        }
+        if (Array.isArray(parsed.disabledProviders)) {
+          for (const p of parsed.disabledProviders) {
+            if (typeof p === 'string') disabledProviders.add(p.trim().toLowerCase());
+          }
+        }
+      } catch {
+        // ignore parse failure
+      }
+    }
+  }
+
+  const isProviderActive = (provider: 'claude' | 'codex' | 'gemini'): boolean => {
+    if (disabledProviders.has(provider)) return false;
+    if (enabledProviders.has(provider) || enabledProviders.has('*') || enabledProviders.has('all')) {
+      return true;
+    }
+    if (provider === 'claude' && Boolean(env.CLAUDE_CONFIG_DIR?.trim())) {
+      return true;
+    }
+    return false;
+  };
+
   const claudeUserDir = env.CLAUDE_CONFIG_DIR?.trim()
     ? resolve(expandTilde(env.CLAUDE_CONFIG_DIR.trim()))
     : join(home, '.claude');
-  const foreignUserDirs = [
-    claudeUserDir,
-    join(home, '.codex'),
-    join(home, '.gemini'),
+
+  const foreignProviders: Array<{ provider: 'claude' | 'codex' | 'gemini'; dir: string }> = [
+    { provider: 'claude', dir: claudeUserDir },
+    { provider: 'codex', dir: join(home, '.codex') },
+    { provider: 'gemini', dir: join(home, '.gemini') },
   ];
-  for (const dir of foreignUserDirs) {
+
+  for (const { provider, dir } of foreignProviders) {
+    if (!isProviderActive(provider)) continue;
     const foreignCandidate = join(dir, 'APPEND_SYSTEM.md');
     if (existsSync(foreignCandidate)) {
       try {

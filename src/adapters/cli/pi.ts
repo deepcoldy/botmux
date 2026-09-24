@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -6,10 +6,18 @@ import { fileURLToPath } from 'node:url';
 import { resolveCommand } from './registry.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
 import { preparePiInitialPromptArg } from './pi-initial-prompt.js';
+import { PI_TURN_BOUNDARY_EXTENSION_SOURCE } from './pi-turn-boundary-extension-data.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
 
 import { delay } from '../../utils/timing.js';
+
+/** botmux ships its built-in skills for Pi here and injects it per-session via
+ *  `--skill` (see buildArgs). Kept out of the global `~/.pi/agent/skills` so a
+ *  standalone `pi` never surfaces (and mis-fires) them. Single source of truth
+ *  for both the adapter's `pluginDir` field and the spawn-time flag. */
+export const PI_PLUGIN_DIR = join(homedir(), '.botmux', 'pi-skills');
+export const PI_BUILTIN_SKILLS_DIR = join(PI_PLUGIN_DIR, 'skills');
 
 /** Absolute path to the turn-boundary extension handed to Pi via `--extension`,
  *  or `undefined` when no readable copy exists on disk.
@@ -21,30 +29,42 @@ import { delay } from '../../utils/timing.js';
  *  caller therefore omits the flag entirely in that case and the reader falls
  *  back to its timeout backstop — degraded, not broken.
  *
- *  The case is real, not theoretical: inside a `bun build --compile` binary the
- *  module graph lives in the virtual `/$bunfs/` root, so both `__dirname`-derived
- *  candidates resolve to paths that exist only inside this process — measured
- *  `/$bunfs/root/pi-turn-boundary-extension.{js,ts}`, neither present on disk.
- *  See CLAUDE.md on why a `__dirname` path must never be handed to another
- *  process. Resolved lazily at spawn time so constructing the adapter never
- *  touches the filesystem. */
+ *  Inside a `bun build --compile` binary the module graph lives in the virtual
+ *  `/$bunfs/` root, so `__dirname`-derived candidates resolve to paths that exist
+ *  only inside this process. To ensure external `pi` processes and sandboxes can
+ *  load the extension in compiled form, we materialize the embedded JS source to
+ *  a real path on disk inside `PI_PLUGIN_DIR/extensions/` (which is whitelisted
+ *  as read-only in fs-policy). */
 export function piTurnBoundaryExtensionPath(): string | undefined {
   const here = dirname(fileURLToPath(import.meta.url));
   for (const candidate of [
     resolve(here, 'pi-turn-boundary-extension.js'),
+    resolve(here, 'pi-turn-boundary-extension.mjs'),
     resolve(here, 'pi-turn-boundary-extension.ts'),
   ]) {
     if (existsSync(candidate)) return candidate;
   }
-  return undefined;
+
+  // Inside a compiled binary, materialize the embedded extension source
+  // to a real path on disk that the child process can load and the file-sandbox permits.
+  return materializePiTurnBoundaryExtension();
 }
 
-/** botmux ships its built-in skills for Pi here and injects it per-session via
- *  `--skill` (see buildArgs). Kept out of the global `~/.pi/agent/skills` so a
- *  standalone `pi` never surfaces (and mis-fires) them. Single source of truth
- *  for both the adapter's `pluginDir` field and the spawn-time flag. */
-export const PI_PLUGIN_DIR = join(homedir(), '.botmux', 'pi-skills');
-export const PI_BUILTIN_SKILLS_DIR = join(PI_PLUGIN_DIR, 'skills');
+/** Materializes the embedded turn-boundary extension JS file into
+ *  `PI_PLUGIN_DIR/extensions/pi-turn-boundary-extension.js`. */
+export function materializePiTurnBoundaryExtension(): string | undefined {
+  try {
+    const extDir = join(PI_PLUGIN_DIR, 'extensions');
+    const extPath = join(extDir, 'pi-turn-boundary-extension.js');
+    if (!existsSync(extPath) || readFileSync(extPath, 'utf8') !== PI_TURN_BOUNDARY_EXTENSION_SOURCE) {
+      mkdirSync(extDir, { recursive: true, mode: 0o755 });
+      writeFileSync(extPath, PI_TURN_BOUNDARY_EXTENSION_SOURCE, { encoding: 'utf8', mode: 0o644 });
+    }
+    return extPath;
+  } catch {
+    return undefined;
+  }
+}
 
 /** Launch argv for Pi. Split out from `buildArgs` so the extension-missing
  *  branch is reachable in a test: that branch only happens inside a compiled
@@ -196,15 +216,25 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
 
       // Inject the Botmux routing prompt into the process environment so that
       // pi-turn-boundary-extension can append it during `before_agent_start`.
-      // We deliberately do NOT pass `--append-system-prompt` via argv here:
-      // Pi's CLI disables native automatic discovery of project/user APPEND_SYSTEM.md
-      // whenever `--append-system-prompt` is present on argv, and ahead-of-time argv
-      // cannot predict runtime project trust decisions (such as interactive
-      // "Trust (this session only)" or `project_trust` extensions). Appending via
-      // the extension after native discovery completes preserves 100% faithful
-      // native project trust resolution while cleanly injecting Botmux rules.
-      if (env && botmuxAppendPrompt) {
-        env.BOTMUX_APPEND_SYSTEM_PROMPT = botmuxAppendPrompt;
+      // We deliberately do NOT pass `--append-system-prompt` via argv when the
+      // extension is loaded: Pi's CLI disables native automatic discovery of
+      // project/user APPEND_SYSTEM.md whenever `--append-system-prompt` is present
+      // on argv, and ahead-of-time argv cannot predict runtime project trust decisions.
+      // Appending via the extension after native discovery completes preserves 100%
+      // faithful native project trust resolution while cleanly injecting Botmux rules.
+      const turnBoundaryExt = piTurnBoundaryExtensionPath();
+      const appendPrompts: string[] = [];
+
+      if (turnBoundaryExt) {
+        if (env && botmuxAppendPrompt) {
+          env.BOTMUX_APPEND_SYSTEM_PROMPT = botmuxAppendPrompt;
+        }
+      } else {
+        // Fallback when extension cannot be materialized: pass via --append-system-prompt
+        // so system prompt is never lost even if boundary tracking degrades.
+        if (botmuxAppendPrompt) {
+          appendPrompts.push(botmuxAppendPrompt);
+        }
       }
 
       return buildPiArgs({
@@ -212,9 +242,10 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
         initialPrompt,
         nativeSessionTitle,
         model,
-        turnBoundaryExtension: piTurnBoundaryExtensionPath(),
+        turnBoundaryExtension: turnBoundaryExt,
         builtinSkillsDir: PI_BUILTIN_SKILLS_DIR,
         skillPluginDir,
+        appendSystemPrompt: appendPrompts.length ? appendPrompts : undefined,
       });
     },
 
