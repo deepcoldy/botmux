@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { applyAllowedUsersResolve } from '../src/utils/allowed-users-apply.js';
+import {
+  applyAllowedUsersResolve,
+  shouldSilenceAllowedUsersOwnerDm,
+  classifyAllowedUsersTerminalNotice,
+} from '../src/utils/allowed-users-apply.js';
 import type { EntryResolveStatus } from '../src/im/lark/client.js';
 
 /** Build a resolveResult from a raw→ou_ map + per-entry status. */
@@ -215,4 +219,53 @@ describe('applyAllowedUsersResolve', () => {
     expect(out.fullyRecovered).toBe(true);
     expect(out.hasPermanentBatchError).toBe(true);
   });
+});
+
+// PR#1559 alert-tiering predicates — the daemon's startup DM gate and terminal
+// notice tier are pure policy over the apply result / current bot state. Pin
+// every boolean combination so a flipped operator (|| vs &&) cannot go green.
+describe('shouldSilenceAllowedUsersOwnerDm — startup alert gate (PR#1559)', () => {
+  const cases: Array<{ name: string; applied: Parameters<typeof shouldSilenceAllowedUsersOwnerDm>[0]; expected: boolean }> = [
+    { name: 'failed + fully recovered + pure transient → silence', applied: { failed: true, fullyRecovered: true, hasPermanentBatchError: false }, expected: true },
+    { name: 'failed + fully recovered + flag absent → silence', applied: { failed: true, fullyRecovered: true }, expected: true },
+    { name: 'failed + fully recovered + permanent batch error → DM', applied: { failed: true, fullyRecovered: true, hasPermanentBatchError: true }, expected: false },
+    { name: 'failed + NOT fully recovered (owner partly locked out) → DM', applied: { failed: true, fullyRecovered: false, hasPermanentBatchError: false }, expected: false },
+    { name: 'failed + not recovered + permanent → DM', applied: { failed: true, fullyRecovered: false, hasPermanentBatchError: true }, expected: false },
+    { name: 'clean pass (failed=false) → gate irrelevant, no silence decision', applied: { failed: false, fullyRecovered: true, hasPermanentBatchError: false }, expected: false },
+  ];
+  for (const { name, applied, expected } of cases) {
+    it(name, () => {
+      expect(shouldSilenceAllowedUsersOwnerDm(applied)).toBe(expected);
+    });
+  }
+
+  it('end-to-end: pure transient timeout with complete cache silences; missing-scope permanent does not', () => {
+    const transient = applyAllowedUsersResolve({
+      rawEntries: ['on_a'],
+      previousResolvedMap: { on_a: 'ou_a' },
+      resolveResult: result([], [['on_a', 'transient']], true),
+    });
+    expect(shouldSilenceAllowedUsersOwnerDm(transient)).toBe(true);
+
+    const permanent = applyAllowedUsersResolve({
+      rawEntries: ['on_a'],
+      previousResolvedMap: { on_a: 'ou_a' },
+      resolveResult: { ...result([], [['on_a', 'transient']], true), hasPermanentBatchError: true },
+    });
+    expect(shouldSilenceAllowedUsersOwnerDm(permanent)).toBe(false);
+  });
+});
+
+describe('classifyAllowedUsersTerminalNotice — retry-exhaustion tier (PR#1559)', () => {
+  const cases: Array<{ name: string; state: { configuredCount: number; resolvedCount: number }; expected: ReturnType<typeof classifyAllowedUsersTerminalNotice> }> = [
+    { name: 'config removed mid-retry → no notice', state: { configuredCount: 0, resolvedCount: 0 }, expected: null },
+    { name: 'still configured, runtime list empty → allowlist-empty', state: { configuredCount: 2, resolvedCount: 0 }, expected: 'allowlist-empty' },
+    { name: 'still configured with recovered list → cache-degraded', state: { configuredCount: 2, resolvedCount: 2 }, expected: 'cache-degraded' },
+    { name: 'teardown with non-empty list does not alarm', state: { configuredCount: 0, resolvedCount: 3 }, expected: null },
+  ];
+  for (const { name, state, expected } of cases) {
+    it(name, () => {
+      expect(classifyAllowedUsersTerminalNotice(state)).toBe(expected);
+    });
+  }
 });

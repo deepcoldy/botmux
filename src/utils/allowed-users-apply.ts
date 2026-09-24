@@ -198,3 +198,42 @@ export function applyAllowedUsersResolve(
   const hasPermanentBatchError = input.resolveResult.hasPermanentBatchError === true;
   return { resolved, map: outMap, usedFallback, failed: true, notice, fullyRecovered, hasPermanentBatchError };
 }
+
+/**
+ * Startup owner-DM silence gate. The yellow ⚠️ resolve-warning DM is suppressed
+ * ONLY when the degraded pass is completely masked by a complete per-entry
+ * cache fallback AND nothing in the failure was a permanent app-level error
+ * (missing contact scope / rejected batch request). A permanent error must page
+ * the owner immediately even if the cache happens to cover every configured
+ * entry: the bot is running on stale grants and operator action is required.
+ *
+ * Pure predicate on the apply result so the alert-tiering policy is table-tested
+ * independently of daemon wiring.
+ */
+export function shouldSilenceAllowedUsersOwnerDm(applied: {
+  failed: boolean;
+  fullyRecovered: boolean;
+  hasPermanentBatchError?: boolean;
+}): boolean {
+  return applied.failed === true
+    && applied.fullyRecovered === true
+    && applied.hasPermanentBatchError !== true;
+}
+
+/** Retry-exhaustion notice tier derived from the bot's current allowlist state. */
+export type AllowedUsersTerminalNoticeKind = 'allowlist-empty' | 'cache-degraded' | null;
+
+/**
+ * Classify the terminal notice after startup + 3 retries all failed:
+ *   - config removed / bot torn down (no configured entries) → no notice;
+ *   - still configured but runtime allowlist empty → everyone incl. owner is denied;
+ *   - still configured with a non-empty runtime list → running degraded on cache.
+ */
+export function classifyAllowedUsersTerminalNotice(state: {
+  configuredCount: number;
+  resolvedCount: number;
+}): AllowedUsersTerminalNoticeKind {
+  if (state.configuredCount <= 0) return null;
+  if (state.resolvedCount <= 0) return 'allowlist-empty';
+  return 'cache-degraded';
+}

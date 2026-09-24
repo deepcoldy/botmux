@@ -131,7 +131,7 @@ import { buildQuoteHint } from './im/lark/quote-hint.js';
 import { buildTopicThreadContext } from './im/lark/topic-root-context.js';
 import { logger } from './utils/logger.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
-import { applyAllowedUsersResolve } from './utils/allowed-users-apply.js';
+import { applyAllowedUsersResolve, shouldSilenceAllowedUsersOwnerDm, classifyAllowedUsersTerminalNotice } from './utils/allowed-users-apply.js';
 import { withFileLock, withFileLockSync } from './utils/file-lock.js';
 import {
   hasUnsettledCodexAppDispatch,
@@ -4618,16 +4618,18 @@ function scheduleAllowedUsersResolveRetry(larkAppId: string, attempt = 1): void 
     // a config change or a bot teardown mid-retry is not an exhaustion worth alarming on.
     try {
       const bot = getBot(larkAppId);
-      const stillConfigured = (bot.config.allowedUsers ?? []).length > 0;
-      const stillEmpty = (bot.resolvedAllowedUsers ?? []).length === 0;
-      if (stillConfigured && stillEmpty) {
+      const terminalKind = classifyAllowedUsersTerminalNotice({
+        configuredCount: (bot.config.allowedUsers ?? []).length,
+        resolvedCount: bot.resolvedAllowedUsers?.length ?? 0,
+      });
+      if (terminalKind === 'allowlist-empty') {
         notifyAllowedUsersResolveFailure(
           larkAppId,
           `allowedUsers 自动解析在启动后重试 3 次仍失败，运行时白名单为空 —— 期间包括你在内的所有人都会被拒。` +
           `请检查网络 / 飞书 contact API 后执行 \`botmux restart\` 重新解析。`,
           bot.resolvedAllowedUsers ?? [],
         );
-      } else if (stillConfigured) {
+      } else if (terminalKind === 'cache-degraded') {
         notifyAllowedUsersResolveFailure(
           larkAppId,
           `allowedUsers 自动解析在启动后重试 3 次仍失败，当前仍依赖本地缓存兜底运行（对话暂未受阻，但无法同步最新人员变更）。` +
@@ -26747,7 +26749,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           });
           logger.info(`[${cfg.larkAppId}] Resolved allowedUsers: ${bot.resolvedAllowedUsers.join(', ') || '(empty)'}${applied.usedFallback ? ' [some from cache]' : ''}`);
           if (applied.failed && applied.notice) {
-            if (applied.fullyRecovered && !applied.hasPermanentBatchError) {
+            if (shouldSilenceAllowedUsersOwnerDm(applied)) {
               logger.warn(`[${cfg.larkAppId}] ${applied.notice} (cached fallback active for transient error, silenced owner DM; scheduled retry)`);
             } else {
               notifyAllowedUsersResolveFailure(cfg.larkAppId, applied.notice, applied.resolved);
@@ -26773,7 +26775,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           }
           const notice = applied.notice
             ?? `Failed to resolve allowedUsers: ${err?.message ?? err}`;
-          if (applied.fullyRecovered) {
+          if (shouldSilenceAllowedUsersOwnerDm(applied)) {
             logger.warn(
               `[${cfg.larkAppId}] ${notice} (throw: ${err?.message ?? err}; cached fallback active, silenced owner DM; scheduled retry)`,
             );

@@ -1804,7 +1804,13 @@ export async function resolveAllowedUsersWithMap(
           // non-definitive code (network/5xx/rate-limit) is transient.
           const definitive = res?.code === 0 ? true : !!classifyContactErrorCode(res?.code);
           if (!definitive) errored = true;
-          if (isPermanentContactErrorCode(res?.code)) hasPermanentBatchError = true;
+          // Per-entry union GET: only APP-LEVEL capability failures (missing
+          // scope) mark a permanent batch error — they fail every entry for
+          // reasons unrelated to identity and must not be silenced. Per-entry
+          // identity verdicts (41050 not-visible / 41012 / 40001 / 99992361)
+          // are NOT batch-wide signals: mixed with a transient email batch they
+          // would false-alarm on startup.
+          if (res?.code === 99991672 || res?.code === 99991679) hasPermanentBatchError = true;
           entryStatus.set(uid, definitive ? 'definitive' : 'transient');
           logger.warn(`Failed to resolve union_id ${uid} to open_id: ${res?.msg} (code: ${res?.code})`);
         }
@@ -1812,7 +1818,9 @@ export async function resolveAllowedUsersWithMap(
         const errCode = getLarkErrorCode(err);
         const definitive = !!classifyContactErrorCode(errCode);
         if (!definitive) errored = true;
-        if (isPermanentContactErrorCode(errCode)) hasPermanentBatchError = true;
+        // Same as the non-throw branch above: only app-level missing-scope
+        // codes are permanent batch signals; per-entry identity codes stay silent.
+        if (errCode === 99991672 || errCode === 99991679) hasPermanentBatchError = true;
         entryStatus.set(uid, definitive ? 'definitive' : 'transient');
         logger.warn(`resolve union_id ${uid} failed: ${err?.message ?? err}`);
       }
