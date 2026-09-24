@@ -7686,6 +7686,17 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         throw new Error('沙盒会话只能管理自己 bot 的任务。');
       }
       await revalidateScheduleCreator(authenticatedCur);
+      // A protected precondition sidecar records a hash of the task's canonical
+      // input (prompt included) and lives in a host-only directory the sandboxed
+      // CLI can neither read nor rebind. Rewriting the prompt here would leave
+      // the stored hash stale, so every later fire fails resolution with
+      // canonical_input_mismatch and the task silently stops forever. Dashboard
+      // edits go through updateTaskWithOptionalPrecondition, which rebinds; the
+      // CLI must refuse instead of reporting success.
+      const bound = scheduleStore.getTask(id);
+      if (bound?.preconditionRef) {
+        throw new Error(`任务 ${id} 绑定了守护前置条件（precondition），CLI 更新会破坏其安全绑定导致任务停止执行；请在 Dashboard 的定时任务页修改提示词。`);
+      }
       const result = scheduler.updateTask(id, { prompt });
       if (!result.ok) throw new Error(`无法更新任务 ${id}: ${result.error}`);
       console.log(`✅ 已更新任务 ${id} 的 prompt；后续执行生效，未触发补跑。`);

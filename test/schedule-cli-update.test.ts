@@ -10,6 +10,11 @@ import { managedOriginCapabilityPath, replaceManagedOriginCapabilityFile } from 
 import { MANAGED_ORIGIN_PROOF_DOMAIN, writeManagedOriginAttestationProof, type ManagedOriginAttestation } from '../src/core/managed-origin-attestation.js';
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
 import { readSchedulePromptUpdate } from '../src/cli/schedule-update.js';
+import {
+  activateSchedulePrecondition,
+  resolveSchedulePrecondition,
+  stageSchedulePrecondition,
+} from '../src/services/schedule-precondition-store.js';
 
 const app = 'cli_schedule';
 const sid = 'schedule-session';
@@ -131,6 +136,29 @@ describe('schedule CLI prompt updates', () => {
     expect(result.code, result.output).toBe(0);
     expect(calls()).toBe(2);
     expect(f.read()[f.task.id].prompt).toBe('host-visible ancestry');
+  });
+  it('refuses to touch a task bound to a protected precondition and keeps the binding valid', async () => {
+    // A CLI prompt rewrite changes canonical schedule input. The host-only
+    // precondition sidecar is unreadable inside the worker sandbox, so the CLI
+    // cannot rebind it; a successful update here would leave every future fire
+    // failing resolution with canonical_input_mismatch and the task silently
+    // never running again.
+    const f = fixture();
+    const staged = stageSchedulePrecondition(app, f.task.id, {
+      enabled: true, source: { kind: 'inline', script: 'exit 0' },
+    }, { dataDir: f.dataDir });
+    const bound = { ...f.task, preconditionRef: staged.preconditionRef };
+    writeFileSync(f.path, JSON.stringify({ [f.task.id]: bound }));
+    activateSchedulePrecondition(bound, app, { dataDir: f.dataDir });
+    const before = readFileSync(f.path, 'utf8');
+
+    const result = await f.run(['update', f.task.id, '--prompt', 'new prompt']);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toMatch(/precondition|前置条件/);
+    expect(readFileSync(f.path, 'utf8')).toBe(before);
+
+    const resolved = resolveSchedulePrecondition(f.read()[f.task.id], app, { dataDir: f.dataDir });
+    expect(resolved).toMatchObject({ kind: 'configured', enabled: true });
   });
   it.each(['denied', 'old-daemon', 'turn-rotated', 'permission-revoked', 'cross-bot'] as const)(
     'preserves the old task when authorization is %s', async mode => {
