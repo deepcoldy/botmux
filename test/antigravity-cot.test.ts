@@ -281,5 +281,46 @@ describe('antigravity-cot', () => {
       );
       expect(isAntigravityTranscriptBusy(file)).toBe(false);
     });
+
+    it('returns false when completed response is followed by cancellation or CHECKPOINT', () => {
+      const file = join(tmpDir, 'canceled.jsonl');
+      writeFileSync(
+        file,
+        JSON.stringify({ source: 'MODEL', type: 'PLANNER_RESPONSE', content: 'done' }) + '\n' +
+        JSON.stringify({ source: 'SYSTEM', type: 'SYSTEM_MESSAGE', content: 'The user canceled the task.' }) + '\n',
+      );
+      expect(isAntigravityTranscriptBusy(file)).toBe(false);
+
+      const checkpointFile = join(tmpDir, 'checkpoint.jsonl');
+      writeFileSync(
+        checkpointFile,
+        JSON.stringify({ source: 'MODEL', type: 'PLANNER_RESPONSE', content: 'done' }) + '\n' +
+        JSON.stringify({ source: 'SYSTEM', type: 'CHECKPOINT', content: 'state snapshot' }) + '\n',
+      );
+      expect(isAntigravityTranscriptBusy(checkpointFile)).toBe(false);
+    });
+
+    it('returns false on ERROR_MESSAGE after user prompt', () => {
+      const file = join(tmpDir, 'error.jsonl');
+      writeFileSync(
+        file,
+        JSON.stringify({ source: 'USER_EXPLICIT', type: 'USER_INPUT', content: 'hi' }) + '\n' +
+        JSON.stringify({ source: 'SYSTEM', type: 'ERROR_MESSAGE', content: 'error: generation failed' }) + '\n',
+      );
+      expect(isAntigravityTranscriptBusy(file)).toBe(false);
+    });
+
+    it('returns true when tool call record is longer than initial read buffer (e.g. 10KB+)', () => {
+      const file = join(tmpDir, 'large-tool-call.jsonl');
+      writeFileSync(
+        file,
+        JSON.stringify({
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          tool_calls: [{ name: 'write_file', args: { content: 'x'.repeat(10_000) } }],
+        }) + '\n',
+      );
+      expect(isAntigravityTranscriptBusy(file)).toBe(true);
+    });
   });
 });

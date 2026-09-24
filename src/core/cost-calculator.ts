@@ -21,7 +21,6 @@ import {
   type TranscriptEvent,
 } from '../services/claude-transcript.js';
 import { readAntigravityTokenUsage } from '../services/antigravity-usage.js';
-import { findAntigravityConversationIdByWorkspace } from '../services/antigravity-discovery.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -1314,9 +1313,8 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
     return readSessionTokenAggregateCached(checkpointPath, 'aiden', { fresh: q.fresh });
   }
   if (q.cliId === 'antigravity') {
-    const sid = q.cliSessionId || (q.cwd ? findAntigravityConversationIdByWorkspace(q.cwd) : null) || q.sessionId;
-    if (!sid) return null;
-    return readAntigravityTokenUsage(sid) as UsageReadResult | null;
+    if (!q.cliSessionId) return null;
+    return readAntigravityTokenUsage(q.cliSessionId) as UsageReadResult | null;
   }
   const resolved = resolveSessionTranscriptPath(q);
   if (!resolved || !existsSync(resolved.path)) return null;

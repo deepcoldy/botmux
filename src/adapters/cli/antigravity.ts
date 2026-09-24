@@ -139,28 +139,69 @@ export function isAntigravityTranscriptBusy(transcriptPath: string): boolean {
     try {
       const stats = fstatSync(fd);
       if (stats.size === 0) return false;
-      const readLen = Math.min(stats.size, 8192);
-      const buf = Buffer.alloc(readLen);
-      readSync(fd, buf, 0, readLen, stats.size - readLen);
-      const text = buf.toString('utf-8');
-      const lines = text.trim().split('\n');
+
+      // Read from end, expanding buffer if needed so records > 8KB parse completely
+      let chunkSize = Math.min(stats.size, 64 * 1024);
+      let lines: string[] = [];
+      let parsedAtLeastOne = false;
+
+      while (chunkSize <= stats.size) {
+        const buf = Buffer.alloc(chunkSize);
+        readSync(fd, buf, 0, chunkSize, stats.size - chunkSize);
+        const text = buf.toString('utf-8');
+        const rawLines = text.split('\n');
+        const candidateLines = stats.size > chunkSize ? rawLines.slice(1) : rawLines;
+        for (let i = candidateLines.length - 1; i >= 0; i--) {
+          const trimmed = candidateLines[i].trim();
+          if (!trimmed) continue;
+          try {
+            JSON.parse(trimmed);
+            parsedAtLeastOne = true;
+            break;
+          } catch {
+            // Not a complete line
+          }
+        }
+        if (parsedAtLeastOne || chunkSize >= stats.size || chunkSize >= 1024 * 1024) {
+          lines = candidateLines;
+          break;
+        }
+        chunkSize = Math.min(stats.size, chunkSize * 4);
+      }
+
       for (let i = lines.length - 1; i >= 0; i--) {
         const line = lines[i].trim();
         if (!line) continue;
+        let rec: any;
         try {
-          const rec = JSON.parse(line);
-          if (rec.type === 'USER_INPUT') return true;
-          if (rec.type === 'GENERIC' || rec.type === 'SYSTEM_MESSAGE' || rec.type === 'CHECKPOINT' || rec.type === 'TASK_NOTIFICATION') {
-            return true;
-          }
-          if (rec.type === 'PLANNER_RESPONSE') {
-            if (Array.isArray(rec.tool_calls) && rec.tool_calls.length > 0) {
-              return true;
-            }
+          rec = JSON.parse(line);
+        } catch {
+          continue;
+        }
+
+        const type = rec?.type;
+        if (type === 'ERROR_MESSAGE' || type === 'ERROR') {
+          return false;
+        }
+        if (type === 'SYSTEM_MESSAGE') {
+          const content = String(rec?.content ?? '');
+          if (/cancell?ed|interrupted|aborted/i.test(content)) {
             return false;
           }
-        } catch {
-          // ignore corrupted trailing chunk line
+          // Non-cancel system messages (e.g. system notifications) don't dictate terminal state; inspect prior record
+          continue;
+        }
+        if (type === 'CHECKPOINT' || type === 'TASK_NOTIFICATION') {
+          continue;
+        }
+        if (type === 'PLANNER_RESPONSE') {
+          if (Array.isArray(rec.tool_calls) && rec.tool_calls.length > 0) {
+            return true;
+          }
+          return false;
+        }
+        if (type === 'GENERIC' || type === 'USER_INPUT') {
+          return true;
         }
       }
     } finally {
