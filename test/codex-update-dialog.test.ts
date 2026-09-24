@@ -4,7 +4,7 @@ import { isObserveBackend } from '../src/adapters/backend/types.js';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { CodexUpdateDialogGuard, codexUpdateDialogSafeKeys } from '../src/utils/codex-update-dialog.js';
+import { aidenCodexResumeNeedsRedraw, CodexUpdateDialogGuard, codexUpdateDialogSafeKeys } from '../src/utils/codex-update-dialog.js';
 
 describe('CodexUpdateDialogGuard', () => {
   it('detects the numbered Update now / Skip picker through ANSI', () => {
@@ -108,3 +108,16 @@ it.each([false, true, undefined])('does not count refused special keys (%s)', re
   expect(run({ sendSpecialKeys: () => result }, ['Enter'], () => {}, 1)).toBe(result === false);
 });
 const workerSourceForDelivery = readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
+
+describe('Aiden resumed composer redraw', () => {
+  it('requests a redraw only for an empty resumed composer with the configured runtime footer', () => {
+    const screen = 'Previous answer\n\n› Ask Codex to do anything\n\n  gpt-5.6-sol high · /tmp/project · Task title\n';
+    expect(aidenCodexResumeNeedsRedraw(screen)).toBe(true);
+    for (const prefix of ['│ model: loading │\n', 'Resuming session...\n', 'Working (esc to interrupt)\n', 'Queued for capacity\n']) {
+      expect(aidenCodexResumeNeedsRedraw(prefix + screen)).toBe(false);
+    }
+    expect(aidenCodexResumeNeedsRedraw(screen.replace('Ask Codex to do anything', 'unsent draft'))).toBe(false);
+    expect(aidenCodexResumeNeedsRedraw(screen + 'Press enter to continue')).toBe(false);
+    expect(aidenCodexResumeNeedsRedraw('› Ask Codex to do anything\n  ? for shortcuts')).toBe(false);
+  });
+});

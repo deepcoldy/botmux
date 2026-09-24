@@ -228,6 +228,29 @@ describe('createRepoWorktree', () => {
     expect(git(res.path, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}')).toBe('origin/feat/remote-only');
   });
 
+  it('can reserve a deterministic explicit branch without adopting a same-named remote', async () => {
+    const upstream = makeUpstream('upstream');
+    const masterHead = git(upstream, 'rev-parse', 'HEAD');
+    git(upstream, 'switch', '-c', 'wt/host-owned');
+    git(upstream, 'commit', '--allow-empty', '-m', 'unrelated remote branch');
+    const remoteHead = git(upstream, 'rev-parse', 'HEAD');
+    git(upstream, 'switch', 'master');
+    const repo = makeClone(upstream, 'proj');
+
+    const res = await createRepoWorktree(repo, {
+      branch: 'wt/host-owned',
+      worktreePath: join(tempRoot, 'host-owned-target'),
+      ignoreRemoteBranch: true,
+    });
+
+    expect(res.baseRef).toBe('origin/master');
+    expect(git(res.path, 'rev-parse', 'HEAD')).toBe(masterHead);
+    expect(git(res.path, 'rev-parse', 'HEAD')).not.toBe(remoteHead);
+    expect(() => git(
+      res.path, 'rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}',
+    )).toThrow();
+  });
+
   it('names the worktree after the MAIN repo when given a linked worktree path', async () => {
     const upstream = makeUpstream('upstream');
     const repo = makeClone(upstream, 'proj');

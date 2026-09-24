@@ -149,7 +149,9 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
 
 /** 大小写不敏感地按 key 找字段 spec。 */
 export function findConfigField(key: string): ConfigFieldSpec | undefined {
-  const k = key.trim().toLowerCase();
+  const requested = key.trim().toLowerCase();
+  // [legacy-thinkingCard] 旧字段名仍可写；随 normalizeCotEnabled 一并移除（不早于 v3.33.0）。
+  const k = requested === 'thinkingcard' ? 'cotenabled' : requested;
   return CONFIG_FIELDS.find(f => f.key.toLowerCase() === k);
 }
 
@@ -368,8 +370,11 @@ async function applyConfigFieldInternal(
         return { write: false, result: `invalid_cli_launch_mode: ${(e as Error).message}` };
       }
     } else if (effective === null) {
+      // [legacy-thinkingCard] 写/清规范键时同步删旧名（懒迁移）；随 normalizeCotEnabled 移除。
+      if (spec.configKey === 'cotEnabled') delete entry.thinkingCard;
       delete entry[spec.configKey];
     } else if (spec.kind === 'boolean') {
+      if (spec.configKey === 'cotEnabled') delete entry.thinkingCard; // [legacy-thinkingCard] 懒迁移，同上
       // 只持久化「非默认」的一侧，bots.json 保持干净：默认 OFF 的字段 true 才写、
       // false 删 key；默认 ON（defaultOn）的字段 false 才写、true 删 key。
       if (spec.defaultOn) {

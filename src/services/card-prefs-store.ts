@@ -34,6 +34,7 @@ import { rmwBotEntry } from './config-store.js';
 import {
   getBot,
   normalizeUsageDisplay,
+  normalizeCotEnabled,
   DEFAULT_USAGE_DISPLAY,
   type ChatReplyMode,
   type UsageDisplayMode,
@@ -86,7 +87,7 @@ export interface BotCardPrefs {
    *  Default TRUE (unlike the others) — only an explicit false is persisted. */
   botToBotSameDir: boolean;
   /** 被动入群（bot.added）时自动把 owner 拉进群。缺省 = 开；只有显式 false
-   *  持久化（同 thinkingCard 约定）。 */
+   *  持久化（同 cotEnabled 约定）。 */
   autoInviteOwnerOnGroupAdd: boolean;
   /** 主动开工 — 场景①: auto-start when added to a new chat (see auto-start.ts). */
   autoStartOnGroupJoin: boolean;
@@ -275,6 +276,8 @@ async function updateBotCardPrefsInternal(
     apply(entry, 'codexBrowser', patch.codexBrowser);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
     apply(entry, 'privateCard', patch.privateCard);
+    // [legacy-thinkingCard] 显式拨开关时清旧名（懒迁移）；随 normalizeCotEnabled 一并移除（不早于 v3.33.0）。
+    if (patch.cotEnabled !== undefined) delete entry.thinkingCard;
     applyDefaultTrue(entry, 'cotEnabled', patch.cotEnabled);
     applyDefaultTrue(entry, 'senderTag', patch.senderTag);
     apply(entry, 'overloadAlert', patch.overloadAlert);
@@ -305,7 +308,7 @@ async function updateBotCardPrefsInternal(
           || (typeof entry.codexBrowser === 'object' && entry.codexBrowser?.enabled === true),
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
         privateCard: entry.privateCard === true,
-        cotEnabled: entry.cotEnabled !== false,
+        cotEnabled: normalizeCotEnabled(entry),
         senderTag: entry.senderTag !== false,
         overloadAlert: entry.overloadAlert === true,
         botToBotSameDir: entry.botToBotSameDir !== false,

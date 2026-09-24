@@ -866,8 +866,9 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // bot as `'user'`, i.e. it vouches for a bot turn as a person.
     const trustedCallerArgs = [...daemonSource.matchAll(/trustedCallerForTurn\(([^;]*?)\);/g)]
       .map(m => m[1].split(',').map(part => part.trim()));
-    expect(trustedCallerArgs.length).toBe(3);
-    for (const args of trustedCallerArgs.slice(0, 2)) {
+    // Three IM entry paths plus the authenticated dispatch launch caller.
+    expect(trustedCallerArgs.length).toBe(4);
+    for (const args of trustedCallerArgs.slice(0, 3)) {
       expect(args.length).toBeGreaterThanOrEqual(4);
       const senderTypeArg = args.slice(3).join(', ');
       expect(senderTypeArg).not.toBe('');
@@ -881,7 +882,7 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // Dispatch launch is not an IM event on the target app: its same-host HMAC
     // authenticated and policy-allowlisted source daemon attests the human
     // caller union_id, while the immediate trigger is known to be that bot.
-    const dispatchArgs = trustedCallerArgs[2]!;
+    const dispatchArgs = trustedCallerArgs[3]!;
     expect(dispatchArgs.slice(0, 3).join(', ')).toContain('operation.callerUnionId');
     expect(dispatchArgs[3]).toBe('true');
     expect(daemonSource).toContain('trustedCaller: dispatchTrustedCaller');

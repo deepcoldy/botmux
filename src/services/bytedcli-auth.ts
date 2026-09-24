@@ -31,7 +31,7 @@
  * that link, the next retry completes the saved challenge before minting JWTs.
  */
 import { spawn } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -66,21 +66,16 @@ export function bytedcliHomeFor(openId: string): string {
   return join(BYTEDCLI_HOME_ROOT, openId);
 }
 
-/** Whether this person has ever completed a bytedcli login here. Cheap enough
- *  to call per turn; says nothing about whether that login is still valid.
- *
- *  The bare HOME does NOT count: {@link runAsUser} mkdirs it on every call, so
- *  a single (even failed) `--begin` would otherwise read as "authorized" until
- *  the directory was manually removed. bytedcli writes the SSO credential at
- *  the data root (`~/.local/share/bytedcli/token.json`, `token.<env>.json` for
- *  other SSO environments, `sso_session*.json` for the browser-session flow);
- *  only one of those proves a login happened. */
-export function hasBytedcliHome(openId: string): boolean {
+/** Ask the credential provider whether this person's isolated login is usable.
+ * Storage layout belongs to bytedcli/its SDK, not Botmux. A directory or a
+ * legacy token filename is neither necessary nor sufficient authorization. */
+export async function hasBytedcliHome(openId: string): Promise<boolean> {
   try {
-    const dataRoot = join(bytedcliHomeFor(openId), '.local', 'share', 'bytedcli');
-    if (!existsSync(dataRoot)) return false;
-    return readdirSync(dataRoot).some(f =>
-      /^token(\.[a-z0-9-]+)?\.json$/.test(f) || /^sso_session(\.[a-z0-9-]+)?\.json$/.test(f));
+    if (!existsSync(bytedcliHomeFor(openId))) return false;
+    const result = await runAsUser(openId, ['auth', 'status', '--json']);
+    const data = parseEnvelope(result.stdout)?.data as Record<string, unknown> | undefined;
+    const sdk = data?.bytecloud_auth as Record<string, unknown> | undefined;
+    return result.ok && data?.authenticated === true && data.auth_as !== 'app' && sdk?.authType !== 'app';
   } catch { return false; }
 }
 
@@ -108,7 +103,7 @@ async function runAsUser(openId: string, args: string[]): Promise<BytedcliResult
   mkdirSync(home, { recursive: true, mode: 0o700 });
   return await new Promise<BytedcliResult>(resolve => {
     const child = spawn('bytedcli', args, {
-      env: { ...process.env, HOME: home },
+      env: { ...process.env, HOME: home, BYTECLOUD_AUTH_AS: 'user', BYTEDCLI_NO_AUTO_UPGRADE: '1' },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -292,7 +287,7 @@ export async function mintBytedcliJwts(openId: string): Promise<BytedcliJwts | n
   if (challenge) {
     await completeBytedcliLogin(openId, challenge);
   }
-  if (!hasBytedcliHome(openId)) return null;
+  if (!await hasBytedcliHome(openId)) return null;
   const cloud = await runAsUser(openId, ['auth', 'get-bytecloud-jwt-token']);
   const cloudJwt = cloud.stdout.trim();
   if (!cloud.ok || !cloudJwt) {

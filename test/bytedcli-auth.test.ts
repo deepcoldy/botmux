@@ -22,14 +22,19 @@ import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 
 /** Every `bytedcli` invocation this test file caused: argv plus the HOME it ran under. */
+const statuses = new Map<string, { code: number; stdout?: string; stderr?: string }>();
+const statusCalls: Array<{ home: string | undefined; identity?: string }> = [];
 const calls: Array<{ args: string[]; home: string | undefined }> = [];
 /** Queued replies, one per invocation, in order. */
 let replies: Array<{ code: number; stdout?: string; stderr?: string }> = [];
 
 vi.mock('node:child_process', () => ({
   spawn: vi.fn((_cmd: string, args: string[], opts: { env?: Record<string, string> }) => {
-    calls.push({ args, home: opts?.env?.HOME });
-    const reply = replies.shift() ?? { code: 0, stdout: '' };
+    const status = args[0] === 'auth' && args[1] === 'status';
+    if (status) statusCalls.push({ home: opts?.env?.HOME, identity: opts?.env?.BYTECLOUD_AUTH_AS });
+    else calls.push({ args, home: opts?.env?.HOME });
+    const reply = status ? (statuses.get(opts?.env?.HOME ?? '') ?? { code: 0, stdout: envelope({ authenticated: false }) })
+      : replies.shift() ?? { code: 0, stdout: '' };
     const child = new EventEmitter() as EventEmitter & {
       stdout: EventEmitter; stderr: EventEmitter; kill: () => void;
     };
@@ -64,6 +69,8 @@ beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), 'botmux-bytedcli-'));
   calls.length = 0;
   replies = [];
+  statuses.clear();
+  statusCalls.length = 0;
 });
 afterEach(() => { rmSync(home, { recursive: true, force: true }); });
 
@@ -95,42 +102,40 @@ function writeBytedData(mod: Awaited<ReturnType<typeof fresh>>, openId: string, 
   writeFileSync(full, '{}');
 }
 
-describe('hasBytedcliHome — a real credential, not a bare directory (F2)', () => {
-  it('is false for the bare HOME that runAsUser creates on every call', async () => {
-    const mod = await fresh();
-    mkdirSync(mod.bytedcliHomeFor(ALICE), { recursive: true });
-    expect(mod.hasBytedcliHome(ALICE)).toBe(false);
-  });
+function authorize(mod: { bytedcliHomeFor: (id: string) => string }, openId: string) {
+  const dir = mod.bytedcliHomeFor(openId);
+  mkdirSync(dir, { recursive: true });
+  statuses.set(dir, { code: 0, stdout: envelope({ authenticated: true, bytecloud_auth: { authType: 'user' } }) });
+}
 
-  it('is false with only the blank-run boilerplate files', async () => {
-    const mod = await fresh();
-    writeBytedData(mod, ALICE, 'data/trace_optin.json');
-    writeBytedData(mod, ALICE, 'data/self_update_version.json');
-    mkdirSync(join(mod.bytedcliHomeFor(ALICE), 'logs'), { recursive: true });
-    mkdirSync(join(mod.bytedcliHomeFor(ALICE), 'traces'), { recursive: true });
-    expect(mod.hasBytedcliHome(ALICE)).toBe(false);
+describe('hasBytedcliHome — provider-owned login state', () => {
+  it('accepts an SDK login without any legacy token file and forces personal identity', async () => {
+    const mod = await fresh(); authorize(mod, ALICE);
+    expect(await mod.hasBytedcliHome(ALICE)).toBe(true);
+    expect(statusCalls).toEqual([{ home: mod.bytedcliHomeFor(ALICE), identity: 'user' }]);
+    expect(existsSync(join(mod.bytedcliHomeFor(ALICE), '.local/share/bytedcli/token.json'))).toBe(false);
   });
-
-  it('is true once the SSO token lands', async () => {
+  it('does not treat a bare HOME or an expired legacy token file as authorization', async () => {
     const mod = await fresh();
     writeBytedData(mod, ALICE, 'token.json');
-    expect(mod.hasBytedcliHome(ALICE)).toBe(true);
+    expect(await mod.hasBytedcliHome(ALICE)).toBe(false);
   });
-
-  it('accepts other-env tokens and browser-session files', async () => {
-    const modA = await fresh();
-    writeBytedData(modA, ALICE, 'token.tiktok.json');
-    expect(modA.hasBytedcliHome(ALICE)).toBe(true);
-    const modB = await fresh();
-    writeBytedData(modB, ALICE, 'sso_session.json');
-    expect(modB.hasBytedcliHome(ALICE)).toBe(true);
+  it.each([
+    { code: 1, stderr: 'provider unavailable' },
+    { code: 0, stdout: 'not json' },
+    { code: 0, stdout: envelope({ authenticated: true, auth_as: 'app' }) },
+    { code: 0, stdout: envelope({ authenticated: true, bytecloud_auth: { authType: 'app' } }) },
+  ])('refuses failed, malformed or non-personal status: %j', async status => {
+    const mod = await fresh(); authorize(mod, ALICE);
+    statuses.set(mod.bytedcliHomeFor(ALICE), status);
+    expect(await mod.hasBytedcliHome(ALICE)).toBe(false);
   });
-
-  it('ignores unrelated json at the data root', async () => {
-    const mod = await fresh();
-    writeBytedData(mod, ALICE, 'pearl_sso_session.json');
-    writeBytedData(mod, ALICE, 'meego_auth.json');
-    expect(mod.hasBytedcliHome(ALICE)).toBe(false);
+  it('keeps two people isolated and observes revocation on the next check', async () => {
+    const mod = await fresh(); authorize(mod, ALICE);
+    expect(await mod.hasBytedcliHome(ALICE)).toBe(true);
+    expect(await mod.hasBytedcliHome(BOB)).toBe(false);
+    statuses.set(mod.bytedcliHomeFor(ALICE), { code: 0, stdout: envelope({ authenticated: false }) });
+    expect(await mod.hasBytedcliHome(ALICE)).toBe(false);
   });
 });
 
@@ -208,20 +213,9 @@ describe('login — device code, in two steps', () => {
 });
 
 describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
-  /** Stand in for a completed login: the HOME exists. */
-  // A completed login is what bytedcli actually writes: the SSO token at the
-  // bytedcli data root. A bare directory does NOT count (runAsUser creates it on
-  // every call) — hasBytedcliHome must not mistake a begin-created HOME for a
-  // login.
-  function markLoggedIn(mod: { bytedcliHomeFor: (id: string) => string }, openId: string) {
-    const dataRoot = join(mod.bytedcliHomeFor(openId), '.local', 'share', 'bytedcli');
-    mkdirSync(dataRoot, { recursive: true });
-    writeFileSync(join(dataRoot, 'token.json'), '{"sso":"yes"}');
-  }
-
   it('mints both JWTs for an authorized person', async () => {
     const mod = await fresh();
-    markLoggedIn(mod, ALICE);
+    authorize(mod, ALICE);
     replies = [{ code: 0, stdout: 'cloud.jwt.value\n' }, { code: 0, stdout: 'code.jwt.value\n' }];
 
     expect(await mod.mintBytedcliJwts(ALICE)).toEqual({
@@ -240,7 +234,7 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
     await mod.beginBytedcliLogin(ALICE);
     // A successful --complete makes bytedcli itself write the SSO token; the
     // scripted runner cannot, so lay down what the real CLI would.
-    markLoggedIn(mod, ALICE);
+    authorize(mod, ALICE);
     replies = [
       { code: 0, stdout: envelope({ status: 'ok' }) },
       { code: 0, stdout: 'cloud.jwt.value\n' },
@@ -285,7 +279,7 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
 
   it('returns nothing once their login has expired', async () => {
     const mod = await fresh();
-    markLoggedIn(mod, ALICE);
+    authorize(mod, ALICE);
     replies = [{ code: 1, stderr: 'not logged in' }];
     expect(await mod.mintBytedcliJwts(ALICE)).toBeNull();
   });
@@ -294,7 +288,7 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
   // deny the turn outright — that would trade a cosmetic failure for a hard one.
   it('still authorizes when only the Codebase JWT is unavailable', async () => {
     const mod = await fresh();
-    markLoggedIn(mod, ALICE);
+    authorize(mod, ALICE);
     replies = [{ code: 0, stdout: 'cloud.jwt.value\n' }, { code: 1, stderr: 'codebase down' }];
     expect(await mod.mintBytedcliJwts(ALICE)).toEqual({ cloudJwt: 'cloud.jwt.value' });
   });
@@ -304,7 +298,7 @@ describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
   // here would re-introduce the 2-hour re-scan this design exists to avoid.
   it('asks bytedcli again on every turn rather than caching', async () => {
     const mod = await fresh();
-    markLoggedIn(mod, ALICE);
+    authorize(mod, ALICE);
     replies = [
       { code: 0, stdout: 'jwt-1\n' }, { code: 0, stdout: 'code-1\n' },
       { code: 0, stdout: 'jwt-2\n' }, { code: 0, stdout: 'code-2\n' },
@@ -329,7 +323,7 @@ describe('mintBytedcliJwts — a pending login is best-effort, never a hard gate
   it('still mints JWTs when the completion poll is pending and a login exists', async () => {
     const mod = await fresh();
     await beginOnce(mod);
-    writeBytedData(mod, ALICE, 'token.json');
+    authorize(mod, ALICE);
     replies = [
       { code: 0, stdout: envelope({ status: 'pending' }) },
       { code: 0, stdout: 'cloud.jwt\n' },
@@ -348,7 +342,7 @@ describe('mintBytedcliJwts — a pending login is best-effort, never a hard gate
   it('still mints when the completion poll fails terminally, and drops the dead challenge', async () => {
     const mod = await fresh();
     await beginOnce(mod);
-    writeBytedData(mod, ALICE, 'token.json');
+    authorize(mod, ALICE);
     replies = [
       { code: 1, stdout: envelope(null, 'error') + JSON.stringify({ error: { message: 'token expired' } }) + '\n' },
       { code: 0, stdout: 'cloud.jwt\n' },
@@ -377,7 +371,7 @@ describe('mintBytedcliJwts — a pending login is best-effort, never a hard gate
     replies = [{ code: 0, stdout: envelope({ status: 'pending' }) }];
     expect(await mod.mintBytedcliJwts(ALICE)).toBeNull();
     // Person taps the link; the next turn completes AND mints.
-    writeBytedData(mod, ALICE, 'token.json');
+    authorize(mod, ALICE);
     replies = [
       { code: 0, stdout: envelope({ status: 'ok' }) },
       { code: 0, stdout: 'cloud.jwt\n' },
@@ -395,6 +389,6 @@ describe('clearBytedcliAuth', () => {
 
     mod.clearBytedcliAuth(ALICE);
     expect(existsSync(mod.bytedcliHomeFor(ALICE))).toBe(false);
-    expect(mod.hasBytedcliHome(ALICE)).toBe(false);
+    expect(await mod.hasBytedcliHome(ALICE)).toBe(false);
   });
 });

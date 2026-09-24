@@ -194,7 +194,7 @@ describe("crash-loop diagnostic terminal (daemon 'claude_exit' handler)", () => 
       'text',
       'app_test',
       undefined,
-      undefined,
+      { sourceSessionId: 'sid-riff-no-restart' },
     );
   });
 

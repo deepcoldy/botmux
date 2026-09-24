@@ -336,6 +336,7 @@ describe('rewriteAidenCodexArgs', () => {
     const out = buildWrappedLaunch('aiden x codex', [
       '-c', 'model_reasoning_effort="ultra"', '--model', 'm',
     ]);
+    expect(out.bin).toBe('aiden');
     expect(out.args).toEqual(['x', 'codex', '--model', 'm']);
     expect(out.env).toBeUndefined();
   });
@@ -420,9 +421,9 @@ describe('buildWrappedLaunch', () => {
       (bin) => `/resolved/${bin}`,
       { childPath: '/child/bin', aidenCodexShimDir: '/botmux/scripts/aiden-codex-shim' },
     );
-    expect(out.args).toEqual(['x', 'codex', '--model', 'm']);
+    expect(out.bin).toBe('/botmux/scripts/aiden-codex-shim/launch');
+    expect(out.args).toEqual(['/resolved/aiden', 'x', 'codex', '--model', 'm']);
     expect(out.env).toMatchObject({
-      PATH: `/botmux/scripts/aiden-codex-shim${delimiter}/child/bin`,
       BOTMUX_AIDEN_CODEX_REAL_BIN: '/resolved/codex',
       BOTMUX_AIDEN_CODEX_REASONING_EFFORT: 'high',
     });

@@ -793,6 +793,7 @@ export const messages: Record<string, string> = {
   'help.heading_session': '📌 Session management:',
   'help.close': '/close      - Close current session, kill {cliName}',
   'help.cleanup_wt': '/cleanup-wt <ID> - Retry a failed worktree cleanup job',
+  'help.lane': '/lane status|close - Inspect or safely close your isolated lane (protects uncommitted and unpushed work)',
   'help.stop': '/stop       - Interrupt the current turn, keep the session',
   'help.restart': '/restart    - Restart {cliName} (keep session)',
   'help.topic': '[title] /t [/repo <repo>] [/model <model>] [/effort <level>] [<first task>]  (alias /topic) - Start a topic in a regular group, declaring title, repo, model, reasoning effort and the first task in one message. Newlines are the same as spaces; the title goes BEFORE /t (Lark shows the raw message in its topic list and the bot cannot rewrite it); quote paths containing spaces; one bad field voids the whole header and replies with a usage error. Bare /t opens setup (repo picker when needed, otherwise waits for the next task or /repo); a bare /repo inside the header (no argument) starts right away in the default working dir, same as the picker card start-directly button. Note that /repo inside the header takes a single token, while a standalone mid-session /repo still takes the rest of the line',

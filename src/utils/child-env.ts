@@ -349,6 +349,7 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX',
   // Per-launch Aiden Codex shim configuration. Forward only into the owning
   // pane, and scrub stale values from shared terminal servers and login shells.
+  'BOTMUX_AIDEN_CODEX_PARENT_PATH',
   'BOTMUX_AIDEN_CODEX_REAL_BIN',
   'BOTMUX_AIDEN_CODEX_REASONING_EFFORT',
   'SESSION_DATA_DIR',

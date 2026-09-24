@@ -411,7 +411,7 @@ describe('host memory pressure worker admission', () => {
       'text',
       'app_test',
       'om_retry',
-      undefined,
+      { sourceSessionId: 'sid-start-test' },
     );
   });
 
@@ -690,7 +690,7 @@ describe('host memory pressure worker admission', () => {
       'text',
       'app_test',
       'om_blocked_turn',
-      undefined,
+      { sourceSessionId: 'sid-start-test' },
     );
   });
 
@@ -782,7 +782,7 @@ describe('host memory pressure worker admission', () => {
       'text',
       'app_test',
       'om_doc_blocked',
-      undefined,
+      { sourceSessionId: 'sid-start-test' },
     );
 
     await Promise.resolve();
@@ -2709,6 +2709,37 @@ describe('TraeX task continuation', () => {
     });
   });
 
+  it('keeps non-provenance observers live when a principal lane binding is missing', () => {
+    const { ds, worker } = startTraexLease();
+    const now = new Date().toISOString();
+    ds.session.principalLane = {
+      version: 1,
+      laneId: 'lane-b',
+      sourceSessionId: 'source-a',
+      principalKey: 'user:union:b',
+      principal: { senderType: 'user', kind: 'union', unionId: 'b' },
+      routingAnchor: 'principal-lane:b',
+      displayTarget: { scope: 'chat', larkAppId: 'app_test', chatId: 'oc_group' },
+      workspaceEpoch: 1,
+      phase: 'active',
+      revision: 1,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    worker.emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: 'om_original',
+      messageId: 'om_final_without_binding',
+      responseKind: 'final',
+    });
+
+    expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'completed',
+      completedMessageId: 'om_final_without_binding',
+    });
+  });
+
   it('does not settle on progress or a final marker from another turn', () => {
     const { ds, worker } = startTraexLease();
     worker.emit('message', {
@@ -2844,7 +2875,11 @@ describe('TraeX task continuation', () => {
       content: '{"status":"completed","content":"done"}',
     });
     expect(ds.session.readonlyTaskContinuation).toMatchObject({ status: 'delivering' });
-    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'completed',
+      completedMessageId: 'om_readonly_final',
+      pendingDelivery: undefined,
+    }));
     expect(ds.session.readonlyTaskContinuation?.lastErrorCode).toBeUndefined();
     expect(ds.session.readonlyTaskContinuation).toMatchObject({
       status: 'completed',
@@ -2897,7 +2932,10 @@ describe('TraeX task continuation', () => {
     setActiveSessionsRegistry(new Map([['om_root::app_test', ds]]));
 
     expect(ensureReadonlyTaskContinuationAttached(ds)).toBe(true);
-    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      status: 'completed',
+      completedMessageId: 'om_recovered_final',
+    }));
     expect(ds.session.readonlyTaskContinuation?.lastErrorCode).toBeUndefined();
 
     expect(ds.session.readonlyTaskContinuation).toMatchObject({
@@ -2957,6 +2995,11 @@ describe('TraeX task continuation', () => {
     await vi.advanceTimersByTimeAsync(60_000);
     await vi.advanceTimersByTimeAsync(1);
 
+    await vi.waitFor(() => expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      warningDispatched: true,
+      warningMessageId: 'om_recovered_warning',
+      pendingWarning: undefined,
+    }));
     expect(sessionReply).toHaveBeenCalledTimes(4);
     expect(sessionReply.mock.calls[3]?.[5]?.uuid).toBe(firstUuid);
     expect(ds.session.readonlyTaskContinuation).toMatchObject({
@@ -3039,6 +3082,11 @@ describe('TraeX task continuation', () => {
     expect(ensureReadonlyTaskContinuationAttached(ds)).toBe(true);
     await vi.advanceTimersByTimeAsync(1);
 
+    await vi.waitFor(() => expect(ds.session.readonlyTaskContinuation).toMatchObject({
+      warningDispatched: true,
+      warningMessageId: 'om_disabled_recovered_warning',
+      pendingWarning: undefined,
+    }));
     expect(sessionReply).toHaveBeenCalledOnce();
     expect(ds.agentAttention).toMatchObject({ kind: 'blocked' });
     expect(ds.session.readonlyTaskContinuation).toMatchObject({
@@ -3271,7 +3319,7 @@ describe('ordinary Claude semantic recovery', () => {
       'interactive',
       'app_test',
       'om_adopted',
-      undefined,
+      { sourceSessionId: 'sid-start-test' },
     ));
     expect(ds.session.ordinaryTurnRecovery).toBeUndefined();
     expect(ds.agentAttention).toEqual(expect.objectContaining({
@@ -6624,7 +6672,7 @@ describe('worker startup failure delivery', () => {
       'text',
       'app_test',
       'turn-clean-start',
-      undefined,
+      { sourceSessionId: 'sid-start-test' },
     );
   });
 
@@ -6668,7 +6716,7 @@ describe('worker startup failure delivery', () => {
       'text',
       'app_test',
       'turn-live-clean',
-      undefined,
+      { sourceSessionId: 'sid-start-test' },
     );
   });
 
@@ -6698,10 +6746,7 @@ describe('worker startup failure delivery', () => {
       'text',
       'app_test',
       'turn-start',
-      // scopedReply now forwards an (empty) opts arg after the vc-agent merge
-      // added beforeQuoteFallback support; the startup-failure delivery is
-      // otherwise unchanged.
-      undefined,
+      { sourceSessionId: 'sid-start-test' },
     );
   });
 

@@ -106,6 +106,10 @@ import {
   type XpiSharedCwdQuarantineNotice,
   type XpiSharedCwdStartupNotice,
 } from './xpi-shared-cwd-admission.js';
+import {
+  reconcilePrincipalLaneRecovery,
+  type PrincipalLaneStartupNotice,
+} from './principal-lane-recovery.js';
 
 export { getAttachmentsDir } from './attachment-path.js';
 
@@ -2244,7 +2248,7 @@ export async function restoreActiveSessions(
   activeSessions: Map<string, DaemonSession>,
   quarantinedSessionIds: ReadonlySet<string> = new Set(),
   options: { prepareTurn?: (ds: DaemonSession, turnId: string) => Promise<void> | undefined } = {},
-): Promise<XpiSharedCwdStartupNotice[] | undefined> {
+): Promise<Array<XpiSharedCwdStartupNotice | PrincipalLaneStartupNotice> | undefined> {
   const sessions = sessionStore.listSessions();
   const restorePriority = (session: Session): number => {
     if (session.headless) return 2;
@@ -2275,6 +2279,77 @@ export async function restoreActiveSessions(
       ? [[session.sessionId, continuation.leaseId] as const]
       : [];
   }));
+
+  // Reconcile principal-lane commit-unknown heads before stale-process
+  // sweeping, registration, or ingress. The old daemon generation can no
+  // longer produce a trusted terminal edge, so replay is forbidden: remove
+  // the exact attempting head and persist a separate retryable notice in one
+  // transaction. Lock contention follows the same bounded boot retry and
+  // fail-closed containment shape as XPI shared-cwd recovery below.
+  const principalLaneStartupNotices: PrincipalLaneStartupNotice[] = [];
+  const principalLaneQuarantined = new Set<string>();
+  for (let activeIndex = 0; activeIndex < active.length; activeIndex++) {
+    const session = active[activeIndex]!;
+    if (!session.principalLane
+        || (!(session.principalLaneQueuedTurns?.length)
+          && !(session.principalLaneDispatchUnknownNotices?.length))) continue;
+    try {
+      let result: ReturnType<typeof reconcilePrincipalLaneRecovery> | undefined;
+      let reconciledSession: Session | undefined;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const mutation = sessionStore.mutateOwnedSessionsAtomically(
+            [session.sessionId],
+            fresh => reconcilePrincipalLaneRecovery(
+              fresh.get(session.sessionId)!,
+              new Date().toISOString(),
+            ),
+            { nonblocking: true },
+          );
+          result = mutation.result;
+          reconciledSession = mutation.rows.get(session.sessionId);
+          break;
+        } catch (error) {
+          if (!(error instanceof sessionStore.SessionStoreBusyError) || attempt === 2) throw error;
+          await new Promise(resolve => setTimeout(resolve, 25 * (attempt + 1)));
+        }
+      }
+      if (!result) throw new Error('principal-lane recovery transaction returned no result');
+      if (!reconciledSession) throw new Error('principal-lane recovery returned no session row');
+      // Restore must continue from the exact committed row. Keeping the
+      // pre-transaction object here would re-register an `attempting` head
+      // that boot recovery had already terminalized and strand its successor.
+      active[activeIndex] = reconciledSession;
+      principalLaneStartupNotices.push(...result.notices);
+      if (result.quarantined) {
+        principalLaneQuarantined.add(session.sessionId);
+        principalLaneStartupNotices.push({
+          kind: 'principal_lane_recovery_quarantine',
+          sessionId: session.sessionId,
+          reason: 'ambiguous_queue',
+          detail: result.detail ?? 'principal-lane recovery found ambiguous durable authority',
+        });
+      }
+    } catch (error) {
+      const detail = `Principal-lane recovery persistence failed for ${session.sessionId}: `
+        + `${error instanceof Error ? error.message : String(error)}`;
+      logger.error(`[principal-lane] recovery_partition_failure ${JSON.stringify({
+        sessionId: session.sessionId,
+        detail,
+      })}`);
+      session.restoreQuarantinedAt ??= new Date().toISOString();
+      principalLaneQuarantined.add(session.sessionId);
+      principalLaneStartupNotices.push({
+        kind: 'principal_lane_recovery_quarantine',
+        sessionId: session.sessionId,
+        reason: 'recovery_persistence_failure',
+        detail,
+      });
+    }
+  }
+  if (principalLaneQuarantined.size > 0) {
+    active = active.filter(session => !principalLaneQuarantined.has(session.sessionId));
+  }
 
   // LOAD-BEARING ORDER: validate and contain the narrow XPI shared-cwd state
   // before stale-pid sweeping, backend probes, registration, card recovery, or
@@ -2365,7 +2440,8 @@ export async function restoreActiveSessions(
 
   if (active.length === 0) {
     logger.info('No active sessions to restore');
-    return xpiQuarantineNotices.length > 0 ? xpiQuarantineNotices : undefined;
+    const notices = [...principalLaneStartupNotices, ...xpiQuarantineNotices];
+    return notices.length > 0 ? notices : undefined;
   }
 
   // Kill any stale CLI processes from previous daemon run
@@ -2399,6 +2475,31 @@ export async function restoreActiveSessions(
     if (runtimeWinnerFor(session.sessionId)) {
       logger.debug(`[${session.sessionId.substring(0, 8)}] Already registered by live runtime during restore; skipping snapshot row`);
       continue;
+    }
+    // Principal lanes share one visible Lark chat anchor but must never share
+    // the daemon's runtime ownership slot. Rebuild the virtual anchor only
+    // after the complete durable lane/worktree authority has passed the same
+    // read-only hydration fence used by live ingress. Without this, restart
+    // registers every lane at chatId and setActiveSessionSafe closes the source
+    // and sibling lanes as apparent same-key duplicates.
+    let restoredRuntimeRoutingAnchor: string | undefined;
+    if (session.principalLane) {
+      const hydrated = await sessionStore.hydratePrincipalLaneForIngress(
+        session.principalLane.sourceSessionId,
+        session.principalLane.laneId,
+      );
+      if (hydrated.status !== 'ready'
+          || hydrated.session.sessionId !== session.sessionId) {
+        logger.error(
+          `[${session.sessionId.substring(0, 8)}] Principal-lane restore authority `
+          + `failed closed (${hydrated.status === 'ready'
+            ? 'session_identity_mismatch'
+            : `${hydrated.status}:${hydrated.reason}`})`,
+        );
+        quarantineUnregisteredRestoreSession(session, 'principal_lane_restore_authority_invalid');
+        continue;
+      }
+      restoredRuntimeRoutingAnchor = hydrated.runtimeRoutingAnchor;
     }
     // New worker generation ⇒ no registered preview port. Runs before every
     // branch below (adopt / queued / ordinary / close / quarantine — including
@@ -2624,6 +2725,7 @@ export async function restoreActiveSessions(
           chatId: session.chatId,
           chatType: session.chatType ?? 'group',
           scope,
+          runtimeRoutingAnchor: restoredRuntimeRoutingAnchor,
           spawnedAt: sessionCreatedAtMs(session),
           cliVersion: getCurrentCliVersion(),
           lastMessageAt: sessionLastMessageAtMs(session),
@@ -2754,6 +2856,7 @@ export async function restoreActiveSessions(
         chatId: session.chatId,
         chatType: session.chatType ?? 'group',
         scope,
+        runtimeRoutingAnchor: restoredRuntimeRoutingAnchor,
         spawnedAt: sessionCreatedAtMs(session),
         cliVersion: getCurrentCliVersion(),
         lastMessageAt: sessionLastMessageAtMs(session),
@@ -2822,6 +2925,7 @@ export async function restoreActiveSessions(
       chatId: session.chatId,
       chatType: session.chatType ?? 'group',
       scope,
+      runtimeRoutingAnchor: restoredRuntimeRoutingAnchor,
       spawnedAt: sessionCreatedAtMs(session),
       cliVersion: getCurrentCliVersion(),
       lastMessageAt: sessionLastMessageAtMs(session),
@@ -3253,7 +3357,8 @@ export async function restoreActiveSessions(
 
   const hasPersistentBackend = [...activeSessions.values()].some(ds => !!getSessionPersistentBackendType(ds));
   logger.info(`Restored ${active.length} session(s)${hasPersistentBackend ? '' : ', waiting for messages to resume'}`);
-  return xpiQuarantineNotices.length > 0 ? xpiQuarantineNotices : undefined;
+  const startupNotices = [...principalLaneStartupNotices, ...xpiQuarantineNotices];
+  return startupNotices.length > 0 ? startupNotices : undefined;
 }
 
 /** Re-attaching to a pane that is already alive: the worker only has to reconnect. */

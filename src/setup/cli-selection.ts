@@ -573,12 +573,10 @@ export function buildWrappedLaunch(
     if (!shimDir) {
       return { bin: binResolver(tokens[0]), args: [...tokens.slice(1), ...forwardedArgs] };
     }
-    const path = `${shimDir}${opts.pathDelimiter ?? ':'}${opts.childPath ?? ''}`;
     return {
-      bin: binResolver(tokens[0]),
-      args: [...tokens.slice(1), ...forwardedArgs],
+      bin: `${shimDir}/launch`,
+      args: [binResolver(tokens[0]), ...tokens.slice(1), ...forwardedArgs],
       env: {
-        PATH: path,
         BOTMUX_AIDEN_CODEX_REAL_BIN: realCodexBin,
         BOTMUX_AIDEN_CODEX_REASONING_EFFORT: reasoningEffort,
       },

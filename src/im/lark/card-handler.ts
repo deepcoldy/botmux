@@ -109,6 +109,7 @@ import { validateWorkingDir } from '../../core/working-dir.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
 import { activeSessionKey, sessionKey, sessionAnchorId, frozenDisplayMode, markRepoCardConsumed, isActiveRepoCard } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
+import { readPrincipalLaneTurnBinding } from '../../core/principal-lane-turn.js';
 import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
@@ -329,6 +330,44 @@ function getSessionByActionValue(
   // on a different current session just because an old card shared the root.
   if (primary && isLegacySelfHealAction(actionType)) return primary;
   return undefined;
+}
+
+export interface PrincipalLaneCardAuthorityDeps {
+  readTrustedProvenance: typeof sessionStore.readTrustedMessageProvenance;
+}
+
+/** Normal cards still display at the real chat/root, so their message id is
+ * the immutable bridge back to lane/turn/generation authority.  Legacy
+ * sessions remain byte-for-byte unaffected. */
+export function validatePrincipalLaneCardActionAuthority(
+  ds: DaemonSession,
+  cardMessageId: string | undefined,
+  activeSessions: Map<string, DaemonSession>,
+  deps?: PrincipalLaneCardAuthorityDeps,
+): boolean {
+  const lane = ds.session.principalLane;
+  if (!lane) return true;
+  if (!cardMessageId || activeSessions.get(activeSessionKey(ds)) !== ds) return false;
+  const provenance = (deps?.readTrustedProvenance ?? sessionStore.readTrustedMessageProvenance)(
+    cardMessageId,
+    lane.sourceSessionId,
+  );
+  if (!provenance
+      || provenance.direction !== 'outbound'
+      || provenance.larkAppId !== ds.larkAppId
+      || provenance.chatId !== ds.chatId
+      || provenance.laneId !== lane.laneId
+      || provenance.sessionId !== ds.session.sessionId
+      || provenance.principalKey !== lane.principalKey
+      || provenance.workerGeneration !== ds.workerGeneration
+      || provenance.workerGeneration !== ds.session.workerGeneration
+      || provenance.turnId !== ds.currentTurnId) return false;
+  const binding = readPrincipalLaneTurnBinding(ds, provenance.turnId);
+  return !!binding
+    && binding.laneId === provenance.laneId
+    && binding.sessionId === provenance.sessionId
+    && binding.principalKey === provenance.principalKey
+    && binding.workerGeneration === provenance.workerGeneration;
 }
 
 function sessionCliId(ds: DaemonSession) {
@@ -2639,6 +2678,18 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const ds = larkAppId
       ? getSessionByActionValue(activeSessions, rootId, larkAppId, value.session_id, actionType)
       : activeSessions.get(rootId);
+    if (ds && !validatePrincipalLaneCardActionAuthority(ds, cardMessageId, activeSessions)) {
+      logger.warn(
+        `[${tag(ds)}] Rejected stale principal-lane card action=${actionType} `
+        + `card=${cardMessageId?.substring(0, 12) ?? 'missing'}`,
+      );
+      return {
+        toast: {
+          type: 'warning',
+          content: '该卡片已不属于当前任务，请使用最新卡片。',
+        },
+      };
+    }
 
     const launchLocalCli = (target: DaemonSession, locDs: Locale) => {
       const cliId = sessionCliId(target);

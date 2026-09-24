@@ -340,18 +340,18 @@ describe('worker app-runner control-channel wiring', () => {
     const marker = workerSource.slice(markerStart, markerEnd);
     const suppressIdx = marker.indexOf('final_output suppressed');
     expect(suppressIdx).toBeGreaterThan(-1);
-    // Within the signed suppress block, the observer notification must fire
-    // against the FIFO-attributed turnId (before the final_output IPC).
-    const suppressBlock = marker.slice(suppressIdx, suppressIdx + 900);
-    expect(suppressBlock).toMatch(/notifyExplicitReplyObserved\(\s*turnId/);
-    expect(suppressBlock).toContain('explicitReplyMarkerForTurnWindow(gateInput');
-    // The notify precedes the suppressed final_output forward (suppressDelivery).
-    const notifyIdx = marker.indexOf('notifyExplicitReplyObserved(', suppressIdx);
-    const suppressedFinalIdx = marker.indexOf('suppressDelivery: true', suppressIdx);
+    // The observer notification is computed from exact-turn markers before the
+    // gate decides whether the final itself is suppressed.
+    const notifyIdx = marker.lastIndexOf('notifyExplicitRepliesObserved(', suppressIdx);
+    const notifyBlock = marker.slice(notifyIdx, suppressIdx);
     expect(notifyIdx).toBeGreaterThan(-1);
+    expect(notifyBlock).toMatch(/notifyExplicitRepliesObserved\(\s*turnId/);
+    expect(notifyBlock).toContain('attributableExplicitReplyMarkersForTurnWindow(');
+    // The notify precedes the suppressed final_output forward (suppressDelivery).
+    const suppressedFinalIdx = marker.indexOf('suppressDelivery: true', suppressIdx);
     expect(suppressedFinalIdx).toBeGreaterThan(notifyIdx);
     // Both the signed final and the bridge-fallback paths notify — never just one.
-    expect((workerSource.match(/notifyExplicitReplyObserved\(/g) ?? []).length).toBeGreaterThanOrEqual(2);
+    expect((workerSource.match(/notifyExplicitRepliesObserved\(/g) ?? []).length).toBeGreaterThanOrEqual(2);
   });
 
   it('passes RAW finalContent (not the pre-stripped deliverable) to the suppress gate', () => {

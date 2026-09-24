@@ -2566,10 +2566,13 @@ describe('antigravity buildArgs', () => {
     expect(args[idx + 1]).toBe('eb4cabea-3060-4b76-8e85-5778cc7ddb49');
   });
 
-  it('ignores configured model because this adapter has no modelChoices', () => {
-    const args = adapter.buildArgs({ sessionId: 'bm-7', resume: false, model: 'gemini-3-pro-preview' });
-    expect(args).not.toContain('--model');
-    expect(adapter.modelChoices).toBeUndefined();
+  it('passes configured model via --model and exposes curated modelChoices', () => {
+    const args = adapter.buildArgs({ sessionId: 'bm-7', resume: false, model: 'gemini-3.8-flash-high' });
+    expect(args).toContain('--model');
+    const idx = args.indexOf('--model');
+    expect(args[idx + 1]).toBe('gemini-3.8-flash-high');
+    expect(adapter.modelChoices).toBeDefined();
+    expect(adapter.modelChoices).toContain('gemini-3.8-flash-high');
   });
 
   it('resume without resumeSessionId starts fresh (no --continue, no random id)', () => {
@@ -3028,8 +3031,13 @@ describe('readyPattern', () => {
     expect(createOpenCodeAdapter('/bin/opencode').readyPattern).toBeUndefined();
   });
 
-  it('antigravity has no readyPattern', () => {
-    expect(createAntigravityAdapter('/bin/agy').readyPattern).toBeUndefined();
+  it('antigravity readyPattern and busyPattern are set to match its TUI footer states', () => {
+    const adapter = createAntigravityAdapter('/bin/agy');
+    expect(adapter.readyPattern).toBeDefined();
+    expect(adapter.readyPattern!.test('? for shortcuts')).toBe(true);
+    expect(adapter.busyPattern).toBeDefined();
+    expect(adapter.busyPattern!.test('esc to cancel')).toBe(true);
+    expect(typeof adapter.isSessionBusy).toBe('function');
   });
 
   it('mtr has no readyPattern', () => {

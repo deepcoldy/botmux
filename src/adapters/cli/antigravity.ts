@@ -1,11 +1,13 @@
-import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { existsSync, statSync, openSync, readSync, closeSync, fstatSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { delay } from '../../utils/timing.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import type { CliAdapter, PtyHandle, SubmitRecheckResult } from './types.js';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { discoverAntigravitySessions } from '../../services/resumable-session-discovery.js';
+import { findAntigravityConversationId } from '../../services/antigravity-discovery.js';
 
 /**
  * Adapter for Google Antigravity CLI (`agy`).
@@ -130,6 +132,69 @@ async function waitForHistoryAppend(
   return historyDeltaContains(path, fromByte, marker);
 }
 
+export function isAntigravityTranscriptBusy(transcriptPath: string): boolean {
+  if (!existsSync(transcriptPath)) return false;
+  try {
+    const fd = openSync(transcriptPath, 'r');
+    try {
+      const stats = fstatSync(fd);
+      if (stats.size === 0) return false;
+
+      // Expand until a lifecycle record is found. A complete checkpoint or
+      // notification is not enough: the preceding tool call may be truncated
+      // at this window's start and still needs a larger read.
+      let chunkSize = Math.min(stats.size, 64 * 1024);
+
+      while (chunkSize <= stats.size) {
+        const buf = Buffer.alloc(chunkSize);
+        readSync(fd, buf, 0, chunkSize, stats.size - chunkSize);
+        const text = buf.toString('utf-8');
+        const rawLines = text.split('\n');
+        const candidateLines = stats.size > chunkSize ? rawLines.slice(1) : rawLines;
+        for (let i = candidateLines.length - 1; i >= 0; i--) {
+          const line = candidateLines[i].trim();
+          if (!line) continue;
+          let rec: any;
+          try {
+            rec = JSON.parse(line);
+          } catch {
+            continue;
+          }
+
+          const type = rec?.type;
+          if (type === 'ERROR_MESSAGE' || type === 'ERROR') {
+            return false;
+          }
+          if (type === 'SYSTEM_MESSAGE') {
+            const content = String(rec?.content ?? '');
+            if (/cancell?ed|interrupted|aborted/i.test(content)) {
+              return false;
+            }
+            // Non-cancel notifications do not dictate lifecycle state.
+            continue;
+          }
+          if (type === 'CHECKPOINT' || type === 'TASK_NOTIFICATION') {
+            continue;
+          }
+          if (type === 'PLANNER_RESPONSE') {
+            return Array.isArray(rec.tool_calls) && rec.tool_calls.length > 0;
+          }
+          if (type === 'GENERIC' || type === 'USER_INPUT') {
+            return true;
+          }
+        }
+        if (chunkSize >= stats.size || chunkSize >= 1024 * 1024) break;
+        chunkSize = Math.min(stats.size, chunkSize * 4);
+      }
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
 export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
   // modelChoices and must not shell out (see resolveCommand); the binary path
@@ -140,8 +205,9 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     id: 'antigravity',
     authPaths: ['~/.gemini/oauth_creds.json', '~/.gemini/antigravity-cli/antigravity-oauth-token'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
+    modelChoices: CLI_MODEL_CHOICES['antigravity'],
 
-    buildArgs({ resume, resumeSessionId, disableCliBypass }) {
+    buildArgs({ resume, resumeSessionId, disableCliBypass, model, reasoningEffort }) {
       const args = disableCliBypass ? [] : ['--dangerously-skip-permissions'];
       // Resume: only when we have agy's own conversation UUID. We never
       // map botmux's sessionId here because agy generates its own id at
@@ -151,6 +217,12 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // racy when multiple botmux sessions run in parallel.
       if (resume && resumeSessionId) {
         args.push('--conversation', resumeSessionId);
+      }
+      if (model && typeof model === 'string' && model.trim()) {
+        args.push('--model', model.trim());
+      }
+      if (reasoningEffort && (reasoningEffort === 'low' || reasoningEffort === 'medium' || reasoningEffort === 'high')) {
+        args.push('--effort', reasoningEffort);
       }
       // NOTE: we deliberately do NOT pass `-i` / `--prompt-interactive`.
       // Despite the flag's existence in `agy --help`, empirical testing
@@ -218,13 +290,23 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       try {
         if (pty.sendText && pty.sendSpecialKeys) {
           const lines = content.split('\n');
-          for (let i = 0; i < lines.length; i++) {
-            if (lines[i].length > 0) pty.sendText(lines[i]);
-            if (i < lines.length - 1) {
-              // M-Enter / alt+Enter: documented soft newline. Don't use
-              // `\` + Enter (Claude Code's idiom) — agy doesn't treat
-              // backslash as an escape.
-              pty.sendSpecialKeys('M-Enter');
+          if (typeof pty.sendLines === 'function') {
+            const BATCH_SIZE = 40;
+            for (let i = 0; i < lines.length; i += BATCH_SIZE) {
+              const chunk = lines.slice(i, i + BATCH_SIZE);
+              pty.sendLines(chunk, 'M-Enter');
+              if (i + BATCH_SIZE < lines.length) {
+                pty.sendSpecialKeys('M-Enter');
+              }
+              await delay(10);
+            }
+          } else {
+            for (let i = 0; i < lines.length; i++) {
+              if (lines[i].length > 0) pty.sendText(lines[i]);
+              if (i < lines.length - 1) {
+                pty.sendSpecialKeys('M-Enter');
+              }
+              await delay(10);
             }
           }
         } else {
@@ -234,6 +316,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
           for (let i = 0; i < lines.length; i++) {
             pty.write(lines[i]);
             if (i < lines.length - 1) pty.write('\x1b\r');
+            await delay(10);
           }
         }
       } catch {
@@ -251,18 +334,29 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       // genuinely dropped Enter is recovered by the worker's deferred
       // recheck, not by a second Enter (same pattern as the grok adapter).
       if (await waitForHistoryAppend(HISTORY_PATH, baseByte, marker, 3_200)) {
-        return undefined;
+        const cliSessionId = findAntigravityConversationId({ pid: pty.cliPid, cwd: pty.cliCwd });
+        return cliSessionId ? { submitted: true, cliSessionId } : undefined;
       }
 
       // In-band budget exhausted. Hand the worker a recheck closure so a
       // slow agy (cold start, large initial prompt, network-bound auth)
       // can still resolve the warning before user-facing Lark notify.
-      const recheck = (): boolean => historyDeltaContains(HISTORY_PATH, baseByte, marker);
+      const recheck = (): SubmitRecheckResult => {
+        if (!historyDeltaContains(HISTORY_PATH, baseByte, marker)) return false;
+        const cliSessionId = findAntigravityConversationId({ pid: pty.cliPid, cwd: pty.cliCwd });
+        return cliSessionId ? { submitted: true, cliSessionId } : true;
+      };
       return { submitted: false, recheck };
     },
 
     completionPattern: undefined,
-    readyPattern: undefined,
+    readyPattern: /\? for shortcuts/,
+    busyPattern: /esc to cancel/,
+    isSessionBusy({ cliSessionId }) {
+      if (!cliSessionId) return false;
+      const transcriptPath = join(homedir(), '.gemini', 'antigravity-cli', 'brain', cliSessionId, '.system_generated', 'logs', 'transcript.jsonl');
+      return isAntigravityTranscriptBusy(transcriptPath);
+    },
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,
   };

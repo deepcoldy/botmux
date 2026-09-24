@@ -1359,25 +1359,31 @@ export async function getMessageDetail(
   return res.data;
 }
 
+/** Resolve a message's chat without collapsing provider failures into absence.
+ * Authorization gates must distinguish unavailable evidence from a mismatch. */
+export async function lookupMessageChatId(
+  larkAppId: string,
+  messageId: string,
+  options?: LarkRequestOptions,
+): Promise<string | null> {
+  const detail = await getMessageDetail(larkAppId, messageId, {
+    userCardContent: false,
+    ...options,
+  });
+  const candidates = [detail?.items?.[0]?.chat_id, detail?.chat_id, detail?.message?.chat_id];
+  for (const value of candidates) {
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return null;
+}
+
 export async function getMessageChatId(
   larkAppId: string,
   messageId: string,
   options?: LarkRequestOptions,
 ): Promise<string | null> {
   try {
-    const detail = await getMessageDetail(larkAppId, messageId, {
-      userCardContent: false,
-      ...options,
-    });
-    const candidates = [
-      detail?.items?.[0]?.chat_id,
-      detail?.chat_id,
-      detail?.message?.chat_id,
-    ];
-    for (const v of candidates) {
-      if (typeof v === 'string' && v.trim()) return v.trim();
-    }
-    return null;
+    return await lookupMessageChatId(larkAppId, messageId, options);
   } catch (err) {
     if (options?.signal?.aborted) {
       throw options.signal.reason instanceof Error ? options.signal.reason : err;

@@ -20,7 +20,8 @@ export function renderAidenCodexShim(): string {
     '  echo "botmux aiden-codex shim: real codex executable is unavailable" >&2',
     '  exit 1',
     'fi',
-    'unset BOTMUX_AIDEN_CODEX_REAL_BIN BOTMUX_AIDEN_CODEX_REASONING_EFFORT',
+    'if [ -n "${BOTMUX_AIDEN_CODEX_PARENT_PATH:-}" ]; then export PATH="$BOTMUX_AIDEN_CODEX_PARENT_PATH"; fi',
+    'unset BOTMUX_AIDEN_CODEX_REAL_BIN BOTMUX_AIDEN_CODEX_REASONING_EFFORT BOTMUX_AIDEN_CODEX_PARENT_PATH',
     'exec "$real_bin" -c "model_reasoning_effort=\\\"$effort\\\"" "$@"',
     '',
   ].join('\n');
@@ -32,5 +33,13 @@ export function installAidenCodexShim(binDir: string): string {
   const path = join(binDir, SHIM_NAME);
   atomicWriteFileSync(path, renderAidenCodexShim(), { mode: 0o755 });
   accessSync(path, constants.X_OK);
+  // Run after the pane shell has loaded its PATH. childEnv.PATH is deliberately
+  // not transported by tmux/zellij, so prepending it in the worker is ineffective.
+  atomicWriteFileSync(join(binDir, 'launch'), [
+    '#!/bin/sh', 'set -eu',
+    'export BOTMUX_AIDEN_CODEX_PARENT_PATH="$PATH"',
+    'export PATH="$(dirname -- "$0"):$PATH"',
+    'exec "$@"', '',
+  ].join('\n'), { mode: 0o755 });
   return binDir;
 }

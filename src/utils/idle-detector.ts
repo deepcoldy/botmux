@@ -3,9 +3,9 @@ import type { CliAdapter } from '../adapters/cli/types.js';
 export type IdleEvidenceSource = 'screen' | 'external';
 
 /** Spinner frames — animate while CLI is working.
- *  Includes Claude Code symbols, Ink dots braille chars (Gemini),
- *  and OpenCode progress bar chars (■⬝). */
-const SPINNER_RE = /[·✢✳✶✻✽⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏■⬝]/;
+ *  Includes Claude Code symbols, all Unicode braille patterns (6-dot & 8-dot
+ *  such as Ink / Antigravity dots ⣾⣽⣻⢿⡿⣟⣯⣷), and OpenCode progress bar chars (■⬝). */
+const SPINNER_RE = /[·✢✳✶✻✽\u2800-\u28ff■⬝]/;
 
 /** Default quiescence timeout (ms) — idle if PTY silent + no recent spinner */
 const QUIESCENCE_MS = 2_000;

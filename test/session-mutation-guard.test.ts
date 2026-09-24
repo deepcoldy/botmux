@@ -27,6 +27,19 @@ describe('hasProtectedSessionMutationOwnership', () => {
         cliInput: { content: 'N+1' }, turnId: 'turn-n-plus-1',
       }],
     }],
+    ['principal-lane full-turn tail', {
+      principalLaneQueuedTurns: [{
+        version: 1,
+        turnId: 'om_b2',
+        caller: { requestUserOpenId: 'ou_b', senderType: 'user' },
+        userPrompt: 'B2',
+        title: 'B2',
+        cliInput: { content: 'B2' },
+        createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+        resume: true,
+        dispatchState: 'queued',
+      }],
+    }],
     ['pending repository setup', {
       pendingRepoSetup: { mode: 'picker', prompt: 'OPENING_N' },
     }],

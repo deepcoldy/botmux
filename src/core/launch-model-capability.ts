@@ -27,7 +27,7 @@ import type { CliId } from '../adapters/cli/types.js';
 export const LAUNCH_MODEL_CLI_IDS: ReadonlySet<CliId> = new Set<CliId>([
   'claude-code', 'seed', 'relay', 'coco', 'codex', 'codex-app', 'cursor', 'gemini',
   'genius', 'opencode', 'mimocode', 'traex', 'pi', 'copilot', 'oh-my-pi', 'kimi', 'grok',
-  'reasonix', 'dsh', 'minimax',
+  'reasonix', 'dsh', 'minimax', 'antigravity',
   // PTY 之外：MojoBackend 把 botmux 解析出的 model 拼进 `mojo -p --model`。
   'mojo',
 ]);

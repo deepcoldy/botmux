@@ -3842,7 +3842,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
-      cotEnabled: entry.cotEnabled === false ? false : undefined,
+      cotEnabled: normalizeCotEnabled(entry) ? undefined : false,
       // Default ON, same convention as cotEnabled: an absent key means the
       // <sender> tag is injected, so existing prompts are unchanged.
       senderTag: entry.senderTag === false ? false : undefined,
@@ -3984,4 +3984,20 @@ export function readBotSkillPolicy(raw: unknown): BotSkillPolicy | undefined {
   const include = readDirectSkillSelectors(r.include);
   if (include) out.include = include;
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Read-compat for `thinkingCard`, renamed to `cotEnabled` in #1477 (shipped
+ * v3.27): without this, an explicitly muted thinking bubble silently comes
+ * back after upgrade. An explicit canonical boolean always wins.
+ *
+ * Removal plan: delete every site marked `[legacy-thinkingCard]` — grep
+ * that exact tag under src/ as the index (a bare `thinkingCard` grep also
+ * matches the unrelated, still-live `thinkingCardToolResult` switch from
+ * #1546) — no earlier than v3.33.0 (at least three minor releases after
+ * this compat ships). Removing it restores default-on for any un-migrated
+ * key, so bump the floor release if old keys still show up in support.
+ */
+export function normalizeCotEnabled(entry?: { cotEnabled?: unknown; thinkingCard?: unknown }): boolean {
+  return typeof entry?.cotEnabled === 'boolean' ? entry.cotEnabled : entry?.thinkingCard !== false;
 }

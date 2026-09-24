@@ -76,10 +76,10 @@ const CONSUMERS: Record<string, Rule> = {
   // ── user surfaces: must render refusal AND residual ──────────────────────
   'core/command-handler.ts::handleCommand::closeSession': {
     category: 'user_surface',
-    why: '/close, shared-adopt /detach and /disconnect, and same-daemon /close wt '
-      + 'siblings all branch on refused/residual results; none report ordinary '
-      + 'success or remove a worktree while cleanup is unproven.',
-    count: 5,
+    why: '/close, /lane close, shared-adopt /detach and /disconnect, and same-daemon '
+      + '/close wt siblings all branch on refused/residual results; none report '
+      + 'ordinary success or remove a worktree while cleanup is unproven.',
+    count: 6,
   },
   'core/command-handler.ts::commitRepoSelection::closeSession': {
     category: 'user_surface',
