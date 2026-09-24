@@ -8203,6 +8203,7 @@ const transferReplacementForkBypass = new WeakSet<DaemonSession>();
 // is only a delayed/ambiguous state because the child may still execute later.
 const ORDINARY_IM_TRANSPORT_TIMEOUT_MS = 2_000;
 const ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS = 2_000;
+const ORDINARY_IM_INIT_COMMIT_TIMEOUT_MS = 90_000;
 const ORDINARY_IM_MAX_ATTEMPTS = 2;
 
 type OrdinaryImDelivery = {
@@ -8506,11 +8507,15 @@ function acknowledgeOrdinaryImDeliveryReceipt(
   if (!record.received) {
     record.received = true;
     clearOrdinaryImDeliveryTimer(record);
-    // Native Codex now commits after history confirms submission, rather than
-    // on enqueue. Its normal two-second screen settle already exceeds the IPC
-    // receipt budget; keep that budget for transport, not for CLI startup.
-    const commitWaitMs = ds.initConfig?.cliId === 'codex' && !ds.initConfig.codexRpcInput
-      ? 90_000 : ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS;
+    // Cold start (worker not ready yet) must await web server bind, plugin prep,
+    // and spawnCli before any turn can commit. Native Codex also commits after
+    // history confirms submission rather than on enqueue. Keep the short
+    // settlement budget for steady-state IPC enqueue, not for multi-second process startup.
+    const isColdStart = ds.workerReady !== true;
+    const isNativeCodex = ds.initConfig?.cliId === 'codex' && !ds.initConfig.codexRpcInput;
+    const commitWaitMs = (isColdStart || isNativeCodex)
+      ? ORDINARY_IM_INIT_COMMIT_TIMEOUT_MS
+      : ORDINARY_IM_ACK_SETTLEMENT_TIMEOUT_MS;
     record.timer = setTimeout(() => {
       delayOrdinaryImDelivery(record);
     }, commitWaitMs);

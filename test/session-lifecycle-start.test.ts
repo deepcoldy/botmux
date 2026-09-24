@@ -1869,6 +1869,58 @@ describe('ordinary IM worker receipt acknowledgement', () => {
     expect(sessionReply.mock.calls[0]?.[1]).toContain('请勿重发');
     expect(sessionReply.mock.calls[0]?.[1]).not.toContain('无法确认');
   });
+
+  it('does not falsely report non-codex cold start as delayed at 2 seconds', async () => {
+    vi.useFakeTimers();
+    const sessionReply = vi.fn(async () => 'om_delayed');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    vi.mocked(getBot).mockReturnValueOnce({
+      config: {
+        larkAppId: 'app_claude',
+        larkAppSecret: 'secret',
+        cliId: 'claude-code',
+        wrapperCli: 'claude',
+        model: 'claude-3-7-sonnet',
+        plugins: [],
+        skills: { include: [] },
+      },
+      resolvedAllowedUsers: [],
+      botOpenId: 'ou_bot',
+      botName: 'ClaudeBot',
+    } as any);
+    const ds = makeDs({ larkAppId: 'app_claude' });
+
+    forkWorker(ds, 'cold start claude', 'om_claude_kickoff');
+    expect(ds.initConfig?.cliId).toBe('claude-code');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_claude_kickoff' });
+
+    // In steady-state, ack settlement timeout is 2s, but cold-start init must not fire at 2s.
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(sessionReply).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(sessionReply).not.toHaveBeenCalled();
+
+    // Simulates CLI spawn finishing after 12s and emitting commit.
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_claude_kickoff' });
+
+    // Follow-up message arriving before worker emits ready (still cold starting) must also be protected
+    expect(sendWorkerInput(ds, 'followup prompt', 'om_claude_followup')).toBe(true);
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_claude_followup' });
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(sessionReply).not.toHaveBeenCalled();
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_claude_followup' });
+
+    // After commit, advancing past 90s must never notify delay.
+    await vi.advanceTimersByTimeAsync(90_000);
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
 });
 
 describe('TraeX task continuation', () => {
