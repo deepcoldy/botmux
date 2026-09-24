@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { delay } from '../../utils/timing.js';
+import { stripAnsiScreenText } from '../../utils/idle-detector.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult } from './types.js';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { discoverAntigravitySessions } from '../../services/resumable-session-discovery.js';
@@ -137,8 +138,28 @@ async function waitForHistoryAppend(
  * composer and its ready footer at the end of the current viewport. Old notices
  * in scrollback, a newer prompt, or a running status must not release input. */
 export function isAntigravityInterruptedScreen(screen: string): boolean {
-  if (/esc to cancel/i.test(screen)) return false;
-  return /(?:^|\n)[ \t]*⎿[ \t]+Interrupted · What should Antigravity CLI do instead\?[ \t]*\n[ \t─━\r\n]*\n>[ \t]*\n[ \t─━\r\n]*\n\? for shortcuts[^\n]*(?:\n\s*)*$/.test(screen);
+  // tmux captureViewport preserves SGR colors and normalizes rows to CRLF;
+  // the PTY renderer already returns plain LF rows. Accept both backends.
+  const plain = stripAnsiScreenText(screen).replace(/\r\n/g, '\n');
+  if (/esc to cancel/i.test(plain)) return false;
+  // Walk rows once instead of matching nested whitespace repetitions against
+  // a whole screen (which can backtrack exponentially on blank rows).
+  const rows = plain.split('\n').map(row => row.trim());
+  let end = rows.length;
+  const skipBlankRows = (): void => {
+    while (end > 0 && rows[end - 1] === '') end--;
+  };
+  const consumeBorder = (): boolean => {
+    skipBlankRows();
+    if (end === 0 || !/^[─━]+$/.test(rows[--end])) return false;
+    skipBlankRows();
+    return true;
+  };
+  skipBlankRows();
+  if (end === 0 || !/^\? for shortcuts(?:\s|$)/.test(rows[--end])) return false;
+  if (!consumeBorder() || end === 0 || rows[--end] !== '>') return false;
+  if (!consumeBorder() || end === 0) return false;
+  return /^⎿[ \t]+Interrupted · What should Antigravity CLI do instead\?$/.test(rows[end - 1]);
 }
 
 export function isAntigravityTranscriptBusy(transcriptPath: string): boolean {
