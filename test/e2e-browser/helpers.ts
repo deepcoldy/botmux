@@ -330,16 +330,24 @@ export async function openThreadForMessage(
     );
   }
 
-  // Step 1: Switch to the 「话题」filter tab on the left-middle column.
-  // After this, the middle column shows the topic list (not the message list).
+  // Step 1: Switch to the 「话题 / Topics」filter tab on the left-middle
+  // column. The saved Feishu account can render either the Chinese UI (tab
+  // labelled 「话题」) or the English UI (tab labelled "Topics" / "Topic
+  // chats"), so the instruction accepts either label instead of demanding the
+  // literal Chinese characters (which made the agent refuse to click when the
+  // UI was English). After this, the middle column shows the topic list.
   await agent.aiAct(
-    '点击飞书左侧中间那一列顶部的"话题"筛选入口（图标是📇/方框，文字就是"话题"两个字）。' +
-      '不要点"话题群"、不要点"消息"、不要点"@我"、不要点"未读"、也不要点"标签"。' +
-      '点击后，中间那一列应切换成"话题"列表',
+    'Click the "Topics" filter tab at the top of the left-middle column ' +
+      '(Chinese UI: the tab labelled 「话题」; English UI: the tab labelled ' +
+      '"Topics" or "Topic chats"). Its icon looks like an index-card/contact ' +
+      'card (📇/▯). It is NOT "Messages/消息", NOT "@mentions/@我", NOT ' +
+      '"Unread/未读", NOT "Labels/标签". After clicking, the middle column ' +
+      'switches to the topics list.',
   );
   await agent.aiWaitFor(
-    '左侧中间那一列顶部显示当前筛选是"话题"（比如标题栏显示"话题"二字），' +
-      '并且中间列是一个话题条目列表（而不是普通的"消息"列表）',
+    'The middle column is now a list of topic/thread entries (a topic list, ' +
+      'not the ordinary message/chats list). The active filter tab is Topics ' +
+      '(「话题」in Chinese).',
     { timeoutMs: 15_000, checkIntervalMs: 2_000 },
   );
 
