@@ -1267,6 +1267,12 @@ function loginPromptLines(
   ];
 }
 
+async function bytedcliLoginStatus(openId: string | undefined): Promise<'authorized' | 'unauthorized' | 'unavailable'> {
+  if (!openId) return 'unauthorized';
+  try { return await hasBytedcliHome(openId) ? 'authorized' : 'unauthorized'; }
+  catch { return 'unavailable'; }
+}
+
 /**
  * Whose credentials this session's CLI calls use right now — per tool.
  *
@@ -1294,6 +1300,7 @@ async function triggerUserAuthStatusLines(
   const larkAuthorized = senderOpenId !== undefined
     && (hasLarkCliHome(senderOpenId) || !!legacyLarkUser);
 
+  const bytedStatus = policy.tools.includes('bytedcli') ? await bytedcliLoginStatus(senderOpenId) : undefined;
   const lines = ['Trigger-user auth: 已开启'];
   for (const tool of policy.tools) {
     lines.push(`  ${tool}: ${
@@ -1310,7 +1317,9 @@ async function triggerUserAuthStatusLines(
         // authorized for one and refused by the other. There is no bot identity
         // to degrade to here either; the mint path tries the existing HOME even
         // while a fresh challenge is pending; ask the provider for the current status.
-        : await hasBytedcliHome(senderOpenId ?? '')
+        : bytedStatus === 'unavailable'
+          ? '授权服务暂时不可用，已有授权会保留；服务恢复后重试，无需重新授权'
+          : bytedStatus === 'authorized'
           ? '以你自己的身份调用'
           : '你未授权 —— 首次调用被拒时会自动返回登录链接'
     }`);
@@ -3343,10 +3352,11 @@ export async function handleCommand(
           }
           // ByteCloud 是另一个身份提供方，飞书授权了不代表这边也授权了。
           if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli')) {
+            const status = await bytedcliLoginStatus(loginOpenId);
             lines.push(t(
-              await hasBytedcliHome(loginOpenId)
-                ? 'cmd.login.bytedcli_status_yes'
-                : 'cmd.login.bytedcli_status_no',
+              status === 'unavailable' ? 'cmd.login.bytedcli_unavailable'
+                : status === 'authorized' ? 'cmd.login.bytedcli_status_yes'
+                  : 'cmd.login.bytedcli_status_no',
               undefined,
               loc,
             ));
@@ -3383,9 +3393,13 @@ export async function handleCommand(
               ? t('cmd.login.bytedcli_ok', undefined, loc)
               : state === 'pending'
                 ? t('cmd.login.bytedcli_pending', undefined, loc)
-                : t('cmd.login.bytedcli_failed', { detail: detail ?? 'unknown' }, loc));
-          } else if (await hasBytedcliHome(loginOpenId)) {
-            doneLines.push(t('cmd.login.bytedcli_status_yes', undefined, loc));
+                : state === 'unavailable'
+                  ? t('cmd.login.bytedcli_unavailable', undefined, loc)
+                  : t('cmd.login.bytedcli_failed', { detail: detail ?? 'unknown' }, loc));
+          } else {
+            const status = await bytedcliLoginStatus(loginOpenId);
+            if (status === 'authorized') doneLines.push(t('cmd.login.bytedcli_status_yes', undefined, loc));
+            else if (status === 'unavailable') doneLines.push(t('cmd.login.bytedcli_unavailable', undefined, loc));
           }
           if (!doneLines.length) doneLines.push(t('cmd.login.no_challenge', undefined, loc));
           await sessionReply(rootId, doneLines.join('\n'));
@@ -3494,7 +3508,9 @@ export async function handleCommand(
               ? t('cmd.login.bytedcli_ok', undefined, loc)
               : state === 'pending'
                 ? t('cmd.login.bytedcli_pending', undefined, loc)
-                : t('cmd.login.bytedcli_failed', { detail: detail ?? 'unknown' }, loc));
+                : state === 'unavailable'
+                  ? t('cmd.login.bytedcli_unavailable', undefined, loc)
+                  : t('cmd.login.bytedcli_failed', { detail: detail ?? 'unknown' }, loc));
             break;
           }
           const started = await beginBytedcliLogin(loginOpenId);

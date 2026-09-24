@@ -37,6 +37,7 @@ import { join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
 import { isUsableOpenId } from '../utils/user-token.js';
+import { scrubSessionTurnMarkerEnv } from '../utils/child-env.js';
 
 /** Root under which each authorized person gets their own bytedcli HOME. */
 const BYTEDCLI_HOME_ROOT = join(homedir(), '.botmux', 'data', 'bytedcli-home');
@@ -69,14 +70,33 @@ export function bytedcliHomeFor(openId: string): string {
 /** Ask the credential provider whether this person's isolated login is usable.
  * Storage layout belongs to bytedcli/its SDK, not Botmux. A directory or a
  * legacy token filename is neither necessary nor sufficient authorization. */
+class BytedcliAuthUnavailableError extends Error {
+  constructor(operation: string) {
+    super(`bytedcli authorization service unavailable (${operation}); retry after the service recovers, without starting another login`);
+    this.name = 'BytedcliAuthUnavailableError';
+  }
+}
+
+async function readLoginState(openId: string): Promise<boolean> {
+  if (!existsSync(bytedcliHomeFor(openId))) return false;
+  const result = await runAsUser(openId, ['auth', 'status', '--json']);
+  const envelope = parseEnvelope(result.stdout);
+  const data = envelope?.data as Record<string, unknown> | undefined;
+  if (!result.ok || envelope?.status !== 'success' || typeof data?.authenticated !== 'boolean') {
+    throw new BytedcliAuthUnavailableError('status');
+  }
+  const sdk = data.bytecloud_auth as Record<string, unknown> | undefined;
+  if (data.auth_as === 'app' || sdk?.authType === 'app') {
+    throw new BytedcliAuthUnavailableError('unexpected app identity');
+  }
+  if (!data.authenticated && sdk?.status && sdk.status !== 'need_login') {
+    throw new BytedcliAuthUnavailableError('provider not ready');
+  }
+  return data.authenticated;
+}
+
 export async function hasBytedcliHome(openId: string): Promise<boolean> {
-  try {
-    if (!existsSync(bytedcliHomeFor(openId))) return false;
-    const result = await runAsUser(openId, ['auth', 'status', '--json']);
-    const data = parseEnvelope(result.stdout)?.data as Record<string, unknown> | undefined;
-    const sdk = data?.bytecloud_auth as Record<string, unknown> | undefined;
-    return result.ok && data?.authenticated === true && data.auth_as !== 'app' && sdk?.authType !== 'app';
-  } catch { return false; }
+  return await readLoginState(openId);
 }
 
 /** Forget one person's bytedcli authorization entirely. */
@@ -94,21 +114,29 @@ export interface BytedcliResult {
 /**
  * Run `bytedcli` as one person.
  *
- * `HOME` is the whole mechanism. Everything else in the environment is
- * inherited, because bytedcli needs the usual PATH/proxy/site settings to reach
- * ByteCloud at all.
+ * Keep transport settings, but remove session wrappers and caller credentials.
+ * The provider must read only this person's isolated HOME.
  */
 async function runAsUser(openId: string, args: string[]): Promise<BytedcliResult> {
   const home = bytedcliHomeFor(openId);
   mkdirSync(home, { recursive: true, mode: 0o700 });
+  const env = { ...process.env };
+  scrubSessionTurnMarkerEnv(env);
+  for (const key of [
+    'BYTEDCLI_PROFILE', 'BYTEDCLI_CODEBASE_APP_ID', 'BYTEDCLI_CODEBASE_APP_SECRET',
+    'AIME_WORKSPACE_PATH', 'AIME_CURRENT_USER',
+    'BYTECLOUD_AUTH_ACCESS_KEY_ID', 'BYTECLOUD_AUTH_SECRET_ACCESS_KEY',
+  ]) delete env[key];
+  Object.assign(env, { HOME: home, BYTECLOUD_AUTH_AS: 'user', BYTEDCLI_NO_AUTO_UPGRADE: '1' });
   return await new Promise<BytedcliResult>(resolve => {
     const child = spawn('bytedcli', args, {
-      env: { ...process.env, HOME: home, BYTECLOUD_AUTH_AS: 'user', BYTEDCLI_NO_AUTO_UPGRADE: '1' },
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
     let stderr = '';
     let settled = false;
+    let timedOut = false;
     const finish = (ok: boolean) => {
       if (settled) return;
       settled = true;
@@ -116,15 +144,19 @@ async function runAsUser(openId: string, args: string[]): Promise<BytedcliResult
       resolve({ ok, stdout, stderr });
     };
     const timer = setTimeout(() => {
+      timedOut = true;
       child.kill('SIGKILL');
       stderr += '\n[bytedcli-auth] timed out';
+      // A descendant can retain the pipes after the CLI exits; do not wait for close.
+      child.stdout.destroy();
+      child.stderr.destroy();
       finish(false);
     }, BYTEDCLI_TIMEOUT_MS);
     child.stdout.on('data', d => { stdout += String(d); });
     child.stderr.on('data', d => { stderr += String(d); });
     // A missing binary lands here, not on a non-zero exit.
     child.on('error', err => { stderr += `\n${err.message}`; finish(false); });
-    child.on('close', code => finish(code === 0));
+    child.on('close', code => finish(!timedOut && code === 0));
   });
 }
 
@@ -132,6 +164,10 @@ async function runAsUser(openId: string, args: string[]): Promise<BytedcliResult
 function parseEnvelope(stdout: string): Record<string, unknown> | null {
   // `--begin` emits progress events (`qr_image_ready`) before the envelope, one
   // JSON object per line, so take the last parseable line rather than the first.
+  try {
+    const parsed = JSON.parse(stdout);
+    if (parsed && typeof parsed === 'object' && 'status' in parsed) return parsed;
+  } catch { /* progress lines may precede the envelope */ }
   const lines = stdout.split('\n').map(l => l.trim()).filter(Boolean);
   for (let i = lines.length - 1; i >= 0; i -= 1) {
     try {
@@ -161,7 +197,8 @@ function pendingBytedcliLogin(openId: string): BytedcliLoginChallenge | null {
   try {
     const raw = JSON.parse(readFileSync(challengePath(openId), 'utf8')) as
       { token?: unknown; authUrl?: unknown; createdAt?: unknown };
-    if (typeof raw.token !== 'string' || typeof raw.createdAt !== 'number') return null;
+    if (typeof raw.token !== 'string' || !raw.token || typeof raw.createdAt !== 'number'
+      || !Number.isFinite(raw.createdAt) || raw.createdAt > Date.now()) return null;
     if (Date.now() - raw.createdAt > CHALLENGE_TTL_MS) return null;
     return {
       completeToken: raw.token,
@@ -174,17 +211,18 @@ export function pendingBytedcliChallenge(openId: string): string | null {
   return pendingBytedcliLogin(openId)?.completeToken ?? null;
 }
 
-function saveChallenge(openId: string, token: string, authUrl: string): void {
+function saveChallenge(openId: string, token: string, authUrl: string): boolean {
   try {
     atomicWriteFileSync(
       challengePath(openId),
       JSON.stringify({ token, authUrl, createdAt: Date.now() }),
       { mode: 0o600 },
     );
-  } catch (e) {
-    // Non-fatal: the person can still authorize, they just cannot resume with
-    // `done` and will need a fresh link.
-    logger.debug(`[bytedcli-auth] could not persist the login challenge: ${e instanceof Error ? e.message : String(e)}`);
+    return true;
+  } catch {
+    // Never hand out a challenge that the next turn cannot resume.
+    logger.warn('[bytedcli-auth] could not persist the login challenge');
+    return false;
   }
 }
 
@@ -207,26 +245,36 @@ export interface BytedcliLoginChallenge {
  * instead of holding a terminal open waiting for a scan, which is the only
  * shape that works when the person authorizing is on the other side of a chat.
  */
+const beginnings = new Map<string, Promise<BytedcliLoginChallenge | null>>();
+
 export async function beginBytedcliLogin(openId: string): Promise<BytedcliLoginChallenge | null> {
+  const existing = beginnings.get(openId);
+  if (existing) return existing;
+  const work = beginLogin(openId);
+  beginnings.set(openId, work);
+  try { return await work; } finally { beginnings.delete(openId); }
+}
+
+async function beginLogin(openId: string): Promise<BytedcliLoginChallenge | null> {
   const pending = pendingBytedcliLogin(openId);
   if (pending?.authUrl) return pending;
 
-  const { ok, stdout, stderr } = await runAsUser(openId, ['auth', 'login', '--begin', '--json']);
+  const { ok, stdout } = await runAsUser(openId, ['auth', 'login', '--begin', '--json']);
   const env = parseEnvelope(stdout);
   const data = env?.data as Record<string, unknown> | undefined;
   const authUrl = typeof data?.verification_uri_complete === 'string'
     ? data.verification_uri_complete
     : undefined;
   const completeToken = typeof data?.complete_token === 'string' ? data.complete_token : undefined;
-  if (!ok || !authUrl || !completeToken) {
-    logger.warn(`[bytedcli-auth] could not start a login: ${stderr.trim() || stdout.trim() || 'no output'}`);
+  if (!ok || env?.status !== 'success' || !authUrl || !completeToken) {
+    logger.warn('[bytedcli-auth] could not start a login; provider failed or returned an invalid challenge');
     return null;
   }
-  saveChallenge(openId, completeToken, authUrl);
+  if (!saveChallenge(openId, completeToken, authUrl)) return null;
   return { authUrl, completeToken };
 }
 
-export type BytedcliLoginState = 'authorized' | 'pending' | 'failed';
+export type BytedcliLoginState = 'authorized' | 'pending' | 'failed' | 'unavailable';
 
 /**
  * Try to finish a started login.
@@ -238,22 +286,35 @@ export async function completeBytedcliLogin(
   openId: string,
   completeToken: string,
 ): Promise<{ state: BytedcliLoginState; detail?: string }> {
-  const { ok, stdout, stderr } = await runAsUser(
+  const { ok, stdout } = await runAsUser(
     openId,
     ['auth', 'login', '--complete', completeToken, '--json'],
   );
   const env = parseEnvelope(stdout);
   const data = env?.data as Record<string, unknown> | undefined;
-  if (ok && data?.status === 'pending') return { state: 'pending' };
-  if (ok) { clearChallenge(openId); return { state: 'authorized' }; }
-  // Terminal (not pending): re-polling the same token cannot succeed. Drop it so
-  // the next begin issues a fresh link instead of wedging on a dead token.
-  clearChallenge(openId);
-  const detail = (env?.error as Record<string, unknown> | undefined)?.message;
-  return {
-    state: 'failed',
-    ...(typeof detail === 'string' ? { detail } : { detail: stderr.trim() || undefined }),
-  };
+  const state = data?.login_status ?? data?.status;
+  const error = env?.error as Record<string, unknown> | undefined;
+  const errorCode = typeof error?.code === 'string' ? error.code : '';
+  if ((ok && env?.status === 'success' && state === 'pending')
+    || errorCode === 'BYTECLOUD_AUTH_LOGIN_PENDING') return { state: 'pending' };
+  if (ok && env?.status === 'success' && (state === 'success' || state === 'ok')) {
+    // Completion is not authority until the isolated provider can use the login.
+    try {
+      if (await readLoginState(openId)) {
+        clearChallenge(openId);
+        return { state: 'authorized' };
+      }
+    } catch { /* Preserve the challenge until the provider can verify it. */ }
+    return { state: 'unavailable', detail: 'Login completion did not produce usable personal credentials; retry status without starting another login.' };
+  }
+  const terminal = ['expired', 'denied', 'invalid_ticket'].includes(String(state))
+    || ['BYTECLOUD_AUTH_LOGIN_EXPIRED', 'BYTECLOUD_AUTH_LOGIN_DENIED',
+      'BYTECLOUD_AUTH_LOGIN_INVALID_TICKET', 'BYTECLOUD_AUTH_LOGIN_CHALLENGE_INVALID'].includes(errorCode);
+  // Network errors, timeouts and unknown output do not invalidate a challenge.
+  if (terminal) clearChallenge(openId);
+  return { state: terminal ? 'failed' : 'unavailable', detail: terminal
+    ? 'Login challenge expired or was rejected.'
+    : 'Authorization service unavailable; the existing login challenge was retained. Retry later without reauthorizing.' };
 }
 
 export interface BytedcliJwts {
@@ -282,17 +343,26 @@ export interface BytedcliJwts {
  * (which is also the only thing that can clear that state). So regardless of
  * the poll outcome, fall through and let the HOME / JWT read be the authority.
  */
+const minting = new Map<string, Promise<BytedcliJwts | null>>();
+
 export async function mintBytedcliJwts(openId: string): Promise<BytedcliJwts | null> {
+  const existing = minting.get(openId);
+  if (existing) return existing;
+  const work = mintJwts(openId);
+  minting.set(openId, work);
+  try { return await work; } finally { minting.delete(openId); }
+}
+
+async function mintJwts(openId: string): Promise<BytedcliJwts | null> {
   const challenge = pendingBytedcliChallenge(openId);
   if (challenge) {
     await completeBytedcliLogin(openId, challenge);
   }
-  if (!await hasBytedcliHome(openId)) return null;
+  if (!await readLoginState(openId)) return null;
   const cloud = await runAsUser(openId, ['auth', 'get-bytecloud-jwt-token']);
   const cloudJwt = cloud.stdout.trim();
   if (!cloud.ok || !cloudJwt) {
-    logger.debug(`[bytedcli-auth] no ByteCloud JWT for ${openId}: ${cloud.stderr.trim() || 'empty output'}`);
-    return null;
+    throw new BytedcliAuthUnavailableError('mint personal JWT');
   }
   // The Codebase JWT is optional: without it lark/bytedcli calls still work and
   // only git attribution degrades, so a failure here must not deny the turn.

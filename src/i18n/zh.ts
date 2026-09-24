@@ -469,6 +469,7 @@ export const messages: Record<string, string> = {
   'cmd.login.bytedcli_failed': '❌ ByteCloud 授权失败：{detail}。可以重新发 /login bytedcli 再试一次。',
   'cmd.login.bytedcli_no_challenge': '❌ 没有正在进行的 ByteCloud 授权。请先发 /login bytedcli 拿授权链接。',
   'cmd.login.bytedcli_begin_failed': '❌ 无法发起 ByteCloud 授权：{detail}',
+  'cmd.login.bytedcli_unavailable': 'ByteCloud（bytedcli）：授权服务暂时不可用，已有授权和待确认的登录会保留。服务恢复后重试，无需重新授权。',
   'cmd.login.bytedcli_status_yes': 'ByteCloud（bytedcli）：已授权',
   'cmd.login.bytedcli_status_no': 'ByteCloud（bytedcli）：未授权 —— 首次调用时会自动返回登录链接',
   'cmd.login.lark_title': '🔐 lark-cli 授权（点链接确认）',

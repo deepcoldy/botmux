@@ -35,6 +35,7 @@
 import { accessSync, constants, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { isCliIdentityPath } from '../utils/child-env.js';
 import type { TriggerUserAuthConfig, TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 
 /** Where a session's identity files live, under its own data dir. */
@@ -730,7 +731,7 @@ export function findRealToolBinary(
 ): string | null {
   const excluded = new Set(excludeDirs.filter(Boolean));
   for (const dir of (pathValue ?? '').split(delimiter)) {
-    if (!dir || excluded.has(dir)) continue;
+    if (!dir || excluded.has(dir) || isCliIdentityPath(dir)) continue;
     const candidate = join(dir, tool);
     try {
       accessSync(candidate, constants.X_OK);

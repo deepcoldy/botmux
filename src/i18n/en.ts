@@ -471,6 +471,7 @@ export const messages: Record<string, string> = {
   'cmd.login.bytedcli_failed': '❌ ByteCloud authorization failed: {detail}. Send /login bytedcli to try again.',
   'cmd.login.bytedcli_no_challenge': '❌ No ByteCloud authorization in progress. Send /login bytedcli to get a link first.',
   'cmd.login.bytedcli_begin_failed': '❌ Could not start ByteCloud authorization: {detail}',
+  'cmd.login.bytedcli_unavailable': 'ByteCloud (bytedcli): authorization service unavailable. Existing credentials and pending login are retained. Retry after recovery; no new authorization is needed.',
   'cmd.login.bytedcli_status_yes': 'ByteCloud (bytedcli): authorized',
   'cmd.login.bytedcli_status_no': 'ByteCloud (bytedcli): not authorized — the first call returns a login link automatically',
   'cmd.login.lark_title': '🔐 lark-cli authorization (tap the link)',

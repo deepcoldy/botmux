@@ -10,6 +10,9 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ─── Mock external modules ──────────────────────────────────────────────────
 
+// Command routing must not load or start a native terminal through transitive imports.
+vi.mock('node-pty', () => ({ spawn: vi.fn(() => { throw new Error('unexpected native terminal spawn'); }) }));
+
 // Mock node builtins that command-handler imports directly
 // Global bot registry as seen via bots-info.json (the deployment-wide source the
 // /group election reads). Two bots, distinct names — the realistic chat shape.
@@ -3378,6 +3381,13 @@ describe('handleCommand', () => {
         expect(text).toContain('首次调用被拒时会自动返回登录链接');
       });
 
+      it('reports provider outages without telling the user to authorize again', async () => {
+        vi.mocked(hasBytedcliHome).mockRejectedValueOnce(new Error('provider unavailable'));
+        const text = await statusText(statusWith({ enabled: true, tools: ['bytedcli'] }, false));
+        expect(text).toContain('授权服务暂时不可用');
+        expect(text).not.toContain('你未授权');
+      });
+
       it('reports bytedcli as authorized once that person has logged in', async () => {
         vi.mocked(hasBytedcliHome).mockResolvedValue(true);
         const text = await statusText(
@@ -5504,6 +5514,32 @@ describe('handleCommand', () => {
     });
 
     describe('/login bytedcli', () => {
+      it.each(['/login bytedcli done', '/login done'])('retains authorization on provider outage: %s', async command => {
+        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
+        vi.mocked(completeBytedcliLogin).mockResolvedValueOnce({ state: 'unavailable' });
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand('/login', ROOT_ID, makeLarkMessage(command), deps, LARK_APP_ID);
+        const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+        expect(text).toContain('授权服务暂时不可用');
+        expect(text).toContain('无需重新授权');
+        expect(text).not.toContain('再试一次');
+      });
+
+      it('reports an unavailable status instead of an unauthorized identity', async () => {
+        const prev = vi.mocked(getBot).getMockImplementation();
+        vi.mocked(getBot).mockImplementation((...args: any[]) => ({
+          ...prev!(...args), config: { ...prev!(...args).config, triggerUserAuth: { enabled: true, tools: ['bytedcli'] } },
+        }) as any);
+        vi.mocked(hasBytedcliHome).mockRejectedValueOnce(new Error('provider unavailable'));
+        try {
+          const deps = makeDeps(makeDaemonSession());
+          await handleCommand('/login', ROOT_ID, makeLarkMessage('/login status'), deps, LARK_APP_ID);
+          const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+          expect(text).toContain('授权服务暂时不可用');
+          expect(text).not.toContain('未授权');
+        } finally { vi.mocked(getBot).mockImplementation(prev!); }
+      });
+
       it('returns the ByteCloud link and says it is separate from Feishu', async () => {
         const deps = makeDeps(makeDaemonSession());
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli'), deps, LARK_APP_ID);

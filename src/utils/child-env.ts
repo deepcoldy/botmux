@@ -559,7 +559,41 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
 
 /** Delete inherited session-only identity/capabilities from `env` in place. */
 export function scrubSessionTurnMarkerEnv(env: NodeJS.ProcessEnv): void {
+  scrubCliIdentityEnv(env);
   for (const key of SESSION_TURN_MARKER_ENV_KEYS) delete env[key];
+}
+
+/** Session wrappers must never intercept the provider that provisions them. */
+export function isCliIdentityPath(value: string | undefined): boolean {
+  return !!value && /(?:^|[\\/])cli-identity[\\/][^\\/]+\.bin(?:[\\/]|$)/.test(value);
+}
+
+export function scrubCliIdentityEnv(env: NodeJS.ProcessEnv): void {
+  const bin = env.BOTMUX_IDENTITY_BIN?.replace(/[\\/]+$/, '');
+  const managed = (value: string | undefined): boolean => !!value && (
+    isCliIdentityPath(value) || !!bin && (value === bin || value.startsWith(`${bin}/`) || value.startsWith(`${bin}\\`))
+  );
+  if (env.PATH !== undefined) {
+    const delimiter = process.platform === 'win32' ? ';' : ':';
+    env.PATH = env.PATH.split(delimiter).filter(p => !managed(p.replace(/[\\/]+$/, ''))).join(delimiter);
+  }
+  if (managed(env.GIT_ASKPASS)) {
+    // These entries are emitted together by gitIdentityConfigEnv for the turn.
+    for (const key of Object.keys(env)) {
+      if (/^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+)$/.test(key)) delete env[key];
+    }
+  }
+  for (const key of ['ZDOTDIR', 'BASH_ENV', 'GIT_ASKPASS']) {
+    if (managed(env[key])) delete env[key];
+  }
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('BOTMUX_IDENTITY_')) delete env[key];
+  }
+  for (const key of [
+    'BYTEDCLI_USER_CLOUD_JWT', 'BYTEDCLI_USER_CODE_JWT', 'BYTEDCLI_USER_CB_OAUTH_AT',
+    'AIME_USER_CLOUD_JWT', 'AIME_USER_CODE_JWT',
+    'LARKSUITE_CLI_USER_ACCESS_TOKEN',
+  ]) delete env[key];
 }
 
 /** Proxy env vars that must reach the CLI child process so it can dial the
