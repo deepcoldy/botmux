@@ -29,6 +29,10 @@ describe('Antigravity explicit interruption viewport', () => {
     expect(isAntigravityInterruptedScreen(tall + 'new output')).toBe(false);
   });
 
+  it('accepts PTY snapshots whose display cleanup removes box-drawing rows', () => {
+    expect(isAntigravityInterruptedScreen(interrupted.replace(/[─━]/g, ''))).toBe(true);
+  });
+
   it.each([
     interrupted.replace('\n>\n', '\n> next request\n'),
     interrupted.replace('accept-edits', 'esc to cancel'),

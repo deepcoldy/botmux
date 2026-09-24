@@ -149,16 +149,17 @@ export function isAntigravityInterruptedScreen(screen: string): boolean {
   const skipBlankRows = (): void => {
     while (end > 0 && rows[end - 1] === '') end--;
   };
-  const consumeBorder = (): boolean => {
-    skipBlankRows();
-    if (end === 0 || !/^[─━]+$/.test(rows[--end])) return false;
-    skipBlankRows();
-    return true;
+  const skipSeparators = (): void => {
+    // PTY rawSnapshot's display cleanup replaces box-drawing rows with blanks;
+    // tmux retains them. Both must preserve the same three semantic rows.
+    while (end > 0 && /^[─━]*$/.test(rows[end - 1])) end--;
   };
   skipBlankRows();
   if (end === 0 || !/^\? for shortcuts(?:\s|$)/.test(rows[--end])) return false;
-  if (!consumeBorder() || end === 0 || rows[--end] !== '>') return false;
-  if (!consumeBorder() || end === 0) return false;
+  skipSeparators();
+  if (end === 0 || rows[--end] !== '>') return false;
+  skipSeparators();
+  if (end === 0) return false;
   return /^⎿[ \t]+Interrupted · What should Antigravity CLI do instead\?$/.test(rows[end - 1]);
 }
 
