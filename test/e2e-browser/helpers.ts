@@ -130,11 +130,19 @@ export function createAgent(page: Page): PlaywrightAgent {
 export async function navigateToMessenger(page: Page): Promise<void> {
   await page.goto(getMessengerUrl(), { waitUntil: 'domcontentloaded' });
   try {
+    // The saved account can render either the English ("Messenger - Feishu",
+    // "Search"/"Messenger") or Chinese ("消息 - 飞书", "搜索"/"消息") UI, so do
+    // not gate on a single language. Require: we stayed out of the login redirect
+    // and the messenger shell rendered (a known title token + a search affordance).
     await page.waitForFunction(
-      () =>
-        document.title.includes('消息 - 飞书') &&
-        document.body.innerText.includes('搜索') &&
-        document.body.innerText.includes('消息'),
+      () => {
+        const title = document.title;
+        const titleReady = /messenger|飞书|lark/i.test(title);
+        const body = document.body?.innerText ?? '';
+        const searchReady = /search|搜索/i.test(body);
+        const messengerReady = /messenger|消息/i.test(body);
+        return titleReady && searchReady && messengerReady;
+      },
       null,
       { timeout: 30_000 },
     );
