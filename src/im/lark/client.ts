@@ -1662,6 +1662,44 @@ export async function resolveTargetAppOpenId(
   }
 }
 
+/**
+ * Retry a contact API operation on transient failure (network timeout / 5xx / rate limit).
+ * Definitive errors (invalid_id / not_visible / cross_app) fail immediately without retry.
+ */
+async function retryContactTransient(
+  op: () => Promise<any>,
+  opts: { maxAttempts?: number; baseMs?: number; label?: string } = {},
+): Promise<any> {
+  const maxAttempts = opts.maxAttempts ?? 2;
+  const baseMs = opts.baseMs ?? (process.env.NODE_ENV === 'test' ? 1 : 500);
+  let attempt = 0;
+  while (true) {
+    attempt++;
+    try {
+      const res = await op();
+      const code = (res as any)?.code;
+      if (typeof code === 'number' && code !== 0) {
+        const definitive = classifyContactErrorCode(code);
+        if (!definitive && attempt < maxAttempts) {
+          logger.warn(`[contact-resolve] ${opts.label ?? 'op'} transient code=${code}, retrying attempt ${attempt}/${maxAttempts}...`);
+          await new Promise(r => setTimeout(r, baseMs * attempt));
+          continue;
+        }
+      }
+      return res;
+    } catch (err: any) {
+      const errCode = getLarkErrorCode(err);
+      const definitive = classifyContactErrorCode(errCode);
+      if (!definitive && attempt < maxAttempts) {
+        logger.warn(`[contact-resolve] ${opts.label ?? 'op'} threw (${err?.message ?? err}), retrying attempt ${attempt}/${maxAttempts}...`);
+        await new Promise(r => setTimeout(r, baseMs * attempt));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 export async function resolveAllowedUsersWithMap(
   larkAppId: string, raw: string[],
 ): Promise<{ resolved: string[]; map: Map<string, string>; errored?: boolean; entryStatus: Map<string, EntryResolveStatus> }> {
@@ -1729,7 +1767,10 @@ export async function resolveAllowedUsersWithMap(
     // union_id → 本 app open_id（单条查询；失败则丢弃该条，与 email 解析失败同口径）。
     for (const uid of unionIds) {
       try {
-        const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(uid)}`, { user_id_type: 'union_id' });
+        const res = await retryContactTransient(
+          () => larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(uid)}`, { user_id_type: 'union_id' }),
+          { label: `union_id ${uid}` },
+        );
         const oid = res?.data?.user?.open_id as string | undefined;
         if (res.code === 0 && oid) {
           map.set(uid, oid);
@@ -1758,10 +1799,13 @@ export async function resolveAllowedUsersWithMap(
 
     if (emails.length > 0) {
       try {
-        const res = await (c as any).contact.v3.user.batchGetId({
-          params: { user_id_type: 'open_id' },
-          data: { emails, include_resigned: false },
-        });
+        const res = await retryContactTransient(
+          () => (c as any).contact.v3.user.batchGetId({
+            params: { user_id_type: 'open_id' },
+            data: { emails, include_resigned: false },
+          }),
+          { label: `emails batch (${emails.length})` },
+        );
         if (res.code !== 0) {
           // A non-zero batchGetId code is a WHOLE-REQUEST failure, not a
           // per-email identity verdict — even a permanent 4xx like 40001
@@ -1814,10 +1858,13 @@ export async function resolveAllowedUsersWithMap(
       // mobileRawByNorm) so exact-match with allowedUsers holds even though the
       // API is queried with the normalized number.
       try {
-        const res = await (c as any).contact.v3.user.batchGetId({
-          params: { user_id_type: 'open_id' },
-          data: { mobiles, include_resigned: false },
-        });
+        const res = await retryContactTransient(
+          () => (c as any).contact.v3.user.batchGetId({
+            params: { user_id_type: 'open_id' },
+            data: { mobiles, include_resigned: false },
+          }),
+          { label: `mobiles batch (${mobiles.length})` },
+        );
         if (res.code !== 0) {
           // Whole-request failure — not a per-mobile verdict. Mark every
           // requested mobile TRANSIENT so a real owner isn't fail-closed out.

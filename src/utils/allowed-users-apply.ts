@@ -64,6 +64,12 @@ export interface ApplyAllowedUsersResolveOutput {
   failed: boolean;
   /** Human-readable notice for logs / owner DM; null when nothing to report. */
   notice: string | null;
+  /**
+   * True when usedFallback is true, every transiently-failed entry was
+   * successfully recovered from cache, and the runtime list is non-empty.
+   * Indicates owner authorization remains 100% operational despite upstream API blips.
+   */
+  fullyRecovered: boolean;
 }
 
 /** Config entries that require a contact resolve (email / union / literal ou_ / mobile). */
@@ -100,7 +106,7 @@ export function applyAllowedUsersResolve(
   const { map: freshMap, errored, entryStatus } = input.resolveResult;
 
   if (rawEntries.length === 0) {
-    return { resolved: [], map: new Map(), usedFallback: false, failed: false, notice: null };
+    return { resolved: [], map: new Map(), usedFallback: false, failed: false, notice: null, fullyRecovered: false };
   }
 
   const outMap = new Map<string, string>();
@@ -151,7 +157,7 @@ export function applyAllowedUsersResolve(
     // definitively-gone / non-resolvable entries — that is a legitimate empty
     // allowlist, not a fallback situation. Non-resolvable-only configs (no
     // contact entries) also land here with no notice.
-    return { resolved, map: outMap, usedFallback: false, failed: false, notice: null };
+    return { resolved, map: outMap, usedFallback: false, failed: false, notice: null, fullyRecovered: false };
   }
 
   // Degraded pass (something transient-failed). Build an operator-facing notice.
@@ -177,5 +183,6 @@ export function applyAllowedUsersResolve(
       `allowedUsers resolve degraded; runtime allowlist is empty. Raw entries: ${rawEntries.join(', ')}.`;
   }
 
-  return { resolved, map: outMap, usedFallback, failed: true, notice };
+  const fullyRecovered = usedFallback && !transientMissWithoutCache && resolved.length > 0;
+  return { resolved, map: outMap, usedFallback, failed: true, notice, fullyRecovered };
 }

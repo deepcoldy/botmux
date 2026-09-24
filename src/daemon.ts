@@ -26740,7 +26740,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           });
           logger.info(`[${cfg.larkAppId}] Resolved allowedUsers: ${bot.resolvedAllowedUsers.join(', ') || '(empty)'}${applied.usedFallback ? ' [some from cache]' : ''}`);
           if (applied.failed && applied.notice) {
-            notifyAllowedUsersResolveFailure(cfg.larkAppId, applied.notice, applied.resolved);
+            if (applied.fullyRecovered) {
+              logger.warn(`[${cfg.larkAppId}] ${applied.notice} (cached fallback active, silenced owner DM; scheduled retry)`);
+            } else {
+              notifyAllowedUsersResolveFailure(cfg.larkAppId, applied.notice, applied.resolved);
+            }
             scheduleAllowedUsersResolveRetry(cfg.larkAppId);
           }
         } catch (err: any) {
@@ -26762,11 +26766,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           }
           const notice = applied.notice
             ?? `Failed to resolve allowedUsers: ${err?.message ?? err}`;
-          notifyAllowedUsersResolveFailure(
-            cfg.larkAppId,
-            `${notice} (throw: ${err?.message ?? err})`,
-            applied.resolved,
-          );
+          if (applied.fullyRecovered) {
+            logger.warn(
+              `[${cfg.larkAppId}] ${notice} (throw: ${err?.message ?? err}; cached fallback active, silenced owner DM; scheduled retry)`,
+            );
+          } else {
+            notifyAllowedUsersResolveFailure(
+              cfg.larkAppId,
+              `${notice} (throw: ${err?.message ?? err})`,
+              applied.resolved,
+            );
+          }
           scheduleAllowedUsersResolveRetry(cfg.larkAppId);
         }
       }

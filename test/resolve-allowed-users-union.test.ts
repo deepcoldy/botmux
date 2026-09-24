@@ -221,6 +221,31 @@ describe('resolveAllowedUsersWithMap — entryStatus classification (PR#590)', (
     expect(network.entryStatus.get('flaky@corp.com')).toBe('transient');
     expect(network.errored).toBe(true);
   });
+
+  it('email batch transient failure retries and succeeds on subsequent attempt', async () => {
+    let callCount = 0;
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => {
+        callCount++;
+        if (callCount === 1) {
+          throw new Error('timeout of 15000ms exceeded');
+        }
+        return {
+          code: 0,
+          data: {
+            user_list: [{ email: 'owner@corp.com', user_id: 'ou_recovered_owner' }],
+          },
+        };
+      },
+    );
+    const result = await resolveAllowedUsersWithMap(APP, ['owner@corp.com']);
+    expect(callCount).toBe(2);
+    expect(result.resolved).toEqual(['ou_recovered_owner']);
+    expect(result.map.get('owner@corp.com')).toBe('ou_recovered_owner');
+    expect(result.entryStatus.get('owner@corp.com')).toBe('resolved');
+    expect(result.errored).toBeFalsy();
+  });
 });
 
 // End-to-end: resolver → applyAllowedUsersResolve → cache decision, for the exact

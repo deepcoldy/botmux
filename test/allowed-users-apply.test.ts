@@ -49,6 +49,7 @@ describe('applyAllowedUsersResolve', () => {
     expect(out.map.get('on_b')).toBe('ou_b_cached');
     expect(out.usedFallback).toBe(true);
     expect(out.failed).toBe(true);
+    expect(out.fullyRecovered).toBe(true);
     expect(out.notice).toContain('on_b');
   });
 
@@ -62,6 +63,7 @@ describe('applyAllowedUsersResolve', () => {
     expect(out.resolved).toEqual(['ou_8a744395b1a13034de3e5e8ba6ba9715']);
     expect(out.usedFallback).toBe(true);
     expect(out.failed).toBe(true);
+    expect(out.fullyRecovered).toBe(true);
     // map/resolved consistency: /revoke reverse-lookup must still work.
     expect(out.map.get('on_928c2db360e48084f1ff72ebe161b1d6')).toBe('ou_8a744395b1a13034de3e5e8ba6ba9715');
   });
@@ -178,5 +180,23 @@ describe('applyAllowedUsersResolve', () => {
     expect(out.resolved).not.toContain('ou_gone_cached');
     expect(out.usedFallback).toBe(false);
     expect(out.failed).toBe(false);
+    expect(out.fullyRecovered).toBe(false);
+  });
+
+  it('partially recovered from cache but one entry has no cache: fullyRecovered is false', () => {
+    const out = applyAllowedUsersResolve({
+      rawEntries: ['on_cached', 'on_uncached'],
+      previousResolvedMap: { on_cached: 'ou_cached' },
+      resolveResult: result(
+        [],
+        [['on_cached', 'transient'], ['on_uncached', 'transient']],
+        true,
+      ),
+    });
+
+    expect(out.resolved).toEqual(['ou_cached']);
+    expect(out.usedFallback).toBe(true);
+    expect(out.failed).toBe(true);
+    expect(out.fullyRecovered).toBe(false);
   });
 });
