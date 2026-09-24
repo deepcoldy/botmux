@@ -12,9 +12,9 @@ curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh 
 
 botmux 是**自包含单文件二进制**，运行时已嵌在里面——**装它和跑它都不需要机器上有 Node**。装到 `~/.botmux/bin/botmux`（`BOTMUX_INSTALL_DIR` 可改），按 OS/arch 自动选二进制、校验 SHA-256，并把 `~/.botmux/bin` 写进你当前 shell 的启动文件（zsh / bash / fish 各写对的那个），**开个新终端就能用**。支持 linux / macOS × x64 / arm64（Alpine 等 musl 环境自动选 musl 版）；**Windows 请在 WSL2 里装**。
 
-> 🔁 **升级**：`botmux upgrade`（原地换二进制），或重跑一遍上面那条 curl 命令——同样原地升级，不会重复往启动文件追加 PATH。装指定版本：`BOTMUX_VERSION=v3.18.8 curl … | sh`。
+> 🔁 **升级统一用 curl**（与当初的安装方式无关，npm / pnpm 装的也一样）：重跑一遍上面那条命令即原地替换二进制，不会重复往启动文件追加 PATH，装完开个新终端跑 `botmux restart`。装指定版本：`curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | BOTMUX_VERSION=v3.18.8 sh`（变量必须写在管道右侧的 `sh` 前面才生效）。⚠️ **v3.18.0 之前的老版本不要用 npm 升级**——跨「Node 源码 → 二进制」形态边界会让 daemon 重启失败，详见 [FAQ · 怎么升级？](/faq#怎么升级)。
 
-> 📦 **也可以走 npm**（`npm install -g botmux`，需 Node ≥ 22 才能执行安装本身）：npm 包内带的是**同一个自包含二进制**（实测与 GitHub Release 资产 SHA-256 逐字节相同，按 os/arch 只装匹配的那一个），postinstall 把 `~/.botmux/bin/botmux` 指向它并同样写 PATH。区别只在**谁来装、以后谁来升**：npm 路径需要 Node，升级交回 `npm i -g botmux@latest`；curl 路径全程不碰 Node。跑起来之后两者完全一致。
+> 📦 **也可以走 npm**（`npm install -g botmux`，需 Node ≥ 22 才能执行安装本身）：npm 包内带的是**同一个自包含二进制**（实测与 GitHub Release 资产 SHA-256 逐字节相同，按 os/arch 只装匹配的那一个），postinstall 把 `~/.botmux/bin/botmux` 指向它并同样写 PATH。区别只在**谁来装**：npm 路径需要 Node，curl 路径全程不碰 Node；**无论当初怎么装，升级都重跑 curl**（v3.18.0 之前的老版本用 npm 跨形态升级会让 daemon 起不回来，见 [FAQ · 怎么升级？](/faq#怎么升级)）。跑起来之后两者完全一致。
 
 跑 botmux 本身不需要 Node，但**本地要装好并登录至少一种 AI 编程 CLI**（`claude` / `codex` / `cursor-agent` / `gemini` / `opencode` / `coco` / `agy` 等，它们各自的运行时要求另算）。**默认会话后端是 tmux（≥3.x），需装好**——不可用时会硬拦截弹卡、不再自动降级 pty；确需无 tmux 环境才用 `BACKEND_TYPE=pty` 或 per-bot `backendType`（`pty`/`herdr`/`zellij`）等显式后端（riff 是云 Agent，不占本地后端）。
 

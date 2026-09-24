@@ -50,7 +50,7 @@ botmux start                 # 启动 daemon（botmux autostart enable 设开机
 >
 > 正式版 macOS CLI 使用稳定的 Apple Developer ID 签名。升级替换二进制后，macOS 的文件与 App 数据访问授权仍绑定同一代码身份，不会因为版本哈希变化而把 botmux 当成一个新程序；canary / beta / rc 等预览版仍使用 ad-hoc 签名。
 >
-> 升级：`botmux upgrade`（原地换二进制），或**重跑一遍上面那条 curl 命令**——同样原地升级，不会重复往启动文件里追加 PATH。
+> 升级：**一律重跑上面那条 curl 命令**（npm / pnpm 全局安装也用它，原地替换、不会重复往启动文件里追加 PATH），装完开个新终端跑 `botmux restart`；≥3.18 的二进制安装上 `botmux upgrade` 与其等价。装指定版本（含回滚）：`curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | BOTMUX_VERSION=v3.18.8 sh`（变量必须在管道右侧的 `sh` 前面）。⚠️ **v3.18.0 之前的老版本不要用 npm 升级**——跨「Node 源码 → 二进制」形态边界会让 daemon 重启失败。
 
 <details>
 <summary>已经在用 Node 生态？也可以走 npm（同一个二进制）</summary>
@@ -61,7 +61,7 @@ npm install -g botmux        # 需要 Node >= 22 装包本身
 
 npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的那一个），postinstall 把 `~/.botmux/bin/botmux` 指向它并同样写 PATH。所以装完只有**一个** botmux 版本，不再出现「装了两个 Node 版本、各自带一份全局 botmux 互相打架 / 不知道更新了哪个」。
 
-区别只在**谁来装、以后谁来升**：npm 路径需要 Node ≥ 22 才能执行安装本身，升级交回 `npm i -g botmux@latest`；curl 路径全程不碰 Node。跑起来之后两者完全一致——同样的二进制、同样的命令。
+区别只在**谁来装**：npm 路径需要 Node ≥ 22 才能执行安装本身，curl 路径全程不碰 Node；**无论哪种装法，升级都重跑 curl**（v3.18.0 之前的老版本用 npm 跨形态升级会让 daemon 起不回来）。跑起来之后两者完全一致——同样的二进制、同样的命令。
 
 </details>
 
