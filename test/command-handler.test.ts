@@ -1791,6 +1791,28 @@ describe('handleCommand', () => {
       expect(forkSession).toHaveBeenCalled();
       expect(vi.mocked(forkSession).mock.calls[0][5]?.childOwnerOpenId).toBeUndefined();
     });
+
+    it('bot 发送方即使 canOperate=true（开放模式）也不被盖成 owner（bot 绝不当 ownerOpenId）', async () => {
+      // 回归：canOperate 的开放模式腿对 peer bot 也放行；闸只判 canOperate 时，bot 会被
+      // 盖成子会话 owner，违反「ownerOpenId 必须是真人」的不变量（owner-only 回复每次
+      // 都 @ 醒它 ⟹ 自触发/重入循环）。闸仍放行（开放模式管理员例外），只是不改 owner。
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_human_owner', cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/fork', ROOT_ID,
+        makeLarkMessage('/fork 接手排查', { threadId: 'omt_parent', senderId: 'ou_peer_bot', senderType: 'app' }),
+        deps, LARK_APP_ID,
+      );
+
+      expect(forkSession).toHaveBeenCalled();
+      // bot 过闸但不能被盖成 owner：childOwnerOpenId 缺省 ⟹ 子会话退回继承源真人 owner。
+      expect(vi.mocked(forkSession).mock.calls[0][5]?.childOwnerOpenId).toBeUndefined();
+    });
   });
 
   describe('/fork --create lineage durability', () => {
@@ -1837,6 +1859,35 @@ describe('handleCommand', () => {
       expect(ds.session.forkChildSessionIds).toEqual(['child-create-1']);
       expect(sessionStore.updateSession).toHaveBeenCalledWith(
         expect.objectContaining({ forkChildSessionIds: ['child-create-1'] }),
+      );
+    });
+
+    it('管理员（非发起人）走 --create：childOwnerOpenId 也必须传给新群那条 fork', async () => {
+      // 反变异守卫：--create 路径与子话题路径是两条独立的 forkSession 调用。若 --create
+      // 漏传 childOwnerOpenId，新群里只有管理员自己，子会话却继承了不在群里的源 owner。
+      vi.mocked(forkSession).mockResolvedValueOnce({ ok: true, childSessionId: 'child-create-admin' });
+      const ds = makeDaemonSession({
+        scope: 'chat',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_other_user', scope: 'chat', cliId: 'codex' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/fork',
+        ROOT_ID,
+        makeLarkMessage('/fork --create 接手群'),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(forkSession).toHaveBeenCalledWith(
+        'sess-001',
+        expect.any(String),
+        expect.any(String),
+        'group',
+        'chat',
+        expect.objectContaining({ forkTaskText: '接手群', childOwnerOpenId: 'ou_sender' }),
       );
     });
   });

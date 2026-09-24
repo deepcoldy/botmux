@@ -4173,10 +4173,21 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.fork.not_owner', undefined, loc));
           break;
         }
-        // 管理员 fork 别人的会话时，子会话归**发起 fork 的管理员**，不继承源 owner：
-        // `/fork --create` 建的新群里只有管理员自己，把子会话记在一个不在群里的人
-        // 名下会让 owner-only 回复、子会话上的 /fork /relay 全部指错人。
-        const forkChildOwnerOpenId = forkByAdminOfOthers ? forkSenderOpenId : undefined;
+        // 「真人管理员」fork 别人的会话时，子会话归**发起 fork 的管理员**，不继承源
+        // owner：`/fork --create` 建的新群里只有管理员自己，把子会话记在一个不在群里
+        // 的人名下会让 owner-only 回复、子会话上的 /fork /relay 全部指错人。
+        //
+        // **bot 发送方绝不能被盖成 owner**：canOperate 在开放模式（没配任何 allowlist）
+        // 下是「任何人含 peer bot」全放行，单看闸会把 bot 放进这条分支。而全仓维护着
+        // 「ownerOpenId 必须是真人」的不变量（见 daemon isForeignBotSender：bot 当 owner
+        // ⟹ owner-only 回复每次都 @ 醒它 ⟹ 自触发/重入循环，还漏 owner-gated 界面）。
+        // 判定与本文件 startForkSubtopicSession 的 senderIsBot 同款；bot 走这里时不下发
+        // childOwnerOpenId，子会话退回继承源 owner。闸本身不动——限制模式下非 operator
+        // 的 bot 仍被上面那条 canOperate 拒，不会因这里而漏进来。
+        const forkSenderIsBot = message.senderType === 'app' || message.senderType === 'bot';
+        const forkChildOwnerOpenId = forkByAdminOfOthers && !forkSenderIsBot
+          ? forkSenderOpenId
+          : undefined;
         // Capability gate — refuse non-forkable backends up front with a clear,
         // typed message (mirrors the design doc §4 refusal). Cheap check before
         // we create any group.
