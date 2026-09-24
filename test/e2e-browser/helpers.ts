@@ -158,15 +158,36 @@ export async function navigateToMessenger(page: Page): Promise<void> {
  * Works for both bot private chats ("Claude") and group chats.
  * Falls back to Feishu search (Ctrl+K) if not visible in sidebar.
  */
+/**
+ * Display name of the Botmux bot conversation in Feishu.
+ *
+ * The test account also has same-named *native* Feishu AI agents (labelled
+ * 智能体, e.g. a DM literally named "codex"/"claude") that never reply to
+ * botmux traffic. The Botmux-backed bots are the conversations explicitly
+ * named `[Botmux]<Name>` with a 机器人/Bot badge. Opening the bare name makes
+ * the visual agent click the native agent, so always resolve and match the
+ * prefixed bot conversation.
+ */
+export function botChatName(botName: string): string {
+  return botName.startsWith('[Botmux]') ? botName : `[Botmux]${botName}`;
+}
+
 export async function openChat(
   page: Page,
   agent: PlaywrightAgent,
-  chatName: string,
+  botName: string,
 ): Promise<void> {
+  // Match the Botmux-backed bot conversation, never the same-named native AI
+  // agent. The display name is `[Botmux]<Name>` and it carries a Bot badge
+  // (机器人), whereas the native agent is labelled 智能体 and has no prefix.
+  const chatName = botChatName(botName);
   // Try clicking directly first
   try {
     await agent.aiAct(
-      `在左侧"消息"列表中或者"消息"列表的置顶会话中，点击名称完全匹配"${chatName}"的对话（群聊或私聊入口，不是话题里的消息）`,
+      `在左侧"消息"列表或其置顶会话中，点击 Botmux 机器人的私聊会话 ` +
+        `"${chatName}"（名称以 [Botmux] 开头、带"机器人/Bot"徽标）。` +
+        `不要点同名的原生智能体（名称只有"${botName}"、带"智能体"徽标、没有 [Botmux] 前缀），` +
+        '也不要点话题里的消息或群聊。',
     );
   } catch {
     // Chat not visible in sidebar — use search to find it
@@ -175,15 +196,17 @@ export async function openChat(
     await page.keyboard.type(chatName);
     await page.waitForTimeout(2000);
     await agent.aiAct(
-      `在搜索结果中，点击名称为"${chatName}"的群聊或对话`,
+      `在搜索结果中点击 Botmux 机器人会话 "${chatName}"（[Botmux] 前缀、机器人徽标），` +
+        `不要点名称仅为"${botName}"的原生智能体。`,
     );
     // Close search overlay if still open
     await page.keyboard.press('Escape');
     await page.waitForTimeout(500);
   }
-  // Wait for chat to load — verify by checking the chat header
+  // Wait for chat to load — the header must show the prefixed bot name (this
+  // also guards against having opened the native agent).
   await agent.aiWaitFor(
-    `右侧聊天区域顶部标题栏显示"${chatName}"`,
+    `右侧聊天区域顶部标题栏显示 Botmux 机器人会话名"${chatName}"，而不是名称仅为"${botName}"的原生智能体`,
     { timeoutMs: 15_000, checkIntervalMs: 3_000 },
   );
 }
