@@ -234,11 +234,12 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     }
   }
 
-  // Grant group manager role to specified users.
-  // Only the chat owner can add managers. If ownership was successfully transferred,
-  // the target user is already owner (so we exclude them). If ownership transfer
-  // was not requested or failed, the creator bot is still owner and can add managers
-  // (including the failed transferOwnerTo target as a graceful fallback).
+  // Grant group manager role to specified users in managerUserIds.
+  // Only the chat owner can add managers:
+  // - If ownership was transferred successfully, ownerTransferredTo is excluded (already owner).
+  // - If ownership transfer failed (and the target was not rejected by invalidUserIds),
+  //   the target can still be added as a manager fallback if included in managerUserIds.
+  // - Any user in invalidUserIds is skipped since they were rejected by Lark and are not in the chat.
   let managersAdded: string[] = [];
   let managerError: string | null = null;
   const rawManagerIds = (opts.managerUserIds ?? []).map(id => id.trim()).filter(Boolean);

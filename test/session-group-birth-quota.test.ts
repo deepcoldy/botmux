@@ -252,6 +252,8 @@ function createGroupResult(overrides: Record<string, unknown> = {}): any {
     roleProfileBootstrapError: null,
     kickoffMessageId: null,
     kickoffError: null,
+    managersAdded: [],
+    managerError: null,
     ...overrides,
   };
 }

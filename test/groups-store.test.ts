@@ -398,12 +398,28 @@ describe('groups-store wrappers', () => {
     expect(call.params.member_id_type).toBe('union_id');
   });
 
-  it('addChatManagers surfaces non-zero code as error after exhausting retries', async () => {
+  it('addChatManagers fails fast without retrying when permanent error is encountered', async () => {
     chatManagersAddStub.mockResolvedValue({ code: 232001, msg: 'permission denied' });
     const r = await addChatManagers('cli_creator', 'oc_chat', ['ou_bad'], 'open_id', { maxRetries: 2, retryDelayMs: 1 });
     expect(r.ok).toBe(false);
-    expect(chatManagersAddStub).toHaveBeenCalledTimes(3);
+    expect(chatManagersAddStub).toHaveBeenCalledTimes(1);
     if (!r.ok) expect(r.error).toMatch(/permission denied.*232001/);
+  });
+
+  it('addChatManagers fails fast on missing scope error (99991672)', async () => {
+    chatManagersAddStub.mockResolvedValue({ code: 99991672, msg: 'missing scope' });
+    const r = await addChatManagers('cli_creator', 'oc_chat', ['ou_bad'], 'open_id', { maxRetries: 2, retryDelayMs: 1 });
+    expect(r.ok).toBe(false);
+    expect(chatManagersAddStub).toHaveBeenCalledTimes(1);
+    if (!r.ok) expect(r.error).toMatch(/missing scope.*99991672/);
+  });
+
+  it('addChatManagers surfaces transient error after exhausting retries', async () => {
+    chatManagersAddStub.mockResolvedValue({ code: 232011, msg: 'user not in chat' });
+    const r = await addChatManagers('cli_creator', 'oc_chat', ['ou_bad'], 'open_id', { maxRetries: 2, retryDelayMs: 1 });
+    expect(r.ok).toBe(false);
+    expect(chatManagersAddStub).toHaveBeenCalledTimes(3);
+    if (!r.ok) expect(r.error).toMatch(/user not in chat.*232011/);
   });
 
   it('addChatManagers retries after transient failure and succeeds on next attempt', async () => {
@@ -415,7 +431,7 @@ describe('groups-store wrappers', () => {
     expect(chatManagersAddStub).toHaveBeenCalledTimes(2);
   });
 
-  it('addChatManagers catches thrown errors and exhausts retries', async () => {
+  it('addChatManagers catches thrown network errors and exhausts retries', async () => {
     chatManagersAddStub.mockRejectedValue(new Error('network timeout'));
     const r = await addChatManagers('cli_creator', 'oc_chat', ['ou_err'], 'open_id', { maxRetries: 1, retryDelayMs: 1 });
     expect(r.ok).toBe(false);
