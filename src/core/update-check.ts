@@ -135,10 +135,15 @@ export function normalizeRegistryBase(raw: string): string | null {
   return null;
 }
 
+/** `GET {registry}botmux/{tag}` — the dist-tag or version manifest. */
+export function registryDistTagUrl(base: string, tag: string = 'latest'): string {
+  const b = base.endsWith('/') ? base : `${base}/`;
+  return `${b}botmux/${encodeURIComponent(tag.trim().replace(/^@/, ''))}`;
+}
+
 /** `GET {registry}botmux/latest` — the dist-tag manifest `@latest` installs. */
 export function registryLatestUrl(base: string): string {
-  const b = base.endsWith('/') ? base : `${base}/`;
-  return `${b}botmux/latest`;
+  return registryDistTagUrl(base, 'latest');
 }
 
 /** `GET {registry}botmux` — the packument behind the rollback picker. */
@@ -261,15 +266,52 @@ export interface FetchOpts {
   registry?: string;
 }
 
+export interface ParsedUpdateTarget {
+  raw: string;
+  tag: string;
+  spec: string;
+  isChannel: boolean;
+}
+
+const KNOWN_CHANNELS = new Set(['latest', 'canary', 'beta', 'rc', 'next']);
+
 /**
- * The `latest` dist-tag version on the registry npm is configured to use —
- * the authoritative target of a `@latest` update. null on any failure
- * (offline, non-200, malformed body, or a version string we can't parse).
+ * Parse a user-supplied update target into a normalized channel or version spec.
+ *
+ * Supports:
+ * - empty / undefined -> latest (botmux@latest)
+ * - 'canary', '@canary', '--canary', 'botmux@canary' -> canary (botmux@canary)
+ * - 'beta', '@beta', '--beta' -> beta (botmux@beta)
+ * - '3.28.0', 'v3.28.0', '@3.28.0', 'botmux@3.28.0' -> 3.28.0 (botmux@3.28.0)
  */
-export async function fetchLatestVersion(opts?: FetchOpts): Promise<string | null> {
+export function parseUpdateTarget(rawInput?: string): ParsedUpdateTarget {
+  const raw = (rawInput ?? '').trim();
+  if (!raw) {
+    return { raw: '', tag: 'latest', spec: 'botmux@latest', isChannel: true };
+  }
+  let cleaned = raw.replace(/^botmux@/i, '').replace(/^--/, '').replace(/^@/, '').trim();
+  const lower = cleaned.toLowerCase();
+  if (KNOWN_CHANNELS.has(lower)) {
+    return { raw, tag: lower, spec: `botmux@${lower}`, isChannel: true };
+  }
+  const v = cleaned.replace(/^v/i, '');
+  if (parseVersion(v)) {
+    return { raw, tag: v, spec: `botmux@${v}`, isChannel: false };
+  }
+  return { raw, tag: cleaned, spec: `botmux@${cleaned}`, isChannel: false };
+}
+
+/**
+ * The dist-tag version (e.g. `latest`, `canary`, `beta`, `rc`, `next`) or specific
+ * manifest version on the registry npm is configured to use.
+ * null on any failure.
+ */
+export async function fetchDistTagVersion(tag: string = 'latest', opts?: FetchOpts): Promise<string | null> {
   const fetchImpl = opts?.fetchImpl ?? fetch;
+  const cleanTag = tag.trim().replace(/^@/, '');
   try {
-    const res = await fetchImpl(registryLatestUrl(await effectiveRegistryBase(opts?.registry)), {
+    const base = await effectiveRegistryBase(opts?.registry);
+    const res = await fetchImpl(registryDistTagUrl(base, cleanTag), {
       headers: { Accept: 'application/json', 'User-Agent': 'botmux' },
       signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
     });
@@ -279,6 +321,15 @@ export async function fetchLatestVersion(opts?: FetchOpts): Promise<string | nul
   } catch {
     return null;
   }
+}
+
+/**
+ * The `latest` dist-tag version on the registry npm is configured to use —
+ * the authoritative target of a `@latest` update. null on any failure
+ * (offline, non-200, malformed body, or a version string we can't parse).
+ */
+export async function fetchLatestVersion(opts?: FetchOpts): Promise<string | null> {
+  return fetchDistTagVersion('latest', opts);
 }
 
 export interface RollbackVersion {

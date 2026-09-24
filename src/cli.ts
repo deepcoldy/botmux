@@ -208,7 +208,7 @@ import {
 } from './utils/global-install.js';
 import { isLocalDevInstall, botmuxCliEntryAt, bakedBinaryVersion, botmuxInstallRoot } from './utils/install-info.js';
 import { currentUpdateStrategy, replaceStandaloneBinary } from './core/binary-self-update.js';
-import { fetchLatestVersion, isNewerVersion } from './core/update-check.js';
+import { fetchLatestVersion, fetchDistTagVersion, isNewerVersion, parseUpdateTarget } from './core/update-check.js';
 import { resolveCurrentVersion } from './utils/install-diagnostics.js';
 import {
   resolveLocalDevCheckoutDir,
@@ -3322,11 +3322,18 @@ async function cmdStatus(): Promise<void> {
   // warnIfLegacyBotmuxAlive above, which is what a pre-migration host needs.
 }
 
-async function cmdUpgrade(): Promise<void> {
+async function cmdUpgrade(args: string[] = []): Promise<void> {
+  const first = args.find(a => !a.startsWith('-')) ?? args[0]?.trim();
+  const target = parseUpdateTarget(first);
+
   // 本地 checkout（有 .git/src）：走 git pull --ff-only → 重新 build → 从本
   // checkout 重启，而不是拿全局包管理器去升级（那对 dev 部署无效，见
   // install-info.ts 的 isLocalDevInstall 说明）。
   if (isLocalDevInstall()) {
+    if (target.tag !== 'latest') {
+      console.error(`❌ 当前为本地 git checkout 开发环境，不支持切换到 npm 频道/版本（${target.raw || target.tag}）。\n若需使用发布版本，请通过安装脚本或包管理器全局安装 botmux。`);
+      process.exit(1);
+    }
     cmdUpgradeLocalDev();
     return;
   }
@@ -3336,17 +3343,21 @@ async function cmdUpgrade(): Promise<void> {
   const strategy = currentUpdateStrategy(botmuxInstallRoot());
   if (strategy.kind === 'self-replace') {
     try {
-      const latest = await fetchLatestVersion();
-      if (!latest) {
-        console.error('❌ 无法获取最新版本号（网络不可达或 registry 异常）。');
+      const resolvedVersion = await fetchDistTagVersion(target.tag);
+      if (!resolvedVersion) {
+        console.error(`❌ 无法获取目标版本（${target.tag}）信息（网络不可达、版本不存在或 registry 异常）。`);
         process.exit(1);
       }
       const current = resolveCurrentVersion();
-      if (!isNewerVersion(latest, current)) {
+      if (target.tag === 'latest' && !isNewerVersion(resolvedVersion, current)) {
         console.log(`✅ 已是最新版本（${current}）。`);
         return;
       }
-      console.log(`🔄 升级中：下载 v${latest} 二进制并替换 ${strategy.target}`);
+      if (resolvedVersion === current) {
+        console.log(`✅ 当前已是版本 ${current}。`);
+        return;
+      }
+      console.log(`🔄 升级中：下载 v${resolvedVersion} 二进制并替换 ${strategy.target}`);
       // 握与 dashboard / maintenance 同一把跨进程锁：这条路径是**写同一个文件**，
       // 两个 update 并发跑会互相盖掉临时文件与 rename。锁文件父目录可能还不存在
       // （daemon 从未在本机起过就先跑 update），先建再握，否则 ENOENT 会盖掉真实错误。
@@ -3356,8 +3367,8 @@ async function cmdUpgrade(): Promise<void> {
       try {
         await withFileLock(lockTarget, async () => {
           acquired = true;
-          const r = await replaceStandaloneBinary(latest, strategy.target);
-          console.log(`✅ 升级完成：${r.asset} → ${r.target}（${current} → ${latest}）。运行 botmux restart 以应用更新。`);
+          const r = await replaceStandaloneBinary(resolvedVersion, strategy.target);
+          console.log(`✅ 升级完成：${r.asset} → ${r.target}（${current} → ${resolvedVersion}）。运行 botmux restart 以应用更新。`);
         }, { maxWaitMs: 2_000 });
       } catch (error) {
         // ⚠️ 三态，不是二态。`withFileLock` 拿不到锁时是**抛异常**不是安静返回，
@@ -3387,7 +3398,7 @@ async function cmdUpgrade(): Promise<void> {
     if (strategy.kind === 'unsupported') {
       throw new UnsupportedGlobalInstallError('unknown', process.execPath);
     }
-    const plan = resolveGlobalInstallPlan(strategy.packageRoot);
+    const plan = resolveGlobalInstallPlan(strategy.packageRoot, process.platform, target.spec);
     console.log(`🔄 升级中：${formatGlobalInstallCommand(plan)}`);
     installLatestBotmuxSync(plan);
     console.log('\n✅ 升级完成。运行 botmux restart 以应用更新。');
@@ -6575,6 +6586,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               启动有鉴权的本机模型协议入口（Chat Completions 子集）
   status      查看 daemon 状态
   upgrade     升级到最新版本（别名：update）
+              支持可选 target：canary / beta / rc 等频道，或具体版本号（默认 latest）
   dashboard current
               获取当前 Web Dashboard 登录 URL（裸 \`dashboard\` 同义；没有则创建）
   dashboard rotate
@@ -14925,8 +14937,8 @@ const FLEET_KNOWN_FLAGS: Record<string, readonly string[]> = {
   start: ['--companion-secret-file', '--companion-bot'],
   stop: ['--with-plugin'],
   restart: ['--with-plugin', '--companion-secret-file', '--companion-bot'],
-  upgrade: [],
-  update: [],
+  upgrade: ['--canary', '--beta', '--rc'],
+  update: ['--canary', '--beta', '--rc'],
 };
 const FLEET_VALUE_FLAGS = new Set(['--companion-secret-file', '--companion-bot']);
 if (ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')) {
@@ -14942,13 +14954,13 @@ if (ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')) {
   // the most destructive interpretation of it, and the flags most likely to be
   // guessed are exactly the read-only ones.
   // Exact set difference rather than `unknownFlags()`: that helper only reports
-  // tokens starting with `-`, so `botmux stop foo` would be waved through. None
-  // of these commands takes a positional argument either, so anything outside
-  // the table above is unknown, flag-shaped or not.
+  // tokens starting with `-`, so `botmux stop foo` would be waved through.
   const knownFleetFlags = FLEET_KNOWN_FLAGS[command ?? ''] ?? [];
+  const maxPositionalArgs = (command === 'upgrade' || command === 'update') ? 1 : 0;
   const unknownArgs = unknownFleetArgs(fleetArgs, {
     boolFlags: knownFleetFlags.filter(flag => !FLEET_VALUE_FLAGS.has(flag)),
     valueFlags: knownFleetFlags.filter(flag => FLEET_VALUE_FLAGS.has(flag)),
+    maxPositionalArgs,
   });
   if (unknownArgs.length > 0) {
     console.error(`未知参数: ${unknownArgs.join(' ')}`);
@@ -15895,7 +15907,7 @@ switch (command) {
     break;
   }
   case 'upgrade':
-  case 'update':  await cmdUpgrade(); break;
+  case 'update':  await cmdUpgrade(process.argv.slice(3)); break;
   case 'dashboard': await cmdDashboard(process.argv.slice(3)); break;
   case 'bind': {
     // `botmux bind <code>` — 把本机绑定到中心化平台
