@@ -1509,6 +1509,49 @@ describe('im.message.receive_v1 — p2p chat-mode owned topic routing', () => {
     });
   });
 
+  it('migrates a pre-store directive-header root (`[title] /t …`) using the live topic-header grammar', async () => {
+    // Roots created by master builds that accept the `[标题] /t …` header form
+    // (and /th /tw aliases) but predate the provenance store must be recognized
+    // by the same grammar as maybeApplyForceTopicOverride — the legacy /t-only
+    // parser rejects the header form and would fold such topics after upgrade.
+    const chatId = 'oc_dm_legacy_header';
+    const rootId = 'om_legacy_header_root';
+    handlers.isSessionOwner.mockImplementation((anchor: string, appId: string) => (
+      appId === MY_APP_ID && (anchor === chatId || anchor === rootId)
+    ));
+    mockGetMessageDetail.mockResolvedValueOnce({
+      items: [{
+        chat_id: chatId,
+        msg_type: 'text',
+        body: { content: JSON.stringify({ text: '[标题] /t header task' }) },
+        mentions: [],
+      }],
+    });
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: 'continue legacy header topic' }),
+      messageId: 'om_legacy_header_reply',
+      rootId,
+      threadId: 'omt_legacy_header',
+      chatId,
+      chatType: 'p2p',
+    });
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    await vi.waitFor(() => {
+      expect(mockGetMessageDetail).toHaveBeenCalledWith(MY_APP_ID, rootId, { userCardContent: false });
+    });
+    expect(mockRecordP2pForceTopicRoot).toHaveBeenCalledWith(MY_APP_ID, rootId, chatId);
+    await vi.waitFor(() => {
+      expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+        scope: 'thread',
+        anchor: rootId,
+      }));
+    });
+  });
+
   it('does not backfill a legacy /t marker for an unauthorized DM sender', async () => {
     const chatId = 'oc_dm_legacy_unauthorized';
     const rootId = 'om_legacy_unauthorized_root';

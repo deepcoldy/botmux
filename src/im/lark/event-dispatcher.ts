@@ -3112,12 +3112,13 @@ async function isExplicitP2pTopic(input: {
   const { larkAppId, chatId, rootId } = input;
   if (isP2pForceTopicRoot(larkAppId, rootId, chatId)) return true;
 
-  // Backward compatibility for /t topics created before the provenance store
-  // existed, including bare /t roots that intentionally have no Session. Active
-  // ownership is not sufficient evidence: p2pMode=thread sessions deliberately
-  // fold into chat after switching to chat mode. Verify the immutable root
-  // message once, then persist only roots whose text really began with /t or
-  // /topic. On lookup failure, preserve the historical flat routing.
+  // Backward compatibility for force-topic roots created before the provenance
+  // store existed, including bare /t roots that intentionally have no Session.
+  // Active ownership is not sufficient evidence: p2pMode=thread sessions
+  // deliberately fold into chat after switching to chat mode. Verify the
+  // immutable root message once with the SAME predicate as the live force-topic
+  // override, then persist only roots that really seeded a topic. On lookup
+  // failure, preserve the historical flat routing.
   const key = `${larkAppId}:${chatId}:${rootId}`;
   const cached = legacyP2pForceTopicChecks.get(key);
   if (cached) return cached;
@@ -3132,8 +3133,12 @@ async function isExplicitP2pTopic(input: {
         mentions: root.mentions,
       });
       if (!rawText) return false;
-      const stripped = stripLeadingMentions(rawText.trim(), root.mentions ?? []);
-      if (!parseForceTopicInvocation(stripped)) return false;
+      // Same mention stripping and parser as maybeApplyForceTopicOverride:
+      // bare /t, /topic, /th, /tw aliases and the `[title] /t …` header form.
+      // The /repo worktree validator is not available here; a root that truly
+      // materialized a topic already passed it when the seed was routed.
+      const stripped = stripHeaderMentions(rawText, { mentions: root.mentions }, larkAppId);
+      if (!isTopicHeader(parseTopicHeaderWithLifecycleAliases(stripped))) return false;
       recordP2pForceTopicRoot(larkAppId, rootId, chatId);
       return true;
     } catch (err) {
@@ -4105,6 +4110,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // persist a marker. Keep that state mutation behind the same talk gate
         // as delivery; an untrusted bot must not be able to populate the ledger
         // even though the later delivery gate would still reject its turn.
+        // bot 能不能在本会话说话：此处只判定一次，紧随的 p2p promote、下方 fold 的
+        // mentionedThisBot 以及再往后的 talk gate 共用同一结论；之间只有路由计算，
+        // 不改授权状态（曾是两条手抄 OR 链，漏一处即「能路由但不能 fold」类二次分裂）。
         const botTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
         if (botTalk.allowed) {
           await promoteExplicitP2pTopicIfNeeded({
@@ -4125,10 +4133,6 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const ownsThreadSession = ctx.scope === 'thread'
           ? (handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false)
           : false;
-        // 这个 bot 能不能在本群跟我们说话 —— 判定一次，fold 与下面的 gate 共用同一个
-        // 结论（二者之间只有 fold / shared-seed 的路由计算，不改任何授权状态）。
-        // 曾经这里是两条手抄的 OR 链，靠人肉保持同步；漏一处就是「能路由但不能 fold」
-        // 或「fold 了却弹卡」的二次分裂。
         let replyRootId = await maybeFoldMentionedRegularGroupThreadToChat({
           larkAppId, chatId, chatType, message, routing: ctx, forceTopicApplied: forcedTopic, mentionedThisBot: botTalk.allowed, ownsThreadSession,
           answeredRootAtTopLevel: root => handlers.chatSessionAnsweredRootAtTopLevel?.(root, chatId, larkAppId) ?? false,
