@@ -7,6 +7,7 @@ import type { CliAdapter, PtyHandle } from './types.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from '../backend/critical-control-key.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
+import { discoverOmpAppendSystemPrompt } from './append-system-discovery.js';
 
 import { findLatestJsonl } from '../../services/claude-transcript.js';
 import { delay } from '../../utils/timing.js';
@@ -180,7 +181,7 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
       args.push('--plugin-dir', OMP_PLUGIN_DIR);
       if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
       const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
-      args.push('--append-system-prompt', buildBotmuxSystemPromptText({
+      const botmuxAppendPrompt = buildBotmuxSystemPromptText({
         locale,
         botName,
         botOpenId,
@@ -188,7 +189,14 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
         triggerUserAuth,
         replyDelivery: effectiveReplyDelivery,
         solo,
-      }));
+      });
+      const discovered = discoverOmpAppendSystemPrompt({ cwd: workingDir });
+      const finalAppendPrompt = discovered?.content?.trim()
+        ? `${discovered.content.trim()}\n\n${botmuxAppendPrompt}`
+        : botmuxAppendPrompt;
+      if (finalAppendPrompt) {
+        args.push('--append-system-prompt', finalAppendPrompt);
+      }
       return args;
     },
 

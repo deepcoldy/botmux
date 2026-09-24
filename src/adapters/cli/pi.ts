@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 
 import { resolveCommand } from './registry.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
+import { discoverPiAppendSystemPrompt } from './append-system-discovery.js';
 import { preparePiInitialPromptArg } from './pi-initial-prompt.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
@@ -59,7 +60,7 @@ export function buildPiArgs(opts: {
   turnBoundaryExtension: string | undefined;
   builtinSkillsDir?: string;
   skillPluginDir?: string;
-  appendSystemPrompt?: string;
+  appendSystemPrompt?: string | string[];
 }): string[] {
   const args: string[] = [];
   // Pi's `stopReason:"error"` is a PER-REQUEST failure that its agent loop
@@ -74,7 +75,14 @@ export function buildPiArgs(opts: {
   if (opts.model?.trim()) args.push('--model', opts.model.trim());
   if (opts.builtinSkillsDir) args.push('--skill', opts.builtinSkillsDir);
   if (opts.skillPluginDir) args.push('--skill', opts.skillPluginDir);
-  if (opts.appendSystemPrompt) args.push('--append-system-prompt', opts.appendSystemPrompt);
+  if (opts.appendSystemPrompt) {
+    const prompts = Array.isArray(opts.appendSystemPrompt)
+      ? opts.appendSystemPrompt
+      : [opts.appendSystemPrompt];
+    for (const prompt of prompts) {
+      if (prompt) args.push('--append-system-prompt', prompt);
+    }
+  }
   // Pi's interactive mode processes positional initial messages after TUI
   // startup, avoiding stdin races while keeping the native TUI visible.
   if (opts.initialPrompt) args.push(opts.initialPrompt);
@@ -170,9 +178,10 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
       replyDelivery,
       solo,
       skillPluginDir,
+      workingDir,
     }) {
       const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
-      const appendSystemPrompt = buildBotmuxSystemPromptText({
+      const botmuxAppendPrompt = buildBotmuxSystemPromptText({
         locale,
         botName,
         botOpenId,
@@ -181,6 +190,16 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
         replyDelivery: effectiveReplyDelivery,
         solo,
       });
+
+      const appendPrompts: string[] = [];
+      const discovered = discoverPiAppendSystemPrompt({ cwd: workingDir });
+      if (discovered?.path && discovered.content.trim()) {
+        appendPrompts.push(discovered.path);
+      }
+      if (botmuxAppendPrompt) {
+        appendPrompts.push(botmuxAppendPrompt);
+      }
+
       return buildPiArgs({
         sessionId,
         initialPrompt,
@@ -189,7 +208,7 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
         turnBoundaryExtension: piTurnBoundaryExtensionPath(),
         builtinSkillsDir: PI_BUILTIN_SKILLS_DIR,
         skillPluginDir,
-        appendSystemPrompt,
+        appendSystemPrompt: appendPrompts,
       });
     },
 

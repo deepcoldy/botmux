@@ -2069,6 +2069,64 @@ describe('pi buildArgs', () => {
     expect(skillArgs).toContain(PI_BUILTIN_SKILLS_DIR);
     expect(skillArgs).toContain('/tmp/session-skills/skills');
   });
+
+  it('preserves existing trusted APPEND_SYSTEM.md via --append-system-prompt alongside botmux system prompt', () => {
+    const tmpCwd = mkdtempSync(join(tmpdir(), 'pi-append-cwd-'));
+    const tmpAgent = mkdtempSync(join(tmpdir(), 'pi-append-agent-'));
+    vi.stubEnv('PI_CODING_AGENT_DIR', tmpAgent);
+
+    try {
+      writeFileSync(join(tmpAgent, 'trust.json'), JSON.stringify({ [tmpCwd]: true }));
+      mkdirSync(join(tmpCwd, '.pi'), { recursive: true });
+      writeFileSync(join(tmpCwd, '.pi', 'APPEND_SYSTEM.md'), 'USER_PROJECT_SENTINEL');
+
+      const args = adapter.buildArgs({
+        sessionId: 'sess-pi',
+        resume: false,
+        workingDir: tmpCwd,
+        botName: 'TestBot',
+      });
+
+      const appendIndices = args.flatMap((arg, i) => arg === '--append-system-prompt' ? [i] : []);
+      expect(appendIndices.length).toBe(2);
+      expect(args[appendIndices[0] + 1]).toBe(join(tmpCwd, '.pi', 'APPEND_SYSTEM.md'));
+      expect(args[appendIndices[1] + 1]).toContain('<botmux_routing>');
+      expect(args[appendIndices[1] + 1]).toContain('TestBot');
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(tmpCwd, { recursive: true, force: true });
+      rmSync(tmpAgent, { recursive: true, force: true });
+    }
+  });
+
+  it('falls back to global APPEND_SYSTEM.md when project is untrusted', () => {
+    const tmpCwd = mkdtempSync(join(tmpdir(), 'pi-append-untrusted-cwd-'));
+    const tmpAgent = mkdtempSync(join(tmpdir(), 'pi-append-untrusted-agent-'));
+    vi.stubEnv('PI_CODING_AGENT_DIR', tmpAgent);
+
+    try {
+      writeFileSync(join(tmpAgent, 'trust.json'), JSON.stringify({ [tmpCwd]: false }));
+      mkdirSync(join(tmpCwd, '.pi'), { recursive: true });
+      writeFileSync(join(tmpCwd, '.pi', 'APPEND_SYSTEM.md'), 'UNTRUSTED_PROJECT_SENTINEL');
+      writeFileSync(join(tmpAgent, 'APPEND_SYSTEM.md'), 'GLOBAL_AGENT_SENTINEL');
+
+      const args = adapter.buildArgs({
+        sessionId: 'sess-pi',
+        resume: false,
+        workingDir: tmpCwd,
+        botName: 'TestBot',
+      });
+
+      const appendIndices = args.flatMap((arg, i) => arg === '--append-system-prompt' ? [i] : []);
+      expect(appendIndices.length).toBe(2);
+      expect(args[appendIndices[0] + 1]).toBe(join(tmpAgent, 'APPEND_SYSTEM.md'));
+      expect(args[appendIndices[1] + 1]).toContain('<botmux_routing>');
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(tmpCwd, { recursive: true, force: true });
+      rmSync(tmpAgent, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('oh-my-pi buildArgs', () => {
@@ -2141,6 +2199,51 @@ describe('oh-my-pi buildArgs', () => {
     expect(promptIdx).toBeGreaterThanOrEqual(0);
     expect(args[promptIdx + 1]).toContain('omp-bot');
     expect(args[promptIdx + 1]).toContain('ou_omp123');
+  });
+
+  it('preserves existing global APPEND_SYSTEM.md by prepending to single --append-system-prompt', () => {
+    mkdirSync(join(home, '.omp', 'agent'), { recursive: true });
+    writeFileSync(join(home, '.omp', 'agent', 'APPEND_SYSTEM.md'), 'USER_OMP_GLOBAL_SENTINEL');
+
+    const args = adapter.buildArgs({
+      sessionId: 'sess-omp',
+      resume: false,
+      botName: 'omp-bot',
+    });
+
+    const appendIndices = args.flatMap((arg, i) => arg === '--append-system-prompt' ? [i] : []);
+    expect(appendIndices.length).toBe(1);
+    const promptValue = args[appendIndices[0] + 1];
+    expect(promptValue).toContain('USER_OMP_GLOBAL_SENTINEL');
+    expect(promptValue).toContain('omp-bot');
+    expect(promptValue.indexOf('USER_OMP_GLOBAL_SENTINEL')).toBeLessThan(promptValue.indexOf('omp-bot'));
+  });
+
+  it('prefers project APPEND_SYSTEM.md over global in OMP', () => {
+    const tmpCwd = mkdtempSync(join(tmpdir(), 'omp-append-cwd-'));
+    mkdirSync(join(tmpCwd, '.omp'), { recursive: true });
+    writeFileSync(join(tmpCwd, '.omp', 'APPEND_SYSTEM.md'), 'USER_OMP_PROJECT_SENTINEL');
+
+    mkdirSync(join(home, '.omp', 'agent'), { recursive: true });
+    writeFileSync(join(home, '.omp', 'agent', 'APPEND_SYSTEM.md'), 'USER_OMP_GLOBAL_SENTINEL');
+
+    try {
+      const args = adapter.buildArgs({
+        sessionId: 'sess-omp',
+        resume: false,
+        workingDir: tmpCwd,
+        botName: 'omp-bot',
+      });
+
+      const appendIndices = args.flatMap((arg, i) => arg === '--append-system-prompt' ? [i] : []);
+      expect(appendIndices.length).toBe(1);
+      const promptValue = args[appendIndices[0] + 1];
+      expect(promptValue).toContain('USER_OMP_PROJECT_SENTINEL');
+      expect(promptValue).toContain('omp-bot');
+      expect(promptValue).not.toContain('USER_OMP_GLOBAL_SENTINEL');
+    } finally {
+      rmSync(tmpCwd, { recursive: true, force: true });
+    }
   });
 
   it('rejects path-like session ids instead of escaping the managed OMP root', () => {
