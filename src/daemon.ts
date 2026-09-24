@@ -123,7 +123,7 @@ import { setSessionLifecycleShutdown } from './services/session-lifecycle-hooks.
 import { setUsageLedgerPricingResolver, setUsageLedgerRecordSink } from './services/usage-ledger.js';
 import { trackBudgetSpend, formatBudgetAlert } from './services/budget-tracker.js';
 import { resolvePricingConfig } from './services/model-pricing.js';
-import { createImgNumberer, extractPostAtParticipants, messageMentionsBot, parseApiMessage, parseEventMessage, resolveNonsupportMessage, stripBotMentions, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
+import { createImgNumberer, extractPostAtParticipants, isPlaceholderOnlyText, messageMentionsBot, parseApiMessage, parseEventMessage, resolveNonsupportMessage, stripBotMentions, stripLeadingMentions, type MessageResource } from './im/lark/message-parser.js';
 import { resolveInboundAudio } from './im/lark/audio-transcribe.js';
 import { expandMergeForward } from './im/lark/merge-forward.js';
 import { bindResourcesToMessage, composeForwardFollowupContent, mergeMessageMentions } from './im/lark/forward-followup-content.js';
@@ -21277,6 +21277,19 @@ function computeCodexAppSteerable(facts: {
     && !facts.vcMeetingImTurnOrigin;
 }
 
+/**
+ * 会话群 AI 命名的共用种子闸：出生侧与自愈侧两个调用点必须同口径。
+ *
+ * 拒绝三类种子：空文本、斜杠命令（那是指令不是内容），以及**纯占位符**
+ * （`[图片 1]` / `[语音]` / `[合并转发消息]`…，见 isPlaceholderOnlyText）。
+ * 前两类是「没东西可提炼」；第三类是「提炼出来的必然是错的」——而错名一旦改名
+ * 成功就置 titled，把两个闸一起焊死，比暂时挂着占位名严重得多。
+ */
+function shouldSeedSessionGroupTitle(content: string): boolean {
+  const seed = content.trim();
+  return !!seed && !seed.startsWith('/') && !isPlaceholderOnlyText(seed);
+}
+
 async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<void> {
   const { chatId, messageId, chatType, larkAppId, replyRootId, substituteTrigger, messageListener } = ctx;
   // Session-group birth re-homes the turn into the new group: replies/quotes
@@ -21451,9 +21464,16 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // sessionGroupTitleScheduled 告诉这里「已经调过了」——两处严格二选一。别指望
   // title 服务自己去重：它的 titled / in-flight 闸在**异步体内**，出生侧刚发起的
   // 那次此刻既没置 titled 也可能还没进 in-flight，重复调用会白烧一轮有限重试。
+  //
+  // 但**纯占位符种子不算内容**：只有 `[图片 1]` / `[合并转发消息]`（展开失败时的
+  // 兜底）这种「只说明发了个附件」的文本，喂给 AI 只会换来一个自信但空洞的名字
+  // （实测「图片内容分析请求」）。而改名成功会置 titled，把出生闸与下面的自愈闸
+  // **一起永久关死** —— 代价从「暂时挂着占位名、下一句真话就自愈」变成「永远错名
+  // 且不可逆」。所以这里宁可不改名，等用户下一句真正有内容的消息。带文件名/alt/
+  // 卡片标题的占位符（`[文件 1: 季度汇报.pdf]`）不在此列，那是有效标题来源。
   if (ctx.sessionGroupBirth && !ctx.sessionGroupTitleScheduled && isSessionGroup(chatId)) {
     const sgEntry = getSessionGroup(chatId);
-    if (sgEntry && !sgEntry.titled && parsed.content.trim() && !parsed.content.trim().startsWith('/')) {
+    if (sgEntry && !sgEntry.titled && shouldSeedSessionGroupTitle(parsed.content)) {
       scheduleSessionGroupTitle({ larkAppId, chatId, userText: parsed.content });
     }
   }
@@ -23504,9 +23524,11 @@ async function handleThreadReplyAdmitted(
   // 会话群自愈命名：出生时 AI 命名失败（CLI 抖动/超时/当时无模板）的群会停在
   // 截断占位名——任意后续文本消息触发一次补跑（title 服务内 in-flight 去重 +
   // titled 标记幂等），把偶发失败自动治愈，而不是永远留疤。
+  // 同样跳过纯占位符种子（见出生侧注释）：自愈闸本就是为「停在占位名」兜底的，
+  // 拿一张图片去改名只会把错名焊死，反而堵死后面真消息的自愈机会。
   if (ctxChatType === 'group' && isSessionGroup(ctxChatId)) {
     const sgEntry = getSessionGroup(ctxChatId);
-    if (sgEntry && !sgEntry.titled && parsed.content.trim() && !parsed.content.trim().startsWith('/')) {
+    if (sgEntry && !sgEntry.titled && shouldSeedSessionGroupTitle(parsed.content)) {
       scheduleSessionGroupTitle({ larkAppId, chatId: ctxChatId, userText: parsed.content });
     }
   }

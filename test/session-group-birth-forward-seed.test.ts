@@ -184,6 +184,34 @@ function textDmEvent(text: string, messageId: string): any {
   };
 }
 
+function imageDmEvent(messageId: string): any {
+  return {
+    sender: { sender_id: { open_id: OWNER }, sender_type: 'user' },
+    message: {
+      message_id: messageId,
+      chat_id: DM_CHAT,
+      chat_type: 'p2p',
+      message_type: 'image',
+      content: JSON.stringify({ image_key: 'img_v2_seed' }),
+      create_time: String(Date.now()),
+    },
+  };
+}
+
+function fileDmEvent(messageId: string, fileName?: string): any {
+  return {
+    sender: { sender_id: { open_id: OWNER }, sender_type: 'user' },
+    message: {
+      message_id: messageId,
+      chat_id: DM_CHAT,
+      chat_type: 'p2p',
+      message_type: 'file',
+      content: JSON.stringify({ file_key: 'file_v2_seed', ...(fileName ? { file_name: fileName } : {}) }),
+      create_time: String(Date.now()),
+    },
+  };
+}
+
 function dmCtx(messageId: string): RoutingContext {
   return {
     chatId: DM_CHAT,
@@ -373,5 +401,76 @@ describe('会话群出生：sessionGroup.forwardOrigin=false', () => {
     // 命名不受开关影响：解析后的转发正文照样喂给 AI。
     expect(mocks.scheduleSessionGroupTitle).toHaveBeenCalledTimes(1);
     expect(mocks.scheduleSessionGroupTitle.mock.calls[0][0].userText).toContain('同学帮忙添加下设备');
+  });
+});
+
+/**
+ * 零信息占位符种子：**不调度** AI 命名。
+ *
+ * 这些消息解析完只剩「发了个附件」这一个事实（`[图片 1]` / `[文件 1]` /
+ * `[语音]`，以及合并转发**展开失败**时的兜底 `[合并转发消息]`——正好落在本 PR
+ * 的主场景上）。喂给 AI 换来的是自信但空洞的名字，而改名成功会置 titled，
+ * 把出生闸与自愈闸一起**永久**关死：代价从「暂时挂占位名、下一句真话就自愈」
+ * 变成「永远错名且不可逆」。所以这里宁可不改名。
+ *
+ * 带文件名 / 图片 alt / 卡片标题的占位符不在此列——那是有效标题来源。
+ */
+describe('会话群出生：纯占位符种子不调度 AI 命名', () => {
+  it('纯图片种子不调度，titled 保持未置位以便后续真消息自愈', async () => {
+    await handleNewTopic(imageDmEvent('om_dm_image_seed'), dmCtx('om_dm_image_seed'));
+
+    // 群照常建、照常转发原图——只是不拿它去提炼标题。
+    expect(mocks.createGroupWithBots).toHaveBeenCalledTimes(1);
+    expect(mocks.forwardMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.scheduleSessionGroupTitle).not.toHaveBeenCalled();
+
+    // 关键：titled 没被置位 ⟹ 自愈闸仍开着。
+    expect(getSessionGroup(BORN_GROUP)?.titled).toBeFalsy();
+  });
+
+  it('无文件名的文件种子不调度', async () => {
+    await handleNewTopic(fileDmEvent('om_dm_file_noname'), dmCtx('om_dm_file_noname'));
+    expect(mocks.scheduleSessionGroupTitle).not.toHaveBeenCalled();
+  });
+
+  it('带文件名的文件种子**照常调度**（文件名就是有效标题来源）', async () => {
+    await handleNewTopic(fileDmEvent('om_dm_file_named', '季度汇报.pdf'), dmCtx('om_dm_file_named'));
+
+    expect(mocks.scheduleSessionGroupTitle).toHaveBeenCalledTimes(1);
+    expect(mocks.scheduleSessionGroupTitle.mock.calls[0][0].userText).toContain('季度汇报.pdf');
+  });
+
+  it('合并转发**展开失败**时种子退回 `[合并转发消息]`，不调度', async () => {
+    // expandMergeForward 的真身在早退/catch 两条路径上都**原样留下** parsed.content
+    // （merge-forward.ts 的 `nodes.length === 0` 与 catch 分支），此时 content 还是
+    // extractTextContent 给 merge_forward 的占位符。
+    mocks.expandMergeForward.mockImplementation(async () => ({ extraResources: [] }));
+
+    await handleNewTopic(mergeForwardDmEvent('om_dm_fwd_expand_fail'), dmCtx('om_dm_fwd_expand_fail'));
+
+    expect(mocks.expandMergeForward).toHaveBeenCalledTimes(1);
+    expect(mocks.scheduleSessionGroupTitle).not.toHaveBeenCalled();
+    expect(getSessionGroup(BORN_GROUP)?.titled).toBeFalsy();
+  });
+
+  it('图文混排（图片 + 真实文字）照常调度', async () => {
+    const ev = {
+      sender: { sender_id: { open_id: OWNER }, sender_type: 'user' },
+      message: {
+        message_id: 'om_dm_post_mixed',
+        chat_id: DM_CHAT,
+        chat_type: 'p2p',
+        message_type: 'post',
+        content: JSON.stringify({
+          zh_cn: { title: '', content: [[{ tag: 'text', text: '帮我看下这张监控图' }, { tag: 'img', image_key: 'i1' }]] },
+        }),
+        create_time: String(Date.now()),
+      },
+    };
+
+    await handleNewTopic(ev, dmCtx('om_dm_post_mixed'));
+
+    expect(mocks.scheduleSessionGroupTitle).toHaveBeenCalledTimes(1);
+    expect(mocks.scheduleSessionGroupTitle.mock.calls[0][0].userText).toContain('帮我看下这张监控图');
   });
 });
