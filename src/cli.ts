@@ -208,7 +208,13 @@ import {
 } from './utils/global-install.js';
 import { isLocalDevInstall, botmuxCliEntryAt, bakedBinaryVersion, botmuxInstallRoot } from './utils/install-info.js';
 import { currentUpdateStrategy, replaceStandaloneBinary } from './core/binary-self-update.js';
-import { fetchLatestVersion, fetchDistTagVersion, isNewerVersion, parseUpdateTarget } from './core/update-check.js';
+import {
+  fetchLatestVersion,
+  fetchDistTagVersion,
+  isNewerVersion,
+  parseUpdateTarget,
+  shouldApplySelfUpdate,
+} from './core/update-check.js';
 import { resolveCurrentVersion } from './utils/install-diagnostics.js';
 import {
   resolveLocalDevCheckoutDir,
@@ -3322,15 +3328,48 @@ async function cmdStatus(): Promise<void> {
   // warnIfLegacyBotmuxAlive above, which is what a pre-migration host needs.
 }
 
+function printUpgradeHelp(): void {
+  console.log(`
+用法:
+  botmux update [target]
+  botmux upgrade [target]
+
+参数:
+  target    目标频道或版本号（可选，默认 latest）
+            - 稳定频道: latest
+            - 预览频道: canary, beta, rc, next
+            - 具体版本: 如 3.28.0, v3.28.0
+
+示例:
+  botmux update            # 升级到最新正式版
+  botmux update canary     # 升级/切换到最新 canary 预览版
+  botmux update @canary    # 同上
+  botmux update 3.28.0     # 安装/切换到指定版本
+`.trim());
+}
+
 async function cmdUpgrade(args: string[] = []): Promise<void> {
-  const first = args.find(a => !a.startsWith('-')) ?? args[0]?.trim();
-  const target = parseUpdateTarget(first);
+  const nonHelpArgs = args.filter(a => a !== '--help' && a !== '-h');
+  if (nonHelpArgs.length > 1) {
+    console.error(`❌ 不能同时指定多个升级目标（收到：${nonHelpArgs.join(' ')}）。请只指定一个频道或版本。`);
+    process.exit(2);
+  }
+  const rawTarget = nonHelpArgs[0]?.trim();
+  if (rawTarget === 'help') {
+    printUpgradeHelp();
+    return;
+  }
+  const target = parseUpdateTarget(rawTarget);
+  if (!target) {
+    console.error(`❌ 非法的目标频道或版本格式：“${rawTarget}”。只支持发布频道（如 canary、beta、latest）或语义化版本号（如 3.28.0）。`);
+    process.exit(2);
+  }
 
   // 本地 checkout（有 .git/src）：走 git pull --ff-only → 重新 build → 从本
   // checkout 重启，而不是拿全局包管理器去升级（那对 dev 部署无效，见
   // install-info.ts 的 isLocalDevInstall 说明）。
   if (isLocalDevInstall()) {
-    if (target.tag !== 'latest') {
+    if (target.isExplicit && target.tag !== 'latest') {
       console.error(`❌ 当前为本地 git checkout 开发环境，不支持切换到 npm 频道/版本（${target.raw || target.tag}）。\n若需使用发布版本，请通过安装脚本或包管理器全局安装 botmux。`);
       process.exit(1);
     }
@@ -3349,12 +3388,13 @@ async function cmdUpgrade(args: string[] = []): Promise<void> {
         process.exit(1);
       }
       const current = resolveCurrentVersion();
-      if (target.tag === 'latest' && !isNewerVersion(resolvedVersion, current)) {
-        console.log(`✅ 已是最新版本（${current}）。`);
-        return;
-      }
-      if (resolvedVersion === current) {
-        console.log(`✅ 当前已是版本 ${current}。`);
+      const decision = shouldApplySelfUpdate(target, resolvedVersion, current);
+      if (!decision.proceed) {
+        if (decision.reason === 'already_latest') {
+          console.log(`✅ 已是最新版本（${current}）。`);
+        } else {
+          console.log(`✅ 当前已是版本 ${current}。`);
+        }
         return;
       }
       console.log(`🔄 升级中：下载 v${resolvedVersion} 二进制并替换 ${strategy.target}`);
@@ -14966,6 +15006,11 @@ if (ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')) {
     console.error(`未知参数: ${unknownArgs.join(' ')}`);
     console.error(`  \`botmux ${command}\` 只接受: ${['--help', ...knownFleetFlags].join(' ')}。`);
     console.error('  为避免把一个看起来像「只检查」的参数当成「执行」，这里直接中止，不做任何改动。');
+    process.exit(2);
+  }
+  if ((command === 'upgrade' || command === 'update') && fleetArgs.filter(a => a !== '--help' && a !== '-h').length > 1) {
+    const nonHelp = fleetArgs.filter(a => a !== '--help' && a !== '-h');
+    console.error(`❌ 不能同时指定多个升级目标（收到：${nonHelp.join(' ')}）。请只指定一个频道或版本。`);
     process.exit(2);
   }
 }

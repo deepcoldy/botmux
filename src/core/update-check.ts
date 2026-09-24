@@ -271,34 +271,61 @@ export interface ParsedUpdateTarget {
   tag: string;
   spec: string;
   isChannel: boolean;
+  isExplicit: boolean;
 }
 
 const KNOWN_CHANNELS = new Set(['latest', 'canary', 'beta', 'rc', 'next']);
 
 /**
+ * Valid npm dist-tag syntax:
+ * Starts with an ASCII letter, followed by alphanumeric characters, hyphen, or underscore.
+ * Deliberately rejects URLs, protocols (npm:, git:, file:), path traversal, semver ranges (^, ~), and arbitrary specifiers.
+ */
+const VALID_DIST_TAG_PATTERN = /^[a-zA-Z][a-zA-Z0-9_-]{0,64}$/;
+
+/**
  * Parse a user-supplied update target into a normalized channel or version spec.
+ * Returns null if the target is invalid, malformed, or an unallowed package source.
  *
  * Supports:
- * - empty / undefined -> latest (botmux@latest)
- * - 'canary', '@canary', '--canary', 'botmux@canary' -> canary (botmux@canary)
- * - 'beta', '@beta', '--beta' -> beta (botmux@beta)
- * - '3.28.0', 'v3.28.0', '@3.28.0', 'botmux@3.28.0' -> 3.28.0 (botmux@3.28.0)
+ * - empty / undefined -> latest (botmux@latest, isExplicit: false)
+ * - 'latest', '@latest', '--latest', 'botmux@latest' -> latest (botmux@latest, isExplicit: true)
+ * - 'canary', '@canary', '--canary', 'botmux@canary' -> canary (botmux@canary, isExplicit: true)
+ * - 'beta', '@beta', '--beta' -> beta (botmux@beta, isExplicit: true)
+ * - '3.28.0', 'v3.28.0', '@3.28.0', 'botmux@3.28.0' -> 3.28.0 (botmux@3.28.0, isExplicit: true)
  */
-export function parseUpdateTarget(rawInput?: string): ParsedUpdateTarget {
+export function parseUpdateTarget(rawInput?: string): ParsedUpdateTarget | null {
   const raw = (rawInput ?? '').trim();
   if (!raw) {
-    return { raw: '', tag: 'latest', spec: 'botmux@latest', isChannel: true };
+    return { raw: '', tag: 'latest', spec: 'botmux@latest', isChannel: true, isExplicit: false };
   }
-  let cleaned = raw.replace(/^botmux@/i, '').replace(/^--/, '').replace(/^@/, '').trim();
+  let cleaned = raw;
+  if (cleaned.toLowerCase().startsWith('botmux@')) {
+    cleaned = cleaned.slice(7).trim();
+  } else if (cleaned.startsWith('@')) {
+    cleaned = cleaned.slice(1).trim();
+  } else if (cleaned.startsWith('--')) {
+    cleaned = cleaned.slice(2).trim();
+  }
+
+  // Reject empty cleaned token or tokens containing forbidden characters
+  // (e.g. URLs, npm: aliases, git references, file paths, ranges)
+  if (!cleaned || /[:/\\?#%^~@]/.test(cleaned)) {
+    return null;
+  }
+
   const lower = cleaned.toLowerCase();
   if (KNOWN_CHANNELS.has(lower)) {
-    return { raw, tag: lower, spec: `botmux@${lower}`, isChannel: true };
+    return { raw, tag: lower, spec: `botmux@${lower}`, isChannel: true, isExplicit: true };
   }
   const v = cleaned.replace(/^v/i, '');
   if (parseVersion(v)) {
-    return { raw, tag: v, spec: `botmux@${v}`, isChannel: false };
+    return { raw, tag: v, spec: `botmux@${v}`, isChannel: false, isExplicit: true };
   }
-  return { raw, tag: cleaned, spec: `botmux@${cleaned}`, isChannel: false };
+  if (VALID_DIST_TAG_PATTERN.test(cleaned)) {
+    return { raw, tag: cleaned, spec: `botmux@${cleaned}`, isChannel: true, isExplicit: true };
+  }
+  return null;
 }
 
 /**
@@ -330,6 +357,26 @@ export async function fetchDistTagVersion(tag: string = 'latest', opts?: FetchOp
  */
 export async function fetchLatestVersion(opts?: FetchOpts): Promise<string | null> {
   return fetchDistTagVersion('latest', opts);
+}
+
+/**
+ * Decision helper for standalone binary self-update:
+ * - When target is implicit (default `botmux update`), only update if resolvedVersion is strictly newer than current.
+ * - When target is explicit (e.g. `botmux update latest` or `botmux update canary`), allow switching or aligning to
+ *   the target version whenever resolvedVersion !== currentVersion (e.g. returning to stable latest from canary).
+ */
+export function shouldApplySelfUpdate(
+  target: ParsedUpdateTarget,
+  resolvedVersion: string,
+  currentVersion: string,
+): { proceed: boolean; reason?: 'already_latest' | 'already_at_target' } {
+  if (!target.isExplicit && !isNewerVersion(resolvedVersion, currentVersion)) {
+    return { proceed: false, reason: 'already_latest' };
+  }
+  if (resolvedVersion === currentVersion) {
+    return { proceed: false, reason: 'already_at_target' };
+  }
+  return { proceed: true };
 }
 
 export interface RollbackVersion {
