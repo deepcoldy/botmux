@@ -1672,6 +1672,65 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     }
   });
 
+  it.each([
+    { behavior: 'success', content: 'fake answer 1' },
+    { behavior: 'resume-not-found', content: 'not found' },
+    { behavior: 'resume-active-writer', content: 'already has an active writer' },
+    { behavior: 'resume-different-thread', content: 'Strict resume expected thread thread-fake' },
+  ])('recovers an idle app-server exit without replaying or replacing history: $behavior', async ({ behavior, content }) => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-codex-idle-exit-'));
+    const fakeCodex = join(dir, 'fake-codex');
+    const logPath = join(dir, 'requests.jsonl');
+    const pidPath = join(dir, 'app-server.pid');
+    copyFileSync(FAKE_SERVER_FIXTURE, fakeCodex);
+    chmodSync(fakeCodex, 0o755);
+    const control = new ControlCollector(dir);
+    await control.listen();
+    const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', behavior, control.bootstrap.path, {
+      env: { FAKE_CODEX_PID_PATH: pidPath },
+    });
+    const send = (replyTurnId: string) => harness.child.stdin.write(
+      `${CONTROL_PREFIX}${encodeRunnerInput(replyTurnId, { text: replyTurnId }, replyTurnId)}\r`,
+    );
+    try {
+      await waitFor(harness, () => control.states.some(state => state.busy === false));
+      send('om_before_exit');
+      await waitFor(harness, () => control.finals.length === 1 && control.states.at(-1)?.busy === false);
+      const pid = Number(readFileSync(pidPath, 'utf8'));
+      process.kill(pid, 'SIGTERM');
+      // The fixture's PID is a real child of the runner, not a mocked RPC rejection.
+      await waitFor(harness, () => {
+        try { process.kill(pid, 0); return false; }
+        catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true;
+          throw error;
+        }
+      });
+      send('om_after_exit');
+      await waitFor(harness, () => control.finals.length === 2
+        || control.markers.some(m => m.kind === 'lifecycle' && m.payload.kind === 'fatal'));
+      expect(control.markers.filter(m => m.kind === 'lifecycle' && m.payload.kind === 'fatal')).toEqual([]);
+      expect(control.finals).toHaveLength(2);
+      expect(control.finals[1]).toMatchObject({ turnId: 'om_after_exit', content: expect.stringContaining(content) });
+      await waitFor(harness, () => control.states.at(-1)?.busy === false);
+      send('om_next');
+      await waitFor(harness, () => control.finals.length === 3);
+      expect(control.finals[2].content).toContain(behavior === 'success' ? 'fake answer 2' : content);
+      const requests = readRequests(logPath);
+      expect(requests.filter(r => r.method === 'initialize')).toHaveLength(2);
+      expect(requests.filter(r => r.method === 'thread/start')).toHaveLength(1);
+      expect(requests.filter(r => r.method === 'thread/resume').map(r => r.params.threadId))
+        .toEqual(behavior === 'success' ? ['thread-fake'] : ['thread-fake', 'thread-fake']);
+      const starts = requests.filter(r => r.method === 'turn/start');
+      expect(starts.map(r => r.params.input[0].text))
+        .toEqual(behavior === 'success' ? ['om_before_exit', 'om_after_exit', 'om_next'] : ['om_before_exit']);
+    } finally {
+      await stopChild(harness.child);
+      await control.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('fences (never a lone root failure final) when a start RPC drops AFTER exact-started proof + an accepted follow-up (R3-B1)', async () => {
     // R3-B1: the runner proves canonical via an exact turn/started, accepts a
     // follow-up steer (group grows to 2, follow-up shifted from the queue), then
