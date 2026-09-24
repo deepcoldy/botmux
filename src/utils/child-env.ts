@@ -415,6 +415,9 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_REPLY_STYLE',
   // Pi deferred long-first-prompt extension reads one exact per-session file.
   'BOTMUX_PI_INITIAL_PROMPT_FILE',
+  // Pi system-prompt extension appends Botmux rules after CLI native discovery.
+  'BOTMUX_APPEND_SYSTEM_PROMPT',
+  'BOTMUX_APPEND_SYSTEM_PROMPT_FILE',
   // Loopback port of the owning daemon's agent-facing IPC. Read-isolated CLIs
   // (whose daemon discovery dir is Seatbelt-denied) need it to reach the
   // session-scoped, capability-gated routes (v3 workflow relay, vc-agent).

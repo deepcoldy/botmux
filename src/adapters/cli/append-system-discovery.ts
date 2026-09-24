@@ -63,7 +63,7 @@ export function isPiProjectTrusted(
 ): boolean {
   const cwd = typeof cwdOrOpts === 'string' ? cwdOrOpts : cwdOrOpts.cwd;
   const opts = typeof cwdOrOpts === 'object' ? cwdOrOpts : undefined;
-  const env = opts?.env ?? process.env;
+  const env = { ...process.env, ...opts?.env };
   const rawAgentDir = opts?.agentDir
     || legacyAgentDir
     || env.PI_CODING_AGENT_DIR
@@ -134,7 +134,7 @@ export function discoverPiAppendSystemPrompt(opts?: {
   trustOverride?: boolean;
   projectTrusted?: boolean;
 }): DiscoveredAppendPrompt | undefined {
-  const env = opts?.env ?? process.env;
+  const env = { ...process.env, ...opts?.env };
   const cwd = opts?.cwd ? resolve(opts.cwd) : process.cwd();
   const rawAgentDir = opts?.agentDir
     || env.PI_CODING_AGENT_DIR
@@ -206,7 +206,7 @@ export function discoverOmpAppendSystemPrompt(opts?: {
   profile?: string;
   env?: NodeJS.ProcessEnv;
 }): DiscoveredAppendPrompt | undefined {
-  const env = opts?.env ?? process.env;
+  const env = { ...process.env, ...opts?.env };
   const cwd = opts?.cwd ? resolve(opts.cwd) : process.cwd();
   const home = opts?.homeDir ? resolve(expandTilde(opts.homeDir)) : homedir();
 
@@ -223,7 +223,7 @@ export function discoverOmpAppendSystemPrompt(opts?: {
     }
   }
 
-  // 2. User level candidates
+  // 2. User level candidates (active OMP profile agent dir)
   const configDir = opts?.configDir || env.PI_CONFIG_DIR || '.omp';
   const profile = opts?.profile ?? resolveOmpProfileEnv(env.OMP_PROFILE, env.PI_PROFILE);
   const userAgentDir = profile
@@ -236,6 +236,26 @@ export function discoverOmpAppendSystemPrompt(opts?: {
       return { path: candidate, content: readFileSync(candidate, 'utf-8') };
     } catch {
       // ignore read failure
+    }
+  }
+
+  // 3. Foreign user config directories (.claude, .codex, .gemini)
+  const claudeUserDir = env.CLAUDE_CONFIG_DIR?.trim()
+    ? resolve(expandTilde(env.CLAUDE_CONFIG_DIR.trim()))
+    : join(home, '.claude');
+  const foreignUserDirs = [
+    claudeUserDir,
+    join(home, '.codex'),
+    join(home, '.gemini'),
+  ];
+  for (const dir of foreignUserDirs) {
+    const foreignCandidate = join(dir, 'APPEND_SYSTEM.md');
+    if (existsSync(foreignCandidate)) {
+      try {
+        return { path: foreignCandidate, content: readFileSync(foreignCandidate, 'utf-8') };
+      } catch {
+        // ignore read failure
+      }
     }
   }
 

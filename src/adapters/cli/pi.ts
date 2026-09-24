@@ -5,7 +5,6 @@ import { fileURLToPath } from 'node:url';
 
 import { resolveCommand } from './registry.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
-import { discoverPiAppendSystemPrompt } from './append-system-discovery.js';
 import { preparePiInitialPromptArg } from './pi-initial-prompt.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
@@ -195,19 +194,17 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
         solo,
       });
 
-      const appendPrompts: string[] = [];
-      const discovered = discoverPiAppendSystemPrompt({
-        cwd: workingDir,
-        env,
-        extraArgs,
-        trustOverride,
-        projectTrusted,
-      });
-      if (discovered?.path && discovered.content.trim()) {
-        appendPrompts.push(discovered.path);
-      }
-      if (botmuxAppendPrompt) {
-        appendPrompts.push(botmuxAppendPrompt);
+      // Inject the Botmux routing prompt into the process environment so that
+      // pi-turn-boundary-extension can append it during `before_agent_start`.
+      // We deliberately do NOT pass `--append-system-prompt` via argv here:
+      // Pi's CLI disables native automatic discovery of project/user APPEND_SYSTEM.md
+      // whenever `--append-system-prompt` is present on argv, and ahead-of-time argv
+      // cannot predict runtime project trust decisions (such as interactive
+      // "Trust (this session only)" or `project_trust` extensions). Appending via
+      // the extension after native discovery completes preserves 100% faithful
+      // native project trust resolution while cleanly injecting Botmux rules.
+      if (env && botmuxAppendPrompt) {
+        env.BOTMUX_APPEND_SYSTEM_PROMPT = botmuxAppendPrompt;
       }
 
       return buildPiArgs({
@@ -218,7 +215,6 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
         turnBoundaryExtension: piTurnBoundaryExtensionPath(),
         builtinSkillsDir: PI_BUILTIN_SKILLS_DIR,
         skillPluginDir,
-        appendSystemPrompt: appendPrompts,
       });
     },
 

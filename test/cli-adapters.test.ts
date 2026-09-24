@@ -45,6 +45,7 @@ import { createMiraAdapter } from '../src/adapters/cli/mira.js';
 import { createMirAdapter } from '../src/adapters/cli/mir.js';
 import { createTraexAdapter, traexNativeSubagentHookConfig } from '../src/adapters/cli/traex.js';
 import { createPiAdapter, buildPiArgs, piTurnBoundaryExtensionPath, PI_PLUGIN_DIR, PI_BUILTIN_SKILLS_DIR } from '../src/adapters/cli/pi.js';
+import registerBotmuxTurnBoundaryExtension from '../src/adapters/cli/pi-turn-boundary-extension.js';
 import { createCopilotAdapter } from '../src/adapters/cli/copilot.js';
 import { createOhMyPiAdapter, ompSessionDir, OMP_PLUGIN_DIR } from '../src/adapters/cli/oh-my-pi.js';
 import { assertEbsdPerBotEnv, createEbsdAdapter, ebsdBotmuxSessionDir } from '../src/adapters/cli/ebsd.js';
@@ -2027,7 +2028,7 @@ describe('pi buildArgs', () => {
     expect(args[0]).toBe('--extension');
   });
 
-  it('injects session context and builtin skills via --append-system-prompt and --skill', () => {
+  it('injects session context and builtin skills via extension env and --skill', () => {
     expect(adapter.injectsSessionContext).toBe(true);
     expect(adapter.pluginDir).toBe(PI_PLUGIN_DIR);
     expect(adapter.skillDelivery).toEqual({
@@ -2036,23 +2037,25 @@ describe('pi buildArgs', () => {
       supportsExclusive: false,
     });
 
+    const env: Record<string, string> = {};
     const args = adapter.buildArgs({
       sessionId: 'sess-pi',
       resume: false,
       botName: 'TestBot',
       botOpenId: 'ou_bot123',
       initialPrompt: 'first message',
+      env,
     });
 
     const skillIdx = args.indexOf('--skill');
     expect(skillIdx).toBeGreaterThanOrEqual(0);
     expect(args[skillIdx + 1]).toBe(PI_BUILTIN_SKILLS_DIR);
 
-    const promptIdx = args.indexOf('--append-system-prompt');
-    expect(promptIdx).toBeGreaterThanOrEqual(0);
-    expect(args[promptIdx + 1]).toContain('<botmux_routing>');
-    expect(args[promptIdx + 1]).toContain('TestBot');
-    expect(args[promptIdx + 1]).toContain('ou_bot123');
+    // Leaves --append-system-prompt off argv so native discovery is not suppressed
+    expect(args).not.toContain('--append-system-prompt');
+    expect(env.BOTMUX_APPEND_SYSTEM_PROMPT).toContain('<botmux_routing>');
+    expect(env.BOTMUX_APPEND_SYSTEM_PROMPT).toContain('TestBot');
+    expect(env.BOTMUX_APPEND_SYSTEM_PROMPT).toContain('ou_bot123');
 
     // Initial prompt must land at the very end
     expect(args.at(-1)).toBe('first message');
@@ -2070,117 +2073,127 @@ describe('pi buildArgs', () => {
     expect(skillArgs).toContain('/tmp/session-skills/skills');
   });
 
-  it('preserves existing trusted APPEND_SYSTEM.md via --append-system-prompt alongside botmux system prompt', () => {
-    const tmpCwd = mkdtempSync(join(tmpdir(), 'pi-append-cwd-'));
-    const tmpAgent = mkdtempSync(join(tmpdir(), 'pi-append-agent-'));
-    vi.stubEnv('PI_CODING_AGENT_DIR', tmpAgent);
+  it('pi-turn-boundary-extension appends BOTMUX_APPEND_SYSTEM_PROMPT in before_agent_start', async () => {
+    let beforeAgentStartHandler: ((event: unknown) => { systemPrompt?: string } | void) | undefined;
+    const mockPi = {
+      on(event: string, handler: any) {
+        if (event === 'before_agent_start') beforeAgentStartHandler = handler;
+      },
+      appendEntry() {},
+    };
+    registerBotmuxTurnBoundaryExtension(mockPi as any);
+    expect(beforeAgentStartHandler).toBeDefined();
 
+    vi.stubEnv('BOTMUX_APPEND_SYSTEM_PROMPT', '<botmux_routing>bot rules</botmux_routing>');
     try {
-      writeFileSync(join(tmpAgent, 'trust.json'), JSON.stringify({ [tmpCwd]: true }));
-      mkdirSync(join(tmpCwd, '.pi'), { recursive: true });
-      writeFileSync(join(tmpCwd, '.pi', 'APPEND_SYSTEM.md'), 'USER_PROJECT_SENTINEL');
-
-      const args = adapter.buildArgs({
-        sessionId: 'sess-pi',
-        resume: false,
-        workingDir: tmpCwd,
-        botName: 'TestBot',
-      });
-
-      const appendIndices = args.flatMap((arg, i) => arg === '--append-system-prompt' ? [i] : []);
-      expect(appendIndices.length).toBe(2);
-      expect(args[appendIndices[0] + 1]).toBe(join(tmpCwd, '.pi', 'APPEND_SYSTEM.md'));
-      expect(args[appendIndices[1] + 1]).toContain('<botmux_routing>');
-      expect(args[appendIndices[1] + 1]).toContain('TestBot');
+      const res = beforeAgentStartHandler!({ systemPrompt: 'BASE SYSTEM PROMPT' });
+      expect(res?.systemPrompt).toBe('BASE SYSTEM PROMPT\n\n<botmux_routing>bot rules</botmux_routing>');
     } finally {
       vi.unstubAllEnvs();
-      rmSync(tmpCwd, { recursive: true, force: true });
-      rmSync(tmpAgent, { recursive: true, force: true });
     }
   });
 
-  it('falls back to global APPEND_SYSTEM.md when project is untrusted', () => {
-    const tmpCwd = mkdtempSync(join(tmpdir(), 'pi-append-untrusted-cwd-'));
-    const tmpAgent = mkdtempSync(join(tmpdir(), 'pi-append-untrusted-agent-'));
-    vi.stubEnv('PI_CODING_AGENT_DIR', tmpAgent);
+  it('preserves native project trust and user APPEND_SYSTEM.md across all runtime trust scenarios', async () => {
+    const { DefaultResourceLoader } = await import('/root/.local/share/fnm/node-versions/v22.21.1/installation/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/resource-loader.js');
+    const { SettingsManager } = await import('/root/.local/share/fnm/node-versions/v22.21.1/installation/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/settings-manager.js');
+    const { ProjectTrustStore } = await import('/root/.local/share/fnm/node-versions/v22.21.1/installation/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/trust-manager.js');
+    const { resolveProjectTrusted } = await import('/root/.local/share/fnm/node-versions/v22.21.1/installation/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/project-trust.js');
+    const { ExtensionRunner } = await import('/root/.local/share/fnm/node-versions/v22.21.1/installation/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/runner.js');
+    const { buildSystemPrompt } = await import('/root/.local/share/fnm/node-versions/v22.21.1/installation/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/system-prompt.js');
 
+    const root = mkdtempSync(join(tmpdir(), 'pi-trust-scenarios-'));
     try {
-      writeFileSync(join(tmpAgent, 'trust.json'), JSON.stringify({ [tmpCwd]: false }));
-      mkdirSync(join(tmpCwd, '.pi'), { recursive: true });
-      writeFileSync(join(tmpCwd, '.pi', 'APPEND_SYSTEM.md'), 'UNTRUSTED_PROJECT_SENTINEL');
-      writeFileSync(join(tmpAgent, 'APPEND_SYSTEM.md'), 'GLOBAL_AGENT_SENTINEL');
+      for (const scenario of ['saved-trust', 'default-always', 'no-approve', 'session-only', 'extension-deny']) {
+        const cwd = join(root, scenario, 'repo');
+        const agentDir = join(root, scenario, 'agent');
+        mkdirSync(join(cwd, '.pi'), { recursive: true });
+        mkdirSync(agentDir, { recursive: true });
+        writeFileSync(join(cwd, '.pi', 'APPEND_SYSTEM.md'), 'PROJECT_SENTINEL_1574');
+        writeFileSync(join(agentDir, 'APPEND_SYSTEM.md'), 'GLOBAL_SENTINEL_1574');
+        writeFileSync(join(agentDir, 'settings.json'), JSON.stringify({ defaultProjectTrust: scenario === 'default-always' ? 'always' : 'ask' }));
+        if (['saved-trust', 'no-approve', 'extension-deny'].includes(scenario)) {
+          writeFileSync(join(agentDir, 'trust.json'), JSON.stringify({ [cwd]: true }));
+        }
 
-      const args = adapter.buildArgs({
-        sessionId: 'sess-pi',
-        resume: false,
-        workingDir: tmpCwd,
-        botName: 'TestBot',
-      });
+        const env: Record<string, string> = { PI_CODING_AGENT_DIR: agentDir };
+        const extraArgs = scenario === 'no-approve' ? ['--no-approve'] : [];
+        const args = adapter.buildArgs({
+          sessionId: 'sess-trust',
+          resume: false,
+          workingDir: cwd,
+          botName: 'TestBot',
+          env,
+          extraArgs,
+        });
 
-      const appendIndices = args.flatMap((arg, i) => arg === '--append-system-prompt' ? [i] : []);
-      expect(appendIndices.length).toBe(2);
-      expect(args[appendIndices[0] + 1]).toBe(join(tmpAgent, 'APPEND_SYSTEM.md'));
-      expect(args[appendIndices[1] + 1]).toContain('<botmux_routing>');
+        // Ensure adapter does NOT bake --append-system-prompt
+        expect(args).not.toContain('--append-system-prompt');
+        expect(env.BOTMUX_APPEND_SYSTEM_PROMPT).toContain('<botmux_routing>');
+
+        // Emulate Pi startup with pi-turn-boundary-extension loaded
+        const extensionFactories: any[] = [
+          (pi: any) => {
+            pi.on('before_agent_start', (event: any) => ({
+              systemPrompt: `${event.systemPrompt}\n\n${env.BOTMUX_APPEND_SYSTEM_PROMPT}`,
+            }));
+          },
+        ];
+        if (scenario === 'extension-deny') {
+          extensionFactories.push((api: any) => {
+            api.on('project_trust', () => ({ trusted: 'no', remember: false }));
+          });
+        }
+
+        const settingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
+        const loader = new DefaultResourceLoader({
+          cwd,
+          agentDir,
+          settingsManager,
+          noSkills: true,
+          noThemes: true,
+          noPromptTemplates: true,
+          noContextFiles: true,
+          extensionFactories,
+        });
+
+        await loader.reload({
+          resolveProjectTrust: async ({ extensionsResult }: any) => resolveProjectTrusted({
+            cwd,
+            trustStore: new ProjectTrustStore(agentDir),
+            trustOverride: scenario === 'no-approve' ? false : undefined,
+            defaultProjectTrust: settingsManager.getDefaultProjectTrust(),
+            extensionsResult,
+            projectTrustContext: {
+              hasUI: scenario === 'session-only',
+              ui: { select: async () => 'Trust (this session only)' },
+            },
+          }),
+        });
+
+        const appendSystemPrompt = loader.getAppendSystemPrompt().join('\n\n');
+        const basePrompt = buildSystemPrompt({
+          cwd,
+          skills: [],
+          contextFiles: [],
+          customPrompt: loader.getSystemPrompt(),
+          appendSystemPrompt,
+          selectedTools: [],
+          toolSnippets: [],
+          promptGuidelines: [],
+        });
+
+        const runner = new ExtensionRunner(loader.getExtensions().extensions, loader.getExtensions().runtime);
+        const startResult = await runner.emitBeforeAgentStart('test prompt', undefined, basePrompt, {});
+        const finalPrompt = startResult?.systemPrompt ?? basePrompt;
+
+        const isTrusted = scenario === 'saved-trust' || scenario === 'default-always' || scenario === 'session-only';
+        expect(settingsManager.isProjectTrusted()).toBe(isTrusted);
+        expect(finalPrompt.includes('PROJECT_SENTINEL_1574')).toBe(isTrusted);
+        expect(finalPrompt.includes('GLOBAL_SENTINEL_1574')).toBe(!isTrusted);
+        expect(finalPrompt.includes('<botmux_routing>')).toBe(true);
+      }
     } finally {
-      vi.unstubAllEnvs();
-      rmSync(tmpCwd, { recursive: true, force: true });
-      rmSync(tmpAgent, { recursive: true, force: true });
-    }
-  });
-
-  it('forwards extraArgs (--no-approve) to override saved project trust', () => {
-    const tmpCwd = mkdtempSync(join(tmpdir(), 'pi-append-noapp-cwd-'));
-    const tmpAgent = mkdtempSync(join(tmpdir(), 'pi-append-noapp-agent-'));
-    try {
-      writeFileSync(join(tmpAgent, 'trust.json'), JSON.stringify({ [tmpCwd]: true }));
-      mkdirSync(join(tmpCwd, '.pi'), { recursive: true });
-      writeFileSync(join(tmpCwd, '.pi', 'APPEND_SYSTEM.md'), 'PROJECT_SENTINEL');
-      writeFileSync(join(tmpAgent, 'APPEND_SYSTEM.md'), 'GLOBAL_SENTINEL');
-
-      const args = adapter.buildArgs({
-        sessionId: 'sess-pi',
-        resume: false,
-        workingDir: tmpCwd,
-        botName: 'TestBot',
-        extraArgs: ['--no-approve'],
-        env: { PI_CODING_AGENT_DIR: tmpAgent },
-      });
-
-      const appendIndices = args.flatMap((arg, i) => arg === '--append-system-prompt' ? [i] : []);
-      expect(appendIndices.length).toBe(2);
-      expect(args[appendIndices[0] + 1]).toBe(join(tmpAgent, 'APPEND_SYSTEM.md'));
-      expect(args[appendIndices[1] + 1]).toContain('<botmux_routing>');
-    } finally {
-      rmSync(tmpCwd, { recursive: true, force: true });
-      rmSync(tmpAgent, { recursive: true, force: true });
-    }
-  });
-
-  it('forwards env with PI_CODING_AGENT_DIR for discovery without worker process pollution', () => {
-    const tmpCwd = mkdtempSync(join(tmpdir(), 'pi-append-env-cwd-'));
-    const workerAgent = mkdtempSync(join(tmpdir(), 'pi-worker-agent-'));
-    const botAgent = mkdtempSync(join(tmpdir(), 'pi-bot-agent-'));
-    vi.stubEnv('PI_CODING_AGENT_DIR', workerAgent);
-    try {
-      writeFileSync(join(workerAgent, 'APPEND_SYSTEM.md'), 'WORKER_SENTINEL');
-      writeFileSync(join(botAgent, 'APPEND_SYSTEM.md'), 'BOT_SENTINEL');
-
-      const args = adapter.buildArgs({
-        sessionId: 'sess-pi',
-        resume: false,
-        workingDir: tmpCwd,
-        botName: 'TestBot',
-        env: { PI_CODING_AGENT_DIR: botAgent },
-      });
-
-      const appendIndices = args.flatMap((arg, i) => arg === '--append-system-prompt' ? [i] : []);
-      expect(appendIndices.length).toBe(2);
-      expect(args[appendIndices[0] + 1]).toBe(join(botAgent, 'APPEND_SYSTEM.md'));
-    } finally {
-      vi.unstubAllEnvs();
-      rmSync(tmpCwd, { recursive: true, force: true });
-      rmSync(workerAgent, { recursive: true, force: true });
-      rmSync(botAgent, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });

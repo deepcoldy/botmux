@@ -15559,6 +15559,9 @@ async function spawnCli(
   if (cfg.chatType) childEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
   else delete childEnv.BOTMUX_CHAT_TYPE;
   childEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
+  if (perBotInjectEnv.BOTMUX_APPEND_SYSTEM_PROMPT) {
+    childEnv.BOTMUX_APPEND_SYSTEM_PROMPT = perBotInjectEnv.BOTMUX_APPEND_SYSTEM_PROMPT;
+  }
   // Pin the EXACT bots.json this daemon loaded so the child's `botmux send`
   // reads the SAME registry. Required when the daemon runs under a non-default
   // HOME (`HOME=~/alt botmux start`): the child inherits BOTMUX_* but not HOME,
