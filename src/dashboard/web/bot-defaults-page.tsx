@@ -44,12 +44,11 @@ import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
 import {
   MentionMock,
-  ModeCardPicker,
-  MODE_GLYPHS,
+  ModeOptionGroup,
   P2pMock,
   RegularMock,
   WorkingDirMock,
-  type ModeCardOption,
+  type ModeOption,
 } from './mode-diagrams.js';
 import { store } from './store.js';
 import { toast } from './toast.js';
@@ -3422,22 +3421,22 @@ function WorkingDirSection(props: {
     }
   }
 
-  const modeOptions: ModeCardOption<'off' | 'default' | 'oncall'>[] = [
+  const modeOptions: ModeOption<'off' | 'default' | 'oncall'>[] = [
     {
-      value: 'off', icon: MODE_GLYPHS.pickCard, name: tr('botDefaults.workingDirModeOff'),
-      description: tr('botDefaults.wdOffDesc'),
+      value: 'off', isDefault: true, name: tr('botDefaults.optWdOffName'),
+      short: tr('botDefaults.optWdOffShort'),
       tags: [tr('botDefaults.wdOffTag1'), tr('botDefaults.wdOffTag2')],
       mock: <WorkingDirMock mode="off" />,
     },
     {
-      value: 'default', icon: MODE_GLYPHS.pinFolder, name: tr('botDefaults.workingDirModeDefault'),
-      description: tr('botDefaults.wdDefaultDesc'),
+      value: 'default', name: tr('botDefaults.optWdDefaultName'),
+      short: tr('botDefaults.optWdDefaultShort'),
       tags: [tr('botDefaults.wdDefaultTag1'), tr('botDefaults.wdDefaultTag2')],
       mock: <WorkingDirMock mode="default" />,
     },
     {
-      value: 'oncall', icon: MODE_GLYPHS.oncall, name: tr('botDefaults.workingDirModeOncall'),
-      description: tr('botDefaults.wdOncallDesc'),
+      value: 'oncall', name: tr('botDefaults.optWdOncallName'),
+      short: tr('botDefaults.optWdOncallShort'),
       tags: [tr('botDefaults.wdOncallTag1'), tr('botDefaults.wdOncallTag2')],
       mock: <WorkingDirMock mode="oncall" />,
     },
@@ -3446,19 +3445,20 @@ function WorkingDirSection(props: {
   return (
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionWorkingDir')}</h3>
-      <div className="bd-row">
-        <div className="bd-field">
-          <FieldTitle help={tr('botDefaults.workingDirModeHelp')}>{tr('botDefaults.workingDirMode')}</FieldTitle>
-          <ModeCardPicker<'off' | 'default' | 'oncall'>
-            dataInput="workingDirMode"
-            ariaLabel={tr('botDefaults.workingDirMode')}
-            value={mode}
-            disabled={busy}
-            options={modeOptions}
-            onChange={next => setMode(next)}
-          />
-        </div>
-      </div>
+      <ModeOptionGroup<'off' | 'default' | 'oncall'>
+        dataInput="workingDirMode"
+        groupName={tr('botDefaults.groupWorkingDir')}
+        groupSub={tr('botDefaults.groupWorkingDirSub')}
+        exampleTitle={tr('botDefaults.exampleTitleWorkingDir')}
+        value={mode}
+        options={modeOptions}
+        wideCols={3}
+        narrowCols={1}
+        disabled={busy}
+        onChange={next => setMode(next)}
+      >
+        <div className="bd-mode-group-side"><StatusSpan status={status} attr={{ 'data-status': '' }} /></div>
+      </ModeOptionGroup>
       <div className="bd-row" data-wd-dir-row hidden={mode === 'off'}>
         <label>
           <span>{tr('botDefaults.workingDirField')}</span>
@@ -3472,7 +3472,6 @@ function WorkingDirSection(props: {
       </label>
       <div className="actions">
         <button type="button" className="primary" data-action="save-working-dir" disabled={busy} onClick={() => void save()}>{tr('botDefaults.save')}</button>
-        <StatusSpan status={status} attr={{ 'data-status': '' }} />
       </div>
       <AutoStartControls bot={bot} putCardPref={props.putCardPref} />
     </section>
@@ -5162,71 +5161,74 @@ function SessionModeSection(props: {
 
   const tags2 = (k1: string, k2: string): string[] => [tr(k1), tr(k2)];
 
-  const p2pOptions: ModeCardOption<'thread' | 'chat' | 'group'>[] = [
+  const p2pOptions: ModeOption<'thread' | 'chat' | 'group'>[] = [
     {
-      value: 'chat', icon: MODE_GLYPHS.continuous, name: tr('botDefaults.p2pChat'),
-      description: tr('botDefaults.p2pChatDesc'), tags: tags2('botDefaults.p2pChatTag1', 'botDefaults.p2pChatTag2'),
+      value: 'chat', isDefault: true, name: tr('botDefaults.optP2pChatName'),
+      short: tr('botDefaults.optP2pChatShort'),
+      tags: tags2('botDefaults.p2pChatTag1', 'botDefaults.p2pChatTag2'),
       mock: <P2pMock mode="chat" />,
     },
     {
-      value: 'thread', icon: MODE_GLYPHS.separate, name: tr('botDefaults.p2pThread'),
-      description: tr('botDefaults.p2pThreadDesc'), tags: tags2('botDefaults.p2pThreadTag1', 'botDefaults.p2pThreadTag2'),
+      value: 'thread', name: tr('botDefaults.optP2pThreadName'),
+      short: tr('botDefaults.optP2pThreadShort'),
+      tags: tags2('botDefaults.p2pThreadTag1', 'botDefaults.p2pThreadTag2'),
       mock: <P2pMock mode="thread" />,
     },
     {
-      value: 'group', icon: MODE_GLYPHS.group, name: tr('botDefaults.p2pGroup'),
-      description: tr('botDefaults.p2pGroupDesc'), tags: tags2('botDefaults.p2pGroupTag1', 'botDefaults.p2pGroupTag2'),
+      value: 'group', name: tr('botDefaults.optP2pGroupName'),
+      short: tr('botDefaults.optP2pGroupShort'),
+      tags: tags2('botDefaults.p2pGroupTag1', 'botDefaults.p2pGroupTag2'),
       mock: <P2pMock mode="group" />,
     },
   ];
-  const regularOptions: ModeCardOption<string>[] = [
+  const regularOptions: ModeOption<string>[] = [
     {
-      value: 'chat-topic', icon: MODE_GLYPHS.hybrid, name: tr('botDefaults.regularGroupModeChatTopic'),
-      description: tr('botDefaults.regularChatTopicDesc'),
+      value: 'chat-topic', isDefault: true, name: tr('botDefaults.optRegularHybridName'),
+      short: tr('botDefaults.optRegularHybridShort'),
       tags: tags2('botDefaults.regularChatTopicTag1', 'botDefaults.regularChatTopicTag2'),
       mock: <RegularMock mode="chat-topic" />,
     },
     {
-      value: 'new-topic', icon: MODE_GLYPHS.topic, name: tr('botDefaults.regularGroupModeNewTopic'),
-      description: tr('botDefaults.regularNewTopicDesc'),
+      value: 'new-topic', name: tr('botDefaults.optRegularNewTopicName'),
+      short: tr('botDefaults.optRegularNewTopicShort'),
       tags: tags2('botDefaults.regularNewTopicTag1', 'botDefaults.regularNewTopicTag2'),
       mock: <RegularMock mode="new-topic" />,
     },
     {
-      value: 'chat', icon: MODE_GLYPHS.message, name: tr('botDefaults.regularGroupModeChat'),
-      description: tr('botDefaults.regularChatDesc'),
+      value: 'chat', name: tr('botDefaults.optRegularChatName'),
+      short: tr('botDefaults.optRegularChatShort'),
       tags: tags2('botDefaults.regularChatTag1', 'botDefaults.regularChatTag2'),
       mock: <RegularMock mode="chat" />,
     },
     {
-      value: 'shared', icon: MODE_GLYPHS.shared, name: tr('botDefaults.regularGroupModeShared'),
-      description: tr('botDefaults.regularSharedDesc'),
+      value: 'shared', name: tr('botDefaults.optRegularSharedName'),
+      short: tr('botDefaults.optRegularSharedShort'),
       tags: tags2('botDefaults.regularSharedTag1', 'botDefaults.regularSharedTag2'),
       mock: <RegularMock mode="shared" />,
     },
   ];
-  const mentionOptions: ModeCardOption<string>[] = [
+  const mentionOptions: ModeOption<string>[] = [
     {
-      value: 'always', icon: MODE_GLYPHS.at, name: tr('botDefaults.mentionModeAlways'),
-      description: tr('botDefaults.mentionAlwaysDesc'),
+      value: 'always', isDefault: true, name: tr('botDefaults.optMentionAlwaysName'),
+      short: tr('botDefaults.optMentionAlwaysShort'),
       tags: tags2('botDefaults.mentionAlwaysTag1', 'botDefaults.mentionAlwaysTag2'),
       mock: <MentionMock mode="always" />,
     },
     {
-      value: 'topic', icon: MODE_GLYPHS.inTopic, name: tr('botDefaults.mentionModeTopic'),
-      description: tr('botDefaults.mentionTopicDesc'),
+      value: 'topic', name: tr('botDefaults.optMentionTopicName'),
+      short: tr('botDefaults.optMentionTopicShort'),
       tags: tags2('botDefaults.mentionTopicTag1', 'botDefaults.mentionTopicTag2'),
       mock: <MentionMock mode="topic" />,
     },
     {
-      value: 'never', icon: MODE_GLYPHS.loud, name: tr('botDefaults.mentionModeNever'),
-      description: tr('botDefaults.mentionNeverDesc'),
+      value: 'never', name: tr('botDefaults.optMentionNeverName'),
+      short: tr('botDefaults.optMentionNeverShort'),
       tags: tags2('botDefaults.mentionNeverTag1', 'botDefaults.mentionNeverTag2'),
       mock: <MentionMock mode="never" />,
     },
     {
-      value: 'ambient', icon: MODE_GLYPHS.yield, name: tr('botDefaults.mentionModeAmbient'),
-      description: tr('botDefaults.mentionAmbientDesc'),
+      value: 'ambient', name: tr('botDefaults.optMentionAmbientName'),
+      short: tr('botDefaults.optMentionAmbientShort'),
       tags: tags2('botDefaults.mentionAmbientTag1', 'botDefaults.mentionAmbientTag2'),
       mock: <MentionMock mode="ambient" />,
     },
@@ -5237,59 +5239,67 @@ function SessionModeSection(props: {
   ];
 
   return (
-    <section className="bd-section">
-      <h3 className="bd-section-title">{tr('botDefaults.sectionSessionMode')}</h3>
-      <div className="bd-row">
-        <div className="bd-field">
-          <FieldTitle help={tr('botDefaults.p2pHelp')}>{tr('botDefaults.p2pMode')}</FieldTitle>
-          <ModeCardPicker<'thread' | 'chat' | 'group'>
-            dataInput="p2pMode"
-            ariaLabel={tr('botDefaults.p2pMode')}
-            value={p2p}
-            disabled={busy === 'p2p'}
-            options={p2pOptions}
-            onChange={next => void saveP2p(next)}
-          />
-        </div>
-        <div className="actions"><StatusSpan status={p2pStatus} attr={{ 'data-p2p-status': '' }} /></div>
-      </div>
-      {p2p === 'group' && <SessionGroupTagRow bot={props.bot} />}
-      <div className="bd-row">
-        <div className="bd-field">
-          <FieldTitle help={tr('botDefaults.regularGroupModeHelp')}>{tr('botDefaults.regularGroupMode')}</FieldTitle>
-          <ModeCardPicker
-            columns={2}
-            dataInput="regularGroupMode"
-            ariaLabel={tr('botDefaults.regularGroupMode')}
-            value={regular}
-            disabled={busy === 'regular'}
-            options={regularOptions}
-            onChange={next => {
-              setRegular(next);
-              void saveCardMode('regular', { regularGroupReplyMode: next }, setRegularStatus);
-            }}
-          />
-        </div>
-        <div className="actions"><StatusSpan status={regularStatus} attr={{ 'data-regular-group-status': '' }} /></div>
-      </div>
-      <div className="bd-row">
-        <div className="bd-field">
-          <FieldTitle help={tr('botDefaults.mentionModeHelp')}>{tr('botDefaults.mentionMode')}</FieldTitle>
-          <ModeCardPicker
-            dataInput="regularGroupMentionMode"
-            ariaLabel={tr('botDefaults.mentionMode')}
-            value={mention}
-            disabled={busy === 'mention'}
-            options={mentionOptions}
-            onChange={next => {
-              setMention(next);
-              void saveCardMode('mention', { regularGroupMentionMode: next }, setMentionStatus);
-            }}
-          />
-        </div>
-        <div className="actions"><StatusSpan status={mentionStatus} attr={{ 'data-mention-mode-status': '' }} /></div>
-      </div>
-      <div className="bd-row">
+    <section className="bd-section bd-session-mode-section">
+      <header className="bd-session-mode-head">
+        <h3 className="bd-section-title">{tr('botDefaults.sectionSessionMode')}</h3>
+        <p className="bd-session-mode-intro">{tr('botDefaults.sessionModeIntro')}</p>
+      </header>
+
+      <ModeOptionGroup<'thread' | 'chat' | 'group'>
+        dataInput="p2pMode"
+        groupName={tr('botDefaults.groupP2p')}
+        groupSub={tr('botDefaults.groupP2pSub')}
+        exampleTitle={tr('botDefaults.exampleTitleP2p')}
+        value={p2p}
+        options={p2pOptions}
+        wideCols={3}
+        narrowCols={1}
+        disabled={busy === 'p2p'}
+        onChange={next => void saveP2p(next)}
+      >
+        <div className="bd-mode-group-side"><StatusSpan status={p2pStatus} attr={{ 'data-p2p-status': '' }} /></div>
+        {p2p === 'group' ? <SessionGroupTagRow bot={props.bot} /> : null}
+      </ModeOptionGroup>
+
+      <ModeOptionGroup
+        dataInput="regularGroupMode"
+        groupName={tr('botDefaults.groupRegular')}
+        groupSub={tr('botDefaults.groupRegularSub')}
+        exampleTitle={tr('botDefaults.exampleTitleRegular')}
+        value={regular}
+        options={regularOptions}
+        wideCols={2}
+        narrowCols={1}
+        disabled={busy === 'regular'}
+        onChange={next => {
+          setRegular(next);
+          void saveCardMode('regular', { regularGroupReplyMode: next }, setRegularStatus);
+        }}
+      >
+        <div className="bd-mode-group-side"><StatusSpan status={regularStatus} attr={{ 'data-regular-group-status': '' }} /></div>
+      </ModeOptionGroup>
+
+      <ModeOptionGroup
+        dataInput="regularGroupMentionMode"
+        groupName={tr('botDefaults.groupMention')}
+        groupSub={tr('botDefaults.groupMentionSub')}
+        exampleTitle={tr('botDefaults.exampleTitleMention')}
+        value={mention}
+        options={mentionOptions}
+        wideCols={4}
+        narrowCols={2}
+        disabled={busy === 'mention'}
+        onChange={next => {
+          setMention(next);
+          void saveCardMode('mention', { regularGroupMentionMode: next }, setMentionStatus);
+        }}
+      >
+        <div className="bd-mode-group-side"><StatusSpan status={mentionStatus} attr={{ 'data-mention-mode-status': '' }} /></div>
+      </ModeOptionGroup>
+
+      <footer className="bd-session-mode-footer">{tr('botDefaults.sessionModeFooter')}</footer>
+
+      <div className="bd-row bd-session-mode-doc">
         <div className="bd-field">
           <FieldTitle help={tr('botDefaults.docSubscribeModeHelp')}>{tr('botDefaults.docSubscribeMode')}</FieldTitle>
           <DropdownField

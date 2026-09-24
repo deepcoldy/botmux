@@ -1,111 +1,230 @@
 /**
- * 会话 / 目录模式的单选卡片 + 逼真飞书聊天截图。
+ * 会话 / 目录模式：紧凑单选选项 + 独立示例侧栏。
  *
- * 每个选项一张大卡片：顶部是模式名 + 单选钮，中间是高保真迷你飞书聊天截图
- * （头像、蓝色气泡、「回复消息」引用条、「回复话题」入口、话题分区），
- * 底部是一句话说明与适用场景标签。
+ * 主页每个选项只保留「单选钮 + 名称 + 一句机制说明」，多模式在同一行/同一块
+ * 直接比较，不内嵌大图；完整的高保真飞书聊天截图收进「查看示例」侧栏：
+ * - 桌面：右侧 460px 浮层；窄屏：底部抽屉（≤90dvh）
+ * - 侧栏一次只渲染正在预览的一张图，顶部按钮只切 previewValue，绝不调用保存回调，
+ *   当前真实配置用「·当前」标出，避免为了比较示例而误改配置
  *
  * 截图区（.bd-mock*）固定使用飞书自己的浅色配色（与嵌入真实截图同理），
- * 不跟随 dashboard 暗色主题；蓝/紫只用来标注上下文归属（A/B 会话）。
+ * 蓝/紫只用来标注上下文归属（A/B 会话）。
  */
-import { useId } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import type React from 'react';
-import type { KeyboardEvent, ReactNode } from 'react';
+import type { ReactNode } from 'react';
+import { createPortal } from 'react-dom';
 import { useT } from './react-hooks.js';
 
 function cx(...parts: Array<string | false | null | undefined>): string {
   return parts.filter(Boolean).join(' ');
 }
 
-/* ── 单选卡片选择器 ───────────────────────────────────────────────────── */
+/* ── 模式选项组（紧凑单选 + 示例入口） ───────────────────────────────── */
 
-export type ModeCardOption<T extends string> = {
+export type ModeOption<T extends string> = {
   value: T;
-  /** 小方块图标（24px 软底 glyph） */
-  icon: ReactNode;
+  /** 选项短名（15px/650） */
   name: string;
-  description: string;
-  /** 适用场景小标签（每卡最多 2 个） */
-  tags: string[];
-  /** 中部的迷你飞书截图 */
+  /** 一句机制说明（12px/常规，低对比） */
+  short: string;
+  /** 该项是否为出厂默认（与"当前选中"是两回事，只显示「默认」字样） */
+  isDefault?: boolean;
+  /** 适用场景标签（只出现在示例侧栏） */
+  tags?: string[];
+  /** 示例侧栏里的高保真飞书截图 */
   mock: ReactNode;
 };
 
-export function ModeCardPicker<T extends string>(props: {
+export function ModeOptionGroup<T extends string>(props: {
+  /** data-input 标记，保留隐藏值锚点语义 */
+  dataInput: string;
+  groupName: string;
+  groupSub: string;
+  /** 侧栏标题后缀，如「私聊 · 对话示例」 */
+  exampleTitle: string;
   value: T;
-  options: ReadonlyArray<ModeCardOption<T>>;
+  options: ReadonlyArray<ModeOption<T>>;
   disabled?: boolean;
   onChange(value: T): void;
-  dataInput?: string;
-  ariaLabel?: string;
-  /** 固定列数（如普通群 4 项固定两列）；窄屏自动降为一列。默认自适应。 */
-  columns?: number;
+  /** 宽容器列数 / 窄容器列数（容器 ≤620px 时） */
+  wideCols: number;
+  narrowCols: number;
+  /** 该组下额外的非选项内容（如私聊群模式下的会话群标签设置） */
+  children?: ReactNode;
 }): React.JSX.Element {
-  const prefix = props.dataInput ?? 'mode';
-
-  function onCardKeyDown(event: KeyboardEvent<HTMLDivElement>, index: number): void {
-    const next = event.key === 'ArrowRight' || event.key === 'ArrowDown' ? 1 : -1;
-    const target = (index + next + props.options.length) % props.options.length;
-    props.onChange(props.options[target].value);
-    document.getElementById(`${prefix}-card-${props.options[target].value}`)?.focus();
-  }
+  const tr = useT();
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
+  const wrapId = useId().replace(/:/g, '');
 
   return (
-    <div
-      className={cx('bd-mode-cards-wrap')}
-    >
-      <div
-        className={cx('bd-mode-cards', props.columns ? 'is-fixed-cols' : undefined)}
-        style={props.columns ? { '--bd-mode-cols': String(props.columns) } as React.CSSProperties : undefined}
-        role="radiogroup"
-        aria-label={props.ariaLabel}
-        data-input={props.dataInput}
-      >
-      {props.options.map((option, index) => {
-        const selected = option.value === props.value;
-        return (
-          <div
-            key={option.value}
-            id={`${prefix}-card-${option.value}`}
-            className={['bd-mode-card', selected && 'is-selected'].filter(Boolean).join(' ')}
-            role="radio"
-            aria-checked={selected}
-            tabIndex={props.disabled ? -1 : selected ? 0 : -1}
-            aria-disabled={props.disabled || undefined}
-            onClick={() => { if (!props.disabled) props.onChange(option.value); }}
-            onKeyDown={event => {
-              if (props.disabled) return;
-              if (event.key === 'Enter' || event.key === ' ') {
-                event.preventDefault();
-                props.onChange(option.value);
-              } else if (event.key.startsWith('Arrow')) {
-                event.preventDefault();
-                onCardKeyDown(event, index);
-              }
-            }}
-          >
-            {/* 顶部固定：图标 + 名称 + 单选钮（同排标题对齐） */}
-            <div className="bd-mode-head">
-              <span className="bd-mode-icon">{option.icon}</span>
-              <span className="bd-mode-name">{option.name}</span>
-              <span className={['bd-mode-radio', selected && 'is-on'].filter(Boolean).join(' ')} aria-hidden="true" />
-            </div>
-            {/* 中部：飞书截图，顶对齐、同排等高 */}
-            <div className="bd-mode-mock" aria-hidden="true">{option.mock}</div>
-            {/* 底部：说明 + 场景标签 */}
-            <div className="bd-mode-foot">
-              <p className="bd-mode-desc">{option.description}</p>
-              {option.tags.length ? (
-                <div className="bd-mode-tags">
-                  {option.tags.slice(0, 2).map(tag => <span key={tag} className="bd-mode-tag">{tag}</span>)}
-                </div>
-              ) : null}
-            </div>
-          </div>
-        );
-      })}
+    <div className="bd-mode-group">
+      <div className="bd-mode-group-head">
+        <div className="bd-mode-group-heading">
+          <h4 className="bd-mode-group-title">{props.groupName}</h4>
+          <span className="bd-mode-group-sub">{props.groupSub}</span>
+        </div>
+        <button
+          ref={triggerRef}
+          type="button"
+          className="bd-mode-example-trigger"
+          aria-haspopup="dialog"
+          aria-expanded={drawerOpen}
+          onClick={() => setDrawerOpen(true)}
+        >
+          {tr('botDefaults.viewExample')}
+          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+            <path d="M6 3.5 10.5 8 6 12.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </button>
       </div>
+      <div className="bd-mode-opts-wrap">
+        <div
+          className="bd-mode-opt-grid"
+          role="radiogroup"
+          aria-label={props.groupName}
+          data-input={props.dataInput}
+          style={{
+            '--bd-wide-cols': String(props.wideCols),
+            '--bd-narrow-cols': String(props.narrowCols),
+          } as React.CSSProperties}
+        >
+          {props.options.map(option => {
+            const selected = option.value === props.value;
+            return (
+              <button
+                key={option.value}
+                type="button"
+                role="radio"
+                aria-checked={selected}
+                disabled={props.disabled}
+                className={cx('bd-mode-opt', selected && 'is-selected')}
+                data-value={option.value}
+                onClick={() => { if (!props.disabled) props.onChange(option.value); }}
+              >
+                <span className={cx('bd-mode-opt-radio', selected && 'is-on')} aria-hidden="true" />
+                <span className="bd-mode-opt-text">
+                  <span className="bd-mode-opt-name">
+                    {option.name}
+                    {option.isDefault ? <em className="bd-mode-default-tag">{tr('botDefaults.defaultWord')}</em> : null}
+                  </span>
+                  <span className="bd-mode-opt-short">{option.short}</span>
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      {props.children}
+      {drawerOpen ? (
+        <ModeExampleDrawer
+          portalKey={wrapId}
+          title={props.exampleTitle}
+          value={props.value}
+          options={props.options}
+          triggerRef={triggerRef}
+          onClose={() => setDrawerOpen(false)}
+        />
+      ) : null}
     </div>
+  );
+}
+
+/* ── 示例侧栏 / 底部抽屉 ──────────────────────────────────────────────── */
+
+function ModeExampleDrawer<T extends string>(props: {
+  portalKey: string;
+  title: string;
+  value: T;
+  options: ReadonlyArray<ModeOption<T>>;
+  triggerRef: React.RefObject<HTMLButtonElement | null>;
+  onClose(): void;
+}): React.JSX.Element {
+  const tr = useT();
+  const [preview, setPreview] = useState<T>(props.value);
+  const closeRef = useRef<HTMLButtonElement | null>(null);
+  const current = props.options.find(o => o.value === props.value) ?? props.options[0];
+  const viewing = props.options.find(o => o.value === preview) ?? current;
+
+  useEffect(() => {
+    closeRef.current?.focus();
+    function onKey(event: KeyboardEvent): void {
+      if (event.key === 'Escape') {
+        event.stopPropagation();
+        props.onClose();
+      }
+    }
+    document.addEventListener('keydown', onKey, true);
+    return () => {
+      document.removeEventListener('keydown', onKey, true);
+      props.triggerRef.current?.focus();
+    };
+  }, [props, props.triggerRef]);
+
+  return createPortal(
+    <div
+      className="bd-example-layer bot-defaults-page"
+      onMouseDown={event => { if (event.target === event.currentTarget) props.onClose(); }}
+    >
+      <aside
+        className="bd-example-panel"
+        role="dialog"
+        aria-modal="false"
+        aria-label={props.title}
+      >
+        <header className="bd-example-head">
+          <div>
+            <h3 className="bd-example-title">{props.title}</h3>
+            <p className="bd-example-note">{tr('botDefaults.exampleNote')}</p>
+          </div>
+          <button
+            ref={closeRef}
+            type="button"
+            className="bd-example-close"
+            aria-label={tr('botDefaults.exampleClose')}
+            onClick={props.onClose}
+          >
+            <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+              <path d="M5 5l10 10M15 5 5 15" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+            </svg>
+          </button>
+        </header>
+        <div className="bd-example-tabs" role="tablist" aria-label={viewing.name}>
+          {props.options.map(option => {
+            const isCurrent = option.value === props.value;
+            const isViewing = option.value === viewing.value;
+            return (
+              <button
+                key={option.value}
+                type="button"
+                role="tab"
+                aria-selected={isViewing}
+                className={cx('bd-example-tab', isViewing && 'is-viewing')}
+                onClick={() => setPreview(option.value)}
+              >
+                {option.name}
+                {isCurrent ? <em className="bd-example-current">{tr('botDefaults.exampleCurrent')}</em> : null}
+              </button>
+            );
+          })}
+        </div>
+        <div className="bd-example-body">
+          <div className="bd-example-meta">
+            <span className="bd-example-name">{viewing.name}</span>
+            <span className="bd-example-short">{viewing.short}</span>
+            {viewing.tags?.length ? (
+              <div className="bd-example-tags">
+                {viewing.tags.map(tag => <span key={tag} className="bd-example-tag">{tag}</span>)}
+              </div>
+            ) : null}
+          </div>
+          <div className="bd-example-mock" aria-hidden="true">{viewing.mock}</div>
+        </div>
+      </aside>
+    </div>,
+    document.body,
+    `bd-example-${props.portalKey}`,
   );
 }
 
@@ -586,31 +705,3 @@ export function WorkingDirMock(props: { mode: 'off' | 'default' | 'oncall' }): R
     </div>
   );
 }
-
-/* ── 模式小图标（卡片标题前的 24px 软底 glyph） ───────────────────────── */
-
-function Glyph(props: { d: string; d2?: string }): React.JSX.Element {
-  return (
-    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path d={props.d} stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-      {props.d2 ? <path d={props.d2} stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" /> : null}
-    </svg>
-  );
-}
-
-export const MODE_GLYPHS = {
-  topic: <Glyph d="M7 3.5h7l4 4V20a.5.5 0 0 1-.5.5h-10a.5.5 0 0 1-.5-.5V4a.5.5 0 0 1 .5-.5z M14 3.5V8h4" d2="M9.5 12.5h6M9.5 16h4.5" />,
-  hybrid: <Glyph d="M5 7.5h10a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H9l-3.5 3v-3H5a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2z" d2="M10 3.5h9a2 2 0 0 1 2 2v3" />,
-  message: <Glyph d="M4 6.5h16a1.5 1.5 0 0 1 1.5 1.5v6A1.5 1.5 0 0 1 20 15.5H9l-4 3.5v-3.5H4A1.5 1.5 0 0 1 2.5 14V8A1.5 1.5 0 0 1 4 6.5z" d2="M8 10h8M8 13h5" />,
-  shared: <Glyph d="M8 7v6a4 4 0 0 0 4 4h4M16 17l3 3 3-3" d2="M8 7L5 4M8 7l3-3M22 7l-3-3M22 7l-3 3" />,
-  continuous: <Glyph d="M7 12h10M13 6l6 6-6 6" d2="M11 6l-6 6 6 6" />,
-  separate: <Glyph d="M4 5h11v10H4zM9 9h11v10H9z" />,
-  group: <Glyph d="M9 11.5a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM3.5 19a5.5 5.5 0 0 1 11 0" d2="M16 8.8a3 3 0 0 0 0-5.6M17.5 19a5.5 5.5 0 0 0-3-4.9" />,
-  at: <Glyph d="M12 8.2a3.8 3.8 0 1 0 0 7.6 3.8 3.8 0 0 0 0-7.6z" d2="M15.8 12v1.6a2.4 2.4 0 0 0 4.2 1.6V12a8 8 0 1 0-3.1 6.3M15.8 12v2.4" />,
-  inTopic: <Glyph d="M5 4.5h14v11H8l-3 3v-3z" d2="M9 9h6M9 12h3.5" />,
-  loud: <Glyph d="M4 10v4h3l5 3.5v-11L7 10H4z" d2="M16 9a4 4 0 0 1 0 6M18.5 7a7 7 0 0 1 0 10" />,
-  yield: <Glyph d="M5 12h14M13 6l6 6-6 6" />,
-  pickCard: <Glyph d="M3.5 7a1 1 0 0 1 1-1h7l2 2.5h6a1 1 0 0 1 1 1V18a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1V7z" />,
-  pinFolder: <Glyph d="M3.5 7a1 1 0 0 1 1-1h15a1 1 0 0 1 1 1v11a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1V7z" d2="M3.5 9.5h17M14.5 4.5v3M9.5 4.5v3" />,
-  oncall: <Glyph d="M12 3.5l7 3v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9v-5l7-3z" d2="M12 8.5v5M9.5 11h5" />,
-};

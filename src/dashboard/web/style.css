@@ -25246,167 +25246,385 @@ dialog select[multiple]:hover:not(:disabled) {
 .sect-sort-pop button[aria-current="true"] .sect-sort-option-hint {
   color: color-mix(in srgb, var(--accent-strong) 72%, var(--muted));
 }
-
-/* ═══ 模式单选卡片（mode-diagrams.tsx） ═══
-   卡片纵向三段：头部（图标+模式名+单选钮，同排对齐）→ 飞书截图预览
-   （顶对齐、同排等高）→ 底部说明+场景标签。 */
-/* 外层命名容器：列数断点按容器（内容区）宽度判，而不是浏览器视口 */
-.bot-defaults-page .bd-mode-cards-wrap {
-  container-type: inline-size;
-  container-name: bd-mode-cards;
+/* ═══ 会话/目录模式：紧凑选项组 + 独立示例侧栏（mode-diagrams.tsx） ═══
+   主页只放「单选钮 + 名称 + 一句机制说明」，大图收进「查看示例」侧栏。
+   区块标题 20px/650，分组标题 16px/650，选项名 15px/650，说明 12px/常规。 */
+.bot-defaults-page .bd-session-mode-section .bd-section-title {
+  font-size: 20px;
+  font-weight: 650;
 }
 
-.bot-defaults-page .bd-mode-cards {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+.bot-defaults-page .bd-session-mode-intro {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.bot-defaults-page .bd-session-mode-footer {
+  margin: 14px 0 4px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border-soft);
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.bot-defaults-page .bd-session-mode-doc {
+  margin-top: 14px;
+}
+
+/* 分组 */
+.bot-defaults-page .bd-mode-group {
+  margin-top: 16px;
+}
+
+.bot-defaults-page .bd-mode-group-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
   gap: 12px;
-  margin-top: 8px;
-  /* 同排卡片等高：卡片内部预览区 flex:1 吸收余量，底边与说明起点对齐；
-     单列时每卡自然高度，不写死整卡高度。 */
-  align-items: stretch;
+  margin-bottom: 8px;
 }
 
-/* 固定列数（如普通群四项固定两列） */
-.bot-defaults-page .bd-mode-cards.is-fixed-cols {
-  grid-template-columns: repeat(var(--bd-mode-cols, 2), minmax(0, 1fr));
+.bot-defaults-page .bd-mode-group-title {
+  margin: 0;
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 650;
+  line-height: 1.3;
 }
 
-/* 容器（不是视口）窄于约 620px 时降为一列——桌面带两侧栏时内容区可能已经很窄 */
-@container bd-mode-cards (max-width: 620px) {
-  .bot-defaults-page .bd-mode-cards,
-  .bot-defaults-page .bd-mode-cards.is-fixed-cols {
-    grid-template-columns: minmax(0, 1fr);
+.bot-defaults-page .bd-mode-group-sub {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.bot-defaults-page .bd-mode-example-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: none;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--accent-strong);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.3;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.bot-defaults-page .bd-mode-example-trigger:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.bot-defaults-page .bd-mode-example-trigger svg {
+  width: 13px;
+  height: 13px;
+}
+
+.bot-defaults-page .bd-mode-group-side:empty {
+  display: none;
+}
+
+/* 列数查询容器必须是网格的外层（元素不能查询自身建立的容器） */
+.bot-defaults-page .bd-mode-opts-wrap {
+  container-type: inline-size;
+  container-name: bd-mode-opts;
+}
+
+.bot-defaults-page .bd-mode-opt-grid {
+  --bd-wide-cols: 2;
+  --bd-narrow-cols: 1;
+  display: grid;
+  grid-template-columns: repeat(var(--bd-wide-cols), minmax(0, 1fr));
+  gap: 8px;
+}
+
+@container bd-mode-opts (max-width: 620px) {
+  .bot-defaults-page .bd-mode-opt-grid {
+    grid-template-columns: repeat(var(--bd-narrow-cols), minmax(0, 1fr));
   }
 }
 
-.bot-defaults-page .bd-mode-card {
+/* 单个选项：单选钮 + 名称（15px/650）+ 机制说明（12px/常规，低对比） */
+.bot-defaults-page .bd-mode-opt {
   display: flex;
-  flex-direction: column;
-  min-width: 0;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
   border: 1.5px solid var(--border);
-  border-radius: 12px;
+  border-radius: 10px;
   background: var(--surface);
-  overflow: hidden;
+  text-align: left;
   cursor: pointer;
-  transition: border-color .12s ease, box-shadow .12s ease, background .12s ease;
+  transition: border-color .12s ease, background .12s ease, box-shadow .12s ease;
 }
 
-.bot-defaults-page .bd-mode-card:hover {
+.bot-defaults-page .bd-mode-opt:hover {
   border-color: var(--border-strong);
 }
 
-.bot-defaults-page .bd-mode-card.is-selected {
+.bot-defaults-page .bd-mode-opt.is-selected {
   border-color: var(--accent);
   box-shadow: inset 0 0 0 1px var(--accent);
   background: var(--accent-soft);
 }
 
-.bot-defaults-page .bd-mode-card:focus-visible {
+.bot-defaults-page .bd-mode-opt:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
-.bot-defaults-page .bd-mode-card[aria-disabled="true"] {
+.bot-defaults-page .bd-mode-opt:disabled {
   opacity: .55;
   cursor: default;
 }
 
-/* 头部固定在卡片顶部，同排标题因此对齐 */
-.bot-defaults-page .bd-mode-head {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 11px 12px 9px;
-}
-
-.bot-defaults-page .bd-mode-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 26px;
-  height: 26px;
+.bot-defaults-page .bd-mode-opt-radio {
+  width: 16px;
+  height: 16px;
+  margin-top: 2px;
   flex: none;
-  border-radius: 8px;
-  background: var(--accent-soft);
-  color: var(--accent-strong);
+  border: 1.5px solid var(--border-strong);
+  border-radius: 50%;
 }
 
-.bot-defaults-page .bd-mode-icon svg {
-  width: 15px;
-  height: 15px;
+.bot-defaults-page .bd-mode-opt.is-selected .bd-mode-opt-radio {
+  border: 5px solid var(--accent);
 }
 
-.bot-defaults-page .bd-mode-name {
+.bot-defaults-page .bd-mode-opt-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
   min-width: 0;
-  flex: 1;
+}
+
+.bot-defaults-page .bd-mode-opt-name {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  color: #16181f;
+  font-size: 15px;
+  font-weight: 650;
+  line-height: 1.3;
+}
+
+.bot-defaults-page .bd-mode-default-tag {
+  font-style: normal;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.bot-defaults-page .bd-mode-opt-short {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.45;
+}
+
+/* ── 示例侧栏（桌面右侧浮层 / 窄屏底部抽屉） ── */
+.bot-defaults-page.bd-example-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 1400;
+  display: flex;
+  justify-content: flex-end;
+  background: rgba(15, 18, 30, .42);
+}
+
+.bot-defaults-page .bd-example-panel {
+  display: flex;
+  flex-direction: column;
+  width: 460px;
+  max-width: 92vw;
+  height: 100%;
+  background: var(--surface-raised);
+  border-left: 1px solid var(--border);
+  box-shadow: -8px 0 32px rgba(15, 18, 30, .18);
+  animation: bd-example-slide-in .16s ease;
+}
+
+@keyframes bd-example-slide-in {
+  from { transform: translateX(24px); opacity: .4; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+.bot-defaults-page .bd-example-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 16px 10px;
+}
+
+.bot-defaults-page .bd-example-title {
+  margin: 0;
   color: var(--text);
-  font-size: 13px;
+  font-size: 17px;
   font-weight: 700;
   line-height: 1.3;
 }
 
-.bot-defaults-page .bd-mode-radio {
-  width: 16px;
-  height: 16px;
-  flex: none;
-  border: 1.5px solid var(--border-strong);
-  border-radius: 50%;
-  transition: border-color .12s ease;
-}
-
-.bot-defaults-page .bd-mode-card.is-selected .bd-mode-radio {
-  border: 5px solid var(--accent);
-}
-
-/* 中部截图：飞书固定浅灰底（中性，不随模式换"皮肤"），顶对齐、同排等高。
-   inline-size 容器：截图内部布局（如建群图横/竖排）按卡片实际宽度切换。 */
-.bot-defaults-page .bd-mode-mock {
-  display: flex;
-  flex-direction: column;
-  justify-content: flex-start;
-  flex: 1 1 auto;
-  margin: 0 10px;
-  padding: 10px;
-  border-radius: 8px;
-  background: #f7f8fa;
-  color-scheme: light;
-  container-type: inline-size;
-  container-name: bd-mode-mock;
-}
-
-.bot-defaults-page .bd-mode-foot {
-  display: flex;
-  flex-direction: column;
-  gap: 7px;
-  padding: 10px 12px 12px;
-}
-
-.bot-defaults-page .bd-mode-desc {
-  margin: 0;
+.bot-defaults-page .bd-example-note {
+  margin: 3px 0 0;
   color: var(--muted);
-  font-size: 11.5px;
-  font-weight: 500;
-  line-height: 1.5;
+  font-size: 12px;
+  line-height: 1.4;
 }
 
-.bot-defaults-page .bd-mode-tags {
+.bot-defaults-page .bd-example-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  flex: none;
+  border: 1.5px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.bot-defaults-page .bd-example-close:hover {
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+
+.bot-defaults-page .bd-example-close svg {
+  width: 18px;
+  height: 18px;
+}
+
+.bot-defaults-page .bd-example-tabs {
+  display: flex;
+  gap: 8px;
+  padding: 2px 16px 12px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.bot-defaults-page .bd-example-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.bot-defaults-page .bd-example-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  padding: 6px 12px;
+  border: 1.5px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.2;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.bot-defaults-page .bd-example-tab.is-viewing {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+
+.bot-defaults-page .bd-example-current {
+  font-style: normal;
+  font-size: 11px;
+  font-weight: 500;
+  opacity: .85;
+}
+
+.bot-defaults-page .bd-example-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 2px 16px 20px;
+}
+
+.bot-defaults-page .bd-example-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+
+.bot-defaults-page .bd-example-name {
+  color: var(--text);
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.bot-defaults-page .bd-example-short {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.bot-defaults-page .bd-example-tags {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  margin-top: 4px;
 }
 
-.bot-defaults-page .bd-mode-tag {
+.bot-defaults-page .bd-example-tag {
   padding: 2px 9px;
   border: 1px solid var(--border);
   border-radius: 7px;
   color: var(--muted);
-  font-size: 10.5px;
+  font-size: 11px;
   line-height: 1.5;
   white-space: nowrap;
 }
 
+/* 侧栏里的飞书截图：贴满内容宽，浅灰底 */
+.bot-defaults-page .bd-example-mock {
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.bot-defaults-page .bd-example-mock .bd-mock {
+  background: #f7f8fa;
+}
+
+/* 窄屏：底部抽屉 ≤90dvh，保留头部与切换区可见 */
+@media (max-width: 720px) {
+  .bot-defaults-page .bd-example-layer {
+    align-items: flex-end;
+  }
+  .bot-defaults-page .bd-example-panel {
+    width: 100%;
+    max-width: none;
+    height: 90dvh;
+    border-left: 0;
+    border-radius: 16px 16px 0 0;
+    animation: bd-example-slide-up .18s ease;
+  }
+  @keyframes bd-example-slide-up {
+    from { transform: translateY(32px); opacity: .4; }
+    to { transform: translateY(0); opacity: 1; }
+  }
+}
+
 /* ── 高保真迷你飞书聊天（.bd-mock*；固定浅色，模拟 App 截图） ── */
 .bot-defaults-page .bd-mock {
+  background: #f7f8fa;
+  color-scheme: light;
   --m-text: #1f2329;
   --m-name: #646a73;
   --m-muted: #8f959e;
@@ -25426,7 +25644,9 @@ dialog select[multiple]:hover:not(:disabled) {
   flex-direction: column;
   gap: 9px;
   min-width: 0;
-  flex: 1 1 auto;
+  padding: 12px;
+  container-type: inline-size;
+  container-name: bd-mode-mock;
   color: var(--m-text);
   font-size: 12px;
   line-height: 1.4;
@@ -25860,6 +26080,7 @@ dialog select[multiple]:hover:not(:disabled) {
   background: var(--m-link);
   color: #fff;
 }
+
 
 
 /* Reply-style overrides stay compact but explicit: every semantic layout gets
