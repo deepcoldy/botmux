@@ -431,6 +431,35 @@ describe('groups-store wrappers', () => {
     expect(chatManagersAddStub).toHaveBeenCalledTimes(2);
   });
 
+  it('addChatManagers fails fast when thrown error is AxiosError with permanent code in response.data.code', async () => {
+    const axiosError: any = new Error('Request failed with status code 403');
+    axiosError.code = 'ERR_BAD_REQUEST';
+    axiosError.response = { status: 403, data: { code: 99991672, msg: 'missing scope' } };
+    chatManagersAddStub.mockRejectedValue(axiosError);
+    const r = await addChatManagers('cli_creator', 'oc_chat', ['ou_bad'], 'open_id', { maxRetries: 2, retryDelayMs: 1 });
+    expect(r.ok).toBe(false);
+    expect(chatManagersAddStub).toHaveBeenCalledTimes(1);
+    if (!r.ok) expect(r.error).toMatch(/Request failed with status code 403/);
+  });
+
+  it('addChatManagers treats 40003 as transient internal error and retries', async () => {
+    chatManagersAddStub
+      .mockResolvedValueOnce({ code: 40003, msg: 'internal error' })
+      .mockResolvedValueOnce({ code: 0, data: { chat_managers: ['ou_m1'] } });
+    const r = await addChatManagers('cli_creator', 'oc_chat', ['ou_m1'], 'open_id', { retryDelayMs: 1 });
+    expect(r).toEqual({ ok: true, addedManagers: ['ou_m1'] });
+    expect(chatManagersAddStub).toHaveBeenCalledTimes(2);
+  });
+
+  it('addChatManagers falls back to retrying unknown error codes', async () => {
+    chatManagersAddStub
+      .mockResolvedValueOnce({ code: 88888888, msg: 'unknown error' })
+      .mockResolvedValueOnce({ code: 0, data: { chat_managers: ['ou_m1'] } });
+    const r = await addChatManagers('cli_creator', 'oc_chat', ['ou_m1'], 'open_id', { retryDelayMs: 1 });
+    expect(r).toEqual({ ok: true, addedManagers: ['ou_m1'] });
+    expect(chatManagersAddStub).toHaveBeenCalledTimes(2);
+  });
+
   it('addChatManagers catches thrown network errors and exhausts retries', async () => {
     chatManagersAddStub.mockRejectedValue(new Error('network timeout'));
     const r = await addChatManagers('cli_creator', 'oc_chat', ['ou_err'], 'open_id', { maxRetries: 1, retryDelayMs: 1 });

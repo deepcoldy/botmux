@@ -240,8 +240,9 @@ export class UserTokenMissingError extends Error {
 }
 
 /** Extract Lark error code from AxiosError or SDK error. */
-function getLarkErrorCode(err: any): number | undefined {
-  return err?.response?.data?.code ?? err?.code;
+export function getLarkErrorCode(err: any): number | undefined {
+  const code = err?.response?.data?.code ?? err?.code;
+  return typeof code === 'number' ? code : undefined;
 }
 
 const LARK_CODE_MESSAGE_WITHDRAWN = 230011;

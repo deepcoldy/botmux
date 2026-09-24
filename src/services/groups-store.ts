@@ -10,7 +10,7 @@
  * proxy selection happens at the route layer.
  */
 import { getBot, getBotClient, getOwnerOpenId } from '../bot-registry.js';
-import { larkGet, listChatBotMembers } from '../im/lark/client.js';
+import { larkGet, listChatBotMembers, getLarkErrorCode } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
 
 export interface ChatBrief {
@@ -265,12 +265,6 @@ export async function transferChatOwner(
 }
 
 /**
- * Add managers to a chat with bounded retries before failing.
- * The calling bot must currently be the owner of the chat.
- * Calls POST /open-apis/im/v1/chats/:chat_id/managers/add_managers
- * Accepts open_id, union_id, or user_id.
- */
-/**
  * 飞书群管 API 常见永久错误（权限未开通/缺失、非群主、群状态异常等），遇到后直接 fail-fast，不浪费重试预算。
  */
 export function isPermanentChatManagerErrorCode(code: number | undefined): boolean {
@@ -282,17 +276,17 @@ export function isPermanentChatManagerErrorCode(code: number | undefined): boole
     code === 232014 ||   // 群管理员人数已达上限
     code === 232018 ||   // 群类型不支持
     code === 232025 ||   // 仅群主可以添加管理员
-    code === 40001 ||    // token invalid
-    code === 40003       // 参数非法
+    code === 40001       // token invalid
   );
 }
 
 /**
- * 判断是否属于瞬时可重试的错误码（建群异步索引延迟、限频、服务端 5xx）。
+ * 判断是否属于瞬时可重试的错误码（建群异步索引延迟、服务端内部错误、限频、服务端 5xx）。
  */
 export function isTransientChatManagerErrorCode(code: number | undefined): boolean {
   return (
     code === 232011 ||   // 用户不在群聊中（建群后异步成员落库延迟，核心重试原因）
+    code === 40003 ||    // 服务端内部瞬时错误 (与 client.ts 约定一致)
     code === 429 ||      // 频控
     code === 99991400 || // 频控
     (typeof code === 'number' && code >= 500 && code < 600)
@@ -343,8 +337,7 @@ export async function addChatManagers(
         return { ok: true, addedManagers: added };
       }
       lastError = `${res.msg ?? 'unknown'} (code: ${res.code})`;
-      const isPermanent = isPermanentChatManagerErrorCode(res.code);
-      if (isPermanent || !isTransientChatManagerErrorCode(res.code)) {
+      if (isPermanentChatManagerErrorCode(res.code)) {
         logger.warn(
           `[groups-store] addChatManagers permanent error code=${res.code} (${res.msg}) for chat=${chatId.substring(0, 12)}, skipping retry`,
         );
@@ -352,8 +345,8 @@ export async function addChatManagers(
       }
     } catch (e: any) {
       lastError = e?.message ?? String(e);
-      const errCode = e?.code ?? e?.status;
-      if (typeof errCode === 'number' && isPermanentChatManagerErrorCode(errCode)) {
+      const errCode = getLarkErrorCode(e);
+      if (isPermanentChatManagerErrorCode(errCode)) {
         logger.warn(
           `[groups-store] addChatManagers permanent thrown error code=${errCode} for chat=${chatId.substring(0, 12)}, skipping retry`,
         );
