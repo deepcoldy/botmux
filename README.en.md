@@ -59,7 +59,7 @@ botmux start                 # start the daemon (botmux autostart enable for aut
 npm install -g botmux        # requires Node >= 22 to run the install itself
 ```
 
-The npm package carries **the same self-contained binary** (only the one matching your os/arch is installed); its postinstall points `~/.botmux/bin/botmux` at it and writes PATH the same way. So you end up with exactly **one** botmux version — no more "two Node versions each carrying their own global botmux, fighting each other / no idea which one I just updated".
+The npm package carries **the same self-contained binary** (only the one matching your os/arch is installed). The package's `bin` points at a shipped sh launcher that the package manager links onto PATH itself, so **npm, pnpm and bun all work without any lifecycle script** (pnpm 10/11 and bun skip dependency postinstalls by default, which used to leave those installs with no `botmux` command at all). The postinstall still points `~/.botmux/bin/botmux` at the same binary and writes PATH. So you still end up with exactly **one** botmux **version** — both entry points exec the same binary — and no more "two Node versions each carrying their own global botmux, fighting each other / no idea which one I just updated".
 
 The only difference is **who installs it**: the npm path needs Node ≥ 22 to run the install itself, the curl path never touches Node; **upgrades always re-run the curl command, no matter how you installed** (npm-upgrading from a pre-v3.18.0 install across that form boundary can leave the daemon unable to come back). Once running, the two are identical — same binary, same commands.
 

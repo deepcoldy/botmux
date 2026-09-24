@@ -69,7 +69,15 @@ pkg=$(cd "$(dirname "$target")/.." && pwd -P)
 # evidence only — never claim musl on a glibc box.
 libc=''
 if [ "$(uname -s)" = Linux ]; then
-  if ls /lib/ld-musl-* /usr/lib/ld-musl-* >/dev/null 2>&1 || [ -f /etc/alpine-release ]; then
+  # ⚠️ ONE `ls` PER DIRECTORY. `ls a/glob b/glob` exits non-zero when EITHER
+  # glob misses, i.e. it is an AND — and on real Alpine the loader lives only in
+  # /lib, so the combined form NEVER fired and only /etc/alpine-release saved it
+  # (MEASURED on alpine:3.20: combined → exit 1, per-dir OR → exit 0). That left
+  # a musl box without that file resolving to the glibc subpackage name. Same
+  # per-directory shape as install.sh, postinstall-bin.mjs and binary-self-update.ts.
+  if ls /lib/ld-musl-* >/dev/null 2>&1 \
+    || ls /usr/lib/ld-musl-* >/dev/null 2>&1 \
+    || [ -f /etc/alpine-release ]; then
     libc='-musl'
   fi
 fi

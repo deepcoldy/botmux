@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -41,7 +41,7 @@ function makeInstall(layout: 'nested' | 'sibling' | 'none'): { dir: string; main
   const main = join(nm, 'botmux');
   mkdirSync(join(main, 'scripts'), { recursive: true });
   // Copy rather than symlink: the launcher must work as a plain file too.
-  const body = spawnSync('cat', [LAUNCHER], { encoding: 'utf-8' }).stdout;
+  const body = readFileSync(LAUNCHER, 'utf-8');
   const shipped = join(main, 'scripts', 'botmux-launcher.sh');
   writeFileSync(shipped, body, { mode: 0o755 });
 

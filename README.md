@@ -59,7 +59,7 @@ botmux start                 # 启动 daemon（botmux autostart enable 设开机
 npm install -g botmux        # 需要 Node >= 22 装包本身
 ```
 
-npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的那一个），postinstall 把 `~/.botmux/bin/botmux` 指向它并同样写 PATH。所以装完只有**一个** botmux 版本，不再出现「装了两个 Node 版本、各自带一份全局 botmux 互相打架 / 不知道更新了哪个」。
+npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的那一个）。包的 `bin` 指向随包发布的 sh 启动器，由包管理器自己链到 PATH——**npm / pnpm / bun 三种装法都不依赖生命周期脚本**（pnpm 10/11 与 bun 默认不跑依赖的 postinstall，早期版本因此装完没有任何 `botmux` 命令）。postinstall 仍会把 `~/.botmux/bin/botmux` 指向同一个二进制并写 PATH。所以装完始终只有**一个** botmux **版本**（两个入口都 exec 同一个二进制），不再出现「装了两个 Node 版本、各自带一份全局 botmux 互相打架 / 不知道更新了哪个」。
 
 区别只在**谁来装**：npm 路径需要 Node ≥ 22 才能执行安装本身，curl 路径全程不碰 Node；**无论哪种装法，升级都重跑 curl**（v3.18.0 之前的老版本用 npm 跨形态升级会让 daemon 起不回来）。跑起来之后两者完全一致——同样的二进制、同样的命令。
 
