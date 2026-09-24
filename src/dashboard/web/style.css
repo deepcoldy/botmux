@@ -25307,6 +25307,7 @@ dialog select[multiple]:hover:not(:disabled) {
   flex-direction: column;
   justify-content: center;
   gap: 7px;
+  flex: 1 1 auto;
   min-height: 168px;
   padding: 11px;
   background: var(--m-tint);
@@ -25349,8 +25350,10 @@ dialog select[multiple]:hover:not(:disabled) {
   flex: 1;
 }
 
-/* 列内右气泡行占满整行，才能把蓝色气泡推到右边 */
-.bot-defaults-page .bd-mock-col .bd-mock-row-r {
+/* 列内右气泡行占满整行，才能把蓝色气泡推到右边（私聊）；
+   群左气泡行同样占满，气泡贴左 */
+.bot-defaults-page .bd-mock-col .bd-mock-row-r,
+.bot-defaults-page .bd-mock-col .bd-mock-row-g {
   width: 100%;
 }
 
@@ -25364,6 +25367,18 @@ dialog select[multiple]:hover:not(:disabled) {
 .bot-defaults-page .bd-mock-row-r {
   display: flex;
   justify-content: flex-end;
+}
+
+/* 群消息：飞书群里所有人的消息都贴左（头像 + 名字 + 蓝色气泡都在左侧）。 */
+.bot-defaults-page .bd-mock-row-g {
+  display: flex;
+  justify-content: flex-start;
+}
+
+.bot-defaults-page .bd-mock-bubble-g {
+  background: var(--m-bubble);
+  color: var(--m-text);
+  border-bottom-left-radius: 3px;
 }
 
 .bot-defaults-page .bd-mock-bubble {
@@ -25407,6 +25422,39 @@ dialog select[multiple]:hover:not(:disabled) {
 .bot-defaults-page .bd-mock-topic.is-fused {
   border-style: dashed;
   border-left-style: solid;
+}
+
+/* 共享会话模式：两个话题上下排（窄卡片里左右排会挤坏） */
+.bot-defaults-page .bd-mock-two-topics {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* 话题盒左上角的会话归属小标签（独立会话 / 共享会话 S1） */
+.bot-defaults-page .bd-mock-topic-stag {
+  align-self: flex-start;
+  border-radius: 999px;
+  padding: 0 7px;
+  background: color-mix(in srgb, var(--m-topic-bar) 16%, #fff);
+  color: color-mix(in srgb, var(--m-topic-bar) 72%, #55607a);
+  font-size: 8.5px;
+  font-weight: 700;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+
+/* 顶层平铺连续流的小标记 */
+.bot-defaults-page .bd-mock-flat-tag {
+  align-self: flex-start;
+  border-radius: 999px;
+  padding: 0 7px;
+  background: #eef1f6;
+  color: var(--m-name);
+  font-size: 8.5px;
+  font-weight: 700;
+  line-height: 1.6;
+  white-space: nowrap;
 }
 
 /* 飞书「回复消息」引用条 */

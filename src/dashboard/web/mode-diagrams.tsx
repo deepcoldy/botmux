@@ -151,10 +151,20 @@ function Mention(props: { children: ReactNode }): React.JSX.Element {
   return <span className="bd-mock-at">{props.children}</span>;
 }
 
+/** 私聊里人发的消息：靠右蓝色气泡（飞书 1:1 会话的真实布局）。 */
 function UserBubble(props: { children: ReactNode }): React.JSX.Element {
   return (
     <div className="bd-mock-row bd-mock-row-r">
       <span className="bd-mock-bubble bd-mock-bubble-r">{props.children}</span>
+    </div>
+  );
+}
+
+/** 群里人发的消息：飞书群里所有人的消息都在左边（头像 + 名字 + 蓝色气泡）。 */
+function GroupBubble(props: { children: ReactNode }): React.JSX.Element {
+  return (
+    <div className="bd-mock-row bd-mock-row-g">
+      <span className="bd-mock-bubble bd-mock-bubble-g">{props.children}</span>
     </div>
   );
 }
@@ -201,9 +211,22 @@ function QuoteReply(props: { to: string; quoted: string; children: ReactNode }):
   );
 }
 
-/** 话题容器：浅蓝圆角底板 = 一个飞书话题。 */
-function TopicBox(props: { children: ReactNode; fused?: boolean }): React.JSX.Element {
-  return <div className={cx('bd-mock-topic', props.fused && 'is-fused')}>{props.children}</div>;
+/**
+ * 话题容器：浅蓝圆角底板 = 一个飞书话题。
+ * tag：会话归属小标签（「独立会话」/「共享会话 S1」），把隔离/共享语义画出来。
+ */
+function TopicBox(props: { children: ReactNode; fused?: boolean; tag?: string; tone?: 'a' | 'b' | 'c' | 'd' }): React.JSX.Element {
+  return (
+    <div className={cx('bd-mock-topic', `bd-mock-tone-${props.tone ?? 'a'}`, props.fused && 'is-fused')}>
+      {props.tag ? <span className="bd-mock-topic-stag">{props.tag}</span> : null}
+      {props.children}
+    </div>
+  );
+}
+
+/** 顶层连续会话的小标记（不装在话题盒里的那段平铺消息）。 */
+function FlatStreamTag(props: { text: string }): React.JSX.Element {
+  return <div className="bd-mock-flat-tag">{props.text}</div>;
 }
 
 /** 「💬 回复话题」入口。 */
@@ -284,37 +307,47 @@ export function RegularMock(props: {
   const atMing = <Mention>@{person}</Mention>;
 
   if (props.mode === 'chat') {
+    // 消息模式：所有消息（含本来在话题里的追问）平铺成一条流，共用一个会话。
     return (
       <div className="bd-mock bd-mock-tone-c">
+        <FlatStreamTag text={tr('botDefaults.mock.tagOneSession')} />
         <PersonLine name={person}>
-          <UserBubble>{atBot} {tr('botDefaults.mock.hi')}</UserBubble>
+          <GroupBubble>{atBot} {tr('botDefaults.mock.hi')}</GroupBubble>
         </PersonLine>
         <BotLine name={bot}>
           <QuoteReply to={person} quoted={tr('botDefaults.mock.hi')}>
             {atMing} {tr('botDefaults.mock.greeting')}
           </QuoteReply>
         </BotLine>
-        <PersonLine name={person}>
-          <UserBubble>{atBot} {tr('botDefaults.mock.intro')}</UserBubble>
+        <PersonLine name={person} dim showName={false}>
+          <GroupBubble>{atBot} {tr('botDefaults.mock.intro')}</GroupBubble>
         </PersonLine>
+        <BotLine name={bot}>
+          <QuoteReply to={person} quoted={tr('botDefaults.mock.intro')}>{tr('botDefaults.mock.willExplain')}</QuoteReply>
+        </BotLine>
       </div>
     );
   }
 
   if (props.mode === 'shared') {
+    // 话题展示、共享会话：每条 @ 各开一个话题展示，但话题同色同标签 S1，
+    // 视觉上明确「话题分开、背后是同一个会话/上下文」。
     return (
       <div className="bd-mock bd-mock-tone-d">
-        <PersonLine name={person}>
-          <UserBubble>{atBot} {tr('botDefaults.mock.atCi')}</UserBubble>
-        </PersonLine>
         <div className="bd-mock-two-topics">
-          <TopicBox fused>
+          <TopicBox fused tag={`${tr('botDefaults.mock.tagSharedSession')} S1`}>
+            <PersonLine name={person}>
+              <GroupBubble>{atBot} {tr('botDefaults.mock.atCi')}</GroupBubble>
+            </PersonLine>
             <BotLine name={bot}>
               <QuoteReply to={person} quoted={tr('botDefaults.mock.atCi')}>{tr('botDefaults.mock.ciResult')}</QuoteReply>
             </BotLine>
             <ReplyTopicEntry />
           </TopicBox>
-          <TopicBox fused>
+          <TopicBox fused tag={`${tr('botDefaults.mock.tagSharedSession')} S1`}>
+            <PersonLine name={person}>
+              <GroupBubble>{atBot} {tr('botDefaults.mock.ciAlsoRelease')}</GroupBubble>
+            </PersonLine>
             <BotLine name={bot}>
               <QuoteReply to={person} quoted={tr('botDefaults.mock.ciAlsoRelease')}>{tr('botDefaults.mock.releaseAnswer')}</QuoteReply>
             </BotLine>
@@ -326,38 +359,61 @@ export function RegularMock(props: {
   }
 
   if (props.mode === 'new-topic') {
+    // 话题模式：一句话开一个话题——两条顶层 @ 各自生成一个独立话题，
+    // 不同色 + 「独立会话」标签，互不共享上下文。
     return (
       <div className="bd-mock bd-mock-tone-a">
-        <TopicBox>
+        <TopicBox tone="a" tag={`${tr('botDefaults.mock.tagIsolatedSession')} ①`}>
           <PersonLine name={person}>
-            <UserBubble>{atBot} {tr('botDefaults.mock.hi')}</UserBubble>
+            <GroupBubble>{atBot} {tr('botDefaults.mock.hi')}</GroupBubble>
           </PersonLine>
           <BotLine name={bot}>
             <QuoteReply to={person} quoted={tr('botDefaults.mock.hi')}>
               {atMing} {tr('botDefaults.mock.greeting')}
             </QuoteReply>
           </BotLine>
-          <PersonLine name={person} dim showName={false}>{tr('botDefaults.mock.intro')}</PersonLine>
+          <ReplyTopicEntry />
+        </TopicBox>
+        <TopicBox tone="d" tag={`${tr('botDefaults.mock.tagIsolatedSession')} ②`}>
+          <PersonLine name={person}>
+            <GroupBubble>{atBot} {tr('botDefaults.mock.atCi')}</GroupBubble>
+          </PersonLine>
+          <BotLine name={bot}>
+            <QuoteReply to={person} quoted={tr('botDefaults.mock.atCi')}>{tr('botDefaults.mock.ciResult')}</QuoteReply>
+          </BotLine>
           <ReplyTopicEntry />
         </TopicBox>
       </div>
     );
   }
 
-  // chat-topic（默认）
+  // chat-topic（默认）：
+  // - 上半段无底色平铺 = 顶层 @ 消息，你来我往是「连续会话」；
+  // - 下半段浅蓝话题盒 = 原生话题，独立会话（与顶层不互通），盒内两轮问答体现话题内连续。
   return (
     <div className="bd-mock bd-mock-tone-b">
+      <FlatStreamTag text={tr('botDefaults.mock.tagTopContinuous')} />
       <PersonLine name={person}>
-        <UserBubble>{atBot} {tr('botDefaults.mock.hi')}</UserBubble>
+        <GroupBubble>{atBot} {tr('botDefaults.mock.hi')}</GroupBubble>
       </PersonLine>
-      <TopicBox>
-        <BotLine name={bot}>
-          <QuoteReply to={person} quoted={tr('botDefaults.mock.hi')}>
-            {atMing} {tr('botDefaults.mock.greeting')}
-          </QuoteReply>
-        </BotLine>
-        <PersonLine name={person} dim showName={false}>{tr('botDefaults.mock.intro')}</PersonLine>
-        <BotLine name={bot}><BotBubble>{tr('botDefaults.mock.willExplain')}</BotBubble></BotLine>
+      <BotLine name={bot}>
+        <QuoteReply to={person} quoted={tr('botDefaults.mock.hi')}>
+          {atMing} {tr('botDefaults.mock.greeting')}
+        </QuoteReply>
+      </BotLine>
+      <PersonLine name={person} dim showName={false}>
+        <GroupBubble>{atBot} {tr('botDefaults.mock.intro')}</GroupBubble>
+      </PersonLine>
+      <BotLine name={bot}><BotBubble>{tr('botDefaults.mock.willExplain')}</BotBubble></BotLine>
+      <TopicBox tag={tr('botDefaults.mock.tagNativeTopicIsolated')}>
+        <PersonLine name={person}>
+          <GroupBubble>{tr('botDefaults.mock.topicTurn1')}</GroupBubble>
+        </PersonLine>
+        <BotLine name={bot}><BotBubble>{tr('botDefaults.mock.topicAns1')}</BotBubble></BotLine>
+        <PersonLine name={person} dim showName={false}>
+          <GroupBubble>{tr('botDefaults.mock.topicTurn2')}</GroupBubble>
+        </PersonLine>
+        <BotLine name={bot}><BotBubble>{tr('botDefaults.mock.topicAns2')}</BotBubble></BotLine>
         <ReplyTopicEntry />
       </TopicBox>
     </div>
@@ -376,10 +432,10 @@ export function MentionMock(props: {
   if (props.mode === 'topic') {
     return (
       <div className="bd-mock bd-mock-tone-b">
-        <PersonLine name={person}><UserBubble>{tr('botDefaults.mock.whoOnDuty')}</UserBubble></PersonLine>
+        <PersonLine name={person}><GroupBubble>{tr('botDefaults.mock.whoOnDuty')}</GroupBubble></PersonLine>
         <IgnoredNote text={tr('botDefaults.mock.ignoredTopLevel')} />
         <TopicBox>
-          <PersonLine name={person}><UserBubble>{tr('botDefaults.mock.keepGoing')}</UserBubble></PersonLine>
+          <PersonLine name={person}><GroupBubble>{tr('botDefaults.mock.keepGoing')}</GroupBubble></PersonLine>
           <BotLine name={bot}><BotBubble>{tr('botDefaults.mock.tookTopic')}</BotBubble></BotLine>
         </TopicBox>
       </div>
@@ -390,9 +446,9 @@ export function MentionMock(props: {
     return (
       <div className="bd-mock bd-mock-tone-c">
         <div className="bd-mock-badge">{tr('botDefaults.mock.noMentionBadge')}</div>
-        <PersonLine name={person}><UserBubble>{tr('botDefaults.mock.whoOnDuty')}</UserBubble></PersonLine>
+        <PersonLine name={person}><GroupBubble>{tr('botDefaults.mock.whoOnDuty')}</GroupBubble></PersonLine>
         <BotLine name={bot}><BotBubble>{tr('botDefaults.mock.onIt')}</BotBubble></BotLine>
-        <PersonLine name={person}><UserBubble>{tr('botDefaults.mock.statusNow')}</UserBubble></PersonLine>
+        <PersonLine name={person}><GroupBubble>{tr('botDefaults.mock.statusNow')}</GroupBubble></PersonLine>
         <BotLine name={bot}><BotBubble>{tr('botDefaults.mock.recovered')}</BotBubble></BotLine>
       </div>
     );
@@ -401,10 +457,10 @@ export function MentionMock(props: {
   if (props.mode === 'ambient') {
     return (
       <div className="bd-mock bd-mock-tone-d">
-        <PersonLine name={person}><UserBubble>{tr('botDefaults.mock.statusNow')}</UserBubble></PersonLine>
+        <PersonLine name={person}><GroupBubble>{tr('botDefaults.mock.statusNow')}</GroupBubble></PersonLine>
         <BotLine name={bot}><BotBubble>{tr('botDefaults.mock.recovered')}</BotBubble></BotLine>
         <PersonLine name={person}>
-          <UserBubble><Mention>@{tr('botDefaults.mock.peerName')}</Mention> {tr('botDefaults.mock.atPeer')}</UserBubble>
+          <GroupBubble><Mention>@{tr('botDefaults.mock.peerName')}</Mention> {tr('botDefaults.mock.atPeer')}</GroupBubble>
         </PersonLine>
         <IgnoredNote text={tr('botDefaults.mock.yieldNote')} />
       </div>
@@ -414,9 +470,9 @@ export function MentionMock(props: {
   // always（默认）
   return (
     <div className="bd-mock bd-mock-tone-a">
-      <PersonLine name={person}><UserBubble>{tr('botDefaults.mock.whoOnDuty')}</UserBubble></PersonLine>
+      <PersonLine name={person}><GroupBubble>{tr('botDefaults.mock.whoOnDuty')}</GroupBubble></PersonLine>
       <IgnoredNote text={tr('botDefaults.mock.ignoredNoMention')} />
-      <PersonLine name={person}><UserBubble><Mention>@agent-bot</Mention> {tr('botDefaults.mock.atLog')}</UserBubble></PersonLine>
+      <PersonLine name={person}><GroupBubble><Mention>@agent-bot</Mention> {tr('botDefaults.mock.atLog')}</GroupBubble></PersonLine>
       <BotLine name={bot}><BotBubble>{tr('botDefaults.mock.errorLine')}</BotBubble></BotLine>
     </div>
   );

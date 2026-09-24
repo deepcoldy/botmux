@@ -119,11 +119,11 @@ describe('mode mock screenshots', () => {
     }
   });
 
-  it('regular group: chat flat, chat-topic isolates one topic, new-topic wraps everything, shared shows two', () => {
+  it('regular group: chat flat, chat-topic isolates one topic, new-topic forks, shared shows two', () => {
     const counts = {
       chat: { topics: 0, fused: 0 },
       'chat-topic': { topics: 1, fused: 0 },
-      'new-topic': { topics: 1, fused: 0 },
+      'new-topic': { topics: 2, fused: 0 },
       shared: { topics: 2, fused: 2 },
     } as const;
     for (const [mode, expected] of Object.entries(counts) as Array<[keyof typeof counts, { topics: number; fused: number }]>) {
@@ -135,6 +135,26 @@ describe('mode mock screenshots', () => {
     const hybrid = render(React.createElement(RegularMock, { mode: 'chat-topic' }));
     expect(findByClass(hybrid, 'bd-mock-quote')).toHaveLength(1);
     expect(findByClass(hybrid, 'bd-mock-reply-topic')).toHaveLength(1);
+    // 顶层连续：flat 流有标记 + 2 个顶层 @；话题隔离+话题内连续：独立标签 + 盒内两轮
+    expect(findByClass(hybrid, 'bd-mock-flat-tag')).toHaveLength(1);
+    expect(findByClass(hybrid, 'bd-mock-topic-stag')).toHaveLength(1);
+    expect(findByClass(hybrid, 'bd-mock-topic')[0].findAll(node => classes(node).includes('bd-mock-bubble-g'))).toHaveLength(2);
+    // 一句话一话题：new-topic 两个话题各带「独立会话」标签
+    const fork = render(React.createElement(RegularMock, { mode: 'new-topic' }));
+    expect(findByClass(fork, 'bd-mock-topic-stag')).toHaveLength(2);
+    // 共享：两个话题都标同一会话 S1
+    const shared = render(React.createElement(RegularMock, { mode: 'shared' }));
+    const tags = findByClass(shared, 'bd-mock-topic-stag').map(n => n.children.join(''));
+    expect(tags).toEqual([expect.stringContaining('S1'), expect.stringContaining('S1')]);
+  });
+
+  it('regular group messages are all left-aligned (Feishu group layout), unlike DM right bubbles', () => {
+    const regular = render(React.createElement(RegularMock, { mode: 'chat-topic' }));
+    expect(findByClass(regular, 'bd-mock-bubble-g').length).toBeGreaterThan(0);
+    expect(findByClass(regular, 'bd-mock-bubble-r')).toHaveLength(0);
+    const dm = render(React.createElement(P2pMock, { mode: 'chat' }));
+    expect(findByClass(dm, 'bd-mock-bubble-r').length).toBeGreaterThan(0);
+    expect(findByClass(dm, 'bd-mock-bubble-g')).toHaveLength(0);
   });
 
   it('mention: always/topic/ambient show an ignored-or-yield note; never answers without one', () => {
