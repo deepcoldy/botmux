@@ -487,6 +487,9 @@ vi.mock('../src/services/oncall-store.js', () => ({
 // own open-mode / allowlist / peer-bot logic (that lives in event-dispatcher).
 vi.mock('../src/im/lark/event-dispatcher.js', () => ({
   canOperate: vi.fn(() => true),
+  // cross-ref bot 兜底腿默认 false（人类）；个别用例翻成 true 模拟「事件没盖
+  // app/bot、但 open_id 已在 peer 互导表里」的 bot。
+  isKnownPeerBot: vi.fn(() => false),
 }));
 
 vi.mock('../src/services/card-mode-store.js', () => ({
@@ -528,7 +531,7 @@ import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolS
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
-import { canOperate } from '../src/im/lark/event-dispatcher.js';
+import { canOperate, isKnownPeerBot } from '../src/im/lark/event-dispatcher.js';
 import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensureSessionWhiteboard, getAvailableBots, resumeSession } from '../src/core/session-manager.js';
 import * as sessionStore from '../src/services/session-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
@@ -1743,7 +1746,10 @@ describe('handleCommand', () => {
   // 理由是权限单调性——管理员本来就能 /close /restart 掉这个会话，"能销毁却不能
   // 拷贝一份"没有安全意义；fork 又是非破坏性的（源会话不动）。非管理员不受影响。
   describe('/fork 发起人闸 — 管理员例外', () => {
-    afterEach(() => { vi.mocked(canOperate).mockReturnValue(true); });
+    afterEach(() => {
+      vi.mocked(canOperate).mockReturnValue(true);
+      vi.mocked(isKnownPeerBot).mockReturnValue(false);
+    });
 
     it('非发起人且非管理员（canOperate=false）→ 拒，不建话题', async () => {
       vi.mocked(canOperate).mockReturnValue(false);
@@ -1812,6 +1818,47 @@ describe('handleCommand', () => {
       expect(forkSession).toHaveBeenCalled();
       // bot 过闸但不能被盖成 owner：childOwnerOpenId 缺省 ⟹ 子会话退回继承源真人 owner。
       expect(vi.mocked(forkSession).mock.calls[0][5]?.childOwnerOpenId).toBeUndefined();
+    });
+
+    it('事件没盖 app/bot 但 open_id 在 peer cross-ref 里的 bot 也不被盖成 owner（兜底腿）', async () => {
+      // daemon isForeignBotSender 是 senderType OR isKnownPeerBot 两条腿；这类消息仍被当
+      // bot 路由进 /fork。只判 senderType 会漏掉它，再把 bot 盖成 owner。
+      vi.mocked(isKnownPeerBot).mockReturnValue(true);
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_human_owner', cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/fork', ROOT_ID,
+        // senderType 留默认 'user'（模拟飞书没盖 app/bot 的边角），仅靠 cross-ref 认出 bot。
+        makeLarkMessage('/fork 接手排查', { threadId: 'omt_parent', senderId: 'ou_peer_bot' }),
+        deps, LARK_APP_ID,
+      );
+
+      expect(isKnownPeerBot).toHaveBeenCalled();
+      expect(forkSession).toHaveBeenCalled();
+      expect(vi.mocked(forkSession).mock.calls[0][5]?.childOwnerOpenId).toBeUndefined();
+    });
+
+    it('真人（非 cross-ref bot、senderType=user）管理员 fork 别人会话仍正常改记 owner', async () => {
+      // 反例守卫：加固不能把真人管理员也误判成 bot。isKnownPeerBot 默认 false。
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_other_user', cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/fork', ROOT_ID,
+        makeLarkMessage('/fork 接手排查', { threadId: 'omt_parent' }),
+        deps, LARK_APP_ID,
+      );
+
+      expect(vi.mocked(forkSession).mock.calls[0][5]).toMatchObject({ childOwnerOpenId: 'ou_sender' });
     });
   });
 

@@ -76,7 +76,7 @@ import { setCardMode } from '../services/card-mode-store.js';
 import { setChatStreamingCardPin } from '../services/pin-streaming-card-mode-store.js';
 import { setCotMode } from '../services/cot-mode-store.js';
 import { handleCotThinkingUpdate } from '../im/lark/cot-message.js';
-import { canOperate } from '../im/lark/event-dispatcher.js';
+import { canOperate, isKnownPeerBot } from '../im/lark/event-dispatcher.js';
 import { buildSafeInsightReport } from '../services/insight/report.js';
 import type { SafeInsightReport } from '../services/insight/types.js';
 import { invalidWorkingDirs } from '../utils/working-dir.js';
@@ -4181,10 +4181,14 @@ export async function handleCommand(
         // 下是「任何人含 peer bot」全放行，单看闸会把 bot 放进这条分支。而全仓维护着
         // 「ownerOpenId 必须是真人」的不变量（见 daemon isForeignBotSender：bot 当 owner
         // ⟹ owner-only 回复每次都 @ 醒它 ⟹ 自触发/重入循环，还漏 owner-gated 界面）。
-        // 判定与本文件 startForkSubtopicSession 的 senderIsBot 同款；bot 走这里时不下发
-        // childOwnerOpenId，子会话退回继承源 owner。闸本身不动——限制模式下非 operator
-        // 的 bot 仍被上面那条 canOperate 拒，不会因这里而漏进来。
-        const forkSenderIsBot = message.senderType === 'app' || message.senderType === 'bot';
+        // bot 判定要与 daemon isForeignBotSender 同口径，是两条腿的 OR：
+        //   ① 飞书盖章的 senderType=app/bot；
+        //   ② cross-ref 兜底——个别事件没盖 app/bot，但 open_id 已在 peer 互导表里
+        //      （daemon 仍按 bot 把它路由进斜杠闸，缺这腿会漏）。
+        // bot 走这里时不下发 childOwnerOpenId，子会话退回继承源 owner。闸本身不动——
+        // 限制模式下非 operator 的 bot 仍被上面那条 canOperate 拒，不会因这里而漏进来。
+        const forkSenderIsBot = message.senderType === 'app' || message.senderType === 'bot'
+          || isKnownPeerBot(config.session.dataDir, forkAppId, forkSenderOpenId);
         const forkChildOwnerOpenId = forkByAdminOfOthers && !forkSenderIsBot
           ? forkSenderOpenId
           : undefined;
