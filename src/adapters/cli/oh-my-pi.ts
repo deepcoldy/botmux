@@ -7,7 +7,7 @@ import type { CliAdapter, PtyHandle } from './types.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from '../backend/critical-control-key.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
-import { discoverOmpAppendSystemPrompt } from './append-system-discovery.js';
+import { piTurnBoundaryExtensionPath } from './pi.js';
 
 import { findLatestJsonl } from '../../services/claude-transcript.js';
 import { delay } from '../../utils/timing.js';
@@ -115,7 +115,10 @@ function submitEnter(pty: PtyHandle, attempts = 3): boolean {
 }
 
 /** Adapter for oh-my-pi coding agent's native TUI (`omp`). */
-export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
+export function createOhMyPiAdapter(
+  pathOverride?: string,
+  resolveExtensionPath: () => string | undefined = piTurnBoundaryExtensionPath,
+): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'omp');
   let composerDirty = false;
   let lastClearAttemptAt = 0;
@@ -191,12 +194,26 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
         replyDelivery: effectiveReplyDelivery,
         solo,
       });
-      const discovered = discoverOmpAppendSystemPrompt({ cwd: workingDir, env });
-      const finalAppendPrompt = discovered?.content?.trim()
-        ? `${discovered.content.trim()}\n\n${botmuxAppendPrompt}`
-        : botmuxAppendPrompt;
-      if (finalAppendPrompt) {
-        args.push('--append-system-prompt', finalAppendPrompt);
+
+      // Inject the Botmux routing prompt into the process environment so that
+      // the extension can append it during `before_agent_start`.
+      // We deliberately do NOT pass `--append-system-prompt` via argv: OMP's CLI
+      // disables native automatic discovery of project/user/foreign APPEND_SYSTEM.md
+      // whenever `--append-system-prompt` is present on argv, and ahead-of-time argv
+      // cannot predict complex profile/project/overlay Settings precedence. Appending
+      // via the extension after native discovery completes preserves 100% faithful
+      // native Settings resolution while cleanly injecting Botmux rules.
+      const turnBoundaryExt = resolveExtensionPath();
+      if (!turnBoundaryExt) {
+        throw new Error(
+          'Failed to resolve or materialize Pi turn-boundary extension for OMP; ' +
+          'refusing to start without extension to avoid suppressing native APPEND_SYSTEM.md discovery',
+        );
+      }
+      args.push('--extension', turnBoundaryExt);
+
+      if (env && botmuxAppendPrompt) {
+        env.BOTMUX_APPEND_SYSTEM_PROMPT = botmuxAppendPrompt;
       }
       return args;
     },

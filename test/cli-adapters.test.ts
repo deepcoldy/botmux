@@ -2080,8 +2080,8 @@ describe('pi buildArgs', () => {
     expect(skillArgs).toContain('/tmp/session-skills/skills');
   });
 
-  it('pi-turn-boundary-extension appends BOTMUX_APPEND_SYSTEM_PROMPT in before_agent_start', async () => {
-    let beforeAgentStartHandler: ((event: unknown) => { systemPrompt?: string } | void) | undefined;
+  it('pi-turn-boundary-extension appends BOTMUX_APPEND_SYSTEM_PROMPT in before_agent_start for Pi (string) and OMP (string array)', async () => {
+    let beforeAgentStartHandler: ((event: unknown) => { systemPrompt?: string | string[] } | void) | undefined;
     const mockPi = {
       on(event: string, handler: any) {
         if (event === 'before_agent_start') beforeAgentStartHandler = handler;
@@ -2093,8 +2093,13 @@ describe('pi buildArgs', () => {
 
     vi.stubEnv('BOTMUX_APPEND_SYSTEM_PROMPT', '<botmux_routing>bot rules</botmux_routing>');
     try {
-      const res = beforeAgentStartHandler!({ systemPrompt: 'BASE SYSTEM PROMPT' });
-      expect(res?.systemPrompt).toBe('BASE SYSTEM PROMPT\n\n<botmux_routing>bot rules</botmux_routing>');
+      // Pi passes string systemPrompt
+      const resString = beforeAgentStartHandler!({ systemPrompt: 'BASE SYSTEM PROMPT' });
+      expect(resString?.systemPrompt).toBe('BASE SYSTEM PROMPT\n\n<botmux_routing>bot rules</botmux_routing>');
+
+      // OMP passes string[] systemPrompt
+      const resArray = beforeAgentStartHandler!({ systemPrompt: ['PART 1', 'PART 2'] });
+      expect(resArray?.systemPrompt).toEqual(['PART 1', 'PART 2', '<botmux_routing>bot rules</botmux_routing>']);
     } finally {
       vi.unstubAllEnvs();
     }
@@ -2272,7 +2277,7 @@ describe('oh-my-pi buildArgs', () => {
     expect(args).not.toContain('--session-id');
   });
 
-  it('injects session context and builtin skills via --append-system-prompt and --plugin-dir', () => {
+  it('injects session context and builtin skills via extension env and --plugin-dir', () => {
     expect(adapter.injectsSessionContext).toBe(true);
     expect(adapter.pluginDir).toBe(OMP_PLUGIN_DIR);
     expect(adapter.skillDelivery).toEqual({
@@ -2281,6 +2286,7 @@ describe('oh-my-pi buildArgs', () => {
       supportsExclusive: false,
     });
 
+    const env: Record<string, string> = {};
     const args = adapter.buildArgs({
       sessionId: 'sess-omp',
       resume: false,
@@ -2288,6 +2294,7 @@ describe('oh-my-pi buildArgs', () => {
       botOpenId: 'ou_omp123',
       locale: 'zh',
       skillPluginDir: '/tmp/session-skills/claude-plugin',
+      env,
     });
 
     const pluginIdx = args.indexOf('--plugin-dir');
@@ -2297,71 +2304,48 @@ describe('oh-my-pi buildArgs', () => {
     expect(pluginArgs).toContain(OMP_PLUGIN_DIR);
     expect(pluginArgs).toContain('/tmp/session-skills/claude-plugin');
 
-    const promptIdx = args.indexOf('--append-system-prompt');
-    expect(promptIdx).toBeGreaterThanOrEqual(0);
-    expect(args[promptIdx + 1]).toContain('omp-bot');
-    expect(args[promptIdx + 1]).toContain('ou_omp123');
+    // Leaves --append-system-prompt off argv so OMP native Settings/discovery is preserved
+    expect(args).not.toContain('--append-system-prompt');
+    const extIdx = args.indexOf('--extension');
+    expect(extIdx).toBeGreaterThanOrEqual(0);
+    expect(args[extIdx + 1]).toBeTruthy();
+
+    expect(env.BOTMUX_APPEND_SYSTEM_PROMPT).toContain('omp-bot');
+    expect(env.BOTMUX_APPEND_SYSTEM_PROMPT).toContain('ou_omp123');
   });
 
-  it('preserves existing global APPEND_SYSTEM.md by prepending to single --append-system-prompt', () => {
-    mkdirSync(join(home, '.omp', 'agent'), { recursive: true });
-    writeFileSync(join(home, '.omp', 'agent', 'APPEND_SYSTEM.md'), 'USER_OMP_GLOBAL_SENTINEL');
-
-    const args = adapter.buildArgs({
-      sessionId: 'sess-omp',
+  it('throws when turnBoundaryExtension cannot be resolved or materialized for OMP', () => {
+    const adapterFailing = createOhMyPiAdapter('/bin/omp', () => undefined);
+    expect(() => adapterFailing.buildArgs({
+      sessionId: 'sess-omp-fail',
       resume: false,
-      botName: 'omp-bot',
-    });
-
-    const appendIndices = args.flatMap((arg, i) => arg === '--append-system-prompt' ? [i] : []);
-    expect(appendIndices.length).toBe(1);
-    const promptValue = args[appendIndices[0] + 1];
-    expect(promptValue).toContain('USER_OMP_GLOBAL_SENTINEL');
-    expect(promptValue).toContain('omp-bot');
-    expect(promptValue.indexOf('USER_OMP_GLOBAL_SENTINEL')).toBeLessThan(promptValue.indexOf('omp-bot'));
+    })).toThrow(/Failed to resolve or materialize Pi turn-boundary extension for OMP/);
   });
 
-  it('prefers project APPEND_SYSTEM.md over global in OMP', () => {
-    const tmpCwd = mkdtempSync(join(tmpdir(), 'omp-append-cwd-'));
-    mkdirSync(join(tmpCwd, '.omp'), { recursive: true });
-    writeFileSync(join(tmpCwd, '.omp', 'APPEND_SYSTEM.md'), 'USER_OMP_PROJECT_SENTINEL');
+  it('preserves native OMP system prompt array and appends Botmux routing in before_agent_start', () => {
+    let beforeAgentStartHandler: ((event: unknown) => { systemPrompt?: string | string[] } | void) | undefined;
+    const mockOmp = {
+      on(event: string, handler: any) {
+        if (event === 'before_agent_start') beforeAgentStartHandler = handler;
+      },
+      appendEntry() {},
+    };
+    registerBotmuxTurnBoundaryExtension(mockOmp as any);
+    expect(beforeAgentStartHandler).toBeDefined();
 
-    mkdirSync(join(home, '.omp', 'agent'), { recursive: true });
-    writeFileSync(join(home, '.omp', 'agent', 'APPEND_SYSTEM.md'), 'USER_OMP_GLOBAL_SENTINEL');
-
+    vi.stubEnv('BOTMUX_APPEND_SYSTEM_PROMPT', '<botmux_routing>omp rules</botmux_routing>');
     try {
-      const args = adapter.buildArgs({
-        sessionId: 'sess-omp',
-        resume: false,
-        workingDir: tmpCwd,
-        botName: 'omp-bot',
+      const res = beforeAgentStartHandler!({
+        systemPrompt: ['NATIVE_DISCOVERED_USER_RULES', 'NATIVE_BASE_RULES'],
       });
-
-      const appendIndices = args.flatMap((arg, i) => arg === '--append-system-prompt' ? [i] : []);
-      expect(appendIndices.length).toBe(1);
-      const promptValue = args[appendIndices[0] + 1];
-      expect(promptValue).toContain('USER_OMP_PROJECT_SENTINEL');
-      expect(promptValue).toContain('omp-bot');
-      expect(promptValue).not.toContain('USER_OMP_GLOBAL_SENTINEL');
+      expect(res?.systemPrompt).toEqual([
+        'NATIVE_DISCOVERED_USER_RULES',
+        'NATIVE_BASE_RULES',
+        '<botmux_routing>omp rules</botmux_routing>',
+      ]);
     } finally {
-      rmSync(tmpCwd, { recursive: true, force: true });
+      vi.unstubAllEnvs();
     }
-  });
-
-  it('forwards env with OMP_PROFILE for profile-specific APPEND_SYSTEM.md discovery', () => {
-    mkdirSync(join(home, '.omp', 'profiles', 'work', 'agent'), { recursive: true });
-    writeFileSync(join(home, '.omp', 'profiles', 'work', 'agent', 'APPEND_SYSTEM.md'), 'OMP_WORK_SENTINEL');
-
-    const args = adapter.buildArgs({
-      sessionId: 'sess-omp',
-      resume: false,
-      botName: 'omp-bot',
-      env: { OMP_PROFILE: 'work' },
-    });
-
-    const appendIndices = args.flatMap((arg, i) => arg === '--append-system-prompt' ? [i] : []);
-    expect(appendIndices.length).toBe(1);
-    expect(args[appendIndices[0] + 1]).toContain('OMP_WORK_SENTINEL');
   });
 
   it('rejects path-like session ids instead of escaping the managed OMP root', () => {

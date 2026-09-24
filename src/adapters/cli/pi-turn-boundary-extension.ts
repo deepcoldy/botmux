@@ -60,7 +60,7 @@ interface PiTurnBoundaryExtensionApi {
   on(event: 'session_start', handler: (event: unknown) => void): void;
   on(event: 'agent_end', handler: (event: unknown) => void): void;
   on(event: 'agent_settled', handler: (event: unknown) => void): void;
-  on(event: 'before_agent_start', handler: (event: unknown) => { systemPrompt?: string } | void | Promise<{ systemPrompt?: string } | void>): void;
+  on(event: 'before_agent_start', handler: (event: unknown) => { systemPrompt?: string | string[] } | void | Promise<{ systemPrompt?: string | string[] } | void>): void;
   appendEntry(customType: string, data?: unknown): void;
 }
 
@@ -137,7 +137,12 @@ export default function registerBotmuxTurnBoundaryExtension(pi: PiTurnBoundaryEx
       }
     }
     if (!prompt) return;
-    const current = (event as { systemPrompt?: string } | undefined)?.systemPrompt;
+    const current = (event as { systemPrompt?: string | string[] } | undefined)?.systemPrompt;
+    if (Array.isArray(current)) {
+      return {
+        systemPrompt: [...current, prompt],
+      };
+    }
     return {
       systemPrompt: current ? `${current}\n\n${prompt}` : prompt,
     };

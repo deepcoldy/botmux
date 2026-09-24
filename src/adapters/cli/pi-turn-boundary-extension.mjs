@@ -52,6 +52,11 @@ export default function registerBotmuxTurnBoundaryExtension(pi) {
     }
     if (!prompt) return;
     const current = event?.systemPrompt;
+    if (Array.isArray(current)) {
+      return {
+        systemPrompt: [...current, prompt],
+      };
+    }
     return {
       systemPrompt: current ? `${current}\n\n${prompt}` : prompt,
     };
