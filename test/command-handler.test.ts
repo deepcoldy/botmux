@@ -98,7 +98,7 @@ vi.mock('../src/services/role-profile-store.js', () => ({
 // Shells out to `bytedcli`; these tests are about what /status and /login SAY,
 // not about the real CLI being installed and logged in.
 vi.mock('../src/services/bytedcli-auth.js', () => ({
-  hasBytedcliHome: vi.fn(() => false),
+  hasBytedcliHome: vi.fn(async () => false),
   beginBytedcliLogin: vi.fn(async () => ({ authUrl: 'https://cloud.example.com/auth?state=x', completeToken: 'tok-1' })),
   completeBytedcliLogin: vi.fn(async () => ({ state: 'authorized' as const })),
   pendingBytedcliChallenge: vi.fn(() => null),
@@ -3369,7 +3369,7 @@ describe('handleCommand', () => {
       // an authorized Lark token says nothing about bytedcli. This sender has a
       // Lark token and no bytedcli login, and the two lines must disagree.
       it('reports bytedcli separately even when Lark is authorized', async () => {
-        vi.mocked(hasBytedcliHome).mockReturnValue(false);
+        vi.mocked(hasBytedcliHome).mockResolvedValue(false);
         const text = await statusText(
           statusWith({ enabled: true, tools: ['lark-cli', 'bytedcli'] }, true),
         );
@@ -3379,7 +3379,7 @@ describe('handleCommand', () => {
       });
 
       it('reports bytedcli as authorized once that person has logged in', async () => {
-        vi.mocked(hasBytedcliHome).mockReturnValue(true);
+        vi.mocked(hasBytedcliHome).mockResolvedValue(true);
         const text = await statusText(
           statusWith({ enabled: true, tools: ['bytedcli'] }, false),
         );
@@ -3387,7 +3387,7 @@ describe('handleCommand', () => {
       });
 
       it('does not call a merely pending device login authorized when there is no HOME', async () => {
-        vi.mocked(hasBytedcliHome).mockReturnValue(false);
+        vi.mocked(hasBytedcliHome).mockResolvedValue(false);
         vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-pending');
         try {
           const text = await statusText(
@@ -3403,7 +3403,7 @@ describe('handleCommand', () => {
       // With the soft-gate mint, a pending challenge never vetoes an existing
       // login — status must keep saying "authorized" while a fresh link is open.
       it('still reports authorized with a pending challenge atop an existing HOME', async () => {
-        vi.mocked(hasBytedcliHome).mockReturnValue(true);
+        vi.mocked(hasBytedcliHome).mockResolvedValue(true);
         vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-pending');
         try {
           const text = await statusText(
@@ -5607,7 +5607,7 @@ describe('handleCommand', () => {
 
       it('reports both sides already authorized with no pending challenge', async () => {
         vi.mocked(hasLarkCliHome).mockReturnValue(true);
-        vi.mocked(hasBytedcliHome).mockReturnValue(true);
+        vi.mocked(hasBytedcliHome).mockResolvedValue(true);
         try {
           const deps = makeDeps(makeDaemonSession());
           await handleCommand('/login', ROOT_ID, makeLarkMessage('/login done'), deps, LARK_APP_ID);
@@ -5619,7 +5619,7 @@ describe('handleCommand', () => {
           expect(text).toContain(t('cmd.login.bytedcli_status_yes', undefined, 'zh'));
         } finally {
           vi.mocked(hasLarkCliHome).mockReturnValue(false);
-          vi.mocked(hasBytedcliHome).mockReturnValue(false);
+          vi.mocked(hasBytedcliHome).mockResolvedValue(false);
         }
       });
 

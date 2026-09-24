@@ -1277,10 +1277,10 @@ function loginPromptLines(
  * has no bearing on — the reader then discovers otherwise only when a command
  * fails.
  */
-function triggerUserAuthStatusLines(
+async function triggerUserAuthStatusLines(
   botCfg: BotConfig,
   senderOpenId: string | undefined,
-): string[] {
+): Promise<string[]> {
   const policy = botCfg.triggerUserAuth;
   if (!policy?.enabled || !policy.tools.length) return [];
   const brand = normalizeBrand(botCfg.brand);
@@ -1309,8 +1309,8 @@ function triggerUserAuthStatusLines(
         // different verdict from the Lark line above — the same person can be
         // authorized for one and refused by the other. There is no bot identity
         // to degrade to here either; the mint path tries the existing HOME even
-        // while a fresh challenge is pending, so the verdict is just HOME/no.
-        : hasBytedcliHome(senderOpenId ?? '')
+        // while a fresh challenge is pending; ask the provider for the current status.
+        : await hasBytedcliHome(senderOpenId ?? '')
           ? '以你自己的身份调用'
           : '你未授权 —— 首次调用被拒时会自动返回登录链接'
     }`);
@@ -3171,7 +3171,7 @@ export async function handleCommand(
             // using RIGHT NOW. Shown only when the policy is on — otherwise the
             // answer is "the machine's", which is the historical behavior and
             // not something /status has ever claimed to report.
-            ...triggerUserAuthStatusLines(botCfg, message.senderId),
+            ...await triggerUserAuthStatusLines(botCfg, message.senderId),
           ];
           await sessionReply(rootId, lines.join('\n'));
         } else {
@@ -3344,7 +3344,7 @@ export async function handleCommand(
           // ByteCloud 是另一个身份提供方，飞书授权了不代表这边也授权了。
           if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'bytedcli')) {
             lines.push(t(
-              hasBytedcliHome(loginOpenId) && !pendingBytedcliChallenge(loginOpenId)
+              await hasBytedcliHome(loginOpenId)
                 ? 'cmd.login.bytedcli_status_yes'
                 : 'cmd.login.bytedcli_status_no',
               undefined,
@@ -3384,7 +3384,7 @@ export async function handleCommand(
               : state === 'pending'
                 ? t('cmd.login.bytedcli_pending', undefined, loc)
                 : t('cmd.login.bytedcli_failed', { detail: detail ?? 'unknown' }, loc));
-          } else if (hasBytedcliHome(loginOpenId)) {
+          } else if (await hasBytedcliHome(loginOpenId)) {
             doneLines.push(t('cmd.login.bytedcli_status_yes', undefined, loc));
           }
           if (!doneLines.length) doneLines.push(t('cmd.login.no_challenge', undefined, loc));
