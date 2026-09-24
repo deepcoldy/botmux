@@ -7,8 +7,8 @@
  * Run:  pnpm vitest run test/message-parser.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseApiMessage, extractResources, parseEventMessage, stripLeadingMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, extractAudioMeta, AUDIO_PLACEHOLDER, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
-import { buildMarkdownCard, buildReplyCardFooter } from '../src/im/lark/md-card.js';
+import { parseApiMessage, extractCardContent, extractResources, parseEventMessage, stripLeadingMentions, stripBotMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, extractAudioMeta, AUDIO_PLACEHOLDER, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
+import { buildMarkdownCard, buildReplyCardFooter, REPLY_CARD_FOOTER_MARKER } from '../src/im/lark/md-card.js';
 import { stampBotmuxCallbackMarkers, hasBotmuxCallbackMarker, BOTMUX_CALLBACK_MARKER_KEY } from '../src/im/lark/callback-button-marker.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
@@ -62,6 +62,17 @@ describe('parseApiMessage metadata', () => {
 // ─── Interactive card: Format A (Lark API simplified) ─────────────────────
 
 describe('Interactive card parsing: Format A (API simplified)', () => {
+  it('preserves the visible XPI choice token through card re-serialisation', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '请处理这项任务' },
+        { tag: 'text', text: '\n[botmux-as:v1:suggestion]' },
+      ]],
+    };
+    expect(parseApiMessage(makeMsg('interactive', card)).content)
+      .toContain('[botmux-as:v1:suggestion]');
+  });
+
   it('should extract title and text elements', () => {
     const card = {
       title: '🎁 Bits UT Defect Challenge | Leaderboard Update!',
@@ -671,6 +682,30 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
     expect(result.content).not.toContain('发送给');
   });
 
+  it('keeps a grey body line containing one U+2063 separator', () => {
+    const bodyLine = "<font color='grey'>注：U+2063 写作 a\u2063b</font>";
+    const raw = buildMarkdownCard(
+      ['结论如下', '', bodyLine, '', '请据此推进'].join('\n'),
+      'ou_owner',
+    );
+    const textB = extractCardContent(raw);
+    const result = mergeCardText(textB, textB);
+
+    expect(result).toContain('结论如下');
+    expect(result).toContain(bodyLine);
+    expect(result).toContain('请据此推进');
+    expect(result).not.toContain('发送给');
+  });
+
+  it('keeps a non-grey body line containing the full footer marker', () => {
+    const bodyLine = `正文包含不可见序列 a${REPLY_CARD_FOOTER_MARKER}b`;
+    const card = {
+      body: { elements: [{ tag: 'markdown', content: bodyLine }] },
+    };
+
+    expect(parseApiMessage(makeMsg('interactive', card)).content).toContain(bodyLine);
+  });
+
   it('round-trips standalone reply headings without losing section text', () => {
     const raw = buildMarkdownCard(
       '# 执行结果\n\n核心链路已验证。\n\n## 下一步\n\n请在飞书确认排版。',
@@ -915,6 +950,67 @@ describe('Interactive card parsing: botmux footer is stripped from prompt', () =
 // ─── Structural footer strip (brand-agnostic, for per-bot custom brands) ──
 
 describe('Interactive card parsing: footer stripped structurally (custom brand)', () => {
+  it('drops a current footer carrying the non-link text marker', () => {
+    const footer = buildReplyCardFooter({
+      brand: 'Acme',
+      recipientOpenIds: ['ou_owner'],
+    })!;
+    expect(footer.content).not.toContain('github.com/deepcoldy/bot%6Dux');
+
+    const card = {
+      schema: '2.0',
+      body: { elements: [
+        { tag: 'markdown', content: '正文内容' },
+        { tag: 'hr' },
+        footer.element,
+      ] },
+    };
+    expect(parseApiMessage(makeMsg('interactive', card)).content).toBe('正文内容');
+  });
+
+  it('drops the current text marker after Lark simplifies the card to Format A', () => {
+    const card = {
+      elements: [
+        [{ tag: 'text', text: '正文内容' }],
+        [
+          { tag: 'text', text: `Acme ·${REPLY_CARD_FOOTER_MARKER} 上下文 12.3K · 发送给：` },
+          { tag: 'at', user_name: 'Owner' },
+        ],
+      ],
+    };
+    expect(parseApiMessage(makeMsg('interactive', card)).content).toBe('正文内容');
+  });
+
+  it('keeps Format A body text containing only one U+2063 separator', () => {
+    const card = {
+      elements: [[
+        { tag: 'text', text: '正文 a\u2063b' },
+        { tag: 'text', text: ' 后续正文' },
+      ]],
+    };
+
+    expect(parseApiMessage(makeMsg('interactive', card)).content).toBe(
+      '正文 a\u2063b 后续正文',
+    );
+  });
+
+  it('drops a brand-disabled recipient-only footer without requiring a visible separator', () => {
+    const footer = buildReplyCardFooter({
+      brand: '',
+      recipientOpenIds: ['ou_owner'],
+    })!;
+    expect(footer.content).not.toContain('·');
+
+    const card = {
+      body: { elements: [
+        { tag: 'markdown', content: '正文内容' },
+        { tag: 'hr' },
+        footer.element,
+      ] },
+    };
+    expect(parseApiMessage(makeMsg('interactive', card)).content).toBe('正文内容');
+  });
+
   it.each([
     { name: 'without text_size', textSize: undefined },
     { name: 'with Card 2.0 notation', textSize: 'notation' },
@@ -1785,6 +1881,41 @@ describe('cmdQuoted shared-numberer invariant', () => {
     expect(resources).toEqual([{ type: 'image', key: 'img_zzz', name: 'img_zzz.jpg' }]);
     expect(parsed.content).toBe('[图片 1]');
   });
+
+  it('post with a top-level files array extracts the upload for download', () => {
+    // Real Feishu shape observed when a user attaches an MD file to a rich-text
+    // message: the body only carries the @ mention, while the upload descriptor
+    // is a sibling of `content`/`content_v2`. It must still reach the shared
+    // resource downloader; otherwise agents see the @ but no attachment path.
+    const postContent = JSON.stringify({
+      title: '',
+      content: [[{ tag: 'at', user_id: '@_user_1', user_name: 'agent' }]],
+      content_v2: [[{ tag: 'at', user_id: '@_user_1', user_name: 'agent' }]],
+      files: [{
+        file_key: 'file_v3_top_level',
+        file_name: 'brief.md',
+        is_folder: false,
+      }],
+    });
+    const msg = {
+      message_id: 'om_post_top_level_file',
+      msg_type: 'post',
+      create_time: '1000',
+      sender: { id: 'ou_u', sender_type: 'user' },
+      body: { content: postContent },
+    };
+
+    const numberer = createImgNumberer();
+    const resources = extractResources(msg.msg_type, msg.body.content, numberer);
+    const parsed = parseApiMessage(msg, numberer);
+
+    expect(resources).toEqual([{
+      type: 'file',
+      key: 'file_v3_top_level',
+      name: 'brief.md',
+    }]);
+    expect(parsed.content).toBe('@agent');
+  });
 });
 
 // ─── parseEventMessage: parentId surfacing for quote-reply ────────────────
@@ -2018,5 +2149,48 @@ describe('extractPostAtParticipants (post inline @ → routing-only participants
     expect(extractPostAtParticipants({ content: '{"text":"plain"}' })).toEqual([]);
     expect(extractPostAtParticipants({ content: 'not json' })).toEqual([]);
     expect(extractPostAtParticipants(undefined)).toEqual([]);
+  });
+});
+
+// ─── stripBotMentions（话题指令头的前置步骤：按身份剥、不限位置）─────────────
+
+describe('stripBotMentions', () => {
+  const SELF = { botOpenId: 'ou_self_bot', larkAppId: 'cli_self_app' };
+  const selfMention = { name: 'Claude', openId: 'ou_self_bot' };
+  const otherBot = { name: 'Codex', openId: 'ou_other_bot' };
+  const human = { name: '张三', openId: 'ou_human' };
+
+  it('剥掉句中与句尾的本 bot @', () => {
+    expect(stripBotMentions('标题 /t 干活 @Claude', [selfMention], SELF)).toBe('标题 /t 干活');
+    expect(stripBotMentions('标题 @Claude /t 干活', [selfMention], SELF)).toBe('标题 /t 干活');
+    expect(stripBotMentions('@Claude 标题 /t 干活 @Claude', [selfMention], SELF)).toBe('标题 /t 干活');
+  });
+
+  it('保留其他成员 / 其它 bot 的 @ —— 那是正文内容', () => {
+    expect(stripBotMentions('/t 让 @Codex 也看看 @Claude', [selfMention, otherBot], SELF))
+      .toBe('/t 让 @Codex 也看看');
+    expect(stripBotMentions('/t @张三 你怎么看 @Claude', [selfMention, human], SELF))
+      .toBe('/t @张三 你怎么看');
+  });
+
+  it('按 app_id 形式的 @ 也能认出自己', () => {
+    const appMention = { name: 'Claude', id: { app_id: 'cli_self_app' }, id_type: 'app_id' };
+    expect(stripBotMentions('/t 干活 @Claude', [appMention], SELF)).toBe('/t 干活');
+  });
+
+  it('长名字优先，避免短名把长名吃掉半截', () => {
+    const long = { name: 'Claude分身', openId: 'ou_self_bot' };
+    const short = { name: 'Claude', openId: 'ou_self_bot' };
+    expect(stripBotMentions('@Claude @Claude分身 /t 干活', [short, long], SELF)).toBe('/t 干活');
+  });
+
+  it('认不出本 bot（无 mentions / 全是别人）→ 原样返回', () => {
+    expect(stripBotMentions('/t 干活 @Claude', undefined, SELF)).toBe('/t 干活 @Claude');
+    expect(stripBotMentions('/t 干活 @Codex', [otherBot], SELF)).toBe('/t 干活 @Codex');
+  });
+
+  it('保留正文换行，只压同一行内的空白', () => {
+    expect(stripBotMentions('标题\n/t @Claude 第一行\n  第二行', [selfMention], SELF))
+      .toBe('标题\n/t 第一行\n  第二行');
   });
 });

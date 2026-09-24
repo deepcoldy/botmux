@@ -119,6 +119,14 @@ describe('API-only bot mode — runtime Feishu transport gates (source lock)', (
     expect(block).toContain('.filter(notApiOnly)');
   });
 
+  it('normalizes legacy document watches before restoring sessions can close them', () => {
+    const block = region(daemonSource, 'reapOrphanWorkers();', '// Close CoT thinking bubbles');
+    expect(block).toContain('normalizeDocNativeSubscriptionsBeforeSessionRestore(cfg.larkAppId)');
+    expect(block).toContain('restoreSessionsAndScheduleStartupRecovery({');
+    expect(block.indexOf('normalizeDocNativeSubscriptionsBeforeSessionRestore(cfg.larkAppId)'))
+      .toBeLessThan(block.indexOf('restoreSessionsAndScheduleStartupRecovery({'));
+  });
+
   it('gates doc-subscription restore + comment poller behind !cfg.apiOnly', () => {
     const block = region(daemonSource, '文档订阅恢复 + 评论轮询', 'Sweep orphan sandbox trees');
     expect(block).toContain('if (!cfg.apiOnly) {');
@@ -305,7 +313,7 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
   });
 
   it('scheduleCardPatch is a defense-in-depth no-op for no-transport sessions', () => {
-    const block = region(workerPoolSource, 'export function scheduleCardPatch(', 'if (streamingCardDisabled(ds, turnId)) return;');
+    const block = region(workerPoolSource, 'export function scheduleCardPatch(', 'if (streamingCardDisabled(ds, turnId)) return false;');
     expect(block).toContain('larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })');
   });
 
@@ -313,7 +321,7 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     const cliSource = readFileSync(resolve('src/cli.ts'), 'utf8');
     // The central gate is defined once and keys on apiOnly bot OR virtual chatId.
     const helper = region(cliSource, 'function currentTurnHasNoTransport(', 'function assertTurnTransportOrExit(');
-    expect(helper).toContain("chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')");
+    expect(helper).toContain('isHttpVirtualSession(chatId)');
     expect(helper).toContain('currentBotIsApiOnly(appId)');
     // Region-scoped per command (NOT file-wide contains): deleting the gate from
     // any ONE command's body must fail this test. Map op → (fn start, fn end).
@@ -352,8 +360,9 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     const originGate = region(cliSource, 'function managedOriginHasNoTransport(', '\n}\n');
     expect(originGate).toContain('resolveSessionContext(resolveDataDir(), process.env.BOTMUX_SESSION_ID)');
     expect(originGate).toContain('loadSessions().get(ctx.sessionId)');
+    expect(originGate).toContain('isHttpVirtualSession(chatId)');
     const sessGate = region(cliSource, 'function assertSessionTransportOrExit(', 'process.exit(2);\n}');
-    expect(sessGate).toContain("chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')");
+    expect(sessGate).toContain('isHttpVirtualSession(chatId)');
     expect(sessGate).toContain('currentBotIsApiOnly(session.larkAppId)');
   });
 
@@ -366,7 +375,7 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     // Region-scoped per route (NOT file-wide count): each write route's body
     // must call the gate, so deleting one seam fails.
     const routes: Array<[string, string, string]> = [
-      ['chat-rename', "ipcRoute('POST', '/api/sessions/:sessionId/chat-rename'", 'groupsStore.renameChat('],
+      ['chat-rename', "ipcRoute('POST', '/api/sessions/:sessionId/chat-rename'", 'executeChatRename('],
       ['write-link-card', "ipcRoute('POST', '/api/sessions/:sessionId/write-link-card'", 'deliverWriteLinkCardToOwners(ds)'],
       ['locate', "ipcRoute('POST', '/api/sessions/:sessionId/locate'", 'sendSessionOwnerThreadNotification('],
     ];
@@ -435,7 +444,7 @@ describe('API-only bot mode — bot-level primitive boundary (source lock)', () 
     // that could never be wrapped, so a no-transport turn must cold-start instead.
     const gate = region(wp, 'export function adoptSandboxBlocked(', 'export function forkAdoptWorker(');
     expect(gate).toContain('botCfg.apiOnly === true');
-    expect(gate).toContain("session.chatId.startsWith('http_async_') || session.chatId.startsWith('http_wait_')");
+    expect(gate).toContain('isHttpVirtualSession(session?.chatId)');
   });
 });
 
@@ -602,6 +611,23 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
     expect(workerSource).toContain('no-transport suppressed');
   });
 
+  it('worker injects a host CA bundle for sandboxed Codex without overriding an explicit value', () => {
+    // Candidate list and selection rules are behaviour, covered by
+    // test/darwin-ca-bundle.test.ts. What can only be asserted here is the
+    // WIRING: both Codex cliIds, sandbox-only, explicit value wins, and the
+    // worker's own logger carries the writable-bundle warning.
+    expect(workerSource).toContain("from './utils/darwin-ca-bundle.js'");
+    // Assert both cliIds are covered, not the exact clause text: swapping the
+    // two sides of `||` is semantically identical and must not fail this.
+    expect(workerSource).toContain("cfg.cliId === 'codex'");
+    expect(workerSource).toContain("cfg.cliId === 'codex-app'");
+    // Operator precedence: childEnv starts from the daemon env, so an
+    // operator-supplied SSL_CERT_FILE is what this guard preserves.
+    expect(workerSource).toContain('&& !childEnv.SSL_CERT_FILE');
+    expect(workerSource).toContain('resolveDarwinCodexCaBundle({ warn: log })');
+    expect(workerSource).toContain('if (caBundle) childEnv.SSL_CERT_FILE = caBundle;');
+  });
+
   it('persistent-pane guard: state-machine + injectable executor wiring (behavioral tests in read-isolation)', () => {
     // The reattach guard delegates the DECISION to evaluatePersistentPaneMigration
     // and the ORDERED, fail-closed side effects to executePersistentPaneMigration.
@@ -680,15 +706,15 @@ describe('API-only bot mode — no-transport fs-policy authority provenance (wor
     // CRITICAL: must NOT name-only kill — an isolated/MCP herdr agent lives on the
     // SHARED host session `botmux`, so a name-only killPersistentSession('herdr',
     // 'botmux') would tear down every bot's agent. Mirror the migration effects:
-    // target helper for herdr's agent scope, frozen-PID path for ZMX identity.
+    // target helper for herdr's agent scope, frozen PID + socket dir for ZMX identity.
     const teardown = region(commitBlock,
       'const teardownTarget = selectedBackend.persistentBackendTarget;', 'Condition #2:');
     // Dispatches on the pure, behaviorally-tested policy (read-isolation.test.ts).
     expect(teardown).toContain('persistentTeardownKillKind({');
     expect(teardown).toContain('killPersistentBackendTarget(teardownTarget!, cfg.sessionId)');
     expect(teardown).toContain('probePersistentBackendTarget(teardownTarget!)');
-    expect(teardown).toContain('ZmxBackend.killManagedSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid)');
-    expect(teardown).toContain('probeOwnedZmxSession(persistentSessionName, cfg.sessionId).probe');
+    expect(teardown).toContain('ZmxBackend.killManagedSession(persistentSessionName, cfg.sessionId, resolvedZmxSessionPid, zmxEnv(process.env, resolvedZmxSocketDir))');
+    expect(teardown).toContain('probeOwnedZmxSession(persistentSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe');
     expect(teardown).toContain("postKill !== 'missing'");
     expect(teardown).toContain('pending proof retained');
 
@@ -769,7 +795,7 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // after restore, ready line last.
     const armAt = daemonSource.indexOf('armCoreOnlyReadinessGate()');
     const bindAt = daemonSource.indexOf('const ipcHandle = await startIpcServer(');
-    const restoreAt = daemonSource.indexOf('await restoreActiveSessions(activeSessions');
+    const restoreAt = daemonSource.indexOf('await restoreSessionsAndScheduleStartupRecovery({');
     const readyAt = daemonSource.indexOf('setCoreOnlyReady()');
     const readyLineAt = daemonSource.indexOf('[core-only] listening on 127.0.0.1:');
     expect(armAt).toBeGreaterThan(0);
@@ -777,6 +803,43 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(restoreAt).toBeGreaterThan(bindAt);
     expect(readyAt).toBeGreaterThan(restoreAt);        // release AFTER restore
     expect(readyLineAt).toBeGreaterThan(readyAt);      // ready line after release
+
+    const helperCall = region(
+      daemonSource,
+      'await restoreSessionsAndScheduleStartupRecovery({',
+      '\n\n  // Close CoT thinking bubbles orphaned by the previous daemon generation',
+    );
+    expect(helperCall).toContain(
+      'restoreSessions: () => restoreActiveSessions(activeSessions, idempotencyQuarantinedSessionIds, {',
+    );
+    expect(helperCall).toContain(
+      'prepareTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),',
+    );
+    expect(helperCall).toContain('markSessionsRestored: () => {');
+    expect(helperCall).toContain('sessionsRestored = true;');
+
+    // Supplemental ordering guard only; this assertion does not prove callback
+    // delivery semantics and must not be treated as load-bearing evidence.
+    const dispatcherStartAt = daemonSource.indexOf(
+      'for (const startDispatcher of startEventDispatchers) startDispatcher();',
+    );
+    const quarantineNoticeAt = daemonSource.indexOf(
+      'for (const notice of startupXpiQuarantineNotices)',
+    );
+    expect(dispatcherStartAt).toBeGreaterThan(restoreAt);
+    expect(quarantineNoticeAt).toBeGreaterThan(dispatcherStartAt);
+
+    const helperBody = region(
+      daemonSource,
+      'async function restoreSessionsAndScheduleStartupRecovery(opts: {',
+      '\n}\n/** Once-per-daemon guard for the mojo containment boot reconciliation.',
+    );
+    const helperAwaitRestoreAt = helperBody.indexOf('await opts.restoreSessions();');
+    const helperScheduleAt = helperBody.indexOf('scheduleRestoredStreamingCardPinRecovery(opts.larkAppId);');
+    const helperMarkReadyAt = helperBody.indexOf('opts.markSessionsRestored();');
+    expect(helperAwaitRestoreAt).toBeGreaterThan(0);
+    expect(helperScheduleAt).toBeGreaterThan(helperAwaitRestoreAt);
+    expect(helperMarkReadyAt).toBeGreaterThan(helperScheduleAt);
   });
 
   it('P1-4: core-only forces terminal proxy + worker HTTP to loopback (unconditional)', () => {
@@ -788,6 +851,34 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(entrySource).toContain('delete process.env.BOTMUX_WORKER_HOST;');
     // NOT gated on "only when unset" anymore.
     expect(entrySource).not.toContain('if (!process.env.BOTMUX_WORKER_HTTP_HOST');
+  });
+
+  it('stamps the turn sender type onto the trusted caller at both IM entry points', () => {
+    // A bot's turn carries a perfectly valid union_id (its own), so a consumer
+    // cannot tell "a person asked" from "a bot triggered itself" unless the host
+    // says which it was. Both inbound paths must therefore pass it — a missed
+    // one silently degrades to "unknown" exactly where a bot could slip through.
+    expect(daemonSource).toContain('senderIsBot?: boolean,');
+    expect(daemonSource).toContain("senderType: senderIsBot ? 'bot' as const : 'user' as const");
+    // Pin the SEMANTICS, not the argument's spelling: every call must pass a
+    // non-empty 4th argument, and it must be the tri-state helper rather than a
+    // bare `sender_type` comparison — that one reads a cross-ref-identified peer
+    // bot as `'user'`, i.e. it vouches for a bot turn as a person.
+    const trustedCallerArgs = [...daemonSource.matchAll(/trustedCallerForTurn\(([^;]*?)\);/g)]
+      .map(m => m[1].split(',').map(part => part.trim()));
+    // handleNewTopic, principal-lane live suggestion, and handleThreadReply.
+    expect(trustedCallerArgs.length).toBe(3);
+    for (const args of trustedCallerArgs) {
+      expect(args.length).toBeGreaterThanOrEqual(4);
+      const senderTypeArg = args.slice(3).join(', ');
+      expect(senderTypeArg).not.toBe('');
+      expect(senderTypeArg).toContain('senderIsBotTriState(');
+      expect(senderTypeArg).not.toMatch(/^isBotSenderType\)?$/);
+      // ...and the cross-ref leg must actually be wired in: passing a literal
+      // `false` there keeps the helper name but drops peer-bot recognition,
+      // which is the exact case a bare `sender_type` check already missed.
+      expect(senderTypeArg).toContain('isForeignBot');
+    }
   });
 
   it('P1-2: entrypoint strips BOTS_CONFIG so no worker fork inherits it', () => {
@@ -834,6 +925,7 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(block).toContain('startMaintenance();');
     expect(block).toContain('startCliRuntimeUpdateMonitor(');
     expect(block).toContain('sendRestartReportIfPending(');
+    expect(block).toContain('notifyOnRestart: readGlobalConfig().maintenance?.notifyOnRestart !== false,');
   });
 
   it('P1(3rd round): core-only does NOT write shared-HOME .data-dir breadcrumb or ~/.botmux/bin wrapper', () => {

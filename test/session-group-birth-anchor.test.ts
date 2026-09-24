@@ -144,6 +144,7 @@ import {
   CurrentTurnProvenanceError,
 } from '../src/core/current-turn-provenance.js';
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import type { RoutingContext } from '../src/im/lark/event-dispatcher.js';
 
 const APP = 'sg_anchor_app';
@@ -341,12 +342,12 @@ describe('session-group birth first-turn anchoring (image/file/merge_forward)', 
     }
 
     // Now run the REAL resolver end-to-end: persist the exact session object
-    // the daemon just built (what sessions.json would contain), plus a real
-    // authenticated ancestor marker for THIS test process — its own pid and
-    // true procStart — carrying the fork turnId.
+    // the daemon just built into a real SQLite session store (the only engine
+    // the resolver reads), plus a real authenticated ancestor marker for THIS
+    // test process — its own pid and true procStart — carrying the fork turnId.
     const provDir = join(mocks.dataDir, `prov-${session.sessionId}`);
     mkdirSync(join(provDir, '.botmux-cli-pids'), { recursive: true });
-    writeFileSync(join(provDir, 'sessions.json'), JSON.stringify({ [session.sessionId]: session }));
+    seedPersistedSessionRows(provDir, APP, { [session.sessionId]: session });
     const procStart = readProcessStartIdentity(process.pid);
     expect(procStart).toBeTruthy();
     const writeMarker = (turnId: string) => writeFileSync(

@@ -66,6 +66,44 @@ describe('writeBotsJsonAtomic', () => {
     writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_t' }]);
     expect(existsSync(join(tmpDir, 'bots.json'))).toBe(true);
   });
+
+  it('rejects a cloned next generation that would create a fallback cycle', () => {
+    writeBotsJsonAtomic(botsPath, [{ larkAppId: 'cli_safe' }]);
+    const before = readFileSync(botsPath, 'utf8');
+    expect(() => writeBotsJsonAtomic(botsPath, [
+      { larkAppId: 'cli_a', quotaFallbackBot: { enabled: true, targetAppId: 'cli_b' } },
+      { larkAppId: 'cli_b', quotaFallbackBot: { enabled: true, targetAppId: 'cli_a' } },
+    ])).toThrow('cli_a -> cli_b -> cli_a');
+    expect(readFileSync(botsPath, 'utf8')).toBe(before);
+  });
+
+  it('rejects setup writes that retain Codex browser config after switching CLI', () => {
+    const original = {
+      larkAppId: 'cli_browser',
+      cliId: 'codex-app',
+      codexBrowser: { enabled: true, family: 'chrome' },
+    };
+    writeBotsJsonAtomic(botsPath, [original]);
+    const before = readFileSync(botsPath, 'utf8');
+
+    expect(() => writeBotsJsonAtomic(botsPath, [{ ...original, cliId: 'claude-code' }]))
+      .toThrow('codex_browser_requires_codex_app');
+    expect(readFileSync(botsPath, 'utf8')).toBe(before);
+  });
+
+  it('allows editing another bot when an unchanged legacy entry violates an invariant', () => {
+    const legacyInvalid = {
+      larkAppId: 'cli_legacy',
+      cliId: 'claude-code',
+      codexBrowser: { enabled: true, family: 'chrome' },
+    };
+    const editable = { larkAppId: 'cli_editable', cliId: 'codex-app', lang: 'en' };
+    writeFileSync(botsPath, JSON.stringify([legacyInvalid, editable], null, 2));
+
+    expect(() => writeBotsJsonAtomic(botsPath, [legacyInvalid, { ...editable, lang: 'zh' }]))
+      .not.toThrow();
+    expect(readBotsJsonOrEmpty(botsPath)[1].lang).toBe('zh');
+  });
 });
 
 describe('readBotsJsonOrEmpty', () => {

@@ -160,7 +160,21 @@ console.log('CLI-less reap of a live legacy fleet:');
     const st = close < 0 ? '' : (raw.slice(close + 1).trim().split(/\s+/)[0] || '');
     return st !== '' && st !== 'Z';
   };
+  const cmdlineOf = (pid) => {
+    try { return readFileSync(`/proc/${pid}/cmdline`, 'utf-8').replace(/\0+$/, '').split('\0').join(' ').trim(); }
+    catch { return ''; }
+  };
+  const waitCmd = (pid, needle) => {
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline) {
+      if (cmdlineOf(pid).includes(needle) && alive(pid)) return;
+      spin(20);
+    }
+    throw new Error(`pid ${pid} cmdline never contained ${JSON.stringify(needle)}`);
+  };
   check('fixture: god alive', alive(god.pid), true);
+  waitCmd(god.pid, 'God Daemon');
+  waitCmd(parseInt(readFileSync(pidFile, 'utf-8').trim(), 10), 'index-daemon');
 
   const r = reapLegacyPm2(configDir, pkgRoot, () => {});
   spin(700);   // let any pending respawn fire

@@ -35,6 +35,7 @@ import {
   strongHandleFromPreparedBoundary,
 } from '../src/core/mojo-containment.js';
 import { isLinux } from './helpers/synthetic-proc.js';
+import { killFixturePid, waitForPidFile } from './helpers/pid-file.js';
 
 let dataDir: string;
 let prevDataDir: string | undefined;
@@ -49,7 +50,7 @@ beforeEach(() => {
 afterEach(() => {
   if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
   else process.env.SESSION_DATA_DIR = prevDataDir;
-  for (const pid of strays.splice(0)) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
+  for (const pid of strays.splice(0)) killFixturePid(pid);
   rmSync(dataDir, { recursive: true, force: true });
 });
 
@@ -242,8 +243,7 @@ describe.runIf(delegated)('real cgroup v2: pre-registration fork escape (layer 3
     const child = spawn('/bin/sh', [
       '-c', MOJO_CGROUP_ENROLL_SHIM, 'enroll', `${prepared.cgroupPath}/cgroup.procs`, escape,
     ]);
-    expect(await waitFor(() => existsSync(pidFile))).toBe(true);
-    const escapee = Number(readFileSync(pidFile, 'utf8').trim());
+    const escapee = await waitForPidFile(pidFile);
     strays.push(escapee);
     await waitFor(() => child.exitCode !== null);
 

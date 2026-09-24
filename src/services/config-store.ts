@@ -4,7 +4,15 @@
  */
 import { promises as fsp } from 'node:fs';
 import { getLoadedConfigPath } from '../bot-registry.js';
+import { assertQuotaFallbackGraphAcyclic } from './quota-fallback.js';
 import { withFileLock } from '../utils/file-lock.js';
+import { assertCodexInstanceConfigWrite } from './codex-instance-config-guard.js';
+import {
+  assertChangedBotConfigInvariants,
+  botConfigInvariantError,
+} from './bot-config-invariants.js';
+export { botConfigInvariantError } from './bot-config-invariants.js';
+export type { BotConfigInvariantError } from './bot-config-invariants.js';
 
 export async function readRawConfig(path: string): Promise<any[]> {
   const raw = JSON.parse(await fsp.readFile(path, 'utf-8'));
@@ -13,6 +21,13 @@ export async function readRawConfig(path: string): Promise<any[]> {
 }
 
 export async function writeRawConfigAtomic(path: string, raw: any[]): Promise<void> {
+  let previous: any[] = [];
+  try { previous = await readRawConfig(path); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  assertCodexInstanceConfigWrite(previous, raw);
+  assertChangedBotConfigInvariants(previous, raw);
+  // Validate the complete next generation, not the currently loaded registry.
+  // Callers invoke this while holding the cross-process lock.
+  assertQuotaFallbackGraphAcyclic(raw);
   const tmp = path + '.tmp.' + process.pid;
   // bots.json 含 appSecret —— 临时文件即以 0o600 写入，rename 后保持私有权限。
   await fsp.writeFile(tmp, JSON.stringify(raw, null, 2) + '\n', { encoding: 'utf-8', mode: 0o600 });
@@ -46,9 +61,15 @@ export async function rmwBotEntry<T>(
     const out = mutate(entry, raw);
     if (out && typeof out === 'object' && 'write' in (out as any)) {
       const wrap = out as { write: boolean; result: T };
-      if (wrap.write) await writeRawConfigAtomic(path, raw);
+      if (wrap.write) {
+        const invariantError = botConfigInvariantError(entry);
+        if (invariantError) return { ok: false, reason: invariantError };
+        await writeRawConfigAtomic(path, raw);
+      }
       return { ok: true, result: wrap.result };
     }
+    const invariantError = botConfigInvariantError(entry);
+    if (invariantError) return { ok: false, reason: invariantError };
     await writeRawConfigAtomic(path, raw);
     return { ok: true, result: out as T };
   });

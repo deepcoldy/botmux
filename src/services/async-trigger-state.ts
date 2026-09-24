@@ -1,5 +1,5 @@
 /**
- * Pure four-state resolution for `GET /api/sessions/:id/trigger-result`
+ * Pure async-state resolution for `GET /api/sessions/:id/trigger-result`
  * (async dispatch design A). Kept free of daemon/registry imports so it can be
  * unit-tested directly; dashboard-ipc-server gathers the three inputs (live
  * session, on-disk session record, persisted async result) and calls this.
@@ -9,6 +9,7 @@
  *  - running:   live session in flight, or a session record still open
  *  - failed:    session record closed with no captured output (no_output; soft
  *               terminal — may be a genuine failure OR a caller-initiated close)
+ *  - interrupted: caller stopped this exact turn while keeping its session open
  *  - not_found: no session record anywhere (never existed / invalid id)
  *
  * Restart guarantee: as long as EITHER a session record OR a persisted result
@@ -77,13 +78,14 @@ export interface AsyncStateInputs {
   chatId?: string;
   /** In-memory async result for the resolved trigger, if the session is live. */
   memResult?: {
-    status: 'pending' | 'completed' | 'failed';
+    status: 'pending' | 'completed' | 'failed' | 'interrupted';
     content?: string;
     completedAt?: number;
     failedAt?: number;
     errorCode?: 'trigger_failed';
     terminalErrorCode?: string;
     usage?: TurnUsageBuckets;
+    interruptedAt?: number;
   };
   /** triggerId the in-memory result is keyed under (latest or explicit). */
   memTriggerId?: string;
@@ -91,7 +93,7 @@ export interface AsyncStateInputs {
   persisted?: {
     triggerId: string;
     result: {
-      status: 'pending' | 'completed' | 'failed';
+      status: 'pending' | 'completed' | 'failed' | 'interrupted';
       content?: string;
       completedAt?: number;
       usage?: TurnUsageBuckets;
@@ -101,6 +103,7 @@ export interface AsyncStateInputs {
       errorCode?: 'no_output' | 'trigger_failed';
       reason?: 'dispatch_unknown' | 'turn_terminal';
       terminalErrorCode?: string;
+      interruptedAt?: number;
     };
   };
   /** On-disk session record status: 'open' (active), 'closed', or absent. */
@@ -157,6 +160,22 @@ export function resolveAsyncTriggerState(inp: AsyncStateInputs): TriggerResponse
       finishedAt,
       async: { status: 'completed', sessionId, completedAt: finishedAt },
       message: 'async trigger completed',
+    };
+  }
+
+  const interrupted = inp.memResult?.status === 'interrupted' && inp.memTriggerId
+    ? { triggerId: inp.memTriggerId, interruptedAt: inp.memResult.interruptedAt }
+    : inp.persisted?.result.status === 'interrupted'
+      ? { triggerId: inp.persisted.triggerId, interruptedAt: inp.persisted.result.interruptedAt }
+      : undefined;
+  if (interrupted) {
+    return {
+      ok: true,
+      state: 'interrupted',
+      triggerId: interrupted.triggerId,
+      target: { kind: 'turn', sessionId, chatId },
+      finishedAt: interrupted.interruptedAt ? new Date(interrupted.interruptedAt).toISOString() : undefined,
+      message: 'async trigger interrupted',
     };
   }
 

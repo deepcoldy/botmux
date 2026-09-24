@@ -26,6 +26,9 @@ describe('botmux capabilities contract', () => {
         stable_dispatch_acceptance_v1: true,
         managed_activation_v2: true,
         current_actor_v2: true,
+        headless_session_v1: true,
+        constrained_invocation_v1: true,
+        model_only_invocation_v1: true,
       },
     });
   });

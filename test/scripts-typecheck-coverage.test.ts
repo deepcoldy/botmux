@@ -17,7 +17,7 @@ import ts from 'typescript';
  *      `scripts/**\/*.ts(x)`（光断言 include 字符串没用——exclude 或 files 一样能把
  *      文件踢出程序）；
  *   ② 它必须继承生产那套 strict 规则、且不产出编译结果；
- *   ③ `pnpm build` 必须真的跑这一步，否则 CI 上这道门等于不存在。
+ *   ③ `bun run build` 必须真的跑这一步，否则 CI 上这道门等于不存在。
  */
 
 const repoRoot = process.cwd();
@@ -74,7 +74,7 @@ describe('scripts/ 纳入类型检查', () => {
     expect(options.jsx).toBe(ts.JsxEmit.ReactJSX);
   });
 
-  it('pnpm build 真的跑这一步', () => {
+  it('build 脚本真的跑这一步', () => {
     const pkg = JSON.parse(readFileSync(join(repoRoot, 'package.json'), 'utf8')) as {
       scripts: Record<string, string>;
     };

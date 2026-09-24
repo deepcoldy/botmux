@@ -7,7 +7,7 @@
  * state so the before/after outputs can be diffed. It runs on Linux only.
  */
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -22,6 +22,7 @@ import {
     type WeakContainmentHandle,
 } from '../src/core/mojo-containment.js';
 import { MOJO_TREE_NONCE_ENV, scanMojoTree } from '../src/adapters/backend/mojo-process-tree.js';
+import { killFixturePid, waitForPidFile } from './helpers/pid-file.js';
 
 const LINUX = process.platform === 'linux';
 const work = mkdtempSync(join(tmpdir(), 'probe3-'));
@@ -68,8 +69,7 @@ async function spawnProbe3(nonce: string): Promise<{
         detached: false,
     });
     const turnPid = turn.pid as number;
-    expect(await waitFor(() => existsSync(pidFile))).toBe(true);
-    const evaderPid = Number(readFileSync(pidFile, 'utf8').trim());
+    const evaderPid = await waitForPidFile(pidFile);
     expect(await waitFor(() => alive(evaderPid))).toBe(true);
     expect(alive(turnPid)).toBe(true);
     return { turnPid, evaderPid, waitTurnGone: async () => {
@@ -140,7 +140,7 @@ describe.skipIf(!LINUX)('reviewer probe shape 3: setsid + scrubbed nonce + repar
             say('blocker_retained', hasUnprovenContainment('sess-probe3', dataDir));
             say('evader_still_alive_at_end', alive(evaderPid));
         } finally {
-            try { process.kill(evaderPid, 'SIGKILL'); } catch { /* gone */ }
+            killFixturePid(evaderPid);
             // eslint-disable-next-line no-console
             console.log(`\n${out.join('\n')}\n`);
         }

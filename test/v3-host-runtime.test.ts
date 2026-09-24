@@ -1,7 +1,8 @@
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { flushFakeTimers } from './helpers/flush-fake-timers.js';
 
 import { validateDag } from '../src/workflows/v3/dag.js';
 import { readWait, resolveWait } from '../src/workflows/v3/human-gate.js';
@@ -76,6 +77,10 @@ const runtimeData = {
   params: { name: 'Ada' },
   context: { larkAppId: 'cli_test', chatId: 'oc_test' },
 };
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 const approveGate: NonNullable<V3RuntimeDeps['resolveGate']> = async () => ({
   resolution: 'approved', by: 'ou_user', selected: 'approve',
@@ -554,7 +559,7 @@ describe('v3 host runtime', () => {
   });
 
   it('clears the referenced original-provider deadline once reconciliation closes the effect', async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
     const base = mkdtempSync(join(tmpdir(), 'v3-host-deadline-detach-'));
     try {
       const controller = new AbortController();
@@ -675,7 +680,7 @@ describe('v3 host runtime', () => {
   });
 
   it('bounds retryable provider recovery and becomes uncertain after ten deferrals', async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
     const base = mkdtempSync(join(tmpdir(), 'v3-host-retry-budget-'));
     try {
       const invoke = vi.fn(async () => { throw new Error('response lost'); });
@@ -701,16 +706,15 @@ describe('v3 host runtime', () => {
         },
         { baseDir: base, gateMode: 'blocking', resolvedWorkflowData: runtimeData },
       );
-      await vi.advanceTimersByTimeAsync(20_000);
-      await expect(running).resolves.toMatchObject({ reason: 'terminal', runStatus: 'blocked' });
+      await flushFakeTimers(30_000);
+      const retryOutcome = await running;
+      expect(retryOutcome).toMatchObject({ reason: 'terminal', runStatus: 'blocked' });
       const events = readJournal(join(base, 'host-retry-budget', 'journal.ndjson'));
       expect(events.filter((event) => event.type === 'hostEffectRetryDeferred')).toHaveLength(10);
-      expect(events).toEqual(expect.arrayContaining([
-        expect.objectContaining({
-          type: 'hostEffectUncertain',
-          errorCode: 'HOST_EFFECT_RETRY_BUDGET_EXHAUSTED',
-        }),
-      ]));
+      expect(events.some((event) =>
+        event.type === 'hostEffectUncertain'
+        && (event as { errorCode?: string }).errorCode === 'HOST_EFFECT_RETRY_BUDGET_EXHAUSTED',
+      )).toBe(true);
       expect(submit).toHaveBeenCalledTimes(11);
       expect(vi.getTimerCount()).toBe(0);
     } finally {

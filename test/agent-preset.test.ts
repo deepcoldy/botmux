@@ -34,6 +34,7 @@ describe('buildPreset — secret-free allow-list', () => {
       allowedChatGroups: ['oc_team'],
       oncallChats: ['oc_oncall'],
       workingDir: '/Users/alice/projects',
+      nativeSubagentRuntime: { model: { mode: 'custom', value: 'private-model' } },
     });
 
     // Structural guarantee: the object carries ONLY allow-listed keys — no
@@ -44,6 +45,7 @@ describe('buildPreset — secret-free allow-list', () => {
     for (const leaked of ['larkAppId', 'larkAppSecret', 'allowedUsers', 'allowedChatGroups', 'oncallChats', 'workingDir']) {
       expect(preset).not.toHaveProperty(leaked);
     }
+    expect(preset).not.toHaveProperty('nativeSubagentRuntime');
 
     // Value guarantee: no secret VALUE leaks into the serialized JSON. (We check
     // values, not key names — the guide text deliberately *names* the excluded

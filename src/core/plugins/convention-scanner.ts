@@ -2,9 +2,11 @@ import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { assertSafePluginRelativePath, resolvePluginPath } from './paths.js';
 import { loadSkillPackage } from '../skills/package.js';
+import { pluginCardActionSelectorOverlapsBotmux } from '../card-action-namespace.js';
 import type {
   BotmuxPluginManifest,
   PluginCliCommandIndexEntry,
+  PluginCardActionsContribution,
   PluginMcpServer,
   PluginServiceMode,
   ScannedPluginContributions,
@@ -168,12 +170,91 @@ function scanService(runtimeDir: string, mode: PluginServiceMode | undefined): S
   return { entry, mode: mode! };
 }
 
+const isCardActionSelector = (value: unknown): value is string => {
+  return typeof value === 'string'
+    && value === value.trim()
+    && Array.from(value).length > 0
+    && Array.from(value).length <= 256
+    && !/[\u0000-\u001f\u007f]/.test(value);
+};
+
+const readCardActionSelectors = (raw: unknown, field: 'actions' | 'actionPrefixes'): string[] | undefined => {
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) throw new Error(`invalid_plugin_card_${field}`);
+  const selectors = raw.map((value) => {
+    if (!isCardActionSelector(value)) {
+      throw new Error(`invalid_plugin_card_${field}_selector`);
+    }
+    if (pluginCardActionSelectorOverlapsBotmux(
+      value,
+      field === 'actions' ? 'action' : 'prefix',
+    )) {
+      throw new Error(`plugin_card_${field}_selector_reserved:${value}`);
+    }
+    return value;
+  });
+  const seen = new Set(selectors);
+  if (seen.size !== selectors.length) {
+    const duplicate = selectors.find((value, index) => selectors.indexOf(value) !== index);
+    throw new Error(`duplicate_plugin_card_${field}_selector:${duplicate}`);
+  }
+  return selectors.length > 0 ? selectors : undefined;
+};
+
+const readCardActionEndpoint = (raw: unknown): string => {
+  if (
+    typeof raw !== 'string'
+    || raw !== raw.trim()
+    || !raw.startsWith('/')
+    || raw.startsWith('//')
+    || raw.includes('\\')
+    || raw.includes('?')
+    || raw.includes('#')
+    || /[\u0000-\u001f\u007f]/.test(raw)
+  ) {
+    throw new Error('invalid_plugin_card_actions_endpoint');
+  }
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    throw new Error('invalid_plugin_card_actions_endpoint');
+  }
+  if (decoded.includes('\\') || decoded.split('/').some(part => part === '..')) {
+    throw new Error('plugin_card_actions_endpoint_escapes_root');
+  }
+  return raw;
+};
+
+const scanCardActions = (
+  runtimeDir: string,
+  service: ScannedPluginContributions['service'],
+): PluginCardActionsContribution | undefined => {
+  const rel = 'card-actions/index.json';
+  if (!isFile(join(runtimeDir, rel))) return undefined;
+  if (!service) throw new Error('plugin_card_actions_service_required');
+  const record = optionalRecord(JSON.parse(readFileSync(join(runtimeDir, rel), 'utf-8')), 'card_actions');
+  if (record.schemaVersion !== 1) throw new Error('invalid_plugin_card_actions_schema');
+  const actions = readCardActionSelectors(record.actions, 'actions');
+  const actionPrefixes = readCardActionSelectors(record.actionPrefixes, 'actionPrefixes');
+  if (!actions && !actionPrefixes) throw new Error('plugin_card_actions_selectors_required');
+  const endpoint = readCardActionEndpoint(record.endpoint);
+  const contribution: PluginCardActionsContribution = {
+    schemaVersion: 1,
+    endpoint,
+  };
+  if (actions) contribution.actions = actions;
+  if (actionPrefixes) contribution.actionPrefixes = actionPrefixes;
+  return contribution;
+};
+
 export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPluginManifest): ScannedPluginContributions | undefined {
   const skills = scanSkills(runtimeDir, manifest.id);
   const mcp = scanMcp(runtimeDir, manifest.id);
   const dashboard = scanDashboard(runtimeDir, manifest.id);
   const cli = scanCli(runtimeDir);
   const service = scanService(runtimeDir, manifest.service?.mode);
+  const cardActions = scanCardActions(runtimeDir, service);
   const contributions: ScannedPluginContributions = {
     ...(skills ? { skills } : {}),
     ...(mcp ? { mcp } : {}),
@@ -181,6 +262,7 @@ export function scanPluginContributions(runtimeDir: string, manifest: BotmuxPlug
     ...(cli ? { cli } : {}),
     ...(service ? { service } : {}),
   };
+  if (cardActions) contributions.cardActions = cardActions;
   return Object.keys(contributions).length > 0 ? contributions : undefined;
 }
 

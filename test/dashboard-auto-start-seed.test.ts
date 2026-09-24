@@ -79,3 +79,35 @@ describe('Bot 默认设置 — 入群 seed 草稿同步', () => {
     });
   });
 });
+
+describe('Bot 默认设置 — 入群执行命令', () => {
+  function render(bot: Record<string, unknown>) {
+    const putCardPref = vi.fn(async () => ({ ok: true, status: 200, body: { ok: true } }));
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(AutoStartControls, { bot: { larkAppId: 'app_a', ...bot }, putCardPref }));
+    });
+    return { renderer, putCardPref };
+  }
+  const toggleInput = (r: TestRenderer.ReactTestRenderer) =>
+    r.root.findByProps({ 'data-action': 'toggle-group-join-command' });
+
+  it('没保存过命令时不能打开开关', () => {
+    const { renderer } = render({});
+    expect(toggleInput(renderer).props.disabled).toBe(true);
+  });
+
+  it('保存命令与切换开关分别提交各自字段', async () => {
+    const { renderer, putCardPref } = render({ groupJoinCommand: 'bash /opt/old.sh' });
+    const input = () => renderer.root.findByProps({ 'data-input': 'groupJoinCommand' });
+    expect(input().props.value).toBe('bash /opt/old.sh');
+    expect(toggleInput(renderer).props.disabled).toBe(false);
+
+    act(() => input().props.onChange({ currentTarget: { value: 'bash /opt/on-join.sh' } }));
+    await flushAction(() => renderer.root.findByProps({ 'data-action': 'save-group-join-command' }).props.onClick());
+    expect(putCardPref).toHaveBeenLastCalledWith({ groupJoinCommand: 'bash /opt/on-join.sh' });
+
+    await flushAction(() => toggleInput(renderer).props.onChange({ currentTarget: { checked: true }, target: { checked: true } }));
+    expect(putCardPref).toHaveBeenLastCalledWith({ groupJoinCommandEnabled: true });
+  });
+});

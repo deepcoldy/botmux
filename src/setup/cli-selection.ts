@@ -21,8 +21,10 @@
  *   - 展示：`CLI_SELECT_OPTIONS`（扁平，web 下拉 + 非 TTY 回退）/ `CLI_SELECT_TREE`（级联，终端 TUI）
  *   - 解析：`resolveCliSelection(key)` → `{ cliId, wrapperCli? }`（纯映射，无副作用）
  */
-import { CLI_OPTIONS } from './bot-config-editor.js';
+import { CLI_ID_CHOICES, CLI_OPTIONS } from './bot-config-editor.js';
 import type { CliId } from '../adapters/cli/types.js';
+import type { CliLaunchMode } from '../core/cli-launch-mode.js';
+import { CODEX_REASONING_EFFORTS } from '../services/codex-reasoning-effort.js';
 
 /** 一个用户可选项；wrapperCli 不为空时表示它以该前缀启动（如 `aiden x claude`）。 */
 export interface CliSelectOption {
@@ -34,9 +36,11 @@ export interface CliSelectOption {
   readonly cliId: CliId;
   /** 通用启动前缀，如 'aiden x claude'；普通 CLI 无此项。 */
   readonly wrapperCli?: string;
+  /** 特殊启动模式；目前仅 Forge 以 `--agent-args` 字符串启动 TraeX。 */
+  readonly cliLaunchMode?: CliLaunchMode;
 }
 
-/** 级联树节点：顶层 CLI；children 非空表示选中后进二级菜单（目前只有 Aiden）。 */
+/** 级联树节点：顶层 CLI；children 非空表示选中后进二级菜单。 */
 export interface CliSelectGroup {
   readonly key: string;
   readonly label: string;
@@ -49,6 +53,7 @@ export interface CliSelectGroup {
 export interface ResolvedCliSelection {
   readonly cliId: CliId;
   readonly wrapperCli?: string;
+  readonly cliLaunchMode?: CliLaunchMode;
 }
 
 // ─── aiden 选项 ──────────────────────────────────────────────────────────────
@@ -77,12 +82,29 @@ const CODEX_APP: CliSelectOption = { key: 'codex-app', label: 'Codex App', cliId
 const CODEX_VARIANTS: ReadonlyArray<CliSelectOption> = [CODEX_NATIVE, CODEX_APP];
 
 // ─── TRAE 选项 ───────────────────────────────────────────────────────────────
-// TRAE 家族合并成一个「TRAE (CoCo)」二级菜单（都是原生 cliId，无 wrapperCli）：
-//   - TRAE CLI (CoCo) → cliId `coco`  ：Trae CLI 的 CoCo 形态
-//   - traex           → cliId `traex` ：TRAE CLI（traecli）
-const TRAE_COCO: CliSelectOption = { key: 'coco', label: 'TRAE CLI（CoCo）', cliId: 'coco' };
-const TRAE_X: CliSelectOption = { key: 'traex', label: 'traex', cliId: 'traex' };
-const TRAE_VARIANTS: ReadonlyArray<CliSelectOption> = [TRAE_COCO, TRAE_X];
+// 新旧两代 TRAE CLI 是不同协议的 adapter，合并展示但不能混用 cliId：
+//   - TRAE CLI 2.0 → cliId `traex`：当前版本；共存期用不冲突的 `traex` 启动，
+//                    面向用户的正式命令名 `traecli` 作为选择 alias 接受
+//   - TRAE CLI 1.0 → cliId `coco` ：旧版 Coco，保留用于已有配置与历史 session
+// 新版必须排在前面，避免安装当前 TRAE CLI 后误选 legacy adapter。
+const TRAE_X: CliSelectOption = {
+  key: 'traex',
+  label: 'TRAE CLI 2.0（推荐；traex / traecli）',
+  cliId: 'traex',
+};
+const FORGE_X_TRAEX: CliSelectOption = {
+  key: 'forge-x-traex',
+  label: 'Forge x TraeX',
+  cliId: 'traex',
+  cliLaunchMode: 'forge-traex',
+};
+const TRAE_COCO: CliSelectOption = {
+  key: 'coco',
+  label: 'TRAE CLI 1.0 / Coco（旧版，已停止维护）',
+  cliId: 'coco',
+};
+const TRAE_VARIANTS: ReadonlyArray<CliSelectOption> = [TRAE_X, TRAE_COCO];
+const FORGE_VARIANTS: ReadonlyArray<CliSelectOption> = [FORGE_X_TRAEX];
 
 // ─── OpenCode 选项 ──────────────────────────────────────────────────────────
 // OpenCode 与 OpenCode 2 合并成一个「OpenCode」二级菜单（都是原生 cliId，无
@@ -169,8 +191,13 @@ export const CLI_SELECT_TREE: ReadonlyArray<CliSelectGroup> = [
     // codex + codex-app collapse into one「Codex」二级菜单 at codex's position.
     if (o.id === 'codex') return [{ key: 'codex', label: 'Codex', children: CODEX_VARIANTS }];
     if (o.id === 'codex-app') return [];
-    // coco + traex collapse into one「TRAE (CoCo)」二级菜单 at coco's position.
-    if (o.id === 'coco') return [{ key: 'trae', label: 'TRAE (CoCo)', children: TRAE_VARIANTS }];
+    // coco + traex collapse into one「TRAE CLI」submenu at coco's position;
+    // Forge x TraeX stays a first-class top-level launch shape.
+    // Keep the underlying CLI_OPTIONS / numeric cliId mapping untouched.
+    if (o.id === 'coco') return [
+      { key: 'trae', label: 'TRAE CLI', children: TRAE_VARIANTS },
+      { key: 'forge-x-traex', label: 'Forge x TraeX', option: FORGE_X_TRAEX },
+    ];
     if (o.id === 'traex') return [];
     // Pi and Oh My Pi are kept as adjacent leaves (emitted together at pi's spot).
     if (o.id === 'pi') return [
@@ -197,7 +224,7 @@ export const CLI_SELECT_OPTIONS: ReadonlyArray<CliSelectOption> = [
     if (o.id === 'mir') return [];               // already included via MIRA_VARIANTS
     if (o.id === 'codex') return CODEX_VARIANTS;  // expands to Codex + Codex App
     if (o.id === 'codex-app') return [];
-    if (o.id === 'coco') return TRAE_VARIANTS;    // expands to TRAE CLI (CoCo) + traex
+    if (o.id === 'coco') return [...TRAE_VARIANTS, ...FORGE_VARIANTS]; // TRAE CLI 2.0 + legacy Coco + Forge x TraeX
     if (o.id === 'traex') return [];
     if (o.id === 'pi') return [PI_OPTION, OHMYPI_OPTION];  // Pi + Oh My Pi adjacent
     if (o.id === 'oh-my-pi') return [];
@@ -213,13 +240,27 @@ const OPTION_BY_KEY: ReadonlyMap<string, CliSelectOption> = new Map(
   CLI_SELECT_OPTIONS.map((o) => [o.key, o]),
 );
 
+/**
+ * 用户文档中的命令名到稳定选择键的 alias。alias 只参与输入解析，不生成重复菜单项；
+ * Bot 配置仍落已有 cliId，避免迁移 adapter 注册、配置和历史 session。
+ */
+export const CLI_SELECTION_ALIASES: Readonly<Record<string, string>> = {
+  ...CLI_ID_CHOICES,
+  traecli: 'traex',
+};
+
 /** 按 key 查选项；非法 key 返回 undefined。 */
 export function lookupCliSelection(key: string): CliSelectOption | undefined {
-  return OPTION_BY_KEY.get(key.trim());
+  const normalized = key.trim();
+  return OPTION_BY_KEY.get(CLI_SELECTION_ALIASES[normalized] ?? normalized);
 }
 
-/** 反查：由一个 bot 现有的 cliId + wrapperCli 得到对应的选择键（供编辑时高亮默认）。 */
-export function selectionKeyForBot(cliId: string, wrapperCli?: string): string {
+/** 反查：由一个 bot 现有的 cliId + wrapperCli / cliLaunchMode 得到对应的选择键。 */
+export function selectionKeyForBot(cliId: string, wrapperCli?: string, cliLaunchMode?: CliLaunchMode): string {
+  if (cliLaunchMode) {
+    const match = CLI_SELECT_OPTIONS.find((o) => o.cliId === cliId && o.cliLaunchMode === cliLaunchMode);
+    if (match) return match.key;
+  }
   if (wrapperCli && wrapperCli.trim()) {
     const match = CLI_SELECT_OPTIONS.find((o) => o.wrapperCli === wrapperCli.trim());
     if (match) return match.key;
@@ -233,11 +274,16 @@ export function selectionKeyForBot(cliId: string, wrapperCli?: string): string {
 export function resolveCliSelection(key: string): ResolvedCliSelection {
   const opt = lookupCliSelection(key);
   if (!opt) {
+    const legalKeys = [...CLI_SELECT_OPTIONS.map((o) => o.key), ...Object.keys(CLI_SELECTION_ALIASES)];
     throw new Error(
-      `未知 CLI 选择项 "${key}"。合法值：${CLI_SELECT_OPTIONS.map((o) => o.key).join(', ')}`,
+      `未知 CLI 选择项 "${key}"。合法值：${legalKeys.join(', ')}`,
     );
   }
-  return opt.wrapperCli ? { cliId: opt.cliId, wrapperCli: opt.wrapperCli } : { cliId: opt.cliId };
+  return {
+    cliId: opt.cliId,
+    ...(opt.wrapperCli ? { wrapperCli: opt.wrapperCli } : {}),
+    ...(opt.cliLaunchMode ? { cliLaunchMode: opt.cliLaunchMode } : {}),
+  };
 }
 
 // ─── 运行时：通用 wrapperCli 启动前缀（无 wrapper 脚本）────────────────────────
@@ -271,8 +317,19 @@ function isBotmuxCodexConfigValue(value: string | undefined): boolean {
   return !!value && (
     value.startsWith('shell_environment_policy.set.BOTMUX_')
     || value === 'check_for_update_on_startup=false'
+    // 关闭 codex 低额度切 luna 的模型 nudge 弹窗（见 codex 适配器 buildArgs），
+    // 同属 botmux 注入的进程级 config 覆盖，须与上面的更新检查一并被 wrapper 识别，
+    // 否则 aiden 网关会拒收裸 `-c` 直接启动失败。
+    || value === 'notice.hide_rate_limit_model_nudge=true'
+    // codex 适配器对 fresh 启动注入的 cwd 信任预置（projects 内联表，见
+    // codex.ts codexCwdTrustOverrideArgs）。aiden 网关拒收裸 `-c` → 剥掉（信任弹窗
+    // 退回 worker 的文案识别兜底）；cjadk 改写成 --config 透传给真 codex 继续生效。
+    || BOTMUX_CODEX_CWD_TRUST_RE.test(value)
   );
 }
+
+/** 匹配 codex 适配器注入的 cwd 信任预置值：projects={"<任意路径>"={trust_level="trusted"}}。 */
+const BOTMUX_CODEX_CWD_TRUST_RE = /^projects=\{"(?:[^"\\]|\\.)*"=\{trust_level="trusted"\}\}$/;
 
 /**
  * 剥掉 aiden x claude 拒收的 `--settings`（含其值），支持 `--settings <v>` 与
@@ -292,7 +349,8 @@ export function stripSettingsArgs(args: ReadonlyArray<string>): string[] {
 /**
  * 剥掉 aiden `aiden x <cli>` 网关拒收的、**botmux 注入的**底层 CLI config 覆盖参数：
  *   - `--settings <v>` / `--settings=<v>`（claude 携带 hook/bypass，aiden x claude 历来就剥）
- *   - botmux 自己注入的 Codex `-c`（session 环境，以及关闭启动更新选择器）；
+ *   - botmux 自己注入的 Codex `-c`（session 环境、关闭启动更新选择器，以及关闭低额度
+ *     切 luna 的模型 nudge 弹窗）；
  *     aiden 1.8.38+ 会直接报错拒收 `aiden x codex` 透传的 `-c`/`--config`。
  *   - `--dangerously-bypass-hook-trust`（codex 家族的 hook-trust 绕过 flag）：aiden 网关
  *     自身已管理底层 codex 的 hook-trust，botmux 再透传一份会让 codex 收到两次 →
@@ -301,7 +359,7 @@ export function stripSettingsArgs(args: ReadonlyArray<string>): string[] {
  *     路径底层 claude 从不注入此 flag，剥除是 no-op。
  * 这些参数承载的 session 环境已在进程级 env（BOTMUX_SESSION_ID 等）注入、并被 wrapper
  * 子进程继承（见 worker.ts childEnv），故剥掉只是去掉一条冗余的 belt-and-suspenders
- * 通道，不丢功能。关闭启动更新的覆盖在 aiden 路径无法传递（launcher 本身禁止 config）；
+ * 通道。关闭启动更新和额度换模型提醒的覆盖在 aiden 路径无法传递（launcher 本身禁止 config）；
  * worker 会在极少数仍出现选择器的启动中自动选择非升级项，host 侧仍会做每日只读检查。
  * `-c` 按 botmux 注入白名单精确识别，用户自带的
  * `-c key=val` 一律不动；`--settings` 则沿用 aiden x claude 历来的兼容策略
@@ -328,6 +386,38 @@ export function stripWrapperUnsafeArgs(args: ReadonlyArray<string>): string[] {
     out.push(a);
   }
   return out;
+}
+
+const AIDEN_CODEX_REASONING_CONFIG = new RegExp(
+  `^model_reasoning_effort="(${CODEX_REASONING_EFFORTS.join('|')})"$`,
+);
+
+/**
+ * Aiden owns the Codex provider configuration and rejects passthrough `-c`.
+ * Extract only the exact reasoning config emitted by Botmux's Codex adapter so
+ * the launch builder can route it through the Codex shim. Unrelated user-owned
+ * `-c` values retain their existing behavior.
+ */
+export function rewriteAidenCodexArgs(args: ReadonlyArray<string>): {
+  reasoningEffort?: string;
+  forwardedArgs: string[];
+} {
+  const stripped = stripWrapperUnsafeArgs(args);
+  let reasoningEffort: string | undefined;
+  const forwardedArgs: string[] = [];
+  for (let i = 0; i < stripped.length; i++) {
+    const arg = stripped[i]!;
+    if (arg === '-c') {
+      const match = stripped[i + 1]?.match(AIDEN_CODEX_REASONING_CONFIG);
+      if (match) {
+        reasoningEffort = match[1]!;
+        i++;
+        continue;
+      }
+    }
+    forwardedArgs.push(arg);
+  }
+  return { reasoningEffort, forwardedArgs };
 }
 
 /**
@@ -381,6 +471,20 @@ export interface WrappedLaunchOptions {
    * 用 {@link TTADK_DEFAULT_MODEL} 兜底；不接受 -m 的子命令（CoCo）忽略此项。
    */
   readonly ttadkModel?: string;
+  /** Effective PATH inherited by the wrapper process. */
+  readonly childPath?: string;
+  /** Resolved underlying Codex executable, used by the Aiden reasoning shim. */
+  readonly aidenCodexRealBin?: string;
+  /** Directory containing Botmux's `codex` shim. */
+  readonly aidenCodexShimDir?: string;
+  /** Platform PATH delimiter supplied by the server-side caller. */
+  readonly pathDelimiter?: string;
+}
+
+export interface WrappedLaunch {
+  readonly bin: string;
+  readonly args: string[];
+  readonly env?: Record<string, string>;
 }
 
 /**
@@ -431,6 +535,7 @@ export function ttadkConfigModelChoices(wrapperCli: string | undefined): string[
  *   - bin = 前缀首 token（经 binResolver 走 PATH 解析）
  *   - args = 前缀其余 token + CLI 参数（aiden `aiden x <cli>` 形态会先经
  *     {@link stripWrapperUnsafeArgs} 剥掉 botmux 注入、aiden 拒收的 `--settings`/`-c`；
+ *     `aiden x codex` 的 reasoning 配置由 PATH shim 在 Aiden 生成网关参数后注入；
  *     cjadk `cjadk <agent>` 形态走 {@link rewriteCjadkCodexConfigArgs} 把 codex 注入的 `-c`
  *     改写成 cjadk 不会吞掉的 `--config`）
  *   - ttadk 网关走专门分支注入 `-m <model> --skip-check`（见 {@link buildTtadkLaunch}）
@@ -454,10 +559,29 @@ export function buildWrappedLaunch(
   cliArgs: ReadonlyArray<string>,
   binResolver: (bin: string) => string = (b) => b,
   opts: WrappedLaunchOptions = {},
-): { bin: string; args: string[] } {
+): WrappedLaunch {
   const tokens = parseWrapperCli(wrapperCli);
   if (tokens.length === 0) return { bin: '', args: [...cliArgs] };
   if (tokens[0] === 'ttadk') return buildTtadkLaunch(tokens, cliArgs, binResolver, opts.ttadkModel);
+  if (tokens[0] === 'aiden' && tokens[1] === 'x' && tokens[2] === 'codex') {
+    const { reasoningEffort, forwardedArgs } = rewriteAidenCodexArgs(cliArgs);
+    if (!reasoningEffort) {
+      return { bin: binResolver(tokens[0]), args: [...tokens.slice(1), ...forwardedArgs] };
+    }
+    const realCodexBin = opts.aidenCodexRealBin ?? binResolver('codex');
+    const shimDir = opts.aidenCodexShimDir;
+    if (!shimDir) {
+      return { bin: binResolver(tokens[0]), args: [...tokens.slice(1), ...forwardedArgs] };
+    }
+    return {
+      bin: `${shimDir}/launch`,
+      args: [binResolver(tokens[0]), ...tokens.slice(1), ...forwardedArgs],
+      env: {
+        BOTMUX_AIDEN_CODEX_REAL_BIN: realCodexBin,
+        BOTMUX_AIDEN_CODEX_REASONING_EFFORT: reasoningEffort,
+      },
+    };
+  }
   let forwarded: string[];
   if (isAidenWrapper(tokens)) forwarded = stripWrapperUnsafeArgs(cliArgs);
   else if (isCjadkWrapper(tokens)) forwarded = rewriteCjadkCodexConfigArgs(cliArgs);

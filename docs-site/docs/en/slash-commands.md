@@ -11,34 +11,72 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/repo <path\|project name>` | Directly specify a path or a top-level project name under workingDir |
 | `/cd <path>` | Switch the working directory and restart the CLI process |
 | `/status` | View session info (uptime, terminal address, etc.) |
+| `/lane status` | Inspect your isolated principal lane, including its branch, worktree, dirty state, and unpushed commit count (available when the existing bot-level XPI switch enables principal lanes) |
+| `/lane close` | Safely close your isolated principal lane: refuses while work is running/queued or files are uncommitted, pushes unpublished commits before cleanup, and never auto-merges or deletes the branch |
 | `/retry` | Retry the most recent failed or interrupted turn (10s cooldown) |
+| `/stop` | Interrupt the current turn while keeping the session; same as the streaming card's Stop button |
 | `/restart` | Restart the CLI process (preserving the session context) |
 | `/close` | Close the session and send a recoverable card (including the CLI's own resume command) |
-| `/fork <task>` | Fork the current session with full context into a new sub-topic of the same topic group; the source session keeps running untouched (Claude family / Codex terminal only) |
+| `/cleanup-wt <ID>` | Retry a persisted worktree cleanup after a final removal failure; revalidates authorization, active sessions, worktree identity, and safety state before deleting |
+| `/fork <task>` | Fork the current session with full context into a new sub-topic of the same topic group; the source session keeps running untouched (Claude family, Codex terminal, or TraeX terminal mode) |
 | `/forklist` | Re-post the current session's forked-task panel with live/closed status and links to the child topics |
 | `/fork --create <group name>` | Clone the current session into a freshly-created group instead of a sub-topic |
 | `/rename <title>` | Rename this Botmux session and sync the running Codex/Claude native session name |
-| `/fork --create <new group name>` | Clone the current idle session into a newly-created group while leaving the source session untouched (Claude family / Codex terminal mode; invoke inside the source session's topic) |
-| `/card` | Manually summon the current session's streaming card (can summon and restore live refresh even when streaming is off; in private-card mode, sends a static snapshot visible only to authorized users instead). `/card off` and `/card on` toggle streaming cards for this chat; `/card pin off`, `/card pin on`, and `/card pin status` control the per-chat streaming-card Pin override |
-| `/cot` | Thinking-process message switch: `/cot off` mutes this chat's thinking bubble, `/cot on` restores it, `/cot show` summons a one-off peek at the current turn's bubble while the switches are off, `/cot status` reports the state (bot-level master switch `thinkingCard`, on by default; claude-code / codex only) |
+| `/fork --create <new group name>` | Clone the current idle session into a newly-created group while leaving the source session untouched (Claude family, Codex terminal, or TraeX terminal mode; Hybrid RPC / external app-server sessions are unsupported; invoke inside the source session) |
+| `/card` | Manually summon the current session's streaming card (can summon and restore live refresh even when streaming is off; in private-card mode, sends a static snapshot visible only to authorized users instead). `/card off` and `/card on` toggle streaming cards for this chat; `/card pin off`, `/card pin on`, and `/card pin status` control the per-chat streaming-card Pin override. `allowedUsers` only (the switch affects the whole chat — Lark has no per-person card view) |
+| `/cot` | CoT switch: `/cot off` mutes this chat's thinking and tool activity, `/cot on` restores it, `/cot show` reveals the current turn once while the switch is off, `/cot status` reports the state (bot-level master switch `cotEnabled`, on by default; supports claude-code / codex / traex). `allowedUsers` only |
+| `/mention-mode [always\|topic\|never\|ambient\|status]` | The regular-group mention policy: when the bot answers without an @. Querying needs talk access, changing needs operate rights; **regular groups only** (rejected in DMs, topic groups, and session groups). The four modes and the 8 no-@ exceptions are explained in [Mention Policy](/en/mention-mode) |
 | `/term` | Get the operable (write-enabled) terminal link for this session, delivered privately to the owner (visible-to-you in-chat, falling back to DM in topic/p2p — never exposed in the group) |
+| `/quote` | Pop a picker of this chat's topics; choosing one reads that topic's transcript into the current session. This fills a gap in Feishu itself — its quote-reply UI can only reference a single message, never a whole topic. The bot replies with a short acknowledgement (how many messages, time span, subject) and waits for your next instruction |
+| `/quote <instruction>` | Same, but runs your instruction as soon as you pick a topic, saving a round trip. The transcript is still injected explicitly labelled as material rather than instructions |
+| `/sessions` | List this bot's active topic sessions in the current group and jump directly back to a topic (legacy sessions use a safe locate fallback) |
 | `/dashboard [module]` | Open Dashboard control cards in Feishu (sessions/schedules/groups/settings/help, etc.) |
+| `@bot /project enable\|status\|roles\|disable` | Enable, inspect, configure agent roles, or leave project-group mode in the current ordinary group (owner/allowedUsers only; does not consume a session slot) |
 | `/insight` | owner-only: instantly posts a "session insight summary" card for the current session (aggregate metrics + rule suggestions; action-span detail / per-turn reconciliation / conversation replay live on the Dashboard "Insights" page) |
 | `/vc prepare <meeting link or number>` | Use the current regular group as a meeting-prep chat and reuse the same Agent session during the meeting |
 | `/introduce` | Register the bots in this chat with each other by `open_id`, so they can @-mention one another precisely when collaborating |
 | `@bot /summary` | Read the current topic (or the configured regular-group history range) and generate a summary (default: latest 50 messages / 24 hours). If the bot has `summaryMemory` enabled, the summary is appended to the configured memory file (`summaryMemoryPath`, defaults to `summary.md`), and text following `/summary` acts as a hard "summarize only from this message" boundary; when memory is off, trailing text is only a focus hint for this summary |
-| `/t [<text>]` `/topic [<text>]` | Force a new topic inside a regular group; text becomes the first task (starting after repository selection when needed), while the bare command opens topic setup |
+| `[title] /t [/repo <repo>] [/model <model>] [/effort <level>] [<first task>]` (alias `/topic`) | Force a new topic inside a regular group, declaring the title, repository, model, reasoning effort and first task in one message. Newlines are equivalent to spaces; the title goes **before** `/t` (Lark shows the raw message in its topic list and a bot cannot rewrite it); quote paths containing spaces; one bad field voids the whole header and replies with a usage error. A bare `/t` opens topic setup |
 | `/issue` | Open the Issue Board card and claim a botmux platform task in place: pick a repo and botmux creates a group, adds you, binds the platform task and starts the agent. Requires this machine to be bound to the platform, and the invoker to be in the bot's `allowedUsers`; only the invoker can operate the card |
 | `/issue status` | Run inside the task group to see which platform task it is bound to and where things stand: platform status / claimant / local binding / whether any status write-back is still stuck in the outbox. Read-only, also limited to the bot's `allowedUsers` |
 | `/issue done` | Run inside the task group to **accept the work** and move the task to its terminal state on the platform. An agent can only deliver up to "in review"; marking it done is a human decision. Once done, the platform clears the claim and the task can no longer be released. Also limited to the bot's `allowedUsers` |
 | `/issue release` | Run inside the group created when the task was claimed: hands the task back to the platform's todo pool so someone else can take it. The group and session are **not** disbanded — the conversation is kept. Also limited to the bot's `allowedUsers` |
 
-See [Session & Topic Model](/en/session-model) for the repository-picker and pinned-directory branches of bare `/t`. You can also make `/repo` the new topic's first command:
+`/sessions` card preview:
 
-- `/t /repo <path|project name>`
-- `/t /repo wt <path|project name> [branch]`
+![Current-group active topic sessions card](/img/sessions-command-card.png)
 
-These forms create the topic and select a repository or create a worktree directly, without starting an empty session and switching it afterward. Send the task as the next message in the topic.
+See [Session & Topic Model](/en/session-model) for the repository-picker and pinned-directory branches of bare `/t`.
+
+The three header directives:
+
+- `/repo <path|project name>` — pin the repository directly, skipping the picker card. Note it takes **exactly one token**: quote a path containing spaces, as in `/repo "~/Code/my project"`.
+- `/repo` (no argument) — start right away in the default working directory, the same as the picker card's start-directly button.
+- `/model <model>` — the model to launch with this time. Only available on CLIs that can actually carry a model in their launch arguments; the rest reject it rather than ignoring it silently.
+- `/effort <level>` — reasoning effort (`low`/`medium`/`high`/`xhigh`/`max`/`ultra`), validated against the model this launch will actually use.
+
+The whole message can be written on one line or split across lines — the result is identical:
+
+```text
+botmux ops /t /repo botmux /model sonnet check the restart records in the daemon log
+```
+
+```text
+botmux ops
+/t
+/repo botmux
+/model sonnet
+
+check the restart records in the daemon log
+```
+
+With no first task (e.g. `/t /repo botmux`), the CLI boots idle and waits for your next message instead of answering an empty turn.
+
+A few boundaries:
+
+- A header only takes effect on the **first message of a new topic**. To change repository/model/reasoning effort inside a running topic, send `/repo`, `/model` or `/effort` on their own; use `/rename` to change the title.
+- Creating a worktree cannot be expressed in the header (`/repo` takes a single token). Open the topic with `/t` first, then send `/repo wt <N|project name> [branch]` inside it.
+- A standalone mid-session `/repo` still takes the rest of the line, unlike the single-token rule inside the header.
 
 ## 💬 Reply Mode (`/reply-mode`)
 
@@ -68,6 +106,34 @@ Controls how the bot opens a session when @mentioned. No argument (or `status`) 
 The group-level setting overrides the dashboard "Bot Config → Regular Group Mode" default.
 
 `/substitute [status|on|off]` — show or toggle **substitute mode** for the current group (owner-only to change).
+
+## 📢 Mention Policy (`/mention-mode`, regular groups only)
+
+`/mention-mode always|topic|never|ambient` switches this chat's policy; `/mention-mode status` (or no argument) reports it. Regular groups only: DMs never need @, and topic groups and `/group` session groups reject the command. Querying needs only talk access; changing needs operate rights (`allowedUsers`).
+
+- `always`: @ required to get an answer (default); `topic`: replies inside the bot's own topics skip @; `never`: no @ required anywhere in the group; `ambient`: no @ required, but the bot yields when a message explicitly @-mentions someone else.
+- Skipping @ never skips the permission gate, and 8 no-@ exceptions still apply (in-topic replies, substitute triggers, the message listener, and more) — see [Mention Policy](/en/mention-mode) for the full semantics.
+
+## 📑 Chat Tabs
+
+| Command | Description |
+|------|------|
+| `/tabs` / `/tab` / `/tabs list` | List every tab in the current chat and its Tab ID (`/tab` is a compatibility alias) |
+| `/tabs add <url> [name]` | Add a URL tab (owner or authorized operator required) |
+| `/tabs rename <tab_id> <name>` | Rename an editable URL or document tab |
+| `/tabs delete <tab_id>` | Delete an editable URL or document tab |
+| `/tabs sort <tab_id> ...` | Reorder tabs; the command must include every Tab ID returned by `/tabs` |
+
+Built-in Lark tabs are read-only through OpenAPI, though they must still be included when sorting. If the chat only allows its owner and administrators to manage tabs, the bot also needs that chat-level privilege.
+
+AI agents and background scripts should use the CLI instead of sending a slash command into the chat:
+
+```bash
+botmux tabs add "https://example.com/project/releases/2026" \
+  --name "Project release" --json
+```
+
+The CLI resolves the bot and chat from the current `BOTMUX_SESSION_ID`. Use `--session-id` outside the current process tree or `--chat-id` to override the destination. `add` is idempotent by URL: an existing page tab is reused and renamed when needed. This works for merge requests, project boards, release pages, and other automation scenarios. Background callers can also use `botmux tabs list|update|remove|sort`.
 
 ## 🔀 Passthrough to the Underlying CLI
 
@@ -137,13 +203,15 @@ See [Session Relay](/en/relay) for details.
 
 `/oncall bind <path>` · `/oncall unbind` · `/oncall status`
 
-## 🔑 Usage Authorization (owner-only)
+## 🔑 Usage Authorization (owner / admins)
 
 | Command | Description |
 |------|------|
-| `@bot /grant @someone` | Authorize that person to chat in this group; `/grant` (without a person) authorizes **all members of this group** to chat |
-| `@bot /revoke @someone` | Revoke that person's chat permission in this group; `/revoke` (without a person) revokes the whole group's authorization |
+| `@bot /grant` (or `/grant all`) | Authorize **all members of this group** to talk (writes `allowedChatGroups`; no quota, no expiry; in a topic group keyed by the `oc_` group and covers all topics); bare `/revoke` removes it |
+| `@bot /grant @someone [N]` | Open a grant card authorizing **talk in this group** for specific members, defaulting to 3 messages / 1 hour each; the card offers 1 hour / 8 hours / 1 day / 7 days / permanent and a quota field (blank = unlimited). The owner-initiated card also offers **global talk**. `@bot /revoke @someone` removes the per-group and global guest grants together, and also removes the person from `allowedUsers` if listed there (revoking the owner themselves, or a revoke that would leave no admin, is refused; the reply names the affected scopes) |
 | `/vc-auth @someone` | While meeting-listening is on, temporarily trust an in-meeting instruction source; `/vc-auth revoke @someone` revokes; `/vc-auth list` shows current grants |
+
+Layers, quotas, grant request cards, and the block list are documented in [Permissions & Access](/en/permissions). Note: **being added to a group is not authorization** — a restricted bot still accepts only listed members.
 
 ## ⚙️ Remote Config & Skills (owner-only)
 
@@ -166,6 +234,24 @@ Add `--role-profile <profile>` to bootstrap the new group with reusable per-bot 
 ```
 
 See [One-Click Session Group](/en/group) for details.
+
+## 📌 Upgrade an Ordinary Group to Project Mode
+
+In the top-level ordinary-group chat, mention the Bot that should coordinate the project:
+
+```text
+@bot /project enable
+```
+
+The addressed Bot becomes coordinator and the other bots in this group that are managed by the same Botmux host become workers. The command writes the same source of truth as Dashboard and immediately sends and pins the getting-started card. A settled project goal is not required; discussion can begin first in the top-level chat. Command-based enablement turns on “automatically enroll new bots” by default, so newly joined bots managed by the same host enter the worker allowlist independently of the auto-start-on-join setting.
+
+On every project turn, the coordinator receives Botmux's fixed project-state protocol: read durable state first, then persist material changes to the goal, phase, current work, remaining plan, blockers, or milestones. This protocol is injected separately from custom Roles, so Role wording and once-only Role injection cannot disable it. On first initialization, Botmux sends and pins a fresh formal project card at the current point in the timeline, then unpins the getting-started guide; later progress updates patch the formal card in place.
+
+- `@bot /project status`: show the coordinator, workers, and whether a project has started.
+- `@bot /project roles`: Reply in the current group with a focused role card for this project’s coordinator and workers; only the admin who opened the card can operate it. Saving reuses the per-chat `/role` files and follows the bot’s existing injection policy: every-turn mode applies on the next message, while once mode applies after a new or rebuilt session.
+- `@bot /project disable`: leave project-group mode; an unused guide is unpinned, while existing project state is retained for a later re-enable.
+
+The command works only in ordinary groups and only for the Bot's owner/allowedUsers. Repeating `enable` preserves any worker subset and auto-enrollment policy already curated in Dashboard. Dashboard can disable “automatically enroll new bots”; when disabled, the explicit worker list remains unchanged. Dashboard also lists the same project agents and deep-links to their group-role editors; both entry points share one role source of truth.
 
 ## 📄 Feishu Doc Comment Entry
 

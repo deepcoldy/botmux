@@ -648,11 +648,17 @@ export class MojoBackend implements SessionBackend {
         const text = data.trim();
         if (!text) return false;
         if (!this.cliSessionId) this.acceptedWriteWithoutLineage = true;
+        // Capture the credential snapshot BEFORE serialization. The writeChain
+        // defers the actual spawn, so a second write() + applyLivePatch() can
+        // overwrite this.liveJwt before the first turn's buildEnv() reads it.
+        // Without the snapshot, two queued credential turns run A/C/C instead of
+        // A/B/C (see mojo-cross-boundary.test.ts §1).
+        const turnLiveJwt = this.liveJwt;
         // Serialize turns: mojo rejects a concurrent turn on the same session,
         // and a second message arriving before the first init event would fork a
         // duplicate session (cliSessionId still null).
         this.writeChain = this.writeChain
-            .then(() => (this.killed || this.closing) ? undefined : this.runTurnWithBusyRetry(text))
+            .then(() => (this.killed || this.closing) ? undefined : this.runTurnWithBusyRetry(text, turnLiveJwt))
             .catch((err: unknown) => {
                 logger.warn(`[mojo] turn failed: ${String(err)}`);
                 this.emitLine(`❌ mojo 执行失败：${this.fmtErr(err)}`, 'err');
@@ -1733,9 +1739,9 @@ export class MojoBackend implements SessionBackend {
     }
 
     /** Retry the "session still RUNNING" race with backoff (see SESSION_BUSY_RE). */
-    private async runTurnWithBusyRetry(prompt: string): Promise<void> {
+    private async runTurnWithBusyRetry(prompt: string, turnLiveJwt?: string | null): Promise<void> {
         for (let attempt = 0; ; attempt++) {
-            const busy = await this.runTurn(prompt);
+            const busy = await this.runTurn(prompt, turnLiveJwt);
             if (!busy) return;
             const delay = BUSY_RETRY_DELAYS_MS[attempt];
             if (delay === undefined) {
@@ -1751,7 +1757,7 @@ export class MojoBackend implements SessionBackend {
 
     /** Resolves `true` when the turn was rejected because the session is still
      *  RUNNING (caller should retry), `false` once the turn is accounted for. */
-    private runTurn(prompt: string): Promise<boolean> {
+    private runTurn(prompt: string, turnLiveJwt?: string | null): Promise<boolean> {
         return new Promise<boolean>((resolve, reject) => {
             const { bin, args } = this.resolveLaunch(this.buildArgs(prompt));
             this.turnSettled = false;
@@ -1804,7 +1810,7 @@ export class MojoBackend implements SessionBackend {
 
             const child = spawnProcess(launchBin, launchArgs, {
                 cwd: this.resolveCwd(),
-                env: this.buildEnv(),
+                env: this.buildEnv(turnLiveJwt),
                 // stdin MUST be closed: mojo waits on socket-type stdin and an open
                 // pipe makes `-p` block until EOF (observed as a silent hang).
                 stdio: ['ignore', 'pipe', 'pipe'],
@@ -2240,7 +2246,7 @@ export class MojoBackend implements SessionBackend {
         return lines.join('\n');
     }
 
-    private buildEnv(): NodeJS.ProcessEnv {
+    private buildEnv(turnLiveJwt?: string | null): NodeJS.ProcessEnv {
         // Layering, lowest → highest precedence:
         //   worker-supplied env (BOTMUX_* session context, redacted process env)
         //   → per-bot injectEnv (bots.json `env`, already sanitized)
@@ -2269,14 +2275,15 @@ export class MojoBackend implements SessionBackend {
         // and never `jwtEnv`), so both sites share one constant rather than two
         // literals that could drift apart and silently re-open the bypass.
         const jwtKey = this.config.jwtEnv ?? MOJO_CANONICAL_JWT_ENV_KEY;
-        if (this.liveJwt !== undefined) {
+        const effectiveLiveJwt = turnLiveJwt !== undefined ? turnLiveJwt : this.liveJwt;
+        if (effectiveLiveJwt !== undefined) {
             // A live snapshot is authoritative and already includes the daemon's
             // ambient fallback. `null` therefore means "no credential anywhere", so
             // the inherited value must be REMOVED rather than left to stand in —
             // otherwise deleting `mojo.jwt` / `jwtEnv` revived the stale token.
             delete env[jwtKey];
             delete env[MOJO_CANONICAL_JWT_ENV_KEY];
-            if (this.liveJwt !== null) env[MOJO_CANONICAL_JWT_ENV_KEY] = this.liveJwt;
+            if (effectiveLiveJwt !== null) env[MOJO_CANONICAL_JWT_ENV_KEY] = effectiveLiveJwt;
         } else {
             const jwt = this.config.jwt ?? env[jwtKey];
             if (jwt) env[MOJO_CANONICAL_JWT_ENV_KEY] = jwt;

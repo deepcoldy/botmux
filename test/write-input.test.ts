@@ -19,23 +19,46 @@
  *   message in the input box. Submit is verified via CoCo's platform-specific
  *   history.jsonl.
  * - CoCo (raw PTY): same explicit \x1b[200~...\x1b[201~ wrap as claude-code.
- * - Other adapters (Aiden/Codex/Gemini): use plain sendText + Enter
+ * - Other adapters (Aiden/Gemini): use plain sendText + Enter
  *   in tmux, or write(content) + \r in raw mode. The whole content (including
  *   newlines) is sent in one sendText call — those CLIs tolerate raw LF.
+ * - Hermes: single pasteText with the whole content + delayed Enter. Its
+ *   prompt_toolkit composer handles a bracketed paste in one event, while the
+ *   old sendText burst's trailing Enter is swallowed by the 50ms anti-paste
+ *   guard on a cold start (opening prompt stranded until manual Enter).
  * - OpenCode: short single-line prompts use sendText + Enter; multiline or
  *   large prompts use pasteText + Enter so OpenTUI receives bracketed paste.
  *
  * Run:  pnpm vitest run test/write-input.test.ts
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
+import { flushFakeTimers } from './helpers/flush-fake-timers.js';
 
-vi.mock('node:child_process', () => ({
-  execSync: vi.fn(() => ''),
-  execFileSync: vi.fn(),
-}));
+vi.mock('node:child_process', () => {
+  const actual = require('node:child_process') as typeof import('node:child_process');
+  return {
+    ...actual,
+    execSync: vi.fn(() => ''),
+    execFileSync: vi.fn(),
+    // writeInput's coco/codex paths call execFile. Spreading the real builtin
+    // without stubbing it would spawn live CLIs and hang the file (measured).
+    execFile: vi.fn((...args: unknown[]) => {
+      const cb = args.find(a => typeof a === 'function') as ((...a: unknown[]) => void) | undefined;
+      if (cb) queueMicrotask(() => cb(null, '', ''));
+      return {};
+    }),
+    spawn: vi.fn(),
+    spawnSync: vi.fn(() => ({ status: 0, stdout: '', stderr: '' })),
+  };
+});
 
-vi.mock('node:fs', async () => {
-  const memfs = await import('memfs');
+// A synchronous `require`, NOT `await import()`. An `await import()` inside a mock
+// factory HANGS under `bun test`: the file emits no output at all and is eventually
+// killed, which looks like "0 tests collected" rather than an error — the most
+// dangerous shape of failure, since it reads as success. `require` resolves at the
+// same moment for both runners and does not deadlock.
+vi.mock('node:fs', () => {
+  const memfs = require('memfs') as typeof import('memfs');
   return memfs.fs;
 });
 
@@ -85,6 +108,13 @@ import { codexHistoryPath } from '../src/services/codex-paths.js';
 // (equally scaled) confirm budget.
 process.env.BOTMUX_TIME_SCALE ??= '0.05';
 const TIME_SCALE = Number(process.env.BOTMUX_TIME_SCALE);
+
+afterEach(() => {
+  // Bun's `runAllTimersAsync` can leave fake timers installed when a test
+  // times out before `finally`. A leftover fake clock then hangs every later
+  // `writeInput` poll in this file (measured: a cascade of 30s timeouts).
+  vi.useRealTimers();
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -177,15 +207,18 @@ function makeRawPty(opts?: { confirmCodexSubmit?: boolean; codexSessionId?: stri
 type AdapterEntry = [string, CliAdapter];
 
 /** Adapters that use plain sendText+Enter (tmux) / write+CR (raw) — Aiden,
- *  Gemini, Genius, MTR, Hermes. (Codex moved to PASTE_BUFFER_ADAPTERS; its
+ *  Gemini, Genius, MTR. (Codex moved to PASTE_BUFFER_ADAPTERS; its
  *  TUI treats every literal \n as Enter, so a multi-line burst fragmented into
- *  per-line submits / "Queued follow-up inputs" — bracketed paste fixes it.) */
+ *  per-line submits / "Queued follow-up inputs" — bracketed paste fixes it.
+ *  Hermes moved to PASTE_BUFFER_ADAPTERS too: on a cold start its prompt_toolkit
+ *  composer drains the send-keys burst together with the trailing Enter, and
+ *  Hermes' 50ms anti-paste window (#10994) then drops that Enter as a pasted
+ *  newline, stranding the opening prompt until a manual Enter.) */
 const PLAIN_ADAPTERS: AdapterEntry[] = [
   ['aiden', createAidenAdapter('/bin/aiden')],
   ['gemini', createGeminiAdapter('/bin/gemini')],
   ['genius', createGeniusAdapter('/bin/genius')],
   ['mtr', createMtrAdapter('/bin/mtr')],
-  ['hermes', createHermesAdapter('/bin/hermes')],
 ];
 
 const OPENCODE_ADAPTER: AdapterEntry = ['opencode', createOpenCodeAdapter('/bin/opencode')];
@@ -201,15 +234,20 @@ const HUMAN_TYPING_ADAPTERS: AdapterEntry[] = [
 ];
 
 /** Adapters that use tmux pasteText (load-buffer + paste-buffer -d) with
- *  delayed Enter — CoCo / Trae CLI, Codex, Kimi, and Pi. See coco.ts for the
+ *  delayed Enter — CoCo / Trae CLI, Codex, Kimi, Pi, and Hermes. See coco.ts for the
  *  Trae 0.120.31 burst bug, and codex.ts for the per-line-submit bug bracketed paste fixes
  *  (Codex 0.134+ handles bracketed paste correctly — the old "Codex exits on
- *  bracketed paste" note was true only for a much earlier build). */
+ *  bracketed paste" note was true only for a much earlier build).
+ *  Hermes: its prompt_toolkit composer's 50ms anti-paste guard (issue #10994)
+ *  eats the trailing Enter of the old send-keys burst on cold start, so the
+ *  opening prompt strands until a manual Enter; a single bracketed-paste
+ *  event keeps embedded newlines inert and submits reliably. */
 const PASTE_BUFFER_ADAPTERS: AdapterEntry[] = [
   ['coco', createCocoAdapter('/bin/coco')],
   ['codex', createCodexAdapter('/bin/codex')],
   ['kimi', createKimiAdapter('/bin/kimi')],
   ['pi', createPiAdapter('/bin/pi')],
+  ['hermes', createHermesAdapter('/bin/hermes')],
 ];
 
 /** Adapters that wrap content in bracketed-paste markers (\x1b[200~ ... \x1b[201~)
@@ -302,9 +340,10 @@ describe('writeInput: single-line, non-tmux mode', () => {
 
 // =========================================================================
 // 2. Multiline content
-//    - Claude Code / CoCo / Codex: bracketed paste (pasteText) with the whole
-//      string — the embedded \n stay content, only the trailing Enter submits.
-//    - PLAIN adapters (Aiden/Gemini/MTR/Hermes): sendText with the
+//    - CLAUDE_CODE / CoCo / Codex / Kimi / Pi / Hermes: bracketed paste
+//      (pasteText) with the whole string — the embedded \n stay content, only
+//      the trailing Enter submits.
+//    - PLAIN adapters (Aiden/Gemini/MTR): sendText with the
 //      whole string (including \n) — those CLIs treat literal LF as a newline,
 //      not a submit, so only the trailing Enter submits.
 //    - OpenCode: pasteText for multiline/large prompts so its TUI receives
@@ -647,6 +686,12 @@ describe('supportsTypeAhead flag', () => {
   it.each(PLAIN_ADAPTERS.filter(([name]) => name !== 'codex' && name !== 'genius'))('%s: undefined (default behavior)', (_name, adapter) => {
     expect(adapter.supportsTypeAhead).toBeUndefined();
   });
+
+  it('hermes: supportsTypeAhead undefined even though writeInput uses pasteText', () => {
+    // Hermes moved to PASTE_BUFFER_ADAPTERS (write mechanics) without opting
+    // into type-ahead: the adapter still relies on deferFirstPromptTimeoutUntilReady.
+    expect(createHermesAdapter('/bin/hermes').supportsTypeAhead).toBeUndefined();
+  });
 });
 
 describe('reliableTurnTerminal capability', () => {
@@ -688,7 +733,7 @@ describe('writeInput: edge cases', () => {
       const adapter = createCursorAdapter('/bin/cursor-agent');
       const pty = makeTmuxPty();
       const write = adapter.writeInput(pty, 'steer this turn');
-      await vi.runAllTimersAsync();
+      await flushFakeTimers();
       await write;
 
       expect(pty.sendText).toHaveBeenCalledWith('steer this turn');
@@ -707,7 +752,7 @@ describe('writeInput: edge cases', () => {
       const adapter = createCursorAdapter('/bin/cursor-agent');
       const pty = makeRawPty();
       const write = adapter.writeInput(pty, 'steer raw turn');
-      await vi.runAllTimersAsync();
+      await flushFakeTimers();
       await write;
 
       expect(pty.write.mock.calls.map(c => c[0])).toEqual([
@@ -730,12 +775,12 @@ describe('writeInput: edge cases', () => {
       expect(pty.pasteText).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(Math.round(250 * TIME_SCALE));
       expect(pty.pasteText).toHaveBeenCalledOnce();
-      await vi.runAllTimersAsync();
+      await flushFakeTimers();
       await first;
 
       const second = adapter.writeInput(pty, 'second');
       expect(pty.pasteText).toHaveBeenCalledTimes(2);
-      await vi.runAllTimersAsync();
+      await flushFakeTimers();
       await second;
     } finally {
       vi.useRealTimers();
@@ -1180,7 +1225,7 @@ describe('claude-code writeInput submission confirmation', () => {
       };
 
       const resultPromise = adapter.writeInput(pty, 'delayed append after pid rotate');
-      await vi.runAllTimersAsync();
+      await flushFakeTimers();
       const result = await resultPromise;
 
       expect(result).toEqual({ submitted: true, cliSessionId: rotatedSessionId });
@@ -1322,17 +1367,20 @@ describe('codex writeInput submission confirmation', () => {
     const adapter = createCodexAdapter('/bin/codex');
 
     expect(adapter.buildArgs({
+      hideRateLimitModelNudge: true,
       sessionId: 'botmux-session',
       resume: true,
       resumeSessionId: '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     })).toEqual([
-      'resume',
-      '--dangerously-bypass-approvals-and-sandbox',
-      '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
+      'resume',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
       '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     ]);
   });
@@ -1342,18 +1390,21 @@ describe('codex writeInput submission confirmation', () => {
     const adapter = createCodexAdapter('/bin/codex');
 
     expect(adapter.buildArgs({
+      hideRateLimitModelNudge: true,
       sessionId: 'botmux-session',
       resume: true,
       resumeSessionId: '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
       workingDir: '/repo/root',
     })).toEqual([
-      'resume',
-      '--dangerously-bypass-approvals-and-sandbox',
-      '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
+      'resume',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
       '019dd3e2-f2da-7592-86b5-a43d4cd0772f',
     ]);
   });
@@ -1365,14 +1416,16 @@ describe('codex writeInput submission confirmation', () => {
     appendCodexHistory('<session_id>botmux-session</session_id>', 'new-codex-session');
     const adapter = createCodexAdapter('/bin/codex');
 
-    expect(adapter.buildArgs({ sessionId: 'botmux-session', resume: true })).toEqual([
-      'resume',
-      '--dangerously-bypass-approvals-and-sandbox',
-      '--no-alt-screen',
+    expect(adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'botmux-session', resume: true })).toEqual([
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
+      'resume',
+      '--dangerously-bypass-approvals-and-sandbox',
+      '--no-alt-screen',
       'new-codex-session',
     ]);
   });
@@ -1385,14 +1438,16 @@ describe('codex writeInput submission confirmation', () => {
       resetCodexHistory();
       appendCodexHistory('<session_id>custom-botmux-session</session_id>', 'custom-codex-session');
       const adapter = createCodexAdapter('/bin/codex');
-      expect(adapter.buildArgs({ sessionId: 'custom-botmux-session', resume: true })).toEqual([
-        'resume',
-        '--dangerously-bypass-approvals-and-sandbox',
-        '--no-alt-screen',
+      expect(adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'custom-botmux-session', resume: true })).toEqual([
         '-c',
         'shell_environment_policy.set.BOTMUX_SESSION_ID="custom-botmux-session"',
         '-c',
         'check_for_update_on_startup=false',
+        '-c',
+        'notice.hide_rate_limit_model_nudge=true',
+        'resume',
+        '--dangerously-bypass-approvals-and-sandbox',
+        '--no-alt-screen',
         'custom-codex-session',
       ]);
 
@@ -1411,13 +1466,15 @@ describe('codex writeInput submission confirmation', () => {
     resetCodexHistory();
     const adapter = createCodexAdapter('/bin/codex');
 
-    expect(adapter.buildArgs({ sessionId: 'botmux-session', resume: true })).toEqual([
+    expect(adapter.buildArgs({ hideRateLimitModelNudge: true, sessionId: 'botmux-session', resume: true })).toEqual([
       '--dangerously-bypass-approvals-and-sandbox',
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
     ]);
   });
 
@@ -1426,6 +1483,7 @@ describe('codex writeInput submission confirmation', () => {
     const adapter = createCodexAdapter('/bin/codex');
 
     expect(adapter.buildArgs({
+      hideRateLimitModelNudge: true,
       sessionId: 'botmux-session',
       resume: true,
       workingDir: '/repo/root',
@@ -1436,6 +1494,10 @@ describe('codex writeInput submission confirmation', () => {
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
       '-c',
       'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
+      '-c',
+      'projects={"/repo/root"={trust_level="trusted"}}',
       '-C',
       '/repo/root',
     ]);

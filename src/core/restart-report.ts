@@ -88,6 +88,8 @@ export interface RestartReportWiring {
   /** Local host:port direct fallback link (set only when dashboardUrl is a
    *  central-platform link). */
   dashboardLocalUrl?: string | undefined;
+  /** Missing preserves the legacy behavior (send intentional-restart DMs). */
+  notifyOnRestart?: boolean;
   /** Send the interactive card as a p2p DM to the owner. */
   sendCard: (openId: string, cardJson: string) => Promise<void>;
   githubAuth?: GithubAuthResolveOptions;
@@ -126,6 +128,10 @@ export async function sendRestartReportIfPending(w: RestartReportWiring): Promis
   }
   if (claim.state !== 'claimed') return;
   const intent = claim.intent;
+  if (w.notifyOnRestart === false) {
+    log(`restart-report suppressed by maintenance.notifyOnRestart=false (kind=${intent.kind})`);
+    return;
+  }
   if (!w.ownerOpenId) { log('restart-report: no owner configured — skipping DM'); return; }
 
   const locale = localeForBot(w.primaryLarkAppId);

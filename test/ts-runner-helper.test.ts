@@ -2,6 +2,8 @@ import { describe, it, expect } from 'vitest';
 import { resolve } from 'node:path';
 import {
   isBunRuntime,
+  nodeTsRunnerPrefix,
+  resolveNodeExecutable,
   tsRunnerPrefix,
   tsEvalArgs,
   spawnSyncTsScript,
@@ -26,6 +28,31 @@ describe('tsRunnerPrefix / tsEvalArgs — shape per runtime', () => {
     // keeps this meaningful on whichever runtime happens to execute it.
     if (isBunRuntime()) expect(prefixArgs).toEqual([]);
     else expect(prefixArgs).toEqual(['--import', 'tsx']);
+  });
+
+  it('nodeTsRunnerPrefix always uses Node + tsx, including under bun', () => {
+    const { command, prefixArgs } = nodeTsRunnerPrefix();
+    expect(prefixArgs).toEqual(['--import', 'tsx']);
+    if (isBunRuntime()) expect(command).not.toBe(process.execPath);
+    else expect(command).toBe(process.execPath);
+  });
+
+  it('resolveNodeExecutable skips a PATH directory named node', () => {
+    const { mkdtempSync, mkdirSync, rmSync } = require('node:fs') as typeof import('node:fs');
+    const { tmpdir } = require('node:os') as typeof import('node:os');
+    const { join: pathJoin, delimiter: pathDelim } = require('node:path') as typeof import('node:path');
+    const dir = mkdtempSync(pathJoin(tmpdir(), 'botmux-node-dir-'));
+    try {
+      mkdirSync(pathJoin(dir, 'node'));
+      if (isBunRuntime()) {
+        expect(resolveNodeExecutable(dir)).toBeUndefined();
+        expect(resolveNodeExecutable(`${dir}${pathDelim}${process.env.PATH}`)).not.toBe(pathJoin(dir, 'node'));
+      } else {
+        expect(resolveNodeExecutable(dir)).toBe(process.execPath);
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('inline eval only needs --input-type=module on Node', () => {

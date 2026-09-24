@@ -1,7 +1,7 @@
 // Child processes the dashboard forks on the HOST: `botmux start-bot/stop-bot`
 // (onboarding brings a bot online without a fleet restart), the global
 // npm/pnpm/bun install behind the update button, and — for a local-dev
-// checkout — the `git pull` / `pnpm build` steps behind the local update button.
+// checkout — the `git pull` / `bun run build` steps behind the local update button.
 //
 // One shared rule, and the reason this lives in its own module: every one of
 // them runs with `redactChildEnv(process.env)`, never raw process.env. The
@@ -15,7 +15,7 @@
 // Extracted from dashboard.ts so the env each child actually receives can be
 // asserted in a test — dashboard.ts is a side-effect module (importing it binds
 // ports and starts probes), so nothing inside it is reachable from a unit test.
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { botmuxCliEntry } from '../utils/install-info.js';
 import { resolveCliSpawn } from '../core/self-spawn.js';
 import { globalInstallUpdateCwd } from '../core/maintenance.js';
@@ -137,12 +137,12 @@ export function runGlobalInstall(plan: GlobalInstallPlan): Promise<void> {
 }
 
 /**
- * Run one local-dev update step (`git pull --ff-only` / `pnpm build`) in `dir`,
+ * Run one local-dev update step (`git pull --ff-only` / `bun run build`) in `dir`,
  * capturing output so a failure surfaces an actionable tail rather than a bare
  * exit code. Like the other host children this runs on `redactChildEnv` — the
- * git/pnpm child (and any lifecycle/hook it spawns) must not inherit the
+ * git/bun child (and any lifecycle/hook it spawns) must not inherit the
  * dashboard's Feishu H5 credentials; the denylist still keeps PATH/HOME/etc. so
- * the tools resolve normally. 300s timeout (a cold `pnpm build` is slower than a
+ * the tools resolve normally. 300s timeout (a cold `bun run build` is slower than a
  * package install). No shell interpolation of untrusted input.
  */
 export function runLocalDevStep(dir: string, command: string, args: string[]): Promise<void> {
@@ -168,4 +168,23 @@ export function runLocalDevStep(dir: string, command: string, args: string[]): P
       else reject(new Error(`\`${command} ${args.join(' ')}\` exited ${code}: ${tail.trim().slice(-800)}`));
     });
   });
+}
+
+/**
+ * Run `dsh plugin --profile <name> add <pkg>` to install profile dependencies
+ * after seeding a new profile skeleton. Synchronous — the dashboard only calls
+ * this during POST /api/dsh/profiles creation, which is already a short-lived
+ * request handler. Uses redacted env (no Feishu H5 credentials for the child).
+ * Throws on failure so the caller can surface the error. */
+export function installDshProfileDeps(profileName: string, dshBin: string): void {
+  const result = spawnSync(dshBin, ['plugin', '--profile', profileName, 'add', '@deepseek-ai/dsh-sdk-jsonrpc-server@next'], {
+    env: redactChildEnv(process.env),
+    stdio: 'pipe',
+    timeout: 120_000,
+  });
+  if (result.status !== 0 || result.error) {
+    const stderr = result.stderr?.toString().trim() || '';
+    const msg = `dsh plugin add failed for profile "${profileName}" (exit ${result.status ?? 'error'}): ${stderr || result.error?.message || 'unknown error'}`;
+    throw new Error(msg);
+  }
 }

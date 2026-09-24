@@ -132,7 +132,7 @@ export const DASHBOARD_H5_ENV_KEYS = [
  *  - core/maintenance.ts detachedRestartEnv(): the detached `botmux restart`
  *    the DASHBOARD spawns (update/restart button) inherits the dashboard's env,
  *    which legitimately holds the secrets; the restart driver does not need
- *    them and must not carry them toward pm2.
+ *    them and must not carry them toward the fleet supervisor.
  * redactChildEnv() keeps its own equivalent strip as the second line of
  * defense at every CLI-child boundary (PTY/tmux pane unset/one-shot).
  */
@@ -208,11 +208,26 @@ export function scrubInvokerTerminalEnv(env: NodeJS.ProcessEnv): void {
  *    client env can't override, so the shell wrapper `unset`s them before exec
  *    (see SHELL_WRAPPER_SCRIPT in tmux-backend.ts).
  */
+export const COMPANION_STARTUP_ENV_KEYS = [
+  'BOTMUX_COMPANION_SECRET_FILE',
+  'BOTMUX_COMPANION_BOT_APP_ID',
+] as const;
+
+/** Remove companion authority from processes that never serve its API. */
+export function stripCompanionStartupEnv(env: NodeJS.ProcessEnv): void {
+  for (const key of COMPANION_STARTUP_ENV_KEYS) delete env[key];
+}
+
 export const REDACTED_CHILD_ENV_KEYS = [
   'LARK_APP_ID',
   'LARK_APP_SECRET',
   'GITHUB_TOKEN',
   'GH_TOKEN',
+  'ONCALL_SERVICE_SECRET',
+  // Startup-only private secret-file path. A session CLI is not the local
+  // companion process and must not learn even the credential's location.
+  // Kept as a literal because this boundary module is dependency-free.
+  ...COMPANION_STARTUP_ENV_KEYS,
   // Dashboard-only Feishu H5 login config/credential family — see
   // DASHBOARD_H5_ENV_KEYS. Listed by exact name (not only swept by prefix in
   // redactChildEnv) so the tmux pane wrapper `unset`s them too: on that backend
@@ -332,6 +347,11 @@ export function scrubSessionCliHomeEnv(env: NodeJS.ProcessEnv): void {
 export const BOTMUX_INJECTED_ENV_KEYS = [
   '__OWNER_OPEN_ID',
   'BOTMUX',
+  // Per-launch Aiden Codex shim configuration. Forward only into the owning
+  // pane, and scrub stale values from shared terminal servers and login shells.
+  'BOTMUX_AIDEN_CODEX_PARENT_PATH',
+  'BOTMUX_AIDEN_CODEX_REAL_BIN',
+  'BOTMUX_AIDEN_CODEX_REASONING_EFFORT',
   'SESSION_DATA_DIR',
   'IS_SANDBOX',
   // botmux ask/hooks use these to locate the daemon and route back to the
@@ -343,6 +363,9 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // capability plus a fail-closed marker.
   'BOTMUX_MCP_GATEWAY_SOCKET',
   'BOTMUX_MCP_GATEWAY_REQUIRED',
+  // Public per-session plugin action selectors. This lets isolated and remote
+  // CLIs validate interactive cards without reading host-only plugin files.
+  'BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES',
   // v3 host effects / schedule delivery need chatType inside the pane.
   'BOTMUX_CHAT_TYPE',
   'BOTMUX_LARK_APP_ID',
@@ -407,9 +430,34 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   'BOTMUX_LARK_LIST_BOTS_API_ENABLED',
   'BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS',
   'BOTMUX_READY_COMMAND',
+  // Per-session computed shell command string: the user's own statusLine
+  // command that `botmux statusline` chains to after persisting the snapshot.
+  // Not a credential — it is what the user already put in their settings.json.
+  'BOTMUX_STATUSLINE_CHAIN',
   // Path to a one-shot 0600 Codex App control bootstrap. Only the path reaches
   // the pane; the runner consumes+unlinks the file before app-server starts.
   'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP',
+  // Trigger-user CLI identity. The pane inherits PATH from the user's rcfile,
+  // NOT from childEnv, so the worker's PATH prepend never reaches it — these
+  // three are how the wrapper dir gets back in front, via the login-shell shim
+  // (ZDOTDIR/BASH_ENV) that re-prepends BOTMUX_IDENTITY_BIN after path_helper.
+  // Without them on this allowlist the whole feature is inert in a tmux pane:
+  // every governed call silently resolves the real tool and runs as the machine
+  // account.
+  'BOTMUX_IDENTITY_BIN',
+  'ZDOTDIR',
+  'BASH_ENV',
+  // Git attribution for the acting person. Same reason: askpass and the
+  // per-host credential config are set on childEnv, which a tmux pane does not
+  // inherit, so a push would carry the machine's identity instead.
+  'GIT_ASKPASS',
+  // gitIdentityConfigEnv emits exactly three entries, so the numbered keys are
+  // a fixed set (0..2). Listed literally because this allowlist is exact-match:
+  // a prefix rule here would widen what any session can push into a pane.
+  'GIT_CONFIG_COUNT',
+  'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0',
+  'GIT_CONFIG_KEY_1', 'GIT_CONFIG_VALUE_1',
+  'GIT_CONFIG_KEY_2', 'GIT_CONFIG_VALUE_2',
   // Hermes profile roots must match the worker-side transcript reader.
   'HERMES_HOME',
   'HERMES_BOTMUX_SOURCE_HOME',
@@ -417,6 +465,7 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // Per-bot isolated data roots for Claude/Codex.
   'CLAUDE_CONFIG_DIR',
   'CODEX_HOME',
+  'BOTMUX_CODEX_INSTANCE_BINDING',
   // CLI-specific non-interactive/resume startup controls.
   'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
   'CJADK_INTERACTIVE',
@@ -477,6 +526,7 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   // Session-scoped MCP gateway capability + fail-closed marker.
   'BOTMUX_MCP_GATEWAY_SOCKET',
   'BOTMUX_MCP_GATEWAY_REQUIRED',
+  'BOTMUX_PLUGIN_CARD_ACTION_CAPABILITIES',
   // Owning daemon's per-boot IPC port; the daemon self-sets the real value at
   // boot (daemon.ts), so an inherited copy is always a stale foreign port.
   'BOTMUX_DAEMON_IPC_PORT',
@@ -498,6 +548,9 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP',
   // Ready-gate hook command, sessionReadyHookCommand() per session.
   'BOTMUX_READY_COMMAND',
+  // Shadowed user statusLine command, resolved per session from the spawn cwd
+  // + user settings (worker.ts); an inherited copy points at another project.
+  'BOTMUX_STATUSLINE_CHAIN',
   // Per-app value pinned by the ecosystemConfig env block; an inherited copy
   // is untrusted (the daemon resolves its bot via BOTMUX_BOT_INDEX).
   'BOTMUX_LARK_APP_ID',
@@ -523,6 +576,15 @@ export const PROXY_ENV_KEYS = [
   'no_proxy', 'NO_PROXY', 'all_proxy', 'ALL_PROXY',
 ] as const;
 
+/** CA-bundle vars. Same shape as {@link PROXY_ENV_KEYS} and excluded from
+ *  BOTMUX_INJECTED_ENV_KEYS for the same reason: that list also drives the pane
+ *  `unset` clause and scrubTmuxServerGlobalEnv(), so listing a standard,
+ *  user-ownable variable there would DELETE the CA bundle a user configured for
+ *  their own tmux server / rcfile — and it would do so for every CLI on every
+ *  platform, not just the sandboxed Codex this exists for. Forwarded per pane by
+ *  buildBotmuxEnvAssignments instead. */
+export const CA_BUNDLE_ENV_KEYS = ['SSL_CERT_FILE'] as const;
+
 const TMUX_CLIENT_STRIP_KEYS: ReadonlySet<string> = new Set([
   ...BOTMUX_INJECTED_ENV_KEYS,
   ...REDACTED_CHILD_ENV_KEYS,
@@ -534,6 +596,9 @@ const TMUX_CLIENT_STRIP_KEYS: ReadonlySet<string> = new Set([
   // via buildBotmuxEnvAssignments reads opts.env directly, so it's unaffected
   // by this client-side strip.
   ...PROXY_ENV_KEYS,
+  // Same reasoning as the proxy keys: keep a daemon-side CA bundle out of the
+  // shared server's global env, but never delete one the user set there.
+  ...CA_BUNDLE_ENV_KEYS,
 ]);
 
 const TMUX_SERVER_GLOBAL_SCRUB_KEYS: ReadonlySet<string> = new Set([

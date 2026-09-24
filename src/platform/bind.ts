@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { readPlatformBinding, writePlatformBinding } from './binding.js';
 import { postJson, type PostJsonResult } from './platform-http.js';
 import { callDashboard } from '../cli/dashboard-endpoint.js';
+import { formatDashboardSuccessLines } from '../cli/dashboard-command.js';
 import { readGlobalConfig, mergeGlobalConfig } from '../global-config.js';
 import { isManagedAgentHostCommandContext } from './host-command-context.js';
 
@@ -150,9 +151,14 @@ export async function cmdBind(
       path: '/__cli/current',
     });
     if (cur.ok) {
-      console.log(`  面板: ${cur.url}`);
-      // 附带本地直连兜底：中心化平台异常时仍可直接 ip:port 访问 dashboard。
-      if (cur.localUrl) console.log(`  本地直连(平台异常时可用): ${cur.localUrl}`);
+      // ⚠️ 这里曾硬编码 `platformHosted: true`，理由是「刚 bind 成功必然平台托管」——
+      // 那是错的：上面的 `remoteAccess === undefined` 才写 `true`，用户显式设过
+      // `false` 时保持 `false`。此时若配了 `BOTMUX_PUBLIC_URL` / Devbox 短链，
+      // dashboard 返回的是反代基址，硬编码 true 会**确定性**把 token 摘成死链。
+      // 现在一律读 dashboard 自己标注的 `cur.platformHosted`，不再由调用方判断。
+      const [primary, ...rest] = formatDashboardSuccessLines(cur);
+      console.log(`  面板: ${primary}`);
+      for (const line of rest) console.log(`  ${line}`);
     } else {
       console.log('  面板: 运行 `botmux dashboard` 获取中心化平台链接。');
     }

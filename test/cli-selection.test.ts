@@ -1,13 +1,16 @@
 import { describe, expect, it } from 'vitest';
+import { delimiter } from 'node:path';
 
 import {
   CLI_SELECT_OPTIONS,
   CLI_SELECT_TREE,
+  CLI_SELECTION_ALIASES,
   resolveCliSelection,
   lookupCliSelection,
   selectionKeyForBot,
   stripSettingsArgs,
   stripWrapperUnsafeArgs,
+  rewriteAidenCodexArgs,
   buildWrappedLaunch,
   parseWrapperCli,
   decorateResumeForWrapper,
@@ -17,6 +20,7 @@ import {
   TTADK_DEFAULT_MODEL,
   TTADK_MODEL_SUGGESTIONS,
 } from '../src/setup/cli-selection.js';
+import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 
 describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
@@ -62,15 +66,46 @@ describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
     expect(resolveCliSelection('codex-app')).toEqual({ cliId: 'codex-app' });
   });
 
-  it('cascades TRAE (CoCo) into one submenu of coco + traex (no top-level coco/traex)', () => {
+  it('cascades TRAE CLI into a current-first submenu without changing adapter ids', () => {
     const trae = CLI_SELECT_TREE.find((g) => g.key === 'trae');
-    expect(trae?.label).toBe('TRAE (CoCo)');
-    expect(trae?.children?.map((c) => c.key)).toEqual(['coco', 'traex']);
+    expect(trae?.label).toBe('TRAE CLI');
+    expect(trae?.children?.map((c) => c.key)).toEqual(['traex', 'coco']);
+    expect(trae?.children?.map((c) => c.label)).toEqual([
+      'TRAE CLI 2.0（推荐；traex / traecli）',
+      'TRAE CLI 1.0 / Coco（旧版，已停止维护）',
+    ]);
     expect(trae?.option).toBeUndefined();
     expect(CLI_SELECT_TREE.find((g) => g.key === 'coco')).toBeUndefined();
     expect(CLI_SELECT_TREE.find((g) => g.key === 'traex')).toBeUndefined();
     expect(resolveCliSelection('coco')).toEqual({ cliId: 'coco' });
     expect(resolveCliSelection('traex')).toEqual({ cliId: 'traex' });
+    const flatKeys = CLI_SELECT_OPTIONS.map((o) => o.key);
+    expect(flatKeys.indexOf('traex')).toBe(flatKeys.indexOf('coco') - 1);
+    expect(flatKeys.indexOf('forge-x-traex')).toBe(flatKeys.indexOf('coco') + 1);
+  });
+
+  it('exposes Forge x TraeX as a first-class top-level launch shape', () => {
+    const forge = CLI_SELECT_TREE.find((g) => g.key === 'forge-x-traex');
+    expect(forge?.label).toBe('Forge x TraeX');
+    expect(forge?.option).toEqual({
+      key: 'forge-x-traex',
+      label: 'Forge x TraeX',
+      cliId: 'traex',
+      cliLaunchMode: 'forge-traex',
+    });
+    expect(forge?.children).toBeUndefined();
+    expect(resolveCliSelection('forge-x-traex')).toEqual({ cliId: 'traex', cliLaunchMode: 'forge-traex' });
+  });
+
+  it('keeps traecli as an input-only alias of the TRAE CLI 2.0 adapter', () => {
+    expect(CLI_SELECTION_ALIASES).toMatchObject({ traecli: 'traex' });
+    expect(CLI_SELECT_OPTIONS.map((o) => o.key)).not.toContain('traecli');
+    expect(lookupCliSelection('traecli')).toBe(lookupCliSelection('traex'));
+    expect(resolveCliSelection('traecli')).toEqual({ cliId: 'traex' });
+  });
+
+  it('keeps numeric setup choices as selection aliases', () => {
+    expect(resolveCliSelection('14')).toEqual({ cliId: 'traex' });
   });
 
   it('keeps Pi and Oh My Pi as adjacent top-level leaves', () => {
@@ -185,6 +220,11 @@ describe('resolveCliSelection', () => {
 });
 
 describe('selectionKeyForBot', () => {
+  it('round-trips Forge x TraeX bots back to their first-class selection key', () => {
+    expect(selectionKeyForBot('traex', undefined, 'forge-traex')).toBe('forge-x-traex');
+    expect(selectionKeyForBot('traex', 'ignored wrapper', 'forge-traex')).toBe('forge-x-traex');
+  });
+
   it('round-trips aiden gateway bots back to their selection key', () => {
     expect(selectionKeyForBot('claude-code', 'aiden x claude')).toBe('aiden-x-claude');
     expect(selectionKeyForBot('codex', 'aiden x codex')).toBe('aiden-x-codex');
@@ -276,6 +316,37 @@ describe('stripWrapperUnsafeArgs', () => {
   });
 });
 
+describe('rewriteAidenCodexArgs', () => {
+  it('rewrites Botmux reasoning config to Aiden native syntax', () => {
+    expect(rewriteAidenCodexArgs([
+      '--model', 'deepseek-v4-pro',
+      '-c', 'model_reasoning_effort="high"',
+    ])).toEqual({
+      reasoningEffort: 'high',
+      forwardedArgs: ['--model', 'deepseek-v4-pro'],
+    });
+  });
+
+  it.each(['max', 'ultra'] as const)('preserves the %s reasoning level for the shim', (effort) => {
+    expect(rewriteAidenCodexArgs(['-c', `model_reasoning_effort="${effort}"`, '--model', 'm']))
+      .toEqual({ reasoningEffort: effort, forwardedArgs: ['--model', 'm'] });
+  });
+
+  it('removes the Aiden-incompatible config even when no shim is available', () => {
+    const out = buildWrappedLaunch('aiden x codex', [
+      '-c', 'model_reasoning_effort="ultra"', '--model', 'm',
+    ]);
+    expect(out.bin).toBe('aiden');
+    expect(out.args).toEqual(['x', 'codex', '--model', 'm']);
+    expect(out.env).toBeUndefined();
+  });
+
+  it('does not rewrite arbitrary user config values', () => {
+    expect(rewriteAidenCodexArgs(['-c', 'model_provider="custom"']))
+      .toEqual({ reasoningEffort: undefined, forwardedArgs: ['-c', 'model_provider="custom"'] });
+  });
+});
+
 describe('parseWrapperCli', () => {
   it('splits on whitespace and drops blanks', () => {
     expect(parseWrapperCli('  aiden   x claude ')).toEqual(['aiden', 'x', 'claude']);
@@ -330,9 +401,32 @@ describe('buildWrappedLaunch', () => {
     expect(out.args).toEqual(['x', 'codex', '--no-alt-screen']);
   });
 
-  it('does not strip a user-supplied -c that is not a botmux override (aiden x codex)', () => {
-    const out = buildWrappedLaunch('aiden x codex', ['-c', 'model_reasoning_effort="high"', '--model', 'm']);
-    expect(out.args).toEqual(['x', 'codex', '-c', 'model_reasoning_effort="high"', '--model', 'm']);
+  it('strips the luna-nudge override alongside the startup-update one (aiden x codex)', () => {
+    // aiden 1.8.38+ rejects passthrough -c outright; without whitelisting this
+    // botmux-injected value the launch would abort instead of merely losing it.
+    const out = buildWrappedLaunch('aiden x codex', [
+      '-c',
+      'check_for_update_on_startup=false',
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
+      '--no-alt-screen',
+    ]);
+    expect(out.args).toEqual(['x', 'codex', '--no-alt-screen']);
+  });
+
+  it('rewrites the Codex adapter reasoning config for aiden x codex', () => {
+    const out = buildWrappedLaunch(
+      'aiden x codex',
+      ['-c', 'model_reasoning_effort="high"', '--model', 'm'],
+      (bin) => `/resolved/${bin}`,
+      { childPath: '/child/bin', aidenCodexShimDir: '/botmux/scripts/aiden-codex-shim' },
+    );
+    expect(out.bin).toBe('/botmux/scripts/aiden-codex-shim/launch');
+    expect(out.args).toEqual(['/resolved/aiden', 'x', 'codex', '--model', 'm']);
+    expect(out.env).toMatchObject({
+      BOTMUX_AIDEN_CODEX_REAL_BIN: '/resolved/codex',
+      BOTMUX_AIDEN_CODEX_REASONING_EFFORT: 'high',
+    });
   });
 
   // Regression: aiden's launcher injects codex's --dangerously-bypass-hook-trust itself,
@@ -393,6 +487,16 @@ describe('buildWrappedLaunch', () => {
       'check_for_update_on_startup=false',
     ]);
     expect(out.args).toEqual(['codex', '--config', 'check_for_update_on_startup=false']);
+  });
+
+  it('rewrites the luna-nudge override to --config for cjadk codex', () => {
+    // Same -c → --config passthrough requirement as the startup-update override;
+    // cjadk's code subcommand claims -c as --command otherwise.
+    const out = buildWrappedLaunch('cjadk codex', [
+      '-c',
+      'notice.hide_rate_limit_model_nudge=true',
+    ]);
+    expect(out.args).toEqual(['codex', '--config', 'notice.hide_rate_limit_model_nudge=true']);
   });
 
   it('keeps the codex -c override for the bare-passthrough ttadk codex gateway', () => {
@@ -507,6 +611,13 @@ describe('codex adapter × aiden wrapper (regression for commit 10d3e61)', () =>
     expect(out.args).toContain('--no-alt-screen');
   });
 
+  it('aiden x codex strips the cwd trust preseed -c (aiden rejects passthrough config)', () => {
+    const args = codex.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo' });
+    expect(args.join(' ')).toContain('projects={"/repo"={trust_level="trusted"}}');
+    const out = buildWrappedLaunch('aiden x codex', args);
+    expect(out.args.some(a => a.startsWith('projects='))).toBe(false);
+  });
+
   // Cross-CLI guard: any aiden `aiden x <cli>` wrapper must drop a botmux-injected
   // `-c shell_environment_policy.set.BOTMUX_*` override, so a future adapter that
   // mirrors Codex's injection cannot re-break aiden launches. ttadk keeps it
@@ -559,6 +670,16 @@ describe('codex adapter × cjadk wrapper (cjadk -c/--command collision)', () => 
     expect(findConfigOverride(out.args, '-c')).toBeUndefined();
     expect(findConfigOverride(out.args, '--config')).toBe('shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"');
     expect(out.args).toContain('codex-uuid');        // resume target survives
+  });
+
+  it('cjadk codex forwards the cwd trust preseed through --config on a fresh launch', () => {
+    const args = codex.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo' });
+    const out = buildWrappedLaunch('cjadk codex', args);
+    expect(out.args).toContain('--config');
+    expect(out.args).toContain('projects={"/repo"={trust_level="trusted"}}');
+    // It must ride --config, never a bare -c (cjadk --command collision).
+    const idx = out.args.indexOf('projects={"/repo"={trust_level="trusted"}}');
+    expect(out.args[idx - 1]).toBe('--config');
   });
 });
 
@@ -624,5 +745,58 @@ describe('decorateResumeForWrapper', () => {
   it('omits -m for ttadk CoCo resume (still adds --skip-check)', () => {
     expect(decorateResumeForWrapper('coco --resume ID', 'ttadk coco', { ttadkModel: 'glm-5.1' }))
       .toBe('ttadk coco --skip-check --resume ID');
+  });
+});
+
+describe('Codex model-nudge override through wrappers', () => {
+  const override = 'notice.hide_rate_limit_model_nudge=true';
+  it.each([
+    { wrapper: 'aiden x codex', flag: null },
+    { wrapper: 'cjadk codex', flag: '--config' },
+    { wrapper: 'ttadk codex', flag: '-c' },
+  ])('$wrapper handles the enabled override without breaking launch', ({ wrapper, flag }) => {
+    for (const resume of [false, true]) {
+      const args = createCodexAdapter('/usr/bin/codex').buildArgs({
+        sessionId: 'session', resume, resumeSessionId: 'existing-thread',
+        hideRateLimitModelNudge: true,
+      });
+      expect(args).toContain(override);
+      const out = buildWrappedLaunch(wrapper, args);
+      if (flag === null) {
+        expect(out.args).not.toContain(override);
+        expect(out.args).not.toContain('-c');
+        expect(out.args).not.toContain('--config');
+      } else {
+        expect(out.args).toContain(override);
+        expect(out.args[out.args.indexOf(override) - 1]).toBe(flag);
+        if (flag === '--config') expect(out.args).not.toContain('-c');
+      }
+      expect(out.args).toContain('--no-alt-screen');
+      if (resume) expect(out.args).toContain('existing-thread');
+    }
+  });
+
+  it.each(['aiden x codex', 'cjadk codex', 'ttadk codex'])(
+    '%s leaves user-provided notice overrides untouched', (wrapper) => {
+      const userArgs = ['-c', 'notice.hide_rate_limit_model_nudge=false'];
+      expect(buildWrappedLaunch(wrapper, userArgs).args.slice(-2)).toEqual(userArgs);
+    },
+  );
+
+  it('ttadk coco preserves the model-nudge long config option across fresh and resume launches', () => {
+    for (const resume of [false, true]) {
+      for (const enabled of [false, true]) {
+        const args = createCocoAdapter('/usr/bin/coco').buildArgs({
+          sessionId: 'coco-session', resume, model: 'coco-model', hideRateLimitModelNudge: enabled,
+        });
+        const out = buildWrappedLaunch('ttadk coco', args);
+        expect(out.args).toEqual(['coco', '--skip-check', ...args]);
+        expect(out.args.includes('notice.hide_rate_limit_model_nudge=true')).toBe(enabled);
+        if (enabled) {
+          expect(out.args[out.args.indexOf('notice.hide_rate_limit_model_nudge=true') - 1]).toBe('--config');
+        }
+        expect(out.args).toContain('model.name=coco-model');
+      }
+    }
   });
 });

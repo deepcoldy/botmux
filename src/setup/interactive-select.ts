@@ -19,6 +19,8 @@ export interface SelectItem {
   readonly label: string;
   /** 暗色后缀（如 cliId / 命令前缀），仅展示用。 */
   readonly hint?: string;
+  /** 仅用于搜索的隐藏文本，例如二级菜单 child 的 key/label。 */
+  readonly searchText?: string;
   /** 选中后还有二级菜单（渲染 ▸）。 */
   readonly submenu?: boolean;
 }
@@ -51,6 +53,11 @@ export function truncateToWidth(s: string, max: number): string {
   return out;
 }
 
+export function matchesSelectItem(item: SelectItem, query: string): boolean {
+  const q = query.trim().toLowerCase();
+  return !q || `${item.label} ${item.hint ?? ''} ${item.searchText ?? ''}`.toLowerCase().includes(q);
+}
+
 /**
  * 计算视口首行，保证光标始终可见：列表超过 capacity 时窗口跟随光标滚动
  * （含首尾 wrap-around），并 clamp 到合法范围。纯函数，单测覆盖。
@@ -81,10 +88,9 @@ export function interactiveSelect(opts: {
   let filtered: number[] = items.map((_, i) => i);
 
   function refilter(): void {
-    const q = query.trim().toLowerCase();
     filtered = items
       .map((_, i) => i)
-      .filter((i) => !q || `${items[i].label} ${items[i].hint ?? ''}`.toLowerCase().includes(q));
+      .filter((i) => matchesSelectItem(items[i], query));
     if (cursor >= filtered.length) cursor = Math.max(0, filtered.length - 1);
     if (cursor < 0) cursor = 0;
   }
@@ -215,8 +221,8 @@ export async function pickChoice(
 }
 
 /**
- * 级联 CLI 选择器：顶层列出所有 CLI（Aiden 带 ▸），选 Aiden 进二级菜单
- * （原生 / × Claude / × Codex）。返回选择键（CLI_SELECT_OPTIONS 的 key），
+ * 级联 CLI 选择器：顶层列出所有 CLI，带变体的 CLI 进入二级菜单。
+ * 返回选择键（CLI_SELECT_OPTIONS 的 key），
  * 取消返回 null。
  *
  * 非 TTY 回退：打印带序号的扁平列表，用 readline 读「序号 / key」。
@@ -237,7 +243,8 @@ export async function pickCliSelection(
     const byNum = CLI_SELECT_OPTIONS[Number(ans) - 1];
     if (byNum) return byNum.key;
     const byKey = CLI_SELECT_OPTIONS.find((o) => o.key === ans);
-    return byKey ? byKey.key : ans; // 透传：让上层 resolveCliSelection 抛错给出明确提示
+    // 未命中时透传：resolveCliSelection 会解析 traecli 等 alias，或给出明确错误。
+    return byKey ? byKey.key : ans;
   }
 
   // ── TTY：级联 ──
@@ -246,9 +253,12 @@ export async function pickCliSelection(
     const topItems: SelectItem[] = CLI_SELECT_TREE.map((g) => ({
       label: g.label,
       hint: g.children ? '' : g.option?.key,
+      searchText: g.children
+        ? [g.key, ...g.children.flatMap((c) => [c.key, c.label, c.wrapperCli ?? ''])].join(' ')
+        : g.option?.key,
       submenu: !!g.children,
     }));
-    const ti = await interactiveSelect({ title, items: topItems, footer: '选 Aiden 进入子菜单（× Claude / × Codex）' });
+    const ti = await interactiveSelect({ title, items: topItems, footer: '带 ▸ 的项目可进入子菜单选择具体版本或形态' });
     if (ti === null) return null;
     const group = CLI_SELECT_TREE[ti];
     if (group.option) return group.option.key;

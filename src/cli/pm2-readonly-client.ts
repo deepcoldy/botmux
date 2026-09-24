@@ -14,6 +14,8 @@ import {
   type LinuxPm2GodProcess,
 } from '../core/pm2-lifecycle-owner.js';
 
+// Legacy desktop runtimes may still have PM2 on disk. Modern plugin services
+// use the built-in supervisor; this optional observer is never embedded.
 const require = createRequire(import.meta.url);
 const pm2 = require('pm2') as any;
 const mode = process.argv[2];
@@ -81,8 +83,9 @@ pm2.Client.pingDaemon((alive: boolean) => {
     if (mode === 'jlist') {
       pm2.list((error: Error | null | undefined, list: unknown[]) => {
         if (error) fail(`PM2 read-only jlist failed: ${error.message}`);
-        process.stdout.write(JSON.stringify(Array.isArray(list) ? list : []));
-        pm2.disconnect(() => process.exit(0));
+        process.stdout.write(JSON.stringify(Array.isArray(list) ? list : []), () => {
+          pm2.disconnect(() => process.exit(0));
+        });
       });
       return;
     }

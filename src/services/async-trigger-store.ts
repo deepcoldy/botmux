@@ -29,7 +29,7 @@ import { withFileLockSync } from '../utils/file-lock.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
 export interface PersistedAsyncTriggerResult {
-  status: 'pending' | 'completed' | 'failed';
+  status: 'pending' | 'completed' | 'failed' | 'interrupted';
   createdAt: number;
   completedAt?: number;
   content?: string;
@@ -43,6 +43,9 @@ export interface PersistedAsyncTriggerResult {
   /** Original structured worker terminal code retained for programmatic
    *  callers without widening TriggerResponse.errorCode with provider values. */
   terminalErrorCode?: string;
+  /** A caller-authorized turn-level interrupt was delivered to the exact live
+   * worker turn. The session deliberately remains open. */
+  interruptedAt?: number;
   /** Per-turn token usage captured at completion (codex-app). Optional — omitted
    *  when the turn produced no coherent usage. */
   usage?: {
@@ -51,6 +54,15 @@ export interface PersistedAsyncTriggerResult {
     cacheReadTokens: number;
     cacheCreateTokens: number;
   };
+  /** Set ONLY on a still-`pending` result. A codex-app steer group member that
+   *  settled as `steer_superseded` (its content merged into a later turn via
+   *  native turn/steer) waits for the group's real final instead of completing
+   *  empty or hanging. This points at the IMMEDIATE successor's turnId (FIFO
+   *  order; N steers form a chain T1→T2→…→Tn). Poll/boot resolution walks the
+   *  chain to the first terminal record and mirrors it back onto this turn. The
+   *  live daemon normally fans the real final out in-memory before any poll;
+   *  this marker is solely the daemon-restart insurance. */
+  steerParkedBy?: string;
 }
 
 /** On-disk shape: { ownerLarkAppId, latestTriggerId, results }. ownerLarkAppId
@@ -113,7 +125,7 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 function isValidPersistedResult(value: unknown): value is PersistedAsyncTriggerResult {
   if (!isPlainObject(value)) return false;
   const status = value.status;
-  if (status !== 'pending' && status !== 'completed' && status !== 'failed') return false;
+  if (status !== 'pending' && status !== 'completed' && status !== 'failed' && status !== 'interrupted') return false;
   if (typeof value.createdAt !== 'number') return false;
   if (status === 'failed') {
     if (typeof value.failedAt !== 'number') return false;
@@ -128,6 +140,13 @@ function isValidPersistedResult(value: unknown): value is PersistedAsyncTriggerR
     }
   }
   if (status === 'completed' && typeof value.completedAt !== 'number') return false;
+  if (status === 'interrupted' && typeof value.interruptedAt !== 'number') return false;
+  // steerParkedBy only makes sense on a parked-pending steer member; a present
+  // non-string/empty value is a corrupt marker (fail-closed, like the fields
+  // above), and it must never ride a terminal record.
+  if (value.steerParkedBy !== undefined) {
+    if (status !== 'pending' || typeof value.steerParkedBy !== 'string' || value.steerParkedBy.length === 0) return false;
+  }
   return true;
 }
 
@@ -217,6 +236,10 @@ export function recordCompleted(
     const file = load(sessionId);
     if (ownerLarkAppId) file.ownerLarkAppId = ownerLarkAppId;
     const prev = file.results[triggerId];
+    // An acknowledged explicit interrupt is the caller-selected terminal
+    // boundary. A late transcript final may have been emitted concurrently
+    // with Ctrl+C, but must not rewrite the externally observed cancellation.
+    if (prev?.status === 'interrupted') return;
     file.results[triggerId] = {
       status: 'completed',
       createdAt: prev?.createdAt ?? completedAt,
@@ -226,6 +249,99 @@ export function recordCompleted(
     };
     if (!file.latestTriggerId) file.latestTriggerId = triggerId;
     save(sessionId, file);
+  });
+}
+
+/** Park a PENDING steer-group member behind its immediate FIFO successor.
+ *  Restart insurance for HTTP `options.steer` (codex-app native turn/steer):
+ *  the live daemon fans the group's merged real final out in-memory; if it dies
+ *  in the superseded→real-final window, this durable chain lets the next
+ *  trigger-result poll resolve the parked turn by walking `steerParkedBy`.
+ *
+ *  Completed/failed is stronger evidence and always wins: a non-pending record
+ *  is never overwritten. Best-effort save (same durability tier as
+ *  recordPending); serialized under the per-session lock against
+ *  recordCompleted/recordFailedStrict. */
+export function recordSteerParked(
+  sessionId: string,
+  triggerId: string,
+  successorTurnId: string,
+  now: number,
+  ownerLarkAppId: string,
+): void {
+  ensureDir();
+  withFileLockSync(getFilePath(sessionId), () => {
+    const file = load(sessionId);
+    const prev = file.results[triggerId];
+    if (prev && prev.status !== 'pending') return;
+    if (ownerLarkAppId) file.ownerLarkAppId = ownerLarkAppId;
+    file.results[triggerId] = {
+      status: 'pending',
+      createdAt: prev?.createdAt ?? now,
+      steerParkedBy: successorTurnId,
+    };
+    save(sessionId, file);
+  });
+}
+
+export type SupersedePendingTriggerOutcome =
+  | 'superseded'
+  | 'already_superseded'
+  | 'predecessor_steer_parked'
+  | 'predecessor_not_pending'
+  | 'successor_not_completed';
+
+/**
+ * Terminalize one exact pending trigger only when one exact successor trigger in
+ * the same session is durably completed. The caller owns proof of the external
+ * causal link (for example a handoff receipt's predecessorReceiptFile); this
+ * store deliberately never infers causality from timestamps or trigger order.
+ * Later authoritative worker completion or terminal failure may replace this
+ * marker through the normal completed-wins persistence contract.
+ */
+export function supersedePendingTriggerByCompletedSuccessorStrict(
+  sessionId: string,
+  predecessorTriggerId: string,
+  successorTriggerId: string,
+  supersededAt: number,
+  ownerLarkAppId: string,
+): SupersedePendingTriggerOutcome {
+  if (!ownerLarkAppId) throw new Error('supersedePendingTriggerByCompletedSuccessorStrict requires ownerLarkAppId');
+  if (!predecessorTriggerId || !successorTriggerId || predecessorTriggerId === successorTriggerId) {
+    throw new Error('supersedePendingTriggerByCompletedSuccessorStrict requires distinct trigger ids');
+  }
+  ensureDir();
+  return withFileLockSync(getFilePath(sessionId), () => {
+    const file = loadStrict(sessionId);
+    if (file.ownerLarkAppId && file.ownerLarkAppId !== ownerLarkAppId) {
+      throw new Error(`supersedePendingTriggerByCompletedSuccessorStrict owner mismatch: file owned by ${file.ownerLarkAppId}, caller ${ownerLarkAppId}`);
+    }
+    const predecessor = file.results[predecessorTriggerId];
+    const successor = file.results[successorTriggerId];
+    if (!isValidPersistedResult(successor) || successor.status !== 'completed') return 'successor_not_completed';
+    if (predecessor?.status === 'failed'
+      && predecessor.reason === 'turn_terminal'
+      && predecessor.terminalErrorCode === `superseded_by_completed_successor:${successorTriggerId}`) {
+      return 'already_superseded';
+    }
+    // Steer owns the parked member's final result, including after a restart.
+    if (predecessor?.status === 'pending' && predecessor.steerParkedBy) {
+      return 'predecessor_steer_parked';
+    }
+    const replaceableAmbiguousFailure = predecessor?.status === 'failed'
+      && predecessor.reason === 'dispatch_unknown';
+    if (predecessor?.status !== 'pending' && !replaceableAmbiguousFailure) return 'predecessor_not_pending';
+    file.ownerLarkAppId = ownerLarkAppId;
+    file.results[predecessorTriggerId] = {
+      status: 'failed',
+      createdAt: predecessor.createdAt,
+      failedAt: supersededAt,
+      errorCode: 'trigger_failed',
+      reason: 'turn_terminal',
+      terminalErrorCode: `superseded_by_completed_successor:${successorTriggerId}`,
+    };
+    saveStrict(sessionId, file);
+    return 'superseded';
   });
 }
 
@@ -268,6 +384,7 @@ export function recordFailedStrict(
     }
     const prev = file.results[triggerId];
     if (prev?.status === 'completed') return 'already_completed'; // completed is stronger — keep it
+    if (prev?.status === 'interrupted') return 'written_failed';
     // An explicit worker terminal is stronger than a later worker-exit
     // `dispatch_unknown`; keep the precise failure while reporting terminal
     // convergence to the caller.
@@ -307,6 +424,7 @@ export function recordTerminalFailureStrict(
     }
     const prev = file.results[triggerId];
     if (prev?.status === 'completed') return 'already_completed';
+    if (prev?.status === 'interrupted') return 'written_failed';
     file.ownerLarkAppId = ownerLarkAppId;
     file.results[triggerId] = {
       status: 'failed',
@@ -315,6 +433,37 @@ export function recordTerminalFailureStrict(
       errorCode: 'trigger_failed',
       reason: 'turn_terminal',
       terminalErrorCode,
+    };
+    if (!file.latestTriggerId) file.latestTriggerId = triggerId;
+    saveStrict(sessionId, file);
+    return 'written_failed';
+  });
+}
+
+/** Persist a user-requested interrupt after the worker has positively confirmed
+ * it matched and delivered Ctrl+C to the exact live turn. Completion remains
+ * stronger evidence: an already captured final is never replaced. */
+export function recordInterruptedStrict(
+  sessionId: string,
+  triggerId: string,
+  interruptedAt: number,
+  ownerLarkAppId: string,
+): RecordFailedStrictOutcome {
+  if (!ownerLarkAppId) throw new Error('recordInterruptedStrict requires ownerLarkAppId');
+  ensureDir();
+  return withFileLockSync(getFilePath(sessionId), () => {
+    const file = loadStrict(sessionId);
+    if (file.ownerLarkAppId && file.ownerLarkAppId !== ownerLarkAppId) {
+      throw new Error(`recordInterruptedStrict owner mismatch: file owned by ${file.ownerLarkAppId}, caller ${ownerLarkAppId}`);
+    }
+    const prev = file.results[triggerId];
+    if (prev?.status === 'completed') return 'already_completed';
+    if (prev?.status === 'interrupted') return 'written_failed';
+    file.ownerLarkAppId = ownerLarkAppId;
+    file.results[triggerId] = {
+      status: 'interrupted',
+      createdAt: prev?.createdAt ?? interruptedAt,
+      interruptedAt,
     };
     if (!file.latestTriggerId) file.latestTriggerId = triggerId;
     saveStrict(sessionId, file);
@@ -364,6 +513,39 @@ export function lookupStrict(sessionId: string, triggerId?: string): {
     throw new Error(`corrupt async-trigger result (invalid shape) for ${sessionId}/${resolved}`);
   }
   return { triggerId: resolved, result, ownerLarkAppId: file.ownerLarkAppId };
+}
+
+/** Walk a durable steer-park chain (T1→T2→…→Tn) from `firstSuccessorTurnId`
+ *  to the first TERMINAL successor. Returns undefined when the chain is absent,
+ *  ends in a pending record without a pointer, or a hop is missing — the caller
+ *  then keeps reporting `running` (the group's real final may simply not be on
+ *  disk yet).
+ *
+ *  No hop COUNT limit: a legitimate steer group can have arbitrarily many
+ *  members, and capping the restart-insurance walk would strand early members
+ *  (running until session close) only when the daemon restarted mid-group.
+ *  Termination is guaranteed instead by a VISITED set: FIFO successors are
+ *  always distinct later turns, so a revisit can only come from a corrupt
+ *  on-disk cycle, which fails closed (undefined → stay running, never loop). */
+export function followSteerParkedChain(
+  sessionId: string,
+  firstSuccessorTurnId: string,
+): {
+  triggerId: string;
+  result: PersistedAsyncTriggerResult;
+  ownerLarkAppId?: string;
+} | undefined {
+  const visited = new Set<string>();
+  let next: string | undefined = firstSuccessorTurnId;
+  while (next !== undefined) {
+    if (visited.has(next)) return undefined;
+    visited.add(next);
+    const hit = lookup(sessionId, next);
+    if (!hit) return undefined;
+    if (hit.result.status === 'completed' || hit.result.status === 'failed') return hit;
+    next = hit.result.steerParkedBy;
+  }
+  return undefined;
 }
 
 /** Delete a session's persisted async results (called on session close). */

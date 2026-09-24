@@ -8,11 +8,13 @@
  * discover live peers, no shared in-memory state required.
  *
  * A daemon is considered offline if its heartbeat hasn't been refreshed in
- * the last STALE_MS (90s by default — matches dashboard/registry.ts).
+ * the last DAEMON_HEARTBEAT_STALE_MS (utils/daemon-heartbeat.ts — shared with
+ * dashboard/registry.ts and the session-store occupancy lease TTL).
  */
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { resolveBotmuxDataDir } from '../core/data-dir.js';
+import { DAEMON_HEARTBEAT_STALE_MS } from './daemon-heartbeat.js';
 
 export interface OnlineDaemonInfo {
   larkAppId: string;
@@ -27,10 +29,11 @@ export interface OnlineDaemonInfo {
   lastHeartbeat?: number;
 }
 
-const STALE_MS = 90_000;
-
-function registryDir(): string {
-  return join(resolveBotmuxDataDir(), 'dashboard-daemons');
+/** `dataDir` lets a caller that already resolved a data dir keep the daemon
+ *  probe and its store access on the SAME directory. Omitting it falls back to
+ *  the process-wide resolution, which is what every host-CLI caller wants. */
+function registryDir(dataDir?: string): string {
+  return join(dataDir ?? resolveBotmuxDataDir(), 'dashboard-daemons');
 }
 
 /** Parse a loopback daemon IPC port from a descriptor or injected env value. */
@@ -58,8 +61,8 @@ export function resolveDaemonIpcPort(
 }
 
 /** List every daemon whose descriptor file is fresh (heartbeat within STALE_MS). */
-export function listOnlineDaemons(): OnlineDaemonInfo[] {
-  const dir = registryDir();
+export function listOnlineDaemons(dataDir?: string): OnlineDaemonInfo[] {
+  const dir = registryDir(dataDir);
   if (!existsSync(dir)) return [];
   const now = Date.now();
   const out: OnlineDaemonInfo[] = [];
@@ -71,7 +74,7 @@ export function listOnlineDaemons(): OnlineDaemonInfo[] {
       const raw = readFileSync(join(dir, f), 'utf-8');
       const d = JSON.parse(raw) as Partial<OnlineDaemonInfo>;
       if (typeof d.ipcPort !== 'number' || typeof d.larkAppId !== 'string') continue;
-      if (now - (d.lastHeartbeat ?? 0) > STALE_MS) continue;
+      if (now - (d.lastHeartbeat ?? 0) > DAEMON_HEARTBEAT_STALE_MS) continue;
       out.push({
         larkAppId: d.larkAppId,
         ipcPort: d.ipcPort,
@@ -92,6 +95,6 @@ export function listOnlineDaemons(): OnlineDaemonInfo[] {
 }
 
 /** Find a specific online daemon by larkAppId. Returns null if offline / not found. */
-export function findOnlineDaemon(larkAppId: string): OnlineDaemonInfo | null {
-  return listOnlineDaemons().find(d => d.larkAppId === larkAppId) ?? null;
+export function findOnlineDaemon(larkAppId: string, dataDir?: string): OnlineDaemonInfo | null {
+  return listOnlineDaemons(dataDir).find(d => d.larkAppId === larkAppId) ?? null;
 }

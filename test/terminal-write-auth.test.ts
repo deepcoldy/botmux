@@ -18,6 +18,8 @@ import { createHmac } from 'node:crypto';
 import { describe, it, expect } from 'vitest';
 import * as terminalWriteAuth from '../src/core/terminal-write-auth.js';
 import {
+  authorizeTerminalStatusPage,
+  deriveTerminalCardViewToken,
   deriveTerminalWriteToken,
   resolveTerminalAccess,
   resolveTerminalAccessForRequest,
@@ -99,6 +101,67 @@ describe('terminal write capability', () => {
     // token — old view links must stay read-dead, not become operate links.
     expect(deriveTerminalWriteToken('host-secret', 'session-a'))
       .not.toBe(retiredStableViewToken('host-secret', 'session-a'));
+  });
+});
+
+describe('terminal card view capability', () => {
+  it('is stable within one epoch and rotates across session lifecycles', () => {
+    const first = deriveTerminalCardViewToken('host-secret', 'session-a', 'epoch-1');
+    expect(first).toBe(deriveTerminalCardViewToken('host-secret', 'session-a', 'epoch-1'));
+    expect(first).not.toBe(deriveTerminalCardViewToken('host-secret', 'session-a', 'epoch-2'));
+    expect(first).not.toBe(deriveTerminalCardViewToken('host-secret', 'session-b', 'epoch-1'));
+    expect(first).not.toBe(deriveTerminalCardViewToken('other-secret', 'session-a', 'epoch-1'));
+    expect(first).not.toBe(deriveTerminalWriteToken('host-secret', 'session-a'));
+    expect(first).not.toBe(retiredStableViewToken('host-secret', 'session-a'));
+  });
+});
+
+describe('authorizeTerminalStatusPage', () => {
+  const secret = 'host-secret';
+  const sessionId = 'session-a';
+  const epoch = 'epoch-1';
+  const session = { terminalCardEpoch: epoch };
+  const live = {
+    workerViewToken: 'boot-view',
+    workerCardViewToken: 'live-card-view',
+  };
+  const authorize = (
+    capability: { viewToken?: string; token?: string },
+    overrides: Partial<Parameters<typeof authorizeTerminalStatusPage>[0]> = {},
+  ) => authorizeTerminalStatusPage({
+    secret,
+    sessionId,
+    session,
+    live,
+    capability,
+    ...overrides,
+  });
+
+  it('accepts the stable write capability', () => {
+    expect(authorize({ token: deriveTerminalWriteToken(secret, sessionId) })).toBe(true);
+  });
+
+  it('accepts both live worker view capabilities', () => {
+    expect(authorize({ viewToken: live.workerViewToken })).toBe(true);
+    expect(authorize({ viewToken: live.workerCardViewToken })).toBe(true);
+  });
+
+  it('accepts the persisted card epoch after the worker is gone', () => {
+    expect(authorize(
+      { viewToken: deriveTerminalCardViewToken(secret, sessionId, epoch) },
+      { live: undefined },
+    )).toBe(true);
+  });
+
+  it('fails closed for missing sessions, missing capabilities, and stale values', () => {
+    const persisted = deriveTerminalCardViewToken(secret, sessionId, epoch);
+    expect(authorize({ viewToken: persisted }, { session: undefined, live: undefined })).toBe(false);
+    expect(authorize({})).toBe(false);
+    expect(authorize({ token: 'wrong', viewToken: 'stale' })).toBe(false);
+    expect(authorize(
+      { viewToken: persisted },
+      { session: { terminalCardEpoch: 'rotated-epoch' }, live: undefined },
+    )).toBe(false);
   });
 });
 

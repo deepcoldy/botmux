@@ -8,7 +8,7 @@
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
-import { existsSync, readFileSync, openSync, mkdirSync } from 'node:fs';
+import { existsSync, readFileSync, openSync, mkdirSync, statSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import type { FleetBotSpec } from './fleet-supervisor.js';
 import { pidAlive } from './fleet-supervisor.js';
@@ -19,6 +19,19 @@ import { enqueueFleetCommand } from './fleet-command-queue.js';
 import type { FleetProcState, FleetState } from './fleet-supervisor-policy.js';
 import { FLEET_GRACEFUL_EXIT_CODE } from './fleet-supervisor-policy.js';
 import { botProcessName } from '../setup/bot-config-editor.js';
+import { resolveDaemonEnv } from '../cli/daemon-lifecycle-env.js';
+import { scrubDetachedRestartEnvRefresh } from './restart-env-refresh.js';
+import type { RestartEnvFallback } from './restart-env-refresh.js';
+import { stripDashboardH5Env } from '../utils/child-env.js';
+import { findQuotaFallbackCycles } from '../services/quota-fallback.js';
+import {
+  inspectFleetProcess,
+  signalAttestedFleetProcess,
+  type FleetProcessAttestation,
+  type FleetProcessIdentityRuntime,
+  type FleetProcessInspection,
+  fleetProcessIdentityRuntime,
+} from './fleet-process-identity.js';
 
 const CONFIG_DIR = join(homedir(), '.botmux');
 const HEAPSHOT_DIR = join(CONFIG_DIR, 'heapshots');
@@ -56,11 +69,89 @@ export function fleetDaemonNodeArgs(): string[] {
 /** The shared env every supervised member (bot daemons + the dashboard) inherits.
  *  Loads the legacy global .env for backward compat (WEB_HOST etc.), same as
  *  index-daemon did via dotenv. */
-export function resolveFleetDaemonEnv(): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  // Legacy: the daemon reads ~/.botmux/.env for global settings. We surface the
-  // file's presence to the caller by NOT parsing here — index-daemon's own
-  // dotenvConfig loads it. Keeping env pass-through avoids double-parsing.
+export type FleetDaemonEnvFileRead =
+  | { status: 'loaded'; text: string }
+  | { status: 'missing' }
+  | { status: 'failed' };
+
+export interface FleetDaemonEnvFileReadOptions {
+  retryDelaysMs?: readonly number[];
+  sleep?: (delayMs: number) => void;
+}
+
+const DEFAULT_ENV_FILE_RETRY_DELAYS_MS = [10, 25] as const;
+
+/**
+ * Read the optional fleet .env without mistaking an unlink-to-rename update for
+ * deletion. The first read happens immediately; only ENOENT enters a finite
+ * synchronous quiet period that may recover a replacement which appears while
+ * we wait. Exhausting that period is still uncertain: elapsed time is not a
+ * writer barrier, so an external unlink-to-rename update may remain in flight.
+ * Without an explicit deletion signal we fail safe and let callers retain their
+ * authenticated fallback snapshot.
+ */
+export function readFleetDaemonEnvFile(
+  envFilePath = ENV_FILE,
+  readTextFile: (path: string) => string = path => readFileSync(path, 'utf-8'),
+  statFile: (path: string) => unknown = path => statSync(path),
+  options: FleetDaemonEnvFileReadOptions = {},
+): FleetDaemonEnvFileRead {
+  const retryDelaysMs = options.retryDelaysMs ?? DEFAULT_ENV_FILE_RETRY_DELAYS_MS;
+  const sleep = options.sleep ?? sleepSyncMs;
+
+  for (let attempt = 0; attempt <= retryDelaysMs.length; attempt += 1) {
+    try {
+      return { status: 'loaded', text: readTextFile(envFilePath) };
+    } catch (readError) {
+      if ((readError as NodeJS.ErrnoException).code !== 'ENOENT') return { status: 'failed' };
+    }
+
+    try {
+      statFile(envFilePath);
+    } catch (statError) {
+      if ((statError as NodeJS.ErrnoException).code !== 'ENOENT') return { status: 'failed' };
+    }
+
+    if (attempt < retryDelaysMs.length) sleep(retryDelaysMs[attempt]);
+  }
+
+  return { status: 'failed' };
+}
+
+export function resolveFleetDaemonEnv(
+  inheritedEnv: NodeJS.ProcessEnv = process.env,
+  envFile: FleetDaemonEnvFileRead | string | undefined = readFleetDaemonEnvFile(),
+  options: boolean | StartFleetOptions = Boolean(inheritedEnv.BOTMUX_SESSION_ID?.trim()),
+): NodeJS.ProcessEnv {
+  // A restart invoked inside a managed session inherits the old daemon's
+  // settings. Resolve the persisted lifecycle snapshot before spawning the
+  // supervisor; its entrypoint deliberately drops BOTMUX_SESSION_ID, after
+  // which it is too late to distinguish a session restart from a shell start.
+  const envFileRead: FleetDaemonEnvFileRead = typeof envFile === 'string'
+    ? { status: 'loaded', text: envFile }
+    : envFile ?? { status: 'missing' };
+  const refreshPersistedEnv = typeof options === 'boolean'
+    ? options
+    : options.refreshPersistedEnv ?? Boolean(inheritedEnv.BOTMUX_SESSION_ID?.trim());
+  const inferredSessionRefresh = typeof options !== 'boolean'
+    && options.refreshPersistedEnv === undefined
+    && Boolean(inheritedEnv.BOTMUX_SESSION_ID?.trim());
+  const readFailureFallback = typeof options === 'boolean'
+    ? (options ? inheritedEnv : undefined)
+    : options.readFailureFallback ?? (inferredSessionRefresh ? inheritedEnv : undefined);
+  const lifecycleSource = envFileRead.status === 'failed' && refreshPersistedEnv
+    ? readFailureFallback ?? {}
+    : inheritedEnv;
+  const env: NodeJS.ProcessEnv = {
+    ...inheritedEnv,
+    ...resolveDaemonEnv(
+      lifecycleSource,
+      envFileRead.status === 'loaded' ? envFileRead.text : undefined,
+      envFileRead.status === 'failed' ? false : refreshPersistedEnv,
+    ),
+  };
+  scrubDetachedRestartEnvRefresh(env);
+  stripDashboardH5Env(env);
   //
   // MIGRATION-CRITICAL: pin SESSION_DATA_DIR for every supervised child. The old
   // pm2 ecosystem injected `SESSION_DATA_DIR: DATA_DIR` into both the bot daemons
@@ -107,6 +198,14 @@ export function resolveFleetBots(): FleetBotSpec[] {
   try { bots = JSON.parse(readFileSync(botsJson, 'utf-8')); } catch { return []; }
   const list = Array.isArray(bots) ? bots : (bots as { bots?: unknown[] })?.bots;
   if (!Array.isArray(list)) return [];
+  return resolveFleetBotsFromEntries(list);
+}
+
+/** Pure projection used by startup and regression tests. Cyclic handoff members
+ * are intentionally absent; the dashboard is appended separately by
+ * resolveFleetMembers(), so operators retain a recovery surface. */
+export function resolveFleetBotsFromEntries(list: readonly unknown[]): FleetBotSpec[] {
+  const cyclicAppIds = new Set(findQuotaFallbackCycles(list as any[]).flat());
   return list.map((b, index) => {
     const bot = (b ?? {}) as { name?: unknown; larkAppId?: unknown };
     return {
@@ -117,7 +216,7 @@ export function resolveFleetBots(): FleetBotSpec[] {
       appId: typeof bot.larkAppId === 'string' ? bot.larkAppId : '',
       botIndex: index,
     };
-  });
+  }).filter(spec => !cyclicAppIds.has(spec.appId));
 }
 
 const LOG_DIR = join(CONFIG_DIR, 'logs');
@@ -129,8 +228,10 @@ export const DASHBOARD_PROCESS_NAME = 'botmux-dashboard';
 
 /**
  * The dashboard's fleet spec. The dashboard is supervised exactly like a bot
- * daemon (crash-restart, graceful-exit code 90 → no restart, max_restarts park),
- * but runs the `dashboard` entry (index-dashboard.ts) instead of a bot daemon,
+ * daemon (crash-restart; the 90 graceful sentinel is honoured ONLY when this
+ * supervisor itself requested the stop via stopAll/stop-bot — an unsolicited
+ * 90 or an outside signal crash-restarts instead; max_restarts parks), but
+ * runs the `dashboard` entry (index-dashboard.ts) instead of a bot daemon,
  * carries no bot index/appId, and logs to dashboard-{out,err}.log. This is what
  * replaces the old unconditional `apps.push({ name: 'botmux-dashboard', … })` in
  * pm2's ecosystemConfig — the dashboard was always a fleet app under pm2, so it
@@ -157,12 +258,55 @@ export function resolveFleetMembers(): FleetBotSpec[] {
   return [...resolveFleetBots(), resolveDashboardSpec()];
 }
 
-/** True if a live fleet supervisor is already running (per fleet-state pid + kill -0). */
-export function liveSupervisorPid(): number | undefined {
-  const state = readFleetState(fleetStatePath());
+function supervisorCommandMatches(state: FleetState, commandLine: string): boolean {
+  if (!state.supervisorEntry || !commandLine.includes(state.supervisorEntry)) return false;
+  return state.supervisorEntry.includes('index-supervisor') || commandLine.includes('__supervisor');
+}
+
+export function inspectSupervisorState(
+  state: FleetState,
+  runtime: FleetProcessIdentityRuntime = fleetProcessIdentityRuntime,
+): FleetProcessInspection {
   const pid = state?.supervisorPid ?? 0;
-  if (!Number.isSafeInteger(pid) || pid <= 1) return undefined;
-  try { process.kill(pid, 0); return pid; } catch { return undefined; }
+  if (pid > 1 && !state.supervisorCommand && !state.supervisorEntry) return { status: 'unverifiable' };
+  return inspectFleetProcess(
+    pid,
+    state.supervisorProcessStart,
+    state.supervisorPidNamespace,
+    commandLine => state.supervisorCommand
+      ? commandLine === state.supervisorCommand
+      : supervisorCommandMatches(state, commandLine),
+    runtime,
+  );
+}
+
+export function liveSupervisorTarget(
+  statePath: string = fleetStatePath(),
+  runtime: FleetProcessIdentityRuntime = fleetProcessIdentityRuntime,
+): FleetProcessAttestation | undefined {
+  const state = readFleetState(statePath);
+  const pid = state?.supervisorPid ?? 0;
+  if (!state) return undefined;
+  const inspection = inspectSupervisorState(state, runtime);
+  if (inspection.status === 'unverifiable') {
+    throw new Error(`fleet: 无法核验 supervisor pid ${pid} 的进程身份；为避免双实例，已中止操作`);
+  }
+  return inspection.status === 'exact' ? inspection.attestation : undefined;
+}
+
+function attestedSupervisorAlive(target: FleetProcessAttestation): boolean {
+  const inspection = inspectFleetProcess(
+    target.pid,
+    target.processStart,
+    target.pidNamespace,
+    commandLine => commandLine === target.commandLine,
+  );
+  return inspection.status === 'exact';
+}
+
+/** True only when fleet-state identifies this exact supervisor generation. */
+export function liveSupervisorPid(): number | undefined {
+  return liveSupervisorTarget()?.pid;
 }
 
 export interface StartFleetResult {
@@ -182,7 +326,12 @@ export interface StartFleetResult {
  * NOTE: the caller must already hold the fleet-mutation file lock so two
  * concurrent `botmux start` invocations can't both pass the liveness check.
  */
-export function startFleetViaSupervisor(): StartFleetResult {
+export interface StartFleetOptions {
+  refreshPersistedEnv?: boolean;
+  readFailureFallback?: RestartEnvFallback;
+}
+
+export function startFleetViaSupervisor(options: StartFleetOptions = {}): StartFleetResult {
   const bots = resolveFleetBots();
   const existing = liveSupervisorPid();
   if (existing !== undefined) {
@@ -197,7 +346,7 @@ export function startFleetViaSupervisor(): StartFleetResult {
     cwd: CONFIG_DIR,
     detached: true,
     stdio: ['ignore', out, err],
-    env: { ...process.env },
+    env: resolveFleetDaemonEnv(process.env, readFleetDaemonEnvFile(), options),
   });
   child.unref();
   return { action: 'started', supervisorPid: child.pid ?? 0, botCount: bots.length };
@@ -223,19 +372,20 @@ export interface StopFleetResult {
  * a time), same contract as startFleetViaSupervisor.
  */
 export function stopFleet(timeoutMs = DEFAULT_STOP_TIMEOUT_MS): StopFleetResult {
-  const pid = liveSupervisorPid();
-  if (pid === undefined) return { action: 'not-running', supervisorPid: 0 };
-  try { process.kill(pid, 'SIGTERM'); } catch { return { action: 'not-running', supervisorPid: pid }; }
+  const target = liveSupervisorTarget();
+  if (!target) return { action: 'not-running', supervisorPid: 0 };
+  const pid = target.pid;
+  if (!signalAttestedFleetProcess(target, 'SIGTERM')) return { action: 'not-running', supervisorPid: pid };
   const deadline = Date.now() + Math.max(0, timeoutMs);
   while (Date.now() < deadline) {
-    if (!pidAlive(pid)) return { action: 'stopped', supervisorPid: pid };
+    if (!attestedSupervisorAlive(target)) return { action: 'stopped', supervisorPid: pid };
     sleepSyncMs(STOP_POLL_INTERVAL_MS);
   }
-  if (!pidAlive(pid)) return { action: 'stopped', supervisorPid: pid };
+  if (!attestedSupervisorAlive(target)) return { action: 'stopped', supervisorPid: pid };
   // Supervisor outlasted its graceful window — hard-kill it. Its daemon children
   // already got SIGTERM from stopAll() and will exit on their own.
-  try { process.kill(pid, 'SIGKILL'); } catch { /* raced to exit */ }
-  return pidAlive(pid) ? { action: 'timeout', supervisorPid: pid } : { action: 'stopped', supervisorPid: pid };
+  signalAttestedFleetProcess(target, 'SIGKILL');
+  return attestedSupervisorAlive(target) ? { action: 'timeout', supervisorPid: pid } : { action: 'stopped', supervisorPid: pid };
 }
 
 export interface RestartFleetResult {
@@ -248,9 +398,16 @@ export interface RestartFleetResult {
  * Because startFleetViaSupervisor re-reads bots.json, this also picks up any
  * config change. Caller must hold the fleet-mutation lock.
  */
-export function restartFleet(timeoutMs = DEFAULT_STOP_TIMEOUT_MS): RestartFleetResult {
-  const stop = stopFleet(timeoutMs);
-  const start = startFleetViaSupervisor();
+export interface RestartFleetOptions extends StartFleetOptions {
+  timeoutMs?: number;
+}
+
+export function restartFleet(options: RestartFleetOptions = {}): RestartFleetResult {
+  const stop = stopFleet(options.timeoutMs);
+  const start = startFleetViaSupervisor({
+    refreshPersistedEnv: options.refreshPersistedEnv,
+    readFailureFallback: options.readFailureFallback,
+  });
   return { stop, start };
 }
 
@@ -306,7 +463,12 @@ export function projectFleetStatus(
  * on its next tick, but status should never lie about liveness in the meantime.
  */
 export function readFleetStatus(statePath: string = fleetStatePath()): FleetStatus {
-  return projectFleetStatus(readFleetState(statePath));
+  const state = readFleetState(statePath);
+  const status = projectFleetStatus(state);
+  if (!state || state.supervisorPid <= 1) return status;
+  const inspection = inspectSupervisorState(state);
+  status.supervisorAlive = inspection.status === 'exact';
+  return status;
 }
 
 /** Block for `ms` without a busy-spin (one-shot CLI; stalling its loop is fine). */
@@ -343,9 +505,16 @@ export function waitFleetOnline(
   let pending: string[] = [...want];
   for (;;) {
     const status = readFleetStatus(statePath);
-    const onlineNames = new Set(
-      status.rows.filter((r) => want.has(r.name) && r.status === 'online' && r.alive).map((r) => r.name),
-    );
+    // Member rows are a projection owned by the supervisor. Never accept old
+    // rows merely because their numeric PIDs happen to exist: until the exact
+    // supervisor generation is attested, none of its projection proves that the
+    // newly-started fleet is healthy. This closes the same cross-namespace/PID
+    // reuse hole as stop/restart signalling.
+    const onlineNames = status.supervisorAlive
+      ? new Set(status.rows
+        .filter((r) => want.has(r.name) && r.status === 'online' && r.alive)
+        .map((r) => r.name))
+      : new Set<string>();
     pending = [...want].filter((n) => !onlineNames.has(n));
     if (pending.length === 0) return { healthy: true, online: expected, expected, pending: [] };
     if (Date.now() >= deadline) return { healthy: false, online: expected - pending.length, expected, pending };
@@ -393,8 +562,8 @@ export function startBotViaSupervisor(
 ): StartBotSupervisorResult {
   const spec = resolveFleetBotByAppId(appId);
   if (!spec) return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
-  const supervisorPid = liveSupervisorPid();
-  if (supervisorPid === undefined) {
+  const supervisorTarget = liveSupervisorTarget();
+  if (!supervisorTarget) {
     return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行，请先 botmux start', name: spec.name };
   }
   // Already online+alive? No-op.
@@ -405,7 +574,7 @@ export function startBotViaSupervisor(
   enqueueFleetCommand(fleetCommandPath(), {
     id: idFactory(), op: 'start-bot', name: spec.name, appId: spec.appId, botIndex: spec.botIndex, at: nowIso(),
   });
-  try { process.kill(supervisorPid, 'SIGHUP'); } catch {
+  if (!signalAttestedFleetProcess(supervisorTarget, 'SIGHUP')) {
     return { ok: false, reason: 'fleet_down', message: 'supervisor 已不在运行', name: spec.name };
   }
   const health = waitFleetOnline([spec.name], timeoutMs);
@@ -427,8 +596,8 @@ export function stopBotViaSupervisor(
 ): StopBotSupervisorResult {
   const spec = resolveFleetBotByAppId(appId);
   if (!spec) return { ok: false, reason: 'not_found', message: `appId ${appId} 不在 bots.json 中` };
-  const supervisorPid = liveSupervisorPid();
-  if (supervisorPid === undefined) {
+  const supervisorTarget = liveSupervisorTarget();
+  if (!supervisorTarget) {
     return { ok: false, reason: 'fleet_down', message: 'daemon 未在运行', name: spec.name };
   }
   const existing = readFleetStatus().rows.find((r) => r.name === spec.name);
@@ -447,7 +616,7 @@ export function stopBotViaSupervisor(
   enqueueFleetCommand(fleetCommandPath(), {
     id: idFactory(), op: 'stop-bot', name: spec.name, appId: spec.appId, botIndex: spec.botIndex, at: nowIso(),
   });
-  try { process.kill(supervisorPid, 'SIGHUP'); } catch {
+  if (!signalAttestedFleetProcess(supervisorTarget, 'SIGHUP')) {
     return { ok: false, reason: 'fleet_down', message: 'supervisor 已不在运行', name: spec.name };
   }
   // Poll until the bot has actually come to rest (stopped/errored/absent), or
@@ -461,4 +630,3 @@ export function stopBotViaSupervisor(
     sleepSyncMs(150);
   }
 }
-

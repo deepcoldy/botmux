@@ -130,6 +130,12 @@ export class CodexAppTurnDispatchQueue {
     return entry ? { ...entry } : undefined;
   }
 
+  /** Resolve a runner-owned reply id to its worker-owned delivery attempt. */
+  findByTurnId(turnId: string): CodexAppTurnDispatchReservation | undefined {
+    const matches = this.queue.filter(candidate => candidate.turnId === turnId);
+    return matches.length === 1 ? { ...matches[0] } : undefined;
+  }
+
   /**
    * Validate and consume one complete final transaction.  The head remains in
    * place on every rejection, so a stale/mismatched marker cannot steal the

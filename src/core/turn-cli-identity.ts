@@ -1,0 +1,348 @@
+/**
+ * Per-turn publication of the acting CLI identity.
+ *
+ * This is where the three pieces meet: the bot's {@link TriggerUserAuthConfig}
+ * policy, the per-person token store, and the session identity file a wrapper
+ * sources. It runs once per turn, just before the turn reaches the CLI.
+ *
+ * The single rule it enforces: **the credentials published for a turn belong to
+ * the person who sent that turn, or nothing is published.** There is no path
+ * here that reads another person's token — the sender's open_id is the only key
+ * ever used, and when it yields nothing the previous file is DELETED rather than
+ * left in place. A stale file would mean the next command silently runs as the
+ * previous person, which is the exact failure the feature exists to remove.
+ */
+import { logger } from '../utils/logger.js';
+import { resolveUserToken, lookupAuthorizedUserName } from '../utils/user-token.js';
+import { t } from '../i18n/index.js';
+import type { Locale } from '../i18n/index.js';
+import { normalizeBrand } from '../im/lark/lark-hosts.js';
+import { beginBytedcliLogin, mintBytedcliJwts } from '../services/bytedcli-auth.js';
+import { resolveLarkCliHomeForTurn, beginLarkCliLogin } from '../services/lark-cli-auth.js';
+import type { BotConfig } from '../bot-registry.js';
+import {
+  triggerUserAuthApplies,
+  TRIGGER_USER_AUTH_TOOLS,
+  type TriggerUserAuthTool,
+} from '../services/trigger-user-auth.js';
+import {
+  writeSessionIdentity,
+  clearSessionIdentity,
+  type CliIdentity,
+} from './cli-identity.js';
+
+/** What was published for one tool this turn — drives the user-visible notice. */
+export interface ToolIdentityOutcome {
+  tool: TriggerUserAuthTool;
+  /**
+   * - `user`: the sender's own credentials are in force.
+   * - `needs-authorization`: nothing published; the sender must authorize
+   *   before the tool will work. Neither governed tool degrades to a machine
+   *   identity anymore, so there is no other "allowed" outcome.
+   * - `off`: the policy does not govern this tool; nothing was touched.
+   */
+  state: 'user' | 'needs-authorization' | 'off';
+}
+
+/** Created only by the daemon after verifying the signed dispatch and resolving
+ * its stable user identity in the receiving app. Never accepted from CLI input. */
+export interface DelegatedCliIdentity {
+  targetOpenId?: string;
+  credentialOpenId: string;
+  tools: TriggerUserAuthTool[];
+  dispatchRoot: string;
+  denialReason?: 'target_access_denied' | 'target_validation_unavailable';
+}
+
+export interface PublishTurnIdentityArgs {
+  botConfig: BotConfig;
+  sessionDataDir: string;
+  sessionId: string;
+  /** The person who sent THIS turn. Absent for turns with no human sender. */
+  senderOpenId: string | undefined;
+  delegatedIdentity?: DelegatedCliIdentity;
+  /** For the stderr text the wrapper prints when a command is refused. */
+  locale?: Locale;
+  /**
+   * The turn these credentials are for. Stamped into the file so the wrapper can
+   * refuse to use them during a different turn — the CLI runs its own queue, so
+   * a newer message's credentials can land while an older turn is still going.
+   */
+  turnId?: string;
+}
+
+/**
+ * Publish (or withhold) each governed tool's identity for the current turn.
+ *
+ * Never throws: a credential-publication failure must not take down the turn.
+ * The worst case is a withheld identity, which the tool reports as an auth error
+ * and the agent can act on.
+ */
+export async function publishTurnCliIdentity(
+  args: PublishTurnIdentityArgs,
+): Promise<ToolIdentityOutcome[]> {
+  const { botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId } = args;
+  const policy = botConfig.triggerUserAuth;
+  const outcomes: ToolIdentityOutcome[] = [];
+
+  for (const tool of TRIGGER_USER_AUTH_TOOLS) {
+    if (!triggerUserAuthApplies(policy, tool)) {
+      outcomes.push({ tool, state: 'off' });
+      continue;
+    }
+    try {
+      outcomes.push(args.delegatedIdentity
+        ? await publishDelegated(tool, args, args.delegatedIdentity)
+        : await publishOne(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId));
+    } catch (e) {
+      // Fail closed through the SAME policy as an ordinary missing token, so a
+      // credential-store outage and "this person never authorized" cannot end
+      // up with different identities in force. Overwriting matters as much as
+      // the policy: leaving the previous person's file would keep running as
+      // them with no signal at all.
+      logger.warn(
+        `[trigger-user-auth] withheld ${tool} identity for session ${sessionId}: `
+        + `${e instanceof Error ? e.message : String(e)}`,
+      );
+      outcomes.push(args.delegatedIdentity
+        ? denyDelegated(tool, args, args.delegatedIdentity)
+        : await withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId));
+    }
+  }
+  return outcomes;
+}
+
+function denyDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs, user: DelegatedCliIdentity): ToolIdentityOutcome {
+  const reason = user.denialReason === 'target_validation_unavailable'
+    ? 'Target user or group membership verification is unavailable. Restore verification before retrying; logging in again will not fix this check.'
+    : user.denialReason === 'target_access_denied'
+      ? 'The requesting user could not be granted access to the target bot/chat. Check target access and group membership; do not request another login.'
+      : 'The source must ask the original human to authorize.';
+  try {
+    writeSessionIdentity(args.sessionDataDir, args.sessionId, {
+      tool, mode: 'denied', ...(args.turnId ? { turnId: args.turnId } : {}),
+      message: `botmux: delegated ${tool} execution refused for the requesting user. `
+        + `Report this blocker with botmux report --dispatch-root ${user.dispatchRoot}; `
+        + reason + ' Do not ask a bot to log in or use another identity.',
+    });
+  } catch {
+    clearSessionIdentity(args.sessionDataDir, args.sessionId, tool);
+  }
+  return { tool, state: 'needs-authorization' };
+}
+
+async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs, user: DelegatedCliIdentity): Promise<ToolIdentityOutcome> {
+  if (!user.tools.includes(tool)) return denyDelegated(tool, args, user);
+  let identity: CliIdentity | null = null;
+  if (tool === 'bytedcli') {
+    // Keep the issuer-scoped credential key; do not copy a source open_id into
+    // the target app or duplicate/extend the lifetime of the user's login.
+    const jwt = await mintBytedcliJwts(user.credentialOpenId);
+    if (jwt) identity = { tool, cloudJwt: jwt.cloudJwt, ...(jwt.codeJwt ? { codeJwt: jwt.codeJwt } : {}) };
+  } else {
+    const home = await resolveLarkCliHomeForTurn(user.credentialOpenId);
+    if (home) identity = { tool, mode: 'user-home', home };
+    else if (user.targetOpenId && args.botConfig.larkAppId && args.botConfig.larkAppSecret) {
+      // Legacy bot-app OAuth is application-bound: only a target-app token is
+      // valid here. A source-app OAuth token is never presented as a target one.
+      const token = await resolveUserToken(args.botConfig.larkAppId, args.botConfig.larkAppSecret,
+        normalizeBrand(args.botConfig.brand), user.targetOpenId);
+      if (token) identity = { tool, appId: args.botConfig.larkAppId, userAccessToken: token };
+    }
+  }
+  if (!identity) return denyDelegated(tool, args, user);
+  writeSessionIdentity(args.sessionDataDir, args.sessionId, { ...identity, ...(args.turnId ? { turnId: args.turnId } : {}) });
+  return { tool, state: 'user' };
+}
+
+async function publishOne(
+  tool: TriggerUserAuthTool,
+  botConfig: BotConfig,
+  sessionDataDir: string,
+  sessionId: string,
+  senderOpenId: string | undefined,
+  locale: Locale | undefined,
+  turnId: string | undefined,
+): Promise<ToolIdentityOutcome> {
+  const withheld = async () =>
+    withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId);
+
+  // No human sender (scheduled run, hook, meeting event, bot-to-bot handoff):
+  // there is no "trigger user" to act as. Withhold — never reach for the session
+  // creator's or the owner's credentials to fill the gap.
+  if (!senderOpenId) return await withheld();
+
+  const identity = await resolveIdentityFor(tool, botConfig, senderOpenId);
+  if (!identity) return await withheld();
+
+  writeSessionIdentity(sessionDataDir, sessionId, { ...identity, ...(turnId ? { turnId } : {}) });
+  return { tool, state: 'user' };
+}
+
+/**
+ * What "no usable credentials for this turn's sender" resolves to.
+ *
+ * The one place that decision is made, so every route into it — no sender, no
+ * token, a store outage — lands on the same identity.
+ *
+ * Neither outcome can be expressed by deleting the file. The wrapper reads an
+ * absent file as a refusal, so running as the bot has to be published
+ * explicitly (with app id + secret; lark-cli given nothing picks up the
+ * operator's on-disk login instead). And a refusal is published too, because it
+ * carries the text the refused person reads.
+ */
+async function withholdIdentity(
+  tool: TriggerUserAuthTool,
+  botConfig: BotConfig,
+  sessionDataDir: string,
+  sessionId: string,
+  senderOpenId: string | undefined,
+  locale: Locale | undefined,
+  turnId: string | undefined,
+): Promise<ToolIdentityOutcome> {
+  // Pre-fetch a ready, valid authorization link for either tool so the moment a
+  // governed command is actually refused, the agent has a link to relay instead
+  // of asking the person to type a command. Beginning only mints a link and
+  // messages nobody, so non-CLI turns are not disturbed. Uses a fresh, still
+  // unexpired challenge when one exists.
+  let authUrl: string | undefined;
+  if (senderOpenId) {
+    try {
+      authUrl = tool === 'bytedcli'
+        ? (await beginBytedcliLogin(senderOpenId))?.authUrl
+        : (await beginLarkCliLogin(senderOpenId))?.authUrl;
+    } catch (e) {
+      logger.warn(
+        `[trigger-user-auth] could not pre-fetch ${tool} auth link for session ${sessionId}: `
+        + `${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+  writeDenial(sessionDataDir, sessionId, tool, senderOpenId, botConfig, locale, turnId, authUrl);
+  return { tool, state: 'needs-authorization' };
+}
+
+/**
+ * Publish a refusal the wrapper prints verbatim on stderr.
+ *
+ * Names the person whose authorization is missing when we know it, and always
+ * says how to supply it. Without the "how", someone whose command just failed
+ * has no way to discover that /login is the answer — they retry, fail again,
+ * and conclude the bot is broken.
+ *
+ * Best-effort by construction: if this write fails the file stays absent, which
+ * the wrapper also reads as a denial. Safety does not depend on it landing —
+ * only the quality of the message does.
+ */
+function writeDenial(
+  sessionDataDir: string,
+  sessionId: string,
+  tool: TriggerUserAuthTool,
+  senderOpenId: string | undefined,
+  botConfig: BotConfig,
+  locale: Locale | undefined,
+  turnId: string | undefined,
+  authUrl?: string,
+): void {
+  try {
+    const name = senderOpenId && botConfig.larkAppId
+      // Brand matters: the lookup checks it, so a Lark-brand bot with the
+      // default 'feishu' finds nothing and the refusal loses the person's name.
+      ? lookupAuthorizedUserName(botConfig.larkAppId, senderOpenId, normalizeBrand(botConfig.brand))
+      : undefined;
+    // Name the right provider. bytedcli authenticates against ByteCloud, so
+    // saying "Feishu authorization" would send the reader to authorize the
+    // wrong thing — the same mistake as naming the wrong /login command.
+    const provider = tool === 'bytedcli'
+      ? 'ByteCloud'
+      : t('trigger_user_auth.provider_lark', undefined, locale);
+    // With no name, address the reader directly rather than printing a raw
+    // open_id at them. The name comes from a stored Lark token, which someone
+    // being refused for lack of authorization usually does not have — so the
+    // nameless case is the COMMON one here, not an edge case, and `「ou_5f3a…」
+    // 本人` reads as a machine talking to itself.
+    const head = !senderOpenId
+      ? t('trigger_user_auth.denied_anonymous', { tool, provider }, locale)
+      : name
+        ? t('trigger_user_auth.denied_known_user', { name, tool, provider }, locale)
+        : t('trigger_user_auth.denied_you', { tool, provider }, locale);
+    writeSessionIdentity(sessionDataDir, sessionId, {
+      tool,
+      mode: 'denied',
+      ...(turnId ? { turnId } : {}),
+      message: [
+        head,
+        // A ready device-code link for either tool: lead with the self-serve,
+        // one-tap instruction and a clear "authorize once" framing so it reads
+        // as "one step left", not as a broken bot. Without a link (fetch failed
+        // or no human sender), fall back to the /login instructions.
+        ...(authUrl
+          ? [
+              t('trigger_user_auth.denied_auto_login', { tool, provider }, locale),
+              authUrl,
+              t('trigger_user_auth.denied_auto_retry', undefined, locale),
+            ]
+          : [t(
+              'trigger_user_auth.denied_howto',
+              { command: tool === 'bytedcli' ? '/login bytedcli' : '/login' },
+              locale,
+            ),
+            t('trigger_user_auth.denied_howto_status', undefined, locale)]),
+      ].join('\n'),
+    });
+  } catch (e) {
+    clearSessionIdentity(sessionDataDir, sessionId, tool);
+    logger.debug(
+      `[trigger-user-auth] could not publish the ${tool} denial (absent file denies too): `
+      + `${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+}
+
+async function resolveIdentityFor(
+  tool: TriggerUserAuthTool,
+  botConfig: BotConfig,
+  senderOpenId: string,
+): Promise<CliIdentity | null> {
+  if (tool === 'lark-cli') {
+    // Preferred path: the per-person HOME created by the lark-cli device-code
+    // flow. lark-cli then acts as that person using the provisioned app bound
+    // inside that HOME — no token is injected into the environment, and the
+    // acting identity is a directory isolated per sender (mirrors bytedcli).
+    // No appId is passed: the HOME's own lark-cli config already names the app.
+    //
+    // The resolver polls a pending device login once before deciding: a browser
+    // approval writes nothing locally, so without that poll "tap the link, then
+    // retry" could never succeed on the turn path.
+    const home = await resolveLarkCliHomeForTurn(senderOpenId);
+    if (home) {
+      return { tool: 'lark-cli', mode: 'user-home', home };
+    }
+    // Back-compat: a bot-app OAuth user token already stored server-side.
+    if (!botConfig.larkAppId || !botConfig.larkAppSecret) return null;
+    const token = await resolveUserToken(
+      botConfig.larkAppId,
+      botConfig.larkAppSecret,
+      normalizeBrand(botConfig.brand),
+      senderOpenId,
+    );
+    if (!token) return null;
+    // The app id travels with the token: lark-cli refuses a token without it
+    // ("blocked by env: …USER_ACCESS_TOKEN is set but …APP_ID is missing").
+    return { tool: 'lark-cli', appId: botConfig.larkAppId, userAccessToken: token };
+  }
+
+  // bytedcli authenticates against ByteCloud SSO, a different provider from
+  // Lark OAuth — a Lark user token is not convertible into a ByteCloud JWT. So
+  // this person's credentials come from their own bytedcli login, minted fresh
+  // per turn: the ByteCloud JWT lives ~2 hours while the login behind it lives
+  // ~3 weeks, and bytedcli refreshes it internally, so asking each time is what
+  // keeps people from being sent back to a QR code every couple of hours.
+  //
+  // Null when they have not authorized (or their login has ended), which the
+  // caller turns into the ordinary "authorize, then retry" refusal rather than
+  // falling back to the machine's own SSO session.
+  const jwts = await mintBytedcliJwts(senderOpenId);
+  if (!jwts) return null;
+  return { tool: 'bytedcli', cloudJwt: jwts.cloudJwt, ...(jwts.codeJwt ? { codeJwt: jwts.codeJwt } : {}) };
+}

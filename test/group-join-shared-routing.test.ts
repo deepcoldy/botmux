@@ -10,6 +10,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 
 const mocks = vi.hoisted(() => ({
   forkWorker: vi.fn(),
+  registerHostAsk: vi.fn(),
   getAvailableBots: vi.fn(async () => []),
   getChatContext: vi.fn(async (_appId: string, chatId: string) => ({
     chatId,
@@ -29,6 +30,11 @@ const mocks = vi.hoisted(() => ({
   replyMessage: vi.fn(async () => 'om_reply'),
   scanMultipleProjects: vi.fn(() => [] as Array<{ name: string; path: string; type: 'repo' | 'worktree'; branch: string }>),
   sendMessage: vi.fn(async () => 'om_join_seed'),
+}));
+
+vi.mock('../src/core/ask-broker.js', async () => ({
+  ...await vi.importActual<any>('../src/core/ask-broker.js'),
+  registerHostAsk: mocks.registerHostAsk,
 }));
 
 vi.mock('@larksuiteoapi/node-sdk', () => {
@@ -98,10 +104,13 @@ function tempDir(name: string): string {
 async function loadModules() {
   const registry = await import('../src/bot-registry.js');
   const sessionStore = await import('../src/services/session-store.js');
+  const collaborationModeStore = await import('../src/services/group-collaboration-mode-store.js');
   const daemon = await import('../src/daemon.js');
   const types = await import('../src/core/types.js');
   sessionStore.init();
-  return { daemon, registry, types };
+  const policy = await import('../src/core/trusted-session-controller.js');
+  const interruptions = await import('../src/core/cross-principal-interruption-store.js');
+  return { collaborationModeStore, daemon, registry, types, policy, interruptions, sessionStore };
 }
 
 beforeAll(async () => {
@@ -137,6 +146,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  for (const ds of modules.daemon.__testOnly_activeSessions.values()) clearTimeout(ds.crossPrincipalWaitTimer);
+  vi.useRealTimers();
+  vi.unstubAllEnvs();
   modules.daemon.__testOnly_setAutoStartJoinReadyMaxWaitMs();
 });
 
@@ -146,6 +158,60 @@ afterAll(() => {
 });
 
 describe('handleBotAdded — 普通群 shared 路由', () => {
+  it('项目群关闭自动纳入时保留显式 Worker 名单', async () => {
+    const { collaborationModeStore, daemon, registry } = modules;
+    const appId = 'app_join_explicit_worker';
+    const chatId = 'oc_join_explicit_worker';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: false,
+    });
+    await collaborationModeStore.writeGroupCollaborationMode(process.env.SESSION_DATA_DIR!, {
+      chatId,
+      mode: 'project',
+      coordinatorAppId: 'app_coordinator',
+      workerAppIds: ['app_existing_worker'],
+      autoEnrollWorkers: false,
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    expect(collaborationModeStore.readGroupCollaborationMode(process.env.SESSION_DATA_DIR!, chatId)?.workerAppIds)
+      .toEqual(['app_existing_worker']);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
+  it('项目群开启自动纳入后，新 Bot 即使未开启入群自动开工也会加入 Worker 白名单', async () => {
+    const { collaborationModeStore, daemon, registry } = modules;
+    const appId = 'app_join_project_worker';
+    const chatId = 'oc_join_project_worker';
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: false,
+    });
+    await collaborationModeStore.writeGroupCollaborationMode(process.env.SESSION_DATA_DIR!, {
+      chatId,
+      mode: 'project',
+      coordinatorAppId: 'app_coordinator',
+      workerAppIds: ['app_existing_worker'],
+      autoEnrollWorkers: true,
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    expect(collaborationModeStore.readGroupCollaborationMode(process.env.SESSION_DATA_DIR!, chatId)?.workerAppIds)
+      .toEqual(['app_existing_worker', appId]);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
   it('创建一个话题根并复用 chat-scope session', async () => {
     const { daemon, registry, types } = modules;
     const appId = 'app_join_shared';
@@ -183,6 +249,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       ds,
       expect.anything(),
       expect.objectContaining({ turnId: seedId }),
+      expect.any(Object),
     );
     expect(mocks.getChatContext).toHaveBeenCalledOnce();
     expect(mocks.getChatContext).toHaveBeenCalledWith(appId, chatId);
@@ -258,6 +325,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       ds,
       expect.anything(),
       expect.objectContaining({ turnId: 'om_join_seed' }),
+      expect.any(Object),
     );
   });
 
@@ -319,6 +387,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       ds,
       expect.anything(),
       expect.objectContaining({ turnId: expect.stringMatching(/^join_/) }),
+      expect.any(Object),
     );
   });
 
@@ -366,6 +435,45 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       undefined,
       expect.anything(),
     );
+  });
+
+  // 卡片发不出去（飞书 230025 等）时不能停在 pendingRepo：入群自动开工没有任何
+  // 用户输入可再触发，会话会永久挂在一张不存在的卡片上。降级 = 走同一个「无可选
+  // 项目」分支，用默认目录直接开工，且共享 seed 仍归本轮所有。
+  it('repo 卡发送失败时改用默认目录直接开工，而不是挂在不存在的卡片上', async () => {
+    const { daemon, registry, types } = modules;
+    const appId = 'app_join_pending_repo_card_fail';
+    const chatId = 'oc_join_pending_repo_card_fail';
+    const scanDir = tempDir('scan-pending-repo-card-fail');
+    mocks.getProjectScanDirs.mockReturnValue([scanDir]);
+    mocks.scanMultipleProjects.mockReturnValue([{
+      name: 'botmux',
+      path: scanDir,
+      type: 'repo',
+      branch: 'master',
+    }]);
+    mocks.replyMessage.mockImplementation(async (...args: any[]) => {
+      if (args[3] === 'interactive') throw new Error('lark card send failure');
+      return 'om_reply';
+    });
+    registry.registerBot({
+      larkAppId: appId,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: ['ou_owner'],
+      autoStartOnGroupJoin: true,
+      autoStartOnGroupJoinPrompt: '开始排查',
+      regularGroupReplyMode: 'shared',
+    });
+
+    await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+
+    const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId));
+    expect(ds?.pendingRepo).toBe(false);
+    expect(ds?.repoCardMessageId).toBeUndefined();
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    // 卡片没发出去就没有可删的消息，别拿 undefined 去调删除接口。
+    expect(mocks.deleteMessage).not.toHaveBeenCalled();
   });
 
   it('losing registration leaves no shared seed message or orphaned first turn', async () => {
@@ -710,6 +818,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       ds,
       expect.objectContaining({ content: expect.stringContaining('seed 失败后仍需处理') }),
       expect.objectContaining({ turnId: userMessageId }),
+      expect.any(Object),
     );
     expect(ds?.session.currentReplyTarget).toMatchObject({
       rootMessageId: userMessageId,
@@ -787,6 +896,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
       ds,
       expect.objectContaining({ content: expect.stringContaining('bootstrap 超时后接管') }),
       expect.objectContaining({ turnId: userMessageId }),
+      expect.any(Object),
     );
 
     releaseSeed('om_late_join_seed');
@@ -988,7 +1098,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     expect(ds?.session.currentReplyTarget).toBeUndefined();
     // 话题群自动开工：seed 消息 id 即首轮权威 turnId（修复前为 false，首轮回复
     // 发不回飞书）。
-    expect(mocks.forkWorker).toHaveBeenCalledWith(ds, expect.anything(), { turnId: 'om_join_seed' });
+    expect(mocks.forkWorker).toHaveBeenCalledWith(ds, expect.anything(), { turnId: 'om_join_seed' }, expect.any(Object));
   });
 
   it('话题群配置自定义 seed 时锚点消息用自定义文案', async () => {
@@ -1050,7 +1160,7 @@ describe('handleBotAdded — 普通群 shared 路由', () => {
     // new-topic 是独立会话（非 shared 复用），不 arm shared reply target。
     expect(ds?.session.currentReplyTarget).toBeUndefined();
     // 同话题群：seed 消息 id 即首轮权威 turnId。
-    expect(mocks.forkWorker).toHaveBeenCalledWith(ds, expect.anything(), { turnId: 'om_join_seed' });
+    expect(mocks.forkWorker).toHaveBeenCalledWith(ds, expect.anything(), { turnId: 'om_join_seed' }, expect.any(Object));
   });
 });
 
@@ -1298,4 +1408,153 @@ describe('handleBotAdded — 非 shared 首轮 turn 身份与 provenance', () =>
     expect(daemon.__testOnly_activeSessions.get(key)).toBeDefined();
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
   });
+});
+
+// Use the real join, talk gate, delivery envelope and durable interruption driver.
+async function collaborativeSession() {
+  const { daemon, registry, types } = modules;
+  const appId = 'app_collaborative';
+  const chatId = 'oc_collaborative';
+  const workingDir = tempDir('collaborative-repo');
+  mocks.forkWorker.mockImplementation((ds: any) => { ds.worker = { killed: false, send: vi.fn() }; });
+  registry.registerBot({ larkAppId: appId, larkAppSecret: 's', cliId: 'codex',
+    allowedUsers: ['ou_owner', 'ou_other'], autoStartOnGroupJoin: true,
+    autoStartOnGroupJoinPrompt: 'Investigate the shared incident',
+    defaultWorkingDir: workingDir, regularGroupReplyMode: 'shared',
+    groupSerialInput: { [chatId]: true } });
+  await daemon.__testOnly_handleBotAdded(chatId, 'ou_owner', appId);
+  const ds = daemon.__testOnly_activeSessions.get(types.sessionKey(chatId, appId))!;
+  const owner = { requestUserOpenId: 'ou_owner', requestLarkAppId: appId, senderType: 'user' as const };
+  ds.activeInteractiveTurn = { turnId: 'om_owner_active', caller: owner };
+  return { ds, owner, other: { ...owner, requestUserOpenId: 'ou_other' } };
+}
+
+describe('configured serial group input', () => {
+  it.each(['false', 'true'])('admits another member in order without an owner question with XPI=%s', async (xpiEnabled) => {
+    vi.stubEnv('BOTMUX_XPI_ENABLED', xpiEnabled);
+    const { ds, other } = await collaborativeSession();
+    for (const [id, text] of [['om_supplement', 'Additional evidence'], ['om_continue', 'Continue investigating']]) {
+      await modules.daemon.__testOnly_handleThreadReply({
+        sender: { sender_id: { open_id: other.requestUserOpenId }, sender_type: 'user' },
+        message: { message_id: id, chat_id: ds.chatId, chat_type: 'group', message_type: 'text',
+          content: JSON.stringify({ text }), create_time: String(Date.now()) },
+      }, { chatId: ds.chatId, messageId: id, chatType: 'group', scope: 'chat',
+        anchor: ds.chatId, replyRootId: id, larkAppId: ds.larkAppId });
+    }
+    const inputs = vi.mocked(ds.worker!.send).mock.calls.map(c => c[0]).filter((m: any) => m.type === 'message');
+    expect(inputs).toMatchObject([
+      { turnId: 'om_supplement', queueAfterActiveTurn: true, trustedCaller: other },
+      { turnId: 'om_continue', queueAfterActiveTurn: true, trustedCaller: other },
+    ]);
+    expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    expect(mocks.registerHostAsk).not.toHaveBeenCalled();
+  });
+
+  it('uses only explicit group configuration while retaining authenticated managed-session boundaries', async () => {
+    const { ds, other } = await collaborativeSession();
+    const allows = modules.policy.isSerialGroupInput;
+    expect(allows(ds, other)).toBe(true);
+    expect(allows(ds)).toBe(false);
+    expect(allows(ds, { ...other, requestLarkAppId: 'foreign' })).toBe(false);
+    expect(allows(ds, { ...other, source: 'schedule_creator', taskId: 'schedule' })).toBe(false);
+    expect(allows({ ...ds, chatType: 'p2p' }, other)).toBe(false);
+    expect(allows({ ...ds, chatId: 'oc_unconfigured' }, other)).toBe(false);
+    expect(allows({ ...ds, adoptedFrom: 'existing-pane' } as typeof ds, other)).toBe(false);
+    // The same configured group works for manually created topics without join provenance.
+    ds.session.turnReplyContexts = {};
+    expect(allows(ds, other)).toBe(true);
+    const cfg = modules.registry.getBot(ds.larkAppId).config;
+    cfg.oncallChats = [{ chatId: ds.chatId, workingDir: '/tmp' }];
+    cfg.groupSerialInput = undefined;
+    expect(allows(ds, other)).toBe(false);
+    cfg.groupSerialInput = { [ds.chatId]: false };
+    expect(allows(ds, other)).toBe(false);
+    cfg.groupSerialInput[ds.chatId] = true;
+    expect(allows(ds, other)).toBe(true);
+  });
+});
+
+describe('confirmation delivery failure', () => {
+  // #1456 made the durable XPI driver run only while the XPI switch is on
+  // (OFF sweeps staged records); these helper-retry cases exercise that driver.
+  beforeEach(() => { vi.stubEnv('BOTMUX_XPI_ENABLED', 'true'); });
+  for (const stage of ['classification', 'owner', 'wait'] as const) {
+    it(`retains ${stage} input durably, backs off, and retries with a new ask identity`, async () => {
+      const { ds, owner, other } = await collaborativeSession();
+      const { record } = modules.interruptions.stageCrossPrincipalInterruptionRecord({
+        session: ds.session, ownerTurnId: 'om_owner_active', owner, proposer: other,
+        message: { turnId: 'om_pending', text: 'original evidence', userPrompt: 'original evidence', createdAt: new Date().toISOString() },
+      });
+      if (stage !== 'classification') record.phase = 'awaiting_owner';
+      if (stage === 'owner') ds.activeInteractiveTurn = undefined;
+      if (stage === 'wait') record.ownerWaitDeadlineAt = Date.now() - 1;
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+      const failure = { kind: 'invalidated', reason: 'card dispatch failed', selected: null, by: null, comment: null, timedOut: false };
+      mocks.registerHostAsk.mockReset().mockResolvedValue(failure);
+      const drive = modules.daemon.__testOnly_driveCrossPrincipalInterruptions;
+      await drive(ds);
+      const firstRequest = mocks.registerHostAsk.mock.calls[0][0].requestId;
+      expect(record.confirmationRetryCount).toBe(1);
+      expect(record.messages[0].text).toBe('original evidence');
+      expect(modules.sessionStore.getSession(ds.session.sessionId)?.crossPrincipalInterruptions?.[0])
+        .toMatchObject({ id: record.id, confirmationRetryCount: 1, confirmationRetryAt: record.confirmationRetryAt });
+      await drive(ds);
+      expect(mocks.registerHostAsk).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(mocks.registerHostAsk).toHaveBeenCalledTimes(2);
+      expect(mocks.registerHostAsk.mock.calls[1][0].requestId).toBe(`${firstRequest}:retry:1`);
+      expect(ds.session.crossPrincipalInterruptions).toHaveLength(1);
+      expect(ds.session.crossPrincipalInterruptions?.[0].confirmationRetryCount).toBe(2);
+      const replies = JSON.stringify([...mocks.replyMessage.mock.calls, ...mocks.sendMessage.mock.calls]);
+      expect(replies).toContain('消息仍保留');
+      expect(replies).not.toContain('未选择处理方式');
+      expect(replies.match(/消息仍保留/g)).toHaveLength(1);
+      // A real delivered-card timeout is still a user decision window expiry.
+      mocks.registerHostAsk.mockResolvedValue({ kind: 'timedOut', selected: null, by: null, comment: null, timedOut: true });
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+    });
+  }
+});
+
+it('recovers a thrown dispatcher failure and accepts the displayed suggestion label', async () => {
+  vi.stubEnv('BOTMUX_XPI_ENABLED', 'true');
+  const { ds, owner, other } = await collaborativeSession();
+  const { record } = modules.interruptions.stageCrossPrincipalInterruptionRecord({
+    session: ds.session, ownerTurnId: 'om_owner_active', owner, proposer: other,
+    message: { turnId: 'om_retry_text', text: 'evidence', userPrompt: 'evidence', createdAt: new Date().toISOString() },
+  });
+  vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+  mocks.registerHostAsk.mockReset().mockRejectedValueOnce(new Error('dispatcher unavailable'));
+  await modules.daemon.__testOnly_driveCrossPrincipalInterruptions(ds);
+  const persisted = modules.sessionStore.readSessionRowFromDisk(ds.session.sessionId, ds.larkAppId);
+  expect(persisted?.crossPrincipalInterruptions?.[0]).toMatchObject({ id: record.id, confirmationRetryCount: 1 });
+  // Simulate restoring the queue from disk, then let its retry deadline fire.
+  ds.session.crossPrincipalInterruptions = persisted!.crossPrincipalInterruptions;
+  mocks.registerHostAsk.mockResolvedValue({ kind: 'answered', answers: [], by: other.requestUserOpenId,
+    comment: '对当前任务的建议', timedOut: false });
+  await vi.advanceTimersByTimeAsync(60_000);
+  expect(ds.session.crossPrincipalInterruptions?.[0]).toMatchObject({ id: record.id, phase: 'awaiting_owner' });
+  expect(ds.session.crossPrincipalInterruptions?.[0].confirmationRetryAt).toBeUndefined();
+});
+
+it('does not resurrect a removed input when its outstanding card fails', async () => {
+  vi.stubEnv('BOTMUX_XPI_ENABLED', 'true');
+  const { ds, owner, other } = await collaborativeSession();
+  modules.interruptions.stageCrossPrincipalInterruptionRecord({
+    session: ds.session, ownerTurnId: 'om_owner_active', owner, proposer: other,
+    message: { turnId: 'om_removed', text: 'evidence', userPrompt: 'evidence', createdAt: new Date().toISOString() },
+  });
+  let fail!: (result: any) => void;
+  mocks.registerHostAsk.mockReset().mockImplementation(() => new Promise(resolve => { fail = resolve; }));
+  const pending = modules.daemon.__testOnly_driveCrossPrincipalInterruptions(ds);
+  // Let the driver reach the (mocked) outstanding ask before the record is
+  // removed externally; the ask call itself stays pending.
+  await vi.waitFor(() => expect(mocks.registerHostAsk).toHaveBeenCalledTimes(1));
+  expect(typeof fail).toBe('function');
+  ds.session.crossPrincipalInterruptions = undefined;
+  fail({ kind: 'invalidated', reason: 'closed', selected: null, by: null, comment: null, timedOut: false });
+  await pending;
+  expect(ds.session.crossPrincipalInterruptions).toBeUndefined();
+  expect(ds.crossPrincipalWaitTimer).toBeUndefined();
 });

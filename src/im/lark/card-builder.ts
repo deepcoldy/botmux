@@ -9,7 +9,7 @@ import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
 import type { TurnRetryOffer } from '../../services/turn-failure-notice.js';
 import { t, type Locale } from '../../i18n/index.js';
-import { cardUsageFooterSegment, cardUsageRuntimeSegment, contextOverCompactThreshold, type CardUsageSnapshot } from './md-card.js';
+import { cardModelFallbackNotice, cardUsageFooterSegment, cardUsageRuntimeSegment, contextOverCompactThreshold, type CardUsageSnapshot } from './md-card.js';
 import { readGlobalConfig } from '../../global-config.js';
 import type { ConfigCardData } from '../../services/bot-config-store.js';
 import { isLocalCliOpenEnabled } from '../../services/local-cli-opener.js';
@@ -20,6 +20,9 @@ import {
   GRANT_DURATION_OPTIONS,
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
+import { STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
+import type { StreamingCardButtonId } from './streaming-card-buttons.js';
+import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -290,6 +293,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'genius': 'Genius',
   'opencode': 'OpenCode',
   'opencode2': 'OpenCode 2',
+  'mimocode': 'MiMoCode',
   'antigravity': 'Antigravity',
   'mtr': 'MTR',
   'hermes': 'Hermes',
@@ -308,6 +312,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'dsh': 'DeepSeek Harness',
   'dsh-tui': 'DeepSeek Harness TUI',
   'mojo': 'Mojo',
+  'minimax': 'MiniMax',
 };
 
 export function getCliDisplayName(cliId: CliId): string {
@@ -599,15 +604,7 @@ export function buildForkPanelCard(
       elements: [{
         tag: 'table',
         page_size: 10,
-        row_height: 'low',
-        header_style: {
-          text_align: 'left',
-          text_size: 'normal',
-          background_style: 'grey',
-          text_color: 'default',
-          bold: true,
-          lines: 1,
-        },
+        ...TABLE_AUTO_ROW_STYLE,
         columns: [
           { name: 'instruction', display_name: t('card.fork_panel.col_instruction', undefined, locale), data_type: 'text', width: 'auto' },
           { name: 'status', display_name: t('card.fork_panel.col_status', undefined, locale), data_type: 'text', width: '90px' },
@@ -693,15 +690,7 @@ export function buildSlashListCard(
     elements.push({
       tag: 'table',
       page_size: 10,
-      row_height: 'low',
-      header_style: {
-        text_align: 'left',
-        text_size: 'normal',
-        background_style: 'grey',
-        text_color: 'default',
-        bold: true,
-        lines: 1,
-      },
+      ...TABLE_AUTO_ROW_STYLE,
       columns: [
         { name: 'cmd', display_name: t('slashlist.col_cmd', undefined, locale), data_type: 'lark_md', width: '200px' },
         { name: 'desc', display_name: t('slashlist.col_desc', undefined, locale), data_type: 'text', width: 'auto' },
@@ -848,20 +837,45 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
  *  card limit, leaving room for JSON escaping + the card's structural overhead. */
 const PRIVATE_SNAPSHOT_TEXT_MAX = 50_000;
 
-const STREAM_TEMPLATE_MAP = {
-  starting: 'yellow', working: 'blue', idle: 'green', analyzing: 'purple', stalled: 'red', limited: 'red', retry_ready: 'green', interrupted: 'orange',
-} as const;
+/** idle 状态下卡头的替代标签：
+ *  - 'silent'：本轮判定无需回复（worker terminal outputDisposition 'nothing_to_send'）；
+ *  - 'completed'：transcript 模式下最终回复卡已投递成功。
+ *  只对 idle 生效，其它状态一律忽略。 */
+export type IdleCardLabel = 'silent' | 'completed';
+
+/** 兼容旧调用：布尔 `true` 等价于 'silent'。 */
+function normalizeIdleLabel(v: boolean | IdleCardLabel | undefined): IdleCardLabel | undefined {
+  if (v === true) return 'silent';
+  if (v === 'silent' || v === 'completed') return v;
+  return undefined;
+}
+
+/** 冻结卡（FrozenCard）回读 idle 标签：新字段 `idleLabel` 优先；旧盘只有
+ *  `silentIdle: true` 时按 'silent' 处理。结构化参数，避免 card-builder 反向依赖 core。 */
+export function frozenIdleLabel(fc: { idleLabel?: IdleCardLabel; silentIdle?: boolean }): IdleCardLabel | undefined {
+  return fc.idleLabel ?? (fc.silentIdle ? 'silent' : undefined);
+}
 
 /** Header status label for a streaming/snapshot card. Shared by the live card
  *  and the private snapshot so the two never drift. */
-function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, silentIdle?: boolean): string {
+function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, idleLabel?: boolean | IdleCardLabel): string {
   switch (status) {
     case 'starting': return t('card.status.starting', undefined, locale);
     case 'working': return t('card.status.working', undefined, locale);
-    // silentIdle: the turn completed as DELIBERATE silence (bare
+    // idleLabel 'silent': the turn completed as DELIBERATE silence (bare
     // nothing-to-send sentinel). Plain 「等待输入」 here is indistinguishable
     // from a hung session; say "handled, judged no reply needed" instead.
-    case 'idle': return t(silentIdle ? 'card.status.idle_silent' : 'card.status.idle', undefined, locale);
+    // 'completed': transcript 模式下最终回复卡已投递，卡头改「已完成」。
+    case 'idle': {
+      const label = normalizeIdleLabel(idleLabel);
+      return t(
+        label === 'completed' ? 'card.status.idle_completed'
+          : label === 'silent' ? 'card.status.idle_silent'
+            : 'card.status.idle',
+        undefined,
+        locale,
+      );
+    }
     case 'analyzing': return t('card.status.analyzing', undefined, locale);
     case 'stalled': return t('card.status.stalled', undefined, locale);
     case 'limited': return usageLimit?.retryReady
@@ -873,6 +887,10 @@ function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState 
 
 /** Push the shared "output body" elements (usage-limit notice + screenshot) used
  *  by both {@link buildStreamingCard} and {@link buildPrivateSnapshotCard}. */
+/** Smallest built-in Feishu card font (10px): the fallback notice is a
+ *  footnote, one step below the 12px usage line. */
+const MODEL_FALLBACK_NOTICE_TEXT_SIZE = 'x-small';
+
 function pushStreamBody(
   elements: any[],
   opts: { status: StreamStatus; usageLimit?: CliUsageLimitState; displayMode: DisplayMode; imageKey?: string; cliName: string; locale?: Locale; usage?: CardUsageSnapshot },
@@ -959,7 +977,8 @@ export function buildStreamingCard(
   usage?: CardUsageSnapshot,
   runtimeDisplayName?: string,
   serviceTierBadge?: string,
-  silentIdle?: boolean,
+  /** idle 卡头替代标签；布尔 `true` 兼容旧调用（= 'silent'）。见 {@link IdleCardLabel}。 */
+  silentIdle?: boolean | IdleCardLabel,
   /** Live per-bot `dshRuntime`. Only meaningful for cliId 'dsh': 'tui' means the
    *  worker spawns the PTY-driven dsh-tui adapter (a real interactive TUI that
    *  accepts a raw /compact), so the compact button must stay visible. Omitted ⇒
@@ -968,6 +987,7 @@ export function buildStreamingCard(
    *  never showed the button either), so a call site that forgets to pass it
    *  degrades to the status quo rather than to a broken button. */
   dshRuntime?: 'official' | 'tui',
+  hiddenButtons: readonly StreamingCardButtonId[] = [],
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
@@ -989,30 +1009,33 @@ export function buildStreamingCard(
 
   // ── Main control row: display toggle, mode toggle, terminal, manage ─────
   const headerActions: any[] = [];
+  const hidden = new Set(hiddenButtons);
 
-  headerActions.push({
-    tag: 'button',
-    text: { tag: 'plain_text', content: t(displayMode === 'hidden' ? 'card.btn.show_output' : 'card.btn.hide_output', undefined, locale) },
-    type: 'default' as const,
-    value: { action: 'toggle_display', ...actionBase },
-  });
-  if (displayMode !== 'hidden') {
+  if (!hidden.has('output')) {
     headerActions.push({
       tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.export_text', undefined, locale) },
+      text: { tag: 'plain_text', content: t(displayMode === 'hidden' ? 'card.btn.show_output' : 'card.btn.hide_output', undefined, locale) },
       type: 'default' as const,
-      value: { action: 'export_text', ...actionBase },
+      value: { action: 'toggle_display', ...actionBase },
     });
+    if (displayMode !== 'hidden') {
+      headerActions.push({
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.export_text', undefined, locale) },
+        type: 'default' as const,
+        value: { action: 'export_text', ...actionBase },
+      });
+    }
+    if (displayMode === 'screenshot') {
+      headerActions.push({
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.refresh', undefined, locale) },
+        type: 'default' as const,
+        value: { action: 'refresh_screenshot', ...actionBase },
+      });
+    }
   }
-  if (displayMode === 'screenshot') {
-    headerActions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.refresh', undefined, locale) },
-      type: 'default' as const,
-      value: { action: 'refresh_screenshot', ...actionBase },
-    });
-  }
-  if (terminalUrl) {
+  if (terminalUrl && !hidden.has('terminal')) {
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
@@ -1030,7 +1053,7 @@ export function buildStreamingCard(
       value: { action: 'retry_last_task', ...actionBase },
     });
   }
-  if (terminalUrl) {
+  if (terminalUrl && !hidden.has('writeLink')) {
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
@@ -1054,7 +1077,7 @@ export function buildStreamingCard(
   //      resolvePassthroughCommands 对这些 CLI 返回空集拦住，按钮不能把那条路重新打开。
   // dsh 是运行时相关的：dshRuntime='tui' 跑的是 PTY 驱动的 dsh-tui（真交互 TUI），照常显示。
   // handler 侧另有一道同谓词的拒绝兜底（compact_session），两层都不依赖百分比。
-  if (!isRemoteCliId(cliId) && !cliHasNoRawPassthroughSurface(effectiveCliId, { dshRuntime })) {
+  if (!hidden.has('compact') && !isRemoteCliId(cliId) && !cliHasNoRawPassthroughSurface(effectiveCliId, { dshRuntime })) {
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.compact', undefined, locale) },
@@ -1067,7 +1090,7 @@ export function buildStreamingCard(
   // term_action ctrlc IPC 链路（与展开态 ^C 快捷键完全同款），中断当前 turn 但保留会话。
   // 仅在有 turn 可停的状态显示：idle 无 turn 可停；starting CLI 未起；limited turn 已失败。
   // remote CLI（riff/mojo）无终端可驱动、codex-app 无 PTY 输入通道，均隐藏。
-  if (!isRemoteCliId(cliId) && effectiveCliId !== 'codex-app'
+  if (!hidden.has('stop') && !isRemoteCliId(cliId) && effectiveCliId !== 'codex-app'
     && (status === 'working' || status === 'analyzing' || status === 'stalled')) {
     headerActions.push({
       tag: 'button',
@@ -1085,13 +1108,15 @@ export function buildStreamingCard(
         value: { action: 'takeover', ...actionBase },
       });
     }
-    headerActions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.disconnect', undefined, locale) },
-      type: 'danger' as const,
-      value: { action: 'disconnect', ...actionBase },
-    });
-  } else {
+    if (!hidden.has('close')) {
+      headerActions.push({
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.disconnect', undefined, locale) },
+        type: 'danger' as const,
+        value: { action: 'disconnect', ...actionBase },
+      });
+    }
+  } else if (!hidden.has('close')) {
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
@@ -1099,7 +1124,7 @@ export function buildStreamingCard(
       value: { action: 'close', ...actionBase },
     });
   }
-  elements.push({ tag: 'action', actions: headerActions });
+  if (headerActions.length > 0) elements.push({ tag: 'action', actions: headerActions });
 
   // ── Writable terminal link (opt-in) ─────────────────────────────────────
   // When the bot enables `writableTerminalLinkInCard`, embed the token-bearing
@@ -1164,11 +1189,23 @@ export function buildStreamingCard(
     });
   }
 
+  // Model auto-fallback notice — pinned as small yellow text at the very bottom of
+  // the session card (never a separate message) for as long as the session
+  // keeps running on the fallback model.
+  const modelFallbackNotice = cardModelFallbackNotice(usage?.modelFallback, locale);
+  if (modelFallbackNotice) {
+    elements.push({
+      tag: 'markdown',
+      text_size: MODEL_FALLBACK_NOTICE_TEXT_SIZE,
+      content: `<font color='yellow'>${modelFallbackNotice}</font>`,
+    });
+  }
+
   const card = {
     config: { wide_screen_mode: true },
     header: {
       title: { tag: 'plain_text', content: `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale, silentIdle)}` },
-      template: STREAM_TEMPLATE_MAP[displayStatus],
+      template: STREAM_STATUS_TEMPLATE_MAP[displayStatus],
     },
     elements,
   };
@@ -1273,7 +1310,7 @@ export function buildPrivateSnapshotCard(
     config: { wide_screen_mode: true },
     header: {
       title: { tag: 'plain_text', content: `🔒 ${cliName} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale)}` },
-      template: STREAM_TEMPLATE_MAP[displayStatus],
+      template: STREAM_STATUS_TEMPLATE_MAP[displayStatus],
     },
     elements,
   };
@@ -1332,10 +1369,13 @@ function worktreeMultiForm(worktreeOptions: Array<{ text: { tag: 'plain_text'; c
   };
 }
 
-/** Repo selection card. `multiPicker` (persisted per-bot via worktreeMultiPicker)
- *  flips the worktree control between an instant single-select dropdown (false)
- *  and the inline multi-select form (true). */
-export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale, multiPicker?: boolean): string {
+/** Render the repo selection card for an already-budgeted slice of the scan.
+ *  `multiPicker` (persisted per-bot via worktreeMultiPicker) flips the worktree
+ *  control between an instant single-select dropdown (false) and the inline
+ *  multi-select form (true). `hiddenCount` > 0 means the caller dropped that
+ *  many trailing projects to fit the card byte budget; the card then says so.
+ *  Callers go through buildRepoSelectCard, which owns the budget. */
+function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | undefined, rootMessageId: string | undefined, locale: Locale | undefined, multiPicker: boolean | undefined, hiddenCount: number): string {
   const currentMarker = t('card.repo.current_marker', undefined, locale);
   const options = projects.map((p, i) => {
     const currentTag = p.path === currentPath ? currentMarker : '';
@@ -1530,6 +1570,18 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
           },
         ],
       },
+      // Over-budget scans lose their tail (see buildRepoSelectCard). Say so, and
+      // point at `/repo <path|name>` — that resolves against a fresh scan, so it
+      // reaches a dropped project regardless of what this dropdown lists.
+      ...(hiddenCount > 0 ? [{
+        tag: 'note',
+        elements: [
+          {
+            tag: 'lark_md',
+            content: t('card.repo.truncated_hint', { shown: projects.length, total: projects.length + hiddenCount }, locale),
+          },
+        ],
+      }] : []),
       {
         tag: 'note',
         elements: [
@@ -1543,6 +1595,53 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
   };
 
   return JSON.stringify(card);
+}
+
+/** Byte budget for the repo picker card.
+ *
+ *  The Feishu card API rejects a payload past ~109 KB with error 230025 ("The
+ *  length of the message content reaches its limit."). Unlike the streaming
+ *  card there is no user-authored content to shorten here: the card carries one
+ *  select_static option per scanned project, so a broad scan root sets the size
+ *  on its own. A live 1174-project root (47 repos + 1127 worktrees) serialized
+ *  to 186 KB and the send threw — and because the picker is published after the
+ *  turn is durably admitted, the session was left waiting on a card that never
+ *  existed, with a restart rebuilding the same oversized card. Budgeting here is
+ *  what keeps that from being reachable at all.
+ *
+ *  Set below the observed cliff (~115 KB of card) rather than at it: the egress
+ *  stamp (stampBotmuxCallbackMarkers) grows the wire payload after this measures
+ *  it, the API envelope adds its own overhead, and non-ASCII project names cost
+ *  more bytes than characters. 80 KB still lists several hundred projects — far
+ *  past what anyone scrolls — and the overflow stays reachable by name. */
+export const REPO_SELECT_CARD_MAX_BYTES = 80_000;
+
+/** Repo selection card, capped at REPO_SELECT_CARD_MAX_BYTES.
+ *
+ *  Truncation takes the head of `projects` and never reorders or renumbers it:
+ *  option labels stay 1-based over the caller's own list, which is the same list
+ *  `/repo <N>` indexes through lastRepoScan, so a visible option means the same
+ *  thing before and after a truncation. The scanner sorts repos ahead of
+ *  worktrees, so in practice the tail that goes is worktrees. */
+export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale, multiPicker?: boolean): string {
+  const render = (visible: number): string =>
+    renderRepoSelectCard(projects.slice(0, visible), currentPath, rootMessageId, locale, multiPicker, projects.length - visible);
+  const fits = (json: string): boolean => Buffer.byteLength(json, 'utf-8') <= REPO_SELECT_CARD_MAX_BYTES;
+
+  const full = render(projects.length);
+  if (fits(full)) return full;
+
+  // Largest head slice that fits. Option size varies (name, branch, path), so
+  // search rather than divide by an assumed per-option cost. Floor at 1: an
+  // empty dropdown would be a worse card than an over-budget one, and the
+  // publish sites degrade gracefully when a send is rejected anyway.
+  let lo = 1;
+  let hi = projects.length - 1;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (fits(render(mid))) lo = mid; else hi = mid - 1;
+  }
+  return render(lo);
 }
 
 // ─── 群内授权卡片 ─────────────────────────────────────────────────────────────
@@ -2540,7 +2639,238 @@ function wrapCard(elements: any[], locale?: Locale, targetChatType: 'group' | 'p
   };
 }
 
+// ─── /quote picker (pick a 话题 in this chat to read into the session) ───────
+//
+// Structurally a slimmed-down sibling of the /relay picker above: same
+// search-input + interactive_container rows + paginator + confirm shape, so the
+// two feel like one family. It stays a separate builder rather than a
+// parameterization of buildRelayPickerCard because the two disagree on almost
+// everything that matters — what an entry IS (a 话题 in this chat vs. a session
+// elsewhere), what selecting one DOES (read messages vs. move a live session),
+// and which states are reachable (a 话题 is never "running"). Folding them
+// together would mean threading a mode flag through every branch of a 300-line
+// function to save a layout that is a dozen lines of JSON.
+
+export interface QuotePickerEntry {
+  /** Opaque container id for the 话题 (`omt_…`) or reply chain (`om_…`). */
+  containerId: string;
+  containerKind: 'thread' | 'root';
+  title: string;
+  starterName?: string;
+  lastMessageAt?: number;
+}
+
+export interface QuotePickerState {
+  searchQuery?: string;
+  page?: number;
+  selectedContainerId?: string;
+}
+
+const QUOTE_PICKER_PAGE_SIZE = 5;
+const QUOTE_SEARCH_FIELD = 'quote_search';
+
+/** Case-insensitive substring match over title + starter name. Empty query
+ *  matches everything. */
+export function quotePickerFilter(entries: QuotePickerEntry[], query: string | undefined): QuotePickerEntry[] {
+  const q = (query ?? '').trim().toLowerCase();
+  if (!q) return entries;
+  return entries.filter(e => `${e.title} ${e.starterName ?? ''}`.toLowerCase().includes(q));
+}
+
+/**
+ * Render the 话题 picker.
+ *
+ * `followUpToken` is the handle for a one-round `/quote <指令>` invocation; it
+ * rides in every button value so the confirm click can recover the parked
+ * instruction. Empty string means two-round mode (read, acknowledge, wait).
+ */
+export function buildQuotePickerCard(
+  entries: QuotePickerEntry[],
+  chatId: string,
+  rootId: string,
+  invokerOpenId: string,
+  locale?: Locale,
+  state?: QuotePickerState,
+  followUpToken: string = '',
+  visibility: 'private' | 'public' = 'public',
+  /** Container ids of the 话题 the invoker is already in, comma-joined. Baked
+   *  into every value so a re-render excludes exactly what the first render
+   *  did — the re-render path resolves the session from `root_id` alone and
+   *  cannot otherwise recover the invoking message's `thread_id`, so without
+   *  this the current 话题 would reappear in the list after the first click. */
+  excludeIds: string = '',
+): string {
+  const searchQuery = state?.searchQuery ?? '';
+  const requestedPage = state?.page ?? 0;
+  const selectedContainerId = state?.selectedContainerId;
+  const elements: any[] = [];
+
+  const filtered = quotePickerFilter(entries, searchQuery);
+  const totalPages = Math.max(1, Math.ceil(filtered.length / QUOTE_PICKER_PAGE_SIZE));
+  const page = Math.min(Math.max(0, requestedPage), totalPages - 1);
+  const start = page * QUOTE_PICKER_PAGE_SIZE;
+  const visible = filtered.slice(start, start + QUOTE_PICKER_PAGE_SIZE);
+
+  // Full state on every interactive value — the card is stateless on Lark's
+  // side, so each callback has to carry everything needed to re-render.
+  // `invoker_open_id` pins the card to whoever summoned it (the handler
+  // refuses clicks from anyone else), so a passer-by can't repoint it.
+  const stateValue = {
+    chat_id: chatId,
+    root_id: rootId,
+    invoker_open_id: invokerOpenId,
+    follow_up: followUpToken,
+    exclude_ids: excludeIds,
+    visibility,
+    search: searchQuery,
+    page,
+    selected: selectedContainerId ?? '',
+  };
+
+  elements.push({
+    tag: 'input',
+    name: QUOTE_SEARCH_FIELD,
+    placeholder: { tag: 'plain_text', content: t('card.quote.search_placeholder', undefined, locale) },
+    default_value: searchQuery,
+    width: 'fill',
+    behaviors: [
+      { type: 'callback', value: { action: 'quote_search', ...stateValue, selected: '' } },
+    ],
+  });
+  elements.push({ tag: 'hr' });
+
+  if (entries.length === 0) {
+    elements.push({ tag: 'markdown', content: t('card.quote.empty', undefined, locale) });
+    return JSON.stringify(wrapQuoteCard(elements, locale));
+  }
+  if (filtered.length === 0) {
+    elements.push({ tag: 'markdown', content: t('card.quote.empty_filtered', { query: searchQuery }, locale) });
+    return JSON.stringify(wrapQuoteCard(elements, locale));
+  }
+
+  const labelStarter = t('card.quote.field_starter', undefined, locale);
+  const labelTime    = t('card.quote.field_time',    undefined, locale);
+  const selectedTag  = t('card.quote.selected_tag',  undefined, locale);
+  const hasValidSelection = !!(selectedContainerId && filtered.some(e => e.containerId === selectedContainerId));
+
+  visible.forEach((e) => {
+    const isSelected = e.containerId === selectedContainerId;
+    const lines: string[] = [
+      isSelected ? `**✅ ${escapeMd(e.title)}** \`${selectedTag}\`` : `**${escapeMd(e.title)}**`,
+    ];
+    if (e.starterName) lines.push(`${labelStarter}: ${escapeMd(e.starterName)}`);
+    // No message count: the chat container returns only 话题 ROOTS, never
+    // their replies, so any number we could show here would be 1 — which
+    // reads as "this 话题 has one message" and is wrong for every 话题 that
+    // has replies. The real count is reported after reading, where it is
+    // actually known.
+    if (e.lastMessageAt) lines.push(`${labelTime}: ${formatDuration(Date.now() - e.lastMessageAt)}`);
+    elements.push({
+      tag: 'interactive_container',
+      width: 'fill',
+      padding: '8px 12px',
+      background_style: isSelected ? 'laser' : 'default',
+      has_border: true,
+      border_color: isSelected ? 'blue-500' : 'grey-200',
+      corner_radius: '8px',
+      behaviors: [
+        { type: 'callback', value: { action: 'quote_select', container_id: e.containerId, container_kind: e.containerKind, ...stateValue } },
+      ],
+      elements: [{ tag: 'markdown', content: lines.join('\n') }],
+    });
+  });
+
+  if (totalPages > 1) {
+    elements.push({
+      tag: 'column_set',
+      flex_mode: 'none',
+      horizontal_spacing: 'default',
+      columns: [
+        {
+          tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
+          elements: [{
+            tag: 'button',
+            text: { tag: 'plain_text', content: t('card.quote.btn_prev_page', undefined, locale) },
+            type: 'default',
+            disabled: page === 0,
+            behaviors: [{ type: 'callback', value: { action: 'quote_page', ...stateValue, page: Math.max(0, page - 1) } }],
+          }],
+        },
+        {
+          tag: 'column', width: 'weighted', weight: 2, vertical_align: 'center',
+          elements: [{
+            tag: 'markdown', text_align: 'center',
+            content: t('card.quote.page_indicator', { current: page + 1, total: totalPages }, locale),
+          }],
+        },
+        {
+          tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
+          elements: [{
+            tag: 'button',
+            text: { tag: 'plain_text', content: t('card.quote.btn_next_page', undefined, locale) },
+            type: 'default',
+            disabled: page === totalPages - 1,
+            behaviors: [{ type: 'callback', value: { action: 'quote_page', ...stateValue, page: Math.min(totalPages - 1, page + 1) } }],
+          }],
+        },
+      ],
+    });
+  }
+
+  elements.push({ tag: 'hr' });
+  if (hasValidSelection) {
+    const selected = filtered.find(e => e.containerId === selectedContainerId)!;
+    elements.push({
+      tag: 'column_set',
+      flex_mode: 'none',
+      columns: [{
+        tag: 'column', width: 'weighted', weight: 1,
+        elements: [{
+          tag: 'button',
+          text: {
+            tag: 'plain_text',
+            content: t(followUpToken ? 'card.quote.btn_confirm_with_task' : 'card.quote.btn_confirm', undefined, locale),
+          },
+          type: 'primary',
+          behaviors: [{
+            type: 'callback',
+            value: {
+              action: 'quote_confirm',
+              container_id: selected.containerId,
+              container_kind: selected.containerKind,
+              // Echoed back so the confirm handler can name the 话题 in its
+              // reply without re-scanning the chat to recover the title.
+              title: selected.title,
+              ...stateValue,
+            },
+          }],
+        }],
+      }],
+    });
+  } else {
+    elements.push({
+      tag: 'markdown',
+      content: `<font color='grey'>${t('card.quote.hint_pick_first', undefined, locale)}</font>`,
+    });
+  }
+
+  return JSON.stringify(wrapQuoteCard(elements, locale));
+}
+
+function wrapQuoteCard(elements: any[], locale?: Locale): any {
+  return {
+    schema: '2.0',
+    config: { update_multi: true },
+    header: {
+      title: { tag: 'plain_text', content: t('card.quote.title', undefined, locale) },
+      template: 'blue',
+    },
+    body: { direction: 'vertical', elements },
+  };
+}
+
 // ─── /adopt picker (V2: search + card list + pagination) ────────────────────
+
 //
 // Replaces the two legacy select_static dropdowns. Unifies the two adopt
 // sources — live processes (tmux/zellij/herdr) and disk-resumable history —

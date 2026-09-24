@@ -37,7 +37,7 @@ import { describe, it, expect } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync, statSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { botmuxWrapperFiles } from '../src/core/botmux-wrapper.js';
 
@@ -136,7 +136,10 @@ describe('claim-botmux-bin --binary — global botmux points at the compiled bin
     expect(r.status).toBe(0);
 
     const content = readFileSync(r.wrapper, 'utf-8');
-    expect(content).toContain(`exec "${real}"`);
+    // Compare against the fully resolved path: on macOS `mkdtemp` hands back
+    // `/var/folders/…` while `/var` itself is a symlink to `/private/var`, so
+    // the resolved target the wrapper stores is not string-equal to `real`.
+    expect(content).toContain(`exec "${realpathSync(real)}"`);
     // The symlink path must NOT survive into the wrapper.
     expect(content).not.toContain(link);
     // And it still execs — resolving must not break the exec itself.
@@ -165,17 +168,29 @@ describe('claim-botmux-bin --binary — global botmux points at the compiled bin
     expect(r.wrote).toBe(false);
   });
 
-  it('without --binary the source form is unchanged (backward compatible)', () => {
+  it('without --binary the source form matches the daemon, with a PINNED interpreter', () => {
     const home = scratchHome();
     const r = runClaim([], home);
     expect(r.status).toBe(0);
     const content = readFileSync(r.wrapper, 'utf-8');
 
     // Must still equal the daemon's NON-standalone form, so the existing
-    // `use:here` behaviour cannot be broken by the --binary addition.
+    // `use:here` behaviour cannot be broken by the --binary addition. This
+    // equality is the real contract: it is what keeps the two writers (this
+    // script and src/daemon.ts) from drifting.
     const [reference] = botmuxWrapperFiles(join(REPO_ROOT, 'dist', 'cli.js'), process.execPath, 'linux', false);
     expect(content).toBe(reference.content);
-    expect(content).toContain('exec node ');
+
+    // The interpreter must be an ABSOLUTE path, never a bare `node`. A bare name
+    // is resolved by PATH at exec time in whatever environment invokes the
+    // wrapper — not the one that wrote it. MEASURED (2026-09-08): a PATH that
+    // resolved `node` to v18.20.4 (no node:sqlite) killed all 55 bot daemons at
+    // boot while the supervisor still reported success.
+    expect(content).not.toMatch(/exec node /);
+    const execLine = /^exec "([^"]+)" "([^"]+)" "\$@"$/m.exec(content);
+    expect(execLine).not.toBeNull();
+    expect(isAbsolute(execLine![1])).toBe(true);
+    expect(execLine![2]).toBe(join(REPO_ROOT, 'dist', 'cli.js'));
   });
 
   it('BOTMUX_NO_CLAIM still short-circuits in --binary mode', () => {

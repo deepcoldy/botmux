@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { realpathSync } from 'node:fs';
 import { ensureGatewayEntry, inspectGatewayEntry, removeGatewayEntry } from '../src/core/plugins/mcp/gateway-installer.js';
 import {
   MCP_GATEWAY_FORWARDED_ENV_KEYS,
@@ -107,6 +108,18 @@ describe('plugin MCP Gateway installer', () => {
     expect(removeGatewayEntry(adapter).state).toBe('removed');
     const removed = JSON.parse(readFileSync(path, 'utf8'));
     expect(removed.mcpServers).toEqual({ keep: { command: 'keep' } });
+  });
+
+  it('defaults the gateway command to the stable main wrapper even when the native hook gets a dedicated sibling', () => {
+    vi.unstubAllEnvs();
+    vi.stubEnv('HOME', home);
+    const path = join(home, '.claude.json');
+    const adapter = { id: 'claude-code', mcpGateway: { format: 'claude-json' as const, configPath: path } };
+
+    expect(ensureGatewayEntry(adapter).state).toBe('installed');
+    const installed = JSON.parse(readFileSync(path, 'utf8'));
+    expect(installed.mcpServers.botmux.command).toBe(join(realpathSync(home), '.botmux', 'bin', 'botmux'));
+    expect(installed.mcpServers.botmux.command).not.toContain('native-subagent-runtime-hook');
   });
 
   it('does not overwrite a malformed JSON config', () => {

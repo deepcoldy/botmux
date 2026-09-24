@@ -23,6 +23,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 
 const mocks = vi.hoisted(() => {
@@ -42,10 +43,12 @@ const mocks = vi.hoisted(() => {
     dataDir,
     replyMessage: vi.fn(async () => 'om_reply'),
     sendMessage: vi.fn(async () => 'om_top'),
+    deleteMessage: vi.fn(async () => true),
     sendEphemeralCard: vi.fn(async () => 'om_ephemeral'),
     addReaction: vi.fn(async () => 'reaction_received'),
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
     getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
+    daemonRequest: vi.fn(async () => ({ status: 200, raw: '', body: { sessions: [] } })),
     resolveSender: vi.fn(async (_appId: string, openId: string | undefined, senderType: string | undefined) => (
       openId
         ? { openId, type: senderType === 'app' || senderType === 'bot' ? 'bot' as const : 'user' as const }
@@ -71,8 +74,14 @@ const mocks = vi.hoisted(() => {
       const session = sessions.get(sessionId);
       if (session) session.status = 'closed';
     }),
-    forkWorker: vi.fn((ds: any) => {
+    forkWorker: vi.fn((ds: any, _input?: any, _resume?: any, opts?: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      opts?.onAdmission?.('accepted');
+      return true;
+    }),
+    forkAdoptWorker: vi.fn((ds: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+      return 'accepted' as const;
     }),
     // Must mirror the real contract: closeSession() always resolves a
     // CloseSessionResult. Returning undefined made the remote-close guard
@@ -88,6 +97,10 @@ const mocks = vi.hoisted(() => {
     scanMultipleProjects: vi.fn(() => [] as any[]),
     getAvailableBots: vi.fn(async () => [] as any[]),
     downloadResources: vi.fn(async () => ({ attachments: [], needLogin: false })),
+    runAutoWorktreeCommit: vi.fn(async (deps: any) => {
+      deps.ds.worktreeCreating = true;
+    }),
+    persistStreamCardState: vi.fn((impl: (...args: any[]) => any, ...args: any[]) => impl(...args)),
   };
 });
 
@@ -112,12 +125,18 @@ vi.mock('../src/im/lark/client.js', async () => {
     ...actual,
     replyMessage: mocks.replyMessage,
     sendMessage: mocks.sendMessage,
+    deleteMessage: mocks.deleteMessage,
     sendEphemeralCard: mocks.sendEphemeralCard,
     addReaction: mocks.addReaction,
     getChatMode: mocks.getChatMode,
+    getChatModeStrict: mocks.getChatMode,
     getChatNameAndMode: mocks.getChatNameAndMode,
   };
 });
+
+vi.mock('../src/daemon-internal-client-wrapper.js', () => ({
+  createDaemonClientFor: vi.fn(() => ({ request: mocks.daemonRequest })),
+}));
 
 vi.mock('../src/services/session-store.js', async () => {
   const actual = await vi.importActual<any>('../src/services/session-store.js');
@@ -135,7 +154,10 @@ vi.mock('../src/core/worker-pool.js', async () => {
   return {
     ...actual,
     forkWorker: mocks.forkWorker,
+    forkAdoptWorker: mocks.forkAdoptWorker,
     closeSession: mocks.closeWorkerPoolSession,
+    closeSessionForBackgroundCleanup: (sessionId: string) =>
+      mocks.closeWorkerPoolSession(sessionId),
   };
 });
 
@@ -165,12 +187,20 @@ vi.mock('../src/core/session-manager.js', async () => {
     ...actual,
     getAvailableBots: mocks.getAvailableBots,
     downloadResources: mocks.downloadResources,
+    persistStreamCardState: (...args: any[]) =>
+      mocks.persistStreamCardState(actual.persistStreamCardState, ...args),
   };
 });
 
 vi.mock('../src/services/project-scanner.js', async () => {
   const actual = await vi.importActual<any>('../src/services/project-scanner.js');
   return { ...actual, scanMultipleProjects: mocks.scanMultipleProjects };
+});
+
+
+vi.mock('../src/im/lark/card-handler.js', async () => {
+  const actual = await vi.importActual<any>('../src/im/lark/card-handler.js');
+  return { ...actual, runAutoWorktreeCommit: mocks.runAutoWorktreeCommit };
 });
 
 vi.mock('../src/im/lark/identity-cache.js', async () => {
@@ -183,6 +213,7 @@ import { sessionAnchorId, sessionKey } from '../src/core/types.js';
 import { recordBotUnionId } from '../src/services/bot-union-ids-store.js';
 import {
   __testOnly_activeSessions as activeSessions,
+  __testOnly_admitFollowerBehindOpening as admitFollowerBehindOpening,
   __testOnly_claimNewDaemonSession as claimNewDaemonSession,
   __testOnly_handleChatModeConverted as handleChatModeConverted,
   __testOnly_handleDocComment as handleDocComment,
@@ -191,11 +222,15 @@ import {
   __testOnly_onQueuedActivationSubmitted as onQueuedActivationSubmitted,
   __testOnly_prewarmDocCommentSession as prewarmDocCommentSession,
   __testOnly_releaseQueuedActivationReservation as releaseQueuedActivationReservation,
-  __testOnly_reserveAsyncQueuedActivationTailAdmission as reserveAsyncQueuedActivationTailAdmission,
   __testOnly_resetDocCommentClaims as resetDocCommentClaims,
-  __testOnly_settleAsyncQueuedActivationTailAdmission as settleAsyncQueuedActivationTailAdmission,
+  __testOnly_retryPendingDocCommentDeliveries as retryPendingDocCommentDeliveries,
 } from '../src/daemon.js';
-import { admitQueuedActivationTail } from '../src/core/worker-pool.js';
+import {
+  admitQueuedActivationTail,
+  hasQueuedActivationAdmissionGate,
+  reserveQueuedActivationTailAdmission,
+} from '../src/core/worker-pool.js';
+import { __testOnly_resetSessionTurnQueues, runSessionTurn } from '../src/core/session-turn-queue.js';
 import type { DaemonSession } from '../src/core/types.js';
 import { getDocSubscription, putDocSubscription, removeDocSubscription } from '../src/services/doc-subs-store.js';
 import { config } from '../src/config.js';
@@ -333,6 +368,14 @@ function makeCtx(anchor: string, messageId: string): any {
     anchor,
     larkAppId: APP,
   };
+}
+
+/** A hand-released promise: parks a queued follower's prompt build so an
+ *  opening ACK can be modelled as landing while that build is still awaiting. */
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+  let resolve!: () => void;
+  const promise = new Promise<void>(res => { resolve = res; });
+  return { promise, resolve };
 }
 
 function seedThreadSession(anchor: string, title: string): DaemonSession {
@@ -505,6 +548,7 @@ function resetRouteTestState(): void {
   mocks.getChatMode.mockResolvedValue('group');
   mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
   activeSessions.clear();
+  __testOnly_resetSessionTurnQueues();
   rmSync(crossRefPath(), { force: true });
   rmSync(botsConfigPath(), { force: true });
   rmSync(botsInfoPath(), { force: true });
@@ -525,12 +569,20 @@ describe('/rename production routing — must not pre-create a session (review P
     mocks.replyMessage.mockResolvedValue('om_reply');
     mocks.sendMessage.mockResolvedValue('om_top');
     mocks.sendEphemeralCard.mockResolvedValue('om_ephemeral');
+    mocks.daemonRequest.mockResolvedValue({ status: 200, raw: '', body: { sessions: [] } });
     mocks.getChatMode.mockResolvedValue('group');
     mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
     mocks.sessions.clear();
-    mocks.forkWorker.mockImplementation((ds: any) => {
+    mocks.forkWorker.mockImplementation((ds: any, _input?: any, _resume?: any, opts?: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      opts?.onAdmission?.('accepted');
+      return true;
     });
+    mocks.forkAdoptWorker.mockImplementation((ds: any) => {
+      ds.worker = { killed: false, send: vi.fn() };
+      return 'accepted';
+    });
+    mocks.persistStreamCardState.mockImplementation((impl: (...args: any[]) => any, ...args: any[]) => impl(...args));
     mocks.closeWorkerPoolSession.mockImplementation(async (sessionId: string) => {
       for (const [key, candidate] of activeSessions) {
         if (candidate.session.sessionId !== sessionId) continue;
@@ -550,6 +602,7 @@ describe('/rename production routing — must not pre-create a session (review P
     mocks.getAvailableBots.mockResolvedValue([]);
     mocks.downloadResources.mockResolvedValue({ attachments: [], needLogin: false });
     activeSessions.clear();
+    __testOnly_resetSessionTurnQueues();
     resetDocCommentClaims();
     // master: clear per-bot store files so a seeded cross-ref / bots config from
     // one test can't leak into the next (see the known-peer + /fast tests).
@@ -576,6 +629,39 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.createSession).not.toHaveBeenCalled();
     expect(activeSessions.size).toBe(0);
     expect(repliedText()).toContain('没有活跃的会话');
+  });
+
+  it('serializes pool creation before drawing or persisting a second same-topic binding', async () => {
+    mkdirSync(mocks.dataDir, { recursive: true });
+    const home = mkdtempSync(join(mocks.dataDir, 'instance-'));
+    writeFileSync(join(home, 'config.toml'), 'cli_auth_credentials_store = "file"\n', { mode: 0o600 });
+    writeFileSync(join(home, 'auth.json'), JSON.stringify({ tokens: { access_token: 'fake' } }), { mode: 0o600 });
+    const bot = registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'codex', backendType: 'tmux',
+      allowedUsers: [OWNER], workingDir: '/tmp', codexInstancePool: { enabled: true, defaultInstanceId: 'a', scope: 'ordinary-feishu', strategy: 'random', instances: [{ id: 'a', codexHome: home }] } });
+    bot.resolvedAllowedUsers = [OWNER];
+    const actual = await vi.importActual<typeof import('../src/services/session-store.js')>('../src/services/session-store.js');
+    actual.init(APP);
+    const original = mocks.createSession.getMockImplementation();
+    mocks.createSession.mockImplementation((...args: any[]) => {
+      const row = actual.createSession(...args as Parameters<typeof actual.createSession>);
+      mocks.sessions.set(row.sessionId, row);
+      return row;
+    });
+    try {
+      await Promise.all([
+        handleNewTopic(makeEventData('om_pool_a', '/status'), makeCtx('om_pool_same', 'om_pool_a')),
+        handleNewTopic(makeEventData('om_pool_b', '/status'), makeCtx('om_pool_same', 'om_pool_b')),
+      ]);
+      expect(mocks.createSession).toHaveBeenCalledTimes(1);
+      expect(actual.listSessions().filter(s => s.rootMessageId === 'om_pool_same')).toHaveLength(1);
+      const owner = activeSessions.get(sessionKey('om_pool_same', APP));
+      expect(owner?.session.cliInstanceBinding).toMatchObject({ instanceId: 'a', source: 'pool' });
+      expect(mocks.closeSession).not.toHaveBeenCalled();
+    } finally {
+      mocks.createSession.mockImplementation(original!);
+      actual.init();
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 
   it('thread reply with no existing session: `/rename Foo` replies no-active-session and creates NOTHING', async () => {
@@ -641,6 +727,154 @@ describe('/rename production routing — must not pre-create a session (review P
 
     expect(mocks.createSession).toHaveBeenCalledTimes(1);
     expect(activeSessions.has(sessionKey('om_new_2', APP))).toBe(true);
+  });
+
+  // The pre-created record is a REAL session: every later turn in this topic
+  // routes into it and forks a CLI from it. Historically only `/repo` resolved a
+  // pinned dir here, so a session born from any other session-needing daemon
+  // command carried NO workingDir and silently ignored the bot's
+  // defaultWorkingDir / the chat's oncall binding for the rest of its life.
+  it.each([
+    ['new topic', false],
+    ['thread reply', true],
+  ] as const)('%s: `/status` pins the bot default workingDir on the pre-created session', async (_label, reply) => {
+    const defaultDir = makeRepoFixtureDir();
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: defaultDir,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const rootId = reply ? 'om_wd_root' : 'om_wd_new';
+    const messageId = reply ? 'om_wd_reply' : rootId;
+    const data = makeEventData(messageId, '/status', reply ? rootId : undefined);
+
+    if (reply) await handleThreadReply(data, makeCtx(rootId, messageId));
+    else await handleNewTopic(data, makeCtx(rootId, messageId));
+
+    const ds = activeSessions.get(sessionKey(rootId, APP));
+    expect(ds).toBeDefined();
+    expect(ds!.workingDir).toBe(defaultDir);
+    expect(ds!.session.workingDir).toBe(defaultDir);
+    // Inheriting the dir must NOT turn a non-`/repo` command into a repo picker:
+    // these commands fork no CLI of their own.
+    expect(ds!.pendingRepo).toBeFalsy();
+  });
+
+  // Auto-worktree bots: `defaultWorkingDir` is a worktree BASE, and the ordinary
+  // spawn paths answer it with pendingRepo + a detached worktree build. A daemon
+  // command must not start that build on the user's behalf, and pinning the base
+  // dir instead would run every later turn of this session inside the SHARED
+  // repo — exactly the isolation the flag buys. So it stays unpinned.
+  it.each([
+    ['new topic', false],
+    ['thread reply', true],
+  ] as const)('%s: `/status` does NOT pin the auto-worktree base dir', async (_label, reply) => {
+    const baseDir = makeRepoFixtureDir();
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      defaultWorkingDir: baseDir,
+      defaultWorkingDirAutoWorktree: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const rootId = reply ? 'om_wt_root' : 'om_wt_new';
+    const messageId = reply ? 'om_wt_reply' : rootId;
+    const data = makeEventData(messageId, '/status', reply ? rootId : undefined);
+
+    if (reply) await handleThreadReply(data, makeCtx(rootId, messageId));
+    else await handleNewTopic(data, makeCtx(rootId, messageId));
+
+    const ds = activeSessions.get(sessionKey(rootId, APP));
+    expect(ds).toBeDefined();
+    expect(ds!.workingDir).toBeUndefined();
+    expect(ds!.session.workingDir).toBeUndefined();
+    expect(mocks.runAutoWorktreeCommit).not.toHaveBeenCalled();
+  });
+
+  // Guard the other half: with nothing configured there is no dir to pin, and
+  // the session must keep the "unset = follow the bot default at fork time"
+  // shape rather than being pinned to some fallback here.
+  it('control: `/status` with no bot default leaves the session unpinned', async () => {
+    await handleNewTopic(makeEventData('om_wd_none', '/status'), makeCtx('om_wd_none', 'om_wd_none'));
+
+    const ds = activeSessions.get(sessionKey('om_wd_none', APP));
+    expect(ds).toBeDefined();
+    expect(ds!.workingDir).toBeUndefined();
+    expect(ds!.session.workingDir).toBeUndefined();
+  });
+
+  it.each([
+    ['new topic', false],
+    ['thread reply', true],
+  ] as const)('%s: `/sessions` is available at canTalk level without creating a session', async (_label, reply) => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      allowedChatGroups: [CHAT],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const rootId = reply ? 'om_sessions_root' : 'om_sessions_new';
+    const messageId = reply ? 'om_sessions_reply' : rootId;
+    const data = makeEventData(messageId, '/sessions', reply ? rootId : undefined);
+    data.sender = { sender_id: { open_id: 'ou_talk_only' }, sender_type: 'user' };
+
+    if (reply) await handleThreadReply(data, makeCtx(rootId, messageId));
+    else await handleNewTopic(data, makeCtx(rootId, messageId));
+
+    await vi.waitFor(() => expect(repliedText()).toContain('本群话题'));
+    expect(repliedText()).not.toContain('仅 allowedUsers 可执行');
+    expect(mocks.daemonRequest).toHaveBeenCalledWith({ method: 'GET', path: '/__daemon/sessions-list?fresh=1' });
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+  });
+
+  it('regular-group top-level `/sessions` stays top-level even after new-topic routing', async () => {
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'claude-code',
+      allowedUsers: [OWNER],
+      allowedChatGroups: [CHAT],
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const messageId = 'om_sessions_regular_group_top';
+    const data = makeEventData(messageId, '/sessions');
+
+    await handleNewTopic(data, {
+      ...makeCtx(messageId, messageId),
+      regularGroupTopLevel: true,
+    });
+
+    await vi.waitFor(() => expect(mocks.sendMessage).toHaveBeenCalled());
+    expect(mocks.replyMessage).not.toHaveBeenCalled();
+    expect(mocks.sendMessage.mock.calls[0]?.[1]).toBe(CHAT);
+    expect(String(mocks.sendMessage.mock.calls[0]?.[2])).toContain('本群话题');
+    expect(mocks.createSession).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['new topic', false],
+    ['thread reply', true],
+  ] as const)('%s: `/sessions` still denies a sender without canTalk', async (_label, reply) => {
+    const rootId = reply ? 'om_sessions_denied_root' : 'om_sessions_denied_new';
+    const messageId = reply ? 'om_sessions_denied_reply' : rootId;
+    const data = makeEventData(messageId, '/sessions', reply ? rootId : undefined);
+    data.sender = { sender_id: { open_id: 'ou_stranger' }, sender_type: 'user' };
+
+    if (reply) await handleThreadReply(data, makeCtx(rootId, messageId));
+    else await handleNewTopic(data, makeCtx(rootId, messageId));
+
+    expect(repliedText()).toContain('仅 allowedUsers 可执行');
+    expect(mocks.daemonRequest).not.toHaveBeenCalled();
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
   });
 
   it('pinned cwd + bare `/t` seeds the thread without creating an empty Session', async () => {
@@ -1277,6 +1511,122 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
   });
 
+
+
+  it('`/t here <content>` reuses the current chat-scope working directory and skips repo selection', async () => {
+    const currentDir = makeRepoFixtureDir();
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      workingDirs: ['/tmp'],
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const existing = seedLiveChatSession();
+    existing.workingDir = currentDir;
+    existing.session.workingDir = currentDir;
+    mocks.sessions.set(existing.session.sessionId, existing.session);
+
+    await handleNewTopic(
+      makeEventData('om_force_topic_here', '/t here 检查实现'),
+      makeCtx('om_force_topic_here', 'om_force_topic_here'),
+    );
+
+    const ds = activeSessions.get(sessionKey('om_force_topic_here', APP));
+    expect(ds?.workingDir).toBe(currentDir);
+    expect(ds?.pendingRepo).toBe(false);
+    expect(mocks.scanMultipleProjects).not.toHaveBeenCalled();
+    expect(mocks.createSession).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(mocks.forkWorker.mock.calls[0]?.[1])).toContain('检查实现');
+  });
+
+
+
+  it('`/tw <content>` creates a topic that starts from a worktree of the current chat working directory', async () => {
+    const repoRoot = makeRepoFixtureDir();
+    const currentDir = join(repoRoot, 'packages', 'app');
+    mkdirSync(currentDir, { recursive: true });
+    execFileSync('git', ['init', '-q'], { cwd: repoRoot });
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      workingDirs: ['/tmp'],
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const existing = seedLiveChatSession();
+    existing.workingDir = currentDir;
+    existing.session.workingDir = currentDir;
+    mocks.sessions.set(existing.session.sessionId, existing.session);
+
+    await handleNewTopic(
+      makeEventData('om_force_topic_worktree', '/tw 检查实现'),
+      makeCtx('om_force_topic_worktree', 'om_force_topic_worktree'),
+    );
+
+    const ds = activeSessions.get(sessionKey('om_force_topic_worktree', APP));
+    expect(ds?.workingDir).toBe(currentDir);
+    expect(ds?.pendingRepo).toBe(true);
+    expect(ds?.initialStartPending).toBe(false);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.runAutoWorktreeCommit).toHaveBeenCalledWith(expect.objectContaining({
+      ds,
+      anchor: 'om_force_topic_worktree',
+      baseDir: currentDir,
+      prompt: expect.stringContaining('检查实现'),
+      force: true,
+      targetSubdir: join('packages', 'app'),
+    }));
+  });
+
+
+
+  it('`/topic here` and `/topic worktree` use the same current-directory variants', async () => {
+    const currentDir = makeRepoFixtureDir();
+    const bot = registerBot({
+      larkAppId: APP,
+      larkAppSecret: 's',
+      cliId: 'codex',
+      allowedUsers: [OWNER],
+      workingDirs: ['/tmp'],
+      disableStreamingCard: true,
+    });
+    bot.resolvedAllowedUsers = [OWNER];
+    const existing = seedLiveChatSession();
+    existing.workingDir = currentDir;
+    existing.session.workingDir = currentDir;
+    mocks.sessions.set(existing.session.sessionId, existing.session);
+
+    await handleNewTopic(
+      makeEventData('om_topic_here', '/topic here 检查实现'),
+      makeCtx('om_topic_here', 'om_topic_here'),
+    );
+    expect(activeSessions.get(sessionKey('om_topic_here', APP))?.workingDir).toBe(currentDir);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+
+    mocks.forkWorker.mockClear();
+    mocks.runAutoWorktreeCommit.mockClear();
+    activeSessions.delete(sessionKey('om_topic_here', APP));
+
+    await handleNewTopic(
+      makeEventData('om_topic_worktree', '/topic worktree 检查实现'),
+      makeCtx('om_topic_worktree', 'om_topic_worktree'),
+    );
+    const ds = activeSessions.get(sessionKey('om_topic_worktree', APP));
+    expect(ds?.pendingRepo).toBe(true);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.runAutoWorktreeCommit).toHaveBeenCalledWith(expect.objectContaining({
+      ds,
+      baseDir: currentDir,
+      force: true,
+    }));
+  });
+
   it('card-off pinned cwd + `/t <content>` immediately seeds the thread and starts work', async () => {
     const bot = registerBot({
       larkAppId: APP,
@@ -1705,7 +2055,7 @@ describe('/rename production routing — must not pre-create a session (review P
       queuedActivationResume: undefined,
       pendingRepoSetup: undefined,
     });
-    expect(onQueuedActivationSubmitted(owner, openingToken)).toBe(true);
+    await expect(onQueuedActivationSubmitted(owner, openingToken)).resolves.toBe(true);
     expect(send).toHaveBeenCalledTimes(1);
     expect(send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'message',
@@ -1771,7 +2121,7 @@ describe('/rename production routing — must not pre-create a session (review P
       queuedActivationResume: undefined,
       pendingRepoSetup: undefined,
     });
-    expect(onQueuedActivationSubmitted(owner, openingToken)).toBe(true);
+    await expect(onQueuedActivationSubmitted(owner, openingToken)).resolves.toBe(true);
     expect(send).toHaveBeenCalledTimes(1);
     expect(send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'message',
@@ -1846,7 +2196,7 @@ describe('/rename production routing — must not pre-create a session (review P
     ]);
 
     const send = vi.mocked(ds.worker!.send);
-    expect(releaseQueuedActivationReservation(ds)).toBe(true);
+    await expect(releaseQueuedActivationReservation(ds)).resolves.toBe(true);
     expect(send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'message',
       turnId: 'om_later_n_plus_1',
@@ -1870,7 +2220,7 @@ describe('/rename production routing — must not pre-create a session (review P
       queuedActivationDispatchAttempt: undefined,
       queuedActivationResume: undefined,
     });
-    expect(onQueuedActivationSubmitted(ds, successorToken)).toBe(true);
+    await expect(onQueuedActivationSubmitted(ds, successorToken)).resolves.toBe(true);
     expect(ds.initialStartPending).toBe(false);
   });
 
@@ -1899,7 +2249,7 @@ describe('/rename production routing — must not pre-create a session (review P
     // into a steer authorization at any layer.
     ds.pendingCodexAppFollowUpGateAccepted = [...gates];
 
-    expect(releaseQueuedActivationReservation(ds)).toBe(true);
+    await expect(releaseQueuedActivationReservation(ds)).resolves.toBe(true);
 
     // release admits the coalesced tail then promotes+sends it. After that, the
     // three durable/live surfaces all persist on ds — assert steerable is absent
@@ -1954,6 +2304,11 @@ describe('/rename production routing — must not pre-create a session (review P
       type: 'raw_input',
       content: '/fast',
       turnId: 'om_fast_live',
+      trustedController: {
+        requestUserOpenId: 'ou_owner',
+        requestLarkAppId: APP,
+        senderType: 'user',
+      },
     });
 
     // Cold (no existing session): /fast is a tier toggle, not "start work", so
@@ -2041,6 +2396,11 @@ describe('/rename production routing — must not pre-create a session (review P
       type: 'raw_input',
       content: '/model',
       turnId: 'om_model_tui',
+      trustedController: {
+        requestUserOpenId: 'ou_owner',
+        requestLarkAppId: APP,
+        senderType: 'user',
+      },
     });
   });
 
@@ -2081,6 +2441,11 @@ describe('/rename production routing — must not pre-create a session (review P
       type: 'raw_input',
       content: '/goal',
       turnId: 'om_goal_tui',
+      trustedController: {
+        requestUserOpenId: 'ou_owner',
+        requestLarkAppId: APP,
+        senderType: 'user',
+      },
     });
 
     // Inverse: bot default is interactive Codex, but a frozen Codex App session
@@ -2260,7 +2625,7 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(ds.initialStartClaimToken).toBe(ownerToken);
 
     const send = vi.mocked(ds.worker!.send);
-    expect(onQueuedActivationSubmitted(ds)).toBe(true);
+    await expect(onQueuedActivationSubmitted(ds)).resolves.toBe(true);
     expect(send).toHaveBeenCalledTimes(1);
     expect(send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'message',
@@ -2279,7 +2644,7 @@ describe('/rename production routing — must not pre-create a session (review P
       queuedActivationDispatchAttempt: undefined,
       queuedActivationResume: undefined,
     });
-    expect(onQueuedActivationSubmitted(ds, successorToken)).toBe(true);
+    await expect(onQueuedActivationSubmitted(ds, successorToken)).resolves.toBe(true);
     expect(ds.initialStartPending).toBe(false);
     expect(ds.initialStartClaimToken).toBeUndefined();
   });
@@ -2288,8 +2653,8 @@ describe('/rename production routing — must not pre-create a session (review P
     { arrivalGate: true, laterGate: false, expectsSidecar: true, label: 'ON→OFF' },
     { arrivalGate: false, laterGate: true, expectsSidecar: false, label: 'OFF→ON' },
   ])(
-    'freezes a queued follower clean-input decision at reservation time ($label)',
-    ({ arrivalGate, laterGate, expectsSidecar }) => {
+    'freezes a queued follower clean-input decision at arrival, even when N\'s ACK lands mid-build ($label)',
+    async ({ arrivalGate, laterGate, expectsSidecar }) => {
       const bot = registerBot({
         larkAppId: APP,
         larkAppSecret: 's',
@@ -2305,34 +2670,43 @@ describe('/rename production routing — must not pre-create a session (review P
       ds.hasHistory = true;
       ds.session.cliId = 'codex-app';
 
-      const reservation = reserveAsyncQueuedActivationTailAdmission(ds);
-      expect(ds.queuedActivationTailAdmissionsOutstanding).toBe(1);
+      // Arrival: FIFO order and the clean-input decision are stamped synchronously.
+      const reservation = reserveQueuedActivationTailAdmission(ds);
       bot.config.codexAppCleanInput = laterGate;
 
-      // Model N's ACK landing while N+1 is still awaiting prompt materialization.
-      expect(releaseQueuedActivationReservation(ds, 'opening-token')).toBe(false);
+      // N+1's prompt build is still awaiting when N's ACK lands. Both are
+      // commands on the session's turn queue, in arrival order: the release
+      // must not run until the follower's admission has landed.
+      const build = deferred();
       const sidecar = {
         text: 'FOLLOWER_CLEAN_N1',
         additionalContext: {
           hidden: { kind: 'application' as const, value: '<hidden>arrival</hidden>' },
         },
       };
-      admitQueuedActivationTail(ds, {
-        userPrompt: 'FOLLOWER_CLEAN_N1',
-        cliInput: {
-          content: '<user_message>FOLLOWER_LEGACY_N1</user_message>',
-          codexAppInput: sidecar,
-        },
-        turnId: 'turn-clean-follower',
-        dispatchAttempt: 2,
-      }, reservation);
-      settleAsyncQueuedActivationTailAdmission(ds);
+      const admission = runSessionTurn(ds.session.sessionId, async () => {
+        await build.promise;
+        admitQueuedActivationTail(ds, {
+          userPrompt: 'FOLLOWER_CLEAN_N1',
+          cliInput: {
+            content: '<user_message>FOLLOWER_LEGACY_N1</user_message>',
+            codexAppInput: sidecar,
+          },
+          turnId: 'turn-clean-follower',
+          dispatchAttempt: 2,
+        }, reservation);
+      });
+      const ack = onQueuedActivationSubmitted(ds, 'opening-token');
+      await Promise.resolve();
+      expect(send).not.toHaveBeenCalled();
+      expect(ds.session.queuedActivationTail).toBeUndefined();
+      build.resolve();
+      await admission;
+      await expect(ack).resolves.toBe(true);
 
       const expectedSidecar = expectsSidecar
         ? { ...sidecar, clientUserMessageId: 'turn-clean-follower' }
         : undefined;
-      expect(ds.queuedActivationTailAdmissionsOutstanding).toBeUndefined();
-      expect(ds.queuedActivationTailReleasePending).toBeUndefined();
       expect(ds.session.queuedActivationTail).toBeUndefined();
       expect(ds.session.queuedActivationInput?.codexAppInput).toEqual(expectedSidecar);
       expect(ds.session.codexAppDispatchLedger?.at(-1)?.codexAppInput)
@@ -2359,16 +2733,22 @@ describe('/rename production routing — must not pre-create a session (review P
     ds.initialStartPending = true;
     ds.worker = { killed: false, send: vi.fn() } as any;
 
-    const reservation = reserveAsyncQueuedActivationTailAdmission(ds);
-    expect(releaseQueuedActivationReservation(ds, 'opening-token')).toBe(false);
+    const reservation = reserveQueuedActivationTailAdmission(ds);
+    const build = deferred();
+    const admission = runSessionTurn(ds.session.sessionId, async () => {
+      await build.promise;
+      admitQueuedActivationTail(ds, {
+        userPrompt: 'LATE_N_PLUS_1',
+        cliInput: { content: 'LATE_N_PLUS_1' },
+        turnId: 'turn-late-n1',
+      }, reservation);
+    });
+    const ack = onQueuedActivationSubmitted(ds, 'opening-token');
     // N's worker exits after its ACK but before the reserved N+1 finishes.
     ds.worker = null;
-    admitQueuedActivationTail(ds, {
-      userPrompt: 'LATE_N_PLUS_1',
-      cliInput: { content: 'LATE_N_PLUS_1' },
-      turnId: 'turn-late-n1',
-    }, reservation);
-    settleAsyncQueuedActivationTailAdmission(ds);
+    build.resolve();
+    await admission;
+    await expect(ack).resolves.toBe(true);
 
     expect(ds.session).toMatchObject({
       queuedActivationPending: true,
@@ -2399,35 +2779,122 @@ describe('/rename production routing — must not pre-create a session (review P
     ]);
   });
 
-  it('releases the route when a post-ACK async follower admission fails', () => {
+  it('releases the route when a follower admission queued ahead of the ACK fails', async () => {
     const ds = seedThreadSession('om_failed_late_admission', 'failed late admission');
     ds.session.cliId = 'claude-code';
     ds.initialStartPending = true;
     ds.worker = { killed: false, send: vi.fn() } as any;
-    const reservation = reserveAsyncQueuedActivationTailAdmission(ds);
-    expect(releaseQueuedActivationReservation(ds, 'opening-token')).toBe(false);
+    const reservation = reserveQueuedActivationTailAdmission(ds);
     mocks.updateSession.mockImplementationOnce(() => {
       throw new Error('tail persistence unavailable');
     });
 
-    expect(() => {
-      try {
-        admitQueuedActivationTail(ds, {
-          userPrompt: 'FAILED_N_PLUS_1',
-          cliInput: { content: 'FAILED_N_PLUS_1' },
-          turnId: 'turn-failed-n1',
-        }, reservation);
-      } finally {
-        settleAsyncQueuedActivationTailAdmission(ds);
-      }
-    }).toThrow('tail persistence unavailable');
+    const admission = runSessionTurn(ds.session.sessionId, () => admitQueuedActivationTail(ds, {
+      userPrompt: 'FAILED_N_PLUS_1',
+      cliInput: { content: 'FAILED_N_PLUS_1' },
+      turnId: 'turn-failed-n1',
+    }, reservation));
+    const ack = onQueuedActivationSubmitted(ds, 'opening-token');
+    await expect(admission).rejects.toThrow('tail persistence unavailable');
+    // The failed command never blocks the release queued behind it.
+    await expect(ack).resolves.toBe(true);
 
     expect(ds.session.queuedActivationTail).toBeUndefined();
-    expect(ds.queuedActivationTailAdmissionsOutstanding).toBeUndefined();
-    expect(ds.queuedActivationTailReleasePending).toBeUndefined();
     expect(ds.initialStartPending).toBe(false);
     expect(ds.initialStartClaimToken).toBeUndefined();
     expect(ds.queuedActivationTailReleaseRetryTimer).toBeUndefined();
+  });
+
+  it('promotes a follower whose admission ran after the opening ACK had already released the route', async () => {
+    const ds = seedThreadSession('om_ack_before_follower', 'ACK before follower admission');
+    ds.session.cliId = 'claude-code';
+    ds.initialStartPending = true;
+    ds.hasHistory = true;
+    const send = vi.fn();
+    ds.worker = { killed: false, send } as any;
+
+    // N's ACK is enqueued first; the follower arrived in the same tick — its
+    // order is stamped now, its build + admission queued behind the release.
+    const ack = onQueuedActivationSubmitted(ds, 'opening-token');
+    const reservation = reserveQueuedActivationTailAdmission(ds);
+    let routeHeldAtAdmission: boolean | undefined;
+    const admission = admitFollowerBehindOpening(ds, reservation, {
+      userPrompt: 'AFTER_RELEASE_N_PLUS_1',
+      turnId: 'turn-after-release-n1',
+      build: async () => {
+        // The release ran ahead and found an empty tail: the route is gone by
+        // the time this follower is built, so nothing else will promote it.
+        routeHeldAtAdmission = ds.initialStartPending;
+        return { content: 'AFTER_RELEASE_N_PLUS_1' };
+      },
+    });
+    await expect(ack).resolves.toBe(true);
+    await admission;
+    expect(routeHeldAtAdmission).toBe(false);
+    // …so the same command promoted it inline, with no separate release call.
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: 'turn-after-release-n1',
+      content: 'AFTER_RELEASE_N_PLUS_1',
+      queuedActivationToken: expect.any(String),
+    }));
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.session.queuedActivationTail).toBeUndefined();
+  });
+
+  it('retries inline promote when the opening already released and the store write fails', async () => {
+    const ds = seedThreadSession('om_inline_promote_retry', 'inline promote retry');
+    ds.session.cliId = 'claude-code';
+    ds.initialStartPending = true;
+    ds.hasHistory = true;
+    const send = vi.fn();
+    ds.worker = { killed: false, send } as any;
+
+    const ack = onQueuedActivationSubmitted(ds, 'opening-token');
+    const reservation = reserveQueuedActivationTailAdmission(ds);
+    mocks.updateSession
+      .mockImplementationOnce((session: any) => { mocks.sessions.set(session.sessionId, session); })
+      .mockImplementationOnce(() => { throw new Error('promote persist unavailable'); });
+    const admission = admitFollowerBehindOpening(ds, reservation, {
+      userPrompt: 'AFTER_RELEASE_RETRY',
+      turnId: 'turn-after-release-retry',
+      build: async () => ({ content: 'AFTER_RELEASE_RETRY' }),
+    });
+    await expect(ack).resolves.toBe(true);
+    await admission;
+    expect(ds.session.queuedActivationTail).toEqual([
+      expect.objectContaining({ turnId: 'turn-after-release-retry' }),
+    ]);
+    expect(ds.queuedActivationTailReleaseRetryTimer).toBeDefined();
+
+    const deadline = Date.now() + 1_000;
+    while (!ds.session.queuedActivationPending && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    expect(ds.session.queuedActivationPending).toBe(true);
+    expect(ds.session.queuedActivationTurnId).toBe('turn-after-release-retry');
+    expect(ds.session.queuedActivationTail).toBeUndefined();
+    expect(send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'message',
+      turnId: 'turn-after-release-retry',
+      content: 'AFTER_RELEASE_RETRY',
+    }));
+    expect(ds.queuedActivationTailReleaseRetryTimer).toBeUndefined();
+  });
+
+  it('holds the admission gate while a follower is still being built, so a live-worker turn cannot overtake it', async () => {
+    const ds = seedThreadSession('om_gate_follows_queue', 'gate follows the turn queue');
+    ds.session.cliId = 'claude-code';
+    ds.worker = { killed: false, send: vi.fn() } as any;
+    expect(hasQueuedActivationAdmissionGate(ds)).toBe(false);
+
+    const build = deferred();
+    const admission = runSessionTurn(ds.session.sessionId, async () => { await build.promise; });
+    expect(hasQueuedActivationAdmissionGate(ds)).toBe(true);
+    build.resolve();
+    await admission;
+    expect(hasQueuedActivationAdmissionGate(ds)).toBe(false);
   });
 
   it('releases a failed queued-refork claim so a later inbound can become the owner', async () => {
@@ -2455,6 +2922,7 @@ describe('/rename production routing — must not pre-create a session (review P
 
     mocks.forkWorker.mockImplementation((owner: any) => {
       owner.worker = { killed: false, send: vi.fn() };
+      return true;
     });
     await handleThreadReply(
       makeEventData('om_retry_owner', 'RETRY_OWNER_REPLY', anchor),
@@ -2486,7 +2954,7 @@ describe('/rename production routing — must not pre-create a session (review P
 
     // Promotion is already a durable acceptance boundary: an IPC throw fences
     // this child but keeps one tokened journal owner for exact recovery.
-    expect(onQueuedActivationSubmitted(ds)).toBe(true);
+    await expect(onQueuedActivationSubmitted(ds)).resolves.toBe(true);
     expect(failedSend).toHaveBeenCalledTimes(1);
     expect(kill).toHaveBeenCalledTimes(1);
     expect(ds.pendingFollowUps).toBeUndefined();
@@ -2532,7 +3000,7 @@ describe('/rename production routing — must not pre-create a session (review P
       queuedActivationDispatchAttempt: undefined,
       queuedActivationResume: undefined,
     });
-    expect(onQueuedActivationSubmitted(ds, retainedToken)).toBe(true);
+    await expect(onQueuedActivationSubmitted(ds, retainedToken)).resolves.toBe(true);
     expect(resumedSend).toHaveBeenCalledTimes(1);
     expect(resumedSend).toHaveBeenCalledWith(expect.objectContaining({
       type: 'message',
@@ -2648,8 +3116,10 @@ describe('document comment canonical ownership and single-flight delivery', () =
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.sessions.clear();
-    mocks.forkWorker.mockImplementation((ds: any) => {
+    mocks.forkWorker.mockImplementation((ds: any, _input?: any, _resume?: any, opts?: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      opts?.onAdmission?.('accepted');
+      return true;
     });
     mocks.getAvailableBots.mockResolvedValue([]);
     activeSessions.clear();
@@ -2673,6 +3143,21 @@ describe('document comment canonical ownership and single-flight delivery', () =
     return sub;
   }
 
+  function docNativeSub(fileToken: string): any {
+    const anchor = `doc:${fileToken}:watch`;
+    const sub = {
+      fileToken,
+      fileType: 'docx',
+      sessionAnchor: anchor,
+      scope: 'chat' as const,
+      chatId: anchor,
+      commentTriggerMode: 'all' as const,
+      managedBy: 'watch-comment' as const,
+      createdAt: Date.now(),
+    };
+    putDocSubscription(config.session.dataDir, APP, sub);
+    return sub;
+  }
   function docCtx(sub: any, suffix: string): any {
     return {
       larkAppId: APP,
@@ -2777,50 +3262,243 @@ describe('document comment canonical ownership and single-flight delivery', () =
     removeDocSubscription(config.session.dataDir, APP, sub.fileToken);
   });
 
-  it('serializes concurrent get-or-create, merges targets, and reuses canonical state after restart', async () => {
+  it('isolates concurrent document comment threads and reuses one thread after restart', async () => {
     const fileToken = `doc-concurrent-${Date.now()}`;
-    const sub = docSub(fileToken);
+    const sub = docNativeSub(fileToken);
 
     await expect(Promise.all([
       handleDocComment(docCtx(sub, 'one')),
       handleDocComment(docCtx(sub, 'two')),
     ])).resolves.toEqual([true, true]);
 
-    const key = sessionKey(`doc:${fileToken}`, APP);
-    const owner = activeSessions.get(key)!;
-    expect(owner).toBeDefined();
-    expect(mocks.createSession).toHaveBeenCalledTimes(1);
-    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
-    expect(Object.keys(owner.session.docCommentTargets ?? {}).sort()).toEqual(['reply-one', 'reply-two']);
+    const keyOne = sessionKey(`doc:${fileToken}:comment-one`, APP);
+    const keyTwo = sessionKey(`doc:${fileToken}:comment-two`, APP);
+    const ownerOne = activeSessions.get(keyOne)!;
+    const ownerTwo = activeSessions.get(keyTwo)!;
+    expect(ownerOne).toBeDefined();
+    expect(ownerTwo).toBeDefined();
+    expect(ownerOne).not.toBe(ownerTwo);
+    expect(mocks.createSession).toHaveBeenCalledTimes(2);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(2);
+    expect(Object.keys(ownerOne.session.docCommentTargets ?? {})).toEqual(['reply-one']);
+    expect(Object.keys(ownerTwo.session.docCommentTargets ?? {})).toEqual(['reply-two']);
 
     const persisted = getDocSubscription(config.session.dataDir, APP, fileToken)!;
     expect(persisted).toMatchObject({
-      sessionAnchor: `doc:${fileToken}`,
-      sessionId: owner.session.sessionId,
+      sessionAnchor: `doc:${fileToken}:watch`,
       scope: 'chat',
-      chatId: `doc:${fileToken}`,
+      chatId: `doc:${fileToken}:watch`,
     });
-    // This is the exact anchor closeSession uses to find subscriptions.
-    expect(sessionAnchorId(owner)).toBe(persisted.sessionAnchor);
+    expect(persisted.sessionId).toBeUndefined();
 
-    // Simulate a daemon memory restart restoring the same persisted session at
-    // activeSessionKey(ds), then deliver another comment from a stale snapshot.
     activeSessions.clear();
-    owner.worker = null;
-    activeSessions.set(key, owner);
+    ownerOne.worker = null;
+    activeSessions.set(keyOne, ownerOne);
     const staleSnapshot = { ...sub };
-    await expect(handleDocComment(docCtx(staleSnapshot, 'three'))).resolves.toBe(true);
-    expect(mocks.createSession).toHaveBeenCalledTimes(1);
-    expect(activeSessions.get(key)).toBe(owner);
-    expect(Object.keys(owner.session.docCommentTargets ?? {}).sort()).toEqual([
+    await expect(handleDocComment({
+      ...docCtx(staleSnapshot, 'one-followup'),
+      commentId: 'comment-one',
+    })).resolves.toBe(true);
+    expect(mocks.createSession).toHaveBeenCalledTimes(2);
+    expect(activeSessions.get(keyOne)).toBe(ownerOne);
+    expect(Object.keys(ownerOne.session.docCommentTargets ?? {}).sort()).toEqual([
       'reply-one',
-      'reply-three',
-      'reply-two',
+      'reply-one-followup',
     ]);
 
     removeDocSubscription(config.session.dataDir, APP, fileToken);
   });
+  it('consumes a stale comment after its document watch is stopped during sender lookup', async () => {
+    const fileToken = `doc-stopped-${Date.now()}`;
+    const sub = docNativeSub(fileToken);
+    const gate = deferred();
+    mocks.resolveSender.mockImplementationOnce(async () => {
+      await gate.promise;
+      return { openId: OWNER, type: 'user' as const };
+    });
+    mocks.closeWorkerPoolSession.mockImplementationOnce(async (sessionId: string) => {
+      for (const [key, candidate] of activeSessions) {
+        if (candidate.session.sessionId !== sessionId) continue;
+        activeSessions.delete(key);
+        candidate.session.status = 'closed';
+      }
+      return { ok: true as const, outcome: 'closed' as const, alreadyClosed: false, known: true };
+    });
 
+    const delivery = handleDocComment(docCtx(sub, 'stopped'));
+    await vi.waitFor(() => expect(mocks.createSession).toHaveBeenCalledTimes(1));
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
+    gate.resolve();
+
+    await expect(delivery).resolves.toBe(true);
+    expect(mocks.closeWorkerPoolSession).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(activeSessions.has(sessionKey(`doc:${fileToken}:comment-stopped`, APP))).toBe(false);
+  });
+
+  it('retries a stale document comment on the latest explicit session binding', async () => {
+    const fileToken = `doc-rebound-${Date.now()}`;
+    const sub = docNativeSub(fileToken);
+    const gate = deferred();
+    mocks.resolveSender.mockImplementationOnce(async () => {
+      await gate.promise;
+      return { openId: OWNER, type: 'user' as const };
+    });
+    mocks.closeWorkerPoolSession.mockImplementationOnce(async (sessionId: string) => {
+      for (const [key, candidate] of activeSessions) {
+        if (candidate.session.sessionId !== sessionId) continue;
+        activeSessions.delete(key);
+        candidate.session.status = 'closed';
+      }
+      return { ok: true as const, outcome: 'closed' as const, alreadyClosed: false, known: true };
+    });
+
+    const delivery = handleDocComment(docCtx(sub, 'rebound'));
+    await vi.waitFor(() => expect(mocks.createSession).toHaveBeenCalledTimes(1));
+    const rebound = seedThreadSession(`om_rebound_${fileToken}`, 'rebound doc owner');
+    putDocSubscription(config.session.dataDir, APP, {
+      ...sub,
+      sessionAnchor: sessionAnchorId(rebound),
+      sessionId: rebound.session.sessionId,
+      scope: rebound.scope,
+      chatId: rebound.chatId,
+    });
+    gate.resolve();
+
+    await expect(delivery).resolves.toBe(true);
+    expect(mocks.closeWorkerPoolSession).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(rebound.session.docCommentTargets).toHaveProperty('reply-rebound');
+    expect(activeSessions.has(sessionKey(`doc:${fileToken}:comment-rebound`, APP))).toBe(false);
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
+  });
+
+  it('keeps a live-worker comment accepted when post-send projection fails', async () => {
+    const fileToken = `doc-live-projection-${Date.now()}`;
+    const sub = docSub(fileToken);
+    sub.commentTriggerMode = 'mention-only';
+    const ds = seedThreadSession(sub.sessionAnchor, 'live projection');
+    const send = vi.fn();
+    ds.worker = { killed: false, send } as any;
+    bindSubToSession(sub, ds);
+    mocks.persistStreamCardState.mockImplementationOnce(() => {
+      throw new Error('projection persistence failed');
+    });
+
+    await expect(handleDocComment(docCtx(sub, 'projection'))).resolves.toBe(true);
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(ds.session.docCommentTargets).toHaveProperty('reply-projection');
+    expect(getDocSubscription(config.session.dataDir, APP, fileToken)?.pendingDocCommentDeliveries).toBeUndefined();
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
+  });
+
+  it('keeps the comment retryable when worker admission rejects the fork', async () => {
+    const fileToken = `doc-admission-rejected-${Date.now()}`;
+    const sub = docNativeSub(fileToken);
+    mocks.forkWorker.mockImplementationOnce((_ds: any, _input: any, _resume: any, opts?: any) => {
+      opts?.onAdmission?.('rejected');
+      return true;
+    });
+
+    await expect(handleDocComment(docCtx(sub, 'rejected'))).resolves.toBe(false);
+
+    expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    expect(mocks.forkWorker.mock.calls[0]?.[3]).toEqual(expect.objectContaining({
+      deferDuringDeviceIsolation: false,
+    }));
+    expect(mocks.closeWorkerPoolSession).toHaveBeenCalledTimes(1);
+    expect(activeSessions.has(sessionKey(`doc:${fileToken}:comment-rejected`, APP))).toBe(false);
+    expect(getDocSubscription(config.session.dataDir, APP, fileToken)).not.toBeNull();
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
+  });
+
+  it('keeps an explicitly bound adopted comment retryable when the adopt fork rejects', async () => {
+    const fileToken = `doc-adopt-rejected-${Date.now()}`;
+    const sub = docSub(fileToken);
+    const ds = seedThreadSession(sub.sessionAnchor, 'adopted doc owner');
+    ds.adoptedFrom = {
+      source: 'tmux',
+      tmuxTarget: 'work:0.0',
+      originalCliPid: 4242,
+      sessionId: 'sess-adopt-live',
+      cliId: 'claude-code',
+      cwd: '/repo',
+    };
+    ds.session.adoptedFrom = { ...ds.adoptedFrom };
+    bindSubToSession(sub, ds);
+    mocks.forkAdoptWorker.mockReturnValueOnce('rejected');
+
+    await expect(handleDocComment(docCtx(sub, 'adopt-rejected'))).resolves.toBe(false);
+
+    expect(mocks.forkAdoptWorker).toHaveBeenCalledTimes(1);
+    expect(ds.session.docCommentTargets).not.toHaveProperty('reply-adopt-rejected');
+    expect(getDocSubscription(config.session.dataDir, APP, fileToken)).not.toBeNull();
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
+  });
+
+  it('retries persisted WS delivery across rounds using the latest explicit binding', async () => {
+    const fileToken = `doc-pending-ws-${Date.now()}`;
+    const sub = docSub(fileToken);
+    sub.commentTriggerMode = 'mention-only';
+    putDocSubscription(config.session.dataDir, APP, {
+      ...sub,
+      pendingDocCommentDeliveries: [{
+        commentId: 'comment-pending',
+        replyId: 'reply-pending',
+        text: 'retry me',
+        queuedAt: 1,
+      }],
+    });
+    const attempts: string[] = [];
+    const reject = vi.fn(async (ctx: any) => {
+      attempts.push(ctx.sub.sessionAnchor);
+      return false;
+    });
+
+    const blocked = await retryPendingDocCommentDeliveries(APP, reject);
+    expect(blocked).toEqual({ acceptedKeys: new Set(), blockedFiles: new Set([fileToken]) });
+    expect(getDocSubscription(config.session.dataDir, APP, fileToken)?.pendingDocCommentDeliveries).toHaveLength(1);
+
+    const rebound = seedThreadSession(`om_pending_rebound_${fileToken}`, 'pending rebound');
+    bindSubToSession(getDocSubscription(config.session.dataDir, APP, fileToken)!, rebound);
+    const accept = vi.fn(async (ctx: any) => {
+      attempts.push(ctx.sub.sessionAnchor);
+      return true;
+    });
+    const accepted = await retryPendingDocCommentDeliveries(APP, accept);
+
+    expect(accepted).toEqual({ acceptedKeys: new Set(), blockedFiles: new Set() });
+    expect(attempts).toEqual([sub.sessionAnchor, sessionAnchorId(rebound)]);
+    expect(getDocSubscription(config.session.dataDir, APP, fileToken)?.pendingDocCommentDeliveries).toBeUndefined();
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
+  });
+  it('does not re-execute an accepted --all pending marker after restart', async () => {
+    const fileToken = `doc-accepted-marker-${Date.now()}`;
+    const sub = docSub(fileToken);
+    sub.commentTriggerMode = 'all';
+    putDocSubscription(config.session.dataDir, APP, {
+      ...sub,
+      pendingDocCommentDeliveries: [{
+        commentId: 'comment-accepted',
+        replyId: 'reply-accepted',
+        text: 'already delivered',
+        queuedAt: 1,
+        acceptedAt: 2,
+      }],
+    });
+    const deliver = vi.fn(async () => true);
+
+    await expect(retryPendingDocCommentDeliveries(APP, deliver)).resolves.toEqual({
+      acceptedKeys: new Set([`${fileToken}:reply-accepted`]),
+      blockedFiles: new Set(),
+    });
+
+    expect(deliver).not.toHaveBeenCalled();
+    expect(getDocSubscription(config.session.dataDir, APP, fileToken)?.pendingDocCommentDeliveries?.[0])
+      .toMatchObject({ replyId: 'reply-accepted', acceptedAt: 2 });
+    removeDocSubscription(config.session.dataDir, APP, fileToken);
+  });
   it('makes duplicate WS/poll deliveries share failure so neither advances its cursor', async () => {
     const fileToken = `doc-failure-${Date.now()}`;
     const sub = docSub(fileToken);
@@ -2836,8 +3514,10 @@ describe('document comment canonical ownership and single-flight delivery', () =
     expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
 
     // Failure was not recorded as completed: a later poll retry can deliver.
-    mocks.forkWorker.mockImplementation((ds: any) => {
+    mocks.forkWorker.mockImplementation((ds: any, _input?: any, _resume?: any, opts?: any) => {
       ds.worker = { killed: false, send: vi.fn() };
+      opts?.onAdmission?.('accepted');
+      return true;
     });
     await expect(handleDocComment(ctx)).resolves.toBe(true);
     expect(mocks.forkWorker).toHaveBeenCalledTimes(2);

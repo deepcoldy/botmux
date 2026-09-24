@@ -10,14 +10,18 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ─── Mocks（与 prompt-builder.test.ts 同一套） ─────────────────────────────
 
-vi.mock('node:child_process', () => ({
-  execFile: vi.fn((_file: string, _args: string[], cb?: (...args: any[]) => void) => {
-    if (typeof cb === 'function') cb(null, '', '');
-    return {} as any;
-  }),
-  execSync: vi.fn(() => ''),
-  execFileSync: vi.fn(() => ''),
-}));
+vi.mock('node:child_process', () => {
+  const actual = require('node:child_process') as typeof import('node:child_process');
+  return {
+    ...actual,
+    execFile: vi.fn((_file: string, _args: string[], cb?: (...args: any[]) => void) => {
+      if (typeof cb === 'function') cb(null, '', '');
+      return {} as any;
+    }),
+    execSync: vi.fn(() => ''),
+    execFileSync: vi.fn(() => ''),
+  };
+});
 
 vi.mock('node-pty', () => ({
   spawn: vi.fn(() => ({
@@ -29,8 +33,13 @@ vi.mock('node-pty', () => ({
   })),
 }));
 
-vi.mock('node:fs', async () => {
-  const memfs = await import('memfs');
+// A synchronous `require`, NOT `await import()`. An `await import()` inside a mock
+// factory HANGS under `bun test`: the file emits no output at all and is eventually
+// killed, which looks like "0 tests collected" rather than an error — the most
+// dangerous shape of failure, since it reads as success. `require` resolves at the
+// same moment for both runners and does not deadlock.
+vi.mock('node:fs', () => {
+  const memfs = require('memfs') as typeof import('memfs');
   return memfs.fs;
 });
 
@@ -50,9 +59,15 @@ vi.mock('../src/im/lark/client.js', () => ({
 const getBotMock = vi.fn(() => ({
   config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
 }));
+// core/reply-delivery.ts 读 per-bot replyDelivery 的入口。本文件的 hook 注入用例都以
+// **显式 send** 为前提（claude-code 未配置时缺省已是 transcript、不注入 reminder——
+// 见下方 transcript 用例），所以 mock 缺省返回显式 'send' 而非 undefined。
+const replyDeliveryMock = vi.fn((..._args: unknown[]): 'send' | 'transcript' | undefined => 'send');
 vi.mock('../src/bot-registry.js', () => ({
   getBot: (...args: unknown[]) => getBotMock(...args),
   getAllBots: vi.fn(() => []),
+  resolveReplyDelivery: (...args: unknown[]) => replyDeliveryMock(...args),
+  getOwnerOpenId: vi.fn(() => undefined),
 }));
 
 vi.mock('../src/services/session-store.js', () => ({
@@ -91,7 +106,7 @@ vi.mock('../src/adapters/hook-installer.js', () => ({
 
 // ─── 被测模块 ──────────────────────────────────────────────────────────────
 
-import { buildFollowUpCliInput } from '../src/core/session-manager.js';
+import { buildFollowUpCliInput, buildNewTopicCliInput } from '../src/core/session-manager.js';
 import { claimPromptContext, fingerprintPromptText, prefixOf } from '../src/services/prompt-context-store.js';
 
 const SESSION_ID = 'hook-session-789';
@@ -133,21 +148,24 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     else process.env.SESSION_DATA_DIR = prevDataDir;
   });
 
-  it('auto + claude-code + preflight 通过：reminder/whiteboard 进 sidecar，PTY 文本只留其余块', () => {
+  it('auto + claude-code + preflight 通过：reminder/whiteboard/sender/mentions 进 sidecar，PTY 文本只剩正文', () => {
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: 'wb_1' }));
 
-    // PTY 文本：有 user_message / sender / mentions，无 reminder / whiteboard
-    expect(result.content).toContain('<user_message>\n帮我修个 bug\n</user_message>');
-    expect(result.content).toContain('<sender ');
-    expect(result.content).toContain('<mentions>');
+    // PTY 文本：只剩用户正文，无 user_message 外壳 / sender / mentions / reminder / whiteboard
+    expect(result.content).toBe('帮我修个 bug');
+    expect(result.content).not.toContain('<user_message>');
+    expect(result.content).not.toContain('<sender ');
+    expect(result.content).not.toContain('<mentions>');
     expect(result.content).not.toContain('<botmux_reminder>');
     expect(result.content).not.toContain('<whiteboard');
 
-    // sidecar：按 PTY 文本指纹读回，含 reminder + whiteboard
+    // sidecar：按 PTY 文本指纹读回，含 reminder + whiteboard + sender + mentions
     const envelope = claimByPrompt(SESSION_ID, TURN_ID, result.content);
     expect(envelope).toBeDefined();
     expect(envelope).toContain('<botmux_reminder>');
     expect(envelope).toContain('<whiteboard');
+    expect(envelope).toContain('<sender ');
+    expect(envelope).toContain('<mentions>');
     // hook 模式用描述式文案（命令式原文只出现在 inline 路径）
     expect(envelope).toContain('本会话通过 botmux 桥接飞书');
     expect(envelope).not.toContain('至少 botmux send 回应一次');
@@ -258,5 +276,190 @@ describe('buildFollowUpCliInput — hook 注入模式', () => {
     const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ sessionBackendType: undefined }));
     expect(result.content).toContain('<botmux_reminder>');
     expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+  });
+
+  // ─── replyDelivery=transcript：续轮不注入 reminder，sidecar 不再承载它 ────────
+
+  it('auto + transcript + whiteboard：sidecar 含 whiteboard 与 sender，reminder 两边都没有', () => {
+    replyDeliveryMock.mockReturnValue('transcript');
+    try {
+      const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: 'wb_t' }));
+      // hook 模式下 PTY 文本只剩用户正文，外壳与 sender/mentions 都进 sidecar。
+      expect(result.content).toBe('帮我修个 bug');
+      expect(result.content).not.toContain('<botmux_reminder>');
+      expect(result.content).not.toContain('<whiteboard');
+      const envelope = claimByPrompt(SESSION_ID, TURN_ID, result.content);
+      expect(envelope).toBeDefined();
+      expect(envelope).toContain('<whiteboard');
+      expect(envelope).toContain('<sender ');
+      expect(envelope).not.toContain('<botmux_reminder>');
+      // 白板末句改口：不再要求「仍必须 botmux send」。
+      expect(envelope).toContain('用户可见结论写进最终回复即可');
+      expect(envelope).not.toContain('仍必须');
+    } finally {
+      replyDeliveryMock.mockReturnValue('send');
+    }
+  });
+
+  it('auto + transcript 无 whiteboard：envelope 只剩 sender，仍走 hook（reminder 两边都没有）', () => {
+    replyDeliveryMock.mockReturnValue('transcript');
+    try {
+      const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: undefined }));
+      expect(result.content).toBe('帮我修个 bug');
+      expect(result.content).not.toContain('<botmux_reminder>');
+      const envelope = claimByPrompt(SESSION_ID, TURN_ID, result.content);
+      expect(envelope).toContain('<sender ');
+      expect(envelope).not.toContain('<botmux_reminder>');
+    } finally {
+      replyDeliveryMock.mockReturnValue('send');
+    }
+  });
+
+  it('未显式配置 + claude-code：缺省即 transcript，与显式 transcript 字节相同（无 reminder）', () => {
+    replyDeliveryMock.mockReturnValue('transcript');
+    let explicit: string;
+    try {
+      explicit = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: undefined })).content;
+    } finally {
+      replyDeliveryMock.mockReturnValue(undefined);
+    }
+    try {
+      const result = buildFollowUpCliInput('帮我修个 bug', SESSION_ID, followUpOpts({ whiteboardId: undefined }));
+      expect(result.content).toBe(explicit);
+      expect(result.content).not.toContain('<botmux_reminder>');
+      expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toContain('<sender ');
+    } finally {
+      replyDeliveryMock.mockReturnValue('send');
+    }
+  });
+});
+
+describe('buildNewTopicCliInput — hook 注入模式（opening）', () => {
+  let prevDataDir: string | undefined;
+  beforeEach(() => {
+    prevDataDir = process.env.SESSION_DATA_DIR;
+    process.env.SESSION_DATA_DIR = '/tmp/test-sessions';
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'auto' as const },
+    });
+    preflightMock.mockReturnValue(true);
+  });
+  afterEach(() => {
+    if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
+    else process.env.SESSION_DATA_DIR = prevDataDir;
+  });
+
+  const openingOpts = (overrides: Record<string, unknown> = {}) => ({
+    larkAppId: LARK_APP_ID,
+    whiteboardId: 'wb_1',
+    turnId: TURN_ID,
+    sessionBackendType: 'pty' as const,
+    ...overrides,
+  });
+
+  it('auto + claude-code + preflight 通过 + turnId：whiteboard/sender/mentions 进 sidecar，PTY 文本只剩正文', () => {
+    const result = buildNewTopicCliInput(
+      '帮我修个 bug', SESSION_ID, 'claude-code', undefined,
+      undefined,
+      [{ name: 'Bob', openId: 'ou_bob' }],
+      undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' },
+      undefined,
+      { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
+      openingOpts(),
+    );
+
+    // PTY 文本：只剩用户正文，无 user_message 外壳 / sender / mentions / whiteboard
+    expect(result.content).toBe('帮我修个 bug');
+    expect(result.content).not.toContain('<user_message>');
+    expect(result.content).not.toContain('<sender ');
+    expect(result.content).not.toContain('<mentions>');
+    expect(result.content).not.toContain('<whiteboard');
+
+    // sidecar：含 whiteboard + sender + mentions
+    const envelope = claimByPrompt(SESSION_ID, TURN_ID, result.content);
+    expect(envelope).toBeDefined();
+    expect(envelope).toContain('<whiteboard');
+    expect(envelope).toContain('<sender ');
+    expect(envelope).toContain('<mentions>');
+  });
+
+  it('缺 turnId：回退 inline（有 user_message 外壳，无 sidecar）', () => {
+    const result = buildNewTopicCliInput(
+      '帮我修个 bug', SESSION_ID, 'claude-code', undefined,
+      undefined, undefined, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' },
+      undefined,
+      { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
+      openingOpts({ turnId: undefined }),
+    );
+    expect(result.content).toContain('<user_message>');
+    expect(result.content).toContain('<sender ');
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+  });
+
+  it('off：完全 inline（无 sidecar）', () => {
+    getBotMock.mockReturnValue({
+      config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code', envelopeInjection: 'off' as const },
+    });
+    const result = buildNewTopicCliInput(
+      '帮我修个 bug', SESSION_ID, 'claude-code', undefined,
+      undefined, undefined, undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' },
+      undefined,
+      { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
+      openingOpts(),
+    );
+    expect(result.content).toContain('<user_message>');
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+  });
+
+  it('无 whiteboard/sender/mentions（envelope 为空）：回退 inline，保留外壳', () => {
+    // envelope 为空时不写 sidecar，回退 inline——外壳保留给会话发现/标题提取用。
+    const result = buildNewTopicCliInput(
+      '帮我修个 bug', SESSION_ID, 'claude-code', undefined,
+      undefined, undefined, undefined, undefined,
+      undefined,
+      undefined,
+      undefined,
+      openingOpts({ whiteboardId: undefined }),
+    );
+    expect(result.content).toContain('<user_message>');
+    expect(claimByPrompt(SESSION_ID, TURN_ID, result.content)).toBeUndefined();
+  });
+
+  it('skill catalog 追加到 prompt 尾部后：全量指纹 miss，prefix 兜底仍能 claim', () => {
+    // opening 是 CLI generation 的首轮，prepareSessionSkillPrompt 会把 skill catalog
+    // 追加到 prompt 尾部（${opts.prompt}\n\n${catalog}），这才是 claude-code 真正
+    // typed 进 PTY 的文本。sidecar 按「catalog 追加前」的 ptyText 写指纹，所以 hook
+    // fire 时全量指纹 exact match 会 miss，只能靠 prefix 兜底（前 30 归一字符，catalog
+    // 在尾 → 前 30 不变 → turnId 定域 0/1 条 → 救回）。本测试锁住这条 fallback 路径。
+    // 注意：消息需长于 PREFIX_FALLBACK_LEN（30 字符），否则前 30 字符本身就被追加改变。
+    const longMessage = '帮我修个 bug，这个问题出现在用户登录模块，需要排查一下认证流程的 token 刷新逻辑';
+    const result = buildNewTopicCliInput(
+      longMessage, SESSION_ID, 'claude-code', undefined,
+      undefined,
+      [{ name: 'Bob', openId: 'ou_bob' }],
+      undefined, undefined,
+      { name: 'Bot', openId: 'ou_bot' },
+      undefined,
+      { openId: 'ou_sender', type: 'user' as const, name: 'Sender' },
+      openingOpts(),
+    );
+    expect(result.content).toBe(longMessage);
+
+    // 模拟 prepareSessionSkillPrompt 把 catalog 追加到尾部
+    const catalog = '<botmux_skills>\n- skill-a\n- skill-b\n</botmux_skills>';
+    const typedText = `${result.content}\n\n${catalog}`;
+
+    // 全量指纹 miss（typed 文本 ≠ sidecar 的 ptyText），且 exact miss 不消费 sidecar
+    const exactMiss = claimPromptContext(SESSION_ID, TURN_ID, fingerprintPromptText(typedText));
+    expect(exactMiss).toBeUndefined();
+
+    // 但 sidecar 还在，用 prefix 兜底能 claim 回 envelope
+    const rescued = claimPromptContext(SESSION_ID, TURN_ID, fingerprintPromptText(typedText), prefixOf(typedText));
+    expect(rescued).toBeDefined();
+    expect(rescued).toContain('<sender ');
+    expect(rescued).toContain('<mentions>');
   });
 });

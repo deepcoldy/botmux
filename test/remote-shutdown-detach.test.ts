@@ -83,6 +83,7 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
       workerPort: 4100,
       workerToken: 'write',
       workerViewToken: 'view',
+      workerCardViewToken: 'card-view',
       managedTurnOrigin: { capability: 'cap' },
       initConfig: { backendType },
     } as unknown as DaemonSession;
@@ -167,6 +168,8 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
       'remote_shutdown_commit',
     ]);
     expect(f.ds.worker).toBeNull();
+    expect(f.ds.workerViewToken).toBeNull();
+    expect(f.ds.workerCardViewToken).toBeNull();
   });
 
   it('retains only the ambiguous session fence and restores an unrelated prepared peer', async () => {
@@ -257,19 +260,20 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
     sessionStore.updateSession(second.ds.session);
     const originalSnapshot = sessionStore.getActiveRemoteShutdownSnapshotsBatch;
     const snapshot = vi.spyOn(sessionStore, 'getActiveRemoteShutdownSnapshotsBatch')
-      .mockImplementation((sessionIds, options) => {
+      .mockImplementation((sessionIds) => {
         expect(first.messages).toEqual([]);
         expect(second.messages).toEqual([]);
-        return originalSnapshot(sessionIds, options);
+        return originalSnapshot(sessionIds);
       });
 
     const results = await prepareRemoteFleetForShutdown([first.ds, second.ds]);
 
     expect(snapshot).toHaveBeenCalledTimes(1);
+    // 等待上限现在由 SQLite busy_timeout 决定，批量快照只收 sessionIds 一个参数。
     expect(snapshot).toHaveBeenCalledWith([
       first.ds.session.sessionId,
       second.ds.session.sessionId,
-    ], expect.any(Object));
+    ]);
     expect(results.every(entry => entry.result.ok)).toBe(true);
     expect(first.messages.map(message => message.type)).toEqual(['remote_shutdown_prepare']);
     expect(second.messages.map(message => message.type)).toEqual(['remote_shutdown_prepare']);
@@ -325,9 +329,11 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
       type: 'remote_shutdown_result', requestId: secondAbortRequestId,
       phase: 'abort', ok: true, taskId: 'task-second',
     });
-    await expect(aborting).resolves.toSatisfy(
-      (results: Array<{ result: { ok: boolean } }>) => results.every(entry => entry.result.ok),
-    );
+    // Bun's `resolves.toSatisfy` calls the predicate with `{}` instead of the
+    // resolved value (see test/bun-test-shim.ts). Await + a sync assertion is
+    // the same contract under both runners.
+    const abortResults = await aborting;
+    expect(abortResults.every(entry => entry.result.ok)).toBe(true);
     expect(first.ds.remoteShutdownState).toBeUndefined();
     expect(second.ds.remoteShutdownState).toBeUndefined();
 
@@ -460,9 +466,10 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
     let now = 10_000;
     const deadlineMs = 10_100;
     vi.spyOn(sessionStore, 'persistActiveRemoteLineagesExactBatch')
-      .mockImplementation((updates, options) => {
-        originalBatch(updates, options);
+      .mockImplementation((updates) => {
+        const published = originalBatch(updates);
         now = deadlineMs;
+        return published;
       });
 
     const result = persistPreparedRemoteShutdownFleet(

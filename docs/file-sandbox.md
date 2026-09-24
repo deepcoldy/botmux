@@ -13,6 +13,10 @@
 
 Linux 依赖 bubblewrap（bwrap），macOS 用同一份 policy 经 Seatbelt（`sandbox-exec`）落地；两平台统一走 fs-policy 三档白名单。除 riff 外的本地后端（pty/tmux/zellij…）都会包裹。
 
+> ⚠️ **前置条件：这台机器要先做过「lark-cli 按 bot 拆配置」** —— 见 [lark-cli 按 bot 隔离配置](./lark-cli-per-bot.md)。
+> 白名单 deny 掉了共享的 `~/.lark-cli`，只放行本 bot 的 `~/.lark-cli-bots/<自己appId>`；没配过的机器上，沙盒内所有 `lark-cli` 命令会以 `not configured` / `operation not permitted` 失败。
+> lark-cli 的密钥并**不**在 per-bot 目录里（那里只有 `config.json`），而在各平台共享的 keystore；两平台都是「整目录 deny + 只放行本 bot 自己的 master key 与 `appsecret_<自己>.enc`」，落点和文件名不同，见那篇的「平台差异」一节。
+
 ## Codex 的 per-bot 登录态
 
 `codexAuthSync` 控制 Codex 使用全局登录态还是该 bot 的独立登录态：
@@ -84,6 +88,32 @@ worker spawnCli
 3. 附件被拷进 `outbox`（共享路径）后路径改写，host 侧才读得到
 
 → **所有飞书密钥全程不进沙盒**。
+
+### Linux 隔离判据
+
+环境变量只是路由提示，不是安全边界。完整 bwrap 和仅凭据隔离 bwrap 在启动 CLI
+前都会安装一个很窄的 seccomp 规则：拒绝 `getpriority(PRIO_PROCESS, 1)`，其它
+已支持 ABI 的系统调用保持原策略。内核会把规则传给 fork / exec 的后代；清空环境、
+替换 HOME / 数据目录或再创建 namespace 都不能移除它。
+
+CLI 通过 `os.getPriority(1)` 查询这个判据，只把成功且位于合法 nice 范围
+`[-20, 19]` 的结果视为普通宿主。不能只匹配 EPERM：后代可以叠加 seccomp 规则
+替换 errno，但不能恢复真实调用；即使伪造 errno 0，libc 返回的 nice 20 仍会被拒绝。
+规则通过匿名管道传给 bwrap，不落可修改的配置文件，也不占用交互终端的 stdin。
+
+确认处于隔离中的 `send` 不能因缺失 capability 或伪造进程标记降级为宿主直发；
+daemon 不可达时，`delete` 等命令也不能退回离线写会话库。正常宿主 relay 不安装此
+规则，普通宿主命令不依赖 HOME 中是否存在探针文件。
+
+兼容边界：支持 Linux x64 / arm64 及其 i386 / ARM EABI / x32 调用约定；未知 ABI
+或无法安装 seccomp 时拒绝启动，不静默关闭保护。查询 PID 1 的 nice 值会被拒绝，
+查询当前进程优先级、调整优先级不受此规则影响。如果外层容器策略本来就禁止这个
+查询，宿主命令也会按隔离处理，需要先核对外层策略，不能靠环境变量绕过。
+隔离 pane 标记版本升至 15，旧 pane 必须冷启动一次才能获得新规则。
+
+这是受信 CLI 的隔离分类防线，不代替文件和凭据隔离，也不承诺阻止修改 CLI 代码、
+持有真实凭据后自行调用 API 或内核逃逸。规则继承与叠加语义见
+[Linux seccomp 文档](https://docs.kernel.org/userspace-api/seccomp_filter.html)。
 
 ## no-transport 会话（apiOnly / HTTP virtual）跟随本地配置
 

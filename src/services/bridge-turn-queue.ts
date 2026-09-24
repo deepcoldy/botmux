@@ -36,6 +36,7 @@ import {
   extractTurnStartText,
   isClaudeTurnTerminalEvent,
   isTranscriptRateLimitEvent,
+  isSyntheticNoModelReplyEvent,
   classifyClaudeTerminalEvent,
   type ClaudeTerminalOutcome,
   type TranscriptEvent,
@@ -164,6 +165,21 @@ export class BridgeTurnQueue {
   private seen = new Set<string>();
   private queue: BridgePendingTurn[] = [];
   private collecting: BridgePendingTurn | null = null;
+  /** Lark turns removed by the head-of-line drop, awaiting journal cleanup by
+   *  the worker. This queue is pure (no fs), so it cannot clear the durable
+   *  journal itself — it reports, the worker retires. Same contract as
+   *  `pruneExpired`'s return value, just accumulated because the drop happens
+   *  deep inside ingest() rather than at an explicit call boundary. */
+  private droppedNeedingJournalClear: BridgePendingTurn[] = [];
+
+  /** Hand over (and forget) the turns dropped head-of-line since the last
+   *  call. The worker drains this after every ingest and clears each one's
+   *  journal entry; leaving them would let a later restart re-mark a turn
+   *  that can never complete. */
+  takeDroppedNeedingJournalClear(): BridgePendingTurn[] {
+    if (this.droppedNeedingJournalClear.length === 0) return [];
+    return this.droppedNeedingJournalClear.splice(0);
+  }
 
   /** Register events as historical — their uuids are now considered seen
    *  but no attribution happens. Used at attach time to baseline. */
@@ -330,9 +346,37 @@ export class BridgeTurnQueue {
           continue;
         }
         const terminalOutcome = classifyClaudeTerminalEvent(ev);
-        if (ev.isApiErrorMessage === true) {
+        // The `<synthetic>` no-model-reply placeholder (see
+        // isSyntheticNoModelReplyEvent) takes the same exit as an API error:
+        // its "No response requested." text must not become the turn's reply,
+        // it must not synthesise a headless local turn, and the turn closes
+        // with the retryable failure the classifier produced. The exit is
+        // shared; the assignment below is NOT - see the two branches.
+        if (ev.isApiErrorMessage === true || isSyntheticNoModelReplyEvent(ev)) {
           if (this.collecting && terminalOutcome?.status !== 'rate_limited') {
-            this.collecting.terminalOutcome = terminalOutcome;
+            // The two signals that share this exit are NOT of equal authority,
+            // so they do not share an assignment operator (maintainer ruling on
+            // PR #1330):
+            if (ev.isApiErrorMessage === true) {
+              // An API-error line is authoritative execution metadata. When the
+              // connection drops mid-response, Claude force-closes the stream
+              // with an `end_turn` record whose text is a half-finished
+              // sentence, and that record has already written `completed` here.
+              // Letting the error win is what keeps the turn `failed` +
+              // retryable, which is the only thing ordinary-turn-recovery acts
+              // on (`status !== 'failed' || retryable !== true` → no
+              // continuation). Unconditional assignment, therefore.
+              this.collecting.terminalOutcome = terminalOutcome;
+            } else {
+              // The `<synthetic>` placeholder is the WEAKEST terminal signal
+              // there is - no model call happened at all (no requestId, usage
+              // all zero). It must not downgrade an already-`completed` turn:
+              // `emitReadyTurns` (`status !== 'completed' → continue`) would
+              // then withhold the real answer text AND let the daemon post a
+              // failure card for a turn that had in fact been answered. With no
+              // earlier terminal outcome it still records the failure.
+              this.collecting.terminalOutcome ??= terminalOutcome;
+            }
             this.collecting.terminalObserved = true;
           }
           continue;
@@ -425,6 +469,15 @@ export class BridgeTurnQueue {
       && this.collecting.assistantUuids.length === 0) {
       const idx = this.queue.indexOf(this.collecting);
       if (idx >= 0) this.queue.splice(idx, 1);
+      // This turn will never reach drainEmittable, which is where the worker
+      // retires its durable journal entry. Record it so the worker can clear
+      // the journal here too — otherwise the entry survives, and every later
+      // restart re-marks it and replays the same stretch of transcript. That
+      // is not hypothetical: one entry was restored on six consecutive
+      // restarts, twice resurfacing a hours-old provider error as a fresh
+      // 「本轮执行失败」card. Local turns are skipped: they are synthesised by
+      // this queue and never had a journal entry to begin with.
+      if (!this.collecting.isLocal) this.droppedNeedingJournalClear.push(this.collecting);
       this.collecting = null;
     }
     const tsParsed = ev.timestamp ? Date.parse(ev.timestamp) : NaN;

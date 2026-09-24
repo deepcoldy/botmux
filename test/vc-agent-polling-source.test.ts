@@ -20,35 +20,10 @@ vi.mock('node:child_process', () => {
   return { ...actual, spawnSync: vi.fn() };
 });
 
-import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
+import { spawnSync } from 'node:child_process';
+import { textSpawnResult } from './helpers/spawn-result.js';
 
 const spawnSyncMock = vi.mocked(spawnSync);
-
-/**
- * A complete `SpawnSyncReturns` from just the fields a test cares about.
- *
- * `vi.mocked(spawnSync)` carries the REAL signature, so `mockReturnValue` demands
- * every field — `pid`, `output` and `signal` included. The previous mock was a bare
- * `vi.fn()` with no signature, which accepted these partial literals silently; the
- * literals were always incomplete, the looseness just hid it. Neither runner checks
- * types at runtime, and `tsc --noEmit -p tsconfig.json` only includes `src`, so this
- * shows up nowhere but the editor. Filling the fields here keeps each call site
- * stating only what it is actually asserting on.
- */
-function spawnResult(
-  partial: Partial<SpawnSyncReturns<string>> & Pick<SpawnSyncReturns<string>, 'status'>,
-): SpawnSyncReturns<string> {
-  const stdout = partial.stdout ?? '';
-  const stderr = partial.stderr ?? '';
-  return {
-    pid: 4242,
-    output: [null, stdout, stderr],
-    stdout,
-    stderr,
-    signal: null,
-    ...partial,
-  };
-}
 
 import {
   fetchMeetingEventsAsBot,
@@ -61,7 +36,7 @@ describe('vc agent polling source process bounds', () => {
   });
 
   it('passes an explicit timeout to synchronous lark-cli execution', () => {
-    spawnSyncMock.mockReturnValue(spawnResult({ status: 0, stdout: '{}' }));
+    spawnSyncMock.mockReturnValue(textSpawnResult({ status: 0, stdout: '{}' }));
 
     expect(runLarkCliJson(['vc', '+meeting-events'], { timeoutMs: 12_345 })).toEqual({});
     expect(spawnSyncMock).toHaveBeenCalledWith('lark-cli', ['vc', '+meeting-events'], expect.objectContaining({
@@ -72,14 +47,14 @@ describe('vc agent polling source process bounds', () => {
 
   it('reports a bounded timeout instead of treating it as an ordinary exit', () => {
     const error = Object.assign(new Error('spawnSync lark-cli ETIMEDOUT'), { code: 'ETIMEDOUT' });
-    spawnSyncMock.mockReturnValue(spawnResult({ status: null, error }));
+    spawnSyncMock.mockReturnValue(textSpawnResult({ status: null, error }));
 
     expect(() => runLarkCliJson(['vc', '+meeting-events'], { timeoutMs: 500 }))
       .toThrow('timed out after 500ms');
   });
 
   it('forwards the restore timeout through meeting event polling', () => {
-    spawnSyncMock.mockReturnValue(spawnResult({
+    spawnSyncMock.mockReturnValue(textSpawnResult({
       status: 0,
       stdout: JSON.stringify({ meeting: { id: 'm1' }, events: [] }),
     }));

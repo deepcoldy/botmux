@@ -13,8 +13,13 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import qrcode from 'qrcode-terminal';
 import bundledScopeManifest from './lark-scopes.json' with { type: 'json' };
+// Plain ESM import, deliberately: `--compile` traces it into the binary, while tsc /
+// tsx / vitest treat it as an ordinary module. See defaultBotmuxAppIcon() for why the
+// icon is base64 in the module graph instead of a file read off disk.
+import { BOTMUX_APP_ICON_BASE64, BOTMUX_APP_ICON_BYTES } from './app-icon-data.js';
 import { registerBotmuxRedirectUrlCollector, VC_MEETING_BOT_EVENTS } from './verify-permissions.js';
 import { readGlobalConfig } from '../global-config.js';
+import { logger } from '../utils/logger.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
 import {
   parseOnlineVisibility,
@@ -37,6 +42,9 @@ export const BOT_BASELINE_APP_EVENTS = [
   'im.message.reaction.deleted_v1',
 ] as const;
 
+/** 消息编辑事件名（用户「修改」已发送消息时推送）。 */
+export const MESSAGE_UPDATED_EVENT = 'im.message.updated_v1';
+
 /**
  * Best-effort app events: subscribed alongside the baseline but NEVER part of
  * the fail-closed verification (missingBaselineEvents / MANAGED_VERIFIED_EVENT_COUNT).
@@ -48,6 +56,12 @@ export const BOT_BASELINE_APP_EVENTS = [
 export const BOT_OPTIONAL_APP_EVENTS = [
   'im.chat.member.user.added_v1',
   'im.chat.member.user.deleted_v1',
+  // 消息编辑（修改已发送消息，典型场景：发出时没 @ bot，编辑补 @ 后期望触发任务）。
+  // 放 OPTIONAL 而非 BASELINE：① dispatcher 对缺订阅天然静默降级（只是编辑补 @ 不生效，
+  // 不影响收消息主链路）；② 不增加 MANAGED_VERIFIED_EVENT_COUNT，避免把存量 bot 已落账
+  // 的 managed activation 校验打回。新建 bot 会随清单一起订阅；存量 bot 由启动时的
+  // ensureMessageUpdatedEventSubscribed 经缓存开放平台登录态增量补订阅。
+  MESSAGE_UPDATED_EVENT,
 ] as const;
 
 /** 缺了它 daemon 完全收不到消息——回读确认失败时整个自动配置 fail-closed。 */
@@ -858,7 +872,23 @@ export function extractOpenPlatformRedirectUrls(payload: unknown): string[] | nu
   const wrapped = asRecord(root.data);
   const data = Object.keys(wrapped).length > 0 ? wrapped : root;
   const raw = data.redirectURL ?? data.redirectUrl ?? data.redirectURLs;
-  if (!Array.isArray(raw)) return null;
+  if (!Array.isArray(raw)) {
+    // 新建应用在白名单为空时会直接省略 redirectURL，而不是返回 []。
+    // 只在其它三个 safe_setting 标志字段都符合真实响应形状时才当空集；
+    // 普通 `{code:0,data:{}}` 仍是不可识别，继续零写入保护用户配置。
+    const omittedEmptyList = raw === undefined
+      && typeof data.allowRefreshToken === 'boolean'
+      && Array.isArray(data.ipWhiteList)
+      && Array.isArray(data.safeServerDomain);
+    // 留一条痕迹：这条分支是从「键缺失」**推断**出空集的，依据是服务端
+    // 「空列表就省略该键」的约定，而不是读到了 `[]`。约定一旦变了，这里会
+    // 静默把「其实有内容」当成空集去合并写，且没有回读校验能兜住。日志是
+    // 事后唯一能把线上白名单异常追回到这次推断的线索。
+    if (omittedEmptyList) {
+      logger.info('[open-platform] safe_setting 未返回 redirectURL 键，按服务端约定视为空白名单（其余字段形状已校验）');
+    }
+    return omittedEmptyList ? [] : null;
+  }
   return uniqueStrings(raw.map(item => (typeof item === 'string' ? item.trim() : '')));
 }
 
@@ -955,6 +985,10 @@ export async function writeRedirectWhitelist(
     existing = extractOpenPlatformRedirectUrls(payload);
     if (existing === null) readError = '返回体里没有可识别的 redirectURL 数组';
   } catch (err: any) {
+    // 开放平台首页仍可能返回 csrf，但具体 console 接口才报
+    // Code=4101 / "please log in again"。这不是「白名单读不出」，而是
+    // 「需要重新扫码」；保留结构化错误给调用方分流，不要压成 warning。
+    if (openPlatformWebSessionExpired(err)) throw err;
     // 端点不存在 / 网络抖动 / 403 → 当作读不出来。
     existing = null;
     readError = safeErrorMessage(err);
@@ -2195,15 +2229,49 @@ class CreatedOpenPlatformAppError extends Error {
   }
 }
 
-function defaultBotmuxAppIconPath(): string | undefined {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const candidates = [
-    // npm build: dist/setup/open-platform-automation.js -> dist/dashboard-web/favicon.png
-    join(here, '..', 'dashboard-web', 'favicon.png'),
-    // tsx / vitest: src/setup/open-platform-automation.ts -> src/dashboard/web/favicon.png
-    join(here, '..', 'dashboard', 'web', 'favicon.png'),
-  ];
-  return candidates.find(existsSync);
+/**
+ * The default Feishu app icon bytes (512×512 PNG).
+ *
+ * ⚠️ THIS USED TO BE A DISK PATH AND THAT BROKE THE COMPILED BINARY. The old
+ * implementation derived candidates from `import.meta.url`:
+ *
+ *     const here = dirname(fileURLToPath(import.meta.url));
+ *     [join(here,'..','dashboard-web','favicon.png'),
+ *      join(here,'..','dashboard','web','favicon.png')].find(existsSync)
+ *
+ * In a `bun build --compile` binary `import.meta.url` lives in the virtual
+ * `/$bunfs/`, so `here` is `/$bunfs/root` and BOTH candidates miss. MEASURED by
+ * compiling that exact function: `here = /$bunfs/root`, result `undefined` — and it
+ * misses even with a real favicon.png sitting beside the binary, because `here`
+ * never points at the filesystem. Every install.sh / npm / bun global user therefore
+ * got `找不到 botmux 默认应用图标` and could not create a bot at all. Same class as
+ * the Dashboard 404 (88e3d7f24) and the missing lark-scopes.json (2ef5c3a58).
+ *
+ * The icon now arrives as a base64 constant in the module graph, which `--compile`
+ * traces like any other import. Base64 rather than the Dashboard's
+ * `with { type: 'file' }` because this module is also compiled by `tsc` and run under
+ * tsx/vitest, where that attribute fails outright (MEASURED: node
+ * `ERR_UNKNOWN_FILE_EXTENSION`; tsx `Transform failed`). The Dashboard can use it
+ * because its preamble is injected at compile time and Node never parses it.
+ * See scripts/generate-app-icon-data.mjs for the full comparison.
+ *
+ * Do NOT reintroduce a `join(__dirname, …)` lookup here.
+ */
+function defaultBotmuxAppIcon() {
+  const icon = Buffer.from(BOTMUX_APP_ICON_BASE64, 'base64');
+  // A silently truncated decode would upload a corrupt image and produce an app
+  // with a broken icon, which is far harder to diagnose than a failed create.
+  if (icon.length !== BOTMUX_APP_ICON_BYTES) {
+    throw new Error(`botmux 默认应用图标解码后长度异常（${icon.length} != ${BOTMUX_APP_ICON_BYTES}）`);
+  }
+  return icon;
+}
+
+/** The custom/test icon override, read off disk. Fails with the path in the message
+ *  so a caller that passed a bad path can see which one. */
+function readIconFile(iconFilePath: string) {
+  if (!existsSync(iconFilePath)) throw new Error(`找不到指定的应用图标: ${iconFilePath}`);
+  return readFileSync(iconFilePath);
 }
 
 function pickPayloadString(payload: unknown, keys: string[]): string | undefined {
@@ -2273,10 +2341,17 @@ export async function createOpenPlatformAppWithClient(
   const name = options.name.trim();
   if (!name) throw new Error('应用名称不能为空');
   if (!options.creatorUserId) throw new Error('创建应用缺少创建者 userId,无法完成上架启用');
-  const iconFile = options.iconFilePath ?? defaultBotmuxAppIconPath();
-  if (!iconFile || !existsSync(iconFile)) throw new Error('找不到 botmux 默认应用图标');
+  // `iconFilePath` stays a DISK path: it is the test/custom-icon override, always
+  // supplied by a caller that knows the file exists. Only the DEFAULT moved into the
+  // module graph — that is the one that has to work inside the compiled binary.
+  //
+  // No explicit `Buffer` annotation on purpose: it widens to `Buffer<ArrayBufferLike>`,
+  // which tsc rejects as a `BlobPart` (SharedArrayBuffer is in that union). Inference
+  // keeps the narrower `Buffer<ArrayBuffer>` both branches actually produce.
+  const icon = options.iconFilePath
+    ? readIconFile(options.iconFilePath)
+    : defaultBotmuxAppIcon();
 
-  const icon = readFileSync(iconFile);
   const form = new FormData();
   form.append('file', new Blob([icon], { type: 'image/png' }), 'botmux.png');
   form.append('uploadType', '4'); // Open Platform console enum: Icon
@@ -2373,22 +2448,31 @@ export async function createOpenPlatformAppWithClient(
   }
 }
 
-/**
- * Read-only probe: are this app's VC meeting events (vc.bot.meeting_* +
- * participant_meeting_joined) subscribed, and is event mode the long connection?
- * Uses ONLY the cached Feishu Web session (disableQrLogin) and never publishes a
- * version — so it is safe to call at daemon startup. The caller decides whether
- * to run the full (publishing) automateOpenPlatformSetup based on the result:
- * only when events are actually missing / mode is wrong.
- */
 export type VcMeetingEventProbeResult =
   | { ok: true; missingVcEvents: string[]; eventModeReady: boolean; sessionFile?: string }
   | { ok: false; reason: string; message: string; sessionFile?: string };
 
-export async function probeVcMeetingEventSubscription(
+/**
+ * Read-only probe: which of `eventNames` are missing from this app's event
+ * subscription, and is event mode the long connection? Uses ONLY the cached
+ * Feishu Web session (disableQrLogin) and never publishes a version — safe to
+ * call at daemon startup. The caller decides whether to run the full
+ * (publishing) automateOpenPlatformSetup based on the result.
+ */
+export type AppEventSubscriptionProbeResult =
+  | { ok: true; missingEvents: string[]; eventModeReady: boolean; sessionFile?: string }
+  | { ok: false; reason: string; message: string; sessionFile?: string };
+
+export type AppEventSubscriptionEnsureResult = AppEventSubscriptionProbeResult & {
+  /** Whether event/update returned success, not whether it persisted or was published. */
+  updateSubmitted: boolean;
+};
+
+export async function probeAppEventSubscriptions(
   appId: string,
+  eventNames: readonly string[],
   options: Pick<FeishuWebSessionOptions, 'sessionFilePath' | 'fetchImpl'> = {},
-): Promise<VcMeetingEventProbeResult> {
+): Promise<AppEventSubscriptionProbeResult> {
   const prepared = await prepareFeishuWebSession({
     ...options,
     disableQrLogin: true,
@@ -2408,13 +2492,79 @@ export async function probeVcMeetingEventSubscription(
     const has = (name: string) => eventState.events.includes(name);
     return {
       ok: true,
-      missingVcEvents: VC_MEETING_BOT_EVENTS.filter(name => !has(name)),
+      missingEvents: eventNames.filter(name => !has(name)),
       eventModeReady: eventState.eventMode === LONG_CONNECTION_EVENT_MODE,
       sessionFile: prepared.sessionFile,
     };
   } catch (err: any) {
     return { ok: false, reason: 'api_error', message: `读取事件订阅失败: ${safeErrorMessage(err)}`, sessionFile: prepared.sessionFile };
   }
+}
+
+/**
+ * Add only the requested missing app events using the cached Web session.
+ * Startup repair must not switch transport modes or publish an existing draft:
+ * the event subscription endpoint is the only write allowed here.
+ * Readback describes configuration only; it does not verify publication or delivery.
+ */
+export async function ensureAppEventSubscriptions(
+  appId: string,
+  eventNames: readonly string[],
+  options: Pick<FeishuWebSessionOptions, 'sessionFilePath' | 'fetchImpl'> = {},
+): Promise<AppEventSubscriptionEnsureResult> {
+  const prepared = await prepareFeishuWebSession({
+    ...options,
+    disableQrLogin: true,
+    disableBytedcliFallback: true,
+  });
+  if (!prepared.ok) {
+    return { ok: false, reason: prepared.reason, message: prepared.message, sessionFile: prepared.sessionFile, updateSubmitted: false };
+  }
+  const clientResult = await createOpenPlatformApiClient(prepared.cookies, { fetchImpl: options.fetchImpl });
+  if (!clientResult.ok) {
+    return { ok: false, reason: clientResult.reason, message: clientResult.message, sessionFile: prepared.sessionFile, updateSubmitted: false };
+  }
+  const readEventState = async () => extractOpenPlatformEventState(
+    await clientResult.client.postJson(`/developers/v1/event/${appId}`, { needEventDetail: true }),
+  );
+  const missingEvents = (state: OpenPlatformEventState) => eventNames.filter(name => !state.events.includes(name));
+  let updateSubmitted = false;
+  try {
+    let eventState = await readEventState();
+    const missing = missingEvents(eventState);
+    if (eventState.eventMode === LONG_CONNECTION_EVENT_MODE && missing.length > 0) {
+      await clientResult.client.postJson(
+        `/developers/v1/event/update/${appId}`,
+        buildEventSubscriptionPayload(appId, eventState.eventMode, missing, []),
+      );
+      updateSubmitted = true;
+      // A successful update may not persist; read back the configured events and mode.
+      eventState = await readEventState();
+    }
+    return {
+      ok: true,
+      missingEvents: missingEvents(eventState),
+      eventModeReady: eventState.eventMode === LONG_CONNECTION_EVENT_MODE,
+      sessionFile: prepared.sessionFile,
+      updateSubmitted,
+    };
+  } catch (err) {
+    return { ok: false, reason: 'api_error', message: `补齐事件订阅失败: ${safeErrorMessage(err)}`, sessionFile: prepared.sessionFile, updateSubmitted };
+  }
+}
+
+export async function probeVcMeetingEventSubscription(
+  appId: string,
+  options: Pick<FeishuWebSessionOptions, 'sessionFilePath' | 'fetchImpl'> = {},
+): Promise<VcMeetingEventProbeResult> {
+  const probed = await probeAppEventSubscriptions(appId, VC_MEETING_BOT_EVENTS, options);
+  if (!probed.ok) return probed;
+  return {
+    ok: true,
+    missingVcEvents: probed.missingEvents,
+    eventModeReady: probed.eventModeReady,
+    sessionFile: probed.sessionFile,
+  };
 }
 
 /**
@@ -2892,6 +3042,36 @@ export class OpenPlatformApiError extends Error {
   constructor(message: string, readonly payload: unknown, readonly status: number) {
     super(message);
   }
+}
+
+/**
+ * 开放平台 Web session 已被服务端注销。
+ *
+ * console 会出现「`/app` 首页还有 csrf，具体管理接口才报退出」的
+ * 半失效状态。实测返回为 HTTP 400 + 顶层 code=99991641，强信号在
+ * `error.Code=4101` / `error.LogoutReason=40` / "please log in again"。顶层
+ * 99991641 是通用错误，不单独当登录失效，避免一般 console 故障也误弹扫码。
+ */
+export function openPlatformWebSessionExpired(error: unknown): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current !== undefined && current !== null; depth += 1) {
+    if (current instanceof OpenPlatformApiError) {
+      if (current.status === 401) return true;
+      const payload = asRecord(current.payload);
+      const detail = asRecord(payload.error);
+      const codes = [payload.code, detail.Code, detail.code];
+      if (codes.some(code => Number(code) === 4101)) return true;
+      if (Number(payload.code) === 99991641 && Number(detail.LogoutReason ?? detail.logoutReason) === 40) {
+        return true;
+      }
+      const messages = [current.message, payload.msg, payload.message, detail.msg, detail.message]
+        .filter((value): value is string => typeof value === 'string')
+        .join(' ');
+      if (/please\s+log\s+in\s+again|请重新登录/i.test(messages)) return true;
+    }
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  return false;
 }
 
 function openPlatformOwnerAccessDenied(error: unknown): boolean {

@@ -49,6 +49,22 @@ describe('desktop dashboard embed', () => {
     expect(sidebarRoutes(desktopHtml)).toEqual(dashboardNavRoutes(dashboardSource));
   });
 
+  it('provides localized desktop labels for the mirrored message-listener route', () => {
+    const rendererSource = readFileSync(
+      fileURLToPath(new URL('../../src/desktop/renderer/app.ts', import.meta.url)),
+      'utf-8',
+    );
+    const desktopHtml = readFileSync(
+      fileURLToPath(new URL('../../src/desktop/renderer/index.html', import.meta.url)),
+      'utf-8',
+    );
+
+    expect(desktopHtml).toContain('data-route="message-listeners"');
+    expect(desktopHtml).toContain('data-i18n="nav.messageListeners"');
+    expect(rendererSource).toContain("'nav.messageListeners': '消息监听'");
+    expect(rendererSource).toContain("'nav.messageListeners': 'Message Listener'");
+  });
+
   it('keeps lower-left runtime status distinct from topbar counts', () => {
     const html = readFileSync(
       fileURLToPath(new URL('../../src/desktop/renderer/index.html', import.meta.url)),

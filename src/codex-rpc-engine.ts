@@ -21,16 +21,33 @@
 // port each incarnation) — reattaching the prior pane would leave it pointed at
 // the now-dead prior app-server (that lifecycle bug, not any non-broadcast, is
 // what froze the Web terminal). See codex-rpc-lifecycle + worker engageCodexRpc.
-import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
+import { spawn, execFileSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createServer } from 'node:net';
 import { get as httpGet } from 'node:http';
 import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { WebSocket } from 'ws';
+import {
+  CODEX_OUTPUT_LIMIT_ERROR_CODE,
+  isExactCodexOutputLimitError,
+} from './services/codex-transcript.js';
 
 type Json = Record<string, any>;
 type LogFn = (msg: string) => void;
+
+function rpcTurnErrorCode(error: unknown, fallback = 'rpc_turn_failed'): string {
+  if (isExactCodexOutputLimitError(error)) return CODEX_OUTPUT_LIMIT_ERROR_CODE;
+  if (error && typeof error === 'object') {
+    const record = error as Record<string, unknown>;
+    const code = String(record.code ?? '').trim();
+    if (code) return code;
+    const message = String(record.message ?? '').trim();
+    if (message) return message;
+  }
+  const text = typeof error === 'string' ? error.trim() : '';
+  return text || fallback;
+}
 
 async function findFreePort(): Promise<number> {
   return new Promise<number>((resolve, reject) => {
@@ -65,12 +82,15 @@ export interface CodexRpcEngineOpts {
    *  new incarnation of this session can reap a prior app-server (P0 teardown). */
   sessionId?: string;
   log?: LogFn;
-  /** Optional model + reasoning effort forwarded to thread config (P1). */
+  /** Optional model, backend variant, and reasoning effort forwarded to fresh thread config (P1). */
   model?: string;
+  modelBackendVariant?: 'standard' | 'max';
   reasoningEffort?: string;
   /** Feature gates owned by the app-server process (the viewer TUI does not
    *  execute model tools in RPC mode). */
   appServerFeatures?: string[];
+  /** Generic process-scoped app-server config overrides. */
+  appServerConfig?: string[];
   /** Bridge a native request_user_input server request to the host UI. */
   onRequestUserInput?: (params: unknown) => Promise<unknown>;
   /** Override the per-request JSON-RPC timeout (default REQUEST_TIMEOUT_MS).
@@ -86,6 +106,16 @@ export interface CodexRpcEngineOpts {
    *  matching rpcActive bridge entry. */
   onTurnTerminal?: (terminal: CodexRpcTurnTerminal) => void;
 }
+
+export interface CodexRpcEngineDependencies {
+  /** Process boundary kept injectable so launch argv/env can be verified without
+   * relying on platform-specific process introspection such as Linux /proc. */
+  spawnProcess(command: string, args: string[], options: SpawnOptions): ChildProcess;
+}
+
+const DEFAULT_DEPENDENCIES: CodexRpcEngineDependencies = {
+  spawnProcess: (command, args, options) => spawn(command, args, options),
+};
 
 export interface CodexRpcTurnIdentity {
   turnId: string;
@@ -163,7 +193,10 @@ export class CodexRpcEngine {
   private lastStderr = '';
   private readonly log: LogFn;
 
-  constructor(private readonly opts: CodexRpcEngineOpts) {
+  constructor(
+    private readonly opts: CodexRpcEngineOpts,
+    private readonly dependencies: CodexRpcEngineDependencies = DEFAULT_DEPENDENCIES,
+  ) {
     this.log = opts.log ?? (() => {});
   }
 
@@ -267,7 +300,9 @@ export class CodexRpcEngine {
     this.reapStaleAppServer();
     this.port = await findFreePort();
     const featureArgs = (this.opts.appServerFeatures ?? []).flatMap(feature => ['--enable', feature]);
-    this.child = spawn(this.opts.cliBin, ['app-server', ...featureArgs, '--listen', `ws://127.0.0.1:${this.port}`], {
+    const configArgs = [...(this.opts.appServerConfig ?? [])]
+      .flatMap(value => ['-c', value]);
+    this.child = this.dependencies.spawnProcess(this.opts.cliBin, ['app-server', ...featureArgs, ...configArgs, '--listen', `ws://127.0.0.1:${this.port}`], {
       cwd: this.opts.cwd,
       env: this.opts.env,
       stdio: ['ignore', 'ignore', 'pipe'],
@@ -336,6 +371,7 @@ export class CodexRpcEngine {
     // either here would trip the app-server's model-resume-override short-circuit.
     if (!forResume) {
       if (this.opts.model) config.model = this.opts.model;
+      if (this.opts.modelBackendVariant) config.model_backend_variant = this.opts.modelBackendVariant;
       if (this.opts.reasoningEffort) config.model_reasoning_effort = this.opts.reasoningEffort;
     }
     return {
@@ -372,11 +408,7 @@ export class CodexRpcEngine {
       sandboxPolicy: { type: 'dangerFullAccess' },
     };
     params.clientUserMessageId = identity.turnId;
-    try {
-      await this.request('turn/start', params, opts, undefined, identity);
-    } catch (err) {
-      throw err;
-    }
+    await this.request('turn/start', params, opts, undefined, identity);
     const nativeTurnId = this.takeNativeTurnId(identity);
     if (!nativeTurnId) throw new Error('turn/start ack did not bind a native turn id');
     return { nativeTurnId };
@@ -719,6 +751,29 @@ export class CodexRpcEngine {
     try { this.send({ jsonrpc: '2.0', id, error: { code: -32000, message } }); } catch { /* connection gone */ }
   }
 
+  private serverRequestNativeTurnId(params: unknown): string | undefined {
+    if (!params || typeof params !== 'object') return undefined;
+    const p = params as Record<string, any>;
+    const value = p.turnId ?? p.turn?.id;
+    return typeof value === 'string' && value ? value : undefined;
+  }
+
+  private handleOrdinaryServerRequest(msg: Json): void {
+    if (msg.method === 'item/tool/requestUserInput' && this.opts.onRequestUserInput) {
+      const requestParams = msg.params;
+      void this.opts.onRequestUserInput(requestParams).then(
+        result => this.respond(msg.id, result),
+        err => {
+          const message = err instanceof Error ? err.message : String(err);
+          this.log(`[codex-rpc] requestUserInput bridge failed: ${message}; interrupting turn`);
+          this.interruptTurnFor(msg.id, requestParams, message);
+        },
+      );
+      return;
+    }
+    this.respond(msg.id, autoApproval(String(msg.method ?? '')));
+  }
+
   private send(msg: Json): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) throw new Error('app-server ws not open');
     this.ws.send(JSON.stringify(msg));
@@ -749,30 +804,8 @@ export class CodexRpcEngine {
       }
       return;
     }
-    // Native user-input requests are the one server→client request that must
-    // wait for a human. In botmux this callback posts a Lark card and returns
-    // the protocol-shaped answers object. Keep all approval requests automatic.
     if (typeof msg.id === 'number' && typeof msg.method === 'string') {
-      if (msg.method === 'item/tool/requestUserInput' && this.opts.onRequestUserInput) {
-        const requestParams = msg.params;
-        void this.opts.onRequestUserInput(requestParams).then(
-          result => this.respond(msg.id, result),
-          err => {
-            // Fail VISIBLY, never silently. Verified against real traex 0.200.19:
-            // ANY response to this request — empty answers OR a JSON-RPC error —
-            // is normalized by the app-server into `{answers:{}}` and the turn
-            // still COMPLETES, so unsupported/broker-failed asks would be
-            // silently skipped. Only `turn/interrupt` (threadId+turnId, both
-            // carried in this request's params) actually stops the turn
-            // (status → 'interrupted'). So fail by interrupting the turn.
-            const message = err instanceof Error ? err.message : String(err);
-            this.log(`[codex-rpc] requestUserInput bridge failed: ${message}; interrupting turn`);
-            this.interruptTurnFor(msg.id, requestParams, message);
-          },
-        );
-        return;
-      }
-      this.respond(msg.id, autoApproval(msg.method));
+      this.handleOrdinaryServerRequest(msg);
       return;
     }
     if (typeof msg.method === 'string') {
@@ -789,7 +822,7 @@ export class CodexRpcEngine {
       if (msg.method === 'turn/completed' && nativeTurnId) {
         const turn = params.turn ?? {};
         const rawStatus = String(turn.status ?? '').toLowerCase();
-        const errorCode = String(turn.error?.code ?? turn.error?.message ?? '');
+        const errorCode = turn.error ? rpcTurnErrorCode(turn.error) : '';
         const failed = !!turn.error || ['failed', 'error'].includes(rawStatus);
         const aborted = ['aborted', 'cancelled', 'canceled', 'interrupted'].includes(rawStatus);
         this.emitTurnTerminal(
@@ -807,7 +840,7 @@ export class CodexRpcEngine {
         this.emitTurnTerminal(
           nativeTurnId,
           'failed',
-          String(params.error?.code ?? params.error?.message ?? 'rpc_turn_failed'),
+          rpcTurnErrorCode(params.error),
         );
         return;
       }

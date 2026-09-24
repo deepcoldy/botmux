@@ -12,7 +12,15 @@ bun run daemon:logs          # 查看日志
 
 - 每次修改后需要 `bun run build` 然后 `bun run daemon:restart`
 
-**包管理器是 bun**（`packageManager: bun@1.4.0`，锁文件 `bun.lock`）。装依赖用 `bun install --frozen-lockfile`。
+⚠️ **别用裸 `node` 起 daemon —— 用 `bun run daemon:*`。** 会话存储硬依赖 SQLite 引擎
+（`node:sqlite` 需 Node ≥ 22.13，或任意 bun 的 `bun:sqlite`），而裸 `node` 由 exec 时的
+PATH 解析，那不是写它的环境：2026-09-08 某次 restart 的 PATH 把 `/usr/bin` 排在 fnm shim
+之前 ⟹ 解析成 v18.20.4 ⟹ **55 个 bot daemon 全部启动即崩**，飞书里所有话题看似全丢（57 个
+SQLite 库其实完好）。**supervisor 自身不需要 SQLite，所以它照常打印「✅ daemon 已重启」**
+—— 这个失败形状是记在这里的唯一理由：报成功、孩子全灭，看日志前无从分辨。
+现在 preflight 会在**拆掉现有 fleet 之前**按引擎能力拒绝（逃生阀 `BOTMUX_INTERPRETER=<abs>`）。
+
+**包管理器是 bun**（`packageManager: bun@1.4.2`，锁文件 `bun.lock`）。装依赖用 `bun install --frozen-lockfile`。
 
 ⚠️ `trustedDependencies: ["electron","node-pty"]` **不能删**：bun 默认**不跑依赖的生命周期脚本**，而 `node-pty` 要靠它 `node-gyp` 编出 `build/Release/pty.node` —— 少了这个，PTY 全废、编译版二进制也打不出来（`pty.node` 是被嵌进去的）。electron 的 postinstall 负责下载对应平台的二进制。
 
@@ -31,7 +39,7 @@ bun run dashboard:bun        # bun src/index-dashboard.ts
 bun run build:bun            # 打自包含单文件二进制（scripts/build-bun-binary.mjs）
 ```
 
-发版编译用的 Bun 版本**钉在 1.4.0**（见 `.github/workflows/`）。本地 bun 与它差太多时，编译产物的行为可能和 CI 不一致——排查编译态问题前先核对 `bun --version`。
+发版编译用的 Bun 版本**钉在 1.4.2**（见 `.github/workflows/`）。本地 bun 与它差太多时，编译产物的行为可能和 CI 不一致——排查编译态问题前先核对 `bun --version`。
 
 **测试里 spawn 子进程必须走 `test/helpers/ts-runner.ts`**，不要写 `spawn(process.execPath, ['--import','tsx', …])`：那是 Node-only 形态，Bun 下 `process.execPath` 是 bun 二进制、`bun --import tsx` 不合法，子进程会全部起不来。helper 按运行时解析（Node 加 tsx loader、Bun 原生跑 TS）。片段里 import 仓库模块（`.js` specifier 实际是 `.ts`）时用 `spawnTsEvalWithRepoImports`，普通 `spawnTsEval` 在 Node 下会 ERR_MODULE_NOT_FOUND。
 

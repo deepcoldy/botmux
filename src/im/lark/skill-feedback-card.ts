@@ -3,8 +3,13 @@ import type { CardActionData } from './card-handler.js';
 import { resolveCardOperatorUnionId } from './card-handler.js';
 import type { FeedbackPolicy } from '../../services/feedback-policy.js';
 import type { SkillFeedbackStore } from '../../services/skill-feedback-store.js';
+import { buildOncallGroupColumn } from './oncall-group.js';
 
-export interface FeedbackCardState { result?: string; reasonKey?: string; comment?: string }
+export interface FeedbackCardState { feedbackId?: string; result?: string; reasonKey?: string; comment?: string }
+
+function versionedValue(state: FeedbackCardState, value: Record<string, unknown>): Record<string, unknown> {
+  return state.feedbackId ? { ...value, expected_feedback_id: state.feedbackId } : value;
+}
 
 function button(text: string, style: string, value: Record<string, unknown>, disabled = false): Record<string, unknown> {
   return { tag: 'button', text: { tag: 'plain_text', content: text }, type: style, disabled, behaviors: [{ type: 'callback', value }] };
@@ -16,7 +21,7 @@ export function buildFeedbackElement(policy: FeedbackPolicy, state: FeedbackCard
     tag: 'column_set', element_id: 'botmux_feedback', flex_mode: 'none', horizontal_spacing: 'small',
     columns: policy.buttons.map(option => ({
       tag: 'column', width: 'auto', elements: [
-        button(option.label, option.style, { action: 'feedback_submit', result: option.key }, locked),
+        button(option.label, option.style, versionedValue(state, { action: 'feedback_submit', result: option.key }), locked),
       ],
     })),
   };
@@ -33,7 +38,7 @@ function feedbackStateElements(policy: FeedbackPolicy, state: FeedbackCardState)
   if (policy.negativeFollowup.reasons.length > 0) {
     elements.push({
       tag: 'column_set', element_id: 'botmux_feedback_reasons', flex_mode: 'none', horizontal_spacing: 'small',
-      columns: policy.negativeFollowup.reasons.map(reason => ({ tag: 'column', width: 'auto', elements: [button(state.reasonKey === reason.key ? `✓ ${reason.label}` : reason.label, state.reasonKey === reason.key ? 'primary' : 'default', { action: 'feedback_reason', reason_key: reason.key })] })),
+      columns: policy.negativeFollowup.reasons.map(reason => ({ tag: 'column', width: 'auto', elements: [button(state.reasonKey === reason.key ? `✓ ${reason.label}` : reason.label, state.reasonKey === reason.key ? 'primary' : 'default', versionedValue(state, { action: 'feedback_reason', reason_key: reason.key }))] })),
     });
   }
   if (policy.negativeFollowup.comment.enabled) {
@@ -41,7 +46,7 @@ function feedbackStateElements(policy: FeedbackPolicy, state: FeedbackCardState)
     else elements.push({
       tag: 'form', name: 'feedback_comment_form', element_id: 'botmux_feedback_comment', elements: [
         { tag: 'input', name: 'comment', input_type: 'multiline_text', rows: 3, max_rows: 8, auto_resize: true, width: 'fill', required: policy.negativeFollowup.comment.required, placeholder: { tag: 'plain_text', content: policy.negativeFollowup.comment.placeholder } },
-        { tag: 'button', name: 'feedback_comment_submit', text: { tag: 'plain_text', content: '提交补充' }, type: 'primary', action_type: 'form_submit', value: { action: 'feedback_comment' } },
+        { tag: 'button', name: 'feedback_comment_submit', text: { tag: 'plain_text', content: '提交补充' }, type: 'primary', action_type: 'form_submit', value: versionedValue(state, { action: 'feedback_comment' }) },
       ],
     });
   }
@@ -64,7 +69,11 @@ export function renderFeedbackCard(baseCard: Record<string, any>, policy: Feedba
   if (feedbackIndex < 0) return card;
   let end = feedbackIndex + 1;
   while (end < elements.length && FEEDBACK_ELEMENT_IDS.has(String((elements[end] as any)?.element_id ?? ''))) end++;
-  elements.splice(feedbackIndex, end - feedbackIndex, ...feedbackStateElements(policy, state));
+  const updated = feedbackStateElements(policy, state);
+  const oncall = (elements[feedbackIndex] as any).columns?.find((column: any) => column.element_id === 'botmux_oncall_group_column');
+  // Lark's message read API omits behaviors, so restore the callback definition.
+  if (oncall) { (updated[0] as any).columns.push(buildOncallGroupColumn()); updated[0].flex_mode = 'flow'; }
+  elements.splice(feedbackIndex, end - feedbackIndex, ...updated);
   card.body.elements = elements;
   return card;
 }
@@ -85,11 +94,35 @@ export async function handleSkillFeedbackCardAction(data: CardActionData, larkAp
   let baseCard = delivery.baseCard;
   try { baseCard = await deps.loadBaseCard?.(platformMessageId) ?? baseCard; }
   catch { /* platform fetch is best-effort; the content-free template remains usable */ }
-  const operatorSubjectId = delivery.requesterSubjectId === operatorOpenId
-    ? operatorOpenId
-    : verifiedOperator.unionId ?? (data.operator?.union_id === undefined ? operatorOpenId : undefined);
-  if (!operatorSubjectId) return { toast: { type: 'error', content: '无法验证反馈来源，请重试' } };
-  if (delivery.requesterSubjectId && delivery.requesterSubjectId !== operatorSubjectId && delivery.requesterSubjectId !== operatorOpenId) return { toast: { type: 'error', content: '仅本次提问者可反馈' } };
+  // Identity gate. `reviewers` matches the platform-verified operator against
+  // the delivery's frozen allowlist (a per-delivery snapshot of already-resolved
+  // ids, so later config changes never re-gate an old card and no network call
+  // happens here); `everyone` accepts any operator whose id the platform
+  // verified; `requester` keeps the original "only the addressed human"
+  // contract. All fail closed when no verifiable identity exists — a bot sender
+  // exposes no listed/verifiable human id.
+  let operatorSubjectId: string | undefined;
+  if (delivery.policy.audience === 'reviewers') {
+    const reviewers = new Set(delivery.policy.reviewers);
+    operatorSubjectId = [operatorOpenId, verifiedOperator.unionId]
+      .find((id): id is string => !!id && reviewers.has(id));
+    if (!operatorSubjectId) return { toast: { type: 'error', content: '仅指定的反馈人可反馈' } };
+  } else if (delivery.policy.audience === 'everyone') {
+    // Anyone may click, but we still key the feedback on a verified id so the
+    // record has a real subject and a bot cannot forge one. Prefer the
+    // cross-app union_id; fall back to the app-scoped open_id.
+    operatorSubjectId = verifiedOperator.unionId ?? operatorOpenId;
+    if (!operatorSubjectId) return { toast: { type: 'error', content: '无法验证反馈来源，请重试' } };
+  } else {
+    if (!delivery.requesterSubjectId) {
+      return { toast: { type: 'error', content: '无法验证本次提问者，无法提交反馈' } };
+    }
+    operatorSubjectId = delivery.requesterSubjectId === operatorOpenId
+      ? operatorOpenId
+      : verifiedOperator.unionId ?? (data.operator?.union_id === undefined ? operatorOpenId : undefined);
+    if (!operatorSubjectId) return { toast: { type: 'error', content: '无法验证反馈来源，请重试' } };
+    if (delivery.requesterSubjectId && delivery.requesterSubjectId !== operatorSubjectId && delivery.requesterSubjectId !== operatorOpenId) return { toast: { type: 'error', content: '仅本次提问者可反馈' } };
+  }
 
   const previous = deps.store.getLatestFeedback(delivery.deliveryId, operatorSubjectId);
   if (previous && !delivery.policy.allowReselect && action === 'feedback_submit') {
@@ -125,16 +158,33 @@ export async function handleSkillFeedbackCardAction(data: CardActionData, larkAp
     return { toast: { type: 'error', content: '反馈操作无效，请重试' } };
   }
   const selectedButton = delivery.policy.buttons.find(item => item.key === result);
-  const recorded = deps.store.recordFeedback({
-    platform: 'lark', platformAppId: larkAppId, platformMessageId, operatorSubjectId, result, semantic: selectedButton?.semantic, reasonKey, comment,
-    callbackKey: callbackKey({
-      platformMessageId, operatorSubjectId, action, result, reasonKey, comment,
-      previousFeedbackId: previous?.feedbackId,
-    }),
-  });
-  const renderedCard = renderFeedbackCard(baseCard, delivery.policy, recorded.feedback);
-  if (action === 'feedback_submit' && delivery.policy.buttons.find(option => option.key === result)?.semantic === 'negative') {
-    return { deferredCard: { type: 'raw', data: renderedCard } };
+  const expectedFeedbackId = data.action?.value?.expected_feedback_id;
+  if (expectedFeedbackId !== undefined && (typeof expectedFeedbackId !== 'string' || !expectedFeedbackId)) {
+    return { toast: { type: 'error', content: '反馈状态无效，请刷新后重试' } };
   }
-  return { card: { type: 'raw', data: renderedCard } };
+  let recorded: ReturnType<SkillFeedbackStore['recordFeedback']>;
+  try {
+    recorded = deps.store.recordFeedback({
+      platform: 'lark', platformAppId: larkAppId, platformMessageId, operatorSubjectId, result, semantic: selectedButton?.semantic, reasonKey, comment,
+      expectedFeedbackId,
+      callbackKey: callbackKey({
+        platformMessageId, operatorSubjectId, action, result, reasonKey, comment,
+        expectedFeedbackId,
+      }),
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message === 'feedback_version_mismatch') {
+      return { toast: { type: 'error', content: '反馈状态已失效，请刷新后重试' } };
+    }
+    throw error;
+  }
+  const renderedCard = renderFeedbackCard(baseCard, delivery.policy, recorded.feedback);
+  const toast = recorded.status === 'stale'
+    ? { type: 'warning', content: '反馈状态已更新，请基于最新卡片重试' }
+    : undefined;
+  const renderedSemantic = delivery.policy.buttons.find(item => item.key === recorded.feedback.result)?.semantic;
+  if (action === 'feedback_submit' && renderedSemantic === 'negative') {
+    return { ...(toast ? { toast } : {}), deferredCard: { type: 'raw', data: renderedCard } };
+  }
+  return { ...(toast ? { toast } : {}), card: { type: 'raw', data: renderedCard } };
 }

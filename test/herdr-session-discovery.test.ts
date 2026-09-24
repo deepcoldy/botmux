@@ -17,23 +17,30 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-vi.mock('node:child_process', () => ({
-  execSync: vi.fn(),
-  execFileSync: vi.fn(),
-}));
+vi.mock('node:child_process', () => {
+  const actual = require('node:child_process') as typeof import('node:child_process');
+  return { ...actual, execSync: vi.fn(), execFileSync: vi.fn() };
+});
 
-vi.mock('node:fs', () => ({
-  existsSync: vi.fn(() => false),
-  readdirSync: vi.fn(() => []),
-  readFileSync: vi.fn(() => { throw new Error('ENOENT'); }),
-  readlinkSync: vi.fn(() => { throw new Error('ENOENT'); }),
-  realpathSync: vi.fn((p: string) => p),
-}));
+vi.mock('node:fs', () => {
+  const actual = require('node:fs') as typeof import('node:fs');
+  return {
+    ...actual,
+    existsSync: () => false,
+    // Plain functions, not vi.fn(): bun's mock.module has been observed to
+    // install a bare mock (returns undefined) in place of `vi.fn(() => [])`,
+    // which then crashes `for (const name of names)` in findUniqueClaudeSessionByCwd.
+    readdirSync: () => [],
+    readFileSync: () => { throw new Error('ENOENT'); },
+    readlinkSync: () => { throw new Error('ENOENT'); },
+    realpathSync: (p: string) => p,
+  };
+});
 
-vi.mock('node:os', () => ({
-  homedir: () => '/home/testuser',
-  platform: () => 'linux',
-}));
+vi.mock('node:os', () => {
+  const actual = require('node:os') as typeof import('node:os');
+  return { ...actual, homedir: () => '/home/testuser', platform: () => 'linux' };
+});
 
 import { execFileSync, execSync } from 'node:child_process';
 import {

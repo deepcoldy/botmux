@@ -45,8 +45,11 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 |------|------|
 | `name` | Process name suffix, e.g. `claude-main` → `botmux-claude-main`; leave empty to default to `botmux-<index>` |
 | `cliId` | CLI adapter, defaults to `claude-code`. See [Multi-CLI adapters](/en/adapters) |
-| `model` | Model name used to launch the CLI (e.g. `claude --model opus`); leave empty to use the CLI default. Multiple bots with the same `cliId` can run different models. Each adapter's `modelChoices` are the candidates offered in `botmux setup`. **Resolved from the current config on every CLI launch**, resume included: a change (dashboard or this file) also applies to **existing sessions**, from their next launch/resume onward. Unlike `cliId` / `cliRuntime` / `wrapperCli`, which are frozen when the session is created so a live conversation never has its runtime swapped underneath it |
+| `model` | Model name used to launch the CLI (e.g. `claude --model opus`); leave empty to use the CLI default. Multiple bots with the same `cliId` can run different models. Each adapter's `modelChoices` are the candidates offered in `botmux setup`. **Resolved from the current config on every CLI launch**, resume included: a change (dashboard or this file) also applies to **existing sessions without a captured group override**, from their next launch/resume onward. Unlike `cliId` / `cliRuntime` / `wrapperCli`, which are frozen when the session is created so a live conversation never has its runtime swapped underneath it |
+| `groupDefaultModels` | Per-chat defaults for new topics, e.g. `{ "oc_team": { "codex": { "model": "your-codex-model", "reasoningEffort": "high" } } }`. Supports Codex and Claude; configure each bot from Dashboard group management |
 | `reasoningEffort` | Default reasoning effort for new sessions. Only applies to CLIs with structured reasoning controls (`codex` / `codex-app` / `traex` / `grok`); values are validated against the selected CLI/model, and unsupported or undeclared combinations are rejected or ignored |
+| `modelBackendVariant` | TraeX-only backend variant: `standard` / `max`; omit it to inherit the user's TraeX global configuration. An explicit value is frozen on a new session's first launch, and non-TraeX CLIs clear the field. A session that explicitly selected its CLI through `/cli` does not inherit the bot-level variant; it only uses a TraeX value saved in that `/cli` snapshot |
+| `nativeSubagentRuntime` | Trae-only native subagent runtime policy. Configure `model` and `reasoningEffort` independently as `{ "mode": "custom", "value": "..." }`; an absent dimension passes through the value from the subagent request. Remove the whole field when both dimensions pass through. `inherit` is not a supported mode |
 | `cliRuntime` | Structured runtime descriptor for a Codex-compatible distribution: `{ id, displayName?, executable, update? }`. It reuses the `codex` adapter while retaining its own version, update source, and session identity. See [Codex-compatible distributions](/en/adapters#codex-compatible-distributions) |
 | `cliPathOverride` | Legacy CLI entry-point override, retained for wrappers / routers and existing custom binaries. Prefer `cliRuntime` for a new Codex-compatible distribution. To support downgrading BotMux, writers also persist an exact compatibility shadow of `cliRuntime.executable`; do not manually configure mismatched values |
 | `disableCliBypass` | When `true`, the CLI's auto-approve / sandbox-bypass flags (`--yolo`, `--dangerously-*`) are not appended automatically; omitted / `false` keeps the original behavior |
@@ -55,8 +58,45 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 | `lang` | The bot's UI language, `zh` / `en`; leave empty to fall back to the `BOTMUX_LANG` / `LANG` environment variable |
 | `customPassthroughCommands` | On top of the fixed passthrough allowlist and the current CLI adapter's default-allowed commands, additionally pass through slash commands to the underlying CLI, e.g. `["/export"]` (Claude Code / Codex default-allow `/goal`). Auto-normalized (a missing `/` is added, lowercased, only `[a-z0-9:_-]` kept, deduplicated); entries that would shadow a botmux daemon command (e.g. `/status`) are dropped and have no effect even if configured. Use `/list-slash-command` to view the full allowlist. See [Slash commands](/en/slash-commands) |
 | `env` | Per-bot process environment variables `{ "KEY": "value" }`, injected into this bot's CLI process. Most common use: run a bot on GLM / a third-party Anthropic·OpenAI-compatible provider (see example below); also handy for `HTTPS_PROXY` or a CLI feature flag. Values accept string / number / boolean; botmux-reserved keys (`BOTMUX_`, `LARK_APP_`, …) are ignored. Injected **per session** (effective from the next session), never written to the shared tmux server env, so it can't leak across bots. Also editable in the dashboard ("Bot defaults → Environment variables") |
+| `quotaFallbackBot` | Optional handoff after the CLI exhausts its quota: `{ "enabled": true, "targetAppId": "cli_...", "kinds"?: ["usage", "rate"], "message"?: "..." }`. Off by default; editable under Dashboard "Bot Configuration → Advanced." See below |
 | `codexAppCleanInput` | **Experimental**, and only effective for Botmux-managed sessions whose actual CLI is `codex-app`. When `true`, the visible / persisted text `UserMessage` contains only the user's original input while message-level Botmux context primarily moves to `additionalContext`. Defaults to off, takes effect on the next turn dispatch, and does not rewrite existing history. See details below |
-| `codexBrowser` | **Experimental and off by default**. Supported only with `cliId: "codex-app"`. Set to `true` to let new sessions control Chrome through the locally installed Codex Chrome plugin. Object form: `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/absolute/path" }`. See below |
+| `codexBrowser` | **Experimental and off by default**. Supported only with `cliId: "codex-app"`. Toggle it under Dashboard **Advanced → Codex App**, or set it to `true` to let new sessions control Chrome through the locally installed Codex Chrome plugin. Object form: `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/absolute/path" }`. See below |
+
+`nativeSubagentRuntime` rewrites only new subagents created through Trae's native `spawn_agent`; it does not alter the parent agent itself. An absent dimension passes through the subagent request, while `custom` replaces it with a fixed value. When both a custom model and custom effort are configured, BotMux validates that Trae supports the combination. Switching the bot to another CLI removes this field automatically. In the Dashboard, “Pass through request” corresponds to an absent dimension. This policy is behavior configuration and is copied when cloning a bot, but it is intentionally excluded from portable Agent presets. Legacy `mode: "inherit"` values are invalid and are not applied.
+
+### Per-group defaults for new topics
+
+Each bot owns its own `groupDefaultModels`, keyed by chat ID and CLI. The Dashboard follows the bot’s Agent CLI and shows only its model and reasoning-effort dropdowns, reusing Agent model discovery and effort validation. Both fields can inherit the Agent defaults. Custom models and legacy string-valued entries remain supported. A new topic captures these settings when its session is created; later edits or clearing the group configuration do not alter that topic on restart or resume. Selecting a CLI uses only its matching entry. Topics without a group override retain the existing live bot-model fallback. Direct messages, chat-scoped group sessions, and adopted external sessions do not use the snapshot.
+
+Precedence: explicit trigger model > captured group model > matching bot model > existing cross-CLI fallback. Reasoning effort is also captured for new topics; explicit trigger settings can override it. The CLI and runtime remain unchanged. Dashboard saves apply without restarting the daemon. Choosing inheritance removes the corresponding override for future topics while retaining historical settings for other CLIs; manual file edits follow the existing configuration-loading procedure.
+
+### Automatic CLI quota handoff
+
+`quotaFallbackBot` lets the daemon post one fixed, real `@` to a backup Bot at the original session landing point once the current CLI is confirmed quota-limited. It does not call the exhausted primary model, and the existing limit card and owner notification remain unchanged.
+
+![Quota-limit handoff under Dashboard Bot Configuration → Advanced](/img/quota-fallback-dashboard.png)
+
+```json
+{
+  "quotaFallbackBot": {
+    "enabled": true,
+    "targetAppId": "cli_xxx_backup",
+    "kinds": ["usage", "rate"],
+    "message": "The primary Bot has exhausted its quota. Please take over this conversation and continue from its context."
+  }
+}
+```
+
+- `targetAppId` is the backup Bot's stable Lark App ID. Never configure or copy an `ou_xxx`: open IDs are scoped to the sending application. At send time, the daemon resolves a receiver-scoped mention handle from the current chat's live membership.
+- `kinds` accepts `usage` and/or `rate`; omitting it enables both. Omitting `message` uses the built-in Chinese handoff text. The message is limited to 1000 characters and must be non-blank without a native `<at>` tag.
+- The target must be a locally configured Bot that is currently in the chat. Cross-deployment/team-directory targets are not supported yet because the daemon cannot safely prove which live `open_id` belongs to a remote App ID. Non-local, self, absent, and live-resolution failures all fail closed.
+- Save and Bot clone validate the complete impending handoff graph and reject self-reference or cycles such as `A → B → C → A`; an acyclic chain may continue cascading. If a manual edit introduces a cycle, `botmux start/restart` skips Bots in that cycle while still starting the Dashboard and unrelated Bots. Bot Config marks the skipped Bots and lets an operator repair the edge under Advanced → Quota-limit handoff; restart after saving to bring them online. A supervisor-driven daemon reload still disables cyclic handoff at load time and logs a warning so malformed configuration cannot spread its impact.
+
+![Dashboard marks Bots skipped because of a handoff cycle and opens the Advanced recovery controls](/img/quota-fallback-cycle-recovery-dashboard.png)
+
+- Within a daemon, the source Bot and limit kind are deduplicated across all sessions for five minutes. A failed identity lookup or delivery still occupies that window to prevent a short retry storm.
+- Chat-scoped sessions land in the original chat and thread-scoped sessions land in the original thread. The backup Bot reads context from the existing history. Restoring a daemon with an already-limited session does not backfill an old handoff.
+- The whole feature is inert when the block is absent or `enabled` is not exactly `true`, preserving previous behavior. Configure it under Dashboard "Bot Configuration → Advanced → Quota-limit handoff," or edit `bots.json` manually.
 
 ### Codex-compatible distributions
 
@@ -133,6 +173,8 @@ You can also add it to the corresponding bot entry directly (manual `bots.json` 
 
 ### Codex App browser bridge (experimental)
 
+Install the browser runtime bundled with the Codex desktop app. The bridge prefers `mcp_servers.node_repl`, but locates the installed runtime when the desktop removes that MCP registration; set `BOTMUX_CODEX_NODE_REPL_PATH` for a custom installation. Identity, site safety status, and feature configuration use the official authenticated request channel. The bridge does not read or store login tokens, and fails closed when the runtime or authentication is unavailable.
+
 This option addresses one narrow gap: Codex running through Botmux's app-server path does not otherwise inherit the Chrome tool built into Codex App. The bridge belongs entirely to Botmux and has no dependency on a project repository, Harness, or local-proxy setup.
 
 ```json
@@ -143,8 +185,10 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 ```
 
 - Install and enable the Codex browser extension in Chrome / Edge under the same OS user first. Botmux selects the newest complete official plugin under `CODEX_HOME` (or `~/.codex`) automatically; use an absolute `pluginRoot` only for a maintained custom location.
-- The setting registers one `botmux_browser` dynamic tool only on newly created Codex App threads. Existing threads are not rewritten; open a new Lark topic / session to verify it.
-- The tool exposes only high-level tab, accessibility-tree interaction, navigation, and screenshot operations. It does not expose arbitrary JavaScript, raw CDP, cookies, local storage, browser history, clipboard, or file transfer.
+- The setting registers the `botmux_browser` dynamic tool when starting or resuming a Codex App thread. Restart or resume an already-running runner to load the updated tool definition.
+- The bridge probes capabilities per tab. It prefers the accessibility tree, falls back automatically to visible-DOM / Playwright-DOM snapshots when AX is unavailable, and exposes typed Playwright locator, DOM, and coordinate operations. A backend without `tab.ax` no longer breaks the entire Chrome connection.
+- Browser Use safety requests for origin access, uploads, downloads, and similar actions block the operation and appear as Lark authorization cards. Only users accepted by Botmux's `canTalk` check can choose session approval, persistent approval, or denial; Botmux ask records the answer and reviewer. A plain approval is also scoped to the current runner session and is reused for the same origin, operation type, and risk context; a different origin, operation type, risk context, or new session requires confirmation again. Denial, timeout, or daemon unavailability fails closed.
+- The tool does not expose arbitrary JavaScript, raw CDP, cookies, local storage, browser history, or clipboard. Uploads/downloads run only through Browser Use's controlled file chooser and safety checks. Secure browser-auth flows involving credentials never downgrade to an ordinary Lark card and require a client with a secure credential broker.
 - Each Botmux runner owns isolated browser-session state. The feature is off by default, so unconfigured bots retain their existing launch arguments and behavior.
 - It currently cannot be combined with `existingAppServer`, `sandbox`, or `readIsolation`; conflicting configuration fails at startup instead of running with an incomplete isolation boundary.
 
@@ -160,6 +204,7 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 
 | Field | Description |
 |------|------|
+| `ownerOpenId` | Explicit primary owner `ou_xxx` for this bot. It participates in runtime authorization only while it remains in the resolved `allowedUsers` list; after removal or resolution failure, permissions follow the resolved allowlist, while the raw value is retained only as a DM fallback for resolution failures. When omitted, ownership defaults to the first resolved `ou_xxx` user. When multiple administrators are configured, grant request cards prioritize @mentioning administrators who are currently present in the chat (avoiding pinging people outside the chat) |
 | `allowedUsers` | The operate-permission list. Prefer a **full email**, mobile number, or `on_xxx`; an `ou_xxx` is valid only for the same app that issued it and must never be copied across Bots. When `allowedChatGroups` is configured, at least one is required to serve as owner |
 | `allowedChatGroups` | Conversable groups (`oc_xxx`). Any member of the group can converse (only `canTalk`); sensitive operations are still controlled by `allowedUsers` |
 | `p2pOpen` | When `true`, any user within the Lark app's availability scope may DM this bot (only `canTalk`). Group behavior is unchanged and sensitive operations still require `allowedUsers`. Always configure at least one `allowedUsers` owner |
@@ -167,9 +212,10 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 | `defaultOncall` | The bot's default: the first new topic in a new group chat is automatically bound to oncall. `{ "enabled": true, "workingDir": "~/foo", "since": <epoch ms> }`; older groups that already existed before `since` are unaffected |
 | `globalGrants` | Global conversable list (`ou_xxx`, people or bots). Can converse in any group, only `canTalk` |
 | `chatGrants` | Per-group, per-user authorization `{ "oc_xxx": ["ou_yyy"] }`, only grants `canTalk`. Usually written by the `/grant` card, but can also be configured by hand |
-| `messageQuota` | Message-quota override `{ "defaultLimit": N }`: once a positive integer is configured, new grant cards and Oncall both use an N-message quota. When unset, new grant cards default to 3 messages per person while Oncall remains unlimited. An explicit `/grant @user N` always uses N. Only constrains talk authorization, does not affect `canOperate` |
+| `messageQuota` | Message-quota override `{ "defaultLimit": N }`: **applies only to grantees admitted by grant cards or self-service requests** — once a positive integer is configured, new grant cards use an N-message quota; when unset they default to 3 messages per person. **Oncall groups are always unmetered and never read this value.** An explicit `/grant @user N` always uses N. Only constrains talk authorization, does not affect `canOperate` |
 | `restrictGrantCommands` | When `true`, people granted only via per-user authorization (`chatGrants` / `globalGrants`) are disabled from **all slash commands** and can only have plain conversations; owner / `allowedUsers` / oncall / whole-group members are unaffected. Defaults to `false` |
 | `autoGrantRequestCards` | Enabled by default. Set to `false` to stop automatically sending `/grant` request cards to the owner when an unauthorized person or external bot @mentions this bot in a group and the talk gate blocks it; the message is dropped silently instead |
+| `blockedUsers` | Block list (same identifier forms as `allowedUsers`: email / mobile / `on_xxx` / `ou_xxx`), a sender-dimension global deny: effective in both groups and DMs, and evaluated before every allow leg — on-call, whole-group open, guest grants, team trust. A blocked sender gets no grant request card. Owners / admins cannot be blocked (the write entry refuses it). It does not affect message-listener matching. Also maintained in Dashboard **Bot Config** and the group-member modal. See [Permissions & Access · Block list](/en/permissions#block-list-blockedusers) |
 
 ## File sandbox
 
@@ -188,8 +234,10 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 |------|------|
 | `brandLabel` | Branding text at the bottom of the card. `undefined` = default `botmux` link; `""` = hidden; any other string = rendered as-is (supports markdown). Purely cosmetic, does not affect routing / permissions |
 | `showUsageInCardFooter` | Whether reply-card footers show native Context / Token usage from the Agent CLI. Missing / `true` = show; `false` = hide both metrics. A missing individual metric is still omitted independently. This controls card display only and does not disable the Usage Ledger or other accounting |
+| `modelBackendVariant` display | A frozen TraeX backend variant appears only in the runtime identity on the live streaming session card. Reply-card footers show Context / Token usage only; they do not show the variant |
 | `disableStreamingCard` | When `true`, no real-time streaming session card is sent at all (the Web Terminal still runs and the final reply still arrives via `botmux send`, there's just no auto-refreshing status card). For users who find the real-time card noisy |
-| `pinStreamingCard` | When `true`, the bot **pins the current public live-status card**. It is opt-in and default-off: only an explicit `true` enables it. Only the current public live-status real `streamCardId` participates; repo-picker cards, private `/card` snapshots, final reply cards, CoT, closed cards, and every other interactive card stay out of scope. The switch is hot-updated: once dashboard or `/botconfig set pinStreamingCard on/off` successfully writes local config and changes the effective value, Botmux runs a best-effort reconciliation across this bot's **existing active sessions**. The configuration response does **not wait** for Feishu Pin/Unpin calls. Failures never interrupt publication, transfer, resume, close, or configuration itself; during exceptional periods there may temporarily be zero or multiple Pins. This feature adds **no durable retry journal and no full-chat Pin audit**: an explicit on-to-off transition cleans the session's known live-card IDs; if the setting is already off and process-local provenance was lost, later close or transfer does not risk removing a Pin that may have been created manually |
+| `hiddenStreamingCardButtons` | Hides selected main controls on live streaming cards. Values: `output` (also hides text export and screenshot refresh), `terminal`, `writeLink`, `compact`, `stop`, and `close` (`Disconnect` on adopted sessions). Missing or empty shows every control, for example `["terminal", "writeLink", "close"]`. Hot-update with `/botconfig set hiddenStreamingCardButtons terminal,writeLink,close`; `unset` restores all controls |
+| `pinStreamingCard` | When `true`, the bot **pins the current public live-status card**. It is opt-in and default-off: only an explicit `true` enables it. Only the current public live-status real `streamCardId` participates; repo-picker cards, private `/card` snapshots, final reply cards, CoT, closed cards, and every other interactive card stay out of scope. The switch is hot-updated: once dashboard or `/botconfig set pinStreamingCard on/off` successfully writes local config and changes the effective value, Botmux runs a best-effort reconciliation across this bot's **existing active sessions**, and after a daemon restart it also schedules one fire-and-forget recovery pass for the current bot after `restoreActiveSessions`. The configuration response and daemon readiness do **not wait** for Feishu Pin/Unpin calls. Failures never interrupt publication, transfer, resume, close, startup, or configuration itself; during exceptional periods there may temporarily be zero or multiple Pins. This feature adds **no durable retry journal and no broad remote cleanup**: restart recovery only trusts Feishu Pins whose operator provenance is `app_id === current larkAppId`, then narrows cleanup to the strict intersection with the enqueue-time local candidate IDs. A colliding current Pin with human, other-app, mixed, or malformed provenance is neither claimed nor re-pinned; an absent current Pin is claimed only when create returns the exact message ID and same-app provenance. Explicit off cleans process-owned IDs plus freshly proven local candidates, while ordinary disable, close, and transfer remain process-ownership-only |
 | `noPinStreamingCardChats` | Array of `chatId`s where Botmux must **not pin** streaming cards even when `pinStreamingCard` is enabled for the bot. This is the negative set behind `/card pin off|on`. The live streaming cards themselves still post normally; only the Pin side effect is suppressed for those chats. Empty / absent means no per-chat opt-out |
 | `silentTurnReactions` | When `true`, card-off sessions no longer add GoGoGo / DONE reactions to the triggering message. Only affects the lightweight status reactions used when `disableStreamingCard` or `noCardChats` suppresses live cards; defaults to `false` |
 | `receivedReactionEmoji` | Feishu emoji_type for the "received" reaction in card-off sessions; `undefined` = default `GoGoGo` (冲!). Free-form string; a bad value just silently fails to attach (best-effort) |
@@ -202,6 +250,31 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 | Field | Description |
 |-------|-------------|
 | `senderTag` | Boolean, default `true` (on). Whether each turn forwarded to the CLI carries a `<sender type="user\|bot" open_id="ou_…" name="…" email="…" />` tag naming who spoke. Only an explicit `false` is persisted and disables it; absent or `true` both keep injecting, leaving the prompt byte-for-byte identical to historical behavior |
+| `replyDelivery` | `"transcript"` or `"send"`; **every CLI defaults to `send`** (matching upstream behaviour), and `transcript` must be turned on explicitly. How the final reply reaches Feishu: `transcript` = the daemon takes the last assistant text of the turn from the CLI transcript and posts it as the final reply card, and the system prompt no longer mentions `botmux send`; `send` = the model must run `botmux send` itself (historical behavior). An explicit `"send"` is the only way to put claude-code back on the old behavior; both `send` and `transcript` are persisted, `unset` returns to the CLI default |
+
+### `replyDelivery: "transcript"`
+
+`claude-code` defaults to `transcript`; the other supported CLIs need it set explicitly. Once active it changes three things for that bot's sessions:
+
+1. **The system prompt never mentions `botmux send`**: the intro becomes "your final assistant message is automatically forwarded back to Lark by botmux — just answer directly"; the heredoc rule, the @ decision gate, the attachment usage and the `<identity>` rule "collaboration requires `botmux send --mention`" are all dropped, leaving only `botmux history` / `botmux bots list` and the `BOTMUX_NOTHING_TO_SEND` silence sentinel. For the cases that genuinely need `botmux send` (attachments, cross-bot @) the model can discover the built-in skill (`botmux-send` under `--plugin-dir`) on its own;
+2. **The per-turn `<botmux_reminder>` is no longer injected** (one less reminder block per prompt);
+3. **Solo sessions are unwrapped**: in a DM, or a plain 1:1 group whose only participants are the owner and this bot, each turn drops the `<user_message>` wrapper and the `<sender/>` tag, so the model sees bare text. Topic groups, multi-member groups, and turns spoken by anyone other than the owner never count as solo; wrapper and tag stay as before.
+
+Supported CLIs: `claude-code`, plus the structured-transcript bridge CLIs `codex` / `traex` / `coco` / `hermes` / `mtr` / `pi` / `oh-my-pi` / `ebsd` / `grok`. Other CLIs (e.g. `cursor`, `gemini`) have no transcript capture, so both `/botconfig set` and the dashboard reject the value (`reply_delivery_unsupported`); if the field is already persisted and `cli` is later switched to an unsupported CLI, the runtime falls back to `send` (one warn in the log) rather than losing replies.
+
+Hot-updatable by the owner / `allowedUsers` via `/botconfig`:
+
+```text
+/botconfig set replyDelivery transcript   # enable explicitly on the other supported CLIs
+/botconfig set replyDelivery send         # put claude-code back on the old behavior (model runs botmux send itself)
+/botconfig unset replyDelivery            # back to the CLI default
+```
+
+- **Two activation points**: the per-turn envelope (reminder / wrapper / `<sender/>`) applies from the next turn; the system prompt is injected at spawn time, so a running session needs `/restart` to pick up the new value, while new sessions use it directly.
+- **Observability cost**: the bare-text shape of a solo session has no `<user_message>` / `<sender>` structure, so `/adopt` no longer recognizes such sessions as botmux's own (the same class of cost as `senderTag: false`).
+- The dashboard "Reply Delivery → Transcript reply mode" toggle saves this field; it is disabled with an explanation when the current CLI does not support it.
+
+### `senderTag: false`
 
 With it off the model cannot see speaker identity: in a multi-person chat it cannot tell participants apart or address them by name. Useful for a CLI whose model copies the tag into its reply body (e.g. cursor — see the `<sender_note>` anti-echo hint, which disappears together with the tag), or when you do not want per-message identity written into the CLI transcript.
 
@@ -229,9 +302,12 @@ Or write it directly into the bot's config:
 
 | Field | Description |
 |------|------|
+| `autoInviteOwnerOnGroupAdd` | On by default: when the bot is added to a new chat, its owner is automatically added to the same chat so the bot never ends up somewhere its owner cannot see; set `false` to turn it off (useful when an alert/on-call platform batch-adds the bot to incident chats). Applies only to the bot being passively added. Editable in Dashboard → Bot defaults → Proactive start or via `/botconfig set autoInviteOwnerOnGroupAdd off`; switching it back on clears the key to the default |
 | `autoStartOnGroupJoin` | When `true`, the bot starts working automatically when added to a new group containing at least one `allowedUsers` member (no @ needed). Requires subscribing the `im.chat.member.bot.added_v1` event for this app in the Lark admin console |
 | `autoStartOnGroupJoinPrompt` | Paired with the above: the first-round prompt for proactive start; if empty / blank, opens with an empty message and lets the bot read the group context itself. Meaningless when `autoStartOnGroupJoin` is off |
 | `autoStartOnNewTopic` | When `true`, the first message of every new topic in a topic group starts working automatically without an @ (no effect in plain groups). Defaults to passive (only @ triggers) |
+| `groupJoinCommandEnabled` | When `true` and `groupJoinCommand` is non-empty, the bot runs that command on this host whenever it is added to **any** chat — no session, no model. Independent of `autoStartOnGroupJoin` (no `allowedUsers` membership requirement). Also requires the `im.chat.member.bot.added_v1` event. Editable in Dashboard → Bot defaults → Auto-start |
+| `groupJoinCommand` | The command to run on join. Same execution contract as [Hooks](./hooks.md): no shell (use `bash -c '…'` for pipes/redirects), minimal environment (no app secret); stdin is JSON `{event:"chat.bot_added", larkAppId, chatId, operatorOpenId, emittedAt}`, plus `BOTMUX_JOIN_CHAT_ID` / `BOTMUX_JOIN_LARK_APP_ID` / `BOTMUX_JOIN_OPERATOR_OPEN_ID` env vars; the process group is killed after 10 minutes |
 
 ## Group message listener
 

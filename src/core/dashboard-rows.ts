@@ -24,6 +24,9 @@ import { isSuspendableBackendType, resolvePersistentBackendTarget } from './pers
 import { isNativeTopicId } from './native-topic-id.js';
 
 export interface SessionRow extends SessionMessagePreview {
+  cliInstanceId?: string;
+  cliInstanceSource?: string;
+  creationSource?: string;
   sessionId: string;
   larkAppId: string;
   botName: string;
@@ -53,6 +56,7 @@ export interface SessionRow extends SessionMessagePreview {
    *  locate, so the dashboard offers "open chat" (feishuChatLink) instead.
    *  Absent on rows from older daemons → callers keep the locate behavior. */
   scope?: 'thread' | 'chat';
+  headless?: Session['headless'];
   title?: string;
   titleUpdatedAt?: string;
   /** Informational only; callers must not treat it as authenticated identity. */
@@ -138,6 +142,13 @@ function sessionThreadLink(
   return threadAppLink(session.chatId, session.larkThreadId, brand);
 }
 
+function sessionFeishuChatLink(session: Pick<Session, 'chatId' | 'headless'>, brand: Brand): string {
+  if (session.headless && !session.headless.boundChatId) return '';
+  return session.headless?.boundChatId
+    ? feishuChatLink(session.headless.boundChatId, brand)
+    : feishuChatLink(session.chatId, brand);
+}
+
 let cachedBotName = '';
 export function setBotName(name: string): void { cachedBotName = name; }
 export function getBotName(): string { return cachedBotName; }
@@ -212,7 +223,28 @@ function sessionRuntimeFields(s: Session): Pick<SessionRow, 'runtimeId' | 'runti
   return {};
 }
 
-export function composeRowFromActive(ds: DaemonSession, opts?: { fresh?: boolean }): SessionRow {
+export interface DashboardRowOptions {
+  fresh?: boolean;
+  /**
+   * Expensive native transcript/token scan. Dashboard list snapshots can contain
+   * thousands of historical rows, so callers that only need routing/status
+   * metadata should leave this off and use the per-session detail endpoint for
+   * on-demand usage.
+   */
+  includeTokenUsage?: boolean;
+}
+
+function maybeSessionTokenUsage(
+  s: Session,
+  workingDir: string | undefined,
+  opts?: DashboardRowOptions,
+  opts2?: { usePersistedSnapshot?: boolean },
+): SessionTokenUsage | null {
+  if (opts2?.usePersistedSnapshot && s.tokenUsage !== undefined) return s.tokenUsage;
+  return opts?.includeTokenUsage === false ? null : sessionTokenUsage(s, workingDir);
+}
+
+export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptions): SessionRow {
   const brand = getBotBrand(ds.larkAppId);
   const topicLink = sessionThreadLink(ds.session, brand);
   return {
@@ -220,6 +252,9 @@ export function composeRowFromActive(ds: DaemonSession, opts?: { fresh?: boolean
     larkAppId: ds.larkAppId,
     botName: cachedBotName,
     cliId: ds.session.cliId ?? 'unknown',
+    cliInstanceId: ds.session.cliInstanceBinding?.instanceId ?? undefined,
+    cliInstanceSource: ds.session.cliInstanceBinding?.source,
+    creationSource: ds.session.creationSource,
     ...sessionRuntimeFields(ds.session),
     // 待办池(queued)会话 CLI 没起，不该算「忙」——报 'idle' 免得 overview 的忙碌
     // 计数/小圆点把它当在跑。看板列由 deriveKanbanColumn 按手动 backlog 定，不受此影响。
@@ -245,6 +280,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: { fresh?: boolean
     rootMessageId: ds.session.rootMessageId,
     lastInputFromBot: ds.session.quoteTargetSenderIsBot === true,
     scope: ds.session.scope,
+    headless: ds.session.headless,
     title: ds.session.title,
     titleUpdatedAt: ds.session.titleUpdatedAt,
     titleSource: ds.session.titleSource,
@@ -265,7 +301,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: { fresh?: boolean
     riffAccessUrl: ds.riffAccessUrl,
     cliVersion: ds.cliVersion,
     hasHistory: ds.hasHistory,
-    feishuChatLink: feishuChatLink(ds.chatId, brand),
+    feishuChatLink: sessionFeishuChatLink(ds.session, brand),
     ...(topicLink ? { feishuThreadLink: topicLink } : {}),
     pendingRepo: !!ds.pendingRepo,
     queued: !!ds.session.queued,
@@ -273,7 +309,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: { fresh?: boolean
     agentAttention: ds.agentAttention
       ? { kind: ds.agentAttention.kind, reason: ds.agentAttention.reason, at: ds.agentAttention.at }
       : undefined,
-    tokenUsage: sessionTokenUsage(ds.session, ds.workingDir),
+    tokenUsage: maybeSessionTokenUsage(ds.session, ds.workingDir, opts),
     openTodos: sessionOpenTodos(ds.session, ds.workingDir, opts?.fresh),
     ...(ds.worker?.pid !== undefined ? { workerPid: ds.worker.pid } : {}),
     ...(ds.adoptedFrom?.originalCliPid !== undefined ? { adoptCliPid: ds.adoptedFrom.originalCliPid } : {}),
@@ -281,7 +317,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: { fresh?: boolean
   };
 }
 
-export function composeRowFromClosed(s: Session): SessionRow {
+export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): SessionRow {
   const brand = getBotBrand(s.larkAppId ?? '');
   const topicLink = sessionThreadLink(s, brand);
   return {
@@ -289,6 +325,9 @@ export function composeRowFromClosed(s: Session): SessionRow {
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
     cliId: s.cliId ?? 'unknown',
+    cliInstanceId: s.cliInstanceBinding?.instanceId ?? undefined,
+    cliInstanceSource: s.cliInstanceBinding?.source,
+    creationSource: s.creationSource,
     ...sessionRuntimeFields(s),
     status: 'closed',
     adopt: !!s.adoptedFrom,
@@ -302,6 +341,7 @@ export function composeRowFromClosed(s: Session): SessionRow {
     rootMessageId: s.rootMessageId,
     lastInputFromBot: s.quoteTargetSenderIsBot === true,
     scope: s.scope,
+    headless: s.headless,
     title: s.title,
     titleUpdatedAt: s.titleUpdatedAt,
     titleSource: s.titleSource,
@@ -313,9 +353,9 @@ export function composeRowFromClosed(s: Session): SessionRow {
     ownerOpenId: s.ownerOpenId,
     webPort: s.webPort ?? null,
     previewTarget: safeSessionPreviewTarget(s.previewTarget),
-    feishuChatLink: feishuChatLink(s.chatId, brand),
+    feishuChatLink: sessionFeishuChatLink(s, brand),
     ...(topicLink ? { feishuThreadLink: topicLink } : {}),
-    tokenUsage: sessionTokenUsage(s),
+    tokenUsage: maybeSessionTokenUsage(s, undefined, opts, { usePersistedSnapshot: true }),
     ...buildSessionMessagePreview(s),
   };
 }
@@ -328,7 +368,7 @@ export function composeRowFromClosed(s: Session): SessionRow {
  * dashboard presents it as dormant, with no terminal port, so operators can
  * see and explicitly retry closing it without an unsafe resume affordance.
  */
-export function composeRowFromPersistedActive(s: Session): SessionRow {
+export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOptions): SessionRow {
   const brand = getBotBrand(s.larkAppId ?? '');
   const topicLink = sessionThreadLink(s, brand);
   return {
@@ -336,6 +376,9 @@ export function composeRowFromPersistedActive(s: Session): SessionRow {
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
     cliId: s.cliId ?? 'unknown',
+    cliInstanceId: s.cliInstanceBinding?.instanceId ?? undefined,
+    cliInstanceSource: s.cliInstanceBinding?.source,
+    creationSource: s.creationSource,
     ...sessionRuntimeFields(s),
     status: s.queued ? 'idle' : 'dormant',
     adopt: !!s.adoptedFrom,
@@ -348,6 +391,7 @@ export function composeRowFromPersistedActive(s: Session): SessionRow {
     rootMessageId: s.rootMessageId,
     lastInputFromBot: s.quoteTargetSenderIsBot === true,
     scope: s.scope,
+    headless: s.headless,
     title: s.title,
     titleUpdatedAt: s.titleUpdatedAt,
     titleSource: s.titleSource,
@@ -358,12 +402,12 @@ export function composeRowFromPersistedActive(s: Session): SessionRow {
     locked: !!s.locked,
     ownerOpenId: s.ownerOpenId,
     webPort: null,
-    feishuChatLink: feishuChatLink(s.chatId, brand),
+    feishuChatLink: sessionFeishuChatLink(s, brand),
     ...(topicLink ? { feishuThreadLink: topicLink } : {}),
     queued: !!s.queued,
     hasHistory: !!(s.cliId || s.lastCliInput || s.backendType || s.adoptedFrom),
     quarantined: !!s.restoreQuarantinedAt,
-    tokenUsage: sessionTokenUsage(s),
+    tokenUsage: maybeSessionTokenUsage(s, undefined, opts),
     ...buildSessionMessagePreview(s),
   };
 }

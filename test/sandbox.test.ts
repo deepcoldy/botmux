@@ -62,6 +62,37 @@ describe('credential-only managed-origin carve-out', () => {
     expect(args).not.toContain(`${parent}/origin-${'b'.repeat(64)}`);
   });
 
+  it('groups sibling private directories by parent so one tmpfs does not mask another', () => {
+    const parent = '/srv/botmux/data/read-isolation';
+    const ownA = `${parent}/origin-${'a'.repeat(64)}`;
+    const ownB = `${parent}/origin-${'b'.repeat(64)}`;
+    const args = buildCredentialOnlySandboxArgs({
+      hideDirectories: ['/srv/botmux/device-authority'],
+      hideFiles: ['/srv/botmux/.dashboard-secret'],
+      privateReadonlyDirectories: [
+        { parent, directory: ownB },
+        { parent, directory: ownA },
+        { parent, directory: ownA },
+      ],
+      workingDir: '/workspace',
+      cliBin: '/usr/bin/true',
+      cliArgs: [],
+    });
+    const parentTmpfs = args
+      .map((value, index) => value === '--tmpfs' && args[index + 1] === parent ? index : -1)
+      .filter(index => index >= 0);
+    const binds = args
+      .map((value, index) => value === '--ro-bind'
+        && args[index + 1].startsWith(`${parent}/origin-`)
+        && args[index + 1] === args[index + 2]
+        ? args[index + 1]
+        : null)
+      .filter((value): value is string => value !== null);
+    expect(parentTmpfs).toHaveLength(1);
+    expect(binds).toEqual([ownA, ownB]);
+    expect(parentTmpfs[0]).toBeLessThan(args.indexOf('--chdir'));
+  });
+
   it('rejects a private directory outside the hidden parent', () => {
     expect(() => buildCredentialOnlySandboxArgs({
       hideDirectories: ['/srv/botmux/device-authority'],
@@ -180,7 +211,7 @@ describe('prepareDirectSandbox canonicalizes the exec bin (symlinked-$HOME)', ()
 });
 
 
-// ── validateRelayRequest: pure schema + flag-allowlist boundary (UNCHANGED) ──
+// ── validateRelayRequest: pure schema + flag-allowlist boundary ─────────────
 // Regression for the "sandbox makes host read an arbitrary path" confused-deputy
 // blocker: only plain outbox basenames + allowlisted flags pass; raw argv /
 // path flags / sandbox-chosen session-id are rejected.
@@ -243,6 +274,27 @@ describe('validateRelayRequest', () => {
     })).toMatchObject({ ok: false, error: 'flag --response-kind must be progress, final, or auxiliary' });
   });
 
+  it('allows only the two cross-principal --as choices through the sandbox relay', () => {
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--as', 'independent', '--no-mention'],
+    })).toMatchObject({
+      ok: true,
+      value: { flags: ['--as', 'independent', '--no-mention'] },
+    });
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--as', 'suggestion'],
+    })).toMatchObject({
+      ok: true,
+      value: { flags: ['--as', 'suggestion'] },
+    });
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--as', 'maybe'],
+    })).toMatchObject({ ok: false, error: 'flag --as must be independent or suggestion' });
+  });
+
   it('allows only canonical reply layouts through the sandbox relay', () => {
     for (const layout of ['result', 'progress', 'risk', 'blocked', 'handoff']) {
       expect(validateRelayRequest({
@@ -264,6 +316,19 @@ describe('validateRelayRequest', () => {
     }
   });
 
+  it('allows only validated urgent modes through the sandbox relay', () => {
+    for (const flag of ['--urgent', '--urgent=app', '--urgent=sms', '--urgent=phone']) {
+      expect(validateRelayRequest({
+        contentFile: 'c.content',
+        flags: [flag, '--mention-back'],
+      })).toMatchObject({ ok: true, value: { flags: [flag, '--mention-back'] } });
+    }
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--urgent=all'],
+    })).toMatchObject({ ok: false, error: 'flag not allowed: --urgent=all' });
+  });
+
   it('accepts a custom card file as a plain outbox basename', () => {
     const r = validateRelayRequest({
       contentFile: 'c.content',
@@ -275,6 +340,32 @@ describe('validateRelayRequest', () => {
     expect(r.value.contentName).toBe('c.content');
     expect(r.value.cardName).toBe('card.json');
     expect(r.value.flags).toEqual(['--no-mention']);
+  });
+
+  it('allows only a valid plugin id with a relayed custom card', () => {
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      cardFile: 'card.json',
+      flags: ['--plugin-card-action', 'happy-cloud-mr-review-fix'],
+    })).toMatchObject({
+      ok: true,
+      value: { flags: ['--plugin-card-action', 'happy-cloud-mr-review-fix'] },
+    });
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      cardFile: 'card.json',
+      flags: ['--plugin-card-action', '../escape'],
+    })).toMatchObject({
+      ok: false,
+      error: 'flag --plugin-card-action must be a valid plugin id',
+    });
+    expect(validateRelayRequest({
+      contentFile: 'c.content',
+      flags: ['--plugin-card-action', 'happy-cloud-mr-review-fix'],
+    })).toMatchObject({
+      ok: false,
+      error: 'flag --plugin-card-action requires a card file',
+    });
   });
 
   it('validates and preserves a frozen relay origin', () => {

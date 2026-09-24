@@ -14,7 +14,7 @@ import {
   hasOwnerEntry,
   type BotConfigEditInput,
 } from './bot-config-editor.js';
-import { CLI_SELECT_OPTIONS, resolveCliSelection } from './cli-selection.js';
+import { CLI_SELECT_OPTIONS, CLI_SELECTION_ALIASES, resolveCliSelection } from './cli-selection.js';
 import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
 
 /** add / edit 共用的 bot 字段 flag（原始字符串，'-' 表示清空，语义同 TUI 编辑）。 */
@@ -123,7 +123,8 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
   --app-id <cli_xxx>         飞书应用 App ID（edit 时改绑另一个应用）
   --app-secret <secret>      App Secret
   --cli <key>                CLI 适配器：cliId 或网关键（claude-code / codex /
-                             aiden-x-claude / ttadk-x-codex …）
+                             traecli / forge-x-traex / aiden-x-claude / ttadk-x-codex …；
+                             traecli 映射到 TRAE CLI 2.0（内部 cliId=traex）
   --cli-path <path>          CLI 可执行文件路径覆盖
   --cli-runtime <JSON|->     Codex-compatible runtime 描述；JSON 含 id、
                              displayName、executable、update，传 - 清空
@@ -219,6 +220,11 @@ function parseCliRuntimeFlag(raw: string | undefined): CliRuntimeConfig | null |
     throw new Error(`--cli-runtime 不是合法 JSON: ${err instanceof Error ? err.message : String(err)}`);
   }
   return parsed as CliRuntimeConfig;
+}
+
+function isSettingWrapperCli(raw: string | undefined): boolean {
+  const value = raw?.trim();
+  return !!value && value !== '-';
 }
 
 /** 解析 `botmux setup` 的脚本化子命令 argv。非法输入抛 Error（message 面向用户）。 */
@@ -319,11 +325,15 @@ export function buildBotFromAddFlags(flags: SetupBotFlags): Record<string, any> 
   }
 
   const sel = resolveCliSelection((flags.cli ?? 'claude-code').trim());
+  if (sel.cliLaunchMode && isSettingWrapperCli(flags.wrapperCli)) {
+    throw new Error('Forge x TraeX 不能与 --wrapper-cli 同时使用。');
+  }
   const base: Record<string, any> = {
     larkAppId: flags.appId!.trim(),
     larkAppSecret: flags.appSecret!.trim(),
     cliId: sel.cliId,
     ...(sel.wrapperCli ? { wrapperCli: sel.wrapperCli } : {}),
+    ...(sel.cliLaunchMode ? { cliLaunchMode: sel.cliLaunchMode } : {}),
     // 与 TUI 同口径：feishu 不落 brand 字段，bots.json 保持干净。
     ...(brand === 'lark' ? { brand: 'lark' } : {}),
   };
@@ -369,13 +379,20 @@ export function editInputFromFlags(flags: SetupBotFlags): BotConfigEditInput {
   if (flags.appSecret !== undefined) input.larkAppSecret = flags.appSecret;
   if (flags.cli !== undefined) {
     const sel = resolveCliSelection(flags.cli.trim());
+    if (sel.cliLaunchMode && isSettingWrapperCli(flags.wrapperCli)) {
+      throw new Error('Forge x TraeX 不能与 --wrapper-cli 同时使用。');
+    }
     input.cliChoice = sel.cliId;
     input.wrapperCli = sel.wrapperCli ?? null;
+    input.cliLaunchMode = sel.cliLaunchMode ?? null;
     // An explicit CLI selection means its built-in/wrapper distribution.
     // `--cli-runtime` below can replace this null with a custom descriptor.
     input.cliRuntime = null;
   }
-  if (flags.wrapperCli !== undefined) input.wrapperCli = flags.wrapperCli;
+  if (flags.wrapperCli !== undefined) {
+    input.wrapperCli = flags.wrapperCli;
+    if (flags.wrapperCli.trim() && flags.wrapperCli.trim() !== '-') input.cliLaunchMode = null;
+  }
   if (flags.cliRuntime !== undefined) input.cliRuntime = parseCliRuntimeFlag(flags.cliRuntime);
   if (flags.cliPath !== undefined) input.cliPathOverride = flags.cliPath;
   if (flags.model !== undefined) input.model = flags.model;
@@ -390,7 +407,7 @@ export function editInputFromFlags(flags: SetupBotFlags): BotConfigEditInput {
 
 /** 合法 --cli 取值（报错提示用）。 */
 export function cliSelectionKeys(): string[] {
-  return CLI_SELECT_OPTIONS.map(o => o.key);
+  return [...CLI_SELECT_OPTIONS.map(o => o.key), ...Object.keys(CLI_SELECTION_ALIASES)];
 }
 
 /** list --json 输出前的 secret 脱敏（CLI 输出可能被贴进聊天/日志）。 */

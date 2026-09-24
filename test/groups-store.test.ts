@@ -12,6 +12,7 @@ const chatCreateStub = vi.fn();
 const chatUpdateStub = vi.fn();
 // chat.link mocks the share-link fetch.
 const chatLinkStub = vi.fn();
+let chatListItems: Array<Record<string, unknown>>;
 
 // Mock bot-registry's getBotClient — that's where groups-store imports from.
 // Read-only GETs (listChats / isInChat / getChatOwner) now go through
@@ -27,16 +28,7 @@ vi.mock('../src/bot-registry.js', () => ({
         return {
           code: 0,
           data: {
-            items: [
-              {
-                chat_id: 'c1',
-                name: 'one',
-                description: 'first chat',
-                chat_mode: 'group',
-                owner_id: 'ou_owner',
-                avatar: 'https://avatar.example/c1.png',
-              },
-            ],
+            items: chatListItems,
             has_more: false,
           },
         };
@@ -76,7 +68,20 @@ import {
 } from '../src/services/groups-store.js';
 
 describe('groups-store wrappers', () => {
-  beforeEach(() => { chatCreateStub.mockClear(); chatUpdateStub.mockClear(); chatLinkStub.mockReset(); });
+  beforeEach(() => {
+    chatCreateStub.mockClear();
+    chatUpdateStub.mockClear();
+    chatLinkStub.mockReset();
+    chatListItems = [{
+      chat_id: 'c1',
+      name: 'one',
+      description: 'first chat',
+      chat_mode: 'group',
+      chat_status: 'normal',
+      owner_id: 'ou_owner',
+      avatar: 'https://avatar.example/c1.png',
+    }];
+  });
 
   it('listChats returns ChatBrief array', async () => {
     const out = await listChats('appA');
@@ -85,8 +90,21 @@ describe('groups-store wrappers', () => {
     expect(out[0].name).toBe('one');
     expect(out[0].description).toBe('first chat');
     expect(out[0].chatMode).toBe('group');
+    expect(out[0].chatStatus).toBe('normal');
     expect(out[0].ownerId).toBe('ou_owner');
     expect(out[0].avatar).toBe('https://avatar.example/c1.png');
+  });
+
+  it('listChats only returns chats that Feishu explicitly reports as normal', async () => {
+    chatListItems.push(
+      { chat_id: 'c2', name: 'dissolved', chat_status: 'dissolved' },
+      { chat_id: 'c3', name: 'retained history', chat_status: 'dissolved_save' },
+      { chat_id: 'c4', name: 'unknown legacy state' },
+    );
+
+    await expect(listChats('appA')).resolves.toEqual([
+      expect.objectContaining({ chatId: 'c1', chatStatus: 'normal' }),
+    ]);
   });
 
   it('isInChat returns boolean', async () => {
@@ -281,6 +299,32 @@ describe('groups-store wrappers', () => {
     const callArgs = chatCreateStub.mock.calls[0][0];
     expect(callArgs.data.user_id_list).toBeUndefined();
     expect(callArgs.params?.user_id_type).toBeUndefined();
+  });
+
+  it('createChat forwards chatMode as data.chat_mode when set', async () => {
+    chatCreateStub.mockResolvedValueOnce({
+      code: 0,
+      data: { chat_id: 'oc_topic' },
+    });
+    const r = await createChat('cli_creator', {
+      name: 'topic chat',
+      botIds: ['cli_creator'],
+      chatMode: 'topic',
+    });
+    expect(r.chatId).toBe('oc_topic');
+    const callArgs = chatCreateStub.mock.calls[0][0];
+    expect(callArgs.data.chat_mode).toBe('topic');
+  });
+
+  it('createChat omits chat_mode when chatMode is not provided', async () => {
+    chatCreateStub.mockResolvedValueOnce({
+      code: 0,
+      data: { chat_id: 'oc_default' },
+    });
+    await createChat('cli_creator', { botIds: ['cli_creator', 'cli_other'] });
+    const callArgs = chatCreateStub.mock.calls[0][0];
+    // Absent field -> Feishu's default (普通群). We must not pin it explicitly.
+    expect(callArgs.data.chat_mode).toBeUndefined();
   });
 
   it('getChatShareLink returns share_link and passes validity_period (default permanently)', async () => {

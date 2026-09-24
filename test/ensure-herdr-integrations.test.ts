@@ -2,10 +2,18 @@ import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import type { SpawnSyncOptionsWithStringEncoding, SpawnSyncReturns } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { textSpawnResult } from './helpers/spawn-result.js';
+
+type TextSpawnSync = (
+  command: string,
+  args?: readonly string[],
+  options?: SpawnSyncOptionsWithStringEncoding,
+) => SpawnSyncReturns<string>;
 
 const spawn = vi.fn();
-const spawnSync = vi.fn();
+const spawnSync = vi.fn<TextSpawnSync>();
 const execSync = vi.fn();
 
 vi.mock('node:child_process', () => ({ spawn, spawnSync, execSync }));
@@ -82,7 +90,7 @@ describe('TraeX herdr plugin installation', () => {
     spawn.mockReset();
     spawnSync.mockReset();
     execSync.mockReset();
-    spawnSync.mockReturnValue({ status: 0, stdout: '', stderr: '' });
+    spawnSync.mockReturnValue(textSpawnResult({ status: 0 }));
     execSync.mockReturnValue('herdr 0.7.3');
   });
 
@@ -116,7 +124,7 @@ describe('TraeX herdr plugin installation', () => {
   it('gates herdr versions without the plugin capability and reports the version', async () => {
     vi.stubEnv('BOTMUX_HERDR_TRAEX_PLUGIN_ENABLED', 'true');
     vi.stubEnv('BOTMUX_HERDR_TRAEX_PLUGIN_SOURCE', 'trusted/repo');
-    spawnSync.mockReturnValue({ status: 1, stdout: '', stderr: 'unknown command' });
+    spawnSync.mockReturnValue(textSpawnResult({ status: 1, stderr: 'unknown command' }));
     execSync.mockReturnValue('herdr 0.6.6');
     const { ensureHerdrIntegrations } = await loadSubject();
     const result = await ensureHerdrIntegrations(['traex']);

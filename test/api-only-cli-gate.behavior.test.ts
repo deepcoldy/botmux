@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeAll, beforeEach, afterAll } from 'vitest';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { execFileSync } from 'node:child_process';
 import { resolve, join } from 'node:path';
 import { existsSync, mkdirSync, writeFileSync, rmSync, readFileSync } from 'node:fs';
@@ -16,17 +17,33 @@ import { tmpdir } from 'node:os';
  * Requires the compiled artifact; skips if dist is absent.
  */
 const CLI = resolve('dist/cli.js');
-const LARK_FACING = ['send', 'dispatch', 'card', 'create-group', 'history', 'quoted', 'bots', 'grant', 'actor'];
+const LARK_FACING = [
+  'send',
+  'dispatch',
+  'card',
+  'history',
+  'quoted',
+  'bots',
+  'create-group',
+  'grant',
+  'react',
+  'thread',
+  'vc-agent',
+  'report',
+  'actor',
+];
 
 let DATA_DIR = '';
 const VIRTUAL_SID = 'sess_behavior_virtual';
+const HEADLESS_SID = 'sess_behavior_headless';
 const REAL_SID = 'sess_behavior_real';
 
 function writeSession(sid: string, chatId: string, larkAppId: string) {
-  const fp = join(DATA_DIR, 'sessions.json');
-  const existing = existsSync(fp) ? JSON.parse(readFileSync(fp, 'utf8')) : [];
-  existing.push({ sessionId: sid, chatId, larkAppId, rootMessageId: '', scope: 'chat', status: 'active' });
-  writeFileSync(fp, JSON.stringify(existing));
+  // 会话行只有 SQLite 一种持久层，且按 larkAppId 分库；旧夹具往单个
+  // sessions.json 里 push 数组的写法（靠 JSON 读侧容忍数组形状）已不适用。
+  seedPersistedSessionRows(DATA_DIR, larkAppId, {
+    [sid]: { sessionId: sid, chatId, larkAppId, rootMessageId: '', scope: 'chat', status: 'active' },
+  });
 }
 
 /** Put a marker at THIS process's pid so a spawned child (whose ppid == our pid)
@@ -67,6 +84,7 @@ d('root-dispatch transport gate — behavioral, tamper-resistant (built CLI)', (
     rmSync(DATA_DIR, { recursive: true, force: true });
     mkdirSync(DATA_DIR, { recursive: true });
     writeSession(VIRTUAL_SID, 'http_async_behaviorzero', 'cli_test_bot');
+    writeSession(HEADLESS_SID, 'headless_hl_behaviorzero', 'cli_test_bot');
     writeSession(REAL_SID, 'oc_real_behavior', 'cli_test_bot');
     writeAncestryMarker(VIRTUAL_SID);
   });
@@ -78,6 +96,17 @@ d('root-dispatch transport gate — behavioral, tamper-resistant (built CLI)', (
       });
       expect(code, `${cmd} honest exit`).toBe(2);
       expect(out, `${cmd} msg`).toMatch(/unavailable|no Feishu|HTTP control-API/);
+    }
+  });
+
+  it('managed headless turn: every Lark-facing command exits 2', () => {
+    writeAncestryMarker(HEADLESS_SID);
+    for (const cmd of LARK_FACING) {
+      const { code, out } = runCli([cmd], {
+        BOTMUX_SESSION_ID: HEADLESS_SID, BOTMUX_CHAT_ID: 'headless_hl_behaviorzero', BOTMUX_LARK_APP_ID: 'cli_test_bot',
+      });
+      expect(code, `${cmd} headless exit`).toBe(2);
+      expect(out, `${cmd} headless msg`).toMatch(/unavailable|no Feishu|headless automation session|HTTP control-API/);
     }
   });
 

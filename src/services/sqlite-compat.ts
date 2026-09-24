@@ -83,6 +83,40 @@ function wrapBunDatabase(db: {
   };
 }
 
+/**
+ * Load `node:sqlite` WITHOUT letting Node print its experimental warning.
+ *
+ * On Node 22 (the version CI and most installs run) the first load of
+ * `node:sqlite` emits
+ *   `(node:PID) ExperimentalWarning: SQLite is an experimental feature …`
+ * plus a "use --trace-warnings" line, on STDERR. Node 24 no longer does, which
+ * is why this went unnoticed on a 24 dev box.
+ *
+ * For a daemon that is one stray log line. For the CLI it is a real defect: the
+ * two lines land in the middle of a full-screen TUI (`botmux list` runs on the
+ * alternate screen — the warning scrolls the pinned header off the top), and
+ * they pollute the stderr of every agent-facing `botmux` command that touches
+ * the session store. Adding a `process.on('warning')` listener does NOT stop
+ * it — Node's default printer runs regardless — so the emit itself has to be
+ * filtered, narrowly and only for the duration of this require.
+ */
+function requireNodeSqlite(require: NodeRequire): unknown {
+  const originalEmitWarning = process.emitWarning;
+  process.emitWarning = function patchedEmitWarning(warning: unknown, ...rest: unknown[]): void {
+    const text = typeof warning === 'string' ? warning : (warning as Error | undefined)?.message ?? '';
+    const type = typeof rest[0] === 'string'
+      ? rest[0]
+      : (rest[0] as { type?: string } | undefined)?.type;
+    if (type === 'ExperimentalWarning' && /\bSQLite\b/i.test(text)) return;
+    (originalEmitWarning as (...a: unknown[]) => void).call(process, warning, ...rest);
+  } as typeof process.emitWarning;
+  try {
+    return require('node:sqlite');
+  } finally {
+    process.emitWarning = originalEmitWarning;
+  }
+}
+
 function openWithLoadedEngine(path: string, opts: OpenOptions = {}): DatabaseSyncLike {
   const require = createRequire(import.meta.url);
   if (isBunRuntime()) {
@@ -90,7 +124,9 @@ function openWithLoadedEngine(path: string, opts: OpenOptions = {}): DatabaseSyn
     const db = opts.readOnly ? new Database(path, { readonly: true }) : new Database(path);
     return wrapBunDatabase(db as never);
   }
-  const { DatabaseSync } = require('node:sqlite');
+  const { DatabaseSync } = requireNodeSqlite(require) as {
+    DatabaseSync: new (path: string, options?: { readOnly?: boolean }) => unknown;
+  };
   const db = opts.readOnly ? new DatabaseSync(path, { readOnly: true }) : new DatabaseSync(path);
   return db as unknown as DatabaseSyncLike;
 }
@@ -104,7 +140,7 @@ export function sqliteEngineAvailable(): boolean {
       require('bun:sqlite');
       return true;
     }
-    require('node:sqlite');
+    requireNodeSqlite(require);
     return true;
   } catch {
     return false;

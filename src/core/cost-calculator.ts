@@ -6,6 +6,7 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { logger } from '../utils/logger.js';
 import type { CliId } from '../adapters/cli/types.js';
+import type { SessionTokenUsageSnapshot } from '../types.js';
 import { findAidenLatestCheckpointByBotmuxSessionId, findAidenLatestCheckpointBySessionId } from '../services/aiden-checkpoints.js';
 import {
   __resetTranscriptResolverCacheForTest,
@@ -19,6 +20,7 @@ import {
   isMeaningfulUserEvent,
   type TranscriptEvent,
 } from '../services/claude-transcript.js';
+import { readAntigravityTokenUsage } from '../services/antigravity-usage.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -31,7 +33,7 @@ export interface SessionCost {
   turns: number;
 }
 
-export interface SessionTokenUsage extends SessionCost {
+export interface SessionTokenUsage extends SessionCost, SessionTokenUsageSnapshot {
   in: number;
   out: number;
 }
@@ -1309,6 +1311,10 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
     );
     if (!checkpointPath || !existsSync(checkpointPath)) return null;
     return readSessionTokenAggregateCached(checkpointPath, 'aiden', { fresh: q.fresh });
+  }
+  if (q.cliId === 'antigravity') {
+    if (!q.cliSessionId) return null;
+    return readAntigravityTokenUsage(q.cliSessionId) as UsageReadResult | null;
   }
   const resolved = resolveSessionTranscriptPath(q);
   if (!resolved || !existsSync(resolved.path)) return null;

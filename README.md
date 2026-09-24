@@ -48,7 +48,9 @@ botmux start                 # 启动 daemon（botmux autostart enable 设开机
 >
 > 安装过程**不编译任何原生模块**（不需要 Python / node-gyp / 编译器）：PTY 已经嵌在二进制里。支持 linux / macOS × x64 / arm64（Alpine 等 musl 环境自动选 musl 版）；**Windows 请在 WSL2 里安装**（daemon 依赖 PTY / tmux / Unix 信号，原生 Windows 跑不了；WSL2 报告为 linux，是完整支持的一等环境）。平台不在列表里、或下下来的二进制在本机跑不起来，安装会**明确报错并保留原有版本**，而不是装上一个起不来的命令。
 >
-> 升级：`botmux upgrade`（原地换二进制），或**重跑一遍上面那条 curl 命令**——同样原地升级，不会重复往启动文件里追加 PATH。
+> 正式版 macOS CLI 使用稳定的 Apple Developer ID 签名。升级替换二进制后，macOS 的文件与 App 数据访问授权仍绑定同一代码身份，不会因为版本哈希变化而把 botmux 当成一个新程序；canary / beta / rc 等预览版仍使用 ad-hoc 签名。
+>
+> 升级：**一律重跑上面那条 curl 命令**（npm / pnpm 全局安装也用它，原地替换、不会重复往启动文件里追加 PATH），装完开个新终端跑 `botmux restart`；≥3.18 的二进制安装上 `botmux upgrade` 与其等价。装指定版本（含回滚）：`curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | BOTMUX_VERSION=v3.18.8 sh`（变量必须在管道右侧的 `sh` 前面）。⚠️ **v3.18.0 之前的老版本不要用 npm 升级**——跨「Node 源码 → 二进制」形态边界会让 daemon 重启失败。
 
 <details>
 <summary>已经在用 Node 生态？也可以走 npm（同一个二进制）</summary>
@@ -59,7 +61,7 @@ npm install -g botmux        # 需要 Node >= 22 装包本身
 
 npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的那一个），postinstall 把 `~/.botmux/bin/botmux` 指向它并同样写 PATH。所以装完只有**一个** botmux 版本，不再出现「装了两个 Node 版本、各自带一份全局 botmux 互相打架 / 不知道更新了哪个」。
 
-区别只在**谁来装、以后谁来升**：npm 路径需要 Node ≥ 22 才能执行安装本身，升级交回 `npm i -g botmux@latest`；curl 路径全程不碰 Node。跑起来之后两者完全一致——同样的二进制、同样的命令。
+区别只在**谁来装**：npm 路径需要 Node ≥ 22 才能执行安装本身，curl 路径全程不碰 Node；**无论哪种装法，升级都重跑 curl**（v3.18.0 之前的老版本用 npm 跨形态升级会让 daemon 起不回来）。跑起来之后两者完全一致——同样的二进制、同样的命令。
 
 </details>
 
@@ -69,6 +71,7 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 
 - **[实时流式卡片](https://deepcoldy.github.io/botmux/cards)** — 每轮对话一张实时刷新的卡片，终端画面原样截图回传；一键显示/隐藏输出、翻屏、重启/关闭/接管会话。
 - **[多机器人协作](https://deepcoldy.github.io/botmux/multi-bot)** — 同群多 bot @mention 路由，不同 CLI 背后不同模型，天然多样性；方案评审 / 代码 review / 技术选型让它们互相挑刺。
+- **[群内真人独立 lane](docs/principal-lanes.md)** — 可复用 Dashboard 的「跨身份打断隔离（XPI）」开关，让同一群里的真人各用独立 CLI 上下文和 git worktree；消息仍公开可见，引用别人的任务仍可走建议/确认协作。
 - **[多话题并行编排](https://deepcoldy.github.io/botmux/multi-topic)** — 给编排者一个大任务，它自动在群里种话题、拉各 bot 起独立会话跑流水线，飞书任务面板一眼看完所有子任务进度。
 - **[可交互 Web 终端](https://deepcoldy.github.io/botmux/web-terminal)** — 不只是看输出，浏览器 / 手机直接操作 CLI，移动端带悬浮快捷键栏（Esc、Ctrl+C、方向键）。
 - **[会话接入 & 接力](https://deepcoldy.github.io/botmux/adopt)** — 本地 tmux 里跑到一半，手机 `/adopt` 接管；`/relay` 把整个会话（原进程、原记忆）搬进团队群继续。
@@ -81,7 +84,7 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 
 `bots.json` 里用 `cliId` 一键切换。**20+ 适配器**，覆盖本地 CLI（进程隔离，`tmux attach` 可直连）和 API / 云 Agent（如 Mira、riff——通过 API / 远端接入，非本地进程；mojo 为 API 驱动、默认在宿主机执行工具，可配 cloud: true 走云沙箱）。代表项：
 
-`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco`(TRAE) · `hermes` · `ebsd` · `mira` · `riff`(云 Agent) … · `mojo`(API 驱动,默认宿主机执行) …
+`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco`(TRAE) · `hermes` · `ebsd` · `mira` · `riff`(云 Agent) … · `mojo`(API 驱动,默认宿主机执行) · `minimax`(MiniMax `mmx text repl`；区域由 `mmx auth login --region cn|global` 决定，同机多区用 per-bot `env` 的 `MMX_CONFIG_DIR` 隔离) …
 
 `ebsd` 使用独立的外部服务身份和原生 OMP 会话目录；部署方必须通过受限权限文件配置 Diag Gateway token 与 ByteCloud service account，不能把密钥写入 `bots.json`。
 
@@ -116,6 +119,10 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 ```
 
 这个选择只切换裸 CLI 适配器，不继承当前 bot 配置中的 `wrapperCli`、`model` 或 `startupCommands`。因此依赖 `ttadk`、`aiden` 等 wrapper / 网关才能启动的 CLI，不适合用会话级选择切换；应直接把 bot 默认配置设为对应的 wrapper 组合。会话启动后 CLI 选择冻结，后续消息和恢复都会继续使用该 CLI。
+
+### 会话级 Codex 实例
+
+同一 Bot 的 Codex 多登录目录可使用 [会话级 Codex 实例](docs/codex-instances.md)：显式 `codexHome` 与默认实例、加权随机新会话分配，以及固定实例的恢复/fork。初始化和登录见该文档；不提供额度不足自动换号。
 
 ### 最终回答反馈（按 bot、默认关闭）
 
@@ -157,6 +164,14 @@ botmux 不重新实现记忆、上下文管理、工具调用、权限体系—�
 | 多 CLI / Agent | 20+ 适配器一键切换 | 取决于 SDK 覆盖面 |
 | 多机器人 | 同群多 bot @mention 路由 | 取决于实现 |
 | 终端直连 | 本地 CLI 可 `tmux attach` 进真进程 | 取决于实现 |
+
+## 可信建群服务的默认免 @
+
+自助建群服务可通过应用与群绑定的签名，为普通群声明默认 `ambient` 模式：无需 @ 即可对话，只 @ 其他成员时保持安静。功能默认关闭，群级显式设置优先，现有对话与操作权限仍然生效。配置、注册表协议和缓存限制见 [可信群默认模式](docs/signed-chat-defaults.md)。
+
+## 接入自带任务流程的专业能力
+
+外部应用可使用实验版[模型透明代理模式](docs/model-proxy.md)：通过有鉴权的本机 Chat Completions 入口复用 CLI 模型能力，调用方继续管理上下文、工具执行和任务流程。[OpenCodeReview（OCR）](https://github.com/alibaba/open-code-review) 等应用可通过模型 SDK 接入；当前兼容字段、原生 CLI 验证范围及专用身份要求见文档。底层[受约束执行接口](docs/constrained-invocations.md)提供任务查询、取消、幂等和进程回收。
 
 ## 文档 · 社区 · 贡献
 

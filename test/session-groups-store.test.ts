@@ -40,7 +40,7 @@ import {
   removeSessionGroup,
   listSessionGroups,
 } from '../src/services/session-groups-store.js';
-import { sanitizeTitleOutput, buildTitlePrompt, buildOneShotEnv, resolveOneShotCommand } from '../src/services/session-group-title.js';
+import { sanitizeTitleOutput, buildTitlePrompt, buildOneShotEnv, resolveOneShotCommand, ONE_SHOT_ARGV } from '../src/services/session-group-title.js';
 import {
   resolveTagMode,
   resolveSessionTagName,
@@ -261,6 +261,14 @@ describe('resolveOneShotCommand (PR review: full buildWrappedLaunch parity)', ()
   it('falls back to the template verbatim', () => {
     expect(resolveOneShotCommand({}, template)).toEqual({ argv: ['claude', '-p'] });
   });
+
+  it('supports antigravity in ONE_SHOT_ARGV with agy -p', () => {
+    expect(ONE_SHOT_ARGV.antigravity).toEqual(['agy', '-p']);
+    expect(resolveOneShotCommand({}, ONE_SHOT_ARGV.antigravity)).toEqual({ argv: ['agy', '-p'] });
+    expect(resolveOneShotCommand({ cliPathOverride: '/custom/bin/agy' }, ONE_SHOT_ARGV.antigravity)).toEqual({
+      argv: ['/custom/bin/agy', '-p'],
+    });
+  });
 });
 
 describe('buildTitlePrompt', () => {
@@ -278,8 +286,8 @@ describe('buildTitlePrompt', () => {
 
 describe('resolveTagMode', () => {
   it('defaults to feed-group when tag.mode is unset', () => {
-    // feed-group 不依赖租户权限目录（chat-tag 的 im:tag scope 部分租户根本
-    // 没有），任何用户 OAuth 一次即可用 —— 因此是未配置时的默认模式。
+    // feed-group 不依赖租户权限目录（chat-tag 的 im:tag scope 飞书尚未开放，
+    // 权限目录里搜不到），任何用户 OAuth 一次即可用 —— 因此是未配置时的默认模式。
     expect(resolveTagMode(undefined)).toBe('feed-group');
     expect(resolveTagMode({})).toBe('feed-group');
   });

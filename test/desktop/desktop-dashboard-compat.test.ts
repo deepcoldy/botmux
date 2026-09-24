@@ -55,11 +55,9 @@ describe('desktop dashboard compat validation', () => {
 
     const result = await validateDashboardCompat('http://127.0.0.1:7891/?token=x', { fetch });
 
-    expect(result).toMatchObject({
-      ok: false,
-      reason: 'incompatible',
-      message: expect.stringContaining('/__desktop/compat'),
-    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('incompatible');
+    expect(result.message).toContain('/__desktop/compat');
     expect(result.message).toContain('升级或切换全局 botmux CLI');
     expect(result.message).not.toContain('src/desktop/install-local.sh');
   });
@@ -74,11 +72,9 @@ describe('desktop dashboard compat validation', () => {
 
     const result = await validateDashboardCompat('http://127.0.0.1:7891/', { fetch });
 
-    expect(result).toMatchObject({
-      ok: false,
-      reason: 'incompatible',
-      message: expect.stringContaining('兼容信息格式不正确'),
-    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('incompatible');
+    expect(result.message).toContain('兼容信息格式不正确');
   });
 
   it('treats invalid compat JSON as an incompatible manifest, not as a network outage', async () => {
@@ -91,11 +87,9 @@ describe('desktop dashboard compat validation', () => {
 
     const result = await validateDashboardCompat('http://127.0.0.1:7891/', { fetch });
 
-    expect(result).toMatchObject({
-      ok: false,
-      reason: 'incompatible',
-      message: expect.stringContaining('兼容信息格式不正确'),
-    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('incompatible');
+    expect(result.message).toContain('兼容信息格式不正确');
   });
 
   it('blocks embedding when the dashboard protocol is newer than this app supports', async () => {
@@ -112,11 +106,9 @@ describe('desktop dashboard compat validation', () => {
 
     const result = await validateDashboardCompat('http://127.0.0.1:7891/', { fetch });
 
-    expect(result).toMatchObject({
-      ok: false,
-      reason: 'incompatible',
-      message: expect.stringContaining('高于 Desktop 支持'),
-    });
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('incompatible');
+    expect(result.message).toContain('高于 Desktop 支持');
   });
 });
 

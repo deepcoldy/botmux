@@ -11,34 +11,72 @@
 | `/repo <路径\|项目名>` | 直接指定路径或 workingDir 下的一级项目名 |
 | `/cd <路径>` | 切换工作目录并重启 CLI 进程 |
 | `/status` | 查看会话信息（运行时间、终端地址等） |
+| `/lane status` | 查看本人的独立 principal lane，包括分支、worktree、脏状态和未推送提交数（复用现有 bot 级 XPI 开关启用 principal lane 时可用） |
+| `/lane close` | 安全关闭本人的独立 principal lane：有运行中/排队任务或未提交文件时拒绝，回收前先推送未发布提交，且不会自动合并或删除分支 |
 | `/retry` | 重试最近一个失败或被中断的 turn（10s 冷却） |
+| `/stop` | 中断当前 turn，保留会话；等价于流式卡片里的「停止」按钮 |
 | `/restart` | 重启 CLI 进程（保留 session 上下文） |
 | `/close` | 关闭会话并发送可恢复卡片（含 CLI 自身 resume 命令） |
-| `/fork <任务>` | 继承当前会话的完整上下文，在同一话题群新建并行子话题；源会话原样继续（仅 Claude 系 / Codex 终端模式） |
+| `/cleanup-wt <ID>` | worktree 最终删除失败后重试已持久化的清理任务；删除前会重新校验权限、活动会话、worktree 身份和安全状态 |
+| `/fork <任务>` | 继承当前会话的完整上下文，在同一话题群新建并行子话题；源会话原样继续（Claude 系 / Codex 或 TraeX 终端模式） |
 | `/forklist` | 重发当前会话的分身任务面板，显示运行/结束状态和子话题链接 |
 | `/fork --create <群名>` | 不建子话题，改为把当前会话分身到一个新建群 |
 | `/rename <标题>` | 重命名当前 Botmux 会话，并同步运行中的 Codex/Claude 原生会话名 |
-| `/fork --create <新群名>` | 把当前空闲会话分身到一个新建群，源会话原样保留继续（仅 Claude 系 / Codex 终端模式；需在源会话所在话题内发起） |
-| `/card` | 手动召唤当前会话的流式卡片（关流式时也能召唤并恢复实时刷新；私密卡片模式下改发仅授权人可见的静态快照）。`/card off`、`/card on` 控制本群是否出流式卡；`/card pin off`、`/card pin on`、`/card pin status` 控制当前群的流式卡片置顶开关 |
-| `/cot` | 思考过程消息开关：`/cot off` 关闭本群的思考气泡，`/cot on` 恢复，`/cot show` 在开关关闭时临时召唤一次当前回合的思考气泡，`/cot status` 查看状态（bot 级总开关 `thinkingCard` 默认 on；仅 claude-code / codex 支持） |
+| `/fork --create <新群名>` | 把当前空闲会话分身到一个新建群，源会话原样保留继续（Claude 系 / Codex 或 TraeX 终端模式；Hybrid RPC / 外部 app-server 会话不支持；需在源会话内发起） |
+| `/card` | 手动召唤当前会话的流式卡片（关流式时也能召唤并恢复实时刷新；私密卡片模式下改发仅授权人可见的静态快照）。`/card off`、`/card on` 控制本群是否出流式卡；`/card pin off`、`/card pin on`、`/card pin status` 控制当前群的流式卡片置顶开关。仅 `allowedUsers` 可执行（开关影响全群，飞书没有按人视图） |
+| `/cot` | CoT 开关：`/cot off` 关闭本群的思考与工具过程，`/cot on` 恢复，`/cot show` 在开关关闭时临时展示一次当前回合，`/cot status` 查看状态（bot 级总开关 `cotEnabled` 默认 on；支持 claude-code / codex / traex）。仅 `allowedUsers` 可执行 |
+| `/mention-mode [always\|topic\|never\|ambient\|status]` | 普通群的 @ 策略：什么时候可以不 @ 也回应。查询需对话权、修改需操作权；**仅普通群可设**（私聊/话题群/会话群会被拒绝）。四模式语义与 8 个免 @ 例外见 [@ 策略](/mention-mode) |
 | `/term` | 获取当前会话的「可操作终端」（带写权限）链接，私密发给 owner（群内仅你可见，话题/单聊回退私信，不在群里暴露） |
+| `/quote` | 弹出本群话题选择卡，选一个就把那个话题的聊天记录读进当前会话。补的是飞书本身的缺口——飞书的「引用」只能引单条消息，没有「引用整个话题」的入口。读完只回一句确认（多少条、时间跨度、主题），等你下一条指令 |
+| `/quote <指令>` | 同上，但选完话题直接执行你的指令，省一个来回。话题内容仍然会被明确标注为「资料而不是指令」注入 |
+| `/sessions` | 列出当前机器人在本群的活跃话题会话，可直接回到原话题（旧会话安全降级为定位通知） |
 | `/dashboard [模块]` | 在飞书里打开 Dashboard 控制卡片（sessions/schedules/groups/settings/help 等） |
+| `@机器人 /project enable\|status\|roles\|disable` | 在当前普通群启用、查看、配置 Agent 角色或退出项目群模式（仅 owner/allowedUsers；不占用会话槽位） |
 | `/insight` | owner 专用：在当前会话即时回一张「本会话洞察摘要」卡片（聚合指标 + 规则建议；动作 span 明细 / 逐轮对账 / 对话回放在 Dashboard「洞察」页看） |
 | `/vc prepare <会议链接或会议号>` | 将当前普通群设为会议准备群，并在开会后复用同一 Agent 会话 |
 | `/introduce` | 让本群机器人互相登记 `open_id`，用于协作时精确 @ 对方 |
 | `@机器人 /summary` | 读取当前话题（或普通群配置范围内）的历史消息并生成总结（默认最近 50 条 / 24 小时）。若该 bot 开启了 `summaryMemory`，总结会追加写入配置的记忆文件（`summaryMemoryPath`，默认 `summary.md`），且 `/summary` 后跟随的文字会作为「只总结从这条起」的硬边界；未开启记忆时，后随文字仅作为本次总结的侧重提示 |
-| `/t [<内容>]` `/topic [<内容>]` | 普通群内强制新开话题；带内容提交首轮任务（需选仓则选择后开工），裸命令进入话题设置 |
+| `[标题] /t [/repo <仓库>] [/model <模型>] [/effort <档位>] [<首轮任务>]`（别名 `/topic`） | 普通群内强制新开话题，一条消息把标题、仓库、模型、推理强度、首轮任务一次交代完。换行等价于空格；标题写在 `/t` **之前**（飞书话题列表显示的是原消息，机器人改不了）；带空格的路径用双引号；任一项写错整条不生效并回一句用法错误。裸 `/t` 进入话题设置 |
 | `/issue` | 打开 Issue Board 看板卡片，直接在卡片上领取 botmux 平台任务：选好仓库后自动建群、拉你进去、绑定平台任务并开工。需要本机已绑定平台，且发起人在该 bot 的 `allowedUsers` 里；卡片只有发起人能操作 |
 | `/issue status` | 在任务群里发，查这个群绑着哪条平台任务、现在什么状态：平台状态 / 领取人 / 本机绑定 / 有没有回写还堵在发件箱里。只读，同样限该 bot 的 `allowedUsers` |
 | `/issue done` | 在任务群里发，**验收通过**，把任务推到平台终态。agent 交付只能到「待验收」，标完成是人的决策。完成后 claim 被平台清掉，这条领取不能再释放。同样限该 bot 的 `allowedUsers` |
 | `/issue release` | 在领取任务时建出来的那个群里发，把任务退回平台「待领取」，别人可以重新领。群和会话**不会自动解散**，对话记录保留。同样限该 bot 的 `allowedUsers` |
 
-裸 `/t` 的选仓/固定目录分支见[会话与话题模型](/session-model)。也可以把 `/repo` 作为新话题的首条命令：
+`/sessions` 卡片示意：
 
-- `/t /repo <路径|项目名>`
-- `/t /repo wt <路径|项目名> [分支]`
+![当前群活跃话题会话卡片](/img/sessions-command-card.png)
 
-这两种组合会直接完成建话题与选仓/创建 worktree，不会先启动空会话再切库；任务在话题内下一条发送。
+裸 `/t` 的选仓/固定目录分支见[会话与话题模型](/session-model)。
+
+指令头的三条指令：
+
+- `/repo <路径|项目名>` —— 直接钉仓库，跳过选仓卡片。注意**只吃一个 token**：带空格的路径要写成 `/repo "~/Code/my project"`。
+- `/repo`（不带参数）—— 直接在默认工作目录开会话，等同选仓卡片上的「直接开始」。
+- `/model <模型>` —— 本次启动用哪个模型。只对启动参数里带得动模型的 CLI 有效，带不动的会被拒绝而不是静默忽略。
+- `/effort <档位>` —— 推理强度（`low`/`medium`/`high`/`xhigh`/`max`/`ultra`），按本次实际使用的模型校验。
+
+整条消息可以写成一行，也可以换行分开，结果一样：
+
+```text
+botmux 日常运维 /t /repo botmux /model sonnet 看一下 daemon 日志里的重启记录
+```
+
+```text
+botmux 日常运维
+/t
+/repo botmux
+/model sonnet
+
+看一下 daemon 日志里的重启记录
+```
+
+不写首轮任务时（如 `/t /repo botmux`），CLI 会空跑起来等你的下一条消息，不会自说自话。
+
+几条边界：
+
+- 指令头只在**新话题的第一条消息**里生效。进行中的话题里要换仓库/模型/推理档位，请分别单独发 `/repo`、`/model`、`/effort`；改标题用 `/rename`。
+- 建 worktree 不能写进头部（`/repo` 只吃一个 token）。先用 `/t` 开话题，再在话题内发 `/repo wt <编号|项目名> [分支]`。
+- 会话中途单独发的 `/repo` 仍然吃整行，与头部里的单 token 规则不同。
 
 ## 💬 回复模式（`/reply-mode`）
 
@@ -68,6 +106,34 @@
 群级设置会覆盖 dashboard「Bot 配置 → 普通群模式」的默认值。
 
 `/substitute [status|on|off]` —— 查看或切换当前群的**替身模式**开关（修改需 owner）。
+
+## 📢 @ 策略（`/mention-mode`，仅普通群）
+
+`/mention-mode always|topic|never|ambient` 切换本群策略，`/mention-mode status`（或不带参数）查看。仅普通群可设：私聊天然不需要 @，话题群与 `/group` 会话群会被拒绝。查询只要对话权，修改需操作权（`allowedUsers`）。
+
+- `always`：必须 @ 才回应（默认）；`topic`：本 bot 自有话题内回复免 @；`never`：全群免 @；`ambient`：免 @，但消息明确 @ 了其他人/bot 时让路。
+- 免 @ 不等于免权限，且仍有 8 个免 @ 例外（话题内回复、替身、消息监听器等）——完整语义见 [@ 策略](/mention-mode)。
+
+## 📑 群标签页
+
+| 命令 | 说明 |
+|------|------|
+| `/tabs` / `/tab` / `/tabs list` | 查看当前群的全部标签页及其 Tab ID（`/tab` 是兼容别名） |
+| `/tabs add <网址> [名称]` | 新增 URL 标签页（修改需 owner 或获授权的操作人） |
+| `/tabs rename <tab_id> <新名称>` | 重命名可编辑的 URL / 文档标签页 |
+| `/tabs delete <tab_id>` | 删除可编辑的 URL / 文档标签页 |
+| `/tabs sort <tab_id> ...` | 按给定顺序排列标签页；必须包含 `/tabs` 列出的全部 Tab ID |
+
+飞书内置标签页只能查看和参与排序，不能通过开放接口重命名或删除。若群设置为「仅群主和管理员可管理标签页」，机器人也必须具备相应群权限。
+
+AI 或后台脚本应使用 CLI，而不是向群里发送 slash command：
+
+```bash
+botmux tabs add "https://example.com/project/releases/2026" \
+  --name "项目发布页" --json
+```
+
+CLI 会从当前 `BOTMUX_SESSION_ID` 自动确定 bot 和群；脱离当前会话时可传 `--session-id`，要覆盖目标群可传 `--chat-id`。`add` 按 URL 幂等：同一个页面已有 Tab 时复用，并按需更新名称，适用于 MR、项目看板、发布页等自动化场景。后台还可使用 `botmux tabs list|update|remove|sort`。
 
 ## 🔀 透传给底层 CLI
 
@@ -137,13 +203,15 @@
 
 `/oncall bind <path>` · `/oncall unbind` · `/oncall status`
 
-## 🔑 使用授权（owner 专用）
+## 🔑 使用授权（owner / 管理员）
 
 | 命令 | 说明 |
 |------|------|
-| `@机器人 /grant @某人` | 授权对方在本群对话；`/grant`（不带人）则授权**本群所有成员**对话 |
-| `@机器人 /revoke @某人` | 撤销对方本群对话权；`/revoke`（不带人）撤销整群授权 |
+| `@机器人 /grant`（或 `/grant all`） | 授权**本群所有成员**对话（写入 `allowedChatGroups`，无额度无期限；话题群按 `oc_` 群生效、覆盖全部话题）；裸 `/revoke` 收回 |
+| `@机器人 /grant @某人 [N]` | 发卡给指定成员授权**本群对话**，默认每人 3 条 / 1 小时，卡上可选 1 小时 / 8 小时 / 1 天 / 7 天 / 永久与额度（留空不限）；owner 主动发起的卡还可「全局授权对话」。`@机器人 /revoke @某人` 一并撤销本群访客授权、全局访客授权；若对方同时在 `allowedUsers` 名单里也会移除（撤 owner 本人或撤到再无管理员会被拒绝，回执注明作用域） |
 | `/vc-auth @成员` | 会议监听中临时授权本场指令源；`/vc-auth revoke @成员` 撤销；`/vc-auth list` 查看 |
+
+分层、额度、授权申请卡与黑名单详见 [权限与授权](/permissions)。注意：**把 bot 拉进群不等于授权**，限制态 bot 仍只接受名单成员。
 
 ## ⚙️ 远程改配置 & 技能（owner 专用）
 
@@ -166,6 +234,24 @@
 ```
 
 详见 [一键建会话群](/group)。
+
+## 📌 普通群升级为项目群
+
+在普通群消息顶层 @ 计划作为主控的 Bot：
+
+```text
+@机器人 /project enable
+```
+
+当前 Bot 会成为主控，群内其余由本机 Botmux 管理的 Bot 自动成为 Worker；配置写入与 Dashboard 相同的事实源，并立即发送、置顶待启动指引卡。启用时无需先确定项目目标，可以先在群顶层讨论。通过命令启用时默认打开“自动纳入新 Bot”：后续新加入且由同一 Botmux 管理的 Bot 会进入 Worker 白名单；这与“入群自动开工”开关相互独立。
+
+主控会在每个项目轮次收到 Botmux 固定的项目状态协议：开始时读取持久状态，目标、阶段、当前推进、待办、阻塞或里程碑变化后及时更新。该协议与自定义 Role 分层注入，不会被 Role 的“仅首轮”策略或 Role 文案覆盖。项目首次正式立项时会在当前消息位置发送并置顶一张新的正式项目卡，再取消旧指引卡置顶；后续进展继续原地更新正式卡。
+
+- `@机器人 /project status`：查看主控、Worker 和项目是否已启动。
+- `@机器人 /project roles`：在当前群回复角色配置卡，只列当前项目的主控与 Worker，且只有触发卡片的管理员可操作。保存复用 `/role` 的群级角色文件，并按该 Bot 的现有注入策略生效：每轮注入模式从下一条消息生效，仅首轮模式在新会话或重建后生效。
+- `@机器人 /project disable`：退出项目群模式；未启动的指引卡会取消置顶，已有项目数据会保留以便重新启用后继续。
+
+该命令只支持普通群，且仅 Bot 的 owner/allowedUsers 可以执行。重复执行 `enable` 不会覆盖已在 Dashboard 精选的 Worker 列表或自动纳入策略。Dashboard 可关闭“自动纳入新 Bot”，关闭后严格保留显式 Worker 名单；项目群配置区也会列出同一批 Agent，并可直接跳转到对应群角色编辑器。两种入口没有第二份角色配置。
 
 ## 📄 飞书文档评论入口
 

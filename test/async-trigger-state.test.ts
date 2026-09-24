@@ -130,6 +130,28 @@ describe('resolveAsyncTriggerState — completed', () => {
   });
 });
 
+describe('resolveAsyncTriggerState — interrupted', () => {
+  it('reports a precise interrupt while the session remains open', () => {
+    const r = resolveAsyncTriggerState({
+      sessionId: 's1', liveActive: true, storedStatus: 'open', memTriggerId: 'trg_stop',
+      memResult: { status: 'interrupted', interruptedAt: 7000 },
+    });
+    expect(r).toMatchObject({
+      ok: true, state: 'interrupted', triggerId: 'trg_stop',
+      finishedAt: new Date(7000).toISOString(),
+    });
+  });
+
+  it('survives a restart from the durable interrupt terminal', () => {
+    const r = resolveAsyncTriggerState({
+      sessionId: 's1', liveActive: false, storedStatus: 'open',
+      persisted: { triggerId: 'trg_stop', result: { status: 'interrupted', interruptedAt: 7000 } },
+    });
+    expect(r.state).toBe('interrupted');
+    expect(r.triggerId).toBe('trg_stop');
+  });
+});
+
 describe('resolveAsyncTriggerState — running', () => {
   it('live session, pending in-memory', () => {
     const r = resolveAsyncTriggerState({

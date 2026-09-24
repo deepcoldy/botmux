@@ -14,6 +14,7 @@
  * report an install root of `/`), and `process.execPath` can.
  */
 import { homedir } from 'node:os';
+import { realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { isStandaloneBinary } from './self-spawn.js';
 
@@ -36,25 +37,68 @@ function defaultInstallDir(home: string): string {
   return join(home, '.botmux', 'bin');
 }
 
+/** Strip Windows separators and any trailing slashes so two paths naming the same
+ *  location compare equal as strings. */
+function normalizeSlashes(p: string): string {
+  return p.replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
 /**
- * Classify a binary path. Pure — the caller passes the path and the relevant
- * environment, so every shape is unit-testable without a real install.
+ * Best-effort canonicalization used ONLY to compare two paths for "same file".
+ *
+ * WHY THIS IS NEEDED (measured on a real box, not hypothetical): the kernel hands
+ * a compiled binary a FULLY RESOLVED `process.execPath`, while `homedir()` returns
+ * whatever `/etc/passwd` says. On a devbox where `/home/<user>` is a symlink to
+ * `/data00/home/<user>`, those two disagree:
+ *
+ *   execPath           /data00/home/u/.botmux/bin/botmux   (realpath, from kernel)
+ *   homedir()+suffix   /home/u/.botmux/bin/botmux          (symlink path)
+ *
+ * The old string equality therefore never matched, `install.sh` installs were
+ * classified `unknown`, and `botmux update` refused with "无法安全识别当前安装方式
+ * （unknown）" even though the binary sat in exactly the expected location.
+ *
+ * Resolving BOTH sides fixes it without weakening anything: this only ever makes
+ * two paths that name the SAME FILE compare equal — it can never make two
+ * different locations match. Failure (ENOENT on a dir that does not exist,
+ * EACCES on an unreadable parent) returns the normalized input, so an
+ * unresolvable path simply falls through to the old string comparison and the
+ * classification stays fail-closed.
+ */
+function canonical(p: string): string {
+  const normalized = normalizeSlashes(p);
+  if (!normalized) return normalized;
+  try {
+    return normalizeSlashes(realpathSync(normalized));
+  } catch {
+    return normalized;
+  }
+}
+
+/**
+ * Classify a binary path. Pure over its inputs apart from the injectable
+ * `resolve` probe, so every shape stays unit-testable without a real install.
  *
  * @param execPath  the running executable (`process.execPath`)
  * @param env       consulted for `BOTMUX_INSTALL_DIR` (install.sh honours it)
  * @param home      the home directory, for the default install dir
+ * @param resolve   path canonicalizer; seam for tests. Must not throw — see
+ *                  {@link canonical}, which swallows and returns its input.
  */
 export function classifyBinaryInstall(
   execPath: string,
   env: NodeJS.ProcessEnv = process.env,
   home: string = homedir(),
+  resolve: (p: string) => string = canonical,
 ): BinaryInstallShape {
-  const path = execPath.replace(/\\/g, '/').replace(/\/+$/, '');
+  const path = normalizeSlashes(execPath);
   if (!path) return 'unknown';
 
   // Platform subpackage: <anything>/node_modules/botmux-<plat>-<arch>[-musl]/botmux
   // Anchored on `/node_modules/` so a user directory that merely happens to be
   // named `botmux-linux-x64` is not mistaken for a package-manager-owned tree.
+  // Deliberately matched on the UNRESOLVED path: this shape is about which
+  // package tree owns the file, and that is what the caller was invoked through.
   if (/\/node_modules\/botmux-(?:linux|darwin)-(?:x64|arm64)(?:-musl)?\/botmux$/.test(path)) {
     return 'npm-binary';
   }
@@ -67,10 +111,19 @@ export function classifyBinaryInstall(
   // is damaged, but self-update is unavailable for that install. Do not describe
   // custom dirs as unconditionally covered; making them work without the variable
   // would need a persisted install record, which is out of scope here.
+  //
+  // Compared BOTH raw and canonicalized (see {@link canonical}): a symlinked home
+  // makes the raw strings differ for one and the same file.
+  const pathResolved = resolve(path);
   for (const raw of [env.BOTMUX_INSTALL_DIR, defaultInstallDir(home)]) {
     if (!raw) continue;
-    const dir = raw.replace(/\\/g, '/').replace(/\/+$/, '');
-    if (dir && path === `${dir}/botmux`) return 'curl-binary';
+    const dir = normalizeSlashes(raw);
+    if (!dir) continue;
+    const candidate = `${dir}/botmux`;
+    if (path === candidate) return 'curl-binary';
+    // `resolve` the candidate's DIRECTORY, not the file: install.sh's target may
+    // not exist yet (or may itself be mid-replace), while its parent does.
+    if (pathResolved === `${resolve(dir)}/botmux`) return 'curl-binary';
   }
   return 'unknown';
 }

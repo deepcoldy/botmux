@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
@@ -161,6 +162,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       locale,
       larkAppId,
       noTransport,
+      triggerUserAuth,
     }) {
       const args: string[] = [];
       if (!disableCliBypass) {
@@ -215,6 +217,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
           botName,
           botOpenId,
           noTransport,
+          triggerUserAuth,
           builtinSkillBlock: builtinSkillBlockForInjectsSessionContext(larkAppId, locale, {
             asksViaHook: false,
             whiteboardEnabled: whiteboardEnabled(),
@@ -381,10 +384,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       format: 'grok-hooks',
       sessionStartCommand: sessionReadyHookCommand(),
     },
-    modelChoices: [
-      'grok-4.6',
-      'grok-4.5',
-    ],
+    modelChoices: CLI_MODEL_CHOICES['grok'],
   };
 }
 

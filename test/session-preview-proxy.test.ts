@@ -1,8 +1,8 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { connect, type Socket } from 'node:net';
+import { connect, createServer as createTcpServer, type Socket } from 'node:net';
 import { PassThrough, type Duplex } from 'node:stream';
-import { afterEach, describe, expect, it, vi } from 'vitest';
-import { WebSocket, WebSocketServer } from 'ws';
+import { afterEach, describe, expect, it } from 'vitest';
+import { WebSocket, WebSocketServer } from './helpers/node-ws.js';
 import {
   PREVIEW_SANDBOX_TOKENS,
   PREVIEW_UPGRADE_REJECTION_TIMEOUT_MS,
@@ -552,22 +552,30 @@ describe('session preview same-origin reverse proxy', () => {
   });
 
   it('returns a bounded 502 for unreachable HTTP and WebSocket targets without target details', async () => {
-    const reservation = createServer();
+    // Keep ownership of the port until both requests finish. Closing a port
+    // reservation before startFront lets the OS reuse it for the front itself,
+    // making the proxy request its own non-preview path and return 404.
+    // Resetting connections exercises the real upstream-error path without a
+    // released-port race against this front or other parallel test processes.
+    const reservation = createTcpServer(socket => socket.destroy());
     await new Promise<void>(resolve => reservation.listen(0, '127.0.0.1', resolve));
     const unreachablePort = (reservation.address() as { port: number }).port;
-    await new Promise<void>(resolve => reservation.close(() => resolve()));
-    const port = await startFront(() => okTarget(unreachablePort));
-    const headers = { cookie: managementCookie() };
+    try {
+      const port = await startFront(() => okTarget(unreachablePort));
+      const headers = { cookie: managementCookie() };
 
-    const response = await fetch(`http://127.0.0.1:${port}/preview/s1/`, { headers });
-    expect(response.status).toBe(502);
-    const text = await response.text();
-    expect(JSON.parse(text)).toEqual({ ok: false, error: 'preview_unreachable' });
-    expect(text).not.toContain(String(unreachablePort));
-    expect(text).not.toContain('127.0.0.1');
-    expect(await websocketStatus(`ws://127.0.0.1:${port}/preview/s1/ws`, {
-      Cookie: managementCookie(),
-    })).toBe(502);
+      const response = await fetch(`http://127.0.0.1:${port}/preview/s1/`, { headers });
+      expect(response.status).toBe(502);
+      const text = await response.text();
+      expect(JSON.parse(text)).toEqual({ ok: false, error: 'preview_unreachable' });
+      expect(text).not.toContain(String(unreachablePort));
+      expect(text).not.toContain('127.0.0.1');
+      expect(await websocketStatus(`ws://127.0.0.1:${port}/preview/s1/ws`, {
+        Cookie: managementCookie(),
+      })).toBe(502);
+    } finally {
+      await new Promise<void>(resolve => reservation.close(() => resolve()));
+    }
   });
 
   it('rejects malformed paths and dashboard query tokens before proxying', async () => {
@@ -1228,32 +1236,26 @@ describe('P1-2 preview 代理在客户端断开与非 101 拒绝路径上回收�
   });
 
   it('非 101 拒绝体超过总时限还没读完时，上游与浏览器两端一起销毁', async () => {
-    // 计时器必须在代理武装它**之前**换成假的，所以整段都跑在假 setTimeout 下；
-    // socket I/O 走的是真事件循环，不受影响。
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-    try {
-      const ctx = await startReclaimProbe();
-      const client = previewUpgrade(ctx.port, `${contentBase('s1')}/socket`);
-      const clientClosed = new Promise<void>(resolve => client.socket.on('close', () => resolve()));
-      await ctx.dialed;
+    // Real timers: bun's fake clock does not fire this production setTimeout
+    // (CI hung until FILE_WALL SIGKILL). 15s + buffer is well under the
+    // per-test ceiling on both runners.
+    const ctx = await startReclaimProbe();
+    const client = previewUpgrade(ctx.port, `${contentBase('s1')}/socket`);
+    const clientClosed = new Promise<void>(resolve => client.socket.on('close', () => resolve()));
+    await ctx.dialed;
 
-      const upstreamGone = ctx.upstreamClosed.then(() => true as const);
-      // 反复推进：上游 200 还在路上时推进是无害的，武装之后第一次推进就会触发。
-      for (let attempt = 0; attempt < 100; attempt++) {
-        vi.advanceTimersByTime(PREVIEW_UPGRADE_REJECTION_TIMEOUT_MS + 1_000);
-        const fired = await Promise.race([
-          upstreamGone,
-          new Promise<false>(resolve => { setImmediate(() => resolve(false)); }),
-        ]);
-        if (fired) break;
-      }
-      await upstreamGone;
-      await clientClosed;
-      expect(ctx.liveUpstream()).toBe(0);
-      expect(client.raw()).toBe('');
-    } finally {
-      vi.useRealTimers();
-    }
+    await Promise.race([
+      ctx.upstreamClosed,
+      new Promise<never>((_, reject) => {
+        setTimeout(
+          () => reject(new Error('upstream was not reclaimed before the rejection timeout')),
+          PREVIEW_UPGRADE_REJECTION_TIMEOUT_MS + 3_000,
+        );
+      }),
+    ]);
+    await clientClosed;
+    expect(ctx.liveUpstream()).toBe(0);
+    expect(client.raw()).toBe('');
   });
 });
 

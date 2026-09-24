@@ -8,6 +8,14 @@ export interface GroupMemberBot extends GroupBot {
   inChat: boolean;
   hasRole?: boolean;
   error?: unknown;
+  pinStreamingCardMasterEnabled?: boolean;
+  pinStreamingCardChatEnabled?: boolean;
+  pinStreamingCardEffectiveEnabled?: boolean;
+  agentCliId?: string;
+  agentModel?: string;
+  agentReasoningEffort?: string;
+  serialInput?: boolean;
+  defaultModels?: import('../../core/group-default-models.js').GroupDefaultModels;
   oncallChat?: { workingDir?: string } | null;
 }
 
@@ -16,7 +24,63 @@ export interface GroupChat {
   name?: string;
   ownerId?: string | null;
   avatar?: string;
+  chatMode?: string;
+  sessionGroup?: boolean;
+  collaborationMode?: 'standard' | 'project';
+  projectCoordinatorAppId?: string;
+  projectWorkerAppIds?: string[];
+  projectAutoEnrollWorkers?: boolean;
+  projectProgressCard?: ProjectProgressCardConfig;
+  projectRuntime?: ProjectGroupRuntimeSummary;
   memberBots: GroupMemberBot[];
+}
+
+export type ProjectProgressCardTemplateId = 'status-dashboard' | 'compact-list';
+export type ProjectProgressCardSectionId = 'goal' | 'blockers' | 'workstreams' | 'milestones';
+
+export interface ProjectProgressCardConfig {
+  schemaVersion: 1;
+  templateId: ProjectProgressCardTemplateId;
+  sections: ProjectProgressCardSectionId[];
+  milestonesExpanded: boolean;
+}
+
+export function defaultProjectProgressCardConfig(): ProjectProgressCardConfig {
+  return {
+    schemaVersion: 1,
+    templateId: 'status-dashboard',
+    sections: ['goal', 'blockers', 'workstreams', 'milestones'],
+    milestonesExpanded: false,
+  };
+}
+
+export interface ProjectGroupRuntimeSummary {
+  status: 'active' | 'paused' | 'completed';
+  phase: string;
+  focus: string;
+  progress: number;
+  remaining: string;
+  workstreamCount: number;
+  completedWorkstreamCount: number;
+  blockerCount: number;
+  cardPinned: boolean;
+  updatedAt: string;
+}
+
+export interface GroupCollaborationModeResponse {
+  ok: boolean;
+  config: {
+    chatId: string;
+    mode: 'standard' | 'project';
+    coordinatorAppId?: string;
+    workerAppIds?: string[];
+    autoEnrollWorkers?: boolean;
+    progressCard?: ProjectProgressCardConfig;
+  };
+  project: ProjectGroupRuntimeSummary | null;
+  cardRefresh?: 'updated' | 'deferred' | 'not_needed';
+  cardRefreshError?: string;
+  error?: string;
 }
 
 export interface GroupsSnapshot {
@@ -40,7 +104,8 @@ let cachedSnapshot: GroupsSnapshot = emptyGroupsSnapshot;
 let cachedAt = 0;
 let inFlight: Promise<GroupsSnapshot> | null = null;
 let requestSeq = 0;
-let latestRequestSeq = 0;
+let latestSuccessfulRequestSeq = 0;
+let cacheEpoch = 0;
 
 function normalizeGroupsSnapshot(body: any): GroupsSnapshot {
   return {
@@ -52,6 +117,18 @@ function normalizeGroupsSnapshot(body: any): GroupsSnapshot {
 export function primeGroupsSnapshotCache(snapshot: GroupsSnapshot): void {
   cachedSnapshot = snapshot;
   cachedAt = Date.now();
+}
+
+export function __testOnly_resetGroupsSnapshotCache(): void {
+  cacheEpoch += 1;
+  cachedSnapshot = emptyGroupsSnapshot;
+  cachedAt = 0;
+  inFlight = null;
+  requestSeq = 0;
+  latestSuccessfulRequestSeq = 0;
+  cachedNames = emptyGroupsSnapshot;
+  cachedNamesAt = 0;
+  namesInFlight = null;
 }
 
 // ─── 名称/头像专用轻量缓存（与上面的完整矩阵缓存**完全分离**）──────────────
@@ -88,19 +165,22 @@ export async function fetchGroupsNamesSnapshot(
   if (!options.force && cachedNamesAt > 0 && now - cachedNamesAt <= cacheMs) return cachedNames;
   if (!options.force && namesInFlight) return namesInFlight;
 
+  const epoch = cacheEpoch;
   const request = (async () => {
     const r = await fetch('/api/groups?view=names');
     const body = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const snapshot = normalizeGroupsSnapshot(body);
-    cachedNames = snapshot;
-    cachedNamesAt = Date.now();
+    if (epoch === cacheEpoch) {
+      cachedNames = snapshot;
+      cachedNamesAt = Date.now();
+    }
     return snapshot;
   })();
 
   if (!options.force) {
     namesInFlight = request.finally(() => {
-      namesInFlight = null;
+      if (epoch === cacheEpoch) namesInFlight = null;
     });
     return namesInFlight;
   }
@@ -114,22 +194,71 @@ export async function fetchGroupsSnapshot(options: FetchGroupsSnapshotOptions = 
   if (!options.force && inFlight) return inFlight;
 
   const seq = ++requestSeq;
-  latestRequestSeq = seq;
+  const epoch = cacheEpoch;
   const request = (async () => {
     const r = await fetch(options.force ? '/api/groups?refresh=1' : '/api/groups');
     const body = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const snapshot = normalizeGroupsSnapshot(body);
-    if (seq === latestRequestSeq) primeGroupsSnapshotCache(snapshot);
+    if (epoch === cacheEpoch && seq > latestSuccessfulRequestSeq) {
+      primeGroupsSnapshotCache(snapshot);
+      latestSuccessfulRequestSeq = seq;
+    }
     return snapshot;
   })();
 
   if (!options.force) {
     inFlight = request.finally(() => {
-      inFlight = null;
+      if (epoch === cacheEpoch) inFlight = null;
     });
     return inFlight;
   }
 
   return request;
+}
+
+export async function setGroupPinStreamingCard(
+  chatId: string,
+  appId: string,
+  enabled: boolean,
+): Promise<{ ok: boolean; status: number; body: any }> {
+  const r = await fetch(
+    `/api/groups/${encodeURIComponent(chatId)}/pin-streaming-card/${encodeURIComponent(appId)}`,
+    {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    },
+  );
+  const body = await r.json().catch(() => ({}));
+  return { ok: r.ok && body?.ok !== false, status: r.status, body };
+}
+
+export async function fetchGroupCollaborationMode(chatId: string): Promise<GroupCollaborationModeResponse> {
+  const response = await fetch(`/api/groups/${encodeURIComponent(chatId)}/collaboration-mode`);
+  const body = await response.json().catch(() => ({})) as GroupCollaborationModeResponse;
+  if (!response.ok || body.ok === false) throw new Error(body.error ?? `HTTP ${response.status}`);
+  return body;
+}
+
+export async function saveGroupCollaborationMode(
+  chatId: string,
+  input:
+    | { mode: 'standard' }
+    | {
+        mode: 'project';
+        coordinatorAppId: string;
+        workerAppIds: string[];
+        autoEnrollWorkers: boolean;
+        progressCard: ProjectProgressCardConfig;
+      },
+): Promise<GroupCollaborationModeResponse> {
+  const response = await fetch(`/api/groups/${encodeURIComponent(chatId)}/collaboration-mode`, {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  const body = await response.json().catch(() => ({})) as GroupCollaborationModeResponse;
+  if (!response.ok || body.ok === false) throw new Error(body.error ?? `HTTP ${response.status}`);
+  return body;
 }

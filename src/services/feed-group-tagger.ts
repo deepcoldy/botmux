@@ -12,9 +12,18 @@
  * property of the GROUP itself, applied with the bot's own tenant token via
  * `im/v2/tags` + `im/v2/biz_entity_tag_relation`. No user OAuth involved; the
  * app needs the `im:tag:write` and `im:biz_entity_tag_relation:write` tenant
- * scopes (setup/lark-scopes.json lists both) — which some tenants' scope
- * catalogs don't offer at all, hence not the default. When a scope is missing
- * the bot DMs the owner a ready-to-click console enable link (throttled).
+ * scopes. ⚠️ Feishu has NOT opened that capability yet — API Explorer marks
+ * `im/v2/tags` "not available yet" (see #895, which demoted this mode from the
+ * default for the same reason). Consequence for setup: the two names map to
+ * nothing. Measured 2026-09-03 against our tenant's live catalog: 1076 entries,
+ * 67 of them `im:`, not one name containing "tag" (only docs/drive 密级标签
+ * matched /tag|label/). They are therefore deliberately absent from
+ * setup/lark-scopes.json: an unmappable name buys nothing — setup cannot apply
+ * for it either — and costs a "N scopes are not present in the Open Platform
+ * catalog" warning on every setup / scope self-heal. Re-add both if Feishu
+ * ships the capability. Until then the mode cannot work on any tenant whose
+ * catalog lacks them, hence not the default. When a scope is missing the bot
+ * DMs the owner a ready-to-click console enable link (throttled).
  *
  * Everything is best-effort and fire-and-forget: failures degrade to
  * "group created, not tagged" with a log line — never block a birth.
@@ -28,7 +37,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { getBot, getBotClient, effectiveBotDisplayName, type BotState } from '../bot-registry.js';
 import { config } from '../config.js';
-import { resolveUserToken, generateAuthUrl, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { resolveOwnerUserToken, generateAuthUrl, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
 import { larkHosts, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { sendUserMessage } from '../im/lark/client.js';
 import { t, localeForBot } from '../i18n/index.js';
@@ -475,6 +484,9 @@ async function maybeNudgeOwnerForAuth(larkAppId: string, ownerOpenId: string, re
       cfg.larkAppSecret,
       normalizeBrand(cfg.brand),
       FEED_GROUP_OAUTH_SCOPES,
+      // 飞书「消息分组」是 owner 自己的收件箱侧边栏，所以这个授权本就只能是他本人
+      // 的；归属写明 owner，别让它落到 per-app 文件里跟别人的 token 混在一起。
+      ownerOpenId,
     );
     const loc = localeForBot(larkAppId);
     await sendUserMessage(
@@ -677,7 +689,9 @@ async function tagViaFeedGroup(larkAppId: string, chatId: string, ownerOpenId: s
   const brand = normalizeBrand(cfg.brand);
   const host = larkHosts(brand).openApi;
 
-  const userToken = await resolveUserToken(cfg.larkAppId, cfg.larkAppSecret, brand);
+  // Owner 个人功能：飞书「消息分组」是 owner 自己的收件箱侧边栏，bot 没有收件箱，
+  // 所以这里始终用 owner 本人的 token，跟本轮消息是谁发的无关。
+  const userToken = await resolveOwnerUserToken(cfg.larkAppId, cfg.larkAppSecret, brand, ownerOpenId);
   if (!userToken) {
     logger.info(`[session-tag] no user token for ${larkAppId}; skip feed-group tagging ${chatId.substring(0, 12)}`);
     void maybeNudgeOwnerForAuth(larkAppId, ownerOpenId, 'no_token');
@@ -726,8 +740,8 @@ async function tagViaFeedGroup(larkAppId: string, chatId: string, ownerOpenId: s
 /**
  * Effective tag mode for a `sessionGroup.tag` config block. Default
  * `feed-group`: per-user message grouping usable on any tenant with a
- * one-time OAuth — unlike `chat-tag`, whose tenant scopes some tenants'
- * scope catalogs don't offer at all.
+ * one-time OAuth — unlike `chat-tag`, whose tenant scopes are missing from the
+ * scope catalog (Feishu hasn't opened the capability; see the file header).
  */
 export function resolveTagMode(
   tag: { mode?: 'chat-tag' | 'feed-group' | 'off' } | undefined,
