@@ -414,8 +414,50 @@ async function waitForSubmit(path: string, baseByte: number, timeoutMs: number):
   return false;
 }
 
-function makeSubmitFingerprint(content: string, len = 30): string | undefined {
-  const collapsed = normaliseForFingerprint(content);
+/** Strip BotMux system envelopes and metadata headers from prompt content
+ *  to extract the unique user payload for submit fingerprinting.
+ *
+ *  All BotMux turns share identical XML wrappers (<botmux_reminder>,
+ *  <botmux_routing>, <identity>, etc.) and header annotations ([用户引用了消息...],
+ *  [来自...的 @mention]). Using the raw envelope causes all sessions across
+ *  the machine to share the exact same 30-char fingerprint, leading to false-positive
+ *  submit confirmations against sibling/other sessions and leaving prompts
+ *  stuck unsubmitted in the CLI input box. */
+export function extractMessageContentForFingerprint(content: string): string {
+  if (typeof content !== 'string') return '';
+  const userMsgMatch = content.match(/<user_message>([\s\S]*?)<\/user_message>/);
+  if (userMsgMatch) {
+    const inner = userMsgMatch[1]
+      .replace(/^\[(?:用户引用了消息|来自)[^\]]*\]\s*/gm, '')
+      .trim();
+    if (inner.length > 0) return inner;
+    const rawInner = userMsgMatch[1].trim();
+    if (rawInner.length > 0) return rawInner;
+  }
+
+  let cleaned = content
+    .replace(/<botmux_routing>[\s\S]*?<\/botmux_routing>/g, '')
+    .replace(/<botmux_builtin_skills>[\s\S]*?<\/botmux_builtin_skills>/g, '')
+    .replace(/<identity>[\s\S]*?<\/identity>/g, '')
+    .replace(/<available_bots[\s\S]*?<\/available_bots>/g, '')
+    .replace(/<session_id>[\s\S]*?<\/session_id>/g, '')
+    .replace(/<role\b[\s\S]*?<\/role>/g, '')
+    .replace(/<botmux_reminder>[\s\S]*?<\/botmux_reminder>/g, '')
+    .replace(/<botmux_task\b[\s\S]*?<\/botmux_task>/g, '')
+    .replace(/<whiteboard\b[\s\S]*?<\/whiteboard>/g, '')
+    .replace(/<attachments>[\s\S]*?<\/attachments>/g, '')
+    .replace(/<mentions>[\s\S]*?<\/mentions>/g, '')
+    .replace(/<sender\b[\s\S]*?\/>/g, '')
+    .replace(/<sender\b[\s\S]*?<\/sender>/g, '')
+    .replace(/^\[(?:用户引用了消息|来自)[^\]]*\]\s*/gm, '')
+    .trim();
+
+  return cleaned.length > 0 ? cleaned : content.trim();
+}
+
+export function makeSubmitFingerprint(content: string, len = 30): string | undefined {
+  const payload = extractMessageContentForFingerprint(content);
+  const collapsed = normaliseForFingerprint(payload || content);
   return collapsed.length > 0 ? collapsed.substring(0, len) : undefined;
 }
 
@@ -561,8 +603,9 @@ export function findOpenClaudeSessionIds(pid: number, dataDir: string = DEFAULT_
 function findJsonlAcrossProjectsRoot(
   searchPath: string,
   fingerprint: string,
-  options: { minMtimeMs?: number; includeQueueOperations?: boolean },
+  options: { minMtimeMs?: number; minEventTimestampMs?: number; includeQueueOperations?: boolean },
 ): string | null {
+  if (fingerprint.length < 10) return null;
   const primaryDir = dirname(searchPath);
   const primary = findJsonlContainingFingerprint(primaryDir, fingerprint, {
     excludePath: searchPath,
@@ -1110,8 +1153,16 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         return buildResult(false, keybindings.failureReason ?? UNSUPPORTED_SUBMIT_KEY_FAILURE);
       }
 
+      // Normalize line breaks and strip invisible characters that would trigger
+      // Claude Code's "Removed X invisible characters · review and press Enter to send"
+      // barrier which blocks input submission on the first Enter.
+      const sanitizedContent = content
+        .replace(/\r\n/g, '\n')
+        .replace(/\r/g, '\n')
+        .replace(/[\u200B-\u200D\u2060\uFEFF\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '');
+
       if (pty.sendText && pty.sendSpecialKeys) {
-        const lines = content.split('\n');
+        const lines = sanitizedContent.split('\n');
         for (let i = 0; i < lines.length; i++) {
           if (lines[i].length > 0) {
             for (const chunk of chunkTextByUtf8Bytes(lines[i])) {
@@ -1133,7 +1184,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       } else {
         // Non-tmux fallback (raw PTY): bracketed paste is reliable here since
         // we control the markers directly.
-        pty.write('\x1b[200~' + content + '\x1b[201~');
+        pty.write('\x1b[200~' + sanitizedContent + '\x1b[201~');
       }
       await delay(submitDelay);
       if (!sendSubmit()) {
@@ -1175,7 +1226,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
             const newPath = pty.claudeJsonlPath;
             const rotatedBaseByte = switched && newPath ? currentFileSize(newPath) : baseByte;
             if (switched && newPath && submitFingerprint) {
-              if (jsonlContainsFingerprint(newPath, submitFingerprint, { includeQueueOperations: true })) {
+              if (jsonlContainsFingerprint(newPath, submitFingerprint, {
+                includeQueueOperations: true,
+                minEventTimestampMs: submitSearchMinMtime,
+              })) {
                 // Sync baseByte to end-of-file so subsequent confirms in
                 // this writeInput pass don't re-trigger on the same line.
                 baseByte = currentFileSize(newPath);
@@ -1203,6 +1257,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
           const matched = findJsonlContainingFingerprint(dirname(searchPath), submitFingerprint, {
             excludePath: searchPath,
             minMtimeMs: submitSearchMinMtime,
+            minEventTimestampMs: submitSearchMinMtime,
             includeQueueOperations: true,
           });
           if (matched) {
@@ -1240,6 +1295,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       if (submitFingerprint && pty.claudeJsonlPath) {
         const matched = findJsonlAcrossProjectsRoot(pty.claudeJsonlPath, submitFingerprint, {
           minMtimeMs: submitSearchMinMtime,
+          minEventTimestampMs: submitSearchMinMtime,
           includeQueueOperations: true,
         });
         if (matched) {
@@ -1265,7 +1321,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
           if (resolved) applyResolved(resolved);
         }
         const currentPath = pty.claudeJsonlPath;
-        if (currentPath && jsonlContainsFingerprint(currentPath, submitFingerprint, { includeQueueOperations: true })) {
+        if (currentPath && jsonlContainsFingerprint(currentPath, submitFingerprint, {
+          includeQueueOperations: true,
+          minEventTimestampMs: submitSearchMinMtime,
+        })) {
           return true;
         }
         // Fan out to sibling jsonls in the project dir, then across every
@@ -1277,6 +1336,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         if (!searchPath) return false;
         const matched = findJsonlAcrossProjectsRoot(searchPath, submitFingerprint, {
           minMtimeMs: submitSearchMinMtime,
+          minEventTimestampMs: submitSearchMinMtime,
           includeQueueOperations: true,
         });
         return !!matched;

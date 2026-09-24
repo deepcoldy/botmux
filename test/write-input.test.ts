@@ -66,6 +66,8 @@ import {
   CLAUDE_INPUT_CHUNK_BYTES,
   chunkTextByUtf8Bytes,
   createClaudeCodeAdapter,
+  extractMessageContentForFingerprint,
+  makeSubmitFingerprint,
 } from '../src/adapters/cli/claude-code.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
@@ -1294,6 +1296,130 @@ describe('claude-code writeInput submission confirmation', () => {
       JSON.stringify({ type: 'user', message: { role: 'user', content: 'slow hook still running' } }) + '\n',
     );
     expect(recheck()).toBe(true);  // Now the worker suppresses the warning
+  });
+
+  it('extractMessageContentForFingerprint strips envelopes and metadata to isolate user payload', () => {
+    const prompt = `<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>
+
+<user_message>
+[用户引用了消息 用 botmux quoted om_123456 查看]
+[来自 协作Bot 的 @mention]
+19e7f5f94 复验通过，14 可以关闭，本轮设计复验收口。
+</user_message>`;
+
+    const payload = extractMessageContentForFingerprint(prompt);
+    expect(payload).toBe('19e7f5f94 复验通过，14 可以关闭，本轮设计复验收口。');
+
+    const fp = makeSubmitFingerprint(prompt, 30);
+    expect(fp).toBe('19e7f5f94 复验通过，14 可以关闭，本轮设计复验收口。'.substring(0, 30));
+    expect(fp).not.toContain('botmux_reminder');
+  });
+
+  it('makeSubmitFingerprint generates distinct fingerprints for prompts with identical botmux_reminder envelopes', () => {
+    const reminder = '<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>';
+    const promptA = `${reminder}\n\n<user_message>First user instruction for session A</user_message>`;
+    const promptB = `${reminder}\n\n<user_message>Second user instruction for session B</user_message>`;
+
+    const fpA = makeSubmitFingerprint(promptA);
+    const fpB = makeSubmitFingerprint(promptB);
+
+    expect(fpA).not.toBe(fpB);
+    expect(fpA).toContain('First user instruction');
+    expect(fpB).toContain('Second user instruction');
+  });
+
+  it('writeInput sanitizes CRLF and invisible characters before typing into tmux pane', async () => {
+    const cwd = '/tmp/sanitized-input';
+    const sessionId = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+    const path = makeJsonlForSession('sanitized-input', sessionId, cwd);
+    writeClaudePidFile(44444, { sessionId, cwd });
+
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    const sentChunks: string[] = [];
+    const pty: PtyHandle = {
+      claudeJsonlPath: path,
+      cliPid: 44444,
+      cliCwd: cwd,
+      write: vi.fn(),
+      sendText: vi.fn((chunk: string) => {
+        sentChunks.push(chunk);
+      }),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key === 'Enter') {
+          appendFileSync(
+            path,
+            JSON.stringify({ type: 'user', message: { role: 'user', content: 'clean line 1\nclean line 2' } }) + '\n',
+          );
+        }
+      }),
+    };
+
+    // Prompt contains Windows CRLF (\r\n) and invisible zero-width space (\u200B) and BOM (\uFEFF)
+    const rawContent = 'clean\u200B line 1\r\nclean\uFEFF line 2';
+    const result = await adapter.writeInput(pty, rawContent);
+
+    expect(result).toEqual({ submitted: true, cliSessionId: sessionId });
+    // Verify no \r was sent via sendText
+    for (const chunk of sentChunks) {
+      expect(chunk).not.toContain('\r');
+      expect(chunk).not.toContain('\u200B');
+      expect(chunk).not.toContain('\uFEFF');
+    }
+  });
+
+  it('writeInput does not false-match sibling session JSONL sharing the same botmux_reminder envelope', async () => {
+    const cwd = '/tmp/sibling-jsonl-nomatch';
+    const sidA = 'aaaaaaaa-1111-4111-8111-111111111111';
+    const sidB = 'bbbbbbbb-2222-4222-8222-222222222222';
+    const pathA = makeJsonlForSession('sibling-jsonl-nomatch', sidA, cwd);
+    const pathB = makeJsonlForSession('sibling-jsonl-nomatch', sidB, cwd);
+
+    const reminder = '<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>';
+    const promptA = `${reminder}\n\n<user_message>Session A specific prompt text</user_message>`;
+    const promptB = `${reminder}\n\n<user_message>Session B specific prompt text</user_message>`;
+
+    // Sibling session B recently logged its own turn with the same reminder envelope
+    writeFileSync(
+      pathB,
+      JSON.stringify({
+        type: 'user',
+        timestamp: new Date().toISOString(),
+        message: { role: 'user', content: promptB },
+      }) + '\n',
+    );
+
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    let enterCount = 0;
+    const pty: PtyHandle = {
+      claudeJsonlPath: pathA,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter') return;
+        enterCount++;
+        // Enter 1 & 2 are soft-newlines during typing (promptA has 2 newlines).
+        // Enter 3 is the initial submit Enter (simulates review barrier / swallowed Enter -> no write to pathA).
+        // Enter 4 is retry submit Enter -> Claude logs the submit to pathA.
+        if (enterCount >= 4) {
+          appendFileSync(
+            pathA,
+            JSON.stringify({
+              type: 'user',
+              timestamp: new Date().toISOString(),
+              message: { role: 'user', content: promptA },
+            }) + '\n',
+          );
+        }
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, promptA);
+
+    // It should NOT match pathB on the first submit Enter.
+    // It must retry Enter and succeed on pathA on the second submit Enter.
+    expect(result).toBeUndefined();
+    expect(pty.claudeJsonlPath).toBe(pathA);
+    expect(enterCount).toBe(4);
   });
 });
 
