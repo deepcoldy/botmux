@@ -1743,48 +1743,60 @@ describe('codex-app-runner app-server protocol integration', { timeout: 120_000,
     const harness = startRunner(fakeCodex, dir, logPath, '0.144.6', 'success', control.bootstrap.path, {
       env: { FAKE_CODEX_PID_PATH: pidPath, FAKE_CODEX_INHERITED_STDIO: exitMode },
     });
-    const inputs = ['om_before_exit', 'om_after_exit', 'om_after_second_exit'];
+    const inputs = [
+      { turnId: 'om_before_exit', generation: 1, answer: 'fake answer 1' },
+      { turnId: 'om_after_exit', generation: 2, answer: 'fake answer 1' },
+      { turnId: 'om_next', generation: 2, answer: 'fake answer 2' },
+      { turnId: 'om_after_second_exit', generation: 3, answer: 'fake answer 1' },
+      { turnId: 'om_final', generation: 3, answer: 'fake answer 2' },
+    ];
     const exitLog = exitMode === 'exit'
       ? 'app-server exited (code=0, signal=null)'
       : 'app-server exited (code=null, signal=SIGTERM)';
     let stage = 'initial idle';
+    let currentGeneration = 1;
     try {
-      for (const [index, turnId] of inputs.entries()) {
-        stage = `generation ${index + 1}: idle`;
+      for (const [index, { turnId, generation, answer }] of inputs.entries()) {
+        stage = `generation ${generation}: idle`;
         await waitFor(harness, () => control.states.at(-1)?.busy === false);
-        if (index > 0) {
-          stage = `generation ${index}: process exit`;
+        if (generation > currentGeneration) {
+          stage = `generation ${currentGeneration}: process exit`;
           process.kill(Number(readFileSync(pidPath, 'utf8')), 'SIGTERM');
-          await waitFor(harness, () => harness.stdout.split(exitLog).length - 1 === index);
+          await waitFor(harness, () => harness.stdout.split(exitLog).length - 1 === currentGeneration);
+          // 父进程已退出，后代仍持有旧连接的 stdio。
+          expect(process.kill(readRequests(logPath).filter(r => r.stdioHolderPid)[currentGeneration - 1].stdioHolderPid, 0)).toBe(true);
         }
         harness.child.stdin.write(`${CONTROL_PREFIX}${encodeRunnerInput(turnId, { text: turnId }, turnId)}\r`);
-        if (index > 0) {
-          stage = `generation ${index + 1}: initialize`;
-          await waitFor(harness, () => readRequests(logPath).filter(r => r.method === 'initialize').length === index + 1);
+        if (generation > currentGeneration) {
+          stage = `generation ${generation}: initialize`;
+          await waitFor(harness, () => readRequests(logPath).filter(r => r.method === 'initialize').length === generation);
           // 换代后旧管道仍可能收到缓冲的服务端请求，必须直接忽略。
-          process.kill(readRequests(logPath).filter(r => r.stdioHolderPid)[index - 1].stdioHolderPid, 'SIGUSR1');
-          stage = `generation ${index}: stale request`;
-          await waitFor(harness, () => readRequests(logPath).filter(r => r.staleRequestSent).length === index);
+          process.kill(readRequests(logPath).filter(r => r.stdioHolderPid)[currentGeneration - 1].stdioHolderPid, 'SIGUSR1');
+          stage = `generation ${currentGeneration}: stale request`;
+          await waitFor(harness, () => readRequests(logPath).filter(r => r.staleRequestSent).length === currentGeneration);
+          currentGeneration = generation;
         }
-        stage = `generation ${index + 1}: final`;
+        stage = `generation ${generation}: final`;
         await waitFor(harness, () => control.finals.length === index + 1
           || control.markers.some(m => m.kind === 'lifecycle' && m.payload.kind === 'fatal'));
         expect(control.markers.filter(m => m.kind === 'lifecycle' && m.payload.kind === 'fatal')).toEqual([]);
         expect(control.finals).toHaveLength(index + 1);
-        expect(control.finals[index]).toMatchObject({ turnId, content: expect.stringContaining('fake answer 1') });
+        expect(control.finals[index]).toMatchObject({ turnId, content: expect.stringContaining(answer) });
         // 每一代的后代仍存活，恢复确实发生在 stdio 关闭之前。
-        stage = `generation ${index + 1}: stdio holder ready`;
-        await waitFor(harness, () => readRequests(logPath).filter(r => r.stdioHolderPid).length === index + 1);
+        stage = `generation ${generation}: stdio holder ready`;
+        await waitFor(harness, () => readRequests(logPath).filter(r => r.stdioHolderPid).length === generation);
         const holders = readRequests(logPath).filter(r => r.stdioHolderPid);
-        expect(holders).toHaveLength(index + 1);
+        expect(holders).toHaveLength(generation);
         for (const holder of holders) expect(process.kill(holder.stdioHolderPid, 0)).toBe(true);
+        expect(readRequests(logPath).filter(r => r.method === 'initialize')).toHaveLength(generation);
       }
       const requests = readRequests(logPath);
       expect(requests.filter(r => r.method === 'initialize')).toHaveLength(3);
       expect(requests.filter(r => r.method === 'thread/start')).toHaveLength(1);
       expect(requests.filter(r => r.method === 'thread/resume').map(r => r.params.threadId))
         .toEqual(['thread-fake', 'thread-fake']);
-      expect(requests.filter(r => r.method === 'turn/start').map(r => r.params.input[0].text)).toEqual(inputs);
+      expect(requests.filter(r => r.method === 'turn/start').map(r => r.params.input[0].text))
+        .toEqual(inputs.map(input => input.turnId));
     } catch (error) {
       throw new Error(`Idle recovery failed at ${stage}`, { cause: error });
     } finally {
