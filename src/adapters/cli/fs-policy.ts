@@ -809,7 +809,20 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   if (roleLibGrant) push([ctx.roleLibrarySubtree!], roleLibGrant, 'internal');
   push(ctx.outbox ? [ctx.outbox] : [], 'readWrite', 'internal');
   push(dropAuthority(ctx.extraWritePaths), 'readWrite', 'internal');
-  push(dropAuthority(ctx.readonlyRoots), 'readOnly', 'internal');
+  // The session's OWN runtime skill plugin (`runtime-skills/<sessionId>/claude-plugin`,
+  // passed to the CLI via --plugin-dir) is exempt from dropAuthority. It lives
+  // under the botmux data dir, so a no-transport turn would otherwise drop it and
+  // the model would see the skill names in its prompt but fail to read any
+  // SKILL.md. The daemon writes it from the skill registry for this session only;
+  // it holds no Feishu credential. Exact-path match: sibling sessions' plugin
+  // dirs and the rest of the data dir stay behind the authority deny.
+  const ownSkillPluginDir = ctx.sessionId
+    ? normalizeFsPath(`${ctx.sessionDataDir}/runtime-skills/${ctx.sessionId}/claude-plugin`)
+    : null;
+  const isOwnSkillPluginDir = (p: string): boolean =>
+    ownSkillPluginDir !== null && normalizeFsPath(p) === ownSkillPluginDir;
+  push((ctx.readonlyRoots ?? []).filter(isOwnSkillPluginDir), 'readOnly', 'internal');
+  push(dropAuthority((ctx.readonlyRoots ?? []).filter(p => !isOwnSkillPluginDir(p))), 'readOnly', 'internal');
   // Own routing metadata (`botmux send` reply routing) — read-only. The store
   // is SQLite in its own per-bot DIRECTORY: the dir grant is deliberate — a
   // single-file bwrap bind pins the inode, and SQLite deletes/recreates

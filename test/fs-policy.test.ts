@@ -1174,6 +1174,27 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-sends/s.jsonl').access).toBe('readWrite');
   });
 
+  it('keeps the OWN runtime skill plugin dir readOnly under no-transport (siblings and other readonlyRoots stay dropped)', () => {
+    const own = '/Users/u/.botmux/data/runtime-skills/s/claude-plugin';
+    const sibling = '/Users/u/.botmux/data/runtime-skills/other/claude-plugin';
+    const p = noTransport({ readonlyRoots: [own, sibling, '/Users/u/.botmux/data'] });
+    expect(accessForPath(p.rules, `${own}/skills/x/SKILL.md`).access).toBe('readOnly');
+    expect(accessForPath(p.rules, `${sibling}/skills/x/SKILL.md`).access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/runtime-skills/other').access).toBe('deny');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('deny');
+    expect(p.suppressedAuthorityPaths).toEqual(expect.arrayContaining([sibling, '/Users/u/.botmux/data']));
+    expect(p.suppressedAuthorityPaths).not.toContain(own);
+    // Trailing slash still matches; a sessionId-less policy gets no exemption.
+    expect(accessForPath(noTransport({ readonlyRoots: [`${own}/`] }).rules, `${own}/x`).access).toBe('readOnly');
+    expect(accessForPath(noTransport({ sessionId: undefined, readonlyRoots: [own] }).rules, `${own}/x`).access).toBe('deny');
+  });
+
+  it('never lets a no-transport skill-plugin grant become writable', () => {
+    const own = '/Users/u/.botmux/data/runtime-skills/s/claude-plugin';
+    const p = noTransport({ readonlyRoots: [own] });
+    expect(accessForPath(p.rules, `${own}/skills/x/SKILL.md`).access).not.toBe('readWrite');
+  });
+
   it('denies Feishu authority (bots.json / lark-cli stores / sibling BOT_HOME) even with workingDir=~', () => {
     const p = noTransport();
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('deny');
