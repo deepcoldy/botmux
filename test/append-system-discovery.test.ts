@@ -401,5 +401,74 @@ describe('append-system-discovery', () => {
         rmSync(home, { recursive: true, force: true });
       }
     });
+
+    it('respects disabledProviders in default profile agent/config.yml', () => {
+      const cwd = mkdtempSync(join(tmpdir(), 'omp-disc-cwd-'));
+      const home = mkdtempSync(join(tmpdir(), 'omp-disc-home-'));
+      const claudeDir = mkdtempSync(join(tmpdir(), 'omp-claude-dir-'));
+      try {
+        const agentDir = join(home, '.omp', 'agent');
+        mkdirSync(agentDir, { recursive: true });
+        writeFileSync(join(agentDir, 'config.yml'), 'disabledProviders:\n  - claude\n');
+        writeFileSync(join(claudeDir, 'APPEND_SYSTEM.md'), 'CLAUDE_ACTIVE_RULES');
+
+        const result = discoverOmpAppendSystemPrompt({
+          cwd,
+          homeDir: home,
+          env: { CLAUDE_CONFIG_DIR: claudeDir },
+        });
+        expect(result).toBeUndefined();
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+        rmSync(home, { recursive: true, force: true });
+        rmSync(claudeDir, { recursive: true, force: true });
+      }
+    });
+
+    it('respects disabledProviders in named profile agent/config.yml', () => {
+      const cwd = mkdtempSync(join(tmpdir(), 'omp-disc-cwd-'));
+      const home = mkdtempSync(join(tmpdir(), 'omp-disc-home-'));
+      const claudeDir = mkdtempSync(join(tmpdir(), 'omp-claude-dir-'));
+      try {
+        const agentDir = join(home, '.omp', 'profiles', 'work', 'agent');
+        mkdirSync(agentDir, { recursive: true });
+        writeFileSync(join(agentDir, 'config.yml'), 'disabledProviders:\n  - claude\n');
+        writeFileSync(join(claudeDir, 'APPEND_SYSTEM.md'), 'CLAUDE_ACTIVE_RULES');
+
+        const result = discoverOmpAppendSystemPrompt({
+          cwd,
+          homeDir: home,
+          env: { CLAUDE_CONFIG_DIR: claudeDir, OMP_PROFILE: 'work' },
+        });
+        expect(result).toBeUndefined();
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+        rmSync(home, { recursive: true, force: true });
+        rmSync(claudeDir, { recursive: true, force: true });
+      }
+    });
+
+    it('respects disabledProviders in project .omp/config.yml', () => {
+      const cwd = mkdtempSync(join(tmpdir(), 'omp-disc-cwd-'));
+      const home = mkdtempSync(join(tmpdir(), 'omp-disc-home-'));
+      const claudeDir = mkdtempSync(join(tmpdir(), 'omp-claude-dir-'));
+      try {
+        const projectOmp = join(cwd, '.omp');
+        mkdirSync(projectOmp, { recursive: true });
+        writeFileSync(join(projectOmp, 'config.yml'), 'disabledProviders:\n  - claude\n');
+        writeFileSync(join(claudeDir, 'APPEND_SYSTEM.md'), 'CLAUDE_ACTIVE_RULES');
+
+        const result = discoverOmpAppendSystemPrompt({
+          cwd,
+          homeDir: home,
+          env: { CLAUDE_CONFIG_DIR: claudeDir },
+        });
+        expect(result).toBeUndefined();
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+        rmSync(home, { recursive: true, force: true });
+        rmSync(claudeDir, { recursive: true, force: true });
+      }
+    });
   });
 });

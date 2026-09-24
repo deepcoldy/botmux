@@ -53,15 +53,24 @@ export function piTurnBoundaryExtensionPath(): string | undefined {
 /** Materializes the embedded turn-boundary extension JS file into
  *  `PI_PLUGIN_DIR/extensions/pi-turn-boundary-extension.js`. */
 export function materializePiTurnBoundaryExtension(): string | undefined {
+  const extDir = join(PI_PLUGIN_DIR, 'extensions');
+  const extPath = join(extDir, 'pi-turn-boundary-extension.js');
   try {
-    const extDir = join(PI_PLUGIN_DIR, 'extensions');
-    const extPath = join(extDir, 'pi-turn-boundary-extension.js');
     if (!existsSync(extPath) || readFileSync(extPath, 'utf8') !== PI_TURN_BOUNDARY_EXTENSION_SOURCE) {
       mkdirSync(extDir, { recursive: true, mode: 0o755 });
       writeFileSync(extPath, PI_TURN_BOUNDARY_EXTENSION_SOURCE, { encoding: 'utf8', mode: 0o644 });
     }
     return extPath;
   } catch {
+    // If writing fails (e.g. read-only mount) but a readable copy is already present on disk, use it
+    if (existsSync(extPath)) {
+      try {
+        readFileSync(extPath, 'utf8');
+        return extPath;
+      } catch {
+        // unreadable
+      }
+    }
     return undefined;
   }
 }
@@ -177,7 +186,10 @@ export function buildPiArgs(opts: {
  *       custom-tool `terminate:true` gap).
  *    3. Post-idle: `idleToBusyPattern` flips a falsely published ready back to
  *       working when `Working...` reappears. */
-export function createPiAdapter(pathOverride?: string): CliAdapter {
+export function createPiAdapter(
+  pathOverride?: string,
+  resolveExtensionPath: () => string | undefined = piTurnBoundaryExtensionPath,
+): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'pi');
   return {
     id: 'pi',
@@ -216,25 +228,22 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
 
       // Inject the Botmux routing prompt into the process environment so that
       // pi-turn-boundary-extension can append it during `before_agent_start`.
-      // We deliberately do NOT pass `--append-system-prompt` via argv when the
-      // extension is loaded: Pi's CLI disables native automatic discovery of
-      // project/user APPEND_SYSTEM.md whenever `--append-system-prompt` is present
-      // on argv, and ahead-of-time argv cannot predict runtime project trust decisions.
-      // Appending via the extension after native discovery completes preserves 100%
-      // faithful native project trust resolution while cleanly injecting Botmux rules.
-      const turnBoundaryExt = piTurnBoundaryExtensionPath();
-      const appendPrompts: string[] = [];
+      // We deliberately do NOT pass `--append-system-prompt` via argv: Pi's CLI
+      // disables native automatic discovery of project/user APPEND_SYSTEM.md
+      // whenever `--append-system-prompt` is present on argv, and ahead-of-time argv
+      // cannot predict runtime project trust decisions. Appending via the extension
+      // after native discovery completes preserves 100% faithful native project trust
+      // resolution while cleanly injecting Botmux rules.
+      const turnBoundaryExt = resolveExtensionPath();
+      if (!turnBoundaryExt) {
+        throw new Error(
+          'Failed to resolve or materialize Pi turn-boundary extension; ' +
+          'refusing to start without extension to avoid suppressing native APPEND_SYSTEM.md discovery',
+        );
+      }
 
-      if (turnBoundaryExt) {
-        if (env && botmuxAppendPrompt) {
-          env.BOTMUX_APPEND_SYSTEM_PROMPT = botmuxAppendPrompt;
-        }
-      } else {
-        // Fallback when extension cannot be materialized: pass via --append-system-prompt
-        // so system prompt is never lost even if boundary tracking degrades.
-        if (botmuxAppendPrompt) {
-          appendPrompts.push(botmuxAppendPrompt);
-        }
+      if (env && botmuxAppendPrompt) {
+        env.BOTMUX_APPEND_SYSTEM_PROMPT = botmuxAppendPrompt;
       }
 
       return buildPiArgs({
@@ -245,7 +254,6 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
         turnBoundaryExtension: turnBoundaryExt,
         builtinSkillsDir: PI_BUILTIN_SKILLS_DIR,
         skillPluginDir,
-        appendSystemPrompt: appendPrompts.length ? appendPrompts : undefined,
       });
     },
 

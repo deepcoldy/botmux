@@ -2100,7 +2100,7 @@ describe('pi buildArgs', () => {
     }
   });
 
-  it('falls back to --append-system-prompt when turnBoundaryExtension is undefined', () => {
+  it('buildPiArgs supports appendSystemPrompt when explicitly passed', () => {
     const args = buildPiArgs({
       sessionId: 'sess-pi',
       turnBoundaryExtension: undefined,
@@ -2109,6 +2109,14 @@ describe('pi buildArgs', () => {
     expect(args).not.toContain('--extension');
     expect(args).toContain('--append-system-prompt');
     expect(args).toContain('<botmux_routing>fallback rules</botmux_routing>');
+  });
+
+  it('throws when turnBoundaryExtension cannot be resolved or materialized', () => {
+    const adapterFailing = createPiAdapter('/bin/pi', () => undefined);
+    expect(() => adapterFailing.buildArgs({
+      sessionId: 'sess-pi-fail',
+      resume: false,
+    })).toThrow(/Failed to resolve or materialize Pi turn-boundary extension/);
   });
 
   const defaultPiCoreCandidate = '/root/.local/share/fnm/node-versions/v22.21.1/installation/lib/node_modules/@earendil-works/pi-coding-agent/dist/core';

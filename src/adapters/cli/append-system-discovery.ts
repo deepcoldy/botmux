@@ -1,6 +1,24 @@
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
+import YAML from 'yaml';
+
+function parseConfigFile(filePath: string): any {
+  if (!existsSync(filePath)) return undefined;
+  try {
+    const raw = readFileSync(filePath, 'utf-8');
+    if (filePath.endsWith('.json')) {
+      try {
+        return JSON.parse(raw);
+      } catch {
+        return YAML.parse(raw);
+      }
+    }
+    return YAML.parse(raw);
+  } catch {
+    return undefined;
+  }
+}
 
 export interface DiscoveredAppendPrompt {
   readonly path: string;
@@ -226,11 +244,12 @@ export function discoverOmpAppendSystemPrompt(opts?: {
   }
 
   // 2. User level candidates (active OMP profile agent dir)
-  const configDir = opts?.configDir || env.PI_CONFIG_DIR || '.omp';
+  const rawConfigDir = opts?.configDir || env.PI_CONFIG_DIR || '.omp';
+  const configRoot = isAbsolute(rawConfigDir) ? rawConfigDir : join(home, rawConfigDir);
   const profile = opts?.profile ?? resolveOmpProfileEnv(env.OMP_PROFILE, env.PI_PROFILE);
   const userAgentDir = profile
-    ? join(home, configDir, 'profiles', profile, 'agent')
-    : join(home, configDir, 'agent');
+    ? join(configRoot, 'profiles', profile, 'agent')
+    : join(configRoot, 'agent');
 
   const candidate = join(userAgentDir, 'APPEND_SYSTEM.md');
   if (existsSync(candidate)) {
@@ -242,7 +261,7 @@ export function discoverOmpAppendSystemPrompt(opts?: {
   }
 
   // 3. Foreign user config directories (.claude, .codex, .gemini)
-  // Aligned with OMP's `isUserSourceEnabled`:
+  // Aligned with OMP 18.2.11 Settings & `isUserSourceEnabled`:
   // - disabledProviders takes absolute precedence (returns false).
   // - explicit enabledProviders (or wildcard '*' / 'all') enables the provider.
   // - CLAUDE_CONFIG_DIR enables claude (unless claude is disabled).
@@ -257,26 +276,32 @@ export function discoverOmpAppendSystemPrompt(opts?: {
     for (const p of opts.disabledProviders) disabledProviders.add(p.trim().toLowerCase());
   }
 
-  const settingsCandidates = [
-    isAbsolute(configDir) ? join(configDir, 'settings.json') : join(home, configDir, 'settings.json'),
-    join(cwd, isAbsolute(configDir) ? '.omp' : configDir, 'settings.json'),
+  // OMP Settings loads YAML/JSON configs from:
+  // 1. Active profile's agent directory (e.g. ~/.omp/agent/config.yml or ~/.omp/profiles/<name>/agent/config.yml)
+  // 2. Project directory (e.g. <cwd>/.omp/config.yml)
+  // 3. Legacy / root fallbacks
+  const settingsCandidates: string[] = [
+    join(userAgentDir, 'config.yml'),
+    join(userAgentDir, 'config.yaml'),
+    join(userAgentDir, 'settings.json'),
+    join(cwd, '.omp', 'config.yml'),
+    join(cwd, '.omp', 'config.yaml'),
+    join(cwd, '.omp', 'settings.json'),
+    join(configRoot, 'config.yml'),
+    join(configRoot, 'config.yaml'),
+    join(configRoot, 'settings.json'),
   ];
   for (const settingsFile of settingsCandidates) {
-    if (existsSync(settingsFile)) {
-      try {
-        const parsed = JSON.parse(readFileSync(settingsFile, 'utf-8'));
-        if (Array.isArray(parsed.enabledProviders)) {
-          for (const p of parsed.enabledProviders) {
-            if (typeof p === 'string') enabledProviders.add(p.trim().toLowerCase());
-          }
-        }
-        if (Array.isArray(parsed.disabledProviders)) {
-          for (const p of parsed.disabledProviders) {
-            if (typeof p === 'string') disabledProviders.add(p.trim().toLowerCase());
-          }
-        }
-      } catch {
-        // ignore parse failure
+    const parsed = parseConfigFile(settingsFile);
+    if (!parsed || typeof parsed !== 'object') continue;
+    if (Array.isArray(parsed.enabledProviders)) {
+      for (const p of parsed.enabledProviders) {
+        if (typeof p === 'string') enabledProviders.add(p.trim().toLowerCase());
+      }
+    }
+    if (Array.isArray(parsed.disabledProviders)) {
+      for (const p of parsed.disabledProviders) {
+        if (typeof p === 'string') disabledProviders.add(p.trim().toLowerCase());
       }
     }
   }
