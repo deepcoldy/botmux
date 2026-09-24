@@ -7,6 +7,12 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const daemonSource = readFileSync(join(__dirname, '..', 'src', 'daemon.ts'), 'utf8');
 
 describe('daemon per-turn reply sender + participant wiring', () => {
+  it('wires delayed raw-input credential preparation into worker-pool startup', () => {
+    expect(daemonSource).toContain(
+      'prepareRawInputTurn: (ds, turnId) => prepareTurnCliIdentity(ds, turnId),',
+    );
+  });
+
   it('computes a turn window per path and binds participants + incomplete', () => {
     // passthrough (raw command → sender-only window)
     expect(daemonSource).toContain('buildTurnParticipants(larkAppId, turn.senderOpenId, turn.senderIsBot, undefined)');
@@ -41,8 +47,10 @@ describe('daemon per-turn reply sender + participant wiring', () => {
     // 所以逐条钉住「值来自 inbound 本身」，而不是只钉「字段存在」。
     const inThreadFromInbound = /inThread: !!parsed\.threadId/g;
     // initial passthrough / new-topic / existing-session / auto-create 四条
-    // beginReplyTargetTurn 直连路径，外加 passthrough 经 turn 结构体的透传。
-    expect(daemonSource.match(inThreadFromInbound) ?? []).toHaveLength(5);
+    // beginReplyTargetTurn 直连路径，外加 passthrough 经 turn 结构体的透传；
+    // 跨 principal 的 daemon 预分流、principal-lane suggestion 与 worker
+    // 拒绝回流三条 durable envelope 同样必须保留 inbound 的真实 thread 形态。
+    expect(daemonSource.match(inThreadFromInbound) ?? []).toHaveLength(8);
     expect(daemonSource).toMatch(/participants: initialWindow\.participants, participantsIncomplete: initialWindow\.incomplete, inThread: !!parsed\.threadId/);
     expect(daemonSource).toMatch(/participants: newTopicWindow\.participants, participantsIncomplete: newTopicWindow\.incomplete, inThread: !!parsed\.threadId/);
     expect(daemonSource).toMatch(/participants: existingWindow\.participants, participantsIncomplete: existingWindow\.incomplete, inThread: !!parsed\.threadId/);
@@ -102,6 +110,9 @@ describe('daemon per-turn reply sender + participant wiring', () => {
     // Both callers pass a cross-ref-resolved is-bot, kept separate from quota's botSender.
     expect(daemonSource).toMatch(/botSender: isBotSenderType,\n[\s\S]{0,400}senderIsBot: isForeignBotSender,/);
     expect(daemonSource).toMatch(/botSender: isBotSenderType \|\| isForeignBot,\n[\s\S]{0,400}senderIsBot: isBotSenderType \|\| isForeignBot,/);
+  });
+
+  it('keeps the source DM id separate from the generated session-group turn id', () => {
   });
 
   it('does not invent a sender for scheduled or system-created turns', () => {

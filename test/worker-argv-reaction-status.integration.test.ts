@@ -61,6 +61,52 @@ async function waitForScreenUpdates(
   );
 }
 
+/** Wait until the screen_update stream has SETTLED on idle: the newest update is
+ *  idle and stays idle across a quiet window.
+ *
+ *  Why this exists instead of `waitForScreenUpdates(..., u => u.status === 'idle')`:
+ *  on an argv-baked first turn the worker legitimately publishes
+ *  `working -> idle -> working -> idle`. The middle idle is the startup-window
+ *  false idle that the worker itself rejects and re-arms (see `src/worker.ts`,
+ *  "re-arming idle detector"), so "an idle has been seen" and "the turn ended
+ *  idle" are different statements. Waiting for the first idle while asserting on
+ *  the LAST update only agrees while every trailing update happens to arrive in
+ *  one IPC batch: locally all three land in the same millisecond, so the poll
+ *  always observes the settled tail and the test passes. Under CI contention that
+ *  batch splits, the poll can wake between the re-armed `working` and the final
+ *  `idle`, and the tail assertion reads `working` -- a CI-only failure with no
+ *  product-side cause. Settling on the tail removes the dependency on delivery
+ *  batching and is strictly stronger: a transient idle is followed by the re-armed
+ *  `working` well inside the quiet window, so it can no longer end the wait. */
+async function waitForSettledIdle(
+  child: ChildProcess,
+  messages: WorkerToDaemon[],
+  logs: string[],
+  quietMs = 500,
+): Promise<Array<Extract<WorkerToDaemon, { type: 'screen_update' }>>> {
+  const deadline = Date.now() + 10_000;
+  let idleSince: number | undefined;
+  while (Date.now() < deadline) {
+    const updates = messages.filter(
+      (message): message is Extract<WorkerToDaemon, { type: 'screen_update' }> =>
+        message.type === 'screen_update',
+    );
+    if (updates.at(-1)?.status === 'idle') {
+      idleSince ??= Date.now();
+      if (Date.now() - idleSince >= quietMs) return updates;
+    } else {
+      idleSince = undefined;
+    }
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`worker exited before the screen settled idle\n${logs.join('')}`);
+    }
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
+  }
+  throw new Error(
+    `timed out waiting for the screen to settle idle: ${JSON.stringify(messages)}\n${logs.join('')}`,
+  );
+}
+
 async function waitForLog(child: ChildProcess, logs: string[], needle: string): Promise<void> {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
@@ -82,11 +128,29 @@ async function waitForPromptReady(
   while (Date.now() < deadline) {
     if (messages.some(message => message.type === 'prompt_ready')) return;
     if (child.exitCode !== null || child.signalCode !== null) {
-      throw new Error(`worker exited before prompt_ready\n${logs.join('')}`);
+      throw new Error(`worker pid=${child.pid} exited before prompt_ready (code=${child.exitCode}, signal=${child.signalCode})\n${JSON.stringify(messages)}\n${logs.join('')}`);
     }
     await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
   }
   throw new Error(`timed out waiting for prompt_ready: ${JSON.stringify(messages)}\n${logs.join('')}`);
+}
+
+async function waitForMessage<T extends WorkerToDaemon['type']>(
+  child: ChildProcess,
+  messages: WorkerToDaemon[],
+  type: T,
+  logs: string[],
+): Promise<Extract<WorkerToDaemon, { type: T }>> {
+  const deadline = Date.now() + 12_000;
+  while (Date.now() < deadline) {
+    const found = messages.find((m): m is Extract<WorkerToDaemon, { type: T }> => m.type === type);
+    if (found) return found;
+    if (child.exitCode !== null || child.signalCode !== null) {
+      throw new Error(`worker exited before ${type}\n${logs.join('')}`);
+    }
+    await new Promise(resolvePromise => setTimeout(resolvePromise, 25));
+  }
+  throw new Error(`timed out waiting for ${type}: ${JSON.stringify(messages)}\n${logs.join('')}`);
 }
 
 /** A Pi transcript `message` record, shaped like SessionManager's JSONL. */
@@ -445,18 +509,7 @@ setInterval(() => {}, 1_000);
 
     appendFileSync(transcriptPath, piTranscriptRecord('assistant', 'final answer', 'stop'));
 
-    await waitForScreenUpdates(
-      child,
-      messages,
-      1,
-      logs,
-      update => update.status === 'idle',
-      'idle screen update',
-    );
-    const updates = messages.filter(
-      (message): message is Extract<WorkerToDaemon, { type: 'screen_update' }> =>
-        message.type === 'screen_update',
-    );
+    const updates = await waitForSettledIdle(child, messages, logs);
     expect(updates[0]?.status).toBe('working');
     expect(updates.at(-1)?.status).toBe('idle');
   }, 20_000);
@@ -765,19 +818,9 @@ setInterval(() => {}, 1_000);
     await waitForPromptReady(child, messages, logs);
 
     // prompt_ready is sent before the seed's working→idle pair; wait for the
-    // seed's idle to land instead of counting raw updates.
-    await waitForScreenUpdates(
-      child,
-      messages,
-      1,
-      logs,
-      update => update.status === 'idle',
-      'idle screen update',
-    );
-    const updates = messages.filter(
-      (message): message is Extract<WorkerToDaemon, { type: 'screen_update' }> =>
-        message.type === 'screen_update',
-    );
+    // screen to settle idle instead of counting raw updates — the seed's idle is
+    // not necessarily the last update (see waitForSettledIdle).
+    const updates = await waitForSettledIdle(child, messages, logs);
     expect(updates.some(message => message.status === 'working'), JSON.stringify(messages)).toBe(true);
     expect(updates.at(-1)?.status).toBe('idle');
   }, 30_000);
@@ -1204,6 +1247,88 @@ setInterval(() => {}, 1_000);
 
     await waitForPromptReady(child, messages, logs);
   }, 15_000);
+
+  it.skipIf(!tmuxAvailable)('publishes the adopted tmux pane CLI pid and start identity before prompt_ready', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-adopt-attest-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+
+    const fakeCli = join(root, 'fake-cli');
+    writeFileSync(fakeCli, `#!/usr/bin/env node
+process.stdout.write('ready\\n');
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakeCli, 0o755);
+
+    const tmuxSession = `botmux-adopt-attest-${process.pid}-${Date.now()}`;
+    tmuxSessions.add(tmuxSession);
+    execFileSync('tmux', ['new-session', '-d', '-s', tmuxSession, fakeCli]);
+    const panePid = Number(
+      execFileSync('tmux', ['list-panes', '-t', tmuxSession, '-F', '#{pane_pid}']).toString().trim().split('\n')[0],
+    );
+    expect(Number.isInteger(panePid) && panePid > 1).toBe(true);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-adopt-attest',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-adopt-attest',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'pi',
+      backendType: 'tmux',
+      prompt: '',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+      turnId: 'om_turn',
+      adoptMode: true,
+      adoptTmuxTarget: `${tmuxSession}:0.0`,
+      adoptCliPid: panePid,
+      adoptPaneCols: 160,
+      adoptPaneRows: 50,
+    } satisfies DaemonToWorker);
+
+    const attestation = await waitForMessage(child, messages, 'local_process_attestation', logs);
+    expect(attestation.cliPid, JSON.stringify(attestation)).toBe(panePid);
+    expect(typeof attestation.cliProcStart === 'string' && attestation.cliProcStart.length > 0).toBe(true);
+    expect(attestation.backendType).toBe('tmux');
+
+    // The daemon snapshots the current turn's pre-existing descendants right
+    // after it records this CLI pid, so the attestation must reach it before
+    // the same-turn readiness edge. An observe-only adopt pane never emits
+    // prompt_ready, so `ready` is the readiness signal here.
+    await waitForMessage(child, messages, 'ready', logs);
+    const attestationIndex = messages.findIndex(m => m.type === 'local_process_attestation');
+    const readyIndex = messages.findIndex(m => m.type === 'ready');
+    expect(attestationIndex).toBeGreaterThanOrEqual(0);
+    expect(attestationIndex).toBeLessThan(readyIndex);
+    // Attestation precedes the current turn's origin snapshot refresh: the
+    // daemon records this CLI pid before it snapshots the turn's descendants,
+    // so a managed_turn_origin for the live turn follows the attestation.
+    const originAfterAttestation = messages.findIndex(
+      (m, i) => i > attestationIndex && m.type === 'managed_turn_origin' && m.turnId === 'om_turn',
+    );
+    expect(originAfterAttestation, JSON.stringify(messages)).toBeGreaterThan(attestationIndex);
+  }, 20_000);
 
   it('forces the synthetic working seed before classifying a limited settle', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-argv-reaction-'));

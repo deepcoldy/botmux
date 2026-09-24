@@ -35,7 +35,7 @@ import {
   rollbackToSnapshot,
   listSnapshots,
 } from '../services/customization-store.js';
-import { PROMPT_FRAGMENTS, validateFragmentOverride } from '../skills/prompt-fragments.js';
+import { PROMPT_FRAGMENTS, PROMPT_STAGES, BLOCK_META, validateFragmentOverride } from '../skills/prompt-fragments.js';
 import { BUILTIN_SKILLS } from '../skills/definitions.js';
 import { frontmatterDescription } from '../skills/injection-mode.js';
 import {
@@ -74,12 +74,15 @@ function buildSnapshot() {
     const out: any = {
       key: f.key,
       block: f.block,
+      stage: f.stage,
       label: f.label,
       kind: f.kind,
       locales: perLocale,
     };
+    if (f.stages && f.stages.length > 0) out.stages = f.stages;
     if (f.placeholders) out.placeholders = f.placeholders;
     if (f.gate) out.gate = f.gate;
+    if (f.gateLabel) out.gateLabel = f.gateLabel;
     if (f.kind === 'conditional') out.conditionForced = state.conditionalLines?.[f.key] ?? null;
     return out;
   });
@@ -97,6 +100,8 @@ function buildSnapshot() {
 
   return {
     enabled: customizationEnabled(),
+    stages: PROMPT_STAGES,
+    blocks: Object.entries(BLOCK_META).map(([id, meta]) => ({ id, ...meta })),
     fragments,
     skills,
     history: listSnapshots(),

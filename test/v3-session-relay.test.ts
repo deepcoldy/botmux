@@ -380,6 +380,37 @@ describe('v3 session relay authorization', () => {
       });
     });
 
+    it('allows an auto-completed one-shot only while that exact turn is live', () => {
+      writeEnvelope('sched-ok', SCHED_BINDING);
+      writeScheduledTask({
+        enabled: false,
+        disabledReason: 'once_completed',
+        parsed: { kind: 'once', runAt: '2026-09-20T03:00:00.000Z', display: 'once' },
+      });
+      expect(authorizeScheduled({
+        isScheduledTurnLive: turnId => turnId === SCHED_TURN_ID,
+      }).ok).toBe(true);
+      expect(authorizeScheduled({
+        isScheduledTurnLive: () => false,
+      })).toMatchObject({
+        ok: false, status: 403, error: 'schedule_turn_unauthorized',
+      });
+    });
+
+    it('does not let daemon liveness override a manual pause', () => {
+      writeEnvelope('sched-ok', SCHED_BINDING);
+      writeScheduledTask({
+        enabled: false,
+        disabledReason: 'manual',
+        parsed: { kind: 'once', runAt: '2026-09-20T03:00:00.000Z', display: 'once' },
+      });
+      expect(authorizeScheduled({
+        isScheduledTurnLive: () => true,
+      })).toMatchObject({
+        ok: false, status: 403, error: 'schedule_turn_unauthorized',
+      });
+    });
+
     it('fails closed when the daemon did not inject the owner gate', () => {
       writeEnvelope('sched-ok', SCHED_BINDING);
       writeScheduledTask();

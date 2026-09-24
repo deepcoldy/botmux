@@ -120,6 +120,61 @@ describe('daemon close barrier used by botmux delete', () => {
     }
   });
 
+  it('keeps a document watch when one comment-thread session closes', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-doc-thread-close-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-doc-thread-close');
+    const fileToken = 'doc-thread-close';
+    const watchAnchor = docSubsStore.docWatchAnchor(fileToken);
+    docSubsStore.putDocSubscription(dataDir, 'app-doc-thread-close', {
+      fileToken,
+      fileType: 'docx',
+      sessionAnchor: watchAnchor,
+      scope: 'chat',
+      chatId: watchAnchor,
+      commentTriggerMode: 'mention-only',
+      managedBy: 'watch-comment',
+      createdAt: Date.now(),
+    });
+    const unsubscribe = vi.spyOn(docComment, 'unsubscribeDocFile');
+
+    try {
+      const commentAnchor = docSubsStore.docCommentThreadAnchor(fileToken, 'comment-1');
+      const session = sessionStore.createSession(commentAnchor, commentAnchor, 'doc comment thread', 'group');
+      session.larkAppId = 'app-doc-thread-close';
+      session.scope = 'chat';
+      sessionStore.updateSession(session);
+      const ds = {
+        session,
+        worker: null,
+        workerPort: null,
+        workerToken: null,
+        workerViewToken: null,
+        larkAppId: 'app-doc-thread-close',
+        chatId: commentAnchor,
+        chatType: 'group',
+        scope: 'chat',
+        spawnedAt: Date.now(),
+        cliVersion: 'test',
+        lastMessageAt: Date.now(),
+        hasHistory: true,
+      } as any;
+      workerPool.setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+
+      await expect(workerPool.closeSession(session.sessionId)).resolves.toMatchObject({ ok: true });
+
+      expect(docSubsStore.getDocSubscription(dataDir, 'app-doc-thread-close', fileToken)).toMatchObject({
+        sessionAnchor: watchAnchor,
+        managedBy: 'watch-comment',
+      });
+      expect(unsubscribe).not.toHaveBeenCalled();
+    } finally {
+      config.session.dataDir = previousDataDir;
+    }
+  });
+
   it('keeps bridge send markers until the live worker acknowledges close', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-close-fence-'));
     tempDirs.push(dataDir);
@@ -236,6 +291,118 @@ describe('daemon close barrier used by botmux delete', () => {
       worker.emit('exit');
       await Promise.resolve();
       expect(existsSync(markerPath)).toBe(false);
+    } finally {
+      config.session.dataDir = previousDataDir;
+    }
+  });
+
+  it('runs coordinator close migration only after the exact live worker exit fence resolves', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-xpi-close-lifecycle-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-xpi-close-lifecycle');
+    const onSessionClosed = vi.fn(async () => undefined);
+    workerPool.initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(async () => true),
+      onSessionClosed,
+    });
+
+    try {
+      const session = sessionStore.createSession('oc_xpi_close', 'om_xpi_close', 'XPI close', 'group');
+      session.larkAppId = 'app-xpi-close-lifecycle';
+      session.workerGeneration = 8;
+      session.xpiSharedCwdAdmissionGroupId = 'xpi-admission:synthetic';
+      session.xpiSharedCwdAdmissionCoordinatorSessionId = session.sessionId;
+      sessionStore.updateSession(session);
+      const worker = Object.assign(new EventEmitter(), {
+        killed: false,
+        send: vi.fn(),
+        kill: vi.fn(),
+      });
+      const ds = {
+        session,
+        worker,
+        workerGeneration: 8,
+        workerPort: 12345,
+        workerToken: 'write-token',
+        workerViewToken: 'view-token',
+        larkAppId: 'app-xpi-close-lifecycle',
+        chatId: session.chatId,
+        chatType: 'group',
+        scope: 'thread',
+        spawnedAt: Date.now(),
+        cliVersion: 'test',
+        lastMessageAt: Date.now(),
+        hasHistory: true,
+        initConfig: { backendType: 'pty' },
+      } as any;
+      const active = new Map([[activeSessionKey(ds), ds]]);
+      workerPool.setActiveSessionsRegistry(active);
+
+      const pending = workerPool.closeSession(session.sessionId);
+      await Promise.resolve();
+      expect(onSessionClosed).not.toHaveBeenCalled();
+
+      worker.emit('exit', 0, null);
+      await pending;
+      expect(onSessionClosed).toHaveBeenCalledTimes(1);
+      expect(onSessionClosed).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: session.sessionId, status: 'closed' }),
+        { workerGeneration: 8, workerExitProven: true },
+      );
+    } finally {
+      config.session.dataDir = previousDataDir;
+    }
+  });
+
+  it('marks close migration unproven when only a killed worker reference remains', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-xpi-close-unproven-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-xpi-close-unproven');
+    const onSessionClosed = vi.fn(async () => undefined);
+    workerPool.initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_reply'),
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(async () => true),
+      onSessionClosed,
+    });
+
+    try {
+      const session = sessionStore.createSession('oc_xpi_close', 'om_xpi_close', 'XPI close', 'group');
+      session.larkAppId = 'app-xpi-close-unproven';
+      session.workerGeneration = 9;
+      session.xpiSharedCwdAdmissionGroupId = 'xpi-admission:synthetic';
+      session.xpiSharedCwdAdmissionCoordinatorSessionId = session.sessionId;
+      sessionStore.updateSession(session);
+      const ds = {
+        session,
+        worker: { killed: true, send: vi.fn(), kill: vi.fn() },
+        workerGeneration: 9,
+        larkAppId: 'app-xpi-close-unproven',
+        chatId: session.chatId,
+        chatType: 'group',
+        scope: 'thread',
+        spawnedAt: Date.now(),
+        cliVersion: 'test',
+        lastMessageAt: Date.now(),
+        hasHistory: true,
+        initConfig: { backendType: 'pty' },
+      } as any;
+      workerPool.setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+
+      await workerPool.closeSession(session.sessionId);
+
+      expect(onSessionClosed).toHaveBeenCalledWith(
+        expect.objectContaining({ sessionId: session.sessionId, status: 'closed' }),
+        { workerGeneration: 9, workerExitProven: false },
+      );
     } finally {
       config.session.dataDir = previousDataDir;
     }

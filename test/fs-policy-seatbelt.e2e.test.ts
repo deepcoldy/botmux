@@ -116,7 +116,7 @@ d('Seatbelt three-tier enforcement (real sandbox-exec)', () => {
     // probe from running (spawn error, crash before print) yields neither
     // OK nor DENIED and fails the assertion — with the details attached.
     const verdict = (...argv: string[]) => {
-      const r = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8' });
+      const r = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8', timeout: 8_000 });
       const why = `spawn ${argv.join(' ')} → status=${r.status} signal=${r.signal} err=${r.error?.message} stderr=${r.stderr}`;
       expect(r.error, why).toBeUndefined();
       expect(['OK', 'DENIED'], why).toContain((r.stdout ?? '').trim());

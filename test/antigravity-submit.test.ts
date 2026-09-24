@@ -9,6 +9,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
+import { delay } from '../src/utils/timing.js';
 
 // HISTORY_PATH is computed at module import from os.homedir() (which honors
 // $HOME on POSIX), so redirect HOME to a temp dir BEFORE importing the
@@ -26,17 +27,6 @@ process.env.BOTMUX_TIME_SCALE = String(SCALE);
 const { createAntigravityAdapter } = await import(
   '../src/adapters/cli/antigravity.js'
 );
-
-// Choreographed real-time events, scaled by the same factor so their
-// ordering against the adapter's (equally scaled) settle/budget is stable.
-const SETTLE_MS = 300 * SCALE; // pre-Enter settle delay
-const BUDGET_MS = 3_200 * SCALE; // in-band history poll budget
-// Old code retried Enter after each 800ms poll window; the 2nd Enter would
-// fire at ~SETTLE_MS + 800*SCALE. A "slow" append lands AFTER that point
-// (so the old code would have double-submitted) but well inside BUDGET_MS
-// (so the new code still confirms it in-band).
-const OLD_FIRST_RETRY_MS = 800 * SCALE;
-const SLOW_APPEND_MS = SETTLE_MS + OLD_FIRST_RETRY_MS + 25;
 
 const HISTORY_PATH = join(home, '.gemini', 'antigravity-cli', 'history.jsonl');
 
@@ -81,7 +71,7 @@ interface FakePty {
   enterCount: () => number;
 }
 
-function makePty(enterThrows = false): FakePty {
+function makePty(opts: { enterThrows?: boolean; onEnter?: () => void } = {}): FakePty {
   const specialKeys: string[][] = [];
   const texts: string[] = [];
   const pty = {
@@ -91,10 +81,15 @@ function makePty(enterThrows = false): FakePty {
       return true;
     },
     sendSpecialKeys: (...keys: string[]) => {
-      if (enterThrows && keys[0] === 'Enter') {
+      if (opts.enterThrows && keys[0] === 'Enter') {
         throw new Error('tmux session gone');
       }
       specialKeys.push(keys);
+      // agy appends history in response to Enter, after writeInput's baseByte
+      // snapshot. Drive the fake the same way — a wall-clock setTimeout from
+      // test start races the scaled poll budget (bun-test: the 80ms "slow"
+      // timer slipped past ~160ms and writeInput returned submitted:false).
+      if (keys[0] === 'Enter') opts.onEnter?.();
       return true;
     },
   } as unknown as PtyHandle;
@@ -123,18 +118,17 @@ describe('antigravity writeInput — single-Enter submit', () => {
 
   it('slow history append (past the old 800ms retry window) still confirms with exactly one Enter', async () => {
     resetHistory();
-    const fake = makePty();
     const content = '<user_message>\n慢写入验证\n</user_message>';
-    // Append lands after the old code's 2nd Enter would have fired, but
-    // inside the 3.2s in-band budget.
-    const timer = setTimeout(() => appendHistory(content), SLOW_APPEND_MS);
-    try {
-      const result = await adapter.writeInput(fake.pty, content);
-      expect(result).toBeUndefined();
-      expect(fake.enterCount()).toBe(1);
-    } finally {
-      clearTimeout(timer);
-    }
+    // After Enter, wait past the old per-attempt retry on the adapter's own
+    // clock (`delay(800)`), then append. That is still well inside the
+    // 32×delay(100) in-band budget, so a revert to "retry Enter every 800ms"
+    // would double-submit while this path still confirms with one Enter.
+    const fake = makePty({
+      onEnter: () => { void delay(800).then(() => appendHistory(content)); },
+    });
+    const result = await adapter.writeInput(fake.pty, content);
+    expect(result).toBeUndefined();
+    expect(fake.enterCount()).toBe(1);
   });
 
   it('never appends within budget → submitted:false + recheck, still exactly one Enter', async () => {
@@ -154,36 +148,26 @@ describe('antigravity writeInput — single-Enter submit', () => {
 
   it('fast history append confirms with exactly one Enter', async () => {
     resetHistory();
-    const fake = makePty();
     const content = '<user_message>\n快速确认\n</user_message>';
-    const timer = setTimeout(() => appendHistory(content), SETTLE_MS + 10);
-    try {
-      const result = await adapter.writeInput(fake.pty, content);
-      expect(result).toBeUndefined();
-      expect(fake.enterCount()).toBe(1);
-    } finally {
-      clearTimeout(timer);
-    }
+    const fake = makePty({ onEnter: () => appendHistory(content) });
+    const result = await adapter.writeInput(fake.pty, content);
+    expect(result).toBeUndefined();
+    expect(fake.enterCount()).toBe(1);
   });
 
   it('multi-line content uses M-Enter between lines and exactly one trailing Enter', async () => {
     resetHistory();
-    const fake = makePty();
     const content = 'line1\nline2';
-    const timer = setTimeout(() => appendHistory(content), SETTLE_MS + 10);
-    try {
-      const result = await adapter.writeInput(fake.pty, content);
-      expect(result).toBeUndefined();
-      expect(fake.specialKeys).toContainEqual(['M-Enter']);
-      expect(fake.enterCount()).toBe(1);
-    } finally {
-      clearTimeout(timer);
-    }
+    const fake = makePty({ onEnter: () => appendHistory(content) });
+    const result = await adapter.writeInput(fake.pty, content);
+    expect(result).toBeUndefined();
+    expect(fake.specialKeys).toContainEqual(['M-Enter']);
+    expect(fake.enterCount()).toBe(1);
   });
 
   it('Enter send failure bails with submitted:false and no recheck', async () => {
     resetHistory();
-    const fake = makePty(/* enterThrows */ true);
+    const fake = makePty({ enterThrows: true });
     const result = await adapter.writeInput(fake.pty, 'anything');
     expect(result).toEqual({ submitted: false });
   });

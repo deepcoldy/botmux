@@ -147,6 +147,41 @@ function readLog(path: string): string[][] {
 }
 
 describe('CLI persisted backend targets', () => {
+  it('lists same-named ZMX targets in their stored directories instead of the CLI environment', async () => {
+    const fixture = makeFixture();
+    const sessionName = 'bmx-abcdef12';
+    const first = {
+      ...fixture.session, title: 'namespace-a', backendType: 'zmx',
+      persistentBackendTarget: { backendType: 'zmx', sessionName, socketDir: '/tmp/list-zmx-a' },
+    };
+    const second = {
+      ...first, sessionId: 'abcdef12-5555-6666-7777-888888888888', rootMessageId: 'om_other', title: 'namespace-b',
+      persistentBackendTarget: { backendType: 'zmx', sessionName, socketDir: '/tmp/list-zmx-b' },
+    };
+    seedPersistedSessionRows(fixture.dataDir, undefined, { [first.sessionId]: first, [second.sessionId]: second });
+    const fakeZmx = join(fixture.binDir, 'zmx');
+    writeFileSync(fakeZmx, `#!/usr/bin/env node
+const { appendFileSync } = require('node:fs');
+const args = process.argv.slice(2);
+appendFileSync(process.env.HERDR_TEST_LOG, JSON.stringify({ args, dir: process.env.ZMX_DIR }) + '\\n');
+if (process.env.ZMX_DIR === '/tmp/list-zmx-a') {
+  process.stdout.write(args.includes('--short') ? '${sessionName}\\n' : 'name=${sessionName}\\tpid=4242\\tclients=0\\tcmd=sh\\n');
+}
+`);
+    chmodSync(fakeZmx, 0o755);
+
+    const result = await runCli(fixture, ['list', '--plain']);
+
+    expect(result.status).toBe(0);
+    const a = result.stdout.split('\n').find(line => line.includes('namespace-a'))!;
+    const b = result.stdout.split('\n').find(line => line.includes('namespace-b'))!;
+    expect(a).toContain(`zmx: ${sessionName}`);
+    expect(a).not.toContain('(miss');
+    expect(b).toContain('(miss');
+    const calls = readFileSync(fixture.logPath, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(calls.map(call => call.dir)).toEqual(['/tmp/list-zmx-a', '/tmp/list-zmx-a', '/tmp/list-zmx-b', '/tmp/list-zmx-b']);
+  });
+
   it('list probes and displays the exact shared Herdr agent instead of auto-pruning it', async () => {
     const fixture = makeFixture();
     const result = await runCli(fixture, ['list', '--plain']);

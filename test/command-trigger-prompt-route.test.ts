@@ -31,6 +31,7 @@ const mocks = vi.hoisted(() => {
         : undefined
     )),
     forkWorker: vi.fn(),
+    resolveInboundAudio: vi.fn(async () => ({ kind: 'not_audio' as const })),
     createSession: vi.fn((chatId: string, rootMessageId: string, title: string, chatType?: 'group' | 'p2p') => {
       const s = {
         sessionId: `sess-fake-${++seq}`,
@@ -79,6 +80,11 @@ vi.mock('../src/core/worker-pool.js', async () => {
   return { ...actual, forkWorker: (...args: any[]) => mocks.forkWorker(...args) };
 });
 
+vi.mock('../src/im/lark/audio-transcribe.js', async () => {
+  const actual = await vi.importActual<any>('../src/im/lark/audio-transcribe.js');
+  return { ...actual, resolveInboundAudio: (...args: any[]) => mocks.resolveInboundAudio(...args) };
+});
+
 import { registerBot } from '../src/bot-registry.js';
 import { sessionKey, type DaemonSession } from '../src/core/types.js';
 import {
@@ -91,13 +97,13 @@ const APP = 'command_trigger_route_app';
 const CHAT = 'oc_command_trigger_route_chat';
 const USER = 'ou_group_member';
 
-function makeEventData(messageId: string, text: string): any {
+function makeEventData(messageId: string, text: string, messageType = 'text'): any {
   return {
     sender: { sender_id: { open_id: USER, union_id: `on_${USER}` }, sender_type: 'user' },
     message: {
       message_id: messageId,
       chat_id: CHAT,
-      message_type: 'text',
+      message_type: messageType,
       content: JSON.stringify({ text }),
       create_time: String(Date.now()),
     },
@@ -143,6 +149,7 @@ describe('handleNewTopic — 免@ 斜杠命令的 prompt 模板', () => {
     mocks.sendMessage.mockResolvedValue('om_top');
     mocks.getChatMode.mockResolvedValue('group');
     mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
+    mocks.resolveInboundAudio.mockResolvedValue({ kind: 'not_audio' });
     activeSessions.clear();
     const bot = registerBot({
       larkAppId: APP,
@@ -331,6 +338,7 @@ describe('handleThreadReply — 免@ 命令投进已有会话', () => {
     mocks.created.length = 0;
     mocks.getChatMode.mockResolvedValue('group');
     mocks.getChatNameAndMode.mockResolvedValue({ name: null, mode: 'group' });
+    mocks.resolveInboundAudio.mockResolvedValue({ kind: 'not_audio' });
     activeSessions.clear();
     const bot = registerBot({
       larkAppId: APP,
@@ -383,5 +391,40 @@ describe('handleThreadReply — 免@ 命令投进已有会话', () => {
 
     expect(mocks.createSession).not.toHaveBeenCalled();
     expect(sentText(send)).toContain('/solve 登录接口 500');
+  });
+
+  it.each([
+    ['/workflow new 不应执行的目标', 'workflow'],
+    ['/clear', 'raw_input'],
+  ])('chat 监听的语音转写不会作为 %s 命令进入驻留会话', async (observedText) => {
+    const send = vi.fn();
+    seedLiveChatSession(send);
+    mocks.resolveInboundAudio.mockResolvedValue({
+      kind: 'transcribed',
+      text: `🎤 语音转写：\n${observedText}`,
+    });
+
+    await handleThreadReply(
+      makeEventData('om_listener_audio', '[语音]', 'audio'),
+      {
+        ...threadCtx('om_listener_audio'),
+        messageListener: {
+          name: '语音告警监听',
+          prompt: '分析命中的内容。',
+          messageText: observedText,
+          msgType: 'audio',
+          senderOpenId: USER,
+          senderType: 'user',
+        },
+      },
+    );
+
+    const kinds = send.mock.calls.map(c => c[0]?.type);
+    expect(kinds).not.toContain('raw_input');
+    expect(kinds).toContain('message');
+    const delivered = sentText(send);
+    expect(delivered).toContain('<message_listener>');
+    expect(delivered).toContain(observedText);
+    expect(delivered).not.toContain('botmux-workflow');
   });
 });

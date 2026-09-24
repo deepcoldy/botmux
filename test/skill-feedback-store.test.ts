@@ -43,7 +43,7 @@ describe('SkillFeedbackStore', () => {
     });
     expect(JSON.stringify(reopened.getResponse(response.responseId))).not.toContain('secret answer');
     expect(reopened.pragmas()).toMatchObject({ journalMode: 'wal', foreignKeys: 1, busyTimeout: 5000 });
-    expect(reopened.schemaVersion()).toBe(7);
+    expect(reopened.schemaVersion()).toBe(8);
     reopened.close();
   });
 
@@ -72,9 +72,9 @@ describe('SkillFeedbackStore', () => {
     dirs.push(dataDir);
     const { DatabaseSync } = await import('node:sqlite');
     const db = new DatabaseSync(join(dataDir, 'botmux-feedback.sqlite'));
-    db.exec('CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES (\'keep\'); PRAGMA user_version=8;');
+    db.exec('CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES (\'keep\'); PRAGMA user_version=9;');
     db.close();
-    await expect(SkillFeedbackStore.open(dataDir)).rejects.toThrow('skill_feedback_schema_newer:8');
+    await expect(SkillFeedbackStore.open(dataDir)).rejects.toThrow('skill_feedback_schema_newer:9');
     const verify = new DatabaseSync(join(dataDir, 'botmux-feedback.sqlite'));
     expect((verify.prepare('SELECT value FROM sentinel').get() as any).value).toBe('keep');
     verify.close();
@@ -107,6 +107,31 @@ describe('SkillFeedbackStore', () => {
     store.close();
   });
 
+  it('rejects a write based on an older feedback card version', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-'));
+    dirs.push(dataDir);
+    const store = await SkillFeedbackStore.open(dataDir);
+    const response = store.createResponse({ interactionId: 'int_version', content: 'answer' });
+    store.createDelivery({ responseId: response.responseId, platform: 'lark', platformAppId: 'app_a', platformMessageId: 'om_version' });
+
+    const first = store.recordFeedback({
+      platform: 'lark', platformAppId: 'app_a', platformMessageId: 'om_version', operatorSubjectId: 'on_user',
+      result: 'helpful', callbackKey: 'cb_version_1', expectedFeedbackId: null,
+    });
+    const second = store.recordFeedback({
+      platform: 'lark', platformAppId: 'app_a', platformMessageId: 'om_version', operatorSubjectId: 'on_user',
+      result: 'incorrect', callbackKey: 'cb_version_2', expectedFeedbackId: first.feedback.feedbackId,
+    });
+    const stale = store.recordFeedback({
+      platform: 'lark', platformAppId: 'app_a', platformMessageId: 'om_version', operatorSubjectId: 'on_user',
+      result: 'helpful', callbackKey: 'cb_version_stale', expectedFeedbackId: first.feedback.feedbackId,
+    });
+
+    expect(stale).toMatchObject({ status: 'stale', feedback: { feedbackId: second.feedback.feedbackId, result: 'incorrect' } });
+    expect(store.listFeedbackRevisions(first.feedback.deliveryId, 'on_user')).toHaveLength(2);
+    store.close();
+  });
+
   it('migrates a v1 database and preserves old rows while adding v2 columns', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-feedback-'));
     dirs.push(dataDir);
@@ -126,7 +151,7 @@ describe('SkillFeedbackStore', () => {
     `);
     db.close();
     const store = await SkillFeedbackStore.open(dataDir);
-    expect(store.schemaVersion()).toBe(7);
+    expect(store.schemaVersion()).toBe(8);
     expect(store.findDeliveryByPlatformMessage('lark', 'app', 'om_old')).toMatchObject({ policy: undefined, baseCard: undefined, requesterSubjectId: undefined });
     store.close();
   });

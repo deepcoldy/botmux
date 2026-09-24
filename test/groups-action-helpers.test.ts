@@ -5,6 +5,7 @@ import {
   bindOncall,
   disbandGroup,
   leaveGroup,
+  renameGroup,
   setPinStreamingCardForGroup,
   unbindOncall,
   type DaemonHandle,
@@ -245,6 +246,51 @@ describe('bindOncall', () => {
     const deps = makeDeps({ proxyToDaemon: proxySpy });
     await bindOncall('oc_demo', 'cli_owner', '', deps);
     expect((proxySpy.mock.calls[0]![2] as RequestInit).body).toBe('{}');
+  });
+});
+
+describe('renameGroup', () => {
+  it('routes through the exact bot identity and invalidates snapshots on success', async () => {
+    const proxySpy = vi.fn(async () => makeRes(200, {
+      ok: true,
+      changed: true,
+      oldName: 'Old',
+      newName: 'New',
+    }));
+    const operationDeps = makeDeps({ proxyToDaemon: proxySpy });
+
+    const result = await renameGroup(
+      'oc topic/one',
+      'cli/app one',
+      '{"name":"New"}',
+      operationDeps,
+    );
+
+    expect(result).toEqual({
+      status: 200,
+      body: { ok: true, changed: true, oldName: 'Old', newName: 'New' },
+    });
+    expect(proxySpy).toHaveBeenCalledWith(
+      'cli/app one',
+      '/api/groups/oc%20topic%2Fone/name',
+      {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: '{"name":"New"}',
+      },
+    );
+    expect(operationDeps.invalidateGroups).toHaveBeenCalledOnce();
+  });
+
+  it('preserves upstream failures without invalidating snapshots', async () => {
+    const operationDeps = makeDeps({
+      proxyToDaemon: vi.fn(async () => makeRes(403, { ok: false, error: 'bot_not_in_chat' })),
+    });
+
+    const result = await renameGroup('oc_demo', 'cli_owner', '{}', operationDeps);
+
+    expect(result).toEqual({ status: 403, body: { ok: false, error: 'bot_not_in_chat' } });
+    expect(operationDeps.invalidateGroups).not.toHaveBeenCalled();
   });
 });
 

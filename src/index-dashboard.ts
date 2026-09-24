@@ -4,8 +4,8 @@
 // entry; under the Bun single binary via the `__dashboard` self-spawn token).
 // It exists so the dashboard can load ~/.botmux/.env ITSELF — in particular the
 // Feishu H5 login family (BOTMUX_DASHBOARD_FEISHU_H5_*, APP_SECRET included),
-// which is deliberately NOT baked into the shared daemon env block
-// (DAEMON_ENV_KEYS): baked there, the secret would reach every bot daemon.
+// which is deliberately NOT included in the shared daemon env block
+// (DAEMON_ENV_KEYS): included there, the secret would reach every bot daemon.
 //
 // The load is ALLOWLISTED (utils/dashboard-env.ts), not a wholesale dotenv:
 // this process forks children that inherit its environment, so only keys with a
@@ -31,8 +31,8 @@ installStdioEpipeGuard();
 
 // Load ~/.botmux/.env (same path logic as index-daemon.ts). This is the
 // dashboard's ONLY channel for the H5 credential family and the fallback for
-// any dashboard setting not baked into the PM2 env block. Values already set
-// still win, so the baked DAEMON_ENV_KEYS snapshot keeps its deterministic
+// any dashboard setting not included in the shared fleet env. Values already
+// set still win, so the resolved DAEMON_ENV_KEYS snapshot keeps its deterministic
 // resolveDaemonEnv semantics.
 //
 // ALLOWLISTED, not wholesale (see utils/dashboard-env.ts): that same file

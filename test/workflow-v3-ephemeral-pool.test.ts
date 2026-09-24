@@ -1,14 +1,46 @@
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createEphemeralPool, buildGoalCommand, GOAL_COMMAND } from '../src/workflows/v3/ephemeral-pool.js';
+import { createEphemeralPool, buildGoalCommand, GOAL_COMMAND, spawnWorkerFactory, v3WorkerBackendType } from '../src/workflows/v3/ephemeral-pool.js';
+import { config } from '../src/config.js';
 import { GOAL_ENV, type RunNodeRequest } from '../src/workflows/v3/contract.js';
 import type { WorkerHandle, WorkerProcessFactory, WorkerSpawnOptions } from '../src/workflows/shared/worker-process.js';
 import { readV3AttemptWorkerFence } from '../src/workflows/v3/worker-fence.js';
+import { botToSnapshot, parseFrozenBotSnapshots } from '../src/workflows/v3/bot-resolve.js';
+import type { BotConfig } from '../src/bot-registry.js';
+
+// The default factory delegates to self-spawn's spawnWorker, which is the only
+// path that gets the compiled-binary case right. Mock node:child_process so we
+// can observe WHICH primitive it reaches (fork vs spawn) without launching a
+// real process; the scripted-worker tests below inject their own factory and
+// never touch these mocks.
+const childProcessMock = vi.hoisted(() => {
+  const makeFakeChild = () => {
+    const child: any = new EventEmitter();
+    child.pid = 4321;
+    child.exitCode = null;
+    child.signalCode = null;
+    child.stdout = new EventEmitter();
+    child.stderr = new EventEmitter();
+    child.send = vi.fn();
+    child.kill = vi.fn();
+    return child;
+  };
+  return {
+    fork: vi.fn(() => makeFakeChild()),
+    spawn: vi.fn(() => makeFakeChild()),
+  };
+});
+
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return { ...actual, fork: childProcessMock.fork, spawn: childProcessMock.spawn };
+});
+
 
 let dir: string;
 
@@ -37,7 +69,47 @@ afterEach(async () => {
   }
 });
 
+describe('v3WorkerBackendType', () => {
+  it('follows a tmux daemon and keeps PTY for every other backend, never a remote one', () => {
+    expect(v3WorkerBackendType('tmux')).toBe('tmux');
+    for (const backend of ['pty', 'herdr', 'zellij', 'zmx', 'riff', 'mojo'] as const) {
+      expect(v3WorkerBackendType(backend), backend).toBe('pty');
+    }
+  });
+});
+
 describe('v3 ephemeral pool', () => {
+  it('persists the explicit default instance and replays it into the existing PTY worker after config changes', async () => {
+    const home = join(dir, 'codex-a');
+    mkdirSync(home, { mode: 0o700 });
+    writeFileSync(join(home, 'config.toml'), 'cli_auth_credentials_store = "file"\n', { mode: 0o600 });
+    writeFileSync(join(home, 'auth.json'), JSON.stringify({ tokens: { access_token: 'fake-token' } }), { mode: 0o600 });
+    const bot: BotConfig = { larkAppId: 'cli_app', larkAppSecret: 'not-persisted', cliId: 'codex', backendType: 'tmux',
+      codexInstancePool: { enabled: true, scope: 'ordinary-feishu', strategy: 'random', defaultInstanceId: 'a',
+        instances: [{ id: 'a', codexHome: home, enabled: false }] } };
+    const frozen = botToSnapshot(bot, '/work/repo');
+    const path = join(dir, 'bots.snapshot.json');
+    writeFileSync(path, JSON.stringify({ '': frozen }));
+    bot.codexInstancePool!.instances[0]!.codexHome = '/changed-after-freeze';
+    const restored = parseFrozenBotSnapshots(JSON.parse(readFileSync(path, 'utf8'))).get('')!;
+    expect(restored.cliInstanceBinding).toMatchObject({ source: 'default', instanceId: 'a', codexHome: realpathSync(home) });
+    expect(restored.cliRuntime).toEqual(frozen.cliRuntime);
+    expect(readFileSync(path, 'utf8')).not.toContain('not-persisted');
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const req = { ...request(), botSnapshot: restored };
+    const pool = createEphemeralPool({ factory, workerPath: '/tmp/worker.js', quiesceMs: 1, resolveLarkAppSecret: () => 'secret' });
+    const running = pool.runNode(req);
+    await worker.waitForInit();
+    expect(worker.init).toMatchObject({ backendType: v3WorkerBackendType(), cliId: 'codex', cliInstanceBinding: restored.cliInstanceBinding, cliRuntime: restored.cliRuntime });
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'prompt_ready' });
+    worker.emitMessage({ type: 'final_output', content: 'done', lastUuid: 'u', turnId: 't' });
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(0);
+    await expect(running).resolves.toMatchObject({ status: 'ok' });
+  });
+
   it('honors the host-neutral attempt lease before resolving credentials or spawning', async () => {
     const worker = new ScriptedWorker();
     const factory = factoryFor(worker);
@@ -90,7 +162,7 @@ describe('v3 ephemeral pool', () => {
     await waitFor(() => factory.lastOpts !== undefined);
     expect(readV3AttemptWorkerFence(req.attemptDir, req)).toMatchObject({ phase: 'active' });
     await worker.waitForInit();
-    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok', viewToken: 'view-tok' });
     expect(worker.rawInputs).toEqual([]);
     worker.emitMessage({ type: 'prompt_ready' });
     expect(worker.rawInputs).toEqual([buildGoalCommand(req)]);
@@ -109,7 +181,7 @@ describe('v3 ephemeral pool', () => {
     expect(result).toMatchObject({
       status: 'ok',
       manifestPath: join(req.attemptDir, 'manifest.json'),
-      sessionInfo: { webPort: 3001, token: 'tok' },
+      sessionInfo: { webPort: 3001, token: 'tok', viewToken: 'view-tok' },
     });
     expect(factory.lastOpts?.cwd).toBe('/work/repo');
     expect(factory.lastOpts?.env[GOAL_ENV.V3_MARKER]).toBe('1');
@@ -117,6 +189,9 @@ describe('v3 ephemeral pool', () => {
     expect(worker.init?.cliId).toBe('claude-code');
     expect(worker.init?.larkAppSecret).toBe('secret');
     expect(worker.init?.prompt).toBe('');
+    // Worker init follows the daemon's resolved backend (tmux by default),
+    // never the old hardcoded 'pty' which is unusable in the compiled binary.
+    expect(worker.init?.backendType).toBe(v3WorkerBackendType(config.daemon.backendType));
     expect(worker.rawInputs).toEqual([buildGoalCommand(req)]);
   });
 
@@ -271,11 +346,12 @@ describe('v3 ephemeral pool', () => {
     await worker.waitForInit();
     expect(readyInfos).toEqual([]);
 
-    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok', viewToken: 'view-tok' });
     expect(readyInfos).toEqual([{
       sessionId: expect.any(String),
       webPort: 3001,
       token: 'tok',
+      viewToken: 'view-tok',
       ptyLogPath: join(req.attemptDir, 'pty.log'),
     }]);
     expect(factory.lastOpts?.env.BOTMUX_WORKFLOW_PTY_LOG_PATH).toBe(join(req.attemptDir, 'pty.log'));
@@ -622,6 +698,94 @@ describe('v3 ephemeral pool', () => {
     await waitFor(() => worker.kills.includes('SIGTERM'));
     worker.emitExit(0);
     await expect(promise).resolves.toMatchObject({ status: 'ok' });
+  });
+});
+
+describe('v3 default worker factory (spawnWorkerFactory) across runtime shapes', () => {
+  // isStandaloneBinary() detects a compiled Bun binary by process.argv[1]
+  // starting with /$bunfs/. Swap it around each case so we exercise both the
+  // Node fork path and the standalone __worker path against the same factory.
+  const realArgv1 = process.argv[1];
+
+  beforeEach(() => {
+    childProcessMock.fork.mockClear();
+    childProcessMock.spawn.mockClear();
+  });
+
+  afterEach(() => {
+    process.argv[1] = realArgv1;
+  });
+
+  it('Node runtime: forks <distDir>/worker.js and never re-execs the binary', () => {
+    process.argv[1] = '/Users/dev/botmux/dist/cli.js';
+    const distDir = join('/opt', 'botmux', 'dist');
+
+    const handle = spawnWorkerFactory.spawn({
+      workerPath: distDir,
+      cwd: '/work/repo',
+      env: { FOO: 'bar' } as NodeJS.ProcessEnv,
+    });
+
+    expect(childProcessMock.fork).toHaveBeenCalledTimes(1);
+    expect(childProcessMock.spawn).not.toHaveBeenCalled();
+    const [modulePath, args, opts] = childProcessMock.fork.mock.calls[0]!;
+    expect(modulePath).toBe(join(distDir, 'worker.js'));
+    expect(args).toEqual([]);
+    expect(opts).toMatchObject({ cwd: '/work/repo' });
+    // The IPC channel the pool talks over must be present.
+    expect((opts as { stdio?: unknown[] }).stdio).toContain('ipc');
+    // The handle proxies the child so the pool's send/kill/pid all work.
+    expect(handle.pid).toBe(4321);
+  });
+
+  it('standalone binary: re-execs process.execPath with the hidden __worker subcommand (no /src/worker.ts fork)', () => {
+    // A compiled binary reports its entry under the embedded /$bunfs/ root.
+    process.argv[1] = '/$bunfs/root/cli.js';
+
+    const handle = spawnWorkerFactory.spawn({
+      // In the binary there is no worker.js on disk; workerPath is ignored.
+      workerPath: '/$bunfs/root/../..',
+      cwd: '/work/repo',
+      env: { FOO: 'bar' } as NodeJS.ProcessEnv,
+    });
+
+    expect(childProcessMock.spawn).toHaveBeenCalledTimes(1);
+    expect(childProcessMock.fork).not.toHaveBeenCalled();
+    const [command, args, opts] = childProcessMock.spawn.mock.calls[0]!;
+    expect(command).toBe(process.execPath);
+    expect(args).toEqual(['__worker']);
+    // This is the whole point: it must NOT try to fork a src/worker.ts path,
+    // which the worker-fence allowlist rejects (exit 2).
+    expect((args as string[]).join(' ')).not.toContain('worker.ts');
+    expect((args as string[]).join(' ')).not.toContain('worker.js');
+    expect(opts).toMatchObject({ cwd: '/work/repo' });
+    expect((opts as { stdio?: unknown[] }).stdio).toContain('ipc');
+    expect(handle.pid).toBe(4321);
+  });
+
+  it('createEphemeralPool defaults to spawnWorkerFactory (fork under Node) when no factory is injected', async () => {
+    process.argv[1] = '/Users/dev/botmux/dist/cli.js';
+    const pool = createEphemeralPool({ resolveLarkAppSecret: () => 'secret' });
+
+    const req = request();
+    // Fire the run; the default factory will fork our fake child. We only need
+    // to prove fork() was reached (not the bogus src/worker.ts path), then let
+    // the fake child close so the promise settles.
+    const promise = pool.runNode(req);
+    await waitFor(() => childProcessMock.fork.mock.calls.length > 0);
+    expect(childProcessMock.spawn).not.toHaveBeenCalled();
+    const forkedModule = childProcessMock.fork.mock.calls[0]![0] as string;
+    // Under vitest the module runs from the source tree, so import.meta.url
+    // resolves distDir to <checkout>/src; in a real dist build it is dist/. The
+    // invariant that matters either way: it forks worker.js (not the bogus
+    // src/worker.ts the old fallback produced, which the fence rejected).
+    expect(forkedModule.endsWith('worker.js')).toBe(true);
+    expect(forkedModule).not.toContain('worker.ts');
+
+    // Settle: emit close on the fake child so no timer leaks.
+    const child = childProcessMock.fork.mock.results[0]!.value as EventEmitter;
+    child.emit('close', 0);
+    await promise.catch(() => { /* fence teardown on a fake pid may reject; irrelevant here */ });
   });
 });
 

@@ -8,6 +8,10 @@ import {
   type ConnectorDefinition,
 } from '../services/connector-store.js';
 import {
+  CONNECTOR_LIFECYCLE_GROUP_NAME_MAX_LENGTH,
+  isValidConnectorLifecycleGroupNameTemplate,
+} from '../services/connector-lifecycle-group-name.js';
+import {
   createWebhookSecret,
   deleteWebhookSecret,
   generateWebhookSecretPlaintext,
@@ -101,6 +105,28 @@ function normalizeLifecycleExtractors(v: unknown): ConnectorDefinition['lifecycl
   const r = v as Record<string, unknown>;
   if (typeof r.dedupKey !== 'string' || !r.dedupKey.trim()) return null;
   return { dedupKey: r.dedupKey.trim() };
+}
+
+function normalizeLifecycleGroupName(
+  value: unknown,
+  prior: ConnectorDefinition['lifecycleGroupName'] | undefined,
+): { ok: true; value?: ConnectorDefinition['lifecycleGroupName'] } | { ok: false; error: string } {
+  const raw = record(value ?? prior);
+  const mode = typeof raw.mode === 'string' ? raw.mode : prior?.mode ?? 'default';
+  if (!['default', 'fixed', 'template'].includes(mode)) {
+    return { ok: false, error: 'bad_lifecycle_group_name_mode' };
+  }
+  if (mode === 'default') return { ok: true };
+
+  const text = typeof raw.text === 'string' ? raw.text.trim() : prior?.text?.trim() ?? '';
+  if (!text) return { ok: false, error: 'lifecycle_group_name_required' };
+  if (Array.from(text).length > CONNECTOR_LIFECYCLE_GROUP_NAME_MAX_LENGTH) {
+    return { ok: false, error: 'lifecycle_group_name_too_long' };
+  }
+  if (mode === 'template' && !isValidConnectorLifecycleGroupNameTemplate(text)) {
+    return { ok: false, error: 'lifecycle_group_name_template_invalid' };
+  }
+  return { ok: true, value: { mode: mode as 'fixed' | 'template', text } };
 }
 
 /** Inbound idempotency config. Both knobs are optional and the whole object is
@@ -260,6 +286,10 @@ function normalizeConnectorInput(
       ? (prior?.lifecycleExtractors ?? null)
       : normalizeLifecycleExtractors(c.lifecycleExtractors))
     : null;
+  const lifecycleGroupName = targetMode === 'new-group'
+    ? normalizeLifecycleGroupName(c.lifecycleGroupName, prior?.lifecycleGroupName)
+    : null;
+  if (lifecycleGroupName && !lifecycleGroupName.ok) return lifecycleGroupName;
 
   const secretRef =
     opts.secretRef ||
@@ -327,6 +357,7 @@ function normalizeConnectorInput(
       retentionDays: positiveInt(loggingPolicy.retentionDays, prior?.loggingPolicy.retentionDays ?? 14, 1, 365),
     },
     lifecycleExtractors,
+    ...(lifecycleGroupName?.ok && lifecycleGroupName.value ? { lifecycleGroupName: lifecycleGroupName.value } : {}),
     // Absent in the request → keep whatever the stored connector had (a PATCH
     // that doesn't mention idempotency must not silently turn it off).
     ...(() => {

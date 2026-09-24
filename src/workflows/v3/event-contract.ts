@@ -124,7 +124,7 @@ export type V3Event =
       nodeId: string;
       instanceId?: string;
       attemptId: string;
-      sessionInfo: { sessionId: string; webPort?: number };
+      sessionInfo: { sessionId: string; webPort?: number; viewToken?: string };
       ptyLogPath?: string;
     }
   | {

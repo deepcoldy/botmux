@@ -25,6 +25,10 @@ import {
   setGlobalLocale,
   writeCodexNotifierConfig,
   writeHostOverloadAlertConfig,
+  SESSION_CLEANUP_HOUR_OPTIONS,
+  SESSION_CLEANUP_MIN_INTERVAL_MINUTES,
+  type SessionCleanupGlobalConfig,
+  type SessionCleanupHours,
 } from '../global-config.js';
 import {
   installCodexNotifierHook,
@@ -50,7 +54,9 @@ export interface ResolvedDashboardSettingsView {
   chatBotDiscovery: boolean;
   herdrTraexPlugin: { enabled: boolean; source: string; ref: string; recommendedSource: string; recommendedRef: string };
   codexRpcInput: boolean;
+  autoUpgradeCodexSessions: boolean;
   bypassCodexHookTrust: boolean;
+  hideCodexRateLimitModelNudge: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -91,6 +97,7 @@ export interface ResolvedDashboardSettingsView {
     targetDaemonOnline?: boolean;
   };
   noVisibleOutputHint: boolean;
+  crossPrincipalInterruption: boolean;
   vcMeetingAgent: {
     enabled: boolean;
     larkCliVersion?: string | null;
@@ -103,6 +110,13 @@ export interface ResolvedDashboardSettingsView {
   remoteAccess?: boolean;
   /** Machine-wide v3 Workflow feature switch. Default ON. */
   workflow: { enabled: boolean };
+  /** 定时自动清理空闲会话。默认关闭。olderThanHours/intervalMinutes 反映当前
+   *  生效值（含默认回退），供设置页回显。 */
+  sessionCleanup: {
+    enabled: boolean;
+    olderThanHours: SessionCleanupHours;
+    intervalMinutes: number;
+  };
   /** OAuth 授权回跳基址（`<base>/oauth/callback`），null/absent = 未配置。 */
   oauthRedirectBase?: string | null;
   /** Configured schedule-task timezone override (IANA), or null/absent when
@@ -148,6 +162,9 @@ export interface SettingsWriteApplierDeps {
   isLocale: (v: unknown) => v is 'zh' | 'en';
   /** Fan out locale reload to all online daemons. */
   reloadLocaleOnAllDaemons?: () => Promise<void>;
+  /** After persisting XPI=false, terminalise every daemon's staged runtime
+   * queue so historical records cannot keep notifying or revive later. */
+  disableCrossPrincipalInterruptionOnAllDaemons?: () => Promise<void>;
   /** 校验通知 Bot；保存关闭态配置时只校验静态配置，启用时再要求 daemon 与收件人就绪。 */
   validateCodexNotifierTargetBotAppId?: (
     appId: string,
@@ -169,6 +186,7 @@ export interface SettingsWriteApplierDeps {
 export function defaultSettingsWriteApplierDeps(
   resolveDashboardSettings: () => ResolvedDashboardSettingsView,
   reloadLocaleOnAllDaemons?: () => Promise<void>,
+  disableCrossPrincipalInterruptionOnAllDaemons?: () => Promise<void>,
 ): SettingsWriteApplierDeps {
   return {
     readGlobalConfig,
@@ -184,6 +202,7 @@ export function defaultSettingsWriteApplierDeps(
     resolveDashboardSettings,
     isLocale,
     reloadLocaleOnAllDaemons,
+    disableCrossPrincipalInterruptionOnAllDaemons,
     installCodexNotifierHook: () => {
       installCodexNotifierHook();
       if (!isCodexNotifierHookInstalled()) throw new Error('codex_notifier_hook_not_executable');
@@ -213,7 +232,9 @@ export type ApplySettingsWriteError =
   | 'invalid_herdrTraexPlugin_source'
   | 'invalid_herdrTraexPlugin_ref'
   | 'invalid_codexRpcInput'
+  | 'invalid_autoUpgradeCodexSessions'
   | 'invalid_bypassCodexHookTrust'
+  | 'invalid_hideCodexRateLimitModelNudge'
   | 'invalid_codexNotifier'
   | 'invalid_codexNotifier_enabled'
   | 'invalid_codexNotifier_targetBotAppId'
@@ -235,6 +256,7 @@ export type ApplySettingsWriteError =
   | 'hostOverloadAlert_target_owner_missing'
   | 'hostOverloadAlert_target_offline'
   | 'invalid_noVisibleOutputHint'
+  | 'invalid_crossPrincipalInterruption'
   | 'invalid_repoPickerMode'
   | 'invalid_remoteAccess'
   | 'invalid_vcMeetingAgent'
@@ -242,6 +264,10 @@ export type ApplySettingsWriteError =
   | 'invalid_vcMeetingAgent_listenerBotAppId'
   | 'invalid_workflow'
   | 'invalid_workflow_enabled'
+  | 'invalid_sessionCleanup'
+  | 'invalid_sessionCleanup_enabled'
+  | 'invalid_sessionCleanup_olderThanHours'
+  | 'invalid_sessionCleanup_intervalMinutes'
   | 'invalid_scheduleTimeZone'
   | 'invalid_oauthRedirectBase'
   | 'invalid_whiteboard'
@@ -431,17 +457,36 @@ export async function applySettingsWrite(
     }
     patch.codexRpcInput = obj.codexRpcInput;
   }
+  if ('autoUpgradeCodexSessions' in obj) {
+    if (typeof obj.autoUpgradeCodexSessions !== 'boolean') {
+      return { ok: false, error: 'invalid_autoUpgradeCodexSessions' };
+    }
+    patch.autoUpgradeCodexSessions = obj.autoUpgradeCodexSessions;
+  }
   if ('bypassCodexHookTrust' in obj) {
     if (typeof obj.bypassCodexHookTrust !== 'boolean') {
       return { ok: false, error: 'invalid_bypassCodexHookTrust' };
     }
     patch.bypassCodexHookTrust = obj.bypassCodexHookTrust;
   }
+  if ('hideCodexRateLimitModelNudge' in obj) {
+    if (typeof obj.hideCodexRateLimitModelNudge !== 'boolean') {
+      return { ok: false, error: 'invalid_hideCodexRateLimitModelNudge' };
+    }
+    patch.hideCodexRateLimitModelNudge = obj.hideCodexRateLimitModelNudge;
+  }
   if ('noVisibleOutputHint' in obj) {
     if (typeof obj.noVisibleOutputHint !== 'boolean') {
       return { ok: false, error: 'invalid_noVisibleOutputHint' };
     }
     patch.noVisibleOutputHint = obj.noVisibleOutputHint;
+  }
+
+  if ('crossPrincipalInterruption' in obj) {
+    if (typeof obj.crossPrincipalInterruption !== 'boolean') {
+      return { ok: false, error: 'invalid_crossPrincipalInterruption' };
+    }
+    patch.crossPrincipalInterruption = obj.crossPrincipalInterruption;
   }
 
   let codexNotifierPatch: import('../global-config.js').CodexNotifierGlobalConfig | undefined;
@@ -597,6 +642,47 @@ export async function applySettingsWrite(
     touched = true;
   }
 
+  if ('sessionCleanup' in obj) {
+    const raw = obj.sessionCleanup;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return { ok: false, error: 'invalid_sessionCleanup' };
+    }
+    const sc = raw as Record<string, unknown>;
+    // Merge over the validated existing block so a partial patch (e.g. just the
+    // toggle) keeps the other supported fields.
+    const next: SessionCleanupGlobalConfig = { ...(deps.readGlobalConfig().sessionCleanup ?? {}) };
+    if ('enabled' in sc) {
+      if (typeof sc.enabled !== 'boolean') {
+        return { ok: false, error: 'invalid_sessionCleanup_enabled' };
+      }
+      next.enabled = sc.enabled;
+    }
+    if ('olderThanHours' in sc) {
+      if (
+        typeof sc.olderThanHours !== 'number'
+        || !(SESSION_CLEANUP_HOUR_OPTIONS as readonly number[]).includes(sc.olderThanHours)
+      ) {
+        return { ok: false, error: 'invalid_sessionCleanup_olderThanHours' };
+      }
+      next.olderThanHours = sc.olderThanHours as SessionCleanupHours;
+    }
+    if ('intervalMinutes' in sc) {
+      if (
+        typeof sc.intervalMinutes !== 'number'
+        || !Number.isFinite(sc.intervalMinutes)
+        || sc.intervalMinutes < SESSION_CLEANUP_MIN_INTERVAL_MINUTES
+      ) {
+        return { ok: false, error: 'invalid_sessionCleanup_intervalMinutes' };
+      }
+      next.intervalMinutes = Math.floor(sc.intervalMinutes);
+    }
+    if (!('enabled' in sc) && !('olderThanHours' in sc) && !('intervalMinutes' in sc)) {
+      return { ok: false, error: 'invalid_sessionCleanup' };
+    }
+    deps.mergeGlobalConfig({ sessionCleanup: next });
+    touched = true;
+  }
+
   if ('vcMeetingAgent' in obj) {
     const raw = obj.vcMeetingAgent;
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -724,6 +810,11 @@ export async function applySettingsWrite(
   if (hostOverloadAlertPatch) {
     deps.writeHostOverloadAlertConfig(hostOverloadAlertPatch);
     touched = true;
+  }
+
+  if (patch.crossPrincipalInterruption === false
+    && deps.disableCrossPrincipalInterruptionOnAllDaemons) {
+    await deps.disableCrossPrincipalInterruptionOnAllDaemons();
   }
 
   if (!touched) return { ok: false, error: 'empty_patch' };

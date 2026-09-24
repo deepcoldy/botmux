@@ -19,6 +19,7 @@
  * tenant-stable ID into the creator app's open_id before transfer.
  */
 import { createChat, transferChatOwner, getChatOwner, getChatShareLink, addUsersToChatByUnionId, addBotToChat } from './groups-store.js';
+import type { ChatMode } from './groups-store.js';
 import { listChatBotMembers, resolveAllowedUsersWithMap, sendMessage } from '../im/lark/client.js';
 import { bindOncall } from './oncall-store.js';
 import { isValidRoleProfileId, readRoleProfileEntry } from './role-profile-store.js';
@@ -31,6 +32,10 @@ export interface CreateGroupOpts {
    *  (Lark rejects self-invite). May be empty (creator-only chat). */
   larkAppIds: string[];
   name?: string;
+  /** Chat topology at creation time. 'topic' creates a 话题群; omit to let
+   *  Feishu use its default 普通群 ('group'). Fixed for the chat's lifetime —
+   *  it cannot be changed afterwards through this API. */
+  chatMode?: ChatMode;
   userOpenIds?: string[];
   /** Users to add by union_id (tenant-stable) — used to pull bot OWNERS into a
    *  federated group regardless of which bot they paired through (open_id is
@@ -143,6 +148,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     name: opts.name,
     botIds: [],
     userIds: opts.userOpenIds ?? [],
+    chatMode: opts.chatMode,
   });
   opts.onChatCreated?.(r.chatId);
   for (let i = 0; i < otherBots.length; i += BOT_BATCH) {

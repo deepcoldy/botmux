@@ -18,7 +18,7 @@ bun run daemon:logs
 
 > Every code change requires `bun run build` then `bun run daemon:restart`.
 
-> **Package manager is [bun](https://bun.sh)** (`packageManager: bun@1.4.0`,
+> **Package manager is [bun](https://bun.sh)** (`packageManager: bun@1.4.2`,
 > lockfile `bun.lock`). `trustedDependencies` in `package.json` must keep
 > `node-pty`: bun does not run dependency lifecycle scripts by default, and
 > `node-pty` needs its install hook to build `build/Release/pty.node` — without
@@ -39,6 +39,7 @@ Lark WebSocket Events
     |
 Daemon (daemon.ts → core/ modules)
     |-- im/lark/event-dispatcher: event routing
+    |-- im/lark/transport/connection: WebSocket connection and failed-state recovery
     |-- im/lark/card-handler: card interactions
     |-- core/worker-pool: worker process pool
     |-- core/command-handler: slash commands
@@ -94,6 +95,7 @@ src/
     lark/
       client.ts             # Lark API wrapper
       event-dispatcher.ts   # Lark WebSocket event routing
+      transport/connection.ts # WebSocket connection, proxy and failed-state recovery
       card-handler.ts       # Lark card interaction handling
       card-builder.ts       # Lark interactive card builders
       message-parser.ts     # Lark event message parsing

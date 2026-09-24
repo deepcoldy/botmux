@@ -5,6 +5,7 @@
  * 且解析 target 时排除 bot 自身。
  */
 import { getOwnerOpenId, getBotOpenId, getBot } from '../../bot-registry.js';
+import { isBotAdmin } from './grant-owner.js';
 import { isBotMentioned, extractMessageTextForRouting } from './event-dispatcher.js';
 import { stripLeadingMentions } from './message-parser.js';
 import { buildGrantCard } from './card-builder.js';
@@ -114,9 +115,9 @@ export async function tryHandleGrantCommand(
   const messageId = message.message_id;
   const chatId = message.chat_id;
 
-  // owner 强闸门
+  // owner / admin 强闸门
   const owner = getOwnerOpenId(larkAppId);
-  if (!senderOpenId || senderOpenId !== owner) {
+  if (!senderOpenId || !isBotAdmin(larkAppId, senderOpenId)) {
     await replyMessage(larkAppId, messageId, t(isGrant ? 'cmd.grant.owner_only' : 'cmd.revoke.owner_only', undefined, loc))
       .catch(err => logger.debug(`grant owner_only reply failed: ${err}`));
     return true;
@@ -222,7 +223,7 @@ export async function tryHandleGrantCommand(
   );
   const card = buildGrantCard(
     {
-      ownerOpenId: owner!,
+      ownerOpenId: senderOpenId ?? owner!,
       targets,
       chatId,
       nonce,

@@ -1,4 +1,4 @@
-import { getBot, type MessageListenerConfig } from '../bot-registry.js';
+import { getBot, type GroupMessageListenerOverride, type MessageListenerConfig } from '../bot-registry.js';
 import { rmwBotEntry } from './config-store.js';
 
 export type MessageListenerUpdate = {
@@ -10,6 +10,7 @@ export type MessageListenerUpdate = {
   senderPolicy?: MessageListenerConfig['senderPolicy'];
   messagePolicy?: MessageListenerConfig['messagePolicy'];
   contentPolicy?: MessageListenerConfig['contentPolicy'];
+  replyPolicy?: MessageListenerConfig['replyPolicy'];
 };
 
 function stringList(raw: unknown): string[] | undefined {
@@ -82,6 +83,9 @@ export function sanitizeMessageListenerUpdate(raw: unknown): MessageListenerUpda
     ? entry.contentPolicy as Record<string, unknown>
     : undefined;
   let contentPolicy: MessageListenerConfig['contentPolicy'];
+  const rawReply = entry.replyPolicy && typeof entry.replyPolicy === 'object' && !Array.isArray(entry.replyPolicy)
+    ? entry.replyPolicy as Record<string, unknown>
+    : {};
   if (rawContent) {
     const includeKeywords = stringList(rawContent.includeKeywords);
     // V1 is keyword-substring only (no regexes on the daemon main loop — see
@@ -103,6 +107,7 @@ export function sanitizeMessageListenerUpdate(raw: unknown): MessageListenerUpda
     ...(Object.keys(senderPolicy).length > 0 ? { senderPolicy } : {}),
     messagePolicy,
     ...(contentPolicy ? { contentPolicy } : {}),
+    ...(rawReply.mode === 'chat' ? { replyPolicy: { mode: 'chat', sessionMode: 'per_message' } } : {}),
   };
 }
 
@@ -119,10 +124,25 @@ export function validateMessageListenerUpdate(update: MessageListenerUpdate | un
 
 export function getMessageListenerConfig(larkAppId: string, chatId: string): MessageListenerConfig | null {
   try {
-    return getBot(larkAppId).config.messageListeners?.[chatId] ?? null;
+    const override = getBot(larkAppId).config.groupMessageListenerOverrides?.[chatId];
+    return override?.mode === 'custom' ? override.listener : null;
   } catch {
     return null;
   }
+}
+
+export type GroupMessageListenerMode = 'inherit' | 'disabled' | 'custom';
+
+export function getGlobalMessageListenerConfig(larkAppId: string): MessageListenerConfig | null {
+  try { return getBot(larkAppId).config.globalMessageListener ?? null; } catch { return null; }
+}
+
+export function getGroupMessageListenerOverride(larkAppId: string, chatId: string): GroupMessageListenerOverride | null {
+  try { return getBot(larkAppId).config.groupMessageListenerOverrides?.[chatId] ?? null; } catch { return null; }
+}
+
+export function getGroupMessageListenerMode(larkAppId: string, chatId: string): GroupMessageListenerMode {
+  return getGroupMessageListenerOverride(larkAppId, chatId)?.mode ?? 'inherit';
 }
 
 /**
@@ -153,7 +173,7 @@ export function messageListenerConfigFromUpdate(patch: MessageListenerUpdate): M
     ...(patch.senderPolicy && Object.keys(patch.senderPolicy).length > 0 ? { senderPolicy: patch.senderPolicy } : {}),
     ...(patch.messagePolicy ? { messagePolicy: { ...patch.messagePolicy, scope: 'top_level' } } : { messagePolicy: { scope: 'top_level' } }),
     ...(patch.contentPolicy ? { contentPolicy: patch.contentPolicy } : {}),
-    replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+    replyPolicy: { mode: patch.replyPolicy?.mode === 'chat' ? 'chat' : 'thread', sessionMode: 'per_message' },
   };
 }
 
@@ -174,27 +194,81 @@ export async function updateMessageListenerConfig(
   const normalized = messageListenerConfigFromUpdate(patch);
 
   const result = await rmwBotEntry<MessageListenerConfig | null>(larkAppId, (entry) => {
-    if (!normalized) {
-      if (entry.messageListeners && typeof entry.messageListeners === 'object') {
-        delete entry.messageListeners[chatId];
-        if (Object.keys(entry.messageListeners).length === 0) delete entry.messageListeners;
-      }
-      return { write: true, result: null };
+    if (!entry.groupMessageListenerOverrides || typeof entry.groupMessageListenerOverrides !== 'object' || Array.isArray(entry.groupMessageListenerOverrides)) {
+      entry.groupMessageListenerOverrides = {};
     }
-    if (!entry.messageListeners || typeof entry.messageListeners !== 'object' || Array.isArray(entry.messageListeners)) {
-      entry.messageListeners = {};
+    if (normalized) entry.groupMessageListenerOverrides[chatId] = { mode: 'custom', listener: normalized };
+    else delete entry.groupMessageListenerOverrides[chatId];
+    if (Object.keys(entry.groupMessageListenerOverrides).length === 0) delete entry.groupMessageListenerOverrides;
+    // Compatibility shadow for the legacy Roles-page endpoint and downgrade
+    // readers. New runtime resolution always prefers group overrides.
+    if (normalized) {
+      if (!entry.messageListeners || typeof entry.messageListeners !== 'object' || Array.isArray(entry.messageListeners)) entry.messageListeners = {};
+      entry.messageListeners[chatId] = normalized;
+    } else if (entry.messageListeners && typeof entry.messageListeners === 'object') {
+      delete entry.messageListeners[chatId];
+      if (Object.keys(entry.messageListeners).length === 0) delete entry.messageListeners;
     }
-    entry.messageListeners[chatId] = normalized;
     return { write: true, result: normalized };
   });
   if (!result.ok) return { ok: false, reason: result.reason };
 
-  if (!bot.config.messageListeners) bot.config.messageListeners = {};
-  if (normalized) bot.config.messageListeners[chatId] = normalized;
-  else {
+  if (!bot.config.groupMessageListenerOverrides) bot.config.groupMessageListenerOverrides = {};
+  if (normalized) bot.config.groupMessageListenerOverrides[chatId] = { mode: 'custom', listener: normalized };
+  else delete bot.config.groupMessageListenerOverrides[chatId];
+  if (Object.keys(bot.config.groupMessageListenerOverrides).length === 0) bot.config.groupMessageListenerOverrides = undefined;
+
+  return { ok: true, listener: result.result };
+}
+
+export async function updateGlobalMessageListenerConfig(
+  larkAppId: string,
+  patch: MessageListenerUpdate,
+): Promise<{ ok: true; listener: MessageListenerConfig | null } | { ok: false; reason: string }> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  const validation = validateMessageListenerUpdate(patch);
+  if (!validation.ok) return { ok: false, reason: validation.reason };
+  const normalized = messageListenerConfigFromUpdate(patch);
+  const result = await rmwBotEntry<MessageListenerConfig | null>(larkAppId, (entry) => {
+    if (normalized) entry.globalMessageListener = normalized;
+    else delete entry.globalMessageListener;
+    return { write: true, result: normalized };
+  });
+  if (!result.ok) return { ok: false, reason: result.reason };
+  bot.config.globalMessageListener = normalized ?? undefined;
+  return { ok: true, listener: result.result };
+}
+
+export async function updateGroupMessageListenerMode(
+  larkAppId: string,
+  chatId: string,
+  mode: Exclude<GroupMessageListenerMode, 'custom'>,
+): Promise<{ ok: true; mode: GroupMessageListenerMode } | { ok: false; reason: string }> {
+  let bot;
+  try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  const result = await rmwBotEntry<GroupMessageListenerMode>(larkAppId, (entry) => {
+    if (!entry.groupMessageListenerOverrides || typeof entry.groupMessageListenerOverrides !== 'object' || Array.isArray(entry.groupMessageListenerOverrides)) entry.groupMessageListenerOverrides = {};
+    if (mode === 'disabled') entry.groupMessageListenerOverrides[chatId] = { mode: 'disabled' };
+    else delete entry.groupMessageListenerOverrides[chatId];
+    if (Object.keys(entry.groupMessageListenerOverrides).length === 0) delete entry.groupMessageListenerOverrides;
+    // The legacy field is only a downgrade/old-endpoint shadow. Leaving an old
+    // row behind when the user chooses inherit would recreate a custom override
+    // on the next config load, defeating the mode change after restart.
+    if (entry.messageListeners && typeof entry.messageListeners === 'object' && !Array.isArray(entry.messageListeners)) {
+      delete entry.messageListeners[chatId];
+      if (Object.keys(entry.messageListeners).length === 0) delete entry.messageListeners;
+    }
+    return { write: true, result: mode };
+  });
+  if (!result.ok) return { ok: false, reason: result.reason };
+  if (!bot.config.groupMessageListenerOverrides) bot.config.groupMessageListenerOverrides = {};
+  if (mode === 'disabled') bot.config.groupMessageListenerOverrides[chatId] = { mode: 'disabled' };
+  else delete bot.config.groupMessageListenerOverrides[chatId];
+  if (Object.keys(bot.config.groupMessageListenerOverrides).length === 0) bot.config.groupMessageListenerOverrides = undefined;
+  if (bot.config.messageListeners) {
     delete bot.config.messageListeners[chatId];
     if (Object.keys(bot.config.messageListeners).length === 0) bot.config.messageListeners = undefined;
   }
-
-  return { ok: true, listener: result.result };
+  return { ok: true, mode: result.result };
 }

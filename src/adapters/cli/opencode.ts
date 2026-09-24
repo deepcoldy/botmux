@@ -1,4 +1,7 @@
+import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { promisify } from 'node:util';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { openDatabaseSyncNow } from '../../services/sqlite-compat.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
@@ -19,8 +22,26 @@ import { delay } from '../../utils/timing.js';
  *   - 兜底：botmux 每条 prompt 都嵌 `<session_id>` 块，直接在 part 表按文本反查。
  */
 
-const OPENCODE_SESSION_ID_RE = /^ses_[0-9A-Za-z]+$/;
+const OPENCODE_SESSION_ID_RE = /^ses_[0-9A-Za-z-]+$/;
 const OPENCODE_PASTE_THRESHOLD = 150;
+
+/** `models` 列表里一行模型 id 的形态：provider/name（允许多级，如 openrouter/anthropic/claude-sonnet-4）。 */
+const MODEL_ID_RE = /^[^\s/]+(?:\/[^\s]+)+$/;
+
+/**
+ * 解析 `opencode models` / `mimo models` 的纯文本输出为模型 id 列表。
+ * 输出每行一个模型，可带 ` — window 1.05M, compacts at 944K` 这类展示元数据
+ * （实测 mimo 1.x）；管道下无 ANSI 颜色，但 TTY 直出时可能带，先剥掉。
+ * 容错：只保留符合 provider/name 形态的行，标题/空行/坏行一律跳过（一条坏数据
+ * 不影响其余模型）；去重并保持出现顺序。
+ */
+export function parseModelList(stdout: string): string[] {
+  return [...new Set(stdout
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '')
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+—.*$/, '').trim())
+    .filter((line) => MODEL_ID_RE.test(line)))];
+}
 
 /** 判断是否 OpenCode 原生会话 id（`ses_…`）。opencode2 复用同一套 id 规则。 */
 export function isOpenCodeSessionId(value: string | undefined): value is string {
@@ -70,8 +91,7 @@ type StatementSyncLike = {
 /** 只读打开 opencode.db 执行一次查询。DB 是 WAL 模式且被活跃 OpenCode 进程持有，
  *  read-only 连接可并发读；任何失败（模块缺失/文件不存在/短暂锁忙）都回落 null，
  *  上层按"无法验证"降级，不影响输入投递本身。opencode2 与 opencode 共用该库。 */
-export function withDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
-  const dbPath = opencodeDbPath();
+export function withDb<T>(fn: (db: DatabaseSyncLike) => T, dbPath = opencodeDbPath()): T | null {
   if (!existsSync(dbPath)) return null;
   // Runtime-agnostic open: node:sqlite on Node, bun:sqlite on the compiled
   // binary (node:sqlite is absent under Bun). Returns null if neither loads,
@@ -89,12 +109,12 @@ export function withDb<T>(fn: (db: DatabaseSyncLike) => T): T | null {
 
 /** 提交验证基线：当前存储层最大 time_created（epoch ms，与 worker 同机同钟）。
  *  之后只认 >= 基线的新行，避免历史消息误配。 */
-export function snapPartBaseline(kind: OpenCodeDbKind = 'v1'): number | null {
+export function snapPartBaseline(kind: OpenCodeDbKind = 'v1', dbPath = opencodeDbPath()): number | null {
   const table = kind === 'v2' ? 'session_message' : 'part';
   return withDb((db) => {
     const row = db.prepare(`SELECT COALESCE(MAX(time_created), 0) AS ts FROM ${table}`).get() as { ts: number } | undefined;
     return row?.ts ?? 0;
-  });
+  }, dbPath);
 }
 
 /**
@@ -107,6 +127,7 @@ function detectNewSubmit(
   baseline: number,
   expectedText: string,
   kind: OpenCodeDbKind,
+  dbPath: string,
 ): { found: boolean; cliSessionId?: string } {
   const q = kind === 'v2'
     ? "SELECT session_id AS sid, json_extract(data, '$.text') AS text " +
@@ -128,7 +149,7 @@ function detectNewSubmit(
       }
     }
     return { found: false };
-  }) ?? { found: false };
+  }, dbPath) ?? { found: false };
 }
 
 /** 提交验证轮询（writeInput 共用实现，opencode2 复用）：基线已由调用方采样，
@@ -140,6 +161,8 @@ export async function detectOpenCodeSubmit(
   content: string,
   delayFn: (ms: number) => Promise<void> = delay,
   kind: OpenCodeDbKind = 'v1',
+  dbPath = opencodeDbPath(),
+  retryEnter = true,
 ): Promise<{ submitted: boolean; cliSessionId?: string; recheck?: () => { submitted: boolean; cliSessionId?: string } | false }> {
   const trySendEnter = (): boolean => {
     try {
@@ -154,7 +177,7 @@ export async function detectOpenCodeSubmit(
   if (baseline === null) return { submitted: true };
 
   for (let attempt = 0; attempt < 3; attempt++) {
-    const match = detectNewSubmit(baseline, content, kind);
+    const match = detectNewSubmit(baseline, content, kind, dbPath);
     if (match.found) {
       return match.cliSessionId
         ? { submitted: true, cliSessionId: match.cliSessionId }
@@ -163,22 +186,22 @@ export async function detectOpenCodeSubmit(
     await delayFn(800);
     // 等待期间记录可能已落库：发送重试 Enter 前先复查，命中就不再补发 Enter
     // （避免对已提交的内容多按一次回车，把输入框里本已提交的行再触发一次）。
-    const afterWait = detectNewSubmit(baseline, content, kind);
+    const afterWait = detectNewSubmit(baseline, content, kind, dbPath);
     if (afterWait.found) {
       return afterWait.cliSessionId
         ? { submitted: true, cliSessionId: afterWait.cliSessionId }
         : { submitted: true };
     }
-    if (!trySendEnter()) return { submitted: false };
+    if (retryEnter && !trySendEnter()) return { submitted: false };
   }
-  const finalMatch = detectNewSubmit(baseline, content, kind);
+  const finalMatch = detectNewSubmit(baseline, content, kind, dbPath);
   if (finalMatch.found) {
     return finalMatch.cliSessionId
       ? { submitted: true, cliSessionId: finalMatch.cliSessionId }
       : { submitted: true };
   }
   const recheck = () => {
-    const late = detectNewSubmit(baseline, content, kind);
+    const late = detectNewSubmit(baseline, content, kind, dbPath);
     return late.found
       ? { submitted: true, cliSessionId: late.cliSessionId }
       : false;
@@ -189,7 +212,7 @@ export async function detectOpenCodeSubmit(
 /** 兜底反查：botmux 每条 prompt 都带 `<session_id>xxx</session_id>` 块，按该文本在
  *  user 行里找最近命中的 OpenCode 会话。用于 cliSessionId 尚未持久化时的 resume
  *  （典型：首条消息经输入队列投递、没走 writeInput 验证就被 suspend/重启）。 */
-export function latestOpenCodeSessionForBotmuxSession(botmuxSessionId: string, kind: OpenCodeDbKind = 'v1'): string | undefined {
+export function latestOpenCodeSessionForBotmuxSession(botmuxSessionId: string, kind: OpenCodeDbKind = 'v1', dbPath = opencodeDbPath()): string | undefined {
   const q = kind === 'v2'
     ? "SELECT session_id AS sid FROM session_message WHERE type = 'user' AND instr(data, ?) > 0 " +
       'ORDER BY time_created DESC LIMIT 1'
@@ -202,15 +225,15 @@ export function latestOpenCodeSessionForBotmuxSession(botmuxSessionId: string, k
   return withDb((db) => {
     const row = db.prepare(q).get(botmuxSessionId) as { sid?: string } | undefined;
     return row?.sid;
-  }) ?? undefined;
+  }, dbPath) ?? undefined;
 }
 
-export function sessionRowExists(cliSessionId: string, kind: OpenCodeDbKind = 'v1'): boolean | null {
+export function sessionRowExists(cliSessionId: string, kind: OpenCodeDbKind = 'v1', dbPath = opencodeDbPath()): boolean | null {
   const table = kind === 'v2' ? 'session_v2' : 'session';
   return withDb((db) => {
     const row = db.prepare(`SELECT 1 AS ok FROM ${table} WHERE id = ? LIMIT 1`).get(cliSessionId) as { ok?: number } | undefined;
     return !!row?.ok;
-  });
+  }, dbPath);
 }
 
 /** 会话忙碌态判断的时效窗口（毫秒）。超过此窗口未更新的异常/孤儿记录不判忙，避免进程异常终止导致死锁。 */
@@ -223,10 +246,38 @@ export const OPENCODE_BUSY_FRESHNESS_MS = 120_000;
  *  1. 存在属于该 session、状态为 `status: "running"` 的 tool part；
  *  2. 该 session 最新的一条 assistant message 处于未完成状态（没有 completed 时间戳）。
  */
+export function isOpenCodeInitialPromptComplete(
+  baseline: number,
+  cliSessionId: string,
+  kind: OpenCodeDbKind = 'v1',
+  dbPath = opencodeDbPath(),
+): boolean {
+  const table = kind === 'v2' ? 'session_message' : 'message';
+  const role = kind === 'v2' ? "type = 'assistant'" : "json_extract(data, '$.role') = 'assistant'";
+  const completed = kind === 'v2'
+    ? "json_extract(data, '$.time.completed')"
+    : "json_extract(data, '$.time.completed')";
+  return withDb((db) => {
+    const assistant = db.prepare(
+      `SELECT ${completed} AS completed FROM ${table} WHERE session_id = ? AND ${role} AND time_created > ? ORDER BY time_created DESC LIMIT 1`,
+    ).get(cliSessionId, baseline) as { completed?: number | null } | undefined;
+    if (assistant?.completed === undefined || assistant.completed === null) return false;
+    const runningTool = kind === 'v2'
+      ? db.prepare(
+        "SELECT 1 AS busy FROM session_message WHERE session_id = ? AND time_created > ? AND json_extract(data, '$.state.status') = 'running' LIMIT 1",
+      ).get(cliSessionId, baseline)
+      : db.prepare(
+        "SELECT 1 AS busy FROM part WHERE session_id = ? AND time_created > ? AND json_extract(data, '$.type') = 'tool' AND json_extract(data, '$.state.status') = 'running' LIMIT 1",
+      ).get(cliSessionId, baseline);
+    return !(runningTool as { busy?: number } | undefined)?.busy;
+  }, dbPath) ?? false;
+}
+
 export function isOpenCodeSessionBusy(
   cliSessionId: string,
   kind: OpenCodeDbKind = 'v1',
   freshnessWindowMs: number = OPENCODE_BUSY_FRESHNESS_MS,
+  dbPath = opencodeDbPath(),
 ): boolean {
   const freshBaseline = Date.now() - freshnessWindowMs;
 
@@ -252,7 +303,7 @@ export function isOpenCodeSessionBusy(
       if (!lastMsg) return false;
       if (lastMsg.completed === undefined || lastMsg.completed === null) return true;
       return false;
-    }) ?? false;
+    }, dbPath) ?? false;
   }
 
   return withDb((db) => {
@@ -278,20 +329,20 @@ export function isOpenCodeSessionBusy(
     if (!lastMsg) return false;
     if (lastMsg.completed === undefined || lastMsg.completed === null) return true;
     return false;
-  }) ?? false;
+  }, dbPath) ?? false;
 }
 
 /** Import path（/adopt 第二过滤器）共用实现：从当前存储层的会话表列出可续接的
  *  顶层会话（parent_id 非空的是子代理会话，跳过）。opencode2 与 opencode 共用
  *  同一库文件，kind 区分表空间。 */
-export function listOpenCodeResumableSessions(opts: { limit: number; exclude?: ReadonlySet<string> }, kind: OpenCodeDbKind = 'v1'): ResumableSession[] {
+export function listOpenCodeResumableSessions(opts: { limit: number; exclude?: ReadonlySet<string> }, kind: OpenCodeDbKind = 'v1', dbPath = opencodeDbPath()): ResumableSession[] {
   const { limit, exclude } = opts;
   const table = kind === 'v2' ? 'session_v2' : 'session';
   const rows = withDb((db) => db.prepare(
     `SELECT id, directory, title, time_updated AS timeUpdated FROM ${table} ` +
     'WHERE parent_id IS NULL AND time_archived IS NULL ' +
     'ORDER BY time_updated DESC LIMIT ?',
-  ).all(limit + (exclude?.size ?? 0)) as { id: string; directory: string; title?: string; timeUpdated: number }[]) ?? [];
+  ).all(limit + (exclude?.size ?? 0)) as { id: string; directory: string; title?: string; timeUpdated: number }[], dbPath) ?? [];
   const out: ResumableSession[] = [];
   for (const r of rows) {
     if (out.length >= limit) break;
@@ -309,23 +360,37 @@ export function listOpenCodeResumableSessions(opts: { limit: number; exclude?: R
 
 // -------------------------------------------------------------------------
 
-export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
+export interface OpenCodeLikeAdapterOptions {
+  id: CliAdapter['id'];
+  defaultBin: string;
+  dataRoot: string;
+  authPaths?: readonly string[];
+  dbPath: () => string;
+  skillsDir: string;
+  hookConfigPath: string;
+  modelChoices: readonly string[] | undefined;
+  /** live 模型枚举的子命令参数（opencode / mimo 都是 `models` 纯文本列表）。 */
+  modelListArgs: readonly string[];
+  startupArgs?: readonly string[];
+}
+
+export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runtime: OpenCodeLikeAdapterOptions): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
   // modelChoices and must not shell out (see resolveCommand); the binary path
   // is a spawn-time concern.
-  const rawBin = pathOverride ?? 'opencode';
+  const rawBin = pathOverride ?? runtime.defaultBin;
   let cachedBin: string | undefined;
   return {
-    id: 'opencode',
+    id: runtime.id,
     // Whole dir kept REAL, not just auth.json: opencode keeps its global SQLite DB
     // (opencode.db, WAL mode) here. Under the deny-by-default file sandbox a path
     // not in authPaths doesn't exist, so the DB is unreachable / can't get the
     // POSIX fcntl locks SQLite needs (same failure as codex, see codex.ts).
-    authPaths: ['~/.local/share/opencode'],
+    authPaths: [...(runtime.authPaths ?? [runtime.dataRoot])],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ sessionId, resume, resumeSessionId, initialPrompt, model }) {
-      const args: string[] = [];
+      const args: string[] = [...(runtime.startupArgs ?? [])];
       if (model && model.trim()) {
         args.push('--model', model.trim());
       }
@@ -333,7 +398,7 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
       // 找不到就退化为全新会话（与旧行为一致）——绝不带无效 id 启动，
       // `opencode -s <不存在的id>` 会立即 exit 1 → daemon 自动重启 crash-loop。
       const openCodeSessionId = resume
-        ? (isOpenCodeSessionId(resumeSessionId) ? resumeSessionId : latestOpenCodeSessionForBotmuxSession(sessionId))
+        ? (isOpenCodeSessionId(resumeSessionId) ? resumeSessionId : latestOpenCodeSessionForBotmuxSession(sessionId, 'v1', runtime.dbPath()))
         : undefined;
       if (openCodeSessionId) {
         args.push('--session', openCodeSessionId);
@@ -351,16 +416,43 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     },
 
     passesInitialPromptViaArgs: true,
+    // tmux `new-session` rejects launch command strings well below OS ARG_MAX
+    // (~12 KB ok, ~16 KB "command too long" on Linux + tmux 3.3a).  OpenCode
+    // bakes the full first-round prompt into `--prompt <content>`, so a long
+    // routing/role/user prompt blows the tmux limit before OpenCode starts.
+    // Budget set to 8 KB: the botmux routing envelope alone is ~5.8–6.2 KB
+    // (zh/en) for a typical new topic, so 8 KB keeps short user messages on
+    // the reliable `--prompt` cold-start path while leaving ~6 KB headroom
+    // below the measured tmux ceiling.  Over-limit prompts defer to the
+    // normal post-start input queue.
+    maxInitialPromptArgBytes: 8192,
     // OpenCode 只在"新会话"应用 --prompt，`-s` 续接时静默忽略（消息会丢）。
     // 置位后 worker 在 resume spawn 时把初始 prompt 转入常规输入队列。
     initialPromptArgsIgnoredOnResume: true,
+    durableInitialPromptViaArgs: true,
+    captureInitialPromptArgSubmission() {
+      return snapPartBaseline('v1', runtime.dbPath());
+    },
+    async confirmInitialPromptArgSubmission(baseline, content) {
+      return detectOpenCodeSubmit({ write() {} }, baseline, content, delay, 'v1', runtime.dbPath(), false);
+    },
+    findInitialPromptArgSubmission(baseline, content) {
+      if (baseline === null) return { submitted: false };
+      const result = detectNewSubmit(baseline, content, 'v1', runtime.dbPath());
+      return result.cliSessionId
+        ? { submitted: result.found, cliSessionId: result.cliSessionId }
+        : { submitted: result.found };
+    },
+    isInitialPromptComplete(baseline, cliSessionId) {
+      return baseline !== null && isOpenCodeInitialPromptComplete(baseline, cliSessionId, 'v1', runtime.dbPath());
+    },
     rawCommandInputMode: 'paste-line',
     rawCommandSettleMs: 300,
 
     buildResumeCommand({ sessionId, cliSessionId }) {
-      const sid = isOpenCodeSessionId(cliSessionId) ? cliSessionId : latestOpenCodeSessionForBotmuxSession(sessionId);
+      const sid = isOpenCodeSessionId(cliSessionId) ? cliSessionId : latestOpenCodeSessionForBotmuxSession(sessionId, 'v1', runtime.dbPath());
       if (!sid) return null;
-      return `opencode -s ${sid}`;
+      return `${runtime.defaultBin} -s ${sid}`;
     },
 
     /** Resume 目标预检：id 不在 session 表 → false（worker 落回全新会话并提示），
@@ -368,31 +460,32 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
      *  （node:sqlite 缺失 / 首次运行 / sandbox 未授权该 DB 路径）→ undefined，交给
      *  worker 的二级重启护栏。 */
     checkResumeTargetExists({ sessionId, cliSessionId }) {
-      const sid = isOpenCodeSessionId(cliSessionId) ? cliSessionId : latestOpenCodeSessionForBotmuxSession(sessionId);
+      const sid = isOpenCodeSessionId(cliSessionId) ? cliSessionId : latestOpenCodeSessionForBotmuxSession(sessionId, 'v1', runtime.dbPath());
       if (!sid) {
         // 反查也找不到 → buildArgs 会退化为全新会话，spawn 本身不会失败。
         // 返回 undefined 让 spawn 正常走（fresh），不触发"无法恢复"提示误报。
-        return withDb(() => true) === null ? undefined : false;
+        return withDb(() => true, runtime.dbPath()) === null ? undefined : false;
       }
-      const exists = sessionRowExists(sid);
+      const exists = sessionRowExists(sid, 'v1', runtime.dbPath());
       return exists === null ? undefined : exists;
     },
 
     /** Import path（/adopt 第二过滤器）：从全局 session 表列出可续接的顶层会话
      *  （parent_id 非空的是子代理会话，跳过）。title 是 OpenCode 自动生成的摘要。 */
     listResumableSessions(opts) {
-      return Promise.resolve(listOpenCodeResumableSessions(opts));
+      return Promise.resolve(listOpenCodeResumableSessions(opts, 'v1', runtime.dbPath()));
     },
 
     async writeInput(pty: PtyHandle, content: string) {
       // 提交验证基线先于写入采样（traex 同款）。斜杠命令是 TUI 命令面板输入，
       // 不产生 user message 行，跳过验证（重试 Enter 还可能误触面板项）。
       const isSlashCommand = content.startsWith('/');
-      const baseline = isSlashCommand ? null : snapPartBaseline();
+      const needsPaste = !isSlashCommand && (content.length > OPENCODE_PASTE_THRESHOLD || content.includes('\n'));
+      const baseline = isSlashCommand ? null : snapPartBaseline('v1', runtime.dbPath());
 
       try {
         if (pty.sendText && pty.sendSpecialKeys) {
-          if (!isSlashCommand && pty.pasteText && (content.length > OPENCODE_PASTE_THRESHOLD || content.includes('\n'))) {
+          if (needsPaste && pty.pasteText) {
             pty.pasteText(content);
           } else {
             pty.sendText(content);
@@ -400,7 +493,10 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
           await delay(200);
           pty.sendSpecialKeys('Enter');
         } else {
-          pty.write(content);
+          // Raw PTY has no tmux paste-buffer to add these markers. Without
+          // them, long/deferred or multiline prompts are parsed as individual
+          // key events and can be dropped instead of submitted as one message.
+          pty.write(needsPaste ? `\x1b[200~${content}\x1b[201~` : content);
           await delay(1000);
           pty.write('\r');
         }
@@ -412,7 +508,7 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
       // DB 缺失（首次运行 / sandbox 未授权该 DB 路径）→ 维持旧行为：盲发、假定成功。
       if (baseline === null) return undefined;
 
-      const result = await detectOpenCodeSubmit(pty, baseline, content, delay);
+      const result = await detectOpenCodeSubmit(pty, baseline, content, delay, 'v1', runtime.dbPath());
       if (result.submitted) {
         return result.cliSessionId
           ? { submitted: true, cliSessionId: result.cliSessionId }
@@ -423,34 +519,67 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
 
     completionPattern: undefined,   // quiescence only — no explicit completion marker
     readyPattern: undefined,        // Bubble Tea TUI — no reliable prompt indicator; rely on quiescence + spinner guard
+    // No reliable prompt anchor: require 4s of silence before the FIRST paste
+    // so cold start / resume→fresh cannot type into a still-booting TUI; later
+    // cycles return to the normal 2s window.
+    firstPromptQuiescenceMs: 4_000,
     busyPattern: undefined,
     isSessionBusy({ sessionId, cliSessionId }) {
       const sid = isOpenCodeSessionId(cliSessionId)
         ? cliSessionId
-        : latestOpenCodeSessionForBotmuxSession(sessionId, 'v1');
+        : latestOpenCodeSessionForBotmuxSession(sessionId, 'v1', runtime.dbPath());
       if (!sid) return false;
-      return isOpenCodeSessionBusy(sid, 'v1');
+      return isOpenCodeSessionBusy(sid, 'v1', OPENCODE_BUSY_FRESHNESS_MS, runtime.dbPath());
     },
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,                // Bubble Tea renders in alternate screen buffer
     readOnlyRemoteScroll: true,
-    skillsDir: '~/.config/opencode/skills',
+    skillsDir: runtime.skillsDir,
     // botmux hook 安装：spawn 时写入 OpenCode 插件文件，
     // 使 question.asked 事件自动转发到 `botmux hook opencode`。
     hookInstall: {
-      configPath: '~/.config/opencode/plugin/botmux-ask.js',
+      configPath: runtime.hookConfigPath,
       format: 'opencode-plugin',
     },
     asksViaHook: true,
+    // Live 模型枚举：`<bin> models` 输出纯文本列表（每行 provider/name，可带
+    // 展示元数据，见 parseModelList）。仅 dashboard 在用户选中该 CLI 时按需调用，
+    // 不在 daemon/worker 启动路径上；任何异常（spawn 失败/超时/输出为空）一律
+    // fail-soft 返回 null，picker 回退到下面的 modelChoices。
+    async detectModels(): Promise<readonly string[] | null> {
+      try {
+        // lazy promisify：顶层 promisify(execFile) 会在部分 mock child_process
+        // 的测试 import 阶段炸（mock 无 execFile 导出）；推迟到调用时，fail-soft
+        // 的 try/catch 兜住（契约：任何异常 → null）。
+        const execFileAsync = promisify(execFile);
+        const { stdout } = await execFileAsync(this.resolvedBin, [...runtime.modelListArgs], {
+          timeout: 8000,
+          maxBuffer: 16 * 1024 * 1024,
+          windowsHide: true,
+        });
+        const models = parseModelList(String(stdout));
+        return models.length > 0 ? models : null;
+      } catch {
+        return null;
+      }
+    },
     // OpenCode model 通常 provider/name 形式（anthropic/claude-sonnet-4、openai/gpt-5），
     // 自由度高，候选只做引导，setup 时选 Other 自定义最常见。
-    modelChoices: [
-      'anthropic/claude-sonnet-4',
-      'anthropic/claude-opus-4',
-      'openai/gpt-5',
-      'google/gemini-2.5-pro',
-    ],
+    modelChoices: runtime.modelChoices ? [...runtime.modelChoices] : undefined,
   };
+}
+
+export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
+  return createOpenCodeLikeAdapter(pathOverride, {
+    id: 'opencode',
+    defaultBin: 'opencode',
+    dataRoot: '~/.local/share/opencode',
+    dbPath: opencodeDbPath,
+    skillsDir: '~/.config/opencode/skills',
+    hookConfigPath: '~/.config/opencode/plugin/botmux-ask.js',
+    modelListArgs: ['models'],
+    modelChoices: CLI_MODEL_CHOICES['opencode'],
+  });
 }
 
 export const create = createOpenCodeAdapter;

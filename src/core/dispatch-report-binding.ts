@@ -11,6 +11,8 @@ export interface DispatchReportBindingPayload {
   dispatchRoot: string;
   targetLarkAppId: string;
   targetSessionId: string;
+  targetChatId?: string;
+  targetScope?: 'thread' | 'chat';
   sourceName: string;
   issuedAt: string;
 }
@@ -36,15 +38,24 @@ function canonicalPayload(input: {
   dispatchRoot: string;
   targetLarkAppId: string;
   targetSessionId: string;
+  targetChatId?: string;
+  targetScope?: 'thread' | 'chat';
   sourceName?: string;
   issuedAt?: string;
 }): DispatchReportBindingPayload {
   const dispatchRoot = input.dispatchRoot.trim();
   const targetLarkAppId = input.targetLarkAppId.trim();
   const targetSessionId = input.targetSessionId.trim();
+  const targetChatId = input.targetChatId?.trim();
   if (!validDispatchRoot(dispatchRoot)) throw new Error('invalid dispatch root');
   if (!validIdentity(targetLarkAppId) || !validIdentity(targetSessionId)) {
     throw new Error('invalid dispatch report target');
+  }
+  if (targetChatId !== undefined && !/^oc_[A-Za-z0-9_-]{1,128}$/.test(targetChatId)) {
+    throw new Error('invalid dispatch report target chat');
+  }
+  if (input.targetScope !== undefined && input.targetScope !== 'thread' && input.targetScope !== 'chat') {
+    throw new Error('invalid dispatch report target scope');
   }
   const sourceName = input.sourceName?.trim().slice(0, 200) || 'dispatched subtask';
   const issuedAt = input.issuedAt ?? new Date().toISOString();
@@ -54,6 +65,8 @@ function canonicalPayload(input: {
     dispatchRoot,
     targetLarkAppId,
     targetSessionId,
+    ...(targetChatId ? { targetChatId } : {}),
+    ...(input.targetScope ? { targetScope: input.targetScope } : {}),
     sourceName,
     issuedAt,
   };
@@ -91,6 +104,12 @@ export function verifyDispatchReportBinding(
       targetSessionId: typeof candidate.targetSessionId === 'string'
         ? candidate.targetSessionId
         : '',
+      targetChatId: typeof candidate.targetChatId === 'string'
+        ? candidate.targetChatId
+        : undefined,
+      targetScope: candidate.targetScope === 'thread' || candidate.targetScope === 'chat'
+        ? candidate.targetScope
+        : undefined,
       sourceName: typeof candidate.sourceName === 'string' ? candidate.sourceName : '',
       issuedAt: typeof candidate.issuedAt === 'string' ? candidate.issuedAt : '',
     });

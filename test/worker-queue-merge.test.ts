@@ -27,11 +27,27 @@ describe('mergeQueuedCliInput', () => {
   });
 
   it('merges incremental queued messages into the pending tail', () => {
-    const pending = [{ content: 'first', turnId: 't1' }];
+    const trustedCaller = {
+      requestUserOpenId: 'ou_same', requestUserUnionId: 'on_same',
+      requestLarkAppId: 'app', senderType: 'user' as const,
+    };
+    const pending = [{ content: 'first', turnId: 't1', trustedCaller }];
 
-    expect(mergeQueuedCliInput(pending, { content: 'second', turnId: 't2' })).toBe(true);
+    expect(mergeQueuedCliInput(pending, { content: 'second', turnId: 't2', trustedCaller })).toBe(true);
 
-    expect(pending).toEqual([{ content: 'first\n\nsecond', turnId: 't2' }]);
+    expect(pending).toEqual([{ content: 'first\n\nsecond', turnId: 't2', trustedCaller }]);
+  });
+
+  it('never merges queue items across trusted caller boundaries', () => {
+    const pending = [{
+      content: 'first', turnId: 't1',
+      trustedCaller: { requestUserUnionId: 'on_a', requestLarkAppId: 'app', senderType: 'user' as const },
+    }];
+    expect(mergeQueuedCliInput(pending, {
+      content: 'second', turnId: 't2',
+      trustedCaller: { requestUserUnionId: 'on_b', requestLarkAppId: 'app', senderType: 'user' as const },
+    })).toBe(false);
+    expect(pending).toHaveLength(1);
   });
 
   it('never merges across a durable envelope boundary in either direction', () => {
@@ -165,11 +181,16 @@ describe('initial prompt args deferral', () => {
 });
 
 describe('durable turn queue boundary', () => {
-  it('routes an args-baked cold durable prompt through the owned queue', () => {
+  it('routes an args-baked cold durable prompt through the owned queue by default', () => {
     expect(shouldDeferArgsBakedDurablePrompt({
       passesInitialPromptViaArgs: true,
       adoptMode: false,
       dispatchAttempt: 1,
+    })).toBe(true);
+    expect(shouldDeferArgsBakedDurablePrompt({
+      passesInitialPromptViaArgs: true,
+      adoptMode: false,
+      queuedActivationToken: 'activation',
     })).toBe(true);
     expect(shouldDeferArgsBakedDurablePrompt({
       passesInitialPromptViaArgs: true,
@@ -184,6 +205,21 @@ describe('durable turn queue boundary', () => {
       passesInitialPromptViaArgs: true,
       adoptMode: true,
       dispatchAttempt: 1,
+    })).toBe(false);
+  });
+
+  it('keeps a fresh durable prompt on argv only for an adapter that guarantees it', () => {
+    expect(shouldDeferArgsBakedDurablePrompt({
+      passesInitialPromptViaArgs: true,
+      durableInitialPromptViaArgs: true,
+      adoptMode: false,
+      dispatchAttempt: 1,
+    })).toBe(false);
+    expect(shouldDeferArgsBakedDurablePrompt({
+      passesInitialPromptViaArgs: true,
+      durableInitialPromptViaArgs: true,
+      adoptMode: false,
+      queuedActivationToken: 'activation',
     })).toBe(false);
   });
 
@@ -325,4 +361,17 @@ describe('resetPreservingPendingCliInputs', () => {
 
     expect(pending.map(item => item.content)).toEqual(['queued', 'reset-added']);
   });
+});
+
+it('keeps collaborative messages separate even from the same sender', () => {
+  const trustedCaller = { requestUserOpenId: 'ou_a', requestLarkAppId: 'app', senderType: 'user' as const };
+  for (const flags of [[true, false], [false, true], [true, true]]) {
+    const tail = { content: 'first', turnId: 'a', trustedCaller,
+      ...(flags[0] ? { queueAfterActiveTurn: true as const } : {}) };
+    const next = { content: 'second', turnId: 'b', trustedCaller,
+      ...(flags[1] ? { queueAfterActiveTurn: true as const } : {}) };
+    expect(mergeQueuedCliInput([tail], next)).toBe(false);
+    expect(tail.content).toBe('first');
+    expect(tail.turnId).toBe('a');
+  }
 });

@@ -4,6 +4,24 @@ import { existsSync, readFileSync } from 'node:fs';
 const LINUX_BOOT_ID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/** Identity suitable for durable process ownership, including across reboots. */
+export function readDurableProcessIdentity(pid: number): string | undefined {
+  const started = readProcessStartIdentity(pid);
+  if (!started) return undefined;
+  if (process.platform !== 'linux') return started;
+  const boot = readLinuxBootIdentity();
+  return boot ? `${boot}:${started}` : undefined;
+}
+
+/** A zombie cannot run code or hold service ports, even though kill(0) succeeds. */
+export function isLinuxZombie(pid: number): boolean {
+  if (process.platform !== 'linux') return false;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(')') + 2).startsWith('Z ');
+  } catch { return false; }
+}
+
 /** Kernel-generated identity that changes on every Linux boot. */
 export function readLinuxBootIdentity(): string | undefined {
   if (process.platform !== 'linux') return undefined;
@@ -37,6 +55,24 @@ export function readProcessStartIdentity(pid: number): string | undefined {
       // Disappeared or unreadable: never fall through to ambient ps.
     }
     return undefined;
+  }
+  if (process.platform === 'win32') {
+    try {
+      const started = execFileSync('powershell.exe', [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `$p = Get-CimInstance Win32_Process -Filter \"ProcessId = ${pid}\"; `
+          + 'if ($p) { $p.CreationDate.ToUniversalTime().Ticks }',
+      ], {
+        encoding: 'utf-8',
+        timeout: 2_000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
+      return started || undefined;
+    } catch {
+      return undefined;
+    }
   }
   const ps = systemPsBin();
   if (!ps) return undefined;

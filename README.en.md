@@ -48,7 +48,9 @@ botmux start                 # start the daemon (botmux autostart enable for aut
 >
 > Nothing native is compiled during install (no Python / node-gyp / compiler): the PTY is already inside the binary. Supported: linux / macOS × x64 / arm64, with musl builds selected automatically on Alpine and similar. **On Windows, install inside WSL2** — the daemon needs PTY / tmux / Unix signals and does not run on native Windows; WSL2 reports as linux and is a fully supported first-class environment. An unsupported platform, or a binary that cannot run on this host, **fails with an explicit error and leaves your existing install untouched** rather than leaving you with a command that won't start.
 >
-> To upgrade: `botmux upgrade` (replaces the binary in place), or just **re-run the curl command** — also an in-place upgrade, and it won't append a second PATH line.
+> Stable macOS CLI releases use a consistent Apple Developer ID signature. Replacing the binary during an upgrade therefore preserves the code identity used by macOS file and App Data permissions instead of appearing as a new program for every version. Canary, beta, and RC builds remain ad-hoc signed.
+>
+> To upgrade: **always re-run the curl command above** (this also upgrades npm/pnpm global installs — in-place replacement, no second PATH line), then open a new terminal and run `botmux restart`; on ≥3.18 binary installs `botmux upgrade` is equivalent. To install a pinned version (rollbacks included): `curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | BOTMUX_VERSION=v3.18.8 sh` (the variable must precede the `sh` on the right side of the pipe). ⚠️ **Do not npm-upgrade from releases older than v3.18.0** — crossing the Node-sources → binary form boundary leaves the daemon unable to restart.
 
 <details>
 <summary>Already living in the Node ecosystem? npm works too (same binary)</summary>
@@ -59,7 +61,7 @@ npm install -g botmux        # requires Node >= 22 to run the install itself
 
 The npm package carries **the same self-contained binary** (only the one matching your os/arch is installed); its postinstall points `~/.botmux/bin/botmux` at it and writes PATH the same way. So you end up with exactly **one** botmux version — no more "two Node versions each carrying their own global botmux, fighting each other / no idea which one I just updated".
 
-The only difference is **who installs it and who upgrades it later**: the npm path needs Node ≥ 22 to run the install itself and hands upgrades back to `npm i -g botmux@latest`; the curl path never touches Node. Once running, the two are identical — same binary, same commands.
+The only difference is **who installs it**: the npm path needs Node ≥ 22 to run the install itself, the curl path never touches Node; **upgrades always re-run the curl command, no matter how you installed** (npm-upgrading from a pre-v3.18.0 install across that form boundary can leave the daemon unable to come back). Once running, the two are identical — same binary, same commands.
 
 </details>
 
@@ -81,7 +83,7 @@ More: [Roles & teams](https://deepcoldy.github.io/botmux/en/roles) · [File sand
 
 Switch with `cliId` in `bots.json`. **20+ adapters**, spanning local CLIs (process-isolated, reachable via `tmux attach`) and API / cloud agents (e.g. Mira, riff — reached over API / remote, not a local process; mojo is API-driven but executes tools on the bot host by default, set cloud: true for the remote sandbox). Representative ones:
 
-`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `hermes` · `ebsd` · `mira` · `riff` (cloud agent) … · `mojo` (API-driven, host execution by default) …
+`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco` (TRAE) · `hermes` · `ebsd` · `mira` · `riff` (cloud agent) … · `mojo` (API-driven, host execution by default) · `minimax` (MiniMax `mmx text repl`; region set by `mmx auth login --region cn|global`, isolate multiple regions on one host via per-bot `env` `MMX_CONFIG_DIR`) …
 
 The `ebsd` adapter uses a dedicated external service identity and native OMP session storage. Operators must provide the Diag Gateway token and ByteCloud service account through permission-restricted files, never through `bots.json`.
 
@@ -131,6 +133,10 @@ The table below compares only **verifiable integration boundaries** — it does 
 | Multi-CLI / agent | 20+ adapters, switch in one line | Depends on SDK coverage |
 | Multi-bot | Multi-bot @mention routing in one group | Depends on the implementation |
 | Direct terminal | Local CLIs can `tmux attach` into the real process | Depends on the implementation |
+
+## Integrating Applications with Their Own Task Workflows
+
+External applications can use experimental [model proxy mode](docs/model-proxy.md) through an authenticated local Chat Completions endpoint. Applications such as [OpenCodeReview (OCR)](https://github.com/alibaba/open-code-review) can connect through a model SDK while retaining control of context, tools, and task workflows. The execution layer implements seven CLI identities; the documentation distinguishes protocol support, native CLI tests, and pending account validation. The underlying [constrained invocation interface](docs/constrained-invocations.md) provides task status, cancellation, deduplication, and process cleanup.
 
 ## Docs · Community · Contributing
 

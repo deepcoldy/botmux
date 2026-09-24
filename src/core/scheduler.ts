@@ -1,13 +1,24 @@
 import { Cron } from 'croner';
+import { randomUUID } from 'node:crypto';
 import * as scheduleStore from '../services/schedule-store.js';
+import type { ScheduleReasoningEffort } from '../services/schedule-store.js';
+import { removeSchedulePrecondition } from '../services/schedule-precondition-store.js';
+import { removeScheduleRunLogs } from '../services/schedule-run-log-store.js';
+import type { ScheduledTaskPreconditionOutcome } from '../services/schedule-precondition-gate.js';
 import { scheduleTimeZone, zonedTomorrowAt } from '../utils/timezone.js';
 import { emitHookEvent } from '../services/hook-runner.js';
 import { logger } from '../utils/logger.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import type { ScheduledTask, ParsedSchedule, ScheduleExecutionPosition } from '../types.js';
 
+export interface ScheduleExecutionContext {
+  runId: string;
+  trigger: 'scheduler' | 'dashboard';
+  startedAt: string;
+}
+
 // Callback set by daemon to execute a scheduled task
-let executeCallback: ((task: ScheduledTask) => Promise<void>) | null = null;
+let executeCallback: ((task: ScheduledTask, context: ScheduleExecutionContext) => Promise<ScheduledTaskPreconditionOutcome | void>) | null = null;
 let tickTimer: NodeJS.Timeout | null = null;
 // Last effective schedule timezone seen by the tick loop. When it changes
 // (dashboard config / env / host), enabled CRON tasks' persisted nextRunAt was
@@ -26,7 +37,10 @@ const ONESHOT_GRACE_SECONDS = 120;        // one-shots fire even if <2min late
 const MIN_GRACE_SECONDS = 120;            // catch-up window lower bound
 const MAX_GRACE_SECONDS = 2 * 60 * 60;    // catch-up window upper bound (2h)
 
-function emitScheduleFiredHook(task: ScheduledTask, status: 'ok' | 'error', error?: unknown): void {
+function emitScheduleFiredHook(task: ScheduledTask, status: 'ok' | 'error' | 'skipped', error?: unknown): void {
+  const chatIds = task.chatIds
+    ? scheduleStore.effectiveScheduleChatIds(task)
+    : [task.chatId];
   emitHookEvent('schedule.fired', {
     id: task.id,
     name: task.name,
@@ -34,6 +48,9 @@ function emitScheduleFiredHook(task: ScheduledTask, status: 'ok' | 'error', erro
     status,
     error: error ? (error instanceof Error ? error.message : String(error)) : undefined,
     chatId: task.chatId,
+    // Preserve the exact legacy hook payload for single-chat tasks while
+    // exposing every independently dispatched target for multi-chat tasks.
+    ...(chatIds.length > 1 ? { chatIds } : {}),
     rootMessageId: task.rootMessageId,
     chatType: task.chatType,
     scope: task.scope,
@@ -42,8 +59,79 @@ function emitScheduleFiredHook(task: ScheduledTask, status: 'ok' | 'error', erro
   });
 }
 
-export function setExecuteCallback(cb: (task: ScheduledTask) => Promise<void>): void {
+export function setExecuteCallback(
+  cb: (task: ScheduledTask, context: ScheduleExecutionContext) => Promise<ScheduledTaskPreconditionOutcome | void>,
+): void {
   executeCallback = cb;
+}
+
+function createExecutionContext(
+  trigger: ScheduleExecutionContext['trigger'],
+  startedAt = new Date().toISOString(),
+): ScheduleExecutionContext {
+  return { runId: randomUUID(), trigger, startedAt };
+}
+
+function cleanupRemovedTaskPrecondition(task: ScheduledTask): void {
+  const appId = task.larkAppId ?? scheduleStore.getScheduleScope();
+  if (!appId) return;
+  try {
+    removeSchedulePrecondition(appId, task.id);
+  } catch (error) {
+    logger.warn(
+      `[scheduler] Failed to remove protected precondition for deleted task ${task.id}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+function cleanupRemovedTaskRunLogs(task: ScheduledTask): void {
+  const appId = task.larkAppId ?? scheduleStore.getScheduleScope();
+  if (!appId) return;
+  try {
+    removeScheduleRunLogs(task.id, appId);
+  } catch (error) {
+    logger.warn(
+      `[scheduler] Failed to remove execution logs for deleted task ${task.id}: `
+      + `${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+function cleanupRemovedTaskSidecars(task: ScheduledTask): void {
+  cleanupRemovedTaskPrecondition(task);
+  cleanupRemovedTaskRunLogs(task);
+}
+
+function cleanupIfTaskWasAutoRemoved(task: ScheduledTask): void {
+  if (!scheduleStore.getTask(task.id)) cleanupRemovedTaskSidecars(task);
+}
+
+function recordDispatchOutcome(
+  task: ScheduledTask,
+  context: ScheduleExecutionContext,
+  outcome: ScheduledTaskPreconditionOutcome | void,
+): void {
+  const status = outcome === 'skipped' ? 'skipped' : 'ok';
+  if (status === 'skipped') {
+    let nextRunAt: string | undefined;
+    if (task.parsed.kind === 'once') {
+      // Keep a one-shot eligible after a skipped check, including runNow,
+      // which clears nextRunAt before dispatch. Do not bring a future plan forward.
+      const scheduledAt = task.nextRunAt ?? task.parsed.runAt;
+      const retryAt = Date.now() + TICK_INTERVAL_MS;
+      nextRunAt = new Date(scheduledAt ? Math.max(retryAt, Date.parse(scheduledAt)) : retryAt).toISOString();
+    }
+    scheduleStore.markSkipped(task.id, nextRunAt, context.runId);
+  } else {
+    scheduleStore.markRun(task.id, true, undefined, undefined, context.runId);
+    cleanupIfTaskWasAutoRemoved(task);
+  }
+  dashboardEventBus.publish({
+    type: 'schedule.fired',
+    body: { id: task.id, runAt: Date.now(), status },
+  });
+  emitScheduleFiredHook(task, status);
 }
 
 /**
@@ -274,7 +362,7 @@ export function parseNaturalSchedule(input: string): ParseNLResult | null {
 }
 
 function extractExecutionPositionModifier(prompt: string): {
-  executionPosition?: Extract<ScheduleExecutionPosition, 'top-level' | 'new-topic'>;
+  executionPosition?: Extract<ScheduleExecutionPosition, 'top-level' | 'new-topic' | 'task'>;
   prompt: string;
 } {
   const topLevelZh = prompt.match(/^\s*(?:群消息顶层|群顶层|顶层)(?:执行|运行)?[\s,，、:：。-]+(.+)$/s);
@@ -286,6 +374,14 @@ function extractExecutionPositionModifier(prompt: string): {
   if (zh && zh[1].trim()) return { executionPosition: 'new-topic', prompt: zh[1].trim() };
   const en = prompt.match(/^\s*(?:every\s+run\s+in\s+a\s+)?new[\s-]?topic[\s,:：-]+(.+)$/is);
   if (en && en[1].trim()) return { executionPosition: 'new-topic', prompt: en[1].trim() };
+
+  // Dedicated per-task topic: 独立话题 / 专属话题 (and English dedicated/task/
+  // own topic). Must stay distinct from the 新话题 / new-topic patterns above —
+  // a task topic is created once and reused across that task's own fires.
+  const taskZh = prompt.match(/^\s*(?:每次|每回|每天|每日)?\s*(?:独立|专属)(?:的)?话题[\s,，、:：。-]*(.+)$/s);
+  if (taskZh && taskZh[1].trim()) return { executionPosition: 'task', prompt: taskZh[1].trim() };
+  const taskEn = prompt.match(/^\s*(?:every\s+run\s+in\s+(?:its\s+own|a\s+dedicated)\s+topic|(?:dedicated|task|own)[\s-]?topic)[\s,:：-]+(.+)$/is);
+  if (taskEn && taskEn[1].trim()) return { executionPosition: 'task', prompt: taskEn[1].trim() };
   return { prompt };
 }
 
@@ -316,25 +412,27 @@ export function extractSilentMode(prompt: string): { silent: boolean; prompt: st
 
 /**
  * Extract both /schedule prompt modifiers regardless of their order.
- * `deliver:new-topic` remains a compatibility token indicating that a position
+ * `deliver:new-topic` remains a compatibility token indicating that a routing
  * modifier was present. `executionPosition` carries the unambiguous modern
- * value: group top level or a fresh topic on every run.
+ * value: group top level, a fresh topic on every run, or the task's own
+ * dedicated topic. The dedicated-task position stays `deliver:'origin'` — it
+ * is a normal in-chat delivery target, not the legacy new-topic delivery.
  */
 export function extractScheduleModifiers(prompt: string): {
   deliver: 'origin' | 'new-topic';
-  executionPosition?: Extract<ScheduleExecutionPosition, 'top-level' | 'new-topic'>;
+  executionPosition?: Extract<ScheduleExecutionPosition, 'top-level' | 'new-topic' | 'task'>;
   silent: boolean;
   prompt: string;
 } {
   let deliver: 'origin' | 'new-topic' = 'origin';
-  let executionPosition: Extract<ScheduleExecutionPosition, 'top-level' | 'new-topic'> | undefined;
+  let executionPosition: Extract<ScheduleExecutionPosition, 'top-level' | 'new-topic' | 'task'> | undefined;
   let silent = false;
   let rest = prompt;
   // Two keywords max — loop twice so either order is handled.
   for (let i = 0; i < 2; i++) {
     const d = extractExecutionPositionModifier(rest);
     if (d.executionPosition) {
-      deliver = 'new-topic';
+      if (d.executionPosition !== 'task') deliver = 'new-topic';
       executionPosition = d.executionPosition;
       rest = d.prompt;
       continue;
@@ -448,30 +546,30 @@ async function tick(): Promise<void> {
       }
     }
 
-    // At-most-once: advance next_run BEFORE execution so crash mid-run doesn't re-fire
-    if (task.parsed.kind !== 'once') {
-      const newNext = computeNextRun(task.parsed, new Date(now).toISOString());
-      if (newNext) scheduleStore.updateTask(task.id, { nextRunAt: newNext });
-    }
-
-    // Execute
-    logger.info(`[scheduler] Task "${task.name}" (${task.id}) triggered (kind=${task.parsed.kind})`);
-    scheduleStore.updateTask(task.id, { lastRunAt: new Date().toISOString() });
+    const executionContext = createExecutionContext('scheduler');
+    // Claim every due run before dispatch. Recurring tasks advance to their next
+    // occurrence; one-shots persist lastRunAt and clear nextRunAt, so another
+    // scheduler tick (or a daemon restart) cannot dispatch the same run while
+    // its asynchronous model turn is still in flight. A precondition skip
+    // explicitly restores a one-shot retry time in recordDispatchOutcome().
+    const newNext = computeNextRun(task.parsed, executionContext.startedAt);
+    const claim = scheduleStore.claimRun(task.id, {
+      lastRunAt: executionContext.startedAt,
+      nextRunAt: newNext ?? undefined,
+      lastRunId: executionContext.runId,
+    });
+    if (!claim.ok) continue;
+    const claimedTask = claim.task;
+    logger.info(`[scheduler] Task "${claimedTask.name}" (${claimedTask.id}) triggered (kind=${claimedTask.parsed.kind})`);
 
     if (executeCallback) {
-      const taskId = task.id;
-      executeCallback(task)
-        .then(() => {
-          scheduleStore.markRun(taskId, true);
-          dashboardEventBus.publish({
-            type: 'schedule.fired',
-            body: { id: taskId, runAt: Date.now(), status: 'ok' },
-          });
-          emitScheduleFiredHook(task, 'ok');
-        })
+      const taskId = claimedTask.id;
+      executeCallback(claimedTask, executionContext)
+        .then(outcome => recordDispatchOutcome(claimedTask, executionContext, outcome))
         .catch(err => {
-          logger.error(`[scheduler] Task "${task.name}" failed: ${err.message}`);
-          scheduleStore.markRun(taskId, false, err.message);
+          logger.error(`[scheduler] Task "${claimedTask.name}" failed: ${err.message}`);
+          scheduleStore.markRun(taskId, false, err.message, undefined, executionContext.runId);
+          cleanupIfTaskWasAutoRemoved(claimedTask);
           dashboardEventBus.publish({
             type: 'schedule.fired',
             body: {
@@ -481,8 +579,16 @@ async function tick(): Promise<void> {
               error: err instanceof Error ? err.message : String(err),
             },
           });
-          emitScheduleFiredHook(task, 'error', err);
+          emitScheduleFiredHook(claimedTask, 'error', err);
         });
+    } else {
+      scheduleStore.markRun(
+        claimedTask.id,
+        false,
+        'scheduler execute callback is not initialised',
+        undefined,
+        executionContext.runId,
+      );
     }
   }
 }
@@ -522,6 +628,17 @@ function applyCronRealign(updates: Array<{ id: string; nextRunAt: string }>): vo
 // ─── Public API ─────────────────────────────────────────────────────────────
 
 export function startScheduler(): void {
+  const startupTasks = scheduleStore.listTasks();
+  for (const task of startupTasks) {
+    if (!taskBelongsToThisDaemon(task) || task.lastStatus !== 'running') continue;
+    scheduleStore.markRun(
+      task.id,
+      false,
+      'schedule run interrupted by daemon restart',
+      undefined,
+      task.lastRunId,
+    );
+  }
   const tasks = scheduleStore.listTasks();
   const enabled = tasks.filter(t => t.enabled);
   logger.info(`[scheduler] Starting with ${enabled.length}/${tasks.length} enabled tasks (tick every ${TICK_INTERVAL_MS/1000}s)`);
@@ -560,12 +677,26 @@ export function stopScheduler(): void {
   logger.info('[scheduler] Stopped');
 }
 
+/** Limit configuration writes, not loading, dispatch or trusted rollback of
+ * legacy tasks. The first chat is the primary target, so order matters. */
+export function assertScheduleChatTargetLimit(chatIds: readonly string[], previous?: readonly string[]): void {
+  if (
+    chatIds.length > 5
+    && (!previous || chatIds.length !== previous.length || chatIds.some((id, index) => id !== previous[index]))
+  ) {
+    throw new Error('too_many_target_chats');
+  }
+}
+
 export function addTask(params: {
+  id?: string;
+  preconditionRef?: string;
   name: string;
   schedule: string;
   prompt: string;
   workingDir: string;
   chatId: string;
+  chatIds?: readonly string[];
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
   executionPosition?: ScheduleExecutionPosition;
@@ -587,7 +718,20 @@ export function addTask(params: {
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
+  /** See ScheduledTask.followActive. Requires executionPosition 'topic'. */
+  followActive?: boolean;
+  /** See ScheduledTask.model — per-task CLI model for this task's own runs. */
+  model?: string;
+  /** See ScheduledTask.reasoningEffort. */
+  reasoningEffort?: ScheduleReasoningEffort;
 }): ScheduledTask {
+  const targets = params.chatIds === undefined
+    ? { chatId: params.chatId }
+    : scheduleStore.normalizeScheduleChatTargets({
+        chatId: params.chatId,
+        chatIds: params.chatIds,
+      });
+  assertScheduleChatTargetLimit(targets.chatIds ?? [targets.chatId]);
   const parsed = params.parsed ?? parseSchedule(params.schedule);
   const nextRunAt = computeNextRun(parsed) ?? undefined;
   const executionPosition: ScheduleExecutionPosition = params.executionPosition
@@ -596,19 +740,41 @@ export function addTask(params: {
       : params.scope === 'chat'
         ? 'top-level'
         : params.rootMessageId ? 'topic' : 'top-level');
-  if (executionPosition === 'topic' && !params.rootMessageId) {
+  if (executionPosition === 'topic' && (targets.chatIds?.length ?? 1) > 1) {
+    throw new Error('multiple_chats_topic_unsupported');
+  }
+  // A task's dedicated topic is created inside its own group — spanning
+  // multiple groups would make the one-topic-per-task identity ambiguous.
+  if (executionPosition === 'task' && (targets.chatIds?.length ?? 1) > 1) {
+    throw new Error('multiple_chats_task_unsupported');
+  }
+  if (executionPosition === 'topic' && !params.rootMessageId?.trim()) {
     throw new Error('topic_root_required');
   }
+  // Following the active topic only makes sense when the task lands in a
+  // topic at all; at top level / new-topic there is nothing to follow.
+  if (params.followActive === true && executionPosition !== 'topic') {
+    throw new Error('follow_active_requires_topic');
+  }
   const topicTitle = normalizeTopicTitle(params.topicTitle);
-  const scope: 'thread' | 'chat' = executionPosition === 'topic' ? 'thread' : 'chat';
+  // Task position owns a topic (created lazily by its first fire), so the row
+  // is thread-scoped like an explicit topic — but the root only exists after
+  // the first fire.
+  const scope: 'thread' | 'chat' = executionPosition === 'topic' || executionPosition === 'task' ? 'thread' : 'chat';
   const task = scheduleStore.createTask({
+    id: params.id,
+    preconditionRef: params.preconditionRef,
     name: params.name,
     schedule: params.schedule,
     parsed,
     prompt: params.prompt,
     workingDir: params.workingDir,
-    chatId: params.chatId,
-    rootMessageId: params.rootMessageId,
+    chatId: targets.chatId,
+    chatIds: targets.chatIds,
+    // Only explicit topic execution keeps a caller root. A task-position root
+    // is written back by the first fire / restart recovery, so a root supplied
+    // at creation (foreign to this task) must never be persisted.
+    rootMessageId: executionPosition === 'topic' ? params.rootMessageId : undefined,
     scope,
     executionPosition,
     topicTitle,
@@ -625,6 +791,9 @@ export function addTask(params: {
     // local-vs-chat distinction; schedule-store also normalizes legacy values.
     deliver: params.deliver === 'local' ? 'local' : 'origin',
     silent: params.silent,
+    followActive: params.followActive === true ? true : undefined,
+    model: params.model?.trim() || undefined,
+    reasoningEffort: params.reasoningEffort,
   });
   logger.info(`[scheduler] Added task "${task.name}" (${task.id}) — ${parsed.display}, next: ${nextRunAt ?? 'N/A'}`);
   return task;
@@ -644,27 +813,37 @@ export function resolveTaskExecutionPosition(
   if (task.executionPosition === 'top-level' || task.executionPosition === 'topic' || task.executionPosition === 'new-topic') {
     return task.executionPosition === 'topic' && !task.rootMessageId ? 'top-level' : task.executionPosition;
   }
+  // Task position: before the dedicated topic materializes (no root yet) the
+  // fire path owns first-fire creation; once the root has been written back,
+  // execution rides the ordinary retained-thread branch ('topic').
+  if (task.executionPosition === 'task') return task.rootMessageId ? 'topic' : 'task';
   if (task.deliver === 'new-topic') return 'new-topic';
   if (task.scope === 'chat') return 'top-level';
   return task.rootMessageId ? 'topic' : 'top-level';
 }
 
 export function removeTask(id: string): boolean {
-  return scheduleStore.removeTask(id);
+  const task = scheduleStore.getTask(id);
+  if (!task) return false;
+  const removed = scheduleStore.removeTask(id);
+  if (removed) cleanupRemovedTaskSidecars(task);
+  return removed;
 }
 
 export function enableTask(id: string): boolean {
   const task = scheduleStore.getTask(id);
   if (!task) return false;
   const next = computeNextRun(task.parsed);
-  scheduleStore.updateTask(id, { enabled: true, nextRunAt: next ?? undefined });
+  scheduleStore.updateTask(id, {
+    enabled: true, disabledReason: undefined, nextRunAt: next ?? undefined,
+  });
   return true;
 }
 
 export function disableTask(id: string): boolean {
   const task = scheduleStore.getTask(id);
   if (!task) return false;
-  scheduleStore.updateTask(id, { enabled: false });
+  scheduleStore.updateTask(id, { enabled: false, disabledReason: 'manual' });
   return true;
 }
 
@@ -675,8 +854,9 @@ export function runTaskNow(id: string): boolean {
   // (< 30s) will pick it up.  Previously we invoked executeCallback inline,
   // which was wrong in multi-bot setups — the callback on this daemon may
   // not even be the right bot for this task.
+  const requested = scheduleStore.requestRunNow(id);
+  if (!requested.ok) return false;
   logger.info(`[scheduler] Marked "${task.name}" (${task.id}) for immediate run`);
-  scheduleStore.updateTask(id, { nextRunAt: new Date().toISOString() });
   return true;
 }
 
@@ -694,7 +874,7 @@ export function getNextRun(id: string): Date | null {
 /**
  * Fire a scheduled task immediately. Returns ok=false if id not found or the
  * scheduler hasn't been initialised with an executeCallback yet.  Emits a
- * `schedule.fired` event on completion (success or error).
+ * `schedule.fired` event on completion (success, skip or error).
  */
 export function runNow(id: string): { ok: boolean; error?: string } {
   const task = scheduleStore.getTask(id);
@@ -702,32 +882,29 @@ export function runNow(id: string): { ok: boolean; error?: string } {
   if (!executeCallback) return { ok: false, error: 'not_initialised' };
   // Bump lastRunAt + nextRunAt synchronously so the upcoming 30s tick won't
   // re-fire the same task while this manual run is still in flight.
-  const nowIso = new Date().toISOString();
-  const next = computeNextRun(task.parsed, nowIso);
-  scheduleStore.updateTask(id, {
-    lastRunAt: nowIso,
+  const executionContext = createExecutionContext('dashboard');
+  const next = computeNextRun(task.parsed, executionContext.startedAt);
+  const claim = scheduleStore.claimRun(id, {
+    lastRunAt: executionContext.startedAt,
     nextRunAt: next ?? undefined,
+    lastRunId: executionContext.runId,
   });
+  if (!claim.ok) return claim;
+  const claimedTask = claim.task;
   // Don't block the caller — fire on next tick. `Promise.resolve().then`
   // coerces a synchronous throw from executeCallback into a rejection so the
   // error path always runs and we don't leak a 500 to the IPC client.
-  void Promise.resolve().then(() => executeCallback!(task)).then(
-    () => {
-      scheduleStore.markRun(task.id, true);
-      dashboardEventBus.publish({
-        type: 'schedule.fired',
-        body: { id, runAt: Date.now(), status: 'ok' },
-      });
-      emitScheduleFiredHook(task, 'ok');
-    },
+  void Promise.resolve().then(() => executeCallback!(claimedTask, executionContext)).then(
+    outcome => recordDispatchOutcome(claimedTask, executionContext, outcome),
     err => {
       const msg = err instanceof Error ? err.message : String(err);
-      scheduleStore.markRun(task.id, false, msg);
+      scheduleStore.markRun(claimedTask.id, false, msg, undefined, executionContext.runId);
+      cleanupIfTaskWasAutoRemoved(claimedTask);
       dashboardEventBus.publish({
         type: 'schedule.fired',
         body: { id, runAt: Date.now(), status: 'error', error: msg },
       });
-      emitScheduleFiredHook(task, 'error', err);
+      emitScheduleFiredHook(claimedTask, 'error', err);
     },
   );
   return { ok: true };
@@ -741,12 +918,15 @@ export function runNow(id: string): { ok: boolean; error?: string } {
 export function setEnabled(id: string, enabled: boolean): { ok: boolean; error?: string } {
   const task = scheduleStore.getTask(id);
   if (!task) return { ok: false, error: 'not_found' };
-  if (task.enabled === enabled) return { ok: true }; // no-op
+  if (task.enabled === enabled
+    && (enabled || task.disabledReason === 'manual')) return { ok: true };
   if (enabled) {
     const next = computeNextRun(task.parsed);
-    scheduleStore.updateTask(id, { enabled: true, nextRunAt: next ?? undefined });
+    scheduleStore.updateTask(id, {
+      enabled: true, disabledReason: undefined, nextRunAt: next ?? undefined,
+    });
   } else {
-    scheduleStore.updateTask(id, { enabled: false });
+    scheduleStore.updateTask(id, { enabled: false, disabledReason: 'manual' });
   }
   dashboardEventBus.publish({
     type: 'schedule.updated',
@@ -757,9 +937,10 @@ export function setEnabled(id: string, enabled: boolean): { ok: boolean; error?:
 
 /**
  * Cycle a task's execution position: retained topic → group top level → fresh
- * topic per run → retained topic (or group top level when no root is retained).
- * Silent tasks skip the fresh-topic state because that state needs a visible
- * seed message. The `deliver` response remains for cached clients.
+ * topic per run → the task's own dedicated topic → group top level (a
+ * materialized dedicated topic starts from the retained-topic state). Silent
+ * tasks skip the fresh-topic state because that state needs a visible seed
+ * message. The `deliver` response remains for cached clients.
  */
 export function toggleDelivery(id: string): {
   ok: boolean;
@@ -774,18 +955,33 @@ export function toggleDelivery(id: string): {
   let executionPosition: ScheduleExecutionPosition;
   if (current === 'topic') executionPosition = 'top-level';
   else if (current === 'top-level') executionPosition = 'new-topic';
-  // Leaving the fresh-topic state parks at top level. The retained root is
-  // never reused to cycle back into a topic silently — that was the
-  // adopt-topic leak.
+  else if (current === 'new-topic') {
+    // Same multi-chat refusal addTask/updateTask enforce: the dedicated-task
+    // position is single-chat only. The body-less delivery toggle is a legacy
+    // compatibility route and must not persist 'task' for a multi-chat task —
+    // the next fire would run a single-chat dedicated task per target and let
+    // them race on the shared rootMessageId.
+    const targets = scheduleStore.normalizeScheduleChatTargets({
+      chatId: task.chatId,
+      chatIds: task.chatIds ?? null,
+    });
+    if ((targets.chatIds ?? [targets.chatId]).length > 1) {
+      return { ok: false, error: 'multiple_chats_task_unsupported' };
+    }
+    executionPosition = 'task';
+  }
+  // A dedicated task parks at top level. The retained root is never reused to
+  // cycle back into a topic silently — that was the adopt-topic leak.
   else executionPosition = 'top-level';
   if (executionPosition === current) return { ok: false, error: 'topic_root_required' };
-  // Topic is never a toggle target (it needs an explicit re-anchor via
-  // updateTask), so every cycle state above lands in chat scope.
-  const scope: 'chat' | 'thread' = 'chat';
-  // Parking at top level clears the retained root bookmark (undefined in the
-  // store; null in the dashboard event so JSON/SSE caches clear it too) — no
-  // later toggle or stale cache may re-enter the original topic.
-  const clearsRoot = executionPosition === 'top-level' && task.rootMessageId !== undefined;
+  // 'topic' is never a toggle target; the dedicated-task position owns a
+  // (possibly not-yet-materialized) thread, everything else lands in chat.
+  const scope: 'chat' | 'thread' = executionPosition === 'task' ? 'thread' : 'chat';
+  // Parking at top level clears the retained root bookmark; entering the
+  // dedicated-task position also starts rootless even if a stale root lingers
+  // (undefined in the store; null in the dashboard event so JSON/SSE caches
+  // clear it too) — its own root is written back by the first fire.
+  const clearsRoot = executionPosition !== 'new-topic' && task.rootMessageId !== undefined;
   scheduleStore.updateTask(id, clearsRoot
     ? { scope, executionPosition, rootMessageId: undefined }
     : { scope, executionPosition });
@@ -799,7 +995,7 @@ export function toggleDelivery(id: string): {
 
 /**
  * Update editable fields of a scheduled task (name, prompt, schedule, silent,
- * execution position and retained topic root).
+ * execution targets, position and retained topic root).
  * Re-parses the schedule expression and recomputes nextRunAt when the schedule
  * string changes. A legacy `deliver` input is accepted and normalized to
  * `origin` for normal writes. Legacy `deliver:new-topic` still maps to the
@@ -817,8 +1013,15 @@ export function updateTask(
     executionPosition?: ScheduleExecutionPosition;
     rootMessageId?: string;
     topicTitle?: string;
+    followActive?: boolean;
+    chatId?: string;
+    chatIds?: readonly string[] | null;
+    /** `''` / `null` clears the per-task model and falls back to the bot's. */
+    model?: string | null;
+    reasoningEffort?: ScheduleReasoningEffort | null;
   },
-): { ok: boolean; error?: string } {
+  options: { deferEvent?: boolean } = {},
+): { ok: boolean; error?: string; deferredEventPatch?: Record<string, unknown> } {
   const task = scheduleStore.getTask(id);
   if (!task) return { ok: false, error: 'not_found' };
 
@@ -830,33 +1033,123 @@ export function updateTask(
     patch.silent = updates.silent === true ? true : undefined;
     eventPatch.silent = updates.silent === true;
   }
+  // `null` (and an all-whitespace model) is the documented way to clear the
+  // per-task override; `undefined` leaves whatever the task already has.
+  if (updates.model !== undefined) {
+    patch.model = updates.model?.trim() || undefined;
+    // JSON/SSE omit undefined, so clearing must travel as null or a cached
+    // dashboard row keeps showing the model the user just removed.
+    eventPatch.model = patch.model ?? null;
+  }
+  if (updates.reasoningEffort !== undefined) {
+    patch.reasoningEffort = updates.reasoningEffort ?? undefined;
+    eventPatch.reasoningEffort = patch.reasoningEffort ?? null;
+  }
 
   const legacyPosition = updates.deliver === 'new-topic'
     ? 'new-topic'
     : undefined;
   const executionPosition = updates.executionPosition ?? legacyPosition;
-  const nextRootMessageId = updates.rootMessageId ?? task.rootMessageId;
-  if (executionPosition === 'topic' && !nextRootMessageId) {
+  const targetUpdate = updates.chatId !== undefined || updates.chatIds !== undefined;
+  let targets: scheduleStore.ScheduleChatTargets;
+  try {
+    targets = targetUpdate
+      ? scheduleStore.normalizeScheduleChatTargets({
+          chatId: updates.chatId ?? task.chatId,
+          chatIds: updates.chatIds !== undefined ? updates.chatIds : null,
+        })
+      : { chatId: task.chatId, chatIds: task.chatIds };
+    if (targetUpdate) {
+      assertScheduleChatTargetLimit(targets.chatIds ?? [targets.chatId], task.chatIds ?? [task.chatId]);
+    }
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  // A stored task-position row projects to 'topic' once its first-fire root
+  // exists (API projection), but edits must keep the dedicated-task semantics:
+  // no user-settable root and the chat-change rule belongs to task, not topic.
+  const storedPosition: ScheduleExecutionPosition = task.executionPosition === 'task'
+    ? 'task'
+    : resolveTaskExecutionPosition(task);
+  const finalExecutionPosition = executionPosition ?? storedPosition;
+  const targetChatIds = targets.chatIds ?? [targets.chatId];
+  if (finalExecutionPosition === 'topic' && targetChatIds.length > 1) {
+    return { ok: false, error: 'multiple_chats_topic_unsupported' };
+  }
+  if (finalExecutionPosition === 'task' && targetChatIds.length > 1) {
+    return { ok: false, error: 'multiple_chats_task_unsupported' };
+  }
+  const primaryChatChanged = targetUpdate && targets.chatId !== task.chatId;
+  const explicitRootMessageId = updates.rootMessageId?.trim();
+  const nextRootMessageId = primaryChatChanged
+    ? explicitRootMessageId
+    : updates.rootMessageId ?? task.rootMessageId;
+  if (finalExecutionPosition === 'topic' && !nextRootMessageId) {
     return { ok: false, error: 'topic_root_required' };
+  }
+  // A task-position root is owned by the runtime (first fire / restart
+  // recovery writeback) — clients may never inject one.
+  if (finalExecutionPosition === 'task' && explicitRootMessageId) {
+    return { ok: false, error: 'task_root_not_user_settable' };
+  }
+  const nextPosition = finalExecutionPosition;
+  const nextFollowActive = updates.followActive ?? task.followActive;
+  if (updates.followActive === true && nextPosition !== 'topic') {
+    return { ok: false, error: 'follow_active_requires_topic' };
+  }
+  if (updates.followActive !== undefined) {
+    patch.followActive = updates.followActive === true ? true : undefined;
+    eventPatch.followActive = updates.followActive === true;
+  }
+  if (nextFollowActive === true && nextPosition !== 'topic') {
+    // Moving a follow-active task away from topic execution drops the flag:
+    // there is no topic to follow at top level / new-topic.
+    patch.followActive = undefined;
+    eventPatch.followActive = false;
+  }
+  if (targetUpdate) {
+    patch.chatId = targets.chatId;
+    patch.chatIds = targets.chatIds;
+    eventPatch.chatId = targets.chatId;
+    // JSON/SSE omit undefined, so null is required to clear a cached prior
+    // multi-chat array when an edit collapses back to one target.
+    eventPatch.chatIds = targets.chatIds ?? null;
   }
   if (updates.topicTitle !== undefined) {
     try { patch.topicTitle = normalizeTopicTitle(updates.topicTitle); }
     catch (err) { return { ok: false, error: err instanceof Error ? err.message : String(err) }; }
   }
-  if (updates.rootMessageId !== undefined) patch.rootMessageId = updates.rootMessageId;
+  // A user-supplied root for a task-position task is rejected above when
+  // non-empty; an empty/whitespace patch must not be written either — the
+  // first-fire root is runtime-managed.
+  if (updates.rootMessageId !== undefined && finalExecutionPosition !== 'task') {
+    patch.rootMessageId = updates.rootMessageId;
+  }
   if (executionPosition !== undefined) {
-    patch.scope = executionPosition === 'topic' ? 'thread' : 'chat';
+    patch.scope = executionPosition === 'topic' || executionPosition === 'task' ? 'thread' : 'chat';
     patch.executionPosition = executionPosition;
     patch.deliver = 'origin';
-    // Parking at top level (or fresh topic) clears the retained root bookmark
-    // so execution can never silently return to the originating (e.g. adopted)
-    // topic — even when the client carries a stale root (dashboard edit form).
-    if (executionPosition !== 'topic' && task.rootMessageId !== undefined) {
+    if (executionPosition === 'task') {
+      // Entering task position from another position drops any foreign root so
+      // the first fire creates this task's own topic. Re-saving a task that
+      // already owns its materialized root keeps it untouched.
+      if (task.executionPosition !== 'task' && task.rootMessageId !== undefined) {
+        patch.rootMessageId = undefined;
+        eventPatch.rootMessageId = null;
+      }
+    } else if (executionPosition !== 'topic' && task.rootMessageId !== undefined) {
+      // Parking at top level (or fresh topic) clears the retained root bookmark
+      // so execution can never silently return to the originating (e.g. adopted)
+      // topic — even when the client carries a stale root (dashboard edit form).
       patch.rootMessageId = undefined;
       eventPatch.rootMessageId = null;
     }
   } else if (updates.deliver !== undefined) {
     patch.deliver = 'origin';
+  }
+  if (primaryChatChanged && finalExecutionPosition !== 'topic' && task.rootMessageId !== undefined) {
+    patch.rootMessageId = undefined;
+    eventPatch.rootMessageId = null;
   }
 
   // Re-parse + recompute next run when the schedule expression changes.
@@ -873,12 +1166,24 @@ export function updateTask(
     patch.nextRunAt = next ?? undefined;
   }
 
-  scheduleStore.updateTask(id, patch);
+  if (!scheduleStore.updateTask(id, patch)) return { ok: false, error: 'not_found' };
+  const publishedPatch = { ...patch, ...eventPatch };
+  if (options.deferEvent) return { ok: true, deferredEventPatch: publishedPatch };
+  publishScheduleTaskUpdated(id, publishedPatch);
+  return { ok: true };
+}
+
+/** Publish a task patch after a compound configuration operation has fully
+ * committed. Keeping this separate lets the protected-precondition wrapper
+ * roll back its task row without first exposing a transient target change. */
+export function publishScheduleTaskUpdated(
+  id: string,
+  patch: Record<string, unknown>,
+): void {
   dashboardEventBus.publish({
     type: 'schedule.updated',
-    body: { id, patch: { ...patch, ...eventPatch } },
+    body: { id, patch },
   });
-  return { ok: true };
 }
 
 /**
@@ -886,9 +1191,7 @@ export function updateTask(
  * drops the row immediately without waiting for the next poll.
  */
 export function removeTaskForDashboard(id: string): { ok: boolean; error?: string } {
-  const task = scheduleStore.getTask(id);
-  if (!task) return { ok: false, error: 'not_found' };
-  scheduleStore.removeTask(id);
+  if (!removeTask(id)) return { ok: false, error: 'not_found' };
   dashboardEventBus.publish({
     type: 'schedule.deleted',
     body: { id },

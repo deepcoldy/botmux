@@ -19,7 +19,7 @@ export interface SkillDef {
 
 const SCHEDULE_SKILL = `---
 name: botmux-schedule
-description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 botmux schedule 命令，支持增删查改暂停恢复）。触发场景：用户说"每天X点"、"每周X"（任意星期，不限周一）、"每月X号"、"N分钟后/N小时后"、"明天X点"、"提醒我"、"定时任务"、"周期任务"、"recurring"、"reminder"、"crontab" 时；或显式提到 botmux schedule。到点后 daemon 会在原话题自动续一条消息并触发新 CLI 会话。注意区分：本 skill 是飞书话题内提醒；要在云端跑 remote agent 用 superpowers:schedule；要在当前会话循环跑 prompt 用 loop。
+description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 botmux schedule 命令，支持增删查改暂停恢复）。触发场景：用户说"每天X点"、"每周X"（任意星期，不限周一）、"每月X号"、"N分钟后/N小时后"、"明天X点"、"提醒我"、"定时任务"、"周期任务"、"recurring"、"reminder"、"crontab" 时；或显式提到 botmux schedule。到点后 daemon 按任务的执行位置续跑；群内默认发到群顶层，要继续当前话题必须显式传 --topic。注意区分：本 skill 是飞书话题内提醒；要在云端跑 remote agent 用 superpowers:schedule；要在当前会话循环跑 prompt 用 loop。
 ---
 
 # botmux-schedule — 定时任务
@@ -29,7 +29,7 @@ description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 bot
 ## 核心原则
 
 1. **创建前必须跟用户确认** schedule 和 prompt 的具体内容，避免误加
-2. **默认不传 --chat-id / --root-msg-id** —— 在 Lark 话题的 CLI 会话内运行时 botmux 会自动推断
+2. **继续当前话题必须显式传 --topic** —— 群内省略执行位置会默认发到群顶层；在当前话题运行时可省略 --chat-id / --root-msg-id，由 botmux 推断话题锚点
 3. 创建后把 task id 和下次执行时间回显给用户
 4. 如果用户是在编程会话里顺手说"以后每天X点都这样做"，先问他：是否希望到点以后自动在当前话题里继续
 
@@ -48,18 +48,30 @@ description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 bot
 ### 创建
 
 \`\`\`
-botmux schedule add "<schedule>" "<prompt>" [--name <name>] [--top-level | --topic --root-msg-id <om_...> | --new-topic [--topic-title <标题>]] [--silent]
+botmux schedule add "<schedule>" "<prompt>" [--name <name>] [--top-level | --topic --root-msg-id <om_...> | --new-topic [--topic-title <标题>]] [--follow-active] [--silent] [--model <id>] [--reasoning-effort <level>]
 \`\`\`
 
 prompt 是到点时会被执行的内容，就像用户新开一个话题向你发送这段 prompt 一样。
 可选 \`--silent\`：**静默执行**——到点不发「🕐 定时任务执行中」提示，也不发流卡片；由执行会话的模型自行判断，只有满足 prompt 里描述的报警/通知条件才 \`botmux send\`，否则整轮完全静默（适合"每30分钟检查服务，挂了才报警，没事别打扰我"这类监控任务；prompt 里务必写清报警条件）。斜杠命令里可在 prompt 前加"静默"关键字，如 \`/schedule 每30分钟 静默 检查服务状态，挂了才报警\`。
-执行位置是任务级可选项：默认跟随创建时会话；\`--top-level\` 从群消息顶层触发，\`--topic --root-msg-id <om_...>\` 固定在指定话题下执行，\`--new-topic [--topic-title <标题>]\` 每次使用一个全新话题和独立会话。群顶层触发后是否平铺、共享话题或新开独立话题，由 Bot/群级「普通群会话模式」决定；显式 \`--new-topic\` 不受该模式影响。\`--silent --new-topic\` 会先启动独立隐藏会话，无需通知时自动关闭；首次 \`botmux send\` 才创建并绑定新话题。
+执行位置是任务级可选项：**群内默认在群顶层执行，即使从话题内创建也不继承原话题**；要按用户要求在当前话题跟进、轮询或提醒，必须显式传 \`--topic\`（可自动推断当前话题锚点）；\`--top-level\` 从群消息顶层触发，\`--topic --root-msg-id <om_...>\` 固定在指定话题下执行，\`--new-topic [--topic-title <标题>]\` 每次使用一个全新话题和独立会话；\`--follow-active\` 三级回退：上次落点的话题没关（还有活的会话）就投那里；关了就投本群里**人**最近说话的话题（跨 bot 判定、只按真人消息不按 bot 消息）；一个都没有就新开一个顶层话题并把它记成新落点，起点是当前话题或 \`--root-msg-id\`。群顶层触发后是否平铺、共享话题或新开独立话题，由 Bot/群级「普通群会话模式」决定；显式 \`--new-topic\` 不受该模式影响。\`--silent --new-topic\` 会先启动独立隐藏会话，无需通知时自动关闭；首次 \`botmux send\` 才创建并绑定新话题。
+可选 \`--model <id>\` / \`--reasoning-effort <low|medium|high|xhigh|max|ultra>\`：**只给这一个任务**换模型/思考强度，不动 Bot 配置（同一个 Bot 下高频哨兵用便宜模型、每日深度任务用最强模型）。仅 Codex / Claude Code / Grok / TraeX 支持。注意模型是 CLI **进程启动参数**：只有新建会话的那次触发能应用，所以 \`--new-topic\` 每次生效，\`--topic\`/\`--top-level\` 只在首次创建会话那次生效、之后复用会话时沿用旧模型。模型不支持所选强度、或 Bot 换了 CLI 时，触发会丢掉该项照常执行并记 warn，不会跳过执行。
 
 ### 查看
 
 \`\`\`
 botmux schedule list
 \`\`\`
+
+### 修改提示词
+
+修改已有任务的 prompt 必须原地更新，不要先删除再创建：
+
+\`\`\`
+botmux schedule update <id> --prompt-file <UTF-8 文件路径>
+botmux schedule update <id> --prompt "新的完整提示词"
+\`\`\`
+
+两种输入方式只能选一种。更新成功保留任务 ID、执行时间、启停状态、每次新话题设置和运行记录；已开始的执行沿用原 prompt，后续执行使用新版，不会自动补跑。文件读取、身份验证或写入失败时保留旧任务，先排查错误，不要通过删除任务重试。旧版本没有 update 时先升级，不要把修改降级为先删后建。若提示任务绑定了守护前置条件（precondition），说明该任务只能在 Dashboard 修改，不要删除重建，告知用户去 Dashboard 的定时任务页编辑。
 
 ### 管理
 
@@ -79,13 +91,13 @@ botmux schedule run <id>       # 标记立即执行（< 30 秒内 daemon 会触�
 用户确认后执行：
 
 \`\`\`bash
-botmux schedule add "每日9:00" "生成昨天的 GitHub PR 汇总（合并的 / 待 review 的），按 repo 分组"
+botmux schedule add "每日9:00" "生成昨天的 GitHub PR 汇总（合并的 / 待 review 的），按 repo 分组" --topic
 \`\`\`
 
 **用户**："30 分钟后提醒我检查一下部署状态"
 
 \`\`\`bash
-botmux schedule add "30m" "检查部署状态（调用 kubectl get pods 看看有无 CrashLoop）"
+botmux schedule add "30m" "检查部署状态（调用 kubectl get pods 看看有无 CrashLoop）" --topic
 \`\`\`
 
 ## 到点会发生什么
@@ -96,7 +108,7 @@ botmux schedule add "30m" "检查部署状态（调用 kubectl get pods 看看�
 
 ## 跨群发布场景（changelog 群、动态频道等）
 
-如果定时任务的目的是"把内容发到另一个群作为顶层消息"（而不是回复到当前话题），让 prompt 内部用 \`botmux send --top-level --chat-id <目标群>\` 即可。任务本身仍然创建在当前话题里——这样：
+如果定时任务的目的是"把内容发到另一个群作为顶层消息"（而不是回复到当前话题），让 prompt 内部用 \`botmux send --top-level --chat-id <目标群>\` 即可。任务本身用 \`--topic\` 创建在当前话题里——这样：
 
 - "🕐 task 开始执行" + 流式卡片留在你当前话题，方便监控
 - 实际内容作为顶层消息发到目标群，不绑定话题、不 @ 你
@@ -105,7 +117,7 @@ botmux schedule add "30m" "检查部署状态（调用 kubectl get pods 看看�
 botmux schedule add "每日11:00" "
 1. <做事>
 2. botmux send --top-level --chat-id oc_xxxxxxxxxxxx '推送内容...'
-"
+" --topic
 \`\`\`
 
 详见 \`botmux-send\` 技能的"顶层广播 / 跨群发布"章节。
@@ -139,6 +151,37 @@ botmux chat rename "支付链路排障｜待验证" --proactive
 
 常见错误：\`not_group_chat\`、\`bot_not_in_chat\`、\`invalid_chat_name\`、
 \`permission_denied\`、\`rate_limited\`、\`lark_api_error\`。
+`;
+
+const SESSION_RENAME_SKILL = `---
+name: botmux-session-rename
+description: 给当前任务/botmux 会话改名时触发——用户明确要求给当前任务或会话改名，或任务进入新阶段、现有标题已不准确时由 agent 主动规范命名。改的是 botmux/Dashboard 的会话标题，不是飞书群名，也不是飞书话题名。
+---
+
+# botmux-session-rename — 更新当前会话的 botmux 标题
+
+在会话内执行（会话自动识别，只能改**当前会话**，没有也不允许 \`--session-id\` 之类参数指定他人会话）：
+
+\`\`\`bash
+botmux session rename "排障｜支付链路超时"
+\`\`\`
+
+## 命名规范
+
+- 格式「类型｜具体事项」，例如：
+  - \`排障｜支付链路超时\`
+  - \`开发｜权限黑名单\`
+  - \`调研｜调度幂等设计\`
+- 简短、稳定、可读，让人在 Dashboard 和 \`/sessions\` 列表里一眼认出任务。
+- 只在**任务阶段发生实质变化**时改（排障 → 验证 → 收尾等），不要因细小进度反复改名。
+- 不写精确百分比、敏感信息（密钥/内部标识）、评价性措辞。
+- 不确定任务主线、只是临时支线时，不主动改名。
+
+## 改名后的生效范围
+
+- 立即生效于 botmux 侧：Dashboard 各视图与 \`/sessions\` 列表；运行中的 CLI 若支持会 best-effort 同步原生会话名（resume picker），CLI 不在线或不支持时命令仍成功，回执会说明。
+- **飞书话题（omt）标题改不了**：开放平台没有话题改名接口，话题列表始终显示首条消息；本命令只改 botmux/Dashboard 标题，不要承诺"飞书里的话题名会变"。
+- **不要与 \`botmux-chat-rename\` 混用**：\`botmux chat rename\` 改的是**整个飞书群**的群名（话题群里是整个群，不是单个话题），影响所有话题和全部成员。只想规范当前任务标题时一律用 \`botmux session rename\`。
 `;
 
 const HISTORY_SKILL = `---
@@ -270,7 +313,7 @@ JSON 格式，与 \`botmux history\` 的单条消息字段一致，并附带 \`r
 
 export const SEND_SKILL = `---
 name: botmux-send
-description: 向飞书话题发送消息。用户在飞书上阅读看不到终端输出，需要用户看到的内容（关键结论、方案、最终结果、进度更新）必须通过 botmux send 发送。支持图文混排（图片穿插在 markdown 正文中）、文本、图片/文件附件、原始 interactive 卡片 JSON（发出后可用 botmux card patch 按 messageId 原地更新）、@mention。**当你自主执行任务撞到只有人类才能解除的硬阻碍、无法靠自己继续时（需要授权/凭证、要人拍不可逆决策、缺访问权限、需求歧义自己定不了），回消息时带 \`--attention\` 举手**——既把"我卡在哪、需要你做什么"发给用户，又把本会话标进 dashboard「需要你」列，让人一眼看到哪个任务卡住、为什么卡。
+description: 向飞书话题发送消息。用户在飞书上阅读看不到终端输出，需要用户看到的内容（关键结论、方案、最终结果、进度更新）必须通过 botmux send 发送。支持图文混排（图片穿插在 markdown 正文中）、文本、图片/文件附件、原始 interactive 卡片 JSON（发出后可用 botmux card patch 原地更新，或用 botmux card stream 做原生打字机流式更新）、@mention。**当你自主执行任务撞到只有人类才能解除的硬阻碍、无法靠自己继续时（需要授权/凭证、要人拍不可逆决策、缺访问权限、需求歧义自己定不了），回消息时带 \`--attention\` 举手**——既把"我卡在哪、需要你做什么"发给用户，又把本会话标进 dashboard「需要你」列，让人一眼看到哪个任务卡住、为什么卡。
 ---
 
 # botmux-send — 向飞书话题发送消息
@@ -335,6 +378,22 @@ botmux send --attention=blocked --mention-back "缺 TOS 上传密钥，拿不到
 - **只用于回复当前会话的文本/卡片消息**：不能与 \`--top-level\` / \`--chat-id\` / \`--into\` / \`--voice\` 混用（否则消息发到别处、撤下绑定会裂，或绕过举手置位路径）。也必须有文本正文（看板要显示 reason）。
 
 **什么时候不要 \`--attention\`**：常规进度汇报、你自己查得到/能合理假设的事、只是想确认一下——都用普通 \`send\`。这是"我真卡住了、必须人来"的信号，不是闲聊也不是汇报。需要用户在**给定选项里二选一**那种用 \`botmux ask\`（发按钮、阻塞等结果）。
+
+## 加急本轮触发者：\`--urgent\`
+
+只有用户明确要求加急时才用；不要把它当普通通知。加急固定只发给
+\`--mention-back\` 解析出的本轮触发者，不会把其他 \`--mention\` 对象一起加急。
+
+\`\`\`bash
+botmux send --urgent --mention-back "发布窗口将在 10 分钟后关闭，请尽快确认"
+botmux send --urgent=sms --mention-back "线上故障需要立即确认"
+botmux send --urgent=phone --mention-back "P0 故障，请立即上线处理"
+\`\`\`
+
+- \`--urgent\` 等价于 \`--urgent=app\`（应用内加急）。
+- \`sms\` / \`phone\` 会消耗租户额度，必须由用户明确要求。
+- 只能用于当前会话回复，不能与 \`--top-level\` / \`--chat-id\` / \`--into\` / \`--voice\` / \`--slash\` 混用。
+- 主消息先发、加急后调；加急失败时命令会返回 \`urgent.sent=false\`，不要重发主消息。
 
 ## 用法
 
@@ -474,6 +533,24 @@ botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","body":{"dire
 
 成功 stdout 一行 JSON \`{"success":true,"messageId":"om_xxx","sessionId":"..."}\`。参数错误（缺 \`--message-id\`、卡片输入未二选一、messageId 非 \`om_\` 开头、含回调控件、JSON 非法）exit 2；\`--card-file\` 不存在、消息已撤回、飞书 API 报错 exit 1，stderr 透出原因。
 
+#### 原生打字机流式更新：\`botmux card stream\`
+
+需要连续输出感时，不要高频整卡 \`patch\`。先发送 Card 2.0 卡片，并给需要流式写入的 \`markdown\` 或 \`plain_text\` 组件设置唯一 \`element_id\`（字母开头、最多 20 字符），然后用 CardKit 原生流：
+
+\`\`\`bash
+MID=$(botmux send --card-file /tmp/progress.json --no-mention | jq -r .messageId)
+OPEN=$(botmux card stream open --message-id "$MID" --summary "执行中")
+STREAM_ID=$(printf '%s' "$OPEN" | jq -r .streamId)
+
+# write 传该 element 的完整最新内容；新增后缀由飞书原生打字机动画呈现
+botmux card stream write --stream-id "$STREAM_ID" --element-id work_log --content-file /tmp/work-log.md
+botmux card stream finish --stream-id "$STREAM_ID" --summary "已完成"
+\`\`\`
+
+如果同一任务需要跟随较新的用户输入，先用当前完整卡片内容发出新卡，再调用 \`stream reanchor --stream-id <旧流> --message-id <新卡>\`。Botmux 会在新流就绪后拒绝旧流的迟到写入、迁移已绑定的运行状态，并尽力撤回旧消息。成功输出会返回新的 \`messageId\` / \`streamId\`，调用方必须立即更新自己的持久化状态。是否跟随新输入由调用 Skill 决定，Core 不自动撤回任意卡片。
+
+多行内容也可用 \`--content-file -\` 从 stdin 读取。核心命令只负责 transport、会话归属、顺序与幂等；阶段、公开工作摘要、工具事件和 UI 语义应由机器人自己的 Skill 决定。不要把模型私有原始 CoT 写进卡片，只展示可公开、可验证的工作摘要。
+
 ### @mention 其他机器人协作
 
 \`\`\`bash
@@ -513,6 +590,20 @@ botmux send --no-mention "后台任务还在跑，预计 5 分钟。"
 \`\`\`
 
 （可设环境变量 \`BOTMUX_REQUIRE_MENTION_DECISION=false\` 关闭此硬门。）
+
+### 对方正在执行任务时：\`--as\`
+
+你的消息如果碰上其他成员（人或另一个 bot）正在跑任务，**不会打断对方**，而是先暂存。这时必须二选一：
+
+| flag | 含义 |
+|---|---|
+| \`botmux send --as independent\` | **另开任务**：马上单独做，不打断当前任务 |
+| \`botmux send --as suggestion\` | **留给当前任务**：等对方结束后确认要不要采纳 |
+
+可以跟原文一起发：\`botmux send --as independent --mention <ou_xxx> "请帮我看这段 diff"\`。
+也可以先发出原文，再单独 \`botmux send --as independent\` 或 \`botmux send --as suggestion\`。
+
+人在飞书里会看到两个按钮（另开任务 / 留给当前任务）；agent 用上面的 flag 选，不要去点卡片。
 
 ### 引用串联（普通群）
 
@@ -575,6 +666,7 @@ sandbox dispatch 暂不支持
 | \`--no-mention\` | 明确声明本条不 @ 任何人。满足 @ 硬门 |
 | \`--quote <message_id>\` | 引用指定消息（普通群）。默认引用本轮触发消息 |
 | \`--no-quote\` | 不引用，发独立消息（普通群） |
+| \`--urgent[=app\\|sms\\|phone]\` | 加急本轮触发者，必须与 \`--mention-back\` 同用；默认应用内加急 |
 | \`--top-level\` | 发顶层消息（不回复进当前话题）；自动跳过"发送给/cc" footer |
 | \`--chat-id <oc_xxx>\` | 指定目标群（默认当前会话所在群）；常和 \`--top-level\` 一起用做跨群发布 |
 | \`--session-id <id>\` | 手动指定 session（通常自动推断，不需要传） |
@@ -1132,10 +1224,12 @@ description: 在当前飞书/Lark 话题里向用户发起阻塞式选择题并�
 
 当你需要用户在明确选项里做选择，并且后续步骤必须等用户回答后才能继续时，使用 \`botmux ask buttons\`。
 
+是否需要用户选择或批准，由当前任务授权和具体操作规则决定。已有授权覆盖的常规文件修改、只读 API 查询和执行步骤应继续推进；具体流程明确要求重新确认时，遵循该要求。
+
 ## 什么时候用
 
-- 发布、回滚、删除、写文件、调用外部 API 等风险动作前，需要用户选择
-- 需求存在 2-6 个清晰分支，继续执行前必须拿到其中一个 key
+- 具体操作规则要求批准，且当前授权尚未满足要求
+- 需求存在 2-6 个会实质改变目标、范围或影响的清晰分支，且无法依据已有要求确定，必须由用户选择
 - 你正在 shell / CLI 里执行任务，需要把用户选择赋给变量继续跑
 
 ## 不要用
@@ -1633,6 +1727,7 @@ export const WHITEBOARD_SKILL_NAME = 'botmux-whiteboard';
 
 export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-chat-rename', content: CHAT_RENAME_SKILL },
+  { name: 'botmux-session-rename', content: SESSION_RENAME_SKILL },
   { name: 'botmux-schedule', content: SCHEDULE_SKILL },
   { name: 'botmux-history', content: HISTORY_SKILL },
   { name: 'botmux-quoted', content: QUOTED_SKILL },

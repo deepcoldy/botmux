@@ -234,9 +234,18 @@ describe('dashboardComingUpFromState — observation mapping', () => {
 
   for (const c of cases) {
     it(c.label, () => {
-      expect(dashboardComingUpFromState(c.state, NAME, c.pidAlive)).toBe(c.want);
+      const supervisorAlive = () => {
+        const pid = c.state?.supervisorPid;
+        return Number.isSafeInteger(pid) && (pid as number) > 1 && c.pidAlive(pid as number);
+      };
+      expect(dashboardComingUpFromState(c.state, NAME, supervisorAlive, c.pidAlive)).toBe(c.want);
     });
   }
+
+  it('does not wait when a live pid fails supervisor identity attestation', () => {
+    const state = { supervisorPid: 10, procs: [{ name: NAME, pid: 77, status: 'launching' }] };
+    expect(dashboardComingUpFromState(state, NAME, () => false, ALIVE)).toBe(false);
+  });
 
   it('distinguishes null from false — they drive OPPOSITE waiting decisions', () => {
     // Not interchangeable: within the grace window `null` keeps waiting while

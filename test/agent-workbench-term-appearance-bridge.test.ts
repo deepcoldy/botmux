@@ -86,7 +86,7 @@ interface Harness {
   fire: (data: unknown, source?: unknown) => void;
 }
 
-function bootTerminalPage(): Harness {
+function bootTerminalPage(fixedSize = false): Harness {
   const term: TermStub = { options: {} };
   let fits = 0;
   const fit = { fit: () => { fits += 1; } };
@@ -98,8 +98,8 @@ function bootTerminalPage(): Harness {
       if (type === 'message') handlers.push(handler);
     },
   };
-  // 子页那段是浏览器端 ES5 脚本，用 Function 注入它依赖的三个外部符号。
-  new Function('term', 'fit', 'window', extractTerminalPageListener())(term, fit, win);
+  // Inject the browser listener dependencies, including remote grid ownership.
+  new Function('term', 'fit', 'window', 'fixedSize', extractTerminalPageListener())(term, fit, win, fixedSize);
   expect(handlers.length, '监听器没挂上').toBe(1);
   return {
     term,
@@ -112,6 +112,13 @@ function bootTerminalPage(): Harness {
 }
 
 describe('工作台 → 终端 iframe 的外观下发接缝', () => {
+  it('preserves a fixed remote grid when changing terminal appearance', () => {
+    const page = bootTerminalPage(true);
+    page.fire(workbenchTermAppearanceMessage('reader', 'ink'));
+    expect(page.term.options.lineHeight).toBe(WORKBENCH_TERM_LINE_HEIGHTS.reader);
+    expect(page.fitCount()).toBe(0);
+  });
+
   it('父页构造的 8 种载荷（4 皮肤 × 2 风格）子页全部收下，主题逐色落到 xterm', () => {
     for (const skin of WORKBENCH_SKIN_IDS) {
       for (const termStyle of WORKBENCH_TERM_STYLES) {

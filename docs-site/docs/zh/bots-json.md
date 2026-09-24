@@ -45,8 +45,11 @@
 |------|------|
 | `name` | 进程名后缀，如 `claude-main` → `botmux-claude-main`；留空默认 `botmux-<序号>` |
 | `cliId` | CLI 适配器，默认 `claude-code`。见 [多 CLI 适配器](/adapters) |
-| `model` | 启动 CLI 用的模型名（如 `claude --model opus`）；留空走 CLI 默认。同一 `cliId` 的多个 bot 可跑不同模型。各适配器的 `modelChoices` 是 `botmux setup` 里给出的候选。**每次启动 CLI 时都按当前配置解析**（含 resume）：改完（dashboard 或本文件）对**存量会话**也生效，在它下一次启动/恢复时应用；与 `cliId` / `cliRuntime` / `wrapperCli` 不同——那几个在会话创建时冻结，避免中途换掉底层运行时 |
+| `model` | 启动 CLI 用的模型名（如 `claude --model opus`）；留空走 CLI 默认。同一 `cliId` 的多个 bot 可跑不同模型。各适配器的 `modelChoices` 是 `botmux setup` 里给出的候选。**每次启动 CLI 时都按当前配置解析**（含 resume）：改完（dashboard 或本文件）对**未设置群级模型的存量会话**也生效，在它下一次启动/恢复时应用；与 `cliId` / `cliRuntime` / `wrapperCli` 不同——那几个在会话创建时冻结，避免中途换掉底层运行时 |
+| `groupDefaultModels` | 按群 ID 配置新话题默认模型，例如 `{ "oc_team": { "codex": { "model": "your-codex-model", "reasoningEffort": "high" } } }`；目前仅支持 Codex 和 Claude。可在 Dashboard「群管理 → 新话题默认模型」按 Bot 配置 |
 | `reasoningEffort` | 新会话默认思考强度。仅对 `codex` / `codex-app` / `traex` / `grok` 这类有结构化思考强度控制的 CLI 生效；按 CLI 与模型能力校验，不支持或未声明支持的组合会被拒绝或忽略 |
+| `modelBackendVariant` | TraeX 专用的后端变体：`standard` / `max`；留空时继承用户 TraeX 全局配置。新会话首次启动时冻结显式值，非 TraeX CLI 会清理该字段。通过 `/cli` 显式选择过 CLI 的会话不继承 bot 级变体；它只采用该次 `/cli` 快照中为 TraeX 保存的值 |
+| `nativeSubagentRuntime` | 仅 `traex` 生效的原生子代理运行策略。`model` 与 `reasoningEffort` 可独立省略以透传子代理请求，或设为 `{ "mode": "custom", "value": "..." }` 以指定固定值；两个维度都透传时应删除整个字段。`inherit` 不是受支持的模式 |
 | `cliRuntime` | Codex 兼容发行版的结构化运行时描述：`{ id, displayName?, executable, update? }`。它复用 `codex` 适配器，但版本、更新源和会话身份都属于该发行版。见 [Codex 兼容发行版](/adapters#codex-兼容发行版) |
 | `cliPathOverride` | 旧版 CLI 入口覆盖，继续兼容 wrapper / router 和存量自定义二进制。新接入的 Codex 兼容发行版优先用 `cliRuntime`。为支持降级到旧版 BotMux，写入端会同时保存一个与 `cliRuntime.executable` 完全相同的兼容影子；不要手工配置不一致的两者 |
 | `disableCliBypass` | `true` 时不自动追加 CLI 的免审批 / 沙箱绕过参数（`--yolo`、`--dangerously-*`）；缺省 / `false` 保持原行为 |
@@ -55,8 +58,49 @@
 | `lang` | 该 bot 的界面语言 `zh` / `en`；留空回落 `BOTMUX_LANG` / `LANG` 环境变量 |
 | `customPassthroughCommands` | 在固定透传白名单和当前 CLI adapter 默认放行命令之上，额外放行透传给底层 CLI 的 slash 命令，如 `["/export"]`（Claude Code / Codex 的 `/goal` 已默认放行）。自动归一化（缺失的 `/` 自动补、转小写、仅留 `[a-z0-9:_-]`、去重）；会遮蔽 botmux daemon 命令（如 `/status`）的项会被丢弃，配了也不生效。用 `/list-slash-command` 查看完整放行清单。见 [斜杠命令](/slash-commands) |
 | `env` | 该 bot 的进程环境变量 `{ "KEY": "值" }`，注入到这个 bot 的 CLI 进程。最常见用途：让某个 bot 跑 GLM / 第三方 Anthropic·OpenAI 兼容服务商（见下方示例），也可设 `HTTPS_PROXY` 或 CLI 专属开关。值支持字符串 / 数字 / 布尔；`BOTMUX_` / `LARK_APP_` 等 botmux 保留键会被忽略。按**会话**注入（下个新会话生效），不写入共享 tmux server 全局、不会串到别的 bot。也可在 dashboard「机器人默认设置 → 环境变量」配置 |
+| `quotaFallbackBot` | CLI 额度耗尽后的可选自动交接：`{ "enabled": true, "targetAppId": "cli_...", "kinds"?: ["usage", "rate"], "message"?: "..." }`。默认关闭；可在 Dashboard「Bot 配置 → 高级」编辑。详见下方 |
 | `codexAppCleanInput` | **实验性**，且仅对 Botmux 托管、实际运行 `codex-app` 的 session 生效。设为 `true` 后，Codex App 的可见 / 持久化文本 `UserMessage` 只保留用户原始输入，消息级 Botmux 上下文主要改走 `additionalContext`；默认关闭，从下一次 turn 派发生效，不改已有历史。详见下方说明 |
-| `codexBrowser` | **实验性、默认关闭**。仅支持 `cliId: "codex-app"`。设为 `true` 后，新会话可通过本机已安装的 Codex Chrome 插件控制 Chrome；对象形式可指定 `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/绝对路径" }`。详见下方说明 |
+| `codexBrowser` | **实验性、默认关闭**。仅支持 `cliId: "codex-app"`。可在 Dashboard 的“高级 → Codex App”中开关；设为 `true` 后，新会话可通过本机已安装的 Codex Chrome 插件控制 Chrome。对象形式可指定 `{ "enabled": true, "family": "chrome" | "edge", "pluginRoot"?: "/绝对路径" }`，详见下方说明 |
+
+`nativeSubagentRuntime` 只改写 Trae 原生 `spawn_agent` 创建的新子代理，不改变父代理自身配置。缺少某一维时透传子代理请求中的原值；`custom` 使用固定值。自定义模型和自定义思考强度同时设置时，BotMux 会校验该组合是否受 Trae 支持。切换到其它 CLI 会自动删除此字段。Dashboard 中“透传子代理请求”对应字段缺失；该策略属于 Bot 行为配置，克隆 Bot 时会复制，但不会进入可移植 Agent preset。旧版 `mode: "inherit"` 配置无效且不会生效。
+
+### 群级新话题默认模型
+
+每个 Bot 的 `groupDefaultModels` 独立配置；不同群、不同 Bot 的模型互不影响。Dashboard 中的 CLI 跟随 Bot 的 Agent 配置，只显示当前 CLI 的模型和思考强度。下拉列表复用 Agent 配置的静态候选、实时模型探测及强度校验，支持继承默认值和自定义模型名称。旧版模型字符串配置仍兼容。
+
+新话题创建时保存该群的模型快照。后续修改或清空群配置只影响新话题，已有话题在重启、恢复时仍使用创建时的群模型。话题首次选择另一种 CLI 时只使用该 CLI 对应的快照，不会把 Claude 模型传给 Codex。未配置群模型的话题继续使用原有 Bot 默认模型规则；没有 Bot 模型时由 CLI 自行选择。私聊、普通群的 chat-scope 会话和外部接管会话不使用此快照。
+
+优先级：显式触发模型 > 新话题保存的群模型 > 同 CLI 的 Bot 模型 > 原有 CLI 不匹配回退。思考强度也在新话题创建时保存，显式触发参数仍可覆盖。此配置不改变 CLI 类型或运行环境。
+
+Dashboard 保存后无需重启 daemon。模型、思考强度分别选择“继承 Agent”可取消相应覆盖；两项都继承时删除当前 CLI 的覆盖，保留其它 CLI 的历史配置。手动编辑 `bots.json` 则沿用原有配置加载方式。
+
+### CLI 限额自动交接
+
+`quotaFallbackBot` 让 daemon 在当前 CLI 确认进入额度限制状态时，用固定文案在原会话落点真实 `@` 一个备用 Bot。它不调用已耗尽额度的主模型，也不会改变原有的限额卡片或 owner 通知。
+
+![Dashboard「Bot 配置 → 高级」中的额度耗尽交接配置](/img/quota-fallback-dashboard.png)
+
+```json
+{
+  "quotaFallbackBot": {
+    "enabled": true,
+    "targetAppId": "cli_xxx_backup",
+    "kinds": ["usage", "rate"],
+    "message": "主 Bot 当前额度已耗尽，请接手本会话并结合上下文继续处理。"
+  }
+}
+```
+
+- `targetAppId` 必须是备用 Bot 的稳定飞书 App ID；不要配置或复制 `ou_xxx`，因为 `open_id` 按发送应用隔离。daemon 会在发送时从当前群的实时成员解析接收方视角下的 mention handle。
+- `kinds` 可选 `usage`（用量上限）和 / 或 `rate`（速率限制）；省略时两类都处理。`message` 省略时使用示例中的默认文案，最多 1000 字符，不能为空或包含原生 `<at>` 标签。
+- 目标必须是本机已配置且当前确实在群内的 Bot；跨部署 / 团队目录目标暂不支持，因为 daemon 目前无法安全证明远端 App ID 对应哪个实时 `open_id`。非本机目标、self、不在群或实时解析失败都会安全跳过。
+- 保存和复制 Bot 时会用「即将落盘」的完整配置检查交接图，拒绝 self 和 `A → B → C → A` 这类环路；无环链可以继续级联。若手工修改配置引入环路，`botmux start/restart` 会跳过环路中的 Bot，但仍启动 Dashboard 和无关 Bot；Dashboard 的 Bot 配置列表会标记这些未启动 Bot，并允许在「高级 → 额度耗尽交接」直接修复，保存后重启即可恢复。supervisor 重拉 daemon 时仍会在加载层禁用环路交接并记录 warning，避免异常配置扩大影响。
+
+![Dashboard 标记因交接环路而未启动的 Bot，并直接打开高级修复入口](/img/quota-fallback-cycle-recovery-dashboard.png)
+
+- daemon 内按「源 Bot + 限额类型」在所有会话间做 5 分钟去重；身份解析或发送失败也会占用这个去重窗口，避免短时重试风暴。
+- chat-scope 会落回原群，thread-scope 会落回原话题；上下文由备用 Bot 自己读取当前历史。daemon 重启恢复旧限额状态时不会补发历史交接。
+- 整个配置块缺省或 `enabled` 不为 `true` 时完全关闭，保持旧行为。可在 Dashboard「Bot 配置 → 高级 → 额度耗尽交接」配置，也可手工编辑 `bots.json`。
 
 ### Codex 兼容发行版
 
@@ -143,8 +187,11 @@
 ```
 
 - 需要先在同一 OS 用户的 Chrome / Edge 中安装并启用 Codex 浏览器扩展；Botmux 默认从 `CODEX_HOME`（或 `~/.codex`）的官方插件缓存中选择最新完整版本。只有维护自定义插件目录时才填写绝对路径 `pluginRoot`。
-- 开启后仅给新建的 Codex App thread 注册一个 `botmux_browser` 动态工具。旧 thread 不会被原地改写，请新开一个飞书话题 / 会话验证。
-- 工具只暴露标签页、可访问性树交互、导航和截图等高层操作，不暴露任意 JavaScript、raw CDP、cookie、local storage、浏览历史、剪贴板或文件传输。
+- 需要安装 Codex 桌面端附带的浏览器运行时。桥接优先使用 `mcp_servers.node_repl` 配置；桌面端移除该 MCP 注册项时，会从已安装的桌面端定位运行时，自定义安装位置可设置 `BOTMUX_CODEX_NODE_REPL_PATH`。身份、站点安全状态和功能配置均走官方认证请求通道，不自行读取或保存登录令牌；运行时缺失或登录失败时会中止操作，不降级为匿名请求。
+- 开启后会在新建和恢复 Codex App thread 时注册 `botmux_browser` 动态工具。已运行的 runner 需重启或重新恢复会话，才能加载更新后的工具定义。
+- 工具先按标签页探测能力：优先使用可访问性树；AX 不可用时自动回退到可见 DOM / Playwright DOM，并提供受类型约束的 Playwright locator、DOM 和坐标交互。不会因为某个后端缺少 `tab.ax` 而中断整个 Chrome 连接。
+- Browser Use 发出的站点访问、上传、下载等安全确认会阻塞当前操作并投射为飞书授权卡；只有通过 Botmux `canTalk` 校验的用户可以选择“本会话允许 / 始终允许 / 拒绝”，回答和回答人由 Botmux ask 记录。普通“允许”也只授予当前 runner 会话，后续同一站点、操作类型和风险上下文自动复用；不同站点、操作类型、风险上下文或新会话仍会重新确认。拒绝、超时、daemon 不可达均 fail closed。
+- 工具不暴露任意 JavaScript、raw CDP、cookie、local storage、浏览历史或剪贴板。上传/下载只通过 Browser Use 的受控文件选择器和安全确认执行；需要密码等秘密输入的 secure browser-auth 流程不会降级到普通飞书卡片，必须由支持安全凭证 broker 的客户端处理。
 - 每个 Botmux runner 独立持有浏览器会话状态；默认关闭，未配置的 bot 启动参数和行为完全不变。
 - 当前不支持与 `existingAppServer`、`sandbox` 或 `readIsolation` 组合，配置冲突会在启动时直接报错，避免以不完整隔离边界运行。
 
@@ -160,6 +207,7 @@
 
 | 字段 | 说明 |
 |------|------|
+| `ownerOpenId` | 显式指定该 bot 的主管理员 `ou_xxx`。它只有在仍存在于 `allowedUsers` 的解析结果中时才参与运行时权限判定；被移除或解析失败后权限会跟随解析出的 allowlist，原始值仅用于解析失败时的 DM 兜底。未指定时默认取解析出的首个 `ou_xxx` 用户。当配置了多位管理员时，群内授权申请卡会优先 @ 当前群内的管理员（避免 ping 群外人员） |
 | `allowedUsers` | 操作权名单。推荐使用**完整邮箱**、手机号或 `on_xxx`；`ou_xxx` 只能用于签发它的同一应用，禁止跨 Bot 复制。配了 `allowedChatGroups` 时至少要有一个作为 owner |
 | `allowedChatGroups` | 可对话群（`oc_xxx`）。群内任何成员可对话（仅 `canTalk`），敏感操作仍由 `allowedUsers` 控制 |
 | `p2pOpen` | `true` 时允许飞书应用可用范围内的任何用户私聊该 bot（仅 `canTalk`）；群聊不受影响，敏感操作仍只认 `allowedUsers`。建议始终同时配置至少一个 `allowedUsers` owner |
@@ -170,6 +218,7 @@
 | `messageQuota` | 消息额度覆盖 `{ "defaultLimit": N }`：**只约束授权卡/自助申请授权放进来的访客**——配了正整数后新授权卡使用 N 条额度；未配置时新授权卡默认每人 3 条。**Oncall 群恒不设额度、不读此值**。显式 `/grant @用户 N` 始终使用 N。仅约束 talk 授权，不影响 `canOperate` |
 | `restrictGrantCommands` | `true` 时，仅靠 per-user 授权（`chatGrants` / `globalGrants`）放行的人禁用**所有斜杠命令**，只能普通对话；owner / `allowedUsers` / oncall / 整群成员不受影响。默认 `false` |
 | `autoGrantRequestCards` | 默认开启。显式设为 `false` 时，群里未授权的人或外部 bot @ 本 bot 但被对话权限闸挡住时，不再自动给 owner 发 `/grant` 申请卡，改为静默丢弃 |
+| `blockedUsers` | 黑名单（与 `allowedUsers` 同款标识：邮箱 / 手机号 / `on_xxx` / `ou_xxx`），sender 维度全局否决：群聊与私聊都生效，优先于 oncall / 整群放开 / 访客授权 / 团队信任等所有放行腿；被拉黑者被拦时不发授权申请卡。owner / 管理员不可被拉黑（写入口拒绝）。不影响消息监听器的监听匹配。也可在 Dashboard「Bot 配置」与群成员弹层维护。完整说明见[权限与授权 · 黑名单](/permissions#黑名单-blockedusers) |
 
 ## 文件沙盒
 
@@ -188,7 +237,9 @@
 |------|------|
 | `brandLabel` | 卡片底部品牌文案。`undefined`=默认 `botmux` 链接；`""`=隐藏；其它字符串=原样渲染（支持 markdown）。纯样式，不影响路由 / 权限 |
 | `showUsageInCardFooter` | 回复卡片页脚是否展示 Agent CLI 原生提供的 Context / Token 用量。缺省 / `true`=展示，`false`=同时隐藏两项；单项数据缺失时仍只省略缺失项。仅控制卡片展示，不停止 Usage Ledger 或其它统计 |
+| `modelBackendVariant` 显示 | 已冻结的 TraeX 后端变体只显示在实时流式 session 卡片的运行时标识中；回复卡片页脚只显示 Context / Token 用量，不展示该变体 |
 | `disableStreamingCard` | `true` 时彻底不发实时流式 session 卡片（web 终端仍跑、最终答复仍经 `botmux send` 到达，只是没有自动刷新的状态卡）。给嫌实时卡吵的用户 |
+| `hiddenStreamingCardButtons` | 隐藏实时流式卡片中的指定主按钮。可选值：`output`（同时隐藏导出文字、截图刷新）、`terminal`、`writeLink`、`compact`、`stop`、`close`（接管会话中对应“断开”）。缺省或空数组显示全部，例如 `["terminal", "writeLink", "close"]`。也可用 `/botconfig set hiddenStreamingCardButtons terminal,writeLink,close` 热更新，`unset` 恢复全部 |
 | `pinStreamingCard` | `true` 时为该 bot **置顶当前公开的实时状态卡片**；默认关闭，只有显式 `true` 才开启。只认当前公开 live-status 的真实 `streamCardId`，repo 选择卡、私有 `/card`、最终回复卡、CoT、关闭卡、以及其它交互卡都不参与。开关支持热更新：通过 dashboard 或 `/botconfig set pinStreamingCard on/off` 成功写盘且有效值发生变化后，会对这个 bot 的**现有活跃会话**做 best-effort 热重算；daemon 重启后还会在 `restoreActiveSessions` 完成后，为当前 bot 额外安排一次 fire-and-forget 恢复。配置响应和 daemon readiness **都不会等待**飞书 Pin/Unpin 完成。失败不会中断发卡、转移、恢复、关闭、启动或配置本身；异常期间可能暂时出现 0 个或多个 Pin。该功能**不维护持久重试日志，也不会做宽泛的远端清理**：重启恢复只信任飞书返回里 `app_id === 当前 larkAppId` 的操作来源，然后再与本进程入队瞬间已知的本地候选 ID 做严格交集。人工、其它应用、混合或来源字段不完整的同 ID 当前 Pin 既不会被认领，也不会被重复 Pin；只有列表中不存在当前卡时才创建，且 create 返回必须精确匹配消息 ID 与同应用来源。显式关闭只清理进程内已拥有的 ID 与远端刚证明属于同应用的本地候选；普通 disable、关闭会话和转移只清理进程内已拥有的 ID |
 | `noPinStreamingCardChats` | 一个 `chatId` 数组，表示即使 bot 已开启 `pinStreamingCard`，这些群里也**不要自动置顶**流式卡片。它就是 `/card pin off|on` 背后的 negative set。实时流式卡片本身仍照常发送，只是当前群不再触发 Pin 副作用；为空或缺省表示没有按群关闭 |
 | `silentTurnReactions` | `true` 时，无卡片会话不再给触发消息添加 GoGoGo / DONE reaction。只影响 `disableStreamingCard` 或 `noCardChats` 关闭实时卡片后的轻量状态提示；默认 `false` |
@@ -197,11 +248,40 @@
 | `writableTerminalLinkInCard` | `true` 时卡片正文直接内嵌**可写**终端链接（带 token，看得到卡片的人都能操作）；默认藏在「获取写权限」按钮后私发给点击者。`disableStreamingCard` 开启时无意义 |
 | `privateCard` | `true` 时 `/card` 走 ephemeral 私有卡片，仅 `allowedUsers` 可见（talk 授权与裸触发者收不到），仅普通 `group` 聊天有效，且不能 live 更新。只作用于 `/card` 命令本身 |
 
+Dashboard 的「Bot 配置 → 消息卡片 → 实时卡片按钮」提供同一配置的可视化开关：
+
+![实时卡片按钮配置](/img/streaming-card-button-settings.png)
+
 ## Prompt 注入
 
 | 字段 | 说明 |
 |------|------|
 | `senderTag` | 布尔，默认 `true`（开）。每轮转发给 CLI 的消息是否附带一个 `<sender type="user\|bot" open_id="ou_…" name="…" email="…" />` 标签，告诉模型这句话是谁说的。只有显式 `false` 会写盘并关闭；缺省或 `true` 都保持注入，prompt 与历史行为逐字节一致 |
+| `replyDelivery` | `"transcript"` 或 `"send"`，**所有 CLI 缺省都是 `send`**（与上游行为一致），`transcript` 需显式开启。最终回复怎么送到飞书：`transcript` = daemon 从 CLI 转写自动取本轮最后的 assistant 文本发最终回复卡，系统提示不再提及 `botmux send`；`send` = 模型必须自己 `botmux send`（历史行为）。显式写 `"send"` 才让 claude-code 退回旧行为；`send` / `transcript` 都会写盘，`unset` 回各 CLI 默认 |
+
+### `replyDelivery: "transcript"`
+
+`claude-code` 缺省即 `transcript`；其它支持的 CLI 需显式设置。生效后对该 bot 的会话有三条效果：
+
+1. **系统提示不再提及 `botmux send`**：开场改为「最终 assistant message 由 botmux 自动转发回飞书，直接作答即可」，heredoc / @ 决策 / 附件用法、`<identity>` 里「协作必须 `botmux send --mention`」的规则一并去掉，只保留 `botmux history` / `botmux bots list` 与 `BOTMUX_NOTHING_TO_SEND` 沉默哨兵。附件、跨 bot @ 等确实需要 `botmux send` 的场景，模型可通过内置 skill（`--plugin-dir` 里的 `botmux-send`）按需自行发现；
+2. **不再逐轮注入 `<botmux_reminder>`**（每轮 prompt 少一段提醒）；
+3. **solo 会话去壳**：私聊、或只有 owner 和本 bot 两个参与者的 1v1 普通群，每轮消息去掉 `<user_message>` 壳与 `<sender/>` 标签，模型看到的就是裸文本。话题群、多人群、非 owner 发言的一律不算 solo，壳与标签照旧。
+
+支持的 CLI 白名单：`claude-code`，以及走结构化转写桥的 `codex` / `traex` / `coco` / `hermes` / `mtr` / `pi` / `oh-my-pi` / `ebsd` / `grok`。其它 CLI（如 `cursor`、`gemini`）没有转写采集通道，`/botconfig set` 与 dashboard 都会拒绝（`reply_delivery_unsupported`）；已写盘后再把 `cli` 切到不支持的 CLI，运行时自动回落 `send`（日志 warn 一次），不会丢回复。
+
+可由 owner / `allowedUsers` 通过 `/botconfig` 热更新：
+
+```text
+/botconfig set replyDelivery transcript   # 其它支持的 CLI 显式开启
+/botconfig set replyDelivery send         # claude-code 退回旧行为（模型自己 botmux send）
+/botconfig unset replyDelivery            # 回各 CLI 默认
+```
+
+- **生效时机分两段**：逐轮信封（reminder / 壳 / `<sender/>`）从下一轮起生效；系统提示是 spawn 时注入的，已在跑的会话要 `/restart` 才换新值，新会话直接用新值。
+- **观测代价**：solo 会话的裸文本形态没有 `<user_message>` / `<sender>` 结构，`/adopt` 不再把这类会话识别为 botmux 自产会话（与 `senderTag: false` 同类代价）。
+- dashboard「回复投递 → 转写回复模式」开关保存的就是这个字段；当前 CLI 不支持时开关禁用并说明。
+
+### `senderTag: false`
 
 关掉后模型看不到发言人身份：多人会话里无法区分谁说的、也无法按人称呼。适合模型会把标签内容抄进回复正文的 CLI（如 cursor，见 `<sender_note>` 反抄写提示——标签关掉后该提示也一并消失），或不希望把每条消息的身份写进 CLI 记录的场景。
 
@@ -229,9 +309,12 @@
 
 | 字段 | 说明 |
 |------|------|
+| `autoInviteOwnerOnGroupAdd` | 默认开：bot 被拉进新群时自动把 owner（管理员）拉进同一个群，避免 bot 落在 owner 看不到的群里；显式 `false` 关闭（适合告警/oncall 平台批量拉事件群）。仅作用于 bot 被动入群；Dashboard「Bot 默认 → 主动开工」与飞书 `/botconfig set autoInviteOwnerOnGroupAdd off` 均可关，选回开即删键回默认 |
 | `autoStartOnGroupJoin` | `true` 时，被拉入含至少一名 `allowedUsers` 的新群即自动开工（不必 @）。需在飞书后台为该应用订阅 `im.chat.member.bot.added_v1` 事件 |
 | `autoStartOnGroupJoinPrompt` | 配合上面：自动开工的首轮 prompt；留空 / 空白则空消息开场，让 bot 自己读群上下文。`autoStartOnGroupJoin` 关闭时无意义 |
 | `autoStartOnNewTopic` | `true` 时，话题群里每个新话题的首条消息无需 @ 也自动开工（普通群无效）。默认被动（仅 @ 触发） |
+| `groupJoinCommandEnabled` | `true` 且 `groupJoinCommand` 非空时，被拉进**任意**群就直接在本机执行该命令，不起会话、不经模型；与 `autoStartOnGroupJoin` 相互独立（不要求群里有 `allowedUsers`）。同样需要订阅 `im.chat.member.bot.added_v1`。Dashboard「Bot 默认设置 → 主动开工」可编辑 |
+| `groupJoinCommand` | 入群执行的命令。执行方式同 [Hooks](./hooks.md)：不经 shell（管道/重定向写成 `bash -c '…'`）、最小环境变量（不含应用密钥）；stdin 是 JSON `{event:"chat.bot_added", larkAppId, chatId, operatorOpenId, emittedAt}`，另有 `BOTMUX_JOIN_CHAT_ID` / `BOTMUX_JOIN_LARK_APP_ID` / `BOTMUX_JOIN_OPERATOR_OPEN_ID` 环境变量；10 分钟超时杀进程组 |
 
 ## 群消息监听
 

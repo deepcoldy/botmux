@@ -266,7 +266,7 @@ describe('plugin card action gateway', () => {
     expect(request).toHaveBeenCalledTimes(2);
   });
 
-  it('插件响应卡只能继续使用本插件 selector，且不能注入 Botmux 路由字段', async () => {
+  it.each(['legacy', 'behaviors'])('插件响应卡（%s）只能继续使用本插件 selector，且不能注入 Botmux 路由字段', async format => {
     const record = makeRecord('response-actions', { prefixes: ['example.'] });
     const shadowingRecord = makeRecord('exact-actions', { actions: ['example.other'] });
     const log = testLog();
@@ -274,24 +274,27 @@ describe('plugin card action gateway', () => {
       schemaVersion: 1,
       ack: { card },
     }), { status: 200, headers: { 'content-type': 'application/json' } });
+    const button = (value: Record<string, unknown>) => format === 'legacy'
+      ? { tag: 'button', value }
+      : { tag: 'button', behaviors: [{ type: 'callback', value }] };
     const request = vi.fn()
       .mockResolvedValueOnce(response({
         schema: '2.0',
-        body: { elements: [{ tag: 'button', value: { action: 'example.submit' } }] },
+        body: { elements: [button({ action: 'example.submit' })] },
       }))
       .mockResolvedValueOnce(response({
         schema: '2.0',
         // This still matches response-actions' broad prefix, but the live
         // routing table gives the exact selector to another enabled plugin.
-        body: { elements: [{ tag: 'button', value: { action: 'example.other' } }] },
+        body: { elements: [button({ action: 'example.other' })] },
       }))
       .mockResolvedValueOnce(response({
         schema: '2.0',
-        body: { elements: [{ tag: 'button', value: { action: 'example.submit', key: 'close' } }] },
+        body: { elements: [button({ action: 'example.submit', key: 'close' })] },
       }))
       .mockResolvedValueOnce(response({
         schema: '2.0',
-        body: { elements: [{ tag: 'button', value: { action: 'close' } }] },
+        body: { elements: [button({ action: 'close' })] },
       }));
     const gateway = createPluginCardActionGateway({
       resolvePluginIds: () => [record.id, shadowingRecord.id],

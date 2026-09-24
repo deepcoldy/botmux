@@ -154,8 +154,8 @@ describe('isForkCapableSession', () => {
     } as any);
   });
 
-  it('accepts claude-code / seed / relay / codex / grok (terminal)', () => {
-    for (const cliId of ['claude-code', 'seed', 'relay', 'codex', 'grok'] as const) {
+  it('accepts claude-code / seed / relay / codex / traex / grok (terminal)', () => {
+    for (const cliId of ['claude-code', 'seed', 'relay', 'codex', 'traex', 'grok'] as const) {
       const ds = makeSourceDs({ cliId });
       expect(isForkCapableSession(ds)).toBe(true);
     }
@@ -177,6 +177,15 @@ describe('isForkCapableSession', () => {
       botName: 'TestBot',
     } as any);
     const ds = makeSourceDs({ cliId: 'codex' });
+    expect(isForkCapableSession(ds)).toBe(false);
+  });
+
+  it('refuses a traex session running under Hybrid RPC input', () => {
+    vi.mocked(getBot).mockReturnValue({
+      config: { cliId: 'traex', larkAppId: 'cli_app_test', codexRpcInput: true },
+      botName: 'TestBot',
+    } as any);
+    const ds = makeSourceDs({ cliId: 'traex' });
     expect(isForkCapableSession(ds)).toBe(false);
   });
 
@@ -579,5 +588,56 @@ describe('sessionAgentConfig — /cli snapshot model wiring', () => {
     const ds = makeSourceDs({ cliId: 'traex', agentFrozen: true });
     const cfg = sessionAgentConfig(ds, { cliId: 'traex', modelBackendVariant: 'max' });
     expect(cfg.modelBackendVariant).toBeUndefined();
+  });
+
+  it('freezes Forge x TraeX launch mode from bot config', () => {
+    const ds = makeSourceDs({ cliId: 'traex', agentFrozen: false });
+    const cfg = sessionAgentConfig(ds, { cliId: 'traex', cliLaunchMode: 'forge-traex' });
+    expect(cfg.cliLaunchMode).toBe('forge-traex');
+    expect(ds.session.cliLaunchMode).toBe('forge-traex');
+    expect(ds.session.agentFrozen).toBe(true);
+  });
+
+  it('repairs a stale backend variant from a frozen non-TraeX session', () => {
+    const ds = makeSourceDs({
+      cliId: 'codex',
+      agentFrozen: true,
+      modelBackendVariant: 'max',
+    });
+
+    const cfg = sessionAgentConfig(ds, { cliId: 'codex' });
+
+    expect(cfg.modelBackendVariant).toBeUndefined();
+    expect(ds.session.modelBackendVariant).toBeUndefined();
+  });
+});
+
+
+describe('sessionAgentConfig — group defaults', () => {
+  const topic = (overrides: Partial<Session> = {}) => makeSourceDs({
+    cliId: 'codex', cliSessionId: undefined, agentFrozen: false,
+    groupDefaultModels: { codex: { model: 'gpt-5.6-sol', reasoningEffort: 'ultra' } },
+    ...overrides,
+  });
+  const bot = { cliId: 'codex', model: 'gpt-5.5', reasoningEffort: 'medium' } as const;
+
+  it.each([false, true])('applies group effort with agentFrozen=%s without changing CLI', (agentFrozen) => {
+    const ds = topic({ agentFrozen });
+    const cfg = sessionAgentConfig(ds, bot);
+    expect(cfg.cliId).toBe('codex');
+    expect(cfg.model).toBe('gpt-5.6-sol');
+    expect(cfg.reasoningEffort).toBe('ultra');
+  });
+
+  it('preserves explicit session effort', () => {
+    expect(sessionAgentConfig(topic({ reasoningEffort: 'high' }), bot).reasoningEffort).toBe('high');
+  });
+
+  it('ignores captured group settings when session becomes chat scope', () => {
+    const ds = topic();
+    ds.session.scope = 'chat';
+    const cfg = sessionAgentConfig(ds, bot);
+    expect(cfg.model).toBe('gpt-5.5');
+    expect(cfg.reasoningEffort).toBe('medium');
   });
 });

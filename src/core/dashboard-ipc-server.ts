@@ -1,5 +1,8 @@
 // src/core/dashboard-ipc-server.ts
+import { authorizeOwnerlessScheduleCreator } from './schedule-creator-authorization.js';
+import { readAllowedUsersResolveCache } from '../utils/allowed-users-cache.js';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
+import { randomBytes } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -10,6 +13,7 @@ import { UnsafeHostAuthorityFileError } from '../platform/secure-host-file.js';
 import { WORKFLOW_DAEMON_IPC_ROUTE_PREFIX } from '../workflows/v3/daemon-ipc-auth.js';
 import { V3_SESSION_RUN_MUTATION_ROUTE_PREFIX } from '../workflows/v3/session-relay.js';
 import { REPORT_SESSION_RELAY_ROUTE } from './report-session-relay.js';
+import { DISPATCH_USER_DELIVERY_ROUTE } from './dispatch-user-delegation.js';
 import { DISPATCH_REPORT_REGISTER_ROUTE } from './dispatch-report-binding.js';
 import { listenWithProbe } from '../utils/listen-with-probe.js';
 import { dashboardSecretPath } from './dashboard-secret.js';
@@ -20,27 +24,57 @@ import {
   writeManagedOriginAttestationProof,
 } from './managed-origin-attestation.js';
 import * as sessionStore from '../services/session-store.js';
+import { applySessionRowCommand } from '../services/session-commands.js';
 import { cliSupportsNativeUsage } from '../services/transcript-resolver.js';
+import { parseHookCommand } from '../services/hook-runner.js';
 import {
   cliModelSupportsReasoningEffort,
+  isBackendVariantCliId,
   isConfigurableReasoningCliId,
   isCodexReasoningEffort,
 } from '../services/codex-reasoning-effort.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import { resolveAsyncTriggerState, decideAsyncOwnership } from '../services/async-trigger-state.js';
 import * as scheduleStore from '../services/schedule-store.js';
+import type { ScheduleReasoningEffort } from '../services/schedule-store.js';
+import { queryScheduleRunLogs } from '../services/schedule-run-log-store.js';
+import {
+  resolveSchedulePrecondition,
+  schedulePreconditionTrustedFilesRoot,
+  validateSchedulePreconditionSource,
+  type SchedulePreconditionDefinition,
+  type SchedulePreconditionSource,
+} from '../services/schedule-precondition-store.js';
+import {
+  assertSchedulePreconditionFilePathTrusted,
+  readSchedulePreconditionFile,
+  SchedulePreconditionFileError,
+} from '../services/schedule-precondition-file.js';
+import {
+  runSchedulePrecondition,
+  SchedulePreconditionError,
+} from '../services/schedule-precondition-runner.js';
 import * as groupsStore from '../services/groups-store.js';
 import { createGroupWithBots, transferGroupOwner } from '../services/group-creator.js';
 import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
 import * as backendTypeStore from '../services/backend-type-store.js';
+import { setGroupSerialInput } from '../services/group-serial-input-store.js';
+import { parseGroupSerialInput } from './group-serial-input.js';
+import { setGroupDefaultModels } from '../services/group-default-models-store.js';
+import { parseGroupDefaultModels } from './group-default-models.js';
 import { setChatStreamingCardPin } from '../services/pin-streaming-card-mode-store.js';
 import { isValidRiffBaseUrl, isValidRiffSandboxCluster } from '../adapters/backend/riff-backend.js';
 import { ensureBackendAvailable } from '../services/backend-availability.js';
 import type { BackendType } from '../adapters/backend/types.js';
 import * as persistentBackend from './persistent-backend.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
+import {
+  isStreamingCardButtonId,
+  normalizeHiddenStreamingCardButtons,
+  type StreamingCardButtonId,
+} from '../im/lark/streaming-card-buttons.js';
 import * as substituteModeStore from '../services/substitute-mode-store.js';
 import { claimPromptContext } from '../services/prompt-context-store.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
@@ -50,6 +84,7 @@ import {
   CURRENT_ACTOR_ROUTE,
 } from '../cli/current-actor.js';
 import {
+  attestCurrentTurnLoopbackPeer,
   resolveDaemonCurrentActor,
   resolveLoopbackPeerProcesses,
 } from './current-actor-attestation.js';
@@ -59,7 +94,7 @@ import {
  *  The dashboard uses it to disable the toggle and to reject persisting an
  *  unenforceable flag, so flipping it on can never brick the bot's next session
  *  (the worker would otherwise refuse to start). Turning it OFF is always allowed. */
-function readIsolationEnforceableFor(cfg: { cliId?: string; cliPathOverride?: string; wrapperCli?: string }): boolean {
+function readIsolationEnforceableFor(cfg: { cliId?: string; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: string }): boolean {
   let adapterSupports = false;
   try {
     adapterSupports = createCliAdapterSync(cfg.cliId as never, cfg.cliPathOverride).supportsReadIsolation === true;
@@ -67,7 +102,7 @@ function readIsolationEnforceableFor(cfg: { cliId?: string; cliPathOverride?: st
   return evaluateReadIsolationGate({
     configured: true,
     adapterSupports,
-    wrapperCliSet: !!cfg.wrapperCli,
+    wrapperCliSet: !!cfg.wrapperCli || !!cfg.cliLaunchMode,
     platform: process.platform,
     sessionDataDirSet: true,
   }).enabled;
@@ -80,12 +115,15 @@ import { getDeploymentIdentity } from '../services/deployment-identity.js';
 import { getBotUnionId } from '../services/bot-union-ids-store.js';
 import * as grantPrefsStore from '../services/grant-prefs-store.js';
 import { applyExactChatGrantRequest } from '../services/exact-chat-grant.js';
+import { addAllowedChatGroup, removeAllowedChatGroup } from '../services/grant-store.js';
+import { normalizeGrantDurationOption, normalizeGrantQuotaOption } from '../services/grant-policy.js';
 import { normalizeBotDescriptions } from '../services/bot-description-schema.js';
 import type {
   OpenPlatformDescriptionReadResult,
   OpenPlatformDescriptionUpdateResult,
 } from '../services/open-platform-rename.js';
-import { findConfigField, applyConfigField, coerceConfigValue, setChatFeedbackPolicy } from '../services/bot-config-store.js';
+import { findConfigField, applyConfigField, coerceConfigValue, setChatFeedbackPolicy, setBotBlockedUsers, removeBlockedUsers, type SetBlockedUsersResult } from '../services/bot-config-store.js';
+import { defaultReplyDeliveryFor, effectiveReplyDelivery, supportsTranscriptReplyDelivery } from './reply-delivery.js';
 import { traceFeedbackPolicyForDelivery } from '../services/feedback-policy-resolver.js';
 import { globalBuiltinSkillInjectionDefault, resolveSkillInjectionSupport } from '../skills/injection-mode.js';
 import { summaryRangeFromBotConfig, updateDashboardSummaryRange } from '../services/summary-range-store.js';
@@ -93,19 +131,46 @@ import { config } from '../config.js';
 import { buildSafeInsightConversation, buildSafeInsightOverview, buildSafeInsightReport, buildSafeInsightTurnDetail } from '../services/insight/report.js';
 import type { InsightConversationRole, InsightDetail, InsightSeverity, SafeSpanTag } from '../services/insight/types.js';
 import { readRawConfig, findEntryIndex, requireConfigPath, rmwBotEntry } from '../services/config-store.js';
+import {
+  findQuotaFallbackCycle,
+  normalizeQuotaFallbackBotConfig,
+  type QuotaFallbackBotConfig,
+} from '../services/quota-fallback.js';
 import { setDefaultLocale, localeForBot, t } from '../i18n/index.js';
 import { isLocale, type Locale } from '../i18n/types.js';
 import { readGlobalConfig } from '../global-config.js';
 import { normalizeChatReplyMode, setChatReplyMode, type ChatReplyMode } from '../services/chat-reply-mode-store.js';
 import * as chatFirstSeenStore from '../services/chat-first-seen-store.js';
 import * as scheduler from './scheduler.js';
-import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, isSessionTransferring, mojoCloseResidualForRow } from './worker-pool.js';
+import {
+  createTaskWithOptionalPrecondition,
+  removeTaskWithPrecondition,
+  toggleTaskDeliveryWithPrecondition,
+  updateTaskWithOptionalPrecondition,
+  type SchedulePreconditionMutation,
+} from './schedule-precondition-config.js';
+import { listActiveSessions, findActiveBySessionId, closeSession, getActiveSessionsRegistry, transferSession, deliverWriteLinkCardToOwners, forkWorker, suspendWorker, killWorker, latestPerBotEnvForRestart, latestModelForRespawn, getDaemonReplyCardUsageSnapshot, sessionSupportsWebTerminal, sendWorkerSessionInput, interruptExactWorkerTurn, isSessionTransferring, mojoCloseResidualForRow, getDaemonBootId, CARD_POSTING_SENTINEL, ensureReadonlyTaskContinuationAttached } from './worker-pool.js';
+import {
+  awaitReadonlyTaskContinuationUser,
+  cancelReadonlyTaskContinuationExplicit,
+  startReadonlyTaskContinuation,
+} from '../services/readonly-task-continuation.js';
 import { listOnlineDaemons } from '../utils/daemon-discovery.js';
 import { isSessionStopped } from './session-liveness.js';
 import { isRemoteBackendType, isRemoteCliId, isSuspendableBackendType } from './persistent-backend.js';
-import { getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, type ChatBotMember } from '../im/lark/client.js';
+import { deleteMessage, getChatMode, replyMessage, sendMessage, resolveUnionIdFromOpenId, listThreadMessages, listChatMessages, listChatMessagesUntil, listChatBotMembers, getUserProfile, getUserProfileStrict, resolveAllowedUsersWithMap, getMessageThreadId, type ChatBotMember } from '../im/lark/client.js';
+import { fillNativeTopicId, isNativeTopicId } from './native-topic-id.js';
+import { parseProjectCoordinatorAction } from '../services/project-coordinator.js';
+import { projectCoordinator } from '../services/project-coordinator-runtime.js';
+import { readProjectGroup } from '../services/project-group-store.js';
+import {
+  evaluateProjectDispatchPolicy,
+  readGroupCollaborationMode,
+} from '../services/group-collaboration-mode-store.js';
+import { publishNativeTopicLinkPatchForSession } from './session-activity.js';
 import { parseApiMessage, cardContentHasUpgradeFallback, resolveMergedCardContent, messageMentionsBot } from '../im/lark/message-parser.js';
-import { resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
+import { createHeadlessSession, resumeSession, spawnDashboardSession, activateQueuedSession, closeCliMismatchedSessionsForBot } from './session-manager.js';
+import { reconcileResumedStreamingCard } from './resume-streaming-card.js';
 
 import { parseSpawnRequest } from './session-create.js';
 import { cleanupMaterializedDashboardImages, materializeDashboardImages } from './dashboard-images.js';
@@ -115,6 +180,7 @@ import { locateLimiter } from './dashboard-locate.js';
 import { DEFAULT_SESSION_OWNER_REMINDER } from './session-owner-reminder.js';
 import { updateSessionOwnerReminderConfig } from '../services/session-owner-reminder-config-store.js';
 import { sendSessionOwnerThreadNotification } from '../services/session-owner-notification.js';
+import { matchesExpectedSessionLocateScope, type SessionLocateExpectedScope } from './session-locate-guard.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { validateWorkingDir } from './working-dir.js';
@@ -131,6 +197,12 @@ import {
 } from '../services/role-profile-store.js';
 import { triggerSessionTurn } from './trigger-session.js';
 import { validateTriggerRequest, type TriggerResponse } from '../services/trigger-types.js';
+import {
+  listHeadlessSessions,
+  readHeadlessSession,
+  updateHeadlessSession,
+  type HeadlessSessionRecord,
+} from '../services/headless-session-store.js';
 import { resolveCliSelection, selectionKeyForBot } from '../setup/cli-selection.js';
 import { checkCliAvailability } from '../setup/cli-availability.js';
 import { enrichHistorySenders, type HistoryBotInfo } from '../dashboard/history-senders.js';
@@ -146,7 +218,7 @@ import {
   protectedSessionMutationReasons,
 } from './session-mutation-guard.js';
 import { listPendingAsks, submitAskFromDesktop } from './ask-broker.js';
-import { getMessageListenerConfig, sanitizeMessageListenerUpdate, updateMessageListenerConfig, validateMessageListenerUpdate } from '../services/message-listener-store.js';
+import { getGlobalMessageListenerConfig, getGroupMessageListenerMode, getMessageListenerConfig, messageListenerConfigFromUpdate, sanitizeMessageListenerUpdate, updateGlobalMessageListenerConfig, updateGroupMessageListenerMode, updateMessageListenerConfig, validateMessageListenerUpdate } from '../services/message-listener-store.js';
 import { getCommandTriggerConfig, setCommandTriggerChatEnabled, updateCommandTriggerConfig } from '../services/command-trigger-store.js';
 import { reservedCommandKind } from '../services/command-trigger.js';
 import { resolvePassthroughCommands } from './command-handler.js';
@@ -158,6 +230,7 @@ import {
   buildListenerBotAppIdToOpenId,
   collectListenerBotAppIds,
   renderMessageListenerInstruction,
+  resolveEffectiveMessageListener,
   type MessageListenerPreviewMatch,
 } from '../services/message-listener.js';
 import {
@@ -222,6 +295,14 @@ export function setSupervisorShutdownHandler(
 ): void {
   supervisorShutdownRegistration = registration;
 }
+
+let crossPrincipalInterruptionDisableHandler: (() => number | Promise<number>) | null = null;
+/** Daemon-owned runtime cleanup for the persisted XPI feature switch. */
+export function setCrossPrincipalInterruptionDisableHandler(
+  handler: (() => number | Promise<number>) | null,
+): void {
+  crossPrincipalInterruptionDisableHandler = handler;
+}
 import {
   composeRowFromActive,
   composeRowFromClosed,
@@ -231,10 +312,15 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, MAX_TURN_TIMEOUT_MS, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
-import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, FEED_GROUP_OAUTH_SCOPES } from '../utils/user-token.js';
+import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
+import { tokenStoreProtection, triggerUserAuthApplies, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
+import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
 import { clampSessionTagName, defaultSessionTagName } from '../services/feed-group-tagger.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
+import { getIdentity, resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
+import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
+import { refreshSessionIdentity } from './cli-identity.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
   normalizeSparseReplyStyleConfig,
@@ -245,6 +331,18 @@ import { validateSlashInjection } from './slash-inject.js';
 import { validateRoleLibraryPath } from './role-library.js';
 import { repinSessionWorkingDir } from './session-cwd.js';
 import { authorizeSessionScopedIpc } from './daemon-ipc-session-auth.js';
+import {
+  NATIVE_SUBAGENT_RUNTIME_IPC_HEADERS,
+  NATIVE_SUBAGENT_RUNTIME_RESPONSE_PROOF_TTL_MS,
+  createNativeSubagentRuntimeNonceStore,
+  type NativeSubagentRuntimeNonceStore,
+  nativeSubagentRuntimeHostRequestNonce,
+  nativeSubagentRuntimeRequestNonce,
+  signNativeSubagentRuntimeResponse,
+  verifyNativeSubagentRuntimeCapabilityRequest,
+  writeNativeSubagentRuntimeResponseProof,
+} from './native-subagent-runtime-ipc-auth.js';
+import { normalizeNativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
 import { normalizeSessionTitleSource, updateSessionTitle } from './session-title.js';
 import { requestAgentSessionRename } from './session-rename.js';
 import {
@@ -256,6 +354,7 @@ import {
 } from './session-preview.js';
 import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
+import { executeChatRename } from './chat-rename-operation.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, larkTransportEnabled, type DaemonSession } from './types.js';
 import { isRemoteBackendSession } from './persistent-backend.js';
@@ -278,6 +377,8 @@ import {
 // active→closed during THIS run — i.e. restore-time zombies — without replaying
 // the entire closed-session history on every connect.
 const PROCESS_START_MS = Date.now();
+
+type HeadlessReasoningEffort = NonNullable<HeadlessSessionRecord['reasoningEffort']>;
 
 export interface IpcServerHandle {
   port: number;
@@ -303,6 +404,7 @@ const routes: Route[] = [];
  * write-link handlers consult this marker so they do not verify (and consume)
  * the same one-shot nonce twice. */
 const trustedHostRequests = new WeakSet<IncomingMessage>();
+const trustedHostRequestSecrets = new WeakMap<IncomingMessage, string>();
 export function isTrustedHostIpcRequest(req: IncomingMessage): boolean {
   return trustedHostRequests.has(req);
 }
@@ -691,6 +793,10 @@ function routeHasPublicAccess(method: string, pathname: string): boolean {
  * model turn could read/perturb sessions, scheduler, mutations). This is a tight
  * allowlist of drive-my-own-turn + poll-my-own-output surfaces:
  *   POST /api/trigger                              (start a turn)
+ *       · options.steer=true authorizes a best-effort native turn/steer into
+ *         a live codex-app turn; same drive-my-own-turn trust surface, no extra
+ *         route or capability.
+ *   POST /api/sessions/:id/turns/:triggerId/interrupt (stop exact turn)
  *   GET  /api/sessions/:id/trigger-result          (poll final)
  *   GET  /api/sessions/:id/insight                 (poll conversation/progress)
  * `/api/asks/answer` is deliberately EXCLUDED — it is askId-keyed with no
@@ -700,6 +806,7 @@ function routeHasPublicAccess(method: string, pathname: string): boolean {
  */
 function routeIsCoreOnlyPublic(method: string, pathname: string): boolean {
   if (method === 'POST' && pathname === '/api/trigger') return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/turns\/[^/]+\/interrupt$/.test(pathname)) return true;
   if (method === 'GET') {
     return /^\/api\/sessions\/[^/]+\/trigger-result$/.test(pathname)
       || /^\/api\/sessions\/[^/]+\/insight$/.test(pathname);
@@ -723,11 +830,12 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|rename|project|project-dispatch-policy|continuation|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
   if (method === 'POST' && /^\/api\/sessions\/[^/]+\/prompt-ctx\/claim$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/native-subagent-runtime$/.test(pathname)) return true;
   if (method === 'POST' && pathname === '/api/hooks/emit') return true;
   if (method === 'POST' && pathname === '/api/attention') return true;
   // A sandboxed report cannot read the host HMAC secret. This narrow route
@@ -735,6 +843,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // root server-side, then lets the trusted daemon relay to the orchestrator.
   if (method === 'POST' && pathname === REPORT_SESSION_RELAY_ROUTE) return true;
   if (method === 'POST' && pathname === DISPATCH_REPORT_REGISTER_ROUTE) return true;
+  if (method === 'POST' && pathname === DISPATCH_USER_DELIVERY_ROUTE) return true;
   // macOS read-isolated `botmux send` presents a rotating worker capability;
   // the handler writes the authoritative tuple into a host-owned read-only
   // proof sidecar, so loopback response spoofing cannot confer authority.
@@ -797,6 +906,19 @@ export function armCoreOnlyReadinessGate(): void { coreOnlyReadinessGate = true;
 export function setCoreOnlyReady(): void { coreOnlyReady = true; }
 /** @internal test-only: reset the core-only readiness gate between cases. */
 export function __testOnly_resetCoreOnlyReadiness(): void { coreOnlyReadinessGate = false; coreOnlyReady = false; }
+/** @internal test-only: clear shared attestation/runtime nonce and proof counters. */
+export function __testOnly_resetManagedOriginRuntimeAuthState(): void {
+  managedOriginOutstandingProofs.clear();
+  managedOriginPreauthInFlight = 0;
+  nativeSubagentRuntimePreauthInFlight = 0;
+  nativeSubagentRuntimeNonceStore = createNativeSubagentRuntimeNonceStore();
+}
+/** @internal test-only: override runtime nonce-store behavior for capacity tests. */
+export function __testOnly_setNativeSubagentRuntimeNonceStore(
+  store: NativeSubagentRuntimeNonceStore | null,
+): void {
+  nativeSubagentRuntimeNonceStore = store ?? createNativeSubagentRuntimeNonceStore();
+}
 /** True when the readiness gate is armed (core-only) but restore hasn't finished.
  *  The server-level gate returns 503 for the public control routes in this state,
  *  and /healthz reports 'starting' — a barrier so riff can't trigger into a racing
@@ -925,6 +1047,16 @@ async function handleManagedOriginAttestation(
   if (outstanding >= MANAGED_ORIGIN_ATTEST_MAX_OUTSTANDING_PER_SESSION) {
     return jsonRes(res, 429, { ok: false, error: 'too_many_attestations' });
   }
+  // Credentials and the allowlist stay on the host. A proof carries only the
+  // authorization for this exact caller/turn, never a client-selected identity.
+  let scheduleBot;
+  try { scheduleBot = getBot(ds.larkAppId); } catch { /* unavailable => denied */ }
+  const scheduleCreator = authorizeOwnerlessScheduleCreator({
+    callerOpenId: origin.callerOpenId,
+    allowedUsers: scheduleBot?.config.allowedUsers,
+    resolvedAllowedUsers: scheduleBot?.resolvedAllowedUsers,
+    resolutionCache: readAllowedUsersResolveCache(config.session.dataDir, ds.larkAppId),
+  });
   let proofPath: string;
   try {
     proofPath = writeManagedOriginAttestationProof({
@@ -936,6 +1068,9 @@ async function handleManagedOriginAttestation(
         channelId: origin.originChannelId,
         sessionId,
         turnId: liveTurnId,
+        scheduleCreator,
+        ...(origin.callerOpenId ? { callerOpenId: origin.callerOpenId } : {}),
+        larkAppId: ds.larkAppId,
         ...(origin.dispatchAttempt !== undefined
           ? { dispatchAttempt: origin.dispatchAttempt }
           : {}),
@@ -975,7 +1110,7 @@ ipcRoute('POST', MANAGED_ORIGIN_ATTEST_ROUTE, async (req, res) => {
 });
 
 ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
-  let body: { sessionId?: unknown };
+  let body: { sessionId?: unknown; expectedScheduledTurnId?: unknown };
   try {
     body = await readBoundedJsonBody(req, 1_024, 1_000);
   } catch (err) {
@@ -991,6 +1126,10 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
   const sessionId = typeof body.sessionId === 'string' && body.sessionId.length <= 256
     ? body.sessionId
     : '';
+  const expectedScheduledTurnId = typeof body.expectedScheduledTurnId === 'string'
+    && body.expectedScheduledTurnId.length <= 256
+    ? body.expectedScheduledTurnId
+    : undefined;
   const peer = resolveLoopbackPeerProcesses({
     remoteAddress: req.socket.remoteAddress,
     remotePort: req.socket.remotePort,
@@ -1007,6 +1146,7 @@ ipcRoute('POST', CURRENT_ACTOR_ROUTE, async (req, res) => {
     sessionId,
     peer: peer.peer,
     findSession: findActiveBySessionId,
+    ...(expectedScheduledTurnId ? { expectedScheduledTurnId } : {}),
   });
   return result.ok
     ? jsonRes(res, 200, result.document)
@@ -1141,6 +1281,46 @@ ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {
   jsonRes(res, 404, { error: 'not_found' });
 });
 
+const topicIdResolveInFlight = new Map<string, Promise<{ ok: boolean; status: string }>>();
+const topicIdResolveCooldownUntil = new Map<string, number>();
+const TOPIC_ID_RESOLVE_COOLDOWN_MS = 5 * 60_000;
+
+ipcRoute('POST', '/api/sessions/:sessionId/resolve-thread-id', async (_req, res, params) => {
+  const sessionId = params.sessionId;
+  const existing = topicIdResolveInFlight.get(sessionId);
+  if (existing) return jsonRes(res, 200, await existing);
+  const task = (async () => {
+    const session = findOwnedSessionRecord(sessionId);
+    if (!session) return { ok: false, status: 'not_found' };
+    if (session.scope !== 'thread' || !/^om_[A-Za-z0-9_-]+$/.test(session.rootMessageId)) {
+      return { ok: true, status: 'ineligible' };
+    }
+    if (isNativeTopicId(session.larkThreadId)) return { ok: true, status: 'already_present' };
+    if ((topicIdResolveCooldownUntil.get(sessionId) ?? 0) > Date.now()) return { ok: true, status: 'unresolved' };
+    let nativeId: string | null;
+    try {
+      nativeId = await getMessageThreadId(session.larkAppId || cachedLarkAppId, session.rootMessageId);
+    } catch {
+      topicIdResolveCooldownUntil.set(sessionId, Date.now() + TOPIC_ID_RESOLVE_COOLDOWN_MS);
+      return { ok: false, status: 'unresolved' };
+    }
+    // Re-read after the remote call: a normal inbound event may have filled it.
+    const current = findOwnedSessionRecord(sessionId);
+    if (!current) return { ok: false, status: 'not_found' };
+    if (isNativeTopicId(current.larkThreadId)) return { ok: true, status: 'already_present' };
+    if (!fillNativeTopicId(current, 'thread', nativeId)) {
+      topicIdResolveCooldownUntil.set(sessionId, Date.now() + TOPIC_ID_RESOLVE_COOLDOWN_MS);
+      return { ok: true, status: 'unresolved' };
+    }
+    sessionStore.updateSession(current);
+    publishNativeTopicLinkPatchForSession(current);
+    topicIdResolveCooldownUntil.delete(sessionId);
+    return { ok: true, status: 'resolved' };
+  })();
+  topicIdResolveInFlight.set(sessionId, task);
+  try { return jsonRes(res, 200, await task); } finally { topicIdResolveInFlight.delete(sessionId); }
+});
+
 /** Low-frequency card-display read used by `botmux send`. Keeping the
  * transcript reader and per-bot visibility decision in the resident daemon
  * preserves its incremental cache and live config instead of making every
@@ -1191,6 +1371,71 @@ ipcRoute('POST', '/api/sessions/:sessionId/close', async (req, res, params) => {
   });
 });
 
+/** Stop exactly one active async trigger without closing its session. The
+ * worker confirms turn identity before Ctrl+C is injected; this endpoint never
+ * falls back to a broad session interrupt. */
+ipcRoute('POST', '/api/sessions/:sessionId/turns/:triggerId/interrupt', async (_req, res, params) => {
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds || ds.session.status === 'closed') {
+    return jsonRes(res, 404, { ok: false, errorCode: 'session_not_found', error: 'active session not found' });
+  }
+  if (isSessionTransferring(ds)) {
+    return jsonRes(res, 409, { ok: false, errorCode: 'trigger_failed', error: 'session transfer in progress' });
+  }
+  const larkAppId = ds.larkAppId;
+  return withBotTurnMutation(larkAppId, async () => {
+    // Recheck under the mutation fence: an accepted new turn must not be
+    // interrupted by a request that was admitted against an older snapshot.
+    if (findActiveBySessionId(params.sessionId) !== ds || ds.session.status === 'closed') {
+      return jsonRes(res, 404, { ok: false, errorCode: 'session_not_found', error: 'active session not found' });
+    }
+    const result = ds.asyncTriggerResults?.get(params.triggerId);
+    const durable = asyncTriggerStore.lookup(params.sessionId, params.triggerId);
+    if (!result && !durable) {
+      return jsonRes(res, 404, { ok: false, errorCode: 'bad_request', error: 'async trigger not found for this session' });
+    }
+    if (result?.status === 'interrupted' || durable?.result.status === 'interrupted') {
+      return jsonRes(res, 200, { ok: true, action: 'interrupted', sessionId: params.sessionId, triggerId: params.triggerId, idempotent: true });
+    }
+    if (result?.status === 'completed' || result?.status === 'failed'
+      || durable?.result.status === 'completed' || durable?.result.status === 'failed') {
+      return jsonRes(res, 409, { ok: false, errorCode: 'trigger_failed', error: 'async trigger is already terminal' });
+    }
+    // A durable pending row without a live in-memory turn cannot prove which
+    // CLI turn would be hit, so fail closed rather than sending a broad Ctrl+C.
+    if (!result || result.status !== 'pending') {
+      return jsonRes(res, 409, { ok: false, errorCode: 'trigger_failed', error: 'async trigger is not live in this daemon generation' });
+    }
+    const delivery = await interruptExactWorkerTurn(ds, params.triggerId);
+    if (!delivery.ok) {
+      const status = delivery.reason === 'stale_turn' ? 409 : 503;
+      return jsonRes(res, status, { ok: false, errorCode: 'trigger_failed', error: `interrupt not delivered: ${delivery.reason}` });
+    }
+    const interruptedAt = Date.now();
+    result.status = 'interrupted';
+    result.interruptedAt = interruptedAt;
+    try {
+      const outcome = asyncTriggerStore.recordInterruptedStrict(params.sessionId, params.triggerId, interruptedAt, larkAppId);
+      if (outcome === 'already_completed') {
+        ds.asyncTriggerResults?.delete(params.triggerId);
+        return jsonRes(res, 409, { ok: false, errorCode: 'trigger_failed', error: 'async trigger completed before interrupt was recorded' });
+      }
+    } catch (err) {
+      // Do not claim a durable terminal without its required restart proof.
+      // The process was interrupted, but callers must retry/poll after storage
+      // recovery rather than receiving an unsafe success acknowledgement.
+      result.status = 'pending';
+      result.interruptedAt = undefined;
+      return jsonRes(res, 503, { ok: false, errorCode: 'trigger_failed', error: `interrupt persistence failed: ${err instanceof Error ? err.message : String(err)}` });
+    }
+    // Only release worker-exit convergence after the durable interrupt proof
+    // exists. Otherwise an exit between Ctrl+C and fsync could rewrite this
+    // caller-selected terminal into dispatch_unknown.
+    ds.idempotentAsyncTurns?.delete(params.triggerId);
+    return jsonRes(res, 200, { ok: true, action: 'interrupted', sessionId: params.sessionId, triggerId: params.triggerId });
+  });
+});
+
 /**
  * Host-side atomic claim/pop for the UserPromptSubmit hook（#794 方向 B）。
  *
@@ -1231,6 +1476,199 @@ ipcRoute('POST', '/api/sessions/:sessionId/prompt-ctx/claim', async (req, res, p
   const envelope = claimPromptContext(params.sessionId, turnId, fingerprint, prefix);
   if (!envelope) return jsonRes(res, 404, { ok: false, error: 'not_found' });
   jsonRes(res, 200, { ok: true, envelope });
+});
+
+/** Return only the live bot's normalized native-subagent policy. The session
+ * identity is selected by the authenticated URL/capability pair; body bot ids
+ * are deliberately ignored so callers cannot read another bot's config. */
+const NATIVE_SUBAGENT_RUNTIME_BODY_MAX_BYTES = 2 * 1024;
+const NATIVE_SUBAGENT_RUNTIME_BODY_TIMEOUT_MS = 1_000;
+const NATIVE_SUBAGENT_RUNTIME_MAX_PREAUTH_IN_FLIGHT = 128;
+let nativeSubagentRuntimeNonceStore = createNativeSubagentRuntimeNonceStore();
+let nativeSubagentRuntimePreauthInFlight = 0;
+
+function nativeSubagentRuntimeJsonRes(input: {
+  req: IncomingMessage;
+  res: ServerResponse;
+  sessionId: string;
+  status: number;
+  body: unknown;
+  authKind: 'host' | 'capability';
+  requestNonce: string;
+  key?: string;
+}): void {
+  const path = new URL(input.req.url ?? '/', 'http://localhost').pathname;
+  const port = input.req.socket.localPort;
+  if (!port) return jsonRes(input.res, 503, { ok: false, error: 'policy_unavailable' });
+  const raw = JSON.stringify(input.body);
+  const responseBinding = {
+    requestNonce: input.requestNonce,
+    method: input.req.method ?? 'POST',
+    path,
+    port,
+    status: input.status,
+    body: raw,
+    sessionId: input.sessionId,
+    larkAppId: cachedLarkAppId,
+    bootInstanceId: getDaemonBootId(),
+  } as const;
+  const responseHeaders: Record<string, string> = { 'content-type': 'application/json' };
+  if (input.authKind === 'host') {
+    if (!input.key) return jsonRes(input.res, 503, { ok: false, error: 'policy_unavailable' });
+    responseHeaders[NATIVE_SUBAGENT_RUNTIME_IPC_HEADERS.responseSignature] =
+      signNativeSubagentRuntimeResponse({ ...responseBinding, key: input.key });
+    input.res.writeHead(input.status, responseHeaders);
+    input.res.end(raw);
+    return;
+  }
+
+  const ds = findActiveBySessionId(input.sessionId);
+  const channelId = ds?.managedTurnOrigin?.originChannelId;
+  if (!channelId) {
+    logger.warn('[native-subagent-runtime] missing origin channel; returning unsigned proof_unavailable');
+    return jsonRes(input.res, 409, { ok: false, error: 'proof_unavailable' });
+  }
+  const outstanding = managedOriginOutstandingProofs.get(input.sessionId) ?? 0;
+  if (outstanding >= MANAGED_ORIGIN_ATTEST_MAX_OUTSTANDING_PER_SESSION) {
+    logger.warn('[native-subagent-runtime] proof capacity exhausted; returning unsigned too_many_attestations');
+    return jsonRes(input.res, 429, { ok: false, error: 'too_many_attestations' });
+  }
+  let proofPath: string;
+  try {
+    proofPath = writeNativeSubagentRuntimeResponseProof({
+      dataDir: config.session.dataDir, channelId, nonce: input.requestNonce,
+      response: responseBinding,
+    });
+  } catch (error) {
+    logger.warn(`[native-subagent-runtime] could not write response proof: ${error}`);
+    return jsonRes(input.res, 409, { ok: false, error: 'proof_unavailable' });
+  }
+  managedOriginOutstandingProofs.set(input.sessionId, outstanding + 1);
+  const cleanupTimer = setTimeout(() => {
+    try { unlinkSync(proofPath); } catch { /* expired/already gone */ }
+    const remaining = (managedOriginOutstandingProofs.get(input.sessionId) ?? 1) - 1;
+    if (remaining > 0) managedOriginOutstandingProofs.set(input.sessionId, remaining);
+    else managedOriginOutstandingProofs.delete(input.sessionId);
+  }, NATIVE_SUBAGENT_RUNTIME_RESPONSE_PROOF_TTL_MS + 1_000);
+  cleanupTimer.unref?.();
+  input.res.writeHead(input.status, responseHeaders);
+  input.res.end(raw);
+}
+
+ipcRoute('POST', '/api/sessions/:sessionId/native-subagent-runtime', async (req, res, params) => {
+  // Trusted-host requests were authenticated by the server-wide gate before
+  // dispatch. Capability requests are still anonymous until their bounded body
+  // and signature have been verified, so cap that slow-body phase globally.
+  const preauthLimited = !trustedHostRequestSecrets.has(req);
+  if (preauthLimited
+    && nativeSubagentRuntimePreauthInFlight >= NATIVE_SUBAGENT_RUNTIME_MAX_PREAUTH_IN_FLIGHT) {
+    closeUntrustedRequestAfterResponse(req, res);
+    return jsonRes(res, 429, { ok: false, error: 'too_many_native_runtime_requests' });
+  }
+  if (preauthLimited) nativeSubagentRuntimePreauthInFlight += 1;
+  let body: Record<string, unknown>;
+  try {
+    body = await readBoundedJsonBody<Record<string, unknown>>(
+      req,
+      NATIVE_SUBAGENT_RUNTIME_BODY_MAX_BYTES,
+      NATIVE_SUBAGENT_RUNTIME_BODY_TIMEOUT_MS,
+    );
+  } catch (err) {
+    if (err instanceof IpcBodyTooLargeError || err instanceof IpcBodyTimeoutError) {
+      closeUntrustedRequestAfterResponse(req, res);
+    }
+    return jsonRes(
+      res,
+      err instanceof IpcBodyTooLargeError
+        ? 413
+        : err instanceof IpcBodyTimeoutError
+          ? 408
+          : 400,
+      {
+        ok: false,
+        error: err instanceof IpcBodyTooLargeError
+          ? 'body_too_large'
+          : err instanceof IpcBodyTimeoutError
+            ? 'body_timeout'
+            : 'bad_json',
+      },
+    );
+  } finally {
+    if (preauthLimited) nativeSubagentRuntimePreauthInFlight -= 1;
+  }
+  const ds = findActiveBySessionId(params.sessionId);
+  const path = new URL(req.url ?? '/', 'http://localhost').pathname;
+  const port = req.socket.localPort;
+  if (!port) return jsonRes(res, 503, { ok: false, error: 'policy_unavailable' });
+  const hostSecret = trustedHostRequestSecrets.get(req);
+  const daemonIdentity = { larkAppId: cachedLarkAppId, bootInstanceId: getDaemonBootId() };
+  const hostNonce = hostSecret
+    ? nativeSubagentRuntimeHostRequestNonce(req.headers, daemonIdentity)
+    : undefined;
+  let responseAuth: {
+    authKind: 'host' | 'capability';
+    key: string;
+    requestNonce: string;
+  };
+  if (hostSecret) {
+    if (!hostNonce) return jsonRes(res, 403, { ok: false, error: 'response_challenge_required' });
+    responseAuth = { authKind: 'host', key: hostSecret, requestNonce: hostNonce };
+  } else {
+    const liveOrigin = ds?.managedTurnOrigin;
+    const policyCapability = liveOrigin?.policyCapability;
+    if (!ds || !policyCapability) {
+      return jsonRes(res, 403, { ok: false, error: 'origin_unproven' });
+    }
+    const verified = verifyNativeSubagentRuntimeCapabilityRequest({
+      capability: policyCapability,
+      headers: req.headers,
+      remoteAddress: req.socket.remoteAddress,
+      nonceStore: nativeSubagentRuntimeNonceStore,
+      method: req.method ?? 'POST',
+      path,
+      port,
+      sessionId: params.sessionId,
+      ...daemonIdentity,
+    });
+    if (!verified.ok) {
+      if (verified.reason === 'capacity_exceeded') {
+        return nativeSubagentRuntimeJsonRes({
+          req,
+          res,
+          sessionId: params.sessionId,
+          status: 429,
+          body: { ok: false, error: 'native_runtime_overloaded' },
+          authKind: 'capability',
+          key: policyCapability,
+          requestNonce: nativeSubagentRuntimeRequestNonce(req.headers) ?? '',
+        });
+      }
+      return jsonRes(res, 403, { ok: false, error: 'origin_unproven' });
+    }
+    responseAuth = {
+      authKind: 'capability',
+      key: policyCapability,
+      requestNonce: verified.nonce,
+    };
+  }
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  let runtimeState;
+  try { runtimeState = getBot(ds.larkAppId).nativeSubagentRuntimeState; }
+  catch { return jsonRes(res, 404, { ok: false, error: 'bot_not_found' }); }
+  if (runtimeState.status === 'invalid') {
+    return nativeSubagentRuntimeJsonRes({
+      req, res, sessionId: params.sessionId, status: 200,
+      body: { ok: true, invalidPolicy: true }, ...responseAuth,
+    });
+  }
+  nativeSubagentRuntimeJsonRes({
+    req, res, sessionId: params.sessionId, status: 200,
+    body: {
+      ok: true,
+      ...(runtimeState.status === 'valid' ? { policy: runtimeState.policy } : {}),
+    },
+    ...responseAuth,
+  });
 });
 
 // `botmux list` zombie pruning is maintenance, not explicit abandon. Serialize
@@ -1717,6 +2155,130 @@ ipcRoute('GET', '/api/sessions/:sessionId/preview', (req, res, params) => {
   return jsonRes(res, 200, { ok: true, preview });
 });
 
+const sessionAuthRequests = new Map<string, {
+  sessionId: string;
+  isCurrent: () => boolean;
+  poll: Awaited<ReturnType<typeof requestUserAuthorization>>['poll'];
+}>();
+
+for (const action of ['auth-request', 'auth-status']) {
+  ipcRoute('POST', `/api/sessions/:sessionId/${action}`, async (req, res, params) => {
+    let body: Record<string, unknown>;
+    try { body = await readBoundedJsonBody(req, 16_384, 1_000); }
+    catch (err) {
+      if (err instanceof IpcBodyTooLargeError || err instanceof IpcBodyTimeoutError) {
+        closeUntrustedRequestAfterResponse(req, res);
+      }
+      return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
+    }
+    const ds = findActiveBySessionId(params.sessionId);
+    const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+    if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+    if (['callerOpenId', 'openId', 'larkAppId', 'chatId'].some(key => key in body)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
+    }
+    const origin = ds?.managedTurnOrigin;
+    if (!ds || ds.session.status !== 'active' || sessionTransportDisabled(ds)
+      || ds.session.vcMeetingReceiver || !ds.worker || ds.worker.killed
+      || !origin?.callerOpenId || !origin.turnId || !origin.capability) {
+      return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+    }
+    // Two proof modes for "this request belongs to the current turn":
+    //  · Isolated pane (sandbox / read isolation): presents the rotating
+    //    capability tuple in the body, cross-checked against managedTurnOrigin.
+    //  · Managed host (no relay/channel injected): sends no tuple and instead
+    //    proves lineage the way `/api/current-actor` does — the daemon maps the
+    //    loopback socket to the client pid and walks it to the live CLI. Never
+    //    let a partial/stale tuple fall through to the host path.
+    const presentsOriginTuple = 'originCapability' in body || 'originTurnId' in body
+      || 'originDispatchAttempt' in body;
+    if (presentsOriginTuple) {
+      if (body.originCapability !== origin.capability || body.originTurnId !== origin.turnId
+        || body.originDispatchAttempt !== origin.dispatchAttempt) {
+        return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+      }
+    } else {
+      const peer = resolveLoopbackPeerProcesses({
+        remoteAddress: req.socket.remoteAddress,
+        remotePort: req.socket.remotePort,
+        localPort: req.socket.localPort,
+      });
+      if (!peer.ok || !attestCurrentTurnLoopbackPeer({
+        sessionId: params.sessionId, peer: peer.peer, findSession: findActiveBySessionId,
+      })) {
+        return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+      }
+    }
+    const callerOpenId = origin.callerOpenId;
+    const turnId = origin.turnId;
+    const capability = origin.capability;
+    const attempt = origin.dispatchAttempt;
+    const worker = ds.worker;
+    const generation = ds.workerGeneration;
+    const isCurrent = () => findActiveBySessionId(params.sessionId) === ds
+      && ds.session.status === 'active' && ds.worker === worker && !worker.killed
+      && ds.workerGeneration === generation && ds.managedTurnOrigin?.callerOpenId === callerOpenId
+      && ds.managedTurnOrigin?.turnId === turnId && ds.managedTurnOrigin?.capability === capability
+      && ds.managedTurnOrigin?.dispatchAttempt === attempt;
+    const cfg = getBot(ds.larkAppId).config;
+    if (!triggerUserAuthApplies(cfg.triggerUserAuth, 'lark-cli')) {
+      return jsonRes(res, 409, { ok: false, error: 'lark_user_auth_disabled' });
+    }
+
+    if (action === 'auth-status') {
+      const request = typeof body.requestId === 'string' ? sessionAuthRequests.get(body.requestId) : undefined;
+      if (!request || request.sessionId !== params.sessionId || !request.isCurrent()) {
+        return jsonRes(res, 409, { ok: false, error: 'auth_request_expired' });
+      }
+      const result = await request.poll();
+      if (!isCurrent() || !request.isCurrent()) {
+        return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+      }
+      if (result.status === 'pending') return jsonRes(res, 200, { ok: true, status: 'pending' });
+      if (result.status === 'failed') {
+        return jsonRes(res, 400, { ok: false, status: 'failed', error: result.error });
+      }
+      if (!refreshSessionIdentity(config.session.dataDir, params.sessionId, {
+        tool: 'lark-cli', appId: cfg.larkAppId, userAccessToken: result.token, turnId,
+      })) {
+        return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+      }
+      return jsonRes(res, 200, { ok: true, status: 'ready' });
+    }
+
+    if (!Array.isArray(body.scopes) || body.scopes.length > 100
+      || body.scopes.some(scope => typeof scope !== 'string' || !scope || scope.length > 256)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
+    }
+    const scopes = [...new Set(body.scopes as string[])];
+    const unknownScopes = scopes.filter(scope => !isKnownLarkUserScope(scope));
+    if (unknownScopes.length) return jsonRes(res, 400, { ok: false, error: 'unknown_scopes', scopes: unknownScopes });
+    const cached = getIdentity(ds.larkAppId, callerOpenId);
+    const identity = cached?.type === 'user' && ['sender', 'message_api', 'contact_api'].includes(cached.source)
+      ? cached
+      : await resolveVerifiedUserIdentity(ds.larkAppId, callerOpenId);
+    if (!identity || identity.type !== 'user' || identity.openId !== callerOpenId || !isCurrent()) {
+      return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
+    }
+    let authorization: Awaited<ReturnType<typeof requestUserAuthorization>>;
+    try {
+      authorization = await requestUserAuthorization(
+        cfg.larkAppId, cfg.larkAppSecret, normalizeBrand(cfg.brand), scopes, callerOpenId, isCurrent,
+      );
+    } catch {
+      return jsonRes(res, 502, { ok: false, error: 'authorization_request_failed' });
+    }
+    if (!isCurrent()) return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
+    const requestId = randomBytes(32).toString('hex');
+    sessionAuthRequests.set(requestId, { sessionId: params.sessionId, isCurrent, poll: authorization.poll });
+    setTimeout(() => sessionAuthRequests.delete(requestId), authorization.expiresIn * 1_000).unref();
+    return jsonRes(res, 200, {
+      ok: true, authUrl: authorization.authUrl, requestId,
+      scopes: authorization.scopes, expiresIn: authorization.expiresIn, autoCallback: true,
+    });
+  });
+}
+
 /** 向本会话 CLI 注入一条 allowlist 内的原生斜杠命令（idle 后生效）。
  *  鉴权双路径（见 sessionCliIpcAuth）：trusted-host 签名或本会话 rotating
  *  capability；命令面由 allowlist（默认空=全拒）承担。 */
@@ -1763,7 +2325,6 @@ ipcRoute('POST', '/api/sessions/:sessionId/slash', async (req, res, params) => {
 
 const proactiveChatRenameCooldown = new ChatRenameCooldown();
 const chatRenameSerialQueue = new ChatRenameSerialQueue();
-
 /** Session-scoped external mutation used by the botmux-chat-rename Skill. */
 ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params) => {
   const body = await readJsonBody<{ name?: unknown; proactive?: unknown } & Record<string, unknown>>(req)
@@ -1781,7 +2342,13 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
   const trigger = proactive ? 'ai_proactive' : 'user_explicit';
   const cooldownKey = `${ds.larkAppId}:${ds.chatId}`;
   await chatRenameSerialQueue.run(cooldownKey, async () => {
-    const result = await groupsStore.renameChat(ds.larkAppId, ds.chatId, normalized.name, {
+    const response = await executeChatRename({
+      larkAppId: ds.larkAppId,
+      chatId: ds.chatId,
+      name: normalized.name,
+      trigger,
+      sessionId: ds.session.sessionId,
+      botOpenId: getBotOpenId(ds.larkAppId),
       beforeUpdate: proactive
         ? () => {
             const cooldown = proactiveChatRenameCooldown.check(cooldownKey);
@@ -1790,44 +2357,267 @@ ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params
               : { ...cooldown, error: 'rate_limited' as const };
           }
         : undefined,
+    }, {
+      renameChat: groupsStore.renameChat,
+      activeSessions: () => getActiveSessionsRegistry()?.values() ?? [],
+      persistSession: sessionStore.updateSession,
+      logger,
     });
-    const botOpenId = getBotOpenId(ds.larkAppId) ?? '-';
-    if (!result.ok) {
-      const status = result.error === 'bot_not_in_chat' ? 403
-        : result.error === 'permission_denied' ? 403
-          : result.error === 'rate_limited' ? 429
-            : 502;
-      logger.warn(
-        `[chat-rename:audit] result=failed session=${ds.session.sessionId} chat=${ds.chatId} `
-        + `app=${ds.larkAppId} botOpenId=${botOpenId} trigger=${trigger} `
-        + `old=${JSON.stringify(result.oldName ?? null)} new=${JSON.stringify(result.newName ?? normalized.name)} `
-        + `error=${result.error} larkCode=${result.larkCode ?? '-'} detail=${result.detail ?? '-'}`,
-      );
-      return jsonRes(res, status, result);
+    if (proactive && response.body.ok && response.body.changed) {
+      proactiveChatRenameCooldown.record(cooldownKey);
     }
-    if (result.changed) {
-      if (proactive) proactiveChatRenameCooldown.record(cooldownKey);
-      // FR-7: the Lark write already succeeded, so a local cache-refresh
-      // failure (ENOSPC/EACCES on the session store) must NOT reverse the
-      // outcome into an HTTP 500 — best-effort per session, warn and keep the
-      // rename a success. Catch per-session so one bad write can't skip the rest.
-      for (const active of getActiveSessionsRegistry()?.values() ?? []) {
-        if (active.chatId !== ds.chatId) continue;
-        active.session.chatDisplayName = result.newName;
-        try {
-          sessionStore.updateSession(active.session);
-        } catch (e) {
-          logger.warn(`[chat-rename:audit] cache_refresh_failed session=${active.session.sessionId} chat=${ds.chatId} app=${ds.larkAppId} detail=${e instanceof Error ? e.message : String(e)}`);
-        }
-      }
-      logger.info(
-        `[chat-rename:audit] result=success session=${ds.session.sessionId} chat=${ds.chatId} `
-        + `app=${ds.larkAppId} botOpenId=${botOpenId} trigger=${trigger} `
-        + `old=${JSON.stringify(result.oldName)} new=${JSON.stringify(result.newName)} larkCode=0`,
-      );
-    }
-    return jsonRes(res, 200, { ...result, chatId: ds.chatId });
+    return jsonRes(res, response.status, response.body);
   });
+});
+
+/** Project-group control plane. The authenticated ordinary-group chat session
+ * is the only caller identity; project state is durable and the pinned card is
+ * merely a projection that this route recreates if a user withdraws it. */
+ipcRoute('POST', '/api/sessions/:sessionId/project', async (req, res, params) => {
+  const body = await readJsonBody<Record<string, unknown>>(req).catch(() => undefined);
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (sessionTransportDisabled(ds)) return jsonRes(res, 409, { ok: false, error: 'no_feishu_transport' });
+  if (ds.chatType !== 'group' || ds.scope !== 'chat') {
+    return jsonRes(res, 400, { ok: false, error: 'project_requires_ordinary_group_chat_session' });
+  }
+  const groupMode = readGroupCollaborationMode(config.session.dataDir, ds.chatId);
+  // An unconfigured group remains compatible with legacy dispatches: the CLI
+  // probes this route after dispatch and treats project_not_found as a silent
+  // no-op. Only an explicit standard-mode choice disables project commands.
+  if (groupMode?.mode === 'standard') {
+    return jsonRes(res, 409, { ok: false, error: 'project_mode_disabled' });
+  }
+  if (groupMode?.mode === 'project' && groupMode.coordinatorAppId !== ds.larkAppId) {
+    return jsonRes(res, 403, { ok: false, error: 'project_coordinator_required' });
+  }
+  const action = parseProjectCoordinatorAction(body);
+  if (!action) return jsonRes(res, 400, { ok: false, error: 'invalid_project_action' });
+  try {
+    const project = await projectCoordinator.run({
+      dataDir: config.session.dataDir,
+      chatId: ds.chatId,
+      larkAppId: ds.larkAppId,
+      coordinatorSessionId: ds.session.sessionId,
+    }, action);
+    return jsonRes(res, 200, { ok: true, project });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    const status = detail === 'project_not_found' ? 404
+      : detail === 'project_already_exists' || detail === 'project_coordinator_mismatch' ? 409
+        : detail.startsWith('invalid_') || detail === 'title_and_goal_required' || detail === 'workstream_not_found'
+          || detail === 'project_workstream_title_required' || detail === 'project_workstream_title_too_long' ? 400
+          : 502;
+    return jsonRes(res, status, { ok: false, error: detail });
+  }
+});
+
+/** Trusted Dashboard creates or refreshes the one pinned pre-project guide. */
+ipcRoute('POST', '/api/project-groups/:chatId/ensure-onboarding-card', async (req, res, params) => {
+  const chatId = decodeURIComponent(params.chatId);
+  if (!/^oc_[A-Za-z0-9_-]{1,128}$/.test(chatId)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  }
+  const mode = readGroupCollaborationMode(config.session.dataDir, chatId);
+  if (mode?.mode !== 'project' || mode.coordinatorAppId !== cachedLarkAppId) {
+    return jsonRes(res, 409, { ok: false, error: 'project_coordinator_mismatch' });
+  }
+  const body = await readJsonBody<Record<string, unknown>>(req).catch(() => undefined);
+  const coordinatorName = typeof body?.coordinatorName === 'string' ? body.coordinatorName.trim().slice(0, 80) : '';
+  const workerNames = Array.isArray(body?.workerNames)
+    ? body.workerNames.filter((name): name is string => typeof name === 'string')
+      .map(name => name.trim().slice(0, 80)).filter(Boolean).slice(0, 64)
+    : [];
+  if (!coordinatorName) return jsonRes(res, 400, { ok: false, error: 'coordinator_name_required' });
+  try {
+    const card = await projectCoordinator.ensureOnboardingCard({
+      dataDir: config.session.dataDir, chatId, larkAppId: cachedLarkAppId,
+    }, { coordinatorName, workerNames });
+    return jsonRes(res, 200, { ok: true, card });
+  } catch (error) {
+    return jsonRes(res, 502, { ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** Trusted Dashboard unpins and forgets the guide when project mode is disabled
+ * or ownership moves to another coordinator. */
+ipcRoute('POST', '/api/project-groups/:chatId/clear-onboarding-card', async (_req, res, params) => {
+  const chatId = decodeURIComponent(params.chatId);
+  if (!/^oc_[A-Za-z0-9_-]{1,128}$/.test(chatId)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  }
+  const mode = readGroupCollaborationMode(config.session.dataDir, chatId);
+  if (!mode?.onboardingCard) return jsonRes(res, 200, { ok: true, cleared: false });
+  if (mode.onboardingCard.larkAppId !== cachedLarkAppId) {
+    return jsonRes(res, 409, { ok: false, error: 'project_onboarding_coordinator_mismatch' });
+  }
+  try {
+    const cleared = await projectCoordinator.clearOnboardingCard({
+      dataDir: config.session.dataDir, chatId, larkAppId: cachedLarkAppId,
+    });
+    return jsonRes(res, 200, { ok: true, cleared });
+  } catch (error) {
+    return jsonRes(res, 502, { ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+/** Trusted Dashboard refresh after a group-level card presentation change. */
+ipcRoute('POST', '/api/project-groups/:chatId/refresh-card', async (_req, res, params) => {
+  const chatId = decodeURIComponent(params.chatId);
+  if (!/^oc_[A-Za-z0-9_-]{1,128}$/.test(chatId)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  }
+  const mode = readGroupCollaborationMode(config.session.dataDir, chatId);
+  if (mode?.mode !== 'project' || mode.coordinatorAppId !== cachedLarkAppId) {
+    return jsonRes(res, 409, { ok: false, error: 'project_coordinator_mismatch' });
+  }
+  const project = readProjectGroup(config.session.dataDir, chatId);
+  if (!project) return jsonRes(res, 404, { ok: false, error: 'project_not_found' });
+  if (project.larkAppId !== cachedLarkAppId) {
+    return jsonRes(res, 409, { ok: false, error: 'project_coordinator_mismatch' });
+  }
+  try {
+    const refreshed = await projectCoordinator.run({
+      dataDir: config.session.dataDir,
+      chatId,
+      larkAppId: cachedLarkAppId,
+      coordinatorSessionId: project.coordinatorSessionId,
+    }, { action: 'refresh' });
+    return jsonRes(res, 200, { ok: true, project: refreshed });
+  } catch (error) {
+    return jsonRes(res, 502, {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+/** Explicit control plane for one authorization-inheriting long-running task lease. The
+ * rotating current-turn capability binds every action to the calling session
+ * and turn; the daemon owns all persisted state and timers. */
+ipcRoute('POST', '/api/sessions/:sessionId/continuation', async (req, res, params) => {
+  type ContinuationRequestBody = {
+    action?: unknown;
+    readonly?: unknown; // accepted as a deprecated compatibility hint
+    ttlMs?: unknown;
+    maxContinuations?: unknown;
+  } & Record<string, unknown>;
+  const body = await readJsonBody<ContinuationRequestBody>(req)
+    .catch(() => ({} as ContinuationRequestBody));
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  const turnId = typeof body.originTurnId === 'string' ? body.originTurnId : undefined;
+  if (!turnId || ds.managedTurnOrigin?.turnId !== turnId) {
+    return jsonRes(res, 409, { ok: false, error: 'active_turn_required' });
+  }
+  if (!ensureReadonlyTaskContinuationAttached(ds)) {
+    return jsonRes(res, 409, { ok: false, error: 'continuation_unavailable' });
+  }
+  try {
+    let state;
+    if (body.action === 'start') {
+      if (!turnId.startsWith('om_') || ds.managedTurnOrigin?.dispatchAttempt !== undefined) {
+        return jsonRes(res, 409, { ok: false, error: 'ordinary_user_turn_required' });
+      }
+      if (body.ttlMs !== undefined
+        && (typeof body.ttlMs !== 'number' || !Number.isSafeInteger(body.ttlMs) || body.ttlMs <= 0)) {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_ttl_ms' });
+      }
+      if (body.maxContinuations !== undefined
+        && (typeof body.maxContinuations !== 'number'
+          || !Number.isSafeInteger(body.maxContinuations)
+          || body.maxContinuations <= 0)) {
+        return jsonRes(res, 400, { ok: false, error: 'invalid_max_continuations' });
+      }
+      const generation = ds.workerGeneration;
+      const proof = ds.taskContinuationRpcProof;
+      const inheritedAuthority = ds.activeInteractiveTurn;
+      if (!inheritedAuthority || inheritedAuthority.turnId !== turnId
+        || inheritedAuthority.caller.requestLarkAppId !== ds.larkAppId
+        || inheritedAuthority.caller.senderType !== 'user') {
+        return jsonRes(res, 409, { ok: false, error: 'continuation_authority_required' });
+      }
+      if (!ds.worker || ds.worker.killed || ds.worker.connected === false
+        || ds.workerReady !== true
+        || !Number.isSafeInteger(generation) || (generation ?? 0) <= 0
+        || ds.session.workerGeneration !== generation
+        || proof?.workerGeneration !== generation) {
+        return jsonRes(res, 409, { ok: false, error: 'continuation_rpc_required' });
+      }
+      state = startReadonlyTaskContinuation(ds.session, {
+        turnId,
+        workerGeneration: generation!,
+        authorizationMode: 'inherited',
+        startMode: 'explicit',
+        trustedCaller: inheritedAuthority.caller,
+        ...(inheritedAuthority.controller
+          ? { trustedController: inheritedAuthority.controller }
+          : {}),
+        ...(typeof body.ttlMs === 'number' ? { ttlMs: body.ttlMs } : {}),
+        ...(typeof body.maxContinuations === 'number'
+          ? { maxContinuations: body.maxContinuations }
+          : {}),
+      });
+    } else if (body.action === 'await-user') {
+      const before = ds.session.readonlyTaskContinuation;
+      state = awaitReadonlyTaskContinuationUser(ds.session, turnId);
+      if (state === before || state?.status !== 'awaiting_user') {
+        return jsonRes(res, 409, { ok: false, error: 'continuation_transition_rejected' });
+      }
+    } else if (body.action === 'cancel') {
+      const before = ds.session.readonlyTaskContinuation;
+      state = cancelReadonlyTaskContinuationExplicit(ds.session, turnId);
+      if (state === before || state?.status !== 'cancelled') {
+        return jsonRes(res, 409, { ok: false, error: 'continuation_transition_rejected' });
+      }
+    } else {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_action' });
+    }
+    return jsonRes(res, 200, { ok: true, state });
+  } catch (err) {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+/** Side-effect-free dispatch guard used before the CLI creates or writes a
+ * topic. The registration route repeats this check on the host boundary. */
+ipcRoute('POST', '/api/sessions/:sessionId/project-dispatch-policy', async (req, res, params) => {
+  const body = await readJsonBody<Record<string, unknown>>(req).catch(() => undefined);
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  const targetChatId = typeof body?.targetChatId === 'string' ? body.targetChatId.trim() : '';
+  const title = typeof body?.title === 'string' ? body.title.trim() : '';
+  const targetAppIds = Array.isArray(body?.targetAppIds)
+    ? body.targetAppIds.filter((value): value is string => typeof value === 'string').map(value => value.trim()).filter(Boolean)
+    : undefined;
+  if (!/^oc_[A-Za-z0-9_-]{1,128}$/.test(targetChatId) || !targetAppIds) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_project_dispatch_policy_request' });
+  }
+  const groupMode = readGroupCollaborationMode(config.session.dataDir, ds.chatId);
+  if (groupMode?.mode === 'project' && (ds.chatType !== 'group' || ds.scope !== 'chat')) {
+    return jsonRes(res, 403, { ok: false, error: 'project_coordinator_chat_scope_required' });
+  }
+  const decision = evaluateProjectDispatchPolicy({
+    config: groupMode,
+    sourceAppId: ds.larkAppId,
+    sourceChatId: ds.chatId,
+    targetChatId,
+    targetAppIds,
+    hasLegacyBots: body?.hasLegacyBots === true,
+    title,
+    existingDispatch: body?.existingDispatch === true,
+  });
+  if (!decision.ok) return jsonRes(res, 403, decision);
+  return jsonRes(res, 200, { ok: true, projectMode: decision.projectMode });
 });
 
 /** 会话内切换工作目录（角色切换专用）：硬校验角色库根 → 更新记录落盘（唯一事实源）
@@ -1984,7 +2774,7 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
     persistedExists: !!persistedRaw,
   });
   const stored = decision.keepStored ? storedRaw : undefined;
-  const persisted = decision.keepPersisted ? persistedRaw : undefined;
+  let persisted = decision.keepPersisted ? persistedRaw : undefined;
 
   if (decision.foreignLeak) {
     return {
@@ -1995,6 +2785,42 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
       error: `no session record for: ${sessionId}`,
       message: 'no session found',
     };
+  }
+
+  // HTTP steer-group restart insurance (options.steer; codex-app turn/steer): a
+  // superseded member parked behind its successor carries a durable
+  // `steerParkedBy` chain. Normally the live daemon fans the group's real final
+  // out in-memory; if it restarted in the superseded→real-final window, walk
+  // the chain to the first terminal successor and mirror that outcome back onto
+  // this turn (completed carries the merged ANSWER, no usage; failed mirrors the
+  // terminal evidence). A chain that still ends pending keeps the turn `running`.
+  if (persisted?.result.status === 'pending' && persisted.result.steerParkedBy) {
+    const owner = persisted.ownerLarkAppId ?? cachedLarkAppId ?? '';
+    const terminal = asyncTriggerStore.followSteerParkedChain(sessionId, persisted.result.steerParkedBy);
+    if (terminal && owner) {
+      const r = terminal.result;
+      const at = (r.status === 'completed' ? r.completedAt : r.failedAt) ?? Date.now();
+      try {
+        if (r.status === 'completed') {
+          asyncTriggerStore.recordCompleted(sessionId, persisted.triggerId, r.content ?? '', at, owner);
+        } else if (r.reason === 'turn_terminal' && r.terminalErrorCode) {
+          asyncTriggerStore.recordTerminalFailureStrict(sessionId, persisted.triggerId, at, owner, r.terminalErrorCode);
+        } else {
+          asyncTriggerStore.recordFailedStrict(sessionId, persisted.triggerId, at, owner, 'dispatch_unknown');
+        }
+        persisted = asyncTriggerStore.lookup(sessionId, persisted.triggerId);
+      } catch (err) {
+        // Mirror writes use the strict/durable tier and can throw on EIO or an
+        // owner mismatch. Never 500 the poll: the parked record stays pending,
+        // this response falls through to `running`, and the next poll retries
+        // the mirror once storage recovers (same fail-soft shape as the
+        // postBarrierFault convergence below).
+        logger.warn(
+          `steer-park chain mirror failed for session=${sessionId} `
+          + `trigger=${(persisted?.triggerId ?? 'unknown').substring(0, 8)}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
   }
 
   const memTriggerId = triggerId || ds?.latestAsyncTriggerId;
@@ -2059,6 +2885,7 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
       errorCode: memResult.errorCode,
       terminalErrorCode: memResult.terminalErrorCode,
       usage: memResult.usage,
+      interruptedAt: memResult.interruptedAt,
     } : undefined,
     memTriggerId: memResult ? memTriggerId : undefined,
     persisted,
@@ -2079,7 +2906,7 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
   // inline; the write token is never included. Closed/restored sessions have no
   // live worker terminal, so no stale URL is ever advertised.
   if (process.env.BOTMUX_CORE_ONLY === '1' && ds && ds.workerPort && ds.workerViewToken) {
-    resolved.readOnlyUrl = buildTerminalUrl(ds);
+    resolved.readOnlyUrl = buildTerminalUrl(ds, { viewScope: 'worker' });
     resolved.viewToken = ds.workerViewToken;
   }
   return resolved;
@@ -2166,15 +2993,20 @@ ipcRoute('POST', '/api/sessions/:sessionId/whiteboard', async (req, res, params)
   return withBotTurnAdmission(larkAppId, async () => {
     const current = findSessionRecord(params.sessionId);
     if (!current) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
-    if (expect !== undefined && current.whiteboardId !== expect) {
+    // The same command a host applies offline (services/session-commands.ts);
+    // here it runs on the daemon's own live row.
+    const applied = applySessionRowCommand(current, {
+      type: 'whiteboard',
+      whiteboardId: unbind ? null : bindId,
+      ...(expect !== undefined ? { expectWhiteboardId: expect } : {}),
+    }, { now: new Date() });
+    if (applied.outcome === 'refused') {
       return jsonRes(res, 409, {
         ok: false,
         error: 'whiteboard_changed',
         whiteboardId: current.whiteboardId ?? null,
       });
     }
-    if (unbind) current.whiteboardId = undefined;
-    else current.whiteboardId = bindId;
     sessionStore.updateSession(current);
     jsonRes(res, 200, { ok: true, whiteboardId: current.whiteboardId ?? null });
   });
@@ -2238,6 +3070,335 @@ ipcRoute('POST', '/api/sessions/spawn', async (req, res) => {
     return jsonRes(res, r.error === 'session_exists' ? 409 : 500, r);
   }
   jsonRes(res, 200, r);
+  });
+});
+
+function parseHeadlessCreateBody(body: unknown): {
+  ok: true;
+  value: {
+    title?: string;
+    workingDir?: string;
+    model?: string;
+    reasoningEffort?: HeadlessReasoningEffort;
+  };
+} | { ok: false; status: number; error: string } {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, status: 400, error: 'bad_request' };
+  }
+  const b = body as Record<string, unknown>;
+  const out: {
+    title?: string;
+    workingDir?: string;
+    model?: string;
+    reasoningEffort?: HeadlessReasoningEffort;
+  } = {};
+  if (b.title !== undefined) {
+    if (typeof b.title !== 'string' || !b.title.trim() || Array.from(b.title.trim()).length > 200) {
+      return { ok: false, status: 400, error: 'invalid_title' };
+    }
+    out.title = b.title.trim();
+  }
+  if (b.workingDir !== undefined) {
+    if (typeof b.workingDir !== 'string' || !b.workingDir.trim()) {
+      return { ok: false, status: 400, error: 'invalid_working_dir' };
+    }
+    out.workingDir = b.workingDir.trim();
+  }
+  if (b.model !== undefined) {
+    if (typeof b.model !== 'string' || !b.model.trim() || b.model.length > 200) {
+      return { ok: false, status: 400, error: 'invalid_model' };
+    }
+    out.model = b.model.trim();
+  }
+  if (b.reasoningEffort !== undefined) {
+    if (!isCodexReasoningEffort(b.reasoningEffort)) {
+      return { ok: false, status: 400, error: 'invalid_reasoning_effort' };
+    }
+    out.reasoningEffort = b.reasoningEffort as HeadlessReasoningEffort;
+  }
+  return { ok: true, value: out };
+}
+
+function findHeadlessRecordForThisDaemon(idOrSessionId: string): HeadlessSessionRecord | null {
+  const record = readHeadlessSession(idOrSessionId);
+  if (!record || record.larkAppId !== cachedLarkAppId) return null;
+  return record;
+}
+
+// Uses the same signed host-CLI IPC boundary and bot admission gate as headless.
+ipcRoute('GET', '/api/headless/invocations/capabilities', async (req, res) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const { invocationCapabilityForBot } = await import('../services/constrained-invocation/daemon.js');
+  return jsonRes(res, 200, { ok: true, capability: invocationCapabilityForBot(cachedLarkAppId) });
+});
+ipcRoute('POST', '/api/headless/invocations', async (req, res) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  const { invocationServiceForBot } = await import('../services/constrained-invocation/daemon.js');
+  return withBotTurnAdmission(cachedLarkAppId, async () => {
+    try {
+      const result = invocationServiceForBot(cachedLarkAppId!, true).start(body);
+      return jsonRes(res, result.state === 'running' ? 202 : 200, { ok: true, result });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'invalid_invocation';
+      return jsonRes(res, message === 'idempotency_conflict' ? 409 : 400, { ok: false, error: message });
+    }
+  });
+});
+ipcRoute('GET', '/api/headless/invocations/:requestId', async (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const { invocationServiceForBot } = await import('../services/constrained-invocation/daemon.js');
+  try {
+    const result = invocationServiceForBot(cachedLarkAppId).get(params.requestId);
+    return jsonRes(res, result ? 200 : 404, { ok: !!result, result });
+  } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_invocation' }); }
+});
+ipcRoute('POST', '/api/headless/invocations/:requestId/cancel', async (req, res, params) => {
+  if (!ipcHmacAuthorized(req)) return jsonRes(res, 401, { ok: false, error: 'unauthorized' });
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const { invocationServiceForBot } = await import('../services/constrained-invocation/daemon.js');
+  try {
+    const result = await invocationServiceForBot(cachedLarkAppId).cancel(params.requestId);
+    return jsonRes(res, result ? 200 : 404, { ok: !!result, result });
+  } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_invocation' }); }
+});
+
+ipcRoute('GET', '/api/headless/sessions', (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const sessions = new Map(sessionStore.listSessions().map(session => [session.sessionId, session]));
+  const records = listHeadlessSessions()
+    .filter(record => record.larkAppId === cachedLarkAppId)
+    .map(record => {
+      const session = sessions.get(record.sessionId);
+      return {
+        ...record,
+        status: session?.status ?? 'missing',
+        chatId: session?.chatId,
+        rootMessageId: session?.rootMessageId,
+      };
+    });
+  return jsonRes(res, 200, { ok: true, sessions: records });
+});
+
+ipcRoute('POST', '/api/headless/sessions', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const activeSessions = getActiveSessionsRegistry();
+  if (!activeSessions) return jsonRes(res, 503, { ok: false, error: 'registry_unavailable' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  const parsed = parseHeadlessCreateBody(body);
+  if (!parsed.ok) return jsonRes(res, parsed.status, { ok: false, error: parsed.error });
+  return withBotTurnAdmission(cachedLarkAppId, async () => {
+    const r = await createHeadlessSession(activeSessions, undefined, {
+      larkAppId: cachedLarkAppId,
+      ...parsed.value,
+    });
+    return jsonRes(res, r.ok ? 200 : 400, r);
+  });
+});
+
+ipcRoute('GET', '/api/headless/sessions/:sessionId', (_req, res, params) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const record = findHeadlessRecordForThisDaemon(params.sessionId);
+  if (!record) return jsonRes(res, 404, { ok: false, error: 'headless_session_not_found' });
+  const ds = findActiveBySessionId(record.sessionId);
+  const session = ds?.session ?? sessionStore.getOwnedSession(record.sessionId);
+  return jsonRes(res, 200, {
+    ok: true,
+    session: record,
+    status: session?.status ?? 'missing',
+    chatId: session?.chatId,
+    rootMessageId: session?.rootMessageId,
+  });
+});
+
+ipcRoute('POST', '/api/headless/sessions/:sessionId/publish', async (req, res, params) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const record = findHeadlessRecordForThisDaemon(params.sessionId);
+  if (!record) return jsonRes(res, 404, { ok: false, error: 'headless_session_not_found' });
+  let body: Record<string, unknown>;
+  try { body = await readJsonBody<Record<string, unknown>>(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  const targetChatId = typeof body.chatId === 'string' && body.chatId.trim()
+    ? body.chatId.trim()
+    : record.boundChatId ?? '';
+  const rootMessageId = typeof body.rootMessageId === 'string' && body.rootMessageId.trim()
+    ? body.rootMessageId.trim()
+    : record.boundScope === 'thread' ? record.boundRootMessageId ?? '' : '';
+  const triggerId = typeof body.triggerId === 'string' && body.triggerId.trim()
+    ? body.triggerId.trim()
+    : record.latestTriggerId;
+  if (!triggerId) return jsonRes(res, 409, { ok: false, error: 'no_trigger' });
+  if (!/^oc_[A-Za-z0-9_-]{1,128}$/.test(targetChatId)) {
+    return jsonRes(res, 400, { ok: false, error: record.boundChatId ? 'invalid_chat_id' : 'chat_id_required' });
+  }
+  if (rootMessageId && !/^om_[A-Za-z0-9_-]{1,128}$/.test(rootMessageId)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_root_message_id' });
+  }
+  const result = buildAsyncTriggerLookupResponse(record.sessionId, triggerId);
+  if (result.state !== 'completed' || result.output?.content === undefined) {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: result.state === 'running' ? 'trigger_running' : 'result_not_available',
+      result,
+    });
+  }
+  try {
+    const content = result.output.content;
+    if (!content.trim()) {
+      return jsonRes(res, 409, { ok: false, error: 'empty_result', result });
+    }
+    const messageId = rootMessageId
+      ? await replyMessage(cachedLarkAppId, rootMessageId, content, 'text', true)
+      : await sendMessage(cachedLarkAppId, targetChatId, content, 'text');
+    const publishedAt = new Date().toISOString();
+    let updated: HeadlessSessionRecord | null = null;
+    let metadataWarning: string | undefined;
+    try {
+      updated = updateHeadlessSession(record.id, current => {
+        current.lastPublishedAt = publishedAt;
+        current.lastPublishedMessageId = messageId;
+      });
+    } catch (error) {
+      metadataWarning = error instanceof Error ? error.message : String(error);
+      logger.warn(`[headless] publish metadata update failed for ${record.id}: ${metadataWarning}`);
+    }
+    const session = findOwnedSessionRecord(record.sessionId);
+    if (session?.headless) {
+      session.headless.lastPublishedAt = publishedAt;
+      session.headless.lastPublishedMessageId = messageId;
+      sessionStore.updateSession(session);
+    }
+    return jsonRes(res, 200, {
+      ok: true,
+      messageId,
+      triggerId: result.triggerId,
+      session: updated ?? record,
+      ...(metadataWarning ? { metadataWarning } : {}),
+    });
+  } catch (error) {
+    return jsonRes(res, 502, { ok: false, error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+ipcRoute('POST', '/api/headless/sessions/:sessionId/bind', async (req, res, params) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'bot_not_found' });
+  const record = findHeadlessRecordForThisDaemon(params.sessionId);
+  if (!record) return jsonRes(res, 404, { ok: false, error: 'headless_session_not_found' });
+  let body: Record<string, unknown>;
+  try { body = await readJsonBody<Record<string, unknown>>(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  const targetChatId = typeof body.chatId === 'string' ? body.chatId.trim() : '';
+  let rootMessageId = typeof body.rootMessageId === 'string' ? body.rootMessageId.trim() : '';
+  const scope = body.scope === 'thread' ? 'thread' : body.scope === 'chat' ? 'chat' : undefined;
+  const replay = body.replay === 'none' ? 'none' : 'latest';
+  const triggerId = typeof body.triggerId === 'string' && body.triggerId.trim()
+    ? body.triggerId.trim()
+    : record.latestTriggerId;
+  const title = typeof body.title === 'string' && body.title.trim()
+    ? body.title.trim().slice(0, 200)
+    : record.title;
+  if (!/^oc_[A-Za-z0-9_-]{1,128}$/.test(targetChatId)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  }
+  const targetScope = scope ?? 'thread';
+  if (rootMessageId && !/^om_[A-Za-z0-9_-]{1,128}$/.test(rootMessageId)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_root_message_id' });
+  }
+  if (!rootMessageId && targetScope === 'chat') {
+    return jsonRes(res, 400, { ok: false, error: 'root_message_id_required_for_chat_scope' });
+  }
+  let replayContent: string | undefined;
+  let replayTriggerId: string | undefined;
+  if (replay === 'latest') {
+    if (!triggerId) return jsonRes(res, 409, { ok: false, error: 'no_trigger' });
+    const latestResult = buildAsyncTriggerLookupResponse(record.sessionId, triggerId);
+    if (latestResult.state !== 'completed' || latestResult.output?.content === undefined) {
+      return jsonRes(res, 409, {
+        ok: false,
+        error: latestResult.state === 'running' ? 'trigger_running' : 'result_not_available',
+        result: latestResult,
+      });
+    }
+    if (!latestResult.output.content.trim()) {
+      return jsonRes(res, 409, { ok: false, error: 'empty_result', result: latestResult });
+    }
+    replayContent = latestResult.output.content;
+    replayTriggerId = latestResult.triggerId;
+  }
+  let createdRootMessage = false;
+  if (!rootMessageId) {
+    try {
+      rootMessageId = await sendMessage(cachedLarkAppId, targetChatId, title, 'text');
+      createdRootMessage = true;
+    } catch (error) {
+      return jsonRes(res, 502, {
+        ok: false,
+        error: 'topic_create_failed',
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  const result = await transferSession(record.sessionId, targetChatId, rootMessageId, 'group', targetScope);
+  if (!result.ok) {
+    if (createdRootMessage) {
+      deleteMessage(cachedLarkAppId, rootMessageId).catch(() => { /* best-effort cleanup */ });
+    }
+    return jsonRes(res, 409, { ok: false, error: result.error });
+  }
+  const boundAt = new Date().toISOString();
+  let replayMessageId: string | undefined;
+  let replayError: string | undefined;
+  if (replayContent) {
+    try {
+      replayMessageId = targetScope === 'thread'
+        ? await replyMessage(cachedLarkAppId, rootMessageId, replayContent, 'text', true)
+        : await sendMessage(cachedLarkAppId, targetChatId, replayContent, 'text');
+    } catch (error) {
+      replayError = error instanceof Error ? error.message : String(error);
+      logger.warn(`[headless] replay failed after bind for ${record.id}: ${replayError}`);
+    }
+  }
+  let updated: HeadlessSessionRecord | null = null;
+  let metadataWarning: string | undefined;
+  try {
+    updated = updateHeadlessSession(record.id, current => {
+      current.boundAt = boundAt;
+      current.boundChatId = targetChatId;
+      current.boundRootMessageId = rootMessageId;
+      current.boundScope = targetScope;
+      if (replayMessageId) {
+        current.lastPublishedAt = boundAt;
+        current.lastPublishedMessageId = replayMessageId;
+      }
+    });
+  } catch (error) {
+    metadataWarning = error instanceof Error ? error.message : String(error);
+    logger.warn(`[headless] bind metadata update failed for ${record.id}: ${metadataWarning}`);
+  }
+  const session = findOwnedSessionRecord(record.sessionId);
+  if (session?.headless) {
+    session.headless.boundAt = boundAt;
+    session.headless.boundChatId = targetChatId;
+    session.headless.boundRootMessageId = rootMessageId;
+    session.headless.boundScope = targetScope;
+    if (replayMessageId) {
+      session.headless.lastPublishedAt = boundAt;
+      session.headless.lastPublishedMessageId = replayMessageId;
+    }
+    sessionStore.updateSession(session);
+  }
+  return jsonRes(res, 200, {
+    ok: true,
+    sessionId: record.sessionId,
+    rootMessageId,
+    replayStatus: replayContent ? (replayMessageId ? 'published' : 'failed') : 'skipped',
+    ...(replayMessageId ? { replayMessageId, replayTriggerId } : {}),
+    ...(replayError ? { replayError } : {}),
+    session: updated ?? record,
+    ...(metadataWarning ? { metadataWarning } : {}),
   });
 });
 
@@ -2349,6 +3510,45 @@ ipcRoute('GET', '/api/sessions/:sessionId/trigger-result', (req, res, params) =>
   // resolved state including not_found — task state lives in `result.state`,
   // not the HTTP status. Only a malformed lookup (ok:false) maps to non-200.
   jsonRes(res, result.ok ? 200 : 400, result);
+});
+
+ipcRoute('POST', '/api/sessions/:sessionId/trigger-result/supersede', async (req, res, params) => {
+  const session = findOwnedSessionRecord(params.sessionId);
+  if (!session || !cachedLarkAppId || session.larkAppId !== cachedLarkAppId) {
+    return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  }
+  let body: Record<string, unknown>;
+  try { body = await readJsonBody<Record<string, unknown>>(req, 4_096); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const predecessorTriggerId = typeof body.predecessorTriggerId === 'string' ? body.predecessorTriggerId.trim() : '';
+  const successorTriggerId = typeof body.successorTriggerId === 'string' ? body.successorTriggerId.trim() : '';
+  if (!predecessorTriggerId || !successorTriggerId || predecessorTriggerId === successorTriggerId) {
+    return jsonRes(res, 400, { ok: false, error: 'distinct_trigger_ids_required' });
+  }
+  try {
+    const outcome = asyncTriggerStore.supersedePendingTriggerByCompletedSuccessorStrict(
+      params.sessionId,
+      predecessorTriggerId,
+      successorTriggerId,
+      Date.now(),
+      cachedLarkAppId,
+    );
+    if (outcome === 'superseded' || outcome === 'already_superseded') {
+      const results = findActiveBySessionId(params.sessionId)?.asyncTriggerResults;
+      if (results?.get(predecessorTriggerId)?.status === 'pending') results.delete(predecessorTriggerId);
+      return jsonRes(res, 200, {
+        ok: true,
+        state: 'superseded',
+        alreadyTerminal: outcome === 'already_superseded',
+        predecessorTriggerId,
+        successorTriggerId,
+      });
+    }
+    return jsonRes(res, 409, { ok: false, error: outcome, predecessorTriggerId, successorTriggerId });
+  } catch (error) {
+    logger.warn(`[async-trigger] exact supersession failed session=${params.sessionId.slice(0, 8)}: ${error}`);
+    return jsonRes(res, 409, { ok: false, error: 'trigger_supersession_rejected' });
+  }
 });
 
 // 会话 insight：只读解析本会话的 transcript，产出动作 span / 失败聚合 / 规则建议
@@ -2539,8 +3739,8 @@ ipcRoute('GET', '/api/sessions/:sessionId/write-link', (req, res, params) => {
 /**
  * Read-only twin of write-link: the base capability URL the Feishu card's
  * 「打开 Web 终端」button also hands out (viewToken, never the write token).
- * The viewToken here is the worker's PER-BOOT card token — it dies with the
- * worker generation and is deliberately not bound to any dashboard auth
+ * The viewToken here is the worker's PER-BOOT token — it dies with the worker
+ * generation and is deliberately not bound to any dashboard auth
  * session. The central dashboard therefore REPLACES it with a short-lived
  * signed read grant bound to the requesting identity before answering its own
  * /api/sessions/:id/view-link (P1-5); this loopback-HMAC route never reaches a
@@ -2558,7 +3758,7 @@ ipcRoute('GET', '/api/sessions/:sessionId/view-link', (req, res, params) => {
   if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
   const port = ds.workerPort ?? ds.session.webPort;
   if (!port || !ds.workerViewToken) return jsonRes(res, 409, { ok: false, error: 'terminal_unavailable' });
-  jsonRes(res, 200, { ok: true, url: buildTerminalUrl(ds) });
+  jsonRes(res, 200, { ok: true, url: buildTerminalUrl(ds, { viewScope: 'worker' }) });
 });
 
 /**
@@ -2618,6 +3818,15 @@ function workingDirForSession(sessionId: string): string | undefined {
  * the original Lark thread so users see why the session is alive again.
  */
 ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => {
+  const parsedBody = await readJsonBody<unknown>(req, 4_096).catch(() => ({}));
+  // JSON accepts null, arrays, and scalars. Treat all non-record input as an
+  // empty option bag before resuming, so a malformed optional body can never
+  // turn a successful state transition into a 500 below.
+  const body: { reconcileStreamingCard?: unknown } = parsedBody !== null
+    && typeof parsedBody === 'object'
+    && !Array.isArray(parsedBody)
+    ? parsedBody as { reconcileStreamingCard?: unknown }
+    : {};
   const sessionId = params.sessionId;
   const sourceSession = findSessionRecord(sessionId);
   if (!sourceSession) return jsonRes(res, 404, { ok: false, error: 'not_found' });
@@ -2662,17 +3871,47 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   const cliName = sessionConfiguredRuntimeDisplayName(ds.session, botCfg?.cliRuntime)
     ?? getCliDisplayName(cliId ?? botCfg?.cliId ?? 'claude-code');
   const notice = JSON.stringify({ text: `🔄 会话已通过命令行恢复，发条消息继续与 ${cliName} 对话。` });
-  if (ds.larkAppId && !sessionTransportDisabled(ds)) {
-    if (ds.scope === 'chat' && ds.chatId) {
-      getChatMode(ds.larkAppId, ds.chatId, { forceRefresh: true })
-        .then((mode) => mode === 'topic' && ds.session.rootMessageId
-          ? replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
-          : sendMessage(ds.larkAppId, ds.chatId, notice, 'text'))
-        .catch(err => logger.debug(`[resume] failed to post chat-scope resume notice: ${err}`));
-    } else if (ds.session.rootMessageId) {
-      replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
-        .catch(err => logger.debug(`[resume] failed to post thread-scope resume notice: ${err}`));
+  const postResumeNotice = async (): Promise<void> => {
+    if (!ds.larkAppId) return;
+    if (!sessionTransportDisabled(ds)) {
+      if (ds.scope === 'chat' && ds.chatId) {
+        await getChatMode(ds.larkAppId, ds.chatId, { forceRefresh: true })
+          .then((mode) => mode === 'topic' && ds.session.rootMessageId
+            ? replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
+            : sendMessage(ds.larkAppId, ds.chatId, notice, 'text'))
+          .catch(err => logger.debug(`[resume] failed to post chat-scope resume notice: ${err}`));
+      } else if (ds.session.rootMessageId) {
+        await replyMessage(ds.larkAppId, ds.session.rootMessageId, notice, 'text', true)
+          .catch(err => logger.debug(`[resume] failed to post thread-scope resume notice: ${err}`));
+      }
     }
+  };
+
+  // `/sessions` resumes from a card outside the original topic, so there is no
+  // clicked in-topic card callback to replace the stale "session closed" card.
+  // Opt in explicitly from that caller: publish the fresh waiting card first,
+  // then withdraw its predecessor. Keep CLI/dashboard resume behavior stable.
+  const staleCardId = ds.streamCardId;
+  const shouldReconcileStreamingCard = body.reconcileStreamingCard === true
+    && ds.scope === 'thread'
+    && !!ds.session.rootMessageId
+    && !!staleCardId
+    && staleCardId !== CARD_POSTING_SENTINEL
+    && botCfg?.privateCard !== true;
+  if (shouldReconcileStreamingCard) {
+    const rootMessageId = ds.session.rootMessageId!;
+    void reconcileResumedStreamingCard(
+      ds,
+      staleCardId,
+      cardJson => replyMessage(ds.larkAppId, rootMessageId, cardJson, 'interactive', true),
+    ).then(async (result) => {
+      if (result.status === 'committed') await postResumeNotice();
+    }).catch(async (err) => {
+      logger.warn(`[resume] failed to reconcile original streaming card: ${err instanceof Error ? err.message : String(err)}`);
+      await postResumeNotice();
+    });
+  } else {
+    void postResumeNotice();
   }
 
   // Report the EFFECTIVE action, not the raw request flag: only fork when wake
@@ -2817,8 +4056,21 @@ ipcRoute('POST', '/api/sessions/migrate-to-chat', async (req, res) => {
   jsonRes(res, 200, { ok: true, sessionId: ds.session.sessionId });
 });
 
-ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) => {
+ipcRoute('POST', '/api/sessions/:sessionId/locate', async (req, res, params) => {
   const sid = params.sessionId;
+  let body: unknown;
+  try {
+    body = await readJsonBody(req, 8 * 1024);
+  } catch (err) {
+    return jsonRes(res, err instanceof JsonBodyTooLargeError ? 413 : 400, {
+      ok: false,
+      error: err instanceof JsonBodyTooLargeError ? 'body_too_large' : 'invalid_json',
+    });
+  }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    return jsonRes(res, 400, { ok: false, error: 'body_must_be_object' });
+  }
+  const expected = body as SessionLocateExpectedScope;
   const acq = locateLimiter.tryAcquire(sid);
   if (!acq.ok) {
     res.writeHead(429, {
@@ -2837,18 +4089,31 @@ ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) =>
   const ctx = ds
     ? {
         larkAppId: ds.larkAppId,
+        chatId: ds.chatId,
+        scope: ds.session.scope,
+        status: ds.session.status,
         rootMessageId: ds.session.rootMessageId,
         ownerOpenId: ds.session.ownerOpenId,
       }
     : closed
       ? {
           larkAppId: closed.larkAppId ?? '',
+          chatId: closed.chatId,
+          scope: closed.scope,
+          status: closed.status,
           rootMessageId: closed.rootMessageId,
           ownerOpenId: closed.ownerOpenId,
         }
       : null;
   if (!ctx || !ctx.larkAppId) {
     return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  }
+  // Optional compare-before-locate guard used by the public `/sessions` card.
+  // Existing dashboard callers send `{}` and keep their historical behavior.
+  // When present, every field is checked against the daemon's latest row so a
+  // transfer/close racing the card handler's fresh GET fails closed here.
+  if (!matchesExpectedSessionLocateScope(ctx, expected)) {
+    return jsonRes(res, 409, { ok: false, error: 'session_scope_changed' });
   }
   if (!ctx.ownerOpenId) {
     return jsonRes(res, 422, { ok: false, error: 'no_owner' });
@@ -2872,6 +4137,99 @@ ipcRoute('POST', '/api/sessions/:sessionId/locate', async (_req, res, params) =>
 
 // ─── Schedules ─────────────────────────────────────────────────────────────
 
+type SchedulePreconditionWriteParseResult =
+  | {
+      ok: true;
+      supplied: boolean;
+      create?: SchedulePreconditionDefinition;
+      update?: SchedulePreconditionMutation;
+    }
+  | { ok: false; field: 'preconditionEnabled' | 'preconditionScript' | 'preconditionFilePath' };
+
+/** Parse the authenticated schedule precondition write DTO. Source values go
+ * directly to protected storage; authenticated management reads receive a
+ * validated flat projection from that sidecar rather than from the task row. */
+function parseSchedulePreconditionWrite(
+  body: Record<string, unknown>,
+  operation: 'create' | 'update',
+): SchedulePreconditionWriteParseResult {
+  const enabledPresent = Object.hasOwn(body, 'preconditionEnabled');
+  const scriptPresent = Object.hasOwn(body, 'preconditionScript');
+  const filePresent = Object.hasOwn(body, 'preconditionFilePath');
+  const supplied = enabledPresent || scriptPresent || filePresent;
+
+  if (enabledPresent && typeof body.preconditionEnabled !== 'boolean') {
+    return { ok: false, field: 'preconditionEnabled' };
+  }
+  if (scriptPresent && filePresent) {
+    return { ok: false, field: 'preconditionFilePath' };
+  }
+
+  const enabled = enabledPresent ? body.preconditionEnabled as boolean : undefined;
+  let source: SchedulePreconditionSource | undefined;
+  if (scriptPresent) {
+    if (body.preconditionScript === null) {
+      if (operation === 'create' || enabledPresent) {
+        return { ok: false, field: 'preconditionScript' };
+      }
+      return { ok: true, supplied, update: { action: 'clear' } };
+    }
+    try {
+      source = validateSchedulePreconditionSource({
+        kind: 'inline',
+        script: body.preconditionScript,
+      });
+    } catch {
+      return { ok: false, field: 'preconditionScript' };
+    }
+  } else if (filePresent) {
+    try {
+      source = validateSchedulePreconditionSource({
+        kind: 'file',
+        path: body.preconditionFilePath,
+      });
+      if (source.kind !== 'file') throw new TypeError('invalid_schedule_precondition_file_source');
+      assertSchedulePreconditionFilePathTrusted(source.path);
+    } catch {
+      return { ok: false, field: 'preconditionFilePath' };
+    }
+  }
+
+  if (source) {
+    if (operation === 'create') {
+      return {
+        ok: true,
+        supplied,
+        create: { enabled: enabled ?? true, source },
+      };
+    }
+    return {
+      ok: true,
+      supplied,
+      update: enabled === undefined
+        ? { action: 'replace', source }
+        : { action: 'replace', source, enabled },
+    };
+  }
+
+  if (enabled !== undefined) {
+    if (operation === 'create') {
+      // The create form defaults off. With no source, false is a no-op and
+      // true is incomplete rather than a phantom configured condition.
+      return enabled
+        ? { ok: false, field: 'preconditionEnabled' }
+        : { ok: true, supplied };
+    }
+    return {
+      ok: true,
+      supplied,
+      update: { action: 'set-enabled', enabled },
+    };
+  }
+
+  return { ok: true, supplied };
+}
+
 export interface ScheduleRow {
   id: string;
   name: string;
@@ -2880,6 +4238,8 @@ export interface ScheduleRow {
   prompt: string;
   workingDir: string;
   chatId: string;
+  /** Effective target chats. Legacy single-chat tasks are projected as one item. */
+  chatIds: string[];
   rootMessageId?: string;
   scope?: 'thread' | 'chat';
   executionPosition?: ScheduleExecutionPosition;
@@ -2890,12 +4250,178 @@ export interface ScheduleRow {
   createdAt: string;
   lastRunAt?: string;
   nextRunAt?: string;
-  lastStatus?: 'ok' | 'error';
+  lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
   lastError?: string;
   repeat?: { times: number | null; completed: number };
   deliver?: 'origin' | 'local' | 'new-topic';
   silent?: boolean;
+  followActive?: boolean;
+  /** Per-task CLI model / effort; absent means "the bot's configuration". */
+  model?: string;
+  reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  hasPrecondition: boolean;
+  preconditionEnabled?: boolean;
+  /** Authenticated management projection of the protected source. Internal
+   * sidecar references and hashes are never exposed. */
+  preconditionSource?: SchedulePreconditionSource['kind'];
+  preconditionScript?: string;
+  preconditionFilePath?: string;
   feishuChatLink: string;
+}
+
+type ScheduleChatTargetsParseResult =
+  | { ok: true; chatId: string; chatIds: string[] }
+  | { ok: false; field: 'chatId' | 'chatIds' };
+
+/** Accept the legacy singular target and the Dashboard's multi-target array.
+ * The array is authoritative when supplied; requiring an agreeing legacy field
+ * avoids two different "primary" targets in one request. */
+type ScheduleModelWriteResult =
+  | { ok: true; model?: string | null; reasoningEffort?: ScheduleReasoningEffort | null }
+  | { ok: false; field: string; error: string };
+
+/**
+ * Parse and validate a write to a task's per-task model / reasoning effort.
+ *
+ * Unlike fire time — which degrades a stale pairing to the bot's configuration
+ * so a run is never skipped — a dashboard write is a human sitting in front of
+ * the form, so an unusable pairing is rejected outright and they can fix it.
+ * The gate mirrors the trigger API: only CLIs implementing the per-turn model
+ * contract may be steered, and the effort must exist on the model the run will
+ * actually use.
+ *
+ * `''` / `null` clears the override (`update` only); absent leaves it alone.
+ */
+function parseScheduleModelWrite(
+  body: Record<string, unknown>,
+  larkAppId: string,
+  mode: 'create' | 'update',
+  current?: { model?: string; reasoningEffort?: ScheduleReasoningEffort },
+): ScheduleModelWriteResult {
+  const out: { model?: string | null; reasoningEffort?: ScheduleReasoningEffort | null } = {};
+  if (body.model !== undefined) {
+    if (body.model !== null && typeof body.model !== 'string') {
+      return { ok: false, field: 'model', error: 'invalid_field' };
+    }
+    const model = typeof body.model === 'string' ? body.model.trim() : '';
+    if (!model && mode === 'create') {
+      // A create with an empty model simply pins nothing.
+    } else {
+      out.model = model || null;
+    }
+  }
+  if (body.reasoningEffort !== undefined) {
+    if (body.reasoningEffort === null || body.reasoningEffort === '') {
+      if (mode === 'update') out.reasoningEffort = null;
+    } else if (!scheduleStore.isScheduleReasoningEffort(body.reasoningEffort)) {
+      return { ok: false, field: 'reasoningEffort', error: 'invalid_field' };
+    } else {
+      out.reasoningEffort = body.reasoningEffort;
+    }
+  }
+  if (out.model === undefined && out.reasoningEffort === undefined) return { ok: true };
+
+  // Validate the SETTLED task, not just this request: an update supplying only
+  // an effort must be checked against the model the task already pinned.
+  const model = out.model === undefined ? current?.model : (out.model ?? undefined);
+  const reasoningEffort = out.reasoningEffort === undefined
+    ? current?.reasoningEffort
+    : (out.reasoningEffort ?? undefined);
+  if (!model && !reasoningEffort) return { ok: true, ...out };
+
+  let botCfg: BotConfig | undefined;
+  try { botCfg = getBot(larkAppId).config; } catch { botCfg = undefined; }
+  if (!isConfigurableReasoningCliId(botCfg?.cliId)) {
+    return {
+      ok: false,
+      field: 'model',
+      error: `CLI ${botCfg?.cliId ?? '(unset)'} 不支持任务级模型/思考强度`,
+    };
+  }
+  const effectiveModel = model ?? botCfg?.model;
+  if (reasoningEffort
+      && !cliModelSupportsReasoningEffort(botCfg?.cliId, effectiveModel, reasoningEffort)) {
+    return {
+      ok: false,
+      field: 'reasoningEffort',
+      error: `模型 ${effectiveModel || '（Agent 默认模型）'} 不支持思考强度 ${reasoningEffort}`,
+    };
+  }
+  return { ok: true, ...out };
+}
+
+function parseScheduleChatTargets(
+  body: Record<string, unknown>,
+  required: boolean,
+): ScheduleChatTargetsParseResult | undefined {
+  const hasChatId = body.chatId !== undefined;
+  const hasChatIds = body.chatIds !== undefined;
+  if (!hasChatId && !hasChatIds) {
+    return required ? { ok: false, field: 'chatId' } : undefined;
+  }
+
+  const legacyChatId = typeof body.chatId === 'string' ? body.chatId.trim() : '';
+  if (hasChatId && !legacyChatId) return { ok: false, field: 'chatId' };
+
+  const rawTargets = hasChatIds ? body.chatIds : [legacyChatId];
+  if (!Array.isArray(rawTargets) || rawTargets.length === 0) {
+    return { ok: false, field: 'chatIds' };
+  }
+  const chatIds: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of rawTargets) {
+    if (typeof raw !== 'string' || !raw.trim()) return { ok: false, field: 'chatIds' };
+    const chatId = raw.trim();
+    if (seen.has(chatId)) continue;
+    seen.add(chatId);
+    chatIds.push(chatId);
+  }
+  if (chatIds.length === 0) return { ok: false, field: 'chatIds' };
+  if (hasChatId && legacyChatId !== chatIds[0]) return { ok: false, field: 'chatId' };
+  return { ok: true, chatId: chatIds[0], chatIds };
+}
+
+function schedulePreconditionProjection(
+  task: ScheduledTask,
+): Pick<
+  ScheduleRow,
+  | 'hasPrecondition'
+  | 'preconditionEnabled'
+  | 'preconditionSource'
+  | 'preconditionScript'
+  | 'preconditionFilePath'
+> {
+  const effectiveAppId = task.larkAppId ?? cachedLarkAppId;
+  if (!effectiveAppId) {
+    return task.preconditionRef === undefined
+      ? { hasPrecondition: false }
+      : { hasPrecondition: true, preconditionEnabled: true };
+  }
+  try {
+    const resolved = resolveSchedulePrecondition(task, effectiveAppId);
+    if (resolved.kind === 'none') return { hasPrecondition: false };
+    return resolved.source.kind === 'inline'
+      ? {
+          hasPrecondition: true,
+          preconditionEnabled: resolved.enabled,
+          preconditionSource: 'inline',
+          preconditionScript: resolved.source.script,
+        }
+      : {
+          hasPrecondition: true,
+          preconditionEnabled: resolved.enabled,
+          preconditionSource: 'file',
+          preconditionFilePath: resolved.source.path,
+        };
+  } catch {
+    // A damaged/mismatched protected record blocks execution. Keep the list
+    // usable without leaking storage details, and represent that state as an
+    // active gate rather than incorrectly claiming no condition exists.
+    logger.error(
+      `[schedule-precondition] management projection unavailable for task ${task.id}; projecting fail-closed gate`,
+    );
+    return { hasPrecondition: true, preconditionEnabled: true };
+  }
 }
 
 function composeScheduleRow(t: ScheduledTask): ScheduleRow {
@@ -2907,6 +4433,7 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     prompt: t.prompt,
     workingDir: t.workingDir,
     chatId: t.chatId,
+    chatIds: scheduleStore.effectiveScheduleChatIds(t),
     rootMessageId: t.rootMessageId,
     scope: t.scope,
     executionPosition: scheduler.resolveTaskExecutionPosition(t),
@@ -2922,6 +4449,10 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     repeat: t.repeat,
     deliver: t.deliver ?? 'origin',
     silent: t.silent,
+    followActive: t.followActive === true ? true : undefined,
+    model: t.model,
+    reasoningEffort: t.reasoningEffort,
+    ...schedulePreconditionProjection(t),
     feishuChatLink: feishuChatLink(t.chatId, getBotBrand(t.larkAppId)),
   };
 }
@@ -2934,30 +4465,160 @@ ipcRoute('GET', '/api/schedules', (_req, res) => {
   jsonRes(res, 200, { schedules: all.map(composeScheduleRow) });
 });
 
+ipcRoute('GET', '/api/schedules/:id/logs', (req, res, p) => {
+  const task = scheduleStore.getTask(p.id);
+  if (!task || !scheduler.belongsToOwner(task)) {
+    return jsonRes(res, 404, { ok: false, error: 'unknown_schedule' });
+  }
+  const appId = task.larkAppId ?? cachedLarkAppId;
+  if (!appId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+
+  const searchParams = new URL(req.url ?? '/', 'http://localhost').searchParams;
+  const rawLimit = Number.parseInt(searchParams.get('limit') ?? '', 10);
+  const rawOffset = Number.parseInt(searchParams.get('offset') ?? '', 10);
+  try {
+    const result = queryScheduleRunLogs(p.id, {
+      limit: Number.isFinite(rawLimit) ? rawLimit : 50,
+      offset: Number.isFinite(rawOffset) ? rawOffset : 0,
+    }, appId);
+    return jsonRes(res, 200, result);
+  } catch (err) {
+    logger.error(
+      `[schedule-run-log] query failed for task ${p.id}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return jsonRes(res, 500, { ok: false, error: 'schedule_run_logs_query_failed' });
+  }
+});
+
+// Execute the current unsaved Dashboard draft without creating/updating a
+// schedule. This route deliberately has no task id: it only reads the selected
+// file (if any) and invokes the existing bounded Bash runner. Consequently it
+// cannot dispatch a model, advance repeat/once accounting, or write task logs.
+ipcRoute('POST', '/api/schedules/precondition/test', async (req, res) => {
+  let body: unknown;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, {
+      ok: false,
+      result: 'error',
+      errorCode: 'invalid_json',
+      error: 'Request body must be valid JSON',
+      durationMs: 0,
+      additionalPrompt: false,
+    });
+  }
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+    return jsonRes(res, 400, {
+      ok: false,
+      result: 'error',
+      errorCode: 'invalid_request',
+      error: 'Request body must be an object',
+      durationMs: 0,
+      additionalPrompt: false,
+    });
+  }
+  const draft = body as Record<string, unknown>;
+  if (typeof draft.workingDir !== 'string' || draft.workingDir.trim().length === 0) {
+    return jsonRes(res, 400, {
+      ok: false,
+      result: 'error',
+      errorCode: 'invalid_working_dir',
+      error: 'Scheduled task precondition requires a non-empty task working directory',
+      field: 'workingDir',
+      durationMs: 0,
+      additionalPrompt: false,
+    });
+  }
+  const checkedWorkingDir = validateWorkingDir(draft.workingDir);
+  if (!checkedWorkingDir.ok) {
+    return jsonRes(res, 400, {
+      ok: false,
+      result: 'error',
+      errorCode: 'invalid_working_dir',
+      error: checkedWorkingDir.error,
+      field: 'workingDir',
+      durationMs: 0,
+      additionalPrompt: false,
+    });
+  }
+
+  let source: SchedulePreconditionSource;
+  try {
+    source = validateSchedulePreconditionSource(draft.source);
+    if (source.kind === 'file') assertSchedulePreconditionFilePathTrusted(source.path);
+  } catch (error) {
+    return jsonRes(res, 400, {
+      ok: false,
+      result: 'error',
+      errorCode: error instanceof SchedulePreconditionFileError ? error.code : 'invalid_source',
+      error: error instanceof Error ? error.message : String(error),
+      field: 'source',
+      durationMs: 0,
+      additionalPrompt: false,
+    });
+  }
+
+  const startedAt = Date.now();
+  try {
+    const script = source.kind === 'inline'
+      ? source.script
+      : readSchedulePreconditionFile(source.path, checkedWorkingDir.resolvedPath);
+    const result = await runSchedulePrecondition(script, checkedWorkingDir.resolvedPath);
+    return jsonRes(res, 200, {
+      ok: true,
+      result: result.decision,
+      durationMs: Date.now() - startedAt,
+      additionalPrompt: result.decision === 'pass' && result.additionalPrompt !== undefined,
+    });
+  } catch (error) {
+    const expected = error instanceof SchedulePreconditionError
+      || error instanceof SchedulePreconditionFileError;
+    return jsonRes(res, expected ? 200 : 500, {
+      ok: false,
+      result: 'error',
+      errorCode: expected ? error.code : 'precondition_test_failed',
+      error: error instanceof Error ? error.message : String(error),
+      durationMs: Date.now() - startedAt,
+      additionalPrompt: false,
+    });
+  }
+});
+
 ipcRoute('POST', '/api/schedules/:id/run',    (_req, res, p) => jsonRes(res, 200, scheduler.runNow(p.id)));
 ipcRoute('POST', '/api/schedules/:id/pause',  (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, false)));
 ipcRoute('POST', '/api/schedules/:id/resume', (_req, res, p) => jsonRes(res, 200, scheduler.setEnabled(p.id, true)));
 // Backward-compatible route used by Lark cards and cached dashboard clients.
 // Modern callers send an exact target; body-less legacy callers keep the
-// historical toggle behavior, now cycling topic → top-level → fresh topic.
+// historical toggle behavior, now cycling topic → top-level → fresh topic →
+// dedicated task topic.
 ipcRoute('POST', '/api/schedules/:id/delivery', async (req, res, p) => {
   let body: unknown;
   try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'invalid_json' }); }
+  const task = scheduleStore.getTask(p.id);
+  if (!task) return jsonRes(res, 200, { ok: false, error: 'not_found' });
+  const effectiveAppId = task.larkAppId ?? cachedLarkAppId;
+  if (!effectiveAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
   const requested = body && typeof body === 'object'
     ? (body as Record<string, unknown>).executionPosition
     : undefined;
   if (requested !== undefined) {
-    if (requested !== 'top-level' && requested !== 'topic' && requested !== 'new-topic') {
+    if (requested !== 'top-level' && requested !== 'topic' && requested !== 'new-topic' && requested !== 'task') {
       return jsonRes(res, 400, { ok: false, error: 'invalid_execution_position', field: 'executionPosition' });
     }
-    const result = scheduler.updateTask(p.id, { executionPosition: requested });
+    const result = updateTaskWithOptionalPrecondition(
+      p.id,
+      { executionPosition: requested },
+      effectiveAppId,
+    );
     return jsonRes(res, 200, result.ok ? { ...result, executionPosition: requested } : result);
   }
-  return jsonRes(res, 200, scheduler.toggleDelivery(p.id));
+  return jsonRes(res, 200, toggleTaskDeliveryWithPrecondition(p.id, effectiveAppId));
 });
 
-// Create a new scheduled task from the dashboard. chatId selects which chat
-// the task fires into; workingDir defaults to the daemon's cwd.
+// Create a new scheduled task from the dashboard. chatIds selects one or more
+// chats owned by this bot; legacy clients may keep sending only chatId.
+// workingDir defaults to the daemon's cwd.
 ipcRoute('POST', '/api/schedules', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
   let body: unknown;
@@ -2970,8 +4631,12 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
   const name = typeof b.name === 'string' ? b.name.trim() : '';
   const schedule = typeof b.schedule === 'string' ? b.schedule.trim() : '';
   const prompt = typeof b.prompt === 'string' ? b.prompt : '';
-  const chatId = typeof b.chatId === 'string' ? b.chatId.trim() : '';
+  const chatTargets = parseScheduleChatTargets(b, true)!;
   const rootMessageId = typeof b.rootMessageId === 'string' ? b.rootMessageId.trim() : '';
+  const precondition = parseSchedulePreconditionWrite(b, 'create');
+  if (!precondition.ok) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: precondition.field });
+  }
   // Validate silent type — if present, must be boolean (no silent degradation).
   let silent = false;
   if (b.silent !== undefined) {
@@ -2980,9 +4645,26 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
     }
     silent = b.silent;
   }
+  // followActive — if present, must be boolean; topic-only (scheduler.addTask
+  // rejects the rest with follow_active_requires_topic).
+  let followActive = false;
+  if (b.followActive !== undefined) {
+    if (typeof b.followActive !== 'boolean') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'followActive' });
+    }
+    followActive = b.followActive;
+  }
+  // 用 `cachedLarkAppId` 校验，与下面落盘的 `larkAppId: cachedLarkAppId` 是同一个
+  // 值：任务归哪个 bot，就必须用那个 bot 的 CLI 判定模型/强度是否可用。表单虽然能
+  // 选 bot，但 POST 目前不接受 body 里的 larkAppId，所以两者恒等。若将来放开，这两
+  // 处必须一起改，否则会变成「用 A bot 的 CLI 去校验 B bot 的任务」。
+  const modelWrite = parseScheduleModelWrite(b, cachedLarkAppId, 'create');
+  if (!modelWrite.ok) {
+    return jsonRes(res, 400, { ok: false, error: modelWrite.error, field: modelWrite.field });
+  }
   let executionPosition: ScheduleExecutionPosition = 'top-level';
   if (b.executionPosition !== undefined) {
-    if (b.executionPosition !== 'top-level' && b.executionPosition !== 'topic' && b.executionPosition !== 'new-topic') {
+    if (b.executionPosition !== 'top-level' && b.executionPosition !== 'topic' && b.executionPosition !== 'new-topic' && b.executionPosition !== 'task') {
       return jsonRes(res, 400, { ok: false, error: 'invalid_execution_position', field: 'executionPosition' });
     }
     executionPosition = b.executionPosition;
@@ -3008,9 +4690,31 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
   if (!name) return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'name' });
   if (!schedule) return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'schedule' });
   if (!prompt.trim()) return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'prompt' });
-  if (!chatId) return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'chatId' });
+  if (!chatTargets.ok) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: chatTargets.field });
+  }
+  const { chatId, chatIds } = chatTargets;
+  if (executionPosition === 'topic' && chatIds.length > 1) {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: 'multiple_chats_topic_unsupported',
+      field: 'chatIds',
+    });
+  }
+  if (executionPosition === 'task' && chatIds.length > 1) {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: 'multiple_chats_task_unsupported',
+      field: 'chatIds',
+    });
+  }
   if (executionPosition === 'topic' && !rootMessageId) {
     return jsonRes(res, 400, { ok: false, error: 'topic_root_required', field: 'rootMessageId' });
+  }
+  // The dedicated task topic is materialised lazily on first fire; a client-
+  // supplied root would only adopt a foreign topic into the task session.
+  if (executionPosition === 'task' && rootMessageId) {
+    return jsonRes(res, 400, { ok: false, error: 'task_root_not_user_settable', field: 'rootMessageId' });
   }
   // Note: bot↔chat membership is intentionally NOT validated here.
   // listChatBotMembers returns [] both when the API is unavailable and when
@@ -3020,17 +4724,31 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
   // a clear lastError, which is the pre-existing behavior for CLI-created
   // tasks. Adding a flaky gate here would block valid creates.
   try {
-    const task = scheduler.addTask({
+    const ownerOpenId = getOwnerOpenId(cachedLarkAppId);
+    let ownerUnionId: string | undefined;
+    if (ownerOpenId) {
+      const deploymentOwnerUnionId = getDeploymentIdentity(config.session.dataDir).ownerUnionId;
+      const bot = getBot(cachedLarkAppId);
+      // The deployment identity is tenant-stable, but it is authoritative for
+      // this app only after the live allowlist resolution maps that exact
+      // union_id back to the same open_id selected as owner.
+      if (deploymentOwnerUnionId
+        && bot.rawAllowedUserResolution.get(deploymentOwnerUnionId) === ownerOpenId) {
+        ownerUnionId = deploymentOwnerUnionId;
+      }
+    }
+    const task = createTaskWithOptionalPrecondition({
       name,
       schedule,
       prompt,
       workingDir: typeof b.workingDir === 'string' ? b.workingDir : process.cwd(),
       chatId,
+      chatIds: chatIds.length > 1 ? chatIds : undefined,
       // Only topic execution retains a root anchor; at top-level/new-topic the
       // root is dropped so it can never pull execution back into the topic the
       // schedule was created from (e.g. an adopted one).
       rootMessageId: executionPosition === 'topic' ? (rootMessageId || undefined) : undefined,
-      scope: executionPosition === 'topic' ? 'thread' : 'chat',
+      scope: executionPosition === 'topic' || executionPosition === 'task' ? 'thread' : 'chat',
       executionPosition,
       topicTitle: topicTitle || undefined,
       chatType: 'group',
@@ -3038,10 +4756,14 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       // Stamp the bot owner as creator: dashboard is local + token-protected,
       // and the daemon re-checks the owner is still allowed at every run
       // mutation (scheduled-turn-provenance).
-      ownerOpenId: getOwnerOpenId(cachedLarkAppId),
+      ownerOpenId,
+      ownerUnionId,
       deliver,
       silent,
-    });
+      followActive: followActive || undefined,
+      model: modelWrite.model ?? undefined,
+      reasoningEffort: modelWrite.reasoningEffort ?? undefined,
+    }, cachedLarkAppId, precondition.create);
     dashboardEventBus.publish({ type: 'schedule.created', body: { schedule: composeScheduleRow(task) } });
     jsonRes(res, 200, { ok: true, task: composeScheduleRow(task) });
   } catch (err) {
@@ -3063,7 +4785,21 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
     name?: string; prompt?: string; schedule?: string;
     deliver?: 'origin' | 'new-topic'; silent?: boolean;
     executionPosition?: ScheduleExecutionPosition; rootMessageId?: string; topicTitle?: string;
+    chatId?: string; chatIds?: readonly string[] | null;
+    model?: string | null; reasoningEffort?: ScheduleReasoningEffort | null;
   } = {};
+  const chatTargets = parseScheduleChatTargets(b, false);
+  if (chatTargets && !chatTargets.ok) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: chatTargets.field });
+  }
+  if (chatTargets?.ok) {
+    updates.chatId = chatTargets.chatId;
+    updates.chatIds = chatTargets.chatIds.length > 1 ? chatTargets.chatIds : null;
+  }
+  const precondition = parseSchedulePreconditionWrite(b, 'update');
+  if (!precondition.ok) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: precondition.field });
+  }
   // If a field is present, it must be the correct type and (for strings)
   // non-empty after trim — otherwise 400, never silently ignore.
   if (b.name !== undefined) {
@@ -3091,7 +4827,7 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
     updates.deliver = b.deliver;
   }
   if (b.executionPosition !== undefined) {
-    if (b.executionPosition !== 'top-level' && b.executionPosition !== 'topic' && b.executionPosition !== 'new-topic') {
+    if (b.executionPosition !== 'top-level' && b.executionPosition !== 'topic' && b.executionPosition !== 'new-topic' && b.executionPosition !== 'task') {
       return jsonRes(res, 400, { ok: false, error: 'invalid_execution_position', field: 'executionPosition' });
     }
     updates.executionPosition = b.executionPosition;
@@ -3118,15 +4854,80 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
     }
     updates.silent = b.silent;
   }
-  const result = scheduler.updateTask(p.id, updates);
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  if (b.model !== undefined || b.reasoningEffort !== undefined) {
+    // The pairing is judged on the task as it will END UP, so an edit touching
+    // only one half is still checked against the other half already stored.
+    const existing = scheduleStore.getTask(p.id, cachedLarkAppId);
+    const modelWrite = parseScheduleModelWrite(b, cachedLarkAppId, 'update', existing);
+    if (!modelWrite.ok) {
+      return jsonRes(res, 400, { ok: false, error: modelWrite.error, field: modelWrite.field });
+    }
+    if (modelWrite.model !== undefined) updates.model = modelWrite.model;
+    if (modelWrite.reasoningEffort !== undefined) updates.reasoningEffort = modelWrite.reasoningEffort;
+  }
+  let result;
+  try {
+    result = updateTaskWithOptionalPrecondition(
+      p.id,
+      updates,
+      cachedLarkAppId,
+      precondition.update,
+    );
+  } catch (err) {
+    if (err instanceof Error && err.message === 'schedule_precondition_not_configured') {
+      return jsonRes(res, 400, {
+        ok: false,
+        error: 'invalid_field',
+        field: 'preconditionEnabled',
+      });
+    }
+    if (err instanceof SchedulePreconditionFileError) {
+      return jsonRes(res, 400, {
+        ok: false,
+        error: 'invalid_field',
+        field: 'preconditionFilePath',
+      });
+    }
+    logger.error(`[schedule-precondition] authenticated update failed for task ${p.id}`);
+    return jsonRes(res, 500, {
+      ok: false,
+      error: 'schedule_precondition_update_failed',
+    });
+  }
   if (!result.ok) return jsonRes(res, 400, result);
-  const task = scheduleStore.getTask(p.id);
+  const task = result.task ?? scheduleStore.getTask(p.id);
+  if (precondition.supplied) {
+    const projection: ReturnType<typeof schedulePreconditionProjection> = task
+      ? schedulePreconditionProjection(task)
+      : { hasPrecondition: false as const };
+    dashboardEventBus.publish({
+      type: 'schedule.updated',
+      body: {
+        id: p.id,
+        // JSON `null` clear markers are event-only: merge-based consumers must
+        // drop the previous source when a condition is cleared or changes kind.
+        // Snapshot rows omit fields that do not apply.
+        patch: {
+          ...projection,
+          preconditionSource: projection.preconditionSource ?? null,
+          preconditionScript: projection.preconditionScript ?? null,
+          preconditionFilePath: projection.preconditionFilePath ?? null,
+        },
+      },
+    });
+  }
   jsonRes(res, 200, { ok: true, task: task ? composeScheduleRow(task) : undefined });
 });
 
 // Delete a scheduled task.
 ipcRoute('DELETE', '/api/schedules/:id', (_req, res, p) => {
-  jsonRes(res, 200, scheduler.removeTaskForDashboard(p.id));
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  try {
+    jsonRes(res, 200, removeTaskWithPrecondition(p.id, cachedLarkAppId));
+  } catch (err) {
+    jsonRes(res, 500, { ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
 });
 
 ipcRoute('POST', '/api/trigger', async (req, res) => {
@@ -3218,6 +5019,8 @@ ipcRoute('POST', '/api/grants/chat', async (req, res) => {
     chatId?: unknown;
     subjectOpenIds?: unknown;
     subjectLarkAppIds?: unknown;
+    quota?: unknown;
+    durationMs?: unknown;
   };
   try {
     body = await readJsonBody(req);
@@ -3247,18 +5050,36 @@ ipcRoute('POST', '/api/grants/chat', async (req, res) => {
       message: 'subjectLarkAppIds may only be used with operation=grant',
     });
   }
+  // Optional quota/validity window. Absent keys keep the legacy CLI wire shape
+  // exactly (no quota/expiry written); 'unlimited'/'permanent'/'' normalize to
+  // undefined and are likewise omitted. Illegal option strings are rejected
+  // before the service runs. durationMs is relative; the service computes the
+  // absolute expiresAt to avoid client clock skew.
+  const grantExtras: { quota?: number; durationMs?: number } = {};
+  if (Object.prototype.hasOwnProperty.call(body, 'quota')) {
+    const quota = normalizeGrantQuotaOption(body.quota);
+    if (quota === null) return jsonRes(res, 400, { ok: false, error: 'invalid_quota' });
+    if (quota !== undefined) grantExtras.quota = quota;
+  }
+  if (Object.prototype.hasOwnProperty.call(body, 'durationMs')) {
+    const durationMs = normalizeGrantDurationOption(body.durationMs);
+    if (durationMs === null) return jsonRes(res, 400, { ok: false, error: 'invalid_duration' });
+    if (durationMs !== undefined) grantExtras.durationMs = durationMs;
+  }
   const result = hasSubjectLarkAppIds
     ? await exactChatGrantHandler({
         operation: body.operation,
         receiverLarkAppId: cachedLarkAppId,
         chatId: body.chatId,
         subjectLarkAppIds: body.subjectLarkAppIds,
+        ...grantExtras,
       })
     : await exactChatGrantHandler({
         operation: body.operation,
         receiverLarkAppId: cachedLarkAppId,
         chatId: body.chatId,
         subjectOpenIds: body.subjectOpenIds,
+        ...grantExtras,
       });
   if (!result.ok) {
     const { status, ...responseBody } = result;
@@ -3267,18 +5088,128 @@ ipcRoute('POST', '/api/grants/chat', async (req, res) => {
   return jsonRes(res, 200, result);
 });
 
+// ─── blockedUsers (talk/operate deny list, P1c) ───────────────────────────
+
+// Read the raw config entries plus the resolved receiver-scoped open_ids.
+// Bare loopback route: the global trusted-host HMAC gate protects it.
+ipcRoute('GET', '/api/blocked-users', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let bot;
+  try { bot = getBot(cachedLarkAppId); } catch {
+    return jsonRes(res, 404, { ok: false, error: 'bot_not_registered' });
+  }
+  return jsonRes(res, 200, {
+    ok: true,
+    raw: bot.config.blockedUsers ?? [],
+    resolved: bot.resolvedBlockedUsers ?? [],
+  });
+});
+
+// Replace the whole blocklist. Empty array clears it. Owner/admin guards live
+// in setBotBlockedUsers (cannot_block_admin carries the conflicting ou_ list).
+// {removeOpenIds} instead unblocks those open_ids by identity, also lifting raw
+// entries written as email/on_/mobile — the row-unblock button uses this route.
+ipcRoute('PUT', '/api/blocked-users', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: { entries?: unknown; removeOpenIds?: unknown };
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (body.entries !== undefined && body.removeOpenIds !== undefined) {
+    return jsonRes(res, 400, { ok: false, error: 'entries_and_removeOpenIds_conflict' });
+  }
+  const isStringArray = (v: unknown): v is string[] =>
+    Array.isArray(v) && v.every(item => typeof item === 'string');
+  let result: SetBlockedUsersResult;
+  if (body.removeOpenIds !== undefined) {
+    if (!isStringArray(body.removeOpenIds)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_remove_open_ids' });
+    }
+    result = await removeBlockedUsers(cachedLarkAppId, body.removeOpenIds);
+  } else {
+    if (!isStringArray(body.entries)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_entries' });
+    }
+    result = await setBotBlockedUsers(cachedLarkAppId, body.entries);
+  }
+  if (result.ok) return jsonRes(res, 200, result);
+  if (result.reason === 'cannot_block_admin') {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: 'cannot_block_admin',
+      conflicting: result.conflicting ?? [],
+    });
+  }
+  if (result.reason === 'empty_resolved') {
+    return jsonRes(res, 422, { ok: false, error: 'empty_resolved' });
+  }
+  if (result.reason === 'bot_not_registered') {
+    return jsonRes(res, 404, { ok: false, error: 'bot_not_registered' });
+  }
+  return jsonRes(res, 400, { ok: false, error: result.reason });
+});
+
+// Whole-chat talk grant toggle: allowedChatGroups makes EVERY current member
+// pass canTalk in that chat (talk-only; canOperate is untouched).
+ipcRoute('PUT', '/api/chat-group-grant', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: { chatId?: unknown; granted?: unknown };
+  try { body = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (typeof body.chatId !== 'string' || !isValidRoleChatId(body.chatId)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  }
+  if (typeof body.granted !== 'boolean') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_granted' });
+  }
+  const result = body.granted
+    ? await addAllowedChatGroup(cachedLarkAppId, body.chatId)
+    : await removeAllowedChatGroup(cachedLarkAppId, body.chatId);
+  if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+  if ('created' in result) return jsonRes(res, 200, { ok: true, created: result.created });
+  return jsonRes(res, 200, { ok: true, removed: result.removed });
+});
+
 // ─── Groups (Phase B) ──────────────────────────────────────────────────────
+
+ipcRoute('PUT', '/api/group-serial-input/:chatId', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  if (!/^oc_[a-zA-Z0-9_-]+$/.test(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  let enabled: boolean;
+  try { enabled = parseGroupSerialInput(await readJsonBody(req)); }
+  catch (e) { return jsonRes(res, 400, { ok: false, error: e instanceof Error ? e.message : 'bad_json' }); }
+  const result = await setGroupSerialInput(cachedLarkAppId, p.chatId, enabled);
+  return jsonRes(res, result.ok ? 200 : 500, result);
+});
+
+ipcRoute('PUT', '/api/group-default-models/:chatId', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  if (!/^oc_[a-zA-Z0-9_-]+$/.test(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  let models;
+  try { models = parseGroupDefaultModels(await readJsonBody(req)); }
+  catch (e) { return jsonRes(res, 400, { ok: false, error: e instanceof Error ? e.message : 'bad_json' }); }
+  const result = await setGroupDefaultModels(cachedLarkAppId, p.chatId, models);
+  return jsonRes(res, result.ok ? 200 : result.reason === 'unsupported_reasoning_effort' ? 400 : 500, result);
+});
 
 ipcRoute('GET', '/api/groups', async (_req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   try {
     const chats = await groupsStore.listChats(cachedLarkAppId);
+    let agentDefaults: { agentCliId?: string; agentModel?: string; agentReasoningEffort?: string } = {};
+    let groupDefaultModels: Record<string, import('./group-default-models.js').GroupDefaultModels> = {};
+    let groupSerialInput: Record<string, boolean> = {};
     let pinStreamingCardMasterEnabled = false;
     let noPinStreamingCardChats = new Set<string>();
+    let effectiveMessageListenerForChat: ((chatId: string) => boolean) | undefined;
     try {
-      const botConfig = getBot(cachedLarkAppId).config;
+      const botState = getBot(cachedLarkAppId);
+      const botConfig = botState.config;
+      agentDefaults = { agentCliId: botConfig.cliId, agentModel: botConfig.model, agentReasoningEffort: botConfig.reasoningEffort };
+      groupDefaultModels = botConfig.groupDefaultModels ?? {};
+      groupSerialInput = botConfig.groupSerialInput ?? {};
       pinStreamingCardMasterEnabled = botConfig.pinStreamingCard === true;
       noPinStreamingCardChats = new Set(botConfig.noPinStreamingCardChats ?? []);
+      effectiveMessageListenerForChat = (chatId) => resolveEffectiveMessageListener(botState, chatId)?.enabled === true;
     } catch {
       // Fail open for the groups board when config lookup is unavailable:
       // rows still render with safe defaults instead of dropping the whole list.
@@ -3292,7 +5223,7 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
     const enriched = chats.map(c => {
       const oncall = oncallStore.getOncallStatus(cachedLarkAppId, c.chatId);
       const hasRole = resolveRoleFile(cachedLarkAppId, c.chatId) !== null;
-      const hasMessageListener = getMessageListenerConfig(cachedLarkAppId, c.chatId)?.enabled === true;
+      const hasMessageListener = effectiveMessageListenerForChat?.(c.chatId) ?? false;
       // /introduce 记录的外部 botmux 机器人（按名字）——dashboard 团队看板用
       // 它识别「介绍过同团队机器人的协作群」。
       const observedBotNames = observedBotsStore
@@ -3302,6 +5233,9 @@ ipcRoute('GET', '/api/groups', async (_req, res) => {
       return {
         ...c,
         oncallChat: oncall ?? null,
+        ...agentDefaults,
+        serialInput: groupSerialInput[c.chatId] === true,
+        ...(groupDefaultModels[c.chatId] ? { defaultModels: groupDefaultModels[c.chatId] } : {}),
         firstSeenAt: seenMap.get(c.chatId) ?? null,
         hasRole,
         hasMessageListener,
@@ -3328,6 +5262,40 @@ ipcRoute('GET', '/api/groups/:chatId/membership', async (_req, res, p) => {
   } catch (e) {
     jsonRes(res, 502, { error: String(e) });
   }
+});
+
+/** Host-only rename through this daemon's exact bot identity. */
+ipcRoute('PUT', '/api/groups/:chatId/name', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: Record<string, unknown>;
+  try {
+    body = await readJsonBody<Record<string, unknown>>(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)
+    || Object.keys(body).some(key => key !== 'name')) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_request' });
+  }
+  const normalized = normalizeLarkChatName(body.name);
+  if (!normalized.ok) return jsonRes(res, 400, normalized);
+
+  const larkAppId = cachedLarkAppId;
+  await chatRenameSerialQueue.run(`${larkAppId}:${p.chatId}`, async () => {
+    const response = await executeChatRename({
+      larkAppId,
+      chatId: p.chatId,
+      name: normalized.name,
+      trigger: 'host_api',
+      botOpenId: getBotOpenId(larkAppId),
+    }, {
+      renameChat: groupsStore.renameChat,
+      activeSessions: () => getActiveSessionsRegistry()?.values() ?? [],
+      persistSession: sessionStore.updateSession,
+      logger,
+    });
+    return jsonRes(res, response.status, response.body);
+  });
 });
 
 ipcRoute('POST', '/api/groups/:chatId/add-bots', async (req, res, p) => {
@@ -3610,23 +5578,27 @@ async function collectMessageListenerPreviewMatches(
   limit: number,
 ): Promise<MessageListenerPreviewMatch[]> {
   const bot = getBot(larkAppId);
-  const previewListener: MessageListenerConfig = {
-    enabled: true,
-    ...(listener.name ? { name: listener.name } : {}),
-    ...(listener.replyCardTitle ? { replyCardTitle: listener.replyCardTitle } : {}),
-    ...(listener.workingDir ? { workingDir: listener.workingDir } : {}),
-    prompt: listener.prompt,
-    ...(listener.senderPolicy && Object.keys(listener.senderPolicy).length > 0 ? { senderPolicy: listener.senderPolicy } : {}),
-    ...(listener.messagePolicy ? { messagePolicy: { ...listener.messagePolicy, scope: 'top_level' } } : { messagePolicy: { scope: 'top_level' } }),
-    replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
-  };
+  // Build the preview listener with the SAME builder the save path uses, so
+  // preview can never drift from what the saved listener actually does. This
+  // used to be a hand-copied object literal that silently omitted
+  // contentPolicy: preview then ran with "no content filter" and reported
+  // every message as a match (and run-preview forked real sessions for
+  // messages the live listener would never wake on). Reusing the builder makes
+  // the preview leg structurally immune to the next field added to the config.
+  // Only `enabled` is overridden: an off draft is still previewable.
+  const configured = messageListenerConfigFromUpdate(listener);
+  // Blank prompt => nothing worth previewing (findMessageListenerForChat would
+  // reject it anyway); mirrors the save path treating it as a clear.
+  if (!configured) return [];
+  const previewListener: MessageListenerConfig = { ...configured, enabled: true };
   const previewBot = {
     ...bot,
     config: {
       ...bot.config,
-      messageListeners: {
-        ...(bot.config.messageListeners ?? {}),
-        [chatId]: previewListener,
+      globalMessageListener: previewListener,
+      groupMessageListenerOverrides: {
+        ...(bot.config.groupMessageListenerOverrides ?? {}),
+        [chatId]: { mode: 'custom' as const, listener: previewListener },
       },
     },
   };
@@ -3807,6 +5779,64 @@ ipcRoute('DELETE', '/api/message-listeners/:chatId', async (_req, res, p) => {
   const result = await updateMessageListenerConfig(cachedLarkAppId, p.chatId, { enabled: false, prompt: '' });
   if (!result.ok) return jsonRes(res, 500, { ok: false, error: result.reason });
   jsonRes(res, 200, { ok: true });
+});
+
+// Bot-scoped listener APIs for the dedicated Dashboard page. The supervisor
+// proxy selects a bot's IPC server; this process therefore uses cachedLarkAppId
+// as the authoritative bot identity rather than accepting an app id from body.
+ipcRoute('GET', '/api/global-message-listener', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  jsonRes(res, 200, { listener: getGlobalMessageListenerConfig(cachedLarkAppId), maxPromptBytes: MAX_MESSAGE_LISTENER_PROMPT_BYTES });
+});
+
+ipcRoute('PUT', '/api/global-message-listener', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: unknown;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const update = sanitizeMessageListenerUpdate(body);
+  if (!update) return jsonRes(res, 400, { ok: false, error: 'invalid_listener' });
+  const validation = validateMessageListenerUpdate(update);
+  if (!validation.ok) return jsonRes(res, 400, { ok: false, error: validation.reason });
+  if (update.prompt && Buffer.byteLength(update.prompt, 'utf-8') > MAX_MESSAGE_LISTENER_PROMPT_BYTES) return jsonRes(res, 400, { ok: false, error: 'prompt_too_large' });
+  const result = await updateGlobalMessageListenerConfig(cachedLarkAppId, update);
+  if (!result.ok) return jsonRes(res, 500, { ok: false, error: result.reason });
+  jsonRes(res, 200, { ok: true, listener: result.listener });
+});
+
+ipcRoute('GET', '/api/group-message-listeners', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  try {
+    const chats = await groupsStore.listChats(cachedLarkAppId);
+    jsonRes(res, 200, { groups: chats.map(chat => ({ chatId: chat.chatId, name: chat.name, mode: getGroupMessageListenerMode(cachedLarkAppId!, chat.chatId), listener: getMessageListenerConfig(cachedLarkAppId!, chat.chatId) })) });
+  } catch (err) { jsonRes(res, 502, { ok: false, error: err instanceof Error ? err.message : String(err) }); }
+});
+
+ipcRoute('GET', '/api/group-message-listeners/:chatId', async (_req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  jsonRes(res, 200, { chatId: p.chatId, mode: getGroupMessageListenerMode(cachedLarkAppId, p.chatId), listener: getMessageListenerConfig(cachedLarkAppId, p.chatId) });
+});
+
+ipcRoute('PUT', '/api/group-message-listeners/:chatId', async (req, res, p) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  if (!isValidRoleChatId(p.chatId)) return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+  let body: any;
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (body?.mode === 'inherit' || body?.mode === 'disabled') {
+    const result = await updateGroupMessageListenerMode(cachedLarkAppId, p.chatId, body.mode);
+    return jsonRes(res, result.ok ? 200 : 500, result.ok ? { ok: true, mode: result.mode } : { ok: false, error: result.reason });
+  }
+  if (body?.mode !== 'custom') return jsonRes(res, 400, { ok: false, error: 'invalid_listener_mode' });
+  const update = sanitizeMessageListenerUpdate(body.listener);
+  if (!update) return jsonRes(res, 400, { ok: false, error: 'invalid_listener' });
+  const validation = validateMessageListenerUpdate(update);
+  if (!validation.ok) return jsonRes(res, 400, { ok: false, error: validation.reason });
+  if (update.prompt && Buffer.byteLength(update.prompt, 'utf-8') > MAX_MESSAGE_LISTENER_PROMPT_BYTES) {
+    return jsonRes(res, 400, { ok: false, error: 'prompt_too_large' });
+  }
+  const result = await updateMessageListenerConfig(cachedLarkAppId, p.chatId, update);
+  jsonRes(res, result.ok ? 200 : ['prompt_required', 'sender_required'].includes(result.reason) ? 400 : 500,
+    result.ok ? { ok: true, mode: 'custom', listener: result.listener } : { ok: false, error: result.reason });
 });
 
 // ─── 免@ 斜杠命令（commandTriggers） ──────────────────────────────────────
@@ -3996,8 +6026,29 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   } catch { /* default chat */ }
   let envelopeInjection: 'auto' | 'off' = 'off';
   try { if (getBot(cachedLarkAppId).config.envelopeInjection === 'auto') envelopeInjection = 'auto'; } catch { /* default off */ }
+  // 最终回复投递方式：给 dashboard 的是**生效值**（显式配置 → 否则缺省 send）
+  // + 该 CLI 的缺省值 + 当前 CLI 是否支持 transcript（dashboard 据此禁用开关并说明）。
+  let replyDelivery: 'send' | 'transcript' = 'send';
+  let replyDeliveryDefault: 'send' | 'transcript' = 'send';
+  let replyDeliverySupported = false;
+  try {
+    const cfg = getBot(cachedLarkAppId).config;
+    replyDelivery = effectiveReplyDelivery(cachedLarkAppId, cfg.cliId);
+    replyDeliveryDefault = defaultReplyDeliveryFor(cfg.cliId);
+    replyDeliverySupported = supportsTranscriptReplyDelivery(cfg.cliId);
+  } catch { /* default send */ }
   let codexAuthSync: 'shared' | 'isolated' = 'shared';
   try { if (getBot(cachedLarkAppId).config.codexAuthSync === 'isolated') codexAuthSync = 'isolated'; } catch { /* default shared */ }
+  // Trigger-user CLI auth policy. Absent → null ("feature off"), which is what
+  // the dashboard toggle renders as unchecked. It has to be echoed here or the
+  // Bot Defaults page loses the setting on every refresh: the PUT persists it,
+  // but this aggregate is the only thing the page reloads from.
+  //
+  // Already-normalized by the registry parser (enabled/tools/fallback always
+  // present), and the policy carries no secret — just which tools it covers and
+  // what to do for an unauthorized sender.
+  let triggerUserAuth: TriggerUserAuthConfig | null = null;
+  try { triggerUserAuth = getBot(cachedLarkAppId).config.triggerUserAuth ?? null; } catch { /* default off */ }
   let skillInjection: 'global' | 'prompt' | 'off' | null = null;
   // How this bot's CLI delivers botmux skills, so the dashboard can render the
   // control correctly: 'dynamic' = per-session --plugin-dir (claude-family, not
@@ -4014,9 +6065,11 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   let cliRuntime: CliRuntimeConfig | null = null;
   let cliPathOverride: string | null = null;
   let wrapperCli: string | null = null;
+  let cliLaunchMode: BotConfig['cliLaunchMode'] | null = null;
   let model: string | null = null;
   let modelBackendVariant: 'standard' | 'max' | null = null;
   let reasoningEffort: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' | null = null;
+  let nativeSubagentRuntime: BotConfig['nativeSubagentRuntime'] | null = null;
   // dsh runner turn timeout (ms). Only meaningful for the dsh adapter; exposed
   // so the dashboard can render the dsh-only field with its current value.
   let turnTimeoutMs: number | null = null;
@@ -4036,25 +6089,33 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
       ? cfg.cliPathOverride
       : null;
     wrapperCli = typeof cfg.wrapperCli === 'string' && cfg.wrapperCli.trim() ? cfg.wrapperCli : null;
+    cliLaunchMode = cfg.cliLaunchMode ?? null;
     model = typeof cfg.model === 'string' && cfg.model.trim() ? cfg.model : null;
-    modelBackendVariant = cfg.cliId === 'traex'
+    modelBackendVariant = isBackendVariantCliId(cfg.cliId)
       && (cfg.modelBackendVariant === 'standard' || cfg.modelBackendVariant === 'max')
       ? cfg.modelBackendVariant
       : null;
     reasoningEffort = cfg.reasoningEffort ?? null;
+    const normalizedNativeSubagentRuntime = normalizeNativeSubagentRuntimePolicy(cfg.nativeSubagentRuntime);
+    nativeSubagentRuntime = normalizedNativeSubagentRuntime.ok
+      ? normalizedNativeSubagentRuntime.value ?? null
+      : null;
     turnTimeoutMs = typeof cfg.turnTimeoutMs === 'number'
       && Number.isInteger(cfg.turnTimeoutMs) && cfg.turnTimeoutMs > 0
       ? cfg.turnTimeoutMs
       : null;
     dshRuntime = cfg.dshRuntime === 'tui' ? 'tui' : null;
-    agentSelectionKey = selectionKeyForBot(cliId, wrapperCli ?? undefined);
+    agentSelectionKey = selectionKeyForBot(cliId, wrapperCli ?? undefined, cliLaunchMode ?? undefined);
   } catch { /* no registered bot */ }
   let maxLiveWorkers: number | null = null;
+  let idleSuspendMinutes: number | null = null;
   let sessionOwnerReminder = DEFAULT_SESSION_OWNER_REMINDER;
   try {
     const botConfig = getBot(cachedLarkAppId).config;
     const m = botConfig.maxLiveWorkers;
     if (typeof m === 'number' && Number.isInteger(m) && m > 0) maxLiveWorkers = m;
+    const ttl = botConfig.idleSuspendMinutes;
+    if (typeof ttl === 'number' && Number.isInteger(ttl) && ttl > 0) idleSuspendMinutes = ttl;
     sessionOwnerReminder = botConfig.sessionOwnerReminder ?? DEFAULT_SESSION_OWNER_REMINDER;
   } catch { /* default unlimited */ }
   let logicalSessionCount = 0;
@@ -4123,13 +6184,21 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     cliRuntime,
     cliPathOverride,
     wrapperCli,
+    cliLaunchMode,
     model,
     modelBackendVariant,
     reasoningEffort,
+    nativeSubagentRuntime,
     turnTimeoutMs,
     dshRuntime,
     agentSelectionKey,
     defaultOncall: defaultOncall ?? { enabled: false, workingDir: '', since: 0 },
+    // Dashboard-created schedules default to this daemon process directory.
+    // It remains the Bash execution cwd, not a file-path resolution base.
+    scheduleWorkingDir: process.cwd(),
+    // Private Dashboard payload only. File-backed preconditions must live under
+    // this daemon-owned host directory; it is never derived from workingDir.
+    schedulePreconditionFileRoot: schedulePreconditionTrustedFilesRoot(),
     defaultWorkingDir,
     defaultWorkingDirAutoWorktree,
     autoboundChatCount: autoboundChats.length,
@@ -4149,25 +6218,36 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     // that is always empty — the CLI has no resolvable transcript).
     usageSupported: cliSupportsNativeUsage(cliId),
     disableStreamingCard: cardPrefs.disableStreamingCard,
+    replyCardMode: cardPrefs.replyCardMode,
+    hiddenStreamingCardButtons: cardPrefs.hiddenStreamingCardButtons,
     pinStreamingCard: cardPrefs.pinStreamingCard,
     silentTurnReactions: cardPrefs.silentTurnReactions,
     codexAppCleanInput: cardPrefs.codexAppCleanInput,
+    codexBrowser: cardPrefs.codexBrowser,
     writableTerminalLinkInCard: cardPrefs.writableTerminalLinkInCard,
     privateCard: cardPrefs.privateCard,
-    thinkingCard: cardPrefs.thinkingCard,
+    cotEnabled: cardPrefs.cotEnabled,
     senderTag: cardPrefs.senderTag,
     overloadAlert: cardPrefs.overloadAlert,
     botToBotSameDir: cardPrefs.botToBotSameDir,
+    autoInviteOwnerOnGroupAdd: cardPrefs.autoInviteOwnerOnGroupAdd,
     autoStartOnGroupJoin: cardPrefs.autoStartOnGroupJoin,
     autoStartOnGroupJoinPrompt: cardPrefs.autoStartOnGroupJoinPrompt,
     autoStartOnGroupJoinSeed: cardPrefs.autoStartOnGroupJoinSeed,
     // 当前生效的内置默认 seed 文案（按 bot locale），供前端 placeholder 展示。
     autoStartOnGroupJoinSeedDefault: t('daemon.auto_start_join_seed', undefined, localeForBot(cachedLarkAppId)),
     autoStartOnNewTopic: cardPrefs.autoStartOnNewTopic,
+    groupJoinCommandEnabled: cardPrefs.groupJoinCommandEnabled,
+    groupJoinCommand: cardPrefs.groupJoinCommand,
     regularGroupReplyMode: cardPrefs.regularGroupReplyMode,
     regularGroupMentionMode: cardPrefs.regularGroupMentionMode,
+    quotaFallbackBot: (() => {
+      try { return getBot(cachedLarkAppId).config.quotaFallbackBot ?? null; }
+      catch { return null; }
+    })(),
     substituteMode: substituteModeStore.getBotSubstituteMode(cachedLarkAppId) ?? null,
     feedback: (() => { try { return getBot(cachedLarkAppId).config.feedback ?? null; } catch { return null; } })(),
+    oncallGroup: (() => { try { return getBot(cachedLarkAppId).config.oncallGroup ?? null; } catch { return null; } })(),
     docSubscribeDefaultMode: cardPrefs.docSubscribeDefaultMode,
     summaryMemory: cardPrefs.summaryMemory,
     summaryMemoryPath: cardPrefs.summaryMemoryPath,
@@ -4178,12 +6258,17 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     grantDefaultDurationMs: grantPrefs.grantDefaultDurationMs,
     p2pMode,
     envelopeInjection,
+    triggerUserAuth,
+    replyDelivery,
+    replyDeliveryDefault,
+    replyDeliverySupported,
     skillInjection,
     skillInjectionSupport,
     // Resolved machine-wide default → the dashboard shows it as the pre-selected
     // value when this bot has no explicit override (prompt/global/off).
     skillInjectionDefault: globalBuiltinSkillInjectionDefault(),
     maxLiveWorkers,
+    idleSuspendMinutes,
     sessionOwnerReminder,
     logicalSessionCount,
     residentSessionCount,
@@ -4199,15 +6284,85 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
   });
 });
 
+type QuotaFallbackDashboardUpdate =
+  | { ok: true; config: QuotaFallbackBotConfig | null }
+  | { ok: false; error: string; reason?: string; cycle?: string[] };
+
+// Per-bot quota fallback topology. The complete next bots.json generation is
+// checked while the cross-process config lock is held, so two concurrent saves
+// cannot each validate against stale state and jointly create A→B→A.
+ipcRoute('PUT', '/api/bot-quota-fallback', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  let body: Record<string, unknown>;
+  try {
+    const raw = await readJsonBody(req);
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_quota_fallback' });
+    }
+    body = raw as Record<string, unknown>;
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+
+  try {
+    const result = await rmwBotEntry<QuotaFallbackDashboardUpdate>(cachedLarkAppId, (entry, all) => {
+      if (body.enabled !== true) {
+        delete entry.quotaFallbackBot;
+        const cycle = findQuotaFallbackCycle(all);
+        return cycle
+          ? { write: false, result: { ok: false, error: 'quota_fallback_cycle', cycle } }
+          : { write: true, result: { ok: true, config: null } };
+      }
+
+      const normalized = normalizeQuotaFallbackBotConfig(body, cachedLarkAppId);
+      if (!normalized.config) {
+        return {
+          write: false,
+          result: { ok: false, error: 'invalid_quota_fallback', reason: normalized.error },
+        };
+      }
+      const target = all.find(candidate =>
+        candidate?.larkAppId === normalized.config!.targetAppId
+        && candidate?.apiOnly !== true
+        && candidate?.activationPending !== true
+        && candidate?.activationDeactivating === undefined
+        && candidate?.activationStarting === undefined
+        && candidate?.activationCommitted === undefined,
+      );
+      if (!target) {
+        return { write: false, result: { ok: false, error: 'quota_fallback_target_not_local' } };
+      }
+
+      entry.quotaFallbackBot = normalized.config;
+      const cycle = findQuotaFallbackCycle(all);
+      if (cycle) {
+        return { write: false, result: { ok: false, error: 'quota_fallback_cycle', cycle } };
+      }
+      return { write: true, result: { ok: true, config: normalized.config } };
+    });
+    if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+    if (!result.result.ok) {
+      const status = result.result.error === 'quota_fallback_cycle' ? 409 : 400;
+      return jsonRes(res, status, result.result);
+    }
+    getBot(cachedLarkAppId).config.quotaFallbackBot = result.result.config ?? undefined;
+    jsonRes(res, 200, { ok: true, quotaFallbackBot: result.result.config });
+  } catch (error: any) {
+    jsonRes(res, 500, { ok: false, error: 'quota_fallback_save_failed', reason: error?.message ?? String(error) });
+  }
+});
+
 // Per-bot card-behaviour toggles. Body may carry any subset of booleans; only
 // present keys are applied.
 ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: {
     usageDisplay?: unknown;
-    disableStreamingCard?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; thinkingCard?: unknown;
+    replyCardMode?: unknown;
+    disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; cotEnabled?: unknown; thinkingCard?: unknown;
     botToBotSameDir?: unknown;
-    autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown;
+    autoStartOnGroupJoin?: unknown; autoStartOnGroupJoinPrompt?: unknown; autoStartOnGroupJoinSeed?: unknown; autoStartOnGroupJoinSeedDefault?: unknown; autoStartOnNewTopic?: unknown; autoInviteOwnerOnGroupAdd?: unknown;
+    groupJoinCommandEnabled?: unknown; groupJoinCommand?: unknown;
     regularGroupReplyMode?: unknown; regularGroupMentionMode?: unknown; docSubscribeDefaultMode?: unknown;
     overloadAlert?: unknown; summaryMemory?: unknown; summaryMemoryPath?: unknown;
     senderTag?: unknown;
@@ -4217,27 +6372,54 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
 
   const patch: {
     usageDisplay?: UsageDisplayMode;
-    disableStreamingCard?: boolean; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; thinkingCard?: boolean;
+    replyCardMode?: import('../services/turn-reply-card.js').ReplyCardMode;
+    disableStreamingCard?: boolean; hiddenStreamingCardButtons?: StreamingCardButtonId[]; pinStreamingCard?: boolean; silentTurnReactions?: boolean; codexAppCleanInput?: boolean; codexBrowser?: boolean; writableTerminalLinkInCard?: boolean; privateCard?: boolean; cotEnabled?: boolean;
     botToBotSameDir?: boolean;
-    autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean;
+    autoStartOnGroupJoin?: boolean; autoStartOnGroupJoinPrompt?: string; autoStartOnGroupJoinSeed?: string; autoStartOnNewTopic?: boolean; autoInviteOwnerOnGroupAdd?: boolean;
+    groupJoinCommandEnabled?: boolean; groupJoinCommand?: string;
     regularGroupReplyMode?: ChatReplyMode; regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
     docSubscribeDefaultMode?: 'mention-only' | 'all';
     overloadAlert?: boolean; summaryMemory?: boolean; summaryMemoryPath?: string;
     senderTag?: boolean;
   } = {};
   if (body.usageDisplay === 'streaming' || body.usageDisplay === 'footer' || body.usageDisplay === 'off') patch.usageDisplay = body.usageDisplay;
+  if (body.replyCardMode !== undefined) {
+    if (body.replyCardMode !== 'legacy' && body.replyCardMode !== 'unified') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_reply_card_mode' });
+    }
+    patch.replyCardMode = body.replyCardMode;
+  }
   if (typeof body.disableStreamingCard === 'boolean') patch.disableStreamingCard = body.disableStreamingCard;
+  if (Array.isArray(body.hiddenStreamingCardButtons)
+      && body.hiddenStreamingCardButtons.every(isStreamingCardButtonId)) {
+    patch.hiddenStreamingCardButtons = normalizeHiddenStreamingCardButtons(body.hiddenStreamingCardButtons) ?? [];
+  }
   if (typeof body.pinStreamingCard === 'boolean') patch.pinStreamingCard = body.pinStreamingCard;
   if (typeof body.botToBotSameDir === 'boolean') patch.botToBotSameDir = body.botToBotSameDir;
   if (typeof body.silentTurnReactions === 'boolean') patch.silentTurnReactions = body.silentTurnReactions;
   if (typeof body.codexAppCleanInput === 'boolean') patch.codexAppCleanInput = body.codexAppCleanInput;
+  if (typeof body.codexBrowser === 'boolean') {
+    if (body.codexBrowser) {
+      const config = getBot(cachedLarkAppId).config;
+      if (config.cliId !== 'codex-app') {
+        return jsonRes(res, 400, { ok: false, error: 'codex_browser_requires_codex_app' });
+      }
+      if (config.existingAppServer || config.sandbox === true || config.readIsolation === true) {
+        return jsonRes(res, 409, { ok: false, error: 'codex_browser_config_conflict' });
+      }
+    }
+    patch.codexBrowser = body.codexBrowser;
+  }
   if (typeof body.writableTerminalLinkInCard === 'boolean') patch.writableTerminalLinkInCard = body.writableTerminalLinkInCard;
   if (typeof body.privateCard === 'boolean') patch.privateCard = body.privateCard;
-  if (typeof body.thinkingCard === 'boolean') patch.thinkingCard = body.thinkingCard;
+  if (typeof body.cotEnabled === 'boolean') patch.cotEnabled = body.cotEnabled;
+  // [legacy-thinkingCard] 旧名请求仍接受；随 normalizeCotEnabled 一并移除（不早于 v3.33.0）。
+  else if (typeof body.thinkingCard === 'boolean') patch.cotEnabled = body.thinkingCard;
   if (typeof body.senderTag === 'boolean') patch.senderTag = body.senderTag;
   if (typeof body.overloadAlert === 'boolean') patch.overloadAlert = body.overloadAlert;
   if (typeof body.summaryMemory === 'boolean') patch.summaryMemory = body.summaryMemory;
   if (typeof body.summaryMemoryPath === 'string') patch.summaryMemoryPath = body.summaryMemoryPath;
+  if (typeof body.autoInviteOwnerOnGroupAdd === 'boolean') patch.autoInviteOwnerOnGroupAdd = body.autoInviteOwnerOnGroupAdd;
   if (typeof body.autoStartOnGroupJoin === 'boolean') patch.autoStartOnGroupJoin = body.autoStartOnGroupJoin;
   if (typeof body.autoStartOnGroupJoinPrompt === 'string') patch.autoStartOnGroupJoinPrompt = body.autoStartOnGroupJoinPrompt;
   if (typeof body.autoStartOnGroupJoinSeed === 'string') {
@@ -4262,6 +6444,16 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
     patch.autoStartOnGroupJoinSeed = looksDefault ? '' : seed;
   }
   if (typeof body.autoStartOnNewTopic === 'boolean') patch.autoStartOnNewTopic = body.autoStartOnNewTopic;
+  if (typeof body.groupJoinCommandEnabled === 'boolean') patch.groupJoinCommandEnabled = body.groupJoinCommandEnabled;
+  if (typeof body.groupJoinCommand === 'string') {
+    // 解析不了的命令（未闭合引号）当场拒绝——否则保存成功、入群时才静默跑不起来。
+    try {
+      if (body.groupJoinCommand.trim()) parseHookCommand(body.groupJoinCommand);
+    } catch {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_group_join_command' });
+    }
+    patch.groupJoinCommand = body.groupJoinCommand;
+  }
   if (typeof body.regularGroupReplyMode === 'string') {
     const m = normalizeChatReplyMode(body.regularGroupReplyMode);
     if (m) patch.regularGroupReplyMode = m;
@@ -4275,7 +6467,11 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (Object.keys(patch).length === 0) return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
 
   const r = await cardPrefsStore.updateBotCardPrefs(cachedLarkAppId, patch);
-  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  if (!r.ok) {
+    const status = r.reason === 'codex_browser_config_conflict'
+      || r.reason === 'existing_app_server_sandbox_conflict' ? 409 : 400;
+    return jsonRes(res, status, { ok: false, error: r.reason });
+  }
   jsonRes(res, 200, { ok: true, ...r.prefs });
 });
 
@@ -4617,8 +6813,17 @@ ipcRoute('PUT', '/api/bot-description', async (req, res) => {
 ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   const larkAppId = cachedLarkAppId;
-  let body: { cliId?: unknown; model?: unknown; modelBackendVariant?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown; dshRuntime?: unknown };
-  try { body = await readJsonBody<{ cliId?: unknown; model?: unknown; modelBackendVariant?: unknown; reasoningEffort?: unknown; turnTimeoutMs?: unknown; cliRuntime?: unknown; dshRuntime?: unknown }>(req); }
+  let body: {
+    cliId?: unknown;
+    model?: unknown;
+    modelBackendVariant?: unknown;
+    reasoningEffort?: unknown;
+    nativeSubagentRuntime?: unknown;
+    turnTimeoutMs?: unknown;
+    cliRuntime?: unknown;
+    dshRuntime?: unknown;
+  };
+  try { body = await readJsonBody<typeof body>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
 
   const key = typeof body.cliId === 'string' && body.cliId.trim() ? body.cliId.trim() : '';
@@ -4632,7 +6837,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   const model = typeof body.model === 'string' ? body.model.trim() : '';
   const modelBackendVariantFieldPresent = Object.prototype.hasOwnProperty.call(body, 'modelBackendVariant');
   let modelBackendVariant: 'standard' | 'max' | undefined;
-  const supportsModelBackendVariant = selected.cliId === 'traex';
+  const supportsModelBackendVariant = isBackendVariantCliId(selected.cliId);
   if (supportsModelBackendVariant
       && modelBackendVariantFieldPresent
       && body.modelBackendVariant !== null
@@ -4649,6 +6854,33 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
   }
   const currentBotConfig = getBot(larkAppId).config;
   const supportsReasoningEffort = isConfigurableReasoningCliId(selected.cliId);
+  const nativeSubagentRuntimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'nativeSubagentRuntime');
+  let requestedNativeSubagentRuntime: BotConfig['nativeSubagentRuntime'];
+  if (selected.cliId === 'traex' && nativeSubagentRuntimeFieldPresent && body.nativeSubagentRuntime !== null) {
+    const normalized = normalizeNativeSubagentRuntimePolicy(body.nativeSubagentRuntime);
+    if (!normalized.ok) {
+      return jsonRes(res, 400, {
+        ok: false,
+        error: 'invalid_native_subagent_runtime',
+        message: normalized.error,
+      });
+    }
+    requestedNativeSubagentRuntime = normalized.value;
+    const customModel = requestedNativeSubagentRuntime?.model?.mode === 'custom'
+      ? requestedNativeSubagentRuntime.model.value
+      : undefined;
+    const customEffort = requestedNativeSubagentRuntime?.reasoningEffort?.mode === 'custom'
+      ? requestedNativeSubagentRuntime.reasoningEffort.value
+      : undefined;
+    if (customModel && customEffort
+        && !cliModelSupportsReasoningEffort('traex', customModel, customEffort)) {
+      return jsonRes(res, 400, {
+        ok: false,
+        error: 'invalid_native_subagent_runtime',
+        message: `模型 ${customModel} 不支持子代理思考强度 ${customEffort}`,
+      });
+    }
+  }
   // Per-bot dsh runner turn timeout. Only the dsh adapter forwards it
   // (`--turn-timeout-ms`); the dashboard exposes the field for dsh only. The
   // field is optional in the body, so distinguish absent (preserve) from
@@ -4678,7 +6910,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     nextDshRuntime = body.dshRuntime;
   }
   const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
-  const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli);
+  const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli, currentBotConfig.cliLaunchMode);
   const selectionChanged = key !== currentSelectionKey;
   let nextRuntime: CliRuntimeConfig | undefined;
   let nextLegacyPath: string | undefined;
@@ -4687,8 +6919,8 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       if (selected.cliId !== 'codex') {
         return jsonRes(res, 400, { ok: false, error: 'runtime_requires_codex' });
       }
-      if (selected.wrapperCli) {
-        return jsonRes(res, 400, { ok: false, error: 'runtime_wrapper_conflict' });
+      if (selected.wrapperCli || selected.cliLaunchMode) {
+        return jsonRes(res, 400, { ok: false, error: selected.wrapperCli ? 'runtime_wrapper_conflict' : 'runtime_launch_mode_conflict' });
       }
       try {
         nextRuntime = normalizeCliRuntimeConfig(body.cliRuntime, 'cliRuntime');
@@ -4713,6 +6945,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     cliId: selected.cliId,
     wrapperCli: selected.wrapperCli,
     cliPathOverride: effectivePath,
+    cliLaunchMode: selected.cliLaunchMode,
   });
   // dsh-tui mode spawns the dsh-tui binary instead of the dsh runner. Check it
   // separately so a missing dsh-tui install surfaces as a save-time warning
@@ -4780,88 +7013,124 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // read-isolation toggle validates at enable time; changing the agent afterwards
     // is the other way a bot could end up configured-but-unenforceable.)
     let readIsolationCleared = false;
+    let codexBrowserCleared = false;
     const r = await rmwBotEntry<{
-      error?: 'reasoning_effort_not_supported_by_model';
+      error?: 'reasoning_effort_not_supported_by_model' | 'launch_mode_sandbox_conflict';
       nextReasoningEffort?: typeof reasoningEffort;
       nextModelBackendVariant?: 'standard' | 'max';
+      nextNativeSubagentRuntimeState?: NativeSubagentRuntimeConfigState;
     }>(larkAppId, (entry) => {
-    const storedModelBackendVariant = entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max'
-      ? entry.modelBackendVariant
-      : undefined;
-    const entryUsesTraex = entry.cliId === 'traex';
-    const nextModelBackendVariant = supportsModelBackendVariant
-      ? (modelBackendVariantFieldPresent
-        ? modelBackendVariant
-        : entryUsesTraex ? storedModelBackendVariant : undefined)
-      : undefined;
-    const nextReasoningEffort = supportsReasoningEffort
-      ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : entry.reasoningEffort)
-      : undefined;
-    if (nextReasoningEffort && !cliModelSupportsReasoningEffort(selected.cliId, model || undefined, nextReasoningEffort)) {
-      return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' } };
-    }
-    entry.cliId = selected.cliId;
-    if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
-    else delete entry.wrapperCli;
-    if (nextRuntime) {
-      entry.cliRuntime = nextRuntime;
-      // Downgrade shadow: older BotMux versions ignore cliRuntime but retain
-      // cliPathOverride, so a rollback still launches this distribution.
-      entry.cliPathOverride = nextRuntime.executable;
-    } else if (nextLegacyPath) {
-      entry.cliPathOverride = nextLegacyPath;
-      delete entry.cliRuntime;
-    } else {
-      delete entry.cliRuntime;
-      delete entry.cliPathOverride;
-    }
-    if (model) entry.model = model;
-    else delete entry.model;
-    if (!supportsModelBackendVariant) delete entry.modelBackendVariant;
-    else if (modelBackendVariantFieldPresent) {
-      if (modelBackendVariant) entry.modelBackendVariant = modelBackendVariant;
-      else delete entry.modelBackendVariant;
-    } else if (!entryUsesTraex) {
-      delete entry.modelBackendVariant;
-    }
-    if (!supportsReasoningEffort) delete entry.reasoningEffort;
-    else if (reasoningEffortFieldPresent) {
-      if (reasoningEffort) entry.reasoningEffort = reasoningEffort;
-      else delete entry.reasoningEffort;
-    }
-    // dsh-only turn timeout: non-dsh always drops it; on dsh, an explicit
-    // field value writes/clears it, absence preserves the current value.
-    if (!supportsTurnTimeout) delete entry.turnTimeoutMs;
-    else if (turnTimeoutFieldPresent) {
-      if (nextTurnTimeoutMs !== undefined) entry.turnTimeoutMs = nextTurnTimeoutMs;
-      else delete entry.turnTimeoutMs;
-    }
-    // dsh-only runtime variant: same present/absent semantics as turnTimeoutMs.
-    if (!supportsDshRuntime) delete entry.dshRuntime;
-    else if (dshRuntimeFieldPresent) {
-      if (nextDshRuntime !== undefined) entry.dshRuntime = nextDshRuntime;
-      else delete entry.dshRuntime;
-    }
-    if (entry.readIsolation === true &&
-        !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli })) {
-      delete entry.readIsolation;
-      readIsolationCleared = true;
-    }
-    // 远端 CLI（riff / mojo）→ backendType 自动设为同名后端（否则 spawn 走 pty 后端，
-    // 而它们的 resolvedBin 是空串）。mojo 加入后这里必须按「是否远端」判断，不能再
-    // 硬编码 riff。
-    if (isRemoteCliId(selected.cliId)) {
-      entry.backendType = selected.cliId as typeof entry.backendType;
-    } else if (entry.backendType && isRemoteBackendType(entry.backendType)) {
-      // 从远端 CLI 切回其它 CLI：清掉这个自动配对的 backend override，回落 daemon
-      // 默认后端——否则新 CLI 会跑在远端 Backend 上（PTY 分块输入被当成一串远端
-      // turn）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不是远端后端）。
-      delete entry.backendType;
-    }
-    return { write: true, result: { nextReasoningEffort, nextModelBackendVariant } };
+      if (selected.cliLaunchMode && (entry.sandbox === true || entry.readIsolation === true)) {
+        return { write: false, result: { error: 'launch_mode_sandbox_conflict' } };
+      }
+      const storedModelBackendVariant = entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max'
+        ? entry.modelBackendVariant
+        : undefined;
+      const entryUsesBackendVariantCli = isBackendVariantCliId(entry.cliId);
+      const nextModelBackendVariant = supportsModelBackendVariant
+        ? (modelBackendVariantFieldPresent
+          ? modelBackendVariant
+          : entryUsesBackendVariantCli ? storedModelBackendVariant : undefined)
+        : undefined;
+      const nextReasoningEffort = supportsReasoningEffort
+        ? (reasoningEffortFieldPresent ? reasoningEffort ?? undefined : entry.reasoningEffort)
+        : undefined;
+      if (nextReasoningEffort && !cliModelSupportsReasoningEffort(selected.cliId, model || undefined, nextReasoningEffort)) {
+        return { write: false, result: { error: 'reasoning_effort_not_supported_by_model' } };
+      }
+      entry.cliId = selected.cliId;
+      if (selected.cliId !== 'codex-app' && entry.codexBrowser !== undefined) {
+        delete entry.codexBrowser;
+        codexBrowserCleared = true;
+      }
+      if (selected.wrapperCli) entry.wrapperCli = selected.wrapperCli;
+      else delete entry.wrapperCli;
+      if (selected.cliLaunchMode) entry.cliLaunchMode = selected.cliLaunchMode;
+      else delete entry.cliLaunchMode;
+      if (nextRuntime) {
+        entry.cliRuntime = nextRuntime;
+        // Downgrade shadow: older BotMux versions ignore cliRuntime but retain
+        // cliPathOverride, so a rollback still launches this distribution.
+        entry.cliPathOverride = nextRuntime.executable;
+      } else if (nextLegacyPath) {
+        entry.cliPathOverride = nextLegacyPath;
+        delete entry.cliRuntime;
+      } else {
+        delete entry.cliRuntime;
+        delete entry.cliPathOverride;
+      }
+      if (model) entry.model = model;
+      else delete entry.model;
+      if (!supportsModelBackendVariant) delete entry.modelBackendVariant;
+      else if (modelBackendVariantFieldPresent) {
+        if (modelBackendVariant) entry.modelBackendVariant = modelBackendVariant;
+        else delete entry.modelBackendVariant;
+      } else if (!entryUsesBackendVariantCli) {
+        delete entry.modelBackendVariant;
+      }
+      if (!supportsReasoningEffort) delete entry.reasoningEffort;
+      else if (reasoningEffortFieldPresent) {
+        if (reasoningEffort) entry.reasoningEffort = reasoningEffort;
+        else delete entry.reasoningEffort;
+      }
+      let nextNativeSubagentRuntimeState: NativeSubagentRuntimeConfigState;
+      if (selected.cliId !== 'traex') {
+        delete entry.nativeSubagentRuntime;
+        nextNativeSubagentRuntimeState = { status: 'absent' };
+      } else if (nativeSubagentRuntimeFieldPresent) {
+        if (requestedNativeSubagentRuntime) entry.nativeSubagentRuntime = requestedNativeSubagentRuntime;
+        else delete entry.nativeSubagentRuntime;
+        nextNativeSubagentRuntimeState = requestedNativeSubagentRuntime
+          ? { status: 'valid', policy: requestedNativeSubagentRuntime }
+          : { status: 'absent' };
+      } else {
+        const normalized = normalizeNativeSubagentRuntimePolicy(entry.nativeSubagentRuntime);
+        nextNativeSubagentRuntimeState = !normalized.ok
+          ? { status: 'invalid' }
+          : normalized.value
+            ? { status: 'valid', policy: normalized.value }
+            : { status: 'absent' };
+      }
+      // dsh-only turn timeout: non-dsh always drops it; on dsh, an explicit
+      // field value writes/clears it, absence preserves the current value.
+      if (!supportsTurnTimeout) delete entry.turnTimeoutMs;
+      else if (turnTimeoutFieldPresent) {
+        if (nextTurnTimeoutMs !== undefined) entry.turnTimeoutMs = nextTurnTimeoutMs;
+        else delete entry.turnTimeoutMs;
+      }
+      // dsh-only runtime variant: same present/absent semantics as turnTimeoutMs.
+      if (!supportsDshRuntime) delete entry.dshRuntime;
+      else if (dshRuntimeFieldPresent) {
+        if (nextDshRuntime !== undefined) entry.dshRuntime = nextDshRuntime;
+        else delete entry.dshRuntime;
+      }
+      if (entry.readIsolation === true &&
+          !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli, cliLaunchMode: selected.cliLaunchMode })) {
+        delete entry.readIsolation;
+        readIsolationCleared = true;
+      }
+      // 远端 CLI（riff / mojo）→ backendType 自动设为同名后端（否则 spawn 走 pty 后端，
+      // 而它们的 resolvedBin 是空串）。mojo 加入后这里必须按「是否远端」判断，不能再
+      // 硬编码 riff。
+      if (isRemoteCliId(selected.cliId)) {
+        entry.backendType = selected.cliId as typeof entry.backendType;
+      } else if (entry.backendType && isRemoteBackendType(entry.backendType)) {
+        // 从远端 CLI 切回其它 CLI：清掉这个自动配对的 backend override，回落 daemon
+        // 默认后端——否则新 CLI 会跑在远端 Backend 上（PTY 分块输入被当成一串远端
+        // turn）。手动的 pty/tmux/herdr/zellij override 不受影响（它们不是远端后端）。
+        delete entry.backendType;
+      }
+      return { write: true, result: { nextReasoningEffort, nextModelBackendVariant, nextNativeSubagentRuntimeState } };
     });
     if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
     if (r.result.error) {
+      if (r.result.error === 'launch_mode_sandbox_conflict') {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: r.result.error,
+          message: 'Forge x TraeX 暂不支持文件沙盒，请先关闭 sandbox 后再切换。',
+        });
+      }
       return jsonRes(res, 400, {
         ok: false,
         error: r.result.error,
@@ -4875,12 +7144,17 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     bot.config.cliPathOverride = nextRuntime?.executable ?? nextLegacyPath;
     if (selected.wrapperCli) bot.config.wrapperCli = selected.wrapperCli;
     else bot.config.wrapperCli = undefined;
+    bot.config.cliLaunchMode = selected.cliLaunchMode;
     bot.config.model = model || undefined;
     bot.config.modelBackendVariant = supportsModelBackendVariant
       ? r.result.nextModelBackendVariant
       : undefined;
     if (!supportsReasoningEffort) bot.config.reasoningEffort = undefined;
     else bot.config.reasoningEffort = r.result.nextReasoningEffort ?? undefined;
+    updateBotNativeSubagentRuntime(
+      larkAppId,
+      r.result.nextNativeSubagentRuntimeState ?? { status: 'absent' },
+    );
     // Mirror the entry write: non-dsh clears it, dsh with an explicit field
     // takes the parsed value, dsh without the field preserves the existing one.
     if (!supportsTurnTimeout) bot.config.turnTimeoutMs = undefined;
@@ -4889,6 +7163,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     if (!supportsDshRuntime) bot.config.dshRuntime = undefined;
     else if (dshRuntimeFieldPresent) bot.config.dshRuntime = nextDshRuntime;
     if (readIsolationCleared) bot.config.readIsolation = false;
+    if (codexBrowserCleared) bot.config.codexBrowser = undefined;
     if (isRemoteCliId(selected.cliId)) {
       bot.config.backendType = selected.cliId as typeof bot.config.backendType;
     } else if (bot.config.backendType && isRemoteBackendType(bot.config.backendType)) {
@@ -4899,16 +7174,18 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // 消息 lazy resume 复活，要等下次 daemon 重启才被 restore 守卫清理。
     const closedMismatchedSessions = await closeCliMismatchedSessionsForBot(larkAppId);
 
-    const selectionKey = selectionKeyForBot(selected.cliId, selected.wrapperCli);
+    const selectionKey = selectionKeyForBot(selected.cliId, selected.wrapperCli, selected.cliLaunchMode);
     jsonRes(res, 200, {
       ok: true,
       cliId: selected.cliId,
       cliRuntime: nextRuntime ?? null,
       cliPathOverride: nextRuntime ? null : nextLegacyPath ?? null,
       wrapperCli: selected.wrapperCli ?? null,
+      cliLaunchMode: selected.cliLaunchMode ?? null,
       model: model || null,
       modelBackendVariant: supportsModelBackendVariant ? bot.config.modelBackendVariant ?? null : null,
       reasoningEffort: supportsReasoningEffort ? bot.config.reasoningEffort ?? null : null,
+      nativeSubagentRuntime: bot.config.nativeSubagentRuntime ?? null,
       turnTimeoutMs: supportsTurnTimeout ? bot.config.turnTimeoutMs ?? null : null,
       dshRuntime: supportsDshRuntime ? bot.config.dshRuntime ?? null : null,
       selectionKey,
@@ -4925,6 +7202,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       readIsolation: bot.config.readIsolation === true,
       readIsolationSupported: readIsolationEnforceableFor(bot.config),
       readIsolationCleared,
+      codexBrowserCleared,
       agentAvailable: availability.available,
       availabilityWarning,
       requiredCommand: availability.command,
@@ -4962,6 +7240,11 @@ ipcRoute('POST', '/api/session-group-tag-auth', async (_req, res) => {
       cfg.larkAppSecret,
       normalizeBrand(cfg.brand),
       FEED_GROUP_OAUTH_SCOPES,
+      // 标签是 owner 自己的收件箱侧边栏，这次授权只可能是他本人的。
+      // 从注册表派生 owner，`ownerOpenId` 只作兜底：那个原始字段实际部署里几乎
+      // 没人填，缺了它 pending 记录就没有归属，回调时也就没法校验「链接是不是
+      // 被转给别人点了」——命令路径有这道校验，Dashboard 这条不该没有。
+      getOwnerOpenId(cfg.larkAppId) ?? cfg.ownerOpenId,
     );
     jsonRes(res, 200, { ok: true, authUrl });
   } catch (e: any) {
@@ -4976,7 +7259,11 @@ ipcRoute('GET', '/api/session-group-tag-status', async (_req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   try {
     const cfg = getBot(cachedLarkAppId).config;
-    const status = getFeedGroupAuthStatus(cfg.larkAppId, normalizeBrand(cfg.brand));
+    // 同上：token 按人存，owner 解析不出来就是拿空 key 去查，徽标会对一个刚
+    // 授权完的人显示「未授权」。
+    const status = getFeedGroupAuthStatus(
+      cfg.larkAppId, normalizeBrand(cfg.brand), getOwnerOpenId(cfg.larkAppId) ?? cfg.ownerOpenId,
+    );
     jsonRes(res, 200, {
       ok: true,
       ...status,
@@ -4994,7 +7281,8 @@ ipcRoute('GET', '/api/session-group-tag-status', async (_req, res) => {
 // Body `{ mode?, name? }`，两者都可单独提交（Dashboard 下拉只发 mode、输入框只发
 // name），但至少要带一个：
 //   mode: 'feed-group'（默认，个人侧边栏分组，需一次 OAuth，任何租户可用）|
-//         'chat-tag'（应用租户身份，无需用户授权，但部分租户权限目录无该 scope）| 'off'
+//         'chat-tag'（应用租户身份，无需用户授权，但飞书尚未开放该能力，权限
+//         目录里搜不到该 scope）| 'off'
 //   name: 自定义标签名；trim 后为空 = 删掉该字段回默认名「<bot 显示名>会话」。
 //         超长按码点保守截断（clampSessionTagName），存进去的就是实际生效的。
 // 写 bots.json 的 sessionGroup.tag 并热更内存注册表，与 /botconfig 同一持久化通道。
@@ -5080,6 +7368,34 @@ ipcRoute('PUT', '/api/bot-envelope-injection', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, envelopeInjection: value ?? 'off' });
+});
+
+// Per-bot 最终回复投递方式 replyDelivery。Body `{ replyDelivery: 'transcript'|'send'|'' }`:
+//   • 'transcript' → daemon 从 CLI 转写自动取本轮最后的 assistant 文本发最终回复卡，
+//     模型不再被要求 botmux send；仅 claude-code 与结构化转写白名单 CLI 支持，其它
+//     CLI 由 store 拒绝（400 reply_delivery_unsupported）。落盘 'transcript'
+//   • 'send' → 模型必须自己 botmux send。落盘 'send'
+//   • ''/其它 → 删 key，回到缺省 send
+// 走 applyConfigField（与 /botconfig 同一写盘 + 热更新路径）：逐轮信封下一轮生效，
+// 系统提示部分要 /restart 才换新值。响应里的 replyDelivery 是写入后的**生效值**。
+ipcRoute('PUT', '/api/bot-reply-delivery', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { replyDelivery?: unknown };
+  try { body = await readJsonBody<{ replyDelivery?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+
+  const spec = findConfigField('replyDelivery');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const value = body.replyDelivery === 'transcript' || body.replyDelivery === 'send' ? body.replyDelivery : null;
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  let cliId: string | undefined;
+  try { cliId = getBot(cachedLarkAppId).config.cliId; } catch { cliId = undefined; }
+  jsonRes(res, 200, {
+    ok: true,
+    replyDelivery: effectiveReplyDelivery(cachedLarkAppId, cliId),
+    replyDeliveryDefault: defaultReplyDeliveryFor(cliId),
+  });
 });
 
 // Per-bot 内置技能注入模式 skillInjection。Body `{ skillInjection: 'global'|'prompt'|'off'|'' }`:
@@ -5205,6 +7521,19 @@ ipcRoute('PUT', '/api/bot-launch-shell', async (req, res) => {
   jsonRes(res, 200, { ok: true, launchShell: value ?? '' });
 });
 
+ipcRoute('PUT', '/api/bot-oncall-group', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { oncallGroup?: unknown };
+  try { body = await readJsonBody<{ oncallGroup?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const spec = findConfigField('oncallGroup')!;
+  const parsed = coerceConfigValue(spec, JSON.stringify(body.oncallGroup ?? {}));
+  if (!parsed.ok) return jsonRes(res, 400, { ok: false, error: parsed.reason });
+  const result = await applyConfigField(cachedLarkAppId, spec, parsed.value);
+  if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+  jsonRes(res, 200, { ok: true, oncallGroup: parsed.value });
+});
+
 ipcRoute('PUT', '/api/bot-feedback', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: { feedback?: unknown };
@@ -5297,6 +7626,87 @@ ipcRoute('PUT', '/api/bot-codex-auth-sync', async (req, res) => {
   jsonRes(res, 200, { ok: true, codexAuthSync: body.codexAuthSync });
 });
 
+// PUT /api/bot-trigger-user-auth — 按触发人身份调用 CLI 的开关。Body
+// `{ triggerUserAuth: object | null }`：null → 清除（关闭）。
+//
+// 走 coerceConfigValue + applyConfigField，与 /botconfig set 的 json 分支同一口径：
+// ① 校验一致，拒绝原因（比如「fallback 不能是 device」）原样透出，不在这里另写一套
+// 判断；② 落盘的是 **parser 归一化后的对象**。之前这里把 JSON.stringify 的结果直接
+// 交给 applyConfigField，而 json kind 的 applyConfigField 不解析、原样写入，于是
+// bots.json 里存的是一个 JSON **字符串**——三个后果都是静默的：
+//   • getBot().config.triggerUserAuth 是 string，`?.enabled` 恒为 undefined，
+//     功能实际从未生效（开关看着开了，凭证边界并没有建立）；
+//   • parser 从未被调用，`fallback:'device'` 这类被刻意禁止的值也会 200 落盘；
+//   • 下次 daemon 重启时 bot-registry 的 parser 抛 "must be an object"，整个
+//     bots.json 加载失败 —— 一个开关把 daemon 拒启了。
+const TRIGGER_USER_AUTH_UI_EDITABLE_KEYS = new Set(['enabled', 'tools', 'fallback']);
+
+ipcRoute('PUT', '/api/bot-trigger-user-auth', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { triggerUserAuth?: unknown };
+  try { body = await readJsonBody<{ triggerUserAuth?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { error: 'invalid_json' }); }
+  const spec = findConfigField('triggerUserAuth');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'field_unavailable' });
+
+  // null → 清除整份配置（关闭）。applyConfigField 的 null 分支 delete key。
+  let value: TriggerUserAuthConfig | null = null;
+  if (body.triggerUserAuth !== null && body.triggerUserAuth !== undefined) {
+    const incoming = body.triggerUserAuth;
+    // 合并保存：dashboard 只回写 UI 展示的三个字段；接口支持但 UI 没有编辑器的
+    // gitHost / gitTokenExchangeUrl 必须原样保留，否则用户只勾一个 tool 就会静默
+    // 删掉「按当轮身份鉴权 git push」的配置。清除（body=null）仍是整份删除。
+    let merged: unknown = incoming;
+    if (incoming && typeof incoming === 'object' && !Array.isArray(incoming)) {
+      let preserved: Record<string, unknown> = {};
+      try {
+        const prev = getBot(cachedLarkAppId).config.triggerUserAuth as
+          Record<string, unknown> | undefined;
+        if (prev && typeof prev === 'object' && !Array.isArray(prev)) {
+          preserved = Object.fromEntries(
+            Object.entries(prev).filter(([k]) => !TRIGGER_USER_AUTH_UI_EDITABLE_KEYS.has(k)),
+          );
+        }
+      } catch { /* 未注册 bot → applyConfigField 会给出 bot_not_registered */ }
+      merged = { ...preserved, ...(incoming as Record<string, unknown>) };
+    }
+    // coerceConfigValue 吃 JSON 文本（与 IM 入口一致），返回 parser 归一化后的对象。
+    const coerced = coerceConfigValue(spec, JSON.stringify(merged));
+    if (!coerced.ok) return jsonRes(res, 400, { ok: false, error: coerced.reason, reason: coerced.reason });
+    value = coerced.value as TriggerUserAuthConfig;
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, r);
+  // 回响规范化后的实际生效值，前端保存后无需再拉一次聚合接口就能对齐。
+  jsonRes(res, 200, { ok: true, triggerUserAuth: value });
+});
+
+// GET /api/bot-trigger-user-auth-status — 当前策略 + 已授权人数 + 两条如实的
+// 边界提示（token 存储保护程度、自带凭证的 MCP server）。
+// 只回人数不回名单：谁授权过是成员关系，dashboard 没有理由把它摊给所有能登录的人。
+ipcRoute('GET', '/api/bot-trigger-user-auth-status', async (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  try {
+    const cfg = getBot(cachedLarkAppId).config;
+    const policy = cfg.triggerUserAuth ?? null;
+    const authorizedCount = listAuthorizedUsers(cfg.larkAppId, normalizeBrand(cfg.brand)).length;
+    // Sandbox is what makes the isolation OS-enforced; without it the agent runs
+    // as the same OS user as botmux and can read other people's token files.
+    const protection = tokenStoreProtection(cfg.sandbox === true);
+    const mcpAdvisory = credentialBearingMcpAdvisory(scanCredentialBearingMcpServers());
+    jsonRes(res, 200, {
+      ok: true,
+      policy,
+      authorizedCount,
+      tokenStoreEnforced: protection.enforced,
+      ...(protection.advisory ? { tokenStoreAdvisory: protection.advisory } : {}),
+      ...(mcpAdvisory ? { mcpAdvisory } : {}),
+    });
+  } catch (e: any) {
+    jsonRes(res, 500, { ok: false, error: e?.message ?? String(e) });
+  }
+});
+
 // Per-bot riff 后端配置。Body `{ riff: string }`（原始 JSON 文本，如
 // `{"baseUrl":"https://...","model":"gpt-5.5","reasoningEffort":"high"}`）：
 // 空白 → 清除；否则按 json kind 解析后落盘。走 applyConfigField（与 /botconfig
@@ -5382,6 +7792,35 @@ ipcRoute('PUT', '/api/bot-max-live-workers', async (req, res) => {
   jsonRes(res, 200, { ok: true, maxLiveWorkers: value });
 });
 
+// Per-bot 空闲会话自动休眠超时 idleSuspendMinutes。Body `{ idleSuspendMinutes: number | null }`:
+//   • 正整数（分钟）→ 会话持续空闲超过该时长即休眠回收内存，与数量上限互不影响
+//   • null          → 清除（关闭空闲 TTL，默认行为，仅受数量上限约束）
+// 同样走 applyConfigField；sweeper 每分钟实时读 bot.config.idleSuspendMinutes，免重启生效。
+ipcRoute('PUT', '/api/bot-idle-suspend-minutes', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let raw: unknown;
+  try { raw = await readJsonBody(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return jsonRes(res, 400, { ok: false, error: 'no_valid_fields' });
+  }
+  const body = raw as { idleSuspendMinutes?: unknown };
+  const spec = findConfigField('idleSuspendMinutes');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+
+  let value: number | null;
+  if (body.idleSuspendMinutes === null || body.idleSuspendMinutes === undefined) {
+    value = null;
+  } else {
+    const c = coerceConfigValue(spec, body.idleSuspendMinutes);
+    if (!c.ok || typeof c.value !== 'number') return jsonRes(res, 400, { ok: false, error: 'invalid_number' });
+    value = c.value;
+  }
+  const r = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, idleSuspendMinutes: value });
+});
+
 ipcRoute('PUT', '/api/bot-session-owner-reminder', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let raw: unknown;
@@ -5442,11 +7881,26 @@ ipcRoute('PUT', '/api/bot-sandbox', async (req, res) => {
   let body: { enabled?: unknown };
   try { body = await readJsonBody<{ enabled?: unknown }>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (body.enabled === true) {
+    try {
+      if (getBot(cachedLarkAppId).config.cliLaunchMode === 'forge-traex') {
+        return jsonRes(res, 400, {
+          ok: false,
+          error: 'launch_mode_sandbox_conflict',
+          message: 'Forge x TraeX 暂不支持文件沙盒。',
+        });
+      }
+    } catch { /* Let the store return the canonical config error below. */ }
+  }
   // File-sandbox policy is frozen onto each Session at creation and reused on
   // restore; this toggle is intentionally next-session-only and cannot mutate
   // a live pane's profile.
   const r = await sandboxStore.updateBotSandbox(cachedLarkAppId, body.enabled === true);
-  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  if (!r.ok) {
+    const status = r.reason === 'codex_browser_config_conflict'
+      || r.reason === 'existing_app_server_sandbox_conflict' ? 409 : 400;
+    return jsonRes(res, status, { ok: false, error: r.reason });
+  }
   jsonRes(res, 200, { ok: true, sandbox: r.sandbox });
 });
 
@@ -5545,7 +7999,12 @@ ipcRoute('PUT', '/api/bot-read-isolation', async (req, res) => {
           backendType,
           session.sessionId,
         );
-        if (persistentBackend.probePersistentSession(backendType, backingName) !== 'missing') {
+        const probe = backendType === 'zmx'
+          ? persistentBackend.probePersistentBackendTarget(persistentBackend.resolvePersistentBackendTarget(
+            backendType, session.sessionId, session.persistentBackendTarget,
+          ))
+          : persistentBackend.probePersistentSession(backendType, backingName);
+        if (probe !== 'missing') {
           return jsonRes(res, 409, {
             ok: false,
             error: 'read_isolation_teardown_unverified',
@@ -5566,7 +8025,11 @@ ipcRoute('PUT', '/api/bot-read-isolation', async (req, res) => {
     // A crash at any point can only lead to a cold spawn under the old or new
     // durable policy; there is no owned pane to reattach.
     const r = await sandboxStore.updateBotReadIsolation(larkAppId, enable);
-    if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+    if (!r.ok) {
+      const status = r.reason === 'codex_browser_config_conflict'
+        || r.reason === 'existing_app_server_sandbox_conflict' ? 409 : 400;
+      return jsonRes(res, status, { ok: false, error: r.reason });
+    }
     jsonRes(res, 200, {
       ok: true,
       readIsolation: r.readIsolation,
@@ -5643,6 +8106,22 @@ ipcRoute('POST', '/api/locale/reload', async (_req, res) => {
   }
 
   jsonRes(res, 200, { ok: true, defaultLocale: resolvedDefault, botLang });
+});
+
+// The Dashboard persists crossPrincipalInterruption=false before calling this
+// endpoint. Runtime cleanup is intentionally daemon-owned because only the
+// daemon can clear its in-memory timers and atomically terminalise its session
+// rows. A missing handler fails closed instead of claiming cleanup succeeded.
+ipcRoute('POST', '/api/xpi/disable', async (_req, res) => {
+  if (!crossPrincipalInterruptionDisableHandler) {
+    return jsonRes(res, 503, { ok: false, error: 'xpi_disable_handler_unavailable' });
+  }
+  try {
+    const cancelled = await crossPrincipalInterruptionDisableHandler();
+    jsonRes(res, 200, { ok: true, cancelled });
+  } catch (err: any) {
+    jsonRes(res, 500, { ok: false, error: err?.message ?? String(err) });
+  }
 });
 
 // Hot-reload the current daemon's per-bot config from bots.json after another
@@ -5987,6 +8466,7 @@ export function startIpcServer(opts: {
           : { ok: false as const, reason: 'secret_unavailable' };
         if (auth.ok) {
           trustedHostRequests.add(req);
+          trustedHostRequestSecrets.set(req, secret!);
         } else if (!capabilityRoute) {
           return jsonRes(res, 401, { ok: false, error: 'unauthorized', reason: auth.reason });
         }

@@ -217,7 +217,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(res).toMatchObject({ ok: true, action: 'queued', target: { sessionId: 'sess_new', chatId: CHAT } });
     expect(mockGetMessageChatId).toHaveBeenCalledWith(APP, ROOT);
     expect(mockSendMessage).not.toHaveBeenCalled();
-    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, ROOT, '[External] alerts', 'group');
+    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, ROOT, '[External] alerts', 'group', undefined, { source: 'http' });
     const ds = activeSessions.get(sessionKey(ROOT, APP));
     expect(ds?.scope).toBe('thread');
     expect(ds?.session.rootMessageId).toBe(ROOT);
@@ -242,6 +242,23 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(ds?.spawnModelOverride).toBe('grok-4.6');
     expect(ds?.session.model).toBeUndefined();
     expect(ds?.session.reasoningEffort).toBe('xhigh');
+  });
+
+  it('stamps per-turn reasoningEffort onto a claude-code session', async () => {
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'claude-code', workingDir: '/tmp' },
+      botName: 'Claude', botOpenId: 'ou_bot',
+    });
+    const req = request();
+    (req.options as any) = { model: 'claude-opus-5', reasoningEffort: 'max' };
+    const activeSessions = new Map<string, DaemonSession>();
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+    const ds = activeSessions.get(sessionKey(ROOT, APP));
+    expect(ds?.spawnModelOverride).toBe('claude-opus-5');
+    expect(ds?.session.model).toBeUndefined();
+    // max is claude-only (codex tops out the same list but grok/traex do not);
+    // it must survive the trigger gate verbatim.
+    expect(ds?.session.reasoningEffort).toBe('max');
   });
 
   it('stamps per-turn model + reasoningEffort onto a codex-family session', async () => {
@@ -334,11 +351,15 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(activeSessions.size).toBe(0);
   });
 
-  it('does NOT stamp model/effort onto a non-codex (claude) session', async () => {
-    // Harness default bot is claude-code. The gate must keep the override from
-    // silently changing a non-codex bot's model.
+  it('does NOT stamp model/effort onto a CLI without reasoning support', async () => {
+    // gemini has no configurable reasoning effort (claude-code now does), so the
+    // gate must keep the override from silently changing such a bot's model.
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'gemini', workingDir: '/tmp' },
+      botName: 'Gemini', botOpenId: 'ou_bot',
+    });
     const req = request();
-    (req.options as any) = { model: 'claude-opus-4-8', reasoningEffort: 'high' };
+    (req.options as any) = { model: 'gemini-3-pro', reasoningEffort: 'high' };
     const activeSessions = new Map<string, DaemonSession>();
     await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
     const ds = activeSessions.get(sessionKey(ROOT, APP));
@@ -355,7 +376,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
     await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
 
     expect(mockSendMessage).toHaveBeenCalledWith(APP, CHAT, 'CI 构建失败，请检查发布流水线');
-    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, 'om_new_topic', '[External] alerts', 'group');
+    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, 'om_new_topic', '[External] alerts', 'group', undefined, { source: 'http' });
     expect(activeSessions.get(sessionKey('om_new_topic', APP))?.scope).toBe('thread');
   });
 
@@ -367,7 +388,7 @@ describe('triggerSessionTurn rootMessageId target', () => {
     await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
 
     expect(mockSendMessage).not.toHaveBeenCalled();
-    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, CHAT, '[External] alerts', 'group');
+    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, CHAT, '[External] alerts', 'group', undefined, { source: 'http' });
     const ds = activeSessions.get(sessionKey(CHAT, APP));
     expect(ds?.scope).toBe('chat');
     expect(ds?.session.externalTriggerTopicless).toBe(true);

@@ -1,6 +1,9 @@
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { connect, type Socket } from 'node:net';
 import { PassThrough, type Duplex } from 'node:stream';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { DashboardSessionStore } from '../src/dashboard/h5-auth.js';
 import {
@@ -25,6 +28,8 @@ import {
   terminalViewForwardProof,
 } from '../src/dashboard/terminal-view-capability.js';
 import { deriveWorkerViewGeneration, verifyTerminalViewForward } from '../src/core/terminal-control-grant.js';
+import { appendEvent } from '../src/workflows/v3/journal.js';
+import { liveV3TerminalPortForSession } from '../src/workflows/v3/ops-projection.js';
 
 const SECRET = 'front-proxy-test-secret';
 const WORKER_GENERATION = deriveWorkerViewGeneration(SECRET, 'front-proxy-boot-token')!;
@@ -54,6 +59,62 @@ function close(server: Server): Promise<void> {
 }
 
 describe('central terminal front proxy boundary', () => {
+  it('routes a live v3 worker with viewToken, preserves 403, then returns 404 after settle', async () => {
+    const runsDir = mkdtempSync(join(tmpdir(), 'v3-front-proxy-'));
+    const runId = 'front-proxy-run';
+    const runDir = join(runsDir, runId);
+    mkdirSync(runDir, { recursive: true });
+    writeFileSync(join(runDir, 'dag.json'), JSON.stringify({
+      runId,
+      nodes: [{ id: 'research', type: 'goal', goal: 'research', depends: [], inputs: [] }],
+    }));
+
+    const worker = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://worker');
+      if (url.searchParams.get('viewToken') !== 'boot-view') {
+        res.writeHead(403).end('forbidden');
+        return;
+      }
+      res.writeHead(200).end('terminal');
+    });
+    const workerPort = await listen(worker);
+    const journal = join(runDir, 'journal.ndjson');
+    appendEvent(journal, { type: 'runStarted', runId });
+    appendEvent(journal, { type: 'nodeDispatched', nodeId: 'research', attemptId: '001' });
+    appendEvent(journal, {
+      type: 'nodeSessionReady', nodeId: 'research', attemptId: '001',
+      sessionInfo: { sessionId: 'sess-v3', webPort: workerPort, viewToken: 'boot-view' },
+    });
+
+    const proxy = createTerminalFrontProxy({
+      resolvePort: sessionId => liveV3TerminalPortForSession(runsDir, sessionId),
+      resolveActor: () => null,
+      control: {} as any,
+    });
+    const front = createServer((req, res) => {
+      const url = new URL(req.url ?? '/', 'http://front');
+      if (!proxy.handleHttp(req, res, url)) res.writeHead(404).end();
+    });
+    const frontPort = await listen(front);
+
+    try {
+      const base = `http://127.0.0.1:${frontPort}/s/sess-v3/`;
+      expect((await fetch(`${base}?viewToken=boot-view`)).status).toBe(200);
+      expect((await fetch(base)).status).toBe(403);
+      expect((await fetch(`${base}?viewToken=wrong`)).status).toBe(403);
+
+      appendEvent(journal, {
+        type: 'nodeSucceeded', nodeId: 'research', attemptId: '001',
+        manifestPath: join(runDir, 'research/attempts/001/manifest.json'),
+      });
+      expect((await fetch(`${base}?viewToken=boot-view`)).status).toBe(404);
+    } finally {
+      await close(front);
+      await close(worker);
+      rmSync(runsDir, { recursive: true, force: true });
+    }
+  });
+
   it('attaches a client error handler synchronously on early failure paths', () => {
     const proxy = createTerminalFrontProxy({
       resolvePort: () => undefined,

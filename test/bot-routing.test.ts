@@ -151,11 +151,25 @@ describe('buildFooterAddressing', () => {
     )).toEqual({ sendTo: 'ou_substitute_caller', cc: [] });
   });
 
+  it('lets an explicit human recipient replace the default owner outside oncall chats', () => {
+    expect(buildFooterAddressing(
+      { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_caller' },
+      { isOncall: false, hasExplicitMention: true, knownBotOpenIds },
+    )).toEqual({ sendTo: undefined, cc: [] });
+  });
+
   it('uses the last caller in oncall chats when the caller is human', () => {
     expect(buildFooterAddressing(
       { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_human_caller' },
       { isOncall: true, knownBotOpenIds },
     )).toEqual({ sendTo: 'ou_human_caller', cc: [] });
+  });
+
+  it('does not append the caller when an explicit human recipient was selected', () => {
+    expect(buildFooterAddressing(
+      { ownerOpenId: 'ou_owner', lastCallerOpenId: 'ou_triggering_bot' },
+      { isOncall: true, hasExplicitMention: true, knownBotOpenIds },
+    )).toEqual({ sendTo: undefined, cc: [] });
   });
 
   it('suppresses owner addressing in oncall when the body explicitly targets a bot', () => {

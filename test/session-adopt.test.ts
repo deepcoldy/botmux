@@ -58,6 +58,7 @@ vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
     config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
     resolvedAllowedUsers: [],
+    resolvedBlockedUsers: [],
     botOpenId: 'ou_bot',
   })),
   getAllBots: vi.fn(() => []),
@@ -251,6 +252,7 @@ describe('Adopt card actions', () => {
     vi.mocked(getBot).mockReturnValue({
       config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code' },
       resolvedAllowedUsers: [],
+      resolvedBlockedUsers: [],
       botOpenId: 'ou_bot',
     } as any);
     vi.mocked(listCodexAppThreads).mockResolvedValue([]);
@@ -530,6 +532,7 @@ describe('Adopt card actions', () => {
           cliPathOverride: '/opt/codex',
         },
         resolvedAllowedUsers: [],
+        resolvedBlockedUsers: [],
         botOpenId: 'ou_bot',
       } as any);
       vi.mocked(listCodexAppThreads).mockResolvedValueOnce([
@@ -569,6 +572,7 @@ describe('Adopt card actions', () => {
           cliPathOverride: '/opt/codex',
         },
         resolvedAllowedUsers: [],
+        resolvedBlockedUsers: [],
         botOpenId: 'ou_bot',
       } as any);
       vi.mocked(listCodexAppThreads).mockResolvedValueOnce([
@@ -616,7 +620,7 @@ describe('Adopt card actions', () => {
     it('sandbox:true bot → replies the sandbox-blocked notice, never persists adoptedFrom', async () => {
       vi.mocked(getBot).mockReturnValue({
         config: { larkAppId: APP_ID, larkAppSecret: 'secret', cliId: 'claude-code', sandbox: true },
-        resolvedAllowedUsers: [], botOpenId: 'ou_bot',
+        resolvedAllowedUsers: [], resolvedBlockedUsers: [], botOpenId: 'ou_bot',
       } as any);
       const { startAdoptSession } = await import('../src/core/command-handler.js');
       const ds = makeDaemonSession();

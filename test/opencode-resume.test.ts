@@ -12,7 +12,12 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 
-import { createOpenCodeAdapter, detectOpenCodeSubmit, snapPartBaseline } from '../src/adapters/cli/opencode.js';
+import {
+  createOpenCodeAdapter,
+  detectOpenCodeSubmit,
+  isOpenCodeInitialPromptComplete,
+  snapPartBaseline,
+} from '../src/adapters/cli/opencode.js';
 import { opencodeDbPath } from '../src/services/opencode-paths.js';
 import type { PtyHandle } from '../src/adapters/cli/types.js';
 
@@ -68,6 +73,20 @@ function seedUserPart(db: DatabaseSync, sessionId: string, text: string, timeCre
     .run(mid, sessionId, timeCreated, JSON.stringify({ role: 'user' }));
   db.prepare('INSERT INTO part (id, message_id, session_id, time_created, data) VALUES (?,?,?,?,?)')
     .run(`prt_${++idSeq}`, mid, sessionId, timeCreated, JSON.stringify({ type: 'text', text }));
+}
+
+function seedCompletedAssistantMessage(db: DatabaseSync, sessionId: string, timeCreated: number): void {
+  db.prepare('INSERT INTO message (id, session_id, time_created, data) VALUES (?,?,?,?)')
+    .run(`msg_${++idSeq}`, sessionId, timeCreated, JSON.stringify({
+      role: 'assistant', time: { completed: timeCreated },
+    }));
+}
+
+function seedRunningToolPart(db: DatabaseSync, sessionId: string, timeCreated: number): void {
+  db.prepare('INSERT INTO part (id, message_id, session_id, time_created, data) VALUES (?,?,?,?,?)')
+    .run(`prt_${++idSeq}`, `msg_${++idSeq}`, sessionId, timeCreated, JSON.stringify({
+      type: 'tool', state: { status: 'running' },
+    }));
 }
 
 beforeEach(() => {
@@ -185,6 +204,24 @@ describe('opencode listResumableSessions', () => {
   });
 });
 
+describe('opencode initial prompt completion', () => {
+  it('requires a completed assistant row after the argv submission baseline', () => {
+    const db = openDb();
+    seedSession(db, { id: 'ses_target' });
+    seedCompletedAssistantMessage(db, 'ses_target', 1_000);
+    expect(isOpenCodeInitialPromptComplete(1_000, 'ses_target')).toBe(false);
+
+    seedCompletedAssistantMessage(db, 'ses_target', 2_000);
+    expect(isOpenCodeInitialPromptComplete(1_000, 'ses_target')).toBe(true);
+
+    const current = Date.now();
+    seedCompletedAssistantMessage(db, 'ses_target', current);
+    seedRunningToolPart(db, 'ses_target', current);
+    expect(isOpenCodeInitialPromptComplete(1_000, 'ses_target')).toBe(false);
+    db.close();
+  });
+});
+
 describe('opencode writeInput DB verification', () => {
   function stubPty(onEnter?: () => void): PtyHandle & { enters: number } {
     const handle = {
@@ -212,6 +249,20 @@ describe('opencode writeInput DB verification', () => {
     const adapter = createOpenCodeAdapter();
     const result = await adapter.writeInput(pty, content);
     db.close();
+    expect(result).toMatchObject({ submitted: true, cliSessionId: 'ses_target' });
+  });
+
+  it('confirms a fresh --prompt submission against the pre-spawn baseline', async () => {
+    const db = openDb();
+    seedSession(db, { id: 'ses_target' });
+    const adapter = createOpenCodeAdapter();
+    const baseline = adapter.captureInitialPromptArgSubmission!();
+    const content = `<session_id>${BOTMUX_SESSION_ID}</session_id>\n\nargv opening`;
+    seedUserPart(db, 'ses_target', content, Date.now());
+
+    const result = await adapter.confirmInitialPromptArgSubmission!(baseline, content);
+    db.close();
+
     expect(result).toMatchObject({ submitted: true, cliSessionId: 'ses_target' });
   });
 
@@ -279,6 +330,43 @@ describe('opencode writeInput DB verification', () => {
 
     expect(result).toMatchObject({ submitted: true, cliSessionId: 'ses_target' });
     expect(events).toEqual([`paste:${content.length}`, 'key:Enter']);
+  });
+
+  it.each([
+    ['long deferred first prompt', `FIRST\n${'中文多行 0123456789\n'.repeat(700)}LAST`],
+    ['short multiline follow-up', 'first line\nsecond line'],
+    ['long single line', '内容'.repeat(100)],
+  ])('uses bracketed paste on raw PTY for a %s', async (_label, content) => {
+    const db = openDb();
+    seedSession(db, { id: 'ses_target' });
+    const writes: string[] = [];
+    const pty: PtyHandle = {
+      write(data) {
+        writes.push(data);
+        if (data === '\r' && writes[0] === `\x1b[200~${content}\x1b[201~`) {
+          seedUserPart(db, 'ses_target', content, Date.now());
+        }
+      },
+    };
+
+    try {
+      const result = await createOpenCodeAdapter().writeInput(pty, content);
+      expect(result).toMatchObject({ submitted: true, cliSessionId: 'ses_target' });
+      expect(writes).toEqual([`\x1b[200~${content}\x1b[201~`, '\r']);
+    } finally {
+      db.close();
+    }
+  });
+
+  it.each([
+    ['short follow-up', 'short follow-up'],
+    ['short slash command', '/session'],
+    ['long slash command', `/compact ${'a'.repeat(300)}`],
+    ['multiline slash command', '/ask first line\nsecond line'],
+  ])('keeps raw PTY typing for %s', async (_label, content) => {
+    const writes: string[] = [];
+    await createOpenCodeAdapter().writeInput({ write(data) { writes.push(data); } }, content);
+    expect(writes).toEqual([content, '\r']);
   });
 
   it('recognizes the submission when OpenCode prepends a Directory Context block to the stored user part', async () => {

@@ -215,8 +215,8 @@ describe('loadDashboardEnvFile() — allowlisted .env load', () => {
     expect(env.BOTMUX_DASHBOARD_FEISHU_H5_FUTURE_KNOB).toBe('on');
   });
 
-  it('never overrides a value already set (baked PM2 snapshot stays authoritative)', () => {
-    // resolveDaemonEnv bakes DAEMON_ENV_KEYS into the PM2 env block precisely
+  it('never overrides a value already set (resolved fleet snapshot stays authoritative)', () => {
+    // resolveDaemonEnv pins DAEMON_ENV_KEYS into the shared fleet env precisely
     // so a restart from inside a bot session is deterministic; the file must
     // not win over it — the historical dotenv semantics.
     const env: NodeJS.ProcessEnv = { BOTMUX_DASHBOARD_PORT: '7891' };

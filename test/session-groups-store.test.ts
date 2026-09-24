@@ -278,8 +278,8 @@ describe('buildTitlePrompt', () => {
 
 describe('resolveTagMode', () => {
   it('defaults to feed-group when tag.mode is unset', () => {
-    // feed-group 不依赖租户权限目录（chat-tag 的 im:tag scope 部分租户根本
-    // 没有），任何用户 OAuth 一次即可用 —— 因此是未配置时的默认模式。
+    // feed-group 不依赖租户权限目录（chat-tag 的 im:tag scope 飞书尚未开放，
+    // 权限目录里搜不到），任何用户 OAuth 一次即可用 —— 因此是未配置时的默认模式。
     expect(resolveTagMode(undefined)).toBe('feed-group');
     expect(resolveTagMode({})).toBe('feed-group');
   });

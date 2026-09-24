@@ -92,7 +92,7 @@ vi.mock('../src/services/async-trigger-store.js', async importOriginal => {
   };
 });
 
-import { initWorkerPool, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
+import { initWorkerPool, interruptExactWorkerTurn, __testOnly_setupWorkerHandlers } from '../src/core/worker-pool.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { EventEmitter } from 'node:events';
@@ -131,6 +131,35 @@ function makeDs(): DaemonSession {
   } as any;
   return ds;
 }
+
+describe('interruptExactWorkerTurn', () => {
+  it('waits for the worker acknowledgement rather than treating IPC send as success', async () => {
+    const ds = makeDs();
+    const pending = interruptExactWorkerTurn(ds, 'turn-exact', 1_000);
+    expect((ds.worker as any).send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'interrupt_turn', turnId: 'turn-exact', requestId: expect.any(String),
+    }));
+    const sent = (ds.worker as any).send.mock.calls[0][0];
+    (ds.worker as any).emit('message', {
+      type: 'turn_interrupt_result', requestId: sent.requestId, turnId: 'turn-exact',
+      delivered: false, reason: 'stale_turn',
+    });
+    await expect(pending).resolves.toEqual({ ok: false, reason: 'stale_turn' });
+  });
+
+  it('accepts only a matching exact-turn delivery acknowledgement', async () => {
+    const ds = makeDs();
+    const pending = interruptExactWorkerTurn(ds, 'turn-exact', 1_000);
+    const sent = (ds.worker as any).send.mock.calls[0][0];
+    (ds.worker as any).emit('message', {
+      type: 'turn_interrupt_result', requestId: 'other', turnId: 'turn-exact', delivered: true,
+    });
+    (ds.worker as any).emit('message', {
+      type: 'turn_interrupt_result', requestId: sent.requestId, turnId: 'turn-exact', delivered: true,
+    });
+    await expect(pending).resolves.toEqual({ ok: true });
+  });
+});
 
 function terminalMsg(
   turnId: string,

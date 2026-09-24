@@ -12,6 +12,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, readdirSync, rmSync } from 'fs';
 import { spawn } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import { join } from 'path';
 import { tmpdir } from 'os';
 
@@ -49,7 +50,7 @@ import {
   countActiveSessionsOnDisk,
   collectBotmuxSessionIdentities,
   loadAllSessionsSnapshot,
-  mutateSessionRowOffline,
+  applySessionCommandUnowned,
   readSessionRowFromDisk,
   readSessionRowCopiesAcrossStores,
   listSessionsStrict,
@@ -283,12 +284,12 @@ describe('the frozen import source is not a store', () => {
     expect(getSession('s1')?.status).toBe('active'); // 首次访问触发导入 → .db
     const jsonAfterImport = readFileSync(jsonFp, 'utf-8');
 
-    const published = mutateSessionRowOffline(
+    const published = applySessionCommandUnowned(
       { sessionId: 's1', larkAppId: 'appA' },
-      (current) => { current.status = 'closed'; current.closedAt = '2026-08-13T00:00:00.000Z'; return true; },
+      { type: 'close' },
       { dataDir: tempDir },
     );
-    expect(published?.status).toBe('closed');
+    expect(published).toMatchObject({ outcome: 'applied', row: { status: 'closed' } });
     expect(readPersistedSessionRows(tempDir, 'appA').s1.status).toBe('closed');
     expect(readFileSync(jsonFp, 'utf-8')).toBe(jsonAfterImport);
     expect(JSON.parse(jsonAfterImport).s1.status).toBe('active');
@@ -301,21 +302,21 @@ describe('the frozen import source is not a store', () => {
     const before = readPersistedSessionRows(tempDir, 'appA');
 
     let probes = 0;
-    const aborted = mutateSessionRowOffline(
+    const aborted = applySessionCommandUnowned(
       { sessionId: 's1', larkAppId: 'appA' },
-      (current) => { current.status = 'closed'; return true; },
+      { type: 'close' },
       { dataDir: tempDir, abortIf: () => ++probes > 1 },
     );
-    expect(aborted).toBeUndefined();
+    expect(aborted).toEqual({ outcome: 'owned' });
     expect(probes).toBe(2);
     expect(readPersistedSessionRows(tempDir, 'appA')).toEqual(before);
 
-    const abortedAtEntry = mutateSessionRowOffline(
+    const abortedAtEntry = applySessionCommandUnowned(
       { sessionId: 's1', larkAppId: 'appA' },
-      (current) => { current.status = 'closed'; return true; },
+      { type: 'close' },
       { dataDir: tempDir, abortIf: () => true },
     );
-    expect(abortedAtEntry).toBeUndefined();
+    expect(abortedAtEntry).toEqual({ outcome: 'owned' });
     expect(readPersistedSessionRows(tempDir, 'appA')).toEqual(before);
   });
 
@@ -325,14 +326,48 @@ describe('the frozen import source is not a store', () => {
     listSessions(); // 触发导入 → .db
     mutatePersistedSessionRow(tempDir, 'appA', 's1', (r) => { r.workerGeneration = 7; });
 
-    const published = mutateSessionRowOffline(
+    const published = applySessionCommandUnowned(
       { sessionId: 's1', larkAppId: 'appA' },
-      (current) => { current.status = 'closed'; return true; },
+      { type: 'close' },
       { dataDir: tempDir },
     );
-    expect(published?.status).toBe('closed');
-    expect(published?.workerGeneration).toBe(7);
+    expect(published).toMatchObject({ outcome: 'applied', row: { status: 'closed', workerGeneration: 7 } });
   });
+
+  it('offline mutation yields on SQLITE_BUSY instead of throwing', () => {
+    // Another writer already holds BEGIN IMMEDIATE past busy_timeout. That is
+    // the same "do not publish" outcome as a live occupancy lease — the CLI
+    // must get undefined, not a database-is-locked stack. Daemon load() still
+    // throws on the same contention (retryable, must not become empty cache).
+    seedJson('sessions-appA.json', { s1: row('s1', { larkAppId: 'appA' }) });
+    init('appA');
+    listSessions();
+    init();
+    const dbPath = join(tempDir, 'session-stores', 'appA', 'sessions.db');
+    const before = readPersistedSessionRows(tempDir, 'appA');
+    const writer = new DatabaseSync(dbPath);
+    writer.exec('PRAGMA busy_timeout = 3000');
+    writer.exec('BEGIN IMMEDIATE');
+    try {
+      const t0 = Date.now();
+      expect(applySessionCommandUnowned(
+        { sessionId: 's1', larkAppId: 'appA' },
+        { type: 'close' },
+        { dataDir: tempDir },
+      )).toEqual({ outcome: 'contended' });
+      expect(Date.now() - t0).toBeGreaterThanOrEqual(2500);
+      expect(readPersistedSessionRows(tempDir, 'appA')).toEqual(before);
+    } finally {
+      writer.exec('ROLLBACK');
+      writer.close();
+    }
+    const published = applySessionCommandUnowned(
+      { sessionId: 's1', larkAppId: 'appA' },
+      { type: 'close' },
+      { dataDir: tempDir },
+    );
+    expect(published).toMatchObject({ outcome: 'applied', row: { status: 'closed' } });
+  }, 20_000);
 });
 
 // ─── cutover 竞态：daemon 首次 load × 在途离线写者 ───────────────────────────
@@ -490,9 +525,9 @@ describe('SQLite capability gate', () => {
     expect(() => readSessionRowFromDisk('s1', 'appA', tempDir)).toThrow(SessionStoreSqliteUnavailableError);
     expect(() => loadAllSessionsSnapshot({ dataDir: tempDir })).toThrow(SessionStoreSqliteUnavailableError);
     expect(() => readSessionRowCopiesAcrossStores('s1', tempDir)).toThrow(SessionStoreSqliteUnavailableError);
-    expect(() => mutateSessionRowOffline(
+    expect(() => applySessionCommandUnowned(
       { sessionId: 's1', larkAppId: 'appA' },
-      () => true,
+      { type: 'close' },
       { dataDir: tempDir },
     )).toThrow(SessionStoreSqliteUnavailableError);
   });

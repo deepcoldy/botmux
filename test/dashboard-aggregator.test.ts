@@ -43,6 +43,57 @@ describe('Aggregator cache merge', () => {
     expect(a.getSchedules().length).toBe(0);
   });
 
+  it('applies explicit precondition clear markers without leaving a stale source', () => {
+    const a = new Aggregator();
+    a.applyEvent('appA', {
+      type: 'schedule.created',
+      body: {
+        schedule: {
+          id: 't1',
+          hasPrecondition: true,
+          preconditionSource: 'inline',
+          preconditionScript: 'printf 1',
+        } as any,
+      },
+    });
+    a.applyEvent('appA', {
+      type: 'schedule.updated',
+      body: {
+        id: 't1',
+        patch: {
+          hasPrecondition: true,
+          preconditionSource: 'file',
+          preconditionScript: null,
+          preconditionFilePath: 'scripts/check-ready.sh',
+        },
+      },
+    });
+    expect(a.getSchedules()[0]).toMatchObject({
+      preconditionSource: 'file',
+      preconditionScript: null,
+      preconditionFilePath: 'scripts/check-ready.sh',
+    });
+
+    a.applyEvent('appA', {
+      type: 'schedule.updated',
+      body: {
+        id: 't1',
+        patch: {
+          hasPrecondition: false,
+          preconditionSource: null,
+          preconditionScript: null,
+          preconditionFilePath: null,
+        },
+      },
+    });
+    expect(a.getSchedules()[0]).toMatchObject({
+      hasPrecondition: false,
+      preconditionSource: null,
+      preconditionScript: null,
+      preconditionFilePath: null,
+    });
+  });
+
   it('hydrate seeds the cache', () => {
     const a = new Aggregator();
     a.hydrateSessions('appA', [{ sessionId: 's1', larkAppId: 'appA' } as any]);

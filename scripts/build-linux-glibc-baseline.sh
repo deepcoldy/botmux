@@ -76,12 +76,21 @@ docker run --rm \
     rm -rf node_modules dist dist-bin
 
     node_version=22.22.3
-    curl -fsSL "https://nodejs.org/dist/v${node_version}/node-v${node_version}-linux-${NODE_ARCH}.tar.xz" -o /tmp/node.tar.xz
+    node_url="https://nodejs.org/dist/v${node_version}/node-v${node_version}-linux-${NODE_ARCH}.tar.xz"
+    for attempt in 1 2 3 4 5; do
+      curl -fsSL "$node_url" -o /tmp/node.tar.xz && break
+      [ "$attempt" -lt 5 ] || {
+        echo "failed to download Node.js after $attempt attempts" >&2
+        exit 1
+      }
+      echo "Node.js download failed (attempt $attempt/5); retrying in 2s..." >&2
+      sleep 2
+    done
     mkdir -p /opt/node
     tar -xJf /tmp/node.tar.xz -C /opt/node --strip-components=1
     export PATH="/opt/node/bin:$PATH"
     node --version
-    npm install -g bun@1.4.0 --loglevel=error
+    npm install -g bun@1.4.2 --loglevel=error
     bun --version
 
     # Compiles node-pty on glibc 2.28; trustedDependencies makes this lifecycle

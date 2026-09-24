@@ -1,15 +1,17 @@
 name: Cancel stale release approvals
 
-# 背景:Release workflow 的 `desktop` job（macOS 签名+公证）挂在 `environment:
-# macos-signing` 的人工审批 gate 上。GitHub 对「等待审批」的 pending 没有原生自动
-# 超时——job 的 timeout 不涵盖排队等审批的时间,environment 的 wait-timer 是「等 N
-# 分钟后自动放行」(反而会去发版),都不是我们要的「超期自动取消」。结果不想发
-# 桌面包时,run 会无限期停在 waiting(最长 30 天),在 deployments 页堆成一排。
+# 背景:Release workflow 的 `desktop` 与 `sign-darwin-binaries` job 都挂在
+# `environment: macos-signing` 的人工审批 gate 上。GitHub 对「等待审批」的 pending
+# 没有原生自动超时——job 的 timeout 不涵盖排队等审批的时间,environment 的
+# wait-timer 是「等 N 分钟后自动放行」(反而会去发版),都不是我们要的「超期自动
+# 取消」。结果一个无人批准的签名任务会一直停在 waiting(最长 30 天),在
+# deployments 页堆成一排。
 #
 # 本 workflow 每天跑一次,把 Release workflow 里 status=waiting 且创建超过阈值
-# (默认 24h)的 run 直接 cancel 掉。npm/GitHub Release 早在 release job 里发完了
-# (它不 needs desktop),所以 cancel 只终止那个干等的 macOS 签名,零副作用。
-# 想真出桌面包就在阈值时间内去点批准,或事后 workflow_dispatch 重跑 Release。
+# (默认 24h)的非 stable run cancel 掉。纯净 vX.Y.Z 正式版现在会在发布任何包之前
+# 等待 CLI Developer ID 签名，且 workflow_dispatch 不能补发一个被取消的 tag，
+# 所以正式版必须豁免清扫，留给维护者在 GitHub 的 30 天期限内审批。预览版只会等
+# 可选 Desktop 签名，workflow_dispatch 也只刷新 Desktop 附件，仍可安全清扫。
 
 on:
   schedule:
@@ -56,7 +58,7 @@ jobs:
             --workflow=release.yml \
             --status=waiting \
             --limit 100 \
-            --json databaseId,createdAt,displayTitle,headBranch,url)
+            --json databaseId,createdAt,displayTitle,event,headBranch,url)
 
           COUNT=$(printf '%s' "$RUNS_JSON" | jq 'length')
           echo "waiting Release runs: $COUNT"
@@ -68,13 +70,19 @@ jobs:
           NOW=$(date -u +%s)
           CUTOFF=$(( THRESHOLD_HOURS * 3600 ))
 
-          # 逐个判断 age;超阈值的 cancel。用 jq 展开成 TSV(id \t createdAt \t ref \t title)。
+          # 逐个判断 age;超阈值的 cancel。用 jq 展开成
+          # TSV(id \t createdAt \t ref \t title \t event)。
           printf '%s' "$RUNS_JSON" \
-            | jq -r '.[] | [.databaseId, .createdAt, .headBranch, (.displayTitle // "")] | @tsv' \
-            | while IFS=$'\t' read -r id created ref title; do
+            | jq -r '.[] | [.databaseId, .createdAt, .headBranch, (.displayTitle // ""), .event] | @tsv' \
+            | while IFS=$'\t' read -r id created ref title event; do
                 created_s=$(date -u -d "$created" +%s)
                 age=$(( NOW - created_s ))
                 age_h=$(( age / 3600 ))
+                version="${ref#v}"
+                if [ "$event" = "push" ] && [[ "$ref" == v* ]] && [[ "$version" != *"-"* ]]; then
+                  echo "keep stable release run $id (ref=$ref age=${age_h}h; CLI signing is release-blocking)"
+                  continue
+                fi
                 if [ "$age" -ge "$CUTOFF" ]; then
                   if [ "$DRY_RUN" = "true" ]; then
                     echo "[dry-run] WOULD cancel run $id (ref=$ref age=${age_h}h) \"$title\""

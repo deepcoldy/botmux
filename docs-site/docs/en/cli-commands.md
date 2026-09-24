@@ -5,9 +5,9 @@ Manage the daemon and sessions from the terminal.
 | Command | Description |
 |------|------|
 | `botmux setup` | Interactive configuration (first run / add / edit / delete a bot) |
-| `botmux start` | Start the daemon (managed by PM2) |
+| `botmux start [--companion-secret-file <path> --companion-bot <appId>]` | Start the daemon. Supplying both companion options enables the closed local API for exactly one isolated test Bot; see [Local Companion API](/en/companion-api) |
 | `botmux stop` | Stop the daemon |
-| `botmux restart [--include-pm2]` | Restart the daemon (automatically restores active sessions); `--include-pm2` additionally retires botmux's PM2 God daemon after the fleet is safely shut down, so the whole process tree restarts from the invoking shell's clean environment (plugin services are gracefully stopped first; auto ones come back after the restart) |
+| `botmux restart [--companion-secret-file <path> --companion-bot <appId>]` | Restart the daemon and restore active sessions; accepts the same closed Companion API options as `start` |
 | `botmux logs [--lines N]` | View logs |
 | `botmux status` | View daemon status |
 | `botmux upgrade` | Upgrade to the latest version |
@@ -50,4 +50,6 @@ Session info is inferred automatically from ancestor-process markers, so the age
 | `botmux bots invite --chat <chatId> --team <id> --agent <appId>...` | Add same-team agents + their owners into a group you're already in (auto-adds the platform app first if absent) |
 | `botmux history [--limit N]` | Pull the session history (JSON) |
 | `botmux quoted <message_id>` | Pull a single quoted message (JSON) |
-| `botmux schedule add/list/remove/pause/resume/run` | Manage scheduled tasks |
+| `botmux schedule add/list/update/remove/pause/resume/run` | Manage scheduled tasks |
+| `botmux session rename "<title>"` | Rename the **current session's** botmux canonical title (the session is auto-detected; no `--session-id` or any way to target another session). Dashboard and the `/sessions` list update instantly, and the CLI-native session name is synced best-effort. The Lark group name and omt topic name are unchanged (no platform API for topic titles). Recommended shape "type \| subject", up to 200 characters |
+| `botmux chat rename <new group name> [--proactive]` | Rename the **Lark group that hosts the current session** (in a topic group this is the whole `oc_` group, visible across every topic and to every member). `--proactive` is for agent-initiated renames on a phase change, with a 10-minute debounce |

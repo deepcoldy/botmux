@@ -31,6 +31,12 @@ export interface AllowedUsersResolveResultLike {
    * `definitive` (safest: never revived from cache).
    */
   entryStatus?: Map<string, EntryResolveStatus>;
+  /**
+   * True when batch contact resolution encountered a permanent API error code
+   * (e.g. 40001 invalid argument, 99991672 missing scope, 41050 not visible)
+   * rather than an in-flight network timeout/transient.
+   */
+  hasPermanentBatchError?: boolean;
 }
 
 export interface ApplyAllowedUsersResolveInput {
@@ -64,6 +70,17 @@ export interface ApplyAllowedUsersResolveOutput {
   failed: boolean;
   /** Human-readable notice for logs / owner DM; null when nothing to report. */
   notice: string | null;
+  /**
+   * True when usedFallback is true, every transiently-failed entry was
+   * successfully recovered from cache, and the runtime list is non-empty.
+   * Indicates owner authorization remains 100% operational despite upstream API blips.
+   */
+  fullyRecovered: boolean;
+  /**
+   * True when fallback was triggered by a permanent API error (e.g. 40001, 99991672)
+   * requiring operator intervention, rather than an in-flight network transient.
+   */
+  hasPermanentBatchError?: boolean;
 }
 
 /** Config entries that require a contact resolve (email / union / literal ou_ / mobile). */
@@ -100,7 +117,7 @@ export function applyAllowedUsersResolve(
   const { map: freshMap, errored, entryStatus } = input.resolveResult;
 
   if (rawEntries.length === 0) {
-    return { resolved: [], map: new Map(), usedFallback: false, failed: false, notice: null };
+    return { resolved: [], map: new Map(), usedFallback: false, failed: false, notice: null, fullyRecovered: false };
   }
 
   const outMap = new Map<string, string>();
@@ -151,7 +168,7 @@ export function applyAllowedUsersResolve(
     // definitively-gone / non-resolvable entries — that is a legitimate empty
     // allowlist, not a fallback situation. Non-resolvable-only configs (no
     // contact entries) also land here with no notice.
-    return { resolved, map: outMap, usedFallback: false, failed: false, notice: null };
+    return { resolved, map: outMap, usedFallback: false, failed: false, notice: null, fullyRecovered: false };
   }
 
   // Degraded pass (something transient-failed). Build an operator-facing notice.
@@ -177,5 +194,46 @@ export function applyAllowedUsersResolve(
       `allowedUsers resolve degraded; runtime allowlist is empty. Raw entries: ${rawEntries.join(', ')}.`;
   }
 
-  return { resolved, map: outMap, usedFallback, failed: true, notice };
+  const fullyRecovered = usedFallback && !transientMissWithoutCache && resolved.length > 0;
+  const hasPermanentBatchError = input.resolveResult.hasPermanentBatchError === true;
+  return { resolved, map: outMap, usedFallback, failed: true, notice, fullyRecovered, hasPermanentBatchError };
+}
+
+/**
+ * Startup owner-DM silence gate. The yellow ⚠️ resolve-warning DM is suppressed
+ * ONLY when the degraded pass is completely masked by a complete per-entry
+ * cache fallback AND nothing in the failure was a permanent app-level error
+ * (missing contact scope / rejected batch request). A permanent error must page
+ * the owner immediately even if the cache happens to cover every configured
+ * entry: the bot is running on stale grants and operator action is required.
+ *
+ * Pure predicate on the apply result so the alert-tiering policy is table-tested
+ * independently of daemon wiring.
+ */
+export function shouldSilenceAllowedUsersOwnerDm(applied: {
+  failed: boolean;
+  fullyRecovered: boolean;
+  hasPermanentBatchError?: boolean;
+}): boolean {
+  return applied.failed === true
+    && applied.fullyRecovered === true
+    && applied.hasPermanentBatchError !== true;
+}
+
+/** Retry-exhaustion notice tier derived from the bot's current allowlist state. */
+export type AllowedUsersTerminalNoticeKind = 'allowlist-empty' | 'cache-degraded' | null;
+
+/**
+ * Classify the terminal notice after startup + 3 retries all failed:
+ *   - config removed / bot torn down (no configured entries) → no notice;
+ *   - still configured but runtime allowlist empty → everyone incl. owner is denied;
+ *   - still configured with a non-empty runtime list → running degraded on cache.
+ */
+export function classifyAllowedUsersTerminalNotice(state: {
+  configuredCount: number;
+  resolvedCount: number;
+}): AllowedUsersTerminalNoticeKind {
+  if (state.configuredCount <= 0) return null;
+  if (state.resolvedCount <= 0) return 'allowlist-empty';
+  return 'cache-degraded';
 }

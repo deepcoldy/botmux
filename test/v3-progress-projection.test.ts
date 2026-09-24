@@ -547,4 +547,122 @@ describe('projectV3Progress', () => {
     });
     expect(view.updatedAt).toBe(CREATED_AT);
   });
+
+  it('surfaces the latest nodeSessionReady terminal for the card deep-link', () => {
+    const events = [
+      at(1, { type: 'runStarted', runId: 'progress-run' }),
+      at(2, { type: 'nodeDispatched', nodeId: 'research', attemptId: '001' }),
+      at(3, {
+        type: 'nodeSessionReady',
+        nodeId: 'research',
+        attemptId: '001',
+        sessionInfo: { sessionId: 'sess-aaa', webPort: 8765, viewToken: 'view-aaa' },
+      }),
+      at(4, {
+        type: 'nodeSucceeded',
+        nodeId: 'research',
+        attemptId: '001',
+        manifestPath: '/tmp/research-manifest.json',
+      }),
+      at(5, { type: 'nodeDispatched', nodeId: 'publish', attemptId: '001' }),
+      at(6, {
+        type: 'nodeSessionReady',
+        nodeId: 'publish',
+        attemptId: '001',
+        sessionInfo: { sessionId: 'sess-bbb', viewToken: 'view-bbb' },
+      }),
+    ];
+    const view = projectV3Progress({ envelope: envelope(), dag: dag(), events });
+    // Last currently-running nodeSessionReady wins and carries the read capability.
+    expect(view.terminal).toEqual({ sessionId: 'sess-bbb', viewToken: 'view-bbb' });
+  });
+
+  it('drops the terminal as soon as its node reaches a terminal verdict', () => {
+    const events = [
+      at(1, { type: 'runStarted', runId: 'progress-run' }),
+      at(2, { type: 'nodeDispatched', nodeId: 'research', attemptId: '001' }),
+      at(3, {
+        type: 'nodeSessionReady',
+        nodeId: 'research',
+        attemptId: '001',
+        sessionInfo: { sessionId: 'sess-aaa', webPort: 8765, viewToken: 'view-aaa' },
+      }),
+      at(4, {
+        type: 'nodeSucceeded',
+        nodeId: 'research',
+        attemptId: '001',
+        manifestPath: '/tmp/research-manifest.json',
+      }),
+    ];
+    expect(projectV3Progress({ envelope: envelope(), dag: dag(), events }).terminal).toBeUndefined();
+  });
+
+  it('ignores a late ready event from an obsolete attempt during retry', () => {
+    const retried = [
+      at(1, { type: 'runStarted', runId: 'progress-run' }),
+      at(2, { type: 'nodeDispatched', nodeId: 'research', attemptId: '001' }),
+      at(3, {
+        type: 'nodeSessionReady',
+        nodeId: 'research',
+        attemptId: '001',
+        sessionInfo: { sessionId: 'sess-old', webPort: 8765, viewToken: 'view-old' },
+      }),
+      at(4, {
+        type: 'nodeBlocked',
+        nodeId: 'research',
+        attemptId: '001',
+        errorClass: 'workerError',
+      }),
+      at(5, { type: 'runBlocked', blockedNodeId: 'research' }),
+      at(6, {
+        type: 'nodeRetryRequested',
+        nodeId: 'research',
+        previousAttemptId: '001',
+        nextAttemptId: '002',
+        reason: 'blockedRetry',
+      }),
+      at(7, { type: 'nodeDispatched', nodeId: 'research', attemptId: '002' }),
+      at(8, {
+        type: 'nodeSessionReady',
+        nodeId: 'research',
+        attemptId: '001',
+        sessionInfo: { sessionId: 'sess-stale', webPort: 8766, viewToken: 'view-stale' },
+      }),
+    ];
+    expect(projectV3Progress({ envelope: envelope(), dag: dag(), events: retried }).terminal).toBeUndefined();
+
+    const current = [
+      ...retried,
+      at(9, {
+        type: 'nodeSessionReady',
+        nodeId: 'research',
+        attemptId: '002',
+        sessionInfo: { sessionId: 'sess-current', webPort: 8767, viewToken: 'view-current' },
+      }),
+    ];
+    expect(projectV3Progress({ envelope: envelope(), dag: dag(), events: current }).terminal).toEqual({
+      sessionId: 'sess-current',
+      webPort: 8767,
+      viewToken: 'view-current',
+    });
+  });
+
+  it('omits terminal when no nodeSessionReady event fired', () => {
+    const view = projectV3Progress({ envelope: envelope(), dag: dag(), events: [] });
+    expect(view.terminal).toBeUndefined();
+  });
+
+  it('ignores nodeSessionReady for private inner-loop nodes', () => {
+    const events = [
+      at(1, { type: 'runStarted', runId: 'progress-run' }),
+      at(2, {
+        type: 'nodeSessionReady',
+        nodeId: 'loop-body#001',
+        attemptId: '001',
+        sessionInfo: { sessionId: 'sess-secret', webPort: 9999 },
+      }),
+    ];
+    const view = projectV3Progress({ envelope: envelope(), dag: dag(), events });
+    expect(view.terminal).toBeUndefined();
+  });
 });
