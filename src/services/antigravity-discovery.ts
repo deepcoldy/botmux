@@ -11,6 +11,7 @@ export interface AntigravityDiscoveryOptions {
   cwd?: string;
   summariesDbPath?: string;
   conversationsDir?: string;
+  allowWorkspaceFallbackWithPid?: boolean;
 }
 
 function getProcessFds(pid: number): string[] {
@@ -90,9 +91,38 @@ export function findAntigravityConversationIdByPid(
   return null;
 }
 
+function uriToPath(uri: string): string {
+  let path = uri.startsWith('file://') ? uri.slice(7) : uri;
+  try {
+    path = decodeURIComponent(path);
+  } catch {
+    // ignore
+  }
+  return path.replace(/\/+$/, '');
+}
+
+function matchesWorkspaceUri(rawUris: unknown, cleanCwd: string): boolean {
+  if (typeof rawUris !== 'string' || !rawUris) return false;
+  try {
+    const parsed = JSON.parse(rawUris);
+    if (Array.isArray(parsed)) {
+      return parsed.some(
+        (u) => typeof u === 'string' && uriToPath(u) === cleanCwd,
+      );
+    }
+    if (typeof parsed === 'string') {
+      return uriToPath(parsed) === cleanCwd;
+    }
+  } catch {
+    // not valid JSON
+  }
+  return uriToPath(rawUris) === cleanCwd;
+}
+
 /**
  * Look up the most recently modified conversation in conversation_summaries.db
  * whose workspace_uris array matches the specified cwd.
+ * Compares exact decoded file URI paths to prevent prefix/substring collisions.
  */
 export function findAntigravityConversationIdByWorkspace(
   cwd: string,
@@ -114,8 +144,7 @@ export function findAntigravityConversationIdByWorkspace(
     for (const row of rows) {
       const cid = typeof row.conversation_id === 'string' ? row.conversation_id : '';
       if (!UUID_RE.test(cid)) continue;
-      const uris = typeof row.workspace_uris === 'string' ? row.workspace_uris : '';
-      if (uris.includes(cleanCwd) || uris.includes(encodeURI(cleanCwd))) {
+      if (matchesWorkspaceUri(row.workspace_uris, cleanCwd)) {
         return cid;
       }
     }
@@ -130,12 +159,17 @@ export function findAntigravityConversationIdByWorkspace(
 
 /**
  * Discover the Antigravity conversation ID for a session.
- * Prioritizes PID open fds (authoritative), falling back to workspace matching.
+ * Prioritizes PID open fds (authoritative).
+ * When PID is present, does not fall back to workspace summaries to prevent
+ * claiming old historical sessions before the new process opens its DB.
  */
 export function findAntigravityConversationId(opts: AntigravityDiscoveryOptions): string | null {
   if (opts.pid) {
     const fromPid = findAntigravityConversationIdByPid(opts.pid, opts.conversationsDir);
     if (fromPid) return fromPid;
+    if (!opts.allowWorkspaceFallbackWithPid) {
+      return null;
+    }
   }
   if (opts.cwd) {
     const fromWs = findAntigravityConversationIdByWorkspace(opts.cwd, opts.summariesDbPath);

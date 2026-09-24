@@ -5,6 +5,7 @@ import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { delay } from '../../utils/timing.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult } from './types.js';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { discoverAntigravitySessions } from '../../services/resumable-session-discovery.js';
 import { findAntigravityConversationId } from '../../services/antigravity-discovery.js';
 
@@ -141,6 +142,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     id: 'antigravity',
     authPaths: ['~/.gemini/oauth_creds.json', '~/.gemini/antigravity-cli/antigravity-oauth-token'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
+    modelChoices: CLI_MODEL_CHOICES['antigravity'],
 
     buildArgs({ resume, resumeSessionId, disableCliBypass, model, reasoningEffort }) {
       const args = disableCliBypass ? [] : ['--dangerously-skip-permissions'];

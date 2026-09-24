@@ -105,7 +105,7 @@ describe('antigravity-usage', () => {
     expect(res?.result?.out).toBe(130);
     expect(res?.result?.turns).toBe(2);
     expect(res?.agg.latestContextUsage?.usedTokens).toBe(160); // last step 120 + 40
-    expect(res?.agg.turnInputTokens).toBe(160);
-    expect(res?.agg.turnOutputTokens).toBe(80);
+    expect(res?.agg.turnInputTokens).toBe(0);
+    expect(res?.agg.turnOutputTokens).toBe(0);
   });
 });

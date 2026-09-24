@@ -231,8 +231,8 @@ export function readAntigravityTokenUsage(
       latestCodexUsageSource: null,
       latestContextUsageSource: null,
       modelSource: null,
-      turnInputTokens: lastStepInput + lastStepCache,
-      turnOutputTokens: lastStepOutput,
+      turnInputTokens: 0,
+      turnOutputTokens: 0,
       reasoningEffort: '',
     };
 

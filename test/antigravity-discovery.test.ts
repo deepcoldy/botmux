@@ -72,4 +72,61 @@ describe('antigravity-discovery', () => {
     const cid = findAntigravityConversationIdByWorkspace('/repo/my-project', join(tmpDir, 'not_exists.db'));
     expect(cid).toBeNull();
   });
+
+  it('prevents substring/prefix false positives (e.g. /repo/project vs /repo/project-backup)', () => {
+    const db = openDatabaseSyncOrThrow(dbPath);
+    db.exec(`
+      CREATE TABLE conversation_summaries (
+        conversation_id TEXT PRIMARY KEY,
+        workspace_uris TEXT NOT NULL,
+        last_modified_time DATETIME NOT NULL
+      );
+    `);
+    db.prepare(`
+      INSERT INTO conversation_summaries (conversation_id, workspace_uris, last_modified_time)
+      VALUES (?, ?, ?);
+    `).run('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', JSON.stringify(['file:///repo/project-backup']), '2026-09-24 07:00:00');
+    db.close();
+
+    // Querying /repo/project must NOT match /repo/project-backup
+    const cid = findAntigravityConversationIdByWorkspace('/repo/project', dbPath);
+    expect(cid).toBeNull();
+
+    // Exact match works
+    const exactCid = findAntigravityConversationIdByWorkspace('/repo/project-backup', dbPath);
+    expect(exactCid).toBe('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+  });
+
+  it('does not fall back to historical workspace summaries when pid is specified', () => {
+    const db = openDatabaseSyncOrThrow(dbPath);
+    db.exec(`
+      CREATE TABLE conversation_summaries (
+        conversation_id TEXT PRIMARY KEY,
+        workspace_uris TEXT NOT NULL,
+        last_modified_time DATETIME NOT NULL
+      );
+    `);
+    db.prepare(`
+      INSERT INTO conversation_summaries (conversation_id, workspace_uris, last_modified_time)
+      VALUES (?, ?, ?);
+    `).run('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee', JSON.stringify(['file:///repo/my-project']), '2026-09-24 07:00:00');
+    db.close();
+
+    // PID 9999999 has no open DB fd. Must NOT hijack old workspace session!
+    const fromPidAndCwd = findAntigravityConversationId({
+      pid: 9999999,
+      cwd: '/repo/my-project',
+      summariesDbPath: dbPath,
+    });
+    expect(fromPidAndCwd).toBeNull();
+
+    // If allowWorkspaceFallbackWithPid is explicitly true, fallback is permitted
+    const withFallback = findAntigravityConversationId({
+      pid: 9999999,
+      cwd: '/repo/my-project',
+      summariesDbPath: dbPath,
+      allowWorkspaceFallbackWithPid: true,
+    });
+    expect(withFallback).toBe('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+  });
 });

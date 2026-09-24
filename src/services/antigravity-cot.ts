@@ -45,9 +45,20 @@ export function extractAntigravityCotEntriesFromRecord(
   if (!d || typeof d !== 'object') return [];
   const entries: AntigravityCotEntry[] = [];
 
-  // User input lines never enter the thinking process
-  if (d.type === 'USER_INPUT') {
+  // User input lines never enter the thinking process; reset any pending tools
+  if (d.type === 'USER_INPUT' || d.source === 'USER_EXPLICIT') {
     pendingTools.length = 0;
+    return entries;
+  }
+
+  // Explicitly ignore internal system messages and checkpoints:
+  // they must NEVER leak into the thinking bubble and must NEVER consume pendingTools.
+  if (
+    d.source === 'SYSTEM' ||
+    d.type === 'SYSTEM_MESSAGE' ||
+    d.type === 'CHECKPOINT' ||
+    d.type === 'TASK_NOTIFICATION'
+  ) {
     return entries;
   }
 
@@ -84,20 +95,21 @@ export function extractAntigravityCotEntriesFromRecord(
     return entries;
   }
 
-  // Tool execution results: MODEL / SYSTEM / GENERIC or specific tool name
+  // Tool execution results: strictly GENERIC (from MODEL or unlabelled) with non-empty content
   if (
-    (d.source === 'MODEL' || d.source === 'SYSTEM' || !d.source) &&
-    (d.type === 'GENERIC' || typeof d.content === 'string')
+    (d.source === 'MODEL' || !d.source) &&
+    d.type === 'GENERIC' &&
+    typeof d.content === 'string' &&
+    d.content.length > 0
   ) {
-    if (typeof d.content === 'string' && d.content.length > 0) {
-      const pt = pendingTools.shift();
-      const id = pt ? pt.id : `res_${d.step_index ?? Date.now()}`;
-      entries.push({
-        kind: 'tool_result',
-        id,
-        result: truncateForCot(d.content, COT_TOOL_RESULT_MAX_CHARS),
-      });
-    }
+    const pt = pendingTools.shift();
+    const id = pt ? pt.id : `res_${d.step_index ?? Date.now()}`;
+    entries.push({
+      kind: 'tool_result',
+      id,
+      result: truncateForCot(d.content, COT_TOOL_RESULT_MAX_CHARS),
+    });
+    return entries;
   }
 
   return entries;

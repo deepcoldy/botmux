@@ -244,8 +244,8 @@ import {
 } from './services/structured-bridge-clis.js';
 import { drainCursorTranscript, findCursorChatIdByPid, findCursorTranscriptByChatId, findCursorTranscriptByPid } from './services/cursor-transcript.js';
 import { startCursorCot, stopAllCursorCot, type CursorCotEntry } from './services/cursor-cot.js';
-import { startAntigravityCot, stopAllAntigravityCot, type AntigravityCotEntry } from './services/antigravity-cot.js';
-import { findAntigravityConversationId } from './services/antigravity-discovery.js';
+import { startAntigravityCot, stopAntigravityCot, stopAllAntigravityCot, type AntigravityCotEntry } from './services/antigravity-cot.js';
+import { findAntigravityConversationId, findAntigravityConversationIdByPid } from './services/antigravity-discovery.js';
 import { shouldObserveCursorChatId, shouldPersistObservedCursorChatId } from './services/cursor-resume-policy.js';
 import { extractKiroSessionIdFromOutput } from './services/kiro-session.js';
 import { baselineJsonlCursor } from './services/jsonl-cursor.js';
@@ -7203,12 +7203,22 @@ let antigravityCotReaderSessionId: string | undefined;
 
 function ensureAntigravityCotReader(cliSessionId: string): void {
   if (!cliSessionId || antigravityCotReaderSessionId === cliSessionId) return;
+  const previousId = antigravityCotReaderSessionId;
+  antigravityCotReaderSessionId = cliSessionId;
+  if (previousId) {
+    if (typeof stopAntigravityCot === 'function') {
+      stopAntigravityCot(previousId);
+    } else if (typeof (startAntigravityCot as any)?.stop === 'function') {
+      (startAntigravityCot as any).stop(previousId);
+    }
+  }
+  const boundSessionId = cliSessionId;
   const ok = startAntigravityCot(cliSessionId, (entries: readonly AntigravityCotEntry[]) => {
+    if (antigravityCotReaderSessionId !== boundSessionId) return;
     if (!currentBotmuxTurnId) return;
     observeCotEntries(entries, { turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
   });
   if (ok) {
-    antigravityCotReaderSessionId = cliSessionId;
     log(`Antigravity CoT reader started for session ${cliSessionId}`);
   }
 }
@@ -7219,7 +7229,7 @@ function armAntigravityCotForTurn(): void {
   if (!cid) {
     const pid = (backend as { cliPid?: number } | null)?.cliPid ?? backend?.getChildPid?.();
     const effectivePid = pid ? (findLaunchedCliPid(pid, 'antigravity') ?? pid) : undefined;
-    cid = findAntigravityConversationId({ pid: effectivePid, cwd: lastInitConfig?.workingDir }) ?? undefined;
+    cid = effectivePid ? (findAntigravityConversationIdByPid(effectivePid) ?? undefined) : undefined;
   }
   if (!cid) return;
   persistCliSessionId(cid);
@@ -11707,8 +11717,12 @@ function observeAntigravityCliSessionId(pid: number, label = 'spawn'): void {
     if (currentPid && currentPid !== pid) return;
 
     const realPid = findLaunchedCliPid(pid, 'antigravity') ?? pid;
-    const cid = findAntigravityConversationId({ pid: realPid, cwd: lastInitConfig?.workingDir });
+    const cid = findAntigravityConversationIdByPid(realPid);
     if (cid) {
+      if (lastSpawnEffectiveResume && lastSpawnEffectiveCliSessionId && lastSpawnEffectiveCliSessionId !== cid) {
+        log(`Observed Antigravity conversationId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}) but kept existing resume target ${lastSpawnEffectiveCliSessionId}`);
+        return;
+      }
       persistCliSessionId(cid);
       log(`Observed Antigravity conversationId via pid ${realPid}${realPid === pid ? '' : ` (launcher ${pid})`} (${label}): ${cid}`);
       ensureAntigravityCotReader(cid);

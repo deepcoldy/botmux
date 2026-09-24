@@ -157,4 +157,82 @@ describe('antigravity-cot', () => {
 
     stopAntigravityCot('conv-1234');
   });
+
+  it('ignores SYSTEM:CHECKPOINT and SYSTEM:SYSTEM_MESSAGE and does not desync pendingTools', () => {
+    const pending: Array<{ id: string; name: string }> = [];
+
+    // 1. Planner response with a tool call
+    const planRes = extractAntigravityCotEntriesFromRecord(
+      {
+        step_index: 1,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        tool_calls: [{ id: 'call_cmd_1', name: 'run_command', args: { CommandLine: 'ls' } }],
+      },
+      pending,
+    );
+    expect(planRes.length).toBe(1);
+    expect(planRes[0].kind).toBe('tool_call');
+    expect(pending).toEqual([{ id: 'call_cmd_1', name: 'run_command' }]);
+
+    // 2. Intermediate checkpoint record
+    const cpRes = extractAntigravityCotEntriesFromRecord(
+      {
+        step_index: 2,
+        source: 'SYSTEM',
+        type: 'CHECKPOINT',
+        content: 'internal checkpoint state json',
+      },
+      pending,
+    );
+    expect(cpRes).toEqual([]);
+    // pendingTools must NOT be consumed!
+    expect(pending).toEqual([{ id: 'call_cmd_1', name: 'run_command' }]);
+
+    // 3. Intermediate system message record
+    const sysRes = extractAntigravityCotEntriesFromRecord(
+      {
+        step_index: 3,
+        source: 'SYSTEM',
+        type: 'SYSTEM_MESSAGE',
+        content: 'Background task finished',
+      },
+      pending,
+    );
+    expect(sysRes).toEqual([]);
+    expect(pending).toEqual([{ id: 'call_cmd_1', name: 'run_command' }]);
+
+    // 4. Actual tool result arrives: must bind to call_cmd_1
+    const resultRes = extractAntigravityCotEntriesFromRecord(
+      {
+        step_index: 4,
+        source: 'MODEL',
+        type: 'GENERIC',
+        content: 'file1.txt\nfile2.txt',
+      },
+      pending,
+    );
+    expect(resultRes).toEqual([
+      {
+        kind: 'tool_result',
+        id: 'call_cmd_1',
+        result: 'file1.txt\nfile2.txt',
+      },
+    ]);
+    expect(pending.length).toBe(0);
+  });
+
+  it('resets pendingTools when a new user input record arrives', () => {
+    const pending: Array<{ id: string; name: string }> = [{ id: 'stale_call', name: 'old_tool' }];
+    const res = extractAntigravityCotEntriesFromRecord(
+      {
+        source: 'USER_EXPLICIT',
+        type: 'USER_INPUT',
+        content: 'next turn instruction',
+      },
+      pending,
+    );
+    expect(res).toEqual([]);
+    expect(pending.length).toBe(0);
+  });
 });
