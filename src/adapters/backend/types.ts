@@ -9,7 +9,9 @@ export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff' |
  * untouched on restore/close paths that run without a live worker.
  */
 export type PersistentBackendTarget =
-  | { backendType: 'tmux' | 'zellij' | 'zmx'; sessionName: string }
+  | { backendType: 'tmux' | 'zellij'; sessionName: string }
+  // New ZMX targets freeze the native socket directory; older rows may omit it.
+  | { backendType: 'zmx'; sessionName: string; socketDir?: string }
   | { backendType: 'herdr'; sessionName: string; agentName?: string };
 
 /**
@@ -49,6 +51,13 @@ export interface SpawnOpts {
    * Ignored by the pty backend (no shell wrapper).
    */
   launchShell?: string;
+  /**
+   * CLI executable resolved before any launch wrapper (session scope,
+   * wrapperCli, or sandbox). Identity hint for Herdr's managed-agent kind and
+   * PATH launcher only; `bin`/`args` remain the full command to execute.
+   * Backends that execute `bin` directly (pty/tmux/zellij/zmx) ignore it.
+   */
+  cliBin?: string;
 }
 
 export type AmbiguousSubmissionRecoveryFailure =

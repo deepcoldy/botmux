@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readlinkSync } from 'node:fs';
+import { basename } from 'node:path';
 import { loopbackFetchImpl } from '../core/loopback-fetch.js';
 
 export const CURRENT_ACTOR_SCHEMA = 'botmux.current-actor.v2' as const;
@@ -15,6 +16,9 @@ export interface CurrentActorDocument {
 export interface ResolveCurrentActorOptions {
   ipcPort: number;
   sessionId: string;
+  /** When set, the daemon must also prove this exact scheduled turn remains
+   *  registered as in-flight before returning the actor document. */
+  expectedScheduledTurnId?: string;
   fetchImpl?: typeof fetch;
 }
 
@@ -81,6 +85,31 @@ function processEnvironment(pid: number, procRoot: string): Record<string, strin
   } catch { return undefined; }
 }
 
+/**
+ * A pane process is parented by the long-lived tmux server, not by the tmux
+ * client that created the session. The server's kernel-held environment is a
+ * launch-time snapshot: `tmux set-environment -gu` can scrub tmux's global
+ * table, but cannot rewrite `/proc/<server>/environ`. Treat the real server as
+ * a lineage boundary so stale routing from an older BotMux session is neither
+ * trusted nor compared with the current pane's fresh routing.
+ *
+ * Require both the kernel process name and executable basename. A process that
+ * merely changes argv/comm to look like tmux must not truncate attestation.
+ */
+function isTmuxServerProcess(pid: number, procRoot: string): boolean {
+  try {
+    const raw = readFileSync(`${procRoot}/${pid}/stat`, 'utf8');
+    const openParen = raw.indexOf('(');
+    const closeParen = raw.lastIndexOf(')');
+    if (openParen < 0 || closeParen <= openParen
+      || raw.slice(openParen + 1, closeParen) !== 'tmux: server') return false;
+    const executable = basename(readlinkSync(`${procRoot}/${pid}/exe`)).replace(/ \(deleted\)$/, '');
+    return executable === 'tmux';
+  } catch {
+    return false;
+  }
+}
+
 /** Read routing only from an already-running BotMux CLI ancestor. A child can
  * mutate its own env but cannot rewrite its parent's kernel-held environment. */
 export function resolveBotmuxAncestorContext(
@@ -93,32 +122,43 @@ export function resolveBotmuxAncestorContext(
   const contexts: BotmuxAncestorContext[] = [];
   let pid = startPid;
   for (let depth = 0; depth < 32 && pid > 1; depth++) {
+    if (isTmuxServerProcess(pid, procRoot)) break;
     const env = processEnvironment(pid, procRoot);
     if (!env) throw new CurrentActorError('current actor ancestor attestation failed');
     if (env.BOTMUX === '1') {
       const ipcPort = Number(env.BOTMUX_DAEMON_IPC_PORT);
-      if (!env.BOTMUX_SESSION_ID || !env.BOTMUX_LARK_APP_ID?.startsWith('cli_')
-        || !Number.isSafeInteger(ipcPort) || ipcPort < 1 || ipcPort > 65_535) {
-        throw new CurrentActorError('current actor ancestor attestation failed');
+      // Codex RPC tool shells intentionally inherit only a narrow BotMux env
+      // (normally BOTMUX_SESSION_ID). They are descendants, not routing
+      // authorities; keep walking until a complete worker/engine context is
+      // found. The daemon endpoint still proves the live CLI process and turn.
+      if (env.BOTMUX_SESSION_ID && env.BOTMUX_LARK_APP_ID?.startsWith('cli_')
+        && Number.isSafeInteger(ipcPort) && ipcPort >= 1 && ipcPort <= 65_535) {
+        contexts.push({
+          sessionId: env.BOTMUX_SESSION_ID,
+          larkAppId: env.BOTMUX_LARK_APP_ID,
+          ipcPort,
+        });
       }
-      contexts.push({
-        sessionId: env.BOTMUX_SESSION_ID,
-        larkAppId: env.BOTMUX_LARK_APP_ID,
-        ipcPort,
-      });
     }
     const parent = parentPid(pid, procRoot);
     if (!parent) break;
     pid = parent;
   }
-  if (contexts.length === 0 || contexts.some(context => (
-    context.sessionId !== contexts[0].sessionId
-    || context.larkAppId !== contexts[0].larkAppId
-    || context.ipcPort !== contexts[0].ipcPort
+  if (contexts.length === 0) {
+    throw new CurrentActorError('current actor ancestor attestation failed');
+  }
+  const nearest = contexts[0];
+  const sameSession = contexts.filter(context => context.sessionId === nearest.sessionId);
+  if (sameSession.some(context => (
+    context.larkAppId !== nearest.larkAppId
+    || context.ipcPort !== nearest.ipcPort
   ))) {
     throw new CurrentActorError('current actor ancestor attestation failed');
   }
-  return contexts[0];
+  // A daemon restarted from another managed session can legitimately retain
+  // that outer session id above the current worker. Select the nearest complete
+  // session; resolveCurrentActor then binds it to the live process marker.
+  return nearest;
 }
 
 function isCurrentActorDocument(value: unknown): value is CurrentActorDocument {
@@ -157,7 +197,12 @@ export async function resolveCurrentActor(
       {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sessionId: options.sessionId }),
+        body: JSON.stringify({
+          sessionId: options.sessionId,
+          ...(options.expectedScheduledTurnId
+            ? { expectedScheduledTurnId: options.expectedScheduledTurnId }
+            : {}),
+        }),
         signal: AbortSignal.timeout(5_000),
       },
     );

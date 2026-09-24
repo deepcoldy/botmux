@@ -1,0 +1,100 @@
+name: Request one code owner
+
+# CODEOWNERS 的原生行为：`*` 下每个 owner 在 PR 打开时都会被自动请求 review
+# （通知全员），但分支保护要求的 code-owner 批准本来就只需其中任意一人。
+# 本 workflow 在 PR 打开 / draft 转 ready 后，把自动请求名单收敛为一人：
+# 按 PR 编号对「owner 池（剔除 PR 作者）」取模——无状态、相邻 PR 均匀分散、
+# 结果可预测。CODEOWNERS 后续增删 owner 时本文件无需改动（名单实时读取）。
+#
+# 为什么用 pull_request_target：外部贡献者的 PR 来自 fork，只有
+# pull_request_target 拿到的 GITHUB_TOKEN 才有 pull-requests: write 去改
+# reviewer。因此本 job 严禁 checkout PR 代码——CODEOWNERS 一律经 API 从
+# 默认分支读取，脚本本身也固定来自 master，不执行任何 PR 侧内容。
+#
+# 合规性：删除多余 review request 只影响通知，不影响分支保护——required
+# code-owner review 校验的是「最终批准者是否为匹配的 code owner」，与请求
+# 名单无关；未被请求的 owner 仍可主动 review 并满足规则。
+#
+# 已知限制：PR 创建瞬间 GitHub 仍会先向全员发一次请求通知，本 workflow
+# 只能在其后秒级修剪（没有任何 API 能阻止首次自动请求）；最终 PR 页面与
+# 后续 re-request / reminder 只针对选中的一人。
+
+on:
+  pull_request_target:
+    types: [opened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: request-one-codeowner-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  assign:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          # 逗号分隔；这些账号永不参与自动轮询（仍是 code owner，可主动 review）。
+          EXCLUDE_REVIEWERS: ''
+        with:
+          script: |
+            const exclude = (process.env.EXCLUDE_REVIEWERS || '')
+              .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+            const { owner, repo } = context.repo;
+            const prNumber = context.payload.pull_request.number;
+            const author = context.payload.pull_request.user.login.toLowerCase();
+
+            // 1) 从默认分支读 CODEOWNERS（不 checkout、不触碰 PR 侧任何内容）。
+            const file = await github.rest.repos.getContent({
+              owner, repo, path: '.github/CODEOWNERS',
+            });
+            const text = Buffer.from(file.data.content, 'base64').toString('utf8');
+            const owners = [...new Set(
+              text.split('\n')
+                .map(line => line.trim())
+                .filter(line => line && !line.startsWith('#'))
+                .flatMap(line => line.match(/@[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)?/g) || [])
+                .map(token => token.slice(1))
+            )];
+            // 个人仓无 team；带 "/" 的是 org/team，走 teams 接口，这里不动它。
+            const userOwners = owners.filter(name => !name.includes('/'));
+            const pool = userOwners.filter(name =>
+              !exclude.includes(name.toLowerCase()) && name.toLowerCase() !== author);
+
+            if (pool.length === 0) {
+              console.log('No eligible code owners (owners=%j, author=%s, exclude=%j)',
+                userOwners, author, exclude);
+              return;
+            }
+
+            // 2) PR 编号取模：无状态轮询。
+            const chosen = pool[prNumber % pool.length];
+            console.log('Owners=%j author=%s -> chosen=%s', userOwners, author, chosen);
+
+            // 3) 只修剪 CODEOWNERS 成员中的多余请求，手动请求的外部 reviewer 不动。
+            const requested = await github.rest.pulls.listRequestedReviewers({
+              owner, repo, pull_number: prNumber,
+            });
+            const requestedUsers = requested.data.users.map(u => u.login);
+            const lowerChosen = chosen.toLowerCase();
+            const toRemove = requestedUsers.filter(login =>
+              userOwners.some(o => o.toLowerCase() === login.toLowerCase()) &&
+              login.toLowerCase() !== lowerChosen);
+
+            if (toRemove.length > 0) {
+              await github.rest.pulls.removeRequestedReviewers({
+                owner, repo, pull_number: prNumber, reviewers: toRemove,
+              });
+              console.log('Removed reviewer requests: %j', toRemove);
+            }
+            if (!requestedUsers.some(login => login.toLowerCase() === lowerChosen)) {
+              await github.rest.pulls.requestReviewers({
+                owner, repo, pull_number: prNumber, reviewers: [chosen],
+              });
+              console.log('Requested reviewer: %s', chosen);
+            }

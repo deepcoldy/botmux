@@ -39,8 +39,9 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { botmuxShimExecLine, botmuxCliInvocation, prepareDirectSandbox } from '../src/adapters/backend/sandbox.js';
+import { isAbsolute, join } from 'node:path';
+import { botmuxShimExecLine, botmuxCliInvocation, prepareDirectSandbox, probeHostCredentialIsolationMechanism } from '../src/adapters/backend/sandbox.js';
+import { stripComments } from './helpers/bun-leg-selectors.js';
 
 const REAL_ARGV1 = process.argv[1];
 function asCompiledBinary() { process.argv[1] = '/$bunfs/root/cli.js'; }
@@ -97,21 +98,30 @@ describe('sandbox botmux shim — compiled binary form', () => {
   });
 });
 
-describe('sandbox botmux shim — Node form unchanged', () => {
-  it('keeps `exec node <dist/cli.js>` (verified byte-identical to pre-change)', () => {
+describe('sandbox botmux shim — Node form pins the interpreter', () => {
+  it('execs an ABSOLUTE interpreter + <dist/cli.js>, never a bare `node`', () => {
     const shim = botmuxShimExecLine();
-    expect(shim.startsWith('#!/bin/sh\nexec node "')).toBe(true);
+    // A bare name would be resolved by the in-sandbox PATH, whose tail is the host
+    // PATH and can name a different Node than the daemon runs on. MEASURED
+    // (2026-09-08): `node dist/cli.js send --help` on v18.20.4 exits 1 at the
+    // session store's SQLite gate, so in-sandbox `botmux send` fails outright.
+    expect(shim).not.toMatch(/exec node /);
+    const m = /^exec (".*?") (".*?") "\$@"$/m.exec(shim);
+    expect(m).not.toBeNull();
+    expect(isAbsolute(JSON.parse(m![1]))).toBe(true);
+    expect(JSON.parse(m![1])).toBe(process.execPath);
     expect(shim).toMatch(/[/\\]cli\.js" "\$@"\n$/);
     expect(shim).not.toContain('$bunfs');
   });
 
-  it('quotes the script path so a directory with spaces still works', () => {
+  it('quotes both paths so a directory with spaces still works', () => {
     // JSON.stringify is the quoting mechanism; assert the observable property
     // rather than the implementation.
     const shim = botmuxShimExecLine();
-    const m = /exec node (".*?") "\$@"/.exec(shim);
+    const m = /exec (".*?") (".*?") "\$@"/.exec(shim);
     expect(m).not.toBeNull();
     expect(() => JSON.parse(m![1])).not.toThrow();
+    expect(() => JSON.parse(m![2])).not.toThrow();
   });
 });
 
@@ -179,7 +189,16 @@ describe('relay host re-exec — botmuxCliInvocation', () => {
  * stand-in binary at a DIFFERENT path — i.e. it only ever exercised the npm
  * layout, where the launcher and the platform binary are separate files.
  */
-describe('sandbox shim overlay — install.sh layout (shim path === exec target)', () => {
+// prepareDirectSandbox returns null off Linux (bwrap DIRECT mode), so on macOS
+// every overlayTargets() call is vacuously [] — the "skips" case passes for the
+// wrong reason and the "still overlays" case can only fail. Linux-only by design.
+const bwrapUsable = probeHostCredentialIsolationMechanism().mechanism === 'bwrap';
+// Also skip on a Linux runner whose unprivileged userns/bwrap is unavailable
+// (GitHub hosted runners can stay `bwrap --unshare-user`-broken even after the
+// workflow relaxes apparmor): prepareDirectSandbox then returns null and the
+// "still overlays" cases would fail instead of skip. Uses the SAME production
+// probe as plugin-mcp-sandbox.test.ts / session-store-bwrap.test.ts.
+describe.skipIf(process.platform !== 'linux' || !bwrapUsable)('sandbox shim overlay — install.sh layout (shim path === exec target)', () => {
   function overlayTargets(trusted: string): string[] {
     const root = mkdtempSync(join(tmpdir(), 'sbx-overlay-'));
     const proj = join(root, 'proj');
@@ -221,5 +240,47 @@ describe('sandbox shim overlay — install.sh layout (shim path === exec target)
     writeFileSync(launcher, '#!/bin/sh\nexec /somewhere/botmux "$@"\n', { mode: 0o755 });
     chmodSync(launcher, 0o755);
     expect(overlayTargets(launcher)).toEqual([launcher]);
+  });
+
+  it('still overlays the stable main wrapper path so gateway/default botmux keeps relay mode', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sbx-stable-wrapper-'));
+    const stable = join(dir, 'botmux');
+    writeFileSync(stable, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    chmodSync(stable, 0o755);
+    expect(overlayTargets(stable)).toEqual([stable]);
+  });
+
+  it('still overlays the dedicated native hook wrapper if someone explicitly trusts that path', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sbx-native-hook-wrapper-'));
+    const stable = join(dir, 'botmux');
+    const nativeHook = join(dir, 'botmux-native-subagent-runtime-hook');
+    writeFileSync(stable, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    writeFileSync(nativeHook, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    chmodSync(stable, 0o755);
+    chmodSync(nativeHook, 0o755);
+    expect(overlayTargets(nativeHook)).toEqual([nativeHook]);
+  });
+
+  it('still overlays a separate configured gateway launcher', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sbx-gateway-wrapper-'));
+    const stable = join(dir, 'stable-botmux');
+    const gateway = join(dir, 'configured-gateway');
+    writeFileSync(stable, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    writeFileSync(gateway, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    chmodSync(stable, 0o755);
+    chmodSync(gateway, 0o755);
+    expect(overlayTargets(gateway)).toEqual([gateway]);
+  });
+
+  it('SOURCE PIN: worker trusts exactly the default gateway entry, not the dedicated native hook wrapper', () => {
+    const src = stripComments(readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf-8'));
+    const callStart = src.indexOf('const sbx = prepareDirectSandbox({');
+    expect(callStart).toBeGreaterThanOrEqual(0);
+    const callEnd = src.indexOf('      });', callStart);
+    expect(callEnd).toBeGreaterThan(callStart);
+    const callRegion = stripComments(src.slice(callStart, callEnd));
+    expect(callRegion).toContain('trustedBotmuxCommandPaths: [defaultGatewayEntry().command],');
+    expect(callRegion).not.toContain('resolveNativeSubagentRuntimeHookWrapperPath');
+    expect(callRegion).not.toContain('botmux-native-subagent-runtime-hook');
   });
 });

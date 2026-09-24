@@ -79,6 +79,7 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
       // Added by upstream #821; shares ~/.config/opencode/skills with opencode,
       // so the shared-root dedup below covers it.
       opencode2: 'global',
+      mimocode: 'global',
       pi: 'global', 'oh-my-pi': 'global', grok: 'global', 'kiro-cli': 'global',
       reasonix: 'global', mojo: 'global',
       // no skill mechanism at all
@@ -88,6 +89,9 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
       // PTY-driven TUI variant of dsh; no skills dir of its own.
       'dsh-tui': 'none',
       mira: 'none', mir: 'none', copilot: 'none', kimi: 'none', riff: 'none',
+      // minimax: `mmx text repl` is a tool-less chat loop (no shell/file
+      // surface, no skillsDir); classifier sees no skillsDir / pluginDir → 'none'.
+      minimax: 'none',
     };
     // Two-way key equality. `Record<CliId, …>` looks like tsc enforces
     // exhaustiveness, but this file lives in test/ and tsconfig only includes

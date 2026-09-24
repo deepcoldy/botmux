@@ -581,23 +581,30 @@ describe('worker structured-turn status wiring', () => {
     expect(channel).not.toContain('spawnArgvNeedsWorkingSeed =');
   });
 
-  it('suppresses the markPromptReady generic idle snapshot while the Grok-class busy arm is pending', () => {
+  it('suppresses the markPromptReady generic idle snapshot while the Grok-class busy arm or a background task is pending', () => {
     const body = functionSlice('markPromptReady', 'persistCliSessionId');
     // The "immediate idle snapshot" fires before the seed consumes
     // spawnArgvInitialPromptBusy. For a Grok-class pre-execution ready edge that
     // generic snapshot projects idle (isPromptReady just went true) and would reach
     // the daemon BEFORE the busy arm re-publishes working — combined with the
     // first-turn publisher's working, that working→idle fires a premature DONE. The
-    // snapshot must be gated on !spawnArgvInitialPromptBusy so no idle escapes.
+    // same escape exists while a background sub-agent is still in flight (the
+    // bg-pending arm below owns that path's working publish), so the snapshot must
+    // be gated on both !spawnArgvInitialPromptBusy and pending()===0.
     const idleSnapshot = body.indexOf('Send immediate idle snapshot');
-    const guardedSend = body.indexOf('renderer && !spawnArgvInitialPromptBusy && pendingMessages.length === 0', idleSnapshot);
+    const guardedSend = body.indexOf('renderer && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pending() === 0 && pendingMessages.length === 0', idleSnapshot);
     expect(idleSnapshot).toBeGreaterThanOrEqual(0);
     expect(guardedSend).toBeGreaterThan(idleSnapshot);
-    // The busy arm below still owns the working publish for this path.
+    // The busy arm below still owns the working publish for the Grok-class path.
     const busyArm = body.indexOf('if (spawnArgvInitialPromptBusy) {', guardedSend);
     const armWorking = body.indexOf("publishScreenStatus('working', { force: true })", busyArm);
     expect(busyArm).toBeGreaterThan(guardedSend);
     expect(armWorking).toBeGreaterThan(busyArm);
+    // The background-task arm owns the working publish for the bg-pending path.
+    const bgArm = body.indexOf('} else if (backgroundTaskTracker.pending() > 0) {', busyArm);
+    const bgWorking = body.indexOf("publishScreenStatus('working')", bgArm);
+    expect(bgArm).toBeGreaterThan(busyArm);
+    expect(bgWorking).toBeGreaterThan(bgArm);
   });
 
 

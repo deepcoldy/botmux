@@ -30,6 +30,7 @@ vi.mock('../src/bot-registry.js', () => ({
   getBotOpenId: () => BOT_OPEN_ID,
   // logger / client import graph. Bun's mock is the whole module.
   getLoadedConfigPath: () => undefined,
+  loadBotConfigs: () => [],
   getBot: () => undefined,
   getAllBots: () => [],
   getBotClient: () => undefined,

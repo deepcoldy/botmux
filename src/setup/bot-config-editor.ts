@@ -4,6 +4,11 @@ import {
   type CliRuntimeConfig,
 } from '../adapters/cli/runtime.js';
 import { sanitizePerBotEnv } from '../core/per-bot-env.js';
+import {
+  normalizeCliLaunchMode,
+  validateCliLaunchModeConfig,
+  type CliLaunchMode,
+} from '../core/cli-launch-mode.js';
 
 export const CLI_ID_CHOICES: Record<string, CliId> = {
   '1': 'claude-code',
@@ -42,6 +47,11 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   // （25→reasonix、26→opencode2、27→dsh）。
   '28': 'mojo',
   '29': 'ebsd',
+  // minimax 的 '30' 已随 v3.21.0 正式发布，序号不能移位。
+  '30': 'minimax',
+  // 新增 CLI 一律追加到尾部：序号是脚本化 setup（非 TTY 管道喂数字）的稳定接口，
+  // 插位会让老脚本静默选错 CLI。
+  '31': 'mimocode',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -61,6 +71,7 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
   'genius': 'Genius',
   'opencode': 'OpenCode',
   'opencode2': 'OpenCode 2',
+  'mimocode': 'MiMoCode',
   'antigravity': 'Antigravity',
   'mtr': 'MTR',
   'hermes': 'Hermes',
@@ -82,6 +93,7 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
   'dsh': 'DeepSeek Harness',
   'dsh-tui': 'DeepSeek Harness TUI',
   'mojo': 'Mojo',
+  'minimax': 'MiniMax',
 };
 
 /**
@@ -223,6 +235,13 @@ export interface BotConfigEditInput {
    * 避免 bot-config-editor 反向依赖 cli-selection（会成循环 import）。
    */
   wrapperCli?: string | null;
+  /**
+   * 特殊启动模式（如 Forge x TraeX）。三态：
+   *   - undefined → 不动
+   *   - 'forge-traex' → 设置
+   *   - null → 清空
+   */
+  cliLaunchMode?: CliLaunchMode | null;
   /**
    * Model 字段三态语义（setup 不再交互式询问 model，此字段仅由切换 CLI 时的
    * 强制清空逻辑设 null；改 model 走 /config 卡片或手动编辑 bots.json）：
@@ -438,7 +457,8 @@ export function parseBotSelection(
  *    chat_id 是租户级共享的，把它们带进新应用既无意义（多为死条目），又会
  *    产生意外行为——例如 `oncallChats` 让新 Bot 在源绑定过的群里直接被
  *    talk + 自动开工，`defaultOncallAutoboundChats` 则相反，会让该群的自动
- *    绑定被误判成「已花掉」而不触发。
+ *    绑定被误判成「已花掉」而不触发。`quotaFallbackBot` 也是源 Bot 的交接
+ *    拓扑；复制到目标 Bot 可能变成自指或错误链路，必须由目标单独配置。
  *
  * 单一真源：回归测试直接 import 本常量，避免测试再抄一份清单后与实现漂移
  * （新增实例态字段时两边都不报警）。新增此类字段请加在这里。
@@ -448,6 +468,8 @@ export const CLONE_EXCLUDED_KEYS = [
   'name',
   'displayName',
   'messageListeners',
+  'globalMessageListener',
+  'groupMessageListenerOverrides',
   'oncallChats',
   'defaultOncallAutoboundChats',
   'allowedChatGroups',
@@ -459,6 +481,7 @@ export const CLONE_EXCLUDED_KEYS = [
   'chatReplyModes',
   'chatFeedbackPolicies',
   'noCardChats',
+  'quotaFallbackBot',
   'activationPending',
   'activationDeactivating',
   'activationStarting',
@@ -476,6 +499,13 @@ export const CLONE_IDENTITY_KEYS = [
   'brand',
   'allowedUsers',
   'ownerOpenId',
+] as const;
+
+const CLONE_LAUNCH_MODE_KEYS = [
+  'wrapperCli',
+  'cliLaunchMode',
+  'cliRuntime',
+  'cliPathOverride',
 ] as const;
 
 /**
@@ -498,6 +528,10 @@ export function cloneBotConfig(
     } else {
       delete cloned[key];
     }
+  }
+
+  for (const key of CLONE_LAUNCH_MODE_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(source, key)) delete cloned[key];
   }
 
   return cloned;
@@ -603,11 +637,39 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
   } else if (typeof input.wrapperCli === 'string') {
     const v = input.wrapperCli.trim();
     if (!v || v === '-') delete out.wrapperCli;
-    else out.wrapperCli = v;
+    else {
+      out.wrapperCli = v;
+      delete out.cliLaunchMode;
+    }
+  }
+
+  if (input.cliLaunchMode === null) {
+    delete out.cliLaunchMode;
+  } else if (input.cliLaunchMode !== undefined) {
+    const mode = normalizeCliLaunchMode(input.cliLaunchMode);
+    if (mode) {
+      out.cliLaunchMode = mode;
+      delete out.wrapperCli;
+      if (input.cliRuntime === null && !cliPathOverrideEdited) {
+        delete out.cliPathOverride;
+      }
+    }
   }
   if (out.cliRuntime && out.wrapperCli) {
     throw new Error('cliRuntime cannot be combined with wrapperCli');
   }
+  if (out.cliLaunchMode !== undefined) {
+    out.cliLaunchMode = normalizeCliLaunchMode(out.cliLaunchMode);
+  }
+  validateCliLaunchModeConfig({
+    cliId: out.cliId,
+    cliLaunchMode: out.cliLaunchMode,
+    wrapperCli: out.wrapperCli,
+    cliRuntime: out.cliRuntime,
+    cliPathOverride: out.cliPathOverride,
+    sandbox: out.sandbox,
+    readIsolation: out.readIsolation,
+  });
 
   // Model 字段：null = 清空，string = 设置，undefined = 不动。
   if (input.model === null) {

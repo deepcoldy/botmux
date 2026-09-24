@@ -1,4 +1,5 @@
 import * as Lark from '@larksuiteoapi/node-sdk';
+import { normalizeCodexInstancePool, registerCodexInstanceBot, clearCodexInstanceBots, validateCodexInstanceRoster } from './services/codex-instance-pool.js';
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { underReadIsolation } from './adapters/cli/read-isolation.js';
@@ -10,12 +11,20 @@ import {
   normalizeCliRuntimeConfig,
   type CliRuntimeConfig,
 } from './adapters/cli/runtime.js';
+import {
+  normalizeCliLaunchMode,
+  validateCliLaunchModeConfig,
+  type CliLaunchMode,
+} from './core/cli-launch-mode.js';
 import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
+import { normalizeGroupSerialInput } from './core/group-serial-input.js';
+import { normalizeGroupDefaultModels, type GroupDefaultModels } from './core/group-default-models.js';
 import type { PricingOverrides } from './services/model-pricing.js';
 import type { BudgetConfig } from './services/budget-tracker.js';
 import { normalizePricingOverrides } from './services/model-pricing.js';
+import { parseTriggerUserAuthConfig } from './services/trigger-user-auth.js';
 import { parseBudgetConfig } from './services/budget-tracker.js';
 import { type Brand, sdkDomain, normalizeBrand } from './im/lark/lark-hosts.js';
 import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
@@ -37,17 +46,27 @@ import {
   type CodexBrowserConfig,
 } from './core/codex-browser-config.js';
 import type { FeedbackPolicy, FeedbackPolicyInput } from './services/feedback-policy.js';
+import { normalizeOncallGroupPolicy, type OncallGroupPolicy } from './services/oncall-group-policy.js';
 import { normalizeFeedbackPolicyLayer } from './services/feedback-policy-resolver.js';
 import type { FeedbackWebhookDestination } from './services/feedback-outbox.js';
 import {
   normalizeReplyStyleConfig,
   type ReplyStyleConfig,
 } from './im/lark/reply-card-style.js';
-import { cliModelSupportsReasoningEffort, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
+import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
+import {
+  normalizeNativeSubagentRuntimePolicy,
+  type NativeSubagentRuntimePolicy,
+} from './services/native-subagent-runtime-policy.js';
 import {
   normalizeSessionOwnerReminderConfig,
   type SessionOwnerReminderConfig,
 } from './core/session-owner-reminder.js';
+import {
+  findQuotaFallbackCycles,
+  normalizeQuotaFallbackBotConfig,
+  type QuotaFallbackBotConfig,
+} from './services/quota-fallback.js';
 import { normalizeCardActionAckTimeoutMs } from './core/card-action-ack.js';
 import type {
   VcMeetingConsumerAgentConfig,
@@ -56,6 +75,10 @@ import type {
   VcMeetingConsumerProfileConfig,
 } from './types.js';
 import type { VcMeetingActivityType } from './vc-agent/types.js';
+import {
+  normalizeHiddenStreamingCardButtons,
+  type StreamingCardButtonId,
+} from './im/lark/streaming-card-buttons.js';
 
 /**
  * Thrown when any Feishu client is requested for a core-only (`apiOnly`) bot.
@@ -244,12 +267,17 @@ export interface MessageListenerConfig {
     matchMode?: 'any' | 'all';
   };
   replyPolicy?: {
-    /** V1 always replies under the triggering message. */
-    mode?: 'thread';
+    /** `thread` replies under the triggering message; `chat` posts at group top level. */
+    mode?: 'thread' | 'chat';
     /** V1 starts one session per matched message. */
     sessionMode?: 'per_message';
   };
 }
+
+/** A group may opt out of its bot's default listener or replace it entirely. */
+export type GroupMessageListenerOverride =
+  | { mode: 'disabled' }
+  | { mode: 'custom'; listener: MessageListenerConfig };
 
 /**
  * 免@ 斜杠命令：普通群里旁人直接发一条配置内的命令（如 `/solve`，未 @ 任何 bot）
@@ -1146,7 +1174,12 @@ function normalizeMessageListenerConfig(raw: unknown, botIndex: number, chatId: 
     ...(Object.keys(senderPolicy).length > 0 ? { senderPolicy } : {}),
     ...(Object.keys(messagePolicy).length > 0 ? { messagePolicy } : {}),
     ...(contentPolicy ? { contentPolicy } : {}),
-    replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+    replyPolicy: {
+      mode: entry.replyPolicy && typeof entry.replyPolicy === 'object' && (entry.replyPolicy as Record<string, unknown>).mode === 'chat'
+        ? 'chat'
+        : 'thread',
+      sessionMode: 'per_message',
+    },
   };
 }
 
@@ -1157,6 +1190,23 @@ function normalizeMessageListeners(raw: unknown, botIndex: number): Record<strin
     if (typeof chatId !== 'string' || !chatId.trim()) continue;
     const listener = normalizeMessageListenerConfig(listenerRaw, botIndex, chatId.trim());
     if (listener) out[chatId.trim()] = listener;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function normalizeGroupMessageListenerOverrides(raw: unknown, botIndex: number): Record<string, GroupMessageListenerOverride> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const out: Record<string, GroupMessageListenerOverride> = {};
+  for (const [chatId, overrideRaw] of Object.entries(raw as Record<string, unknown>)) {
+    if (!chatId.trim() || !overrideRaw || typeof overrideRaw !== 'object' || Array.isArray(overrideRaw)) continue;
+    const entry = overrideRaw as Record<string, unknown>;
+    if (entry.mode === 'disabled') {
+      out[chatId.trim()] = { mode: 'disabled' };
+      continue;
+    }
+    if (entry.mode !== 'custom') continue;
+    const listener = normalizeMessageListenerConfig(entry.listener, botIndex, chatId.trim());
+    if (listener) out[chatId.trim()] = { mode: 'custom', listener };
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }
@@ -1317,8 +1367,10 @@ export interface SessionGroupConfig {
    *   afterwards; works on any tenant — no tenant scope catalog involved.
    * 'chat-tag' — tenant chat tags (企业自定义群标签): a property of the GROUP
    *   itself, applied with the bot's own tenant token. Zero user OAuth; needs
-   *   the im:tag:write + im:biz_entity_tag_relation:write tenant scopes, which
-   *   some tenants' scope catalogs don't offer at all (hence not the default).
+   *   the im:tag:write + im:biz_entity_tag_relation:write tenant scopes —
+   *   a capability Feishu has not opened yet, so they are absent from the
+   *   scope catalog (verified on our tenant) and setup cannot even apply for
+   *   them (hence not the default). See services/feed-group-tagger.ts.
    * 'off' — no tagging.
    */
   tag?: {
@@ -1356,6 +1408,7 @@ export interface BotConfig {
   apiOnly?: boolean;
   /** Final-answer feedback policy. Missing/disabled is intentionally inert. */
   feedback?: FeedbackPolicyInput | FeedbackPolicy;
+  oncallGroup?: OncallGroupPolicy;
   /** Per-chat final-answer feedback overrides, scoped to this bot app id. */
   chatFeedbackPolicies?: Record<string, FeedbackPolicyInput>;
   feedbackWebhooks?: { destinations: FeedbackWebhookDestination[] };
@@ -1410,6 +1463,8 @@ export interface BotConfig {
    * `aiden x claude` 时自动剥掉 aiden 拒收的 --settings。见 src/setup/cli-selection.ts。
    */
   wrapperCli?: string;
+  /** Special launch mode layered above the adapter; currently Forge x TraeX. */
+  cliLaunchMode?: CliLaunchMode;
   /**
    * Per-bot launch-shell override for the persistent backends (tmux/zellij/zmx).
    * When set, botmux launches the CLI under this shell instead of the daemon's
@@ -1433,6 +1488,12 @@ export interface BotConfig {
    * `modelChoices` for the curated candidates surfaced in `botmux setup`.
    */
   model?: string;
+  /** Per-chat defaults captured only by newly created topics. */
+  groupDefaultModels?: Record<string, GroupDefaultModels>;
+  /** Explicit per-group FIFO for authenticated managed-session IM inputs. Default off; independent of Oncall. */
+  groupSerialInput?: Record<string, boolean>;
+  /** Optional TraeX backend variant. Missing inherits TraeX global config. */
+  modelBackendVariant?: 'standard' | 'max';
   /**
    * Per-bot dsh runner turn timeout in milliseconds. The dsh adapter forwards
    * it as `--turn-timeout-ms` to the runner, overriding the built-in 10-minute
@@ -1458,6 +1519,8 @@ export interface BotConfig {
   dshRuntime?: 'official' | 'tui';
   /** Default reasoning effort for newly created sessions on CLIs that support it. */
   reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  /** Native TraeCode spawn_agent model/effort override policy. */
+  nativeSubagentRuntime?: NativeSubagentRuntimePolicy;
   /**
    * If true, botmux does not add CLI-default approval/sandbox bypass flags
    * such as --yolo or --dangerously-*. Missing/false preserves legacy behavior.
@@ -1480,6 +1543,17 @@ export interface BotConfig {
    * 缺省/`off`：保持内联 envelope（历史行为）。从下一个 follow-up turn 生效。
    */
   envelopeInjection?: 'auto' | 'off';
+  /**
+   * 最终回复投递方式。`send`：模型必须自己执行 `botmux send` 把回复发到飞书，
+   * 系统提示与每轮 reminder 都这么要求。`transcript`：daemon 从 CLI 转写自动取
+   * 本轮最后的 assistant 文本发最终回复卡（即原来的 bridge fallback 升为主通道），
+   * 系统提示不再提及 `botmux send`、不再注入每轮 reminder；solo 会话（私聊 / 仅
+   * owner 的 1v1 群）还会去掉 `<user_message>` 壳与 `<sender/>`。只对有转写采集
+   * 的 CLI 有效（见 core/reply-delivery.ts），不支持的 CLI 运行时自动回落 send。
+   * 缺省为 `send`（`defaultReplyDeliveryFor`）；显式 `'send'` / `'transcript'`
+   * 都持久化。系统提示部分需 /restart 生效，逐轮信封立即生效。
+   */
+  replyDelivery?: 'send' | 'transcript';
   /**
    * Whether each forwarded turn carries a `<sender type=… open_id=… name=…
    * email=… />` tag naming who spoke. Default ON (ABSENT ⇒ ON — only an
@@ -1531,6 +1605,15 @@ export interface BotConfig {
    * CODEX_HOME and never reads or copies global auth, with or without sandbox.
    */
   codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode;
+  codexInstancePool?: import('./services/codex-instance-pool.js').CodexInstancePool;
+  /**
+   * Trigger-user CLI authentication. Missing → off; this bot's CLI calls keep
+   * using whatever identity is logged in on the machine. Enabled → `lark-cli` /
+   * `bytedcli` run as the person who sent the current message, and a sender who
+   * has not authorized gets the bot's own tenant identity (or a failure, per
+   * `fallback`) — never another person's login. See services/trigger-user-auth.ts.
+   */
+  triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig;
   /**
    * Run this bot's CLI inside a per-session file sandbox (unified three-tier
    * whitelist, deny-by-default; Linux bwrap + macOS Seatbelt with identical
@@ -1598,9 +1681,27 @@ export interface BotConfig {
    * sessions are never suspended. See core/idle-worker-sweeper.ts.
    */
   maxLiveWorkers?: number;
+  /**
+   * Per-bot idle session time-to-live, in MINUTES. A live session whose screen
+   * status has stayed continuously `idle` for this long is suspended
+   * automatically (worker + CLI killed to reclaim memory; the next message
+   * cold-resumes from transcript), independently of the {@link maxLiveWorkers}
+   * count cap. Unset / 0 / non-positive = TTL disabled (the default — idle
+   * sessions are never timed out, only the count cap can suspend them).
+   * Positive integer only. Adopted sessions and non-resumable backends
+   * (pty/riff/mojo) are never TTL-suspended. See core/idle-worker-sweeper.ts.
+   */
+  idleSuspendMinutes?: number;
   /** Periodically @ the persisted Session owner while selected actionable
    * runtime states remain unchanged. Missing means disabled. */
   sessionOwnerReminder?: SessionOwnerReminderConfig;
+  /**
+   * Optional daemon-side handoff when this bot's CLI enters a trusted usage or
+   * rate-limit state. The stable target App ID is resolved to a live,
+   * receiver-scoped mention handle at send time; no open_id is persisted here.
+   * Missing/invalid/disabled means no automatic handoff.
+   */
+  quotaFallbackBot?: QuotaFallbackBotConfig;
   /**
    * When true, THIS bot's daemon watches host load/memory and DMs the bot owner
    * when the machine crosses into (and back out of) an overloaded state — a
@@ -1618,6 +1719,20 @@ export interface BotConfig {
   workingDirs?: string[];
   allowedUsers?: string[];
   /**
+   * 黑名单（纯增量「否决腿」，与 allowedUsers 白名单独立）：原始条目形态与
+   * allowedUsers 完全一致（邮箱 / 手机号 / on_ / ou_ 混写），daemon 启动期复用
+   * 同一套 resolveAllowedUsersWithMap + sidecar 缓存解析成**本 app 视角**的
+   * open_id（resolvedBlockedUsers）。注意 `ou_` 与 allowedUsers 一样是
+   * app-scoped：只对本飞书应用有效，不能从别的 Bot 配置复制。
+   *
+   * 语义：命中黑名单的 sender 在 evaluateTalk 里于 allowedUser 命中腿**之后**、
+   * 其它所有放行腿（oncall / peer / team / grants / open …）**之前**被否决，
+   * canOperate 同腿；黑名单不进 dashboard owner 描述符。owner / 管理员
+   * （resolvedAllowedUsers）不可被拉黑——写入口 setBotBlockedUsers 有守卫，
+   * 判定顺序是双保险。空/缺省 = 不否决任何人。
+   */
+  blockedUsers?: string[];
+  /**
    * Owner's native app-scoped `open_id` (`ou_…`), captured at setup from the
    * device-flow scanner identity. UNLIKE `allowedUsers` (which may hold `on_`/
    * email entries needing a contact-API resolve every boot), this is stored raw
@@ -1625,7 +1740,9 @@ export interface BotConfig {
    *   1. a fail-safe DM recipient for allowedUsers-resolve failure notices, so
    *      the owner is reachable even when the resolve that would have produced
    *      their open_id is the very thing that failed (cold-start race);
-   *   2. an always-available owner anchor for runtime permission checks.
+   *   2. an explicit owner priority, but only while that identity is still
+   *      present in the resolved allowlist. Runtime permissions remain
+   *      fail-closed when the allowlist removes or cannot resolve this entry.
    * Optional: bots created before this field, or via paths without a scanner
    * identity, simply have none and fall back to the resolved allowlist.
    */
@@ -1665,6 +1782,10 @@ export interface BotConfig {
   defaultWorkingDirAutoWorktree?: boolean;
   /** Per-bot default: auto-bind every new group chat to oncall on first new-topic. */
   defaultOncall?: BotDefaultOncall;
+  /** Opt-in: accept app/chat-bound signed ambient defaults from a trusted creator. No grants. */
+  signedChatDefaults?: boolean;
+  /** Optional trusted HTTPS registry for private self-service room metadata. */
+  signedChatDefaultsRegistryUrl?: string;
   /**
    * Chat IDs that have ever been auto-bound by `defaultOncall`. Append-only.
    * Once a chat appears here, the default is permanently "spent" for it — even
@@ -1716,9 +1837,10 @@ export interface BotConfig {
    */
   acceptSlashFromBots?: boolean;
   /**
-   * 消息额度覆盖配置：
-   *   • 未配置（undefined）→ 卡片使用产品默认 3 条；oncall 不自动计数。
-   *   • 配置正整数 D    → 卡片默认 D 条，同时作为 oncall 默认额度。
+   * 消息额度覆盖配置 —— **只约束「授权卡 / 自助申请授权」放进来的访客**：
+   *   • 未配置（undefined）→ 卡片使用产品默认 3 条。
+   *   • 配置正整数 D    → 卡片默认 D 条。
+   * **Oncall 群恒不限额、不读本字段**（历史上读过，病史见 event-dispatcher.oncallTalk）。
    * 显式 `/grant @x N` 的 N **恒生效**，与本字段是否配置无关（见 {@link quotaState}）。
    * 仅约束 chatGrants / globalGrants 这类 per-user talk 授权，绝不影响 canOperate。
    */
@@ -1832,6 +1954,8 @@ export interface BotConfig {
    * `usageDisplay` set is read as `'off'` (see {@link resolveUsageDisplay}).
    */
   usageDisplay?: UsageDisplayMode;
+  /** Show per-turn waiting and native execution time on final reply cards. Default off. */
+  showReplyTiming?: boolean;
   tuiSlashAllow?: string[];
   /**
    * When true, suppress the live streaming session card entirely. The web
@@ -1840,6 +1964,10 @@ export interface BotConfig {
    * (undefined) keeps the streaming card. For users who find the live card noisy.
    */
   disableStreamingCard?: boolean;
+  /** Ordinary Claude Code/Codex replies. Absent preserves legacy delivery. */
+  replyCardMode?: import('./services/turn-reply-card.js').ReplyCardMode;
+  /** Main controls omitted from live streaming cards. Missing means show all. */
+  hiddenStreamingCardButtons?: StreamingCardButtonId[];
   /**
    * Pin the current public streaming card. Default false; best-effort only.
    */
@@ -1856,10 +1984,10 @@ export interface BotConfig {
    * Requires a transcript-backed CLI (claude-code and codex today); other
    * CLIs simply never emit the thinking channel. Per-chat opt-out via
    * {@link noCotChats} (`/cot off`).
-   */
-  thinkingCard?: boolean;
+  */
+  cotEnabled?: boolean;
   /** chat_id list: chats where the CoT (thinking process) message is suppressed
-   *  even when {@link thinkingCard} is on. Written by `/cot off|on`. */
+   *  even when {@link cotEnabled} is on. Written by `/cot off|on`. */
   noCotChats?: string[];
   /**
    * When true, suppress the lightweight GoGoGo → DONE message reactions used as
@@ -1962,10 +2090,25 @@ export interface BotConfig {
    */
   autoStartOnGroupJoinSeed?: string;
   /**
+   * 主动开工 — 入群执行命令开关。true 且 {@link groupJoinCommand} 非空时，bot 被拉进
+   * 任意群就直接执行该命令（不起 CLI 会话、不经 LLM），与 {@link autoStartOnGroupJoin}
+   * 互相独立、可同时开。不做 allowedUser 在群闸：命令本身由 bot 管理员配置，
+   * 典型场景是告警平台拉的应急群里人还没进来就要先跑诊断脚本。
+   */
+  groupJoinCommandEnabled?: boolean;
+  /**
+   * 主动开工 — 入群执行的命令。执行契约同 hooks.json（无 shell、按空白/引号切分参数、
+   * 最小 env 白名单）；stdin 是 JSON `{event:'chat.bot_added', larkAppId, chatId,
+   * operatorOpenId, emittedAt}`，另有 BOTMUX_JOIN_CHAT_ID / BOTMUX_JOIN_LARK_APP_ID /
+   * BOTMUX_JOIN_OPERATOR_OPEN_ID 环境变量；超时 10 分钟杀进程组。
+   */
+  groupJoinCommand?: string;
+  /**
    * 进群自动拉 owner。Default (undefined) = ON：本 bot 被加进任何群时，自动把
    * 自己的 owner（resolvedAllowedUsers 首个 ou_ 用户）拉进群——bot 应始终处于
    *  owner 可见的群里（不打黑工）。显式 false 关闭（如告警/oncall 类 bot 被
-   * 平台批量拉进大量事件群、不想打扰 owner 的场景）。仅 bots.json 文件配置。
+   * 平台批量拉进大量事件群、不想打扰 owner 的场景）。可在 Dashboard Bot
+   * Defaults 或飞书 /botconfig 配置；仅作用于被动入群，团队建群/federation 不读此开关。
    */
   autoInviteOwnerOnGroupAdd?: boolean;
   /**
@@ -1975,13 +2118,11 @@ export interface BotConfig {
    * Default (undefined) = passive.
    */
   autoStartOnNewTopic?: boolean;
-  /**
-   * Per-chat group message listener. Keyed by chat_id and bot-scoped so the
-   * dashboard can configure it from the Roles page's natural group × bot
-   * matrix. When enabled, the bot may react to non-@ top-level group messages
-   * after deterministic sender/msgType filtering. V1 always replies in a
-   * fresh thread under the triggering message.
-   */
+  /** Bot-wide default listener. It applies to every joined group without an override. */
+  globalMessageListener?: MessageListenerConfig;
+  /** Per-chat exceptions to {@link globalMessageListener}; an absent entry inherits. */
+  groupMessageListenerOverrides?: Record<string, GroupMessageListenerOverride>;
+  /** @deprecated Read-only compatibility shape; normalized as custom overrides. */
   messageListeners?: Record<string, MessageListenerConfig>;
   /**
    * 免@ 斜杠命令。per-bot 一份命令表 + 生效群范围（chats 空 = 所有群，
@@ -2093,6 +2234,10 @@ export interface BotConfig {
 
 export interface BotState {
   config: BotConfig;
+  /** In-memory parser outcome for nativeSubagentRuntime. Invalid persisted input
+   * is intentionally omitted from `config`, so this bounded marker is the only
+   * authoritative way to distinguish it from an absent policy after startup. */
+  nativeSubagentRuntimeState: NativeSubagentRuntimeConfigState;
   /** The Lark SDK client — NULL for apiOnly (core-only) bots: they have no
    *  Feishu credential (empty appSecret), and the SDK's Client ctor throws
    *  "appSecret or clientAssertionProvider is required" on an empty secret. An
@@ -2112,14 +2257,26 @@ export interface BotState {
   resolvedAllowedUsers: string[];
   /** raw allowedUsers 条目 → 解析后的 open_id。供 /revoke 反查并删除 email 形式的 raw 条目。 */
   rawAllowedUserResolution: Map<string, string>;
+  /** blockedUsers 原始条目解析后的本 app open_id（纯否决腿，启动期 best-effort 解析，
+   *  缺省 [] = 不否决任何人）。与 resolvedAllowedUsers 共用同一 sidecar 缓存。 */
+  resolvedBlockedUsers: string[];
 }
 
+export type NativeSubagentRuntimeConfigState =
+  | { status: 'absent' }
+  | { status: 'valid'; policy: NativeSubagentRuntimePolicy }
+  | { status: 'invalid' };
+
 const bots = new Map<string, BotState>();
+let parsedNativeSubagentRuntimeStatus = new WeakMap<BotConfig, NativeSubagentRuntimeConfigState['status']>();
 
 export function __testOnly_resetBotRegistry(): void {
+  clearCodexInstanceBots();
   bots.clear();
+  parsedNativeSubagentRuntimeStatus = new WeakMap();
   loadedConfigPath = undefined;
   loadedConfigProvenance = undefined;
+  registeredOncallConfigMtimeMs = null;
   oncallChatCache = null;
   brandLabelCache = null;
   cachedLarkUploadHttpInstance = undefined;
@@ -2277,6 +2434,23 @@ export function vcMeetingAgentConfigActive(
 }
 
 export function registerBot(cfg: BotConfig): BotState {
+  registerCodexInstanceBot(cfg);
+  const parsedStatus = parsedNativeSubagentRuntimeStatus.get(cfg);
+  const normalizedRuntime = cfg.cliId === 'traex'
+    ? normalizeNativeSubagentRuntimePolicy(cfg.nativeSubagentRuntime)
+    : { ok: true as const, value: undefined };
+  const nativeSubagentRuntimeState: NativeSubagentRuntimeConfigState =
+    parsedStatus === 'invalid' && cfg.nativeSubagentRuntime === undefined
+      ? { status: 'invalid' }
+      : !normalizedRuntime.ok
+        ? { status: 'invalid' }
+        : normalizedRuntime.value
+          ? { status: 'valid', policy: normalizedRuntime.value }
+          : { status: 'absent' };
+  parsedNativeSubagentRuntimeStatus.set(cfg, nativeSubagentRuntimeState.status);
+  cfg.nativeSubagentRuntime = nativeSubagentRuntimeState.status === 'valid'
+    ? nativeSubagentRuntimeState.policy
+    : undefined;
   // apiOnly (core-only) bots have NO Feishu credential (empty appSecret). The Lark
   // SDK Client ctor throws "appSecret or clientAssertionProvider is required" on an
   // empty secret, so constructing it would fatal the whole daemon at boot — the
@@ -2307,10 +2481,12 @@ export function registerBot(cfg: BotConfig): BotState {
   }
   const state: BotState = {
     config: cfg,
+    nativeSubagentRuntimeState,
     client,
     uploadClient,
     resolvedAllowedUsers: [...(cfg.allowedUsers ?? [])],
     rawAllowedUserResolution: new Map(),
+    resolvedBlockedUsers: [],
   };
   // p2pOpen 是一次显式的权限边界声明（进入限制态），但它只授 talk。没有 allowedUsers 就
   // 没有任何人能 operate（/restart、/cd、卡片按钮全锁死），也没有 owner 可以处置授权卡 ——
@@ -2320,6 +2496,29 @@ export function registerBot(cfg: BotConfig): BotState {
   }
   bots.set(cfg.larkAppId, state);
   return state;
+}
+
+/** Publish the persisted native-subagent policy and its diagnostic metadata as
+ * one synchronous registry operation. Call only after the corresponding
+ * bots.json mutation commits; no request can observe a half-updated snapshot. */
+export function updateBotNativeSubagentRuntime(
+  larkAppId: string,
+  next: NativeSubagentRuntimeConfigState,
+): void {
+  const bot = getBot(larkAppId);
+  const result = next.status === 'valid'
+    ? normalizeNativeSubagentRuntimePolicy(next.policy)
+    : undefined;
+  if (result && (!result.ok || !result.value)) {
+    throw new Error('native subagent runtime registry update requires a valid policy');
+  }
+  const normalized: NativeSubagentRuntimeConfigState = next.status === 'valid'
+    ? { status: 'valid', policy: result!.value! }
+    : { status: next.status };
+  bot.config.nativeSubagentRuntime = normalized.status === 'valid'
+    ? normalized.policy
+    : undefined;
+  bot.nativeSubagentRuntimeState = normalized;
 }
 
 export function getBot(larkAppId: string): BotState {
@@ -2371,14 +2570,50 @@ export function getBotUploadClient(larkAppId: string): Lark.Client {
   return bot.uploadClient;
 }
 
-/** Owner = bot 首个已授权 open_id，与「缺权限警告私信对象」同口径（见 admin 解析）。 */
-export function getOwnerOpenId(larkAppId: string): string | undefined {
-  return bots.get(larkAppId)?.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
+/**
+ * Return the raw setup-time owner identity for DM fallback paths only.
+ *
+ * This value is deliberately not an authorization result: it can outlive an
+ * allowlist edit or a transient contact-resolution failure. Callers that gate
+ * runtime actions must use getOwnerOpenId() or the resolved allowlist instead.
+ */
+export function getConfiguredOwnerOpenId(larkAppId: string): string | undefined {
+  const bot = bots.get(larkAppId);
+  if (!bot) return undefined;
+  if (bot.config.ownerOpenId && typeof bot.config.ownerOpenId === 'string' && bot.config.ownerOpenId.startsWith('ou_')) {
+    return bot.config.ownerOpenId;
+  }
+  return undefined;
 }
 
-/** Admins = all resolved allowedUsers, matching `/botconfig`'s permission model. */
+/**
+ * Current permission owner: explicit ownerOpenId keeps priority only while it
+ * is still in the resolved allowlist. Once removed or unresolved, ownership
+ * follows the first resolved ou_ entry, matching legacy allowlist semantics.
+ */
+export function getOwnerOpenId(larkAppId: string): string | undefined {
+  const bot = bots.get(larkAppId);
+  if (!bot) return undefined;
+  const configuredOwner = getConfiguredOwnerOpenId(larkAppId);
+  if (configuredOwner && bot.resolvedAllowedUsers.includes(configuredOwner)) {
+    return configuredOwner;
+  }
+  return bot.resolvedAllowedUsers.find(u => u.startsWith('ou_'));
+}
+
+/** Per-bot 最终回复投递方式的**显式**配置值；未配置 / 未注册的 bot 返回 undefined，
+ *  由 core/reply-delivery.ts 的 effectiveReplyDelivery 补缺省 send。只读内存
+ *  registry：worker 通过 init IPC 拿冻结值，不需要磁盘 mtime 缓存。 */
+export function resolveReplyDelivery(larkAppId: string): 'send' | 'transcript' | undefined {
+  const v = bots.get(larkAppId)?.config.replyDelivery;
+  return v === 'transcript' || v === 'send' ? v : undefined;
+}
+
+/** Admins = only resolved allowedUsers, matching `/botconfig`'s fail-closed permission model. */
 export function getDashboardAdminOpenIds(larkAppId: string): string[] {
-  return [...(bots.get(larkAppId)?.resolvedAllowedUsers ?? [])];
+  const bot = bots.get(larkAppId);
+  if (!bot) return [];
+  return [...(bot.resolvedAllowedUsers ?? [])].filter(u => typeof u === 'string' && u.startsWith('ou_'));
 }
 
 /**
@@ -2437,8 +2672,57 @@ export function effectiveBotDisplayName(state: BotState): string {
   return state.config.displayName || state.botName || state.config.larkAppId;
 }
 
+// Exact-bot oncall bindings can be written by another process. The main case is
+// `botmux create-group --working-dir`: the one-shot creator process persists a
+// binding for every invited bot, then immediately sends the kickoff message.
+// Each target bot daemon must observe that write before it resolves the new
+// session's working directory. Keep the registered configs fresh with one
+// stat() per lookup and only re-read bots.json when its mtime changes.
+let registeredOncallConfigMtimeMs: number | null = null;
+let oncallChatCache: { mtimeMs: number; chats: Map<string, OncallChat> } | null = null;
+
+function refreshRegisteredOncallChatsFromDisk(): void {
+  if (underReadIsolation()) return;
+  const path = loadedConfigProvenance === 'loaded' ? loadedConfigPath : undefined;
+  if (!path) return;
+  try {
+    const mtimeMs = statSync(path).mtimeMs;
+    if (registeredOncallConfigMtimeMs === mtimeMs) return;
+
+    const raw = JSON.parse(readFileSync(path, 'utf-8'));
+    if (!Array.isArray(raw)) return;
+
+    const byAppId = new Map<string, OncallChat[]>();
+    const chats = new Map<string, OncallChat>();
+    for (const entry of raw) {
+      if (!entry || typeof entry.larkAppId !== 'string') continue;
+      const botChats: OncallChat[] = [];
+      if (Array.isArray(entry.oncallChats)) {
+        for (const chat of entry.oncallChats) {
+          if (chat && typeof chat.chatId === 'string' && typeof chat.workingDir === 'string') {
+            const normalized = { chatId: chat.chatId, workingDir: chat.workingDir };
+            botChats.push(normalized);
+            chats.set(normalized.chatId, normalized);
+          }
+        }
+      }
+      byAppId.set(entry.larkAppId, botChats);
+    }
+
+    for (const [larkAppId, bot] of bots) {
+      const chats = byAppId.get(larkAppId);
+      if (chats) bot.config.oncallChats = chats;
+    }
+    oncallChatCache = { mtimeMs, chats };
+    registeredOncallConfigMtimeMs = mtimeMs;
+  } catch {
+    // Keep the last known-good in-memory snapshot during transient read errors.
+  }
+}
+
 /** Lookup the oncall binding for a given bot+chat, if any. */
 export function findOncallChat(larkAppId: string, chatId: string): OncallChat | undefined {
+  refreshRegisteredOncallChatsFromDisk();
   const bot = bots.get(larkAppId);
   return bot?.config.oncallChats?.find(c => c.chatId === chatId);
 }
@@ -2479,39 +2763,15 @@ export function effectiveDefaultWorkingDir(cfg: BotConfig): string | undefined {
 // map only sees this daemon's own bot — sibling bots' bindings live only on
 // disk in the shared bots.json. Re-read that file lazily, keyed by mtime,
 // so the hot path is a single stat() once the cache is warm.
-let oncallChatCache: { mtimeMs: number; chats: Map<string, OncallChat> } | null = null;
-
 export function findOncallChatForAnyBot(chatId: string): OncallChat | undefined {
+  refreshRegisteredOncallChatsFromDisk();
   // Fast path: this daemon's own bot(s). Covers single-daemon setups and any
   // case where the receiving bot itself is bound.
   for (const bot of bots.values()) {
     const entry = bot.config.oncallChats?.find(c => c.chatId === chatId);
     if (entry) return entry;
   }
-  // Slow path: scan the shared bots.json for sibling bots' bindings.
-  const path = loadedConfigPath;
-  if (!path) return undefined;
-  try {
-    const stat = statSync(path);
-    if (!oncallChatCache || oncallChatCache.mtimeMs !== stat.mtimeMs) {
-      const raw = JSON.parse(readFileSync(path, 'utf-8'));
-      const chats = new Map<string, OncallChat>();
-      if (Array.isArray(raw)) {
-        for (const entry of raw) {
-          if (!Array.isArray(entry?.oncallChats)) continue;
-          for (const c of entry.oncallChats) {
-            if (c && typeof c.chatId === 'string' && typeof c.workingDir === 'string') {
-              chats.set(c.chatId, { chatId: c.chatId, workingDir: c.workingDir });
-            }
-          }
-        }
-      }
-      oncallChatCache = { mtimeMs: stat.mtimeMs, chats };
-    }
-    return oncallChatCache.chats.get(chatId);
-  } catch {
-    return undefined;
-  }
+  return oncallChatCache?.chats.get(chatId);
 }
 
 export function isChatOncallBoundForAnyBot(chatId: string): boolean {
@@ -2736,6 +2996,7 @@ function maybeSynthesizeCoreOnlyConfig(): BotConfig[] | null {
   const entry: Record<string, unknown> = { larkAppId, apiOnly: true, cliId };
   if (process.env.BOTMUX_CORE_WORKING_DIR) entry.workingDir = process.env.BOTMUX_CORE_WORKING_DIR;
   if (process.env.BOTMUX_CORE_MODEL) entry.model = process.env.BOTMUX_CORE_MODEL;
+  if (process.env.BOTMUX_CORE_CODEX_AUTH_SYNC === 'isolated') entry.codexAuthSync = 'isolated';
   // Route through the normal parser so the synthesized entry gets identical
   // validation + normalization as a file-loaded one (apiOnly secret exemption,
   // cliId check, defaults). Pin loadedConfigPath to the default in-root path.
@@ -2790,10 +3051,30 @@ function resolveBotConfigPath(): string {
   );
 }
 
+/** Warn once per relevant cycle and identify only the Bot rows whose handoff must be disabled. */
+function warnAndCollectCyclicQuotaFallbackIds(
+  entries: any[],
+  selectedAppId?: string,
+): Set<string> {
+  const cycles = findQuotaFallbackCycles(entries);
+  const affected = new Set<string>();
+  for (const cycle of cycles) {
+    for (const appId of cycle) affected.add(appId);
+    // Indexed daemon loading should not make every unrelated daemon repeat the
+    // same warning. The all-bot parser has no selectedAppId and logs each cycle.
+    if (selectedAppId && !cycle.includes(selectedAppId)) continue;
+    logger.warn(
+      `[bot-registry] quotaFallbackBot cycle disabled for affected bots: ${cycle.join(' -> ')}; `
+      + 'unrelated bots remain available',
+    );
+  }
+  return affected;
+}
+
 /**
  * Resolve one daemon's exact raw bots.json slot without compacting earlier
- * activation-pending entries. PM2 assigns BOTMUX_BOT_INDEX from the durable
- * array index; filtering the array first would make a later ready bot load a
+ * activation-pending entries. The supervisor assigns BOTMUX_BOT_INDEX from the
+ * durable array index; filtering first would make a later ready bot load a
  * different App whenever concurrent onboarding left an earlier slot pending.
  */
 export function loadBotConfigAtIndex(index: number): BotConfig {
@@ -2814,6 +3095,8 @@ export function loadBotConfigAtIndex(index: number): BotConfig {
   if (!entry || typeof entry !== 'object') {
     throw new Error(`Bot config [${index}] does not exist (file: ${filePath})`);
   }
+  const selectedAppId = String((entry as Record<string, unknown>).larkAppId ?? '');
+  const cyclicQuotaFallbackIds = warnAndCollectCyclicQuotaFallbackIds(parsed, selectedAppId);
   if ((entry as Record<string, unknown>).activationPending === true) {
     throw new Error(`Bot config [${index}] activation pending (file: ${filePath})`);
   }
@@ -2849,6 +3132,9 @@ export function loadBotConfigAtIndex(index: number): BotConfig {
     }
   }
   const entryForDaemon = { ...(entry as Record<string, unknown>) };
+  if (cyclicQuotaFallbackIds.has(String(entryForDaemon.larkAppId))) {
+    delete entryForDaemon.quotaFallbackBot;
+  }
   delete entryForDaemon.activationStarting;
   delete entryForDaemon.activationCommitted;
   const exact = parseBotConfigsFromText(JSON.stringify([entryForDaemon]));
@@ -2945,10 +3231,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
   if (!Array.isArray(parsed)) {
     throw new Error(`Bot config file must contain a JSON array`);
   }
+  const cyclicQuotaFallbackIds = warnAndCollectCyclicQuotaFallbackIds(parsed);
 
   const configs: BotConfig[] = [];
   for (let i = 0; i < parsed.length; i++) {
     const entry = parsed[i];
+    const codexInstancePool = normalizeCodexInstancePool(entry.codexInstancePool, entry);
     if (!entry.larkAppId || typeof entry.larkAppId !== 'string') {
       throw new Error(`Bot config [${i}]: larkAppId is required and must be a string`);
     }
@@ -3006,16 +3294,38 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const cliRuntime = entry.cliRuntime === undefined
       ? undefined
       : normalizeCliRuntimeConfig(entry.cliRuntime, `Bot config [${i}].cliRuntime`);
+    const cliLaunchMode = normalizeCliLaunchMode(
+      entry.cliLaunchMode,
+      `Bot config [${i}].cliLaunchMode`,
+    );
     if (cliRuntime && entry.cliPathOverride === undefined) {
       throw new Error(`Bot config [${i}]: cliPathOverride is required as an exact downgrade shadow of cliRuntime.executable`);
     }
     if (cliRuntime && entry.cliPathOverride !== cliRuntime.executable) {
       throw new Error(`Bot config [${i}]: cliPathOverride must exactly match cliRuntime.executable`);
     }
+    validateCliLaunchModeConfig({
+      cliId: entryCliId,
+      cliLaunchMode,
+      wrapperCli: entry.wrapperCli,
+      cliRuntime: entry.cliRuntime,
+      cliPathOverride: entry.cliPathOverride,
+      sandbox: entry.sandbox,
+      readIsolation: entry.readIsolation,
+    }, `Bot config [${i}]`);
     const existingAppServer = normalizeExistingAppServerConfig(
       entry.existingAppServer,
       `Bot config [${i}].existingAppServer`,
     );
+    // Malformed input throws instead of degrading to off: an operator who typo'd
+    // a tool name would otherwise believe a credential boundary is enforced
+    // when it is not — worse than not having the feature.
+    let triggerUserAuth;
+    try {
+      triggerUserAuth = parseTriggerUserAuthConfig(entry.triggerUserAuth) ?? undefined;
+    } catch (e) {
+      throw new Error(`Bot config [${i}]: ${(e as Error).message}`);
+    }
     const codexBrowser = normalizeCodexBrowserConfig(
       entry.codexBrowser,
       `Bot config [${i}].codexBrowser`,
@@ -3263,9 +3573,35 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     const summaryMemory = entry.summaryMemory === true ? true : undefined;
     const summaryMemoryPath = normalizeNonEmptyString(entry.summaryMemoryPath);
     const contentTriggers = normalizeContentTriggers(entry.contentTriggers, i);
-    const messageListeners = normalizeMessageListeners(entry.messageListeners, i);
+    const globalMessageListener = normalizeMessageListenerConfig(entry.globalMessageListener, i, 'global');
+    const groupMessageListenerOverrides = normalizeGroupMessageListenerOverrides(entry.groupMessageListenerOverrides, i);
+    // Existing configurations are semantically group-specific custom rules.
+    // Read them as a compatibility fallback without widening their scope.
+    const legacyMessageListeners = normalizeMessageListeners(entry.messageListeners, i);
+    const mergedGroupMessageListenerOverrides = {
+      ...(legacyMessageListeners
+        ? Object.fromEntries(Object.entries(legacyMessageListeners).map(([chatId, listener]) => [chatId, { mode: 'custom' as const, listener }]))
+        : {}),
+      ...(groupMessageListenerOverrides ?? {}),
+    };
     const commandTriggers = normalizeCommandTriggers(entry.commandTriggers);
     const vcMeetingAgent = normalizeVcMeetingAgentConfig(entry.vcMeetingAgent);
+    const normalizedQuotaFallback = cyclicQuotaFallbackIds.has(entry.larkAppId)
+      ? {}
+      : normalizeQuotaFallbackBotConfig(entry.quotaFallbackBot, entry.larkAppId);
+    if (normalizedQuotaFallback.error) {
+      logger.warn(
+        `[bot-registry:${entry.larkAppId}] quotaFallbackBot ignored: ${normalizedQuotaFallback.error}`,
+      );
+    }
+    const normalizedNativeSubagentRuntime = normalizeNativeSubagentRuntimePolicy(
+      entry.nativeSubagentRuntime,
+    );
+    if (!normalizedNativeSubagentRuntime.ok) {
+      logger.warn(
+        `[bot-registry:${entry.larkAppId}] nativeSubagentRuntime ignored: ${normalizedNativeSubagentRuntime.error}`,
+      );
+    }
 
     // Preserve a structured per-bot voice override. Deep credential and ASR
     // validation remains in the voice service; this parser only rejects an
@@ -3310,13 +3646,14 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     // 非法/缺字段返回 null。
     const budget = parseBudgetConfig(entry.budget);
 
-    configs.push({
+    const config: BotConfig = {
       larkAppId: entry.larkAppId,
       // apiOnly bots may omit the secret (never used — no Feishu connection);
       // fall back to '' so downstream env plumbing stays a string. Feishu image
       // upload etc. already degrade gracefully on an empty secret.
       larkAppSecret: entry.larkAppSecret ?? '',
       apiOnly: entry.apiOnly === true || undefined,
+      oncallGroup: entry.oncallGroup === undefined ? undefined : normalizeOncallGroupPolicy(entry.oncallGroup),
       feedback: entry.feedback === undefined
         ? undefined
         : normalizeFeedbackPolicyLayer(entry.feedback),
@@ -3338,11 +3675,18 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       wrapperCli: typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()
         ? entry.wrapperCli.trim()
         : undefined,
+      cliLaunchMode,
       launchShell: typeof entry.launchShell === 'string' && entry.launchShell.trim()
         ? entry.launchShell.trim()
         : undefined,
       model: typeof entry.model === 'string' && entry.model.trim()
         ? entry.model.trim()
+        : undefined,
+      groupDefaultModels: normalizeGroupDefaultModels(entry.groupDefaultModels),
+      groupSerialInput: normalizeGroupSerialInput(entry.groupSerialInput),
+      modelBackendVariant: isBackendVariantCliId(entryCliId)
+        && (entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max')
+        ? entry.modelBackendVariant
         : undefined,
       // Positive integer within the arm-able bound only; anything else → undefined
       // (= runner default). See normalizeTurnTimeoutMs / MAX_TURN_TIMEOUT_MS.
@@ -3357,13 +3701,20 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
           entry.reasoningEffort,
         )
         ? entry.reasoningEffort : undefined,
+      nativeSubagentRuntime: entryCliId === 'traex' && normalizedNativeSubagentRuntime.ok
+        ? normalizedNativeSubagentRuntime.value
+        : undefined,
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
+      // 显式 send / transcript 都保留；缺省按 defaultReplyDeliveryFor 解析。
+      replyDelivery: entry.replyDelivery === 'transcript' || entry.replyDelivery === 'send' ? entry.replyDelivery : undefined,
       codexBrowser,
       codexRpcInput: entry.codexRpcInput === true,
       existingAppServer,
       // Missing keeps the historical every-cold-spawn global auth refresh.
       codexAuthSync: entry.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
+      codexInstancePool,
+      ...(triggerUserAuth ? { triggerUserAuth } : {}),
       sandbox: entry.sandbox === true,
       sandboxPaths: entry.sandboxPaths && typeof entry.sandboxPaths === 'object' && !Array.isArray(entry.sandboxPaths)
         ? {
@@ -3385,13 +3736,25 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         && Number.isInteger(entry.maxLiveWorkers) && entry.maxLiveWorkers > 0
         ? entry.maxLiveWorkers
         : undefined,
+      // Positive integer minutes only; 0 / negative / fractional / absent →
+      // undefined (= idle TTL disabled).
+      idleSuspendMinutes: typeof entry.idleSuspendMinutes === 'number'
+        && Number.isInteger(entry.idleSuspendMinutes) && entry.idleSuspendMinutes > 0
+        ? entry.idleSuspendMinutes
+        : undefined,
       sessionOwnerReminder: normalizeSessionOwnerReminderConfig(entry.sessionOwnerReminder),
+      quotaFallbackBot: normalizedQuotaFallback.config,
       // Only explicit true persisted (undefined = off), same as restrictGrantCommands.
       overloadAlert: entry.overloadAlert === true || undefined,
       vcMeetingAgent,
       workingDir: workingDirs?.[0] ?? entry.workingDir,
       workingDirs,
       allowedUsers: entry.allowedUsers,
+      // 与 allowedUsers 同款原始条目（邮箱/手机/on_/ou_），daemon 启动期复用同一套
+      // 解析缓存换成本 app open_id；非数组 / 空归一为 undefined，保持 bots.json 干净。
+      blockedUsers: Array.isArray(entry.blockedUsers)
+        ? (normalizeStringList(entry.blockedUsers) || undefined)
+        : undefined,
       // Only a well-formed native open_id is trusted; anything else (stray on_/
       // email/garbage) is dropped so the fail-safe recipient can never be a
       // value that itself needs resolving.
@@ -3401,6 +3764,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       allowedChatGroups,
       oncallChats,
       defaultOncall,
+      signedChatDefaults: entry.signedChatDefaults === true || undefined,
+      signedChatDefaultsRegistryUrl: typeof entry.signedChatDefaultsRegistryUrl === 'string' && entry.signedChatDefaultsRegistryUrl.startsWith('https://') ? entry.signedChatDefaultsRegistryUrl : undefined,
       defaultOncallAutoboundChats,
       defaultWorkingDir: typeof entry.defaultWorkingDir === 'string' && entry.defaultWorkingDir.trim()
         ? entry.defaultWorkingDir.trim()
@@ -3443,11 +3808,15 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       usageDisplay: normalizeUsageDisplay(entry) === DEFAULT_USAGE_DISPLAY
         ? undefined
         : normalizeUsageDisplay(entry),
-      disableStreamingCard: entry.disableStreamingCard === true || undefined,
+      showReplyTiming: entry.showReplyTiming === true || undefined,
+      // Retired final-only preference must not opt into an extra terminal card.
+      disableStreamingCard: entry.disableStreamingCard === true || entry.replyCardMode === 'final-only' || undefined,
+      replyCardMode: entry.replyCardMode === 'unified' || entry.replyCardMode === 'final-only' ? 'unified' : undefined,
+      hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
-      thinkingCard: entry.thinkingCard === false ? false : undefined,
-      // Default ON, same convention as thinkingCard: an absent key means the
+      cotEnabled: normalizeCotEnabled(entry) ? undefined : false,
+      // Default ON, same convention as cotEnabled: an absent key means the
       // <sender> tag is injected, so existing prompts are unchanged.
       senderTag: entry.senderTag === false ? false : undefined,
       noPinStreamingCardChats: Array.isArray(entry.noPinStreamingCardChats)
@@ -3497,10 +3866,21 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.autoStartOnGroupJoinSeed
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
+      groupJoinCommandEnabled: entry.groupJoinCommandEnabled === true || undefined,
+      groupJoinCommand: typeof entry.groupJoinCommand === 'string' && entry.groupJoinCommand.trim()
+        ? entry.groupJoinCommand.trim()
+        : undefined,
       // 默认 OFF：只有显式 true 有意义/落盘。开启后 `botmux send --mention`
       // 才能用完整邮箱/手机号等标识 @ 群内任意成员（见 BotConfig 上的说明）。
       allowArbitraryMention: entry.allowArbitraryMention === true || undefined,
-      messageListeners,
+      globalMessageListener,
+      groupMessageListenerOverrides: Object.keys(mergedGroupMessageListenerOverrides).length > 0
+        ? mergedGroupMessageListenerOverrides
+        : undefined,
+      // Compatibility read view for existing callers during the transition.
+      // New runtime resolution prefers groupMessageListenerOverrides, while
+      // legacy consumers continue seeing the original per-chat rules.
+      messageListeners: legacyMessageListeners,
       commandTriggers,
       worktreeMultiPicker: entry.worktreeMultiPicker === true || undefined,
       // Per-bot regular-group default mode. Default is 'chat-topic' (顶层平铺
@@ -3538,9 +3918,17 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       voice,
       pricing,
       budget: budget ?? undefined,
-    });
+    };
+    const nativeSubagentRuntimeStatus: NativeSubagentRuntimeConfigState['status'] =
+      entryCliId !== 'traex' || (normalizedNativeSubagentRuntime.ok && !normalizedNativeSubagentRuntime.value)
+        ? 'absent'
+        : normalizedNativeSubagentRuntime.ok
+          ? 'valid'
+          : 'invalid';
+    parsedNativeSubagentRuntimeStatus.set(config, nativeSubagentRuntimeStatus);
+    configs.push(config);
   }
-
+  validateCodexInstanceRoster(configs);
   return configs;
 }
 
@@ -3569,4 +3957,20 @@ export function readBotSkillPolicy(raw: unknown): BotSkillPolicy | undefined {
   const include = readDirectSkillSelectors(r.include);
   if (include) out.include = include;
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Read-compat for `thinkingCard`, renamed to `cotEnabled` in #1477 (shipped
+ * v3.27): without this, an explicitly muted thinking bubble silently comes
+ * back after upgrade. An explicit canonical boolean always wins.
+ *
+ * Removal plan: delete every site marked `[legacy-thinkingCard]` — grep
+ * that exact tag under src/ as the index (a bare `thinkingCard` grep also
+ * matches the unrelated, still-live `thinkingCardToolResult` switch from
+ * #1546) — no earlier than v3.33.0 (at least three minor releases after
+ * this compat ships). Removing it restores default-on for any un-migrated
+ * key, so bump the floor release if old keys still show up in support.
+ */
+export function normalizeCotEnabled(entry?: { cotEnabled?: unknown; thinkingCard?: unknown }): boolean {
+  return typeof entry?.cotEnabled === 'boolean' ? entry.cotEnabled : entry?.thinkingCard !== false;
 }

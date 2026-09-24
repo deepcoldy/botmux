@@ -152,15 +152,61 @@ describe('createTask — id provided, task exists with identical canonical input
     expect(second.repeat?.completed).toBe(1);
   });
 
-  it('keeps creator identity out of the canonical input so the same id stays idempotent', async () => {
-    const { createTask } = await freshImport();
+  it('settles only the run id that currently owns the durable running claim', async () => {
+    const { createTask, getTask, markRun, updateTask } = await freshImport();
+    const id = 'deadbeef';
+    createTask({ ...BASE_PARAMS, id });
+    updateTask(id, {
+      lastStatus: 'running',
+      lastRunId: '11111111-2222-4333-8444-555555555555',
+      lastRunAt: '2026-05-19T10:00:00Z',
+      nextRunAt: undefined,
+    });
+
+    markRun(id, true, undefined, undefined, 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee');
+    expect(getTask(id)).toMatchObject({
+      enabled: true,
+      lastStatus: 'running',
+      lastRunId: '11111111-2222-4333-8444-555555555555',
+    });
+
+    markRun(id, true, undefined, undefined, '11111111-2222-4333-8444-555555555555');
+    expect(getTask(id)).toMatchObject({ enabled: true, lastStatus: 'ok' });
+  });
+
+  it('atomically rejects a second claim and run-now request while running', async () => {
+    const { claimRun, createTask, requestRunNow } = await freshImport();
+    const id = 'cafefeed';
+    createTask({ ...BASE_PARAMS, id });
+
+    expect(claimRun(id, {
+      lastRunAt: '2026-05-19T10:00:00Z',
+      nextRunAt: undefined,
+      lastRunId: '11111111-2222-4333-8444-555555555555',
+    })).toMatchObject({ ok: true });
+    expect(claimRun(id, {
+      lastRunAt: '2026-05-19T10:00:01Z',
+      nextRunAt: undefined,
+      lastRunId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+    })).toEqual({ ok: false, error: 'already_running' });
+    expect(requestRunNow(id)).toEqual({ ok: false, error: 'already_running' });
+  });
+
+  it('treats ownerOpenId as part of the canonical input so a re-create with a different creator conflicts', async () => {
+    const { createTask, IdempotencyConflictError } = await freshImport();
     const id = 'wf_owner_identity';
     const first = createTask({ ...BASE_PARAMS, id, ownerOpenId: 'ou_old', ownerUnionId: 'on_old' });
-    const second = createTask({ ...BASE_PARAMS, id, ownerOpenId: 'ou_new', ownerUnionId: 'on_new' });
-    // Creator identity is audit metadata, not task input: a re-create with a
-    // different creator must return the existing task untouched rather than
-    // conflict — and must not quietly re-stamp whose identity it runs as.
+    // The creator open_id is the identity scheduled turns authenticate as, so
+    // the same workflow id re-run by a different creator must not silently
+    // reuse the existing task; it conflicts instead.
+    expect(() => createTask({ ...BASE_PARAMS, id, ownerOpenId: 'ou_new', ownerUnionId: 'on_new' })).toThrow(
+      IdempotencyConflictError,
+    );
+    // Same id + same creator stays idempotent and keeps the stored audit
+    // metadata (ownerUnionId is not part of the canonical input).
+    const second = createTask({ ...BASE_PARAMS, id, ownerOpenId: 'ou_old', ownerUnionId: 'on_new' });
     expect(second.id).toBe(first.id);
+    expect(second.ownerOpenId).toBe('ou_old');
     expect(second.ownerUnionId).toBe('on_old');
   });
 
@@ -181,6 +227,29 @@ describe('createTask — id provided, task exists with identical canonical input
     const id = 'wf_chattype';
     createTask({ ...BASE_PARAMS, id, chatType: 'group' });
     expect(() => createTask({ ...BASE_PARAMS, id })).toThrow(IdempotencyConflictError);
+  });
+
+  it('treats normalized multi-chat order as canonical while ignoring duplicates', async () => {
+    const { createTask, IdempotencyConflictError } = await freshImport();
+    const id = 'wf_multi_chat';
+    const first = createTask({
+      ...BASE_PARAMS,
+      id,
+      chatIds: ['oc_primary', 'oc_secondary', 'oc_primary'],
+    });
+    const identical = createTask({
+      ...BASE_PARAMS,
+      id,
+      chatId: 'oc_stale_compat',
+      chatIds: [' oc_primary ', 'oc_secondary'],
+    });
+    expect(identical.id).toBe(first.id);
+    expect(identical.chatIds).toEqual(['oc_primary', 'oc_secondary']);
+    expect(() => createTask({
+      ...BASE_PARAMS,
+      id,
+      chatIds: ['oc_secondary', 'oc_primary'],
+    })).toThrow(IdempotencyConflictError);
   });
 });
 

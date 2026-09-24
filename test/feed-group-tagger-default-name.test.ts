@@ -47,7 +47,8 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 vi.mock('../src/utils/user-token.js', () => ({
-  resolveUserToken: vi.fn(async () => 'u-token'),
+  // Owner-scoped: a bot has no inbox sidebar to hold a label.
+  resolveOwnerUserToken: vi.fn(async () => 'u-token'),
   generateAuthUrl: vi.fn(() => ({ authUrl: 'https://auth.example/x', state: 's' })),
   FEED_GROUP_OAUTH_SCOPES: ['im:feed_group_v1'],
 }));

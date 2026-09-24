@@ -144,20 +144,23 @@ function readRestartLeaseTo(dir: string): RestartLease | null {
 export function hasActiveRestartLeaseTo(dir: string, nowMs: number): boolean {
   const lease = readRestartLeaseTo(dir);
   if (!lease) return false;
-  const age = Math.abs(nowMs - lease.at);
-  if (!lease.pid) return age <= RESTART_LEASE_CLAIM_MS;
+  const age = nowMs - lease.at;
+  if (!Number.isFinite(nowMs)) return false;
+  if (!lease.pid) return age >= 0 && age <= RESTART_LEASE_CLAIM_MS;
   if (lease.procStart) {
     const liveStart = readProcessStartIdentity(lease.pid);
     if (liveStart !== undefined) {
       if (liveStart !== lease.procStart) return false;
+      // A matching process birth identity tolerates bounded wall-clock skew.
+      // Provisional leases never receive this identity-based exception.
       // A stuck driver must not hold the lease forever: even if the process
       // is still alive (and its start time matches), expire after MAX_MS so a
       // new restart can be attempted.
-      if (age > RESTART_LEASE_MAX_MS) return false;
+      if (age < -RESTART_LEASE_MAX_MS || age > RESTART_LEASE_MAX_MS) return false;
       return true;
     }
   }
-  if (age > RESTART_LEASE_MAX_MS) return false;
+  if (age < 0 || age > RESTART_LEASE_MAX_MS) return false;
   try { process.kill(lease.pid, 0); return true; } catch { return false; }
 }
 
@@ -176,7 +179,17 @@ export function claimRestartLeaseTo(dir: string, nowMs: number): string | null {
 /** Bind a provisional claim while holding globalInstallUpdateLockTarget(). */
 export function bindRestartLeaseTo(dir: string, id: string, pid: number, nowMs: number): boolean {
   const lease = readRestartLeaseTo(dir);
-  if (!lease || lease.id !== id || !Number.isSafeInteger(pid) || pid <= 1) return false;
+  if (
+    !lease
+    || lease.id !== id
+    || lease.pid !== undefined
+    || lease.procStart !== undefined
+    || !Number.isFinite(nowMs)
+    || nowMs < lease.at
+    || nowMs - lease.at > RESTART_LEASE_CLAIM_MS
+    || !Number.isSafeInteger(pid)
+    || pid <= 1
+  ) return false;
   const path = restartLeasePathIn(dir);
   const tmp = `${path}.${process.pid}.tmp`;
   const procStart = readProcessStartIdentity(pid);
@@ -185,9 +198,28 @@ export function bindRestartLeaseTo(dir: string, id: string, pid: number, nowMs: 
   return true;
 }
 
-export function clearRestartLeaseTo(dir: string, id: string): void {
+function clearRestartLeaseToUnlocked(dir: string, id: string): void {
   if (readRestartLeaseTo(dir)?.id !== id) return;
   try { rmSync(restartLeasePathIn(dir)); } catch { /* absent / best-effort */ }
+}
+
+/**
+ * Best-effort clear through the same lock used by claim/bind. Launch-failure
+ * cleanup can run from an event callback after the caller released that lock;
+ * never block or throw there. A busy lock leaves the generation lease to expire.
+ */
+export function clearRestartLeaseToLocked(dir: string, id: string, lockTarget: string): boolean {
+  try {
+    withFileLockSync(lockTarget, () => clearRestartLeaseToUnlocked(dir, id), { maxWaitMs: 0 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Low-level helper for callers that already hold the global update lock. */
+export function clearRestartLeaseTo(dir: string, id: string): void {
+  clearRestartLeaseToUnlocked(dir, id);
 }
 
 /** Read + delete the breadcrumb. Always deletes (fresh, stale, or corrupt) so
@@ -331,6 +363,11 @@ export function claimRestartLease(nowMs: number = Date.now()): string | null {
 
 export function clearRestartLease(id: string): void {
   clearRestartLeaseTo(config.session.dataDir, id);
+}
+
+export function clearRestartLeaseLocked(id: string): boolean {
+  const dataDir = config.session.dataDir;
+  return clearRestartLeaseToLocked(dataDir, id, join(dataDir, 'npm-global-update'));
 }
 
 export function claimRestartIntentForReport(

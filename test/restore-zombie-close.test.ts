@@ -50,6 +50,7 @@ const bot = vi.hoisted(() => ({
   cliRuntime: undefined as import('../src/adapters/cli/runtime.js').CliRuntimeConfig | undefined,
   cliPathOverride: undefined as string | undefined,
   wrapperCli: undefined as string | undefined,
+  cliLaunchMode: undefined as import('../src/core/cli-launch-mode.js').CliLaunchMode | undefined,
 }));
 
 vi.mock('../src/config.js', () => ({
@@ -101,6 +102,8 @@ vi.mock('../src/core/worker-pool.js', () => ({
   getCurrentCliVersion: vi.fn(() => '1.0.0-test'),
   restoreUsageLimitRuntimeState: vi.fn(),
   ensureOrdinaryTurnRecoveryAttached: vi.fn(),
+  ensureReadonlyTaskContinuationAttached: vi.fn(),
+  markReadonlyTaskContinuationInterruptedByRestart: vi.fn(() => false),
   withActiveSessionKeyLock: vi.fn(async (_map: Map<string, any>, _key: string, action: () => any) => action()),
   setActiveSessionSafe: vi.fn(async (map: Map<string, any>, key: string, ds: any) => {
     const prev = map.get(key);
@@ -188,6 +191,7 @@ vi.mock('../src/bot-registry.js', () => ({
       cliRuntime: bot.cliRuntime,
       cliPathOverride: bot.cliPathOverride,
       wrapperCli: bot.wrapperCli,
+      cliLaunchMode: bot.cliLaunchMode,
       workingDir: '~',
       workingDirs: ['~'],
     },
@@ -276,6 +280,8 @@ import { ZmxBackend } from '../src/adapters/backend/zmx-backend.js';
 import {
   closeSession,
   ensureOrdinaryTurnRecoveryAttached,
+  ensureReadonlyTaskContinuationAttached,
+  markReadonlyTaskContinuationInterruptedByRestart,
   forkAdoptWorker,
   forkWorker,
   setActiveSessionSafe,
@@ -302,9 +308,12 @@ beforeEach(() => {
   bot.cliRuntime = undefined;
   bot.cliPathOverride = undefined;
   bot.wrapperCli = undefined;
+  bot.cliLaunchMode = undefined;
   vi.mocked(closeSession).mockClear();
   vi.mocked(forkWorker).mockClear();
   vi.mocked(ensureOrdinaryTurnRecoveryAttached).mockClear();
+  vi.mocked(ensureReadonlyTaskContinuationAttached).mockClear();
+  vi.mocked(markReadonlyTaskContinuationInterruptedByRestart).mockClear();
   vi.mocked(announceSessionRow).mockClear();
   vi.mocked(ZmxBackend.probeSessions).mockClear();
   vi.mocked(ZmxBackend.killManagedSession).mockReset();
@@ -328,6 +337,211 @@ function makeActivePersistentSession(rootMessageId: string, backendType: 'tmux' 
   sessionStore.updateSession(s);
   return s; // left active
 }
+
+describe('restoreActiveSessions — narrow XPI recovery containment', () => {
+  function makePrincipalLaneSession(rootMessageId: string) {
+    sessionStore.init('app_test');
+    const legacy = makeActivePersistentSession(rootMessageId);
+    legacy.workingDir = process.cwd();
+    legacy.ownerOpenId = 'ou_owner';
+    legacy.ownerUnionId = 'on_owner';
+    sessionStore.updateSession(legacy);
+    const ensured = sessionStore.ensurePrincipalLaneSource({
+      sourceSessionId: legacy.sessionId,
+      caller: {
+        senderType: 'user',
+        kind: 'union',
+        unionId: 'on_owner',
+      },
+      now: '2026-09-22T00:00:00.000Z',
+    });
+    if (ensured.status !== 'ready') {
+      throw new Error(`principal lane fixture bootstrap failed: ${JSON.stringify(ensured)}`);
+    }
+    const session = sessionStore.getOwnedSession(legacy.sessionId)!;
+    session.principalLaneQueuedTurns = [{
+      version: 1,
+      turnId: 'om_attempting',
+      caller: { requestLarkAppId: 'app_test', requestUserOpenId: 'ou_owner', senderType: 'user' },
+      userPrompt: 'attempting',
+      title: 'attempting',
+      cliInput: { content: 'attempting', resources: [] },
+      createdAt: '2026-09-22T00:00:01.000Z',
+      resume: true,
+      dispatchState: 'attempting',
+    }, {
+      version: 1,
+      turnId: 'om_next',
+      caller: { requestLarkAppId: 'app_test', requestUserOpenId: 'ou_owner', senderType: 'user' },
+      userPrompt: 'next',
+      title: 'next',
+      cliInput: { content: 'next', resources: [] },
+      createdAt: '2026-09-22T00:00:02.000Z',
+      resume: true,
+      dispatchState: 'queued',
+    }];
+    sessionStore.updateSession(session);
+    return session;
+  }
+
+  it('terminalizes a principal-lane attempting head before restore and keeps the next turn runnable', async () => {
+    const lane = makePrincipalLaneSession('om_principal_lane_recovery');
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    const notices = await restoreActiveSessions(map);
+
+    expect(notices).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'principal_lane_dispatch_unknown',
+        sessionId: lane.sessionId,
+        turnId: 'om_attempting',
+      }),
+    ]));
+    const persisted = sessionStore.getSession(lane.sessionId)!;
+    expect(persisted.principalLaneQueuedTurns).toMatchObject([
+      { turnId: 'om_next', dispatchState: 'queued' },
+    ]);
+    expect(persisted.principalLaneDispatchUnknownNotices).toMatchObject([
+      { turnId: 'om_attempting', noticePending: true },
+    ]);
+    expect(persisted.restoreQuarantinedAt).toBeUndefined();
+    expect([...map.values()].map(ds => ds.session.sessionId)).toContain(lane.sessionId);
+  });
+
+  it('retries principal-lane boot reconciliation on store busy', async () => {
+    const lane = makePrincipalLaneSession('om_principal_lane_busy_retry');
+    const originalMutate = sessionStore.mutateOwnedSessionsAtomically;
+    let attempts = 0;
+    const mutation = vi.spyOn(sessionStore, 'mutateOwnedSessionsAtomically').mockImplementation((ids, mutate, options) => {
+      if (ids.length === 1 && ids[0] === lane.sessionId && attempts++ < 2) {
+        throw new sessionStore.SessionStoreBusyError(new Error('synthetic busy'));
+      }
+      return originalMutate(ids, mutate, options);
+    });
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+    try {
+      const notices = await restoreActiveSessions(map);
+      expect(attempts).toBe(3);
+      expect(notices).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: 'principal_lane_dispatch_unknown', turnId: 'om_attempting' }),
+      ]));
+      expect(sessionStore.getSession(lane.sessionId)?.restoreQuarantinedAt).toBeUndefined();
+      expect([...map.values()].map(ds => ds.session.sessionId)).toContain(lane.sessionId);
+    } finally {
+      mutation.mockRestore();
+    }
+  });
+
+  it('keeps a principal lane closed when boot reconciliation persistence exhausts retries', async () => {
+    const lane = makePrincipalLaneSession('om_principal_lane_busy_fail_closed');
+    const healthy = makeActivePersistentSession('om_principal_lane_healthy_peer');
+    const originalMutate = sessionStore.mutateOwnedSessionsAtomically;
+    const mutation = vi.spyOn(sessionStore, 'mutateOwnedSessionsAtomically').mockImplementation((ids, mutate, options) => {
+      if (ids.length === 1 && ids[0] === lane.sessionId) {
+        throw new sessionStore.SessionStoreBusyError(new Error('synthetic persistent busy'));
+      }
+      return originalMutate(ids, mutate, options);
+    });
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+    try {
+      const notices = await restoreActiveSessions(map);
+      expect(notices).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'principal_lane_recovery_quarantine',
+          sessionId: lane.sessionId,
+          reason: 'recovery_persistence_failure',
+        }),
+      ]));
+      expect([...map.values()].map(ds => ds.session.sessionId)).not.toContain(lane.sessionId);
+      expect([...map.values()].map(ds => ds.session.sessionId)).toContain(healthy.sessionId);
+      expect(sessionStore.getSession(lane.sessionId)?.restoreQuarantinedAt).toBeDefined();
+    } finally {
+      mutation.mockRestore();
+    }
+  });
+
+  it('quarantines only the stale XPI session before restore side effects and keeps restoring a healthy peer', async () => {
+    const stale = makeActivePersistentSession('om_stale_xpi');
+    stale.crossPrincipalInterruptions = [{
+      version: 1,
+      id: 'xpi_synthetic_stale',
+      ownerTurnId: 'turn_owner',
+      owner: { requestLarkAppId: 'app_test', requestUserOpenId: 'ou_owner', senderType: 'user' },
+      proposer: { requestLarkAppId: 'app_test', requestUserOpenId: 'ou_proposer', senderType: 'user' },
+      phase: 'awaiting_classification',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      classificationDeadlineAt: 1,
+      messages: [{ turnId: 'turn_proposal', text: 'synthetic', createdAt: '2026-01-01T00:00:00.000Z' }],
+    }];
+    sessionStore.updateSession(stale);
+    const healthy = makeActivePersistentSession('om_healthy_peer');
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    const notices = await restoreActiveSessions(map);
+
+    expect(notices).toEqual([expect.objectContaining({
+      sessionId: stale.sessionId,
+      scope: 'session',
+      reason: 'stale_legacy_xpi_record',
+    })]);
+    expect([...map.values()].map(ds => ds.session.sessionId)).toContain(healthy.sessionId);
+    expect([...map.values()].map(ds => ds.session.sessionId)).not.toContain(stale.sessionId);
+    expect(sessionStore.getSession(stale.sessionId)?.xpiSharedCwdQuarantine).toMatchObject({
+      scope: 'session',
+      reason: 'stale_legacy_xpi_record',
+    });
+    expect(vi.mocked(forkWorker).mock.calls.some(([ds]) => ds.session.sessionId === stale.sessionId)).toBe(false);
+  });
+
+  it('contains a recovery transaction failure to its explicit group and restores an unrelated session', async () => {
+    const coordinator = makeActivePersistentSession('om_failed_group_coordinator');
+    const member = makeActivePersistentSession('om_failed_group_member');
+    const healthy = makeActivePersistentSession('om_healthy_outside_failed_group');
+    for (const session of [coordinator, member]) {
+      session.xpiSharedCwdAdmissionGroupId = 'xpi_group_persist_failure';
+      session.xpiSharedCwdAdmissionCoordinatorSessionId = coordinator.sessionId;
+      sessionStore.updateSession(session);
+    }
+    sessionStore.init();
+    const originalMutate = sessionStore.mutateOwnedSessionsAtomically;
+    const mutation = vi.spyOn(sessionStore, 'mutateOwnedSessionsAtomically').mockImplementation((ids, mutate, options) => {
+      if (ids.includes(coordinator.sessionId)) throw new Error('synthetic group persistence failure');
+      return originalMutate(ids, mutate, options);
+    });
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    try {
+      const notices = await restoreActiveSessions(map);
+
+      expect(notices).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          sessionId: coordinator.sessionId,
+          scope: 'group',
+          reason: 'recovery_persistence_failure',
+        }),
+        expect.objectContaining({
+          sessionId: member.sessionId,
+          scope: 'group',
+          reason: 'recovery_persistence_failure',
+        }),
+      ]));
+      expect([...map.values()].map(ds => ds.session.sessionId)).toContain(healthy.sessionId);
+      expect([...map.values()].map(ds => ds.session.sessionId)).not.toContain(coordinator.sessionId);
+      expect([...map.values()].map(ds => ds.session.sessionId)).not.toContain(member.sessionId);
+      expect(sessionStore.getSession(coordinator.sessionId)?.restoreQuarantinedAt).toBeDefined();
+      expect(sessionStore.getSession(member.sessionId)?.restoreQuarantinedAt).toBeDefined();
+      expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('recovery_partition_failure'));
+    } finally {
+      mutation.mockRestore();
+    }
+  });
+});
 
 describe('restoreActiveSessions — mojo identity freeze attribution (P0-4)', () => {
   // The module-level bot-registry mock serves every other describe; stash its
@@ -402,6 +616,141 @@ describe('restoreActiveSessions — mojo identity freeze attribution (P0-4)', ()
 });
 
 describe('restoreActiveSessions — persistent-backend zombie-close decision', () => {
+  it('marks a restored automatic original turn as interrupted before reattaching', async () => {
+    vi.mocked(markReadonlyTaskContinuationInterruptedByRestart).mockImplementationOnce((ds, leaseId) => {
+      const continuation = ds.session.readonlyTaskContinuation;
+      if (continuation?.status !== 'active' || continuation.leaseId !== leaseId) return false;
+      ds.session.readonlyTaskContinuation = {
+        ...continuation,
+        status: 'awaiting_user',
+        lastErrorCode: 'daemon_restart',
+      };
+      return true;
+    });
+    const s = makeActivePersistentSession('om_automatic_continuation_restart');
+    s.readonlyTaskContinuation = {
+      leaseId: 'readonly-restart',
+      logicalTurnId: 'om_original',
+      currentTurnId: 'om_original',
+      currentWorkerGeneration: 7,
+      createdAt: Date.now() - 10_000,
+      expiresAt: Date.now() + 60_000,
+      maxContinuations: 6,
+      continuationsStarted: 0,
+      authorizationMode: 'inherited',
+      startMode: 'automatic',
+      trustedCaller: {
+        requestUserOpenId: 'ou_owner',
+        requestLarkAppId: 'app_test',
+        senderType: 'user',
+      },
+      status: 'active',
+    };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(markReadonlyTaskContinuationInterruptedByRestart).toHaveBeenCalledWith(
+      expect.objectContaining({ session: expect.objectContaining({ sessionId: s.sessionId }) }),
+      'readonly-restart',
+    );
+    expect(ensureReadonlyTaskContinuationAttached).not.toHaveBeenCalledWith(
+      expect.objectContaining({ session: expect.objectContaining({ sessionId: s.sessionId }) }),
+    );
+    expect([...map.values()].find(ds => ds.session.sessionId === s.sessionId)?.session
+      .readonlyTaskContinuation).toMatchObject({
+        status: 'awaiting_user',
+        lastErrorCode: 'daemon_restart',
+      });
+  });
+
+  it('does not label a replacement lease created during restore as interrupted', async () => {
+    const s = makeActivePersistentSession('om_continuation_restore_race');
+    s.readonlyTaskContinuation = {
+      leaseId: 'readonly-old-process',
+      logicalTurnId: 'om_old',
+      currentTurnId: 'om_old',
+      currentWorkerGeneration: 7,
+      createdAt: Date.now() - 10_000,
+      expiresAt: Date.now() + 60_000,
+      maxContinuations: 6,
+      continuationsStarted: 0,
+      authorizationMode: 'inherited',
+      startMode: 'automatic',
+      trustedCaller: {
+        requestUserOpenId: 'ou_owner',
+        requestLarkAppId: 'app_test',
+        senderType: 'user',
+      },
+      status: 'active',
+    };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+    vi.mocked(setActiveSessionSafe).mockImplementationOnce(async (sessions, key, ds) => {
+      ds.session.readonlyTaskContinuation = {
+        ...ds.session.readonlyTaskContinuation!,
+        leaseId: 'readonly-new-process',
+        logicalTurnId: 'om_new',
+        currentTurnId: 'om_new',
+      };
+      sessions.set(key, ds);
+      return { accepted: true };
+    });
+
+    await restoreActiveSessions(map);
+
+    expect(markReadonlyTaskContinuationInterruptedByRestart).toHaveBeenCalledWith(
+      expect.objectContaining({ session: expect.objectContaining({ sessionId: s.sessionId }) }),
+      'readonly-old-process',
+    );
+    expect(ensureReadonlyTaskContinuationAttached).toHaveBeenCalledWith(
+      expect.objectContaining({
+        session: expect.objectContaining({
+          sessionId: s.sessionId,
+          readonlyTaskContinuation: expect.objectContaining({ leaseId: 'readonly-new-process' }),
+        }),
+      }),
+    );
+  });
+
+  it('keeps an explicit restored lease on the ordinary attachment path', async () => {
+    const s = makeActivePersistentSession('om_explicit_continuation_restart');
+    s.readonlyTaskContinuation = {
+      leaseId: 'readonly-explicit',
+      logicalTurnId: 'om_original',
+      currentTurnId: 'om_original',
+      currentWorkerGeneration: 7,
+      createdAt: Date.now() - 10_000,
+      expiresAt: Date.now() + 60_000,
+      maxContinuations: 6,
+      continuationsStarted: 0,
+      authorizationMode: 'inherited',
+      startMode: 'explicit',
+      trustedCaller: {
+        requestUserOpenId: 'ou_owner',
+        requestLarkAppId: 'app_test',
+        senderType: 'user',
+      },
+      status: 'active',
+    };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(markReadonlyTaskContinuationInterruptedByRestart).not.toHaveBeenCalled();
+    expect(ensureReadonlyTaskContinuationAttached).toHaveBeenCalledWith(
+      expect.objectContaining({ session: expect.objectContaining({ sessionId: s.sessionId }) }),
+    );
+  });
+
   it('finishes a durable prepared Mojo close without registering or re-cancelling', async () => {
     const s = makeActivePersistentSession('om_mojo_prepared_recovery');
     s.backendType = 'mojo';
@@ -739,6 +1088,30 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(forkWorker).not.toHaveBeenCalled();
   });
 
+  it('restores same-named ZMX targets from their individual persisted directories', async () => {
+    const first = makeActivePersistentSession('om_zmx_directory_a', 'zmx');
+    const second = makeActivePersistentSession('om_zmx_directory_b', 'zmx');
+    first.persistentBackendTarget = { backendType: 'zmx', sessionName: 'bmx-same', socketDir: '/tmp/restore-a' };
+    second.persistentBackendTarget = { backendType: 'zmx', sessionName: 'bmx-same', socketDir: '/tmp/restore-b' };
+    sessionStore.updateSession(first);
+    sessionStore.updateSession(second);
+    const snapshot = (env?: NodeJS.ProcessEnv) => ({
+      ok: true as const, sessions: env?.ZMX_DIR === '/tmp/restore-a' ? ['bmx-same'] : [],
+      unhealthySessions: [], raw: '',
+    });
+    vi.mocked(ZmxBackend.probeSessions).mockImplementationOnce(snapshot).mockImplementationOnce(snapshot);
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(ZmxBackend.probeSessions).toHaveBeenCalledTimes(2);
+    expect(forkWorker).toHaveBeenCalledTimes(1);
+    expect(forkWorker).toHaveBeenCalledWith(expect.objectContaining({ session: expect.objectContaining({ sessionId: first.sessionId }) }), '', true);
+    expect(sessionStore.getSession(second.sessionId)!.status).toBe('active');
+    expect(closeSession).not.toHaveBeenCalled();
+  });
+
   it('classifies multiple ZMX restore rows from one full-list snapshot', async () => {
     const first = makeActivePersistentSession('om_zmx_batch_1', 'zmx');
     const second = makeActivePersistentSession('om_zmx_batch_2', 'zmx');
@@ -775,6 +1148,27 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     expect(map.get(sessionKey('om_cli_mismatch', 'app_test'))).toBeUndefined();
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
     expect(forkWorker).not.toHaveBeenCalled();
+  });
+
+  it.each(['exists', 'missing', 'unknown'] as const)('restores a legacy-bound Codex session after the bot switched CLI with backing %s', async (backing) => {
+    probe.result = backing;
+    const s = makeActivePersistentSession('om_legacy_bound');
+    s.cliId = 'codex';
+    s.agentFrozen = true;
+    s.cliInstanceBinding = { version: 1, source: 'legacy', instanceId: null, cliId: 'codex', codexHome: '/private/legacy-home', authMode: 'global' };
+    sessionStore.updateSession(s);
+    sessionStore.init();
+    bot.cliId = 'traex';
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    await restoreActiveSessions(map);
+
+    expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
+    expect(sessionStore.getSession(s.sessionId)).toMatchObject({ status: 'active', cliId: 'codex', cliInstanceBinding: s.cliInstanceBinding });
+    expect(map.get(sessionKey(s.rootMessageId, 'app_test'))?.session.cliInstanceBinding).toEqual(s.cliInstanceBinding);
+    if (backing === 'exists') expect(forkWorker).toHaveBeenCalled();
+    else expect(forkWorker).not.toHaveBeenCalled();
   });
 
   it('CLI mismatch on restore preserves and reattaches an unsettled Codex App ledger', async () => {
@@ -1352,6 +1746,22 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
     expect(wp.registry!.get(sessionKey('om_rt_fresh', 'app_test'))).toBeDefined();
   });
 
+  it.each(['pool', 'default', 'legacy'] as const)('keeps %s-bound Codex sessions across a different bot CLI/runtime default without a pool', async (source) => {
+    const s = makeActivePersistentSession('om_instance_sticky');
+    s.cliId = 'codex';
+    s.agentFrozen = true;
+    s.cliInstanceBinding = { version: 1, source, instanceId: source === 'legacy' ? null : 'a', cliId: 'codex', codexHome: '/private/instance-a', authMode: source === 'legacy' ? 'global' : 'isolated' };
+    sessionStore.updateSession(s);
+    const ds = registerDs(s);
+    bot.cliId = 'traex';
+    bot.cliPathOverride = '/different/runtime';
+    const outcome = await closeCliMismatchedSessionsForBot('app_test');
+    expect(outcome).toMatchObject({ closed: 0 });
+    expect(closeSession).not.toHaveBeenCalledWith(s.sessionId);
+    expect(wp.registry!.get(sessionKey(s.rootMessageId, 'app_test'))).toBe(ds);
+    expect(sessionStore.getSession(s.sessionId)?.status).toBe('active');
+  });
+
   it('closes wrapper-axis mismatches for frozen sessions', async () => {
     const s = makeActivePersistentSession('om_rt_wrapper');
     s.wrapperCli = 'aiden x claude';
@@ -1361,6 +1771,21 @@ describe('closeCliMismatchedSessionsForBot — runtime CLI hot-switch sweep', ()
 
     expect(await closeCliMismatchedSessionsForBot('app_test'))
       .toMatchObject({ closed: 1 });
+    expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
+  });
+
+  it('closes legacy unfrozen TraeX sessions when the bot switches to Forge x TraeX', async () => {
+    bot.cliId = 'traex';
+    bot.cliLaunchMode = 'forge-traex';
+    const s = makeActivePersistentSession('om_rt_legacy_traex_forge');
+    s.cliId = 'traex';
+    s.agentFrozen = false;
+    sessionStore.updateSession(s);
+    registerDs(s);
+
+    expect(await closeCliMismatchedSessionsForBot('app_test'))
+      .toMatchObject({ closed: 1 });
+    expect(closeSession).toHaveBeenCalledWith(s.sessionId);
     expect(sessionStore.getSession(s.sessionId)!.status).toBe('closed');
   });
 

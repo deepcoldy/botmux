@@ -769,6 +769,60 @@ describe('webhook new-group lifecycle', () => {
     expect(proxyToDaemon).toHaveBeenCalledTimes(2);
     expect((await a.json()).lifecycle).toMatchObject({ action: 'create', chatId: 'oc_fresh' });
   });
+
+  it('uses a fixed lifecycle group name for every fresh group when configured', async () => {
+    const createLifecycleGroup = vi.fn(async () => ({ chatId: 'oc_fixed_name', creatorLarkAppId: 'app1' }));
+    const proxyToDaemon = vi.fn(async () => ({
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, action: 'delivered', target: { kind: 'turn', chatId: 'oc_fixed_name' } }),
+    })) as any;
+    await startWebhookServer({ createLifecycleGroup, proxyToDaemon });
+    const connector = await seedNoDedupConnector();
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    upsertConnector({ ...connector, lifecycleGroupName: { mode: 'fixed', text: '固定处理群' } });
+
+    const res = await fetch(`${baseUrl}/webhook/conn_nodedup/tok_plain_value`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{"x":1}',
+    });
+
+    expect(res.status).toBe(200);
+    expect(createLifecycleGroup).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'conn_nodedup' }),
+      expect.objectContaining({ groupName: '固定处理群' }),
+    );
+  });
+
+  it('renders a lifecycle group name template from the webhook payload', async () => {
+    const createLifecycleGroup = vi.fn(async () => ({ chatId: 'oc_templated_name', creatorLarkAppId: 'app1' }));
+    const proxyToDaemon = vi.fn(async () => ({
+      status: 200,
+      text: async () => JSON.stringify({ ok: true, action: 'delivered', target: { kind: 'turn', chatId: 'oc_templated_name' } }),
+    })) as any;
+    await startWebhookServer({ createLifecycleGroup, proxyToDaemon });
+    const connector = await seedNewGroupConnector();
+    const { upsertConnector } = await import('../src/services/connector-store.js');
+    upsertConnector({
+      ...connector,
+      lifecycleGroupName: { mode: 'template', text: '告警 {{payload.name}} #{{$.payload.id}} {{source}}' },
+    });
+
+    const result = await postWebhook('conn_new_group', 'nonce_group_name_template', {
+      name: 'ROOT_NAME',
+      alert: { id: 'cpu-high' },
+      payload: { id: 'wi_1', name: 'CPU 过高' },
+    });
+
+    expect(result.status).toBe(200);
+    expect(createLifecycleGroup).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'conn_new_group' }),
+      expect.objectContaining({
+        dedupKey: 'cpu-high',
+        groupName: '告警 CPU 过高 #wi_1 alerts',
+      }),
+    );
+  });
 });
 
 describe('webhook suppressFinalOutput passthrough', () => {

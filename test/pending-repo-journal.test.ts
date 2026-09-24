@@ -65,6 +65,11 @@ describe('pending repository setup journal', () => {
 
     stagePendingRepoSetup(ds, {
       mode: 'auto_worktree', baseDir: '/repos/base', turnId: 'turn-n',
+      force: true,
+      worktreePath: '/repos/base-wt-botmux-abc',
+      branch: 'wt/botmux-abc',
+      reuseExisting: true,
+      targetSubdir: 'packages/app',
     });
 
     expect(ds.session.queued).toBe(true);
@@ -77,6 +82,11 @@ describe('pending repository setup journal', () => {
       rawInput: '/goal exact raw',
       turnId: 'turn-n',
       baseDir: '/repos/base',
+      force: true,
+      worktreePath: '/repos/base-wt-botmux-abc',
+      branch: 'wt/botmux-abc',
+      reuseExisting: true,
+      targetSubdir: 'packages/app',
       codexAppText: 'visible opening',
       codexAppApplicationContext: '<trusted>app</trusted>',
       codexAppMessageContext: '<trusted>message</trusted>',

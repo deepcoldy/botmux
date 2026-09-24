@@ -39,9 +39,15 @@
  *   - Non-adopt + send observed in window: suppress. The window is
  *     [turn.markTimeMs, nextBoundaryMs). Legacy markers only carry time,
  *     so any marker in the window still suppresses. Newer markers carry the
- *     normalized length of the explicit `botmux send` body. When the
- *     transcript final is available, only emit fallback if that final is
- *     materially longer than any single explicit send in the same window.
+ *     normalized length of the explicit `botmux send` body. A marker tagged
+ *     responseKind/replyCardResponseKind 'final' is an explicit final-answer
+ *     delivery, so it suppresses the fallback UNCONDITIONALLY (regardless of
+ *     length) under EVERY replyDelivery, including when the marker carries no
+ *     body length at all (image-only / voice sends) — see the note on
+ *     markerSetDuplicatesFinal. That comparison only ever runs for
+ *     progress/kind-less sends. When the transcript final is available, only
+ *     emit fallback if that final is materially longer than any single
+ *     explicit send in the same window.
  *     This lets short progress updates surface a later substantive final
  *     answer, while same-size rewrites and short acknowledgements stay
  *     suppressed. Boundary handling intentionally also considers
@@ -194,8 +200,11 @@ export function bridgePostText(finalText: string, adoptMode: boolean): string {
 export interface BridgeSendMarker {
   sentAtMs: number;
   messageId?: string;
+  responseKind?: 'progress' | 'final' | 'auxiliary';
   turnId?: string;
   dispatchAttempt?: number;
+  /** Present only for opted-in managed replies; legacy marker semantics stay intact. */
+  replyCardResponseKind?: 'progress' | 'final' | 'auxiliary';
   contentLength?: number;
   /** Bounded, whitespace-compacted copy for dashboard session previews.
    *  The fallback gate still uses contentLength only. */
@@ -283,11 +292,66 @@ function markerSetCoversFinal(markers: readonly BridgeSendMarker[], finalText: s
   return !finalIsMateriallyLongerThanSends(finalNormalized.length, structuredMarkers);
 }
 
+/** A bounded preview is a prefix of the send body, with a trailing「…」when it
+ *  was cut. Compare it against the final on that basis. */
+function previewMatchesFinal(previewText: string, finalNormalized: string): boolean {
+  const body = previewText.endsWith('…') ? previewText.slice(0, -1) : previewText;
+  const normalizedPreview = normaliseForFingerprint(body);
+  if (!normalizedPreview) return true;
+  return finalNormalized.startsWith(normalizedPreview);
+}
+
+/**
+ * transcript-mode duplicate test — the counterpart of {@link markerSetCoversFinal}.
+ *
+ * Under `send` the final is a FALLBACK, so "the model already sent something
+ * comparable" is reason enough to drop it. Under `transcript` the final IS the
+ * delivery channel, so the same reasoning would silently eat the turn's real
+ * answer whenever the model also pushed something mid-turn (an attachment note,
+ * a progress line) — and mid-turn sends are explicitly legitimate there.
+ *
+ * So the bar is inverted: suppress ONLY when the final is the same content that
+ * already went out. A marker stores the fingerprint-normalized LENGTH plus a
+ * bounded preview, never the full body, so "same content" is judged by exact
+ * length equality confirmed by the preview prefix. Anything of a different
+ * length is delivered.
+ *
+ * Markers with no `contentLength` (`botmux send --images` with no body, and the
+ * `--voice` path, whose marker is hand-assembled) cannot establish equality at
+ * all, so they never suppress HERE — a duplicate message is a far cheaper
+ * failure than a silently swallowed answer. This leniency applies only to
+ * progress/kind-less markers: an explicit responseKind='final' marker, body or
+ * no body, is already an unconditional return-true in shouldSuppressBridgeEmit
+ * before this function is reached, under every replyDelivery (an image-only or
+ * voice `--response-kind final` IS the declared final delivery; letting the
+ * transcript final through would double-post).
+ */
+function markerSetDuplicatesFinal(markers: readonly BridgeSendMarker[], finalText: string | undefined): boolean {
+  const finalNormalized = normaliseForFingerprint(finalText ?? '');
+  // Empty final. This is NOT only "the model said nothing": emitReadyCodexTurns
+  // re-runs this gate for SYNTHESISED failure cards / empty-turn diagnostics,
+  // whose visible text lives in `content`, never in finalText. Suppressing them
+  // unconditionally would swallow the failure reason on a turn where the model
+  // sent nothing at all — and it would not even match `send`, which delivers on
+  // "empty final + zero markers" (markerSetCoversFinal returns false there).
+  // So mirror that: suppress only when something actually went out this turn.
+  if (!finalNormalized) return markers.length > 0;
+  return markers.some(marker => {
+    if (marker.contentLength !== finalNormalized.length) return false;
+    return marker.previewText === undefined
+      || previewMatchesFinal(marker.previewText, finalNormalized);
+  });
+}
+
 export function shouldSuppressBridgeEmit(
   turn: BridgeGateInput,
   nextBoundaryMs: number | undefined,
   markers: readonly BridgeSendMarker[],
   adoptMode: boolean,
+  /** How this session's final reply reaches Lark. Under 'transcript' the final
+   *  is the delivery channel rather than a fallback, which inverts two of the
+   *  rules below. Defaults to the historical 'send' semantics. */
+  replyDelivery: 'send' | 'transcript' = 'send',
 ): boolean {
   if (adoptMode) return false;
   if (isBridgeNothingToSendFinal(turn.finalText)) return true;
@@ -295,7 +359,20 @@ export function shouldSuppressBridgeEmit(
   if (turn.markTimeMs === undefined) return false;
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
-  const markersInWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper);
+  const inWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper);
+  // An explicit `botmux send --response-kind final` already delivered this
+  // turn's final answer to Lark. The unified-reply path also writes
+  // replyCardResponseKind='final'; the plain (non-unified) path writes only
+  // responseKind='final' (replyCardResponseKind is absent). Suppress the
+  // terminal-transcription fallback in both cases, otherwise the same answer
+  // is double-posted (e.g. Chinese answer sent, then an English summary).
+  // Managed-card progress/auxiliary markers are not final deliveries.
+  if (inWindow.some(m => m.responseKind === 'final'
+      && (m.replyCardResponseKind === undefined || m.replyCardResponseKind === 'final'))) {
+    return true;
+  }
+  const markersInWindow = inWindow.filter(m => m.replyCardResponseKind === undefined
+    || m.replyCardResponseKind === 'final');
   // A trailing sentinel line is the model's explicit "I have nothing more to
   // send" signal. Split the two prose+sentinel cases by whether the model
   // ALREADY sent this turn:
@@ -313,7 +390,10 @@ export function shouldSuppressBridgeEmit(
   const visibleFinalText = turn.finalText === undefined
     ? undefined
     : stripTrailingOaiMemoryCitation(turn.finalText);
-  if (visibleFinalText !== undefined
+  // transcript 例外：那里 prose 就是本轮答案，模型习惯性在末尾补 sentinel
+  // （提示词仍教它）不该让整轮答案消失。剥掉 sentinel 后交给下面的重复判定。
+  if (replyDelivery !== 'transcript'
+      && visibleFinalText !== undefined
       && hasTrailingBridgeSentinelLine(visibleFinalText)
       && markersInWindow.length > 0) {
     return true;
@@ -326,7 +406,9 @@ export function shouldSuppressBridgeEmit(
   const gatedFinal = visibleFinalText === undefined
     ? undefined
     : stripTrailingBridgeSentinelLine(visibleFinalText);
-  return markerSetCoversFinal(markersInWindow, gatedFinal);
+  return replyDelivery === 'transcript'
+    ? markerSetDuplicatesFinal(markersInWindow, gatedFinal)
+    : markerSetCoversFinal(markersInWindow, gatedFinal);
 }
 
 /** Some structured CLIs can report a durable completed turn while their
@@ -362,15 +444,16 @@ export function shouldEmitEmptyCompletedBridgeFallback(
   nextBoundaryMs: number | undefined,
   markers: readonly BridgeSendMarker[],
   adoptMode: boolean,
+  replyDelivery: 'send' | 'transcript' = 'send',
 ): boolean {
   if (adoptMode) return false;
   if (turn.isLocal) return false;
   if (turn.terminalStatus !== undefined && turn.terminalStatus !== 'completed') return false;
   if ((turn.finalText ?? '').trim().length > 0) return false;
-  return !shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode);
+  return !shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode, replyDelivery);
 }
 
-/** 结构化失败回合补发可见错误；部分回答不能替代失败原因。 */
+/** 结构化失败回合补发可见错误；进度回复不能替代失败原因。 */
 export function shouldEmitFailedBridgeFallback(
   turn: BridgeGateInput,
   nextBoundaryMs: number | undefined,
@@ -380,7 +463,52 @@ export function shouldEmitFailedBridgeFallback(
   if (adoptMode) return false;
   if (turn.isLocal) return false;
   if (turn.terminalStatus !== 'failed') return false;
-  return !shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode);
+  // A bare sentinel is an explicit request for silence, even when the provider
+  // also reports a failed terminal. Never turn that internal token into visible
+  // failure content.
+  if (isBridgeNothingToSendFinal(turn.finalText)) return false;
+  // A progress/final send only proves that some user-facing content was already
+  // delivered; it cannot replace the structured terminal failure reason. The
+  // existing delivery path uses the current turn's stable key for deduplication.
+  return true;
+}
+
+/** Failure fallbacks are terminal diagnostics, not another model answer. Only
+ * bypass marker-based suppression; preserve deliberate silence and the existing
+ * local/adopt ownership gates. Non-failure output keeps the ordinary gate. */
+export function shouldSuppressStructuredFallback(
+  fallbackKind: StructuredFallbackKind,
+  turn: BridgeGateInput,
+  nextBoundaryMs: number | undefined,
+  markers: readonly BridgeSendMarker[],
+  adoptMode: boolean,
+  /** failed 走下面的 mode-agnostic 三门禁，用不到它；non-failed 必须透传，
+   *  否则 transcript 下的重复判定会退回 send 缺省的「明显更长才放行」。 */
+  replyDelivery: 'send' | 'transcript' = 'send',
+): boolean {
+  if (fallbackKind !== 'failed') {
+    return shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode, replyDelivery);
+  }
+  return adoptMode || Boolean(turn.isLocal) || isBridgeNothingToSendFinal(turn.finalText);
+}
+
+/** Compose a failed-turn diagnostic without replaying partial text that the
+ * ordinary marker gate already classifies as delivered or deliberately kept
+ * out of chat. Any retained partial text is sentinel-cleaned before the
+ * diagnostic is appended, so the protocol token can never become body text. */
+export function composeFailedBridgeFallbackContent(
+  failureText: string,
+  turn: BridgeGateInput,
+  nextBoundaryMs: number | undefined,
+  markers: readonly BridgeSendMarker[],
+  adoptMode: boolean,
+  replyDelivery: 'send' | 'transcript' = 'send',
+): string {
+  if (shouldSuppressBridgeEmit(turn, nextBoundaryMs, markers, adoptMode, replyDelivery)) {
+    return failureText;
+  }
+  const visiblePartialText = bridgePostText(turn.finalText ?? '', adoptMode).trim();
+  return visiblePartialText ? `${visiblePartialText}\n\n${failureText}` : failureText;
 }
 
 /** Which fallback content the worker should post for a ready structured turn.
@@ -401,15 +529,18 @@ export function structuredFallbackKind(
   markers: readonly BridgeSendMarker[],
   adoptMode: boolean,
   hasDedicatedRateLimitChain: boolean,
+  replyDelivery: 'send' | 'transcript' = 'send',
 ): StructuredFallbackKind {
   const rateLimitHandled = hasDedicatedRateLimitChain
     && turn.terminalErrorCode === CODEX_RATE_LIMIT_ERROR_CODE;
+  // failed 判定在 #1337 之后是 mode-agnostic 的（恒开，只留 adopt / isLocal /
+  // 裸 sentinel 三道门禁，不读 markers），所以这里不传 replyDelivery。
   if (!rateLimitHandled
     && shouldEmitFailedBridgeFallback(turn, nextBoundaryMs, markers, adoptMode)) {
     return 'failed';
   }
   if (turn.finalText && turn.finalText.trim()) return 'final';
-  if (shouldEmitEmptyCompletedBridgeFallback(turn, nextBoundaryMs, markers, adoptMode)) {
+  if (shouldEmitEmptyCompletedBridgeFallback(turn, nextBoundaryMs, markers, adoptMode, replyDelivery)) {
     return 'empty_completed';
   }
   return 'none';

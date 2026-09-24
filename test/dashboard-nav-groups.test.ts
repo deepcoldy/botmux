@@ -66,4 +66,13 @@ describe('dashboard sidebar nav grouping', () => {
     const ghosts = groupedIds().filter(id => !ids.has(id));
     expect(ghosts, `NAV_GROUPS references unknown ids: ${ghosts.join(', ')}`).toEqual([]);
   });
+
+  it('keeps message-listener styles within the workbench radius contract', () => {
+    const style = readFileSync(
+      fileURLToPath(new URL('../src/dashboard/web/style.css', import.meta.url)),
+      'utf8',
+    );
+    const listenerStyles = style.slice(style.indexOf('.message-listener-page'));
+    expect(listenerStyles).not.toContain('var(--radius-xl)');
+  });
 });

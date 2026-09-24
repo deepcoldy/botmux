@@ -53,6 +53,43 @@ describe('DaemonRegistry', () => {
     rmSync(empty, { recursive: true, force: true });
   });
 
+  it('coalesces a burst of watch events into one refresh per window', async () => {
+    // 55 daemons heartbeating together = ~220 watch events in a few seconds;
+    // refreshing on each one re-read every descriptor ~220 times (measured
+    // ~12,000 synchronous reads per burst on the dashboard's event loop).
+    vi.useFakeTimers();
+    writeDesc('appA', 7892);
+    const reg = new DaemonRegistry(dir, { refreshIntervalMs: 0, watchDebounceMs: 250 });
+    await reg.start();
+    const refresh = vi.spyOn(reg as unknown as { refresh(): void }, 'refresh');
+    const onWatchEvent = () => (reg as unknown as { scheduleWatchRefresh(): void }).scheduleWatchRefresh();
+
+    for (let i = 0; i < 50; i++) onWatchEvent();
+    expect(refresh).not.toHaveBeenCalled();     // nothing yet: the window is open
+
+    writeDesc('appB', 7893);                    // a change landing inside the window…
+    await vi.advanceTimersByTimeAsync(250);
+    expect(refresh).toHaveBeenCalledTimes(1);   // …is picked up by the single coalesced refresh
+    expect(reg.list().map(d => d.larkAppId).sort()).toEqual(['appA', 'appB']);
+
+    // A second burst after the window closes gets its own refresh.
+    for (let i = 0; i < 10; i++) onWatchEvent();
+    await vi.advanceTimersByTimeAsync(250);
+    expect(refresh).toHaveBeenCalledTimes(2);
+    reg.stop();
+  });
+
+  it('refreshes on every watch event when the coalescing window is disabled', async () => {
+    vi.useFakeTimers();
+    writeDesc('appA', 7892);
+    const reg = new DaemonRegistry(dir, { refreshIntervalMs: 0, watchDebounceMs: 0 });
+    await reg.start();
+    const refresh = vi.spyOn(reg as unknown as { refresh(): void }, 'refresh');
+    for (let i = 0; i < 5; i++) (reg as unknown as { scheduleWatchRefresh(): void }).scheduleWatchRefresh();
+    expect(refresh).toHaveBeenCalledTimes(5);
+    reg.stop();
+  });
+
   it('polls descriptors so missed fs.watch heartbeat updates do not mark daemons stale', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(1_000);

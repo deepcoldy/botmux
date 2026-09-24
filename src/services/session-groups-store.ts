@@ -47,9 +47,11 @@ export interface SessionGroupEntry {
    * being re-judged against the brand-new chat id (which no chatGrant, no
    * quota counter and no expiry has ever seen). Without this, the auto-written
    * oncall binding — created only to carry the working dir — became the group's
-   * talk source: unlimited when no `messageQuota.defaultLimit` is configured,
-   * a FRESH per-group allowance when one is, and `restrictGrantCommands`
-   * silently defeated because the reason was no longer `chatGrant`/`globalGrant`.
+   * talk source: unmetered (the oncall leg never attaches a quotaKey), and
+   * `restrictGrantCommands` silently defeated because the reason was no longer
+   * `chatGrant`/`globalGrant`. (Historically it was ALSO a fresh per-group
+   * allowance whenever `messageQuota.defaultLimit` was set; oncall no longer
+   * reads that field — see event-dispatcher's oncallTalk.)
    *
    * Typed as a plain string (not `TalkReason`) on purpose: importing the type
    * from `im/lark/event-dispatcher` would close an import cycle, since the

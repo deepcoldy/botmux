@@ -2,6 +2,7 @@ import { getBot } from '../bot-registry.js';
 import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import { resolveCliRuntime, runtimePathOverride } from '../adapters/cli/runtime.js';
 import { decorateResumeForWrapper } from '../setup/cli-selection.js';
+import { decorateResumeForCliLaunchMode } from './cli-launch-mode.js';
 import { buildSessionClosedCard } from '../im/lark/card-builder.js';
 import { sessionAnchorId, type DaemonSession } from './types.js';
 import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
@@ -52,6 +53,8 @@ export function buildClosedSessionCard(ds: DaemonSession, locale: Locale): strin
   const frozenPath = runtimePathOverride(frozenRuntime);
   const frozenWrapper = ds.session.wrapperCli
     ?? (ds.session.agentFrozen ? undefined : botCfg.wrapperCli);
+  const frozenLaunchMode = ds.session.cliLaunchMode
+    ?? (ds.session.agentFrozen ? undefined : botCfg.cliLaunchMode);
   // The `-m` in the printed ttadk resume command must match what botmux itself
   // would launch, and the model is NOT frozen with the rest of the launch
   // posture — it follows the live bot config on every spawn.
@@ -72,9 +75,11 @@ export function buildClosedSessionCard(ds: DaemonSession, locale: Locale): strin
       // ttadk 网关：resume 命令必须带 `-m <model> --skip-check`（模型取 bot.model），
       // 否则用户复制粘贴这条命令会卡在 ttadk 的交互式选模型菜单（CoCo 不带 -m）。
       if (!raw) return null;
-      return frozenWrapper
-        ? decorateResumeForWrapper(raw, frozenWrapper, { ttadkModel: frozenModel })
-        : frozenPath
+      return frozenLaunchMode
+        ? decorateResumeForCliLaunchMode(raw, frozenLaunchMode)
+        : frozenWrapper
+          ? decorateResumeForWrapper(raw, frozenWrapper, { ttadkModel: frozenModel })
+          : frozenPath
           ? replaceResumeExecutable(raw, frozenPath)
           : raw;
     } catch { return null; }

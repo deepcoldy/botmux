@@ -30,6 +30,11 @@ import {
 import type { EffectiveMojoConfig } from '../src/adapters/backend/mojo-types.js';
 import { isLinux } from './helpers/synthetic-proc.js';
 
+/** The fake `mojo` is a bash script spawned per turn; under a loaded parallel
+ *  vitest run its first stdout line can take well over vi.waitFor's 1s default
+ *  (observed on macOS: green alone, red in the full suite). Budget, not a sleep. */
+const SESSION_ID_WAIT_MS = 15_000;
+
 let binDir: string;
 
 describe('Mojo close budgets', () => {
@@ -172,7 +177,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-known","war
     backend.spawn('', [], {} as never);
     backend.write('start');
 
-    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-known'));
+    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-known'), { timeout: SESSION_ID_WAIT_MS });
     await expect(backend.destroySession()).resolves.toMatchObject({
       ok: false,
       taskId: 'sid-known',

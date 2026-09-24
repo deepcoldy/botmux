@@ -25,8 +25,8 @@ import { DASHBOARD_H5_ENV_PREFIX } from './child-env.js';
 
 /**
  * Keys the dashboard process reads from ~/.botmux/.env, beyond
- * {@link DAEMON_ENV_KEYS} (which is folded in below: every key baked into the
- * shared PM2 env block is by definition a setting the dashboard may resolve,
+ * {@link DAEMON_ENV_KEYS} (which is folded in below: every key pinned into the
+ * shared fleet env is by definition a setting the dashboard may resolve,
  * and a foreground/manual `dist/index-dashboard.js` has only the file).
  *
  * Each entry names its consumer inside the dashboard process, so a future
@@ -83,7 +83,7 @@ export function isDashboardEnvKey(key: string): boolean {
  *
  * Semantics kept identical to the previous wholesale `dotenvConfig({ path })`
  * for allowlisted keys — a value already present in `target` wins, so the
- * deterministic PM2 snapshot (resolveDaemonEnv → DAEMON_ENV_KEYS) still
+ * deterministic fleet snapshot (resolveDaemonEnv → DAEMON_ENV_KEYS) still
  * outranks the file. The difference is everything else in the file: it is
  * parsed into a private object and dropped.
  *

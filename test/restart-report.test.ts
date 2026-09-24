@@ -180,6 +180,18 @@ describe('sendRestartReportIfPending', () => {
     expect(existsSync(restartIntentPathIn(dir))).toBe(false); // still consumed (no retry storm)
   });
 
+  it('consumes the intent but skips the DM when restart notifications are disabled', async () => {
+    writeRestartIntentTo(dir, { kind: 'manual', at: new Date(T0).toISOString() });
+    const log = vi.fn();
+    const { w, sent } = fakeWiring({ notifyOnRestart: false, log });
+
+    await sendRestartReportIfPending(w);
+
+    expect(sent).toHaveLength(0);
+    expect(log).toHaveBeenCalledWith(expect.stringContaining('notifyOnRestart=false'));
+    expect(existsSync(restartIntentPathIn(dir))).toBe(false); // consumed so it cannot leak into a later restart
+  });
+
   it('fires at most once — a second call after consume sends nothing', async () => {
     writeRestartIntentTo(dir, { kind: 'manual', at: new Date(T0).toISOString() });
     const { w, sent } = fakeWiring();

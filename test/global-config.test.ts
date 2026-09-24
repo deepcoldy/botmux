@@ -3,6 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, s
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
+  clearWorkerConfig,
   GROUP_NAME_PREFIX_MAX_LENGTH,
   globalVcMeetingAgentListenerBotAppId,
   globalConfigPath,
@@ -11,6 +12,7 @@ import {
   isWorkflowFeatureEnabled,
   mergeDashboardConfig,
   mergeGlobalConfig,
+  mergeWorkerConfig,
   readGlobalConfig,
   writeCodexNotifierConfig,
   writeHostOverloadAlertConfig,
@@ -176,6 +178,34 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().groupNamePrefix).toBeUndefined();
     expect(raw).not.toHaveProperty('groupNamePrefix');
     expect(raw.futureSetting).toBe('keep-me');
+  });
+
+  it('validates worker memory policy and preserves future sibling keys on update', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      worker: {
+        memoryAdmissionEnabled: false,
+        minAvailableMemoryBytes: 4 * 1024 ** 3,
+        maxMemoryFullAvg10: 15.5,
+        sessionMemoryMaxBytes: 8 * 1024 ** 3,
+        futurePolicy: { version: 2 },
+      },
+    }));
+    expect(readGlobalConfig().worker).toEqual({
+      memoryAdmissionEnabled: false,
+      minAvailableMemoryBytes: 4 * 1024 ** 3,
+      maxMemoryFullAvg10: 15.5,
+      sessionMemoryMaxBytes: 8 * 1024 ** 3,
+    });
+    mergeWorkerConfig({ maxMemoryFullAvg10: 25 });
+    const raw = JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
+    expect(raw.worker.futurePolicy).toEqual({ version: 2 });
+    expect(readGlobalConfig().worker?.maxMemoryFullAvg10).toBe(25);
+    expect(readGlobalConfig().worker?.memoryAdmissionEnabled).toBe(false);
+
+    clearWorkerConfig();
+    const cleared = JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
+    expect(cleared.worker).toEqual({ futurePolicy: { version: 2 } });
+    expect(readGlobalConfig().worker).toBeUndefined();
   });
 
   it('drops invalid repoPickerMode values', () => {
@@ -476,5 +506,61 @@ describe('global dashboard config', () => {
     expect(raw.dashboard.publicReadOnly).toBe(false);
     expect(raw.dashboard.openTerminalInFeishu).toBe(true);
     expect(raw.dashboard.localCliOpenMode).toBe('attach');
+  });
+});
+
+describe('global sessionCleanup config', () => {
+  let home: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'botmux-session-cleanup-config-'));
+    vi.stubEnv('HOME', home);
+    mkdirSync(dirname(globalConfigPath()), { recursive: true });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('reads a full sessionCleanup block', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: true, olderThanHours: 72, intervalMinutes: 30 },
+    }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({
+      enabled: true, olderThanHours: 72, intervalMinutes: 30,
+    });
+  });
+
+  it('drops an unsupported olderThanHours but keeps the rest', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: true, olderThanHours: 12, intervalMinutes: 15 },
+    }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({ enabled: true, intervalMinutes: 15 });
+  });
+
+  it('drops a sub-floor intervalMinutes and floors a fractional one', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: true, intervalMinutes: 1 },
+    }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({ enabled: true });
+
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: true, intervalMinutes: 90.7 },
+    }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().sessionCleanup).toEqual({ enabled: true, intervalMinutes: 90 });
+  });
+
+  it('ignores a non-object sessionCleanup', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ sessionCleanup: 'nope' }));
+    expect(readGlobalConfig().sessionCleanup).toBeUndefined();
+  });
+
+  it('drops a non-boolean enabled', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: 'yes', olderThanHours: 24 },
+    }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({ olderThanHours: 24 });
   });
 });

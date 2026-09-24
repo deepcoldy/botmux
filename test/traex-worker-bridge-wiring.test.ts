@@ -146,27 +146,29 @@ describe('TRAE worker structured-bridge wiring', () => {
     expect(ctx).toContain('traexHistorySidOwnedByCurrentPid(sid)');
   });
 
-  it('resolves the real traex leaf under an outer bwrap supervisor (sandbox pid)', () => {
+  it('resolves the real traex leaf under a launcher process', () => {
     // Under the file sandbox / credential-only bwrap, getChildPid() is the bwrap
     // supervisor, not traex. resolveTraexOwnershipPid BFS-descends to the leaf so
-    // the ownership gate can admit the id; gated on outerBwrapActive (sandbox OR
-    // credential-only bwrap, since both produce an outer supervisor).
+    // the ownership gate can admit the id. Forge x TraeX has the same launcher
+    // shape: the observed child is forge, while the rollout owner is traex.
     const start = workerSource.indexOf('function resolveTraexOwnershipPid');
     const body = workerSource.slice(start, workerSource.indexOf('\n}\n', start));
     expect(body).toContain("findLaunchedCliPid(candidatePid, 'traex')");
     expect(workerSource).toContain('const outerBwrapActive = sandboxRequested || credentialOnlyBwrap;');
+    expect(workerSource).toContain("const traexLauncherActive = outerBwrapActive || cfg.cliLaunchMode === 'forge-traex';");
+    expect(workerSource).toContain('lastSpawnTraexLauncherActive = traexLauncherActive;');
   });
 
   it('drives the sandbox leaf resolver as a BOUNDED RETRY (leaf may not be forked yet)', () => {
     // One-shot resolution loses the common case where bwrap has not exec'd traex
-    // at wire time. startTraexSandboxPidResolve reuses scheduleWrapperRealCliPid
-    // (the same bounded-retry + stale-backend guard as the wrapperCli resolver),
-    // and both the sync and zellij-async wiring sites kick it.
-    const start = workerSource.indexOf('const startTraexSandboxPidResolve');
+    // at wire time. The same is true for Forge spawning traex as an agent.
+    // startTraexLauncherPidResolve reuses scheduleWrapperRealCliPid (bounded
+    // retry + stale-backend guard), and both sync and zellij-async sites kick it.
+    const start = workerSource.indexOf('const startTraexLauncherPidResolve');
     const body = workerSource.slice(start, start + 900);
     expect(body).toContain('scheduleWrapperRealCliPid(launcherPid');
     expect(body).toContain("findLaunchedCliPid(lp, 'traex')");
-    const kicks = workerSource.match(/if \(cfg\.cliId === 'traex' && outerBwrapActive\) startTraexSandboxPidResolve\(/g) ?? [];
+    const kicks = workerSource.match(/if \(cfg\.cliId === 'traex' && traexLauncherActive\) startTraexLauncherPidResolve\(/g) ?? [];
     expect(kicks.length).toBeGreaterThanOrEqual(2);
   });
 

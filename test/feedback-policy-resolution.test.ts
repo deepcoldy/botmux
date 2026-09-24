@@ -120,6 +120,49 @@ describe('feedback policy layered resolution', () => {
     expect(resolveFeedbackPolicyForDelivery({ dataDir, larkAppId: 'appB', chatId: 'sameChat', bot: botB })).toMatchObject({ allowReselect: true });
   });
 
+  it('merges a reviewers allowlist across layers and fails closed on an invalid merged whole', () => {
+    // audience and reviewers may legitimately arrive from different layers.
+    expect(resolveEffectiveFeedbackPolicy({
+      team: { enabled: true },
+      bot: { audience: 'reviewers' },
+      chat: { reviewers: ['ou_alice', 'on_bob'] },
+    })).toMatchObject({ enabled: true, audience: 'reviewers', reviewers: ['ou_alice', 'on_bob'] });
+
+    // A later layer atomically replaces the allowlist rather than concatenating.
+    expect(resolveEffectiveFeedbackPolicy({
+      team: { enabled: true, audience: 'reviewers', reviewers: ['ou_alice'] },
+      chat: { reviewers: ['ou_carol'] },
+    })).toMatchObject({ audience: 'reviewers', reviewers: ['ou_carol'] });
+
+    // Individually-valid layers can merge into an invalid whole (reviewers
+    // audience with an empty allowlist, or an allowlist without the audience) —
+    // fail closed instead of shipping a dead or mis-gated button.
+    expect(resolveEffectiveFeedbackPolicy({ team: { enabled: true, audience: 'reviewers' } })).toBeUndefined();
+    expect(resolveEffectiveFeedbackPolicy({ team: { enabled: true, reviewers: ['ou_alice'] } })).toBeUndefined();
+  });
+
+  it('format-validates a reviewers layer but leaves the audience coupling to the merged whole', () => {
+    // A partial layer may carry reviewers without audience (the coupling is only
+    // enforced once merged), but the entries must still be ids or full emails.
+    expect(normalizeFeedbackPolicyLayer({ reviewers: ['ou_alice', 'on_bob', 'alice@example.com'] })).toMatchObject({
+      reviewers: ['ou_alice', 'on_bob', 'alice@example.com'],
+    });
+    expect(() => normalizeFeedbackPolicyLayer({ reviewers: ['alice'] })).toThrow(/full email/);
+    expect(() => normalizeFeedbackPolicyLayer({ reviewers: 'ou_alice' })).toThrow(/reviewers/);
+    expect(() => normalizeFeedbackPolicyLayer({ audience: 'anyone' })).toThrow(/audience/);
+  });
+
+  it('allows everyone at any layer without a reviewers allowlist', () => {
+    expect(resolveEffectiveFeedbackPolicy({
+      team: { enabled: true },
+      chat: { audience: 'everyone' },
+    })).toMatchObject({ enabled: true, audience: 'everyone', reviewers: [] });
+    expect(resolveEffectiveFeedbackPolicy({
+      team: { enabled: true, audience: 'reviewers', reviewers: ['ou_alice'] },
+      chat: { audience: 'everyone', reviewers: [] },
+    })).toMatchObject({ audience: 'everyone', reviewers: [] });
+  });
+
   it('traces the effective source chain and reports ambiguous local team bindings', () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'feedback-trace-'));
     const a = createTeam(dataDir, 'A');

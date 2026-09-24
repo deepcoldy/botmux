@@ -208,6 +208,20 @@ describe('reconcileIdempotencyLeasesOnBoot (crash convergence)', () => {
     expect(quarantined.size).toBe(0);
   });
 
+  it('interrupted → kept intact, session NOT closed or quarantined after boot reconcile', async () => {
+    const { record } = idempotencyStore.claim({ ownerLarkAppId: OWNER, sessionId: 'sess-interrupted', triggerId: 'trg_interrupted', requestHash: 'h', ownerBootId: 'boot-OLD', key: 'k-interrupted', now: 1 }) as any;
+    idempotencyStore.transition(OWNER, 'k-interrupted', record, { state: 'attempting', now: 2 });
+    sessionRows.set('sess-interrupted', { sessionId: 'sess-interrupted', status: 'open' });
+    asyncTriggerStore.recordInterruptedStrict('sess-interrupted', 'trg_interrupted', 100, OWNER);
+
+    const quarantined = await reconcileIdempotencyLeasesOnBoot(OWNER, 'boot-CURRENT', getSession);
+
+    expect(idempotencyStore.lookup(OWNER, 'k-interrupted')).toBeDefined();
+    expect(asyncTriggerStore.lookup('sess-interrupted', 'trg_interrupted')?.result.status).toBe('interrupted');
+    expect(mockCloseSession).not.toHaveBeenCalled();
+    expect(quarantined.has('sess-interrupted')).toBe(false);
+  });
+
   it('CURRENT boot lease → skipped (not treated as previous-boot orphan)', async () => {
     const { record } = idempotencyStore.claim({ ownerLarkAppId: OWNER, sessionId: 'sess-cur', triggerId: 'trg_cur', requestHash: 'h', ownerBootId: 'boot-CURRENT', key: 'k-cur', now: 1 }) as any;
     idempotencyStore.transition(OWNER, 'k-cur', record, { state: 'attempting', now: 2 });

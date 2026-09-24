@@ -131,6 +131,37 @@ export interface WorkflowFeatureGlobalConfig {
   enabled?: boolean;
 }
 
+export interface WorkerConfig {
+  /** Default-on switch for fresh/resumed worker memory admission. */
+  memoryAdmissionEnabled?: boolean;
+  /** Refuse a fresh/resumed worker while available memory is below this value. */
+  minAvailableMemoryBytes?: number;
+  /** Refuse a fresh/resumed worker while memory full PSI avg10 reaches this percentage. */
+  maxMemoryFullAvg10?: number;
+  /** Optional per-session hard limit. Applied only after cgroup-v2 placement is verified. */
+  sessionMemoryMaxBytes?: number;
+}
+
+/** Supported idle thresholds (hours) for both the manual「清理空闲」button and
+ *  scheduled auto-cleanup. Kept in lockstep with session-cleanup's
+ *  IDLE_CLEANUP_HOUR_OPTIONS so the two paths never diverge. */
+export const SESSION_CLEANUP_HOUR_OPTIONS = [24, 72, 168] as const;
+export type SessionCleanupHours = typeof SESSION_CLEANUP_HOUR_OPTIONS[number];
+/** Bounds for the check cadence. A 5-minute floor keeps a hand-edited config
+ *  from turning the sweep into a hot loop; the default matches "once an hour". */
+export const SESSION_CLEANUP_MIN_INTERVAL_MINUTES = 5;
+export const SESSION_CLEANUP_DEFAULT_INTERVAL_MINUTES = 60;
+export const SESSION_CLEANUP_DEFAULT_HOURS: SessionCleanupHours = 168;
+
+export interface SessionCleanupGlobalConfig {
+  /** 定时自动清理空闲会话开关。缺省关闭 —— 不开启则完全保持既有（纯手动）行为。 */
+  enabled?: boolean;
+  /** 空闲阈值（小时）。仅接受 24 / 72 / 168，与手动清理按钮完全一致。缺省 168（7 天）。 */
+  olderThanHours?: SessionCleanupHours;
+  /** 检查频率（分钟）。缺省 60，最小 5（低于则回退到最小值）。 */
+  intervalMinutes?: number;
+}
+
 export interface GlobalConfig {
   lang?: Locale;
   /** Machine-wide default prefix for groups created via `/group` or `/g`.
@@ -148,6 +179,8 @@ export interface GlobalConfig {
    *  services/voice/types.ts. Presence (with usable creds) gates the
    *  "🔊 语音总结" button. */
   voice?: VoiceConfig;
+  /** Machine-wide worker admission and containment policy. */
+  worker?: WorkerConfig;
   /** Machine-wide auto-update / auto-restart schedule. Off unless explicitly
    *  enabled. Only the primary daemon (bot-0) acts on it — see core/maintenance.ts. */
   maintenance?: MaintenanceConfig;
@@ -157,6 +190,10 @@ export interface GlobalConfig {
   codexNotifier?: CodexNotifierGlobalConfig;
   /** 机器过载告警。机器级、默认关闭，由 Dashboard 管理;走所选「通知 Bot」发送。 */
   hostOverloadAlert?: HostOverloadAlertGlobalConfig;
+  /** 定时自动清理空闲会话。机器级、默认关闭，由 Dashboard 管理。开启后由 dashboard
+   *  聚合进程周期性调用与手动「清理空闲」按钮完全相同的判定/关闭逻辑
+   *  （dashboard/session-cleanup.ts），无人值守地关掉空闲超过阈值的会话。 */
+  sessionCleanup?: SessionCleanupGlobalConfig;
   /** Machine-wide meeting listener kill-switch. Missing / enabled !== false
    *  preserves legacy behavior; set false to stop accepting new VC meetings
    *  and skip restore/readiness for this host. */
@@ -227,6 +264,9 @@ export interface MaintenanceConfig {
    *  its own — reuses autoUpdate's time, fires only when there's a pending
    *  update. */
   autoRestart?: MaintenanceToggle;
+  /** Whether an intentional restart sends the owner a restart report DM.
+   *  Missing preserves the legacy behavior (enabled). */
+  notifyOnRestart?: boolean;
 }
 
 export interface MaintenanceTask {
@@ -282,6 +322,11 @@ export interface DashboardGlobalConfig {
    *  see config.ts `codexRpcInputDefault`. A per-bot `codexRpcInput: true` still
    *  force-enables regardless of this global default. */
   codexRpcInput?: boolean;
+  /** Automatically replace outdated Codex session processes when safely idle
+   *  and resume the same thread without sending a new prompt. Experimental,
+   *  default OFF; read live so an explicit true starts scheduling upgrades and
+   *  removing it stops them, both without restarting the daemon. */
+  autoUpgradeCodexSessions?: boolean;
   /** Whether botmux auto-bypasses Codex's interactive hook-trust gate ("Press t
    *  to trust") for Codex-family plain-TUI launches (codex / traex). Codex 0.14x
    *  gates the botmux-installed ~/.codex/hooks.json behind a manual trust prompt,
@@ -296,6 +341,10 @@ export interface DashboardGlobalConfig {
    *  fail-closed lower bound (a restricted bot never gets it regardless). Read live
    *  by the daemon — see config.ts `bypassCodexHookTrust`. */
   bypassCodexHookTrust?: boolean;
+  /** Suppress Codex/TraeX/CoCo's low-quota model-switch picker for managed launches.
+   *  Default ON; false leaves the CLI's own notice configuration in control.
+   *  Applied per process; never edits the user's CLI config. Aiden's gateway cannot forward it. */
+  hideCodexRateLimitModelNudge?: boolean;
   /** Experimental: inject the "no visible output" anti-resend guidance into the
    *  botmux routing hints. Counters Claude Code (≥2.1.212) thinking-only nudges
    *  that make a model resend after a silent `botmux send`-only turn. Default OFF
@@ -303,6 +352,18 @@ export interface DashboardGlobalConfig {
    *  model; harmless but unnecessary otherwise. Read live — see config.ts
    *  `noVisibleOutputHint`. */
   noVisibleOutputHint?: boolean;
+  /** Experimental: enforce cross-principal turn isolation (XPI). When a message
+   *  arrives while a DIFFERENT principal owns the active CLI turn, the daemon
+   *  diverts it into a staged `crossPrincipalInterruptions` record and asks the
+   *  proposer to classify it (另开任务 / 留给当前任务) instead of delivering it.
+   *  Human proposers use the host-ask card path. Agent proposers must declare
+   *  `botmux send --as …` before the send; the durable visible annotation
+   *  survives Feishu card re-serialization. An unclassified legacy bot message
+   *  is terminalised without publishing bot-addressed protocol traffic into the
+   *  shared topic. Default OFF (absent ⇒ off). With the switch OFF the message
+   *  is delivered exactly as it was before the feature existed. Read live — see
+   *  config.ts `crossPrincipalInterruption`. */
+  crossPrincipalInterruption?: boolean;
   /** 流式卡片上下文占用百分比变色/高亮阈值（1-100 整数）。缺省 80。由 card-builder
    *  在构建时读取（readGlobalConfig 2s TTL 缓存），低于阈值灰色、≥阈值红色并提示压缩。 */
   contextCompactThreshold?: number;
@@ -344,8 +405,8 @@ function readMaintenanceToggle(raw: unknown): MaintenanceToggle | undefined {
 }
 
 /** Validate a maintenance patch from the dashboard PUT. Type-strict on enabled
- *  (both keys) and on autoUpdate's time. autoRestart is a toggle — any `time`
- *  on it is ignored (it reuses autoUpdate's schedule). */
+ *  (both task keys), autoUpdate's time, and notifyOnRestart. autoRestart is a
+ *  toggle — any `time` on it is ignored (it reuses autoUpdate's schedule). */
 export function parseMaintenancePatch(
   body: unknown,
 ): { ok: true; patch: MaintenanceConfig } | { ok: false; error: string } {
@@ -378,6 +439,10 @@ export function parseMaintenancePatch(
     }
     patch.autoRestart = toggle;
   }
+  if ('notifyOnRestart' in b) {
+    if (typeof b.notifyOnRestart !== 'boolean') return { ok: false, error: 'invalid_notify_on_restart' };
+    patch.notifyOnRestart = b.notifyOnRestart;
+  }
   if (Object.keys(patch).length === 0) return { ok: false, error: 'empty' };
   return { ok: true, patch };
 }
@@ -390,6 +455,7 @@ function readMaintenance(raw: unknown): MaintenanceConfig | undefined {
   if (au) out.autoUpdate = au;
   const ar = readMaintenanceToggle(m.autoRestart);
   if (ar) out.autoRestart = ar;
+  if (typeof m.notifyOnRestart === 'boolean') out.notifyOnRestart = m.notifyOnRestart;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -433,16 +499,41 @@ function readDashboard(raw: unknown): DashboardGlobalConfig | undefined {
   const herdrTraexPlugin = readHerdrTraexPlugin(d.herdrTraexPlugin);
   if (herdrTraexPlugin) out.herdrTraexPlugin = herdrTraexPlugin;
   if (typeof d.codexRpcInput === 'boolean') out.codexRpcInput = d.codexRpcInput;
+  if (typeof d.autoUpgradeCodexSessions === 'boolean') out.autoUpgradeCodexSessions = d.autoUpgradeCodexSessions;
   // Round-trip an explicit boolean either way. Absent stays absent — the live
   // getter (config.ts `bypassCodexHookTrust`) treats absent as ON, so we must
   // preserve a stored `false` to let an operator disable it.
   if (typeof d.bypassCodexHookTrust === 'boolean') out.bypassCodexHookTrust = d.bypassCodexHookTrust;
+  if (typeof d.hideCodexRateLimitModelNudge === 'boolean') out.hideCodexRateLimitModelNudge = d.hideCodexRateLimitModelNudge;
   if (typeof d.noVisibleOutputHint === 'boolean') out.noVisibleOutputHint = d.noVisibleOutputHint;
+  if (typeof d.crossPrincipalInterruption === 'boolean') out.crossPrincipalInterruption = d.crossPrincipalInterruption;
   // 非法值（非数字 / NaN / 越界）静默丢弃，走 card-builder 的默认 80。
   if (typeof d.contextCompactThreshold === 'number'
     && Number.isFinite(d.contextCompactThreshold)
     && d.contextCompactThreshold >= 1 && d.contextCompactThreshold <= 100) {
     out.contextCompactThreshold = Math.round(d.contextCompactThreshold);
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function readPositiveInteger(raw: unknown): number | undefined {
+  return typeof raw === 'number' && Number.isSafeInteger(raw) && raw > 0 ? raw : undefined;
+}
+
+function readWorker(raw: unknown): WorkerConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  const out: WorkerConfig = {};
+  const minAvailableMemoryBytes = readPositiveInteger(value.minAvailableMemoryBytes);
+  const sessionMemoryMaxBytes = readPositiveInteger(value.sessionMemoryMaxBytes);
+  if (typeof value.memoryAdmissionEnabled === 'boolean') out.memoryAdmissionEnabled = value.memoryAdmissionEnabled;
+  if (minAvailableMemoryBytes !== undefined) out.minAvailableMemoryBytes = minAvailableMemoryBytes;
+  if (sessionMemoryMaxBytes !== undefined) out.sessionMemoryMaxBytes = sessionMemoryMaxBytes;
+  if (typeof value.maxMemoryFullAvg10 === 'number'
+    && Number.isFinite(value.maxMemoryFullAvg10)
+    && value.maxMemoryFullAvg10 > 0
+    && value.maxMemoryFullAvg10 <= 100) {
+    out.maxMemoryFullAvg10 = value.maxMemoryFullAvg10;
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }
@@ -509,6 +600,32 @@ function readHostOverloadAlert(raw: unknown): HostOverloadAlertGlobalConfig | un
   }
   const browserTargets = readBrowserRestartTargets(value.browserRestartTargets);
   if (browserTargets) out.browserRestartTargets = browserTargets;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Parse `sessionCleanup` from config. Whitelist known keys; drop invalid
+ *  values so a hand-edited config degrades to defaults rather than crashing.
+ *  `olderThanHours` accepts only the three supported thresholds (same set as the
+ *  manual button); `intervalMinutes` is clamped to a 5-minute floor. The tick
+ *  (dashboard/auto-cleanup.ts) layers defaults over whatever survives here. */
+function readSessionCleanup(raw: unknown): SessionCleanupGlobalConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  const out: SessionCleanupGlobalConfig = {};
+  if (typeof value.enabled === 'boolean') out.enabled = value.enabled;
+  if (
+    typeof value.olderThanHours === 'number'
+    && (SESSION_CLEANUP_HOUR_OPTIONS as readonly number[]).includes(value.olderThanHours)
+  ) {
+    out.olderThanHours = value.olderThanHours as SessionCleanupHours;
+  }
+  if (
+    typeof value.intervalMinutes === 'number'
+    && Number.isFinite(value.intervalMinutes)
+    && value.intervalMinutes >= SESSION_CLEANUP_MIN_INTERVAL_MINUTES
+  ) {
+    out.intervalMinutes = Math.floor(value.intervalMinutes);
+  }
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -638,6 +755,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (dashboard) out.dashboard = dashboard;
   const voice = readVoice(raw.voice);
   if (voice) out.voice = voice;
+  const worker = readWorker(raw.worker);
+  if (worker) out.worker = worker;
   const maintenance = readMaintenance(raw.maintenance);
   if (maintenance) out.maintenance = maintenance;
   const whiteboard = readWhiteboard(raw.whiteboard);
@@ -646,6 +765,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (codexNotifier) out.codexNotifier = codexNotifier;
   const hostOverloadAlert = readHostOverloadAlert(raw.hostOverloadAlert);
   if (hostOverloadAlert) out.hostOverloadAlert = hostOverloadAlert;
+  const sessionCleanup = readSessionCleanup(raw.sessionCleanup);
+  if (sessionCleanup) out.sessionCleanup = sessionCleanup;
   const vcMeetingAgent = readVcMeetingAgent(raw.vcMeetingAgent);
   if (vcMeetingAgent) out.vcMeetingAgent = vcMeetingAgent;
   const workflow = readWorkflowFeature(raw.workflow);
@@ -788,6 +909,35 @@ export function isWorkflowFeatureEnabled(env: NodeJS.ProcessEnv = process.env): 
   return readGlobalConfig().workflow?.enabled === true;
 }
 
+/**
+ * Machine-wide experimental switch for cross-principal turn isolation (XPI).
+ *
+ * OFF (the default) restores the pre-#1348 delivery shape exactly: a message
+ * from another principal is appended to the queue and delivered to the active
+ * CLI turn like any other message — no divert, no staged record, no
+ * classification card. Agent-to-agent sends classify up front with
+ * `botmux send --as …`; human proposers use the host-ask card path. Legacy bot
+ * messages without a choice are terminalised instead of entering an unbounded
+ * wait or publishing recursive control traffic.
+ *
+ * Mirrors isWorkflowFeatureEnabled: `BOTMUX_XPI_ENABLED` wins when set (an
+ * escape hatch for a single daemon / a test), otherwise the dashboard toggle.
+ * Read live off the short-TTL config cache, so flipping Settings applies to the
+ * next turn without a daemon restart. Worker and daemon each call this on their
+ * own side; a mid-turn flip can only change what happens to the NEXT message,
+ * never rewrite an authority tuple already in flight.
+ */
+export function isCrossPrincipalInterruptionEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const flag = env.BOTMUX_XPI_ENABLED;
+  if (flag != null && flag !== '') {
+    const v = flag.trim().toLowerCase();
+    return v === 'true' || v === '1' || v === 'yes' || v === 'on';
+  }
+  return readGlobalConfig().dashboard?.crossPrincipalInterruption === true;
+}
+
 /** Derive repo-picker scan options from the machine-wide `repoPickerMode`.
  *  'repos' hides linked worktrees from selection cards; anything else
  *  (default 'all') lists repos + their worktrees. Shared by every scan
@@ -833,6 +983,32 @@ export function mergeDashboardConfig(patch: DashboardGlobalConfig): DashboardGlo
     : {};
   mergeGlobalConfig({ dashboard: { ...existing, ...patch } as DashboardGlobalConfig });
   return readGlobalConfig().dashboard ?? {};
+}
+
+/** Merge worker policy without deleting future keys written by a newer client. */
+export function mergeWorkerConfig(patch: WorkerConfig): WorkerConfig {
+  const raw = readRawConfig();
+  const existing = raw.worker && typeof raw.worker === 'object' && !Array.isArray(raw.worker)
+    ? raw.worker as Record<string, unknown>
+    : {};
+  mergeGlobalConfig({ worker: { ...existing, ...patch } as WorkerConfig });
+  return readGlobalConfig().worker ?? {};
+}
+
+/** Clear the worker keys this version owns without deleting future policy keys. */
+export function clearWorkerConfig(): WorkerConfig {
+  const raw = readRawConfig();
+  if (!raw.worker || typeof raw.worker !== 'object' || Array.isArray(raw.worker)) {
+    mergeGlobalConfig({ worker: null });
+    return {};
+  }
+  const remaining = { ...raw.worker as Record<string, unknown> };
+  delete remaining.memoryAdmissionEnabled;
+  delete remaining.minAvailableMemoryBytes;
+  delete remaining.maxMemoryFullAvg10;
+  delete remaining.sessionMemoryMaxBytes;
+  mergeGlobalConfig({ worker: Object.keys(remaining).length > 0 ? remaining as WorkerConfig : null });
+  return readGlobalConfig().worker ?? {};
 }
 
 /** 写入 notifier 的完整已知配置，同时保留配置块内的未来字段。 */

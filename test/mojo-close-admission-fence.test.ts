@@ -31,6 +31,11 @@ import {
   normalizeDestroyResult,
 } from '../src/adapters/backend/destroy-result.js';
 
+/** The fake `mojo` is a bash script spawned per turn; under a loaded parallel
+ *  vitest run its first stdout line can take well over vi.waitFor's 1s default
+ *  (observed on macOS: green alone, red in the full suite). Budget, not a sleep. */
+const SESSION_ID_WAIT_MS = 15_000;
+
 let binDir: string;
 beforeAll(() => { binDir = mkdtempSync(join(tmpdir(), 'mojo-admission-')); });
 afterAll(() => { rmSync(binDir, { recursive: true, force: true }); });
@@ -105,7 +110,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-adm","warni
     const backend = new FastProofBackend({ bin }, 'session-under-test');
     backend.spawn('', [], {} as never);
     backend.write('start');
-    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-adm'));
+    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-adm'), { timeout: SESSION_ID_WAIT_MS });
 
     const result = await withUnprovableChild(backend, () => backend.destroySession());
 
@@ -147,7 +152,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-report","wa
     const backend = new FastProofBackend({ bin }, 'session-under-test');
     backend.spawn('', [], {} as never);
     backend.write('start');
-    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-report'));
+    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-report'), { timeout: SESSION_ID_WAIT_MS });
     await withUnprovableChild(backend, () => backend.destroySession());
 
     const outcome = interpretAbortOutcome(await backend.abortDestroySession());
@@ -178,7 +183,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-lifetime","
     const backend = new FastProofBackend({ bin }, 'session-under-test');
     backend.spawn('', [], {} as never);
     backend.write('start');
-    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-lifetime'));
+    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-lifetime'), { timeout: SESSION_ID_WAIT_MS });
 
     // First close: local termination cannot be proven → fence latches.
     await withUnprovableChild(backend, () => backend.destroySession());
@@ -208,7 +213,7 @@ exit 0`);
     const backend = new FastProofBackend({ bin }, 'session-under-test');
     backend.spawn('', [], {} as never);
     backend.write('start');
-    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-torn'));
+    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-torn'), { timeout: SESSION_ID_WAIT_MS });
     await vi.waitFor(() => {
       expect((backend as unknown as { child: unknown }).child).toBeNull();
     }, { timeout: 10_000 });
@@ -284,7 +289,7 @@ exit 0`);
     const backend = new FastProofBackend({ bin }, 'session-under-test');
     backend.spawn('', [], {} as never);
     backend.write('start');
-    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-cancelfail'));
+    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-cancelfail'), { timeout: SESSION_ID_WAIT_MS });
     await vi.waitFor(() => {
       expect((backend as unknown as { child: unknown }).child).toBeNull();
     }, { timeout: 10_000 });
@@ -413,7 +418,7 @@ echo '{"type":"result","status":"ok","result":"ok","session_id":"sid-cache","war
     const backend = new FastProofBackend({ bin }, 'session-under-test');
     backend.spawn('', [], {} as never);
     backend.write('start');
-    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-cache'));
+    await vi.waitFor(() => expect(backend.cliSessionIdForTest).toBe('sid-cache'), { timeout: SESSION_ID_WAIT_MS });
     (backend as unknown as { terminateChildProven: () => Promise<TerminationOutcome> })
       .terminateChildProven = async () => ({
         ok: true,

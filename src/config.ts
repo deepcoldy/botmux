@@ -4,6 +4,7 @@ import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { resolveWorkerHttpHost } from './utils/worker-http.js';
 import {
   globalVcMeetingAgentListenerBotAppId,
+  isCrossPrincipalInterruptionEnabled,
   isGlobalVcMeetingAgentEnabled,
   readGlobalConfig,
 } from './global-config.js';
@@ -112,6 +113,28 @@ export interface HerdrTraexPluginRuntimeConfig {
   enabled: boolean;
   source: string;
   ref: string;
+}
+
+/** Startup-only handoff for a local companion process.
+ *
+ * This is deliberately a path, not a secret value: this resolver performs no
+ * file IO. The startup boundary validates/loads the dedicated file and never
+ * logs or falls back to the Dashboard/internal HMAC secret. */
+export interface CompanionStartupConfig {
+  secretFile: string | undefined;
+  botAppId: string | undefined;
+}
+
+/** The sole supported private secret-file configuration input. */
+export const COMPANION_SECRET_FILE_ENV = 'BOTMUX_COMPANION_SECRET_FILE';
+export const COMPANION_BOT_APP_ID_ENV = 'BOTMUX_COMPANION_BOT_APP_ID';
+
+/** Resolve the fixed scoped startup handoff without touching the secret file. */
+export function resolveCompanionStartupConfig(env: NodeJS.ProcessEnv = process.env): CompanionStartupConfig {
+  return {
+    secretFile: nonBlankHost(env[COMPANION_SECRET_FILE_ENV]),
+    botAppId: nonBlankHost(env[COMPANION_BOT_APP_ID_ENV]),
+  };
 }
 
 /**
@@ -274,6 +297,10 @@ export const config = {
      *  要回到 env 控制需删掉 config.json 里的 dashboard.publicReadOnly）. */
     publicReadOnly: (process.env.BOTMUX_DASHBOARD_PUBLIC_READONLY ?? 'true').toLowerCase() !== 'false',
   },
+  // A local companion process consumes this typed handoff. Keep it separate
+  // from dashboard/daemon HMAC configuration: there is intentionally no
+  // default path and therefore no credential reuse.
+  companion: resolveCompanionStartupConfig(),
   stuckDetector: {
     /**
      * Lightweight, AI-free fallback that warns the user when a written input
@@ -327,6 +354,10 @@ export const config = {
   // ON. A per-bot codexRpcInput:true still force-enables; the dashboard toggle
   // sets this global explicitly.
   get codexRpcInputDefault(): boolean { return readGlobalConfig().dashboard?.codexRpcInput === true; },
+  // Default OFF (experimental; only an explicit stored true enables). Read live
+  // so a Dashboard change gates the next session upgrade without restarting
+  // daemons or changing the current turn.
+  get autoUpgradeCodexSessions(): boolean { return readGlobalConfig().dashboard?.autoUpgradeCodexSessions === true; },
   // Live getter (like codexRpcInputDefault): re-reads the experimental global
   // toggle that gates the "no visible output" anti-resend guidance in the botmux
   // routing hints, so a Settings change takes effect on the next session without
@@ -335,6 +366,14 @@ export const config = {
   // thinking-only nudge as a send failure; it is harmless but unnecessary for the
   // common all-Claude setup, so operators opt in explicitly.
   get noVisibleOutputHint(): boolean { return readGlobalConfig().dashboard?.noVisibleOutputHint === true; },
+  // Live getter (like noVisibleOutputHint): the experimental cross-principal
+  // interruption (XPI) switch. Default OFF (absent ⇒ disabled) — with it off the
+  // daemon delivers another principal's message normally instead of diverting it
+  // into a staged record, i.e. exactly the pre-#1348 behavior. Read per message
+  // so a Settings flip applies to the next turn without a daemon restart; the
+  // worker reads the same switch through isCrossPrincipalInterruptionEnabled so
+  // both ends of the IPC agree. `BOTMUX_XPI_ENABLED` overrides for one process.
+  get crossPrincipalInterruption(): boolean { return isCrossPrincipalInterruptionEnabled(); },
   // Live getter: whether to auto-bypass Codex's interactive hook-trust gate for
   // Codex-family plain-TUI launches. Re-read per spawn so a Settings toggle takes
   // effect on the next session without a daemon restart (existing panes keep their
@@ -342,6 +381,7 @@ export const config = {
   // stored `false` disables it. The daemon ANDs this with each bot's
   // `!disableCliBypass` before handing it to the adapter (see worker init).
   get bypassCodexHookTrust(): boolean { return readGlobalConfig().dashboard?.bypassCodexHookTrust !== false; },
+  get hideCodexRateLimitModelNudge(): boolean { return readGlobalConfig().dashboard?.hideCodexRateLimitModelNudge !== false; },
 };
 
 // allowedUsers is mutable — daemon resolves email prefixes to open_ids at startup

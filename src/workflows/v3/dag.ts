@@ -747,7 +747,7 @@ function validateHostInputShape(
       required: ['name', 'schedule', 'prompt', 'workingDir', 'chatId', 'chatType', 'larkAppId'],
       allowed: [
         'name', 'schedule', 'prompt', 'workingDir', 'chatId',
-        'chatType', 'rootMessageId', 'scope', 'larkAppId', 'repeat', 'deliver',
+        'chatType', 'rootMessageId', 'scope', 'larkAppId', 'ownerOpenId', 'repeat', 'deliver',
       ],
     },
   };

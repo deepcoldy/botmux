@@ -30,7 +30,7 @@ dsh 是 DeepSeek 开源的 agent harness（cordis 插件架构，opencode 血统
   - 请求 3 个：`initialize {cwd, provider, model, maxTokens?}` → `{serverInfo}`；`session/prompt {sessionId, contentBlocks}` → `{messageId}`（入队回执，**不是最终结果**）；`shutdown`。
   - 通知 4 个：`session.event {sessionId, event}`（完整事件流）、`session.status {sessionId, status: 'idle'|'running'}`、`subagent.started`、`subagent.finished`。
   - session 语义：`sessionId` 由客户端指定，未知 id 懒创建；**同一连接内**复用 id 即多轮（server 内存 Map 持有 agent）。
-- runtime 启动走**标准 profile 机制**：`dsh --profile <name>`（botmux 默认 `botmux`）。profile 位于 `~/.dsh/profiles/<name>/`，dsh 以其中的 **`package.json` 判定 profile 是否存在**（不是目录、也不是 `cordis.yml`），且只有 `web` / `headless` 是 shipped template——其它 profile 不会被 CLI 自动创建，需要先落盘骨架（`package.json` 声明 `dsh-base` bundle + `cordis.yml` 空数组 + `cordis.patch.yml`），再 `dsh plugin --profile <name> add <pkg>` 把依赖装进 profile 的 `node_modules`（dsh 自己**不会**触发安装）。插件组合由 `cordis.patch.yml` 在 `dsh-base` 之上叠加。会话根目录 `$DSH_SESSION_ROOT`（默认进程 cwd 下 `./.sessions`），工作目录 `$DSH_CWD`。
+- runtime 启动走**标准 profile 机制**：`dsh --profile <name>`（botmux 默认 `botmux`）。profile 位于 `$DSH_HOME/profiles/<name>/`（未设置 `DSH_HOME` 时默认 `~/.dsh/profiles/<name>/`），dsh 以其中的 **`package.json` 判定 profile 是否存在**（不是目录、也不是 `cordis.yml`），且只有 `web` / `headless` 是 shipped template——其它 profile 不会被 CLI 自动创建，需要先落盘骨架（`package.json` 声明 `dsh-base` bundle + `cordis.yml` 空数组 + `cordis.patch.yml`），再 `dsh plugin --profile <name> add <pkg>` 把依赖装进 profile 的 `node_modules`（dsh 自己**不会**触发安装）。插件组合由 `cordis.patch.yml` 在 `dsh-base` 之上叠加。会话根目录 `$DSH_SESSION_ROOT`（默认进程 cwd 下 `./.sessions`），工作目录 `$DSH_CWD`。
   - `cordis.patch.yml` 的条目有两种语义，混用会静默失效：`- insert: [...]` 才是**插入**新 entry；裸 `- id: X`（无 `insert`）是对**已存在** entry 的覆盖，目标 id 不存在时只 warn + 跳过。所以 botmux 的默认 patch 只 insert `dsh-base` 真正缺的 `sdk-jsonrpc-server`，其余能力全部沿用 `dsh-base`（agent / llm / bash / fs / sessions / sandbox / subagent 等 70+ 行），并 disable 掉 headless 下会阻塞 `loader.await()` 的 Web GUI 行（`hmr` / `web` / `web-search-deepseek` / `tool-web`）。
   - `@deepseek-ai/dsh-*` 目前**只发 prerelease**，且 `latest` dist-tag 指向的是很早的版本（实测 `dsh-sdk-jsonrpc-server`：`latest → 0.0.1-rc.5`、`next → 0.1.1-rc.2`）。因此依赖范围必须带 prerelease 标识（`^0.1.1-rc.1`）——`^0.1.1` 乃至 `*` 都解析不到任何版本，`npm install` 会直接 `ETARGET`。
 - 模型鉴权：`DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` 环境变量。
@@ -57,7 +57,7 @@ dsh 是 DeepSeek 开源的 agent harness（cordis 插件架构，opencode 血统
       ▼
 dsh-runner.js（长驻 Node 进程）
   ├─ spawn: dsh --profile botmux
-  │    env: DSH_SESSION_ROOT=~/.dsh/sessions/botmux/<id>, DSH_CWD, credentials
+  │    env: DSH_SESSION_ROOT=$DSH_HOME/sessions/botmux/<id>, DSH_CWD, credentials
   ├─ initialize（握手，provider, model）
   ├─ 每 turn：session/prompt（固定 sessionId，连接内多轮）
   ├─ session.event → 工具调用渲染成进度行写 stdout（worker 当卡片渲染）
@@ -87,7 +87,7 @@ worker 解码 final → 投递飞书
 | `readyPattern` | `/›/`（runner 握手完成后打印 `›`） |
 | `deferFirstPromptTimeoutUntilReady` | `true` |
 | `modelChoices` | `['deepseek-v4-flash', 'deepseek-v4-pro']` |
-| `authPaths` | `['~/.dsh']`（adapter 在进沙盒前预创建） |
+| `authPaths` | 有效 DSH home（`process.env.DSH_HOME` 或默认 `~/.dsh`，adapter 在进沙盒前预创建）；dsh-tui 额外包含 `~/.dsh-tui` |
 | `buildResumeCommand` | `() => null`（v1 不支持） |
 
 ### 5.2 `src/dsh-runner.ts`（新增，~450 行）
@@ -96,7 +96,7 @@ worker 解码 final → 投递飞书
 
 **boot**：
 1. 解析 profile 名称：`--dsh-profile`（默认 `botmux`）。
-2. `spawn(dshBin, ['--profile', profileName], {env: {...process.env, DSH_SESSION_ROOT: ~/.dsh/sessions/botmux/<session-id>, DSH_CWD: cwd}})`。
+2. 先解析有效 DSH home（`process.env.DSH_HOME` 或默认 `~/.dsh`），再 `spawn(dshBin, ['--profile', profileName], {env: {...process.env, DSH_SESSION_ROOT: <dshHome>/sessions/botmux/<session-id>, DSH_CWD: cwd}})`。
 3. NDJSON 握手：发 `initialize {cwd, provider, model, maxTokens: 49152}`，等 result；超时 30s → lifecycle fatal 退出。
 4. 成功后 stdout 打印 `›`（ready 标记）。
 
@@ -137,8 +137,8 @@ runner→dsh（SDK JSON-RPC，NDJSON over stdio）：见 2.2。
 
 ### 5.4 配置与注册点
 
-- **profile 配置**：`~/.dsh/profiles/botmux/cordis.patch.yml`，在 `dsh-base` bundle 基础上叠加社区插件（sdk-jsonrpc-server、archify-skill-filesystem、openviking-memory、genui 等）和 LLM provider（llm-pi-ai 通过 traex-bridge）。`dsh --profile botmux` 自动 compose 完整插件树。
-- **bots.json**：`"cliId": "dsh"`，`"env": {"DEEPSEEK_API_KEY": "..."}`，可选 `"model": "deepseek-v4-pro"`、`"workingDir"`。
+- **profile 配置**：`$DSH_HOME/profiles/botmux/cordis.patch.yml`（未设置 `DSH_HOME` 时默认 `~/.dsh/profiles/botmux/cordis.patch.yml`），在 `dsh-base` bundle 基础上叠加社区插件（sdk-jsonrpc-server、archify-skill-filesystem、openviking-memory、genui 等）和 LLM provider（llm-pi-ai 通过 traex-bridge）。`dsh --profile botmux` 自动 compose 完整插件树。
+- **bots.json**：`"cliId": "dsh"`，`"env": {"DEEPSEEK_API_KEY": "..."}`，可选 `"model": "deepseek-v4-pro"`、`"workingDir"`。`DSH_HOME` 只能在 daemon 进程级环境中配置，per-bot `env.DSH_HOME` 被保留/拒绝，避免 adapter 预创建路径与 child 实际 profile 路径分裂。
 - **注册点**（照 `src/adapters/cli/CLAUDE.md`）：
   1. `src/adapters/cli/types.ts` CliId 加 `'dsh'`
   2. `src/adapters/cli/registry.ts`：import + `RAW_CLI_EXECUTABLES['dsh']` + switch case
@@ -209,7 +209,20 @@ runner 在首轮用户消息前插入（后续轮不插）：
 4. **双重沙箱**：默认 cordis.yml 不含 landlock 沙箱插件，v1 靠 botmux 沙箱兜底，无冲突。
 5. **密钥**：DEEPSEEK_API_KEY 走 bots.json env 注入，不进配置文件、不落盘。
 
-## 11. 已知限制（v2 backlog）
+## 11. ask_user_question bridge（2026-09-02）
+
+botmux 不改 dsh-tui 源码，而是通过 DSH profile overlay 注入一个 botmux 生成的 question bridge：
+
+- official `dsh` runner：启动 `dsh --profile <name> --patch=<bridgePatch>`，patch 只对本次进程生效，不写用户 profile 的 `cordis.patch.yml`。
+- `dshRuntime='tui'`：启动 `dsh-tui --patch=<bridgePatch>`，且必须使用单 token `--patch=/abs/path`；split form `--patch /abs/path` 会被 dsh-tui launcher 的 workspace-target 逻辑吞掉 path。
+- 新版 DSH（waterfall）：bridge 监听 `user-questions/request`，用 `{ prepend: true }` 抢在原生 answerer 前；unsupported 时 dsh-tui `next()` 回原生 UI，official dsh 抛可见错误。
+- legacy DSH（`registerProvider()` 单 seat）：official botmux 默认 profile 无原生 provider，可注册 bridge provider；dsh-tui 则使用 wrapper patch（disable 原 `id: dsh-tui` + insert 唯一 wrapper entry），wrapper 先临时 wrap `registerProvider()`，把 dsh-tui 原生 provider 包成 composite provider：botmux-first、失败/unsupported 时 native fallback。
+- bridge 调 `botmux hook dsh` / `botmux hook dsh-tui` 必须使用 `hookCommandParts()` 生成 argv，不能依赖全局 shim、shell 字符串或手写 `dist/cli.js` 路径。
+- 路由身份仍由 worker 注入 env/capability 与 daemon `/api/asks` 绑定，bridge payload 不携带也不信任 session/chat/root/app 身份。
+- MVP 只接管每题都有 >=2 个合法 option label 的 request；text-only、plan-review、混合 unsupported request 整体 fallback/error。
+- 线上回滚：设置 `BOTMUX_DSH_ASK_BRIDGE=0`，然后重启 daemon/worker 或对会话执行 `/restart`，新进程不再注入 bridge patch。
+
+## 12. 已知限制（v2 backlog）
 
 - **跨重启 resume**：dsh SDK server 无 create-or-resume；`agents.create` 不 resume，持久化层拒绝同 ID 覆盖。runner 重启后开新会话（随机 sessionId）。需要 dsh 上游支持。
 - **中断/取消**：SDK 协议无 cancel；worker 杀 runner 重拉即取消，但会丢当前会话上下文（配合上一条，无法 resume）。

@@ -42,6 +42,8 @@ function activeSession(): any {
   };
 }
 
+const SCHEDULED_TURN_ID = 'schedule:abcdef12:12345678-1234-1234-1234-123456789abc';
+
 describe('POST /api/current-actor', () => {
   it.skipIf(process.platform !== 'linux')('returns only the daemon-resolved actor for a live CLI descendant', async () => {
     vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(activeSession());
@@ -75,5 +77,37 @@ describe('POST /api/current-actor', () => {
       status: 'blocked',
       error: 'current_actor_unverified',
     });
+  });
+
+  it.skipIf(process.platform !== 'linux')('binds an expected scheduled turn to daemon liveness', async () => {
+    const ds = activeSession();
+    ds.managedTurnOrigin.turnId = SCHEDULED_TURN_ID;
+    ds.scheduledTurnCallers = new Map([[SCHEDULED_TURN_ID, {
+      requestUserOpenId: 'ou_current',
+      requestLarkAppId: 'cli_app',
+      source: 'schedule_creator',
+      taskId: 'abcdef12',
+    }]]);
+    vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(ds);
+    ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+
+    const accepted = await fetch(`http://127.0.0.1:${ipc.port}/api/current-actor`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sessionId: 's-actor', expectedScheduledTurnId: SCHEDULED_TURN_ID,
+      }),
+    });
+    expect(accepted.status).toBe(200);
+
+    ds.scheduledTurnCallers = undefined;
+    const rejected = await fetch(`http://127.0.0.1:${ipc.port}/api/current-actor`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        sessionId: 's-actor', expectedScheduledTurnId: SCHEDULED_TURN_ID,
+      }),
+    });
+    expect(rejected.status).toBe(403);
   });
 });

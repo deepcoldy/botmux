@@ -69,6 +69,7 @@ export interface MessageListenerData {
     includeKeywords?: string[];
     matchMode?: 'any' | 'all';
   };
+  replyPolicy?: { mode?: 'thread' | 'chat'; sessionMode?: 'per_message' };
 }
 
 export interface MessageListenerPreviewItem {
@@ -176,6 +177,12 @@ export function hashChatId(hash = location.hash): string | null {
   const [, query = ''] = hash.split('?');
   const chatId = new URLSearchParams(query).get('chatId')?.trim();
   return chatId || null;
+}
+
+export function hashBotId(hash = location.hash): string | null {
+  const [, query = ''] = hash.split('?');
+  const botId = new URLSearchParams(query).get('botId')?.trim();
+  return botId || null;
 }
 
 export function roleKey(larkAppId: string, chatId: string): string {

@@ -1,10 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../src/utils/user-token.js', () => ({
-  resolveUserToken: vi.fn(async () => 'u-test'),
+  // Feed groups are the OWNER's own inbox labels, so this layer resolves
+  // credentials through the owner-scoped entry point.
+  resolveOwnerUserToken: vi.fn(async () => 'u-test'),
 }));
 
-import { resolveUserToken } from '../src/utils/user-token.js';
+import { resolveOwnerUserToken } from '../src/utils/user-token.js';
 import { addChatToFeedGroup, createFeedGroup, FeedGroupApiError, listFeedGroups } from '../src/dashboard/feed-groups.js';
 
 const bot = { larkAppId: 'cli_test', larkAppSecret: 'secret', brand: 'feishu' as const };
@@ -14,7 +16,7 @@ function response(data: Record<string, unknown>, status = 200): Response {
 }
 
 describe('dashboard native Feishu feed groups', () => {
-  beforeEach(() => vi.mocked(resolveUserToken).mockResolvedValue('u-test'));
+  beforeEach(() => vi.mocked(resolveOwnerUserToken).mockResolvedValue('u-test'));
 
   it('paginates and normalizes live labels', async () => {
     const fetcher = vi.fn()
@@ -42,7 +44,7 @@ describe('dashboard native Feishu feed groups', () => {
   });
 
   it('reports login-required without making an API request', async () => {
-    vi.mocked(resolveUserToken).mockResolvedValueOnce(null);
+    vi.mocked(resolveOwnerUserToken).mockResolvedValueOnce(null);
     const fetcher = vi.fn();
     await expect(listFeedGroups(bot, fetcher)).rejects.toMatchObject<Partial<FeedGroupApiError>>({ code: 'user_login_required', status: 401 });
     expect(fetcher).not.toHaveBeenCalled();

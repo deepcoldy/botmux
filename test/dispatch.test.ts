@@ -21,6 +21,7 @@ import {
   appendDispatchReportProtocol,
   appendLegacyDispatchReportProtocol,
   buildDispatchCompletionBrief,
+  buildProjectDispatchSyncAction,
   parseDispatchBotSpec,
   buildDispatchMessages,
   buildRepoPrimeText,
@@ -33,6 +34,7 @@ import {
   recordDispatchInputCommit,
   resolveReportPlacement,
   resolveReportRecipient,
+  resolveReportRecipientForSession,
   resolveReportTarget,
   resolveSendTarget,
   threadRootForReachability,
@@ -103,6 +105,26 @@ describe('buildDispatchMessages', () => {
 
   it('throws on an empty title', () => {
     expect(() => buildDispatchMessages({ title: '   ', brief: 'b', bots })).toThrow();
+  });
+});
+
+describe('buildProjectDispatchSyncAction', () => {
+  const input = {
+    dispatchRoot: 'om_existing', title: '', purpose: '', owners: ['worker-a'],
+    status: 'in_progress' as const, progress: 20,
+  };
+
+  it('omits lifecycle and owners when coordinating an existing topic', () => {
+    expect(buildProjectDispatchSyncAction({ ...input, existingDispatch: true })).toEqual({
+      action: 'dispatch', dispatchRoot: 'om_existing', title: '', purpose: '',
+    });
+  });
+
+  it('includes initial projection fields for a newly dispatched topic', () => {
+    expect(buildProjectDispatchSyncAction({ ...input, existingDispatch: false })).toEqual({
+      action: 'dispatch', dispatchRoot: 'om_existing', title: '', purpose: '',
+      owners: ['worker-a'], status: 'in_progress', progress: 20,
+    });
   });
 });
 
@@ -654,6 +676,93 @@ describe('resolveReportRecipient', () => {
   });
 });
 
+describe('resolveReportRecipientForSession', () => {
+  const reviewer = 'ou_reviewer';
+  const user = 'ou_user';
+  const source = {
+    sessionId: 'chat', larkAppId: 'cli_worker', chatId: 'oc_task',
+    rootMessageId: 'om_dispatch', scope: 'chat' as const, status: 'active',
+    creatorOpenId: reviewer, createdAt: '2026-08-07T07:30:00Z',
+  };
+  const current = {
+    ...source, sessionId: 'thread', rootMessageId: 'om_thread', scope: 'thread' as const,
+    creatorOpenId: user, ownerOpenId: user, createdAt: '2026-08-07T07:45:00Z',
+  };
+  const input = {
+    session: current, sessions: [source, current], knownPeerBotOpenIds: new Set([reviewer]),
+    recipientRoot: 'om_dispatch',
+  };
+
+  it('inherits the creator of the exact recipient root', () => {
+    expect(resolveReportRecipientForSession(input)).toEqual({
+      openId: reviewer, source: 'recipient-root-chat-creator', sourceSessionId: 'chat',
+    });
+  });
+
+  it('inherits the source creator for a legacy thread without scope', () => {
+    expect(resolveReportRecipientForSession({ ...input, session: { ...current, scope: undefined } }))
+      .toEqual({ openId: reviewer, source: 'recipient-root-chat-creator', sourceSessionId: 'chat' });
+  });
+
+  it('does not override a peer creator in the current thread', () => {
+    expect(resolveReportRecipientForSession({
+      ...input, session: { ...current, creatorOpenId: 'ou_current_peer' },
+      knownPeerBotOpenIds: new Set([reviewer, 'ou_current_peer']),
+    })).toEqual({ openId: 'ou_current_peer', source: 'session-creator' });
+  });
+
+  it.each([
+    { status: 'closed' }, { scope: 'thread' as const }, { scope: undefined }, { larkAppId: 'cli_other' },
+    { chatId: 'oc_other' }, { rootMessageId: 'om_other' },
+    { createdAt: current.createdAt }, { createdAt: '2026-08-08T00:00:00Z' },
+    { createdAt: 'invalid' }, { creatorOpenId: 'ou_human' }, { creatorOpenId: undefined },
+  ])('fails closed for an invalid explicit source: %j', overrides => {
+    expect(() => resolveReportRecipientForSession({ ...input, sessions: [{ ...source, ...overrides }, current] }))
+      .toThrow('--recipient-root');
+  });
+
+  it.each([
+    { status: 'closed' }, { scope: 'chat' as const }, { sessionId: undefined },
+    { larkAppId: undefined }, { chatId: undefined }, { createdAt: 'invalid' },
+  ])('fails closed for an invalid current session: %j', overrides => {
+    expect(() => resolveReportRecipientForSession({ ...input, session: { ...current, ...overrides } }))
+      .toThrow('--recipient-root');
+  });
+
+  it('keeps the session creator when no recipient root is supplied', () => {
+    expect(resolveReportRecipientForSession({ ...input, recipientRoot: undefined }))
+      .toEqual({ openId: user, source: 'session-creator' });
+  });
+
+  it.each(['', ' ', 'invalid', 'om_', `om_${'x'.repeat(129)}`, 'om_missing'])('fails closed for root %j', recipientRoot => {
+    expect(() => resolveReportRecipientForSession({ ...input, recipientRoot })).toThrow('--recipient-root');
+  });
+
+  it('requires sender-scoped peer evidence', () => {
+    expect(() => resolveReportRecipientForSession({ ...input, knownPeerBotOpenIds: new Set() }))
+      .toThrow('--recipient-root');
+  });
+
+  it.each([reviewer, 'ou_human'])('rejects structural ambiguity before verifying %s', creatorOpenId => {
+    expect(() => resolveReportRecipientForSession({ ...input, sessions: [source, { ...source, sessionId: 'other', creatorOpenId }, current] }))
+      .toThrow('--recipient-root');
+  });
+
+  it('rejects a missing explicit source even when the current creator is a peer', () => {
+    expect(() => resolveReportRecipientForSession({ ...input, sessions: [current], session: { ...current, creatorOpenId: reviewer } }))
+      .toThrow('--recipient-root');
+  });
+
+  it.each([
+    [{ creatorOpenId: ' creator ', ownerOpenId: 'owner' }, { openId: 'creator', source: 'session-creator' }],
+    [{ creatorOpenId: ' ', ownerOpenId: ' owner ' }, { openId: 'owner', source: 'session-owner' }],
+    [{ quoteTargetSenderOpenId: ' quote ' }, { openId: 'quote', source: 'quote-sender' }],
+    [{}, { source: 'none' }],
+  ])('preserves the historical fallback: %j', (session, expected) => {
+    expect(resolveReportRecipientForSession({ ...input, recipientRoot: undefined, session })).toEqual(expected);
+  });
+});
+
 describe('resolveReportPlacement', () => {
   const base = {
     chatScope: true,
@@ -992,6 +1101,26 @@ describe('acceptedDispatchBotAppIds', () => {
       notBeforeMs: sentAt,
       isWorkerAlive,
     })).toEqual(['cli_repo']);
+  });
+
+  it('keeps a rootless ordinary chat-scope turn unbound instead of falling back to a stale session root', () => {
+    const session = {
+      larkAppId: 'cli_repo',
+      chatId: 'oc_target',
+      rootMessageId: 'om_stale_trace_root',
+      scope: 'chat' as const,
+      status: 'active',
+      pid: workerPid,
+      workerGeneration,
+    };
+
+    expect(recordDispatchInputCommit(
+      session,
+      turnId,
+      workerGeneration,
+      '2026-07-14T09:00:01.000Z',
+    )).toBe(false);
+    expect(session.dispatchInputReceipts).toBeUndefined();
   });
 
   it('rejects a receipt from the previous worker generation after replacement', () => {

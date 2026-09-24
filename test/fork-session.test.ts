@@ -154,8 +154,8 @@ describe('isForkCapableSession', () => {
     } as any);
   });
 
-  it('accepts claude-code / seed / relay / codex / grok (terminal)', () => {
-    for (const cliId of ['claude-code', 'seed', 'relay', 'codex', 'grok'] as const) {
+  it('accepts claude-code / seed / relay / codex / traex / grok (terminal)', () => {
+    for (const cliId of ['claude-code', 'seed', 'relay', 'codex', 'traex', 'grok'] as const) {
       const ds = makeSourceDs({ cliId });
       expect(isForkCapableSession(ds)).toBe(true);
     }
@@ -177,6 +177,15 @@ describe('isForkCapableSession', () => {
       botName: 'TestBot',
     } as any);
     const ds = makeSourceDs({ cliId: 'codex' });
+    expect(isForkCapableSession(ds)).toBe(false);
+  });
+
+  it('refuses a traex session running under Hybrid RPC input', () => {
+    vi.mocked(getBot).mockReturnValue({
+      config: { cliId: 'traex', larkAppId: 'cli_app_test', codexRpcInput: true },
+      botName: 'TestBot',
+    } as any);
+    const ds = makeSourceDs({ cliId: 'traex' });
     expect(isForkCapableSession(ds)).toBe(false);
   });
 
@@ -261,6 +270,46 @@ describe('forkSession — frozen launch posture inheritance', () => {
     expect(child.sandboxNetwork).toBe(false);
   });
 
+  // ── childOwnerOpenId: an admin forking someone else's session is stamped as
+  //    the CHILD owner instead of inheriting the source owner. The stamp has to
+  //    land on BOTH the persisted row and the runtime childDs (the latter feeds
+  //    BOTMUX_OWNER_OPEN_ID into the CLI subprocess via applySessionOwnerEnv).
+  //    Dropping the option on either copy must flip these red. ──
+  it('childOwnerOpenId overrides owner on BOTH the persisted row and runtime childDs', async () => {
+    const src = makeSourceDs();   // source owner = 'ou_owner'
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
+
+    const r = await forkSession(
+      src.session.sessionId, 'oc_child', 'oc_child', 'group', 'chat',
+      { forkWorkerImpl: forkWorkerSpy as any, childOwnerOpenId: 'ou_admin' },
+    );
+    expect(r.ok).toBe(true);
+
+    // Persisted row (worker-pool.ts childSession.ownerOpenId).
+    const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
+    expect(child.ownerOpenId).toBe('ou_admin');
+
+    // Runtime DaemonSession handed to forkWorker (feeds the worker owner env).
+    const childDs = forkWorkerSpy.mock.calls[0][0] as DaemonSession;
+    expect(childDs.ownerOpenId).toBe('ou_admin');
+  });
+
+  it('without childOwnerOpenId the child inherits the SOURCE owner (persisted + runtime)', async () => {
+    const src = makeSourceDs();   // source owner = 'ou_owner'
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
+
+    const r = await forkSession(
+      src.session.sessionId, 'oc_child', 'om_child_root', 'group', 'thread',
+      { forkWorkerImpl: forkWorkerSpy as any },
+    );
+    expect(r.ok).toBe(true);
+
+    const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
+    expect(child.ownerOpenId).toBe('ou_owner');
+    const childDs = forkWorkerSpy.mock.calls[0][0] as DaemonSession;
+    expect(childDs.ownerOpenId).toBe('ou_owner');
+  });
+
   it('P1: a fork of an explicitly UN-sandboxed source stays un-sandboxed (false travels, not just true)', async () => {
     const src = makeSourceDs({ sandbox: false, sandboxNetwork: true });
     registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
@@ -274,9 +323,10 @@ describe('forkSession — frozen launch posture inheritance', () => {
   // ── P2: the per-session reasoningEffort override + the agentFrozen marker
   //    must ride along, else sessionAgentConfig re-freezes from the live bot
   //    config and the clone silently drops the source's launch identity. ──
-  it('P2: reasoningEffort / cliRuntime / cliPathOverride / wrapperCli / agentFrozen inherited', async () => {
+  it('P2: reasoningEffort / backend variant / cliRuntime / cliPathOverride / wrapperCli / agentFrozen inherited', async () => {
     const src = makeSourceDs({
       reasoningEffort: 'xhigh',
+      modelBackendVariant: 'max',
       cliRuntime: {
         id: 'custom-claude',
         displayName: 'Custom Claude',
@@ -294,6 +344,7 @@ describe('forkSession — frozen launch posture inheritance', () => {
     expect(r.ok).toBe(true);
     const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
     expect(child.reasoningEffort).toBe('xhigh');
+    expect(child.modelBackendVariant).toBe('max');
     expect(child.cliRuntime).toEqual(src.session.cliRuntime);
     expect(child.cliRuntime).not.toBe(src.session.cliRuntime);
     expect(child.cliPathOverride).toBe('/opt/custom/claude');
@@ -561,5 +612,72 @@ describe('sessionAgentConfig — /cli snapshot model wiring', () => {
     const ds = selectedDs('codex', { spawnModelOverride: 'gpt-5.6-terra' } as any);
     const cfg = sessionAgentConfig(ds, { cliId: 'claude-code', model: 'opus' });
     expect(cfg.model).toBe('gpt-5.6-terra');    // override wins even on cross-CLI
+  });
+
+  it('freezes a TraeX backend variant for the session launch identity', () => {
+    const ds = makeSourceDs({ cliId: 'traex', agentFrozen: false });
+    const first = sessionAgentConfig(ds, { cliId: 'traex', modelBackendVariant: 'max' });
+    expect(first.modelBackendVariant).toBe('max');
+    expect(ds.session.modelBackendVariant).toBe('max');
+
+    const resumed = sessionAgentConfig(ds, { cliId: 'traex', modelBackendVariant: 'standard' });
+    expect(resumed.modelBackendVariant).toBe('max');
+  });
+
+  it('keeps old frozen sessions without a variant in inherit mode', () => {
+    const ds = makeSourceDs({ cliId: 'traex', agentFrozen: true });
+    const cfg = sessionAgentConfig(ds, { cliId: 'traex', modelBackendVariant: 'max' });
+    expect(cfg.modelBackendVariant).toBeUndefined();
+  });
+
+  it('freezes Forge x TraeX launch mode from bot config', () => {
+    const ds = makeSourceDs({ cliId: 'traex', agentFrozen: false });
+    const cfg = sessionAgentConfig(ds, { cliId: 'traex', cliLaunchMode: 'forge-traex' });
+    expect(cfg.cliLaunchMode).toBe('forge-traex');
+    expect(ds.session.cliLaunchMode).toBe('forge-traex');
+    expect(ds.session.agentFrozen).toBe(true);
+  });
+
+  it('repairs a stale backend variant from a frozen non-TraeX session', () => {
+    const ds = makeSourceDs({
+      cliId: 'codex',
+      agentFrozen: true,
+      modelBackendVariant: 'max',
+    });
+
+    const cfg = sessionAgentConfig(ds, { cliId: 'codex' });
+
+    expect(cfg.modelBackendVariant).toBeUndefined();
+    expect(ds.session.modelBackendVariant).toBeUndefined();
+  });
+});
+
+
+describe('sessionAgentConfig — group defaults', () => {
+  const topic = (overrides: Partial<Session> = {}) => makeSourceDs({
+    cliId: 'codex', cliSessionId: undefined, agentFrozen: false,
+    groupDefaultModels: { codex: { model: 'gpt-5.6-sol', reasoningEffort: 'ultra' } },
+    ...overrides,
+  });
+  const bot = { cliId: 'codex', model: 'gpt-5.5', reasoningEffort: 'medium' } as const;
+
+  it.each([false, true])('applies group effort with agentFrozen=%s without changing CLI', (agentFrozen) => {
+    const ds = topic({ agentFrozen });
+    const cfg = sessionAgentConfig(ds, bot);
+    expect(cfg.cliId).toBe('codex');
+    expect(cfg.model).toBe('gpt-5.6-sol');
+    expect(cfg.reasoningEffort).toBe('ultra');
+  });
+
+  it('preserves explicit session effort', () => {
+    expect(sessionAgentConfig(topic({ reasoningEffort: 'high' }), bot).reasoningEffort).toBe('high');
+  });
+
+  it('ignores captured group settings when session becomes chat scope', () => {
+    const ds = topic();
+    ds.session.scope = 'chat';
+    const cfg = sessionAgentConfig(ds, bot);
+    expect(cfg.model).toBe('gpt-5.5');
+    expect(cfg.reasoningEffort).toBe('medium');
   });
 });

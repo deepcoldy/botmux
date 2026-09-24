@@ -17,6 +17,7 @@ import {
   buildGroupsCard,
   buildGroupsDetailCard,
   buildGroupsRoleCard,
+  buildProjectGroupRolesCard,
   handleGroupsCardAction,
   GROUPS_ACTION_ADD_BOT,
   GROUPS_ACTION_DETAIL,
@@ -28,6 +29,7 @@ import {
   GROUPS_ACTION_ROLE_DELETE,
   GROUPS_ACTION_ROLE_OPEN,
   GROUPS_ACTION_ROLE_SAVE,
+  GROUPS_ACTION_PROJECT_ROLES,
 } from '../src/im/lark/groups-card.js';
 
 const INVOKER = 'ou_owner';
@@ -288,6 +290,35 @@ describe('buildGroupsCard', () => {
     expect(json).toContain(GROUPS_ACTION_ADD_BOT);
     expect(json).toContain('"dashboard_scope":"global"');
     expect(json).toContain('dash_overview_refresh');
+  });
+
+  it('project role card shows only configured participants and preserves focused navigation', () => {
+    const worker: GroupsBotInput = { larkAppId: 'cli_worker', botName: 'worker-bot' };
+    const unrelated: GroupsBotInput = { larkAppId: 'cli_unrelated', botName: 'unrelated-bot' };
+    const group = chat({
+      chatId: 'oc_project_roles',
+      name: 'project-room',
+      memberBots: [
+        member({ inChat: true, hasRole: true }),
+        { larkAppId: 'cli_worker', botName: 'worker-bot', inChat: true, hasRole: false },
+        { larkAppId: 'cli_unrelated', botName: 'unrelated-bot', inChat: true, hasRole: true },
+      ],
+    });
+    const json = buildProjectGroupRolesCard(
+      matrix([group], [SELF_BOT, worker, unrelated]),
+      group,
+      { coordinatorAppId: LARK_APP_ID, workerAppIds: ['cli_worker'] },
+      { invokerOpenId: INVOKER, locale: 'zh', scope: 'global' },
+    );
+    expect(json).toContain('项目群角色配置');
+    expect(json).toContain('self-bot');
+    expect(json).toContain('worker-bot');
+    expect(json).not.toContain('unrelated-bot');
+    expect(json).toContain('主控');
+    expect(json).toContain('Worker');
+    expect(json).toContain('继承该 Bot 的团队默认角色');
+    expect(json).toContain('"origin":"project_roles"');
+    expect(json).toContain(GROUPS_ACTION_PROJECT_ROLES);
   });
 
   /** ─── Overview drilldown (2026-06-10) ───
@@ -921,6 +952,59 @@ describe('handleGroupsCardAction', () => {
       body: { content: 'new role' },
     });
     expect(JSON.stringify(r.card?.data)).toContain('群组管理');
+  });
+
+  it('role_save from project roles returns to the focused project card', async () => {
+    const worker = { larkAppId: 'cli_worker', botName: 'worker-bot' };
+    const group = chat({
+      chatId: 'oc_role',
+      memberBots: [member({ inChat: true }), { ...worker, inChat: true }],
+    });
+    const requestSpy = vi.fn(async (req: any) => {
+      if (req.method === 'GET') return {
+        status: 200,
+        body: { chats: [group], bots: [SELF_BOT, worker] },
+        raw: '',
+      };
+      return { status: 200, body: { ok: true }, raw: '{"ok":true}' };
+    });
+    const deps = makeDeps({ createClient: vi.fn(() => ({ request: requestSpy } as any)) });
+    const r = await handleGroupsCardAction(
+      {
+        ...makeAction({
+          action: GROUPS_ACTION_ROLE_SAVE,
+          invoker_open_id: INVOKER,
+          chat_id: 'oc_role',
+          app_id: 'cli_worker',
+          dashboard_scope: 'global',
+          origin: 'project_roles',
+          project_coordinator_app_id: LARK_APP_ID,
+          project_worker_app_ids: 'cli_worker',
+        }),
+        action: {
+          value: {
+            action: GROUPS_ACTION_ROLE_SAVE,
+            invoker_open_id: INVOKER,
+            chat_id: 'oc_role',
+            app_id: 'cli_worker',
+            dashboard_scope: 'global',
+            origin: 'project_roles',
+            project_coordinator_app_id: LARK_APP_ID,
+            project_worker_app_ids: 'cli_worker',
+          },
+          form_value: { role: '负责验收' },
+        },
+      } as any,
+      LARK_APP_ID,
+      deps,
+    );
+    expect(requestSpy.mock.calls[1][0]).toEqual({
+      method: 'PUT',
+      path: '/__daemon/groups/oc_role/roles/cli_worker',
+      body: { content: '负责验收' },
+    });
+    expect(JSON.stringify(r.card?.data)).toContain('项目群角色配置');
+    expect(JSON.stringify(r.card?.data)).not.toContain('群组管理');
   });
 
   it('role_save action accepts input_value callback fallback', async () => {

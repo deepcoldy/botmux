@@ -35,6 +35,7 @@ const zhSidebar = [
       { text: 'Web 终端', link: '/web-terminal' },
       { text: '多机器人协作', link: '/multi-bot' },
       { text: '多话题协作模式', link: '/multi-topic' },
+      { text: '@ 策略', link: '/mention-mode' },
       { text: '本地白板', link: '/whiteboard' },
       { text: '角色与团队', link: '/roles' },
       { text: 'tmux 会话常驻', link: '/tmux' },
@@ -45,6 +46,7 @@ const zhSidebar = [
       { text: '飞书文档评论入口', link: '/doc-comment' },
       { text: '定时任务', link: '/schedule' },
       { text: 'Oncall 模式', link: '/oncall' },
+      { text: '权限与授权', link: '/permissions' },
       { text: '文件沙盒', link: '/sandbox' },
       { text: '语音总结', link: '/voice' },
       { text: 'Dashboard 管控面', link: '/dashboard' },
@@ -77,6 +79,7 @@ const zhSidebar = [
     items: [
       { text: 'bots.json 配置', link: '/bots-json' },
       { text: '环境变量与文件位置', link: '/env' },
+      { text: '本地 Companion API', link: '/companion-api' },
       { text: '多 CLI 适配器', link: '/adapters' },
     ],
   },
@@ -118,6 +121,7 @@ const enSidebar = [
       { text: 'Web Terminal', link: '/en/web-terminal' },
       { text: 'Multi-Bot Collaboration', link: '/en/multi-bot' },
       { text: 'Multi-Topic Orchestration', link: '/en/multi-topic' },
+      { text: 'Mention Policy', link: '/en/mention-mode' },
       { text: 'Local Whiteboard', link: '/en/whiteboard' },
       { text: 'Roles & Teams', link: '/en/roles' },
       { text: 'tmux Session Persistence', link: '/en/tmux' },
@@ -128,6 +132,7 @@ const enSidebar = [
       { text: 'Feishu Doc Comment Entry', link: '/en/doc-comment' },
       { text: 'Scheduled Tasks', link: '/en/schedule' },
       { text: 'On-Call Mode', link: '/en/oncall' },
+      { text: 'Permissions & Access', link: '/en/permissions' },
       { text: 'File Sandbox', link: '/en/sandbox' },
       { text: 'Voice Summary', link: '/en/voice' },
       { text: 'Dashboard', link: '/en/dashboard' },
@@ -160,6 +165,7 @@ const enSidebar = [
     items: [
       { text: 'bots.json', link: '/en/bots-json' },
       { text: 'Environment & File Locations', link: '/en/env' },
+      { text: 'Local Companion API', link: '/en/companion-api' },
       { text: 'CLI Adapters', link: '/en/adapters' },
     ],
   },
@@ -195,7 +201,7 @@ export default defineConfig({
   // og:title / og:description 由 rspress 按页自动生成，这里只补它不处理的
   head: [
     ['meta', { property: 'og:type', content: 'website' }],
-    ['meta', { property: 'og:url', content: 'https://github.com/deepcoldy/botmux/tree/master/docs-site/docs' }],
+    ['meta', { property: 'og:url', content: 'https://deepcoldy.github.io/botmux/' }],
     ['meta', { property: 'og:image', content: socialLogoUrl }],
     ['meta', { name: 'twitter:card', content: 'summary_large_image' }],
     ['meta', { name: 'twitter:image', content: socialLogoUrl }],

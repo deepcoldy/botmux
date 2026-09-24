@@ -20,7 +20,7 @@ vi.mock('../src/services/hook-runner.js', () => ({
   emitHookEvent: vi.fn(),
 }));
 
-import { getMessageChatId, sendUserMessage } from '../src/im/lark/client.js';
+import { getMessageChatId, lookupMessageChatId, sendUserMessage } from '../src/im/lark/client.js';
 
 describe('Codex notifier Lark request deadlines', () => {
   beforeEach(() => {
@@ -101,6 +101,18 @@ describe('Codex notifier Lark request deadlines', () => {
       timeout: 900,
       signal: controller.signal,
     }));
+  });
+
+  it('preserves lookup failures for authorization gates while best-effort callers retain null', async () => {
+    const failure = new Error('network unavailable');
+    mocks.request.mockRejectedValue(failure);
+    await expect(lookupMessageChatId('app', 'om_card')).rejects.toBe(failure);
+    await expect(getMessageChatId('app', 'om_card')).resolves.toBeNull();
+  });
+
+  it.each([{ items: [] }, { items: [{ chat_id: 'oc_target' }] }])('strict lookup distinguishes an empty result from a resolved chat', async data => {
+    mocks.request.mockResolvedValue({ code: 0, data });
+    await expect(lookupMessageChatId('app', 'om_card')).resolves.toBe(data.items[0]?.chat_id ?? null);
   });
 
   it('propagates cancellation instead of hiding it as a missing chat', async () => {

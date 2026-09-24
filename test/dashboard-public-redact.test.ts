@@ -1,9 +1,12 @@
+import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
 import {
   projectSessionEventForAudience,
   projectSessionsForAudience,
   redactGroupsForPublic,
   redactSchedulesForPublic,
+  stripAllSchedulePreconditionMaterial,
+  stripSchedulePreconditionMaterial,
   redactSessionEventForPublic,
   redactSessionsForPublic,
   redactSettingsForPublic,
@@ -57,6 +60,16 @@ function sampleSchedules() {
       lastStatus: 'ok',
       prompt: '部署到 /root/iserver/customer-secret 并通知客户',
       workingDir: '/root/iserver/customer-secret',
+      hasPrecondition: true,
+      preconditionEnabled: false,
+      preconditionScript: 'cat /host/private && echo 1',
+      preconditionFile: '/host/private/check.sh',
+      preconditionFilePath: '/host/private/check.sh',
+      preconditionPath: '/host/private/check.sh',
+      preconditionSource: 'file',
+      preconditionDefinition: { enabled: false, source: { kind: 'inline', script: 'echo 1' } },
+      preconditionRef: 'spc_private_ref',
+      preconditionHash: 'sha256:private',
       chatId: 'oc_chat1',
     },
   ];
@@ -143,11 +156,21 @@ describe('redactGroupsForPublic', () => {
 });
 
 describe('redactSchedulesForPublic', () => {
-  it('strips prompt + workingDir for anonymous visitors', () => {
+  it('strips prompt, workingDir, and executable precondition material for anonymous visitors', () => {
     const out = redactSchedulesForPublic(sampleSchedules()) as any[];
     expect(out[0]).not.toHaveProperty('prompt');
     expect(out[0]).not.toHaveProperty('workingDir');
+    expect(out[0]).not.toHaveProperty('preconditionScript');
+    expect(out[0]).not.toHaveProperty('preconditionFile');
+    expect(out[0]).not.toHaveProperty('preconditionFilePath');
+    expect(out[0]).not.toHaveProperty('preconditionPath');
+    expect(out[0]).not.toHaveProperty('preconditionSource');
+    expect(out[0]).not.toHaveProperty('preconditionDefinition');
+    expect(out[0]).not.toHaveProperty('preconditionRef');
+    expect(out[0]).not.toHaveProperty('preconditionHash');
     expect(JSON.stringify(out)).not.toContain('customer-secret');
+    expect(JSON.stringify(out)).not.toContain('host/private');
+    expect(JSON.stringify(out)).not.toContain('spc_private_ref');
   });
 
   it('preserves name / timing / status fields', () => {
@@ -158,21 +181,108 @@ describe('redactSchedulesForPublic', () => {
       enabled: true,
       nextRunAt: '2026-06-07T01:00:00Z',
       lastStatus: 'ok',
+      hasPrecondition: true,
+      preconditionEnabled: false,
       chatId: 'oc_chat1',
     });
   });
 
-  it('does not mutate the input (authed callers keep prompt + workingDir)', () => {
+  it('does not mutate the input (authed callers keep their source object)', () => {
     const input = sampleSchedules();
     redactSchedulesForPublic(input);
     expect(input[0]).toHaveProperty('prompt');
     expect(input[0].workingDir).toBe('/root/iserver/customer-secret');
+    expect(input[0].preconditionScript).toBe('cat /host/private && echo 1');
   });
 
   it('tolerates malformed shapes without throwing', () => {
     expect(redactSchedulesForPublic([])).toEqual([]);
     expect(redactSchedulesForPublic([null] as unknown[])).toEqual([null]);
     expect(redactSchedulesForPublic(undefined as unknown as unknown[])).toBeUndefined();
+  });
+});
+
+describe('stripSchedulePreconditionMaterial', () => {
+  it('keeps validated flat edit fields for management but removes internal precondition material', () => {
+    const input = {
+      id: 'sched-1',
+      prompt: 'management may see this',
+      workingDir: '/repo',
+      hasPrecondition: true,
+      preconditionEnabled: false,
+      preconditionScript: 'echo 1',
+      preconditionFilePath: '/host/private/check.sh',
+      preconditionSource: 'file',
+      preconditionDefinition: { enabled: false, source: { kind: 'inline', script: 'echo 1' } },
+      preconditionRef: 'spc_private_ref',
+      preconditionHash: 'private_hash',
+      precondition: { script: 'echo 1' },
+    };
+
+    const out = stripSchedulePreconditionMaterial(input) as Record<string, unknown>;
+
+    expect(out).toMatchObject({
+      id: 'sched-1',
+      prompt: 'management may see this',
+      workingDir: '/repo',
+      hasPrecondition: true,
+      preconditionEnabled: false,
+      preconditionSource: 'file',
+      preconditionFilePath: '/host/private/check.sh',
+    });
+    expect(out).not.toHaveProperty('preconditionScript');
+    expect(out).not.toHaveProperty('preconditionDefinition');
+    expect(out).not.toHaveProperty('preconditionRef');
+    expect(out).not.toHaveProperty('preconditionHash');
+    expect(out).not.toHaveProperty('precondition');
+    expect(input.preconditionRef).toBe('spc_private_ref');
+  });
+
+  it('passes clear markers only for management live patches', () => {
+    const patch = {
+      id: 'sched-1',
+      hasPrecondition: false,
+      preconditionSource: null,
+      preconditionScript: null,
+      preconditionFilePath: null,
+      preconditionRef: 'spc_private_ref',
+    };
+
+    expect(stripSchedulePreconditionMaterial(patch)).toEqual({
+      id: 'sched-1',
+      hasPrecondition: false,
+    });
+    expect(stripSchedulePreconditionMaterial(patch, { preserveClearMarkers: true })).toEqual({
+      id: 'sched-1',
+      hasPrecondition: false,
+      preconditionSource: null,
+      preconditionScript: null,
+      preconditionFilePath: null,
+    });
+  });
+
+  it('offers a source-only redactor for non-browser schedule consumers', () => {
+    expect(stripAllSchedulePreconditionMaterial({
+      id: 'sched-1',
+      prompt: 'keep this for the schedule card',
+      workingDir: '/repo',
+      preconditionSource: 'inline',
+      preconditionScript: 'echo 1',
+      preconditionRef: 'spc_private_ref',
+    })).toEqual({
+      id: 'sched-1',
+      prompt: 'keep this for the schedule card',
+      workingDir: '/repo',
+    });
+  });
+
+  it('is wired into authenticated schedule snapshots and live events', () => {
+    const dashboard = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
+
+    expect(dashboard).toContain('rawSchedules.map(schedule => stripSchedulePreconditionMaterial(schedule))');
+    expect(dashboard).toContain('schedule: stripSchedulePreconditionMaterial(b.schedule)');
+    expect(dashboard).toMatch(/patch:\s*stripSchedulePreconditionMaterial\(b\.patch,/);
+    expect(dashboard).toContain('{ preserveClearMarkers: true }');
   });
 });
 

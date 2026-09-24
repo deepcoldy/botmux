@@ -80,6 +80,11 @@ const RESERVED_ENV_KEYS = new Set<string>([
   // the process-level GROK_HOME. A per-bot inject would only reach the child
   // CLI and split-brain path resolution (see grok-paths header).
   'GROK_HOME',
+  // DSH profile/session home is a process-level path: adapters must pre-create
+  // and sandbox-bind the same directory the child will use. Per-bot injection
+  // happens too late for authPaths/readonlyRoots and would split-brain the
+  // runner/TUI profile state, so keep it process-level like GROK_HOME.
+  'DSH_HOME',
   'CLAUDE_CODE_RESUME_TOKEN_THRESHOLD',
   'CJADK_INTERACTIVE',
 ]);

@@ -75,10 +75,14 @@ describe('resolveUserToken — per-app isolation', () => {
     expect(await resolveUserToken('app_lark', 'sec', 'lark')).toBeNull();
   });
 
-  it('env override still wins regardless of app', async () => {
+  // The env override was REMOVED deliberately: a global FEISHU_USER_ACCESS_TOKEN
+  // is an invisible bypass around the whole per-user boundary — set it once and
+  // every bot, every session and every person silently share one identity, with
+  // nothing in the logs to say so. Storage on disk is now the only source.
+  it('ignores FEISHU_USER_ACCESS_TOKEN — no env bypass of per-user storage', async () => {
     process.env.FEISHU_USER_ACCESS_TOKEN = 'ENV_TOK';
     const { resolveUserToken } = await fresh();
-    expect(await resolveUserToken('whatever', 'sec', 'lark')).toBe('ENV_TOK');
+    expect(await resolveUserToken('whatever', 'sec', 'lark')).toBeNull();
   });
 
   // Hardening (Codex review): validate the file's inner appId/brand, not just the

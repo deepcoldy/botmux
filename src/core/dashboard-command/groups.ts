@@ -9,7 +9,7 @@
 
 import type { LarkMessage } from '../../types.js';
 import { localeForBot, t, type Locale } from '../../i18n/index.js';
-import { buildGroupsCard } from '../../im/lark/groups-card.js';
+import { buildGroupsCard, buildProjectGroupRolesCard } from '../../im/lark/groups-card.js';
 import { createDaemonClientFor } from '../../daemon-internal-client-wrapper.js';
 import { sendUserMessage as defaultSendUserMessage } from '../../im/lark/client.js';
 import type { DaemonClient } from '../../dashboard/daemon-internal-client.js';
@@ -26,6 +26,35 @@ export interface DashboardGroupsCommandDeps {
   locale?: Locale;
 }
 
+type ProjectRolesConfig = {
+  coordinatorAppId: string;
+  workerAppIds: string[];
+};
+
+async function loadGlobalGroupsMatrix(
+  rootId: string,
+  deps: CommandHandlerDeps,
+  larkAppId: string,
+  locale: Locale,
+  testDeps: DashboardGroupsCommandDeps,
+): Promise<{ chats: ReadonlyArray<GroupsChatInput>; bots: ReadonlyArray<GroupsBotInput> } | undefined> {
+  const client = (testDeps.createClient ?? createDaemonClientFor)(larkAppId);
+  let snap;
+  try {
+    snap = await client.request({ method: 'GET', path: '/__daemon/groups-matrix?scope=global' });
+  } catch (e: any) {
+    await deps.sessionReply(rootId, t('card.dashboard.groups.list_failed', { reason: e?.message ?? String(e) }, locale), undefined, larkAppId);
+    return undefined;
+  }
+  if (snap.status !== 200) {
+    const reason = String((snap.body as any)?.error ?? `http_${snap.status}`);
+    await deps.sessionReply(rootId, t('card.dashboard.groups.list_failed', { reason }, locale), undefined, larkAppId);
+    return undefined;
+  }
+  const body = (snap.body as { chats?: ReadonlyArray<GroupsChatInput>; bots?: ReadonlyArray<GroupsBotInput> }) ?? {};
+  return { chats: body.chats ?? [], bots: body.bots ?? [] };
+}
+
 export async function handleDashboardGroups(
   _message: LarkMessage,
   _args: string,
@@ -39,37 +68,8 @@ export async function handleDashboardGroups(
   if (!larkAppId) return;
   const locale: Locale = testDeps.locale ?? localeForBot(larkAppId);
 
-  const client = (testDeps.createClient ?? createDaemonClientFor)(larkAppId);
-  let snap;
-  try {
-    snap = await client.request({ method: 'GET', path: '/__daemon/groups-matrix?scope=global' });
-  } catch (e: any) {
-    await deps.sessionReply(
-      rootId,
-      t('card.dashboard.groups.list_failed', { reason: e?.message ?? String(e) }, locale),
-      undefined, larkAppId,
-    );
-    return;
-  }
-
-  if (snap.status !== 200) {
-    const reason = String((snap.body as any)?.error ?? `http_${snap.status}`);
-    await deps.sessionReply(
-      rootId,
-      t('card.dashboard.groups.list_failed', { reason }, locale),
-      undefined, larkAppId,
-    );
-    return;
-  }
-
-  const body = (snap.body as {
-    chats?: ReadonlyArray<GroupsChatInput>;
-    bots?: ReadonlyArray<GroupsBotInput>;
-  }) ?? {};
-  const matrix = {
-    chats: body.chats ?? [],
-    bots: body.bots ?? [],
-  };
+  const matrix = await loadGlobalGroupsMatrix(rootId, deps, larkAppId, locale, testDeps);
+  if (!matrix) return;
   // invokerOpenId = adminOpenId so subsequent clicks still pass the invoker lock.
   const cardJson = buildGroupsCard(matrix, {
     invokerOpenId: adminOpenId,
@@ -93,4 +93,32 @@ export async function handleDashboardGroups(
       undefined, larkAppId,
     );
   }
+}
+
+/** Reply with a focused role editor card in the current project group. The card writes through
+ * the same per-chat role endpoints as `/role` and the Web Dashboard; this is
+ * only a more convenient project-group entry point, not a second role store. */
+export async function handleProjectGroupRoles(
+  rootId: string,
+  chatId: string,
+  deps: CommandHandlerDeps,
+  larkAppId: string,
+  adminOpenId: string,
+  project: ProjectRolesConfig,
+  testDeps: DashboardGroupsCommandDeps = {},
+): Promise<void> {
+  const locale: Locale = testDeps.locale ?? localeForBot(larkAppId);
+  const matrix = await loadGlobalGroupsMatrix(rootId, deps, larkAppId, locale, testDeps);
+  if (!matrix) return;
+  const chat = matrix.chats.find(item => item.chatId === chatId);
+  if (!chat) {
+    await deps.sessionReply(rootId, t('card.dashboard.groups.chat_not_found', undefined, locale), undefined, larkAppId);
+    return;
+  }
+  const cardJson = buildProjectGroupRolesCard(matrix, chat, project, {
+    invokerOpenId: adminOpenId,
+    locale,
+    scope: 'global',
+  });
+  await deps.sessionReply(rootId, cardJson, 'interactive', larkAppId);
 }

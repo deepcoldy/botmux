@@ -9,6 +9,11 @@ import { updateResponseNeedsRestart } from './update-action.js';
 import { ui } from './ui.js';
 import { confirm } from './confirm-modal.js';
 import { toast } from './toast.js';
+import {
+  IDLE_CLEANUP_HOUR_OPTIONS,
+  idleCleanupHoursLabel,
+  type IdleCleanupHours,
+} from '../session-cleanup.js';
 
 interface MaintenanceTaskCfg { enabled?: boolean; time?: string }
 interface MaintenanceCfg { autoUpdate?: MaintenanceTaskCfg; autoRestart?: MaintenanceTaskCfg }
@@ -28,7 +33,9 @@ interface DashboardSettings {
     recommendedRef: string;
   };
   codexRpcInput: boolean;
+  autoUpgradeCodexSessions: boolean;
   bypassCodexHookTrust: boolean;
+  hideCodexRateLimitModelNudge: boolean;
   codexNotifier: {
     enabled: boolean;
     targetBotAppId: string | null;
@@ -65,6 +72,7 @@ interface DashboardSettings {
     targetDaemonOnline: boolean;
   };
   noVisibleOutputHint: boolean;
+  crossPrincipalInterruption: boolean;
   vcMeetingAgent: {
     enabled: boolean;
     larkCliVersion?: string | null;
@@ -77,6 +85,7 @@ interface DashboardSettings {
   autoUpdateSupported: boolean;
   whiteboard: { enabled: boolean };
   workflow: { enabled: boolean };
+  sessionCleanup: { enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
   remoteAccess: boolean;
   /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
   oauthRedirectBase: string;
@@ -177,8 +186,10 @@ function parseSettings(s: any): DashboardSettings {
       recommendedRef: typeof s?.herdrTraexPlugin?.recommendedRef === 'string' ? s.herdrTraexPlugin.recommendedRef : '',
     },
     codexRpcInput: s?.codexRpcInput === true,
+    autoUpgradeCodexSessions: s?.autoUpgradeCodexSessions === true,
     // default ON — only an explicit persisted false disables (matches server snapshot)
     bypassCodexHookTrust: s?.bypassCodexHookTrust !== false,
+    hideCodexRateLimitModelNudge: s?.hideCodexRateLimitModelNudge !== false,
     codexNotifier: {
       enabled: s?.codexNotifier?.enabled === true,
       targetBotAppId: typeof s?.codexNotifier?.targetBotAppId === 'string'
@@ -213,6 +224,7 @@ function parseSettings(s: any): DashboardSettings {
       targetDaemonOnline: s?.hostOverloadAlert?.targetDaemonOnline === true,
     },
     noVisibleOutputHint: s?.noVisibleOutputHint === true,
+    crossPrincipalInterruption: s?.crossPrincipalInterruption === true,
     vcMeetingAgent: {
       enabled: s?.vcMeetingAgent?.enabled !== false,
       larkCliVersion: s?.vcMeetingAgent?.larkCliVersion === undefined ? undefined : (s.vcMeetingAgent.larkCliVersion ?? null),
@@ -225,6 +237,15 @@ function parseSettings(s: any): DashboardSettings {
     autoUpdateSupported: s?.autoUpdateSupported !== false,
     whiteboard: { enabled: s?.whiteboard?.enabled === true },
     workflow: { enabled: s?.workflow?.enabled === true },
+    sessionCleanup: {
+      enabled: s?.sessionCleanup?.enabled === true,
+      olderThanHours: (IDLE_CLEANUP_HOUR_OPTIONS as readonly unknown[]).includes(s?.sessionCleanup?.olderThanHours)
+        ? s.sessionCleanup.olderThanHours as IdleCleanupHours
+        : 168,
+      intervalMinutes: typeof s?.sessionCleanup?.intervalMinutes === 'number' && s.sessionCleanup.intervalMinutes >= 5
+        ? Math.floor(s.sessionCleanup.intervalMinutes)
+        : 60,
+    },
     remoteAccess: s?.remoteAccess === true,
     oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
     scheduleTimeZone: typeof s?.scheduleTimeZone === 'string' ? s.scheduleTimeZone : '',
@@ -720,7 +741,7 @@ function SettingsBody(props: {
   const autoUpdateDisabled = !canWrite || settings.localDevInstall || !settings.autoUpdateSupported;
   const autoRestartDisabled = !canWrite || settings.maintenance.autoUpdate?.enabled !== true;
 
-  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'bypassCodexHookTrust' | 'noVisibleOutputHint' | 'remoteAccess', value: boolean) => {
+  const saveBoolean = (key: 'publicReadOnly' | 'openTerminalInFeishu' | 'enableLocalCliOpen' | 'chatBotDiscovery' | 'codexRpcInput' | 'autoUpgradeCodexSessions' | 'bypassCodexHookTrust' | 'hideCodexRateLimitModelNudge' | 'noVisibleOutputHint' | 'crossPrincipalInterruption' | 'remoteAccess', value: boolean) => {
     void props.onSave(key, { [key]: value }, s => ({ ...s, [key]: value }));
   };
   const saveHerdrTraexPlugin = (patch: Partial<Pick<DashboardSettings['herdrTraexPlugin'], 'enabled' | 'source' | 'ref'>>) => {
@@ -864,11 +885,25 @@ function SettingsBody(props: {
             onChange={value => saveBoolean('codexRpcInput', value)}
           />
           <ToggleRow
+            title={tr('settings.autoUpgradeCodexSessions')}
+            help={tr('settings.autoUpgradeCodexSessionsHelp')}
+            checked={settings.autoUpgradeCodexSessions}
+            disabled={dis || savingKey === 'autoUpgradeCodexSessions'}
+            onChange={value => saveBoolean('autoUpgradeCodexSessions', value)}
+          />
+          <ToggleRow
             title={tr('settings.bypassCodexHookTrust')}
             help={tr('settings.bypassCodexHookTrustHelp')}
             checked={settings.bypassCodexHookTrust}
             disabled={dis || savingKey === 'bypassCodexHookTrust'}
             onChange={value => saveBoolean('bypassCodexHookTrust', value)}
+          />
+          <ToggleRow
+            title={tr('settings.hideCodexRateLimitModelNudge')}
+            help={tr('settings.hideCodexRateLimitModelNudgeHelp')}
+            checked={settings.hideCodexRateLimitModelNudge}
+            disabled={dis || savingKey === 'hideCodexRateLimitModelNudge'}
+            onChange={value => saveBoolean('hideCodexRateLimitModelNudge', value)}
           />
           <CodexNotifierSettingsEditor
             value={settings.codexNotifier}
@@ -882,6 +917,13 @@ function SettingsBody(props: {
             checked={settings.noVisibleOutputHint}
             disabled={dis || savingKey === 'noVisibleOutputHint'}
             onChange={value => saveBoolean('noVisibleOutputHint', value)}
+          />
+          <ToggleRow
+            title={tr('settings.crossPrincipalInterruption')}
+            help={tr('settings.crossPrincipalInterruptionHelp')}
+            checked={settings.crossPrincipalInterruption}
+            disabled={dis || savingKey === 'crossPrincipalInterruption'}
+            onChange={value => saveBoolean('crossPrincipalInterruption', value)}
           />
         </SettingsBlock>
         <SettingsBlock id="settings-overload" title={tr('settings.sectionHostOverloadAlert')}>
@@ -941,6 +983,17 @@ function SettingsBody(props: {
                 'scheduleTimeZone',
                 { scheduleTimeZone: tz },
                 s => ({ ...s, scheduleTimeZone: tz ?? '' }),
+              );
+            }}
+          />
+          <SessionCleanupRow
+            value={settings.sessionCleanup}
+            disabled={dis || savingKey === 'sessionCleanup'}
+            onSave={patch => {
+              void props.onSave(
+                'sessionCleanup',
+                { sessionCleanup: patch },
+                s => ({ ...s, sessionCleanup: { ...s.sessionCleanup, ...patch } }),
               );
             }}
           />
@@ -1501,6 +1554,74 @@ function ToggleRow(props: {
 }
 
 const GROUP_NAME_PREFIX_INPUT_MAX_LENGTH = 32;
+
+/** 定时自动清理空闲会话：开关 + 空闲阈值（24H/72H/7d，与手动清理一致）+ 检查频率。 */
+function SessionCleanupRow(props: {
+  value: { enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
+  disabled: boolean;
+  onSave(patch: { enabled?: boolean; olderThanHours?: IdleCleanupHours; intervalMinutes?: number }): void;
+}) {
+  const tr = useT();
+  const [intervalDraft, setIntervalDraft] = useState(String(props.value.intervalMinutes));
+  useEffect(() => setIntervalDraft(String(props.value.intervalMinutes)), [props.value.intervalMinutes]);
+
+  const parsedInterval = Number(intervalDraft);
+  const intervalValid = Number.isFinite(parsedInterval) && parsedInterval >= 5 && Number.isInteger(parsedInterval);
+  const intervalDirty = intervalValid && Math.floor(parsedInterval) !== props.value.intervalMinutes;
+
+  return (
+    <div className="settings-session-cleanup">
+      <ToggleRow
+        title={tr('settings.sessionCleanupEnable')}
+        help={tr('settings.sessionCleanupEnableHelp')}
+        checked={props.value.enabled}
+        disabled={props.disabled}
+        onChange={value => props.onSave({ enabled: value })}
+      />
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.sessionCleanupOlderThanHelp')}>{tr('settings.sessionCleanupOlderThan')}</FieldTitle>
+        <div
+          className="idle-cleanup-threshold-options"
+          role="radiogroup"
+          aria-label={tr('settings.sessionCleanupOlderThan')}
+        >
+          {IDLE_CLEANUP_HOUR_OPTIONS.map(hours => {
+            const active = hours === props.value.olderThanHours;
+            return (
+              <button
+                type="button"
+                key={hours}
+                className={active ? 'active' : undefined}
+                aria-pressed={active ? 'true' : 'false'}
+                disabled={props.disabled || !props.value.enabled}
+                onClick={() => { if (hours !== props.value.olderThanHours) props.onSave({ olderThanHours: hours }); }}
+              >
+                {idleCleanupHoursLabel(hours)}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <div className="settings-field-row">
+        <FieldTitle help={tr('settings.sessionCleanupIntervalHelp')}>{tr('settings.sessionCleanupInterval')}</FieldTitle>
+        <input
+          type="number"
+          min={5}
+          step={1}
+          inputMode="numeric"
+          value={intervalDraft}
+          disabled={props.disabled || !props.value.enabled}
+          onChange={e => setIntervalDraft(e.currentTarget.value)}
+          onBlur={() => {
+            if (intervalDirty) props.onSave({ intervalMinutes: Math.floor(parsedInterval) });
+            else setIntervalDraft(String(props.value.intervalMinutes));
+          }}
+          onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur(); }}
+        />
+      </div>
+    </div>
+  );
+}
 
 export function GroupNamePrefixRow(props: {
   value: string;

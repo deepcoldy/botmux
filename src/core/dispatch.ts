@@ -39,6 +39,45 @@ export interface DispatchMessages {
   mentionedOpenIds: string[];
 }
 
+export type ProjectDispatchSyncStatus = 'pending' | 'in_progress' | 'blocked' | 'failed';
+
+export interface ProjectDispatchSyncAction {
+  action: 'dispatch';
+  dispatchRoot: string;
+  title: string;
+  purpose: string;
+  owners?: string[];
+  status?: ProjectDispatchSyncStatus;
+  progress?: number;
+}
+
+/**
+ * Build the project-card mutation that mirrors a dispatch.
+ *
+ * `--into` is coordination inside an existing workstream, not a fresh
+ * lifecycle event. It may rename the workstream explicitly, but must not
+ * revive completed work, reset progress, or clear the recorded owners.
+ */
+export function buildProjectDispatchSyncAction(input: {
+  existingDispatch: boolean;
+  dispatchRoot: string;
+  title: string;
+  purpose: string;
+  owners: string[];
+  status: ProjectDispatchSyncStatus;
+  progress: number;
+}): ProjectDispatchSyncAction {
+  const base: ProjectDispatchSyncAction = {
+    action: 'dispatch',
+    dispatchRoot: input.dispatchRoot,
+    title: input.title,
+    purpose: input.purpose,
+  };
+  return input.existingDispatch
+    ? base
+    : { ...base, owners: input.owners, status: input.status, progress: input.progress };
+}
+
 const DISPATCH_ROOT_ID_RE = /^om_[A-Za-z0-9_-]{1,128}$/;
 
 /**
@@ -377,6 +416,90 @@ export function resolveReportRecipient(input: {
     input.ownerOpenId,
     input.quoteTargetSenderOpenId,
   ].find(value => !!value?.trim())?.trim();
+}
+
+export interface ReportRecipientSession {
+  sessionId?: string;
+  larkAppId?: string;
+  chatId?: string;
+  rootMessageId?: string;
+  scope?: 'thread' | 'chat';
+  status?: string;
+  creatorOpenId?: string;
+  ownerOpenId?: string;
+  quoteTargetSenderOpenId?: string;
+  createdAt?: string;
+}
+
+export type ReportRecipientSource =
+  | 'recipient-root-chat-creator'
+  | 'session-creator'
+  | 'session-owner'
+  | 'quote-sender'
+  | 'none';
+
+export interface ResolvedReportRecipient {
+  openId?: string;
+  source: ReportRecipientSource;
+  sourceSessionId?: string;
+}
+
+export function resolveReportRecipientForSession(input: {
+  session: ReportRecipientSession;
+  sessions: ReportRecipientSession[];
+  knownPeerBotOpenIds: ReadonlySet<string>;
+  recipientRoot?: string;
+}): ResolvedReportRecipient {
+  const current = input.session;
+  const currentCreator = current.creatorOpenId?.trim();
+  if (input.recipientRoot !== undefined) {
+    if (!/^om_[A-Za-z0-9_-]{1,128}$/.test(input.recipientRoot)) {
+      throw new Error('--recipient-root 必须是有效的 om_ 消息 id。');
+    }
+    const currentCreatedAt = Date.parse(current.createdAt ?? '');
+    if ((current.scope ?? 'thread') !== 'thread'
+      || current.status !== 'active'
+      || !current.sessionId
+      || !current.larkAppId
+      || !current.chatId
+      || !Number.isFinite(currentCreatedAt)) {
+      throw new Error('--recipient-root 需要有效的 active thread 来源会话。');
+    }
+    // Count structural matches before checking peer identity so a peer+human ambiguity fails closed.
+    const candidates = input.sessions.filter(candidate => {
+      const candidateCreatedAt = Date.parse(candidate.createdAt ?? '');
+      return candidate.sessionId !== current.sessionId
+        && candidate.status === 'active'
+        && candidate.scope === 'chat'
+        && candidate.larkAppId === current.larkAppId
+        && candidate.chatId === current.chatId
+        && candidate.rootMessageId === input.recipientRoot
+        && Number.isFinite(candidateCreatedAt)
+        && candidateCreatedAt < currentCreatedAt;
+    });
+    if (candidates.length !== 1) {
+      throw new Error('--recipient-root 未匹配唯一的同应用、同群且严格更早的 active chat 会话。');
+    }
+    const candidateCreator = candidates[0].creatorOpenId?.trim();
+    if (!candidateCreator || !input.knownPeerBotOpenIds.has(candidateCreator)) {
+      throw new Error('--recipient-root 对应的 creator 不是当前应用已知的 peer。');
+    }
+    if (currentCreator && input.knownPeerBotOpenIds.has(currentCreator)) {
+      return { openId: currentCreator, source: 'session-creator' };
+    }
+    return {
+      openId: candidateCreator,
+      source: 'recipient-root-chat-creator',
+      sourceSessionId: candidates[0].sessionId,
+    };
+  }
+
+  if (currentCreator) return { openId: currentCreator, source: 'session-creator' };
+  const owner = current.ownerOpenId?.trim();
+  if (owner) return { openId: owner, source: 'session-owner' };
+  const quoteSender = current.quoteTargetSenderOpenId?.trim();
+  if (quoteSender) return { openId: quoteSender, source: 'quote-sender' };
+  return { source: 'none' };
 }
 
 /**

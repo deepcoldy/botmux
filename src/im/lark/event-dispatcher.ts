@@ -4,28 +4,32 @@
  * Extracted from daemon.ts for modularity.
  */
 import * as Lark from '@larksuiteoapi/node-sdk';
-import { ProxyAgent } from 'proxy-agent';
+import { startLarkConnection } from './transport/connection.js';
 import { readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
-import { getBot, getAllBots, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
+import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
-import { getChatInfo, getChatMode, getCachedChatMode, getUserProfile, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { getChatInfo, getChatMode, getCachedChatMode, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { listChats } from '../../services/groups-store.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
-import { parseForceTopicInvocation, parseSlashCommandInvocation, resolvePassthroughCommands } from '../../core/command-handler.js';
+import { parseSlashCommandInvocation, resolvePassthroughCommands } from '../../core/command-handler.js';
+import { isTopicHeader, parseTopicHeader, parseTopicHeaderWithLifecycleAliases } from '../../core/topic-header.js';
 import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
-import { resolveNonsupportMessage, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, type MentionIdentity } from './message-parser.js';
+import { resolveNonsupportMessage, stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, type MentionIdentity } from './message-parser.js';
+import { emitHookEvent, runGroupJoinCommand } from '../../services/hook-runner.js';
+import { commandPrecedesMentions } from './mention-targets.js';
 import { recordObservedBots, listObservedBots } from '../../services/observed-bots-store.js';
 import { isTeamBot, recordTeamBot } from '../../services/team-bots-store.js';
 import { isTeamGroupChat } from '../../services/team-groups-store.js';
 import { isPlatformTeamBot, isPlatformHallChat, isPlatformTeamMember } from '../../services/platform-team-store.js';
 import { getBotUnionId, recordBotUnionId, recordBotUnionIdFromMentions } from '../../services/bot-union-ids-store.js';
-import { getDocSubscription, putDocSubscription, removeDocSubscription, listAllDocSubscriptions, type DocSubscription } from '../../services/doc-subs-store.js';
+import { docWatchAnchor, getDocSubscription, putDocSubscription, removeDocSubscription, listAllDocSubscriptions, settleDocCommentWsDelivery, type DocSubscription } from '../../services/doc-subs-store.js';
 import { wasPendingReviewNotified, markPendingReviewNotified } from '../../services/under-review-notify-store.js';
-import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed, BOT_REPLY_SENTINEL } from './doc-comment.js';
+import { getDocComment, isBotAuthoredReply, hasBotSentinel, commentTriggerAllowed, BOT_REPLY_SENTINEL, addCommentReactionChecked } from './doc-comment.js';
 import {
   BOTMUX_REQUIRED_SCOPES,
   DOC_FEATURE_SCOPES,
@@ -37,16 +41,18 @@ import {
   buildEventSubDeepLink,
   buildScopeDeepLink,
 } from '../../setup/verify-permissions.js';
-import { automateOpenPlatformSetup, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest, inspectUnderReviewConfigHints } from '../../setup/open-platform-automation.js';
-import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
+import { automateOpenPlatformSetup, MESSAGE_UPDATED_EVENT, ensureAppEventSubscriptions, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest, inspectUnderReviewConfigHints } from '../../setup/open-platform-automation.js';
+import { type Brand, larkHosts, normalizeBrand } from './lark-hosts.js';
 import { tryHandleGrantCommand } from './grant-command.js';
 import { tryHandleInviteCommand } from './invite-command.js';
 import { autoInviteOwnerOnGroupJoin } from '../../services/groups-store.js';
 import { tryHandleReplyModeCommand } from './reply-mode-command.js';
+import { tryHandleChatTabsCommand } from './chat-tabs-command.js';
 import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled, clearPending } from './grant-pending.js';
+import { resolveGrantApprover } from './grant-owner.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import {
   chatQuotaKey,
@@ -57,12 +63,15 @@ import {
 import { ForwardFollowupBuffer } from './forward-followup-buffer.js';
 import { listForwardFollowups, putForwardFollowup, removeForwardFollowup } from './forward-followup-store.js';
 import { claimMessageOnce, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
+import { hasTriggeredMessage, markMessageTriggered, _resetCacheForTest as _resetTriggeredMessagesForTest } from '../../services/triggered-message-store.js';
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
+import { ensureSignedChatDefault } from '../../services/signed-chat-defaults.js';
 import { getSessionGroup } from '../../services/session-groups-store.js';
 import { resolveRegularGroupMode, resolveGroupMentionMode, type GroupMentionMode } from '../../services/chat-reply-mode-store.js';
 import { buildSummaryCommandPrompt, type SummaryChatKind, type SummaryCommandMatch, type SummaryCommandRuntimeContext } from './summary-command.js';
 import { DEFAULT_SUMMARY_PROMPT, summaryRangeFromBotConfig } from '../../services/summary-range-store.js';
 import { isSubstituteEnabledForChat } from '../../services/substitute-chat-toggle-store.js';
+import { isP2pForceTopicRoot, recordP2pForceTopicRoot } from '../../services/p2p-force-topic-store.js';
 import { evaluateMessageListener, resolveListenerSenderIdentity, buildListenerBotAppIdToOpenId, collectListenerBotAppIds, type MessageListenerMatch } from '../../services/message-listener.js';
 import {
   parseVcMeetingPushEvent,
@@ -77,6 +86,7 @@ import type { VcMeetingImTurnOrigin } from '../../types.js';
 import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/grant-policy.js';
 import { readPeerCrossRef, writePeerCrossRef } from '../../services/peer-cross-ref-store.js';
 import { resolveCardActionAckTimeoutMs } from '../../core/card-action-ack.js';
+import { DROPPED_REACTION_EMOJI_TYPE } from '../../core/pending-response.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
 const hallEchoReplied = new Set<string>();
@@ -847,6 +857,49 @@ export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promis
   }
 }
 
+/**
+ * Startup only adds the missing edit event over the cached Feishu web session.
+ * Never run full setup here: it changes scopes and can publish unrelated drafts.
+ * Readback checks configured events and mode, not the published version or delivery.
+ * Failure only disables edit-to-@, so log without sending an admin DM per bot.
+ */
+export async function ensureMessageUpdatedEventSubscribed(larkAppId: string): Promise<void> {
+  const bot = getBot(larkAppId);
+  if (normalizeBrand(bot.config.brand) !== 'feishu') return;
+  try {
+    const result = await ensureAppEventSubscriptions(larkAppId, [MESSAGE_UPDATED_EVENT]);
+    const updateStatus = result.updateSubmitted ? '更新请求已成功返回' : '无成功返回的更新请求';
+    if (!result.ok) {
+      logger.info(
+        `[${larkAppId}] im.message.updated_v1 配置检查未完成（${result.reason}，${updateStatus}）：` +
+        `请检查开放平台登录态和事件订阅配置；发布生效及实际推送未验证。`,
+      );
+      return;
+    }
+    if (!result.eventModeReady || result.missingEvents.length > 0) {
+      logger.info(
+        `[${larkAppId}] im.message.updated_v1 配置回读不完整（longConnection=${result.eventModeReady}, ` +
+        `missing=${result.missingEvents.join(',')}，${updateStatus}）：请在开放平台检查事件和长连接配置；` +
+        `发布生效及实际推送未验证，不影响正常消息。`,
+      );
+      return;
+    }
+    if (result.updateSubmitted) {
+      logger.info(
+        `[${larkAppId}] im.message.updated_v1 更新请求已成功返回，配置回读包含事件且为长连接；` +
+        `启动流程不会自动发布，请在开放平台检查并发布应用版本；发布生效及实际推送未验证。`,
+      );
+    } else {
+      logger.info(
+        `[${larkAppId}] im.message.updated_v1 已有配置包含事件且为长连接，本次未更新；` +
+        `发布生效及实际推送未验证，编辑补 @ 无响应时请检查已发布版本的事件订阅。`,
+      );
+    }
+  } catch (err: any) {
+    logger.debug(`[${larkAppId}] message-updated event subscription check errored: ${err?.message ?? err}`);
+  }
+}
+
 // ─── Group chat stats cache ───────────────────────────────────────────────
 //
 // chat.get returns both user_count (real users only) and bot_count (bots).
@@ -1026,7 +1079,7 @@ function shapeCardActionResult(result: any): any {
   // The handler may return:
   //   - an already-shaped Lark response ({toast} and/or {card}) -> pass through;
   //   - a raw card body (e.g. toggle_stream) -> wrap as an in-place card patch.
-  if (result && (result.toast || result.card || result.deferredCard)) return result;
+  if (result && (result.toast || result.card || result.deferredCard || result.afterAck)) return result;
   if (result) return { card: { type: 'raw', data: result } };
   // The Lark WS SDK only serializes callback `data` for truthy results. An
   // empty object therefore means "ACK with no UI update", while undefined
@@ -1074,6 +1127,15 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
   const work = handlers.handleCardAction(data, larkAppId)
     .then(shapeCardActionResult)
     .then(result => {
+      if (typeof result?.afterAck === 'function') {
+        // Run a fresh serialized publisher after ACK, never a captured card
+        // snapshot which could overwrite another tool/answer update.
+        setTimeout(() => {
+          void Promise.resolve().then(result.afterAck)
+            .catch(err => logger.warn(`Failed to publish card action after ACK: ${err}`));
+        }, 0);
+        return result.toast ? { toast: result.toast } : {};
+      }
       if (!result?.deferredCard) return result;
       // ACK the callback before patching. If we await message.patch here, Lark
       // applies the callback completion after the API patch and can restore the
@@ -1082,7 +1144,7 @@ async function handleCardActionAckSafe(data: any, larkAppId: string, handlers: E
         void patchTimedOutCardActionResult(larkAppId, data, result)
           .catch(err => logger.warn(`Failed to patch deferred card action result: ${err}`));
       }, 0);
-      return {};
+      return result.toast ? { toast: result.toast } : {};
     })
     .catch(err => {
       logger.error(`Error handling card action: ${err}`);
@@ -1124,6 +1186,9 @@ export function __resetEventClaimsForTest(): void {
   // The message path now dedupes via the persistent seen-message store; clear its
   // in-memory cache too so cases reusing the same message_id don't suppress each other.
   _resetSeenMessagesForTest();
+  // 同清「已触发任务」记录，避免编辑事件幂等在用例间串状态。
+  _resetTriggeredMessagesForTest();
+  pendingMessageTriggers.clear();
 }
 
 export async function getGroupStats(larkAppId: string, chatId: string): Promise<{ userCount: number; botCount: number }> {
@@ -1398,7 +1463,7 @@ export function updateBotOpenIdCrossRef(
 
 /** Command-position match: after stripping leading @mentions, the remaining
  *  text must begin with `/introduce` (optionally followed by whitespace).
- *  This is the same approach `parseForceTopicInvocation` takes for /t /topic.
+ *  This is the same approach `parseTopicHeader` takes for its /t /topic sentinel.
  *  Stricter than a bare token match — "please run /introduce" or similar
  *  quoted/explanatory text won't trigger. */
 const INTRODUCE_RE = /^\/introduce(?:\s|$)/i;
@@ -1676,6 +1741,7 @@ export const TALK_REASONS = [
   'chatGrant',
   'globalGrant',
   'p2pOpen',
+  'blocked',
   'none',
 ] as const;
 
@@ -1686,20 +1752,20 @@ export interface TalkEvaluation {
   reason: TalkReason;
   quotaKey?: string;
   /**
-   * 仅在 reason==='oncall' 且命中 quotaKey 时可能为 true：本 oncall 用户在**同群**还持有一条
-   * 「未过期的显式 chatGrant」。oncall 与 chatGrant 共用同一把 chat quotaKey，owner 给 oncall
-   * 用户 /grant「不限」时磁盘上无 quota 记录（= 显式不限），若额度层再按 messageQuota.defaultLimit
-   * 懒初始化就会把「显式不限」静默套回 default。带上这个标志让额度层对这种交集**不兜 default**。
-   * 显式 N 授权已有 quota 记录，consumeQuota 直接消费现有记录，与本标志无关。
+   * **已无生产产出方**（保留字段，待独立 cleanup 一并删）。
+   * 历史语义：oncall 腿曾按 messageQuota.defaultLimit 挂 quotaKey，与 chatGrant 共用同一把 chat
+   * quotaKey，于是「oncall ∩ 显式不限 chatGrant」需要这个标志告诉额度层**不兜 default**。
+   * 现在 oncall 恒不挂 quotaKey（见 oncallTalk），该交集不再存在 —— 唯一产出这个标志的分支已删除，
+   * 没有任何代码再把它置为 true。
    */
   explicitGrantOverride?: boolean;
   /**
-   * 仅在 reason==='oncall' 且该用户同群持有一条**已过期** chatGrant 时给出：透传给
-   * consumeQuota，由它在**同一把额度锁内**以「当前 expiry」为权威判定——当前 expiry<=now 则原子清
-   *「成员+quota+expiry」并回落 oncall default；当前无 expiry/未来 expiry 则该 grant 仍 live（成员在→
-   * 不兜 default 按现有记录/不限消费；成员已被清→普通 oncall→回落 default）。收口进一把锁，杜绝跨
-   * await 用陈旧 ev 决策，也不会让过期成员关系残留成永久授权。（pure chatGrant/globalGrant 的过期走
-   * grantNotExpired 拒发。）
+   * **已无生产产出方**（保留字段，待独立 cleanup 一并删）。
+   * 历史语义：oncall 用户同群持有一条**已过期** chatGrant 时给出，透传给 consumeQuota 在同一把额度
+   * 锁内原子清「成员+quota+expiry」并回落 oncall default。现在 oncall 恒不挂 quotaKey，该腿不再产生
+   * 这个描述符；oncall 群里的过期 chatGrant 记录成为孤儿（该群不读 quotaState/expiry，不影响判定，
+   * 群一旦退出 oncall 即由 hasChatGrant 的 grantNotExpired 首条消息拒发 + 自愈清理）。
+   * 纯 chatGrant / globalGrant 的过期一直走 grantNotExpired 拒发，与本字段无关。
    */
   expiredGrantCleanup?: { scope: 'chat'; chatId: string; openId: string };
   /**
@@ -1739,32 +1805,22 @@ function hasGlobalGrant(larkAppId: string, openId: string | undefined): boolean 
 }
 
 /**
- * oncall 群命中的 talk 判定（chat 维度、与发送者无关）。抽成函数是为了让**会话群**的
- * 存量条目能原样复用旧语义，见 evaluateSessionGroupTalk 的兜底分支。
+ * oncall 群命中的 talk 判定（chat 维度、与发送者无关）——**恒不限额**。
+ *
+ * `messageQuota.defaultLimit` 的语义是「授权卡/自助申请授权放进来的**访客**默认额度」，
+ * oncall 群不读它。历史上曾读过：`2cbc61076`（一个讲「自助授权卡继承 defaultLimit」的
+ * commit）顺手把 oncall 从恒不限额改成「配了 defaultLimit 就挂 quotaKey」，commit message
+ * 未提及；随后 #768「统一文案」把这个既成事实写进了 dashboard 帮助文案与文档。实际后果：
+ *   • oncall 腿排在 peer/teamBot 之前 → 同团队 bot 本该「免 /grant 且不限额」，却被这条
+ *     访客额度连带计量，`teamBot` 腿结构上不可达；
+ *   • 额度耗尽后 `revokeQuotaGrant` 对 reason='oncall' 是 no-op（无 chatGrant 可删）→
+ *     授权并未真被收回，计数器也不会清，于是**每条后续消息都重发一张「额度已用尽」卡**；
+ *   • 而恢复手段只有「点名带额度」`/grant @x N`：裸 `/grant` 只写 allowedChatGroups
+ *     （同样被 oncall 短路）且不碰 quotaState，owner 反复授权无效。
+ * 即「限了额也没法用 /grant 提额」，护栏在 oncall 场景下只会把群锁死，因此不再计量。
+ * 访客侧不受影响：chatGrant / globalGrant 腿仍各自挂 quotaKey 并照常消费 defaultLimit。
  */
-function oncallTalk(
-  bot: ReturnType<typeof getBot>,
-  larkAppId: string,
-  chatId: string,
-  senderOpenId: string | undefined,
-): TalkEvaluation {
-  const def = bot.config.messageQuota?.defaultLimit;
-  if (typeof def === 'number' && Number.isInteger(def) && def > 0 && senderOpenId) {
-    // 交集处理：同群若还持有显式 chatGrant，额度由授权决定而非 oncall default。
-    // 三态：live 显式授权 → explicitGrantOverride（不兜 default）；已过期 → expiredGrantCleanup
-    //（透传给 consumeQuota，锁内以当前 expiry 为准原子清成员+quota+expiry 并回落 default）；
-    // 非成员 → 无覆盖，正常走 oncall default 懒初始化。
-    const gk = chatQuotaKey(chatId, senderOpenId);
-    const isMember = !!bot.config.chatGrants?.[chatId]?.includes(senderOpenId);
-    const exp = isMember ? getGrantExpiresAt(larkAppId, gk) : undefined;
-    if (isMember && exp !== undefined && Date.now() >= exp) {
-      return {
-        allowed: true, reason: 'oncall', quotaKey: gk,
-        expiredGrantCleanup: { scope: 'chat', chatId, openId: senderOpenId },
-      };
-    }
-    return { allowed: true, reason: 'oncall', quotaKey: gk, explicitGrantOverride: isMember };
-  }
+function oncallTalk(): TalkEvaluation {
   return { allowed: true, reason: 'oncall' };
 }
 
@@ -1829,9 +1885,9 @@ function evaluateSessionGroupTalk(
   }
   // 存量会话群：provenance 是本次修复才加的字段，升级前出生的条目没有它。回退到旧的
   // oncall 语义，但**只对群主**生效（群里其他人的绕过口子照样堵死），以免升级瞬间把已有
-  // 会话群全部打成「无权发言」。这些群仍是每群一份额度，直到重新出生 —— 已知且有界。
+  // 会话群全部打成「无权发言」。oncall 现在恒不限额（见 oncallTalk），故这里也不再计量。
   if (!findOncallChat(larkAppId, chatId)) return undefined;
-  return oncallTalk(bot, larkAppId, chatId, senderOpenId);
+  return oncallTalk();
 }
 
 const expiryCleanupInFlight = new Set<string>();
@@ -1878,6 +1934,7 @@ function hasConfiguredAllowlist(bot: ReturnType<typeof getBot>): boolean {
   return (bot.config.allowedUsers?.length ?? 0) > 0
     || (bot.config.allowedChatGroups?.length ?? 0) > 0
     || (bot.config.globalGrants?.length ?? 0) > 0
+    || !!bot.config.ownerOpenId
     // p2pOpen 也是一次显式的权限边界声明：配了它 = 进入限制态。否则「只配 p2pOpen、
     // 没配 allowedUsers」会 fall through 到 open 模式，把**群聊**和 **canOperate** 一起
     // 放开（陌生人能 /restart /cd），与 p2pOpen「只开私聊 talk」的语义正好相反。
@@ -1911,6 +1968,15 @@ export function evaluateTalk(
   // 成员关系隐含在"能在该 chat 发言"里 —— 退群者发不了言自动失权，新人进群即生效，无需成员快照。
   const allowedUsers = bot.resolvedAllowedUsers;
   if (senderOpenId && allowedUsers.includes(senderOpenId)) return { allowed: true, reason: 'allowedUser' };
+  // blockedUsers 黑名单否决腿（P1c）：纯增量、sender open_id 维度，排在 allowedUser
+  // 命中之后（管理员即使被误写进黑名单也仍放行，双保险——写入口 setBotBlockedUsers
+  // 已挡住 owner/管理员）、其余所有放行腿（会话群/oncall/peer/teamBot/teamMember/
+  // allowedChatGroup/p2pOpen/open/chatGrant/globalGrant）之前——黑名单不依赖限制态，
+  // open 模式下同样生效。被黑用户静默处理：不弹授权申请卡（见
+  // maybeSendGrantRequestCard / requestGrantForAskClicker）。
+  if (senderOpenId && bot.resolvedBlockedUsers.includes(senderOpenId)) {
+    return { allowed: false, reason: 'blocked' };
+  }
   // 会话群专用腿，**必须排在 oncall 之前**：会话群里的 oncall 绑定只是出生时为了
   // 承载 workingDir 写下的，不能当作 talk 来源（详见 evaluateSessionGroupTalk）。
   // 命中会话群时无论表不表态，都不再回落 oncall 腿。
@@ -1919,10 +1985,9 @@ export function evaluateTalk(
     const inherited = evaluateSessionGroupTalk(bot, larkAppId, chatId!, senderOpenId, sessionGroup);
     if (inherited) return inherited;
   } else if (chatId && findOncallChat(larkAppId, chatId)) {
-    // Oncall 群命中：默认不限额；仅当 bot 配了 messageQuota.defaultLimit 时，
-    // 才挂 chat:<chatId>:<openId> 这一 quotaKey（与 chatGrant 同键、同计数器，
-    // 便于 owner 后续 /grant @x N 续杯/重置）。
-    return oncallTalk(bot, larkAppId, chatId, senderOpenId);
+    // Oncall 群命中：**恒不限额**，不读 messageQuota.defaultLimit（那是访客授权额度，
+    // 详见 oncallTalk 的病史说明）。
+    return oncallTalk();
   }
   if (isKnownPeerBot(config.session.dataDir, larkAppId, senderOpenId)) return { allowed: true, reason: 'peer' };
   // 跨部署团队 peer bot（旧版联邦学来的 union_id / 平台 roster 下发的 union_id）——
@@ -1998,6 +2063,9 @@ export function evaluateBotTalk(
 ): TalkEvaluation {
   const ev = evaluateTalk(larkAppId, chatId, senderOpenId, senderUnionId);
   if (ev.allowed) return ev;
+  // 黑名单否决不可被 bot 独有的团队拉群 chat 维度腿复活：被黑 bot 即使出现在团队
+  // 拉群里也照样拒绝（人侧 evaluateTalk 已挡 union 腿，这里挡 chat 腿）。
+  if (ev.reason === 'blocked') return ev;
   return isTrustedTeamBotSender(config.session.dataDir, chatId, senderUnionId)
     ? { allowed: true, reason: 'teamBot' }
     : ev;
@@ -2090,6 +2158,13 @@ export function canOperate(
   senderUnionId?: string | undefined,
 ): boolean {
   const bot = getBot(larkAppId);
+  const allowedUsers = bot.resolvedAllowedUsers;
+  // 管理员正向腿排在最前：owner/管理员即使被误写进黑名单（写入口
+  // setBotBlockedUsers 已拦，这里兜历史脏数据/手工编辑）也不丢 operate。
+  if (senderOpenId && allowedUsers.includes(senderOpenId)) return true;
+  // blockedUsers 否决腿（P1c）：必须排在 isTeamBot / isPlatformTeamBot 两条
+  // union 信任腿之前——被黑团队 bot 不能借团队背书复活 operate。
+  if (senderOpenId && bot.resolvedBlockedUsers.includes(senderOpenId)) return false;
   // 同部署 cross-ref / isKnownPeerBot 只证明「这是一个可路由的 bot 身份」，仅供
   // evaluateTalk 的 peer 腿使用，绝不能隐式升级为管理权限。需要让编排者执行
   // /repo /cd /restart 等命令时，必须命中下面显式支持 operate 的权限源。
@@ -2101,7 +2176,6 @@ export function canOperate(
   // 是发送方专属、且必须先被团队背书（团队群学习 / 平台 roster）才进表，人不会命中。
   if (isTeamBot(config.session.dataDir, senderUnionId)) return true;
   if (isPlatformTeamBot(config.session.dataDir, senderUnionId)) return true;
-  const allowedUsers = bot.resolvedAllowedUsers;
   // globalGrants（与 allowedChatGroups 同理）确立"有白名单"语义：只配 globalGrants 也算限制态，
   // 否则 canOperate 会 fall through 到"全开放"，把 talk-only 授权变成 operate 全开——正是 PR #46
   // 要堵的洞。注意 globalGrants 只进 hasAllowlist 判定，operate 命中仍只认 allowedUsers。
@@ -2113,7 +2187,9 @@ export function canOperate(
 /**
  * Daemon 命令统一闸：canOperate 恒放行；此外，bot 配置的 `canTalkDaemonCommands`
  * 名单内的命令降到 canTalk 判定（oncall / allowedChatGroup / grant / p2pOpen 等
- * 对话放行腿命中即可）。名单外或未配置 → 与 canOperate 完全等价（现状不变）。
+ * 对话放行腿命中即可）。启用 trigger-user auth 时，`/login` 也自动降到 canTalk：
+ * talk-only 用户必须能为自己建立该功能要求的凭证，不能先要求 owner 把他提升成
+ * operator。功能关闭时 `/login` 仍保持 canOperate，其他命令也不自动扩权。
  *
  * 只作用于 daemon.ts 两条路由的 DAEMON_COMMANDS 统一闸；在统一闸之前特判的命令
  * （/vc-auth /term）与 handler 内部自带 owner 闸的命令（/card /insight）
@@ -2148,8 +2224,9 @@ export function canRunDaemonCommand(
     && isVerifiedLocalSiblingBot(config.session.dataDir, larkAppId, senderOpenId, senderUnionId)) {
     return true;
   }
-  const list = getBot(larkAppId).config.canTalkDaemonCommands;
-  if (!list?.includes(cmd)) return false;
+  const botConfig = getBot(larkAppId).config;
+  const triggerUserLogin = cmd === '/login' && botConfig.triggerUserAuth?.enabled === true;
+  if (!triggerUserLogin && !botConfig.canTalkDaemonCommands?.includes(cmd)) return false;
   return botSender
     ? evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId).allowed
     : canTalk(larkAppId, chatId, senderOpenId, senderUnionId, memberUnionId, chatType);
@@ -2159,13 +2236,17 @@ export function canRunDaemonCommand(
  * 入口 A：无权限者 @bot 时弹授权申请卡（正文 @owner，由 owner 处置）。
  * 受 grant-pending 节流：pending 中 / deny 冷却期内静默不发。开放模式（无 owner）兜底不发。
  */
-async function maybeSendGrantRequestCard(
+export async function maybeSendGrantRequestCard(
   larkAppId: string, message: any, chatId: string, requesterOpenId: string | undefined, messageData?: any,
 ): Promise<void> {
+  // 黑名单用户静默：不弹授权申请卡、不开 pending、不触发任何回复（P1c）。
+  // 必须在 autoGrantRequestCards / owner / 节流等一切判定之前短路。
+  if (requesterOpenId && evaluateTalk(larkAppId, chatId, requesterOpenId).reason === 'blocked') return;
   if (getBot(larkAppId).config.autoGrantRequestCards === false) return;
   const owner = getOwnerOpenId(larkAppId);
   if (!owner || !requesterOpenId) return;
   if (isThrottled(larkAppId, chatId, requesterOpenId)) return;
+  const approverPromise = resolveGrantApprover(larkAppId, chatId, message).catch(() => undefined);
   // 名字优先级：本消息 mentions（真人发送方、被 @ 目标都在此）→ observed-bots 花名册
   // （/introduce 登记过的 (open_id,name)）→ 裸 open_id 兜底。外部 bot 发送方不在自己
   // 消息的 mentions 里（那是 @ 目标），只靠 mentions 会让 owner 只看到 open_id。
@@ -2178,6 +2259,7 @@ async function maybeSendGrantRequestCard(
     : (await getUserProfile(larkAppId, requesterOpenId).catch(() => null))?.name;
   const shortRequester = `${requesterOpenId.slice(0, 10)}…${requesterOpenId.slice(-4)}`;
   const name = mentionName ?? observedName ?? profileName ?? shortRequester;
+  const approver = (await approverPromise) ?? owner;
   // 把原始消息事件挂在 pending 上：授权成功后可重放，用户无需再 @ 一遍。
   const botConfig = getBot(larkAppId).config;
   const quota = botConfig.messageQuota?.defaultLimit ?? DEFAULT_GRANT_QUOTA;
@@ -2192,7 +2274,7 @@ async function maybeSendGrantRequestCard(
   );
   const card = buildGrantCard(
     {
-      ownerOpenId: owner,
+      ownerOpenId: approver,
       targets: [{ openId: requesterOpenId, name: String(name) }],
       chatId,
       nonce,
@@ -2272,6 +2354,13 @@ export interface RoutingContext {
    *  replace it with a daemon-owned synthetic anchor for a dedicated receiver
    *  session; the visible chatId/scope remain unchanged. */
   anchor: string;
+  /** Daemon-only validated principal-lane registry key. Never derived from the
+   * event and never used as a Lark destination. */
+  runtimeRoutingAnchor?: string;
+  /** The inbound message was sent at the top level of a regular group. This
+   * remains true in `new-topic` mode even though its conversational route was
+   * rewritten to a fresh thread, allowing sessionless group UI to stay flat. */
+  regularGroupTopLevel?: boolean;
   /** Chat-scope shared-topic reply target for this turn, if any. */
   replyRootId?: string;
   /** Set when the turn folded into the group chat-scope session from a Lark
@@ -2280,6 +2369,9 @@ export interface RoutingContext {
    *  registered under this root so a later NON-@ message inside that topic
    *  folds back here instead of forking a new thread-scope session. */
   foldedRootId?: string;
+  /** 本次路由的 thread-scope 是 `/t` / 指令头翻出来的（maybeApplyForceTopicOverride），
+   *  不是消息本来的位置。handler 侧的授权闸靠它认出「这条路是命令挣来的」。 */
+  forceTopicApplied?: boolean;
   /** Command prompt that should be sent to the CLI instead of raw text. */
   promptOverride?: string;
   /** Durable VC routing succeeded but the bounded pre-turn catch-up did not.
@@ -2344,6 +2436,7 @@ function listenerRoutingContext(input: {
   chatType: 'group' | 'p2p';
   larkAppId: string;
 }): PendingForwardTopicPayload {
+  const replyInChat = input.match.replyMode === 'chat';
   return {
     data: input.data,
     ctx: {
@@ -2351,8 +2444,9 @@ function listenerRoutingContext(input: {
       messageId: input.messageId,
       chatType: input.chatType,
       larkAppId: input.larkAppId,
-      scope: 'thread',
-      anchor: input.messageId,
+      scope: replyInChat ? 'chat' : 'thread',
+      anchor: replyInChat ? input.chatId : input.messageId,
+      regularGroupTopLevel: replyInChat,
       messageListener: input.match,
     },
     ownsSession: false,
@@ -2377,9 +2471,20 @@ const MESSAGE_LISTENER_BACKFILL_PAGE_SIZE = Math.min(50, Math.max(
 ));
 
 function enabledMessageListenerChatIds(bot: BotState): string[] {
-  return Object.entries(bot.config.messageListeners ?? {})
+  // Global listeners potentially apply to every joined group. The polling
+  // backfill needs concrete chat ids, so callers provide the configured
+  // exception set here; joined chats without an exception are still covered by
+  // realtime delivery and are discovered by the dashboard group list.
+  const customChatIds = Object.entries(bot.config.groupMessageListenerOverrides ?? {})
+    .filter(([, override]) => override?.mode === 'custom' && override.listener.enabled === true && !!override.listener.prompt?.trim())
+    .map(([chatId]) => chatId);
+  // Keep legacy-only configurations pollable during the rolling migration.
+  // bot-registry exposes this compatibility view specifically for callers that
+  // have not yet been converted to groupMessageListenerOverrides.
+  const legacyChatIds = Object.entries(bot.config.messageListeners ?? {})
     .filter(([, listener]) => listener?.enabled === true && !!listener.prompt?.trim())
     .map(([chatId]) => chatId);
+  return [...new Set([...customChatIds, ...legacyChatIds])];
 }
 
 function messageCreateTimeMs(message: any): number | undefined {
@@ -2415,6 +2520,30 @@ function historyMessageSender(message: any): {
   };
 }
 
+/**
+ * 飞书「修改」消息走的是富文本编辑器：一条原本的 text 消息保存后，REST 回读的
+ * body.content 会变成 {"text":"<p>正文</p>"}（多段为多个 <p>），而正常 WS 事件
+ * 是 {"text":"正文"}。若不解包，字面 HTML 会漏给 CLI，且 `<p>/solve …</p>` 这类
+ * 编辑补 @ 的斜杠命令会让群闸 startsWith('/') 失效。这里把「整段恰好被一个或多个
+ * <p> 包裹」的 text 还原成按换行连接的纯文本；只在能确认整体就是段落包裹时处理，
+ * 用户正文里本来就含 `<p>` 字样的消息绝不误伤。
+ */
+function unwrapEditedTextContent(rawContent: string): string {
+  let parsed: any;
+  try {
+    parsed = JSON.parse(rawContent);
+  } catch {
+    return rawContent;
+  }
+  const text = parsed?.text;
+  if (typeof text !== 'string' || !text.includes('<p>')) return rawContent;
+  const paragraphs = [...text.matchAll(/<p>([\s\S]*?)<\/p>/g)].map(m => m[1]);
+  // 去掉所有 <p>…</p> 后若还有非空白残留，说明 <p> 只是正文的一部分，保持原样。
+  const residual = text.replace(/<p>[\s\S]*?<\/p>/g, '').trim();
+  if (paragraphs.length === 0 || residual !== '') return rawContent;
+  return JSON.stringify({ ...parsed, text: paragraphs.join('\n') });
+}
+
 function larkReceiveEventFromHistoryMessage(message: any, chatId: string): any {
   const { senderOpenId, senderTypeRaw, senderIdType } = historyMessageSender(message);
   // sender_type and the ID DOMAIN are independent axes. A bot sender keeps
@@ -2447,19 +2576,61 @@ function larkReceiveEventFromHistoryMessage(message: any, chatId: string): any {
   };
 }
 
+// Reserve before joining the canonical anchor queue. The raw routing lane is
+// released as soon as work is enqueued, so completion records alone leave a gap
+// for another edit (or receive/edit crossing different ingress lanes).
+const pendingMessageTriggers = new Set<string>();
+
+function messageTriggerKey(larkAppId: string, messageId: string): string {
+  return `${larkAppId}:${messageId}`;
+}
+
+function isMessageTriggerClaimed(larkAppId: string, messageId: string): boolean {
+  return hasTriggeredMessage(larkAppId, messageId)
+    || pendingMessageTriggers.has(messageTriggerKey(larkAppId, messageId));
+}
+
 async function dispatchHumanMessageViaHandlers(
   larkAppId: string,
   handlers: EventHandlers,
   payload: PendingForwardTopicPayload,
   capMs?: number,
 ): Promise<void> {
-  await serializeByAnchor(payload.ctx.anchor, () => {
-    const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId) ?? payload.ownsSession;
-    return ownsSession
-      ? handlers.handleThreadReply(payload.data, payload.ctx)
-      : handlers.handleNewTopic(payload.data, payload.ctx);
-  }, capMs);
+  const appId = payload.ctx.larkAppId ?? larkAppId;
+  const messageId = payload.ctx.messageId;
+  if (messageId && isMessageTriggerClaimed(appId, messageId)) {
+    logger.debug(`[message-trigger:${appId}] duplicate dispatch ignored msg=${messageId.substring(0, 12)}`);
+    return;
+  }
+  const key = messageId ? messageTriggerKey(appId, messageId) : undefined;
+  if (key) pendingMessageTriggers.add(key);
+  let completed = false;
+  try {
+    const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId)
+      ?? payload.ownsSession;
+    if (handlers.handlePrincipalLaneMessage
+        && await handlers.handlePrincipalLaneMessage(payload.data, payload.ctx, ownsSession)) {
+      completed = true;
+      return;
+    }
+    await serializeByAnchor(payload.ctx.anchor, () => {
+      const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId) ?? payload.ownsSession;
+      return ownsSession
+        ? handlers.handleThreadReply(payload.data, payload.ctx)
+        : handlers.handleNewTopic(payload.data, payload.ctx);
+    }, capMs);
+    completed = true;
+  } finally {
+    // A pre-admission failure can be retried by a later edit. Once admitted,
+    // even a subsequent presentation error must not allow the task to run again.
+    if (messageId && (completed || payload.ctx.ingressAdmission?.admitted)) {
+      markMessageTriggered(appId, messageId);
+    }
+    if (key) pendingMessageTriggers.delete(key);
+  }
 }
+
+export const __testOnly_dispatchHumanMessageViaHandlers = dispatchHumanMessageViaHandlers;
 
 async function dispatchPolledMessageListenerMatch(input: {
   larkAppId: string;
@@ -2489,7 +2660,20 @@ async function dispatchPolledMessageListenerMatch(input: {
 
 async function pollMessageListenersOnce(larkAppId: string, handlers: EventHandlers, now = Date.now()): Promise<void> {
   const bot = getBot(larkAppId);
-  const chatIds = enabledMessageListenerChatIds(bot);
+  const configuredChatIds = enabledMessageListenerChatIds(bot);
+  let chatIds = configuredChatIds;
+  if (bot.config.globalMessageListener?.enabled) {
+    try {
+      chatIds = [...new Set([...(await listChats(larkAppId)).map(chat => chat.chatId), ...configuredChatIds])];
+    } catch (error) {
+      // A transient roster failure must not suppress custom/legacy listener
+      // backfill for the whole 30s pass. Realtime delivery stays unaffected.
+      logger.warn(
+        `[message-listener:${larkAppId}] list joined chats failed; polling configured listener chats only: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
   if (chatIds.length === 0) return;
 
   const cutoff = now - MESSAGE_LISTENER_BACKFILL_WINDOW_MS;
@@ -2581,6 +2765,17 @@ export interface EventHandlers {
   handleCardAction: (data: any, larkAppId: string) => Promise<any>;
   handleNewTopic: (data: any, ctx: RoutingContext) => Promise<void>;
   handleThreadReply: (data: any, ctx: RoutingContext) => Promise<void>;
+  /** Validate a syntactically valid topic header before routing mutates scope.
+   * The daemon supplies the same semantic resolver used by handleNewTopic. */
+  validateTopicHeader?: (header: import('../../core/topic-header.js').TopicHeader, larkAppId: string) => boolean;
+  /** Optional live principal-lane adapter. It runs after dispatcher trust and
+   * message-shape gates but before the legacy chat-anchor serializer. Returning
+   * false preserves the legacy path byte-for-byte. */
+  handlePrincipalLaneMessage?: (
+    data: any,
+    ctx: RoutingContext,
+    ownsSession: boolean,
+  ) => Promise<boolean>;
   /** 主动开工 — 场景①: fired when this bot is added to a chat
    *  (`im.chat.member.bot.added_v1`). The daemon decides whether to auto-start
    *  based on the bot's `autoStartOnGroupJoin` toggle + allowedUser membership.
@@ -2665,7 +2860,7 @@ export function extractMessageTextForRouting(message: any): string | null {
     // text shape: {"text":"..."}. Lark stuffs placeholder keys like "@_user_1"
     // into obj.text; the human name only lives in message.mentions[].name. We
     // must resolve keys → @${name} so stripLeadingMentions can strip them
-    // before parseForceTopicInvocation sees the content. Mirrors the
+    // before parseTopicHeader sees the content. Mirrors the
     // resolveMentions logic in parseEventMessage.
     if (typeof obj?.text === 'string') {
       let text: string = obj.text;
@@ -2700,6 +2895,26 @@ export function extractMessageTextForRouting(message: any): string | null {
 }
 
 /**
+ * 路由侧判「这是不是指令头」时的 @ 剥离，必须与 daemon 侧**逐字同源**。
+ *
+ * daemon 走两道：先按位置剥前导 @（谁的都剥），再按身份剥本 bot 的 @（任意位置）。
+ * 路由这边曾经只做第一道，于是 `重构登录 /t /model @机器人` 在这里解析成「合法头部
+ *（模型名 = @机器人）」、在 daemon 那边解析成「/model 缺参数」——路由已经把 scope 翻成
+ * 新话题，daemon 才回一句用法错误，错误提示落进一个凭空开出来的话题里。
+ *
+ * `getBotOpenId` 不抛（未注册的 app id 返回 undefined），而 `stripBotMentions` 认不出
+ * 本 bot 时原样返回，所以 botOpenId 尚未解析出来的窗口期最坏退化成改动前的行为。
+ */
+function stripHeaderMentions(rawText: string, message: any, larkAppId: string): string {
+  const mentions = message?.mentions ?? [];
+  return stripBotMentions(
+    stripLeadingMentions(rawText.trim(), mentions),
+    mentions,
+    { botOpenId: getBotOpenId(larkAppId), larkAppId },
+  );
+}
+
+/**
  * If the inbound message starts with `/t` / `/topic` AND the routing
  * currently lands on chat-scope, override to thread-scope anchored at
  * the inbound message_id. This makes "force topic mode" work even when
@@ -2711,17 +2926,29 @@ export function extractMessageTextForRouting(message: any): string | null {
  * the prefix is still stripped downstream by handleNewTopic.
  */
 export function maybeApplyForceTopicOverride(
-  routing: { scope: 'thread' | 'chat'; anchor: string },
+  routing: { scope: 'thread' | 'chat'; anchor: string; forceTopicApplied?: boolean },
   message: any,
   messageId: string,
+  larkAppId: string,
+  validateTopicHeader?: (header: import('../../core/topic-header.js').TopicHeader, larkAppId: string) => boolean,
 ): boolean {
   if (routing.scope !== 'chat') return false;
   const rawText = extractMessageTextForRouting(message);
   if (!rawText) return false;
-  const stripped = stripLeadingMentions(rawText.trim(), message?.mentions ?? []);
-  if (!parseForceTopicInvocation(stripped)) return false;
+  const stripped = stripHeaderMentions(rawText, message, larkAppId);
+  // 指令头（`[标题] /t …`）与生命周期别名 `/th` `/tw` 走同一条判定。语法与
+  // 完整规格都校验成功后才能翻 scope；否则错误必须留在原 chat 中，不能先产生
+  // 新话题副作用。
+  const header = parseTopicHeaderWithLifecycleAliases(stripped);
+  if (!isTopicHeader(header) || (validateTopicHeader && !validateTopicHeader(header, larkAppId))) return false;
   routing.scope = 'thread';
   routing.anchor = messageId;
+  // 把「这条路由是 `/t` 翻出来的」记在 ctx 上，让下游 handler 能对**它自己没做过的
+  // 决定**上闸。翻 scope 就是 `/t` 的核心语义（把消息从共享 chat 拎进隔离的新话题、
+  // 并在那里 auto-create 出一个新会话），所以它必须能被授权闸盖住；而 handler 里看
+  // 「这个 anchor 上有没有会话」是看不出这件事的——翻转把 anchor 设成了 messageId，
+  // 那个 anchor 上**永远**没有会话。
+  routing.forceTopicApplied = true;
   return true;
 }
 
@@ -2753,6 +2980,8 @@ async function maybeApplySharedTopicSeed(input: {
   // (unconditional) or 'ambient' — but for 'ambient' NOT when the message
   // @mentions another specific member (person/bot) without @ing us: that is a
   // redirect to someone else, so we back off (mentionsAnotherMember).
+  // Bot-originated seeds can precede an authorized human turn. A cold signed
+  // default intentionally falls back to the stricter global mention mode.
   const seedMentionMode = resolveGroupMentionMode(larkAppId, chatId);
   if (!isBotMentioned(larkAppId, message, senderOpenId)
       && !(seedMentionMode === 'never'
@@ -2796,8 +3025,7 @@ async function maybeFoldMentionedRegularGroupThreadToChat(input: {
   if (threadId.startsWith('omt_') && resolveRegularGroupMode(larkAppId, chatId) === 'chat-topic') return undefined;
   const rawText = extractMessageTextForRouting(message);
   if (rawText) {
-    const stripped = stripLeadingMentions(rawText.trim(), message?.mentions ?? []);
-    if (parseForceTopicInvocation(stripped)) return undefined;
+    if (isTopicHeader(parseTopicHeaderWithLifecycleAliases(stripHeaderMentions(rawText, message, larkAppId)))) return undefined;
   }
 
   // In a regular group, `chat` and `shared` both mean "use the group's one
@@ -2873,6 +3101,85 @@ type RoutingDecision = {
   anchor: string;
   source: RoutingSource;
 };
+
+const legacyP2pForceTopicChecks = new BoundedMap<string, Promise<boolean>>(1000);
+
+async function isExplicitP2pTopic(input: {
+  larkAppId: string;
+  chatId: string;
+  rootId: string;
+}): Promise<boolean> {
+  const { larkAppId, chatId, rootId } = input;
+  if (isP2pForceTopicRoot(larkAppId, rootId, chatId)) return true;
+
+  // Backward compatibility for force-topic roots created before the provenance
+  // store existed, including bare /t roots that intentionally have no Session.
+  // Active ownership is not sufficient evidence: p2pMode=thread sessions
+  // deliberately fold into chat after switching to chat mode. Verify the
+  // immutable root message once with the SAME predicate as the live force-topic
+  // override, then persist only roots that really seeded a topic. On lookup
+  // failure, preserve the historical flat routing.
+  const key = `${larkAppId}:${chatId}:${rootId}`;
+  const cached = legacyP2pForceTopicChecks.get(key);
+  if (cached) return cached;
+  const check = (async () => {
+    try {
+      const detail = await getMessageDetail(larkAppId, rootId, { userCardContent: false });
+      const root = detail?.items?.[0];
+      if (!root || (root.chat_id && root.chat_id !== chatId)) return false;
+      const rawText = extractMessageTextForRouting({
+        message_type: root.msg_type ?? root.message_type,
+        content: root.body?.content ?? root.content,
+        mentions: root.mentions,
+      });
+      if (!rawText) return false;
+      // Same mention stripping and parser as maybeApplyForceTopicOverride:
+      // bare /t, /topic, /th, /tw aliases and the `[title] /t …` header form.
+      // The /repo worktree validator is not available here; a root that truly
+      // materialized a topic already passed it when the seed was routed.
+      const stripped = stripHeaderMentions(rawText, { mentions: root.mentions }, larkAppId);
+      if (!isTopicHeader(parseTopicHeaderWithLifecycleAliases(stripped))) return false;
+      recordP2pForceTopicRoot(larkAppId, rootId, chatId);
+      return true;
+    } catch (err) {
+      logger.debug(`[routing] failed to verify legacy p2p topic root=${rootId.substring(0, 12)}: ${err}`);
+      legacyP2pForceTopicChecks.delete(key);
+      return false;
+    }
+  })();
+  legacyP2pForceTopicChecks.set(key, check);
+  return check;
+}
+
+async function promoteExplicitP2pTopicIfNeeded(input: {
+  larkAppId: string;
+  chatId: string;
+  chatType: 'group' | 'p2p';
+  message: any;
+  routing: { scope: 'thread' | 'chat'; anchor: string };
+  routingSource: RoutingSource;
+}): Promise<boolean> {
+  const { larkAppId, chatId, chatType, message, routing, routingSource } = input;
+  if (routingSource !== 'p2p'
+      || routing.scope !== 'chat'
+      || chatType !== 'p2p'
+      || !message.root_id
+      || !message.thread_id) {
+    return false;
+  }
+  if (!await isExplicitP2pTopic({
+    larkAppId, chatId, rootId: message.root_id,
+  })) {
+    return false;
+  }
+  routing.scope = 'thread';
+  routing.anchor = message.root_id;
+  logger.info(
+    `[routing] p2p topic root=${message.root_id.substring(0, 12)} is /t-created or actively owned; ` +
+    `continuing thread-scope instead of chat=${chatId.substring(0, 12)}`,
+  );
+  return true;
+}
 
 function regularGroupRouting(larkAppId: string, messageId: string, chatId: string): RoutingDecision {
   // Only `new-topic` forks a fresh thread-scope session for a TOP-LEVEL @.
@@ -3067,6 +3374,163 @@ function handleVcMeetingPushEventAckSafe(
   }, `vc-meeting ${kind} event`);
 }
 
+/**
+ * 在被丢弃的触发回复上打一个 ❌，让「这条 @ 我没能处理」在文档里**看得见**。
+ *
+ * 为什么需要：文档评论事件被丢弃后，飞书不会重投（事件已 ACK）。已经读到正文、
+ * 通过 @ 与审计门的投递会进入持久 pending 重试；但本 helper 处理的是更早的失败
+ * （正文/回复都没读全，无法构造安全投递上下文），所以仍是终点。用户侧原本只能
+ * 看到「bot 不理我」，与「bot 正在忙」无法区分——doc
+ * 发起的会话在飞书上整个不可见，只能去 dashboard 翻 terminal 才知道发生了什么。
+ *
+ * 只在**明确知道该怪谁**、且非预期的丢弃点上打：
+ *   • 拉不到评论内容 / 触发回复不在拉到的回复里 —— 都是我们这边没读到用户说了啥
+ *   • 纯 @bot 无文本正文（elementsToText 只拼 text_run，丢掉 person）
+ * **不打**的场景：自触发（bot 自己的回复）、mention-only 未 @ 本 bot（压根不该
+ * 触发，打了反而在别人的评论上留噪音）、'all' 模式下真正没 @ 谁的空评论。
+ *
+ * 顺序是**自触发拦截 → 审计门 → tenant-only 写入**：先挡掉自己的事件，免得为它
+ * 去打扰 owner；审计通过后才允许产生 provider-visible 效果。
+ *
+ * best-effort：内部再兜一层 try/catch，绝不让「打标记失败」影响丢弃路径本身
+ * （那已经是失败路径了）。返回值如实回报结果，调用方据此记日志。
+ */
+/**
+ * 审计硬门：非 owner 触发时，必须**成功通知 owner** 才允许对外产生可见效果。
+ * owner 无法感知 = 越权，一律拒绝并回滚本次 auto-sub。owner 本人触发直接放行。
+ *
+ * 抽成 helper 是为了让「回复」和「失败标记」共用同一套规则 —— 两者都是
+ * provider-visible 的外部写入，规则分叉迟早会让其中一条悄悄绕过审计。
+ *
+ * `textSummary` 是通知正文里给 owner 看的摘要。**它可以不是评论正文**：失败
+ * 路径根本读不到正文，此时传一句说明（「评论正文读取失败…」）即可，不能因为
+ * 「构造不出摘要」就跳过审计。
+ *
+ * @returns true = 已授权（owner 本人，或通知成功）；false = 拒绝，调用方必须
+ *          立刻 return，且 auto-sub 已在这里回滚。
+ */
+async function passesDocCommentAuditGate(
+  larkAppId: string,
+  fileToken: string,
+  requesterOpenId: string | undefined,
+  textSummary: string,
+  rollbackAutoSub: () => void,
+  kind: 'reply' | 'dropped-signal' = 'reply',
+): Promise<boolean> {
+  const ownerOpenId = getOwnerOpenId(larkAppId);
+  if (ownerOpenId && requesterOpenId && requesterOpenId === ownerOpenId) return true;
+
+  if (!ownerOpenId) {
+    logger.warn(`[doc-comment] non-owner @mention but no ownerOpenId configured — rejecting (audit gate) file=${fileToken.slice(0, 12)} requester=${requesterOpenId?.slice(0, 12) || '?'}`);
+    rollbackAutoSub();
+    return false;
+  }
+  try {
+    const loc = localeForBot(larkAppId);
+    const requesterName = requesterOpenId?.slice(0, 12) || '?';
+    const notifyText = [
+      t(kind === 'reply' ? 'daemon.doc_mention_notify_title' : 'daemon.doc_dropped_notify_title', undefined, loc),
+      '',
+      t(kind === 'reply' ? 'daemon.doc_mention_notify_body' : 'daemon.doc_dropped_notify_body', { requester: requesterName, token: fileToken.slice(0, 12) }, loc),
+      '',
+      `📄 \`${fileToken}\``,
+      `💬 ${textSummary.slice(0, 200)}${textSummary.length > 200 ? '…' : ''}`,
+    ].join('\n');
+    await sendUserMessage(larkAppId, ownerOpenId, notifyText);
+    return true;
+  } catch (e) {
+    logger.warn(`[doc-comment] non-owner @mention but owner notification failed — rejecting (audit gate) file=${fileToken.slice(0, 12)} requester=${requesterOpenId?.slice(0, 12) || '?'} err=${e instanceof Error ? e.message : String(e)}`);
+    rollbackAutoSub();
+    return false;
+  }
+}
+
+export const __testOnly_passesDocCommentAuditGate = passesDocCommentAuditGate;
+
+/**
+ * 打失败标记的真实结果。**日志必须记这个，不能在调用前自己猜** —— 「模式命中」
+ * 只说明有资格尝试，离真的打上还隔着审计门、自触发拦截和 tenant 请求本身。
+ * 记错了会让排障的人以为「打了但飞书没渲染」，正好和加这个字段的目的相反。
+ */
+type DroppedSignalOutcome =
+  | 'marked'           // 真的打上了
+  | 'no-reply-id'      // 事件没带 reply_id，无处可打
+  | 'self-triggered'   // 触发者是 bot 自己（best-effort 识别）
+  | 'audit-rejected'   // 未过审计硬门（非 owner 且通知 owner 失败 / owner 未配置）
+  | 'reaction-failed'; // 审计通过了，但 tenant 请求失败
+
+async function markCommentEventDropped(
+  larkAppId: string,
+  file: { fileToken: string; fileType: string },
+  commentId: string,
+  replyId: string | undefined,
+  requesterOpenId: string | undefined,
+  auditSummary: string,
+  rollbackAutoSub: () => void,
+): Promise<DroppedSignalOutcome> {
+  // reply_id 缺失时无处可打：reaction 端点要求 comment_id + reply_id 两者齐全。
+  // 这条事件到此为止且从未过审计，auto-sub 占位必须回滚 —— 否则 malformed /
+  // 缺字段的事件也能留下一条 owner 不知情的订阅。下面 self-triggered 同理。
+  if (!replyId) {
+    rollbackAutoSub();
+    return 'no-reply-id';
+  }
+
+  // ⚠️ 自触发拦截要放在审计门**之前**：给自己打标记本来就不该发生，没必要为它
+  // 去打扰 owner。正常那道 self-filter（trigger.userId 等三重保险）在下游，
+  // 前两个丢弃点跑在它之前，所以这里得自己挡一次。缺正文时可用的两个信号：
+  //   ① 事件操作者就是本 bot（应用身份发的评论）
+  //   ② reply_id 在本进程「bot 创建过」的集合里（用户身份发的评论，作者分不出）
+  // 信号 ② 不可省：bot 回退 user 身份发评论时作者 = 授权用户 = owner，
+  // 恰好**穿过**下面那道 owner 审计门 —— 只靠审计门挡不住这种自标。
+  // 注意这只是 best-effort：authored set 是进程内内存，重启即失效；
+  // hasBotSentinel 那道要正文，这里没有。不宣称密封。
+  // getBot 抛错时不能让 rollback 被跳过（占位订阅会残留），故取值也包进容错：
+  // 拿不到 open_id 就退化成只靠 isBotAuthoredReply 这一路信号。
+  let selfBotOpenId: string | undefined;
+  try {
+    selfBotOpenId = getBot(larkAppId).botOpenId;
+  } catch {
+    selfBotOpenId = undefined;
+  }
+  if ((selfBotOpenId && requesterOpenId === selfBotOpenId) || isBotAuthoredReply(replyId)) {
+    logger.debug(`[doc-comment] dropped-signal skipped: 触发者是 bot 自己 comment=${commentId.slice(0, 12)} reply=${replyId.slice(0, 12)}`);
+    rollbackAutoSub();
+    return 'self-triggered';
+  }
+
+  // ⚠️ 审计硬门：打标记是 **provider-visible 的持久外部写入**，不是内部日志，
+  // 必须和「回复」受同一套约束 —— 非 owner 触发时 owner 无法感知 = 越权。
+  // 这些丢弃点全在下游那道门之前，所以在这里显式过一次同一个 helper。
+  //
+  // 关键：**不能因为「读不到正文、构造不出摘要」就跳过审计**。摘要不必是评论
+  // 正文，失败路径传一句说明即可（见调用方传的 auditSummary）。也不能拿
+  // 「本次是否新建了 auto-sub」当授权判据 —— 历史脏状态和并发窗口都会让
+  // 未审计的订阅看起来像既有授权。
+  if (!await passesDocCommentAuditGate(larkAppId, file.fileToken, requesterOpenId, auditSummary, rollbackAutoSub, 'dropped-signal')) {
+    logger.info(`[doc-comment] dropped-signal skipped (audit gate): comment=${commentId.slice(0, 12)} requester=${requesterOpenId?.slice(0, 12) || '?'}`);
+    return 'audit-rejected';
+  }
+
+  try {
+    // ⚠️ tenantOnly：**绝不能**回退 user 身份。这个 ❌ 是终态标记、故意不清理，
+    // 一旦以授权用户身份落上去，就是在用户自己的评论上、以用户自己的名义、
+    // 永久挂一个叉 —— 用户会看到「我自己给自己打了个叉」。错误主体的持久写入
+    // 比没有标记更糟，所以 tenant 不行就放弃（下面 catch 里只记日志）。
+    // 对比同文件 Typing 指示器：那个成对、几秒后必被 removeCommentReaction 清掉，
+    // 回退 user 只是短暂误导，故仍用 preferTenant，本 PR 不动它。
+    const { ok } = await addCommentReactionChecked(larkAppId, file, commentId, replyId, DROPPED_REACTION_EMOJI_TYPE, { tenantOnly: true });
+    // ⚠️ 不能用 reactionId 是否存在判成败：官方 schema 的响应体是空对象、
+    // 不承诺带 id，那样会把 code=0 的成功记成失败。只信 ok。
+    return ok ? 'marked' : 'reaction-failed';
+  } catch (err) {
+    logger.debug(`[doc-comment] failed to mark dropped event on reply=${replyId.slice(0, 12)}: ${err instanceof Error ? err.message : err}`);
+    return 'reaction-failed';
+  }
+}
+
+export const __testOnly_markCommentEventDropped = markCommentEventDropped;
+
 async function processCommentEvent(
   parsed: ReturnType<typeof parseCommentEvent>,
   larkAppId: string,
@@ -3090,13 +3554,14 @@ async function processCommentEvent(
     const operatorOpenId = parsed.operatorOpenId;
     const botCfg = getBot(larkAppId).config;
     const mappedDir = botCfg.docRepoMap?.[fileToken];
+    const watchAnchor = docWatchAnchor(fileToken);
     const autoSub: DocSubscription = {
       fileToken,
       fileType: parsed.fileType || 'docx',
-      sessionAnchor: `doc:${fileToken}`,
+      sessionAnchor: watchAnchor,
       sessionId: undefined,
       scope: 'chat',
-      chatId: `doc:${fileToken}`,
+      chatId: watchAnchor,
       commentTriggerMode: 'mention-only',
       managedBy: 'watch-comment',
       ownerOpenId: operatorOpenId || getOwnerOpenId(larkAppId),
@@ -3109,6 +3574,32 @@ async function processCommentEvent(
     logger.info(`[doc-comment] auto-subscribed file=${fileToken.slice(0, 12)} by @mention (mention-only${mappedDir ? `, wd=${mappedDir}` : ''}, anchor=doc:${fileToken.slice(0, 12)}, requester=${operatorOpenId?.slice(0, 12) || '?'})`);
   }
 
+  // ⚠️ 回滚能力必须在**所有**早退路径之前就绪。auto-sub 是先建占位、后由审计门
+  // 决定去留的；下面几个丢弃点（拉不到评论 / 触发回复不在回复里 / 纯 @bot 无正文）
+  // 都在原审计门之前 return，若不在这里备好回滚，陌生人一次触发就会留下一条
+  // **owner 完全不知情**的订阅记录，且不会被任何人清掉。
+  // 注意反过来也不成立：不能拿「本次没新建 auto-sub」当「owner 曾授权」的证据 ——
+  // 历史脏记录（旧版本留下的未审计订阅）和并发窗口（事件 A 刚 put、事件 B 就读到）
+  // 都会让未授权的订阅看起来像既有授权。授权判据只有审计门本身。
+  const rollbackAutoSub = () => { if (autoCreatedSub) removeDocSubscription(config.session.dataDir, larkAppId, fileToken); };
+
+  // 「这条事件**可能**与本 bot 有关，且丢了就真的没了」—— 读不到评论正文时唯一
+  // 能用的收窄。两个条件都必须满足才允许打那个**终态、不清理**的 ❌：
+  //
+  //  ① 只在 mention-only 下打。它没有评论列表轮询；持久 pending 又只在正文、
+  //     @ 与审计门都已通过后才建立，所以这里这种「正文尚不可读」的失败没有恢复
+  //     上下文。'all' 则有列表轮询兜底 —— push 链路这次拉取失败的评论，下一轮
+  //     poll 很可能被正常处理，而 ❌ 是
+  //     终态、不会被摘掉，结果就是永久挂在一条根本没丢的评论上。
+  //     （早先注释写的「'all' 拉不到就是真丢了」是反的，PR 描述里「不进轮询 ⇒
+  //     没兜底 ⇒ 终点」那条论证**只对 mention-only 成立**。）
+  //  ② `is_mentioned` 为 false 说明这条评论里一个 @ 都没有，肯定不是找 bot 的。
+  //     注意这是用它**收紧**，与「不能用 is_mentioned 放行」的既有警告不冲突
+  //     —— 那条警告说的是 true 不代表 @ 的是本 bot。
+  //
+  // 这样三个打点的闸口就一致了（第三个打点用的 markEligible 同样只认 mention-only）。
+  const mayConcernThisBot = sub.commentTriggerMode === 'mention-only' && parsed.isMentioned === true;
+
   // 关掉 open_id 启动竞态：probeBotOpenId 在启动时 fire-and-forget，若评论事件
   // 在该窗口内到达，下面 mention-only 闸 / 自触发过滤会拿到 undefined 的 botOpenId
   // → 合法的 @bot 评论被误丢（事件已被 ACK，飞书不会重投，@ 永久丢失）。await
@@ -3120,18 +3611,66 @@ async function processCommentEvent(
   const comment = await getDocComment(larkAppId, { fileToken, fileType: sub.fileType }, commentId);
   if (!comment || comment.replies.length === 0) {
     logger.info(`[doc-comment] event dropped: 取不到评论内容 comment=${commentId.slice(0, 12)}（replies=${comment ? comment.replies.length : 'null'}）`);
+    // ⚠️ 这个丢弃点在 mention-only 闸（下面第 4 步）**之前** —— 而 mention-only
+    // 订阅下该文档的**所有**评论事件都会推给我们。拉不到正文时我们无从判断这条
+    // 评论是不是冲 bot 来的，无条件打标记会在**别人的评论上**留 ❌。
+    // 拿不到正文时能做到的最窄收窄：`is_mentioned` 为 false 说明评论里一个 @ 都
+    // 没有，肯定不是找 bot 的。注意这里是用它**收紧**，与代码里「不能用
+    // is_mentioned 放行」的警告不冲突 —— 那条警告说的是 true 不代表 @ 的是本 bot。
+    // 'all' 模式不收窄：那种模式不 @ 也该触发，拉不到就是真丢了。
+    if (mayConcernThisBot) {
+      const outcome = await markCommentEventDropped(
+        larkAppId, { fileToken, fileType: sub.fileType }, commentId,
+        parsed.replyId, parsed.operatorOpenId,
+        '评论正文读取失败，bot 未处理该条 @，准备留下失败标记',
+        rollbackAutoSub,
+      );
+      logger.info(`[doc-comment] dropped-signal outcome=${outcome} (取不到评论内容) comment=${commentId.slice(0, 12)}`);
+    } else {
+      // 没打标记 = 从未过审计，auto-sub 占位必须回滚（同 !trigger 分支）。
+      rollbackAutoSub();
+    }
     return;
   }
   const trigger = parsed.replyId
-    ? comment.replies.find(r => r.replyId === parsed.replyId) ?? comment.replies[comment.replies.length - 1]
+    ? comment.replies.find(r => r.replyId === parsed.replyId)
     : comment.replies[comment.replies.length - 1];
+  // ⚠️ 事件给了 reply_id 却在 thread 里找不到 → 只能是**我们拿到的 replies 不完整**
+  // （飞书对回复串分页，见 doc-comment.ts:hydrateTruncatedReplies）。这里曾经
+  // `?? replies[last]` 静默回退到最后一条已知回复，后果是长 thread 从第 6 条起
+  // 永久失联：turnId 恒等于那条老回复 → 每条新评论都被 dedup 当成重复回合丢掉，
+  // @ 判定和自触发过滤也全基于错误的回复。宁可丢这一条并告警，也不能拿错的顶上。
+  if (!trigger) {
+    logger.warn(`[doc-comment] event dropped: 触发回复 ${parsed.replyId?.slice(0, 12)} 不在拉到的 ${comment.replies.length} 条回复里 (comment=${commentId.slice(0, 12)} truncated=${comment.hasMoreReplies === true}) — 回复串可能未补全`);
+    // ⚠️ 和第一个打点同样要收窄。`trigger` 缺失只证明**回复数据不完整**，
+    // 不证明这条回复是冲 bot 来的 —— 已订阅文档下别人的普通回复同样会推事件，
+    // 只要那条 reply 恰好没被拉到就会走到这里。不收窄就会在别人的评论上留 ❌。
+    if (mayConcernThisBot) {
+      const outcome = await markCommentEventDropped(
+        larkAppId, { fileToken, fileType: sub.fileType }, commentId,
+        parsed.replyId, parsed.operatorOpenId,
+        '评论回复串未能补全，bot 读不到这条评论的正文，准备留下失败标记',
+        rollbackAutoSub,
+      );
+      logger.info(`[doc-comment] dropped-signal outcome=${outcome} (触发回复不在拉到的回复里) comment=${commentId.slice(0, 12)}`);
+    } else {
+      // 没打标记 = 这条事件从未过审计。auto-sub 是这次事件建的占位，必须回滚，
+      // 否则陌生人的一条无关回复就留下 owner 不知情的订阅。
+      rollbackAutoSub();
+    }
+    return;
+  }
   const triggerIndex = Math.max(0, comment.replies.indexOf(trigger));
 
   // 3) 自触发过滤（防死循环）：bot 的回复可能以应用身份（作者=bot open_id）或回退
   //    用户身份（作者=授权用户，无法靠作者区分）发出。三重保险：①作者==本 bot
   //    ②reply_id 在 bot 创建集合 ③文本含隐形哨兵。任一命中即跳过。
   const selfBotOpenId = getBot(larkAppId).botOpenId;
-  if ((selfBotOpenId && trigger.userId === selfBotOpenId) || isBotAuthoredReply(trigger.replyId) || hasBotSentinel(trigger.text)) return;
+  if ((selfBotOpenId && trigger.userId === selfBotOpenId) || isBotAuthoredReply(trigger.replyId) || hasBotSentinel(trigger.text)) {
+    // 这条事件不会走到审计门，本次 auto-sub 占位必须回滚（同下面 mention gate）。
+    rollbackAutoSub();
+    return;
+  }
 
   // 4) 触发范围闸（mention-only 仅当评论真的 @ 了本 bot 才触发）。
   //    ⚠️ 必须以拉到的评论正文 @person(open_id) 列表为准，不能信事件自带的
@@ -3139,46 +3678,49 @@ async function processCommentEvent(
   //    「@ 同事的评论也被误触发」。详见 commentTriggerAllowed 注释。
   if (!commentTriggerAllowed(sub.commentTriggerMode, trigger.mentions, selfBotOpenId)) {
     logger.info(`[doc-comment] event dropped: mention-only 但未 @ 本 bot (comment=${commentId.slice(0, 12)} isMentioned=${parsed.isMentioned} mentions=${trigger.mentions.length} self=${selfBotOpenId ? selfBotOpenId.slice(0, 10) : '?'})`);
+    rollbackAutoSub();
     return;
   }
 
   const text = trigger.text.trim();
-  if (!text) return;
+  if (!text) {
+    // ⚠️ 空正文**不等于**用户没说话：`elementsToText` 只拼 text_run，把 person
+    // 元素整个丢掉（doc-comment.ts:elementsToText）。所以一条纯「@bot」、后面
+    // 一个字都没打的评论，走到这里 text 就是空串 —— 用户主观上明确 @ 了 bot，
+    // 客观上却零感知，正是 #1260 要治的症状。这里曾经是个裸 return，连日志都没有。
+    //
+    // 打不打标记按模式分：走到这一步已经过了上面的权威 mention gate，
+    // mention-only 说明**确认 @ 了本 bot**，噪音风险已排除，该打；
+    // 'all' 模式下没 @ 谁的空评论是真的「没说话」，只记日志不打，免得把文档里
+    // 所有无正文评论统一标成错误。
+    //
+    // ⚠️ 这里只能判「有没有资格尝试」（markEligible），**不能**写成 marked ——
+    // 离真的打上还隔着审计门、自触发拦截和 tenant 请求，任一不过都不会打。
+    // 真实结果由 helper 返回后单独记，否则排障的人会以为「打了但飞书没渲染」。
+    const markEligible = sub.commentTriggerMode === 'mention-only';
+    logger.info(`[doc-comment] event dropped: 触发回复无文本正文 (comment=${commentId.slice(0, 12)} mode=${sub.commentTriggerMode} mentions=${trigger.mentions.length} markEligible=${markEligible}) — 纯 @bot 无正文也会落到这里`);
+    if (markEligible) {
+      const outcome = await markCommentEventDropped(
+        larkAppId, { fileToken, fileType: sub.fileType }, commentId,
+        trigger.replyId || parsed.replyId, parsed.operatorOpenId,
+        '纯 @bot，无文本正文，bot 未处理，准备留下失败标记',
+        rollbackAutoSub,
+      );
+      logger.info(`[doc-comment] dropped-signal outcome=${outcome} (纯 @bot 无正文) comment=${commentId.slice(0, 12)}`);
+    } else {
+      rollbackAutoSub();
+    }
+    return;
+  }
 
   // 审计硬门：非 owner @bot 触发时，必须成功通知 owner 才允许回复。
   // 通知失败 = owner 无法感知 = 越权，直接拒绝响应并回滚 auto-sub。
   // （owner 自己触发的不通知，直接放行。）
-  const ownerOpenId = getOwnerOpenId(larkAppId);
-  const requesterOpenId = parsed.operatorOpenId;
-  const isOwnerTrigger = ownerOpenId && requesterOpenId && requesterOpenId === ownerOpenId;
-  if (!isOwnerTrigger) {
-    const rollbackAutoSub = () => { if (autoCreatedSub) removeDocSubscription(config.session.dataDir, larkAppId, fileToken); };
-    if (!ownerOpenId) {
-      logger.warn(`[doc-comment] non-owner @mention but no ownerOpenId configured — rejecting (audit gate) file=${fileToken.slice(0, 12)} requester=${requesterOpenId?.slice(0, 12) || '?'}`);
-      rollbackAutoSub();
-      return;
-    }
-    try {
-      const loc = localeForBot(larkAppId);
-      const requesterName = requesterOpenId?.slice(0, 12) || '?';
-      const notifyText = [
-        t('daemon.doc_mention_notify_title', undefined, loc),
-        '',
-        t('daemon.doc_mention_notify_body', { requester: requesterName, token: fileToken.slice(0, 12) }, loc),
-        '',
-        `📄 \`${fileToken}\``,
-        `💬 ${text.slice(0, 200)}${text.length > 200 ? '…' : ''}`,
-      ].join('\n');
-      await sendUserMessage(larkAppId, ownerOpenId, notifyText);
-    } catch (e) {
-      logger.warn(`[doc-comment] non-owner @mention but owner notification failed — rejecting (audit gate) file=${fileToken.slice(0, 12)} requester=${requesterOpenId?.slice(0, 12) || '?'} err=${e instanceof Error ? e.message : String(e)}`);
-      rollbackAutoSub();
-      return;
-    }
-  }
+  // 走同一个 helper —— 「回复」和「失败标记」共用一套规则，规则分叉迟早会让
+  // 其中一条悄悄绕过审计（本 PR 就险些如此）。这里传的是真实评论正文摘要。
+  if (!await passesDocCommentAuditGate(larkAppId, fileToken, parsed.operatorOpenId, text, rollbackAutoSub)) return;
 
-  logger.info(`[doc-comment] dispatch file=${fileToken.slice(0, 12)} comment=${commentId.slice(0, 12)} mode=${sub.commentTriggerMode} → session anchor=${sub.sessionAnchor.slice(0, 12)}`);
-  await handlers.handleDocComment({
+  const delivery: DocCommentContext = {
     larkAppId,
     sub,
     commentId,
@@ -3191,33 +3733,38 @@ async function processCommentEvent(
     })).filter(reply => reply.text.length > 0),
     isWhole: comment.isWhole,
     authorOpenId: trigger.userId,
-  });
-}
-
-const LARK_WS_PROXY_ENV_KEYS = [
-  'npm_config_https_proxy',
-  'NPM_CONFIG_HTTPS_PROXY',
-  'https_proxy',
-  'HTTPS_PROXY',
-  'npm_config_proxy',
-  'NPM_CONFIG_PROXY',
-  'all_proxy',
-  'ALL_PROXY',
-] as const;
-
-function createLarkWsAgent(): ProxyAgent | undefined {
-  const hasSecureProxy = LARK_WS_PROXY_ENV_KEYS.some(key => process.env[key]?.trim());
-  if (!hasSecureProxy) return undefined;
-
-  const agent = new ProxyAgent();
-  const resolveEnvProxy = agent.getProxyForUrl;
-  agent.getProxyForUrl = (url, req) => {
-    const target = new URL(url);
-    if (target.protocol === 'wss:') target.protocol = 'https:';
-    else if (target.protocol === 'ws:') target.protocol = 'http:';
-    return resolveEnvProxy(target.href, req);
   };
-  return agent;
+  logger.info(`[doc-comment] dispatch file=${fileToken.slice(0, 12)} comment=${commentId.slice(0, 12)} mode=${sub.commentTriggerMode} → session anchor=${sub.sessionAnchor.slice(0, 12)}`);
+  let accepted = false;
+  let deliveryError: unknown;
+  try {
+    accepted = await handlers.handleDocComment(delivery);
+  } catch (err) {
+    deliveryError = err;
+  }
+  const retryOutcome = settleDocCommentWsDelivery(
+    config.session.dataDir,
+    larkAppId,
+    fileToken,
+    {
+      commentId: delivery.commentId,
+      replyId: delivery.replyId,
+      text: delivery.text,
+      selectedText: delivery.selectedText,
+      priorReplies: delivery.priorReplies,
+      isWhole: delivery.isWhole,
+      authorOpenId: delivery.authorOpenId,
+      queuedAt: Date.now(),
+    },
+    accepted,
+  );
+  if (!accepted) {
+    logger.warn(
+      `[doc-comment] WS delivery not accepted; retry outcome=${retryOutcome} `
+      + `file=${fileToken.slice(0, 12)} reply=${(delivery.replyId ?? delivery.commentId).slice(0, 12)}`,
+    );
+  }
+  if (deliveryError) throw deliveryError;
 }
 
 /**
@@ -3269,6 +3816,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       dispatchPersistedForwardFollowup(record.messageId, payload);
     const remainingMs = record.dueAt - Date.now();
     const isUnpairedSeed = !record.payload.ctx.forwardSeedData;
+    // Startup restore precedes signed-default hydration; cold cache is
+    // deliberately fail-closed until the next authorized human message.
     const delayStillEnabled = usesForwardFollowupDelay(resolveGroupMentionMode(larkAppId, chatId));
     if (isUnpairedSeed && delayStillEnabled && remainingMs > 0 && forwardFollowups.hold({
       larkAppId,
@@ -3356,6 +3905,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const chatId = message.chat_id;
       const chatType = (message.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
       const messageId = message.message_id;
+
 
       // Bot-originated messages — bots historically only post inside threads
       // (their own thread replies). With chat-scope sessions a bot can also
@@ -3532,6 +4082,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             if (autoTopic) {
               const seedBotTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
               if (!seedBotTalk.allowed) {
+                // 黑名单 bot 静默吞掉：不自动开工、不发授权卡、不做 sibling 自愈。
+                if (seedBotTalk.reason === 'blocked') return;
                 logger.info(
                   `[auto-start:新话题] ${chatId.substring(0, 12)} 其他机器人开新话题但未授权（restricted）→ 发授权卡不自动开工 ` +
                   `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'}`,
@@ -3554,6 +4106,19 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         }
         const decision = await decideRoutingWithSource(larkAppId, message);
         const ctx = { scope: decision.scope, anchor: decision.anchor };
+        // Legacy /t provenance backfill reads an immutable root message and may
+        // persist a marker. Keep that state mutation behind the same talk gate
+        // as delivery; an untrusted bot must not be able to populate the ledger
+        // even though the later delivery gate would still reject its turn.
+        // bot 能不能在本会话说话：此处只判定一次，紧随的 p2p promote、下方 fold 的
+        // mentionedThisBot 以及再往后的 talk gate 共用同一结论；之间只有路由计算，
+        // 不改授权状态（曾是两条手抄 OR 链，漏一处即「能路由但不能 fold」类二次分裂）。
+        const botTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
+        if (botTalk.allowed) {
+          await promoteExplicitP2pTopicIfNeeded({
+            larkAppId, chatId, chatType, message, routing: ctx, routingSource: decision.source,
+          });
+        }
         // Honor `/t` / `/topic` from bot senders too, aligning with the human
         // path so an explicit `@bot /t …` handoff seeds a fresh topic instead of
         // sticking to chat-scope. Applied BEFORE the gate (and the shared-topic
@@ -3561,18 +4126,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // brand-new {thread, messageId} anchor. forceTopicApplied also suppresses
         // the shared-topic fold below — a `/t` seed wins over shared, same
         // precedence as the human path.
-        const forcedTopic = maybeApplyForceTopicOverride(ctx, message, messageId);
+        const forcedTopic = maybeApplyForceTopicOverride(ctx, message, messageId, larkAppId, handlers.validateTopicHeader);
         if (forcedTopic) {
           logger.info(`[/t] Force-topic override (bot sender): msg=${messageId.substring(0, 12)} → thread-scope, anchor=msg`);
         }
         const ownsThreadSession = ctx.scope === 'thread'
           ? (handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false)
           : false;
-        // 这个 bot 能不能在本群跟我们说话 —— 判定一次，fold 与下面的 gate 共用同一个
-        // 结论（二者之间只有 fold / shared-seed 的路由计算，不改任何授权状态）。
-        // 曾经这里是两条手抄的 OR 链，靠人肉保持同步；漏一处就是「能路由但不能 fold」
-        // 或「fold 了却弹卡」的二次分裂。
-        const botTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
         let replyRootId = await maybeFoldMentionedRegularGroupThreadToChat({
           larkAppId, chatId, chatType, message, routing: ctx, forceTopicApplied: forcedTopic, mentionedThisBot: botTalk.allowed, ownsThreadSession,
           answeredRootAtTopLevel: root => handlers.chatSessionAnsweredRootAtTopLevel?.(root, chatId, larkAppId) ?? false,
@@ -3599,6 +4159,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // 唯一留在闸门里的 bot 专属逻辑是下面的 cross-ref 冷启动自愈：它不是一条
         // 授权来源，而是「同部署兄弟 bot 的身份还没学到」这个**识别**问题的补救。
         if (!botTalk.allowed) {
+          // 黑名单 bot：静默 return，不做 sibling 冷启动自愈（否则被黑的同部署
+          // 兄弟 bot 会经这条识别补救旁路绕过否决腿直接路由）、不发授权卡。
+          if (botTalk.reason === 'blocked') return;
           // Cold-start self-heal: the cross-ref (bot-openids-<appId>.json) is
           // learned lazily from observed mentions[], so the FIRST bot→bot
           // direct @ from a same-deployment sibling can arrive before the
@@ -3626,6 +4189,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             return;
           }
         }
+        if (chatType === 'p2p' && forcedTopic) {
+          recordP2pForceTopicRoot(larkAppId, messageId, chatId);
+        }
         logger.info(`Bot-to-bot @mention detected (scope=${ctx.scope}): routing to handleThreadReply`);
         // Serialize per anchor — a sub-bot dispatched a /repo prime + kickoff
         // back-to-back into this thread must be handled in order, not raced.
@@ -3647,6 +4213,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // 人的路径（bot 发送方已在上面的分支 return）：union 走 memberUnionId 腿，
       // 不进 bot-trust 腿——teamBot 只认 bot-locked union。
       const isAllowed = canTalk(larkAppId, chatId, senderOpenId, undefined, humanSenderUnionId, chatType);
+      // Trusted creator metadata affects addressing only. Unauthorized senders
+      // must not trigger Lark/registry I/O; operation gates stay unchanged.
+      if (isAllowed) {
+        await ensureSignedChatDefault(larkAppId, chatId, chatType).catch(err =>
+          logger.warn(`[signed-chat-default] lookup failed: ${err instanceof Error ? err.message : String(err)}`),
+        );
+      }
 
       // /introduce — collaboration handshake. Intercept before any routing
       // so the command never reaches a CLI session (each @ed bot's daemon
@@ -3657,6 +4230,10 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       }
 
       if (await tryHandleReplyModeCommand(larkAppId, message, senderOpenId, isAllowed)) {
+        return;
+      }
+
+      if (await tryHandleChatTabsCommand(larkAppId, message, senderOpenId, isAllowed)) {
         return;
       }
 
@@ -3702,6 +4279,21 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         anchor: decision.anchor,
       };
       let routingSource = decision.source;
+      // Default/chat-mode DMs normally stay in one flat chat-scope session, even
+      // when Lark supplies root_id + thread_id. An explicitly seeded topic (for
+      // example via /t) is the exception: an app-scoped /t provenance marker or
+      // an active session at that root makes later replies continue thread-scope
+      // instead of running in the unrelated DM chat context. The durable marker
+      // also covers bare /t, which intentionally materializes a topic without a
+      // Session. Match the chat as well as the complete root ID; ordinary DM
+      // topics retain the flat behavior.
+      // Legacy provenance backfill is a durable state mutation, so keep it
+      // behind the same permission gate as message delivery.
+      if (isAllowed && await promoteExplicitP2pTopicIfNeeded({
+        larkAppId, chatId, chatType, message, routing, routingSource,
+      })) {
+        routingSource = 'real-thread';
+      }
       let replyRootId: string | undefined;
       // 私聊 chat 模式：会话是扁平连续的(整段 DM 一个 chat-scope 会话),但如果这条
       // 消息本身是在某个已存在的话题里回复的(root_id+thread_id),可见回复必须落回
@@ -3724,9 +4316,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           })
         : undefined;
       if (messageListener) {
-        routing.scope = 'thread';
-        routing.anchor = messageId;
-        routingSource = 'topic-chat';
+        routing.scope = messageListener.replyMode === 'chat' ? 'chat' : 'thread';
+        routing.anchor = messageListener.replyMode === 'chat' ? chatId : messageId;
+        routingSource = messageListener.replyMode === 'chat' ? 'regular-group-chat' : 'topic-chat';
         replyRootId = undefined;
         logger.info(
           `[message-listener:${larkAppId}] matched chat=${chatId.substring(0, 12)} ` +
@@ -3885,7 +4477,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // /t / /topic in 普通群: flip routing to thread-scope so the bot's
       // first reply seeds a fresh Lark thread, even if a chat-scope session
       // is currently active in this chat.
-      const forceTopicApplied = substituteTrigger ? false : maybeApplyForceTopicOverride(routing, message, messageId);
+      const forceTopicApplied = substituteTrigger
+        ? false
+        : maybeApplyForceTopicOverride(routing, message, messageId, larkAppId, handlers.validateTopicHeader);
       if (forceTopicApplied) {
         logger.info(`[/t] Force-topic override: msg=${messageId.substring(0, 12)} → thread-scope, anchor=msg`);
       }
@@ -3966,6 +4560,15 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const triggeredCommand = isControlCommand
         ? parseSlashCommandInvocation(strippedRoutingText)?.cmd
         : undefined;
+      // 命令是不是排在所有 @ 之前 —— 用来区分 @ 的两种位置（两者的
+      // mentionsAnotherMember 都为 true，光看那个布尔值分不出来）：
+      //   `@张三 /solve 看看`  → 先点名再下命令，是把活儿交给张三 → 让路
+      //   `/solve @张三 看看`  → 命令在前，@ 是命令的参数（让 bot 去找谁 / 处理谁）
+      //                          → 仍然是发给本 bot 的，要触发
+      // 判定必须回到原始 content：post 富文本的 @ 是独立的 `at` 节点，
+      // extractMessageTextForRouting 只 join text 节点，拼出来的正文天然以命令开头，
+      // 拿它做位置判断会把前导 @ 误判成「命令在最前」（见 commandPrecedesMentions）。
+      const commandLeadsMessage = commandPrecedesMentions(message);
       let pairedForwardSeed;
       let stalePendingSeed;
       // Require isAllowed before pairing: a root-linked clarification from a
@@ -4062,11 +4665,13 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         //     （建 Set + 解析 adapter 默认集）只在真是斜杠命令时才求值，不进每条
         //     群消息的热路径。
         //   • `!mentionsOther` 与 ambient 同款语义：`@张三 /solve` 是指给张三的，
-        //     命令形态不改变「点名了别人就让路」这条群礼仪。
+        //     命令形态不改变「点名了别人就让路」这条群礼仪。但只有**命令之前**的
+        //     @ 才算点名让路：`/solve @张三` 里的 @ 是命令自己的参数，命令仍然是
+        //     冲本 bot 来的，所以用 commandLeadsMessage 放行（见其定义处）。
         //   • 只认普通群顶层（regular-group-*）：话题群（topic-chat）与话题内回复
         //     （real-thread）各有自己的续话规则，不该被一条裸命令另开一路。
         const commandTriggerEntry = isAllowed
-          && !mentionsOther
+          && (!mentionsOther || commandLeadsMessage)
           && (routingSource === 'regular-group-chat' || routingSource === 'regular-group-thread')
           && triggeredCommand
           ? matchCommandTrigger(larkAppId, chatId, triggeredCommand, resolvePassthroughCommands(larkAppId))
@@ -4140,6 +4745,16 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             return;
           }
           if (access === 'ignore') {
+            // 黑名单是纯否决腿：被拉黑者的非@消息即便落在开启
+            // autoStartOnNewTopic 的话题群，也不得作为新话题种子自动开工——
+            // 'ignore' 对普通未授权者意为「可能是种子」，对 blocked 必须彻底
+            // 静默。上方 relax 中的 messageListener 是 owner 显式内容观察者订阅，
+            // 不在此否决（既有语义）。
+            if (senderOpenId
+              && evaluateTalk(larkAppId, chatId, senderOpenId).reason === 'blocked') {
+              logger.debug(`Ignoring new-topic auto-start from blocked sender: ${senderOpenId}`);
+              return;
+            }
             // 主动开工 — 场景②: a non-@ message that seeds a brand-new topic in
             // a 话题群 auto-starts a session when the bot opted in. Everything
             // else (regular-group chatter, thread replies, disabled bots) keeps
@@ -4182,6 +4797,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         chatType,
         larkAppId,
         ...routing,
+        regularGroupTopLevel: routingSource === 'regular-group-chat' || routingSource === 'regular-group-thread',
         replyRootId,
         promptOverride,
         commandTrigger,
@@ -4197,6 +4813,14 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         if (before?.block) return;
         if (before?.anchorOverride) ctx.anchor = before.anchorOverride;
         ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? ownsSession;
+      }
+      // Record explicit DM /t intent before this message releases the raw
+      // per-chat routing lane and before handleNewTopic begins its async session
+      // registration. A back-to-back root-linked reply can therefore select the
+      // same canonical root immediately. This is intentionally after permission
+      // and beforeSessionTurn gates: rejected /t messages create no routing state.
+      if (chatType === 'p2p' && forceTopicApplied) {
+        recordP2pForceTopicRoot(larkAppId, messageId, chatId);
       }
       const payload = { data, ctx, ownsSession } satisfies PendingForwardTopicPayload;
       const groupMentionMode = resolveGroupMentionMode(larkAppId, chatId);
@@ -4299,6 +4923,103 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
   // 暴露给 daemon 的 cardDeps.replayGrantedMessage 调用。
   handlers.replayMessageEvent = replayMessageEvent;
 
+  /**
+   * im.message.updated_v1 —— 用户「修改」了一条已发送消息。
+   *
+   * 要解决的场景：消息发出时**没有 @ 本 bot**（按 @ 策略被忽略，从未触发任务），
+   * 用户用飞书消息菜单的「修改」补 @ 机器人并确定，期望像新发一条 @ 消息一样开工。
+   *
+   * 关键约束：
+   *  1. 该事件对**任何编辑**都会推送（改正文字、bot 更新卡片……），绝大多数与补 @ 无关，
+   *     所以必须以「编辑后确实 @ 了本 bot」为闸门，且只处理人类消息。
+   *  2. 事件 payload 常不带新正文/mentions（第三方实测，字段不可靠）→ 一律用
+   *     im.message.get 回读编辑后的权威消息再判定。
+   *  3. message_id 与原消息相同，但**绝不能**走 claimMessageOnce：原消息到达时已 claim，
+   *     会把编辑事件误吞。投递层去重只用 event_id（在 register 处接 scheduleAckSafeEvent）。
+   *  4. 幂等：这条消息若已触发过任务（triggered-message-store，含 receive 与本路径），
+   *     或正处在 forward-followup 延迟派发队列里，不再触发——改个别名不该重跑任务。
+   *
+   * 语义因此是「一次延迟的首次 @」，而不是「编辑即重新执行」。
+   */
+  async function processMessageUpdatedEvent(rawData: any): Promise<void> {
+    try {
+      const eventMessage = rawData?.message ?? rawData?.event?.message;
+      const messageId: string | undefined = eventMessage?.message_id;
+      if (!messageId) return;
+
+      // 回读权威消息。回读失败时不盲触发（@ 状态无从确认），降级为忽略并记日志。
+      let readback: any;
+      try {
+        readback = await getMessageDetail(larkAppId, messageId, { userCardContent: false });
+      } catch (err) {
+        logger.warn(`[message-updated:${larkAppId}] 回读消息失败，忽略编辑事件 msg=${messageId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
+        return;
+      }
+      const current = readback?.items?.[0] ?? readback?.message;
+      if (!current) {
+        logger.warn(`[message-updated:${larkAppId}] 回读无消息内容，忽略编辑事件 msg=${messageId.substring(0, 12)}`);
+        return;
+      }
+
+      // REST 形态 → receive_v1 同构形态（polled message-listener 走的是同一个归一化）。
+      const data = larkReceiveEventFromHistoryMessage(current, current.chat_id ?? eventMessage?.chat_id);
+      // 让下游与 WS 事件完全同形：REST 正文在 body.content，把它提升到 content
+      //（resolveNonsupportMessage 回读时也是这么做的）。编辑富文本编辑器额外包了
+      // <p> 段落，需先还原为普通 text 消息形态。
+      if (!data.message.content && current.body?.content) {
+        data.message.content = unwrapEditedTextContent(current.body.content);
+      }
+
+      // 只处理人类消息：bot/app 编辑自己的消息（含卡片刷新）不触发任务。
+      const senderType = data.sender?.sender_type;
+      if (senderType === 'app' || senderType === 'bot') return;
+
+      // @ 判定依赖本 bot open_id；冷启动窗口先等探测完成，与 receive 路径一致。
+      await ensureBotOpenId(larkAppId).catch(() => { /* degrade; heartbeat retries */ });
+      if (!isBotMentioned(larkAppId, data.message, undefined)) {
+        logger.debug(`[message-updated:${larkAppId}] edited message does not mention us, ignoring msg=${messageId.substring(0, 12)}`);
+        return;
+      }
+
+      // 已触发过任务（原消息本就 @、p2p、免@ 策略等）→ 不因编辑再触发一遍。
+      if (isMessageTriggerClaimed(larkAppId, messageId)) {
+        logger.info(`[message-updated:${larkAppId}] 消息已派发或正在排队，忽略编辑补 @ msg=${messageId.substring(0, 12)}`);
+        return;
+      }
+      // 正处在 never/ambient 的 topic 种子延迟队列里：它马上会以原快照派发，
+      // 这里再发会重复。跳过即可（延迟窗口只有几秒，属竞态兜底）。
+      try {
+        if (listForwardFollowups(larkAppId).some(record => record.messageId === messageId)) {
+          logger.info(`[message-updated:${larkAppId}] 消息在延迟派发队列中，跳过编辑补 @ msg=${messageId.substring(0, 12)}`);
+          return;
+        }
+      } catch { /* 队列不可读时不阻断 */ }
+
+      logger.info(
+        `[message-updated:${larkAppId}] 编辑后补 @ 触发任务 chat=${String(data.message.chat_id ?? '').substring(0, 12)} ` +
+        `msg=${messageId.substring(0, 12)}`,
+      );
+      // im.message.get 条目不带 chat_type（归一化默认 'group'）。即将派发前补判 p2p，
+      // 保证私聊走对权限/路由分支（getChatMode 有 5min 缓存，且下游路由也会用到它）。
+      if (data.message.chat_type !== 'p2p' && data.message.chat_id) {
+        const mode = await getChatMode(larkAppId, data.message.chat_id);
+        if (mode === 'p2p') data.message.chat_type = 'p2p';
+      }
+      // Message REST rows carry open_id only. Resolve this actual sender in the
+      // receiving app's identity domain so teamMember talk authorization has the
+      // same union_id as receive_v1. Never borrow the edit operator's identity.
+      const senderOpenId = data.sender?.sender_id?.open_id;
+      if (senderOpenId) {
+        const unionId = await resolveUnionIdFromOpenId(larkAppId, senderOpenId);
+        if (unionId) data.sender.sender_id.union_id = unionId;
+      }
+      // 复用完整消息处理链路：权限/@ 闸、mention 策略、路由、会话派发全部与新消息一致。
+      await processMessageEvent(data);
+    } catch (err) {
+      logger.error(`Error handling message updated event: ${err}`);
+    }
+  }
+
   const eventDispatcher = new Lark.EventDispatcher({}).register({
     // 主动开工 — 场景①: the bot was added to a chat. Hand off to the daemon,
     // which gates on the autoStartOnGroupJoin toggle + allowedUser membership.
@@ -4321,6 +5042,24 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const operatorOpenId: string | undefined = data?.operator_id?.open_id;
         if (!chatId) return;
         logger.info(`[auto-start:入群] bot added to chat=${chatId.substring(0, 12)} by ${String(operatorOpenId ?? '?').substring(0, 12)}`);
+        // chat.bot_added 观察钩子：拉群信号（应急群自动化的触发点之一）。
+        // 放在 scheduleAckSafeEvent 的去重 claim 之后，重推不会重复发射。
+        try {
+          emitHookEvent('chat.bot_added', { larkAppId, chatId, operatorOpenId });
+        } catch (err) {
+          logger.debug(`[hooks:${larkAppId}] chat.bot_added emit failed: ${err}`);
+        }
+        // 主动开工 — 入群执行命令（bots.json groupJoinCommand，不经 CLI/LLM）。
+        // 不受 autoStartOnGroupJoin / allowedUser 在群闸约束，两者独立。
+        try {
+          const joinCfg = getBot(larkAppId).config;
+          const joinCommand = joinCfg.groupJoinCommand?.trim();
+          if (joinCfg.groupJoinCommandEnabled === true && joinCommand) {
+            runGroupJoinCommand(joinCommand, { larkAppId, chatId, operatorOpenId });
+          }
+        } catch (err) {
+          logger.warn(`[group-join-command:${larkAppId}] skipped: ${err}`);
+        }
         // 进群先自动拉 owner（不受任何开工开关影响，失败仅日志）：bot 应始终
         // 处于 owner 可见的群里。放在 handleBotAdded 之前，让 autoStart 的
         // D7「群内需有 allowedUser」闸能吃到刚拉进来的 owner。
@@ -4405,6 +5144,23 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         seedRoutingGate = registerSeedRoutingGate(rawMessage.message_id);
       }
     },
+    // 消息编辑（修改已发送消息）。只在编辑后补 @ 了本 bot 且该消息从未触发过任务时
+    // 当作延迟首次 @ 处理，见 processMessageUpdatedEvent。投递层用 event_id 去重，
+    // 刻意不走 message_id claim（原消息已 claim 过同 id）。
+    'im.message.updated_v1': (data: any) => {
+      const eventMessage = data?.message ?? data?.event?.message;
+      const eventKey = `im.message.updated_v1:${larkAppId}:${eventIdForKey(data) ?? eventMessage?.message_id ?? unkeyableEventKey()}`;
+      // 事件常不带 chat_id（字段不可靠）；缺时 rawMessageIngressAnchor 收敛到 __chatless__
+      // 全局泳道，读回权威消息后再在 processMessageEvent 内按真实 anchor 串行。
+      scheduleAckSafeEvent(
+        eventKey,
+        () => serializeByAnchor(
+          rawMessageIngressAnchor(larkAppId, eventMessage),
+          () => processMessageUpdatedEvent(data),
+        ),
+        'message updated event',
+      );
+    },
   });
 
   // 诊断：包一层 invoke，记录长连接收到的**每一个**事件类型（含未注册的）。
@@ -4446,38 +5202,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
     };
   }
 
-  // Start WSClient
-  const wsClient = new Lark.WSClient({
-    appId: larkAppId,
-    appSecret: larkAppSecret,
-    // brand → 长连接域名。国际版租户必须连 larksuite.com，否则收不到任何事件。
-    domain: sdkDomain(brand),
-    // `proxy-from-env` treats WSS_PROXY as distinct from HTTPS_PROXY, while
-    // Lark's preceding Axios bootstrap request uses HTTPS proxy semantics.
-    // The custom resolver keeps both phases aligned and still honors NO_PROXY.
-    agent: createLarkWsAgent(),
-    // Default to warn — the SDK is chatty at info ("client ready", reconnect
-    // heartbeats, etc.) and floods pm2 error.log when stderr is the only sink.
-    // DEBUG=1 widens the level back to info for troubleshooting.
-    loggerLevel: process.env.DEBUG ? Lark.LoggerLevel.info : Lark.LoggerLevel.warn,
-    // 主机长断网（夜间合盖睡眠、Wi-Fi 切换、VPN 重连）后，SDK 重连要先用 HTTPS 去
-    // 飞书换 ws 接入点，这步会 ENOTFOUND / 15s 超时；重连次数由服务端下发且有限，
-    // 耗尽后 SDK 置 terminalError 永久放弃，但进程仍 online、PM2 不会兜底 —— 表现为
-    // 「必须手动 botmux restart 才能恢复收消息」。下面两道防线让长连接死后自愈。
-    //
-    // ① pingTimeout：发 ping 后 30s 内无任何 inbound 帧即掐断 socket，触发 close →
-    //    SDK 自身重连。专治 TCP 半开连接（没收到 FIN/RST、close 事件不触发）的静默卡死。
-    wsConfig: { pingTimeout: 30 },
-    // 重连握手卡死（DNS/代理/NAT）兜底，避免单次握手永久 pending。
-    handshakeTimeoutMs: 15_000,
-    // 重连过程打日志，便于事后从 `bun run daemon:logs` 复盘（warn 默认看不到这些）。
-    onReconnecting: () => logger.warn(`[ws] ${larkAppId} reconnecting…`),
-    onReconnected: () => logger.info(`[ws] ${larkAppId} reconnected`),
-    onError: (err) => logger.error(`[ws] ${larkAppId} terminal error: ${err.message}`),
-  });
-
-  wsClient.start({ eventDispatcher });
-  logger.info('Daemon WSClient started');
+  const wsClient = startLarkConnection(larkAppId, larkAppSecret, eventDispatcher, brand);
 
   let listenerPollInFlight = false;
   const listenerPollTimer = setInterval(() => {
@@ -4488,7 +5213,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       .finally(() => { listenerPollInFlight = false; });
   }, MESSAGE_LISTENER_POLL_INTERVAL_MS);
   listenerPollTimer.unref();
-  const hasListenerBackfill = enabledMessageListenerChatIds(getBot(larkAppId)).length > 0;
+  const hasListenerBackfill = getBot(larkAppId).config.globalMessageListener?.enabled === true
+    || enabledMessageListenerChatIds(getBot(larkAppId)).length > 0;
   if (hasListenerBackfill) {
     setTimeout(() => {
       if (listenerPollInFlight) return;
@@ -4499,25 +5225,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
     }, 2_000).unref();
     logger.info(
       `[message-listener:${larkAppId}] polling backfill enabled interval=${MESSAGE_LISTENER_POLL_INTERVAL_MS}ms ` +
-      `window=${MESSAGE_LISTENER_BACKFILL_WINDOW_MS}ms chats=${enabledMessageListenerChatIds(getBot(larkAppId)).length}`,
+      `window=${MESSAGE_LISTENER_BACKFILL_WINDOW_MS}ms mode=${getBot(larkAppId).config.globalMessageListener?.enabled === true ? 'global' : 'overrides'}`,
     );
   }
-
-  // ② SDK 重连耗尽后停在 terminalError（getConnectionStatus().state === 'failed'）并
-  //    永久放弃。每分钟探测一次，发现已放弃就 start() 重新发起一轮全新握手 —— start()
-  //    会清掉 terminalError 并重新 pullConnectConfig + connect，无需手动重启 daemon。
-  //    只在 'failed' 时介入，不打断 SDK 正在进行的 'reconnecting' / 'connecting'。
-  let reviving = false;
-  const reviveTimer = setInterval(() => {
-    if (reviving) return;
-    if (wsClient.getConnectionStatus().state !== 'failed') return;
-    reviving = true;
-    logger.warn(`[ws] ${larkAppId} connection failed (reconnect exhausted), restarting WSClient`);
-    wsClient.start({ eventDispatcher })
-      .catch(err => logger.error(`[ws] ${larkAppId} WSClient restart failed: ${err?.message ?? err}`))
-      .finally(() => { reviving = false; });
-  }, 60_000);
-  reviveTimer.unref();
 
   return wsClient;
 }

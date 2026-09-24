@@ -349,7 +349,7 @@ describe('worker-pool lifecycle hook integration', () => {
       'text',
       'app_test',
       'om_exact_steer_message',
-      undefined,
+      { sourceSessionId: 'sid-lifecycle-test' },
     );
     expect(emitHookEventMock).not.toHaveBeenCalledWith(
       'session.requires_attention',

@@ -2,6 +2,7 @@ import { type ChildProcess } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
 import { spawnNodeTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
@@ -103,6 +104,308 @@ setInterval(() => {}, 1_000);
     }));
   }, 15_000);
 
+  // 跨身份隔离（XPI）现在由实验开关控制且默认关闭，所以这条用例必须显式打开它
+  // ——它锁的正是「开关打开时」的拒绝行为。关闭态的镜像用例紧随其后。
+  it('rejects a different principal at the worker backstop before type-ahead can steer it (XPI on)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-principal-queue-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+    const inputLog = join(root, 'stdin.log');
+    const fakePi = join(root, 'fake-pi');
+    writeFileSync(fakePi, `#!/usr/bin/env node
+const fs = require('node:fs');
+const inputLog = process.env.FAKE_INPUT_LOG;
+let firstSeen = false;
+let firstDone = false;
+let secondSeen = false;
+setTimeout(() => process.stdout.write('Ready\\n'), 100);
+process.stdin.on('data', chunk => {
+  const text = chunk.toString();
+  fs.appendFileSync(inputLog, text);
+  if (!firstSeen && text.includes('PRINCIPAL_A_MARKER')) {
+    firstSeen = true;
+    fs.appendFileSync(inputLog, '\\nA_SEEN\\n');
+    process.stdout.write('Working...\\n');
+    setTimeout(() => {
+      firstDone = true;
+      fs.appendFileSync(inputLog, '\\nA_DONE\\n');
+      process.stdout.write('\\x1b[2J\\x1b[HReady\\n');
+    }, 500);
+  }
+  if (!secondSeen && text.includes('PRINCIPAL_B_MARKER')) {
+    secondSeen = true;
+    fs.appendFileSync(inputLog, firstDone ? '\\nB_AFTER_A\\n' : '\\nB_BEFORE_A\\n');
+  }
+});
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakePi, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-principal-queue',
+        BOTMUX_XPI_ENABLED: 'true',
+        BOTMUX_TIME_SCALE: '0.05',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+        FAKE_INPUT_LOG: inputLog,
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => {
+      messages.push(raw as WorkerToDaemon);
+      logs.push(`[ipc] ${JSON.stringify(raw)}\n`);
+    });
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-principal-queue',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'pi',
+      cliPathOverride: fakePi,
+      backendType: 'pty',
+      prompt: '',
+      env: { FAKE_INPUT_LOG: inputLog },
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    await waitFor(() => messages.some(message => message.type === 'ready'), logs);
+
+    child.send({
+      type: 'message',
+      content: 'PRINCIPAL_A_MARKER',
+      turnId: 'om_principal_a',
+      trustedCaller: {
+        requestUserOpenId: 'ou_a',
+        requestUserUnionId: 'on_a',
+        requestLarkAppId: 'app_test',
+        senderType: 'user',
+      },
+    } satisfies DaemonToWorker);
+    await waitFor(() => existsSync(inputLog)
+      && readFileSync(inputLog, 'utf8').includes('A_SEEN'), logs);
+
+    child.send({
+      type: 'message',
+      content: 'PRINCIPAL_B_MARKER',
+      turnId: 'om_principal_b',
+      trustedCaller: {
+        requestUserOpenId: 'ou_b',
+        requestUserUnionId: 'on_b',
+        requestLarkAppId: 'app_test',
+        senderType: 'user',
+      },
+      rerouteEnvelope: {
+        turnId: 'om_principal_b',
+        text: 'PRINCIPAL_B_MARKER',
+        userPrompt: 'PRINCIPAL_B_MARKER',
+        createdAt: new Date().toISOString(),
+      },
+    } satisfies DaemonToWorker);
+
+    child.send({
+      type: 'message',
+      content: 'PRINCIPAL_BOT_MARKER',
+      turnId: 'om_principal_bot',
+      trustedCaller: {
+        requestUserOpenId: 'ou_bot_b',
+        requestUserUnionId: 'on_bot_b',
+        requestLarkAppId: 'app_test',
+        senderType: 'bot',
+      },
+      rerouteEnvelope: {
+        turnId: 'om_principal_bot',
+        text: 'PRINCIPAL_BOT_MARKER',
+        userPrompt: 'PRINCIPAL_BOT_MARKER',
+        createdAt: new Date().toISOString(),
+      },
+    } satisfies DaemonToWorker);
+
+    await waitFor(() => messages.some(message =>
+      message.type === 'turn_input_rejected' && message.turnId === 'om_principal_b'), logs);
+    await waitFor(() => messages.some(message =>
+      message.type === 'turn_input_rejected' && message.turnId === 'om_principal_bot'), logs);
+    await waitFor(() => existsSync(inputLog)
+      && readFileSync(inputLog, 'utf8').includes('A_DONE'), logs);
+    const input = readFileSync(inputLog, 'utf8');
+    expect(input).not.toContain('B_BEFORE_A');
+    expect(input).not.toContain('PRINCIPAL_B_MARKER');
+    expect(input).not.toContain('PRINCIPAL_BOT_MARKER');
+    const rejected = messages.filter(message => message.type === 'turn_input_rejected');
+    expect(rejected).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+      type: 'turn_input_rejected',
+      turnId: 'om_principal_b',
+      reason: 'cross_principal_requires_owner_confirmation',
+      rejectedBeforeAdmission: true,
+      activeTurnId: 'om_principal_a',
+    }),
+      expect.objectContaining({
+        type: 'turn_input_rejected',
+        turnId: 'om_principal_bot',
+        reason: 'cross_principal_requires_owner_confirmation',
+        rejectedBeforeAdmission: true,
+        activeTurnId: 'om_principal_a',
+      }),
+    ]));
+    expect(rejected.filter(message => message.turnId === 'om_principal_b')).toHaveLength(1);
+    expect(rejected.filter(message => message.turnId === 'om_principal_bot')).toHaveLength(1);
+
+    await waitFor(() => messages.some(message =>
+      message.type === 'managed_turn_origin_revoked' && message.turnId === 'om_principal_a'), logs);
+    child.send({
+      type: 'message',
+      content: 'PRINCIPAL_B_MARKER_AFTER_A',
+      turnId: 'om_principal_b_after_a',
+      trustedCaller: {
+        requestUserOpenId: 'ou_b',
+        requestUserUnionId: 'on_b',
+        requestLarkAppId: 'app_test',
+        senderType: 'user',
+      },
+    } satisfies DaemonToWorker);
+    await waitFor(() => readFileSync(inputLog, 'utf8').includes('B_AFTER_A'), logs);
+    await waitFor(() => messages.some(message =>
+      message.type === 'turn_input_committed' && message.turnId === 'om_principal_b_after_a'), logs);
+  }, 20_000);
+
+  // 关闭态镜像：这是「整体关掉」真正要保证的行为——第二个身份的消息不再被拦成
+  // turn_input_rejected，而是像该特性上线（#1348）之前那样直接送达 CLI。
+  // 断言的是送达本身（stdin 里出现 marker + turn_input_committed），不是「没有拒绝」；
+  // 纯否定断言在 worker 起不来时也会通过，那种绿是空的。
+  it('delivers a different principal instead of rejecting it when the XPI switch is off', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-worker-principal-xpi-off-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    mkdirSync(dataDir, { recursive: true });
+    const inputLog = join(root, 'stdin.log');
+    const fakePi = join(root, 'fake-pi');
+    writeFileSync(fakePi, `#!/usr/bin/env node
+const fs = require('node:fs');
+const inputLog = process.env.FAKE_INPUT_LOG;
+let firstSeen = false;
+setTimeout(() => process.stdout.write('Ready\\n'), 100);
+process.stdin.on('data', chunk => {
+  const text = chunk.toString();
+  fs.appendFileSync(inputLog, text);
+  if (!firstSeen && text.includes('PRINCIPAL_A_MARKER')) {
+    firstSeen = true;
+    fs.appendFileSync(inputLog, '\\nA_SEEN\\n');
+    process.stdout.write('Working...\\n');
+    setTimeout(() => {
+      fs.appendFileSync(inputLog, '\\nA_DONE\\n');
+      process.stdout.write('\\x1b[2J\\x1b[HReady\\n');
+    }, 500);
+  }
+});
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakePi, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-worker-principal-xpi-off',
+        // The switch under test. Set explicitly so the case does not depend on
+        // the ambient default staying off.
+        BOTMUX_XPI_ENABLED: 'false',
+        BOTMUX_TIME_SCALE: '0.05',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+        FAKE_INPUT_LOG: inputLog,
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => {
+      messages.push(raw as WorkerToDaemon);
+      logs.push(`[ipc] ${JSON.stringify(raw)}\n`);
+    });
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-worker-principal-xpi-off',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'pi',
+      cliPathOverride: fakePi,
+      backendType: 'pty',
+      prompt: '',
+      env: { FAKE_INPUT_LOG: inputLog },
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    await waitFor(() => messages.some(message => message.type === 'ready'), logs);
+
+    // Principal A takes the active turn first.
+    child.send({
+      type: 'message',
+      content: 'PRINCIPAL_A_MARKER',
+      turnId: 'om_principal_a',
+      trustedCaller: {
+        requestUserOpenId: 'ou_a',
+        requestUserUnionId: 'on_a',
+        requestLarkAppId: 'app_test',
+        senderType: 'user',
+      },
+    } satisfies DaemonToWorker);
+    await waitFor(() => existsSync(inputLog)
+      && readFileSync(inputLog, 'utf8').includes('A_SEEN'), logs);
+
+    // A DIFFERENT principal interrupts while A still owns the active turn.
+    child.send({
+      type: 'message',
+      content: 'PRINCIPAL_B_MARKER',
+      turnId: 'om_principal_b',
+      trustedCaller: {
+        requestUserOpenId: 'ou_b',
+        requestUserUnionId: 'on_b',
+        requestLarkAppId: 'app_test',
+        senderType: 'user',
+      },
+      rerouteEnvelope: {
+        turnId: 'om_principal_b',
+        text: 'PRINCIPAL_B_MARKER',
+        userPrompt: 'PRINCIPAL_B_MARKER',
+        createdAt: new Date().toISOString(),
+      },
+    } satisfies DaemonToWorker);
+
+    // Positive assertion: it reaches the CLI and commits.
+    await waitFor(() => existsSync(inputLog)
+      && readFileSync(inputLog, 'utf8').includes('PRINCIPAL_B_MARKER'), logs);
+    await waitFor(() => messages.some(message =>
+      message.type === 'turn_input_committed' && message.turnId === 'om_principal_b'), logs);
+
+    // And nothing was rejected on cross-principal grounds.
+    expect(messages.filter(message =>
+      message.type === 'turn_input_rejected'
+      && (message as { reason?: string }).reason === 'cross_principal_requires_owner_confirmation',
+    )).toEqual([]);
+  }, 20_000);
+
   it('holds a non-argv follow-up until the initial prompt owns the queue head', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-worker-init-order-'));
     tempDirs.add(root);
@@ -191,6 +494,99 @@ if (process.argv.includes('app-server')) {
       turnId: 'om_followup_order',
     }));
   }, 20_000);
+
+  it('acknowledges an OpenCode argv activation token without a dispatch attempt', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-opencode-argv-activation-'));
+    tempDirs.add(root);
+    const dataDir = join(root, 'session');
+    const xdgDataDir = join(root, 'xdg');
+    const dbDir = join(xdgDataDir, 'opencode');
+    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(dbDir, { recursive: true });
+    const prompt = '<session_id>sid-opencode-activation</session_id>\n<user_message>OPEN_CODE_TOKEN_ONLY</user_message>';
+    const db = new DatabaseSync(join(dbDir, 'opencode.db'));
+    db.exec(`
+      CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT, title TEXT, time_created INTEGER, time_updated INTEGER, time_archived INTEGER);
+      CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+      CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, time_created INTEGER, data TEXT);
+    `);
+    db.prepare('INSERT INTO session VALUES (?,?,?,?,?,?,?)')
+      .run('ses_activation', null, dataDir, '', 1, 1, null);
+    const initialBaseline = Date.now();
+    db.prepare('INSERT INTO message VALUES (?,?,?,?)')
+      .run('msg_before', 'ses_activation', initialBaseline, JSON.stringify({ role: 'user' }));
+    db.prepare('INSERT INTO part VALUES (?,?,?,?,?)')
+      .run('part_before', 'msg_before', 'ses_activation', initialBaseline, JSON.stringify({ type: 'text', text: 'before' }));
+    db.close();
+
+    const fakeOpenCode = join(root, 'fake-opencode');
+    writeFileSync(fakeOpenCode, `#!/usr/bin/env node
+const fs = require('node:fs');
+const { DatabaseSync } = require('node:sqlite');
+const args = process.argv.slice(2);
+const prompt = args[args.indexOf('--prompt') + 1];
+const db = new DatabaseSync(process.env.OPENCODE_DB_PATH);
+const now = Date.now();
+db.prepare('INSERT INTO message VALUES (?,?,?,?)').run('msg_user', 'ses_activation', now, JSON.stringify({ role: 'user' }));
+db.prepare('INSERT INTO part VALUES (?,?,?,?,?)').run('part_user', 'msg_user', 'ses_activation', now, JSON.stringify({ type: 'text', text: prompt }));
+setInterval(() => {}, 1_000);
+`);
+    chmodSync(fakeOpenCode, 0o755);
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnNodeTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        XDG_DATA_HOME: xdgDataDir,
+        OPENCODE_DB_PATH: join(dbDir, 'opencode.db'),
+        SESSION_DATA_DIR: dataDir,
+        BOTMUX_SESSION_ID: 'sid-opencode-activation',
+        // This starts a real Node process: shrinking the 2.4s confirmation
+        // window to 120ms races its SQLite write, then the 20s deferred
+        // recheck falls outside this test's 8s acknowledgement deadline.
+        BOTMUX_TIME_SCALE: '1',
+        LARK_APP_ID: 'app_test',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.add(child);
+    child.on('message', raw => {
+      messages.push(raw as WorkerToDaemon);
+      logs.push(`[ipc] ${JSON.stringify(raw)}\n`);
+    });
+    child.stdout?.on('data', chunk => logs.push(chunk.toString()));
+    child.stderr?.on('data', chunk => logs.push(chunk.toString()));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-opencode-activation',
+      chatId: 'oc_test',
+      rootMessageId: 'om_root',
+      workingDir: dataDir,
+      cliId: 'opencode',
+      cliPathOverride: fakeOpenCode,
+      backendType: 'pty',
+      prompt,
+      queuedActivationToken: 'opencode-token-only',
+      larkAppId: 'app_test',
+      larkAppSecret: 'secret',
+      turnId: 'om_opencode_initial',
+    } satisfies DaemonToWorker);
+
+    await waitFor(() => messages.some(message =>
+      message.type === 'queued_activation_submitted'
+      && message.activationToken === 'opencode-token-only'), logs, 8_000);
+
+    expect(messages).toContainEqual({
+      type: 'queued_activation_submitted',
+      sessionId: 'sid-opencode-activation',
+      activationToken: 'opencode-token-only',
+    });
+  }, 12_000);
 
   it('renames a TraeX native session only after the first Lark prompt is submitted', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-traex-native-title-'));

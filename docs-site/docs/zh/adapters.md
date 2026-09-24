@@ -45,14 +45,16 @@ botmux 通过适配器桥接不同 CLI / Agent，`bots.json` 里用 `cliId` 选�
 `cliId: "dsh"` 通过内置 runner 驱动本机的 `dsh` CLI（[deepseek-harness](https://github.com/deepseekai/deepseek-harness)），走 `dsh --profile <name>` 的 SDK JSON-RPC 协议。前置条件：
 
 1. `dsh` 在 PATH 上（或用 `cliPathOverride` 指定路径）。**升级注意**：这里需要的是 npm 包 `@deepseek-ai/dsh` 提供的 `dsh` 命令；早期版本依赖的是 Python wheel 里的 `dsh-jsonrpc-agent`，若 PATH 上只有旧命令，升级后会报「找不到命令」。
-2. 已通过原生 `dsh` CLI 完成配置（`~/.dsh/settings.yaml` + `~/.dsh/.credentials.yaml`）。
-3. 目标 profile（默认 `botmux`，可用 per-bot 的 `dshProfile` 覆盖）位于 `~/.dsh/profiles/<name>/`。**首次使用无需手工创建**：profile 不存在时 botmux 会落盘骨架（`package.json` + 空 `cordis.yml` + `cordis.patch.yml`）并调 `dsh plugin add` 安装依赖。要增删社区插件或换 LLM provider，直接编辑该 profile 的 `cordis.patch.yml`——botmux 只在文件缺失时创建，不会覆盖已有内容。
+2. 已通过原生 `dsh` CLI 完成配置（默认 `$DSH_HOME/settings.yaml` + `$DSH_HOME/.credentials.yaml`；未设置 `DSH_HOME` 时为 `~/.dsh/...`）。
+3. 目标 profile（默认 `botmux`，可用 per-bot 的 `dshProfile` 覆盖）位于 `$DSH_HOME/profiles/<name>/`（默认 `~/.dsh/profiles/<name>/`）。**首次使用无需手工创建**：profile 不存在时 botmux 会落盘骨架（`package.json` + 空 `cordis.yml` + `cordis.patch.yml`）并调 `dsh plugin add` 安装依赖。要增删社区插件或换 LLM provider，直接编辑该 profile 的 `cordis.patch.yml`——botmux 只在文件缺失时创建，不会覆盖已有内容。`DSH_HOME` 只能在 daemon 进程环境配置，per-bot `env.DSH_HOME` 会被拒绝，避免 profile 路径分裂。
 
-runner 读取 `~/.dsh/settings.yaml` 的 `agent-default-model`（provider + model）传给 initialize RPC；插件组合由 profile 的 `cordis.patch.yml` 完全控制，runner 不再生成 cordis.yml。
+runner 读取 `$DSH_HOME/settings.yaml` 的 `agent-default-model`（provider + model）传给 initialize RPC；插件组合由 profile 的 `cordis.patch.yml` 完全控制，runner 不再生成 cordis.yml。
 
 编辑 `cordis.patch.yml` 时注意两种条目语义不同：`- insert: [...]` 是**插入**新插件；裸 `- id: X`（没有 `insert`）是覆盖**已存在**插件的配置，目标 id 不存在时会被静默跳过。botmux 生成的默认 patch 只 insert `dsh-base` 缺少的 `sdk-jsonrpc-server`，其余能力沿用 `dsh-base`，并 disable 掉 headless 下会阻塞启动的 Web GUI 插件。
 
-会话 JSONL 落在 `~/.dsh/sessions/botmux/`；同一 runner 连接内多轮，daemon 重启后开新会话（不续上下文）。
+会话 JSONL 落在 `$DSH_HOME/sessions/botmux/`（默认 `~/.dsh/sessions/botmux/`）；同一 runner 连接内多轮，daemon 重启后开新会话（不续上下文）。`dshRuntime: "tui"` 的 TUI 自身状态仍使用 `~/.dsh-tui`。
+
+`ask_user_question` 通过 botmux 生成的临时 DSH profile patch 接入飞书 ask 卡片：official runner 直接注入 bridge；`dshRuntime: "tui"` 通过 dsh-tui wrapper patch 包住原生 question provider，优先飞书作答、不可表示时回退原生 TUI。若线上需要关闭，可设置 `BOTMUX_DSH_ASK_BRIDGE=0` 后重启会话。
 
 ## Mir CLI 与 MCP Bridge
 

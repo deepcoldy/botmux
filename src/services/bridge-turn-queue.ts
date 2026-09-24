@@ -36,6 +36,7 @@ import {
   extractTurnStartText,
   isClaudeTurnTerminalEvent,
   isTranscriptRateLimitEvent,
+  isSyntheticNoModelReplyEvent,
   classifyClaudeTerminalEvent,
   type ClaudeTerminalOutcome,
   type TranscriptEvent,
@@ -345,9 +346,37 @@ export class BridgeTurnQueue {
           continue;
         }
         const terminalOutcome = classifyClaudeTerminalEvent(ev);
-        if (ev.isApiErrorMessage === true) {
+        // The `<synthetic>` no-model-reply placeholder (see
+        // isSyntheticNoModelReplyEvent) takes the same exit as an API error:
+        // its "No response requested." text must not become the turn's reply,
+        // it must not synthesise a headless local turn, and the turn closes
+        // with the retryable failure the classifier produced. The exit is
+        // shared; the assignment below is NOT - see the two branches.
+        if (ev.isApiErrorMessage === true || isSyntheticNoModelReplyEvent(ev)) {
           if (this.collecting && terminalOutcome?.status !== 'rate_limited') {
-            this.collecting.terminalOutcome = terminalOutcome;
+            // The two signals that share this exit are NOT of equal authority,
+            // so they do not share an assignment operator (maintainer ruling on
+            // PR #1330):
+            if (ev.isApiErrorMessage === true) {
+              // An API-error line is authoritative execution metadata. When the
+              // connection drops mid-response, Claude force-closes the stream
+              // with an `end_turn` record whose text is a half-finished
+              // sentence, and that record has already written `completed` here.
+              // Letting the error win is what keeps the turn `failed` +
+              // retryable, which is the only thing ordinary-turn-recovery acts
+              // on (`status !== 'failed' || retryable !== true` → no
+              // continuation). Unconditional assignment, therefore.
+              this.collecting.terminalOutcome = terminalOutcome;
+            } else {
+              // The `<synthetic>` placeholder is the WEAKEST terminal signal
+              // there is - no model call happened at all (no requestId, usage
+              // all zero). It must not downgrade an already-`completed` turn:
+              // `emitReadyTurns` (`status !== 'completed' → continue`) would
+              // then withhold the real answer text AND let the daemon post a
+              // failure card for a turn that had in fact been answered. With no
+              // earlier terminal outcome it still records the failure.
+              this.collecting.terminalOutcome ??= terminalOutcome;
+            }
             this.collecting.terminalObserved = true;
           }
           continue;

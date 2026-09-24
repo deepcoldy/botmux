@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { promisify } from 'node:util';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommandReal } from './registry.js';
 import { parseDebugModelsJson } from './model-catalog-json.js';
 import type { CliAdapter, PtyHandle } from './types.js';
@@ -62,7 +63,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
       return [(cachedCodexBin ??= resolveCommandReal(rawCodexBin))];
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, workingDir, botName, botOpenId, locale, model, reasoningEffort, codexBrowser }) {
+    buildArgs({ sessionId, resume, resumeSessionId, quietResume, workingDir, botName, botOpenId, locale, model, reasoningEffort, codexBrowser }) {
       const args = [
         runnerArgv0('codex-app-runner', runnerPath()),
         '--session-id', sessionId,
@@ -71,6 +72,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
         '--codex-bin', (cachedCodexBin ??= resolveCommandReal(rawCodexBin)),
       ];
       if (resume && resumeSessionId) args.push('--thread-id', resumeSessionId);
+      if (quietResume) args.push('--strict-resume');
       pushOpt(args, '--cwd', workingDir);
       pushOpt(args, '--bot-name', botName);
       pushOpt(args, '--bot-open-id', botOpenId);
@@ -86,7 +88,7 @@ export function createCodexAppAdapter(pathOverride?: string): CliAdapter {
 
     // 与 codex CLI 同一模型目录（app-server 后端就是 codex binary）：静态列表是
     // `codex debug models` visibility=list 的快照，live 探测补充目录增量。
-    modelChoices: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5', 'gpt-5.2'],
+    modelChoices: CLI_MODEL_CHOICES['codex-app'],
     // Live 模型枚举：直接 spawn 被 wrap 的 codex binary 跑 `debug models`
     // （resolvedBin 是 node runner 不是 codex，故这里用懒解析的 cachedCodexBin）。
     // 8s 超时、16MB maxBuffer、fail-soft → null，picker 回退上面的静态快照。

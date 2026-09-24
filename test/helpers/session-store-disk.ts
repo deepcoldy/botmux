@@ -17,7 +17,20 @@ CREATE TABLE IF NOT EXISTS sessions (
   root_message_id TEXT GENERATED ALWAYS AS (json_extract(row, '$.rootMessageId')) VIRTUAL,
   scope TEXT GENERATED ALWAYS AS (json_extract(row, '$.scope')) VIRTUAL
 );
+CREATE TABLE IF NOT EXISTS occupancy (
+  scope TEXT PRIMARY KEY,
+  owner_pid INTEGER NOT NULL,
+  boot_id TEXT NOT NULL,
+  lease_until INTEGER NOT NULL
+);
 `;
+
+export type SeededOccupancyLease = {
+  scope?: string;
+  ownerPid: number;
+  bootId: string;
+  leaseUntil: number;
+};
 
 export function sessionStorePath(dataDir: string, appId?: string): string {
   return appId
@@ -65,6 +78,54 @@ export function readPersistedSessionRows(dataDir: string, appId?: string): Recor
   try {
     const rows = db.prepare('SELECT session_id, row FROM sessions').all() as { session_id: string; row: string }[];
     return Object.fromEntries(rows.map(r => [r.session_id, JSON.parse(r.row)]));
+  } finally {
+    db.close();
+  }
+}
+
+/** 播种 / 覆盖一个 store 的 occupancy 租约（默认 scope='bot'）。 */
+export function seedOccupancyLease(
+  dataDir: string,
+  appId: string | undefined,
+  lease: SeededOccupancyLease,
+): void {
+  const path = sessionStorePath(dataDir, appId);
+  const db = open(path, true);
+  try {
+    db.prepare(
+      'INSERT INTO occupancy (scope, owner_pid, boot_id, lease_until) VALUES (?, ?, ?, ?) '
+      + 'ON CONFLICT(scope) DO UPDATE SET owner_pid = excluded.owner_pid, '
+      + 'boot_id = excluded.boot_id, lease_until = excluded.lease_until',
+    ).run(lease.scope ?? 'bot', lease.ownerPid, lease.bootId, lease.leaseUntil);
+  } finally {
+    db.close();
+  }
+}
+
+/** 读某个 store 的 occupancy 行；表不存在或没有行时返回 undefined。 */
+export function readOccupancyLeaseFromDisk(
+  dataDir: string,
+  appId?: string,
+  scope = 'bot',
+): SeededOccupancyLease | undefined {
+  const path = sessionStorePath(dataDir, appId);
+  if (!existsSync(path)) return undefined;
+  const db = open(path, false);
+  try {
+    const hit = db.prepare(
+      'SELECT scope, owner_pid, boot_id, lease_until FROM occupancy WHERE scope = ?',
+    ).get(scope) as { scope: string; owner_pid: number; boot_id: string; lease_until: number } | undefined;
+    if (!hit) return undefined;
+    return {
+      scope: hit.scope,
+      ownerPid: Number(hit.owner_pid),
+      bootId: hit.boot_id,
+      leaseUntil: Number(hit.lease_until),
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/no such table/i.test(message)) return undefined;
+    throw err;
   } finally {
     db.close();
   }

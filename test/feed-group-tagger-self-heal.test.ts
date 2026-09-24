@@ -50,7 +50,11 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 vi.mock('../src/utils/user-token.js', () => ({
-  resolveUserToken: vi.fn(async () => 'u-token'),
+  // Feed-group labels live in the OWNER's own inbox sidebar — a bot has no inbox —
+  // so the tagger resolves credentials through the owner-scoped entry point,
+  // which also accepts a pre-existing unattributed token file (installs that
+  // authorized before tokens were keyed per person).
+  resolveOwnerUserToken: vi.fn(async () => 'u-token'),
   generateAuthUrl: vi.fn(() => ({ authUrl: 'https://auth.example/x', state: 's' })),
   FEED_GROUP_OAUTH_SCOPES: ['im:feed_group_v1'],
 }));

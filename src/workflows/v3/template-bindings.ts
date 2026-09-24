@@ -225,6 +225,16 @@ export function assertSavedWorkflowTemplateBindings(
     ) {
       requiredIdentity.rootMessageId = 'rootMessageId';
     }
+    // Only enforced when the template carries its own ownerOpenId: ownerless /
+    // cross-app templates may omit it. When present it must be the run
+    // initiator's exact context ref — a literal or params ref would let a
+    // template schedule turns authenticated as a forged/arbitrary identity.
+    if (
+      node.executor === 'botmux-schedule' &&
+      Object.prototype.hasOwnProperty.call(root, 'ownerOpenId')
+    ) {
+      requiredIdentity.ownerOpenId = 'initiatorOpenId';
+    }
     for (const [field, contextName] of Object.entries(requiredIdentity)) {
       const value = (root as Record<string, unknown>)[field];
       const expected = `context.${contextName}`;

@@ -18,6 +18,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
+import { isBunRuntime } from './helpers/ts-runner.js';
 
 function bwrapUsable(): boolean {
   if (process.platform !== 'linux') return false;
@@ -44,8 +45,34 @@ async function pollFor(predicate: () => boolean, what: string, timeoutMs = 10_00
   }
 }
 
+/**
+ * Bun-only skip — the SCENARIO, not just an assertion, is Node-shaped.
+ *
+ * This regression is about a sidecar getting a NEW INODE when the store is
+ * closed and reopened: SQLite deletes `-wal`/`-shm` with the last connection, so
+ * a single-file `--ro-bind` pins a dead inode while a directory bind follows the
+ * name. MEASURED, closing the last connection:
+ *   node:sqlite (Node)              → `-wal` deleted        ← the premise holds
+ *   node:sqlite (Bun 1.4.2)         → `-wal` KEPT
+ *   bun:sqlite  (Bun, = PRODUCTION) → `-wal` KEPT
+ * `src/services/sqlite-compat.ts` deliberately uses `bun:sqlite` under Bun, so
+ * the third line is what actually ships there. With the sidecar never deleted
+ * there is no new inode, so under Bun this test HARD-FAILS on its own premise —
+ * the `existsSync(<db>-wal) === false` assertion below, reached before any
+ * sandbox query ("1 expect() calls"). It never gets as far as `toBe('v2')`.
+ * That is the strongest reason to skip rather than relax: deleting the premise
+ * assertion to make Bun green would leave `toBe('v2')` passing VACUOUSLY, since
+ * without a reopen-inode the OLD single-file-bind shape reads v2 too.
+ *
+ * So this stays Node-only coverage instead of being weakened into an assertion
+ * that cannot fail. The `bun-test` leg runs every OTHER case in this repo; the
+ * inode scenario is exercised by the vitest/Node leg, which is where the premise
+ * is real.
+ */
+const BUN_SKIP_REASON = 'SQLite under Bun keeps -wal on last close, so the reopen-inode premise never occurs';
+
 describe.skipIf(!bwrapUsable())('bwrap persistent pane × SQLite store reopen', () => {
-  it('a dir-bound sandbox that outlives the writer reads commits made by the REOPENED store', async () => {
+  it.skipIf(isBunRuntime())(`a dir-bound sandbox that outlives the writer reads commits made by the REOPENED store (${BUN_SKIP_REASON} — Node-only)`, async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'bwrap-session-store-'));
     const ctlDir = mkdtempSync(join(tmpdir(), 'bwrap-session-ctl-'));
     const storeDir = join(dataDir, 'session-stores', 'appA');

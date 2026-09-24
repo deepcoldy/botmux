@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   setIpcAuthSecret,
+  setLarkAppId,
   startIpcServer,
   type IpcServerHandle,
 } from '../src/core/dashboard-ipc-server.js';
+import { daemonIpcAuthHeaders } from '../src/core/daemon-ipc-auth.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import * as groupsStore from '../src/services/groups-store.js';
 import * as sessionStore from '../src/services/session-store.js';
@@ -17,6 +19,7 @@ afterEach(async () => {
   if (handle) await handle.close();
   handle = null;
   setIpcAuthSecret(null);
+  setLarkAppId('');
   vi.restoreAllMocks();
 });
 
@@ -106,5 +109,99 @@ describe('POST /api/sessions/:sessionId/chat-rename', () => {
     expect(updateSpy).toHaveBeenCalledOnce();
     // FR-7 requires a cache-refresh warning be recorded on failure.
     expect(warnSpy.mock.calls.some(([msg]) => String(msg).includes('cache_refresh_failed'))).toBe(true);
+  });
+});
+
+describe('PUT /api/groups/:chatId/name', () => {
+  async function put(body: string): Promise<Response> {
+    if (!handle) handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+    return fetch(`http://127.0.0.1:${handle.port}/api/groups/oc-target/name`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body,
+    });
+  }
+
+  it('renames through the daemon bot identity and validates the exact body', async () => {
+    setLarkAppId('cli_exact_bot');
+    const renameSpy = vi.spyOn(groupsStore, 'renameChat').mockResolvedValue({
+      ok: true,
+      oldName: 'Old',
+      newName: 'New',
+      changed: true,
+    });
+
+    const response = await put(JSON.stringify({ name: 'New' }));
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      ok: true,
+      oldName: 'Old',
+      newName: 'New',
+      changed: true,
+      chatId: 'oc-target',
+    });
+    expect(renameSpy).toHaveBeenCalledWith('cli_exact_bot', 'oc-target', 'New', {
+      beforeUpdate: undefined,
+    });
+
+    const invalid = await put(JSON.stringify({ name: 'New', unexpected: true }));
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toEqual({ ok: false, error: 'invalid_request' });
+    expect(renameSpy).toHaveBeenCalledOnce();
+  });
+
+  it('maps membership denial and never falls back to another bot', async () => {
+    setLarkAppId('cli_exact_bot');
+    const renameSpy = vi.spyOn(groupsStore, 'renameChat').mockResolvedValue({
+      ok: false,
+      error: 'bot_not_in_chat',
+    });
+
+    const response = await put(JSON.stringify({ name: 'New' }));
+
+    expect(response.status).toBe(403);
+    expect(await response.json()).toEqual({
+      ok: false,
+      error: 'bot_not_in_chat',
+    });
+    expect(renameSpy).toHaveBeenCalledOnce();
+  });
+
+  it('requires trusted-host authentication in the production IPC mode', async () => {
+    const secret = 'test-chat-rename-host-secret';
+    setIpcAuthSecret(secret);
+    setLarkAppId('cli_exact_bot');
+    const renameSpy = vi.spyOn(groupsStore, 'renameChat').mockResolvedValue({
+      ok: true,
+      oldName: 'Old',
+      newName: 'New',
+      changed: true,
+    });
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+    const path = '/api/groups/oc-target/name';
+    const body = JSON.stringify({ name: 'New' });
+
+    const denied = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body,
+    });
+    expect(denied.status).toBe(401);
+    expect(renameSpy).not.toHaveBeenCalled();
+
+    const allowed = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
+      method: 'PUT',
+      headers: daemonIpcAuthHeaders({
+        secret,
+        port: handle.port,
+        method: 'PUT',
+        path,
+        headers: { 'content-type': 'application/json' },
+      }),
+      body,
+    });
+    expect(allowed.status).toBe(200);
+    expect(renameSpy).toHaveBeenCalledOnce();
   });
 });
