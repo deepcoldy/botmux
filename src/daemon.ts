@@ -615,7 +615,7 @@ import {
   submitCustomReply,
 } from './core/ask-broker.js';
 import { createAskPersistStore } from './core/ask-persist-store.js';
-import { parseAskBody } from './core/ask-api.js';
+import { parseAskBody, registerAskForResponse } from './core/ask-api.js';
 import { shouldReturnAskStartupNotReady } from './core/ask-types.js';
 import { computeCocoPickerKeys } from './core/coco-picker-keys.js';
 import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
@@ -6775,7 +6775,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // p2pOpen 的 bot 在私聊里会出现「对方点不动按钮」，留痕便于排查。
     logger.warn(`[ask:${boundAsk.larkAppId}] no active session for ${boundAsk.sessionId.substring(0, 8)}; chatType unknown (p2pOpen answer gate falls back to allowlist)`);
   }
-  const result = await registerAskBroker({
+  const result = await registerAskForResponse({
     larkAppId: boundAsk.larkAppId,
     chatId: boundAsk.chatId,
     rootMessageId: boundAsk.rootMessageId,
@@ -6793,7 +6793,8 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // a restart-surviving mux backend (tmux/herdr/zellij/zmx) is resumable.
     backendSurvivesRestart:
       !!askSession && getSessionPersistentBackendType(askSession) !== undefined,
-  });
+  }, res);
+  if (res.destroyed) return;
 
   // CoCo 专属：它的 hook 不能用 directive 代答（hook 客户端永远 passthrough，CoCo 会
   // 渲染原生 picker）。这里在 ask 结算为「已作答」时，把答案翻成按键序列下发给该会话
