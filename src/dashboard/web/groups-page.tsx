@@ -293,6 +293,12 @@ export const GroupListRow = memo(function GroupListRow(props: {
   // nothing to add, so opening the dialog would only show an empty picker. Derived
   // from the snapshot, so it re-enables automatically once membership/roster shifts.
   const hasAddableBots = chatHasAddableBots(chat, props.bots);
+  // An empty roster is NOT "every bot is already in this chat" — it means no bot is
+  // configured/online right now (the opposite of full coverage), so the disabled
+  // tooltip must distinguish the two instead of claiming every bot is already present.
+  const disabledTitle = props.bots.length === 0
+    ? tr('groups.noBotsOnline')
+    : tr('groups.addBotsAllInChat');
   return (
     <OverviewListItem kind="group" className="groups-list-row" data-chat={chat.chatId}>
       <ChatAvatar chat={chat} />
@@ -322,7 +328,7 @@ export const GroupListRow = memo(function GroupListRow(props: {
             className="add-bots"
             onClick={() => props.onAddBots(chat)}
             disabled={!hasAddableBots}
-            title={hasAddableBots ? undefined : tr('groups.addBotsAllInChat')}
+            title={hasAddableBots ? undefined : disabledTitle}
           >{tr('groups.addBots')}</CreateActionButton>
           <button
             className="save-profile"

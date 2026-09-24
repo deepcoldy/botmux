@@ -466,6 +466,17 @@ export function createAddBotsReconciler(deps: AddBotsReconcilerDeps): {
         return;
       }
     }
+    // Budget exhausted without converging. Drop THIS run's state so a later batch on
+    // the same chat is not blocked forever by a residual pending id the server may
+    // never show (bot removed after add, daemon offline, …): the surviving newest poll
+    // only ever commits when the whole union is visible, so leaving the stale id here
+    // would make allExpectedInChat false for every subsequent batch. The generation
+    // guard matters — a newer batch may have started in the gap after the last check,
+    // and it owns the (union) pending set now.
+    if (runByChat.get(chatId) === myRun) {
+      pendingByChat.delete(chatId);
+      runByChat.delete(chatId);
+    }
   }
 
   return { reconcile };

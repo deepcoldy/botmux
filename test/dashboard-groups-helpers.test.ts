@@ -588,6 +588,42 @@ describe('createAddBotsReconciler — overlapping-batch snapshot reconciliation'
 
     expect(fetchSnapshot).not.toHaveBeenCalled();
   });
+
+  it('a batch that exhausts its poll budget clears its pending state, so a later converged batch on the same chat still commits', async () => {
+    // Regression for the pending-set leak: the maps were only cleared on the success
+    // path, so a batch whose okId never appeared server-side (removed after add, daemon
+    // offline) poisoned the chat — every later batch polled for a union containing the
+    // residual id and could never commit, until the page remounted.
+    const clock = manualClock();
+    const commits: string[][] = [];
+    // cli_a was reported ok but never actually lands; cli_b is a separate later add.
+    let inChat: string[] = [];
+    const fetchSnapshot = vi.fn(async () => serverSnapshot(inChat));
+
+    const reconciler = createAddBotsReconciler({
+      fetchSnapshot,
+      delay: clock.delay,
+      isMounted: () => true,
+      commit: (_chatId, next) => {
+        const row = next.chats.find(c => c.chatId === 'oc_x')!;
+        commits.push(row.memberBots.filter(m => m.inChat).map(m => m.larkAppId));
+      },
+      delays: [1, 1, 1],
+    });
+
+    // Batch A: cli_a never propagates → budget exhausted, no commit.
+    void reconciler.reconcile('oc_x', ['cli_a']);
+    for (let i = 0; i < 4; i++) await clock.tick();
+    expect(commits).toEqual([]);
+
+    // Batch B: a fresh add that HAS converged. cli_a is STILL missing server-side,
+    // so B can only commit if A's residual id was cleared when A gave up.
+    inChat = ['cli_b'];
+    void reconciler.reconcile('oc_x', ['cli_b']);
+    for (let i = 0; i < 3; i++) await clock.tick();
+
+    expect(commits).toEqual([['cli_b']]);
+  });
 });
 
 describe('summarizeGroupProfileMatches — group role/profile status', () => {

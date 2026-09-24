@@ -370,4 +370,26 @@ describe('GroupListRow — add-bots button disabled when nothing to add', () => 
     });
     expect(addBotsButton(renderer.root)!.props.disabled).toBe(false);
   });
+
+  it('shows the "no bots online" reason — not "all in chat" — when the roster itself is empty', () => {
+    // Disabled with zero roster bots means "nothing configured/online yet", the
+    // opposite of "every bot is already in this chat"; the tooltip must not lie.
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(createElement(GroupListRow, {
+        chat: { chatId: 'oc_x', name: 'Room', memberBots: [] } as any,
+        bots: [] as any,
+        roleContext: EMPTY_ROLE_CONTEXT,
+        tr: createDashboardTranslator('zh'),
+        onAddBots: vi.fn(),
+        onSaveProfile: vi.fn(),
+        onManage: vi.fn(),
+      }));
+    });
+    const btn = addBotsButton(renderer.root);
+    expect(btn).toBeDefined();
+    expect(btn!.props.disabled).toBe(true);
+    expect(btn!.props.title).toContain('没有在线');
+    expect(btn!.props.title).not.toContain('已在群里');
+  });
 });
