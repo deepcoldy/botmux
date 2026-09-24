@@ -116,8 +116,18 @@ describe('parseUpdateTarget', () => {
       '^3.0.0',
       '~3.0.0',
       '3.x',
+      '3.X',
       'package#branch',
       'tag with space',
+      'x',
+      'X',
+      'vx',
+      'vX',
+      'v3',
+      '3',
+      '*',
+      'alpha',
+      'staging',
     ];
     for (const invalid of invalidTargets) {
       expect(parseUpdateTarget(invalid)).toBeNull();

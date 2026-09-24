@@ -3361,7 +3361,7 @@ async function cmdUpgrade(args: string[] = []): Promise<void> {
   }
   const target = parseUpdateTarget(rawTarget);
   if (!target) {
-    console.error(`❌ 非法的目标频道或版本格式：“${rawTarget}”。只支持发布频道（如 canary、beta、latest）或语义化版本号（如 3.28.0）。`);
+    console.error(`❌ 非法的目标频道或版本格式：“${rawTarget}”。只支持发布频道（latest、canary、beta、rc、next）或语义化版本号（如 3.28.0）。`);
     process.exit(2);
   }
 
@@ -14977,8 +14977,8 @@ const FLEET_KNOWN_FLAGS: Record<string, readonly string[]> = {
   start: ['--companion-secret-file', '--companion-bot'],
   stop: ['--with-plugin'],
   restart: ['--with-plugin', '--companion-secret-file', '--companion-bot'],
-  upgrade: ['--canary', '--beta', '--rc'],
-  update: ['--canary', '--beta', '--rc'],
+  upgrade: ['--canary', '--beta', '--rc', '--next', '--latest'],
+  update: ['--canary', '--beta', '--rc', '--next', '--latest'],
 };
 const FLEET_VALUE_FLAGS = new Set(['--companion-secret-file', '--companion-bot']);
 if (ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')) {

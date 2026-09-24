@@ -274,24 +274,24 @@ export interface ParsedUpdateTarget {
   isExplicit: boolean;
 }
 
-const KNOWN_CHANNELS = new Set(['latest', 'canary', 'beta', 'rc', 'next']);
-
-/**
- * Valid npm dist-tag syntax:
- * Starts with an ASCII letter, followed by alphanumeric characters, hyphen, or underscore.
- * Deliberately rejects URLs, protocols (npm:, git:, file:), path traversal, semver ranges (^, ~), and arbitrary specifiers.
- */
-const VALID_DIST_TAG_PATTERN = /^[a-zA-Z][a-zA-Z0-9_-]{0,64}$/;
+export const KNOWN_CHANNELS = new Set(['latest', 'canary', 'beta', 'rc', 'next']);
 
 /**
  * Parse a user-supplied update target into a normalized channel or version spec.
- * Returns null if the target is invalid, malformed, or an unallowed package source.
+ * Returns null if the target is invalid, malformed, an unallowed package source,
+ * or a semver range/wildcard (e.g. `x`, `X`, `vx`, `v3`, `3.x`, `*`).
+ *
+ * Per npm dist-tag rules (https://docs.npmjs.com/cli/v11/commands/npm-dist-tag/#caveats),
+ * tags must not parse as semver ranges or versions. To ensure safety across all install
+ * methods, botmux only accepts explicitly known release channels or exact semver versions.
  *
  * Supports:
  * - empty / undefined -> latest (botmux@latest, isExplicit: false)
  * - 'latest', '@latest', '--latest', 'botmux@latest' -> latest (botmux@latest, isExplicit: true)
  * - 'canary', '@canary', '--canary', 'botmux@canary' -> canary (botmux@canary, isExplicit: true)
  * - 'beta', '@beta', '--beta' -> beta (botmux@beta, isExplicit: true)
+ * - 'rc', '@rc', '--rc' -> rc (botmux@rc, isExplicit: true)
+ * - 'next', '@next', '--next' -> next (botmux@next, isExplicit: true)
  * - '3.28.0', 'v3.28.0', '@3.28.0', 'botmux@3.28.0' -> 3.28.0 (botmux@3.28.0, isExplicit: true)
  */
 export function parseUpdateTarget(rawInput?: string): ParsedUpdateTarget | null {
@@ -321,9 +321,6 @@ export function parseUpdateTarget(rawInput?: string): ParsedUpdateTarget | null 
   const v = cleaned.replace(/^v/i, '');
   if (parseVersion(v)) {
     return { raw, tag: v, spec: `botmux@${v}`, isChannel: false, isExplicit: true };
-  }
-  if (VALID_DIST_TAG_PATTERN.test(cleaned)) {
-    return { raw, tag: cleaned, spec: `botmux@${cleaned}`, isChannel: true, isExplicit: true };
   }
   return null;
 }

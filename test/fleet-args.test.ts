@@ -20,11 +20,13 @@ describe('root fleet option parser', () => {
   });
 
   it('accepts positional arguments up to maxPositionalArgs and channel flags', () => {
-    const update = { boolFlags: ['--canary', '--beta', '--rc'], maxPositionalArgs: 1 };
+    const update = { boolFlags: ['--canary', '--beta', '--rc', '--next', '--latest'], maxPositionalArgs: 1 };
     expect(unknownFleetArgs([], update)).toEqual([]);
     expect(unknownFleetArgs(['canary'], update)).toEqual([]);
     expect(unknownFleetArgs(['@canary'], update)).toEqual([]);
     expect(unknownFleetArgs(['--canary'], update)).toEqual([]);
+    expect(unknownFleetArgs(['--next'], update)).toEqual([]);
+    expect(unknownFleetArgs(['--latest'], update)).toEqual([]);
     expect(unknownFleetArgs(['3.28.0'], update)).toEqual([]);
     expect(unknownFleetArgs(['v3.28.0'], update)).toEqual([]);
     expect(unknownFleetArgs(['canary', 'beta'], update)).toEqual(['beta']);
