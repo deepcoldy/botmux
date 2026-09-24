@@ -10,6 +10,7 @@ import {
   stopAllAntigravityCot,
   type AntigravityCotEntry,
 } from '../src/services/antigravity-cot.js';
+import { isAntigravityTranscriptBusy } from '../src/adapters/cli/antigravity.js';
 
 describe('antigravity-cot', () => {
   let tmpDir: string;
@@ -234,5 +235,51 @@ describe('antigravity-cot', () => {
     );
     expect(res).toEqual([]);
     expect(pending.length).toBe(0);
+  });
+
+  describe('isAntigravityTranscriptBusy', () => {
+    it('returns false for non-existent file or empty transcript', () => {
+      expect(isAntigravityTranscriptBusy(join(tmpDir, 'not-exists.jsonl'))).toBe(false);
+      const emptyFile = join(tmpDir, 'empty.jsonl');
+      writeFileSync(emptyFile, '');
+      expect(isAntigravityTranscriptBusy(emptyFile)).toBe(false);
+    });
+
+    it('returns true when last record is USER_INPUT or has pending tool calls', () => {
+      const file = join(tmpDir, 'busy.jsonl');
+      writeFileSync(
+        file,
+        JSON.stringify({ source: 'USER_EXPLICIT', type: 'USER_INPUT', content: 'do work' }) + '\n',
+      );
+      expect(isAntigravityTranscriptBusy(file)).toBe(true);
+
+      // Model started a tool call
+      appendFileSync(
+        file,
+        JSON.stringify({
+          source: 'MODEL',
+          type: 'PLANNER_RESPONSE',
+          tool_calls: [{ name: 'run_command', args: { CommandLine: 'sleep 5' } }],
+        }) + '\n',
+      );
+      expect(isAntigravityTranscriptBusy(file)).toBe(true);
+
+      // Tool result received
+      appendFileSync(
+        file,
+        JSON.stringify({ source: 'MODEL', type: 'GENERIC', content: 'ok' }) + '\n',
+      );
+      expect(isAntigravityTranscriptBusy(file)).toBe(true);
+    });
+
+    it('returns false when last record is final PLANNER_RESPONSE without tool calls', () => {
+      const file = join(tmpDir, 'idle.jsonl');
+      writeFileSync(
+        file,
+        JSON.stringify({ source: 'USER_EXPLICIT', type: 'USER_INPUT', content: 'hi' }) + '\n' +
+        JSON.stringify({ source: 'MODEL', type: 'PLANNER_RESPONSE', content: 'Hello there!' }) + '\n',
+      );
+      expect(isAntigravityTranscriptBusy(file)).toBe(false);
+    });
   });
 });

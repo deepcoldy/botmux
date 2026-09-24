@@ -562,6 +562,27 @@ export class TmuxPipeBackend implements SessionBackend {
     });
   }
 
+  sendLines(lines: string[], softNewlineKey: string): boolean {
+    if (this.exited || lines.length === 0) return false;
+    this.exitCopyModeIfNeeded();
+    const args: string[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) args.push(';');
+      args.push('send-keys', '-t', this.paneTarget, '-l', '--', lines[i]);
+      if (i < lines.length - 1) {
+        args.push(';');
+        args.push('send-keys', '-t', this.paneTarget, softNewlineKey);
+      }
+    }
+    return this.guardedSend('send-lines', () => {
+      execFileSync('tmux', args, {
+        stdio: 'ignore',
+        timeout: 5000,
+        env: tmuxEnv(),
+      });
+    });
+  }
+
   /**
    * Paste text into the pane via load-buffer + paste-buffer.
    * The -p flag asks tmux to wrap the buffer in bracketed-paste markers

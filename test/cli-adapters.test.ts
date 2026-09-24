@@ -3031,8 +3031,13 @@ describe('readyPattern', () => {
     expect(createOpenCodeAdapter('/bin/opencode').readyPattern).toBeUndefined();
   });
 
-  it('antigravity has no readyPattern', () => {
-    expect(createAntigravityAdapter('/bin/agy').readyPattern).toBeUndefined();
+  it('antigravity readyPattern and busyPattern are set to match its TUI footer states', () => {
+    const adapter = createAntigravityAdapter('/bin/agy');
+    expect(adapter.readyPattern).toBeDefined();
+    expect(adapter.readyPattern!.test('? for shortcuts')).toBe(true);
+    expect(adapter.busyPattern).toBeDefined();
+    expect(adapter.busyPattern!.test('esc to cancel')).toBe(true);
+    expect(typeof adapter.isSessionBusy).toBe('function');
   });
 
   it('mtr has no readyPattern', () => {

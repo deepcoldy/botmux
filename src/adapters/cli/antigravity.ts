@@ -1,4 +1,4 @@
-import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { existsSync, statSync, openSync, readSync, closeSync, fstatSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
@@ -132,6 +132,46 @@ async function waitForHistoryAppend(
   return historyDeltaContains(path, fromByte, marker);
 }
 
+export function isAntigravityTranscriptBusy(transcriptPath: string): boolean {
+  if (!existsSync(transcriptPath)) return false;
+  try {
+    const fd = openSync(transcriptPath, 'r');
+    try {
+      const stats = fstatSync(fd);
+      if (stats.size === 0) return false;
+      const readLen = Math.min(stats.size, 8192);
+      const buf = Buffer.alloc(readLen);
+      readSync(fd, buf, 0, readLen, stats.size - readLen);
+      const text = buf.toString('utf-8');
+      const lines = text.trim().split('\n');
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim();
+        if (!line) continue;
+        try {
+          const rec = JSON.parse(line);
+          if (rec.type === 'USER_INPUT') return true;
+          if (rec.type === 'GENERIC' || rec.type === 'SYSTEM_MESSAGE' || rec.type === 'CHECKPOINT' || rec.type === 'TASK_NOTIFICATION') {
+            return true;
+          }
+          if (rec.type === 'PLANNER_RESPONSE') {
+            if (Array.isArray(rec.tool_calls) && rec.tool_calls.length > 0) {
+              return true;
+            }
+            return false;
+          }
+        } catch {
+          // ignore corrupted trailing chunk line
+        }
+      }
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
 export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
   // modelChoices and must not shell out (see resolveCommand); the binary path
@@ -227,13 +267,23 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       try {
         if (pty.sendText && pty.sendSpecialKeys) {
           const lines = content.split('\n');
-          for (let i = 0; i < lines.length; i++) {
-            if (lines[i].length > 0) pty.sendText(lines[i]);
-            if (i < lines.length - 1) {
-              // M-Enter / alt+Enter: documented soft newline. Don't use
-              // `\` + Enter (Claude Code's idiom) — agy doesn't treat
-              // backslash as an escape.
-              pty.sendSpecialKeys('M-Enter');
+          if (typeof pty.sendLines === 'function') {
+            const BATCH_SIZE = 40;
+            for (let i = 0; i < lines.length; i += BATCH_SIZE) {
+              const chunk = lines.slice(i, i + BATCH_SIZE);
+              pty.sendLines(chunk, 'M-Enter');
+              if (i + BATCH_SIZE < lines.length) {
+                pty.sendSpecialKeys('M-Enter');
+              }
+              await delay(10);
+            }
+          } else {
+            for (let i = 0; i < lines.length; i++) {
+              if (lines[i].length > 0) pty.sendText(lines[i]);
+              if (i < lines.length - 1) {
+                pty.sendSpecialKeys('M-Enter');
+              }
+              await delay(10);
             }
           }
         } else {
@@ -243,6 +293,7 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
           for (let i = 0; i < lines.length; i++) {
             pty.write(lines[i]);
             if (i < lines.length - 1) pty.write('\x1b\r');
+            await delay(10);
           }
         }
       } catch {
@@ -276,7 +327,13 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     },
 
     completionPattern: undefined,
-    readyPattern: undefined,
+    readyPattern: /\? for shortcuts/,
+    busyPattern: /esc to cancel/,
+    isSessionBusy({ cliSessionId }) {
+      if (!cliSessionId) return false;
+      const transcriptPath = join(homedir(), '.gemini', 'antigravity-cli', 'brain', cliSessionId, '.system_generated', 'logs', 'transcript.jsonl');
+      return isAntigravityTranscriptBusy(transcriptPath);
+    },
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,
   };
