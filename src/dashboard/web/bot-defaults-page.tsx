@@ -5161,7 +5161,6 @@ function SessionModeSection(props: {
   }
 
   const tags2 = (k1: string, k2: string): string[] => [tr(k1), tr(k2)];
-  const tags3 = (k1: string, k2: string, k3: string): string[] => [tr(k1), tr(k2), tr(k3)];
 
   const p2pOptions: ModeCardOption<'thread' | 'chat' | 'group'>[] = [
     {
@@ -5190,13 +5189,13 @@ function SessionModeSection(props: {
     {
       value: 'new-topic', icon: MODE_GLYPHS.topic, name: tr('botDefaults.regularGroupModeNewTopic'),
       description: tr('botDefaults.regularNewTopicDesc'),
-      tags: tags3('botDefaults.regularNewTopicTag1', 'botDefaults.regularNewTopicTag2', 'botDefaults.regularNewTopicTag3'),
+      tags: tags2('botDefaults.regularNewTopicTag1', 'botDefaults.regularNewTopicTag2'),
       mock: <RegularMock mode="new-topic" />,
     },
     {
       value: 'chat', icon: MODE_GLYPHS.message, name: tr('botDefaults.regularGroupModeChat'),
       description: tr('botDefaults.regularChatDesc'),
-      tags: tags3('botDefaults.regularChatTag1', 'botDefaults.regularChatTag2', 'botDefaults.regularChatTag3'),
+      tags: tags2('botDefaults.regularChatTag1', 'botDefaults.regularChatTag2'),
       mock: <RegularMock mode="chat" />,
     },
     {
@@ -5259,6 +5258,7 @@ function SessionModeSection(props: {
         <div className="bd-field">
           <FieldTitle help={tr('botDefaults.regularGroupModeHelp')}>{tr('botDefaults.regularGroupMode')}</FieldTitle>
           <ModeCardPicker
+            columns={2}
             dataInput="regularGroupMode"
             ariaLabel={tr('botDefaults.regularGroupMode')}
             value={regular}

@@ -121,31 +121,32 @@ describe('mode mock screenshots', () => {
 
   it('regular group: chat flat, chat-topic isolates one topic, new-topic forks, shared shows two', () => {
     const counts = {
-      chat: { topics: 0, fused: 0 },
-      'chat-topic': { topics: 1, fused: 0 },
-      'new-topic': { topics: 2, fused: 0 },
-      shared: { topics: 2, fused: 2 },
+      chat: { topics: 0 },
+      'chat-topic': { topics: 1 },
+      'new-topic': { topics: 2 },
+      shared: { topics: 2 },
     } as const;
-    for (const [mode, expected] of Object.entries(counts) as Array<[keyof typeof counts, { topics: number; fused: number }]>) {
+    for (const [mode, expected] of Object.entries(counts) as Array<[keyof typeof counts, { topics: number }]>) {
       const root = render(React.createElement(RegularMock, { mode }));
       expect(findByClass(root, 'bd-mock-topic')).toHaveLength(expected.topics);
-      expect(findByClass(root, 'is-fused')).toHaveLength(expected.fused);
     }
     // Feishu quote reference appears in every regular-group mock.
     const hybrid = render(React.createElement(RegularMock, { mode: 'chat-topic' }));
     expect(findByClass(hybrid, 'bd-mock-quote')).toHaveLength(1);
     expect(findByClass(hybrid, 'bd-mock-reply-topic')).toHaveLength(1);
-    // 顶层连续：flat 流有标记 + 2 个顶层 @；话题隔离+话题内连续：独立标签 + 盒内两轮
-    expect(findByClass(hybrid, 'bd-mock-flat-tag')).toHaveLength(1);
-    expect(findByClass(hybrid, 'bd-mock-topic-stag')).toHaveLength(1);
+    // 顶层连续：普通文字的上下文标签（非胶囊）；话题盒另有一个 B 标签；盒内两轮 @ 追问
+    expect(findByClass(hybrid, 'bd-mock-ctx')).toHaveLength(1);
+    expect(findByClass(hybrid, 'bd-mock-topic-label')).toHaveLength(1);
     expect(findByClass(hybrid, 'bd-mock-topic')[0].findAll(node => classes(node).includes('bd-mock-bubble-g'))).toHaveLength(2);
-    // 一句话一话题：new-topic 两个话题各带「独立会话」标签
+    // 一句话一话题：new-topic 两个话题各有自己的上下文标签（A / B）
     const fork = render(React.createElement(RegularMock, { mode: 'new-topic' }));
-    expect(findByClass(fork, 'bd-mock-topic-stag')).toHaveLength(2);
-    // 共享：两个话题都标同一会话 S1
+    expect(findByClass(fork, 'bd-mock-topic-a')).toHaveLength(1);
+    expect(findByClass(fork, 'bd-mock-topic-b')).toHaveLength(1);
+    // 共享：两话题同色（都是 A），外侧有「共用上下文」括线
     const shared = render(React.createElement(RegularMock, { mode: 'shared' }));
-    const tags = findByClass(shared, 'bd-mock-topic-stag').map(n => n.children.join(''));
-    expect(tags).toEqual([expect.stringContaining('S1'), expect.stringContaining('S1')]);
+    expect(findByClass(shared, 'bd-mock-shared-brace')).toHaveLength(1);
+    expect(findByClass(shared, 'bd-mock-topic-b')).toHaveLength(0);
+    expect(findByClass(shared, 'bd-mock-ctx')[0].children.join('')).toContain('共用上下文');
   });
 
   it('regular group messages are all left-aligned (Feishu group layout), unlike DM right bubbles', () => {
@@ -196,24 +197,27 @@ describe('bot defaults page wiring', () => {
     }
     // Cards carry descriptions + tags from i18n keys.
     expect(page).toContain("description: tr('botDefaults.regularChatTopicDesc')");
-    expect(page).toContain("tags: tags3('botDefaults.regularChatTag1'");
+    // Regular group is pinned to two columns; scene tags are capped at two per card.
+    expect(page).toMatch(/<ModeCardPicker\s+columns=\{2\}\s+dataInput="regularGroupMode"/);
     // Doc subscription stays a (hinted) dropdown — only the four settings became cards.
     expect(page).toContain('dataInput="docSubscribeDefaultMode"');
   });
 });
 
 describe('mode card / mock CSS', () => {
-  it('lays cards out as a responsive equal-width grid', () => {
-    expect(css).toMatch(/\.bot-defaults-page \.bd-mode-cards\s*\{[^}]*grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(210px,\s*1fr\)\);/);
+  it('lays fixed-column cards out two-wide (one column on narrow screens), top aligned', () => {
+    expect(css).toMatch(/\.bd-mode-cards\.is-fixed-cols\s*\{[^}]*repeat\(var\(--bd-mode-cols,\s*2\),\s*minmax\(0,\s*1fr\)\);/);
+    expect(css).toMatch(/@media \(max-width:\s*620px\)[^@]*grid-template-columns:\s*minmax\(0,\s*1fr\);/);
+    expect(css).toMatch(/\.bd-mode-cards\s*\{[^}]*align-items:\s*start;/);
   });
 
-  it('shows selection with an accent ring and keeps mock screenshots fixed-light', () => {
-    expect(css).toMatch(/\.bd-mode-card\.is-selected\s*\{[^}]*border-color:\s*var\(--accent\);/);
+  it('keeps mock screenshots on a fixed neutral Feishu light base, with color used only for context', () => {
+    expect(css).toMatch(/\.bd-mode-mock\s*\{[^}]*background:\s*#f7f8fa;/);
     expect(css).toContain('color-scheme: light');
-    // Four per-mode tone tints exist.
-    for (const tone of ['a', 'b', 'c', 'd']) {
-      expect(css).toContain(`.bd-mock-tone-${tone} {`);
-    }
+    // Two context tones (A/B) — but never a full-tint base per mock.
+    expect(css).toContain('--m-ctx-a: #5b7cf0;');
+    expect(css).toContain('--m-ctx-b: #8a6ce8;');
+    expect(css).not.toContain('is-fused');
   });
 });
 
