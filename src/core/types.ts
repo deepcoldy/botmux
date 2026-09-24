@@ -434,6 +434,14 @@ export interface DaemonSession {
     turnId: string;
     workerGeneration: number;
   };
+  /** Runtime-only wake-up for a durable principal-lane FIFO head whose worker
+   * fork was rejected before IPC. The turn id fences a stale timer from
+   * dispatching a successor after the queue head changes. */
+  principalLaneDispatchRetry?: {
+    turnId: string;
+    attempt: number;
+    timer?: ReturnType<typeof setTimeout>;
+  };
   /** Host-owned classification/approval driver currently attached to disk state. */
   crossPrincipalInterruptionDriving?: boolean;
   /** Runtime wake-up for the bounded wait until the current owner turn ends. */

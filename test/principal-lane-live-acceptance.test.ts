@@ -615,6 +615,93 @@ describe('principal lane production live acceptance', () => {
     expect(mocks.workerInputs.some(row => row.turnId === 'om_retry_follower')).toBe(false);
   }, 30_000);
 
+  it('self-wakes a queued FIFO head after a pre-IPC fork rejection', async () => {
+    await dispatch('a', 'om_reject_source', 'source active');
+    await dispatch('c', 'om_reject_seed', 'materialize C');
+    const c = laneByPrincipal('user:union:on_c')!;
+    const caller = {
+      requestLarkAppId: appId,
+      requestUserOpenId: 'ou_c',
+      requestUserUnionId: 'on_c',
+      senderType: 'user' as const,
+    };
+    c.worker = null;
+    c.activeInteractiveTurn = undefined;
+    c.principalLaneRunningTurn = undefined;
+    c.session.principalLaneQueuedTurns = [{
+      version: 1,
+      turnId: 'om_reject_head',
+      caller,
+      userPrompt: 'rejected head',
+      title: 'rejected head',
+      cliInput: { content: 'rejected head', resources: [] },
+      createdAt: new Date().toISOString(),
+      resume: true,
+      dispatchState: 'queued',
+    }];
+    sessionStore.updateSession(c.session);
+    mocks.forkWorker.mockImplementationOnce(() => false);
+
+    expect(driveNextPrincipalLaneTurn(c)).toBe(false);
+    expect(c.session.principalLaneQueuedTurns).toMatchObject([
+      { turnId: 'om_reject_head', dispatchState: 'queued' },
+    ]);
+    expect(mocks.workerInputs.some(row => row.turnId === 'om_reject_head')).toBe(false);
+
+    await vi.waitFor(() => {
+      expect(mocks.workerInputs.filter(row => row.turnId === 'om_reject_head')).toHaveLength(1);
+    }, { timeout: 2_000, interval: 10 });
+    expect(c.session.principalLaneQueuedTurns).toMatchObject([
+      { turnId: 'om_reject_head', dispatchState: 'attempting' },
+    ]);
+    expect(c.principalLaneDispatchRetry).toBeUndefined();
+  }, 30_000);
+
+  it('does not let a stale retry timer dispatch a replacement FIFO head', async () => {
+    await dispatch('a', 'om_stale_source', 'source active');
+    await dispatch('c', 'om_stale_seed', 'materialize C');
+    const c = laneByPrincipal('user:union:on_c')!;
+    const caller = {
+      requestLarkAppId: appId,
+      requestUserOpenId: 'ou_c',
+      requestUserUnionId: 'on_c',
+      senderType: 'user' as const,
+    };
+    c.worker = null;
+    c.activeInteractiveTurn = undefined;
+    c.principalLaneRunningTurn = undefined;
+    c.session.principalLaneQueuedTurns = [{
+      version: 1,
+      turnId: 'om_stale_original',
+      caller,
+      userPrompt: 'stale original',
+      title: 'stale original',
+      cliInput: { content: 'stale original', resources: [] },
+      createdAt: new Date().toISOString(),
+      resume: true,
+      dispatchState: 'queued',
+    }];
+    sessionStore.updateSession(c.session);
+    mocks.forkWorker.mockImplementationOnce(() => false);
+
+    expect(driveNextPrincipalLaneTurn(c)).toBe(false);
+    c.session.principalLaneQueuedTurns = [{
+      ...c.session.principalLaneQueuedTurns[0]!,
+      turnId: 'om_stale_replacement',
+      userPrompt: 'replacement',
+      title: 'replacement',
+      cliInput: { content: 'replacement', resources: [] },
+      dispatchState: 'queued',
+    }];
+    sessionStore.updateSession(c.session);
+
+    await new Promise(resolve => setTimeout(resolve, 150));
+    expect(mocks.workerInputs.some(row => (
+      row.turnId === 'om_stale_original' || row.turnId === 'om_stale_replacement'
+    ))).toBe(false);
+    expect(c.principalLaneDispatchRetry).toBeUndefined();
+  }, 30_000);
+
   it('persists real explicit-send IPC provenance and routes own/foreign references', async () => {
     await dispatch('a', 'om_ipc_a', 'A active');
     await dispatch('b', 'om_ipc_b', 'B active');
