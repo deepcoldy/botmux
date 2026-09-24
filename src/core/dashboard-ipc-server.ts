@@ -69,6 +69,7 @@ import { ensureBackendAvailable } from '../services/backend-availability.js';
 import type { BackendType } from '../adapters/backend/types.js';
 import * as persistentBackend from './persistent-backend.js';
 import * as cardPrefsStore from '../services/card-prefs-store.js';
+import { setCardMode } from '../services/card-mode-store.js';
 import {
   isStreamingCardButtonId,
   normalizeHiddenStreamingCardButtons,
@@ -6350,11 +6351,13 @@ ipcRoute('PUT', '/api/bot-quota-fallback', async (req, res) => {
   }
 });
 
-// Per-bot card-behaviour toggles. Body may carry any subset of booleans; only
-// present keys are applied.
+// Either per-bot preferences (only present keys are applied), or an exact chat
+// override: { chatId, streamingCard }. The two scopes cannot be mixed.
 ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  const appId = cachedLarkAppId;
   let body: {
+    chatId?: unknown; streamingCard?: unknown;
     usageDisplay?: unknown;
     replyCardMode?: unknown;
     disableStreamingCard?: unknown; hiddenStreamingCardButtons?: unknown; pinStreamingCard?: unknown; silentTurnReactions?: unknown; codexAppCleanInput?: unknown; codexBrowser?: unknown; writableTerminalLinkInCard?: unknown; privateCard?: unknown; cotEnabled?: unknown;
@@ -6367,6 +6370,32 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
   };
   try { body = await readJsonBody(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_body' });
+  }
+
+  if (Object.hasOwn(body, 'chatId') || Object.hasOwn(body, 'streamingCard')) {
+    if (typeof body.chatId !== 'string' || !body.chatId.startsWith('oc_') || !isValidRoleChatId(body.chatId)) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_chat_id' });
+    }
+    if (typeof body.streamingCard !== 'boolean') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_streaming_card' });
+    }
+    if (Object.keys(body).some(key => key !== 'chatId' && key !== 'streamingCard')) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_chat_card_prefs' });
+    }
+    const { chatId, streamingCard } = body;
+    const result = await setCardMode(appId, chatId, !streamingCard);
+    if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+    // A prior /card show overrides noCardChats for that turn. Clear it across
+    // this chat's topics only after the persistent and live config both update.
+    for (const session of getActiveSessionsRegistry()?.values() ?? []) {
+      if (session.larkAppId === appId && session.chatId === chatId) {
+        session.streamingCardForced = undefined;
+      }
+    }
+    return jsonRes(res, 200, { ok: true, chatId, streamingCard, changed: result.changed });
+  }
 
   const patch: {
     usageDisplay?: UsageDisplayMode;

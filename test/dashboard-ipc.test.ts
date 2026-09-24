@@ -43,7 +43,7 @@ import * as persistentBackend from '../src/core/persistent-backend.js';
 import { __testOnly_resetBotRegistry, getBot, loadBotConfigs, registerBot } from '../src/bot-registry.js';
 import { config } from '../src/config.js';
 import { setDeploymentOwner } from '../src/services/deployment-identity.js';
-import { sessionKey } from '../src/core/types.js';
+import { sessionKey, type DaemonSession } from '../src/core/types.js';
 import { writeRoleFile, writeTeamRoleFile } from '../src/core/role-resolver.js';
 import {
   _allAskIds,
@@ -2075,6 +2075,119 @@ describe('PUT /api/bot-card-prefs — autoInviteOwnerOnGroupAdd', () => {
       else process.env.BOTS_CONFIG = prevBotsConfig;
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('PUT /api/bot-card-prefs — per-chat streaming cards', () => {
+  const appId = 'test-chat-card-app';
+  const otherAppId = 'test-other-card-app';
+  let dir: string;
+  let configPath: string;
+  let previousConfig: string | undefined;
+  let previousSessions: ReturnType<typeof workerPool.getActiveSessionsRegistry>;
+  let sessions: DaemonSession[];
+  const entries = [
+    { larkAppId: appId, larkAppSecret: 'secret', cliId: 'traex', noCardChats: ['oc_other'], replyCardMode: 'legacy' },
+    { larkAppId: otherAppId, larkAppSecret: 'other-secret', cliId: 'codex', noCardChats: ['oc_preserved'] },
+  ];
+  const readConfig = () => JSON.parse(readFileSync(configPath, 'utf8'));
+  const put = (body: unknown) => requestJson(handle!.port, '/api/bot-card-prefs', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json', ...trustedHostHeaders('PUT', '/api/bot-card-prefs', handle!.port) },
+    body: JSON.stringify(body),
+  });
+
+  beforeEach(async () => {
+    dir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-chat-card-'));
+    configPath = join(dir, 'bots.json');
+    previousConfig = process.env.BOTS_CONFIG;
+    previousSessions = workerPool.getActiveSessionsRegistry();
+    process.env.BOTS_CONFIG = configPath;
+    writeFileSync(configPath, JSON.stringify(entries));
+    loadBotConfigs().forEach(registerBot);
+    setLarkAppId(appId);
+    sessions = [
+      [appId, 'oc_target'], [appId, 'oc_target'],
+      [appId, 'oc_other'], [otherAppId, 'oc_target'],
+    ].map(([larkAppId, chatId]) => ({ larkAppId, chatId, streamingCardForced: true }) as DaemonSession);
+    workerPool.setActiveSessionsRegistry(new Map(sessions.map((session, index) => [String(index), session])));
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+  });
+
+  afterEach(async () => {
+    if (handle) await handle.close();
+    handle = null;
+    workerPool.setActiveSessionsRegistry(previousSessions);
+    if (previousConfig === undefined) delete process.env.BOTS_CONFIG;
+    else process.env.BOTS_CONFIG = previousConfig;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('persists and hot-applies only the selected bot/chat, including an idempotent repeat and re-enable', async () => {
+    const off = await put({ chatId: 'oc_target', streamingCard: false });
+    expect(off.status).toBe(200);
+    expect(off.json).toEqual({ ok: true, chatId: 'oc_target', streamingCard: false, changed: true });
+    expect(readConfig()).toEqual([{ ...entries[0], noCardChats: ['oc_other', 'oc_target'] }, entries[1]]);
+    expect(getBot(appId).config.noCardChats).toEqual(['oc_other', 'oc_target']);
+    expect(getBot(otherAppId).config.noCardChats).toEqual(['oc_preserved']);
+    expect(sessions.map(session => session.streamingCardForced)).toEqual([undefined, undefined, true, true]);
+
+    sessions[0].streamingCardForced = true;
+    const repeated = await put({ chatId: 'oc_target', streamingCard: false });
+    expect(repeated.status).toBe(200);
+    expect(repeated.json.changed).toBe(false);
+    expect(sessions[0].streamingCardForced).toBeUndefined();
+
+    const on = await put({ chatId: 'oc_target', streamingCard: true });
+    expect(on.status).toBe(200);
+    expect(on.json).toEqual({ ok: true, chatId: 'oc_target', streamingCard: true, changed: true });
+    expect(readConfig()).toEqual(entries);
+    expect(getBot(appId).config.noCardChats).toEqual(['oc_other']);
+  });
+
+  it('rejects incomplete, malformed, or mixed-scope bodies without changing settings or forced cards', async () => {
+    for (const body of [
+      null, [], 'off', { streamingCard: false }, { chatId: 'oc_target' },
+      { chatId: 'oc_', streamingCard: false }, { chatId: 'om_message', streamingCard: false },
+      { chatId: ' oc_target', streamingCard: false }, { chatId: 'oc_bad/path', streamingCard: false },
+      { chatId: 'oc_target', streamingCard: 'false' },
+      { chatId: 'oc_target', streamingCard: false, disableStreamingCard: true },
+      { chatId: 'oc_target', streamingCard: false, larkAppId: otherAppId },
+    ]) {
+      const response = await put(body);
+      expect(response.status, JSON.stringify(body)).toBe(400);
+    }
+    expect(readConfig()).toEqual(entries);
+    expect(getBot(appId).config.noCardChats).toEqual(['oc_other']);
+    expect(sessions.every(session => session.streamingCardForced)).toBe(true);
+  });
+
+  it('requires the existing host authorization and preserves forced cards on persistence failure', async () => {
+    const unauthorized = await requestJson(handle!.port, '/api/bot-card-prefs', {
+      method: 'PUT', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ chatId: 'oc_target', streamingCard: false }),
+    });
+    expect(unauthorized.status).toBe(401);
+    expect(readConfig()).toEqual(entries);
+
+    writeFileSync(configPath, JSON.stringify([entries[1]]));
+    const missingBot = await put({ chatId: 'oc_target', streamingCard: false });
+    expect(missingBot.status).toBe(400);
+    expect(missingBot.json).toEqual({ ok: false, error: 'bot_not_in_config' });
+    expect(readConfig()).toEqual([entries[1]]);
+    expect(getBot(appId).config.noCardChats).toEqual(['oc_other']);
+    expect(sessions.every(session => session.streamingCardForced)).toBe(true);
+
+    writeFileSync(configPath, JSON.stringify(entries));
+    // Block the atomic writer's temporary file without relying on user/OS
+    // permission differences. The original configuration must stay intact.
+    mkdirSync(`${configPath}.tmp.${process.pid}`);
+    const writeFailure = await put({ chatId: 'oc_target', streamingCard: false });
+    expect(writeFailure.status).toBe(500);
+    expect(readConfig()).toEqual(entries);
+    expect(getBot(appId).config.noCardChats).toEqual(['oc_other']);
+    expect(sessions.every(session => session.streamingCardForced)).toBe(true);
   });
 });
 

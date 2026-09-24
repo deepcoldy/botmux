@@ -7365,7 +7365,7 @@ const server = createServer(async (req, res) => {
     }
 
     // PUT /api/bots/:appId/card-prefs — proxy to that bot's daemon. Body carries
-    // any subset of per-bot behavior booleans / prompt strings.
+    // per-bot preferences, or the exact per-chat { chatId, streamingCard } override.
     let mBotCardPrefs: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotCardPrefs = url.pathname.match(/^\/api\/bots\/([^/]+)\/card-prefs$/))) {
       const appId = decodeURIComponent(mBotCardPrefs[1]);
