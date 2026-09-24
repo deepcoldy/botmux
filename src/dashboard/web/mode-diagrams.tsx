@@ -159,9 +159,15 @@ function ModeExampleDrawer<T extends string>(props: {
   onClose(): void;
 }): React.JSX.Element {
   const tr = useT();
+  const uid = useId().replace(/:/g, '');
+  const tabPanelId = `bd-example-panel-${uid}`;
+  const tabIdFor = (v: string): string => `bd-example-tab-${uid}-${v}`;
   const [preview, setPreview] = useState<T>(props.value);
   const closeRef = useRef<HTMLButtonElement | null>(null);
   const panelRef = useRef<HTMLElement | null>(null);
+  // onClose 用 ref，让焦点管理 effect 可以只在挂载时跑一次（父组件 rerender 不抢焦点）
+  const onCloseRef = useRef(props.onClose);
+  onCloseRef.current = props.onClose;
   const current = props.options.find(o => o.value === props.value) ?? props.options[0];
   const viewing = props.options.find(o => o.value === preview) ?? current;
 
@@ -169,42 +175,61 @@ function ModeExampleDrawer<T extends string>(props: {
     const panel = panelRef.current;
     closeRef.current?.focus();
 
-    function focusables(): HTMLElement[] {
+    // 打开期间锁住背景滚动，并把 dashboard 主区标 inert，
+    // 从 DOM 层杜绝 Tab 穿到背景（aria-modal 本身不做隔离）
+    const main = document.querySelector('main');
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    main?.setAttribute('inert', '');
+    main?.setAttribute('aria-hidden', 'true');
+
+    function tabbables(): HTMLElement[] {
       if (!panel) return [];
-      return [...panel.querySelectorAll<HTMLElement>(
-        'button:not([disabled]), [href], input:not([disabled]), [tabindex]:not([tabindex="-1"])',
-      )].filter(el => el.offsetParent !== null);
+      // 必须按运行时 tabIndex>=0 过滤：roving 组里非查看项是 tabindex=-1，
+      // CSS :not([tabindex="-1"]) 选不掉通过属性/反射设置的 -1 按钮
+      return [...panel.querySelectorAll<HTMLElement>('button, [href], input, select, textarea, [tabindex]')]
+        .filter(el => !el.hasAttribute('disabled') && el.tabIndex >= 0 && el.offsetParent !== null);
     }
 
     function onKey(event: KeyboardEvent): void {
       if (event.key === 'Escape') {
         event.stopPropagation();
-        props.onClose();
+        onCloseRef.current();
         return;
       }
-      // 焦点陷阱：Tab/Shift+Tab 在侧栏内循环，不穿到背景主页
-      if (event.key === 'Tab' && panel) {
-        const seq = focusables();
-        if (seq.length === 0) return;
-        const first = seq[0];
-        const last = seq[seq.length - 1];
-        const active = document.activeElement as HTMLElement | null;
-        if (event.shiftKey && (active === first || !panel.contains(active))) {
+      if (!panel || event.key !== 'Tab') return;
+      const seq = tabbables();
+      if (seq.length === 0) {
+        event.preventDefault();
+        return;
+      }
+      const first = seq[0];
+      const last = seq[seq.length - 1];
+      const active = document.activeElement as HTMLElement | null;
+      const inside = active && panel.contains(active);
+      if (event.shiftKey) {
+        if (!inside || active === first) {
           event.preventDefault();
           last.focus();
-        } else if (!event.shiftKey && active === last) {
-          event.preventDefault();
-          first.focus();
         }
+      } else if (!inside || active === last) {
+        // 正向：在最后一项（或焦点本不在抽屉里，理论不会发生）时回到首项
+        event.preventDefault();
+        first.focus();
       }
     }
 
     document.addEventListener('keydown', onKey, true);
     return () => {
       document.removeEventListener('keydown', onKey, true);
+      document.body.style.overflow = prevOverflow;
+      main?.removeAttribute('inert');
+      main?.removeAttribute('aria-hidden');
       props.triggerRef.current?.focus();
     };
-  }, [props, props.triggerRef]);
+    // 只在挂载/卸载时跑：依赖 triggerRef（稳定 ref 对象），父组件 rerender 不重放焦点
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function onTabKeyDown(event: React.KeyboardEvent, index: number): void {
     // roving tabindex：左右（窄屏下也支持上下）在 tabs 间移动焦点
@@ -250,17 +275,19 @@ function ModeExampleDrawer<T extends string>(props: {
             </svg>
           </button>
         </header>
-        <div className="bd-example-tabs" role="tablist" aria-label={viewing.name}>
+        <div className="bd-example-tabs" role="tablist" aria-label={props.title}>
           {props.options.map((option, index) => {
             const isCurrent = option.value === props.value;
             const isViewing = option.value === viewing.value;
             return (
               <button
                 key={option.value}
+                id={tabIdFor(option.value)}
                 type="button"
                 role="tab"
                 tabIndex={isViewing ? 0 : -1}
                 aria-selected={isViewing}
+                aria-controls={tabPanelId}
                 className={cx('bd-example-tab', isViewing && 'is-viewing')}
                 onClick={() => setPreview(option.value)}
                 onKeyDown={event => onTabKeyDown(event, index)}
@@ -271,7 +298,13 @@ function ModeExampleDrawer<T extends string>(props: {
             );
           })}
         </div>
-        <div className="bd-example-body">
+        <div
+          id={tabPanelId}
+          className="bd-example-body"
+          role="tabpanel"
+          aria-labelledby={tabIdFor(viewing.value)}
+          tabIndex={-1}
+        >
           <div className="bd-example-meta">
             <span className="bd-example-name">{viewing.name}</span>
             <span className="bd-example-short">{viewing.short}</span>

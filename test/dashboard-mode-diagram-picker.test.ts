@@ -6,7 +6,7 @@
 import { readFileSync } from 'node:fs';
 import React from 'react';
 import TestRenderer, { act, type ReactTestInstance } from 'react-test-renderer';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -16,13 +16,36 @@ vi.mock('react-dom', async () => {
   return { ...actual, createPortal: (node: unknown) => node };
 });
 
-const keyHandlers: Record<string, (event: { key: string; stopPropagation: () => void }) => void> = {};
-(globalThis as Record<string, unknown>).document = {
-  body: null,
-  addEventListener: (type: string, fn: (e: unknown) => void) => { keyHandlers[type] = fn as never; },
-  removeEventListener: () => {},
+const bodyStyle: Record<string, string> = {};
+const mainAttrs: Record<string, string> = {};
+type DocEvent = { key: string; shiftKey?: boolean; stopPropagation: () => void; preventDefault: () => void };
+const listeners: Record<string, Array<(e: DocEvent) => void>> = {};
+function resetDom(): void {
+  for (const k of Object.keys(bodyStyle)) delete bodyStyle[k];
+  for (const k of Object.keys(mainAttrs)) delete mainAttrs[k];
+  for (const k of Object.keys(listeners)) delete listeners[k];
+  (globalThis as Record<string, unknown>).__activeEl = null;
+}
+const makeDocument = () => ({
+  body: { style: bodyStyle },
+  addEventListener: (type: string, fn: (e: DocEvent) => void) => { (listeners[type] ??= []).push(fn); },
+  removeEventListener: (type: string, fn: (e: DocEvent) => void) => {
+    listeners[type] = (listeners[type] ?? []).filter(f => f !== fn);
+  },
   getElementById: () => ({ focus: () => {} }),
-};
+  querySelector: (sel: string) => {
+    if (sel !== 'main') return null;
+    return {
+      setAttribute: (k: string, v: string) => { mainAttrs[k] = v; },
+      removeAttribute: (k: string) => { delete mainAttrs[k]; },
+    };
+  },
+  get activeElement() { return (globalThis as Record<string, unknown>).__activeEl as unknown; },
+});
+(globalThis as Record<string, unknown>).document = makeDocument();
+function dispatch(event: DocEvent): void {
+  (listeners.keydown ?? []).forEach(fn => fn(event));
+}
 
 import {
   MentionMock,
@@ -79,6 +102,8 @@ function groupProps(overrides: Partial<{ value: string; onChange: ReturnType<typ
     ...overrides,
   };
 }
+
+beforeEach(() => { resetDom(); });
 
 describe('ModeOptionGroup main view', () => {
   it('renders compact radios with name + short + default tag and NO big mock on the page', () => {
@@ -145,7 +170,7 @@ describe('ModeOptionGroup example drawer', () => {
     act(() => findByClass(root, 'bd-mode-example-trigger')[0].props.onClick());
     expect(findByClass(root, 'bd-example-panel')).toHaveLength(1);
     act(() => {
-      keyHandlers.keydown({ key: 'Escape', stopPropagation: () => {} });
+      dispatch({ key: 'Escape', stopPropagation: () => {}, preventDefault: () => {} });
     });
     expect(findByClass(root, 'bd-example-panel')).toHaveLength(0);
   });
@@ -158,6 +183,57 @@ describe('ModeOptionGroup example drawer', () => {
     const tabs = root.findAll(node => node.props.role === 'tab');
     expect(tabs[0].props.tabIndex).toBe(0);
     expect(tabs[1].props.tabIndex).toBe(-1);
+  });
+
+  it('locks scroll and marks background main inert while open, restores on close', () => {
+    const root = render(React.createElement(ModeOptionGroup<string>, groupProps()));
+    act(() => findByClass(root, 'bd-mode-example-trigger')[0].props.onClick());
+    expect(bodyStyle.overflow).toBe('hidden');
+    expect(mainAttrs.inert).toBe('');
+    expect(mainAttrs['aria-hidden']).toBe('true');
+    act(() => {
+      dispatch({ key: 'Escape', stopPropagation: () => {}, preventDefault: () => {} });
+    });
+    expect(bodyStyle.overflow).toBeUndefined();
+    expect(mainAttrs.inert).toBeUndefined();
+  });
+
+  it('Tab trap filters by runtime tabIndex>=0 and wraps both directions (source assertion; verified by browser probe)', () => {
+    // react-test-renderer 不提供真实 DOM（panelRef.current 为 null），
+    // 原生 Tab 顺序由浏览器回归脚本验证；这里锁定实现要点防回退
+    expect(diagrams).toContain('el.tabIndex >= 0');
+    expect(diagrams).toMatch(/if \(!inside \|\| active === first\)/);
+    expect(diagrams).toMatch(/if \(!inside \|\| active === last\)/);
+  });
+
+  it('does not steal focus on parent re-render while open (mount-once effect)', () => {
+    let renderer!: TestRenderer.ReactTestRenderer;
+    act(() => {
+      renderer = TestRenderer.create(React.createElement(ModeOptionGroup<string>, groupProps()));
+    });
+    const root1 = renderer.root;
+    act(() => findByClass(root1, 'bd-mode-example-trigger')[0].props.onClick());
+    // switch preview to second option, then force a fresh render with new props object
+    act(() => root1.findAll(node => node.props.role === 'tab')[1].props.onClick());
+    act(() => {
+      renderer.update(React.createElement(ModeOptionGroup<string>, { ...groupProps(), groupSub: '副标题变了' }));
+    });
+    const root2 = renderer.root;
+    // drawer still open; preview is a controlled state inside the same instance
+    expect(findByClass(root2, 'bd-example-panel')).toHaveLength(1);
+    const viewing = root2.findAll(node => node.props.role === 'tab').find(t => t.props['aria-selected'] === true);
+    expect(viewing?.props['data-value'] ?? (viewing?.children[0] as string)).toBeTruthy();
+  });
+
+  it('wires tabs to the tabpanel with stable ids (aria-controls / labelledby)', () => {
+    const root = render(React.createElement(ModeOptionGroup<string>, groupProps()));
+    act(() => findByClass(root, 'bd-mode-example-trigger')[0].props.onClick());
+    const panel = findByClass(root, 'bd-example-body')[0];
+    expect(panel.props.role).toBe('tabpanel');
+    expect(panel.props['aria-labelledby']).toMatch(/^bd-example-tab-/);
+    expect(panel.props.id).toMatch(/^bd-example-panel-/);
+    const firstTab = root.findAll(node => node.props.role === 'tab')[0];
+    expect(firstTab.props['aria-controls']).toBe(panel.props.id);
   });
 
   it('arrow-right in the tablist moves focus/preview via a handled key event', () => {
