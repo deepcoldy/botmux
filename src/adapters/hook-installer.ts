@@ -21,6 +21,10 @@ export interface HookInstallConfig {
    *  rotated auth/provider/proxy settings refresh on every cold spawn; global
    *  hooks and unrelated top-level settings are deliberately not inherited. */
   readonly inheritClaudeEnvFrom?: string;
+  /** Keys never inherited from {@link inheritClaudeEnvFrom} and removed from
+   *  the per-bot env (per-bot credential source: the shared login's provider
+   *  auth must not override the bot's own account). */
+  readonly inheritClaudeEnvExclude?: readonly string[];
   /** 可选：SessionStart 就绪 hook 命令。
    *  - claude-settings：写全局 settings.json
    *  - grok-hooks：写 `~/.grok/hooks/*.json` 的 SessionStart
@@ -354,6 +358,7 @@ function installClaudeSettings(
   sessionStartCommand?: string,
   inheritClaudeEnvFrom?: string,
   userPromptSubmitCommand?: string,
+  inheritClaudeEnvExclude: readonly string[] = [],
 ): void {
   const settings: ClaudeSettings = readJsonFile<ClaudeSettings>(configPath) ?? {};
   let inheritedEnvState: { path: string; content: string } | undefined;
@@ -372,8 +377,10 @@ function installClaudeSettings(
       const localEnv = isRecord(settings.env) ? { ...settings.env } : {};
       for (const key of previousInheritedKeys) delete localEnv[key];
 
-      const sharedEnv = isRecord(source.env) ? source.env : {};
+      const sharedEnv = isRecord(source.env) ? { ...source.env } : {};
+      for (const key of inheritClaudeEnvExclude) delete sharedEnv[key];
       const mergedEnv = { ...localEnv, ...sharedEnv };
+      for (const key of inheritClaudeEnvExclude) delete mergedEnv[key];
       if (Object.keys(mergedEnv).length > 0) settings.env = mergedEnv;
       else delete settings.env;
 
@@ -900,6 +907,7 @@ export function installHook(
           hookInstall.sessionStartCommand,
           hookInstall.inheritClaudeEnvFrom,
           hookInstall.userPromptSubmitCommand,
+          hookInstall.inheritClaudeEnvExclude,
         );
         break;
       case 'opencode-plugin':
