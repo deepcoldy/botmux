@@ -5305,26 +5305,55 @@ describe('handleCommand', () => {
       expect(scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({ prompt: '/回显 7' }));
     });
 
-    it('rejects an unknown or unapproved scheduled frozen command without persisting a task', async () => {
+    it('keeps an unknown slash-leading prompt on the normal scheduled model path', async () => {
       vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
         parsed: { kind: 'interval', minutes: 1, display: '每 1 分钟' },
-        prompt: '/不存在 7',
-        name: '/不存在 7',
+        prompt: '/status',
+        name: '/status',
       });
       vi.mocked(scheduler.extractScheduleModifiers).mockReturnValue({
-        deliver: 'origin', silent: false, prompt: '/不存在 7',
+        deliver: 'origin', silent: false, prompt: '/status',
       });
       vi.mocked(frozenCommand.parseScheduledFrozenCommandInvocation).mockReturnValue({
-        cmd: '/不存在', commandContent: '/不存在 7',
+        cmd: '/status', commandContent: '/status',
       });
-      vi.mocked(frozenLifecycle.evaluateFrozenCommandLifecycle).mockReturnValue({ kind: 'missing' } as any);
-      vi.mocked(frozenCommand.lookupFrozenCommand).mockReturnValue({ kind: 'missing', command: '不存在' } as any);
+      vi.mocked(frozenLifecycle.evaluateFrozenCommandLifecycle).mockReturnValue({ kind: 'legacy' });
+      vi.mocked(frozenCommand.lookupFrozenCommand).mockReturnValue({ kind: 'missing', command: 'status' });
+      vi.mocked(scheduler.addTask).mockReturnValue({ id: 'task-slash', prompt: '/status' } as any);
+      vi.mocked(scheduler.getNextRun).mockReturnValue(new Date('2026-09-24T10:00:00+08:00'));
 
       const deps = makeDeps(makeDaemonSession());
-      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每1分钟 /不存在 7'), deps, LARK_APP_ID);
+      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每1分钟 /status'), deps, LARK_APP_ID);
+
+      expect(frozenCommand.assertFrozenCommandSchedulable).not.toHaveBeenCalled();
+      expect(frozenCommand.normalizeFrozenCommandArguments).not.toHaveBeenCalled();
+      expect(scheduler.addTask).toHaveBeenCalledWith(expect.objectContaining({ prompt: '/status' }));
+    });
+
+    it('rejects a defined but unapproved scheduled frozen command without persisting a task', async () => {
+      vi.mocked(scheduler.parseNaturalSchedule).mockReturnValue({
+        parsed: { kind: 'interval', minutes: 1, display: '每 1 分钟' },
+        prompt: '/回显 7',
+        name: '/回显 7',
+      });
+      vi.mocked(scheduler.extractScheduleModifiers).mockReturnValue({
+        deliver: 'origin', silent: false, prompt: '/回显 7',
+      });
+      vi.mocked(frozenCommand.parseScheduledFrozenCommandInvocation).mockReturnValue({
+        cmd: '/回显', commandContent: '/回显 7',
+      });
+      vi.mocked(frozenLifecycle.evaluateFrozenCommandLifecycle).mockReturnValue({
+        kind: 'fail_closed', reason: '命令声明为 active，但尚未完成宿主批准',
+      });
+      vi.mocked(frozenCommand.lookupFrozenCommand).mockReturnValue({
+        kind: 'found', snapshot: { definition: { executor: 'test.echo' } },
+      } as any);
+
+      const deps = makeDeps(makeDaemonSession());
+      await handleCommand('/schedule', ROOT_ID, makeLarkMessage('/schedule 每1分钟 /回显 7'), deps, LARK_APP_ID);
 
       expect(scheduler.addTask).not.toHaveBeenCalled();
-      expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1]).toContain('尚未完成当前机器人批准');
+      expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1]).toContain('状态异常');
     });
 
     it('should inherit defaultWorkingDir (not legacy workingDir) when creating a schedule', async () => {

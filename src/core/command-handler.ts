@@ -1097,28 +1097,35 @@ async function handleScheduleCommand(
           command: frozenInvocation.cmd,
         });
         const lookup = lookupFrozenCommand({ workingDir, command: frozenInvocation.cmd });
-        if (lifecycle.kind !== 'active') {
-          throw new FrozenCommandError('definition_schedule_unavailable', lifecycle.kind === 'retired'
-            ? `固化命令 ${frozenInvocation.cmd} 已废弃`
-            : lifecycle.kind === 'revoked'
-              ? `固化命令 ${frozenInvocation.cmd} 已撤销`
-              : lifecycle.kind === 'fail_closed'
-                ? `固化命令 ${frozenInvocation.cmd} 状态异常，已拒绝创建定时任务`
-                : `固化命令 ${frozenInvocation.cmd} 尚未完成当前机器人批准`);
+        // A slash-leading schedule prompt is not automatically a Frozen
+        // Command. Preserve the historical passthrough behavior for CLI /
+        // daemon commands (for example /status and /compact) unless either a
+        // definition or a lifecycle record proves this slug belongs to the
+        // Frozen Command subsystem.
+        if (lookup.kind !== 'missing' || lifecycle.kind !== 'legacy') {
+          if (lifecycle.kind !== 'active') {
+            throw new FrozenCommandError('definition_schedule_unavailable', lifecycle.kind === 'retired'
+              ? `固化命令 ${frozenInvocation.cmd} 已废弃`
+              : lifecycle.kind === 'revoked'
+                ? `固化命令 ${frozenInvocation.cmd} 已撤销`
+                : lifecycle.kind === 'fail_closed'
+                  ? `固化命令 ${frozenInvocation.cmd} 状态异常，已拒绝创建定时任务`
+                  : `固化命令 ${frozenInvocation.cmd} 尚未完成当前机器人批准`);
+          }
+          if (lookup.kind !== 'found') {
+            throw lookup.kind === 'invalid'
+              ? lookup.error
+              : new FrozenCommandError('definition_missing', `未找到固化命令 ${frozenInvocation.cmd}`);
+          }
+          assertFrozenCommandSchedulable(lookup.snapshot.definition);
+          normalizeFrozenCommandArguments({
+            definition: lookup.snapshot.definition,
+            rawArgs: frozenInvocation.commandContent.slice(frozenInvocation.cmd.length).trim(),
+          });
+          // Persist one canonical representation. The execution-side parser still
+          // accepts the older "，执行 /x" form for already-created tasks.
+          schedPrompt = frozenInvocation.commandContent;
         }
-        if (lookup.kind !== 'found') {
-          throw lookup.kind === 'invalid'
-            ? lookup.error
-            : new FrozenCommandError('definition_missing', `未找到固化命令 ${frozenInvocation.cmd}`);
-        }
-        assertFrozenCommandSchedulable(lookup.snapshot.definition);
-        normalizeFrozenCommandArguments({
-          definition: lookup.snapshot.definition,
-          rawArgs: frozenInvocation.commandContent.slice(frozenInvocation.cmd.length).trim(),
-        });
-        // Persist one canonical representation. The execution-side parser still
-        // accepts the older "，执行 /x" form for already-created tasks.
-        schedPrompt = frozenInvocation.commandContent;
       } catch (error) {
         await sessionReply(
           rootId,
