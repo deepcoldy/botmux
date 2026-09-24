@@ -38,7 +38,7 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
     findActiveBySessionId: (id: string) => id === ds.session.sessionId ? ds : undefined,
     authorizeSessionScopedIpc, isTrustedHostIpcRequest: () => isHost, selfDaemonLarkAppId: 'cli_source',
     jsonRes: (_res: unknown, status: number, value: any) => ({ status, value }),
-    getMessageChatId: vi.fn(async () => 'oc_target'), readGroupCollaborationMode: () => undefined,
+    lookupMessageChatId: vi.fn(async () => 'oc_target'), readGroupCollaborationMode: () => undefined,
     evaluateProjectDispatchPolicy: vi.fn(() => ({ ok: true })),
     getBot: () => ({ config: { triggerUserAuth: { enabled: true, tools: ['bytedcli'] } } }),
     dispatchUserForTurn: vi.fn(async () => undefined),
@@ -98,6 +98,19 @@ describe('dispatch user IPC end-to-end identity binding', () => {
   it('rejects routing a root into a different chat', async () => {
     const h = harness({ chatId: 'oc_wrong' });
     expect((await h.run()).status).toBe(403);
+    expect(h.send).not.toHaveBeenCalled();
+  });
+  it('treats unavailable root lookup as a provider failure, not a route mismatch', async () => {
+    const h = harness();
+    h.scope.lookupMessageChatId = vi.fn(async () => { throw new Error('network unavailable'); });
+    expect(await h.run()).toMatchObject({ status: 502, value: { error: 'dispatch_delivery_failed' } });
+    expect(h.send).not.toHaveBeenCalled();
+    expect(await read()).toBeUndefined();
+  });
+  it('refuses a root whose successful lookup contains no chat', async () => {
+    const h = harness();
+    h.scope.lookupMessageChatId = vi.fn(async () => null);
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'dispatch_chat_mismatch' } });
     expect(h.send).not.toHaveBeenCalled();
   });
   it('does not acquire a human identity from an ordinary peer-bot turn', async () => {
