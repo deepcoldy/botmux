@@ -258,6 +258,17 @@ export interface CliAdapter {
      *  per-bot BOT_HOME). Absent ⇒ the adapter must NOT inline secrets into
      *  argv; it falls back to process-env-only delivery (the old behavior). */
     settingsFilePath?: string;
+    /** Effective environment for the CLI process (including sanitized per-bot env
+     *  from bots.json). Passed so adapters discovering configuration or system
+     *  prompt files can inspect the effective environment without mutating
+     *  the worker process.env. */
+    env?: NodeJS.ProcessEnv;
+    /** Extra arguments passed to the CLI via CLI_EXTRA_ARGS or configuration. */
+    extraArgs?: string[];
+    /** Explicit project trust override passed down to adapters with trust policies. */
+    trustOverride?: boolean;
+    /** Project trust state from session context if resolved. */
+    projectTrusted?: boolean;
   }): string[];
 
   /** Adapter-specific chance to rewrite the first prompt before buildArgs sees

@@ -165,6 +165,7 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
       noTransport,
       solo,
       skillPluginDir,
+      env,
     }) {
       const sessionDir = ompSessionDir(sessionId);
       const args = ['--no-title'];
@@ -190,7 +191,7 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
         replyDelivery: effectiveReplyDelivery,
         solo,
       });
-      const discovered = discoverOmpAppendSystemPrompt({ cwd: workingDir });
+      const discovered = discoverOmpAppendSystemPrompt({ cwd: workingDir, env });
       const finalAppendPrompt = discovered?.content?.trim()
         ? `${discovered.content.trim()}\n\n${botmuxAppendPrompt}`
         : botmuxAppendPrompt;

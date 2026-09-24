@@ -179,6 +179,10 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
       solo,
       skillPluginDir,
       workingDir,
+      env,
+      extraArgs,
+      trustOverride,
+      projectTrusted,
     }) {
       const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
       const botmuxAppendPrompt = buildBotmuxSystemPromptText({
@@ -192,7 +196,13 @@ export function createPiAdapter(pathOverride?: string): CliAdapter {
       });
 
       const appendPrompts: string[] = [];
-      const discovered = discoverPiAppendSystemPrompt({ cwd: workingDir });
+      const discovered = discoverPiAppendSystemPrompt({
+        cwd: workingDir,
+        env,
+        extraArgs,
+        trustOverride,
+        projectTrusted,
+      });
       if (discovered?.path && discovered.content.trim()) {
         appendPrompts.push(discovered.path);
       }

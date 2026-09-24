@@ -2127,6 +2127,62 @@ describe('pi buildArgs', () => {
       rmSync(tmpAgent, { recursive: true, force: true });
     }
   });
+
+  it('forwards extraArgs (--no-approve) to override saved project trust', () => {
+    const tmpCwd = mkdtempSync(join(tmpdir(), 'pi-append-noapp-cwd-'));
+    const tmpAgent = mkdtempSync(join(tmpdir(), 'pi-append-noapp-agent-'));
+    try {
+      writeFileSync(join(tmpAgent, 'trust.json'), JSON.stringify({ [tmpCwd]: true }));
+      mkdirSync(join(tmpCwd, '.pi'), { recursive: true });
+      writeFileSync(join(tmpCwd, '.pi', 'APPEND_SYSTEM.md'), 'PROJECT_SENTINEL');
+      writeFileSync(join(tmpAgent, 'APPEND_SYSTEM.md'), 'GLOBAL_SENTINEL');
+
+      const args = adapter.buildArgs({
+        sessionId: 'sess-pi',
+        resume: false,
+        workingDir: tmpCwd,
+        botName: 'TestBot',
+        extraArgs: ['--no-approve'],
+        env: { PI_CODING_AGENT_DIR: tmpAgent },
+      });
+
+      const appendIndices = args.flatMap((arg, i) => arg === '--append-system-prompt' ? [i] : []);
+      expect(appendIndices.length).toBe(2);
+      expect(args[appendIndices[0] + 1]).toBe(join(tmpAgent, 'APPEND_SYSTEM.md'));
+      expect(args[appendIndices[1] + 1]).toContain('<botmux_routing>');
+    } finally {
+      rmSync(tmpCwd, { recursive: true, force: true });
+      rmSync(tmpAgent, { recursive: true, force: true });
+    }
+  });
+
+  it('forwards env with PI_CODING_AGENT_DIR for discovery without worker process pollution', () => {
+    const tmpCwd = mkdtempSync(join(tmpdir(), 'pi-append-env-cwd-'));
+    const workerAgent = mkdtempSync(join(tmpdir(), 'pi-worker-agent-'));
+    const botAgent = mkdtempSync(join(tmpdir(), 'pi-bot-agent-'));
+    vi.stubEnv('PI_CODING_AGENT_DIR', workerAgent);
+    try {
+      writeFileSync(join(workerAgent, 'APPEND_SYSTEM.md'), 'WORKER_SENTINEL');
+      writeFileSync(join(botAgent, 'APPEND_SYSTEM.md'), 'BOT_SENTINEL');
+
+      const args = adapter.buildArgs({
+        sessionId: 'sess-pi',
+        resume: false,
+        workingDir: tmpCwd,
+        botName: 'TestBot',
+        env: { PI_CODING_AGENT_DIR: botAgent },
+      });
+
+      const appendIndices = args.flatMap((arg, i) => arg === '--append-system-prompt' ? [i] : []);
+      expect(appendIndices.length).toBe(2);
+      expect(args[appendIndices[0] + 1]).toBe(join(botAgent, 'APPEND_SYSTEM.md'));
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(tmpCwd, { recursive: true, force: true });
+      rmSync(workerAgent, { recursive: true, force: true });
+      rmSync(botAgent, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('oh-my-pi buildArgs', () => {
@@ -2244,6 +2300,22 @@ describe('oh-my-pi buildArgs', () => {
     } finally {
       rmSync(tmpCwd, { recursive: true, force: true });
     }
+  });
+
+  it('forwards env with OMP_PROFILE for profile-specific APPEND_SYSTEM.md discovery', () => {
+    mkdirSync(join(home, '.omp', 'profiles', 'work', 'agent'), { recursive: true });
+    writeFileSync(join(home, '.omp', 'profiles', 'work', 'agent', 'APPEND_SYSTEM.md'), 'OMP_WORK_SENTINEL');
+
+    const args = adapter.buildArgs({
+      sessionId: 'sess-omp',
+      resume: false,
+      botName: 'omp-bot',
+      env: { OMP_PROFILE: 'work' },
+    });
+
+    const appendIndices = args.flatMap((arg, i) => arg === '--append-system-prompt' ? [i] : []);
+    expect(appendIndices.length).toBe(1);
+    expect(args[appendIndices[0] + 1]).toContain('OMP_WORK_SENTINEL');
   });
 
   it('rejects path-like session ids instead of escaping the managed OMP root', () => {
