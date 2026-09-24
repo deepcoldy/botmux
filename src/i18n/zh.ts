@@ -1659,6 +1659,7 @@ export const messages: Record<string, string> = {
   'worker.codex_composer_conflict': '已 adopt 的 Codex 终端输入框里已有未提交的本地草稿。botmux 保留了草稿，没有把这条飞书消息拼到后面。请先提交或清空本地草稿，再重发飞书消息。',
   'worker.transcriptLabel': '会话存储',
   'worker.submit_impossible': '⚠️ 刚才那条消息没有安全写入 {cliName}。\n原因：{reason}\n请处理上述原因并确认终端状态后再试。\n开头：{preview}',
+  'worker.activation_submit_unconfirmed': '⚠️ 首条消息的提交尚未确认\n阶段：输入提交\n错误码：submit_unconfirmed\nBotMux 尚未在{transcriptLabel}确认 {cliName} 收到首条消息；它可能仍在执行或已经执行。后续消息会等待这条确认。\n请打开 Web 终端核对原输入与执行状态；若原输入仍未提交，请在终端完成提交。BotMux 会继续观察原提交回执，确认到达后自动释放队列。\n此时在飞书重发只会继续排队。若终端无法恢复，请关闭该会话后重新开始。\n原消息：{preview}',
   'worker.submit_unconfirmed': '⚠️ 消息提交自动确认失败\n阶段：输入提交\n错误码：submit_unconfirmed\nBotMux 未能在{transcriptLabel}确认 {cliName} 已接收这条消息。自动确认失败不代表消息一定没有执行：它可能仍在执行或已经执行。\n请打开 Web 终端检查输入框与执行状态；确认消息确实未执行后再重发。\n原消息：{preview}',
   'worker.submit_unconfirmed_zmx': '⚠️ 消息提交自动确认失败\n阶段：输入提交\n错误码：submit_unconfirmed\nBotMux 未能在{transcriptLabel}确认 {cliName} 已接收这条消息。自动确认失败不代表消息一定没有执行：它可能仍在执行或已经执行。\n不要直接重发；请在本机运行 botmux list，进入该 ZMX 会话检查输入框与执行状态，确认消息确实未执行后再重发。\n原消息：{preview}',
   'worker.zmx_recovery_pending': 'ZMX 控制面暂时无法确认会话身份，自动清理没有执行。不要直接重发；请在本机运行 botmux list 进入会话，检查并按 Ctrl+C 清空输入框，然后用 /restart 重启会话后再试。',

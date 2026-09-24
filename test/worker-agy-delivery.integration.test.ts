@@ -27,7 +27,7 @@ async function waitFor(check: () => boolean, logs: string[], timeout = 10_000): 
   throw new Error(`Worker condition timed out\n${logs.join('')}`);
 }
 
-function startWorker(mode: 'delayed' | 'interrupted', cliId: 'antigravity' | 'traex' = 'antigravity') {
+function startWorker(mode: 'delayed' | 'interrupted' | 'manual', cliId: 'antigravity' | 'traex' = 'antigravity') {
   const root = mkdtempSync(join(tmpdir(), 'botmux-agy-delivery-'));
   roots.add(root);
   const dataDir = join(root, 'session');
@@ -57,6 +57,7 @@ const history = ${JSON.stringify(history)};
 const ready = ${JSON.stringify(ready)};
 const screen = ${JSON.stringify(screen)};
 const delayed = ${mode === 'delayed'};
+const manual = ${mode === 'manual'};
 process.stdin.setRawMode?.(true);
 setTimeout(() => process.stdout.write('\\x1b[2J\\x1b[H' + screen), 150);
 process.stdin.on('data', chunk => {
@@ -64,7 +65,7 @@ process.stdin.on('data', chunk => {
   fs.appendFileSync(inputLog, text);
   for (const marker of ['ACTIVATION_UNIQUE_MARKER', 'FOLLOWUP_UNIQUE_MARKER']) {
     if (!text.includes(marker)) continue;
-    setTimeout(() => {
+    if (!manual) setTimeout(() => {
       const row = ${JSON.stringify(cliId)} === 'antigravity'
         ? { display: marker, workspace: ${JSON.stringify(dataDir)}, timestamp: Date.now() }
         : { text: marker, session_id: ${JSON.stringify(nativeId)}, ts: Date.now() };
@@ -104,11 +105,17 @@ setInterval(() => {}, 1_000);
     type: 'init', sessionId: 'sid-agy-delivery', chatId: 'oc_test', rootMessageId: 'om_root',
     workingDir: dataDir, cliId, cliPathOverride: fakeCli, backendType: 'pty',
     cliSessionId: nativeId,
-    prompt: mode === 'delayed' ? 'ACTIVATION_UNIQUE_MARKER' : '',
-    ...(mode === 'delayed' ? { queuedActivationToken: 'activation-token', turnId: 'om_initial' } : {}),
+    prompt: mode !== 'interrupted' ? 'ACTIVATION_UNIQUE_MARKER' : '',
+    ...(mode !== 'interrupted' ? { queuedActivationToken: 'activation-token', turnId: 'om_initial' } : {}),
     larkAppId: 'app_test', larkAppSecret: 'secret',
   } satisfies DaemonToWorker);
-  return { child, messages, logs, input: () => existsSync(inputLog) ? readFileSync(inputLog, 'utf8') : '' };
+  return {
+    child, messages, logs,
+    recordReceipt: () => writeFileSync(history, JSON.stringify({
+      display: 'ACTIVATION_UNIQUE_MARKER', workspace: dataDir, timestamp: Date.now(),
+    }) + '\n'),
+    input: () => existsSync(inputLog) ? readFileSync(inputLog, 'utf8') : '',
+  };
 }
 
 describe('worker delayed activation and interrupted Antigravity delivery', () => {
@@ -132,4 +139,21 @@ describe('worker delayed activation and interrupted Antigravity delivery', () =>
     await waitFor(() => worker.input().includes('FOLLOWUP_UNIQUE_MARKER'), worker.logs);
     expect(worker.input().match(/FOLLOWUP_UNIQUE_MARKER/g)).toHaveLength(1);
   }, 20_000);
+
+  it('acknowledges a manual terminal submission after the warning chain has ended without writing again', async () => {
+    const worker = startWorker('manual');
+    await waitFor(() => worker.messages.some(m => m.type === 'user_notify'), worker.logs, 65_000);
+    const warning = worker.messages.find(m => m.type === 'user_notify');
+    expect(warning?.type === 'user_notify' ? warning.message : '').toMatch(/首条消息|Opening message/);
+    expect(warning?.type === 'user_notify' ? warning.message : '').toMatch(/关闭该会话|close this session/);
+    const originalInput = worker.input();
+    worker.recordReceipt();
+    await waitFor(() => worker.messages.some(m => m.type === 'queued_activation_submitted'), worker.logs, 25_000);
+    expect(worker.messages.filter(m => m.type === 'queued_activation_submitted')).toEqual([{
+      type: 'queued_activation_submitted', sessionId: 'sid-agy-delivery', activationToken: 'activation-token',
+    }]);
+    expect(worker.messages.filter(m => m.type === 'user_notify')).toHaveLength(1);
+    expect(originalInput.match(/ACTIVATION_UNIQUE_MARKER/g)).toHaveLength(1);
+    expect(worker.input()).toBe(originalInput);
+  }, 100_000);
 });
