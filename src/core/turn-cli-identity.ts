@@ -51,6 +51,7 @@ export interface DelegatedCliIdentity {
   credentialOpenId: string;
   tools: TriggerUserAuthTool[];
   dispatchRoot: string;
+  denialReason?: 'target_access_denied' | 'target_validation_unavailable';
 }
 
 export interface PublishTurnIdentityArgs {
@@ -112,12 +113,17 @@ export async function publishTurnCliIdentity(
 }
 
 function denyDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs, user: DelegatedCliIdentity): ToolIdentityOutcome {
+  const reason = user.denialReason === 'target_validation_unavailable'
+    ? 'Target user or group membership verification is unavailable. Restore verification before retrying; logging in again will not fix this check.'
+    : user.denialReason === 'target_access_denied'
+      ? 'The requesting user could not be granted access to the target bot/chat. Check target access and group membership; do not request another login.'
+      : 'The source must ask the original human to authorize.';
   try {
     writeSessionIdentity(args.sessionDataDir, args.sessionId, {
       tool, mode: 'denied', ...(args.turnId ? { turnId: args.turnId } : {}),
-      message: `botmux: delegated ${tool} authorization unavailable for the requesting user. `
+      message: `botmux: delegated ${tool} execution refused for the requesting user. `
         + `Report this blocker with botmux report --dispatch-root ${user.dispatchRoot}; `
-        + 'the source must ask the original human to authorize. Do not ask a bot to log in or use another identity.',
+        + reason + ' Do not ask a bot to log in or use another identity.',
     });
   } catch {
     clearSessionIdentity(args.sessionDataDir, args.sessionId, tool);

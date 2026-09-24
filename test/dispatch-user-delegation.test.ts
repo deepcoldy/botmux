@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { authorityForDispatch, deliverDispatchWithUser, dispatchUserStorePath,
+import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, dispatchUserStorePath,
   resolveDispatchUser, signDispatchUser, verifyDispatchUser,
   type DispatchUserPayload } from '../src/core/dispatch-user-delegation.js';
 
@@ -27,6 +27,23 @@ const deliver = (messageId = 'om_kickoff', who = 'alice') => deliverDispatchWith
 });
 
 describe('daemon-derived dispatch authority', () => {
+  it('never delegates a schedule creator as the triggering human', async () => {
+    const resolveUnionId = vi.fn(async () => 'on_alice');
+    expect(await authorityForDispatch({ sourceAppId: 'cli_source', tools: ['bytedcli'],
+      caller: { senderType: 'user', source: 'schedule_creator', requestLarkAppId: 'cli_source', requestUserOpenId: 'ou_alice_source', requestUserUnionId: 'on_alice' }, resolveUnionId,
+    })).toBeUndefined();
+    expect(resolveUnionId).not.toHaveBeenCalled();
+  });
+  it.each([undefined, true, false])('restored caller requires positive human evidence (isBot=%s)', isBot => {
+    const caller = dispatchCallerFromReply('cli_source', { senderOpenId: 'ou_alice',
+      participants: [{ openId: 'ou_alice', name: 'Alice', isBot }],
+    });
+    if (isBot === false) expect(caller?.requestUserOpenId).toBe('ou_alice');
+    else expect(caller).toBeUndefined();
+    expect(dispatchCallerFromReply('cli_source', { senderOpenId: 'ou_alice',
+      participants: [{ openId: 'ou_other', name: 'Other', isBot: false }],
+    })).toBeUndefined();
+  });
   it('resolves a human through its issuing app; never assumes source open_id is global', async () => {
     const resolveUnionId = vi.fn(async () => 'on_alice');
     expect(await authorityForDispatch({ sourceAppId: 'cli_source', tools: ['bytedcli'],
@@ -57,6 +74,18 @@ describe('daemon-derived dispatch authority', () => {
 });
 
 describe('message-bound signed delegation', () => {
+  it('does not wait on a pending grant at or beyond the 30s freshness boundary', async () => {
+    vi.useFakeTimers();
+    try {
+      const p = { ...payload(), issuedAt: Date.now() - 30_000, messageId: undefined };
+      writeFileSync(dispatchUserStorePath(dataDir), JSON.stringify({ 'pending:stale': signDispatchUser(secret, p) }));
+      let finished = false;
+      const resolution = resolve({ waitMs: 5000 }).then(value => { finished = true; return value; });
+      await Promise.resolve();
+      expect(finished).toBe(true);
+      await expect(resolution).resolves.toBeUndefined();
+    } finally { vi.useRealTimers(); }
+  });
   it('rejects edits to every identity and routing field and a different key', () => {
     const value = payload();
     const signed = signDispatchUser(secret, value);

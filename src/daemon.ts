@@ -347,7 +347,7 @@ import {
   closeCliMismatchedSessionsForBot,
 } from './core/session-manager.js';
 import { publishTurnCliIdentity } from './core/turn-cli-identity.js';
-import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, DISPATCH_USER_DELIVERY_ROUTE } from './core/dispatch-user-delegation.js';
+import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES } from './core/dispatch-user-delegation.js';
 import { resolveUnionIdFromOpenId } from './im/lark/client.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
@@ -3767,6 +3767,12 @@ function prepareTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void
 async function dispatchUserForTurn(ds: DaemonSession, turnId: string) {
   const reply = pickTurnReplyTarget(ds.session, turnId);
   if (!reply) return undefined;
+  const active = ds.activeInteractiveTurn;
+  const caller = active?.turnId === turnId ? active.caller : dispatchCallerFromReply(ds.larkAppId, reply);
+  // A positively identified human already has a platform identity. Their turn
+  // does not depend on the unrelated delegation store being readable.
+  if (caller?.senderType === 'user' && !caller.source
+    && caller.requestLarkAppId === ds.larkAppId && caller.requestUserOpenId) return undefined;
   return resolveDispatchUser({
     dataDir: config.session.dataDir,
     secret: loadOrCreateDashboardSecret(dispatchReportBindingSecretPath(config.session.dataDir)),
@@ -3800,14 +3806,17 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
       // lookup throws; never turn this back into "ask the peer bot to log in".
       delegatedIdentity = {
         credentialOpenId: delegation.authority.openId, tools: [], dispatchRoot: delegation.rootId,
+        denialReason: 'target_access_denied',
       };
       const targetOpenId = await targetUserForDelegation(ds, delegation.authority);
       if (targetOpenId) delegatedIdentity = {
         ...delegatedIdentity, targetOpenId, tools: delegation.authority.tools,
+        denialReason: undefined,
       };
     }
   } catch (error) {
     delegationBlocked = true;
+    if (delegatedIdentity) delegatedIdentity.denialReason = 'target_validation_unavailable';
     logger.warn(`[dispatch-user] identity unavailable for ${ds.session.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
   }
   await publishTurnCliIdentity({
@@ -6500,8 +6509,13 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
 // It observes the live caller itself and signs only the message it actually sends.
 ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
   let body: any;
-  try { body = await readJsonBody(req, DISPATCH_REPORT_REGISTER_MAX_BYTES); }
-  catch { return jsonRes(res, 400, { ok: false, error: 'bad_dispatch_body' }); }
+  try { body = await readJsonBody(req, DISPATCH_USER_DELIVERY_MAX_BYTES); }
+  catch (error) {
+    if (error instanceof JsonBodyTooLargeError) {
+      return jsonRes(res, 413, { ok: false, error: 'dispatch_body_too_large', maxBytes: DISPATCH_USER_DELIVERY_MAX_BYTES });
+    }
+    return jsonRes(res, 400, { ok: false, error: 'bad_dispatch_body' });
+  }
   const ds = typeof body?.sessionId === 'string' ? findActiveBySessionId(body.sessionId) : undefined;
   const verified = authorizeSessionScopedIpc({
     trustedHost: isTrustedHostIpcRequest(req), sessionExists: !!ds,
@@ -6539,11 +6553,13 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     const bot = getBot(ds.larkAppId).config;
     const turnId = ds.managedTurnOrigin?.turnId;
     const active = ds.activeInteractiveTurn;
-    const inherited = turnId ? await dispatchUserForTurn(ds, turnId) : undefined;
+    const needsDelegation = targetAppIds.length > 0 && bot.triggerUserAuth?.enabled === true
+      && bot.triggerUserAuth.tools.length > 0;
+    const inherited = needsDelegation && turnId ? await dispatchUserForTurn(ds, turnId) : undefined;
     if (inherited && !await targetUserForDelegation(ds, inherited.authority)) {
       return jsonRes(res, 403, { ok: false, error: 'delegated_caller_not_allowed' });
     }
-    const authority = turnId ? await authorityForDispatch({
+    const authority = needsDelegation && turnId ? await authorityForDispatch({
       sourceAppId: ds.larkAppId,
       caller: active?.turnId === turnId ? active.caller
         : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId)),

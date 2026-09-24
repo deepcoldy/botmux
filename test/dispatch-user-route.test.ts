@@ -2,10 +2,12 @@
 import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { Readable } from 'node:stream';
 import ts from 'typescript';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser } from '../src/core/dispatch-user-delegation.js';
+import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, DISPATCH_USER_DELIVERY_MAX_BYTES } from '../src/core/dispatch-user-delegation.js';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
+import { readJsonBody, JsonBodyTooLargeError } from '../src/core/dashboard-ipc-server.js';
 
 const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
 const route = source.statements.find(node => ts.isExpressionStatement(node) && ts.isCallExpression(node.expression)
@@ -32,7 +34,7 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
   const send = vi.fn(async () => 'om_kickoff');
   const resolveUnionIdFromOpenId = vi.fn(async () => 'on_alice');
   const scope: any = {
-    readJsonBody: async () => body, DISPATCH_REPORT_REGISTER_MAX_BYTES: 65536,
+    readJsonBody: async () => body, DISPATCH_USER_DELIVERY_MAX_BYTES, JsonBodyTooLargeError,
     findActiveBySessionId: (id: string) => id === ds.session.sessionId ? ds : undefined,
     authorizeSessionScopedIpc, isTrustedHostIpcRequest: () => isHost, selfDaemonLarkAppId: 'cli_source',
     jsonRes: (_res: unknown, status: number, value: any) => ({ status, value }),
@@ -46,11 +48,40 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
     config: { session: { dataDir } }, loadOrCreateDashboardSecret: () => secret, dispatchReportBindingSecretPath: () => '',
   };
   const run = new Function('scope', 'with (scope) { ' + code + '; return handler; }')(scope);
-  return { ds, scope, send, run: () => run({}, {}) };
+  return { ds, scope, send, body, run: (req: unknown = {}) => run(req, {}) };
 }
 const read = () => resolveDispatchUser({ dataDir, secret, appId: 'cli_target', chatId: 'oc_target', rootId: 'om_root', turnId: 'om_kickoff', waitMs: 0 });
 
 describe('dispatch user IPC end-to-end identity binding', () => {
+  it.each(['legacy', 'disabled', 'no-tools'])('does not resolve delegation when it is not requested (%s)', async mode => {
+    const h = harness(mode === 'legacy' ? { targetAppIds: [], hasLegacyBots: true } : {});
+    delete h.ds.activeInteractiveTurn.caller.requestUserUnionId;
+    if (mode !== 'legacy') h.scope.getBot = () => ({ config: { triggerUserAuth: {
+      enabled: mode !== 'disabled', tools: mode === 'disabled' ? ['bytedcli'] : [],
+    } } });
+    h.scope.dispatchUserForTurn = vi.fn(async () => { throw new Error('corrupt store'); });
+    h.scope.resolveUnionIdFromOpenId = vi.fn(async () => { throw new Error('contact unavailable'); });
+    expect((await h.run()).status).toBe(200);
+    expect(h.send).toHaveBeenCalledOnce();
+    expect(h.scope.dispatchUserForTurn).not.toHaveBeenCalled();
+    expect(h.scope.resolveUnionIdFromOpenId).not.toHaveBeenCalled();
+    expect(await read()).toBeUndefined();
+  });
+  it.each([0, 1])('enforces the complete UTF-8 body boundary (extra bytes=%s)', async extra => {
+    const h = harness({ targetAppIds: [], content: '授权测试' });
+    const prefixBytes = Buffer.byteLength(JSON.stringify(h.body));
+    h.body.content += 'x'.repeat(DISPATCH_USER_DELIVERY_MAX_BYTES - prefixBytes + extra);
+    const bytes = Buffer.from(JSON.stringify(h.body));
+    const req = Readable.from([bytes.subarray(0, 30000), bytes.subarray(30000)]) as any;
+    req.headers = {}; // Exercise streaming byte counting, not just Content-Length.
+    h.scope.readJsonBody = readJsonBody;
+    const result = await h.run(req);
+    expect(result.status).toBe(extra ? 413 : 200);
+    if (extra) {
+      expect(result.value).toEqual({ ok: false, error: 'dispatch_body_too_large', maxBytes: DISPATCH_USER_DELIVERY_MAX_BYTES });
+      expect(h.send).not.toHaveBeenCalled();
+    } else expect(h.send).toHaveBeenCalledOnce();
+  });
   it.each([false, true])('ignores claimed user identity and binds the actual sent message (host=%s)', async host => {
     const h = harness({ user: 'mallory', requested_by: 'mallory', authority: { openId: 'ou_mallory' }, sourceTurnId: 'forged' }, host);
     expect(await h.run()).toEqual({ status: 200, value: { ok: true, messageId: 'om_kickoff' } });

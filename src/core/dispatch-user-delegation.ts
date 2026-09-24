@@ -8,6 +8,8 @@ import { updateDispatchRegistry } from './dispatch-registry.js';
 import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 
 export const DISPATCH_USER_DELIVERY_ROUTE = '/api/dispatch-user/deliver';
+/** Limit the complete UTF-8 JSON request, including routing and encoded brief. */
+export const DISPATCH_USER_DELIVERY_MAX_BYTES = 64 * 1024;
 const identity = (prefix: string) => z.string().regex(new RegExp(`^${prefix}[A-Za-z0-9_-]{1,128}$`));
 const authoritySchema = z.object({
   appId: identity('cli_'),

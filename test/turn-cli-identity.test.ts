@@ -15,7 +15,7 @@
  * Run:  npx vitest run --project unit test/turn-cli-identity.test.ts
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -385,9 +385,9 @@ describe('verified cross-bot delegation', () => {
 });
 
 describe('target daemon consumes signed message authority', () => {
-  async function targetHarness(options: { mapping?: 'resolved' | 'transient'; member?: boolean; talk?: boolean; scope?: 'chat' | 'thread' } = {}) {
+  async function targetHarness(options: { mapping?: 'resolved' | 'transient'; member?: boolean; memberError?: boolean; talk?: boolean; scope?: 'chat' | 'thread' } = {}) {
     const ts = (await import('typescript')).default;
-    const { deliverDispatchWithUser, resolveDispatchUser } = await import('../src/core/dispatch-user-delegation.js');
+    const { deliverDispatchWithUser, resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
     const { pickTurnReplyTarget } = await import('../src/core/reply-target.js');
     const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
     const code = ['dispatchUserForTurn', 'targetUserForDelegation', 'refreshTurnCliIdentity'].map(name => {
@@ -410,16 +410,64 @@ describe('target daemon consumes signed message authority', () => {
     const resolveTargetAppOpenId = vi.fn(async () => options.mapping === 'transient'
       ? { status: 'transient' } : { status: 'resolved', openId: 'ou_alice_target' });
     const scopeValues = {
-      config: { session: { dataDir: dir } }, pickTurnReplyTarget, resolveDispatchUser,
+      config: { session: { dataDir: dir } }, pickTurnReplyTarget, resolveDispatchUser, dispatchCallerFromReply,
       getBot: () => ({ config: botConfig({ enabled: true, tools: ['bytedcli'] }) }),
       loadOrCreateDashboardSecret: () => secret, dispatchReportBindingSecretPath: () => '',
       resolveTargetAppOpenId, evaluateTalk: () => ({ allowed: options.talk !== false }),
-      listChatMemberOpenIds: async () => options.member === false ? [] : ['ou_alice_target'],
+      listChatMemberOpenIds: async () => {
+        if (options.memberError) throw new Error('member list exceeds 2000 members');
+        return options.member === false ? [] : ['ou_alice_target'];
+      },
       publishTurnCliIdentity, localeForBot: () => 'en', logger: { warn: vi.fn() },
     };
     const run = new Function('scope', 'with (scope) { ' + code + '; return refreshTurnCliIdentity; }')(scopeValues);
-    return { ds, run: (turnId = 'om_kickoff') => run(ds, turnId), resolveTargetAppOpenId };
+    return { ds, scopeValues, run: (turnId = 'om_kickoff') => run(ds, turnId), resolveTargetAppOpenId };
   }
+  it.each(['live', 'restored'])('a proven human turn does not depend on the delegation store (%s)', async mode => {
+    const h = await targetHarness();
+    writeFileSync(join(dir, 'dispatch-user-delegations.json'), 'corrupt-json');
+    h.ds.session.replyTargets.om_human = { senderOpenId: BOB, rootMessageId: 'om_root', updatedAt: new Date().toISOString(),
+      ...(mode === 'restored' ? { participants: [{ openId: BOB, isBot: false }] } : {}),
+    };
+    if (mode === 'live') h.ds.activeInteractiveTurn = { turnId: 'om_human', caller: {
+      senderType: 'user', requestLarkAppId: APP, requestUserOpenId: BOB,
+    } };
+    bytedcliJwts.set(BOB, { cloudJwt: 'direct-human' });
+    await h.run('om_human');
+    expect(readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8')).toContain('direct-human');
+    expect(h.resolveTargetAppOpenId).not.toHaveBeenCalled();
+  });
+  it('a delegated bot turn still refuses a corrupt delegation store', async () => {
+    const h = await targetHarness();
+    writeFileSync(join(dir, 'dispatch-user-delegations.json'), 'corrupt-json');
+    bytedcliJwts.set(ALICE, { cloudJwt: 'must-not-leak' });
+    bytedcliJwts.set('ou_peer', { cloudJwt: 'must-not-use-peer' });
+    await h.run();
+    const env = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
+    expect(env).not.toContain('must-not-');
+  });
+  it.each(['participants', 'quote'])('does not publish a peer bot as a human (%s)', async evidence => {
+    const h = await targetHarness();
+    h.ds.session.replyTargets.om_peer = { senderOpenId: 'ou_peer', rootMessageId: 'om_root', updatedAt: new Date().toISOString(),
+      ...(evidence === 'participants' ? { participants: [{ openId: 'ou_peer', isBot: true }] } : {}),
+    };
+    if (evidence === 'quote') {
+      h.ds.session.quoteTargetId = 'om_peer'; h.ds.session.quoteTargetSenderIsBot = true;
+    }
+    bytedcliJwts.set('ou_peer', { cloudJwt: 'must-not-use-peer' });
+    await h.run('om_peer');
+    expect(readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8')).not.toContain('must-not-use-peer');
+  });
+  it('reports unavailable member verification without telling the human to log in again', async () => {
+    const h = await targetHarness({ memberError: true });
+    bytedcliJwts.set(ALICE, { cloudJwt: 'must-not-leak' });
+    await h.run();
+    const env = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
+    expect(env).toContain('membership verification is unavailable');
+    expect(env).toContain('report --dispatch-root om_root');
+    expect(env).not.toContain('ask the original human to authorize');
+    expect(env).not.toContain('must-not-leak');
+  });
   it.each(['chat', 'thread'] as const)('publishes original credentials after signed dispatch + cross-app resolution (%s)', async scope => {
     const h = await targetHarness({ scope });
     bytedcliJwts.set(ALICE, { cloudJwt: 'original-user' });
