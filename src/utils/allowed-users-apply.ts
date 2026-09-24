@@ -31,6 +31,12 @@ export interface AllowedUsersResolveResultLike {
    * `definitive` (safest: never revived from cache).
    */
   entryStatus?: Map<string, EntryResolveStatus>;
+  /**
+   * True when batch contact resolution encountered a permanent API error code
+   * (e.g. 40001 invalid argument, 99991672 missing scope, 41050 not visible)
+   * rather than an in-flight network timeout/transient.
+   */
+  hasPermanentBatchError?: boolean;
 }
 
 export interface ApplyAllowedUsersResolveInput {
@@ -70,6 +76,11 @@ export interface ApplyAllowedUsersResolveOutput {
    * Indicates owner authorization remains 100% operational despite upstream API blips.
    */
   fullyRecovered: boolean;
+  /**
+   * True when fallback was triggered by a permanent API error (e.g. 40001, 99991672)
+   * requiring operator intervention, rather than an in-flight network transient.
+   */
+  hasPermanentBatchError?: boolean;
 }
 
 /** Config entries that require a contact resolve (email / union / literal ou_ / mobile). */
@@ -184,5 +195,6 @@ export function applyAllowedUsersResolve(
   }
 
   const fullyRecovered = usedFallback && !transientMissWithoutCache && resolved.length > 0;
-  return { resolved, map: outMap, usedFallback, failed: true, notice, fullyRecovered };
+  const hasPermanentBatchError = input.resolveResult.hasPermanentBatchError === true;
+  return { resolved, map: outMap, usedFallback, failed: true, notice, fullyRecovered, hasPermanentBatchError };
 }

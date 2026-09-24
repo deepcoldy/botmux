@@ -273,6 +273,8 @@ describe('resolve → apply end-to-end: email-only owner + batch error keeps own
     // key is NOT in the definitive set, so a caller pruning definitives keeps it.
     expect(applied.resolved).toEqual(['ou_owner']);
     expect(applied.usedFallback).toBe(true);
+    expect(applied.fullyRecovered).toBe(true);
+    expect(applied.hasPermanentBatchError).toBe(true);
     expect(applied.failed).toBe(true);
     expect(applied.map.get('owner@corp.com')).toBe('ou_owner');
     const definitives = [...resolveResult.entryStatus.entries()]
@@ -294,5 +296,48 @@ describe('resolve → apply end-to-end: email-only owner + batch error keeps own
     expect(applied.resolved).toEqual([]);
     expect(applied.failed).toBe(true); // NOT a silent success — owner-lockout is surfaced + retried
     expect(applied.notice).toBeTruthy();
+  });
+
+  it('permanent batch error (99991672 missing scope) does not retry in-place and sets hasPermanentBatchError', async () => {
+    let callCount = 0;
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => {
+        callCount++;
+        return { code: 99991672, msg: 'Access denied: missing scope' };
+      },
+    );
+    const resolveResult = await resolveAllowedUsersWithMap(APP, ['owner@corp.com']);
+    expect(callCount).toBe(1); // permanent error: no useless immediate retry
+    expect(resolveResult.hasPermanentBatchError).toBe(true);
+    expect(resolveResult.entryStatus.get('owner@corp.com')).toBe('transient');
+
+    const applied = applyAllowedUsersResolve({
+      rawEntries: ['owner@corp.com'],
+      previousResolvedMap: { 'owner@corp.com': 'ou_cached_owner' },
+      resolveResult,
+    });
+    expect(applied.resolved).toEqual(['ou_cached_owner']);
+    expect(applied.fullyRecovered).toBe(true);
+    expect(applied.hasPermanentBatchError).toBe(true); // daemon will NOT silence DM for permanent errors
+  });
+
+  it('pure transient error with cached owner sets fullyRecovered=true and hasPermanentBatchError=false', async () => {
+    stubClient(
+      async () => ({ code: 0, data: { user: {} } }),
+      async () => { throw new Error('timeout of 15000ms exceeded'); },
+    );
+    const resolveResult = await resolveAllowedUsersWithMap(APP, ['owner@corp.com']);
+    expect(resolveResult.hasPermanentBatchError).toBeFalsy();
+    expect(resolveResult.entryStatus.get('owner@corp.com')).toBe('transient');
+
+    const applied = applyAllowedUsersResolve({
+      rawEntries: ['owner@corp.com'],
+      previousResolvedMap: { 'owner@corp.com': 'ou_cached_owner' },
+      resolveResult,
+    });
+    expect(applied.resolved).toEqual(['ou_cached_owner']);
+    expect(applied.fullyRecovered).toBe(true);
+    expect(applied.hasPermanentBatchError).toBe(false); // daemon can safely silence initial DM
   });
 });

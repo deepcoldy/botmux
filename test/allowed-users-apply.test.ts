@@ -199,4 +199,20 @@ describe('applyAllowedUsersResolve', () => {
     expect(out.failed).toBe(true);
     expect(out.fullyRecovered).toBe(false);
   });
+
+  it('propagates hasPermanentBatchError flag to output', () => {
+    const out = applyAllowedUsersResolve({
+      rawEntries: ['on_cached'],
+      previousResolvedMap: { on_cached: 'ou_cached' },
+      resolveResult: {
+        ...result([], [['on_cached', 'transient']], true),
+        hasPermanentBatchError: true,
+      },
+    });
+
+    expect(out.resolved).toEqual(['ou_cached']);
+    expect(out.usedFallback).toBe(true);
+    expect(out.fullyRecovered).toBe(true);
+    expect(out.hasPermanentBatchError).toBe(true);
+  });
 });

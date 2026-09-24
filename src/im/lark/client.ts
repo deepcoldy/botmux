@@ -1662,9 +1662,20 @@ export async function resolveTargetAppOpenId(
   }
 }
 
+function isPermanentContactErrorCode(code: number | undefined): boolean {
+  return (
+    code === 40001 ||
+    code === 41012 ||
+    code === 41050 ||
+    code === 99991672 ||
+    code === 99991679 ||
+    code === 99992361
+  );
+}
+
 /**
  * Retry a contact API operation on transient failure (network timeout / 5xx / rate limit).
- * Definitive errors (invalid_id / not_visible / cross_app) fail immediately without retry.
+ * Definitive / permanent errors (invalid_id / not_visible / cross_app / missing scope) fail immediately without retry.
  */
 async function retryContactTransient(
   op: () => Promise<any>,
@@ -1679,8 +1690,8 @@ async function retryContactTransient(
       const res = await op();
       const code = (res as any)?.code;
       if (typeof code === 'number' && code !== 0) {
-        const definitive = classifyContactErrorCode(code);
-        if (!definitive && attempt < maxAttempts) {
+        const permanent = !!classifyContactErrorCode(code) || isPermanentContactErrorCode(code);
+        if (!permanent && attempt < maxAttempts) {
           logger.warn(`[contact-resolve] ${opts.label ?? 'op'} transient code=${code}, retrying attempt ${attempt}/${maxAttempts}...`);
           await new Promise(r => setTimeout(r, baseMs * attempt));
           continue;
@@ -1689,8 +1700,8 @@ async function retryContactTransient(
       return res;
     } catch (err: any) {
       const errCode = getLarkErrorCode(err);
-      const definitive = classifyContactErrorCode(errCode);
-      if (!definitive && attempt < maxAttempts) {
+      const permanent = !!classifyContactErrorCode(errCode) || isPermanentContactErrorCode(errCode);
+      if (!permanent && attempt < maxAttempts) {
         logger.warn(`[contact-resolve] ${opts.label ?? 'op'} threw (${err?.message ?? err}), retrying attempt ${attempt}/${maxAttempts}...`);
         await new Promise(r => setTimeout(r, baseMs * attempt));
         continue;
@@ -1702,13 +1713,20 @@ async function retryContactTransient(
 
 export async function resolveAllowedUsersWithMap(
   larkAppId: string, raw: string[],
-): Promise<{ resolved: string[]; map: Map<string, string>; errored?: boolean; entryStatus: Map<string, EntryResolveStatus> }> {
+): Promise<{
+  resolved: string[];
+  map: Map<string, string>;
+  errored?: boolean;
+  entryStatus: Map<string, EntryResolveStatus>;
+  hasPermanentBatchError?: boolean;
+}> {
   const map = new Map<string, string>();
   // True when a TRANSIENT failure (throw / rate limit / server error) hit any
   // requested item — the caller can then say "resolution failed, retry" instead
   // of the misleading "this identifier does not exist". Definitive failures
   // (id invalid / not visible: DEFINITIVE_CONTACT_ERROR_CODES) don't set it.
   let errored = false;
+  let hasPermanentBatchError = false;
   // Per-raw-entry outcome so callers can fall back to a last-known-good cache
   // ONLY for entries that transient-failed AND are still configured — never for
   // definitively-removed users (revives ex-owners) or entries no longer in
@@ -1786,12 +1804,15 @@ export async function resolveAllowedUsersWithMap(
           // non-definitive code (network/5xx/rate-limit) is transient.
           const definitive = res?.code === 0 ? true : !!classifyContactErrorCode(res?.code);
           if (!definitive) errored = true;
+          if (isPermanentContactErrorCode(res?.code)) hasPermanentBatchError = true;
           entryStatus.set(uid, definitive ? 'definitive' : 'transient');
           logger.warn(`Failed to resolve union_id ${uid} to open_id: ${res?.msg} (code: ${res?.code})`);
         }
       } catch (err: any) {
-        const definitive = !!classifyContactErrorCode(getLarkErrorCode(err));
+        const errCode = getLarkErrorCode(err);
+        const definitive = !!classifyContactErrorCode(errCode);
         if (!definitive) errored = true;
+        if (isPermanentContactErrorCode(errCode)) hasPermanentBatchError = true;
         entryStatus.set(uid, definitive ? 'definitive' : 'transient');
         logger.warn(`resolve union_id ${uid} failed: ${err?.message ?? err}`);
       }
@@ -1816,6 +1837,9 @@ export async function resolveAllowedUsersWithMap(
           // (retry-eligible, cache-fallback-eligible). Only a code-0 response
           // that omits a specific email (below) is a per-entry definitive miss.
           errored = true;
+          if (isPermanentContactErrorCode(res.code)) {
+            hasPermanentBatchError = true;
+          }
           for (const rawEmail of emails) entryStatus.set(rawEmail, 'transient');
           logger.warn(`Failed to resolve emails to open_ids: ${res.msg} (code: ${res.code})`);
         } else {
@@ -1847,6 +1871,10 @@ export async function resolveAllowedUsersWithMap(
         // NOT a per-email identity verdict, so every requested email is
         // transient (retry + cache-fallback eligible), never definitive.
         errored = true;
+        const errCode = getLarkErrorCode(err);
+        if (isPermanentContactErrorCode(errCode)) {
+          hasPermanentBatchError = true;
+        }
         for (const rawEmail of emails) entryStatus.set(rawEmail, 'transient');
         logger.warn(`resolveAllowedUsers failed: ${err.message}`);
       }
@@ -1869,6 +1897,9 @@ export async function resolveAllowedUsersWithMap(
           // Whole-request failure — not a per-mobile verdict. Mark every
           // requested mobile TRANSIENT so a real owner isn't fail-closed out.
           errored = true;
+          if (isPermanentContactErrorCode(res.code)) {
+            hasPermanentBatchError = true;
+          }
           for (const norm of mobiles) {
             const rawEntry = mobileRawByNorm.get(norm) ?? norm;
             entryStatus.set(rawEntry, 'transient');
@@ -1912,6 +1943,10 @@ export async function resolveAllowedUsersWithMap(
         }
       } catch (err: any) {
         errored = true;
+        const errCode = getLarkErrorCode(err);
+        if (isPermanentContactErrorCode(errCode)) {
+          hasPermanentBatchError = true;
+        }
         for (const norm of mobiles) {
           const rawEntry = mobileRawByNorm.get(norm) ?? norm;
           entryStatus.set(rawEntry, 'transient');
@@ -1934,7 +1969,7 @@ export async function resolveAllowedUsersWithMap(
       resolved.push(oid);
     }
   }
-  return { resolved, map, errored, entryStatus };
+  return { resolved, map, errored, entryStatus, hasPermanentBatchError };
 }
 
 /**

@@ -4612,10 +4612,10 @@ function notifyAllowedUsersResolveFailure(
 function scheduleAllowedUsersResolveRetry(larkAppId: string, attempt = 1): void {
   if (attempt > 3) {
     // Retries exhausted (startup + 3 retries all degraded). Don't just fall
-    // silent — the owner has been locked out for ~7.5 min and auto-recovery
+    // silent — the owner has been locked out or degraded for ~7.5 min and auto-recovery
     // won't try again. Emit a terminal notice so they know to intervene. Only
-    // when the allowlist is still actually broken: a config change or a bot
-    // teardown mid-retry is not an exhaustion worth alarming on.
+    // when the allowlist is still actually broken or running degraded on cache:
+    // a config change or a bot teardown mid-retry is not an exhaustion worth alarming on.
     try {
       const bot = getBot(larkAppId);
       const stillConfigured = (bot.config.allowedUsers ?? []).length > 0;
@@ -4625,6 +4625,13 @@ function scheduleAllowedUsersResolveRetry(larkAppId: string, attempt = 1): void 
           larkAppId,
           `allowedUsers 自动解析在启动后重试 3 次仍失败，运行时白名单为空 —— 期间包括你在内的所有人都会被拒。` +
           `请检查网络 / 飞书 contact API 后执行 \`botmux restart\` 重新解析。`,
+          bot.resolvedAllowedUsers ?? [],
+        );
+      } else if (stillConfigured) {
+        notifyAllowedUsersResolveFailure(
+          larkAppId,
+          `allowedUsers 自动解析在启动后重试 3 次仍失败，当前仍依赖本地缓存兜底运行（对话暂未受阻，但无法同步最新人员变更）。` +
+          `请检查飞书通讯录权限（如 contact:user.id:readonly 权限）或网络后执行 \`botmux restart\` 重新解析。`,
           bot.resolvedAllowedUsers ?? [],
         );
       }
@@ -26740,8 +26747,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           });
           logger.info(`[${cfg.larkAppId}] Resolved allowedUsers: ${bot.resolvedAllowedUsers.join(', ') || '(empty)'}${applied.usedFallback ? ' [some from cache]' : ''}`);
           if (applied.failed && applied.notice) {
-            if (applied.fullyRecovered) {
-              logger.warn(`[${cfg.larkAppId}] ${applied.notice} (cached fallback active, silenced owner DM; scheduled retry)`);
+            if (applied.fullyRecovered && !applied.hasPermanentBatchError) {
+              logger.warn(`[${cfg.larkAppId}] ${applied.notice} (cached fallback active for transient error, silenced owner DM; scheduled retry)`);
             } else {
               notifyAllowedUsersResolveFailure(cfg.larkAppId, applied.notice, applied.resolved);
             }
