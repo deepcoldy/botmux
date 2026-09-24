@@ -310,7 +310,7 @@ describe('antigravity-cot', () => {
       expect(isAntigravityTranscriptBusy(file)).toBe(false);
     });
 
-    it('returns true when tool call record is longer than initial read buffer (e.g. 10KB+)', () => {
+    it('returns true when tool call record is longer than the former 8KB read buffer', () => {
       const file = join(tmpDir, 'large-tool-call.jsonl');
       writeFileSync(
         file,
@@ -321,6 +321,33 @@ describe('antigravity-cot', () => {
         }) + '\n',
       );
       expect(isAntigravityTranscriptBusy(file)).toBe(true);
+    });
+
+    it.each(['CHECKPOINT', 'TASK_NOTIFICATION', 'SYSTEM_MESSAGE'])(
+      'keeps active work busy when a large tool call is followed by %s',
+      (type) => {
+        const file = join(tmpDir, 'large-tool-with-notification.jsonl');
+        writeFileSync(file, [
+          { source: 'MODEL', type: 'PLANNER_RESPONSE', tool_calls: [
+            { name: 'write_file', args: { content: 'x'.repeat(100_000) } },
+          ] },
+          { source: 'SYSTEM', type, content: 'state notification' },
+        ].map(record => JSON.stringify(record)).join('\n') + '\n');
+
+        expect(isAntigravityTranscriptBusy(file)).toBe(true);
+      },
+    );
+
+    it('finds a completed response behind a large checkpoint and later notification', () => {
+      const file = join(tmpDir, 'completed-before-large-checkpoint.jsonl');
+      writeFileSync(file, [
+        { source: 'USER_EXPLICIT', type: 'USER_INPUT', content: 'work' },
+        { source: 'MODEL', type: 'PLANNER_RESPONSE', content: 'done' },
+        { source: 'SYSTEM', type: 'CHECKPOINT', content: 'x'.repeat(100_000) },
+        { source: 'SYSTEM', type: 'TASK_NOTIFICATION', content: 'state notification' },
+      ].map(record => JSON.stringify(record)).join('\n') + '\n');
+
+      expect(isAntigravityTranscriptBusy(file)).toBe(false);
     });
   });
 });

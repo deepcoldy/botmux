@@ -140,10 +140,10 @@ export function isAntigravityTranscriptBusy(transcriptPath: string): boolean {
       const stats = fstatSync(fd);
       if (stats.size === 0) return false;
 
-      // Read from end, expanding buffer if needed so records > 8KB parse completely
+      // Expand until a lifecycle record is found. A complete checkpoint or
+      // notification is not enough: the preceding tool call may be truncated
+      // at this window's start and still needs a larger read.
       let chunkSize = Math.min(stats.size, 64 * 1024);
-      let lines: string[] = [];
-      let parsedAtLeastOne = false;
 
       while (chunkSize <= stats.size) {
         const buf = Buffer.alloc(chunkSize);
@@ -152,57 +152,39 @@ export function isAntigravityTranscriptBusy(transcriptPath: string): boolean {
         const rawLines = text.split('\n');
         const candidateLines = stats.size > chunkSize ? rawLines.slice(1) : rawLines;
         for (let i = candidateLines.length - 1; i >= 0; i--) {
-          const trimmed = candidateLines[i].trim();
-          if (!trimmed) continue;
+          const line = candidateLines[i].trim();
+          if (!line) continue;
+          let rec: any;
           try {
-            JSON.parse(trimmed);
-            parsedAtLeastOne = true;
-            break;
+            rec = JSON.parse(line);
           } catch {
-            // Not a complete line
+            continue;
           }
-        }
-        if (parsedAtLeastOne || chunkSize >= stats.size || chunkSize >= 1024 * 1024) {
-          lines = candidateLines;
-          break;
-        }
-        chunkSize = Math.min(stats.size, chunkSize * 4);
-      }
 
-      for (let i = lines.length - 1; i >= 0; i--) {
-        const line = lines[i].trim();
-        if (!line) continue;
-        let rec: any;
-        try {
-          rec = JSON.parse(line);
-        } catch {
-          continue;
-        }
-
-        const type = rec?.type;
-        if (type === 'ERROR_MESSAGE' || type === 'ERROR') {
-          return false;
-        }
-        if (type === 'SYSTEM_MESSAGE') {
-          const content = String(rec?.content ?? '');
-          if (/cancell?ed|interrupted|aborted/i.test(content)) {
+          const type = rec?.type;
+          if (type === 'ERROR_MESSAGE' || type === 'ERROR') {
             return false;
           }
-          // Non-cancel system messages (e.g. system notifications) don't dictate terminal state; inspect prior record
-          continue;
-        }
-        if (type === 'CHECKPOINT' || type === 'TASK_NOTIFICATION') {
-          continue;
-        }
-        if (type === 'PLANNER_RESPONSE') {
-          if (Array.isArray(rec.tool_calls) && rec.tool_calls.length > 0) {
+          if (type === 'SYSTEM_MESSAGE') {
+            const content = String(rec?.content ?? '');
+            if (/cancell?ed|interrupted|aborted/i.test(content)) {
+              return false;
+            }
+            // Non-cancel notifications do not dictate lifecycle state.
+            continue;
+          }
+          if (type === 'CHECKPOINT' || type === 'TASK_NOTIFICATION') {
+            continue;
+          }
+          if (type === 'PLANNER_RESPONSE') {
+            return Array.isArray(rec.tool_calls) && rec.tool_calls.length > 0;
+          }
+          if (type === 'GENERIC' || type === 'USER_INPUT') {
             return true;
           }
-          return false;
         }
-        if (type === 'GENERIC' || type === 'USER_INPUT') {
-          return true;
-        }
+        if (chunkSize >= stats.size || chunkSize >= 1024 * 1024) break;
+        chunkSize = Math.min(stats.size, chunkSize * 4);
       }
     } finally {
       closeSync(fd);
