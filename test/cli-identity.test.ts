@@ -19,6 +19,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, existsSync, wri
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  prepareTriggerUserCliEnv,
   renderIdentityEnv,
   renderIdentityWrapper,
   IDENTITY_DENIED_EXIT_CODE,
@@ -756,5 +757,35 @@ describe('gitIdentityConfigEnv', () => {
       expect(env[`GIT_CONFIG_VALUE_${i}`]).toBeTruthy();
     }
     expect(env[`GIT_CONFIG_KEY_${count}`]).toBeUndefined();
+  });
+});
+
+
+describe('tool-owning process identity environment', () => {
+  it('intercepts login-shell commands before viewer startup, then follows each turn and revocation', () => {
+    const bin = join(dir, 'real-bin');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'bytedcli'), '#!/bin/sh\nprintf "%s" "$BYTEDCLI_USER_CLOUD_JWT"\n', { mode: 0o755 });
+    const env: NodeJS.ProcessEnv = { HOME: dir, PATH: `${bin}:/usr/bin:/bin` };
+    prepareTriggerUserCliEnv(env, dir, SESSION, { enabled: true, tools: ['bytedcli'], fallback: 'none' }, () => {});
+    const run = () => execFileSync('/bin/bash', ['-lc', 'bytedcli'], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    // No native/viewer CLI has been spawned. The model-owning process already
+    // rejects absent identity rather than reaching the unwrapped binary.
+    expect(run).toThrow();
+    for (const [turnId, jwt] of [['turn-a', 'user-a-jwt'], ['turn-b', 'user-b-jwt']]) {
+      writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: jwt }, turnId);
+      publishActiveTurn(dir, SESSION, turnId);
+      expect(run()).toBe(jwt);
+      expect(env.BYTEDCLI_USER_CLOUD_JWT).toBeUndefined();
+    }
+    clearSessionIdentity(dir, SESSION, 'bytedcli');
+    expect(run).toThrow();
+    expect(env.GIT_ASKPASS).toBeTruthy();
+  });
+
+  it('leaves an ungoverned process environment untouched', () => {
+    const env = { PATH: '/usr/bin:/bin' };
+    prepareTriggerUserCliEnv(env, dir, SESSION, undefined, () => {});
+    expect(env).toEqual({ PATH: '/usr/bin:/bin' });
   });
 });

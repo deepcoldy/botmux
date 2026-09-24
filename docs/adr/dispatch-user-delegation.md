@@ -29,6 +29,8 @@
 - 不修改 CLI/backend 实现或改变沙箱隔离保证。macOS、Linux 使用相同的宿主 IPC、文件锁和签名格式；TCE 无沙箱时仍依赖既有宿主进程信任边界。
 - 本地代码和测试通过不等于已部署、已通过真实飞书/OAuth/Codebase 操作验收。PR 不变更运行中 fleet、TCC、发布版本或平台权限。
 
+Codex RPC 模式由 app-server 执行工具，必须在其启动和首轮提交之前安装与普通 CLI 相同的按人 wrapper、登录 shell 路径和 Git 凭据辅助程序；只配置终端 viewer 不构成鉴权。进程环境只携带本会话定位信息，凭据仍由 wrapper 每次调用按当前回合读取。
+
 ## 验证
 
 - 真实来源 IPC handler：隔离 CLI capability、宿主 HMAC 信任、伪造用户字段、过期 capability、跨群根消息、身份解析期间换回合、多跳派发。
