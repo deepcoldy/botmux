@@ -173,5 +173,25 @@ export function throttleReason(
   return null;
 }
 
-export function _resetForTest(): void { table.clear(); lastPrunedAt = 0; }
+/** owner 维度节流：转投 owner 私聊的申请卡，每个 (bot, owner) 滑动窗口内最多发这么多张。
+ *  上面的 per (chat, target) 节流只挡「同一个人反复申请」；私聊转投后任何能看到 bot 的人
+ *  都能让 owner 私聊收卡，需要再加一层总量上限，避免被大量不同申请人刷屏。 */
+const OWNER_DM_WINDOW_MS = 60 * 60 * 1000;
+export const OWNER_DM_MAX_PER_WINDOW = 20;
+const ownerDmSent = new Map<string, number[]>();
+
+/** 申请占用一个 owner 私聊发卡名额：窗口内未满 → 记账并返回 true；已满 → false（本次不发）。 */
+export function tryReserveOwnerDmSlot(larkAppId: string, ownerOpenId: string, now: number = Date.now()): boolean {
+  const k = `${larkAppId}:${ownerOpenId}`;
+  const recent = (ownerDmSent.get(k) ?? []).filter(ts => now - ts < OWNER_DM_WINDOW_MS);
+  if (recent.length >= OWNER_DM_MAX_PER_WINDOW) {
+    ownerDmSent.set(k, recent);
+    return false;
+  }
+  recent.push(now);
+  ownerDmSent.set(k, recent);
+  return true;
+}
+
+export function _resetForTest(): void { table.clear(); ownerDmSent.clear(); lastPrunedAt = 0; }
 export function _tableSizeForTest(): number { return table.size; }

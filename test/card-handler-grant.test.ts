@@ -18,6 +18,8 @@ const deleteMock = vi.fn(async () => true);  // deleteMessage now returns boolea
 const getMessageDetailMock = vi.fn(async () => ({ items: [{ thread_id: 'omt_thread' }] }));
 // 默认所有 open_id 判为「非真人」（bot）→ 全部登记花名册；需要模拟真人用 mockImplementation。
 const isHumanMock = vi.fn(async () => false);
+// 转投私聊的申请卡处置后，回告原会话申请人走 sendMessage（fire-and-forget）。
+const sendMock = vi.fn(async () => 'om_sent');
 vi.mock('../src/im/lark/client.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/im/lark/client.js')>();
   return {
@@ -26,6 +28,7 @@ vi.mock('../src/im/lark/client.js', async (importOriginal) => {
     deleteMessage: (...a: any[]) => deleteMock(...a),
     getMessageDetail: (...a: any[]) => getMessageDetailMock(...a),
     isHumanOpenId: (...a: any[]) => isHumanMock(...a),
+    sendMessage: (...a: any[]) => sendMock(...a),
   };
 });
 
@@ -64,6 +67,7 @@ beforeEach(() => {
   getMessageDetailMock.mockClear(); getMessageDetailMock.mockImplementation(async () => ({ items: [{ thread_id: 'omt_thread' }] }));
   recordObservedMock.mockClear();
   isHumanMock.mockClear(); isHumanMock.mockImplementation(async () => false);
+  sendMock.mockClear();
   const dir = mkdtempSync(join(tmpdir(), 'botmux-cardgrant-'));
   configPath = join(dir, 'bots.json');
   writeFileSync(configPath, JSON.stringify([{ larkAppId: 'h1', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'] }], null, 2));
@@ -167,6 +171,9 @@ describe('card-handler grant actions', () => {
     expect(deleteMock).not.toHaveBeenCalled();
     expect(pending.isThrottled('h1', 'oc_1', 'ou_g')).toBe(true);
     expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
+    await flushBackground();
+    // 群内卡（无 delivery）申请人自己看得到终态卡，不另发回告
+    expect(sendMock).not.toHaveBeenCalled();
   });
 
   it('owner grant_global → writes globalGrants (not chatGrants/allowedUsers), 就地 patch 终态卡(@ 被授权人)，不发通知不撤回', async () => {
@@ -318,5 +325,81 @@ describe('card-handler grant actions', () => {
     const res = await handler.handleCardAction(action('grant_chat', { operator: 'ou_coowner', nonce }), deps, 'h1');
     expect(res?.toast?.type).toBeUndefined();
     expect(registry.getBot('h1').config.chatGrants).toEqual({ oc_1: ['ou_g'] });
+  });
+});
+
+describe('card-handler grant actions — request card forwarded to the approver DM', () => {
+  function dmAction(a: string, nonce: string, delivery: 'dm_p2p' | 'dm_group', extra: Record<string, any> = {}) {
+    return {
+      operator: { open_id: 'ou_owner' },
+      context: { open_message_id: 'om_dm_card' },
+      action: { value: { action: a, target_open_ids: ['ou_g'], target_names: ['张三'], chat_id: 'oc_origin', nonce, mode: 'request', delivery, ...extra } },
+    } as any;
+  }
+
+  it('dm_p2p grant → grants the origin p2p chat, owner card names DM scope, requester gets a notice in the origin chat', async () => {
+    const { registry, pending, handler } = await fresh();
+    isHumanMock.mockImplementation(async () => true);
+    const nonce = pending.openPending('h1', 'oc_origin', 'ou_g', 3);
+    const res = await handler.handleCardAction(dmAction('grant_chat', nonce, 'dm_p2p'), deps, 'h1');
+    expect(registry.getBot('h1').config.chatGrants).toEqual({ oc_origin: ['ou_g'] });
+    const resultText = JSON.stringify(res);
+    expect(resultText).toContain('私聊');
+    expect(resultText).not.toContain('在本群');
+    await flushBackground();
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    const [appId, chatId, content, msgType] = sendMock.mock.calls[0] as any[];
+    expect([appId, chatId, msgType]).toEqual(['h1', 'oc_origin', 'interactive']);
+    expect(content).toContain('管理员已同意');
+    expect(content).not.toContain('<at');
+    // 在 owner 私聊里点的卡，不往那个私聊 reply 额外消息
+    expect(replyMock).not.toHaveBeenCalled();
+  });
+
+  it('dm_group grant → owner card shows the origin chat name, requester is @-ed in the origin group', async () => {
+    const { pending, handler } = await fresh();
+    isHumanMock.mockImplementation(async () => true);
+    const nonce = pending.openPending('h1', 'oc_origin', 'ou_g', 3);
+    const res = await handler.handleCardAction(dmAction('grant_chat', nonce, 'dm_group', { chat_name: '值班群' }), deps, 'h1');
+    expect(JSON.stringify(res)).toContain('值班群');
+    await flushBackground();
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    const [, chatId, content] = sendMock.mock.calls[0] as any[];
+    expect(chatId).toBe('oc_origin');
+    expect(content).toContain('<at id=ou_g></at>');
+  });
+
+  it('dm_p2p deny → cooldown + neutral "not approved" notice in the origin chat, no grant', async () => {
+    const { registry, pending, handler } = await fresh();
+    const nonce = pending.openPending('h1', 'oc_origin', 'ou_g');
+    const res = await handler.handleCardAction(dmAction('grant_deny', nonce, 'dm_p2p'), deps, 'h1');
+    expect(res?.body?.elements).toBeTruthy();
+    expect(pending.isThrottled('h1', 'oc_origin', 'ou_g')).toBe(true);
+    expect(registry.getBot('h1').config.chatGrants).toBeUndefined();
+    await flushBackground();
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    const [, chatId, content] = sendMock.mock.calls[0] as any[];
+    expect(chatId).toBe('oc_origin');
+    expect(content).toContain('未通过');
+    expect(content).not.toContain('<at');
+  });
+
+  it('dm_group deny → bot requester is named in plain text, not @-ed', async () => {
+    const { pending, handler } = await fresh();
+    isHumanMock.mockImplementation(async () => false);
+    const nonce = pending.openPending('h1', 'oc_origin', 'ou_g');
+    await handler.handleCardAction(dmAction('grant_deny', nonce, 'dm_group'), deps, 'h1');
+    await flushBackground();
+    const [, , content] = sendMock.mock.calls[0] as any[];
+    expect(content).toContain('张三');
+    expect(content).not.toContain('<at id=ou_g');
+  });
+
+  it('forged delivery value is ignored (only dm_p2p / dm_group are honored)', async () => {
+    const { pending, handler } = await fresh();
+    const nonce = pending.openPending('h1', 'oc_origin', 'ou_g');
+    await handler.handleCardAction(dmAction('grant_chat', nonce, 'bogus' as any), deps, 'h1');
+    await flushBackground();
+    expect(sendMock).not.toHaveBeenCalled();
   });
 });

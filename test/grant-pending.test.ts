@@ -11,6 +11,8 @@ import {
   markDenied,
   isThrottled,
   updatePendingGrantLimits,
+  tryReserveOwnerDmSlot,
+  OWNER_DM_MAX_PER_WINDOW,
   _resetForTest,
   _tableSizeForTest,
 } from '../src/im/lark/grant-pending.js';
@@ -118,5 +120,30 @@ describe('grant-pending', () => {
       expect(isThrottled('a1', 'oc_1', 'ou_g')).toBe(true); // still throttled
       expect(checkNonce('a1', 'oc_1', 'ou_g', n)).toBe(true); // nonce still valid
     });
+  });
+});
+
+describe('grant-pending — owner DM request-card cap', () => {
+  it('allows up to the cap per (bot, owner) within the window, then refuses', () => {
+    for (let i = 0; i < OWNER_DM_MAX_PER_WINDOW; i++) {
+      expect(tryReserveOwnerDmSlot('a1', 'ou_owner')).toBe(true);
+    }
+    expect(tryReserveOwnerDmSlot('a1', 'ou_owner')).toBe(false);
+    // 别的 owner / 别的 bot 各自独立计数
+    expect(tryReserveOwnerDmSlot('a1', 'ou_other_owner')).toBe(true);
+    expect(tryReserveOwnerDmSlot('a2', 'ou_owner')).toBe(true);
+  });
+
+  it('slots free up once the window slides past', () => {
+    for (let i = 0; i < OWNER_DM_MAX_PER_WINDOW; i++) tryReserveOwnerDmSlot('a1', 'ou_owner');
+    expect(tryReserveOwnerDmSlot('a1', 'ou_owner')).toBe(false);
+    vi.advanceTimersByTime(60 * 60 * 1000);
+    expect(tryReserveOwnerDmSlot('a1', 'ou_owner')).toBe(true);
+  });
+
+  it('_resetForTest clears the owner DM counters', () => {
+    for (let i = 0; i < OWNER_DM_MAX_PER_WINDOW; i++) tryReserveOwnerDmSlot('a1', 'ou_owner');
+    _resetForTest();
+    expect(tryReserveOwnerDmSlot('a1', 'ou_owner')).toBe(true);
   });
 });

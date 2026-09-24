@@ -15,7 +15,8 @@ import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
 import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
 import { isBotAdmin } from './grant-owner.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard, frozenIdleLabel } from './card-builder.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, buildGrantRequesterNoticeCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard, frozenIdleLabel } from './card-builder.js';
+import type { GrantCardDelivery } from './card-builder.js';
 import { codexServiceTierBadge } from '../../services/codex-service-tier.js';
 import {
   findConfigField,
@@ -424,6 +425,26 @@ function duplicateMultiWorktreeChildNames(repoPaths: string[], projects: Project
     else seen.add(childName);
   }
   return [...dupes];
+}
+
+/** 转投私聊的申请卡被拒后，回原会话告知申请人（fire-and-forget，不阻塞 callback）。
+ *  群里 bot 申请人只写名字不 @，避免唤醒对方 bot 拉空会话（与授权成功通知同一口径）。 */
+function notifyGrantRequesterInOrigin(
+  larkAppId: string,
+  chatId: string,
+  outcome: 'deny',
+  delivery: GrantCardDelivery,
+  targets: string[],
+  names: string[],
+  loc?: Locale,
+): void {
+  void (async () => {
+    const humanFlags = delivery === 'dm_group'
+      ? await Promise.all(targets.map(id => isHumanOpenId(larkAppId, id).catch(() => false)))
+      : targets.map(() => true);
+    const entries = targets.map((id, i) => ({ openId: id, name: names[i] || undefined, isBot: !humanFlags[i] }));
+    await sendMessage(larkAppId, chatId, buildGrantRequesterNoticeCard(outcome, delivery, entries, loc), 'interactive');
+  })().catch(err => logger.warn(`grant requester notice (${outcome}) failed: ${err}`));
 }
 
 function deferRepoCardWithdraw(larkAppId: string | undefined, messageId: string | undefined): void {
@@ -1261,6 +1282,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       : (value.target_open_id ? [value.target_open_id] : []);
     const grantChatId = value.chat_id;
     const nonce = value.nonce;
+    // 转投管理员私聊的申请卡：申请人看不到这张卡，处置结果要另发回原会话。
+    const delivery: GrantCardDelivery | undefined = value.delivery === 'dm_p2p' || value.delivery === 'dm_group'
+      ? value.delivery
+      : undefined;
+    const originChatName = typeof value.chat_name === 'string' ? value.chat_name : undefined;
     // 全部 target 都得仍 pending 且 nonce 匹配，否则视为整卡失效。
     if (!targets.length || !grantChatId || !nonce || !targets.every(tt => checkNonce(larkAppId, grantChatId, tt, nonce))) {
       return { toast: { type: 'error', content: t('card.grant.toast_expired', undefined, loc) } };
@@ -1292,6 +1318,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // 返回原始卡 body，由 dispatcher 包成 in-place patch（不再走 updateMessage 双写）。
     if (value.action === 'grant_deny') {
       for (const tt of targets) markDenied(larkAppId, grantChatId, tt);
+      if (delivery) {
+        const denyNames: string[] = Array.isArray(value.target_names) ? value.target_names : [];
+        notifyGrantRequesterInOrigin(larkAppId, grantChatId, 'deny', delivery, targets, denyNames, loc);
+      }
       return JSON.parse(buildGrantResultCard('deny', loc));
     }
     const formValue = action?.form_value;
@@ -1376,7 +1406,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // 「已授权」结果态、又 ping 到被授权人——无需再单独发通知卡、也无需撤回原卡（申晗 2026-07-31
     // 反馈：直接在原卡更新即可）。同步返回该 body 即完成 in-place patch，避免 deleteMessage 与
     // callback 响应竞态导致客户端 300000。仅「部分失败」仍走后台补一条文字告知。
-    const resultCardBody = JSON.parse(buildGrantResultCard(kind, loc, quota, expiresAt, notifyTargets));
+    const resultCardBody = JSON.parse(buildGrantResultCard(
+      kind, loc, quota, expiresAt, notifyTargets,
+      delivery ? { delivery, chatName: originChatName } : undefined,
+    ));
+    if (delivery) {
+      const grantedNotice = buildGrantRequesterNoticeCard(kind, delivery, notifyTargets, loc, quota, expiresAt);
+      sendMessage(larkAppId, grantChatId, grantedNotice, 'interactive')
+        .catch(err => logger.warn(`grant requester notice (granted) failed: ${err}`));
+    }
     if (cardMessageId && failed.length > 0) {
       let replyInThread = true;
       try {

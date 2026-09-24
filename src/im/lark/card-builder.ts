@@ -1657,13 +1657,24 @@ export interface GrantCardOpts {
   /** 当前卡片暂存的限制；缺省使用产品默认值。 */
   durationMs?: number;
   quota?: number;
+  /** 申请卡转投管理员私聊时的来源：'dm_p2p' = 申请人在私聊里申请；'dm_group' = 群里没有管理员。
+   *  缺省 = 卡片就在原会话里（原行为）。 */
+  delivery?: GrantCardDelivery;
+  /** delivery='dm_group' 时展示的来源群名（查不到时由调用方传占位）。 */
+  chatName?: string;
 }
+
+export type GrantCardDelivery = 'dm_p2p' | 'dm_group';
 
 /** 授权卡片：有效期与消息额度并列展示，owner 一次提交两项限制。 */
 export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
   const names = o.targets.map(t => `**${escapeMd(t.name)}**`).join('、');
   const single = o.targets[0];
-  const body = o.mode === 'request'
+  const body = o.mode === 'request' && o.delivery === 'dm_p2p'
+    ? t('card.grant.body_request_p2p', { name: escapeMd(single?.name ?? '') }, locale)
+    : o.mode === 'request' && o.delivery === 'dm_group'
+    ? t('card.grant.body_request_remote', { name: escapeMd(single?.name ?? ''), chat: escapeMd(o.chatName ?? '') }, locale)
+    : o.mode === 'request'
     ? t('card.grant.body_request', { name: escapeMd(single?.name ?? ''), owner: o.ownerOpenId }, locale)
     : o.targets.length > 1
       ? t('card.grant.body_owner_multi', { names, owner: o.ownerOpenId }, locale)
@@ -1679,6 +1690,9 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
     chat_id: o.chatId,
     nonce: o.nonce,
     mode: o.mode,
+    // 私聊转投的卡：处置时据此选终态文案，并回告原会话里的申请人（申请人看不到这张卡）。
+    ...(o.delivery ? { delivery: o.delivery } : {}),
+    ...(o.delivery === 'dm_group' && o.chatName ? { chat_name: o.chatName } : {}),
   };
   const button = (action: string, text: string, type: string): Record<string, unknown> => ({
     tag: 'button',
@@ -1691,8 +1705,11 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
     action_type: 'form_submit',
     value: { action, ...v },
   });
+  const chatBtnKey = o.delivery === 'dm_p2p'
+    ? 'card.grant.btn_chat_p2p'
+    : o.delivery === 'dm_group' ? 'card.grant.btn_chat_remote' : 'card.grant.btn_chat';
   const grantButtons: Array<Record<string, unknown>> = [
-    button('grant_chat', t('card.grant.btn_chat', undefined, locale), 'primary'),
+    button('grant_chat', t(chatBtnKey, undefined, locale), 'primary'),
   ];
   if (o.mode === 'owner') {
     grantButtons.push(button('grant_global', t('card.grant.btn_global', undefined, locale), 'default'));
@@ -1826,10 +1843,42 @@ export function buildGrantNotifyCard(
   return JSON.stringify(card);
 }
 
-/** 额度用尽通知卡（@被授权人）：daemon 收回该 scope 授权后发到 session/线程。 */
-export function buildQuotaExhaustedCard(targetOpenId: string, limit: number, locale?: Locale): string {
+/** 申请卡转投管理员私聊后，给原会话里申请人的处置结果回告（申请人看不到那张卡）。
+ *  p2p 不 @（会话里只有 ta）；群里 @ 申请人。授权成功带额度/有效期后缀，拒绝不带。 */
+export function buildGrantRequesterNoticeCard(
+  outcome: 'chat' | 'global' | 'deny',
+  delivery: GrantCardDelivery,
+  targets: GrantTargetEntry[],
+  locale?: Locale,
+  quota?: number,
+  expiresAt?: number,
+): string {
+  let content: string;
+  if (delivery === 'dm_p2p') {
+    content = t(outcome === 'deny' ? 'card.grant.requester_denied_p2p' : 'card.grant.requester_granted_p2p', undefined, locale);
+  } else {
+    const at = renderGrantAtMentions(targets);
+    content = outcome === 'deny'
+      ? t('card.grant.requester_denied_chat', { at }, locale)
+      : t(outcome === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
+  }
+  if (outcome !== 'deny') {
+    if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
+    if (expiresAt !== undefined) content += t('card.grant.notify_expiry_suffix', { time: formatGrantExpiry(expiresAt, locale) }, locale);
+  }
+  const card = {
+    config: { wide_screen_mode: true },
+    elements: [{ tag: 'div', text: { tag: 'lark_md', content } }],
+  };
+  return JSON.stringify(card);
+}
+
+/** 额度用尽通知卡（@被授权人）：daemon 收回该 scope 授权后发到 session/线程。
+ *  `autoReapply`：开了 grantRequestToOwnerDm 时，下一条消息会自动再弹申请卡（私聊也会），
+ *  不必让被授权人去「联系 owner 重新 /grant」（私聊陌生人既不知道 owner 是谁也不会用 /grant）。 */
+export function buildQuotaExhaustedCard(targetOpenId: string, limit: number, locale?: Locale, autoReapply = false): string {
   const at = `<at id=${targetOpenId}></at>`;
-  const content = t('quota.exhausted_notify', { at, limit }, locale);
+  const content = t(autoReapply ? 'quota.exhausted_notify_reapply' : 'quota.exhausted_notify', { at, limit }, locale);
   const card = {
     config: { wide_screen_mode: true },
     elements: [{ tag: 'div', text: { tag: 'lark_md', content } }],
@@ -2044,13 +2093,19 @@ export function buildGrantResultCard(
   quota?: number,
   expiresAt?: number,
   targets?: string | string[] | GrantTargetEntry[],
+  origin?: { delivery?: GrantCardDelivery; chatName?: string },
 ): string {
   let content: string;
   const at = targets !== undefined ? renderGrantAtMentions(targets) : '';
   if (kind !== 'deny' && at) {
     // 授权成功且有被授权人：复用 notify 文案（{at} 已获授权，发消息 @ 我即可 + 额度/有效期后缀），
     // 让就地 patch 的原卡直接把授权成功通知 + @ping 合为一张。
-    content = t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
+    // 转投私聊的卡只有管理员看得到，「在本群」说法不成立，改用标明来源的文案。
+    content = kind === 'chat' && origin?.delivery === 'dm_p2p'
+      ? t('card.grant.notify_owner_p2p', { at }, locale)
+      : kind === 'chat' && origin?.delivery === 'dm_group'
+      ? t('card.grant.notify_owner_remote', { at, chat: escapeMd(origin.chatName ?? '') }, locale)
+      : t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
     if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
     if (expiresAt !== undefined) content += t('card.grant.notify_expiry_suffix', { time: formatGrantExpiry(expiresAt, locale) }, locale);
   } else {
