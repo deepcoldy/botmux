@@ -1,6 +1,7 @@
 import { getBot } from '../bot-registry.js';
 import type { LarkAttachment } from '../types.js';
 import { supportsTranscriptReplyDelivery } from '../services/structured-bridge-clis.js';
+import type { DaemonSession } from './types.js';
 
 export type PromptInjection = 'default' | 'none';
 
@@ -13,7 +14,14 @@ export function supportsZeroPromptInjection(cliId: string | undefined, opts?: {
     && (!opts?.backendType || ['pty', 'tmux', 'herdr', 'zellij', 'zmx'].includes(opts.backendType));
 }
 
-export function zeroPromptInjectionForBot(larkAppId?: string, cliId?: string): boolean {
+export function sessionPromptInjection(ds: Pick<DaemonSession, 'session' | 'initConfig'>): PromptInjection {
+  // Historical/adopted sessions predate this setting and retain their original
+  // input contract. A live worker snapshot also covers an in-place upgrade.
+  return ds.session.promptInjection ?? ds.initConfig?.promptInjection ?? 'default';
+}
+
+export function zeroPromptInjectionForBot(larkAppId?: string, cliId?: string, frozen?: PromptInjection): boolean {
+  if (frozen !== undefined) return frozen === 'none';
   if (!larkAppId) return false;
   try {
     const cfg = getBot(larkAppId).config;

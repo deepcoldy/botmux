@@ -287,10 +287,13 @@ export function resolveReportRelayFallbackTarget(input: {
 
 export function buildOrchestratorReportTrigger(
   decision: Extract<ReportSessionRelayDecision, { ok: true }>,
-  meta: { requestId: string; receivedAt: string },
+  meta: { requestId: string; receivedAt: string; turnIdempotencyKey?: string },
   target = decision.target,
 ): Record<string, unknown> {
   return {
+    ...(meta.turnIdempotencyKey ? { options: {
+      asyncReturnSessionId: true, turnIdempotencyKey: meta.turnIdempotencyKey,
+    } } : {}),
     source: {
       type: 'ui',
       connectorId: 'botmux-report',
@@ -324,9 +327,19 @@ interface ReportRelayHttpResponse {
   json(): Promise<unknown>;
 }
 
+/** A separate retry budget for the lead sink; never replay the Lark sink.
+ * The caller freezes the entire trigger payload before entering this loop. */
+export async function retryAutomaticDispatchReport(deliver: () => Promise<void>): Promise<void> {
+  for (const delay of [0, 1000, 5000]) {
+    if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+    try { await deliver(); return; }
+    catch (error) { if (delay === 5000) throw error; }
+  }
+}
+
 export async function deliverReportSessionRelay(input: {
   decision: Extract<ReportSessionRelayDecision, { ok: true }>;
-  triggerMeta: { requestId: string; receivedAt: string };
+  triggerMeta: { requestId: string; receivedAt: string; turnIdempotencyKey?: string };
   fetchTarget(path: string, init: RequestInit): Promise<ReportRelayHttpResponse>;
   postProjectUpdate(target: { larkAppId: string; sessionId: string }): Promise<{
     projectSynced: boolean;

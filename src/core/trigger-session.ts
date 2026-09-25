@@ -1,4 +1,4 @@
-import { zeroPromptInjectionForBot } from './prompt-injection.js';
+import { zeroPromptInjectionForBot, sessionPromptInjection } from './prompt-injection.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import * as idempotencyStore from '../services/idempotency-store.js';
@@ -759,6 +759,7 @@ function buildExistingSessionContent(
     // HTTP response directives are carried separately at application priority.
     codexAppMessageContext,
     sessionBackendType: ds.session.backendType,
+    promptInjection: sessionPromptInjection(ds),
     turnId,
   });
 }
@@ -906,9 +907,11 @@ async function triggerSessionTurnAdmitted(
   }
 
   const dryRun = !!req.options?.dryRun;
-  const prompt = zeroPromptInjectionForBot(larkAppId)
+  const promptForSession = (target?: DaemonSession) => zeroPromptInjectionForBot(larkAppId, undefined,
+    target ? sessionPromptInjection(target) : undefined)
     ? [req.instruction, req.envelope.rawText ?? JSON.stringify(req.envelope.payload ?? {})].filter(Boolean).join('\n\n')
     : buildUntrustedEventPrompt(req, triggerId);
+  const prompt = promptForSession();
   const topicMessage = buildExternalEventTopicMessage(req, larkAppId);
   const codexAppText = buildExternalEventVisibleText(req, larkAppId);
   const codexAppApplicationContext = buildExternalEventApplicationContext(req);
@@ -1207,6 +1210,7 @@ async function triggerSessionTurnAdmitted(
   }
 
   const deliverToExisting = async (target: DaemonSession): Promise<TriggerResponse> => {
+    const prompt = promptForSession(target);
     // Ownership guard (PR #597): the target must still be the live, registered
     // occupant before we dispatch. Validate by object identity at its canonical
     // key AND — because a session can legitimately be reached via a non-canonical

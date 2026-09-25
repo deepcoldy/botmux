@@ -1,4 +1,4 @@
-import { buildZeroPromptInput, zeroPromptInjectionForBot } from './core/prompt-injection.js';
+import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -314,6 +314,7 @@ import {
 import {
   authorizeReportSessionRelayRequest,
   prepareAutomaticDispatchReport,
+  retryAutomaticDispatchReport,
   deliverReportSessionRelay,
   REPORT_SESSION_RELAY_MAX_BYTES,
   REPORT_SESSION_RELAY_ROUTE,
@@ -3890,22 +3891,25 @@ async function reportZeroPromptFinal(ds: DaemonSession, input: {
     sourceLarkAppId: ds.larkAppId, content: input.content,
   });
   if (!decision) return;
-  const target = findOnlineDaemon(decision.target.larkAppId);
-  if (!target) throw new Error('zero-prompt report: orchestrator daemon is offline');
-  const delivered = await deliverReportSessionRelay({
-    decision,
-    triggerMeta: { requestId: `zero-prompt:${ds.session.sessionId}:${input.turnId}`, receivedAt: new Date().toISOString() },
-    fetchTarget: (path, init) => fetchDaemonIpc(target.ipcPort, path, init),
-    postProjectUpdate: async () => ({ projectSynced: false }),
+  const requestId = `zero-prompt:${ds.session.sessionId}:${input.turnId}`;
+  const triggerMeta = { requestId, receivedAt: new Date().toISOString(), turnIdempotencyKey: requestId };
+  await retryAutomaticDispatchReport(async () => {
+    const target = findOnlineDaemon(decision.target.larkAppId);
+    if (!target) throw new Error('zero-prompt report: orchestrator daemon is offline');
+    const delivered = await deliverReportSessionRelay({
+      decision, triggerMeta,
+      fetchTarget: (path, init) => fetchDaemonIpc(target.ipcPort, path, init),
+      postProjectUpdate: async () => ({ projectSynced: false }),
+    });
+    if (delivered.status >= 400 || delivered.body.ok === false) {
+      throw new Error(`zero-prompt report: ${delivered.body.error ?? delivered.status}`);
+    }
   });
-  if (delivered.status >= 400 || delivered.body.ok === false) {
-    throw new Error(`zero-prompt report: ${delivered.body.error ?? delivered.status}`);
-  }
 }
 
 /** Only an authenticated dispatch can shed the protocol appended by our CLI. */
-function zeroPromptTaskContent(content: string, larkAppId: string, dispatchRoot?: string): string {
-  if (!zeroPromptInjectionForBot(larkAppId) || !dispatchRoot) return content;
+function zeroPromptTaskContent(content: string, larkAppId: string, dispatchRoot?: string, frozen?: PromptInjection): string {
+  if (!zeroPromptInjectionForBot(larkAppId, undefined, frozen) || !dispatchRoot) return content;
   try {
     const registry = JSON.parse(readFileSync(join(config.session.dataDir, 'orchestrate-dispatch.json'), 'utf8'));
     const bound = resolveVerifiedDispatchReportTarget({ registry, dispatchRoot,
@@ -17616,7 +17620,7 @@ async function resolveSoloSessionForTurn(
   let solo = false;
   try {
     const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
-    if (effectiveReplyDelivery(ds.larkAppId, cliId) === 'transcript') {
+    if (effectiveReplyDelivery(ds.larkAppId, cliId, sessionPromptInjection(ds)) === 'transcript') {
       let chatMode: 'group' | 'topic' | undefined;
       let stats: { userCount: number; botCount: number } | undefined;
       if (chatType === 'group') {
@@ -19955,6 +19959,7 @@ function cloneIndependentLaunchPosture(source: Session, child: Session): void {
   child.wrapperCli = source.wrapperCli;
   child.cliLaunchMode = source.cliLaunchMode;
   child.agentFrozen = source.agentFrozen;
+  child.promptInjection = source.promptInjection ?? 'default';
 }
 
 function independentChildById(sessionId: string | undefined): DaemonSession | undefined {
@@ -23626,17 +23631,20 @@ async function handleThreadReplyAdmitted(
   }
   const senderUnionIdForPrefix = parsed.senderUnionId || data?.sender?.sender_id?.union_id;
   const foreignBotName = isForeignBot ? lookupForeignBotName(senderOpenIdForPrefix!, larkAppId, senderUnionIdForPrefix) : undefined;
-  const botSenderPrefix = isForeignBot && !zeroPromptInjectionForBot(larkAppId)
+  const inputSession = activeSessions.get(runtimeSessionKey);
+  const zeroInjection = zeroPromptInjectionForBot(larkAppId, undefined,
+    inputSession ? sessionPromptInjection(inputSession) : undefined);
+  const botSenderPrefix = isForeignBot && !zeroInjection
     ? `${tr('daemon.foreign_bot_mention_prefix', { botName: foreignBotName! }, localeForBot(larkAppId))}\n`
     : '';
 
   // `let` (not const): the v3 grill gate below may replace this with a
   // skill-trigger prompt when the user sends `/workflow [new] <目标>` mid-thread.
-  const initialCodexAppMessageContext = zeroPromptInjectionForBot(larkAppId) ? ''
+  const initialCodexAppMessageContext = zeroInjection ? ''
     : buildQuoteHint(parsed, scope, anchor, localeForBot(larkAppId)) + botSenderPrefix;
   const initialCodexAppApplicationContext = vcMeetingApplicationContext(ctx);
-  const initialPromptContent = zeroPromptInjectionForBot(larkAppId)
-    ? zeroPromptTaskContent(stripCrossPrincipalAsToken(parsed.content).text, larkAppId, parsed.rootId ?? parsed.messageId)
+  const initialPromptContent = zeroInjection
+    ? zeroPromptTaskContent(stripCrossPrincipalAsToken(parsed.content).text, larkAppId, parsed.rootId ?? parsed.messageId, 'none')
     : initialCodexAppMessageContext + initialCodexAppApplicationContext
       + stripCrossPrincipalAsToken(parsed.content).text;
   let promptContent = initialPromptContent;
@@ -24471,11 +24479,11 @@ async function handleThreadReplyAdmitted(
     // Enrich content with attachment hints and mention metadata (same as normal send)
     const codexAppFollowUpContextParts: string[] = [];
     if (codexAppMessageContext) codexAppFollowUpContextParts.push(codexAppMessageContext);
-    const attachmentHint = !zeroPromptInjectionForBot(larkAppId) && attachments.length > 0 ? formatAttachmentsHint(attachments) : '';
-    let enriched = zeroPromptInjectionForBot(larkAppId) ? buildZeroPromptInput(promptContent, attachments)
+    const attachmentHint = !zeroInjection && attachments.length > 0 ? formatAttachmentsHint(attachments) : '';
+    let enriched = zeroInjection ? buildZeroPromptInput(promptContent, attachments)
       : attachmentHint ? `${promptContent}${attachmentHint}` : promptContent;
     if (attachmentHint) codexAppFollowUpContextParts.push(attachmentHint);
-    if (!zeroPromptInjectionForBot(larkAppId) && parsed.mentions && parsed.mentions.length > 0) {
+    if (!zeroInjection && parsed.mentions && parsed.mentions.length > 0) {
       const mentionLines = parsed.mentions.map(m => {
         const idPart = m.openId ? ` → open_id: ${m.openId}` : '';
         return `- @${m.name}${idPart}`;
@@ -24501,7 +24509,7 @@ async function handleThreadReplyAdmitted(
     const hadBufferedFollowUps = (ds.pendingFollowUps?.length ?? 0) > 0;
     const sameInitialCaller = !!followUpSender?.openId
       && followUpSender.openId === ds.pendingSender?.openId;
-    if (!zeroPromptInjectionForBot(larkAppId) && followUpSender?.openId && followUpSender.openId !== ds.pendingSender?.openId) {
+    if (!zeroInjection && followUpSender?.openId && followUpSender.openId !== ds.pendingSender?.openId) {
       // This buffer folds into the opening <user_message> after repo selection,
       // so pair the foreign sender tag with the cursor anti-echo note: without
       // the adjacent note a cursor session sees an inline ou_xxx:name with no

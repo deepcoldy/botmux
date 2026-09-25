@@ -88,7 +88,7 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 
 支持范围复用 CLI 的最终回复兜底采集能力：目前包括 Claude Code、Codex、TraeX、CoCo、Hermes、MTR、Pi、Oh My Pi、ebsd、Grok（PTY、tmux 等本地后端，包含 Codex / TraeX RPC 输入）。暂不支持远端后端和 v3 workflow；仅 adopt 能采集 final 的 CLI 不作为整 bot 开关的支持依据。CLI 的共享技能目录若存在全局安装的 `botmux-*` 技能，会拒绝启动以免假称零注入；请使用按会话的技能注入方式或独立 home，不会删除其它 bot 共用的文件。
 
-lead 使用 `botmux dispatch --bot-app <稳定 App ID>` 派活时，sub 的 daemon 根据已签名的派活绑定去掉自动附加的 report/send 指令，并把最终回答回报到原 lead 会话；普通聊天仍自动回复当前会话。回报内容不自动把任务标记为完成，验收由 lead 决定。
+普通协作可直接在群内 @ 执行 bot，最终回答自动回复当前会话。需要自动回报原 lead 会话时，使用已建立签名回报绑定的 `botmux dispatch --bot-app <稳定 App ID>` 派单：sub 的 daemon 根据绑定去掉自动附加的 report/send 指令，每轮最终回答回报原 lead。回报不自动把任务标记为完成，验收由 lead 决定；网络重试按子会话与轮次去重，失败不影响子会话自己的回复。`dispatch --into` 向此前没有派单记录的普通消息追加任务不会创建该绑定，当前仍会保留完成指令且无法自动回报，不应用它验证零注入。
 
 ## 支持的 CLI / Agent
 

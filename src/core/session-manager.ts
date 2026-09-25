@@ -1,4 +1,4 @@
-import { buildZeroPromptInput, zeroPromptInjectionForBot } from './prompt-injection.js';
+import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './prompt-injection.js';
 /**
  * Session manager — session helper functions extracted from daemon.ts.
  * Handles working directory resolution, attachment downloads, prompt building,
@@ -1227,9 +1227,18 @@ function triggerUserAuthEnabledForPrompt(larkAppId?: string): boolean {
 /** 本会话的最终回复投递方式（per-bot replyDelivery × 该 CLI 的转写能力，见
  *  core/reply-delivery.ts）。缺参 / bot 未加载 / 任何异常 → 'send'（fail-closed：
  *  信封字节等于今天）。noTransport 的优先级由各调用点自己叠加。 */
-function replyDeliveryFor(larkAppId?: string, cliId?: string): ReplyDelivery {
+function replyDeliveryFor(larkAppId?: string, cliId?: string, promptInjection?: PromptInjection): ReplyDelivery {
   if (!larkAppId || !cliId) return 'send';
-  try { return effectiveReplyDelivery(larkAppId, cliId); } catch { return 'send'; }
+  try { return effectiveReplyDelivery(larkAppId, cliId, promptInjection); } catch { return 'send'; }
+}
+
+/** All public builders share the durable session policy, including callers
+ * outside the daemon (repo selection, scheduled turns and comment replies). */
+function inputPromptInjection(sessionId: string, larkAppId?: string, cliId?: string): PromptInjection {
+  const session = sessionStore.getSession(sessionId);
+  if (session) return session.promptInjection ?? 'default';
+  // Pure/new-input callers may render before a session row exists.
+  return zeroPromptInjectionForBot(larkAppId, cliId) ? 'none' : 'default';
 }
 
 /** opening 构建选项。在原有 larkAppId/chatId/whiteboardId 等之外，新增 hook 模式
@@ -1237,6 +1246,7 @@ function replyDeliveryFor(larkAppId?: string, cliId?: string): ReplyDelivery {
  *  turnId（= 发给 worker 的 turnId，最终成为 managedTurnOrigin.turnId），用于
  *  sidecar 绑定；sessionBackendType 取会话冻结的后端类型（远端后端无本地 hook 进程）。 */
 type NewTopicOpts = {
+  promptInjection?: PromptInjection;
   larkAppId?: string;
   chatId?: string;
   whiteboardId?: string;
@@ -1275,7 +1285,7 @@ function buildNewTopicBlocks(
   opts?: NewTopicOpts,
   hookMode = false,
 ): Array<{ key: NewTopicBlockKey; text: string }> {
-  if (zeroPromptInjectionForBot(opts?.larkAppId, cliId)) {
+  if (zeroPromptInjectionForBot(opts?.larkAppId, cliId, opts?.promptInjection)) {
     return [{ key: 'userMessage', text: buildZeroPromptInput([userMessage, ...(followUps ?? [])].join('\n\n'), attachments) }];
   }
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
@@ -1294,7 +1304,7 @@ function buildNewTopicBlocks(
   // replyDelivery=transcript 只在有传输的会话上生效（noTransport 优先）；bare =
   // transcript + solo，首轮同样去壳。
   const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
-  const replyDelivery: ReplyDelivery = noTransport ? 'send' : replyDeliveryFor(opts?.larkAppId, cliId);
+  const replyDelivery: ReplyDelivery = noTransport ? 'send' : replyDeliveryFor(opts?.larkAppId, cliId, opts?.promptInjection);
   const bare = replyDelivery === 'transcript' && opts?.solo === true;
   const hints = adapter.injectsSessionContext
     ? []
@@ -1455,6 +1465,7 @@ export function buildNewTopicPrompt(
   sender?: ResolvedSender,
   opts?: NewTopicOpts,
 ): string {
+  opts = { ...opts, promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, cliId) };
   return buildNewTopicBlocks(
     userMessage, sessionId, cliId, cliPathOverride, attachments, mentions,
     availableBots, followUps, botIdentity, locale, sender, opts,
@@ -1479,6 +1490,7 @@ export function buildNewTopicCliInput(
   locale?: Locale,
   sender?: ResolvedSender,
   opts?: {
+    promptInjection?: PromptInjection;
     larkAppId?: string;
     chatId?: string;
     whiteboardId?: string;
@@ -1502,6 +1514,7 @@ export function buildNewTopicCliInput(
     sessionBackendType?: BackendType;
   },
 ): CliTurnPayload {
+  opts = { ...opts, promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, cliId) };
   // 调用点漏传 locale 时回落该 bot 的 per-bot 语言（与 buildFollowUpCliInput /
   // buildReforkCliInput 同一兜底）；bot 未配 lang 时 localeForBot 即进程默认，
   // 与旧行为一致。否则首轮按 bot 语言、续轮回落进程默认会造成同会话语言混排。
@@ -1515,6 +1528,7 @@ export function buildNewTopicCliInput(
     cliId,
     cliPathOverride,
     sessionBackendType: opts?.sessionBackendType,
+    promptInjection: opts?.promptInjection,
     larkAppId: opts?.larkAppId,
   }) === 'hook' && hookTurnId) {
     const blocks = buildNewTopicBlocks(
@@ -1549,7 +1563,7 @@ export function buildNewTopicCliInput(
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts?.whiteboardId,
     noTransport: sessionIsNoTransport(opts?.larkAppId, opts?.chatId),
-    replyDelivery: replyDeliveryFor(opts?.larkAppId, cliId),
+    replyDelivery: replyDeliveryFor(opts?.larkAppId, cliId, opts?.promptInjection),
     locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, locale);
@@ -1598,6 +1612,7 @@ type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'reminder' | 'w
 /** follow-up 构建选项。sessionBackendType 取会话冻结的后端类型（非当前 bot 配置，
  *  那些是 next-session 生效），用于判断该会话是否有本地 Claude hook 进程。 */
 type FollowUpOpts = {
+  promptInjection?: PromptInjection;
   attachments?: LarkAttachment[];
   mentions?: LarkMention[];
   isAdoptMode?: boolean;
@@ -1635,7 +1650,7 @@ function buildFollowUpBlocks(
   opts?: FollowUpOpts,
   hookMode = false,
 ): Array<{ key: FollowUpBlockKey; text: string }> {
-  if (zeroPromptInjectionForBot(opts?.larkAppId, opts?.cliId)) {
+  if (zeroPromptInjectionForBot(opts?.larkAppId, opts?.cliId, opts?.promptInjection)) {
     return [{ key: 'userMessage', text: buildZeroPromptInput(content, opts?.attachments) }];
   }
   const blocks: Array<{ key: FollowUpBlockKey; text: string }> = [];
@@ -1643,7 +1658,7 @@ function buildFollowUpBlocks(
   // 转发，续轮不再注入 <botmux_reminder>；noTransport 优先（HTTP 虚拟会话照旧走
   // reminder_no_transport）。bare = transcript + solo → 信封去壳。
   const noTransport = sessionIsNoTransport(opts?.larkAppId, opts?.chatId);
-  const transcript = !noTransport && replyDeliveryFor(opts?.larkAppId, opts?.cliId) === 'transcript';
+  const transcript = !noTransport && replyDeliveryFor(opts?.larkAppId, opts?.cliId, opts?.promptInjection) === 'transcript';
   const bare = transcript && opts?.solo === true;
   const roleBlock = renderApplicationRoleBlock(opts?.larkAppId, opts?.chatId, { followUp: true });
   const whiteboardBlock = renderWhiteboardBlock({
@@ -1738,12 +1753,13 @@ export function buildFollowUpContent(
   sessionId: string,
   opts?: FollowUpOpts,
 ): string {
+  opts = { ...opts, promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, opts?.cliId) };
   // 同 buildFollowUpCliInput 的 locale 兜底：public 入口自保，调用点漏传时
   // 按该 bot 配置的语言渲染（buildRefork* 外层也有同构兜底）。
   opts = opts ? { ...opts, locale: opts.locale ?? localeForBot(opts.larkAppId) } : opts;
   if (
     opts?.cliId
-    && !zeroPromptInjectionForBot(opts.larkAppId, opts.cliId)
+    && !zeroPromptInjectionForBot(opts.larkAppId, opts.cliId, opts.promptInjection)
     && createCliAdapterSync(opts.cliId, opts.cliPathOverride).inputEnvelope === 'service-user'
   ) {
     return buildServiceUserPrompt(content);
@@ -1779,6 +1795,7 @@ const HOOK_ENVELOPE_MAX_CHARS = 8000;
  * NewTopicOpts 的结构化子集，两边都满足。
  */
 type EnvelopeInjectionCfg = {
+  promptInjection?: PromptInjection;
   cliId?: CliId;
   cliPathOverride?: string;
   sessionBackendType?: BackendType;
@@ -1786,7 +1803,7 @@ type EnvelopeInjectionCfg = {
 };
 
 function resolveEnvelopeInjectionMode(cfg?: EnvelopeInjectionCfg): 'hook' | 'inline' {
-  if (!cfg?.cliId || zeroPromptInjectionForBot(cfg.larkAppId, cfg.cliId)) return 'inline';
+  if (!cfg?.cliId || zeroPromptInjectionForBot(cfg.larkAppId, cfg.cliId, cfg.promptInjection)) return 'inline';
   // 远端后端（riff 等）没有本地 Claude hook 进程，sidecar 写了没人读，
   // 必须用会话冻结的 backendType（不是当前 bot 配置，那是 next-session 生效）。
   // 只有确知在本地跑 CLI 的后端才允许 hook 模式（白名单）。未来新增远端后端
@@ -1855,6 +1872,7 @@ export function buildFollowUpCliInput(
   sessionId: string,
   opts?: FollowUpOpts,
 ): CliTurnPayload {
+  opts = { ...opts, promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, opts?.cliId) };
   // 兜底 locale：活 worker 普通续轮、worker-null re-fork、XPI 重放、文档评论等
   // 调用点若漏传，首轮（buildNewTopicCliInput 已按 per-bot 语言渲染）与续轮就会
   // 语言混排。统一在此按 bot 配置补齐；bot 未配 lang 时即进程默认，与旧行为一致。
@@ -1894,7 +1912,7 @@ export function buildFollowUpCliInput(
   const whiteboardBlock = renderWhiteboardBlock({
     whiteboardId: opts.whiteboardId,
     noTransport: sessionIsNoTransport(opts.larkAppId, opts.chatId),
-    replyDelivery: replyDeliveryFor(opts.larkAppId, opts.cliId),
+    replyDelivery: replyDeliveryFor(opts.larkAppId, opts.cliId, opts.promptInjection),
     locale: opts.locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts.larkAppId, opts.locale);
@@ -2057,6 +2075,7 @@ export function buildReforkPrompt(
     chatId: ds.session.chatId,
     whiteboardId: ds.session.whiteboardId,
     sessionBackendType: ds.session.backendType,
+    promptInjection: sessionPromptInjection(ds),
     solo: ds.soloSession,
     selfMention: opts?.selfMention,
   });
@@ -2105,6 +2124,7 @@ export function buildReforkCliInput(
     chatId: ds.session.chatId,
     whiteboardId: ds.session.whiteboardId,
     sessionBackendType: ds.session.backendType,
+    promptInjection: sessionPromptInjection(ds),
     turnId: opts?.turnId,
     substituteTrigger: opts?.substituteTrigger,
     codexAppText: opts?.codexAppText,

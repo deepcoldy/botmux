@@ -4816,3 +4816,25 @@ it('deeply snapshots group model and effort without changing runtime identity', 
   init('effort-test');
   expect(getSession(session.sessionId)?.groupDefaultModels?.codex).toEqual({model:'gpt-5.6-sol',reasoningEffort:'ultra'});
 });
+
+
+describe('session prompt injection snapshot', () => {
+  it('persists the chosen mode across bot toggles, reload and inherited forks', () => {
+    const appId = 'cli_prompt_snapshot';
+    const bot = { larkAppId: appId, cliId: 'claude-code', promptInjection: 'none' } as any;
+    registerCodexInstanceBot(bot);
+    init(appId);
+    const original = createSession('oc_snapshot', 'om_original', 'original');
+    expect(original.promptInjection).toBe('none');
+    bot.promptInjection = 'default';
+    registerCodexInstanceBot(bot);
+    const next = createSession('oc_snapshot', 'om_next', 'next');
+    expect(next.promptInjection).toBe('default');
+    expect(createSession('oc_snapshot', 'om_fork', 'fork', 'group', 'thread', { inherit: original }).promptInjection).toBe('none');
+    bot.promptInjection = 'none';
+    expect(createSession('oc_snapshot', 'om_adopt', 'adopt', 'group', 'thread', { source: 'external' }).promptInjection).toBe('default');
+    init(appId);
+    expect(getSession(original.sessionId)?.promptInjection).toBe('none');
+    expect(getSession(next.sessionId)?.promptInjection).toBe('default');
+  });
+});

@@ -16,7 +16,7 @@
 import { getOwnerOpenId, resolveReplyDelivery } from '../bot-registry.js';
 import { supportsTranscriptReplyDelivery } from '../services/structured-bridge-clis.js';
 import { logger } from '../utils/logger.js';
-import { zeroPromptInjectionForBot } from './prompt-injection.js';
+import { zeroPromptInjectionForBot, type PromptInjection } from './prompt-injection.js';
 
 export type ReplyDelivery = 'send' | 'transcript';
 
@@ -46,9 +46,9 @@ const warnedUnsupported = new Set<string>();
 /** 运行时生效值：显式配置（send / transcript）优先，未配置按 CLI 缺省；结果为
  *  transcript 但当前 CLI 不支持时回落 send（每个 bot+cli 组合只 warn 一次，避免
  *  每轮刷日志）。无 larkAppId / registry 异常 → send（fail-closed）。 */
-export function effectiveReplyDelivery(larkAppId: string | undefined, cliId: string | undefined): ReplyDelivery {
+export function effectiveReplyDelivery(larkAppId: string | undefined, cliId: string | undefined, promptInjection?: PromptInjection): ReplyDelivery {
   if (!larkAppId) return 'send';
-  if (zeroPromptInjectionForBot(larkAppId, cliId)) return 'transcript';
+  if (zeroPromptInjectionForBot(larkAppId, cliId, promptInjection)) return 'transcript';
   let configured: ReplyDelivery | undefined;
   try { configured = resolveReplyDelivery(larkAppId); } catch { return 'send'; }
   const wanted: ReplyDelivery = configured ?? defaultReplyDeliveryFor(cliId);

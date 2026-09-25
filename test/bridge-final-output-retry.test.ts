@@ -498,6 +498,26 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(onZeroPromptFinal).toHaveBeenCalledTimes(1);
   });
 
+  it('settles the visible final once even when the independent lead report rejects', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const onZeroPromptFinal = vi.fn(async () => { throw new Error('lead offline'); });
+    const onComplete = vi.fn();
+    initWorkerPool({ sessionReply, onZeroPromptFinal,
+      getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.initConfig = { promptInjection: 'none' } as any;
+    ds.currentTurnId = 'turn-1';
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, finalOutputMsg(), 'tag', 0, onComplete);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(onZeroPromptFinal).toHaveBeenCalledTimes(1);
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    expect(ds.completedIdleTurnId).toBe('turn-1');
+    expect(onComplete).toHaveBeenCalledWith(true, 'om_reply');
+  });
+
   it('commits dedup uuid only after a successful sessionReply', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     const closeSession = vi.fn();

@@ -940,6 +940,8 @@ export interface Session {
   suspendedColdResume?: boolean;
   /** CLI used to spawn this session, frozen at creation so bot-level CLI edits only affect new sessions. */
   cliId?: import('./adapters/cli/types.js').CliId;
+  /** Frozen at creation; absent on historical/adopted sessions means default. */
+  promptInjection?: 'default' | 'none';
   /** Bot-owned /cli selection, authoritative when present. */
   cliLaunchSnapshot?: SessionCliLaunchSnapshotV1;
   /** Durable account-directory routing, independent of the live bot defaults. */
