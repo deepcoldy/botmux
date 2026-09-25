@@ -8251,11 +8251,21 @@ function clearOrdinaryImDeliveryTimer(record: OrdinaryImDelivery): void {
   record.timer = undefined;
 }
 
+/** Terminal user-facing notices for an ordinary-IM delivery that never landed.
+ * `input_delivery_failed` states an UNKNOWN outcome ("could not confirm ...
+ * do not resend"), which is only honest when the daemon really cannot tell.
+ * A `rejectedBeforeAdmission` rejection is the opposite: the worker reports
+ * with certainty that the turn never entered the queue, so it gets its own
+ * key instead of being described as ambiguous. */
+type OrdinaryImFailureMessageKey =
+  | 'worker.input_delivery_failed'
+  | 'worker.input_retired_unconfirmed'
+  | 'worker.input_rejected_before_admission';
+
 function failOrdinaryImDelivery(
   record: OrdinaryImDelivery,
   reason: string,
-  messageKey: 'worker.input_delivery_failed' | 'worker.input_retired_unconfirmed'
-    = 'worker.input_delivery_failed',
+  messageKey: OrdinaryImFailureMessageKey = 'worker.input_delivery_failed',
 ): void {
   if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
   clearOrdinaryImDelivery(record);
@@ -8283,7 +8293,7 @@ function failOrdinaryImDelivery(
   const loc = botLocale(getBot(record.ds.larkAppId).config);
   void requireCallbacks().sessionReply(
     sessionAnchorId(record.ds),
-    tr(messageKey, { turnId: record.turnId.substring(0, 16) }, loc),
+    tr(messageKey, { turnId: record.turnId.substring(0, 16), reason }, loc),
     'text',
     record.ds.larkAppId,
     record.turnId,
@@ -8337,7 +8347,11 @@ function delayOrdinaryImDelivery(record: OrdinaryImDelivery): void {
   ));
 }
 
-function retryOrFailOrdinaryImDelivery(record: OrdinaryImDelivery, reason: string): void {
+function retryOrFailOrdinaryImDelivery(
+  record: OrdinaryImDelivery,
+  reason: string,
+  failureMessageKey?: OrdinaryImFailureMessageKey,
+): void {
   if (pendingOrdinaryImDeliveries.get(record.key) !== record) return;
   if (
     record.attempt < ORDINARY_IM_MAX_ATTEMPTS
@@ -8354,7 +8368,7 @@ function retryOrFailOrdinaryImDelivery(record: OrdinaryImDelivery, reason: strin
     sendOrdinaryImDeliveryAttempt(record);
     return;
   }
-  failOrdinaryImDelivery(record, reason);
+  failOrdinaryImDelivery(record, reason, failureMessageKey);
 }
 
 function sendOrdinaryImDeliveryAttempt(record: OrdinaryImDelivery): boolean {
@@ -8606,7 +8620,16 @@ async function rejectOrdinaryImDelivery(
       if (record.rejectionHandoff === handoff) record.rejectionHandoff = undefined;
     }
   }
-  retryOrFailOrdinaryImDelivery(record, `worker_rejected:${rejection.reason}`);
+  // A pre-admission rejection is a KNOWN outcome: the worker refused the turn
+  // before it entered the queue, so nothing ran and nothing has side effects.
+  // Reporting it as "could not confirm ... do not resend" would strand a
+  // message the user is free (and expected) to send again once the turn that
+  // owns the session finishes.
+  retryOrFailOrdinaryImDelivery(
+    record,
+    `worker_rejected:${rejection.reason}`,
+    rejection.rejectedBeforeAdmission ? 'worker.input_rejected_before_admission' : undefined,
+  );
 }
 
 function settleOrdinaryImDeliveriesForWorker(
