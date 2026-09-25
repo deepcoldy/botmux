@@ -2,9 +2,22 @@
  * Pre-built Lark card action webhook event payloads for integration tests.
  */
 
-export function makeToggleEvent(rootId: string, cardNonce?: string, operatorOpenId = 'ou_user', clickedMessageId?: string) {
+export function makeToggleEvent(
+  rootId: string,
+  cardNonce?: string,
+  operatorOpenId = 'ou_user',
+  clickedMessageId?: string,
+  streamCardVersion: string | null = '1',
+) {
   return {
-    action: { value: { action: 'toggle_stream', root_id: rootId, ...(cardNonce ? { card_nonce: cardNonce } : {}) } },
+    action: {
+      value: {
+        action: 'toggle_stream',
+        root_id: rootId,
+        ...(cardNonce ? { card_nonce: cardNonce } : {}),
+        ...(streamCardVersion ? { stream_card_version: streamCardVersion } : {}),
+      },
+    },
     operator: { open_id: operatorOpenId },
     ...(clickedMessageId ? { context: { open_message_id: clickedMessageId } } : {}),
   };

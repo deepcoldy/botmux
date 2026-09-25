@@ -917,6 +917,18 @@ describe('buildStreamingCard', () => {
   it('should have wide_screen_mode config', () => {
     const card = parse(buildStreamingCard(SID, ROOT, URL, TITLE, CONTENT, 'working'));
     expect(card.config.wide_screen_mode).toBe(true);
+    expect(card.config.update_multi).toBe(true);
+  });
+
+  it('marks every callback action with the patchable streaming-card version', () => {
+    const card = parse(buildStreamingCard(
+      SID, ROOT, URL, TITLE, CONTENT, 'working', 'claude-code', 'screenshot',
+    ));
+    const callbackActions = allActions(card).filter((action: any) => action.value?.action);
+    expect(callbackActions.length).toBeGreaterThan(0);
+    for (const action of callbackActions) {
+      expect(action.value.stream_card_version).toBe('1');
+    }
   });
 
   // ── Header / status / template color ───────────────────────────────────
@@ -2339,6 +2351,10 @@ describe('buildPrivateSnapshotCard', () => {
       .filter((e: any) => e.tag === 'action')
       .flatMap((e: any) => e.actions ?? []);
   }
+
+  it('does not opt private one-shot snapshots into shared PATCH updates', () => {
+    expect(build().config.update_multi).toBeUndefined();
+  });
 
   it('exposes open-terminal link, get_write_link, close for non-Codex/TRAE sessions, with no patch-driven controls', () => {
     const card = build({ screen: 'hello' });
