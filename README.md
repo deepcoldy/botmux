@@ -110,6 +110,8 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 
 当前完整 `cliId` 以 [`src/adapters/cli/registry.ts`](https://github.com/deepcoldy/botmux/blob/master/src/adapters/cli/registry.ts) 为准；各 CLI 的配置与套 wrapper / 网关方法见 [多 CLI 适配器](https://deepcoldy.github.io/botmux/adapters)。
 
+托管的本地 Codex（tmux，含 `aiden x codex`）会话卡片提供「思考强度」下拉框。仅修改当前会话；空闲时选择后仅保存配置，卡片显示「待生效」；当前 CLI、预览和后台服务保持运行。设置在下一次正常冷恢复、重新创建 Worker/CLI 时生效，下一条消息或连接重附不会强制重启。执行中、等待输入、接管的外部 CLI 和未验证的后端会拒绝切换。下拉框优先显示上一轮实际强度，已保存但尚未应用的配置沿用「待生效」提示；独立 Codex 实例按已绑定的 home 检查历史，Aiden wrapper 继续遵守上游不支持实例池的限制。机器人默认值仍由各机器人配置管理，不修改本机 Codex 默认值。
+
 ### 会话级 CLI 选择
 
 在会话尚未启动前，可以用 `/cli <cliId>` 为当前会话选择已注册的 CLI，例如：

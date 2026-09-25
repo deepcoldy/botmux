@@ -98,7 +98,7 @@ import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
-import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, canCommitStreamingCardPublication, continuePublishedStreamingCardPinChain, idleCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
+import { setSessionReasoningEffort, forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, canCommitStreamingCardPublication, continuePublishedStreamingCardPinChain, idleCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -129,7 +129,7 @@ import {
 } from '../../services/local-cli-opener.js';
 import { hasProtectedSessionMutationOwnership } from '../../core/session-mutation-guard.js';
 import { persistPendingRepoCardMessageId } from '../../core/pending-repo-journal.js';
-import { runDetachedBotTurnAdmission, withBotTurnAdmission, withBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
+import { runDetachedBotTurnAdmission, withBotTurnAdmission, withBotTurnMutation, tryWithBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
 import { isSharedAdoptSession } from '../../core/shared-adopt.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
@@ -2373,7 +2373,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     );
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'retry_turn', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'stop_turn', 'compact_session', 'quote_confirm'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'retry_turn', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'stop_turn', 'compact_session', 'quote_confirm', 'set_reasoning_effort'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -2841,6 +2841,34 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       if (voicedCardIds.size > 5000) { voicedCardIds.clear(); voicedCardIds.add(dedupeKey); }
       logger.info(`[${tag(ds)}] voice_summary triggered by ${operatorOpenId ?? '?'}`);
       return { toast: { type: 'success', content: t('card.voice.toast_wait', undefined, locDs) } };
+    }
+
+    if (actionType === 'set_reasoning_effort') {
+      const loc = localeForBot(ds?.larkAppId ?? larkAppId);
+      const warning = (key: string) => ({
+        toast: { type: 'warning', content: t(key, undefined, loc) },
+        // A rejected dropdown selection must not keep displaying the unsaved value.
+        ...(ds && ds.streamCardId === cardMessageId ? {
+          card: { type: 'raw' as const, data: JSON.parse(buildStreamingCardJson(ds, ds.session.suspendedColdResume ? 'idle' : undefined)) },
+        } : {}),
+      });
+      if (!ds || !operatorOpenId || !canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
+        return warning('card.effort.unavailable');
+      }
+      const mutation = await tryWithBotTurnMutation(ds.larkAppId, 1000, () => {
+        const current = getSessionByActionValue(activeSessions, rootId, ds.larkAppId, value.session_id, actionType);
+        if (current !== ds || value.session_id !== ds.session.sessionId
+          || !cardMessageId || cardMessageId !== ds.streamCardId
+          || value.card_nonce !== ds.streamCardNonce
+          || value.expected_effort !== (ds.session.reasoningEffort ?? '')) return 'stale' as const;
+        return setSessionReasoningEffort(ds, data.action?.option);
+      });
+      if (!mutation.acquired) return warning('card.effort.busy');
+      if (mutation.value !== 'saved') return warning(`card.effort.${mutation.value}`);
+      return {
+        toast: { type: 'success', content: t('card.effort.saved', undefined, loc) },
+        card: { type: 'raw' as const, data: JSON.parse(buildStreamingCardJson(ds, ds.session.suspendedColdResume ? 'idle' : undefined)) },
+      };
     }
 
     if (actionType === 'restart' && ds) {

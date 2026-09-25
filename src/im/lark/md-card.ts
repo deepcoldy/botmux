@@ -102,6 +102,12 @@ export interface CardUsageSnapshot {
   model?: string;
   /** Latest executor-reported reasoning effort. */
   reasoningEffort?: string;
+  /** Session-only configuration; separate from the last executor-reported effort. */
+  reasoningControl?: {
+    choices: readonly import('../../services/codex-reasoning-effort.js').CodexReasoningEffort[];
+    selected?: string;
+    pending: boolean;
+  };
   /** Frozen TraeX backend variant selected for this session. */
   modelBackendVariant?: string;
   /** Claude model fallback in effect, rendered as its own notice line on the

@@ -5,7 +5,7 @@
 import { execSync, type ChildProcess } from 'node:child_process';
 import { join, dirname, basename } from 'node:path';
 import { homedir } from 'node:os';
-import { readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
+import { statSync, readFileSync, readdirSync, mkdirSync, existsSync, realpathSync, unlinkSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { ensureSkills, ensureAskSkill, ensurePluginSkills, ensureWhiteboardSkill, ensureWorkflowSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
@@ -25,6 +25,7 @@ import { reclaimIdleWorkersForAdmissionAfterTurnDrain } from './idle-worker-swee
 import { createWorkerStderrRing, WORKER_ERROR_MARKER, type WorkerStderrRing } from './worker-stderr-ring.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
+import { drainCodexRollout, findCodexRolloutBySessionId } from '../services/codex-transcript.js';
 import {
   markMessageListenerRunPreviewFailed,
   markMessageListenerRunPreviewReplied,
@@ -39,7 +40,7 @@ import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, s
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName, type IdleCardLabel } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
-import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
+import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, reasoningEffortsForCliModel } from '../services/codex-reasoning-effort.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
 import { loadFrozenCards, saveFrozenCards } from '../services/frozen-card-store.js';
 import { hashUrlForLog } from '../adapters/backend/riff-backend.js';
@@ -438,6 +439,7 @@ export function getDaemonStreamingCardUsageSnapshot(
   // usage metric — it rides the snapshot (every buildStreamingCard call site
   // already forwards one) but must survive the 'off'/'footer' early return.
   const modelFallback = ds.modelFallback;
+  const reasoningControl = sessionReasoningControl(ds);
   try {
     if (resolveUsageDisplay(ds.larkAppId) !== 'streaming') {
       return {
@@ -447,6 +449,7 @@ export function getDaemonStreamingCardUsageSnapshot(
         ...(reasoningEffort ? { reasoningEffort } : {}),
         ...(modelBackendVariant ? { modelBackendVariant } : {}),
         ...(modelFallback ? { modelFallback } : {}),
+        ...(reasoningControl ? { reasoningControl } : {}),
       };
     }
   } catch {
@@ -470,6 +473,7 @@ export function getDaemonStreamingCardUsageSnapshot(
     ...(reasoningEffort ? { reasoningEffort } : grokReasoningEffort ? { reasoningEffort: grokReasoningEffort } : {}),
     ...(modelBackendVariant ? { modelBackendVariant } : {}),
     ...(modelFallback ? { modelFallback } : {}),
+    ...(reasoningControl ? { reasoningControl } : {}),
   };
 }
 
@@ -6782,6 +6786,69 @@ function clearPendingSuspendClaim(ds: DaemonSession, why: string): void {
   ds.pendingSuspendReason = undefined;
   ds.pendingSuspendGeneration = undefined;
   logger.debug(`[${tag(ds)}] Cleared queued suspend claim (${reason ?? 'none'}): ${why}`);
+}
+
+/** Only managed local Codex TUI sessions have a verified cold-resume effort path. */
+export function sessionReasoningControl(ds: DaemonSession): CardUsageSnapshot['reasoningControl'] {
+  const cfg = ds.initConfig ?? ds.session;
+  const wrapper = cfg.wrapperCli?.trim();
+  if ((cfg.cliId ?? ds.session.cliId) !== 'codex'
+    || (wrapper && (wrapper !== 'aiden x codex' || ds.session.cliInstanceBinding || ds.initConfig?.cliInstanceBinding))
+    || cfg.backendType !== 'tmux' || ds.initConfig?.codexRpcInput
+    || ds.session.sandbox || ds.initConfig?.sandbox || ds.initConfig?.readIsolation || sandboxEnabled()
+    || ds.adoptedFrom || ds.session.adoptedFrom || ds.initConfig?.adoptMode) return undefined;
+  return {
+    choices: reasoningEffortsForCliModel('codex', ds.activeModel ?? cfg.model),
+    selected: ds.session.reasoningEffort,
+    pending: !!ds.session.reasoningEffort && (!!ds.session.suspendedColdResume
+      || ds.session.reasoningEffort !== (ds.activeReasoningEffort ?? ds.initConfig?.reasoningEffort)),
+  };
+}
+
+/** Caller holds the bot mutation gate. Never interrupt or replay a business turn. */
+export function setSessionReasoningEffort(ds: DaemonSession, effort: unknown): 'saved' | 'busy' | 'unsupported' | 'invalid' {
+  const control = sessionReasoningControl(ds);
+  if (!control) return 'unsupported';
+  const selected = control.choices.find(candidate => candidate === effort);
+  if (!selected) return 'invalid';
+  if (ds.session.status !== 'active' || isSessionTransferring(ds)
+    || hasProtectedSessionMutationOwnership(ds) || ds.pendingRawInput || ds.pendingFollowUpInput
+    || [...pendingOrdinaryImDeliveries.values()].some(delivery => delivery.ds === ds)) return 'busy';
+  const live = ds.worker && !ds.worker.killed;
+  if (live && (ds.lastScreenStatus !== 'idle' || !ds.workerReady)) return 'busy';
+  if (!live && !ds.session.suspendedColdResume) return 'busy';
+  if (live && ds.session.cliSessionId) {
+    // Reattach can briefly report an idle screen during a native tool call.
+    // Require a real turn boundary before accepting an idle-only change. Bound the read;
+    // missing/partial history is uncertainty, never permission to interrupt.
+    try {
+      const binding = ds.session.cliInstanceBinding ?? ds.initConfig?.cliInstanceBinding;
+      const path = findCodexRolloutBySessionId(ds.session.cliSessionId, binding
+        ? { codexHome: binding.codexHome, noFollow: binding.source !== 'legacy' }
+        : undefined);
+      if (!path) return 'busy';
+      const tail = drainCodexRollout(path, Math.max(0, statSync(path).size - 1024 * 1024));
+      const last = tail.events.filter(event => event.kind !== 'cot').at(-1);
+      if (tail.pendingTail || !last || !['assistant_final', 'turn_aborted'].includes(last.kind)) return 'busy';
+    } catch { return 'busy'; }
+  }
+  if (ds.session.reasoningEffort === selected
+    && (!live || ds.activeReasoningEffort === selected)) return 'saved';
+  const previous = ds.session.reasoningEffort;
+  const snapshot = ds.session.cliLaunchSnapshot;
+  const previousSnapshotEffort = snapshot?.reasoningEffort ?? null;
+  ds.session.reasoningEffort = selected;
+  if (snapshot) snapshot.reasoningEffort = selected;
+  try {
+    // Persist only the next launch preference. Keep the live CLI, preview and
+    // owned services intact; a normal cold resume will consume this setting.
+    sessionStore.updateSession(ds.session);
+  } catch (error) {
+    ds.session.reasoningEffort = previous;
+    if (snapshot) snapshot.reasoningEffort = previousSnapshotEffort;
+    throw error;
+  }
+  return 'saved';
 }
 
 export function suspendWorker(ds: DaemonSession, reason = 'suspended_idle'): boolean {
