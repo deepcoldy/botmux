@@ -414,50 +414,148 @@ async function waitForSubmit(path: string, baseByte: number, timeoutMs: number):
   return false;
 }
 
+export const CLAUDE_MIN_FALLBACK_FINGERPRINT_LEN = 10;
+
+/**
+ * Normalize line endings and strip invisible/formatting characters that trigger
+ * Claude Code 2.1's "Removed X invisible characters · review and press Enter to send"
+ * barrier.
+ *
+ * Note on ZWJ/ZWNJ: Stripping \u200C (ZWNJ) and \u200D (ZWJ) here is an intentional
+ * trade-off: it simplifies TUI input sanitization and eliminates review prompts,
+ * even though it may decompose emoji sequences or certain non-Latin ligatures in TUI input.
+ */
+export function sanitizeClaudeInput(content: string): string {
+  if (typeof content !== 'string') return '';
+  return content
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/[\u200B-\u200D\u2060\uFEFF\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '');
+}
+
+/** Lark metadata headers prepended to user messages (e.g. quote hint and foreign bot handoff).
+ *  Supports both Chinese and English i18n templates. */
+const LARK_METADATA_HEADER_RE = /^\[(?:(?:用户引用了消息|User quoted a message)[^\]\n]*|来自\s+[^\]\n]+?\s+的 @mention|@mention from\s+[^\]\n]+?)\]\s*/gm;
+
+/**
+ * Known BotMux envelope tags to strip when extracting user payload in fallback
+ * mode (e.g. hook injection mode or bare transcript mode where <user_message> is absent).
+ * Covers both pre-userMessage blocks (summary_memory, chat_context, role, whiteboard, etc.)
+ * and post-userMessage blocks (substitute, attachments, mentions, available_bots, etc.).
+ */
+const BOTMUX_ENVELOPE_TAGS = new Set([
+  'botmux_routing',
+  'botmux_builtin_skills',
+  'botmux_skill_help',
+  'identity',
+  'botmux_credentials',
+  'session_id',
+  'role',
+  'summary_memory',
+  'botmux_reminder',
+  'whiteboard',
+  'chat_context_policy',
+  'chat_context',
+  'substitute_trigger',
+  'substitute_target',
+  'substitute_policy',
+  'attachments',
+  'mentions',
+  'available_bots',
+  'botmux_task',
+  'botmux_http_response_mode',
+]);
+
+/**
+ * Strip BotMux envelope blocks using a linear cursor walk (O(N), no regex backtracking).
+ */
+function stripBotmuxEnvelopeBlocks(text: string): string {
+  let i = 0;
+  let out = '';
+  while (i < text.length) {
+    if (text[i] !== '<') {
+      out += text[i];
+      i++;
+      continue;
+    }
+    let nameEnd = -1;
+    for (let j = i + 1; j < text.length; j++) {
+      const ch = text[j];
+      if (ch === '>' || ch === ' ' || ch === '\n' || ch === '\t' || ch === '\r' || ch === '/') {
+        nameEnd = j;
+        break;
+      }
+    }
+    if (nameEnd === -1) {
+      out += text.slice(i);
+      break;
+    }
+    const tagName = text.slice(i + 1, nameEnd);
+    if (tagName === 'sender' || BOTMUX_ENVELOPE_TAGS.has(tagName)) {
+      const openTagEnd = text.indexOf('>', nameEnd);
+      if (openTagEnd === -1) {
+        out += text.slice(i);
+        break;
+      }
+      if (text[openTagEnd - 1] === '/') {
+        i = openTagEnd + 1;
+        continue;
+      }
+      const closeTag = `</${tagName}>`;
+      const closeIdx = text.indexOf(closeTag, openTagEnd + 1);
+      if (closeIdx === -1) {
+        out += text[i];
+        i++;
+        continue;
+      }
+      i = closeIdx + closeTag.length;
+      continue;
+    }
+    out += text[i];
+    i++;
+  }
+  return out;
+}
+
 /** Strip BotMux system envelopes and metadata headers from prompt content
  *  to extract the unique user payload for submit fingerprinting.
  *
  *  All BotMux turns share identical XML wrappers (<botmux_reminder>,
  *  <botmux_routing>, <identity>, etc.) and header annotations ([用户引用了消息...],
- *  [来自...的 @mention]). Using the raw envelope causes all sessions across
- *  the machine to share the exact same 30-char fingerprint, leading to false-positive
+ *  [来自...的 @mention], [@mention from ...]). Using the raw envelope causes all sessions
+ *  across the machine to share the exact same 30-char fingerprint, leading to false-positive
  *  submit confirmations against sibling/other sessions and leaving prompts
  *  stuck unsubmitted in the CLI input box. */
 export function extractMessageContentForFingerprint(content: string): string {
   if (typeof content !== 'string') return '';
-  const userMsgMatch = content.match(/<user_message>([\s\S]*?)<\/user_message>/);
-  if (userMsgMatch) {
-    const inner = userMsgMatch[1]
-      .replace(/^\[(?:用户引用了消息|来自)[^\]]*\]\s*/gm, '')
-      .trim();
-    if (inner.length > 0) return inner;
-    const rawInner = userMsgMatch[1].trim();
-    if (rawInner.length > 0) return rawInner;
+
+  // 1. Fast, linear search for <user_message>...</user_message> (avoids regex quadratic backtracking)
+  const openTag = '<user_message>';
+  const closeTag = '</user_message>';
+  const openIdx = content.indexOf(openTag);
+  if (openIdx !== -1) {
+    const closeIdx = content.indexOf(closeTag, openIdx + openTag.length);
+    if (closeIdx !== -1) {
+      const inner = content.slice(openIdx + openTag.length, closeIdx);
+      const cleaned = inner.replace(LARK_METADATA_HEADER_RE, '').trim();
+      if (cleaned.length > 0) return cleaned;
+      const rawCleaned = inner.trim();
+      if (rawCleaned.length > 0) return rawCleaned;
+    }
   }
 
-  let cleaned = content
-    .replace(/<botmux_routing>[\s\S]*?<\/botmux_routing>/g, '')
-    .replace(/<botmux_builtin_skills>[\s\S]*?<\/botmux_builtin_skills>/g, '')
-    .replace(/<identity>[\s\S]*?<\/identity>/g, '')
-    .replace(/<available_bots[\s\S]*?<\/available_bots>/g, '')
-    .replace(/<session_id>[\s\S]*?<\/session_id>/g, '')
-    .replace(/<role\b[\s\S]*?<\/role>/g, '')
-    .replace(/<botmux_reminder>[\s\S]*?<\/botmux_reminder>/g, '')
-    .replace(/<botmux_task\b[\s\S]*?<\/botmux_task>/g, '')
-    .replace(/<whiteboard\b[\s\S]*?<\/whiteboard>/g, '')
-    .replace(/<attachments>[\s\S]*?<\/attachments>/g, '')
-    .replace(/<mentions>[\s\S]*?<\/mentions>/g, '')
-    .replace(/<sender\b[\s\S]*?\/>/g, '')
-    .replace(/<sender\b[\s\S]*?<\/sender>/g, '')
-    .replace(/^\[(?:用户引用了消息|来自)[^\]]*\]\s*/gm, '')
-    .trim();
-
+  // 2. Fallback for hook injection mode or bare transcript mode where <user_message> is omitted.
+  //    Walks all known envelope blocks (<summary_memory>, <chat_context_policy>, <chat_context>, etc.)
+  //    and strips metadata headers.
+  const stripped = stripBotmuxEnvelopeBlocks(content);
+  const cleaned = stripped.replace(LARK_METADATA_HEADER_RE, '').trim();
   return cleaned.length > 0 ? cleaned : content.trim();
 }
 
 export function makeSubmitFingerprint(content: string, len = 30): string | undefined {
-  const payload = extractMessageContentForFingerprint(content);
-  const collapsed = normaliseForFingerprint(payload || content);
+  const sanitized = sanitizeClaudeInput(content);
+  const payload = extractMessageContentForFingerprint(sanitized);
+  const collapsed = normaliseForFingerprint(payload || sanitized);
   return collapsed.length > 0 ? collapsed.substring(0, len) : undefined;
 }
 
@@ -605,7 +703,7 @@ function findJsonlAcrossProjectsRoot(
   fingerprint: string,
   options: { minMtimeMs?: number; minEventTimestampMs?: number; includeQueueOperations?: boolean },
 ): string | null {
-  if (fingerprint.length < 10) return null;
+  if (fingerprint.length < CLAUDE_MIN_FALLBACK_FINGERPRINT_LEN) return null;
   const primaryDir = dirname(searchPath);
   const primary = findJsonlContainingFingerprint(primaryDir, fingerprint, {
     excludePath: searchPath,
@@ -1137,8 +1235,9 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // so future writes are measured against the right transcript. Inside
       // confirmSubmit a mid-flight rotation does NOT advance baseByte — the
       // submit may already be in the rotated jsonl from before our re-resolve.
+      const sanitizedContent = sanitizeClaudeInput(content);
       let baseByte = pty.claudeJsonlPath ? currentFileSize(pty.claudeJsonlPath) : 0;
-      const submitFingerprint = makeSubmitFingerprint(content);
+      const submitFingerprint = makeSubmitFingerprint(sanitizedContent);
       const submitSearchMinMtime = Date.now() - 60_000;
       const buildResult = (submitted: boolean, failureReason?: string): { submitted: boolean; cliSessionId?: string; failureReason?: string } => {
         const result = observedCliSessionId
@@ -1152,14 +1251,6 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       if (!submitKeySupportedByBackend) {
         return buildResult(false, keybindings.failureReason ?? UNSUPPORTED_SUBMIT_KEY_FAILURE);
       }
-
-      // Normalize line breaks and strip invisible characters that would trigger
-      // Claude Code's "Removed X invisible characters · review and press Enter to send"
-      // barrier which blocks input submission on the first Enter.
-      const sanitizedContent = content
-        .replace(/\r\n/g, '\n')
-        .replace(/\r/g, '\n')
-        .replace(/[\u200B-\u200D\u2060\uFEFF\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '');
 
       if (pty.sendText && pty.sendSpecialKeys) {
         const lines = sanitizedContent.split('\n');
@@ -1252,7 +1343,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         // Per-attempt scope is intentionally narrow (dirname only) — the
         // cross-project fan-out only runs once at end-of-writeInput and in
         // the recheck closure, not per retry, to keep the worst case bounded.
-        if (submitFingerprint) {
+        if (submitFingerprint && submitFingerprint.length >= CLAUDE_MIN_FALLBACK_FINGERPRINT_LEN) {
           const searchPath = pty.claudeJsonlPath ?? startPath;
           const matched = findJsonlContainingFingerprint(dirname(searchPath), submitFingerprint, {
             excludePath: searchPath,

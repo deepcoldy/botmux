@@ -64,10 +64,12 @@ vi.mock('node:fs', () => {
 
 import {
   CLAUDE_INPUT_CHUNK_BYTES,
+  CLAUDE_MIN_FALLBACK_FINGERPRINT_LEN,
   chunkTextByUtf8Bytes,
   createClaudeCodeAdapter,
   extractMessageContentForFingerprint,
   makeSubmitFingerprint,
+  sanitizeClaudeInput,
 } from '../src/adapters/cli/claude-code.js';
 import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
@@ -1315,6 +1317,53 @@ describe('claude-code writeInput submission confirmation', () => {
     expect(fp).not.toContain('botmux_reminder');
   });
 
+  it('extractMessageContentForFingerprint strips English metadata headers and hook mode context blocks', () => {
+    // English metadata headers
+    const enPrompt = `<user_message>
+[@mention from ReviewerBot]
+[User quoted a message — run \`botmux quoted om_123456\` to view it]
+Please review this implementation.
+</user_message>`;
+    expect(extractMessageContentForFingerprint(enPrompt)).toBe('Please review this implementation.');
+
+    // Hook mode context blocks (no <user_message> wrapper)
+    const hookPrompt = `<role context="group" chat_id="oc_123">Software Engineer</role>
+
+<summary_memory>
+Read summary.md first.
+</summary_memory>
+
+<whiteboard id="wb_123" hint="whiteboard">
+Active whiteboard content
+</whiteboard>
+
+<chat_context_policy>Group chat context policy</chat_context_policy>
+
+<chat_context source="lark" trust="untrusted">
+  <name>Project Group</name>
+</chat_context>
+
+Fix the test suite failure on CI
+
+<sender type="user" id="ou_123" />
+<attachments hint="attachments">test.log</attachments>`;
+
+    const hookPayload = extractMessageContentForFingerprint(hookPrompt);
+    expect(hookPayload).toBe('Fix the test suite failure on CI');
+    expect(hookPayload).not.toContain('summary_memory');
+    expect(hookPayload).not.toContain('chat_context');
+    expect(hookPayload).not.toContain('whiteboard');
+    expect(hookPayload).not.toContain('attachments');
+
+    // ReDoS safety on unclosed <user_message>
+    const unclosed = '<user_message>'.repeat(3000) + 'safe content';
+    const t0 = Date.now();
+    const res = extractMessageContentForFingerprint(unclosed);
+    const elapsed = Date.now() - t0;
+    expect(elapsed).toBeLessThan(100);
+    expect(res).toContain('safe content');
+  });
+
   it('makeSubmitFingerprint generates distinct fingerprints for prompts with identical botmux_reminder envelopes', () => {
     const reminder = '<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>';
     const promptA = `${reminder}\n\n<user_message>First user instruction for session A</user_message>`;
@@ -1326,6 +1375,16 @@ describe('claude-code writeInput submission confirmation', () => {
     expect(fpA).not.toBe(fpB);
     expect(fpA).toContain('First user instruction');
     expect(fpB).toContain('Second user instruction');
+  });
+
+  it('makeSubmitFingerprint sanitizes invisible characters and CRLF to match normalized jsonl content', () => {
+    const raw = '<user_message>clean\u200B line one\r\nsecond\uFEFF line</user_message>';
+    const fp = makeSubmitFingerprint(raw, 30);
+    expect(fp).toBeDefined();
+    expect(fp).not.toContain('\u200B');
+    expect(fp).not.toContain('\uFEFF');
+    expect(fp).not.toContain('\r');
+    expect(fp).toContain('clean line one');
   });
 
   it('writeInput sanitizes CRLF and invisible characters before typing into tmux pane', async () => {
@@ -1365,6 +1424,77 @@ describe('claude-code writeInput submission confirmation', () => {
       expect(chunk).not.toContain('\u200B');
       expect(chunk).not.toContain('\uFEFF');
     }
+  });
+
+  it('writeInput confirms submit via fingerprint when prompt contains zero-width characters in first 30 chars', async () => {
+    const { oldPath, newPath } = makeClaudeJsonlPaths('sanitized-fp-rotation');
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+
+    // Raw prompt has zero-width space inside the first 30 chars of payload
+    const rawPrompt = '<user_message>clean\u200B prefix payload line</user_message>';
+    const sanitizedPrompt = sanitizeClaudeInput(rawPrompt);
+
+    let wroteNewTranscript = false;
+    const pty: PtyHandle = {
+      claudeJsonlPath: oldPath,
+      cliPid: 98765, // No pid file -> falls back to fingerprint search
+      cliCwd: '/tmp/sanitized-fp-cwd',
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn((key: string) => {
+        if (key !== 'Enter' || wroteNewTranscript) return;
+        wroteNewTranscript = true;
+        // Claude writes sanitized content into newPath
+        writeFileSync(
+          newPath,
+          JSON.stringify({
+            type: 'user',
+            timestamp: new Date().toISOString(),
+            message: { role: 'user', content: sanitizedPrompt },
+          }) + '\n',
+        );
+      }),
+    };
+
+    const result = await adapter.writeInput(pty, rawPrompt);
+    expect(result).toBeUndefined();
+    // Successfully confirmed via fingerprint and repointed claudeJsonlPath to newPath
+    expect(pty.claudeJsonlPath).toBe(newPath);
+  });
+
+  it('writeInput fallback fingerprint search does not match sibling session for short inputs (< 10 chars)', async () => {
+    const cwd = '/tmp/sibling-short-nomatch';
+    const sidA = '11111111-aaaa-4aaa-8aaa-111111111111';
+    const sidB = '22222222-bbbb-4bbb-8bbb-222222222222';
+    const pathA = makeJsonlForSession('sibling-short-nomatch', sidA, cwd);
+    const pathB = makeJsonlForSession('sibling-short-nomatch', sidB, cwd);
+
+    const shortPrompt = '<user_message>ok</user_message>';
+
+    // Sibling session B recently logged "ok"
+    writeFileSync(
+      pathB,
+      JSON.stringify({
+        type: 'user',
+        timestamp: new Date().toISOString(),
+        message: { role: 'user', content: 'ok' },
+      }) + '\n',
+    );
+
+    const adapter = createClaudeCodeAdapter('/bin/claude');
+    const pty: PtyHandle = {
+      claudeJsonlPath: pathA,
+      write: vi.fn(),
+      sendText: vi.fn(),
+      sendSpecialKeys: vi.fn(), // Simulate swallowed Enter -> no write to pathA
+    };
+
+    const result = await adapter.writeInput(pty, shortPrompt);
+
+    // Because fingerprint is shorter than CLAUDE_MIN_FALLBACK_FINGERPRINT_LEN (10),
+    // it must NOT hijack sibling session B's pathB!
+    expect(result).toMatchObject({ submitted: false });
+    expect(pty.claudeJsonlPath).toBe(pathA);
   });
 
   it('writeInput does not false-match sibling session JSONL sharing the same botmux_reminder envelope', async () => {
