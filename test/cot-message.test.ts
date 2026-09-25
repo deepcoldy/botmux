@@ -68,6 +68,19 @@ beforeEach(() => {
 });
 
 describe('handleCotThinkingUpdate', () => {
+  it.each([false, true])('keeps hidden recovery turns quiet after restore with cotForced=%s', async cotForced => {
+    const ds = makeDs({ cotForced, session: JSON.parse(JSON.stringify({ hiddenThinkingTurns: ['trg_recovery'] })) });
+    handleCotThinkingUpdate(ds, upd([say('User work')], 'om_user'));
+    await flush(); request.mockClear();
+    expect(handleCotThinkingUpdate(ds, upd([say('Internal recovery')], 'trg_recovery'))).toBe(false);
+    expect(finalizeCotMessage(ds, 'trg_recovery', 'completed')).toBe(false);
+    expect(handleCotThinkingUpdate(ds, upd([say('Late update')], 'trg_recovery'))).toBe(false);
+    await flush(); expect(request).not.toHaveBeenCalled();
+    expect(finalizeCotMessage(ds, 'om_user', 'completed')).toBe(true);
+    await flush(); expect(pushedEvents().some(e => e.type === 'RUN_FINISHED')).toBe(true);
+    expect(handleCotThinkingUpdate(ds, upd([say('Next user reply')], 'om_next'))).toBe(true);
+  });
+
   it.each([false, true])('keeps silent scheduled thinking quiet with cotForced=%s', async (cotForced) => {
     const ds = makeDs({ cotForced });
     armSilentScheduledTurn(ds, 'schedule:quiet');

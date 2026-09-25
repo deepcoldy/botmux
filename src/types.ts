@@ -858,6 +858,8 @@ export interface Session {
   quoteTargetSenderIsBot?: boolean;
   /** Persisted streaming-card state — allows the existing card to be PATCHed
    *  (rather than a fresh POST) after daemon restart. */
+  /** Exact trigger turns with hidden thinking, persisted for restore and late transcript events. */
+  hiddenThinkingTurns?: string[];
   streamCardId?: string;
   streamCardNonce?: string;
   /** Stable visible destination of the persisted live streaming card. */

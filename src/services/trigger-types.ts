@@ -38,6 +38,8 @@ export interface TriggerRequest {
   /** Trusted presentation chosen by the connector owner. Undefined keeps the
    * localized default topic seed; null suppresses the seed entirely. */
   presentation?: {
+    /** Hide only this trigger's thinking bubble; business notices and HTTP results remain available. */
+    thinking?: 'hidden';
     topicMessage?: string | null;
     title?: string;
   };
@@ -269,6 +271,9 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   if (raw.presentation !== undefined) {
     if (!isRecord(raw.presentation)) {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation must be an object' } };
+    }
+    if (raw.presentation.thinking !== undefined && raw.presentation.thinking !== 'hidden') {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.thinking must be hidden' } };
     }
     const topicMessage = raw.presentation.topicMessage;
     if (topicMessage !== undefined && topicMessage !== null && typeof topicMessage !== 'string') {

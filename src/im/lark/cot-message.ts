@@ -631,7 +631,7 @@ export function handleCotThinkingUpdate(
 ): boolean {
   // Thinking bubbles are outbound messages too. Keep silent fires quiet even
   // when /cot show is armed, without suppressing another turn in this session.
-  if (isSilentScheduledTurn(ds, msg.turnId)) return false;
+  if (isSilentScheduledTurn(ds, msg.turnId) || ds.session.hiddenThinkingTurns?.includes(msg.turnId)) return false;
   if (!cotEnabled(ds)) return false;
   const key = turnKeyOf(msg);
   let state = states.get(ds);

@@ -17,7 +17,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { TriggerRequest } from '../src/services/trigger-types.js';
+import { validateTriggerRequest, type TriggerRequest } from '../src/services/trigger-types.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 let tempDir: string;
@@ -512,5 +512,45 @@ describe('turn-level idempotency — codex #818 P1 regressions', () => {
     expect(ds.idempotentAsyncTurns?.size ?? 0).toBe(0); // stale fault entry cleared
     expect(mockSendWorkerInput).not.toHaveBeenCalled();
     void realRFS;
+  });
+});
+
+
+describe('recovery thinking presentation', () => {
+  it('validates the explicit thinking option and retains normal requests', () => {
+    const req = followUpReq('presentation');
+    expect(validateTriggerRequest(req).ok).toBe(true);
+    expect(validateTriggerRequest({ ...req, presentation: { thinking: 'hidden' } }).ok).toBe(true);
+    expect(validateTriggerRequest({ ...req, presentation: { thinking: true } }).ok).toBe(false);
+  });
+
+  it('bounds restored hidden turns while recording the exact new worker input', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    ds.session.hiddenThinkingTurns = Array.from({ length: 256 }, (_, i) => `old_${i}`);
+    const req = followUpReq(undefined);
+    req.presentation = { thinking: 'hidden' };
+    const res = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: activeWith(ds) });
+    expect(res.ok).toBe(true);
+    expect(ds.session.hiddenThinkingTurns).toHaveLength(256);
+    expect(ds.session.hiddenThinkingTurns).not.toContain('old_0');
+    expect(ds.session.hiddenThinkingTurns.at(-1)).toBe(res.triggerId);
+    expect(mockSendWorkerInput.mock.calls.at(-1)?.[2]).toBe(res.triggerId);
+  });
+
+  it.each([true, false])('preserves async receipts and ordinary turns with live worker=%s', async live => {
+    const ds = existingDs({ worker: live ? { killed: false, send: vi.fn() } as any : null });
+    const active = activeWith(ds);
+    const req = followUpReq('hidden-recovery'); req.presentation = { thinking: 'hidden' };
+    const first = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(first.ok).toBe(true);
+    expect(ds.session.hiddenThinkingTurns).toEqual([first.triggerId]);
+    expect(ds.asyncTriggerResults?.has(first.triggerId!)).toBe(true);
+    const repeated = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(repeated.triggerId).toBe(first.triggerId);
+    expect(ds.session.hiddenThinkingTurns).toEqual([first.triggerId]);
+    const normal = await triggerSessionTurn(followUpReq('normal'), { larkAppId: APP, activeSessions: active });
+    expect(normal.ok).toBe(true);
+    expect(ds.session.hiddenThinkingTurns).not.toContain(normal.triggerId);
+    expect(ds.suppressedTriggerFinalTurns?.has(first.triggerId!)).not.toBe(true);
   });
 });
