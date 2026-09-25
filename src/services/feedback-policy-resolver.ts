@@ -120,10 +120,10 @@ export function resolveEffectiveFeedbackPolicy(input: {
   mergeLayer(merged, input.bot);
   mergeLayer(merged, input.chat);
   if (merged.enabled !== true) return undefined;
-  // Individually-valid layers can still merge into an invalid whole — most
-  // notably `audience: 'reviewers'` with an empty reviewers allowlist once the
-  // layers are combined. Fail closed (feedback simply not shown) rather than
-  // letting the throw propagate to the unguarded worker-spawn delivery path.
+  // Individually-valid layers can still merge into an invalid whole (for
+  // example, a reviewers allowlist paired with another audience). Fail closed
+  // rather than letting the throw propagate to worker-spawn delivery. An empty
+  // reviewers allowlist is valid and remains visible but unclickable.
   try {
     return structuredClone(normalizeFeedbackPolicy(merged));
   } catch {
