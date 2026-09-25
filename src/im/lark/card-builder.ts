@@ -957,6 +957,8 @@ function pushStreamBody(
  * Quick-action buttons (Esc, ^C, Tab, Space, Enter, ←↑↓→, ½屏 ↑/↓) appear
  * whenever displayMode !== 'hidden'.
  */
+export const STREAMING_CARD_PATCH_VERSION = '1';
+
 export function buildStreamingCard(
   sessionId: string,
   rootId: string,
@@ -991,7 +993,13 @@ export function buildStreamingCard(
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
-  const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId, ...(cardNonce ? { card_nonce: cardNonce } : {}) };
+  const actionBase = {
+    root_id: rootId,
+    session_id: sessionId,
+    cli_id: effectiveCliId,
+    stream_card_version: STREAMING_CARD_PATCH_VERSION,
+    ...(cardNonce ? { card_nonce: cardNonce } : {}),
+  };
   const displayStatus = status === 'limited' && usageLimit?.retryReady ? 'retry_ready' : status;
 
   const elements: any[] = [];
@@ -1202,7 +1210,10 @@ export function buildStreamingCard(
   }
 
   const card = {
-    config: { wide_screen_mode: true },
+    // Lark's ordinary message PATCH endpoint only updates cards whose original
+    // and replacement payloads both opt into shared updates. Streaming cards
+    // are group-visible mutable UI, so this is part of their wire contract.
+    config: { wide_screen_mode: true, update_multi: true },
     header: {
       title: { tag: 'plain_text', content: `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale, silentIdle)}` },
       template: STREAM_STATUS_TEMPLATE_MAP[displayStatus],

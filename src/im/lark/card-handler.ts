@@ -15,7 +15,7 @@ import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
 import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
 import { isBotAdmin } from './grant-owner.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard, frozenIdleLabel } from './card-builder.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard, frozenIdleLabel, STREAMING_CARD_PATCH_VERSION } from './card-builder.js';
 import { codexServiceTierBadge } from '../../services/codex-service-tier.js';
 import {
   findConfigField,
@@ -98,7 +98,7 @@ import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
-import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, canCommitStreamingCardPublication, continuePublishedStreamingCardPinChain, idleCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
+import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, canCommitStreamingCardPublication, continuePublishedStreamingCardPinChain, idleCardLabel, dshRuntimeForSession, postFreshStreamingCard, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -289,6 +289,18 @@ const LEGACY_SELF_HEAL_ACTIONS = new Set(['toggle_display', 'toggle_stream', 're
 // In-memory (per daemon lifetime) — a restart resets it, which at worst allows
 // one re-trigger on an old card; acceptable. Capped to avoid unbounded growth.
 const voicedCardIds = new Set<string>();
+const legacyStreamingCardMigrationIds = new Set<string>();
+const LEGACY_STREAMING_CARD_MIGRATION_LIMIT = 2_000;
+
+function claimLegacyStreamingCardMigration(messageId: string): boolean {
+  if (legacyStreamingCardMigrationIds.has(messageId)) return false;
+  if (legacyStreamingCardMigrationIds.size >= LEGACY_STREAMING_CARD_MIGRATION_LIMIT) {
+    const oldest = legacyStreamingCardMigrationIds.values().next().value;
+    if (oldest) legacyStreamingCardMigrationIds.delete(oldest);
+  }
+  legacyStreamingCardMigrationIds.add(messageId);
+  return true;
+}
 
 // Instruction injected into the session when the voice button is clicked. The
 // model (which still has its just-sent reply in context) condenses it into
@@ -3745,10 +3757,61 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
       }
       const clickedNonce: string | undefined = value?.card_nonce;
+      const needsPatchContractMigration =
+        value?.stream_card_version !== STREAMING_CARD_PATCH_VERSION;
       const isFrozenClick = clickedNonce && ds.streamCardNonce && clickedNonce !== ds.streamCardNonce;
 
       const nextMode = (current: DisplayMode): DisplayMode =>
         current === 'hidden' ? 'screenshot' : 'hidden';
+
+      if (needsPatchContractMigration) {
+        const legacyMessageId = cardMessageId
+          ?? (ds.streamCardId !== CARD_POSTING_SENTINEL ? ds.streamCardId : undefined);
+        if (!legacyMessageId || !claimLegacyStreamingCardMigration(legacyMessageId)) {
+          return { toast: { type: 'info', content: t('toast.action_received_bg', undefined, localeForBot(ds.larkAppId)) } };
+        }
+        const current: DisplayMode = ds.displayMode ?? 'hidden';
+        const next = nextMode(current);
+        ds.displayMode = next;
+        persistStreamCardState(ds);
+        if (ds.worker || isSessionTransferring(ds)) {
+          sendWorkerSessionInput(ds, { type: 'set_display_mode', mode: next });
+        }
+        logger.info(`[${tag(ds)}] Display mode → ${next} (legacy card migration)`);
+        return {
+          toast: {
+            type: 'info',
+            content: t('toast.action_received_bg', undefined, localeForBot(ds.larkAppId)),
+          },
+          afterAck: async () => {
+            let migrated = false;
+            try {
+              migrated = await postFreshStreamingCard(
+                ds,
+                deps.sessionReply,
+                { retireMessageId: legacyMessageId },
+              );
+            } catch (err) {
+              logger.warn(`[${tag(ds)}] Legacy streaming-card migration crashed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+            if (!migrated) {
+              // The old card did not change, so roll back the optimistic mode
+              // only when no newer action has superseded it. A retry will then
+              // request the same visible transition instead of toggling back.
+              if (ds.displayMode === next) {
+                ds.displayMode = current;
+                persistStreamCardState(ds);
+                if (ds.worker || isSessionTransferring(ds)) {
+                  sendWorkerSessionInput(ds, { type: 'set_display_mode', mode: current });
+                }
+              }
+              // A failed migration must remain retryable on the next click.
+              legacyStreamingCardMigrationIds.delete(legacyMessageId);
+              logger.warn(`[${tag(ds)}] Legacy streaming-card migration failed for ${legacyMessageId.substring(0, 12)}`);
+            }
+          },
+        };
+      }
 
       if (isFrozenClick) {
         // Historical card — toggle using cached state
@@ -3896,7 +3959,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
             logger.debug(`[${tag(ds)}] Failed to migrate clicked legacy card: ${err}`),
           );
           try { return JSON.parse(cardJson); } catch { /* fall through */ }
-        } else if (!scheduleCardPatch(ds, cardJson)) {
+        } else if (!scheduleCardPatch(ds, cardJson, undefined, { userInitiated: true })) {
           // The queue can decline when live cards are disabled for this turn or
           // transport/card identity is unavailable. In that case the callback
           // must carry the rebuilt card so the clicked card still updates.
