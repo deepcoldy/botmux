@@ -18,6 +18,25 @@ import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
 const item = (content: string, turnId?: string) => ({ content, turnId });
 
 describe('InflightInputTracker', () => {
+  it('retires an interrupted turn before CLI exit without dropping its next task', () => {
+    const tracker = new InflightInputTracker();
+    tracker.onWrite(item('interrupted', 'stop'));
+    tracker.onWrite(item('next task', 'next'));
+    tracker.retireTurn('stop');
+    expect(tracker.onCliExit()).toBe(1);
+    expect(tracker.takeCarryOver()).toEqual([item('next task', 'next')]);
+  });
+
+  it('retires an interrupted turn already moved to carry-over before restart', () => {
+    const tracker = new InflightInputTracker();
+    tracker.onWrite(item('interrupted', 'stop'));
+    tracker.onWrite(item('next task', 'next'));
+    tracker.onCliExit();
+    tracker.retireTurn('stop');
+    tracker.retireTurn('stop');
+    expect(tracker.takeCarryOver()).toEqual([item('next task', 'next')]);
+  });
+
   it('incident shape: write → CLI crash → respawn re-queues the lost input', () => {
     const t = new InflightInputTracker();
     t.onWrite(item('review PR #159', 'turn-1'));

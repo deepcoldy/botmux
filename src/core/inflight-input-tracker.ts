@@ -63,6 +63,14 @@ export class InflightInputTracker {
     return true;
   }
 
+  /** A caller acknowledged an exact-turn interrupt. Drop that turn from both
+   * replay stages, including an exit that already moved its input to carryOver.
+   * Unrelated type-ahead inputs still belong to the next CLI generation. */
+  retireTurn(turnId: string): void {
+    this.unacked = this.unacked.filter(item => item.turnId !== turnId);
+    this.carryOver = this.carryOver.filter(item => item.turnId !== turnId);
+  }
+
   /** CLI is back at its idle prompt — everything written has been consumed
    *  (answered, steered into the active turn, or drained from the TUI's own
    *  type-ahead queue). Nothing is in flight anymore. */

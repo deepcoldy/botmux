@@ -9522,6 +9522,15 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
     send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'stale_turn' });
     return;
   }
+  if (delivered) {
+    // Ctrl+C can exit the CLI and enter its ordinary crash-replay path. Retire
+    // only this exact turn BEFORE acknowledging interruption to the daemon;
+    // otherwise the caller sees interrupted while auto-restart executes it again.
+    inflightInputs.retireTurn(turnId);
+    for (let i = pendingMessages.length - 1; i >= 0; i--) {
+      if (pendingMessages[i].turnId === turnId) pendingMessages.splice(i, 1);
+    }
+  }
   send({ type: 'turn_interrupt_result', requestId, turnId, delivered, ...(delivered ? {} : { reason: 'delivery_failed' as const }) });
   if (delivered) {
     if (tuiPromptBlocking) {
