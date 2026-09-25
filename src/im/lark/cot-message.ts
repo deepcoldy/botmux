@@ -248,6 +248,17 @@ export function cotEnabled(ds: DaemonSession): boolean {
   }
 }
 
+/** 思考气泡是否附带工具输出（TOOL_CALL_RESULT 代码块）：bot 级
+ *  `thinkingCardToolResult`，默认 ON，只有显式 false 关闭。每个 entry 现场读
+ *  注册表，改配置下一批推送即生效；读不到 bot 按开处理，保持既有渲染。 */
+export function cotToolResultEnabled(ds: DaemonSession): boolean {
+  try {
+    return getBot(ds.larkAppId).config.thinkingCardToolResult !== false;
+  } catch {
+    return true;
+  }
+}
+
 function ev(eventType: string, content: unknown): CotEvent {
   return { event_type: eventType, content: JSON.stringify(content), timestamp: Date.now() };
 }
@@ -537,7 +548,7 @@ function entryEvents(ds: DaemonSession, state: CotState, entry: CotEntry, index:
   }
   // TOOL_CALL_RESULT settles the tool node. Empty results still need a compact
   // completion marker so the Feishu renderer does not leave the node spinning.
-  const omitResult = entry.result.length === 0;
+  const omitResult = !cotToolResultEnabled(ds) || entry.result.length === 0;
   const language = omitResult ? undefined : state.resultLanguages?.get(entry.id);
   return [
     ev('TOOL_CALL_RESULT', {

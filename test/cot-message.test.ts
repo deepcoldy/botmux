@@ -569,6 +569,19 @@ describe('handleCotThinkingUpdate', () => {
     expect(body.language).toBe('typescript');
   });
 
+  it('legacy tool-output opt-out still settles the tool without publishing its result', async () => {
+    vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: true, thinkingCardToolResult: false } } as any);
+    const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([
+      { kind: 'tool_call', id: 'hidden-result', name: 'Bash', args: '{"command":"echo example"}' },
+      { kind: 'tool_result', id: 'hidden-result', result: 'private-result-body' },
+    ]));
+    await flush();
+    const result = pushedEvents().find(e => e.type === 'TOOL_CALL_RESULT')!;
+    expect(JSON.parse(result.content.content)).toEqual({ type: 'text', text: '✓ 已完成' });
+    expect(JSON.stringify(pushedEvents())).not.toContain('private-result-body');
+  });
+
   it('an empty tool result is also closed with the marker rather than left pending', async () => {
     const ds = makeDs();
     handleCotThinkingUpdate(ds, upd([

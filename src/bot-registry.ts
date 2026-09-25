@@ -1986,6 +1986,8 @@ export interface BotConfig {
    * {@link noCotChats} (`/cot off`).
   */
   cotEnabled?: boolean;
+  /** Legacy tool-output preference; false still suppresses result bodies. */
+  thinkingCardToolResult?: boolean;
   /** chat_id list: chats where the CoT (thinking process) message is suppressed
    *  even when {@link cotEnabled} is on. Written by `/cot off|on`. */
   noCotChats?: string[];
@@ -3813,6 +3815,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // Retired final-only preference must not opt into an extra terminal card.
       disableStreamingCard: entry.disableStreamingCard === true || entry.replyCardMode === 'final-only' || undefined,
       replyCardMode: entry.replyCardMode === 'unified' || entry.replyCardMode === 'final-only' ? 'unified' : undefined,
+      thinkingCardToolResult: entry.thinkingCardToolResult === false ? false : undefined,
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
