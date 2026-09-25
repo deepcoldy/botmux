@@ -6644,6 +6644,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               blocker 的可审计操作员出口；revoke 需 --yes，存活证据需 --force）
   list        列出活跃会话（交互式选择并连接 tmux）
               --plain  纯文本表格输出（管道/脚本场景）
+  observe [--session <id>] [--lark-app <appId>] [--include-raw]
+              通过 daemon 实时 IPC 输出 canonical worker/session JSON；失败保持 unknown，不回退缓存
   delete <id>      关闭指定会话（支持 ID 前缀匹配）
   delete all       关闭所有活跃会话
   delete stopped   清理所有进程已退出的僵尸会话
@@ -16238,6 +16240,13 @@ switch (command) {
     }
     const { cmdSession } = await import('./cli/session-command.js');
     process.exitCode = await cmdSession(process.argv.slice(3));
+    break;
+  }
+  case 'observe': {
+    // Canonical worker/session observe seam (see src/services/session-observe.ts).
+    // Read-only, HMAC loopback IPC, no cache fallback, no phase inference.
+    const { runObserveCommand } = await import('./cli/observe-command.js');
+    process.exitCode = await runObserveCommand(process.argv.slice(3));
     break;
   }
   case 'send':     await cmdSend(process.argv.slice(3)); break;
