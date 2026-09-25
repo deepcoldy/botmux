@@ -14476,7 +14476,11 @@ async function spawnCli(
     sourceDir: cfg.credentialsSourceDir,
     cliId: cfg.cliId,
     codexAuthSync: cfg.codexAuthSync,
+    sandboxRequested,
     willRedirectCliData,
+    wrapperCli: cfg.wrapperCli,
+    supportsReadIsolation: cliAdapter.supportsReadIsolation === true,
+    sessionDataDirPresent: !!process.env.SESSION_DATA_DIR,
     isClaudeFamily: !!claudeDataDir,
     perBotEnv: cfg.env,
   });

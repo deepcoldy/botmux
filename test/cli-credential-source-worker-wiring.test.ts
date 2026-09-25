@@ -20,6 +20,10 @@ describe('credentialsSourceDir daemon → worker cold-spawn wiring', () => {
     expect(gate).toBeGreaterThan(plan);
     const planBlock = worker.slice(plan, gate);
     expect(planBlock).toContain('willRedirectCliData,');
+    expect(planBlock).toContain('    sandboxRequested,\n');
+    expect(planBlock).toContain('wrapperCli: cfg.wrapperCli,');
+    expect(planBlock).toContain('supportsReadIsolation: cliAdapter.supportsReadIsolation === true,');
+    expect(planBlock).toContain('sessionDataDirPresent: !!process.env.SESSION_DATA_DIR,');
     expect(planBlock).toContain("credentialSourcePlan.kind === 'refuse'");
     expect(planBlock).toMatch(/kind === 'refuse'\) \{\s*throw new Error/);
     expect(planBlock).toMatch(/readCredentialSource\([^)]*\);\s*\} catch \(e\) \{\s*throw new Error/);

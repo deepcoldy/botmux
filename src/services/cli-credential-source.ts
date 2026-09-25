@@ -10,16 +10,23 @@
  *   <credentialsSourceDir>/claude/.credentials.json
  *
  * On every cold spawn the worker copies the file(s) listed for the bot's CLI
- * family into the bot's per-bot data root. The field is CLI-agnostic; each CLI
- * family opts in by adding an entry to {@link CREDENTIAL_SOURCE_LAYOUTS}.
+ * family into the bot's per-bot data root. The field is CLI-agnostic; a CLI
+ * opts in only with BOTH a family layout in {@link CREDENTIAL_SOURCE_LAYOUTS}
+ * and its exact cliId in {@link CREDENTIAL_SOURCE_SUPPORTED_CLIS} (after it is
+ * verified on a real host to log in from the copied files).
  *
  * Contract (fail closed — a bot configured for account B must never silently
  * run as the shared account):
- *  - not configured                  → historical behaviour, untouched.
- *  - configured, bot not redirected  → no per-bot data root exists to copy
+ *  - not configured                  → historical behaviour, untouched (for
+ *    every sandbox setting).
+ *  - configured, bot not sandboxed   → no per-bot data root exists to copy
  *    into, the CLI keeps using the global login; warn so the operator sees the
  *    field had no effect.
- *  - configured, redirected, CLI family without a layout → refuse to start.
+ *  - configured, sandbox requested but the CLI data dir is not redirected
+ *    (wrapperCli / adapter without redirection / no SESSION_DATA_DIR) →
+ *    refuse to start, naming which of the three applies.
+ *  - configured, redirected, CLI not in {@link CREDENTIAL_SOURCE_SUPPORTED_CLIS}
+ *    → refuse to start.
  *  - configured, redirected, source missing/unreadable/invalid → refuse to
  *    start; never fall back to the global login or keychain.
  *
@@ -144,57 +151,104 @@ export type CredentialSourcePlan =
   | { kind: 'refuse'; reason: string }
   | { kind: 'copy'; family: CredentialSourceFamily; sourceDir: string };
 
+/**
+ * CLIs proven to take their login from the copied file(s). Allow-list on
+ * purpose: other Claude-family forks (seed / relay authenticate via ByteCloud
+ * SSO, not `.credentials.json`) would otherwise slide into the copy branch
+ * just because they expose a CLAUDE_CONFIG_DIR, and silently keep running on
+ * the shared login. Add a CLI here only after verifying it on a real host.
+ */
+export const CREDENTIAL_SOURCE_SUPPORTED_CLIS: Readonly<Record<string, CredentialSourceFamily>> = {
+  'claude-code': 'claude',
+};
+
+/** Why a sandbox-requested spawn is NOT redirecting its CLI data root. */
+function redirectBlocker(input: {
+  cliId: string;
+  wrapperCli?: string;
+  supportsReadIsolation: boolean;
+  sessionDataDirPresent: boolean;
+}): string {
+  if (input.wrapperCli) {
+    return `wrapperCli is set (under the sandbox the wrapper is ignored and the CLI data dir is not redirected) — remove wrapperCli and retry`;
+  }
+  if (!input.supportsReadIsolation) return `adapter ${input.cliId} does not support per-bot data dir redirection`;
+  if (!input.sessionDataDirPresent) return 'SESSION_DATA_DIR is missing, so there is no per-bot data dir to copy into';
+  return 'the CLI data dir is not redirected for this session';
+}
+
 /** Pure decision: what the worker must do with `credentialsSourceDir` for this spawn.
  *  `sourceDir` is the raw configured value (a `/config set` write stores it
- *  as typed), normalized here so every entry point gets the same rules. */
+ *  as typed), normalized here so every entry point gets the same rules.
+ *  Unconfigured → `default` regardless of any sandbox setting. */
 export function planCredentialSource(input: {
   sourceDir?: unknown;
   cliId: string;
   codexAuthSync?: string;
+  /** Sandbox / readIsolation requested for this spawn (incl. the host-wide switch). */
+  sandboxRequested: boolean;
   /** The spawn redirects the CLI into a per-bot data root (sandbox / forced home). */
   willRedirectCliData: boolean;
+  /** Inputs explaining a non-redirect under a requested sandbox. */
+  wrapperCli?: string;
+  supportsReadIsolation: boolean;
+  sessionDataDirPresent: boolean;
   /** The adapter is Claude-family (it exposes a CLAUDE_CONFIG_DIR data root). */
   isClaudeFamily: boolean;
   /** The bot's own bots.json `env` (injected into its CLI). */
   perBotEnv?: Record<string, string>;
   home?: string;
 }): CredentialSourcePlan {
+  const cannot = (why: string): CredentialSourcePlan => ({
+    kind: 'refuse',
+    reason: `this bot's credentialsSourceDir cannot take effect under the current sandbox/redirect conditions: ${why}`,
+  });
+  // Only a bot that is not sandboxed at all is outside this feature's reach
+  // (it uses the global login, exactly as today). A sandboxed bot that was
+  // configured for its own account must never fall back to the shared one.
+  const notSandboxed = !input.sandboxRequested && !input.willRedirectCliData;
   let sourceDir: string | undefined;
   try {
     sourceDir = normalizeCredentialsSourceDir(input.sourceDir, input.home);
   } catch (e) {
     const reason = (e as Error).message;
-    return input.willRedirectCliData
-      ? { kind: 'refuse', reason }
-      : { kind: 'ineffective', warning: `${reason} (ignored: this bot is not sandboxed)` };
+    return notSandboxed
+      ? { kind: 'ineffective', warning: `${reason} (ignored: this bot is not sandboxed)` }
+      : cannot(reason);
   }
   if (!sourceDir) return { kind: 'default' };
-  if (!input.willRedirectCliData) {
+  if (notSandboxed) {
     return {
       kind: 'ineffective',
       warning: `credentialsSourceDir=${sourceDir} has no effect: this bot is not sandboxed, `
         + `so its CLI uses the global login directly (nothing is copied)`,
     };
   }
+  if (!input.willRedirectCliData) {
+    return cannot(redirectBlocker(input));
+  }
   if (input.codexAuthSync === 'isolated') {
     return { kind: 'refuse', reason: 'credentialsSourceDir cannot be combined with codexAuthSync "isolated"' };
   }
-  if (input.isClaudeFamily) {
-    const conflicting = claudeAuthOverrideKeys(input.perBotEnv);
-    if (conflicting.length) {
-      return {
-        kind: 'refuse',
-        reason: `credentialsSourceDir cannot be combined with per-bot env ${conflicting.join(', ')} `
-          + `(the bot would not run as the source account)`,
-      };
-    }
-    return { kind: 'copy', family: 'claude', sourceDir };
+  const family = Object.prototype.hasOwnProperty.call(CREDENTIAL_SOURCE_SUPPORTED_CLIS, input.cliId)
+    ? CREDENTIAL_SOURCE_SUPPORTED_CLIS[input.cliId]
+    : undefined;
+  if (family !== 'claude' || !input.isClaudeFamily) {
+    return {
+      kind: 'refuse',
+      reason: `credentialsSourceDir is not supported for cli ${input.cliId} yet (supported: `
+        + `${Object.keys(CREDENTIAL_SOURCE_SUPPORTED_CLIS).join(', ')}); refusing to start rather than run with the shared login`,
+    };
   }
-  return {
-    kind: 'refuse',
-    reason: `credentialsSourceDir is not supported for cli ${input.cliId} yet; `
-      + `refusing to start rather than run with the shared login`,
-  };
+  const conflicting = claudeAuthOverrideKeys(input.perBotEnv);
+  if (conflicting.length) {
+    return {
+      kind: 'refuse',
+      reason: `credentialsSourceDir cannot be combined with per-bot env ${conflicting.join(', ')} `
+        + `(the bot would not run as the source account)`,
+    };
+  }
+  return { kind: 'copy', family, sourceDir };
 }
 
 /**

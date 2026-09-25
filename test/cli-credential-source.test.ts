@@ -40,21 +40,52 @@ describe('normalizeCredentialsSourceDir', () => {
 });
 
 describe('planCredentialSource', () => {
-  const base = { cliId: 'claude-code', willRedirectCliData: true, isClaudeFamily: true, home: '/h/u' };
+  const base = {
+    cliId: 'claude-code', sandboxRequested: true, willRedirectCliData: true, isClaudeFamily: true,
+    supportsReadIsolation: true, sessionDataDirPresent: true, home: '/h/u',
+  };
+  const notSandboxed = { ...base, sandboxRequested: false, willRedirectCliData: false };
   it('is a no-op when unset (historical shared-login behaviour)', () => {
     expect(planCredentialSource({ ...base })).toEqual({ kind: 'default' });
-    expect(planCredentialSource({ ...base, willRedirectCliData: false })).toEqual({ kind: 'default' });
+    for (const v of [notSandboxed, { ...base, willRedirectCliData: false }, { ...base, wrapperCli: 'aiden x', willRedirectCliData: false }]) {
+      expect(planCredentialSource(v)).toEqual({ kind: 'default' });
+    }
   });
   it('copies for a redirected Claude-family bot', () => {
     expect(planCredentialSource({ ...base, sourceDir: '~/accounts/b' }))
       .toEqual({ kind: 'copy', family: 'claude', sourceDir: '/h/u/accounts/b' });
+    // Forced per-bot home without a sandbox request still counts as redirected.
+    expect(planCredentialSource({ ...base, sandboxRequested: false, sourceDir: '/acc/b' }))
+      .toEqual({ kind: 'copy', family: 'claude', sourceDir: '/acc/b' });
   });
   it('only warns for a non-redirected bot — it keeps the global login, as today', () => {
-    const plan = planCredentialSource({ ...base, sourceDir: '/acc/b', willRedirectCliData: false });
+    const plan = planCredentialSource({ ...notSandboxed, sourceDir: '/acc/b' });
     expect(plan.kind).toBe('ineffective');
-    const bad = planCredentialSource({ ...base, sourceDir: 'rel', willRedirectCliData: false });
+    const bad = planCredentialSource({ ...notSandboxed, sourceDir: 'rel' });
     expect(bad.kind).toBe('ineffective');
   });
+  it.each([
+    ['wrapperCli', { wrapperCli: 'aiden x' }, /wrapperCli is set/],
+    ['adapter without redirection', { cliId: 'genius', supportsReadIsolation: false }, /adapter genius does not support/],
+    ['missing SESSION_DATA_DIR', { sessionDataDirPresent: false }, /SESSION_DATA_DIR is missing/],
+  ])('refuses when the sandbox is requested but the data dir is not redirected (%s)', (_l, extra, re) => {
+    const plan = planCredentialSource({ ...base, ...extra, willRedirectCliData: false, sourceDir: '/acc/b' });
+    expect(plan).toMatchObject({ kind: 'refuse' });
+    const reason = (plan as { reason: string }).reason;
+    expect(reason).toMatch(re);
+    expect(reason).toContain("this bot's credentialsSourceDir cannot take effect");
+    // A bad path under a requested sandbox is also a refusal, not a warning.
+    expect(planCredentialSource({ ...base, ...extra, willRedirectCliData: false, sourceDir: 'rel' }).kind).toBe('refuse');
+  });
+
+  it('allow-lists claude-code only: other Claude-family forks are refused', () => {
+    for (const cliId of ['seed', 'relay', 'some-future-claude-fork', 'constructor', '__proto__']) {
+      const plan = planCredentialSource({ ...base, cliId, sourceDir: '/acc/b' });
+      expect(plan).toMatchObject({ kind: 'refuse' });
+      expect((plan as { reason: string }).reason).toContain(`cli ${cliId}`);
+    }
+  });
+
   it('refuses an unsupported CLI family instead of running on the shared login', () => {
     const plan = planCredentialSource({ ...base, cliId: 'codex', isClaudeFamily: false, sourceDir: '/acc/b' });
     expect(plan).toMatchObject({ kind: 'refuse' });
@@ -102,7 +133,7 @@ describe('bots.json credentialsSourceDir parsing', () => {
   });
 });
 
-describe('fail-closed hardening (codex review round 1)', () => {
+describe('fail-closed hardening: symlinks, file modes, auth overrides, stamps', () => {
   it('refuses a leaf symlink as the source credential', async () => {
     const { symlinkSync } = await import('node:fs');
     const real = account(VALID);
@@ -133,13 +164,13 @@ describe('fail-closed hardening (codex review round 1)', () => {
 
   it('refuses per-bot env auth overrides alongside a source dir', () => {
     const plan = planCredentialSource({
-      sourceDir: '/acc/b', cliId: 'claude-code', willRedirectCliData: true, isClaudeFamily: true,
+      cliId: 'claude-code', sandboxRequested: true, willRedirectCliData: true, isClaudeFamily: true, supportsReadIsolation: true, sessionDataDirPresent: true, sourceDir: '/acc/b',
       perBotEnv: { ANTHROPIC_API_KEY: 'k', HTTPS_PROXY: 'p' },
     });
     expect(plan).toMatchObject({ kind: 'refuse' });
     expect((plan as { reason: string }).reason).toContain('ANTHROPIC_API_KEY');
     expect(planCredentialSource({
-      sourceDir: '/acc/b', cliId: 'claude-code', willRedirectCliData: true, isClaudeFamily: true,
+      cliId: 'claude-code', sandboxRequested: true, willRedirectCliData: true, isClaudeFamily: true, supportsReadIsolation: true, sessionDataDirPresent: true, sourceDir: '/acc/b',
       perBotEnv: { HTTPS_PROXY: 'p', ANTHROPIC_AUTH_TOKEN: '' },
     }).kind).toBe('copy');
   });
@@ -175,7 +206,7 @@ describe('fail-closed hardening (codex review round 1)', () => {
   });
 });
 
-describe('fail-closed hardening (codex review round 2)', () => {
+describe('fail-closed hardening: settings layers, parent directory, temp cleanup', () => {
   it('checks project shared/local and managed settings layers, failing closed on unparseable files', async () => {
     const { claudeAuthOverridesInSettingsLayers } = await import('../src/services/cli-credential-source.js');
     const d = account(null);
