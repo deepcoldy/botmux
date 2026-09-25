@@ -459,7 +459,7 @@ export const messages: Record<string, string> = {
   // bytedcli uses ByteCloud SSO, a different identity provider from Feishu, so
   // both need authorizing separately.
   'cmd.login.scope_title': '🔐 Feishu authorization (extra scopes)',
-  'cmd.login.scope_usage': 'Usage: /login --scope <scope> [more scopes]\nFor example: /login --scope docx:document\nCopy the names straight out of the error — Feishu names the scopes it is missing.',
+  'cmd.login.scope_usage': 'Usage: /login --scope <scope> [more scopes]\nFor example: /login --scope docx:document:readonly\nCopy the names straight out of the error — Feishu names the scopes it is missing.',
   'cmd.login.scope_unknown': '❌ Not valid Feishu scope names: {scopes}\nA typo makes the whole authorization link fail. Copy them verbatim from the error\'s missing_scopes.',
   'cmd.login.scope_footer': 'Requesting in addition: {scopes}\nOnce authorized, retry what you were doing.',
   'cmd.login.bytedcli_title': '🔐 ByteCloud (bytedcli) authorization',

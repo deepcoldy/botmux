@@ -168,10 +168,13 @@ CLI 会从当前 `BOTMUX_SESSION_ID` 自动确定 bot 和群；脱离当前会�
 
 | 命令 | 说明 |
 |------|------|
-| `/login` | 飞书用户授权，授权后可下载第三方卡片图片、以你身份调云文档/日历等 API |
+| `/login` | 飞书基础用户授权：消息读取、资源访问和授权续期；不默认申请云文档、通讯录或日历权限 |
+| `/login --scope <权限名> [更多权限名]` | 在基础权限上按需追加指定权限，例如 `/login --scope docx:document:readonly` |
 | `/login status` | 查看授权状态 |
 | `/login tags` | 会话群标签专项授权（消息分组权限），授权后新建会话群自动进入侧边栏分组（p2pMode=group + feed-group 标签模式用，feed-group 为默认标签模式） |
 | `/pair <配对码>` | 把 Web/Dashboard 端的会话与你的飞书身份配对（在网页端拿配对码，话题里发 `/pair <码>` 认领） |
+
+基础授权需要应用开通 `im:message:readonly`、`im:resource`、`offline_access`。其它操作若返回 `missing_scope`，按错误中的权限名使用 `/login --scope ...` 补授权，并由应用管理员先在开发者后台开通相应的用户权限。资源不可见或无访问权需要处理该资源的授权，重复 `/login` 不能解决。
 
 ## 🎭 角色（人设）
 
