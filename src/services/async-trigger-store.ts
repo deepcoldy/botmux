@@ -542,7 +542,7 @@ export function followSteerParkedChain(
     visited.add(next);
     const hit = lookup(sessionId, next);
     if (!hit) return undefined;
-    if (hit.result.status === 'completed' || hit.result.status === 'failed') return hit;
+    if (hit.result.status === 'completed' || hit.result.status === 'failed' || hit.result.status === 'interrupted') return hit;
     next = hit.result.steerParkedBy;
   }
   return undefined;

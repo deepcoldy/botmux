@@ -2799,10 +2799,12 @@ function buildAsyncTriggerLookupResponse(sessionId: string, triggerId?: string):
     const terminal = asyncTriggerStore.followSteerParkedChain(sessionId, persisted.result.steerParkedBy);
     if (terminal && owner) {
       const r = terminal.result;
-      const at = (r.status === 'completed' ? r.completedAt : r.failedAt) ?? Date.now();
+      const at = (r.status === 'completed' ? r.completedAt : r.status === 'interrupted' ? r.interruptedAt : r.failedAt) ?? Date.now();
       try {
         if (r.status === 'completed') {
           asyncTriggerStore.recordCompleted(sessionId, persisted.triggerId, r.content ?? '', at, owner);
+        } else if (r.status === 'interrupted') {
+          asyncTriggerStore.recordInterruptedStrict(sessionId, persisted.triggerId, at, owner);
         } else if (r.reason === 'turn_terminal' && r.terminalErrorCode) {
           asyncTriggerStore.recordTerminalFailureStrict(sessionId, persisted.triggerId, at, owner, r.terminalErrorCode);
         } else {
