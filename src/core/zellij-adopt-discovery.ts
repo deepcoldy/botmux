@@ -21,7 +21,7 @@ import {
 } from './session-discovery.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
-import { findTraexRolloutByPid } from '../services/traex-transcript.js';
+import { findTraexRolloutByPid, readTraexThreadTitle } from '../services/traex-transcript.js';
 import { findServerPid } from '../adapters/backend/zellij-backend.js';
 import {
   listLiveSessions, parseListPanesJson, type ListedPane,
@@ -38,6 +38,7 @@ export interface ZellijAdoptableSession {
   cliPid: number;          // resolved CLI process pid
   cliId: CliId;
   sessionId?: string;      // CLI-native session id (claude/codex/coco)
+  title?: string;          // CLI-native title when available
   cwd: string;             // CLI working directory
   startedAt?: number;      // epoch ms (claude only)
   paneCols: number;
@@ -177,7 +178,7 @@ function paneDimensions(session: string, paneId: string): { cols: number; rows: 
   }
 }
 
-function resolveSessionId(cliId: CliId, pid: number): { sessionId?: string; startedAt?: number } {
+function resolveSessionId(cliId: CliId, pid: number): { sessionId?: string; title?: string; startedAt?: number } {
   if (cliId === 'claude-code') {
     const meta = readClaudeSessionMeta(pid);
     return { sessionId: meta?.sessionId, startedAt: meta?.startedAt };
@@ -192,7 +193,10 @@ function resolveSessionId(cliId: CliId, pid: number): { sessionId?: string; star
   }
   if (cliId === 'traex') {
     const rollout = findTraexRolloutByPid(pid);
-    return { sessionId: rollout?.cliSessionId };
+    return {
+      sessionId: rollout?.cliSessionId,
+      title: rollout?.cliSessionId ? readTraexThreadTitle(rollout.cliSessionId) : undefined,
+    };
   }
   return {};
 }
@@ -248,13 +252,14 @@ export function discoverAdoptableZellijSessions(
       const dims = paneDimensions(session, terminals[i]!.paneId);
       if (!dims) continue;
 
-      const { sessionId, startedAt } = resolveSessionId(cli.cliId, cli.pid);
+      const { sessionId, title, startedAt } = resolveSessionId(cli.cliId, cli.pid);
       results.push({
         zellijSession: session,
         zellijPaneId: terminals[i]!.paneId,
         cliPid: cli.pid,
         cliId: cli.cliId,
         sessionId,
+        title,
         cwd: cli.cwd ?? '',
         // Same uptime fallback as the tmux path: only Claude carries startedAt
         // from its session JSON, so derive it from the process for everyone else.

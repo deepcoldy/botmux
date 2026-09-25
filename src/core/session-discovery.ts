@@ -12,7 +12,7 @@ import type { CliId } from '../adapters/cli/types.js';
 import { executableBasename } from '../adapters/cli/runtime.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
-import { findTraexRolloutByPid } from '../services/traex-transcript.js';
+import { findTraexRolloutByPid, readTraexThreadTitle } from '../services/traex-transcript.js';
 import { tmuxEnv } from '../setup/ensure-tmux.js';
 
 // macOS 没有 /proc，所以走 ps/lsof/pgrep 兜底。Linux 仍优先走 /proc 快路径。
@@ -32,6 +32,7 @@ export interface AdoptableSession {
   herdrTerminalId?: string;
   cliId: CliId;              // recognized CLI type
   sessionId?: string;        // CLI session ID
+  title?: string;            // CLI-native title when the backend exposes one
   cwd: string;               // CLI working directory
   startedAt?: number;        // epoch ms
   paneCols: number;          // current pane width
@@ -868,6 +869,9 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
       const claudeMeta = cliId === 'claude-code'
         ? (cliPid ? readClaudeSessionMeta(cliPid) : undefined) ?? findUniqueClaudeSessionByCwd(cwd)
         : undefined;
+      const title = cliId === 'traex' && sessionId
+        ? readTraexThreadTitle(sessionId)
+        : undefined;
       discoveredPaneIds.add(paneId);
       results.push({
         source: 'herdr',
@@ -879,6 +883,7 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
         cliPid,
         cliId,
         sessionId: sessionId ?? claudeMeta?.sessionId,
+        title,
         cwd,
         startedAt: claudeMeta?.startedAt ?? (cliPid ? readProcessStartTime(cliPid) : undefined),
         paneCols: 200,
@@ -906,6 +911,9 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
       else if (process.cliId === 'codex') sessionId = findCodexRolloutByPid(process.pid)?.cliSessionId;
       else if (process.cliId === 'coco') sessionId = findCocoSessionByPid(process.pid)?.sessionId;
       const claudeMeta = process.cliId === 'claude-code' ? readClaudeSessionMeta(process.pid) : undefined;
+      const title = process.cliId === 'traex' && sessionId
+        ? readTraexThreadTitle(sessionId)
+        : undefined;
       results.push({
         source: 'herdr',
         herdrSessionName: sessionName,
@@ -916,6 +924,7 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
         cliPid: process.pid,
         cliId: process.cliId,
         sessionId: sessionId ?? claudeMeta?.sessionId,
+        title,
         cwd,
         startedAt: claudeMeta?.startedAt ?? readProcessStartTime(process.pid),
         paneCols: 200,
@@ -1008,6 +1017,7 @@ function resolveAdoptableSessionForPane(
 
   // 5. Try to read CLI session metadata
   let sessionId: string | undefined;
+  let title: string | undefined;
   let startedAt: number | undefined;
   if (match.cliId === 'claude-code') {
     const meta = readClaudeSessionMeta(cliPid);
@@ -1033,7 +1043,10 @@ function resolveAdoptableSessionForPane(
     // path matcher (~/.trae/cli/sessions/...). Worker-side re-probes by
     // pid as a fallback, so undefined here is acceptable.
     const rollout = findTraexRolloutByPid(cliPid);
-    if (rollout) sessionId = rollout.cliSessionId;
+    if (rollout) {
+      sessionId = rollout.cliSessionId;
+      title = readTraexThreadTitle(sessionId);
+    }
   }
 
   // 5b. Fall back to the CLI process's own start time for uptime. Without
@@ -1054,6 +1067,7 @@ function resolveAdoptableSessionForPane(
     cliPid,
     cliId: match.cliId,
     sessionId,
+    title,
     cwd,
     startedAt,
     paneCols: dims.cols,
