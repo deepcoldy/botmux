@@ -78,6 +78,45 @@ describe('bot-config store', () => {
     return { registry, store, pinStreamingCardChange };
   }
 
+  it('zero injection is per-bot, preserves reply preferences, and refuses unsupported CLI changes', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex', replyDelivery: 'send' });
+    const spec = store.findConfigField('promptInjection')!;
+    expect((await store.applyConfigField('app_default', spec, 'none')).ok).toBe(true);
+    expect(readConfig()).toMatchObject({ promptInjection: 'none', replyDelivery: 'send' });
+    const { effectiveReplyDelivery } = await import('../src/core/reply-delivery.js');
+    expect(effectiveReplyDelivery('app_default', 'codex')).toBe('transcript');
+    registry.registerBot({ larkAppId: 'plain', larkAppSecret: 's', cliId: 'codex' });
+    expect(effectiveReplyDelivery('plain', 'codex')).toBe('send');
+    const cli = store.findConfigField('cli')!;
+    const changed = await store.applyConfigField('app_default', cli, 'gemini');
+    expect(changed).toMatchObject({ ok: false, reason: 'zero_prompt_unsupported' });
+    expect(readConfig().cliId).toBe('codex');
+    expect((await store.applyConfigField('app_default', spec, 'default')).ok).toBe(true);
+    expect(effectiveReplyDelivery('app_default', 'codex')).toBe('send');
+    expect(readConfig().replyDelivery).toBe('send');
+  });
+
+  it.each(['traex', 'coco', 'hermes', 'mtr', 'pi', 'oh-my-pi', 'ebsd', 'grok'])('enables zero injection for %s using its final-reply capability', async (cliId) => {
+    const { store } = await loaded({ cliId, replyDelivery: 'send' });
+    expect((await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none')).ok).toBe(true);
+    expect(readConfig()).toMatchObject({ promptInjection: 'none', replyDelivery: 'send' });
+    const { effectiveReplyDelivery } = await import('../src/core/reply-delivery.js');
+    expect(effectiveReplyDelivery('app_default', cliId)).toBe('transcript');
+  });
+
+  it.each(['codex', 'traex'])('supports zero injection with local %s RPC input', async (cliId) => {
+    const { store } = await loaded({ cliId, codexRpcInput: true });
+    expect((await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none')).ok).toBe(true);
+    expect(readConfig()).toMatchObject({ promptInjection: 'none', codexRpcInput: true });
+  });
+
+  it('rejects zero injection without automatic reply support', async () => {
+    const { store } = await loaded({ cliId: 'gemini' });
+    expect(await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none'))
+      .toMatchObject({ ok: false, reason: 'zero_prompt_unsupported' });
+    expect(readConfig().promptInjection).toBeUndefined();
+  });
+
   it('CONFIG_FIELDS have unique keys and include allowedUsers', async () => {
     const { store } = await freshModules();
     const keys = store.CONFIG_FIELDS.map(f => f.key);

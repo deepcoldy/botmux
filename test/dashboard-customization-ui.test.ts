@@ -68,6 +68,7 @@ beforeEach(() => {
 afterEach(() => {
   void act(() => { renderer?.unmount(); });
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 async function mount() {
@@ -89,6 +90,91 @@ function findTab(label: string) {
 }
 
 describe('customization page stage UX', () => {
+  function setupBots(failures: Set<string> = new Set()) {
+    const data = { ...snapshot, enabled: false, bots: [
+      { larkAppId: 'lead', name: 'Lead', cliId: 'claude-code', promptInjection: 'default', supported: true },
+      { larkAppId: 'sub-a', name: 'Sub A', cliId: 'codex', promptInjection: 'default', supported: true },
+      { larkAppId: 'sub-b', name: 'Sub B', cliId: 'claude-code', promptInjection: 'none', supported: true },
+      { larkAppId: 'other', name: 'Other', cliId: 'gemini', promptInjection: 'default', supported: false },
+    ] };
+    const calls: Array<{ url: string; body: any }> = [];
+    globalThis.fetch = vi.fn(async (url: any, init?: any) => {
+      if (init?.method === 'PUT') {
+        const body = JSON.parse(init.body); calls.push({ url, body });
+        const bot = data.bots.find(bot => url === `/api/bots/${bot.larkAppId}/prompt-injection`)!;
+        if (failures.has(bot.larkAppId)) return { ok: false, json: async () => ({ error: 'daemon_offline' }) };
+        bot.promptInjection = body.promptInjection;
+      }
+      return { ok: true, json: async () => init?.method === 'PUT' ? { ok: true } : structuredClone(data) };
+    }) as any;
+    return { data, calls };
+  }
+
+  async function selectBot(name: string) {
+    await act(async () => { renderer.root.findByProps({ 'aria-label': `选择 ${name}` }).props.onChange({ currentTarget: { checked: true } }); });
+  }
+
+  it('batch enables and restores selected bots without changing the lead or customization master', async () => {
+    const { data, calls } = setupBots();
+    await mount();
+    expect(findTab('开启零注入').props.disabled).toBe(true);
+    expect(renderer.root.findByProps({ 'aria-label': '选择 Other' }).props.disabled).toBe(true);
+    await selectBot('Sub A');
+    await selectBot('Sub B');
+    expect(text().replace(/\s+/g, '')).toContain('已选2个Bot');
+    expect(calls).toHaveLength(0); // Selecting never writes settings.
+    await act(async () => { findTab('开启零注入').props.onClick(); });
+    expect(calls).toEqual(['sub-a', 'sub-b'].map(id => ({ url: `/api/bots/${id}/prompt-injection`, body: { promptInjection: 'none' } })));
+    expect(data.bots.map(bot => bot.promptInjection)).toEqual(['default', 'none', 'none', 'default']);
+    expect(data.enabled).toBe(false);
+    expect(text().replace(/\s+/g, '')).toContain('已开启零注入2个Bot');
+    expect(text().replace(/\s+/g, '')).toContain('已选0个Bot');
+    await selectBot('Sub A');
+    await selectBot('Sub B');
+    await act(async () => { findTab('恢复原配置').props.onClick(); });
+    expect(calls.slice(2).map(call => call.body)).toEqual([{ promptInjection: 'default' }, { promptInjection: 'default' }]);
+    expect(data.bots.map(bot => bot.promptInjection)).toEqual(['default', 'default', 'default', 'default']);
+    expect(text().replace(/\s+/g, '')).toContain('已恢复原配置2个Bot');
+  });
+
+  it('selects filtered results, keeps hidden selections visible in the count, and clears without saving', async () => {
+    const { calls } = setupBots();
+    await mount();
+    await act(async () => { renderer.root.findByProps({ 'aria-label': '搜索 Bot' }).props.onChange({ currentTarget: { value: 'Sub' } }); });
+    await act(async () => { findTab('全选当前结果').props.onClick(); });
+    expect(text().replace(/\s+/g, '')).toContain('已选2个Bot');
+    await act(async () => { renderer.root.findByProps({ 'aria-label': '搜索 Bot' }).props.onChange({ currentTarget: { value: 'Lead' } }); });
+    expect(text().replace(/\s+/g, '')).toContain('含搜索结果外的选择');
+    expect(renderer.root.findByProps({ 'aria-label': '选择 Lead' }).props.checked).toBe(false);
+    await act(async () => { findTab('清空选择').props.onClick(); });
+    expect(text().replace(/\s+/g, '')).toContain('已选0个Bot');
+    expect(calls).toHaveLength(0);
+    await act(async () => { renderer.root.findByProps({ 'aria-label': '搜索 Bot' }).props.onChange({ currentTarget: { value: '' } }); });
+    await act(async () => { findTab('全选当前结果').props.onClick(); });
+    expect(text().replace(/\s+/g, '')).toContain('已选3个Bot');
+    expect(renderer.root.findByProps({ 'aria-label': '选择 Other' }).props.checked).toBe(false);
+  });
+
+  it('keeps only failed bots selected for retry and does not misreport a partial save as success', async () => {
+    const failures = new Set(['sub-a']);
+    const { data, calls } = setupBots(failures);
+    await mount();
+    await selectBot('Sub A');
+    await selectBot('Sub B');
+    await act(async () => { findTab('开启零注入').props.onClick(); });
+    expect(text().replace(/\s+/g, '')).toContain('已开启零注入1个Bot');
+    expect(text().replace(/\s+/g, '')).toContain('保存失败1个');
+    expect(text().replace(/\s+/g, '')).toContain('SubA：daemon_offline');
+    expect(renderer.root.findByProps({ 'aria-label': '选择 Sub A' }).props.checked).toBe(true);
+    expect(renderer.root.findByProps({ 'aria-label': '选择 Sub B' }).props.checked).toBe(false);
+    expect(data.bots[1].promptInjection).toBe('default');
+    failures.clear();
+    await act(async () => { findTab('开启零注入').props.onClick(); });
+    expect(calls.map(call => call.url)).toEqual(['sub-a', 'sub-b', 'sub-a'].map(id => `/api/bots/${id}/prompt-injection`));
+    expect(data.bots[1].promptInjection).toBe('none');
+    expect(text().replace(/\s+/g, '')).not.toContain('保存失败');
+  });
+
   it('renders stage tabs + skills tab, opening on 会话开始', async () => {
     await mount();
     const t = text();

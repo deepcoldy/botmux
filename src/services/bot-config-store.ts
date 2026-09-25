@@ -46,6 +46,7 @@ import {
 import { parseHiddenStreamingCardButtonsInput } from '../im/lark/streaming-card-buttons.js';
 import { validateCliLaunchModeConfig } from '../core/cli-launch-mode.js';
 import { defaultReplyDeliveryFor, supportsTranscriptReplyDelivery } from '../core/reply-delivery.js';
+import { supportsZeroPromptInjection } from '../core/prompt-injection.js';
 
 /**
  * 生效时机：
@@ -126,6 +127,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'worktreeMultiPicker', configKey: 'worktreeMultiPicker', kind: 'boolean', effect: 'immediate', clearable: false, hint: 'repo 卡片 worktree 选择器默认多仓库模式 on|off（卡片「切换多仓库选择器」按钮同款）' },
   { key: 'disableCliBypass', configKey: 'disableCliBypass', kind: 'boolean', effect: 'next-session', clearable: false, hint: '不加 CLI 审批/sandbox 绕过参数 on|off' },
   { key: 'codexAppCleanInput', configKey: 'codexAppCleanInput', kind: 'boolean', effect: 'immediate', clearable: false, hint: '实验性：Codex App 用户气泡只保留真实输入，Botmux 元数据走隐藏上下文；默认 off，从下一次 turn 派发生效，不改已有历史' },
+  { key: 'promptInjection', configKey: 'promptInjection', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['default', 'none'], enumDefault: 'default', hint: '零 botmux 注入：none=仅传任务与附件，自动回传最终回复；default=恢复原有提示/技能配置。支持可自动获取最终回复的本地 CLI；新会话完整生效，已有历史不清除' },
   { key: 'envelopeInjection', configKey: 'envelopeInjection', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['auto', 'off'], hint: '每轮上下文注入方式：auto=支持的 CLI（claude-code）把提醒/白板经 hook 注入为系统提醒，输入框只留消息本身，不支持的自动回退｜off=内联（默认）；unset 回 off' },
   { key: 'replyDelivery', configKey: 'replyDelivery', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['send', 'transcript'], enumDefault: cfg => defaultReplyDeliveryFor(cfg.cliId), hint: '最终回复投递方式：send=模型必须自己 botmux send（**所有 CLI 的缺省**，与上游一致）｜transcript=从 CLI 转写自动取最终回复发卡，模型不再被要求 botmux send（opt-in，需显式开启）；仅 claude-code 与 codex/traex/coco/hermes/mtr/pi/oh-my-pi/ebsd/grok 支持 transcript；系统提示需 /restart 才换新值，逐轮信封立即生效；unset 回缺省 send' },
   { key: 'senderTag', configKey: 'senderTag', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '每轮注入 <sender> 发言人标签 on|off（默认 on）：标注本轮是谁在说话（open_id/姓名/邮箱）。关掉后模型看不到发言人身份，多人会话里无法区分谁说的；--mention-back 不受影响（走 daemon 侧独立记录）。代价：/adopt 少一条识别本 bot 自产会话的指纹，dashboard 洞察无法从标签判断发言人类型与 A2A 对方名字' },
@@ -322,6 +324,15 @@ async function applyConfigFieldInternal(
     const currentModel = typeof entry.model === 'string' && entry.model.trim()
       ? entry.model.trim()
       : undefined;
+    const zeroPrompt = spec.configKey === 'promptInjection'
+      ? effective === 'none'
+      : entry.promptInjection === 'none';
+    if (zeroPrompt && !supportsZeroPromptInjection(nextCliId, {
+      backendType: spec.configKey === 'backendType' ? (effective as string | undefined) : entry.backendType as string | undefined,
+      codexRpcInput: spec.configKey === 'codexRpcInput' ? effective === true : entry.codexRpcInput === true,
+    })) {
+      return { write: false, result: 'zero_prompt_unsupported' };
+    }
     const nextModel = spec.configKey === 'model'
       ? typeof effective === 'string' && effective.trim()
         ? effective.trim()

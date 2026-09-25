@@ -8,6 +8,7 @@ import { TERMINAL_CANCEL_COOLDOWN_MS } from '../backend/critical-control-key.js'
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
 import { piTurnBoundaryExtensionPath } from './pi.js';
+import { clearBotmuxPromptEnv } from '../../skills/zero-injection.js';
 
 import { findLatestJsonl } from '../../services/claude-transcript.js';
 import { delay } from '../../utils/timing.js';
@@ -169,6 +170,7 @@ export function createOhMyPiAdapter(
       solo,
       skillPluginDir,
       env,
+      promptInjection,
     }) {
       const sessionDir = ompSessionDir(sessionId);
       const args = ['--no-title'];
@@ -182,10 +184,12 @@ export function createOhMyPiAdapter(
       }
       if (model?.trim()) args.push('--model', model.trim());
       if (workingDir) args.push('--cwd', workingDir);
-      args.push('--plugin-dir', OMP_PLUGIN_DIR);
-      if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
+      if (promptInjection !== 'none') {
+        args.push('--plugin-dir', OMP_PLUGIN_DIR);
+        if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
+      }
       const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
-      const botmuxAppendPrompt = buildBotmuxSystemPromptText({
+      const botmuxAppendPrompt = promptInjection === 'none' ? '' : buildBotmuxSystemPromptText({
         locale,
         botName,
         botOpenId,
@@ -212,7 +216,8 @@ export function createOhMyPiAdapter(
       }
       args.push('--extension', turnBoundaryExt);
 
-      if (env && botmuxAppendPrompt) {
+      if (env && promptInjection === 'none') clearBotmuxPromptEnv(env);
+      else if (env && botmuxAppendPrompt) {
         env.BOTMUX_APPEND_SYSTEM_PROMPT = botmuxAppendPrompt;
       }
       return args;

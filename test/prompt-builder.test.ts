@@ -1242,3 +1242,31 @@ describe('builder locale fallback when the caller omits locale', () => {
     expect(content).toContain('Respond to messages addressed to you');
   });
 });
+
+
+describe('per-bot zero prompt injection', () => {
+  afterEach(() => { delete mockBotConfig.promptInjection; delete mockBotConfig.envelopeInjection; });
+
+  for (const cliId of ['codex', 'claude-code', 'traex', 'coco', 'hermes', 'mtr', 'pi', 'oh-my-pi', 'ebsd', 'grok'] as const) {
+    it(`${cliId}: opening, follow-up, hook and refork preserve only the task and attachment facts`, () => {
+      mockBotConfig.promptInjection = 'none';
+      mockBotConfig.envelopeInjection = 'auto';
+      const task = '检查 <botmux_reminder> 字样，保留用户原文';
+      const opts = { larkAppId: 'app_test', chatId: 'oc_group', whiteboardId: 'board',
+        cliId, sessionBackendType: 'pty' as const, turnId: 'om_turn',
+        sender: { type: 'bot' as const, openId: 'ou_lead', name: 'Lead' },
+        attachments: [{ type: 'file' as const, name: 'spec.md', path: '/tmp/spec.md' }] };
+      const expected = task + '\n\n[file] spec.md: /tmp/spec.md';
+      const opening = buildNewTopicCliInput(task, 'sid', cliId, undefined, opts.attachments,
+        undefined, undefined, undefined, { name: 'Sub', openId: 'ou_sub' }, 'zh', opts.sender, opts);
+      expect(opening.content).toBe(expected);
+      expect(buildFollowUpCliInput(task, 'sid', opts).content).toBe(expected);
+      const ds = { larkAppId: 'app_test', session: { sessionId: 'sid', chatId: 'oc_group', backendType: 'pty' } } as DaemonSession;
+      expect(buildReforkPrompt(ds, task, opts)).toBe(expected);
+      expect(buildNewTopicPrompt(task, 'sid', cliId, undefined, undefined, undefined,
+        undefined, ['第二条'], undefined, 'zh', undefined, opts)).toBe(task + '\n\n第二条');
+      delete mockBotConfig.promptInjection;
+      expect(buildFollowUpCliInput('原有 bot', 'sid', opts).content).toContain(cliId === 'ebsd' ? 'BotMux service user message' : '<botmux_reminder>');
+    });
+  }
+});

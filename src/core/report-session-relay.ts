@@ -65,6 +65,35 @@ export type ReportSessionRelayDecision =
     }
   | { ok: false; status: number; error: string };
 
+/** The host already owns the exact transcript turn and reply root. Resolve
+ * only its signed dispatch binding; never guess a lead from recent activity. */
+export function prepareAutomaticDispatchReport(input: {
+  registry: Record<string, unknown>;
+  bindingSecret: string;
+  dispatchRoot?: string;
+  sourceSessionId: string;
+  sourceLarkAppId: string;
+  content: string;
+}): Extract<ReportSessionRelayDecision, { ok: true }> | undefined {
+  if (!input.dispatchRoot || !input.content.trim()) return undefined;
+  const resolved = resolveVerifiedDispatchReportTarget({ registry: input.registry,
+    secret: input.bindingSecret, dispatchRoot: input.dispatchRoot });
+  if (!resolved.ok || resolved.binding.targetSessionId === input.sourceSessionId) return undefined;
+  const binding = resolved.binding;
+  return {
+    ok: true,
+    source: { sessionId: input.sourceSessionId, larkAppId: input.sourceLarkAppId },
+    target: { sessionId: binding.targetSessionId, larkAppId: binding.targetLarkAppId },
+    targetChatId: binding.targetChatId,
+    targetScope: binding.targetScope,
+    dispatchRoot: input.dispatchRoot,
+    sourceName: binding.sourceName,
+    content: input.content,
+    // A final answer may be a question or progress. Do not infer completion.
+    projectUpdate: {},
+  };
+}
+
 export function authorizeReportSessionRelayRequest(input: {
   raw: unknown;
   trustedHost: boolean;

@@ -9,6 +9,7 @@ import { preparePiInitialPromptArg } from './pi-initial-prompt.js';
 import { PI_TURN_BOUNDARY_EXTENSION_SOURCE } from './pi-turn-boundary-extension-data.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { GOAL_ENV } from '../../workflows/v3/contract.js';
+import { clearBotmuxPromptEnv } from '../../skills/zero-injection.js';
 
 import { delay } from '../../utils/timing.js';
 
@@ -214,9 +215,10 @@ export function createPiAdapter(
       extraArgs,
       trustOverride,
       projectTrusted,
+      promptInjection,
     }) {
       const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
-      const botmuxAppendPrompt = buildBotmuxSystemPromptText({
+      const botmuxAppendPrompt = promptInjection === 'none' ? '' : buildBotmuxSystemPromptText({
         locale,
         botName,
         botOpenId,
@@ -242,7 +244,8 @@ export function createPiAdapter(
         );
       }
 
-      if (env && botmuxAppendPrompt) {
+      if (env && promptInjection === 'none') clearBotmuxPromptEnv(env);
+      else if (env && botmuxAppendPrompt) {
         env.BOTMUX_APPEND_SYSTEM_PROMPT = botmuxAppendPrompt;
       }
 
@@ -252,8 +255,8 @@ export function createPiAdapter(
         nativeSessionTitle,
         model,
         turnBoundaryExtension: turnBoundaryExt,
-        builtinSkillsDir: PI_BUILTIN_SKILLS_DIR,
-        skillPluginDir,
+        builtinSkillsDir: promptInjection === 'none' ? undefined : PI_BUILTIN_SKILLS_DIR,
+        skillPluginDir: promptInjection === 'none' ? undefined : skillPluginDir,
       });
     },
 

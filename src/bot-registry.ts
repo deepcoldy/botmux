@@ -1562,6 +1562,9 @@ export interface BotConfig {
    * 都持久化。系统提示部分需 /restart 生效，逐轮信封立即生效。
    */
   replyDelivery?: 'send' | 'transcript';
+  /** Skip Botmux prompt/skill/context injection and auto-forward final replies.
+   * Existing prompt and skill customizations remain saved. */
+  promptInjection?: 'default' | 'none';
   /**
    * Whether each forwarded turn carries a `<sender type=… open_id=… name=…
    * email=… />` tag naming who spoke. Default ON (ABSENT ⇒ ON — only an
@@ -3717,6 +3720,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
       // 显式 send / transcript 都保留；缺省按 defaultReplyDeliveryFor 解析。
       replyDelivery: entry.replyDelivery === 'transcript' || entry.replyDelivery === 'send' ? entry.replyDelivery : undefined,
+      promptInjection: entry.promptInjection === 'none' ? 'none' : undefined,
       codexBrowser,
       codexRpcInput: entry.codexRpcInput === true,
       existingAppServer,

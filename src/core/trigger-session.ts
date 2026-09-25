@@ -1,3 +1,4 @@
+import { zeroPromptInjectionForBot } from './prompt-injection.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
 import * as idempotencyStore from '../services/idempotency-store.js';
@@ -905,7 +906,9 @@ async function triggerSessionTurnAdmitted(
   }
 
   const dryRun = !!req.options?.dryRun;
-  const prompt = buildUntrustedEventPrompt(req, triggerId);
+  const prompt = zeroPromptInjectionForBot(larkAppId)
+    ? [req.instruction, req.envelope.rawText ?? JSON.stringify(req.envelope.payload ?? {})].filter(Boolean).join('\n\n')
+    : buildUntrustedEventPrompt(req, triggerId);
   const topicMessage = buildExternalEventTopicMessage(req, larkAppId);
   const codexAppText = buildExternalEventVisibleText(req, larkAppId);
   const codexAppApplicationContext = buildExternalEventApplicationContext(req);

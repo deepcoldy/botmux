@@ -795,6 +795,10 @@ export interface WorkerSessionReplyOptions {
 }
 
 export interface WorkerPoolCallbacks {
+  /** Host-owned return path for zero-injection sub-bots. */
+  onZeroPromptFinal?: (ds: DaemonSession, input: {
+    turnId: string; content: string; dispatchRoot?: string;
+  }) => Promise<void>;
   sessionReply: (
     rootId: string,
     content: string,
@@ -12143,6 +12147,7 @@ export function forkWorker(
     // injectsSessionContext 适配器选系统提示措辞；solo 由 daemon 在 fork 前按轮算好
     // 写在 ds 上（resolveSoloSessionForTurn），缺省非 solo。
     replyDelivery: effectiveReplyDelivery(botCfg.larkAppId, agentCfg.cliId),
+    promptInjection: botCfg.promptInjection,
     solo: ds.soloSession === true,
     feedback: feedbackPolicy,
     terminalCardEpoch: ds.session.terminalCardEpoch,
@@ -17027,6 +17032,15 @@ function deliverFinalOutput(
       }
       if (preparedListenerReply?.kind === 'send' || preparedListenerReply?.kind === 'succeeded') {
         finishVcMeetingImReply(config.session.dataDir, preparedListenerReply.ref, messageId);
+      }
+      if (!managedReceiver && (!msg.kind || msg.kind === 'bridge')
+        && ds.initConfig?.promptInjection === 'none') {
+        await cb.onZeroPromptFinal?.(ds, {
+          turnId: msg.turnId, content: safeAssistantText,
+          dispatchRoot: frozenReplyTarget?.mode === 'thread' ? frozenReplyTarget.rootMessageId
+            : ds.scope === 'chat' ? ds.session.replyTargets?.[msg.turnId]?.rootMessageId
+              : ds.session.rootMessageId,
+        });
       }
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
       markTurnReplyDelivered(ds, msg, effectiveCliId);

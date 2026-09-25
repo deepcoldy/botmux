@@ -6262,6 +6262,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     replyDelivery,
     replyDeliveryDefault,
     replyDeliverySupported,
+    promptInjection: (() => { try { return getBot(cachedLarkAppId).config.promptInjection ?? 'default'; } catch { return 'default'; } })(),
     skillInjection,
     skillInjectionSupport,
     // Resolved machine-wide default → the dashboard shows it as the pre-selected
@@ -7378,6 +7379,21 @@ ipcRoute('PUT', '/api/bot-envelope-injection', async (req, res) => {
 //   • ''/其它 → 删 key，回到缺省 send
 // 走 applyConfigField（与 /botconfig 同一写盘 + 热更新路径）：逐轮信封下一轮生效，
 // 系统提示部分要 /restart 才换新值。响应里的 replyDelivery 是写入后的**生效值**。
+ipcRoute('PUT', '/api/bot-prompt-injection', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { promptInjection?: unknown };
+  try { body = await readJsonBody<{ promptInjection?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (body.promptInjection !== 'none' && body.promptInjection !== 'default') {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_prompt_injection' });
+  }
+  const spec = findConfigField('promptInjection');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const r = await applyConfigField(cachedLarkAppId, spec, body.promptInjection);
+  if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
+  jsonRes(res, 200, { ok: true, promptInjection: body.promptInjection });
+});
+
 ipcRoute('PUT', '/api/bot-reply-delivery', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: { replyDelivery?: unknown };

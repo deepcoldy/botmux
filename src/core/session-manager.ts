@@ -1,3 +1,4 @@
+import { buildZeroPromptInput, zeroPromptInjectionForBot } from './prompt-injection.js';
 /**
  * Session manager — session helper functions extracted from daemon.ts.
  * Handles working directory resolution, attachment downloads, prompt building,
@@ -1274,6 +1275,9 @@ function buildNewTopicBlocks(
   opts?: NewTopicOpts,
   hookMode = false,
 ): Array<{ key: NewTopicBlockKey; text: string }> {
+  if (zeroPromptInjectionForBot(opts?.larkAppId, cliId)) {
+    return [{ key: 'userMessage', text: buildZeroPromptInput([userMessage, ...(followUps ?? [])].join('\n\n'), attachments) }];
+  }
   const adapter = createCliAdapterSync(cliId, cliPathOverride);
   if (adapter.inputEnvelope === 'service-user') {
     // service-user 适配器（ebsd）自带完整外壳，不参与分块：包成单块返回，
@@ -1631,6 +1635,9 @@ function buildFollowUpBlocks(
   opts?: FollowUpOpts,
   hookMode = false,
 ): Array<{ key: FollowUpBlockKey; text: string }> {
+  if (zeroPromptInjectionForBot(opts?.larkAppId, opts?.cliId)) {
+    return [{ key: 'userMessage', text: buildZeroPromptInput(content, opts?.attachments) }];
+  }
   const blocks: Array<{ key: FollowUpBlockKey; text: string }> = [];
   // replyDelivery=transcript（core/reply-delivery.ts）：最终回复由 daemon 从转写自动
   // 转发，续轮不再注入 <botmux_reminder>；noTransport 优先（HTTP 虚拟会话照旧走
@@ -1736,6 +1743,7 @@ export function buildFollowUpContent(
   opts = opts ? { ...opts, locale: opts.locale ?? localeForBot(opts.larkAppId) } : opts;
   if (
     opts?.cliId
+    && !zeroPromptInjectionForBot(opts.larkAppId, opts.cliId)
     && createCliAdapterSync(opts.cliId, opts.cliPathOverride).inputEnvelope === 'service-user'
   ) {
     return buildServiceUserPrompt(content);
@@ -1778,7 +1786,7 @@ type EnvelopeInjectionCfg = {
 };
 
 function resolveEnvelopeInjectionMode(cfg?: EnvelopeInjectionCfg): 'hook' | 'inline' {
-  if (!cfg?.cliId) return 'inline';
+  if (!cfg?.cliId || zeroPromptInjectionForBot(cfg.larkAppId, cfg.cliId)) return 'inline';
   // 远端后端（riff 等）没有本地 Claude hook 进程，sidecar 写了没人读，
   // 必须用会话冻结的 backendType（不是当前 bot 配置，那是 next-session 生效）。
   // 只有确知在本地跑 CLI 的后端才允许 hook 模式（白名单）。未来新增远端后端

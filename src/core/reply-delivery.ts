@@ -14,19 +14,16 @@
  * 拿不准就回到 `send` / 非 solo。
  */
 import { getOwnerOpenId, resolveReplyDelivery } from '../bot-registry.js';
-import { isStructuredBridgeFallbackActive } from '../services/structured-bridge-clis.js';
+import { supportsTranscriptReplyDelivery } from '../services/structured-bridge-clis.js';
 import { logger } from '../utils/logger.js';
+import { zeroPromptInjectionForBot } from './prompt-injection.js';
 
 export type ReplyDelivery = 'send' | 'transcript';
 
 /** claude-code 走 `claudeDataDir` 转写桥（worker.ts bridge fallback），其余按
  *  结构化转写白名单（codex/traex/coco/hermes/mtr/pi/oh-my-pi/ebsd/grok）。
  *  cursor 只在 adopt 下有转写，不算；codex-app 天然是转写模式，不需要本开关。 */
-export function supportsTranscriptReplyDelivery(cliId: string | undefined): boolean {
-  if (!cliId) return false;
-  if (cliId === 'claude-code') return true;
-  return isStructuredBridgeFallbackActive(cliId, false);
-}
+export { supportsTranscriptReplyDelivery };
 
 /**
  * 未显式配置时的缺省投递方式：**一律 `send`**，与上游行为逐字节一致——模型仍被
@@ -51,6 +48,7 @@ const warnedUnsupported = new Set<string>();
  *  每轮刷日志）。无 larkAppId / registry 异常 → send（fail-closed）。 */
 export function effectiveReplyDelivery(larkAppId: string | undefined, cliId: string | undefined): ReplyDelivery {
   if (!larkAppId) return 'send';
+  if (zeroPromptInjectionForBot(larkAppId, cliId)) return 'transcript';
   let configured: ReplyDelivery | undefined;
   try { configured = resolveReplyDelivery(larkAppId); } catch { return 'send'; }
   const wanted: ReplyDelivery = configured ?? defaultReplyDeliveryFor(cliId);

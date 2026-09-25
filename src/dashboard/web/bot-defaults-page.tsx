@@ -4831,14 +4831,15 @@ export function ReplyDeliverySection(props: { bot: BotDefaultsRow; patchBot: Pat
       <h3 className="bd-section-title">{tr('botDefaults.replyDelivery')}</h3>
       <ToggleRow
         checked={transcript}
-        disabled={busy || !supported}
+        disabled={busy || !supported || props.bot.promptInjection === 'none'}
         dataAction="toggle-reply-delivery"
         title={tr('botDefaults.replyDeliveryTranscript')}
         help={tr('botDefaults.replyDeliveryHelp')}
         onChange={checked => void save(checked)}
       />
       <small className="bd-section-note">
-        {supported ? tr('botDefaults.replyDeliveryNote', { defaultMode }) : tr('botDefaults.replyDeliveryUnsupported')}
+        {props.bot.promptInjection === 'none' ? tr('botDefaults.replyDeliveryZeroPrompt')
+          : supported ? tr('botDefaults.replyDeliveryNote', { defaultMode }) : tr('botDefaults.replyDeliveryUnsupported')}
       </small>
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-reply-delivery-status': '' }} />
