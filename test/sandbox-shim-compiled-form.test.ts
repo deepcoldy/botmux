@@ -283,4 +283,14 @@ describe.skipIf(process.platform !== 'linux' || !bwrapUsable)('sandbox shim over
     expect(callRegion).not.toContain('resolveNativeSubagentRuntimeHookWrapperPath');
     expect(callRegion).not.toContain('botmux-native-subagent-runtime-hook');
   });
+
+  it('SOURCE PIN: worker uses compact bwrap argument transport only for tmux', () => {
+    const src = stripComments(readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf-8'));
+    const callStart = src.indexOf('const sbx = prepareDirectSandbox({');
+    expect(callStart).toBeGreaterThanOrEqual(0);
+    const callEnd = src.indexOf('      });', callStart);
+    expect(callEnd).toBeGreaterThan(callStart);
+    const callRegion = stripComments(src.slice(callStart, callEnd));
+    expect(callRegion).toContain("useBwrapArgsFile: effectiveBackendType === 'tmux',");
+  });
 });

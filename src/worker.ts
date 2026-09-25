@@ -16407,6 +16407,7 @@ async function spawnCli(
         trustedBotmuxCommandPaths: [defaultGatewayEntry().command],
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
         larkCliDataDir: childLarkDataRoot,
+        useBwrapArgsFile: effectiveBackendType === 'tmux',
       });
       if (!sbx) {
         // FAIL-SAFE: never silently run unsandboxed.
