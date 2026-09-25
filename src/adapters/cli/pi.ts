@@ -284,12 +284,17 @@ export function createPiAdapter(
     passesInitialPromptViaArgs: true,
 
     async writeInput(pty: PtyHandle, content: string) {
+      // Pi interprets Enter immediately after a backslash as a soft newline,
+      // even when that backslash arrived in a paste. End the paste on an empty
+      // line instead so the single Enter submits; Pi trims trailing whitespace
+      // in submitValue(), preserving the original trailing backslash.
+      const pastedContent = content.endsWith('\\') ? `${content}\n` : content;
       if (pty.pasteText && pty.sendSpecialKeys) {
-        pty.pasteText(content);
+        pty.pasteText(pastedContent);
         await delay(200);
         pty.sendSpecialKeys('Enter');
       } else {
-        pty.write(`\x1b[200~${content}\x1b[201~`);
+        pty.write(`\x1b[200~${pastedContent}\x1b[201~`);
         await delay(1000);
         pty.write('\r');
       }
