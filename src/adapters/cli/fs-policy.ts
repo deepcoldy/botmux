@@ -99,6 +99,16 @@ export interface FsPolicyContext {
   execPaths?: readonly string[];
   /** Trusted runtime read-only roots (skill/plugin dirs, botmux dist). */
   readonlyRoots?: readonly string[];
+  /** Read-only roots the daemon generated for THIS session under
+   *  sessionDataDir (runtime skill delivery dirs, Pi initial-prompt dir).
+   *  Unlike readonlyRoots they are NOT dropped for a no-transport turn, but only
+   *  when they pass the containment check in buildFsPolicy (inside
+   *  sessionDataDir, with a segment equal to one of this session's ids). Never
+   *  put user-configured paths here — those belong in userPaths. */
+  sessionOwnedReadonlyRoots?: readonly string[];
+  /** Extra ids that count as "this session" for sessionOwnedReadonlyRoots
+   *  containment (e.g. originalSessionId on resume). sessionId always counts. */
+  sessionOwnedIds?: readonly string[];
   /** The botmux install/checkout root (dir containing dist/ + node_modules).
    *  Exposed readOnly so the agent's `botmux` CLI and the claude hooks (which
    *  exec `node <checkout>/dist/cli.js …`) can load — without this a sandboxed
@@ -809,20 +819,25 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   if (roleLibGrant) push([ctx.roleLibrarySubtree!], roleLibGrant, 'internal');
   push(ctx.outbox ? [ctx.outbox] : [], 'readWrite', 'internal');
   push(dropAuthority(ctx.extraWritePaths), 'readWrite', 'internal');
-  // The session's OWN runtime skill plugin (`runtime-skills/<sessionId>/claude-plugin`,
-  // passed to the CLI via --plugin-dir) is exempt from dropAuthority. It lives
-  // under the botmux data dir, so a no-transport turn would otherwise drop it and
-  // the model would see the skill names in its prompt but fail to read any
-  // SKILL.md. The daemon writes it from the skill registry for this session only;
-  // it holds no Feishu credential. Exact-path match: sibling sessions' plugin
-  // dirs and the rest of the data dir stay behind the authority deny.
-  const ownSkillPluginDir = ctx.sessionId
-    ? normalizeFsPath(`${ctx.sessionDataDir}/runtime-skills/${ctx.sessionId}/claude-plugin`)
-    : null;
-  const isOwnSkillPluginDir = (p: string): boolean =>
-    ownSkillPluginDir !== null && normalizeFsPath(p) === ownSkillPluginDir;
-  push((ctx.readonlyRoots ?? []).filter(isOwnSkillPluginDir), 'readOnly', 'internal');
-  push(dropAuthority((ctx.readonlyRoots ?? []).filter(p => !isOwnSkillPluginDir(p))), 'readOnly', 'internal');
+  push(dropAuthority(ctx.readonlyRoots), 'readOnly', 'internal');
+  // Session-owned read-only roots: directories the daemon generated for THIS
+  // session under the botmux data dir (runtime skill delivery, Pi's long
+  // initial prompt). They carry no Feishu credential, so they skip
+  // dropAuthority — a no-transport turn would otherwise drop them and the CLI
+  // could not read its own skills / prompt. Defense in depth: a path is exempt
+  // only if it sits strictly inside sessionDataDir AND one of its segments is
+  // one of this session's ids; anything else falls back to the ordinary
+  // readonlyRoots treatment (fail-closed for no-transport).
+  const ownIds = new Set([ctx.sessionId, ...(ctx.sessionOwnedIds ?? [])].filter((id): id is string => !!id));
+  const sessionRoot = normalizeFsPath(ctx.sessionDataDir);
+  const isSessionOwned = (raw: string): boolean => {
+    const p = normalizeFsPath(raw);
+    if (!p || !sessionRoot || p === sessionRoot || !coversPath(sessionRoot, p)) return false;
+    return p.slice(sessionRoot.length + 1).split('/').some(seg => ownIds.has(seg));
+  };
+  const sessionOwned = ctx.sessionOwnedReadonlyRoots ?? [];
+  push(sessionOwned.filter(isSessionOwned), 'readOnly', 'internal');
+  push(dropAuthority(sessionOwned.filter(p => !isSessionOwned(p))), 'readOnly', 'internal');
   // Own routing metadata (`botmux send` reply routing) — read-only. The store
   // is SQLite in its own per-bot DIRECTORY: the dir grant is deliberate — a
   // single-file bwrap bind pins the inode, and SQLite deletes/recreates

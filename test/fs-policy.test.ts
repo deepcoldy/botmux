@@ -1174,25 +1174,55 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-sends/s.jsonl').access).toBe('readWrite');
   });
 
-  it('keeps the OWN runtime skill plugin dir readOnly under no-transport (siblings and other readonlyRoots stay dropped)', () => {
-    const own = '/Users/u/.botmux/data/runtime-skills/s/claude-plugin';
-    const sibling = '/Users/u/.botmux/data/runtime-skills/other/claude-plugin';
-    const p = noTransport({ readonlyRoots: [own, sibling, '/Users/u/.botmux/data'] });
-    expect(accessForPath(p.rules, `${own}/skills/x/SKILL.md`).access).toBe('readOnly');
-    expect(accessForPath(p.rules, `${sibling}/skills/x/SKILL.md`).access).toBe('deny');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/runtime-skills/other').access).toBe('deny');
-    expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('deny');
-    expect(p.suppressedAuthorityPaths).toEqual(expect.arrayContaining([sibling, '/Users/u/.botmux/data']));
-    expect(p.suppressedAuthorityPaths).not.toContain(own);
-    // Trailing slash still matches; a sessionId-less policy gets no exemption.
-    expect(accessForPath(noTransport({ readonlyRoots: [`${own}/`] }).rules, `${own}/x`).access).toBe('readOnly');
-    expect(accessForPath(noTransport({ sessionId: undefined, readonlyRoots: [own] }).rules, `${own}/x`).access).toBe('deny');
-  });
+  describe('session-owned read-only roots', () => {
+    const sd = '/Users/u/.botmux/data';
+    const ownRoots = [
+      `${sd}/runtime-skills/s/claude-plugin`,   // claude-plugin delivery
+      `${sd}/runtime-skills/s/skills`,          // skill-root delivery (pi)
+      `${sd}/pi-initial-prompts/s`,             // pi long initial prompt
+    ];
 
-  it('never lets a no-transport skill-plugin grant become writable', () => {
-    const own = '/Users/u/.botmux/data/runtime-skills/s/claude-plugin';
-    const p = noTransport({ readonlyRoots: [own] });
-    expect(accessForPath(p.rules, `${own}/skills/x/SKILL.md`).access).not.toBe('readWrite');
+    it('stays readOnly under no-transport for every delivery shape; siblings stay denied', () => {
+      const p = noTransport({ sessionOwnedReadonlyRoots: ownRoots });
+      for (const root of ownRoots) {
+        expect(accessForPath(p.rules, `${root}/x`).access).toBe('readOnly');
+      }
+      expect(accessForPath(p.rules, `${sd}/runtime-skills/other/skills/x`).access).toBe('deny');
+      expect(accessForPath(p.rules, `${sd}/pi-initial-prompts/other/initial.prompt.md`).access).toBe('deny');
+      expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('deny');
+      expect(p.suppressedAuthorityPaths ?? []).toEqual([]);
+    });
+
+    it('drops paths that fail containment (sibling id, outside sessionDataDir, the data dir itself)', () => {
+      const bad = [`${sd}/runtime-skills/other/skills`, '/Users/u/.botmux/skills/store', sd];
+      const p = noTransport({ sessionOwnedReadonlyRoots: bad });
+      expect(accessForPath(p.rules, `${sd}/runtime-skills/other/skills/x`).access).toBe('deny');
+      expect(accessForPath(p.rules, '/Users/u/.botmux/skills/store/x').access).toBe('deny');
+      expect(accessForPath(p.rules, `${sd}/sessions-cli_self.json.bak`).access).toBe('deny');
+      expect(p.suppressedAuthorityPaths).toEqual(expect.arrayContaining(bad));
+    });
+
+    it('accepts sessionOwnedIds (resume keeps the original id) and needs a session id', () => {
+      const resumed = `${sd}/pi-initial-prompts/orig`;
+      expect(accessForPath(noTransport({ sessionOwnedReadonlyRoots: [resumed] }).rules, `${resumed}/x`).access).toBe('deny');
+      expect(accessForPath(noTransport({ sessionOwnedReadonlyRoots: [resumed], sessionOwnedIds: ['orig'] }).rules, `${resumed}/x`).access).toBe('readOnly');
+      const own = ownRoots[0];
+      expect(accessForPath(noTransport({ sessionId: undefined, sessionOwnedReadonlyRoots: [own] }).rules, `${own}/x`).access).toBe('deny');
+      expect(accessForPath(noTransport({ sessionOwnedReadonlyRoots: [`${own}/`] }).rules, `${own}/x`).access).toBe('readOnly');
+    });
+
+    it('is read-only even when the session has a Lark transport', () => {
+      const p = buildFsPolicy(ctx({ sessionOwnedReadonlyRoots: ownRoots }));
+      for (const root of ownRoots) {
+        expect(accessForPath(p.rules, `${root}/x`).access).toBe('readOnly');
+      }
+    });
+
+    it('ordinary readonlyRoots inside the data dir are still dropped under no-transport', () => {
+      const p = noTransport({ readonlyRoots: [ownRoots[0]] });
+      expect(accessForPath(p.rules, `${ownRoots[0]}/x`).access).toBe('deny');
+      expect(p.suppressedAuthorityPaths).toContain(ownRoots[0]);
+    });
   });
 
   it('denies Feishu authority (bots.json / lark-cli stores / sibling BOT_HOME) even with workingDir=~', () => {

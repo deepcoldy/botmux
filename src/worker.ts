@@ -16281,8 +16281,6 @@ async function spawnCli(
       execPaths: keepExisting([...execDirs, ...execCarve]),
       readonlyRoots: keepExisting([
         botmuxDependencyRoot,
-        ...(cfg.skillReadonlyRoots ?? []),
-        ...piInitialPromptReadonlyRoots,
         // Adapter-declared read-only host paths (e.g. traex/coco first-run
         // migration done-markers at ~/.trae root). Exposed read-only so the CLI
         // sees them without widening the read-WRITE authPaths surface. `~`-expanded
@@ -16292,6 +16290,13 @@ async function spawnCli(
           ...perBotInjectEnv,
         }) ?? [])].map(expandTildeLexical),
       ]),
+      // Daemon-generated per-session roots (skill delivery, Pi initial prompt).
+      // Separate channel so no-transport turns keep them (see fs-policy).
+      sessionOwnedReadonlyRoots: keepExisting([
+        ...(cfg.skillReadonlyRoots ?? []),
+        ...piInitialPromptReadonlyRoots,
+      ]),
+      sessionOwnedIds: cfg.originalSessionId ? [cfg.originalSessionId] : undefined,
       botmuxInstallRoot,
       outbox,
       extraWritePaths: keepExisting([process.env.TMPDIR, canonicalManagedSessionDir]),
