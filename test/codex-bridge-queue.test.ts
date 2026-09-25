@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   CodexBridgeQueue,
   STRUCTURED_SUBMIT_START_GRACE_MS,
+  STRUCTURED_TASK_START_CORROBORATION_GRACE_MS,
   STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS,
   STRUCTURED_SUBMIT_VERIFICATION_GRACE_MS,
 } from '../src/services/codex-bridge-queue.js';
@@ -14,6 +15,9 @@ function userEv(text: string, uuid?: string, ts = 0): CodexBridgeEvent {
 }
 function asstEv(text: string, uuid?: string, ts = 0): CodexBridgeEvent {
   return { uuid: uuid ?? `a${++nextUuid}`, timestampMs: ts, kind: 'assistant_final', text };
+}
+function startedEv(sourceTurnId: string, uuid?: string, ts = 0): CodexBridgeEvent {
+  return { uuid: uuid ?? `s${++nextUuid}`, timestampMs: ts, kind: 'turn_started', text: '', sourceTurnId };
 }
 function abortEv(reason = 'interrupted', uuid?: string, ts = 0, sourceSessionId?: string): CodexBridgeEvent {
   return { uuid: uuid ?? `x${++nextUuid}`, timestampMs: ts, kind: 'turn_aborted', text: reason, sourceSessionId };
@@ -214,6 +218,224 @@ describe('CodexBridgeQueue — cot observer (thinking timeline)', () => {
       expect.objectContaining({ turnId: 't1', started: true, sourceTurnId: 'native-1' }),
       expect.objectContaining({ turnId: 't2', started: false }),
     ]);
+  });
+
+  it('keeps a task_started turn attributable while its user record is delayed past the lease', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('late-user', 'prompt persisted late', now);
+    q.ingest([startedEv('native-late-user', 'start-late-user', now + 1)]);
+
+    now += STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS + 80_000;
+    expect(q.pruneExpiredPreStartHeads()).toEqual([]);
+    expect(q.hasBlockingTurn()).toBe(true);
+
+    q.ingest([userEv('prompt persisted late', 'user-late-user', now)]);
+    expect(q.peek()[0]).toMatchObject({
+      turnId: 'late-user',
+      started: true,
+      sourceTurnId: 'native-late-user',
+      transcriptStartTimeMs: now,
+      markTimeMs: 1_001,
+    });
+
+    q.ingest([{ ...asstEv('done', 'final-late-user', now + 1), sourceTurnId: 'native-late-user' }]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'late-user', finalText: 'done' }),
+    ]);
+  });
+
+  it('does not let a stale task_started replay claim a fresh pending turn', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('fresh', 'fresh prompt', 10_000);
+    q.ingest([startedEv('stale-native-turn', 'stale-start', 4_999)]);
+
+    expect(q.peek()[0]).toMatchObject({ turnId: 'fresh', started: false });
+  });
+
+  it('rolls back a foreign task_started claim so the real Lark turn still settles', () => {
+    let now = 10_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('lark-A', 'LARK prompt', now);
+    q.ingest([startedEv('T-WEB', 'start-web', 10_100)]);
+
+    now = 10_200;
+    q.ingest([userEv('WEB prompt', 'user-web', now)]);
+    expect(q.peek()[0]).toMatchObject({
+      turnId: 'lark-A',
+      started: false,
+      unconfirmedAttributionStartedAtMs: now,
+    });
+    expect(q.peek()[0].sourceTurnId).toBeUndefined();
+    expect(q.peek()[0].sourceSessionId).toBeUndefined();
+
+    q.ingest([
+      { ...asstEv('foreign no-id answer', 'final-no-id', 11_000) },
+      { ...asstEv('WEB answer', 'final-web', 12_000), sourceTurnId: 'T-WEB' },
+    ]);
+    expect(q.peek()[0].finalText).toBeUndefined();
+
+    q.ingest([
+      startedEv('T-LARK', 'start-lark', 12_400),
+      userEv('LARK prompt', 'user-lark', 12_500),
+      { ...asstEv('LARK answer', 'final-lark', 14_000), sourceTurnId: 'T-LARK' },
+    ]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'lark-A', finalText: 'LARK answer', sourceTurnId: 'T-LARK' }),
+    ]);
+  });
+
+  it('rolls back an iTerm task_started claim before synthesising the adopt-mode local turn', () => {
+    let now = 10_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.setLocalTurns(true, 0);
+    q.mark('lark-A', 'LARK prompt', now);
+    q.ingest([startedEv('T-ITERM', 'start-iterm', 10_100)]);
+
+    now = 10_200;
+    q.ingest([userEv('iTerm prompt', 'user-iterm', now)]);
+    expect(q.peek()).toEqual([
+      expect.objectContaining({ isLocal: true, userText: 'iTerm prompt', started: true }),
+      expect.objectContaining({ turnId: 'lark-A', started: false }),
+    ]);
+    q.ingest([{ ...asstEv('iTerm answer', 'final-iterm', 12_000), sourceTurnId: 'T-ITERM' }]);
+
+    q.ingest([
+      startedEv('T-LARK', 'start-lark-adopt', 12_400),
+      userEv('LARK prompt', 'user-lark-adopt', 12_500),
+      { ...asstEv('LARK answer', 'final-lark-adopt', 14_000), sourceTurnId: 'T-LARK' },
+    ]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ isLocal: true, finalText: 'iTerm answer', sourceTurnId: 'T-ITERM' }),
+      expect.objectContaining({ turnId: 'lark-A', finalText: 'LARK answer', sourceTurnId: 'T-LARK' }),
+    ]);
+  });
+
+  it.each([
+    ['task_complete', (ts: number): CodexBridgeEvent => ({
+      ...asstEv('foreign answer', 'foreign-final', ts), sourceTurnId: 'T-FOREIGN',
+    })],
+    ['turn_aborted', (ts: number): CodexBridgeEvent => ({
+      ...abortEv('interrupted', 'foreign-abort', ts), sourceTurnId: 'T-FOREIGN',
+    })],
+  ])('rolls back an uncorroborated claim when its %s arrives', (_kind, terminal) => {
+    let now = 10_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('lark-A', 'LARK prompt', now);
+    q.ingest([startedEv('T-FOREIGN', 'start-foreign', 10_100)]);
+
+    now = 12_000;
+    q.ingest([terminal(now)]);
+    expect(q.peek()[0]).toMatchObject({
+      turnId: 'lark-A',
+      started: false,
+      unconfirmedAttributionStartedAtMs: now,
+    });
+    expect(q.peek()[0].sourceTurnId).toBeUndefined();
+    expect(q.peek()[0].finalText).toBeUndefined();
+    expect(q.drainEmittable()).toEqual([]);
+
+    q.ingest([
+      startedEv('T-LARK', `start-lark-after-${_kind}`, 12_100),
+      userEv('LARK prompt', `user-lark-after-${_kind}`, 12_200),
+      { ...asstEv('LARK answer', `final-lark-after-${_kind}`, 12_300), sourceTurnId: 'T-LARK' },
+    ]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'lark-A', finalText: 'LARK answer' }),
+    ]);
+  });
+
+  it('does not roll back a provisional claim for a foreign native terminal', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('lark-A', 'LARK prompt', 10_000);
+    q.ingest([{ ...startedEv('T-LARK', 'start-lark-exact', 10_100), sourceSessionId: 'session-a' }]);
+    q.ingest([{
+      ...asstEv('foreign answer', 'foreign-other-id', 10_200),
+      sourceSessionId: 'session-a', sourceTurnId: 'T-OTHER',
+    }]);
+    q.ingest([{
+      ...asstEv('wrong-session answer', 'foreign-other-session', 10_300),
+      sourceSessionId: 'session-b', sourceTurnId: 'T-LARK',
+    }]);
+
+    expect(q.peek()[0]).toMatchObject({ started: true, sourceTurnId: 'T-LARK' });
+    expect(q.peek()[0].finalText).toBeUndefined();
+    q.ingest([
+      { ...userEv('LARK prompt', 'user-lark-exact', 10_400), sourceSessionId: 'session-a' },
+      {
+        ...asstEv('LARK answer', 'final-lark-exact', 10_500),
+        sourceSessionId: 'session-a', sourceTurnId: 'T-LARK',
+      },
+    ]);
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'lark-A', finalText: 'LARK answer' }),
+    ]);
+  });
+
+  it('bounds a task_started-only claim, then re-anchors the ordinary attribution lease', () => {
+    let now = 1_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('missing-user', 'prompt never persisted', now);
+    q.ingest([startedEv('T-MISSING', 'start-missing', now + 1)]);
+    expect(q.preStartLeaseRemainingMs()).toBe(STRUCTURED_TASK_START_CORROBORATION_GRACE_MS);
+
+    now += STRUCTURED_TASK_START_CORROBORATION_GRACE_MS + 1;
+    expect(q.pruneExpiredPreStartHeads()).toEqual([]);
+    expect(q.peek()[0]).toMatchObject({
+      turnId: 'missing-user',
+      started: false,
+      unconfirmedAttributionStartedAtMs: now,
+    });
+    expect(q.peek()[0].sourceTurnId).toBeUndefined();
+
+    now += STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS + 1;
+    expect(q.pruneExpiredPreStartHeads().map(turn => turn.turnId)).toEqual(['missing-user']);
+    expect(q.peek()).toEqual([]);
+  });
+
+  it('re-anchors the lease after a fingerprint mismatch and lets the mark expire', () => {
+    let now = 10_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('rolled-back', 'LARK prompt', now);
+    q.ingest([startedEv('T-WEB', 'start-before-mismatch', 10_100)]);
+
+    now = 10_200;
+    q.ingest([userEv('WEB prompt', 'mismatching-user', now)]);
+    expect(q.peek()[0].unconfirmedAttributionStartedAtMs).toBe(now);
+
+    now += STRUCTURED_UNCONFIRMED_ATTRIBUTION_GRACE_MS + 1;
+    expect(q.pruneExpiredPreStartHeads().map(turn => turn.turnId)).toEqual(['rolled-back']);
+  });
+
+  it('re-anchors the confirmed lease when a provisional claim rolls back', () => {
+    let now = 10_000;
+    const q = new CodexBridgeQueue(() => now);
+    q.mark('confirmed-rollback', 'LARK prompt', now);
+    q.confirmPendingTurn('confirmed-rollback', now + 1);
+    q.ingest([startedEv('T-WEB-CONFIRMED', 'start-confirmed-mismatch', 10_100)]);
+
+    now = 10_200;
+    q.ingest([userEv('WEB prompt', 'confirmed-mismatching-user', now)]);
+    expect(q.peek()[0]).toMatchObject({
+      started: false,
+      submitConfirmedAtMs: now,
+    });
+    expect(q.peek()[0].unconfirmedAttributionStartedAtMs).toBeUndefined();
+
+    now += STRUCTURED_SUBMIT_START_GRACE_MS + 1;
+    expect(q.pruneExpiredPreStartHeads().map(turn => turn.turnId)).toEqual(['confirmed-rollback']);
+  });
+
+  it('does not bind a stale task_started onto an id-less user-started turn', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('lark-A', 'LARK prompt', 100);
+    q.ingest([userEv('LARK prompt', 'user-first', 200)]);
+
+    q.ingest([startedEv('T-STALE', 'stale-start-after-user', 199)]);
+    expect(q.peek()[0].sourceTurnId).toBeUndefined();
+
+    q.ingest([startedEv('T-LARK', 'fresh-start-after-user', 201)]);
+    expect(q.peek()[0].sourceTurnId).toBe('T-LARK');
   });
 
   it('attributes cot events to the collecting turn and ignores them outside a turn', () => {
