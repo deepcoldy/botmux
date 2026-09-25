@@ -400,6 +400,49 @@ describe('claude-code buildArgs', () => {
     expect(sys).not.toBe(buildBotmuxSystemPromptText({ locale: 'en' }));
   });
 
+  // ── #1504: Cursor detaches an over-long shell command into a background task
+  //    and, on completion, injects a synthetic "Briefly inform the user about
+  //    the task result…" turn with no Lark message behind it. The only lever is
+  //    a Cursor-scoped routing line; every other CLI's hints must stay
+  //    byte-identical.
+  it('adds the Cursor background-task note only for cliId=cursor, in both delivery modes', () => {
+    const baseLines = buildBotmuxShellHints('en');
+    const base = baseLines.join('\n');
+    const cursorLines = buildBotmuxShellHints('en', false, 'send', 'cursor');
+    const cursor = cursorLines.join('\n');
+    expect(cursor).toContain('background task');
+    expect(cursor).toContain('Briefly inform the user about the task result');
+    expect(cursor).toContain('NOT a new message from the Lark user');
+    expect(cursor).toContain('do not `botmux send` again');
+    expect(cursor).not.toBe(base);
+    // Exactly one extra line; everything else is the shared baseline, in order.
+    const noteLines = cursorLines.filter((l) => l.includes('Briefly inform the user about the task result'));
+    expect(noteLines).toHaveLength(1);
+    expect(cursorLines.filter((l) => l !== noteLines[0])).toEqual(baseLines);
+
+    const cursorZh = buildBotmuxShellHints('zh', false, 'send', 'cursor').join('\n');
+    expect(cursorZh).toContain('后台任务');
+    expect(cursorZh).toContain('Briefly inform the user about the task result');
+    expect(cursorZh).toContain('不是飞书用户的新消息');
+    expect(cursorZh).toContain('不要再 botmux send');
+
+    // transcript mode: same warning, but it must not reintroduce `botmux send`.
+    const cursorTranscript = buildBotmuxShellHints('en', false, 'transcript', 'cursor').join('\n');
+    expect(cursorTranscript).toContain('background task');
+    expect(cursorTranscript).toContain('BOTMUX_NOTHING_TO_SEND');
+    expect(cursorTranscript).not.toContain('botmux send');
+    expect(cursorTranscript).not.toBe(buildBotmuxShellHints('en', false, 'transcript').join('\n'));
+
+    // Other CLIs: byte-identical to the no-cliId baseline.
+    for (const cliId of ['codex', 'gemini', 'coco', 'opencode'] as const) {
+      expect(buildBotmuxShellHints('en', false, 'send', cliId).join('\n')).toBe(base);
+      expect(buildBotmuxShellHints('en', false, 'transcript', cliId))
+        .toEqual(buildBotmuxShellHints('en', false, 'transcript'));
+    }
+    // noTransport collapses to the hidden-context defense only — cursor included.
+    expect(buildBotmuxShellHints('en', true, 'send', 'cursor')).toEqual(buildBotmuxShellHints('en', true));
+  });
+
   it('transcript identity keeps the three routing rules minus mention_must; solo drops routing_rules; noTransport still wins', () => {
     const solo = buildBotmuxSystemPromptText({ locale: 'en', botName: 'Bot', botOpenId: 'ou_x', replyDelivery: 'transcript', solo: true });
     expect(solo).toContain('<name>Bot</name>');
