@@ -239,6 +239,11 @@ describe('durable turn queue boundary', () => {
       { content: 'delivery', dispatchAttempt: 1 },
     )).toBe(true);
     expect(shouldStopPendingBatch({ content: 'user 1' }, { content: 'user 2' })).toBe(false);
+    expect(shouldStopPendingBatch(
+      { content: 'user 1' },
+      { content: 'user 2' },
+      false,
+    )).toBe(true);
   });
 
   it('does not cross an unresolved durable boundary on a screen-idle edge', () => {
