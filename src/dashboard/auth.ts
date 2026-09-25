@@ -378,6 +378,89 @@ export function workbenchH5Capability(method: string, pathname: string): Workben
   return null;
 }
 
+// ─── 平台 OpenAPI 链路（外部平台派任务）────────────────────────────────────
+
+/**
+ * 平台 OpenAPI 反代过来的**机器协管者**能做的 daemon API。
+ *
+ * 为什么必须是**独立的一张表**，而不是往 {@link workbenchH5Capability} 里加几条：
+ * 那张表服务的是飞书 H5 扫码进来的工作台访客，而 `decideWorkbenchH5Auth` 只收
+ * method + pathname、**不看身份** —— 往里加一条 `POST /api/trigger`，等于每个
+ * 扫过码的人都能在别人机器上派任务。两类身份共用一个 `workbenchOnlyIdentity`
+ * 布尔，所以隔离只能做在表这一层。
+ *
+ * 档位按 scope 分，不按路由分组的直觉：
+ *   - `observe`  ← 平台授予 `sessions:open`。只读：查结果、看会话洞察、列 bot。
+ *   - `dispatch` ← 再加 `terminal:control`（平台据此发 role=owner）。可以派任务、
+ *     关会话 —— 都是让机器**跑东西**，与「能直接往 CLI 里打字」同量级，所以绑在
+ *     同一档上；只读档拿不到。
+ *
+ * 这是 fail-closed 的乘法而非加法，与 `canManageHost` 同一口径：平台侧一个勾选
+ * 失误不该让只读协管者获得执行能力。
+ *
+ * 调用方（riff 这类外部平台）应据平台机器列表回的 `scopes` 决定要不要画「派任务」
+ * 入口，否则只读档用户会点到一个必然 401 的按钮。
+ */
+export type PlatformSessionsCapability =
+  | 'sessions.observe'
+  | 'sessions.dispatch';
+
+/** 能力档，从高到低。`none` = 平台没给任何相关 scope（老平台、免登录只读）。 */
+export type PlatformSessionsTier = 'none' | 'observe' | 'dispatch';
+
+export function platformSessionsCapability(
+  method: string,
+  pathname: string,
+): PlatformSessionsCapability | null {
+  const m = method.toUpperCase();
+
+  // 派任务：唯一的执行入口。
+  if (m === 'POST' && pathname === '/api/trigger') return 'sessions.dispatch';
+  // 关会话：终止整个会话（riff 的「取消」映射到它），是写操作。
+  if (m === 'POST' && /^\/api\/sessions\/[^/]+\/close$/.test(pathname)) return 'sessions.dispatch';
+
+  // 轮询任务结果 / 会话洞察（含 conversation 分页）。daemon 侧已安全投影。
+  // insight 后面允许再跟子路径（`/turn/:i` 的 prompt 详情弹窗），不能用 `$`
+  // 锚死：锚死了 dispatch 档点开 turn 也是 401。trigger-result 没有子路径，
+  // 保持精确匹配，别顺手放宽。
+  if ((m === 'GET' || m === 'HEAD')
+    && (/^\/api\/sessions\/[^/]+\/trigger-result$/.test(pathname)
+      || /^\/api\/sessions\/[^/]+\/insight(\/[^?]*)?$/.test(pathname))) {
+    return 'sessions.observe';
+  }
+  // 列 bot：选 agent 用。平台机器列表里的 bot 形状太薄（没有 cliId），所以要这条。
+  if ((m === 'GET' || m === 'HEAD') && pathname === '/api/bots') return 'sessions.observe';
+
+  return null;
+}
+
+/** 该档位是否覆盖某项能力。`dispatch` 含 `observe`，反之不然。 */
+export function platformSessionsTierAllows(
+  tier: PlatformSessionsTier,
+  capability: PlatformSessionsCapability,
+): boolean {
+  if (tier === 'dispatch') return true;
+  if (tier === 'observe') return capability === 'sessions.observe';
+  return false;
+}
+
+/**
+ * 协管者身份的门禁：先看平台 OpenAPI 那张表，不命中再退回工作台 H5 那张窄表。
+ *
+ * 顺序是「加法」而非「替换」：协管者同时也是工作台访客（要能看会话板、开终端
+ * 只读链接），所以两张表并集。但 H5 身份**只**走 {@link decideWorkbenchH5Auth}，
+ * 永远碰不到这张新表 —— tier 由平台注入的 scopes 算出，H5 恒 `none`。
+ */
+export function decidePlatformSessionsAuth(opts: {
+  method: string;
+  pathname: string;
+  tier: PlatformSessionsTier;
+}): AuthDecision {
+  const capability = platformSessionsCapability(opts.method, opts.pathname);
+  if (capability && platformSessionsTierAllows(opts.tier, capability)) return { kind: 'allow' };
+  return decideWorkbenchH5Auth({ method: opts.method, pathname: opts.pathname });
+}
+
 /** Fail-closed auth decision for an already-authenticated H5/readonly-platform
  * identity. Static shell reads retain the ordinary public behavior; everything
  * else must name one of the Workbench capabilities above. */

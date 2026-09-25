@@ -315,7 +315,7 @@ import type { BotSkillPolicy, SkillPack, SkillPackage, SkillSelector } from './c
 import { discoverNativeCliSkillGroups } from './core/skills/discovery.js';
 import { analyzeSkillReferences, packsContainingSkill, type SkillReferenceBot, type SkillReferenceSummary } from './core/skills/references.js';
 import { discoverDashboardSkills, installDashboardSkill, parseDashboardSkillInstallRequest, parseInstallLocalLinksSources, MAX_LOCAL_LINK_SOURCES } from './dashboard/skill-install-request.js';
-import { botDefaultsPayload, botSummaryPayload, brandMapByAppId } from './dashboard/bot-payload.js';
+import { botCoManagerPayload, botDefaultsPayload, botSummaryPayload, brandMapByAppId } from './dashboard/bot-payload.js';
 import {
   handleVcMeetingConsumerProfilesGet,
   handleVcMeetingConsumerProfilesPut,
@@ -6868,6 +6868,17 @@ const server = createServer(async (req, res) => {
       );
       const out = [...onlineOut, ...recoveryRows]
         .sort((a, b) => Number(a.botIndex ?? Number.MAX_SAFE_INTEGER) - Number(b.botIndex ?? Number.MAX_SAFE_INTEGER));
+      // 平台协管者只拿得到「选 agent」需要的那几个字段。这一整份 payload 是
+      // owner 的 Bot Defaults 编辑器数据源,逐字带着明文 env / launchShell /
+      // startupCommands —— daemon 侧那段注释的前提「dashboard is owner-
+      // authenticated」在协管者进来之后就不成立了。
+      //
+      // 判据用 workbenchOnlyIdentity 而不是 platformSessionsTier:H5 访客的那张
+      // 表根本不含 /api/bots,所以能走到这里的窄门禁身份只可能是平台协管者;
+      // 万一将来 H5 也被放进来,它同样应该只拿到瘦投影,这里不必再改一次。
+      if (workbenchOnlyIdentity) {
+        return jsonRes(res, 200, { bots: out.map(botCoManagerPayload) });
+      }
       return jsonRes(res, 200, { bots: out });
     }
 
