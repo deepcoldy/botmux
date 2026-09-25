@@ -103,12 +103,9 @@ export interface FsPolicyContext {
    *  sessionDataDir (runtime skill delivery dirs, Pi initial-prompt dir).
    *  Unlike readonlyRoots they are NOT dropped for a no-transport turn, but only
    *  when they pass the containment check in buildFsPolicy (inside
-   *  sessionDataDir, with a segment equal to one of this session's ids). Never
-   *  put user-configured paths here — those belong in userPaths. */
+   *  sessionDataDir, with a segment equal to this session's id). Never put
+   *  user-configured paths here — those belong in userPaths. */
   sessionOwnedReadonlyRoots?: readonly string[];
-  /** Extra ids that count as "this session" for sessionOwnedReadonlyRoots
-   *  containment (e.g. originalSessionId on resume). sessionId always counts. */
-  sessionOwnedIds?: readonly string[];
   /** The botmux install/checkout root (dir containing dist/ + node_modules).
    *  Exposed readOnly so the agent's `botmux` CLI and the claude hooks (which
    *  exec `node <checkout>/dist/cli.js …`) can load — without this a sandboxed
@@ -826,14 +823,13 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // dropAuthority — a no-transport turn would otherwise drop them and the CLI
   // could not read its own skills / prompt. Defense in depth: a path is exempt
   // only if it sits strictly inside sessionDataDir AND one of its segments is
-  // one of this session's ids; anything else falls back to the ordinary
-  // readonlyRoots treatment (fail-closed for no-transport).
-  const ownIds = new Set([ctx.sessionId, ...(ctx.sessionOwnedIds ?? [])].filter((id): id is string => !!id));
+  // this session's id; anything else falls back to the ordinary readonlyRoots
+  // treatment (fail-closed for no-transport).
   const sessionRoot = normalizeFsPath(ctx.sessionDataDir);
   const isSessionOwned = (raw: string): boolean => {
     const p = normalizeFsPath(raw);
-    if (!p || !sessionRoot || p === sessionRoot || !coversPath(sessionRoot, p)) return false;
-    return p.slice(sessionRoot.length + 1).split('/').some(seg => ownIds.has(seg));
+    if (!ctx.sessionId || !p || !sessionRoot || p === sessionRoot || !coversPath(sessionRoot, p)) return false;
+    return p.slice(sessionRoot.length + 1).split('/').includes(ctx.sessionId);
   };
   const sessionOwned = ctx.sessionOwnedReadonlyRoots ?? [];
   push(sessionOwned.filter(isSessionOwned), 'readOnly', 'internal');

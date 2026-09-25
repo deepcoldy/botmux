@@ -16296,7 +16296,6 @@ async function spawnCli(
         ...(cfg.skillReadonlyRoots ?? []),
         ...piInitialPromptReadonlyRoots,
       ]),
-      sessionOwnedIds: cfg.originalSessionId ? [cfg.originalSessionId] : undefined,
       botmuxInstallRoot,
       outbox,
       extraWritePaths: keepExisting([process.env.TMPDIR, canonicalManagedSessionDir]),

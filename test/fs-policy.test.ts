@@ -1202,10 +1202,7 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
       expect(p.suppressedAuthorityPaths).toEqual(expect.arrayContaining(bad));
     });
 
-    it('accepts sessionOwnedIds (resume keeps the original id) and needs a session id', () => {
-      const resumed = `${sd}/pi-initial-prompts/orig`;
-      expect(accessForPath(noTransport({ sessionOwnedReadonlyRoots: [resumed] }).rules, `${resumed}/x`).access).toBe('deny');
-      expect(accessForPath(noTransport({ sessionOwnedReadonlyRoots: [resumed], sessionOwnedIds: ['orig'] }).rules, `${resumed}/x`).access).toBe('readOnly');
+    it('needs a session id and tolerates a trailing slash', () => {
       const own = ownRoots[0];
       expect(accessForPath(noTransport({ sessionId: undefined, sessionOwnedReadonlyRoots: [own] }).rules, `${own}/x`).access).toBe('deny');
       expect(accessForPath(noTransport({ sessionOwnedReadonlyRoots: [`${own}/`] }).rules, `${own}/x`).access).toBe('readOnly');
