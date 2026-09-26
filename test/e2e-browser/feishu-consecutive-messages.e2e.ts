@@ -3,7 +3,7 @@
  * Verifies the type-ahead message queue — sends 3 messages rapidly
  * while CLI is still processing the first, asserts all are handled.
  */
-import { describe, it, beforeAll, afterAll } from 'vitest';
+import { describe, it, beforeAll, afterAll } from './midscene-suite.js';
 import type { Browser, Page, BrowserContext } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
 import { existsSync } from 'node:fs';

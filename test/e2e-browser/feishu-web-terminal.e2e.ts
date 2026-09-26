@@ -5,7 +5,7 @@
  *  3. Open Web Terminal (click button or follow link)
  *  4. Verify terminal loaded
  */
-import { describe, it, beforeAll, afterAll } from 'vitest';
+import { describe, it, beforeAll, afterAll } from './midscene-suite.js';
 import type { Browser, Page, BrowserContext } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
 import { existsSync } from 'node:fs';
@@ -75,7 +75,7 @@ describe('feishu web terminal', () => {
     await showStreamingOutput(agent, page);
 
     // Scroll down in thread panel to reveal card buttons below expanded content
-    await agent.aiScroll(undefined, { direction: 'down', scrollType: 'untilBottom' });
+    await agent.aiAct('滚动当前话题详情面板到底部，显示流式卡片下方的操作按钮');
     await page.waitForTimeout(1000);
 
     // Open terminal: listen for popup OR navigation simultaneously
