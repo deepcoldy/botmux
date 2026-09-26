@@ -10,7 +10,7 @@ import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
-import { getChatInfo, getChatMode, getCachedChatMode, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { getChatInfo, getChatMode, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { listChats } from '../../services/groups-store.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
@@ -51,8 +51,8 @@ import { tryHandleChatTabsCommand } from './chat-tabs-command.js';
 import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
-import { openPending, isThrottled, clearPending } from './grant-pending.js';
-import { resolveGrantApprover } from './grant-owner.js';
+import { openPending, isThrottled, clearPending, tryReserveOwnerDmSlot, releaseOwnerDmSlot } from './grant-pending.js';
+import { resolveGrantApprover, resolveGrantRequestRoute, type GrantRequestRoute } from './grant-owner.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import {
   chatQuotaKey,
@@ -2233,8 +2233,15 @@ export function canRunDaemonCommand(
 }
 
 /**
- * 入口 A：无权限者 @bot 时弹授权申请卡（正文 @owner，由 owner 处置）。
+ * 入口 A：无权限者 @bot（或私聊 bot）时弹授权申请卡，由管理员处置。
  * 受 grant-pending 节流：pending 中 / deny 冷却期内静默不发。开放模式（无 owner）兜底不发。
+ *
+ * 默认（grantRequestToOwnerDm 未开）：卡片回复在原会话、正文 @ resolveGrantApprover 选出的管理员；
+ * p2p 不发卡。开启 grantRequestToOwnerDm 后投递位置见 resolveGrantRequestRoute：会话里有管理员 →
+ * 同上；会话里没有管理员（p2p，或群里查不到管理员）→ 卡片改投主 owner 私聊，申请人只收到一句
+ * 不含 owner 身份的中性回执。私聊投递另受 owner 维度总量节流；投递失败或超限时撤掉 pending
+ * 静默、下一条消息再重试：p2p 不能把卡 reply 给申请人自己，群里已确认没有管理员，回落群内
+ * 只会留一张没人能点的卡。
  */
 export async function maybeSendGrantRequestCard(
   larkAppId: string, message: any, chatId: string, requesterOpenId: string | undefined, messageData?: any,
@@ -2246,7 +2253,15 @@ export async function maybeSendGrantRequestCard(
   const owner = getOwnerOpenId(larkAppId);
   if (!owner || !requesterOpenId) return;
   if (isThrottled(larkAppId, chatId, requesterOpenId)) return;
-  const approverPromise = resolveGrantApprover(larkAppId, chatId, message).catch(() => undefined);
+  const chatType: 'p2p' | 'group' = message?.chat_type === 'p2p' ? 'p2p' : 'group';
+  const forwardToOwnerDm = getBot(larkAppId).config.grantRequestToOwnerDm === true;
+  // 未开转投时 p2p 维持不发卡：卡 reply 回来只会发给申请人自己（按钮又是 owner 专属）且暴露 owner。
+  if (chatType === 'p2p' && !forwardToOwnerDm) return;
+  const routePromise: Promise<GrantRequestRoute | undefined> = forwardToOwnerDm
+    ? resolveGrantRequestRoute(larkAppId, chatId, chatType, message).catch(() => undefined)
+    : resolveGrantApprover(larkAppId, chatId, message)
+      .then(approver => (approver ? { approver, delivery: 'in_chat' as const } : undefined))
+      .catch(() => undefined);
   // 名字优先级：本消息 mentions（真人发送方、被 @ 目标都在此）→ observed-bots 花名册
   // （/introduce 登记过的 (open_id,name)）→ 裸 open_id 兜底。外部 bot 发送方不在自己
   // 消息的 mentions 里（那是 @ 目标），只靠 mentions 会让 owner 只看到 open_id。
@@ -2259,7 +2274,8 @@ export async function maybeSendGrantRequestCard(
     : (await getUserProfile(larkAppId, requesterOpenId).catch(() => null))?.name;
   const shortRequester = `${requesterOpenId.slice(0, 10)}…${requesterOpenId.slice(-4)}`;
   const name = mentionName ?? observedName ?? profileName ?? shortRequester;
-  const approver = (await approverPromise) ?? owner;
+  const route = await routePromise;
+  const approver = route?.approver ?? owner;
   // 把原始消息事件挂在 pending 上：授权成功后可重放，用户无需再 @ 一遍。
   const botConfig = getBot(larkAppId).config;
   const quota = botConfig.messageQuota?.defaultLimit ?? DEFAULT_GRANT_QUOTA;
@@ -2272,6 +2288,20 @@ export async function maybeSendGrantRequestCard(
     messageData,
     durationMs,
   );
+  const loc = localeForBot(larkAppId);
+  if (route?.delivery === 'dm' || chatType === 'p2p') {
+    const delivery = chatType === 'p2p' ? 'dm_p2p' : 'dm_group';
+    const sentToDm = await sendGrantRequestToApproverDm({
+      larkAppId, chatId, requesterOpenId, name: String(name), approver, nonce, quota, durationMs, delivery,
+    });
+    if (sentToDm) {
+      await replyMessage(larkAppId, message.message_id, t('card.grant.request_forwarded', undefined, loc))
+        .catch(err => logger.debug(`grant request forwarded ack failed: ${err}`));
+      return;
+    }
+    clearPending(larkAppId, chatId, requesterOpenId);
+    return;
+  }
   const card = buildGrantCard(
     {
       ownerOpenId: approver,
@@ -2282,7 +2312,7 @@ export async function maybeSendGrantRequestCard(
       quota,
       durationMs,
     },
-    localeForBot(larkAppId),
+    loc,
   );
   await replyMessage(larkAppId, message.message_id, card, 'interactive')
     .catch(err => {
@@ -2291,6 +2321,51 @@ export async function maybeSendGrantRequestCard(
       clearPending(larkAppId, chatId, requesterOpenId);
       logger.debug(`grant request card send failed: ${err}`);
     });
+}
+
+/** 把自助申请卡投到管理员私聊。返回 false = 没发出去（owner 维度超限或发送失败），由调用方撤 pending。 */
+async function sendGrantRequestToApproverDm(o: {
+  larkAppId: string;
+  chatId: string;
+  requesterOpenId: string;
+  name: string;
+  approver: string;
+  nonce: string;
+  quota: number | undefined;
+  durationMs: number | undefined;
+  delivery: 'dm_p2p' | 'dm_group';
+}): Promise<boolean> {
+  const reservedAt = Date.now();
+  if (!tryReserveOwnerDmSlot(o.larkAppId, o.approver, reservedAt)) {
+    logger.info(`[grant:${o.larkAppId}] owner DM request-card cap reached; not forwarding request from ${o.requesterOpenId.substring(0, 12)} in ${o.chatId.substring(0, 12)}`);
+    return false;
+  }
+  const chatName = o.delivery === 'dm_group'
+    ? (await getChatName(o.larkAppId, o.chatId).catch(() => null)) ?? `${o.chatId.slice(0, 10)}…`
+    : undefined;
+  const card = buildGrantCard(
+    {
+      ownerOpenId: o.approver,
+      targets: [{ openId: o.requesterOpenId, name: o.name }],
+      chatId: o.chatId,
+      nonce: o.nonce,
+      mode: 'request',
+      quota: o.quota,
+      durationMs: o.durationMs,
+      delivery: o.delivery,
+      chatName,
+    },
+    localeForBot(o.larkAppId),
+  );
+  try {
+    await sendUserMessage(o.larkAppId, o.approver, card, 'interactive');
+    logger.info(`[grant:${o.larkAppId}] request card forwarded to approver DM (${o.delivery}) for ${o.requesterOpenId.substring(0, 12)} in ${o.chatId.substring(0, 12)}`);
+    return true;
+  } catch (err) {
+    releaseOwnerDmSlot(o.larkAppId, o.approver, reservedAt);
+    logger.warn(`[grant:${o.larkAppId}] forwarding request card to approver DM failed: ${err}`);
+    return false;
+  }
 }
 
 // ─── Group message access check ──────────────────────────────────────────
@@ -4783,9 +4858,14 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           }
         }
       } else if (!isAllowed) {
-        // 私聊被挡目前是静默丢弃：owner 不在这个 p2p 会话里，把授权申请卡 reply 回来只会
-        // 发给陌生人自己（卡上的按钮又是 owner 专属），既不可用又泄露 owner —— 所以不发。
-        // 真正的修法是把申请发到 owner 自己的 DM 并加 owner 维度节流，单独一个 PR 做。
+        // 私聊被挡默认静默：owner 不在这个 p2p 会话里，把授权申请卡 reply 回来只会发给陌生人
+        // 自己（卡上的按钮又是 owner 专属），既不可用又泄露 owner。开了 grantRequestToOwnerDm
+        // 才把申请卡转投 owner 自己的私聊（owner 维度节流），申请人只收到一句中性回执，
+        // 授权后重放这条消息；blocked / autoGrantRequestCards=false / 节流中仍静默。
+        if (getBot(larkAppId).config.grantRequestToOwnerDm === true) {
+          await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data);
+          return;
+        }
         logger.debug(`Ignoring p2p message from non-allowed user: ${senderOpenId}`);
         return;
       }

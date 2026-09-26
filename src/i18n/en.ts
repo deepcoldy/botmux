@@ -120,9 +120,13 @@ export const messages: Record<string, string> = {
   'card.grant.body_request': 'Sender **{name}** is requesting to use me in this chat. <at id={owner}></at> allow them to talk to me here?',
   'card.grant.body_owner': 'Grant **{name}** permission to talk to me in this chat? (<at id={owner}></at>)',
   'card.grant.body_owner_multi': 'Grant {names} permission to talk to me in this chat? (<at id={owner}></at>)',
+  'card.grant.body_request_p2p': '**{name}** is requesting to talk to me in a direct message. Allow?',
+  'card.grant.body_request_remote': '**{name}** @-mentioned me in "{chat}" and is requesting access. That chat has no bot admin, so the request was forwarded to your DM. Allow them to talk to me in that chat?',
   'card.grant.btn_chat': 'Grant talk in this chat',
   'card.grant.btn_global': 'Grant talk globally',
   'card.grant.btn_deny': 'Deny',
+  'card.grant.btn_chat_p2p': 'Grant DM access',
+  'card.grant.btn_chat_remote': 'Grant for that chat',
   'card.grant.duration_label': 'Expires after',
   'card.grant.duration_3600000': '1 hour',
   'card.grant.duration_28800000': '8 hours',
@@ -145,6 +149,12 @@ export const messages: Record<string, string> = {
   'card.grant.partial_failed': '⚠️ The following targets failed to authorize (re-run /grant to retry): {names}',
   'card.grant.notify_chat': '✅ {at} can now use me in this chat — just @-mention me.',
   'card.grant.notify_global': '✅ {at} now has global access — @-mention me in any chat.',
+  'card.grant.notify_owner_p2p': '✅ {at} can now talk to me in a direct message.',
+  'card.grant.notify_owner_remote': '✅ {at} can now talk to me in "{chat}".',
+  'card.grant.request_forwarded': 'Your access request was sent to the bot admin. Your message will be processed automatically once approved.',
+  'card.grant.requester_granted_p2p': '✅ The admin approved your request — you can message me directly now.',
+  'card.grant.requester_denied_p2p': 'Your access request was not approved.',
+  'card.grant.requester_denied_chat': 'The access request from {at} was not approved.',
   'card.grant.notify_quota_suffix': ' (message quota: {n}; access is revoked once used up)',
   'card.grant.notify_expiry_suffix': ' (expires at {time})',
   'card.grant.result_expiry': 'Expires at: {time}',
@@ -152,6 +162,7 @@ export const messages: Record<string, string> = {
 
   // Message quota exhausted
   'quota.exhausted_notify': '⚠️ {at} has used up their message quota ({limit}/{limit}); talk access has been revoked. Ask the owner to /grant again to continue.',
+  'quota.exhausted_notify_reapply': '⚠️ {at} has used up their message quota ({limit}/{limit}); talk access has been revoked. Sending another message will automatically request a new quota from the bot admin.',
 
   // Granted-user command restriction (when restrictGrantCommands is on)
   'cmd.grant_restricted': '⚠️ This grant only allows plain conversation — commands like {cmd} are not permitted. Ask the owner to lift the restriction.',
@@ -676,6 +687,7 @@ export const messages: Record<string, string> = {
   'config.label.disableCliBypass': 'Disable bypass · safer',
   'config.label.restrictGrantCommands': 'Grantees chat-only',
   'config.label.p2pOpen': 'Open DMs',
+  'config.label.grantRequestToOwnerDm': 'Forward requests to owner DM',
   'card.config.note': '🟢=on ⚪=off, tap to flip & refresh (model/cli take effect next session). Language: `/botconfig zh` | `/botconfig en`.\nMore fields via "✏️ Text fields"; allowedUsers / oncall use `/botconfig help`.',
   'card.config.text_btn': '✏️ Text fields',
   'card.config.text_title': '✏️ {name} · text fields',

@@ -4185,10 +4185,15 @@ async function notifyQuotaExhausted(
   limit: number | undefined,
 ): Promise<void> {
   if (typeof limit !== 'number') return;
+  let autoReapply = false;
+  try {
+    const cfg = getBot(larkAppId).config;
+    autoReapply = cfg.grantRequestToOwnerDm === true && cfg.autoGrantRequestCards !== false;
+  } catch { /* bot 不在 registry：沿用默认文案 */ }
   try {
     await sessionReply(
       anchor,
-      buildQuotaExhaustedCard(senderOpenId, limit, localeForBot(larkAppId)),
+      buildQuotaExhaustedCard(senderOpenId, limit, localeForBot(larkAppId), autoReapply),
       'interactive',
       larkAppId,
     );

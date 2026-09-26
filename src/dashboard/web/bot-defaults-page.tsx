@@ -7408,6 +7408,7 @@ function ReplyStyleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
 export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const [autoCard, setAutoCard] = useState(props.bot.autoGrantRequestCards !== false);
+  const [ownerDm, setOwnerDm] = useState(props.bot.grantRequestToOwnerDm === true);
   const [restrict, setRestrict] = useState(props.bot.restrictGrantCommands === true);
   const [p2pOpen, setP2pOpen] = useState(props.bot.p2pOpen === true);
   const [duration, setDuration] = useState(typeof props.bot.grantDefaultDurationMs === 'number' ? props.bot.grantDefaultDurationMs : null);
@@ -7423,6 +7424,10 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   useEffect(() => {
     setAutoCard(props.bot.autoGrantRequestCards !== false);
   }, [props.bot.autoGrantRequestCards]);
+
+  useEffect(() => {
+    setOwnerDm(props.bot.grantRequestToOwnerDm === true);
+  }, [props.bot.grantRequestToOwnerDm]);
 
   useEffect(() => {
     setRestrict(props.bot.restrictGrantCommands === true);
@@ -7447,6 +7452,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   async function savePatch(
     patch: {
       autoGrantRequestCards?: boolean;
+      grantRequestToOwnerDm?: boolean;
       restrictGrantCommands?: boolean;
       p2pOpen?: boolean;
       grantDefaultDurationMs?: number | null;
@@ -7465,6 +7471,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
         const nextDuration = typeof res.body.grantDefaultDurationMs === 'number' ? res.body.grantDefaultDurationMs : null;
         const nextQuota = typeof res.body.messageQuotaDefaultLimit === 'number' ? res.body.messageQuotaDefaultLimit : null;
         setAutoCard(res.body.autoGrantRequestCards !== false);
+        setOwnerDm(res.body.grantRequestToOwnerDm === true);
         setRestrict(res.body.restrictGrantCommands === true);
         setP2pOpen(res.body.p2pOpen === true);
         setDuration(nextDuration);
@@ -7475,6 +7482,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
         }
         props.patchBot(props.bot.larkAppId, {
           autoGrantRequestCards: res.body.autoGrantRequestCards !== false,
+          grantRequestToOwnerDm: res.body.grantRequestToOwnerDm === true,
           restrictGrantCommands: res.body.restrictGrantCommands === true,
           p2pOpen: res.body.p2pOpen === true,
           grantDefaultDurationMs: nextDuration,
@@ -7582,6 +7590,18 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
             const previous = autoCard;
             setAutoCard(checked);
             void savePatch({ autoGrantRequestCards: checked }, 'autoGrant', () => setAutoCard(previous));
+          }}
+        />
+        <ToggleRow
+          checked={ownerDm}
+          disabled={busy !== null || !autoCard}
+          dataAction="toggle-grant-request-owner-dm"
+          title={tr('botDefaults.grantRequestToOwnerDm')}
+          help={tr('botDefaults.grantRequestToOwnerDmHelp')}
+          onChange={checked => {
+            const previous = ownerDm;
+            setOwnerDm(checked);
+            void savePatch({ grantRequestToOwnerDm: checked }, 'ownerDm', () => setOwnerDm(previous));
           }}
         />
         <ToggleRow

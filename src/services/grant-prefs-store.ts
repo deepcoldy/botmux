@@ -3,12 +3,14 @@
  * 跨进程文件锁 + bots.json 原子写，外加内存 registry 同步，让 daemon 的
  * 路由 / grant 处理不必重启即可生效。
  *
- * 五个独立设置：
+ * 六个独立设置：
  *   • restrictGrantCommands     — owner 开关：被授权人只能纯对话，拦截一切 slash 命令
  *   • autoGrantRequestCards     — 未授权者/外部 bot @ 本 bot 但被权限闸挡住时，是否自动发
  *                                 /grant 申请卡给 owner（默认开启；false 显式关闭）
  *   • p2pOpen                   — 私聊对话全开：任何人都能私聊本 bot（talk-only），免逐个
  *                                 加 globalGrants。只放行 canTalk，管理操作仍只认 allowedUsers。
+ *   • grantRequestToOwnerDm     — 会话里没有管理员能点申请卡时，把申请卡转投主 owner 私聊
+ *                                 （默认关闭；只落显式 true）。
  *   • messageQuota.defaultLimit — 授权卡/自助申请授权放进来的**访客**默认额度。缺省时
  *                                 使用内置 3 条。**Oncall 群恒不限额、不读此值**
  *                                 （历史上读过，见 event-dispatcher 的 oncallTalk）。
@@ -28,6 +30,8 @@ export interface BotGrantPrefs {
   autoGrantRequestCards: boolean;
   /** 私聊对话全开（talk-only，不授管理权）。默认 false。 */
   p2pOpen: boolean;
+  /** 无管理员可点卡时申请卡转投 owner 私聊。默认 false。 */
+  grantRequestToOwnerDm: boolean;
   /** 访客消息额度覆盖值：null = 授权卡内置 3 条；正整数 = 授权卡按该值。Oncall 恒不限额。 */
   messageQuotaDefaultLimit: number | null;
   /** 新授权默认有效期：null = 产品默认 1 小时；number = 卡片支持的有限时长（毫秒）。 */
@@ -48,6 +52,7 @@ export function getBotGrantPrefs(larkAppId: string): BotGrantPrefs {
       restrictGrantCommands: c.restrictGrantCommands === true,
       autoGrantRequestCards: c.autoGrantRequestCards !== false,
       p2pOpen: c.p2pOpen === true,
+      grantRequestToOwnerDm: c.grantRequestToOwnerDm === true,
       messageQuotaDefaultLimit: readQuotaLimit(c),
       grantDefaultDurationMs: isGrantDurationOption(c.grantDefaultDurationMs)
         ? c.grantDefaultDurationMs
@@ -58,6 +63,7 @@ export function getBotGrantPrefs(larkAppId: string): BotGrantPrefs {
       restrictGrantCommands: false,
       autoGrantRequestCards: true,
       p2pOpen: false,
+      grantRequestToOwnerDm: false,
       messageQuotaDefaultLimit: null,
       grantDefaultDurationMs: null,
     };
@@ -69,6 +75,7 @@ export function getBotGrantPrefs(larkAppId: string): BotGrantPrefs {
  *   • restrictGrantCommands=false → 删 key（bots.json 保持干净，缺省即默认）
  *   • autoGrantRequestCards=true  → 删 key（默认开启）；false → 显式写 false
  *   • p2pOpen=false → 删 key（缺省即关闭）；true → 显式写 true
+ *   • grantRequestToOwnerDm=false → 删 key（缺省即关闭）；true → 显式写 true
  *   • messageQuotaDefaultLimit=null → 删整个 messageQuota（恢复授权卡内置 3 条；不动 quotaState）
  *   • messageQuotaDefaultLimit=1–1000 的整数 → 写入；其它值直接拒绝，返回 bad_quota
  *   • grantDefaultDurationMs=null → 删 key（恢复产品默认 1 小时）；合法有限时长 → 写入
@@ -108,6 +115,10 @@ export async function updateBotGrantPrefs(
       if (patch.p2pOpen) entry.p2pOpen = true;
       else delete entry.p2pOpen;
     }
+    if (patch.grantRequestToOwnerDm !== undefined) {
+      if (patch.grantRequestToOwnerDm) entry.grantRequestToOwnerDm = true;
+      else delete entry.grantRequestToOwnerDm;
+    }
     if (patch.messageQuotaDefaultLimit !== undefined) {
       if (patch.messageQuotaDefaultLimit === null) {
         // 恢复内置策略只删 messageQuota.defaultLimit，保留已有 quotaState 计数。
@@ -126,6 +137,7 @@ export async function updateBotGrantPrefs(
         restrictGrantCommands: entry.restrictGrantCommands === true,
         autoGrantRequestCards: entry.autoGrantRequestCards !== false,
         p2pOpen: entry.p2pOpen === true,
+        grantRequestToOwnerDm: entry.grantRequestToOwnerDm === true,
         messageQuotaDefaultLimit: readQuotaLimit(entry),
         grantDefaultDurationMs: isGrantDurationOption(entry.grantDefaultDurationMs)
           ? entry.grantDefaultDurationMs
@@ -159,6 +171,9 @@ export async function updateBotGrantPrefs(
       );
     }
   }
+  if (patch.grantRequestToOwnerDm !== undefined) {
+    bot.config.grantRequestToOwnerDm = patch.grantRequestToOwnerDm || undefined;
+  }
   if (patch.messageQuotaDefaultLimit !== undefined) {
     bot.config.messageQuota = patch.messageQuotaDefaultLimit === null
       ? undefined
@@ -171,6 +186,7 @@ export async function updateBotGrantPrefs(
     `[grant-prefs:${larkAppId}] restrictGrantCommands=${r.result.restrictGrantCommands} ` +
     `autoGrantRequestCards=${r.result.autoGrantRequestCards} ` +
     `p2pOpen=${r.result.p2pOpen} ` +
+    `grantRequestToOwnerDm=${r.result.grantRequestToOwnerDm} ` +
     `messageQuotaDefaultLimit=${r.result.messageQuotaDefaultLimit ?? 'built-in'} ` +
     `grantDefaultDurationMs=${r.result.grantDefaultDurationMs ?? 'default'}`,
   );
