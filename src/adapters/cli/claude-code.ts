@@ -414,8 +414,171 @@ async function waitForSubmit(path: string, baseByte: number, timeoutMs: number):
   return false;
 }
 
-function makeSubmitFingerprint(content: string, len = 30): string | undefined {
-  const collapsed = normaliseForFingerprint(content);
+export const CLAUDE_MIN_FALLBACK_FINGERPRINT_LEN = 10;
+
+/**
+ * Normalize line endings and strip invisible/formatting characters that trigger
+ * Claude Code 2.1's "Removed X invisible characters · review and press Enter to send"
+ * barrier.
+ *
+ * Note on ZWJ/ZWNJ: Stripping \u200C (ZWNJ) and \u200D (ZWJ) here is an intentional
+ * trade-off: it simplifies TUI input sanitization and eliminates review prompts,
+ * even though it may decompose emoji sequences or certain non-Latin ligatures in TUI input.
+ */
+export function sanitizeClaudeInput(content: string): string {
+  if (typeof content !== 'string') return '';
+  return content
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/[\u200B-\u200D\u2060\uFEFF\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '');
+}
+
+/** Lark metadata headers prepended to user messages (e.g. quote hint and foreign bot handoff).
+ *  Supports both Chinese and English i18n templates. */
+const LARK_METADATA_HEADER_RE = /^\[(?:(?:用户引用了消息|User quoted a message)[^\]\n]*|来自\s+[^\]\n]+?\s+的 @mention|@mention from\s+[^\]\n]+?)\]\s*/gm;
+
+/**
+ * Known BotMux envelope tags to strip when extracting user payload in fallback
+ * mode (e.g. hook injection mode or bare transcript mode where <user_message> is absent).
+ * Covers both pre-userMessage blocks (summary_memory, chat_context, role, whiteboard, etc.)
+ * and post-userMessage blocks (substitute, attachments, mentions, available_bots, etc.).
+ */
+const BOTMUX_ENVELOPE_TAGS = new Set([
+  'botmux_routing',
+  'botmux_builtin_skills',
+  'botmux_skill_help',
+  'identity',
+  'botmux_credentials',
+  'session_id',
+  'role',
+  'summary_memory',
+  'botmux_reminder',
+  'whiteboard',
+  'chat_context_policy',
+  'chat_context',
+  'substitute_trigger',
+  'substitute_target',
+  'substitute_policy',
+  'attachments',
+  'mentions',
+  'available_bots',
+  'botmux_task',
+  'botmux_http_response_mode',
+]);
+
+/**
+ * Strip BotMux envelope blocks using a linear cursor walk (O(N), no regex backtracking).
+ */
+function stripBotmuxEnvelopeBlocks(text: string): string {
+  let i = 0;
+  let out = '';
+  // Tags that already appeared once without a matching close tag. Their next
+  // occurrences are treated as ordinary text: retrying the close-tag search for
+  // each of them would rescan the whole tail every time (quadratic on inputs
+  // like '<summary_memory>x'.repeat(N)). Malformed inputs only — every block
+  // botmux itself renders is well-formed, so this never triggers in production.
+  const deadTags = new Set<string>();
+  while (i < text.length) {
+    if (text[i] !== '<') {
+      out += text[i];
+      i++;
+      continue;
+    }
+    let nameEnd = -1;
+    for (let j = i + 1; j < text.length; j++) {
+      const ch = text[j];
+      // '<' is also a name delimiter: a legal tag name never contains '<'.
+      // Including it bounds the inner scan when a run of '<' is followed by a
+      // single delimiter (otherwise every '<' rescans the whole run — quadratic
+      // on inputs like '<'.repeat(N) + ' >').
+      if (ch === '>' || ch === ' ' || ch === '\n' || ch === '\t' || ch === '\r' || ch === '/' || ch === '<') {
+        nameEnd = j;
+        break;
+      }
+    }
+    if (nameEnd === -1) {
+      out += text.slice(i);
+      break;
+    }
+    const tagName = text.slice(i + 1, nameEnd);
+    const recognized = tagName === 'sender' || BOTMUX_ENVELOPE_TAGS.has(tagName);
+    if (recognized && !deadTags.has(tagName)) {
+      const openTagEnd = text.indexOf('>', nameEnd);
+      if (openTagEnd === -1) {
+        out += text.slice(i);
+        break;
+      }
+      if (text[openTagEnd - 1] === '/') {
+        i = openTagEnd + 1;
+        continue;
+      }
+      const closeTag = `</${tagName}>`;
+      const closeIdx = text.indexOf(closeTag, openTagEnd + 1);
+      if (closeIdx === -1) {
+        // No close tag for this open tag. Mark it dead so later same-named open
+        // tags skip the tail-rescan, then emit the leading '<' and advance by
+        // one — do NOT break: later, *other* well-formed blocks must still be
+        // stripped (e.g. '<summary_memory>x<attachments>f</attachments>' keeps
+        // stripping the attachments block).
+        deadTags.add(tagName);
+        out += text[i];
+        i++;
+        continue;
+      }
+      i = closeIdx + closeTag.length;
+      continue;
+    }
+    out += text[i];
+    i++;
+  }
+  return out;
+}
+
+/** Strip BotMux system envelopes and metadata headers from prompt content
+ *  to extract the unique user payload for submit fingerprinting.
+ *
+ *  All BotMux turns share identical XML wrappers (<botmux_reminder>,
+ *  <botmux_routing>, <identity>, etc.) and header annotations ([用户引用了消息...],
+ *  [来自...的 @mention], [@mention from ...]). Using the raw envelope causes all sessions
+ *  across the machine to share the exact same 30-char fingerprint, leading to false-positive
+ *  submit confirmations against sibling/other sessions and leaving prompts
+ *  stuck unsubmitted in the CLI input box.
+ *
+ *  Semantics: exact for every well-formed block shape botmux renders (plain / attributed /
+ *  self-closing open tags, matched close tags). Inputs whose *user text itself* contains
+ *  malformed nests of these tag literals (e.g. a literal '<role <sender/>' soup botmux never
+ *  emits) are handled on a best-effort basis with no byte-for-byte guarantee; the scanner is
+ *  linear (O(N)) even on such pathological input. */
+export function extractMessageContentForFingerprint(content: string): string {
+  if (typeof content !== 'string') return '';
+
+  // 1. Fast, linear search for <user_message>...</user_message> (avoids regex quadratic backtracking)
+  const openTag = '<user_message>';
+  const closeTag = '</user_message>';
+  const openIdx = content.indexOf(openTag);
+  if (openIdx !== -1) {
+    const closeIdx = content.indexOf(closeTag, openIdx + openTag.length);
+    if (closeIdx !== -1) {
+      const inner = content.slice(openIdx + openTag.length, closeIdx);
+      const cleaned = inner.replace(LARK_METADATA_HEADER_RE, '').trim();
+      if (cleaned.length > 0) return cleaned;
+      const rawCleaned = inner.trim();
+      if (rawCleaned.length > 0) return rawCleaned;
+    }
+  }
+
+  // 2. Fallback for hook injection mode or bare transcript mode where <user_message> is omitted.
+  //    Walks all known envelope blocks (<summary_memory>, <chat_context_policy>, <chat_context>, etc.)
+  //    and strips metadata headers.
+  const stripped = stripBotmuxEnvelopeBlocks(content);
+  const cleaned = stripped.replace(LARK_METADATA_HEADER_RE, '').trim();
+  return cleaned.length > 0 ? cleaned : content.trim();
+}
+
+export function makeSubmitFingerprint(content: string, len = 30): string | undefined {
+  const sanitized = sanitizeClaudeInput(content);
+  const payload = extractMessageContentForFingerprint(sanitized);
+  const collapsed = normaliseForFingerprint(payload || sanitized);
   return collapsed.length > 0 ? collapsed.substring(0, len) : undefined;
 }
 
@@ -561,8 +724,9 @@ export function findOpenClaudeSessionIds(pid: number, dataDir: string = DEFAULT_
 function findJsonlAcrossProjectsRoot(
   searchPath: string,
   fingerprint: string,
-  options: { minMtimeMs?: number; includeQueueOperations?: boolean },
+  options: { minMtimeMs?: number; minEventTimestampMs?: number; includeQueueOperations?: boolean },
 ): string | null {
+  if (fingerprint.length < CLAUDE_MIN_FALLBACK_FINGERPRINT_LEN) return null;
   const primaryDir = dirname(searchPath);
   const primary = findJsonlContainingFingerprint(primaryDir, fingerprint, {
     excludePath: searchPath,
@@ -1094,8 +1258,9 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // so future writes are measured against the right transcript. Inside
       // confirmSubmit a mid-flight rotation does NOT advance baseByte — the
       // submit may already be in the rotated jsonl from before our re-resolve.
+      const sanitizedContent = sanitizeClaudeInput(content);
       let baseByte = pty.claudeJsonlPath ? currentFileSize(pty.claudeJsonlPath) : 0;
-      const submitFingerprint = makeSubmitFingerprint(content);
+      const submitFingerprint = makeSubmitFingerprint(sanitizedContent);
       const submitSearchMinMtime = Date.now() - 60_000;
       const buildResult = (submitted: boolean, failureReason?: string): { submitted: boolean; cliSessionId?: string; failureReason?: string } => {
         const result = observedCliSessionId
@@ -1111,7 +1276,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       }
 
       if (pty.sendText && pty.sendSpecialKeys) {
-        const lines = content.split('\n');
+        const lines = sanitizedContent.split('\n');
         for (let i = 0; i < lines.length; i++) {
           if (lines[i].length > 0) {
             for (const chunk of chunkTextByUtf8Bytes(lines[i])) {
@@ -1133,7 +1298,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       } else {
         // Non-tmux fallback (raw PTY): bracketed paste is reliable here since
         // we control the markers directly.
-        pty.write('\x1b[200~' + content + '\x1b[201~');
+        pty.write('\x1b[200~' + sanitizedContent + '\x1b[201~');
       }
       await delay(submitDelay);
       if (!sendSubmit()) {
@@ -1175,7 +1340,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
             const newPath = pty.claudeJsonlPath;
             const rotatedBaseByte = switched && newPath ? currentFileSize(newPath) : baseByte;
             if (switched && newPath && submitFingerprint) {
-              if (jsonlContainsFingerprint(newPath, submitFingerprint, { includeQueueOperations: true })) {
+              if (jsonlContainsFingerprint(newPath, submitFingerprint, {
+                includeQueueOperations: true,
+                minEventTimestampMs: submitSearchMinMtime,
+              })) {
                 // Sync baseByte to end-of-file so subsequent confirms in
                 // this writeInput pass don't re-trigger on the same line.
                 baseByte = currentFileSize(newPath);
@@ -1198,11 +1366,12 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         // Per-attempt scope is intentionally narrow (dirname only) — the
         // cross-project fan-out only runs once at end-of-writeInput and in
         // the recheck closure, not per retry, to keep the worst case bounded.
-        if (submitFingerprint) {
+        if (submitFingerprint && submitFingerprint.length >= CLAUDE_MIN_FALLBACK_FINGERPRINT_LEN) {
           const searchPath = pty.claudeJsonlPath ?? startPath;
           const matched = findJsonlContainingFingerprint(dirname(searchPath), submitFingerprint, {
             excludePath: searchPath,
             minMtimeMs: submitSearchMinMtime,
+            minEventTimestampMs: submitSearchMinMtime,
             includeQueueOperations: true,
           });
           if (matched) {
@@ -1240,6 +1409,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       if (submitFingerprint && pty.claudeJsonlPath) {
         const matched = findJsonlAcrossProjectsRoot(pty.claudeJsonlPath, submitFingerprint, {
           minMtimeMs: submitSearchMinMtime,
+          minEventTimestampMs: submitSearchMinMtime,
           includeQueueOperations: true,
         });
         if (matched) {
@@ -1265,7 +1435,10 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
           if (resolved) applyResolved(resolved);
         }
         const currentPath = pty.claudeJsonlPath;
-        if (currentPath && jsonlContainsFingerprint(currentPath, submitFingerprint, { includeQueueOperations: true })) {
+        if (currentPath && jsonlContainsFingerprint(currentPath, submitFingerprint, {
+          includeQueueOperations: true,
+          minEventTimestampMs: submitSearchMinMtime,
+        })) {
           return true;
         }
         // Fan out to sibling jsonls in the project dir, then across every
@@ -1277,6 +1450,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
         if (!searchPath) return false;
         const matched = findJsonlAcrossProjectsRoot(searchPath, submitFingerprint, {
           minMtimeMs: submitSearchMinMtime,
+          minEventTimestampMs: submitSearchMinMtime,
           includeQueueOperations: true,
         });
         return !!matched;
