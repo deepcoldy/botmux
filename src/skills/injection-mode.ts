@@ -1,9 +1,9 @@
 /**
  * Built-in skill injection mode — how botmux's own bridge skills
  * (botmux-send / botmux-schedule / …) reach a CLI that only supports a GLOBAL
- * skills directory (codex/gemini/opencode/cursor/coco/traex/pi/oh-my-pi/mtr/
+ * skills directory (codex/gemini/opencode/cursor/coco/traex/mtr/
  * kiro-cli/genius/grok — everything with an adapter `skillsDir`, i.e. no per-session
- * `--plugin-dir` injection like Claude Code).
+ * injection like Claude Code, Pi, or Oh My Pi).
  *
  * Three modes, resolved from per-bot `skillInjection` (bots.json) → machine-wide
  * `skills.builtinInjection` (config.json) → the `prompt` default:
@@ -118,11 +118,12 @@ export function shouldInstallGlobalSkills(skillsDir: string): boolean {
 /**
  * How a CLI delivers botmux skills, for the dashboard control (and any other
  * consumer that must branch on skill-delivery capability):
- *  - 'dynamic': per-session `--plugin-dir` injection — the claude-family
- *    (claude-code / seed / relay), which set `pluginDir`. Not configurable: they
- *    always inject dynamically, no global leak. The mode knobs don't apply.
+ *  - 'dynamic': per-session injection — the claude-family (`--plugin-dir`,
+ *    claude-code / seed / relay / oh-my-pi) and pi (`--skill`), which set `pluginDir`.
+ *    Not configurable: they always inject dynamically, no global leak.
+ *    The mode knobs don't apply.
  *  - 'global': a shared global skills dir (`skillsDir`) — codex/gemini/opencode/
- *    cursor/coco/traex/pi/oh-my-pi/mtr/kiro-cli/genius/grok — where
+ *    cursor/coco/traex/mtr/kiro-cli/genius/grok — where
  *    global|prompt|off applies.
  *  - 'none': neither — the CLI has no skill mechanism (antigravity/aiden/hermes/
  *    mir/mira/codex-app), so there's nothing to configure.

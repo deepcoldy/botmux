@@ -71,6 +71,7 @@ import { resolveRegularGroupMode, resolveGroupMentionMode, type GroupMentionMode
 import { buildSummaryCommandPrompt, type SummaryChatKind, type SummaryCommandMatch, type SummaryCommandRuntimeContext } from './summary-command.js';
 import { DEFAULT_SUMMARY_PROMPT, summaryRangeFromBotConfig } from '../../services/summary-range-store.js';
 import { isSubstituteEnabledForChat } from '../../services/substitute-chat-toggle-store.js';
+import { isP2pForceTopicRoot, recordP2pForceTopicRoot } from '../../services/p2p-force-topic-store.js';
 import { evaluateMessageListener, resolveListenerSenderIdentity, buildListenerBotAppIdToOpenId, collectListenerBotAppIds, type MessageListenerMatch } from '../../services/message-listener.js';
 import {
   parseVcMeetingPushEvent,
@@ -2428,6 +2429,9 @@ export interface RoutingContext {
    *  replace it with a daemon-owned synthetic anchor for a dedicated receiver
    *  session; the visible chatId/scope remain unchanged. */
   anchor: string;
+  /** Daemon-only validated principal-lane registry key. Never derived from the
+   * event and never used as a Lark destination. */
+  runtimeRoutingAnchor?: string;
   /** The inbound message was sent at the top level of a regular group. This
    * remains true in `new-topic` mode even though its conversational route was
    * rewritten to a fresh thread, allowing sessionless group UI to stay flat. */
@@ -2478,6 +2482,14 @@ export interface RoutingContext {
    * an already-charged turn is exactly the "charged, then lost the task"
    * failure. See enforceMessageQuotaForCliInput's alreadyAuthorizedAndCharged. */
   sessionGroupQuotaConsumed?: boolean;
+  /** Session-group birth only: the birth flow already scheduled the AI title
+   *  from its own text peek (a text/post seed). Non-text seeds leave it unset,
+   *  because that peek yields nothing for them — the recursed handleNewTopic
+   *  schedules from the FULLY PARSED content instead (merge_forward expanded,
+   *  audio transcribed). Exactly one of the two sites runs per birth: the title
+   *  service is idempotent, but only via its async in-flight/titled guards, so
+   *  a duplicate call still burns a bounded retry round. */
+  sessionGroupTitleScheduled?: boolean;
   /** Session-group birth only: the in-group intro message id used as the
    *  turn's REPLY anchor (quote target / session rootMessageId), so the first
    *  turn's outputs land in the group. `messageId` stays the ORIGINAL inbound
@@ -2677,6 +2689,13 @@ async function dispatchHumanMessageViaHandlers(
   if (key) pendingMessageTriggers.add(key);
   let completed = false;
   try {
+    const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId)
+      ?? payload.ownsSession;
+    if (handlers.handlePrincipalLaneMessage
+        && await handlers.handlePrincipalLaneMessage(payload.data, payload.ctx, ownsSession)) {
+      completed = true;
+      return;
+    }
     await serializeByAnchor(payload.ctx.anchor, () => {
       const ownsSession = handlers.isSessionOwner?.(payload.ctx.anchor, larkAppId) ?? payload.ownsSession;
       return ownsSession
@@ -2693,6 +2712,8 @@ async function dispatchHumanMessageViaHandlers(
     if (key) pendingMessageTriggers.delete(key);
   }
 }
+
+export const __testOnly_dispatchHumanMessageViaHandlers = dispatchHumanMessageViaHandlers;
 
 async function dispatchPolledMessageListenerMatch(input: {
   larkAppId: string;
@@ -2830,6 +2851,14 @@ export interface EventHandlers {
   /** Validate a syntactically valid topic header before routing mutates scope.
    * The daemon supplies the same semantic resolver used by handleNewTopic. */
   validateTopicHeader?: (header: import('../../core/topic-header.js').TopicHeader, larkAppId: string) => boolean;
+  /** Optional live principal-lane adapter. It runs after dispatcher trust and
+   * message-shape gates but before the legacy chat-anchor serializer. Returning
+   * false preserves the legacy path byte-for-byte. */
+  handlePrincipalLaneMessage?: (
+    data: any,
+    ctx: RoutingContext,
+    ownsSession: boolean,
+  ) => Promise<boolean>;
   /** 主动开工 — 场景①: fired when this bot is added to a chat
    *  (`im.chat.member.bot.added_v1`). The daemon decides whether to auto-start
    *  based on the bot's `autoStartOnGroupJoin` toggle + allowedUser membership.
@@ -3155,6 +3184,85 @@ type RoutingDecision = {
   anchor: string;
   source: RoutingSource;
 };
+
+const legacyP2pForceTopicChecks = new BoundedMap<string, Promise<boolean>>(1000);
+
+async function isExplicitP2pTopic(input: {
+  larkAppId: string;
+  chatId: string;
+  rootId: string;
+}): Promise<boolean> {
+  const { larkAppId, chatId, rootId } = input;
+  if (isP2pForceTopicRoot(larkAppId, rootId, chatId)) return true;
+
+  // Backward compatibility for force-topic roots created before the provenance
+  // store existed, including bare /t roots that intentionally have no Session.
+  // Active ownership is not sufficient evidence: p2pMode=thread sessions
+  // deliberately fold into chat after switching to chat mode. Verify the
+  // immutable root message once with the SAME predicate as the live force-topic
+  // override, then persist only roots that really seeded a topic. On lookup
+  // failure, preserve the historical flat routing.
+  const key = `${larkAppId}:${chatId}:${rootId}`;
+  const cached = legacyP2pForceTopicChecks.get(key);
+  if (cached) return cached;
+  const check = (async () => {
+    try {
+      const detail = await getMessageDetail(larkAppId, rootId, { userCardContent: false });
+      const root = detail?.items?.[0];
+      if (!root || (root.chat_id && root.chat_id !== chatId)) return false;
+      const rawText = extractMessageTextForRouting({
+        message_type: root.msg_type ?? root.message_type,
+        content: root.body?.content ?? root.content,
+        mentions: root.mentions,
+      });
+      if (!rawText) return false;
+      // Same mention stripping and parser as maybeApplyForceTopicOverride:
+      // bare /t, /topic, /th, /tw aliases and the `[title] /t …` header form.
+      // The /repo worktree validator is not available here; a root that truly
+      // materialized a topic already passed it when the seed was routed.
+      const stripped = stripHeaderMentions(rawText, { mentions: root.mentions }, larkAppId);
+      if (!isTopicHeader(parseTopicHeaderWithLifecycleAliases(stripped))) return false;
+      recordP2pForceTopicRoot(larkAppId, rootId, chatId);
+      return true;
+    } catch (err) {
+      logger.debug(`[routing] failed to verify legacy p2p topic root=${rootId.substring(0, 12)}: ${err}`);
+      legacyP2pForceTopicChecks.delete(key);
+      return false;
+    }
+  })();
+  legacyP2pForceTopicChecks.set(key, check);
+  return check;
+}
+
+async function promoteExplicitP2pTopicIfNeeded(input: {
+  larkAppId: string;
+  chatId: string;
+  chatType: 'group' | 'p2p';
+  message: any;
+  routing: { scope: 'thread' | 'chat'; anchor: string };
+  routingSource: RoutingSource;
+}): Promise<boolean> {
+  const { larkAppId, chatId, chatType, message, routing, routingSource } = input;
+  if (routingSource !== 'p2p'
+      || routing.scope !== 'chat'
+      || chatType !== 'p2p'
+      || !message.root_id
+      || !message.thread_id) {
+    return false;
+  }
+  if (!await isExplicitP2pTopic({
+    larkAppId, chatId, rootId: message.root_id,
+  })) {
+    return false;
+  }
+  routing.scope = 'thread';
+  routing.anchor = message.root_id;
+  logger.info(
+    `[routing] p2p topic root=${message.root_id.substring(0, 12)} is /t-created or actively owned; ` +
+    `continuing thread-scope instead of chat=${chatId.substring(0, 12)}`,
+  );
+  return true;
+}
 
 function regularGroupRouting(larkAppId: string, messageId: string, chatId: string): RoutingDecision {
   // Only `new-topic` forks a fresh thread-scope session for a TOP-LEVEL @.
@@ -4081,6 +4189,19 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         }
         const decision = await decideRoutingWithSource(larkAppId, message);
         const ctx = { scope: decision.scope, anchor: decision.anchor };
+        // Legacy /t provenance backfill reads an immutable root message and may
+        // persist a marker. Keep that state mutation behind the same talk gate
+        // as delivery; an untrusted bot must not be able to populate the ledger
+        // even though the later delivery gate would still reject its turn.
+        // bot 能不能在本会话说话：此处只判定一次，紧随的 p2p promote、下方 fold 的
+        // mentionedThisBot 以及再往后的 talk gate 共用同一结论；之间只有路由计算，
+        // 不改授权状态（曾是两条手抄 OR 链，漏一处即「能路由但不能 fold」类二次分裂）。
+        const botTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
+        if (botTalk.allowed) {
+          await promoteExplicitP2pTopicIfNeeded({
+            larkAppId, chatId, chatType, message, routing: ctx, routingSource: decision.source,
+          });
+        }
         // Honor `/t` / `/topic` from bot senders too, aligning with the human
         // path so an explicit `@bot /t …` handoff seeds a fresh topic instead of
         // sticking to chat-scope. Applied BEFORE the gate (and the shared-topic
@@ -4095,11 +4216,6 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const ownsThreadSession = ctx.scope === 'thread'
           ? (handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? false)
           : false;
-        // 这个 bot 能不能在本群跟我们说话 —— 判定一次，fold 与下面的 gate 共用同一个
-        // 结论（二者之间只有 fold / shared-seed 的路由计算，不改任何授权状态）。
-        // 曾经这里是两条手抄的 OR 链，靠人肉保持同步；漏一处就是「能路由但不能 fold」
-        // 或「fold 了却弹卡」的二次分裂。
-        const botTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
         let replyRootId = await maybeFoldMentionedRegularGroupThreadToChat({
           larkAppId, chatId, chatType, message, routing: ctx, forceTopicApplied: forcedTopic, mentionedThisBot: botTalk.allowed, ownsThreadSession,
           answeredRootAtTopLevel: root => handlers.chatSessionAnsweredRootAtTopLevel?.(root, chatId, larkAppId) ?? false,
@@ -4155,6 +4271,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data);
             return;
           }
+        }
+        if (chatType === 'p2p' && forcedTopic) {
+          recordP2pForceTopicRoot(larkAppId, messageId, chatId);
         }
         logger.info(`Bot-to-bot @mention detected (scope=${ctx.scope}): routing to handleThreadReply`);
         // Serialize per anchor — a sub-bot dispatched a /repo prime + kickoff
@@ -4243,6 +4362,21 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         anchor: decision.anchor,
       };
       let routingSource = decision.source;
+      // Default/chat-mode DMs normally stay in one flat chat-scope session, even
+      // when Lark supplies root_id + thread_id. An explicitly seeded topic (for
+      // example via /t) is the exception: an app-scoped /t provenance marker or
+      // an active session at that root makes later replies continue thread-scope
+      // instead of running in the unrelated DM chat context. The durable marker
+      // also covers bare /t, which intentionally materializes a topic without a
+      // Session. Match the chat as well as the complete root ID; ordinary DM
+      // topics retain the flat behavior.
+      // Legacy provenance backfill is a durable state mutation, so keep it
+      // behind the same permission gate as message delivery.
+      if (isAllowed && await promoteExplicitP2pTopicIfNeeded({
+        larkAppId, chatId, chatType, message, routing, routingSource,
+      })) {
+        routingSource = 'real-thread';
+      }
       let replyRootId: string | undefined;
       // 私聊 chat 模式：会话是扁平连续的(整段 DM 一个 chat-scope 会话),但如果这条
       // 消息本身是在某个已存在的话题里回复的(root_id+thread_id),可见回复必须落回
@@ -4767,6 +4901,14 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         if (before?.block) return;
         if (before?.anchorOverride) ctx.anchor = before.anchorOverride;
         ownsSession = handlers.isSessionOwner?.(ctx.anchor, larkAppId) ?? ownsSession;
+      }
+      // Record explicit DM /t intent before this message releases the raw
+      // per-chat routing lane and before handleNewTopic begins its async session
+      // registration. A back-to-back root-linked reply can therefore select the
+      // same canonical root immediately. This is intentionally after permission
+      // and beforeSessionTurn gates: rejected /t messages create no routing state.
+      if (chatType === 'p2p' && forceTopicApplied) {
+        recordP2pForceTopicRoot(larkAppId, messageId, chatId);
       }
       const payload = { data, ctx, ownsSession } satisfies PendingForwardTopicPayload;
       const groupMentionMode = resolveGroupMentionMode(larkAppId, chatId);

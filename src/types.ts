@@ -262,6 +262,187 @@ export interface FailedTurnRecord {
   lastRetryAt?: string;    // ISO
 }
 
+/** Stable human/bot identity used only for principal-lane routing.  The
+ * serialized `principalKey` is derived from this value; it is never accepted
+ * from model output or persisted caller claims. */
+export type HumanLanePrincipal =
+  | {
+      senderType: 'user';
+      kind: 'union';
+      unionId: string;
+    }
+  | {
+      senderType: 'user';
+      kind: 'app_open';
+      larkAppId: string;
+      openId: string;
+    };
+
+/** Trusted inbound identity is broader than durable lane identity. Bot
+ * principals may be recognised for the explicit --as protocol, but can never
+ * be persisted as principal lanes. */
+export type InboundPrincipal = HumanLanePrincipal
+  | {
+      senderType: 'bot';
+      kind: 'union';
+      unionId: string;
+    }
+  | {
+      senderType: 'bot';
+      kind: 'app_open';
+      larkAppId: string;
+      openId: string;
+    };
+
+/** Backward-compatible name for the durable, human-only lane principal. */
+export type LanePrincipal = HumanLanePrincipal;
+
+/** Identity evidence reconstructed from one trusted human inbound event.
+ * unionId is canonical when present; the same-event app/openId is retained as
+ * a source-scoped alias so a later identity upgrade cannot duplicate a lane. */
+export interface HumanLaneIdentityEvidence {
+  larkAppId: string;
+  unionId?: string;
+  openId?: string;
+}
+
+/** Visible Lark surface is deliberately independent from the daemon routing
+ * anchor. Multiple principal lanes may render into one chat/topic while each
+ * keeps an isolated worker/session key. */
+export type PrincipalLaneDisplayTarget =
+  | { scope: 'chat'; larkAppId: string; chatId: string }
+  | { scope: 'thread'; larkAppId: string; chatId: string; rootMessageId: string };
+
+export type PrincipalLanePhase =
+  | 'creating'
+  | 'active'
+  | 'dormant'
+  | 'closing'
+  | 'closed'
+  | 'quarantined';
+
+/** Durable binding carried by a source (lane 0) or one shadow lane. */
+export interface PrincipalLaneBinding {
+  version: 1;
+  laneId: string;
+  sourceSessionId: string;
+  principalKey: string;
+  principal: LanePrincipal;
+  routingAnchor: string;
+  displayTarget: PrincipalLaneDisplayTarget;
+  workspaceEpoch: number;
+  phase: PrincipalLanePhase;
+  revision: number;
+  createdAt: string;
+  updatedAt: string;
+  quarantineReason?: string;
+}
+
+/**
+ * One exact human turn admitted behind an already-running turn in the same
+ * principal lane.  The final CLI payload is persisted so daemon-side FIFO does
+ * not depend on re-parsing a Lark event after the transport has acknowledged
+ * it.  `attempting` is a commit-unknown fence: a restart must never replay a
+ * turn that may already have crossed the worker IPC boundary.
+ */
+export interface PrincipalLaneQueuedTurn {
+  version: 1;
+  turnId: string;
+  caller: TrustedCaller;
+  userPrompt: string;
+  title: string;
+  cliInput: CliTurnPayload;
+  createdAt: string;
+  resume: boolean;
+  codexAppSteerable?: true;
+  dispatchState?: 'queued' | 'attempting';
+}
+
+/** Durable owner-visible terminal notice for a principal-lane turn that
+ * crossed the dispatch barrier before its outcome became unknowable. The
+ * original turn is removed from the runnable FIFO in the same transaction;
+ * only this notice is retried after restart. */
+export interface PrincipalLaneDispatchUnknownNotice {
+  version: 1;
+  id: string;
+  turnId: string;
+  caller: TrustedCaller;
+  detectedAt: string;
+  noticePending: true;
+}
+
+/** Durable proof that one shadow lane runs in its own linked git worktree.
+ * The source checkout remains the workspace identity; `workingDir` preserves
+ * the source session's repo-relative subdirectory inside the linked worktree.
+ * Source lane 0 deliberately has no such proof. */
+export interface PrincipalLaneWorktreeProof {
+  version: 1;
+  materializationId: string;
+  sourceSessionId: string;
+  laneId: string;
+  sessionId: string;
+  principalKey: string;
+  workspaceEpoch: number;
+  sourceCanonicalCwd: string;
+  sourceRepoRoot: string;
+  sourceGitCommonDir: string;
+  sourceRelativeCwd: string;
+  worktreeRoot: string;
+  worktreeGitCommonDir: string;
+  workingDir: string;
+  branch: string;
+  baseRef: string;
+  phase: 'ready';
+  revision: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Source-owned lane/workspace epoch. `sourcePrincipalKey` is lane 0 and must
+ * be proven from the original owner identity; it is never first-speaker-wins. */
+export interface PrincipalLaneSourceState {
+  version: 1;
+  sourcePrincipalKey: string;
+  displayTarget: PrincipalLaneDisplayTarget;
+  canonicalCwd: string;
+  workspaceEpoch: number;
+  workspaceGroupId: string;
+  /** Missing only on a provable legacy v1 group id. New shared workspace
+   * groups always persist version 2 explicitly. */
+  workspaceGroupKeyVersion?: 2;
+  phase: PrincipalLanePhase;
+  revision: number;
+  updatedAt: string;
+  leaseOwner?: string;
+  leaseGeneration?: number;
+  principalLaneDisabledReason?: string;
+  migrationAudit?: {
+    evidence: 'owner_union_id' | 'same_app_owner_open_id';
+    migratedAt: string;
+    larkAppId: string;
+  };
+}
+
+/** Unique durable owner of quote/reply authority. A successful outbound send
+ * is trusted only after this record commits; missing/untrusted records are
+ * never reconstructed from text, timestamps, or replyTargets. */
+export interface MessageProvenance {
+  messageId: string;
+  larkAppId: string;
+  chatId: string;
+  displayRootId?: string;
+  sourceSessionId: string;
+  laneId: string;
+  sessionId: string;
+  turnId: string;
+  principalKey: string;
+  workerGeneration: number;
+  direction: 'inbound' | 'outbound';
+  trustState: 'trusted' | 'untrusted';
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface Session {
   sessionId: string;
   /** Build fingerprint of the last fresh owned Codex App runner that became ready. */
@@ -332,6 +513,27 @@ export interface Session {
   /** Informational origin label for UI/debugging, not a trusted audit identity. */
   titleSource?: 'initial' | 'user' | 'agent' | 'cli' | 'dashboard' | 'system';
   status: 'active' | 'closed';
+  /** Principal-lane routing/display binding. Optional while the feature is
+   * staged and for legacy sessions that have not passed the migration gate. */
+  principalLane?: PrincipalLaneBinding;
+  /** Present only on the source row (lane 0). */
+  principalLaneSource?: PrincipalLaneSourceState;
+  /** Present only on a materialized shadow lane. The matching indexed sidecar
+   * is re-read before on-demand hydration; this embedded copy alone is never a
+   * capability to register or fork a worker. */
+  principalLaneWorktree?: PrincipalLaneWorktreeProof;
+  /** Crash-safe, per-lane FIFO. Only the exact head may enter this lane's
+   * worker, and it is retained until that turn reaches a terminal edge. */
+  principalLaneQueuedTurns?: PrincipalLaneQueuedTurn[];
+  /** Pending notices are deliberately separate from the runnable FIFO. */
+  principalLaneDispatchUnknownNotices?: PrincipalLaneDispatchUnknownNotice[];
+  /** Legacy source could not prove its original human identity. This disables
+   * only principal-lane routing; the original single-principal session remains
+   * usable. */
+  principalLaneDisabledReason?: 'caller_identity_unproven';
+  /** Durable fail-closed marker for malformed source routing metadata. It
+   * disables only principal-lane routing and keeps the legacy session usable. */
+  principalLaneQuarantineReason?: 'invalid_source_display_target';
   /**
    * Crash-safe host-owned state for a human message that arrived while another
    * human's interactive turn owned this session.  The message is deliberately

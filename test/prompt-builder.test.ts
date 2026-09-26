@@ -189,6 +189,17 @@ describe('buildNewTopicPrompt', () => {
     expect(prompt).not.toContain('<session_id>');
   });
 
+  it('should NOT embed <session_id>, <botmux_routing>, or <identity> for Pi and Oh My Pi (injectsSessionContext)', () => {
+    for (const cli of ['pi', 'oh-my-pi'] as const) {
+      const prompt = buildNewTopicPrompt('hello', SESSION_ID, cli);
+      expect(prompt).not.toContain('<session_id>');
+      expect(prompt).not.toContain('<botmux_routing>');
+      expect(prompt).not.toContain('<identity>');
+      expect(prompt).not.toContain('<botmux_builtin_skills>');
+      expect(prompt).toContain('<user_message>\nhello\n</user_message>');
+    }
+  });
+
   it('should wrap the user message in <user_message>', () => {
     const prompt = buildNewTopicPrompt('请帮我看一下这个 bug', SESSION_ID, 'claude-code');
     expect(prompt).toContain('<user_message>');
@@ -653,6 +664,13 @@ describe('buildReforkPrompt', () => {
     } finally {
       delete mockBotConfig.replyDelivery;
     }
+  });
+
+  it('omits <session_id> for pi (injectsSessionContext=true)', () => {
+    const ds = makeDs();
+    const out = buildReforkPrompt(ds, 'hello', { cliId: 'pi' });
+    expect(out).not.toContain('<session_id>');
+    expect(out).toContain('<user_message>');
   });
 
   it('omits botmux_reminder for Mira re-fork prompts', () => {

@@ -240,8 +240,9 @@ export class UserTokenMissingError extends Error {
 }
 
 /** Extract Lark error code from AxiosError or SDK error. */
-function getLarkErrorCode(err: any): number | undefined {
-  return err?.response?.data?.code ?? err?.code;
+export function getLarkErrorCode(err: any): number | undefined {
+  const code = err?.response?.data?.code ?? err?.code;
+  return typeof code === 'number' ? code : undefined;
 }
 
 const LARK_CODE_MESSAGE_WITHDRAWN = 230011;
@@ -445,6 +446,58 @@ export async function urgentMessage(
     throw new Error(`Failed to urgent message (${mode}): ${res.msg ?? ''} (code: ${res.code})`);
   }
   logger.info(`Urgent ${mode} sent for message ${messageId} to ${recipients.length} user(s)`);
+}
+
+/**
+ * Forward an existing message into another chat (im.v1.message.forward).
+ *
+ * Unlike send/reply this carries the ORIGINAL message over verbatim — sender
+ * name, message type and all — which is the only faithful way to replay a
+ * non-text seed (image / file / 合并转发消息) into a different chat: those
+ * bodies cannot be re-created from an event payload, only pointed at.
+ *
+ * Used by session-group birth to make the freshly-created group
+ * self-explaining: the DM that spawned it is forwarded in as the group's first
+ * message, so the conversation carries its own origin instead of a
+ * "（非文本消息）" placeholder.
+ *
+ * Emits no outbound hook (same as {@link sendUserMessage}): the hook event
+ * union is closed and a forward is not one of its members.
+ */
+export async function forwardMessage(
+  larkAppId: string,
+  messageId: string,
+  chatId: string,
+  uuid?: string,
+): Promise<string> {
+  assertLarkTransport(larkAppId, 'forwardMessage');
+  return executeWithLarkGate(larkAppId, 'forwardMessage', async () => {
+    const c = getBotClient(larkAppId);
+    let res: any;
+    try {
+      res = await (c as any).im.v1.message.forward({
+        path: { message_id: messageId },
+        // NOTE: forward takes `uuid` in params (not data) — unlike create/reply.
+        params: { receive_id_type: 'chat_id', ...(uuid ? { uuid } : {}) },
+        data: { receive_id: chatId },
+      });
+    } catch (err: any) {
+      if (getLarkErrorCode(err) === LARK_CODE_MESSAGE_WITHDRAWN) {
+        throw new MessageWithdrawnError(messageId);
+      }
+      throw err;
+    }
+
+    if (res.code !== 0) {
+      if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
+      throw new Error(`Failed to forward message: ${res.msg} (code: ${res.code})`);
+    }
+
+    const forwardedId = res.data?.message_id;
+    if (!forwardedId) throw new Error('No message_id in forward response');
+    logger.info(`Forwarded message ${messageId} to chat ${chatId} as ${forwardedId}`);
+    return forwardedId;
+  });
 }
 
 export async function addReaction(larkAppId: string, messageId: string, emojiType: string): Promise<string> {
@@ -1662,15 +1715,71 @@ export async function resolveTargetAppOpenId(
   }
 }
 
+function isPermanentContactErrorCode(code: number | undefined): boolean {
+  return (
+    code === 40001 ||
+    code === 41012 ||
+    code === 41050 ||
+    code === 99991672 ||
+    code === 99991679 ||
+    code === 99992361
+  );
+}
+
+/**
+ * Retry a contact API operation on transient failure (network timeout / 5xx / rate limit).
+ * Definitive / permanent errors (invalid_id / not_visible / cross_app / missing scope) fail immediately without retry.
+ */
+async function retryContactTransient(
+  op: () => Promise<any>,
+  opts: { maxAttempts?: number; baseMs?: number; label?: string } = {},
+): Promise<any> {
+  const maxAttempts = opts.maxAttempts ?? 2;
+  const baseMs = opts.baseMs ?? (process.env.NODE_ENV === 'test' ? 1 : 500);
+  let attempt = 0;
+  while (true) {
+    attempt++;
+    try {
+      const res = await op();
+      const code = (res as any)?.code;
+      if (typeof code === 'number' && code !== 0) {
+        const permanent = !!classifyContactErrorCode(code) || isPermanentContactErrorCode(code);
+        if (!permanent && attempt < maxAttempts) {
+          logger.warn(`[contact-resolve] ${opts.label ?? 'op'} transient code=${code}, retrying attempt ${attempt}/${maxAttempts}...`);
+          await new Promise(r => setTimeout(r, baseMs * attempt));
+          continue;
+        }
+      }
+      return res;
+    } catch (err: any) {
+      const errCode = getLarkErrorCode(err);
+      const permanent = !!classifyContactErrorCode(errCode) || isPermanentContactErrorCode(errCode);
+      if (!permanent && attempt < maxAttempts) {
+        logger.warn(`[contact-resolve] ${opts.label ?? 'op'} threw (${err?.message ?? err}), retrying attempt ${attempt}/${maxAttempts}...`);
+        await new Promise(r => setTimeout(r, baseMs * attempt));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
 export async function resolveAllowedUsersWithMap(
   larkAppId: string, raw: string[],
-): Promise<{ resolved: string[]; map: Map<string, string>; errored?: boolean; entryStatus: Map<string, EntryResolveStatus> }> {
+): Promise<{
+  resolved: string[];
+  map: Map<string, string>;
+  errored?: boolean;
+  entryStatus: Map<string, EntryResolveStatus>;
+  hasPermanentBatchError?: boolean;
+}> {
   const map = new Map<string, string>();
   // True when a TRANSIENT failure (throw / rate limit / server error) hit any
   // requested item — the caller can then say "resolution failed, retry" instead
   // of the misleading "this identifier does not exist". Definitive failures
   // (id invalid / not visible: DEFINITIVE_CONTACT_ERROR_CODES) don't set it.
   let errored = false;
+  let hasPermanentBatchError = false;
   // Per-raw-entry outcome so callers can fall back to a last-known-good cache
   // ONLY for entries that transient-failed AND are still configured — never for
   // definitively-removed users (revives ex-owners) or entries no longer in
@@ -1729,7 +1838,10 @@ export async function resolveAllowedUsersWithMap(
     // union_id → 本 app open_id（单条查询；失败则丢弃该条，与 email 解析失败同口径）。
     for (const uid of unionIds) {
       try {
-        const res = await larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(uid)}`, { user_id_type: 'union_id' });
+        const res = await retryContactTransient(
+          () => larkGet(c, `/open-apis/contact/v3/users/${encodeURIComponent(uid)}`, { user_id_type: 'union_id' }),
+          { label: `union_id ${uid}` },
+        );
         const oid = res?.data?.user?.open_id as string | undefined;
         if (res.code === 0 && oid) {
           map.set(uid, oid);
@@ -1745,12 +1857,23 @@ export async function resolveAllowedUsersWithMap(
           // non-definitive code (network/5xx/rate-limit) is transient.
           const definitive = res?.code === 0 ? true : !!classifyContactErrorCode(res?.code);
           if (!definitive) errored = true;
+          // Per-entry union GET: only APP-LEVEL capability failures (missing
+          // scope) mark a permanent batch error — they fail every entry for
+          // reasons unrelated to identity and must not be silenced. Per-entry
+          // identity verdicts (41050 not-visible / 41012 / 40001 / 99992361)
+          // are NOT batch-wide signals: mixed with a transient email batch they
+          // would false-alarm on startup.
+          if (res?.code === 99991672 || res?.code === 99991679) hasPermanentBatchError = true;
           entryStatus.set(uid, definitive ? 'definitive' : 'transient');
           logger.warn(`Failed to resolve union_id ${uid} to open_id: ${res?.msg} (code: ${res?.code})`);
         }
       } catch (err: any) {
-        const definitive = !!classifyContactErrorCode(getLarkErrorCode(err));
+        const errCode = getLarkErrorCode(err);
+        const definitive = !!classifyContactErrorCode(errCode);
         if (!definitive) errored = true;
+        // Same as the non-throw branch above: only app-level missing-scope
+        // codes are permanent batch signals; per-entry identity codes stay silent.
+        if (errCode === 99991672 || errCode === 99991679) hasPermanentBatchError = true;
         entryStatus.set(uid, definitive ? 'definitive' : 'transient');
         logger.warn(`resolve union_id ${uid} failed: ${err?.message ?? err}`);
       }
@@ -1758,10 +1881,13 @@ export async function resolveAllowedUsersWithMap(
 
     if (emails.length > 0) {
       try {
-        const res = await (c as any).contact.v3.user.batchGetId({
-          params: { user_id_type: 'open_id' },
-          data: { emails, include_resigned: false },
-        });
+        const res = await retryContactTransient(
+          () => (c as any).contact.v3.user.batchGetId({
+            params: { user_id_type: 'open_id' },
+            data: { emails, include_resigned: false },
+          }),
+          { label: `emails batch (${emails.length})` },
+        );
         if (res.code !== 0) {
           // A non-zero batchGetId code is a WHOLE-REQUEST failure, not a
           // per-email identity verdict — even a permanent 4xx like 40001
@@ -1772,6 +1898,9 @@ export async function resolveAllowedUsersWithMap(
           // (retry-eligible, cache-fallback-eligible). Only a code-0 response
           // that omits a specific email (below) is a per-entry definitive miss.
           errored = true;
+          if (isPermanentContactErrorCode(res.code)) {
+            hasPermanentBatchError = true;
+          }
           for (const rawEmail of emails) entryStatus.set(rawEmail, 'transient');
           logger.warn(`Failed to resolve emails to open_ids: ${res.msg} (code: ${res.code})`);
         } else {
@@ -1803,6 +1932,10 @@ export async function resolveAllowedUsersWithMap(
         // NOT a per-email identity verdict, so every requested email is
         // transient (retry + cache-fallback eligible), never definitive.
         errored = true;
+        const errCode = getLarkErrorCode(err);
+        if (isPermanentContactErrorCode(errCode)) {
+          hasPermanentBatchError = true;
+        }
         for (const rawEmail of emails) entryStatus.set(rawEmail, 'transient');
         logger.warn(`resolveAllowedUsers failed: ${err.message}`);
       }
@@ -1814,14 +1947,20 @@ export async function resolveAllowedUsersWithMap(
       // mobileRawByNorm) so exact-match with allowedUsers holds even though the
       // API is queried with the normalized number.
       try {
-        const res = await (c as any).contact.v3.user.batchGetId({
-          params: { user_id_type: 'open_id' },
-          data: { mobiles, include_resigned: false },
-        });
+        const res = await retryContactTransient(
+          () => (c as any).contact.v3.user.batchGetId({
+            params: { user_id_type: 'open_id' },
+            data: { mobiles, include_resigned: false },
+          }),
+          { label: `mobiles batch (${mobiles.length})` },
+        );
         if (res.code !== 0) {
           // Whole-request failure — not a per-mobile verdict. Mark every
           // requested mobile TRANSIENT so a real owner isn't fail-closed out.
           errored = true;
+          if (isPermanentContactErrorCode(res.code)) {
+            hasPermanentBatchError = true;
+          }
           for (const norm of mobiles) {
             const rawEntry = mobileRawByNorm.get(norm) ?? norm;
             entryStatus.set(rawEntry, 'transient');
@@ -1865,6 +2004,10 @@ export async function resolveAllowedUsersWithMap(
         }
       } catch (err: any) {
         errored = true;
+        const errCode = getLarkErrorCode(err);
+        if (isPermanentContactErrorCode(errCode)) {
+          hasPermanentBatchError = true;
+        }
         for (const norm of mobiles) {
           const rawEntry = mobileRawByNorm.get(norm) ?? norm;
           entryStatus.set(rawEntry, 'transient');
@@ -1887,7 +2030,7 @@ export async function resolveAllowedUsersWithMap(
       resolved.push(oid);
     }
   }
-  return { resolved, map, errored, entryStatus };
+  return { resolved, map, errored, entryStatus, hasPermanentBatchError };
 }
 
 /**

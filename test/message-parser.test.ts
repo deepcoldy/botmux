@@ -7,7 +7,7 @@
  * Run:  pnpm vitest run test/message-parser.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { parseApiMessage, extractCardContent, extractResources, parseEventMessage, stripLeadingMentions, stripBotMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, extractAudioMeta, AUDIO_PLACEHOLDER, CARD_EMBEDDED_PLACEHOLDER } from '../src/im/lark/message-parser.js';
+import { parseApiMessage, extractCardContent, extractResources, parseEventMessage, stripLeadingMentions, stripBotMentions, createImgNumberer, cardContentHasUpgradeFallback, isPureCardUpgradeFallback, mergeCardText, wrapResolvedCardText, mentionOpenId, messageMentionsBot, extractPostAtParticipants, extractAudioMeta, AUDIO_PLACEHOLDER, CARD_EMBEDDED_PLACEHOLDER, isPlaceholderOnlyText } from '../src/im/lark/message-parser.js';
 import { buildMarkdownCard, buildReplyCardFooter, REPLY_CARD_FOOTER_MARKER } from '../src/im/lark/md-card.js';
 import { stampBotmuxCallbackMarkers, hasBotmuxCallbackMarker, BOTMUX_CALLBACK_MARKER_KEY } from '../src/im/lark/callback-button-marker.js';
 
@@ -2192,5 +2192,62 @@ describe('stripBotMentions', () => {
   it('保留正文换行，只压同一行内的空白', () => {
     expect(stripBotMentions('标题\n/t @Claude 第一行\n  第二行', [selfMention], SELF))
       .toBe('标题\n/t 第一行\n  第二行');
+  });
+});
+
+
+/**
+ * isPlaceholderOnlyText —— 「这段文本除了『发了个附件』之外没有任何信息」。
+ *
+ * 调用方是会话群 AI 命名的种子闸：命中就不改名。判错的代价不对称——漏判（该剥
+ * 没剥）会让群被焊死在一个空洞错名上且不可逆，错判（不该剥却剥了）只是晚几秒
+ * 改名，所以带真实文字的占位符一律保留。
+ */
+describe('isPlaceholderOnlyText', () => {
+  it('裸占位符（含带编号的）判为零信息', () => {
+    for (const s of [
+      '[图片]', '[图片 1]', '[图片 12]',
+      '[文件]', '[文件 1]',
+      '[语音]', AUDIO_PLACEHOLDER,
+      '[卡片]', '[卡片 (模板)]',
+      '[合并转发消息]',
+      CARD_EMBEDDED_PLACEHOLDER,
+    ]) {
+      expect(isPlaceholderOnlyText(s), s).toBe(true);
+    }
+  });
+
+  it('多个占位符拼在一起仍是零信息（相册 / 多附件）', () => {
+    expect(isPlaceholderOnlyText('[图片 1][图片 2]')).toBe(true);
+    expect(isPlaceholderOnlyText('[图片 1]\n[文件 2]\n[语音]')).toBe(true);
+  });
+
+  it('带真实文字的占位符**不是**零信息——文件名/alt/卡片标题就是标题来源', () => {
+    for (const s of [
+      '[文件 1: 季度汇报.pdf]',
+      '[文件: 季度汇报.pdf]',
+      '[图片 2: 报警前30分钟今(红)昨(蓝)同比]',
+      '[卡片: 发布单 #123]',
+      '[标签: P0]',
+      '[输入框: 收件人]',
+      '[确认发布]',
+    ]) {
+      expect(isPlaceholderOnlyText(s), s).toBe(false);
+    }
+  });
+
+  it('占位符 + 正文 → 有信息（图文混排不能被误杀）', () => {
+    expect(isPlaceholderOnlyText('看这张图 [图片 1]')).toBe(false);
+    expect(isPlaceholderOnlyText('[图片 1] 帮我看下报错')).toBe(false);
+  });
+
+  it('空串不算零信息占位符（「没内容」与「只有占位符」是两回事，各自有调用方）', () => {
+    expect(isPlaceholderOnlyText('')).toBe(false);
+    expect(isPlaceholderOnlyText('   \n ')).toBe(false);
+  });
+
+  it('普通文本不受影响', () => {
+    expect(isPlaceholderOnlyText('帮我排查数据库连接池')).toBe(false);
+    expect(isPlaceholderOnlyText('图片里的报错是什么意思')).toBe(false);
   });
 });

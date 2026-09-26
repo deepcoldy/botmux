@@ -285,7 +285,8 @@ export async function applyBotmuxUpdate(
     const r = await replaceStandaloneBinary(version, strategy.target);
     return { strategy: 'self-replace', detail: `${r.asset} → ${r.target}` };
   }
-  const plan = resolveGlobalInstallPlan(strategy.packageRoot, process.platform, `botmux@${version}`);
+  const spec = version.startsWith('botmux@') ? version : `botmux@${version}`;
+  const plan = resolveGlobalInstallPlan(strategy.packageRoot, process.platform, spec);
   installLatestBotmuxSync(plan);
   return { strategy: 'package-manager', detail: formatGlobalInstallCommand(plan) };
 }

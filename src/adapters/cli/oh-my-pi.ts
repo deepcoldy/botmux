@@ -3,12 +3,16 @@ import { realpathSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { resolveCommand } from './registry.js';
-import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { TERMINAL_CANCEL_COOLDOWN_MS } from '../backend/critical-control-key.js';
+import { GOAL_ENV } from '../../workflows/v3/contract.js';
+import { buildBotmuxSystemPromptText } from './shared-hints.js';
+import { piTurnBoundaryExtensionPath } from './pi.js';
 
 import { findLatestJsonl } from '../../services/claude-transcript.js';
 import { delay } from '../../utils/timing.js';
+
+export const OMP_PLUGIN_DIR = join(homedir(), '.botmux', 'omp-plugin');
 
 const OMP_INPUT_CHUNK_CHARS = 512;
 const OMP_INPUT_CHUNK_NEWLINES = 9;
@@ -111,7 +115,10 @@ function submitEnter(pty: PtyHandle, attempts = 3): boolean {
 }
 
 /** Adapter for oh-my-pi coding agent's native TUI (`omp`). */
-export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
+export function createOhMyPiAdapter(
+  pathOverride?: string,
+  resolveExtensionPath: () => string | undefined = piTurnBoundaryExtensionPath,
+): CliAdapter {
   const bin = resolveCommand(pathOverride ?? 'omp');
   let composerDirty = false;
   let lastClearAttemptAt = 0;
@@ -147,7 +154,22 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
     // as positional launch args: OMP deposits those in the TUI composer but
     // does not auto-submit them. Route prompts through writeInput, where botmux
     // controls the final submit key.
-    buildArgs({ sessionId, resume, model, workingDir, disableCliBypass }) {
+    buildArgs({
+      sessionId,
+      resume,
+      model,
+      workingDir,
+      disableCliBypass,
+      locale,
+      botName,
+      botOpenId,
+      replyDelivery,
+      triggerUserAuth,
+      noTransport,
+      solo,
+      skillPluginDir,
+      env,
+    }) {
       const sessionDir = ompSessionDir(sessionId);
       const args = ['--no-title'];
       if (resume) {
@@ -160,8 +182,45 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
       }
       if (model?.trim()) args.push('--model', model.trim());
       if (workingDir) args.push('--cwd', workingDir);
+      args.push('--plugin-dir', OMP_PLUGIN_DIR);
+      if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
+      const effectiveReplyDelivery = process.env[GOAL_ENV.V3_MARKER] === '1' ? 'send' : replyDelivery;
+      const botmuxAppendPrompt = buildBotmuxSystemPromptText({
+        locale,
+        botName,
+        botOpenId,
+        noTransport,
+        triggerUserAuth,
+        replyDelivery: effectiveReplyDelivery,
+        solo,
+      });
+
+      // Inject the Botmux routing prompt into the process environment so that
+      // the extension can append it during `before_agent_start`.
+      // We deliberately do NOT pass `--append-system-prompt` via argv: OMP's CLI
+      // disables native automatic discovery of project/user/foreign APPEND_SYSTEM.md
+      // whenever `--append-system-prompt` is present on argv, and ahead-of-time argv
+      // cannot predict complex profile/project/overlay Settings precedence. Appending
+      // via the extension after native discovery completes preserves 100% faithful
+      // native Settings resolution while cleanly injecting Botmux rules.
+      const turnBoundaryExt = resolveExtensionPath();
+      if (!turnBoundaryExt) {
+        throw new Error(
+          'Failed to resolve or materialize Pi turn-boundary extension for OMP; ' +
+          'refusing to start without extension to avoid suppressing native APPEND_SYSTEM.md discovery',
+        );
+      }
+      args.push('--extension', turnBoundaryExt);
+
+      if (env && botmuxAppendPrompt) {
+        env.BOTMUX_APPEND_SYSTEM_PROMPT = botmuxAppendPrompt;
+      }
       return args;
     },
+
+    injectsSessionContext: true,
+    pluginDir: OMP_PLUGIN_DIR,
+    skillDelivery: { nativeKind: 'claude-plugin', supportsScopedSession: true, supportsExclusive: false },
 
     // OMP positional prompts are not an auto-submit channel; stdin injection is
     // the reliable path.
@@ -219,7 +278,7 @@ export function createOhMyPiAdapter(pathOverride?: string): CliAdapter {
     readyPattern: undefined,
     busyPattern: /Working(?:\.\.\.|…)/,
     supportsTypeAhead: true,
-    systemHints: BOTMUX_SHELL_HINTS,
+    systemHints: [],
     altScreen: true,
     skillsDir: '~/.omp/agent/skills',
   };

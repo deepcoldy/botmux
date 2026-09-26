@@ -9,7 +9,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { DaemonSession, FrozenCard } from '../src/core/types.js';
-import { activeSessionKey } from '../src/core/types.js';
+import { activeSessionKey, sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 
 // ─── Mocks ─────────────────────────────────────────────────────────────────
@@ -515,6 +515,23 @@ describe('meeting-agent streaming card (Plan B)', () => {
 });
 
 describe('postFreshStreamingCard', () => {
+  it('uses the runtime lane slot while posting /card to the visible root', async () => {
+    const ds = makeDs();
+    ds.runtimeRoutingAnchor = 'lane:source:fresh-b';
+    ds.workerReady = true;
+    const registry = new Map([[activeSessionKey(ds), ds]]);
+    expect(registry.has(sessionKey('om_root', APP_ID))).toBe(false);
+    setActiveSessionsRegistry(registry);
+    const sessionReply = vi.fn(async () => 'om_lane_fresh_card');
+
+    await expect(postFreshStreamingCard(ds, sessionReply)).resolves.toBe(true);
+
+    expect(sessionReply.mock.calls[0]?.[0]).toBe('om_root');
+    expect(sessionReply.mock.calls[0]?.[3]).toBe(APP_ID);
+    expect(ds.streamCardId).toBe('om_lane_fresh_card');
+    expect(deleteMessageMock).not.toHaveBeenCalledWith(APP_ID, 'om_lane_fresh_card');
+  });
+
   it('completes /card publication before its deferred Pin chain settles', async () => {
     let resolvePin!: (value: { messageId: string; operatorId: string; operatorIdType: string }) => void;
     pinMessageMock.mockImplementationOnce(() => new Promise((resolve) => {
@@ -795,6 +812,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPending = true;
     ds.streamCardTurnGeneration = 1;
     ds.streamCardPendingTurnId = 'om_turn_1';
+    activate(ds);
 
     const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
     ds.session = {
@@ -826,6 +844,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPending = true;
     ds.streamCardTurnGeneration = 1;
     ds.streamCardPendingTurnId = 'om_turn_1';
+    activate(ds);
 
     const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
     ds.session.status = 'closed' as any;
@@ -851,6 +870,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPending = true;
     ds.streamCardTurnGeneration = 1;
     ds.streamCardPendingTurnId = 'om_turn_1';
+    activate(ds);
 
     const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
     ds.session.rootMessageId = 'om_transferred_root';
@@ -876,6 +896,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPending = true;
     ds.streamCardTurnGeneration = 1;
     ds.streamCardPendingTurnId = 'om_turn_1';
+    activate(ds);
 
     const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
     ds.session = {

@@ -96,6 +96,16 @@ export interface DaemonSession {
   };
   larkAppId: string;
   chatId: string;
+  /**
+   * Daemon-internal routing identity for one validated principal lane.
+   *
+   * This is deliberately in-memory and is populated only after the durable
+   * principal-lane binding has passed the authority/materialization checks.
+   * It may be a virtual value, so it must never be handed to a Lark send API.
+   * `sessionAnchorId()` remains the visible delivery anchor; registry/lock/
+   * worker-liveness ownership uses `runtimeSessionAnchorId()` instead.
+   */
+  runtimeRoutingAnchor?: string;
   chatType: 'group' | 'p2p';    // p2p chats need reply_in_thread to create topics
   /** Routing scope:
    *   'thread' → routing key = session.rootMessageId, replies use reply_in_thread=true
@@ -416,6 +426,14 @@ export interface DaemonSession {
    * daemon-minted schedule turn id and never persisted. The worker can name a
    * turn id but cannot add or change the identity behind it. */
   scheduledTurnCallers?: Map<string, TrustedCaller>;
+  /** Exact principal-lane turn/generation that still owns the worker until a
+   * matching terminal or proven worker exit. Unlike activeInteractiveTurn,
+   * the worker's earlier managed-origin revoke must not clear this FIFO fence,
+   * and a delayed callback from a retired generation must not release it. */
+  principalLaneRunningTurn?: {
+    turnId: string;
+    workerGeneration: number;
+  };
   /** Host-owned classification/approval driver currently attached to disk state. */
   crossPrincipalInterruptionDriving?: boolean;
   /** Runtime wake-up for the bounded wait until the current owner turn ends. */
@@ -778,10 +796,13 @@ export function claimCurrentRepoCard(ds: DaemonSession, cardMessageId: string | 
   return current;
 }
 
-/** Resolve the routing anchor for an active session — chatId for chat-scope
- *  sessions, rootMessageId for thread-scope. Used to compute `sessionKey()` at
- *  storage and lookup time. */
-export function sessionAnchorId(ds: DaemonSession): string {
+/** Resolve the visible delivery anchor for an active session — chatId for
+ * chat-scope sessions, rootMessageId for thread-scope. Principal lanes may use
+ * a different runtime ownership anchor; never infer registry ownership from
+ * this value. */
+export function sessionAnchorId(
+  ds: Pick<DaemonSession, 'session' | 'scope' | 'chatId'>,
+): string {
   const deferredAnchor = ds.session.deferredScheduleRun?.routingAnchor;
   if (deferredAnchor) return deferredAnchor;
   return ds.scope === 'chat' ? ds.chatId : ds.session.rootMessageId;
@@ -797,13 +818,30 @@ export function storedSessionAnchorId(
     ?? (session.scope === 'chat' ? session.chatId : session.rootMessageId);
 }
 
-/** Storage key for the daemon-owned activeSessions map. A VC meeting agent is
- * now an ordinary chat-scope session in its listener group (Plan B): it is keyed
- * by the normal `(chatId, appId)` slot so plain IM and meeting transcripts both
- * fold into the one session. The `vcMeetingReceiver` marker is retained as pure
- * delivery/meeting-output metadata and no longer affects routing. */
+/** Principal-lane-only routing identity. Do not use this as a Lark send target:
+ * the value may be virtual and has no corresponding message/chat in Lark. */
+export function principalLaneRoutingAnchorId(
+  session: Pick<Session, 'scope' | 'chatId' | 'rootMessageId' | 'deferredScheduleRun' | 'principalLane'>,
+): string {
+  return session.principalLane?.routingAnchor ?? storedSessionAnchorId(session);
+}
+
+/** Resolve the daemon's live ownership anchor. Principal-lane sessions receive
+ * an explicit virtual anchor only after their durable authority is validated;
+ * every legacy/non-lane session falls back byte-for-byte to sessionAnchorId().
+ * Never use this return value as a Lark reply/send target. */
+export function runtimeSessionAnchorId(
+  ds: Pick<DaemonSession, 'runtimeRoutingAnchor' | 'session' | 'scope' | 'chatId'>,
+): string {
+  return ds.runtimeRoutingAnchor ?? sessionAnchorId(ds);
+}
+
+/** Storage key for the daemon-owned activeSessions map. A validated principal
+ * lane uses its explicit runtime anchor; every other session keeps the existing
+ * visible `(anchor, appId)` key. A VC meeting agent remains an ordinary
+ * chat-scope session in its listener group. */
 export function activeSessionKey(ds: DaemonSession): string {
-  return sessionKey(sessionAnchorId(ds), ds.larkAppId);
+  return sessionKey(runtimeSessionAnchorId(ds), ds.larkAppId);
 }
 
 /** A session whose only IM surface is a Feishu document comment thread.

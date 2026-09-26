@@ -15,7 +15,7 @@ Turn the AI's text reply into a **voice message** in your Lark group with one cl
 
 Configure interactively with the dedicated command `botmux voice` (deliberately kept separate from `botmux setup`). The configuration is written to the `voice` block of the global `~/.botmux/config.json`, and takes effect after `botmux restart`.
 
-Two kinds of engines are supported — **pick one based on your identity**:
+Three engines are supported — **pick one based on your identity / the service you have**:
 
 ### ByteDance tenant: SAMI (large-model speech synthesis)
 
@@ -57,6 +57,24 @@ botmux restart        # Take effect
 
 The voice is optional: OpenAI defaults to `alloy`; for self-hosted, fill in a voice your service supports.
 
+### MiniMax (Hailuo speech)
+
+If you have an API key from the [MiniMax open platform](https://platform.minimax.io), you can use the official T2A v2 speech synthesis directly — no need to run your own service.
+
+**① Prepare credentials**
+
+- Enable the text-to-audio (T2A) capability on the MiniMax open platform and get an **API key**.
+- Confirm your region: mainland China accounts usually pick "China" (`api.minimaxi.com`); overseas accounts pick "Global" (`api.minimax.io`). **The key and region must match**, otherwise you'll get an auth error.
+
+**② Configure**
+
+```bash
+botmux voice          # Interactive: select [3] MiniMax → paste API key → pick region
+botmux restart        # Take effect
+```
+
+The model defaults to `speech-2.8-hd` and the voice to `female-shaonv`; both can be overridden during configuration or in the config file. If the default voice isn't available on your account (voices can differ across regions / models), just fill in a system voice id listed in the MiniMax console.
+
 ## System dependencies
 
 The synthesized output needs to be encoded into the opus format used by Lark voice bubbles, which depends on the system's **opus-tools** (providing `opusenc`). **When you run `botmux voice` to configure, it auto-detects this; if it's missing, it asks and installs it for you** (using the same package manager + sudo logic as tmux). You can also install it manually:
@@ -96,6 +114,15 @@ You can also edit the `voice` block of `~/.botmux/config.json` directly:
     "engine": "openai",
     "speaker": "alloy",                            // Optional
     "openai": { "baseUrl": "https://api.openai.com/v1", "apiKey": "...", "model": "tts-1" }
+  }
+}
+
+// MiniMax (region: "cn" mainland China / "global" international, defaults to global)
+{
+  "voice": {
+    "engine": "minimax",
+    "speaker": "female-shaonv",                   // Optional, defaults to female-shaonv
+    "minimax": { "apiKey": "...", "region": "cn", "model": "speech-2.8-hd" }
   }
 }
 ```

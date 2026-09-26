@@ -491,3 +491,19 @@ describe('target daemon consumes signed message authority', () => {
     expect(readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8')).not.toContain('must-not-leak');
   });
 });
+
+
+it('does not begin another login when the bytedcli provider fails', async () => {
+  const provider = await import('../src/services/bytedcli-auth.js');
+  vi.mocked(provider.beginBytedcliLogin).mockClear();
+  vi.mocked(provider.mintBytedcliJwts).mockRejectedValueOnce(new Error('provider unavailable'));
+  writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'old-sender-credential' });
+  const result = await publishTurnCliIdentity({
+    botConfig: botConfig({ enabled: true, tools: ['bytedcli'] }), sessionDataDir: dir, sessionId: SESSION, senderOpenId: ALICE,
+  });
+  expect(result).toContainEqual({ tool: 'bytedcli', state: 'unavailable' });
+  expect(provider.beginBytedcliLogin).not.toHaveBeenCalled();
+  const written = readFileSync(sessionIdentityPath(dir, SESSION, 'bytedcli'), 'utf8');
+  expect(written).toContain('停止自动重试');
+  expect(written).not.toContain('old-sender-credential');
+});

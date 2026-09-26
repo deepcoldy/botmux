@@ -59,7 +59,7 @@ botmux start                 # 启动 daemon（botmux autostart enable 设开机
 npm install -g botmux        # 需要 Node >= 22 装包本身
 ```
 
-npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的那一个），postinstall 把 `~/.botmux/bin/botmux` 指向它并同样写 PATH。所以装完只有**一个** botmux 版本，不再出现「装了两个 Node 版本、各自带一份全局 botmux 互相打架 / 不知道更新了哪个」。
+npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的那一个）。包的 `bin` 指向随包发布的 sh 启动器，由包管理器自己链到 PATH——**npm / pnpm / bun 三种装法都不依赖生命周期脚本**（pnpm 10/11 与 bun 默认不跑依赖的 postinstall，早期版本因此装完没有任何 `botmux` 命令）。postinstall 仍会把 `~/.botmux/bin/botmux` 指向同一个二进制并写 PATH。所以装完始终只有**一个** botmux **版本**（两个入口都 exec 同一个二进制），不再出现「装了两个 Node 版本、各自带一份全局 botmux 互相打架 / 不知道更新了哪个」。
 
 区别只在**谁来装**：npm 路径需要 Node ≥ 22 才能执行安装本身，curl 路径全程不碰 Node；**无论哪种装法，升级都重跑 curl**（v3.18.0 之前的老版本用 npm 跨形态升级会让 daemon 起不回来）。跑起来之后两者完全一致——同样的二进制、同样的命令。
 
@@ -71,6 +71,7 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 
 - **[实时流式卡片](https://deepcoldy.github.io/botmux/cards)** — 每轮对话一张实时刷新的卡片，终端画面原样截图回传；一键显示/隐藏输出、翻屏、重启/关闭/接管会话。
 - **[多机器人协作](https://deepcoldy.github.io/botmux/multi-bot)** — 同群多 bot @mention 路由，不同 CLI 背后不同模型，天然多样性；方案评审 / 代码 review / 技术选型让它们互相挑刺。
+- **[群内真人独立 lane](docs/principal-lanes.md)** — 可复用 Dashboard 的「跨身份打断隔离（XPI）」开关，让同一群里的真人各用独立 CLI 上下文和 git worktree；消息仍公开可见，引用别人的任务仍可走建议/确认协作。
 - **[多话题并行编排](https://deepcoldy.github.io/botmux/multi-topic)** — 给编排者一个大任务，它自动在群里种话题、拉各 bot 起独立会话跑流水线，飞书任务面板一眼看完所有子任务进度。
 - **[可交互 Web 终端](https://deepcoldy.github.io/botmux/web-terminal)** — 不只是看输出，浏览器 / 手机直接操作 CLI，移动端带悬浮快捷键栏（Esc、Ctrl+C、方向键）。
 - **[会话接入 & 接力](https://deepcoldy.github.io/botmux/adopt)** — 本地 tmux 里跑到一半，手机 `/adopt` 接管；`/relay` 把整个会话（原进程、原记忆）搬进团队群继续。

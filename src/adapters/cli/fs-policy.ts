@@ -875,6 +875,8 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     `${bh}/.dashboard-port`,    // dashboard port (owner term-link; harmless port int)
     `${bh}/bin`,                // the daemon-written `botmux` wrapper (head of PATH)
     `${bh}/claude-plugin`,      // skill/plugin dir (claude --plugin-dir); no secrets
+    `${bh}/omp-plugin`,         // skill/plugin dir (omp --plugin-dir); no secrets
+    `${bh}/pi-skills`,          // skill dir (pi --skill); no secrets
     `${bh}/lark-scopes.json`,   // static scope catalog
     // dashboard-daemons (sibling IPC port table) is the discovery half of the
     // trusted-host escalation — a no-transport turn must NOT get it (paired with

@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import { delay } from '../../utils/timing.js';
+import { stripAnsiScreenText } from '../../utils/idle-detector.js';
 import type { CliAdapter, PtyHandle, SubmitRecheckResult } from './types.js';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { discoverAntigravitySessions } from '../../services/resumable-session-discovery.js';
@@ -130,6 +131,36 @@ async function waitForHistoryAppend(
     await delay(HISTORY_POLL_MS);
   }
   return historyDeltaContains(path, fromByte, marker);
+}
+
+/** Cancellation can leave the transcript at a tool result forever. Accept only
+ * the CLI's explicit interruption notice followed immediately by an EMPTY
+ * composer and its ready footer at the end of the current viewport. Old notices
+ * in scrollback, a newer prompt, or a running status must not release input. */
+export function isAntigravityInterruptedScreen(screen: string): boolean {
+  // tmux captureViewport preserves SGR colors and normalizes rows to CRLF;
+  // the PTY renderer already returns plain LF rows. Accept both backends.
+  const plain = stripAnsiScreenText(screen).replace(/\r\n/g, '\n');
+  if (/esc to cancel/i.test(plain)) return false;
+  // Walk rows once instead of matching nested whitespace repetitions against
+  // a whole screen (which can backtrack exponentially on blank rows).
+  const rows = plain.split('\n').map(row => row.trim());
+  let end = rows.length;
+  const skipBlankRows = (): void => {
+    while (end > 0 && rows[end - 1] === '') end--;
+  };
+  const skipSeparators = (): void => {
+    // PTY rawSnapshot's display cleanup replaces box-drawing rows with blanks;
+    // tmux retains them. Both must preserve the same three semantic rows.
+    while (end > 0 && /^[─━]*$/.test(rows[end - 1])) end--;
+  };
+  skipBlankRows();
+  if (end === 0 || !/^\? for shortcuts(?:\s|$)/.test(rows[--end])) return false;
+  skipSeparators();
+  if (end === 0 || rows[--end] !== '>') return false;
+  skipSeparators();
+  if (end === 0) return false;
+  return /^⎿[ \t]+Interrupted · What should Antigravity CLI do instead\?$/.test(rows[end - 1]);
 }
 
 export function isAntigravityTranscriptBusy(transcriptPath: string): boolean {
@@ -352,10 +383,14 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
     completionPattern: undefined,
     readyPattern: /\? for shortcuts/,
     busyPattern: /esc to cancel/,
-    isSessionBusy({ cliSessionId }) {
+    isSessionBusy({ cliSessionId, getCurrentScreen }) {
       if (!cliSessionId) return false;
       const transcriptPath = join(homedir(), '.gemini', 'antigravity-cli', 'brain', cliSessionId, '.system_generated', 'logs', 'transcript.jsonl');
-      return isAntigravityTranscriptBusy(transcriptPath);
+      if (!isAntigravityTranscriptBusy(transcriptPath)) return false;
+      try {
+        if (getCurrentScreen && isAntigravityInterruptedScreen(getCurrentScreen())) return false;
+      } catch { /* Missing viewport is not evidence of cancellation. */ }
+      return true;
     },
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,

@@ -6,9 +6,12 @@
  *
  * Run:  pnpm vitest run test/command-handler.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ─── Mock external modules ──────────────────────────────────────────────────
+
+// Command routing must not load or start a native terminal through transitive imports.
+vi.mock('node-pty', () => ({ spawn: vi.fn(() => { throw new Error('unexpected native terminal spawn'); }) }));
 
 // Mock node builtins that command-handler imports directly
 // Global bot registry as seen via bots-info.json (the deployment-wide source the
@@ -181,6 +184,9 @@ vi.mock('../src/services/session-store.js', () => ({
   findActiveSessionsByWorkingDir: vi.fn(() => []),
   findActiveSessionsByWorkingDirStrict: vi.fn(() => []),
   getOwnedSession: vi.fn(() => undefined),
+  resolvePrincipalLaneForIngress: vi.fn(() => ({ status: 'missing' })),
+  hydratePrincipalLaneForIngress: vi.fn(async () => ({ status: 'missing', reason: 'lane_missing' })),
+  retirePrincipalLane: vi.fn(() => ({ status: 'retired' })),
   listSessions: vi.fn(() => []),
   collectBotmuxSessionIdentities: vi.fn(() => new Set<string>()),
 }));
@@ -310,6 +316,8 @@ vi.mock('../src/services/group-creator.js', () => ({
     oncallBindings: [],
     roleProfileBootstrapMessageId: null,
     roleProfileBootstrapError: null,
+    managersAdded: [],
+    managerError: null,
   })),
 }));
 
@@ -521,6 +529,9 @@ vi.mock('../src/services/oncall-store.js', () => ({
 // own open-mode / allowlist / peer-bot logic (that lives in event-dispatcher).
 vi.mock('../src/im/lark/event-dispatcher.js', () => ({
   canOperate: vi.fn(() => true),
+  // cross-ref bot 兜底腿默认 false（人类）；个别用例翻成 true 模拟「事件没盖
+  // app/bot、但 open_id 已在 peer 互导表里」的 bot。
+  isKnownPeerBot: vi.fn(() => false),
 }));
 
 vi.mock('../src/services/bot-union-ids-store.js', () => ({
@@ -580,7 +591,7 @@ import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolS
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
-import { canOperate } from '../src/im/lark/event-dispatcher.js';
+import { canOperate, isKnownPeerBot } from '../src/im/lark/event-dispatcher.js';
 import { deleteWorktreeCleanupJob, getWorktreeCleanupJob, putWorktreeCleanupJob } from '../src/services/worktree-cleanup-store.js';
 import { getBotUnionId } from '../src/services/bot-union-ids-store.js';
 import { isTeamBot } from '../src/services/team-bots-store.js';
@@ -669,6 +680,19 @@ function closeWorktreeState(
   })).digest('hex');
 }
 
+function laneCloseState(
+  safetyFingerprint = 'lane-clean',
+  invokerOpenId = 'ou_sender',
+): string {
+  return createHash('sha256').update(JSON.stringify({
+    sessionId: 'lane-session-b',
+    worktreeDir: resolve('/home/testuser/project-wt-principal'),
+    siblingSessionIds: [],
+    safetyFingerprint,
+    invokerOpenId,
+  })).digest('hex');
+}
+
 function makeDaemonSession(overrides: Partial<DaemonSession> = {}): DaemonSession {
   return {
     session: makeSession(),
@@ -743,7 +767,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/cleanup-wt', '/stop', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/project', '/group', '/g', '/relay', '/quote', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/sessions', '/vc-auth', '/issue', '/cli'];
+    const expected = ['/close', '/cleanup-wt', '/lane', '/stop', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/project', '/group', '/g', '/relay', '/quote', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/sessions', '/vc-auth', '/issue', '/cli'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -780,7 +804,7 @@ describe('DAEMON_COMMANDS set', () => {
     // bot 发送方和 `/t /tabs ...` 会建出 phantom session 后静默失效。
     // /fork 与 /issue 仍是一等 daemon 命令；/subscribe-lark-doc 保持原本的
     // 按文件 API 订阅命令语义，不做别名。
-    expect(DAEMON_COMMANDS.size).toBe(41);
+    expect(DAEMON_COMMANDS.size).toBe(42);
     expect(DAEMON_COMMANDS.has('/tabs')).toBe(false);
     expect(DAEMON_COMMANDS.has('/tab')).toBe(false);
   });
@@ -1069,6 +1093,11 @@ describe('EXISTING_SESSION_ONLY_DAEMON_COMMANDS set', () => {
   it('keeps /stop existing-session-only so it cannot create a phantom command session', () => {
     expect(EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has('/stop')).toBe(true);
     expect(DAEMON_COMMANDS.has('/stop')).toBe(true);
+  });
+
+  it('keeps /lane existing-session-only so status and cleanup never create a phantom session', () => {
+    expect(EXISTING_SESSION_ONLY_DAEMON_COMMANDS.has('/lane')).toBe(true);
+    expect(DAEMON_COMMANDS.has('/lane')).toBe(true);
   });
 });
 
@@ -1923,6 +1952,127 @@ describe('handleCommand', () => {
     });
   });
 
+  // 会话发起人闸放宽：bot 管理员（canOperate）能 fork 本 bot 的任意会话。
+  // 理由是权限单调性——管理员本来就能 /close /restart 掉这个会话，"能销毁却不能
+  // 拷贝一份"没有安全意义；fork 又是非破坏性的（源会话不动）。非管理员不受影响。
+  describe('/fork 发起人闸 — 管理员例外', () => {
+    afterEach(() => {
+      vi.mocked(canOperate).mockReturnValue(true);
+      vi.mocked(isKnownPeerBot).mockReturnValue(false);
+    });
+
+    it('非发起人且非管理员（canOperate=false）→ 拒，不建话题', async () => {
+      vi.mocked(canOperate).mockReturnValue(false);
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_other_user', cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/fork', ROOT_ID, makeLarkMessage('/fork 接手排查', { threadId: 'omt_parent' }), deps, LARK_APP_ID);
+
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('发起人');
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(forkSession).not.toHaveBeenCalled();
+    });
+
+    it('非发起人但是管理员（canOperate=true）→ 放行，子会话归 fork 发起的管理员', async () => {
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_other_user', cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/fork', ROOT_ID, makeLarkMessage('/fork 接手排查', { threadId: 'omt_parent' }), deps, LARK_APP_ID);
+
+      expect(forkSession).toHaveBeenCalled();
+      // 关键：子会话 owner 改记成 ou_sender（发 fork 的管理员），不继承 ou_other_user。
+      // 否则 --create 建的新群里只有管理员自己，owner-only 回复会指向一个不在群里的人。
+      expect(vi.mocked(forkSession).mock.calls[0][5]).toMatchObject({ childOwnerOpenId: 'ou_sender' });
+    });
+
+    it('发起人自己 fork → childOwnerOpenId 不下发（继承源 owner，保持现状）', async () => {
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_sender', cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/fork', ROOT_ID, makeLarkMessage('/fork 接手排查', { threadId: 'omt_parent' }), deps, LARK_APP_ID);
+
+      expect(forkSession).toHaveBeenCalled();
+      expect(vi.mocked(forkSession).mock.calls[0][5]?.childOwnerOpenId).toBeUndefined();
+    });
+
+    it('bot 发送方即使 canOperate=true（开放模式）也不被盖成 owner（bot 绝不当 ownerOpenId）', async () => {
+      // 回归：canOperate 的开放模式腿对 peer bot 也放行；闸只判 canOperate 时，bot 会被
+      // 盖成子会话 owner，违反「ownerOpenId 必须是真人」的不变量（owner-only 回复每次
+      // 都 @ 醒它 ⟹ 自触发/重入循环）。闸仍放行（开放模式管理员例外），只是不改 owner。
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_human_owner', cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/fork', ROOT_ID,
+        makeLarkMessage('/fork 接手排查', { threadId: 'omt_parent', senderId: 'ou_peer_bot', senderType: 'app' }),
+        deps, LARK_APP_ID,
+      );
+
+      expect(forkSession).toHaveBeenCalled();
+      // bot 过闸但不能被盖成 owner：childOwnerOpenId 缺省 ⟹ 子会话退回继承源真人 owner。
+      expect(vi.mocked(forkSession).mock.calls[0][5]?.childOwnerOpenId).toBeUndefined();
+    });
+
+    it('事件没盖 app/bot 但 open_id 在 peer cross-ref 里的 bot 也不被盖成 owner（兜底腿）', async () => {
+      // daemon isForeignBotSender 是 senderType OR isKnownPeerBot 两条腿；这类消息仍被当
+      // bot 路由进 /fork。只判 senderType 会漏掉它，再把 bot 盖成 owner。
+      vi.mocked(isKnownPeerBot).mockReturnValue(true);
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_human_owner', cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/fork', ROOT_ID,
+        // senderType 留默认 'user'（模拟飞书没盖 app/bot 的边角），仅靠 cross-ref 认出 bot。
+        makeLarkMessage('/fork 接手排查', { threadId: 'omt_parent', senderId: 'ou_peer_bot' }),
+        deps, LARK_APP_ID,
+      );
+
+      expect(forkSession).toHaveBeenCalled();
+      // 行为判据（不是「函数被调用」）：缺 senderType 戳记时仍靠 cross-ref 认出 bot，
+      // childOwnerOpenId 必须缺省 ⟹ 子会话退回继承源真人 owner，而不是盖成 ou_peer_bot。
+      expect(vi.mocked(forkSession).mock.calls[0][5]?.childOwnerOpenId).toBeUndefined();
+    });
+
+    it('真人（非 cross-ref bot、senderType=user）管理员 fork 别人会话仍正常改记 owner', async () => {
+      // 反例守卫：加固不能把真人管理员也误判成 bot。isKnownPeerBot 默认 false。
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_other_user', cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/fork', ROOT_ID,
+        makeLarkMessage('/fork 接手排查', { threadId: 'omt_parent' }),
+        deps, LARK_APP_ID,
+      );
+
+      expect(vi.mocked(forkSession).mock.calls[0][5]).toMatchObject({ childOwnerOpenId: 'ou_sender' });
+    });
+  });
+
   describe('/fork --create lineage durability', () => {
     it('persists parent lineage even when the created-notice reply fails (expired root → 400)', async () => {
       // Regression for the ordering blocker: the "created" notice is a reply to
@@ -1967,6 +2117,35 @@ describe('handleCommand', () => {
       expect(ds.session.forkChildSessionIds).toEqual(['child-create-1']);
       expect(sessionStore.updateSession).toHaveBeenCalledWith(
         expect.objectContaining({ forkChildSessionIds: ['child-create-1'] }),
+      );
+    });
+
+    it('管理员（非发起人）走 --create：childOwnerOpenId 也必须传给新群那条 fork', async () => {
+      // 反变异守卫：--create 路径与子话题路径是两条独立的 forkSession 调用。若 --create
+      // 漏传 childOwnerOpenId，新群里只有管理员自己，子会话却继承了不在群里的源 owner。
+      vi.mocked(forkSession).mockResolvedValueOnce({ ok: true, childSessionId: 'child-create-admin' });
+      const ds = makeDaemonSession({
+        scope: 'chat',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_other_user', scope: 'chat', cliId: 'codex' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/fork',
+        ROOT_ID,
+        makeLarkMessage('/fork --create 接手群'),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(forkSession).toHaveBeenCalledWith(
+        'sess-001',
+        expect.any(String),
+        expect.any(String),
+        'group',
+        'chat',
+        expect.objectContaining({ forkTaskText: '接手群', childOwnerOpenId: 'ou_sender' }),
       );
     });
   });
@@ -2260,6 +2439,219 @@ describe('handleCommand', () => {
   });
 
   // ─── /close ─────────────────────────────────────────────────────────────
+
+  describe('/lane', () => {
+    function mockShadowLane() {
+      const laneSession = makeSession({
+        sessionId: 'lane-session-b',
+        workingDir: '/home/testuser/project-wt-principal',
+        principalLane: {
+          version: 1,
+          laneId: 'lane-b',
+          sourceSessionId: 'sess-001',
+          principalKey: 'user:union:on_b',
+          principal: { senderType: 'user', kind: 'union', unionId: 'on_b' },
+          routingAnchor: 'principal-lane:lane-b',
+          displayTarget: { scope: 'chat', larkAppId: LARK_APP_ID, chatId: CHAT_ID },
+          workspaceEpoch: 1,
+          phase: 'active',
+          revision: 1,
+          createdAt: '2026-09-22T00:00:00.000Z',
+          updatedAt: '2026-09-22T00:00:00.000Z',
+        },
+      });
+      const worktree = {
+        version: 1,
+        materializationId: 'materialization-b',
+        sourceSessionId: 'sess-001',
+        laneId: 'lane-b',
+        sessionId: laneSession.sessionId,
+        principalKey: 'user:union:on_b',
+        workspaceEpoch: 1,
+        sourceCanonicalCwd: '/home/testuser/project',
+        sourceRepoRoot: '/home/testuser/project',
+        sourceGitCommonDir: '/home/testuser/project/.git',
+        sourceRelativeCwd: '',
+        worktreeRoot: '/home/testuser/project-wt-principal',
+        worktreeGitCommonDir: '/home/testuser/project/.git',
+        workingDir: '/home/testuser/project-wt-principal',
+        branch: 'wt/principal-lane-b',
+        baseRef: 'HEAD',
+        phase: 'ready',
+        revision: 1,
+        createdAt: '2026-09-22T00:00:00.000Z',
+        updatedAt: '2026-09-22T00:00:00.000Z',
+      };
+      vi.mocked(sessionStore.resolvePrincipalLaneForIngress).mockReturnValueOnce({
+        status: 'ready', laneId: 'lane-b', routingAnchor: 'principal-lane:lane-b',
+      } as never);
+      vi.mocked(sessionStore.hydratePrincipalLaneForIngress).mockResolvedValueOnce({
+        status: 'ready',
+        source: {},
+        lane: laneSession.principalLane,
+        session: laneSession,
+        runtimeRoutingAnchor: 'principal-lane:lane-b',
+        worktree,
+      } as never);
+      return { laneSession, worktree };
+    }
+
+    it('reports the caller lane branch, worktree and publication state', async () => {
+      mockShadowLane();
+      vi.mocked(worktreeSafetyStatus).mockResolvedValueOnce({
+        dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 2,
+        unpushedCommits: ['abc change'], fingerprint: 'lane-clean',
+      });
+      const deps = makeDeps(makeDaemonSession());
+
+      await handleCommand('/lane', ROOT_ID, makeLarkMessage('/lane status'), deps, LARK_APP_ID);
+
+      const reply = vi.mocked(deps.sessionReply).mock.calls[0]?.[1] as string;
+      expect(reply).toContain('wt/principal-lane-b');
+      expect(reply).toContain('/home/testuser/project-wt-principal');
+      expect(reply).toContain('未推送提交：2');
+    });
+
+    it('refuses close before confirmation when the lane has uncommitted files', async () => {
+      mockShadowLane();
+      vi.mocked(worktreeSafetyStatus).mockResolvedValueOnce({
+        dirty: true, dirtyCount: 1, dirtyFiles: ['src/dirty.ts'], ahead: 0,
+        unpushedCommits: [], fingerprint: 'lane-dirty',
+      });
+      const deps = makeDeps(makeDaemonSession());
+
+      await handleCommand('/lane', ROOT_ID, makeLarkMessage('/lane close'), deps, LARK_APP_ID);
+
+      const reply = vi.mocked(deps.sessionReply).mock.calls[0]?.[1] as string;
+      expect(reply).toContain('拒绝关闭');
+      expect(reply).toContain('src/dirty.ts');
+      expect(pushWorktreeBranch).not.toHaveBeenCalled();
+      expect(closeWorkerPoolSession).not.toHaveBeenCalled();
+    });
+
+    it('publishes committed work, retires routing, then reclaims the worktree', async () => {
+      const { laneSession } = mockShadowLane();
+      const beforePush = {
+        dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 1,
+        unpushedCommits: ['abc change'], fingerprint: 'lane-before-push',
+      };
+      const published = {
+        dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 0,
+        unpushedCommits: [], fingerprint: 'lane-published',
+      };
+      vi.mocked(worktreeSafetyStatus)
+        .mockResolvedValueOnce(beforePush)
+        .mockResolvedValueOnce(beforePush)
+        .mockResolvedValueOnce(published)
+        .mockResolvedValueOnce(published)
+        .mockResolvedValueOnce(published);
+      vi.mocked(sessionStore.retirePrincipalLane)
+        .mockReturnValueOnce({ status: 'ready' } as never)
+        .mockReturnValueOnce({ status: 'retired' } as never);
+      const deps = makeDeps(makeDaemonSession());
+      deps.activeSessions.set('lane-runtime', makeDaemonSession({ session: laneSession }));
+
+      await handleCommand(
+        '/lane',
+        ROOT_ID,
+        makeLarkMessage(`/lane close --yes --state=${laneCloseState('lane-before-push')}`),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(pushWorktreeBranch).toHaveBeenCalledWith(
+        '/home/testuser/project-wt-principal',
+        'wt/principal-lane-b',
+      );
+      expect(closeWorkerPoolSession).toHaveBeenCalledWith('lane-session-b');
+      expect(sessionStore.retirePrincipalLane).toHaveBeenNthCalledWith(1, expect.objectContaining({ dryRun: true }));
+      expect(sessionStore.retirePrincipalLane).toHaveBeenNthCalledWith(2, expect.not.objectContaining({ dryRun: true }));
+      expect(removeRepoWorktree).toHaveBeenCalledWith(
+        '/home/testuser/project',
+        '/home/testuser/project-wt-principal',
+      );
+      expect(deps.sessionReply).toHaveBeenCalledWith(
+        ROOT_ID,
+        expect.stringContaining('已关闭'),
+        undefined,
+        LARK_APP_ID,
+        'msg_001',
+      );
+    });
+
+    it('preserves routing and worktree when worker close leaves a residual', async () => {
+      const { laneSession } = mockShadowLane();
+      const clean = {
+        dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 0,
+        unpushedCommits: [], fingerprint: 'lane-clean',
+      };
+      vi.mocked(worktreeSafetyStatus)
+        .mockResolvedValueOnce(clean)
+        .mockResolvedValueOnce(clean);
+      vi.mocked(sessionStore.retirePrincipalLane).mockReturnValueOnce({ status: 'ready' } as never);
+      vi.mocked(closeWorkerPoolSession).mockResolvedValueOnce({
+        ok: true,
+        outcome: 'closed_with_residual',
+        residual: { reason: 'local_subtree_boundary_unproven' },
+        alreadyClosed: false,
+        known: true,
+      } as never);
+      const deps = makeDeps(makeDaemonSession());
+      deps.activeSessions.set('lane-runtime', makeDaemonSession({ session: laneSession }));
+
+      await handleCommand(
+        '/lane',
+        ROOT_ID,
+        makeLarkMessage(`/lane close --yes --state=${laneCloseState()}`),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(sessionStore.retirePrincipalLane).toHaveBeenCalledTimes(1);
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      expect(vi.mocked(deps.sessionReply).mock.calls[0]?.[1]).toContain('运行时残留');
+    });
+
+    it('preserves routing and worktree when a clean commit appears while close waits', async () => {
+      const { laneSession } = mockShadowLane();
+      const beforePush = {
+        dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 1,
+        unpushedCommits: ['abc change'], fingerprint: 'lane-before-push',
+      };
+      const published = {
+        dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 0,
+        unpushedCommits: [], fingerprint: 'lane-published',
+      };
+      const committedDuringClose = {
+        dirty: false, dirtyCount: 0, dirtyFiles: [], ahead: 1,
+        unpushedCommits: ['def late change'], fingerprint: 'lane-late-commit',
+      };
+      vi.mocked(worktreeSafetyStatus)
+        .mockResolvedValueOnce(beforePush)
+        .mockResolvedValueOnce(beforePush)
+        .mockResolvedValueOnce(published)
+        .mockResolvedValueOnce(committedDuringClose);
+      vi.mocked(sessionStore.retirePrincipalLane).mockReturnValueOnce({ status: 'ready' } as never);
+      const deps = makeDeps(makeDaemonSession());
+      deps.activeSessions.set('lane-runtime', makeDaemonSession({ session: laneSession }));
+
+      await handleCommand(
+        '/lane',
+        ROOT_ID,
+        makeLarkMessage(`/lane close --yes --state=${laneCloseState('lane-before-push')}`),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(pushWorktreeBranch).toHaveBeenCalledTimes(1);
+      expect(closeWorkerPoolSession).toHaveBeenCalledWith('lane-session-b');
+      expect(sessionStore.retirePrincipalLane).toHaveBeenCalledTimes(1);
+      expect(sessionStore.retirePrincipalLane).toHaveBeenCalledWith(expect.objectContaining({ dryRun: true }));
+      expect(removeRepoWorktree).not.toHaveBeenCalled();
+      expect(vi.mocked(deps.sessionReply).mock.calls[0]?.[1]).toContain('关闭期间');
+      expect(vi.mocked(deps.sessionReply).mock.calls[0]?.[1]).toContain('路由与 worktree 均已保留');
+    });
+  });
 
   describe('/close', () => {
     it('treats an existing App Server adopt as a BotMux-only disconnect', async () => {
@@ -3376,6 +3768,13 @@ describe('handleCommand', () => {
         expect(text).toContain('lark-cli: 以「孙晓雪」的身份调用');
         expect(text).toContain('bytedcli: 你未授权');
         expect(text).toContain('首次调用被拒时会自动返回登录链接');
+      });
+
+      it('reports provider outages without telling the user to authorize again', async () => {
+        vi.mocked(hasBytedcliHome).mockRejectedValueOnce(new Error('provider unavailable'));
+        const text = await statusText(statusWith({ enabled: true, tools: ['bytedcli'] }, false));
+        expect(text).toContain('授权服务暂时不可用');
+        expect(text).not.toContain('你未授权');
       });
 
       it('reports bytedcli as authorized once that person has logged in', async () => {
@@ -5504,6 +5903,32 @@ describe('handleCommand', () => {
     });
 
     describe('/login bytedcli', () => {
+      it.each(['/login bytedcli done', '/login done'])('retains authorization on provider outage: %s', async command => {
+        vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
+        vi.mocked(completeBytedcliLogin).mockResolvedValueOnce({ state: 'unavailable' });
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand('/login', ROOT_ID, makeLarkMessage(command), deps, LARK_APP_ID);
+        const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+        expect(text).toContain('授权服务暂时不可用');
+        expect(text).toContain('无需重新授权');
+        expect(text).not.toContain('再试一次');
+      });
+
+      it('reports an unavailable status instead of an unauthorized identity', async () => {
+        const prev = vi.mocked(getBot).getMockImplementation();
+        vi.mocked(getBot).mockImplementation((...args: any[]) => ({
+          ...prev!(...args), config: { ...prev!(...args).config, triggerUserAuth: { enabled: true, tools: ['bytedcli'] } },
+        }) as any);
+        vi.mocked(hasBytedcliHome).mockRejectedValueOnce(new Error('provider unavailable'));
+        try {
+          const deps = makeDeps(makeDaemonSession());
+          await handleCommand('/login', ROOT_ID, makeLarkMessage('/login status'), deps, LARK_APP_ID);
+          const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+          expect(text).toContain('授权服务暂时不可用');
+          expect(text).not.toContain('未授权');
+        } finally { vi.mocked(getBot).mockImplementation(prev!); }
+      });
+
       it('returns the ByteCloud link and says it is separate from Feishu', async () => {
         const deps = makeDeps(makeDaemonSession());
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli'), deps, LARK_APP_ID);

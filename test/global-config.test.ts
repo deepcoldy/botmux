@@ -70,6 +70,35 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().dashboard).toEqual({ chatBotDiscovery: false });
   });
 
+  it('reads a MiniMax voice engine configuration', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      voice: {
+        engine: 'minimax',
+        speaker: 'voice-id',
+        minimax: { apiKey: 'key', model: 'speech-2.8-hd', region: 'cn' },
+      },
+    }));
+    invalidateGlobalConfigCache();
+
+    expect(readGlobalConfig().voice).toEqual({
+      engine: 'minimax',
+      speaker: 'voice-id',
+      minimax: { apiKey: 'key', model: 'speech-2.8-hd', region: 'cn' },
+    });
+  });
+
+  it('sanitizes a mistyped MiniMax region instead of routing on it', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      voice: { engine: 'minimax', minimax: { apiKey: 'key', region: 'cnn' } },
+    }));
+    invalidateGlobalConfigCache();
+
+    // 'cnn' 既不是 'cn' 也不是 'global'：丢弃该字段（适配器兜底 global），
+    // 而不是把脏值原样保留、静默打到海外端点。
+    expect(readGlobalConfig().voice?.minimax).toEqual({ apiKey: 'key' });
+    expect(readGlobalConfig().voice?.minimax?.region).toBeUndefined();
+  });
+
   it('reads dashboard.noVisibleOutputHint as a boolean (on)', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       dashboard: { noVisibleOutputHint: true },

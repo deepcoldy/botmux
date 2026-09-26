@@ -330,8 +330,9 @@ try {
 // This used to only PRINT `echo 'export PATH=…' >> ~/.profile`. Two problems:
 // the user had to act on it, and for zsh users the suggested file is WRONG —
 // zsh never reads ~/.profile (measured), so following the hint verbatim left
-// `botmux` still not found. There is no `bin` field any more, so PATH is the
-// only way this launcher becomes a command; we now write the right startup file
+// `botmux` still not found. PATH is the only way THIS launcher becomes a
+// command (the package's own `bin` is linked by the package manager and is a
+// separate entry point); we now write the right startup file
 // for the user's actual shell (bash/zsh/fish/other) and tell them what we did.
 //
 // ⚠️ DO NOT GATE THIS ON `process.env.PATH`. It used to be wrapped in

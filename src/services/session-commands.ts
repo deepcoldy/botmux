@@ -182,6 +182,12 @@ function applyClose(row: Session, command: SessionCloseCommand, now: Date): Sess
     row.queuedAttachments = undefined;
     changed = true;
   }
+  // Closing ends the principal-lane lifecycle. No queued human turn may cross
+  // that boundary or be replayed by a later explicit resume.
+  if (row.principalLaneQueuedTurns !== undefined) {
+    row.principalLaneQueuedTurns = undefined;
+    changed = true;
+  }
 
   // `previewTarget` is a live loopback (host, port) the session's agent
   // registered with `botmux preview <port>` for its CURRENT worker generation —

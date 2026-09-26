@@ -15,6 +15,12 @@ import { createPortal } from 'react-dom';
 export type DropdownOption<T extends string> = {
   value: T;
   label: ReactNode;
+  /**
+   * Optional second line under the label, shown in the popup only (the
+   * collapsed trigger keeps rendering `label` alone via dropdownLabel).
+   * Lets option lists double as inline help for hard-to-name settings.
+   */
+  hint?: ReactNode;
   /** Non-selectable informational entry (e.g. a mode the current CLI can't use). */
   disabled?: boolean;
 };
@@ -633,7 +639,7 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
     };
   }, []);
   useEffect(() => {
-    if (!props.disabled) return;
+    if (props.disabled) return;
     if (detailsRef.current?.open) detailsRef.current.open = false;
     // Third programmatic close path — keep it in sync too (see choose()).
     setOpen(false);
@@ -701,7 +707,12 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
             aria-current={props.value === option.value ? 'true' : undefined}
             onClick={() => choose(option.value)}
           >
-            {option.label}
+            {option.hint ? (
+              <span className="sect-sort-option">
+                <span className="sect-sort-option-title">{option.label}</span>
+                <span className="sect-sort-option-hint">{option.hint}</span>
+              </span>
+            ) : option.label}
           </button>
         ))}
         {props.searchable && visibleOptions.length === 0

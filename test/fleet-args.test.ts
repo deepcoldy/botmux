@@ -18,4 +18,19 @@ describe('root fleet option parser', () => {
     expect(unknownFleetArgs(['--companion-bot', '--with-plugin'], restart)).toEqual(['--companion-bot']);
     expect(unknownFleetArgs(['--unknown'], restart)).toEqual(['--unknown']);
   });
+
+  it('accepts positional arguments up to maxPositionalArgs and channel flags', () => {
+    const update = { boolFlags: ['--canary', '--beta', '--rc', '--next', '--latest'], maxPositionalArgs: 1 };
+    expect(unknownFleetArgs([], update)).toEqual([]);
+    expect(unknownFleetArgs(['canary'], update)).toEqual([]);
+    expect(unknownFleetArgs(['@canary'], update)).toEqual([]);
+    expect(unknownFleetArgs(['--canary'], update)).toEqual([]);
+    expect(unknownFleetArgs(['--next'], update)).toEqual([]);
+    expect(unknownFleetArgs(['--latest'], update)).toEqual([]);
+    expect(unknownFleetArgs(['3.28.0'], update)).toEqual([]);
+    expect(unknownFleetArgs(['v3.28.0'], update)).toEqual([]);
+    expect(unknownFleetArgs(['canary', 'beta'], update)).toEqual(['beta']);
+    expect(unknownFleetArgs(['--check'], update)).toEqual(['--check']);
+    expect(unknownFleetArgs(['--dry-run'], update)).toEqual(['--dry-run']);
+  });
 });

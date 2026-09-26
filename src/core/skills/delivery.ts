@@ -1,6 +1,7 @@
 import type { CliAdapter } from '../../adapters/cli/types.js';
 import type { SessionSkillManifest } from './types.js';
 import { prepareClaudeSkillPlugin } from './claude-plugin-delivery.js';
+import { prepareSkillRootDelivery } from './skill-root-delivery.js';
 
 export interface PreparedSkillDelivery {
   prompt: boolean;
@@ -22,6 +23,10 @@ export function prepareSkillDelivery(
   if (adapter.skillDelivery?.nativeKind === 'claude-plugin') {
     const prepared = prepareClaudeSkillPlugin(manifest);
     return { prompt: true, pluginDir: prepared.pluginDir, readonlyRoots: [prepared.pluginDir], diagnostics: [] };
+  }
+  if (adapter.skillDelivery?.nativeKind === 'skill-root') {
+    const prepared = prepareSkillRootDelivery(manifest);
+    return { prompt: true, pluginDir: prepared.skillDir, readonlyRoots: [prepared.skillDir], diagnostics: [] };
   }
   if (requested === 'native') {
     return {

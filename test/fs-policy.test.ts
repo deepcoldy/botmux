@@ -314,6 +314,9 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/.dashboard-port').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bin/botmux').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/claude-plugin/x').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/omp-plugin/x').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/pi-skills/x').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/pi-skills/extensions/pi-turn-boundary-extension.js').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/dashboard-daemons/cli_x.json').access).toBe('readOnly'); // daemon IPC discovery
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/bots-info.json').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/bot-openids-cli_self.json').access).toBe('readOnly'); // own

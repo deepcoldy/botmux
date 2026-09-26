@@ -201,7 +201,7 @@ export default defineConfig({
   // og:title / og:description 由 rspress 按页自动生成，这里只补它不处理的
   head: [
     ['meta', { property: 'og:type', content: 'website' }],
-    ['meta', { property: 'og:url', content: 'https://github.com/deepcoldy/botmux/tree/master/docs-site/docs' }],
+    ['meta', { property: 'og:url', content: 'https://deepcoldy.github.io/botmux/' }],
     ['meta', { property: 'og:image', content: socialLogoUrl }],
     ['meta', { name: 'twitter:card', content: 'summary_large_image' }],
     ['meta', { name: 'twitter:image', content: socialLogoUrl }],
