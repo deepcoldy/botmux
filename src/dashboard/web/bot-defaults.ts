@@ -2,6 +2,7 @@ import { store } from './store.js';
 import type { CliRuntimeConfig as SharedCliRuntimeConfig } from '../../adapters/cli/runtime.js';
 import type { FeedbackPolicyLayer } from '../../services/feedback-policy-resolver.js';
 import type { ReplyStyleConfig } from '../../im/lark/reply-card-style.js';
+import type { AskOptionLayout } from '../../im/lark/ask-option-layout.js';
 import type { CodexReasoningEffort } from '../../services/codex-reasoning-effort.js';
 import type { StreamingCardButtonId } from '../../im/lark/streaming-card-buttons.js';
 
@@ -90,6 +91,8 @@ export type BotDefaultsRow = {
   brandLabel?: string | null;
   /** Sparse per-bot reply-card style override; null means all built-in defaults. */
   replyStyle?: ReplyStyleConfig | null;
+  /** Per-bot ask option layout; null means the built-in compact default. */
+  askOptionLayout?: AskOptionLayout | null;
   sandbox?: boolean;
   codexAuthSync?: 'shared' | 'isolated';
   /** Trigger-user CLI auth: null / absent = off (the historical behavior, where

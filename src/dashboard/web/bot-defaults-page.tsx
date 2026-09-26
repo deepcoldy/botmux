@@ -119,6 +119,10 @@ import {
   type ReplyTheme,
 } from '../../im/lark/reply-card-style.js';
 import {
+  ASK_OPTION_LAYOUTS,
+  type AskOptionLayout,
+} from '../../im/lark/ask-option-layout.js';
+import {
   clampUnicodeCodePoints,
   replyStyleConfigFromDraft,
   replyStyleDraftFromConfig,
@@ -1178,6 +1182,7 @@ function BotDefaultsCard(props: {
             <section className="bd-tile bd-tile-wide"><CardBehaviorSection bot={bot} putCardPref={putCardPref} /></section>
             <section className="bd-tile bd-tile-wide"><FeedbackSettingsSection bot={bot} patchBot={patchBot} active={props.activeTab === 'cards'} /></section>
             <section className="bd-tile bd-tile-wide"><ReplyStyleSection bot={bot} patchBot={patchBot} /></section>
+            <section className="bd-tile"><AskOptionLayoutSection bot={bot} patchBot={patchBot} /></section>
             <section className="bd-tile"><BrandSection bot={bot} patchBot={patchBot} /></section>
           </BdTabGrid>
         </div>
@@ -7156,6 +7161,72 @@ function RiffSection(props: { bot: BotDefaultsRow; patchBot: PatchBot; persistCl
         <StatusSpan status={status} attr={{ 'data-riff-status': '' }} />
       </div>
     </div>
+  );
+}
+
+function AskOptionLayoutSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [value, setValue] = useState<AskOptionLayout>(props.bot.askOptionLayout ?? 'compact');
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    setValue(props.bot.askOptionLayout ?? 'compact');
+    setStatus(null);
+  }, [props.bot.askOptionLayout]);
+
+  const options = ASK_OPTION_LAYOUTS.map(layout => ({
+    value: layout,
+    label: tr(`botDefaults.askOptionLayout.${layout}`),
+  }));
+
+  async function save(): Promise<void> {
+    setStatus(null);
+    setBusy(true);
+    try {
+      // 稀疏存储：compact 即缺省，写 null 让 daemon 从 bots.json 删除该键。
+      const res = await sendJson(
+        'PUT',
+        `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/ask-option-layout`,
+        { askOptionLayout: value === 'vertical' ? 'vertical' : null },
+      );
+      if (!res.ok || !res.body.ok) {
+        setStatus({ text: `✗ ${responseErrorText(res)}` });
+        return;
+      }
+      const next = (res.body.askOptionLayout ?? null) as AskOptionLayout | null;
+      setValue(next ?? 'compact');
+      props.patchBot(props.bot.larkAppId, { askOptionLayout: next });
+      setStatus({ text: `✓ ${tr('botDefaults.askOptionLayoutSaved')}`, ok: true });
+    } catch (e: any) {
+      setStatus({ text: `✗ ${caughtErrorText(e)}` });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="bd-section" aria-busy={busy}>
+      <h3 className="bd-section-title">
+        <FieldTitle help={tr('botDefaults.askOptionLayoutHelp')}>{tr('botDefaults.sectionAskOptionLayout')}</FieldTitle>
+      </h3>
+      <div className="bd-row">
+        <div className="bd-field">
+          <DropdownField<AskOptionLayout>
+            dataInput="askOptionLayout"
+            ariaLabel={tr('botDefaults.sectionAskOptionLayout')}
+            value={value}
+            disabled={busy}
+            options={options}
+            onChange={setValue}
+          />
+        </div>
+      </div>
+      <div className="actions">
+        <button type="button" className="primary" data-action="save-ask-option-layout" disabled={busy} onClick={() => void save()}>{tr('botDefaults.askOptionLayoutSave')}</button>
+        <StatusSpan status={status} attr={{ 'data-ask-option-layout-status': '' }} />
+      </div>
+    </section>
   );
 }
 

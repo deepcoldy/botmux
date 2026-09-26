@@ -45,7 +45,7 @@ describe('dashboard bot payload helpers', () => {
       'autoStartOnNewTopic',
       'summaryRange', 'summaryMemory', 'summaryMemoryPath',
       'regularGroupReplyMode', 'regularGroupMentionMode', 'docSubscribeDefaultMode',
-      'substituteMode', 'feedback', 'replyStyle',
+      'substituteMode', 'feedback', 'replyStyle', 'askOptionLayout',
       'restrictGrantCommands', 'autoGrantRequestCards', 'p2pOpen', 'grantRequestToOwnerDm',
       'grantDefaultDurationMs', 'messageQuotaDefaultLimit', 'p2pMode',
       'envelopeInjection', 'replyDelivery', 'replyDeliveryDefault', 'replyDeliverySupported', 'codexAuthSync', 'triggerUserAuth',
@@ -143,6 +143,19 @@ describe('dashboard bot payload helpers', () => {
     expect(botDefaultsPayload({ larkAppId: 'app' }, { replyStyle: 'secret-looking-invalid' }))
       .toMatchObject({ replyStyle: null });
     expect(botSummaryPayload({ larkAppId: 'app' })).not.toHaveProperty('replyStyle');
+  });
+
+  it('exposes only the normalized ask option layout in private Bot Defaults payloads', () => {
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { askOptionLayout: 'vertical' }))
+      .toMatchObject({ askOptionLayout: 'vertical' });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { askOptionLayout: 'compact' }))
+      .toMatchObject({ askOptionLayout: 'compact' });
+    // 非法手改值 fail-soft → null（compact 缺省），不原样透传给表单态
+    expect(botDefaultsPayload({ larkAppId: 'app' }, { askOptionLayout: 'secret-looking-invalid' }))
+      .toMatchObject({ askOptionLayout: null });
+    expect(botDefaultsPayload({ larkAppId: 'app' }, {}))
+      .toMatchObject({ askOptionLayout: null });
+    expect(botSummaryPayload({ larkAppId: 'app' })).not.toHaveProperty('askOptionLayout');
   });
 
   it('keeps executable runtime details out of public group roster summaries', () => {

@@ -103,6 +103,7 @@ import {
 } from './workflows/v3/daemon-ipc-auth.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { REPLY_STYLE_REQUEST_MAX_BYTES } from './dashboard/reply-style.js';
+import { ASK_OPTION_LAYOUT_REQUEST_MAX_BYTES } from './im/lark/ask-option-layout.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
 import {
   projectSessionEventForAudience,
@@ -2904,6 +2905,9 @@ async function configuredBotDefaultsRecoveryRows(
           larkBotName: persistedNames.get(bot.larkAppId) ?? null,
           quotaFallbackBot: rawEntry?.quotaFallbackBot,
           autoInviteOwnerOnGroupAdd: rawEntry?.autoInviteOwnerOnGroupAdd,
+          // 离线行也要带上磁盘里的排版配置，否则 daemon 不在线时 Dashboard
+          // 会把已配置的竖放布局显示回 compact（payload 层 fail-soft 归一化）。
+          askOptionLayout: rawEntry?.askOptionLayout,
         });
         return {
           ...payload,
@@ -7085,6 +7089,32 @@ const server = createServer(async (req, res) => {
         return;
       }
       const upstream = await proxyToDaemon(appId, `/api/bot-reply-style`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // PUT /api/bots/:appId/ask-option-layout — proxy the per-bot ask option
+    // layout to the target bot's daemon. The daemon owns validation, atomic
+    // bots.json persistence, and its in-memory config update; ask cards render
+    // in the daemon process, so the change is visible on the next card.
+    let mBotAskOptionLayout: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotAskOptionLayout = url.pathname.match(/^\/api\/bots\/([^/]+)\/ask-option-layout$/))) {
+      const appId = decodeURIComponent(mBotAskOptionLayout[1]);
+      let raw: string;
+      try {
+        raw = JSON.stringify(await readJsonBody(req, ASK_OPTION_LAYOUT_REQUEST_MAX_BYTES));
+      } catch (err) {
+        const status = err instanceof DashboardJsonBodyTooLargeError ? 413 : 400;
+        res.writeHead(status, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: status === 413 ? 'body_too_large' : 'bad_json' }));
+        return;
+      }
+      const upstream = await proxyToDaemon(appId, `/api/bot-ask-option-layout`, {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,

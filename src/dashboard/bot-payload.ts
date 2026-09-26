@@ -6,6 +6,7 @@ import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import type { CliLaunchMode } from '../core/cli-launch-mode.js';
 import { GRANT_DURATION_OPTIONS } from '../services/grant-policy.js';
 import { normalizeSparseReplyStyleConfig } from './reply-style.js';
+import { normalizeAskOptionLayout } from '../im/lark/ask-option-layout.js';
 import { parseTriggerUserAuthConfig, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import type { NativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
 import { normalizeQuotaFallbackBotConfig } from '../services/quota-fallback.js';
@@ -125,6 +126,8 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     // Private Bot Defaults payload only. Keep the persisted shape sparse and
     // drop malformed hand edits field-by-field before they reach form state.
     replyStyle: normalizeSparseReplyStyleConfig(j?.replyStyle).config ?? null,
+    // 同上：非法手改值 fail-soft 丢掉，缺省（compact）以 null 表达。
+    askOptionLayout: normalizeAskOptionLayout(j?.askOptionLayout).layout ?? null,
     sandbox: j?.sandbox === true,
     sandboxPaths: (j?.sandboxPaths && typeof j.sandboxPaths === 'object' && !Array.isArray(j.sandboxPaths))
       ? {
