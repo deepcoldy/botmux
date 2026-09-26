@@ -5,6 +5,9 @@
  * spinning up an HTTP server, registering bots, or mounting a full session map.
  */
 
+import type { ServerResponse } from 'node:http';
+import { registerAsk } from './ask-broker.js';
+import type { CreateAskInput, AskResult } from './ask-types.js';
 import type { AskOption, AskQuestion } from './ask-types.js';
 
 export interface AskApiBody {
@@ -156,4 +159,21 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     ...(requestId !== undefined ? { requestId } : {}),
     ...(originKind !== undefined ? { originKind } : {}),
   };
+}
+
+/** The response, not IncomingMessage.close, tracks the long-poll lifetime:
+ * a fully read POST body may close while the client is still waiting. */
+export async function registerAskForResponse(
+  input: CreateAskInput,
+  res: ServerResponse,
+): Promise<AskResult> {
+  const controller = new AbortController();
+  const onClose = () => { controller.abort(); };
+  res.once('close', onClose);
+  if (res.destroyed) controller.abort();
+  try {
+    return await registerAsk(input, controller.signal);
+  } finally {
+    res.off('close', onClose);
+  }
 }

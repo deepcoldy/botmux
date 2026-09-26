@@ -121,15 +121,15 @@ describe('daemon session-scoped IPC route wiring', () => {
       "ipcRoute('POST', '/api/attention'",
     );
     const bindAt = route.indexOf('boundAsk = bindSessionScopedIpcIdentity(');
-    const registerAt = route.indexOf('registerAskBroker({');
+    const registerAt = route.indexOf('registerAskForResponse({');
     expect(bindAt).toBeGreaterThanOrEqual(0);
     expect(registerAt).toBeGreaterThan(bindAt);
     expect(route).toContain('const askChatType = askSession?.chatType;');
     expect(route).toMatch(
-      /registerAskBroker\(\{\s*larkAppId: boundAsk\.larkAppId,[\s\S]*chatType: askChatType,/,
+      /registerAskForResponse\(\{\s*larkAppId: boundAsk\.larkAppId,[\s\S]*chatType: askChatType,/,
     );
     expect(route).not.toMatch(
-      /registerAskBroker\(\{\s*larkAppId: parsed\.larkAppId,/,
+      /registerAskForResponse\(\{\s*larkAppId: parsed\.larkAppId,/,
     );
   });
 
