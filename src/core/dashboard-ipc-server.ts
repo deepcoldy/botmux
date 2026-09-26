@@ -59,6 +59,7 @@ import { createGroupWithBots, transferGroupOwner } from '../services/group-creat
 import * as oncallStore from '../services/oncall-store.js';
 import * as brandStore from '../services/brand-store.js';
 import * as sandboxStore from '../services/sandbox-store.js';
+import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
 import * as backendTypeStore from '../services/backend-type-store.js';
 import { setGroupSerialInput } from '../services/group-serial-input-store.js';
 import { parseGroupSerialInput } from './group-serial-input.js';
@@ -6205,6 +6206,11 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     brandLabel: brandStore.getBotBrandLabel(cachedLarkAppId) ?? null,
     replyStyle,
     sandbox: sandboxStore.getBotSandbox(cachedLarkAppId),
+    sandboxMode: sandboxStore.getBotSandboxMode(cachedLarkAppId),
+    scratchStorage: (() => { try { return getBot(cachedLarkAppId).config.scratchStorage ?? null; } catch { return null; } })(),
+    scratchTmpfsSizeMb: (() => { try { return getBot(cachedLarkAppId).config.scratchTmpfsSizeMb ?? null; } catch { return null; } })(),
+    scratchDenyPaths: (() => { try { return getBot(cachedLarkAppId).config.scratchDenyPaths ?? null; } catch { return null; } })(),
+    scratchSupported: process.platform === 'linux' || process.platform === 'darwin',
     codexAuthSync,
     sandboxPaths: sandboxStore.getBotSandboxPaths(cachedLarkAppId) ?? null,
     readIsolation: sandboxStore.getBotReadIsolation(cachedLarkAppId),
@@ -6404,7 +6410,7 @@ ipcRoute('PUT', '/api/bot-card-prefs', async (req, res) => {
       if (config.cliId !== 'codex-app') {
         return jsonRes(res, 400, { ok: false, error: 'codex_browser_requires_codex_app' });
       }
-      if (config.existingAppServer || config.sandbox === true || config.readIsolation === true) {
+      if (config.existingAppServer || sandboxBoolValue(config.sandbox) || config.readIsolation === true) {
         return jsonRes(res, 409, { ok: false, error: 'codex_browser_config_conflict' });
       }
     }
@@ -7020,7 +7026,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       nextModelBackendVariant?: 'standard' | 'max';
       nextNativeSubagentRuntimeState?: NativeSubagentRuntimeConfigState;
     }>(larkAppId, (entry) => {
-      if (selected.cliLaunchMode && (entry.sandbox === true || entry.readIsolation === true)) {
+      if (selected.cliLaunchMode && (sandboxBoolValue(entry.sandbox) || entry.readIsolation === true)) {
         return { write: false, result: { error: 'launch_mode_sandbox_conflict' } };
       }
       const storedModelBackendVariant = entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max'
@@ -7690,9 +7696,11 @@ ipcRoute('GET', '/api/bot-trigger-user-auth-status', async (_req, res) => {
     const cfg = getBot(cachedLarkAppId).config;
     const policy = cfg.triggerUserAuth ?? null;
     const authorizedCount = listAuthorizedUsers(cfg.larkAppId, normalizeBrand(cfg.brand)).length;
-    // Sandbox is what makes the isolation OS-enforced; without it the agent runs
-    // as the same OS user as botmux and can read other people's token files.
-    const protection = tokenStoreProtection(cfg.sandbox === true);
+    // Oncall (legacy true) provides the OS-enforced credential boundary that
+    // makes other people's token files unreadable. scratch is NOT counted here:
+    // it is write-integrity COW, not a read/credential boundary, so the agent
+    // can still read shared token stores.
+    const protection = tokenStoreProtection(cfg.sandbox === true || cfg.sandbox === 'oncall');
     const mcpAdvisory = credentialBearingMcpAdvisory(scanCredentialBearingMcpServers());
     jsonRes(res, 200, {
       ok: true,
@@ -7873,35 +7881,81 @@ ipcRoute('PUT', '/api/bot-skills', async (req, res) => {
   jsonRes(res, 200, { ok: true, skills: getBot(cachedLarkAppId).config.skills ?? null });
 });
 
-// Per-bot file-sandbox toggle. Body `{ enabled: boolean }`. When on, this bot's
-// CLI sessions run inside a per-session bwrap file sandbox (Linux). For oncall
-// bots shared with semi-trusted users.
+// Per-bot file-sandbox selection. Body either:
+//   { enabled: boolean }                 — legacy toggle (true = oncall)
+//   { mode: 'off'|'oncall'|'scratch',    — tri-state + scratch sub-options
+//     scratchStorage?, scratchTmpfsSizeMb?, scratchDenyPaths? }
+// oncall = per-session bwrap/Seatbelt whitelist for bots shared with
+// semi-trusted users; scratch = Linux-only full-root COW throwaway sandbox for
+// the owner's own disposable experiments.
 ipcRoute('PUT', '/api/bot-sandbox', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
-  let body: { enabled?: unknown };
-  try { body = await readJsonBody<{ enabled?: unknown }>(req); }
+  let body: { enabled?: unknown; mode?: unknown; scratchStorage?: unknown; scratchTmpfsSizeMb?: unknown; scratchDenyPaths?: unknown };
+  try { body = await readJsonBody<typeof body>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
-  if (body.enabled === true) {
+
+  let mode: 'off' | 'oncall' | 'scratch';
+  if (typeof body.mode === 'string') {
+    if (body.mode !== 'off' && body.mode !== 'oncall' && body.mode !== 'scratch') {
+      return jsonRes(res, 400, { ok: false, error: 'bad_sandbox_mode' });
+    }
+    mode = body.mode;
+  } else {
+    mode = body.enabled === true ? 'oncall' : 'off';
+  }
+  if (mode === 'scratch' && process.platform !== 'linux' && process.platform !== 'darwin') {
+    return jsonRes(res, 400, {
+      ok: false,
+      error: 'scratch_platform_unsupported',
+      message: 'scratch 沙盒仅支持 Linux 与 macOS。',
+    });
+  }
+  if (mode !== 'off') {
     try {
-      if (getBot(cachedLarkAppId).config.cliLaunchMode === 'forge-traex') {
+      const cfg = getBot(cachedLarkAppId).config;
+      if (cfg.cliLaunchMode === 'forge-traex') {
         return jsonRes(res, 400, {
           ok: false,
           error: 'launch_mode_sandbox_conflict',
           message: 'Forge x TraeX 暂不支持文件沙盒。',
         });
       }
+      // codexBrowser / existingAppServer conflicts are enforced by the shared
+      // bot-config invariants on the bots.json WRITE below, which return the
+      // canonical 409 reason (same contract as the legacy boolean toggle).
     } catch { /* Let the store return the canonical config error below. */ }
   }
+
+  let scratch: { storage?: 'tmpfs' | 'disk'; tmpfsSizeMb?: number; denyPaths?: string[] } | undefined;
+  if (mode === 'scratch') {
+    if (body.scratchStorage !== undefined && body.scratchStorage !== 'tmpfs' && body.scratchStorage !== 'disk') {
+      return jsonRes(res, 400, { ok: false, error: 'bad_scratch_storage' });
+    }
+    if (body.scratchTmpfsSizeMb !== undefined
+      && (typeof body.scratchTmpfsSizeMb !== 'number' || body.scratchTmpfsSizeMb <= 0)) {
+      return jsonRes(res, 400, { ok: false, error: 'bad_scratch_tmpfs_size' });
+    }
+    if (body.scratchDenyPaths !== undefined
+      && (!Array.isArray(body.scratchDenyPaths) || body.scratchDenyPaths.some(x => typeof x !== 'string'))) {
+      return jsonRes(res, 400, { ok: false, error: 'bad_scratch_deny_paths' });
+    }
+    scratch = {
+      storage: body.scratchStorage as 'tmpfs' | 'disk' | undefined,
+      tmpfsSizeMb: body.scratchTmpfsSizeMb as number | undefined,
+      denyPaths: body.scratchDenyPaths as string[] | undefined,
+    };
+  }
+
   // File-sandbox policy is frozen onto each Session at creation and reused on
-  // restore; this toggle is intentionally next-session-only and cannot mutate
-  // a live pane's profile.
-  const r = await sandboxStore.updateBotSandbox(cachedLarkAppId, body.enabled === true);
+  // restore; this selection is intentionally next-session-only and cannot
+  // mutate a live pane's profile.
+  const r = await sandboxStore.updateBotSandboxMode(cachedLarkAppId, mode, scratch);
   if (!r.ok) {
     const status = r.reason === 'codex_browser_config_conflict'
       || r.reason === 'existing_app_server_sandbox_conflict' ? 409 : 400;
     return jsonRes(res, status, { ok: false, error: r.reason });
   }
-  jsonRes(res, 200, { ok: true, sandbox: r.sandbox });
+  jsonRes(res, 200, { ok: true, sandbox: r.sandbox !== 'off', mode: r.sandbox });
 });
 
 // Per-bot sandboxPaths (three-tier whitelist: readWrite / readOnly / deny).

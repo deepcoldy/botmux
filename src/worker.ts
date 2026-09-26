@@ -305,7 +305,7 @@ import {
 } from './core/session-discovery.js';
 import { CODEX_RPC_TERMINAL_HYDRATION_DELAYS_MS, RpcEngagementFence, codexRpcEligible, paneRunsRemoteTui, orchestrateCodexRpcInit, rolloutUserTurnMatches, decideStartupDialogAction, shouldQueueInitialPrompt, shouldPreMarkFirstTurn, killAndVerifyPersistentPane, rpcTranscriptIngestBlockedByAwaitingActivation, type EngageOutcome } from './codex-rpc-lifecycle.js';
 import { delay } from './utils/timing.js';
-import { claudeJsonlPathForSession, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
+import { claudeJsonlPathForSession, resolveClaudeJsonlPath, resolveJsonlFromPid, findOpenClaudeSessionIds, syncClaudeResumeTargetToCwd, resolveShadowedStatusLine, DEFAULT_CLAUDE_DATA_DIR } from './adapters/cli/claude-code.js';
 import { sessionReadyHookCommand } from './adapters/hook-command.js';
 import { statuslineDir } from './services/statusline-snapshot.js';
 import { mtrSessionIdForBotmuxSession } from './adapters/cli/mtr.js';
@@ -369,6 +369,19 @@ import {
   sandboxEnabled,
   localSandboxApplies,
 } from './adapters/backend/sandbox.js';
+import {
+  prepareScratchSandbox,
+  attachScratchSession,
+  scratchHostView,
+  type ScratchStorage,
+} from './adapters/backend/scratch-sandbox.js';
+import {
+  prepareMacScratchSandbox,
+  attachMacScratchSession,
+} from './adapters/backend/scratch-sandbox-darwin.js';
+import { enumerateScratchSecretPaths } from './adapters/backend/scratch-credentials.js';
+import { resolveSandboxMode } from './adapters/cli/sandbox-mode.js';
+import { registerScratchView, scratchViewPath, scratchLinuxMappings, type ScratchPathMapping } from './services/scratch-host-view.js';
 import {
   DEVICE_AUTHORITY_DIRECTORY,
   DEVICE_CREDENTIAL_FILE,
@@ -14317,17 +14330,33 @@ async function spawnCli(
       : undefined,
   );
   const riffRemoteBackend = remoteBackendFullyOffBox;
-  if (riffRemoteBackend && (cfg.sandbox === true || cfg.readIsolation === true)) {
-    log(`Sandbox flag set but backend is ${effectiveBackendType} (remote sandbox, no local process) — local sandbox bypassed`);
+  // Resolve the tri-state once: 'off' | 'oncall' (fs-policy whitelist) |
+  // 'scratch' (full-root COW, adapters/backend/scratch-sandbox.ts). The env
+  // override is the operator's global force switch; legacy readIsolation
+  // implies oncall.
+  const sandboxMode = !riffRemoteBackend
+    ? resolveSandboxMode({
+      configSandbox: cfg.sandbox,
+      readIsolation: cfg.readIsolation === true,
+      envValue: process.env.BOTMUX_SANDBOX,
+    })
+    : 'off' as const;
+  if (riffRemoteBackend && sandboxMode !== 'off') {
+    log(`Sandbox flag set (${sandboxMode}) but backend is ${effectiveBackendType} (remote sandbox, no local process) — local sandbox bypassed`);
   }
-  if (effectiveBackendType === 'mojo' && !remoteBackendFullyOffBox
-      && (cfg.sandbox === true || cfg.readIsolation === true)) {
+  if (effectiveBackendType === 'mojo' && !remoteBackendFullyOffBox && sandboxMode !== 'off') {
     // Loud on purpose: this is the combination where a mojo bot DOES execute
     // locally, so the local sandbox stays on rather than being skipped.
     log('mojo runs tools locally (cloud not enabled, or localDaemon set) — keeping the local sandbox engaged');
   }
-  const sandboxRequested = !riffRemoteBackend
-    && (cfg.sandbox === true || cfg.readIsolation === true || sandboxEnabled());
+  const scratchRequested = sandboxMode === 'scratch';
+  const sandboxRequested = sandboxMode !== 'off';
+  if (scratchRequested && process.platform !== 'linux' && process.platform !== 'darwin') {
+    throw new Error('sandbox "scratch" is supported only on Linux (full-root COW overlay) and macOS (APFS clonefile); use "oncall" or turn the sandbox off');
+  }
+  if (scratchRequested && cfg.readIsolation === true) {
+    throw new Error('sandbox "scratch" cannot be combined with the legacy readIsolation flag');
+  }
   if (cfg.cliLaunchMode === 'forge-traex' && sandboxRequested) {
     throw new Error('Forge x TraeX does not support sandbox/readIsolation yet');
   }
@@ -14499,7 +14528,12 @@ async function spawnCli(
   // the redirect (and its env) can't be guaranteed there → not redirected.
   const legacyHomePolicy = !cfg.cliInstanceBinding || cfg.cliInstanceBinding.source === 'legacy';
   const isolatedCodexHomeRequested = legacyHomePolicy && cfg.cliId === 'codex' && cfg.codexAuthSync === 'isolated';
-  const willRedirectCliData = legacyHomePolicy && shouldRedirectCliData({
+  // scratch deliberately reads the CLI's NATIVE ~/.claude/~/.codex (zero-config
+  // is the mode's point); the oncall BOT_HOME redirect does not apply there.
+  if (scratchRequested && isolatedCodexHomeRequested) {
+    throw new Error('codexAuthSync "isolated" cannot be combined with sandbox "scratch" (scratch uses the native CLI home)');
+  }
+  const willRedirectCliData = !scratchRequested && legacyHomePolicy && shouldRedirectCliData({
     sandboxRequested,
     forcePerBotHome: isolatedCodexHomeRequested,
     supportsReadIsolation: cliAdapter.supportsReadIsolation === true,
@@ -15846,7 +15880,8 @@ async function spawnCli(
   // Three-tier deny-by-default whitelist compiled to Seatbelt (darwin) or bwrap
   // (linux). Cross-bot read isolation is inherent (siblings' data simply isn't
   // exposed) — no enumeration, no deny-list to keep in sync.
-  if (sandboxRequested) {
+  // SCRATCH (Linux only) branches to its own full-root COW setup BELOW.
+  if (sandboxRequested && !scratchRequested) {
     const dataDir = process.env.SESSION_DATA_DIR;
     // FAIL-SAFE (not fail-open): a requested sandbox that can't be established
     // must be a HARD ERROR, never a silent unconfined run.
@@ -16432,6 +16467,199 @@ async function spawnCli(
       log(`Sandbox ON (${cfg.cliId}, fs-policy ${policy.rules.length} rules): outbox=${sbx.outbox}`);
     }
   }
+
+  // ── SCRATCH sandbox: full-root COW overlay (Linux) ──
+  // The CLI sees the whole real fs; every write copy-ups into a throwaway
+  // upper. No FsPolicy, no BOT_HOME redirect (native CLI data dirs), but the
+  // same outbox relay / seccomp marker / credential masks. Host-side readers of
+  // CLI-written files must go through the scratch path mappings (Linux merged
+  // root, macOS clone trees).
+  let scratchMergedHost: string | undefined;
+  let scratchMappings: import('./services/scratch-host-view.js').ScratchPathMapping[] | undefined;
+  /** The clone HOME the worker points its own transcript readers at (both
+   *  platforms; on Linux equals scratchMergedHost + real $HOME). */
+  let scratchHostHome: string | undefined;
+  /** In-sandbox cwd: on macOS the clone path (project key differs from host);
+   *  undefined on Linux where the in-container cwd path == the host path. */
+  let scratchChdirInSandbox: string | undefined;
+  /** NATIVE host codex/trae home for the prepare-time child env force. */
+  let scratchNativeCodexHome: string | undefined;
+  let scratchNativeTraeHome: string | undefined;
+  if (scratchRequested) {
+    const scratchDataDir = process.env.SESSION_DATA_DIR;
+    if (!scratchDataDir) {
+      throw new Error('Sandbox ENABLED (scratch) but SESSION_DATA_DIR is unset — aborting spawn to avoid an unsandboxed run');
+    }
+    if (effectiveBackendType !== 'pty' && effectiveBackendType !== 'tmux') {
+      const msg = `Sandbox ENABLED (scratch) but backend "${effectiveBackendType}" is not sandboxable (only pty/tmux) — aborting spawn`;
+      log(msg);
+      throw new Error(msg);
+    }
+    const scratchCanonical = (p: string) => { try { return realpathSync(p); } catch { return p; } };
+    const scratchHome = scratchCanonical(homedir());
+    // NATIVE host CLI-home values the child must keep seeing (captured before
+    // the worker repoints its own copies at the merged tree below).
+    const nativeCodexHome = process.env.CODEX_HOME?.trim() || join(homedir(), '.codex');
+    const nativeTraeHome = process.env.TRAE_HOME?.trim() || undefined;
+
+    // Fixed transport-credential masks (bots.json + sidecars, dashboard
+    // secret, …) + the per-session sandbox tree itself, plus user denies.
+    const credentialRules = buildCredentialIsolationRules({
+      homeDir: scratchHome,
+      botmuxHome: scratchCanonical(configuredBotmuxHome),
+      defaultBotmuxHome: scratchCanonical(defaultBotmuxHome),
+    });
+    // Complete transport-credential mask. NOT just device files: enumerate
+    // bots.json + sidecars, dashboard secret, per-bot send-cred.json, webhook
+    // keys, external BOTS_CONFIG and the shared lark-cli keystore from the
+    // on-disk layout — a hand-built list once drifted and left bots.json
+    // readable inside scratch (PR #1513 review).
+    const scratchSecrets = enumerateScratchSecretPaths({
+      botmuxHomes: [...new Set([defaultBotmuxHome, configuredBotmuxHome])].map(scratchCanonical),
+      dataDirs: [scratchDataDir].map(scratchCanonical),
+      botsConfigPath: cfg.loadedBotsConfigPath ? scratchCanonical(cfg.loadedBotsConfigPath) : undefined,
+      sessionId: cfg.sessionId,
+    });
+    const scratchDeny = [...new Set<string>([
+      ...credentialRules.denyPaths.map(scratchCanonical),
+      ...scratchSecrets.denyPaths,
+      join(scratchCanonical(scratchDataDir), 'sandboxes', cfg.sessionId),
+      ...(cfg.scratchDenyPaths ?? [])
+        .filter((p): p is string => typeof p === 'string' && !!p)
+        .map(p => scratchCanonical(p.replace(/^~(?=\/|$)/, scratchHome))),
+    ])];
+    // This session's own trigger-user identity files (under the sealed
+    // cli-identity dir) must stay readable for the governed CLI / relay.
+    const scratchReadOnlyCarves = scratchSecrets.readOnlyCarvePaths.map(scratchCanonical);
+
+    scratchNativeCodexHome = nativeCodexHome;
+    scratchNativeTraeHome = nativeTraeHome;
+
+    if (willReattachPersistent) {
+      // Live pane across a daemon restart: the overlay/clone + pane survive;
+      // only re-wire the outbox watcher. Never remount/re-clone here.
+      if (process.platform === 'darwin') {
+        const att = attachMacScratchSession({ sessionId: cfg.sessionId, dataDir: scratchDataDir });
+        if (att) {
+          if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+          sandboxCleanup = att.cleanup;
+          sandboxRelayOutbox = att.outbox;
+          scratchMappings = att.mappings;
+          scratchHostHome = att.clonedHome;
+          scratchChdirInSandbox = att.chdirInSandbox;
+          sandboxStopWatcher = startOutboxWatcher(
+            att.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
+          );
+          publishSandboxRelayCapability();
+          log(`Scratch(mac) REATTACH (${cfg.cliId}): live pane kept, outbox=${att.outbox}`);
+        } else {
+          log(`Scratch(mac) REATTACH (${cfg.cliId}): no clone found — reattaching live pane as-is`);
+        }
+      } else {
+        const att = attachScratchSession({ sessionId: cfg.sessionId, dataDir: scratchDataDir });
+        if (att) {
+          if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+          sandboxCleanup = att.cleanup;
+          sandboxRelayOutbox = att.outbox;
+          scratchMergedHost = att.mergedHostPath;
+          scratchMappings = scratchLinuxMappings(att.mergedHostPath);
+          scratchHostHome = scratchHostView(att.mergedHostPath, scratchHome);
+          sandboxStopWatcher = startOutboxWatcher(
+            att.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
+          );
+          publishSandboxRelayCapability();
+          log(`Scratch REATTACH (${cfg.cliId}): live pane kept, outbox=${att.outbox}`);
+        } else {
+          log(`Scratch REATTACH (${cfg.cliId}): no scratch tree found — reattaching live pane as-is`);
+        }
+      }
+    } else if (process.platform === 'darwin') {
+      // ── macOS: APFS clonefile COW clone + Seatbelt ──
+      const sbx = prepareMacScratchSandbox({
+        sessionId: cfg.sessionId,
+        dataDir: scratchDataDir,
+        chdir: cfg.workingDir,
+        home: scratchHome,
+        cliBin: cliAdapter.resolvedBin,
+        cliArgs: args,
+        denyPaths: scratchDeny,
+        mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
+        net: cfg.sandboxNetwork !== false,
+      });
+      if (!sbx) {
+        throw new Error('scratch sandbox (macOS) could not be established (clonefile/Seatbelt setup failed; check same-volume and free space) — aborting, never bare-running');
+      }
+      spawnBin = sbx.bin;
+      spawnArgs = sbx.args;
+      Object.assign(childEnv, sbx.env);
+      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
+      sandboxCleanup = sbx.cleanup;
+      sandboxRelayOutbox = sbx.outbox;
+      scratchMappings = sbx.mappings;
+      scratchHostHome = sbx.clonedHome;
+      scratchChdirInSandbox = sbx.chdirInSandbox;
+      spawnCwd = sbx.chdirInSandbox;
+      sandboxStopWatcher = startOutboxWatcher(
+        sbx.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
+      );
+      publishSandboxRelayCapability();
+      log(`Sandbox ON (${cfg.cliId}, scratch APFS clone): home=${sbx.clonedHome} outbox=${sbx.outbox}`);
+    } else {
+      // ── Linux: full-root COW overlay ──
+      const storage: ScratchStorage = cfg.scratchStorage === 'disk' ? 'disk' : 'tmpfs';
+      const sbx = prepareScratchSandbox({
+        sessionId: cfg.sessionId,
+        dataDir: scratchDataDir,
+        storage,
+        tmpfsSizeMb: cfg.scratchTmpfsSizeMb,
+        net: cfg.sandboxNetwork !== false,
+        chdir: cfg.workingDir,
+        home: scratchHome,
+        cliBin: cliAdapter.resolvedBin,
+        cliArgs: args,
+        denyPaths: scratchDeny,
+        shimBindTargets: [defaultGatewayEntry().command],
+        mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
+        childEnvForce: { CODEX_HOME: nativeCodexHome, TRAE_HOME: nativeTraeHome },
+        readOnlyCarvePaths: scratchReadOnlyCarves,
+      });
+      if (!sbx) {
+        throw new Error('scratch sandbox requested but could not be established (overlay/bwrap setup failed, or the tmpfs upper was lost in a reboot) — start a new session; never bare-running');
+      }
+      spawnBin = sbx.bin;
+      spawnArgs = sbx.args;
+      Object.assign(childEnv, sbx.env);
+      if (sandboxStopWatcher) { try { sandboxStopWatcher(); } catch { /* */ } }
+      if (sandboxCleanup) { try { sandboxCleanup(); } catch { /* */ } }
+      sandboxCleanup = sbx.cleanup;
+      sandboxRelayOutbox = sbx.outbox;
+      scratchMergedHost = sbx.mergedHostPath;
+      scratchMappings = scratchLinuxMappings(sbx.mergedHostPath);
+      scratchHostHome = scratchHostView(sbx.mergedHostPath, scratchHome);
+      sandboxStopWatcher = startOutboxWatcher(
+        sbx.outbox, childEnv, cfg.sessionId, { authorize: authorizeManagedSend },
+      );
+      publishSandboxRelayCapability();
+      log(`Sandbox ON (${cfg.cliId}, scratch full-root COW, ${storage}): merged=${sbx.mergedHostPath} outbox=${sbx.outbox}`);
+    }
+    // Host-side reads of CLI-written files (transcript bridge, rollouts, cwd
+    // products) resolve through the scratch mappings for this spawn.
+    registerScratchView(cfg.sessionId, scratchMappings);
+    if (scratchMappings && scratchHostHome) {
+      // The worker is a PER-SESSION process, so repointing these env vars here
+      // only affects THIS session's transcript finders (codex/traex honor them
+      // dynamically). The sandboxed child got its OWN values: on Linux the
+      // native homes forced back via childEnvForce; on macOS the prepare module
+      // sets HOME (and we derive the cloned codex/trae homes below).
+      const hostView = (hostPath: string): string => scratchViewPath(scratchMappings, hostPath);
+      process.env.CODEX_HOME = hostView(scratchNativeCodexHome!);
+      process.env.TRAE_HOME = hostView(scratchNativeTraeHome ?? join(homedir(), '.trae'));
+      // CLAUDE_CONFIG_DIR is deliberately NOT set: the claude bridge receives
+      // the remapped data dir explicitly at the bridge site below.
+    }
+  }
+
   // Fresh spawn on a persistent backend: write a PENDING generation proof BEFORE
   // the pane is created, then COMMIT it after spawn only once the fresh generation
   // is attributably established (see the post-spawn commit below). pty needs no
@@ -17240,12 +17468,23 @@ async function spawnCli(
   // fallbacks that fire for non-Claude CLIs (below).
   if (claudeDataDir && effectiveAdapterSessionId) {
     const claudeBridgeSessionId = effectiveCliSessionId ?? effectiveAdapterSessionId;
-    const claudeJsonl = claudeJsonlPathForSession(claudeBridgeSessionId, cfg.workingDir, claudeDataDir);
+    // Scratch: Claude writes into its NATIVE ~/.claude inside the COW view; the
+    // host-side bridge tails the same subtree THROUGH the merged root.
+    const bridgeClaudeDataDir = scratchMappings
+      ? scratchViewPath(scratchMappings, claudeDataDir)
+      : claudeDataDir;
+    // On macOS the clone cwd is a different path and Claude keys its project
+    // dir by the realpath of ITS cwd; Linux keeps the identical path. Resolve
+    // via the glob-aware helper so a long (>200-char) truncated+hashed project
+    // slug still points at the real jsonl (falls back to the slug path).
+    const bridgeCwd = scratchChdirInSandbox ?? cfg.workingDir;
+    const claudeJsonl = resolveClaudeJsonlPath(claudeBridgeSessionId, bridgeCwd, bridgeClaudeDataDir)
+      ?? claudeJsonlPathForSession(claudeBridgeSessionId, bridgeCwd, bridgeClaudeDataDir);
     startBridgeWatcher(claudeJsonl, {
       cliPid: cliPid ?? undefined,
-      cliCwd: cfg.workingDir,
+      cliCwd: bridgeCwd,
       mode: effectiveResume ? 'baseline-existing' : 'fresh-empty',
-      dataDir: claudeDataDir,
+      dataDir: bridgeClaudeDataDir,
     });
   }
 

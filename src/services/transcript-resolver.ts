@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, realpathSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { homedir } from 'node:os';
 import type { CliId } from '../adapters/cli/types.js';
@@ -8,6 +8,8 @@ import { expandHome } from '../core/working-dir.js';
 import { findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId } from './codex-transcript.js';
 import { codexHome as configuredCodexHome } from './codex-paths.js';
 import { getSession } from './session-store.js';
+import { config } from '../config.js';
+import { scratchViewPath, persistedScratchMappings, type ScratchPathMapping } from './scratch-host-view.js';
 import { cocoEventsPathForSession } from './coco-transcript.js';
 import { findCursorTranscriptByChatId } from './cursor-transcript.js';
 import { findTraexRolloutBySessionId, findTraexSessionIdByBotmuxSessionId } from './traex-transcript.js';
@@ -82,6 +84,23 @@ function realCwd(cwd: string): string {
   try { return realpathSync(expanded); } catch { return resolve(expanded); }
 }
 
+/** Claude truncates a long (over 200-char) project slug and appends an opaque
+ *  6-char hash suffix (custom algorithm, non-reproducible). For a KNOWN
+ *  session id locate the jsonl by globbing the truncated project prefix plus
+ *  the session UUID file name — collision-free regardless of the hash. */
+function findClaudeJsonlByGlob(projectsDir: string, slug: string, sessionId: string): string | null {
+  if (slug.length <= 200) return null;
+  const prefix = slug.slice(0, 200);
+  let entries: string[];
+  try { entries = readdirSync(projectsDir); } catch { return null; }
+  const target = `${sessionId}.jsonl`;
+  const hits = entries
+    .filter(name => name === prefix || name.startsWith(`${prefix}-`))
+    .map(name => join(projectsDir, name, target))
+    .filter(p => existsSync(p));
+  return hits.length === 1 ? hits[0]! : null;
+}
+
 export function getClaudeSessionJsonlPath(
   sessionId: string,
   cwd: string,
@@ -98,13 +117,22 @@ export function getClaudeSessionJsonlPath(
   const projectsDir = join(dataDir, 'projects');
   const projectDir = join(projectsDir, projectKey);
   const jsonlPath = join(projectDir, `${sessionId}.jsonl`);
-  if (!opts?.noFollow) return existsSync(jsonlPath) ? jsonlPath : null;
-  return isDirectoryNoFollow(dataDir)
+  if (!opts?.noFollow) {
+    if (existsSync(jsonlPath)) return jsonlPath;
+    return findClaudeJsonlByGlob(projectsDir, projectKey, sessionId);
+  }
+  if (isDirectoryNoFollow(dataDir)
     && isDirectoryNoFollow(projectsDir)
     && isDirectoryNoFollow(projectDir)
-    && regularFileMtime(jsonlPath) !== null
-    ? jsonlPath
-    : null;
+    && regularFileMtime(jsonlPath) !== null) {
+    return jsonlPath;
+  }
+  // Long-slug truncated project dir: regularFileMtime on the exact path misses.
+  if (isDirectoryNoFollow(projectsDir)) {
+    const globbed = findClaudeJsonlByGlob(projectsDir, projectKey, sessionId);
+    if (globbed && regularFileMtime(globbed) !== null) return globbed;
+  }
+  return null;
 }
 
 /** Resolve a Claude-family fork's (seed / relay) data root EXACTLY as the worker
@@ -275,20 +303,67 @@ export function cliSupportsNativeUsage(cliId: string | undefined): boolean {
   return !!cliId && USAGE_RESOLVABLE_CLI_IDS.has(cliId);
 }
 
+const foundWrap = (found: string | null | undefined, v: (p: string) => string): string | null =>
+  found ? v(found) : null;
+
+/** Scratch sessions write CLI transcripts inside the per-session merged
+ *  overlay; the host-global roots (~/.claude, ~/.codex, …) only hold the
+ *  lower (pre-session) files. Returns the merged root for a frozen scratch
+ *  session, else undefined (real-host paths apply). */
+/**
+ * Loads the scratch path MAPPINGS for a frozen scratch session — one
+ * full-root entry on Linux (`/ → merged`), HOME (+project) clone entries on
+ * macOS. Returns undefined for a non-scratch / unreadable session (callers
+ * then use real-host paths — fail open). Never falls back to real paths for a
+ * covered-but-absent clone: the mapping still rewrites and reads get ENOENT.
+ */
+function sessionScratchMappings(q: TranscriptPathQuery): ScratchPathMapping[] | undefined {
+  let session;
+  try { session = getSession(q.sessionId); } catch { return undefined; }
+  if (session?.sandbox !== 'scratch') return undefined;
+  try {
+    return persistedScratchMappings(config.session.dataDir, q.sessionId);
+  } catch {
+    return undefined;
+  }
+}
+
 export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTranscriptPath | null {
   const sid = q.cliSessionId || q.sessionId;
+  // Scratch: every host-derived root below is read through the per-session
+  // merged overlay (Linux) or clone tree (macOS). Never read the real lower
+  // transcript for a scratch session (it belongs to a different state).
+  const svMappings = sessionScratchMappings(q);
+  const v = (hostPath: string): string => scratchViewPath(svMappings, hostPath);
   switch (q.cliId) {
     case 'claude-code': {
-      const path = claudeJsonlWithBotHomeFallback(sid, q, join(homedir(), '.claude'));
+      const homeRoot = v(join(homedir(), '.claude'));
+      // cwd must be remapped too: on macOS Claude runs with the CLONE path as
+      // cwd and keys its project dir by that slug; passing the host cwd here
+      // yields a slug that never matches. (Linux identity-maps, so v() is a
+      // no-op there.)
+      const scratchCwd = svMappings && q.cwd ? v(q.cwd) : q.cwd;
+      const sq: TranscriptPathQuery = scratchCwd === q.cwd ? q : { ...q, cwd: scratchCwd };
+      const path = svMappings
+        ? (scratchCwd ? getClaudeSessionJsonlPath(sid, scratchCwd, homeRoot) : null)
+        : claudeJsonlWithBotHomeFallback(sid, sq, join(homedir(), '.claude'));
       return path ? { path, kind: 'claude' } : null;
     }
     case 'aiden': {
-      const path = claudeJsonlWithBotHomeFallback(sid, q, join(homedir(), '.claude'));
+      const homeRoot = v(join(homedir(), '.claude'));
+      const scratchCwd = svMappings && q.cwd ? v(q.cwd) : q.cwd;
+      const sq: TranscriptPathQuery = scratchCwd === q.cwd ? q : { ...q, cwd: scratchCwd };
+      const path = svMappings
+        ? (scratchCwd ? getClaudeSessionJsonlPath(sid, scratchCwd, homeRoot) : null)
+        : claudeJsonlWithBotHomeFallback(sid, sq, join(homedir(), '.claude'));
       return path ? { path, kind: 'claude' } : null;
     }
     case 'seed':
     case 'relay': {
-      const path = claudeJsonlWithBotHomeFallback(sid, q, claudeForkDataDir(q.cliId));
+      const scratchCwd = svMappings && q.cwd ? v(q.cwd) : q.cwd;
+      const path = svMappings
+        ? (scratchCwd ? getClaudeSessionJsonlPath(sid, scratchCwd, v(claudeForkDataDir(q.cliId))) : null)
+        : claudeJsonlWithBotHomeFallback(sid, q, claudeForkDataDir(q.cliId));
       return path ? { path, kind: 'claude' } : null;
     }
     case 'codex': {
@@ -303,8 +378,10 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       // absolute path is part of the cache key so changing it cannot reuse a
       // rollout discovered under a previous root.
       const globalCodexHome = resolve(configuredCodexHome());
-      const globalPath = codexRolloutInHome(q, globalCodexHome, false);
-      const botHomeDir = botHomeCliDataDir(q.larkAppId, 'codex');
+      const globalPath = codexRolloutInHome(q, svMappings ? v(globalCodexHome) : globalCodexHome, false);
+      // Scratch uses the NATIVE codex home (no BOT_HOME redirect); scanning a
+      // host-real BOT_HOME could only surface a stale rollout, so skip it.
+      const botHomeDir = svMappings ? null : botHomeCliDataDir(q.larkAppId, 'codex');
       const resolvedBotHomeDir = botHomeDir ? resolve(botHomeDir) : null;
       const botHomeRollout = resolvedBotHomeDir
         ? codexRolloutInHome(q, resolvedBotHomeDir, true)
@@ -323,11 +400,12 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       return path ? { path, kind: 'codex' } : null;
     }
     case 'coco': {
-      const path = cocoEventsPathForSession(sid);
+      const found = cocoEventsPathForSession(sid);
+      const path = found ? v(found) : null;
       return path ? { path, kind: 'coco' } : null;
     }
     case 'cursor': {
-      const path = cachedTranscriptPathLookup(`cursor:${sid}`, null, () => findCursorTranscriptByChatId(sid) ?? null, { retryMiss: q.fresh });
+      const path = cachedTranscriptPathLookup(`cursor:${sid}`, null, () => foundWrap(findCursorTranscriptByChatId(sid), v), { retryMiss: q.fresh });
       return path ? { path, kind: 'cursor' } : null;
     }
     case 'traex': {
@@ -336,7 +414,7 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
           ? undefined
           : findTraexSessionIdByBotmuxSessionId(q.sessionId);
         const traexSid = q.cliSessionId || mappedSid || q.sessionId;
-        return findTraexRolloutBySessionId(traexSid) ?? null;
+        return foundWrap(findTraexRolloutBySessionId(traexSid), v);
       }, { retryMiss: q.fresh });
       return path ? { path, kind: 'traex' } : null;
     }
@@ -344,13 +422,13 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       const path = cachedTranscriptPathLookup(
         `grok:${sid}:${q.cwd ?? ''}`,
         null,
-        () => findGrokUpdatesBySessionId(sid, q.cwd) ?? null,
+        () => foundWrap(findGrokUpdatesBySessionId(sid, q.cwd), v),
         { retryMiss: q.fresh },
       );
       return path ? { path, kind: 'grok' } : null;
     }
     case 'pi': {
-      const path = cachedTranscriptPathLookup(`pi:${sid}:${q.cwd ?? ''}`, null, () => findPiTranscriptBySessionId(sid, q.cwd) ?? null, { retryMiss: q.fresh });
+      const path = cachedTranscriptPathLookup(`pi:${sid}:${q.cwd ?? ''}`, null, () => foundWrap(findPiTranscriptBySessionId(sid, q.cwd), v), { retryMiss: q.fresh });
       return path ? { path, kind: 'pi' } : null;
     }
     case 'antigravity': {
@@ -359,7 +437,8 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       // directly). Conservative charset rules out traversal / separators, and
       // existsSync keeps the null-when-absent contract the other branches honor.
       if (!q.cliSessionId || !/^[A-Za-z0-9._-]+$/.test(q.cliSessionId)) return null;
-      const p = join(homedir(), '.gemini', 'antigravity-cli', 'brain', q.cliSessionId, '.system_generated', 'logs', 'transcript.jsonl');
+      const pReal = join(homedir(), '.gemini', 'antigravity-cli', 'brain', q.cliSessionId, '.system_generated', 'logs', 'transcript.jsonl');
+      const p = v(pReal);
       return existsSync(p) ? { path: p, kind: 'antigravity' } : null;
     }
     default:

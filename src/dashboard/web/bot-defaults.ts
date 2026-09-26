@@ -91,6 +91,13 @@ export type BotDefaultsRow = {
   /** Sparse per-bot reply-card style override; null means all built-in defaults. */
   replyStyle?: ReplyStyleConfig | null;
   sandbox?: boolean;
+  /** Tri-state sandbox selection ('off' absent historically → derive from sandbox). */
+  sandboxMode?: 'off' | 'oncall' | 'scratch' | null;
+  scratchStorage?: 'tmpfs' | 'disk' | null;
+  scratchTmpfsSizeMb?: number | null;
+  scratchDenyPaths?: string[] | null;
+  /** Whether the scratch mode is available on this platform (Linux only). */
+  scratchSupported?: boolean;
   codexAuthSync?: 'shared' | 'isolated';
   /** Trigger-user CLI auth: null / absent = off (the historical behavior, where
    *  CLI calls use whatever identity is logged in on the machine).

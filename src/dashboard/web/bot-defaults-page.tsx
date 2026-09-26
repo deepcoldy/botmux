@@ -1157,7 +1157,7 @@ function BotDefaultsCard(props: {
             {bot.cliId === 'codex' ? (
               <section className="bd-tile"><CodexAuthSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
-            {bot.cliId !== 'riff' && bot.sandbox === true ? (
+            {bot.cliId !== 'riff' && (bot.sandboxMode ?? (bot.sandbox ? 'oncall' : 'off')) === 'oncall' ? (
               <section className="bd-tile bd-tile-wide"><SandboxPathsSection bot={bot} patchBot={patchBot} /></section>
             ) : null}
             <section className="bd-tile"><TriggerUserAuthSection bot={bot} patchBot={patchBot} /></section>
@@ -3830,53 +3830,98 @@ function CodexAuthSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
 function SandboxSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const { bot, patchBot } = props;
-  const [enabled, setEnabled] = useState(bot.sandbox === true);
+  const mode: 'off' | 'oncall' | 'scratch' = bot.sandboxMode ?? (bot.sandbox ? 'oncall' : 'off');
+  const [selected, setSelected] = useState(mode);
+  const [storage, setStorage] = useState<'tmpfs' | 'disk'>(bot.scratchStorage ?? 'tmpfs');
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
 
-  useEffect(() => setEnabled(bot.sandbox === true), [bot.sandbox]);
+  useEffect(() => {
+    setSelected(bot.sandboxMode ?? (bot.sandbox ? 'oncall' : 'off'));
+    setStorage(bot.scratchStorage ?? 'tmpfs');
+  }, [bot.sandboxMode, bot.sandbox, bot.scratchStorage]);
 
-  async function toggle(next: boolean): Promise<void> {
-    setEnabled(next);
+  async function save(next: 'off' | 'oncall' | 'scratch', nextStorage: 'tmpfs' | 'disk'): Promise<void> {
+    setSelected(next);
     setStatus(null);
     setBusy(true);
     try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/sandbox`, { enabled: next });
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/sandbox`, {
+        mode: next,
+        ...(next === 'scratch' ? { scratchStorage: nextStorage } : {}),
+      });
       if (res.ok && res.body.ok) {
         setStatus({ text: `✓ ${tr('botDefaults.sandboxSaved')}`, ok: true });
-        patchBot(bot.larkAppId, { sandbox: res.body.sandbox === true });
+        patchBot(bot.larkAppId, {
+          sandbox: res.body.sandbox === true,
+          sandboxMode: (res.body.mode ?? next) as 'off' | 'oncall' | 'scratch',
+          ...(next === 'scratch' ? { scratchStorage: nextStorage } : {}),
+        });
       } else {
         setStatus({ text: `✗ ${responseErrorText(res)}` });
-        setEnabled(!next);
+        setSelected(mode);
       }
     } catch (e: any) {
       setStatus({ text: `✗ ${caughtErrorText(e)}` });
-      setEnabled(!next);
+      setSelected(mode);
     } finally {
       setBusy(false);
     }
   }
 
-  // The unified fs-policy always provides deny-by-default file read/write
-  // isolation. This capability line is narrower: whether the CLI's global data
-  // root can additionally be redirected into this bot's private BOT_HOME
-  // (claude/codex, no wrapper), keeping CLI credentials/config/history separate
-  // from sibling bots. Keep that distinction explicit in the UI copy.
   const readIsoSupported = bot.readIsolationSupported === true;
+  const scratchSupported = bot.scratchSupported !== false;
+  const modeBtn = (m: 'off' | 'oncall' | 'scratch', label: string) => (
+    <button
+      type="button"
+      className={`bd-seg-btn${selected === m ? ' bd-seg-btn-active' : ''}`}
+      data-action={`sandbox-mode-${m}`}
+      aria-pressed={selected === m}
+      disabled={busy || (m === 'scratch' && !scratchSupported)}
+      onClick={() => void save(m, m === 'scratch' ? storage : 'tmpfs')}
+    >
+      {label}
+    </button>
+  );
   return (
-    <section className="bd-section">
+    <section className="bd-section" data-sandbox-mode={selected}>
       <h3 className="bd-section-title">{tr('botDefaults.sectionSandbox')}</h3>
-      <ToggleRow
-        checked={enabled}
-        disabled={busy}
-        dataAction="toggle-sandbox"
-        title={tr('botDefaults.sandboxToggle')}
-        help={tr('botDefaults.sandboxHelp')}
-        onChange={checked => void toggle(checked)}
-      />
-      <p className="bd-section-note" data-read-iso-capability={readIsoSupported ? 'yes' : 'no'}>
-        {readIsoSupported ? `＋ ${tr('botDefaults.sandboxReadIsoOn')}` : tr('botDefaults.sandboxReadIsoOff')}
-      </p>
+      <div className="bd-seg" role="group">
+        {modeBtn('off', tr('botDefaults.sandboxModeOff'))}
+        {modeBtn('oncall', tr('botDefaults.sandboxModeOncall'))}
+        {modeBtn('scratch', tr('botDefaults.sandboxModeScratch'))}
+      </div>
+      <p className="bd-section-note">{tr('botDefaults.sandboxModeHelp')}</p>
+      {selected === 'oncall' ? (
+        <p className="bd-section-note" data-read-iso-capability={readIsoSupported ? 'yes' : 'no'}>
+          {readIsoSupported ? `＋ ${tr('botDefaults.sandboxReadIsoOn')}` : tr('botDefaults.sandboxReadIsoOff')}
+        </p>
+      ) : null}
+      {selected === 'scratch' ? (
+        <div className="bd-scratch-opts">
+          <p className="bd-section-note bd-warn">{tr('botDefaults.sandboxScratchWarning')}</p>
+          <div className="bd-seg" role="group" aria-label={tr('botDefaults.sandboxScratchStorage')}>
+            <button
+              type="button"
+              className={`bd-seg-btn${storage === 'tmpfs' ? ' bd-seg-btn-active' : ''}`}
+              data-action="scratch-storage-tmpfs"
+              disabled={busy}
+              onClick={() => void save('scratch', 'tmpfs')}
+            >
+              {tr('botDefaults.sandboxScratchTmpfs')}
+            </button>
+            <button
+              type="button"
+              className={`bd-seg-btn${storage === 'disk' ? ' bd-seg-btn-active' : ''}`}
+              data-action="scratch-storage-disk"
+              disabled={busy}
+              onClick={() => void save('scratch', 'disk')}
+            >
+              {tr('botDefaults.sandboxScratchDisk')}
+            </button>
+          </div>
+        </div>
+      ) : null}
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-sandbox-status': '' }} />
       </div>

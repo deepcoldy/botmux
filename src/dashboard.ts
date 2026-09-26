@@ -3653,7 +3653,7 @@ const companionApi = (() => {
   const requireBoundBot = () => {
     const matches = readBotsJsonOrEmpty(BOTS_JSON_PATH).filter((entry) => entry?.larkAppId === appId);
     const bot = matches.length === 1 ? matches[0] : undefined;
-    if (!bot || bot.sandbox !== true || (bot.cliId !== 'codex' && bot.cliId !== 'traex')) {
+    if (!bot || !(bot.sandbox === true || bot.sandbox === 'oncall' || bot.sandbox === 'scratch') || (bot.cliId !== 'codex' && bot.cliId !== 'traex')) {
       throw new Error('companion_bound_bot_invalid');
     }
     return bot;

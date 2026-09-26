@@ -35182,3 +35182,52 @@ a.card-menu-item {
 .group-serial-input-row > label { display: flex; align-items: center; gap: 6px; }
 .group-serial-input-row input { width: auto; }
 .group-serial-input-row > small { flex-basis: 100%; }
+
+/* Sandbox tri-state segmented control (off / oncall / scratch). */
+.bot-defaults-page .bd-seg {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  background: var(--surface-muted);
+}
+.bot-defaults-page .bd-seg-btn {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: var(--button-height);
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.bot-defaults-page .bd-seg-btn:hover:not(:disabled),
+.bot-defaults-page .bd-seg-btn:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+  outline: none;
+}
+.bot-defaults-page .bd-seg-btn[aria-pressed="true"],
+.bot-defaults-page .bd-seg-btn-active {
+  background: var(--surface);
+  border-color: var(--accent);
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+.bot-defaults-page .bd-seg-btn:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+.bot-defaults-page .bd-warn {
+  color: var(--warning, #b25f00);
+}
+.bot-defaults-page .bd-scratch-opts {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}

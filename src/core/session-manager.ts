@@ -2680,7 +2680,7 @@ export async function restoreActiveSessions(
       // as an ordinary session, NOT an adopt row. Doing the conversion here (not
       // via a worker-pool side-effect after announceSessionRow) keeps daemon
       // orchestration state consistent.
-      let adoptBotCfg: { sandbox?: boolean; readIsolation?: boolean; apiOnly?: boolean } = {};
+      let adoptBotCfg: { sandbox?: boolean | 'off' | 'oncall' | 'scratch'; readIsolation?: boolean; apiOnly?: boolean } = {};
       try { adoptBotCfg = getBot(session.larkAppId ?? '').config; } catch { /* unknown bot → only the frozen decision matters */ }
       if (adoptSandboxBlocked(adoptBotCfg, session)) {
         logger.warn(`[${session.sessionId.substring(0, 8)}] isolated/no-transport session persisted as adopt — converting to cold-start (a sandbox / apiOnly bot can't wrap a live external CLI)`);
