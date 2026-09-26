@@ -115,7 +115,7 @@
   "packageManager": "bun@1.4.2",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/deepcoldy/botmux.git"
+    "url": "git+https://github.com/jason-jimenez-bytedance/botmux.git"
   },
   "license": "MIT",
   "trustedDependencies": [

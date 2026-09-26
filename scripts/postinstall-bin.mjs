@@ -322,7 +322,7 @@ try {
     // NOT "npm's own shim still works" — `bin` was removed with the Node fallback,
     // so there is no other `botmux` on PATH. Give the user something they can act on.
     `Fix the permissions on ${binDir} and retry, or set BOTMUX_INSTALL_DIR and use the `
-      + 'standalone installer: curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh',
+      + 'standalone installer: curl -fsSL https://raw.githubusercontent.com/jason-jimenez-bytedance/botmux/master/install.sh | sh',
   );
 }
 

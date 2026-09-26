@@ -1,7 +1,7 @@
 #!/bin/sh
 # botmux single-binary installer.
 #
-#   curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/jason-jimenez-bytedance/botmux/master/install.sh | sh
 #
 # Downloads the self-contained Bun executable for your OS/arch from the latest
 # GitHub Release, verifies its SHA-256 checksum, and installs it to
@@ -14,10 +14,10 @@
 # Env overrides:
 #   BOTMUX_INSTALL_DIR   install location (default: $HOME/.botmux/bin)
 #   BOTMUX_VERSION       release tag to install (default: latest)
-#   BOTMUX_REPO          owner/repo (default: deepcoldy/botmux)
+#   BOTMUX_REPO          owner/repo (default: jason-jimenez-bytedance/botmux)
 set -eu
 
-REPO="${BOTMUX_REPO:-deepcoldy/botmux}"
+REPO="${BOTMUX_REPO:-jason-jimenez-bytedance/botmux}"
 INSTALL_DIR="${BOTMUX_INSTALL_DIR:-$HOME/.botmux/bin}"
 
 err() { printf '%s\n' "botmux install: $*" >&2; exit 1; }

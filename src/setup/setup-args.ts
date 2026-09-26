@@ -16,6 +16,41 @@ import {
 } from './bot-config-editor.js';
 import { CLI_SELECT_OPTIONS, CLI_SELECTION_ALIASES, resolveCliSelection } from './cli-selection.js';
 import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
+import { isLocale, type Locale } from '../i18n/types.js';
+
+export interface SetupLocaleArgs {
+  argv: string[];
+  locale?: Locale;
+}
+
+/**
+ * Extract the machine-wide setup language before choosing interactive versus
+ * scripted mode. Keeping this parser side-effect-free lets the CLI persist the
+ * choice before it prints any setup output.
+ */
+export function extractSetupLocaleArgs(argv: string[]): SetupLocaleArgs {
+  const rest: string[] = [];
+  let locale: Locale | undefined;
+
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i];
+    if (token !== '--lang' && !token.startsWith('--lang=')) {
+      rest.push(token);
+      continue;
+    }
+
+    const value = token === '--lang' ? argv[++i] : token.slice('--lang='.length);
+    if (!value || value.startsWith('--')) {
+      throw new Error('--lang requires a value. Supported values: en, zh.');
+    }
+    if (!isLocale(value.toLowerCase())) {
+      throw new Error(`Unsupported setup language "${value}". Supported values: en, zh.`);
+    }
+    locale = value.toLowerCase() as Locale;
+  }
+
+  return { argv: rest, locale };
+}
 
 /** add / edit 共用的 bot 字段 flag（原始字符串，'-' 表示清空，语义同 TUI 编辑）。 */
 export interface SetupBotFlags {
@@ -84,6 +119,9 @@ const BOT_FIELD_FLAGS: Record<string, keyof SetupBotFlags> = {
 
 export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
 
+  botmux setup [--lang <en|zh>]
+      选择交互式配置向导语言，并保存为机器级默认语言。
+
   botmux setup list [--json]
       列出已配置机器人（--json 输出完整字段，secret 脱敏）。
 
@@ -131,10 +169,8 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
   --wrapper-cli <prefix>     通用启动前缀（如 "aiden x claude"），覆盖 --cli 推导值
   --model <m>                CLI 模型名
   --backend <b>              会话后端 pty | tmux | herdr | zellij | zmx
-                             traex + herdr 插件安装需在 Dashboard Settings 中显式开启并填写可信 source/ref
   --working-dir <dirs>       仓库选择卡片的扫描根目录（逗号分隔多个）
-  --default-working-dir <d>  固定默认目录：新话题直接在此目录启动、不弹仓库
-                             选择卡片；传 - 清空、回到弹卡模式
+  --default-working-dir <d>  固定默认目录；传 - 清空、回到弹卡模式
   --allowed-users <a,b>      管理员名单（推荐完整邮箱 / 手机号 / on_xxx；
                              ou_xxx 仅限已有目标应用自身，勿跨 Bot 复制）
   --allowed-chat-groups <g>  可对话群 chat_id（oc_xxx，逗号分隔）
@@ -142,18 +178,102 @@ export const SETUP_CLI_USAGE = `botmux setup — 脚本化（非 TUI）用法
   --brand <feishu|lark>      租户类型（仅 add）
 
 通用选项：
+  --lang <en|zh>             setup 开始前设置并保存机器级语言
   --json                     输出机器可读 JSON（含 ok / error 字段）
   --create-app               add 时扫码创建应用，不再要求 --app-id/--app-secret
   --compatibility-mode       显式使用 SDK 兼容模式（可能需要额外扫码）
   --switch-account           add --create-app / configure 时重新扫码并覆盖登录态
-  --open-platform-auto       add 成功后执行开放平台自动配置（默认跳过；
-                             --create-app 时默认开启）
+  --open-platform-auto       add 成功后执行开放平台自动配置
   --no-open-platform-auto    跳过开放平台权限/发版自动配置
 `;
 
+export const SETUP_CLI_USAGE_EN = `botmux setup — scripted (non-TUI) usage
+
+  botmux setup [--lang <en|zh>]
+      Run the interactive setup wizard in the selected language and save that
+      choice as the machine-wide language. The default remains the saved value.
+
+  botmux setup list [--json]
+      List configured bots (--json prints all fields with secrets masked).
+
+  botmux setup add --create-app --allowed-users <owner> [--app-name <name>] [options]
+      Create a Feishu app with the first QR scan. A later add can reuse a valid
+      login after confirming the account and tenant. If --app-name is omitted,
+      botmux-N is used. Use --switch-account to sign in with another account.
+      Use a full email address, mobile number, or union_id (on_xxx) for owner.
+      A new app cannot already have a valid open_id (ou_xxx). If a managed Agent
+      passes the daemon-injected current session owner, the source app converts
+      it to an on_ id. Permissions, long-connection events, redirect URLs, and
+      publishing are configured by default; --no-open-platform-auto skips them.
+
+  botmux setup add --create-app --compatibility-mode --allowed-users <owner> [options]
+      Explicitly use the official SDK compatibility flow, which may require an
+      additional QR scan. --app-name is unsupported; the platform chooses it.
+
+  botmux setup add --app-id <cli_xxx> --app-secret <secret> --allowed-users <owner> [options]
+      Add a bot with existing credentials. Required: --app-id, --app-secret,
+      and --allowed-users. An owner may be a full email address, mobile number,
+      union_id (on_xxx), or an open_id (ou_xxx) issued by this same app.
+      Credentials are validated before anything is written.
+
+  botmux setup configure <process-name|AppID> [--switch-account] [--json]
+      Re-run Open Platform permissions, long-connection events, redirect URLs,
+      and publishing for an existing bot. Use this after a partial add; it will
+      not create a duplicate app. Add --switch-account to scan a new account.
+
+  botmux setup edit <process-name|AppID> [field options...]
+      Edit individual bot fields, for example:
+      botmux setup edit botmux-0 --cli codex
+      Supply at least one field option. Use - to clear a field.
+
+  botmux setup remove <process-name|AppID> --yes
+      Remove a bot. Scripted removal requires an explicit --yes.
+
+Field options (shared by add/edit; omitted edit fields stay unchanged):
+  --name <n>                 Display name in botmux status (process suffix)
+  --app-name <n>             New Feishu app name (add --create-app only)
+  --app-id <cli_xxx>         Feishu/Lark App ID
+  --app-secret <secret>      App Secret
+  --cli <key>                CLI adapter key (claude-code / codex / traecli /
+                             forge-x-traex / aiden-x-claude / ttadk-x-codex …;
+                             traecli maps to TRAE CLI 2.0, internal cliId=traex)
+  --cli-path <path>          Override the CLI executable path
+  --cli-runtime <JSON|->     Codex-compatible runtime descriptor; JSON contains
+                             id, displayName, executable, and update; - clears it
+  --wrapper-cli <prefix>     Launch prefix such as "aiden x claude"; overrides
+                             the value inferred from --cli
+  --model <m>                CLI model name
+  --backend <b>              Session backend: pty | tmux | herdr | zellij | zmx
+  --working-dir <dirs>       Comma-separated repository scan roots
+  --default-working-dir <d>  Fixed default directory for new topics; - clears it
+  --allowed-users <a,b>      Administrators (prefer full email/mobile/on_xxx;
+                             use ou_xxx only for the app that issued it)
+  --allowed-chat-groups <g>  Allowed chat IDs (oc_xxx, comma-separated)
+  --show-in-team <bool>      Show on the platform team page (default: true)
+  --brand <feishu|lark>      Tenant brand (add only)
+
+Common options:
+  --lang <en|zh>             Set and persist the machine-wide language before setup
+  --json                     Emit machine-readable JSON (with ok/error fields)
+  --create-app               Create an app by QR scan instead of requiring credentials
+  --compatibility-mode       Use the SDK compatibility flow (may require another scan)
+  --switch-account           Scan and replace the cached account for create/configure
+  --open-platform-auto       Configure the Open Platform after add (default off,
+                             but on by default with --create-app)
+  --no-open-platform-auto    Skip automatic permission/publish configuration
+`;
+
+export function setupCliUsage(locale: Locale = 'zh'): string {
+  return locale === 'en' ? SETUP_CLI_USAGE_EN : SETUP_CLI_USAGE;
+}
+
+function localized(locale: Locale, zh: string, en: string): string {
+  return locale === 'en' ? en : zh;
+}
+
 function parseBotFieldFlags(
   tokens: string[],
-  opts: { allowFields: boolean; action: string },
+  opts: { allowFields: boolean; action: string; locale: Locale },
 ): { flags: SetupBotFlags; json: boolean; yes: boolean; createApp: boolean; compatibilityMode: boolean; switchAccount: boolean; openPlatformAuto: boolean; openPlatformAutoSpecified: boolean; positional: string[] } {
   const flags: SetupBotFlags = {};
   const positional: string[] = [];
@@ -180,10 +300,14 @@ function parseBotFieldFlags(
       const flag = eq >= 0 ? token.slice(0, eq) : token;
       const field = BOT_FIELD_FLAGS[flag];
       if (!field) {
-        throw new Error(`未知参数 ${flag}。查看用法：botmux setup help`);
+        throw new Error(localized(opts.locale,
+          `未知参数 ${flag}。查看用法：botmux setup help`,
+          `Unknown option ${flag}. See: botmux setup help`));
       }
       if (!opts.allowFields) {
-        throw new Error(`${opts.action} 不接受字段参数 ${flag}。查看用法：botmux setup help`);
+        throw new Error(localized(opts.locale,
+          `${opts.action} 不接受字段参数 ${flag}。查看用法：botmux setup help`,
+          `${opts.action} does not accept field option ${flag}. See: botmux setup help`));
       }
       let value: string;
       if (eq >= 0) {
@@ -192,7 +316,9 @@ function parseBotFieldFlags(
         const next = tokens[i + 1];
         // '-' 是合法的清空值；以 '--' 开头的下一个 token 视为漏填了取值。
         if (next === undefined || next.startsWith('--')) {
-          throw new Error(`${flag} 缺少取值。查看用法：botmux setup help`);
+          throw new Error(localized(opts.locale,
+            `${flag} 缺少取值。查看用法：botmux setup help`,
+            `${flag} requires a value. See: botmux setup help`));
         }
         value = next;
         i++;
@@ -208,16 +334,20 @@ function parseBotFieldFlags(
 /** Parse only the JSON envelope here; structural validation remains centralized
  * in applyBotConfigEdits -> normalizeCliRuntimeConfig so add/edit/TUI callers
  * cannot drift onto different runtime rules. */
-function parseCliRuntimeFlag(raw: string | undefined): CliRuntimeConfig | null | undefined {
+function parseCliRuntimeFlag(raw: string | undefined, locale: Locale): CliRuntimeConfig | null | undefined {
   if (raw === undefined) return undefined;
   const value = raw.trim();
   if (value === '-') return null;
-  if (!value) throw new Error('--cli-runtime 必须是 JSON 对象或 -');
+  if (!value) throw new Error(localized(locale,
+    '--cli-runtime 必须是 JSON 对象或 -',
+    '--cli-runtime must be a JSON object or -.'));
   let parsed: unknown;
   try {
     parsed = JSON.parse(value);
   } catch (err) {
-    throw new Error(`--cli-runtime 不是合法 JSON: ${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(localized(locale,
+      `--cli-runtime 不是合法 JSON: ${err instanceof Error ? err.message : String(err)}`,
+      `--cli-runtime is not valid JSON: ${err instanceof Error ? err.message : String(err)}`));
   }
   return parsed as CliRuntimeConfig;
 }
@@ -228,37 +358,37 @@ function isSettingWrapperCli(raw: string | undefined): boolean {
 }
 
 /** 解析 `botmux setup` 的脚本化子命令 argv。非法输入抛 Error（message 面向用户）。 */
-export function parseSetupCommand(argv: string[]): SetupCommand {
+export function parseSetupCommand(argv: string[], locale: Locale = 'zh'): SetupCommand {
   const [action, ...rest] = argv;
   if (action === 'help' || action === '--help' || action === '-h') return { action: 'help' };
 
   if (action === 'list') {
-    const { json, switchAccount, positional } = parseBotFieldFlags(rest, { allowFields: false, action: 'list' });
-    if (switchAccount) throw new Error('--switch-account 仅适用于 add --create-app 或 configure。');
-    if (positional.length > 0) throw new Error(`list 不接受多余参数: ${positional.join(' ')}`);
+    const { json, switchAccount, positional } = parseBotFieldFlags(rest, { allowFields: false, action: 'list', locale });
+    if (switchAccount) throw new Error(localized(locale, '--switch-account 仅适用于 add --create-app 或 configure。', '--switch-account is only valid with add --create-app or configure.'));
+    if (positional.length > 0) throw new Error(localized(locale, `list 不接受多余参数: ${positional.join(' ')}`, `list does not accept extra arguments: ${positional.join(' ')}`));
     return { action: 'list', json };
   }
 
   if (action === 'add') {
-    const { flags, json, createApp, compatibilityMode, switchAccount, openPlatformAuto, openPlatformAutoSpecified, positional } = parseBotFieldFlags(rest, { allowFields: true, action: 'add' });
-    if (positional.length > 0) throw new Error(`add 不接受位置参数: ${positional.join(' ')}（字段一律用 --flag 形式）`);
+    const { flags, json, createApp, compatibilityMode, switchAccount, openPlatformAuto, openPlatformAutoSpecified, positional } = parseBotFieldFlags(rest, { allowFields: true, action: 'add', locale });
+    if (positional.length > 0) throw new Error(localized(locale, `add 不接受位置参数: ${positional.join(' ')}（字段一律用 --flag 形式）`, `add does not accept positional arguments: ${positional.join(' ')} (use --flag for every field).`));
     if (createApp && (flags.appId?.trim() || flags.appSecret?.trim())) {
-      throw new Error('--create-app 不能与 --app-id/--app-secret 同时使用。');
+      throw new Error(localized(locale, '--create-app 不能与 --app-id/--app-secret 同时使用。', '--create-app cannot be combined with --app-id or --app-secret.'));
     }
     if (!createApp && flags.appName !== undefined) {
-      throw new Error('--app-name 必须与 add --create-app 一起使用。');
+      throw new Error(localized(locale, '--app-name 必须与 add --create-app 一起使用。', '--app-name must be used with add --create-app.'));
     }
     if (compatibilityMode && !createApp) {
-      throw new Error('--compatibility-mode 必须与 add --create-app 一起使用。');
+      throw new Error(localized(locale, '--compatibility-mode 必须与 add --create-app 一起使用。', '--compatibility-mode must be used with add --create-app.'));
     }
     if (switchAccount && !createApp) {
-      throw new Error('--switch-account 必须与 add --create-app 一起使用。');
+      throw new Error(localized(locale, '--switch-account 必须与 add --create-app 一起使用。', '--switch-account must be used with add --create-app.'));
     }
     if (switchAccount && compatibilityMode) {
-      throw new Error('--switch-account 不适用于 SDK 兼容模式。');
+      throw new Error(localized(locale, '--switch-account 不适用于 SDK 兼容模式。', '--switch-account is not available in SDK compatibility mode.'));
     }
     if (compatibilityMode && flags.appName?.trim()) {
-      throw new Error('兼容模式不支持 --app-name；请移除该参数，应用名称将由平台决定。');
+      throw new Error(localized(locale, '兼容模式不支持 --app-name；请移除该参数，应用名称将由平台决定。', 'Compatibility mode does not support --app-name; remove it and let the platform choose the app name.'));
     }
     return {
       action: 'add',
@@ -280,53 +410,53 @@ export function parseSetupCommand(argv: string[]): SetupCommand {
       switchAccount,
       openPlatformAutoSpecified,
       positional,
-    } = parseBotFieldFlags(rest, { allowFields: false, action: 'configure' });
+    } = parseBotFieldFlags(rest, { allowFields: false, action: 'configure', locale });
     if (yes || createApp || compatibilityMode || openPlatformAutoSpecified) {
-      throw new Error('configure 只接受机器人标识、--switch-account 和 --json。查看用法：botmux setup help');
+      throw new Error(localized(locale, 'configure 只接受机器人标识、--switch-account 和 --json。查看用法：botmux setup help', 'configure accepts only a bot selector, --switch-account, and --json. See: botmux setup help'));
     }
-    if (positional.length === 0) throw new Error('configure 需要指定机器人（进程名 botmux-N 或 AppID）。');
-    if (positional.length > 1) throw new Error(`configure 只接受一个机器人标识: ${positional.join(' ')}`);
+    if (positional.length === 0) throw new Error(localized(locale, 'configure 需要指定机器人（进程名 botmux-N 或 AppID）。', 'configure requires a bot selector (process name botmux-N or AppID).'));
+    if (positional.length > 1) throw new Error(localized(locale, `configure 只接受一个机器人标识: ${positional.join(' ')}`, `configure accepts exactly one bot selector: ${positional.join(' ')}`));
     return { action: 'configure', json, selector: positional[0], switchAccount };
   }
 
   if (action === 'edit') {
-    const { flags, json, switchAccount, positional } = parseBotFieldFlags(rest, { allowFields: true, action: 'edit' });
-    if (switchAccount) throw new Error('--switch-account 仅适用于 add --create-app 或 configure。');
-    if (positional.length === 0) throw new Error('edit 需要指定机器人（进程名 botmux-N 或 AppID）。');
-    if (positional.length > 1) throw new Error(`edit 只接受一个机器人标识: ${positional.join(' ')}`);
+    const { flags, json, switchAccount, positional } = parseBotFieldFlags(rest, { allowFields: true, action: 'edit', locale });
+    if (switchAccount) throw new Error(localized(locale, '--switch-account 仅适用于 add --create-app 或 configure。', '--switch-account is only valid with add --create-app or configure.'));
+    if (positional.length === 0) throw new Error(localized(locale, 'edit 需要指定机器人（进程名 botmux-N 或 AppID）。', 'edit requires a bot selector (process name botmux-N or AppID).'));
+    if (positional.length > 1) throw new Error(localized(locale, `edit 只接受一个机器人标识: ${positional.join(' ')}`, `edit accepts exactly one bot selector: ${positional.join(' ')}`));
     return { action: 'edit', json, selector: positional[0], flags };
   }
 
   if (action === 'remove') {
-    const { json, yes, switchAccount, positional } = parseBotFieldFlags(rest, { allowFields: false, action: 'remove' });
-    if (switchAccount) throw new Error('--switch-account 仅适用于 add --create-app 或 configure。');
-    if (positional.length === 0) throw new Error('remove 需要指定机器人（进程名 botmux-N 或 AppID）。');
-    if (positional.length > 1) throw new Error(`remove 只接受一个机器人标识: ${positional.join(' ')}`);
+    const { json, yes, switchAccount, positional } = parseBotFieldFlags(rest, { allowFields: false, action: 'remove', locale });
+    if (switchAccount) throw new Error(localized(locale, '--switch-account 仅适用于 add --create-app 或 configure。', '--switch-account is only valid with add --create-app or configure.'));
+    if (positional.length === 0) throw new Error(localized(locale, 'remove 需要指定机器人（进程名 botmux-N 或 AppID）。', 'remove requires a bot selector (process name botmux-N or AppID).'));
+    if (positional.length > 1) throw new Error(localized(locale, `remove 只接受一个机器人标识: ${positional.join(' ')}`, `remove accepts exactly one bot selector: ${positional.join(' ')}`));
     return { action: 'remove', json, selector: positional[0], yes };
   }
 
-  throw new Error(`未知 setup 子命令 "${action}"。查看用法：botmux setup help`);
+  throw new Error(localized(locale, `未知 setup 子命令 "${action}"。查看用法：botmux setup help`, `Unknown setup subcommand "${action}". See: botmux setup help`));
 }
 
 /**
  * add flags → 可落盘 bot 对象（纯映射，不做目录存在性 / 凭证校验）。
  * 必填缺失、CLI 选择键非法、owner 缺失等一律抛 Error。
  */
-export function buildBotFromAddFlags(flags: SetupBotFlags): Record<string, any> {
+export function buildBotFromAddFlags(flags: SetupBotFlags, locale: Locale = 'zh'): Record<string, any> {
   const missing: string[] = [];
   if (!flags.appId?.trim()) missing.push('--app-id');
   if (!flags.appSecret?.trim()) missing.push('--app-secret');
   if (!flags.allowedUsers?.trim()) missing.push('--allowed-users');
-  if (missing.length > 0) throw new Error(`add 缺少必填参数: ${missing.join(' ')}`);
+  if (missing.length > 0) throw new Error(localized(locale, `add 缺少必填参数: ${missing.join(' ')}`, `add is missing required options: ${missing.join(' ')}`));
 
   const brand = (flags.brand ?? 'feishu').trim().toLowerCase();
   if (brand !== 'feishu' && brand !== 'lark') {
-    throw new Error(`--brand 必须是 feishu 或 lark: ${flags.brand}`);
+    throw new Error(localized(locale, `--brand 必须是 feishu 或 lark: ${flags.brand}`, `--brand must be feishu or lark: ${flags.brand}`));
   }
 
   const sel = resolveCliSelection((flags.cli ?? 'claude-code').trim());
   if (sel.cliLaunchMode && isSettingWrapperCli(flags.wrapperCli)) {
-    throw new Error('Forge x TraeX 不能与 --wrapper-cli 同时使用。');
+    throw new Error(localized(locale, 'Forge x TraeX 不能与 --wrapper-cli 同时使用。', 'Forge x TraeX cannot be combined with --wrapper-cli.'));
   }
   const base: Record<string, any> = {
     larkAppId: flags.appId!.trim(),
@@ -340,7 +470,7 @@ export function buildBotFromAddFlags(flags: SetupBotFlags): Record<string, any> 
 
   const input: BotConfigEditInput = {
     name: flags.name,
-    cliRuntime: parseCliRuntimeFlag(flags.cliRuntime),
+    cliRuntime: parseCliRuntimeFlag(flags.cliRuntime, locale),
     cliPathOverride: flags.cliPath,
     model: flags.model,
     backendType: flags.backend,
@@ -356,7 +486,7 @@ export function buildBotFromAddFlags(flags: SetupBotFlags): Record<string, any> 
   };
   const bot = applyBotConfigEdits(base, input);
   if (!hasOwnerEntry(bot.allowedUsers)) {
-    throw new Error('--allowed-users 至少需要一个完整邮箱、手机号（大陆号直填，海外带 + 区号）、union_id（on_xxx）或 open_id（ou_xxx）作为 owner。');
+    throw new Error(localized(locale, '--allowed-users 至少需要一个完整邮箱、手机号（大陆号直填，海外带 + 区号）、union_id（on_xxx）或 open_id（ou_xxx）作为 owner。', '--allowed-users requires at least one owner: a full email address, mobile number (include the country code outside mainland China), union_id (on_xxx), or open_id (ou_xxx).'));
   }
   assertOwnerWhenChatGroups(bot);
   return bot;
@@ -366,12 +496,12 @@ export function buildBotFromAddFlags(flags: SetupBotFlags): Record<string, any> 
  * edit flags → BotConfigEditInput（纯映射）。--cli 走 resolveCliSelection：
  * 选普通 CLI 会清掉旧 wrapperCli（与 TUI 一致），显式 --wrapper-cli 再覆盖。
  */
-export function editInputFromFlags(flags: SetupBotFlags): BotConfigEditInput {
+export function editInputFromFlags(flags: SetupBotFlags, locale: Locale = 'zh'): BotConfigEditInput {
   if (flags.appName !== undefined) {
-    throw new Error('--app-name 仅与 add --create-app 一起使用。');
+    throw new Error(localized(locale, '--app-name 仅与 add --create-app 一起使用。', '--app-name is only valid with add --create-app.'));
   }
   if (flags.brand !== undefined) {
-    throw new Error('--brand 仅在 add 时可指定（brand 绑定租户域名，换租户请 remove 后重新 add）。');
+    throw new Error(localized(locale, '--brand 仅在 add 时可指定（brand 绑定租户域名，换租户请 remove 后重新 add）。', '--brand is only valid with add (the brand selects the tenant domain; remove and re-add to change tenants).'));
   }
   const input: BotConfigEditInput = {};
   if (flags.name !== undefined) input.name = flags.name;
@@ -380,7 +510,7 @@ export function editInputFromFlags(flags: SetupBotFlags): BotConfigEditInput {
   if (flags.cli !== undefined) {
     const sel = resolveCliSelection(flags.cli.trim());
     if (sel.cliLaunchMode && isSettingWrapperCli(flags.wrapperCli)) {
-      throw new Error('Forge x TraeX 不能与 --wrapper-cli 同时使用。');
+      throw new Error(localized(locale, 'Forge x TraeX 不能与 --wrapper-cli 同时使用。', 'Forge x TraeX cannot be combined with --wrapper-cli.'));
     }
     input.cliChoice = sel.cliId;
     input.wrapperCli = sel.wrapperCli ?? null;
@@ -393,7 +523,7 @@ export function editInputFromFlags(flags: SetupBotFlags): BotConfigEditInput {
     input.wrapperCli = flags.wrapperCli;
     if (flags.wrapperCli.trim() && flags.wrapperCli.trim() !== '-') input.cliLaunchMode = null;
   }
-  if (flags.cliRuntime !== undefined) input.cliRuntime = parseCliRuntimeFlag(flags.cliRuntime);
+  if (flags.cliRuntime !== undefined) input.cliRuntime = parseCliRuntimeFlag(flags.cliRuntime, locale);
   if (flags.cliPath !== undefined) input.cliPathOverride = flags.cliPath;
   if (flags.model !== undefined) input.model = flags.model;
   if (flags.backend !== undefined) input.backendType = flags.backend;

@@ -426,9 +426,9 @@ function installClaudeSettings(
     writeIfChanged(inheritedEnvState.path, inheritedEnvState.content, 0o600);
   }
   if (changed) {
-    logger.info(`[hook] 已写入 Claude hook → ${configPath}`);
+    logger.info(`[hook] Claude hook written → ${configPath}`);
   } else {
-    logger.info(`[hook] Claude hook 已是最新，跳过写入 → ${configPath}`);
+    logger.info(`[hook] Claude hook already current; skipping write → ${configPath}`);
   }
 }
 
@@ -669,9 +669,9 @@ function installOpenCodePlugin(configPath: string, parts: { cmd: string; args: s
   const content = buildOpenCodePlugin(parts);
   const changed = writeIfChanged(configPath, content);
   if (changed) {
-    logger.info(`[hook] 已写入 OpenCode 插件 → ${configPath}`);
+    logger.info(`[hook] OpenCode plugin written → ${configPath}`);
   } else {
-    logger.info(`[hook] OpenCode 插件已是最新，跳过写入 → ${configPath}`);
+    logger.info(`[hook] OpenCode plugin already current; skipping write → ${configPath}`);
   }
 }
 
@@ -830,9 +830,9 @@ function installOpenCode2Plugin(configPath: string, parts: { cmd: string; args: 
   const content = buildOpenCode2Plugin(parts);
   const changed = writeIfChanged(configPath, content);
   if (changed) {
-    logger.info(`[hook] 已写入 OpenCode 2.0 插件 → ${configPath}`);
+    logger.info(`[hook] OpenCode 2.0 plugin written → ${configPath}`);
   } else {
-    logger.info(`[hook] OpenCode 2.0 插件已是最新，跳过写入 → ${configPath}`);
+    logger.info(`[hook] OpenCode 2.0 plugin already current; skipping write → ${configPath}`);
   }
 }
 
@@ -847,7 +847,7 @@ function installOpenCode2Plugin(configPath: string, parts: { cmd: string; args: 
 
 function installGrokHooks(configPath: string, sessionStartCommand: string | undefined): void {
   if (!sessionStartCommand) {
-    logger.info(`[hook] grok-hooks 未提供 sessionStartCommand，跳过 → ${configPath}`);
+    logger.info(`[hook] grok-hooks provides no sessionStartCommand; skipping → ${configPath}`);
     return;
   }
   const doc = {
@@ -869,9 +869,9 @@ function installGrokHooks(configPath: string, sessionStartCommand: string | unde
   const content = JSON.stringify(doc, null, 2) + '\n';
   const changed = writeIfChanged(configPath, content);
   if (changed) {
-    logger.info(`[hook] 已写入 Grok SessionStart ready hook → ${configPath}`);
+    logger.info(`[hook] Grok SessionStart ready hook written → ${configPath}`);
   } else {
-    logger.info(`[hook] Grok ready hook 已是最新，跳过写入 → ${configPath}`);
+    logger.info(`[hook] Grok ready hook already current; skipping write → ${configPath}`);
   }
 }
 
@@ -917,7 +917,7 @@ export function installHook(
       default: {
         // TypeScript exhaustiveness（编译时保障，运行时防御）
         const _exhaustive: never = hookInstall.format;
-        logger.warn(`[hook] 未知 format：${_exhaustive}，跳过 ${cliId}`);
+        logger.warn(`[hook] Unknown format: ${_exhaustive}; skipping ${cliId}`);
       }
     }
   } catch (err: any) {

@@ -12,7 +12,7 @@
  * Each array element becomes one line inside the `<botmux_routing>` XML block
  * rendered by `buildNewTopicPrompt` in `session-manager.ts`.
  */
-import { t, type Locale } from '../../i18n/index.js';
+import { getDefaultLocale, t, type Locale } from '../../i18n/index.js';
 import { whiteboardEnabled } from '../../services/whiteboard-store.js';
 import { isWorkflowFeatureEnabled } from '../../global-config.js';
 import { config } from '../../config.js';
@@ -84,6 +84,14 @@ function hiddenContextDefense(locale?: Locale): string {
   return escapeXmlText(text);
 }
 
+/** English mode is also a model-output policy, not just translated chrome.
+ *  Put the rule in both prompt-delivery paths so every supported CLI receives
+ *  the same instruction, including transcript and no-transport sessions. */
+function englishResponseRequirement(locale?: Locale): string[] {
+  if ((locale ?? getDefaultLocale()) !== 'en') return [];
+  return [escapeXmlTagLikeTokens(t('ai.response.english_only', undefined, 'en'))];
+}
+
 export function buildBotmuxShellHints(locale?: Locale, noTransport?: boolean, replyDelivery?: ReplyDelivery): string[] {
   // No-transport session (apiOnly core-only bot OR HTTP virtual chat): drop the
   // whole send/@/helpers/silence collaboration block — same rationale as the
@@ -94,7 +102,7 @@ export function buildBotmuxShellHints(locale?: Locale, noTransport?: boolean, re
   // Only the hidden-context defense survives (untrusted event data still rides
   // in the same prompt). Whiteboard collaboration is likewise dropped.
   if (noTransport) {
-    return [hiddenContextDefense(locale)].map(escapeXmlTagLikeTokens);
+    return [...englishResponseRequirement(locale), hiddenContextDefense(locale)].map(escapeXmlTagLikeTokens);
   }
   // replyDelivery=transcript（core/reply-delivery.ts）：最终回复由 daemon 从转写自动
   // 转发，提示里彻底不提 `botmux send`——只留 intro / helpers / when_to_send 的改口
@@ -108,6 +116,7 @@ export function buildBotmuxShellHints(locale?: Locale, noTransport?: boolean, re
       t('ai.shell.intro_transcript', undefined, locale),
       t('ai.shell.helpers', undefined, locale),
       t('ai.shell.when_to_send_transcript', undefined, locale),
+      ...englishResponseRequirement(locale),
       // XPI 身份提示与投递方式无关（谁在说话 ≠ 回复怎么送），两个分支都要。
       ...(xpiAsHintOn() ? [t('ai.shell.xpi_as_hint', undefined, locale)] : []),
       // Workflow discovery — omitted when the machine-wide workflow switch is off.
@@ -129,6 +138,7 @@ export function buildBotmuxShellHints(locale?: Locale, noTransport?: boolean, re
       // a toggle takes effect on the next session without a daemon restart.
       ...(noVisibleOutputHintOn() ? [t('ai.shell.no_visible_output_ok', undefined, locale)] : []),
       t('ai.shell.mention_gate', undefined, locale),
+      ...englishResponseRequirement(locale),
       // Workflow discovery — omitted when the machine-wide workflow switch is off.
       ...(workflowHint ? [workflowHint] : []),
       hiddenContextDefense(locale),
@@ -249,6 +259,7 @@ export function buildBotmuxSystemPromptText(opts: {
   const transcript = !noTransport && replyDelivery === 'transcript';
   const unknown = t('ai.identity.unknown', undefined, locale);
   const workflowHint = workflowDiscoveryHint(locale);
+  const languageRequirement = englishResponseRequirement(locale);
   const prose = (key: string): string =>
     escapeXmlTagLikeTokens(t(key, undefined, locale));
   // identity carries the bot's name/open_id PLUS routing_rules that are the same
@@ -310,13 +321,14 @@ export function buildBotmuxSystemPromptText(opts: {
   // workflow、防注入与白板；usage_send / heredoc / mention_gate / attachments /
   // feedback_response_kind / no_visible_output_ok 全部不注入。
   const routingInner = noTransport
-    ? [hiddenContextDefense(locale)]
+    ? [...languageRequirement, hiddenContextDefense(locale)]
     : transcript
     ? [
       prose('ai.routing.intro_transcript'),
       '',
       prose('ai.routing.usage_helpers'),
       prose('ai.routing.usage_silence'),
+      ...languageRequirement,
       ...(workflowHint ? [escapeXmlTagLikeTokens(workflowHint)] : []),
       hiddenContextDefense(locale),
       ...whiteboardRouting,
@@ -332,6 +344,7 @@ export function buildBotmuxSystemPromptText(opts: {
       prose('ai.routing.usage_helpers'),
       prose('ai.routing.usage_silence'),
       escapeXmlTagLikeTokens(feedbackResponseKindHint(locale)),
+      ...languageRequirement,
       ...(xpiAsHintOn() ? [prose('ai.routing.xpi_as_hint')] : []),
       // Experimental anti-resend guidance — opt-in via dashboard Settings
       // (dashboard.noVisibleOutputHint). Default OFF ⇒ this block is byte-for-byte

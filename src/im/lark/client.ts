@@ -2047,8 +2047,8 @@ export async function resolveUserUnionId(larkAppId: string, openId: string): Pro
       return { unionId: res.data.user.union_id ?? undefined, name: res.data.user.name ?? undefined };
     }
     if (res.code === 99992361) {
-      logger.warn(`resolveUserUnionId [${larkAppId}]: open_id ${openId} 属于其他应用（cross app）。` +
-        `请在 allowedUsers 中改用邮箱或 union_id（on_ 前缀）代替 open_id。`);
+      logger.warn(`resolveUserUnionId [${larkAppId}]: open_id ${openId} belongs to another app (cross-app).` +
+        ' Use an email address or union_id (on_ prefix) instead of open_id in allowedUsers.');
     } else {
       logger.debug(`resolveUserUnionId non-zero code: ${res.code} ${res.msg}`);
     }

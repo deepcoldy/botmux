@@ -198,8 +198,8 @@ export async function normalizeManagedOwnerEntries(
     : [];
   if (unconvertible.length > 0) {
     throw new Error(
-      '--allowed-users 在创建新 Bot 时不能使用 app-scoped open_id：' +
-      `${unconvertible.join(', ')}；请改用完整邮箱、手机号或 on_ union_id。`,
+      '--allowed-users cannot use an app-scoped open_id while creating a new bot: ' +
+      `${unconvertible.join(', ')}. Use a full email address, mobile number, or on_ union_id instead.`,
     );
   }
   if (!canResolveSourceOwner) return rawAllowedUsers;
@@ -207,8 +207,8 @@ export async function normalizeManagedOwnerEntries(
   const stable = await resolveStableOwner(context.sourceAppId!, sourceOwner!);
   if (!stable?.startsWith('on_')) {
     throw new Error(
-      '--allowed-users 不能把当前 Bot 的 app-scoped open_id 直接用于另一个 Bot；' +
-      '无法解析跨应用 union_id，请改用完整邮箱、手机号或 on_ union_id。',
+      '--allowed-users cannot reuse the current bot\'s app-scoped open_id for another bot. ' +
+      'A cross-app union_id could not be resolved; use a full email address, mobile number, or on_ union_id instead.',
     );
   }
 

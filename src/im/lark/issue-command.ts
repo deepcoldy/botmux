@@ -149,7 +149,7 @@ export function reposFor(larkAppId: string, deps: IssueCommandDeps): RepoChoice[
     }];
   } catch (e) {
     // 扫描失败不该让整个命令挂掉：回落到空候选，确认卡会说明"没扫到仓库"。
-    logger.warn(`[issue] 扫描仓库失败: ${String((e as Error)?.message ?? e)}`);
+    logger.warn(`[issue] Repository scan failed: ${String((e as Error)?.message ?? e)}`);
     return [];
   }
 }
@@ -266,7 +266,7 @@ export async function handleIssueRelease(
   if (!last) return err('拿不到当前会话的锚点，无法定位领取记录');
 
   if (last.ok) {
-    logger.info(`[issue] 释放成功 issue=${last.issueId} platform_already=${last.alreadyReleasedOnPlatform}`);
+    logger.info(`[issue] Release succeeded issue=${last.issueId} platform_already=${last.alreadyReleasedOnPlatform}`);
     return info(
       last.alreadyReleasedOnPlatform
         ? '✅ 已释放。平台上这条任务此前就已经不归本机了（可能被回收或已被别人领走），本机记录已同步。\n\n群和会话都还在，需要的话自己停会话或退群。'
@@ -276,7 +276,7 @@ export async function handleIssueRelease(
   if (last.reason === 'no_binding') return err('这个会话没有领取任何平台任务，没什么可释放的。');
   if (last.reason === 'already_released') return info(terminalHint(last.bindState));
 
-  logger.warn(`[issue] 释放失败 detail=${last.detail} permanent=${last.permanent === true}`);
+  logger.warn(`[issue] Release failed detail=${last.detail} permanent=${last.permanent === true}`);
   // 劝人重试之前先看这次失败是不是永久性的：401/403/404 再发一百次也一样，那句"稍后再试"
   // 会让人一直重试到放弃，而真正该做的是去平台上看这条任务还在不在。
   return err(
@@ -308,7 +308,7 @@ export async function handleIssueDone(
   if (!last) return err('拿不到当前会话的锚点，无法定位领取记录');
 
   if (last.ok) {
-    logger.info(`[issue] 验收完成 issue=${last.issueId} platform_already=${last.alreadyReleasedOnPlatform}`);
+    logger.info(`[issue] Acceptance completed issue=${last.issueId} platform_already=${last.alreadyReleasedOnPlatform}`);
     return info(
       last.alreadyReleasedOnPlatform
         ? '✅ 已标记完成。平台上这条任务此前就已经不归本机了，本机记录已同步。\n\n群和会话都还在，需要的话自己停会话或退群。'
@@ -318,7 +318,7 @@ export async function handleIssueDone(
   if (last.reason === 'no_binding') return err('这个会话没有领取任何平台任务，没什么可验收的。');
   if (last.reason === 'already_released') return info(terminalHint(last.bindState));
 
-  logger.warn(`[issue] 验收完成失败 detail=${last.detail} permanent=${last.permanent === true}`);
+  logger.warn(`[issue] Acceptance completion failed detail=${last.detail} permanent=${last.permanent === true}`);
   // 平台的追赶白名单不允许 needs_attention → done。这是设计而不是故障，得说清楚下一步。
   const blocked = /invalid_transition/.test(last.detail ?? '');
   return err(
@@ -421,7 +421,7 @@ async function handleIssueCardActionInner(
 
     const r = await deps.runClaim({ issue, teamId, larkAppId, workingDir, invokerOpenId });
     if (r.ok) {
-      logger.info(`[issue] 领取成功 issue=${issue._id} chat=${r.chatId}`);
+      logger.info(`[issue] Claim succeeded issue=${issue._id} chat=${r.chatId}`);
       return {
         card: buildClaimResultCard({
           ok: true,
@@ -432,7 +432,7 @@ async function handleIssueCardActionInner(
         }),
       };
     }
-    logger.warn(`[issue] 领取失败 issue=${issue._id} stage=${r.stage} reason=${r.reason}`);
+    logger.warn(`[issue] Claim failed issue=${issue._id} stage=${r.stage} reason=${r.reason}`);
     return {
       card: buildClaimResultCard({
         ok: false,

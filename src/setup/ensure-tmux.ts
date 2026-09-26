@@ -73,19 +73,19 @@ function childFailureReason(command: string, failure: any, timeoutMs: number): s
     || /clone3/i.test(stderr) || /clone3/i.test(rawMessage ?? '')
     || /operation not permitted/i.test(stderr) || /operation not permitted/i.test(rawMessage ?? '')
   ) {
-    return `${command} 启动失败：tmux 已安装，但当前运行环境（容器 seccomp/沙箱）禁止进程克隆`
-      + '（clone3 返回 EPERM / Operation not permitted），tmux server 无法启动';
+    return `${command} failed to start: tmux is installed, but this runtime (container seccomp/sandbox) blocks process cloning `
+      + '(clone3 returned EPERM / Operation not permitted), so the tmux server cannot start';
   }
-  if (code === 'ENOENT') return `${command} 启动失败：找不到 tmux 可执行文件（ENOENT）`;
-  if (code === 'EACCES') return `${command} 启动失败：tmux 不可执行（EACCES）`;
-  if (code === 'EMFILE' || code === 'ENFILE') return `${command} 启动失败：文件描述符耗尽（${code}）`;
+  if (code === 'ENOENT') return `${command} failed to start: the tmux executable was not found (ENOENT)`;
+  if (code === 'EACCES') return `${command} failed to start: tmux is not executable (EACCES)`;
+  if (code === 'EMFILE' || code === 'ENFILE') return `${command} failed to start: file descriptors exhausted (${code})`;
   if (code === 'ETIMEDOUT' || signal || failure?.killed || nested?.killed) {
-    const detail = signal ? `，signal=${signal}` : '';
-    return `${command} 探测超时（${timeoutMs}ms${detail}）`;
+    const detail = signal ? `, signal=${signal}` : '';
+    return `${command} probe timed out (${timeoutMs}ms${detail})`;
   }
-  if (stderr) return `${command} 失败：${stderr}`;
-  if (typeof failure?.status === 'number') return `${command} 失败（exit ${failure.status}）`;
-  return `${command} 启动/探测失败${rawMessage ? `：${rawMessage}` : ''}`;
+  if (stderr) return `${command} failed: ${stderr}`;
+  if (typeof failure?.status === 'number') return `${command} failed (exit ${failure.status})`;
+  return `${command} start/probe failed${rawMessage ? `: ${rawMessage}` : ''}`;
 }
 
 /** Coarse class of a tmux probe failure reason string, used to pick the
@@ -485,13 +485,13 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
       binaryPresent: true,
       version: initialProbe.version,
       reason: initialProbe.version
-        ? `${initialProbe.version} 已安装但启动 server 失败：${initialProbe.reason}`
+        ? `${initialProbe.version} is installed, but its server failed to start: ${initialProbe.reason}`
         : initialProbe.reason,
-      manualCommand: '排查 ~/.tmux.conf / /tmp 权限 / libevent 依赖后再试',
+      manualCommand: 'Check ~/.tmux.conf, /tmp permissions, and libevent dependencies, then retry',
     };
   }
 
-  console.log('⚠️  tmux 未检测到，正在安装...');
+  console.log('⚠️  tmux was not found. Installing it...');
 
   // Step 2..4: walk the package-manager preference list.
   const tried: string[] = [];
@@ -499,20 +499,20 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
     if (pm === 'unknown') continue;
     const argv = buildInstallArgv(pm, 'tmux', platform);
     if (!argv) {
-      tried.push(`${pm}（跳过：当前用户无 sudo 且无 TTY）`);
+      tried.push(`${pm} (skipped: the current user has neither sudo nor a TTY)`);
       continue;
     }
     if (pm === 'apt') aptUpdateBeforeInstall(platform);
-    console.log(`   尝试 ${pm}: ${argv.join(' ')}`);
+    console.log(`   Trying ${pm}: ${argv.join(' ')}`);
     if (runInstall(argv)) {
       const postInstall = probeTmuxFunctional();
       if (postInstall.ok) {
-        console.log(`✅ tmux ${postInstall.version} 安装完成 (via ${pm})`);
+        console.log(`✅ tmux ${postInstall.version} installed (via ${pm})`);
         return { installed: true, version: postInstall.version, freshInstall: true, strategy: pm, binaryPresent: true };
       }
-      tried.push(`${pm}（装上了但 server 起不来：${postInstall.reason}）`);
+      tried.push(`${pm} (installed, but the server could not start: ${postInstall.reason})`);
     } else {
-      tried.push(`${pm}（命令返回非零）`);
+      tried.push(`${pm} (command exited non-zero)`);
     }
   }
 
@@ -520,15 +520,15 @@ export async function ensureTmux(info?: PlatformInfo): Promise<TmuxResult> {
   const preferred = platform.packageManagers.find(p => p !== 'unknown') ?? 'unknown';
   const manual = suggestManualCommand(preferred, 'tmux');
   const reasonLines = [
-    '自动安装 tmux 失败',
-    '已尝试：',
+    'Automatic tmux installation failed',
+    'Attempted:',
     ...tried.map(t => `  - ${t}`),
   ];
   if (platform.os === 'darwin' && !platform.packageManagers.includes('brew')) {
-    reasonLines.push('macOS 推荐先安装 Homebrew：/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"');
+    reasonLines.push('On macOS, install Homebrew first: /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"');
   }
   if (!platform.hasTty && !platform.isRoot && !platform.passwordlessSudo && platform.os === 'linux') {
-    reasonLines.push('提示：当前不是交互式 TTY 且 sudo 需要密码，systemd/pm2 自启下无法弹密码 — 先在 shell 跑一次 `botmux start`，或配置 NOPASSWD sudoers。');
+    reasonLines.push('The current process has no interactive TTY and sudo needs a password, so an autostart service cannot prompt. Run `botmux start` once in a shell or configure NOPASSWD sudoers.');
   }
   const finalVersionProbe = probeTmuxVersion();
   return {

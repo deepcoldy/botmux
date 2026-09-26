@@ -50,32 +50,32 @@ export type CriticalScopeReadbackResult =
  * 的 manifest 一致性测试用 lark-scopes.json 兜底防止这类裸名再溜进来。
  */
 export const BOTMUX_REQUIRED_SCOPES: RequiredScope[] = [
-  { name: 'im:message', desc: '收发消息', critical: true },
-  { name: 'im:message.group_at_msg:readonly', desc: '群消息接收', critical: true },
+  { name: 'im:message', desc: 'Send and receive messages', critical: true },
+  { name: 'im:message.group_at_msg:readonly', desc: 'Receive group messages', critical: true },
   // 没有这个 scope，listChatMessages（container_id_type=chat）只能拿到 @bot 的
   // 消息，拉不到群里的全量历史，botmux history / 群上下文回溯失效。标 critical 是
   // 为了让启动自检在它缺失时也会 DM 管理员——非 critical 的缺失只在同时缺别的
   // critical 项时才会被提示。
-  { name: 'im:message.group_msg', desc: '群组历史消息读取（botmux history、群上下文）', critical: true },
-  { name: 'im:resource', desc: '消息附件下载', critical: true },
-  { name: 'im:chat:read', desc: '群信息读取', critical: true },
+  { name: 'im:message.group_msg', desc: 'Read group history (botmux history and group context)', critical: true },
+  { name: 'im:resource', desc: 'Download message attachments', critical: true },
+  { name: 'im:chat:read', desc: 'Read chat information', critical: true },
   // /group 多 bot 建群解析靠 chatMembers.isInChat 判断每个 bot 是否在群。该 API
   // 接受 im:chat / im:chat:readonly / im:chat.members:read / im:chat.group_info:readonly
   // 任一即可（OR），但实际可申请的只有 im:chat.members:read，故只校验它。缺它时
   // isInChat 抛 Access denied 被吞，bot 静默掉出 roster，/group fail-closed 建不了群。
-  { name: 'im:chat.members:read', desc: '群成员读取（/group 建群解析、判断 bot 是否在群）', critical: true },
+  { name: 'im:chat.members:read', desc: 'Read chat members (/group resolution and bot membership checks)', critical: true },
   // 拉群把人/机器人加进群（chatMembers.create）需要写权限；缺它时建群能成、加成员
   // 报 code 99991672 Access denied → 跨部署拉群「机器人进了但人没进」。拉群是核心刚需
   // 功能，标 critical：缺它时启动自检直接 DM 管理员，不再静默报「all scopes granted」。
-  { name: 'im:chat.members:write_only', desc: '群成员写入（/group、跨部署拉群把人和机器人加进群）', critical: true },
+  { name: 'im:chat.members:write_only', desc: 'Manage chat members (/group and cross-deployment invitations)', critical: true },
   // 除用户基本信息外，/grant 自动登记 & /introduce 用它查通讯录区分真人/机器人
   // （isHumanOpenId）：缺这权限时真人无法被剔除，会混进机器人协作名单 <available_bots>
   // 误导模型。已是 critical，启动自检（checkRequiredScopes）缺失即 DM 管理员。
-  { name: 'contact:user.base:readonly', desc: '用户基本信息（也用于 /grant、/introduce 判定真人/机器人；缺失会让真人混入机器人协作名单）', critical: true },
+  { name: 'contact:user.base:readonly', desc: 'Read basic user info (also distinguishes people from bots for /grant and /introduce)', critical: true },
   // event-dispatcher.checkRequiredScopes 历史上一直对这一项 DM 管理员（"多 bot
   // 协作收不到事件"），等价于 critical 处理；保留 critical 标记是为了让启动
   // 时的统一巡检循环也覆盖它。
-  { name: 'im:message.group_at_msg.include_bot:readonly', desc: '跨 bot @ 事件', critical: true },
+  { name: 'im:message.group_at_msg.include_bot:readonly', desc: 'Cross-bot @mention events', critical: true },
   // 「话题群新话题自动开工」(autoStartOnNewTopic) 要覆盖到「其他机器人开的新话题」时，
   // 飞书只有开了这个 scope 才会把「其他用户和机器人发送的、未 @ 本 bot 的群消息」推到
   // WSClient（官方 im.message.receive_v1 文档：「接收群聊中所有用户和其他机器人发送的
@@ -83,23 +83,23 @@ export const BOTMUX_REQUIRED_SCOPES: RequiredScope[] = [
   // 机器人）。它是 opt-in 特性专用，故标 non-critical：没开该功能的 bot 缺它不该被启动
   // 自检 DM 打扰；只有当同时缺别的 critical 项时才顺带在提示里列出。开了功能却缺它 →
   // bot 开的新话题收不到事件、自动开工静默不触发（预期降级，非崩溃）。
-  { name: 'im:message.group_msg.include_bot:read', desc: '接收群聊中所有用户和其他机器人发送的消息（「其他机器人开的新话题也自动开工」需要）', critical: false },
+  { name: 'im:message.group_msg.include_bot:read', desc: 'Receive messages from all users and bots in a group (required for auto-start on topics created by other bots)', critical: false },
   // Dashboard 建群/创建会话的原生飞书标签功能。标签 API 只接受用户身份，
   // 这里检测的是应用是否已经声明对应 user scope；真正使用时仍需用户做一次 OAuth。
   // 标 non-critical：不用标签的部署不应因它阻塞 daemon 启动；有缓存的开放平台
   // Web session 时，event-dispatcher 会在启动阶段静默补权限并发布新版本。
-  { name: 'im:feed_group_v1:read', desc: '读取飞书会话标签（Dashboard 建群分类）', critical: false },
-  { name: 'im:feed_group_v1:write', desc: '创建飞书会话标签并将新群加入标签', critical: false },
-  { name: 'im:chat.tabs:read', desc: '读取飞书群标签页（/tabs、botmux tabs）', critical: false },
-  { name: 'im:chat.tabs:write_only', desc: '管理飞书群标签页（/tabs、botmux tabs）', critical: false },
+  { name: 'im:feed_group_v1:read', desc: 'Read Lark conversation labels (Dashboard group classification)', critical: false },
+  { name: 'im:feed_group_v1:write', desc: 'Create Lark conversation labels and add new groups', critical: false },
+  { name: 'im:chat.tabs:read', desc: 'Read Lark chat tabs (/tabs and botmux tabs)', critical: false },
+  { name: 'im:chat.tabs:write_only', desc: 'Manage Lark chat tabs (/tabs and botmux tabs)', critical: false },
   // `botmux send --urgent[=app|sms|phone]`. Keep these non-critical: ordinary
   // messaging must continue when a tenant declines disruptive/quota-bearing
   // Buzz channels. New apps import them from the default manifest; existing
   // apps are silently topped up from the cached Open Platform session.
-  { name: 'im:message.urgent', desc: '应用内加急消息', critical: false },
-  { name: 'im:message.urgent:sms', desc: '短信加急消息（消耗租户额度）', critical: false },
-  { name: 'im:message.urgent:phone', desc: '电话加急消息（消耗租户额度）', critical: false },
-  { name: 'application:application:self_manage', desc: '应用自查 (免审批)', critical: false },
+  { name: 'im:message.urgent', desc: 'In-app urgent messages', critical: false },
+  { name: 'im:message.urgent:sms', desc: 'Urgent SMS messages (uses tenant quota)', critical: false },
+  { name: 'im:message.urgent:phone', desc: 'Urgent phone calls (uses tenant quota)', critical: false },
+  { name: 'application:application:self_manage', desc: 'App self-inspection (auto-approved)', critical: false },
 ];
 
 /** 文档评论入口（/watch-comment / /subscribe-lark-doc）专用的 app 权限。**不在** BOTMUX_REQUIRED_SCOPES
@@ -108,11 +108,11 @@ export const BOTMUX_REQUIRED_SCOPES: RequiredScope[] = [
  *  名字单一事实源 = utils/user-token.DOC_COMMENT_OAUTH_SCOPES（同名 OAuth user scope），
  *  这里补中文说明；test 兜底两者一致 + 都在 lark-scopes.json manifest 内。 */
 const DOC_SCOPE_DESC: Record<string, string> = {
-  'docs:document.subscription': '订阅云文档事件（评论新增）',
-  'docs:event:subscribe': '云文档事件订阅',
-  'docs:document.comment:read': '读取文档评论',
-  'docs:document.comment:create': '回复 / 新建文档评论',
-  'wiki:wiki:readonly': '解析 wiki 节点（订阅 wiki 文档时）',
+  'docs:document.subscription': 'Subscribe to cloud-document events (new comments)',
+  'docs:event:subscribe': 'Subscribe to cloud-document events',
+  'docs:document.comment:read': 'Read document comments',
+  'docs:document.comment:create': 'Reply to or create document comments',
+  'wiki:wiki:readonly': 'Resolve wiki nodes when subscribing to wiki documents',
 };
 export const DOC_FEATURE_SCOPES: RequiredScope[] = DOC_COMMENT_OAUTH_SCOPES.map((name) => ({
   name,
@@ -140,14 +140,14 @@ export const DOC_COMMENT_EVENT = 'drive.notice.comment_add_v1';
 
 /** VC meeting agent 所需的 app 权限。只有 bot 显式启用 vcMeetingAgent 时才检查。 */
 export const VC_MEETING_FEATURE_SCOPES: RequiredScope[] = [
-  { name: 'vc:meeting.bot.join:write', desc: '会议智能体入会 / 离会', critical: false },
-  { name: 'vc:meeting.meetingevent:read', desc: '读取 / 订阅会中事件流', critical: false },
-  { name: 'vc:meeting.message:write', desc: '发送会中文本消息 / 弹幕', critical: false },
+  { name: 'vc:meeting.bot.join:write', desc: 'Join or leave meetings as a meeting agent', critical: false },
+  { name: 'vc:meeting.meetingevent:read', desc: 'Read and subscribe to meeting event streams', critical: false },
+  { name: 'vc:meeting.message:write', desc: 'Send in-meeting text messages', critical: false },
 ];
 
 /** Realtime voice is only required when vcMeetingAgent.realtimeVoice.enabled is true. */
 export const VC_MEETING_REALTIME_VOICE_SCOPES: RequiredScope[] = [
-  { name: 'vc:meeting.bot.realtime:write', desc: '会议智能体实时语音发言', critical: false },
+  { name: 'vc:meeting.bot.realtime:write', desc: 'Meeting-agent real-time voice output', critical: false },
 ];
 
 /** VC bot push 事件。开放平台当前没有公开 API 可列出已订阅事件，只能给管理员检查清单。 */
@@ -380,7 +380,7 @@ export async function checkRequiredScopes(
     return {
       ok: false,
       error: 'need_self_manage',
-      message: '应用缺少 application:application:self_manage 权限, 无法自查 scope 列表',
+      message: 'The app lacks application:application:self_manage and cannot inspect its scope list',
     };
   }
   if (resp?.code !== 0) {
@@ -492,13 +492,13 @@ export function buildRemainingSteps(appId: string, brand: Brand = 'feishu'): Rem
   return [
     {
       title:
-        '申请权限 (一次性导入完整 JSON 提交审批) — 进入「权限管理」→「批量导入/导出权限」, 粘贴 ~/.botmux/lark-scopes.json',
+        'Request permissions by importing the complete JSON under Permission Management → Import/Export Permissions, then paste ~/.botmux/lark-scopes.json and submit',
       url: `${buildAppHomeDeepLink(appId, brand)}/auth`,
     },
     {
       title:
-        `添加重定向 URL ${remainingStepRedirectUrls().join(' 和 ')} `
-        + '(群聊模式 p2pMode=group / 会话群标签 feed-group / /login 必需, 用于跨用户调 API; 缺了会报 20029)',
+        `Add redirect URLs ${remainingStepRedirectUrls().join(' and ')} `
+        + '(required for p2pMode=group, feed-group session tags, and /login; missing URLs cause error 20029)',
       url: `${buildAppHomeDeepLink(appId, brand)}/safe`,
     },
   ];

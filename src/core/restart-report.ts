@@ -13,7 +13,10 @@ import { countActiveSessionsOnDisk } from '../services/session-store.js';
 import { botmuxVersion } from '../utils/install-info.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 
-export const GITHUB_REPO = 'deepcoldy/botmux';
+/** Release source for this downstream distribution. An environment override is
+ * useful for mirrors and test deployments without rebuilding the binary. */
+export const GITHUB_REPO = process.env.BOTMUX_GITHUB_REPO?.trim()
+  || 'jason-jimenez-bytedance/botmux';
 
 export interface RestartReportInput {
   kind: RestartKind;

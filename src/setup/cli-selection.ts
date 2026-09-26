@@ -58,7 +58,7 @@ export interface ResolvedCliSelection {
 
 // ─── aiden 选项 ──────────────────────────────────────────────────────────────
 
-const AIDEN_NATIVE: CliSelectOption = { key: 'aiden', label: 'Aiden（原生 agent）', cliId: 'aiden' };
+const AIDEN_NATIVE: CliSelectOption = { key: 'aiden', label: 'Aiden (native agent)', cliId: 'aiden' };
 const AIDEN_X_CLAUDE: CliSelectOption = { key: 'aiden-x-claude', label: 'Aiden × Claude', cliId: 'claude-code', wrapperCli: 'aiden x claude' };
 const AIDEN_X_CODEX: CliSelectOption = { key: 'aiden-x-codex', label: 'Aiden × Codex', cliId: 'codex', wrapperCli: 'aiden x codex' };
 
@@ -69,7 +69,7 @@ const AIDEN_VARIANTS: ReadonlyArray<CliSelectOption> = [AIDEN_NATIVE, AIDEN_X_CL
 //   - Mira App  → cliId `mira`：直连 Mira Web API（云端编排 + 远程沙盒，聊天/搜索）
 //   - Mir CLI   → cliId `mir` ：本地 `mircli -p`（在用户机器上执行、操作工作区）
 const MIRA_APP: CliSelectOption = { key: 'mira', label: 'Mira App（Web API）', cliId: 'mira' };
-const MIRA_CLI: CliSelectOption = { key: 'mir', label: 'Mir CLI（本地 mircli）', cliId: 'mir' };
+const MIRA_CLI: CliSelectOption = { key: 'mir', label: 'Mir CLI (local mircli)', cliId: 'mir' };
 
 const MIRA_VARIANTS: ReadonlyArray<CliSelectOption> = [MIRA_APP, MIRA_CLI];
 
@@ -89,7 +89,7 @@ const CODEX_VARIANTS: ReadonlyArray<CliSelectOption> = [CODEX_NATIVE, CODEX_APP]
 // 新版必须排在前面，避免安装当前 TRAE CLI 后误选 legacy adapter。
 const TRAE_X: CliSelectOption = {
   key: 'traex',
-  label: 'TRAE CLI 2.0（推荐；traex / traecli）',
+  label: 'TRAE CLI 2.0 (recommended; traex / traecli)',
   cliId: 'traex',
 };
 const FORGE_X_TRAEX: CliSelectOption = {
@@ -100,7 +100,7 @@ const FORGE_X_TRAEX: CliSelectOption = {
 };
 const TRAE_COCO: CliSelectOption = {
   key: 'coco',
-  label: 'TRAE CLI 1.0 / Coco（旧版，已停止维护）',
+  label: 'TRAE CLI 1.0 / Coco (legacy, no longer maintained)',
   cliId: 'coco',
 };
 const TRAE_VARIANTS: ReadonlyArray<CliSelectOption> = [TRAE_X, TRAE_COCO];

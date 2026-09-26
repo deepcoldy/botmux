@@ -65,14 +65,14 @@ export interface RegisterAppOptions {
 
 function defaultPrintQRCode(info: { url: string; expireIn: number }): void {
   const mins = Math.max(1, Math.round(info.expireIn / 60));
-  process.stderr.write('\n请用飞书 App 扫码完成应用创建：\n\n');
+  process.stderr.write('\nScan with the Feishu/Lark app to create the application:\n\n');
   qrcode.generate(info.url, { small: true }, (qr) => process.stderr.write(qr + '\n'));
   process.stderr.write(`\n二维码有效期约 ${mins} 分钟。也可在浏览器打开：\n  ${info.url}\n\n`);
 }
 
 function defaultPrintStatus(info: { status: string; interval?: number }): void {
   if (info.status === 'domain_switched') {
-    process.stderr.write('识别到国际版租户, 已切换到 larksuite.com 域名继续轮询。\n');
+    process.stderr.write('International tenant detected; continuing through larksuite.com.\n');
   } else if (info.status === 'slow_down' && info.interval) {
     process.stderr.write(`轮询过快, 间隔自动调整到 ${info.interval}s。\n`);
   }
@@ -101,7 +101,7 @@ export async function tryRegisterApp(opts: RegisterAppOptions = {}): Promise<Reg
       return {
         ok: false,
         error: 'unknown',
-        message: 'SDK 返回的 client_id/client_secret 为空',
+        message: 'The SDK returned an empty client_id/client_secret',
       };
     }
 
@@ -125,13 +125,13 @@ export async function tryRegisterApp(opts: RegisterAppOptions = {}): Promise<Reg
     // SDK 不会把 secret 放进 message, 但保险起见再过一次
     const safeMsg = rawMsg.replace(/[a-zA-Z0-9_-]{30,}/g, '***');
 
-    if (code === 'abort') return { ok: false, error: 'aborted', message: '用户取消扫码' };
-    if (code === 'expired_token') return { ok: false, error: 'expired', message: '二维码已过期, 请重试' };
-    if (code === 'access_denied') return { ok: false, error: 'denied', message: '用户在浏览器里拒绝授权' };
+    if (code === 'abort') return { ok: false, error: 'aborted', message: 'The QR scan was cancelled' };
+    if (code === 'expired_token') return { ok: false, error: 'expired', message: 'The QR code expired; retry' };
+    if (code === 'access_denied') return { ok: false, error: 'denied', message: 'Authorization was denied in the browser' };
 
     // 网络层错误 (axios) — 没固定 code, 看 message
     if (/ETIMEDOUT|ECONNREFUSED|ENOTFOUND|ECONNRESET|network/i.test(rawMsg)) {
-      return { ok: false, error: 'network', message: `网络错误: ${safeMsg}` };
+      return { ok: false, error: 'network', message: `Network error: ${safeMsg}` };
     }
 
     return { ok: false, error: 'unknown', message: safeMsg };

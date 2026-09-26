@@ -228,7 +228,7 @@ export class CodexNotifierOutboxWorker {
           message: `invalid_outbox_quarantined:${errorMessage(error)}`.slice(0, 500),
           retryAt: new Date(now).toISOString(),
         };
-        this.logger.error(`[codex-notifier] 损坏的 outbox 已隔离: ${file.name}`);
+        this.logger.error(`[codex-notifier] Corrupt outbox entry quarantined: ${file.name}`);
         continue;
       }
       try {
@@ -252,7 +252,7 @@ export class CodexNotifierOutboxWorker {
           message: errorMessage(error).slice(0, 500),
           retryAt: new Date(this.now() + retryMs).toISOString(),
         };
-        this.logger.error(`[codex-notifier] 事件投递失败，将在 ${retryMs}ms 后重试: ${this.lastError.message}`);
+        this.logger.error(`[codex-notifier] Event delivery failed; retrying in ${retryMs}ms: ${this.lastError.message}`);
       }
     }
     this.writeState(summary.accepted + summary.duplicate + summary.failed > 0);
@@ -277,7 +277,7 @@ export class CodexNotifierOutboxWorker {
         try {
           await this.processOnce();
         } catch (error) {
-          this.logger.error(`[codex-notifier] worker 循环失败: ${errorMessage(error)}`);
+          this.logger.error(`[codex-notifier] Worker loop failed: ${errorMessage(error)}`);
           this.writeState(true);
         }
         await delay(this.pollIntervalMs, this.options.signal);
@@ -312,7 +312,7 @@ export async function runCodexNotifierWorkerSupervisor(
     try {
       lease = acquireLease(options.dataDir);
     } catch (error) {
-      options.logger?.error(`[codex-notifier] worker lease 获取失败: ${errorMessage(error)}`);
+      options.logger?.error(`[codex-notifier] Failed to acquire worker lease: ${errorMessage(error)}`);
       await delay(retryMs, options.signal);
       continue;
     }

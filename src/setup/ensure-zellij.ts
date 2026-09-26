@@ -72,7 +72,7 @@ function probeZellijVersion(): string | undefined {
  */
 export function probeZellijFunctional(): { ok: true; version: string } | { ok: false; reason: string } {
   const raw = probeZellijVersion();
-  if (!raw) return { ok: false, reason: 'zellij 二进制不在 PATH 上' };
+  if (!raw) return { ok: false, reason: 'The zellij binary is not on PATH' };
   const parsed = parseZellijVersion(raw);
   if (!parsed) return { ok: false, reason: `无法解析 zellij 版本：${raw}` };
   if (!isZellijVersionSupported(parsed)) {

@@ -191,7 +191,7 @@ describe('zmx env/probe helpers', () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toContain('ReadOnlyFileSystem');
-      expect(result.reason).not.toContain('不在 PATH 上');
+      expect(result.reason).not.toContain('not on PATH');
       // The effective socket-dir source is actionable on a headless daemon.
       expect(result.reason).toContain('ZMX_DIR=/tmp/zmx-readonly');
     }
@@ -202,7 +202,7 @@ describe('zmx env/probe helpers', () => {
     failure.code = 'ENOENT';
     execFileSyncMock.mockImplementationOnce(() => { throw failure; });
 
-    expect(probeZmxVersion()).toEqual({ ok: false, reason: 'zmx 二进制不在 PATH 上' });
+    expect(probeZmxVersion()).toEqual({ ok: false, reason: 'The zmx binary is not on PATH' });
   });
 
   it('reports a probe timeout as a timeout rather than a missing binary', () => {
@@ -215,7 +215,7 @@ describe('zmx env/probe helpers', () => {
     expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toContain('超时');
-      expect(result.reason).not.toContain('不在 PATH 上');
+      expect(result.reason).not.toContain('not on PATH');
     }
   });
 

@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildBotFromAddFlags,
   editInputFromFlags,
+  extractSetupLocaleArgs,
   isScriptedSetupInvocation,
   maskAppSecret,
   parseSetupCommand,
@@ -29,10 +30,32 @@ describe('isScriptedSetupInvocation', () => {
   });
 });
 
+describe('extractSetupLocaleArgs', () => {
+  it('extracts --lang before setup mode detection', () => {
+    expect(extractSetupLocaleArgs(['--lang', 'en'])).toEqual({ argv: [], locale: 'en' });
+    expect(extractSetupLocaleArgs(['add', '--lang=zh', '--json'])).toEqual({
+      argv: ['add', '--json'],
+      locale: 'zh',
+    });
+  });
+
+  it('rejects missing and unsupported language values in English', () => {
+    expect(() => extractSetupLocaleArgs(['--lang'])).toThrow('--lang requires a value');
+    expect(() => extractSetupLocaleArgs(['--lang', 'fr'])).toThrow('Supported values: en, zh');
+  });
+
+  it('renders scripted validation errors in the selected setup language', () => {
+    expect(() => parseSetupCommand(['list', '--cli', 'codex'], 'en'))
+      .toThrow('list does not accept field option --cli');
+    expect(() => parseSetupCommand(['list', '--cli', 'codex'], 'zh'))
+      .toThrow('list 不接受字段参数 --cli');
+  });
+});
+
 describe('SETUP_CLI_USAGE', () => {
   it('warns Agents that open_id is app-scoped and must not be copied across Bots', () => {
     expect(SETUP_CLI_USAGE).toContain('ou_xxx 仅限已有目标应用自身');
-    expect(SETUP_CLI_USAGE).toContain('勿跨 Bot 复制');
+    expect(SETUP_CLI_USAGE).toContain('--lang <en|zh>');
   });
 });
 

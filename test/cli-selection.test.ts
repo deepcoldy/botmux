@@ -71,8 +71,8 @@ describe('CLI_SELECT_OPTIONS / CLI_SELECT_TREE', () => {
     expect(trae?.label).toBe('TRAE CLI');
     expect(trae?.children?.map((c) => c.key)).toEqual(['traex', 'coco']);
     expect(trae?.children?.map((c) => c.label)).toEqual([
-      'TRAE CLI 2.0（推荐；traex / traecli）',
-      'TRAE CLI 1.0 / Coco（旧版，已停止维护）',
+      'TRAE CLI 2.0 (recommended; traex / traecli)',
+      'TRAE CLI 1.0 / Coco (legacy, no longer maintained)',
     ]);
     expect(trae?.option).toBeUndefined();
     expect(CLI_SELECT_TREE.find((g) => g.key === 'coco')).toBeUndefined();

@@ -103,11 +103,11 @@ export function ensureAskSkill(cliId: string, skillsDir: string | undefined, ins
       if (existsSync(skillFile) && readFileSync(skillFile, 'utf-8') === ASK_SKILL) return;
       mkdirSync(skillDir, { recursive: true });
       atomicWriteFileSync(skillFile, ASK_SKILL);
-      logger.info(`[skills] Installed ${ASK_SKILL_NAME} (无 hook 接管，兜底) for ${cliId} → ${skillFile}`);
+      logger.info(`[skills] Installed ${ASK_SKILL_NAME} (fallback without hook interception) for ${cliId} → ${skillFile}`);
     } else {
       if (!existsSync(skillDir)) return;
       rmSync(skillDir, { recursive: true, force: true });
-      logger.info(`[skills] Removed ${ASK_SKILL_NAME} (hook 已接管) for ${cliId}`);
+      logger.info(`[skills] Removed ${ASK_SKILL_NAME} (hook now handles it) for ${cliId}`);
     }
   } catch (err: any) {
     logger.warn(`[skills] ensureAskSkill(${install}) failed for ${cliId}: ${err.message}`);

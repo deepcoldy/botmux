@@ -191,8 +191,8 @@ export function createDebugTerminalManager(deps: DebugTerminalDeps): DebugTermin
     // 必须和 `/api/debug-terminal` 的 HTTP 门禁一致——解析出 legacy 管理身份才放行，
     // 平台注入身份（X-Botmux-Role owner/teammate/guest）一律拒。
     if (!deps.isLegacyManagementRequest(req)) {
-      logger.warn('[debug-terminal] 拒绝非本机管理身份的 WS 升级'
-        + '（cookie 有效但不是 legacy-dashboard 身份，例如经中心平台隧道注入的角色）');
+      logger.warn('[debug-terminal] Rejected WebSocket upgrade from a non-local administrative identity'
+        + ' (cookie is valid but not a legacy-dashboard identity, such as a role injected through the central-platform tunnel)');
       return false;
     }
     return true;

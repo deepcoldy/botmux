@@ -279,8 +279,8 @@ export function assertOwnerWhenChatGroups(
 ): void {
   if ((config.allowedChatGroups?.length ?? 0) > 0 && !hasOwnerEntry(config.allowedUsers)) {
     throw new Error(
-      '配置了 allowedChatGroups 时必须同时在 allowedUsers 配置至少一个 owner（完整邮箱、union_id on_xxx 或 open_id ou_xxx），' +
-      '否则群成员能对话但没人能执行 /restart、/close 等敏感操作，/grant 也不可用。',
+      'When allowedChatGroups is configured, allowedUsers must include at least one owner (full email address, union_id on_xxx, or open_id ou_xxx). ' +
+      'Otherwise chat members can talk to the bot, but nobody can perform sensitive operations such as /restart or /close, and /grant is unavailable.',
     );
   }
 }
@@ -368,7 +368,7 @@ export function assertUniqueBotProcessNames(
     if (firstIndex !== undefined) {
       throw new Error(
         `进程名 "${name}" 在 bots.json 第 ${firstIndex + 1} 条和第 ${i + 1} 条重复. ` +
-        '请改 "name" 让进程名唯一, 或清空其中一个后再重启.',
+        'Change "name" so every process name is unique, or clear one of the values before restarting.',
       );
     }
     seen.set(name, i);

@@ -112,15 +112,15 @@ describe('「选择已有应用」遇到飞书 Web 登录态失效', () => {
       .mockResolvedValueOnce([{ clientId: 'cli_existing', name: '存量应用' }]);
     mocks.fetchOpenPlatformAppSecret.mockResolvedValue('existing-secret');
     const titles = scriptChoices({
-      '飞书应用来源': [1],
-      '飞书登录态已失效': [0], // 重新扫码
-      '选择已有应用': [0],
+      'App source': [1],
+      'Feishu session expired': [0], // scan again
+      'Select an existing app': [0],
     });
 
     const creds = await obtainCredentials(fakeRl([]));
 
     expect(creds).toMatchObject({ ok: true, appId: 'cli_existing', appSecret: 'existing-secret', brand: 'feishu' });
-    expect(titles).toEqual(['飞书应用来源', '飞书登录态已失效', '选择已有应用']);
+    expect(titles).toEqual(['App source', 'Feishu session expired', 'Select an existing app']);
     // 关键：第一轮复用缓存，第二轮必须 forceQrLogin —— 否则还是同一份坏 cookie。
     expect(mocks.prepareFeishuWebSession).toHaveBeenCalledTimes(2);
     expect(mocks.prepareFeishuWebSession.mock.calls[0][0]).toMatchObject({ forceQrLogin: false });
@@ -130,30 +130,30 @@ describe('「选择已有应用」遇到飞书 Web 登录态失效', () => {
   it('TTY：选「返回应用来源」不重扫，回到来源菜单继续走别的路', async () => {
     mocks.listOpenPlatformApps.mockRejectedValue(loggedOutError());
     const titles = scriptChoices({
-      '飞书应用来源': [1, 2],   // 先「选择已有应用」，失败后改「手动输入」
-      '飞书登录态已失效': [1],  // 返回应用来源
-      '租户类型': [0],
+      'App source': [1, 2],
+      'Feishu session expired': [1],
+      'Tenant type': [0],
     });
 
     const creds = await obtainCredentials(fakeRl(['cli_manual', 'manual-secret']));
 
     expect(creds).toMatchObject({ ok: true, appId: 'cli_manual' });
-    expect(titles).toEqual(['飞书应用来源', '飞书登录态已失效', '飞书应用来源', '租户类型']);
+    expect(titles).toEqual(['App source', 'Feishu session expired', 'App source', 'Tenant type']);
     expect(mocks.prepareFeishuWebSession).toHaveBeenCalledTimes(1);
   });
 
   it('TTY：重新扫完还是失效 → 不再追问，直接回来源菜单（不换个死循环）', async () => {
     mocks.listOpenPlatformApps.mockRejectedValue(loggedOutError());
     const titles = scriptChoices({
-      '飞书应用来源': [1, 2],
-      '飞书登录态已失效': [0],  // 只会被问这一次
-      '租户类型': [0],
+      'App source': [1, 2],
+      'Feishu session expired': [0],
+      'Tenant type': [0],
     });
 
     const creds = await obtainCredentials(fakeRl(['cli_manual', 'manual-secret']));
 
     expect(creds).toMatchObject({ ok: true, appId: 'cli_manual' });
-    expect(titles.filter(t => t === '飞书登录态已失效')).toHaveLength(1);
+    expect(titles.filter(t => t === 'Feishu session expired')).toHaveLength(1);
     expect(mocks.prepareFeishuWebSession).toHaveBeenCalledTimes(2);
   });
 
@@ -161,10 +161,10 @@ describe('「选择已有应用」遇到飞书 Web 登录态失效', () => {
     mocks.listOpenPlatformApps.mockResolvedValue([{ clientId: 'cli_existing', name: '存量应用' }]);
     mocks.fetchOpenPlatformAppSecret.mockRejectedValue(loggedOutError('/developers/v1/secret/cli_existing'));
     const titles = scriptChoices({
-      '飞书应用来源': [1, 2],
-      '选择已有应用': [0],
-      '飞书登录态已失效': [1], // 返回应用来源
-      '租户类型': [0],
+      'App source': [1, 2],
+      'Select an existing app': [0],
+      'Feishu session expired': [1],
+      'Tenant type': [0],
     });
     const asked: string[] = [];
     const rl = fakeRl(['cli_manual', 'manual-secret']);
@@ -176,15 +176,15 @@ describe('「选择已有应用」遇到飞书 Web 登录态失效', () => {
     expect(creds).toMatchObject({ ok: true, appId: 'cli_manual' });
     // 登出态下「手动粘贴 AppSecret」是个死路（secret 本来就要登录态才读得到），
     // 选了返回就不该再被问一遍。
-    expect(asked.some(q => q.includes('请手动粘贴'))).toBe(false);
-    expect(titles).toEqual(['飞书应用来源', '选择已有应用', '飞书登录态已失效', '飞书应用来源', '租户类型']);
+    expect(asked.some(q => q.includes('Paste the AppSecret'))).toBe(false);
+    expect(titles).toEqual(['App source', 'Select an existing app', 'Feishu session expired', 'App source', 'Tenant type']);
   });
 
   it('非 TTY：读 AppSecret 报登出 → 问不成扫码，保留手动粘贴兜底（管道下唯一能走通的路）', async () => {
     setTty(false);
     mocks.listOpenPlatformApps.mockResolvedValue([{ clientId: 'cli_existing', name: '存量应用' }]);
     mocks.fetchOpenPlatformAppSecret.mockRejectedValue(loggedOutError('/developers/v1/secret/cli_existing'));
-    scriptChoices({ '飞书应用来源': [1], '选择已有应用': [0] });
+    scriptChoices({ 'App source': [1], 'Select an existing app': [0] });
 
     const creds = await obtainCredentials(fakeRl(['pasted-secret']));
 
@@ -197,15 +197,15 @@ describe('「选择已有应用」遇到飞书 Web 登录态失效', () => {
       .mockRejectedValueOnce(loggedOutError('/developers/v1/secret/cli_existing'))
       .mockResolvedValueOnce('existing-secret');
     const titles = scriptChoices({
-      '飞书应用来源': [1],
-      '选择已有应用': [0, 0],
-      '飞书登录态已失效': [0],
+      'App source': [1],
+      'Select an existing app': [0, 0],
+      'Feishu session expired': [0],
     });
 
     const creds = await obtainCredentials(fakeRl([]));
 
     expect(creds).toMatchObject({ ok: true, appId: 'cli_existing', appSecret: 'existing-secret' });
-    expect(titles).toEqual(['飞书应用来源', '选择已有应用', '飞书登录态已失效', '选择已有应用']);
+    expect(titles).toEqual(['App source', 'Select an existing app', 'Feishu session expired', 'Select an existing app']);
     expect(mocks.listOpenPlatformApps).toHaveBeenCalledTimes(2);
     expect(mocks.prepareFeishuWebSession.mock.calls[1][0]).toMatchObject({ forceQrLogin: true });
   });
@@ -214,7 +214,7 @@ describe('「选择已有应用」遇到飞书 Web 登录态失效', () => {
     // obtainCredentials 的契约：back = 用户主动退出（静默），failed = 技术性失败
     // （补一句「已返回…可重试或改走其他方式」）。两条都回同一个菜单，差别只在这句话，
     // 所以只能从输出上锚定——否则这个分支等于没测。
-    const navLine = '已返回「飞书应用来源」';
+    const navLine = 'Returned to app source';
     const capture = (): string[] => {
       const lines: string[] = [];
       vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => { lines.push(args.join(' ')); });
@@ -223,7 +223,7 @@ describe('「选择已有应用」遇到飞书 Web 登录态失效', () => {
 
     // ① 用户自己选「返回应用来源」→ 静默。
     mocks.listOpenPlatformApps.mockRejectedValue(loggedOutError());
-    scriptChoices({ '飞书应用来源': [1, 2], '飞书登录态已失效': [1], '租户类型': [0] });
+    scriptChoices({ 'App source': [1, 2], 'Feishu session expired': [1], 'Tenant type': [0] });
     let lines = capture();
     await obtainCredentials(fakeRl(['cli_manual', 'manual-secret']));
     vi.restoreAllMocks();
@@ -234,7 +234,7 @@ describe('「选择已有应用」遇到飞书 Web 登录态失效', () => {
     mocks.prepareFeishuWebSession.mockResolvedValue({ ok: true, cookies: [] });
     mocks.createOpenPlatformApiClient.mockResolvedValue({ ok: true, client: {} });
     mocks.listOpenPlatformApps.mockRejectedValue(loggedOutError());
-    scriptChoices({ '飞书应用来源': [1, 2], '飞书登录态已失效': [0], '租户类型': [0] });
+    scriptChoices({ 'App source': [1, 2], 'Feishu session expired': [0], 'Tenant type': [0] });
     lines = capture();
     await obtainCredentials(fakeRl(['cli_manual', 'manual-secret']));
     vi.restoreAllMocks();
@@ -249,24 +249,24 @@ describe('「选择已有应用」遇到飞书 Web 登录态失效', () => {
       { code: 99991641, msg: '系统繁忙' },
       400,
     ));
-    const titles = scriptChoices({ '飞书应用来源': [1, 2], '租户类型': [0] });
+    const titles = scriptChoices({ 'App source': [1, 2], 'Tenant type': [0] });
 
     const creds = await obtainCredentials(fakeRl(['cli_manual', 'manual-secret']));
 
     expect(creds).toMatchObject({ ok: true, appId: 'cli_manual' });
-    expect(titles).not.toContain('飞书登录态已失效');
+    expect(titles).not.toContain('Feishu session expired');
     expect(mocks.prepareFeishuWebSession).toHaveBeenCalledTimes(1);
   });
 
   it('非 TTY：不弹二维码也不重扫，按旧契约直落手动输入', async () => {
     setTty(false);
     mocks.listOpenPlatformApps.mockRejectedValue(loggedOutError());
-    const titles = scriptChoices({ '飞书应用来源': [1], '租户类型': [0] });
+    const titles = scriptChoices({ 'App source': [1], 'Tenant type': [0] });
 
     const creds = await obtainCredentials(fakeRl(['cli_manual', 'manual-secret']));
 
     expect(creds).toMatchObject({ ok: true, appId: 'cli_manual' });
-    expect(titles).not.toContain('飞书登录态已失效');
+    expect(titles).not.toContain('Feishu session expired');
     expect(mocks.prepareFeishuWebSession).toHaveBeenCalledTimes(1);
     expect(mocks.prepareFeishuWebSession.mock.calls[0][0]).toMatchObject({ forceQrLogin: false });
   });
@@ -277,7 +277,7 @@ describe('「选择已有应用」遇到飞书 Web 登录态失效', () => {
       .mockResolvedValueOnce({ ok: true, client: {} });
     mocks.listOpenPlatformApps.mockResolvedValue([{ clientId: 'cli_existing', name: '存量应用' }]);
     mocks.fetchOpenPlatformAppSecret.mockResolvedValue('existing-secret');
-    scriptChoices({ '飞书应用来源': [1], '飞书登录态已失效': [0], '选择已有应用': [0] });
+    scriptChoices({ 'App source': [1], 'Feishu session expired': [0], 'Select an existing app': [0] });
 
     const creds = await obtainCredentials(fakeRl([]));
 
@@ -287,12 +287,12 @@ describe('「选择已有应用」遇到飞书 Web 登录态失效', () => {
 
   it('network 类失败不弹扫码（重扫治不了连不上）', async () => {
     mocks.createOpenPlatformApiClient.mockResolvedValue({ ok: false, reason: 'network', message: '读取开放平台页面失败' });
-    const titles = scriptChoices({ '飞书应用来源': [1, 2], '租户类型': [0] });
+    const titles = scriptChoices({ 'App source': [1, 2], 'Tenant type': [0] });
 
     const creds = await obtainCredentials(fakeRl(['cli_manual', 'manual-secret']));
 
     expect(creds).toMatchObject({ ok: true, appId: 'cli_manual' });
-    expect(titles).not.toContain('飞书登录态已失效');
+    expect(titles).not.toContain('Feishu session expired');
     expect(mocks.prepareFeishuWebSession).toHaveBeenCalledTimes(1);
   });
 });

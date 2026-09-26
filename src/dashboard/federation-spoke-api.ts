@@ -111,7 +111,7 @@ export async function resolveOwnerCandidatesFromAllowedUsers(d: OwnerResolveDeps
     try { ensureClient(cfg); } catch { continue; }
     let openIds: string[] = [];
     try { openIds = await resolveAllowed(cfg.larkAppId, nonUnion); } catch {
-      logger.warn(`resolveOwnerCandidates [${cfg.larkAppId}]: resolveAllowed 失败，跳过该 bot`);
+      logger.warn(`resolveOwnerCandidates [${cfg.larkAppId}]: resolveAllowed failed; skipping this bot`);
       continue;
     }
     for (const oid of openIds) {

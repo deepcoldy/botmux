@@ -28,7 +28,7 @@ export function ensureCjkFontsInstalled(): void {
   if (process.platform !== 'linux') return;
   if (CJK_PROBE_PATHS.some(p => existsSync(p))) return;
   if (!existsSync('/usr/bin/apt-get')) {
-    logger.warn(`截图缺 CJK 字体，但当前系统不是 Debian/Ubuntu，请手动安装 Noto CJK 字体（包名因发行版而异）。`);
+    logger.warn('CJK screenshot fonts are missing, and this system is not Debian/Ubuntu. Install Noto CJK fonts manually (package names vary by distribution).');
     return;
   }
 
@@ -37,7 +37,7 @@ export function ensureCjkFontsInstalled(): void {
     ? ['apt-get', 'install', '-y', ...PKGS]
     : ['sudo', '-n', 'apt-get', 'install', '-y', ...PKGS];
 
-  logger.info(`[font-installer] 后台安装 CJK 字体：${argv.join(' ')}`);
+  logger.info(`[font-installer] Installing CJK fonts in the background: ${argv.join(' ')}`);
 
   const proc = spawn(argv[0], argv.slice(1), {
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -47,16 +47,16 @@ export function ensureCjkFontsInstalled(): void {
   let stderr = '';
   proc.stderr?.on('data', d => { stderr += d.toString(); });
   proc.on('error', err => {
-    logger.warn(`[font-installer] 启动失败：${err.message}。请手动执行：${MANUAL_CMD}`);
+    logger.warn(`[font-installer] Startup failed: ${err.message}. Run manually: ${MANUAL_CMD}`);
   });
   proc.on('exit', code => {
     if (code === 0) {
-      logger.info('[font-installer] CJK 字体安装成功；重启 daemon 后截图即可正确渲染中文（botmux restart）。');
+      logger.info('[font-installer] CJK fonts installed. Restart the daemon for screenshots to render CJK characters correctly (botmux restart).');
     } else {
       const hint = stderr.includes('password is required') || stderr.includes('a terminal is required')
         ? '（当前用户没有免密 sudo 权限）'
         : '';
-      logger.warn(`[font-installer] 安装失败 exit=${code}${hint}。请手动执行：${MANUAL_CMD}\n${stderr.trim().slice(0, 400)}`);
+      logger.warn(`[font-installer] Installation failed exit=${code}${hint}. Run manually: ${MANUAL_CMD}\n${stderr.trim().slice(0, 400)}`);
     }
   });
   proc.unref();

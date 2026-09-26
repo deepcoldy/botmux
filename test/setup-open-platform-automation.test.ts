@@ -20,6 +20,7 @@ import {
   BOTMUX_REDIRECT_URL,
   botmuxFeishuSessionFilePath,
   buildFeishuQrPayload,
+  buildManifestTemplateCreatePayload,
   buildPrivilegeAppAvailabilityContent,
   buildPrivilegeUpdatePayload,
   buildSafeSettingPayload,
@@ -61,6 +62,7 @@ import {
   writeStoredCookiesToSessionFile,
 } from '../src/setup/open-platform-automation.js';
 import { classifySetupOpenPlatformOutcome } from '../src/setup/open-platform-outcome.js';
+import { setDefaultLocale } from '../src/i18n/index.js';
 
 function cookie(overrides: Partial<StoredCookie> = {}): StoredCookie {
   return {
@@ -217,6 +219,21 @@ describe('botmux Feishu session cookie adapter', () => {
 });
 
 describe('Open Platform payload helpers', () => {
+  it('uses the selected setup language as the new app primary language', () => {
+    try {
+      setDefaultLocale('en');
+      expect(buildManifestTemplateCreatePayload('Team Bot', 'Assistant', 'avatar', 'cid'))
+        .toMatchObject({
+          createAppUserCustomField: {
+            i18n: { en_us: { name: 'Team Bot', description: 'Assistant' } },
+            primaryLang: 'en_us',
+          },
+        });
+    } finally {
+      setDefaultLocale('zh');
+    }
+  });
+
   it('builds Feishu QR payload and maps polling status', () => {
     expect(buildFeishuQrPayload('qr-token')).toBe(JSON.stringify({ qrlogin: { token: 'qr-token' } }));
     expect(mapFeishuQrPollingStatus(2)).toBe('已经扫码，等待手机确认');

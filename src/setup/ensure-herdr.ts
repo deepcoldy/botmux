@@ -59,7 +59,7 @@ export async function ensureHerdr(): Promise<HerdrResult> {
     return { installed: true, version: existing, freshInstall: false };
   }
 
-  console.log('⚠️  herdr 未检测到，正在通过官方 install.sh 安装...');
+  console.log('⚠️  herdr was not found. Installing it through the official install.sh...');
   const ok = runCurlInstaller();
   if (ok) {
     const after = probeHerdrVersion();
@@ -70,14 +70,14 @@ export async function ensureHerdr(): Promise<HerdrResult> {
     return {
       installed: false,
       freshInstall: true,
-      reason: '安装脚本返回 0，但 PATH 上仍找不到 herdr — 可能装到了非 PATH 目录，请重启 shell 或检查 ~/.local/bin / ~/.cargo/bin 是否在 PATH 中',
+      reason: 'The installer exited successfully, but herdr is still not on PATH. Restart the shell or check whether ~/.local/bin / ~/.cargo/bin is on PATH.',
       manualCommand: 'curl -fsSL https://herdr.dev/install.sh | sh',
     };
   }
   return {
     installed: false,
     freshInstall: false,
-    reason: '官方 install.sh 执行失败（curl/网络/权限问题）',
+    reason: 'The official install.sh failed (curl, network, or permission error)',
     manualCommand: 'curl -fsSL https://herdr.dev/install.sh | sh',
   };
 }

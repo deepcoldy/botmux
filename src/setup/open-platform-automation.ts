@@ -20,12 +20,17 @@ import { BOTMUX_APP_ICON_BASE64, BOTMUX_APP_ICON_BYTES } from './app-icon-data.j
 import { registerBotmuxRedirectUrlCollector, VC_MEETING_BOT_EVENTS } from './verify-permissions.js';
 import { readGlobalConfig } from '../global-config.js';
 import { logger } from '../utils/logger.js';
+import { getDefaultLocale } from '../i18n/index.js';
 import { platformMachineBaseUrl, publicReverseProxyBaseUrl } from '../platform/binding.js';
 import {
   parseOnlineVisibility,
   VisibilityParseError,
   type VisibilitySuggest,
 } from './open-platform-visibility.js';
+
+function setupText(zh: string, en: string): string {
+  return getDefaultLocale() === 'en' ? en : zh;
+}
 
 /**
  * All non-VC events (application identity) that the botmux dispatcher consumes.
@@ -771,9 +776,9 @@ export async function inspectUnderReviewConfigHints(appId: string, brand?: 'feis
       const unnarrowed = state.privileges.filter(p => p.isRequired && !isPrivilegeRangeNarrowed(p));
       if (unnarrowed.length > 0) {
         const listed = unnarrowed.map(p => `${p.bizName || p.bizId}/${p.name || p.resource}`).join('、');
-        parts.push(`实测该应用有 ${unnarrowed.length} 项必填「数据范围」尚未收敛（${listed}）——大概率就是卡点`);
+        parts.push(`${unnarrowed.length} required data-scope setting(s) are still unrestricted (${listed}); this is probably blocking approval`);
       } else {
-        parts.push('实测必填「数据范围」都已收敛，卡点可能是别的规则（看审批详情）');
+        parts.push('All required data-scope settings are restricted; another rule may be blocking approval (see the approval details)');
       }
     } catch { /* 读不到就不提数据范围 */ }
     // ② 租户审批规则原文链接：比我们转述强 —— 万一卡的是别的规则，链接照样有用。
@@ -783,9 +788,9 @@ export async function inspectUnderReviewConfigHints(appId: string, brand?: 'feis
     try {
       const rule: any = await post(`/developers/v1/config/audit_rule/${appId}`, {});
       const auditUrl = pickString(asRecord(asRecord(rule).data), ['auditUrl']);
-      if (auditUrl) parts.push(`企业审批规则原文：${auditUrl}`);
+      if (auditUrl) parts.push(`Tenant approval rules: ${auditUrl}`);
     } catch { /* 拿不到链接不影响其余线索 */ }
-    return parts.length > 0 ? `\n\n**线索**：${parts.join('；')}。` : '';
+    return parts.length > 0 ? `\n\n**Evidence**: ${parts.join('; ')}.` : '';
   } catch {
     return '';
   }
@@ -885,7 +890,7 @@ export function extractOpenPlatformRedirectUrls(payload: unknown): string[] | nu
     // 静默把「其实有内容」当成空集去合并写，且没有回读校验能兜住。日志是
     // 事后唯一能把线上白名单异常追回到这次推断的线索。
     if (omittedEmptyList) {
-      logger.info('[open-platform] safe_setting 未返回 redirectURL 键，按服务端约定视为空白名单（其余字段形状已校验）');
+      logger.info('[open-platform] safe_setting omitted redirectURL; treating it as an empty allowlist according to the server contract after validating the remaining response shape');
     }
     return omittedEmptyList ? [] : null;
   }
@@ -983,7 +988,7 @@ export async function writeRedirectWhitelist(
   try {
     const payload = await postJson(`/developers/v1/safe_setting/${appId}`, {});
     existing = extractOpenPlatformRedirectUrls(payload);
-    if (existing === null) readError = '返回体里没有可识别的 redirectURL 数组';
+    if (existing === null) readError = 'the response contained no recognizable redirectURL array';
   } catch (err: any) {
     // 开放平台首页仍可能返回 csrf，但具体 console 接口才报
     // Code=4101 / "please log in again"。这不是「白名单读不出」，而是
@@ -1000,7 +1005,10 @@ export async function writeRedirectWhitelist(
       status: 'skipped_unreadable',
       existing: null,
       redirectUrls: [],
-      warning: `读不到开放平台现有 redirect 白名单（${readError ?? '未知原因'}），为避免覆盖用户自定义回调地址，本次未写入`,
+      warning: setupText(
+        `读不到开放平台现有 redirect 白名单（${readError ?? '未知原因'}），为避免覆盖用户自定义回调地址，本次未写入`,
+        `Could not read the existing Open Platform redirect allowlist (${readError ?? 'unknown reason'}); nothing was written to avoid overwriting custom callback URLs`,
+      ),
     };
   }
 
@@ -1268,9 +1276,9 @@ export function buildFeishuQrPayload(token: string): string {
 }
 
 export function mapFeishuQrPollingStatus(status: number | null): string {
-  if (status === 2) return '已经扫码，等待手机确认';
-  if (status === 5) return '二维码已过期';
-  return '等待飞书扫码';
+  if (status === 2) return setupText('已经扫码，等待手机确认', 'QR code scanned; waiting for confirmation on the phone');
+  if (status === 5) return setupText('二维码已过期', 'QR code expired');
+  return setupText('等待飞书扫码', 'Waiting for a Feishu/Lark QR scan');
 }
 
 export async function prepareFeishuWebSession(
@@ -1295,7 +1303,7 @@ export async function prepareFeishuWebSession(
     return {
       ok: false,
       reason: 'invalid_session',
-      message: '没有可复用的 Feishu Web session；为避免意外出现第二个二维码，已停止自动登录',
+      message: 'No reusable Feishu Web session is available. Automatic sign-in was stopped to avoid showing an unexpected second QR code.',
       sessionFile,
     };
   }
@@ -1347,7 +1355,7 @@ export async function automateOpenPlatformSetup(
     return {
       ok: false,
       reason: 'unsupported_brand',
-      message: '开放平台自动配置当前只支持 feishu.cn 租户',
+      message: 'Automatic Open Platform configuration currently supports only feishu.cn tenants',
       redirectConfigured: false,
     };
   }
@@ -1370,7 +1378,7 @@ export async function automateOpenPlatformSetup(
     return {
       ok: false,
       reason: preparedSession.reason,
-      message: `获取 Feishu Web session 失败: ${preparedSession.message}`,
+      message: `Could not obtain a Feishu Web session: ${preparedSession.message}`,
       sessionFile: preparedSession.sessionFile,
       redirectConfigured: false,
     };
@@ -1403,7 +1411,7 @@ export async function automateOpenPlatformSetup(
     return {
       ok: false,
       reason: 'network',
-      message: `读取开放平台页面失败: ${safeErrorMessage(err)}`,
+      message: `Could not read the Open Platform page: ${safeErrorMessage(err)}`,
       sessionFile,
       redirectConfigured: false,
     };
@@ -1413,7 +1421,7 @@ export async function automateOpenPlatformSetup(
       ok: false,
       reason: 'missing_csrf',
       message:
-        'Feishu session 可读取，但开放平台页面没有返回 window.csrfToken；可能需要在浏览器完成开放平台登录',
+        'The Feishu session is readable, but the Open Platform page did not return window.csrfToken. Complete the Open Platform sign-in in a browser.',
       sessionFile,
       redirectConfigured: false,
     };
@@ -1629,11 +1637,15 @@ export async function automateOpenPlatformSetup(
       return {
         ok: false,
         reason: 'app_under_review',
-        message:
+        message: setupText(
           '应用正在飞书审核中，开放平台暂时锁定了它的配置写入（权限申请、机器人能力、回调白名单都改不了）。'
-          + '**审批被触发通常意味着有配置不合规**（最常见：权限的「数据范围」没配，默认成「全部/全员」，'
-          + '撞上租户「非必要不申请全员数据」的加签规则）。需要人工处理：到开放平台看审批详情 → 修掉不合规项 '
-          + '→ 撤回该待审版本 → 重新提交。注意：撤回后直接重提**不会**自动通过，规则会再拦一次。',
+            + '**审批被触发通常意味着有配置不合规**（最常见：权限的「数据范围」没配，默认成「全部/全员」，'
+            + '撞上租户「非必要不申请全员数据」的加签规则）。需要人工处理：到开放平台看审批详情 → 修掉不合规项 '
+            + '→ 撤回该待审版本 → 重新提交。注意：撤回后直接重提**不会**自动通过，规则会再拦一次。',
+          'The app is under Feishu review, so Open Platform temporarily blocks configuration writes (permissions, bot capability, and callback allowlists). '
+            + '**Review usually means a configuration violates a policy**. The most common cause is an unrestricted permission data scope that triggers a tenant rule against unnecessary all-employee access. '
+            + 'Open the approval details, fix the non-compliant setting, withdraw the pending version, and submit again. Withdrawing and immediately resubmitting without a fix will be blocked by the same rule.',
+        ),
         sessionFile,
         redirectConfigured,
         redirectWarning,
@@ -1689,7 +1701,7 @@ export async function automateOpenPlatformSetup(
         try {
           await addEvents([name], [], eventMode);
         } catch (err: any) {
-          const optional = (BOT_OPTIONAL_APP_EVENTS as readonly string[]).includes(name) ? '（可选事件, 不影响核心功能）' : '';
+          const optional = (BOT_OPTIONAL_APP_EVENTS as readonly string[]).includes(name) ? ' (optional event; core functionality is unaffected)' : '';
           eventWarnings.push(`订阅事件 ${name} 失败${optional}: ${safeErrorMessage(err)}`);
         }
       }
@@ -1778,16 +1790,25 @@ export async function automateOpenPlatformSetup(
   // dashboard listener 门要靠它识别「订阅名齐但接收方式不对」的黑洞。
   const eventModeReady = eventState?.eventMode === LONG_CONNECTION_EVENT_MODE;
   if (!eventModeReady) {
-    criticalIssues.push(`事件接收模式=${eventState?.eventMode ?? '未知'}(需长连接 ${LONG_CONNECTION_EVENT_MODE})`);
+    criticalIssues.push(setupText(
+      `事件接收模式=${eventState?.eventMode ?? '未知'}(需长连接 ${LONG_CONNECTION_EVENT_MODE})`,
+      `event mode=${eventState?.eventMode ?? 'unknown'} (persistent connection ${LONG_CONNECTION_EVENT_MODE} required)`,
+    ));
   }
   if (callbackState?.callbackMode !== LONG_CONNECTION_EVENT_MODE) {
-    criticalIssues.push(`回调接收模式=${callbackState?.callbackMode ?? '未知'}(需长连接 ${LONG_CONNECTION_EVENT_MODE})`);
+    criticalIssues.push(setupText(
+      `回调接收模式=${callbackState?.callbackMode ?? '未知'}(需长连接 ${LONG_CONNECTION_EVENT_MODE})`,
+      `callback mode=${callbackState?.callbackMode ?? 'unknown'} (persistent connection ${LONG_CONNECTION_EVENT_MODE} required)`,
+    ));
   }
   if (criticalIssues.length > 0) {
     return {
       ok: false,
       reason: options.requireVerifiedEvents ? 'event_verification_failed' : 'api_error',
-      message: `核心事件/回调订阅未生效(${criticalIssues.join('; ')}),机器人将收不到消息或卡片点击;请到开放平台「事件与回调」手动补齐后重试`,
+      message: setupText(
+        `核心事件/回调订阅未生效(${criticalIssues.join('; ')}),机器人将收不到消息或卡片点击;请到开放平台「事件与回调」手动补齐后重试`,
+        `Required event/callback subscriptions are not active (${criticalIssues.join('; ')}). The bot will not receive messages or card actions. Complete them under Open Platform → Events & Callbacks, then retry.`,
+      ),
       sessionFile,
       subscribedEventCount,
       eventWarning,
@@ -1923,7 +1944,7 @@ export async function automateOpenPlatformSetup(
       return {
         ok: false,
         reason: 'version_verification_failed',
-        message: '开放平台未返回可发布的精确版本 ID，受管机器人保持未激活',
+        message: 'Open Platform did not return an exact publishable version ID, so the managed bot remains inactive',
         sessionFile,
         subscribedEventCount,
         eventWarning,
@@ -2092,13 +2113,13 @@ export async function createOpenPlatformApiClient(
     csrfToken = extractOpenPlatformCsrfToken(page.text);
     identity = extractOpenPlatformSessionIdentity(page.text) ?? undefined;
   } catch (err) {
-    return { ok: false, reason: 'network', message: `读取开放平台页面失败: ${safeErrorMessage(err)}` };
+    return { ok: false, reason: 'network', message: `Could not read the Open Platform page: ${safeErrorMessage(err)}` };
   }
   if (!csrfToken) {
     return {
       ok: false,
       reason: 'missing_csrf',
-      message: '开放平台页面没有返回 window.csrfToken；Web session 可能已过期或未完成开放平台登录',
+      message: 'The Open Platform page did not return window.csrfToken; the Web session may have expired or Open Platform sign-in may be incomplete',
     };
   }
 
@@ -2172,7 +2193,7 @@ export async function inspectCachedFeishuOpenPlatformSession(
     return {
       ok: false,
       reason: 'identity_unavailable',
-      message: '开放平台没有返回当前账号与企业信息；为避免创建到错误租户，未复用该登录态',
+      message: 'Open Platform did not return the current account and tenant identity; the session was not reused to avoid creating an app in the wrong tenant',
       sessionFile: prepared.sessionFile,
     };
   }
@@ -2270,7 +2291,7 @@ function defaultBotmuxAppIcon() {
 /** The custom/test icon override, read off disk. Fails with the path in the message
  *  so a caller that passed a bad path can see which one. */
 function readIconFile(iconFilePath: string) {
-  if (!existsSync(iconFilePath)) throw new Error(`找不到指定的应用图标: ${iconFilePath}`);
+  if (!existsSync(iconFilePath)) throw new Error(`The specified app icon was not found: ${iconFilePath}`);
   return readFileSync(iconFilePath);
 }
 
@@ -2294,12 +2315,13 @@ export function buildManifestTemplateCreatePayload(
   avatar: string,
   cid: string,
 ) {
+  const primaryLang = getDefaultLocale() === 'en' ? 'en_us' : 'zh_cn';
   return {
     appManifestTemplateID: ONECLICK_APP_MANIFEST_TEMPLATE_ID,
     createAppUserCustomField: {
-      i18n: { zh_cn: { name, description } },
+      i18n: { [primaryLang]: { name, description } },
       avatar,
-      primaryLang: 'zh_cn',
+      primaryLang,
     },
     cid,
     HTTPHead: {},
@@ -2339,8 +2361,8 @@ export async function createOpenPlatformAppWithClient(
   options: { name: string; description?: string; iconFilePath?: string; creatorUserId: string },
 ): Promise<{ appId: string; appSecret: string }> {
   const name = options.name.trim();
-  if (!name) throw new Error('应用名称不能为空');
-  if (!options.creatorUserId) throw new Error('创建应用缺少创建者 userId,无法完成上架启用');
+  if (!name) throw new Error('App name cannot be empty');
+  if (!options.creatorUserId) throw new Error('App creation is missing the creator userId, so activation cannot be completed');
   // `iconFilePath` stays a DISK path: it is the test/custom-icon override, always
   // supplied by a caller that knows the file exists. Only the DEFAULT moved into the
   // module graph — that is the one that has to work inside the compiled binary.
@@ -2355,11 +2377,11 @@ export async function createOpenPlatformAppWithClient(
   const form = new FormData();
   form.append('file', new Blob([icon], { type: 'image/png' }), 'botmux.png');
   form.append('uploadType', '4'); // Open Platform console enum: Icon
-  form.append('isIsv', 'false'); // 企业自建应用
+  form.append('isIsv', 'false'); // tenant-owned custom app
   form.append('scale', JSON.stringify({ width: 512, height: 512 }));
   const uploaded = await client.postForm('/developers/v1/app/upload/image', form);
   const avatar = pickPayloadString(uploaded, ['url']);
-  if (!avatar) throw new Error('开放平台上传图标后没有返回 url');
+  if (!avatar) throw new Error('Open Platform returned no URL after uploading the app icon');
 
   const description = options.description?.trim() || 'AI coding assistant powered by botmux';
   let appId: string | undefined;
@@ -2372,26 +2394,30 @@ export async function createOpenPlatformAppWithClient(
     if (!templateAppId?.startsWith('cli_')) {
       // code=0 却没有 ClientID:应用可能已建成(响应结构变化),结果未知——
       // 不能落入 fallback 再 create,让下面的 catch 按「非明确拒绝」抛出。
-      throw new Error('一键智能体模板创建返回成功但没有 ClientID(结果未知);请到开放平台确认是否已创建同名应用后重试');
+      throw new Error(setupText(
+        '一键智能体模板创建返回成功但没有 ClientID(结果未知);请到开放平台确认是否已创建同名应用后重试',
+        'One-click agent template creation reported success without a ClientID. Check Open Platform for an app with the same name before retrying.',
+      ));
     }
     appId = templateAppId;
   } catch (err) {
     if (!isDefiniteTemplateRejection(err)) throw err;
-    console.warn(`一键智能体模板创建被拒,回退普通自建应用: ${safeErrorMessage(err)}`);
+    console.warn(`One-click agent template creation was rejected; falling back to a standard custom app: ${safeErrorMessage(err)}`);
     appId = undefined;
   }
   if (!appId) {
+    const primaryLang = getDefaultLocale() === 'en' ? 'en_us' : 'zh_cn';
     const created = await client.postJson('/developers/v1/app/create', {
       appSceneType: 0, // SelfBuild
       name,
       desc: description,
       avatar,
-      i18n: { zh_cn: { name, description } },
-      primaryLang: 'zh_cn',
+      i18n: { [primaryLang]: { name, description } },
+      primaryLang,
     });
     appId = pickPayloadString(created, ['ClientID', 'clientID', 'clientId', 'appId']);
   }
-  if (!appId?.startsWith('cli_')) throw new Error('开放平台创建应用后没有返回 ClientID');
+  if (!appId?.startsWith('cli_')) throw new Error('Open Platform returned no ClientID after creating the app');
 
   try {
     // 模板应用出生已带 bot + 长连接(重复调用幂等);fallback 的裸自建应用
@@ -2412,7 +2438,7 @@ export async function createOpenPlatformAppWithClient(
     // 「应用已建成、还没发版」的窗口里，为它把整条创建链路判死（用户被丢进手动读
     // Secret 的恢复路径）代价明显更大。
     await narrowRequiredPrivilegeRanges(client, appId).catch((err: unknown) => {
-      console.warn(`权限数据范围自动收窄失败（不影响建 bot，可到开放平台手动选「与应用的可用范围一致」）: ${safeErrorMessage(err)}`);
+      console.warn(`Automatic permission data-scope restriction failed. Bot creation can continue; select "same as app availability" manually in Open Platform: ${safeErrorMessage(err)}`);
     });
 
     // 复刻 console launcher「一键创建智能体」的最后一步:立刻用极简版本发布一次,
@@ -2434,7 +2460,7 @@ export async function createOpenPlatformAppWithClient(
     );
     const enableVersionId = extractVersionId(versionCreated);
     if (!enableVersionId) {
-      throw new Error('上架启用版本创建返回成功但没有 versionId(可能已留下未发布草稿);请到开放平台确认后重试');
+      throw new Error('Activation-version creation reported success without a versionId and may have left an unpublished draft. Check Open Platform before retrying.');
     }
     await client.postJson(`/developers/v1/publish/commit/${appId}/${enableVersionId}`, { clientId: appId });
 
@@ -2579,7 +2605,7 @@ export async function createFeishuOpenPlatformApp(
     return {
       ok: false,
       reason: prepared.reason,
-      message: `获取 Feishu Web session 失败: ${prepared.message}`,
+      message: `Could not obtain a Feishu Web session: ${prepared.message}`,
       sessionFile: prepared.sessionFile,
     };
   }
@@ -2597,7 +2623,7 @@ export async function createFeishuOpenPlatformApp(
     return {
       ok: false,
       reason: 'identity_unavailable',
-      message: '开放平台没有返回当前账号与企业信息；为避免创建到错误租户，未创建应用',
+      message: 'Open Platform did not return the current account and tenant identity, so no app was created in order to avoid using the wrong tenant',
       sessionFile: prepared.sessionFile,
     };
   }
@@ -2607,7 +2633,7 @@ export async function createFeishuOpenPlatformApp(
     return {
       ok: false,
       reason: 'session_changed',
-      message: `当前登录账号或企业已变化（${clientResult.identity.userName} · ${clientResult.identity.tenantName}）；请重新确认后再创建`,
+      message: `The signed-in account or tenant changed (${clientResult.identity.userName} · ${clientResult.identity.tenantName}); confirm it again before creating the app`,
       sessionFile: prepared.sessionFile,
     };
   }
@@ -2630,7 +2656,7 @@ export async function createFeishuOpenPlatformApp(
     const message = safeErrorMessage(err);
     return {
       ok: false,
-      reason: /默认应用图标/.test(message) ? 'missing_icon' : 'api_error',
+      reason: /specified app icon|default app icon/i.test(message) ? 'missing_icon' : 'api_error',
       message,
       ...(err instanceof CreatedOpenPlatformAppError ? { appId: err.appId } : {}),
       sessionFile: prepared.sessionFile,
@@ -2693,7 +2719,7 @@ export async function fetchOpenPlatformAppSecret(
     : await client.postJson(`/developers/v1/secret/${clientId}`, {});
   const record = asRecord(payload);
   const secret = pickString(asRecord(record.data), ['secret']) ?? pickString(record, ['secret']);
-  if (!secret) throw new Error('开放平台没有返回 secret 字段');
+  if (!secret) throw new Error('Open Platform returned no secret field');
   return secret;
 }
 
@@ -2729,7 +2755,7 @@ async function loginFeishuWebSession(fetcher: typeof fetch, options: FeishuWebSe
   let scanConfirmationEmitted = false;
   for (;;) {
     if (Date.now() - start > maxWaitMs) {
-      throw new FeishuWebSessionError('等待飞书扫码超时', 'timeout');
+      throw new FeishuWebSessionError('Timed out waiting for a Feishu/Lark QR scan', 'timeout');
     }
 
     const poll = await pollFeishuQrLogin(session, fetcher, qrInit.flowKey);
@@ -2744,7 +2770,7 @@ async function loginFeishuWebSession(fetcher: typeof fetch, options: FeishuWebSe
       await session.fetchRaw(fetcher, redirectUrl, { method: 'GET' });
       const cookies = session.toJSON();
       if (!await validateFeishuWebSession(cookies, fetcher)) {
-        throw new FeishuWebSessionError('飞书扫码已完成，但没有拿到可复用的 Web session', 'invalid_session');
+        throw new FeishuWebSessionError('The QR scan completed, but no reusable Web session was obtained', 'invalid_session');
       }
       return cookies;
     }
@@ -2755,7 +2781,7 @@ async function loginFeishuWebSession(fetcher: typeof fetch, options: FeishuWebSe
       await options.onStatus(statusMessage);
     }
     if (poll.status === 5) {
-      throw new FeishuWebSessionError('二维码已过期', 'qr_expired');
+      throw new FeishuWebSessionError('The QR code expired', 'qr_expired');
     }
     await sleep(pollIntervalMs);
   }
@@ -3108,9 +3134,9 @@ const DEFAULT_BROWSER_USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36';
 
 function defaultPrintFeishuQrCode(info: { qrText: string }): void {
-  process.stderr.write('\n请用飞书 App 扫码完成开放平台自动配置登录：\n\n');
+  process.stderr.write('\nScan with the Feishu/Lark app to sign in for automatic Open Platform configuration:\n\n');
   process.stderr.write(`${info.qrText}\n`);
-  process.stderr.write('如果当前环境无法扫码，可重新运行 `botmux setup --no-open-platform-auto` 跳过自动配置。\n\n');
+  process.stderr.write('If this environment cannot scan a QR code, rerun `botmux setup --no-open-platform-auto` to skip automatic configuration.\n\n');
 }
 
 async function renderTerminalQr(payload: string): Promise<string> {
@@ -3421,7 +3447,7 @@ export function predictApprovalFlow(payload: unknown): ApprovalFlowPrediction {
   if (!Array.isArray(nodes) || nodes.length === 0) {
     // 空数组的正常成因是「没有待发布版本，无流程可算」，不是故障；但既然算不出来，
     // 就必须让调用方走保守路径，不能默认成「可以自动提交」。
-    return { known: false, autoApproved: false, humanApprovers: [], reason: '审批流程为空（可能没有待发布版本）' };
+    return { known: false, autoApproved: false, humanApprovers: [], reason: 'The approval flow is empty (there may be no pending version)' };
   }
   const gates = nodes
     .map(node => asRecord(node))
@@ -3434,7 +3460,7 @@ export function predictApprovalFlow(payload: unknown): ApprovalFlowPrediction {
       return !(cc.length > 0 && users.length === 0);
     });
   if (gates.length === 0) {
-    return { known: false, autoApproved: false, humanApprovers: [], reason: '审批流程里没有可判定的关卡节点' };
+    return { known: false, autoApproved: false, humanApprovers: [], reason: 'The approval flow has no evaluable gate nodes' };
   }
   const humanApprovers: string[] = [];
   for (const gate of gates) {

@@ -77,15 +77,15 @@ export async function pumpOnce(opts: OutboxPumpOptions): Promise<number> {
     if (r.ok) {
       sent += 1;
       logger.info(
-        `[issue] 发件箱重投成功 issue=${binding.issueId} ${r.applied ? `→ ${r.issue.status}` : '（平台已不认本机 claim，就此结算）'}`,
+        `[issue] Outbox retry succeeded issue=${binding.issueId} ${r.applied ? `→ ${r.issue.status}` : '(platform no longer recognizes the local claim; settled)'}`,
       );
     } else if (r.reason === 'platform') {
       // permanent = 平台明确拒绝（凭证失效 / issue 已删或归档），行已标 fatal 不再重投。
       // 用 error 而不是 warn：它不会自愈，等人去看；`/issue status` 上也会显示这一条。
       if (r.permanent) {
-        logger.error(`[issue] 发件箱回写被平台拒绝、已放弃重投 issue=${binding.issueId}: ${r.detail}`);
+        logger.error(`[issue] Platform rejected the outbox writeback; retries abandoned issue=${binding.issueId}: ${r.detail}`);
       } else {
-        logger.warn(`[issue] 发件箱重投失败 issue=${binding.issueId}: ${r.detail}`);
+        logger.warn(`[issue] Outbox retry failed issue=${binding.issueId}: ${r.detail}`);
       }
     }
   }
@@ -102,7 +102,7 @@ export function startIssueOutboxPump(opts: OutboxPumpOptions): () => void {
 
   const requeued = resetInflightToPending(opts.dataDir);
   if (requeued > 0) {
-    logger.info(`[issue] 启动对账：${requeued} 条卡在 inflight 的回写已退回待发`);
+    logger.info(`[issue] Reconciliation started: ${requeued} inflight writeback(s) returned to pending`);
   }
 
   const tick = (): void => {
@@ -113,7 +113,7 @@ export function startIssueOutboxPump(opts: OutboxPumpOptions): () => void {
         // 避免空闲时也反复重写文件。
         if (n > 0) pruneOutbox(opts.dataDir);
       })
-      .catch((e) => logger.warn(`[issue] 发件箱泵异常：${String((e as Error)?.message ?? e)}`));
+      .catch((e) => logger.warn(`[issue] Outbox pump failed: ${String((e as Error)?.message ?? e)}`));
   };
 
   const timer = setInterval(tick, opts.intervalMs ?? PUMP_INTERVAL_MS);

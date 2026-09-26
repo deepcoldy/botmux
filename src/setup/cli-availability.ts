@@ -115,7 +115,7 @@ export function checkCliAvailability(
       return {
         available: false,
         localExecutableRequired: true,
-        reason: 'Forge x TraeX 只能用于 cliId "traex"',
+        reason: 'Forge x TraeX can only be used with cliId "traex"',
       };
     }
     const traex = checkCommand(requiredCommand({ cliId: 'traex' }), opts);
@@ -143,5 +143,5 @@ export function cliUnavailableMessage(input: CliAvailabilityInput, displayName?:
   const result = checkCliAvailability(input);
   if (result.available) return undefined;
   const name = displayName?.trim() || input.cliId;
-  return `无法启动 ${name}：${result.reason ?? '本地启动依赖不可用'}。请先在运行 botmux daemon 的这台机器上安装或修正 PATH / CLI 路径。`;
+  return `Cannot start ${name}: ${result.reason ?? 'a local launch dependency is unavailable'}. Install it or fix PATH / the CLI path on the host running the botmux daemon.`;
 }

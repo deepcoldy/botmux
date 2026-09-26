@@ -59,7 +59,7 @@ export function effectiveReplyDelivery(larkAppId: string | undefined, cliId: str
   const key = `${larkAppId}:${cliId ?? ''}`;
   if (!warnedUnsupported.has(key)) {
     warnedUnsupported.add(key);
-    logger.warn(`[reply-delivery] bot ${larkAppId} 配置 replyDelivery=transcript，但 cliId=${cliId ?? '(none)'} 没有转写采集，回落 send`);
+    logger.warn(`[reply-delivery] Bot ${larkAppId} has replyDelivery=transcript, but cliId=${cliId ?? '(none)'} has no transcript capture; falling back to send`);
   }
   return 'send';
 }

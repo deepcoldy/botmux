@@ -167,7 +167,7 @@ describe('tryAutoFixScopes — silent / disableQrLogin plumbing', () => {
 describe('checkRequiredScopes — 审核中：提示人工 + 按待审版本节流', () => {
   const region = fnRegionUntil(
     "    if (autoFixed.kind === 'under_review') {",
-    '本次不重复打扰',
+    'suppressing duplicate notice',
   );
 
   it('🔴 按待审版本节流，且状态落盘（不是内存态）', () => {

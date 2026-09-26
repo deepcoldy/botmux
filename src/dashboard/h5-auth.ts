@@ -761,7 +761,7 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
       try {
         audit.append(controlAuditRecord('unknown', 'dashboard', 'auth.login_denied'));
       } catch (auditError) {
-        logger.error(`[dashboard-h5] auth.login_denied 审计写入失败：${describeForLog(auditError)}`);
+        logger.error(`[dashboard-h5] Failed to write auth.login_denied audit event: ${describeForLog(auditError)}`);
       }
       throw error;
     }
@@ -864,11 +864,11 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
         // 报 502。原始错因只落 daemon 日志——曾经这里是裸 catch，磁盘写满会让
         // 全量登录静默失败并谎称是飞书的问题，日志里一条线索都没有。
         if (error instanceof DashboardH5LocalFailure) {
-          logger.error(`[dashboard-h5] 登录本地失败（${error.stage}）：${describeForLog(error.reason)}`);
+          logger.error(`[dashboard-h5] Local sign-in failed (${error.stage}): ${describeForLog(error.reason)}`);
           json(res, 503, { ok: false, error: 'login_unavailable' });
           return true;
         }
-        logger.warn(`[dashboard-h5] 飞书换取 open_id 失败：${describeForLog(error)}`);
+        logger.warn(`[dashboard-h5] Failed to exchange Feishu identity for open_id: ${describeForLog(error)}`);
         json(res, 502, { ok: false, error: 'feishu_exchange_failed' });
         return true;
       }
@@ -909,7 +909,7 @@ export function createDashboardH5AuthController(opts: DashboardH5AuthControllerO
       try {
         audit.append(controlAuditRecord(identity.userId, 'dashboard', 'auth.logout'));
       } catch (error) {
-        logger.error(`[dashboard-h5] auth.logout 审计写入失败（会话已撤销）：${describeForLog(error)}`);
+        logger.error(`[dashboard-h5] Failed to write auth.logout audit event (session already revoked): ${describeForLog(error)}`);
       }
       json(res, 200, { ok: true }, { 'set-cookie': clearDashboardSessionCookie(config.secureCookies) });
       return true;

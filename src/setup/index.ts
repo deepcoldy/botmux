@@ -103,18 +103,18 @@ export async function ensureDependencies(): Promise<DependenciesReport> {
     if (!tmux.freshInstall) console.log(`✓ tmux ${tmux.version} (existing)`);
   } else if (ptyOptIn) {
     console.warn('');
-    console.warn('⚠️  tmux 不可用，但已显式设置 BACKEND_TYPE=pty —— 将使用 PTY 后端兜底。');
-    console.warn(`    原因：${tmux.reason ?? '未知'}`);
-    console.warn('    注意：PTY 会话不跨 daemon 重启存活，/adopt 与多人 Web 终端不可用。');
+    console.warn('⚠️  tmux is unavailable, but BACKEND_TYPE=pty is explicitly set, so the PTY backend will be used as a fallback.');
+    console.warn(`    Reason: ${tmux.reason ?? 'unknown'}`);
+    console.warn('    PTY sessions do not survive daemon restarts, and /adopt plus multi-user Web Terminal are unavailable.');
     console.warn('');
   } else {
     console.error('');
-    console.error('❌  tmux 不可用，botmux 会话将无法启动。');
-    console.error(`    原因：${tmux.reason ?? '未知'}`);
-    if (tmux.manualCommand) console.error(`    请安装：${tmux.manualCommand}`);
-    console.error('    安装好 tmux 后重试即可。');
-    console.error('    （如确需在没有 tmux 的环境运行，可显式设置环境变量 BACKEND_TYPE=pty 用 PTY 后端兜底，');
-    console.error('      但 PTY 会话不跨 daemon 重启存活，仅作应急。）');
+    console.error('❌  tmux is unavailable, so botmux sessions cannot start.');
+    console.error(`    Reason: ${tmux.reason ?? 'unknown'}`);
+    if (tmux.manualCommand) console.error(`    Install with: ${tmux.manualCommand}`);
+    console.error('    Install tmux and retry.');
+    console.error('    If this environment must run without tmux, explicitly set BACKEND_TYPE=pty,');
+    console.error('    but PTY sessions do not survive daemon restarts and should be used only as an emergency fallback.');
     console.error('');
   }
 
@@ -122,12 +122,12 @@ export async function ensureDependencies(): Promise<DependenciesReport> {
   const fonts = await ensureFonts(platform);
   if (fonts.failed.length === 0) {
     if (platform.os === 'darwin') {
-      console.log('✓ 字体: 系统字体已就绪 (macOS)');
+      console.log('✓ Fonts: system fonts are ready (macOS)');
     } else {
-      console.log(`✓ 字体: ${fonts.ready.join(' / ')} 已就绪`);
+      console.log(`✓ Fonts ready: ${fonts.ready.join(' / ')}`);
     }
   } else {
-    console.warn(`⚠️  字体部分缺失: ${fonts.failed.join(' / ')} —— 飞书截图中相关字符可能渲染为方块`);
+    console.warn(`⚠️  Some fonts are missing: ${fonts.failed.join(' / ')}. Related characters may render as boxes in Lark screenshots.`);
   }
 
   // herdr: on-demand only. We won't pull it onto hosts that don't use it.
@@ -144,10 +144,10 @@ export async function ensureDependencies(): Promise<DependenciesReport> {
       reportHerdrIntegrations(herdrIntegrations);
     } else {
       console.warn('');
-      console.warn('⚠️  herdr 安装失败，使用 herdr backend 的 bot 将无法启动');
-      console.warn(`    原因：${herdr.reason ?? '未知'}`);
-      if (herdr.manualCommand) console.warn(`    手动尝试：${herdr.manualCommand}`);
-      console.warn('    临时方案：把对应 bot 的 backendType 改回 "tmux" 或 "pty"');
+      console.warn('⚠️  herdr installation failed. Bots using the herdr backend cannot start.');
+      console.warn(`    Reason: ${herdr.reason ?? 'unknown'}`);
+      if (herdr.manualCommand) console.warn(`    Try manually: ${herdr.manualCommand}`);
+      console.warn('    Temporary workaround: change the affected bot backendType to "tmux" or "pty"');
       console.warn('');
     }
   }
@@ -161,33 +161,33 @@ function reportHerdrIntegrations(r: HerdrIntegrationResult): void {
   // its hint printed, otherwise a herdr+traex host with the toggle on but no
   // source would silently no-op with no diagnostic when traex is the only herdr CLI.
   if (r.attempted.length === 0 && r.unsupportedCliIds.length === 0 && !r.traexPlugin) return;
-  if (r.installed.length > 0) console.log(`✓ herdr integrations 已安装: ${r.installed.join(' / ')}`);
+  if (r.installed.length > 0) console.log(`✓ herdr integrations installed: ${r.installed.join(' / ')}`);
   if (r.alreadyInstalled.length > 0) console.log(`✓ herdr integrations (existing): ${r.alreadyInstalled.join(' / ')}`);
   if (r.traexPlugin) {
     const tp = r.traexPlugin;
     if (tp.skippedReason === 'disabled') {
-      console.warn('ℹ️  检测到 herdr + traex；TraeX herdr plugin 自动安装默认关闭，可在 Dashboard Settings 中开启并填写可信 plugin source。');
+      console.warn('ℹ️  herdr + traex detected. Automatic TraeX herdr plugin installation is disabled by default; enable it in Dashboard Settings and provide a trusted plugin source.');
     } else if (tp.skippedReason === 'missing_source') {
-      console.warn('⚠️  herdr TraeX plugin 已开启但未配置 plugin source；请在 Dashboard Settings 填写你信任的 source（owner/repo，建议钉 ref）。');
+      console.warn('⚠️  The herdr TraeX plugin is enabled without a plugin source. Configure a trusted source in Dashboard Settings (owner/repo, preferably with a pinned ref).');
     } else if (tp.skippedReason === 'plugin_unsupported') {
-      console.warn(`⚠️  当前 herdr${tp.herdrVersion ? ` ${tp.herdrVersion}` : ''} 不支持插件（需 ≥0.7.0）；请运行 \`herdr update\` 升级后重试。`);
+      console.warn(`⚠️  herdr${tp.herdrVersion ? ` ${tp.herdrVersion}` : ''} does not support plugins (requires >=0.7.0). Run \`herdr update\` and retry.`);
     } else if (tp.failed) {
-      console.warn(`⚠️  herdr TraeX plugin ${tp.failed.step === 'install' ? '安装' : '配置'}失败：${tp.failed.reason}`);
-      console.warn(`    手动尝试：${tp.failed.manualCommand}`);
-      console.warn('    说明：herdr + traex 不装该插件也能启动，但状态只能退回屏幕启发式检测。');
+      console.warn(`⚠️  herdr TraeX plugin ${tp.failed.step === 'install' ? 'installation' : 'configuration'} failed: ${tp.failed.reason}`);
+      console.warn(`    Try manually: ${tp.failed.manualCommand}`);
+      console.warn('    herdr + traex can start without this plugin, but status detection falls back to screen heuristics.');
     } else if (tp.installed || tp.actionInvoked) {
-      console.log(`✓ herdr TraeX plugin 已安装并写入 ~/.trae hooks: ${tp.source}`);
+      console.log(`✓ herdr TraeX plugin installed and ~/.trae hooks updated: ${tp.source}`);
     } else if (tp.alreadyInstalled) {
-      console.log(`✓ herdr TraeX plugin (existing)，已是最新: ${tp.source}`);
+      console.log(`✓ herdr TraeX plugin is already current: ${tp.source}`);
     }
   }
   for (const f of r.failed) {
-    console.warn(`⚠️  herdr integration 安装失败: ${f.name} — ${f.reason}`);
-    console.warn(`    手动尝试：${f.manualCommand ?? `herdr integration install ${f.name}`}`);
+    console.warn(`⚠️  herdr integration installation failed: ${f.name} — ${f.reason}`);
+    console.warn(`    Try manually: ${f.manualCommand ?? `herdr integration install ${f.name}`}`);
   }
   if (r.unsupportedCliIds.length > 0) {
     console.warn(
-      `⚠️  以下 CLI 暂无官方 herdr integration（herdr 仍可用，但仅靠屏幕启发式检测状态）: ${r.unsupportedCliIds.join(', ')}`,
+      `⚠️  These CLIs have no official herdr integration. herdr still works, but status detection uses screen heuristics: ${r.unsupportedCliIds.join(', ')}`,
     );
   }
 }

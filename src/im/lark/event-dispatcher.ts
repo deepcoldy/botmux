@@ -510,12 +510,12 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
       const selfManageAuthUrl = buildScopeDeepLink(bot.config.larkAppId, SELF_MANAGE_SCOPE, brand);
       const targetAuthUrl = buildScopeDeepLink(bot.config.larkAppId, REQUIRED_BOT_AT_SCOPE, brand);
       logger.warn(
-        `[${larkAppId}] scope 自检 API 被拒（99991672）：应用缺少 ${SELF_MANAGE_SCOPE}（免审批）。` +
-        `开通后下次 daemon 重启即可自动核验跨 bot @ 必需权限 ${REQUIRED_BOT_AT_SCOPE}。申请链接：${selfManageAuthUrl}`,
+        `[${larkAppId}] Scope self-check API was rejected (99991672): the app lacks ${SELF_MANAGE_SCOPE} (auto-approved). ` +
+        `After granting it, the next daemon restart can verify the required cross-bot @mention permission ${REQUIRED_BOT_AT_SCOPE}. Request URL: ${selfManageAuthUrl}`,
       );
       const adminOpenId = getAdminOpenId(bot);
       if (!adminOpenId) {
-        logger.warn(`[${larkAppId}] 没有 resolved 的 admin open_id，self_manage 提示仅出现在 daemon 日志`);
+        logger.warn(`[${larkAppId}] No resolved admin open_id; the self_manage notice is available only in daemon logs`);
         return;
       }
       const dm =
@@ -587,7 +587,7 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
         ].filter(Boolean).join(' + ');
         if (missingDoc.length > 0) {
           const summary = missingDoc.map(s => `${s.name}(${s.desc})`).join('、');
-          logger.error(`[${larkAppId}] ${featureLabel} 已在用（${docSubs.length} 个绑定）但缺 ${missingDoc.length} 项文档权限：${summary}。评论将收不到/回不了，请到权限管理开通后 botmux restart。`);
+          logger.error(`[${larkAppId}] ${featureLabel} is active (${docSubs.length} binding(s)) but lacks ${missingDoc.length} document permission(s): ${summary}. Comments cannot be received or answered; grant them in Permission Management, then run botmux restart.`);
           const adminDoc = getAdminOpenId(bot);
           if (adminDoc) {
             const lines = missingDoc.map((s, i) => `${i + 1}. **${s.desc}** (\`${s.name}\`)\n   ${buildScopeDeepLink(bot.config.larkAppId, s.name, brand)}`).join('\n\n');
@@ -598,7 +598,7 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
           }
         } else {
           // 权限齐了——事件订阅查不了，仅 info 记一条提醒（不 DM 免重启刷屏）。
-          logger.info(`[${larkAppId}] ${featureLabel} 文档权限齐全（${docSubs.length} 绑定）；请确保后台已订阅事件 ${DOC_COMMENT_EVENT}（无法自动检测）`);
+          logger.info(`[${larkAppId}] ${featureLabel} document permissions are complete (${docSubs.length} binding(s)); ensure event ${DOC_COMMENT_EVENT} is subscribed in the console (cannot be detected automatically)`);
         }
       }
     } catch (err: any) {
@@ -629,8 +629,8 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
         if (missingVc.length > 0) {
           const summary = missingVc.map(s => `${s.name}(${s.desc})`).join('、');
           logger.error(
-            `[${larkAppId}] vcMeetingAgent 已启用但缺 ${missingVc.length} 项 VC 权限：${summary}。` +
-            `会议智能体入会/读事件可能失败。请到权限管理开通，并确认事件订阅页包含 ${VC_MEETING_BOT_EVENTS.join(', ')}。`,
+            `[${larkAppId}] vcMeetingAgent is enabled but lacks ${missingVc.length} VC permission(s): ${summary}. ` +
+            `Meeting-agent join/event reads may fail. Grant the permissions and ensure the event-subscription page includes ${VC_MEETING_BOT_EVENTS.join(', ')}.`,
           );
           const adminVc = getAdminOpenId(bot);
           if (adminVc) {
@@ -644,8 +644,8 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
           }
         } else {
           logger.info(
-            `[${larkAppId}] vcMeetingAgent VC 权限齐全；请确保后台事件订阅页已添加 ${VC_MEETING_BOT_EVENTS.join(', ')} ` +
-            `并已发布（无法自动检测）：${eventSubUrl}`,
+            `[${larkAppId}] vcMeetingAgent VC permissions are complete; ensure ${VC_MEETING_BOT_EVENTS.join(', ')} ` +
+            `are added and published on the event-subscription page (cannot be detected automatically): ${eventSubUrl}`,
           );
         }
       }
@@ -699,8 +699,8 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     if (autoFixed.kind === 'under_review') {
       const summary = missingCritical.map(s => `${s.name} (${s.desc})`).join('、');
       logger.warn(
-        `[${larkAppId}] 缺少 ${missingCritical.length} 项必需权限（${summary}），` +
-        '但应用有一个版本卡在飞书审核中、配置暂时不可写；需人工修配置后撤回重提，botmux 无法自动解决。',
+        `[${larkAppId}] Missing ${missingCritical.length} required permission(s) (${summary}), ` +
+        'but an app version is under Feishu review and configuration is temporarily locked. Fix the configuration manually, withdraw, and resubmit; botmux cannot resolve this automatically.',
       );
       const reviewAdmin = getAdminOpenId(bot);
       // 🔴 同一个待审版本只打扰一次。不做节流的话，卡在审核中是个持续数天的状态
@@ -738,7 +738,7 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
         }
       } else if (alreadyNotified) {
         logger.info(
-          `[${larkAppId}] 待审版本 ${autoFixed.inReviewVersionId} 已通知过管理员，本次不重复打扰`,
+          `[${larkAppId}] Admin was already notified about pending-review version ${autoFixed.inReviewVersionId}; suppressing duplicate notice`,
         );
       }
       return;
@@ -747,8 +747,8 @@ export async function checkRequiredScopes(larkAppId: string): Promise<void> {
     // Log + DM consolidated message listing all missing critical scopes.
     const summaryLine = missingCritical.map(s => `${s.name} (${s.desc})`).join('、');
     logger.error(
-      `[${larkAppId}] 缺少 ${missingCritical.length} 项必需权限：${summaryLine}。` +
-      `botmux 核心功能（消息收发、附件下载、用户名解析等）会受影响。请到飞书开放平台 → 应用 → 权限管理里申请，开通后 \`botmux restart\`。`,
+      `[${larkAppId}] Missing ${missingCritical.length} required permission(s): ${summaryLine}. ` +
+      `Core botmux functions (message send/receive, attachment downloads, user-name resolution, and others) are affected. Request them under Feishu Open Platform → App → Permission Management, then run \`botmux restart\`.`,
     );
     const adminOpenId = getAdminOpenId(bot);
     if (!adminOpenId) {
@@ -798,7 +798,7 @@ export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promis
       // pop a QR at boot. Surface once to the admin so they can `botmux setup`.
       logger.info(
         `[${larkAppId}] VC event subscription check skipped (${probe.reason}): ${probe.message}. ` +
-        `被邀请进会需先订阅 vc.bot.meeting_* 事件；如该 bot 从未订阅，请运行 \`botmux setup\` 刷新开放平台登录态后重启。`,
+        'Meeting invitations require vc.bot.meeting_* event subscriptions. If this bot has never subscribed, run `botmux setup` to refresh the Open Platform session, then restart.',
       );
       return;
     }
@@ -807,7 +807,7 @@ export async function ensureVcMeetingEventsSubscribed(larkAppId: string): Promis
       return;
     }
     logger.info(
-      `[${larkAppId}] VC events missing (${probe.missingVcEvents.join('、') || '事件模式非长连接'}); auto-subscribing via Open Platform...`,
+      `[${larkAppId}] VC events missing (${probe.missingVcEvents.join(', ') || 'event mode is not a persistent connection'}); auto-subscribing via Open Platform...`,
     );
     const result = await automateOpenPlatformSetup({
       appId: bot.config.larkAppId,
@@ -868,31 +868,31 @@ export async function ensureMessageUpdatedEventSubscribed(larkAppId: string): Pr
   if (normalizeBrand(bot.config.brand) !== 'feishu') return;
   try {
     const result = await ensureAppEventSubscriptions(larkAppId, [MESSAGE_UPDATED_EVENT]);
-    const updateStatus = result.updateSubmitted ? '更新请求已成功返回' : '无成功返回的更新请求';
+    const updateStatus = result.updateSubmitted ? 'update request succeeded' : 'no successful update request';
     if (!result.ok) {
       logger.info(
-        `[${larkAppId}] im.message.updated_v1 配置检查未完成（${result.reason}，${updateStatus}）：` +
-        `请检查开放平台登录态和事件订阅配置；发布生效及实际推送未验证。`,
+        `[${larkAppId}] im.message.updated_v1 configuration check did not finish (${result.reason}, ${updateStatus}). ` +
+        'Check the Open Platform session and event subscriptions. Publication and actual delivery were not verified.',
       );
       return;
     }
     if (!result.eventModeReady || result.missingEvents.length > 0) {
       logger.info(
-        `[${larkAppId}] im.message.updated_v1 配置回读不完整（longConnection=${result.eventModeReady}, ` +
-        `missing=${result.missingEvents.join(',')}，${updateStatus}）：请在开放平台检查事件和长连接配置；` +
-        `发布生效及实际推送未验证，不影响正常消息。`,
+        `[${larkAppId}] im.message.updated_v1 configuration readback is incomplete (longConnection=${result.eventModeReady}, ` +
+        `missing=${result.missingEvents.join(',')}, ${updateStatus}). Check events and persistent-connection settings in Open Platform. ` +
+        'Publication and actual delivery were not verified; regular messages are unaffected.',
       );
       return;
     }
     if (result.updateSubmitted) {
       logger.info(
-        `[${larkAppId}] im.message.updated_v1 更新请求已成功返回，配置回读包含事件且为长连接；` +
-        `启动流程不会自动发布，请在开放平台检查并发布应用版本；发布生效及实际推送未验证。`,
+        `[${larkAppId}] im.message.updated_v1 update succeeded and readback includes the event in persistent-connection mode. ` +
+        'Startup does not publish automatically; check and publish the app version in Open Platform. Publication and actual delivery were not verified.',
       );
     } else {
       logger.info(
-        `[${larkAppId}] im.message.updated_v1 已有配置包含事件且为长连接，本次未更新；` +
-        `发布生效及实际推送未验证，编辑补 @ 无响应时请检查已发布版本的事件订阅。`,
+        `[${larkAppId}] Existing im.message.updated_v1 configuration includes the event in persistent-connection mode; no update was made. ` +
+        'Publication and actual delivery were not verified. If adding an @mention by editing gets no response, check event subscriptions in the published version.',
       );
     }
   } catch (err: any) {
@@ -3502,7 +3502,7 @@ async function markCommentEventDropped(
     selfBotOpenId = undefined;
   }
   if ((selfBotOpenId && requesterOpenId === selfBotOpenId) || isBotAuthoredReply(replyId)) {
-    logger.debug(`[doc-comment] dropped-signal skipped: 触发者是 bot 自己 comment=${commentId.slice(0, 12)} reply=${replyId.slice(0, 12)}`);
+    logger.debug(`[doc-comment] dropped-signal skipped: trigger was the bot itself comment=${commentId.slice(0, 12)} reply=${replyId.slice(0, 12)}`);
     rollbackAutoSub();
     return 'self-triggered';
   }
@@ -3547,7 +3547,7 @@ async function processCommentEvent(
   if (!handlers.handleDocComment) return;
   const { fileToken, commentId } = parsed;
   if (!fileToken || !commentId) {
-    logger.info(`[doc-comment] event dropped: missing fileToken/commentId (fileToken=${fileToken ?? '?'} commentId=${commentId ?? '?'}) — payload 字段路径可能与解析不符`);
+    logger.info(`[doc-comment] event dropped: missing fileToken/commentId (fileToken=${fileToken ?? '?'} commentId=${commentId ?? '?'}) — payload field paths may not match the parser`);
     return;
   }
 
@@ -3618,7 +3618,7 @@ async function processCommentEvent(
   //    同时用最新一条回复作为"触发回复"。
   const comment = await getDocComment(larkAppId, { fileToken, fileType: sub.fileType }, commentId);
   if (!comment || comment.replies.length === 0) {
-    logger.info(`[doc-comment] event dropped: 取不到评论内容 comment=${commentId.slice(0, 12)}（replies=${comment ? comment.replies.length : 'null'}）`);
+    logger.info(`[doc-comment] event dropped: comment content unavailable comment=${commentId.slice(0, 12)} (replies=${comment ? comment.replies.length : 'null'})`);
     // ⚠️ 这个丢弃点在 mention-only 闸（下面第 4 步）**之前** —— 而 mention-only
     // 订阅下该文档的**所有**评论事件都会推给我们。拉不到正文时我们无从判断这条
     // 评论是不是冲 bot 来的，无条件打标记会在**别人的评论上**留 ❌。
@@ -3633,7 +3633,7 @@ async function processCommentEvent(
         '评论正文读取失败，bot 未处理该条 @，准备留下失败标记',
         rollbackAutoSub,
       );
-      logger.info(`[doc-comment] dropped-signal outcome=${outcome} (取不到评论内容) comment=${commentId.slice(0, 12)}`);
+      logger.info(`[doc-comment] dropped-signal outcome=${outcome} (comment content unavailable) comment=${commentId.slice(0, 12)}`);
     } else {
       // 没打标记 = 从未过审计，auto-sub 占位必须回滚（同 !trigger 分支）。
       rollbackAutoSub();
@@ -3649,7 +3649,7 @@ async function processCommentEvent(
   // 永久失联：turnId 恒等于那条老回复 → 每条新评论都被 dedup 当成重复回合丢掉，
   // @ 判定和自触发过滤也全基于错误的回复。宁可丢这一条并告警，也不能拿错的顶上。
   if (!trigger) {
-    logger.warn(`[doc-comment] event dropped: 触发回复 ${parsed.replyId?.slice(0, 12)} 不在拉到的 ${comment.replies.length} 条回复里 (comment=${commentId.slice(0, 12)} truncated=${comment.hasMoreReplies === true}) — 回复串可能未补全`);
+    logger.warn(`[doc-comment] event dropped: trigger reply ${parsed.replyId?.slice(0, 12)} was not among ${comment.replies.length} fetched replies (comment=${commentId.slice(0, 12)} truncated=${comment.hasMoreReplies === true}) — reply thread may be incomplete`);
     // ⚠️ 和第一个打点同样要收窄。`trigger` 缺失只证明**回复数据不完整**，
     // 不证明这条回复是冲 bot 来的 —— 已订阅文档下别人的普通回复同样会推事件，
     // 只要那条 reply 恰好没被拉到就会走到这里。不收窄就会在别人的评论上留 ❌。
@@ -3660,7 +3660,7 @@ async function processCommentEvent(
         '评论回复串未能补全，bot 读不到这条评论的正文，准备留下失败标记',
         rollbackAutoSub,
       );
-      logger.info(`[doc-comment] dropped-signal outcome=${outcome} (触发回复不在拉到的回复里) comment=${commentId.slice(0, 12)}`);
+      logger.info(`[doc-comment] dropped-signal outcome=${outcome} (trigger reply absent from fetched replies) comment=${commentId.slice(0, 12)}`);
     } else {
       // 没打标记 = 这条事件从未过审计。auto-sub 是这次事件建的占位，必须回滚，
       // 否则陌生人的一条无关回复就留下 owner 不知情的订阅。
@@ -3685,7 +3685,7 @@ async function processCommentEvent(
   //    `is_mentioned`——它表示「评论里存在任意 @」，@ 别人时也是 true，曾导致
   //    「@ 同事的评论也被误触发」。详见 commentTriggerAllowed 注释。
   if (!commentTriggerAllowed(sub.commentTriggerMode, trigger.mentions, selfBotOpenId)) {
-    logger.info(`[doc-comment] event dropped: mention-only 但未 @ 本 bot (comment=${commentId.slice(0, 12)} isMentioned=${parsed.isMentioned} mentions=${trigger.mentions.length} self=${selfBotOpenId ? selfBotOpenId.slice(0, 10) : '?'})`);
+    logger.info(`[doc-comment] event dropped: mention-only mode without an @mention of this bot (comment=${commentId.slice(0, 12)} isMentioned=${parsed.isMentioned} mentions=${trigger.mentions.length} self=${selfBotOpenId ? selfBotOpenId.slice(0, 10) : '?'})`);
     rollbackAutoSub();
     return;
   }
@@ -3706,7 +3706,7 @@ async function processCommentEvent(
     // 离真的打上还隔着审计门、自触发拦截和 tenant 请求，任一不过都不会打。
     // 真实结果由 helper 返回后单独记，否则排障的人会以为「打了但飞书没渲染」。
     const markEligible = sub.commentTriggerMode === 'mention-only';
-    logger.info(`[doc-comment] event dropped: 触发回复无文本正文 (comment=${commentId.slice(0, 12)} mode=${sub.commentTriggerMode} mentions=${trigger.mentions.length} markEligible=${markEligible}) — 纯 @bot 无正文也会落到这里`);
+    logger.info(`[doc-comment] event dropped: trigger reply has no text body (comment=${commentId.slice(0, 12)} mode=${sub.commentTriggerMode} mentions=${trigger.mentions.length} markEligible=${markEligible}) — an @mention-only reply also reaches this path`);
     if (markEligible) {
       const outcome = await markCommentEventDropped(
         larkAppId, { fileToken, fileType: sub.fileType }, commentId,
@@ -3714,7 +3714,7 @@ async function processCommentEvent(
         '纯 @bot，无文本正文，bot 未处理，准备留下失败标记',
         rollbackAutoSub,
       );
-      logger.info(`[doc-comment] dropped-signal outcome=${outcome} (纯 @bot 无正文) comment=${commentId.slice(0, 12)}`);
+      logger.info(`[doc-comment] dropped-signal outcome=${outcome} (@mention-only reply without text) comment=${commentId.slice(0, 12)}`);
     } else {
       rollbackAutoSub();
     }
@@ -4052,7 +4052,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
               if (freshMode === 'group') {
                 logger.info(
                   `[chat-mode-converted] ${chatId.substring(0, 12)} chat_mode flipped 'topic' → 'group'; ` +
-                  `跳过 bot 新话题自动开工 msg=${messageId.substring(0, 12)}`,
+                  `skipping automatic bot startup for new topic msg=${messageId.substring(0, 12)}`,
                 );
                 seedIsTopicChat = false;
               }
@@ -4093,7 +4093,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
                 // 黑名单 bot 静默吞掉：不自动开工、不发授权卡、不做 sibling 自愈。
                 if (seedBotTalk.reason === 'blocked') return;
                 logger.info(
-                  `[auto-start:新话题] ${chatId.substring(0, 12)} 其他机器人开新话题但未授权（restricted）→ 发授权卡不自动开工 ` +
+                  `[auto-start:new-topic] ${chatId.substring(0, 12)} another bot opened a new topic without authorization (restricted); sending an authorization card without auto-start ` +
                   `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'}`,
                 );
                 await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data)
@@ -4101,7 +4101,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
                 return;
               }
               logger.info(
-                `[auto-start:新话题] ${chatId.substring(0, 12)} 其他机器人开新话题免@自动开工 ` +
+                `[auto-start:new-topic] ${chatId.substring(0, 12)} another bot opened a new topic; auto-starting without requiring @mention ` +
                 `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'} reason=${seedBotTalk.reason}`,
               );
               const seedCtx: RoutingContext = { chatId, messageId, chatType, larkAppId, scope: seedScope, anchor: seedAnchor };
@@ -4738,8 +4738,8 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           || (ownsSession && isAllowed && !!stats && !mentionsOther && stats.userCount <= 1 && stats.botCount <= 1);
         if (commandTriggerRelax) {
           logger.info(
-            `[command-trigger:${larkAppId}] ${commandTrigger?.cmd} 免@ 命中` +
-            `${commandTrigger?.prompt ? '（模板）' : '（原文）'} chat=${chatId.substring(0, 12)} ` +
+            `[command-trigger:${larkAppId}] ${commandTrigger?.cmd} matched without @mention` +
+            `${commandTrigger?.prompt ? ' (template)' : ' (original text)'} chat=${chatId.substring(0, 12)} ` +
             `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'}`,
           );
         }
@@ -4779,7 +4779,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
               logger.debug(`Ignoring group message not addressed to bot: ${messageId}`);
               return;
             }
-            logger.info(`[auto-start:新话题] ${chatId.substring(0, 12)} 新话题免@自动开工 msg=${messageId.substring(0, 12)}`);
+            logger.info(`[auto-start:new-topic] ${chatId.substring(0, 12)} started a new topic without requiring @mention msg=${messageId.substring(0, 12)}`);
           }
         }
       } else if (!isAllowed) {
@@ -4960,12 +4960,12 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       try {
         readback = await getMessageDetail(larkAppId, messageId, { userCardContent: false });
       } catch (err) {
-        logger.warn(`[message-updated:${larkAppId}] 回读消息失败，忽略编辑事件 msg=${messageId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
+        logger.warn(`[message-updated:${larkAppId}] Message readback failed; ignoring edit event msg=${messageId.substring(0, 12)}: ${err instanceof Error ? err.message : err}`);
         return;
       }
       const current = readback?.items?.[0] ?? readback?.message;
       if (!current) {
-        logger.warn(`[message-updated:${larkAppId}] 回读无消息内容，忽略编辑事件 msg=${messageId.substring(0, 12)}`);
+        logger.warn(`[message-updated:${larkAppId}] Message readback returned no content; ignoring edit event msg=${messageId.substring(0, 12)}`);
         return;
       }
 
@@ -4991,20 +4991,20 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
 
       // 已触发过任务（原消息本就 @、p2p、免@ 策略等）→ 不因编辑再触发一遍。
       if (isMessageTriggerClaimed(larkAppId, messageId)) {
-        logger.info(`[message-updated:${larkAppId}] 消息已派发或正在排队，忽略编辑补 @ msg=${messageId.substring(0, 12)}`);
+        logger.info(`[message-updated:${larkAppId}] Message already dispatched or queued; ignoring @mention added by edit msg=${messageId.substring(0, 12)}`);
         return;
       }
       // 正处在 never/ambient 的 topic 种子延迟队列里：它马上会以原快照派发，
       // 这里再发会重复。跳过即可（延迟窗口只有几秒，属竞态兜底）。
       try {
         if (listForwardFollowups(larkAppId).some(record => record.messageId === messageId)) {
-          logger.info(`[message-updated:${larkAppId}] 消息在延迟派发队列中，跳过编辑补 @ msg=${messageId.substring(0, 12)}`);
+          logger.info(`[message-updated:${larkAppId}] Message is in the delayed-dispatch queue; skipping @mention added by edit msg=${messageId.substring(0, 12)}`);
           return;
         }
       } catch { /* 队列不可读时不阻断 */ }
 
       logger.info(
-        `[message-updated:${larkAppId}] 编辑后补 @ 触发任务 chat=${String(data.message.chat_id ?? '').substring(0, 12)} ` +
+        `[message-updated:${larkAppId}] @mention added by edit triggered task chat=${String(data.message.chat_id ?? '').substring(0, 12)} ` +
         `msg=${messageId.substring(0, 12)}`,
       );
       // im.message.get 条目不带 chat_type（归一化默认 'group'）。即将派发前补判 p2p，
@@ -5049,7 +5049,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         const chatId: string | undefined = data?.chat_id;
         const operatorOpenId: string | undefined = data?.operator_id?.open_id;
         if (!chatId) return;
-        logger.info(`[auto-start:入群] bot added to chat=${chatId.substring(0, 12)} by ${String(operatorOpenId ?? '?').substring(0, 12)}`);
+        logger.info(`[auto-start:group-join] bot added to chat=${chatId.substring(0, 12)} by ${String(operatorOpenId ?? '?').substring(0, 12)}`);
         // chat.bot_added 观察钩子：拉群信号（应急群自动化的触发点之一）。
         // 放在 scheduleAckSafeEvent 的去重 claim 之后，重推不会重复发射。
         try {

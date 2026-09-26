@@ -1,0 +1,175 @@
+name: Team binary release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            targets: bun-linux-x64
+            artifact: linux-x64
+            linux_baseline: true
+          - os: ubuntu-24.04-arm
+            targets: bun-linux-arm64
+            artifact: linux-arm64
+            linux_baseline: true
+          - os: macos-14
+            targets: bun-darwin-x64 bun-darwin-arm64
+            artifact: darwin
+            linux_baseline: false
+    runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        if: matrix.linux_baseline == false
+        with:
+          node-version: 22
+
+      - uses: oven-sh/setup-bun@v2
+        if: matrix.linux_baseline == false
+        with:
+          bun-version: 1.4.2
+
+      - if: matrix.linux_baseline == false
+        run: bun install --frozen-lockfile
+
+      - name: Stamp release version
+        if: matrix.linux_baseline == false
+        run: npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
+
+      - if: matrix.linux_baseline == false
+        run: bun run build
+
+      - name: Build Linux binary on the glibc 2.28 baseline
+        if: matrix.linux_baseline == true
+        run: |
+          target="${{ matrix.targets }}"
+          scripts/build-linux-glibc-baseline.sh \
+            "$target" "dist-bin/botmux-${target#bun-}" "${RELEASE_TAG#v}"
+
+      - name: Build native binaries
+        if: matrix.linux_baseline == false
+        run: |
+          mkdir -p dist-bin
+          for target in ${{ matrix.targets }}; do
+            bun scripts/build-bun-binary.mjs \
+              --target "$target" \
+              --out "dist-bin/botmux-${target#bun-}"
+          done
+
+      - name: Verify macOS signatures
+        if: runner.os == 'macOS'
+        run: |
+          for file in dist-bin/botmux-darwin-*; do
+            case "$file" in *.map) continue;; esac
+            codesign --verify --strict --verbose=2 "$file"
+          done
+
+      - name: Create checksums
+        run: |
+          cd dist-bin
+          for file in botmux-*; do
+            case "$file" in *.map|*.sha256) continue;; esac
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$file" > "$file.sha256"
+            else
+              shasum -a 256 "$file" > "$file.sha256"
+            fi
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: botmux-${{ matrix.artifact }}
+          path: dist-bin/botmux-*
+          if-no-files-found: error
+
+  musl:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: bun-linux-x64-musl
+            artifact: linux-x64-musl
+          - os: ubuntu-24.04-arm
+            target: bun-linux-arm64-musl
+            artifact: linux-arm64-musl
+    runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build inside Alpine
+        run: |
+          docker run --rm \
+            -v "$PWD:/work" -w /work \
+            -e RELEASE_TAG \
+            -e TARGET="${{ matrix.target }}" \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            node:22-alpine sh -euc '
+              apk add --no-cache python3 make g++ libstdc++ binutils >/dev/null
+              npm i -g bun@1.4.2 --loglevel=error
+              bun install --frozen-lockfile
+              npm version "${RELEASE_TAG#v}" --no-git-tag-version --allow-same-version
+              bun run build
+              mkdir -p dist-bin
+              bun scripts/build-bun-binary.mjs \
+                --target "$TARGET" \
+                --out "dist-bin/botmux-${TARGET#bun-}"
+              chown -R "$HOST_UID:$HOST_GID" dist-bin
+            '
+
+      - name: Create checksum
+        run: |
+          cd dist-bin
+          file="botmux-${{ matrix.target }}"
+          file="${file/bun-/}"
+          sha256sum "$file" > "$file.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: botmux-${{ matrix.artifact }}
+          path: dist-bin/botmux-*
+          if-no-files-found: error
+
+  publish:
+    needs: [native, musl]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: botmux-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify release assets
+        run: |
+          for asset in \
+            botmux-linux-x64 botmux-linux-arm64 \
+            botmux-linux-x64-musl botmux-linux-arm64-musl \
+            botmux-darwin-x64 botmux-darwin-arm64; do
+            test -f "release-assets/$asset"
+            test -f "release-assets/$asset.sha256"
+          done
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" release-assets/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --generate-notes \
+            --title "${GITHUB_REF_NAME}"

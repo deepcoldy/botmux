@@ -360,6 +360,16 @@ describe('ebsd service follow-up input', () => {
 });
 
 describe('botmux routing prose XML boundaries', () => {
+  it('makes English a persistent response policy in both prompt delivery paths', () => {
+    const shell = buildBotmuxShellHints('en').join('\n');
+    const system = buildBotmuxSystemPromptText({ locale: 'en' });
+
+    expect(shell).toContain('write every user-facing response in English');
+    expect(system).toContain('write every user-facing response in English');
+    expect(buildBotmuxShellHints('zh').join('\n')).not.toContain('user-facing response in English');
+    expect(buildBotmuxSystemPromptText({ locale: 'zh' })).not.toContain('user-facing response in English');
+  });
+
   it.each([
     ['zh', '&lt;open_id:名字&gt;'],
     ['en', '&lt;open_id:name&gt;'],
@@ -1201,7 +1211,7 @@ describe('builder locale fallback when the caller omits locale', () => {
     setDefaultLocale('zh');
     setBotLookup(enBot);
     const content = buildFollowUpContent('hello', SID, { cliId: 'codex', larkAppId: 'en-app' });
-    expect(content).toContain('<botmux_reminder>Respond to messages addressed to you');
+    expect(content).toContain('<botmux_reminder>Write every user-facing response in English. Respond to messages addressed to you');
     expect(content).not.toContain('发给你的消息');
   });
 

@@ -889,6 +889,7 @@ export const messages: Record<string, string> = {
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────
   'ai.routing.intro': '你在飞书（Lark）会话中。用户看不到终端输出，必须用 `botmux send` 发送回复。',
+  'ai.response.english_only': 'Language requirement: write every user-facing response in English. Do not switch languages merely because the user writes in another language.',
   'ai.routing.usage_send': '- 发送：`botmux send "消息"`',
   'ai.routing.usage_mention_gate': '- 每条 send 必须三选一：`--mention <open_id>` / `--mention-back` / `--no-mention`——按内容价值选：有实质结论要对方看/确认/决策 → @；纯记录/低优先级进度/简短确认 → --no-mention；没信息量的"收到"不如不发',
   'ai.routing.usage_attachments': '- 附件：`--images`、`--files`、`--videos`（详见 `botmux send --help`）',

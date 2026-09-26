@@ -156,7 +156,7 @@ export function buildIssueCommandDeps(activate: ActivateSession | undefined = re
           announce: async (chatId, card) => {
             await sendMessage(larkAppId, chatId, card, 'interactive');
           },
-          onAnnounceError: (reason) => logger.warn(`[issue] 开工播报失败（不影响领取）：${reason}`),
+          onAnnounceError: (reason) => logger.warn(`[issue] Start announcement failed (claim unaffected): ${reason}`),
           activate: async (chatId, botLarkAppId, prompt) => {
             if (!activate) throw new Error('activate_not_wired');
             return activate({ chatId, larkAppId: botLarkAppId, prompt, workingDir });
@@ -164,7 +164,7 @@ export function buildIssueCommandDeps(activate: ActivateSession | undefined = re
           writeStatus: (issueId, args) => writeIssueStatus(issueId, args) as any,
           fetchIssue: (teamId, issueId) => findIssueById(teamId, issueId),
           onStatusError: (reason) =>
-            logger.warn(`[issue] in_progress 回写失败（领取仍成功，pump 会重投）：${reason}`),
+            logger.warn(`[issue] in_progress writeback failed (claim succeeded; pump will retry): ${reason}`),
         },
         {
           issue,
@@ -185,7 +185,7 @@ export function buildIssueCommandDeps(activate: ActivateSession | undefined = re
       );
 
       if (r.ok) {
-        logger.info(`[issue] 领取完成 issue=${issue._id} chat=${r.chatId} dir=${workingDir}`);
+        logger.info(`[issue] Claim completed issue=${issue._id} chat=${r.chatId} dir=${workingDir}`);
         return {
           ok: true,
           chatId: r.chatId,

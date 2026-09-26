@@ -67,7 +67,7 @@ function zmxSocketDirHint(env: NodeJS.ProcessEnv): string {
     const value = env[key];
     if (value) return `，socket dir 来自 ${key}=${value}`;
   }
-  return '，未设置 ZMX_DIR / XDG_RUNTIME_DIR / TMPDIR';
+  return '; ZMX_DIR, XDG_RUNTIME_DIR, and TMPDIR are unset';
 }
 
 /**
@@ -83,7 +83,7 @@ function zmxProbeFailureReason(command: string, failure: any, timeoutMs: number,
   const signal = failure?.signal ?? nested?.signal;
   const stderr = (failure?.stderr?.toString?.() ?? nested?.stderr?.toString?.() ?? '').trim();
 
-  if (code === 'ENOENT') return 'zmx 二进制不在 PATH 上';
+  if (code === 'ENOENT') return 'The zmx binary is not on PATH';
   if (code === 'EACCES') return `${command} 启动失败：zmx 不可执行（EACCES）`;
   if (code === 'EMFILE' || code === 'ENFILE') return `${command} 启动失败：文件描述符耗尽（${code}）`;
   if (code === 'ETIMEDOUT' || signal || failure?.killed || nested?.killed) {
@@ -142,7 +142,7 @@ export function parseZmxSocketDir(output: string): string | undefined {
 export function resolveZmxSocketDir(env: NodeJS.ProcessEnv = zmxEnv()): string {
   const probe = probeZmxRuntime(env);
   if (!probe.ok) throw new Error(probe.reason);
-  if (!probe.socketDir) throw new Error('无法解析 zmx version 的 socket_dir，已拒绝创建未固定地址的会话');
+  if (!probe.socketDir) throw new Error('Could not parse socket_dir from zmx version; refusing to create a session without a fixed address');
   return probe.socketDir;
 }
 
@@ -165,7 +165,7 @@ export function probeZmxFunctional(): { ok: true; version: string } | { ok: fals
     });
   } catch (err: any) {
     const stderr = err?.stderr?.toString?.().trim?.() || '';
-    return { ok: false, reason: stderr || 'zmx list 失败' };
+    return { ok: false, reason: stderr || 'zmx list failed' };
   }
 
   return versionProbe;

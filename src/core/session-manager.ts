@@ -2910,7 +2910,7 @@ export async function restoreActiveSessions(
       }
       logger.info(
         `[${session.sessionId.substring(0, 8)}] Restored queued `
-        + `${restoredPendingRepo ? 'pending-repo' : '(待办池)'} session (scope: ${scope})`,
+        + `${restoredPendingRepo ? 'pending-repo' : '(pending pool)'} session (scope: ${scope})`,
       );
       continue;
     }

@@ -812,7 +812,7 @@ export async function handleCallbackUrl(url: string): Promise<string | null> {
     // 唯一理由就是防止这件事。宁可让人重来一次，也不能存一个可能张冠李戴的 token：
     // 存错了没有任何报错，只是之后 A 的每次操作都在用 B 的权限。
     if (!authorized.ok) {
-      logger.warn(`[user-token] 放弃保存：无法确认授权人（${authorized.reason}）`);
+      logger.warn(`[user-token] Token not saved because the authorized user could not be confirmed (${authorized.reason})`);
       return `❌ 授权未完成：拿到了 token，但无法确认是谁完成的授权（${authorized.reason}），`
         + `为避免记到错误的人名下，本次没有保存。请重新 /login。`;
     }

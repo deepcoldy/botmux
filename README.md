@@ -8,7 +8,7 @@
   <a href="https://www.npmjs.com/package/botmux"><img src="https://img.shields.io/npm/v/botmux.svg" alt="npm"></a>
   <img src="https://img.shields.io/badge/binary-no%20Node%20required-brightgreen.svg" alt="self-contained binary, no Node required">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT"></a>
-  <a href="https://github.com/deepcoldy/botmux"><img src="https://img.shields.io/github/stars/deepcoldy/botmux.svg?style=social" alt="Stars"></a>
+  <a href="https://github.com/jason-jimenez-bytedance/botmux"><img src="https://img.shields.io/github/stars/jason-jimenez-bytedance/botmux.svg?style=social" alt="Stars"></a>
 </p>
 
 <p align="center"><b>在飞书里遥控你的 AI 编程 CLI。</b>一条消息启动一个会话，每个会话一个独立 CLI 进程，实时流式回传——手机、电脑、终端三端同步。</p>
@@ -39,8 +39,8 @@ Daemon 监听飞书消息，为每个新会话自动 spawn 一个独立的会话
 > 约 5 分钟：`botmux setup` 一次飞书扫码就连续建好应用、配全权限、发版（加 `--no-open-platform-auto` 则只建应用、跳过权限与发版的自动配置，之后需手动完成；手动创建 / 粘贴凭证是 setup 里的另一个选项）。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
-botmux setup                 # 一次扫码建应用 → 选 CLI → 选工作目录（自动配权限 + 发版）
+curl -fsSL https://raw.githubusercontent.com/jason-jimenez-bytedance/botmux/master/install.sh | sh
+botmux setup --lang en       # 保存英文设置、日志/卡片和仅英文机器人回复
 botmux start                 # 启动 daemon（botmux autostart enable 设开机自启）
 ```
 
@@ -48,9 +48,11 @@ botmux start                 # 启动 daemon（botmux autostart enable 设开机
 >
 > 安装过程**不编译任何原生模块**（不需要 Python / node-gyp / 编译器）：PTY 已经嵌在二进制里。支持 linux / macOS × x64 / arm64（Alpine 等 musl 环境自动选 musl 版）；**Windows 请在 WSL2 里安装**（daemon 依赖 PTY / tmux / Unix 信号，原生 Windows 跑不了；WSL2 报告为 linux，是完整支持的一等环境）。平台不在列表里、或下下来的二进制在本机跑不起来，安装会**明确报错并保留原有版本**，而不是装上一个起不来的命令。
 >
-> 正式版 macOS CLI 使用稳定的 Apple Developer ID 签名。升级替换二进制后，macOS 的文件与 App 数据访问授权仍绑定同一代码身份，不会因为版本哈希变化而把 botmux 当成一个新程序；canary / beta / rc 等预览版仍使用 ad-hoc 签名。
+> 团队 fork 的 macOS 构建使用 ad-hoc 签名。如需在团队内广泛分发并跨升级保留 macOS 隐私授权，请先配置 Apple Developer ID 签名环境。
 >
-> 升级：**一律重跑上面那条 curl 命令**（npm / pnpm 全局安装也用它，原地替换、不会重复往启动文件里追加 PATH），装完开个新终端跑 `botmux restart`；≥3.18 的二进制安装上 `botmux upgrade` 与其等价。装指定版本（含回滚）：`curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | BOTMUX_VERSION=v3.18.8 sh`（变量必须在管道右侧的 `sh` 前面）。⚠️ **v3.18.0 之前的老版本不要用 npm 升级**——跨「Node 源码 → 二进制」形态边界会让 daemon 重启失败。
+> 升级：重跑上面的 curl 命令，之后开一个新终端运行 `botmux restart`；二进制安装也可直接运行 `botmux upgrade`。安装指定版本：`curl -fsSL https://raw.githubusercontent.com/jason-jimenez-bytedance/botmux/master/install.sh | BOTMUX_VERSION=vX.Y.Z sh`（变量必须放在管道右侧的 `sh` 前面）。
+
+> 本 fork 通过 GitHub Releases 分发自包含二进制，不发布上游同名 npm 包；`npm install -g botmux` 安装的是上游版本。
 
 <details>
 <summary>已经在用 Node 生态？也可以走 npm（同一个二进制）</summary>
@@ -108,7 +110,7 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 
 三个密钥文件必须是运行 BotMux 的账号持有的 `0600` 普通文件，不能是符号链接；文件内容、AK/SK 和 Gateway token 都不得写进 `bots.json`。`workingDir` 应是专用空目录，仓库通过只读的 `EBSD_BOTMUX_REPOSITORY_ROOT` 暴露。Linux 开启 `sandbox` 前需安装 bubblewrap，隔离建立失败时会拒绝启动。当前/上一把 Gateway key 可以在服务端并存完成轮换，subject 保持不变。
 
-当前完整 `cliId` 以 [`src/adapters/cli/registry.ts`](https://github.com/deepcoldy/botmux/blob/master/src/adapters/cli/registry.ts) 为准；各 CLI 的配置与套 wrapper / 网关方法见 [多 CLI 适配器](https://deepcoldy.github.io/botmux/adapters)。
+当前完整 `cliId` 以 [`src/adapters/cli/registry.ts`](https://github.com/jason-jimenez-bytedance/botmux/blob/master/src/adapters/cli/registry.ts) 为准；各 CLI 的配置与套 wrapper / 网关方法见 [多 CLI 适配器](https://deepcoldy.github.io/botmux/adapters)。
 
 ### 会话级 CLI 选择
 
@@ -182,4 +184,4 @@ botmux 不重新实现记忆、上下文管理、工具调用、权限体系—�
 - 🤝 **贡献**：欢迎 issue / PR。新增适配器见 [多 CLI 适配器](https://deepcoldy.github.io/botmux/adapters)。
 - 📄 **License**：[MIT](LICENSE)
 
-<p align="center">好用的话，顺手点个 ⭐ Star 吧 → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>
+<p align="center">团队 fork → <a href="https://github.com/jason-jimenez-bytedance/botmux">jason-jimenez-bytedance/botmux</a></p>

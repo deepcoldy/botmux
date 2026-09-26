@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,6 +10,7 @@ import {
   isNewerVersion,
   selectReleasesSince,
   fetchLatestVersion,
+  fetchGithubReleaseVersion,
   selectRollbackVersions,
   fetchRollbackVersions,
   fetchReleasesSince,
@@ -192,6 +193,35 @@ describe('fetchLatestVersion', () => {
     const fetchImpl = async (url: unknown) => { seen = String(url); return jsonResponse(200, { version: '2.85.1' }); };
     await fetchLatestVersion({ registry: 'garbage', fetchImpl });
     expect(seen).toBe('https://registry.npmjs.org/botmux/latest');
+  });
+});
+
+describe('fetchGithubReleaseVersion', () => {
+  it('reads latest and prerelease-channel versions from this fork', async () => {
+    let seen = '';
+    const latest = await fetchGithubReleaseVersion('latest', {
+      fetchImpl: async (url) => {
+        seen = String(url);
+        return jsonResponse(200, { tag_name: 'v3.31.0' });
+      },
+    });
+    expect(seen).toBe('https://api.github.com/repos/jason-jimenez-bytedance/botmux/releases/latest');
+    expect(latest).toBe('3.31.0');
+
+    const canary = await fetchGithubReleaseVersion('canary', {
+      fetchImpl: async () => jsonResponse(200, [
+        { tag_name: 'v3.31.0-canary.1' },
+        { tag_name: 'v3.31.0-canary.3' },
+        { tag_name: 'v3.31.0-beta.1' },
+      ]),
+    });
+    expect(canary).toBe('3.31.0-canary.3');
+  });
+
+  it('accepts an exact version without a network request', async () => {
+    const fetchImpl = vi.fn();
+    expect(await fetchGithubReleaseVersion('v3.31.0', { fetchImpl })).toBe('3.31.0');
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });
 

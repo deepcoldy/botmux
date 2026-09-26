@@ -228,9 +228,9 @@ function warnForeignOrigin(
   const authorities = requestAuthorities(headers, surface)
     .filter((value): value is string => typeof value === 'string' && value.trim() !== '')
     .map(logSafeValue);
-  logger.warn(`[dashboard-csrf] ${kind} 判为跨站并拒绝：origin=${logSafeValue(origin)}`
-    + ` 候选 authority=[${authorities.join(', ')}]`
-    + '（反代请原样透传 host:port，或用 BOTMUX_PUBLIC_URL 声明对外基址）');
+  logger.warn(`[dashboard-csrf] Rejected ${kind} as cross-site: origin=${logSafeValue(origin)}`
+    + ` candidate authorities=[${authorities.join(', ')}]`
+    + ' (reverse proxies must preserve host:port, or declare the public base with BOTMUX_PUBLIC_URL)');
 }
 
 /**

@@ -151,10 +151,10 @@ export async function updateBotGrantPrefs(
     if (patch.p2pOpen && (bot.config.allowedUsers?.length ?? 0) === 0) {
       const downgraded = bot.config.canTalkDaemonCommands ?? [];
       logger.warn(
-        `[grant-prefs:${larkAppId}] p2pOpen 已开启但未配 allowedUsers：`
-        + '任何人都能私聊，但没有人能执行 /restart、/cd、卡片按钮等管理操作。请补上 allowedUsers。'
+        `[grant-prefs:${larkAppId}] p2pOpen is enabled without allowedUsers: `
+        + 'anyone can send a direct message, but nobody can perform administrative actions such as /restart, /cd, or card buttons. Configure allowedUsers.'
         + (downgraded.length
-          ? ` 另注意 canTalkDaemonCommands=[${downgraded.join(' ')}] 已被降级到「能对话即可用」，私聊者可执行。`
+          ? ` Note: canTalkDaemonCommands=[${downgraded.join(' ')}] is downgraded to conversation-level access, so direct-message users can execute it.`
           : ''),
       );
     }

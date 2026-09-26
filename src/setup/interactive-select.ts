@@ -108,13 +108,13 @@ export function interactiveSelect(opts: {
 
     output.write('\x1b[H\x1b[J');
     output.write(`\x1b[1m ${opts.title}\x1b[0m\n`);
-    output.write(`\x1b[2m 输入可搜索 · ↑/↓ 选择 · ⏎ 确认 · Esc 取消\x1b[0m\n\n`);
-    output.write(` \x1b[36m🔍\x1b[0m ${query || '\x1b[2m(全部)\x1b[0m'}${filtered.length > capacity ? `  \x1b[2m(${cursor + 1}/${filtered.length})\x1b[0m` : ''}\n\n`);
+    output.write(`\x1b[2m Type to search · ↑/↓ select · Enter confirm · Esc cancel\x1b[0m\n\n`);
+    output.write(` \x1b[36m🔍\x1b[0m ${query || '\x1b[2m(all)\x1b[0m'}${filtered.length > capacity ? `  \x1b[2m(${cursor + 1}/${filtered.length})\x1b[0m` : ''}\n\n`);
 
     if (filtered.length === 0) {
-      output.write(`   \x1b[2m无匹配项\x1b[0m\n`);
+      output.write(`   \x1b[2mNo matches\x1b[0m\n`);
     } else {
-      if (top > 0) output.write(`   \x1b[2m↑ 上面还有 ${top} 项\x1b[0m\n`);
+      if (top > 0) output.write(`   \x1b[2m↑ ${top} more above\x1b[0m\n`);
       for (let row = top; row < end; row++) {
         const it = items[filtered[row]];
         const selected = row === cursor;
@@ -231,14 +231,14 @@ export async function pickCliSelection(
   rl: ReturnType<typeof createInterface>,
   opts: { title?: string; currentKey?: string } = {},
 ): Promise<string | null> {
-  const title = opts.title ?? '选择 CLI 适配器';
+  const title = opts.title ?? 'Select a CLI adapter';
 
   // ── 非 TTY 回退：序号 / key 文本输入 ──
   if (!input.isTTY || !output.isTTY) {
     const lines = CLI_SELECT_OPTIONS.map((o, i) => `  ${i + 1}) ${o.label} (${o.key})`);
     output.write(`\n${title}\n${lines.join('\n')}\n`);
     const def = opts.currentKey ?? CLI_SELECT_OPTIONS[0].key;
-    const ans = (await new Promise<string>((res) => rl.question(`选择 [${def}]: `, res))).trim();
+    const ans = (await new Promise<string>((res) => rl.question(`Select [${def}]: `, res))).trim();
     if (!ans) return def;
     const byNum = CLI_SELECT_OPTIONS[Number(ans) - 1];
     if (byNum) return byNum.key;
@@ -258,13 +258,13 @@ export async function pickCliSelection(
         : g.option?.key,
       submenu: !!g.children,
     }));
-    const ti = await interactiveSelect({ title, items: topItems, footer: '带 ▸ 的项目可进入子菜单选择具体版本或形态' });
+    const ti = await interactiveSelect({ title, items: topItems, footer: 'Items marked ▸ open a submenu for a specific version or mode' });
     if (ti === null) return null;
     const group = CLI_SELECT_TREE[ti];
     if (group.option) return group.option.key;
     if (group.children) {
       const subItems: SelectItem[] = group.children.map((c) => ({ label: c.label, hint: c.wrapperCli ?? c.key }));
-      const si = await interactiveSelect({ title: `${title} › ${group.label}`, items: subItems, footer: 'Esc 返回上一级' });
+      const si = await interactiveSelect({ title: `${title} › ${group.label}`, items: subItems, footer: 'Esc: go back' });
       if (si === null) continue; // 退回顶层
       return group.children[si].key;
     }

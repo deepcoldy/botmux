@@ -75,10 +75,10 @@ export function installCocoAskPlugin(cocoBin: string): void {
       stdio: 'ignore',
       timeout: 60_000,
     });
-    logger.info(`[hook] CoCo ask 插件已安装 → ${COCO_ASK_PLUGIN_DIR}`);
+    logger.info(`[hook] CoCo ask plugin installed → ${COCO_ASK_PLUGIN_DIR}`);
   } catch (err) {
     logger.warn(
-      `[hook] CoCo ask 插件安装失败：${err instanceof Error ? err.message : String(err)}`,
+      `[hook] CoCo ask plugin installation failed: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
 }

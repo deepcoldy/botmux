@@ -754,7 +754,7 @@ function ipcAuthSecret(): string | null {
       const now = Date.now();
       if (now - loggedUnsafeIpcSecretAt > 60_000) {
         loggedUnsafeIpcSecretAt = now;
-        logger.error(`[dashboard-ipc] 拒绝使用不安全的 .dashboard-secret：${err.message}（IPC 鉴权 fail-closed）`);
+        logger.error(`[dashboard-ipc] Refusing unsafe .dashboard-secret: ${err.message} (IPC authentication fails closed)`);
       }
       return null;
     }
@@ -2676,9 +2676,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/cd', async (req, res, params) => {
     // 根（回落是 fail-open，会让存量部署继续能跨 bot 切并经 workingDir 拿 rw）。回
     // 409 + 迁移指引，让运营看得见查得到，而不是静默放行或静默拒绝。
     if (v.error === 'own_role_library_missing') {
-      logger.warn(`[role] 角色库每-bot 目录名不是 appId（期望 ~/botmux-roles/${ds.larkAppId}）——`
-        + 'role switch 已 fail-closed 拒绝，避免跨 bot 越权。按 docs/roles/deploy-runbook.md '
-        + '§8「迁移：每-bot 目录名改为 appId」重命名该目录即恢复。');
+      logger.warn(`[role] Per-bot role-library directory name is not the appId (expected ~/botmux-roles/${ds.larkAppId}) —`
+        + ' role switching was rejected fail-closed to prevent cross-bot access. Rename the directory as described in '
+        + 'docs/roles/deploy-runbook.md §8, "Migration: rename each per-bot directory to its appId".');
       return jsonRes(res, 409, { ok: false, error: v.error });
     }
     return jsonRes(res, forbidden ? 403 : 400, { ok: false, error: v.error });

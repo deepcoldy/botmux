@@ -153,7 +153,7 @@ export async function repairOpenPlatformRedirects(
   opts: RepairOpenPlatformRedirectsOptions = {},
 ): Promise<RepairOpenPlatformRedirectsResult> {
   if (inFlight) {
-    return { ok: false, reason: 'in_flight', message: '已有一批 redirect 白名单修复在执行，请等它跑完再试' };
+    return { ok: false, reason: 'in_flight', message: 'A redirect-allowlist repair is already running; wait for it to finish and retry' };
   }
   const deadlineMs = opts.deadlineMs ?? REPAIR_BATCH_DEADLINE_MS;
   const generation = ++batchGeneration;
@@ -166,7 +166,7 @@ export async function repairOpenPlatformRedirects(
       batchGeneration += 1;
       // 再 abort：真实下游（默认 session/client 工厂）会当场断开连接；不认 abort 的
       // 注入依赖则由上面那次代际推进兜住，之后任何写提交都会被 fence 拒掉。
-      controller.abort(new Error('redirect 白名单批量修复超时'));
+      controller.abort(new Error('Redirect-allowlist batch repair timed out'));
       resolve({
         ok: false,
         reason: 'timeout',
@@ -331,7 +331,7 @@ async function repairOne(
       return {
         appId,
         status: 'not_owned',
-        message: '当前扫码登录的飞书账号不是该应用的协作者，请换成该应用的开发者账号重新扫码后再修复',
+        message: 'The Feishu account used for the QR sign-in is not an app collaborator. Scan again with an app developer account before repairing.',
       };
     }
     logger.warn(`[redirect-repair] ${appId} failed: ${safeErrorMessage(err)}`);
@@ -399,10 +399,10 @@ function resolveTargets(
 
 function rejectionReason(bots: BotConfig[], appId: string): string {
   const bot = bots.find(item => item.larkAppId === appId);
-  if (!bot) return '这个 appId 不在 bots.json 里';
-  if (bot.apiOnly) return 'core-only（apiOnly）bot 没有飞书应用，无需也无法配置 redirect 白名单';
-  if (normalizeBrand(bot.brand) !== 'feishu') return '开放平台自动配置当前只支持 feishu.cn 租户';
-  return '这个 bot 不在可修复目标里';
+  if (!bot) return 'This appId is not present in bots.json';
+  if (bot.apiOnly) return 'A core-only (apiOnly) bot has no Feishu app and cannot require redirect-allowlist configuration';
+  if (normalizeBrand(bot.brand) !== 'feishu') return 'Automatic Open Platform configuration currently supports only feishu.cn tenants';
+  return 'This bot is not an eligible repair target';
 }
 
 function countByStatus(results: RedirectRepairItem[]): Record<RedirectRepairStatus, number> {

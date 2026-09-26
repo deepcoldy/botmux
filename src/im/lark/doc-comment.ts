@@ -430,9 +430,9 @@ async function driveApiCall(larkAppId: string, opts: DriveCallOpts): Promise<any
     try {
       const res = await callTenant();
       if (res?.code === 0) return res;
-      logger.debug(`[doc-comment] tenant call code=${res?.code} (${opts.path})；回退 user 身份`);
+      logger.debug(`[doc-comment] Tenant call code=${res?.code} (${opts.path}); falling back to user identity`);
     } catch (err) {
-      logger.debug(`[doc-comment] tenant call threw (${opts.path})；回退 user 身份：${err instanceof Error ? err.message : err}`);
+      logger.debug(`[doc-comment] Tenant call threw (${opts.path}); falling back to user identity: ${err instanceof Error ? err.message : err}`);
     }
     return callUser();
   }
@@ -846,7 +846,7 @@ export async function replyToDocComment(
     // 有的评论不允许被回复（飞书 1069302：全文评论 / 已解决 / 文档评论设置受限）。
     // 退回新建一条全文评论，保证 bot 的答复总能落到文档（不嵌套但仍在评论区）。
     if (isReplyNotAllowed(err)) {
-      logger.warn(`[doc-comment] comment=${commentId.slice(0, 12)} 不允许回复，退回新建全文评论`);
+      logger.warn(`[doc-comment] comment=${commentId.slice(0, 12)} does not allow replies; falling back to a new full-text comment`);
       const c = await createDocComment(larkAppId, file, text, mentionOpenId, options);
       return { replyId: c.replyId, commentId: c.commentId };
     }
@@ -855,7 +855,7 @@ export async function replyToDocComment(
   // ensureOk 对 code!==0 抛错；同样要识别"不允许回复"并退回新建。
   if (res?.code !== 0) {
     if (isReplyNotAllowed(res)) {
-      logger.warn(`[doc-comment] comment=${commentId.slice(0, 12)} 不允许回复(code=${res?.code})，退回新建全文评论`);
+      logger.warn(`[doc-comment] comment=${commentId.slice(0, 12)} does not allow replies (code=${res?.code}); falling back to a new full-text comment`);
       const c = await createDocComment(larkAppId, file, text, mentionOpenId, options);
       return { replyId: c.replyId, commentId: c.commentId };
     }

@@ -8,7 +8,7 @@
   <a href="https://www.npmjs.com/package/botmux"><img src="https://img.shields.io/npm/v/botmux.svg" alt="npm"></a>
   <img src="https://img.shields.io/badge/binary-no%20Node%20required-brightgreen.svg" alt="self-contained binary, no Node required">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT"></a>
-  <a href="https://github.com/deepcoldy/botmux"><img src="https://img.shields.io/github/stars/deepcoldy/botmux.svg?style=social" alt="Stars"></a>
+  <a href="https://github.com/jason-jimenez-bytedance/botmux"><img src="https://img.shields.io/github/stars/jason-jimenez-bytedance/botmux.svg?style=social" alt="Stars"></a>
 </p>
 
 <p align="center"><b>Drive your AI coding CLI from Lark (Feishu).</b> One message starts a session, each session runs its own isolated CLI process, streamed back in real time — synced across phone, desktop, and terminal.</p>
@@ -39,8 +39,8 @@ A daemon watches Lark messages and spawns an isolated session process for each n
 > About 5 minutes: a single Lark QR scan in `botmux setup` creates the app, configures all permissions, and publishes a version in one flow (add `--no-open-platform-auto` to only create the app and skip the permission + publish automation, which you then complete manually; creating the app manually / pasting credentials is a separate option inside setup).
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
-botmux setup                 # one scan to create the app → pick a CLI → pick a working dir (permissions + publish auto-configured)
+curl -fsSL https://raw.githubusercontent.com/jason-jimenez-bytedance/botmux/master/install.sh | sh
+botmux setup --lang en       # persist English setup, logs/cards, and English-only bot responses
 botmux start                 # start the daemon (botmux autostart enable for auto-start on boot)
 ```
 
@@ -48,22 +48,24 @@ botmux start                 # start the daemon (botmux autostart enable for aut
 >
 > Nothing native is compiled during install (no Python / node-gyp / compiler): the PTY is already inside the binary. Supported: linux / macOS × x64 / arm64, with musl builds selected automatically on Alpine and similar. **On Windows, install inside WSL2** — the daemon needs PTY / tmux / Unix signals and does not run on native Windows; WSL2 reports as linux and is a fully supported first-class environment. An unsupported platform, or a binary that cannot run on this host, **fails with an explicit error and leaves your existing install untouched** rather than leaving you with a command that won't start.
 >
-> Stable macOS CLI releases use a consistent Apple Developer ID signature. Replacing the binary during an upgrade therefore preserves the code identity used by macOS file and App Data permissions instead of appearing as a new program for every version. Canary, beta, and RC builds remain ad-hoc signed.
+> Team-fork macOS builds are ad-hoc signed. If your organization distributes broadly on macOS, configure an Apple Developer ID signing environment before relying on persistent macOS privacy grants across upgrades.
 >
-> To upgrade: **always re-run the curl command above** (this also upgrades npm/pnpm global installs — in-place replacement, no second PATH line), then open a new terminal and run `botmux restart`; on ≥3.18 binary installs `botmux upgrade` is equivalent. To install a pinned version (rollbacks included): `curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | BOTMUX_VERSION=v3.18.8 sh` (the variable must precede the `sh` on the right side of the pipe). ⚠️ **Do not npm-upgrade from releases older than v3.18.0** — crossing the Node-sources → binary form boundary leaves the daemon unable to restart.
+> To upgrade, re-run the curl command above, then open a new terminal and run `botmux restart`; `botmux upgrade` is equivalent for binary installs. To install a pinned version: `curl -fsSL https://raw.githubusercontent.com/jason-jimenez-bytedance/botmux/master/install.sh | BOTMUX_VERSION=vX.Y.Z sh` (the variable must precede `sh` on the right side of the pipe).
 
-<details>
-<summary>Already living in the Node ecosystem? npm works too (same binary)</summary>
+### Publishing a team release
+
+This fork publishes standalone binaries from `.github/workflows/team-release.yml`; it intentionally does not publish the upstream `botmux` npm package. Merge a tested change to `master`, then create and push a semantic-version tag:
 
 ```bash
-npm install -g botmux        # requires Node >= 22 to run the install itself
+git checkout master
+git pull --ff-only origin master
+git tag -a v3.30.1 -m "Team release v3.30.1"
+git push origin v3.30.1
 ```
 
-The npm package carries **the same self-contained binary** (only the one matching your os/arch is installed). The package's `bin` points at a shipped sh launcher that the package manager links onto PATH itself, so **npm, pnpm and bun all work without any lifecycle script** (pnpm 10/11 and bun skip dependency postinstalls by default, which used to leave those installs with no `botmux` command at all). The postinstall still points `~/.botmux/bin/botmux` at the same binary and writes PATH. So you still end up with exactly **one** botmux **version** — both entry points exec the same binary — and no more "two Node versions each carrying their own global botmux, fighting each other / no idea which one I just updated".
+The workflow builds Linux (glibc and musl) and macOS binaries for x64/arm64, creates SHA-256 files, and publishes a GitHub Release. Do not reuse an existing tag; increment the version for every release.
 
-The only difference is **who installs it**: the npm path needs Node ≥ 22 to run the install itself, the curl path never touches Node; **upgrades always re-run the curl command, no matter how you installed** (npm-upgrading from a pre-v3.18.0 install across that form boundary can leave the daemon unable to come back). Once running, the two are identical — same binary, same commands.
-
-</details>
+> This fork is distributed through GitHub Releases. `npm install -g botmux` installs the upstream package, not this fork.
 
 Then DM the bot, or run `botmux dashboard` to create a group, and start chatting. Full steps (Lark international, manual permission / publish setup after `--no-open-platform-auto`, troubleshooting) are in the **[5-Minute Quickstart](https://deepcoldy.github.io/botmux/en/quickstart)**.
 
@@ -107,7 +109,7 @@ Store only non-secret metadata and credential file paths in `bots.json`:
 
 The three credential files must be owner-held `0600` regular files, not symlinks. Never put their contents, the AK/SK, or the Gateway token in `bots.json`. Use a dedicated empty `workingDir`; repositories are exposed separately through the read-only `EBSD_BOTMUX_REPOSITORY_ROOT`. Linux hosts need bubblewrap before enabling `sandbox`, and startup fails closed if isolation cannot be established. The Gateway may accept current and previous keys during rotation while the subject remains stable.
 
-The current full set of `cliId`s is authoritative in [`src/adapters/cli/registry.ts`](https://github.com/deepcoldy/botmux/blob/master/src/adapters/cli/registry.ts); per-CLI config and wrapper / gateway setups are in [CLI Adapters](https://deepcoldy.github.io/botmux/en/adapters).
+The current full set of `cliId`s is authoritative in [`src/adapters/cli/registry.ts`](https://github.com/jason-jimenez-bytedance/botmux/blob/master/src/adapters/cli/registry.ts); per-CLI config and wrapper / gateway setups are in [CLI Adapters](https://deepcoldy.github.io/botmux/en/adapters).
 
 ### Session-level CLI selection
 
@@ -147,4 +149,4 @@ External applications can use experimental [model proxy mode](docs/model-proxy.m
 - 🤝 **Contributing**: issues / PRs welcome. To add an adapter, see [CLI Adapters](https://deepcoldy.github.io/botmux/en/adapters).
 - 📄 **License**: [MIT](LICENSE)
 
-<p align="center">If it's useful, drop a ⭐ Star → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>
+<p align="center">Team fork → <a href="https://github.com/jason-jimenez-bytedance/botmux">jason-jimenez-bytedance/botmux</a></p>

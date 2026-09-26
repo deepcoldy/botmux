@@ -347,6 +347,40 @@ export async function fetchDistTagVersion(tag: string = 'latest', opts?: FetchOp
   }
 }
 
+/** Resolve a version from this distribution's GitHub Releases. Standalone
+ * installs use this instead of the upstream npm dist-tags. */
+export async function fetchGithubReleaseVersion(tag: string = 'latest', opts?: FetchOpts): Promise<string | null> {
+  const cleanTag = tag.trim().replace(/^@/, '').toLowerCase();
+  if (parseVersion(cleanTag)) return cleanTag.replace(/^v/i, '');
+  const fetchImpl = opts?.fetchImpl ?? fetch;
+  const endpoint = cleanTag === 'latest'
+    ? `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`
+    : `https://api.github.com/repos/${GITHUB_REPO}/releases?per_page=100`;
+  try {
+    const res = await fetchImpl(endpoint, {
+      headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'botmux', ...githubAuthHeaders(opts?.auth) },
+      signal: AbortSignal.timeout(opts?.timeoutMs ?? 8_000),
+    });
+    if (!res.ok) return null;
+    const body = await res.json() as unknown;
+    if (cleanTag === 'latest') {
+      const release = body as { tag_name?: unknown };
+      const version = typeof release.tag_name === 'string' ? release.tag_name.replace(/^v/i, '') : '';
+      return parseVersion(version) ? version : null;
+    }
+    if (!KNOWN_CHANNELS.has(cleanTag) || cleanTag === 'latest' || !Array.isArray(body)) return null;
+    const versions = body
+      .map(item => (item && typeof item === 'object' && typeof (item as { tag_name?: unknown }).tag_name === 'string')
+        ? (item as { tag_name: string }).tag_name.replace(/^v/i, '')
+        : '')
+      .filter(version => parseVersion(version)?.pre[0] === cleanTag)
+      .sort((a, b) => compareVersions(b, a));
+    return versions[0] ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * The `latest` dist-tag version on the registry npm is configured to use —
  * the authoritative target of a `@latest` update. null on any failure

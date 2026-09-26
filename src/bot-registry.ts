@@ -2500,7 +2500,7 @@ export function registerBot(cfg: BotConfig): BotState {
   // 没有任何人能 operate（/restart、/cd、卡片按钮全锁死），也没有 owner 可以处置授权卡 ——
   // 这几乎肯定是配错了，明确告警而不是静默把 bot 变成谁也管不了的状态。
   if (cfg.p2pOpen === true && (cfg.allowedUsers?.length ?? 0) === 0) {
-    logger.warn(`[bot:${cfg.larkAppId}] p2pOpen 已开启但未配 allowedUsers：任何人都能私聊，但没有人能执行管理操作（/restart、/cd、卡片按钮）。请补上 allowedUsers。`);
+    logger.warn(`[bot:${cfg.larkAppId}] p2pOpen is enabled without allowedUsers: anyone can send a direct message, but nobody can perform administrative actions (/restart, /cd, card buttons). Configure allowedUsers.`);
   }
   bots.set(cfg.larkAppId, state);
   return state;
@@ -3532,7 +3532,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         .map((x: string) => (x.startsWith('/') ? x : `/${x}`));
       const dropped = strs.filter((x: string) => !DAEMON_COMMANDS.has(x));
       if (dropped.length > 0) {
-        logger.warn(`[bot-registry:${entry.larkAppId}] canTalkDaemonCommands 丢弃非 daemon 命令条目: ${[...new Set(dropped)].join(' ')}（仅接受 daemon 命令，透传命令写 customPassthroughCommands）`);
+        logger.warn(`[bot-registry:${entry.larkAppId}] canTalkDaemonCommands dropped non-daemon commands: ${[...new Set(dropped)].join(' ')} (daemon commands only; use customPassthroughCommands for passthrough commands)`);
       }
       const uniq = [...new Set<string>(strs.filter((x: string) => DAEMON_COMMANDS.has(x)))];
       if (uniq.length > 0) canTalkDaemonCommands = uniq;

@@ -35,31 +35,31 @@ export async function ensureOpusTools(info?: PlatformInfo): Promise<OpusToolsRes
   if (present) return { installed: true, version: present, freshInstall: false };
 
   const platform = info ?? detectPlatform();
-  console.log('⚠️  opus 编码器（opus-tools）未检测到，正在安装...');
+  console.log('⚠️  The Opus encoder (opus-tools) was not found. Installing it...');
 
   const tried: string[] = [];
   for (const pm of platform.packageManagers) {
     if (pm === 'unknown') continue;
     const argv = buildInstallArgv(pm, PKG, platform);
-    if (!argv) { tried.push(`${pm}（跳过：当前用户无 sudo 且无 TTY）`); continue; }
+    if (!argv) { tried.push(`${pm} (skipped: the current user has neither sudo nor a TTY)`); continue; }
     if (pm === 'apt') aptUpdateBeforeInstall(platform);
-    console.log(`   尝试 ${pm}: ${argv.join(' ')}`);
+    console.log(`   Trying ${pm}: ${argv.join(' ')}`);
     if (runInstall(argv)) {
       const v = probeOpusenc();
       if (v) {
-        console.log(`✅ opus-tools 安装完成（via ${pm}）`);
+        console.log(`✅ opus-tools installed (via ${pm})`);
         return { installed: true, version: v, freshInstall: true };
       }
-      tried.push(`${pm}（命令成功但 opusenc 仍不可用）`);
+      tried.push(`${pm} (the command succeeded, but opusenc is still unavailable)`);
     } else {
-      tried.push(`${pm}（命令返回非零）`);
+      tried.push(`${pm} (command exited non-zero)`);
     }
   }
 
   const preferred = platform.packageManagers.find(p => p !== 'unknown') ?? 'unknown';
-  const reasonLines = ['自动安装 opus-tools 失败', '已尝试：', ...tried.map(t => `  - ${t}`)];
+  const reasonLines = ['Automatic opus-tools installation failed', 'Attempted:', ...tried.map(t => `  - ${t}`)];
   if (platform.os === 'darwin' && !platform.packageManagers.includes('brew')) {
-    reasonLines.push('macOS 推荐先装 Homebrew，再 `brew install opus-tools`。');
+    reasonLines.push('On macOS, install Homebrew first, then run `brew install opus-tools`.');
   }
   return {
     installed: false,

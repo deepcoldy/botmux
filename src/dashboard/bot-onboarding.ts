@@ -532,7 +532,7 @@ export class BotOnboardingManager {
       try {
         unlinkSync(this.pendingStorePath);
       } catch (err: any) {
-        if (err?.code !== 'ENOENT') logger.warn(`[bot-onboarding] 无法清理 owner 待确认恢复文件: ${err?.message ?? String(err)}`);
+        if (err?.code !== 'ENOENT') logger.warn(`[bot-onboarding] Could not remove the pending-owner recovery file: ${err?.message ?? String(err)}`);
       }
       return;
     }
@@ -541,7 +541,7 @@ export class BotOnboardingManager {
       atomicWriteFileSync(this.pendingStorePath, `${JSON.stringify(store, null, 2)}\n`, { mode: 0o600 });
     } catch (err: any) {
       // 保留内存态继续让当前页面完成；仅失去进程重启恢复能力，不把已创建应用误报失败。
-      logger.warn(`[bot-onboarding] 无法持久化 owner 待确认任务: ${err?.message ?? String(err)}`);
+      logger.warn(`[bot-onboarding] Could not persist the pending-owner task: ${err?.message ?? String(err)}`);
     }
   }
 
@@ -848,7 +848,7 @@ export class BotOnboardingManager {
     try {
       this.persistPermissionRecoveryJobs();
     } catch (err: any) {
-      logger.warn(`[bot-onboarding] 无法更新权限恢复 lineage: ${err?.message ?? String(err)}`);
+      logger.warn(`[bot-onboarding] Could not update permission-recovery lineage: ${err?.message ?? String(err)}`);
     }
   }
 

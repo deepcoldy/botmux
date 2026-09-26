@@ -15,8 +15,8 @@ export function checkAllowedChatGroupsConfig(bot: BotState): void {
   if (chatIds.length === 0) return;
   if (!hasOwnerEntry(bot.config.allowedUsers)) {
     logger.warn(
-      `[${bot.config.larkAppId}] allowedChatGroups 已配置但 allowedUsers 无 owner（完整邮箱或 open_id）: ` +
-      `群成员可对话，但 /restart、/close、/grant 等敏感操作将对所有人不可用。请在 allowedUsers 配置至少一个 owner。`,
+      `[${bot.config.larkAppId}] allowedChatGroups is configured but allowedUsers has no owner (full email address or open_id): ` +
+      'chat members can talk, but sensitive operations such as /restart, /close, and /grant are unavailable to everyone. Configure at least one owner in allowedUsers.',
     );
   }
 }

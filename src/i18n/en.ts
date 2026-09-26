@@ -891,6 +891,7 @@ export const messages: Record<string, string> = {
 
   // ─── AI system prompt (Claude Code: --append-system-prompt) ──────────────
   'ai.routing.intro': 'You are in a Lark (Feishu) conversation. The user cannot see terminal output — you MUST reply via `botmux send`.',
+  'ai.response.english_only': 'Language requirement: write every user-facing response in English. Do not switch languages merely because the user writes in another language.',
   'ai.routing.usage_send': '- Send: `botmux send "message"`',
   'ai.routing.usage_mention_gate': '- Every send MUST pick one: `--mention <open_id>` / `--mention-back` / `--no-mention` — pick by VALUE: substantive conclusions the other party should read/confirm/decide → @; pure record / low-priority progress / short ack → --no-mention; a contentless "got it" is better not sent',
   'ai.routing.usage_attachments': '- Attachments: `--images`, `--files`, `--videos` (see `botmux send --help`)',
@@ -975,16 +976,16 @@ export const messages: Record<string, string> = {
   'ai.available_bots.hint': 'To communicate or collaborate with a bot listed here you MUST --mention its open_id (botmux send --mention ou_xxx ...). Without --mention the other bot receives nothing.',
   'ai.available_bots.hint_collapsed': 'To communicate or collaborate with another bot, first run `botmux bots list` to get its open_id, then --mention it. Without --mention the other bot receives nothing.',
   'ai.available_bots.collapsed_line': 'There are {count} collaborator bots in this chat: {names}.',
-  'ai.followup.reminder': 'Respond to messages addressed to you at least once via `botmux send`, never stay silent; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND.',
-  'ai.followup.reminder_hook': 'This session is bridged to Lark via botmux; terminal output is not visible to the user. Session convention: send replies to the Lark conversation via `botmux send`; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND.',
-  'ai.followup.reminder_no_resend': 'Respond to messages addressed to you at least once via `botmux send`, never stay silent; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND. A successful send is already delivered; ending a turn with no visible text is normal, so do not resend on a "no visible output" nudge.',
+  'ai.followup.reminder': 'Write every user-facing response in English. Respond to messages addressed to you at least once via `botmux send`, never stay silent; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND.',
+  'ai.followup.reminder_hook': 'Write every user-facing response in English. This session is bridged to Lark via botmux; terminal output is not visible to the user. Session convention: send replies to the Lark conversation via `botmux send`; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND.',
+  'ai.followup.reminder_no_resend': 'Write every user-facing response in English. Respond to messages addressed to you at least once via `botmux send`, never stay silent; what and how many to send is your call. Only when a message is not for you make the final just the single word BOTMUX_NOTHING_TO_SEND. A successful send is already delivered; ending a turn with no visible text is normal, so do not resend on a "no visible output" nudge.',
   // No-transport follow-up (apiOnly bot / HTTP virtual session): a program-driven
   // request/response turn with no Lark conversation, no sibling bots, and no
   // `botmux send`. The nothing-to-send sentinel appears exactly once, in this
   // turn's <botmux_http_response_mode> (migrated, not deleted — #808 async settle
   // depends on it); this reminder MUST NOT carry send/@/BOTMUX_NOTHING_TO_SEND,
   // or it would conflict with http_response_mode again.
-  'ai.followup.reminder_no_transport': 'This turn is a program-driven request/response: your entire reply is returned verbatim to the caller, not shown in any chat. Just follow the <botmux_http_response_mode> instructions in this turn\'s content; do not call botmux send, do not post to Feishu/Lark.',
+  'ai.followup.reminder_no_transport': 'Write every user-facing response in English. This turn is a program-driven request/response: your entire reply is returned verbatim to the caller, not shown in any chat. Just follow the <botmux_http_response_mode> instructions in this turn\'s content; do not call botmux send, do not post to Feishu/Lark.',
   'ai.cursor.sender_note': 'The sender tag is metadata identifying the current speaker — never copy its open_id or name (e.g. ou_xxx:Alice) into your botmux send body or opening line; to @ the triggerer use botmux send --mention-back.',
   'ai.bridge.attachments_label': '[Attachments]',
   'ai.bridge.mentions_label': '[@Mentions]',

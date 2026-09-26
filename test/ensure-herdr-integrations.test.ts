@@ -208,7 +208,7 @@ describe('TraeX herdr plugin installation', () => {
     const { installTraexPluginNow } = await loadSubject();
     const result = await installTraexPluginNow('trusted/repo', 'reviewed-sha');
     expect(result.failed).toMatchObject({ step: 'install' });
-    expect(result.failed?.reason).toContain('元数据不匹配');
+    expect(result.failed?.reason).toContain('metadata did not match');
     expect(spawn.mock.calls.filter(([, args]) => args?.[1] === 'action')).toHaveLength(0);
     expect(existsSync(markerPath)).toBe(false);
   });

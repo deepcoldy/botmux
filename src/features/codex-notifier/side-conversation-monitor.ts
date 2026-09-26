@@ -611,7 +611,7 @@ export class CodexSideConversationMonitor {
         || this.pendingBytes + bytes > this.maxPendingBytes
       ) {
         this.logger.warn(
-          `[codex-notifier] Side Chat 内存待入队已达上限，跳过事件: ${event.eventId.slice(0, 12)}`,
+          `[codex-notifier] Side Chat in-memory pending queue is full; skipping event: ${event.eventId.slice(0, 12)}`,
         );
         continue;
       }
@@ -627,10 +627,10 @@ export class CodexSideConversationMonitor {
         this.enqueue(this.options.dataDir, item.targetBotAppId, item.event);
         this.pending.delete(eventId);
         this.pendingBytes = Math.max(0, this.pendingBytes - item.bytes);
-        this.logger.debug(`[codex-notifier] Side Chat 完成事件已入队: ${eventId.slice(0, 12)}`);
+        this.logger.debug(`[codex-notifier] Side Chat completion event queued: ${eventId.slice(0, 12)}`);
       } catch (error) {
         this.logger.warn(
-          `[codex-notifier] Side Chat 完成事件入队失败，将重试: ${
+          `[codex-notifier] Failed to enqueue Side Chat completion event; retrying: ${
             error instanceof Error ? error.message : String(error)
           }`,
         );
@@ -646,7 +646,7 @@ export class CodexSideConversationMonitor {
         socket = this.connect(this.socketPath);
       } catch (error) {
         this.logger.debug(
-          `[codex-notifier] Codex Desktop IPC 连接失败: ${
+          `[codex-notifier] Codex Desktop IPC connection failed: ${
             error instanceof Error ? error.message : String(error)
           }`,
         );
@@ -849,7 +849,7 @@ export class CodexSideConversationMonitor {
           connectTimer = undefined;
         }
         initializeTimer = setTimeout(() => {
-          this.logger.warn('[codex-notifier] Codex Desktop IPC 初始化超时，将重连');
+          this.logger.warn('[codex-notifier] Codex Desktop IPC initialization timed out; reconnecting');
           finish();
         }, this.initializeTimeoutMs);
         initializeTimer.unref?.();
@@ -873,7 +873,7 @@ export class CodexSideConversationMonitor {
             const frameLength = header.readUInt32LE(0);
             headerOffset = 0;
             if (frameLength === 0 || frameLength > IPC_MAX_FRAME_BYTES) {
-              this.logger.warn(`[codex-notifier] Codex Desktop IPC 帧长度无效: ${frameLength}`);
+              this.logger.warn(`[codex-notifier] Invalid Codex Desktop IPC frame length: ${frameLength}`);
               finish();
               return;
             }
@@ -894,7 +894,7 @@ export class CodexSideConversationMonitor {
             handleMessage(JSON.parse(completedFrame.toString('utf8')) as IpcMessage);
           } catch (error) {
             this.logger.warn(
-              `[codex-notifier] Codex Desktop IPC 消息解析失败: ${
+              `[codex-notifier] Codex Desktop IPC message parsing failed: ${
                 error instanceof Error ? error.message : String(error)
               }`,
             );
@@ -902,12 +902,12 @@ export class CodexSideConversationMonitor {
         }
       });
       socket.on('error', (error) => {
-        this.logger.debug(`[codex-notifier] Codex Desktop IPC 暂不可用: ${error.message}`);
+        this.logger.debug(`[codex-notifier] Codex Desktop IPC is temporarily unavailable: ${error.message}`);
       });
       socket.on('close', finish);
       signal?.addEventListener('abort', abort, { once: true });
       connectTimer = setTimeout(() => {
-        this.logger.warn('[codex-notifier] Codex Desktop IPC 连接超时，将重连');
+        this.logger.warn('[codex-notifier] Codex Desktop IPC connection timed out; reconnecting');
         finish();
       }, this.connectTimeoutMs);
       connectTimer.unref?.();

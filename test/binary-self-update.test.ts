@@ -398,7 +398,7 @@ describe('release asset selection', () => {
 
   it('the download base is the tagged release, with exactly one v prefix', () => {
     expect(releaseAssetBaseUrl('3.18.4'))
-      .toBe('https://github.com/deepcoldy/botmux/releases/download/v3.18.4');
+      .toBe('https://github.com/jason-jimenez-bytedance/botmux/releases/download/v3.18.4');
     // A caller that already has the "v" must not produce ".../vv3.18.4".
     expect(releaseAssetBaseUrl('v3.18.4')).toBe(releaseAssetBaseUrl('3.18.4'));
   });

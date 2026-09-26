@@ -326,7 +326,7 @@ export async function installTraexPluginNow(source: string, ref: string): Promis
 
       let installed = false;
       if (needsInstall) {
-        console.log(`   安装 herdr TraeX plugin: ${src}${rf ? ` (--ref ${rf})` : ''}`);
+        console.log(`   Installing herdr TraeX plugin: ${src}${rf ? ` (--ref ${rf})` : ''}`);
         const install = await spawnHerdrAsync(['plugin', 'install', src, ...(rf ? ['--ref', rf] : []), '--yes'], 120_000);
         if (!install.ok) {
           return { ...base, attempted: true, failed: { step: 'install' as const, reason: install.reason, manualCommand } };
@@ -347,7 +347,7 @@ export async function installTraexPluginNow(source: string, ref: string): Promis
           installed,
           failed: {
             step: 'install' as const,
-            reason: `herdr 安装后元数据不匹配（source=${installedSource || '缺失'}, ref=${installedRef || '缺失'}, resolved_commit=${after.resolvedCommit || '缺失'}）`,
+            reason: `herdr metadata did not match after installation (source=${installedSource || 'missing'}, ref=${installedRef || 'missing'}, resolved_commit=${after.resolvedCommit || 'missing'})`,
             manualCommand,
           },
         };
@@ -375,7 +375,7 @@ export async function installTraexPluginNow(source: string, ref: string): Promis
             attempted: true,
             installed,
             actionInvoked,
-            failed: { step: 'action' as const, reason: `hooks 已写入，但状态 marker 保存失败：${err?.message ?? err}`, manualCommand },
+            failed: { step: 'action' as const, reason: `Hooks were written, but saving the state marker failed: ${err?.message ?? err}`, manualCommand },
           };
         }
       }
@@ -388,7 +388,7 @@ export async function installTraexPluginNow(source: string, ref: string): Promis
       attempted: true,
       failed: {
         step: 'install',
-        reason: `安装锁失败：${err?.message ?? err}`,
+        reason: `Installation lock failed: ${err?.message ?? err}`,
         manualCommand,
       },
     };
@@ -469,7 +469,7 @@ export async function ensureHerdrIntegrations(cliIds: Iterable<CliId>): Promise<
       result.alreadyInstalled.push(name);
       continue;
     }
-    console.log(`   安装 herdr integration: ${name}`);
+    console.log(`   Installing herdr integration: ${name}`);
     const r = installSingleIntegration(name);
     if (r.ok) {
       result.installed.push(name);

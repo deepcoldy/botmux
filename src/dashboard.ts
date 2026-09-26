@@ -2114,7 +2114,7 @@ void runCodexNotifierWorkerSupervisor({
   }),
   logger,
   onLeaseUnavailable: path => {
-    logger.warn(`[codex-notifier] outbox worker 已由另一 Dashboard 持有，等待接管：${path}`);
+    logger.warn(`[codex-notifier] Outbox worker is held by another Dashboard; waiting to take over: ${path}`);
   },
 });
 
@@ -8339,12 +8339,12 @@ federationSync.unref();
 async function tryAutoBindOwner(): Promise<'done' | 'retry'> {
   try {
     const r = await autoBindOwnerIfUnambiguous(config.session.dataDir, { fetcher: fetch, live: liveBots() });
-    if (r.status === 'bound') { logger.info(`[identity] 已自动绑定本部署负责人：${r.owner?.name || r.owner?.unionId}（头像/拉群/归属即时生效）`); return 'done'; }
+    if (r.status === 'bound') { logger.info(`[identity] Deployment owner bound automatically: ${r.owner?.name || r.owner?.unionId} (avatar, group invitation, and ownership take effect immediately)`); return 'done'; }
     if (r.status === 'already_bound') return 'done';
-    if (r.status === 'need_choice') { logger.info(`[identity] 检测到 ${r.candidates?.length ?? 0} 个候选负责人，请到面板「团队」手动选择绑定`); return 'done'; }
+    if (r.status === 'need_choice') { logger.info(`[identity] Found ${r.candidates?.length ?? 0} owner candidates; select one manually under Team in the Dashboard`); return 'done'; }
     return 'retry'; // no_candidates：可能是网络/凭证未就绪的瞬时失败，退避后重试
   } catch (e) {
-    logger.debug(`[identity] 自动绑定尝试失败（将退避重试）：${(e as Error).message}`);
+    logger.debug(`[identity] Automatic owner binding failed; retrying with backoff: ${(e as Error).message}`);
     return 'retry';
   }
 }
@@ -8433,7 +8433,7 @@ function startPlatformTunnelIfBound(): void {
     // Only the first token creation needs the path+lock helper.
     if (!existingToken) {
       loadOrCreatePersistedToken(TOKEN_PATH);
-      logger.info('[platform-tunnel] 已初始化 dashboard token');
+      logger.info('[platform-tunnel] Dashboard token initialized');
     }
     const version = readBotmuxVersion();
     platformTunnel = startPlatformTunnelClient({
@@ -8446,13 +8446,13 @@ function startPlatformTunnelIfBound(): void {
       onTeamSync: handlePlatformTeamSync,
       log: (msg, extra) => logger.info(`[platform-tunnel] ${msg}${extra ? ' ' + JSON.stringify(extra) : ''}`),
     });
-    logger.info(`[platform-tunnel] 绑定到 ${binding.platformUrl}，启动隧道`);
+    logger.info(`[platform-tunnel] Bound to ${binding.platformUrl}; starting tunnel`);
     // 大厅打卡自愈重试：team-sync 应用时会立即尝试一次；这里的低频周期兜住
     // "当时 daemon 离线 / bot 还没进大厅 / 发送失败"的漏拍。无平台绑定不启动。
     const hallTimer = setInterval(() => { void maybeAnnounceHallPresence(); }, 5 * 60 * 1000);
     hallTimer.unref();
   } catch (e) {
-    logger.warn(`[platform-tunnel] 启动失败: ${(e as Error).message}`);
+    logger.warn(`[platform-tunnel] Startup failed: ${(e as Error).message}`);
   }
 }
 
@@ -8460,10 +8460,10 @@ function startPlatformTunnelIfBound(): void {
 function handlePlatformTeamSync(payload: PlatformTeamSyncMessage): void {
   const applied = applyPlatformTeamSync(config.session.dataDir, payload);
   if (!applied) {
-    logger.warn('[platform-tunnel] team-sync 负载无效，忽略');
+    logger.warn('[platform-tunnel] Invalid team-sync payload; ignoring');
     return;
   }
-  logger.info(`[platform-tunnel] team-sync 已应用 rev=${applied.rev} teams=${applied.teams.length}`);
+  logger.info(`[platform-tunnel] team-sync applied rev=${applied.rev} teams=${applied.teams.length}`);
   void maybeAnnounceHallPresence();
 }
 
@@ -8542,22 +8542,22 @@ async function maybeAnnounceHallPresence(): Promise<void> {
           });
           const j = await r.json().catch(() => ({} as { ok?: boolean; error?: string; mentioned?: string[]; unresolved?: string[]; skipped?: string }));
           if (!r.ok || !(j as { ok?: boolean }).ok) {
-            logger.warn(`[platform-tunnel] 大厅打卡失败 bot=${bot.appId} chat=${hallChatId.substring(0, 12)}: ${(j as { error?: string }).error ?? r.status}`);
+            logger.warn(`[platform-tunnel] Hall check-in failed bot=${bot.appId} chat=${hallChatId.substring(0, 12)}: ${(j as { error?: string }).error ?? r.status}`);
           } else {
             sent = !(j as { skipped?: string }).skipped;
             const mentioned = (j as { mentioned?: string[] }).mentioned ?? [];
             const unresolved = (j as { unresolved?: string[] }).unresolved ?? [];
-            if (sent) logger.info(`[platform-tunnel] 大厅打卡已发 bot=${bot.appId} chat=${hallChatId.substring(0, 12)}${mentioned.length ? ` 点名=[${mentioned.join(',')}]` : ''}${unresolved.length ? ` 未解析=[${unresolved.join(',')}]` : ''}`);
+            if (sent) logger.info(`[platform-tunnel] Hall check-in sent bot=${bot.appId} chat=${hallChatId.substring(0, 12)}${mentioned.length ? ` mentioned=[${mentioned.join(',')}]` : ''}${unresolved.length ? ` unresolved=[${unresolved.join(',')}]` : ''}`);
           }
         } catch (e) {
-          logger.warn(`[platform-tunnel] 大厅打卡请求异常 bot=${bot.appId}: ${(e as Error).message}`);
+          logger.warn(`[platform-tunnel] Hall check-in request failed bot=${bot.appId}: ${(e as Error).message}`);
         }
         bumpHallAnnounceState(throttleKey, sent);
         state[throttleKey] = { lastAt: now, tries: (st?.tries ?? 0) + (sent ? 1 : 0) };
       }
     }
   } catch (e) {
-    logger.warn(`[platform-tunnel] 大厅打卡检查异常: ${(e as Error).message}`);
+    logger.warn(`[platform-tunnel] Hall check-in verification failed: ${(e as Error).message}`);
   }
 }
 

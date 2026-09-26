@@ -275,7 +275,7 @@ async function fetchUserProfile(larkAppId: string, openId: string): Promise<void
       if (!scopeUnavailable.has(larkAppId)) {
         scopeUnavailable.add(larkAppId);
         logger.warn(
-          `[identity] [${larkAppId}] contact:user.base:readonly 未开通，sender name 解析将降级到 open_id (code=99991672)`,
+          `[identity] [${larkAppId}] contact:user.base:readonly is not granted; sender-name resolution will fall back to open_id (code=99991672)`,
         );
       }
       return;
