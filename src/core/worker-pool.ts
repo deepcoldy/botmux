@@ -37,6 +37,7 @@ import { effectiveReplyDelivery } from './reply-delivery.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
 import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName, type IdleCardLabel } from '../im/lark/card-builder.js';
+import { buildClosedSessionCard } from './closed-session-card.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
 import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId } from '../services/codex-reasoning-effort.js';
@@ -4471,6 +4472,8 @@ export async function deliverEphemeralOrReply(
  * whether the PATCH was accepted for immediate or queued delivery.
  */
 export function scheduleCardPatch(ds: DaemonSession, cardJson: string, turnId?: string): boolean {
+  // A late screen/config callback must not repaint a closed session as working.
+  if (ds.session.status === 'closed') return false;
   // Defense-in-depth transport gate: a no-transport session (apiOnly bot or HTTP
   // virtual chat) has no real Feishu card to PATCH. Callers already suppress via
   // managedAuxUiSuppressed, but guarding the flush entry too means a stray direct
@@ -7576,6 +7579,21 @@ export async function closeSession(
     );
   }
 
+  // Close can originate from IPC/background cleanup, not only a card button.
+  // Freeze the existing live card through the same serialized PATCH queue so
+  // an in-flight screen update cannot land after the closed state. Refused or
+  // residual closes must not claim the underlying execution was terminated.
+  if (ds && !prepared.residual && ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL) {
+    try {
+      if (larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) {
+        ds.pendingCardId = ds.streamCardId;
+        ds.pendingCardJson = buildClosedSessionCard(ds, localeForBot(ds.larkAppId));
+        if (!ds.cardPatchInFlight) flushCardPatch(ds);
+      }
+    } catch (error) {
+      logger.warn(`[${sessionId.slice(0, 8)}] Could not freeze closed session card: ${error}`);
+    }
+  }
   const closedSnapshot = sessionStore.getOwnedSession(sessionId) ?? ds?.session ?? stored;
   const runClosedLifecycle = async (workerExitProven: boolean): Promise<void> => {
     if (!closedSnapshot || !callbacks?.onSessionClosed) return;

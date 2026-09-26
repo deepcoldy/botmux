@@ -5,6 +5,9 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { config } from '../src/config.js';
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
+import * as larkClient from '../src/im/lark/client.js';
+import * as botRegistry from '../src/bot-registry.js';
+import * as closedCard from '../src/core/closed-session-card.js';
 import * as docComment from '../src/im/lark/doc-comment.js';
 import * as workerPool from '../src/core/worker-pool.js';
 import { activeSessionKey } from '../src/core/types.js';
@@ -567,5 +570,38 @@ describe('daemon close barrier used by botmux delete', () => {
     } finally {
       config.session.dataDir = previousDataDir;
     }
+  });
+});
+
+
+describe('closed live card lifecycle', () => {
+  it.each(['claude-code', 'codex'])('serializes the closed card after in-flight output for %s', async cliId => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-close-card-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-close-card');
+    vi.spyOn(botRegistry, 'getBot').mockReturnValue({ config: { cliId, larkAppId: 'app-close-card' } } as any);
+    vi.spyOn(closedCard, 'buildClosedSessionCard').mockReturnValue('closed-card');
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const patch = vi.spyOn(larkClient, 'updateMessage').mockImplementationOnce(() => gate as any).mockResolvedValue(undefined as any);
+    vi.spyOn(docSubsStore, 'listDocSubscriptionsForSession').mockReturnValue([]);
+    try {
+      const session = sessionStore.createSession('oc_card', 'om_root', 'card', 'group');
+      session.larkAppId = 'app-close-card'; session.cliId = cliId as any;
+      sessionStore.updateSession(session);
+      const ds = { session, worker: null, larkAppId: 'app-close-card', chatId: 'oc_card',
+        chatType: 'group', scope: 'thread', streamCardId: 'om_live', hasHistory: true } as any;
+      workerPool.setActiveSessionsRegistry(new Map([[activeSessionKey(ds), ds]]));
+      expect(workerPool.scheduleCardPatch(ds, 'working-card')).toBe(true);
+      await workerPool.closeSession(session.sessionId);
+      expect(patch).toHaveBeenCalledTimes(1);
+      expect(workerPool.scheduleCardPatch(ds, 'late-working-card')).toBe(false);
+      release();
+      await vi.waitFor(() => expect(patch).toHaveBeenCalledTimes(2));
+      expect(patch).toHaveBeenLastCalledWith('app-close-card', 'om_live', 'closed-card');
+      expect(sessionStore.getSession(session.sessionId)?.status).toBe('closed');
+    } finally { release(); config.session.dataDir = previousDataDir; }
   });
 });
