@@ -166,6 +166,112 @@ export function decidePostHookPromptEvidence(state: {
   return { action: 'accept' };
 }
 
+/**
+ * First-prompt-timeout fallback for a SessionStart boundary that never got its
+ * fresh prompt — accept the input box ALREADY on screen.
+ *
+ * `shouldArmPostHookPromptEvidenceFallback` keeps the boundary fallback
+ * startup-only because resume is expected to redraw a fresh ❯ within ~2s. That
+ * expectation does not always hold: when a session is woken with nothing to
+ * deliver (e.g. opening the web terminal of a suspended session), Claude can
+ * paint the resumed transcript and its prompt before the SessionStart signal
+ * reaches the worker and then never output again. The boundary has already
+ * dropped the ready evidence, the idle detector's quiescence strategy stays
+ * suppressed, and for a type-ahead CLI the first-prompt timeout only calls
+ * flushPending() — which is a no-op with an empty queue. The prompt is then
+ * never marked ready, the screen status stays `working` for the life of the
+ * worker, and anything waiting for an idle edge (a deferred suspend, for one)
+ * waits forever.
+ *
+ * Arm only when the boundary was still unresolved at the timeout, nothing was
+ * queued, and nobody typed into the web terminal since the boundary: a queued
+ * message is flushed by the timeout itself and its reply redraws the prompt
+ * through the normal path; typed input echoes a redraw of its own. By the time the timeout fires the
+ * transcript replay is long over, so the replay concern that keeps the boundary
+ * fallback startup-only does not apply; the caller still requires a quiet PTY
+ * and a framed input box (see `screenShowsFramedPrompt`).
+ */
+export function shouldArmFirstPromptTimeoutPromptSeed(state: {
+  /** `awaitingPostSessionStartPromptEvidence` as it was when the timeout fired. */
+  wasAwaitingPostHookPrompt: boolean;
+  /** Any input was queued for the timeout's flush. */
+  hasPendingInput: boolean;
+  /** Bytes were forwarded from the web terminal since the SessionStart boundary.
+   *  Such a submission is invisible to the queue and may not have produced
+   *  output yet, so the screen can no longer be read as a prompt left idle. */
+  webInputSinceBoundary: boolean;
+}): boolean {
+  return state.wasAwaitingPostHookPrompt && !state.hasPendingInput && !state.webInputSinceBoundary;
+}
+
+/**
+ * Whether the first-prompt-timeout fallback may keep polling.
+ *
+ * The fallback only ever accepts a screen that has been FROZEN since it was
+ * armed. Any PTY output after arming — a redraw, an echo of keys typed straight
+ * into the web terminal, a live turn — hands the prompt back to the normal idle
+ * path: fresh output re-feeds the idle detector, and a submission made directly
+ * in the terminal is invisible to the queue and in-flight tracking, so a quiet
+ * gap later in that turn must not be mistaken for a prompt left idle. Input is
+ * fenced separately from output because a submission can land before the CLI
+ * has echoed anything.
+ */
+export function firstPromptSeedStillWaiting(state: {
+  /** The backend the fallback was armed for is still the current one. */
+  sameBackend: boolean;
+  /** The prompt already became ready by itself. */
+  promptReady: boolean;
+  /** Input is queued for the CLI. */
+  hasPendingInput: boolean;
+  /** Input written to the PTY has not been consumed yet. */
+  hasUnackedInput: boolean;
+  /** Any PTY output chunk since the fallback was armed. */
+  outputSinceArm: boolean;
+  /** Any input since arming that the queue does not track — bytes forwarded from
+   *  the web terminal, or a botmux turn (e.g. a raw command) that changed the
+   *  current turn id — even if the CLI has not answered it with output yet. */
+  inputSinceArm: boolean;
+}): boolean {
+  return state.sameBackend
+    && !state.promptReady
+    && !state.hasPendingInput
+    && !state.hasUnackedInput
+    && !state.outputSinceArm
+    && !state.inputSinceArm;
+}
+
+/** A full-width light horizontal rule, as Claude draws above and below its input box. */
+const INPUT_BOX_RULE = /^\s*─{8,}\s*$/;
+
+/**
+ * The LAST line matching `readyPattern` sits inside a framed input box: the
+ * nearest non-blank line above and below it are both horizontal rules.
+ *
+ * A bare `readyPattern.test(screen)` also matches a selector's `❯ 1. Yes`
+ * (startup / trust / hook dialogs) and any ❯ left in the replayed transcript.
+ * Neither is framed by rules on both sides, so they are rejected here. Pass the
+ * rendered viewport (`renderer.rawSnapshot()`), not the appended PTY log.
+ */
+export function screenShowsFramedPrompt(screen: string, readyPattern: RegExp): boolean {
+  if (!screen) return false;
+  const lines = screen.split('\n');
+  let promptLine = -1;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (readyPattern.test(lines[i])) { promptLine = i; break; }
+  }
+  if (promptLine < 0) return false;
+  const nearestNonBlank = (from: number, step: 1 | -1): string | undefined => {
+    for (let i = from + step; i >= 0 && i < lines.length; i += step) {
+      if (lines[i].trim() !== '') return lines[i];
+    }
+    return undefined;
+  };
+  const above = nearestNonBlank(promptLine, -1);
+  const below = nearestNonBlank(promptLine, 1);
+  return above !== undefined && below !== undefined
+    && INPUT_BOX_RULE.test(above) && INPUT_BOX_RULE.test(below);
+}
+
 export function shouldReleaseFirstPromptTimeout(state: {
   /** Adapter wants the soft timeout to wait for a real readyPattern. */
   deferFirstPromptTimeoutUntilReady: boolean;
