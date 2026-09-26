@@ -1,3 +1,4 @@
+import { sessionPromptInjection } from './prompt-injection.js';
 /**
  * Worker pool — manages forking, killing, and lifecycle of worker processes.
  * Extracted from daemon.ts for modularity.
@@ -795,6 +796,10 @@ export interface WorkerSessionReplyOptions {
 }
 
 export interface WorkerPoolCallbacks {
+  /** Host-owned return path for zero-injection sub-bots. */
+  onZeroPromptFinal?: (ds: DaemonSession, input: {
+    turnId: string; content: string; dispatchRoot?: string;
+  }) => Promise<void>;
   sessionReply: (
     rootId: string,
     content: string,
@@ -9628,6 +9633,7 @@ export async function forkSession(
   childSession.wrapperCli = ds.session.wrapperCli;
   childSession.cliLaunchMode = ds.session.cliLaunchMode;
   childSession.agentFrozen = ds.session.agentFrozen;
+  childSession.promptInjection = sessionPromptInjection(ds);
   childSession.nativeSessionTitle = childTitle;
   childSession.nativeSessionTitleUserDefined = true;
   sessionStore.updateSession(childSession);
@@ -12142,7 +12148,8 @@ export function forkWorker(
     // replyDelivery=transcript 的冻结值（core/reply-delivery.ts）：worker 只用它给
     // injectsSessionContext 适配器选系统提示措辞；solo 由 daemon 在 fork 前按轮算好
     // 写在 ds 上（resolveSoloSessionForTurn），缺省非 solo。
-    replyDelivery: effectiveReplyDelivery(botCfg.larkAppId, agentCfg.cliId),
+    replyDelivery: effectiveReplyDelivery(botCfg.larkAppId, agentCfg.cliId, sessionPromptInjection(ds)),
+    promptInjection: sessionPromptInjection(ds),
     solo: ds.soloSession === true,
     feedback: feedbackPolicy,
     terminalCardEpoch: ds.session.terminalCardEpoch,
@@ -16490,7 +16497,7 @@ function markTurnReplyDelivered(
 ): void {
   if (msg.kind && msg.kind !== 'bridge') return;
   if (ds.session.vcMeetingReceiver) return;
-  if (effectiveReplyDelivery(ds.larkAppId, effectiveCliId) !== 'transcript') return;
+  if (effectiveReplyDelivery(ds.larkAppId, effectiveCliId, sessionPromptInjection(ds)) !== 'transcript') return;
   if (ds.currentTurnId && ds.currentTurnId !== msg.turnId) return;
   ds.completedIdleTurnId = msg.turnId;
   // 卡已 idle 就立即重刷卡头；仍在 working 则等下一次状态边沿自然带上标签。
@@ -17027,6 +17034,21 @@ function deliverFinalOutput(
       }
       if (preparedListenerReply?.kind === 'send' || preparedListenerReply?.kind === 'succeeded') {
         finishVcMeetingImReply(config.session.dataDir, preparedListenerReply.ref, messageId);
+      }
+      if (!managedReceiver && (!msg.kind || msg.kind === 'bridge')
+        && ds.initConfig?.promptInjection === 'none') {
+        // Reporting is a separate sink. Its bounded retries must not resend
+        // the already-delivered card or delay this sub-session's settlement.
+        const report = cb.onZeroPromptFinal;
+        const input = {
+          turnId: msg.turnId, content: safeAssistantText,
+          dispatchRoot: frozenReplyTarget?.mode === 'thread' ? frozenReplyTarget.rootMessageId
+            : ds.scope === 'chat' ? ds.session.replyTargets?.[msg.turnId]?.rootMessageId
+              : ds.session.rootMessageId,
+        };
+        if (report) void Promise.resolve().then(() => report(ds, input)).catch(error => {
+          logger.warn(`[${t}] Automatic dispatch report failed (turn ${msg.turnId}): ${error}`);
+        });
       }
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
       markTurnReplyDelivered(ds, msg, effectiveCliId);

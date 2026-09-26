@@ -98,6 +98,12 @@ export function isStructuredBridgeFallbackActive(
   return false;
 }
 
+/** Automatic final replies for ordinary bot-spawned CLI sessions. Claude uses
+ * its own transcript bridge; the remaining drivers share the structured one. */
+export function supportsTranscriptReplyDelivery(cliId: string | undefined): boolean {
+  return cliId === 'claude-code' || isStructuredBridgeFallbackActive(cliId, false);
+}
+
 /** Daemon adopt path — forward transcript bind fields. */
 export function isStructuredBridgeAdoptCli(cliId: string | undefined): boolean {
   return !!cliId && ADOPT_SET.has(cliId);

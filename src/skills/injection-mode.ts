@@ -106,6 +106,7 @@ export function shouldInstallGlobalSkills(skillsDir: string): boolean {
   const target = expandHome(skillsDir);
   try {
     for (const b of loadBotConfigs()) {
+      if (b.promptInjection === 'none') continue;
       if (resolveSkillInjectionMode(b.skillInjection) !== 'global') continue;
       let sd: string | undefined;
       try { sd = createCliAdapterSync(b.cliId, b.cliPathOverride).skillsDir; } catch { continue; }

@@ -17,7 +17,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import type { TriggerRequest } from '../src/services/trigger-types.js';
+import { validateTriggerRequest, type TriggerRequest } from '../src/services/trigger-types.js';
+import { buildOrchestratorReportTrigger, deliverReportSessionRelay, retryAutomaticDispatchReport } from '../src/core/report-session-relay.js';
 import type { DaemonSession } from '../src/core/types.js';
 
 let tempDir: string;
@@ -179,6 +180,39 @@ describe('turn-level idempotency — worker LIVE (sendWorkerInput) branch', () =
     expect(second.idempotent).toBe(true);
     expect(second.triggerId).toBe(first.triggerId);
     expect(mockSendWorkerInput).toHaveBeenCalledTimes(1); // still ONE send
+  });
+
+  it('automatic report retries a lost HTTP response without dispatching a second lead turn', async () => {
+    vi.useFakeTimers();
+    try {
+      const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+      const activeSessions = activeWith(ds);
+      const decision = { ok: true as const, source: { sessionId: 'sub', larkAppId: 'cli_sub' },
+        target: { sessionId: SID, larkAppId: APP }, dispatchRoot: 'om_dispatch',
+        sourceName: 'review', content: 'review result', projectUpdate: {} };
+      const key = 'zero-prompt:sub:turn-1';
+      const triggerMeta = { requestId: key, receivedAt: '2026-09-25T07:00:00.000Z', turnIdempotencyKey: key };
+      const shape = validateTriggerRequest(buildOrchestratorReportTrigger(decision, triggerMeta));
+      expect(shape.ok).toBe(true);
+      let lost = true;
+      const fetchTarget = vi.fn(async (_path: string, init: RequestInit) => {
+        const req = JSON.parse(init.body as string) as TriggerRequest;
+        const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+        expect(result.ok).toBe(true);
+        if (lost) { lost = false; throw new Error('response lost after acceptance'); }
+        expect(result.idempotent).toBe(true);
+        return { ok: true, status: 200, json: async () => result };
+      });
+      const work = retryAutomaticDispatchReport(async () => {
+        const response = await deliverReportSessionRelay({ decision, triggerMeta, fetchTarget,
+          postProjectUpdate: async () => ({ projectSynced: false }) });
+        expect(response.status).toBe(200);
+      });
+      await vi.runAllTimersAsync();
+      await work;
+      expect(fetchTarget).toHaveBeenCalledTimes(2);
+      expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
   });
 
   it('same key + DIFFERENT payload → 409 idempotency_conflict, no second send', async () => {

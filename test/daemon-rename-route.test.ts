@@ -2523,6 +2523,25 @@ describe('/rename production routing — must not pre-create a session (review P
     }
   });
 
+  it('zero-injection pending-repo attachments remain on separate opening and successor turns', async () => {
+    const anchor = 'om_zero_pending';
+    const ds = seedPendingRawSession(anchor);
+    ds.session.promptInjection = 'none';
+    ds.pendingRawInput = undefined;
+    ds.pendingPrompt = 'opening task';
+    ds.pendingAttachments = [{ type: 'file', name: 'opening.md', path: '/tmp/opening.md' }];
+    mocks.downloadResources.mockResolvedValueOnce({ attachments: [
+      { type: 'file', name: 'followup.md', path: '/tmp/followup.md' },
+    ], needLogin: false });
+    await handleThreadReply(makeEventData('om_zero_followup', 'follow-up task', anchor),
+      makeCtx(anchor, 'om_zero_followup'));
+    const tail = ds.session.queuedActivationTail ?? [];
+    expect(tail).toHaveLength(1);
+    expect(tail[0]?.cliInput?.content).toBe('follow-up task\n\n[file] followup.md: /tmp/followup.md');
+    expect(ds.pendingFollowUps).toBeUndefined();
+    expect(ds.pendingAttachments).toEqual([{ type: 'file', name: 'opening.md', path: '/tmp/opening.md' }]);
+  });
+
   it('pending raw follow-up keeps the raw root identity and durably stages an exact successor', async () => {
     // codex ruling (merge migration): #597 replaced master's "coalesce raw root +
     // follow-up into one raw_input IPC and rotate both turn ids" model with a

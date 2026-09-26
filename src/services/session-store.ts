@@ -2197,6 +2197,8 @@ function buildNewSession(
     status: 'active',
     createdAt: new Date().toISOString(),
     creationSource: source,
+    promptInjection: intent.inherit ? intent.inherit.promptInjection ?? 'default'
+      : source === 'external' ? 'default' : bot?.promptInjection ?? 'default',
     ...initial,
   };
   if (chatType !== 'p2p' && scope !== 'chat') {
@@ -5854,7 +5856,7 @@ function shadowRoutingAnchor(sourceSessionId: string, laneId: string): string {
 }
 
 const PRINCIPAL_LANE_RUNTIME_KEYS = [
-  'cliId', 'cliLaunchSnapshot', 'cliInstanceBinding', 'cliRuntime', 'cliPathOverride',
+  'cliId', 'promptInjection', 'cliLaunchSnapshot', 'cliInstanceBinding', 'cliRuntime', 'cliPathOverride',
   'wrapperCli', 'agentFrozen', 'model', 'reasoningEffort', 'modelBackendVariant',
   'backendType', 'mojoIdentity', 'mojoIdentityHostDefault',
   'sandbox', 'sandboxPaths', 'sandboxHidePaths',

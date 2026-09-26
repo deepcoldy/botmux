@@ -474,6 +474,50 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply.mock.calls[3][1]).not.toContain('等待');
   });
 
+  it('zero-prompt final reports the exact old turn dispatch root, while ordinary bots never auto-report', async () => {
+    const onZeroPromptFinal = vi.fn(async () => {});
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_reply'), onZeroPromptFinal,
+      getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.scope = 'chat';
+    ds.currentTurnId = 'turn-next';
+    ds.currentReplyTarget = { mode: 'thread', rootMessageId: 'om_next', turnId: 'turn-next' } as any;
+    ds.initConfig = { promptInjection: 'none' } as any;
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, finalOutputMsg(), 'tag', 0, undefined, () => true,
+      { mode: 'thread', rootMessageId: 'om_original' });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(onZeroPromptFinal).toHaveBeenCalledWith(ds, {
+      turnId: 'turn-1', content: 'final answer', dispatchRoot: 'om_original',
+    });
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    ds.initConfig = { promptInjection: 'default' } as any;
+    deliver(ds, { ...finalOutputMsg(), lastUuid: 'other', turnId: 'turn-next' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(onZeroPromptFinal).toHaveBeenCalledTimes(1);
+  });
+
+  it('settles the visible final once even when the independent lead report rejects', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const onZeroPromptFinal = vi.fn(async () => { throw new Error('lead offline'); });
+    const onComplete = vi.fn();
+    initWorkerPool({ sessionReply, onZeroPromptFinal,
+      getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.initConfig = { promptInjection: 'none' } as any;
+    ds.currentTurnId = 'turn-1';
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, finalOutputMsg(), 'tag', 0, onComplete);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(onZeroPromptFinal).toHaveBeenCalledTimes(1);
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    expect(ds.completedIdleTurnId).toBe('turn-1');
+    expect(onComplete).toHaveBeenCalledWith(true, 'om_reply');
+  });
+
   it('commits dedup uuid only after a successful sessionReply', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     const closeSession = vi.fn();

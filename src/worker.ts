@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { GOAL_ENV } from './workflows/v3/contract.js';
+import { supportsZeroPromptInjection } from './core/prompt-injection.js';
+import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
 /**
  * Worker process: manages a single CLI PTY session + web terminal.
  * Forked by the daemon, communicates via Node.js IPC.
@@ -1301,6 +1304,7 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // injects into the TUI — else a 3rd-party-provider bot's app-server silently
     // falls back to the default provider. Re-sanitized (crossed IPC).
     Object.assign(engineEnv, sanitizePerBotEnv(cfg.env));
+    if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(engineEnv);
     applyCodexInstanceEnv(engineEnv, cfg.cliInstanceBinding);
     // Session identity is host-owned. Pin it after the config-controlled merge,
     // matching every other backend and preventing stale owner resurrection.
@@ -1650,6 +1654,10 @@ function refreshCliPluginGeneration(
   cfg: Extract<DaemonToWorker, { type: 'init' }>,
   adapter: CliAdapter,
 ): void {
+  if (cfg.promptInjection === 'none' && (!supportsZeroPromptInjection(cfg.cliId, cfg)
+    || process.env[GOAL_ENV.V3_MARKER] === '1')) {
+    throw new Error('零注入需要本地 CLI 支持自动获取最终回复，暂不支持远端后端或 v3 workflow');
+  }
   const bot = resolvePluginGenerationBot(cfg);
 
   const generation = prepareCliPluginGeneration({
@@ -1662,6 +1670,7 @@ function refreshCliPluginGeneration(
     workingDir: cfg.workingDir,
     prompt: cfg.prompt,
     replacesPriorGeneration: cfg.resume === true,
+    promptInjection: cfg.promptInjection,
   });
   for (const diagnostic of generation.diagnostics) log(`Plugin generation: ${diagnostic}`);
   if (generation.fatal) {
@@ -15381,6 +15390,7 @@ async function spawnCli(
     }
   }
   const perBotInjectEnv = sanitizePerBotEnv(cfg.env);
+  if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(perBotInjectEnv);
   const cliExtra = cliAdapter.allowExtraArgs === false
     ? ''
     : (process.env.CLI_EXTRA_ARGS ?? '').trim();
@@ -15451,6 +15461,7 @@ async function spawnCli(
     ...(Object.keys(identityShellEnv).length ? { shellSubprocessEnv: identityShellEnv } : {}),
     // replyDelivery=transcript + solo：daemon 冻结在 init 上的值，系统提示改口用。
     replyDelivery: cfg.replyDelivery,
+    promptInjection: cfg.promptInjection,
     solo: cfg.solo,
     locale: cfg.locale,
     model: ttadkGateway ? undefined : cfg.model,
@@ -15566,6 +15577,7 @@ async function spawnCli(
   // namespaced BOTMUX_LARK_APP_ID injected below; the worker keeps its own
   // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
   const childEnv = redactChildEnv(process.env);
+  if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(childEnv);
   childEnv[PLUGIN_CARD_ACTION_CAPABILITIES_ENV] = cardActionCapabilities;
   if (sessionMcpGatewayHost) {
     childEnv[MCP_GATEWAY_SOCKET_ENV] = sessionMcpGatewayHost.socketPath;

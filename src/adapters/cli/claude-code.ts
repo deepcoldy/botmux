@@ -904,7 +904,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       return discoverClaudeFamilySessions(variant.dataDir, limit, exclude);
     },
 
-    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, settingsEnv, settingsFilePath, replyDelivery, solo }) {
+    buildArgs({ sessionId, resume, resumeSessionId, forkSession, botName, botOpenId, locale, model, reasoningEffort, disableCliBypass, skillPluginDir, noTransport, triggerUserAuth, settingsEnv, settingsFilePath, replyDelivery, solo, promptInjection }) {
       const args: string[] = [];
       if (resume) {
         args.push('--resume', resumeSessionId ?? sessionId);
@@ -1011,6 +1011,7 @@ export function createClaudeFamilyAdapter(variant: ClaudeFamilyVariant, rawBin: 
       // Inject botmux's built-in skills as a plugin scoped to THIS session only.
       // Keeps them out of the user's global ~/.claude/skills so a standalone
       // `claude` never surfaces/mis-fires `botmux send` etc.
+      if (promptInjection === 'none') return args;
       args.push('--plugin-dir', CLAUDE_PLUGIN_DIR);
       if (skillPluginDir) args.push('--plugin-dir', skillPluginDir);
       // replyDelivery=transcript：系统提示改口为「最终回复由 botmux 自动转发」。v3 workflow
