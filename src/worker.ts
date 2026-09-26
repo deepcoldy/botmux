@@ -218,7 +218,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult } from './services/codex-transcript.js';
+import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult, type CodexDrainState } from './services/codex-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
@@ -4892,6 +4892,7 @@ function resetThinkingChannel(): void {
 // gate function are CLI-agnostic and shared.
 let codexBridgeRolloutPath: string | undefined;
 let codexBridgeOffset = 0;
+let codexBridgeDrainState: CodexDrainState | undefined;
 let codexBridgePendingTail = '';
 let codexBridgeBaselineDone = false;
 let publishedActiveRuntime: TraexRuntimeSnapshot = {};
@@ -6772,7 +6773,11 @@ function structuredBridgeIngestPath(
   offset: number,
   opts: { flushOmpTrailingFinal?: boolean } = {},
 ) {
-  if (structuredBridgeIsCodex()) return drainCodexRollout(path, offset);
+  if (structuredBridgeIsCodex()) {
+    const result = drainCodexRollout(path, offset, codexBridgeDrainState);
+    codexBridgeDrainState = result.state;
+    return result;
+  }
   // adoptMode gates the drainer's bare-sentinel synthesis: adopt posts
   // transcript text verbatim, so a synthesised token would leak into Lark.
   if (structuredBridgeIsTraex()) {
@@ -7022,6 +7027,7 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
   ompQuietCandidateKey = undefined;
   ompQuietCandidateCompleteOffset = undefined;
   codexBridgeRolloutPath = rolloutPath;
+  codexBridgeDrainState = undefined;
   if (structuredBridgeIsCodex()) codexServiceTierTracker.bind(rolloutPath);
   if (mode === 'fresh-empty') {
     // Brand-new session OR late-attach right after first submit. Either
@@ -7265,6 +7271,7 @@ function codexBridgeDetachFile(): void {
   }
   codexBridgeRolloutPath = undefined;
   codexBridgeOffset = 0;
+  codexBridgeDrainState = undefined;
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
   ompBridgeState = {};
@@ -8350,6 +8357,7 @@ function stopCodexBridge(): void {
   publishedActiveRuntime = {};
   codexBridgeRolloutPath = undefined;
   codexBridgeOffset = 0;
+  codexBridgeDrainState = undefined;
   codexBridgePendingTail = '';
   codexBridgeBaselineDone = false;
   ompBridgeState = {};
