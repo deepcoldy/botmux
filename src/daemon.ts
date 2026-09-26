@@ -17988,6 +17988,68 @@ function settlePrincipalLaneDispatchUnknown(
   }
 }
 
+const PRINCIPAL_LANE_DISPATCH_RETRY_BASE_MS = 100;
+const PRINCIPAL_LANE_DISPATCH_RETRY_MAX_MS = 5_000;
+
+function clearPrincipalLaneDispatchRetry(ds: DaemonSession, turnId?: string): void {
+  const retry = ds.principalLaneDispatchRetry;
+  if (!retry || (turnId !== undefined && retry.turnId !== turnId)) return;
+  if (retry.timer) clearTimeout(retry.timer);
+  ds.principalLaneDispatchRetry = undefined;
+}
+
+/** Keep one rejected pre-IPC FIFO head live without relying on a later inbound
+ * event. The runtime/session/head checks make a stale timer a no-op after close,
+ * route replacement, or queue advancement; delay growth is capped so a
+ * transient quarantine can recover without creating a tight retry loop. */
+function schedulePrincipalLaneDispatchRetry(ds: DaemonSession, turnId: string): void {
+  let retry = ds.principalLaneDispatchRetry;
+  if (retry?.turnId !== turnId) {
+    clearPrincipalLaneDispatchRetry(ds);
+    retry = { turnId, attempt: 0 };
+    ds.principalLaneDispatchRetry = retry;
+  }
+  if (retry.timer) return;
+
+  const delay = Math.min(
+    PRINCIPAL_LANE_DISPATCH_RETRY_MAX_MS,
+    PRINCIPAL_LANE_DISPATCH_RETRY_BASE_MS * (2 ** Math.min(retry.attempt, 6)),
+  );
+  retry.attempt += 1;
+  const timer = setTimeout(() => {
+    if (ds.principalLaneDispatchRetry !== retry || retry.timer !== timer) return;
+    retry.timer = undefined;
+    const head = ds.session.principalLaneQueuedTurns?.[0];
+    if (ds.session.status !== 'active'
+        || activeSessions.get(activeSessionKey(ds)) !== ds
+        || !ds.session.principalLane
+        || ds.principalLaneRunningTurn
+        || ds.activeInteractiveTurn
+        || !head
+        || head.turnId !== turnId
+        || head.dispatchState !== 'queued') {
+      clearPrincipalLaneDispatchRetry(ds, turnId);
+      return;
+    }
+    try {
+      driveNextPrincipalLaneTurn(ds);
+    } catch (error) {
+      logger.error(
+        `[${tag(ds)}] Principal-lane queued turn retry failed `
+        + `turn=${turnId.slice(0, 12)}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+      const currentHead = ds.session.principalLaneQueuedTurns?.[0];
+      if (currentHead?.turnId === turnId && currentHead.dispatchState === 'queued') {
+        schedulePrincipalLaneDispatchRetry(ds, turnId);
+      } else {
+        clearPrincipalLaneDispatchRetry(ds, turnId);
+      }
+    }
+  }, delay);
+  timer.unref?.();
+  retry.timer = timer;
+}
+
 /** Dispatch only the durable FIFO head.  The `attempting` write happens before
  * worker IPC, so a commit-unknown/restart can never replay a turn that may have
  * reached the CLI.  The head remains present until its exact terminal edge. */
@@ -17996,7 +18058,13 @@ function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
       || ds.principalLaneRunningTurn
       || ds.activeInteractiveTurn) return false;
   const head = ds.session.principalLaneQueuedTurns?.[0];
-  if (!head || head.dispatchState === 'attempting') return false;
+  if (!head || head.dispatchState === 'attempting') {
+    clearPrincipalLaneDispatchRetry(ds);
+    return false;
+  }
+  if (ds.principalLaneDispatchRetry?.turnId !== head.turnId) {
+    clearPrincipalLaneDispatchRetry(ds);
+  }
 
   head.dispatchState = 'attempting';
   sessionStore.updateSession(ds.session);
@@ -18043,6 +18111,7 @@ function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
         `[${tag(ds)}] Principal-lane queued turn was not dispatched; retained for retry `
         + `turn=${head.turnId.slice(0, 12)}: ${error instanceof Error ? error.message : String(error)}`,
       );
+      schedulePrincipalLaneDispatchRetry(ds, head.turnId);
       return false;
     }
     // Once the IPC boundary was crossed the outcome is unknowable. Keep the
@@ -18051,6 +18120,7 @@ function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
       `[${tag(ds)}] Principal-lane queued turn dispatch became unknown `
       + `turn=${head.turnId.slice(0, 12)}: ${error instanceof Error ? error.message : String(error)}`,
     );
+    clearPrincipalLaneDispatchRetry(ds, head.turnId);
     settlePrincipalLaneDispatchUnknown(ds, head.turnId, undefined);
     return false;
   }
@@ -18061,9 +18131,11 @@ function driveNextPrincipalLaneTurn(ds: DaemonSession): boolean {
     }
     durableHead.dispatchState = 'queued';
     sessionStore.updateSession(ds.session);
+    schedulePrincipalLaneDispatchRetry(ds, head.turnId);
     return false;
   }
 
+  clearPrincipalLaneDispatchRetry(ds, head.turnId);
   beginNewTurn(ds, head.title, head.turnId);
   setActiveInteractiveTurn(ds, head.turnId, head.caller, head.title);
   rememberLastCliInput(ds, head.userPrompt, head.cliInput);
