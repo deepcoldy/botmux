@@ -20,6 +20,7 @@ import type { CliAdapter } from '../adapters/cli/types.js';
 import { botHomePath } from '../adapters/cli/read-isolation.js';
 import { buildBotmuxShellHints, buildCredentialBoundaryBlock } from '../adapters/cli/shared-hints.js';
 import { effectiveReplyDelivery, type ReplyDelivery } from './reply-delivery.js';
+import { frozenCommandSkillHintForMessage } from './frozen-command-guidance.js';
 import {
   resolveSkillInjectionModeForApp,
   builtinSkillEntries,
@@ -100,6 +101,14 @@ import { writePromptContext } from '../services/prompt-context-store.js';
 import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
 import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
 import { readGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
+import {
+  executeFrozenCommand,
+  lookupFrozenCommand,
+  parseScheduledFrozenCommandInvocation,
+  resolveFrozenCommandScheduledOutput,
+  userFacingFrozenCommandError,
+} from '../services/frozen-command.js';
+import { evaluateFrozenCommandLifecycle } from '../services/frozen-command-lifecycle.js';
 import { createHeadlessRecord, headlessChatId, newHeadlessId, saveHeadlessSession } from '../services/headless-session-store.js';
 import {
   reconcileXpiSharedCwdRecovery,
@@ -1251,7 +1260,7 @@ type NewTopicOpts = {
   selfMention?: { name?: string | null; openId?: string | null };
 };
 
-type NewTopicBlockKey = 'routing' | 'skill' | 'identity' | 'credentials' | 'sessionId' | 'role'
+type NewTopicBlockKey = 'routing' | 'skill' | 'capability' | 'identity' | 'credentials' | 'sessionId' | 'role'
   | 'summaryMemory' | 'whiteboard' | 'chatContextPolicy' | 'chatContext'
   | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments'
   | 'mentions' | 'availableBots';
@@ -1350,6 +1359,9 @@ function buildNewTopicBlocks(
     locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, locale);
+  const frozenCommandHint = frozenCommandSkillHintForMessage(
+    [userMessage, ...(followUps ?? [])].join('\n\n'),
+  );
   const chatContextPolicyBlock = renderChatContextPolicyBlock(opts?.chatContext, locale);
   const chatContextBlock = renderChatContextBlock(opts?.chatContext);
 
@@ -1408,6 +1420,7 @@ function buildNewTopicBlocks(
   }
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
   if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
+  if (frozenCommandHint) blocks.push({ key: 'capability', text: frozenCommandHint });
   if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
   if (chatContextPolicyBlock) blocks.push({ key: 'chatContextPolicy', text: chatContextPolicyBlock });
   if (chatContextBlock) blocks.push({ key: 'chatContext', text: chatContextBlock });
@@ -1549,6 +1562,9 @@ export function buildNewTopicCliInput(
     locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, locale);
+  const frozenCommandHint = frozenCommandSkillHintForMessage(
+    [userMessage, ...(followUps ?? [])].join('\n\n'),
+  );
   const senderBlock = renderSenderTag(sender, opts?.larkAppId);
   const substitutePolicyBlock = renderSubstitutePolicy(opts?.substituteTrigger);
   const substituteTargetBlock = renderSubstituteTarget(opts?.substituteTrigger);
@@ -1562,7 +1578,7 @@ export function buildNewTopicCliInput(
     ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     codexAppInput: buildCodexAppTurnInput({
       text: [opts?.codexAppText ?? userMessage, ...(opts?.codexAppFollowUps ?? [])].join('\n\n'),
-      roleBlock: [roleBlock, summaryMemoryBlock].filter(Boolean).join('\n\n'),
+      roleBlock: [roleBlock, summaryMemoryBlock, frozenCommandHint].filter(Boolean).join('\n\n'),
       whiteboardBlock,
       senderBlock,
       substitutePolicyBlock,
@@ -1585,7 +1601,7 @@ export function buildNewTopicCliInput(
  * Mirrors buildNewTopicPrompt structure but for subsequent messages.
  * Session ID is omitted for adopt mode and CLIs with injectsSessionContext.
  */
-type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'reminder' | 'whiteboard' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
+type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'capability' | 'reminder' | 'whiteboard' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
 
 /**
  * 按既有顺序构造 follow-up 的各个块。inline 模式直接 join；hook 模式
@@ -1646,6 +1662,7 @@ function buildFollowUpBlocks(
     locale: opts?.locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts?.larkAppId, opts?.locale);
+  const frozenCommandHint = frozenCommandSkillHintForMessage(content);
   const skipSessionId = opts?.isAdoptMode || (opts?.cliId
     ? createCliAdapterSync(opts.cliId, opts.cliPathOverride).injectsSessionContext
     : false);
@@ -1658,6 +1675,7 @@ function buildFollowUpBlocks(
   if (!skipSessionId) blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });
   if (summaryMemoryBlock) blocks.push({ key: 'summaryMemory', text: summaryMemoryBlock });
+  if (frozenCommandHint) blocks.push({ key: 'capability', text: frozenCommandHint });
   // transcript：不注入 reminder（判定同样落在 KEY 选择层，hook 模式的 sidecar 自然为空
   // → buildFollowUpCliInput 回退 inline 且不写 sidecar）。
   if (opts?.cliId !== 'mira' && !transcript) {
@@ -1890,6 +1908,7 @@ export function buildFollowUpCliInput(
     locale: opts.locale,
   });
   const summaryMemoryBlock = renderSummaryMemoryBlock(opts.larkAppId, opts.locale);
+  const frozenCommandHint = frozenCommandSkillHintForMessage(content);
   const senderBlock = renderSenderTag(opts.sender, opts.larkAppId);
   const substitutePolicyBlock = renderSubstitutePolicy(opts.substituteTrigger);
   const substituteTargetBlock = renderSubstituteTarget(opts.substituteTrigger);
@@ -1900,7 +1919,7 @@ export function buildFollowUpCliInput(
     ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
     codexAppInput: buildCodexAppTurnInput({
       text: opts.codexAppText ?? content,
-      roleBlock: [roleBlock, summaryMemoryBlock].filter(Boolean).join('\n\n'),
+      roleBlock: [roleBlock, summaryMemoryBlock, frozenCommandHint].filter(Boolean).join('\n\n'),
       whiteboardBlock,
       senderBlock,
       substitutePolicyBlock,
@@ -4091,14 +4110,116 @@ export async function executeScheduledTask(
     }
   }
 
+  // Scheduled prompts bypass inbound Lark command parsing, so intercept an
+  // installed Frozen Command here before any CLI/session path. This applies to
+  // loud and silent tasks alike. Missing creator identity and every execution
+  // or conditional-output error fail closed: a frozen command literal must
+  // never fall through to the model as an ordinary prompt.
+  let frozenHandoffPrompt: string | undefined;
+  const frozenInvocation = parseScheduledFrozenCommandInvocation(task.prompt);
+  if (frozenInvocation) {
+    const lifecycle = evaluateFrozenCommandLifecycle({
+      dataDir: config.session.dataDir,
+      targetBotId: larkAppId,
+      workingDir: task.workingDir,
+      command: frozenInvocation.cmd,
+    });
+    const lookup = lookupFrozenCommand({
+      workingDir: task.workingDir,
+      command: frozenInvocation.cmd,
+    });
+    const deliver = async (text: string): Promise<void> => {
+      const replyRoot = sharedTopicRootId ?? (anchor === task.chatId ? undefined : anchor);
+      if (replyRoot) await replyMessage(larkAppId, replyRoot, text, 'text', true);
+      else await sendMessage(larkAppId, task.chatId, text);
+    };
+    if (lifecycle.kind === 'retired') {
+      const payload = lifecycle.record.tombstonePayload;
+      await deliver(`固化命令 /${lifecycle.record.command} 已废弃：${payload?.reason ?? '未提供原因'}${payload?.replacement ? `。请改用 ${payload.replacement}` : ''}`);
+      return;
+    }
+    if (lifecycle.kind === 'revoked') {
+      await deliver('该固化命令已撤销，拒绝执行。');
+      return;
+    }
+    if (lifecycle.kind === 'fail_closed') {
+      await deliver('固化命令状态异常，已拒绝执行。请联系维护方检查批准记录。');
+      return;
+    }
+    if (lookup.kind === 'invalid') {
+      await deliver(`固化命令暂不可用：${lookup.error.message}`);
+      return;
+    }
+    if (lookup.kind === 'found') {
+      if (lifecycle.kind !== 'active') {
+        await deliver('固化命令尚未完成当前机器人批准，已拒绝执行。请先由管理员接管并批准。');
+        return;
+      }
+      const definition = lookup.snapshot.definition;
+      const rawArgs = frozenInvocation.commandContent.slice(frozenInvocation.cmd.length).trim();
+      const invocationNow = new Date();
+      try {
+        const result = await executeFrozenCommand({
+          definition,
+          rawArgs,
+          targetLarkAppId: larkAppId,
+          botConfig: bot.config,
+          trustedCaller: scheduledTrustedCaller,
+          turnId: scheduledTurnId,
+          dataDir: config.session.dataDir,
+          now: invocationNow,
+          workingDir: task.workingDir,
+          context: {
+            caller: {
+              open_id: scheduledTrustedCaller?.requestUserOpenId,
+              union_id: scheduledTrustedCaller?.requestUserUnionId,
+            },
+            chat: { id: task.chatId, type: task.chatType },
+            message: { id: scheduledTurnId },
+          },
+          expectedExecutorRevision: lifecycle.record.executorRevision,
+          audit: {
+            source: 'schedule',
+            taskId: task.id,
+            ...(lifecycle.record.specHash
+              ? { specHash: lifecycle.record.specHash }
+              : {}),
+            stateRevisionId: lifecycle.record.stateRevisionId,
+          },
+        });
+        const output = resolveFrozenCommandScheduledOutput(definition, result);
+        if (output.kind === 'deliver') {
+          if (silent) {
+            logger.info(`[scheduler] ${JSON.stringify({
+              event: 'frozen_command_output_suppressed',
+              task_id: task.id,
+              task_name: task.name,
+              command: frozenInvocation.cmd,
+              suppressed: 'success_output',
+              reason: 'silent_schedule',
+            })}`);
+            return;
+          }
+          await deliver(output.text);
+          return;
+        }
+        frozenHandoffPrompt = output.prompt;
+      } catch (error) {
+        await deliver(`固化命令执行失败：${userFacingFrozenCommandError(error)}`);
+        return;
+      }
+    }
+  }
+
   refreshCliVersion(bot.config);
 
   // A Bash precondition may provide per-fire context. Keep the durable task and
   // Dashboard-facing lastUserPrompt unchanged; lastCliInput still records the
   // exact input sent to the model through the ordinary session lifecycle.
+  const scheduledPrompt = frozenHandoffPrompt ?? task.prompt;
   const effectivePrompt = additionalPrompt === undefined
-    ? task.prompt
-    : `${task.prompt}\n\n${additionalPrompt}`;
+    ? scheduledPrompt
+    : `${scheduledPrompt}\n\n${additionalPrompt}`;
   const firePrompt = silent
     ? `${buildSilentScheduleHint(task.name, localeForBot(larkAppId))}\n\n${effectivePrompt}`
     : effectivePrompt;
@@ -4203,8 +4324,16 @@ export async function executeScheduledTask(
           existing.session.deferredScheduleRun.turnId = scheduledTurnId;
           sessionStore.updateSession(existing.session);
         }
-        if (sharedTopicRootId) {
-          beginReplyTargetTurn(existing, sharedTopicRootId, scheduledTurnId);
+        if (scope === 'chat' && anchor === task.chatId) {
+          // Every chat-scope schedule fire needs an immutable per-turn target,
+          // including flat/top-level mode where there is deliberately no root
+          // message. Without this rootless record, botmux send falls back to
+          // the session's previous human turn and can bury the scheduled result
+          // under an unrelated old reply. Shared mode supplies the fresh banner
+          // root; flat and silent top-level mode freeze a plain chat target.
+          beginReplyTargetTurn(existing, sharedTopicRootId, scheduledTurnId, undefined, {
+            inThread: false,
+          });
           sessionStore.updateSession(existing.session);
         }
         const input = buildFollowUpCliInput(firePrompt, existing.session.sessionId, {
@@ -4329,8 +4458,13 @@ export async function executeScheduledTask(
       // resume of this session (see resolveSessionLaunchModel).
       ...(modelOverride.model ? { spawnModelOverride: modelOverride.model } : {}),
     };
-    if (sharedTopicRootId) {
-      beginReplyTargetTurn(ds, sharedTopicRootId, scheduledTurnId);
+    if (runtimeScope === 'chat' && anchor === task.chatId) {
+      // Mirror the continuation path above for a newly-created chat session.
+      // Deferred new-topic/task runs use a virtual anchor and must retain their
+      // own materialization flow, so the real-chat anchor check excludes them.
+      beginReplyTargetTurn(ds, sharedTopicRootId, scheduledTurnId, undefined, {
+        inThread: false,
+      });
       sessionStore.updateSession(ds.session);
     }
     ensureSessionWhiteboard(ds);

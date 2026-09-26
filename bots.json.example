@@ -9,6 +9,7 @@
     },
     "disableCliBypass": true,
     "allowedUsers": ["alice@company.com"],
+    "frozenCommandAdmins": ["on_xxx_union_id"],
     "allowedChatGroups": ["oc_xxx_team"],
     "workingDir": "~/projects",
     "customPassthroughCommands": ["/goal", "/export"],

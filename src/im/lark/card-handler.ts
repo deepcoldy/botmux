@@ -155,6 +155,9 @@ export interface CardHandlerDeps {
   vcMeetingCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
   /** Codex 完成通知卡动作。事件存储、App 打开和会话接管由 daemon 单点持有。 */
   codexNotifierCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
+  /** Host-owned Frozen Command preview confirmation. The callback value only
+   * carries an opaque transition id + nonce; daemon owns all query details. */
+  frozenCommandCardAction?: (data: CardActionData, larkAppId: string) => Promise<any>;
   /** 授权成功后重放之前被拦截的消息，让用户无需再 @ 一遍。 */
   replayGrantedMessage?: (data: any, larkAppId: string) => void;
   /** 把 passthrough 命令（如 /compact）透传到仍存活的会话。由 daemon 接线到
@@ -1493,6 +1496,19 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
   if (value?.action === 'oncall_group_create' && larkAppId) {
     const { handleOncallGroupAction } = await import('./oncall-group.js');
     return handleOncallGroupAction(data, larkAppId);
+  }
+
+  if (
+    (value?.action === 'frozen_command_run_confirm'
+      || value?.action === 'frozen_command_run_cancel'
+      || value?.action === 'frozen_command_lifecycle_confirm'
+      || value?.action === 'frozen_command_lifecycle_cancel')
+    && larkAppId
+  ) {
+    if (!deps.frozenCommandCardAction) {
+      return { toast: { type: 'error', content: '固化命令确认处理器未启用' } };
+    }
+    return deps.frozenCommandCardAction(data, larkAppId);
   }
 
   if (['feedback_submit', 'feedback_reason', 'feedback_comment', 'skill_feedback_submit'].includes(value?.action ?? '') && larkAppId) {

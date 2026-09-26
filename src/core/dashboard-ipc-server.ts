@@ -418,6 +418,38 @@ export function ipcRoute(method: string, path: string, handler: Handler): void {
   routes.push({ method: method.toUpperCase(), pattern, keys, handler });
 }
 
+/** Narrow test seam for the Frozen Command action route. Production
+ * authorization inside the registered handler (including rotating turn
+ * capabilities) still executes; only the outer loopback/HMAC listener is
+ * bypassed. Keeping the path fixed prevents tests from using this as a generic
+ * authorization bypass for unrelated dashboard routes. */
+export async function __testOnly_dispatchFrozenCommandActionRoute(
+  req: IncomingMessage,
+  res: ServerResponse,
+  options: { trustedHost?: boolean } = {},
+): Promise<boolean> {
+  const method = 'POST';
+  const pathname = '/api/frozen-command-actions';
+  for (let index = routes.length - 1; index >= 0; index -= 1) {
+    const route = routes[index];
+    if (!route || route.method !== method) continue;
+    const match = route.pattern.exec(pathname);
+    if (!match) continue;
+    const params: Record<string, string> = {};
+    route.keys.forEach((key, keyIndex) => {
+      params[key] = decodeURIComponent(match[keyIndex + 1] ?? '');
+    });
+    if (options.trustedHost) trustedHostRequests.add(req);
+    try {
+      await route.handler(req, res, params);
+    } finally {
+      if (options.trustedHost) trustedHostRequests.delete(req);
+    }
+    return true;
+  }
+  return false;
+}
+
 export function jsonRes(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(JSON.stringify(body));
@@ -825,6 +857,10 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // forge readiness or an ask for that session.
   if (method === 'POST' && pathname === '/api/session-ready') return true;
   if (method === 'POST' && pathname === '/api/asks') return true;
+  // Natural-language Frozen Command actions are authenticated by the same
+  // rotating per-turn capability, then rebound to the daemon-owned actor
+  // snapshot. The handler never trusts caller-selected bot/chat/identity.
+  if (method === 'POST' && pathname === '/api/frozen-command-actions') return true;
   // botmux slash / botmux role switch（角色切换）/ botmux delete（关闭自身）：合法调用方
   // 是会话内的 CLI 自身，沙箱 / 读隔离下读不到 host secret。handler 内验证
   // 该会话的 rotating per-turn

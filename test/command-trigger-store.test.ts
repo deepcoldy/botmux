@@ -49,6 +49,11 @@ describe('validateCommandTriggerUpdate', () => {
       .toEqual({ ok: false, reason: 'reserved_command', conflicts: [{ cmd: '/t', kind: 'force-topic' }] });
   });
 
+  it('rejects the /freeze lifecycle command without adding it to daemon commands', () => {
+    expect(validateCommandTriggerUpdate({ enabled: true, commands: ['/freeze'] }))
+      .toEqual({ ok: false, reason: 'reserved_command', conflicts: [{ cmd: '/freeze', kind: 'frozen-command' }] });
+  });
+
   it('rejects a CLI-specific passthrough command when the caller supplies the set', () => {
     expect(validateCommandTriggerUpdate({ enabled: true, commands: ['/goal'] })).toEqual({ ok: true });
     expect(validateCommandTriggerUpdate({ enabled: true, commands: ['/goal'] }, new Set(['/goal'])))

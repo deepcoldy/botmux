@@ -386,18 +386,31 @@ export class PluginMcpGateway {
     try {
       if (descriptor.server.transport === 'stdio') {
         const resolved = resolveStdioCommand(descriptor);
+        const downstreamEnv: Record<string, string> = {
+          ...getDefaultEnvironment(),
+          ...descriptor.server.env,
+          BOTMUX_PLUGIN_ID: descriptor.pluginId,
+          BOTMUX_PLUGIN_DIR: descriptor.pluginDir,
+          BOTMUX_PLUGIN_HOME: pluginHome(descriptor.pluginId),
+        };
+        // Both context variables are host authority. Remove descriptor values
+        // even when this invocation does not have the corresponding context;
+        // merely omitting our override would leave a forged descriptor value
+        // alive. Data MCP intentionally prefers SESSION over EXECUTION, so this
+        // deletion is also required for the sessionless B-scheme to be sound.
+        delete downstreamEnv.BOTMUX_SESSION_ID;
+        delete downstreamEnv.BOTMUX_EXECUTION_ID;
+        if (this.env.BOTMUX_SESSION_ID?.trim()) {
+          downstreamEnv.BOTMUX_SESSION_ID = this.env.BOTMUX_SESSION_ID.trim();
+        }
+        if (this.env.BOTMUX_EXECUTION_ID?.trim()) {
+          downstreamEnv.BOTMUX_EXECUTION_ID = this.env.BOTMUX_EXECUTION_ID.trim();
+        }
         transport = new StdioClientTransport({
           command: resolved.command,
           args: resolved.args,
           cwd: descriptor.pluginDir,
-          env: {
-            ...getDefaultEnvironment(),
-            ...descriptor.server.env,
-            BOTMUX_PLUGIN_ID: descriptor.pluginId,
-            BOTMUX_PLUGIN_DIR: descriptor.pluginDir,
-            BOTMUX_PLUGIN_HOME: pluginHome(descriptor.pluginId),
-            ...(this.env.BOTMUX_SESSION_ID ? { BOTMUX_SESSION_ID: this.env.BOTMUX_SESSION_ID } : {}),
-          },
+          env: downstreamEnv,
           stderr: 'inherit',
         });
       } else {

@@ -853,7 +853,7 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     expect(entrySource).not.toContain('if (!process.env.BOTMUX_WORKER_HTTP_HOST');
   });
 
-  it('stamps the turn sender type onto the trusted caller at both IM entry points', () => {
+  it('stamps the turn sender type onto the trusted caller at every IM execution boundary', () => {
     // A bot's turn carries a perfectly valid union_id (its own), so a consumer
     // cannot tell "a person asked" from "a bot triggered itself" unless the host
     // says which it was. Both inbound paths must therefore pass it — a missed
@@ -866,19 +866,40 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
     // bot as `'user'`, i.e. it vouches for a bot turn as a person.
     const trustedCallerArgs = [...daemonSource.matchAll(/trustedCallerForTurn\(([^;]*?)\);/g)]
       .map(m => m[1].split(',').map(part => part.trim()));
-    // handleNewTopic, principal-lane live suggestion, and handleThreadReply.
-    expect(trustedCallerArgs.length).toBe(3);
+    // Frozen-command direct execution, handleNewTopic, principal-lane live
+    // suggestion, and handleThreadReply.
+    expect(trustedCallerArgs.length).toBe(4);
     for (const args of trustedCallerArgs) {
       expect(args.length).toBeGreaterThanOrEqual(4);
       const senderTypeArg = args.slice(3).join(', ');
       expect(senderTypeArg).not.toBe('');
-      expect(senderTypeArg).toContain('senderIsBotTriState(');
       expect(senderTypeArg).not.toMatch(/^isBotSenderType\)?$/);
+      // The frozen-command helper receives the already-normalized tri-state as
+      // a typed input; the two direct IM paths normalize it at the call site.
+      if (senderTypeArg.startsWith('input.senderIsBot')) continue;
+      expect(senderTypeArg).toContain('senderIsBotTriState(');
       // ...and the cross-ref leg must actually be wired in: passing a literal
       // `false` there keeps the helper name but drops peer-bot recognition,
       // which is the exact case a bare `sender_type` check already missed.
       expect(senderTypeArg).toContain('isForeignBot');
     }
+  });
+
+  it('passes tenant-stable actor identity into all frozen-command routing paths', () => {
+    const routes = [...daemonSource.matchAll(/const frozen = await routeFrozenCommand\(\{([\s\S]*?)\n\s*\}\);/gu)]
+      .map(match => match[1]);
+    expect(routes).toHaveLength(4);
+    expect(routes[0]).toContain('chatId,');
+    expect(routes[0]).toContain('senderUnionId,');
+    expect(routes[1]).toContain('chatId,');
+    expect(routes[1]).toContain('senderUnionId,');
+    expect(routes[2]).toContain('chatId: effectiveThreadChatId,');
+    expect(routes[2]).toContain('senderUnionId: threadSenderUnionId,');
+    expect(routes[3]).toContain('chatId: effectiveThreadChatId,');
+    expect(routes[3]).toContain('senderUnionId: threadSenderUnionId,');
+    expect(daemonSource).toContain(
+      'actorIsAdmin: canManageFrozenCommands(input.larkAppId, input.senderUnionId),',
+    );
   });
 
   it('P1-2: entrypoint strips BOTS_CONFIG so no worker fork inherits it', () => {

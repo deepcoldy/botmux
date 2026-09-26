@@ -130,6 +130,7 @@ import { withFileLock, withFileLockSync, FileLockTimeoutError } from './utils/fi
 import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional, hasFlagOrEq, unknownFlags } from './cli/arg-utils.js';
+import { frozenCommandLifecycleFlagValue } from './cli/frozen-command-args.js';
 import { parseDispatchArgs } from './cli/dispatch-args.js';
 import { isColdResumeDormant, isRealManagedSession, sessionListDisposition } from './cli/session-list-liveness.js';
 import {
@@ -13301,6 +13302,155 @@ async function postAsk(body: Record<string, unknown>): Promise<import('./core/as
   }
 }
 
+async function postFrozenCommandIntent(body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const larkAppId = body.larkAppId as string;
+  const daemon = findDaemon(larkAppId);
+  if (!daemon) throw new Error(`botmux freeze: 找不到 daemon (larkAppId=${larkAppId})`);
+  const requestBody = { ...body };
+  if (typeof requestBody.originCapability !== 'string') {
+    const claim = readManagedOriginCapability(
+      resolveDataDir(),
+      typeof requestBody.sessionId === 'string' ? requestBody.sessionId : undefined,
+      process.env.BOTMUX_SEND_RELAY,
+      process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+    );
+    if (claim) requestBody.originCapability = claim.capability;
+  }
+  const init = {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(requestBody),
+  } satisfies RequestInit;
+  let hostSecret: string | undefined;
+  if (!process.env.BOTMUX_SEND_RELAY) {
+    try { hostSecret = loadDaemonIpcSecret(); } catch { /* isolated CLI uses marker auth */ }
+  }
+  const response = hostSecret
+    ? await fetchDaemonIpc(daemon.ipcPort, '/api/frozen-command-actions', init, hostSecret)
+    : await loopbackFetch(`http://127.0.0.1:${daemon.ipcPort}/api/frozen-command-actions`, init);
+  const text = await response.text();
+  let parsed: Record<string, unknown>;
+  try { parsed = JSON.parse(text) as Record<string, unknown>; }
+  catch { throw new Error(`botmux freeze: daemon 返回非 JSON (${response.status})`); }
+  if (!response.ok) {
+    throw new Error(`botmux freeze: ${String(parsed.error ?? response.status)}${parsed.detail ? `：${String(parsed.detail)}` : ''}`);
+  }
+  return parsed;
+}
+
+function frozenRawArgs(parts: string[]): string {
+  return parts.map(part => (/\s|["'\\]/u.test(part) ? JSON.stringify(part) : part)).join(' ');
+}
+
+async function cmdFreeze(rest: string[]): Promise<void> {
+  const sub = rest[0] ?? '';
+  const lifecycleOperation = sub === 'apply'
+    ? 'approve'
+    : sub === 'rm'
+      ? 'retire'
+      : sub === 'restore'
+        ? 'restore'
+        : sub === 'purge'
+          ? 'revoke'
+          : undefined;
+  if (sub !== 'list' && sub !== 'executors' && sub !== 'run' && !lifecycleOperation) {
+    console.error('用法: botmux freeze list | executors | run /<命令> [参数...] | apply /<命令> --file <草稿> --reason <原因> | rm|restore|purge /<命令> --reason <原因>');
+    process.exitCode = 2;
+    return;
+  }
+  if (sub === 'run') {
+    console.error('botmux freeze run 已停用：运行已安装命令时，请让用户直接发送“/命令 参数”或“运行 /命令 参数”；宿主会直接执行且不再发送确认卡');
+    process.exitCode = 2;
+    return;
+  }
+  const sessionId = process.env.BOTMUX_SESSION_ID;
+  const larkAppId = process.env.BOTMUX_LARK_APP_ID;
+  if (!sessionId || !larkAppId) {
+    console.error('botmux freeze: 只能在 botmux 管理的当前真人消息轮次中使用');
+    process.exitCode = 2;
+    return;
+  }
+  if (process.env.BOTMUX_WORKFLOW === '1') {
+    console.error('botmux freeze: workflow 子任务不能发起真人查询确认');
+    process.exitCode = 2;
+    return;
+  }
+  if ((sub === 'run' || lifecycleOperation) && !rest[1]) {
+    console.error('用法: botmux freeze run /<命令> [参数...]');
+    process.exitCode = 2;
+    return;
+  }
+  const origin = resolveSessionContext(resolveDataDir(), sessionId);
+  // Tool runners such as Codex app-server may execute commands outside the
+  // long-lived CLI process tree. In that shape the worker marker is not an
+  // ancestor of this short-lived process, while BOTMUX_TURN_ID is injected for
+  // the exact tool turn. The daemon still compares it with both live turn
+  // snapshots, so a stale spawn-time value fails closed.
+  const originTurnId = origin?.turnId ?? process.env.BOTMUX_TURN_ID;
+  const envDispatchAttempt = Number(process.env.BOTMUX_DISPATCH_ATTEMPT);
+  const originDispatchAttempt = origin?.dispatchAttempt
+    ?? (Number.isSafeInteger(envDispatchAttempt) && envDispatchAttempt > 0
+      ? envDispatchAttempt
+      : undefined);
+  if (!originTurnId) {
+    console.error('botmux freeze: 当前工具进程未绑定真人消息轮次，请在原话题重新发送请求');
+    process.exitCode = 2;
+    return;
+  }
+  const capability = readManagedOriginCapability(
+    resolveDataDir(),
+    sessionId,
+    process.env.BOTMUX_SEND_RELAY,
+    process.env.BOTMUX_ORIGIN_CHANNEL_ID,
+  )?.capability;
+  try {
+    let lifecycleFields: Record<string, unknown> = {};
+    if (lifecycleOperation) {
+      const reason = frozenCommandLifecycleFlagValue(rest, '--reason');
+      const replacement = frozenCommandLifecycleFlagValue(rest, '--replacement');
+      const definitionFile = frozenCommandLifecycleFlagValue(rest, '--file');
+      if (!reason || (lifecycleOperation === 'approve' && !definitionFile)) {
+        throw new Error(lifecycleOperation === 'approve'
+          ? 'botmux freeze apply: 必须提供 --file <草稿> 和 --reason <原因>'
+          : `botmux freeze ${sub}: 必须提供 --reason <原因>`);
+      }
+      if (lifecycleOperation !== 'retire' && replacement) {
+        throw new Error('--replacement 仅可用于 rm');
+      }
+      let definitionYaml: string | undefined;
+      if (definitionFile) {
+        const stat = statSync(definitionFile);
+        if (!stat.isFile() || stat.size > 512 * 1024) {
+          throw new Error('固化命令草稿必须是小于 512 KiB 的普通文件');
+        }
+        definitionYaml = readFileSync(definitionFile, 'utf8');
+      }
+      lifecycleFields = {
+        command: rest[1],
+        reason,
+        ...(replacement ? { replacement } : {}),
+        ...(definitionYaml !== undefined ? { definitionYaml } : {}),
+      };
+    }
+    const result = await postFrozenCommandIntent({
+      sessionId,
+      larkAppId,
+      operation: lifecycleOperation ?? sub,
+      ...(sub === 'run' ? { command: rest[1], rawArgs: frozenRawArgs(rest.slice(2)) } : {}),
+      ...lifecycleFields,
+      originTurnId,
+      ...(originDispatchAttempt !== undefined
+        ? { originDispatchAttempt }
+        : {}),
+      ...(capability ? { originCapability: capability } : {}),
+    });
+    process.stdout.write(`${JSON.stringify(result)}\n`);
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 3;
+  }
+}
+
 async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   // Workflow-subagent safety gate (same posture as cmdSend): a CLI running
   // inside a workflow subagent (Slice F) must not surface chat UI. Workflow
@@ -13330,6 +13480,8 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
 
   const { findMissingAskEnv, parseAskOptions, parseAskTimeoutSeconds, AskArgsError } =
     await import('./core/ask-args.js');
+  const { frozenCommandNamesInMessage, rejectsFrozenCommandLifecycleAsk } =
+    await import('./core/frozen-command-guidance.js');
   type AskJsonOutput = import('./core/ask-types.js').AskJsonOutput;
   const { toLegacySelected, isCustomReply } = await import('./core/ask-types.js');
 
@@ -13368,10 +13520,37 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     );
     process.exit(2);
   }
-
   const larkAppId = process.env.BOTMUX_LARK_APP_ID!;
   const askSessionId = process.env.BOTMUX_SESSION_ID!;
   const liveAskOrigin = resolveSessionContext(resolveDataDir(), askSessionId);
+  const knownFrozenCommands = new Set<string>();
+  const commandNames = frozenCommandNamesInMessage(prompt);
+  if (commandNames.length > 0) {
+    try {
+      const session = loadSessions().get(liveAskOrigin?.sessionId ?? askSessionId);
+      if (session?.workingDir) {
+        const { lookupFrozenCommand } = await import('./services/frozen-command.js');
+        for (const command of commandNames) {
+          if (lookupFrozenCommand({ workingDir: session.workingDir, command }).kind !== 'missing') {
+            knownFrozenCommands.add(command);
+          }
+        }
+      }
+    } catch {
+      // This guard is defense in depth, not the lifecycle authorization
+      // boundary. If session metadata is unavailable, retain only the strict
+      // explicit-wording check instead of breaking unrelated ask flows.
+    }
+  }
+  if (rejectsFrozenCommandLifecycleAsk(prompt, options, knownFrozenCommands)) {
+    console.error(
+      'botmux ask: 固化命令的创建、更新和生命周期操作必须使用宿主专用确认卡。' +
+        ' 请先运行 `botmux skill show botmux-freeze`，再按说明使用 `botmux freeze apply|rm|restore|purge`；' +
+        ' 不要用通用 ask 代替生命周期确认。',
+    );
+    process.exit(2);
+  }
+
   const askRelayDir = process.env.BOTMUX_SEND_RELAY;
   const askOriginCapability = readManagedOriginCapability(
     resolveDataDir(),
@@ -16057,6 +16236,10 @@ switch (command) {
     const { normalizeAskDispatch } = await import('./core/ask-args.js');
     const { sub, rest } = normalizeAskDispatch(process.argv.slice(3));
     await cmdAsk(sub, rest);
+    break;
+  }
+  case 'freeze': {
+    await cmdFreeze(process.argv.slice(3));
     break;
   }
   case 'skill': {

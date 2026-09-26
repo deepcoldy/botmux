@@ -20,8 +20,17 @@
  * dashboard-create-session.test.ts) so the routing logic runs in isolation.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import type { Session, ScheduledTask } from '../src/types.js';
 import type { DaemonSession } from '../src/core/types.js';
+import { installLocalPlugin } from '../src/core/plugins/install.js';
+import {
+  confirmFrozenCommandTransition,
+  prepareFrozenCommandTransition,
+} from '../src/services/frozen-command-lifecycle.js';
+import { logger } from '../src/utils/logger.js';
 
 // ── in-memory session store ──────────────────────────────────────────────
 const store = new Map<string, Session>();
@@ -224,6 +233,77 @@ function baseTask(overrides: Partial<ScheduledTask>): ScheduledTask {
   };
 }
 
+function installScheduledFrozenFixture(
+  yaml: string,
+  options: { approve?: boolean } = {},
+): { root: string; restore: () => void } {
+  const root = mkdtempSync(join(tmpdir(), 'botmux-scheduled-frozen-'));
+  const previousDataDir = config.session.dataDir;
+  const previousPlugins = (BOT.config as any).plugins;
+  const home = join(root, 'home');
+  const source = join(root, 'plugin');
+  mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
+  mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
+  writeFileSync(join(root, '.botmux', 'commands', '泰国上账.yaml'), yaml);
+  writeFileSync(join(source, 'package.json'), JSON.stringify({
+    name: '@botmux-ai/plugin-data-mcp', version: '0.1.0', type: 'module',
+    keywords: ['botmux-plugin'], botmux: { schemaVersion: 1, id: 'data-mcp' },
+  }));
+  writeFileSync(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({
+    transport: 'stdio',
+    command: [process.execPath, resolve('test/fixtures/plugin-mcp-server.mjs'), 'data'],
+  }));
+  vi.stubEnv('HOME', home);
+  vi.stubEnv('SESSION_DATA_DIR', join(home, '.botmux', 'data'));
+  config.session.dataDir = join(home, '.botmux', 'data');
+  (BOT.config as any).plugins = ['data-mcp'];
+  installLocalPlugin(source);
+  if (options.approve !== false) {
+    const actor = { openId: 'ou_test', unionId: 'on_test' };
+    const pending = prepareFrozenCommandTransition({
+      dataDir: config.session.dataDir,
+      targetBotId: APP,
+      workingDir: root,
+      command: '/泰国上账',
+      action: 'approve',
+      actor,
+      actorIsAdmin: true,
+      reason: '定时固化命令测试批准',
+    });
+    confirmFrozenCommandTransition({
+      dataDir: config.session.dataDir,
+      targetBotId: APP,
+      token: pending.token,
+      actor,
+      actorIsAdmin: true,
+    });
+  }
+  return {
+    root,
+    restore: () => {
+      config.session.dataDir = previousDataDir;
+      (BOT.config as any).plugins = previousPlugins;
+      vi.unstubAllEnvs();
+      rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
+const SCHEDULED_FROZEN_YAML = `
+schemaVersion: 2
+name: 泰国上账
+description: 查询泰国最近 N 天的上账金额
+executor: builtin.data-mcp.readonly
+params:
+  - name: days
+    type: integer
+    min: 1
+    max: 90
+    default: 7
+input:
+  sql: SELECT sum(amount) FROM bills WHERE dt >= today() - {{days}} LIMIT 100
+`;
+
 function forkedCliInput(): string {
   const arg = forkWorkerMock.mock.calls[0][1];
   return typeof arg === 'string' ? arg : arg.content;
@@ -330,6 +410,321 @@ describe('executeScheduledTask — silent thread fire', () => {
     expect(recordDispatchInputCommit(ds.session, forkedTurnId(), 1)).toBe(true);
   });
 
+  it('runs an installed frozen command directly as the native schedule creator', async () => {
+    const fixture = installScheduledFrozenFixture(SCHEDULED_FROZEN_YAML);
+    try {
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账 30',
+        workingDir: fixture.root,
+        rootMessageId: ROOT,
+        scope: 'thread',
+        ownerOpenId: 'ou_test',
+        ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+      const resultReply = replyMessageMock.mock.calls.at(-1)?.[2];
+      expect(resultReply).toBe('12');
+      expect(resultReply).not.toContain('SELECT sum');
+    } finally {
+      fixture.restore();
+    }
+  });
+
+  it('executes an existing task stored with the legacy comma-plus-run wording without starting a model', async () => {
+    const fixture = installScheduledFrozenFixture(SCHEDULED_FROZEN_YAML);
+    try {
+      await executeScheduledTask(baseTask({
+        prompt: '，执行 /泰国上账 30',
+        workingDir: fixture.root,
+        rootMessageId: ROOT,
+        scope: 'thread',
+        ownerOpenId: 'ou_test',
+        ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+      expect(sendWorkerInputMock).not.toHaveBeenCalled();
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).toBe('12');
+    } finally {
+      fixture.restore();
+    }
+  });
+
+  it('rejects an unapproved frozen command even for a silent schedule', async () => {
+    const fixture = installScheduledFrozenFixture(SCHEDULED_FROZEN_YAML, { approve: false });
+    try {
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账 30',
+        workingDir: fixture.root,
+        rootMessageId: ROOT,
+        scope: 'thread',
+        silent: true,
+        ownerOpenId: 'ou_test',
+        ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+      expect(sendWorkerInputMock).not.toHaveBeenCalled();
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).toContain('尚未完成当前机器人批准');
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).not.toContain('SELECT sum');
+    } finally {
+      fixture.restore();
+    }
+  });
+
+  it('reports a stable public error when an approved scheduled command drifts', async () => {
+    const fixture = installScheduledFrozenFixture(SCHEDULED_FROZEN_YAML);
+    try {
+      writeFileSync(
+        join(fixture.root, '.botmux', 'commands', '泰国上账.yaml'),
+        SCHEDULED_FROZEN_YAML.replace('SELECT sum(amount)', 'SELECT avg(amount)'),
+      );
+
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账 30',
+        workingDir: fixture.root,
+        rootMessageId: ROOT,
+        scope: 'thread',
+        silent: true,
+        ownerOpenId: 'ou_test',
+        ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+      expect(sendWorkerInputMock).not.toHaveBeenCalled();
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).toContain('固化命令状态异常，已拒绝执行');
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).not.toContain('定义与已批准版本不一致');
+    } finally {
+      fixture.restore();
+    }
+  });
+
+  it('fails ownerless CLI-created frozen schedules closed without starting a CLI', async () => {
+    const fixture = installScheduledFrozenFixture(SCHEDULED_FROZEN_YAML);
+    try {
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账 30',
+        workingDir: fixture.root,
+        rootMessageId: ROOT,
+        scope: 'thread',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+      expect(sendWorkerInputMock).not.toHaveBeenCalled();
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).toContain('无法确认调用者身份');
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).not.toContain('命令不存在');
+    } finally {
+      fixture.restore();
+    }
+  });
+
+  it('suppresses a successful unconditional frozen-command result for a silent schedule', async () => {
+    const fixture = installScheduledFrozenFixture(SCHEDULED_FROZEN_YAML);
+    const logSpy = vi.spyOn(logger, 'info');
+    try {
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账 30',
+        workingDir: fixture.root,
+        rootMessageId: ROOT,
+        scope: 'thread',
+        silent: true,
+        ownerOpenId: 'ou_test',
+        ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+      expect(sendWorkerInputMock).not.toHaveBeenCalled();
+      expect(replyMessageMock).not.toHaveBeenCalled();
+      expect(sendMessageMock).not.toHaveBeenCalled();
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('"suppressed":"success_output"'));
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining('"command":"/泰国上账"'));
+    } finally {
+      logSpy.mockRestore();
+      fixture.restore();
+    }
+  });
+
+  it('suppresses the normal branch of conditional output for a silent schedule', async () => {
+    const fixture = installScheduledFrozenFixture(`${SCHEDULED_FROZEN_YAML}
+output:
+  maxChars: 20000
+  when: "{{q.amount}} > 20"
+  handoff:
+    prompt: "金额异常，请分析"
+    data: "{{q.rows}}"
+    maxRows: 50
+  else:
+    text: "今日正常，合计 {{q.amount}}"
+`);
+    try {
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账 30', workingDir: fixture.root,
+        rootMessageId: ROOT, scope: 'thread', silent: true,
+        ownerOpenId: 'ou_test', ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(replyMessageMock).not.toHaveBeenCalled();
+      expect(sendMessageMock).not.toHaveBeenCalled();
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+      expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    } finally {
+      fixture.restore();
+    }
+  });
+
+  it('hands an abnormal conditional result to a session even when the schedule is silent', async () => {
+    const fixture = installScheduledFrozenFixture(`${SCHEDULED_FROZEN_YAML}
+output:
+  maxChars: 20000
+  when: "{{q.amount}} > 10"
+  handoff:
+    prompt: "金额异常，请分析"
+    data: "{{q.rows}}"
+    maxRows: 50
+  else:
+    text: "今日正常，合计 {{q.amount}}"
+`);
+    try {
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账 30', workingDir: fixture.root,
+        rootMessageId: ROOT, scope: 'thread', silent: true,
+        ownerOpenId: 'ou_test', ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+      expect(sendWorkerInputMock).not.toHaveBeenCalled();
+      expect(forkedCliInput()).toContain('金额异常，请分析');
+      expect(forkedCliInput()).toContain('"amount":12');
+      expect(forkedCliInput()).toContain('静默执行');
+      expect(replyMessageMock).not.toHaveBeenCalled();
+    } finally {
+      fixture.restore();
+    }
+  });
+
+  it('uses conditional output as an exclusive deliver-or-handoff switch', async () => {
+    const yaml = `${SCHEDULED_FROZEN_YAML}
+output:
+  maxChars: 20000
+  when: "{{q.amount}} > 20"
+  handoff:
+    prompt: "金额异常，请分析"
+    data: "{{q.rows}}"
+    maxRows: 50
+  else:
+    text: "今日正常，合计 {{q.amount}}"
+`;
+    const fixture = installScheduledFrozenFixture(yaml);
+    try {
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账 30', workingDir: fixture.root,
+        rootMessageId: ROOT, scope: 'thread', ownerOpenId: 'ou_test', ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).toBe('今日正常，合计 12');
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+      expect(sendWorkerInputMock).not.toHaveBeenCalled();
+    } finally {
+      fixture.restore();
+    }
+
+    const handoffFixture = installScheduledFrozenFixture(yaml.replace('> 20', '> 10'));
+    try {
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账 30', workingDir: handoffFixture.root,
+        rootMessageId: ROOT, scope: 'thread', ownerOpenId: 'ou_test', ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(forkWorkerMock).toHaveBeenCalledTimes(1);
+      expect(sendWorkerInputMock).not.toHaveBeenCalled();
+      expect(forkedCliInput()).toContain('金额异常，请分析');
+      expect(forkedCliInput()).toContain('"amount":12');
+      expect(replyMessageMock.mock.calls.some(call => call[2] === '12')).toBe(false);
+    } finally {
+      handoffFixture.restore();
+    }
+  });
+
+  it('fails a broken condition closed without choosing either output branch or starting a CLI', async () => {
+    const fixture = installScheduledFrozenFixture(`${SCHEDULED_FROZEN_YAML}
+output:
+  maxChars: 20000
+  when: "{{q.missing}} > 0"
+  handoff:
+    prompt: "异常分析"
+    maxRows: 50
+  else:
+    text: "正常"
+`);
+    try {
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账 30', workingDir: fixture.root,
+        rootMessageId: ROOT, scope: 'thread', ownerOpenId: 'ou_test', ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+      expect(sendWorkerInputMock).not.toHaveBeenCalled();
+      const failure = replyMessageMock.mock.calls.at(-1)?.[2] as string;
+      expect(failure).toContain('固化命令执行失败');
+      expect(failure).not.toContain('正常');
+      expect(failure).not.toContain('异常分析');
+    } finally {
+      fixture.restore();
+    }
+  });
+
+  it('fails closed for a retired command without spawning a model session or Data MCP', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-scheduled-retired-'));
+    const previousDataDir = config.session.dataDir;
+    try {
+      const dataDir = join(root, 'data');
+      mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
+      writeFileSync(join(root, '.botmux', 'commands', '泰国上账.yaml'), `
+schemaVersion: 2
+name: 泰国上账
+description: 即将废弃的命令
+executor: builtin.data-mcp.readonly
+params: []
+input:
+  sql: SELECT 1
+onError: fallback_llm
+`);
+      config.session.dataDir = dataDir;
+      const actor = { openId: 'ou_test', unionId: 'on_test' };
+      const pending = prepareFrozenCommandTransition({
+        dataDir,
+        targetBotId: APP,
+        workingDir: root,
+        command: '/泰国上账',
+        action: 'retire',
+        actor,
+        actorIsAdmin: true,
+        reason: '改用新命令',
+        replacement: '/新命令',
+      });
+      confirmFrozenCommandTransition({
+        dataDir, targetBotId: APP, token: pending.token, actor, actorIsAdmin: true,
+      });
+
+      await executeScheduledTask(baseTask({
+        prompt: '/泰国上账',
+        workingDir: root,
+        rootMessageId: ROOT,
+        scope: 'thread',
+        ownerOpenId: 'ou_test',
+        ownerUnionId: 'on_test',
+      }), new Map<string, DaemonSession>(), refreshCliVersion);
+
+      expect(forkWorkerMock).not.toHaveBeenCalled();
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).toContain('已废弃');
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).toContain('/新命令');
+    } finally {
+      config.session.dataDir = previousDataDir;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('loud fresh session appends per-fire context without mutating the scheduled task', async () => {
     const active = new Map<string, DaemonSession>();
     const task = baseTask({ rootMessageId: ROOT, scope: 'thread' });
@@ -429,6 +824,34 @@ describe('executeScheduledTask — fresh-topic execution', () => {
     expect(new Set([...active.values()].map(ds => ds.session.deferredScheduleRun?.routingAnchor)).size).toBe(2);
   });
 
+  it.each(['new-topic', 'task'] as const)(
+    'keeps a silent %s run deferred instead of freezing a flat chat target',
+    async (executionPosition) => {
+      const active = new Map<string, DaemonSession>();
+
+      await executeScheduledTask(baseTask({ executionPosition, silent: true }), active, refreshCliVersion);
+
+      expect(sendMessageMock).not.toHaveBeenCalled();
+      expect(replyMessageMock).not.toHaveBeenCalled();
+      expect(active.size).toBe(1);
+      const [ds] = [...active.values()];
+      const turnId = forkedTurnId();
+      expect(ds.session.deferredScheduleRun).toMatchObject({
+        taskId: 'task0001',
+        turnId,
+      });
+      expect(ds.session.deferredScheduleRun?.routingAnchor).toMatch(
+        executionPosition === 'task'
+          ? /^schedule-task:task0001$/
+          : /^schedule-run:task0001:[^:]+$/,
+      );
+      expect(ds.session.rootMessageId).toBe(ds.session.deferredScheduleRun?.routingAnchor);
+      expect(ds.session.turnReplyContexts?.[turnId]).toBeUndefined();
+      expect(ds.session.replyTargets?.[turnId]).toBeUndefined();
+      expect(ds.currentReplyTarget).toBeUndefined();
+    },
+  );
+
   it('thread task without a real root safely degrades to silent chat scope', async () => {
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(baseTask({ scope: 'thread', silent: true }), active, refreshCliVersion);
@@ -490,6 +913,10 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
     // during turn 1 must not steal materialization ownership (turn equality).
     expect(ds.session.deferredScheduleRun?.turnId).toBe(secondTurn);
     expect(ds.session.deferredScheduleRun?.routingAnchor).toBe(taskAnchor);
+    expect(ds.session.turnReplyContexts?.[firstTurn]).toBeUndefined();
+    expect(ds.session.turnReplyContexts?.[secondTurn]).toBeUndefined();
+    expect(ds.session.replyTargets?.[firstTurn]).toBeUndefined();
+    expect(ds.session.replyTargets?.[secondTurn]).toBeUndefined();
     expect(ds.silentScheduledTurns?.has(secondTurn)).toBe(true);
   });
 
@@ -820,6 +1247,55 @@ describe('executeScheduledTask — chat-scope regular-group mode', () => {
     expect(ds.scope).toBe('chat');
     expect(ds.session.replyTargets?.[turnId]?.rootMessageId).toBe('om_banner_123');
     expect(ds.currentReplyTarget).toMatchObject({ rootMessageId: 'om_banner_123', turnId });
+  });
+
+  it('flat mode freezes a plain target for a fresh chat-scope scheduled turn', async () => {
+    (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode = 'chat';
+    const active = new Map<string, DaemonSession>();
+
+    await executeScheduledTask(baseTask({ scope: 'chat', chatType: 'group' }), active, refreshCliVersion);
+
+    const ds = active.get(sessionKey(CHAT, APP))!;
+    const turnId = forkedTurnId();
+    expect(ds.scope).toBe('chat');
+    expect(ds.session.turnReplyContexts?.[turnId]?.target).toEqual({ mode: 'plain', chatId: CHAT });
+    expect(ds.session.replyTargets?.[turnId]).toBeDefined();
+    expect(ds.session.replyTargets?.[turnId]?.rootMessageId).toBeUndefined();
+    expect(ds.currentReplyTarget).toBeUndefined();
+  });
+
+  it('flat mode replaces a stale reply destination when reusing a live chat session', async () => {
+    (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode = 'chat';
+    const session: Session = {
+      sessionId: 'sess-flat-live', chatId: CHAT, rootMessageId: CHAT, title: 'flat live',
+      status: 'active', createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+      scope: 'chat',
+      currentReplyTarget: {
+        rootMessageId: 'om_stale_human_turn',
+        turnId: 'om_stale_human_turn',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      },
+    };
+    store.set(session.sessionId, session);
+    const existing: DaemonSession = {
+      session,
+      worker: { killed: false, send: vi.fn() } as any,
+      workerPort: 1234, workerToken: 'tok',
+      larkAppId: APP, chatId: CHAT, chatType: 'group', scope: 'chat',
+      spawnedAt: 0, cliVersion: 'test-cli-v1', lastMessageAt: 0,
+      hasHistory: true, workingDir: '/tmp', lastScreenStatus: 'idle',
+      currentReplyTarget: session.currentReplyTarget,
+    };
+    const active = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), existing]]);
+
+    await executeScheduledTask(baseTask({ scope: 'chat', chatType: 'group' }), active, refreshCliVersion);
+
+    expect(sendWorkerInputMock).toHaveBeenCalledTimes(1);
+    const turnId = sendWorkerInputMock.mock.calls[0][2];
+    expect(session.turnReplyContexts?.[turnId]?.target).toEqual({ mode: 'plain', chatId: CHAT });
+    expect(session.replyTargets?.[turnId]?.rootMessageId).toBeUndefined();
+    expect(existing.currentReplyTarget).toBeUndefined();
+    expect(session.currentReplyTarget).toBeUndefined();
   });
 
   it('a topic group uses the top-level banner as its thread anchor', async () => {

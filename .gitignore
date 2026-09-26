@@ -53,3 +53,9 @@ src/desktop/assets/*.png
 
 # OMO 计划产物（.omo/ 计划、草稿、证据），绝不提交
 .omo/
+
+# 固化命令草稿和当前目录定义可能包含业务 SQL；宿主批准状态也只在本机生效。
+# 默认禁止 `git add .` 误提交。如需版本化，请复制到经过脱敏的专用配置仓。
+# `**/` 显式覆盖仓库根及任意子目录，避免子目录工作区里的业务 SQL 被误提交。
+**/.botmux/frozen-command-drafts/
+**/.botmux/commands/

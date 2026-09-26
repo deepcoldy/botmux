@@ -194,6 +194,29 @@ describe('plugin MCP Gateway', () => {
     await gateway.close();
   });
 
+  it('host-overrides a descriptor supplied execution id for sessionless MCP processes', async () => {
+    installFixturePlugin('plugin-a', 'alpha', {
+      BOTMUX_SESSION_ID: 'descriptor-forged-session',
+      BOTMUX_EXECUTION_ID: 'descriptor-forged-execution',
+    });
+    const gateway = new PluginMcpGateway(
+      ['plugin-a'],
+      { ...process.env, BOTMUX_SESSION_ID: undefined, BOTMUX_EXECUTION_ID: 'host-execution' },
+    );
+    const client = new Client({ name: 'gateway-execution-test', version: '1.0.0' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+
+    const result = await client.callTool({ name: 'echo', arguments: {} });
+    const text = (result.content[0] as any).text;
+    expect(text).toContain('session=:token=:execution=host-execution');
+    expect(text).not.toContain('descriptor-forged-session');
+    expect(text).not.toContain('descriptor-forged-execution');
+
+    await client.close();
+    await gateway.close();
+  });
+
   it('injects host-owned per-turn trusted caller metadata and overrides caller supplied metadata', async () => {
     installFixturePlugin('plugin-a', 'alpha');
     const gateway = new PluginMcpGateway(

@@ -6329,6 +6329,7 @@ describe('managed Agent clone owner boundary', () => {
       larkAppSecret: 'source-secret',
       cliId: 'codex',
       allowedUsers: ['ou_source_owner', 'ou_stale_coowner'],
+      frozenCommandAdmins: ['on_source_admin'],
       name: 'source-proc',
       ...Object.fromEntries(instanceKeys.map(key => [key, { source: key }])),
     };
@@ -6346,6 +6347,7 @@ describe('managed Agent clone owner boundary', () => {
       allowedUsers: normalized?.split(','),
     });
     expect(target.allowedUsers).toEqual(['on_human_owner']);
+    expect(target).not.toHaveProperty('frozenCommandAdmins');
     for (const key of CLONE_EXCLUDED_KEYS) expect(target).not.toHaveProperty(key);
     // 行为配置仍照常克隆（否则「全删掉」也能让上面那条断言通过）。
     expect(target.cliId).toBe('codex');
@@ -9650,6 +9652,19 @@ describe('im.message.receive_v1 — 免@ 斜杠命令 commandTriggers', () => {
     await flushEventWork();
 
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  // `/freeze` 由 daemon 的独立 lifecycle 路由处理，不属于 DAEMON_COMMANDS；仍必须
+  // 被保留分类挡在免@入口外，避免手改 bots.json 后在多 bot 群里变成无目标广播。
+  it('fails closed on /freeze smuggled into the no-mention whitelist', async () => {
+    setup({ enabled: true, commands: [{ cmd: '/freeze' }] });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](fire('/freeze list'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
   });
 
   it('fails closed on a reserved passthrough command', async () => {

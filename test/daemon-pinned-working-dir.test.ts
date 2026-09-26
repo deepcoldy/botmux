@@ -3,7 +3,7 @@
  *
  * Run: pnpm vitest run test/daemon-pinned-working-dir.test.ts test/inherit-peer.test.ts
  */
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -21,6 +21,16 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 });
 
 let tmpRoot = '';
+
+function lifecycleCardToken(content: string): string | undefined {
+  try {
+    const parsed = JSON.parse(content) as any;
+    const row = parsed.body?.elements?.find((element: any) => element.tag === 'column_set');
+    return row?.columns?.[0]?.elements?.[0]?.behaviors?.[0]?.value?.transition_token;
+  } catch {
+    return undefined;
+  }
+}
 
 function tempDir(name: string): string {
   const dir = join(tmpRoot, name);
@@ -57,6 +67,179 @@ afterEach(() => {
 });
 
 describe('resolvePinnedWorkingDir', () => {
+  it('strips only the current bot mention from frozen-command arguments', async () => {
+    const { daemon } = await loadFreshModules();
+    const self = { botOpenId: 'ou_self', larkAppId: 'cli_self' };
+    const selfMentions = [{ key: '@_user_1', name: 'Current Bot', openId: 'ou_self' }];
+    const otherMentions = [{ key: '@_user_2', name: 'Other Member', openId: 'ou_other' }];
+
+    expect(daemon.__testOnly_frozenCommandRawArgs('/fc验收 11 @Current Bot', selfMentions, self)).toBe('11');
+    expect(daemon.__testOnly_frozenCommandRawArgs('@Current Bot /fc验收 11', selfMentions, self)).toBe('11');
+    expect(daemon.__testOnly_frozenCommandRawArgs('/fc验收 11', selfMentions, self)).toBe('11');
+    expect(daemon.__testOnly_frozenCommandRawArgs('/fc验收 11 @Other Member', otherMentions, self)).toBe('11 @Other Member');
+  });
+
+  it('retires through same-user confirmation and blocks later invocation before MCP/model fallback', async () => {
+    const { botRegistry, daemon } = await loadFreshModules();
+    const workingDir = tempDir('frozen-lifecycle-route');
+    mkdirSync(join(workingDir, '.botmux', 'commands'), { recursive: true });
+    writeFileSync(join(workingDir, '.botmux', 'commands', '生命周期测试.yaml'), `
+schemaVersion: 2
+name: 生命周期测试
+description: route lifecycle test
+executor: builtin.data-mcp.readonly
+params: []
+input:
+  sql: SELECT 1
+onError: fallback_llm
+`);
+    botRegistry.registerBot({
+      larkAppId: 'app-self', larkAppSecret: 's', cliId: 'claude-code',
+      allowedUsers: ['ou_user'], frozenCommandAdmins: ['on_user'],
+    });
+    const replies: string[] = [];
+    const base = {
+      workingDir,
+      larkAppId: 'app-self',
+      chatId: 'oc_chat',
+      anchor: 'om_root',
+      turnId: 'om_turn',
+      senderOpenId: 'ou_user',
+      senderUnionId: 'on_user',
+      senderIsBot: false,
+      reply: async (_rootId: string, content: string) => {
+        replies.push(content);
+        return `om_reply_${replies.length}`;
+      },
+    };
+    await daemon.__testOnly_routeFrozenCommand({
+      ...base,
+      cmd: '/freeze',
+      commandContent: '/freeze rm /生命周期测试 --reason 口径迁移 --replacement /新命令',
+    });
+    const token = lifecycleCardToken(replies.at(-1)!);
+    expect(token).toBeTruthy();
+    await daemon.__testOnly_routeFrozenCommand({
+      ...base,
+      cmd: '/freeze',
+      commandContent: `/freeze confirm ${token}`,
+    });
+    expect(readFileSync(join(workingDir, '.botmux', 'commands', '生命周期测试.yaml'), 'utf8')).toContain('status: retired');
+
+    const result = await daemon.__testOnly_routeFrozenCommand({
+      ...base,
+      cmd: '/生命周期测试',
+      commandContent: '/生命周期测试',
+    });
+    expect(result).toEqual({ kind: 'handled' });
+    expect(replies.at(-1)).toContain('已废弃');
+    expect(replies.at(-1)).toContain('/新命令');
+  });
+
+  it('uses admin only to claim a legacy command, then lets its owner manage it', async () => {
+    const { botRegistry, daemon } = await loadFreshModules();
+    const workingDir = tempDir('frozen-lifecycle-auth');
+    mkdirSync(join(workingDir, '.botmux', 'commands'), { recursive: true });
+    const definitionPath = join(workingDir, '.botmux', 'commands', '权限测试.yaml');
+    writeFileSync(definitionPath, `
+schemaVersion: 2
+name: 权限测试
+description: lifecycle authorization test
+executor: builtin.data-mcp.readonly
+params: []
+input:
+  sql: SELECT 1
+onError: fail
+`);
+    const bot = botRegistry.registerBot({
+      larkAppId: 'app-self', larkAppSecret: 's', cliId: 'claude-code',
+      allowedUsers: ['ou_owner'], frozenCommandAdmins: ['on_owner'],
+    });
+    const replies: string[] = [];
+    const route = (overrides: Record<string, unknown>) => daemon.__testOnly_routeFrozenCommand({
+      workingDir,
+      larkAppId: 'app-self',
+      chatId: 'oc_chat',
+      anchor: 'om_root',
+      turnId: 'om_turn',
+      senderUnionId: 'on_member',
+      mentions: [],
+      reply: async (_rootId: string, content: string) => {
+        replies.push(content);
+        return `om_reply_${replies.length}`;
+      },
+      ...overrides,
+    } as Parameters<typeof daemon.__testOnly_routeFrozenCommand>[0]);
+
+    await route({
+      cmd: '/freeze', commandContent: '/freeze rm /权限测试 --reason 越权尝试',
+      senderOpenId: 'ou_owner', senderIsBot: false,
+    });
+    expect(replies.at(-1)).toContain('管理员接管');
+    expect(replies.at(-1)).not.toContain('/freeze confirm');
+
+    for (const senderIsBot of [true, undefined]) {
+      await route({
+        cmd: '/freeze', commandContent: '/freeze rm /权限测试 --reason 身份尝试',
+        senderOpenId: 'ou_owner', senderUnionId: 'on_owner', senderIsBot,
+      });
+      expect(replies.at(-1)).toContain('身份明确的真人');
+      expect(replies.at(-1)).not.toContain('/freeze confirm');
+    }
+
+    await route({
+      cmd: '/freeze', commandContent: '/freeze approve /权限测试 --reason 接管历史命令',
+      senderOpenId: 'ou_owner', senderUnionId: 'on_owner', senderIsBot: false,
+    });
+    const claimToken = lifecycleCardToken(replies.at(-1)!);
+    expect(claimToken).toBeTruthy();
+    await route({
+      cmd: '/freeze', commandContent: `/freeze confirm ${claimToken}`,
+      senderOpenId: 'ou_owner', senderUnionId: 'on_owner', senderIsBot: false,
+    });
+    expect(replies.at(-1)).toContain('已批准');
+
+    // Ownership survives removal from the break-glass admin list.
+    bot.config.frozenCommandAdmins = [];
+    await route({
+      cmd: '/freeze', commandContent: '/freeze rm /权限测试 --reason owner 合法废弃',
+      senderOpenId: 'ou_other', senderUnionId: 'on_other', senderIsBot: false,
+    });
+    expect(replies.at(-1)).toContain('owner');
+    expect(replies.at(-1)).not.toContain('/freeze confirm');
+
+    await route({
+      cmd: '/freeze', commandContent: '/freeze rm /权限测试 --reason owner 合法废弃',
+      senderOpenId: 'ou_owner', senderUnionId: 'on_owner', senderIsBot: false,
+    });
+    const retireToken = lifecycleCardToken(replies.at(-1)!);
+    expect(retireToken).toBeTruthy();
+    expect(readFileSync(definitionPath, 'utf8')).not.toContain('status: retired');
+
+    await route({
+      cmd: '/freeze', commandContent: `/freeze confirm ${retireToken}`,
+      senderOpenId: 'ou_owner', senderUnionId: 'on_owner', senderIsBot: false,
+    });
+    expect(replies.at(-1)).toContain('已废弃');
+    expect(readFileSync(definitionPath, 'utf8')).toContain('status: retired');
+  });
+
+  it('looks up frozen commands without auto-binding a defaultOncall chat', async () => {
+    const { botRegistry, daemon } = await loadFreshModules();
+    const oncallDir = tempDir('frozen-read-only-oncall');
+    botRegistry.registerBot({
+      larkAppId: 'app-self', larkAppSecret: 's', cliId: 'claude-code',
+      defaultOncall: { enabled: true, workingDir: oncallDir, since: 1 },
+    });
+
+    const resolved = daemon.__testOnly_resolveFrozenCommandWorkingDir({
+      scope: 'thread', anchor: 'om_root', chatId: 'oc_unseen', chatType: 'group', larkAppId: 'app-self',
+    });
+
+    expect(resolved).toBe(oncallDir);
+    expect(botRegistry.findOncallChat('app-self', 'oc_unseen')).toBeUndefined();
+  });
+
   it('prefers THIS bot\'s own defaultWorkingDir over a valid same-anchor peer (no cross-bot dir pollution)', async () => {
     const { botRegistry, sessionStore, daemon } = await loadFreshModules();
     const peerDir = tempDir('peer-repo');
