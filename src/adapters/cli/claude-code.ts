@@ -472,6 +472,12 @@ const BOTMUX_ENVELOPE_TAGS = new Set([
 function stripBotmuxEnvelopeBlocks(text: string): string {
   let i = 0;
   let out = '';
+  // Tags that already appeared once without a matching close tag. Their next
+  // occurrences are treated as ordinary text: retrying the close-tag search for
+  // each of them would rescan the whole tail every time (quadratic on inputs
+  // like '<summary_memory>x'.repeat(N)). Malformed inputs only — every block
+  // botmux itself renders is well-formed, so this never triggers in production.
+  const deadTags = new Set<string>();
   while (i < text.length) {
     if (text[i] !== '<') {
       out += text[i];
@@ -481,7 +487,11 @@ function stripBotmuxEnvelopeBlocks(text: string): string {
     let nameEnd = -1;
     for (let j = i + 1; j < text.length; j++) {
       const ch = text[j];
-      if (ch === '>' || ch === ' ' || ch === '\n' || ch === '\t' || ch === '\r' || ch === '/') {
+      // '<' is also a name delimiter: a legal tag name never contains '<'.
+      // Including it bounds the inner scan when a run of '<' is followed by a
+      // single delimiter (otherwise every '<' rescans the whole run — quadratic
+      // on inputs like '<'.repeat(N) + ' >').
+      if (ch === '>' || ch === ' ' || ch === '\n' || ch === '\t' || ch === '\r' || ch === '/' || ch === '<') {
         nameEnd = j;
         break;
       }
@@ -491,7 +501,8 @@ function stripBotmuxEnvelopeBlocks(text: string): string {
       break;
     }
     const tagName = text.slice(i + 1, nameEnd);
-    if (tagName === 'sender' || BOTMUX_ENVELOPE_TAGS.has(tagName)) {
+    const recognized = tagName === 'sender' || BOTMUX_ENVELOPE_TAGS.has(tagName);
+    if (recognized && !deadTags.has(tagName)) {
       const openTagEnd = text.indexOf('>', nameEnd);
       if (openTagEnd === -1) {
         out += text.slice(i);
@@ -504,6 +515,12 @@ function stripBotmuxEnvelopeBlocks(text: string): string {
       const closeTag = `</${tagName}>`;
       const closeIdx = text.indexOf(closeTag, openTagEnd + 1);
       if (closeIdx === -1) {
+        // No close tag for this open tag. Mark it dead so later same-named open
+        // tags skip the tail-rescan, then emit the leading '<' and advance by
+        // one — do NOT break: later, *other* well-formed blocks must still be
+        // stripped (e.g. '<summary_memory>x<attachments>f</attachments>' keeps
+        // stripping the attachments block).
+        deadTags.add(tagName);
         out += text[i];
         i++;
         continue;
@@ -525,7 +542,13 @@ function stripBotmuxEnvelopeBlocks(text: string): string {
  *  [来自...的 @mention], [@mention from ...]). Using the raw envelope causes all sessions
  *  across the machine to share the exact same 30-char fingerprint, leading to false-positive
  *  submit confirmations against sibling/other sessions and leaving prompts
- *  stuck unsubmitted in the CLI input box. */
+ *  stuck unsubmitted in the CLI input box.
+ *
+ *  Semantics: exact for every well-formed block shape botmux renders (plain / attributed /
+ *  self-closing open tags, matched close tags). Inputs whose *user text itself* contains
+ *  malformed nests of these tag literals (e.g. a literal '<role <sender/>' soup botmux never
+ *  emits) are handled on a best-effort basis with no byte-for-byte guarantee; the scanner is
+ *  linear (O(N)) even on such pathological input. */
 export function extractMessageContentForFingerprint(content: string): string {
   if (typeof content !== 'string') return '';
 

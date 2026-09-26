@@ -1364,6 +1364,53 @@ Fix the test suite failure on CI
     expect(res).toContain('safe content');
   });
 
+  it('stripBotmuxEnvelopeBlocks stays linear and preserves later blocks on malformed tag soup', () => {
+    // An unclosed recognized open tag must NOT make the scanner give up: later,
+    // independent well-formed blocks are still stripped (a naive "break on
+    // missing close tag" would wrongly keep the attachments block).
+    const unclosedThenBlock =
+      '<summary_memory>unclosed head <attachments hint="x">attached</attachments>\nReal user prompt';
+    expect(extractMessageContentForFingerprint(unclosedThenBlock)).toBe(
+      '<summary_memory>unclosed head \nReal user prompt',
+    );
+
+    // Repeated recognized open tags without close tags: dead-tag short-circuit
+    // keeps the scan linear (old scanner did an indexOf-to-tail per occurrence,
+    // ~3s at 80k repeats). Payload after the soup is preserved.
+    const openTagSoup = '<summary_memory>x'.repeat(80000) + '\nReal user prompt';
+    let t0 = Date.now();
+    const soupRes = extractMessageContentForFingerprint(openTagSoup);
+    expect(Date.now() - t0).toBeLessThan(500);
+    expect(soupRes).toContain('Real user prompt');
+
+    // A long run of bare '<' followed by a single delimiter: '<' terminates the
+    // tag-name scan so each '<' costs O(1) (old scanner: ~18s at 120k '<').
+    const angleRun = '<'.repeat(120000) + ' > payload';
+    t0 = Date.now();
+    extractMessageContentForFingerprint(angleRun);
+    expect(Date.now() - t0).toBeLessThan(500);
+  });
+
+  it('extractMessageContentForFingerprint fingerprint begins at user payload over well-formed hook blocks', () => {
+    // Realistic opening/follow-up hook-mode PTY shape: attributed/self-closing
+    // pre-user blocks, mixed with an unclosed-tag-in-payload edge, then payload.
+    const ptyText = `<role context="group">Engineer</role>
+
+<summary_memory>
+Read summary.md first.
+</summary_memory>
+
+<chat_context_policy>policy text</chat_context_policy>
+
+<chat_context source="lark" trust="untrusted" fetch_status="ok">
+  <name>Review group</name>
+</chat_context>
+
+Fix the failing test now
+<sender type="user" open_id="ou_x" />`;
+    expect(extractMessageContentForFingerprint(ptyText)).toBe('Fix the failing test now');
+  });
+
   it('makeSubmitFingerprint generates distinct fingerprints for prompts with identical botmux_reminder envelopes', () => {
     const reminder = '<botmux_reminder>发给你的消息至少 botmux send 回应一次,别沉默;发什么、发几条你自己判断。只有根本不是发给你的消息才让 final 只输出 BOTMUX_NOTHING_TO_SEND</botmux_reminder>';
     const promptA = `${reminder}\n\n<user_message>First user instruction for session A</user_message>`;
