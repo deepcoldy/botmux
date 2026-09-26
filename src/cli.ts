@@ -69,6 +69,9 @@ import {
   disableAutostart,
   autostartStatus,
   refreshAutostart,
+  clearWatchdogStopped,
+  markWatchdogStopped,
+  watchdogStopRequested,
 } from './autostart.js';
 import { tmuxEnv } from './setup/ensure-tmux.js';
 import { writeBotsJsonAtomic as writeBotsAtomic } from './setup/bots-store.js';
@@ -2613,6 +2616,8 @@ function applyCompanionOptions(argv: string[]): void {
   });
 }
 
+let watchdogStart = false;
+
 async function cmdStart(): Promise<void> {
   // FIRST STATEMENT, before any await or dependency probe: those run as child
   // processes and would inherit the marker. See consumeAutostartUnitMarker.
@@ -2628,12 +2633,29 @@ async function cmdStart(): Promise<void> {
     process.exit(1);
   }
   ensureConfigDir();
+  if (watchdogStart) {
+    // The periodic path must stay local and cheap while healthy. In particular,
+    // do not run dependency installers or one credential request per bot every
+    // 30 seconds merely to discover that the supervisor is already alive.
+    if (watchdogStopRequested(CONFIG_DIR)) return;
+    const { liveSupervisorPid } = await import('./core/fleet-runtime.js');
+    if (liveSupervisorPid() !== undefined) return;
+  } else {
+    // An explicit start (including the enabled boot unit) overrides a previous
+    // explicit stop and re-arms crash recovery.
+    clearWatchdogStopped(CONFIG_DIR);
+  }
   await ensureSystemDependencies();
 
   const botsForCheck = await preflightConfiguredBotCredentials();
   // The boot hook marks itself so purely presentational waiting can be skipped
   // there (see startConfiguredFleet).
-  await startConfiguredFleet(botsForCheck, { bootHookStart });
+  await startConfiguredFleet(botsForCheck, { bootHookStart, watchdogStart });
+}
+
+async function cmdWatchdog(): Promise<void> {
+  watchdogStart = true;
+  await cmdStart();
 }
 
 /** Validate before systemd handoff so a predictable failure cannot stop the old fleet. */
@@ -2672,11 +2694,19 @@ async function preflightConfiguredBotCredentials() {
 
 async function startConfiguredFleet(
   botsForCheck: ReturnType<typeof loadBotsJson>,
-  options: { bootHookStart?: boolean } = {},
+  options: { bootHookStart?: boolean; watchdogStart?: boolean } = {},
 ): Promise<void> {
+  let skippedForIntentionalStop = false;
 
   await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
     await withFileLock(BOTS_JSON_FILE, async () => {
+      // Re-check under the fleet mutation lock. This closes the race where an
+      // operator runs `botmux stop` after the watchdog's initial cheap check but
+      // before it reaches the actual spawn.
+      if (options.watchdogStart && watchdogStopRequested(CONFIG_DIR)) {
+        skippedForIntentionalStop = true;
+        return;
+      }
       const lockedBots = loadBotsJson();
       if (JSON.stringify(lockedBots) !== JSON.stringify(botsForCheck)) {
         throw new Error('[start] bots.json changed during credential preflight; retry with the new configuration');
@@ -2705,6 +2735,7 @@ async function startConfiguredFleet(
       }
     }, { maxWaitMs: 5_000 });
   }, { maxWaitMs: 5_000 });
+  if (skippedForIntentionalStop) return;
   await reconcilePluginServicesForCli(undefined, {
     autoOnly: true,
   });
@@ -2796,6 +2827,9 @@ function cleanupLegacyPm2(_op?: 'stop' | 'restart'): boolean {
 async function cmdStop(): Promise<void> {
   const includePluginServices = process.argv.includes('--with-plugin');
   ensureConfigDir();
+  // Persist intent before taking the fleet lock so a concurrently-fired
+  // watchdog cannot resurrect the fleet after this stop completes.
+  markWatchdogStopped(CONFIG_DIR);
   await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
     cleanupLegacyPm2('stop'); // reap any pre-migration pm2 God still holding botmux procs
     const { stopFleet } = await import('./core/fleet-runtime.js');
@@ -2835,6 +2869,7 @@ async function cmdRestart(): Promise<void> {
     process.exit(1);
   }
   ensureConfigDir();
+  clearWatchdogStopped(CONFIG_DIR);
   await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
     // Report recovery guidance before any live-fleet mutation. The locked
     // check below repeats against the exact generation used for restart.
@@ -15955,6 +15990,7 @@ switch (command) {
   }
   case 'clone': await cmdClone(process.argv.slice(3)); break;
   case 'start':   await cmdStart(); break;
+  case '__watchdog': await cmdWatchdog(); break;
   case 'serve':   await cmdServe(process.argv.slice(3)); break;
   case 'start-bot': await cmdStartBot(process.argv.slice(3)); break;
   case 'stop-bot': await cmdStopBot(process.argv.slice(3)); break;
