@@ -74,10 +74,13 @@ import {
   decideHardTimeoutAction,
   decidePostHookPromptEvidence,
   decideSettleMarkReady,
+  firstPromptSeedStillWaiting,
+  shouldArmFirstPromptTimeoutPromptSeed,
   shouldArmPostHookPromptEvidenceFallback,
   shouldReleaseFirstPromptTimeout,
   shouldWaitForPostSessionStartPromptEvidence,
   shouldWriteNow,
+  screenShowsFramedPrompt,
   POST_HOOK_EVIDENCE_FALLBACK_MS,
   POST_HOOK_EVIDENCE_RETRY_MS,
 } from './utils/input-gate.js';
@@ -2575,6 +2578,14 @@ const FIRST_PROMPT_STARTUP_RECHECK_MS = 5_000;
 /** Epoch ms of the most recent PTY output — used to settle for quiescence
  *  before the first flush (see settleThenFlush). */
 let lastPtyOutputAtMs = 0;
+/** Last byte forwarded from a writable web-terminal client straight to the
+ *  backend. Such input bypasses the queue and in-flight tracking, so fallbacks
+ *  that trust a quiet screen must also treat it as activity. */
+let lastWebTerminalInputAtMs = 0;
+/** Monotonic count of those forwards (timestamps can collide within a millisecond). */
+let webTerminalInputGeneration = 0;
+/** webTerminalInputGeneration at the latest SessionStart boundary. */
+let webTerminalInputGenerationAtBoundary = 0;
 /** After the SessionStart signal fires, Ink's startup rendering or sibling
  *  hooks may still be active — typing immediately can trip Claude's
  *  paste-burst heuristic and the `\` soft-newline markers (claude-code
@@ -8665,6 +8676,80 @@ function armPostHookPromptEvidenceFallback(
     // markIdle('screen') → markPromptReadyFromPty() 链路清除等待标记。
     if (idleDetector?.seedReadyEvidence()) {
       log(`Post-SessionStart evidence fallback: screen quiet ${quietMs}ms with readyPattern on screen; accepting existing prompt`);
+    }
+  }, delayMs);
+  postHookEvidenceFallbackTimer.unref?.();
+}
+
+/** 当前渲染画面里，最后一个提示符是否落在上下都有横线的输入框里（见 screenShowsFramedPrompt）。 */
+function screenShowsFramedReadyPrompt(): boolean {
+  const pattern = cliAdapter?.readyPattern;
+  if (!pattern) return false;
+  let screen = '';
+  try { screen = renderer?.rawSnapshot() ?? ''; } catch { return false; }
+  return screenShowsFramedPrompt(screen, pattern);
+}
+
+/**
+ * First-prompt-timeout fallback: the SessionStart boundary never saw a fresh
+ * prompt and nothing was queued (see shouldArmFirstPromptTimeoutPromptSeed).
+ * Shares the post-hook fallback's timer so every spawn/kill path that clears
+ * that one clears this too. It only accepts a screen frozen since arming: any
+ * PTY output, queued or in-flight input, or a prompt that became ready by
+ * itself stops it (see firstPromptSeedStillWaiting). From then on the normal
+ * idle path owns the prompt; seeding evidence under a live turn — including
+ * one submitted straight into the web terminal, which no queue records —
+ * could finish it early.
+ */
+function armFirstPromptTimeoutPromptSeed(
+  observedBackend: SessionBackend,
+  armed: {
+    at: number;
+    outputGeneration: number;
+    webInputGeneration: number;
+    turnId: string | undefined;
+  } = {
+    at: Date.now(),
+    outputGeneration: ptyOutputGeneration.snapshot(),
+    webInputGeneration: webTerminalInputGeneration,
+    turnId: currentBotmuxTurnId,
+  },
+  delayMs: number = 0,
+): void {
+  clearPostHookEvidenceFallback();
+  postHookEvidenceFallbackTimer = setTimeout(() => {
+    postHookEvidenceFallbackTimer = null;
+    // Web-terminal input counts as activity for the quiet window too: a
+    // submission typed just before arming may not have produced output yet.
+    const quietMs = Date.now() - Math.max(lastPtyOutputAtMs, lastWebTerminalInputAtMs);
+    const decision = decidePostHookPromptEvidence({
+      stillWaiting: firstPromptSeedStillWaiting({
+        sameBackend: backend === observedBackend,
+        promptReady: isPromptReady,
+        hasPendingInput: hasPendingInputForFlush(),
+        hasUnackedInput: inflightInputs.hasUnacked(),
+        // Real PTY chunks only. An authoritative screen resync (observer
+        // reconnect) is not activity: it resets the idle detector without
+        // feeding it, so stopping here would strand the prompt again. It still
+        // restarts the quiet window, and the framed-prompt check reads the
+        // resynced screen.
+        outputSinceArm: !ptyOutputGeneration.isCurrent(armed.outputGeneration),
+        inputSinceArm: webTerminalInputGeneration !== armed.webInputGeneration
+          || currentBotmuxTurnId !== armed.turnId,
+      }),
+      // The window restarts with a resync (the only screen change that does not
+      // stop this fallback), so a late resync still gets its full quiet window.
+      elapsedMs: Date.now() - Math.max(armed.at, lastPtyOutputAtMs),
+      quietMs,
+      screenHasReadyPattern: screenShowsFramedReadyPrompt(),
+    });
+    if (decision.action === 'stop') return;
+    if (decision.action === 'retry') {
+      armFirstPromptTimeoutPromptSeed(observedBackend, armed, decision.retryInMs ?? POST_HOOK_EVIDENCE_RETRY_MS);
+      return;
+    }
+    if (idleDetector?.seedReadyEvidence()) {
+      log(`First-prompt-timeout evidence fallback: screen quiet ${quietMs}ms with a framed prompt on screen; accepting existing prompt`);
     }
   }, delayMs);
   postHookEvidenceFallbackTimer.unref?.();
@@ -17811,6 +17896,7 @@ async function spawnCli(
       return;
     }
 
+    const wasAwaitingPostHookPrompt = awaitingPostSessionStartPromptEvidence;
     awaitingFirstPrompt = false;
     awaitingPostSessionStartPromptEvidence = false;
     clearPostHookEvidenceFallback();
@@ -17840,7 +17926,13 @@ async function spawnCli(
     // the previous code only logged "forcing flush" without actually flushing
     // for non-type-ahead adapters.
     if (decideHardTimeoutAction(cliAdapter?.supportsTypeAhead === true) === 'flush') {
+      const armPromptSeed = shouldArmFirstPromptTimeoutPromptSeed({
+        wasAwaitingPostHookPrompt,
+        hasPendingInput: hasPendingInputForFlush(),
+        webInputSinceBoundary: webTerminalInputGeneration !== webTerminalInputGenerationAtBoundary,
+      });
       flushPending();
+      if (armPromptSeed && backend) armFirstPromptTimeoutPromptSeed(backend);
       return;
     }
     markPromptReady();
@@ -18649,6 +18741,8 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               // A read-only view capability must never forward bytes to the backend.
               if (!authedClients.has(ws)) return;
               auditTerminalInput(auditUser, msg.data);
+              lastWebTerminalInputAtMs = Date.now();
+              webTerminalInputGeneration++;
               if (usesHerdrSnapshotWebHistory()) {
                 if (msg.data.includes('\x1b[<64;')) herdrWebScrollDirection = 'up';
                 else if (msg.data.includes('\x1b[<65;')) herdrWebScrollDirection = 'down';
@@ -21533,6 +21627,7 @@ process.on('message', async (raw: unknown) => {
         readyPatternSeenDuringHold = false;
         idleDetector?.resetReadyEvidence();
         lastPtyOutputAtMs = Date.now();
+        webTerminalInputGenerationAtBoundary = webTerminalInputGeneration;
         log('SessionStart boundary recorded — waiting for fresh post-hook prompt evidence');
         if (armPostHookFallback) armPostHookPromptEvidenceFallback();
       }
