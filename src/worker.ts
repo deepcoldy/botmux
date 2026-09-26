@@ -481,6 +481,18 @@ import {
 } from './utils/runtime-screen-status.js';
 import { AsyncSerialQueue } from './utils/async-serial-queue.js';
 import { provisionCodexAuth, type CodexAuthSyncMode } from './services/codex-auth-sync.js';
+import {
+  CLAUDE_AUTH_OVERRIDE_ENV_KEYS,
+  claudeAuthOverrideKeys,
+  claudeAuthOverridesInSettingsLayers,
+  claudeStateAuthOverrides,
+  planCredentialSource,
+  readCredentialSource,
+  readCredentialSourceStamp,
+  reconcileClaudeAccountState,
+  writeCredentialSourceStamp,
+  writeFileAtomic0600,
+} from './services/cli-credential-source.js';
 
 // A worker must never trust an INHERITED session-level CLI home pointer
 // (CLAUDE_CONFIG_DIR / CODEX_HOME): a stale pm2 dump can resurrect the daemon
@@ -1783,6 +1795,10 @@ function provisionIsolatedBotHome(
   hookInstall: HookInstallConfig | undefined,
   codexAuthSync: CodexAuthSyncMode,
   log: (m: string) => void,
+  /** Set when `credentialsSourceDir` supplies this bot's Claude login: the shared
+   *  credential must NOT be seeded (the caller copies the source afterwards and
+   *  fails closed on error, outside this best-effort block). */
+  claudeCredFromSource = false,
 ): void {
   try {
     if (isClaude) {
@@ -1800,6 +1816,7 @@ function provisionIsolatedBotHome(
             ...hookInstall,
             configPath: isolatedSettingsPath,
             inheritClaudeEnvFrom: join(homedir(), '.claude', 'settings.json'),
+            ...(claudeCredFromSource ? { inheritClaudeEnvExclude: CLAUDE_AUTH_OVERRIDE_ENV_KEYS } : {}),
           }, hookCommandFor(cliId));
         } catch (e) {
           log(`[read-isolation] WARN per-bot settings/hook install failed: ${(e as Error).message}`);
@@ -1810,8 +1827,9 @@ function provisionIsolatedBotHome(
       // on EVERY spawn (verified: Claude logs in from that file). Refreshing here (not
       // just seeding once) means a re-login elsewhere self-heals on the next cold
       // spawn — no separate sync step needed. Same shared account for every bot.
-      const fresh = freshestClaudeCred();
+      const fresh = claudeCredFromSource ? null : freshestClaudeCred();
       if (fresh) writeCredIfChanged(join(cdir, '.credentials.json'), fresh);
+      else if (claudeCredFromSource) { /* copied by the caller from credentialsSourceDir */ }
       else if (
         !existsSync(join(cdir, '.credentials.json'))
         && !claudeSettingsHasProviderAuth(isolatedSettingsPath)
@@ -14506,6 +14524,36 @@ async function spawnCli(
     wrapperCli: cfg.wrapperCli,
     sessionDataDir: process.env.SESSION_DATA_DIR,
   });
+  // Per-bot credential source: decided before any provisioning so a refused
+  // plan never leaves a half-seeded data root behind. See
+  // services/cli-credential-source.ts for the fail-closed contract.
+  const credentialSourcePlan = planCredentialSource({
+    sourceDir: cfg.credentialsSourceDir,
+    cliId: cfg.cliId,
+    codexAuthSync: cfg.codexAuthSync,
+    sandboxRequested,
+    willRedirectCliData,
+    wrapperCli: cfg.wrapperCli,
+    supportsReadIsolation: cliAdapter.supportsReadIsolation === true,
+    sessionDataDirPresent: !!process.env.SESSION_DATA_DIR,
+    isClaudeFamily: !!claudeDataDir,
+    perBotEnv: cfg.env,
+  });
+  if (credentialSourcePlan.kind === 'ineffective') {
+    log(`[credentials-source] WARN ${credentialSourcePlan.warning}`);
+  } else if (credentialSourcePlan.kind === 'refuse') {
+    throw new Error(`[credentials-source] refusing to start bot ${cfg.larkAppId}: ${credentialSourcePlan.reason}`);
+  }
+  const credentialSourceDir = credentialSourcePlan.kind === 'copy' ? credentialSourcePlan.sourceDir : undefined;
+  const credentialSourceFiles = credentialSourcePlan.kind === 'copy'
+    ? (() => {
+        try {
+          return readCredentialSource(credentialSourcePlan.sourceDir, credentialSourcePlan.family);
+        } catch (e) {
+          throw new Error(`[credentials-source] refusing to start bot ${cfg.larkAppId}: ${(e as Error).message}`);
+        }
+      })()
+    : undefined;
   if (isolatedCodexHomeRequested && !willRedirectCliData) {
     const reason = cfg.wrapperCli
       ? 'wrapperCli cannot guarantee CODEX_HOME propagation'
@@ -14544,30 +14592,79 @@ async function spawnCli(
     if (isClaudeFam) claudeDataDir = join(isolationBotHome, 'claude');
     // Provision the per-bot config dir (auth + onboarding/trust seed + hooks for claude;
     // auth/config copy for codex) so the CLI starts fully set up under the Seatbelt wrapper.
-    provisionIsolatedBotHome(
-      isolationBotHome,
-      cfg.workingDir,
-      isClaudeFam,
-      cfg.cliId,
-      cliAdapter.hookInstall,
-      cfg.codexAuthSync ?? 'shared',
-      log,
-    );
-    if (isClaudeFam && effectiveReadyHookInstall) {
-      effectiveReadyHookInstall = {
-        ...effectiveReadyHookInstall,
-        configPath: join(claudeDataDir!, 'settings.json'),
-      };
-    }
-    if (cliAdapter.mcpGateway) {
-      const isolatedConfigPath = isClaudeFam
-        ? join(claudeDataDir!, '.claude.json')
-        : join(isolationBotHome, 'codex', 'config.toml');
-      const report = ensureGatewayEntry({
-        id: cliAdapter.id,
-        mcpGateway: { ...cliAdapter.mcpGateway, configPath: isolatedConfigPath },
-      });
-      if (report.warning) log(`[mcp-gateway] WARN ${report.warning}`);
+    // Every writer of the per-bot data root runs inside one closure: in
+    // credential-source mode it is serialized per bot (sibling sessions share
+    // <BOT_HOME>/claude), so a concurrent spawn cannot re-install a stale
+    // snapshot (shared oauthAccount / primaryApiKey) after this one's
+    // reconcile, and the post-check below sees the final state.
+    const botHome = isolationBotHome;
+    const adapter = cliAdapter;
+    const provisionBotHome = (): void => {
+      provisionIsolatedBotHome(
+        botHome,
+        cfg.workingDir,
+        isClaudeFam,
+        cfg.cliId,
+        adapter.hookInstall,
+        cfg.codexAuthSync ?? 'shared',
+        log,
+        credentialSourceFiles !== undefined,
+      );
+      if (credentialSourceFiles && claudeDataDir) {
+        // Outside provisionIsolatedBotHome's best-effort catch on purpose: a
+        // failed copy must stop the spawn, not leave an older (possibly shared-
+        // account) credential in place. Atomic 0600 replace: never writes
+        // through a planted leaf symlink, never keeps a loose mode.
+        for (const [name, raw] of Object.entries(credentialSourceFiles)) {
+          writeFileAtomic0600(join(claudeDataDir, name), `${raw}\n`);
+        }
+        // The per-bot .claude.json was seeded once from the global state: align
+        // its account identity with the source and drop any API-key login.
+        reconcileClaudeAccountState(join(claudeDataDir, '.claude.json'), credentialSourceDir!);
+      }
+      if (isClaudeFam && effectiveReadyHookInstall) {
+        effectiveReadyHookInstall = {
+          ...effectiveReadyHookInstall,
+          configPath: join(claudeDataDir!, 'settings.json'),
+        };
+      }
+      if (adapter.mcpGateway) {
+        const isolatedConfigPath = isClaudeFam
+          ? join(claudeDataDir!, '.claude.json')
+          : join(botHome, 'codex', 'config.toml');
+        const report = ensureGatewayEntry({
+          id: adapter.id,
+          mcpGateway: { ...adapter.mcpGateway, configPath: isolatedConfigPath },
+        });
+        if (report.warning) log(`[mcp-gateway] WARN ${report.warning}`);
+      }
+      if (credentialSourceFiles && claudeDataDir) {
+        // Post-condition, independent of the (best-effort) settings merge: no
+        // auth override may remain where the CLI reads it.
+        const overrides = [
+          ...claudeAuthOverridesInSettingsLayers({
+            userSettingsPath: join(claudeDataDir, 'settings.json'),
+            workingDir: cfg.workingDir,
+          }),
+          ...claudeStateAuthOverrides(join(claudeDataDir, '.claude.json')).map((k) => `.claude.json:${k}`),
+          ...claudeAuthOverrideKeys(process.env).map((k) => `worker env:${k}`),
+        ];
+        if (overrides.length) {
+          throw new Error(
+            `[credentials-source] refusing to start bot ${cfg.larkAppId}: auth overrides would bypass `
+            + `${credentialSourceDir}: ${overrides.join(', ')}`,
+          );
+        }
+        log(`[credentials-source] copied ${Object.keys(credentialSourceFiles).join(', ')} from ${credentialSourceDir}`);
+      }
+    };
+    if (credentialSourceFiles) {
+      // Lock lives in the worker data dir, outside the sandbox's reach.
+      const provisionLock = join(config.session.dataDir, 'credentials-source', `${cfg.larkAppId}.provision`);
+      mkdirSync(dirname(provisionLock), { recursive: true, mode: 0o700 });
+      withFileLockSync(provisionLock, provisionBotHome);
+    } else {
+      provisionBotHome();
     }
     if (!isClaudeFam) {
       isolatedCodexHome = join(isolationBotHome, 'codex');
@@ -14974,6 +15071,62 @@ async function spawnCli(
     }
   }
 
+  // Credential-source gate: a surviving persistent pane keeps the login its CLI
+  // started with. Reattach only when that generation's recorded source equals
+  // the configured one (both absent ≡ shared login → historical behaviour).
+  // Otherwise kill + cold-spawn so the freshly copied credential takes effect.
+  if (willReattachPersistent && persistentSessionName && effectiveBackendType !== 'pty') {
+    const launchedWith = readCredentialSourceStamp(config.session.dataDir, cfg.sessionId);
+    if (launchedWith !== (credentialSourceDir ?? null)) {
+      log(`[credentials-source] persistent pane ${cfg.sessionId} was launched with a different credential source — killing + cold-spawning`);
+      const persistentBackendType = effectiveBackendType as PersistentBackendType;
+      const persistentTarget = selectedBackend.persistentBackendTarget;
+      if (effectiveBackendType === 'zmx') {
+        ZmxBackend.killManagedSession(
+          persistentSessionName,
+          cfg.sessionId,
+          resolvedZmxSessionPid,
+          zmxEnv(process.env, resolvedZmxSocketDir),
+        );
+      } else if (persistentTarget) {
+        killPersistentBackendTarget(persistentTarget, cfg.sessionId);
+      } else {
+        killPersistentSession(persistentBackendType, persistentSessionName, cfg.sessionId);
+      }
+      const postKillProbe = effectiveBackendType === 'zmx'
+        ? probeOwnedZmxSession(persistentSessionName, cfg.sessionId, undefined, resolvedZmxSocketDir).probe
+        : (persistentTarget
+          ? probePersistentBackendTarget(persistentTarget)
+          : probePersistentSession(persistentBackendType, persistentSessionName));
+      // Only an authoritative `missing` proves the old-account CLI is gone.
+      if (postKillProbe !== 'missing') {
+        throw new Error(
+          `[credentials-source] refusing to start session ${cfg.sessionId}: `
+          + `could not confirm stale ${effectiveBackendType} pane termination (post-kill probe: ${postKillProbe})`,
+        );
+      }
+      if (effectiveBackendType === 'zmx') {
+        resolvedZmxSessionProbe = postKillProbe;
+        resolvedZmxSessionPid = undefined;
+      } else if (effectiveBackendType === 'zellij') {
+        resolvedZellijSessionProbe = 'missing';
+      }
+      selectedBackend = selectBackend();
+      isTmuxMode = selectedBackend.isTmuxMode;
+      isPipeMode = selectedBackend.isPipeMode;
+      isZellijMode = selectedBackend.isZellijMode;
+      backend = selectedBackend.backend;
+      cliLifetimeNonce++;
+      persistentSessionName = selectedBackend.persistentSessionName;
+      willReattachPersistent = selectedBackend.isReattach === true;
+      if (willReattachPersistent) {
+        throw new Error(
+          `[credentials-source] refusing to start session ${cfg.sessionId}: backend still selects reattach after killing the stale pane`,
+        );
+      }
+    }
+  }
+
   // A pane created before asymmetric control framing has no persisted public
   // identity capable of answering this worker's fresh challenge. Never fall
   // back to terminal OSC trust: terminate it and cold-spawn a signed runner.
@@ -14990,6 +15143,13 @@ async function spawnCli(
       throw new Error(`Refusing unauthenticated Codex App reattach: could not kill stale pane (${err?.message ?? err})`);
     }
     willReattachPersistent = false;
+  }
+
+  // Record which credential source this CLI generation launches with, before
+  // spawn, so the next worker's reattach gate above can compare. A reattach
+  // keeps the existing record (it was verified equal).
+  if (!willReattachPersistent) {
+    writeCredentialSourceStamp(config.session.dataDir, cfg.sessionId, credentialSourceDir);
   }
 
   // The worker establishes trust before any runner output can be parsed. A

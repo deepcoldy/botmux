@@ -31,6 +31,7 @@ import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { DAEMON_COMMANDS } from './core/passthrough-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { normalizeCredentialsSourceDir } from './services/cli-credential-source.js';
 import { resolveBotmuxConfigDir, resolveBotsConfigFile, type BotsConfigProvenance } from './core/config-dir.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
 import { normalizeCommandTriggers } from './services/command-trigger-normalize.js';
@@ -1613,6 +1614,14 @@ export interface BotConfig {
    * CODEX_HOME and never reads or copies global auth, with or without sandbox.
    */
   codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode;
+  /**
+   * Per-bot CLI credential source directory (absolute, `~/` expanded). When set,
+   * a sandboxed bot copies its CLI login from `<dir>/<cli>/…` on every cold
+   * spawn instead of the machine's shared login, and refuses to start if that
+   * source is unusable. No effect on non-sandboxed bots. See
+   * services/cli-credential-source.ts.
+   */
+  credentialsSourceDir?: string;
   codexInstancePool?: import('./services/codex-instance-pool.js').CodexInstancePool;
   /**
    * Trigger-user CLI authentication. Missing → off; this bot's CLI calls keep
@@ -3306,6 +3315,15 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       entry.cliLaunchMode,
       `Bot config [${i}].cliLaunchMode`,
     );
+    let credentialsSourceDir: string | undefined;
+    try {
+      credentialsSourceDir = normalizeCredentialsSourceDir(entry.credentialsSourceDir);
+    } catch (e) {
+      throw new Error(`Bot config [${i}]: ${(e as Error).message}`);
+    }
+    if (credentialsSourceDir && entry.codexAuthSync === 'isolated') {
+      throw new Error(`Bot config [${i}]: credentialsSourceDir cannot be combined with codexAuthSync "isolated"`);
+    }
     if (cliRuntime && entry.cliPathOverride === undefined) {
       throw new Error(`Bot config [${i}]: cliPathOverride is required as an exact downgrade shadow of cliRuntime.executable`);
     }
@@ -3722,6 +3740,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       existingAppServer,
       // Missing keeps the historical every-cold-spawn global auth refresh.
       codexAuthSync: entry.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
+      credentialsSourceDir,
       codexInstancePool,
       ...(triggerUserAuth ? { triggerUserAuth } : {}),
       sandbox: entry.sandbox === true,
