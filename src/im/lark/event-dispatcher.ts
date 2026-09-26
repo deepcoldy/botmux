@@ -51,7 +51,7 @@ import { tryHandleChatTabsCommand } from './chat-tabs-command.js';
 import { tryHandleMentionModeCommand } from './mention-mode-command.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
-import { openPending, isThrottled, clearPending, tryReserveOwnerDmSlot } from './grant-pending.js';
+import { openPending, isThrottled, clearPending, tryReserveOwnerDmSlot, releaseOwnerDmSlot } from './grant-pending.js';
 import { resolveGrantApprover, resolveGrantRequestRoute, type GrantRequestRoute } from './grant-owner.js';
 import { localeForBot, t } from '../../i18n/index.js';
 import {
@@ -2238,8 +2238,9 @@ export function canRunDaemonCommand(
  * 默认（grantRequestToOwnerDm 未开）：卡片回复在原会话、正文 @ resolveGrantApprover 选出的管理员；
  * p2p 不发卡。开启 grantRequestToOwnerDm 后投递位置见 resolveGrantRequestRoute：会话里有管理员 →
  * 同上；会话里没有管理员（p2p，或群里查不到管理员）→ 卡片改投主 owner 私聊，申请人只收到一句
- * 不含 owner 身份的中性回执。私聊投递另受 owner 维度总量节流；投递失败或超限时，
- * 群聊回落到原会话卡片，p2p 撤掉 pending 静默（不能把卡 reply 给申请人自己）。
+ * 不含 owner 身份的中性回执。私聊投递另受 owner 维度总量节流；投递失败或超限时撤掉 pending
+ * 静默、下一条消息再重试：p2p 不能把卡 reply 给申请人自己，群里已确认没有管理员，回落群内
+ * 只会留一张没人能点的卡。
  */
 export async function maybeSendGrantRequestCard(
   larkAppId: string, message: any, chatId: string, requesterOpenId: string | undefined, messageData?: any,
@@ -2297,10 +2298,8 @@ export async function maybeSendGrantRequestCard(
         .catch(err => logger.debug(`grant request forwarded ack failed: ${err}`));
       return;
     }
-    if (chatType === 'p2p') {
-      clearPending(larkAppId, chatId, requesterOpenId);
-      return;
-    }
+    clearPending(larkAppId, chatId, requesterOpenId);
+    return;
   }
   const card = buildGrantCard(
     {
@@ -2323,7 +2322,7 @@ export async function maybeSendGrantRequestCard(
     });
 }
 
-/** 把自助申请卡投到管理员私聊。返回 false = 没发出去（owner 维度超限或发送失败），由调用方回落。 */
+/** 把自助申请卡投到管理员私聊。返回 false = 没发出去（owner 维度超限或发送失败），由调用方撤 pending。 */
 async function sendGrantRequestToApproverDm(o: {
   larkAppId: string;
   chatId: string;
@@ -2335,7 +2334,8 @@ async function sendGrantRequestToApproverDm(o: {
   durationMs: number | undefined;
   delivery: 'dm_p2p' | 'dm_group';
 }): Promise<boolean> {
-  if (!tryReserveOwnerDmSlot(o.larkAppId, o.approver)) {
+  const reservedAt = Date.now();
+  if (!tryReserveOwnerDmSlot(o.larkAppId, o.approver, reservedAt)) {
     logger.info(`[grant:${o.larkAppId}] owner DM request-card cap reached; not forwarding request from ${o.requesterOpenId.substring(0, 12)} in ${o.chatId.substring(0, 12)}`);
     return false;
   }
@@ -2361,6 +2361,7 @@ async function sendGrantRequestToApproverDm(o: {
     logger.info(`[grant:${o.larkAppId}] request card forwarded to approver DM (${o.delivery}) for ${o.requesterOpenId.substring(0, 12)} in ${o.chatId.substring(0, 12)}`);
     return true;
   } catch (err) {
+    releaseOwnerDmSlot(o.larkAppId, o.approver, reservedAt);
     logger.warn(`[grant:${o.larkAppId}] forwarding request card to approver DM failed: ${err}`);
     return false;
   }

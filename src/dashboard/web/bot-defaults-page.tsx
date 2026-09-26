@@ -7503,7 +7503,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
         />
         <ToggleRow
           checked={ownerDm}
-          disabled={busy !== null}
+          disabled={busy !== null || !autoCard}
           dataAction="toggle-grant-request-owner-dm"
           title={tr('botDefaults.grantRequestToOwnerDm')}
           help={tr('botDefaults.grantRequestToOwnerDmHelp')}

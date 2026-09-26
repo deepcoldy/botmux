@@ -1,8 +1,8 @@
 /**
  * 自助授权申请卡的投递路线（maybeSendGrantRequestCard）：
  * grantRequestToOwnerDm 默认关 → 与改动前完全一致（群内卡、p2p 不发卡）；开启后：会话里有管理员 → 卡片回复在原会话（原行为）；会话里没有管理员（p2p / 群里查不到管理员）
- * → 卡片改投主 owner 私聊 + 给申请人中性回执；私聊投递失败或 owner 维度超限时，
- * 群聊回落原会话卡片、p2p 撤 pending 静默。
+ * → 卡片改投主 owner 私聊 + 给申请人中性回执；私聊投递失败或 owner 维度超限时撤 pending 静默
+ * （群里已确认没有管理员，不留没人能点的卡），发送失败退还 owner 维度名额。
  *
  * Run: bunx vitest run test/grant-request-dm-route.test.ts
  */
@@ -154,17 +154,30 @@ describe('maybeSendGrantRequestCard — grantRequestToOwnerDm on', () => {
     expect((vi.mocked(replyMessage).mock.calls[0] as any[])[3]).toBe('interactive');
   });
 
-  it('group without admin + DM send failure → falls back to the in-chat card', async () => {
+  it('group without admin + DM send failure → no dead in-chat card, pending cleared for a retry', async () => {
     registerRestrictedBot();
     vi.mocked(listChatMemberOpenIds).mockResolvedValue([REQUESTER]);
     vi.mocked(sendUserMessage).mockRejectedValue(new Error('dm failed'));
     await maybeSendGrantRequestCard(APP, groupMsg('om_g4'), GROUP, REQUESTER);
     expect(sendUserMessage).toHaveBeenCalledTimes(1);
+    expect(replyMessage).not.toHaveBeenCalled();
+    expect(isThrottled(APP, GROUP, REQUESTER)).toBe(false);
+  });
+
+  it('repeated DM send failures do not burn the owner DM quota for any path', async () => {
+    registerRestrictedBot();
+    vi.mocked(listChatMemberOpenIds).mockResolvedValue([REQUESTER]);
+    vi.mocked(sendUserMessage).mockRejectedValue(new Error('dm failed'));
+    for (let i = 0; i < OWNER_DM_MAX_PER_WINDOW + 5; i++) {
+      await maybeSendGrantRequestCard(APP, groupMsg(`om_gf_${i}`), GROUP, REQUESTER);
+    }
+    expect(sendUserMessage).toHaveBeenCalledTimes(OWNER_DM_MAX_PER_WINDOW + 5);
+
+    // 故障恢复后另一条路径（p2p）立刻能转投：群聊路径的失败没有占着同一 owner 的窗口额度。
+    vi.mocked(sendUserMessage).mockReset().mockResolvedValue('om_dm');
+    await maybeSendGrantRequestCard(APP, p2pMsg('om_p_after'), P2P, REQUESTER);
+    expect(sendUserMessage).toHaveBeenCalledTimes(1);
     expect(replyMessage).toHaveBeenCalledTimes(1);
-    const [, , card, msgType] = vi.mocked(replyMessage).mock.calls[0] as any[];
-    expect(msgType).toBe('interactive');
-    expect(card).not.toContain('"delivery"');
-    expect(isThrottled(APP, GROUP, REQUESTER)).toBe(true);
   });
 
   it('p2p → card to owner DM without listing members; ack replies to the requester message', async () => {
@@ -188,7 +201,7 @@ describe('maybeSendGrantRequestCard — grantRequestToOwnerDm on', () => {
     expect(isThrottled(APP, P2P, REQUESTER)).toBe(false);
   });
 
-  it('owner DM cap reached → p2p stays silent, group falls back to the in-chat card', async () => {
+  it('owner DM cap reached → p2p and the admin-less group both stay silent (no dead card)', async () => {
     registerRestrictedBot();
     for (let i = 0; i < OWNER_DM_MAX_PER_WINDOW; i++) tryReserveOwnerDmSlot(APP, OWNER);
 
@@ -200,8 +213,8 @@ describe('maybeSendGrantRequestCard — grantRequestToOwnerDm on', () => {
     vi.mocked(listChatMemberOpenIds).mockResolvedValue([REQUESTER]);
     await maybeSendGrantRequestCard(APP, groupMsg('om_g5'), GROUP, REQUESTER);
     expect(sendUserMessage).not.toHaveBeenCalled();
-    expect(replyMessage).toHaveBeenCalledTimes(1);
-    expect((vi.mocked(replyMessage).mock.calls[0] as any[])[3]).toBe('interactive');
+    expect(replyMessage).not.toHaveBeenCalled();
+    expect(isThrottled(APP, GROUP, REQUESTER)).toBe(false);
   });
 
   it('chat name lookup miss → DM card still sent with a short chat id placeholder', async () => {

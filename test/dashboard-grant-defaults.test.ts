@@ -360,6 +360,17 @@ describe('dashboard grant defaults', () => {
     expect(root.findByProps({ 'data-action': 'toggle-grant-request-owner-dm' }).props.checked).toBe(true);
   });
 
+  it('greys out the owner-DM forwarding toggle while auto grant cards are off', () => {
+    (globalThis as any).fetch = vi.fn();
+    const off = renderGrantSection({ autoGrantRequestCards: false, grantRequestToOwnerDm: true });
+    const offToggle = off.root.findByProps({ 'data-action': 'toggle-grant-request-owner-dm' });
+    expect(offToggle.props.disabled).toBe(true);
+    expect(offToggle.props.checked).toBe(true);
+
+    const on = renderGrantSection({ autoGrantRequestCards: true });
+    expect(on.root.findByProps({ 'data-action': 'toggle-grant-request-owner-dm' }).props.disabled).toBe(false);
+  });
+
   it('rolls the owner-DM forwarding toggle back when the save fails', async () => {
     (globalThis as any).fetch = vi.fn(async () => ({
       ok: false,

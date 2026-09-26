@@ -40,6 +40,7 @@ function pruneStale(now: number): void {
     if (e.state === 'denied' && now - e.ts >= DENY_COOLDOWN_MS) table.delete(k);
     else if (e.state === 'pending' && now - e.ts >= STALE_PENDING_MS) table.delete(k);
   }
+  pruneOwnerDmSent(now);
 }
 
 /** 开一张待处置的卡，返回 nonce。`quota` 为可选的消息额度（已解析），落授权时透传给 grant-store。
@@ -193,5 +194,25 @@ export function tryReserveOwnerDmSlot(larkAppId: string, ownerOpenId: string, no
   return true;
 }
 
+/** 退还 tryReserveOwnerDmSlot 在 `reservedAt` 记下的名额：发送失败不能占用后续额度，
+ *  否则持续故障会烧光窗口额度，恢复后同一 owner 的转投仍被挡到窗口滑过。 */
+export function releaseOwnerDmSlot(larkAppId: string, ownerOpenId: string, reservedAt: number): void {
+  const k = `${larkAppId}:${ownerOpenId}`;
+  const recent = ownerDmSent.get(k);
+  if (!recent) return;
+  const i = recent.lastIndexOf(reservedAt);
+  if (i >= 0) recent.splice(i, 1);
+  if (recent.length === 0) ownerDmSent.delete(k);
+}
+
+function pruneOwnerDmSent(now: number): void {
+  for (const [k, list] of ownerDmSent) {
+    const recent = list.filter(ts => now - ts < OWNER_DM_WINDOW_MS);
+    if (recent.length === 0) ownerDmSent.delete(k);
+    else if (recent.length !== list.length) ownerDmSent.set(k, recent);
+  }
+}
+
 export function _resetForTest(): void { table.clear(); ownerDmSent.clear(); lastPrunedAt = 0; }
 export function _tableSizeForTest(): number { return table.size; }
+export function _ownerDmKeyCountForTest(): number { return ownerDmSent.size; }
