@@ -11,10 +11,21 @@
  * Run: pnpm vitest run test/tmux-backend.e2e.ts
  */
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
+import { spawnSync } from 'node:child_process';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
+import { linuxIsolationLaunchViaArgsFile } from '../src/core/linux-isolation.js';
 
 const TEST_SESSION = 'bmx-test0001';
 const TEST_TIMEOUT = 15_000;
+const canRunBwrap = process.platform === 'linux'
+  && ['x64', 'arm64', 'ia32', 'arm'].includes(process.arch)
+  && spawnSync('bwrap', [
+    '--ro-bind', '/', '/', '--unshare-user', '--unshare-pid', '--proc', '/proc',
+    '--', '/bin/true',
+  ], { stdio: 'ignore', timeout: 5_000 }).status === 0;
 
 describe('TmuxBackend', () => {
   beforeEach(() => {
@@ -53,6 +64,47 @@ describe('TmuxBackend', () => {
     backend.kill();
     expect(TmuxBackend.hasSession(TEST_SESSION)).toBe(true);
   }, TEST_TIMEOUT);
+
+  it.skipIf(!TmuxBackend.isAvailable() || !canRunBwrap)(
+    'starts a sandbox whose bwrap options exceed tmux command limits',
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), 'botmux-tmux-bwrap-args-'));
+      const backend = new TmuxBackend(TEST_SESSION);
+      const output: string[] = [];
+      const longOptions = [
+        '--ro-bind', '/', '/',
+        '--unshare-user', '--unshare-pid', '--proc', '/proc', '--dev', '/dev',
+        ...Array.from({ length: 512 }, (_, index) => [
+          '--setenv',
+          `BOTMUX_LONG_OPTION_${index}`,
+          `padding-${index}-${'x'.repeat(40)}`,
+        ]).flat(),
+      ];
+      const launch = linuxIsolationLaunchViaArgsFile(
+        'bwrap',
+        longOptions,
+        ['/bin/sh', '-c', 'echo COMPACT_TMUX_BWRAP_OK; sleep 60'],
+        root,
+      );
+      try {
+        backend.spawn(launch.bin, launch.args, {
+          cwd: root,
+          cols: 80,
+          rows: 24,
+          env: { PATH: process.env.PATH ?? '/usr/bin:/bin' },
+        });
+        backend.onData(data => output.push(data));
+        await waitFor(() => output.join('').includes('COMPACT_TMUX_BWRAP_OK'), 8_000);
+        expect(output.join('')).toContain('COMPACT_TMUX_BWRAP_OK');
+        expect(existsSync(launch.argsFile)).toBe(false);
+      } finally {
+        backend.destroySession();
+        launch.cleanup();
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+    TEST_TIMEOUT,
+  );
 
   it.skipIf(!TmuxBackend.isAvailable())('re-attach captures output from surviving session', async () => {
     // Phase 1: Create session

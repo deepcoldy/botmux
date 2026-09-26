@@ -10,7 +10,7 @@
 import { describe, it, expect } from 'vitest';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync } from 'node:fs';
+import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, rmSync, statSync } from 'node:fs';
 import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 
@@ -207,6 +207,79 @@ describe('prepareDirectSandbox canonicalizes the exec bin (symlinked-$HOME)', ()
     expect(execTarget).not.toBe(linkBin);
     expect(r.args.slice(dashDash + 2)).toEqual(['--v']); // cliArgs preserved verbatim
     r.cleanup();
+  });
+});
+
+describe('prepareDirectSandbox tmux argument transport', () => {
+  it('stores long bwrap options in a private file while keeping CLI argv on the command line', () => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-tmux-args-'));
+    const dataDir = join(root, 'data');
+    mkdirSync(dataDir);
+    const policyRoot = join(root, 'policy');
+    mkdirSync(policyRoot);
+    const rules = Array.from({ length: 360 }, (_, index) => {
+      const path = join(policyRoot, `entry-${index}-${'x'.repeat(32)}`);
+      mkdirSync(path);
+      return { path, access: 'readOnly' as const, source: 'user' as const };
+    });
+    let plan: ReturnType<typeof prepareDirectSandbox> = null;
+    try {
+      plan = prepareDirectSandbox({
+        sessionId: 'long-tmux',
+        dataDir,
+        policy: { rules, net: true, writeRegexes: [] },
+        chdir: policyRoot,
+        home: root,
+        cliBin: '/bin/printf',
+        cliArgs: ['%s', 'space value', '$literal', 'line\nbreak'],
+        useBwrapArgsFile: true,
+      });
+      if (!plan) return;
+
+      expect(plan.argsFile).toBeDefined();
+      expect(statSync(plan.argsFile!).mode & 0o777).toBe(0o600);
+      expect(Buffer.byteLength([plan.bin, ...plan.args].join('\0'))).toBeLessThan(8 * 1024);
+      expect(plan.args.slice(plan.args.indexOf('--') + 1)).toEqual([
+        realpathSync('/bin/printf'), '%s', 'space value', '$literal', 'line\nbreak',
+      ]);
+      const optionBytes = readFileSync(plan.argsFile!);
+      expect(optionBytes.length).toBeGreaterThan(16 * 1024);
+      expect(optionBytes.includes(Buffer.from('space value'))).toBe(false);
+    } finally {
+      plan?.cleanup();
+      if (plan?.argsFile) expect(existsSync(plan.argsFile)).toBe(false);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('reclaims the sandbox tree if compact launch preparation rejects invalid argv', () => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-tmux-invalid-'));
+    const dataDir = join(root, 'data');
+    const workingDir = join(root, 'work');
+    mkdirSync(dataDir);
+    mkdirSync(workingDir);
+    const sessionRoot = join(realpathSync(dataDir), 'sandboxes', 'invalid-argv');
+    try {
+      expect(() => prepareDirectSandbox({
+        sessionId: 'invalid-argv',
+        dataDir,
+        policy: {
+          rules: [{ path: workingDir, access: 'readWrite', source: 'internal' }],
+          net: true,
+          writeRegexes: [],
+        },
+        chdir: workingDir,
+        home: root,
+        cliBin: '/bin/true',
+        cliArgs: ['invalid\0argument'],
+        useBwrapArgsFile: true,
+      })).toThrow(/NUL/);
+      expect(existsSync(sessionRoot)).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
