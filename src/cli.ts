@@ -131,6 +131,17 @@ import { scheduleTimeZone } from './utils/timezone.js';
 import { expandHomePath, invalidWorkingDirs } from './utils/working-dir.js';
 import { firstPositional, hasFlagOrEq, unknownFlags } from './cli/arg-utils.js';
 import { parseDispatchArgs } from './cli/dispatch-args.js';
+import { createCliAdapterSync } from './adapters/cli/registry.js';
+import { isCodexReasoningEffort, type CodexReasoningEffort } from './services/codex-reasoning-effort.js';
+import { resolveDispatchLaunchSpec } from './core/dispatch-launch-spec.js';
+import {
+  canonicalizeDispatchLaunchKickoff,
+  createDispatchLaunchId,
+  dispatchLaunchInspection,
+  type DispatchLaunchPrepareRequestV1,
+} from './core/dispatch-launch-contract.js';
+import { createDispatchLaunchOperationStore } from './core/dispatch-launch-operation-store.js';
+import { createDispatchLaunchSourceCoordinator } from './core/dispatch-launch-source.js';
 import { isColdResumeDormant, isRealManagedSession, sessionListDisposition } from './cli/session-list-liveness.js';
 import {
   computeSessionPickerLayout,
@@ -3843,6 +3854,9 @@ interface SessionData {
   cliSessionId?: string;
   /** Frozen file-sandbox decision from the persisted session. */
   sandbox?: boolean;
+  dispatchLaunchSpec?: import('./types.js').Session['dispatchLaunchSpec'];
+  model?: string;
+  reasoningEffort?: string;
   backendType?: BackendType;
   /** Exact persistent host/agent selected by the worker. In particular, Herdr
    * may own one agent inside a shared host session rather than the host itself. */
@@ -5104,6 +5118,20 @@ function cmdManagedZmxAttach(args: string[]): void {
 async function cmdList(): Promise<void> {
   const sessions = loadSessions();
   const active = [...sessions.values()].filter(s => s.status === 'active');
+  if (process.argv.includes('--json')) {
+    console.log(JSON.stringify({
+      sessions: active.map(session => ({
+        ...session,
+        ...(session.dispatchLaunchSpec ? {
+          requestedLaunch: session.dispatchLaunchSpec.requested,
+          ...(session.dispatchLaunchSpec.effectiveRuntime ? {
+            effectiveRuntime: session.dispatchLaunchSpec.effectiveRuntime,
+          } : {}),
+        } : {}),
+      })),
+    }));
+    return;
+  }
   // One immutable control-plane snapshot per invocation. In particular, ZMX's
   // full-list probe walks every per-session daemon, so running it once per row
   // would make a large session list quadratic and amplify socket timeouts.
@@ -11856,6 +11884,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
 说明:
   新开话题: 发一条顶层「子项目」种子消息，在它线程里把 bot @ 进来各起独立会话。
   --repo:   先用 /repo 给每个子 bot 定好工作目录——spawn 时不弹「选仓库」卡、不用手点。
+  --model / --reasoning-effort: 为唯一 --bot-app 的新话题冻结启动规格；与 --into 冲突。
   --standby: 配合 --repo——只把 bot 拉起来定好目录待命（不派简报），之后用 --into 派具体任务。
   --into:   不建种子，直接回到已有话题线程 @ bot 追加一条。
   返回 JSON：seedMessageId / threadRootId 仍为 om_...；新增 threadId 为 omt_... 或 null。
@@ -11872,6 +11901,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --brief-file <path>   从文件读取简报
   --steer               在简报前注入通用 @steer 指令；普通 dispatch 默认仍进入 Queue
   --repo <path>         预设子 bot 工作目录（绝对路径，需在子 bot 所在机器上存在）
+  --model <catalog-id>  目标 Codex 实时目录中的模型；仅新话题、单 Worker
+  --reasoning-effort <level>  low|medium|high|xhigh|max|ultra（按模型校验）
   --standby             仅 --repo 待命，不派简报
   --into <root_id>      回到已有话题线程追加（与 --title/种子互斥）
   --chat-id <id>        覆盖目标群（默认当前会话所在群）
@@ -11893,6 +11924,9 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const briefFile = dispatchArgs.briefFile;
   const overrideChatId = dispatchArgs.chatId;
   const repo = dispatchArgs.repo;
+  const requestedModel = dispatchArgs.model?.trim();
+  const requestedEffortRaw = dispatchArgs.reasoningEffort?.trim().toLowerCase();
+  const hasLaunchOverride = dispatchArgs.model !== undefined || dispatchArgs.reasoningEffort !== undefined;
   const intoRoot = dispatchArgs.into;
   const standby = dispatchArgs.standby;
   const steer = dispatchArgs.steer;
@@ -11922,7 +11956,31 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     console.error('--standby 与 --steer 不能同用（待命模式没有简报可调整当前 turn）。');
     process.exit(1);
   }
-  if (botAppSpecs.length > 0 && repo) {
+  if (hasLaunchOverride && intoRoot) {
+    console.error('--model/--reasoning-effort 只允许新话题，不能与 --into 同用。');
+    process.exit(1);
+  }
+  if (hasLaunchOverride && botAppSpecs.length !== 1) {
+    console.error('--model/--reasoning-effort 需要且只允许一个 --bot-app 目标。');
+    process.exit(1);
+  }
+  if (hasLaunchOverride && botSpecs.length > 1) {
+    console.error('--model/--reasoning-effort 只允许一个 Worker 目标。');
+    process.exit(1);
+  }
+  if (hasLaunchOverride && repo && botSpecs.length !== 1) {
+    console.error('--repo 与 launch spec 同用时仍需一个 --bot open_id 走既有 operate 授权入口。');
+    process.exit(1);
+  }
+  if (dispatchArgs.model !== undefined && !requestedModel) {
+    console.error('--model 需要非空 catalog id。');
+    process.exit(1);
+  }
+  if (dispatchArgs.reasoningEffort !== undefined && !isCodexReasoningEffort(requestedEffortRaw)) {
+    console.error('--reasoning-effort 只接受 low|medium|high|xhigh|max|ultra。');
+    process.exit(1);
+  }
+  if (botAppSpecs.length > 0 && repo && !hasLaunchOverride) {
     console.error('--bot-app 仅自动建立 talk-only chatGrant，不能授权 /repo 管理命令；请使用驻守 Bot 的默认工作目录，或另走显式 operate 信任链路。');
     process.exit(1);
   }
@@ -11995,6 +12053,21 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     if (!parsedBotApps.some(item => item.appId === targetAppId)) parsedBotApps.push({ appId: targetAppId, role });
   }
 
+  let requestedLaunch: { model?: string; reasoningEffort?: CodexReasoningEffort } | undefined;
+  let effectiveRuntime: { model: string; reasoningEffort?: CodexReasoningEffort } | undefined;
+  if (hasLaunchOverride) {
+    const target = botConfigs.find(cfg => cfg.larkAppId === parsedBotApps[0]!.appId)!;
+    const adapter = createCliAdapterSync(target.cliId, target.cliRuntime?.executable ?? target.cliPathOverride);
+    const resolved = await resolveDispatchLaunchSpec({
+      requested: { model: dispatchArgs.model, reasoningEffort: dispatchArgs.reasoningEffort },
+      target,
+      detectModels: () => adapter.detectModels?.() ?? Promise.resolve(null),
+    });
+    if (!resolved.ok) { console.error(resolved.error); process.exit(1); }
+    requestedLaunch = resolved.requested;
+    effectiveRuntime = resolved.effective;
+  }
+
   try {
     await assertProjectDispatchPolicy({
       sessionId: sid,
@@ -12039,6 +12112,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
 
   const bots = [...legacyBots, ...appBots]
     .filter((bot, index, all) => all.findIndex(candidate => candidate.openId === bot.openId) === index);
+  if (hasLaunchOverride && bots.length !== 1) {
+    console.error('--model/--reasoning-effort 的 --bot 与 --bot-app 必须解析到同一个 Worker。');
+    process.exit(1);
+  }
   const { readRoleDispatchCompletionEnabled } = await import('./core/role-resolver.js');
   const sameTopicSendEnabled = readRoleDispatchCompletionEnabled(appId, targetChatId);
   const exactReportRootEnabled = parsedBotApps.length > 0 && legacyBots.length === 0;
@@ -12058,6 +12135,89 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   } catch (err: any) {
     console.error(`dispatch 构建失败: ${err.message}`);
     process.exit(1);
+  }
+  if (requestedLaunch && effectiveRuntime && !repo) {
+    const target = parsedBotApps[0]!;
+    const targetDaemon = findDaemon(target.appId);
+    if (!targetDaemon) {
+      console.error(`目标 Bot daemon 不在线: ${target.appId}`);
+      process.exit(1);
+    }
+    const origin = findAncestorSessionContext();
+    const sourceTurnId = origin?.turnId;
+    if (!sourceTurnId) {
+      console.error('launch spec 需要当前受管 turn 身份；请从本轮 Bot 会话内调用。');
+      process.exit(1);
+    }
+    const dispatchId = createDispatchLaunchId();
+    const request: DispatchLaunchPrepareRequestV1 = {
+      schemaVersion: 1,
+      protocol: 'v1',
+      dispatchId,
+      source: { larkAppId: appId, sessionId: sid, turnId: sourceTurnId },
+      targetLarkAppId: target.appId,
+      chatId: targetChatId,
+      kickoff: canonicalizeDispatchLaunchKickoff({
+        title: title.trim(), brief,
+        ...(target.role ? { role: target.role } : {}),
+        sourceDisplay: appId, targetLarkAppId: target.appId,
+      }),
+      requestedOverride: requestedLaunch,
+      expiresAt: new Date(Date.now() + 10 * 60_000).toISOString(),
+    };
+    const coordinator = createDispatchLaunchSourceCoordinator({
+      sourceLarkAppId: appId,
+      store: createDispatchLaunchOperationStore({ dataDir: resolveDataDir(), ownerLarkAppId: appId }),
+      targetDaemon,
+      now: () => new Date(),
+    });
+    // validateRequestAuthority throws plain Error (not DispatchLaunchFailure)
+    // when the target daemon does not advertise IPC v1 or is behind a stale
+    // findDaemon lookup. Convert to a human-readable exit instead of letting
+    // the stack trace bubble out of the CLI.
+    let prepared: Awaited<ReturnType<typeof coordinator.prepare>>;
+    try {
+      prepared = await coordinator.prepare(request);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`DISPATCH_LAUNCH_UNAVAILABLE: ${message}`);
+      process.exit(1);
+    }
+    if (!prepared.ok) {
+      console.error(`${prepared.errorCode}: ${prepared.message}`);
+      process.exit(1);
+    }
+    let started: Awaited<ReturnType<typeof coordinator.start>>;
+    try {
+      started = await coordinator.start(dispatchId);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`DISPATCH_LAUNCH_UNAVAILABLE: ${message}`);
+      process.exit(1);
+    }
+    if (!started.ok) {
+      console.error(`${started.errorCode}: ${started.message}`);
+      process.exit(1);
+    }
+    const operation = started.operation;
+    // Direct-IPC dispatch requires !repo; --standby was rejected above when it
+    // arrived without --repo. So `standby` is provably false in this branch —
+    // do not compute `!standby` / `standby ? ...` here.
+    console.log(JSON.stringify({
+      success: operation.state === 'awaiting_proof',
+      taskSent: true,
+      mode: 'dispatch',
+      sourceSessionId: sid,
+      targetAppIds: [target.appId],
+      threadRootId: 'rootMessageId' in operation ? operation.rootMessageId : null,
+      seedMessageId: 'rootMessageId' in operation ? operation.rootMessageId : null,
+      threadId: null,
+      chatId: targetChatId,
+      repo: repo ?? null,
+      ...dispatchLaunchInspection(operation),
+    }));
+    if (operation.state !== 'awaiting_proof') process.exitCode = 1;
+    return;
   }
   const intoBriefJson = intoRoot
     ? JSON.stringify({ zh_cn: { title: '', content: built.threadContent } })
@@ -12161,6 +12321,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
         bots: built.mentionedOpenIds,
         purpose: brief,
         owners: bots.map(bot => bot.name ?? bot.openId),
+        ...(requestedLaunch && effectiveRuntime ? {
+          requestedLaunch,
+          effectiveRuntime,
+        } : {}),
       },
     });
     const registrationBody: any = await registration.json().catch(() => ({}));
@@ -12262,6 +12426,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       bots: built.mentionedOpenIds,
       collaborationReady: parsedBotApps.length > 0,
       projectSynced,
+      ...(requestedLaunch && effectiveRuntime ? {
+        requestedLaunch,
+        effectiveRuntime,
+      } : {}),
       ...(acceptance ? {
         accepted,
         acceptedBotAppIds: acceptance.acceptedBotAppIds,

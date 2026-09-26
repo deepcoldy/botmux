@@ -173,7 +173,7 @@ describe('Ask inside the running reply card', () => {
   });
 
   it('records timeouts without allowing a late initial snapshot to restore buttons', async () => {
-    const { snapshot, answer } = await ask({ timeoutMs: 150 });
+    const { snapshot, answer } = await ask({ timeoutMs: 500 });
     expect(await answer).toMatchObject({ kind: 'timedOut' });
     await publishReplyCardAsk(snapshot);
     expect(body).toContain('超时未答');

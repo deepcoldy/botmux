@@ -2289,6 +2289,39 @@ export function createSessionWithOwnedMutation<T>(
   return { session: created, result, rows: fresh };
 }
 
+/** Create the target-side dispatch session with its durable owner marker in one row write. */
+export function createDispatchLaunchSession(input: {
+  dispatchId: string;
+  chatId: string;
+  rootMessageId: string;
+  title: string;
+  chatType: 'group' | 'p2p';
+  workingDir: string;
+  larkAppId: string;
+  requestedOverride: import('../core/dispatch-launch-contract.js').DispatchLaunchRequestedOverride;
+  effectiveOverride: import('../core/dispatch-launch-contract.js').DispatchLaunchEffectiveOverride;
+  createdAt: string;
+  expiresAt: string;
+}): Session {
+  loadForWrite();
+  const session: Session = {
+    sessionId: randomUUID(), dispatchLaunchId: input.dispatchId, chatId: input.chatId,
+    chatType: input.chatType, rootMessageId: input.rootMessageId, scope: 'thread',
+    title: input.title, status: 'active', createdAt: new Date().toISOString(),
+    workingDir: input.workingDir, larkAppId: input.larkAppId,
+    reasoningEffort: input.effectiveOverride.reasoningEffort,
+    dispatchLaunchSpec: {
+      version: 1, targetLarkAppId: input.larkAppId, chatId: input.chatId,
+      rootMessageId: input.rootMessageId, requested: input.requestedOverride,
+      effective: input.effectiveOverride, createdAt: input.createdAt, expiresAt: input.expiresAt,
+    },
+  };
+  sessions.set(session.sessionId, session);
+  persistRow(session);
+  logger.info(`Created dispatch launch session ${session.sessionId} (thread: ${input.rootMessageId})`);
+  return session;
+}
+
 export function getSession(sessionId: string): Session | undefined {
   load();
   return sessions.get(sessionId) ?? findInOtherFiles(sessionId);
