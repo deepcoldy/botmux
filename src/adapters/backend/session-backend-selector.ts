@@ -16,6 +16,7 @@ import { ZmxBackend } from './zmx-backend.js';
 import { classifyTmuxProbeFailure } from '../../setup/ensure-tmux.js';
 import { resolveZmxSocketDir, zmxEnv } from '../../setup/ensure-zmx.js';
 import type { BackendType, PersistentBackendTarget, SessionBackend } from './types.js';
+export { decideTmuxReattach } from './tmux-reattach-decision.js';
 
 const MANAGED_HERDR_AGENT_PREFIX = 'botmux-';
 const MANAGED_HERDR_AGENT_TOKEN_LENGTH = 25;
@@ -303,6 +304,7 @@ export function selectSessionBackend(opts: {
   reuseRecordedHerdrTarget?: boolean;
   persistentBackendTarget?: PersistentBackendTarget;
   hasExistingSession?: boolean;
+  hasExistingTmuxSession?: boolean;
   /** Host-persistent journal for fail-closed ZMX composer recovery. */
   zmxRecoveryStateDir?: string;
 }): SelectedSessionBackend {
@@ -537,7 +539,8 @@ export function selectSessionBackend(opts: {
   }
 
   const sessionName = TmuxBackend.sessionName(opts.sessionId);
-  if (TmuxBackend.hasSession(sessionName)) {
+  const tmuxReattach = opts.hasExistingTmuxSession ?? TmuxBackend.hasSession(sessionName);
+  if (tmuxReattach) {
     return {
       backend: new TmuxPipeBackend(sessionName, { ownsSession: true, isReattach: true }),
       isTmuxMode: true,

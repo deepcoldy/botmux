@@ -55,11 +55,50 @@ import { ZmxBackend } from '../src/adapters/backend/zmx-backend.js';
 import * as zmxSetup from '../src/setup/ensure-zmx.js';
 import {
   backendSandboxCompatibilityError,
+  decideTmuxReattach,
   isStrongManagedHerdrAgentName,
   managedHerdrAgentName,
   retireSupersededRecordedHerdrTarget,
   selectSessionBackend,
 } from '../src/adapters/backend/session-backend-selector.js';
+
+describe('decideTmuxReattach', () => {
+  it('keeps ordinary tmux reattach semantics for existing sessions', () => {
+    expect(decideTmuxReattach({
+      workflowWorker: false,
+      sessionExists: true,
+      targetCliAlive: false,
+    })).toEqual({ reattach: true });
+  });
+
+  it('reattaches workflow workers only when the target Agent CLI is proven alive', () => {
+    expect(decideTmuxReattach({
+      workflowWorker: true,
+      sessionExists: true,
+      targetCliAlive: true,
+    })).toEqual({ reattach: true });
+  });
+
+  it('rejects a workflow reattach without a live target Agent so /goal cannot reach a husk', () => {
+    expect(decideTmuxReattach({
+      workflowWorker: true,
+      sessionExists: true,
+      targetCliAlive: false,
+    })).toEqual({
+      reattach: false,
+      cleanupStale: true,
+      reason: 'workflow tmux pane has no live target Agent CLI',
+    });
+  });
+
+  it('cold-spawns when the tmux session is absent', () => {
+    expect(decideTmuxReattach({
+      workflowWorker: true,
+      sessionExists: false,
+      targetCliAlive: true,
+    })).toEqual({ reattach: false, cleanupStale: false });
+  });
+});
 
 describe('selectSessionBackend', () => {
   afterEach(() => vi.restoreAllMocks());
@@ -89,6 +128,23 @@ describe('selectSessionBackend', () => {
       backendType: 'tmux',
       sessionName: 'bmx-9cfa0024',
     });
+  });
+
+  it('honors a caller-frozen tmux fresh decision even when a same-named session exists', () => {
+    vi.mocked(TmuxBackend.hasSession).mockReturnValue(true);
+
+    const selected = selectSessionBackend({
+      sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
+      backendType: 'tmux',
+      hasExistingTmuxSession: false,
+    });
+
+    expect(selected.isTmuxMode).toBe(true);
+    expect(selected.isPipeMode).toBe(true);
+    expect(selected.backend.constructor.name).toBe('MockTmuxPipeBackend');
+    expect((selected.backend as any).paneTarget).toBe('bmx-9cfa0024');
+    expect((selected.backend as any).opts).toEqual({ createSession: true, ownsSession: true });
+    expect(selected.isReattach).toBe(false);
   });
 
   it('uses managed pipe backend for a new tmux session', () => {

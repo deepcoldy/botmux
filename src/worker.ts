@@ -345,9 +345,11 @@ import {
   backendSandboxCompatibilityError,
   backendSandboxCompatibilityUserMessage,
   decideBackendGate,
+  decideTmuxReattach,
   retireSupersededRecordedHerdrTarget,
   selectSessionBackend,
 } from './adapters/backend/session-backend-selector.js';
+import { tmuxPaneHasTargetCli } from './adapters/backend/tmux-reattach-decision.js';
 import { buildReproduceCommand, selectReproduceLaunch } from './adapters/backend/reproduce-command.js';
 import {
   deriveRiffReposFromDirs,
@@ -2981,6 +2983,25 @@ function armSessionRenameIdleTimeout(): void {
  * Commands received while /rename owns the TUI are deferred by the IPC handler
  * and come through this same function after the prompt returns. */
 async function deliverRawInput(msg: Extract<DaemonToWorker, { type: 'raw_input' }>): Promise<void> {
+  if (!bareShellChecked) {
+    bareShellChecked = true;
+    if (await detectBareShellLaunch()) {
+      if (isWorkflowWorker()) {
+        await sendFatalWorkerErrorAndExit(
+          new Error('workflow goal worker refused to send /goal into a bare shell; retry will start a fresh CLI'),
+          msg.turnId,
+        );
+      } else {
+        pendingRawInputs.push(msg);
+      }
+      return;
+    }
+  }
+  if (cliRestartInProgress) {
+    pendingRawInputs.push(msg);
+    return;
+  }
+
   const writeRawInput = async (
     targetBackend: SessionBackend,
     fence?: AdoptWriteFence,
@@ -11146,6 +11167,32 @@ function readPaneLeafComm(observedBackend: SessionBackend | null = backend): str
   return comm;
 }
 
+function tmuxSessionHasTargetCli(
+  sessionName: string,
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+): boolean {
+  const pid = TmuxBackend.sessionChildPid(sessionName);
+  return tmuxPaneHasTargetCli(pid, cfg.cliId as CliId, cfg.cliPathOverride);
+}
+
+function decideWorkflowTmuxReattach(
+  sessionName: string,
+  cfg: Extract<DaemonToWorker, { type: 'init' }>,
+): boolean {
+  const sessionExists = TmuxBackend.hasSession(sessionName);
+  if (!isWorkflowWorker()) return sessionExists;
+  const decision = decideTmuxReattach({
+    workflowWorker: true,
+    sessionExists,
+    targetCliAlive: tmuxSessionHasTargetCli(sessionName, cfg),
+  });
+  if (!decision.reattach && decision.cleanupStale) {
+    log(`Workflow tmux session ${sessionName} is not reusable: ${decision.reason}; killing stale backing session before fresh spawn`);
+    TmuxBackend.killSession(sessionName);
+  }
+  return decision.reattach;
+}
+
 /** A slow rcfile can outlive the launch detector's settle window, then finish
  *  normally. Screen readiness alone is not enough to reopen the gate because a
  *  customized shell prompt can resemble a CLI prompt. Require both the PTY
@@ -13970,6 +14017,7 @@ async function spawnCli(
   let resolvedZmxSessionProbe: SessionProbe | undefined;
   let resolvedZmxSessionPid: number | undefined;
   let resolvedZmxSocketDir: string | undefined;
+  let resolvedTmuxHasReusableSession: boolean | undefined;
   // Frozen zellij existence decision, mirroring resolvedZmxSessionProbe: the
   // gate resolves the tri-state probe ONCE (biasing an indeterminate answer
   // toward reattach) and every teardown below refreshes it to 'missing', so a
@@ -13982,7 +14030,11 @@ async function spawnCli(
     let hasExistingSession = false;
     let existingSessionUnknown = false;
     if (effectiveBackend === 'tmux') {
-      hasExistingSession = TmuxBackend.hasSession(TmuxBackend.sessionName(cfg.sessionId));
+      resolvedTmuxHasReusableSession = decideWorkflowTmuxReattach(
+        TmuxBackend.sessionName(cfg.sessionId),
+        cfg,
+      );
+      hasExistingSession = resolvedTmuxHasReusableSession;
       if (!hasExistingSession) {
         const probe = probeTmuxFunctionalWithRetry();
         available = probe.ok;
@@ -14480,7 +14532,9 @@ async function spawnCli(
       ? resolvedZmxSessionProbe === 'exists'
       : effectiveBackend === 'zellij'
         ? resolvedZellijSessionProbe !== undefined && resolvedZellijSessionProbe !== 'missing'
-        : undefined,
+        : effectiveBackend === 'tmux'
+          ? resolvedTmuxHasReusableSession
+          : undefined,
     zmxRecoveryStateDir: isolationRuntimeDataDir,
   });
   let selectedBackend = selectBackend();
@@ -20412,6 +20466,16 @@ async function sendFatalWorkerErrorAndExit(
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
   });
   log('Fatal worker error delivered; exiting process');
+  if (isWorkflowWorker()) {
+    const closeTeardown = backend?.destroySession?.();
+    if (closeTeardown && typeof (closeTeardown as Promise<void>).then === 'function') {
+      try { await Promise.race([closeTeardown, new Promise((r) => setTimeout(r, 5_000))]); }
+      catch { /* best-effort cleanup before terminal workflow exit */ }
+    }
+    stopOwnedSessionScope('workflow fatal exit');
+    killCli();
+    cleanup();
+  }
   if (opts.hardExit) {
     // A fail-closed Codex App generation must produce a real OS-level worker
     // exit so the daemon can arm its worker-generation receipt fence. On some
@@ -21696,6 +21760,22 @@ process.on('message', async (raw: unknown) => {
           log(`${effectiveBackendType} close prepare failed (${result.error ?? 'cancel failed'}); session stays active for retry`);
         }
         break;
+      }
+
+      if (isWorkflowWorker()) {
+        closeRequested = true;
+        stopScreenshotLoop();
+        stopBridgeWatcher();
+        stopCodexBridge();
+        const closeTeardown = backend?.destroySession?.();
+        if (closeTeardown && typeof (closeTeardown as Promise<void>).then === 'function') {
+          try { await Promise.race([closeTeardown, new Promise((r) => setTimeout(r, 22_000))]); }
+          catch { /* logged by backend */ }
+        }
+        stopOwnedSessionScope('workflow close');
+        killCli();
+        cleanup();
+        process.exit(0);
       }
 
       closeRequested = true;
