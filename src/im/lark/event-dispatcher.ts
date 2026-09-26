@@ -4035,7 +4035,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // 收到 im:message.group_msg.include_bot:read 推来的「其他用户/机器人发的群消息」后，
         // 只有满足形态门才免 @ 自动开工；否则保持原有「未 @ 即忽略」语义。
         if (!isBotMentioned(larkAppId, message, undefined)) {
-          if (getBot(larkAppId).config.autoStartOnNewTopic === true && chatType === 'group') {
+          if (getBot(larkAppId).config.autoStartOnNewTopic === true && !getBot(larkAppId).config.autoStartExcludedChats?.includes(chatId) && chatType === 'group') {
             const seedDecision = await decideRoutingWithSource(larkAppId, message);
             // P3 — 镜像人分支「话题群 → 普通群 (reverse conversion)」那道 forceRefresh
             // 守卫：decideRoutingWithSource 判 topic-chat 种子靠的是**缓存** chat_mode
@@ -4768,7 +4768,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
             // else (regular-group chatter, thread replies, disabled bots) keeps
             // the original ignore. Sender is intentionally not gated (D4).
             const autoTopic = shouldAutoStartOnNewTopic({
-              enabled: getBot(larkAppId).config.autoStartOnNewTopic === true,
+              enabled: getBot(larkAppId).config.autoStartOnNewTopic === true && !getBot(larkAppId).config.autoStartExcludedChats?.includes(chatId),
               scope: autoTopicSeedScope,
               anchor: autoTopicSeedAnchor,
               messageId,

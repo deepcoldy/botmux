@@ -158,6 +158,14 @@ afterAll(() => {
 });
 
 describe('handleBotAdded — 普通群 shared 路由', () => {
+  it('excluded group joins send no greeting and start no worker', async () => {
+    const { daemon, registry } = modules;
+    registry.registerBot({ larkAppId: 'app_excluded', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'], autoStartOnGroupJoin: true, autoStartExcludedChats: ['oc_quiet'] });
+    await daemon.__testOnly_handleBotAdded('oc_quiet', 'ou_owner', 'app_excluded');
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
   it('项目群关闭自动纳入时保留显式 Worker 名单', async () => {
     const { collaborationModeStore, daemon, registry } = modules;
     const appId = 'app_join_explicit_worker';

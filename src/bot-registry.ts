@@ -2126,6 +2126,8 @@ export interface BotConfig {
    * Default (undefined) = passive.
    */
   autoStartOnNewTopic?: boolean;
+  /** Chat IDs excluded from group-join and new-topic auto-start (explicit requests still work). */
+  autoStartExcludedChats?: string[];
   /** Bot-wide default listener. It applies to every joined group without an override. */
   globalMessageListener?: MessageListenerConfig;
   /** Per-chat exceptions to {@link globalMessageListener}; an absent entry inherits. */
@@ -3875,6 +3877,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.autoStartOnGroupJoinSeed
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
+      autoStartExcludedChats: Array.isArray(entry.autoStartExcludedChats) ? entry.autoStartExcludedChats.filter((id: unknown): id is string => typeof id === 'string') : undefined,
       groupJoinCommandEnabled: entry.groupJoinCommandEnabled === true || undefined,
       groupJoinCommand: typeof entry.groupJoinCommand === 'string' && entry.groupJoinCommand.trim()
         ? entry.groupJoinCommand.trim()
