@@ -229,6 +229,11 @@ describe('durable turn queue boundary', () => {
     expect(pendingInputAllowsTypeAhead(true, false, { content: 'delivery', dispatchAttempt: 1 })).toBe(false);
   });
 
+  it('disables type-ahead while a direct RPC turn is still active', () => {
+    expect(pendingInputAllowsTypeAhead(true, false, { content: 'follow-up' }, true)).toBe(false);
+    expect(pendingInputAllowsTypeAhead(true, false, { content: 'follow-up' }, false)).toBe(true);
+  });
+
   it('forces separate idle edges on both sides of a durable attempt', () => {
     expect(shouldStopPendingBatch(
       { content: 'delivery', dispatchAttempt: 1 },

@@ -398,6 +398,33 @@ describe('worker structured-turn status wiring', () => {
     expect(postWriteBreak).toBeGreaterThan(loopStart);
   });
 
+  it('queues direct RPC follow-ups until the active native turn reaches a terminal', () => {
+    const gate = functionSlice('directRpcTurnBlocksTypeAhead', 'flushPending');
+    expect(gate).toContain('rpcTurnsAwaitingActivation.size > 0');
+    expect(gate).toContain('rpcActiveOwners.size > 0');
+    expect(gate).toContain('settlingRpcTerminalOwners.size > 0');
+    expect(gate).toContain('rpcTerminalHydrationOwners.size > 0');
+
+    const flush = source.slice(
+      source.indexOf('async function flushPending'),
+      source.indexOf('function sendToPty'),
+    );
+    const typeAheadDecision = flush.indexOf('const typeAheadAllowed = pendingInputAllowsTypeAhead');
+    const busyArgument = flush.indexOf('directRpcTurnBlocksTypeAhead()', typeAheadDecision);
+    const loopStart = flush.indexOf('while (pendingMessages.length > 0');
+    const postWriteBreak = flush.indexOf('if (directRpcTurnBlocksTypeAhead()) break', loopStart);
+    const sendToPtyStart = source.indexOf('function sendToPty');
+    const sendToPtyEnd = source.indexOf('// ─── Screen Update Timer', sendToPtyStart);
+    const sendToPty = source.slice(sendToPtyStart, sendToPtyEnd);
+    const sendToPtyTypeAhead = sendToPty.indexOf('const supportsTypeAhead = pendingInputAllowsTypeAhead');
+    const sendToPtyBusyArgument = sendToPty.indexOf('directRpcTurnBlocksTypeAhead()', sendToPtyTypeAhead);
+    expect(typeAheadDecision).toBeGreaterThanOrEqual(0);
+    expect(busyArgument).toBeGreaterThan(typeAheadDecision);
+    expect(postWriteBreak).toBeGreaterThan(loopStart);
+    expect(sendToPtyTypeAhead).toBeGreaterThanOrEqual(0);
+    expect(sendToPtyBusyArgument).toBeGreaterThan(sendToPtyTypeAhead);
+  });
+
   it('makes native terminal settlement idempotent and generation-owned across abort/death/stop cleanup', () => {
     const settle = functionSlice('settleRpcTurnTerminal', 'handleRpcTurnTerminal');
     expect(settle).toContain('const existingSettlement = settlingRpcTerminalOwners.get(ownerKey)');
