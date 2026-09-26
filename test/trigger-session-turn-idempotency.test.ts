@@ -91,6 +91,7 @@ import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempoten
 import * as asyncTriggerStore from '../src/services/async-trigger-store.js';
 import * as idempotencyStore from '../src/services/idempotency-store.js';
 import { sessionKey } from '../src/core/types.js';
+import { commitTriggerStreamingCard } from '../src/core/trigger-streaming-card.js';
 
 const APP = 'local_riff';
 const SID = 'sess_existing';
@@ -138,6 +139,7 @@ beforeEach(() => {
   existingRows.push({ sessionId: SID, chatId: CHAT, scope: 'chat', status: 'active' });
   forkShouldThrow = false; sendShouldRefuse = false; queuedActivationGateActive = false;
   mockForkWorker.mockClear(); mockSendWorkerInput.mockClear(); mockCloseSession.mockClear();
+  mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: true } });
 });
 afterEach(() => {
   if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR; else process.env.SESSION_DATA_DIR = prevDataDir;
@@ -512,5 +514,42 @@ describe('turn-level idempotency — codex #818 P1 regressions', () => {
     expect(ds.idempotentAsyncTurns?.size ?? 0).toBe(0); // stale fault entry cleared
     expect(mockSendWorkerInput).not.toHaveBeenCalled();
     void realRFS;
+  });
+});
+
+
+describe('visible handoff dispatch to a reused session', () => {
+  it.each(['ordinary', 'async', 'suppressed', 'dormant'] as const)(
+    '%s dispatch commits the card using the actual worker input id', async mode => {
+      mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: false } });
+      const chatId = 'oc_handoff';
+      const ds = existingDs({ chatId, worker: mode === 'dormant' ? null : { killed: false, send: vi.fn() } as any });
+      ds.session.chatId = chatId;
+      const req = followUpReq(undefined);
+      req.options = mode === 'async' ? { asyncReturnSessionId: true }
+        : mode === 'suppressed' ? { suppressFinalOutput: true } : undefined;
+      req.presentation = { liveCard: 'on-start', title: '接手任务' };
+      const res = await triggerSessionTurn(req, { larkAppId: APP,
+        activeSessions: new Map([[sessionKey(chatId, APP), ds]]) });
+      expect(res.ok).toBe(true);
+      const turnId = mode === 'dormant' ? mockForkWorker.mock.calls[0][2].turnId
+        : mockSendWorkerInput.mock.calls[0][2];
+      expect(turnId).toBe(res.triggerId);
+      const start = vi.fn();
+      expect(start).not.toHaveBeenCalled();
+      expect(commitTriggerStreamingCard(ds, turnId, start)).toBe(true);
+      expect(start).toHaveBeenCalledExactlyOnceWith(ds, '接手任务', turnId);
+      expect(commitTriggerStreamingCard(ds, turnId, start)).toBe(false);
+    });
+
+  it('leaves an ordinary input without handoff presentation unchanged', async () => {
+    mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: false } });
+    const ds = existingDs({ chatId: 'oc_handoff', worker: { killed: false, send: vi.fn() } as any });
+    ds.session.chatId = 'oc_handoff';
+    const req = followUpReq(undefined); req.options = undefined;
+    const res = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map([[sessionKey(ds.chatId, APP), ds]]) });
+    expect(res.ok).toBe(true);
+    expect(mockSendWorkerInput.mock.calls[0][2]).toBeUndefined();
+    expect(commitTriggerStreamingCard(ds, res.triggerId, vi.fn())).toBe(false);
   });
 });

@@ -858,6 +858,8 @@ export interface Session {
   quoteTargetSenderIsBot?: boolean;
   /** Persisted streaming-card state — allows the existing card to be PATCHed
    *  (rather than a fresh POST) after daemon restart. */
+  /** Connector-owned lifecycle, scoped to the exact committed handoff. */
+  handoffLiveCard?: { turnId: string; sequence: number; title?: string; closed?: boolean; resultMessageId?: string };
   streamCardId?: string;
   streamCardNonce?: string;
   /** Stable visible destination of the persisted live streaming card. */

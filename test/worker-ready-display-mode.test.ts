@@ -1,3 +1,4 @@
+import { armTriggerStreamingCard } from '../src/core/trigger-streaming-card.js';
 /**
  * Verifies that the `case 'ready'` handler in worker-pool.ts sends
  * `set_display_mode` to the worker after POSTing a new streaming card.
@@ -1670,5 +1671,62 @@ describe('Worker ready: set_display_mode re-sync', () => {
     fakeWorker.emit('message', { type: 'prompt_ready' });
     await flush();
     expect(fakeWorker.send).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('worker-authoritative handoff live card', () => {
+  const handoff = { source: { type: 'ui' as const }, target: { kind: 'turn' as const },
+    envelope: { format: 'handoff', sourceName: 'team', trusted: false as const },
+    presentation: { liveCard: 'on-start' as const, title: '审查上传取消修复' } };
+
+  async function prepare(disabled = false) {
+    vi.clearAllMocks();
+    getBotMock.mockReturnValue({ config: { larkAppId: 'app_test', cliId: 'claude-code', disableStreamingCard: disabled }, resolvedAllowedUsers: [] });
+    const reply = vi.fn(async () => 'om_handoff_card');
+    const onStart = vi.fn((ds: DaemonSession, title: string, turnId: string) => {
+      ds.currentTurnId = turnId; ds.currentTurnTitle = title;
+      ds.streamCardPending = true; ds.streamCardPendingTurnId = turnId;
+      ds.streamCardTurnGeneration = (ds.streamCardTurnGeneration ?? 0) + 1;
+      void postTurnStartingCard(ds, reply, turnId);
+    });
+    initWorkerPool({ sessionReply: reply, getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1, closeSession: vi.fn(), onTriggerTurnStarted: onStart });
+    const worker = makeFakeWorker();
+    const ds = makeDs({ scope: 'chat', worker, workerPort: 9999, workerToken: 'tok',
+      streamCardId: 'om_previous', streamCardNonce: 'old-nonce', streamCardReplyTargetKey: 'plain:oc_chat' });
+    ds.session.scope = 'chat'; ds.session.rootMessageId = 'oc_chat';
+    setupActiveWorkerHandlers(ds, worker);
+    return { ds, worker, reply, onStart };
+  }
+
+  it('keeps a queued handoff silent, posts on commit, and recalls its predecessor after success', async () => {
+    const { ds, worker, reply, onStart } = await prepare();
+    armTriggerStreamingCard(ds, handoff, 'trg_review');
+    worker.emit('message', { type: 'ready', port: 9999, token: 'tok', turnId: 'trg_review' });
+    await flush(); expect(reply).not.toHaveBeenCalled();
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_review' });
+    await flush(); await flush();
+    expect(onStart).toHaveBeenCalledExactlyOnceWith(ds, '审查上传取消修复', 'trg_review');
+    expect(reply).toHaveBeenCalledTimes(1); expect(ds.streamCardId).toBe('om_handoff_card');
+    expect(deleteMessageMock).toHaveBeenCalledWith('app_test', 'om_previous');
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_review' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_unrelated_user' });
+    await flush(); expect(reply).toHaveBeenCalledTimes(1);
+  });
+
+  it('honors a bot that explicitly disabled its card', async () => {
+    const { ds, worker, reply, onStart } = await prepare(true);
+    armTriggerStreamingCard(ds, handoff, 'trg_review');
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_review' });
+    await flush(); expect(onStart).not.toHaveBeenCalled(); expect(reply).not.toHaveBeenCalled();
+  });
+
+  it('does not publish from a replaced worker generation', async () => {
+    const { ds, worker, reply, onStart } = await prepare();
+    armTriggerStreamingCard(ds, handoff, 'trg_review');
+    ds.worker = makeFakeWorker();
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_review' });
+    await flush(); expect(onStart).not.toHaveBeenCalled(); expect(reply).not.toHaveBeenCalled();
   });
 });

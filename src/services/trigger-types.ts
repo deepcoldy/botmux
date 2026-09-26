@@ -40,6 +40,9 @@ export interface TriggerRequest {
   presentation?: {
     topicMessage?: string | null;
     title?: string;
+    /** Connector-owned handoff UI: replace the native live card only when this
+     * exact input is committed by the worker. Never driven by group messages. */
+    liveCard?: 'on-start';
   };
   options?: {
     dryRun?: boolean;
@@ -269,6 +272,9 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   if (raw.presentation !== undefined) {
     if (!isRecord(raw.presentation)) {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation must be an object' } };
+    }
+    if (raw.presentation.liveCard !== undefined && raw.presentation.liveCard !== 'on-start') {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.liveCard must be on-start' } };
     }
     const topicMessage = raw.presentation.topicMessage;
     if (topicMessage !== undefined && topicMessage !== null && typeof topicMessage !== 'string') {
