@@ -708,7 +708,7 @@ export async function setCodexAppThreadName(opts: SetCodexAppThreadNameOptions):
     opts.registerForceClose,
   );
   try {
-    await client.initialize(timeoutMs);
+    await client.initialize(opts.initializeTimeoutMs ?? timeoutMs);
     if (opts.waitForExistingPreview) {
       await client.waitForThreadPreview(opts.threadId, timeoutMs);
     }

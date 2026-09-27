@@ -31,6 +31,15 @@ export interface SessionRow extends SessionMessagePreview {
   larkAppId: string;
   botName: string;
   cliId: CliId | 'unknown';
+  requestedLaunch?: NonNullable<Session['dispatchLaunchSpec']>['requested'];
+  /** Only populated once the worker has actually observed the runtime (i.e. the
+   *  session carries dispatchLaunchSpec.effectiveRuntime). No synthetic
+   *  "requested-as-effective" fallback: consumers that need pre-observation
+   *  intent must read requestedLaunch. */
+  effectiveRuntime?: {
+    model: string; reasoningEffort?: string;
+    workerGeneration?: number; observedAt?: string;
+  };
   /** Concrete distribution identity frozen on the session. Older path-only
    * sessions expose a basename-derived legacy identity. */
   runtimeId?: string;
@@ -252,6 +261,12 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     larkAppId: ds.larkAppId,
     botName: cachedBotName,
     cliId: ds.session.cliId ?? 'unknown',
+    ...(ds.session.dispatchLaunchSpec ? {
+      requestedLaunch: ds.session.dispatchLaunchSpec.requested,
+      ...(ds.session.dispatchLaunchSpec.effectiveRuntime
+        ? { effectiveRuntime: ds.session.dispatchLaunchSpec.effectiveRuntime }
+        : {}),
+    } : {}),
     cliInstanceId: ds.session.cliInstanceBinding?.instanceId ?? undefined,
     cliInstanceSource: ds.session.cliInstanceBinding?.source,
     creationSource: ds.session.creationSource,
@@ -325,6 +340,12 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
     cliId: s.cliId ?? 'unknown',
+    ...(s.dispatchLaunchSpec ? {
+      requestedLaunch: s.dispatchLaunchSpec.requested,
+      ...(s.dispatchLaunchSpec.effectiveRuntime
+        ? { effectiveRuntime: s.dispatchLaunchSpec.effectiveRuntime }
+        : {}),
+    } : {}),
     cliInstanceId: s.cliInstanceBinding?.instanceId ?? undefined,
     cliInstanceSource: s.cliInstanceBinding?.source,
     creationSource: s.creationSource,
@@ -376,6 +397,12 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     larkAppId: s.larkAppId ?? '',
     botName: cachedBotName,
     cliId: s.cliId ?? 'unknown',
+    ...(s.dispatchLaunchSpec ? {
+      requestedLaunch: s.dispatchLaunchSpec.requested,
+      ...(s.dispatchLaunchSpec.effectiveRuntime
+        ? { effectiveRuntime: s.dispatchLaunchSpec.effectiveRuntime }
+        : {}),
+    } : {}),
     cliInstanceId: s.cliInstanceBinding?.instanceId ?? undefined,
     cliInstanceSource: s.cliInstanceBinding?.source,
     creationSource: s.creationSource,

@@ -445,6 +445,25 @@ export interface MessageProvenance {
 
 export interface Session {
   sessionId: string;
+  /** Internal target-side owner for an idempotent dispatch-launch session. */
+  dispatchLaunchId?: string;
+  /** Immutable model/effort selected by the public topic dispatch seam. */
+  dispatchLaunchSpec?: {
+    version: 1;
+    targetLarkAppId: string;
+    chatId: string;
+    rootMessageId: string;
+    requested: { model?: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' };
+    effective: { model: string; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra' };
+    createdAt: string;
+    expiresAt: string;
+    effectiveRuntime?: {
+      model: string;
+      reasoningEffort?: string;
+      workerGeneration: number;
+      observedAt: string;
+    };
+  };
   /** Build fingerprint of the last fresh owned Codex App runner that became ready. */
   runnerBuildId?: string;
   chatId: string;
