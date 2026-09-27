@@ -55,6 +55,7 @@ import {
   type ReplyStyleConfig,
 } from './im/lark/reply-card-style.js';
 import {
+  normalizeAskOptionLayout,
   setAskOptionLayoutLookup,
   type AskOptionLayout,
 } from './im/lark/ask-option-layout.js';
@@ -3619,6 +3620,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       logger.warn(`[bot-registry:${entry.larkAppId}] ${warning}`);
     }
 
+    // 冷读线程化：写侧（PUT → rmwBotEntry）只保证落盘与热更新；daemon 重启后
+    // 配置能活下来的唯一通路是 parser 在这里把磁盘字段读进 BotConfig。
+    const normalizedAskOptionLayout = normalizeAskOptionLayout(entry.askOptionLayout);
+    for (const warning of normalizedAskOptionLayout.warnings) {
+      logger.warn(`[bot-registry:${entry.larkAppId}] ${warning}`);
+    }
+
     const skills = readBotSkillPolicy(entry.skills);
     // Presence is semantic for plugins: [] is an exact "none" override, while
     // an absent field inherits the machine defaults.
@@ -3863,6 +3871,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // means "use default botmux brand". Don't trim-to-undefined here.
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,
       replyStyle: normalizedReplyStyle.config,
+      // 稀疏语义与写侧一致：缺省/非法值 → undefined（compact 行为）；显式
+      // vertical（或手改的 compact）原样读出。
+      askOptionLayout: normalizedAskOptionLayout.layout,
       // Persist only a non-default usage-display mode; 'streaming' (default) and
       // an absent key both mean streaming. Legacy showUsageInCardFooter:false is
       // still honored on read (see normalizeUsageDisplay) but never re-emitted.
