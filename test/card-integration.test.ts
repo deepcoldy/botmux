@@ -36,12 +36,15 @@ import {
 const fakeLark = new FakeLarkClient();
 let sessionReplyResults: string[] = [];
 let sessionReplyCallIndex = 0;
+const { deleteMessageMock } = vi.hoisted(() => ({
+  deleteMessageMock: vi.fn(async () => true),
+}));
 
 // ─── Mocks ────────────────────────────────────────────────────────────────
 
 vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: (...args: any[]) => fakeLark.createMock('updateMessage')(...args),
-  deleteMessage: vi.fn(async () => true),
+  deleteMessage: deleteMessageMock,
   sendUserMessage: (...args: any[]) => fakeLark.createMock('sendUserMessage')(...args),
   // Resolves immediately (no manual orchestration) — the private-close path just
   // awaits it; tests assert on the recorded args.
@@ -314,6 +317,8 @@ describe('Card integration: full event flow', () => {
       expect(deps.sessionReply).toHaveBeenCalledTimes(1);
       expect(ds.streamCardId).toBe('om_card_0');
       expect(fakeLark.patches).toHaveLength(0);
+      expect(deleteMessageMock).toHaveBeenCalledTimes(1);
+      expect(deleteMessageMock).toHaveBeenCalledWith(APP_ID, legacyCardId);
 
       const duplicate = await handleCardAction(
         makeToggleEvent(ROOT_ID, NONCE_CURRENT, 'ou_user', legacyCardId, null),
