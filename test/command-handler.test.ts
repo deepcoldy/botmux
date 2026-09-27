@@ -816,6 +816,20 @@ describe('DAEMON_COMMANDS set', () => {
 });
 
 describe('/cli session selection', () => {
+  it('rejects unsupported CLIs using the frozen session policy before changing selection', async () => {
+    const ds = makeDaemonSession({
+      hasHistory: false,
+      session: makeSession({ promptInjection: 'none', cliId: undefined, cliLaunchSnapshot: undefined }),
+    });
+    const deps = makeDeps(ds);
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli gemini'), deps, LARK_APP_ID);
+    expect(ds.session.cliLaunchSnapshot).toBeUndefined();
+    expect(deps.sessionReply).toHaveBeenLastCalledWith(ROOT_ID,
+      expect.stringContaining('automatic final reply capture'), undefined, LARK_APP_ID, 'msg_001');
+    await handleCommand('/cli', ROOT_ID, makeLarkMessage('/cli hermes'), deps, LARK_APP_ID);
+    expect(ds.session.cliLaunchSnapshot?.cliId).toBe('hermes');
+  });
+
   it('persists a pending CLI selection and allows pre-freeze reselection', async () => {
     const ds = makeDaemonSession({
       hasHistory: false,

@@ -5392,7 +5392,18 @@ const server = createServer(async (req, res) => {
     // ─── Customization center (built-in prompt/skill overrides) ──────────────
     // GET is a public read (overview only, no secrets); all mutations are
     // owner-gated (not on PUBLIC_READ_PATHS → decideDashboardAuth 401s guests).
-    if (await handleCustomizationApi(req, res, url)) {
+    if (await handleCustomizationApi(req, res, url, {
+      getBotNames: () => {
+        const names = readPersistedBotNames();
+        for (const bot of registry.list()) {
+          const name = bot.botName?.trim();
+          // A daemon can publish its App ID while the Feishu probe warms up.
+          // Keep a known cached name until a real live name is available.
+          if (name && name !== bot.larkAppId) names.set(bot.larkAppId, name);
+        }
+        return names;
+      },
+    })) {
       return;
     }
 
@@ -7513,6 +7524,20 @@ const server = createServer(async (req, res) => {
         method: 'PUT',
         headers: { 'content-type': 'application/json' },
         body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    let mBotPromptInjection: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotPromptInjection = url.pathname.match(/^\/api\/bots\/([^/]+)\/prompt-injection$/))) {
+      const appId = decodeURIComponent(mBotPromptInjection[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const upstream = await proxyToDaemon(appId, '/api/bot-prompt-injection', {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: Buffer.concat(chunks).toString('utf8') || '{}',
       });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());

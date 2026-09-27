@@ -114,6 +114,22 @@ describe('card-prefs store — 主动开工 fields', () => {
     expect(registry.loadBotConfigs()[0].cotEnabled).toBe(false);
   });
 
+  it('persists per-bot exclusions, keeps them on unrelated saves, and clears them', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    expect(store.getBotCardPrefs('app_default').autoStartExcludedChats).toEqual([]);
+    await store.updateBotCardPrefs('app_default', { autoStartExcludedChats: ['oc_quiet'] });
+    await store.updateBotCardPrefs('app_default', { autoStartOnNewTopic: true });
+    expect(readConfig().autoStartExcludedChats).toEqual(['oc_quiet']);
+    expect(registry.loadBotConfigs()[0].autoStartExcludedChats).toEqual(['oc_quiet']);
+    expect(registry.getBot('app_default').config.autoStartExcludedChats).toEqual(['oc_quiet']);
+    expect(store.getBotCardPrefs('app_default').autoStartExcludedChats).toEqual(['oc_quiet']);
+    await store.updateBotCardPrefs('app_default', { autoStartExcludedChats: [] });
+    expect(readConfig().autoStartExcludedChats).toBeUndefined();
+    expect(store.getBotCardPrefs('app_default').autoStartExcludedChats).toEqual([]);
+  });
+
   it('defaults to false/empty when unset (FR-10)', async () => {
     writeConfig();
     const { registry, store } = await freshModules();

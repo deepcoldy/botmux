@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   authorizeReportSessionRelayRequest,
+  prepareAutomaticDispatchReport,
   buildOrchestratorReportTrigger,
   deliverReportSessionRelay,
   isReportRelayOriginalSessionUnavailable,
@@ -606,5 +607,20 @@ describe('report session relay wiring', () => {
       'raw = await readJsonBody<unknown>(req, REPORT_SESSION_RELAY_MAX_BYTES);',
     );
     expect(daemonSource).toContain('if (error instanceof JsonBodyTooLargeError)');
+  });
+});
+
+
+describe('automatic zero-injection dispatch report', () => {
+  it('returns to the signed lead session without assuming task completion', () => {
+    const input = { registry: REGISTRY, bindingSecret: BINDING_SECRET, dispatchRoot: 'om_dispatch',
+      sourceSessionId: 'sub', sourceLarkAppId: 'cli_sub', content: '测试通过' };
+    const decision = prepareAutomaticDispatchReport(input)!;
+    expect(decision.target).toEqual({ sessionId: 'session-orchestrator', larkAppId: 'cli_orchestrator' });
+    expect(decision.content).toBe('测试通过');
+    expect(decision.projectUpdate).toEqual({});
+    expect(prepareAutomaticDispatchReport({ ...input, bindingSecret: 'forged' })).toBeUndefined();
+    expect(prepareAutomaticDispatchReport({ ...input, dispatchRoot: undefined })).toBeUndefined();
+    expect(prepareAutomaticDispatchReport({ ...input, sourceSessionId: 'session-orchestrator' })).toBeUndefined();
   });
 });

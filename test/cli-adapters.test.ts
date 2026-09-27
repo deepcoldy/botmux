@@ -160,7 +160,79 @@ describe('lazy binary resolution', () => {
 // 2. buildArgs
 // ---------------------------------------------------------------------------
 
+describe('Codex zero injection isolation', () => {
+  it('refuses shared Botmux skill files without deleting them or user skills', () => {
+    const home = mkdtempSync(join(tmpdir(), 'botmux-zero-codex-'));
+    const previous = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = home;
+    try {
+      mkdirSync(join(home, 'skills', 'botmux-send'), { recursive: true });
+      const skill = join(home, 'skills', 'botmux-send', 'SKILL.md');
+      writeFileSync(skill, 'shared skill');
+      expect(() => createCodexAdapter().buildArgs({ sessionId: 'zero', resume: false, promptInjection: 'none' })).toThrow('全局 botmux 技能');
+      expect(existsSync(skill)).toBe(true);
+      expect(() => createCodexAdapter().buildArgs({ sessionId: 'ordinary', resume: false })).not.toThrow();
+      rmSync(join(home, 'skills', 'botmux-send'), { recursive: true });
+      mkdirSync(join(home, 'skills', 'user-skill'), { recursive: true });
+      writeFileSync(join(home, 'skills', 'user-skill', 'SKILL.md'), 'user skill');
+      expect(() => createCodexAdapter().buildArgs({ sessionId: 'zero', resume: true, promptInjection: 'none' })).not.toThrow();
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = previous;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('zero injection with structured final reply adapters', () => {
+  it.each([false, true])('Grok omits only Botmux rules and preserves the task (resume=%s)', resume => {
+    const args = createGrokAdapter('/bin/grok').buildArgs({ sessionId: 'zero-grok', resume,
+      promptInjection: 'none', initialPrompt: '检查变更', botName: 'Sub' });
+    expect(args).not.toContain('--rules');
+    expect(args.join(' ')).not.toContain('botmux_routing');
+    expect(args).toContain('检查变更');
+  });
+
+  for (const [name, create] of [
+    ['pi', () => createPiAdapter('/bin/pi', () => '/tmp/boundary.js')],
+    ['oh-my-pi', () => createOhMyPiAdapter('/bin/omp', () => '/tmp/boundary.js')],
+  ] as const) {
+    it(`${name} keeps final-detection hooks while dropping skills and inherited prompt channels`, () => {
+      for (const resume of [false, true]) {
+        const env: Record<string, string> = { BOTMUX_APPEND_SYSTEM_PROMPT: 'stale rules', BOTMUX_APPEND_SYSTEM_PROMPT_FILE: '/tmp/stale-rules' };
+        const args = create().buildArgs({ sessionId: 'zero-pi', resume, promptInjection: 'none', env, skillPluginDir: '/tmp/plugin' });
+        expect(args).toContain('--extension');
+        expect(args).not.toContain('--skill');
+        expect(args).not.toContain('--plugin-dir');
+        expect(args).not.toContain('--append-system-prompt');
+        expect(env.BOTMUX_APPEND_SYSTEM_PROMPT).toBe('');
+        expect(env.BOTMUX_APPEND_SYSTEM_PROMPT_FILE).toBe('');
+        const handlers: Record<string, (event?: any) => any> = {};
+        const appendEntry = vi.fn();
+        registerBotmuxTurnBoundaryExtension({ on: (event: string, handler: any) => { handlers[event] = handler; }, appendEntry } as any);
+        vi.stubEnv('BOTMUX_APPEND_SYSTEM_PROMPT', env.BOTMUX_APPEND_SYSTEM_PROMPT);
+        vi.stubEnv('BOTMUX_APPEND_SYSTEM_PROMPT_FILE', env.BOTMUX_APPEND_SYSTEM_PROMPT_FILE);
+        try {
+          expect(handlers.before_agent_start({ systemPrompt: 'native prompt' })).toBeUndefined();
+          handlers.agent_end({ messages: [{ role: 'assistant', stopReason: 'stop' }] });
+          handlers.agent_settled();
+          expect(appendEntry).toHaveBeenCalledWith('botmux-turn-settled', { lastStopReason: 'stop' });
+        } finally { vi.unstubAllEnvs(); }
+      }
+    });
+  }
+});
+
 describe('claude-code buildArgs', () => {
+  it('zero injection omits Botmux system prompts and both plugin directories on fresh and resumed CLI launches', () => {
+    for (const resume of [false, true]) {
+      const args = createClaudeCodeAdapter().buildArgs({ sessionId: 'zero', resume,
+        promptInjection: 'none', skillPluginDir: '/tmp/custom-plugin', botName: 'Sub' });
+      expect(args).not.toContain('--append-system-prompt');
+      expect(args).not.toContain('--plugin-dir');
+      expect(args.join(' ')).not.toContain('botmux_routing');
+    }
+  });
+
   const adapter = createClaudeCodeAdapter('/usr/bin/claude');
 
   it('new session passes --session-id and permission flags', () => {

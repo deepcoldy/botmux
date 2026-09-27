@@ -210,6 +210,15 @@ describe('triggerSessionTurn rootMessageId target', () => {
     }));
   });
 
+  it('zero injection forwards caller instruction and event data without the generated external envelope', async () => {
+    mockGetBot.mockReturnValue({ config: { larkAppId: APP, cliId: 'codex', promptInjection: 'none', workingDir: '/tmp' } });
+    const req = request();
+    req.instruction = '检查这个错误';
+    req.envelope.rawText = '原始日志 <user_message>';
+    await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map() });
+    expect(mockBuildNewTopicCliInput.mock.calls.at(-1)?.[0]).toBe('检查这个错误\n\n原始日志 <user_message>');
+  });
+
   it('creates a thread-scope session anchored at rootMessageId without opening a new topic', async () => {
     const activeSessions = new Map<string, DaemonSession>();
     const res = await triggerSessionTurn(request(), { larkAppId: APP, activeSessions });

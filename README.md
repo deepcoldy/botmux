@@ -80,6 +80,20 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 
 更多：[角色与团队](https://deepcoldy.github.io/botmux/roles) · [文件沙盒](https://deepcoldy.github.io/botmux/sandbox) · [Dashboard 管控面](https://deepcoldy.github.io/botmux/dashboard) · [tmux 会话常驻](https://deepcoldy.github.io/botmux/tmux) · [飞书会议智能体（效果展示）](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg)。
 
+## 按 Bot 设置零注入
+
+在 Dashboard → 自定义中心 →「按 Bot 设置零注入」勾选一个或多个 bot，批量开启或恢复原配置；支持搜索与全选当前结果，每个 bot 独立保存，失败项会保留勾选供重试。也可在对应 `bots.json` 条目设置 `"promptInjection": "none"`。适合 lead-bot 派活、sub-bot 专注执行的场景。`default` / 删除字段恢复原行为，既有 prompt、角色和技能配置不会被清空。
+
+此模式只传任务正文与附件信息，跳过 botmux 的系统提示、逐轮提醒、身份信封、角色、白板、记忆与技能目录；自动从 CLI 转写回传最终回答。使用新会话验证：已经进入历史的提示无法撤回，CLI 原生系统提示、项目 `AGENTS.md` 及用户自行安装的技能仍由 CLI 管理。
+
+支持范围复用 CLI 的最终回复兜底采集能力：目前包括 Claude Code、Codex、TraeX、CoCo、Hermes、MTR、Pi、Oh My Pi、ebsd、Grok（PTY、tmux 等本地后端，包含 Codex / TraeX RPC 输入）。暂不支持远端后端和 v3 workflow；仅 adopt 能采集 final 的 CLI 不作为整 bot 开关的支持依据。CLI 的共享技能目录若存在全局安装的 `botmux-*` 技能，会拒绝启动以免假称零注入；请使用按会话的技能注入方式或独立 home，不会删除其它 bot 共用的文件。
+
+普通协作可直接在群内 @ 执行 bot，最终回答自动回复当前会话，并默认 @ 本轮任务的发起人（真人或 bot）。收件人取自宿主记录的本轮身份，排队和重试不借用后续轮次的发送者；缺少可用身份时不猜测会话 owner，也不注入额外 prompt。已经 @ 发起 bot 的回复本身就是回报，不再额外通过 HTTP 重复追加一轮任务。
+
+零注入会话也默认回传 Web 终端中的最终回答：`/rewind` 重跑和随后直接输入的多轮对话，都沿用最新飞书发起人的回复位置和 @，以普通回复卡发送，不附加终端来源或复述输入。每个终端回合开始时固定回复对象，新飞书消息只影响之后开始的回合；`/model` 等设置命令、菜单输出和已有历史不回传。该行为复用原生转写监听，不增加开关或 prompt；普通模式和 `/adopt` 保持原行为。
+
+没有通过 @ 发起 bot 回报时，已建立签名回报绑定的 `botmux dispatch --bot-app <稳定 App ID>` 派单仍可自动回报原 lead：sub 的 daemon 根据绑定去掉自动附加的 report/send 指令，每轮最终回答回报一次，不自动判定任务完成。回报使用独立重试和持久化去重回执，失败不影响子会话回复；lead 正常在原会话回复，不进入 HTTP 结果轮询。提交结果不明时拒绝自动重放。`dispatch --into` 向此前没有派单记录的普通消息追加任务不会创建该绑定，仍会保留完成指令，不能据此验证零注入。
+
 ## 支持的 CLI / Agent
 
 `bots.json` 里用 `cliId` 一键切换。**20+ 适配器**，覆盖本地 CLI（进程隔离，`tmux attach` 可直连）和 API / 云 Agent（如 Mira、riff——通过 API / 远端接入，非本地进程；mojo 为 API 驱动、默认在宿主机执行工具，可配 cloud: true 走云沙箱）。代表项：

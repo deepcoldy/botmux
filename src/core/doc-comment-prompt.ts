@@ -1,3 +1,4 @@
+import { sessionPromptInjection } from './prompt-injection.js';
 import type { Brand } from '../im/lark/lark-hosts.js';
 import type { Locale } from '../i18n/index.js';
 import type { CliId } from '../adapters/cli/types.js';
@@ -125,6 +126,7 @@ export function buildDocWatchWarmupTurnInput(args: {
         sender: args.sender,
         larkAppId: ds.larkAppId,
         sessionBackendType: ds.session.backendType,
+        promptInjection: sessionPromptInjection(ds),
         turnId: args.turnId,
         chatId: ds.session.chatId,
         whiteboardId: ds.session.whiteboardId,
@@ -293,6 +295,7 @@ export function buildDocCommentTurnInput(args: {
         sender: args.sender,
         larkAppId: ds.larkAppId,
         sessionBackendType: ds.session.backendType,
+        promptInjection: sessionPromptInjection(ds),
         turnId: args.turnId,
         chatId: ds.session.chatId,
         whiteboardId: ds.session.whiteboardId,

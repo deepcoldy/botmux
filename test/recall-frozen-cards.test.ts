@@ -14,6 +14,11 @@ import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 
 // ─── Mocks ─────────────────────────────────────────────────────────────────
 
+const { loggerWarnMock, loggerDebugMock } = vi.hoisted(() => ({
+  loggerWarnMock: vi.fn(),
+  loggerDebugMock: vi.fn(),
+}));
+
 const deleteMessageMock = vi.fn(async (_appId: string, _messageId: string) => {});
 const updateMessageMock = vi.fn(async (_appId: string, _messageId: string, _json: string) => {});
 const pinMessageMock = vi.fn(async (appId: string, messageId: string) => ({
@@ -47,7 +52,7 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
-  logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
+  logger: { info: vi.fn(), warn: loggerWarnMock, debug: loggerDebugMock, error: vi.fn() },
 }));
 
 vi.mock('../src/im/lark/card-builder.js', () => ({
@@ -201,6 +206,8 @@ beforeEach(() => {
   loadFrozenCardsMock.mockReset();
   loadFrozenCardsMock.mockReturnValue(new Map());
   persistStreamCardStateMock.mockClear();
+  loggerWarnMock.mockClear();
+  loggerDebugMock.mockClear();
   buildStreamingCardMock.mockClear();
   getBotMock.mockReturnValue({
     config: { larkAppId: APP_ID, cliId: 'claude-code' },
@@ -1309,6 +1316,32 @@ describe('scheduleCardPatch expired (230031) handling', () => {
 });
 
 describe('scheduleCardPatch adjacent duplicate handling', () => {
+  it('warns once per minute for user-triggered PATCH failures with sanitized Lark fields', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-25T00:00:00Z'));
+    const ds = makeDs();
+    ds.streamCardId = 'om_USER';
+    const failure = Object.assign(new Error('request failed'), {
+      response: {
+        status: 400,
+        data: { code: 230001, msg: 'card cannot be updated', log_id: 'log_safe' },
+      },
+      config: { headers: { Authorization: 'Bearer secret' } },
+    });
+    updateMessageMock.mockRejectedValue(failure);
+
+    scheduleCardPatch(ds, '{"state":1}', undefined, { userInitiated: true });
+    await vi.runAllTimersAsync();
+    scheduleCardPatch(ds, '{"state":2}', undefined, { userInitiated: true });
+    await vi.runAllTimersAsync();
+
+    expect(loggerWarnMock).toHaveBeenCalledTimes(1);
+    const warning = String(loggerWarnMock.mock.calls[0]?.[0]);
+    expect(warning).toContain('HTTP 400 code=230001 card cannot be updated log_id=log_safe');
+    expect(warning).not.toContain('Bearer secret');
+    expect(loggerDebugMock).toHaveBeenCalledTimes(1);
+  });
+
   it('drops an identical PATCH queued for the same card after the in-flight PATCH succeeds', async () => {
     const ds = makeDs();
     ds.streamCardId = 'om_SAME';

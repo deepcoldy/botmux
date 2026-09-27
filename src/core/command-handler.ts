@@ -2,6 +2,7 @@
  * Command handler — processes /slash commands from users.
  * Extracted from daemon.ts for modularity.
  */
+import { sessionPromptInjection, supportsZeroPromptInjection, type PromptInjection } from './prompt-injection.js';
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { join, resolve, basename } from 'node:path';
@@ -207,7 +208,8 @@ function cliSelectionSnapshot(cliId: CliId): SessionCliLaunchSnapshotV1 {
   };
 }
 
-function cliSelectionSecurityError(botCfg: { env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean }, cliId: string): string | undefined {
+function cliSelectionSecurityError(botCfg: { env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean }, cliId: string, promptInjection: PromptInjection): string | undefined {
+  if (promptInjection === 'none' && !supportsZeroPromptInjection(cliId, botCfg)) return 'zero prompt injection requires a CLI with automatic final reply capture';
   if (cliId === 'riff') return 'Riff requires bot-level backend configuration and cannot be selected per session';
   if (botCfg.env && Object.keys(botCfg.env).length > 0) return 'CLI-selected sessions cannot use bot env';
   if (botCfg.backendType === 'riff' || botCfg.riff !== undefined) return 'CLI-selected sessions cannot use Riff';
@@ -1818,7 +1820,7 @@ export async function handleCommand(
           await sessionReply(rootId, t('daemon.cmd_allowed_users_only', { cmd: '/cli' }, loc));
           break;
         }
-        const securityError = cliSelectionSecurityError(botCfg, selectedCliId);
+        const securityError = cliSelectionSecurityError(botCfg, selectedCliId, sessionPromptInjection(ds));
         if (securityError) {
           await sessionReply(rootId, `CLI selection rejected: ${securityError}`);
           break;

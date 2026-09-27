@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { chmodSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
@@ -14,15 +14,27 @@ beforeAll(() => { chmodSync(FIXTURE, 0o755); });
 
 type EngineDependencies = NonNullable<ConstructorParameters<typeof CodexRpcEngine>[1]>;
 
+// The fixture is spawned `detached` + `unref()`ed, so only engine.stop() kills it.
+// Tests call stop() on their last line; if an assertion throws first, the fake
+// app-server outlives vitest as an orphan holding a port. Stop every engine after
+// each test regardless of outcome (stop() is idempotent).
+const liveEngines = new Set<CodexRpcEngine>();
+afterEach(() => {
+  for (const engine of liveEngines) engine.stop();
+  liveEngines.clear();
+});
+
 function makeEngine(
   over: Partial<ConstructorParameters<typeof CodexRpcEngine>[0]> = {},
   dependencies?: EngineDependencies,
 ) {
-  return new CodexRpcEngine({
+  const engine = new CodexRpcEngine({
     cliBin: FIXTURE, cwd: tmpdir(), env: process.env,
     sessionId: `test-${Math.round(performance.now())}-${over.sessionId ?? ''}`,
     ...over,
   }, dependencies);
+  liveEngines.add(engine);
+  return engine;
 }
 const owner = (turnId: string, dispatchAttempt?: number) => ({
   turnId,
