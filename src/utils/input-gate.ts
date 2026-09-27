@@ -186,10 +186,11 @@ export function decidePostHookPromptEvidence(state: {
  * Arm only when the boundary was still unresolved at the timeout, nothing was
  * queued, and nobody typed into the web terminal since the boundary: a queued
  * message is flushed by the timeout itself and its reply redraws the prompt
- * through the normal path; typed input echoes a redraw of its own. By the time the timeout fires the
- * transcript replay is long over, so the replay concern that keeps the boundary
- * fallback startup-only does not apply; the caller still requires a quiet PTY
- * and a framed input box (see `screenShowsFramedPrompt`).
+ * through the normal path; typed input echoes a redraw of its own. By the time
+ * the timeout fires the transcript replay is long over, so the replay concern
+ * that keeps the boundary fallback startup-only does not apply; the caller
+ * still requires a quiet PTY and a framed input box (see
+ * `screenShowsFramedPrompt`).
  */
 export function shouldArmFirstPromptTimeoutPromptSeed(state: {
   /** `awaitingPostSessionStartPromptEvidence` as it was when the timeout fired. */
@@ -250,7 +251,9 @@ const INPUT_BOX_RULE = /^\s*─{8,}\s*$/;
  * A bare `readyPattern.test(screen)` also matches a selector's `❯ 1. Yes`
  * (startup / trust / hook dialogs) and any ❯ left in the replayed transcript.
  * Neither is framed by rules on both sides, so they are rejected here. Pass the
- * rendered viewport (`renderer.rawSnapshot()`), not the appended PTY log.
+ * rendered viewport with box drawing kept
+ * (`renderer.rawSnapshot({ preserveFormatting: true })`) — the default snapshot
+ * turns every `─` into a space — and never the appended PTY log.
  */
 export function screenShowsFramedPrompt(screen: string, readyPattern: RegExp): boolean {
   if (!screen) return false;

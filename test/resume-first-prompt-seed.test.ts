@@ -14,6 +14,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { IdleDetector } from '../src/utils/idle-detector.js';
 import { InflightInputTracker } from '../src/core/inflight-input-tracker.js';
+import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 import {
   decidePostHookPromptEvidence,
   firstPromptSeedStillWaiting,
@@ -292,7 +293,9 @@ describe('worker 接线（source-lock）', () => {
       source.indexOf('function screenShowsFramedReadyPrompt'),
       seedStart,
     );
-    expect(probe).toContain('renderer?.rawSnapshot()');
+    expect(probe).toContain('renderer?.rawSnapshot({ preserveFormatting: true })');
+    // 默认 rawSnapshot() 会把 ─ 清洗成空格，框线判据在真实画面上恒为 false。
+    expect(probe).not.toMatch(/rawSnapshot\(\)/);
     expect(probe).toContain('screenShowsFramedPrompt(screen, pattern)');
     expect(probe).toContain('catch { return false; }');
   });
@@ -312,5 +315,43 @@ describe('InflightInputTracker.hasUnacked', () => {
     expect(tracker.hasUnacked()).toBe(true);
     tracker.onTurnComplete();
     expect(tracker.hasUnacked()).toBe(false);
+  });
+});
+
+describe('screenShowsFramedPrompt × 真实 TerminalRenderer（渲染清洗层）', () => {
+  const COLS = 80;
+  const rule = '─'.repeat(COLS);
+  // 与 claude 的实际输出同形：框线带颜色转义、行间用 \r\n，框线占满整行。
+  const frame = [
+    '⏺ Done.',
+    '',
+    `\x1b[2m${rule}\x1b[0m`,
+    '\x1b[1m❯\x1b[0m ',
+    `\x1b[2m${rule}\x1b[0m`,
+    '  ⏵⏵ bypass permissions on (shift+tab to cycle)',
+  ].join('\r\n');
+
+  it('preserveFormatting 快照保留框线 → 判定为输入框', async () => {
+    const r = new TerminalRenderer(COLS, 24);
+    await r.writeAndFlush(frame);
+    expect(screenShowsFramedPrompt(r.rawSnapshot({ preserveFormatting: true }), CLAUDE_READY)).toBe(true);
+  });
+
+  it('默认快照把 ─ 清洗成空格 → 判定失败（worker 必须传 preserveFormatting）', async () => {
+    const r = new TerminalRenderer(COLS, 24);
+    await r.writeAndFlush(frame);
+    expect(screenShowsFramedPrompt(r.rawSnapshot(), CLAUDE_READY)).toBe(false);
+  });
+
+  it('真实渲染下选择器依旧被拒', async () => {
+    const r = new TerminalRenderer(COLS, 24);
+    await r.writeAndFlush([
+      rule,
+      ' Do you trust the files in this folder?',
+      '',
+      ' ❯ 1. Yes, proceed',
+      '   2. No, exit',
+    ].join('\r\n'));
+    expect(screenShowsFramedPrompt(r.rawSnapshot({ preserveFormatting: true }), CLAUDE_READY)).toBe(false);
   });
 });

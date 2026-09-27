@@ -8681,12 +8681,13 @@ function armPostHookPromptEvidenceFallback(
   postHookEvidenceFallbackTimer.unref?.();
 }
 
-/** 当前渲染画面里，最后一个提示符是否落在上下都有横线的输入框里（见 screenShowsFramedPrompt）。 */
+/** 当前渲染画面里，最后一个提示符是否落在上下都有横线的输入框里（见 screenShowsFramedPrompt）。
+ *  必须 preserveFormatting：默认的 rawSnapshot() 会把 ─ 清洗成空格，框线判据永远不成立。 */
 function screenShowsFramedReadyPrompt(): boolean {
   const pattern = cliAdapter?.readyPattern;
   if (!pattern) return false;
   let screen = '';
-  try { screen = renderer?.rawSnapshot() ?? ''; } catch { return false; }
+  try { screen = renderer?.rawSnapshot({ preserveFormatting: true }) ?? ''; } catch { return false; }
   return screenShowsFramedPrompt(screen, pattern);
 }
 
