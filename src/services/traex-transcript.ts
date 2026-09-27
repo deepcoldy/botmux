@@ -45,7 +45,7 @@ import {
   statSync,
   type Dirent,
 } from 'node:fs';
-import { execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { platform } from 'node:os';
 import { isAbsolute, join, relative, sep } from 'node:path';
 import {
@@ -104,6 +104,7 @@ const TRAEX_SESSION_META_SCAN_MAX_BYTES = 4 * 1024 * 1024;
 const TRAEX_ROLLOUT_LOOKUP_INITIAL_BACKOFF_MS = 2_000;
 const TRAEX_ROLLOUT_LOOKUP_MAX_BACKOFF_MS = 8_000;
 const TRAEX_ROLLOUT_LOOKUP_MISS_CACHE_MAX = 256;
+const TRAEX_LSOF_TIMEOUT_MS = 1_000;
 const TRAEX_YEAR_DIR_RE = /^\d{4}$/;
 const TRAEX_MONTH_DIR_RE = /^(?:0[1-9]|1[0-2])$/;
 const TRAEX_DAY_DIR_RE = /^(?:0[1-9]|[12]\d|3[01])$/;
@@ -1169,7 +1170,13 @@ function traexProcessOpenTargets(pid: number): string[] | undefined {
   }
   let out: string;
   try {
-    out = execSync(`lsof -p ${pid} -Fn`, { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+    out = execFileSync('lsof', ['-p', String(pid), '-Fn'], {
+      encoding: 'utf-8',
+      timeout: TRAEX_LSOF_TIMEOUT_MS,
+      killSignal: 'SIGKILL',
+      maxBuffer: 4 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
   } catch {
     return undefined;
   }
