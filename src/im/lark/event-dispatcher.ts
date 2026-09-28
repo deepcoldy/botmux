@@ -3421,7 +3421,10 @@ function parseCommentEvent(data: any): {
     replyId: pick('reply_id'),
     noticeType: pick('notice_type'),
     isMentioned: d.is_mentioned === true || m.is_mentioned === true,
-    operatorOpenId: d.operator_id?.open_id ?? d.user_id?.open_id ?? m.operator_id?.open_id,
+    // comment_add_v1 puts the actor in notice_meta.from_user_id; to_user_id
+    // is the notification recipient, never the person who wrote the comment.
+    operatorOpenId: d.operator_id?.open_id ?? d.user_id?.open_id ?? m.operator_id?.open_id
+      ?? d.from_user_id?.open_id ?? m.from_user_id?.open_id,
     meta,
   };
 }
@@ -3744,6 +3747,10 @@ async function processCommentEvent(
     return;
   }
   const triggerIndex = Math.max(0, comment.replies.indexOf(trigger));
+  // Older/incomplete event payloads may omit the actor. Once the trigger reply
+  // is available, use its author for both audit paths instead of reporting '?'.
+  // Preserve an explicit event operator (e.g. an edit by a different person).
+  const requesterOpenId = parsed.operatorOpenId || trigger.userId;
 
   // 3) 自触发过滤（防死循环）：bot 的回复可能以应用身份（作者=bot open_id）或回退
   //    用户身份（作者=授权用户，无法靠作者区分）发出。三重保险：①作者==本 bot
@@ -3785,7 +3792,7 @@ async function processCommentEvent(
     if (markEligible) {
       const outcome = await markCommentEventDropped(
         larkAppId, { fileToken, fileType: sub.fileType }, commentId,
-        trigger.replyId || parsed.replyId, parsed.operatorOpenId,
+        trigger.replyId || parsed.replyId, requesterOpenId,
         '纯 @bot，无文本正文，bot 未处理，准备留下失败标记',
         rollbackAutoSub,
       );
@@ -3801,7 +3808,7 @@ async function processCommentEvent(
   // （owner 自己触发的不通知，直接放行。）
   // 走同一个 helper —— 「回复」和「失败标记」共用一套规则，规则分叉迟早会让
   // 其中一条悄悄绕过审计（本 PR 就险些如此）。这里传的是真实评论正文摘要。
-  if (!await passesDocCommentAuditGate(larkAppId, fileToken, parsed.operatorOpenId, text, rollbackAutoSub)) return;
+  if (!await passesDocCommentAuditGate(larkAppId, fileToken, requesterOpenId, text, rollbackAutoSub)) return;
 
   const delivery: DocCommentContext = {
     larkAppId,
@@ -5268,7 +5275,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         if (isCommentish) {
           const ev = data?.event ?? data;
           const p = parseCommentEvent(data);
-          logger.info(`[ws-event] ${larkAppId} event_type=${et} → parsed fileToken=${p.fileToken ?? '?'} commentId=${p.commentId ?? '?'} replyId=${p.replyId ?? '?'} isMentioned=${p.isMentioned} | notice_meta=${JSON.stringify(ev?.notice_meta ?? ev?.noticeMeta ?? null)}`);
+          logger.info(`[ws-event] ${larkAppId} event_type=${et} → parsed fileToken=${p.fileToken ?? '?'} commentId=${p.commentId ?? '?'} replyId=${p.replyId ?? '?'} isMentioned=${p.isMentioned} operatorOpenId=${p.operatorOpenId ?? '?'} | notice_meta=${JSON.stringify(ev?.notice_meta ?? ev?.noticeMeta ?? null)}`);
         } else if (isVcMeeting) {
           const kind: VcMeetingPushEventKind = et === VC_BOT_MEETING_INVITED_EVENT
             ? 'meeting_invited'
