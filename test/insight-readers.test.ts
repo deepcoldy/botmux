@@ -151,6 +151,57 @@ describe('Codex item_completed insight', () => {
     expect(parsed.spans.every(span => span.phase === 'run' && span.status === 'ok')).toBe(true);
   });
 
+  it('projects mixed-dialect calls once, including cross-type calls, while preserving unmatched legacy calls', () => {
+    const path = fp('codex-mixed-calls.jsonl');
+    const call = (call_id: string, name: string, args: object) => ({
+      type: 'response_item', payload: { type: 'function_call', call_id, name, arguments: JSON.stringify(args) },
+    });
+    const output = (call_id: string) => ({
+      type: 'response_item', payload: { type: 'function_call_output', call_id, output: 'Process exited with code 1' },
+    });
+    const completed = (item: object) => ({
+      type: 'event_msg', payload: { type: 'item_completed', turn_id: 't0', item },
+    });
+    writeFileSync(path, [
+      call('cmd', 'exec_command', { cmd: 'npm test' }), output('cmd'),
+      { type: 'response_item', payload: { type: 'custom_tool_call', call_id: 'patch', name: 'apply_patch', input: '*** Begin Patch\n*** Add File: a.ts\n+x\n*** End Patch' } },
+      { type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'patch', output: 'patch failed' } },
+      call('shell-patch', 'exec_command', { cmd: "apply_patch <<'PATCH'" }), output('shell-patch'),
+      call('mcp-alias', '_get_pr_info', { id: 1 }), output('mcp-alias'),
+      call('collab', 'wait_agent', { id: 'agent' }), output('collab'),
+      call('stdin', 'write_stdin', { session_id: 1 }), output('stdin'),
+      completed({ type: 'CommandExecution', id: 'cmd', command: ['npm', 'test'], status: 'completed', exit_code: 0 }),
+      completed({ type: 'FileChange', id: 'patch', changes: { 'a.ts': { unified_diff: '+x' } } }),
+      completed({ type: 'FileChange', id: 'shell-patch', changes: { 'b.ts': { unified_diff: '+y' } } }),
+      completed({ type: 'McpToolCall', id: 'mcp-alias', server: 'github', tool: 'get_pr_info', status: 'completed' }),
+      completed({ type: 'CollabAgentToolCall', id: 'collab', tool: 'wait', status: 'completed' }),
+    ].map(entry => JSON.stringify(entry)).join('\n') + '\n');
+    const parsed = parseCodexInsight(path);
+    expect(parsed.spans.map(span => [span.tool, span.phase, span.status])).toEqual([
+      ['write_stdin', 'edit', 'error'],
+      ['exec_command', 'run', 'ok'],
+      ['apply_patch', 'edit', 'ok'],
+      ['apply_patch', 'edit', 'ok'],
+      ['github.get_pr_info', 'discuss', 'ok'],
+      ['wait', 'delegate', 'ok'],
+    ]);
+  });
+
+  it('retains legacy calls sharing IDs only with unprojected completed items', () => {
+    const path = fp('codex-unprojected-ids.jsonl');
+    writeFileSync(path, [
+      { type: 'response_item', payload: { type: 'function_call', call_id: 'subagent', name: 'spawn_agent', arguments: '{}' } },
+      { type: 'response_item', payload: { type: 'function_call_output', call_id: 'subagent', output: 'agent started' } },
+      { type: 'response_item', payload: { type: 'function_call', call_id: 'search', name: 'search', arguments: '{}' } },
+      { type: 'response_item', payload: { type: 'function_call_output', call_id: 'search', output: 'found' } },
+      { type: 'event_msg', payload: { type: 'item_completed', item: { type: 'SubAgentActivity', id: 'subagent' } } },
+      { type: 'event_msg', payload: { type: 'item_completed', item: { type: 'WebSearch', id: 'search' } } },
+    ].map(entry => JSON.stringify(entry)).join('\n') + '\n');
+    const parsed = parseCodexInsight(path);
+    expect(parsed.spans).toHaveLength(2);
+    expect(parsed.spans.map(span => [span.tool, span.status])).toEqual([['spawn_agent', 'ok'], ['search', 'ok']]);
+  });
+
   it('safely projects MCP results and classifies collaboration as delegate', () => {
     const parsed = codexItems([
       { type: 'McpToolCall', server: 'fs', tool: 'read_file', arguments: { path: '/repo/a.ts', token: 'private-argument' }, status: 'completed', result: { text: 'TOKEN=secret' } },

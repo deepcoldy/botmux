@@ -255,6 +255,18 @@ export function parseCodexInsight(path: string, opts: InsightReaderOptions = {})
   // without ANY CommandExecution items use wrappers as the fallback spans.
   const allowExecFallback = !read.entries.some(entry => entry?.type === 'event_msg'
     && entry.payload?.type === 'item_completed' && entry.payload.item?.type === 'CommandExecution');
+  // Transitional rollouts can record one call in both dialects with the same ID.
+  // Only completed items that this reader actually projects replace legacy spans.
+  const projectedItemIds = new Set<string>();
+  for (const entry of read.entries) {
+    if (entry?.type !== 'event_msg' || entry.payload?.type !== 'item_completed') continue;
+    const item = entry.payload.item;
+    if (typeof item?.id === 'string'
+      && (item.type === 'CommandExecution' || item.type === 'FileChange'
+        || item.type === 'McpToolCall' || item.type === 'CollabAgentToolCall')) {
+      projectedItemIds.add(item.id);
+    }
+  }
   let pendingPromptMirror: { text: string; ms?: number; dialect: 'legacy' | 'item'; turnId?: string } | undefined;
   const addPrompt = (raw: string, dialect: 'legacy' | 'item', ms: number | undefined, turnId: unknown): void => {
     // Compare full extracted text before scrubbing/truncation: distinct prompts
@@ -322,6 +334,7 @@ export function parseCodexInsight(path: string, opts: InsightReaderOptions = {})
 
     const tool = entry?.type === 'response_item' ? normalizeCodexTool(payload, allowExecFallback) : null;
     if (tool) {
+      if (typeof payload.call_id === 'string' && projectedItemIds.has(payload.call_id)) continue;
       const span: RawInsightSpan = {
         tool,
         phase: phaseForTool(tool),
