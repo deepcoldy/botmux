@@ -7,8 +7,7 @@
 
 import type { ServerResponse } from 'node:http';
 import { registerAsk } from './ask-broker.js';
-import type { CreateAskInput, AskResult } from './ask-types.js';
-import type { AskOption, AskQuestion } from './ask-types.js';
+import type { CreateAskInput, AskResult, AskOption, AskQuestion } from './ask-types.js';
 
 export interface AskApiBody {
   sessionId: string;

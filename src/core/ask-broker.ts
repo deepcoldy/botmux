@@ -415,7 +415,8 @@ function sendCardForAsk(ask: InternalPending): void {
         if (cur) {
           cur.cardMessageId = messageId;
           // The caller can disconnect while send is in flight. The earlier
-          // terminal notification had no messageId to patch; update it now.
+          // standalone-card notification had no messageId to patch; update it
+          // now. Reply-card settlement does not need that id and is idempotent.
           if (cur.settled && cur.terminalResult) {
             notifyOnSettle(cur, cur.terminalResult);
             return;
@@ -941,6 +942,9 @@ function settle(askId: string, result: AskResult): void {
   ask.settled = true;
   ask.settledAt = Date.now();
   ask.terminalResult = result; // retained for a same-requestId replay in the ambiguous window
+  // Terminal non-answers must replay directly instead of reattaching a waiter.
+  // The answered-stash branch above keeps dormant until its answer is claimed.
+  ask.dormant = false;
   clearTimeout(ask.timeoutHandle);
   // The durable record's job is done the moment the ask leaves the pending
   // state (delivered to live waiters, or a terminal non-answer) — drop it so a

@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   _resetForTest, _pendingCount, findPendingAskByAnchor, registerAsk,
   registerHostAsk, setCardDispatcher, setCanTalkChecker, submitCustomReply,
-  tryResolveAsk,
+  tryResolveAsk, invalidateReplyCardAsks,
 } from '../src/core/ask-broker.js';
 import { registerAskForResponse } from '../src/core/ask-api.js';
 import type { CreateAskInput, PendingAsk, AskResult } from '../src/core/ask-types.js';
@@ -27,7 +27,7 @@ beforeEach(() => {
     onSettle(ask, result) { settled.push({ ask, result }); },
   });
 });
-afterEach(() => { _resetForTest(); });
+afterEach(() => { _resetForTest(); vi.useRealTimers(); });
 const answer = () => submitCustomReply({ askId: cards[0].askId, by: 'user', text: 'A follow-up question' });
 
 describe('ask caller lifetime', () => {
@@ -101,6 +101,37 @@ describe('ask caller lifetime', () => {
     expect(await registerAsk(hook)).toMatchObject({ kind: 'answered', comment: 'A follow-up question' });
     expect(cards).toHaveLength(1);
   });
+
+  it.each(['timedOut', 'invalidated'] as const)(
+    'replays %s when a disconnected resumable hook reconnects after settlement',
+    async kind => {
+      vi.useFakeTimers();
+      const hook = {
+        ...input, originKind: 'hook', backendSurvivesRestart: true, timeoutMs: 1_000,
+        replyCardTarget: { turnId: 'turn' },
+      };
+      const controller = new AbortController();
+      const first = registerAsk(hook, controller.signal);
+      await Promise.resolve();
+      controller.abort();
+      expect(await first).toMatchObject({ kind: 'invalidated' });
+      expect(_pendingCount()).toBe(1);
+      if (kind === 'timedOut') {
+        await vi.advanceTimersByTimeAsync(1_000);
+      } else {
+        invalidateReplyCardAsks({ larkAppId: 'app', sessionId: 'session', turnId: 'turn' }, 'turn ended');
+      }
+      expect(_pendingCount()).toBe(0);
+      expect(settled).toHaveLength(1);
+      expect(settled[0].result).toMatchObject({ kind });
+      const replayed = vi.fn();
+      void registerAsk(hook).then(replayed);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(replayed).toHaveBeenCalledExactlyOnceWith(settled[0].result);
+      expect(cards).toHaveLength(1);
+      expect(findPendingAskByAnchor(anchor)).toBeUndefined();
+    },
+  );
 
   it('reattaches a hook before the answer and still tracks the new connection', async () => {
     const hook = { ...input, originKind: 'hook', backendSurvivesRestart: true };
