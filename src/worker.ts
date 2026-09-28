@@ -23,6 +23,7 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { sessionIdentityBinDir, prepareTriggerUserCliEnv, publishActiveTurn, GIT_ASKPASS_BASENAME } from './core/cli-identity.js';
+import { prepareLarkToolEnv, usesLarkToolBinding, larkToolBindingPath } from './core/lark-tool-binding.js';
 import { tokenStoreProtection } from './services/trigger-user-auth.js';
 import { installAidenCodexShim } from './services/aiden-codex-shim.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
@@ -139,7 +140,6 @@ import { runRemoteRunnerSessionTool } from './services/remote-runner-session-too
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { spawnHasStartupWork } from './core/initial-native-rename.js';
-import { sanitizePerBotEnv } from './core/per-bot-env.js';
 import { botInjectedEnv, buildSessionChildEnv } from './core/env-policy.js';
 import { envPolicyRequiresColdStart, readEnvPolicyStamp, writeEnvPolicyStamp } from './services/env-policy-stamp.js';
 import { cliModelSupportsReasoningEffort } from './services/codex-reasoning-effort.js';
@@ -1318,7 +1318,13 @@ async function engageCodexRpc(cfg: Extract<DaemonToWorker, { type: 'init' }>): P
     // matching every other backend and preventing stale owner resurrection.
     applySessionOwnerEnv(engineEnv, cfg.ownerOpenId);
     // RPC shell tools execute here, before the viewer CLI is even spawned.
-    prepareTriggerUserCliEnv(engineEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, cfg.triggerUserAuth, log);
+    const boundLark = !!process.env.SESSION_DATA_DIR && usesLarkToolBinding(cfg, process.env.SESSION_DATA_DIR, isWorkflowWorker());
+    const identityPolicy = boundLark && cfg.triggerUserAuth
+      ? { ...cfg.triggerUserAuth, tools: cfg.triggerUserAuth.tools.filter(tool => tool !== 'lark-cli') }
+      : cfg.triggerUserAuth;
+    prepareTriggerUserCliEnv(engineEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, identityPolicy, log);
+    if (boundLark) prepareLarkToolEnv({ env: engineEnv, dataDir: process.env.SESSION_DATA_DIR!,
+      sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand });
     engine = new CodexRpcEngine({
       cliBin, cwd: cfg.workingDir, env: engineEnv, sessionId: cfg.sessionId,
       model: cfg.model, modelBackendVariant: cfg.modelBackendVariant, reasoningEffort: cfg.reasoningEffort, log: (m: string) => log(m),
@@ -17276,6 +17282,7 @@ async function spawnCli(
     }
   }
   const perBotInjectEnv = botInjectedEnv(cfg.env, cfg.envPolicy);
+  const boundLark = !!process.env.SESSION_DATA_DIR && usesLarkToolBinding(cfg, process.env.SESSION_DATA_DIR, isWorkflowWorker());
   if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(perBotInjectEnv);
   const cliExtra = cliAdapter.allowExtraArgs === false
     ? ''
@@ -17298,7 +17305,7 @@ async function spawnCli(
   };
   if (cfg.chatType) identityShellEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
   if (cfg.rootMessageId?.startsWith('om_')) identityShellEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
-  if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {
+  if ((cfg.triggerUserAuth?.enabled || boundLark) && process.env.SESSION_DATA_DIR) {
     const dir = sessionIdentityBinDir(process.env.SESSION_DATA_DIR, cfg.sessionId);
     identityShellEnv.SESSION_DATA_DIR = process.env.SESSION_DATA_DIR;
     identityShellEnv.BOTMUX_IDENTITY_BIN = dir;
@@ -17309,9 +17316,13 @@ async function spawnCli(
     // governed — that is the exact condition under which installGitAskpass
     // writes the file, and pointing GIT_ASKPASS at a missing path would break
     // git prompts rather than fall back.
-    if (cfg.triggerUserAuth.tools.includes('bytedcli')) {
+    if (cfg.triggerUserAuth?.enabled && cfg.triggerUserAuth.tools.includes('bytedcli')) {
       identityShellEnv.GIT_ASKPASS = join(dir, GIT_ASKPASS_BASENAME);
     }
+  }
+  if (boundLark) {
+    identityShellEnv.BOTMUX_LARK_TOOL_BINDING = larkToolBindingPath(process.env.SESSION_DATA_DIR!, cfg.sessionId);
+    if (process.env.BOTMUX_DAEMON_IPC_PORT) identityShellEnv.BOTMUX_DAEMON_IPC_PORT = process.env.BOTMUX_DAEMON_IPC_PORT;
   }
   const args = cliAdapter.buildArgs({
     sessionId: effectiveAdapterSessionId,
@@ -17484,7 +17495,12 @@ async function spawnCli(
   // (The tmux backend re-prepends this in its pane script after rcfile load; this covers the
   // pty/direct-spawn path, whose child inherits childEnv.PATH directly.)
   childEnv.PATH = prependBotmuxBin(resolveBotmuxWrapperBinDir(process.env), childEnv.PATH);
-  prepareTriggerUserCliEnv(childEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, cfg.triggerUserAuth, log);
+  const identityPolicy = boundLark && cfg.triggerUserAuth
+    ? { ...cfg.triggerUserAuth, tools: cfg.triggerUserAuth.tools.filter(tool => tool !== 'lark-cli') }
+    : cfg.triggerUserAuth;
+  prepareTriggerUserCliEnv(childEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, identityPolicy, log);
+  if (boundLark) prepareLarkToolEnv({ env: childEnv, dataDir: process.env.SESSION_DATA_DIR!,
+    sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand });
   if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {
     // Say plainly how protected the token store actually is. Without the file
     // sandbox the agent runs as the same OS user as botmux and can read every
@@ -17731,6 +17747,14 @@ async function spawnCli(
     perBotInjectEnv.KIMI_MODEL_THINKING_EFFORT = cfg.reasoningEffort;
   }
   if (cliAdapter.id === 'ebsd') assertEbsdPerBotEnv(perBotInjectEnv);
+  if (boundLark) {
+    const dir = sessionIdentityBinDir(process.env.SESSION_DATA_DIR!, cfg.sessionId);
+    perBotInjectEnv.PATH = [dir, ...(perBotInjectEnv.PATH ?? childEnv.PATH ?? '').split(':').filter(p => p !== dir)].join(':');
+    perBotInjectEnv.BOTMUX_IDENTITY_BIN = dir;
+    perBotInjectEnv.BOTMUX_LARK_TOOL_BINDING = childEnv.BOTMUX_LARK_TOOL_BINDING!;
+    perBotInjectEnv.ZDOTDIR = join(dir, 'shell');
+    perBotInjectEnv.BASH_ENV = join(dir, 'shell', 'bash_env.sh');
+  }
   const perBotInjectKeys = Object.keys(perBotInjectEnv);
   if (perBotInjectKeys.length) log(`Injecting ${perBotInjectKeys.length} per-bot env var(s): ${perBotInjectKeys.join(', ')}`);
   const hermesUsesBotmuxSessionProfile = basename(cfg.cliPathOverride ?? '') === 'hermes-botmux-session';

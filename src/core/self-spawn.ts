@@ -34,7 +34,8 @@ export type BotmuxEntry =
   // an adapter spawns one as the CLI session itself (`resolvedBin` is
   // process.execPath and the runner is argv[0]). They need the same treatment for
   // the same reason — see RUNNER_ENTRIES below.
-  | 'codex-app-runner' | 'dsh-runner' | 'mira-runner' | 'mir-runner' | 'minimax-runner';
+  | 'codex-app-runner' | 'dsh-runner' | 'mira-runner' | 'mir-runner'
+  | 'minimax-runner' | 'lark-tool-runner';
 
 /** Hidden CLI subcommand that runs a given entry inline (see cli.ts dispatch). */
 const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
@@ -50,6 +51,7 @@ const ENTRY_SUBCOMMAND: Record<BotmuxEntry, string> = {
   'mira-runner': '__mira-runner',
   'mir-runner': '__mir-runner',
   'minimax-runner': '__minimax-runner',
+  'lark-tool-runner': '__lark-tool-runner',
 };
 
 /** dist/<entry>.js filename for the Node path. */
@@ -66,6 +68,7 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
   'mira-runner': 'mira-runner.js',
   'mir-runner': 'mir-runner.js',
   'minimax-runner': 'minimax-runner.js',
+  'lark-tool-runner': 'lark-tool-runner.js',
 };
 
 /**
@@ -87,6 +90,7 @@ const ENTRY_SCRIPT: Record<BotmuxEntry, string> = {
  */
 export const RUNNER_ENTRIES: readonly BotmuxEntry[] = [
   'codex-app-runner', 'dsh-runner', 'mira-runner', 'mir-runner', 'minimax-runner',
+  'lark-tool-runner',
 ] as const;
 
 /**

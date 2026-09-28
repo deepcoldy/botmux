@@ -791,7 +791,7 @@ export function prepareTriggerUserCliEnv(
   childEnv: NodeJS.ProcessEnv, sessionDataDir: string | undefined, sessionId: string,
   policy: TriggerUserAuthConfig | undefined, log: (message: string) => void,
 ): void {
-  if (!policy?.enabled || !sessionDataDir) return;
+  if (!policy?.enabled || !policy.tools.length || !sessionDataDir) return;
   childEnv.SESSION_DATA_DIR = sessionDataDir;
   childEnv.BOTMUX_SESSION_ID = sessionId;
   const wrapperDir = sessionIdentityBinDir(sessionDataDir, sessionId);
