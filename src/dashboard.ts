@@ -3076,6 +3076,25 @@ async function transferTeamGroupOwner(args: {
   }
 }
 
+/** Dashboard has no daemon-local BotRegistry. Resolve personal feed-group
+ * credentials against the matching daemon's live allowlist, just like
+ * getOwnerOpenId does inside a daemon. Raw config / another app's open_id
+ * cannot establish ownership, including after an owner was revoked. */
+function withFeedGroupOwner(bot: BotConfig): BotConfig {
+  const allowed = registry.getByAppId(bot.larkAppId)?.resolvedAllowedUsers ?? [];
+  const ownerOpenId = bot.ownerOpenId && allowed.includes(bot.ownerOpenId)
+    ? bot.ownerOpenId
+    : allowed.find(id => id.startsWith('ou_'));
+  if (!ownerOpenId) {
+    throw new FeedGroupApiError(
+      '无法确认该机器人的负责人，请确认机器人已上线且管理员身份解析成功。',
+      'feed_group_owner_unresolved',
+      409,
+    );
+  }
+  return { ...bot, ownerOpenId };
+}
+
 function lifecycleBotIds(connector: ConnectorDefinition): string[] {
   return Array.from(new Set([connector.target.botId, ...(connector.target.botIds ?? [])].filter(Boolean)));
 }
@@ -7717,6 +7736,11 @@ const server = createServer(async (req, res) => {
       try { bot = loadBotConfigs().find(item => !item.apiOnly && (!appId || item.larkAppId === appId)); }
       catch { /* handled below */ }
       if (!bot) return jsonRes(res, 404, { ok: false, error: 'bot_not_found' });
+      try { bot = withFeedGroupOwner(bot); }
+      catch (error) {
+        const e = error as FeedGroupApiError;
+        return jsonRes(res, e.status, { ok: false, error: e.code, message: e.message });
+      }
       const { authUrl } = generateAuthUrl(
         bot.larkAppId,
         bot.larkAppSecret,
@@ -7752,7 +7776,7 @@ const server = createServer(async (req, res) => {
       let loginRequired = false;
       for (const bot of ordered) {
         try {
-          const groups = await listFeedGroups(bot);
+          const groups = await listFeedGroups(withFeedGroupOwner(bot));
           return jsonRes(res, 200, { ok: true, larkAppId: bot.larkAppId, groups });
         } catch (error) {
           if (error instanceof FeedGroupApiError && error.code === 'user_login_required') {
@@ -7888,7 +7912,8 @@ const server = createServer(async (req, res) => {
         const feedGroupAppId = typeof parsed.feedGroupAppId === 'string' ? parsed.feedGroupAppId.trim() : '';
         if (upstream.ok && upstreamJson.ok && typeof upstreamJson.chatId === 'string' && (existingFeedGroupId || newFeedGroupName)) {
           try {
-            const feedBot = loadBotConfigs().find(bot => bot.larkAppId === feedGroupAppId && !bot.apiOnly);
+            const configuredFeedBot = loadBotConfigs().find(bot => bot.larkAppId === feedGroupAppId && !bot.apiOnly);
+            const feedBot = configuredFeedBot ? withFeedGroupOwner(configuredFeedBot) : undefined;
             if (!feedBot) {
               upstreamJson.feedGroupError = '读取标签所用的机器人当前不可用。群聊已创建，但未加入标签。';
             } else {
@@ -8000,7 +8025,8 @@ const server = createServer(async (req, res) => {
       if (existingFeedGroupId || newFeedGroupName) {
         const feedGroupAppId = typeof parsed.feedGroupAppId === 'string' ? parsed.feedGroupAppId.trim() : '';
         try {
-          const feedBot = loadBotConfigs().find(bot => bot.larkAppId === feedGroupAppId && !bot.apiOnly);
+          const configuredFeedBot = loadBotConfigs().find(bot => bot.larkAppId === feedGroupAppId && !bot.apiOnly);
+          const feedBot = configuredFeedBot ? withFeedGroupOwner(configuredFeedBot) : undefined;
           if (!feedBot) {
             feedGroupError = '读取标签所用的机器人当前不可用。';
           } else {
