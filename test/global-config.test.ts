@@ -474,12 +474,14 @@ describe('global dashboard config', () => {
 
   it('keeps schedule delegation issuance and execution revocation independent', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
-      scheduleDelegation: { createEnabled: true, runEnabled: false, ignored: true },
+      scheduleDelegation: { createEnabled: true, runEnabled: false,
+        defaultOnDispatchFromBotAppIds: ['cli_orchestrator', 'bad', 'cli_orchestrator'], ignored: true },
     }));
     invalidateGlobalConfigCache();
     expect(readGlobalConfig().scheduleDelegation).toEqual({
       createEnabled: true,
       runEnabled: false,
+      defaultOnDispatchFromBotAppIds: ['cli_orchestrator'],
     });
   });
 

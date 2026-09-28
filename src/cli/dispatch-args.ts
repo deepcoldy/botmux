@@ -12,6 +12,7 @@ export interface DispatchArgs {
   standby: boolean;
   steer: boolean;
   delegates?: string[];
+  noDelegates?: string[];
   bots: string[];
   botApps: string[];
 }
@@ -43,6 +44,7 @@ const REPEATABLE_VALUE_FLAGS = new Map<string, 'bots' | 'botApps'>([
 ]);
 
 const DELEGATE_FLAG = '--delegate';
+const NO_DELEGATE_FLAG = '--no-delegate';
 
 const BOOLEAN_FLAGS = new Map<string, 'standby' | 'steer' | 'help'>([
   ['--standby', 'standby'],
@@ -89,13 +91,14 @@ export function parseDispatchArgs(args: readonly string[]): DispatchArgsResult {
 
     const singletonKey = VALUE_FLAGS.get(flag);
     const repeatableKey = REPEATABLE_VALUE_FLAGS.get(flag);
-    if (flag === DELEGATE_FLAG) {
+    if (flag === DELEGATE_FLAG || flag === NO_DELEGATE_FLAG) {
       const optionValue = equals >= 0 ? token.slice(equals + 1) : args[index + 1];
       if (optionValue === undefined || optionValue === '') {
         return fail('OPTION_VALUE_REQUIRED', `${flag} requires a value`, flag);
       }
       if (equals < 0) index += 1;
-      (value.delegates ??= []).push(optionValue);
+      if (flag === DELEGATE_FLAG) (value.delegates ??= []).push(optionValue);
+      else (value.noDelegates ??= []).push(optionValue);
       continue;
     }
     if (singletonKey || repeatableKey) {

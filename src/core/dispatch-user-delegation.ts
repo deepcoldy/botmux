@@ -26,8 +26,6 @@ const scheduleCreateCapabilitySchema = z.object({
   allowedExecutionPositions: z.array(z.enum(['top-level', 'topic'])).min(1).max(2),
   /** First release deliberately carries no long-lived personal tool identity. */
   allowedRunScopes: z.array(z.never()).max(0),
-  maxTasks: z.literal(1),
-  expiresAt: z.number().int().positive(),
 }).strict();
 const authorityV2Schema = z.object({
   appId: identity('cli_'),
@@ -56,7 +54,6 @@ const payloadV2Schema = z.object({
   domain: z.literal('botmux.dispatch-user.v2'),
   ...payloadBase,
   authority: authorityV2Schema,
-  expiresAt: z.number().int().positive(),
 }).strict();
 const payloadSchema = z.discriminatedUnion('domain', [payloadV1Schema, payloadV2Schema]);
 
@@ -112,7 +109,6 @@ export async function authorityForDispatch(input: {
   scheduleCreate?: {
     targetAppIds: string[];
     targetChatId: string;
-    expiresAt: number;
   };
   resolveUnionId: (appId: string, openId: string) => Promise<string | null>;
 }): Promise<DispatchUserAuthority | undefined> {
@@ -146,8 +142,6 @@ export async function authorityForDispatch(input: {
       targetChatId: input.scheduleCreate!.targetChatId,
       allowedExecutionPositions: ['top-level', 'topic'] as const,
       allowedRunScopes: [] as const,
-      maxTasks: 1 as const,
-      expiresAt: input.scheduleCreate!.expiresAt,
     })),
   });
 }
@@ -168,7 +162,7 @@ function readStore(dataDir: string): Record<string, unknown> {
 export async function deliverDispatchWithUser(input: {
   dataDir: string;
   secret: string;
-  payload: Omit<DispatchUserPayload, 'domain' | 'deliveryId' | 'issuedAt' | 'messageId' | 'expiresAt'>;
+  payload: Omit<DispatchUserPayload, 'domain' | 'deliveryId' | 'issuedAt' | 'messageId'>;
   send: () => Promise<string>;
 }): Promise<string> {
   const capabilities = scheduleCreateCapabilities(input.payload.authority);
@@ -180,9 +174,6 @@ export async function deliverDispatchWithUser(input: {
     targetAppIds: input.payload.targetAppIds, authority: input.payload.authority,
     domain: v2 ? 'botmux.dispatch-user.v2' : 'botmux.dispatch-user.v1',
     deliveryId: randomUUID(), issuedAt,
-    ...(v2 ? { expiresAt: Math.min(
-      ...capabilities.map(capability => capability.expiresAt),
-    ) } : {}),
   } as DispatchUserPayload);
   const key = `pending:${pending.payload.deliveryId}`;
   const path = dispatchUserStorePath(input.dataDir);
@@ -218,12 +209,10 @@ export async function resolveDispatchUser(input: {
   do {
     const store = readStore(input.dataDir);
     const exact = verifyDispatchUser(input.secret, store[input.turnId]);
-    if (exact && exact.messageId === input.turnId && matches(exact)
-      && (exact.domain === 'botmux.dispatch-user.v1' || Date.now() <= exact.expiresAt)) return exact;
+    if (exact && exact.messageId === input.turnId && matches(exact)) return exact;
     const pending = Object.entries(store).some(([key, raw]) => {
       const p = key.startsWith('pending:') ? verifyDispatchUser(input.secret, raw) : undefined;
-      return p && !p.messageId && matches(p) && Date.now() - p.issuedAt < 30_000
-        && (p.domain === 'botmux.dispatch-user.v1' || Date.now() <= p.expiresAt);
+      return p && !p.messageId && matches(p) && Date.now() - p.issuedAt < 30_000;
     });
     if (!pending || Date.now() >= deadline) return;
     await delay(25);

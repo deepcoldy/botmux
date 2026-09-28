@@ -113,6 +113,9 @@ describe('parseDispatchArgs', () => {
     const legacy = parseDispatchArgs(['--title', 'task']);
     expect(legacy).toMatchObject({ ok: true, value: { title: 'task' } });
     if (legacy.ok) expect('delegates' in legacy.value).toBe(false);
+    expect(parseDispatchArgs(['--no-delegate', 'schedule:create'])).toMatchObject({
+      ok: true, value: { noDelegates: ['schedule:create'] },
+    });
   });
 
   it('preserves help short-circuit even alongside incomplete or unknown arguments', () => {

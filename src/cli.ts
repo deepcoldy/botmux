@@ -8779,7 +8779,7 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
   }
   const allowedFlags = new Set([
     '--title', '--bot-app', '--chat-id', '--steer',
-    '--brief', '--brief-file', '--session-id', '--delegate',
+    '--brief', '--brief-file', '--session-id', '--delegate', '--no-delegate',
   ]);
   const unsupportedFlags = [...new Set(rest
     .filter(token => token.startsWith('--'))
@@ -8806,7 +8806,7 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
     brief = readFileSync(briefFile, 'utf8');
   }
   const flags: string[] = [];
-  for (const flag of ['--title', '--bot-app', '--chat-id', '--delegate'] as const) {
+  for (const flag of ['--title', '--bot-app', '--chat-id', '--delegate', '--no-delegate'] as const) {
     for (const value of argValues(rest, flag)) flags.push(flag, value);
   }
   if (rest.includes('--steer')) flags.push('--steer');
@@ -12491,7 +12491,9 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --brief-file <path>   从文件读取简报
   --steer               在简报前注入通用 @steer 指令；普通 dispatch 默认仍进入 Queue
   --delegate schedule:create
-                        请求把当前真人回合的一次性 schedule 创建权限委托给目标 Bot（需宿主策略开启）
+                        请求把当前真人回合的 schedule 创建权限委托给目标 Bot 当前派发 turn（需宿主策略开启）
+  --no-delegate schedule:create
+                        本次派发不附带来源 Bot 配置的默认 schedule 创建权限
   --repo <path>         预设子 bot 工作目录（绝对路径，需在子 bot 所在机器上存在）
   --standby             仅 --repo 待命，不派简报
   --into <root_id>      回到已有话题线程追加（与 --title/种子互斥）
@@ -12520,6 +12522,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const botSpecs = dispatchArgs.bots;
   const botAppSpecs = dispatchArgs.botApps;
   const delegateScheduleCreate = dispatchArgs.delegates?.includes('schedule:create') === true;
+  const suppressScheduleCreate = dispatchArgs.noDelegates?.includes('schedule:create') === true;
 
   let brief = dispatchArgs.brief ?? '';
   if (briefFile) {
@@ -12546,6 +12549,14 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   }
   if (dispatchArgs.delegates?.some(value => value !== 'schedule:create')) {
     console.error('--delegate 当前只支持 schedule:create。');
+    process.exit(1);
+  }
+  if (dispatchArgs.noDelegates?.some(value => value !== 'schedule:create')) {
+    console.error('--no-delegate 当前只支持 schedule:create。');
+    process.exit(1);
+  }
+  if (delegateScheduleCreate && suppressScheduleCreate) {
+    console.error('--delegate schedule:create 与 --no-delegate schedule:create 不能同时使用。');
     process.exit(1);
   }
   if (delegateScheduleCreate && (standby || botSpecs.length > 0 || botAppSpecs.length === 0)) {
@@ -12696,7 +12707,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       path: DISPATCH_USER_DELIVERY_ROUTE, sessionId: sid, larkAppId: appId,
       body: { rootId, chatId: targetChatId, content,
         targetAppIds: parsedBotApps.map(item => item.appId), hasLegacyBots: legacyBots.length > 0,
-        ...(delegateScheduleCreate ? { delegateScheduleCreate: true } : {}) },
+        ...(delegateScheduleCreate ? { delegateScheduleCreate: true } : {}),
+        ...(suppressScheduleCreate ? { suppressScheduleCreate: true } : {}) },
     });
     const result: any = await response.json();
     if (!response.ok || result?.ok !== true || typeof result.messageId !== 'string') {

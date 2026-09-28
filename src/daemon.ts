@@ -6707,8 +6707,11 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     const bot = getBot(ds.larkAppId).config;
     const turnId = ds.managedTurnOrigin?.turnId;
     const active = ds.activeInteractiveTurn;
-    const scheduleCreateRequested = body.delegateScheduleCreate === true;
-    if (scheduleCreateRequested && readGlobalConfig().scheduleDelegation?.createEnabled !== true) {
+    const delegationPolicy = readGlobalConfig().scheduleDelegation;
+    const scheduleCreateRequested = body.suppressScheduleCreate !== true
+      && (body.delegateScheduleCreate === true
+        || delegationPolicy?.defaultOnDispatchFromBotAppIds?.includes(ds.larkAppId) === true);
+    if (scheduleCreateRequested && delegationPolicy?.createEnabled !== true) {
       return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_disabled' });
     }
     const tools = bot.triggerUserAuth?.enabled === true ? bot.triggerUserAuth.tools : [];
@@ -6735,7 +6738,6 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
         scheduleCreate: {
           targetAppIds,
           targetChatId: chatId,
-          expiresAt: Date.now() + 5 * 60_000,
         },
       } : {}),
       resolveUnionId: resolveUnionIdFromOpenId,
@@ -6856,7 +6858,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
         ? scheduleCreateCapabilities(delegation.authority).find(item => item.action === 'schedule:create'
           && item.targetAppId === ds.larkAppId && item.targetChatId === ds.chatId)
         : undefined;
-      if (!delegation || !capability || Date.now() > capability.expiresAt) {
+      if (!delegation || !capability) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_missing' });
       }
       if (!capability.allowedExecutionPositions.includes(task.executionPosition)) {
@@ -6881,11 +6883,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     if (ds.managedTurnOrigin?.turnId !== turnId || ds.workerGeneration !== generation) {
       return jsonRes(res, 409, { ok: false, error: 'schedule_delegation_turn_changed' });
     }
-    const committedTaskId = direct
-      ? task.id
-      : createHash('sha256').update(`botmux.schedule.delegated.v1\0${grantId}`).digest('hex').slice(0, 8);
-    const params = {
-      id: committedTaskId,
+    const baseParams = {
       name: task.name.trim(),
       schedule: task.schedule,
       prompt: task.prompt,
@@ -6907,13 +6905,18 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       reasoningEffort: task.reasoningEffort,
     };
     if (direct) {
-      const created = scheduler.addTask({ ...params, ownerOpenId: controlOpenId, ownerUnionId: controlUnionId });
+      const created = scheduler.addTask({ ...baseParams, id: task.id,
+        ownerOpenId: controlOpenId, ownerUnionId: controlUnionId });
       return jsonRes(res, 201, { ok: true, task: created, replay: false });
     }
+    const requestHash = computeInputHash(baseParams);
+    const committedTaskId = createHash('sha256')
+      .update(`botmux.schedule.delegated.v1\0${grantId}\0${requestHash}`)
+      .digest('hex').slice(0, 8);
     const result = scheduler.commitDelegatedTask({
-      params,
+      params: { ...baseParams, id: committedTaskId },
       grantId,
-      requestHash: computeInputHash(params),
+      requestHash,
       control: { openId: controlOpenId, unionId: controlUnionId, runScopes: [] },
       sourceMessageId,
       sourceSessionId,

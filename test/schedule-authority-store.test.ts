@@ -66,7 +66,7 @@ describe('host-only schedule authority store', () => {
     });
   });
 
-  it('rejects the same grant with different canonical request or a reused task id', () => {
+  it('lets one turn create multiple canonical tasks but rejects a reused task id', () => {
     store.initializeApp(APP, []);
     const base = {
       appId: APP, grantId: 'grant-1', requestHash: 'hash-1', task: task(),
@@ -75,7 +75,7 @@ describe('host-only schedule authority store', () => {
     };
     expect(store.commitDelegated(base).ok).toBe(true);
     expect(store.commitDelegated({ ...base, requestHash: 'hash-2', task: task('deadbeef') }))
-      .toEqual({ ok: false, error: 'grant_conflict' });
+      .toMatchObject({ ok: true, replay: false, task: { id: 'deadbeef' } });
     expect(store.commitDelegated({ ...base, grantId: 'grant-2', requestHash: 'hash-2' }))
       .toEqual({ ok: false, error: 'task_id_conflict' });
   });

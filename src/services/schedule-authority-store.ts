@@ -102,7 +102,7 @@ export class ScheduleAuthorityStore {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         PRIMARY KEY (app_id, task_id),
-        UNIQUE (grant_id)
+        UNIQUE (grant_id, request_hash)
       );
     `);
     return new ScheduleAuthorityStore(db);
@@ -240,8 +240,8 @@ export class ScheduleAuthorityStore {
     try {
       const prior = this.db.prepare(`
         SELECT app_id, task_id, request_hash, task_json FROM schedule_authority_tasks
-        WHERE grant_id = ?
-      `).get(input.grantId) as Record<string, unknown> | undefined;
+        WHERE grant_id = ? AND request_hash = ?
+      `).get(input.grantId, input.requestHash) as Record<string, unknown> | undefined;
       if (prior) {
         if (prior.app_id !== input.appId || prior.request_hash !== input.requestHash) {
           this.db.exec('ROLLBACK;');

@@ -37,7 +37,20 @@ The host must also opt in through `~/.botmux/config.json` (off by default):
 }
 ```
 
-The initial version is single-hop and single-use. It permits only the target bot in the original dispatch chat, at chat top level or in the current topic. It rejects `--new-topic`, `--follow-active`, multi-chat targets, and onward delegation. The grant authorizes create only, not update/remove/pause/resume/run.
+The initial version is single-hop and bound to the target bot's current dispatch turn. It has no fixed five-minute deadline: multiple distinct tasks may be created while that turn is live, and the authority ends with the turn. Each canonical request gets a deterministic task ID, so an identical retry returns the original task. Tasks may run only in the original dispatch chat, at chat top level or in the current topic. `--new-topic`, `--follow-active`, multi-chat targets, and onward delegation are rejected. The grant authorizes create only, not update/remove/pause/resume/run.
+
+To make every managed dispatch from a selected orchestrator request the capability without changing each SOP, configure the source bot id:
+
+```json
+{
+  "scheduleDelegation": {
+    "createEnabled": true,
+    "defaultOnDispatchFromBotAppIds": ["cli_spu_orchestrator"]
+  }
+}
+```
+
+Use `--no-delegate schedule:create` to opt out for one dispatch.
 
 Delegated tasks receive no personal tool run scopes by default. The target bot must enable the `triggerUserAuth` isolation wrappers so a reused session cannot inherit an earlier identity; otherwise execution fails closed. `createEnabled:false` stops new grants only, while `runEnabled:false` revokes future runs of existing delegated tasks.
 

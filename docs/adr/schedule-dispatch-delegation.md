@@ -6,13 +6,13 @@
 
 跨机器人创建定时任务使用独立的 `schedule:create` capability，不恢复 session owner 或环境变量 fallback。来源 daemon 仅在当前回合由真人管理员直接触发、宿主 `scheduleDelegation.createEnabled` 已开启且 dispatch 显式传入 `--delegate schedule:create` 时签发 v2 委托。
 
-目标 daemon 将精确消息绑定的 v2 委托兑换为单次创建权。首版严格单跳、一个 grant 一个任务，仅允许目标 Bot 在原群顶层或当前 dispatch 话题执行，不支持多群、`new-topic`、`follow-active` 或继续转委托。真实 current actor 仍是发消息的 Bot，不冒充原真人。
+目标 daemon 将精确消息绑定的 v2 委托兑换为当前目标 dispatch turn 的创建权。首版严格单跳；同一 live turn 可以创建多个不同任务，turn 结束即失效，不使用固定墙钟 TTL。仅允许目标 Bot 在原群顶层或当前 dispatch 话题执行，不支持多群、`new-topic`、`follow-active` 或继续转委托。真实 current actor 仍是发消息的 Bot，不冒充原真人。
 
 ## 持久边界
 
 `schedule-authority.sqlite` 是 task 定义、控制主体、grant 消费、启停/完成状态和 run claim 的权威源；每个目标 app 首次升级时只登记当时已有的任务清单一次。`schedules.json` 只作 UI/兼容投影：修改 `enabled` / `nextRunAt` / repeat、删除标记、复制或换 task id 都不会取得执行权。删除任务在权威库留下 tombstone，不能靠恢复旧 JSON 复活。
 
-委托 grant 与任务在同一个 SQLite 事务中提交。提交前回合或 generation 变化即拒绝；提交后响应丢失时，同 grant + 同 canonical request 返回原 task id；同 grant + 不同请求返回冲突。未提交的事务不会被 scheduler 看见。
+委托 grant 的 canonical request 与任务在同一个 SQLite 事务中提交。任务 id 由 grant + canonical request 确定性派生：提交前回合或 generation 变化即拒绝；提交后响应丢失时，同请求返回原 task id；同一 live turn 的不同 canonical request 创建不同任务。未提交的事务不会被 scheduler 看见。
 
 ## 身份与撤权
 
@@ -38,3 +38,4 @@
 - 显式请求发送给旧 daemon 时必须明确失败，不能静默创建 ownerless task。
 - 首次升级迁移是一次性的宿主信任边界，后续未知 JSON 行不会被识别为 legacy。
 - 非沙箱测试只证明受管入口遵守协议。本设计不抵御与 daemon 同 UID、可任意读取或改写宿主密钥和 SQLite 权威库的进程；那属于操作系统隔离边界。
+- `scheduleDelegation.defaultOnDispatchFromBotAppIds` 可让指定来源 orchestrator 的每次受管 dispatch 默认请求该能力；`--no-delegate schedule:create` 可对单次派发降权。

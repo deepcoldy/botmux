@@ -37,7 +37,20 @@ botmux dispatch --bot-app cli_target --title "轮询任务" --brief "创建并�
 }
 ```
 
-首版委托严格单跳、一个 grant 只能创建一个任务，并只允许目标 Bot 在原派发群的顶层或当前话题执行；不支持 `--new-topic`、`--follow-active`、多群或继续转委托。委托只允许创建任务，不授予 update/remove/pause/resume/run。
+首版委托严格单跳，并绑定目标 Bot 的当前 dispatch turn；不设固定的 5 分钟期限，turn 存活期间可创建多个不同任务，turn 结束即失效。每个 canonical request 会得到确定性 task ID，相同请求重试返回原任务。任务只允许落在原派发群的顶层或当前话题；不支持 `--new-topic`、`--follow-active`、多群或继续转委托。委托只允许创建任务，不授予 update/remove/pause/resume/run。
+
+若某个 orchestrator 的所有受管 dispatch 都应默认附带该能力，可按来源 Bot 配置，无需修改每条 SOP：
+
+```json
+{
+  "scheduleDelegation": {
+    "createEnabled": true,
+    "defaultOnDispatchFromBotAppIds": ["cli_spu_orchestrator"]
+  }
+}
+```
+
+单次派发可用 `--no-delegate schedule:create` 明确降权。
 
 委托任务默认没有真人工具运行权限。目标 Bot 必须启用 `triggerUserAuth` 的隔离 wrapper 才会执行，以保证复用会话时不会继承历史身份；否则任务会 fail-closed。`createEnabled:false` 只停止新签发，`runEnabled:false` 才撤销已有委托任务的后续运行。
 

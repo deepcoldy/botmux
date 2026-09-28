@@ -142,6 +142,23 @@ describe('dispatch user IPC end-to-end identity binding', () => {
     expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_source_operator_denied' } });
     expect(h.send).not.toHaveBeenCalled();
   });
+  it('can default schedule delegation by source orchestrator and honors one-shot opt-out', async () => {
+    const enabled = harness();
+    enabled.scope.getBot = () => ({ config: {} });
+    enabled.scope.readGlobalConfig = () => ({ scheduleDelegation: {
+      createEnabled: true, defaultOnDispatchFromBotAppIds: ['cli_source'],
+    } });
+    expect((await enabled.run()).status).toBe(200);
+    expect((await read())?.domain).toBe('botmux.dispatch-user.v2');
+
+    rmSync(dataDir, { recursive: true, force: true });
+    dataDir = mkdtempSync(join(tmpdir(), 'dispatch-ipc-'));
+    const suppressed = harness({ suppressScheduleCreate: true });
+    suppressed.scope.getBot = () => ({ config: {} });
+    suppressed.scope.readGlobalConfig = enabled.scope.readGlobalConfig;
+    expect((await suppressed.run()).status).toBe(200);
+    expect(await read()).toBeUndefined();
+  });
   it('refuses sending after the active turn changes during identity resolution', async () => {
     const h = harness(); delete h.ds.activeInteractiveTurn.caller.requestUserUnionId;
     h.scope.resolveUnionIdFromOpenId = async () => { h.ds.managedTurnOrigin.turnId = 'om_bob'; return 'on_alice'; };

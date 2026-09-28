@@ -171,6 +171,8 @@ export interface ScheduleDelegationGlobalConfig {
   createEnabled?: boolean;
   /** Allow already committed delegated schedules to run. Missing means on. */
   runEnabled?: boolean;
+  /** Source orchestrator app ids whose managed dispatches request schedule:create by default. */
+  defaultOnDispatchFromBotAppIds?: string[];
 }
 
 export interface GlobalConfig {
@@ -565,6 +567,12 @@ function readScheduleDelegation(raw: unknown): ScheduleDelegationGlobalConfig | 
   const out: ScheduleDelegationGlobalConfig = {};
   if (typeof value.createEnabled === 'boolean') out.createEnabled = value.createEnabled;
   if (typeof value.runEnabled === 'boolean') out.runEnabled = value.runEnabled;
+  if (Array.isArray(value.defaultOnDispatchFromBotAppIds)) {
+    const appIds = [...new Set(value.defaultOnDispatchFromBotAppIds.filter(
+      (item): item is string => typeof item === 'string' && /^cli_[A-Za-z0-9_-]{1,128}$/.test(item),
+    ))];
+    if (appIds.length > 0) out.defaultOnDispatchFromBotAppIds = appIds;
+  }
   return Object.keys(out).length > 0 ? out : undefined;
 }
 

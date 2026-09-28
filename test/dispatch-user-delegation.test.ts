@@ -76,16 +76,16 @@ describe('daemon-derived dispatch authority', () => {
       sourceAppId: 'cli_source', tools: [],
       caller: { senderType: 'user', requestLarkAppId: 'cli_source',
         requestUserOpenId: 'ou_alice_source', requestUserUnionId: 'on_alice' },
-      scheduleCreate: { targetAppIds: ['cli_target'], targetChatId: 'oc_chat', expiresAt: Date.now() + 60_000 },
+      scheduleCreate: { targetAppIds: ['cli_target'], targetChatId: 'oc_chat' },
       resolveUnionId: async () => 'on_alice',
     });
     expect(direct && scheduleCreateCapabilities(direct)).toEqual([expect.objectContaining({
       action: 'schedule:create', targetAppId: 'cli_target', targetChatId: 'oc_chat',
-      allowedExecutionPositions: ['top-level', 'topic'], allowedRunScopes: [], maxTasks: 1,
+      allowedExecutionPositions: ['top-level', 'topic'], allowedRunScopes: [],
     })]);
     const inherited = await authorityForDispatch({
       sourceAppId: 'cli_target', tools: [], inherited: direct,
-      scheduleCreate: { targetAppIds: ['cli_third'], targetChatId: 'oc_chat', expiresAt: Date.now() + 60_000 },
+      scheduleCreate: { targetAppIds: ['cli_third'], targetChatId: 'oc_chat' },
       resolveUnionId: async () => { throw new Error('must not resolve'); },
     });
     expect(inherited).toBeUndefined();
@@ -93,7 +93,7 @@ describe('daemon-derived dispatch authority', () => {
 });
 
 describe('message-bound signed delegation', () => {
-  it('expires v2 schedule capability while retaining v1 compatibility', async () => {
+  it('keeps v2 schedule capability valid for the exact live dispatch turn without a wall-clock deadline', async () => {
     vi.useFakeTimers();
     try {
       const now = Date.now();
@@ -101,7 +101,7 @@ describe('message-bound signed delegation', () => {
         sourceAppId: 'cli_source', tools: [],
         caller: { senderType: 'user', requestLarkAppId: 'cli_source',
           requestUserOpenId: 'ou_alice_source', requestUserUnionId: 'on_alice' },
-        scheduleCreate: { targetAppIds: ['cli_target'], targetChatId: 'oc_chat', expiresAt: now + 1_000 },
+        scheduleCreate: { targetAppIds: ['cli_target'], targetChatId: 'oc_chat' },
         resolveUnionId: async () => 'on_alice',
       });
       await deliverDispatchWithUser({ dataDir, secret, payload: {
@@ -109,8 +109,8 @@ describe('message-bound signed delegation', () => {
         rootId: 'om_root', chatId: 'oc_chat', targetAppIds: ['cli_target'], authority: v2Authority!,
       }, send: async () => 'om_kickoff' });
       expect((await resolve())?.domain).toBe('botmux.dispatch-user.v2');
-      vi.setSystemTime(now + 1_001);
-      expect(await resolve()).toBeUndefined();
+      vi.setSystemTime(now + 24 * 60 * 60_000);
+      expect((await resolve())?.domain).toBe('botmux.dispatch-user.v2');
     } finally { vi.useRealTimers(); }
   });
   it('does not wait on a pending grant at or beyond the 30s freshness boundary', async () => {
