@@ -10,9 +10,10 @@
 import { describe, it, expect } from 'vitest';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, statSync } from 'node:fs';
 import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
+import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'sbx-'));
 
@@ -249,7 +250,8 @@ describe('prepareDirectSandbox tmux argument transport', () => {
     } finally {
       plan?.cleanup();
       if (plan?.argsFile) expect(existsSync(plan.argsFile)).toBe(false);
-      rmSync(root, { recursive: true, force: true });
+      if (plan) expect(existsSync(join(realpathSync(dataDir), 'sandboxes', 'long-tmux'))).toBe(false);
+      rmSandboxScratch(root);
     }
   });
 
@@ -278,7 +280,7 @@ describe('prepareDirectSandbox tmux argument transport', () => {
       })).toThrow(/NUL/);
       expect(existsSync(sessionRoot)).toBe(false);
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSandboxScratch(root);
     }
   });
 });
