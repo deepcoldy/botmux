@@ -17,6 +17,32 @@ botmux schedule add "每日18:00" "检查部署状态" --topic
 
 `--topic` 可从当前话题会话推断锚点，也可用 `--root-msg-id <om_...>` 指定目标话题。
 
+## 跨 Bot 委托创建
+
+当真人在 Bot A 的当前回合中明确要求 Bot B 建立定时任务时，A 必须在受管派发中显式请求：
+
+```bash
+botmux dispatch --bot-app cli_target --title "轮询任务" --brief "创建并维护状态轮询" \
+  --delegate schedule:create
+```
+
+宿主还必须在 `~/.botmux/config.json` 显式开启新签发（默认关闭）：
+
+```json
+{
+  "scheduleDelegation": {
+    "createEnabled": true,
+    "runEnabled": true
+  }
+}
+```
+
+首版委托严格单跳、一个 grant 只能创建一个任务，并只允许目标 Bot 在原派发群的顶层或当前话题执行；不支持 `--new-topic`、`--follow-active`、多群或继续转委托。委托只允许创建任务，不授予 update/remove/pause/resume/run。
+
+委托任务默认没有真人工具运行权限。目标 Bot 必须启用 `triggerUserAuth` 的隔离 wrapper 才会执行，以保证复用会话时不会继承历史身份；否则任务会 fail-closed。`createEnabled:false` 只停止新签发，`runEnabled:false` 才撤销已有委托任务的后续运行。
+
+任务定义、授权、启停/完成状态和运行 claim 以宿主侧 SQLite 为准，`schedules.json` 只是可重建投影。首次升级会把当时已有任务清单一次性登记为 legacy；之后新增、复制或改写 JSON 记录不会获得执行资格。该边界保护受管 CLI 与文件沙盒，不承诺抵御能以同一系统用户任意读取宿主密钥和授权库的进程。
+
 ## 支持的格式
 
 ```bash

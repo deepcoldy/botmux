@@ -105,6 +105,16 @@ describe('parseDispatchArgs', () => {
       });
   });
 
+  it('parses explicit schedule delegation without changing legacy calls', () => {
+    expect(parseDispatchArgs([
+      '--title', 'task', '--bot-app', 'cli_a', '--brief', 'b',
+      '--delegate', 'schedule:create',
+    ])).toMatchObject({ ok: true, value: { delegates: ['schedule:create'] } });
+    const legacy = parseDispatchArgs(['--title', 'task']);
+    expect(legacy).toMatchObject({ ok: true, value: { title: 'task' } });
+    if (legacy.ok) expect('delegates' in legacy.value).toBe(false);
+  });
+
   it('preserves help short-circuit even alongside incomplete or unknown arguments', () => {
     expect(parseDispatchArgs(['--help', '--title'])).toMatchObject({ ok: true, value: { help: true } });
     expect(parseDispatchArgs(['--unknown', '-h'])).toMatchObject({ ok: true, value: { help: true } });

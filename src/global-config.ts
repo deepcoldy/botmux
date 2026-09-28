@@ -162,6 +162,17 @@ export interface SessionCleanupGlobalConfig {
   intervalMinutes?: number;
 }
 
+/** Host policy for delegating creation of persistent scheduled work across bots.
+ * Creation is opt-in and independent from triggerUserAuth.  Disabling execution
+ * is a separate emergency revocation switch so stopping new grants does not
+ * silently change the meaning of already committed tasks. */
+export interface ScheduleDelegationGlobalConfig {
+  /** Allow a directly authenticated human turn to request schedule:create. Default off. */
+  createEnabled?: boolean;
+  /** Allow already committed delegated schedules to run. Missing means on. */
+  runEnabled?: boolean;
+}
+
 export interface GlobalConfig {
   lang?: Locale;
   /** Machine-wide default prefix for groups created via `/group` or `/g`.
@@ -232,6 +243,8 @@ export interface GlobalConfig {
    *  Stored lenient here; final IANA validity is enforced on write
    *  (settings-write-applier) and re-checked at resolve time. */
   scheduleTimeZone?: string;
+  /** Machine-wide cross-bot schedule delegation policy. */
+  scheduleDelegation?: ScheduleDelegationGlobalConfig;
 }
 
 export interface GlobalSkillConfig {
@@ -546,6 +559,15 @@ function readWorker(raw: unknown): WorkerConfig | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+function readScheduleDelegation(raw: unknown): ScheduleDelegationGlobalConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  const out: ScheduleDelegationGlobalConfig = {};
+  if (typeof value.createEnabled === 'boolean') out.createEnabled = value.createEnabled;
+  if (typeof value.runEnabled === 'boolean') out.runEnabled = value.runEnabled;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function readGlobalSkills(raw: unknown): GlobalSkillConfig | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const r = raw as Record<string, unknown>;
@@ -795,6 +817,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (typeof raw.scheduleTimeZone === 'string' && raw.scheduleTimeZone.trim()) {
     out.scheduleTimeZone = raw.scheduleTimeZone.trim();
   }
+  const scheduleDelegation = readScheduleDelegation(raw.scheduleDelegation);
+  if (scheduleDelegation) out.scheduleDelegation = scheduleDelegation;
   readCache = { path, value: out, at: Date.now() };
   return out;
 }

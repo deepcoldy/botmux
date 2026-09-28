@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+let scheduleAuthorityStore: ScheduleAuthorityStore | null = null;
 import {
   config,
   getDashboardExternalHost,
@@ -367,8 +368,11 @@ import {
   closeCliMismatchedSessionsForBot,
 } from './core/session-manager.js';
 import { publishTurnCliIdentity } from './core/turn-cli-identity.js';
-import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES } from './core/dispatch-user-delegation.js';
+import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './core/dispatch-user-delegation.js';
 import { resolveUnionIdFromOpenId } from './im/lark/client.js';
+import { ScheduleAuthorityStore } from './services/schedule-authority-store.js';
+import { computeInputHash } from './utils/canonical-input-hash.js';
+import { authorizeDelegatedScheduleRun } from './core/schedule-delegated-runtime.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
   runIdempotencyFailClose,
@@ -3418,7 +3422,7 @@ async function promoteMaterializedTaskPositionSession(
       // Guards passed — commit the durable/session state first, then move the
       // live registration. reconcileDeferredTopicBinding already set
       // rootMessageId + aliases on the session.
-      scheduleStore.updateTask(run.taskId, { rootMessageId }, larkAppId);
+      scheduler.updateRuntimeTaskState(run.taskId, { rootMessageId }, larkAppId);
       ds.session.deferredScheduleRun = undefined;
       ds.session.scope = 'thread';
       ds.scope = 'thread';
@@ -6703,8 +6707,20 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     const bot = getBot(ds.larkAppId).config;
     const turnId = ds.managedTurnOrigin?.turnId;
     const active = ds.activeInteractiveTurn;
-    const needsDelegation = targetAppIds.length > 0 && bot.triggerUserAuth?.enabled === true
-      && bot.triggerUserAuth.tools.length > 0;
+    const scheduleCreateRequested = body.delegateScheduleCreate === true;
+    if (scheduleCreateRequested && readGlobalConfig().scheduleDelegation?.createEnabled !== true) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_disabled' });
+    }
+    const tools = bot.triggerUserAuth?.enabled === true ? bot.triggerUserAuth.tools : [];
+    const needsDelegation = targetAppIds.length > 0
+      && (tools.length > 0 || scheduleCreateRequested);
+    const directScheduleSource = !!active && active.turnId === turnId
+      && active.caller.senderType === 'user' && !active.caller.source
+      && !!active.caller.requestUserOpenId
+      && getDashboardAdminOpenIds(ds.larkAppId).includes(active.caller.requestUserOpenId);
+    if (scheduleCreateRequested && !directScheduleSource) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_source_operator_denied' });
+    }
     const inherited = needsDelegation && turnId ? await dispatchUserForTurn(ds, turnId) : undefined;
     if (inherited && !await targetUserForDelegation(ds, inherited.authority)) {
       return jsonRes(res, 403, { ok: false, error: 'delegated_caller_not_allowed' });
@@ -6714,9 +6730,20 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
       caller: active?.turnId === turnId ? active.caller
         : dispatchCallerFromReply(ds.larkAppId, pickTurnReplyTarget(ds.session, turnId)),
       inherited: inherited?.authority,
-      tools: bot.triggerUserAuth?.enabled ? bot.triggerUserAuth.tools : [],
+      tools,
+      ...(scheduleCreateRequested ? {
+        scheduleCreate: {
+          targetAppIds,
+          targetChatId: chatId,
+          expiresAt: Date.now() + 5 * 60_000,
+        },
+      } : {}),
       resolveUnionId: resolveUnionIdFromOpenId,
     }) : undefined;
+    if (scheduleCreateRequested
+      && (!authority || scheduleCreateCapabilities(authority).length === 0)) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_direct_human_required' });
+    }
     // Identity lookup may await the network. Do not send under a turn that was
     // replaced while resolving it, nor silently borrow the session owner.
     if (authority && ds.managedTurnOrigin?.turnId !== turnId) {
@@ -6737,6 +6764,228 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
   } catch (error) {
     return jsonRes(res, 502, { ok: false, error: 'dispatch_delivery_failed', detail: error instanceof Error ? error.message : String(error) });
   }
+});
+
+// Managed schedule creation. The caller supplies task input only; creator
+// identity, grant scope and the commit authority are derived from this exact
+// live turn and the host-signed dispatch record.
+ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
+  let body: any;
+  try { body = await readJsonBody(req, 64 * 1024); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_request' }); }
+  const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : '';
+  const ds = sessionId ? findActiveBySessionId(sessionId) : undefined;
+  const trustedHost = isTrustedHostIpcRequest(req);
+  const verified = authorizeSessionScopedIpc({
+    trustedHost, sessionExists: !!ds,
+    receiverSession: !!ds?.session.vcMeetingReceiver, allowReceiver: false,
+    sessionId, liveOrigin: ds?.managedTurnOrigin,
+    claimedCapability: body?.originCapability,
+    claimedTurnId: body?.originTurnId,
+    claimedDispatchAttempt: body?.originDispatchAttempt,
+  });
+  if (!verified.ok || (ds && ds.larkAppId !== selfDaemonLarkAppId)) {
+    return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_origin_unproven' });
+  }
+  const task = body.task;
+  if (!task || typeof task !== 'object' || Array.isArray(task)
+    || typeof task.id !== 'string' || !/^[0-9a-f]{8}$/.test(task.id)
+    || typeof task.schedule !== 'string' || !task.schedule.trim()
+    || typeof task.prompt !== 'string' || !task.prompt.trim()
+    || typeof task.name !== 'string' || !task.name.trim()
+    || typeof task.workingDir !== 'string' || !task.workingDir.trim()
+    || typeof task.chatId !== 'string' || !/^oc_[A-Za-z0-9_-]{1,128}$/.test(task.chatId)
+    || !['top-level', 'topic', 'new-topic'].includes(task.executionPosition)
+    || task.larkAppId !== undefined && task.larkAppId !== (ds?.larkAppId ?? selfDaemonLarkAppId)) {
+    return jsonRes(res, 400, { ok: false, error: 'schedule_delegation_scope_invalid' });
+  }
+  // A host-terminal invocation authenticates with the daemon HMAC rather than
+  // a conversation turn. It may create an ownerless local task, preserving the
+  // historical admin CLI while still committing through the authority store.
+  if (!ds) {
+    if (!trustedHost || task.larkAppId !== selfDaemonLarkAppId) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_host_admin_required' });
+    }
+    try {
+      const created = scheduler.addTask(task);
+      return jsonRes(res, 201, { ok: true, task: created, replay: false });
+    } catch (error) {
+      return jsonRes(res, 409, { ok: false, error: 'schedule_host_commit_failed',
+        detail: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  if (!ds.managedTurnOrigin?.turnId || ds.workerGeneration === undefined) {
+    return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_origin_unproven' });
+  }
+  const reply = pickTurnReplyTarget(ds.session, ds.managedTurnOrigin.turnId);
+  const expectedRoot = reply?.rootMessageId
+    ?? ((ds.scope ?? ds.session.scope) === 'thread' ? ds.session.rootMessageId : undefined);
+  const turnId = ds.managedTurnOrigin.turnId;
+  const generation = ds.workerGeneration;
+  let controlOpenId: string | undefined;
+  let controlUnionId: string | undefined;
+  let grantId: string;
+  let sourceMessageId = turnId;
+  let sourceSessionId = sessionId;
+  const active = ds.activeInteractiveTurn;
+  const direct = active?.turnId === turnId && active.caller.senderType === 'user'
+    && !active.caller.source && active.caller.requestLarkAppId === ds.larkAppId;
+  try {
+    if (direct) {
+      controlOpenId = active.caller.requestUserOpenId;
+      controlUnionId = active.caller.requestUserUnionId
+        ?? (controlOpenId ? await resolveUnionIdFromOpenId(ds.larkAppId, controlOpenId) ?? undefined : undefined);
+      grantId = `direct:${sessionId}:${turnId}`;
+    } else {
+      if (readGlobalConfig().scheduleDelegation?.createEnabled !== true) {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_disabled' });
+      }
+      if (task.chatId !== ds.chatId
+        || (task.executionPosition !== 'top-level' && task.executionPosition !== 'topic')
+        || task.followActive === true || task.topicTitle !== undefined) {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_scope_invalid' });
+      }
+      if (task.executionPosition === 'topic' && (!expectedRoot || task.rootMessageId !== expectedRoot)) {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_root_mismatch' });
+      }
+      if (task.executionPosition === 'top-level' && task.rootMessageId !== undefined) {
+        return jsonRes(res, 400, { ok: false, error: 'schedule_delegation_root_forbidden' });
+      }
+      const delegation = await dispatchUserForTurn(ds, turnId);
+      const capability = delegation?.domain === 'botmux.dispatch-user.v2'
+        ? scheduleCreateCapabilities(delegation.authority).find(item => item.action === 'schedule:create'
+          && item.targetAppId === ds.larkAppId && item.targetChatId === ds.chatId)
+        : undefined;
+      if (!delegation || !capability || Date.now() > capability.expiresAt) {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_missing' });
+      }
+      if (!capability.allowedExecutionPositions.includes(task.executionPosition)) {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_position_denied' });
+      }
+      const resolved = await resolveTargetAppOpenId(ds.larkAppId, delegation.authority.unionId);
+      if (resolved.status !== 'resolved') {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_identity_unresolved' });
+      }
+      controlOpenId = resolved.openId;
+      controlUnionId = delegation.authority.unionId;
+      grantId = `dispatch:${delegation.deliveryId}:${ds.larkAppId}`;
+      sourceMessageId = delegation.messageId!;
+      sourceSessionId = delegation.sourceSessionId;
+    }
+    if (!controlOpenId || !controlUnionId
+      || !getDashboardAdminOpenIds(ds.larkAppId).includes(controlOpenId)
+      || (ds.chatType === 'group'
+        && !(await listChatMemberOpenIds(ds.larkAppId, task.chatId)).includes(controlOpenId))) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_operator_denied' });
+    }
+    if (ds.managedTurnOrigin?.turnId !== turnId || ds.workerGeneration !== generation) {
+      return jsonRes(res, 409, { ok: false, error: 'schedule_delegation_turn_changed' });
+    }
+    const committedTaskId = direct
+      ? task.id
+      : createHash('sha256').update(`botmux.schedule.delegated.v1\0${grantId}`).digest('hex').slice(0, 8);
+    const params = {
+      id: committedTaskId,
+      name: task.name.trim(),
+      schedule: task.schedule,
+      prompt: task.prompt,
+      workingDir: task.workingDir,
+      chatId: task.chatId,
+      rootMessageId: task.executionPosition === 'topic'
+        ? (direct ? task.rootMessageId : expectedRoot)
+        : undefined,
+      executionPosition: task.executionPosition,
+      larkAppId: ds.larkAppId,
+      creatorChatId: ds.chatId,
+      creatorRootMessageId: expectedRoot,
+      creatorLarkAppId: ds.larkAppId,
+      chatType: ds.chatType === 'p2p' ? 'p2p' as const : 'topic_group' as const,
+      silent: task.silent === true,
+      followActive: task.followActive === true,
+      topicTitle: typeof task.topicTitle === 'string' ? task.topicTitle : undefined,
+      model: typeof task.model === 'string' ? task.model : undefined,
+      reasoningEffort: task.reasoningEffort,
+    };
+    if (direct) {
+      const created = scheduler.addTask({ ...params, ownerOpenId: controlOpenId, ownerUnionId: controlUnionId });
+      return jsonRes(res, 201, { ok: true, task: created, replay: false });
+    }
+    const result = scheduler.commitDelegatedTask({
+      params,
+      grantId,
+      requestHash: computeInputHash(params),
+      control: { openId: controlOpenId, unionId: controlUnionId, runScopes: [] },
+      sourceMessageId,
+      sourceSessionId,
+      targetTurnId: turnId,
+      targetGeneration: generation,
+    });
+    if (!result.ok) return jsonRes(res, 409, { ok: false, error: result.error });
+    return jsonRes(res, result.replay ? 200 : 201, { ok: true, task: result.task, replay: result.replay });
+  } catch (error) {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: 'schedule_delegation_commit_failed',
+      detail: error instanceof Error ? error.message : String(error),
+    });
+  }
+});
+
+ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
+  let body: any;
+  try { body = await readJsonBody(req, 32 * 1024); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_mutation' }); }
+  const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : '';
+  const ds = sessionId ? findActiveBySessionId(sessionId) : undefined;
+  const trustedHost = isTrustedHostIpcRequest(req);
+  const verified = authorizeSessionScopedIpc({
+    trustedHost, sessionExists: !!ds,
+    receiverSession: !!ds?.session.vcMeetingReceiver, allowReceiver: false,
+    sessionId, liveOrigin: ds?.managedTurnOrigin,
+    claimedCapability: body?.originCapability,
+    claimedTurnId: body?.originTurnId,
+    claimedDispatchAttempt: body?.originDispatchAttempt,
+  });
+  const turnId = ds?.managedTurnOrigin?.turnId;
+  const active = ds?.activeInteractiveTurn;
+  const hostAdmin = trustedHost && !ds && body?.larkAppId === selfDaemonLarkAppId;
+  const currentHumanAdmin = !!ds && !!turnId && active?.turnId === turnId
+    && active.caller.senderType === 'user' && !active.caller.source
+    && active.caller.requestLarkAppId === ds.larkAppId
+    && !!active.caller.requestUserOpenId
+    && getDashboardAdminOpenIds(ds.larkAppId).includes(active.caller.requestUserOpenId);
+  if (!verified.ok || (!hostAdmin && !currentHumanAdmin)) {
+    return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_current_human_required' });
+  }
+  const id = typeof body.id === 'string' && /^[0-9a-z_]{1,50}$/.test(body.id) ? body.id : '';
+  const action = body.action;
+  if (!id || !['update', 'remove', 'pause', 'resume', 'run'].includes(action)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_mutation' });
+  }
+  const appId = ds?.larkAppId ?? selfDaemonLarkAppId;
+  if (!appId) return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_daemon_unbound' });
+  const authority = scheduleAuthorityStore?.getRecord(appId, id);
+  if (!authority) return jsonRes(res, 404, { ok: false, error: 'schedule_not_found' });
+  if (action === 'update' && authority.kind === 'delegated') {
+    return jsonRes(res, 403, { ok: false, error: 'delegated_schedule_reauthorization_required' });
+  }
+  if (action === 'update' && authority.task.preconditionRef) {
+    return jsonRes(res, 409, { ok: false, error: 'schedule_precondition_dashboard_update_required' });
+  }
+  let ok = false;
+  let error: string | undefined;
+  if (action === 'update') {
+    if (typeof body.prompt !== 'string' || !body.prompt.trim()) {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_prompt' });
+    }
+    const result = scheduler.updateTask(id, { prompt: body.prompt });
+    ok = result.ok;
+    error = result.error;
+  } else if (action === 'remove') ok = scheduler.removeTask(id);
+  else if (action === 'pause') ok = scheduler.disableTask(id);
+  else if (action === 'resume') ok = scheduler.enableTask(id);
+  else ok = scheduler.runTaskNow(id);
+  return jsonRes(res, ok ? 200 : 409, { ok, ...(error ? { error } : !ok ? { error: 'not_found_or_denied' } : {}) });
 });
 
 ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
@@ -26927,6 +27176,13 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // running in a separate node process) so dashboard event bus stays in sync.
   scheduleStore.setScheduleScope(cfg.larkAppId);
   migrateSharedSchedulesAtStartup(botConfigs.map(b => b.larkAppId), botConfigs[0]?.larkAppId ?? cfg.larkAppId);
+  scheduleAuthorityStore ??= ScheduleAuthorityStore.open(config.session.dataDir);
+  scheduleAuthorityStore.initializeApp(cfg.larkAppId, scheduleStore.listTasks());
+  scheduleStore.replaceAuthoritativeProjection(
+    scheduleAuthorityStore.listTasks(cfg.larkAppId),
+    cfg.larkAppId,
+  );
+  scheduler.setScheduleAuthorityStore(scheduleAuthorityStore);
   void migrateOverloadAlertAtStartup(botConfigs.map(b => ({ larkAppId: b.larkAppId, apiOnly: b.apiOnly })));
   scheduleStore.startExternalWriteWatcher();
   logger.info(`Bot ${idx}/${botConfigs.length}: ${cfg.larkAppId} (cli: ${cfg.cliId})`)
@@ -28295,6 +28551,29 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // missing larkAppId falls through to bot-0 as a legacy fallback).
   scheduler.setExecuteCallback(async (task, executionContext) => {
     const effectiveAppId = task.larkAppId ?? cfg.larkAppId;
+    const authority = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
+    if (!authority) {
+      throw new Error('schedule authority record missing; refusing unregistered task');
+    }
+    if (authority.state !== 'active') {
+      throw new Error(`schedule authority state is ${authority.state}; refusing run`);
+    }
+    if (authority.kind === 'delegated') {
+      // Empty runScopes is an actual anonymous execution boundary, not merely
+      // "do not publish a fresh token". A governed wrapper is required so a
+      // reused session cannot fall through to an ambient machine login.
+      const botConfig = getBot(effectiveAppId).config;
+      task = await authorizeDelegatedScheduleRun(task, authority, {
+        runEnabled: readGlobalConfig().scheduleDelegation?.runEnabled !== false,
+        triggerUserAuthEnabled: botConfig.triggerUserAuth?.enabled === true,
+        adminOpenIds: getDashboardAdminOpenIds(effectiveAppId),
+        resolveTargetOpenId: async unionId => {
+          const resolved = await resolveTargetAppOpenId(effectiveAppId, unionId);
+          return resolved.status === 'resolved' ? resolved.openId : undefined;
+        },
+        listChatMemberOpenIds: chatId => listChatMemberOpenIds(effectiveAppId, chatId),
+      });
+    }
     let targetResults: ScheduleRunTargetResult[] | undefined;
     let precondition: ScheduledTaskPreconditionObservation = {
       precondition: 'none',

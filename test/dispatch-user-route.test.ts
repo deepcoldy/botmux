@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { Readable } from 'node:stream';
 import ts from 'typescript';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, DISPATCH_USER_DELIVERY_MAX_BYTES } from '../src/core/dispatch-user-delegation.js';
+import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_MAX_BYTES } from '../src/core/dispatch-user-delegation.js';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
 import { readJsonBody, JsonBodyTooLargeError } from '../src/core/dashboard-ipc-server.js';
 
@@ -43,7 +43,9 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
     getBot: () => ({ config: { triggerUserAuth: { enabled: true, tools: ['bytedcli'] } } }),
     dispatchUserForTurn: vi.fn(async () => undefined),
     targetUserForDelegation: vi.fn(async () => 'ou_alice_target'),
-    authorityForDispatch, dispatchCallerFromReply, pickTurnReplyTarget: () => undefined,
+    authorityForDispatch, scheduleCreateCapabilities, dispatchCallerFromReply, pickTurnReplyTarget: () => undefined,
+    readGlobalConfig: () => ({ scheduleDelegation: { createEnabled: true } }),
+    getDashboardAdminOpenIds: () => ['ou_alice'],
     resolveUnionIdFromOpenId, replyMessage: send, deliverDispatchWithUser,
     config: { session: { dataDir } }, loadOrCreateDashboardSecret: () => secret, dispatchReportBindingSecretPath: () => '',
   };
@@ -117,6 +119,28 @@ describe('dispatch user IPC end-to-end identity binding', () => {
     const h = harness(); h.ds.activeInteractiveTurn.caller.senderType = 'bot';
     expect((await h.run()).status).toBe(200);
     expect(await read()).toBeUndefined();
+  });
+  it('issues schedule scope without triggerUserAuth and only from a direct human turn', async () => {
+    const h = harness({ delegateScheduleCreate: true });
+    h.scope.getBot = () => ({ config: {} });
+    expect((await h.run()).status).toBe(200);
+    const delegated = await read();
+    expect(delegated?.domain).toBe('botmux.dispatch-user.v2');
+    expect(delegated && scheduleCreateCapabilities(delegated.authority)).toEqual([
+      expect.objectContaining({ action: 'schedule:create', targetAppId: 'cli_target', allowedRunScopes: [] }),
+    ]);
+
+    const bot = harness({ delegateScheduleCreate: true });
+    bot.scope.getBot = () => ({ config: {} });
+    bot.ds.activeInteractiveTurn.caller.senderType = 'bot';
+    expect(await bot.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_source_operator_denied' } });
+  });
+  it('does not let a talk-only human request persistent schedule authority', async () => {
+    const h = harness({ delegateScheduleCreate: true });
+    h.scope.getBot = () => ({ config: {} });
+    h.scope.getDashboardAdminOpenIds = () => [];
+    expect(await h.run()).toMatchObject({ status: 403, value: { error: 'schedule_delegation_source_operator_denied' } });
+    expect(h.send).not.toHaveBeenCalled();
   });
   it('refuses sending after the active turn changes during identity resolution', async () => {
     const h = harness(); delete h.ds.activeInteractiveTurn.caller.requestUserUnionId;

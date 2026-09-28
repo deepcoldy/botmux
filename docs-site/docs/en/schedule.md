@@ -17,6 +17,32 @@ botmux schedule add "0 18 * * *" "check deployment status" --topic
 
 `--topic` can infer the anchor from the current topic session. Use `--root-msg-id <om_...>` to specify a target topic explicitly.
 
+## Cross-bot delegated creation
+
+When a human explicitly asks Bot A to have Bot B create a schedule, A must request the persistent capability on the managed dispatch:
+
+```bash
+botmux dispatch --bot-app cli_target --title "Polling task" --brief "Create and maintain the poll" \
+  --delegate schedule:create
+```
+
+The host must also opt in through `~/.botmux/config.json` (off by default):
+
+```json
+{
+  "scheduleDelegation": {
+    "createEnabled": true,
+    "runEnabled": true
+  }
+}
+```
+
+The initial version is single-hop and single-use. It permits only the target bot in the original dispatch chat, at chat top level or in the current topic. It rejects `--new-topic`, `--follow-active`, multi-chat targets, and onward delegation. The grant authorizes create only, not update/remove/pause/resume/run.
+
+Delegated tasks receive no personal tool run scopes by default. The target bot must enable the `triggerUserAuth` isolation wrappers so a reused session cannot inherit an earlier identity; otherwise execution fails closed. `createEnabled:false` stops new grants only, while `runEnabled:false` revokes future runs of existing delegated tasks.
+
+The host SQLite store is authoritative for task definitions, grants, pause/completion state, and run claims; `schedules.json` is a rebuildable projection. The first upgraded start records the then-existing task inventory once as legacy. Later JSON additions, copies, or edits gain no execution authority. This boundary protects managed CLIs and the file sandbox; it does not claim to defend against a process running as the same OS user with unrestricted access to host keys and authority databases.
+
 ## Supported Formats
 
 ```bash

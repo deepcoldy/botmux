@@ -12,6 +12,7 @@ import { expandHome, validateWorkingDir } from './working-dir.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
+import { updateRuntimeTaskState } from './scheduler.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
@@ -3035,7 +3036,7 @@ export async function restoreActiveSessions(
       // registers at the real om_ key (sessionAnchorId reads the cleared
       // marker + thread scope) instead of the stable virtual slot.
       if (binding.routingAnchor.startsWith('schedule-task:')) {
-        scheduleStore.updateTask(
+        updateRuntimeTaskState(
           session.deferredScheduleRun.taskId,
           { rootMessageId: binding.rootMessageId },
           larkAppId,
@@ -3862,7 +3863,12 @@ export async function executeScheduledTask(
   // Runs before position/scope resolution so the rest of the fire path sees
   // an ordinary retained-topic / new-topic task.
   const taskBeforeFollowActive = task;
-  task = applyFollowActive(task);
+  const persistLanding = (id: string, rootMessageId: string, appId?: string) => {
+    if (!updateRuntimeTaskState(id, { rootMessageId }, appId)) {
+      throw new Error(`schedule task ${id} no longer exists`);
+    }
+  };
+  task = applyFollowActive(task, { persist: persistLanding });
   const followActiveFreshTopic = followActiveOpenedFreshTopic(taskBeforeFollowActive, task);
 
   const { getChatMode, sendMessage, replyMessage } = await import('../im/lark/client.js');
@@ -3935,7 +3941,7 @@ export async function executeScheduledTask(
       // next fire stays here (step 3) instead of opening one more topic. A
       // silent fresh topic has no real root yet (deferred until the first
       // `botmux send`), so it is not recorded and the next fire re-resolves.
-      if (followActiveFreshTopic) recordFollowActiveFreshTopic(taskBeforeFollowActive, anchor);
+      if (followActiveFreshTopic) recordFollowActiveFreshTopic(taskBeforeFollowActive, anchor, persistLanding);
     }
   } else if (executionPosition === 'task') {
     // Dedicated per-task topic, first fire: the task has no materialized root
@@ -3990,7 +3996,7 @@ export async function executeScheduledTask(
           // Write the root straight into the task row (store call, not the
           // scheduler wrapper/event bus): every later fire resolves to this
           // exact thread and resumes the session created below.
-          scheduleStore.updateTask(task.id, { rootMessageId: seed }, larkAppId);
+          updateRuntimeTaskState(task.id, { rootMessageId: seed }, larkAppId);
           return { anchor: seed, rootMessageId: seed, isContinuation: false };
         },
       );

@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, dispatchUserStorePath,
-  resolveDispatchUser, signDispatchUser, verifyDispatchUser,
+  resolveDispatchUser, scheduleCreateCapabilities, signDispatchUser, verifyDispatchUser,
   type DispatchUserPayload } from '../src/core/dispatch-user-delegation.js';
 
 const secret = 'host-only-secret';
@@ -71,9 +71,48 @@ describe('daemon-derived dispatch authority', () => {
       inherited: payload().authority, resolveUnionId: async () => null,
     })).toBeUndefined();
   });
+  it('mints schedule:create only for a direct human and never carries it through inheritance', async () => {
+    const direct = await authorityForDispatch({
+      sourceAppId: 'cli_source', tools: [],
+      caller: { senderType: 'user', requestLarkAppId: 'cli_source',
+        requestUserOpenId: 'ou_alice_source', requestUserUnionId: 'on_alice' },
+      scheduleCreate: { targetAppIds: ['cli_target'], targetChatId: 'oc_chat', expiresAt: Date.now() + 60_000 },
+      resolveUnionId: async () => 'on_alice',
+    });
+    expect(direct && scheduleCreateCapabilities(direct)).toEqual([expect.objectContaining({
+      action: 'schedule:create', targetAppId: 'cli_target', targetChatId: 'oc_chat',
+      allowedExecutionPositions: ['top-level', 'topic'], allowedRunScopes: [], maxTasks: 1,
+    })]);
+    const inherited = await authorityForDispatch({
+      sourceAppId: 'cli_target', tools: [], inherited: direct,
+      scheduleCreate: { targetAppIds: ['cli_third'], targetChatId: 'oc_chat', expiresAt: Date.now() + 60_000 },
+      resolveUnionId: async () => { throw new Error('must not resolve'); },
+    });
+    expect(inherited).toBeUndefined();
+  });
 });
 
 describe('message-bound signed delegation', () => {
+  it('expires v2 schedule capability while retaining v1 compatibility', async () => {
+    vi.useFakeTimers();
+    try {
+      const now = Date.now();
+      const v2Authority = await authorityForDispatch({
+        sourceAppId: 'cli_source', tools: [],
+        caller: { senderType: 'user', requestLarkAppId: 'cli_source',
+          requestUserOpenId: 'ou_alice_source', requestUserUnionId: 'on_alice' },
+        scheduleCreate: { targetAppIds: ['cli_target'], targetChatId: 'oc_chat', expiresAt: now + 1_000 },
+        resolveUnionId: async () => 'on_alice',
+      });
+      await deliverDispatchWithUser({ dataDir, secret, payload: {
+        sourceAppId: 'cli_source', sourceSessionId: 'source-session', sourceTurnId: 'om_human',
+        rootId: 'om_root', chatId: 'oc_chat', targetAppIds: ['cli_target'], authority: v2Authority!,
+      }, send: async () => 'om_kickoff' });
+      expect((await resolve())?.domain).toBe('botmux.dispatch-user.v2');
+      vi.setSystemTime(now + 1_001);
+      expect(await resolve()).toBeUndefined();
+    } finally { vi.useRealTimers(); }
+  });
   it('does not wait on a pending grant at or beyond the 30s freshness boundary', async () => {
     vi.useFakeTimers();
     try {

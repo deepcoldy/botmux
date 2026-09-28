@@ -68,7 +68,7 @@ describe('sandbox relay watcher host handoff', () => {
     writeFileSync(join(outbox, `${id}.req.json`), JSON.stringify({
       command: 'dispatch',
       contentFile: `${id}.content`,
-      flags: ['--title', 'work', '--bot-app', 'cli_target', '--chat-id', 'oc_target'],
+      flags: ['--title', 'work', '--bot-app', 'cli_target', '--chat-id', 'oc_target', '--delegate', 'schedule:create'],
     }));
     const stop = startOutboxWatcher(outbox, { ...process.env }, 'forced-source', { cliPath: fixture });
     try {
@@ -82,6 +82,7 @@ describe('sandbox relay watcher host handoff', () => {
       expect(child.brief).toBe('bounded task');
       expect(child.argv).toContain('cli_target');
       expect(child.argv).toContain('oc_target');
+      expect(child.argv).toContain('schedule:create');
     } finally {
       stop();
     }

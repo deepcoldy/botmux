@@ -472,6 +472,17 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().httpProxy).toBeUndefined();
   });
 
+  it('keeps schedule delegation issuance and execution revocation independent', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      scheduleDelegation: { createEnabled: true, runEnabled: false, ignored: true },
+    }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().scheduleDelegation).toEqual({
+      createEnabled: true,
+      runEnabled: false,
+    });
+  });
+
   it('ignores a non-string / blank httpProxy', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({ httpProxy: 123 }));
     expect(readGlobalConfig().httpProxy).toBeUndefined();
