@@ -10,8 +10,9 @@
 import { describe, it, expect } from 'vitest';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, rmSync, statSync } from 'node:fs';
-import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
+import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, rmSync, statSync, chmodSync, utimesSync } from 'node:fs';
+import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, attachSandboxOutbox, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
+import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'sbx-'));
@@ -246,10 +247,12 @@ describe('prepareDirectSandbox tmux argument transport', () => {
       const optionBytes = readFileSync(plan.argsFile!);
       expect(optionBytes.length).toBeGreaterThan(16 * 1024);
       expect(optionBytes.includes(Buffer.from('space value'))).toBe(false);
+      plan.cleanup();
+      expect(existsSync(join(dataDir, 'sandboxes', 'long-tmux'))).toBe(false);
     } finally {
       plan?.cleanup();
       if (plan?.argsFile) expect(existsSync(plan.argsFile)).toBe(false);
-      rmSync(root, { recursive: true, force: true });
+      rmSandboxScratch(root);
     }
   });
 
@@ -278,11 +281,62 @@ describe('prepareDirectSandbox tmux argument transport', () => {
       })).toThrow(/NUL/);
       expect(existsSync(sessionRoot)).toBe(false);
     } finally {
-      rmSync(root, { recursive: true, force: true });
+      rmSandboxScratch(root);
     }
   });
 });
 
+
+describe('sandbox tree cleanup', () => {
+  it.each(['reattach', 'sweep'] as const)('removes a mode-000 mask during %s cleanup', method => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-cleanup-'));
+    const sessionId = 'closed-session';
+    const sessionRoot = join(root, 'sandboxes', sessionId);
+    const empty = join(sessionRoot, 'empty');
+    mkdirSync(empty, { recursive: true });
+    chmodSync(empty, 0o000);
+    try {
+      if (method === 'reattach') {
+        const plan = attachSandboxOutbox({ sessionId, dataDir: root });
+        expect(plan).not.toBeNull();
+        plan!.cleanup();
+      } else {
+        const old = new Date(Date.now() - 120_000);
+        utimesSync(sessionRoot, old, old);
+        // An active session must retain its mask and outbox.
+        sweepOrphanSandboxes(root, new Set([sessionId]));
+        expect(existsSync(sessionRoot)).toBe(true);
+        expect(statSync(empty).mode & 0o777).toBe(0);
+        sweepOrphanSandboxes(root, new Set());
+      }
+      expect(existsSync(sessionRoot)).toBe(false);
+    } finally {
+      rmSandboxScratch(root);
+    }
+  });
+
+  it('does not follow a replacement mask symlink during cleanup', () => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-cleanup-symlink-'));
+    const sessionId = 'closed-session';
+    const sessionRoot = join(root, 'sandboxes', sessionId);
+    const outside = join(root, 'outside');
+    mkdirSync(sessionRoot, { recursive: true });
+    mkdirSync(outside);
+    writeFileSync(join(outside, 'keep'), 'host data');
+    symlinkSync(outside, join(sessionRoot, 'empty'));
+    try {
+      const plan = attachSandboxOutbox({ sessionId, dataDir: root });
+      expect(plan).not.toBeNull();
+      plan!.cleanup();
+      expect(existsSync(sessionRoot)).toBe(false);
+      expect(readFileSync(join(outside, 'keep'), 'utf8')).toBe('host data');
+    } finally {
+      rmSandboxScratch(root);
+    }
+  });
+});
 
 // ── validateRelayRequest: pure schema + flag-allowlist boundary ─────────────
 // Regression for the "sandbox makes host read an arbitrary path" confused-deputy

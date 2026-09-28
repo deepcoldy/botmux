@@ -581,6 +581,14 @@ function reclaimMaskMounts(sessionRoot: string): void {
   reclaimMaskEntries(entries);
 }
 
+/** Remove the known-empty mode-000 mask before recursive traversal. rmdir
+ * needs write permission on its parent, not read permission on the mask itself.
+ * Keep the mask mode unchanged and never follow a replacement symlink. */
+function removeSandboxTree(sessionRoot: string): void {
+  try { rmdirSync(join(sessionRoot, 'empty')); } catch { /* absent or replaced */ }
+  try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
+}
+
 /** Spawn-setup rollback: reclaim the mountpoints we pre-created FROM THE
  *  IN-MEMORY accumulator (NOT the manifest — on the failure paths the manifest
  *  may never have been written, so reading it back would reclaim nothing and
@@ -590,7 +598,7 @@ function reclaimMaskMounts(sessionRoot: string): void {
  *  itself fails). */
 function rollbackSandboxSetup(sessionRoot: string, createdMasks: MaskMountEntry[]): void {
   reclaimMaskEntries(createdMasks);
-  try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
+  removeSandboxTree(sessionRoot);
 }
 
 /** Create a mask mountpoint on the host (all missing ancestors too), pushing
@@ -929,7 +937,7 @@ export function prepareDirectSandbox(opts: {
       // Reclaim empty deny-mask mountpoints we created on the host BEFORE
       // dropping the manifest with the rest of the tree.
       reclaimMaskMounts(sessionRoot);
-      try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
+      removeSandboxTree(sessionRoot);
     },
   };
 }
@@ -954,7 +962,7 @@ export function attachSandboxOutbox(opts: { sessionId: string; dataDir: string }
       // Reclaim empty deny-mask mountpoints we created on the host BEFORE
       // dropping the manifest with the rest of the tree.
       reclaimMaskMounts(sessionRoot);
-      try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
+      removeSandboxTree(sessionRoot);
     },
   };
 }
@@ -1009,7 +1017,7 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
     // BEFORE removing the tree (which holds the manifest). Only runs once we've
     // confirmed no live bwrap references the sid (liveSandboxSids above).
     reclaimMaskMounts(sessionRoot);
-    try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
+    removeSandboxTree(sessionRoot);
   }
 }
 
