@@ -466,7 +466,7 @@ botmux send --content-file $msg
 
 \`\`\`bash
 # 单图：默认追加到末尾
-botmux send --images /tmp/screenshot.png "截图如上，红框部分是问题所在。"
+botmux send --images "$TMPDIR/screenshot.png" "截图如上，红框部分是问题所在。"
 
 # 图文混排：占位符控制图片位置
 botmux send --images chart.png --images table.png <<'EOF'
@@ -489,7 +489,7 @@ EOF
 ### 带文件附件
 
 \`\`\`bash
-botmux send --files /tmp/report.pdf "报告已生成，请查收附件。"
+botmux send --files "$TMPDIR/report.pdf" "报告已生成，请查收附件。"
 \`\`\`
 
 ### 带视频预览
@@ -497,7 +497,7 @@ botmux send --files /tmp/report.pdf "报告已生成，请查收附件。"
 \`--videos <path>\` 发送本地 H.264 MP4 预览消息，可重复；\`--video-covers <path>\` 按顺序提供每个视频的封面图片（当前必须显式提供 cover）。视频会作为飞书/Lark media message 单独发送；正文存在时先发正文卡片，再发视频。
 
 \`\`\`bash
-botmux send --videos /tmp/replay.mp4 --video-covers /tmp/cover.png --no-mention "RRH replay preview"
+botmux send --videos "$TMPDIR/replay.mp4" --video-covers "$TMPDIR/cover.png" --no-mention "RRH replay preview"
 \`\`\`
 
 ### 原始飞书/Lark 卡片 JSON
@@ -507,7 +507,7 @@ botmux send --videos /tmp/replay.mp4 --video-covers /tmp/cover.png --no-mention 
 安全边界：自定义卡片是**纯展示 + open_url 跳转**——所有会触发回调的交互控件（回调按钮、下拉 select、person 选择、overflow、日期/时间选择、input、表单提交等）都会被拒绝，只保留展示元素（markdown/图片/多列/图表…）与 open_url 按钮。这样外部卡片无法误触 botmux 内部 close/restart/ask/relay/dashboard 等处理器。\`--card-file/--card-json\` 暂不和 \`--images\`/\`--files\`/\`--videos\`/\`--content-file\`/\`--voice\` 混用；素材需要先上传成飞书资源并写入卡片 JSON。
 
 \`\`\`bash
-botmux send --card-file /tmp/card.json --no-mention
+botmux send --card-file "$TMPDIR/card.json" --no-mention
 botmux send --card-json '{"schema":"2.0","body":{"direction":"vertical","elements":[{"tag":"markdown","content":"**Done**"}]}}' --mention-back
 \`\`\`
 
@@ -518,8 +518,8 @@ botmux send --card-json '{"schema":"2.0","body":{"direction":"vertical","element
 流程是 \`send\` 拿 \`messageId\` → \`card patch\` 按它更新：
 
 \`\`\`bash
-MID=$(botmux send --card-file /tmp/progress.json --no-mention | jq -r .messageId)
-botmux card patch --message-id "$MID" --card-file /tmp/progress-50.json
+MID=$(botmux send --card-file "$TMPDIR/progress.json" --no-mention | jq -r .messageId)
+botmux card patch --message-id "$MID" --card-file "$TMPDIR/progress-50.json"
 botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","body":{"direction":"vertical","elements":[{"tag":"markdown","content":"进度: 100%"}]}}'
 \`\`\`
 
@@ -538,12 +538,12 @@ botmux card patch --message-id "$MID" --card-json '{"schema":"2.0","body":{"dire
 需要连续输出感时，不要高频整卡 \`patch\`。先发送 Card 2.0 卡片，并给需要流式写入的 \`markdown\` 或 \`plain_text\` 组件设置唯一 \`element_id\`（字母开头、最多 20 字符），然后用 CardKit 原生流：
 
 \`\`\`bash
-MID=$(botmux send --card-file /tmp/progress.json --no-mention | jq -r .messageId)
+MID=$(botmux send --card-file "$TMPDIR/progress.json" --no-mention | jq -r .messageId)
 OPEN=$(botmux card stream open --message-id "$MID" --summary "执行中")
 STREAM_ID=$(printf '%s' "$OPEN" | jq -r .streamId)
 
 # write 传该 element 的完整最新内容；新增后缀由飞书原生打字机动画呈现
-botmux card stream write --stream-id "$STREAM_ID" --element-id work_log --content-file /tmp/work-log.md
+botmux card stream write --stream-id "$STREAM_ID" --element-id work_log --content-file "$TMPDIR/work-log.md"
 botmux card stream finish --stream-id "$STREAM_ID" --summary "已完成"
 \`\`\`
 
@@ -1434,9 +1434,9 @@ description: 多 bot 长期项目编排。仅当任务同时需要「多个 bot 
 建完把任务清单链接用 \`botmux send\` 发给用户，让他确认能在飞书任务里看到。
 
 ### 5. 逐个派活（开话题）
-对每个子项目，把简报写进 /tmp/brief-X.md，再：
+对每个子项目，把简报写进会话专属临时目录（如 \`$TMPDIR/brief-X.md\`），再：
 \`\`\`bash
-botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder" --bot "<reviewer_open_id>:名字:reviewer" --repo "<工作目录>" --brief-file /tmp/brief-X.md
+botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder" --bot "<reviewer_open_id>:名字:reviewer" --repo "<工作目录>" --brief-file "$TMPDIR/brief-X.md"
 \`\`\`
 **简报必须写清子 bot 的「完成协议」**，否则收不齐：
 - 你的飞书任务 ID 是 <task_guid>；
@@ -1458,7 +1458,7 @@ botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder"
 所有子项目完成 → 读各任务产出 → 给用户一份总汇总（做了什么、产出在哪、遗留项）。
 
 ## 登记（别丢上下文）
-把「子项目 ↔ task_guid ↔ 话题root ↔ 指派bot」记一张小表（可写本地 scratch，如 /tmp/orchestrate-<项目>.json）；断点续跑/被唤起时据此恢复。
+把「子项目 ↔ task_guid ↔ 话题root ↔ 指派bot」记一张小表（可写本地 scratch，如 \`$TMPDIR/orchestrate-<项目>.json\`）；断点续跑/被唤起时据此恢复。
 
 ## 注意
 - **没通过用户审批不要建板/派活。**

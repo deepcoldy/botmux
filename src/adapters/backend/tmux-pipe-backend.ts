@@ -415,7 +415,13 @@ export class TmuxPipeBackend implements SessionBackend {
     }
 
     // Step 1: create the fifo. mkfifo is POSIX; linux/darwin both have it.
-    spawnSync('mkfifo', [this.fifoPath], { stdio: 'ignore' });
+    const fifoCreation = spawnSync('mkfifo', [this.fifoPath], { encoding: 'utf8' });
+    if (fifoCreation.error || fifoCreation.status !== 0) {
+      const detail = fifoCreation.error?.message
+        || String(fifoCreation.stderr || '').trim()
+        || `exit=${fifoCreation.status}, signal=${fifoCreation.signal}`;
+      throw new Error(`Could not create tmux FIFO ${this.fifoPath}: ${detail}. Check temporary storage capacity and free inodes.`);
+    }
 
     // Step 2: open the read end with O_RDWR (no O_NONBLOCK).
     //

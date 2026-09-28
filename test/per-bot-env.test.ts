@@ -60,6 +60,9 @@ describe('sanitizePerBotEnv()', () => {
         CJADK_INTERACTIVE: '1',
         IS_SANDBOX: '1',
         SESSION_DATA_DIR: '/tmp',
+        TMPDIR: '/tmp/shared',
+        TMP: '/tmp/shared',
+        TEMP: '/tmp/shared',
         __OWNER_OPEN_ID: 'ou_x',
         // a legit key survives alongside the rejected ones
         ANTHROPIC_BASE_URL: 'https://api.z.ai/api/anthropic',
@@ -85,7 +88,8 @@ describe('isReservedPerBotEnvKey()', () => {
       'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SESSION_ID',
       'CLAUDE_CODE_ENTRYPOINT', 'CLAUDE_CODE_EXECPATH', 'CLAUDE_PID',
       'CODEX_HOME', 'GROK_HOME', 'DSH_HOME', 'LARKSUITE_CLI_DATA_DIR',
-      'CJADK_INTERACTIVE', 'IS_SANDBOX', 'SESSION_DATA_DIR', '__OWNER_OPEN_ID',
+      'CJADK_INTERACTIVE', 'IS_SANDBOX', 'SESSION_DATA_DIR',
+      'TMPDIR', 'TMP', 'TEMP', '__OWNER_OPEN_ID',
     ]) {
       expect(isReservedPerBotEnvKey(k), k).toBe(true);
     }

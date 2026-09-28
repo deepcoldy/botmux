@@ -149,12 +149,14 @@ describe('zmx env/probe helpers', () => {
   it('applies the stored socket address after payload stripping without changing TMPDIR', () => {
     const opts = {
       cwd: '/tmp', cols: 80, rows: 24,
-      env: { TMPDIR: '/tmp/caller', ZMX_DIR: '/tmp/caller-zmx', ZMX_SESSION: 'outer' },
+      env: { TMPDIR: '/tmp/caller', TMP: '/tmp/caller', TEMP: '/tmp/caller', ZMX_DIR: '/tmp/caller-zmx', ZMX_SESSION: 'outer' },
       injectEnv: { ZMX_DIR: '/tmp/payload-zmx' },
     };
     const env = zmxControlEnv(opts, '/tmp/recorded-zmx');
     expect(env.ZMX_DIR).toBe('/tmp/recorded-zmx');
     expect(env.TMPDIR).toBe('/tmp/caller');
+    expect(env.TMP).toBe('/tmp/caller');
+    expect(env.TEMP).toBe('/tmp/caller');
     expect(env.ZMX_SESSION).toBeUndefined();
     expect(opts.env.ZMX_DIR).toBe('/tmp/caller-zmx');
     expect(zmxFreshSessionEnv(opts, '/tmp/recorded-zmx').ZMX_DIR).toBe('/tmp/recorded-zmx');
