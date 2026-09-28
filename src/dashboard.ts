@@ -3077,14 +3077,14 @@ async function transferTeamGroupOwner(args: {
 }
 
 /** Dashboard has no daemon-local BotRegistry. Resolve personal feed-group
- * credentials against the matching daemon's live allowlist, just like
- * getOwnerOpenId does inside a daemon. Raw config / another app's open_id
- * cannot establish ownership, including after an owner was revoked. */
+ * credentials against the matching daemon's live allowlist, then fall back to
+ * this app's configured owner when no open_id is available, matching daemon
+ * feed-group calls. A resolved owner takes precedence over a removed one. */
 function withFeedGroupOwner(bot: BotConfig): BotConfig {
   const allowed = registry.getByAppId(bot.larkAppId)?.resolvedAllowedUsers ?? [];
   const ownerOpenId = bot.ownerOpenId && allowed.includes(bot.ownerOpenId)
     ? bot.ownerOpenId
-    : allowed.find(id => id.startsWith('ou_'));
+    : (allowed.find(id => id.startsWith('ou_')) ?? bot.ownerOpenId);
   if (!ownerOpenId) {
     throw new FeedGroupApiError(
       '无法确认该机器人的负责人，请确认机器人已上线且管理员身份解析成功。',
