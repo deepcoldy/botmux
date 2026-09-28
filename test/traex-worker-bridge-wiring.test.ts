@@ -119,13 +119,16 @@ describe('TRAE worker structured-bridge wiring', () => {
     // and writeInput cannot prove the session id belongs to this process. The
     // separate codexAdoptPendingPid fallback must stay adopt-only: populating it
     // for a fresh spawn makes the 1s bridge poller run pid-fd discovery before
-    // the first submit.
-    const start = workerSource.indexOf('// Wire pid + cwd so adapters');
+    // the first submit. Start before the async launcher resolver so bwrap and
+    // forge-traex leaf-pid rewiring is covered alongside direct/zellij wiring.
+    const start = workerSource.indexOf('const startTraexLauncherPidResolve');
     const end = workerSource.indexOf('// Bridge fallback:', start);
     const wiring = workerSource.slice(start, end);
     const matches = wiring.match(/claudeDataDir \|\| cfg\.cliId === 'grok' \|\| cfg\.cliId === 'traex'/g) ?? [];
     expect(matches.length).toBeGreaterThanOrEqual(2);
+    expect(wiring).toContain('.cliPid = realPid;');
     expect(wiring).toContain('.cliPid = wiredPid;');
+    expect(wiring).not.toContain('codexAdoptPendingPid = realPid;');
     expect(wiring).not.toContain('codexAdoptPendingPid = wiredPid;');
   });
 
