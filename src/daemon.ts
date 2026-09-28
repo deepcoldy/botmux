@@ -22,7 +22,12 @@ import {
   isVcMeetingAgentGloballyEnabled,
   vcMeetingAgentGlobalListenerBotAppId,
 } from './config.js';
-import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from './global-config.js';
+import {
+  readGlobalConfig,
+  repoPickerScanOptions,
+  isWorkflowFeatureEnabled,
+  SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
+} from './global-config.js';
 import { buildDashboardUrls, reportDashboardUrls } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
@@ -6708,9 +6713,11 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     const turnId = ds.managedTurnOrigin?.turnId;
     const active = ds.activeInteractiveTurn;
     const delegationPolicy = readGlobalConfig().scheduleDelegation;
+    const scheduleCreateDefaulted = body.suppressScheduleCreate !== true
+      && body.delegateScheduleCreate !== true
+      && delegationPolicy?.defaultOnDispatchFromBotAppIds?.includes(ds.larkAppId) === true;
     const scheduleCreateRequested = body.suppressScheduleCreate !== true
-      && (body.delegateScheduleCreate === true
-        || delegationPolicy?.defaultOnDispatchFromBotAppIds?.includes(ds.larkAppId) === true);
+      && (body.delegateScheduleCreate === true || scheduleCreateDefaulted);
     if (scheduleCreateRequested && delegationPolicy?.createEnabled !== true) {
       return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_disabled' });
     }
@@ -6762,6 +6769,12 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
           }, send,
         })
       : await send();
+    if (scheduleCreateDefaulted) {
+      logger.info(
+        `[schedule-delegation:audit] auto-attached schedule:create source=${ds.larkAppId} `
+        + `turn=${turnId ?? 'unknown'} chat=${chatId} targets=${targetAppIds.join(',')}`,
+      );
+    }
     return jsonRes(res, 200, { ok: true, messageId });
   } catch (error) {
     return jsonRes(res, 502, { ok: false, error: 'dispatch_delivery_failed', detail: error instanceof Error ? error.message : String(error) });
@@ -6789,6 +6802,9 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   if (!verified.ok || (ds && ds.larkAppId !== selfDaemonLarkAppId)) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_origin_unproven' });
   }
+  if (!scheduleAuthorityStore) {
+    return jsonRes(res, 503, { ok: false, error: 'schedule_authority_store_unavailable' });
+  }
   const task = body.task;
   if (!task || typeof task !== 'object' || Array.isArray(task)
     || typeof task.id !== 'string' || !/^[0-9a-f]{8}$/.test(task.id)
@@ -6798,6 +6814,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
     || typeof task.workingDir !== 'string' || !task.workingDir.trim()
     || typeof task.chatId !== 'string' || !/^oc_[A-Za-z0-9_-]{1,128}$/.test(task.chatId)
     || !['top-level', 'topic', 'new-topic'].includes(task.executionPosition)
+    || (task.deliver !== undefined && task.deliver !== 'origin' && task.deliver !== 'local')
     || task.larkAppId !== undefined && task.larkAppId !== (ds?.larkAppId ?? selfDaemonLarkAppId)) {
     return jsonRes(res, 400, { ok: false, error: 'schedule_delegation_scope_invalid' });
   }
@@ -6844,7 +6861,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       }
       if (task.chatId !== ds.chatId
         || (task.executionPosition !== 'top-level' && task.executionPosition !== 'topic')
-        || task.followActive === true || task.topicTitle !== undefined) {
+        || task.deliver === 'local' || task.followActive === true || task.topicTitle !== undefined) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_scope_invalid' });
       }
       if (task.executionPosition === 'topic' && (!expectedRoot || task.rootMessageId !== expectedRoot)) {
@@ -6893,6 +6910,7 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
         ? (direct ? task.rootMessageId : expectedRoot)
         : undefined,
       executionPosition: task.executionPosition,
+      deliver: task.deliver === 'local' ? 'local' as const : 'origin' as const,
       larkAppId: ds.larkAppId,
       creatorChatId: ds.chatId,
       creatorRootMessageId: expectedRoot,
@@ -6922,8 +6940,15 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       sourceSessionId,
       targetTurnId: turnId,
       targetGeneration: generation,
+      maxTasksPerTurn: readGlobalConfig().scheduleDelegation?.maxTasksPerTurn
+        ?? SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
     });
-    if (!result.ok) return jsonRes(res, 409, { ok: false, error: result.error });
+    if (!result.ok) {
+      return jsonRes(res, result.error === 'grant_task_limit' ? 403 : 409, {
+        ok: false,
+        error: result.error,
+      });
+    }
     return jsonRes(res, result.replay ? 200 : 201, { ok: true, task: result.task, replay: result.replay });
   } catch (error) {
     return jsonRes(res, 409, {
@@ -6959,6 +6984,9 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     && getDashboardAdminOpenIds(ds.larkAppId).includes(active.caller.requestUserOpenId);
   if (!verified.ok || (!hostAdmin && !currentHumanAdmin)) {
     return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_current_human_required' });
+  }
+  if (!scheduleAuthorityStore) {
+    return jsonRes(res, 503, { ok: false, error: 'schedule_authority_store_unavailable' });
   }
   const id = typeof body.id === 'string' && /^[0-9a-z_]{1,50}$/.test(body.id) ? body.id : '';
   const action = body.action;
@@ -27179,13 +27207,22 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // running in a separate node process) so dashboard event bus stays in sync.
   scheduleStore.setScheduleScope(cfg.larkAppId);
   migrateSharedSchedulesAtStartup(botConfigs.map(b => b.larkAppId), botConfigs[0]?.larkAppId ?? cfg.larkAppId);
-  scheduleAuthorityStore ??= ScheduleAuthorityStore.open(config.session.dataDir);
-  scheduleAuthorityStore.initializeApp(cfg.larkAppId, scheduleStore.listTasks());
-  scheduleStore.replaceAuthoritativeProjection(
-    scheduleAuthorityStore.listTasks(cfg.larkAppId),
-    cfg.larkAppId,
-  );
-  scheduler.setScheduleAuthorityStore(scheduleAuthorityStore);
+  try {
+    scheduleAuthorityStore ??= ScheduleAuthorityStore.open(config.session.dataDir);
+    scheduleAuthorityStore.initializeApp(cfg.larkAppId, scheduleStore.listTasks());
+    const authoritativeTasks = scheduleAuthorityStore.listTasks(cfg.larkAppId);
+    scheduleStore.replaceAuthoritativeProjection(authoritativeTasks, cfg.larkAppId);
+    scheduler.setScheduleAuthorityStore(scheduleAuthorityStore);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    logger.error(
+      `[scheduler] authority initialization failed for ${cfg.larkAppId}; `
+      + `scheduled execution and mutations are disabled until recovery: ${detail}`,
+    );
+    try { scheduleAuthorityStore?.close(); } catch { /* no-op */ }
+    scheduleAuthorityStore = null;
+    scheduler.setScheduleAuthorityUnavailable(error);
+  }
   void migrateOverloadAlertAtStartup(botConfigs.map(b => ({ larkAppId: b.larkAppId, apiOnly: b.apiOnly })));
   scheduleStore.startExternalWriteWatcher();
   logger.info(`Bot ${idx}/${botConfigs.length}: ${cfg.larkAppId} (cli: ${cfg.cliId})`)

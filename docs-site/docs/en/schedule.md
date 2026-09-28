@@ -32,12 +32,13 @@ The host must also opt in through `~/.botmux/config.json` (off by default):
 {
   "scheduleDelegation": {
     "createEnabled": true,
-    "runEnabled": true
+    "runEnabled": true,
+    "maxTasksPerTurn": 64
   }
 }
 ```
 
-The initial version is single-hop and bound to the target bot's current dispatch turn. It has no fixed five-minute deadline: multiple distinct tasks may be created while that turn is live, and the authority ends with the turn. Each canonical request gets a deterministic task ID, so an identical retry returns the original task. Tasks may run only in the original dispatch chat, at chat top level or in the current topic. `--new-topic`, `--follow-active`, multi-chat targets, and onward delegation are rejected. The grant authorizes create only, not update/remove/pause/resume/run.
+The initial version is single-hop and bound to the target bot's current dispatch turn. It has no fixed five-minute deadline: multiple distinct tasks may be created while that turn is live, and the authority ends with the turn. A turn may create at most 64 tasks by default; `maxTasksPerTurn` accepts a host-configured limit from 1 through 1024. Each canonical request gets a deterministic task ID, so an identical retry returns the original task without consuming another slot. Tasks may run only in the original dispatch chat, at chat top level or in the current topic. `--new-topic`, `--follow-active`, multi-chat targets, and onward delegation are rejected. The grant authorizes create only, not update/remove/pause/resume/run.
 
 To make every managed dispatch from a selected orchestrator request the capability without changing each SOP, configure the source bot id:
 
@@ -55,6 +56,8 @@ Use `--no-delegate schedule:create` to opt out for one dispatch.
 Delegated tasks receive no personal tool run scopes by default. The target bot must enable the `triggerUserAuth` isolation wrappers so a reused session cannot inherit an earlier identity; otherwise execution fails closed. `createEnabled:false` stops new grants only, while `runEnabled:false` revokes future runs of existing delegated tasks.
 
 The host SQLite store is authoritative for task definitions, grants, pause/completion state, and run claims; `schedules.json` is a rebuildable projection. The first upgraded start records the then-existing task inventory once as legacy. Later JSON additions, copies, or edits gain no execution authority. This boundary protects managed CLIs and the file sandbox; it does not claim to defend against a process running as the same OS user with unrestricted access to host keys and authority databases.
+
+Consequently, writes from `schedule add/update/remove/pause/resume/run` must reach the owning bot daemon. If that daemon is unavailable or its authority store failed to initialize, the command fails explicitly instead of editing `schedules.json` and leaving behind a task that appears to exist but can never run.
 
 ## Supported Formats
 

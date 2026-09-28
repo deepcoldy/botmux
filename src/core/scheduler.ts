@@ -34,11 +34,26 @@ let lastTickTz: string | null = null;
 let ownerAppId: string | null = null;
 let ownerIsPrimary = false;
 let authorityStore: ScheduleAuthorityStore | null = null;
+let authorityUnavailable: string | null = null;
 
 /** Installed only in daemon processes. CLI processes keep using the JSON
  * projection for display, but all daemon execution/mutation uses SQLite. */
 export function setScheduleAuthorityStore(store: ScheduleAuthorityStore | null): void {
   authorityStore = store;
+  authorityUnavailable = null;
+}
+
+/** Keep the daemon alive when authority bootstrap fails, while ensuring the
+ * projection can neither execute nor accept mutations as a fallback. */
+export function setScheduleAuthorityUnavailable(error: unknown): void {
+  authorityStore = null;
+  authorityUnavailable = error instanceof Error ? error.message : String(error);
+}
+
+function assertScheduleAuthorityAvailable(): void {
+  if (authorityUnavailable) {
+    throw new Error(`schedule_authority_store_unavailable: ${authorityUnavailable}`);
+  }
 }
 
 /** Daemon-owned runtime state update used by session materialization/recovery.
@@ -49,10 +64,12 @@ export function updateRuntimeTaskState(
   updates: Partial<ScheduledTask>,
   appId?: string,
 ): boolean {
+  assertScheduleAuthorityAvailable();
   return !!mutateRuntimeTask(id, task => ({ ...task, ...updates }), appId);
 }
 
 export function rollbackUnpublishedRuntimeTask(id: string, appId: string): boolean {
+  assertScheduleAuthorityAvailable();
   if (!authorityStore?.isInitialized(appId)) return scheduleStore.removeTask(id, appId);
   const removed = authorityStore.rollbackUnpublishedDirectCreate(appId, id);
   if (removed) scheduleStore.removeAuthoritativeTaskProjection(id, appId);
@@ -65,6 +82,7 @@ function authorityAppId(appId?: string): string | undefined {
 }
 
 function runtimeTasks(): ScheduledTask[] {
+  if (authorityUnavailable) return [];
   if (!authorityStore) return scheduleStore.listTasks();
   const appId = authorityAppId();
   if (!appId || !authorityStore.isInitialized(appId)) return scheduleStore.listTasks();
@@ -72,6 +90,7 @@ function runtimeTasks(): ScheduledTask[] {
 }
 
 function runtimeTask(id: string, appId?: string): ScheduledTask | undefined {
+  if (authorityUnavailable) return;
   if (!authorityStore) return scheduleStore.getTask(id, appId);
   const effectiveAppId = authorityAppId(appId);
   if (!effectiveAppId || !authorityStore?.isInitialized(effectiveAppId)) {
@@ -857,6 +876,7 @@ export function addTask(params: {
   /** See ScheduledTask.reasoningEffort. */
   reasoningEffort?: ScheduleReasoningEffort;
 }): ScheduledTask {
+  assertScheduleAuthorityAvailable();
   const targets = params.chatIds === undefined
     ? { chatId: params.chatId }
     : scheduleStore.normalizeScheduleChatTargets({
@@ -947,7 +967,9 @@ export function commitDelegatedTask(input: {
   sourceSessionId: string;
   targetTurnId: string;
   targetGeneration: number;
+  maxTasksPerTurn: number;
 }): CommitDelegatedScheduleResult {
+  assertScheduleAuthorityAvailable();
   if (!authorityStore?.isInitialized(input.params.larkAppId)) {
     throw new Error('schedule_authority_store_unavailable');
   }
@@ -1005,6 +1027,7 @@ export function commitDelegatedTask(input: {
     sourceSessionId: input.sourceSessionId,
     targetTurnId: input.targetTurnId,
     targetGeneration: input.targetGeneration,
+    maxTasksPerTurn: input.maxTasksPerTurn,
   });
   if (result.ok) project(result.task);
   return result;

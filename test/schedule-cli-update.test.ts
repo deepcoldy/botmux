@@ -10,6 +10,7 @@ import { managedOriginCapabilityPath, replaceManagedOriginCapabilityFile } from 
 import { MANAGED_ORIGIN_PROOF_DOMAIN, writeManagedOriginAttestationProof, type ManagedOriginAttestation } from '../src/core/managed-origin-attestation.js';
 import { readProcessStartIdentity } from '../src/core/session-marker.js';
 import { readSchedulePromptUpdate } from '../src/cli/schedule-update.js';
+import { SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from '../src/core/dispatch-user-delegation.js';
 import {
   activateSchedulePrecondition,
   resolveSchedulePrecondition,
@@ -69,6 +70,53 @@ async function managed(f: ReturnType<typeof fixture>, customize?: (proof: Manage
       larkAppId: app, requiresCodexAppLedger: false, scheduleCreator: { ok: true, ownerUnionId: 'on_owner' } };
     calls++;
     customize?.(proof, calls);
+    if (req.url === SCHEDULE_DELEGATED_ADD_ROUTE) {
+      if (proof.turnId !== 'om_live') {
+        res.statusCode = 409;
+        return res.end(JSON.stringify({ ok: false, error: 'provenance changed before write' }));
+      }
+      if (proof.larkAppId !== app) {
+        res.statusCode = 403;
+        return res.end(JSON.stringify({ ok: false, error: 'schedule creator bot does not match the session' }));
+      }
+      if (proof.scheduleCreator?.ok !== true) {
+        res.statusCode = 401;
+        return res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+      }
+      const created = { ...request.task, parsed: { kind: 'cron', expr: request.task.schedule, display: 'daily' },
+        ownerOpenId: 'ou_owner', ownerUnionId: 'on_owner', enabled: true,
+        createdAt: '2026-09-28T00:00:00.000Z' };
+      const rows = f.read(); rows[created.id] = created; writeFileSync(f.path, JSON.stringify(rows));
+      res.statusCode = 201;
+      return res.end(JSON.stringify({ ok: true, task: created }));
+    }
+    if (req.url === SCHEDULE_MANAGED_MUTATE_ROUTE) {
+      if (proof.turnId !== 'om_live') {
+        res.statusCode = 409;
+        return res.end(JSON.stringify({ ok: false, error: 'provenance changed before write' }));
+      }
+      if (proof.larkAppId !== app) {
+        res.statusCode = 403;
+        return res.end(JSON.stringify({ ok: false, error: 'schedule creator bot does not match the session' }));
+      }
+      if (proof.scheduleCreator?.ok !== true) {
+        res.statusCode = 403;
+        return res.end(JSON.stringify({ ok: false, error: 'current turn caller is not an allowed bot operator' }));
+      }
+      const rows = f.read();
+      const current = rows[request.id];
+      if (!current) {
+        res.statusCode = 404;
+        return res.end(JSON.stringify({ ok: false, error: 'schedule_not_found' }));
+      }
+      if (current.preconditionRef) {
+        res.statusCode = 409;
+        return res.end(JSON.stringify({ ok: false, error: 'schedule_precondition_dashboard_update_required' }));
+      }
+      rows[request.id] = { ...current, prompt: request.prompt };
+      writeFileSync(f.path, JSON.stringify(rows));
+      return res.end(JSON.stringify({ ok: true }));
+    }
     writeManagedOriginAttestationProof({ dataDir: f.dataDir, proof: {
       ...proof, domain: MANAGED_ORIGIN_PROOF_DOMAIN, version: 1, nonce: request.nonce,
       channelId: channel, issuedAtMs: Date.now(),
@@ -82,6 +130,7 @@ async function managed(f: ReturnType<typeof fixture>, customize?: (proof: Manage
     sessionId: sid, channelId: channel, capability, turnId: 'om_live', larkAppId: app, ipcPort: port,
   }));
   Object.assign(f.env, { BOTMUX_SESSION_ID: sid, BOTMUX_ORIGIN_CHANNEL_ID: channel, BOTMUX_READ_ISOLATION: '1' });
+  f.env.BOTMUX_DAEMON_IPC_PORT = String(port);
   return () => calls;
 }
 
@@ -92,12 +141,14 @@ describe('schedule CLI prompt updates', () => {
     expect(result.code, result.output).toBe(0);
     expect(result.output).toContain('--prompt TEXT | --prompt-file FILE');
   });
-  it('updates from a UTF-8 file and preserves the task identity, timing, position and history', async () => {
+  it('fails explicitly instead of mutating JSON when the daemon route is unavailable', async () => {
     const f = fixture(); const prompt = '新的完整提示词\n第二行\n';
     const file = join(f.root, 'prompt.md'); writeFileSync(file, prompt);
+    const before = readFileSync(f.path, 'utf8');
     const result = await f.run(['update', f.task.id, '--prompt-file', file]);
-    expect(result.code, result.output).toBe(0);
-    expect(f.read()).toEqual({ [f.task.id]: { ...f.task, prompt } });
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain('daemon 不在线');
+    expect(readFileSync(f.path, 'utf8')).toBe(before);
   });
   it('rejects missing, empty, conflicting and unknown input without touching the old task', async () => {
     const f = fixture(); const before = readFileSync(f.path, 'utf8');
@@ -126,6 +177,15 @@ describe('schedule CLI prompt updates', () => {
     expect(calls()).toBe(4);
     expect(readPersistedSessionRows(f.dataDir, app)[sid].ownerOpenId).toBeUndefined();
   });
+  it('keeps the original creator-auth error when delegated add returns non-OK', async () => {
+    const f = fixture();
+    await managed(f, proof => { proof.scheduleCreator = { ok: false, error: 'caller_not_allowed' }; });
+    const result = await f.run(['add', '0 12 * * *', 'new task', '--id', '11223344']);
+    expect(result.code, result.output).not.toBe(0);
+    expect(result.output).toContain('not an allowed bot operator');
+    expect(result.output).not.toContain('unauthorized');
+    expect(f.read()['11223344']).toBeUndefined();
+  });
   it('uses the daemon proof when host ancestry is visible but bots.json is unavailable', async () => {
     const f = fixture(); const calls = await managed(f);
     const markers = join(f.dataDir, '.botmux-cli-pids'); mkdirSync(markers, { recursive: true });
@@ -143,7 +203,7 @@ describe('schedule CLI prompt updates', () => {
     // cannot rebind it; a successful update here would leave every future fire
     // failing resolution with canonical_input_mismatch and the task silently
     // never running again.
-    const f = fixture();
+    const f = fixture(); await managed(f);
     const staged = stageSchedulePrecondition(app, f.task.id, {
       enabled: true, source: { kind: 'inline', script: 'exit 0' },
     }, { dataDir: f.dataDir });

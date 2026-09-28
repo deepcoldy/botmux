@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
 import { scheduleCreateCapabilities } from '../src/core/dispatch-user-delegation.js';
 import { computeInputHash } from '../src/utils/canonical-input-hash.js';
+import { SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN } from '../src/global-config.js';
 
 const source = ts.createSourceFile(
   'daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true,
@@ -62,6 +63,8 @@ function harness(overrides: Record<string, unknown> = {}) {
     listChatMemberOpenIds: async () => ['ou_user_target'],
     resolveUnionIdFromOpenId: async () => 'on_user',
     computeInputHash,
+    SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
+    scheduleAuthorityStore: {},
     createHash,
     scheduler: { commitDelegatedTask, addTask: vi.fn() },
   };
@@ -77,10 +80,20 @@ describe('delegated schedule add route', () => {
       grantId: 'dispatch:delivery-1:cli_target',
       sourceMessageId: 'om_kickoff', sourceSessionId: 'source-session',
       targetTurnId: 'om_kickoff', targetGeneration: 7,
+      maxTasksPerTurn: SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
       control: { openId: 'ou_user_target', unionId: 'on_user', runScopes: [] },
       params: expect.objectContaining({ larkAppId: 'cli_target', chatId: 'oc_chat',
         executionPosition: 'topic', rootMessageId: 'om_root' }),
     }));
+  });
+
+  it('returns a clear forbidden response when the turn task limit is exhausted', async () => {
+    const h = harness();
+    h.commitDelegatedTask.mockReturnValue({ ok: false, error: 'grant_task_limit' });
+    expect(await h.run()).toEqual({
+      status: 403,
+      value: { ok: false, error: 'grant_task_limit' },
+    });
   });
 
   it.each([

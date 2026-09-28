@@ -32,12 +32,13 @@ botmux dispatch --bot-app cli_target --title "轮询任务" --brief "创建并�
 {
   "scheduleDelegation": {
     "createEnabled": true,
-    "runEnabled": true
+    "runEnabled": true,
+    "maxTasksPerTurn": 64
   }
 }
 ```
 
-首版委托严格单跳，并绑定目标 Bot 的当前 dispatch turn；不设固定的 5 分钟期限，turn 存活期间可创建多个不同任务，turn 结束即失效。每个 canonical request 会得到确定性 task ID，相同请求重试返回原任务。任务只允许落在原派发群的顶层或当前话题；不支持 `--new-topic`、`--follow-active`、多群或继续转委托。委托只允许创建任务，不授予 update/remove/pause/resume/run。
+首版委托严格单跳，并绑定目标 Bot 的当前 dispatch turn；不设固定的 5 分钟期限，turn 存活期间可创建多个不同任务，turn 结束即失效。每个 turn 默认最多创建 64 个任务，可通过 `maxTasksPerTurn` 在 1–1024 间调整。每个 canonical request 会得到确定性 task ID，相同请求重试返回原任务且不重复计数。任务只允许落在原派发群的顶层或当前话题；不支持 `--new-topic`、`--follow-active`、多群或继续转委托。委托只允许创建任务，不授予 update/remove/pause/resume/run。
 
 若某个 orchestrator 的所有受管 dispatch 都应默认附带该能力，可按来源 Bot 配置，无需修改每条 SOP：
 
@@ -55,6 +56,8 @@ botmux dispatch --bot-app cli_target --title "轮询任务" --brief "创建并�
 委托任务默认没有真人工具运行权限。目标 Bot 必须启用 `triggerUserAuth` 的隔离 wrapper 才会执行，以保证复用会话时不会继承历史身份；否则任务会 fail-closed。`createEnabled:false` 只停止新签发，`runEnabled:false` 才撤销已有委托任务的后续运行。
 
 任务定义、授权、启停/完成状态和运行 claim 以宿主侧 SQLite 为准，`schedules.json` 只是可重建投影。首次升级会把当时已有任务清单一次性登记为 legacy；之后新增、复制或改写 JSON 记录不会获得执行资格。该边界保护受管 CLI 与文件沙盒，不承诺抵御能以同一系统用户任意读取宿主密钥和授权库的进程。
+
+因此 `schedule add/update/remove/pause/resume/run` 的写操作必须到达所属 Bot daemon；daemon 不可用或权威库初始化失败时命令会明确报错，不会只改写 `schedules.json` 后制造一个看似存在但永不执行的任务。
 
 ## 支持的格式
 

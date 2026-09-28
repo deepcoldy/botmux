@@ -173,7 +173,11 @@ export interface ScheduleDelegationGlobalConfig {
   runEnabled?: boolean;
   /** Source orchestrator app ids whose managed dispatches request schedule:create by default. */
   defaultOnDispatchFromBotAppIds?: string[];
+  /** Maximum distinct delegated tasks one target turn may commit. Default 64. */
+  maxTasksPerTurn?: number;
 }
+
+export const SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN = 64;
 
 export interface GlobalConfig {
   lang?: Locale;
@@ -567,6 +571,8 @@ function readScheduleDelegation(raw: unknown): ScheduleDelegationGlobalConfig | 
   const out: ScheduleDelegationGlobalConfig = {};
   if (typeof value.createEnabled === 'boolean') out.createEnabled = value.createEnabled;
   if (typeof value.runEnabled === 'boolean') out.runEnabled = value.runEnabled;
+  const maxTasksPerTurn = readPositiveInteger(value.maxTasksPerTurn);
+  if (maxTasksPerTurn !== undefined) out.maxTasksPerTurn = Math.min(maxTasksPerTurn, 1024);
   if (Array.isArray(value.defaultOnDispatchFromBotAppIds)) {
     const appIds = [...new Set(value.defaultOnDispatchFromBotAppIds.filter(
       (item): item is string => typeof item === 'string' && /^cli_[A-Za-z0-9_-]{1,128}$/.test(item),

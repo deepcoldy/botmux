@@ -4,7 +4,7 @@
 
 ## 决定
 
-跨机器人创建定时任务使用独立的 `schedule:create` capability，不恢复 session owner 或环境变量 fallback。来源 daemon 仅在当前回合由真人管理员直接触发、宿主 `scheduleDelegation.createEnabled` 已开启且 dispatch 显式传入 `--delegate schedule:create` 时签发 v2 委托。
+跨机器人创建定时任务使用独立的 `schedule:create` capability，不恢复 session owner 或环境变量 fallback。来源 daemon 仅在当前回合由真人管理员直接触发、宿主 `scheduleDelegation.createEnabled` 已开启，且 dispatch 显式请求该能力或命中受管来源 Bot 默认策略时签发 v2 委托。
 
 目标 daemon 将精确消息绑定的 v2 委托兑换为当前目标 dispatch turn 的创建权。首版严格单跳；同一 live turn 可以创建多个不同任务，turn 结束即失效，不使用固定墙钟 TTL。仅允许目标 Bot 在原群顶层或当前 dispatch 话题执行，不支持多群、`new-topic`、`follow-active` 或继续转委托。真实 current actor 仍是发消息的 Bot，不冒充原真人。
 
@@ -36,6 +36,9 @@
 
 - v1 委托永远没有 schedule 权限。
 - 显式请求发送给旧 daemon 时必须明确失败，不能静默创建 ownerless task。
+- 所有 CLI 写操作都必须经所属 Bot daemon 提交到权威库；daemon 或权威库不可用时明确失败，不回退为只写 `schedules.json`。
 - 首次升级迁移是一次性的宿主信任边界，后续未知 JSON 行不会被识别为 legacy。
 - 非沙箱测试只证明受管入口遵守协议。本设计不抵御与 daemon 同 UID、可任意读取或改写宿主密钥和 SQLite 权威库的进程；那属于操作系统隔离边界。
 - `scheduleDelegation.defaultOnDispatchFromBotAppIds` 可让指定来源 orchestrator 的每次受管 dispatch 默认请求该能力；`--no-delegate schedule:create` 可对单次派发降权。
+- v2 capability 没有独立的墙钟 TTL：它的寿命严格等于目标 Bot 的同一个 live dispatch turn。新 turn、worker generation 变化或来源记录不再匹配都会拒绝兑换；很长的 turn 会在其整个生命周期内保留创建权。
+- 一个 turn 可以创建多个不同任务，但最多为 `scheduleDelegation.maxTasksPerTurn`（默认 64，宿主可在 1–1024 间配置）。相同 canonical request 返回同一任务回执且不重复计数，超过上限明确拒绝。

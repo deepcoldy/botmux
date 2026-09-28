@@ -7146,18 +7146,6 @@ async function detectAuthenticatedCurrentSession(): Promise<CurrentSession | nul
   };
 }
 
-/** Re-attest at the effect boundary; detached calls must not acquire authority. */
-async function revalidateScheduleCreator(current: CurrentSession | null): Promise<CurrentSession | null> {
-  if (!current) return null;
-  const fresh = await detectAuthenticatedCurrentSession();
-  if (!fresh || fresh.sessionId !== current.sessionId || fresh.turnId !== current.turnId
-    || fresh.larkAppId !== current.larkAppId || fresh.ownerOpenId !== current.ownerOpenId
-    || fresh.ownerUnionId !== current.ownerUnionId) {
-    throw new Error('schedule creator provenance changed before write');
-  }
-  return fresh;
-}
-
 /** Pick a value from --flag <value> or --flag=value style args. */
 function argValue(args: string[], ...flags: string[]): string | undefined {
   for (let i = 0; i < args.length; i++) {
@@ -7665,9 +7653,8 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     }
 
     const cur = await detectCurrentSession();
-    let authenticatedCur: CurrentSession | null = null;
     let creatorAuthError: unknown;
-    try { authenticatedCur = await detectAuthenticatedCurrentSession(); }
+    try { await detectAuthenticatedCurrentSession(); }
     catch (error) { creatorAuthError = error; }
     const explicitTaskId = argValue(rest, '--id');
     if (rest.includes('--id') && !explicitTaskId) {
@@ -7682,12 +7669,10 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     const explicitRootMessageId = argValue(rest, '--root-msg-id');
     const rootMessageId = explicitRootMessageId
       ?? (chatId && chatId === cur?.chatId ? cur.rootMessageId : undefined);
-    // Owner resolution mirrors the store-scope resolution above (flag →
-    // session marker → daemon-injected env): a sandboxed session without a
-    // readable marker must still stamp its own bot as owner, or the task
-    // would land in this bot's store as OWNERLESS — which only the primary
-    // daemon executes — and never fire (codex review P1).
-    const larkAppId = cliScopeAppId;
+    // Resolve the daemon that owns the authoritative task store. A bare host
+    // terminal uses the primary bot selected above; managed sessions stay
+    // pinned to their own app.
+    const larkAppId = cliScopeAppId ?? scheduleStore.getScheduleScope() ?? undefined;
     const workingDir = argValue(rest, '--workdir') ?? cur?.workingDir ?? process.cwd();
     const name = argValue(rest, '--name') ?? (promptArg.length > 20 ? promptArg.slice(0, 20) + '…' : promptArg);
     const legacyDeliver = argValue(rest, '--deliver') as 'origin' | 'local' | 'new-topic' | undefined;
@@ -7796,6 +7781,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
               rootMessageId: executionPosition === 'topic' ? rootMessageId : undefined,
               executionPosition,
               larkAppId,
+              deliver,
               silent,
               model,
               reasoningEffort,
@@ -7804,24 +7790,19 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
             } },
           });
         } catch (error) {
-          // A direct-human fixture/standalone managed process can carry a valid
-          // creator proof while its daemon is offline. Preserve that historical
-          // local path; a bot-authored turn has no such fallback.
-          if (creatorAuthError) throw error;
+          if (creatorAuthError) throw creatorAuthError;
+          throw error;
         }
         if (response) {
           const body = await response.json() as { ok?: boolean; task?: any; error?: string; detail?: string };
           if (!response.ok || body.ok !== true || !body.task) {
+            if (creatorAuthError) throw creatorAuthError;
             throw new Error(body.detail ?? body.error ?? `HTTP ${response.status}`);
           }
           task = body.task;
         }
       }
-      const hostDaemonAvailable = !cur && larkAppId ? (() => {
-        try { return !!findDaemon(larkAppId)?.ipcPort && !!loadDaemonIpcSecret(); }
-        catch { return false; }
-      })() : false;
-      if (!cur && larkAppId && hostDaemonAvailable) {
+      if (!cur && larkAppId) {
         const hostTaskId = explicitTaskId ?? randomBytes(4).toString('hex');
         const response = await postCurrentSessionDaemonRoute({
           path: SCHEDULE_DELEGATED_ADD_ROUTE,
@@ -7832,6 +7813,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
             workingDir, chatId,
             rootMessageId: executionPosition === 'topic' ? rootMessageId : undefined,
             executionPosition, larkAppId, silent, model, reasoningEffort,
+            deliver,
             ...(wantsFollowActive ? { followActive: true } : {}),
             ...(topicTitle ? { topicTitle } : {}),
           } },
@@ -7844,51 +7826,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       }
       if (!task) {
         if (creatorAuthError) throw creatorAuthError;
-      // Identity-bearing task fields are a write authority. Re-attest at the
-      // effect boundary so a turn rotation cannot carry an earlier proof into
-      // a later schedule write. If the first lookup was ownerless, do not
-      // opportunistically gain an identity at this later point.
-      authenticatedCur = await revalidateScheduleCreator(authenticatedCur);
-      task = scheduler.addTask({
-        id: explicitTaskId,
-        name,
-        schedule: rawSchedule,
-        parsed,
-        prompt: promptArg,
-        workingDir,
-        chatId,
-        // Only topic execution keeps the captured root; at top-level the root
-        // is dropped so toggles can never pull execution back into the
-        // originating (e.g. adopted) topic.
-        rootMessageId: executionPosition === 'topic' ? rootMessageId : undefined,
-        larkAppId,
-        creatorChatId: cur?.chatId,
-        creatorRootMessageId: cur?.rootMessageId,
-        creatorLarkAppId: cur?.larkAppId,
-        // Stamp the creator (sandboxed session owner) so the task's scheduled
-        // turns can authenticate workflow commands as them. The daemon
-        // re-checks the owner is still allowed at every run mutation.
-        // Creator identity is authority-bearing. It comes only from the
-        // procStart-bound live ancestor marker, never BOTMUX_SESSION_ID or
-        // BOTMUX_OWNER_OPEN_ID environment fallbacks. The app equality guard
-        // prevents an authenticated session from lending app-scoped open_id to
-        // an explicitly selected different bot store.
-        ownerOpenId: authenticatedCur && authenticatedCur.larkAppId === larkAppId
-          ? authenticatedCur.ownerOpenId
-          : undefined,
-        ownerUnionId: authenticatedCur && authenticatedCur.larkAppId === larkAppId
-          ? authenticatedCur.ownerUnionId
-          : undefined,
-        chatType: cur?.chatType === 'p2p' ? 'p2p' : 'topic_group',
-        scope,
-        executionPosition,
-        topicTitle,
-        deliver,
-        silent,
-        followActive: wantsFollowActive ? true : undefined,
-        model,
-        reasoningEffort,
-      });
+        throw new Error('无法确定可用的 Bot daemon；定时任务未创建。');
       }
     } catch (err) {
       // Sandboxed sessions can only write their OWN bot's store — a cross-bot
@@ -7927,37 +7865,37 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     process.exit(1);
   }
 
-  // Id-addressed op missed the bound store: locate the id across every
-  // READABLE bot store (bare-terminal admin usage) and rebind the scope to the
-  // owning bot for this one-shot process. Sandboxed callers cannot read
-  // sibling stores, so they stay confined to their own tasks by construction.
-  const retargetIfElsewhere = (): boolean => {
-    const hit = scheduleStore.findTaskAcrossBots(id, allBotAppIds());
-    if (!hit || hit.appId === scheduleStore.getScheduleScope()) return false;
-    scheduleStore.setScheduleScope(hit.appId);
-    console.log(`（任务属于 bot ${hit.appId} 的存储）`);
-    return true;
-  };
-
   // Persistent task-management actions are distinct from schedule:create.
   // In a managed session every mutation needs its own current-human proof; a
   // bot-authored dispatch turn cannot reuse its create grant to alter, resume,
-  // delete or force-run any task. Bare host-terminal administration retains
-  // the historical local path.
-  const mutationSession = detectCurrentSession();
+  // delete or force-run any task. Host-terminal administration authenticates
+  // to the owning daemon; neither path falls back to editing schedules.json.
+  const mutationSession = await detectCurrentSession();
   if (sub !== 'update' && mutationSession) {
     await detectAuthenticatedCurrentSession();
   }
-  const tryManagedMutation = async (
+  const managedMutation = async (
     action: 'update' | 'remove' | 'pause' | 'resume' | 'run',
     extra: Record<string, unknown> = {},
-  ): Promise<boolean> => {
-    const mutationAppId = mutationSession?.larkAppId ?? cliScopeAppId;
-    if (!mutationAppId) return false;
+  ): Promise<void> => {
+    let mutationAppId = mutationSession?.larkAppId ?? cliScopeAppId
+      ?? scheduleStore.getScheduleScope() ?? undefined;
+    if (!mutationSession) {
+      const hit = scheduleStore.findTaskAcrossBots(id, allBotAppIds());
+      if (hit) {
+        mutationAppId = hit.appId;
+        scheduleStore.setScheduleScope(hit.appId);
+      }
+    }
+    if (!mutationAppId) throw new Error('无法确定任务所属 Bot；未执行任何修改。');
     if (!mutationSession) {
       try {
-        if (!findDaemon(mutationAppId)?.ipcPort || !loadDaemonIpcSecret()) return false;
-      } catch { return false; }
+        if (!findDaemon(mutationAppId)?.ipcPort || !loadDaemonIpcSecret()) {
+          throw new Error('daemon unavailable');
+        }
+      } catch {
+        throw new Error('当前 Bot daemon 不在线；未执行任何定时任务修改。');
+      }
     }
     let response: Response;
     try {
@@ -7967,40 +7905,18 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
         larkAppId: mutationAppId,
         body: { action, id, larkAppId: mutationAppId, ...extra },
       });
-    } catch { return false; }
+    } catch (error) {
+      throw new Error(`无法连接当前 Bot daemon；未执行任何定时任务修改：${error instanceof Error ? error.message : String(error)}`);
+    }
     const body = await response.json() as { ok?: boolean; error?: string };
     if (!response.ok || body.ok !== true) throw new Error(body.error ?? `HTTP ${response.status}`);
-    return true;
   };
 
   switch (sub) {
     case 'update': {
       const prompt = readSchedulePromptUpdate(rest);
-      const authenticatedCur = await detectAuthenticatedCurrentSession();
-      if (await tryManagedMutation('update', { prompt })) {
-        console.log(`✅ 已更新任务 ${id} 的 prompt；后续执行生效，未触发补跑。`);
-        break;
-      }
-      if (!scheduleStore.getTask(id) && !retargetIfElsewhere()) {
-        throw new Error(`未找到任务 ${id}`);
-      }
-      if (authenticatedCur && authenticatedCur.larkAppId !== scheduleStore.getScheduleScope()) {
-        throw new Error('沙盒会话只能管理自己 bot 的任务。');
-      }
-      await revalidateScheduleCreator(authenticatedCur);
-      // A protected precondition sidecar records a hash of the task's canonical
-      // input (prompt included) and lives in a host-only directory the sandboxed
-      // CLI can neither read nor rebind. Rewriting the prompt here would leave
-      // the stored hash stale, so every later fire fails resolution with
-      // canonical_input_mismatch and the task silently stops forever. Dashboard
-      // edits go through updateTaskWithOptionalPrecondition, which rebinds; the
-      // CLI must refuse instead of reporting success.
-      const bound = scheduleStore.getTask(id);
-      if (bound?.preconditionRef) {
-        throw new Error(`任务 ${id} 绑定了守护前置条件（precondition），CLI 更新会破坏其安全绑定导致任务停止执行；请在 Dashboard 的定时任务页修改提示词。`);
-      }
-      const result = scheduler.updateTask(id, { prompt });
-      if (!result.ok) throw new Error(`无法更新任务 ${id}: ${result.error}`);
+      await detectAuthenticatedCurrentSession();
+      await managedMutation('update', { prompt });
       console.log(`✅ 已更新任务 ${id} 的 prompt；后续执行生效，未触发补跑。`);
       break;
     }
@@ -8008,49 +7924,27 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     case 'rm':
     case 'delete':
     case 'del': {
-      if (await tryManagedMutation('remove')) { console.log(`已删除任务 ${id}`); break; }
-      let ok = scheduler.removeTask(id);
-      if (!ok && retargetIfElsewhere()) ok = scheduler.removeTask(id);
-      if (ok) console.log(`已删除任务 ${id}`);
-      else { console.error(`未找到任务 ${id}`); process.exit(1); }
+      await managedMutation('remove');
+      console.log(`已删除任务 ${id}`);
       break;
     }
     case 'pause':
     case 'disable': {
-      if (await tryManagedMutation('pause')) { console.log(`已暂停任务 ${id}`); break; }
-      let ok = scheduler.disableTask(id);
-      if (!ok && retargetIfElsewhere()) ok = scheduler.disableTask(id);
-      if (ok) console.log(`已暂停任务 ${id}`);
-      else { console.error(`未找到任务 ${id}`); process.exit(1); }
+      await managedMutation('pause');
+      console.log(`已暂停任务 ${id}`);
       break;
     }
     case 'resume':
     case 'enable': {
-      if (await tryManagedMutation('resume')) { console.log(`已恢复任务 ${id}`); break; }
-      let ok = scheduler.enableTask(id);
-      if (!ok && retargetIfElsewhere()) ok = scheduler.enableTask(id);
-      if (ok) console.log(`已恢复任务 ${id}`);
-      else { console.error(`未找到任务 ${id}`); process.exit(1); }
+      await managedMutation('resume');
+      console.log(`已恢复任务 ${id}`);
       break;
     }
     case 'run':
       // Running requires the daemon (executeCallback is daemon-side).
       // CLI can only mark a task to run ASAP; daemon's next tick picks it up.
       {
-        if (await tryManagedMutation('run')) {
-          console.log(`已标记任务 ${id} 下次 tick 立即执行（< 30s）`);
-          break;
-        }
-        let task = scheduleStore.getTask(id);
-        if (!task && retargetIfElsewhere()) task = scheduleStore.getTask(id);
-        if (!task) { console.error(`未找到任务 ${id}`); process.exit(1); }
-        const requested = scheduleStore.requestRunNow(id);
-        if (!requested.ok) {
-          console.error(requested.error === 'already_running'
-            ? `任务 ${id} 正在运行，未重复触发`
-            : `未找到任务 ${id}`);
-          process.exit(1);
-        }
+        await managedMutation('run');
         console.log(`已标记任务 ${id} 下次 tick 立即执行（< 30s）`);
       }
       break;

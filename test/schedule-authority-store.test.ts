@@ -43,6 +43,13 @@ describe('host-only schedule authority store', () => {
     store.initializeApp(APP, [task('forged01')]);
     expect(store.getRecord(APP, 'legacy01')).toMatchObject({ kind: 'legacy', state: 'active' });
     expect(store.getRecord(APP, 'forged01')).toBeUndefined();
+    expect(() => store.initializeApp(APP, [{ id: 'bad' } as ScheduledTask])).not.toThrow();
+  });
+
+  it('requires an explicit app for direct authoritative creates', () => {
+    store.initializeApp(APP, []);
+    expect(() => store.createDirect(task('noapp001', { larkAppId: undefined })))
+      .toThrow('schedule_authority_app_required');
   });
 
   it('atomically commits one grant and returns the same receipt after response loss', () => {
@@ -57,6 +64,7 @@ describe('host-only schedule authority store', () => {
       sourceSessionId: 'source-session',
       targetTurnId: 'om_kickoff',
       targetGeneration: 3,
+      maxTasksPerTurn: 64,
     };
     expect(store.commitDelegated(input)).toMatchObject({ ok: true, replay: false, task: { id: 'a1b2c3d4' } });
     expect(store.commitDelegated(input)).toMatchObject({ ok: true, replay: true, task: { id: 'a1b2c3d4' } });
@@ -72,12 +80,42 @@ describe('host-only schedule authority store', () => {
       appId: APP, grantId: 'grant-1', requestHash: 'hash-1', task: task(),
       control: { openId: 'ou_user', unionId: 'on_user', runScopes: [] as const },
       sourceMessageId: 'om_1', sourceSessionId: 's1', targetTurnId: 'om_1', targetGeneration: 1,
+      maxTasksPerTurn: 64,
     };
     expect(store.commitDelegated(base).ok).toBe(true);
     expect(store.commitDelegated({ ...base, requestHash: 'hash-2', task: task('deadbeef') }))
       .toMatchObject({ ok: true, replay: false, task: { id: 'deadbeef' } });
     expect(store.commitDelegated({ ...base, grantId: 'grant-2', requestHash: 'hash-2' }))
       .toEqual({ ok: false, error: 'task_id_conflict' });
+  });
+
+  it('accepts ownerless legacy rows but refuses an explicit app mismatch before the marker', () => {
+    const ownerless = task('owner000', { larkAppId: undefined });
+    const mismatched = task('wrongapp', { larkAppId: 'cli_other' });
+    expect(() => store.initializeApp(APP, [ownerless, mismatched]))
+      .toThrow('schedule_authority_app_mismatch');
+    expect(store.isInitialized(APP)).toBe(false);
+    expect(store.listTasks(APP)).toEqual([]);
+
+    store.initializeApp(APP, [ownerless]);
+    expect(store.isInitialized(APP)).toBe(true);
+    expect(store.listTasks(APP)).toEqual([ownerless]);
+  });
+
+  it('bounds distinct tasks per grant without breaking idempotent receipts', () => {
+    store.initializeApp(APP, []);
+    const base = {
+      appId: APP, grantId: 'grant-bounded', requestHash: 'hash-1', task: task(),
+      control: { openId: 'ou_user', unionId: 'on_user', runScopes: [] as const },
+      sourceMessageId: 'om_1', sourceSessionId: 's1', targetTurnId: 'om_1', targetGeneration: 1,
+      maxTasksPerTurn: 2,
+    };
+    expect(store.commitDelegated(base)).toMatchObject({ ok: true, replay: false });
+    expect(store.commitDelegated({ ...base, requestHash: 'hash-2', task: task('deadbeef') }))
+      .toMatchObject({ ok: true, replay: false });
+    expect(store.commitDelegated(base)).toMatchObject({ ok: true, replay: true });
+    expect(store.commitDelegated({ ...base, requestHash: 'hash-3', task: task('facefeed') }))
+      .toEqual({ ok: false, error: 'grant_task_limit' });
   });
 
   it('keeps pause, completion and revocation in protected state', () => {
@@ -100,6 +138,7 @@ describe('host-only schedule authority store', () => {
       appId: APP, grantId: 'grant-crash', requestHash: 'hash-crash', task: task(),
       control: { openId: 'ou_user', unionId: 'on_user', runScopes: [] as const },
       sourceMessageId: 'om_1', sourceSessionId: 's1', targetTurnId: 'om_1', targetGeneration: 1,
+      maxTasksPerTurn: 64,
     };
     __setScheduleAuthorityBeforeCommitTestHook(() => { throw new Error('simulated crash'); });
     expect(() => store.commitDelegated(input)).toThrow('simulated crash');

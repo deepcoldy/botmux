@@ -48,6 +48,7 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
     getDashboardAdminOpenIds: () => ['ou_alice'],
     resolveUnionIdFromOpenId, replyMessage: send, deliverDispatchWithUser,
     config: { session: { dataDir } }, loadOrCreateDashboardSecret: () => secret, dispatchReportBindingSecretPath: () => '',
+    logger: { info: vi.fn() },
   };
   const run = new Function('scope', 'with (scope) { ' + code + '; return handler; }')(scope);
   return { ds, scope, send, body, run: (req: unknown = {}) => run(req, {}) };
@@ -150,6 +151,9 @@ describe('dispatch user IPC end-to-end identity binding', () => {
     } });
     expect((await enabled.run()).status).toBe(200);
     expect((await read())?.domain).toBe('botmux.dispatch-user.v2');
+    expect(enabled.scope.logger.info).toHaveBeenCalledWith(expect.stringContaining(
+      '[schedule-delegation:audit] auto-attached schedule:create',
+    ));
 
     rmSync(dataDir, { recursive: true, force: true });
     dataDir = mkdtempSync(join(tmpdir(), 'dispatch-ipc-'));

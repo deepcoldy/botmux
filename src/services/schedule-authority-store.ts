@@ -39,7 +39,7 @@ export interface ScheduleAuthorityRecord {
 
 export type CommitDelegatedScheduleResult =
   | { ok: true; task: ScheduledTask; replay: boolean }
-  | { ok: false; error: 'grant_conflict' | 'task_id_conflict' };
+  | { ok: false; error: 'grant_conflict' | 'grant_task_limit' | 'task_id_conflict' };
 
 export const scheduleAuthorityDbPath = (dataDir: string): string =>
   join(dataDir, 'schedule-authority.sqlite');
@@ -59,12 +59,18 @@ function stateFor(task: ScheduledTask): ScheduleAuthorityState {
   return 'active';
 }
 
-function parseTask(raw: unknown): ScheduledTask {
+function parseTask(raw: unknown, expectedAppId?: string): ScheduledTask {
   if (typeof raw !== 'string') throw new Error('schedule_authority_corrupt_task');
-  const task = JSON.parse(raw) as ScheduledTask;
+  let task: ScheduledTask;
+  try { task = JSON.parse(raw) as ScheduledTask; }
+  catch { throw new Error('schedule_authority_corrupt_task'); }
   if (!task || typeof task !== 'object' || typeof task.id !== 'string'
-    || typeof task.chatId !== 'string' || typeof task.larkAppId !== 'string') {
+    || typeof task.chatId !== 'string'
+    || (task.larkAppId !== undefined && typeof task.larkAppId !== 'string')) {
     throw new Error('schedule_authority_corrupt_task');
+  }
+  if (expectedAppId && task.larkAppId !== undefined && task.larkAppId !== expectedAppId) {
+    throw new Error('schedule_authority_app_mismatch');
   }
   return task;
 }
@@ -113,6 +119,12 @@ export class ScheduleAuthorityStore {
   /** One-time trusted migration. Unknown JSON rows after this marker exists are
    * never auto-classified as legacy. */
   initializeApp(appId: string, existing: readonly ScheduledTask[]): void {
+    if (this.isInitialized(appId)) return;
+    // Validate the complete migration inventory before opening the transaction.
+    // In particular, a marker must never be committed for rows that the
+    // authoritative read path cannot subsequently parse. Legacy ownerless rows
+    // are valid for the primary daemon, but an explicit different app id is not.
+    const validated = existing.map(task => parseTask(JSON.stringify(task), appId));
     this.db.exec('BEGIN IMMEDIATE;');
     try {
       const initialized = this.db.prepare(
@@ -126,7 +138,7 @@ export class ScheduleAuthorityStore {
              control_open_id, control_union_id, run_scopes_json, created_at, updated_at)
           VALUES (1, ?, ?, 'legacy', ?, ?, ?, ?, ?, '[]', ?, ?)
         `);
-        for (const task of existing) {
+        for (const task of validated) {
           insert.run(
             appId, task.id, stateFor(task), JSON.stringify(task), taskHash(task),
             task.ownerOpenId ?? null, task.ownerUnionId ?? null, now, now,
@@ -176,7 +188,7 @@ export class ScheduleAuthorityStore {
     if (!Array.isArray(runScopes) || runScopes.length !== 0) {
       throw new Error('schedule_authority_run_scopes_unsupported');
     }
-    const task = parseTask(row.task_json);
+    const task = parseTask(row.task_json, appId);
     if (String(row.canonical_hash) !== taskHash(task)) {
       throw new Error('schedule_authority_canonical_mismatch');
     }
@@ -197,7 +209,10 @@ export class ScheduleAuthorityStore {
   }
 
   createDirect(task: ScheduledTask): ScheduledTask {
-    const appId = task.larkAppId!;
+    const appId = task.larkAppId;
+    if (typeof appId !== 'string' || !appId) {
+      throw new Error('schedule_authority_app_required');
+    }
     const now = new Date().toISOString();
     this.db.exec('BEGIN IMMEDIATE;');
     try {
@@ -234,7 +249,11 @@ export class ScheduleAuthorityStore {
     sourceSessionId: string;
     targetTurnId: string;
     targetGeneration: number;
+    maxTasksPerTurn: number;
   }): CommitDelegatedScheduleResult {
+    if (!Number.isSafeInteger(input.maxTasksPerTurn) || input.maxTasksPerTurn < 1) {
+      throw new Error('schedule_authority_invalid_task_limit');
+    }
     const now = new Date().toISOString();
     this.db.exec('BEGIN IMMEDIATE;');
     try {
@@ -250,6 +269,13 @@ export class ScheduleAuthorityStore {
         const task = parseTask(prior.task_json);
         this.db.exec('COMMIT;');
         return { ok: true, task, replay: true };
+      }
+      const committedForGrant = this.db.prepare(`
+        SELECT COUNT(*) AS count FROM schedule_authority_tasks WHERE grant_id = ?
+      `).get(input.grantId) as { count?: number | bigint } | undefined;
+      if (Number(committedForGrant?.count ?? 0) >= input.maxTasksPerTurn) {
+        this.db.exec('ROLLBACK;');
+        return { ok: false, error: 'grant_task_limit' };
       }
       const occupied = this.db.prepare(
         'SELECT 1 AS present FROM schedule_authority_tasks WHERE app_id = ? AND task_id = ?',

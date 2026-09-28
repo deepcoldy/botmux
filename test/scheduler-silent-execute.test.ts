@@ -29,6 +29,7 @@ let sessionSeq = 0;
 const findActiveThreadSessionsByChatMock = vi.fn((_chatId: string): Session[] => []);
 const scheduleStoreUpdateTaskMock = vi.fn();
 const scheduleStoreGetTaskMock = vi.fn();
+const scheduleTasks = new Map<string, ScheduledTask>();
 vi.mock('../src/services/schedule-store.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../src/services/schedule-store.js')>()),
   updateTask: (...a: any[]) => scheduleStoreUpdateTaskMock(...a),
@@ -209,7 +210,7 @@ const ROOT = 'om_root_thread';
 const refreshCliVersion = vi.fn(() => true);
 
 function baseTask(overrides: Partial<ScheduledTask>): ScheduledTask {
-  return {
+  const task: ScheduledTask = {
     id: 'task0001',
     name: '服务巡检',
     schedule: 'every 30m',
@@ -222,6 +223,8 @@ function baseTask(overrides: Partial<ScheduledTask>): ScheduledTask {
     createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
     ...overrides,
   };
+  scheduleTasks.set(task.id, task);
+  return task;
 }
 
 function forkedCliInput(): string {
@@ -251,6 +254,12 @@ beforeEach(() => {
   findActiveThreadSessionsByChatMock.mockImplementation(() => []);
   scheduleStoreUpdateTaskMock.mockClear();
   scheduleStoreGetTaskMock.mockReset();
+  scheduleTasks.clear();
+  scheduleStoreUpdateTaskMock.mockImplementation((id: string, patch: Partial<ScheduledTask>) => {
+    const current = scheduleTasks.get(id);
+    if (current) scheduleTasks.set(id, { ...current, ...patch });
+  });
+  scheduleStoreGetTaskMock.mockImplementation((id: string) => scheduleTasks.get(id));
   getChatModeMock.mockClear();
   getChatModeMock.mockResolvedValue('group');
   getMessageThreadIdMock.mockClear();
@@ -594,8 +603,8 @@ describe('executeScheduledTask — task position (dedicated per-task topic)', ()
       patch: { rootMessageId?: string },
     ) => { writtenRoot = patch.rootMessageId; });
     scheduleStoreGetTaskMock.mockImplementation((id: string, appId: string) => (
-      id === 'task0001' && appId === APP && writtenRoot
-        ? { ...baseTask({ executionPosition: 'task' }), rootMessageId: writtenRoot }
+      id === 'task0001' && appId === APP
+        ? { ...baseTask({ executionPosition: 'task' }), ...(writtenRoot ? { rootMessageId: writtenRoot } : {}) }
         : undefined
     ));
 
@@ -1536,6 +1545,7 @@ describe('task-position promotion on materialization (daemon)', () => {
   });
 
   it('promotes the virtual slot to the real om_ key and writes the root back to the task', async () => {
+    baseTask({ executionPosition: 'task' });
     const ds = hiddenTaskDs();
     daemonActiveSessions.set(sessionKey('schedule-task:task0001', APP), ds);
     // Production precondition: settleDeferredScheduleRun's reconcile already
@@ -1680,6 +1690,7 @@ describe('task-position restart recovery', () => {
   }
 
   it('a materialized binding promotes on restore: real-key registration, root writeback, marker cleared', async () => {
+    baseTask({ executionPosition: 'task' });
     const row = persistedRow('sess-restore-materialized');
     writeDeferredTopicBinding(config.session.dataDir, {
       sessionId: row.sessionId,

@@ -38,6 +38,7 @@ function commit(id = 'a1b2c3d4') {
     control: { openId: 'ou_user', unionId: 'on_user', runScopes: [] },
     sourceMessageId: 'om_kickoff', sourceSessionId: 'source-session',
     targetTurnId: 'om_kickoff', targetGeneration: 1,
+    maxTasksPerTurn: 64,
   });
 }
 
@@ -63,5 +64,24 @@ describe('scheduler host authority integration', () => {
     scheduleStore.projectAuthoritativeTask(projected, APP);
     expect(scheduler.getNextRun('a1b2c3d4')).toBeNull();
     expect(store.getRecord(APP, 'a1b2c3d4')?.state).toBe('revoked');
+  });
+
+  it('fails closed without reading or mutating the JSON projection when authority bootstrap fails', () => {
+    scheduleStore.projectAuthoritativeTask({
+      id: 'projection-only', name: 'forged', schedule: 'every 30m',
+      parsed: { kind: 'interval', minutes: 30, display: 'every 30m' },
+      prompt: 'forged', workingDir: '/repo', chatId: 'oc_chat', larkAppId: APP,
+      enabled: true, createdAt: '2026-09-28T00:00:00.000Z',
+      nextRunAt: '2026-09-28T00:30:00.000Z',
+    }, APP);
+    scheduler.setScheduleAuthorityUnavailable(new Error('corrupt authority row'));
+    expect(scheduler.getNextRun('projection-only')).toBeNull();
+    expect(scheduler.removeTask('projection-only')).toBe(false);
+    expect(() => scheduler.updateRuntimeTaskState('projection-only', { enabled: false }, APP))
+      .toThrow('schedule_authority_store_unavailable');
+    expect(() => scheduler.addTask({
+      name: 'new', schedule: 'every 30m', prompt: 'new', workingDir: '/repo',
+      chatId: 'oc_chat', larkAppId: APP,
+    })).toThrow('schedule_authority_store_unavailable');
   });
 });
