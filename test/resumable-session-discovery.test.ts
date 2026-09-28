@@ -530,6 +530,110 @@ describe('discoverRolloutSessions (codex / traex)', () => {
     ]);
     expect(await discoverRolloutSessions(sessionsRoot, 10)).toEqual([]);
   });
+
+  it('reads TraeX 0.201.7 user messages from history_mutation records', async () => {
+    writeRollout('2026/08/29', 'rollout-traex-history-mutation.jsonl', [
+      { type: 'session_meta', payload: { id: 'traex-history-mutation', cwd: '/root/traex' } },
+      { type: 'history_mutation', payload: { operation: 'append', items: [
+        { type: 'message', role: 'developer', content: [{ type: 'input_text', text: '<permissions instructions>...</permissions instructions>' }] },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: '# AGENTS.md instructions for /root/traex\n\n<INSTRUCTIONS>repo guide</INSTRUCTIONS>' }] },
+      ] } },
+      { type: 'history_mutation', payload: { operation: 'append', items: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'show the native TraeX title' }] },
+      ] } },
+    ]);
+
+    const out = await discoverRolloutSessions(sessionsRoot, 10, undefined, { dialect: 'traex' });
+    expect(out).toEqual([
+      expect.objectContaining({
+        cliSessionId: 'traex-history-mutation',
+        cwd: '/root/traex',
+        title: 'show the native TraeX title',
+      }),
+    ]);
+  });
+
+  it('reads compacted TraeX history from a history_mutation replace snapshot', async () => {
+    writeRollout('2026/08/29', 'rollout-traex-history-replace.jsonl', [
+      { type: 'session_meta', payload: { id: 'traex-history-replace', cwd: '/root/traex' } },
+      { type: 'history_mutation', payload: { operation: 'replace', items: [
+        { type: 'message', role: 'developer', content: [{ type: 'input_text', text: '<permissions instructions>...</permissions instructions>' }] },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: '# AGENTS.md instructions for /root/traex' }] },
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'resume this compacted conversation' }] },
+      ] } },
+    ]);
+
+    const out = await discoverRolloutSessions(sessionsRoot, 10, undefined, { dialect: 'traex' });
+    expect(out).toEqual([
+      expect.objectContaining({
+        cliSessionId: 'traex-history-replace',
+        title: 'resume this compacted conversation',
+      }),
+    ]);
+  });
+
+  it('drops botmux-origin TraeX history_mutation sessions', async () => {
+    writeRollout('2026/08/29', 'rollout-traex-botmux.jsonl', [
+      { type: 'session_meta', payload: { id: 'traex-botmux', cwd: '/root/traex' } },
+      { type: 'history_mutation', payload: { operation: 'append', items: [
+        { type: 'message', role: 'user', content: [{
+          type: 'input_text',
+          text: '<botmux_routing>route through Lark</botmux_routing>\n<session_id>botmux-id</session_id>\n<user_message>hello</user_message>',
+        }] },
+      ] } },
+    ]);
+
+    expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, { dialect: 'traex' })).toEqual([]);
+  });
+
+  it('prefers TraeX native index title and activity metadata over inferred rollout values', async () => {
+    writeRollout('2026/08/29', 'rollout-traex-renamed.jsonl', [
+      { type: 'session_meta', payload: { id: 'traex-renamed', cwd: '/old/cwd' } },
+      { type: 'history_mutation', payload: { operation: 'append', items: [
+        { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'original prompt' }] },
+      ] } },
+    ]);
+    const metadataById = new Map([['traex-renamed', {
+      title: 'Renamed in TraeX',
+      firstUserMessage: 'original prompt',
+      cwd: '/current/cwd',
+      lastActivityAt: 1_787_900_000_000,
+    }]]);
+
+    const out = await discoverRolloutSessions(sessionsRoot, 10, undefined, {
+      dialect: 'traex',
+      metadataById,
+    });
+    expect(out).toEqual([{
+      cliSessionId: 'traex-renamed',
+      cwd: '/current/cwd',
+      title: 'Renamed in TraeX',
+      lastActivityAt: 1_787_900_000_000,
+    }]);
+  });
+
+  it('still drops botmux-owned TraeX sessions when the native index has a title', async () => {
+    writeRollout('2026/08/29', 'rollout-traex-native-botmux.jsonl', [
+      { type: 'session_meta', payload: { id: 'traex-native-botmux', cwd: '/root/traex' } },
+      { type: 'history_mutation', payload: { operation: 'append', items: [{
+        type: 'message',
+        role: 'user',
+        content: [{
+          type: 'input_text',
+          text: '<session_id>botmux-id</session_id>\n<user_message>hello</user_message>',
+        }],
+      }] } },
+    ]);
+    const metadataById = new Map([['traex-native-botmux', {
+      title: 'Native title must not bypass ownership filtering',
+      firstUserMessage: '<session_id>botmux-id</session_id>\n<user_message>hello</user_message>',
+    }]]);
+
+    expect(await discoverRolloutSessions(sessionsRoot, 10, undefined, {
+      dialect: 'traex',
+      metadataById,
+    })).toEqual([]);
+  });
 });
 
 describe('discoverAntigravitySessions', () => {
