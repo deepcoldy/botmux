@@ -318,6 +318,15 @@ export async function resolveDaemonCurrentActor(input: {
       schema: CURRENT_ACTOR_SCHEMA,
       status: 'verified',
       actor: { email },
+      // Both values are already in scope here and are the daemon's own state,
+      // not anything the caller supplied: `ds.chatId` was read a few lines
+      // above by the transport check, and `frozen.turnId` is the turn the
+      // attestation just re-verified as byte-identical. Publishing them lets a
+      // consumer record WHICH conversation and WHICH turn a human act came
+      // from — without them, "this actor is verified" is true of every turn and
+      // a consumer has no attested way to bind one act to one effect.
+      chatId: frozen.ds.chatId,
+      turnId: frozen.turnId,
     },
   };
 }

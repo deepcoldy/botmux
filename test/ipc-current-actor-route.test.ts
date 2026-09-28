@@ -58,6 +58,10 @@ describe('POST /api/current-actor', () => {
       schema: 'botmux.current-actor.v2',
       status: 'verified',
       actor: { email: 'current.user@example.com' },
+      // The locators come from the daemon's own session state, not from the
+      // request body — the body above even carries a forged `callerOpenId`.
+      chatId: 'oc_chat',
+      turnId: 'om_turn',
     });
   });
 
@@ -99,6 +103,10 @@ describe('POST /api/current-actor', () => {
       }),
     });
     expect(accepted.status).toBe(200);
+    // On a scheduled turn `turnId` is the daemon's own id rather than a Lark
+    // message id. It is still what the document reports, because the consumer
+    // binds to "the turn the daemon just re-verified", not to "a message".
+    expect(await accepted.json()).toMatchObject({ turnId: SCHEDULED_TURN_ID });
 
     ds.scheduledTurnCallers = undefined;
     const rejected = await fetch(`http://127.0.0.1:${ipc.port}/api/current-actor`, {
