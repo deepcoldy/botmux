@@ -3069,7 +3069,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           // SIGKILL backstop, which blows past Lark's ~3s card-ACK window and
           // surfaces the client-side "code: 300000" toast. The logical close is
           // synchronous; the worker is killed in the background.
-          closeResult = await closeWorkerPoolSession(targetSessionId, { awaitWorkerExit: false });
+          closeResult = await closeWorkerPoolSession(targetSessionId, {
+            awaitWorkerExit: false,
+            cardVisibility: value?.visibility === 'private' ? 'private' : 'public',
+          });
         } catch (err) {
           logger.error(`[${tag(current)}] Refused close because backing teardown was not verified: ${err}`);
           return { status: 'teardown_failed' as const, err };

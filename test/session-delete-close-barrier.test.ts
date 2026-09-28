@@ -575,6 +575,53 @@ describe('daemon close barrier used by botmux delete', () => {
 
 
 describe('closed live card lifecycle', () => {
+  it.each([
+    { name: 'tmux adopt', adoptedFrom: { source: 'tmux', tmuxTarget: 'user:1.0', cwd: '/repo' } },
+    { name: 'zellij adopt', adoptedFrom: { source: 'zellij', cwd: '/repo' } },
+    { name: 'persisted adopt', persistedAdopt: true },
+    { name: 'Codex App adopt', existingAppServerEndpoint: 'ws://127.0.0.1:4500' },
+    { name: 'private bot config', privateCard: true },
+    { name: 'private clicked card', cardVisibility: 'private' as const },
+  ])('does not publish a closed card for $name', async scenario => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-close-card-boundary-'));
+    tempDirs.push(dataDir);
+    const previousDataDir = config.session.dataDir;
+    config.session.dataDir = dataDir;
+    sessionStore.init('app-close-card');
+    vi.spyOn(botRegistry, 'getBot').mockReturnValue({
+      config: { cliId: 'claude-code', larkAppId: 'app-close-card', privateCard: scenario.privateCard },
+    } as any);
+    const patch = vi.spyOn(larkClient, 'updateMessage').mockResolvedValue(undefined as any);
+    vi.spyOn(docSubsStore, 'listDocSubscriptionsForSession').mockReturnValue([]);
+    try {
+      const session = sessionStore.createSession('oc_card', 'om_root', 'card', 'group');
+      session.larkAppId = 'app-close-card';
+      session.workingDir = '/private/repo';
+      session.cliSessionId = 'private-cli-session';
+      session.existingAppServerEndpoint = scenario.existingAppServerEndpoint;
+      if (scenario.persistedAdopt) {
+        session.adoptedFrom = { source: 'tmux', tmuxTarget: 'user:1.0', cwd: '/repo' } as any;
+      }
+      sessionStore.updateSession(session);
+      const ds = {
+        session, worker: null, larkAppId: 'app-close-card', chatId: 'oc_card',
+        chatType: 'group', scope: 'thread', streamCardId: 'om_live', hasHistory: true,
+        adoptedFrom: scenario.adoptedFrom,
+      } as any;
+      const active = new Map([[activeSessionKey(ds), ds]]);
+      workerPool.setActiveSessionsRegistry(active);
+      await expect(workerPool.closeSession(session.sessionId, {
+        cardVisibility: scenario.cardVisibility,
+      })).resolves.toMatchObject({ ok: true, outcome: 'closed' });
+      expect(sessionStore.getSession(session.sessionId)?.status).toBe('closed');
+      expect(active.has(activeSessionKey(ds))).toBe(false);
+      expect(patch).not.toHaveBeenCalled();
+      expect(workerPool.scheduleCardPatch(ds, 'late-working-card')).toBe(false);
+    } finally {
+      config.session.dataDir = previousDataDir;
+    }
+  });
+
   it.each(['claude-code', 'codex'])('serializes the closed card after in-flight output for %s', async cliId => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-close-card-'));
     tempDirs.push(dataDir);

@@ -7517,7 +7517,7 @@ export async function closeSessionForBackgroundCleanup(
 
 export async function closeSession(
   sessionId: string,
-  opts?: { awaitWorkerExit?: boolean },
+  opts?: { awaitWorkerExit?: boolean; cardVisibility?: 'private' | 'public' },
 ): Promise<CloseSessionResult> {
   // `awaitWorkerExit` (default true): whether to block on the worker process
   // actually exiting before returning. A busy CLI wedges in node-pty teardown
@@ -7774,9 +7774,15 @@ export async function closeSession(
   // Freeze the existing live card through the same serialized PATCH queue so
   // an in-flight screen update cannot land after the closed state. Refused or
   // residual closes must not claim the underlying execution was terminated.
-  if (ds && !prepared.residual && ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL) {
+  // Shared-adopt closes only detach BotMux. Private close cards contain local
+  // paths and resume commands, so neither bot policy nor clicked-card privacy
+  // may be bypassed by this background PATCH path.
+  if (ds && !prepared.residual && !isSharedAdoptSession(ds)
+      && opts?.cardVisibility !== 'private'
+      && ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL) {
     try {
-      if (larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly })) {
+      const botCfg = getBot(ds.larkAppId).config;
+      if (!botCfg.privateCard && larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly })) {
         ds.pendingCardId = ds.streamCardId;
         ds.pendingCardJson = buildClosedSessionCard(ds, localeForBot(ds.larkAppId));
         if (!ds.cardPatchInFlight) flushCardPatch(ds);
