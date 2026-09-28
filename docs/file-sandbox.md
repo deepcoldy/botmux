@@ -49,6 +49,43 @@ Linux 依赖 bubblewrap（bwrap），macOS 用同一份 policy 经 Seatbelt（`s
 （PTY 与 tmux 均覆盖），不会写进共享 tmux server 环境。它可以为自定义 provider
 提供 endpoint/key，但不能替代 `requires_openai_auth = true` 时 Codex 选择的登录凭证。
 
+## Claude 的 per-bot 账号（`credentialsSourceDir`）
+
+默认所有沙盒 bot 共用本机登录的同一个 Claude 账号（每次冷启动把全局凭证写进
+`<BOTMUX_HOME>/bots/<larkAppId>/claude`）。要让不同 bot 用不同账号，给 bot 配一个
+凭证来源目录，目录下按 CLI 分子目录：
+
+```json
+{
+  "cliId": "claude-code",
+  "sandbox": true,
+  "credentialsSourceDir": "~/accounts/acct-b"
+}
+```
+
+```
+~/accounts/acct-b/
+  claude/.credentials.json   # 必需：OAuth 凭证（claudeAiOauth.accessToken）
+  claude/.claude.json        # 可选：提供 oauthAccount（账号展示信息）
+```
+
+- 每次冷启动：把 `.credentials.json` 以 `0600` 原子写入 per-bot 目录；per-bot
+  `.claude.json` 的 `oauthAccount` 取自来源（来源没有则删除），`primaryApiKey` 一律删除，
+  其余内容（projects / mcpServers 等）保留。来源模式下不继承全局 settings 里的认证 env。
+- **fail-closed**：以下任一情况拒绝启动，绝不回退到共享登录——来源文件缺失/不是普通文件/
+  是符号链接/不是 OAuth 凭证；沙盒已请求但 CLI 数据目录没有重定向（设了 `wrapperCli`、
+  adapter 不支持重定向、缺 `SESSION_DATA_DIR`，报错会点名是哪一种）；CLI 不在支持清单
+  （目前仅 `claude-code`）；bot 的 `env`、任一层 settings（per-bot / 项目
+  `.claude/settings(.local).json` / managed）或 worker 环境里存在
+  `ANTHROPIC_API_KEY`、`ANTHROPIC_AUTH_TOKEN`、`CLAUDE_CODE_OAUTH_TOKEN`、
+  Bedrock/Vertex/Foundry 开关或 `apiKeyHelper`；与 `codexAuthSync: "isolated"` 同配。
+- 持久后端（tmux 等）的存活 pane 若是用别的来源启动的，会被杀掉并冷启动，不会复用。
+- 完全没开沙盒的 bot 不生效（仅打 WARN），仍用全局登录；未配置该字段的 bot 行为不变。
+- **token 刷新不归 botmux 管**：外部脚本负责刷新来源目录里的凭证（必须赶在 CLI 自己
+  刷新之前），并 suspend 使用该账号的 bot 让其冷启动取新凭证。
+- 修改某个 bot 的 `credentialsSourceDir`（或换掉它背后的账号）前，先 suspend 该 bot 的
+  全部会话：运行中的旧 CLI 进程可能把旧账号状态写回 per-bot 目录。
+
 ## 工作原理
 
 ```

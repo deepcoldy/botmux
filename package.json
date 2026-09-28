@@ -3,7 +3,11 @@
   "version": "0.0.0",
   "description": "Bridge between IM platforms and AI coding CLIs \u2014 one topic, one CLI session with live streaming",
   "type": "module",
+  "bin": {
+    "botmux": "scripts/botmux-launcher.sh"
+  },
   "files": [
+    "scripts/botmux-launcher.sh",
     "scripts/postinstall-bin.mjs",
     "scripts/install-path-entry.mjs",
     "README.md",
@@ -15,7 +19,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "bun run audit:domains && node scripts/generate-app-icon-data.mjs && node scripts/generate-pi-initial-prompt-extension.mjs && node scripts/clean-dist.mjs && tsc && bun run typecheck:scripts && bun run typecheck:test-mocks && node scripts/generate-runtime-build-id.mjs && cp src/setup/lark-scopes.json dist/setup/ && bun run dashboard:bundle && chmod +x dist/cli.js && node scripts/audit-dist.mjs && node scripts/audit-embedded-assets.mjs --require-dist",
+    "build": "bun run audit:domains && node scripts/generate-app-icon-data.mjs && node scripts/generate-pi-initial-prompt-extension.mjs && node scripts/generate-pi-turn-boundary-extension.mjs && node scripts/clean-dist.mjs && tsc && bun run typecheck:scripts && bun run typecheck:test-mocks && node scripts/generate-runtime-build-id.mjs && cp src/setup/lark-scopes.json dist/setup/ && bun run dashboard:bundle && chmod +x dist/cli.js && node scripts/audit-dist.mjs && node scripts/audit-embedded-assets.mjs --require-dist",
     "verify:binary": "bun scripts/verify-binary.mjs",
     "typecheck:scripts": "tsc -p tsconfig.scripts.json",
     "typecheck:test-mocks": "tsc -p tsconfig.test-mocks.json",

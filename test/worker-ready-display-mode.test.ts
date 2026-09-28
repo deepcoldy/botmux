@@ -155,7 +155,7 @@ import {
   setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
-import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
+import { activeSessionKey, sessionKey, type DaemonSession } from '../src/core/types.js';
 import { getBot } from '../src/bot-registry.js';
 import * as sessionStore from '../src/services/session-store.js';
 
@@ -635,6 +635,33 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(ds.streamCardReplyTargetKey).toBe('thread:om_topic_a');
   });
 
+  it('screen_update first card uses the runtime lane slot while posting to the visible root', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      runtimeRoutingAnchor: 'lane:source:screen-b',
+      streamCardPending: true,
+      streamCardId: undefined,
+      workerReady: true,
+      worker: fakeWorker,
+    });
+    const registry = new Map([[activeSessionKey(ds), ds]]);
+    expect(registry.has(sessionKey('om_root', 'app_test'))).toBe(false);
+    setActiveSessionsRegistry(registry);
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', {
+      type: 'screen_update',
+      content: 'working in lane B',
+      status: 'working',
+    });
+    await flush();
+
+    expect(sessionReplyMock.mock.calls[0]?.[0]).toBe('om_root');
+    expect(sessionReplyMock.mock.calls[0]?.[3]).toBe('app_test');
+    expect(ds.streamCardId).toBe('om_new_card');
+    expect(deleteMessageMock).not.toHaveBeenCalledWith('app_test', 'om_new_card');
+  });
+
   it('screen_update POST discards stale results once remote retirement starts waiting', async () => {
     let resolvePost!: (messageId: string) => void;
     sessionReplyMock.mockImplementationOnce(() => new Promise<string>((resolve) => {
@@ -862,6 +889,28 @@ describe('Worker ready: set_display_mode re-sync', () => {
     );
   });
 
+  it('ready first card uses the runtime lane slot while posting to the visible root', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      runtimeRoutingAnchor: 'lane:source:ready-b',
+      streamCardPending: true,
+      streamCardId: undefined,
+      worker: fakeWorker,
+    });
+    const registry = new Map([[activeSessionKey(ds), ds]]);
+    expect(registry.has(sessionKey('om_root', 'app_test'))).toBe(false);
+    setActiveSessionsRegistry(registry);
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_lane' });
+    await flush();
+
+    expect(sessionReplyMock.mock.calls[0]?.[0]).toBe('om_root');
+    expect(sessionReplyMock.mock.calls[0]?.[3]).toBe('app_test');
+    expect(ds.streamCardId).toBe('om_new_card');
+    expect(deleteMessageMock).not.toHaveBeenCalledWith('app_test', 'om_new_card');
+  });
+
   it('ready POST discards stale results once remote retirement starts waiting', async () => {
     let resolvePost!: (messageId: string) => void;
     sessionReplyMock.mockImplementationOnce(() => new Promise<string>((resolve) => {
@@ -962,6 +1011,31 @@ describe('Worker ready: set_display_mode re-sync', () => {
     expect(fakeWorker.send).toHaveBeenCalledWith(
       expect.objectContaining({ type: 'set_display_mode', mode: 'screenshot' }),
     );
+  });
+
+  it('restored card PATCH uses the runtime lane slot while keeping the visible card id', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      runtimeRoutingAnchor: 'lane:source:restored-b',
+      streamCardPending: false,
+      streamCardId: 'om_lane_restored',
+      worker: fakeWorker,
+    });
+    const registry = new Map([[activeSessionKey(ds), ds]]);
+    expect(registry.has(sessionKey('om_root', 'app_test'))).toBe(false);
+    setActiveSessionsRegistry(registry);
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_restored_lane' });
+    await flush();
+
+    expect(updateMessageMock).toHaveBeenCalledWith(
+      'app_test',
+      'om_lane_restored',
+      expect.any(String),
+    );
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    expect(ds.streamCardId).toBe('om_lane_restored');
   });
 
   it('silent recovery restores screenshot mode without touching the streaming card', async () => {

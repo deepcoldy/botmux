@@ -3,6 +3,7 @@
  * from Feishu interactive cards.
  * Extracted from daemon.ts for modularity.
  */
+import { sessionPromptInjection } from '../../core/prompt-injection.js';
 import { execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { basename as pathBasename, dirname, join } from 'node:path';
@@ -15,7 +16,8 @@ import { resolveHiddenStreamingCardButtons } from './streaming-card-buttons.js';
 import { canOperate, canTalk, canRunDaemonCommand } from './event-dispatcher.js';
 import { isBotAdmin } from './grant-owner.js';
 import { updateMessage, deleteMessage, replyMessage, sendMessage, sendUserMessage, sendEphemeralCard, getMessageDetail, isHumanOpenId, resolveUserUnionId as defaultResolveUserUnionId } from './client.js';
-import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard, frozenIdleLabel } from './card-builder.js';
+import { buildSessionCard, buildStreamingCard, buildTuiPromptCard, buildTuiPromptProcessingCard, buildGrantResultCard, buildGrantRequesterNoticeCard, getCliDisplayName, truncateContent, buildConfigCard, buildConfigQuotaCard, buildConfigTextCard, CONFIG_UNSET, buildRepoSelectCard, frozenIdleLabel, STREAMING_CARD_PATCH_VERSION } from './card-builder.js';
+import type { GrantCardDelivery } from './card-builder.js';
 import { codexServiceTierBadge } from '../../services/codex-service-tier.js';
 import {
   findConfigField,
@@ -98,7 +100,7 @@ import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
-import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, canCommitStreamingCardPublication, continuePublishedStreamingCardPinChain, idleCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
+import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, canCommitStreamingCardPublication, continuePublishedStreamingCardPinChain, idleCardLabel, dshRuntimeForSession, postFreshStreamingCard, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -109,6 +111,7 @@ import { validateWorkingDir } from '../../core/working-dir.js';
 import type { DaemonToWorker, DisplayMode, TermActionKey } from '../../types.js';
 import { activeSessionKey, sessionKey, sessionAnchorId, frozenDisplayMode, markRepoCardConsumed, isActiveRepoCard } from '../../core/types.js';
 import type { DaemonSession } from '../../core/types.js';
+import { readPrincipalLaneTurnBinding } from '../../core/principal-lane-turn.js';
 import { buildTerminalUrl } from '../../core/terminal-url.js';
 import type { ProjectInfo } from '../../services/project-scanner.js';
 import { createRepoWorktree, removeRepoWorktree, dirSuffixForBranch, pushWorktreeBranch } from '../../services/git-worktree.js';
@@ -288,6 +291,18 @@ const LEGACY_SELF_HEAL_ACTIONS = new Set(['toggle_display', 'toggle_stream', 're
 // In-memory (per daemon lifetime) — a restart resets it, which at worst allows
 // one re-trigger on an old card; acceptable. Capped to avoid unbounded growth.
 const voicedCardIds = new Set<string>();
+const legacyStreamingCardMigrationIds = new Set<string>();
+const LEGACY_STREAMING_CARD_MIGRATION_LIMIT = 2_000;
+
+function claimLegacyStreamingCardMigration(messageId: string): boolean {
+  if (legacyStreamingCardMigrationIds.has(messageId)) return false;
+  if (legacyStreamingCardMigrationIds.size >= LEGACY_STREAMING_CARD_MIGRATION_LIMIT) {
+    const oldest = legacyStreamingCardMigrationIds.values().next().value;
+    if (oldest) legacyStreamingCardMigrationIds.delete(oldest);
+  }
+  legacyStreamingCardMigrationIds.add(messageId);
+  return true;
+}
 
 // Instruction injected into the session when the voice button is clicked. The
 // model (which still has its just-sent reply in context) condenses it into
@@ -329,6 +344,44 @@ function getSessionByActionValue(
   // on a different current session just because an old card shared the root.
   if (primary && isLegacySelfHealAction(actionType)) return primary;
   return undefined;
+}
+
+export interface PrincipalLaneCardAuthorityDeps {
+  readTrustedProvenance: typeof sessionStore.readTrustedMessageProvenance;
+}
+
+/** Normal cards still display at the real chat/root, so their message id is
+ * the immutable bridge back to lane/turn/generation authority.  Legacy
+ * sessions remain byte-for-byte unaffected. */
+export function validatePrincipalLaneCardActionAuthority(
+  ds: DaemonSession,
+  cardMessageId: string | undefined,
+  activeSessions: Map<string, DaemonSession>,
+  deps?: PrincipalLaneCardAuthorityDeps,
+): boolean {
+  const lane = ds.session.principalLane;
+  if (!lane) return true;
+  if (!cardMessageId || activeSessions.get(activeSessionKey(ds)) !== ds) return false;
+  const provenance = (deps?.readTrustedProvenance ?? sessionStore.readTrustedMessageProvenance)(
+    cardMessageId,
+    lane.sourceSessionId,
+  );
+  if (!provenance
+      || provenance.direction !== 'outbound'
+      || provenance.larkAppId !== ds.larkAppId
+      || provenance.chatId !== ds.chatId
+      || provenance.laneId !== lane.laneId
+      || provenance.sessionId !== ds.session.sessionId
+      || provenance.principalKey !== lane.principalKey
+      || provenance.workerGeneration !== ds.workerGeneration
+      || provenance.workerGeneration !== ds.session.workerGeneration
+      || provenance.turnId !== ds.currentTurnId) return false;
+  const binding = readPrincipalLaneTurnBinding(ds, provenance.turnId);
+  return !!binding
+    && binding.laneId === provenance.laneId
+    && binding.sessionId === provenance.sessionId
+    && binding.principalKey === provenance.principalKey
+    && binding.workerGeneration === provenance.workerGeneration;
 }
 
 function sessionCliId(ds: DaemonSession) {
@@ -424,6 +477,26 @@ function duplicateMultiWorktreeChildNames(repoPaths: string[], projects: Project
     else seen.add(childName);
   }
   return [...dupes];
+}
+
+/** 转投私聊的申请卡被拒后，回原会话告知申请人（fire-and-forget，不阻塞 callback）。
+ *  群里 bot 申请人只写名字不 @，避免唤醒对方 bot 拉空会话（与授权成功通知同一口径）。 */
+function notifyGrantRequesterInOrigin(
+  larkAppId: string,
+  chatId: string,
+  outcome: 'deny',
+  delivery: GrantCardDelivery,
+  targets: string[],
+  names: string[],
+  loc?: Locale,
+): void {
+  void (async () => {
+    const humanFlags = delivery === 'dm_group'
+      ? await Promise.all(targets.map(id => isHumanOpenId(larkAppId, id).catch(() => false)))
+      : targets.map(() => true);
+    const entries = targets.map((id, i) => ({ openId: id, name: names[i] || undefined, isBot: !humanFlags[i] }));
+    await sendMessage(larkAppId, chatId, buildGrantRequesterNoticeCard(outcome, delivery, entries, loc), 'interactive');
+  })().catch(err => logger.warn(`grant requester notice (${outcome}) failed: ${err}`));
 }
 
 function deferRepoCardWithdraw(larkAppId: string | undefined, messageId: string | undefined): void {
@@ -602,6 +675,7 @@ export async function commitRepoSelection(
                 ? undefined
                 : (ds.pendingTurnId ?? ds.session.pendingRepoSetup?.turnId),
               sessionBackendType: ds.session.backendType,
+              promptInjection: sessionPromptInjection(ds),
             },
           )
         : undefined;
@@ -1261,6 +1335,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       : (value.target_open_id ? [value.target_open_id] : []);
     const grantChatId = value.chat_id;
     const nonce = value.nonce;
+    // 转投管理员私聊的申请卡：申请人看不到这张卡，处置结果要另发回原会话。
+    const delivery: GrantCardDelivery | undefined = value.delivery === 'dm_p2p' || value.delivery === 'dm_group'
+      ? value.delivery
+      : undefined;
+    const originChatName = typeof value.chat_name === 'string' ? value.chat_name : undefined;
     // 全部 target 都得仍 pending 且 nonce 匹配，否则视为整卡失效。
     if (!targets.length || !grantChatId || !nonce || !targets.every(tt => checkNonce(larkAppId, grantChatId, tt, nonce))) {
       return { toast: { type: 'error', content: t('card.grant.toast_expired', undefined, loc) } };
@@ -1292,6 +1371,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // 返回原始卡 body，由 dispatcher 包成 in-place patch（不再走 updateMessage 双写）。
     if (value.action === 'grant_deny') {
       for (const tt of targets) markDenied(larkAppId, grantChatId, tt);
+      if (delivery) {
+        const denyNames: string[] = Array.isArray(value.target_names) ? value.target_names : [];
+        notifyGrantRequesterInOrigin(larkAppId, grantChatId, 'deny', delivery, targets, denyNames, loc);
+      }
       return JSON.parse(buildGrantResultCard('deny', loc));
     }
     const formValue = action?.form_value;
@@ -1376,7 +1459,15 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     // 「已授权」结果态、又 ping 到被授权人——无需再单独发通知卡、也无需撤回原卡（申晗 2026-07-31
     // 反馈：直接在原卡更新即可）。同步返回该 body 即完成 in-place patch，避免 deleteMessage 与
     // callback 响应竞态导致客户端 300000。仅「部分失败」仍走后台补一条文字告知。
-    const resultCardBody = JSON.parse(buildGrantResultCard(kind, loc, quota, expiresAt, notifyTargets));
+    const resultCardBody = JSON.parse(buildGrantResultCard(
+      kind, loc, quota, expiresAt, notifyTargets,
+      delivery ? { delivery, chatName: originChatName } : undefined,
+    ));
+    if (delivery) {
+      const grantedNotice = buildGrantRequesterNoticeCard(kind, delivery, notifyTargets, loc, quota, expiresAt);
+      sendMessage(larkAppId, grantChatId, grantedNotice, 'interactive')
+        .catch(err => logger.warn(`grant requester notice (granted) failed: ${err}`));
+    }
     if (cardMessageId && failed.length > 0) {
       let replyInThread = true;
       try {
@@ -1899,6 +1990,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       chatId: ds.chatId,
       whiteboardId: ds.session.whiteboardId,
       sessionBackendType: ds.session.backendType,
+      promptInjection: sessionPromptInjection(ds),
       turnId,
     });
     let accepted = false;
@@ -2639,6 +2731,18 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const ds = larkAppId
       ? getSessionByActionValue(activeSessions, rootId, larkAppId, value.session_id, actionType)
       : activeSessions.get(rootId);
+    if (ds && !validatePrincipalLaneCardActionAuthority(ds, cardMessageId, activeSessions)) {
+      logger.warn(
+        `[${tag(ds)}] Rejected stale principal-lane card action=${actionType} `
+        + `card=${cardMessageId?.substring(0, 12) ?? 'missing'}`,
+      );
+      return {
+        toast: {
+          type: 'warning',
+          content: '该卡片已不属于当前任务，请使用最新卡片。',
+        },
+      };
+    }
 
     const launchLocalCli = (target: DaemonSession, locDs: Locale) => {
       const cliId = sessionCliId(target);
@@ -3694,10 +3798,61 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
         return { toast: { type: 'warning', content: t('card.action.session_gone', undefined, localeForBot(larkAppId)) } };
       }
       const clickedNonce: string | undefined = value?.card_nonce;
+      const needsPatchContractMigration =
+        value?.stream_card_version !== STREAMING_CARD_PATCH_VERSION;
       const isFrozenClick = clickedNonce && ds.streamCardNonce && clickedNonce !== ds.streamCardNonce;
 
       const nextMode = (current: DisplayMode): DisplayMode =>
         current === 'hidden' ? 'screenshot' : 'hidden';
+
+      if (needsPatchContractMigration) {
+        const legacyMessageId = cardMessageId
+          ?? (ds.streamCardId !== CARD_POSTING_SENTINEL ? ds.streamCardId : undefined);
+        if (!legacyMessageId || !claimLegacyStreamingCardMigration(legacyMessageId)) {
+          return { toast: { type: 'info', content: t('toast.action_received_bg', undefined, localeForBot(ds.larkAppId)) } };
+        }
+        const current: DisplayMode = ds.displayMode ?? 'hidden';
+        const next = nextMode(current);
+        ds.displayMode = next;
+        persistStreamCardState(ds);
+        if (ds.worker || isSessionTransferring(ds)) {
+          sendWorkerSessionInput(ds, { type: 'set_display_mode', mode: next });
+        }
+        logger.info(`[${tag(ds)}] Display mode → ${next} (legacy card migration)`);
+        return {
+          toast: {
+            type: 'info',
+            content: t('toast.action_received_bg', undefined, localeForBot(ds.larkAppId)),
+          },
+          afterAck: async () => {
+            let migrated = false;
+            try {
+              migrated = await postFreshStreamingCard(
+                ds,
+                deps.sessionReply,
+                { retireMessageId: legacyMessageId },
+              );
+            } catch (err) {
+              logger.warn(`[${tag(ds)}] Legacy streaming-card migration crashed: ${err instanceof Error ? err.message : String(err)}`);
+            }
+            if (!migrated) {
+              // The old card did not change, so roll back the optimistic mode
+              // only when no newer action has superseded it. A retry will then
+              // request the same visible transition instead of toggling back.
+              if (ds.displayMode === next) {
+                ds.displayMode = current;
+                persistStreamCardState(ds);
+                if (ds.worker || isSessionTransferring(ds)) {
+                  sendWorkerSessionInput(ds, { type: 'set_display_mode', mode: current });
+                }
+              }
+              // A failed migration must remain retryable on the next click.
+              legacyStreamingCardMigrationIds.delete(legacyMessageId);
+              logger.warn(`[${tag(ds)}] Legacy streaming-card migration failed for ${legacyMessageId.substring(0, 12)}`);
+            }
+          },
+        };
+      }
 
       if (isFrozenClick) {
         // Historical card — toggle using cached state
@@ -3845,7 +4000,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
             logger.debug(`[${tag(ds)}] Failed to migrate clicked legacy card: ${err}`),
           );
           try { return JSON.parse(cardJson); } catch { /* fall through */ }
-        } else if (!scheduleCardPatch(ds, cardJson)) {
+        } else if (!scheduleCardPatch(ds, cardJson, undefined, { userInitiated: true })) {
           // The queue can decline when live cards are disabled for this turn or
           // transport/card identity is unavailable. In that case the callback
           // must carry the rebuilt card so the clicked card still updates.

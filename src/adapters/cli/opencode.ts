@@ -1,4 +1,6 @@
+import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
+import { promisify } from 'node:util';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { openDatabaseSyncNow } from '../../services/sqlite-compat.js';
 import { resolveCommand } from './registry.js';
@@ -22,6 +24,24 @@ import { delay } from '../../utils/timing.js';
 
 const OPENCODE_SESSION_ID_RE = /^ses_[0-9A-Za-z-]+$/;
 const OPENCODE_PASTE_THRESHOLD = 150;
+
+/** `models` 列表里一行模型 id 的形态：provider/name（允许多级，如 openrouter/anthropic/claude-sonnet-4）。 */
+const MODEL_ID_RE = /^[^\s/]+(?:\/[^\s]+)+$/;
+
+/**
+ * 解析 `opencode models` / `mimo models` 的纯文本输出为模型 id 列表。
+ * 输出每行一个模型，可带 ` — window 1.05M, compacts at 944K` 这类展示元数据
+ * （实测 mimo 1.x）；管道下无 ANSI 颜色，但 TTY 直出时可能带，先剥掉。
+ * 容错：只保留符合 provider/name 形态的行，标题/空行/坏行一律跳过（一条坏数据
+ * 不影响其余模型）；去重并保持出现顺序。
+ */
+export function parseModelList(stdout: string): string[] {
+  return [...new Set(stdout
+    .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, '')
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+—.*$/, '').trim())
+    .filter((line) => MODEL_ID_RE.test(line)))];
+}
 
 /** 判断是否 OpenCode 原生会话 id（`ses_…`）。opencode2 复用同一套 id 规则。 */
 export function isOpenCodeSessionId(value: string | undefined): value is string {
@@ -349,6 +369,8 @@ export interface OpenCodeLikeAdapterOptions {
   skillsDir: string;
   hookConfigPath: string;
   modelChoices: readonly string[] | undefined;
+  /** live 模型枚举的子命令参数（opencode / mimo 都是 `models` 纯文本列表）。 */
+  modelListArgs: readonly string[];
   startupArgs?: readonly string[];
 }
 
@@ -520,6 +542,27 @@ export function createOpenCodeLikeAdapter(pathOverride: string | undefined, runt
       format: 'opencode-plugin',
     },
     asksViaHook: true,
+    // Live 模型枚举：`<bin> models` 输出纯文本列表（每行 provider/name，可带
+    // 展示元数据，见 parseModelList）。仅 dashboard 在用户选中该 CLI 时按需调用，
+    // 不在 daemon/worker 启动路径上；任何异常（spawn 失败/超时/输出为空）一律
+    // fail-soft 返回 null，picker 回退到下面的 modelChoices。
+    async detectModels(): Promise<readonly string[] | null> {
+      try {
+        // lazy promisify：顶层 promisify(execFile) 会在部分 mock child_process
+        // 的测试 import 阶段炸（mock 无 execFile 导出）；推迟到调用时，fail-soft
+        // 的 try/catch 兜住（契约：任何异常 → null）。
+        const execFileAsync = promisify(execFile);
+        const { stdout } = await execFileAsync(this.resolvedBin, [...runtime.modelListArgs], {
+          timeout: 8000,
+          maxBuffer: 16 * 1024 * 1024,
+          windowsHide: true,
+        });
+        const models = parseModelList(String(stdout));
+        return models.length > 0 ? models : null;
+      } catch {
+        return null;
+      }
+    },
     // OpenCode model 通常 provider/name 形式（anthropic/claude-sonnet-4、openai/gpt-5），
     // 自由度高，候选只做引导，setup 时选 Other 自定义最常见。
     modelChoices: runtime.modelChoices ? [...runtime.modelChoices] : undefined,
@@ -534,6 +577,7 @@ export function createOpenCodeAdapter(pathOverride?: string): CliAdapter {
     dbPath: opencodeDbPath,
     skillsDir: '~/.config/opencode/skills',
     hookConfigPath: '~/.config/opencode/plugin/botmux-ask.js',
+    modelListArgs: ['models'],
     modelChoices: CLI_MODEL_CHOICES['opencode'],
   });
 }

@@ -78,6 +78,7 @@ function harness() {
     bareShellCheckInProgress: false,
     ambiguousSubmissionRecoveryHold: undefined,
     submitFailureChains: { size: () => 0 },
+    queuedActivationReceipts: { size: () => 0 },
     codexAppTurnLiveness: { hasActiveTurn: () => false },
     codexAppCompletionAwaitingFinal: false,
     codexAppTurnDispatchQueue: { size: () => 0 },
@@ -271,6 +272,22 @@ describe('worker ready-time Codex runtime version observation', () => {
 describe('worker Codex session automatic upgrade', () => {
   beforeEach(() => { vi.useFakeTimers(); });
   afterEach(() => { vi.useRealTimers(); });
+
+  it('keeps the original CLI while an activation receipt is still being observed', async () => {
+    const h = harness();
+    h.state.queuedActivationReceipts.size = () => 1;
+    expect(await h.run()).toEqual(new Error('waiting for the current turn and input queues'));
+    expect(h.oldBackend.destroySession).not.toHaveBeenCalled();
+    expect(h.state.killCli).not.toHaveBeenCalled();
+    expect(h.state.spawnCli).not.toHaveBeenCalled();
+
+    h.state.queuedActivationReceipts.size = () => 0;
+    const done = h.run();
+    await settleMicrotasks();
+    expect(h.state.spawnCli).toHaveBeenCalledTimes(1);
+    h.ready();
+    expect(await done).toBeUndefined();
+  });
 
   it('leaves a configured CLI launcher in control of its runtime', async () => {
     const h = harness();

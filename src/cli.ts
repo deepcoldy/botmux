@@ -26,6 +26,8 @@
  *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd / Windows Task Scheduler)
  *   botmux whiteboard status|enable|disable|current|list|read|update|write — local project whiteboard
  */
+import { authorizeOwnerlessScheduleCreator, requireScheduleCreatorUnionId } from './core/schedule-creator-authorization.js';
+import { readSchedulePromptUpdate, SCHEDULE_UPDATE_USAGE } from './cli/schedule-update.js';
 import { execSync, execFileSync, spawnSync, spawn } from 'node:child_process';
 import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, renameSync, readdirSync, readlinkSync, symlinkSync, appendFileSync, statSync, unlinkSync, rmSync, realpathSync, chmodSync } from 'node:fs';
 import { underReadIsolation, sendCredFilePath } from './adapters/cli/read-isolation.js';
@@ -206,7 +208,13 @@ import {
 } from './utils/global-install.js';
 import { isLocalDevInstall, botmuxCliEntryAt, bakedBinaryVersion, botmuxInstallRoot } from './utils/install-info.js';
 import { currentUpdateStrategy, replaceStandaloneBinary } from './core/binary-self-update.js';
-import { fetchLatestVersion, isNewerVersion } from './core/update-check.js';
+import {
+  fetchLatestVersion,
+  fetchDistTagVersion,
+  isNewerVersion,
+  parseUpdateTarget,
+  shouldApplySelfUpdate,
+} from './core/update-check.js';
 import { resolveCurrentVersion } from './utils/install-diagnostics.js';
 import {
   resolveLocalDevCheckoutDir,
@@ -227,6 +235,7 @@ import {
 } from './workflows/v3/session-relay-client.js';
 import { fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import { REPORT_SESSION_RELAY_ROUTE } from './core/report-session-relay.js';
+import { DISPATCH_USER_DELIVERY_ROUTE } from './core/dispatch-user-delegation.js';
 import { DISPATCH_REPORT_REGISTER_ROUTE } from './core/dispatch-report-binding.js';
 import { isRetryableAskHttpStatus } from './core/ask-types.js';
 import { linuxIsolationDetected } from './core/linux-isolation.js';
@@ -3319,11 +3328,51 @@ async function cmdStatus(): Promise<void> {
   // warnIfLegacyBotmuxAlive above, which is what a pre-migration host needs.
 }
 
-async function cmdUpgrade(): Promise<void> {
+function printUpgradeHelp(): void {
+  console.log(`
+用法:
+  botmux update [target]
+  botmux upgrade [target]
+
+参数:
+  target    目标频道或版本号（可选，默认 latest）
+            - 稳定频道: latest
+            - 预览频道: canary, beta, rc, next
+            - 具体版本: 如 3.28.0, v3.28.0
+
+示例:
+  botmux update            # 升级到最新正式版
+  botmux update canary     # 升级/切换到最新 canary 预览版
+  botmux update @canary    # 同上
+  botmux update 3.28.0     # 安装/切换到指定版本
+`.trim());
+}
+
+async function cmdUpgrade(args: string[] = []): Promise<void> {
+  const nonHelpArgs = args.filter(a => a !== '--help' && a !== '-h');
+  if (nonHelpArgs.length > 1) {
+    console.error(`❌ 不能同时指定多个升级目标（收到：${nonHelpArgs.join(' ')}）。请只指定一个频道或版本。`);
+    process.exit(2);
+  }
+  const rawTarget = nonHelpArgs[0]?.trim();
+  if (rawTarget === 'help') {
+    printUpgradeHelp();
+    return;
+  }
+  const target = parseUpdateTarget(rawTarget);
+  if (!target) {
+    console.error(`❌ 非法的目标频道或版本格式：“${rawTarget}”。只支持发布频道（latest、canary、beta、rc、next）或语义化版本号（如 3.28.0）。`);
+    process.exit(2);
+  }
+
   // 本地 checkout（有 .git/src）：走 git pull --ff-only → 重新 build → 从本
   // checkout 重启，而不是拿全局包管理器去升级（那对 dev 部署无效，见
   // install-info.ts 的 isLocalDevInstall 说明）。
   if (isLocalDevInstall()) {
+    if (target.isExplicit && target.tag !== 'latest') {
+      console.error(`❌ 当前为本地 git checkout 开发环境，不支持切换到 npm 频道/版本（${target.raw || target.tag}）。\n若需使用发布版本，请通过安装脚本或包管理器全局安装 botmux。`);
+      process.exit(1);
+    }
     cmdUpgradeLocalDev();
     return;
   }
@@ -3333,17 +3382,22 @@ async function cmdUpgrade(): Promise<void> {
   const strategy = currentUpdateStrategy(botmuxInstallRoot());
   if (strategy.kind === 'self-replace') {
     try {
-      const latest = await fetchLatestVersion();
-      if (!latest) {
-        console.error('❌ 无法获取最新版本号（网络不可达或 registry 异常）。');
+      const resolvedVersion = await fetchDistTagVersion(target.tag);
+      if (!resolvedVersion) {
+        console.error(`❌ 无法获取目标版本（${target.tag}）信息（网络不可达、版本不存在或 registry 异常）。`);
         process.exit(1);
       }
       const current = resolveCurrentVersion();
-      if (!isNewerVersion(latest, current)) {
-        console.log(`✅ 已是最新版本（${current}）。`);
+      const decision = shouldApplySelfUpdate(target, resolvedVersion, current);
+      if (!decision.proceed) {
+        if (decision.reason === 'already_latest') {
+          console.log(`✅ 已是最新版本（${current}）。`);
+        } else {
+          console.log(`✅ 当前已是版本 ${current}。`);
+        }
         return;
       }
-      console.log(`🔄 升级中：下载 v${latest} 二进制并替换 ${strategy.target}`);
+      console.log(`🔄 升级中：下载 v${resolvedVersion} 二进制并替换 ${strategy.target}`);
       // 握与 dashboard / maintenance 同一把跨进程锁：这条路径是**写同一个文件**，
       // 两个 update 并发跑会互相盖掉临时文件与 rename。锁文件父目录可能还不存在
       // （daemon 从未在本机起过就先跑 update），先建再握，否则 ENOENT 会盖掉真实错误。
@@ -3353,8 +3407,8 @@ async function cmdUpgrade(): Promise<void> {
       try {
         await withFileLock(lockTarget, async () => {
           acquired = true;
-          const r = await replaceStandaloneBinary(latest, strategy.target);
-          console.log(`✅ 升级完成：${r.asset} → ${r.target}（${current} → ${latest}）。运行 botmux restart 以应用更新。`);
+          const r = await replaceStandaloneBinary(resolvedVersion, strategy.target);
+          console.log(`✅ 升级完成：${r.asset} → ${r.target}（${current} → ${resolvedVersion}）。运行 botmux restart 以应用更新。`);
         }, { maxWaitMs: 2_000 });
       } catch (error) {
         // ⚠️ 三态，不是二态。`withFileLock` 拿不到锁时是**抛异常**不是安静返回，
@@ -3384,7 +3438,7 @@ async function cmdUpgrade(): Promise<void> {
     if (strategy.kind === 'unsupported') {
       throw new UnsupportedGlobalInstallError('unknown', process.execPath);
     }
-    const plan = resolveGlobalInstallPlan(strategy.packageRoot);
+    const plan = resolveGlobalInstallPlan(strategy.packageRoot, process.platform, target.spec);
     console.log(`🔄 升级中：${formatGlobalInstallCommand(plan)}`);
     installLatestBotmuxSync(plan);
     console.log('\n✅ 升级完成。运行 botmux restart 以应用更新。');
@@ -6572,6 +6626,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
               启动有鉴权的本机模型协议入口（Chat Completions 子集）
   status      查看 daemon 状态
   upgrade     升级到最新版本（别名：update）
+              支持可选 target：canary / beta / rc 等频道，或具体版本号（默认 latest）
   dashboard current
               获取当前 Web Dashboard 登录 URL（裸 \`dashboard\` 同义；没有则创建）
   dashboard rotate
@@ -6659,6 +6714,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
        --follow-active                 上次落点话题没关就投那里；关了投本群里人最近说话的话题；都没有就新开顶层话题（起点＝当前话题或 --root-msg-id）
        --new-topic [--topic-title ...] 每次创建新话题和独立会话
        --silent                        静默执行：不发「执行中」提示，模型判断是否 botmux send 报警
+  schedule update <id> --prompt-file FILE  原地更新提示词，保留任务与执行安排
   schedule remove <id>                 删除任务
   schedule pause|resume <id>           暂停/恢复
   schedule run <id>                    标记立即执行
@@ -6744,7 +6800,7 @@ botmux skills 注入方式（仅影响 codex/gemini/opencode 等只支持全局 
 提示: 多数子命令支持 \`botmux <子命令> --help\` 查看完整参数。
 
 配置目录: ~/.botmux/
-文档: https://github.com/deepcoldy/botmux
+文档: https://deepcoldy.github.io/botmux/
 `);
 }
 
@@ -6818,6 +6874,25 @@ function detectCurrentSession(): CurrentSession | null {
  */
 async function detectAuthenticatedCurrentSession(): Promise<CurrentSession | null> {
   const dataDir = resolveDataDir();
+  let attested: ManagedOriginAttestation | undefined;
+  const attestCurrentOrigin = async () => {
+    const isolated = readWorkflowSessionRelayContext({ env: process.env, dataDir, includeHostSession: true });
+    if (!isolated?.originChannelId) return undefined;
+    return attestManagedOrigin({
+      context: {
+        sessionId: isolated.sessionId,
+        channelId: isolated.originChannelId,
+        capability: isolated.capability,
+        dataDir,
+        larkAppId: isolated.larkAppId,
+        ipcPortFallback: isolated.ipcPortFallback,
+      },
+      resolveIpcPort: appId => {
+        try { return appId ? findDaemon(appId)?.ipcPort : undefined; }
+        catch { return undefined; }
+      },
+    });
+  };
   let provenance: {
     sessionId: string;
     turnId: string;
@@ -6873,25 +6948,8 @@ async function detectAuthenticatedCurrentSession(): Promise<CurrentSession | nul
       // absence of host ancestors as a detached call. A sandbox fixture/legacy
       // session without that capability fails closed; a claimed BotMux session
       // must never degrade to a standalone OWNERLESS task.
-      const isolated = readWorkflowSessionRelayContext({ env: process.env, dataDir });
-      if (!isolated?.originChannelId) throw hostError;
-      const attested = await attestManagedOrigin({
-        context: {
-          sessionId: isolated.sessionId,
-          channelId: isolated.originChannelId,
-          capability: isolated.capability,
-          dataDir,
-          ...(isolated.larkAppId ? { larkAppId: isolated.larkAppId } : {}),
-          ...(isolated.ipcPortFallback !== undefined
-            ? { ipcPortFallback: isolated.ipcPortFallback }
-            : {}),
-        },
-        resolveIpcPort: (appId) => {
-          try { return appId ? findDaemon(appId)?.ipcPort : undefined; }
-          catch { return undefined; }
-        },
-      });
-      if (!attested.callerOpenId || !attested.larkAppId) throw hostError;
+      attested = await attestCurrentOrigin();
+      if (!attested?.callerOpenId || !attested.larkAppId) throw hostError;
       provenance = {
         sessionId: attested.sessionId,
         turnId: attested.turnId,
@@ -6902,8 +6960,8 @@ async function detectAuthenticatedCurrentSession(): Promise<CurrentSession | nul
   }
   if (!provenance) return null;
   const s = loadSessions().get(provenance.sessionId);
-  if (!s || s.status !== 'active') return null;
-  if (provenance.larkAppId !== s.larkAppId) return null;
+  if (!s || s.status !== 'active') throw new Error('authenticated schedule session is no longer active');
+  if (provenance.larkAppId !== s.larkAppId) throw new Error('schedule creator bot does not match the session');
   // The current-turn provenance authenticates the human who actually invoked
   // this command. A persisted session owner is useful when present, but older
   // bot/schedule-created sessions can legitimately be ownerless. In that case
@@ -6917,35 +6975,27 @@ async function detectAuthenticatedCurrentSession(): Promise<CurrentSession | nul
     }
     ownerUnionId = s.ownerUnionId;
   } else {
-    // `botmux schedule ...` runs in a short-lived CLI process whose in-memory
-    // daemon registry is intentionally not initialized. Reconstruct the same
-    // fail-closed allowlist view from durable config + its last-known-good
-    // raw-entry resolution cache instead of calling getBot().
-    const configuredBot = loadBotsJson().find(bot => bot?.larkAppId === s.larkAppId);
-    if (!configuredBot) {
-      throw new Error(`cannot load bot config for ${s.larkAppId}`);
+    // macOS can retain host ancestry while denying bots.json, so consult the
+    // managed origin for ownerless sessions even when PID provenance succeeded.
+    attested ??= await attestCurrentOrigin();
+    if (attested) {
+      if (attested.sessionId !== provenance.sessionId || attested.turnId !== provenance.turnId
+        || attested.larkAppId !== provenance.larkAppId || attested.callerOpenId !== provenance.callerOpenId) {
+        throw new Error('schedule creator provenance changed during authorization');
+      }
+      ownerUnionId = requireScheduleCreatorUnionId(attested.scheduleCreator);
+    } else {
+      // Standalone host CLI retains its durable allowlist lookup. Managed CLI
+      // must never fall back from an unsupported/denied proof to host config.
+      const configuredBot = loadBotsJson().find(bot => bot?.larkAppId === s.larkAppId);
+      ownerUnionId = requireScheduleCreatorUnionId(authorizeOwnerlessScheduleCreator({
+        callerOpenId: provenance.callerOpenId,
+        allowedUsers: configuredBot && (Array.isArray(configuredBot.allowedUsers)
+          ? configuredBot.allowedUsers.filter((entry: unknown): entry is string => typeof entry === 'string')
+          : []),
+        resolutionCache: readAllowedUsersResolveCache(dataDir, s.larkAppId),
+      }));
     }
-    const allowedRaw: string[] = Array.isArray(configuredBot.allowedUsers)
-      ? configuredBot.allowedUsers.filter((entry: unknown): entry is string => typeof entry === 'string')
-      : [];
-    const cache = readAllowedUsersResolveCache(dataDir, s.larkAppId);
-    const resolvedAllowedUsers = new Set(
-      allowedRaw
-        .map((entry: string) => entry.startsWith('ou_') ? entry : cache[entry])
-        .filter((entry): entry is string => typeof entry === 'string' && entry.startsWith('ou_')),
-    );
-    if (!resolvedAllowedUsers.has(provenance.callerOpenId)) {
-      throw new Error('current turn caller is not an allowed bot operator');
-    }
-    const matches = [...new Set(
-      allowedRaw
-        .filter((entry: string) => entry.startsWith('on_'))
-        .filter((entry: string) => cache[entry] === provenance.callerOpenId),
-    )];
-    if (matches.length !== 1) {
-      throw new Error('cannot resolve the current turn caller union_id');
-    }
-    ownerUnionId = matches[0];
   }
   return {
     sessionId: s.sessionId,
@@ -6959,6 +7009,18 @@ async function detectAuthenticatedCurrentSession(): Promise<CurrentSession | nul
     ownerOpenId: provenance.callerOpenId,
     ownerUnionId,
   };
+}
+
+/** Re-attest at the effect boundary; detached calls must not acquire authority. */
+async function revalidateScheduleCreator(current: CurrentSession | null): Promise<CurrentSession | null> {
+  if (!current) return null;
+  const fresh = await detectAuthenticatedCurrentSession();
+  if (!fresh || fresh.sessionId !== current.sessionId || fresh.turnId !== current.turnId
+    || fresh.larkAppId !== current.larkAppId || fresh.ownerOpenId !== current.ownerOpenId
+    || fresh.ownerUnionId !== current.ownerUnionId) {
+    throw new Error('schedule creator provenance changed before write');
+  }
+  return fresh;
 }
 
 /** Pick a value from --flag <value> or --flag=value style args. */
@@ -7386,6 +7448,10 @@ Context flags: --session-id, --lark-app-id, --chat-id, --working-dir/--repo`);
 }
 
 async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
+  if (sub === 'update' && rest.length === 1 && ['--help', '-h'].includes(rest[0])) {
+    console.log(SCHEDULE_UPDATE_USAGE);
+    return;
+  }
   // Ensure SESSION_DATA_DIR points at the daemon's data dir so schedule-store
   // writes to the right file even when invoked outside the daemon env.
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
@@ -7572,18 +7638,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       // effect boundary so a turn rotation cannot carry an earlier proof into
       // a later schedule write. If the first lookup was ownerless, do not
       // opportunistically gain an identity at this later point.
-      if (authenticatedCur) {
-        const fresh = await detectAuthenticatedCurrentSession();
-        if (!fresh
-          || fresh.sessionId !== authenticatedCur.sessionId
-          || fresh.turnId !== authenticatedCur.turnId
-          || fresh.larkAppId !== authenticatedCur.larkAppId
-          || fresh.ownerOpenId !== authenticatedCur.ownerOpenId
-          || fresh.ownerUnionId !== authenticatedCur.ownerUnionId) {
-          throw new Error('schedule creator provenance changed before write');
-        }
-        authenticatedCur = fresh;
-      }
+      authenticatedCur = await revalidateScheduleCreator(authenticatedCur);
       task = scheduler.addTask({
         id: explicitTaskId,
         name,
@@ -7674,6 +7729,32 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   };
 
   switch (sub) {
+    case 'update': {
+      const prompt = readSchedulePromptUpdate(rest);
+      const authenticatedCur = await detectAuthenticatedCurrentSession();
+      if (!scheduleStore.getTask(id) && !retargetIfElsewhere()) {
+        throw new Error(`未找到任务 ${id}`);
+      }
+      if (authenticatedCur && authenticatedCur.larkAppId !== scheduleStore.getScheduleScope()) {
+        throw new Error('沙盒会话只能管理自己 bot 的任务。');
+      }
+      await revalidateScheduleCreator(authenticatedCur);
+      // A protected precondition sidecar records a hash of the task's canonical
+      // input (prompt included) and lives in a host-only directory the sandboxed
+      // CLI can neither read nor rebind. Rewriting the prompt here would leave
+      // the stored hash stale, so every later fire fails resolution with
+      // canonical_input_mismatch and the task silently stops forever. Dashboard
+      // edits go through updateTaskWithOptionalPrecondition, which rebinds; the
+      // CLI must refuse instead of reporting success.
+      const bound = scheduleStore.getTask(id);
+      if (bound?.preconditionRef) {
+        throw new Error(`任务 ${id} 绑定了守护前置条件（precondition），CLI 更新会破坏其安全绑定导致任务停止执行；请在 Dashboard 的定时任务页修改提示词。`);
+      }
+      const result = scheduler.updateTask(id, { prompt });
+      if (!result.ok) throw new Error(`无法更新任务 ${id}: ${result.error}`);
+      console.log(`✅ 已更新任务 ${id} 的 prompt；后续执行生效，未触发补跑。`);
+      break;
+    }
     case 'remove':
     case 'rm':
     case 'delete':
@@ -7718,7 +7799,7 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
       }
       break;
     default:
-      console.error(`未知子命令: ${sub}\n可用: list | add | remove | pause | resume | run`);
+      console.error(`未知子命令: ${sub}\n可用: list | add | update | remove | pause | resume | run`);
       process.exit(1);
   }
 }
@@ -11982,12 +12063,25 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     ? JSON.stringify({ zh_cn: { title: '', content: built.threadContent } })
     : undefined;
 
+  const deliverKickoff = async (rootId: string, content: string): Promise<string> => {
+    const response = await postCurrentSessionDaemonRoute({
+      path: DISPATCH_USER_DELIVERY_ROUTE, sessionId: sid, larkAppId: appId,
+      body: { rootId, chatId: targetChatId, content,
+        targetAppIds: parsedBotApps.map(item => item.appId), hasLegacyBots: legacyBots.length > 0 },
+    });
+    const result: any = await response.json();
+    if (!response.ok || result?.ok !== true || typeof result.messageId !== 'string') {
+      throw new Error(`dispatch delivery failed: ${result?.error ?? response.status}`);
+    }
+    return result.messageId;
+  };
+
   let dispatchRootForLifecycle = intoRoot;
   try {
     // --into: append into an existing thread (activate standby bots / coordinate).
     if (intoRoot) {
       const sentAtMs = Date.now();
-      const kickoffId = await replyMessage(appId, intoRoot, intoBriefJson!, 'post', true);
+      const kickoffId = await deliverKickoff(intoRoot, intoBriefJson!);
       const acceptance = parsedBotApps.length > 0
         ? await waitForExactDispatchAcceptance({
             targetAppIds: parsedBotApps.map(item => item.appId),
@@ -12107,7 +12201,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
       });
       const kickoffBriefJson = JSON.stringify({ zh_cn: { title: '', content: kickoffBuilt.threadContent } });
       const sentAtMs = Date.now();
-      kickoffId = await replyMessage(appId, seedId, kickoffBriefJson, 'post', true);
+      kickoffId = await deliverKickoff(seedId, kickoffBriefJson);
       if (parsedBotApps.length > 0) {
         acceptance = await waitForExactDispatchAcceptance({
           targetAppIds: parsedBotApps.map(item => item.appId),
@@ -14883,8 +14977,8 @@ const FLEET_KNOWN_FLAGS: Record<string, readonly string[]> = {
   start: ['--companion-secret-file', '--companion-bot'],
   stop: ['--with-plugin'],
   restart: ['--with-plugin', '--companion-secret-file', '--companion-bot'],
-  upgrade: [],
-  update: [],
+  upgrade: ['--canary', '--beta', '--rc', '--next', '--latest'],
+  update: ['--canary', '--beta', '--rc', '--next', '--latest'],
 };
 const FLEET_VALUE_FLAGS = new Set(['--companion-secret-file', '--companion-bot']);
 if (ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')) {
@@ -14900,18 +14994,23 @@ if (ROOT_FLEET_MUTATION_COMMANDS.has(command ?? '')) {
   // the most destructive interpretation of it, and the flags most likely to be
   // guessed are exactly the read-only ones.
   // Exact set difference rather than `unknownFlags()`: that helper only reports
-  // tokens starting with `-`, so `botmux stop foo` would be waved through. None
-  // of these commands takes a positional argument either, so anything outside
-  // the table above is unknown, flag-shaped or not.
+  // tokens starting with `-`, so `botmux stop foo` would be waved through.
   const knownFleetFlags = FLEET_KNOWN_FLAGS[command ?? ''] ?? [];
+  const maxPositionalArgs = (command === 'upgrade' || command === 'update') ? 1 : 0;
   const unknownArgs = unknownFleetArgs(fleetArgs, {
     boolFlags: knownFleetFlags.filter(flag => !FLEET_VALUE_FLAGS.has(flag)),
     valueFlags: knownFleetFlags.filter(flag => FLEET_VALUE_FLAGS.has(flag)),
+    maxPositionalArgs,
   });
   if (unknownArgs.length > 0) {
     console.error(`未知参数: ${unknownArgs.join(' ')}`);
     console.error(`  \`botmux ${command}\` 只接受: ${['--help', ...knownFleetFlags].join(' ')}。`);
     console.error('  为避免把一个看起来像「只检查」的参数当成「执行」，这里直接中止，不做任何改动。');
+    process.exit(2);
+  }
+  if ((command === 'upgrade' || command === 'update') && fleetArgs.filter(a => a !== '--help' && a !== '-h').length > 1) {
+    const nonHelp = fleetArgs.filter(a => a !== '--help' && a !== '-h');
+    console.error(`❌ 不能同时指定多个升级目标（收到：${nonHelp.join(' ')}）。请只指定一个频道或版本。`);
     process.exit(2);
   }
 }
@@ -15051,7 +15150,12 @@ if (process.env.BOTMUX_WORKFLOW === '1') {
 async function cmdVoiceSetup(args: string[]): Promise<void> {
   const sub = (args[0] ?? '').toLowerCase();
   const { readGlobalConfig, mergeGlobalConfig } = await import('./global-config.js');
-  const { DEFAULT_SAMI_SPEAKER, DEFAULT_OPENAI_SPEAKER } = await import('./services/voice/index.js');
+  const {
+    DEFAULT_SAMI_SPEAKER,
+    DEFAULT_OPENAI_SPEAKER,
+    DEFAULT_MINIMAX_SPEAKER,
+    DEFAULT_MINIMAX_TTS_MODEL,
+  } = await import('./services/voice/index.js');
   const mask = (s?: string) => (s ? `${s.slice(0, 4)}***` : '(未设)');
 
   if (sub === 'status') {
@@ -15063,6 +15167,7 @@ async function cmdVoiceSetup(args: string[]): Promise<void> {
     if (typeof v.rate === 'number') console.log(`  语速: ${v.rate}`);
     if (v.sami) console.log(`  SAMI: accessKey=${mask(v.sami.accessKey)} secretKey=${mask(v.sami.secretKey)} appkey=${v.sami.appkey ?? '(未设)'}${v.sami.tokenUrl ? ` tokenUrl=${v.sami.tokenUrl}` : ''}`);
     if (v.openai) console.log(`  OpenAI: baseUrl=${v.openai.baseUrl ?? '(未设)'} model=${v.openai.model ?? '(未设)'} apiKey=${mask(v.openai.apiKey)}`);
+    if (v.minimax) console.log(`  MiniMax: region=${v.minimax.region ?? 'global'} model=${v.minimax.model ?? DEFAULT_MINIMAX_TTS_MODEL} apiKey=${mask(v.minimax.apiKey)}`);
     return;
   }
   if (sub === 'disable' || sub === 'off') {
@@ -15127,9 +15232,19 @@ async function cmdVoiceSetup(args: string[]): Promise<void> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
     console.log('🔊 配置语音总结（高级功能）。写入全局 ~/.botmux/config.json，重启后生效。\n');
-    const eng = (await ask(rl, '选择 TTS 引擎  [1] SAMI（需 AK/SK/appkey）  [2] OpenAI 兼容（自带 baseUrl/key）: ')).trim();
+    const eng = (await ask(rl, '选择 TTS 引擎  [1] SAMI（需 AK/SK/appkey）  [2] OpenAI 兼容（自带 baseUrl/key）  [3] MiniMax（自带 API key）: ')).trim();
     const voice: Record<string, any> = {};
-    if (eng === '2' || /openai/i.test(eng)) {
+    if (eng === '3' || /minimax/i.test(eng)) {
+      voice.engine = 'minimax';
+      const apiKey = (await ask(rl, 'MiniMax API key: ')).trim();
+      if (!apiKey) { console.error('❌ MiniMax API key 必填，未写入。'); return; }
+      const regionAnswer = (await ask(rl, '接入区域  [1] 国际 api.minimax.io  [2] 国内 api.minimaxi.com（默认 1）: ')).trim();
+      const region = regionAnswer === '2' || /^(cn|china)$/i.test(regionAnswer) ? 'cn' : 'global';
+      const model = (await ask(rl, `模型 model（留空=默认 ${DEFAULT_MINIMAX_TTS_MODEL}）: `)).trim() || DEFAULT_MINIMAX_TTS_MODEL;
+      voice.minimax = { apiKey, region, model };
+      const sp = (await ask(rl, `音色 voice id（留空=默认 ${DEFAULT_MINIMAX_SPEAKER}）: `)).trim();
+      if (sp) voice.speaker = sp;
+    } else if (eng === '2' || /openai/i.test(eng)) {
       voice.engine = 'openai';
       const baseUrl = (await ask(rl, 'baseUrl（如 https://api.openai.com/v1，自托管如 http://127.0.0.1:8880/v1）: ')).trim();
       const apiKey = (await ask(rl, 'apiKey（无则留空）: ')).trim();
@@ -15853,7 +15968,7 @@ switch (command) {
     break;
   }
   case 'upgrade':
-  case 'update':  await cmdUpgrade(); break;
+  case 'update':  await cmdUpgrade(process.argv.slice(3)); break;
   case 'dashboard': await cmdDashboard(process.argv.slice(3)); break;
   case 'bind': {
     // `botmux bind <code>` — 把本机绑定到中心化平台

@@ -163,6 +163,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       larkAppId,
       noTransport,
       triggerUserAuth,
+      promptInjection,
     }) {
       const args: string[] = [];
       if (!disableCliBypass) {
@@ -210,7 +211,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
 
       // Claude: --append-system-prompt. Grok: --rules (append; docs alias).
       // Do NOT use --system-prompt-override — that replaces Grok's agent prompt.
-      args.push(
+      if (promptInjection !== 'none') args.push(
         '--rules',
         buildBotmuxSystemPromptText({
           locale,

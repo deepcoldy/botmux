@@ -31,6 +31,7 @@ import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { DAEMON_COMMANDS } from './core/passthrough-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { normalizeCredentialsSourceDir } from './services/cli-credential-source.js';
 import { resolveBotmuxConfigDir, resolveBotsConfigFile, type BotsConfigProvenance } from './core/config-dir.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
 import { normalizeCommandTriggers } from './services/command-trigger-normalize.js';
@@ -1354,6 +1355,14 @@ export interface SessionGroupConfig {
   /** Send a DM receipt linking the freshly-created group (true). */
   dmReceipt?: boolean;
   /**
+   * Forward the DM that spawned the group into the group as its first
+   * message (true). This is what makes the group self-explaining: a text
+   * seed can be quoted inline, but an image / file / 合并转发消息 cannot be
+   * re-created from the event payload — only forwarded. Set false to keep
+   * just the intro line (non-text seeds then read「（非文本消息）」).
+   */
+  forwardOrigin?: boolean;
+  /**
    * What to do with the group when its session is closed:
    * 'keep' (default) — leave the group and registry entry; a later message in
    * the group resumes the closed session (same-group resume). 'disband' /
@@ -1554,6 +1563,9 @@ export interface BotConfig {
    * 都持久化。系统提示部分需 /restart 生效，逐轮信封立即生效。
    */
   replyDelivery?: 'send' | 'transcript';
+  /** Skip Botmux prompt/skill/context injection and auto-forward final replies.
+   * Existing prompt and skill customizations remain saved. */
+  promptInjection?: 'default' | 'none';
   /**
    * Whether each forwarded turn carries a `<sender type=… open_id=… name=…
    * email=… />` tag naming who spoke. Default ON (ABSENT ⇒ ON — only an
@@ -1605,6 +1617,14 @@ export interface BotConfig {
    * CODEX_HOME and never reads or copies global auth, with or without sandbox.
    */
   codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode;
+  /**
+   * Per-bot CLI credential source directory (absolute, `~/` expanded). When set,
+   * a sandboxed bot copies its CLI login from `<dir>/<cli>/…` on every cold
+   * spawn instead of the machine's shared login, and refuses to start if that
+   * source is unusable. No effect on non-sandboxed bots. See
+   * services/cli-credential-source.ts.
+   */
+  credentialsSourceDir?: string;
   codexInstancePool?: import('./services/codex-instance-pool.js').CodexInstancePool;
   /**
    * Trigger-user CLI authentication. Missing → off; this bot's CLI calls keep
@@ -1877,6 +1897,15 @@ export interface BotConfig {
    */
   autoGrantRequestCards?: boolean;
   /**
+   * 申请卡转投 owner 私聊。默认关闭（undefined = off），只有显式 true 才开：
+   * - 会话里没有任何管理员可点卡时（群里查不到管理员），申请卡改发到主 owner 私聊，
+   *   而不是回复在一个 owner 看不到的群里；
+   * - 私聊（p2p）被 talk 闸挡住时不再静默丢弃，同样把申请卡发到主 owner 私聊。
+   * 两种情况申请人都只收到一句不含 owner 身份的中性回执；私聊投递另受 owner 维度总量节流。
+   * 前提是 autoGrantRequestCards 未关闭。适合关掉 autoInviteOwnerOnGroupAdd、owner 不进群的用法。
+   */
+  grantRequestToOwnerDm?: boolean;
+  /**
    * 用户自定义、额外放行透传给 CLI 的 slash 命令 —— 在固定的 PASSTHROUGH_COMMANDS
    * 之上扩展（例如把 CLI 支持但默认不放行的 `/goal`、`/export` 加进来）。每项必须
    * `/` 开头、小写、仅含 [a-z0-9:_-]；解析时归一化（缺失的 `/` 自动补、转小写、去重、
@@ -2118,6 +2147,8 @@ export interface BotConfig {
    * Default (undefined) = passive.
    */
   autoStartOnNewTopic?: boolean;
+  /** Chat IDs excluded from group-join and new-topic auto-start (explicit requests still work). */
+  autoStartExcludedChats?: string[];
   /** Bot-wide default listener. It applies to every joined group without an override. */
   globalMessageListener?: MessageListenerConfig;
   /** Per-chat exceptions to {@link globalMessageListener}; an absent entry inherits. */
@@ -3298,6 +3329,15 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       entry.cliLaunchMode,
       `Bot config [${i}].cliLaunchMode`,
     );
+    let credentialsSourceDir: string | undefined;
+    try {
+      credentialsSourceDir = normalizeCredentialsSourceDir(entry.credentialsSourceDir);
+    } catch (e) {
+      throw new Error(`Bot config [${i}]: ${(e as Error).message}`);
+    }
+    if (credentialsSourceDir && entry.codexAuthSync === 'isolated') {
+      throw new Error(`Bot config [${i}]: credentialsSourceDir cannot be combined with codexAuthSync "isolated"`);
+    }
     if (cliRuntime && entry.cliPathOverride === undefined) {
       throw new Error(`Bot config [${i}]: cliPathOverride is required as an exact downgrade shadow of cliRuntime.executable`);
     }
@@ -3603,15 +3643,15 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       );
     }
 
-    // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai，sami/openai
-    // 为对象，speaker/rate 透传，asr 为对象）；非对象或 engine 非法 → undefined。
-    // 深度校验（凭证是否可用 / asr 是否 enabled）在 resolveVoiceConfig /
-    // resolveAsrConfig 做，这里只挡明显垃圾。
+    // voice：per-bot 语音引擎覆盖。结构化保留（engine ∈ sami|openai|minimax，
+    // 三类凭证为对象，speaker/rate 透传，asr 为对象）；非对象或 engine 非法 →
+    // undefined。深度校验（凭证是否可用 / asr 是否 enabled）在 resolveVoiceConfig
+    // / resolveAsrConfig 做，这里只挡明显垃圾（如 minimax.region 拼错）。
     let voice: VoiceConfig | undefined;
     const rawVoice = entry.voice;
     if (rawVoice && typeof rawVoice === 'object' && !Array.isArray(rawVoice)) {
       const eng = (rawVoice as any).engine;
-      if (eng === undefined || eng === 'sami' || eng === 'openai') {
+      if (eng === undefined || eng === 'sami' || eng === 'openai' || eng === 'minimax') {
         const v: VoiceConfig = {};
         if (eng) v.engine = eng;
         if (typeof (rawVoice as any).speaker === 'string') v.speaker = (rawVoice as any).speaker;
@@ -3620,6 +3660,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         if (s && typeof s === 'object') v.sami = { accessKey: s.accessKey, secretKey: s.secretKey, appkey: s.appkey, tokenUrl: s.tokenUrl, wsUrl: s.wsUrl };
         const o = (rawVoice as any).openai;
         if (o && typeof o === 'object') v.openai = { baseUrl: o.baseUrl, apiKey: o.apiKey, model: o.model };
+        const m = (rawVoice as any).minimax;
+        if (m && typeof m === 'object') v.minimax = {
+          apiKey: typeof m.apiKey === 'string' ? m.apiKey : undefined,
+          model: typeof m.model === 'string' ? m.model : undefined,
+          region: m.region === 'cn' ? 'cn' : m.region === 'global' ? 'global' : undefined,
+        };
         const a = (rawVoice as any).asr;
         if (a && typeof a === 'object') v.asr = {
           enabled: a.enabled === true,
@@ -3629,7 +3675,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
           ...(typeof a.timeoutMs === 'number' ? { timeoutMs: a.timeoutMs } : {}),
           ...(typeof a.language === 'string' ? { language: a.language } : {}),
         };
-        if (v.engine || v.sami || v.openai || v.speaker || v.asr) voice = v;
+        if (v.engine || v.sami || v.openai || v.minimax || v.speaker || v.asr) voice = v;
       }
     }
 
@@ -3703,11 +3749,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
       // 显式 send / transcript 都保留；缺省按 defaultReplyDeliveryFor 解析。
       replyDelivery: entry.replyDelivery === 'transcript' || entry.replyDelivery === 'send' ? entry.replyDelivery : undefined,
+      promptInjection: entry.promptInjection === 'none' ? 'none' : undefined,
       codexBrowser,
       codexRpcInput: entry.codexRpcInput === true,
       existingAppServer,
       // Missing keeps the historical every-cold-spawn global auth refresh.
       codexAuthSync: entry.codexAuthSync === 'isolated' ? 'isolated' : 'shared',
+      credentialsSourceDir,
       codexInstancePool,
       ...(triggerUserAuth ? { triggerUserAuth } : {}),
       sandbox: entry.sandbox === true,
@@ -3781,6 +3829,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       restrictGrantCommands: entry.restrictGrantCommands === true || undefined,
       // Default is ON, so only explicit false is meaningful/persisted.
       autoGrantRequestCards: entry.autoGrantRequestCards === false ? false : undefined,
+      // 默认关，只落显式 true。
+      grantRequestToOwnerDm: entry.grantRequestToOwnerDm === true || undefined,
       // Default is ON (accept bot-sent slash), so only explicit false persists.
       acceptSlashFromBots: entry.acceptSlashFromBots === false ? false : undefined,
       customPassthroughCommands,
@@ -3810,7 +3860,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
-      cotEnabled: entry.cotEnabled === false ? false : undefined,
+      cotEnabled: normalizeCotEnabled(entry) ? undefined : false,
       // Default ON, same convention as cotEnabled: an absent key means the
       // <sender> tag is injected, so existing prompts are unchanged.
       senderTag: entry.senderTag === false ? false : undefined,
@@ -3861,6 +3911,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         ? entry.autoStartOnGroupJoinSeed
         : undefined,
       autoStartOnNewTopic: entry.autoStartOnNewTopic === true || undefined,
+      autoStartExcludedChats: Array.isArray(entry.autoStartExcludedChats) ? entry.autoStartExcludedChats.filter((id: unknown): id is string => typeof id === 'string') : undefined,
       groupJoinCommandEnabled: entry.groupJoinCommandEnabled === true || undefined,
       groupJoinCommand: typeof entry.groupJoinCommand === 'string' && entry.groupJoinCommand.trim()
         ? entry.groupJoinCommand.trim()
@@ -3952,4 +4003,20 @@ export function readBotSkillPolicy(raw: unknown): BotSkillPolicy | undefined {
   const include = readDirectSkillSelectors(r.include);
   if (include) out.include = include;
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/**
+ * Read-compat for `thinkingCard`, renamed to `cotEnabled` in #1477 (shipped
+ * v3.27): without this, an explicitly muted thinking bubble silently comes
+ * back after upgrade. An explicit canonical boolean always wins.
+ *
+ * Removal plan: delete every site marked `[legacy-thinkingCard]` — grep
+ * that exact tag under src/ as the index (a bare `thinkingCard` grep also
+ * matches the unrelated, still-live `thinkingCardToolResult` switch from
+ * #1546) — no earlier than v3.33.0 (at least three minor releases after
+ * this compat ships). Removing it restores default-on for any un-migrated
+ * key, so bump the floor release if old keys still show up in support.
+ */
+export function normalizeCotEnabled(entry?: { cotEnabled?: unknown; thinkingCard?: unknown }): boolean {
+  return typeof entry?.cotEnabled === 'boolean' ? entry.cotEnabled : entry?.thinkingCard !== false;
 }

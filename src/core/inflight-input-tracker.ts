@@ -41,6 +41,11 @@ export class InflightInputTracker {
   private unacked: InflightItem[] = [];
   private carryOver: InflightItem[] = [];
 
+  /** Something written to the PTY has not been consumed yet (no idle since). */
+  hasUnacked(): boolean {
+    return this.unacked.length > 0;
+  }
+
   /** An input just went onto the CLI's PTY. */
   onWrite(item: InflightItem): void {
     this.unacked.push(item);

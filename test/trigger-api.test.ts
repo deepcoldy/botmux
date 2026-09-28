@@ -282,11 +282,10 @@ describe('trigger request contract', () => {
     if (!v.ok) expect(v.body.errorCode).toBe('bad_request');
   });
 
-  it('rejects turnIdempotencyKey outside async scope (wait / dryRun / no async mode)', () => {
+  it('rejects turnIdempotencyKey with wait or dryRun', () => {
     const cases: any[] = [
       { asyncReturnSessionId: true, waitForFinalOutput: true, turnIdempotencyKey: 'tk' },
       { asyncReturnSessionId: true, dryRun: true, turnIdempotencyKey: 'tk' },
-      { turnIdempotencyKey: 'tk' }, // no async response mode
     ];
     for (const options of cases) {
       const req = request();

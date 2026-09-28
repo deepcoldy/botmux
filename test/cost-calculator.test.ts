@@ -803,6 +803,19 @@ describe('getSessionTokenUsage', () => {
     });
   });
 
+  it('requires trusted native cliSessionId for Antigravity and refuses workspace fallback', () => {
+    expect(getSessionUsageSnapshot({
+      cliId: 'antigravity',
+      sessionId: 'botmux-sid',
+      cwd: '/workspace/unrelated',
+      fresh: true,
+    })).toEqual({
+      context: null,
+      tokens: null,
+      turnTokens: null,
+    });
+  });
+
   it('maps Botmux session ids to TraeX native session ids for usage lookup', () => {
     vi.mocked(findTraexSessionIdByBotmuxSessionId).mockReturnValue('mapped-traex-sid');
     vi.mocked(findTraexRolloutBySessionId).mockReturnValue('/home/testuser/.trae/cli/sessions/2026/06/30/rollout-mapped-traex-sid.jsonl');

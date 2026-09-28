@@ -462,6 +462,25 @@ export class TmuxBackend implements SessionBackend {
     });
   }
 
+  sendLines(lines: string[], softNewlineKey: string): void {
+    if (lines.length === 0) return;
+    this.exitCopyModeIfNeeded();
+    const args: string[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (i > 0) args.push(';');
+      args.push('send-keys', '-t', this.cmdTarget, '-l', '--', lines[i]);
+      if (i < lines.length - 1) {
+        args.push(';');
+        args.push('send-keys', '-t', this.cmdTarget, softNewlineKey);
+      }
+    }
+    execFileSync('tmux', args, {
+      stdio: 'ignore',
+      timeout: 5000,
+      env: tmuxEnv(),
+    });
+  }
+
   /**
    * Enter copy-mode on the pane (`-e` makes it auto-exit when scrolled back to
    * the bottom). Lets us use tmux's own scrollback even when the running app

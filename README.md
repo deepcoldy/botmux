@@ -50,7 +50,7 @@ botmux start                 # 启动 daemon（botmux autostart enable 设开机
 >
 > 正式版 macOS CLI 使用稳定的 Apple Developer ID 签名。升级替换二进制后，macOS 的文件与 App 数据访问授权仍绑定同一代码身份，不会因为版本哈希变化而把 botmux 当成一个新程序；canary / beta / rc 等预览版仍使用 ad-hoc 签名。
 >
-> 升级：`botmux upgrade`（原地换二进制），或**重跑一遍上面那条 curl 命令**——同样原地升级，不会重复往启动文件里追加 PATH。
+> 升级：**一律重跑上面那条 curl 命令**（npm / pnpm 全局安装也用它，原地替换、不会重复往启动文件里追加 PATH），装完开个新终端跑 `botmux restart`；≥3.18 的二进制安装上 `botmux upgrade` 与其等价。装指定版本（含回滚）：`curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | BOTMUX_VERSION=v3.18.8 sh`（变量必须在管道右侧的 `sh` 前面）。⚠️ **v3.18.0 之前的老版本不要用 npm 升级**——跨「Node 源码 → 二进制」形态边界会让 daemon 重启失败。
 
 <details>
 <summary>已经在用 Node 生态？也可以走 npm（同一个二进制）</summary>
@@ -59,9 +59,9 @@ botmux start                 # 启动 daemon（botmux autostart enable 设开机
 npm install -g botmux        # 需要 Node >= 22 装包本身
 ```
 
-npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的那一个），postinstall 把 `~/.botmux/bin/botmux` 指向它并同样写 PATH。所以装完只有**一个** botmux 版本，不再出现「装了两个 Node 版本、各自带一份全局 botmux 互相打架 / 不知道更新了哪个」。
+npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的那一个）。包的 `bin` 指向随包发布的 sh 启动器，由包管理器自己链到 PATH——**npm / pnpm / bun 三种装法都不依赖生命周期脚本**（pnpm 10/11 与 bun 默认不跑依赖的 postinstall，早期版本因此装完没有任何 `botmux` 命令）。postinstall 仍会把 `~/.botmux/bin/botmux` 指向同一个二进制并写 PATH。所以装完始终只有**一个** botmux **版本**（两个入口都 exec 同一个二进制），不再出现「装了两个 Node 版本、各自带一份全局 botmux 互相打架 / 不知道更新了哪个」。
 
-区别只在**谁来装、以后谁来升**：npm 路径需要 Node ≥ 22 才能执行安装本身，升级交回 `npm i -g botmux@latest`；curl 路径全程不碰 Node。跑起来之后两者完全一致——同样的二进制、同样的命令。
+区别只在**谁来装**：npm 路径需要 Node ≥ 22 才能执行安装本身，curl 路径全程不碰 Node；**无论哪种装法，升级都重跑 curl**（v3.18.0 之前的老版本用 npm 跨形态升级会让 daemon 起不回来）。跑起来之后两者完全一致——同样的二进制、同样的命令。
 
 </details>
 
@@ -71,6 +71,7 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 
 - **[实时流式卡片](https://deepcoldy.github.io/botmux/cards)** — 每轮对话一张实时刷新的卡片，终端画面原样截图回传；一键显示/隐藏输出、翻屏、重启/关闭/接管会话。
 - **[多机器人协作](https://deepcoldy.github.io/botmux/multi-bot)** — 同群多 bot @mention 路由，不同 CLI 背后不同模型，天然多样性；方案评审 / 代码 review / 技术选型让它们互相挑刺。
+- **[群内真人独立 lane](docs/principal-lanes.md)** — 可复用 Dashboard 的「跨身份打断隔离（XPI）」开关，让同一群里的真人各用独立 CLI 上下文和 git worktree；消息仍公开可见，引用别人的任务仍可走建议/确认协作。
 - **[多话题并行编排](https://deepcoldy.github.io/botmux/multi-topic)** — 给编排者一个大任务，它自动在群里种话题、拉各 bot 起独立会话跑流水线，飞书任务面板一眼看完所有子任务进度。
 - **[可交互 Web 终端](https://deepcoldy.github.io/botmux/web-terminal)** — 不只是看输出，浏览器 / 手机直接操作 CLI，移动端带悬浮快捷键栏（Esc、Ctrl+C、方向键）。
 - **[会话接入 & 接力](https://deepcoldy.github.io/botmux/adopt)** — 本地 tmux 里跑到一半，手机 `/adopt` 接管；`/relay` 把整个会话（原进程、原记忆）搬进团队群继续。
@@ -78,6 +79,20 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 - **[Oncall 模式](https://deepcoldy.github.io/botmux/oncall) & [语音总结](https://deepcoldy.github.io/botmux/voice)** — 拉进 oncall 群，任何成员 @ 即在项目目录排查；配好 TTS 后每张卡片页脚会多一个 🔊 语音总结按钮，让模型「说人话」。
 
 更多：[角色与团队](https://deepcoldy.github.io/botmux/roles) · [文件沙盒](https://deepcoldy.github.io/botmux/sandbox) · [Dashboard 管控面](https://deepcoldy.github.io/botmux/dashboard) · [tmux 会话常驻](https://deepcoldy.github.io/botmux/tmux) · [飞书会议智能体（效果展示）](https://bytedance.larkoffice.com/wiki/UBOXwH01CixfxfkqxUpcKgvQnsg)。
+
+## 按 Bot 设置零注入
+
+在 Dashboard → 自定义中心 →「按 Bot 设置零注入」勾选一个或多个 bot，批量开启或恢复原配置；支持搜索与全选当前结果，每个 bot 独立保存，失败项会保留勾选供重试。也可在对应 `bots.json` 条目设置 `"promptInjection": "none"`。适合 lead-bot 派活、sub-bot 专注执行的场景。`default` / 删除字段恢复原行为，既有 prompt、角色和技能配置不会被清空。
+
+此模式只传任务正文与附件信息，跳过 botmux 的系统提示、逐轮提醒、身份信封、角色、白板、记忆与技能目录；自动从 CLI 转写回传最终回答。使用新会话验证：已经进入历史的提示无法撤回，CLI 原生系统提示、项目 `AGENTS.md` 及用户自行安装的技能仍由 CLI 管理。
+
+支持范围复用 CLI 的最终回复兜底采集能力：目前包括 Claude Code、Codex、TraeX、CoCo、Hermes、MTR、Pi、Oh My Pi、ebsd、Grok（PTY、tmux 等本地后端，包含 Codex / TraeX RPC 输入）。暂不支持远端后端和 v3 workflow；仅 adopt 能采集 final 的 CLI 不作为整 bot 开关的支持依据。CLI 的共享技能目录若存在全局安装的 `botmux-*` 技能，会拒绝启动以免假称零注入；请使用按会话的技能注入方式或独立 home，不会删除其它 bot 共用的文件。
+
+普通协作可直接在群内 @ 执行 bot，最终回答自动回复当前会话，并默认 @ 本轮任务的发起人（真人或 bot）。收件人取自宿主记录的本轮身份，排队和重试不借用后续轮次的发送者；缺少可用身份时不猜测会话 owner，也不注入额外 prompt。已经 @ 发起 bot 的回复本身就是回报，不再额外通过 HTTP 重复追加一轮任务。
+
+零注入会话也默认回传 Web 终端中的最终回答：`/rewind` 重跑和随后直接输入的多轮对话，都沿用最新飞书发起人的回复位置和 @，以普通回复卡发送，不附加终端来源或复述输入。每个终端回合开始时固定回复对象，新飞书消息只影响之后开始的回合；`/model` 等设置命令、菜单输出和已有历史不回传。该行为复用原生转写监听，不增加开关或 prompt；普通模式和 `/adopt` 保持原行为。
+
+没有通过 @ 发起 bot 回报时，已建立签名回报绑定的 `botmux dispatch --bot-app <稳定 App ID>` 派单仍可自动回报原 lead：sub 的 daemon 根据绑定去掉自动附加的 report/send 指令，每轮最终回答回报一次，不自动判定任务完成。回报使用独立重试和持久化去重回执，失败不影响子会话回复；lead 正常在原会话回复，不进入 HTTP 结果轮询。提交结果不明时拒绝自动重放。`dispatch --into` 向此前没有派单记录的普通消息追加任务不会创建该绑定，仍会保留完成指令，不能据此验证零注入。
 
 ## 支持的 CLI / Agent
 

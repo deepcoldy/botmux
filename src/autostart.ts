@@ -22,6 +22,7 @@ import { existsSync, mkdirSync, writeFileSync, unlinkSync, readFileSync } from '
 import { homedir, userInfo } from 'node:os';
 import { join, dirname } from 'node:path';
 import { isStandaloneBinary } from './core/self-spawn.js';
+import { isCliIdentityPath } from './utils/child-env.js';
 
 export interface AutostartOpts {
   /** Absolute path to the botmux package root (one level up from dist/). */
@@ -167,6 +168,7 @@ export function autostartPath(
   const entries = pathValue
     .split(separator)
     .filter(Boolean)
+    .filter(entry => !isCliIdentityPath(entry))
     .filter(entry => !entry.replace(/\\/g, '/').includes('/tmp/arg0/'));
   const stable = [...new Set(entries)].join(separator);
   if (stable) return stable;

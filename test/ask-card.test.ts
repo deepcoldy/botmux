@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { PendingAsk } from '../src/core/ask-types.js';
+import type { AskResult, PendingAsk } from '../src/core/ask-types.js';
 
 // vi.mock 被 vitest 提升到模块顶层，在 import 之前执行。
 // 用 importOriginal 保留所有真实导出，仅把 submitAsk 替换为可监测的 spy。
@@ -68,6 +68,27 @@ function makePending(overrides: Partial<PendingAsk> = {}): PendingAsk {
 }
 
 describe('buildAskCard', () => {
+  it.each([false, true])('preserves labelled web links before and after settlement (%s)', (settled) => {
+    const ask = makePending();
+    ask.questions[0]!.prompt = 'Review [design](https://example.com/design?id=4&rev=2) and [preview](http://localhost:3000/path_(v2)) before _confirming_.';
+    const result: AskResult | undefined = settled ? { kind: 'answered', answers: [['deploy']], by: 'ou_owner', comment: null, timedOut: false } : undefined;
+    const card = JSON.parse(buildAskCard(ask, result));
+    const question = card.elements.find((item: any) => item.text?.content?.includes('Review'));
+    expect(question.text.content).toContain('[design](https://example.com/design?id=4&rev=2)');
+    expect(question.text.content).toContain('[preview](http://localhost:3000/path_%28v2%29)');
+    expect(question.text.content).toContain('\\_confirming\\_');
+  });
+
+  it('keeps unsupported, escaped and incomplete link markup literal', () => {
+    const ask = makePending();
+    ask.questions[0]!.prompt = String.raw`literal \[escaped](https://example.com) ![image](https://example.com/a.png) [unsafe](javascript:alert(1)) [file](file:///tmp/a) [broken](https://example.com`;
+    const card = JSON.parse(buildAskCard(ask));
+    const question = card.elements.find((item: any) => item.text?.content?.includes('literal'));
+    for (const label of ['escaped', 'image', 'unsafe', 'file', 'broken']) {
+      expect(question.text.content).toContain(`\\[${label}\\]`);
+    }
+  });
+
   it.each(['ou_proposer_123', 'ou_proposer-123', '"ou_proposer-123"', "'ou_proposer-123'"])('preserves a host question mention with ID %s', (id) => {
     const tag = `<at id=${id}></at>`;
     const ask = makePending({ questions: [{

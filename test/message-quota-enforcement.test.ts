@@ -286,6 +286,21 @@ describe('message quota enforcement', () => {
     expect(mocks.replyMessage).toHaveBeenCalled();
   });
 
+  it('exhausted notice wording: default asks for /grant; grantRequestToOwnerDm says the next message re-applies', async () => {
+    mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: false, used: 5, limit: 5 });
+    await enforceMessageQuotaForCliInput('quota_app', 'oc_1', 'ou_chat', 'om_ex_default', 'om_anchor');
+    expect(mocks.buildQuotaExhaustedCard).toHaveBeenLastCalledWith('ou_chat', 5, expect.anything(), false);
+
+    getBot('quota_app').config.grantRequestToOwnerDm = true;
+    await enforceMessageQuotaForCliInput('quota_app', 'oc_1', 'ou_both', 'om_ex_reapply', 'om_anchor');
+    expect(mocks.buildQuotaExhaustedCard).toHaveBeenLastCalledWith('ou_both', 5, expect.anything(), true);
+
+    // autoGrantRequestCards=false 时下一条不会弹卡，文案不能承诺自动申请
+    getBot('quota_app').config.autoGrantRequestCards = false;
+    await enforceMessageQuotaForCliInput('quota_app', 'oc_9', 'ou_global', 'om_ex_nocards', 'om_anchor');
+    expect(mocks.buildQuotaExhaustedCard).toHaveBeenLastCalledWith('ou_global', 5, expect.anything(), false);
+  });
+
   it('P1: explicit-unlimited grant is NOT re-capped by messageQuota.defaultLimit', async () => {
     // 复现 codex 抓的回归：配了默认额度时，卡片选「不限」/裸 /grant 授的授权在磁盘上无
     // quota 记录（= 显式不限）。enforce 绝不能把 defaultLimit 传给 consumeQuota，否则首条

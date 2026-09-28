@@ -515,6 +515,22 @@ describe('transferSession', () => {
     expect(registry.get(newKey)).toBe(ds);
   });
 
+  it('keeps a validated principal-lane runtime slot while its display target moves', async () => {
+    const runtimeAnchor = 'lane:source:principal-b';
+    const runtimeKey = sessionKey(runtimeAnchor, 'cli_app_test');
+    const ds = makeDs({ runtimeRoutingAnchor: runtimeAnchor });
+    registry.set(runtimeKey, ds);
+
+    const result = await callTransfer(ds.session.sessionId, 'oc_target', 'om_M1_target');
+
+    expect(result.ok).toBe(true);
+    expect(ds.chatId).toBe('oc_target');
+    expect(ds.scope).toBe('chat');
+    expect(registry.get(runtimeKey)).toBe(ds);
+    expect(registry.has(sessionKey('om_source_root', 'cli_app_test'))).toBe(false);
+    expect(registry.has(sessionKey('oc_target', 'cli_app_test'))).toBe(false);
+  });
+
   it('persists session record via sessionStore.updateSession', async () => {
     const ds = makeDs();
     registry.set(sessionKey('om_source_root', 'cli_app_test'), ds);

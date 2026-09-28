@@ -39,9 +39,20 @@ export interface ToolIdentityOutcome {
    * - `needs-authorization`: nothing published; the sender must authorize
    *   before the tool will work. Neither governed tool degrades to a machine
    *   identity anymore, so there is no other "allowed" outcome.
+   * - `unavailable`: the provider failed; retain login state without requesting a new login.
    * - `off`: the policy does not govern this tool; nothing was touched.
    */
-  state: 'user' | 'needs-authorization' | 'off';
+  state: 'user' | 'needs-authorization' | 'unavailable' | 'off';
+}
+
+/** Created only by the daemon after verifying the signed dispatch and resolving
+ * its stable user identity in the receiving app. Never accepted from CLI input. */
+export interface DelegatedCliIdentity {
+  targetOpenId?: string;
+  credentialOpenId: string;
+  tools: TriggerUserAuthTool[];
+  dispatchRoot: string;
+  denialReason?: 'target_access_denied' | 'target_validation_unavailable';
 }
 
 export interface PublishTurnIdentityArgs {
@@ -50,6 +61,7 @@ export interface PublishTurnIdentityArgs {
   sessionId: string;
   /** The person who sent THIS turn. Absent for turns with no human sender. */
   senderOpenId: string | undefined;
+  delegatedIdentity?: DelegatedCliIdentity;
   /** For the stderr text the wrapper prints when a command is refused. */
   locale?: Locale;
   /**
@@ -80,7 +92,9 @@ export async function publishTurnCliIdentity(
       continue;
     }
     try {
-      outcomes.push(await publishOne(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId));
+      outcomes.push(args.delegatedIdentity
+        ? await publishDelegated(tool, args, args.delegatedIdentity)
+        : await publishOne(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId));
     } catch (e) {
       // Fail closed through the SAME policy as an ordinary missing token, so a
       // credential-store outage and "this person never authorized" cannot end
@@ -91,10 +105,67 @@ export async function publishTurnCliIdentity(
         `[trigger-user-auth] withheld ${tool} identity for session ${sessionId}: `
         + `${e instanceof Error ? e.message : String(e)}`,
       );
-      outcomes.push(await withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId));
+      if (tool === 'bytedcli') {
+        try {
+          writeSessionIdentity(sessionDataDir, sessionId, {
+            tool, mode: 'denied', ...(turnId ? { turnId } : {}),
+            message: locale === 'en'
+              ? 'botmux: bytedcli authorization service is unavailable. Stop automatic retries and repeated login requests; retry after the service recovers. Existing authorization is retained.'
+              : 'botmux: bytedcli 授权服务暂时不可用。请停止自动重试和重复要求用户登录；服务恢复后再重试，已有授权会保留。',
+          });
+        } catch { clearSessionIdentity(sessionDataDir, sessionId, tool); }
+        outcomes.push({ tool, state: 'unavailable' });
+        continue;
+      }
+      outcomes.push(args.delegatedIdentity
+        ? denyDelegated(tool, args, args.delegatedIdentity)
+        : await withholdIdentity(tool, botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId));
     }
   }
   return outcomes;
+}
+
+function denyDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs, user: DelegatedCliIdentity): ToolIdentityOutcome {
+  const reason = user.denialReason === 'target_validation_unavailable'
+    ? 'Target user or group membership verification is unavailable. Restore verification before retrying; logging in again will not fix this check.'
+    : user.denialReason === 'target_access_denied'
+      ? 'The requesting user could not be granted access to the target bot/chat. Check target access and group membership; do not request another login.'
+      : 'The source must ask the original human to authorize.';
+  try {
+    writeSessionIdentity(args.sessionDataDir, args.sessionId, {
+      tool, mode: 'denied', ...(args.turnId ? { turnId: args.turnId } : {}),
+      message: `botmux: delegated ${tool} execution refused for the requesting user. `
+        + `Report this blocker with botmux report --dispatch-root ${user.dispatchRoot}; `
+        + reason + ' Do not ask a bot to log in or use another identity.',
+    });
+  } catch {
+    clearSessionIdentity(args.sessionDataDir, args.sessionId, tool);
+  }
+  return { tool, state: 'needs-authorization' };
+}
+
+async function publishDelegated(tool: TriggerUserAuthTool, args: PublishTurnIdentityArgs, user: DelegatedCliIdentity): Promise<ToolIdentityOutcome> {
+  if (!user.tools.includes(tool)) return denyDelegated(tool, args, user);
+  let identity: CliIdentity | null = null;
+  if (tool === 'bytedcli') {
+    // Keep the issuer-scoped credential key; do not copy a source open_id into
+    // the target app or duplicate/extend the lifetime of the user's login.
+    const jwt = await mintBytedcliJwts(user.credentialOpenId);
+    if (jwt) identity = { tool, cloudJwt: jwt.cloudJwt, ...(jwt.codeJwt ? { codeJwt: jwt.codeJwt } : {}) };
+  } else {
+    const home = await resolveLarkCliHomeForTurn(user.credentialOpenId);
+    if (home) identity = { tool, mode: 'user-home', home };
+    else if (user.targetOpenId && args.botConfig.larkAppId && args.botConfig.larkAppSecret) {
+      // Legacy bot-app OAuth is application-bound: only a target-app token is
+      // valid here. A source-app OAuth token is never presented as a target one.
+      const token = await resolveUserToken(args.botConfig.larkAppId, args.botConfig.larkAppSecret,
+        normalizeBrand(args.botConfig.brand), user.targetOpenId);
+      if (token) identity = { tool, appId: args.botConfig.larkAppId, userAccessToken: token };
+    }
+  }
+  if (!identity) return denyDelegated(tool, args, user);
+  writeSessionIdentity(args.sessionDataDir, args.sessionId, { ...identity, ...(args.turnId ? { turnId: args.turnId } : {}) });
+  return { tool, state: 'user' };
 }
 
 async function publishOne(
@@ -153,7 +224,9 @@ async function withholdIdentity(
       authUrl = tool === 'bytedcli'
         ? (await beginBytedcliLogin(senderOpenId))?.authUrl
         : (await beginLarkCliLogin(senderOpenId))?.authUrl;
+      if (tool === 'bytedcli' && !authUrl) throw new Error('bytedcli login provider unavailable');
     } catch (e) {
+      if (tool === 'bytedcli') throw e;
       logger.warn(
         `[trigger-user-auth] could not pre-fetch ${tool} auth link for session ${sessionId}: `
         + `${e instanceof Error ? e.message : String(e)}`,

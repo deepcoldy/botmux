@@ -22,6 +22,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 
 // Mock child_process.execSync 使 resolveCommand() 直接返回命令名。
 vi.mock('node:child_process', () => ({
+  execFile: vi.fn(),
   execSync: vi.fn(() => ''),
 }));
 

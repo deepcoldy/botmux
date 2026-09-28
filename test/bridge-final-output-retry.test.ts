@@ -474,6 +474,51 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply.mock.calls[3][1]).not.toContain('等待');
   });
 
+  it('zero-prompt final reports the exact old turn dispatch root, while ordinary bots never auto-report', async () => {
+    const onZeroPromptFinal = vi.fn(async () => {});
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_reply'), onZeroPromptFinal,
+      getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.scope = 'chat';
+    ds.currentTurnId = 'turn-next';
+    ds.currentReplyTarget = { mode: 'thread', rootMessageId: 'om_next', turnId: 'turn-next' } as any;
+    ds.session.promptInjection = 'none';
+    ds.initConfig = { promptInjection: 'default' } as any;
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, finalOutputMsg(), 'tag', 0, undefined, () => true,
+      { mode: 'thread', rootMessageId: 'om_original' });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(onZeroPromptFinal).toHaveBeenCalledWith(ds, {
+      turnId: 'turn-1', content: 'final answer', dispatchRoot: 'om_original',
+    });
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    ds.session.promptInjection = 'default';
+    deliver(ds, { ...finalOutputMsg(), lastUuid: 'other', turnId: 'turn-next' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(onZeroPromptFinal).toHaveBeenCalledTimes(1);
+  });
+
+  it('settles the visible final once even when the independent lead report rejects', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const onZeroPromptFinal = vi.fn(async () => { throw new Error('lead offline'); });
+    const onComplete = vi.fn();
+    initWorkerPool({ sessionReply, onZeroPromptFinal,
+      getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    ds.initConfig = { promptInjection: 'none' } as any;
+    ds.currentTurnId = 'turn-1';
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, finalOutputMsg(), 'tag', 0, onComplete);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(onZeroPromptFinal).toHaveBeenCalledTimes(1);
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    expect(ds.completedIdleTurnId).toBe('turn-1');
+    expect(onComplete).toHaveBeenCalledWith(true, 'om_reply');
+  });
+
   it('commits dedup uuid only after a successful sessionReply', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     const closeSession = vi.fn();
@@ -1890,6 +1935,162 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     const cardJson = sessionReply.mock.calls[0][1] as string;
     expect(cardJson).toContain('[botmux](');
     expect(cardJson).not.toContain('<at id=ou_foreign_bot></at>');
+  });
+
+  it.each(['claude-code', 'codex', 'hermes'] as const)(
+    'zero-prompt %s terminal finals inherit the initiator at start and use fresh normal cards through retries', async cliId => {
+      const sessionReply = vi.fn().mockRejectedValueOnce(new Error('network error')).mockResolvedValue('om_reply');
+      const onZeroPromptFinal = vi.fn(async () => {});
+      initWorkerPool({ sessionReply, onZeroPromptFinal, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.scope = 'chat';
+      ds.session.cliId = cliId;
+      ds.session.promptInjection = 'none';
+      ds.session.quoteTargetId = 'om_original';
+      ds.session.quoteTargetSenderOpenId = 'ou_initiator';
+      ds.session.quoteTargetSenderIsBot = true;
+      ds.session.turnReplyContexts = { om_original: {
+        target: { mode: 'thread', rootMessageId: 'om_original_topic' },
+        replyTargetSenderOpenId: 'ou_initiator', replyTargetSenderIsBot: true,
+      } };
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+      ds.worker!.emit('message', { type: 'terminal_turn_started', turnId: 'local-native-1', startedAtMs: Date.now() });
+      ds.session.quoteTargetId = 'om_new';
+      ds.session.quoteTargetSenderOpenId = 'ou_later';
+      ds.session.turnReplyContexts.om_new = {
+        target: { mode: 'quote', rootMessageId: 'om_new_topic' },
+        replyTargetSenderOpenId: 'ou_later', replyTargetSenderIsBot: true,
+      };
+      ds.worker!.emit('message', {
+        ...finalOutputMsg(), sessionId: ds.session.sessionId, turnId: 'local-native-1',
+        terminalLocal: true, content: 'Recovered review final',
+      });
+      await vi.advanceTimersByTimeAsync(10);
+      // The in-flight attempt owns its frozen address even if bounded records
+      // are pruned before the retry.
+      delete ds.session.turnReplyContexts['local-native-1'];
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(sessionReply).toHaveBeenCalledTimes(2);
+      for (const call of sessionReply.mock.calls) {
+        const card = String(call[1]);
+        expect(card).toContain('Recovered review final');
+        expect(card).toContain('<at id=ou_initiator></at>');
+        expect(card).not.toContain('ou_later');
+        expect(card).not.toMatch(/终端本地对话|来自终端/);
+        expect(call[5]).toMatchObject({ replyTarget: { mode: 'thread', rootMessageId: 'om_original_topic' } });
+      }
+      expect(sessionReply.mock.calls[0][5].uuid).toBe(sessionReply.mock.calls[1][5].uuid);
+      expect(updateMessageMock).not.toHaveBeenCalled();
+      expect(onZeroPromptFinal).not.toHaveBeenCalled();
+      ds.worker!.emit('message', { type: 'terminal_turn_started', turnId: 'local-native-2', startedAtMs: Date.now() });
+      ds.worker!.emit('message', {
+        ...finalOutputMsg(), sessionId: ds.session.sessionId, turnId: 'local-native-2',
+        lastUuid: 'uuid-2', terminalLocal: true, content: 'Next terminal final',
+      });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply).toHaveBeenCalledTimes(3);
+      expect(String(sessionReply.mock.calls[2][1])).toContain('<at id=ou_later></at>');
+      expect(sessionReply.mock.calls[2][5]).toMatchObject({ replyTarget: { mode: 'quote', rootMessageId: 'om_new_topic' } });
+    },
+  );
+
+  it('does not enable terminal final forwarding in ordinary or adopted sessions', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    for (const zero of [false, true]) {
+      const ds = makeDs();
+      if (zero) ds.session.promptInjection = 'none';
+      else ds.adoptedFrom = undefined;
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+      ds.worker!.emit('message', { type: 'terminal_turn_started', turnId: 'local-native', startedAtMs: Date.now() });
+      ds.worker!.emit('message', { ...finalOutputMsg(), turnId: 'local-native', terminalLocal: true });
+      expect(ds.session.turnReplyContexts?.['local-native']).toBeUndefined();
+    }
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it.each(['claude-code', 'codex', 'hermes'] as const)(
+    'zero-injection %s finals @ the exact initiating bot once without an extra HTTP report', async cliId => {
+      const sessionReply = vi.fn(async () => 'om_reply');
+      const onZeroPromptFinal = vi.fn(async () => {});
+      initWorkerPool({ sessionReply, onZeroPromptFinal, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.session.cliId = cliId;
+      ds.session.promptInjection = 'none';
+      ds.session.ownerOpenId = 'ou_owner';
+      ds.session.quoteTargetId = 'turn-new';
+      ds.session.quoteTargetSenderOpenId = 'ou_new_sender';
+      ds.session.replyTargets = {
+        'turn-1': { updatedAt: new Date().toISOString(), senderOpenId: 'ou_initiating_bot',
+          participants: [{ openId: 'ou_initiating_bot', isBot: true }, { openId: 'ou_other', isBot: false }] },
+      };
+      const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+      deliver(ds, finalOutputMsg(), 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      const card = String(sessionReply.mock.calls[0][1]);
+      expect(card.match(/<at id=ou_initiating_bot><\/at>/g)).toHaveLength(1);
+      for (const id of ['ou_owner', 'ou_new_sender', 'ou_other']) expect(card).not.toContain(`<at id=${id}>`);
+      expect(onZeroPromptFinal).not.toHaveBeenCalled();
+    },
+  );
+
+  it('zero-injection final retries retain the original human sender even after the turn records are pruned', async () => {
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error('network error')).mockResolvedValue('om_reply');
+    const onZeroPromptFinal = vi.fn(async () => {});
+    initWorkerPool({ sessionReply, onZeroPromptFinal, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.initConfig = { promptInjection: 'none' } as any;
+    ds.session.ownerOpenId = 'ou_owner';
+    ds.session.turnReplyContexts = { 'turn-1': {
+      target: { mode: 'thread', rootMessageId: 'om_original' },
+      replyTargetSenderOpenId: 'ou_initiator', replyTargetSenderIsBot: false,
+    } };
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, finalOutputMsg(), 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    ds.session.turnReplyContexts = {};
+    ds.session.quoteTargetId = 'turn-new';
+    ds.session.quoteTargetSenderOpenId = 'ou_other';
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    for (const call of sessionReply.mock.calls) {
+      expect(String(call[1])).toContain('<at id=ou_initiator></at>');
+      expect(String(call[1])).not.toContain('<at id=ou_owner>');
+      expect(String(call[1])).not.toContain('<at id=ou_other>');
+    }
+    expect(onZeroPromptFinal).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['ou_stale', 'all', 'cli_peer', 'ou_bot'])(
+    'zero-injection final never guesses or emits an invalid/self recipient (%s)', async sender => {
+      const sessionReply = vi.fn(async () => 'om_reply');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.session.promptInjection = 'none';
+      ds.session.ownerOpenId = 'ou_owner';
+      ds.session.quoteTargetId = sender === 'ou_stale' ? 'turn-new' : 'turn-1';
+      ds.session.quoteTargetSenderOpenId = sender;
+      const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+      deliver(ds, finalOutputMsg(), 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(String(sessionReply.mock.calls[0][1])).not.toContain('<at id=');
+    },
+  );
+
+  it('zero-injection accepts a legacy sender only for the matching reply turn', async () => {
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.promptInjection = 'none';
+    ds.session.quoteTargetId = 'original-turn';
+    ds.session.quoteTargetSenderOpenId = 'ou_original_bot';
+    ds.session.quoteTargetSenderIsBot = true;
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), replyTurnId: 'original-turn' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(String(sessionReply.mock.calls[0][1])).toContain('<at id=ou_original_bot></at>');
   });
 
   it('addresses Mira daemon fallback output back to the bot dispatcher', async () => {

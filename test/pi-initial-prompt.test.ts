@@ -118,12 +118,11 @@ describe('Pi initial prompt @file delivery', () => {
       });
       // The turn-boundary extension leads every Pi launch line (asserted in
       // `pi buildArgs`); the @file prompt still lands last.
-      expect(args[0]).toBe('--extension');
-      expect(args.slice(2)).toEqual([
-        '--session-id', 'sess-long-adapter',
-        '--name', '[BotMux·Lark] Long Pi prompt',
-        adapterPrepared.initialPrompt,
-      ]);
+      expect(args).toContain('--session-id');
+      expect(args[args.indexOf('--session-id') + 1]).toBe('sess-long-adapter');
+      expect(args).toContain('--name');
+      expect(args[args.indexOf('--name') + 1]).toBe('[BotMux·Lark] Long Pi prompt');
+      expect(args.at(-1)).toBe(adapterPrepared.initialPrompt);
 
       expect(Buffer.byteLength(prompt, 'utf8')).toBeGreaterThan(PI_INITIAL_PROMPT_ARG_BYTE_LIMIT);
       expect(Buffer.byteLength(adapterPrepared.initialPrompt, 'utf8')).toBeLessThan(prompt.length);

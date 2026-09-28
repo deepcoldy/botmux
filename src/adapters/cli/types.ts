@@ -13,6 +13,8 @@ export interface PtyHandle {
   /** Send special keys via tmux send-keys, e.g. 'Enter', 'Escape', 'C-c' (tmux mode only).
    *  Returns `false` on an unconfirmed write (see sendText). */
   sendSpecialKeys?(...keys: string[]): void | boolean;
+  /** Send multiple lines separated by a special soft-newline key in a single batch (tmux mode only). */
+  sendLines?(lines: string[], softNewlineKey: string): void | boolean;
   /**
    * Epoch-ms timestamp of the most recent Ctrl+C the backend may have injected.
    * Snapshot transports record this before an ambiguous send so adapters with
@@ -180,6 +182,8 @@ export interface CliAdapter {
      *  send` is only for mid-turn pushes / attachments / cross-bot @. Omitted or
      *  'send' → today's text byte-for-byte. `noTransport` takes precedence. */
     replyDelivery?: 'send' | 'transcript';
+    /** Disable all Botmux-owned prompt and skill injection for this spawn. */
+    promptInjection?: 'default' | 'none';
     /** transcript-only: this session is a solo chat (owner + this bot). Drops
      *  the identity routing_rules (no other bot to route to). Ignored for
      *  'send'. */
@@ -256,6 +260,17 @@ export interface CliAdapter {
      *  per-bot BOT_HOME). Absent ⇒ the adapter must NOT inline secrets into
      *  argv; it falls back to process-env-only delivery (the old behavior). */
     settingsFilePath?: string;
+    /** Effective environment for the CLI process (including sanitized per-bot env
+     *  from bots.json). Passed so adapters discovering configuration or system
+     *  prompt files can inspect the effective environment without mutating
+     *  the worker process.env. */
+    env?: NodeJS.ProcessEnv;
+    /** Extra arguments passed to the CLI via CLI_EXTRA_ARGS or configuration. */
+    extraArgs?: string[];
+    /** Explicit project trust override passed down to adapters with trust policies. */
+    trustOverride?: boolean;
+    /** Project trust state from session context if resolved. */
+    projectTrusted?: boolean;
   }): string[];
 
   /** Adapter-specific chance to rewrite the first prompt before buildArgs sees
@@ -459,7 +474,13 @@ export interface CliAdapter {
    * (e.g. OpenCode SQLite db). When true, suppresses premature idle detection
    * even if PTY output has quiesced.
    */
-  readonly isSessionBusy?: (opts: { sessionId: string; cliSessionId?: string }) => boolean;
+  readonly isSessionBusy?: (opts: {
+    sessionId: string;
+    cliSessionId?: string;
+    /** Only supplied for an authoritative current viewport. Adapters may use
+     * explicit terminal interruption evidence when native state omits it. */
+    getCurrentScreen?: () => string;
+  }) => boolean;
 
   /** Opt-in positive marker for an idle→working edge observed in PTY output.
    *  Kept separate from busyPattern because transcript/full-screen redraws may

@@ -62,7 +62,11 @@ function harness(mode: Mode, options: {
     currentThreadId = THREAD;
     return mode === 'standby' ? 'om_prime' : 'om_kickoff';
   });
-  const postCurrentSessionDaemonRoute = vi.fn(async () => {
+  const postCurrentSessionDaemonRoute = vi.fn(async (input: { path: string; body: any }) => {
+    if (input.path === '/api/dispatch-user/deliver') {
+      const messageId = await replyMessage('cli_source', input.body.rootId, input.body.content, 'post', true);
+      return { ok: true, json: async () => ({ ok: true, messageId }) };
+    }
     steps.push('seed');
     return { ok: true, json: async () => ({ ok: true, dispatchRoot: root }) };
   });
@@ -97,6 +101,7 @@ function harness(mode: Mode, options: {
     })),
     persistDispatchLifecycle, postCurrentSessionDaemonRoute,
     DISPATCH_REPORT_REGISTER_ROUTE: '/dispatch-report/register',
+    DISPATCH_USER_DELIVERY_ROUTE: '/api/dispatch-user/deliver',
     trySyncProjectDispatch: vi.fn(async () => true),
     __import: async (path: string) => {
       if (path === './bot-registry.js') return {
@@ -146,7 +151,7 @@ for (const chatMode of ['normal', 'topic'] as const) {
         expect(threadId).toMatch(/^omt_[A-Za-z0-9_-]+$/);
         expect(oldFields).toEqual(oldReceipt(mode));
         expect(h.steps).toEqual(mode === 'into' ? ['reply', 'lookup'] : ['seed', 'reply', 'lookup']);
-        expect(h.postCurrentSessionDaemonRoute).toHaveBeenCalledTimes(mode === 'into' ? 0 : 1);
+        expect(h.postCurrentSessionDaemonRoute).toHaveBeenCalledTimes(mode === 'dispatch' ? 2 : 1);
         expect(h.request).toHaveBeenCalledExactlyOnceWith({
           method: 'GET', url: '/open-apis/im/v1/messages/' + h.root,
           params: { with_sender_name: 'true' }, timeout: 2_000, signal: h.timeoutSignals[0].signal,

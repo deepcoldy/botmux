@@ -42,6 +42,14 @@ import {
 import { isRemoteCliId } from '../../core/remote-cli-ids.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { useT } from './react-hooks.js';
+import {
+  MentionMock,
+  ModeOptionGroup,
+  P2pMock,
+  RegularMock,
+  WorkingDirMock,
+  type ModeOption,
+} from './mode-diagrams.js';
 import { store } from './store.js';
 import { toast } from './toast.js';
 import type { RoleInjectMode } from './roles.js';
@@ -125,7 +133,7 @@ const MAX_SG_TAG_NAME_LENGTH = 60;
 
 type StatusMessage = { text: string; ok?: boolean } | null;
 type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefaultsRow) => BotDefaultsRow)) => void;
-type CardPrefPatch = Record<string, boolean | string | StreamingCardButtonId[]>;
+type CardPrefPatch = Record<string, boolean | string | string[]>;
 
 type JsonResponse = {
   ok: boolean;
@@ -479,6 +487,7 @@ function FieldTitle(props: { children: ReactNode; help?: ReactNode }) {
 type DropdownFieldOption<T extends string> = {
   value: T;
   label: ReactNode;
+  hint?: ReactNode;
   disabled?: boolean;
 };
 
@@ -782,6 +791,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     groupJoinCommandEnabled: body.groupJoinCommandEnabled,
     groupJoinCommand: body.groupJoinCommand,
     autoStartOnNewTopic: body.autoStartOnNewTopic,
+    autoStartExcludedChats: body.autoStartExcludedChats,
     regularGroupReplyMode: body.regularGroupReplyMode,
     regularGroupMentionMode: body.regularGroupMentionMode,
     docSubscribeDefaultMode: body.docSubscribeDefaultMode,
@@ -3412,28 +3422,44 @@ function WorkingDirSection(props: {
     }
   }
 
-  const modeOptions: DropdownFieldOption<'off' | 'default' | 'oncall'>[] = [
-    { value: 'off', label: tr('botDefaults.workingDirModeOff') },
-    { value: 'default', label: tr('botDefaults.workingDirModeDefault') },
-    { value: 'oncall', label: tr('botDefaults.workingDirModeOncall') },
+  const modeOptions: ModeOption<'off' | 'default' | 'oncall'>[] = [
+    {
+      value: 'off', isDefault: true, name: tr('botDefaults.optWdOffName'),
+      short: tr('botDefaults.optWdOffShort'),
+      tags: [tr('botDefaults.wdOffTag1'), tr('botDefaults.wdOffTag2')],
+      mock: <WorkingDirMock mode="off" />,
+    },
+    {
+      value: 'default', name: tr('botDefaults.optWdDefaultName'),
+      short: tr('botDefaults.optWdDefaultShort'),
+      tags: [tr('botDefaults.wdDefaultTag1'), tr('botDefaults.wdDefaultTag2')],
+      mock: <WorkingDirMock mode="default" />,
+    },
+    {
+      value: 'oncall', name: tr('botDefaults.optWdOncallName'),
+      short: tr('botDefaults.optWdOncallShort'),
+      tags: [tr('botDefaults.wdOncallTag1'), tr('botDefaults.wdOncallTag2')],
+      mock: <WorkingDirMock mode="oncall" />,
+    },
   ];
 
   return (
     <section className="bd-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionWorkingDir')}</h3>
-      <div className="bd-row">
-        <div className="bd-field">
-          <FieldTitle help={tr('botDefaults.workingDirModeHelp')}>{tr('botDefaults.workingDirMode')}</FieldTitle>
-          <DropdownField
-            dataInput="workingDirMode"
-            ariaLabel={tr('botDefaults.workingDirMode')}
-            value={mode}
-            disabled={busy}
-            options={modeOptions}
-            onChange={next => setMode(next as 'off' | 'default' | 'oncall')}
-          />
-        </div>
-      </div>
+      <ModeOptionGroup<'off' | 'default' | 'oncall'>
+        dataInput="workingDirMode"
+        groupName={tr('botDefaults.groupWorkingDir')}
+        groupSub={tr('botDefaults.groupWorkingDirSub')}
+        exampleTitle={tr('botDefaults.exampleTitleWorkingDir')}
+        value={mode}
+        options={modeOptions}
+        wideCols={3}
+        narrowCols={1}
+        disabled={busy}
+        onChange={next => setMode(next)}
+      >
+        <div className="bd-mode-group-side"><StatusSpan status={status} attr={{ 'data-status': '' }} /></div>
+      </ModeOptionGroup>
       <div className="bd-row" data-wd-dir-row hidden={mode === 'off'}>
         <label>
           <span>{tr('botDefaults.workingDirField')}</span>
@@ -3447,7 +3473,6 @@ function WorkingDirSection(props: {
       </label>
       <div className="actions">
         <button type="button" className="primary" data-action="save-working-dir" disabled={busy} onClick={() => void save()}>{tr('botDefaults.save')}</button>
-        <StatusSpan status={status} attr={{ 'data-status': '' }} />
       </div>
       <AutoStartControls bot={bot} putCardPref={props.putCardPref} />
     </section>
@@ -3466,6 +3491,8 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
   const [inviteOwner, setInviteOwner] = useState(bot.autoInviteOwnerOnGroupAdd !== false);
   const [onJoin, setOnJoin] = useState(bot.autoStartOnGroupJoin === true);
   const [onTopic, setOnTopic] = useState(bot.autoStartOnNewTopic === true);
+  const [showExcluded, setShowExcluded] = useState(false);
+  const [excluded, setExcluded] = useState((bot.autoStartExcludedChats ?? []).join('\n'));
   const [prompt, setPrompt] = useState(typeof bot.autoStartOnGroupJoinPrompt === 'string' ? bot.autoStartOnGroupJoinPrompt : '');
   // 编辑态软预填：未自定义时显示内置默认文案，只有点保存才落盘（空 = 跟随动态默认）。
   const [seed, setSeed] = useState(bot.autoStartOnGroupJoinSeed || bot.autoStartOnGroupJoinSeedDefault || '');
@@ -3480,6 +3507,7 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
     setInviteOwner(bot.autoInviteOwnerOnGroupAdd !== false);
     setOnJoin(bot.autoStartOnGroupJoin === true);
     setOnTopic(bot.autoStartOnNewTopic === true);
+    setExcluded((bot.autoStartExcludedChats ?? []).join('\n'));
     setPrompt(typeof bot.autoStartOnGroupJoinPrompt === 'string' ? bot.autoStartOnGroupJoinPrompt : '');
     setSeed(bot.autoStartOnGroupJoinSeed || bot.autoStartOnGroupJoinSeedDefault || '');
     setJoinCmdOn(bot.groupJoinCommandEnabled === true);
@@ -3492,6 +3520,7 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
     bot.autoStartOnGroupJoinSeed,
     bot.autoStartOnGroupJoinSeedDefault,
     bot.autoStartOnNewTopic,
+    bot.autoStartExcludedChats,
     bot.groupJoinCommandEnabled,
     bot.groupJoinCommand,
   ]);
@@ -3502,7 +3531,7 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
     setStatusKey(key);
     try {
       const res = await putCardPref(patch);
-      setStatus(res.ok ? { text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true } : { text: `✗ ${responseErrorText(res)}` });
+      setStatus(res.ok ? { text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true } : { text: `✗ ${res.body?.error === 'invalid_auto_start_excluded_chats' ? tr('botDefaults.autoStartExcludedChatsInvalid') : responseErrorText(res)}` });
     } catch (e: any) {
       setStatus({ text: `✗ ${caughtErrorText(e)}` });
     } finally {
@@ -3513,6 +3542,14 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
   return (
     <div className="bd-subsection">
       <h4 className="bd-subsection-title">{tr('botDefaults.sectionAutoStart')}</h4>
+      <button type="button" data-action="toggle-auto-start-exclusions" aria-expanded={showExcluded} onClick={() => setShowExcluded(!showExcluded)}>{tr('botDefaults.autoStartExcludedChats')}</button>
+      {showExcluded && <div className="bd-row"><label>
+        {tr('botDefaults.autoStartExcludedChatsHelp')}
+        <textarea data-input="autoStartExcludedChats" rows={3} value={excluded} placeholder={'oc_xxx\noc_yyy'} onChange={e => setExcluded(e.currentTarget.value)} />
+      </label><div className="actions">
+        <button type="button" data-action="save-auto-start-exclusions" disabled={busy === 'excluded'} onClick={() => void savePatch({ autoStartExcludedChats: excluded.split(/\r?\n/).map(id => id.trim()).filter(Boolean) }, 'excluded')}>{tr('botDefaults.save')}</button>
+        {statusKey === 'excluded' && <StatusSpan status={status} />}
+      </div></div>}
       <ToggleRow
         checked={inviteOwner}
         disabled={busy === 'inviteOwner'}
@@ -3583,7 +3620,7 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
             {tr('botDefaults.autoStartJoinSeedReset')}
           </button>
         ) : null}
-        {statusKey?.startsWith('joincmd') ? null : <StatusSpan status={status} attr={{ 'data-auto-start-status': '' }} />}
+        {statusKey === 'excluded' || statusKey?.startsWith('joincmd') ? null : <StatusSpan status={status} attr={{ 'data-auto-start-status': '' }} />}
       </div>
       <ToggleRow
         checked={joinCmdOn}
@@ -4118,13 +4155,13 @@ function SandboxPathsSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   );
 }
 
-const BACKEND_TYPE_OPTIONS: Array<{ value: string; labelKey: string }> = [
-  { value: '', labelKey: 'botDefaults.backendAuto' },
-  { value: 'tmux', labelKey: 'botDefaults.backendTmux' },
-  { value: 'herdr', labelKey: 'botDefaults.backendHerdr' },
-  { value: 'zellij', labelKey: 'botDefaults.backendZellij' },
-  { value: 'zmx', labelKey: 'botDefaults.backendZmx' },
-  { value: 'pty', labelKey: 'botDefaults.backendPty' },
+const BACKEND_TYPE_OPTIONS: Array<{ value: string; labelKey: string; hintKey: string }> = [
+  { value: '', labelKey: 'botDefaults.backendAuto', hintKey: 'botDefaults.backendAutoHint' },
+  { value: 'tmux', labelKey: 'botDefaults.backendTmux', hintKey: 'botDefaults.backendTmuxHint' },
+  { value: 'herdr', labelKey: 'botDefaults.backendHerdr', hintKey: 'botDefaults.backendHerdrHint' },
+  { value: 'zellij', labelKey: 'botDefaults.backendZellij', hintKey: 'botDefaults.backendZellijHint' },
+  { value: 'zmx', labelKey: 'botDefaults.backendZmx', hintKey: 'botDefaults.backendZmxHint' },
+  { value: 'pty', labelKey: 'botDefaults.backendPty', hintKey: 'botDefaults.backendPtyHint' },
 ];
 
 function BackendTypeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
@@ -4136,7 +4173,10 @@ function BackendTypeSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) 
 
   useEffect(() => setValue(typeof bot.backendType === 'string' ? bot.backendType : ''), [bot.backendType]);
 
-  const options = useMemo(() => BACKEND_TYPE_OPTIONS.map(o => ({ value: o.value, label: tr(o.labelKey) })), [tr]);
+  const options = useMemo(
+    () => BACKEND_TYPE_OPTIONS.map(o => ({ value: o.value, label: tr(o.labelKey), hint: tr(o.hintKey) })),
+    [tr],
+  );
 
   async function save(next: string): Promise<void> {
     const prev = value;
@@ -4831,14 +4871,15 @@ export function ReplyDeliverySection(props: { bot: BotDefaultsRow; patchBot: Pat
       <h3 className="bd-section-title">{tr('botDefaults.replyDelivery')}</h3>
       <ToggleRow
         checked={transcript}
-        disabled={busy || !supported}
+        disabled={busy || !supported || props.bot.promptInjection === 'none'}
         dataAction="toggle-reply-delivery"
         title={tr('botDefaults.replyDeliveryTranscript')}
         help={tr('botDefaults.replyDeliveryHelp')}
         onChange={checked => void save(checked)}
       />
       <small className="bd-section-note">
-        {supported ? tr('botDefaults.replyDeliveryNote', { defaultMode }) : tr('botDefaults.replyDeliveryUnsupported')}
+        {props.bot.promptInjection === 'none' ? tr('botDefaults.replyDeliveryZeroPrompt')
+          : supported ? tr('botDefaults.replyDeliveryNote', { defaultMode }) : tr('botDefaults.replyDeliveryUnsupported')}
       </small>
       <div className="actions">
         <StatusSpan status={status} attr={{ 'data-reply-delivery-status': '' }} />
@@ -5132,81 +5173,145 @@ function SessionModeSection(props: {
     }
   }
 
-  const p2pOptions: DropdownFieldOption<'thread' | 'chat' | 'group'>[] = [
-    { value: 'thread', label: tr('botDefaults.p2pThread') },
-    { value: 'chat', label: tr('botDefaults.p2pChat') },
-    { value: 'group', label: tr('botDefaults.p2pGroup') },
+  const tags2 = (k1: string, k2: string): string[] => [tr(k1), tr(k2)];
+
+  const p2pOptions: ModeOption<'thread' | 'chat' | 'group'>[] = [
+    {
+      value: 'chat', isDefault: true, name: tr('botDefaults.optP2pChatName'),
+      short: tr('botDefaults.optP2pChatShort'),
+      tags: tags2('botDefaults.p2pChatTag1', 'botDefaults.p2pChatTag2'),
+      mock: <P2pMock mode="chat" />,
+    },
+    {
+      value: 'thread', name: tr('botDefaults.optP2pThreadName'),
+      short: tr('botDefaults.optP2pThreadShort'),
+      tags: tags2('botDefaults.p2pThreadTag1', 'botDefaults.p2pThreadTag2'),
+      mock: <P2pMock mode="thread" />,
+    },
+    {
+      value: 'group', name: tr('botDefaults.optP2pGroupName'),
+      short: tr('botDefaults.optP2pGroupShort'),
+      tags: tags2('botDefaults.p2pGroupTag1', 'botDefaults.p2pGroupTag2'),
+      mock: <P2pMock mode="group" />,
+    },
   ];
-  const regularOptions: DropdownFieldOption<string>[] = [
-    { value: 'chat', label: tr('botDefaults.regularGroupModeChat') },
-    { value: 'chat-topic', label: tr('botDefaults.regularGroupModeChatTopic') },
-    { value: 'new-topic', label: tr('botDefaults.regularGroupModeNewTopic') },
-    { value: 'shared', label: tr('botDefaults.regularGroupModeShared') },
+  const regularOptions: ModeOption<string>[] = [
+    {
+      value: 'chat-topic', isDefault: true, name: tr('botDefaults.optRegularHybridName'),
+      short: tr('botDefaults.optRegularHybridShort'),
+      tags: tags2('botDefaults.regularChatTopicTag1', 'botDefaults.regularChatTopicTag2'),
+      mock: <RegularMock mode="chat-topic" />,
+    },
+    {
+      value: 'new-topic', name: tr('botDefaults.optRegularNewTopicName'),
+      short: tr('botDefaults.optRegularNewTopicShort'),
+      tags: tags2('botDefaults.regularNewTopicTag1', 'botDefaults.regularNewTopicTag2'),
+      mock: <RegularMock mode="new-topic" />,
+    },
+    {
+      value: 'chat', name: tr('botDefaults.optRegularChatName'),
+      short: tr('botDefaults.optRegularChatShort'),
+      tags: tags2('botDefaults.regularChatTag1', 'botDefaults.regularChatTag2'),
+      mock: <RegularMock mode="chat" />,
+    },
+    {
+      value: 'shared', name: tr('botDefaults.optRegularSharedName'),
+      short: tr('botDefaults.optRegularSharedShort'),
+      tags: tags2('botDefaults.regularSharedTag1', 'botDefaults.regularSharedTag2'),
+      mock: <RegularMock mode="shared" />,
+    },
   ];
-  const mentionOptions: DropdownFieldOption<string>[] = [
-    { value: 'always', label: tr('botDefaults.mentionModeAlways') },
-    { value: 'topic', label: tr('botDefaults.mentionModeTopic') },
-    { value: 'never', label: tr('botDefaults.mentionModeNever') },
-    { value: 'ambient', label: tr('botDefaults.mentionModeAmbient') },
+  const mentionOptions: ModeOption<string>[] = [
+    {
+      value: 'always', isDefault: true, name: tr('botDefaults.optMentionAlwaysName'),
+      short: tr('botDefaults.optMentionAlwaysShort'),
+      tags: tags2('botDefaults.mentionAlwaysTag1', 'botDefaults.mentionAlwaysTag2'),
+      mock: <MentionMock mode="always" />,
+    },
+    {
+      value: 'topic', name: tr('botDefaults.optMentionTopicName'),
+      short: tr('botDefaults.optMentionTopicShort'),
+      tags: tags2('botDefaults.mentionTopicTag1', 'botDefaults.mentionTopicTag2'),
+      mock: <MentionMock mode="topic" />,
+    },
+    {
+      value: 'never', name: tr('botDefaults.optMentionNeverName'),
+      short: tr('botDefaults.optMentionNeverShort'),
+      tags: tags2('botDefaults.mentionNeverTag1', 'botDefaults.mentionNeverTag2'),
+      mock: <MentionMock mode="never" />,
+    },
+    {
+      value: 'ambient', name: tr('botDefaults.optMentionAmbientName'),
+      short: tr('botDefaults.optMentionAmbientShort'),
+      tags: tags2('botDefaults.mentionAmbientTag1', 'botDefaults.mentionAmbientTag2'),
+      mock: <MentionMock mode="ambient" />,
+    },
   ];
   const docOptions: DropdownFieldOption<string>[] = [
-    { value: 'mention-only', label: tr('botDefaults.docSubscribeModeMention') },
-    { value: 'all', label: tr('botDefaults.docSubscribeModeAll') },
+    { value: 'mention-only', label: tr('botDefaults.docSubscribeModeMention'), hint: tr('botDefaults.docSubscribeModeMentionHint') },
+    { value: 'all', label: tr('botDefaults.docSubscribeModeAll'), hint: tr('botDefaults.docSubscribeModeAllHint') },
   ];
 
   return (
-    <section className="bd-section">
+    <section className="bd-section bd-session-mode-section">
       <h3 className="bd-section-title">{tr('botDefaults.sectionSessionMode')}</h3>
-      <div className="bd-row">
-        <div className="bd-field">
-          <FieldTitle help={tr('botDefaults.p2pHelp')}>{tr('botDefaults.p2pMode')}</FieldTitle>
-          <DropdownField
-            dataInput="p2pMode"
-            ariaLabel={tr('botDefaults.p2pMode')}
-            value={p2p}
-            disabled={busy === 'p2p'}
-            options={p2pOptions}
-            onChange={next => void saveP2p(next)}
-          />
-        </div>
-        <div className="actions"><StatusSpan status={p2pStatus} attr={{ 'data-p2p-status': '' }} /></div>
-      </div>
-      {p2p === 'group' && <SessionGroupTagRow bot={props.bot} />}
-      <div className="bd-row">
-        <div className="bd-field">
-          <FieldTitle help={tr('botDefaults.regularGroupModeHelp')}>{tr('botDefaults.regularGroupMode')}</FieldTitle>
-          <DropdownField
-            dataInput="regularGroupMode"
-            ariaLabel={tr('botDefaults.regularGroupMode')}
-            value={regular}
-            disabled={busy === 'regular'}
-            options={regularOptions}
-            onChange={next => {
-              setRegular(next);
-              void saveCardMode('regular', { regularGroupReplyMode: next }, setRegularStatus);
-            }}
-          />
-        </div>
-        <div className="actions"><StatusSpan status={regularStatus} attr={{ 'data-regular-group-status': '' }} /></div>
-      </div>
-      <div className="bd-row">
-        <div className="bd-field">
-          <FieldTitle help={tr('botDefaults.mentionModeHelp')}>{tr('botDefaults.mentionMode')}</FieldTitle>
-          <DropdownField
-            dataInput="regularGroupMentionMode"
-            ariaLabel={tr('botDefaults.mentionMode')}
-            value={mention}
-            disabled={busy === 'mention'}
-            options={mentionOptions}
-            onChange={next => {
-              setMention(next);
-              void saveCardMode('mention', { regularGroupMentionMode: next }, setMentionStatus);
-            }}
-          />
-        </div>
-        <div className="actions"><StatusSpan status={mentionStatus} attr={{ 'data-mention-mode-status': '' }} /></div>
-      </div>
-      <div className="bd-row">
+      <p className="bd-session-mode-intro">{tr('botDefaults.sessionModeIntro')}</p>
+
+      <ModeOptionGroup<'thread' | 'chat' | 'group'>
+        dataInput="p2pMode"
+        groupName={tr('botDefaults.groupP2p')}
+        groupSub={tr('botDefaults.groupP2pSub')}
+        exampleTitle={tr('botDefaults.exampleTitleP2p')}
+        value={p2p}
+        options={p2pOptions}
+        wideCols={3}
+        narrowCols={1}
+        disabled={busy === 'p2p'}
+        onChange={next => void saveP2p(next)}
+      >
+        <div className="bd-mode-group-side"><StatusSpan status={p2pStatus} attr={{ 'data-p2p-status': '' }} /></div>
+        {p2p === 'group' ? <SessionGroupTagRow bot={props.bot} /> : null}
+      </ModeOptionGroup>
+
+      <ModeOptionGroup
+        dataInput="regularGroupMode"
+        groupName={tr('botDefaults.groupRegular')}
+        groupSub={tr('botDefaults.groupRegularSub')}
+        exampleTitle={tr('botDefaults.exampleTitleRegular')}
+        value={regular}
+        options={regularOptions}
+        wideCols={2}
+        narrowCols={1}
+        disabled={busy === 'regular'}
+        onChange={next => {
+          setRegular(next);
+          void saveCardMode('regular', { regularGroupReplyMode: next }, setRegularStatus);
+        }}
+      >
+        <div className="bd-mode-group-side"><StatusSpan status={regularStatus} attr={{ 'data-regular-group-status': '' }} /></div>
+      </ModeOptionGroup>
+
+      <ModeOptionGroup
+        dataInput="regularGroupMentionMode"
+        groupName={tr('botDefaults.groupMention')}
+        groupSub={tr('botDefaults.groupMentionSub')}
+        exampleTitle={tr('botDefaults.exampleTitleMention')}
+        value={mention}
+        options={mentionOptions}
+        wideCols={4}
+        narrowCols={2}
+        disabled={busy === 'mention'}
+        onChange={next => {
+          setMention(next);
+          void saveCardMode('mention', { regularGroupMentionMode: next }, setMentionStatus);
+        }}
+      >
+        <div className="bd-mode-group-side"><StatusSpan status={mentionStatus} attr={{ 'data-mention-mode-status': '' }} /></div>
+      </ModeOptionGroup>
+
+      <footer className="bd-session-mode-footer">{tr('botDefaults.sessionModeFooter')}</footer>
+
+      <div className="bd-row bd-session-mode-doc">
         <div className="bd-field">
           <FieldTitle help={tr('botDefaults.docSubscribeModeHelp')}>{tr('botDefaults.docSubscribeMode')}</FieldTitle>
           <DropdownField
@@ -7317,6 +7422,7 @@ function ReplyStyleSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
 export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
   const [autoCard, setAutoCard] = useState(props.bot.autoGrantRequestCards !== false);
+  const [ownerDm, setOwnerDm] = useState(props.bot.grantRequestToOwnerDm === true);
   const [restrict, setRestrict] = useState(props.bot.restrictGrantCommands === true);
   const [p2pOpen, setP2pOpen] = useState(props.bot.p2pOpen === true);
   const [duration, setDuration] = useState(typeof props.bot.grantDefaultDurationMs === 'number' ? props.bot.grantDefaultDurationMs : null);
@@ -7332,6 +7438,10 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   useEffect(() => {
     setAutoCard(props.bot.autoGrantRequestCards !== false);
   }, [props.bot.autoGrantRequestCards]);
+
+  useEffect(() => {
+    setOwnerDm(props.bot.grantRequestToOwnerDm === true);
+  }, [props.bot.grantRequestToOwnerDm]);
 
   useEffect(() => {
     setRestrict(props.bot.restrictGrantCommands === true);
@@ -7356,6 +7466,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
   async function savePatch(
     patch: {
       autoGrantRequestCards?: boolean;
+      grantRequestToOwnerDm?: boolean;
       restrictGrantCommands?: boolean;
       p2pOpen?: boolean;
       grantDefaultDurationMs?: number | null;
@@ -7374,6 +7485,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
         const nextDuration = typeof res.body.grantDefaultDurationMs === 'number' ? res.body.grantDefaultDurationMs : null;
         const nextQuota = typeof res.body.messageQuotaDefaultLimit === 'number' ? res.body.messageQuotaDefaultLimit : null;
         setAutoCard(res.body.autoGrantRequestCards !== false);
+        setOwnerDm(res.body.grantRequestToOwnerDm === true);
         setRestrict(res.body.restrictGrantCommands === true);
         setP2pOpen(res.body.p2pOpen === true);
         setDuration(nextDuration);
@@ -7384,6 +7496,7 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
         }
         props.patchBot(props.bot.larkAppId, {
           autoGrantRequestCards: res.body.autoGrantRequestCards !== false,
+          grantRequestToOwnerDm: res.body.grantRequestToOwnerDm === true,
           restrictGrantCommands: res.body.restrictGrantCommands === true,
           p2pOpen: res.body.p2pOpen === true,
           grantDefaultDurationMs: nextDuration,
@@ -7491,6 +7604,18 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
             const previous = autoCard;
             setAutoCard(checked);
             void savePatch({ autoGrantRequestCards: checked }, 'autoGrant', () => setAutoCard(previous));
+          }}
+        />
+        <ToggleRow
+          checked={ownerDm}
+          disabled={busy !== null || !autoCard}
+          dataAction="toggle-grant-request-owner-dm"
+          title={tr('botDefaults.grantRequestToOwnerDm')}
+          help={tr('botDefaults.grantRequestToOwnerDmHelp')}
+          onChange={checked => {
+            const previous = ownerDm;
+            setOwnerDm(checked);
+            void savePatch({ grantRequestToOwnerDm: checked }, 'ownerDm', () => setOwnerDm(previous));
           }}
         />
         <ToggleRow

@@ -232,6 +232,8 @@ vi.mock('../src/services/group-creator.js', () => ({
       oncallBindings: [],
       roleProfileBootstrapMessageId: null,
       roleProfileBootstrapError: null,
+      managersAdded: [],
+      managerError: null,
     };
   }),
 }));

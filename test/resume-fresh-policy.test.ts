@@ -57,7 +57,7 @@ describe('resumeStartsFresh', () => {
 // internal wiring is source-lock tests (see config-dir.test.ts). These assert
 // the missing-exact-id case is routed through the EXISTING fresh-demotion
 // branch — the one that flips effectiveResume=false and emits the
-// "历史会话无法恢复，已为你新起一个干净会话" user_notify — instead of leaving
+// fresh-start attempt user_notify — instead of leaving
 // effectiveResume=true while the adapter silently launches a blank session.
 describe('worker spawnCli resume demotion (source lock)', () => {
   const workerSource = readFileSync(resolvePath('src/worker.ts'), 'utf8');
@@ -84,10 +84,13 @@ describe('worker spawnCli resume demotion (source lock)', () => {
     expect(block).toContain('effectiveCliSessionId = undefined;');
     expect(block).toContain('resumeFallbackNotified');
     expect(block).toContain('user_notify');
-    expect(block).toContain('新起一个干净会话');
+    expect(block).toContain('正在尝试以新会话重新启动');
+    expect(block).toContain('不会恢复历史上下文');
+    expect(block).not.toContain('已为你**新起一个干净会话**');
+    expect(block).not.toContain('历史会话（');
   });
 
-  it('gives the missing-id case its own reason in the notice', () => {
+  it('keeps the missing-id diagnostic reason in the worker', () => {
     expect(workerSource).toContain('no persisted CLI session id');
   });
 

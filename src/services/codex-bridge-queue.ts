@@ -133,7 +133,10 @@ export class CodexBridgeQueue {
   private localLowerBoundMs = 0;
   private static readonly CLOSED_NATIVE_TURNS_MAX = 4_096;
 
-  constructor(private readonly now: () => number = Date.now) {}
+  constructor(
+    private readonly now: () => number = Date.now,
+    private readonly onLocalTurnStarted?: (turn: CodexPendingTurn) => void,
+  ) {}
 
   private isClosedNativeTurn(sourceSessionId: string | undefined, sourceTurnId: string): boolean {
     return this.closedNativeTurns.some(closed => closed.sourceTurnId === sourceTurnId
@@ -620,6 +623,7 @@ export class CodexBridgeQueue {
         if (insertAt === -1) this.queue.push(localTurn);
         else this.queue.splice(insertAt, 0, localTurn);
         this.collecting = localTurn;
+        this.onLocalTurnStarted?.(localTurn);
       } else if (bufferUnmatched && !this.localTurnsEnabled) {
         // Cursor can write the Lark/user line to JSONL before the daemon IPC
         // that marks the turn reaches this worker. Keep a tiny recent buffer

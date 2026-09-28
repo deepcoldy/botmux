@@ -94,9 +94,10 @@ describe('antigravity adapter — high-level invariants', () => {
     expect(a.altScreen).toBe(true);
   });
 
-  it('omits readyPattern/completionPattern (uses idle-detector quiescence)', () => {
+  it('requires the input footer before quiescence can indicate readiness', () => {
     const a = createAntigravityAdapter('/usr/local/bin/agy');
-    expect(a.readyPattern).toBeUndefined();
+    expect(a.readyPattern?.test('? for shortcuts')).toBe(true);
+    expect(a.readyPattern?.test('esc to cancel')).toBe(false);
     expect(a.completionPattern).toBeUndefined();
   });
 

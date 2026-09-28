@@ -216,7 +216,8 @@ fork 出的 child 自动写区分标题 `🔱 <原标题>`（source=`system`，�
    - 选择器到已有群：目标群已有该 bot 会话 → **必拒**，提示先 close。
    - 话题群新话题：新 anchor 天然不撞。
    - 关键区分：跨群"目标已有会话 → 拒绝，不覆盖别人"；非话题群本群"已有会话 → 提示 close 换"（原地切换模式 Branch，PR2）。
-3. **权限**：只有会话发起人（ownerOpenId）能 fork（复用 relay picker 门）。
+3. **权限**：默认只有会话发起人（`ownerOpenId`）能 fork（复用 relay picker 门）。**例外**：bot 管理员（`canOperate` / `allowedUsers`）可 fork 本 bot 的任意会话——他们本来就能 `/close` `/restart` 掉该会话，"能销毁却不能拷贝"没有安全意义，且 fork 非破坏性（源会话不动）。管理员 fork 别人的会话时，子会话 owner 记为**发起 fork 的管理员**，不继承源 owner（`--create` 新群里只有他自己，继承会让 owner-only 回复指向不在群里的人）。
+   另注：`/fork` 属 `DAEMON_COMMANDS`，还有一道更早的 daemon 闸默认只认 `allowedUsers`；要让普通群成员 fork 自己的会话，需在 bot 配置里把 `/fork` 加入 `canTalkDaemonCommands`。
 4. **连续 fork / 卡片堆叠**：靠 `🔱` 血缘标题 + 来源标注区分；注意选择器别被自己 fork 出的一堆占满。
 5. **【原地切换模式 Branch / PR2】确认卡 TOCTOU**：弹卡到点击间源状态可能变（busy / 被 close / anchor 易主）→ **点击时刻重校验**，不凭旧状态执行（照抄 relay confirm）。
 6. **【原地切换模式 Branch / PR2】顺序安全（最危险）**：必须**先 fork 起成功、再 close 原会话**；先 close 后 fork 失败 = 用户两头空。失败须能把原会话恢复回来。

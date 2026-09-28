@@ -617,6 +617,146 @@ export function isClaudeTurnTerminalEvent(ev: TranscriptEvent): boolean {
     && reason !== 'pause_turn';
 }
 
+/** The launch-ack a background Agent/Task tool_result carries the moment it is
+ *  dispatched: the tool call returns immediately with "launched"/"in the
+ *  background" text and an `agentId:` line, and the real result only arrives
+ *  later as a re-injected `<task-notification>`. Anchored on both markers so an
+ *  ordinary synchronous tool_result that merely mentions "background" is not
+ *  mistaken for an async dispatch. */
+const BACKGROUND_LAUNCH_ACK_RE = /launched|in the background/i;
+const BACKGROUND_LAUNCH_AGENT_ID_RE = /\bagentId:\s*(\S+)/;
+
+/** Identify a background Agent/Task dispatch from an assistant event: returns
+ *  the tool_use ids that dispatched async work. Empty when the event dispatched
+ *  none. The launch-ack lives in the FOLLOWING user event's tool_result, so the
+ *  caller pairs this with {@link backgroundTaskDispatchAcks}. */
+export function backgroundTaskDispatchToolUseIds(ev: TranscriptEvent): string[] {
+  if (!ev || (ev as any).isSidechain === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const ids: string[] = [];
+  for (const block of content as any[]) {
+    if (block && block.type === 'tool_use' && typeof block.id === 'string'
+      && (block.name === 'Agent' || block.name === 'Task')) {
+      ids.push(block.id);
+    }
+  }
+  return ids;
+}
+
+/** Read a background launch-ack out of a user event's tool_result blocks. Maps
+ *  each async-dispatch tool_use_id to the durable agent id minted in its ack
+ *  text (the id `<task-notification>` later reports under `<task-id>`). Only
+ *  tool_results whose text carries BOTH the launch phrasing and an `agentId:`
+ *  line qualify, so a synchronous tool result is never counted. */
+export function backgroundTaskDispatchAcks(ev: TranscriptEvent): Array<{ toolUseId: string; agentId: string }> {
+  if (!ev || (ev as any).isSidechain === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'user') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const acks: Array<{ toolUseId: string; agentId: string }> = [];
+  for (const block of content as any[]) {
+    if (!block || block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue;
+    const text = stringifyToolResultContent(block.content);
+    if (!BACKGROUND_LAUNCH_ACK_RE.test(text)) continue;
+    const m = BACKGROUND_LAUNCH_AGENT_ID_RE.exec(text);
+    if (!m) continue;
+    acks.push({ toolUseId: block.tool_use_id, agentId: m[1] });
+  }
+  return acks;
+}
+
+/** A `<task-notification>` re-injected when a background agent stops. It is a
+ *  synthetic event whose payload STARTS WITH the tag — a tool_result that
+ *  merely contains the literal string (e.g. grep over this source) is not one.
+ *  Two on-disk shapes carry it: the legacy `role:user` event (text in
+ *  `message.content`) and the type-ahead `attachment(queued_command)` form
+ *  (text in `attachment.prompt`, `commandMode:'task-notification'`) that
+ *  current CLI builds write — mirroring {@link extractTurnStartText}.
+ *  `status` is the agent's terminal state; the same task-id may notify more
+ *  than once (a resumed agent stops again), so a completed/failed notice only
+ *  ever RETIRES a tracked id, it never adds one. */
+export function parseTaskNotification(ev: TranscriptEvent):
+  { taskId: string; toolUseId?: string; status: string } | undefined {
+  if (!ev) return undefined;
+  let text: string;
+  if (ev.type === 'attachment' && ev.attachment?.type === 'queued_command') {
+    const prompt = ev.attachment.prompt;
+    text = typeof prompt === 'string' ? prompt : stringifyUserContent(prompt);
+  } else {
+    const role = ev.message?.role ?? ev.type;
+    if (role !== 'user') return undefined;
+    const raw = ev.message?.content;
+    text = typeof raw === 'string'
+      ? raw
+      : Array.isArray(raw)
+        ? (raw.find((b: any) => b && b.type === 'text' && typeof b.text === 'string')?.text ?? '')
+        : '';
+  }
+  if (!text.trimStart().startsWith('<task-notification>')) return undefined;
+  const taskId = /<task-id>([^<]+)<\/task-id>/.exec(text)?.[1]?.trim();
+  if (!taskId) return undefined;
+  const toolUseId = /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(text)?.[1]?.trim();
+  const status = /<status>([^<]+)<\/status>/.exec(text)?.[1]?.trim() ?? 'completed';
+  return { taskId, ...(toolUseId ? { toolUseId } : {}), status };
+}
+
+/** Live count of background Agent/Task dispatches whose completion notification
+ *  has not yet arrived, folded from a transcript event stream. The worker keeps
+ *  one per session and consults `pending()` at the PTY idle edge: while a main
+ *  turn is only idle because it is awaiting a background sub-agent, the session
+ *  card must stay `working` rather than freezing to idle (which Lark surfaces as
+ *  「已完成」). State is intentionally id-keyed, not a bare counter, so a
+ *  duplicate notification or a re-drained dispatch cannot double-count. */
+export class BackgroundTaskTracker {
+  /** agentId → toolUseId that dispatched it, for the ids still in flight. */
+  private readonly live = new Map<string, string>();
+  /** tool_use_id → agentId, so a dispatch seen before its ack can be paired. */
+  private readonly ackByToolUse = new Map<string, string>();
+  /** Dispatch tool_use ids awaiting their launch-ack (async not yet confirmed). */
+  private readonly awaitingAck = new Set<string>();
+
+  observe(ev: TranscriptEvent): void {
+    // A genuine user-typed prompt starts a new turn and supersedes any prior
+    // turn's background waits — whether it lands as a `role:user` event or the
+    // type-ahead `attachment(queued_command)` form the CLI writes when it
+    // dequeues a submission (a resumed agent's `<task-notification>` is
+    // synthetic and both predicates exclude it, so it never trips this).
+    // Resetting here bounds the tracker: even if a completion notification is
+    // somehow never parsed, the account cannot leak past the next real prompt
+    // and wedge the card in `working`.
+    if (isMeaningfulUserEvent(ev) || isMeaningfulQueuedCommand(ev)) {
+      this.reset();
+      return;
+    }
+    for (const toolUseId of backgroundTaskDispatchToolUseIds(ev)) {
+      const agentId = this.ackByToolUse.get(toolUseId);
+      if (agentId) this.live.set(agentId, toolUseId);
+      else this.awaitingAck.add(toolUseId);
+    }
+    for (const ack of backgroundTaskDispatchAcks(ev)) {
+      this.ackByToolUse.set(ack.toolUseId, ack.agentId);
+      if (this.awaitingAck.delete(ack.toolUseId)) this.live.set(ack.agentId, ack.toolUseId);
+    }
+    const note = parseTaskNotification(ev);
+    if (note) this.live.delete(note.taskId);
+  }
+
+  /** Number of background agents still in flight. */
+  pending(): number {
+    return this.live.size;
+  }
+
+  reset(): void {
+    this.live.clear();
+    this.ackByToolUse.clear();
+    this.awaitingAck.clear();
+  }
+}
+
 /** Extract the user-typed prompt text for a "turn start" event — works for
  *  both legacy `role:user` events (text in `message.content`) and the
  *  type-ahead `attachment(queued_command)` form (text in `attachment.prompt`).

@@ -784,6 +784,22 @@ describe('IdleDetector: quiescence detection', () => {
     detector.dispose();
   });
 
+  it('delays idle for 8-dot braille spinner frames (Ink / Antigravity ⣷)', () => {
+    const detector = new IdleDetector(makeCli());
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    // Feed 8-dot braille spinner character (⣷ = U+28F7)
+    detector.feed('⣷ Running command...');
+
+    vi.advanceTimersByTime(2000);
+    expect(cb).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(3500);
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
   it('still reports quiescence after static busy output', () => {
     const detector = new IdleDetector(makeCli({ busyPattern: /Working\.\.\./ }));
     const cb = vi.fn();

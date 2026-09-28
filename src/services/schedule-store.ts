@@ -708,10 +708,10 @@ export function updateTask(
     'enabled' | 'disabledReason' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastRunId' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
   >> & { chatIds?: readonly string[] | null },
   appId?: string,
-): void {
-  mutateTasks(working => {
+): boolean {
+  return mutateTasks(working => {
     const task = working.get(id);
-    if (!task) return { result: undefined, changed: false };
+    if (!task) return { result: false, changed: false };
     const targetUpdate = updates.chatId !== undefined || updates.chatIds !== undefined;
     const targets = targetUpdate
       ? normalizeScheduleChatTargets({
@@ -740,7 +740,7 @@ export function updateTask(
       if (targets.chatIds) task.chatIds = targets.chatIds;
       else delete task.chatIds;
     }
-    return { result: undefined, changed: true };
+    return { result: true, changed: true };
   }, appId);
 }
 

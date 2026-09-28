@@ -370,13 +370,17 @@ describe('A4/A5: actual durable session store', () => {
     expect(sessionStore.getSessionFresh(session.sessionId)?.cliInstanceBinding).toEqual(binding);
   });
   it('prevents an old whole-row object from deleting or replacing the binding', () => {
-    initialize();
+    registerCodexInstanceBot({ ...bot(), promptInjection: 'none' });
+    sessionStore.init('acceptance-app');
     const session = create('http');
     const original = structuredClone(session.cliInstanceBinding);
-    const stale = { ...session, cliInstanceBinding: undefined, cliRuntime: undefined, agentFrozen: undefined, title: 'updated title' };
+    const stale = { ...session, cliInstanceBinding: undefined, cliRuntime: undefined, agentFrozen: undefined, promptInjection: undefined, title: 'updated title' };
     sessionStore.updateSession(stale);
     expect(sessionStore.getSessionFresh(session.sessionId)?.cliInstanceBinding).toEqual(original);
     expect(sessionStore.getSession(session.sessionId)?.cliInstanceBinding).toEqual(original);
+    expect(sessionStore.getSessionFresh(session.sessionId)?.promptInjection).toBe('none');
+    expect(sessionStore.getSession(session.sessionId)?.promptInjection).toBe('none');
+    expect(stale.promptInjection).toBe('none');
     expect(() => sessionStore.updateSession({ ...session, cliInstanceBinding: { ...original!, codexHome: b } })).toThrow();
     expect(sessionStore.getSessionFresh(session.sessionId)?.cliInstanceBinding).toEqual(original);
   });

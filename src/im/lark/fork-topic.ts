@@ -58,7 +58,7 @@ export async function prepareForkTopic(
   const attachments = message.attachments ?? (resources.length ? (await deps.download(resources)).attachments : []);
   const images = new Map<string, string>();
   for (const resource of resources.filter(r => r.type === 'image')) {
-    const attachment = attachments.find(a => a.type === 'image' && a.name === resource.name);
+    const attachment = attachments.find(a => a.type === 'image' && (a.resourceKey ? a.resourceKey === resource.key : a.name === resource.name));
     if (!attachment) continue;
     try { images.set(resource.key, await deps.upload(attachment.path)); } catch { /* source link remains available */ }
   }

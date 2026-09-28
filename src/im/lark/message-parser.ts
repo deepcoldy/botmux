@@ -1160,6 +1160,40 @@ const RESOLVED_TEXT_KEY = '__botmux_card_text__';
  */
 export const CARD_EMBEDDED_PLACEHOLDER = '[卡片内嵌组件，需在飞书客户端展开查看]';
 
+/**
+ * True when the text carries **no information beyond "an attachment was sent"**
+ * — i.e. it is nothing but bare placeholders emitted by the renderers above.
+ *
+ * Only the *bare* forms count as zero-information. A placeholder that carries
+ * real text — `[文件 1: 季度汇报.pdf]`, `[图片 2: 报警前30分钟同比]` (see
+ * {@link withImgAlt}), `[卡片: 发布单 #123]`, `[标签: P0]`, `[输入框: 收件人]`,
+ * or a button's own `[确认发布]` — is deliberately NOT stripped: that text is
+ * the whole point, and for an attachment-only message it is the only thing
+ * worth naming the chat after.
+ *
+ * Used as the AI-title gate for session groups: feeding `[图片 1]` to the
+ * titler yields a confident-but-content-free name ("图片内容分析请求") and,
+ * because a successful rename sets `titled` (see `markSessionGroupTitled`),
+ * permanently closes both the birth and the heal gate. Skipping instead leaves
+ * the group on its placeholder name until the user's next real message — ugly
+ * for a moment, but self-healing rather than wrong forever.
+ *
+ * ⚠️ Coupled to the placeholder literals rendered in this file (`renderPostNode`,
+ * `extractTextContent`, `extractCardContent` and {@link CARD_EMBEDDED_PLACEHOLDER}).
+ * Adding a new zero-information placeholder means adding it here too.
+ */
+export function isPlaceholderOnlyText(text: string): boolean {
+  if (!text.trim()) return false;
+  const stripped = text
+    // `[图片]` / `[图片 2]` / `[文件]` / `[文件 3]` / `[语音]` / `[卡片]`
+    .replace(/\[(?:图片|文件|语音|卡片)(?:\s+\d+)?\]/g, '')
+    .replace(/\[卡片 \(模板\)\]/g, '')
+    .replace(/\[合并转发消息\]/g, '')
+    .replaceAll(CARD_EMBEDDED_PLACEHOLDER, '')
+    .trim();
+  return stripped === '';
+}
+
 /** Wrap merged text so extractCardContent returns it verbatim downstream. */
 export function wrapResolvedCardText(text: string): string {
   return JSON.stringify({ [RESOLVED_TEXT_KEY]: text });

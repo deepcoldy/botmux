@@ -71,8 +71,8 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
     // so adding one is a deliberate decision, and dropping a skillsDir from an
     // adapter classified 'global' turns this red.
     const EXPECTED: Readonly<Record<CliId, SkillInjectionSupport>> = {
-      // per-session --plugin-dir (claude family)
-      'claude-code': 'dynamic', seed: 'dynamic', relay: 'dynamic',
+      // per-session --plugin-dir (claude family, oh-my-pi) or --skill (pi)
+      'claude-code': 'dynamic', seed: 'dynamic', relay: 'dynamic', pi: 'dynamic', 'oh-my-pi': 'dynamic',
       // shared global skills dir → global|prompt|off all apply
       coco: 'global', codex: 'global', cursor: 'global', gemini: 'global',
       genius: 'global', opencode: 'global', mtr: 'global', traex: 'global',
@@ -80,7 +80,7 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
       // so the shared-root dedup below covers it.
       opencode2: 'global',
       mimocode: 'global',
-      pi: 'global', 'oh-my-pi': 'global', grok: 'global', 'kiro-cli': 'global',
+      grok: 'global', 'kiro-cli': 'global',
       reasonix: 'global', mojo: 'global',
       // no skill mechanism at all
       aiden: 'none', 'codex-app': 'none', antigravity: 'none', hermes: 'none', ebsd: 'none',

@@ -99,6 +99,13 @@ export interface FsPolicyContext {
   execPaths?: readonly string[];
   /** Trusted runtime read-only roots (skill/plugin dirs, botmux dist). */
   readonlyRoots?: readonly string[];
+  /** Read-only roots the daemon generated for THIS session under
+   *  sessionDataDir (runtime skill delivery dirs, Pi initial-prompt dir).
+   *  Unlike readonlyRoots they are NOT dropped for a no-transport turn, but only
+   *  when they pass the containment check in buildFsPolicy (inside
+   *  sessionDataDir, with a segment equal to this session's id). Never put
+   *  user-configured paths here — those belong in userPaths. */
+  sessionOwnedReadonlyRoots?: readonly string[];
   /** The botmux install/checkout root (dir containing dist/ + node_modules).
    *  Exposed readOnly so the agent's `botmux` CLI and the claude hooks (which
    *  exec `node <checkout>/dist/cli.js …`) can load — without this a sandboxed
@@ -810,6 +817,23 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   push(ctx.outbox ? [ctx.outbox] : [], 'readWrite', 'internal');
   push(dropAuthority(ctx.extraWritePaths), 'readWrite', 'internal');
   push(dropAuthority(ctx.readonlyRoots), 'readOnly', 'internal');
+  // Session-owned read-only roots: directories the daemon generated for THIS
+  // session under the botmux data dir (runtime skill delivery, Pi's long
+  // initial prompt). They carry no Feishu credential, so they skip
+  // dropAuthority — a no-transport turn would otherwise drop them and the CLI
+  // could not read its own skills / prompt. Defense in depth: a path is exempt
+  // only if it sits strictly inside sessionDataDir AND one of its segments is
+  // this session's id; anything else falls back to the ordinary readonlyRoots
+  // treatment (fail-closed for no-transport).
+  const sessionRoot = normalizeFsPath(ctx.sessionDataDir);
+  const isSessionOwned = (raw: string): boolean => {
+    const p = normalizeFsPath(raw);
+    if (!ctx.sessionId || !p || !sessionRoot || p === sessionRoot || !coversPath(sessionRoot, p)) return false;
+    return p.slice(sessionRoot.length + 1).split('/').includes(ctx.sessionId);
+  };
+  const sessionOwned = ctx.sessionOwnedReadonlyRoots ?? [];
+  push(sessionOwned.filter(isSessionOwned), 'readOnly', 'internal');
+  push(dropAuthority(sessionOwned.filter(p => !isSessionOwned(p))), 'readOnly', 'internal');
   // Own routing metadata (`botmux send` reply routing) — read-only. The store
   // is SQLite in its own per-bot DIRECTORY: the dir grant is deliberate — a
   // single-file bwrap bind pins the inode, and SQLite deletes/recreates
@@ -836,8 +860,9 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // （在沙盒内）按内容指纹读回。worker 预创建目录以通过 existence-filter。
   if (ctx.sessionId) push([`${ctx.sessionDataDir}/prompt-ctx/${ctx.sessionId}`], 'readOnly', 'internal');
   // Trigger-user CLI identity (this session ONLY) — the wrapper on PATH sources
-  // `cli-identity/<sessionId>.<tool>.env` on every invocation, so a sandboxed
-  // session needs to READ exactly those files plus the wrapper scripts.
+  // `cli-identity/<sessionId>.bin/.data/<tool>.env` on every invocation. Bind
+  // the per-session directory, not each mutable file: atomic writes replace
+  // inodes, while a long-lived bwrap single-file bind keeps reading the old one.
   //
   // Granted per file/dir, never the `cli-identity/` parent: that directory holds
   // every concurrent session's files, each with a live user token belonging to a
@@ -849,16 +874,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // able to. Writable would let an agent publish its own identity and act as
   // anyone whose token it could name.
   if (ctx.sessionId && larkTransport) {
-    push([
-      `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.lark-cli.env`,
-      `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bytedcli.env`,
-      `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bin`,
-      // The turn the CLI is currently executing. The wrapper compares it against
-      // the turn stamped on the identity and refuses on a mismatch, so without
-      // this grant a sandboxed session reads nothing and every governed command
-      // fails — the deny is safe, but it is not the behavior we want.
-      `${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.turn`,
-    ], 'readOnly', 'internal');
+    push([`${ctx.sessionDataDir}/cli-identity/${ctx.sessionId}.bin`], 'readOnly', 'internal');
   }
   // Own per-bot lark-cli config (agent-facing lark-cli identity). Withheld from
   // a no-transport turn — it IS this bot's Feishu credential surface.
@@ -883,6 +899,8 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     `${bh}/.dashboard-port`,    // dashboard port (owner term-link; harmless port int)
     `${bh}/bin`,                // the daemon-written `botmux` wrapper (head of PATH)
     `${bh}/claude-plugin`,      // skill/plugin dir (claude --plugin-dir); no secrets
+    `${bh}/omp-plugin`,         // skill/plugin dir (omp --plugin-dir); no secrets
+    `${bh}/pi-skills`,          // skill dir (pi --skill); no secrets
     `${bh}/lark-scopes.json`,   // static scope catalog
     // dashboard-daemons (sibling IPC port table) is the discovery half of the
     // trusted-host escalation — a no-transport turn must NOT get it (paired with

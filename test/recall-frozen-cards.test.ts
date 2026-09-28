@@ -9,10 +9,15 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { DaemonSession, FrozenCard } from '../src/core/types.js';
-import { activeSessionKey } from '../src/core/types.js';
+import { activeSessionKey, sessionKey } from '../src/core/types.js';
 import { setTerminalProxyPort } from '../src/core/terminal-url.js';
 
 // ─── Mocks ─────────────────────────────────────────────────────────────────
+
+const { loggerWarnMock, loggerDebugMock } = vi.hoisted(() => ({
+  loggerWarnMock: vi.fn(),
+  loggerDebugMock: vi.fn(),
+}));
 
 const deleteMessageMock = vi.fn(async (_appId: string, _messageId: string) => {});
 const updateMessageMock = vi.fn(async (_appId: string, _messageId: string, _json: string) => {});
@@ -47,7 +52,7 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
-  logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
+  logger: { info: vi.fn(), warn: loggerWarnMock, debug: loggerDebugMock, error: vi.fn() },
 }));
 
 vi.mock('../src/im/lark/card-builder.js', () => ({
@@ -201,6 +206,8 @@ beforeEach(() => {
   loadFrozenCardsMock.mockReset();
   loadFrozenCardsMock.mockReturnValue(new Map());
   persistStreamCardStateMock.mockClear();
+  loggerWarnMock.mockClear();
+  loggerDebugMock.mockClear();
   buildStreamingCardMock.mockClear();
   getBotMock.mockReturnValue({
     config: { larkAppId: APP_ID, cliId: 'claude-code' },
@@ -515,6 +522,23 @@ describe('meeting-agent streaming card (Plan B)', () => {
 });
 
 describe('postFreshStreamingCard', () => {
+  it('uses the runtime lane slot while posting /card to the visible root', async () => {
+    const ds = makeDs();
+    ds.runtimeRoutingAnchor = 'lane:source:fresh-b';
+    ds.workerReady = true;
+    const registry = new Map([[activeSessionKey(ds), ds]]);
+    expect(registry.has(sessionKey('om_root', APP_ID))).toBe(false);
+    setActiveSessionsRegistry(registry);
+    const sessionReply = vi.fn(async () => 'om_lane_fresh_card');
+
+    await expect(postFreshStreamingCard(ds, sessionReply)).resolves.toBe(true);
+
+    expect(sessionReply.mock.calls[0]?.[0]).toBe('om_root');
+    expect(sessionReply.mock.calls[0]?.[3]).toBe(APP_ID);
+    expect(ds.streamCardId).toBe('om_lane_fresh_card');
+    expect(deleteMessageMock).not.toHaveBeenCalledWith(APP_ID, 'om_lane_fresh_card');
+  });
+
   it('completes /card publication before its deferred Pin chain settles', async () => {
     let resolvePin!: (value: { messageId: string; operatorId: string; operatorIdType: string }) => void;
     pinMessageMock.mockImplementationOnce(() => new Promise((resolve) => {
@@ -795,6 +819,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPending = true;
     ds.streamCardTurnGeneration = 1;
     ds.streamCardPendingTurnId = 'om_turn_1';
+    activate(ds);
 
     const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
     ds.session = {
@@ -826,6 +851,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPending = true;
     ds.streamCardTurnGeneration = 1;
     ds.streamCardPendingTurnId = 'om_turn_1';
+    activate(ds);
 
     const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
     ds.session.status = 'closed' as any;
@@ -851,6 +877,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPending = true;
     ds.streamCardTurnGeneration = 1;
     ds.streamCardPendingTurnId = 'om_turn_1';
+    activate(ds);
 
     const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
     ds.session.rootMessageId = 'om_transferred_root';
@@ -876,6 +903,7 @@ describe('postTurnStartingCard', () => {
     ds.streamCardPending = true;
     ds.streamCardTurnGeneration = 1;
     ds.streamCardPendingTurnId = 'om_turn_1';
+    activate(ds);
 
     const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
     ds.session = {
@@ -1288,6 +1316,32 @@ describe('scheduleCardPatch expired (230031) handling', () => {
 });
 
 describe('scheduleCardPatch adjacent duplicate handling', () => {
+  it('warns once per minute for user-triggered PATCH failures with sanitized Lark fields', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-09-25T00:00:00Z'));
+    const ds = makeDs();
+    ds.streamCardId = 'om_USER';
+    const failure = Object.assign(new Error('request failed'), {
+      response: {
+        status: 400,
+        data: { code: 230001, msg: 'card cannot be updated', log_id: 'log_safe' },
+      },
+      config: { headers: { Authorization: 'Bearer secret' } },
+    });
+    updateMessageMock.mockRejectedValue(failure);
+
+    scheduleCardPatch(ds, '{"state":1}', undefined, { userInitiated: true });
+    await vi.runAllTimersAsync();
+    scheduleCardPatch(ds, '{"state":2}', undefined, { userInitiated: true });
+    await vi.runAllTimersAsync();
+
+    expect(loggerWarnMock).toHaveBeenCalledTimes(1);
+    const warning = String(loggerWarnMock.mock.calls[0]?.[0]);
+    expect(warning).toContain('HTTP 400 code=230001 card cannot be updated log_id=log_safe');
+    expect(warning).not.toContain('Bearer secret');
+    expect(loggerDebugMock).toHaveBeenCalledTimes(1);
+  });
+
   it('drops an identical PATCH queued for the same card after the in-flight PATCH succeeds', async () => {
     const ds = makeDs();
     ds.streamCardId = 'om_SAME';

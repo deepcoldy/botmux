@@ -658,6 +658,19 @@ describe('resumeSession', () => {
         }];
         session.queuedActivationTailNextOrder = 2;
       }],
+      ['principal lane FIFO', (session: any) => {
+        session.principalLaneQueuedTurns = [{
+          version: 1,
+          turnId: 'abandoned-lane-turn',
+          caller: { requestUserOpenId: 'ou_b', senderType: 'user' },
+          userPrompt: 'abandoned lane turn',
+          title: 'abandoned lane turn',
+          cliInput: { content: 'abandoned lane turn' },
+          createdAt: '2026-01-01T00:00:00.000Z',
+          resume: true,
+          dispatchState: 'attempting',
+        }];
+      }],
     ] as const)('never revives legacy %s when a closed row is resumed', async (_label, injectLegacyState) => {
       const closed = makeClosedSession({ rootMessageId: `om_legacy_${_label.replaceAll(' ', '_')}` });
       injectLegacyState(closed);
@@ -680,6 +693,8 @@ describe('resumeSession', () => {
       expect(persisted.queuedActivationInput).toBeUndefined();
       expect(persisted.queuedActivationTail).toBeUndefined();
       expect(persisted.queuedActivationTailNextOrder).toBeUndefined();
+      expect(persisted.principalLaneQueuedTurns).toBeUndefined();
+      expect(result.ds.principalLaneRunningTurn).toBeUndefined();
       expect(result.ds.initialStartPending).toBeFalsy();
       expect(result.ds.pendingRepo).toBeFalsy();
     });

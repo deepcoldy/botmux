@@ -31,7 +31,8 @@
  *     session is unaware of botmux, so transcript drain is the ONLY
  *     channel from model to Lark. There's no `botmux send` to compete
  *     with, hence no marker to gate on.
- *   - Non-adopt + isLocal: suppress. A local-typing turn means the
+ *   - Non-adopt + isLocal: suppress unless zero-injection forwards local
+ *     finals (`forwardLocalFinal`). A local-typing turn means the
  *     attribution queue saw a user event whose content didn't match any
  *     pending Lark fingerprint. In a worker-spawned CLI that's a Web
  *     terminal hand-typed input — the user is already looking at it, no
@@ -219,6 +220,9 @@ export interface BridgeGateInput {
   /** Whether the queue synthesised this turn from a local-terminal event
    *  (no fingerprint match for a Lark message). */
   isLocal: boolean | undefined;
+  /** Zero-injection sessions forward real terminal answers through the same
+   * delivery channel. Keep local attribution for failure/empty-turn filtering. */
+  forwardLocalFinal?: boolean;
   /** Transcript final text for this turn, when available. Lets structured
    *  send markers distinguish final-answer sends from earlier progress sends. */
   finalText?: string;
@@ -355,7 +359,9 @@ export function shouldSuppressBridgeEmit(
 ): boolean {
   if (adoptMode) return false;
   if (isBridgeNothingToSendFinal(turn.finalText)) return true;
-  if (turn.isLocal) return true;
+  if (turn.isLocal && !turn.forwardLocalFinal) return true;
+  if (turn.isLocal && turn.forwardLocalFinal && turn.terminalStatus
+    && turn.terminalStatus !== 'completed') return true;
   if (turn.markTimeMs === undefined) return false;
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;

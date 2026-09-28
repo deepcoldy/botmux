@@ -35,11 +35,26 @@
 import { accessSync, constants, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
-import type { TriggerUserAuthTool } from '../services/trigger-user-auth.js';
+import { isCliIdentityPath } from '../utils/child-env.js';
+import type { TriggerUserAuthConfig, TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 
 /** Where a session's identity files live, under its own data dir. */
 export function sessionIdentityDir(sessionDataDir: string): string {
   return join(sessionDataDir, 'cli-identity');
+}
+
+/**
+ * Mutable identity data for one session.
+ *
+ * Keep the env and active-turn files below the existing per-session wrapper
+ * directory instead of binding either file into the sandbox directly. Atomic
+ * writes replace a file inode; a long-lived bubblewrap single-file bind would
+ * otherwise keep reading the inode captured at spawn. Reusing the directory
+ * already mounted for wrappers also lets sessions created before an upgrade see
+ * this layout without rebuilding their persistent pane.
+ */
+export function sessionIdentityDataDir(sessionDataDir: string, sessionId: string): string {
+  return join(sessionIdentityBinDir(sessionDataDir, sessionId), '.data');
 }
 
 /**
@@ -53,7 +68,7 @@ export function sessionIdentityPath(
   sessionId: string,
   tool: TriggerUserAuthTool,
 ): string {
-  return join(sessionIdentityDir(sessionDataDir), `${assertSafeSegment(sessionId)}.${tool}.env`);
+  return join(sessionIdentityDataDir(sessionDataDir, sessionId), `${tool}.env`);
 }
 
 /**
@@ -68,7 +83,7 @@ export function sessionIdentityPath(
  * invocation, and parsing JSON there would mean spawning `jq`.
  */
 export function sessionActiveTurnPath(sessionDataDir: string, sessionId: string): string {
-  return join(sessionIdentityDir(sessionDataDir), `${assertSafeSegment(sessionId)}.turn`);
+  return join(sessionIdentityDataDir(sessionDataDir, sessionId), 'turn');
 }
 
 /**
@@ -86,7 +101,7 @@ export function publishActiveTurn(
 ): void {
   const path = sessionActiveTurnPath(sessionDataDir, sessionId);
   try {
-    mkdirSync(sessionIdentityDir(sessionDataDir), { recursive: true, mode: 0o700 });
+    mkdirSync(sessionIdentityDataDir(sessionDataDir, sessionId), { recursive: true, mode: 0o700 });
     atomicWriteFileSync(path, `${turnId ?? ''}\n`, { mode: 0o600 });
   } catch { /* best-effort: a stale/absent turn file refuses, never misattributes */ }
 }
@@ -280,7 +295,7 @@ export function writeSessionIdentity(
   identity: CliIdentity,
 ): string {
   const path = sessionIdentityPath(sessionDataDir, sessionId, identity.tool);
-  mkdirSync(sessionIdentityDir(sessionDataDir), { recursive: true, mode: 0o700 });
+  mkdirSync(sessionIdentityDataDir(sessionDataDir, sessionId), { recursive: true, mode: 0o700 });
   atomicWriteFileSync(path, renderIdentityEnv(identity), { mode: 0o600 });
   return path;
 }
@@ -375,7 +390,7 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     `${MODE_VAR}=`,
     `${DENY_MSG_VAR}=`,
     'if [ -n "$SESSION_DATA_DIR" ] && [ -n "$BOTMUX_SESSION_ID" ]; then',
-    `  __botmux_cred="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.${tool}.env"`,
+    `  __botmux_cred="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.bin/.data/${tool}.env"`,
     '  if [ -f "$__botmux_cred" ]; then',
     '    . "$__botmux_cred"',
     '  fi',
@@ -388,7 +403,7 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
     // running, so these are somebody else's.
     '__botmux_live=',
     'if [ -n "$SESSION_DATA_DIR" ] && [ -n "$BOTMUX_SESSION_ID" ]; then',
-    '  __botmux_turnf="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.turn"',
+    '  __botmux_turnf="$SESSION_DATA_DIR/cli-identity/$BOTMUX_SESSION_ID.bin/.data/turn"',
     '  if [ -f "$__botmux_turnf" ]; then',
     '    read -r __botmux_live < "$__botmux_turnf" || __botmux_live=',
     '  fi',
@@ -443,12 +458,12 @@ export function renderIdentityWrapper(tool: TriggerUserAuthTool, realBinaryPath:
 }
 
 /**
- * Create empty identity files so a sandboxed session can read them later.
+ * Create the per-session identity directory and empty files before sandbox
+ * spawn so a sandboxed session can read them later.
  *
- * The file sandbox existence-filters its allow list: a path that does not exist
- * at spawn is dropped, and a dropped path stays unreadable even once the daemon
- * publishes to it — the session would then run without the sender's identity,
- * silently. Creating the files up front keeps the grant intact.
+ * The file sandbox existence-filters its allow list: a directory that does not
+ * exist at spawn is dropped. Binding the directory (rather than its files) is
+ * also what makes later atomic rename updates visible to a persistent sandbox.
  *
  * Empty is the right initial content. No identity exists until the first turn
  * resolves one, and both the wrapper and a `.`-source treat an empty file the
@@ -462,7 +477,7 @@ export function ensureSessionIdentityPlaceholders(
   sessionId: string,
   tools: readonly TriggerUserAuthTool[],
 ): void {
-  mkdirSync(sessionIdentityDir(sessionDataDir), { recursive: true, mode: 0o700 });
+  mkdirSync(sessionIdentityDataDir(sessionDataDir, sessionId), { recursive: true, mode: 0o700 });
   const paths = [
     ...tools.map(tool => sessionIdentityPath(sessionDataDir, sessionId, tool)),
     // Same existence-filter reason: the wrapper reads the active turn on every
@@ -716,7 +731,7 @@ export function findRealToolBinary(
 ): string | null {
   const excluded = new Set(excludeDirs.filter(Boolean));
   for (const dir of (pathValue ?? '').split(delimiter)) {
-    if (!dir || excluded.has(dir)) continue;
+    if (!dir || excluded.has(dir) || isCliIdentityPath(dir)) continue;
     const candidate = join(dir, tool);
     try {
       accessSync(candidate, constants.X_OK);
@@ -724,4 +739,110 @@ export function findRealToolBinary(
     } catch { /* not here, keep looking */ }
   }
   return null;
+}
+
+/** Install identity interception on the process that actually executes tools.
+ * Used before both native CLI and RPC app-server startup. No token is copied
+ * into the process environment: wrappers read the current turn on each call. */
+export function prepareTriggerUserCliEnv(
+  childEnv: NodeJS.ProcessEnv, sessionDataDir: string | undefined, sessionId: string,
+  policy: TriggerUserAuthConfig | undefined, log: (message: string) => void,
+): void {
+  if (!policy?.enabled || !sessionDataDir) return;
+  childEnv.SESSION_DATA_DIR = sessionDataDir;
+  childEnv.BOTMUX_SESSION_ID = sessionId;
+  const wrapperDir = sessionIdentityBinDir(sessionDataDir, sessionId);
+  // Pre-create the identity files so they survive the sandbox's
+  // existence-filter (it drops allow paths that do not exist at spawn, and a
+  // dropped path would leave the wrapper unable to read what the daemon later
+  // publishes — the session would silently run without the sender's identity).
+  // Empty is the correct initial content: no identity is published until the
+  // first turn resolves one, and the wrapper treats an empty file as "no
+  // identity", the same as absent.
+  try {
+    ensureSessionIdentityPlaceholders(
+      sessionDataDir,
+      sessionId,
+      policy.tools,
+    );
+  } catch (e) {
+    log(`[trigger-user-auth] WARN could not pre-create identity files: ${(e as Error).message}`);
+  }
+  let installedAny = false;
+  for (const tool of policy.tools) {
+    try {
+      const real = findRealToolBinary(tool, childEnv.PATH, [wrapperDir]);
+      if (!real) {
+        log(`[trigger-user-auth] ${tool} is not installed; no wrapper written`);
+        continue;
+      }
+      installIdentityWrapper(wrapperDir, tool, real);
+      installedAny = true;
+      log(`[trigger-user-auth] wrapping ${tool} -> ${real}`);
+    } catch (e) {
+      // A missing wrapper means the tool keeps its previous behavior; it must
+      // not stop the session from starting.
+      log(`[trigger-user-auth] WARN could not wrap ${tool}: ${(e as Error).message}`);
+    }
+  }
+  // Every governed tool failed to wrap, yet the policy is on. The session
+  // then runs completely unprotected while the operator believes otherwise —
+  // the failure mode observed in production, where the agent cheerfully
+  // reported `identity: user` (the machine account) as "normal". Absence of a
+  // wrapper is invisible by nature, so it has to be said out loud.
+  if (!installedAny) {
+    log('[trigger-user-auth] WARN no tool wrapper installed — this session is NOT running under '
+      + 'trigger-user identity; calls will use whatever credentials the machine has');
+  }
+  if (installedAny) {
+    childEnv.PATH = [wrapperDir, ...(childEnv.PATH ?? '').split(delimiter).filter(p => p !== wrapperDir)].join(delimiter);
+    // A prepend alone loses to path_helper in the login shell the agent's
+    // tool calls run through — see installLoginShellPathShim. These three
+    // vars put the wrapper dir back in front after the system startup files
+    // have run, without touching the user's dotfiles.
+    try {
+      const { zdotdir, bashEnv } = installLoginShellPathShim(wrapperDir);
+      childEnv.BOTMUX_IDENTITY_BIN = wrapperDir;
+      childEnv.ZDOTDIR = zdotdir;
+      childEnv.BASH_ENV = bashEnv;
+    } catch (e) {
+      // Without the shim a login shell resolves the REAL tool, which is the
+      // silent-bypass this feature exists to prevent. Say so loudly rather
+      // than letting the session look protected while it is not.
+      log(`[trigger-user-auth] WARN login-shell PATH shim not installed (${(e as Error).message}); `
+        + `tool calls made through a login shell may bypass the identity wrapper`);
+    }
+  }
+  // Git attribution: a push over HTTPS to Codebase authenticates with a
+  // Codebase JWT, which git mints via GIT_ASKPASS and which reads none of the
+  // env vars above. Without this, work pushed on someone's behalf carries the
+  // machine's identity — and "who opened this MR" is exactly what this feature
+  // exists to fix. The helper asks the WRAPPED bytedcli, so it inherits the
+  // per-turn identity with no second credential path to keep in sync.
+  if (policy.tools.includes('bytedcli')
+      && identityWrapperInstalled(wrapperDir, 'bytedcli')) {
+    try {
+      const askpass = installGitAskpass(
+        wrapperDir,
+        true,
+        policy.gitTokenExchangeUrl,
+      );
+      if (askpass) {
+        childEnv.GIT_ASKPASS = askpass;
+        // Bind the helper to the configured code host and rewrite SSH remotes
+        // to HTTPS for it. Without the rewrite, a repo cloned over SSH keeps
+        // authenticating with the machine's key and the attribution chain
+        // breaks silently. Scoped via GIT_CONFIG_* env so the operator's own
+        // ~/.gitconfig is never touched.
+        if (policy.gitHost) {
+          Object.assign(childEnv, gitIdentityConfigEnv(askpass, policy.gitHost));
+          log(`[trigger-user-auth] git pushes to ${policy.gitHost} authenticate as the acting user`);
+        } else {
+          log('[trigger-user-auth] git askpass installed; set triggerUserAuth.gitHost to also force HTTPS for a code host');
+        }
+      }
+    } catch (e) {
+      log(`[trigger-user-auth] WARN could not install the git credential helper: ${(e as Error).message}`);
+    }
+  }
 }

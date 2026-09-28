@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { appendFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
@@ -10,6 +10,7 @@ import {
 } from '../src/services/bridge-fallback-gate.js';
 import {
   drainTraexRollout,
+  findTraexRolloutSetByPid,
   findTraexRolloutBySessionId,
   readLatestTraexRuntime,
   traexRolloutHasUserInputSince,
@@ -20,6 +21,10 @@ import {
 import { openDatabaseSyncNow } from '../src/services/sqlite-compat.js';
 
 const SID = '00000000-0000-7000-8000-000000000001';
+const traexTranscriptSource = readFileSync(
+  new URL('../src/services/traex-transcript.ts', import.meta.url),
+  'utf8',
+);
 let dir: string;
 let path: string;
 
@@ -2077,5 +2082,34 @@ describe('traexHistorySidIsOwned (ownership gate predicate)', () => {
 
   it('fails closed on an empty set (pid holds no TRAE rollout)', () => {
     expect(traexHistorySidIsOwned(OWNED, new Set())).toBe(false);
+  });
+});
+
+describe('TRAE pid ownership probe on macOS/BSD', () => {
+  it('uses a shell-free lsof call with a hard timeout', () => {
+    const start = traexTranscriptSource.indexOf('function traexProcessOpenTargets');
+    const end = traexTranscriptSource.indexOf('/** Find the visible top-level rollout', start);
+    const body = traexTranscriptSource.slice(start, end);
+
+    expect(body).toContain("execFileSync('lsof', ['-p', String(pid), '-Fn']");
+    expect(body).toContain('timeout: TRAEX_LSOF_TIMEOUT_MS');
+    expect(body).toContain("killSignal: 'SIGKILL'");
+    expect(body).not.toContain('execSync(');
+    expect(traexTranscriptSource).toContain('const TRAEX_LSOF_TIMEOUT_MS = 1_000;');
+  });
+
+  it.skipIf(process.platform !== 'darwin')('kills a stalled lsof probe within the bounded deadline', () => {
+    const fakeLsof = join(dir, 'lsof');
+    writeFileSync(fakeLsof, '#!/bin/sh\nsleep 10\n');
+    chmodSync(fakeLsof, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${dir}:${originalPath ?? ''}`;
+    const startedAt = Date.now();
+    try {
+      expect(findTraexRolloutSetByPid(process.pid)).toBeUndefined();
+    } finally {
+      process.env.PATH = originalPath;
+    }
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
   });
 });
