@@ -585,7 +585,9 @@ function reclaimMaskMounts(sessionRoot: string): void {
  * needs write permission on its parent, not read permission on the mask itself.
  * Keep the mask mode unchanged and never follow a replacement symlink. */
 function removeSandboxTree(sessionRoot: string): void {
-  try { rmdirSync(join(sessionRoot, 'empty')); } catch { /* absent or replaced */ }
+  try {
+    if (lstatSync(sessionRoot).isDirectory()) rmdirSync(join(sessionRoot, 'empty'));
+  } catch { /* absent or replaced */ }
   try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
 }
 

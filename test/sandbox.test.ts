@@ -316,6 +316,26 @@ describe('sandbox tree cleanup', () => {
     }
   });
 
+  it('does not traverse a replaced session root during orphan cleanup', () => {
+    if (process.platform !== 'linux') return;
+    const root = mkdtempSync(join(tmpdir(), 'sbx-cleanup-root-link-'));
+    const sessionRoot = join(root, 'sandboxes', 'replaced-session');
+    const outside = join(root, 'outside');
+    const outsideEmpty = join(outside, 'empty');
+    mkdirSync(join(root, 'sandboxes'));
+    mkdirSync(outsideEmpty, { recursive: true });
+    symlinkSync(outside, sessionRoot);
+    const old = new Date(Date.now() - 120_000);
+    utimesSync(outside, old, old);
+    try {
+      sweepOrphanSandboxes(root, new Set());
+      expect(existsSync(sessionRoot)).toBe(false);
+      expect(existsSync(outsideEmpty)).toBe(true);
+    } finally {
+      rmSandboxScratch(root);
+    }
+  });
+
   it('does not follow a replacement mask symlink during cleanup', () => {
     if (process.platform !== 'linux') return;
     const root = mkdtempSync(join(tmpdir(), 'sbx-cleanup-symlink-'));
