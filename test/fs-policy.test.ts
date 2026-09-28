@@ -788,7 +788,7 @@ describe('resolveRedirectedAdapterAuthPaths (redirect authPath suppression)', ()
     expect(policyAssembly).toBeGreaterThan(precreate);
     expect(src).toContain("relative(canonicalManagedSessionsRoot, canonicalManagedSessionDir) !== join('botmux', effectiveAdapterSessionId)");
     expect(src).toContain('mandatoryDenyPaths.push(canonicalManagedSessionsRoot)');
-    expect(src).toContain('extraWritePaths: keepExisting([process.env.TMPDIR, canonicalManagedSessionDir])');
+    expect(src).toContain('extraWritePaths: keepExisting([sessionScratchDir, canonicalManagedSessionDir])');
   });
 
   it('SYMLINKED-HOME regression (codex #605 P1): worker-assembly under /home/u → /data00/home/u keeps Claude/Codex dropped, Seed/Relay bytedcli kept', () => {
