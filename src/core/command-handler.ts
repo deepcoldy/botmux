@@ -12,6 +12,7 @@ import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effec
 import { triggerUserAuthApplies } from '../services/trigger-user-auth.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
+import { hasLarkToolBinding } from './lark-tool-binding.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from '../global-config.js';
 import { closeResidualIsLocal, describeCloseResidual, parseCloseResidual } from './close-residual.js';
@@ -3623,10 +3624,21 @@ export async function handleCommand(
         // 这个 open_id，同 bot 里第二个人 /login 会覆盖第一个人，之后所有人的操作
         // 都在用最后授权那个人的权限。回调仍会用 user_info 复核真实授权人。
         const loginOpenId = message.senderId;
+        // Only sessions created with the new entry use the receiving app here.
+        // Existing sessions keep the original login flow below.
+        if (ds && hasLarkToolBinding(config.session.dataDir, ds.session.sessionId)
+          && (subCmd === '' || subCmd === 'lark')) {
+          const { authUrl } = generateAuthUrl(botCfg2.larkAppId, botCfg2.larkAppSecret,
+            normalizeBrand(botCfg2.brand), [], loginOpenId);
+          await sessionReply(rootId, loginPromptLines(authUrl, loc).join('\n'));
+          break;
+        }
         if (subCmd === 'status' || subCmd === '状态') {
           // Per-person status lines, only for governed tools.
           const lines: string[] = [];
-          if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
+          if (ds && hasLarkToolBinding(config.session.dataDir, ds.session.sessionId)) {
+            lines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
+          } else if (loginOpenId && triggerUserAuthApplies(botCfg2.triggerUserAuth, 'lark-cli')) {
             lines.push(t(hasLarkCliHome(loginOpenId) ? 'cmd.login.lark_status_yes' : 'cmd.login.lark_status_no', undefined, loc));
           }
           // ByteCloud 是另一个身份提供方，飞书授权了不代表这边也授权了。
@@ -3654,8 +3666,11 @@ export async function handleCommand(
         // matching side suppressing the other.
         if (subCmd === 'done' || subCmd === '完成') {
           const doneLines: string[] = [];
-          const larkPending = pendingLarkCliChallenge(loginOpenId);
-          if (larkPending) {
+          const boundLark = !!ds && hasLarkToolBinding(config.session.dataDir, ds.session.sessionId);
+          const larkPending = boundLark ? null : pendingLarkCliChallenge(loginOpenId);
+          if (boundLark) {
+            doneLines.push(getTokenStatus(botCfg2.larkAppId, normalizeBrand(botCfg2.brand), loginOpenId));
+          } else if (larkPending) {
             const { state, detail } = await completeLarkCliLogin(loginOpenId);
             doneLines.push(state === 'authorized'
               ? t('cmd.login.lark_ok', undefined, loc)

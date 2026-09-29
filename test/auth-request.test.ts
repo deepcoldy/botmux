@@ -12,6 +12,7 @@ import {
 } from '../src/core/managed-origin-capability.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
+import { prepareLarkToolEnv } from '../src/core/lark-tool-binding.js';
 
 describe('auth request arguments', () => {
   it('accepts default authorization and preserves requested scope names', () => {
@@ -123,6 +124,19 @@ describe('auth request CLI', () => {
       sessionId: 'session', channelId, capability, turnId, dispatchAttempt: 3,
     }));
   }
+
+  it('uses the new session application binding without a Linux process or origin claim', async () => {
+    delete env.BOTMUX_ORIGIN_CHANNEL_ID;
+    const binding = prepareLarkToolEnv({ env, dataDir, sessionId: 'session', appId: 'cli_auth' });
+    const result = await run(['request', '--scope', 'sheets:spreadsheet:read']);
+    expect(result.code, result.stderr).toBe(0);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      url: '/api/sessions/session/auth-request', body: { scopes: ['sheets:spreadsheet:read'] },
+      headers: { 'x-botmux-lark-session': binding.accessKey },
+    });
+    expect(requests[0].body).not.toHaveProperty('originCapability');
+  });
 
   it.each(['host', 'relay'])('requests authorization as the current turn over %s transport', async transport => {
     if (transport === 'host') writeFileSync(join(root, '.botmux', '.dashboard-secret'), 'test-ipc-secret', { mode: 0o600 });

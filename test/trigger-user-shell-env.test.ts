@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import ts from 'typescript';
+import { larkToolBindingPath } from '../src/core/lark-tool-binding.js';
 import { describe, expect, it } from 'vitest';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createTraexAdapter } from '../src/adapters/cli/traex.js';
@@ -25,13 +26,13 @@ const assembly = ts.transpileModule(worker.slice(start, end), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText;
 const assemble = new Function('cfg', 'process', 'sessionIdentityBinDir', 'join', 'GIT_ASKPASS_BASENAME',
-  'effectiveAdapterSessionId', `${assembly}\nreturn identityShellEnv;`);
+  'effectiveAdapterSessionId', 'boundLark', 'larkToolBindingPath', 'identityDataDir', `${assembly}\nreturn identityShellEnv;`);
 
-function workerShellEnv(sessionDataDir: string | undefined, enabled = true, tools = ['bytedcli']): Record<string, string> {
+function workerShellEnv(sessionDataDir: string | undefined, enabled = true, tools = ['bytedcli'], boundLark = false): Record<string, string> {
   return assemble(
     { sessionId: 'botmux-session', chatId: 'oc_chat', larkAppId: 'cli_app', triggerUserAuth: { enabled, tools } },
-    { env: sessionDataDir === undefined ? {} : { SESSION_DATA_DIR: sessionDataDir } },
-    sessionIdentityBinDir, join, GIT_ASKPASS_BASENAME, 'native-session',
+    { env: sessionDataDir === undefined ? {} : { SESSION_DATA_DIR: sessionDataDir, BOTMUX_DAEMON_IPC_PORT: '12345' } },
+    sessionIdentityBinDir, join, GIT_ASKPASS_BASENAME, 'native-session', boundLark, larkToolBindingPath, sessionDataDir,
   );
 }
 
@@ -65,6 +66,20 @@ describe('worker trigger-user shell contract', () => {
     expect(workerShellEnv(undefined)).toEqual(routingEnv);
   });
 
+  it.each([false, true])('forwards a bound lark entry with trigger-user auth enabled=%s', (enabled) => {
+    const dataDir = '/tmp/data "quoted"';
+    const bin = sessionIdentityBinDir(dataDir, 'botmux-session');
+    expect(workerShellEnv(dataDir, enabled, ['lark-cli'], true)).toEqual({
+      ...routingEnv,
+      SESSION_DATA_DIR: dataDir,
+      BOTMUX_IDENTITY_BIN: bin,
+      ZDOTDIR: join(bin, 'shell'),
+      BASH_ENV: join(bin, 'shell', 'bash_env.sh'),
+      BOTMUX_LARK_TOOL_BINDING: larkToolBindingPath(dataDir, 'botmux-session'),
+      BOTMUX_DAEMON_IPC_PORT: '12345',
+    });
+  });
+
   it('does not request git askpass for lark-only authentication', () => {
     expect(workerShellEnv('/tmp/data', true, ['lark-cli'])).not.toHaveProperty('GIT_ASKPASS');
   });
@@ -82,6 +97,15 @@ describe.each([
     expect(args.filter(arg => arg.startsWith('shell_environment_policy.set.BOTMUX_SESSION_ID='))).toHaveLength(1);
     expect(shellOverrides(args)).toMatchObject(routingEnv);
     expect(shellOverrides(args)).not.toHaveProperty('UNSET');
+  });
+
+  it('forwards the bound lark entry to shell commands without legacy authentication', () => {
+    const shellEnv = workerShellEnv('/tmp/bound-lark', false, [], true);
+    const args = createAdapter('/bin/cli').buildArgs({
+      sessionId: 'native-session', shellSubprocessEnv: shellEnv,
+    });
+    expect(shellOverrides(args)).toEqual(shellEnv);
+    expect(args.filter(arg => arg.startsWith('shell_environment_policy.set.BOTMUX_LARK_TOOL_BINDING='))).toHaveLength(1);
   });
 
   it.each([false, true])('runs the real wrapper without inherited identity variables, resume=%s', (resume) => {

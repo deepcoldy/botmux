@@ -448,6 +448,7 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // every governed call silently resolves the real tool and runs as the machine
   // account.
   'BOTMUX_IDENTITY_BIN',
+  'BOTMUX_LARK_TOOL_BINDING',
   'ZDOTDIR',
   'BASH_ENV',
   // Git attribution for the acting person. Same reason: askpass and the
@@ -573,6 +574,7 @@ export function isCliIdentityPath(value: string | undefined): boolean {
 }
 
 export function scrubCliIdentityEnv(env: NodeJS.ProcessEnv): void {
+  delete env.BOTMUX_LARK_TOOL_BINDING;
   const bin = env.BOTMUX_IDENTITY_BIN?.replace(/[\\/]+$/, '');
   const managed = (value: string | undefined): boolean => !!value && (
     isCliIdentityPath(value) || !!bin && (value === bin || value.startsWith(`${bin}/`) || value.startsWith(`${bin}\\`))

@@ -685,6 +685,9 @@ export function prepareDirectSandbox(opts: {
   home: string;
   cliBin: string;
   cliArgs: string[];
+  /** Final per-bot PATH; the session identity wrapper must precede real tools. */
+  effectivePath?: string;
+  identityBin?: string;
   /** Absolute Botmux command paths already persisted in CLI MCP configs.
    * Bind the worker-generated relay shim at those exact paths so a stale or
    * tampered host wrapper cannot replace the trusted gateway entry. */
@@ -851,7 +854,8 @@ export function prepareDirectSandbox(opts: {
   // root — so the trusted `botmux` shim's bare `node` would fail `not found`
   // and the MCP gateway would exit (Connection closed). Prepend the canonical
   // dirs of node + the CLI bin (deduped) so bare-name resolution always hits a
-  // bound path, THEN keep the host PATH as a lexical fallback.
+  // bound path. Keep the session identity entry ahead of those dirs and resolve
+  // the effective per-bot PATH in the same namespace as the mounted paths.
   const canonicalExecDirs: string[] = [];
   const pushExecDir = (p: string | undefined) => {
     if (!p) return;
@@ -869,7 +873,11 @@ export function prepareDirectSandbox(opts: {
     // locate the owning session store or its per-bot schedule directory.
     SESSION_DATA_DIR: dataDir,
     BOTMUX_SEND_RELAY: outbox,
-    PATH: ['/run/sbxbin', ...canonicalExecDirs, process.env.PATH ?? ''].filter(Boolean).join(':'),
+    PATH: [...new Set([
+      '/run/sbxbin', opts.identityBin ? canonical(opts.identityBin) : '',
+      ...canonicalExecDirs,
+      ...(opts.effectivePath ?? process.env.PATH ?? '').split(':').filter(Boolean).map(canonical),
+    ].filter(Boolean))].join(':'),
   };
   if (process.env.BOTMUX_DAEMON_IPC_PORT) {
     env.BOTMUX_DAEMON_IPC_PORT = process.env.BOTMUX_DAEMON_IPC_PORT;

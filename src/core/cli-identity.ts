@@ -35,6 +35,7 @@
 import { accessSync, constants, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { clearLarkToolDelegations } from './lark-tool-delegation.js';
 import { isCliIdentityPath } from '../utils/child-env.js';
 import type { TriggerUserAuthConfig, TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 
@@ -337,6 +338,7 @@ export function clearSessionIdentity(
 
 /** Drop every identity for a session (teardown). */
 export function clearAllSessionIdentities(sessionDataDir: string, sessionId: string): void {
+  clearLarkToolDelegations(sessionDataDir, sessionId);
   for (const tool of Object.keys(IDENTITY_ENV_KEYS) as TriggerUserAuthTool[]) {
     clearSessionIdentity(sessionDataDir, sessionId, tool);
   }
@@ -748,7 +750,7 @@ export function prepareTriggerUserCliEnv(
   childEnv: NodeJS.ProcessEnv, sessionDataDir: string | undefined, sessionId: string,
   policy: TriggerUserAuthConfig | undefined, log: (message: string) => void,
 ): void {
-  if (!policy?.enabled || !sessionDataDir) return;
+  if (!policy?.enabled || !policy.tools.length || !sessionDataDir) return;
   childEnv.SESSION_DATA_DIR = sessionDataDir;
   childEnv.BOTMUX_SESSION_ID = sessionId;
   const wrapperDir = sessionIdentityBinDir(sessionDataDir, sessionId);

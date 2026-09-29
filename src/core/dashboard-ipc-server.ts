@@ -314,7 +314,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotClient, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
 import { tokenStoreProtection, triggerUserAuthApplies, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
@@ -323,6 +323,9 @@ import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { getIdentity, resolveVerifiedUserIdentity } from '../im/lark/identity-cache.js';
 import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { refreshSessionIdentity } from './cli-identity.js';
+import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js';
+import { resolveUserToken } from '../utils/user-token.js';
+import { getLarkToolDelegation } from './lark-tool-delegation.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
   normalizeSparseReplyStyleConfig,
@@ -817,6 +820,7 @@ function routeIsCoreOnlyPublic(method: string, pathname: string): boolean {
 }
 
 function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean {
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/lark-tool-identity$/.test(pathname)) return true;
   // The receiver action endpoint performs its own rotating worker-capability
   // verification and then enters the durable action ledger. Keeping this one
   // aperture is what preserves managed meeting actions from inside bwrap.
@@ -2157,6 +2161,81 @@ ipcRoute('GET', '/api/sessions/:sessionId/preview', (req, res, params) => {
   return jsonRes(res, 200, { ok: true, preview });
 });
 
+/** Session-local access key, installed with the tool entry at standard launch.
+ * This selects the configured app; it is not a process/turn attestation API. */
+function boundLarkToolRequest(req: IncomingMessage, sessionId: string, appId?: string): boolean {
+  try {
+    const binding = readLarkToolBinding(larkToolBindingPath(config.session.dataDir, sessionId));
+    return binding.appId === appId && binding.sessionId === sessionId
+      && req.headers['x-botmux-lark-session'] === binding.accessKey;
+  } catch { return false; }
+}
+
+ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res, params) => {
+  let body: Record<string, unknown>;
+  try { body = await readBoundedJsonBody(req, 4096, 1000); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'invalid_lark_tool_request' }); }
+  const ds = findActiveBySessionId(params.sessionId);
+  if (!ds || ds.session.status !== 'active' || sessionTransportDisabled(ds)
+    || !boundLarkToolRequest(req, params.sessionId, ds.larkAppId)) {
+    return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' });
+  }
+  if (!body || Object.keys(body).some(key => key !== 'mode') || !['bot', 'user'].includes(String(body.mode))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_lark_tool_request' });
+  }
+  res.setHeader('cache-control', 'no-store');
+  const bot = getBot(ds.larkAppId).config;
+  if (body.mode === 'bot') {
+    let token: unknown;
+    try {
+      // The app-bound SDK caches TATs and refreshes them before expiry. Resolve
+      // on every invocation, rather than freezing a token for the session.
+      token = await getBotClient(bot.larkAppId).tokenManager.getTenantAccessToken();
+    } catch {
+      return jsonRes(res, 502, { ok: false, error: 'lark_tool_bot_token_unavailable' });
+    }
+    if (typeof token !== 'string' || !token) {
+      return jsonRes(res, 502, { ok: false, error: 'lark_tool_bot_token_unavailable' });
+    }
+    if (findActiveBySessionId(params.sessionId) !== ds || ds.session.status !== 'active'
+      || sessionTransportDisabled(ds) || ds.larkAppId !== bot.larkAppId
+      || !boundLarkToolRequest(req, params.sessionId, bot.larkAppId)) {
+      return jsonRes(res, 403, { ok: false, error: 'lark_tool_session_unavailable' });
+    }
+    return jsonRes(res, 200, {
+      ok: true, appId: bot.larkAppId, mode: 'bot', credentialType: 'tenant_access_token', credential: token,
+    });
+  }
+  const origin = ds.managedTurnOrigin;
+  const originSender = origin?.callerOpenId;
+  const turnId = origin?.turnId;
+  if (!turnId) return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
+  const delegated = getLarkToolDelegation(config.session.dataDir, params.sessionId, turnId);
+  const delegatedError = (reason: string) => `Delegated lark-cli execution refused: ${reason}. Report with botmux report --dispatch-root ${delegated!.dispatchRoot}; do not ask a bot to log in.`;
+  if (delegated && (delegated.denialReason || !delegated.targetOpenId || !delegated.tools.includes('lark-cli')
+    || !triggerUserAuthApplies(bot.triggerUserAuth, 'lark-cli'))) {
+    return jsonRes(res, 403, { ok: false, error: delegatedError(delegated.denialReason ?? 'target user/tool access unavailable') });
+  }
+  const sender = delegated?.targetOpenId ?? originSender;
+  if (!sender) return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
+  const cached = delegated ? undefined : getIdentity(ds.larkAppId, sender);
+  const user = delegated ? { type: 'user' as const, openId: sender }
+    : cached?.type === 'user' && ['sender', 'message_api', 'contact_api'].includes(cached.source)
+      ? cached : await resolveVerifiedUserIdentity(ds.larkAppId, sender);
+  if (!user || user.type !== 'user' || user.openId !== sender) {
+    return jsonRes(res, 403, { ok: false, error: 'The current requesting user could not be verified' });
+  }
+  const token = await resolveUserToken(bot.larkAppId, bot.larkAppSecret, normalizeBrand(bot.brand), sender);
+  if (ds.managedTurnOrigin?.turnId !== turnId || ds.managedTurnOrigin?.callerOpenId !== originSender
+    || delegated && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, turnId)) !== JSON.stringify(delegated)) {
+    return jsonRes(res, 409, { ok: false, error: 'The current requesting user changed; retry the command' });
+  }
+  if (!token) return jsonRes(res, 403, { ok: false, error: delegated
+    ? delegatedError(`the original user's authorization for ${bot.larkAppId} is missing`)
+    : `Application ${bot.larkAppId} needs this user's authorization. Run botmux auth request --scope "<required scopes>" --json, or send /login in this conversation, then retry with --as user.` });
+  return jsonRes(res, 200, { ok: true, appId: bot.larkAppId, mode: 'user', credentialType: 'user_access_token', credential: token });
+});
+
 const sessionAuthRequests = new Map<string, {
   sessionId: string;
   isCurrent: () => boolean;
@@ -2174,7 +2253,8 @@ for (const action of ['auth-request', 'auth-status']) {
       return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
     }
     const ds = findActiveBySessionId(params.sessionId);
-    const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+    const boundTool = boundLarkToolRequest(req, params.sessionId, ds?.larkAppId);
+    const auth = boundTool ? { ok: true as const } : sessionCliIpcAuth(req, ds, params.sessionId, body);
     if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
     if (['callerOpenId', 'openId', 'larkAppId', 'chatId'].some(key => key in body)) {
       return jsonRes(res, 400, { ok: false, error: 'invalid_auth_request' });
@@ -2199,7 +2279,7 @@ for (const action of ['auth-request', 'auth-status']) {
         || body.originDispatchAttempt !== origin.dispatchAttempt) {
         return jsonRes(res, 403, { ok: false, error: 'current_actor_unverified' });
       }
-    } else {
+    } else if (!boundTool) {
       const peer = resolveLoopbackPeerProcesses({
         remoteAddress: req.socket.remoteAddress,
         remotePort: req.socket.remotePort,
@@ -2223,7 +2303,7 @@ for (const action of ['auth-request', 'auth-status']) {
       && ds.managedTurnOrigin?.turnId === turnId && ds.managedTurnOrigin?.capability === capability
       && ds.managedTurnOrigin?.dispatchAttempt === attempt;
     const cfg = getBot(ds.larkAppId).config;
-    if (!triggerUserAuthApplies(cfg.triggerUserAuth, 'lark-cli')) {
+    if (!boundTool && !triggerUserAuthApplies(cfg.triggerUserAuth, 'lark-cli')) {
       return jsonRes(res, 409, { ok: false, error: 'lark_user_auth_disabled' });
     }
 
@@ -2240,7 +2320,7 @@ for (const action of ['auth-request', 'auth-status']) {
       if (result.status === 'failed') {
         return jsonRes(res, 400, { ok: false, status: 'failed', error: result.error });
       }
-      if (!refreshSessionIdentity(config.session.dataDir, params.sessionId, {
+      if (!boundTool && !refreshSessionIdentity(config.session.dataDir, params.sessionId, {
         tool: 'lark-cli', appId: cfg.larkAppId, userAccessToken: result.token, turnId,
       })) {
         return jsonRes(res, 409, { ok: false, error: 'auth_turn_changed' });
