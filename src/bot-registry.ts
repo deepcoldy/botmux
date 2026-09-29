@@ -3752,6 +3752,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 显式 send / transcript 都保留；缺省按 defaultReplyDeliveryFor 解析。
       replyDelivery: entry.replyDelivery === 'transcript' || entry.replyDelivery === 'send' ? entry.replyDelivery : undefined,
       promptInjection: entry.promptInjection === 'none' ? 'none' : undefined,
+      // Only the non-default hook mode is persisted; absent, 'off', and invalid
+      // values all retain the historical inline behavior.
+      envelopeInjection: entry.envelopeInjection === 'auto' ? 'auto' : undefined,
       codexBrowser,
       codexRpcInput: entry.codexRpcInput === true,
       existingAppServer,

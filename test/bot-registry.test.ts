@@ -1409,6 +1409,28 @@ describe('parseBotConfigsFromText — replyStyle', () => {
   });
 });
 
+describe('parseBotConfigsFromText — envelopeInjection cold read', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('preserves auto and treats unset, off, and invalid values as the default', () => {
+    const [auto, unset, off, invalid] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'auto', larkAppSecret: 's', envelopeInjection: 'auto' },
+      { larkAppId: 'unset', larkAppSecret: 's' },
+      { larkAppId: 'off', larkAppSecret: 's', envelopeInjection: 'off' },
+      { larkAppId: 'invalid', larkAppSecret: 's', envelopeInjection: 'sideways' },
+    ]));
+
+    expect(auto.envelopeInjection).toBe('auto');
+    expect(unset.envelopeInjection).toBeUndefined();
+    expect(off.envelopeInjection).toBeUndefined();
+    expect(invalid.envelopeInjection).toBeUndefined();
+  });
+});
+
 // ─── parseBotConfigsFromText — apiOnly (core-only / headless) ──────────────
 
 describe('parseBotConfigsFromText — apiOnly', () => {
@@ -2047,6 +2069,18 @@ describe('loadBotConfigs', () => {
     expect(configs[0].larkAppId).toBe('env_app');
     expect(configs[0].larkAppSecret).toBe('env_secret');
     expect(configs[0].cliId).toBe('claude-code'); // default
+  });
+
+  it('cold-reads envelopeInjection for the indexed daemon slot', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([{
+      larkAppId: 'daemon_app',
+      larkAppSecret: 'secret',
+      envelopeInjection: 'auto',
+    }]));
+
+    expect(mod.loadBotConfigAtIndex(0).envelopeInjection).toBe('auto');
   });
 
   it('does not register activation-pending bots before their critical scopes are ready', () => {
