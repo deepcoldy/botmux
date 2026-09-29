@@ -413,11 +413,21 @@ describe('Frozen Commands definition and positional UX', () => {
     });
   });
 
-  it('only permits model fallback for explicitly transient failures', () => {
+  it('never falls back Data MCP frozen queries to a model', () => {
     const { definition } = fixture(BASE);
+    const transientError = new FrozenCommandError(
+      'data_mcp_unavailable',
+      'down',
+      undefined,
+      true,
+    );
     expect(shouldFallbackFrozenCommand(
       definition,
-      new FrozenCommandError('data_mcp_unavailable', 'down', undefined, true),
+      transientError,
+    )).toBe(false);
+    expect(shouldFallbackFrozenCommand(
+      { ...definition, executor: 'custom.readonly' },
+      transientError,
     )).toBe(true);
     expect(shouldFallbackFrozenCommand(
       definition,

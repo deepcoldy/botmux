@@ -1710,7 +1710,11 @@ export function shouldFallbackFrozenCommand(
   definition: FrozenCommandDefinition,
   error: unknown,
 ): boolean {
-  return definition.onError === 'fallback_llm'
+  // Data MCP owns the frozen SQL and intentionally never returns it to the
+  // host. Falling back to a model here would regenerate a different query,
+  // violating the command's deterministic execution contract.
+  return definition.executor !== BUILTIN_DATA_MCP_EXECUTOR_ID
+    && definition.onError === 'fallback_llm'
     && error instanceof FrozenCommandError
     && error.fallbackAllowed;
 }

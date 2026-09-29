@@ -19,7 +19,7 @@
 
 ## 管理员执行器白名单
 
-Data MCP 查询使用宿主内建的 `builtin.data-mcp.readonly`，不需要登记外部执行器。BotMux 只校验通用参数并把已批准的 `input` 作为不透明载荷交给 Data MCP 插件；SQL 参数编码、同字节校验与执行都在插件内完成。插件必须提供 `execute_frozen_query` 能力，旧版插件会明确报错并停止，不会回退到宿主旧 SQL 路径。要固化 `lark-cli` 或自有脚本，管理员必须先创建 `~/.botmux/command-executors.yaml`。文件不存在时注册表为空，所有 process/script 类固化命令默认不可用。
+Data MCP 查询使用宿主内建的 `builtin.data-mcp.readonly`，不需要登记外部执行器。BotMux 只校验通用参数并把已批准的 `input` 作为不透明载荷交给 Data MCP 插件；SQL 参数编码、同字节校验与执行都在插件内完成。插件必须提供 `execute_frozen_query` 能力，旧版插件会明确报错并停止，不会回退到宿主旧 SQL 路径。Data MCP 执行器发生错误时也会直接报错；即使定义写了 `onError: fallback_llm`，也不会交给大模型重新生成查询，以保持冻结 SQL 的确定性。要固化 `lark-cli` 或自有脚本，管理员必须先创建 `~/.botmux/command-executors.yaml`。文件不存在时注册表为空，所有 process/script 类固化命令默认不可用。
 
 Agent 可在当前真人消息轮次调用 `botmux freeze executors` 查看只读参数契约。返回内容只包含 executor id 与参数名、类型、来源和约束，不暴露可执行文件路径、固定参数或脚本制品路径/摘要。候选定义在弹出确认卡前会完整校验该契约；字段、必填项、类型、来源或约束不兼容时直接拒绝。
 
