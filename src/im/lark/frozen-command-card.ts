@@ -284,6 +284,8 @@ export function buildFrozenCommandLifecyclePreviewCard(input: {
   const presentation = lifecyclePresentation(input.transition);
   const currentHash = input.transition.previousSpecHash?.slice(0, 12);
   const nextHash = input.transition.specHash?.slice(0, 12);
+  const stepLines = input.transition.steps?.map(step =>
+    `- **${escapeMd(step.id)}**：${escapeMd(step.executor)} → ${escapeMd(step.renderer)}；模型交接：${step.allowHandoff ? '允许' : '不允许'}`) ?? [];
   return card({
     header: {
       title: { tag: 'plain_text', content: presentation.title },
@@ -306,6 +308,7 @@ export function buildFrozenCommandLifecyclePreviewCard(input: {
             ...(currentHash && nextHash && currentHash !== nextHash
               ? [`定义变更：\`${currentHash}\` → \`${nextHash}\``]
               : nextHash ? [`定义 hash：\`${nextHash}\``] : []),
+            ...(stepLines.length > 0 ? [`步骤：\n${stepLines.join('\n')}`] : []),
             `模型交接：${input.transition.handoffConfigured ? '**已配置，结果或执行失败命中规则时会交给模型**' : '未配置'}`,
             `有效期至：${escapeMd(input.transition.expiresAt)}`,
             '',

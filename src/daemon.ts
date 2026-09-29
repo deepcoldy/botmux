@@ -6638,7 +6638,7 @@ async function executeClaimedFrozenCommandAction(action: FrozenCommandActionReco
       || lifecycle.record.stateRevisionId !== action.revisionId
       || lifecycle.record.specHash !== action.specHash
       || lifecycle.record.executorRevision !== action.executorRevision
-      || lookup.snapshot.definition.steps[0]?.executor !== action.executorId) {
+      || lookup.snapshot.definition.steps.map(step => step.executor).join(',') !== action.executorId) {
       throw new FrozenCommandError('command_revision_changed', '命令版本已变化，请重新发起');
     }
     const normalized = normalizeFrozenCommandArguments({
@@ -7762,7 +7762,7 @@ function frozenCommandCenterRows(
       command: row.command,
       usage: frozenCommandUsage(definition),
       description: definition.description,
-      executor: definition.steps[0]!.executor,
+      executor: definition.steps.map(step => step.executor).join('、'),
       state: gate.kind === 'active' ? 'active' : 'unapproved',
       ...(gate.kind === 'legacy' ? { reason: '尚未完成当前机器人批准，暂不可运行' } : {}),
     }];

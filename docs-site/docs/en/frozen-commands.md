@@ -21,7 +21,7 @@ executors:
     kind: plugin-tool
     plugin: data-mcp
     tool: execute_frozen_query
-    minimumVersion: 0.4.0
+    minimumVersion: 0.4.1
     arguments:
       sql:
         type: string
@@ -61,11 +61,11 @@ Executor kinds are `process`, `script`, and `plugin-tool`. `arguments.*.accepts`
 
 Optional fields are `labels` / `labelsFrom`, `totalRowsField`, `auditFields`, `errorField`, and `maxContentBytes`. Undeclared fields cannot be displayed or referenced. A plugin-tool string accepted only from `literal` may be up to 200000 characters; dynamic and process/script arguments remain capped at 10000.
 
-Data MCP 0.4.0 `execute_frozen_query` returns only `rows`, `columns`, `row_count`, `query_id`, and `error_code`. Parameter encoding, byte-identical validate/run, and `_meta` identity remain plugin responsibilities; the host does not interpret SQL. The service also enforces `MAX_SQL_BYTES` on rendered SQL (20000 UTF-8 bytes by default). An oversized query records `sql_too_large` in service audit logs while users receive only a fixed host error.
+Data MCP 0.4.1 `execute_frozen_query` returns only `rows`, `columns`, `row_count`, `query_id`, and `error_code`. Parameter encoding, byte-identical validate/run, and `_meta` identity remain plugin responsibilities; the host does not interpret SQL. The service also enforces `MAX_SQL_BYTES` on rendered SQL (20000 UTF-8 bytes by default). An oversized query records `sql_too_large` in service audit logs while users receive only a fixed host error.
 
 ## Command definition
 
-Batch one accepts exactly one step, but already uses the final `steps[]` syntax and step-qualified namespaces:
+Each command contains 1–8 independent steps and uses step-qualified namespaces:
 
 ```yaml
 schemaVersion: 2
@@ -97,9 +97,9 @@ output:
     - show: result
 ```
 
-Every step requires `id`, `executor`, `input`, and `renderer`. Data executors use `builtin.table` or a registered script renderer. Executors with `content` must use `builtin.content`. `required` defaults to false and becomes relevant when multi-step execution is enabled.
+Every step requires `id`, `executor`, `input`, and `renderer`. Data executors use `builtin.table` or a registered script renderer. Executors with `content` must use `builtin.content`. Steps run concurrently without feeding data to one another, under both their own executor/renderer timeout and a command-wide deadline. `required` defaults to false: an optional failure renders a fixed message in place while other steps remain visible; a required-step failure or any gate failure fails the whole command.
 
-`output` permits only `format: markdown|text` (markdown by default) and ordered `rules`. Each rule has exactly one action: `handoff` or `show`. Variables are `q.<step-id>.*`, `run.status`, `run.<step-id>.*`, and `cmd.*`. With no matching rule, the renderer result is shown. Handoffs require executor `allowHandoff`; the host prepends immutable command context and exposes only fixed error codes and messages.
+`output` permits only `format: markdown|text` (markdown by default) and ordered `rules`. Each rule has exactly one action: `handoff` or `show`. Variables are `q.<step-id>.*`, `run.status`, `run.<step-id>.*`, and `cmd.*`; any failed step makes aggregate `run.status` equal `error`. With no matching rule, the renderer result is shown. A handoff carries data only from steps whose executors set `allowHandoff: true`; the host prepends immutable command context and exposes only fixed error codes and messages. Scheduling requires every step to be `schedulable`.
 
 Legacy fields are rejected with no compatibility parser: top-level `executor` / `input`, `output.text`, `prefix` / `suffix`, `else`, `onError`, `format: table|auto`, and registry `risk`, `format: json`, `contractVersion`, or `aliases`.
 
@@ -119,4 +119,35 @@ For every source, the host removes mentions, replaces the opening angle bracket 
 
 ## Scheduling and release
 
-A verified human creates a task with `/schedule <rule> /<command> [args]`. Creation and execution re-check approval, revision, creator identity, and `schedulable`. Production rollout still requires QA, development, and operations online, plus technical monitoring, core-function verification, and product/business acceptance. Production configuration changes require mandatory approval.
+A verified human creates a task with `/schedule <rule> /<command> [args]`. Creation and execution re-check approval, revision, creator identity, and every step's `schedulable` policy. Revision, specHash, and the confirmation card cover every step's executor and renderer; the card lists each dependency and its handoff permission. Every step writes its own execution audit under one shared execution ID. Production rollout still requires QA, development, and operations online, plus technical monitoring, core-function verification, and product/business acceptance. Production configuration changes require mandatory approval.
+
+## Complete example: three-step morning report
+
+```yaml
+schemaVersion: 2
+name: morning_report
+description: Registration trend + amount Top 10 + today's calendar
+params:
+  - { name: days, label: Days, type: integer, min: 1, max: 90, default: 7 }
+steps:
+  - id: reg
+    executor: data.query.readonly
+    input: { sql: "SELECT dt, count() AS registrations … {{days}} …" }
+    renderer: risk.trend-chart
+  - id: top
+    executor: data.query.readonly
+    input: { sql: "SELECT merchant, amount … ORDER BY amount DESC LIMIT 10" }
+    renderer: builtin.table
+  - id: cal
+    executor: lark.calendar-agenda
+    input: { date: "{{today}}" }
+    renderer: builtin.table
+output:
+  format: markdown
+  rules:
+    - when: "{{q.reg.row_count}} == 0"
+      show: { text: "No data in the last {{cmd.args.days}} days" }
+    - show: result
+```
+
+The steps are parallel rather than chained, and their output is assembled in definition order. Run it with `/morning_report 7`; schedule it with `/schedule every day at 9am /morning_report 7`.

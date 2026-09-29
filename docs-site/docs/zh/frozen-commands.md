@@ -21,7 +21,7 @@ executors:
     kind: plugin-tool
     plugin: data-mcp
     tool: execute_frozen_query
-    minimumVersion: 0.4.0
+    minimumVersion: 0.4.1
     arguments:
       sql:
         type: string
@@ -61,11 +61,11 @@ renderers:
 
 可选字段还有 `labels` / `labelsFrom`、`totalRowsField`、`auditFields`、`errorField`、`maxContentBytes`。未登记字段不会展示，也不能被规则引用。plugin-tool 的纯 literal 字符串最长 200000；动态参数和 process/script 仍最多 10000。
 
-Data MCP 插件 0.4.0 的 `execute_frozen_query` 只返回 `rows`、`columns`、`row_count`、`query_id`、`error_code`；参数编码、同字节 validate/run 和 `_meta` 身份仍由插件保证。宿主不理解 SQL。服务端还会按 `MAX_SQL_BYTES` 校验参数替换后的最终 SQL（默认 20000 个 UTF-8 字节），超限在审计日志中记录 `sql_too_large`，固化命令对用户只显示固定错误。
+Data MCP 插件 0.4.1 的 `execute_frozen_query` 只返回 `rows`、`columns`、`row_count`、`query_id`、`error_code`；参数编码、同字节 validate/run 和 `_meta` 身份仍由插件保证。宿主不理解 SQL。服务端还会按 `MAX_SQL_BYTES` 校验参数替换后的最终 SQL（默认 20000 个 UTF-8 字节），超限在审计日志中记录 `sql_too_large`，固化命令对用户只显示固定错误。
 
 ## 命令定义
 
-第一阶段只允许一个 step，但语法已经使用最终的 `steps[]` 和带步骤 id 的命名空间：
+每条命令必须包含 1–8 个相互独立的 step，并使用带步骤 id 的命名空间：
 
 ```yaml
 schemaVersion: 2
@@ -97,14 +97,14 @@ output:
     - show: result
 ```
 
-`steps[].id`、`executor`、`input`、`renderer` 都必填。数据 executor 使用 `builtin.table` 或登记的脚本 renderer；带 `content` 的 executor 只能使用 `builtin.content`。`required` 默认 false，在多步版本中生效。
+`steps[].id`、`executor`、`input`、`renderer` 都必填。数据 executor 使用 `builtin.table` 或登记的脚本 renderer；带 `content` 的 executor 只能使用 `builtin.content`。各步并行执行、互不传递数据，并同时受自己的 executor/renderer 超时与整条命令的总超时约束。`required` 默认 false：可选步骤失败时在原位置显示固定提示，其余步骤继续展示；必需步骤或任一闸门失败会让整条命令失败。
 
 `output` 只允许：
 
 - `format: markdown | text`；省略时默认为 markdown；
 - `rules`：按顺序匹配，第一条命中即停止。每条规则必须且只能有 `handoff` 或 `show`。
 
-规则变量为 `q.<步骤 id>.*`、`run.status`、`run.<步骤 id>.*` 和 `cmd.*`。没有规则或全部未命中时展示 renderer 的结果。`show: result` 展示结果；`show: {text: ...}` 展示安全插值后的文字。handoff 受相关 executor 的 `allowHandoff` 约束，宿主固定注入命令上下文，错误只提供固定错误码与文案。
+规则变量为 `q.<步骤 id>.*`、`run.status`、`run.<步骤 id>.*` 和 `cmd.*`。只要任一步失败，`run.status` 就是 `error`；每一步的状态和固定错误信息位于 `run.<步骤 id>.*`。没有规则或全部未命中时展示 renderer 的结果。`show: result` 展示结果；`show: {text: ...}` 展示安全插值后的文字。handoff 只携带 `allowHandoff: true` 的步骤数据，宿主固定注入命令上下文，错误只提供固定错误码与文案；定时能力则要求所有步骤都允许 `schedulable`。
 
 旧字段不兼容并会直接拒绝，包括顶层 `executor` / `input`、`output.text`、`prefix` / `suffix`、`else`、`onError`、`format: table|auto`，以及白名单的 `risk`、`format: json`、`contractVersion`、`aliases`。
 
@@ -124,4 +124,35 @@ stdout 必须是 UTF-8 Markdown。renderer 超时、非零退出、提前关闭 
 
 ## 定时与发布
 
-真人使用 `/schedule <规则> /<命令> [参数]` 创建任务。创建和运行时都会复核批准状态、revision、可信创建者身份与 `schedulable`。常规生产部署仍需 QA、研发、运维在线，并完成技术监控、核心功能和产品业务验收；生产配置变更须走强制审批。
+真人使用 `/schedule <规则> /<命令> [参数]` 创建任务。创建和运行时都会复核批准状态、revision、可信创建者身份与所有步骤的 `schedulable`。revision、specHash 和确认卡覆盖全部步骤的 executor 与 renderer；确认卡逐步列出依赖及模型交接权限。每一步单独写执行审计，并关联同一个 execution ID。常规生产部署仍需 QA、研发、运维在线，并完成技术监控、核心功能和产品业务验收；生产配置变更须走强制审批。
+
+## 完整示例：经营早报（三步图文混排）
+
+```yaml
+schemaVersion: 2
+name: 经营早报
+description: 注册趋势 + 金额 Top10 + 今日日程
+params:
+  - { name: days, label: 天数, type: integer, min: 1, max: 90, default: 7 }
+steps:
+  - id: reg
+    executor: data.query.readonly
+    input: { sql: "SELECT dt, count() AS 注册数 … {{days}} …" }
+    renderer: risk.trend-chart
+  - id: top
+    executor: data.query.readonly
+    input: { sql: "SELECT 商户, 金额 … ORDER BY 金额 DESC LIMIT 10" }
+    renderer: builtin.table
+  - id: cal
+    executor: lark.calendar-agenda
+    input: { date: "{{today}}" }
+    renderer: builtin.table
+output:
+  format: markdown
+  rules:
+    - when: "{{q.reg.row_count}} == 0"
+      show: { text: "近 {{cmd.args.days}} 天无数据" }
+    - show: result
+```
+
+三步只并列、不串联，结果按定义顺序拼接。运行使用 `/经营早报 7`；定时使用 `/schedule 每天9点 /经营早报 7`。

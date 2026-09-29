@@ -214,7 +214,7 @@ executors:
     }
   });
 
-  it('rejects schema v1, multi-step batch-one definitions, and every removed field', () => {
+  it('rejects schema v1, invalid multi-step definitions, and every removed field', () => {
     const variants = [
       BASE.replace('schemaVersion: 2', 'schemaVersion: 1'),
       BASE.replace('steps:\n', 'executor: test.plugin.readonly\nsteps:\n'),
@@ -226,7 +226,8 @@ executors:
       BASE.replace('  format: markdown', '  format: markdown\n  suffix: legacy'),
       BASE.replace('  format: markdown', '  format: markdown\n  else: legacy'),
       `${BASE}\nonError: fail\n`,
-      BASE.replace('output:\n', `steps:\n  - id: second\n    executor: test.plugin.readonly\n    input: {sql: SELECT 1}\n    renderer: builtin.table\noutput:\n`),
+      BASE.replace('\noutput:\n', `\n  - id: main\n    executor: test.plugin.readonly\n    input: {sql: SELECT 1}\n    renderer: builtin.table\noutput:\n`),
+      BASE.replace('\noutput:\n', `\n${Array.from({ length: 8 }, (_, index) => `  - id: extra${index}\n    executor: test.plugin.readonly\n    input: {sql: SELECT ${index}}\n    renderer: builtin.table`).join('\n')}\noutput:\n`),
     ];
     for (const [index, yaml] of variants.entries()) {
       const root = join(tmpdir(), `botmux-frozen-invalid-${process.pid}-${index}-${Math.random().toString(36).slice(2)}`);
@@ -613,7 +614,7 @@ executors:
     expect(result.truncated).toBe(false);
   });
 
-  it('maps plugin error fields to fixed host errors', async () => {
+  it('maps an optional plugin failure to a fixed inline error', async () => {
     const yaml = BASE.replace('SELECT sum(amount) FROM bills', "SELECT 'RETURN_VALIDATION_ERROR'");
     const { root, definition } = fixture(yaml);
     const home = installFixturePlugin(root, 'data-mcp', 'data', '0.1.0');
@@ -626,7 +627,10 @@ executors:
         requestUserOpenId: 'ou_test', requestUserUnionId: 'on_test', requestLarkAppId: 'cli_test', senderType: 'user',
       },
       turnId: 'om_turn', dataDir: join(home, '.botmux', 'data'),
-    })).rejects.toMatchObject({ code: 'plugin_tool_execution_failed', message: '插件工具执行失败。', executionFailure: true });
+    })).resolves.toMatchObject({
+      text: '步骤 main 执行失败：插件工具执行失败。',
+      steps: [{ status: 'error', error: { code: 'plugin_tool_execution_failed', executionFailure: true } }],
+    });
   });
 
   it('fails closed on absent identity and keeps public error text safe', async () => {

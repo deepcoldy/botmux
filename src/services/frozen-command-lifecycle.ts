@@ -22,6 +22,7 @@ import {
   type FrozenCommandSnapshot,
 } from './frozen-command.js';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from './sqlite-compat.js';
+import { resolveCommandExecutor } from './command-executors.js';
 import { logger } from '../utils/logger.js';
 
 export type FrozenCommandLifecycleState = 'active' | 'retired' | 'revoked';
@@ -79,6 +80,7 @@ export interface FrozenCommandPreparedTransition {
   expectedRevisionId?: string;
   /** True when the approved definition may hand a result or execution error to a model. */
   handoffConfigured?: boolean;
+  steps?: Array<{ id: string; executor: string; renderer: string; allowHandoff: boolean }>;
 }
 
 const DB_DIR = 'frozen-commands';
@@ -500,7 +502,7 @@ export function evaluateFrozenCommandLifecycle(input: {
         logger.warn('[frozen-command] third-party executor binary drift detected; execution remains allowed by scheme B', {
           target_bot_id: record.targetBotId,
           command: record.command,
-          executor_id: snapshot.definition.steps[0]!.executor,
+          executor_ids: snapshot.definition.steps.map(step => step.executor),
           approved_binary_digest: record.executorBinaryDigest,
           current_binary_digest: currentBinaryDigest,
         });
@@ -561,6 +563,7 @@ export function prepareFrozenCommandTransition(input: {
   let previousSpecHash: string | undefined;
   let expectedRevisionId: string | undefined;
   let handoffConfigured = false;
+  let preparedSteps: FrozenCommandPreparedTransition['steps'];
   withDb(input.dataDir, db => transaction(db, () => {
     const current = selectRecord(db, input.targetBotId, key.commandPath, key.command);
     const definitionExists = existsSync(key.commandPath);
@@ -592,6 +595,12 @@ export function prepareFrozenCommandTransition(input: {
       preparedExecutorRevision = frozenCommandExecutorRevision(snapshot.definition);
       preparedSpecHash = expectedSpecHash;
       handoffConfigured = snapshot.definition.output.rules.some(rule => rule.handoff);
+      preparedSteps = snapshot.definition.steps.map(step => ({
+        id: step.id,
+        executor: step.executor,
+        renderer: step.renderer,
+        allowHandoff: resolveCommandExecutor(step.executor).policy.allowHandoff,
+      }));
       if (current?.state === 'retired' || current?.state === 'revoked') {
         throw new FrozenCommandError('transition_invalid_state', `/${key.command} 当前为 ${current.state}，必须走 restore 而不是 approve`);
       }
@@ -601,6 +610,12 @@ export function prepareFrozenCommandTransition(input: {
       expectedSpecHash = frozenCommandSpecHash(snapshot);
       preparedExecutorRevision = frozenCommandExecutorRevision(snapshot.definition);
       handoffConfigured = snapshot.definition.output.rules.some(rule => rule.handoff);
+      preparedSteps = snapshot.definition.steps.map(step => ({
+        id: step.id,
+        executor: step.executor,
+        renderer: step.renderer,
+        allowHandoff: resolveCommandExecutor(step.executor).policy.allowHandoff,
+      }));
       if (current?.state === 'active') {
         if (!current.specHash || !current.sourceYaml) {
           throw new FrozenCommandError('lifecycle_store_corrupt', '已批准命令缺少原始定义或 hash');
@@ -629,6 +644,12 @@ export function prepareFrozenCommandTransition(input: {
       preparedSpecHash = current.specHash;
       preparedExecutorRevision = frozenCommandExecutorRevision(snapshot.definition);
       handoffConfigured = snapshot.definition.output.rules.some(rule => rule.handoff);
+      preparedSteps = snapshot.definition.steps.map(step => ({
+        id: step.id,
+        executor: step.executor,
+        renderer: step.renderer,
+        allowHandoff: resolveCommandExecutor(step.executor).policy.allowHandoff,
+      }));
     } else if (input.action === 'revoke' && current?.state !== 'retired') {
       throw new FrozenCommandError('transition_invalid_state', `/${key.command} 必须先 retired 才能彻底撤销`);
     }
@@ -658,6 +679,7 @@ export function prepareFrozenCommandTransition(input: {
     ...(previousSpecHash ? { previousSpecHash } : {}),
     ...(expectedRevisionId ? { expectedRevisionId } : {}),
     ...(handoffConfigured ? { handoffConfigured: true } : {}),
+    ...(preparedSteps ? { steps: preparedSteps } : {}),
   };
 }
 

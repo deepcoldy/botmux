@@ -1041,6 +1041,7 @@ export async function runProcessCommandExecutor(input: {
   botConfig: Pick<BotConfig, 'larkAppId' | 'larkAppSecret'>;
   workingDir?: string;
   executionId?: string;
+  timeoutMs?: number;
 }): Promise<ProcessExecutorResult> {
   verifyCommandExecutorArtifacts(input.executor);
   const argv = buildCommandExecutorArgv(input.executor, input.values);
@@ -1074,7 +1075,7 @@ export async function runProcessCommandExecutor(input: {
       const timer = setTimeout(() => {
         terminalError = new CommandExecutorError('executor_timeout', `执行器 ${input.executor.id} 超时`);
         terminateProcessGroup(child);
-      }, input.executor.policy.timeoutMs);
+      }, Math.min(input.timeoutMs ?? input.executor.policy.timeoutMs, input.executor.policy.timeoutMs));
       timer.unref?.();
       child.stdout?.on('data', (chunk: Buffer | string) => {
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -1148,6 +1149,7 @@ export async function runCommandRenderer(input: {
   renderer: CommandRenderer;
   payload: unknown;
   workingDir?: string;
+  timeoutMs?: number;
 }): Promise<CommandRendererResult> {
   verifyCommandRendererArtifacts(input.renderer);
   const stdin = Buffer.from(JSON.stringify(input.payload), 'utf8');
@@ -1183,7 +1185,7 @@ export async function runCommandRenderer(input: {
       const timer = setTimeout(() => {
         terminalError = new CommandExecutorError('renderer_timeout', `渲染器 ${input.renderer.id} 超时`);
         terminateProcessGroup(child);
-      }, input.renderer.policy.timeoutMs);
+      }, Math.min(input.timeoutMs ?? input.renderer.policy.timeoutMs, input.renderer.policy.timeoutMs));
       timer.unref?.();
       child.stdout?.on('data', (chunk: Buffer | string) => {
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);

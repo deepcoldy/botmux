@@ -201,6 +201,10 @@ describe('Frozen Command business cards', () => {
         previousSpecHash: 'a'.repeat(64),
         expectedRevisionId: 'revision-old',
         handoffConfigured: true,
+        steps: [
+          { id: 'reg', executor: 'data.query.readonly', renderer: 'risk.trend-chart', allowHandoff: false },
+          { id: 'cal', executor: 'lark.calendar-agenda', renderer: 'builtin.table', allowHandoff: true },
+        ],
       },
       workingDirLabel: 'finance',
     })) as any;
@@ -208,6 +212,13 @@ describe('Frozen Command business cards', () => {
     expect(JSON.stringify(parsed)).toContain('aaaaaaaaaaaa');
     expect(JSON.stringify(parsed)).toContain('bbbbbbbbbbbb');
     expect(JSON.stringify(parsed)).toContain('结果或执行失败命中规则时会交给模型');
+    expect(JSON.stringify(parsed)).toContain('reg');
+    expect(JSON.stringify(parsed)).toContain('data.query.readonly');
+    expect(JSON.stringify(parsed)).toContain('risk.trend-chart');
+    expect(JSON.stringify(parsed)).toContain('cal');
+    expect(JSON.stringify(parsed)).toContain('lark.calendar-agenda');
+    expect(JSON.stringify(parsed)).toContain('允许');
+    expect(JSON.stringify(parsed)).toContain('不允许');
     const buttons = parsed.body.elements[1].columns.map((column: any) => column.elements[0]);
     expect(buttons.map((button: any) => button.behaviors[0].value)).toEqual([
       { action: 'frozen_command_lifecycle_confirm', transition_token: 'opaque-token' },

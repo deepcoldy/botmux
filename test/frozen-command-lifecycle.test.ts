@@ -302,6 +302,12 @@ output: { format: markdown }
       actorIsAdmin: true,
       reason: '批准初版',
     });
+    expect(first.steps).toEqual([{
+      id: 'main',
+      executor: 'test.plugin.readonly',
+      renderer: 'builtin.table',
+      allowHandoff: true,
+    }]);
     const initial = confirmFrozenCommandTransition({
       dataDir: input.dataDir,
       targetBotId: BOT,
