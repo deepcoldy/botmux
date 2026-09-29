@@ -35,13 +35,29 @@ const MAX_PROJECTED_FIELDS = 64;
 const JSON_PATH_RE = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/;
 const FORBIDDEN_PATH_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor']);
 const FORBIDDEN_PLUGIN_IDENTITY_ARGUMENTS = new Set([
+  'caller',
   'calleropenid',
   'callerunionid',
+  'email',
+  'openid',
+  'phone',
+  'phonenumber',
+  'mobile',
   'requestuseropenid',
   'requestuserunionid',
+  'requestuseremail',
+  'requestuserid',
+  'unionid',
+  'userid',
   'useropenid',
   'userunionid',
 ]);
+
+function isForbiddenPluginIdentityArgument(name: string): boolean {
+  const normalized = name.toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (FORBIDDEN_PLUGIN_IDENTITY_ARGUMENTS.has(normalized)) return true;
+  return /^(?:caller|requestuser|user|sender|actor|principal)(?:id|openid|unionid|email|mail|phone|phonenumber|mobile)$/u.test(normalized);
+}
 
 export class CommandExecutorError extends Error {
   constructor(readonly code: string, message: string, options?: ErrorOptions) {
@@ -410,9 +426,7 @@ function parsePluginToolExecutor(
     );
   }
   const argumentsSchema = parseArguments(value.arguments, id);
-  const declaresIdentityArgument = Object.keys(argumentsSchema).some(name => (
-    FORBIDDEN_PLUGIN_IDENTITY_ARGUMENTS.has(name.toLowerCase().replace(/[^a-z0-9]/g, ''))
-  ));
+  const declaresIdentityArgument = Object.keys(argumentsSchema).some(isForbiddenPluginIdentityArgument);
   if (declaresIdentityArgument
     || Object.values(argumentsSchema).some(argument => argument.accepts.some(source => source.startsWith('context:caller.')))) {
     throw new CommandExecutorError(

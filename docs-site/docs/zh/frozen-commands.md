@@ -73,6 +73,12 @@ executors:
         required: true
         maxLength: 100000
         accepts: [literal]
+      datasource:
+        type: enum
+        required: false
+        values: [tchouse-c]
+        default: tchouse-c
+        accepts: [literal]
     policy:
       schedulable: true
       allowHandoff: true
@@ -127,12 +133,21 @@ executors:
 - `plugin-tool` 的参数不能接受 `context:caller.*`；调用者身份只能使用宿主冻结后注入的 `_meta`。
 - 输出必须是 JSON，并通过 `exposeFields` 或 `container` + `exposeRowFields` 二选一投影；未列出的字段不会返回给用户。
 - 凭证由宿主按当前 Bot 注入，业务命令与白名单都不经手凭证路径或环境变量。
+- 插件注册表是全局安装面；全局启用的插件会对所有 Bot 可见，但每个固化命令仍只能调用白名单登记的单个插件和单个工具。
 - 当前隔离方案不提供额外 OS 级沙箱：进程以 daemon 的同一 UID 运行。同 UID 进程可能读取子进程环境，因此不得把进程环境或 `ps eww` 输出粘贴到群聊。
 - 修改白名单或脚本会改变 executor revision；已批准命令必须重新批准后才能运行。
 
 ### 从旧版内建 Data MCP 执行器迁移
 
-升级前先增加上面的 `plugin-tool` 登记，并用 `aliases` 把旧 id `builtin.data-mcp.readonly` 指向新 executor；新定义应直接使用新 id（例如 `data.query.readonly`）。注册表迁移会改变 executor revision，因此既有命令必须由 owner 或管理员重新批准。先升级并启用满足最低版本的插件，再升级 BotMux；反过来会按设计 fail closed。
+升级前先增加上面的 `plugin-tool` 登记，并用 `aliases` 把旧 id `builtin.data-mcp.readonly` 指向新 executor；新定义应直接使用新 id（例如 `data.query.readonly`）。保留可选 `datasource` 参数，才能继续读取显式写了该字段的旧定义。
+
+本次迁移有三个需要显式处理的影响：
+
+1. executor revision 的计算方式发生变化，所有已批准命令都必须由 owner 或管理员重新批准。
+2. 旧定义中的 `onError: fallback_llm` 会转换为瞬时错误 handoff 规则；若对应 executor 没有显式开启 `policy.allowHandoff`，该定义会 fail closed，必须先删除旧回退或开启经过审查的 handoff。
+3. 旧 Data MCP 定义若包含 `datasource`，白名单也必须声明上例中的同名参数，否则定义校验会拒绝迁移。
+
+推荐顺序：先备份命令定义与审批账本；部署并启用满足 `minimumVersion` 的插件；更新 executor 注册表和 alias；逐条校验旧定义并重新批准；最后升级 BotMux 并做 direct、confirmed、scheduled 三条链路冒烟。反向升级会按设计 fail closed。
 
 ## 定时执行
 

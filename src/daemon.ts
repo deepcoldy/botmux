@@ -22716,7 +22716,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // legacy model prompt. Codex App clean-input must keep those original bytes
   // as the visible UserMessage and move the generated skill prompt into hidden
   // untrusted context.
-  const codexAppVisibleText = content;
+  let codexAppVisibleText = content;
   let workflowGrillPrompt: string | undefined;
   const newTopicGrill = parseWorkflowGrillTrigger(cmdContent);
   if (newTopicGrill) {
@@ -22796,6 +22796,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     if (frozen.kind === 'handoff') {
       content = frozen.prompt;
       parsed.content = frozen.prompt;
+      codexAppVisibleText = frozen.prompt;
     }
   }
   if (invocation) {

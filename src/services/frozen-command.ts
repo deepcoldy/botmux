@@ -93,6 +93,64 @@ const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const RELATIVE_DATE_RE = /^today(?:([+-])(\d{1,4}))?$/;
 const DEFAULT_TIMEZONE = 'Asia/Shanghai';
 const DEFAULT_MAX_OUTPUT_CHARS = 20_000;
+const PROCESS_EXECUTION_FAILURE_CODES = new Set([
+  'executor_timeout',
+  'executor_spawn_failed',
+  'executor_non_zero_exit',
+  'executor_output_limit',
+  'executor_output_encoding',
+  'executor_output_json',
+  'executor_output_invalid',
+  'executor_output_too_deep',
+  'executor_output_field_missing',
+  'executor_output_projection_conflict',
+  'executor_output_container_invalid',
+]);
+const PLUGIN_TOOL_ERROR_POLICY = {
+  invalid_request: {
+    code: 'plugin_tool_invalid_request',
+    message: '插件工具请求不合法。',
+    transient: false,
+  },
+  permission_denied: {
+    code: 'plugin_tool_permission_denied',
+    message: '当前用户无权执行该插件工具。',
+    transient: false,
+  },
+  not_found: {
+    code: 'plugin_tool_not_found',
+    message: '插件工具未找到请求的资源。',
+    transient: false,
+  },
+  rate_limited: {
+    code: 'plugin_tool_rate_limited',
+    message: '插件工具请求过于频繁，请稍后重试。',
+    transient: true,
+  },
+  timeout: {
+    code: 'plugin_tool_timeout',
+    message: '插件工具执行超时，请稍后重试。',
+    transient: true,
+  },
+  temporarily_unavailable: {
+    code: 'plugin_tool_temporarily_unavailable',
+    message: '插件工具暂时不可用，请稍后重试。',
+    transient: true,
+  },
+  execution_failed: {
+    code: 'plugin_tool_execution_failed',
+    message: '插件工具执行失败。',
+    transient: false,
+  },
+} as const;
+const SAFE_PLUGIN_TOOL_ERROR_CODES = new Set<string>(
+  Object.values(PLUGIN_TOOL_ERROR_POLICY).map(policy => policy.code),
+);
+const RAW_HTML_TAG_RE = /<\s*\/?\s*(?:a|abbr|address|area|article|aside|at|audio|b|base|bdi|bdo|blockquote|body|br|button|canvas|caption|cite|code|col|colgroup|data|datalist|dd|del|details|dfn|dialog|div|dl|dt|em|embed|fieldset|figcaption|figure|font|footer|form|h[1-6]|head|header|hgroup|hr|html|i|iframe|img|input|ins|kbd|label|legend|li|link|main|map|mark|menu|meta|meter|nav|noscript|object|ol|optgroup|option|output|p|picture|pre|progress|q|rp|rt|ruby|s|samp|script|search|section|select|slot|small|source|span|strong|style|sub|summary|sup|svg|table|tbody|td|template|textarea|tfoot|th|thead|time|title|tr|track|u|ul|var|video|wbr)\b(?:\s+[A-Za-z_:][A-Za-z0-9_:.-]*(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?)*\s*\/?>/iu;
+
+export function isProcessExecutionFailureCode(code: string): boolean {
+  return PROCESS_EXECUTION_FAILURE_CODES.has(code);
+}
 
 export class FrozenCommandError extends Error {
   override readonly name = 'FrozenCommandError';
@@ -770,7 +828,7 @@ function parseDefinition(raw: string, command: string): FrozenCommandDefinition 
     const hasLegacyConditional = value.output.when !== undefined || value.output.handoff !== undefined;
     if (hasLegacyConditional) {
       rules.push({
-        when: nonBlank(value.output.when, 'output.when', 1_000).trim(),
+        when: `{{run.status}} == 'ok' && ${nonBlank(value.output.when, 'output.when', 1_000).trim()}`,
         handoff: parseHandoff(value.output.handoff, 'output.handoff'),
       });
     }
@@ -1083,6 +1141,18 @@ const safeBusinessText = (value: string): string => value
     .replace(/[\t\r\n\u2028\u2029]+/g, ' ')
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '�');
 
+const escapeMarkdownData = (value: string): string => safeBusinessText(value)
+  .replace(/([\\`*{}\[\]()#+\-.!_|>~])/g, '\\$1');
+
+function renderedTemplateValue(value: unknown, markdownData: boolean): string {
+  let rendered: string;
+  if (typeof value === 'string') rendered = value;
+  else if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') rendered = String(value);
+  else if (value === null || value === undefined) rendered = '—';
+  else rendered = JSON.stringify(value, (_key, child) => typeof child === 'bigint' ? child.toString() : child);
+  return markdownData ? escapeMarkdownData(rendered) : safeBusinessText(rendered);
+}
+
 const MAX_PRESENTATION_TABLE_ROWS = 50;
 const MAX_PRESENTATION_TABLE_COLUMNS = 20;
 const MAX_PRESENTATION_CELL_CHARS = 1_000;
@@ -1235,7 +1305,10 @@ export function evaluateFrozenCommandOutputCondition(
   expression: string,
   result: FrozenCommandExecutionResult,
 ): boolean {
-  return evaluateFrozenCommandRule(expression, { q: frozenOutputContext(result) });
+  return evaluateFrozenCommandRule(expression, {
+    q: frozenOutputContext(result),
+    run: { status: 'ok' },
+  });
 }
 
 function evaluateFrozenCommandRule(expression: string, context: Record<string, unknown>): boolean {
@@ -1263,23 +1336,25 @@ function evaluateFrozenCommandRule(expression: string, context: Record<string, u
   });
 }
 
-function renderFrozenOutputTemplate(template: string, context: Record<string, unknown>): string {
+function renderFrozenOutputTemplate(
+  template: string,
+  context: Record<string, unknown>,
+  markdownData = false,
+): string {
   return template.replace(/\{\{\s*((?:q|run|cmd)\.[A-Za-z_][A-Za-z0-9_.]*)\s*\}\}/g, (_full, path: string) => {
     const value = contextValue(context, path);
-    if (typeof value === 'string') return safeBusinessText(value);
-    if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
-    if (value === null || value === undefined) return '—';
-    return JSON.stringify(value, (_key, child) => typeof child === 'bigint' ? child.toString() : child);
+    return renderedTemplateValue(value, markdownData);
   });
 }
 
-function renderProcessOutputTemplate(template: string, projected: Record<string, unknown>): string {
+function renderProcessOutputTemplate(
+  template: string,
+  projected: Record<string, unknown>,
+  markdownData: boolean,
+): string {
   return template.replace(OUTPUT_PLACEHOLDER_RE, (_full, path: string) => {
     const value = contextValue(projected, path);
-    if (typeof value === 'string') return safeBusinessText(value);
-    if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
-    if (value === null || value === undefined) return '—';
-    return JSON.stringify(value, (_key, child) => typeof child === 'bigint' ? child.toString() : child);
+    return renderedTemplateValue(value, markdownData);
   });
 }
 
@@ -1336,7 +1411,11 @@ function resolveExecutorInput(input: {
   trustedCaller: TrustedCaller;
   context?: FrozenCommandExecutionContext;
   now: Date;
-}): { values: Record<string, ResolvedExecutorInput>; referenceDate: string } {
+}): {
+  values: Record<string, ResolvedExecutorInput>;
+  parameterValues: Record<string, string | number>;
+  referenceDate: string;
+} {
   const resolved = resolveFrozenCommandArguments({
     definition: input.definition,
     rawArgs: input.rawArgs,
@@ -1370,7 +1449,11 @@ function resolveExecutorInput(input: {
     }
     values[name] = { value: configured as string | number, source: 'literal' };
   }
-  return { values, referenceDate: resolved.referenceDate };
+  return {
+    values,
+    parameterValues: Object.fromEntries(resolved.values),
+    referenceDate: resolved.referenceDate,
+  };
 }
 
 function truncateFrozenOutput(text: string, maxChars: number): string {
@@ -1427,7 +1510,13 @@ export function resolveFrozenCommandOutput(input: {
       taskId: input.taskId ?? '',
     },
   };
-  const matched = definition.output.rules.find(rule => rule.when === undefined || evaluateFrozenCommandRule(rule.when, context));
+  const matched = definition.output.rules.find((rule) => {
+    // A show rule can only render a successful result. On failure it must not
+    // swallow the original error or evaluate a q.* condition against an empty
+    // result. Handoff rules remain eligible for execution-stage failures.
+    if (error !== undefined && (rule.show || rule.when?.includes('{{q.'))) return false;
+    return rule.when === undefined || evaluateFrozenCommandRule(rule.when, context);
+  });
   if (matched?.handoff) {
     const executor = resolveCommandExecutor(definition.executor);
     if (!executor.policy.allowHandoff) {
@@ -1439,15 +1528,17 @@ export function resolveFrozenCommandOutput(input: {
       ...context,
       q: { ...q, rows: limitedRows, data: limitedRows },
     };
-    const invocation = `/${definition.name}${normalized.args.length > 0 ? ` ${normalized.args.map(argument => argument.value).join(' ')}` : ''}`;
     const statusLine = result
       ? `成功，execution_id=${result.executionId ?? 'unknown'}`
       : `失败，${safeError!.code}，${JSON.stringify(safeError!.message)}`;
+    const serializedArguments = JSON.stringify(Object.fromEntries(
+      normalized.args.map(argument => [argument.name, argument.value]),
+    ));
     const fixedContext = [
       '[固化命令上下文]',
-      `命令：${invocation}`,
-      `说明：${definition.description}`,
-      `参数：${normalized.args.map(argument => `${argument.label}(${argument.name})=${argument.value}`).join('，') || '无'}`,
+      `命令：/${definition.name}`,
+      `说明：${JSON.stringify(definition.description)}`,
+      `参数：${serializedArguments}`,
       `执行器：${definition.executor}`,
       `触发方式：${input.source}`,
       `执行结果：${statusLine}`,
@@ -1484,9 +1575,13 @@ export function resolveFrozenCommandOutput(input: {
       });
       return { kind: 'deliver', text: presentation.fallbackText, presentation };
     }
-    const text = `${definition.output.prefix ?? ''}${renderFrozenOutputTemplate(matched.show.text!, context)}${definition.output.suffix ?? ''}`;
-    const rendered = truncateFrozenOutput(text, definition.output.maxChars);
     const format = matched.show.format ?? definition.output.format;
+    const text = `${definition.output.prefix ?? ''}${renderFrozenOutputTemplate(
+      matched.show.text!,
+      context,
+      format !== 'text',
+    )}${definition.output.suffix ?? ''}`;
+    const rendered = truncateFrozenOutput(text, definition.output.maxChars);
     return {
       kind: 'deliver',
       text: rendered,
@@ -1519,19 +1614,17 @@ function frozenPresentationFromToolResult(
   presentation: FrozenCommandPresentation;
   businessResult?: FrozenCommandExecutionResult['businessResult'];
 } {
-  const containsRawHtml = (value: string): boolean => /<\s*\/?\s*[A-Za-z][^>]*>/u.test(value);
+  const containsRawHtml = (value: string): boolean => RAW_HTML_TAG_RE.test(value);
   const payload = jsonFromToolResult(result);
   if (!isPlainObject(payload) || payload.contractVersion !== expectedContractVersion) {
     throw new FrozenCommandError('plugin_tool_contract_mismatch', '插件工具展示契约版本不兼容');
   }
   if (payload.status !== 'success') {
-    const message = typeof payload.message === 'string' && payload.message.length <= 10_000
-      ? payload.message
-      : '插件工具未完成固化命令';
-    const code = typeof payload.errorCode === 'string' && /^[A-Za-z0-9_.-]{1,128}$/.test(payload.errorCode)
-      ? payload.errorCode
-      : 'plugin_tool_execution_failed';
-    throw new FrozenCommandError(code, message, undefined, true, isTransientPluginToolFailure(message), executionId);
+    const policy = typeof payload.errorCode === 'string'
+      ? PLUGIN_TOOL_ERROR_POLICY[payload.errorCode as keyof typeof PLUGIN_TOOL_ERROR_POLICY]
+      : undefined;
+    const safe = policy ?? PLUGIN_TOOL_ERROR_POLICY.execution_failed;
+    throw new FrozenCommandError(safe.code, safe.message, undefined, true, safe.transient, executionId);
   }
   if (typeof payload.fallbackText !== 'string' || payload.fallbackText.length > 100_000 || containsRawHtml(payload.fallbackText)) {
     throw new FrozenCommandError('plugin_tool_presentation_invalid', '插件工具返回了不安全的展示文本');
@@ -1736,7 +1829,11 @@ export async function executeFrozenCommand(input: {
       if (/\{\{|\}\}/.test(template.replace(OUTPUT_PLACEHOLDER_RE, ''))) {
         throw new FrozenCommandError('definition_invalid_output', 'output.text 包含无法识别的占位符');
       }
-      const raw = renderProcessOutputTemplate(template, executed.projected);
+      const raw = renderProcessOutputTemplate(
+        template,
+        executed.projected,
+        input.definition.output.format !== 'text',
+      );
       const decorated = `${input.definition.output.prefix ?? ''}${raw}${input.definition.output.suffix ?? ''}`;
       logger.info('[frozen-command:audit]', frozenCommandAuditRecord({
         input,
@@ -1782,12 +1879,13 @@ export async function executeFrozenCommand(input: {
       }));
       if (error instanceof FrozenCommandError) throw error;
       if (error instanceof CommandExecutorError) {
+        const executionFailure = isProcessExecutionFailureCode(error.code);
         throw new FrozenCommandError(
           error.code,
           error.message,
           undefined,
-          true,
-          error.code === 'executor_timeout' || error.code === 'executor_spawn_failed',
+          executionFailure,
+          executionFailure && (error.code === 'executor_timeout' || error.code === 'executor_spawn_failed'),
           executionId,
         );
       }
@@ -1837,7 +1935,7 @@ export async function executeFrozenCommand(input: {
       : {
           payload: input.definition.input,
           parameters: input.definition.params,
-          values: Object.fromEntries(Object.entries(resolved.values).map(([key, value]) => [key, value.value])),
+          values: resolved.parameterValues,
           output: {
             format: input.definition.output.format,
             maxChars: input.definition.output.maxChars,
@@ -1866,7 +1964,11 @@ export async function executeFrozenCommand(input: {
           if (/\{\{|\}\}/.test(template.replace(OUTPUT_PLACEHOLDER_RE, ''))) {
             throw new FrozenCommandError('definition_invalid_output', 'output.text 包含无法识别的占位符');
           }
-          const raw = renderProcessOutputTemplate(template, projected);
+          const raw = renderProcessOutputTemplate(
+            template,
+            projected,
+            input.definition.output.format !== 'text',
+          );
           const decorated = `${input.definition.output.prefix ?? ''}${raw}${input.definition.output.suffix ?? ''}`;
           const text = truncateFrozenOutput(decorated, input.definition.output.maxChars);
           const businessResult = processBusinessResult(
@@ -1938,7 +2040,8 @@ export async function executeFrozenCommand(input: {
 export function userFacingFrozenCommandError(error: unknown): string {
   if (!(error instanceof FrozenCommandError)) return '固化命令执行失败，请稍后重试。';
   if (error.code === 'plugin_tool_unavailable') return '插件工具暂时不可用，请稍后重试。';
-  if (/^(?:parameter_|definition_|executor_|context_value_missing$|untrusted_caller$|plugin_tool_|execution_timeout$)/.test(error.code)) {
+  if (SAFE_PLUGIN_TOOL_ERROR_CODES.has(error.code)) return error.message;
+  if (/^(?:parameter_|definition_|executor_|context_value_missing$|untrusted_caller$|execution_timeout$)/.test(error.code)) {
     return error.message;
   }
   return '固化命令未执行完成，请稍后重试或联系维护方。';

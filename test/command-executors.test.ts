@@ -14,6 +14,7 @@ import {
 import {
   executeFrozenCommand,
   assertFrozenCommandExecutorContract,
+  isProcessExecutionFailureCode,
   lookupFrozenCommand,
 } from '../src/services/frozen-command.js';
 
@@ -188,6 +189,38 @@ executors:
       timeoutMs: 5000
 `);
     expect(() => loadCommandExecutorRegistry(fixture.registry)).toThrowError(/可信 _meta/);
+
+    for (const identityName of [
+      'open_id',
+      'union_id',
+      'user_id',
+      'email',
+      'phone_number',
+      'caller_email',
+      'sender_open_id',
+      'actor_union_id',
+      'principal_mobile',
+    ]) {
+      writeFileSync(fixture.registry, `
+schemaVersion: 2
+executors:
+  - id: test.plugin.readonly
+    kind: plugin-tool
+    plugin: fixture-plugin
+    tool: render_report
+    minimumVersion: 1.0.0
+    contractVersion: 1
+    arguments:
+      ${identityName}:
+        type: string
+        required: false
+        maxLength: 100
+        accepts: [literal]
+    policy:
+      timeoutMs: 5000
+`);
+      expect(() => loadCommandExecutorRegistry(fixture.registry)).toThrowError(/可信 _meta/);
+    }
 
     writeFileSync(fixture.registry, `
 schemaVersion: 2
@@ -522,6 +555,28 @@ executors:
       botConfig: { larkAppId: 'cli_test', larkAppSecret: 'secret' },
       workingDir: fixture.root,
     })).rejects.toThrowError(/脚本制品已变化/);
+  });
+
+  it('keeps pre-execution process gates outside output handoff rules', () => {
+    for (const gateCode of [
+      'executor_artifact_changed',
+      'executor_argument_source_denied',
+      'executor_argument_invalid',
+      'executor_argument_required',
+      'executor_identity_unavailable',
+    ]) {
+      expect(isProcessExecutionFailureCode(gateCode)).toBe(false);
+    }
+    for (const executionCode of [
+      'executor_timeout',
+      'executor_spawn_failed',
+      'executor_non_zero_exit',
+      'executor_output_limit',
+      'executor_output_json',
+      'executor_output_invalid',
+    ]) {
+      expect(isProcessExecutionFailureCode(executionCode)).toBe(true);
+    }
   });
 
   it('executes a schema v2 process command and renders only projected output', async () => {

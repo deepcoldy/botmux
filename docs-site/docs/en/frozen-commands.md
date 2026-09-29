@@ -73,6 +73,12 @@ executors:
         required: true
         maxLength: 100000
         accepts: [literal]
+      datasource:
+        type: enum
+        required: false
+        values: [tchouse-c]
+        default: tchouse-c
+        accepts: [literal]
     policy:
       schedulable: true
       allowHandoff: true
@@ -125,12 +131,21 @@ Security boundaries:
 - `plugin-tool` arguments cannot accept `context:caller.*`; caller identity is available only through host-frozen `_meta`.
 - JSON output is projected through either `exposeFields` or `container` plus `exposeRowFields`; unlisted fields are not returned.
 - The host injects credentials for the current bot. Neither command definitions nor the allowlist handle credential paths or environment variables.
+- The plugin registry is installed globally. A globally enabled plugin is visible to every bot, while each frozen command can still invoke only the one plugin and one tool in its allowlist entry.
 - The current isolation scheme does not add an OS sandbox. Executors run under the daemon UID, so never paste child environments or `ps eww` output into chat.
 - Changing the allowlist or an artifact changes the executor revision; affected commands require approval again.
 
 ### Migrating the legacy built-in Data MCP executor
 
-Add the `plugin-tool` registration above and map the legacy `builtin.data-mcp.readonly` id through `aliases`; new definitions should use the canonical id such as `data.query.readonly`. This registry migration changes the executor revision, so every existing command must be approved again by its owner or an administrator. Upgrade and enable a plugin that satisfies `minimumVersion` before upgrading BotMux; the reverse order intentionally fails closed.
+Add the `plugin-tool` registration above and map the legacy `builtin.data-mcp.readonly` id through `aliases`; new definitions should use the canonical id such as `data.query.readonly`. Keep the optional `datasource` argument so legacy definitions that set it explicitly remain valid.
+
+Handle these three migration effects explicitly:
+
+1. The executor revision calculation changes, so every approved command requires approval again from its owner or an administrator.
+2. Legacy `onError: fallback_llm` becomes a transient-error handoff rule. If its executor does not explicitly enable `policy.allowHandoff`, the definition fails closed; remove the legacy fallback or approve handoff first.
+3. A legacy Data MCP definition containing `datasource` is rejected unless the allowlist declares the same argument shown above.
+
+Recommended order: back up definitions and the approval ledger; deploy and enable a plugin satisfying `minimumVersion`; update the executor registry and alias; validate and re-approve each legacy command; then upgrade BotMux and smoke-test direct, confirmed, and scheduled paths. Reversing the plugin/BotMux order intentionally fails closed.
 
 ## Scheduling
 

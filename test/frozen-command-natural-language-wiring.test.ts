@@ -33,10 +33,11 @@ describe('Frozen Command natural-language P0a wiring', () => {
 
   it('keeps listing model-assisted while installed-command execution stays host-direct', () => {
     expect(skill).toContain('botmux freeze list');
-    expect(skill).toContain('运行已安装的固化命令由宿主直达');
+    expect(skill).toContain('运行已安装的固化命令默认由宿主直达');
     expect(skill).toContain('不要**调用 \\`botmux freeze run\\`');
     expect(cli).toContain('botmux freeze run 已停用');
     expect(guidance).toContain('Never call `botmux freeze run`');
+    expect(daemon).toContain('codexAppVisibleText = frozen.prompt');
   });
 
   it('routes lifecycle candidates through the same exact-turn host boundary and one-click card', () => {

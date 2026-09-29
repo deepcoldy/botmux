@@ -60,6 +60,19 @@ server.setRequestHandler(CallToolRequestSchema, request => {
       return { isError: true, content: [{ type: 'text', text: 'wrong_identity' }] };
     }
     if (request.params.name === contractTool) {
+      if (args.values?.days !== 30 || Object.hasOwn(args.values ?? {}, 'sql') || Object.hasOwn(args.values ?? {}, 'report')) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              contractVersion: 1,
+              status: 'error',
+              errorCode: 'invalid_request',
+              message: 'parameter values must be keyed by command parameter name',
+            }),
+          }],
+        };
+      }
       if (args.payload?.sql?.includes('RETURN_VALIDATION_ERROR')) {
         return {
           content: [{
@@ -67,11 +80,27 @@ server.setRequestHandler(CallToolRequestSchema, request => {
             text: JSON.stringify({
               contractVersion: 1,
               status: 'error',
-              errorCode: 'query_plan_session_required',
-              message: 'missing execution context',
+              errorCode: 'untrusted_caller',
+              message: 'raw plugin secret: missing execution context',
             }),
           }],
         };
+      }
+      if (args.payload?.sql?.includes('RETURN_MATH_TEXT')) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          contractVersion: 1,
+          status: 'success',
+          fallbackText: 'a<b 且 c>d',
+          blocks: [{ type: 'markdown', markdown: 'a<b 且 c>d' }],
+        }) }] };
+      }
+      if (args.payload?.sql?.includes('RETURN_RAW_HTML')) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          contractVersion: 1,
+          status: 'success',
+          fallbackText: '<a href="https://evil.example">click</a>',
+          blocks: [{ type: 'markdown', markdown: '<a href="https://evil.example">click</a>' }],
+        }) }] };
       }
       return { content: [{ type: 'text', text: JSON.stringify({
         contractVersion: 1,
@@ -97,7 +126,13 @@ server.setRequestHandler(CallToolRequestSchema, request => {
       content: [{ type: 'text', text: 'report ready' }],
       structuredContent: {
         rows: [
-          { name: `report-${request.params.arguments?.days}`, total: 12, secret: 'hidden' },
+          {
+            name: request.params.arguments?.days === 31
+              ? '[点我领奖](http://evil.example) **bold** _italic_'
+              : `report-${request.params.arguments?.days}`,
+            total: 12,
+            secret: 'hidden',
+          },
         ],
       },
     };
