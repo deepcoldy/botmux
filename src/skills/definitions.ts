@@ -245,7 +245,7 @@ output:
 
 \`output.format\` 只支持 \`markdown\`（默认）和 \`text\`。executor 只返回白名单投影后的数据或 content，renderer 再生成 Markdown；数据类执行器使用 \`builtin.table\` 或登记的 renderer，content 类执行器只能使用 \`builtin.content\`。不要使用原始 HTML。
 
-只有需要按结果选择展示或模型分析时才配置有序的 \`output.rules\`；第一条命中规则生效，每条规则必须且只能写 \`handoff\` 或 \`show\`。\`show: result\` 展示原结果，\`show: { text }\` 展示模板文字；没有规则或全部未命中时展示 renderer 结果。条件只能使用 \`q.<step-id>.*\`、\`run.status\`、\`run.<step-id>.*\` 与 \`cmd.*\`，handoff 能否执行仍受管理员白名单的 \`allowHandoff\` 限制。顶层 \`executor/input\`、\`output.text\`、\`prefix/suffix\`、\`else\`、\`onError\`、\`format: table|auto\` 都是旧协议，宿主会直接拒绝，不得生成。
+只有需要按结果选择展示或模型分析时才配置有序的 \`output.rules\`；第一条命中规则生效，每条规则必须且只能写 \`handoff\` 或 \`show\`。\`show: result\` 展示原结果，\`show: { text }\` 展示模板文字；没有规则或全部未命中时展示 renderer 结果。条件只能使用 \`q.<step-id>.*\`、\`run.status\`、\`run.<step-id>.*\` 与 \`cmd.*\`，handoff 能否执行仍受管理员白名单的 \`allowHandoff\` 限制。顶层 \`executor/input\`、\`output.text\`、\`prefix/suffix\`、\`else\`、\`onError\`、\`format: table|auto\` 都是旧协议，宿主会直接拒绝，不得生成。输出内容不要包含原始 HTML、@ 或可点击链接；只有顶格的 \`vega-lite\` 代码块可保留，正文 URL 会被宿主改成不可点击的行内代码。
 
 ## 安装步骤
 

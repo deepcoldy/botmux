@@ -48,7 +48,6 @@ executors:
     plugin: fixture-plugin
     tool: render_report
     minimumVersion: 1.0.0
-    contractVersion: 1
     arguments:
       value:
         type: string
@@ -59,6 +58,8 @@ executors:
       schedulable: true
       allowHandoff: true
       timeoutMs: 5000
+    output:
+      exposeFields: [report]
 `);
   return registry;
 }
@@ -114,11 +115,19 @@ describe('resolvePinnedWorkingDir', () => {
 schemaVersion: 2
 name: 生命周期测试
 description: route lifecycle test
-executor: test.plugin.readonly
 params: []
-input:
-  value: fixture
-onError: fallback_llm
+steps:
+  - id: main
+    executor: test.plugin.readonly
+    input:
+      value: fixture
+    renderer: builtin.table
+output:
+  format: markdown
+  rules:
+    - when: "{{run.status}} == 'error'"
+      handoff:
+        prompt: command failed
 `);
     botRegistry.registerBot({
       larkAppId: 'app-self', larkAppSecret: 's', cliId: 'claude-code',
@@ -172,11 +181,16 @@ onError: fallback_llm
 schemaVersion: 2
 name: 权限测试
 description: lifecycle authorization test
-executor: test.plugin.readonly
 params: []
-input:
-  value: fixture
-onError: fail
+steps:
+  - id: main
+    executor: test.plugin.readonly
+    input:
+      value: fixture
+    renderer: builtin.table
+output:
+  format: markdown
+  rules: []
 `);
     const bot = botRegistry.registerBot({
       larkAppId: 'app-self', larkAppSecret: 's', cliId: 'claude-code',

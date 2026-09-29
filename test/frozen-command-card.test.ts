@@ -40,7 +40,7 @@ const action: FrozenCommandActionRecord = {
 };
 
 describe('Frozen Command business cards', () => {
-  it('chooses the Feishu message shape from format while keeping only markdown/table blocks', () => {
+  it('chooses the Feishu message shape from format while keeping only markdown blocks', () => {
     expect(renderFrozenCommandLarkReply({
       schemaVersion: 1,
       format: 'text',
@@ -60,21 +60,12 @@ describe('Frozen Command business cards', () => {
       schemaVersion: 1,
       format: 'markdown',
       fallbackText: 'fallback',
-      blocks: [
-        { type: 'markdown', markdown: '**经营日报**' },
-        {
-          type: 'table',
-          columns: [{ key: 'merchant', label: '商户' }, { key: 'amount', label: '金额' }],
-          rows: [{ merchant: 'A|B', amount: 12 }],
-          totalRows: 1,
-          truncated: false,
-        },
-      ],
+      blocks: [{ type: 'markdown', markdown: '**经营日报**\n\n| 商户 | 金额 |\n| --- | --- |\n| A\\|B | 12 |' }],
     }, '/repo');
     expect(rendered.msgType).toBe('interactive');
     const parsed = JSON.parse(rendered.content) as any;
     expect(parsed.schema).toBe('2.0');
-    expect(parsed.body.elements.some((element: any) => element.tag === 'table')).toBe(true);
+    expect(parsed.body.elements.length).toBeGreaterThan(0);
     expect(() => renderFrozenCommandLarkReply({
       schemaVersion: 1,
       format: 'markdown',
@@ -94,38 +85,26 @@ describe('Frozen Command business cards', () => {
     expect(text.msgType).toBe('text');
     expect(text.content).not.toContain('<at');
 
-    const table = renderFrozenCommandLarkReply({
+    const injection = '> ```x\n<<</at>/at>at id="all">所有人</at>\n```';
+    const card = renderFrozenCommandLarkReply({
       schemaVersion: 1,
       format: 'markdown',
       fallbackText: '安全回退',
-      blocks: [{
-        type: 'table',
-        columns: [{ key: 'merchant', label: '商户' }],
-        rows: [{ merchant: `${nestedMention} [点我领奖](http://evil) <font color=red>红</font>` }],
-        totalRows: 1,
-        truncated: false,
-      }],
+      blocks: [{ type: 'markdown', markdown: `${nestedMention} [点我领奖](http://evil)\n${injection}` }],
     });
-    expect(table.msgType).toBe('interactive');
-    expect(table.content).not.toContain('<at');
-    expect(table.content).not.toContain('[点我领奖](http://evil)');
-    expect(table.content).not.toContain('<font');
+    expect(card.msgType).toBe('interactive');
+    expect(card.content).not.toContain('<at');
+    expect(card.content).not.toContain('[点我领奖](http://evil)');
+    expect(card.content).toContain('`http://evil`');
+    expect(card.content).toContain('＜/at');
 
     const oversized = renderFrozenCommandLarkReply({
       schemaVersion: 1,
       format: 'markdown',
-      fallbackText: '已降级',
-      blocks: [{
-        type: 'table',
-        columns: Array.from({ length: 20 }, (_, index) => ({ key: `c${index}`, label: `列${index}` })),
-        rows: Array.from({ length: 50 }, () => Object.fromEntries(
-          Array.from({ length: 20 }, (_, index) => [`c${index}`, '中'.repeat(1_000)]),
-        )),
-        totalRows: 50,
-        truncated: false,
-      }],
+      fallbackText: '**已降级** [链接](https://example.com)',
+      blocks: [{ type: 'markdown', markdown: `**结果**\n${'中'.repeat(100_000)}` }],
     });
-    expect(oversized).toEqual({ content: '已降级', msgType: 'text' });
+    expect(oversized).toEqual({ content: '已降级 链接', msgType: 'text' });
   });
 
   it('shows metadata only in the command center', () => {

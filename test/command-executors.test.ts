@@ -8,7 +8,9 @@ import {
   isPluginToolCommandExecutor,
   listCommandExecutorAuthoringSchemas,
   loadCommandExecutorRegistry,
+  materializeCommandExecutorOutput,
   pluginVersionAtLeast,
+  runCommandRenderer,
   runProcessCommandExecutor,
 } from '../src/services/command-executors.js';
 import {
@@ -441,6 +443,55 @@ executors:
     });
     expect(result.projected).toEqual({ rows: [{ city: 'Shenzhen', safe: 1 }] });
     expect(JSON.stringify(result.projected)).not.toContain('secret');
+  });
+
+  it('falls back to column names for null descriptions and truncates rows with a total', () => {
+    const fixture = setup();
+    writeFileSync(fixture.registry, `
+schemaVersion: 2
+executors:
+  - id: test.rows
+    kind: plugin-tool
+    plugin: fixture-plugin
+    tool: read_rows
+    minimumVersion: 1.0.0
+    arguments: {}
+    policy: { timeoutMs: 5000 }
+    output:
+      container: rows
+      exposeRowFields: [name, code]
+      labelsFrom: columns
+`);
+    const output = loadCommandExecutorRegistry(fixture.registry).executors.get('test.rows')!.output;
+    const rows = Array.from({ length: 1_002 }, (_, index) => ({ name: `row-${index}`, code: index, secret: 'hidden' }));
+    const result = materializeCommandExecutorOutput(output, {
+      rows,
+      columns: [{ name: 'name', description: null }, { name: 'code', description: '' }],
+    });
+    expect(result.rows).toHaveLength(1_000);
+    expect(result.totalRows).toBe(1_002);
+    expect(result.columns).toEqual([{ key: 'name', label: 'name' }, { key: 'code', label: 'code' }]);
+    expect(JSON.stringify(result.projected)).not.toContain('hidden');
+  });
+
+  it('turns an early renderer stdin close with a large payload into a renderer failure', async () => {
+    const fixture = setup();
+    const rendererScript = join(fixture.root, 'renderer-exit.mjs');
+    writeFileSync(rendererScript, 'process.stdin.destroy(); process.exit(0);\n');
+    writeFileSync(fixture.registry, `${readFileSync(fixture.registry, 'utf8')}
+renderers:
+  - id: test.early-exit
+    executable: { realpath: ${JSON.stringify(resolve(process.execPath))} }
+    fixedArgs: [${JSON.stringify(rendererScript)}]
+    scriptArtifacts: [${JSON.stringify(rendererScript)}]
+    policy: { timeoutMs: 5000, maxInputBytes: 10485760, maxOutputBytes: 65536 }
+`);
+    const renderer = loadCommandExecutorRegistry(fixture.registry).renderers.get('test.early-exit')!;
+    await expect(runCommandRenderer({
+      renderer,
+      payload: { rows: [{ value: 'x'.repeat(2 * 1024 * 1024) }] },
+      workingDir: fixture.root,
+    })).rejects.toMatchObject({ code: 'renderer_stdin_failed' });
   });
 
   it('rejects an output contract that mixes flat and collection projections', () => {

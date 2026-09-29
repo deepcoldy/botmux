@@ -126,6 +126,9 @@ server.setRequestHandler(CallToolRequestSchema, request => {
       },
     };
   }
+  if (serverName === 'content-large') {
+    return { content: [{ type: 'text', text: '中'.repeat(25_000) }] };
+  }
   return {
     content: [{
       type: 'text',

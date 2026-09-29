@@ -116,11 +116,11 @@ output:
 {"rows":[{"商户":"A店","异常笔数":12}],"columns":[{"key":"商户","label":"商户"}],"totalRows":1,"fields":{},"cmd":{"name":"风险日报","args":{"date":"2026-09-28"}}}
 ```
 
-stdout 必须是 UTF-8 Markdown。renderer 超时、非零退出、输出超限或制品变化时，宿主记录 `renderer_failed` 并退回 `builtin.table`。renderer 不会获得凭证或调用人身份。
+stdout 必须是 UTF-8 Markdown。renderer 超时、非零退出、提前关闭 stdin、输出超限或制品变化时，宿主记录 `renderer_failed` 并退回 `builtin.table`。renderer 不会获得凭证或调用人身份。数据结果超过 1000 行时，宿主只投影前 1000 行，并用总行数提示还有未展示的数据。
 
 ## 展示安全
 
-所有来源统一经过宿主策略：消除 @，拒绝原始 HTML，链接默认转为纯文本。转义会识别 fenced code；代码块里的尖括号不会被错误转义。`vega-lite` 图表由飞书适配层在 #1633 可用时处理，未安装该能力时按普通代码显示。`format: text` 从 Markdown 推导纯文本；20KB 文本与 80KB 卡片预算继续由共享展示层控制。
+所有来源统一经过宿主策略：消除 @；把飞书专有标签的左尖括号替换为全角字符；拒绝剩余原始 HTML；把正文 URL 包成不可点击、可复制的行内代码，并删除引用式链接定义。只有顶格的 `vega-lite` fenced code 免于正文清洗；引用、列表或缩进中的代码块都按正文处理。`vega-lite` 图表由飞书适配层在 #1633 可用时处理，未安装该能力时按普通代码显示。`format: text` 从 Markdown 推导纯文本。内容本身不按 20KB 截断；卡片超过 80KB 时整体降级为推导后的纯文本，只有最终文本消息会按 20KB 截断。
 
 ## 定时与发布
 

@@ -908,10 +908,10 @@ export function projectCommandExecutorOutput(
     output.container,
     `执行器输出缺少容器：${output.container}`,
   );
-  if (!Array.isArray(rawRows) || rawRows.length > MAX_PROJECTED_ROWS || rawRows.some(row => !isPlainObject(row))) {
-    throw new CommandExecutorError('executor_output_container_invalid', `执行器输出 ${output.container} 必须是最多 ${MAX_PROJECTED_ROWS} 项的对象数组`);
+  if (!Array.isArray(rawRows) || rawRows.some(row => !isPlainObject(row))) {
+    throw new CommandExecutorError('executor_output_container_invalid', `执行器输出 ${output.container} 必须是对象数组`);
   }
-  const rows = rawRows.map((row, index) => {
+  const rows = rawRows.slice(0, MAX_PROJECTED_ROWS).map((row, index) => {
     const projected: Record<string, unknown> = {};
     for (const field of output.exposeRowFields!) {
       assignProjectedPath(
@@ -948,6 +948,12 @@ export function materializeCommandExecutorOutput(
   }
   if (!isPlainObject(raw)) throw new CommandExecutorError('executor_output_invalid', '执行器输出必须是 JSON 对象');
   safeJsonDepth(raw);
+  const sourceRows = output.container
+    ? projectedPathValue(raw, output.container, `执行器输出缺少容器：${output.container}`)
+    : undefined;
+  if (output.container && (!Array.isArray(sourceRows) || sourceRows.some(row => !isPlainObject(row)))) {
+    throw new CommandExecutorError('executor_output_container_invalid', `执行器输出 ${output.container} 必须是对象数组`);
+  }
   const projected = projectCommandExecutorOutput(output, raw);
   const rows = output.container
     ? (projectedPathValue(projected, output.container, `执行器输出缺少容器：${output.container}`) as Array<Record<string, unknown>>)
@@ -962,16 +968,18 @@ export function materializeCommandExecutorOutput(
     }
     labels = Object.fromEntries(rawLabels.map((item, index) => {
       if (!isPlainObject(item) || typeof item.name !== 'string' || !item.name
-        || typeof item.description !== 'string' || item.description.length > 256) {
-        throw new CommandExecutorError('executor_output_invalid', `${output.labelsFrom}[${index}] 必须包含 name 和 description`);
+        || (item.description !== undefined && item.description !== null
+          && (typeof item.description !== 'string' || item.description.length > 256))) {
+        throw new CommandExecutorError('executor_output_invalid', `${output.labelsFrom}[${index}] 必须包含 name，description 必须是字符串或 null`);
       }
-      return [item.name, item.description];
+      return [item.name, typeof item.description === 'string' && item.description ? item.description : item.name];
     }));
   }
   const keys = output.container ? output.exposeRowFields! : output.exposeFields ?? [];
   const columns = keys.map(key => ({ key, label: labels[key] ?? key }));
-  const rawTotalRows = output.totalRowsField ? projectedPathValue(raw, output.totalRowsField, `执行器输出缺少字段：${output.totalRowsField}`) : rows.length;
-  if (!Number.isSafeInteger(rawTotalRows) || (rawTotalRows as number) < rows.length) {
+  const sourceRowCount = Array.isArray(sourceRows) ? sourceRows.length : rows.length;
+  const rawTotalRows = output.totalRowsField ? projectedPathValue(raw, output.totalRowsField, `执行器输出缺少字段：${output.totalRowsField}`) : sourceRowCount;
+  if (!Number.isSafeInteger(rawTotalRows) || (rawTotalRows as number) < sourceRowCount) {
     throw new CommandExecutorError('executor_output_invalid', '执行器输出总行数不合法');
   }
   if (output.totalRowsField) assignProjectedPath(projected, output.totalRowsField, rawTotalRows);
@@ -1188,6 +1196,10 @@ export async function runCommandRenderer(input: {
         stdout.push(buffer);
       });
       child.stderr?.resume();
+      child.stdin?.on('error', error => {
+        terminalError = new CommandExecutorError('renderer_stdin_failed', `渲染器 ${input.renderer.id} 无法读取输入`, { cause: error });
+        terminateProcessGroup(child);
+      });
       child.on('error', error => {
         clearTimeout(timer);
         fail(new CommandExecutorError('renderer_spawn_failed', `渲染器 ${input.renderer.id} 启动失败`, { cause: error }));

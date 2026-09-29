@@ -1,7 +1,7 @@
 import type { FrozenCommandActionRecord } from '../../services/frozen-command-action.js';
 import {
+  markdownToPlainText,
   sanitizeFrozenCommandMarkdown,
-  type FrozenCommandOutputBlock,
   type FrozenCommandPresentation,
 } from '../../services/frozen-command.js';
 import type {
@@ -66,17 +66,6 @@ export interface FrozenCommandLarkReply {
   msgType: 'text' | 'interactive';
 }
 
-function markdownTable(block: Extract<FrozenCommandOutputBlock, { type: 'table' }>): string {
-  const cell = (value: unknown): string => escapeMd(String(value ?? '—').replace(/[\r\n]+/g, ' '));
-  const header = `| ${block.columns.map(column => cell(column.label)).join(' | ')} |`;
-  const separator = `| ${block.columns.map(() => '---').join(' | ')} |`;
-  const rows = block.rows.map(row => `| ${block.columns.map(column => cell(row[column.key])).join(' | ')} |`);
-  const note = block.truncated
-    ? `\n\n共 ${block.totalRows} 行，仅展示前 ${block.rows.length} 行或前 ${block.columns.length} 列。`
-    : '';
-  return [header, separator, ...rows].join('\n') + note;
-}
-
 function sanitizeRichMarkdown(value: string): string {
   return sanitizeFrozenCommandMarkdown(value);
 }
@@ -95,21 +84,22 @@ export function renderFrozenCommandLarkReply(
       msgType: 'text',
     };
   }
+  const plainFallback = markdownToPlainText(presentation.fallbackText);
   const elements = presentation.blocks.flatMap(block => buildCardBodyElements(
-    block.type === 'markdown' ? sanitizeRichMarkdown(block.markdown) : markdownTable(block),
+    sanitizeRichMarkdown(block.markdown),
     workingDir,
     'disabled',
   ));
   if (elements.length === 0) {
     return {
-      content: truncateUtf8(safeLarkText(presentation.fallbackText), MAX_FROZEN_LARK_TEXT_BYTES),
+      content: truncateUtf8(safeLarkText(plainFallback), MAX_FROZEN_LARK_TEXT_BYTES),
       msgType: 'text',
     };
   }
   const content = JSON.stringify(createReplyCard(elements));
   if (Buffer.byteLength(content, 'utf8') > MAX_FROZEN_LARK_CARD_BYTES) {
     return {
-      content: truncateUtf8(safeLarkText(presentation.fallbackText), MAX_FROZEN_LARK_TEXT_BYTES),
+      content: truncateUtf8(safeLarkText(plainFallback), MAX_FROZEN_LARK_TEXT_BYTES),
       msgType: 'text',
     };
   }

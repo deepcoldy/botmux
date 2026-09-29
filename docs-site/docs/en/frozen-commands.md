@@ -111,11 +111,11 @@ Legacy fields are rejected with no compatibility parser: top-level `executor` / 
 {"rows":[{"merchant":"A","failures":12}],"columns":[{"key":"merchant","label":"Merchant"}],"totalRows":1,"fields":{},"cmd":{"name":"risk_report","args":{"date":"2026-09-28"}}}
 ```
 
-stdout is UTF-8 Markdown. Timeout, non-zero exit, output limit, or artifact drift records `renderer_failed` and falls back to `builtin.table`. Renderers receive no credential or caller identity.
+stdout is UTF-8 Markdown. Timeout, non-zero exit, an early stdin close, output limit, or artifact drift records `renderer_failed` and falls back to `builtin.table`. Renderers receive no credential or caller identity. When a data result exceeds 1,000 rows, the host projects the first 1,000 rows and reports the full row count.
 
 ## Display safety
 
-The host removes mentions, rejects raw HTML, and converts links to plain text for every source. Escaping recognizes fenced code so angle brackets inside code are preserved. `vega-lite` blocks are handled by the Feishu adapter when #1633 is present; without it they remain ordinary code. `format: text` derives plain text from Markdown. Shared 20KB text and 80KB card budgets remain in force.
+For every source, the host removes mentions, replaces the opening angle bracket of Feishu-specific tags with its full-width form, rejects remaining raw HTML, wraps body URLs in non-clickable copyable inline code, and removes reference-link definition lines. Only a top-level `vega-lite` fence is exempt from body cleaning; quoted, listed, or indented fences are treated as body text. The Feishu adapter handles `vega-lite` when #1633 is present; without it the fence remains ordinary code. `format: text` derives plain text from Markdown. Content itself is not truncated at 20KB: a card over 80KB falls back as a whole to derived plain text, and only the final text message may be truncated to 20KB.
 
 ## Scheduling and release
 
