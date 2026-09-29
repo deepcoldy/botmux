@@ -8,7 +8,7 @@ const safe = (text: string) => text.replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[men
 /** Same broker actions as the standalone Ask card, expressed as Card JSON 2.0. */
 export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 'zh'): Array<Record<string, any>> {
   const { ask } = entry;
-  const submit = ask.questions.length > 1 || ask.questions.some(q => q.multiSelect);
+  const submit = ask.questions.length > 1 || ask.questions.some(q => q.multiSelect || q.defaultSelectedKeys !== undefined);
   const elements: Array<Record<string, any>> = [];
   const button = (label: string, value: Record<string, string>, type = 'default') => ({
     tag: 'button', text: { tag: 'plain_text', content: label }, type,

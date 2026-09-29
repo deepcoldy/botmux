@@ -6879,6 +6879,7 @@ ${SEND_HELP_BODY}
                                        --with-card-json 为每张卡片附原始结构化 JSON（消息均带 resources 附件 key）
   quoted <message_id> [--raw]          按消息 id 拉取单条消息 (JSON) 并下载附件到本地；id 取自引用提示行或 history 输出，
                                        --raw 附原始内容（卡片 → cardJson，其它 → rawContent）
+  ask buttons --questions-file <file>   多题卡片，支持 defaultSelectedKeys 预选；底部提交，返回 JSON
   ask buttons [--multi] --options "a,b" "<问题>"
                                        把选择题做成按钮卡片抛给飞书；--multi 返回逗号分隔的多个 key
                                        （无 hook 的 CLI 用它把决策引到人；也可省略 buttons 走裸别名）
@@ -13830,7 +13831,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     process.exit(2);
   }
 
-  const { findMissingAskEnv, parseAskOptions, parseAskTimeoutSeconds, AskArgsError } =
+  const { findMissingAskEnv, parseAskOptions, parseAskQuestionsFile, parseAskTimeoutSeconds, AskArgsError } =
     await import('./core/ask-args.js');
   type AskJsonOutput = import('./core/ask-types.js').AskJsonOutput;
   const { toLegacySelected, isCustomReply } = await import('./core/ask-types.js');
@@ -13844,16 +13845,28 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     process.exit(2);
   }
 
+  const hasQuestionsFile = rest.some(arg => arg === '--questions-file' || arg.startsWith('--questions-file='));
+  const questionsFile = argValue(rest, '--questions-file');
   const optionsRaw = argValue(rest, '--options');
   const timeoutRaw = argValue(rest, '--timeout');
-  const useJson = rest.includes('--json');
+  const useJson = rest.includes('--json') || questionsFile !== undefined;
   const multiSelect = rest.includes('--multi');
   const positionalArgs = positionals(rest, ['--json', '--multi']);
 
   let options;
+  let questions;
   let timeoutMs;
   try {
-    options = parseAskOptions(optionsRaw);
+    if (hasQuestionsFile && (!questionsFile || rest.some(arg => arg === '--options' || arg.startsWith('--options=')) || multiSelect || positionalArgs.length)) {
+      throw new AskArgsError('questions_invalid', '--questions-file 需要文件路径，且不能与 --options、--multi 或位置参数混用');
+    }
+    if (questionsFile) {
+      const { readFileSync } = await import('node:fs');
+      let raw: string;
+      try { raw = readFileSync(questionsFile, 'utf8'); }
+      catch { throw new AskArgsError('questions_invalid', '--questions-file 无法读取'); }
+      questions = parseAskQuestionsFile(raw);
+    } else options = parseAskOptions(optionsRaw);
     timeoutMs = parseAskTimeoutSeconds(timeoutRaw);
   } catch (err) {
     if (err instanceof AskArgsError) {
@@ -13864,7 +13877,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
   }
 
   const prompt = positionalArgs.join(' ').trim();
-  if (!prompt) {
+  if (!questions && !prompt) {
     console.error(
       'botmux ask: 缺少 prompt。用法: botmux ask buttons --options "yes,no" "继续发版吗？"',
     );
@@ -13886,7 +13899,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
     chatId: process.env.BOTMUX_CHAT_ID!,
     larkAppId,
     rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID || null,
-    ...(multiSelect
+    ...(questions ? { questions } : multiSelect
       ? { questions: [{ prompt, options, multiSelect: true }] }
       : { options, prompt }),
     timeoutMs,
@@ -13919,7 +13932,7 @@ async function cmdAsk(sub: string, rest: string[]): Promise<void> {
       // 恰好 1 问且恰好 1 个 key）。`--multi` 下调用方明确按多选语义读 `answers[0]`，
       // 此时 `selected` 必须恒为 null——否则「多选恰好 1 项」会因形状巧合退化出一个
       // key，令 `selected` 的含义随选中数量漂移（违反公开契约）。
-      selected: multiSelect ? null : selected,
+      selected: multiSelect || questions?.some(q => q.multiSelect) ? null : selected,
       answers: result.kind === 'answered' ? (result.answers as string[][]) : null,
       by: result.kind === 'answered' ? result.by : null,
       comment: result.kind === 'answered' ? result.comment : null,

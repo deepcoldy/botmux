@@ -25,6 +25,9 @@ export interface AskQuestion {
   options: ReadonlyArray<AskOption>;
   /** true = 多选（可选多个 key）；false = 单选（恰好 1 个 key）。 */
   multiSelect: boolean;
+  /** Optional draft selection. Presence (even []) requires a Submit button;
+   * never an answer until an authorized user explicitly submits. */
+  defaultSelectedKeys?: ReadonlyArray<string>;
 }
 
 /** Terminal result of an ask, returned to the CLI caller. Discriminated by
