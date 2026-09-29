@@ -5,19 +5,19 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
 import {
   FrozenCommandError,
+  assertFrozenCommandExecutorContract,
   buildFrozenCommandPresentation,
   executeFrozenCommand,
   evaluateFrozenCommandOutputCondition,
   frozenCommandUsage,
   listFrozenCommandSnapshots,
   lookupFrozenCommand,
-  isTransientDataMcpFailure,
+  isTransientPluginToolFailure,
   normalizeFrozenCommandName,
   normalizeFrozenCommandArguments,
   parseNaturalLanguageFrozenCommandInvocation,
   parseScheduledFrozenCommandInvocation,
-  resolveFrozenCommandScheduledOutput,
-  shouldFallbackFrozenCommand,
+  resolveFrozenCommandOutput,
   userFacingFrozenCommandError,
 } from '../src/services/frozen-command.js';
 
@@ -28,7 +28,39 @@ function fixture(yaml: string): { root: string; definition: ReturnType<typeof de
   dirs.push(root);
   mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
   writeFileSync(join(root, '.botmux', 'commands', '泰国上账.yaml'), yaml);
+  writePluginExecutorRegistry(root);
   return { root, definition: definitionAt(root) };
+}
+
+function writePluginExecutorRegistry(root: string): void {
+  const registry = join(root, 'command-executors.yaml');
+  writeFileSync(registry, `
+schemaVersion: 2
+executors:
+  - id: test.plugin.readonly
+    kind: plugin-tool
+    plugin: data-mcp
+    tool: execute_frozen_query
+    minimumVersion: 0.1.0
+    contractVersion: 1
+    arguments:
+      sql:
+        type: string
+        required: true
+        maxLength: 10000
+        accepts: [literal]
+      queryTemplate:
+        type: string
+        required: false
+        maxLength: 10000
+        accepts: [literal]
+    policy:
+      schedulable: true
+      allowHandoff: true
+      handoffIncludesInput: false
+      timeoutMs: 120000
+`);
+  vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', registry);
 }
 
 function definitionAt(root: string) {
@@ -46,7 +78,7 @@ const BASE = `
 schemaVersion: 2
 name: 泰国上账
 description: 查询泰国最近 N 天的上账金额
-executor: builtin.data-mcp.readonly
+executor: test.plugin.readonly
 timezone: Asia/Bangkok
 params:
   - name: days
@@ -149,13 +181,12 @@ describe('Frozen Commands definition and positional UX', () => {
     }
   });
 
-  it('keeps builtin plugin input opaque to the host definition parser', () => {
+  it('keeps plugin input opaque while still validating declared parameters', () => {
     const opaque = BASE
-      .replace('  sql: |-\n    SELECT sum(amount) FROM bills\n    WHERE country = \'TH\' AND dt >= today() - {{days}}\n    LIMIT 100', '  queryTemplate: "opaque {{caller.open_id}} {{days}}"')
-      .replace('    default: 7', '    default: 7\n  - name: unused\n    type: string\n    default: still-opaque');
+      .replace('  sql: |-\n    SELECT sum(amount) FROM bills\n    WHERE country = \'TH\' AND dt >= today() - {{days}}\n    LIMIT 100', '  queryTemplate: "opaque {{days}}"');
     const { definition } = fixture(opaque);
-    expect(definition.input).toEqual({ queryTemplate: 'opaque {{caller.open_id}} {{days}}' });
-    expect(definition.params.map(parameter => parameter.name)).toEqual(['days', 'unused']);
+    expect(definition.input).toEqual({ queryTemplate: 'opaque {{days}}' });
+    expect(definition.params.map(parameter => parameter.name)).toEqual(['days']);
   });
 
   it('renders the documented positional parameter and default', () => {
@@ -182,7 +213,7 @@ describe('Frozen Commands definition and positional UX', () => {
   });
 
   it('evaluates conditional output fail-closed and marks handoff truncation explicitly', () => {
-    const conditional = BASE.replace(
+    const conditional = BASE.replace('onError: fallback_llm', '').replace(
       '  prefix: "查询结果：\\n"\n  maxChars: 20000',
       `  maxChars: 20000
   when: "{{q.max_drop}} > 0.2"
@@ -194,6 +225,10 @@ describe('Frozen Commands definition and positional UX', () => {
     text: "今日正常，合计 {{q.total}}"`,
     );
     const { definition } = fixture(conditional);
+    expect(definition.output.rules).toHaveLength(2);
+    expect(definition.output.rules[1]).toMatchObject({
+      show: { kind: 'text', text: '今日正常，合计 {{q.total}}' },
+    });
     const result = {
       referenceDate: '2026-09-21',
       text: '原始结果',
@@ -206,8 +241,8 @@ describe('Frozen Commands definition and positional UX', () => {
         totalRows: 2,
       },
     };
-    expect(evaluateFrozenCommandOutputCondition(definition.output.when!, result)).toBe(true);
-    const handoff = resolveFrozenCommandScheduledOutput(definition, result);
+    expect(evaluateFrozenCommandOutputCondition(definition.output.rules[0]!.when, result)).toBe(true);
+    const handoff = resolveFrozenCommandOutput({ definition, rawArgs: '', source: 'schedule', result });
     expect(handoff.kind).toBe('handoff');
     if (handoff.kind === 'handoff') {
       expect(handoff.prompt).toContain('以下数据出现异常');
@@ -215,17 +250,19 @@ describe('Frozen Commands definition and positional UX', () => {
       expect(handoff.prompt).not.toContain('"country":"SG"');
       expect(handoff.prompt).toContain('共 2 行，已截断为前 1 行');
     }
-    const charLimited = resolveFrozenCommandScheduledOutput({
-      ...definition,
-      output: { ...definition.output, maxChars: 100 },
-    }, {
-      ...result,
-      businessResult: {
-        rows: [
-          { max_drop: 0.3, total: 120, country: 'X'.repeat(500) },
-          { max_drop: 0.1, total: 80, country: 'SG' },
-        ],
-        totalRows: 2,
+    const charLimited = resolveFrozenCommandOutput({
+      definition: { ...definition, output: { ...definition.output, maxChars: 100 } },
+      rawArgs: '',
+      source: 'schedule',
+      result: {
+        ...result,
+        businessResult: {
+          rows: [
+            { max_drop: 0.3, total: 120, country: 'X'.repeat(500) },
+            { max_drop: 0.1, total: 80, country: 'SG' },
+          ],
+          totalRows: 2,
+        },
       },
     });
     expect(charLimited.kind).toBe('handoff');
@@ -234,30 +271,104 @@ describe('Frozen Commands definition and positional UX', () => {
       expect(charLimited.prompt).toContain('字符上限');
     }
 
-    const normal = resolveFrozenCommandScheduledOutput(definition, {
-      ...result,
-      businessResult: { rows: [{ max_drop: 0.1, total: 120 }], totalRows: 1 },
+    const normal = resolveFrozenCommandOutput({
+      definition,
+      rawArgs: '',
+      source: 'schedule',
+      result: {
+        ...result,
+        businessResult: { rows: [{ max_drop: 0.1, total: 120 }], totalRows: 1 },
+      },
     });
     expect(normal).toMatchObject({
       kind: 'deliver',
       text: '今日正常，合计 120',
       presentation: {
         schemaVersion: 1,
+        format: 'text',
         fallbackText: '今日正常，合计 120',
-        blocks: [{ type: 'text', text: '今日正常，合计 120' }],
+        blocks: [{ type: 'markdown', markdown: '今日正常，合计 120' }],
       },
     });
 
-    expect(() => resolveFrozenCommandScheduledOutput(definition, {
-      ...result,
-      businessResult: { rows: [{ total: 120 }], totalRows: 1 },
+    expect(() => resolveFrozenCommandOutput({
+      definition,
+      rawArgs: '',
+      source: 'schedule',
+      result: { ...result, businessResult: { rows: [{ total: 120 }], totalRows: 1 } },
     })).toThrowError(/q\.max_drop/);
-    expect(() => resolveFrozenCommandScheduledOutput(definition, {
-      ...result,
-      businessResult: undefined,
-    })).toThrowError(/结果缺失或格式异常/);
+    expect(() => resolveFrozenCommandOutput({
+      definition,
+      rawArgs: '',
+      source: 'schedule',
+      result: { ...result, businessResult: undefined },
+    })).toThrowError(/q\.max_drop/);
     expect(() => evaluateFrozenCommandOutputCondition('not-an-expression', result))
       .toThrowError(/条件表达式/);
+  });
+
+  it('matches ordered rules across run/cmd namespaces and prepends immutable host context', () => {
+    const withRules = BASE
+      .replace('onError: fallback_llm', '')
+      .replace(
+        '  maxChars: 20000',
+        `  maxChars: 20000
+  rules:
+    - when: "{{cmd.args.days}} == '7'"
+      handoff:
+        prompt: "wrong branch"
+    - when: "{{run.status}} == 'ok' && {{cmd.source}} == 'direct'"
+      handoff:
+        prompt: "author prompt for {{cmd.name}}"
+        maxRows: 1`,
+      );
+    const { root, definition } = fixture(withRules);
+    const registry = join(root, 'command-executors.yaml');
+    const current = readFileSync(registry, 'utf8');
+    writeFileSync(registry, current.replace('handoffIncludesInput: false', 'handoffIncludesInput: true'));
+    const result = {
+      referenceDate: '2026-09-21',
+      text: 'ok',
+      presentation: {
+        schemaVersion: 1 as const,
+        format: 'auto' as const,
+        fallbackText: 'ok',
+        blocks: [{ type: 'markdown' as const, markdown: 'ok' }],
+      },
+      truncated: false,
+      executionId: 'exec-ordered',
+      businessResult: { rows: [{ total: 12 }], totalRows: 1 },
+    };
+    const output = resolveFrozenCommandOutput({
+      definition,
+      rawArgs: '30',
+      source: 'direct',
+      result,
+    });
+    expect(output.kind).toBe('handoff');
+    if (output.kind === 'handoff') {
+      expect(output.prompt).toContain('[固化命令上下文]');
+      expect(output.prompt.indexOf('[固化命令上下文]')).toBeLessThan(output.prompt.indexOf('author prompt'));
+      expect(output.prompt).toContain('执行 ID：exec-ordered');
+      expect(output.prompt).toContain('[执行器输入，仅供工具调用，不要向用户展示]');
+      expect(output.prompt).not.toContain('wrong branch');
+    }
+  });
+
+  it('rejects handoff rules when the executor policy does not allow handoff', () => {
+    const withRules = BASE
+      .replace('onError: fallback_llm', '')
+      .replace(
+        '  maxChars: 20000',
+        `  maxChars: 20000
+  rules:
+    - handoff:
+        prompt: "分析结果"`,
+      );
+    const { root, definition } = fixture(withRules);
+    const registry = join(root, 'command-executors.yaml');
+    writeFileSync(registry, readFileSync(registry, 'utf8').replace('allowHandoff: true', 'allowHandoff: false'));
+    expect(() => assertFrozenCommandExecutorContract(definition)).toThrowError(/不允许把结果或失败交给模型/);
   });
 
   it('rejects incomplete conditional output definitions', () => {
@@ -272,6 +383,88 @@ describe('Frozen Commands definition and positional UX', () => {
     const lookup = lookupFrozenCommand({ workingDir: root, command: '/泰国上账' });
     expect(lookup.kind).toBe('invalid');
     if (lookup.kind === 'invalid') expect(lookup.error.code).toBe('definition_invalid_output');
+  });
+
+  it('supports ordered show rules and defaults to output.format when none match', () => {
+    const withShow = BASE
+      .replace('onError: fallback_llm', '')
+      .replace(
+        '  maxChars: 20000',
+        `  format: table
+  maxChars: 20000
+  rules:
+    - when: "{{q.total}} > 100"
+      show:
+        text: "**总量 {{q.total}}**"
+        format: markdown
+    - when: "{{q.total}} == 50"
+      show:
+        format: markdown
+    - when: "{{q.total}} < 0"
+      show: result`,
+      );
+    const { definition } = fixture(withShow);
+    const baseResult = {
+      referenceDate: '2026-09-21',
+      text: '默认结果',
+      presentation: {
+        schemaVersion: 1 as const,
+        format: 'table' as const,
+        fallbackText: '默认结果',
+        blocks: [{ type: 'table' as const, columns: [], rows: [], totalRows: 0, truncated: false }],
+      },
+      truncated: false,
+      businessResult: { rows: [{ total: 120 }], totalRows: 1 },
+    };
+    expect(resolveFrozenCommandOutput({
+      definition,
+      rawArgs: '',
+      source: 'direct',
+      result: baseResult,
+    })).toMatchObject({
+      kind: 'deliver',
+      text: '查询结果：\n**总量 120**',
+      presentation: { blocks: [{ type: 'markdown', markdown: '查询结果：\n**总量 120**' }] },
+    });
+    const formatOverrideResult = { ...baseResult, businessResult: { rows: [{ total: 50 }], totalRows: 1 } };
+    expect(resolveFrozenCommandOutput({
+      definition,
+      rawArgs: '',
+      source: 'direct',
+      result: formatOverrideResult,
+    })).toMatchObject({
+      kind: 'deliver',
+      presentation: { blocks: [{ type: 'markdown', markdown: '默认结果' }] },
+    });
+    const noMatchResult = { ...baseResult, businessResult: { rows: [{ total: 10 }], totalRows: 1 } };
+    expect(resolveFrozenCommandOutput({
+      definition,
+      rawArgs: '',
+      source: 'direct',
+      result: noMatchResult,
+    })).toEqual({ kind: 'deliver', text: '默认结果', presentation: baseResult.presentation });
+  });
+
+  it('requires exactly one action per output rule', () => {
+    const variants = [
+      `  rules:
+    - when: "{{q.total}} > 0"
+      handoff:
+        prompt: "分析"
+      show: result`,
+      `  rules:
+    - when: "{{q.total}} > 0"`,
+    ];
+    for (const rules of variants) {
+      const invalid = BASE.replace('  maxChars: 20000', `  maxChars: 20000\n${rules}`);
+      const root = join(tmpdir(), `botmux-frozen-${process.pid}-${Math.random().toString(36).slice(2)}`);
+      dirs.push(root);
+      mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
+      writeFileSync(join(root, '.botmux', 'commands', '泰国上账.yaml'), invalid);
+      const lookup = lookupFrozenCommand({ workingDir: root, command: '/泰国上账' });
+      expect(lookup.kind).toBe('invalid');
+      if (lookup.kind === 'invalid') expect(lookup.error.message).toContain('必须且只能声明 handoff 或 show');
+    }
   });
 
   it('parses portable output formats and rejects raw HTML', () => {
@@ -302,6 +495,7 @@ describe('Frozen Commands definition and positional UX', () => {
     });
     expect(presentation).toMatchObject({
       schemaVersion: 1,
+      format: 'table',
       fallbackText: '查询结果：\n金额：12',
       blocks: [
         { type: 'markdown', markdown: '查询结果：' },
@@ -355,6 +549,144 @@ describe('Frozen Commands definition and positional UX', () => {
     expect(result.text).toContain('12');
     expect(result.text).not.toContain('amount');
     expect(result.text).not.toContain('SELECT sum');
+  });
+
+  it('connects a second plugin through registry data without host code changes', async () => {
+    const second = BASE
+      .replace('executor: test.plugin.readonly', 'executor: test.report.readonly')
+      .replace('  sql: |-\n    SELECT sum(amount) FROM bills\n    WHERE country = \'TH\' AND dt >= today() - {{days}}\n    LIMIT 100', '  report: "{{days}}"');
+    const { root, definition } = fixture(second);
+    const registry = join(root, 'command-executors.yaml');
+    writeFileSync(registry, `
+schemaVersion: 2
+executors:
+  - id: test.report.readonly
+    kind: plugin-tool
+    plugin: report-plugin
+    tool: render_report
+    minimumVersion: 1.0.0
+    contractVersion: 1
+    arguments:
+      report:
+        type: integer
+        required: true
+        min: 1
+        max: 90
+        accepts: [param]
+    policy:
+      schedulable: true
+      allowHandoff: true
+      handoffIncludesInput: false
+      timeoutMs: 120000
+`);
+    vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', registry);
+    const home = join(root, 'home');
+    const source = join(root, 'report-plugin');
+    mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
+    writeFileSync(join(source, 'package.json'), JSON.stringify({
+      name: '@botmux-ai/plugin-report-fixture',
+      version: '1.0.0',
+      type: 'module',
+      keywords: ['botmux-plugin'],
+      botmux: { schemaVersion: 1, id: 'report-plugin' },
+    }));
+    writeFileSync(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({
+      transport: 'stdio',
+      command: [process.execPath, resolve('test/fixtures/plugin-mcp-server.mjs'), 'report'],
+    }));
+    vi.stubEnv('HOME', home);
+    vi.stubEnv('SESSION_DATA_DIR', join(home, '.botmux', 'data'));
+    installLocalPlugin(source);
+
+    const result = await executeFrozenCommand({
+      definition,
+      rawArgs: '30',
+      targetLarkAppId: 'cli_test',
+      botConfig: { plugins: ['report-plugin'], larkAppId: 'cli_test', larkAppSecret: 'test-secret' },
+      trustedCaller: {
+        requestUserOpenId: 'ou_test',
+        requestUserUnionId: 'on_test',
+        requestLarkAppId: 'cli_test',
+        senderType: 'user',
+      },
+      turnId: 'om_turn',
+      dataDir: join(home, '.botmux', 'data'),
+    });
+
+    expect(result).toMatchObject({ executorId: 'test.report.readonly', text: 'second-plugin-ok' });
+  });
+
+  it('adapts an ordinary MCP JSON tool through registry projection only', async () => {
+    const ordinary = BASE
+      .replace('executor: test.plugin.readonly', 'executor: test.json.readonly')
+      .replace(
+        "  sql: |-\n    SELECT sum(amount) FROM bills\n    WHERE country = 'TH' AND dt >= today() - {{days}}\n    LIMIT 100",
+        '  days: "{{days}}"',
+      )
+      .replace('output:\n', 'output:\n  format: table\n  text: "{{result.rows}}"\n');
+    const { root, definition } = fixture(ordinary);
+    const registry = join(root, 'command-executors.yaml');
+    writeFileSync(registry, `
+schemaVersion: 2
+executors:
+  - id: test.json.readonly
+    kind: plugin-tool
+    plugin: json-report-plugin
+    tool: read_report
+    minimumVersion: 1.0.0
+    arguments:
+      days:
+        type: integer
+        required: true
+        min: 1
+        max: 90
+        accepts: [param]
+    policy:
+      schedulable: true
+      allowHandoff: true
+      timeoutMs: 120000
+    output:
+      format: json
+      container: rows
+      exposeRowFields: [name, total]
+`);
+    vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', registry);
+    const home = join(root, 'home');
+    const source = join(root, 'json-report-plugin');
+    mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
+    writeFileSync(join(source, 'package.json'), JSON.stringify({
+      name: '@botmux-ai/plugin-json-report-fixture',
+      version: '1.0.0',
+      type: 'module',
+      keywords: ['botmux-plugin'],
+      botmux: { schemaVersion: 1, id: 'json-report-plugin' },
+    }));
+    writeFileSync(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({
+      transport: 'stdio',
+      command: [process.execPath, resolve('test/fixtures/plugin-mcp-server.mjs'), 'json-report'],
+    }));
+    vi.stubEnv('HOME', home);
+    vi.stubEnv('SESSION_DATA_DIR', join(home, '.botmux', 'data'));
+    installLocalPlugin(source);
+
+    const result = await executeFrozenCommand({
+      definition,
+      rawArgs: '30',
+      targetLarkAppId: 'cli_test',
+      botConfig: { plugins: ['json-report-plugin'], larkAppId: 'cli_test', larkAppSecret: 'test-secret' },
+      trustedCaller: {
+        requestUserOpenId: 'ou_test',
+        requestUserUnionId: 'on_test',
+        requestLarkAppId: 'cli_test',
+        senderType: 'user',
+      },
+      turnId: 'om_turn',
+      dataDir: join(home, '.botmux', 'data'),
+    });
+
+    expect(result.projectedResult).toEqual({ rows: [{ name: 'report-30', total: 12 }] });
+    expect(result.text).not.toContain('hidden');
+    expect(result.presentation.blocks.some(block => block.type === 'table')).toBe(true);
   });
 
   it('fails closed before opening Data MCP when the triggering identity is absent', async () => {
@@ -413,36 +745,46 @@ describe('Frozen Commands definition and positional UX', () => {
     });
   });
 
-  it('never falls back Data MCP frozen queries to a model', () => {
+  it('converts legacy fallback into an explicit transient-error rule and keeps gates out', () => {
     const { definition } = fixture(BASE);
     const transientError = new FrozenCommandError(
-      'data_mcp_unavailable',
+      'plugin_tool_unavailable',
       'down',
       undefined,
       true,
+      true,
+      'exec-test',
     );
-    expect(shouldFallbackFrozenCommand(
+    const handoff = resolveFrozenCommandOutput({
       definition,
-      transientError,
-    )).toBe(false);
-    expect(shouldFallbackFrozenCommand(
-      { ...definition, executor: 'custom.readonly' },
-      transientError,
-    )).toBe(true);
-    expect(shouldFallbackFrozenCommand(
+      rawArgs: '30',
+      source: 'direct',
+      error: transientError,
+    });
+    expect(handoff).toMatchObject({ kind: 'handoff' });
+    if (handoff.kind === 'handoff') {
+      expect(handoff.prompt).toContain('[固化命令上下文]');
+      expect(handoff.prompt).toContain('plugin_tool_unavailable');
+      expect(handoff.prompt).not.toContain('down');
+      expect(handoff.prompt).toContain('插件工具暂时不可用');
+      expect(handoff.prompt).not.toContain('[执行器输入');
+    }
+    expect(() => resolveFrozenCommandOutput({
       definition,
-      new FrozenCommandError('untrusted_caller', 'denied'),
-    )).toBe(false);
-    expect(isTransientDataMcpFailure('connection closed by peer')).toBe(true);
-    expect(isTransientDataMcpFailure('Unknown identifier amount after schema migration')).toBe(true);
-    expect(isTransientDataMcpFailure('memory limit exceeded')).toBe(false);
-    expect(isTransientDataMcpFailure('sql_guard rejected non-select statement')).toBe(false);
+      rawArgs: '30',
+      source: 'direct',
+      error: new FrozenCommandError('untrusted_caller', 'denied'),
+    })).toThrowError(/denied/);
+    expect(isTransientPluginToolFailure('connection closed by peer')).toBe(true);
+    expect(isTransientPluginToolFailure('Unknown identifier amount after schema migration')).toBe(false);
+    expect(isTransientPluginToolFailure('memory limit exceeded')).toBe(false);
+    expect(isTransientPluginToolFailure('policy rejected request')).toBe(false);
     expect(userFacingFrozenCommandError(
-      new FrozenCommandError('data_mcp_validate_failed', 'bad near SELECT secret FROM t'),
-    )).not.toContain('SELECT secret');
+      new FrozenCommandError('provider_validation_failed', 'bad near private template'),
+    )).not.toContain('private template');
     expect(userFacingFrozenCommandError(
-      new FrozenCommandError('data_mcp_validate_failed', 'bad near SELECT secret FROM t'),
-    )).not.toContain('data_mcp_validate_failed');
+      new FrozenCommandError('provider_validation_failed', 'bad near private template'),
+    )).not.toContain('provider_validation_failed');
   });
 
   it('rejects a command definition symlink instead of escaping the role directory', () => {

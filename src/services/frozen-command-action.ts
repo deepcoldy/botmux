@@ -32,14 +32,12 @@ export interface FrozenCommandActionRecord {
   command: string;
   rawArgs: string;
   normalizedArgs: Array<{ name: string; label: string; value: string }>;
-  datasource?: string;
   executorId: string;
   executorRevision: string;
   specHash: string;
   revisionId: string;
   cardMessageId?: string;
   callbackEventId?: string;
-  queryId?: string;
   errorCode?: string;
   createdAt: string;
   expiresAt: string;
@@ -48,7 +46,7 @@ export interface FrozenCommandActionRecord {
 
 export interface CreateFrozenCommandActionInput
   extends Omit<FrozenCommandActionRecord,
-    'id' | 'status' | 'cardMessageId' | 'queryId' | 'errorCode' | 'createdAt' | 'expiresAt' | 'updatedAt'> {
+    'id' | 'status' | 'cardMessageId' | 'errorCode' | 'createdAt' | 'expiresAt' | 'updatedAt'> {
   ttlMs?: number;
   now?: Date;
 }
@@ -85,14 +83,12 @@ CREATE TABLE IF NOT EXISTS command_actions (
   command TEXT NOT NULL,
   raw_args TEXT NOT NULL,
   normalized_args_json TEXT NOT NULL,
-  datasource TEXT,
   executor_id TEXT,
   executor_revision TEXT,
   spec_hash TEXT NOT NULL,
   revision_id TEXT NOT NULL,
   card_message_id TEXT,
   callback_event_id TEXT,
-  query_id TEXT,
   error_code TEXT,
   created_at TEXT NOT NULL,
   expires_at TEXT NOT NULL,
@@ -123,14 +119,12 @@ interface ActionRow {
   command: string;
   raw_args: string;
   normalized_args_json: string;
-  datasource: string | null;
   executor_id: string | null;
   executor_revision: string | null;
   spec_hash: string;
   revision_id: string;
   card_message_id: string | null;
   callback_event_id: string | null;
-  query_id: string | null;
   error_code: string | null;
   created_at: string;
   expires_at: string;
@@ -221,14 +215,12 @@ function parseRow(row: ActionRow): FrozenCommandActionRecord {
     command: row.command,
     rawArgs: row.raw_args,
     normalizedArgs,
-    ...(row.datasource ? { datasource: row.datasource } : {}),
-    executorId: row.executor_id ?? 'builtin.data-mcp.readonly',
+    executorId: row.executor_id ?? '',
     executorRevision: row.executor_revision ?? '',
     specHash: row.spec_hash,
     revisionId: row.revision_id,
     ...(row.card_message_id ? { cardMessageId: row.card_message_id } : {}),
     ...(row.callback_event_id ? { callbackEventId: row.callback_event_id } : {}),
-    ...(row.query_id ? { queryId: row.query_id } : {}),
     ...(row.error_code ? { errorCode: row.error_code } : {}),
     createdAt: row.created_at,
     expiresAt: row.expires_at,
@@ -255,15 +247,15 @@ export function createFrozenCommandAction(
       id,nonce_hash,status,target_bot_id,chat_id,chat_type,root_message_id,scope,
       session_id,turn_id,dispatch_attempt,working_dir,source_message_id,source_content_hash,
       intent_schema_version,parser_version,
-      actor_open_id,actor_union_id,command,raw_args,normalized_args_json,datasource,
+      actor_open_id,actor_union_id,command,raw_args,normalized_args_json,
       executor_id,executor_revision,spec_hash,revision_id,created_at,expires_at,updated_at
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       id, sha256(nonce), 'pending', input.targetBotId, input.chatId, input.chatType,
       input.rootMessageId, input.scope, input.sessionId, input.turnId,
       input.dispatchAttempt, input.workingDir, input.sourceMessageId,
       input.sourceContentHash, input.intentSchemaVersion, input.parserVersion,
       input.actorOpenId, input.actorUnionId, input.command,
-      input.rawArgs, JSON.stringify(input.normalizedArgs), input.datasource ?? null,
+      input.rawArgs, JSON.stringify(input.normalizedArgs),
       input.executorId, input.executorRevision,
       input.specHash, input.revisionId, createdAt, expiresAt, createdAt,
     );
@@ -291,7 +283,6 @@ export function createFrozenCommandAction(
       command: input.command,
       rawArgs: input.rawArgs,
       normalizedArgs: input.normalizedArgs,
-      ...(input.datasource ? { datasource: input.datasource } : {}),
       executorId: input.executorId,
       executorRevision: input.executorRevision,
       specHash: input.specHash,
@@ -399,19 +390,18 @@ export function settleFrozenCommandAction(input: {
   dataDir: string;
   id: string;
   status: 'completed' | 'failed';
-  queryId?: string;
   errorCode?: string;
   now?: Date;
 }): boolean {
   const now = (input.now ?? new Date()).toISOString();
   return withDb(input.dataDir, db => Number(db.prepare(`UPDATE command_actions
-    SET status=?,query_id=?,error_code=?,updated_at=?
+    SET status=?,error_code=?,updated_at=?
     WHERE id=? AND status='executing'`)
-    .run(input.status, input.queryId ?? null, input.errorCode ?? null, now, input.id).changes) === 1);
+    .run(input.status, input.errorCode ?? null, now, input.id).changes) === 1);
 }
 
 /** Crash recovery is deliberately fail-closed: an executing read may already
- * have reached Data MCP, so it is never replayed after daemon restart. */
+ * have reached its external executor, so it is never replayed after restart. */
 export function expireInterruptedFrozenCommandActions(
   dataDir: string,
   targetBotId: string,

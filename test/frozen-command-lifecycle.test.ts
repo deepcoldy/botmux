@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { lookupFrozenCommand } from '../src/services/frozen-command.js';
 import {
   cancelFrozenCommandTransition,
@@ -21,7 +21,7 @@ const ACTIVE = `
 schemaVersion: 2
 name: 生命周期测试
 description: 生命周期测试命令
-executor: builtin.data-mcp.readonly
+executor: test.plugin.readonly
 params:
   - name: value
     type: integer
@@ -43,6 +43,29 @@ function setup(): { root: string; dataDir: string; file: string } {
   const file = join(root, '.botmux', 'commands', '生命周期测试.yaml');
   mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
   writeFileSync(file, ACTIVE);
+  const registry = join(root, 'plugin-executors.yaml');
+  writeFileSync(registry, `
+schemaVersion: 2
+executors:
+  - id: test.plugin.readonly
+    kind: plugin-tool
+    plugin: fixture-plugin
+    tool: render_report
+    minimumVersion: 1.0.0
+    contractVersion: 1
+    arguments:
+      sql:
+        type: string
+        required: true
+        maxLength: 10000
+        accepts: [literal]
+    policy:
+      schedulable: true
+      allowHandoff: true
+      handoffIncludesInput: false
+      timeoutMs: 5000
+`);
+  vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', registry);
   return { root, dataDir, file };
 }
 
@@ -59,6 +82,35 @@ function prepare(input: ReturnType<typeof setup>, action: 'retire' | 'restore' |
     replacement: action === 'retire' ? '/新命令' : undefined,
   });
 }
+
+beforeEach(() => {
+  const root = join(tmpdir(), `botmux-frozen-lifecycle-registry-${process.pid}-${Math.random().toString(36).slice(2)}`);
+  roots.push(root);
+  mkdirSync(root, { recursive: true });
+  const registry = join(root, 'executors.yaml');
+  writeFileSync(registry, `
+schemaVersion: 2
+executors:
+  - id: test.plugin.readonly
+    kind: plugin-tool
+    plugin: fixture-plugin
+    tool: render_report
+    minimumVersion: 1.0.0
+    contractVersion: 1
+    arguments:
+      sql:
+        type: string
+        required: true
+        maxLength: 10000
+        accepts: [literal]
+    policy:
+      schedulable: true
+      allowHandoff: true
+      handoffIncludesInput: false
+      timeoutMs: 5000
+`);
+  vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', registry);
+});
 
 afterEach(() => {
   vi.unstubAllEnvs();

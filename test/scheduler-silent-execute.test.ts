@@ -245,6 +245,7 @@ function installScheduledFrozenFixture(
   mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
   mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
   writeFileSync(join(root, '.botmux', 'commands', '泰国上账.yaml'), yaml);
+  const registry = writeScheduledExecutorRegistry(root);
   writeFileSync(join(source, 'package.json'), JSON.stringify({
     name: '@botmux-ai/plugin-data-mcp', version: '0.1.0', type: 'module',
     keywords: ['botmux-plugin'], botmux: { schemaVersion: 1, id: 'data-mcp' },
@@ -255,6 +256,7 @@ function installScheduledFrozenFixture(
   }));
   vi.stubEnv('HOME', home);
   vi.stubEnv('SESSION_DATA_DIR', join(home, '.botmux', 'data'));
+  vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', registry);
   config.session.dataDir = join(home, '.botmux', 'data');
   (BOT.config as any).plugins = ['data-mcp'];
   installLocalPlugin(source);
@@ -289,11 +291,37 @@ function installScheduledFrozenFixture(
   };
 }
 
+function writeScheduledExecutorRegistry(root: string): string {
+  const registry = join(root, 'command-executors.yaml');
+  writeFileSync(registry, `
+schemaVersion: 2
+executors:
+  - id: test.plugin.readonly
+    kind: plugin-tool
+    plugin: data-mcp
+    tool: execute_frozen_query
+    minimumVersion: 0.1.0
+    contractVersion: 1
+    arguments:
+      sql:
+        type: string
+        required: true
+        maxLength: 10000
+        accepts: [literal]
+    policy:
+      schedulable: true
+      allowHandoff: true
+      handoffIncludesInput: false
+      timeoutMs: 120000
+`);
+  return registry;
+}
+
 const SCHEDULED_FROZEN_YAML = `
 schemaVersion: 2
 name: 泰国上账
 description: 查询泰国最近 N 天的上账金额
-executor: builtin.data-mcp.readonly
+executor: test.plugin.readonly
 params:
   - name: days
     type: integer
@@ -577,13 +605,13 @@ output:
     const fixture = installScheduledFrozenFixture(`${SCHEDULED_FROZEN_YAML}
 output:
   maxChars: 20000
-  when: "{{q.amount}} > 10"
-  handoff:
-    prompt: "金额异常，请分析"
-    data: "{{q.rows}}"
-    maxRows: 50
-  else:
-    text: "今日正常，合计 {{q.amount}}"
+  rules:
+    - when: "{{q.amount}} > 10"
+      handoff:
+        prompt: "金额异常，请分析"
+        data: "{{q.rows}}"
+        maxRows: 50
+    - show: result
 `);
     try {
       await executeScheduledTask(baseTask({
@@ -680,11 +708,12 @@ output:
     try {
       const dataDir = join(root, 'data');
       mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
+      vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', writeScheduledExecutorRegistry(root));
       writeFileSync(join(root, '.botmux', 'commands', '泰国上账.yaml'), `
 schemaVersion: 2
 name: 泰国上账
 description: 即将废弃的命令
-executor: builtin.data-mcp.readonly
+executor: test.plugin.readonly
 params: []
 input:
   sql: SELECT 1

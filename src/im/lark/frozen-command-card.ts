@@ -19,7 +19,6 @@ export interface FrozenCommandCenterRow {
   usage?: string;
   description?: string;
   executor?: string;
-  datasource?: string;
   state: 'active' | 'retired' | 'revoked' | 'invalid' | 'unapproved';
   reason?: string;
 }
@@ -81,30 +80,25 @@ function sanitizeRichMarkdown(value: string): string {
   return value.replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-/** Render the channel-neutral frozen-command presentation for Feishu. Plain
- * text keeps the legacy message shape; markdown/table output becomes a safe
- * schema-v2 card through the shared markdown renderer (raw HTML is disabled
- * there). */
+/** Render the channel-neutral frozen-command presentation for Feishu. The
+ * effective command format, rather than a block variant, owns the transport
+ * choice: `text` stays a plain message while every other format becomes a
+ * safe schema-v2 card. */
 export function renderFrozenCommandLarkReply(
   presentation: FrozenCommandPresentation,
   workingDir = process.cwd(),
 ): FrozenCommandLarkReply {
-  if (presentation.blocks.length === 1 && presentation.blocks[0]?.type === 'text') {
+  if (presentation.format === 'text') {
     return {
-      content: truncateUtf8(safeLarkText(presentation.blocks[0].text), MAX_FROZEN_LARK_TEXT_BYTES),
+      content: truncateUtf8(safeLarkText(presentation.fallbackText), MAX_FROZEN_LARK_TEXT_BYTES),
       msgType: 'text',
     };
   }
-  const elements = presentation.blocks.flatMap(block => {
-    if (block.type === 'text') {
-      return buildCardBodyElements(escapeMd(block.text), workingDir, 'disabled');
-    }
-    return buildCardBodyElements(
-      block.type === 'markdown' ? sanitizeRichMarkdown(block.markdown) : markdownTable(block),
-      workingDir,
-      'disabled',
-    );
-  });
+  const elements = presentation.blocks.flatMap(block => buildCardBodyElements(
+    block.type === 'markdown' ? sanitizeRichMarkdown(block.markdown) : markdownTable(block),
+    workingDir,
+    'disabled',
+  ));
   if (elements.length === 0) {
     return {
       content: truncateUtf8(safeLarkText(presentation.fallbackText), MAX_FROZEN_LARK_TEXT_BYTES),
@@ -133,7 +127,7 @@ export function buildFrozenCommandCenterCard(input: {
       content: [
         `当前机器人：**${escapeMd(input.botLabel)}**`,
         `工作目录：**${escapeMd(input.workingDirLabel)}**`,
-        '只展示命令元数据，不展示 SQL 或敏感输入。',
+        '只展示命令元数据，不展示内部模板或敏感输入。',
       ].join('\n'),
     },
   }, { tag: 'hr' }];
@@ -162,7 +156,6 @@ export function buildFrozenCommandCenterCard(input: {
             row.description ? escapeMd(row.description) : undefined,
             row.usage ? `用法：${escapeMd(row.usage)}` : undefined,
             row.executor ? `执行器：${escapeMd(row.executor)}` : undefined,
-            row.datasource ? `数据源：${escapeMd(row.datasource)}` : undefined,
             row.reason ? `说明：${escapeMd(row.reason)}` : undefined,
           ].filter(Boolean).join('\n'),
         },
@@ -173,7 +166,7 @@ export function buildFrozenCommandCenterCard(input: {
     tag: 'div',
     text: {
       tag: 'lark_md',
-      content: '需要执行时直接发送“/命令 参数”或“运行 /命令 参数”。系统会直接执行，不再展示运行确认卡。',
+      content: '需要执行时直接发送“/命令 参数”或“运行 /命令 参数”。系统默认直接展示结果；命令显式配置交接规则时，结果或执行失败可交给模型。运行不再展示确认卡。',
     },
   });
   return card({
@@ -186,6 +179,7 @@ export function buildFrozenCommandPreviewCard(input: {
   action: FrozenCommandActionRecord;
   nonce: string;
   initiatorLabel: string;
+  handoffConfigured?: boolean;
 }): string {
   const args = input.action.normalizedArgs.length > 0
     ? input.action.normalizedArgs
@@ -203,12 +197,10 @@ export function buildFrozenCommandPreviewCard(input: {
             `命令：**/${escapeMd(input.action.command)}**`,
             `参数：\n${args}`,
             `执行器：**${escapeMd(input.action.executorId)}**`,
-            ...(input.action.datasource ? [`数据源：**${escapeMd(input.action.datasource)}**`] : []),
             `发起人：${escapeMd(input.initiatorLabel)}`,
+            `模型交接：${input.handoffConfigured ? '**已配置，结果或执行失败命中规则时会交给模型**' : '未配置'}`,
             '',
-            input.action.executorId === 'builtin.data-mcp.readonly'
-              ? '确认后将以你的真实账号权限执行一次查询；SQL 不会在卡片中展示。'
-              : '确认后将运行一次已批准的只读白名单能力。确认卡是本次操作确认，不是额外授权；身份与权限仍由执行路径校验。',
+            '确认后将运行一次已批准的只读白名单能力。确认卡是本次操作确认，不是额外授权；身份与权限仍由执行路径校验。',
           ].join('\n'),
         },
       }, {
@@ -254,7 +246,7 @@ export function buildFrozenCommandPreviewCard(input: {
 }
 
 export function buildFrozenCommandActionStatusCard(
-  action: Pick<FrozenCommandActionRecord, 'command' | 'status' | 'queryId' | 'errorCode'>,
+  action: Pick<FrozenCommandActionRecord, 'command' | 'status' | 'errorCode'>,
 ): Record<string, unknown> {
   const state = action.status === 'executing'
     ? { title: '正在执行', template: 'blue', text: '请求已受理，请勿重复点击。查询结果会发送到原会话。' }
@@ -323,6 +315,7 @@ export function buildFrozenCommandLifecyclePreviewCard(input: {
             ...(currentHash && nextHash && currentHash !== nextHash
               ? [`定义变更：\`${currentHash}\` → \`${nextHash}\``]
               : nextHash ? [`定义 hash：\`${nextHash}\``] : []),
+            `模型交接：${input.transition.handoffConfigured ? '**已配置，结果或执行失败命中规则时会交给模型**' : '未配置'}`,
             `有效期至：${escapeMd(input.transition.expiresAt)}`,
             '',
             presentation.warning,

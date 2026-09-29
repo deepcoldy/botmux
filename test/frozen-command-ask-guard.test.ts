@@ -56,15 +56,36 @@ describe('frozen-command generic ask guard', () => {
     const dataDir = join(root, 'data');
     const workingDir = join(root, 'repo');
     mkdirSync(join(workingDir, '.botmux', 'commands'), { recursive: true });
+    const registry = join(root, 'command-executors.yaml');
+    writeFileSync(registry, `
+schemaVersion: 2
+executors:
+  - id: test.plugin.readonly
+    kind: plugin-tool
+    plugin: fixture-plugin
+    tool: render_report
+    minimumVersion: 1.0.0
+    contractVersion: 1
+    arguments:
+      value:
+        type: string
+        required: true
+        maxLength: 20
+        accepts: [literal]
+    policy:
+      schedulable: true
+      allowHandoff: false
+      timeoutMs: 5000
+`);
     writeFileSync(join(workingDir, '.botmux', 'commands', '泰国上账.yaml'), `
 schemaVersion: 2
 name: 泰国上账
 description: 查询泰国上账
-executor: builtin.data-mcp.readonly
+executor: test.plugin.readonly
 timezone: Asia/Bangkok
 params: []
 input:
-  sql: SELECT 1
+  value: fixture
 output:
   maxChars: 2000
 onError: fail
@@ -89,6 +110,7 @@ onError: fail
       BOTMUX_LARK_APP_ID: 'cli_guard',
       BOTMUX_ROOT_MESSAGE_ID: 'om_guard',
       BOTMUX_DAEMON_IPC_PORT: '1',
+      BOTMUX_COMMAND_EXECUTORS_FILE: registry,
       BOTMUX_WORKFLOW: '',
     };
     const args = (prompt: string) => [

@@ -17,10 +17,14 @@ import { basename, isAbsolute, join, resolve } from 'node:path';
 import { TextDecoder } from 'node:util';
 import { parse as parseYaml } from 'yaml';
 import type { BotConfig } from '../bot-registry.js';
+import { assertValidPluginId } from '../core/plugins/ids.js';
 import { applySessionOwnerEnv } from '../utils/child-env.js';
+import { logger } from '../utils/logger.js';
 
 const EXECUTOR_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const ARGUMENT_NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
+const TOOL_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const STABLE_VERSION_RE = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const HASH_RE = /^[a-f0-9]{64}$/;
 const MAX_EXECUTORS = 256;
 const MAX_ARTIFACTS = 32;
@@ -30,11 +34,14 @@ const MAX_PROJECTED_ROWS = 1_000;
 const MAX_PROJECTED_FIELDS = 64;
 const JSON_PATH_RE = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/;
 const FORBIDDEN_PATH_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor']);
-
-export const BUILTIN_DATA_MCP_EXECUTOR_ID = 'builtin.data-mcp.readonly';
-export const BUILTIN_DATA_MCP_EXECUTOR_REVISION = createHash('sha256')
-  .update('botmux:builtin.data-mcp.readonly:v2')
-  .digest('hex');
+const FORBIDDEN_PLUGIN_IDENTITY_ARGUMENTS = new Set([
+  'calleropenid',
+  'callerunionid',
+  'requestuseropenid',
+  'requestuserunionid',
+  'useropenid',
+  'userunionid',
+]);
 
 export class CommandExecutorError extends Error {
   constructor(readonly code: string, message: string, options?: ErrorOptions) {
@@ -70,9 +77,9 @@ export interface ProcessCommandExecutor {
   arguments: Record<string, CommandExecutorArgument>;
   scriptArtifacts: Array<{ realpath: string; sha256: string; size: number }>;
   policy: {
-    risk: 'read';
     schedulable: boolean;
     allowHandoff: boolean;
+    handoffIncludesInput: boolean;
     timeoutMs: number;
     maxOutputBytes: number;
   };
@@ -80,9 +87,30 @@ export interface ProcessCommandExecutor {
   revision: string;
 }
 
+export interface PluginToolCommandExecutor {
+  id: string;
+  kind: 'plugin-tool';
+  plugin: string;
+  tool: string;
+  minimumVersion: string;
+  contractVersion?: number;
+  output?: CommandExecutorOutput;
+  arguments: Record<string, CommandExecutorArgument>;
+  policy: {
+    schedulable: boolean;
+    allowHandoff: boolean;
+    handoffIncludesInput: boolean;
+    timeoutMs: number;
+  };
+  revision: string;
+}
+
+export type CommandExecutor = ProcessCommandExecutor | PluginToolCommandExecutor;
+
 export interface CommandExecutorRegistry {
   filePath: string;
-  executors: Map<string, ProcessCommandExecutor>;
+  executors: Map<string, CommandExecutor>;
+  aliases: Map<string, string>;
 }
 
 export interface CommandExecutorAuthoringSchema {
@@ -322,16 +350,104 @@ function parseOutput(value: unknown, executorId: string): CommandExecutorOutput 
   };
 }
 
-function parseExecutor(value: unknown, index: number): ProcessCommandExecutor {
-  if (!isPlainObject(value)) throw new CommandExecutorError('executor_invalid', `executors[${index}] 必须是对象`);
+function parseArguments(value: unknown, id: string): Record<string, CommandExecutorArgument> {
+  if (!isPlainObject(value)) throw new CommandExecutorError('executor_argument_invalid', `${id}.arguments 必须是对象`);
+  if (Object.keys(value).length > 32) throw new CommandExecutorError('executor_argument_invalid', `${id}.arguments 最多 32 项`);
+  return Object.fromEntries(Object.entries(value).map(([name, argument]) => [name, parseArgument(name, argument)]));
+}
+
+function parseCommonPolicy(value: unknown, id: string): {
+  schedulable: boolean;
+  allowHandoff: boolean;
+  handoffIncludesInput: boolean;
+  timeoutMs: number;
+} {
+  if (!isPlainObject(value)) throw new CommandExecutorError('executor_policy_invalid', `${id}.policy 必须是对象`);
+  if (value.risk !== undefined) {
+    logger.warn(`[frozen-command] ${id}.policy.risk 已废弃并被忽略；只读边界由 executor 登记人负责`);
+  }
+  for (const field of ['schedulable', 'allowHandoff', 'handoffIncludesInput'] as const) {
+    if (value[field] !== undefined && typeof value[field] !== 'boolean') {
+      throw new CommandExecutorError('executor_policy_invalid', `${id}: ${field} 必须是布尔值`);
+    }
+  }
+  return {
+    schedulable: value.schedulable === true,
+    allowHandoff: value.allowHandoff === true,
+    handoffIncludesInput: value.handoffIncludesInput === true,
+    timeoutMs: positiveInteger(value.timeoutMs, `${id}.policy.timeoutMs`, 100, 10 * 60_000),
+  };
+}
+
+function parsePluginToolExecutor(
+  value: Record<string, unknown>,
+  id: string,
+  index: number,
+): PluginToolCommandExecutor {
+  onlyKeys(value, ['id', 'kind', 'plugin', 'tool', 'minimumVersion', 'contractVersion', 'arguments', 'policy', 'output'], `executors[${index}]`);
+  let pluginId: string;
+  try {
+    pluginId = assertValidPluginId(value.plugin, `${id}.plugin`);
+  } catch {
+    throw new CommandExecutorError('executor_plugin_invalid', `${id}.plugin 不合法`);
+  }
+  const tool = nonBlank(value.tool, `${id}.tool`, 128);
+  if (!TOOL_NAME_RE.test(tool)) {
+    throw new CommandExecutorError('executor_plugin_invalid', `${id}.tool 不合法`);
+  }
+  const minimumVersion = nonBlank(value.minimumVersion, `${id}.minimumVersion`, 64);
+  if (!STABLE_VERSION_RE.test(minimumVersion)) {
+    throw new CommandExecutorError('executor_plugin_invalid', `${id}.minimumVersion 必须是稳定语义版本 x.y.z`);
+  }
+  const contractVersion = value.contractVersion === undefined
+    ? undefined
+    : positiveInteger(value.contractVersion, `${id}.contractVersion`, 1, 1_000);
+  const output = value.output === undefined ? undefined : parseOutput(value.output, id);
+  if ((contractVersion === undefined) === (output === undefined)) {
+    throw new CommandExecutorError(
+      'executor_plugin_invalid',
+      `${id}: plugin-tool 必须且只能声明 contractVersion（富结果）或 output（普通 JSON 投影）`,
+    );
+  }
+  const argumentsSchema = parseArguments(value.arguments, id);
+  const declaresIdentityArgument = Object.keys(argumentsSchema).some(name => (
+    FORBIDDEN_PLUGIN_IDENTITY_ARGUMENTS.has(name.toLowerCase().replace(/[^a-z0-9]/g, ''))
+  ));
+  if (declaresIdentityArgument
+    || Object.values(argumentsSchema).some(argument => argument.accepts.some(source => source.startsWith('context:caller.')))) {
+    throw new CommandExecutorError(
+      'executor_identity_invalid',
+      `${id}: plugin-tool 身份只允许由宿主通过可信 _meta 注入，arguments 不得声明 caller 身份来源`,
+    );
+  }
+  if (!isPlainObject(value.policy)) {
+    throw new CommandExecutorError('executor_policy_invalid', `${id}.policy 必须是对象`);
+  }
+  onlyKeys(value.policy, ['risk', 'schedulable', 'allowHandoff', 'handoffIncludesInput', 'timeoutMs'], `${id}.policy`);
+  const normalized = {
+    id,
+    kind: 'plugin-tool',
+    plugin: pluginId,
+    tool,
+    minimumVersion,
+    ...(contractVersion === undefined ? {} : { contractVersion }),
+    ...(output === undefined ? {} : { output }),
+    arguments: argumentsSchema,
+    policy: parseCommonPolicy(value.policy, id),
+  } satisfies Omit<PluginToolCommandExecutor, 'revision'>;
+  return { ...normalized, revision: sha256(canonicalJson(normalized)) };
+}
+
+function parseProcessExecutor(
+  value: Record<string, unknown>,
+  id: string,
+  index: number,
+): ProcessCommandExecutor {
   onlyKeys(value, ['id', 'kind', 'executable', 'fixedArgs', 'arguments', 'scriptArtifacts', 'policy', 'output'], `executors[${index}]`);
-  const id = nonBlank(value.id, `executors[${index}].id`, 128);
-  if (!EXECUTOR_ID_RE.test(id) || id.startsWith('builtin.')) {
-    throw new CommandExecutorError('executor_id_invalid', `非法 executor id：${id}`);
-  }
   if (value.kind !== 'process' && value.kind !== 'script') {
-    throw new CommandExecutorError('executor_kind_invalid', `${id}.kind 必须是 process 或 script`);
+    throw new CommandExecutorError('executor_kind_invalid', `${id}.kind 必须是 process、script 或 plugin-tool`);
   }
+  if (!isPlainObject(value)) throw new CommandExecutorError('executor_invalid', `executors[${index}] 必须是对象`);
   if (!isPlainObject(value.executable)) throw new CommandExecutorError('executor_path_invalid', `${id}.executable 必须是对象`);
   onlyKeys(value.executable, ['realpath'], `${id}.executable`);
   const executable = assertCanonicalRegularFile(
@@ -344,9 +460,7 @@ function parseExecutor(value: unknown, index: number): ProcessCommandExecutor {
     throw new CommandExecutorError('executor_invalid_fixed_args', `${id}.fixedArgs 必须是最多 64 项的数组`);
   }
   const fixedArgs = value.fixedArgs.map((arg, argIndex) => nonBlank(arg, `${id}.fixedArgs[${argIndex}]`, 4_096));
-  if (!isPlainObject(value.arguments)) throw new CommandExecutorError('executor_argument_invalid', `${id}.arguments 必须是对象`);
-  if (Object.keys(value.arguments).length > 32) throw new CommandExecutorError('executor_argument_invalid', `${id}.arguments 最多 32 项`);
-  const args = Object.fromEntries(Object.entries(value.arguments).map(([name, arg]) => [name, parseArgument(name, arg)]));
+  const args = parseArguments(value.arguments, id);
   if (basename(executable.realpath) === 'lark-cli') {
     const asIndex = fixedArgs.indexOf('--as');
     if (asIndex < 0 || fixedArgs[asIndex + 1] !== 'bot' || Object.values(args).some(arg => arg.flag === '--as')) {
@@ -357,13 +471,7 @@ function parseExecutor(value: unknown, index: number): ProcessCommandExecutor {
     }
   }
   if (!isPlainObject(value.policy)) throw new CommandExecutorError('executor_policy_invalid', `${id}.policy 必须是对象`);
-  onlyKeys(value.policy, ['risk', 'schedulable', 'allowHandoff', 'timeoutMs', 'maxOutputBytes'], `${id}.policy`);
-  if (value.policy.risk !== 'read') {
-    throw new CommandExecutorError('executor_risk_unsupported', `${id}: 首版只允许 risk=read`);
-  }
-  if (typeof value.policy.schedulable !== 'boolean' || typeof value.policy.allowHandoff !== 'boolean') {
-    throw new CommandExecutorError('executor_policy_invalid', `${id}: schedulable/allowHandoff 必须是布尔值`);
-  }
+  onlyKeys(value.policy, ['risk', 'schedulable', 'allowHandoff', 'handoffIncludesInput', 'timeoutMs', 'maxOutputBytes'], `${id}.policy`);
   const scriptPaths = value.scriptArtifacts ?? [];
   if (!Array.isArray(scriptPaths) || scriptPaths.length > MAX_ARTIFACTS) {
     throw new CommandExecutorError('executor_artifacts_invalid', `${id}.scriptArtifacts 最多 ${MAX_ARTIFACTS} 项`);
@@ -394,10 +502,7 @@ function parseExecutor(value: unknown, index: number): ProcessCommandExecutor {
     arguments: args,
     scriptArtifacts,
     policy: {
-      risk: 'read',
-      schedulable: value.policy.schedulable,
-      allowHandoff: value.policy.allowHandoff,
-      timeoutMs: positiveInteger(value.policy.timeoutMs, `${id}.policy.timeoutMs`, 100, 10 * 60_000),
+      ...parseCommonPolicy(value.policy, id),
       maxOutputBytes: positiveInteger(value.policy.maxOutputBytes, `${id}.policy.maxOutputBytes`, 1_024, 10 * 1024 * 1024),
     },
     output: parseOutput(value.output, id),
@@ -406,13 +511,23 @@ function parseExecutor(value: unknown, index: number): ProcessCommandExecutor {
   return { ...normalized, revision };
 }
 
+function parseExecutor(value: unknown, index: number): CommandExecutor {
+  if (!isPlainObject(value)) throw new CommandExecutorError('executor_invalid', `executors[${index}] 必须是对象`);
+  const id = nonBlank(value.id, `executors[${index}].id`, 128);
+  if (!EXECUTOR_ID_RE.test(id) || id.startsWith('builtin.')) {
+    throw new CommandExecutorError('executor_id_invalid', `非法 executor id：${id}`);
+  }
+  if (value.kind === 'plugin-tool') return parsePluginToolExecutor(value, id, index);
+  return parseProcessExecutor(value, id, index);
+}
+
 export function commandExecutorRegistryPath(): string {
   return process.env.BOTMUX_COMMAND_EXECUTORS_FILE || join(homedir(), '.botmux', 'command-executors.yaml');
 }
 
 export function loadCommandExecutorRegistry(filePath = commandExecutorRegistryPath()): CommandExecutorRegistry {
   if (!existsSync(filePath)) {
-    return { filePath, executors: new Map() };
+    return { filePath, executors: new Map(), aliases: new Map() };
   }
   const stat = lstatSync(filePath);
   if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 1024 * 1024) {
@@ -425,8 +540,10 @@ export function loadCommandExecutorRegistry(filePath = commandExecutorRegistryPa
     throw new CommandExecutorError('executor_registry_yaml_invalid', `执行器白名单 YAML 解析失败：${error instanceof Error ? error.message : String(error)}`);
   }
   if (!isPlainObject(parsed)) throw new CommandExecutorError('executor_registry_invalid', '执行器白名单必须是对象');
-  onlyKeys(parsed, ['schemaVersion', 'executors'], 'executor registry');
-  if (parsed.schemaVersion !== 1) throw new CommandExecutorError('executor_registry_version_unsupported', '执行器白名单 schemaVersion 必须是 1');
+  onlyKeys(parsed, ['schemaVersion', 'executors', 'aliases'], 'executor registry');
+  if (parsed.schemaVersion !== 1 && parsed.schemaVersion !== 2) {
+    throw new CommandExecutorError('executor_registry_version_unsupported', '执行器白名单 schemaVersion 必须是 1 或 2');
+  }
   if (!Array.isArray(parsed.executors) || parsed.executors.length > MAX_EXECUTORS) {
     throw new CommandExecutorError('executor_registry_invalid', `executors 必须是最多 ${MAX_EXECUTORS} 项的数组`);
   }
@@ -434,13 +551,46 @@ export function loadCommandExecutorRegistry(filePath = commandExecutorRegistryPa
   if (new Set(items.map(item => item.id)).size !== items.length) {
     throw new CommandExecutorError('executor_registry_duplicate', 'executor id 不能重复');
   }
-  return { filePath: realpathSync(filePath), executors: new Map(items.map(item => [item.id, item])) };
+  const aliasesValue = parsed.aliases ?? {};
+  if (!isPlainObject(aliasesValue) || Object.keys(aliasesValue).length > MAX_EXECUTORS) {
+    throw new CommandExecutorError('executor_registry_invalid', `aliases 必须是最多 ${MAX_EXECUTORS} 项的对象`);
+  }
+  const aliases = new Map(Object.entries(aliasesValue).map(([alias, target]) => {
+    if (!EXECUTOR_ID_RE.test(alias) || typeof target !== 'string' || !EXECUTOR_ID_RE.test(target)) {
+      throw new CommandExecutorError('executor_alias_invalid', `非法 executor alias：${alias}`);
+    }
+    if (!items.some(item => item.id === target)) {
+      throw new CommandExecutorError('executor_alias_invalid', `${alias} 指向不存在的 executor：${target}`);
+    }
+    return [alias, target];
+  }));
+  if ([...aliases.keys()].some(alias => items.some(item => item.id === alias))) {
+    throw new CommandExecutorError('executor_alias_invalid', 'executor alias 不能与 executor id 重名');
+  }
+  return { filePath: realpathSync(filePath), executors: new Map(items.map(item => [item.id, item])), aliases };
 }
 
-export function resolveCommandExecutor(executorId: string): ProcessCommandExecutor {
-  const executor = loadCommandExecutorRegistry().executors.get(executorId);
+export function resolveCommandExecutor(executorId: string): CommandExecutor {
+  const registry = loadCommandExecutorRegistry();
+  const executor = registry.executors.get(registry.aliases.get(executorId) ?? executorId);
   if (!executor) throw new CommandExecutorError('executor_not_found', `执行器白名单中不存在：${executorId}`);
   return executor;
+}
+
+export function isPluginToolCommandExecutor(executor: CommandExecutor): executor is PluginToolCommandExecutor {
+  return executor.kind === 'plugin-tool';
+}
+
+export function pluginVersionAtLeast(installedVersion: string, minimumVersion: string): boolean {
+  const installed = STABLE_VERSION_RE.exec(installedVersion);
+  const minimum = STABLE_VERSION_RE.exec(minimumVersion);
+  if (!installed || !minimum) return false;
+  for (let index = 1; index <= 3; index += 1) {
+    const left = Number(installed[index]);
+    const right = Number(minimum[index]);
+    if (left !== right) return left > right;
+  }
+  return true;
 }
 
 /**
@@ -565,12 +715,15 @@ function assignProjectedPath(target: Record<string, unknown>, path: string, valu
   current[segments.at(-1)!] = value;
 }
 
-function projectOutput(executor: ProcessCommandExecutor, parsed: unknown): Record<string, unknown> {
+export function projectCommandExecutorOutput(
+  output: CommandExecutorOutput,
+  parsed: unknown,
+): Record<string, unknown> {
   if (!isPlainObject(parsed)) throw new CommandExecutorError('executor_output_invalid', '执行器 stdout 必须是 JSON 对象');
   safeJsonDepth(parsed);
-  if ('exposeFields' in executor.output) {
+  if ('exposeFields' in output) {
     const projected: Record<string, unknown> = {};
-    for (const field of executor.output.exposeFields) {
+    for (const field of output.exposeFields) {
       assignProjectedPath(
         projected,
         field,
@@ -579,14 +732,14 @@ function projectOutput(executor: ProcessCommandExecutor, parsed: unknown): Recor
     }
     return projected;
   }
-  const collectionOutput = executor.output as Extract<CommandExecutorOutput, { container: string }>;
+  const collectionOutput = output as Extract<CommandExecutorOutput, { container: string }>;
   const rawRows = projectedPathValue(
     parsed,
     collectionOutput.container,
     `执行器输出缺少容器：${collectionOutput.container}`,
   );
   if (!Array.isArray(rawRows) || rawRows.length > MAX_PROJECTED_ROWS || rawRows.some(row => !isPlainObject(row))) {
-    throw new CommandExecutorError('executor_output_container_invalid', `执行器输出 ${executor.output.container} 必须是最多 ${MAX_PROJECTED_ROWS} 项的对象数组`);
+    throw new CommandExecutorError('executor_output_container_invalid', `执行器输出 ${collectionOutput.container} 必须是最多 ${MAX_PROJECTED_ROWS} 项的对象数组`);
   }
   const rows = rawRows.map((row, index) => {
     const projected: Record<string, unknown> = {};
@@ -703,7 +856,7 @@ export async function runProcessCommandExecutor(input: {
           return finishError(new CommandExecutorError('executor_output_json', '执行器 stdout 不是有效 JSON', { cause: error }));
         }
         try {
-          const projected = projectOutput(input.executor, parsed);
+          const projected = projectCommandExecutorOutput(input.executor.output, parsed);
           settled = true;
           resolvePromise({
             executorId: input.executor.id,

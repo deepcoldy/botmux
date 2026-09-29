@@ -44,8 +44,7 @@ function create(dataDir: string, now = new Date('2026-09-20T00:00:00.000Z')) {
     command: '日报',
     rawArgs: '7',
     normalizedArgs: [{ name: 'days', label: '天数', value: '7' }],
-    datasource: 'warehouse',
-    executorId: 'builtin.data-mcp.readonly',
+    executorId: 'test.plugin.readonly',
     executorRevision: 'c'.repeat(64),
     specHash: 'b'.repeat(64),
     revisionId: 'revision-1',
@@ -106,11 +105,9 @@ describe('FrozenCommandAction store', () => {
       dataDir,
       id: created.record.id,
       status: 'completed',
-      queryId: 'q_123',
     })).toBe(true);
     expect(getFrozenCommandAction(dataDir, created.record.id)).toMatchObject({
       status: 'completed',
-      queryId: 'q_123',
       callbackEventId: 'event-1',
       sourceContentHash: 'a'.repeat(64),
       parserVersion: 'frozen-command-args.v1',

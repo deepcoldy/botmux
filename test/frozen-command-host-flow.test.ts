@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   validateCalls: 0,
   runCalls: 0,
-  runResultShape: 'text' as 'top-level' | 'structured' | 'text' | 'malformed' | 'missing' | 'html' | 'wrong-contract',
+  runResultShape: 'text' as 'top-level' | 'structured' | 'text' | 'malformed' | 'missing' | 'html' | 'wrong-contract' | 'legacy-text-block',
   toolsAvailable: true,
   cardBodies: [] as string[],
   messageTypes: [] as string[],
@@ -138,13 +138,15 @@ vi.mock('@modelcontextprotocol/sdk/client/index.js', () => ({
               totalRows: 1,
               truncated: false,
             }]
-          : [{ type: format === 'markdown' ? 'markdown' : 'text', ...(format === 'markdown' ? { markdown: fallbackText } : { text: fallbackText }) }];
+          : [{ type: 'markdown', markdown: fallbackText }];
         const contract = {
           contractVersion: mocks.runResultShape === 'wrong-contract' ? 2 : 1,
           status: 'success',
           fallbackText: mocks.runResultShape === 'html' ? '<font color=red>unsafe</font>' : fallbackText,
           blocks: mocks.runResultShape === 'html'
             ? [{ type: 'markdown', markdown: '<font color=red>unsafe</font>' }]
+            : mocks.runResultShape === 'legacy-text-block'
+              ? [{ type: 'text', text: fallbackText }]
             : blocks,
           meta: { queryId: 'q_host_flow', totalRows: 1 },
           data: {
@@ -194,12 +196,13 @@ const GRANT_GUEST_OPEN_ID = 'ou_grant_guest';
 const GRANT_GUEST_UNION_ID = 'on_grant_guest';
 const CAPABILITY = 'ab'.repeat(32);
 const COMMAND = '/宿主闭环';
+const ORIGINAL_HOME = process.env.HOME;
 const YAML = `
 schemaVersion: 2
 status: active
 name: 宿主闭环
 description: 宿主闭环测试
-executor: builtin.data-mcp.readonly
+executor: test.plugin.readonly
 params:
   - name: value
     label: 测试数字
@@ -366,6 +369,38 @@ function installApprovedCommand(command: string): void {
     actor: { openId: ACTOR_OPEN_ID, unionId: ACTOR_UNION_ID },
     actorIsAdmin: true,
   });
+}
+
+function approveCommandYaml(candidateYaml: string, reason: string): void {
+  const pending = modules.lifecycle.prepareFrozenCommandTransition({
+    dataDir,
+    targetBotId: APP,
+    workingDir: root,
+    command: COMMAND,
+    action: 'approve',
+    actor: { openId: ACTOR_OPEN_ID, unionId: ACTOR_UNION_ID },
+    actorIsAdmin: true,
+    reason,
+    candidateYaml,
+  });
+  modules.lifecycle.confirmFrozenCommandTransition({
+    dataDir,
+    targetBotId: APP,
+    token: pending.token,
+    actor: { openId: ACTOR_OPEN_ID, unionId: ACTOR_UNION_ID },
+    actorIsAdmin: true,
+  });
+}
+
+function handoffCommandYaml(prompt: string): string {
+  return YAML.replace(
+    '  maxChars: 20000',
+    `  maxChars: 20000
+  rules:
+    - when: "{{q.probe_value}} > 20"
+      handoff:
+        prompt: ${JSON.stringify(prompt)}`,
+  );
 }
 
 function grantGuestEvent(messageId: string, text: string, rootId?: string): any {
@@ -546,9 +581,6 @@ function seedLegacyPendingRun(ds: any, rawArgs = '11'): {
     command: COMMAND.slice(1),
     rawArgs,
     normalizedArgs,
-    datasource: typeof lookup.snapshot.definition.input.datasource === 'string'
-      ? lookup.snapshot.definition.input.datasource
-      : undefined,
     executorId: lookup.snapshot.definition.executor,
     executorRevision: lifecycle.record.executorRevision!,
     specHash: lifecycle.record.specHash!,
@@ -666,7 +698,52 @@ beforeEach(async () => {
   mocks.resolveInboundAudio.mockResolvedValue({ kind: 'not_audio' });
   root = mkdtempSync(join(tmpdir(), 'botmux-frozen-host-flow-'));
   dataDir = join(root, 'data');
+  process.env.HOME = root;
   process.env.SESSION_DATA_DIR = dataDir;
+  const registry = join(root, 'command-executors.yaml');
+  writeFileSync(registry, `
+schemaVersion: 2
+executors:
+  - id: test.plugin.readonly
+    kind: plugin-tool
+    plugin: data-mcp
+    tool: execute_frozen_query
+    minimumVersion: 0.2.0
+    contractVersion: 1
+    arguments:
+      datasource:
+        type: string
+        required: true
+        maxLength: 100
+        accepts: [literal]
+      sql:
+        type: string
+        required: true
+        maxLength: 10000
+        accepts: [literal]
+    policy:
+      schedulable: true
+      allowHandoff: true
+      handoffIncludesInput: false
+      timeoutMs: 120000
+`);
+  process.env.BOTMUX_COMMAND_EXECUTORS_FILE = registry;
+  mkdirSync(join(root, '.botmux'), { recursive: true });
+  writeFileSync(join(root, '.botmux', 'plugins-registry.json'), JSON.stringify({
+    schemaVersion: 1,
+    plugins: {
+      'data-mcp': {
+        id: 'data-mcp',
+        packageName: '@fixture/plugin',
+        version: '0.2.0',
+        source: { type: 'local', spec: root },
+        manifest: { schemaVersion: 1, id: 'data-mcp' },
+        contributions: { mcp: { name: 'data-mcp', transport: 'stdio', privateRef: 'private/mcp.json' } },
+        installedAt: new Date(0).toISOString(),
+        updatedAt: new Date(0).toISOString(),
+      },
+    },
+  }));
   mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
   writeFileSync(join(root, '.botmux', 'commands', '宿主闭环.yaml'), YAML);
   modules = await loadModules();
@@ -711,6 +788,8 @@ afterEach(() => {
   modules?.workerPool.setActiveSessionsRegistry(undefined);
   delete process.env.SESSION_DATA_DIR;
   delete process.env.BOTMUX_COMMAND_EXECUTORS_FILE;
+  if (ORIGINAL_HOME === undefined) delete process.env.HOME;
+  else process.env.HOME = ORIGINAL_HOME;
   if (root) rmSync(root, { recursive: true, force: true });
 });
 
@@ -828,6 +907,48 @@ executors:
     expect(card.body.elements.some((element: any) => element.tag === 'table')).toBe(true);
     expect(mocks.cardBodies.at(-1)).not.toContain('SELECT');
     expect(mocks.cardBodies.at(-1)).not.toContain('query_id');
+  });
+
+  it('keeps format=text as a plain Feishu text message although the plugin carrier is markdown', async () => {
+    const candidate = YAML.replace('output:\n', 'output:\n  format: text\n');
+    const pending = modules.lifecycle.prepareFrozenCommandTransition({
+      dataDir,
+      targetBotId: APP,
+      workingDir: root,
+      command: COMMAND,
+      action: 'approve',
+      actor: { openId: ACTOR_OPEN_ID, unionId: ACTOR_UNION_ID },
+      reason: '保持纯文本消息形态',
+      candidateYaml: candidate,
+    });
+    modules.lifecycle.confirmFrozenCommandTransition({
+      dataDir,
+      targetBotId: APP,
+      token: pending.token,
+      actor: { openId: ACTOR_OPEN_ID, unionId: ACTOR_UNION_ID },
+    });
+    const messageId = `om_direct_text_${Math.random().toString(36).slice(2)}`;
+    await modules.daemon.__testOnly_handleNewTopic(
+      ingressEvent(messageId, '@_bot /宿主闭环 11'),
+      ingressContext(messageId, messageId),
+    );
+
+    expect(mocks.messageTypes.at(-1)).toBe('text');
+    expect(mocks.cardBodies.at(-1)).toContain('真实链路：');
+  });
+
+  it('routes an explicitly configured direct handoff through the existing session worker', async () => {
+    approveCommandYaml(handoffCommandYaml('请解释直接运行结果'), '启用直接运行模型交接');
+    const ds = await ingressExistingThread('tmux', '@_bot /宿主闭环 11');
+
+    expect(mocks.validateCalls).toBe(1);
+    expect(mocks.runCalls).toBe(1);
+    expect(ds.worker.send).toHaveBeenCalledTimes(1);
+    const sent = JSON.stringify(ds.worker.send.mock.calls[0]);
+    expect(sent).toContain('[固化命令上下文]');
+    expect(sent).toContain('触发方式：direct');
+    expect(sent).toContain('请解释直接运行结果');
+    expect(sent).not.toContain('SELECT');
   });
 
   it('rejects a valid command definition that the current bot has not approved', async () => {
@@ -1136,24 +1257,25 @@ executors:
     ['top-level', 'top-level'],
     ['structuredContent', 'structured'],
     ['content[].text JSON', 'text'],
-  ] as const)('persists query_id from the %s MCP result shape', async (_label, shape) => {
+    ['opaque metadata', 'malformed'],
+    ['missing metadata', 'missing'],
+  ] as const)('accepts the channel-neutral contract from the %s result shape', async (_label, shape) => {
     mocks.runResultShape = shape;
     const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '运行命令' });
     const value = seedLegacyPendingRun(ds);
 
     await modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP);
     const completed = await waitForStatus(value.transition_id, 'completed');
-    expect(completed.queryId).toBe('q_host_flow');
+    expect(completed.status).toBe('completed');
     expect(mocks.validateCalls).toBe(1);
     expect(mocks.runCalls).toBe(1);
   });
 
   it.each([
-    ['malformed', 'malformed', 'data_mcp_presentation_invalid'],
-    ['missing', 'missing', 'query_id_missing'],
-    ['raw HTML', 'html', 'data_mcp_presentation_invalid'],
-    ['wrong contract version', 'wrong-contract', 'data_mcp_contract_mismatch'],
-  ] as const)('fails closed for a %s query_id without replay or model fallback', async (_label, shape, errorCode) => {
+    ['raw HTML', 'html', 'plugin_tool_presentation_invalid'],
+    ['legacy text block', 'legacy-text-block', 'plugin_tool_presentation_invalid'],
+    ['wrong contract version', 'wrong-contract', 'plugin_tool_contract_mismatch'],
+  ] as const)('fails closed for %s without replay or model fallback', async (_label, shape, errorCode) => {
     mocks.runResultShape = shape;
     const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '运行命令' });
     const value = seedLegacyPendingRun(ds);
@@ -1161,7 +1283,6 @@ executors:
     await modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP);
     const failed = await waitForStatus(value.transition_id, 'failed');
     expect(failed).toMatchObject({ errorCode });
-    expect(failed.queryId).toBeUndefined();
     expect(mocks.validateCalls).toBe(1);
     expect(mocks.runCalls).toBe(1);
     expect(mocks.cardBodies.at(-1)).toContain('不会回退模型');
@@ -1171,14 +1292,14 @@ executors:
     expect(mocks.runCalls).toBe(1);
   });
 
-  it('fails closed when the installed Data MCP plugin lacks execute_frozen_query', async () => {
+  it('fails closed when the registered plugin lacks its configured tool', async () => {
     mocks.toolsAvailable = false;
     const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '运行命令' });
     const value = seedLegacyPendingRun(ds);
 
     await modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP);
     const failed = await waitForStatus(value.transition_id, 'failed');
-    expect(failed).toMatchObject({ errorCode: 'data_mcp_tool_missing' });
+    expect(failed).toMatchObject({ errorCode: 'plugin_tool_missing' });
     expect(mocks.validateCalls).toBe(0);
     expect(mocks.runCalls).toBe(0);
   });
@@ -1336,7 +1457,7 @@ schemaVersion: 2
 status: active
 name: 损坏命令
 description: 不应暴露解析细节
-executor: builtin.data-mcp.readonly
+executor: test.plugin.readonly
 input:
   sql: SELECT 1
 unexpectedInternalField: true
@@ -1523,10 +1644,26 @@ unexpectedInternalField: true
       actorOpenId: ACTOR_OPEN_ID,
       actorUnionId: ACTOR_UNION_ID,
       dispatchAttempt: 0,
-      queryId: 'q_host_flow',
     });
     expect(mocks.validateCalls).toBe(1);
     expect(mocks.runCalls).toBe(1);
+  });
+
+  it('routes a confirmed run handoff through the same session worker', async () => {
+    approveCommandYaml(handoffCommandYaml('请解释确认运行结果'), '启用确认运行模型交接');
+    const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '运行命令' });
+    ds.worker = { killed: false, send: vi.fn(() => true) };
+    const value = seedLegacyPendingRun(ds);
+
+    await modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP);
+    const completed = await waitForStatus(value.transition_id, 'completed');
+    expect(completed.status).toBe('completed');
+    expect(ds.worker.send).toHaveBeenCalledTimes(1);
+    const sent = JSON.stringify(ds.worker.send.mock.calls[0]);
+    expect(sent).toContain('[固化命令上下文]');
+    expect(sent).toContain('触发方式：confirmed');
+    expect(sent).toContain('请解释确认运行结果');
+    expect(sent).not.toContain('SELECT');
   });
 
   it.each([
@@ -1559,7 +1696,6 @@ unexpectedInternalField: true
       actorOpenId: ACTOR_OPEN_ID,
       actorUnionId: ACTOR_UNION_ID,
       sourceContentHash: hash(normalizedText),
-      queryId: 'q_host_flow',
     });
     expect(mocks.validateCalls).toBe(1);
     expect(mocks.runCalls).toBe(1);

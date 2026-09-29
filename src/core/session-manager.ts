@@ -103,9 +103,10 @@ import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-ad
 import { readGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
 import {
   executeFrozenCommand,
+  FrozenCommandError,
   lookupFrozenCommand,
   parseScheduledFrozenCommandInvocation,
-  resolveFrozenCommandScheduledOutput,
+  resolveFrozenCommandOutput,
   userFacingFrozenCommandError,
 } from '../services/frozen-command.js';
 import { evaluateFrozenCommandLifecycle } from '../services/frozen-command-lifecycle.js';
@@ -4191,7 +4192,14 @@ export async function executeScheduledTask(
             stateRevisionId: lifecycle.record.stateRevisionId,
           },
         });
-        const output = resolveFrozenCommandScheduledOutput(definition, result);
+        const output = resolveFrozenCommandOutput({
+          definition,
+          rawArgs,
+          source: 'schedule',
+          taskId: task.id,
+          result,
+          now: invocationNow,
+        });
         if (output.kind === 'deliver') {
           if (silent) {
             logger.info(`[scheduler] ${JSON.stringify({
@@ -4210,8 +4218,24 @@ export async function executeScheduledTask(
         }
         frozenHandoffPrompt = output.prompt;
       } catch (error) {
-        await deliver(`固化命令执行失败：${userFacingFrozenCommandError(error)}`);
-        return;
+        try {
+          const output = resolveFrozenCommandOutput({
+            definition,
+            rawArgs,
+            source: 'schedule',
+            taskId: task.id,
+            error,
+            now: invocationNow,
+          });
+          if (output.kind === 'handoff') {
+            frozenHandoffPrompt = output.prompt;
+          } else {
+            throw new FrozenCommandError('output_decision_invalid', '失败规则不能直接展示成功结果');
+          }
+        } catch (decisionError) {
+          await deliver(`固化命令执行失败：${userFacingFrozenCommandError(decisionError)}`);
+          return;
+        }
       }
     }
   }

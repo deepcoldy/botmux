@@ -5,8 +5,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   buildCommandExecutorArgv,
   commandExecutorBinaryDigest,
+  isPluginToolCommandExecutor,
   listCommandExecutorAuthoringSchemas,
   loadCommandExecutorRegistry,
+  pluginVersionAtLeast,
   runProcessCommandExecutor,
 } from '../src/services/command-executors.js';
 import {
@@ -33,7 +35,7 @@ function setup(output = 'flat'): {
     : `console.log(JSON.stringify({ value: process.argv.at(-1), secret: 'hidden' }));\n`);
   const registry = join(root, 'command-executors.yaml');
   writeFileSync(registry, `
-schemaVersion: 1
+schemaVersion: 2
 executors:
   - id: test.echo
     kind: script
@@ -50,9 +52,9 @@ executors:
         pattern: "^[A-Za-z ]+$"
         accepts: [param, "context:caller.open_id"]
     policy:
-      risk: read
       schedulable: true
       allowHandoff: false
+      handoffIncludesInput: false
       timeoutMs: 5000
       maxOutputBytes: 65536
     output:
@@ -87,6 +89,129 @@ afterEach(() => {
 });
 
 describe('generic frozen-command executors', () => {
+  it('loads a generic plugin-tool registration and keeps private routing out of the authoring schema', () => {
+    const fixture = setup();
+    writeFileSync(fixture.registry, `
+schemaVersion: 2
+executors:
+  - id: test.plugin.readonly
+    kind: plugin-tool
+    plugin: fixture-plugin
+    tool: render_report
+    minimumVersion: 1.2.3
+    contractVersion: 1
+    arguments:
+      report:
+        type: string
+        required: true
+        maxLength: 100
+        accepts: [literal]
+    policy:
+      schedulable: true
+      allowHandoff: false
+      timeoutMs: 5000
+`);
+    vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', fixture.registry);
+    const executor = loadCommandExecutorRegistry().executors.get('test.plugin.readonly')!;
+    expect(isPluginToolCommandExecutor(executor)).toBe(true);
+    expect(listCommandExecutorAuthoringSchemas()).toEqual([{
+      id: 'test.plugin.readonly',
+      arguments: [{
+        name: 'report',
+        type: 'string',
+        required: true,
+        accepts: ['literal'],
+        maxLength: 100,
+      }],
+    }]);
+    expect(JSON.stringify(listCommandExecutorAuthoringSchemas())).not.toContain('fixture-plugin');
+    expect(pluginVersionAtLeast('1.2.3', '1.2.3')).toBe(true);
+    expect(pluginVersionAtLeast('1.3.0', '1.2.3')).toBe(true);
+    expect(pluginVersionAtLeast('1.2.3-beta.1', '1.2.3')).toBe(false);
+  });
+
+  it('supports registry aliases, ordinary JSON tools, and conservative policy defaults', () => {
+    const fixture = setup();
+    writeFileSync(fixture.registry, `
+schemaVersion: 2
+aliases:
+  builtin.legacy.readonly: test.plugin.json
+executors:
+  - id: test.plugin.json
+    kind: plugin-tool
+    plugin: fixture-plugin
+    tool: read_report
+    minimumVersion: 1.0.0
+    arguments:
+      report:
+        type: string
+        required: true
+        maxLength: 100
+        accepts: [literal]
+    policy:
+      timeoutMs: 5000
+    output:
+      format: json
+      container: rows
+      exposeRowFields: [name, total]
+`);
+    const registry = loadCommandExecutorRegistry(fixture.registry);
+    expect(registry.aliases.get('builtin.legacy.readonly')).toBe('test.plugin.json');
+    const executor = registry.executors.get('test.plugin.json')!;
+    expect(executor).toMatchObject({
+      kind: 'plugin-tool',
+      output: { format: 'json', container: 'rows', exposeRowFields: ['name', 'total'] },
+      policy: { schedulable: false, allowHandoff: false, handoffIncludesInput: false },
+    });
+  });
+
+  it('rejects caller identity parameters from plugin-tool registrations', () => {
+    const fixture = setup();
+    writeFileSync(fixture.registry, `
+schemaVersion: 2
+executors:
+  - id: test.plugin.readonly
+    kind: plugin-tool
+    plugin: fixture-plugin
+    tool: render_report
+    minimumVersion: 1.0.0
+    contractVersion: 1
+    arguments:
+      caller:
+        type: string
+        required: true
+        maxLength: 100
+        accepts: ["context:caller.open_id"]
+    policy:
+      schedulable: true
+      allowHandoff: false
+      timeoutMs: 5000
+`);
+    expect(() => loadCommandExecutorRegistry(fixture.registry)).toThrowError(/可信 _meta/);
+
+    writeFileSync(fixture.registry, `
+schemaVersion: 2
+executors:
+  - id: test.plugin.readonly
+    kind: plugin-tool
+    plugin: fixture-plugin
+    tool: render_report
+    minimumVersion: 1.0.0
+    contractVersion: 1
+    arguments:
+      request_user_union_id:
+        type: string
+        required: true
+        maxLength: 100
+        accepts: [literal]
+    policy:
+      schedulable: true
+      allowHandoff: false
+      timeoutMs: 5000
+`);
+    expect(() => loadCommandExecutorRegistry(fixture.registry)).toThrowError(/可信 _meta/);
+  });
+
   it('exposes only the model-safe authoring contract', () => {
     const fixture = setup();
     vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', fixture.registry);

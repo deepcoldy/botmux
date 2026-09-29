@@ -30,10 +30,17 @@ const server = new Server(
   },
 );
 
-server.setRequestHandler(ListToolsRequestSchema, request => serverName === 'data'
+const contractTool = serverName === 'data'
+  ? 'execute_frozen_query'
+  : serverName === 'report'
+    ? 'render_report'
+    : undefined;
+const jsonTool = serverName === 'json-report' ? 'read_report' : undefined;
+
+server.setRequestHandler(ListToolsRequestSchema, request => (contractTool || jsonTool)
   ? {
       tools: [
-        { name: 'execute_frozen_query', description: 'execute frozen query', inputSchema: { type: 'object' } },
+        { name: contractTool ?? jsonTool, description: 'execute frozen command', inputSchema: { type: 'object' } },
       ],
     }
   : request.params?.cursor
@@ -46,13 +53,13 @@ server.setRequestHandler(ListToolsRequestSchema, request => serverName === 'data
       });
 
 server.setRequestHandler(CallToolRequestSchema, request => {
-  if (serverName === 'data') {
+  if (contractTool) {
     const args = request.params.arguments ?? {};
     const trusted = request.params._meta?.botmuxTrustedCaller;
     if (process.env.BOTMUX_SESSION_ID || !process.env.BOTMUX_EXECUTION_ID || trusted?.requestUserUnionId !== 'on_test') {
       return { isError: true, content: [{ type: 'text', text: 'wrong_identity' }] };
     }
-    if (request.params.name === 'execute_frozen_query') {
+    if (request.params.name === contractTool) {
       if (args.payload?.sql?.includes('RETURN_VALIDATION_ERROR')) {
         return {
           content: [{
@@ -69,8 +76,8 @@ server.setRequestHandler(CallToolRequestSchema, request => {
       return { content: [{ type: 'text', text: JSON.stringify({
         contractVersion: 1,
         status: 'success',
-        fallbackText: '12',
-        blocks: [{ type: 'text', text: '12' }],
+        fallbackText: serverName === 'report' ? 'second-plugin-ok' : '12',
+        blocks: [{ type: 'markdown', markdown: serverName === 'report' ? 'second-plugin-ok' : '12' }],
         meta: { queryId: 'q_fixture', totalRows: 1 },
         data: {
           rows: [{ amount: 12 }],
@@ -80,6 +87,20 @@ server.setRequestHandler(CallToolRequestSchema, request => {
       }) }] };
     }
     return { isError: true, content: [{ type: 'text', text: 'query_plan_sql_mismatch' }] };
+  }
+  if (jsonTool && request.params.name === jsonTool) {
+    const trusted = request.params._meta?.botmuxTrustedCaller;
+    if (trusted?.requestUserUnionId !== 'on_test') {
+      return { isError: true, content: [{ type: 'text', text: 'wrong_identity' }] };
+    }
+    return {
+      content: [{ type: 'text', text: 'report ready' }],
+      structuredContent: {
+        rows: [
+          { name: `report-${request.params.arguments?.days}`, total: 12, secret: 'hidden' },
+        ],
+      },
+    };
   }
   return {
     content: [{

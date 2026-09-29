@@ -77,6 +77,8 @@ export interface FrozenCommandPreparedTransition {
   executorRevision?: string;
   previousSpecHash?: string;
   expectedRevisionId?: string;
+  /** True when the approved definition may hand a result or execution error to a model. */
+  handoffConfigured?: boolean;
 }
 
 const DB_DIR = 'frozen-commands';
@@ -558,6 +560,7 @@ export function prepareFrozenCommandTransition(input: {
   let preparedExecutorRevision: string | undefined;
   let previousSpecHash: string | undefined;
   let expectedRevisionId: string | undefined;
+  let handoffConfigured = false;
   withDb(input.dataDir, db => transaction(db, () => {
     const current = selectRecord(db, input.targetBotId, key.commandPath, key.command);
     const definitionExists = existsSync(key.commandPath);
@@ -588,6 +591,7 @@ export function prepareFrozenCommandTransition(input: {
       expectedSpecHash = frozenCommandSpecHash(snapshot);
       preparedExecutorRevision = frozenCommandExecutorRevision(snapshot.definition);
       preparedSpecHash = expectedSpecHash;
+      handoffConfigured = snapshot.definition.output.rules.some(rule => rule.handoff);
       if (current?.state === 'retired' || current?.state === 'revoked') {
         throw new FrozenCommandError('transition_invalid_state', `/${key.command} 当前为 ${current.state}，必须走 restore 而不是 approve`);
       }
@@ -596,6 +600,7 @@ export function prepareFrozenCommandTransition(input: {
       if (!snapshot) throw new FrozenCommandError('definition_missing', `未找到 /${key.command}`);
       expectedSpecHash = frozenCommandSpecHash(snapshot);
       preparedExecutorRevision = frozenCommandExecutorRevision(snapshot.definition);
+      handoffConfigured = snapshot.definition.output.rules.some(rule => rule.handoff);
       if (current?.state === 'active') {
         if (!current.specHash || !current.sourceYaml) {
           throw new FrozenCommandError('lifecycle_store_corrupt', '已批准命令缺少原始定义或 hash');
@@ -623,6 +628,7 @@ export function prepareFrozenCommandTransition(input: {
       });
       preparedSpecHash = current.specHash;
       preparedExecutorRevision = frozenCommandExecutorRevision(snapshot.definition);
+      handoffConfigured = snapshot.definition.output.rules.some(rule => rule.handoff);
     } else if (input.action === 'revoke' && current?.state !== 'retired') {
       throw new FrozenCommandError('transition_invalid_state', `/${key.command} 必须先 retired 才能彻底撤销`);
     }
@@ -651,6 +657,7 @@ export function prepareFrozenCommandTransition(input: {
     ...(preparedExecutorRevision ? { executorRevision: preparedExecutorRevision } : {}),
     ...(previousSpecHash ? { previousSpecHash } : {}),
     ...(expectedRevisionId ? { expectedRevisionId } : {}),
+    ...(handoffConfigured ? { handoffConfigured: true } : {}),
   };
 }
 
@@ -830,7 +837,7 @@ export function confirmFrozenCommandTransition(input: {
       tombstonePayload = current.tombstonePayload;
       tombstoneHash = current.tombstoneHash;
       // Revocation is the irreversible purge state. Keep hashes + audit
-      // metadata, but remove the executable SQL bytes from the authority DB.
+      // metadata, but remove executable payload bytes from the authority DB.
       sourceYaml = undefined;
     }
     if (!specHash || !HASH_RE.test(specHash)) throw new FrozenCommandError('lifecycle_hash_invalid', '命令定义 hash 缺失');

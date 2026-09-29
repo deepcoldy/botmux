@@ -119,7 +119,6 @@ import {
 } from './services/schedule-target-executor.js';
 import { migrateOverloadAlertAtStartup } from './services/overload-alert-migration.js';
 import {
-  buildFrozenCommandFallbackPrompt,
   executeFrozenCommand,
   FrozenCommandError,
   frozenCommandUsage,
@@ -129,7 +128,7 @@ import {
   normalizeFrozenCommandName,
   parseNaturalLanguageFrozenCommandInvocation,
   readFrozenCommandFileStatus,
-  shouldFallbackFrozenCommand,
+  resolveFrozenCommandOutput,
   userFacingFrozenCommandError,
 } from './services/frozen-command.js';
 import { listCommandExecutorAuthoringSchemas } from './services/command-executors.js';
@@ -5520,7 +5519,24 @@ function commandDepsForInvocation(input: {
 type FrozenCommandRouteResult =
   | { kind: 'not_found' }
   | { kind: 'handled' }
-  | { kind: 'fallback'; prompt: string };
+  | { kind: 'handoff'; prompt: string };
+
+function frozenCommandIngressInvocation(input: {
+  naturalText: string;
+  allowNatural: boolean;
+  slash: ReturnType<typeof parseSlashCommandInvocation>;
+  passthroughCommands: ReadonlySet<string>;
+}): { cmd: string; commandContent: string } | undefined {
+  if (input.allowNatural) {
+    const natural = parseNaturalLanguageFrozenCommandInvocation(input.naturalText);
+    if (natural) return natural;
+  }
+  if (!input.slash) return undefined;
+  return input.slash.cmd === '/freeze'
+    || reservedCommandKind(input.slash.cmd, input.passthroughCommands) === null
+    ? { cmd: input.slash.cmd, commandContent: input.slash.content }
+    : undefined;
+}
 
 function parseFrozenCommandTransitionRequest(args: string): {
   action: FrozenCommandLifecycleAction;
@@ -5840,19 +5856,29 @@ async function routeFrozenCommand(input: {
         stateRevisionId: lifecycle.record.stateRevisionId,
       },
     });
-    const renderedReply = renderFrozenCommandLarkReply(result.presentation, input.workingDir);
+    const output = resolveFrozenCommandOutput({
+      definition,
+      rawArgs,
+      source: 'direct',
+      result,
+      now: invocationNow,
+    });
+    if (output.kind === 'handoff') return output;
+    const renderedReply = renderFrozenCommandLarkReply(output.presentation, input.workingDir);
     await input.reply(input.anchor, renderedReply.content, renderedReply.msgType, input.larkAppId);
     return { kind: 'handled' };
   } catch (error) {
-    if (shouldFallbackFrozenCommand(definition, error)) {
-      return {
-        kind: 'fallback',
-        prompt: buildFrozenCommandFallbackPrompt({
-          definition,
-          rawArgs,
-          reason: error instanceof Error ? error.message : String(error),
-        }),
-      };
+    try {
+      const output = resolveFrozenCommandOutput({
+        definition,
+        rawArgs,
+        source: 'direct',
+        error,
+        now: invocationNow,
+      });
+      if (output.kind === 'handoff') return output;
+    } catch (decisionError) {
+      error = decisionError;
     }
     await input.reply(
       input.anchor,
@@ -6494,8 +6520,51 @@ async function patchFrozenCommandActionCard(action: FrozenCommandActionRecord): 
   );
 }
 
+function handoffConfirmedFrozenCommandAction(action: FrozenCommandActionRecord, prompt: string): void {
+  const ds = findActiveBySessionId(action.sessionId);
+  if (!ds) {
+    throw new FrozenCommandError('confirmed_handoff_session_missing', '原会话已不可用，无法把结果交给模型');
+  }
+  const botCfg = getBot(action.targetBotId).config;
+  const turnId = `frozen-handoff:${action.id}`;
+  const caller = {
+    requestUserOpenId: action.actorOpenId,
+    requestUserUnionId: action.actorUnionId,
+    requestLarkAppId: action.targetBotId,
+    senderType: 'user' as const,
+  };
+  const cliInput = buildFollowUpCliInput(prompt, ds.session.sessionId, {
+    isAdoptMode: false,
+    cliId: ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? botCfg.cliId,
+    cliPathOverride: ds.session.cliLaunchSnapshot?.cliPathOverride
+      ?? ds.session.cliPathOverride
+      ?? botCfg.cliPathOverride,
+    sender: { openId: action.actorOpenId, type: 'user' },
+    larkAppId: action.targetBotId,
+    chatId: action.chatId,
+    whiteboardId: ds.session.whiteboardId,
+    sessionBackendType: ds.session.backendType,
+    turnId,
+  });
+  cliInput.trustedCaller = caller;
+  beginReplyTargetTurn(ds, action.scope === 'chat' ? action.rootMessageId : undefined, turnId, new Date().toISOString(), {
+    senderOpenId: action.actorOpenId,
+    participants: [{ openId: action.actorOpenId, isBot: false }],
+    inThread: action.scope === 'thread',
+  });
+  rememberLastCliInput(ds, prompt, cliInput);
+  sessionStore.updateSession(ds.session);
+  const accepted = ds.worker && !ds.worker.killed
+    ? sendWorkerInput(ds, cliInput, turnId, { atMostOnce: true, trustedCaller: caller })
+    : forkWorker(ds, cliInput, ds.hasHistory);
+  if (!accepted) {
+    throw new FrozenCommandError('confirmed_handoff_delivery_failed', '原会话暂不可用，无法把结果交给模型');
+  }
+  beginNewTurn(ds, `/${action.command}`, turnId);
+  markSessionActivity(ds);
+}
+
 async function executeClaimedFrozenCommandAction(action: FrozenCommandActionRecord): Promise<void> {
-  let queryId: string | undefined;
   try {
     const lookup = lookupFrozenCommand({ workingDir: action.workingDir, command: action.command });
     if (lookup.kind !== 'found') throw new FrozenCommandError('definition_unavailable', '命令定义已不可用');
@@ -6517,11 +6586,8 @@ async function executeClaimedFrozenCommandAction(action: FrozenCommandActionReco
       definition: lookup.snapshot.definition,
       rawArgs: action.rawArgs,
     }).args;
-    if (JSON.stringify(normalized) !== JSON.stringify(action.normalizedArgs)
-      || (typeof lookup.snapshot.definition.input.datasource === 'string'
-        ? lookup.snapshot.definition.input.datasource
-        : '') !== (action.datasource ?? '')) {
-      throw new FrozenCommandError('command_preview_changed', '命令参数或数据源已变化，请重新发起');
+    if (JSON.stringify(normalized) !== JSON.stringify(action.normalizedArgs)) {
+      throw new FrozenCommandError('command_preview_changed', '命令参数已变化，请重新发起');
     }
     const result = await executeFrozenCommand({
       definition: lookup.snapshot.definition,
@@ -6549,31 +6615,59 @@ async function executeClaimedFrozenCommandAction(action: FrozenCommandActionReco
         stateRevisionId: action.revisionId,
       },
     });
-    queryId = result.queryId;
-    if (lookup.snapshot.definition.executor === 'builtin.data-mcp.readonly' && !queryId) {
-      throw new FrozenCommandError('query_id_missing', '查询完成状态缺少 query_id，已按失败留档');
-    }
+    const output = resolveFrozenCommandOutput({
+      definition: lookup.snapshot.definition,
+      rawArgs: action.rawArgs,
+      source: 'confirmed',
+      result,
+    });
+    if (output.kind === 'handoff') handoffConfirmedFrozenCommandAction(action, output.prompt);
     const settled = settleFrozenCommandAction({
       dataDir: config.session.dataDir,
       id: action.id,
       status: 'completed',
-      queryId,
     });
     if (!settled) throw new Error('action_settlement_conflict');
     const completed = getFrozenCommandAction(config.session.dataDir, action.id);
     if (!completed) throw new Error('action_record_missing_after_completion');
-    const renderedReply = renderFrozenCommandLarkReply(result.presentation, action.workingDir);
-    await Promise.allSettled([
-      patchFrozenCommandActionCard(completed),
-      deliverFrozenCommandActionResult(completed, renderedReply.content, renderedReply.msgType),
-    ]);
+    const delivery = output.kind === 'deliver'
+      ? (() => {
+          const renderedReply = renderFrozenCommandLarkReply(output.presentation, action.workingDir);
+          return deliverFrozenCommandActionResult(completed, renderedReply.content, renderedReply.msgType);
+        })()
+      : Promise.resolve();
+    await Promise.allSettled([patchFrozenCommandActionCard(completed), delivery]);
   } catch (error) {
+    const lookup = lookupFrozenCommand({ workingDir: action.workingDir, command: action.command });
+    if (lookup.kind === 'found') {
+      try {
+        const output = resolveFrozenCommandOutput({
+          definition: lookup.snapshot.definition,
+          rawArgs: action.rawArgs,
+          source: 'confirmed',
+          error,
+        });
+        if (output.kind === 'handoff') {
+          handoffConfirmedFrozenCommandAction(action, output.prompt);
+          const settled = settleFrozenCommandAction({
+            dataDir: config.session.dataDir,
+            id: action.id,
+            status: 'completed',
+          });
+          const completed = getFrozenCommandAction(config.session.dataDir, action.id)
+            ?? { ...action, status: 'completed' as const };
+          if (settled) await patchFrozenCommandActionCard(completed);
+          return;
+        }
+      } catch (decisionError) {
+        error = decisionError;
+      }
+    }
     const errorCode = error instanceof FrozenCommandError ? error.code : 'execution_failed';
     const settled = settleFrozenCommandAction({
       dataDir: config.session.dataDir,
       id: action.id,
       status: 'failed',
-      ...(queryId ? { queryId } : {}),
       errorCode,
     });
     const failed = getFrozenCommandAction(config.session.dataDir, action.id)
@@ -7610,7 +7704,6 @@ function frozenCommandCenterRows(
       usage: frozenCommandUsage(definition),
       description: definition.description,
       executor: definition.executor,
-      datasource: typeof definition.input.datasource === 'string' ? definition.input.datasource : undefined,
       state: gate.kind === 'active' ? 'active' : 'unapproved',
       ...(gate.kind === 'legacy' ? { reason: '尚未完成当前机器人批准，暂不可运行' } : {}),
     }];
@@ -22653,17 +22746,40 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   // ordinary message handling — the peer bot can still talk, it just can't drive
   // /clear /model /close … into this bot. Human senders are never gated here.
   const senderIsBotForSlashGate = isBotSenderType || isForeignBotSender;
-  const naturalFrozenInvocation = senderIsBotForSlashGate
-    ? undefined
-    : parseNaturalLanguageFrozenCommandInvocation(stripBotMentions(
-        cmdContent,
-        followupMentions,
-        { botOpenId: getBot(larkAppId).botOpenId, larkAppId },
-      ));
-  if (naturalFrozenInvocation) {
+  const invocation = (senderIsBotForSlashGate && !botAcceptsSlashFromBots(larkAppId))
+    ? null
+    : parseSlashCommandInvocation(cmdContent);
+  const invocationDeps = commandDepsForInvocation({
+    scope,
+    chatId,
+    anchor,
+    messageId: parsed.messageId,
+    replyRootId,
+  });
+  const frozenInvocation = frozenCommandIngressInvocation({
+    naturalText: stripBotMentions(
+      cmdContent,
+      followupMentions,
+      { botOpenId: getBot(larkAppId).botOpenId, larkAppId },
+    ),
+    allowNatural: !senderIsBotForSlashGate,
+    slash: invocation,
+    passthroughCommands: resolvePassthroughCommands(larkAppId),
+  });
+  if (frozenInvocation) {
+    const restrictedText = grantRestrictedSlashCommandText(
+      larkAppId,
+      chatId,
+      senderOpenId,
+      frozenInvocation.cmd,
+    );
+    if (restrictedText) {
+      await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
+      return;
+    }
     const pinnedWorkingDir = resolveFrozenCommandWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
     const frozen = await routeFrozenCommand({
-      ...naturalFrozenInvocation,
+      ...frozenInvocation,
       workingDir: pinnedWorkingDir,
       larkAppId,
       chatId,
@@ -22672,57 +22788,22 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
       turnId: parsed.messageId,
       senderOpenId,
       senderUnionId,
-      senderIsBot: false,
+      senderIsBot: senderIsBotTriState(parsed.senderType, isForeignBotSender),
       mentions: parsed.mentions,
-      reply: commandDepsForInvocation({
-        scope,
-        chatId,
-        anchor,
-        messageId: parsed.messageId,
-        replyRootId,
-      }).sessionReply,
+      reply: invocationDeps.sessionReply,
     });
     if (frozen.kind === 'handled') return;
+    if (frozen.kind === 'handoff') {
+      content = frozen.prompt;
+      parsed.content = frozen.prompt;
+    }
   }
-  const invocation = (senderIsBotForSlashGate && !botAcceptsSlashFromBots(larkAppId))
-    ? null
-    : parseSlashCommandInvocation(cmdContent);
   if (invocation) {
     const { cmd, content: commandContent } = invocation;
-    const invocationDeps = commandDepsForInvocation({
-      scope,
-      chatId,
-      anchor,
-      messageId: parsed.messageId,
-      replyRootId,
-    });
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, chatId, senderOpenId, cmd);
     if (restrictedText) {
       await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
       return;
-    }
-    if (cmd === '/freeze' || reservedCommandKind(cmd, resolvePassthroughCommands(larkAppId)) === null) {
-      const pinnedWorkingDir = resolveFrozenCommandWorkingDir({ scope, anchor, chatId, chatType, larkAppId });
-      const frozen = await routeFrozenCommand({
-        cmd,
-        commandContent,
-        workingDir: pinnedWorkingDir,
-        larkAppId,
-        chatId,
-        chatType,
-        anchor,
-        turnId: parsed.messageId,
-        senderOpenId,
-        senderUnionId,
-        senderIsBot: senderIsBotTriState(parsed.senderType, isForeignBotSender),
-        mentions: parsed.mentions,
-        reply: invocationDeps.sessionReply,
-      });
-      if (frozen.kind === 'handled') return;
-      if (frozen.kind === 'fallback') {
-        content = frozen.prompt;
-        parsed.content = frozen.prompt;
-      }
     }
     // Unlike daemon-management commands, `/sessions` is a read-only view of
     // metadata already visible in this group. Authorize it at canTalk level so
@@ -24852,16 +24933,41 @@ async function handleThreadReplyAdmitted(
   // acceptSlashFromBots gate (mirror of the new-topic path): a bot sender's
   // slash is only routed as a command when this bot opts in (default on); when
   // off it falls through to ordinary message handling. Human senders unaffected.
-  const naturalFrozenInvocation = ctx.messageListener || isBotSenderType || isForeignBot
-    ? undefined
-    : parseNaturalLanguageFrozenCommandInvocation(stripBotMentions(
-        cmdContent,
-        parsed.mentions,
-        { botOpenId: getBot(larkAppId).botOpenId, larkAppId },
-      ));
-  if (naturalFrozenInvocation) {
-    const existingDs = activeSessions.get(sessionKey(anchor, larkAppId));
-    const effectiveThreadChatId = existingDs?.chatId ?? threadChatId;
+  const invocation = ctx.messageListener
+    ? null
+    : ((isBotSenderType || isForeignBot) && !botAcceptsSlashFromBots(larkAppId))
+    ? null
+    : parseSlashCommandInvocation(cmdContent);
+  const invocationDeps = commandDepsForInvocation({
+    scope,
+    chatId: ctxChatId,
+    anchor,
+    messageId: parsed.messageId,
+    replyRootId,
+  });
+  const existingDs = activeSessions.get(runtimeSessionKey);
+  const effectiveThreadChatId = existingDs?.chatId ?? threadChatId;
+  const frozenInvocation = frozenCommandIngressInvocation({
+    naturalText: stripBotMentions(
+      cmdContent,
+      parsed.mentions,
+      { botOpenId: getBot(larkAppId).botOpenId, larkAppId },
+    ),
+    allowNatural: !ctx.messageListener && !isBotSenderType && !isForeignBot,
+    slash: invocation,
+    passthroughCommands: resolvePassthroughCommands(larkAppId),
+  });
+  if (frozenInvocation) {
+    const restrictedText = grantRestrictedSlashCommandText(
+      larkAppId,
+      effectiveThreadChatId,
+      threadSenderOpenId,
+      frozenInvocation.cmd,
+    );
+    if (restrictedText) {
+      await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
+      return;
+    }
     const frozenWorkingDir = existingDs
       ? getSessionWorkingDir(existingDs)
       : resolveFrozenCommandWorkingDir({
@@ -24872,7 +24978,7 @@ async function handleThreadReplyAdmitted(
           larkAppId,
         });
     const frozen = await routeFrozenCommand({
-      ...naturalFrozenInvocation,
+      ...frozenInvocation,
       workingDir: frozenWorkingDir,
       larkAppId,
       chatId: effectiveThreadChatId,
@@ -24881,71 +24987,24 @@ async function handleThreadReplyAdmitted(
       turnId: parsed.messageId,
       senderOpenId: threadSenderOpenId,
       senderUnionId: threadSenderUnionId,
-      senderIsBot: false,
+      senderIsBot: senderIsBotTriState(parsed.senderType, isForeignBot),
       mentions: parsed.mentions,
-      reply: commandDepsForInvocation({
-        scope,
-        chatId: ctxChatId,
-        anchor,
-        messageId: parsed.messageId,
-        replyRootId,
-      }).sessionReply,
+      reply: invocationDeps.sessionReply,
     });
     if (frozen.kind === 'handled') return;
+    if (frozen.kind === 'handoff') {
+      promptContent = initialCodexAppMessageContext
+        + initialCodexAppApplicationContext
+        + frozen.prompt;
+      rewrittenCodexAppMessageContext = initialCodexAppMessageContext + frozen.prompt;
+    }
   }
-  const invocation = ctx.messageListener
-    ? null
-    : ((isBotSenderType || isForeignBot) && !botAcceptsSlashFromBots(larkAppId))
-    ? null
-    : parseSlashCommandInvocation(cmdContent);
   if (invocation) {
     const { cmd, content: commandContent } = invocation;
-    const invocationDeps = commandDepsForInvocation({
-      scope,
-      chatId: ctxChatId,
-      anchor,
-      messageId: parsed.messageId,
-      replyRootId,
-    });
-    const existingDs = activeSessions.get(runtimeSessionKey);
-    const effectiveThreadChatId = existingDs?.chatId ?? threadChatId;
     const restrictedText = grantRestrictedSlashCommandText(larkAppId, effectiveThreadChatId, threadSenderOpenId, cmd);
     if (restrictedText) {
       await invocationDeps.sessionReply(anchor, restrictedText, 'text', larkAppId);
       return;
-    }
-    if (cmd === '/freeze' || reservedCommandKind(cmd, resolvePassthroughCommands(larkAppId)) === null) {
-      const frozenWorkingDir = existingDs
-        ? getSessionWorkingDir(existingDs)
-        : resolveFrozenCommandWorkingDir({
-            scope,
-            anchor,
-            chatId: effectiveThreadChatId,
-            chatType: ctxChatType,
-            larkAppId,
-          });
-      const frozen = await routeFrozenCommand({
-        cmd,
-        commandContent,
-        workingDir: frozenWorkingDir,
-        larkAppId,
-        chatId: effectiveThreadChatId,
-        chatType: ctxChatType,
-        anchor,
-        turnId: parsed.messageId,
-        senderOpenId: threadSenderOpenId,
-        senderUnionId: threadSenderUnionId,
-        senderIsBot: senderIsBotTriState(parsed.senderType, isForeignBot),
-        mentions: parsed.mentions,
-        reply: invocationDeps.sessionReply,
-      });
-      if (frozen.kind === 'handled') return;
-      if (frozen.kind === 'fallback') {
-        promptContent = initialCodexAppMessageContext
-          + initialCodexAppApplicationContext
-          + frozen.prompt;
-        rewrittenCodexAppMessageContext = initialCodexAppMessageContext + frozen.prompt;
-      }
     }
     if (cmd === '/sessions') {
       const botSender = isBotSenderType || isForeignBot;

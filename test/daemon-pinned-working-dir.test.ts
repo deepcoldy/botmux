@@ -38,6 +38,31 @@ function tempDir(name: string): string {
   return dir;
 }
 
+function writePluginExecutorRegistry(): string {
+  const registry = join(tmpRoot, 'command-executors.yaml');
+  writeFileSync(registry, `
+schemaVersion: 2
+executors:
+  - id: test.plugin.readonly
+    kind: plugin-tool
+    plugin: fixture-plugin
+    tool: render_report
+    minimumVersion: 1.0.0
+    contractVersion: 1
+    arguments:
+      value:
+        type: string
+        required: true
+        maxLength: 20
+        accepts: [literal]
+    policy:
+      schedulable: true
+      allowHandoff: true
+      timeoutMs: 5000
+`);
+  return registry;
+}
+
 async function loadFreshModules() {
   vi.resetModules();
   process.env.SESSION_DATA_DIR = tempDir('sessions');
@@ -59,10 +84,12 @@ async function seedPeerSession(sessionStore: typeof import('../src/services/sess
 
 beforeEach(() => {
   tmpRoot = mkdtempSync(join(tmpdir(), 'botmux-daemon-pinned-dir-'));
+  process.env.BOTMUX_COMMAND_EXECUTORS_FILE = writePluginExecutorRegistry();
 });
 
 afterEach(() => {
   delete process.env.SESSION_DATA_DIR;
+  delete process.env.BOTMUX_COMMAND_EXECUTORS_FILE;
   rmSync(tmpRoot, { recursive: true, force: true });
 });
 
@@ -87,10 +114,10 @@ describe('resolvePinnedWorkingDir', () => {
 schemaVersion: 2
 name: 生命周期测试
 description: route lifecycle test
-executor: builtin.data-mcp.readonly
+executor: test.plugin.readonly
 params: []
 input:
-  sql: SELECT 1
+  value: fixture
 onError: fallback_llm
 `);
     botRegistry.registerBot({
@@ -145,10 +172,10 @@ onError: fallback_llm
 schemaVersion: 2
 name: 权限测试
 description: lifecycle authorization test
-executor: builtin.data-mcp.readonly
+executor: test.plugin.readonly
 params: []
 input:
-  sql: SELECT 1
+  value: fixture
 onError: fail
 `);
     const bot = botRegistry.registerBot({

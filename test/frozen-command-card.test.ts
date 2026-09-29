@@ -30,9 +30,8 @@ const action: FrozenCommandActionRecord = {
   command: '日报',
   rawArgs: '7',
   normalizedArgs: [{ name: 'days', label: '天数', value: '7' }],
-  datasource: 'warehouse',
-  executorId: 'builtin.data-mcp.readonly',
-  executorRevision: 'builtin-data-mcp-v1',
+  executorId: 'test.plugin.readonly',
+  executorRevision: 'plugin-revision-v1',
   specHash: 'b'.repeat(64),
   revisionId: 'revision',
   createdAt: '2026-09-20T00:00:00.000Z',
@@ -41,15 +40,25 @@ const action: FrozenCommandActionRecord = {
 };
 
 describe('Frozen Command business cards', () => {
-  it('keeps text output as text and renders markdown/table output as a safe Card 2.0 payload', () => {
+  it('chooses the Feishu message shape from format while keeping only markdown/table blocks', () => {
     expect(renderFrozenCommandLarkReply({
       schemaVersion: 1,
+      format: 'text',
       fallbackText: 'plain',
-      blocks: [{ type: 'text', text: 'plain' }],
+      blocks: [{ type: 'markdown', markdown: 'plain' }],
     })).toEqual({ content: 'plain', msgType: 'text' });
+
+    const markdownCard = renderFrozenCommandLarkReply({
+      schemaVersion: 1,
+      format: 'markdown',
+      fallbackText: 'plain',
+      blocks: [{ type: 'markdown', markdown: 'plain' }],
+    });
+    expect(markdownCard.msgType).toBe('interactive');
 
     const rendered = renderFrozenCommandLarkReply({
       schemaVersion: 1,
+      format: 'table',
       fallbackText: 'fallback',
       blocks: [
         { type: 'markdown', markdown: '**经营日报** <script>alert(1)</script>' },
@@ -73,14 +82,16 @@ describe('Frozen Command business cards', () => {
     const nestedMention = '<a<at>t id=all><</at>/a</at>t>';
     const text = renderFrozenCommandLarkReply({
       schemaVersion: 1,
+      format: 'text',
       fallbackText: nestedMention,
-      blocks: [{ type: 'text', text: nestedMention }],
+      blocks: [{ type: 'markdown', markdown: nestedMention }],
     });
     expect(text.msgType).toBe('text');
     expect(text.content).not.toContain('<at');
 
     const table = renderFrozenCommandLarkReply({
       schemaVersion: 1,
+      format: 'table',
       fallbackText: '安全回退',
       blocks: [{
         type: 'table',
@@ -97,6 +108,7 @@ describe('Frozen Command business cards', () => {
 
     const oversized = renderFrozenCommandLarkReply({
       schemaVersion: 1,
+      format: 'table',
       fallbackText: '已降级',
       blocks: [{
         type: 'table',
@@ -119,7 +131,7 @@ describe('Frozen Command business cards', () => {
         command: '日报',
         usage: '/日报 [天数]',
         description: '经营日报',
-        datasource: 'warehouse',
+        executor: 'test.plugin.readonly',
         state: 'active',
       }, {
         command: '旧日报',
@@ -132,7 +144,8 @@ describe('Frozen Command business cards', () => {
     expect(rendered).toContain('财务助手');
     expect(rendered).toContain('工作目录');
     expect(rendered).toContain('已废弃');
-    expect(rendered).toContain('系统会直接执行，不再展示运行确认卡');
+    expect(rendered).toContain('系统默认直接展示结果');
+    expect(rendered).toContain('结果或执行失败可交给模型');
     expect(rendered).not.toContain('系统会先展示操作确认卡');
     expect(rendered).not.toContain('SELECT');
     expect(rendered).not.toContain('sql');
@@ -143,9 +156,11 @@ describe('Frozen Command business cards', () => {
       action,
       nonce: 'nonce-1',
       initiatorLabel: '本人',
+      handoffConfigured: true,
     })) as any;
     expect(parsed.schema).toBe('2.0');
     expect(parsed.body.elements.some((element: any) => element.tag === 'action')).toBe(false);
+    expect(JSON.stringify(parsed)).toContain('结果或执行失败命中规则时会交给模型');
     const buttonRow = parsed.body.elements[1];
     expect(buttonRow).toMatchObject({ tag: 'column_set', flex_mode: 'flow' });
     const buttons = buttonRow.columns.map((column: any) => column.elements[0]);
@@ -165,12 +180,10 @@ describe('Frozen Command business cards', () => {
     expect(buildFrozenCommandActionStatusCard({ ...action, status: 'executing' })).toMatchObject({
       header: { template: 'blue' },
     });
-    const completed = buildFrozenCommandActionStatusCard({ ...action, status: 'completed', queryId: 'q_1' });
+    const completed = buildFrozenCommandActionStatusCard({ ...action, status: 'completed' });
     expect(completed).toMatchObject({
       header: { template: 'green' },
     });
-    expect(JSON.stringify(completed)).not.toContain('q_1');
-    expect(JSON.stringify(completed)).not.toContain('query_id');
     expect(buildFrozenCommandActionStatusCard({ ...action, status: 'expired' })).toMatchObject({
       header: { template: 'grey' },
     });
@@ -183,13 +196,13 @@ describe('Frozen Command business cards', () => {
     const rendered = buildFrozenCommandActionStatusCard({
       ...action,
       status: 'failed',
-      errorCode: 'data_mcp_not_enabled',
+      errorCode: 'plugin_tool_not_enabled',
     });
     expect(rendered).toMatchObject({
       header: { template: 'red', title: { content: '执行失败' } },
       body: { elements: [{ text: { content: expect.stringContaining('执行未完成') } }] },
     });
-    expect(JSON.stringify(rendered)).not.toContain('data_mcp_not_enabled');
+    expect(JSON.stringify(rendered)).not.toContain('plugin_tool_not_enabled');
   });
 
   it('renders a one-click lifecycle card with only an opaque token in callbacks', () => {
@@ -203,12 +216,14 @@ describe('Frozen Command business cards', () => {
         specHash: 'b'.repeat(64),
         previousSpecHash: 'a'.repeat(64),
         expectedRevisionId: 'revision-old',
+        handoffConfigured: true,
       },
       workingDirLabel: 'finance',
     })) as any;
     expect(parsed.header).toMatchObject({ template: 'orange', title: { content: '确认更新固化命令' } });
     expect(JSON.stringify(parsed)).toContain('aaaaaaaaaaaa');
     expect(JSON.stringify(parsed)).toContain('bbbbbbbbbbbb');
+    expect(JSON.stringify(parsed)).toContain('结果或执行失败命中规则时会交给模型');
     const buttons = parsed.body.elements[1].columns.map((column: any) => column.elements[0]);
     expect(buttons.map((button: any) => button.behaviors[0].value)).toEqual([
       { action: 'frozen_command_lifecycle_confirm', transition_token: 'opaque-token' },

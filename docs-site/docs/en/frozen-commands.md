@@ -1,6 +1,6 @@
 # Frozen Commands
 
-Frozen commands turn a verified query or read-only script into a slash command. After installation, `/command args` or the single sentence `run /command args` executes directly in the host without an LLM or a second run-confirmation card.
+Frozen commands turn a verified plugin tool or allowlisted process into a slash command. After installation, `/command args` or the single sentence `run /command args` executes directly by default. A result or execution failure reaches a model only when the author explicitly configures and matches an `output.rules` entry. Lifecycle confirmation does not become a per-run confirmation prompt.
 
 ## Lifecycle and permissions
 
@@ -15,18 +15,84 @@ Live definitions are stored in `<working-directory>/.botmux/commands/*.yaml`; dr
 
 ## Result presentation
 
-`output.format` accepts `text` (the backward-compatible default), `markdown`, `table`, or `auto`. The host stores a versioned text/Markdown/table structure rather than raw HTML: Feishu renders rich results as cards, while a future Web surface can render the same structure with its own HTML sanitizer. Tables display at most 50 rows and 20 columns; the complete plain-text form remains available as a fallback.
+`output.format` accepts `text` (the backward-compatible plain-message default), `markdown`, `table`, or `auto`. The intermediate contract stores only versioned Markdown/table blocks, never text blocks or raw HTML. With `format: text`, Feishu sends the escaped, 20KB-bounded `fallbackText` as a text message; every other format renders a card. A future Web surface can consume the same blocks with its own HTML sanitizer. Tables display at most 50 rows and 20 columns; the complete plain-text form remains available as a fallback. Legacy plugin text blocks fail closed instead of being converted implicitly.
+
+Use ordered `output.rules` to choose between display and model interpretation. The first matching rule wins. Every rule must contain exactly one action: `handoff` or `show`. With no rules or no match, the result follows `output.format`. Direct, confirmed, and scheduled runs share this decision path:
+
+```yaml
+output:
+  format: table
+  maxChars: 20000
+  rules:
+    - when: "{{run.status}} == 'error' && {{run.error.transient}} == true"
+      handoff:
+        prompt: "Execution failed temporarily. Give safe next steps from the command context."
+    - when: "{{q.max_drop}} > 0.2"
+      handoff:
+        prompt: "Explain the likely causes of this threshold breach."
+        data: "{{q.rows}}"
+        maxRows: 20
+    - when: "{{q.row_count}} == 0"
+      show:
+        text: "No matching data"
+        format: markdown
+    - show: result
+```
+
+- `q.*` contains successful result fields plus `q.rows` and `q.row_count`. `run.*` contains `status`, `error.code`, `error.message`, `error.transient`, and `executionId`. `cmd.*` contains the command name, description, arguments, executor, trigger source, and task id.
+- Only execution-stage failures can enter rules. Unapproved, retired, or revoked commands, untrusted identity, invalid arguments, fail-closed state, and executor revision drift always fail directly.
+- The host prepends immutable command context before the author prompt. Error handoff includes only a stable code and user-safe message, never raw executor output.
+- `policy.allowHandoff` controls every handoff and defaults to `false`. `policy.handoffIncludesInput` also defaults to `false`; when enabled, definition input is attached strictly for tool use and marked as non-displayable.
+- `show: result` displays the original result with the default `format`; `show: { text, format }` renders a template and may override that format. A rule without `when` always matches and can be the final explicit catch-all.
+- Legacy `output.when` / `handoff` / `else` remains readable and is converted into two rules: handoff on the condition, otherwise show `else.text`. Legacy `onError: fallback_llm` is converted to an equivalent transient-execution-error rule; new definitions should use neither `onError` nor `else`.
 
 ## Administrator executor allowlist
 
-Data MCP queries use the built-in `builtin.data-mcp.readonly` executor. BotMux validates generic arguments only and passes the approved `input` to the Data MCP plugin as an opaque payload; SQL literal encoding and byte-identical validation/execution belong to the plugin. The plugin must expose the `execute_frozen_query` capability. Older plugins fail explicitly and stop instead of falling back to the retired host SQL path. Data MCP executor failures also fail closed: `onError: fallback_llm` is ignored for this executor so a model can never regenerate a query that differs from the frozen SQL. To freeze `lark-cli` or a custom script, an administrator must create `~/.botmux/command-executors.yaml`. If the file is absent, the registry is empty and every process/script command is disabled by default.
+Every frozen command must be registered in `~/.botmux/command-executors.yaml`. The registry supports `process`, `script`, and the generic `plugin-tool` kind; the host does not embed any business-plugin name. If the file is absent, the registry is empty and frozen commands are disabled by default.
+
+A `plugin-tool` entry declares a plugin id, tool name, minimum stable version, and generic safety policy. Contract-aware tools declare `contractVersion` and return channel-neutral Markdown/table blocks plus a plain-text fallback. Ordinary MCP tools declare `output`, and the host projects their JSON through allowlisted `exposeFields` or `container` plus `exposeRowFields`. At execution time the host opens a one-plugin gateway and injects trusted caller identity through `_meta`. The plugin must be installed, enabled, and new enough according to the host registry; a missing tool or incompatible contract fails closed.
 
 During a trusted human turn, an agent may call `botmux freeze executors` for the read-only authoring contract. The response contains only executor ids and argument names, types, accepted sources, and constraints; it excludes executable paths, fixed arguments, and artifact paths/digests. Candidate definitions are checked against this complete contract before a confirmation card can be shown.
 
-Paths must be absolute canonical realpaths, not symlinks. Entry scripts listed in `scriptArtifacts` are hashed again before each run.
+Data MCP is configured as an ordinary plugin tool. SQL is opaque to the host; literal encoding, byte-identical validation, and execution remain inside the plugin. Caller identity must not be declared in `arguments`; it arrives only through trusted gateway `_meta`.
 
 ```yaml
-schemaVersion: 1
+schemaVersion: 2
+aliases:
+  builtin.data-mcp.readonly: data.query.readonly
+executors:
+  - id: data.query.readonly
+    kind: plugin-tool
+    plugin: data-mcp
+    tool: execute_frozen_query
+    minimumVersion: 0.3.0
+    contractVersion: 2
+    arguments:
+      sql:
+        type: string
+        required: true
+        maxLength: 100000
+        accepts: [literal]
+    policy:
+      schedulable: true
+      allowHandoff: true
+      handoffIncludesInput: false
+      timeoutMs: 120000
+```
+
+For an ordinary JSON MCP tool, replace `contractVersion` with a projection such as:
+
+```yaml
+    output:
+      format: json
+      container: rows
+      exposeRowFields: [name, total]
+```
+
+The following example registers a read-only script. Paths must be absolute canonical realpaths, not symlinks. Entry scripts listed in `scriptArtifacts` are hashed again before each run.
+
+```yaml
+schemaVersion: 2
 executors:
   - id: finance.report
     kind: script
@@ -43,7 +109,6 @@ executors:
         max: 90
         accepts: [param]
     policy:
-      risk: read
       schedulable: true
       allowHandoff: false
       timeoutMs: 10000
@@ -55,12 +120,17 @@ executors:
 
 Security boundaries:
 
-- Version 1 accepts only `policy.risk: read`; it does not allow writes or shell-string composition. Arguments are passed as distinct argv tokens.
+- The `risk` field has been removed. A legacy value is ignored with a warning; read-only behavior is the executor registrant's responsibility and is not inferred from a string. Process arguments are still passed as distinct argv tokens, never composed into a shell string.
 - `arguments.*.accepts` declares the allowed source for each value.
+- `plugin-tool` arguments cannot accept `context:caller.*`; caller identity is available only through host-frozen `_meta`.
 - JSON output is projected through either `exposeFields` or `container` plus `exposeRowFields`; unlisted fields are not returned.
 - The host injects credentials for the current bot. Neither command definitions nor the allowlist handle credential paths or environment variables.
 - The current isolation scheme does not add an OS sandbox. Executors run under the daemon UID, so never paste child environments or `ps eww` output into chat.
 - Changing the allowlist or an artifact changes the executor revision; affected commands require approval again.
+
+### Migrating the legacy built-in Data MCP executor
+
+Add the `plugin-tool` registration above and map the legacy `builtin.data-mcp.readonly` id through `aliases`; new definitions should use the canonical id such as `data.query.readonly`. This registry migration changes the executor revision, so every existing command must be approved again by its owner or an administrator. Upgrade and enable a plugin that satisfies `minimumVersion` before upgrading BotMux; the reverse order intentionally fails closed.
 
 ## Scheduling
 

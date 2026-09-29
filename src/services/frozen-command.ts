@@ -17,17 +17,19 @@ import { readGlobalConfig } from '../global-config.js';
 import type { TrustedCaller } from '../types.js';
 import { logger } from '../utils/logger.js';
 import {
-  BUILTIN_DATA_MCP_EXECUTOR_ID,
-  BUILTIN_DATA_MCP_EXECUTOR_REVISION,
   commandExecutorBinaryDigest,
   CommandExecutorError,
+  isPluginToolCommandExecutor,
+  pluginVersionAtLeast,
+  projectCommandExecutorOutput,
   resolveCommandExecutor,
   runProcessCommandExecutor,
+  type CommandExecutor,
   type ExecutorArgumentSource,
   type ResolvedExecutorInput,
 } from './command-executors.js';
+import { getInstalledPlugin } from './plugin-registry-store.js';
 
-export const DATA_MCP_PLUGIN_ID = 'data-mcp';
 export const FROZEN_COMMAND_DIR = join('.botmux', 'commands');
 
 export interface NaturalLanguageFrozenCommandInvocation {
@@ -84,12 +86,13 @@ export function parseScheduledFrozenCommandInvocation(
 const COMMAND_NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N}_-]{0,63}$/u;
 const PARAM_NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 const INPUT_PLACEHOLDER_RE = /^\{\{\s*((?:caller\.(?:open_id|union_id|name)|chat\.(?:id|type)|message\.id|today|now)|[A-Za-z][A-Za-z0-9_]*)\s*\}\}$/;
+const EMBEDDED_PARAMETER_PLACEHOLDER_RE = /\{\{\s*([A-Za-z][A-Za-z0-9_]*)\s*\}\}/g;
+const EMBEDDED_CALLER_PLACEHOLDER_RE = /\{\{\s*caller\.(?:open_id|union_id|name)\s*\}\}/;
 const OUTPUT_PLACEHOLDER_RE = /\{\{\s*result\.([A-Za-z_][A-Za-z0-9_.]*)\s*\}\}/g;
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 const RELATIVE_DATE_RE = /^today(?:([+-])(\d{1,4}))?$/;
 const DEFAULT_TIMEZONE = 'Asia/Shanghai';
 const DEFAULT_MAX_OUTPUT_CHARS = 20_000;
-const DEFAULT_TIMEOUT_MS = 120_000;
 
 export class FrozenCommandError extends Error {
   override readonly name = 'FrozenCommandError';
@@ -98,7 +101,9 @@ export class FrozenCommandError extends Error {
     readonly code: string,
     message: string,
     readonly usage?: string,
-    readonly fallbackAllowed = false,
+    readonly executionFailure = false,
+    readonly transient = false,
+    readonly executionId?: string,
   ) {
     super(message);
   }
@@ -141,6 +146,28 @@ interface StringParameter {
 
 export type FrozenCommandParameter = IntegerParameter | EnumParameter | DateParameter | StringParameter;
 
+export type FrozenCommandOutputFormat = 'text' | 'markdown' | 'table' | 'auto';
+type FrozenCommandOutputHandoff = {
+  prompt: string;
+  data?: string;
+  maxRows: number;
+};
+type FrozenCommandOutputShow = {
+  kind: 'result' | 'text';
+  text?: string;
+  format?: FrozenCommandOutputFormat;
+};
+
+export type FrozenCommandOutputRule = {
+  when?: string;
+  handoff: FrozenCommandOutputHandoff;
+  show?: never;
+} | {
+  when?: string;
+  handoff?: never;
+  show: FrozenCommandOutputShow;
+};
+
 export interface FrozenCommandDefinition {
   schemaVersion: 2;
   status: 'active';
@@ -154,28 +181,18 @@ export interface FrozenCommandDefinition {
     /** Presentation preference. The host keeps a structured result envelope
      * and lets each transport render it; raw HTML is intentionally not part of
      * the command definition because it is neither portable nor safe. */
-    format: 'text' | 'markdown' | 'table' | 'auto';
+    format: FrozenCommandOutputFormat;
     text?: string;
     prefix?: string;
     suffix?: string;
     maxChars: number;
-    when?: string;
-    handoff?: {
-      prompt: string;
-      data: string;
-      maxRows: number;
-    };
-    else?: {
-      text: string;
-    };
+    rules: FrozenCommandOutputRule[];
   };
-  onError: 'fallback_llm' | 'fail';
 }
 
 export type FrozenCommandOutputScalar = string | number | boolean | null;
 
 export type FrozenCommandOutputBlock =
-  | { type: 'text'; text: string }
   | { type: 'markdown'; markdown: string }
   | {
       type: 'table';
@@ -190,6 +207,10 @@ export type FrozenCommandOutputBlock =
  * treating Feishu JSON or arbitrary HTML as the source of truth. */
 export interface FrozenCommandPresentation {
   schemaVersion: 1;
+  /** Effective command format after a matching `show` rule override. The IM
+   * transport uses this hint to choose a plain text message only for `text`;
+   * blocks stay channel-neutral markdown/table in every format. */
+  format: FrozenCommandOutputFormat;
   fallbackText: string;
   blocks: FrozenCommandOutputBlock[];
 }
@@ -210,7 +231,6 @@ export interface FrozenCommandExecutionResult {
   executorRevision?: string;
   executionId?: string;
   projectedResult?: Record<string, unknown>;
-  queryId?: string;
   businessResult?: {
     rows: Array<Record<string, string | number | boolean | bigint | null | undefined>>;
     totalRows: number;
@@ -218,7 +238,7 @@ export interface FrozenCommandExecutionResult {
   };
 }
 
-export type FrozenCommandScheduledOutput =
+export type FrozenCommandResolvedOutput =
   | { kind: 'deliver'; text: string; presentation: FrozenCommandPresentation }
   | { kind: 'handoff'; prompt: string };
 
@@ -256,7 +276,6 @@ export type FrozenCommandLookup =
   | { kind: 'found'; snapshot: FrozenCommandSnapshot };
 
 export function frozenCommandExecutorRevision(definition: FrozenCommandDefinition): string {
-  if (definition.executor === BUILTIN_DATA_MCP_EXECUTOR_ID) return BUILTIN_DATA_MCP_EXECUTOR_REVISION;
   try {
     const executor = resolveCommandExecutor(definition.executor);
     assertFrozenCommandExecutorContract(definition, executor);
@@ -335,8 +354,17 @@ function assertParameterExecutorContract(
 /** Validate every possible command input before an approval/restore can be staged. */
 export function assertFrozenCommandExecutorContract(
   definition: FrozenCommandDefinition,
-  executor = resolveCommandExecutor(definition.executor),
+  executor: CommandExecutor = resolveCommandExecutor(definition.executor),
 ): void {
+  if (!isPluginToolCommandExecutor(executor) && !definition.output.text) {
+    executorContractError('process/script 命令必须声明 output.text');
+  }
+  if (isPluginToolCommandExecutor(executor) && executor.output && !definition.output.text) {
+    executorContractError('普通 JSON plugin-tool 命令必须声明 output.text');
+  }
+  if (definition.output.rules.some(rule => rule.handoff) && !executor.policy.allowHandoff) {
+    executorContractError(`执行器 ${executor.id} 不允许把结果或失败交给模型`);
+  }
   const configured = new Set(Object.keys(definition.input));
   const unknown = [...configured].filter(name => !Object.hasOwn(executor.arguments, name));
   if (unknown.length > 0) executorContractError(`执行器不接受 input：${unknown.join(', ')}`);
@@ -346,6 +374,11 @@ export function assertFrozenCommandExecutorContract(
       continue;
     }
     const value = definition.input[name]!;
+    if (isPluginToolCommandExecutor(executor)
+      && typeof value === 'string'
+      && EMBEDDED_CALLER_PLACEHOLDER_RE.test(value)) {
+      executorContractError(`input.${name} 不得声明 caller 身份；插件身份只能由可信 _meta 注入`);
+    }
     const placeholder = typeof value === 'string' ? INPUT_PLACEHOLDER_RE.exec(value) : null;
     if (!placeholder) {
       if (!schema.accepts.includes('literal')) executorContractError(`input.${name} 不接受 literal 来源`);
@@ -367,7 +400,6 @@ export function assertFrozenCommandExecutorContract(
 }
 
 export function assertFrozenCommandSchedulable(definition: FrozenCommandDefinition): void {
-  if (definition.executor === BUILTIN_DATA_MCP_EXECUTOR_ID) return;
   try {
     const executor = resolveCommandExecutor(definition.executor);
     assertFrozenCommandExecutorContract(definition, executor);
@@ -386,9 +418,9 @@ export function assertFrozenCommandSchedulable(definition: FrozenCommandDefiniti
  * under isolation scheme B; scripts remain covered by the blocking artifact
  * digests inside executorRevision. */
 export function frozenCommandExecutorBinaryDigest(definition: FrozenCommandDefinition): string | undefined {
-  if (definition.executor === BUILTIN_DATA_MCP_EXECUTOR_ID) return undefined;
   try {
-    return commandExecutorBinaryDigest(resolveCommandExecutor(definition.executor));
+    const executor = resolveCommandExecutor(definition.executor);
+    return isPluginToolCommandExecutor(executor) ? undefined : commandExecutorBinaryDigest(executor);
   } catch (error) {
     if (error instanceof CommandExecutorError) {
       throw new FrozenCommandError(error.code, error.message);
@@ -628,30 +660,37 @@ function parseDefinition(raw: string, command: string): FrozenCommandDefinition 
   if (new Set(params.map(param => param.name)).size !== params.length) {
     throw new FrozenCommandError('definition_duplicate_parameter', '参数名不能重复');
   }
-  if (executor !== BUILTIN_DATA_MCP_EXECUTOR_ID) {
-    const declared = new Set(params.map(param => param.name));
-    const referencedParams: string[] = [];
-    for (const [key, candidate] of Object.entries(commandInput)) {
-      if (typeof candidate !== 'string' || !candidate.includes('{{')) continue;
-      const match = INPUT_PLACEHOLDER_RE.exec(candidate);
-      if (!match) throw new FrozenCommandError('definition_invalid_placeholder', `input.${key} 变量必须独占整个值，且 key 必须在封闭集合中`);
+  const declared = new Set(params.map(param => param.name));
+  const referencedParams: string[] = [];
+  for (const [key, candidate] of Object.entries(commandInput)) {
+    if (typeof candidate !== 'string' || !candidate.includes('{{')) continue;
+    const match = INPUT_PLACEHOLDER_RE.exec(candidate);
+    if (match) {
       const placeholder = match[1]!;
       if (!placeholder.includes('.') && placeholder !== 'today' && placeholder !== 'now') {
         referencedParams.push(placeholder);
       }
+      continue;
     }
-    const unknown = [...new Set(referencedParams.filter(name => !declared.has(name)))];
-    if (unknown.length > 0) throw new FrozenCommandError('definition_unknown_placeholder', `input 使用了未声明参数：${unknown.join(', ')}`);
-    const unused = params.filter(param => !referencedParams.includes(param.name));
-    if (unused.length > 0) throw new FrozenCommandError('definition_unused_parameter', `参数未在 input 中使用：${unused.map(item => item.name).join(', ')}`);
+    const embedded = [...candidate.matchAll(EMBEDDED_PARAMETER_PLACEHOLDER_RE)].map(item => item[1]!);
+    const residue = candidate.replace(EMBEDDED_PARAMETER_PLACEHOLDER_RE, '');
+    if (embedded.length === 0 || residue.includes('{{') || residue.includes('}}')) {
+      throw new FrozenCommandError('definition_invalid_placeholder', `input.${key} 包含无法识别的模板变量`);
+    }
+    referencedParams.push(...embedded);
   }
+  const unknown = [...new Set(referencedParams.filter(name => !declared.has(name)))];
+  if (unknown.length > 0) throw new FrozenCommandError('definition_unknown_placeholder', `input 使用了未声明参数：${unknown.join(', ')}`);
+  const unused = params.filter(param => !referencedParams.includes(param.name));
+  if (unused.length > 0) throw new FrozenCommandError('definition_unused_parameter', `参数未在 input 中使用：${unused.map(item => item.name).join(', ')}`);
   let output: FrozenCommandDefinition['output'] = {
     format: 'text',
     maxChars: DEFAULT_MAX_OUTPUT_CHARS,
+    rules: [],
   };
   if (value.output !== undefined) {
     if (!isPlainObject(value.output)) throw new FrozenCommandError('definition_invalid_output', 'output 必须是对象');
-    onlyKeys(value.output, ['format', 'text', 'prefix', 'suffix', 'maxChars', 'when', 'handoff', 'else'], 'output');
+    onlyKeys(value.output, ['format', 'text', 'prefix', 'suffix', 'maxChars', 'rules', 'when', 'handoff', 'else'], 'output');
     const format = value.output.format ?? 'text';
     if (format !== 'text' && format !== 'markdown' && format !== 'table' && format !== 'auto') {
       throw new FrozenCommandError(
@@ -663,49 +702,110 @@ function parseDefinition(raw: string, command: string): FrozenCommandDefinition 
     if (!Number.isInteger(maxChars) || (maxChars as number) < 100 || (maxChars as number) > 100_000) {
       throw new FrozenCommandError('definition_invalid_output', 'output.maxChars 必须在 100-100000 之间');
     }
-    const hasConditionalField = value.output.when !== undefined
-      || value.output.handoff !== undefined
-      || value.output.else !== undefined;
-    let conditional: Pick<FrozenCommandDefinition['output'], 'when' | 'handoff' | 'else'> = {};
-    if (hasConditionalField) {
-      const when = nonBlank(value.output.when, 'output.when', 1_000).trim();
-      if (!isPlainObject(value.output.handoff)) {
-        throw new FrozenCommandError('definition_invalid_output', 'output.handoff 必须是对象');
+    const parseHandoff = (candidate: unknown, field: string): FrozenCommandOutputHandoff => {
+      if (!isPlainObject(candidate)) {
+        throw new FrozenCommandError('definition_invalid_output', `${field} 必须是对象`);
       }
-      onlyKeys(value.output.handoff, ['prompt', 'data', 'maxRows'], 'output.handoff');
-      const prompt = nonBlank(value.output.handoff.prompt, 'output.handoff.prompt', 10_000);
-      const data = value.output.handoff.data === undefined
-        ? '{{q.rows}}'
-        : nonBlank(value.output.handoff.data, 'output.handoff.data', 10_000);
-      const maxRows = value.output.handoff.maxRows ?? 50;
+      onlyKeys(candidate, ['prompt', 'data', 'maxRows'], field);
+      const prompt = nonBlank(candidate.prompt, `${field}.prompt`, 10_000);
+      const data = candidate.data === undefined
+        ? undefined
+        : nonBlank(candidate.data, `${field}.data`, 10_000);
+      const maxRows = candidate.maxRows ?? 50;
       if (!Number.isInteger(maxRows) || (maxRows as number) < 1 || (maxRows as number) > 1_000) {
-        throw new FrozenCommandError('definition_invalid_output', 'output.handoff.maxRows 必须在 1-1000 之间');
+        throw new FrozenCommandError('definition_invalid_output', `${field}.maxRows 必须在 1-1000 之间`);
       }
+      return { prompt, ...(data === undefined ? {} : { data }), maxRows: maxRows as number };
+    };
+    const parseOutputFormat = (candidate: unknown, field: string): FrozenCommandOutputFormat => {
+      if (candidate !== 'text' && candidate !== 'markdown' && candidate !== 'table' && candidate !== 'auto') {
+        throw new FrozenCommandError('definition_invalid_output', `${field} 只能是 text、markdown、table 或 auto`);
+      }
+      return candidate;
+    };
+    const parseShow = (candidate: unknown, field: string): FrozenCommandOutputShow => {
+      if (candidate === 'result') return { kind: 'result' };
+      if (!isPlainObject(candidate)) {
+        throw new FrozenCommandError('definition_invalid_output', `${field} 必须是 result 或对象`);
+      }
+      onlyKeys(candidate, ['text', 'format'], field);
+      const text = candidate.text === undefined ? undefined : nonBlank(candidate.text, `${field}.text`, 10_000);
+      const format = candidate.format === undefined ? undefined : parseOutputFormat(candidate.format, `${field}.format`);
+      if (text === undefined && format === undefined) {
+        throw new FrozenCommandError('definition_invalid_output', `${field} 必须声明 text 或 format`);
+      }
+      return {
+        kind: text === undefined ? 'result' : 'text',
+        ...(text === undefined ? {} : { text }),
+        ...(format === undefined ? {} : { format }),
+      };
+    };
+    const rules: FrozenCommandOutputRule[] = [];
+    if (value.output.rules !== undefined) {
+      if (!Array.isArray(value.output.rules) || value.output.rules.length > 20) {
+        throw new FrozenCommandError('definition_invalid_output', 'output.rules 必须是最多 20 项的数组');
+      }
+      for (const [index, candidate] of value.output.rules.entries()) {
+        if (!isPlainObject(candidate)) throw new FrozenCommandError('definition_invalid_output', `output.rules[${index}] 必须是对象`);
+        onlyKeys(candidate, ['when', 'handoff', 'show'], `output.rules[${index}]`);
+        const hasHandoff = candidate.handoff !== undefined;
+        const hasShow = candidate.show !== undefined;
+        if (hasHandoff === hasShow) {
+          throw new FrozenCommandError('definition_invalid_output', `output.rules[${index}] 必须且只能声明 handoff 或 show`);
+        }
+        const when = candidate.when === undefined
+          ? undefined
+          : nonBlank(candidate.when, `output.rules[${index}].when`, 1_000).trim();
+        rules.push(hasHandoff
+          ? {
+              ...(when === undefined ? {} : { when }),
+              handoff: parseHandoff(candidate.handoff, `output.rules[${index}].handoff`),
+            }
+          : {
+              ...(when === undefined ? {} : { when }),
+              show: parseShow(candidate.show, `output.rules[${index}].show`),
+            });
+      }
+    }
+    const hasLegacyConditional = value.output.when !== undefined || value.output.handoff !== undefined;
+    if (hasLegacyConditional) {
+      rules.push({
+        when: nonBlank(value.output.when, 'output.when', 1_000).trim(),
+        handoff: parseHandoff(value.output.handoff, 'output.handoff'),
+      });
+    }
+    if (value.output.else !== undefined) {
       if (!isPlainObject(value.output.else)) {
         throw new FrozenCommandError('definition_invalid_output', 'output.else 必须是对象');
       }
       onlyKeys(value.output.else, ['text'], 'output.else');
-      const elseText = nonBlank(value.output.else.text, 'output.else.text', 10_000);
-      conditional = {
-        when,
-        handoff: { prompt, data, maxRows: maxRows as number },
-        else: { text: elseText },
-      };
+      rules.push({
+        show: {
+          kind: 'text',
+          text: nonBlank(value.output.else.text, 'output.else.text', 10_000),
+        },
+      });
     }
     output = {
       format,
       maxChars: maxChars as number,
+      rules,
       ...(typeof value.output.text === 'string' ? { text: value.output.text } : {}),
       ...(typeof value.output.prefix === 'string' ? { prefix: value.output.prefix } : {}),
       ...(typeof value.output.suffix === 'string' ? { suffix: value.output.suffix } : {}),
-      ...conditional,
     };
-  }
-  if (executor !== BUILTIN_DATA_MCP_EXECUTOR_ID && !output.text) {
-    throw new FrozenCommandError('definition_invalid_output', 'process/script 命令必须声明 output.text');
   }
   if (value.onError !== undefined && value.onError !== 'fallback_llm' && value.onError !== 'fail') {
     throw new FrozenCommandError('definition_invalid_on_error', 'onError 只能是 fallback_llm 或 fail');
+  }
+  if (value.onError === 'fallback_llm') {
+    output.rules = [{
+      when: "{{run.status}} == 'error' && {{run.error.transient}} == true",
+      handoff: {
+        prompt: '固化命令执行失败，请根据命令上下文分析原因并给出安全的后续建议。',
+        maxRows: 50,
+      },
+    }, ...output.rules];
   }
   return {
     schemaVersion: 2,
@@ -717,7 +817,6 @@ function parseDefinition(raw: string, command: string): FrozenCommandDefinition 
     input: commandInput,
     params,
     output,
-    onError: value.onError === 'fail' ? 'fail' : 'fallback_llm',
   };
 }
 
@@ -971,7 +1070,7 @@ function jsonFromToolResult(result: Record<string, unknown>): unknown {
     .join('\n')
     .trim();
   if (text) {
-    try { return JSON.parse(text); } catch { return undefined; }
+    try { return JSON.parse(text); } catch { /* prefer structuredContent below */ }
   }
   if (result.structuredContent !== undefined) return result.structuredContent;
   return result.contractVersion !== undefined ? result : undefined;
@@ -1077,19 +1176,13 @@ export function buildFrozenCommandPresentation(input: {
     if (suffix) {
       blocks.push({ type: 'markdown', markdown: suffix });
     }
-    return { schemaVersion: 1, fallbackText: text, blocks };
-  }
-  if (format === 'markdown') {
-    return {
-      schemaVersion: 1,
-      fallbackText: text,
-      blocks: [{ type: 'markdown', markdown: text }],
-    };
+    return { schemaVersion: 1, format, fallbackText: text, blocks };
   }
   return {
     schemaVersion: 1,
+    format,
     fallbackText: text,
-    blocks: [{ type: 'text', text }],
+    blocks: [{ type: 'markdown', markdown: text }],
   };
 }
 
@@ -1112,7 +1205,7 @@ function contextValue(context: Record<string, unknown>, path: string): unknown {
   let current: unknown = context;
   for (const part of parts) {
     if (!isPlainObject(current) || !Object.hasOwn(current, part)) {
-      throw new FrozenCommandError('conditional_output_value_missing', `条件引用了不存在的字段：q.${path}`);
+      throw new FrozenCommandError('conditional_output_value_missing', `条件引用了不存在的字段：${path}`);
     }
     current = current[part];
   }
@@ -1142,26 +1235,36 @@ export function evaluateFrozenCommandOutputCondition(
   expression: string,
   result: FrozenCommandExecutionResult,
 ): boolean {
-  const match = /^\s*\{\{\s*q\.([A-Za-z_][A-Za-z0-9_.]*)\s*\}\}\s*(>=|<=|===|!==|==|!=|>|<)\s*(.*?)\s*$/.exec(expression);
-  if (!match) {
+  return evaluateFrozenCommandRule(expression, { q: frozenOutputContext(result) });
+}
+
+function evaluateFrozenCommandRule(expression: string, context: Record<string, unknown>): boolean {
+  const clauses = expression.split(/\s+&&\s+/u);
+  if (clauses.length === 0 || clauses.length > 10) {
     throw new FrozenCommandError('conditional_output_invalid_expression', '条件表达式格式不合法');
   }
-  const left = contextValue(frozenOutputContext(result), match[1]!);
-  const right = parseConditionLiteral(match[3]!);
-  const operator = match[2]!;
-  if (operator === '==' || operator === '===') return left === right;
-  if (operator === '!=' || operator === '!==') return left !== right;
-  if (typeof left !== 'number' || !Number.isFinite(left) || typeof right !== 'number') {
-    throw new FrozenCommandError('conditional_output_type_mismatch', '大小比较只支持有限数值');
-  }
-  if (operator === '>') return left > right;
-  if (operator === '>=') return left >= right;
-  if (operator === '<') return left < right;
-  return left <= right;
+  return clauses.every((clause) => {
+    const match = /^\s*\{\{\s*((?:q|run|cmd)\.[A-Za-z_][A-Za-z0-9_.]*)\s*\}\}\s*(>=|<=|===|!==|==|!=|>|<)\s*(.*?)\s*$/.exec(clause);
+    if (!match) {
+      throw new FrozenCommandError('conditional_output_invalid_expression', '条件表达式格式不合法');
+    }
+    const left = contextValue(context, match[1]!);
+    const right = parseConditionLiteral(match[3]!);
+    const operator = match[2]!;
+    if (operator === '==' || operator === '===') return left === right;
+    if (operator === '!=' || operator === '!==') return left !== right;
+    if (typeof left !== 'number' || !Number.isFinite(left) || typeof right !== 'number') {
+      throw new FrozenCommandError('conditional_output_type_mismatch', '大小比较只支持有限数值');
+    }
+    if (operator === '>') return left > right;
+    if (operator === '>=') return left >= right;
+    if (operator === '<') return left < right;
+    return left <= right;
+  });
 }
 
 function renderFrozenOutputTemplate(template: string, context: Record<string, unknown>): string {
-  return template.replace(/\{\{\s*q\.([A-Za-z_][A-Za-z0-9_.]*)\s*\}\}/g, (_full, path: string) => {
+  return template.replace(/\{\{\s*((?:q|run|cmd)\.[A-Za-z_][A-Za-z0-9_.]*)\s*\}\}/g, (_full, path: string) => {
     const value = contextValue(context, path);
     if (typeof value === 'string') return safeBusinessText(value);
     if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
@@ -1227,7 +1330,7 @@ function processContextMap(input: {
   };
 }
 
-function resolveProcessInput(input: {
+function resolveExecutorInput(input: {
   definition: FrozenCommandDefinition;
   rawArgs: string;
   trustedCaller: TrustedCaller;
@@ -1285,79 +1388,159 @@ function truncateFrozenHandoff(body: string, notice: string, maxChars: number): 
   return `${body.slice(0, keep)}${reserved}`;
 }
 
-export function resolveFrozenCommandScheduledOutput(
-  definition: FrozenCommandDefinition,
-  result: FrozenCommandExecutionResult,
-): FrozenCommandScheduledOutput {
-  const { when, handoff, else: elseOutput } = definition.output;
-  if (!when || !handoff || !elseOutput) {
-    return { kind: 'deliver', text: result.text, presentation: result.presentation };
+export function resolveFrozenCommandOutput(input: {
+  definition: FrozenCommandDefinition;
+  rawArgs: string;
+  source: 'direct' | 'confirmed' | 'schedule';
+  taskId?: string;
+  result?: FrozenCommandExecutionResult;
+  error?: unknown;
+  now?: Date;
+}): FrozenCommandResolvedOutput {
+  const { definition, result, error } = input;
+  if ((result === undefined) === (error === undefined)) {
+    throw new FrozenCommandError('output_decision_invalid', '输出决策必须且只能包含执行结果或执行错误');
   }
-  const context = frozenOutputContext(result);
-  if (!evaluateFrozenCommandOutputCondition(when, result)) {
-    const text = `${definition.output.prefix ?? ''}${renderFrozenOutputTemplate(elseOutput.text, context)}${definition.output.suffix ?? ''}`;
+  if (error !== undefined && (!(error instanceof FrozenCommandError) || !error.executionFailure)) {
+    throw error;
+  }
+  const normalized = normalizeFrozenCommandArguments({ definition, rawArgs: input.rawArgs, now: input.now });
+  const q = result?.businessResult ? frozenOutputContext(result) : {};
+  const safeError = error instanceof FrozenCommandError ? {
+    code: error.code,
+    message: userFacingFrozenCommandError(error),
+    transient: error.transient,
+  } : undefined;
+  const context: Record<string, unknown> = {
+    q,
+    run: {
+      status: result ? 'ok' : 'error',
+      error: safeError ?? { code: '', message: '', transient: false },
+      executionId: result?.executionId ?? (error instanceof FrozenCommandError ? error.executionId : undefined) ?? '',
+    },
+    cmd: {
+      name: definition.name,
+      description: definition.description,
+      args: Object.fromEntries(normalized.args.map(argument => [argument.name, argument.value])),
+      executor: definition.executor,
+      source: input.source,
+      taskId: input.taskId ?? '',
+    },
+  };
+  const matched = definition.output.rules.find(rule => rule.when === undefined || evaluateFrozenCommandRule(rule.when, context));
+  if (matched?.handoff) {
+    const executor = resolveCommandExecutor(definition.executor);
+    if (!executor.policy.allowHandoff) {
+      throw new FrozenCommandError('executor_handoff_denied', `执行器 ${executor.id} 不允许把结果或失败交给模型`);
+    }
+    const qRows = result?.businessResult?.rows ?? [];
+    const limitedRows = qRows.slice(0, matched.handoff.maxRows);
+    const handoffContext = {
+      ...context,
+      q: { ...q, rows: limitedRows, data: limitedRows },
+    };
+    const invocation = `/${definition.name}${normalized.args.length > 0 ? ` ${normalized.args.map(argument => argument.value).join(' ')}` : ''}`;
+    const statusLine = result
+      ? `成功，execution_id=${result.executionId ?? 'unknown'}`
+      : `失败，${safeError!.code}，${JSON.stringify(safeError!.message)}`;
+    const fixedContext = [
+      '[固化命令上下文]',
+      `命令：${invocation}`,
+      `说明：${definition.description}`,
+      `参数：${normalized.args.map(argument => `${argument.label}(${argument.name})=${argument.value}`).join('，') || '无'}`,
+      `执行器：${definition.executor}`,
+      `触发方式：${input.source}`,
+      `执行结果：${statusLine}`,
+      `执行 ID：${result?.executionId ?? (error instanceof FrozenCommandError ? error.executionId : undefined) ?? 'unknown'}`,
+    ].join('\n');
+    const authorPrompt = renderFrozenOutputTemplate(matched.handoff.prompt, handoffContext);
+    const data = matched.handoff.data === undefined
+      ? (result?.businessResult ? JSON.stringify(limitedRows) : undefined)
+      : renderFrozenOutputTemplate(matched.handoff.data, handoffContext);
+    const inputNotice = executor.policy.handoffIncludesInput
+      ? `\n\n[执行器输入，仅供工具调用，不要向用户展示]\n${JSON.stringify(definition.input)}`
+      : '';
+    const truncation = result?.businessResult
+      ? (result.businessResult.totalRows > limitedRows.length
+          ? `\n\n共 ${result.businessResult.totalRows} 行，已截断为前 ${limitedRows.length} 行。`
+          : `\n\n共 ${result.businessResult.totalRows} 行。`)
+      : '';
+    const body = `${fixedContext}\n\n${authorPrompt}${data === undefined ? '' : `\n\n数据：\n${data}`}${inputNotice}`;
+    return { kind: 'handoff', prompt: truncateFrozenHandoff(body, truncation, definition.output.maxChars) };
+  }
+  if (matched?.show) {
+    if (matched.show.kind === 'result') {
+      if (error !== undefined) throw error;
+      if (matched.show.format === undefined || matched.show.format === definition.output.format) {
+        return { kind: 'deliver', text: result!.text, presentation: result!.presentation };
+      }
+      const presentation = buildFrozenCommandPresentation({
+        definition: {
+          ...definition,
+          output: { ...definition.output, format: matched.show.format },
+        },
+        text: result!.text,
+        businessResult: result!.businessResult,
+      });
+      return { kind: 'deliver', text: presentation.fallbackText, presentation };
+    }
+    const text = `${definition.output.prefix ?? ''}${renderFrozenOutputTemplate(matched.show.text!, context)}${definition.output.suffix ?? ''}`;
     const rendered = truncateFrozenOutput(text, definition.output.maxChars);
+    const format = matched.show.format ?? definition.output.format;
     return {
       kind: 'deliver',
       text: rendered,
       presentation: {
         schemaVersion: 1,
+        format,
         fallbackText: rendered,
-        blocks: [{
-          type: definition.output.format === 'markdown' ? 'markdown' : 'text',
-          ...(definition.output.format === 'markdown'
-            ? { markdown: rendered }
-            : { text: rendered }),
-        } as FrozenCommandOutputBlock],
+        blocks: [{ type: 'markdown', markdown: rendered }],
       },
     };
   }
-  const business = result.businessResult!;
-  const limitedRows = business.rows.slice(0, handoff.maxRows);
-  const handoffContext = { ...context, rows: limitedRows, data: limitedRows };
-  const prompt = renderFrozenOutputTemplate(handoff.prompt, handoffContext);
-  const data = renderFrozenOutputTemplate(handoff.data, handoffContext);
-  const truncation = business.totalRows > limitedRows.length
-    ? `\n\n共 ${business.totalRows} 行，已截断为前 ${limitedRows.length} 行。`
-    : `\n\n共 ${business.totalRows} 行。`;
-  return {
-    kind: 'handoff',
-    prompt: truncateFrozenHandoff(`${prompt}\n\n数据：\n${data}`, truncation, definition.output.maxChars),
-  };
+  if (error !== undefined) throw error;
+  return { kind: 'deliver', text: result!.text, presentation: result!.presentation };
 }
 
-function toolName(tools: Array<{ name?: unknown }>, requested: string): string {
+function toolName(tools: Array<{ name?: unknown }>, pluginId: string, requested: string): string {
   const names = tools.map(tool => typeof tool.name === 'string' ? tool.name : '').filter(Boolean);
   if (names.includes(requested)) return requested;
-  const candidates = names.filter(name => name === `${DATA_MCP_PLUGIN_ID}__${requested}` || name.endsWith(`__${requested}`));
+  const candidates = names.filter(name => name === `${pluginId}__${requested}`);
   if (candidates.length === 1) return candidates[0]!;
-  throw new FrozenCommandError('data_mcp_tool_missing', `Data MCP 未提供 ${requested}`);
+  throw new FrozenCommandError('plugin_tool_missing', `插件 ${pluginId} 未提供工具 ${requested}`);
 }
 
-function frozenPresentationFromToolResult(result: Record<string, unknown>): {
+function frozenPresentationFromToolResult(
+  result: Record<string, unknown>,
+  expectedContractVersion: number,
+  executionId: string,
+  format: FrozenCommandOutputFormat,
+): {
   presentation: FrozenCommandPresentation;
-  queryId?: string;
   businessResult?: FrozenCommandExecutionResult['businessResult'];
 } {
   const containsRawHtml = (value: string): boolean => /<\s*\/?\s*[A-Za-z][^>]*>/u.test(value);
   const payload = jsonFromToolResult(result);
-  if (!isPlainObject(payload) || payload.contractVersion !== 1) {
-    throw new FrozenCommandError('data_mcp_contract_mismatch', 'Data MCP 固化查询契约版本不兼容');
+  if (!isPlainObject(payload) || payload.contractVersion !== expectedContractVersion) {
+    throw new FrozenCommandError('plugin_tool_contract_mismatch', '插件工具展示契约版本不兼容');
   }
   if (payload.status !== 'success') {
-    const message = typeof payload.message === 'string' ? payload.message : 'Data MCP 未完成固化查询';
-    const code = typeof payload.errorCode === 'string' ? payload.errorCode : 'data_mcp_execution_failed';
-    throw new FrozenCommandError(code, message, undefined, isTransientDataMcpFailure(message));
+    const message = typeof payload.message === 'string' && payload.message.length <= 10_000
+      ? payload.message
+      : '插件工具未完成固化命令';
+    const code = typeof payload.errorCode === 'string' && /^[A-Za-z0-9_.-]{1,128}$/.test(payload.errorCode)
+      ? payload.errorCode
+      : 'plugin_tool_execution_failed';
+    throw new FrozenCommandError(code, message, undefined, true, isTransientPluginToolFailure(message), executionId);
   }
   if (typeof payload.fallbackText !== 'string' || payload.fallbackText.length > 100_000 || containsRawHtml(payload.fallbackText)) {
-    throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 返回了不安全的展示文本');
+    throw new FrozenCommandError('plugin_tool_presentation_invalid', '插件工具返回了不安全的展示文本');
   }
   if (!Array.isArray(payload.blocks) || payload.blocks.length < 1 || payload.blocks.length > 12) {
-    throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 返回了无效的展示块');
+    throw new FrozenCommandError('plugin_tool_presentation_invalid', '插件工具返回了无效的展示块');
   }
   const blocks: FrozenCommandOutputBlock[] = payload.blocks.map(block => {
-    if (!isPlainObject(block)) throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 展示块格式无效');
-    if (block.type === 'text' && typeof block.text === 'string' && block.text.length <= 100_000) return { type: 'text', text: block.text };
+    if (!isPlainObject(block)) throw new FrozenCommandError('plugin_tool_presentation_invalid', '插件工具展示块格式无效');
     if (block.type === 'markdown' && typeof block.markdown === 'string' && block.markdown.length <= 100_000
       && !containsRawHtml(block.markdown)) return { type: 'markdown', markdown: block.markdown };
     if (block.type === 'table' && Array.isArray(block.columns) && Array.isArray(block.rows)
@@ -1366,66 +1549,57 @@ function frozenPresentationFromToolResult(result: Record<string, unknown>): {
       const columns = block.columns.map(column => {
         if (!isPlainObject(column) || typeof column.key !== 'string' || !column.key || column.key.length > 128
           || typeof column.label !== 'string' || column.label.length > 256) {
-          throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 表格列格式无效');
+          throw new FrozenCommandError('plugin_tool_presentation_invalid', '插件工具表格列格式无效');
         }
         return { key: column.key, label: column.label };
       });
       const rows = block.rows.map(row => {
-        if (!isPlainObject(row)) throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 表格行格式无效');
+        if (!isPlainObject(row)) throw new FrozenCommandError('plugin_tool_presentation_invalid', '插件工具表格行格式无效');
         return Object.fromEntries(columns.map(column => {
           const value = row[column.key];
           if (value !== null && !['string', 'number', 'boolean'].includes(typeof value)) {
-            throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 表格单元格格式无效');
+            throw new FrozenCommandError('plugin_tool_presentation_invalid', '插件工具表格单元格格式无效');
           }
           if (typeof value === 'string' && value.length > 1_000) {
-            throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 表格单元格过长');
+            throw new FrozenCommandError('plugin_tool_presentation_invalid', '插件工具表格单元格过长');
           }
           return [column.key, value as FrozenCommandOutputScalar];
         }));
       });
       return { type: 'table', columns, rows, totalRows: block.totalRows as number, truncated: block.truncated };
     }
-    throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 展示块格式无效');
+    throw new FrozenCommandError('plugin_tool_presentation_invalid', '插件工具展示块格式无效');
   });
-  let queryId: string | undefined;
-  if (payload.meta !== undefined) {
-    if (!isPlainObject(payload.meta)) {
-      throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 返回了无效的展示元数据');
-    }
-    if (payload.meta.queryId !== undefined && payload.meta.queryId !== null) {
-      if (typeof payload.meta.queryId !== 'string' || !payload.meta.queryId) {
-        throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 返回了无效的 query_id');
-      }
-      queryId = payload.meta.queryId;
-    }
+  if (payload.meta !== undefined && !isPlainObject(payload.meta)) {
+    throw new FrozenCommandError('plugin_tool_presentation_invalid', '插件工具返回了无效的展示元数据');
   }
   let businessResult: FrozenCommandExecutionResult['businessResult'];
   if (payload.data !== undefined) {
     if (!isPlainObject(payload.data) || !Array.isArray(payload.data.rows)
       || !Number.isSafeInteger(payload.data.totalRows) || (payload.data.totalRows as number) < 0
       || payload.data.rows.length > 1_000 || !Array.isArray(payload.data.columns)) {
-      throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 返回了无效的结构化结果');
+      throw new FrozenCommandError('plugin_tool_presentation_invalid', '插件工具返回了无效的结构化结果');
     }
     const columns = payload.data.columns.map(column => {
       if (!isPlainObject(column) || typeof column.key !== 'string' || !column.key || column.key.length > 128
         || typeof column.label !== 'string' || column.label.length > 256) {
-        throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 返回了无效的结果列');
+        throw new FrozenCommandError('plugin_tool_presentation_invalid', '插件工具返回了无效的结果列');
       }
       return { key: column.key, label: column.label };
     });
     if (columns.length > 100) {
-      throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 返回的结果列过多');
+      throw new FrozenCommandError('plugin_tool_presentation_invalid', '插件工具返回的结果列过多');
     }
     const rows = payload.data.rows.map(row => {
-      if (!isPlainObject(row)) throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 返回了无效的结果行');
+      if (!isPlainObject(row)) throw new FrozenCommandError('plugin_tool_presentation_invalid', '插件工具返回了无效的结果行');
       const projected: Record<string, string | number | boolean | null> = {};
       for (const column of columns) {
         const value = row[column.key];
         if (value !== null && value !== undefined && !['string', 'number', 'boolean'].includes(typeof value)) {
-          throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 返回了无效的结果值');
+          throw new FrozenCommandError('plugin_tool_presentation_invalid', '插件工具返回了无效的结果值');
         }
         if (typeof value === 'string' && value.length > 10_000) {
-          throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 返回的结果值过长');
+          throw new FrozenCommandError('plugin_tool_presentation_invalid', '插件工具返回的结果值过长');
         }
         projected[column.key] = (value ?? null) as string | number | boolean | null;
       }
@@ -1434,17 +1608,16 @@ function frozenPresentationFromToolResult(result: Record<string, unknown>): {
     businessResult = { rows, totalRows: payload.data.totalRows as number, columns };
   }
   return {
-    presentation: { schemaVersion: 1, fallbackText: payload.fallbackText, blocks },
-    ...(queryId ? { queryId } : {}),
+    presentation: { schemaVersion: 1, format, fallbackText: payload.fallbackText, blocks },
     ...(businessResult ? { businessResult } : {}),
   };
 }
 
-export function isTransientDataMcpFailure(text: string): boolean {
+export function isTransientPluginToolFailure(text: string): boolean {
   // Resource ceilings are deliberate protection, not transient transport
   // noise. Retrying them through a model would amplify load.
   if (/memory limit|resource limit|quota|too many rows|limit exceeded/i.test(text)) return false;
-  return /timed?\s*out|timeout|temporar|unavailable|connection|transport|socket|econn|connection closed|overload|rate.?limit|too many requests|\b50[234]\b|unknown (?:column|identifier)|does not exist|schema/i.test(text);
+  return /timed?\s*out|timeout|temporar|unavailable|connection|transport|socket|econn|connection closed|overload|rate.?limit|too many requests|\b50[234]\b/i.test(text);
 }
 
 function frozenCommandAuditRecord(input: {
@@ -1538,23 +1711,20 @@ export async function executeFrozenCommand(input: {
   if (input.expectedExecutorRevision && input.expectedExecutorRevision !== currentExecutorRevision) {
     throw new FrozenCommandError('executor_revision_changed', '执行器配置或脚本已变化，命令必须重新确认');
   }
-  if (input.definition.executor !== BUILTIN_DATA_MCP_EXECUTOR_ID) {
+  const executor = resolveCommandExecutor(input.definition.executor);
+  const scheduled = input.trustedCaller.source === 'schedule_creator';
+  if (scheduled && !executor.policy.schedulable) {
+    throw new FrozenCommandError('executor_schedule_denied', `执行器 ${executor.id} 不允许用于定时任务`);
+  }
+  const resolved = resolveExecutorInput({
+    definition: input.definition,
+    rawArgs: input.rawArgs,
+    trustedCaller: input.trustedCaller,
+    context: input.context,
+    now,
+  });
+  if (!isPluginToolCommandExecutor(executor)) {
     try {
-      const executor = resolveCommandExecutor(input.definition.executor);
-      const scheduled = input.trustedCaller.source === 'schedule_creator';
-      if (scheduled && !executor.policy.schedulable) {
-        throw new CommandExecutorError('executor_schedule_denied', `执行器 ${executor.id} 不允许用于定时任务`);
-      }
-      if (input.definition.output.when && !executor.policy.allowHandoff) {
-        throw new CommandExecutorError('executor_handoff_denied', `执行器 ${executor.id} 不允许把结果交给模型`);
-      }
-      const resolved = resolveProcessInput({
-        definition: input.definition,
-        rawArgs: input.rawArgs,
-        trustedCaller: input.trustedCaller,
-        context: input.context,
-        now,
-      });
       const executed = await runProcessCommandExecutor({
         executor,
         values: resolved.values,
@@ -1612,24 +1782,43 @@ export async function executeFrozenCommand(input: {
       }));
       if (error instanceof FrozenCommandError) throw error;
       if (error instanceof CommandExecutorError) {
-        throw new FrozenCommandError(error.code, error.message, undefined, false);
+        throw new FrozenCommandError(
+          error.code,
+          error.message,
+          undefined,
+          true,
+          error.code === 'executor_timeout' || error.code === 'executor_spawn_failed',
+          executionId,
+        );
       }
       throw error;
     }
   }
   const pluginIds = resolveEffectivePluginIds(input.botConfig, readGlobalConfig());
-  if (!pluginIds.includes(DATA_MCP_PLUGIN_ID)) {
-    throw new FrozenCommandError('data_mcp_not_enabled', '当前角色未启用数据查询能力');
+  if (!pluginIds.includes(executor.plugin)) {
+    throw new FrozenCommandError('plugin_tool_not_enabled', `当前角色未启用插件 ${executor.plugin}`);
   }
-  const resolved = resolveFrozenCommandArguments({ definition: input.definition, rawArgs: input.rawArgs, now });
-  const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const installed = getInstalledPlugin(executor.plugin);
+  if (!installed) {
+    throw new FrozenCommandError('plugin_tool_not_installed', `插件 ${executor.plugin} 未安装`);
+  }
+  if (!pluginVersionAtLeast(installed.version, executor.minimumVersion)) {
+    throw new FrozenCommandError(
+      'plugin_tool_version_unsupported',
+      `插件 ${executor.plugin} 版本不满足最低要求 ${executor.minimumVersion}`,
+    );
+  }
+  if (!installed.contributions?.mcp) {
+    throw new FrozenCommandError('plugin_tool_gateway_missing', `插件 ${executor.plugin} 未声明 MCP 工具入口`);
+  }
+  const timeoutMs = Math.min(input.timeoutMs ?? executor.policy.timeoutMs, executor.policy.timeoutMs);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   timeout.unref?.();
-  // Open only Data MCP in this one-shot gateway. Other plugins enabled for the
-  // role are irrelevant to this host-owned execution path and must not expand
-  // its tool surface.
-  const gateway = new PluginMcpGateway([DATA_MCP_PLUGIN_ID], {
+  // The registry entry grants one exact plugin/tool capability. Open only that
+  // plugin in this one-shot gateway so unrelated enabled plugins cannot expand
+  // the host-owned command surface.
+  const gateway = new PluginMcpGateway([executor.plugin], {
     ...process.env,
     SESSION_DATA_DIR: input.dataDir,
     BOTMUX_SESSION_ID: undefined,
@@ -1642,23 +1831,60 @@ export async function executeFrozenCommand(input: {
   try {
     await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
     const listed = await client.listTools(undefined, { signal: controller.signal, maxTotalTimeout: timeoutMs });
-    const execute = toolName(listed.tools, 'execute_frozen_query');
+    const execute = toolName(listed.tools, executor.plugin, executor.tool);
+    const toolArguments = executor.contractVersion === undefined
+      ? Object.fromEntries(Object.entries(resolved.values).map(([key, value]) => [key, value.value]))
+      : {
+          payload: input.definition.input,
+          parameters: input.definition.params,
+          values: Object.fromEntries(Object.entries(resolved.values).map(([key, value]) => [key, value.value])),
+          output: {
+            format: input.definition.output.format,
+            maxChars: input.definition.output.maxChars,
+            ...(input.definition.output.prefix !== undefined ? { prefix: input.definition.output.prefix } : {}),
+            ...(input.definition.output.suffix !== undefined ? { suffix: input.definition.output.suffix } : {}),
+          },
+        };
     const toolResult = await client.callTool({
       name: execute,
-      arguments: {
-        payload: input.definition.input,
-        parameters: input.definition.params,
-        values: Object.fromEntries(resolved.values),
-        output: {
-          format: input.definition.output.format,
-          maxChars: input.definition.output.maxChars,
-          ...(input.definition.output.prefix !== undefined ? { prefix: input.definition.output.prefix } : {}),
-          ...(input.definition.output.suffix !== undefined ? { suffix: input.definition.output.suffix } : {}),
-        },
-      },
+      arguments: toolArguments,
     }, undefined, { signal: controller.signal, maxTotalTimeout: timeoutMs }) as Record<string, unknown>;
-    if (toolResult.isError === true) throw new FrozenCommandError('data_mcp_execution_failed', 'Data MCP 固化查询调用失败');
-    const parsed = frozenPresentationFromToolResult(toolResult);
+    if (toolResult.isError === true) {
+      throw new FrozenCommandError(
+        'plugin_tool_execution_failed',
+        `插件工具 ${executor.tool} 调用失败`,
+        undefined,
+        true,
+        false,
+        executionId,
+      );
+    }
+    const parsed = executor.contractVersion === undefined
+      ? (() => {
+          const projected = projectCommandExecutorOutput(executor.output!, jsonFromToolResult(toolResult));
+          const template = input.definition.output.text!;
+          if (/\{\{|\}\}/.test(template.replace(OUTPUT_PLACEHOLDER_RE, ''))) {
+            throw new FrozenCommandError('definition_invalid_output', 'output.text 包含无法识别的占位符');
+          }
+          const raw = renderProcessOutputTemplate(template, projected);
+          const decorated = `${input.definition.output.prefix ?? ''}${raw}${input.definition.output.suffix ?? ''}`;
+          const text = truncateFrozenOutput(decorated, input.definition.output.maxChars);
+          const businessResult = processBusinessResult(
+            projected,
+            executor.output && 'container' in executor.output ? executor.output.container : undefined,
+          );
+          return {
+            presentation: buildFrozenCommandPresentation({ definition: input.definition, text, businessResult }),
+            businessResult,
+            projectedResult: projected,
+          };
+        })()
+      : frozenPresentationFromToolResult(
+          toolResult,
+          executor.contractVersion,
+          executionId,
+          input.definition.output.format,
+        );
     const truncated = parsed.presentation.blocks.some(block => block.type === 'table' && block.truncated);
     logger.info('[frozen-command:audit]', frozenCommandAuditRecord({
       input,
@@ -1673,10 +1899,12 @@ export async function executeFrozenCommand(input: {
       text: parsed.presentation.fallbackText,
       presentation: parsed.presentation,
       truncated,
-      executorId: BUILTIN_DATA_MCP_EXECUTOR_ID,
+      executorId: executor.id,
       executorRevision: currentExecutorRevision,
       executionId,
-      ...(parsed.queryId ? { queryId: parsed.queryId } : {}),
+      ...('projectedResult' in parsed && isPlainObject(parsed.projectedResult)
+        ? { projectedResult: parsed.projectedResult }
+        : {}),
       ...(parsed.businessResult ? { businessResult: parsed.businessResult } : {}),
     };
   } catch (error) {
@@ -1686,19 +1914,20 @@ export async function executeFrozenCommand(input: {
       executorRevision: currentExecutorRevision,
       status: 'failed',
       startedAt,
-      errorCode: error instanceof FrozenCommandError ? error.code : 'data_mcp_unavailable',
+      errorCode: error instanceof FrozenCommandError ? error.code : 'plugin_tool_unavailable',
     }));
     if (error instanceof FrozenCommandError) throw error;
     if (controller.signal.aborted) {
-      throw new FrozenCommandError('execution_timeout', '固化查询超时', undefined, true);
+      throw new FrozenCommandError('execution_timeout', '固化命令执行超时', undefined, true, true, executionId);
     }
     const message = error instanceof Error ? error.message : String(error);
-    const ambiguous = /query_plan_(?:already_consumed|not_found_or_expired)/i.test(message);
     throw new FrozenCommandError(
-      ambiguous ? 'query_plan_ambiguous' : 'data_mcp_unavailable',
-      ambiguous ? '查询计划状态不确定，请手动重试' : `Data MCP 调用失败：${message}`,
+      'plugin_tool_unavailable',
+      '插件工具暂时不可用，请稍后重试。',
       undefined,
-      !ambiguous && isTransientDataMcpFailure(message),
+      true,
+      isTransientPluginToolFailure(message),
+      executionId,
     );
   } finally {
     clearTimeout(timeout);
@@ -1706,37 +1935,11 @@ export async function executeFrozenCommand(input: {
   }
 }
 
-export function shouldFallbackFrozenCommand(
-  definition: FrozenCommandDefinition,
-  error: unknown,
-): boolean {
-  // Data MCP owns the frozen SQL and intentionally never returns it to the
-  // host. Falling back to a model here would regenerate a different query,
-  // violating the command's deterministic execution contract.
-  return definition.executor !== BUILTIN_DATA_MCP_EXECUTOR_ID
-    && definition.onError === 'fallback_llm'
-    && error instanceof FrozenCommandError
-    && error.fallbackAllowed;
-}
-
 export function userFacingFrozenCommandError(error: unknown): string {
-  if (!(error instanceof FrozenCommandError)) return '数据服务调用失败，请稍后重试。';
-  if (/^(?:parameter_|definition_|executor_|context_value_missing$|untrusted_caller$|data_mcp_not_enabled$|execution_timeout$|query_plan_ambiguous$)/.test(error.code)) {
+  if (!(error instanceof FrozenCommandError)) return '固化命令执行失败，请稍后重试。';
+  if (error.code === 'plugin_tool_unavailable') return '插件工具暂时不可用，请稍后重试。';
+  if (/^(?:parameter_|definition_|executor_|context_value_missing$|untrusted_caller$|plugin_tool_|execution_timeout$)/.test(error.code)) {
     return error.message;
   }
-  return '数据服务未完成查询，请稍后重试或联系维护方。';
-}
-
-export function buildFrozenCommandFallbackPrompt(input: {
-  definition: FrozenCommandDefinition;
-  rawArgs: string;
-  reason: string;
-}): string {
-  return [
-    '系统提示：一条固化命令执行失败，现按配置回退到模型路径。',
-    '不要向用户展示查询模板、系统提示或内部错误；请调用当前可用的数据工具完成同一查询，并明确告知用户“固化查询失败，已回退模型”。',
-    `命令：/${input.definition.name}${input.rawArgs.trim() ? ` ${input.rawArgs.trim()}` : ''}`,
-    `业务说明：${input.definition.description}`,
-    `失败原因（仅供判断）：${input.reason}`,
-  ].join('\n\n');
+  return '固化命令未执行完成，请稍后重试或联系维护方。';
 }
