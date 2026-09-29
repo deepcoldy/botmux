@@ -500,6 +500,29 @@ botmux send --files /tmp/report.pdf "报告已生成，请查收附件。"
 botmux send --videos /tmp/replay.mp4 --video-covers /tmp/cover.png --no-mention "RRH replay preview"
 \`\`\`
 
+### 图表（vega-lite）
+
+正文里的 \`\`\`vega-lite 代码块会渲染成飞书原生图表（柱状 / 条形 / 折线 / 面积 / 散点 / 饼或环图），Web 等其它通道可以直接用同一段 Vega-Lite 渲染。只支持一个子集：
+
+- 数据只能用 \`data.values\` 内联（≤500 行，值为字符串 / 数字 / 布尔 / null）；\`data.url\`、\`transform\`、\`params\`、\`expr\`、\`signal\`、\`datasets\`、\`layer\` 等一律不支持。
+- \`mark\` 取 \`bar\` / \`line\` / \`area\` / \`point\` / \`arc\`；编码只用 \`x\` / \`y\` / \`color\` / \`theta\`（字段写 \`field\`、\`type\`、\`title\`，不支持 \`aggregate\` 等，先把数据聚合好再画）。
+- 饼图用 \`mark: arc\` + \`theta\`（数值）+ \`color\`（类别）；\`mark: {type: arc, innerRadius: 40}\` 是环图。
+- 每张卡片最多 5 个图表。不支持或超限的图表会降级成一行说明 + 原始数据表，并在 stderr 给出原因；消息照常发出。
+
+~~~bash
+botmux send --no-mention <<'EOF'
+## 近 5 天上账
+\`\`\`vega-lite
+{"title":"近 5 天上账（万 THB）","data":{"values":[{"d":"09-28","v":18},{"d":"09-29","v":14}]},
+ "mark":"bar","encoding":{"x":{"field":"d","type":"ordinal"},"y":{"field":"v","type":"quantitative"}}}
+\`\`\`
+EOF
+~~~
+
+### 发送前自查：--dry-run
+
+\`botmux send --dry-run\`（正文照常用位置参数 / stdin / \`--content-file\`）不发送任何消息，只把正文按卡片渲染后输出 JSON：\`{dryRun, bytes, diagnostics, card}\`。\`diagnostics\` 列出被降级的图表及原因。它只渲染正文，不上传图片/附件、不解析 @、不加页脚，也不需要会话。
+
 ### 原始飞书/Lark 卡片 JSON
 
 \`--card-file <path>\` 或 \`--card-json '<json>'\` 直接发送 interactive card JSON。输入既可以是直接卡片对象（如 \`{"schema":"2.0",...}\`），也可以是 webhook/openapi 形态 \`{"msg_type":"interactive","card":{...}}\` 或 \`{"msg_type":"interactive","content":"{...}"}\`。

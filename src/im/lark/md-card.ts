@@ -37,6 +37,14 @@ import type { FeedbackPolicy } from '../../services/feedback-policy.js';
 import type { StatuslineQuota } from '../../services/statusline-snapshot.js';
 import type { ReplyCardHeader } from './reply-card-style.js';
 import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
+import {
+  VEGA_LITE_FENCE_LANGS,
+  convertVegaLiteFence,
+  degradedVegaLiteElements,
+  type CardRenderDiagnostic,
+} from './vega-lite-chart.js';
+
+export type { CardRenderDiagnostic } from './vega-lite-chart.js';
 
 export { REPLY_CARD_FOOTER_MARKER } from './reply-card-footer-signature.js';
 
@@ -47,6 +55,17 @@ const MAX_LOCAL_HOME_LINK_REPAIRS = 256;
  *  split one prose buffer into another element, so six keeps ordinary cards
  *  bounded while still covering the sections in a typical result report. */
 const MAX_PROMOTED_CARD_HEADINGS = 6;
+/** Feishu recommends at most five charts per card; every chart also carries
+ * its data inline, so the total is bounded separately from the per-spec cap. */
+const MAX_CARD_CHARTS = 5;
+const MAX_CARD_CHART_BYTES = 60 * 1024;
+
+interface CardLayoutBudget {
+  promotedHeadings: number;
+  charts: number;
+  chartBytes: number;
+  diagnostics?: CardRenderDiagnostic[];
+}
 
 /** Canonical chrome for ordinary Bot Session reply cards. The CLI send path
  *  and daemon final-output fallback both spread this object so layout cannot
@@ -926,6 +945,7 @@ export function buildCardBodyElements(
   cwd = process.cwd(),
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
   imageMode = 'fit_horizontal',
+  diagnostics?: CardRenderDiagnostic[],
 ): any[] {
   if (!input) return [];
   // Recover model-escaped fences first so markdown-it can classify their
@@ -936,7 +956,7 @@ export function buildCardBodyElements(
   // else flows through the markdown element builder unchanged. Fence-aware so
   // image-looking lines inside ``` code blocks are left intact.
   const elements: any[] = [];
-  const layoutBudget = { promotedHeadings: 0 };
+  const layoutBudget: CardLayoutBudget = { promotedHeadings: 0, charts: 0, chartBytes: 0, diagnostics };
   for (const seg of splitImageRowSegments(input, imageMode)) {
     if (seg.type === 'imgrow') elements.push(imageRowElement(seg.keys));
     else if (seg.type === 'img') elements.push(singleImageLayout(seg.key, imageMode, seg.alt));
@@ -947,7 +967,7 @@ export function buildCardBodyElements(
 
 function buildMarkdownElements(
   input: string,
-  layoutBudget: { promotedHeadings: number },
+  layoutBudget: CardLayoutBudget,
 ): any[] {
   if (!input) return [];
   input = unescapeFenceLines(input);
@@ -1012,6 +1032,15 @@ function buildMarkdownElements(
       continue;
     }
 
+    if (t.type === 'fence' && VEGA_LITE_FENCE_LANGS.has((t.info || '').trim().split(/\s+/)[0]!.toLowerCase())) {
+      // A chart fence becomes a native Card 2.0 chart, or a notice plus a
+      // plain-text data table — never the raw spec (see vega-lite-chart.ts).
+      flushBuf();
+      elements.push(...buildVegaLiteElements(t.content, layoutBudget));
+      i++;
+      continue;
+    }
+
     if (t.type === 'fence' || t.type === 'code_block') {
       const fence = t.markup || '```';
       const info = (t.info || '').trim();
@@ -1047,6 +1076,32 @@ function buildMarkdownElements(
 
   flushBuf();
   return elements;
+}
+
+function buildVegaLiteElements(source: string, layoutBudget: CardLayoutBudget): any[] {
+  let result = convertVegaLiteFence(source);
+  if (result.ok) {
+    const bytes = Buffer.byteLength(JSON.stringify(result.element), 'utf8');
+    // Over-budget charts are valid; keep their data so the table fallback
+    // still shows the numbers.
+    const rows = (result.element.chart_spec as { data: { values: Record<string, string | number | boolean | null>[] } }).data.values;
+    const kept = { ...(result.title ? { title: result.title } : {}), rows };
+    if (layoutBudget.charts >= MAX_CARD_CHARTS) {
+      result = { ok: false, reason: 'too_many_charts', ...kept };
+    } else if (layoutBudget.chartBytes + bytes > MAX_CARD_CHART_BYTES) {
+      result = { ok: false, reason: 'chart_budget_exceeded', ...kept };
+    } else {
+      layoutBudget.charts++;
+      layoutBudget.chartBytes += bytes;
+      return [result.element];
+    }
+  }
+  layoutBudget.diagnostics?.push({
+    kind: 'chart_degraded',
+    reason: result.reason,
+    ...(result.title ? { title: result.title } : {}),
+  });
+  return degradedVegaLiteElements(result);
 }
 
 // Existing multi-image rows retain their legacy payload for compatibility.
@@ -1198,8 +1253,9 @@ export function buildImageCardElements(
   cwd = process.cwd(),
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
   imageMode?: string,
+  diagnostics?: CardRenderDiagnostic[],
 ): any[] {
-  if (imageKeys.length === 0) return md ? buildCardBodyElements(md, cwd, localHomeLinkMode, imageMode) : [];
+  if (imageKeys.length === 0) return md ? buildCardBodyElements(md, cwd, localHomeLinkMode, imageMode, diagnostics) : [];
 
   const used = new Set<number>();
   const keyAt = (idx: number): string | null =>
@@ -1230,7 +1286,7 @@ export function buildImageCardElements(
   const trailing = imageKeys.map((k, i) => (used.has(i) ? '' : `![](${k})`)).filter(Boolean).join('\n\n');
   if (trailing) resolved = resolved ? `${resolved}\n\n${trailing}` : trailing;
 
-  return buildCardBodyElements(resolved, cwd, localHomeLinkMode, imageMode);
+  return buildCardBodyElements(resolved, cwd, localHomeLinkMode, imageMode, diagnostics);
 }
 
 /**
