@@ -66,6 +66,7 @@ export function prepareLarkToolEnv(input: {
   appId: string;
   brand?: Brand;
   defaultAs?: 'bot' | 'user';
+  effectivePath?: string;
   runner?: { command: string; args: string[] };
 }): LarkToolBinding {
   const binDir = sessionIdentityBinDir(input.dataDir, input.sessionId);
@@ -74,7 +75,7 @@ export function prepareLarkToolEnv(input: {
   const configDir = join(dataDir, 'lark-config');
   mkdirSync(configDir, { recursive: true, mode: 0o700 });
   mkdirSync(join(configDir, 'data'), { recursive: true, mode: 0o700 });
-  const realBinary = findRealToolBinary('lark-cli', input.env.PATH, [binDir]);
+  const realBinary = findRealToolBinary('lark-cli', input.effectivePath ?? input.env.PATH, [binDir]);
   const bindingPath = larkToolBindingPath(input.dataDir, input.sessionId);
   let prior: LarkToolBinding | undefined;
   try { prior = readLarkToolBinding(bindingPath); } catch { /* first binding */ }
@@ -128,54 +129,7 @@ export function larkToolPrompt(appId: string, locale?: string): string {
     : `lark-cli 固定使用当前机器人的应用 ${appId}，默认以 bot 身份调用（其他工具的按用户鉴权不改变此默认）。需要个人资源或 bot 无权时，可用 --as user 使用当前用户对同一应用的授权。缺授权时运行 botmux auth request --scope "<所需权限>" --json。不要切换 profile，也不要重复执行结果尚不确定的写操作。`;
 }
 
-export interface LarkToolInvocation {
-  args: string[];
-  mode: 'bot' | 'user';
-  offline: boolean;
-}
-
-/** Parse only tool-level identity flags, preserving literal payload argv. */
-export function parseLarkToolInvocation(args: readonly string[], binding: Pick<LarkToolBinding, 'appId' | 'defaultAs'>): LarkToolInvocation {
-  const output: string[] = [];
-  let mode = binding.defaultAs;
-  let sawAs = false, sawProfile = false, literal = false, help = false;
-  const payloadFlags = new Set(['--text', '--content', '--data', '--params', '--json-body', '--body', '--jq', '-q', '--file', '--output', '--output-dir', '--doc', '--url', '--title', '--name', '--scope', '--query']);
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (literal) { output.push(arg); continue; }
-    if (arg === '--') { literal = true; output.push(arg); continue; }
-    if (payloadFlags.has(arg)) {
-      output.push(arg);
-      if (i + 1 < args.length) output.push(args[++i]);
-      continue;
-    }
-    if (arg === '--as' || arg.startsWith('--as=')) {
-      const value = arg === '--as' ? args[++i] : arg.slice(5);
-      if (sawAs || (value !== 'bot' && value !== 'user')) throw new Error('Use exactly one --as bot or --as user');
-      sawAs = true; mode = value; continue;
-    }
-    if (arg === '--profile' || arg.startsWith('--profile=')) {
-      const value = arg === '--profile' ? args[++i] : arg.slice(10);
-      if (sawProfile || value !== binding.appId) throw new Error(`lark-cli is bound to application ${binding.appId}; profile switching is unavailable`);
-      sawProfile = true; continue;
-    }
-    if (arg === '--help' || arg === '-h') help = true;
-    output.push(arg);
-  }
-  // Command payloads may legitimately contain '--as user' as a string. Only
-  // exact argv identity flags above are consumed; never regex-rewrite a body.
-  const command = output[0];
-  const offline = help || !command || command === 'help' || command === 'schema'
-    || command === '--version' || command === '-v'
-    || command === 'skills' && ['read', 'list'].includes(output[1]);
-  if (!offline && ['auth', 'profile', 'config', 'update'].includes(command)) {
-    if (!(command === 'auth' && output[1] === 'status')) {
-      throw new Error('Managed lark-cli cannot change accounts. For this application authorization use botmux auth request --scope "<required scopes>" --json');
-    }
-  }
-  if (!offline && command?.startsWith('-')) throw new Error('Put the lark-cli command before business flags');
-  return { args: output, mode, offline };
-}
+export { parseLarkToolInvocation } from './lark-tool-command.js';
 
 export function larkToolChildEnv(
   inherited: NodeJS.ProcessEnv, binding: LarkToolBinding,

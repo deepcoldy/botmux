@@ -373,6 +373,7 @@ import { isKnownLarkUserScope } from '../utils/lark-scope-catalog.js';
 import { refreshSessionIdentity } from './cli-identity.js';
 import { larkToolBindingPath, readLarkToolBinding } from './lark-tool-binding.js';
 import { resolveUserToken } from '../utils/user-token.js';
+import { getLarkToolDelegation } from './lark-tool-delegation.js';
 import type { ReplyStyleConfig } from '../im/lark/reply-card-style.js';
 import {
   ASK_OPTION_LAYOUT_REQUEST_MAX_BYTES,
@@ -2435,20 +2436,32 @@ ipcRoute('POST', '/api/sessions/:sessionId/lark-tool-identity', async (req, res,
     ok: true, appId: ds.larkAppId, mode: 'bot', credential: bot.larkAppSecret,
   });
   const origin = ds.managedTurnOrigin;
-  const sender = origin?.callerOpenId;
+  const originSender = origin?.callerOpenId;
   const turnId = origin?.turnId;
-  if (!sender || !turnId) return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
-  const cached = getIdentity(ds.larkAppId, sender);
-  const user = cached?.type === 'user' && ['sender', 'message_api', 'contact_api'].includes(cached.source)
-    ? cached : await resolveVerifiedUserIdentity(ds.larkAppId, sender);
+  if (!turnId) return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
+  const delegated = getLarkToolDelegation(config.session.dataDir, params.sessionId, turnId);
+  const delegatedError = (reason: string) => `Delegated lark-cli execution refused: ${reason}. Report with botmux report --dispatch-root ${delegated!.dispatchRoot}; do not ask a bot to log in.`;
+  if (delegated && (delegated.denialReason || !delegated.targetOpenId || !delegated.tools.includes('lark-cli')
+    || !triggerUserAuthApplies(bot.triggerUserAuth, 'lark-cli'))) {
+    return jsonRes(res, 403, { ok: false, error: delegatedError(delegated.denialReason ?? 'target user/tool access unavailable') });
+  }
+  const sender = delegated?.targetOpenId ?? originSender;
+  if (!sender) return jsonRes(res, 403, { ok: false, error: 'No current requesting user; --as user requires their authorization' });
+  const cached = delegated ? undefined : getIdentity(ds.larkAppId, sender);
+  const user = delegated ? { type: 'user' as const, openId: sender }
+    : cached?.type === 'user' && ['sender', 'message_api', 'contact_api'].includes(cached.source)
+      ? cached : await resolveVerifiedUserIdentity(ds.larkAppId, sender);
   if (!user || user.type !== 'user' || user.openId !== sender) {
     return jsonRes(res, 403, { ok: false, error: 'The current requesting user could not be verified' });
   }
   const token = await resolveUserToken(bot.larkAppId, bot.larkAppSecret, normalizeBrand(bot.brand), sender);
-  if (ds.managedTurnOrigin?.turnId !== turnId || ds.managedTurnOrigin?.callerOpenId !== sender) {
+  if (ds.managedTurnOrigin?.turnId !== turnId || ds.managedTurnOrigin?.callerOpenId !== originSender
+    || delegated && JSON.stringify(getLarkToolDelegation(config.session.dataDir, params.sessionId, turnId)) !== JSON.stringify(delegated)) {
     return jsonRes(res, 409, { ok: false, error: 'The current requesting user changed; retry the command' });
   }
-  if (!token) return jsonRes(res, 403, { ok: false, error: `Application ${bot.larkAppId} needs this user's authorization. Run botmux auth request --scope "<required scopes>" --json, or send /login in this conversation, then retry with --as user.` });
+  if (!token) return jsonRes(res, 403, { ok: false, error: delegated
+    ? delegatedError(`the original user's authorization for ${bot.larkAppId} is missing`)
+    : `Application ${bot.larkAppId} needs this user's authorization. Run botmux auth request --scope "<required scopes>" --json, or send /login in this conversation, then retry with --as user.` });
   return jsonRes(res, 200, { ok: true, appId: bot.larkAppId, mode: 'user', credential: token });
 });
 

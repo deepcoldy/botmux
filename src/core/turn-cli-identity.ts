@@ -21,6 +21,7 @@ import { beginBytedcliLogin, mintBytedcliJwts } from '../services/bytedcli-auth.
 import { resolveLarkCliHomeForTurn, beginLarkCliLogin } from '../services/lark-cli-auth.js';
 import type { BotConfig } from '../bot-registry.js';
 import { hasLarkToolBinding } from './lark-tool-binding.js';
+import { rememberLarkToolDelegation } from './lark-tool-delegation.js';
 import {
   triggerUserAuthApplies,
   TRIGGER_USER_AUTH_TOOLS,
@@ -86,6 +87,9 @@ export async function publishTurnCliIdentity(
   const { botConfig, sessionDataDir, sessionId, senderOpenId, locale, turnId } = args;
   const policy = botConfig.triggerUserAuth;
   const outcomes: ToolIdentityOutcome[] = [];
+  // Record before the new-entry shortcut (and before first worker spawn).
+  // The daemon has already verified the signed dispatch and target access.
+  rememberLarkToolDelegation(sessionDataDir, sessionId, turnId, args.delegatedIdentity);
 
   for (const tool of TRIGGER_USER_AUTH_TOOLS) {
     if (tool === 'lark-cli' && hasLarkToolBinding(sessionDataDir, sessionId)) {

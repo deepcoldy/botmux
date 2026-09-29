@@ -17499,7 +17499,7 @@ async function spawnCli(
     ? { ...cfg.triggerUserAuth, tools: cfg.triggerUserAuth.tools.filter(tool => tool !== 'lark-cli') }
     : cfg.triggerUserAuth;
   prepareTriggerUserCliEnv(childEnv, process.env.SESSION_DATA_DIR, cfg.sessionId, identityPolicy, log);
-  if (boundLark) prepareLarkToolEnv({ env: childEnv, dataDir: process.env.SESSION_DATA_DIR!,
+  if (boundLark) prepareLarkToolEnv({ env: childEnv, effectivePath: perBotInjectEnv.PATH ?? childEnv.PATH, dataDir: process.env.SESSION_DATA_DIR!,
     sessionId: cfg.sessionId, appId: cfg.larkAppId, brand: cfg.brand });
   if (cfg.triggerUserAuth?.enabled && process.env.SESSION_DATA_DIR) {
     // Say plainly how protected the token store actually is. Without the file

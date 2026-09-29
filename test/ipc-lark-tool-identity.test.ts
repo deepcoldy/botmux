@@ -9,7 +9,10 @@ import * as identities from '../src/im/lark/identity-cache.js';
 import * as tokens from '../src/utils/user-token.js';
 import { config } from '../src/config.js';
 import { prepareLarkToolEnv, larkToolBindingPath, type LarkToolBinding } from '../src/core/lark-tool-binding.js';
+import { fakeLarkHelpScript } from './helpers/lark-tool-help.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
+import { publishTurnCliIdentity } from '../src/core/turn-cli-identity.js';
+import { clearLarkToolDelegations } from '../src/core/lark-tool-delegation.js';
 
 let dir: string, previousDataDir: string, ipc: IpcServerHandle | undefined, session: any, binding: LarkToolBinding;
 beforeEach(async () => {
@@ -28,6 +31,7 @@ beforeEach(async () => {
   ipc = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
 });
 afterEach(async () => {
+  clearLarkToolDelegations(dir, 'tool-session');
   await ipc?.close(); ipc = undefined; config.session.dataDir = previousDataDir;
   setIpcAuthSecret(null); vi.restoreAllMocks(); rmSync(dir, { recursive: true, force: true });
 });
@@ -38,6 +42,69 @@ async function request(mode: string, accessKey = binding.accessKey) {
   });
 }
 describe('session application identity route', () => {
+  async function delegate(options: { tools?: ('lark-cli' | 'bytedcli')[]; denialReason?: 'target_access_denied' | 'target_validation_unavailable'; targetOpenId?: string; turnId?: string } = {}) {
+    session.managedTurnOrigin.callerOpenId = 'ou_dispatch_bot';
+    const botConfig = { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret',
+      triggerUserAuth: { enabled: true, tools: ['lark-cli'], fallback: 'none' } } as any;
+    vi.mocked(bots.getBot).mockReturnValue({ config: botConfig } as any);
+    await publishTurnCliIdentity({ botConfig, sessionDataDir: dir, sessionId: 'tool-session',
+      senderOpenId: 'ou_dispatch_bot', turnId: options.turnId ?? 'om_turn', delegatedIdentity: {
+        credentialOpenId: 'ou_source_human', targetOpenId: options.targetOpenId ?? 'ou_target_human',
+        tools: options.tools ?? ['lark-cli'], dispatchRoot: 'om_dispatch_root', denialReason: options.denialReason,
+      } });
+  }
+  it('uses the verified delegated human’s target-app authorization, never the dispatch bot or source token', async () => {
+    await delegate();
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async (app, _secret, _brand, person) =>
+      app === 'cli_bound' && person === 'ou_target_human' ? 'target-grant' : 'WRONG_GRANT');
+    const response = await request('user');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ appId: 'cli_bound', mode: 'user', credential: 'target-grant' });
+    expect(tokens.resolveUserToken).toHaveBeenCalledExactlyOnceWith('cli_bound', 'bound-secret', 'feishu', 'ou_target_human');
+    expect(identities.resolveVerifiedUserIdentity).not.toHaveBeenCalled();
+  });
+  it.each([
+    { tools: ['bytedcli'] as ('lark-cli' | 'bytedcli')[] },
+    { denialReason: 'target_access_denied' as const },
+    { denialReason: 'target_validation_unavailable' as const },
+  ])('does not widen a denied delegation: %j', async options => {
+    await delegate(options);
+    expect(await (await request('user')).json()).toMatchObject({ ok: false, error: expect.stringContaining('report --dispatch-root om_dispatch_root') });
+    expect(tokens.resolveUserToken).not.toHaveBeenCalled();
+  });
+  it('rechecks the delegated user token and reports missing authorization to the source task', async () => {
+    await delegate();
+    vi.mocked(tokens.resolveUserToken).mockResolvedValue(null);
+    const response = await request('user');
+    expect(await response.json()).toMatchObject({ ok: false, error: expect.stringContaining('original user') });
+    expect(response.status).toBe(403);
+  });
+  it('refuses when target permission is withdrawn while resolving the delegated token', async () => {
+    await delegate();
+    vi.mocked(tokens.resolveUserToken).mockImplementation(async () => {
+      await delegate({ denialReason: 'target_access_denied' });
+      return 'late-token';
+    });
+    const response = await request('user');
+    expect(response.status).toBe(409);
+    expect(await response.text()).not.toContain('late-token');
+  });
+  it('publishes delegation before a new worker creates its application binding', async () => {
+    rmSync(larkToolBindingPath(dir, 'tool-session'));
+    await delegate();
+    binding = prepareLarkToolEnv({ env: { PATH: '/usr/bin:/bin' }, dataDir: dir, sessionId: 'tool-session', appId: 'cli_bound' });
+    expect((await request('user')).status).toBe(200);
+    expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_target_human');
+  });
+  it('keeps queued turns separate and never inherits delegation in a later direct turn', async () => {
+    await delegate();
+    await delegate({ targetOpenId: 'ou_later', turnId: 'om_queued' });
+    await request('user');
+    expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_target_human');
+    session.managedTurnOrigin = { turnId: 'om_direct', capability: 'cap', callerOpenId: 'ou_sender' };
+    await request('user');
+    expect(tokens.resolveUserToken).toHaveBeenLastCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_sender');
+  });
   it('binds bot and current user without requiring triggerUserAuth configuration', async () => {
     const bot = await request('bot'); const raw = await bot.text();
     expect(bot.status).toBe(200);
@@ -91,7 +158,7 @@ describe('session application identity route', () => {
   });
   it('runs the real tool process with only the selected application credentials', async () => {
     const real = join(dir, 'real-lark');
-    writeFileSync(real, '#!/bin/sh\nprintf "%s|%s|%s|%s" "$LARKSUITE_CLI_APP_ID" "$LARKSUITE_CLI_APP_SECRET" "$LARKSUITE_CLI_USER_ACCESS_TOKEN" "$*"\n'); chmodSync(real, 0o755);
+    writeFileSync(real, '#!/usr/bin/env node\n' + fakeLarkHelpScript() + 'process.stdout.write([process.env.LARKSUITE_CLI_APP_ID,process.env.LARKSUITE_CLI_APP_SECRET,process.env.LARKSUITE_CLI_USER_ACCESS_TOKEN,process.argv.slice(2).join(" ")].map(x=>x||"").join("|"));\n'); chmodSync(real, 0o755);
     binding.realBinary = real; writeFileSync(larkToolBindingPath(dir, 'tool-session'), JSON.stringify(binding), { mode: 0o600 });
     const run = (args: string[]) => new Promise<{ code: number | null; out: string; err: string }>((resolve, reject) => {
       const child = spawnTsScript(join(process.cwd(), 'src/lark-tool-runner.ts'), ['--binding', larkToolBindingPath(dir, 'tool-session'), '--', ...args], {

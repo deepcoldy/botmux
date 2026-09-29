@@ -1,5 +1,6 @@
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { readLarkToolBinding, parseLarkToolInvocation, larkToolChildEnv, LARK_TOOL_ROUTE, larkToolPrompt } from './core/lark-tool-binding.js';
+import { larkToolExecutionArgs } from './core/lark-tool-command.js';
 import { loopbackFetch } from './core/loopback-fetch.js';
 
 async function main(): Promise<void> {
@@ -7,7 +8,12 @@ async function main(): Promise<void> {
   if (argv[0] === '__lark-tool-runner') argv.shift();
   if (argv[0] !== '--binding' || !argv[1] || argv[2] !== '--') throw new Error('Invalid managed lark-cli invocation');
   const binding = readLarkToolBinding(argv[1]);
-  const invocation = parseLarkToolInvocation(argv.slice(3), binding);
+  const invocation = parseLarkToolInvocation(argv.slice(3), binding, command => execFileSync(
+    binding.realBinary, [...command, '--help'], {
+      env: larkToolChildEnv(process.env, binding), encoding: 'utf8',
+      timeout: 5_000, maxBuffer: 4 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  ));
   let identity: { mode: 'bot' | 'user'; credential: string } | undefined;
   if (!invocation.offline) {
     const port = binding.ipcPort ?? Number(process.env.BOTMUX_DAEMON_IPC_PORT);
@@ -25,16 +31,10 @@ async function main(): Promise<void> {
     }
     identity = { mode: invocation.mode, credential: result.credential };
   }
-  if (invocation.args.includes('--help') || invocation.args.includes('-h')) {
+  if (invocation.showHelp) {
     process.stderr.write(`botmux: ${larkToolPrompt(binding.appId, process.env.LANG?.startsWith('zh') ? 'zh' : 'en')}\n`);
   }
-  const args = [...invocation.args];
-  // Place mode before `--`, which terminates flags. Management reads such as
-  // auth status use env identity and do not expose an --as flag.
-  if (!invocation.offline && args[0] !== 'auth') {
-    const literal = args.indexOf('--');
-    args.splice(literal < 0 ? args.length : literal, 0, '--as', invocation.mode);
-  }
+  const args = larkToolExecutionArgs(invocation);
   const child = spawn(binding.realBinary, args, {
     env: larkToolChildEnv(process.env, binding, identity), cwd: process.cwd(), stdio: 'inherit',
   });

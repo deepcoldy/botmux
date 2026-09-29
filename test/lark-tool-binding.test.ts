@@ -2,13 +2,18 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { larkToolBindingPath, larkToolChildEnv, parseLarkToolInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding } from '../src/core/lark-tool-binding.js';
+import { larkToolBindingPath, larkToolChildEnv, parseLarkToolInvocation as parseInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding } from '../src/core/lark-tool-binding.js';
+import { readLarkToolHelp, fakeLarkHelpScript } from './helpers/lark-tool-help.js';
 import { spawnSyncTsScript } from './helpers/ts-runner.js';
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'lark-tool-binding-')); });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 const defaults = { appId: 'cli_current', defaultAs: 'bot' as const };
+const parseLarkToolInvocation = (args: string[], binding: { appId: string; defaultAs: 'bot' | 'user' }) => {
+  const { args: output, mode, offline } = parseInvocation(args, binding, readLarkToolHelp);
+  return { args: output, mode, offline };
+};
 
 describe('managed lark-cli binding', () => {
   it('binds new standard sessions and leaves old/adopt/remote sessions alone', () => {
@@ -70,16 +75,28 @@ describe('managed lark-cli binding', () => {
     expect(userEnv.LARKSUITE_CLI_APP_SECRET).toBeUndefined();
     expect(userEnv.LARKSUITE_CLI_USER_ACCESS_TOKEN).toBe('own-user');
   });
-  it('executes help offline through the real runner and preserves its exit code', () => {
+  it('keeps the configured PATH when viewer setup repeats an RPC binding', () => {
+    const daemonBin = join(dir, 'daemon-bin'), botBin = join(dir, 'bot-bin');
+    for (const bin of [daemonBin, botBin]) {
+      mkdirSync(bin); writeFileSync(join(bin, 'lark-cli'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    }
+    const input = { dataDir: dir, sessionId: 'rpc-session', appId: defaults.appId };
+    const first = prepareLarkToolEnv({ ...input, env: { PATH: botBin } });
+    const second = prepareLarkToolEnv({ ...input, env: { PATH: daemonBin }, effectivePath: botBin });
+    expect(first.realBinary).toBe(join(botBin, 'lark-cli'));
+    expect(second.realBinary).toBe(first.realBinary);
+    expect(second.accessKey).toBe(first.accessKey);
+  });
+  it('executes version offline through the real runner and preserves its exit code', () => {
     const bin = join(dir, 'bin'); mkdirSync(bin);
     const real = join(bin, 'lark-cli');
-    writeFileSync(real, '#!/bin/sh\nprintf "%s|%s" "$LARKSUITE_CLI_APP_ID" "$*"\nexit 3\n'); chmodSync(real, 0o755);
+    writeFileSync(real, '#!/usr/bin/env node\n' + fakeLarkHelpScript() + 'process.stdout.write(process.env.LARKSUITE_CLI_APP_ID+"|"+process.argv.slice(2).join(" ")); process.exit(3);\n'); chmodSync(real, 0o755);
     const env = { PATH: `${bin}:/usr/bin:/bin`, HOME: dir };
     prepareLarkToolEnv({ env, dataDir: dir, sessionId: 'session-a', appId: defaults.appId });
     const result = spawnSyncTsScript(join(process.cwd(), 'src/lark-tool-runner.ts'), [
-      '--binding', larkToolBindingPath(dir, 'session-a'), '--', 'docs', '+fetch', '--help',
+      '--binding', larkToolBindingPath(dir, 'session-a'), '--', '--version',
     ], { env, encoding: 'utf8' });
     expect(result.status, String(result.stderr)).toBe(3);
-    expect(result.stdout).toBe('cli_current|docs +fetch --help');
+    expect(result.stdout).toBe('cli_current|--version');
   });
 });
