@@ -32,7 +32,7 @@ describe('host workspace resolver', () => {
   it('returns explicit directory and missing fallbacks and caches concurrent calls', async () => {
     const root = dir(); const resolve = createWorkspaceResolver(() => 'host');
     const [a, b] = await Promise.all([resolve(root, 'pty'), resolve(root, 'pty', true)]);
-    expect(a).toBe(b); expect(a.kind).toBe('directory');
+    expect(a).toBe(b); expect(a).toMatchObject({ kind: 'directory', state: 'resolved' });
     expect(await resolve(join(root, 'missing'), 'pty')).toMatchObject({ state: 'missing', kind: 'directory' });
   });
   it('does not probe remote or unknown backend paths even when they exist locally', async () => {

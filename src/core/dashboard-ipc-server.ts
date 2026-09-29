@@ -1281,7 +1281,11 @@ ipcRoute('GET', '/api/sessions/:sessionId/workspace', async (req, res, params) =
   const persisted = ds?.session ?? sessionStore.listSessions().find(s => s.sessionId === params.sessionId);
   if (!persisted) return jsonRes(res, 404, { error: 'not_found' });
   const workingDir = ds ? ds.workingDir : persisted.workingDir;
-  const backend = ds?.initConfig?.backendType ?? persisted.backendType;
+  // Match the backend identity published on the dashboard row. In particular,
+  // a remote session can retain a local-looking initConfig fallback while its
+  // persisted spawn stamp is `riff`/`mojo`; probing that cwd on this host would
+  // assign the remote session a false local workspace identity.
+  const backend = persisted.backendType;
   const force = new URL(req.url!, 'http://localhost').searchParams.get('force') === '1';
   const workspace = await resolveWorkspace(workingDir ?? '', backend, force);
   jsonRes(res, 200, { workingDir, workspace });

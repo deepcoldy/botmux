@@ -35,6 +35,18 @@ describe('worktree grouping', () => {
     aggregator.applyEvent('a', { type: 'session.update', body: { sessionId: 's1', patch: { workingDir: '/different' } } });
     expect(aggregator.getSession('s1')?.workspace).toBeNull();
   });
+  it('keeps cached metadata when an older or temporarily unavailable host cannot resolve it', async () => {
+    const aggregator = new Aggregator();
+    const coordinator = createSessionPresentationCoordinator(aggregator, async () => null, async () => null);
+    aggregator.hydrateSessions('a', [{ ...row('s1'), larkAppId: 'a', repoName: 'feature', gitBranch: 'main' }]);
+    coordinator.schedule('a', aggregator.getSession('s1')!);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    expect(aggregator.getSession('s1')).toMatchObject({
+      workspace,
+      repoName: 'feature',
+      gitBranch: 'main',
+    });
+  });
   it('rejects a delayed host result when execution switches to a remote backend', async () => {
     const aggregator = new Aggregator();
     let finish!: (value: typeof workspace) => void;

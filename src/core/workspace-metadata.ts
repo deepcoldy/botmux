@@ -39,7 +39,9 @@ function git(cwd: string, args: string[]): Promise<string> {
     const env = { ...process.env, LC_ALL: 'C' } as NodeJS.ProcessEnv;
     for (const key of Object.keys(env)) if (key.startsWith('GIT_')) delete env[key];
     execFile('git', ['-C', cwd, ...args], { env, timeout: 1500, maxBuffer: 65536 },
-      (error, stdout) => error ? reject(error) : resolve(stdout.replace(/\r?\n$/, '')));
+      (error, stdout, stderr) => error
+        ? reject(Object.assign(error, { stderr }))
+        : resolve(stdout.replace(/\r?\n$/, '')));
   });
 }
 
@@ -64,7 +66,8 @@ export function createWorkspaceResolver(source: () => string = workspaceSourceId
       let root: string;
       try { root = await realpath(await git(canonical, ['rev-parse', '--show-toplevel'])); }
       catch (error) {
-        const notRepo = String((error as { stderr?: string; message?: string }).message ?? '').includes('not a git repository');
+        const failure = error as { stderr?: string; message?: string };
+        const notRepo = `${failure.stderr ?? ''}\n${failure.message ?? ''}`.includes('not a git repository');
         return { ...base, kind: 'directory', rootPath: canonical, displayName: basename(canonical), state: notRepo ? 'resolved' : 'error' };
       }
       let branch: string | undefined;

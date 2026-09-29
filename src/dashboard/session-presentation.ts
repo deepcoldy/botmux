@@ -44,6 +44,13 @@ export function createSessionPresentationCoordinator(
       if (pending.get(sessionId) !== token) return;
       const current = aggregator.getSession(sessionId);
       if (!current || current.larkAppId !== larkAppId || current.workingDir !== workingDir || current.backendType !== row.backendType) return;
+      // A null host result means the endpoint is temporarily unavailable (or
+      // this is an older daemon that does not expose workspace metadata yet).
+      // The aggregator deliberately preserves presentation fields across an
+      // otherwise identical snapshot; do not erase that useful cached value on
+      // a best-effort enrichment miss. Authoritative non-Git/remote outcomes
+      // are explicit WorkspaceMetadata values (`directory` / `unknown`).
+      if (resolveWorkspace && !workspace) return;
       const repoName = workspace?.kind === 'git' ? workspace.displayName ?? null : info?.repoName ?? null;
       const gitBranch = workspace?.branch ?? info?.branch ?? null;
       if (
