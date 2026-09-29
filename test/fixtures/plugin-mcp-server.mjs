@@ -40,7 +40,13 @@ const jsonTool = serverName === 'json-report' ? 'read_report' : undefined;
 server.setRequestHandler(ListToolsRequestSchema, request => (contractTool || jsonTool)
   ? {
       tools: [
-        { name: contractTool ?? jsonTool, description: 'execute frozen command', inputSchema: { type: 'object' } },
+        {
+          name: contractTool ?? jsonTool,
+          description: 'execute frozen command',
+          inputSchema: contractTool
+            ? { type: 'object', properties: { payload: {}, parameters: {}, values: {} } }
+            : { type: 'object' },
+        },
       ],
     }
   : request.params?.cursor
@@ -65,10 +71,7 @@ server.setRequestHandler(CallToolRequestSchema, request => {
           content: [{
             type: 'text',
             text: JSON.stringify({
-              contractVersion: 1,
-              status: 'error',
-              errorCode: 'invalid_request',
-              message: 'parameter values must be keyed by command parameter name',
+              rows: [], columns: [], row_count: 0, query_id: null, error_code: 'invalid_request',
             }),
           }],
         };
@@ -78,41 +81,27 @@ server.setRequestHandler(CallToolRequestSchema, request => {
           content: [{
             type: 'text',
             text: JSON.stringify({
-              contractVersion: 1,
-              status: 'error',
-              errorCode: 'untrusted_caller',
-              message: 'raw plugin secret: missing execution context',
+              rows: [], columns: [], row_count: 0, query_id: null, error_code: 'untrusted_caller',
             }),
           }],
         };
       }
       if (args.payload?.sql?.includes('RETURN_MATH_TEXT')) {
         return { content: [{ type: 'text', text: JSON.stringify({
-          contractVersion: 1,
-          status: 'success',
-          fallbackText: 'a<b 且 c>d',
-          blocks: [{ type: 'markdown', markdown: 'a<b 且 c>d' }],
+          rows: [{ amount: 'a<b 且 c>d' }], columns: [{ name: 'amount', description: 'amount' }], row_count: 1, query_id: 'q_fixture', error_code: null,
         }) }] };
       }
       if (args.payload?.sql?.includes('RETURN_RAW_HTML')) {
         return { content: [{ type: 'text', text: JSON.stringify({
-          contractVersion: 1,
-          status: 'success',
-          fallbackText: '<a href="https://evil.example">click</a>',
-          blocks: [{ type: 'markdown', markdown: '<a href="https://evil.example">click</a>' }],
+          rows: [{ amount: '<a href="https://evil.example">click</a>' }], columns: [{ name: 'amount', description: 'amount' }], row_count: 1, query_id: 'q_fixture', error_code: null,
         }) }] };
       }
       return { content: [{ type: 'text', text: JSON.stringify({
-        contractVersion: 1,
-        status: 'success',
-        fallbackText: serverName === 'report' ? 'second-plugin-ok' : '12',
-        blocks: [{ type: 'markdown', markdown: serverName === 'report' ? 'second-plugin-ok' : '12' }],
-        meta: { queryId: 'q_fixture', totalRows: 1 },
-        data: {
-          rows: [{ amount: 12 }],
-          columns: [{ key: 'amount', label: 'amount' }],
-          totalRows: 1,
-        },
+        rows: [{ amount: serverName === 'report' ? 'second-plugin-ok' : 12 }],
+        columns: [{ name: 'amount', description: 'amount' }],
+        row_count: 1,
+        query_id: 'q_fixture',
+        error_code: null,
       }) }] };
     }
     return { isError: true, content: [{ type: 'text', text: 'query_plan_sql_mismatch' }] };

@@ -1,7 +1,8 @@
 import type { FrozenCommandActionRecord } from '../../services/frozen-command-action.js';
-import type {
-  FrozenCommandOutputBlock,
-  FrozenCommandPresentation,
+import {
+  sanitizeFrozenCommandMarkdown,
+  type FrozenCommandOutputBlock,
+  type FrozenCommandPresentation,
 } from '../../services/frozen-command.js';
 import type {
   FrozenCommandLifecycleAction,
@@ -77,7 +78,7 @@ function markdownTable(block: Extract<FrozenCommandOutputBlock, { type: 'table' 
 }
 
 function sanitizeRichMarkdown(value: string): string {
-  return value.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return sanitizeFrozenCommandMarkdown(value);
 }
 
 /** Render the channel-neutral frozen-command presentation for Feishu. The

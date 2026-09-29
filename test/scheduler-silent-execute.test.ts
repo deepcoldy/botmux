@@ -301,7 +301,6 @@ executors:
     plugin: data-mcp
     tool: execute_frozen_query
     minimumVersion: 0.1.0
-    contractVersion: 1
     arguments:
       sql:
         type: string
@@ -313,6 +312,11 @@ executors:
       allowHandoff: true
       handoffIncludesInput: false
       timeoutMs: 120000
+    output:
+      container: rows
+      exposeRowFields: [amount]
+      totalRowsField: row_count
+      errorField: error_code
 `);
   return registry;
 }
@@ -321,15 +325,18 @@ const SCHEDULED_FROZEN_YAML = `
 schemaVersion: 2
 name: 泰国上账
 description: 查询泰国最近 N 天的上账金额
-executor: test.plugin.readonly
 params:
   - name: days
     type: integer
     min: 1
     max: 90
     default: 7
-input:
-  sql: SELECT sum(amount) FROM bills WHERE dt >= today() - {{days}} LIMIT 100
+steps:
+  - id: main
+    executor: test.plugin.readonly
+    input:
+      sql: SELECT sum(amount) FROM bills WHERE dt >= today() - {{days}} LIMIT 100
+    renderer: builtin.table
 `;
 
 function forkedCliInput(): string {
@@ -452,7 +459,7 @@ describe('executeScheduledTask — silent thread fire', () => {
 
       expect(forkWorkerMock).not.toHaveBeenCalled();
       const resultReply = replyMessageMock.mock.calls.at(-1)?.[2];
-      expect(resultReply).toBe('12');
+      expect(resultReply).toContain('12');
       expect(resultReply).not.toContain('SELECT sum');
     } finally {
       fixture.restore();
@@ -473,7 +480,7 @@ describe('executeScheduledTask — silent thread fire', () => {
 
       expect(forkWorkerMock).not.toHaveBeenCalled();
       expect(sendWorkerInputMock).not.toHaveBeenCalled();
-      expect(replyMessageMock.mock.calls.at(-1)?.[2]).toBe('12');
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).toContain('12');
     } finally {
       fixture.restore();
     }
@@ -576,14 +583,10 @@ describe('executeScheduledTask — silent thread fire', () => {
   it('suppresses the normal branch of conditional output for a silent schedule', async () => {
     const fixture = installScheduledFrozenFixture(`${SCHEDULED_FROZEN_YAML}
 output:
-  maxChars: 20000
-  when: "{{q.amount}} > 20"
-  handoff:
-    prompt: "金额异常，请分析"
-    data: "{{q.rows}}"
-    maxRows: 50
-  else:
-    text: "今日正常，合计 {{q.amount}}"
+  rules:
+    - when: "{{q.main.amount}} > 20"
+      handoff: { prompt: "金额异常，请分析", data: "{{q.main.rows}}", maxRows: 50 }
+    - show: { text: "今日正常，合计 {{q.main.amount}}" }
 `);
     try {
       await executeScheduledTask(baseTask({
@@ -604,12 +607,11 @@ output:
   it('hands an abnormal conditional result to a session even when the schedule is silent', async () => {
     const fixture = installScheduledFrozenFixture(`${SCHEDULED_FROZEN_YAML}
 output:
-  maxChars: 20000
   rules:
-    - when: "{{q.amount}} > 10"
+    - when: "{{q.main.amount}} > 10"
       handoff:
         prompt: "金额异常，请分析"
-        data: "{{q.rows}}"
+        data: "{{q.main.rows}}"
         maxRows: 50
     - show: result
 `);
@@ -634,14 +636,10 @@ output:
   it('uses conditional output as an exclusive deliver-or-handoff switch', async () => {
     const yaml = `${SCHEDULED_FROZEN_YAML}
 output:
-  maxChars: 20000
-  when: "{{q.amount}} > 20"
-  handoff:
-    prompt: "金额异常，请分析"
-    data: "{{q.rows}}"
-    maxRows: 50
-  else:
-    text: "今日正常，合计 {{q.amount}}"
+  rules:
+    - when: "{{q.main.amount}} > 20"
+      handoff: { prompt: "金额异常，请分析", data: "{{q.main.rows}}", maxRows: 50 }
+    - show: { text: "今日正常，合计 {{q.main.amount}}" }
 `;
     const fixture = installScheduledFrozenFixture(yaml);
     try {
@@ -650,7 +648,7 @@ output:
         rootMessageId: ROOT, scope: 'thread', ownerOpenId: 'ou_test', ownerUnionId: 'on_test',
       }), new Map<string, DaemonSession>(), refreshCliVersion);
 
-      expect(replyMessageMock.mock.calls.at(-1)?.[2]).toBe('今日正常，合计 12');
+      expect(replyMessageMock.mock.calls.at(-1)?.[2]).toContain('今日正常，合计 12');
       expect(forkWorkerMock).not.toHaveBeenCalled();
       expect(sendWorkerInputMock).not.toHaveBeenCalled();
     } finally {
@@ -677,13 +675,10 @@ output:
   it('fails a broken condition closed without choosing either output branch or starting a CLI', async () => {
     const fixture = installScheduledFrozenFixture(`${SCHEDULED_FROZEN_YAML}
 output:
-  maxChars: 20000
-  when: "{{q.missing}} > 0"
-  handoff:
-    prompt: "异常分析"
-    maxRows: 50
-  else:
-    text: "正常"
+  rules:
+    - when: "{{q.main.missing}} > 0"
+      handoff: { prompt: "异常分析", maxRows: 50 }
+    - show: { text: "正常" }
 `);
     try {
       await executeScheduledTask(baseTask({
@@ -713,11 +708,12 @@ output:
 schemaVersion: 2
 name: 泰国上账
 description: 即将废弃的命令
-executor: test.plugin.readonly
 params: []
-input:
-  sql: SELECT 1
-onError: fallback_llm
+steps:
+  - id: main
+    executor: test.plugin.readonly
+    input: { sql: SELECT 1 }
+    renderer: builtin.table
 `);
       config.session.dataDir = dataDir;
       const actor = { openId: 'ou_test', unionId: 'on_test' };

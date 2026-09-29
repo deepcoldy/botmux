@@ -6638,7 +6638,7 @@ async function executeClaimedFrozenCommandAction(action: FrozenCommandActionReco
       || lifecycle.record.stateRevisionId !== action.revisionId
       || lifecycle.record.specHash !== action.specHash
       || lifecycle.record.executorRevision !== action.executorRevision
-      || lookup.snapshot.definition.executor !== action.executorId) {
+      || lookup.snapshot.definition.steps[0]?.executor !== action.executorId) {
       throw new FrozenCommandError('command_revision_changed', '命令版本已变化，请重新发起');
     }
     const normalized = normalizeFrozenCommandArguments({
@@ -6680,6 +6680,9 @@ async function executeClaimedFrozenCommandAction(action: FrozenCommandActionReco
       source: 'confirmed',
       result,
     });
+    const renderedReply = output.kind === 'deliver'
+      ? renderFrozenCommandLarkReply(output.presentation, action.workingDir)
+      : undefined;
     if (output.kind === 'handoff') handoffConfirmedFrozenCommandAction(action, output.prompt);
     const settled = settleFrozenCommandAction({
       dataDir: config.session.dataDir,
@@ -6689,11 +6692,8 @@ async function executeClaimedFrozenCommandAction(action: FrozenCommandActionReco
     if (!settled) throw new Error('action_settlement_conflict');
     const completed = getFrozenCommandAction(config.session.dataDir, action.id);
     if (!completed) throw new Error('action_record_missing_after_completion');
-    const delivery = output.kind === 'deliver'
-      ? (() => {
-          const renderedReply = renderFrozenCommandLarkReply(output.presentation, action.workingDir);
-          return deliverFrozenCommandActionResult(completed, renderedReply.content, renderedReply.msgType);
-        })()
+    const delivery = renderedReply
+      ? deliverFrozenCommandActionResult(completed, renderedReply.content, renderedReply.msgType)
       : Promise.resolve();
     await Promise.allSettled([patchFrozenCommandActionCard(completed), delivery]);
   } catch (error) {
@@ -7762,7 +7762,7 @@ function frozenCommandCenterRows(
       command: row.command,
       usage: frozenCommandUsage(definition),
       description: definition.description,
-      executor: definition.executor,
+      executor: definition.steps[0]!.executor,
       state: gate.kind === 'active' ? 'active' : 'unapproved',
       ...(gate.kind === 'legacy' ? { reason: '尚未完成当前机器人批准，暂不可运行' } : {}),
     }];

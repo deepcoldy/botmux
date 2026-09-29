@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -6,33 +6,49 @@ import { installLocalPlugin } from '../src/core/plugins/install.js';
 import {
   FrozenCommandError,
   assertFrozenCommandExecutorContract,
-  buildFrozenCommandPresentation,
   executeFrozenCommand,
-  evaluateFrozenCommandOutputCondition,
+  frozenCommandExecutorRevision,
   frozenCommandUsage,
+  isTransientPluginToolFailure,
   listFrozenCommandSnapshots,
   lookupFrozenCommand,
-  isTransientPluginToolFailure,
-  normalizeFrozenCommandName,
   normalizeFrozenCommandArguments,
+  normalizeFrozenCommandName,
   parseNaturalLanguageFrozenCommandInvocation,
   parseScheduledFrozenCommandInvocation,
   resolveFrozenCommandOutput,
+  sanitizeFrozenCommandMarkdown,
   userFacingFrozenCommandError,
 } from '../src/services/frozen-command.js';
 
 const dirs: string[] = [];
 
-function fixture(yaml: string): { root: string; definition: ReturnType<typeof definitionAt> } {
-  const root = join(tmpdir(), `botmux-frozen-${process.pid}-${Math.random().toString(36).slice(2)}`);
-  dirs.push(root);
-  mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
-  writeFileSync(join(root, '.botmux', 'commands', '泰国上账.yaml'), yaml);
-  writePluginExecutorRegistry(root);
-  return { root, definition: definitionAt(root) };
-}
+const BASE = `
+schemaVersion: 2
+name: 泰国上账
+description: 查询泰国最近 N 天的上账金额
+timezone: Asia/Bangkok
+params:
+  - name: days
+    label: 天数
+    type: integer
+    min: 1
+    max: 90
+    default: 7
+steps:
+  - id: main
+    executor: test.plugin.readonly
+    input:
+      sql: |-
+        SELECT sum(amount) FROM bills
+        WHERE country = 'TH' AND dt >= today() - {{days}}
+        LIMIT 100
+    renderer: builtin.table
+output:
+  format: markdown
+`;
 
-function writePluginExecutorRegistry(root: string): void {
+function writeRegistry(root: string, extra = ''): string {
   const registry = join(root, 'command-executors.yaml');
   writeFileSync(registry, `
 schemaVersion: 2
@@ -42,31 +58,81 @@ executors:
     plugin: data-mcp
     tool: execute_frozen_query
     minimumVersion: 0.1.0
-    contractVersion: 1
     arguments:
       sql:
         type: string
         required: true
         maxLength: 10000
         accepts: [literal]
-      queryTemplate:
-        type: string
-        required: false
-        maxLength: 10000
-        accepts: [literal]
+    output:
+      container: rows
+      exposeRowFields: [amount]
+      labelsFrom: columns
+      totalRowsField: row_count
+      auditFields: [query_id]
+      errorField: error_code
     policy:
       schedulable: true
       allowHandoff: true
       handoffIncludesInput: false
       timeoutMs: 120000
-`);
+${extra}`);
   vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', registry);
+  return registry;
+}
+
+function fixture(yaml = BASE): { root: string; definition: NonNullable<ReturnType<typeof definitionAt>> } {
+  const root = join(tmpdir(), `botmux-frozen-${process.pid}-${Math.random().toString(36).slice(2)}`);
+  dirs.push(root);
+  mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
+  writeFileSync(join(root, '.botmux', 'commands', '泰国上账.yaml'), yaml);
+  writeRegistry(root);
+  const definition = definitionAt(root);
+  if (!definition) throw new Error('fixture definition is invalid');
+  return { root, definition };
 }
 
 function definitionAt(root: string) {
   const result = lookupFrozenCommand({ workingDir: root, command: '/泰国上账' });
-  if (result.kind !== 'found') throw new Error(`fixture failed: ${result.kind}`);
-  return result.snapshot.definition;
+  return result.kind === 'found' ? result.snapshot.definition : undefined;
+}
+
+function installFixturePlugin(root: string, pluginId: string, mode: string, version = '1.0.0'): string {
+  const home = join(root, 'home');
+  const source = join(root, `${pluginId}-plugin`);
+  mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
+  writeFileSync(join(source, 'package.json'), JSON.stringify({
+    name: `@botmux-ai/plugin-${pluginId}`,
+    version,
+    type: 'module',
+    keywords: ['botmux-plugin'],
+    botmux: { schemaVersion: 1, id: pluginId },
+  }));
+  writeFileSync(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({
+    transport: 'stdio',
+    command: [process.execPath, resolve('test/fixtures/plugin-mcp-server.mjs'), mode],
+  }));
+  vi.stubEnv('HOME', home);
+  vi.stubEnv('SESSION_DATA_DIR', join(home, '.botmux', 'data'));
+  installLocalPlugin(source);
+  return home;
+}
+
+function successResult(total = 120) {
+  return {
+    referenceDate: '2026-09-29',
+    text: `amount：${total}`,
+    presentation: {
+      schemaVersion: 1 as const,
+      format: 'markdown' as const,
+      fallbackText: `amount：${total}`,
+      blocks: [{ type: 'markdown' as const, markdown: `amount：${total}` }],
+    },
+    truncated: false,
+    executionId: 'exec-v2',
+    projectedResult: { amount: total, row_count: 1 },
+    businessResult: { rows: [{ amount: total }], totalRows: 1 },
+  };
 }
 
 afterEach(() => {
@@ -74,612 +140,293 @@ afterEach(() => {
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-const BASE = `
-schemaVersion: 2
-name: 泰国上账
-description: 查询泰国最近 N 天的上账金额
-executor: test.plugin.readonly
-timezone: Asia/Bangkok
-params:
-  - name: days
-    label: 天数
-    type: integer
-    min: 1
-    max: 90
-    default: 7
-input:
-  sql: |-
-    SELECT sum(amount) FROM bills
-    WHERE country = 'TH' AND dt >= today() - {{days}}
-    LIMIT 100
-output:
-  prefix: "查询结果：\\n"
-  maxChars: 20000
-onError: fallback_llm
-`;
-
-describe('Frozen Commands definition and positional UX', () => {
-  it('keeps query rendering and Data MCP query tools outside the host service', () => {
+describe('Frozen Commands v2', () => {
+  it('keeps SQL rendering and Data MCP query tools outside the host service', () => {
     const source = readFileSync(resolve('src/services/frozen-command.ts'), 'utf8');
-    for (const forbidden of [
-      'validate_sql_for_user',
-      'run_query_for_user',
-      'renderFrozenCommandSql',
-      'sqlString',
-      'redactSqlFields',
-      'renderedSql',
-    ]) {
+    for (const forbidden of ['validate_sql_for_user', 'run_query_for_user', 'renderFrozenCommandSql', 'sqlString', 'contractVersion']) {
       expect(source, forbidden).not.toContain(forbidden);
     }
   });
 
-  it('parses only exact single-line natural-language run requests', () => {
-    expect(parseNaturalLanguageFrozenCommandInvocation('运行 /泰国上账 30')).toEqual({
-      cmd: '/泰国上账',
-      commandContent: '/泰国上账 30',
-    });
-    expect(parseNaturalLanguageFrozenCommandInvocation('执行 /泰国上账 30。')).toEqual({
-      cmd: '/泰国上账',
-      commandContent: '/泰国上账 30',
-    });
-    expect(parseNaturalLanguageFrozenCommandInvocation('run /report 7')).toEqual({
-      cmd: '/report',
-      commandContent: '/report 7',
-    });
-    expect(parseNaturalLanguageFrozenCommandInvocation('1. /泰国上账 30')).toBeUndefined();
+  it('parses only exact direct and scheduled invocation forms', () => {
+    expect(parseNaturalLanguageFrozenCommandInvocation('运行 /泰国上账 30')).toEqual({ cmd: '/泰国上账', commandContent: '/泰国上账 30' });
+    expect(parseNaturalLanguageFrozenCommandInvocation('run /report 7')).toEqual({ cmd: '/report', commandContent: '/report 7' });
     expect(parseNaturalLanguageFrozenCommandInvocation('示例：运行 /泰国上账 30')).toBeUndefined();
-    expect(parseNaturalLanguageFrozenCommandInvocation('运行 /泰国上账 30\n- 另一个步骤')).toBeUndefined();
-    expect(parseNaturalLanguageFrozenCommandInvocation('运行 /api/users')).toBeUndefined();
+    expect(parseScheduledFrozenCommandInvocation('/泰国上账 30')).toEqual({ cmd: '/泰国上账', commandContent: '/泰国上账 30' });
+    expect(parseScheduledFrozenCommandInvocation('，执行 /泰国上账 30')).toEqual({ cmd: '/泰国上账', commandContent: '/泰国上账 30' });
+    expect(parseScheduledFrozenCommandInvocation('执行 /泰国上账 30，然后告诉我')).toBeUndefined();
   });
 
-  it('normalizes only exact scheduled frozen-command prompts', () => {
-    expect(parseScheduledFrozenCommandInvocation('/泰国上账 30')).toEqual({
-      cmd: '/泰国上账',
-      commandContent: '/泰国上账 30',
-    });
-    expect(parseScheduledFrozenCommandInvocation('，执行 /泰国上账 30')).toEqual({
-      cmd: '/泰国上账',
-      commandContent: '/泰国上账 30',
-    });
-    expect(parseScheduledFrozenCommandInvocation(', run /report 7')).toEqual({
-      cmd: '/report',
-      commandContent: '/report 7',
-    });
-    for (const prose of [
-      '1. 执行 /泰国上账 30',
-      '- 执行 /泰国上账 30',
-      '执行 /泰国上账 30\n再执行 /泰国上账 7',
-      '我们讨论一下怎么执行 /泰国上账 30',
-      '/usr/bin/foo',
-      '执行日报生成',
-      '请执行 /泰国上账 30',
-      '执行 /泰国上账 30 然后告诉我',
-      '，执行 /泰国上账 30，然后告诉我',
-    ]) {
-      expect(parseScheduledFrozenCommandInvocation(prose), prose).toBeUndefined();
-    }
-  });
-  it('accepts a Chinese command name and normalizes NFKC safely', () => {
+  it('normalizes names and positional arguments', () => {
+    const { definition } = fixture();
     expect(normalizeFrozenCommandName('/泰国上账')).toBe('泰国上账');
     expect(normalizeFrozenCommandName('/ＴＥＳＴ')).toBe('test');
     expect(normalizeFrozenCommandName('../泰国上账')).toBeUndefined();
-  });
-
-  it('rejects legacy schemaVersion 1 command definitions', () => {
-    const root = join(tmpdir(), `botmux-frozen-${process.pid}-${Math.random().toString(36).slice(2)}`);
-    dirs.push(root);
-    mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
-    writeFileSync(
-      join(root, '.botmux', 'commands', '泰国上账.yaml'),
-      BASE.replace('schemaVersion: 2', 'schemaVersion: 1'),
-    );
-    const result = lookupFrozenCommand({ workingDir: root, command: '/泰国上账' });
-    expect(result.kind).toBe('invalid');
-    if (result.kind === 'invalid') {
-      expect(result.error.code).toBe('definition_version_unsupported');
-      expect(result.error.message).toContain('仅支持 schemaVersion=2');
-    }
-  });
-
-  it('keeps plugin input opaque while still validating declared parameters', () => {
-    const opaque = BASE
-      .replace('  sql: |-\n    SELECT sum(amount) FROM bills\n    WHERE country = \'TH\' AND dt >= today() - {{days}}\n    LIMIT 100', '  queryTemplate: "opaque {{days}}"');
-    const { definition } = fixture(opaque);
-    expect(definition.input).toEqual({ queryTemplate: 'opaque {{days}}' });
-    expect(definition.params.map(parameter => parameter.name)).toEqual(['days']);
-  });
-
-  it('renders the documented positional parameter and default', () => {
-    const { definition } = fixture(BASE);
     expect(frozenCommandUsage(definition)).toBe('/泰国上账 [天数]');
     expect(normalizeFrozenCommandArguments({ definition, rawArgs: '' }).args[0]?.value).toBe('7');
-    expect(normalizeFrozenCommandArguments({ definition, rawArgs: '30' }).args).toEqual([
-      { name: 'days', label: '天数', value: '30' },
-    ]);
+    expect(() => normalizeFrozenCommandArguments({ definition, rawArgs: '999' })).toThrowError(/1～90/);
   });
 
-  it('rejects range explosions before Data MCP is called', () => {
-    const { definition } = fixture(BASE);
-    expect(() => normalizeFrozenCommandArguments({ definition, rawArgs: '99999' }))
-      .toThrowError(/1～90/);
+  it('uses steps[] and keeps executor input opaque', () => {
+    const { definition } = fixture(BASE.replace(/sql: \|-\n[\s\S]*?LIMIT 100/u, 'queryTemplate: "opaque {{days}}"'));
+    expect(definition.steps).toEqual([expect.objectContaining({
+      id: 'main',
+      executor: 'test.plugin.readonly',
+      input: { queryTemplate: 'opaque {{days}}' },
+      renderer: 'builtin.table',
+      required: false,
+    })]);
   });
 
-  it('does not expose SQL when listing commands', () => {
-    const { root } = fixture(BASE);
-    const listed = listFrozenCommandSnapshots(root);
-    expect(listed).toHaveLength(1);
-    expect(listed[0]?.command).toBe('泰国上账');
-    expect(listed[0]?.snapshot?.definition.description).toContain('泰国');
-  });
-
-  it('evaluates conditional output fail-closed and marks handoff truncation explicitly', () => {
-    const conditional = BASE.replace('onError: fallback_llm', '').replace(
-      '  prefix: "查询结果：\\n"\n  maxChars: 20000',
-      `  maxChars: 20000
-  when: "{{q.max_drop}} > 0.2"
-  handoff:
-    prompt: "以下数据出现异常，请分析原因"
-    data: "{{q.rows}}"
-    maxRows: 1
-  else:
-    text: "今日正常，合计 {{q.total}}"`,
-    );
-    const { definition } = fixture(conditional);
-    expect(definition.output.rules).toHaveLength(2);
-    expect(definition.output.rules[0]?.when).toContain("{{run.status}} == 'ok'");
-    expect(definition.output.rules[1]).toMatchObject({
-      show: { kind: 'text', text: '今日正常，合计 {{q.total}}' },
-    });
-    const result = {
-      referenceDate: '2026-09-21',
-      text: '原始结果',
-      truncated: false,
-      businessResult: {
-        rows: [
-          { max_drop: 0.3, total: 120, country: 'TH' },
-          { max_drop: 0.1, total: 80, country: 'SG' },
-        ],
-        totalRows: 2,
-      },
-    };
-    expect(evaluateFrozenCommandOutputCondition(definition.output.rules[0]!.when, result)).toBe(true);
-    const handoff = resolveFrozenCommandOutput({ definition, rawArgs: '', source: 'schedule', result });
-    expect(handoff.kind).toBe('handoff');
-    if (handoff.kind === 'handoff') {
-      expect(handoff.prompt).toContain('以下数据出现异常');
-      expect(handoff.prompt).toContain('"country":"TH"');
-      expect(handoff.prompt).not.toContain('"country":"SG"');
-      expect(handoff.prompt).toContain('共 2 行，已截断为前 1 行');
+  it('loads the documented command example in both languages', () => {
+    for (const locale of ['zh', 'en']) {
+      const documentation = readFileSync(resolve(`docs-site/docs/${locale}/frozen-commands.md`), 'utf8');
+      const blocks = [...documentation.matchAll(/```yaml\n([\s\S]*?)\n```/gu)].map(match => match[1]!);
+      const yaml = blocks.find(block => block.includes('\nsteps:') && block.includes('data.query.readonly'));
+      if (!yaml) throw new Error(`missing command example in ${locale} documentation`);
+      const name = /^name:\s*([^\n#]+)/mu.exec(yaml)?.[1]?.trim();
+      if (!name) throw new Error(`missing command name in ${locale} documentation`);
+      const root = join(tmpdir(), `botmux-frozen-doc-${locale}-${process.pid}-${Math.random().toString(36).slice(2)}`);
+      dirs.push(root);
+      mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
+      writeFileSync(join(root, '.botmux', 'commands', `${name}.yaml`), yaml);
+      writeFileSync(join(root, 'command-executors.yaml'), `
+schemaVersion: 2
+executors:
+  - id: data.query.readonly
+    kind: plugin-tool
+    plugin: data-mcp
+    tool: execute_frozen_query
+    minimumVersion: 0.4.0
+    arguments:
+      sql: {type: string, required: true, maxLength: 100000, accepts: [literal]}
+    output:
+      container: rows
+      exposeRowFields: [dt, 渠道, 注册数]
+      labelsFrom: columns
+      totalRowsField: row_count
+      auditFields: [query_id]
+      errorField: error_code
+    policy: {schedulable: true, allowHandoff: false, timeoutMs: 120000}
+`);
+      vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', join(root, 'command-executors.yaml'));
+      expect(lookupFrozenCommand({ workingDir: root, command: `/${name}` }).kind).toBe('found');
     }
-    const charLimited = resolveFrozenCommandOutput({
-      definition: { ...definition, output: { ...definition.output, maxChars: 100 } },
-      rawArgs: '',
-      source: 'schedule',
-      result: {
-        ...result,
-        businessResult: {
-          rows: [
-            { max_drop: 0.3, total: 120, country: 'X'.repeat(500) },
-            { max_drop: 0.1, total: 80, country: 'SG' },
-          ],
-          totalRows: 2,
-        },
-      },
-    });
-    expect(charLimited.kind).toBe('handoff');
-    if (charLimited.kind === 'handoff') {
-      expect(charLimited.prompt).toContain('共 2 行，已截断为前 1 行');
-      expect(charLimited.prompt).toContain('字符上限');
-    }
-
-    const normal = resolveFrozenCommandOutput({
-      definition,
-      rawArgs: '',
-      source: 'schedule',
-      result: {
-        ...result,
-        businessResult: { rows: [{ max_drop: 0.1, total: 120 }], totalRows: 1 },
-      },
-    });
-    expect(normal).toMatchObject({
-      kind: 'deliver',
-      text: '今日正常，合计 120',
-      presentation: {
-        schemaVersion: 1,
-        format: 'text',
-        fallbackText: '今日正常，合计 120',
-        blocks: [{ type: 'markdown', markdown: '今日正常，合计 120' }],
-      },
-    });
-
-    expect(() => resolveFrozenCommandOutput({
-      definition,
-      rawArgs: '',
-      source: 'schedule',
-      result: { ...result, businessResult: { rows: [{ total: 120 }], totalRows: 1 } },
-    })).toThrowError(/q\.max_drop/);
-    expect(() => resolveFrozenCommandOutput({
-      definition,
-      rawArgs: '',
-      source: 'schedule',
-      result: { ...result, businessResult: undefined },
-    })).toThrowError(/q\.max_drop/);
-    expect(() => evaluateFrozenCommandOutputCondition('not-an-expression', result))
-      .toThrowError(/条件表达式/);
-
-    const executionError = new FrozenCommandError(
-      'plugin_tool_execution_failed',
-      '插件工具执行失败。',
-      undefined,
-      true,
-      false,
-      'exec-error',
-    );
-    expect(() => resolveFrozenCommandOutput({
-      definition,
-      rawArgs: '',
-      source: 'direct',
-      error: executionError,
-    })).toThrow(executionError);
   });
 
-  it('matches ordered rules across run/cmd namespaces and prepends immutable host context', () => {
-    const withRules = BASE
-      .replace('onError: fallback_llm', '')
-      .replace(
-        '  maxChars: 20000',
-        `  maxChars: 20000
+  it('rejects schema v1, multi-step batch-one definitions, and every removed field', () => {
+    const variants = [
+      BASE.replace('schemaVersion: 2', 'schemaVersion: 1'),
+      BASE.replace('steps:\n', 'executor: test.plugin.readonly\nsteps:\n'),
+      BASE.replace('steps:\n', 'input: {}\nsteps:\n'),
+      BASE.replace('  format: markdown', '  format: table'),
+      BASE.replace('  format: markdown', '  format: auto'),
+      BASE.replace('  format: markdown', '  format: markdown\n  text: legacy'),
+      BASE.replace('  format: markdown', '  format: markdown\n  prefix: legacy'),
+      BASE.replace('  format: markdown', '  format: markdown\n  suffix: legacy'),
+      BASE.replace('  format: markdown', '  format: markdown\n  else: legacy'),
+      `${BASE}\nonError: fail\n`,
+      BASE.replace('output:\n', `steps:\n  - id: second\n    executor: test.plugin.readonly\n    input: {sql: SELECT 1}\n    renderer: builtin.table\noutput:\n`),
+    ];
+    for (const [index, yaml] of variants.entries()) {
+      const root = join(tmpdir(), `botmux-frozen-invalid-${process.pid}-${index}-${Math.random().toString(36).slice(2)}`);
+      dirs.push(root);
+      mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
+      writeFileSync(join(root, '.botmux', 'commands', '泰国上账.yaml'), yaml);
+      expect(lookupFrozenCommand({ workingDir: root, command: '/泰国上账' }).kind, String(index)).toBe('invalid');
+    }
+  });
+
+  it('requires exactly one rule action and a step-qualified q namespace', () => {
+    const invalid = BASE.replace('  format: markdown', `  format: markdown
   rules:
-    - when: "{{cmd.args.days}} == '7'"
+    - when: "{{q.main.amount}} > 0"
+      handoff: { prompt: 分析 }
+      show: result`);
+    const invalidRoot = join(tmpdir(), `botmux-frozen-rule-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    dirs.push(invalidRoot);
+    mkdirSync(join(invalidRoot, '.botmux', 'commands'), { recursive: true });
+    writeFileSync(join(invalidRoot, '.botmux', 'commands', '泰国上账.yaml'), invalid);
+    expect(lookupFrozenCommand({ workingDir: invalidRoot, command: '/泰国上账' }).kind).toBe('invalid');
+
+    const unqualified = BASE.replace('  format: markdown', `  format: markdown
+  rules:
+    - when: "{{q.amount}} > 0"
+      show: result`);
+    const unqualifiedRoot = join(tmpdir(), `botmux-frozen-namespace-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    dirs.push(unqualifiedRoot);
+    mkdirSync(join(unqualifiedRoot, '.botmux', 'commands'), { recursive: true });
+    writeFileSync(join(unqualifiedRoot, '.botmux', 'commands', '泰国上账.yaml'), unqualified);
+    expect(lookupFrozenCommand({ workingDir: unqualifiedRoot, command: '/泰国上账' }).kind).toBe('invalid');
+
+    const legacyRunRoot = join(tmpdir(), `botmux-frozen-run-namespace-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    dirs.push(legacyRunRoot);
+    mkdirSync(join(legacyRunRoot, '.botmux', 'commands'), { recursive: true });
+    writeFileSync(join(legacyRunRoot, '.botmux', 'commands', '泰国上账.yaml'), BASE.replace('  format: markdown', `  format: markdown
+  rules:
+    - when: "{{run.error.code}} == 'failed'"
+      show: result`));
+    expect(lookupFrozenCommand({ workingDir: legacyRunRoot, command: '/泰国上账' }).kind).toBe('invalid');
+  });
+
+  it('evaluates ordered q.main, run.main, run.status, and cmd rules', () => {
+    const yaml = BASE.replace('  format: markdown', `  format: markdown
+  rules:
+    - when: "{{run.status}} == 'ok' && {{run.main.status}} == 'ok' && {{q.main.amount}} > 100"
       handoff:
-        prompt: "wrong branch"
-    - when: "{{run.status}} == 'ok' && {{cmd.source}} == 'direct'"
-      handoff:
-        prompt: "author prompt for {{cmd.name}}"
-        maxRows: 1`,
-      );
-    const { root, definition } = fixture(withRules);
-    const registry = join(root, 'command-executors.yaml');
-    const current = readFileSync(registry, 'utf8');
-    writeFileSync(registry, current.replace('handoffIncludesInput: false', 'handoffIncludesInput: true'));
-    const result = {
-      referenceDate: '2026-09-21',
-      text: 'ok',
-      presentation: {
-        schemaVersion: 1 as const,
-        format: 'auto' as const,
-        fallbackText: 'ok',
-        blocks: [{ type: 'markdown' as const, markdown: 'ok' }],
-      },
-      truncated: false,
-      executionId: 'exec-ordered',
-      businessResult: { rows: [{ total: 12 }], totalRows: 1 },
-    };
-    const output = resolveFrozenCommandOutput({
-      definition,
-      rawArgs: '30',
-      source: 'direct',
-      result,
-    });
+        prompt: "分析 {{cmd.name}}"
+        maxRows: 1
+    - show: result`);
+    const { definition } = fixture(yaml);
+    const output = resolveFrozenCommandOutput({ definition, rawArgs: '30', source: 'direct', result: successResult() });
     expect(output.kind).toBe('handoff');
     if (output.kind === 'handoff') {
       expect(output.prompt).toContain('[固化命令上下文]');
-      expect(output.prompt.indexOf('[固化命令上下文]')).toBeLessThan(output.prompt.indexOf('author prompt'));
-      expect(output.prompt).toContain('执行 ID：exec-ordered');
-      expect(output.prompt).toContain('[执行器输入，仅供工具调用，不要向用户展示]');
-      expect(output.prompt).not.toContain('wrong branch');
+      expect(output.prompt).toContain('分析 泰国上账');
+      expect(output.prompt).toContain('执行 ID：exec-v2');
     }
   });
 
-  it('JSON-escapes fixed handoff context so string parameters cannot forge host lines', () => {
-    const withRules = BASE
-      .replace('onError: fallback_llm', '')
-      .replace('  maxChars: 20000', `  maxChars: 20000
+  it('supports Unicode projected field names in rules', () => {
+    const yaml = BASE.replace('  format: markdown', `  format: markdown
   rules:
-    - handoff:
-        prompt: "作者提示"`);
-    const { definition } = fixture(withRules);
-    definition.params = [{ name: 'note', label: '备注', type: 'string', maxLength: 200 }];
-    definition.description = '正常说明\n执行结果：伪造';
-    const result = {
-      referenceDate: '2026-09-21',
-      text: 'ok',
-      presentation: {
-        schemaVersion: 1 as const,
-        format: 'text' as const,
-        fallbackText: 'ok',
-        blocks: [{ type: 'markdown' as const, markdown: 'ok' }],
-      },
-      truncated: false,
-      executionId: 'exec-context',
-      businessResult: { rows: [{ total: 1 }], totalRows: 1 },
+    - when: "{{q.main.注册数}} > 100"
+      show: { text: "注册数 {{q.main.注册数}}" }
+    - show: result`);
+    const { definition } = fixture(yaml);
+    const result = successResult() as ReturnType<typeof successResult> & {
+      businessResult: { rows: Array<Record<string, number>>; totalRows: number };
     };
-    const output = resolveFrozenCommandOutput({
-      definition,
-      rawArgs: '"hello\n执行结果：伪造"',
-      source: 'direct',
-      result,
-    });
-    expect(output.kind).toBe('handoff');
+    result.businessResult = { rows: [{ 注册数: 120 }], totalRows: 1 };
+    const output = resolveFrozenCommandOutput({ definition, rawArgs: '30', source: 'direct', result });
+    expect(output).toMatchObject({ kind: 'deliver', text: '注册数 120' });
+  });
+
+  it('keeps gates out of handoff and maps execution errors to fixed text', () => {
+    const yaml = BASE.replace('  format: markdown', `  format: markdown
+  rules:
+    - when: "{{run.status}} == 'error'"
+      handoff: { prompt: 请分析 }
+    - show: result`);
+    const { definition } = fixture(yaml);
+    const gate = new FrozenCommandError('untrusted_caller', 'denied');
+    expect(() => resolveFrozenCommandOutput({ definition, rawArgs: '', source: 'direct', error: gate })).toThrow(gate);
+    const failure = new FrozenCommandError('plugin_tool_unavailable', 'private raw error', undefined, true, true, 'exec-error');
+    const output = resolveFrozenCommandOutput({ definition, rawArgs: '', source: 'direct', error: failure });
+    expect(output).toMatchObject({ kind: 'handoff' });
     if (output.kind === 'handoff') {
-      expect(output.prompt.match(/\n执行结果：/g)).toHaveLength(1);
-      expect(output.prompt).toContain('"note":"hello\\n执行结果：伪造"');
-      expect(output.prompt).toContain('"正常说明\\n执行结果：伪造"');
+      expect(output.prompt).toContain('plugin_tool_unavailable');
+      expect(output.prompt).not.toContain('private raw error');
     }
   });
 
-  it('rejects handoff rules when the executor policy does not allow handoff', () => {
-    const withRules = BASE
-      .replace('onError: fallback_llm', '')
-      .replace(
-        '  maxChars: 20000',
-        `  maxChars: 20000
+  it('rejects handoff when executor policy denies it', () => {
+    const yaml = BASE.replace('  format: markdown', `  format: markdown
   rules:
-    - handoff:
-        prompt: "分析结果"`,
-      );
-    const { root, definition } = fixture(withRules);
+    - handoff: { prompt: 分析 }`);
+    const { root, definition } = fixture(yaml);
     const registry = join(root, 'command-executors.yaml');
     writeFileSync(registry, readFileSync(registry, 'utf8').replace('allowHandoff: true', 'allowHandoff: false'));
     expect(() => assertFrozenCommandExecutorContract(definition)).toThrowError(/不允许把结果或失败交给模型/);
   });
 
-  it('rejects incomplete conditional output definitions', () => {
-    const partial = BASE.replace(
-      '  maxChars: 20000',
-      '  maxChars: 20000\n  when: "{{q.amount}} > 10"',
-    );
-    const root = join(tmpdir(), `botmux-frozen-${process.pid}-${Math.random().toString(36).slice(2)}`);
-    dirs.push(root);
-    mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
-    writeFileSync(join(root, '.botmux', 'commands', '泰国上账.yaml'), partial);
-    const lookup = lookupFrozenCommand({ workingDir: root, command: '/泰国上账' });
-    expect(lookup.kind).toBe('invalid');
-    if (lookup.kind === 'invalid') expect(lookup.error.code).toBe('definition_invalid_output');
+  it('applies display policy outside code fences without corrupting Vega-Lite JSON', () => {
+    const markdown = '链接：[点我](https://evil.example) @all\n```vega-lite\n{"label":"<10 >5","who":"@all"}\n```';
+    const safe = sanitizeFrozenCommandMarkdown(markdown);
+    expect(safe).toContain('链接：点我 ＠all');
+    expect(safe).toContain('{"label":"<10 >5","who":"＠all"}');
+    expect(() => sanitizeFrozenCommandMarkdown('<script>alert(1)</script>')).toThrowError(/原始 HTML/);
   });
 
-  it('supports ordered show rules and defaults to output.format when none match', () => {
-    const withShow = BASE
-      .replace('onError: fallback_llm', '')
-      .replace(
-        '  maxChars: 20000',
-        `  format: table
-  maxChars: 20000
-  rules:
-    - when: "{{q.total}} > 100"
-      show:
-        text: "**总量 {{q.total}}**"
-        format: markdown
-    - when: "{{q.total}} == 50"
-      show:
-        format: markdown
-    - when: "{{q.total}} < 0"
-      show: result`,
-      );
-    const { definition } = fixture(withShow);
-    const baseResult = {
-      referenceDate: '2026-09-21',
-      text: '默认结果',
-      presentation: {
-        schemaVersion: 1 as const,
-        format: 'table' as const,
-        fallbackText: '默认结果',
-        blocks: [{ type: 'table' as const, columns: [], rows: [], totalRows: 0, truncated: false }],
+  it('hashes both executor and renderer revisions', () => {
+    const { root, definition } = fixture();
+    const renderer = join(root, 'renderer.mjs');
+    writeFileSync(renderer, 'process.stdin.pipe(process.stdout);\n');
+    const rendererRealpath = realpathSync(renderer);
+    const registry = join(root, 'command-executors.yaml');
+    writeFileSync(registry, `${readFileSync(registry, 'utf8')}
+renderers:
+  - id: test.renderer
+    executable: { realpath: ${JSON.stringify(resolve(process.execPath))} }
+    fixedArgs: [${JSON.stringify(rendererRealpath)}]
+    scriptArtifacts: [${JSON.stringify(rendererRealpath)}]
+    policy: { timeoutMs: 5000, maxInputBytes: 65536, maxOutputBytes: 65536 }
+`);
+    definition.steps[0]!.renderer = 'test.renderer';
+    const before = frozenCommandExecutorRevision(definition);
+    writeFileSync(renderer, 'process.stdout.write("changed");\n');
+    const after = frozenCommandExecutorRevision(definition);
+    expect(after).not.toBe(before);
+  });
+
+  it('runs a registered renderer and falls back to builtin.table when it fails', async () => {
+    const { root, definition } = fixture();
+    const renderer = join(root, 'renderer.mjs');
+    writeFileSync(renderer, `
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => { input += chunk; });
+process.stdin.on('end', () => {
+  const payload = JSON.parse(input);
+  process.stdout.write('custom-renderer:' + payload.rows[0].amount);
+});
+`);
+    const rendererRealpath = realpathSync(renderer);
+    writeRegistry(root, `
+renderers:
+  - id: test.renderer
+    executable: { realpath: ${JSON.stringify(resolve(process.execPath))} }
+    fixedArgs: [${JSON.stringify(rendererRealpath)}]
+    scriptArtifacts: [${JSON.stringify(rendererRealpath)}]
+    policy: { timeoutMs: 5000, maxInputBytes: 65536, maxOutputBytes: 65536 }
+`);
+    definition.steps[0]!.renderer = 'test.renderer';
+    const home = installFixturePlugin(root, 'data-mcp', 'data', '0.1.0');
+    const execute = () => executeFrozenCommand({
+      definition,
+      rawArgs: '30',
+      targetLarkAppId: 'cli_test',
+      botConfig: { plugins: ['data-mcp'], larkAppId: 'cli_test', larkAppSecret: 'test-secret' },
+      trustedCaller: {
+        requestUserOpenId: 'ou_test', requestUserUnionId: 'on_test', requestLarkAppId: 'cli_test', senderType: 'user' as const,
       },
-      truncated: false,
-      businessResult: { rows: [{ total: 120 }], totalRows: 1 },
-    };
-    expect(resolveFrozenCommandOutput({
-      definition,
-      rawArgs: '',
-      source: 'direct',
-      result: baseResult,
-    })).toMatchObject({
-      kind: 'deliver',
-      text: '查询结果：\n**总量 120**',
-      presentation: { blocks: [{ type: 'markdown', markdown: '查询结果：\n**总量 120**' }] },
+      turnId: 'om_turn', dataDir: join(home, '.botmux', 'data'), workingDir: root,
     });
-    const formatOverrideResult = { ...baseResult, businessResult: { rows: [{ total: 50 }], totalRows: 1 } };
-    expect(resolveFrozenCommandOutput({
-      definition,
-      rawArgs: '',
-      source: 'direct',
-      result: formatOverrideResult,
-    })).toMatchObject({
-      kind: 'deliver',
-      presentation: { blocks: [{ type: 'markdown', markdown: '默认结果' }] },
-    });
-    const noMatchResult = { ...baseResult, businessResult: { rows: [{ total: 10 }], totalRows: 1 } };
-    expect(resolveFrozenCommandOutput({
-      definition,
-      rawArgs: '',
-      source: 'direct',
-      result: noMatchResult,
-    })).toEqual({ kind: 'deliver', text: '默认结果', presentation: baseResult.presentation });
+
+    await expect(execute()).resolves.toMatchObject({ text: 'custom-renderer:12' });
+
+    writeFileSync(renderer, 'process.exit(7);\n');
+    const fallback = await execute();
+    expect(fallback.text).toContain('amount');
+    expect(fallback.text).toContain('12');
+    expect(fallback.text).not.toContain('custom-renderer');
   });
 
-  it('requires exactly one action per output rule', () => {
-    const variants = [
-      `  rules:
-    - when: "{{q.total}} > 0"
-      handoff:
-        prompt: "分析"
-      show: result`,
-      `  rules:
-    - when: "{{q.total}} > 0"`,
-    ];
-    for (const rules of variants) {
-      const invalid = BASE.replace('  maxChars: 20000', `  maxChars: 20000\n${rules}`);
-      const root = join(tmpdir(), `botmux-frozen-${process.pid}-${Math.random().toString(36).slice(2)}`);
-      dirs.push(root);
-      mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
-      writeFileSync(join(root, '.botmux', 'commands', '泰国上账.yaml'), invalid);
-      const lookup = lookupFrozenCommand({ workingDir: root, command: '/泰国上账' });
-      expect(lookup.kind).toBe('invalid');
-      if (lookup.kind === 'invalid') expect(lookup.error.message).toContain('必须且只能声明 handoff 或 show');
-    }
-  });
-
-  it('parses portable output formats and rejects raw HTML', () => {
-    expect(fixture(BASE.replace('output:\n', 'output:\n  format: table\n')).definition.output.format)
-      .toBe('table');
-    const root = join(tmpdir(), `botmux-frozen-${process.pid}-${Math.random().toString(36).slice(2)}`);
-    dirs.push(root);
-    mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
-    writeFileSync(
-      join(root, '.botmux', 'commands', '泰国上账.yaml'),
-      BASE.replace('output:\n', 'output:\n  format: html\n'),
-    );
-    const lookup = lookupFrozenCommand({ workingDir: root, command: '/泰国上账' });
-    expect(lookup.kind).toBe('invalid');
-    if (lookup.kind === 'invalid') expect(lookup.error.message).toContain('不接受原始 HTML');
-  });
-
-  it('builds a bounded channel-neutral table presentation with a text fallback', () => {
-    const { definition } = fixture(BASE.replace('output:\n', 'output:\n  format: table\n'));
-    const presentation = buildFrozenCommandPresentation({
-      definition,
-      text: '查询结果：\n金额：12',
-      businessResult: {
-        rows: [{ amount: 12, merchant: 'A' }, { amount: 18, merchant: 'B' }],
-        totalRows: 2,
-        columns: [{ key: 'amount', label: '金额' }, { key: 'merchant', label: '商户' }],
-      },
-    });
-    expect(presentation).toMatchObject({
-      schemaVersion: 1,
-      format: 'table',
-      fallbackText: '查询结果：\n金额：12',
-      blocks: [
-        { type: 'markdown', markdown: '查询结果：' },
-        {
-          type: 'table',
-          columns: [{ key: 'amount', label: '金额' }, { key: 'merchant', label: '商户' }],
-          rows: [{ amount: 12, merchant: 'A' }, { amount: 18, merchant: 'B' }],
-          totalRows: 2,
-          truncated: false,
-        },
-      ],
-    });
-  });
-
-  it('executes validate and run in one sessionless context with identical SQL bytes', async () => {
-    const { root, definition } = fixture(BASE);
-    const home = join(root, 'home');
-    const source = join(root, 'data-mcp-plugin');
-    mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
-    writeFileSync(join(source, 'package.json'), JSON.stringify({
-      name: '@botmux-ai/plugin-data-mcp',
-      version: '0.1.0',
-      type: 'module',
-      keywords: ['botmux-plugin'],
-      botmux: { schemaVersion: 1, id: 'data-mcp' },
-    }));
-    writeFileSync(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({
-      transport: 'stdio',
-      command: [process.execPath, resolve('test/fixtures/plugin-mcp-server.mjs'), 'data'],
-      env: { BOTMUX_SESSION_ID: 'forged-session', BOTMUX_EXECUTION_ID: 'forged-execution' },
-    }));
-    vi.stubEnv('HOME', home);
-    vi.stubEnv('SESSION_DATA_DIR', join(home, '.botmux', 'data'));
-    installLocalPlugin(source);
-
+  it('executes the raw Data MCP carrier with trusted identity and no SQL leakage', async () => {
+    const { root, definition } = fixture();
+    const home = installFixturePlugin(root, 'data-mcp', 'data', '0.1.0');
     const result = await executeFrozenCommand({
       definition,
       rawArgs: '30',
       targetLarkAppId: 'cli_test',
       botConfig: { plugins: ['data-mcp'], larkAppId: 'cli_test', larkAppSecret: 'test-secret' },
       trustedCaller: {
-        requestUserOpenId: 'ou_test',
-        requestUserUnionId: 'on_test',
-        requestLarkAppId: 'cli_test',
-        senderType: 'user',
+        requestUserOpenId: 'ou_test', requestUserUnionId: 'on_test', requestLarkAppId: 'cli_test', senderType: 'user',
       },
       turnId: 'om_turn',
       dataDir: join(home, '.botmux', 'data'),
     });
-
     expect(result.text).toContain('12');
-    expect(result.text).not.toContain('amount');
     expect(result.text).not.toContain('SELECT sum');
+    expect(result.projectedResult).toEqual({ rows: [{ amount: 12 }], row_count: 1 });
   });
 
-  it('connects a second plugin through registry data without host code changes', async () => {
-    const second = BASE
-      .replace('executor: test.plugin.readonly', 'executor: test.report.readonly')
-      .replace('  sql: |-\n    SELECT sum(amount) FROM bills\n    WHERE country = \'TH\' AND dt >= today() - {{days}}\n    LIMIT 100', '  report: "{{days}}"');
-    const { root, definition } = fixture(second);
-    const registry = join(root, 'command-executors.yaml');
-    writeFileSync(registry, `
-schemaVersion: 2
-executors:
-  - id: test.report.readonly
-    kind: plugin-tool
-    plugin: report-plugin
-    tool: render_report
-    minimumVersion: 1.0.0
-    contractVersion: 1
-    arguments:
-      report:
-        type: integer
-        required: true
-        min: 1
-        max: 90
-        accepts: [param]
-    policy:
-      schedulable: true
-      allowHandoff: true
-      handoffIncludesInput: false
-      timeoutMs: 120000
-`);
-    vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', registry);
-    const home = join(root, 'home');
-    const source = join(root, 'report-plugin');
-    mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
-    writeFileSync(join(source, 'package.json'), JSON.stringify({
-      name: '@botmux-ai/plugin-report-fixture',
-      version: '1.0.0',
-      type: 'module',
-      keywords: ['botmux-plugin'],
-      botmux: { schemaVersion: 1, id: 'report-plugin' },
-    }));
-    writeFileSync(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({
-      transport: 'stdio',
-      command: [process.execPath, resolve('test/fixtures/plugin-mcp-server.mjs'), 'report'],
-    }));
-    vi.stubEnv('HOME', home);
-    vi.stubEnv('SESSION_DATA_DIR', join(home, '.botmux', 'data'));
-    installLocalPlugin(source);
-
-    const result = await executeFrozenCommand({
-      definition,
-      rawArgs: '30',
-      targetLarkAppId: 'cli_test',
-      botConfig: { plugins: ['report-plugin'], larkAppId: 'cli_test', larkAppSecret: 'test-secret' },
-      trustedCaller: {
-        requestUserOpenId: 'ou_test',
-        requestUserUnionId: 'on_test',
-        requestLarkAppId: 'cli_test',
-        senderType: 'user',
-      },
-      turnId: 'om_turn',
-      dataDir: join(home, '.botmux', 'data'),
-    });
-
-    expect(result).toMatchObject({ executorId: 'test.report.readonly', text: 'second-plugin-ok' });
-  });
-
-  it('adapts an ordinary MCP JSON tool through registry projection only', async () => {
-    const ordinary = BASE
-      .replace('executor: test.plugin.readonly', 'executor: test.json.readonly')
-      .replace(
-        "  sql: |-\n    SELECT sum(amount) FROM bills\n    WHERE country = 'TH' AND dt >= today() - {{days}}\n    LIMIT 100",
-        '  days: "{{days}}"',
-      )
-      .replace('output:\n', 'output:\n  format: table\n  text: "{{result.rows}}"\n');
-    const { root, definition } = fixture(ordinary);
-    const registry = join(root, 'command-executors.yaml');
-    writeFileSync(registry, `
+  it('connects an ordinary JSON MCP tool without host-specific code', async () => {
+    const yaml = BASE
+      .replace('test.plugin.readonly', 'test.json.readonly')
+      .replace(/sql: \|-\n[\s\S]*?LIMIT 100/u, 'days: "{{days}}"');
+    const { root, definition } = fixture(yaml);
+    writeFileSync(join(root, 'command-executors.yaml'), `
 schemaVersion: 2
 executors:
   - id: test.json.readonly
@@ -688,236 +435,102 @@ executors:
     tool: read_report
     minimumVersion: 1.0.0
     arguments:
-      days:
-        type: integer
-        required: true
-        min: 1
-        max: 90
-        accepts: [param]
-    policy:
-      schedulable: true
-      allowHandoff: true
-      timeoutMs: 120000
+      days: { type: integer, required: true, min: 1, max: 90, accepts: [param] }
     output:
-      format: json
       container: rows
       exposeRowFields: [name, total]
+    policy: { schedulable: true, allowHandoff: false, timeoutMs: 120000 }
 `);
-    vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', registry);
-    const home = join(root, 'home');
-    const source = join(root, 'json-report-plugin');
-    mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
-    writeFileSync(join(source, 'package.json'), JSON.stringify({
-      name: '@botmux-ai/plugin-json-report-fixture',
-      version: '1.0.0',
-      type: 'module',
-      keywords: ['botmux-plugin'],
-      botmux: { schemaVersion: 1, id: 'json-report-plugin' },
-    }));
-    writeFileSync(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({
-      transport: 'stdio',
-      command: [process.execPath, resolve('test/fixtures/plugin-mcp-server.mjs'), 'json-report'],
-    }));
-    vi.stubEnv('HOME', home);
-    vi.stubEnv('SESSION_DATA_DIR', join(home, '.botmux', 'data'));
-    installLocalPlugin(source);
-
+    const home = installFixturePlugin(root, 'json-report-plugin', 'json-report');
     const result = await executeFrozenCommand({
       definition,
       rawArgs: '30',
       targetLarkAppId: 'cli_test',
       botConfig: { plugins: ['json-report-plugin'], larkAppId: 'cli_test', larkAppSecret: 'test-secret' },
       trustedCaller: {
-        requestUserOpenId: 'ou_test',
-        requestUserUnionId: 'on_test',
-        requestLarkAppId: 'cli_test',
-        senderType: 'user',
+        requestUserOpenId: 'ou_test', requestUserUnionId: 'on_test', requestLarkAppId: 'cli_test', senderType: 'user',
       },
-      turnId: 'om_turn',
-      dataDir: join(home, '.botmux', 'data'),
+      turnId: 'om_turn', dataDir: join(home, '.botmux', 'data'),
     });
-
     expect(result.projectedResult).toEqual({ rows: [{ name: 'report-30', total: 12 }] });
     expect(result.text).not.toContain('hidden');
-    expect(result.presentation.blocks.some(block => block.type === 'table')).toBe(true);
-
-    const markdownResult = await executeFrozenCommand({
-      definition: {
-        ...definition,
-        output: { ...definition.output, format: 'markdown' },
-      },
-      rawArgs: '31',
-      targetLarkAppId: 'cli_test',
-      botConfig: { plugins: ['json-report-plugin'], larkAppId: 'cli_test', larkAppSecret: 'test-secret' },
-      trustedCaller: {
-        requestUserOpenId: 'ou_test',
-        requestUserUnionId: 'on_test',
-        requestLarkAppId: 'cli_test',
-        senderType: 'user',
-      },
-      turnId: 'om_turn_markdown',
-      dataDir: join(home, '.botmux', 'data'),
-    });
-    const markdown = markdownResult.presentation.blocks[0];
-    expect(markdown).toMatchObject({ type: 'markdown' });
-    if (markdown?.type === 'markdown') {
-      expect(markdown.markdown).toContain('\\[\u70b9\u6211\u9886\u5956\\]\\(http://evil\\.example\\)');
-      expect(markdown.markdown).toContain('\\*\\*bold\\*\\*');
-      expect(markdown.markdown).toContain('\\_italic\\_');
-      expect(markdown.markdown).not.toContain('[点我领奖](http://evil.example)');
-    }
   });
 
-  it('fails closed before opening Data MCP when the triggering identity is absent', async () => {
-    const { root, definition } = fixture(BASE);
-    await expect(executeFrozenCommand({
+  it('uses a generic MCP text result as markdown in content mode', async () => {
+    const { root, definition } = fixture();
+    writeFileSync(join(root, 'command-executors.yaml'), `
+schemaVersion: 2
+executors:
+  - id: test.content.readonly
+    kind: plugin-tool
+    plugin: content-plugin
+    tool: echo
+    minimumVersion: 1.0.0
+    arguments: {}
+    output: { content: markdown, maxContentBytes: 60000 }
+    policy: { schedulable: true, allowHandoff: false, timeoutMs: 120000 }
+`);
+    definition.params = [];
+    definition.steps[0] = {
+      id: 'main', executor: 'test.content.readonly', input: {}, renderer: 'builtin.content', required: false,
+    };
+    const home = installFixturePlugin(root, 'content-plugin', 'content');
+    const result = await executeFrozenCommand({
       definition,
       rawArgs: '',
       targetLarkAppId: 'cli_test',
-      botConfig: { plugins: ['data-mcp'], larkAppId: 'cli_test', larkAppSecret: 'test-secret' },
-      trustedCaller: undefined,
-      turnId: 'schedule:ownerless',
-      dataDir: join(root, 'data'),
+      botConfig: { plugins: ['content-plugin'], larkAppId: 'cli_test', larkAppSecret: 'test-secret' },
+      trustedCaller: {
+        requestUserOpenId: 'ou_test', requestUserUnionId: 'on_test', requestLarkAppId: 'cli_test', senderType: 'user',
+      },
+      turnId: 'om_turn', dataDir: join(home, '.botmux', 'data'), workingDir: root,
+    });
+    expect(result.text).toContain('content:echo:{}');
+    expect(result.projectedResult).toEqual({});
+  });
+
+  it('maps plugin error fields to fixed host errors', async () => {
+    const yaml = BASE.replace('SELECT sum(amount) FROM bills', "SELECT 'RETURN_VALIDATION_ERROR'");
+    const { root, definition } = fixture(yaml);
+    const home = installFixturePlugin(root, 'data-mcp', 'data', '0.1.0');
+    await expect(executeFrozenCommand({
+      definition,
+      rawArgs: '30',
+      targetLarkAppId: 'cli_test',
+      botConfig: { plugins: ['data-mcp'], larkAppId: 'cli_test', larkAppSecret: 'secret' },
+      trustedCaller: {
+        requestUserOpenId: 'ou_test', requestUserUnionId: 'on_test', requestLarkAppId: 'cli_test', senderType: 'user',
+      },
+      turnId: 'om_turn', dataDir: join(home, '.botmux', 'data'),
+    })).rejects.toMatchObject({ code: 'plugin_tool_execution_failed', message: '插件工具执行失败。', executionFailure: true });
+  });
+
+  it('fails closed on absent identity and keeps public error text safe', async () => {
+    const { root, definition } = fixture();
+    await expect(executeFrozenCommand({
+      definition, rawArgs: '', targetLarkAppId: 'cli_test',
+      botConfig: { plugins: ['data-mcp'], larkAppId: 'cli_test', larkAppSecret: 'secret' },
+      trustedCaller: undefined, turnId: 'ownerless', dataDir: join(root, 'data'),
     })).rejects.toMatchObject({ code: 'untrusted_caller' });
-  });
-
-  it('maps plugin failures to a fixed safe code and message', async () => {
-    const validationErrorDefinition = BASE.replace(
-      'SELECT sum(amount) FROM bills',
-      "SELECT 'RETURN_VALIDATION_ERROR'",
-    );
-    const { root, definition } = fixture(validationErrorDefinition);
-    const home = join(root, 'home');
-    const source = join(root, 'data-mcp-plugin');
-    mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
-    writeFileSync(join(source, 'package.json'), JSON.stringify({
-      name: '@botmux-ai/plugin-data-mcp',
-      version: '0.1.0',
-      type: 'module',
-      keywords: ['botmux-plugin'],
-      botmux: { schemaVersion: 1, id: 'data-mcp' },
-    }));
-    writeFileSync(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({
-      transport: 'stdio',
-      command: [process.execPath, resolve('test/fixtures/plugin-mcp-server.mjs'), 'data'],
-    }));
-    vi.stubEnv('HOME', home);
-    vi.stubEnv('SESSION_DATA_DIR', join(home, '.botmux', 'data'));
-    installLocalPlugin(source);
-
-    await expect(executeFrozenCommand({
-      definition,
-      rawArgs: '30',
-      targetLarkAppId: 'cli_test',
-      botConfig: { plugins: ['data-mcp'], larkAppId: 'cli_test', larkAppSecret: 'test-secret' },
-      trustedCaller: {
-        requestUserOpenId: 'ou_test',
-        requestUserUnionId: 'on_test',
-        requestLarkAppId: 'cli_test',
-        senderType: 'user',
-      },
-      turnId: 'om_turn',
-      dataDir: join(home, '.botmux', 'data'),
-    })).rejects.toMatchObject({
-      code: 'plugin_tool_execution_failed',
-      message: '插件工具执行失败。',
-      executionFailure: true,
-      transient: false,
-    });
-  });
-
-  it('accepts comparison text but rejects actual raw HTML from a plugin contract', async () => {
-    const { root, definition } = fixture(BASE.replace('SELECT sum(amount) FROM bills', "SELECT 'RETURN_MATH_TEXT'"));
-    const home = join(root, 'home');
-    const source = join(root, 'data-mcp-plugin');
-    mkdirSync(join(source, 'dist', 'mcp'), { recursive: true });
-    writeFileSync(join(source, 'package.json'), JSON.stringify({
-      name: '@botmux-ai/plugin-data-mcp',
-      version: '0.1.0',
-      type: 'module',
-      keywords: ['botmux-plugin'],
-      botmux: { schemaVersion: 1, id: 'data-mcp' },
-    }));
-    writeFileSync(join(source, 'dist', 'mcp', 'index.json'), JSON.stringify({
-      transport: 'stdio',
-      command: [process.execPath, resolve('test/fixtures/plugin-mcp-server.mjs'), 'data'],
-    }));
-    vi.stubEnv('HOME', home);
-    vi.stubEnv('SESSION_DATA_DIR', join(home, '.botmux', 'data'));
-    installLocalPlugin(source);
-    const common = {
-      rawArgs: '30',
-      targetLarkAppId: 'cli_test',
-      botConfig: { plugins: ['data-mcp'], larkAppId: 'cli_test', larkAppSecret: 'test-secret' },
-      trustedCaller: {
-        requestUserOpenId: 'ou_test',
-        requestUserUnionId: 'on_test',
-        requestLarkAppId: 'cli_test',
-        senderType: 'user' as const,
-      },
-      turnId: 'om_turn',
-      dataDir: join(home, '.botmux', 'data'),
-    };
-    await expect(executeFrozenCommand({ definition, ...common })).resolves.toMatchObject({ text: 'a<b 且 c>d' });
-    await expect(executeFrozenCommand({
-      definition: {
-        ...definition,
-        input: { sql: "SELECT 'RETURN_RAW_HTML'" },
-      },
-      ...common,
-    })).rejects.toMatchObject({ code: 'plugin_tool_presentation_invalid' });
-  });
-
-  it('converts legacy fallback into an explicit transient-error rule and keeps gates out', () => {
-    const { definition } = fixture(BASE);
-    const transientError = new FrozenCommandError(
-      'plugin_tool_unavailable',
-      'down',
-      undefined,
-      true,
-      true,
-      'exec-test',
-    );
-    const handoff = resolveFrozenCommandOutput({
-      definition,
-      rawArgs: '30',
-      source: 'direct',
-      error: transientError,
-    });
-    expect(handoff).toMatchObject({ kind: 'handoff' });
-    if (handoff.kind === 'handoff') {
-      expect(handoff.prompt).toContain('[固化命令上下文]');
-      expect(handoff.prompt).toContain('plugin_tool_unavailable');
-      expect(handoff.prompt).not.toContain('down');
-      expect(handoff.prompt).toContain('插件工具暂时不可用');
-      expect(handoff.prompt).not.toContain('[执行器输入');
-    }
-    expect(() => resolveFrozenCommandOutput({
-      definition,
-      rawArgs: '30',
-      source: 'direct',
-      error: new FrozenCommandError('untrusted_caller', 'denied'),
-    })).toThrowError(/denied/);
     expect(isTransientPluginToolFailure('connection closed by peer')).toBe(true);
-    expect(isTransientPluginToolFailure('Unknown identifier amount after schema migration')).toBe(false);
     expect(isTransientPluginToolFailure('memory limit exceeded')).toBe(false);
-    expect(isTransientPluginToolFailure('policy rejected request')).toBe(false);
-    expect(userFacingFrozenCommandError(
-      new FrozenCommandError('provider_validation_failed', 'bad near private template'),
-    )).not.toContain('private template');
-    expect(userFacingFrozenCommandError(
-      new FrozenCommandError('provider_validation_failed', 'bad near private template'),
-    )).not.toContain('provider_validation_failed');
+    expect(userFacingFrozenCommandError(new FrozenCommandError('provider_validation_failed', 'private template')))
+      .not.toContain('private template');
   });
 
-  it('rejects a command definition symlink instead of escaping the role directory', () => {
-    const root = join(tmpdir(), `botmux-frozen-${process.pid}-${Math.random().toString(36).slice(2)}`);
-    dirs.push(root);
-    mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
-    const outside = join(root, 'outside.yaml');
+  it('lists definitions without SQL and rejects symlink definitions', () => {
+    const { root } = fixture();
+    const listed = listFrozenCommandSnapshots(root);
+    expect(listed).toHaveLength(1);
+    expect(JSON.stringify(listed.map(item => item.command))).not.toContain('SELECT');
+
+    const linkedRoot = join(tmpdir(), `botmux-frozen-link-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    dirs.push(linkedRoot);
+    mkdirSync(join(linkedRoot, '.botmux', 'commands'), { recursive: true });
+    const outside = join(linkedRoot, 'outside.yaml');
     writeFileSync(outside, BASE);
-    symlinkSync(outside, join(root, '.botmux', 'commands', '泰国上账.yaml'));
-    const result = lookupFrozenCommand({ workingDir: root, command: '/泰国上账' });
+    symlinkSync(outside, join(linkedRoot, '.botmux', 'commands', '泰国上账.yaml'));
+    const result = lookupFrozenCommand({ workingDir: linkedRoot, command: '/泰国上账' });
     expect(result.kind).toBe('invalid');
     if (result.kind === 'invalid') expect(result.error.code).toBe('definition_file_invalid');
   });

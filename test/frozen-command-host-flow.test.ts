@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   validateCalls: 0,
   runCalls: 0,
-  runResultShape: 'text' as 'top-level' | 'structured' | 'text' | 'malformed' | 'missing' | 'html' | 'wrong-contract' | 'legacy-text-block',
+  runResultShape: 'text' as 'top-level' | 'structured' | 'text' | 'malformed' | 'missing' | 'html',
   toolsAvailable: true,
   cardBodies: [] as string[],
   messageTypes: [] as string[],
@@ -120,41 +120,19 @@ vi.mock('@modelcontextprotocol/sdk/client/index.js', () => ({
     async close() {}
     async listTools() {
       return {
-        tools: mocks.toolsAvailable ? [{ name: 'execute_frozen_query' }] : [],
+        tools: mocks.toolsAvailable ? [{
+          name: 'execute_frozen_query',
+          inputSchema: { type: 'object', properties: { payload: {}, parameters: {}, values: {} } },
+        }] : [],
       };
     }
     async callTool(input: { name: string; arguments?: Record<string, any> }) {
       if (input.name === 'execute_frozen_query') {
         mocks.validateCalls += 1;
         mocks.runCalls += 1;
-        const prefix = typeof input.arguments?.output?.prefix === 'string' ? input.arguments.output.prefix : '';
-        const format = input.arguments?.output?.format;
-        const fallbackText = `${prefix}测试数字：22`;
-        const blocks = format === 'table'
-          ? [{
-              type: 'table',
-              columns: [{ key: 'probe_value', label: 'probe_value' }],
-              rows: [{ probe_value: 22 }],
-              totalRows: 1,
-              truncated: false,
-            }]
-          : [{ type: 'markdown', markdown: fallbackText }];
-        const contract = {
-          contractVersion: mocks.runResultShape === 'wrong-contract' ? 2 : 1,
-          status: 'success',
-          fallbackText: mocks.runResultShape === 'html' ? '<font color=red>unsafe</font>' : fallbackText,
-          blocks: mocks.runResultShape === 'html'
-            ? [{ type: 'markdown', markdown: '<font color=red>unsafe</font>' }]
-            : mocks.runResultShape === 'legacy-text-block'
-              ? [{ type: 'text', text: fallbackText }]
-            : blocks,
-          meta: { queryId: 'q_host_flow', totalRows: 1 },
-          data: {
-            rows: [{ probe_value: 22 }],
-            columns: [{ key: 'probe_value', label: 'probe_value' }],
-            totalRows: 1,
-          },
-        };
+        const contract = mocks.runResultShape === 'html'
+          ? { rows: [{ probe_value: '<font color=red>unsafe</font>' }], columns: [{ name: 'probe_value', description: 'probe_value' }], row_count: 1, query_id: 'q_host_flow', error_code: null }
+          : { rows: [{ probe_value: 22 }], columns: [{ name: 'probe_value', description: 'probe_value' }], row_count: 1, query_id: 'q_host_flow', error_code: null };
         if (mocks.runResultShape === 'top-level') {
           return {
             ...contract,
@@ -202,7 +180,6 @@ schemaVersion: 2
 status: active
 name: 宿主闭环
 description: 宿主闭环测试
-executor: test.plugin.readonly
 params:
   - name: value
     label: 测试数字
@@ -210,13 +187,15 @@ params:
     min: 1
     max: 90
     default: 7
-input:
-  datasource: tchouse-c
-  sql: SELECT {{value}} * 2 AS probe_value
+steps:
+  - id: main
+    executor: test.plugin.readonly
+    input:
+      datasource: tchouse-c
+      sql: SELECT {{value}} * 2 AS probe_value
+    renderer: builtin.table
 output:
-  prefix: "真实链路："
-  maxChars: 20000
-onError: fail
+  format: markdown
 `;
 
 type Loaded = Awaited<ReturnType<typeof loadModules>>;
@@ -395,10 +374,10 @@ function approveCommandYaml(candidateYaml: string, reason: string): void {
 
 function handoffCommandYaml(prompt: string): string {
   return YAML.replace(
-    '  maxChars: 20000',
-    `  maxChars: 20000
+    '  format: markdown',
+    `  format: markdown
   rules:
-    - when: "{{q.probe_value}} > 20"
+    - when: "{{q.main.probe_value}} > 20"
       handoff:
         prompt: ${JSON.stringify(prompt)}`,
   );
@@ -582,7 +561,7 @@ function seedLegacyPendingRun(ds: any, rawArgs = '11'): {
     command: COMMAND.slice(1),
     rawArgs,
     normalizedArgs,
-    executorId: lookup.snapshot.definition.executor,
+    executorId: lookup.snapshot.definition.steps[0]!.executor,
     executorRevision: lifecycle.record.executorRevision!,
     specHash: lifecycle.record.specHash!,
     revisionId: lifecycle.record.stateRevisionId,
@@ -710,7 +689,6 @@ executors:
     plugin: data-mcp
     tool: execute_frozen_query
     minimumVersion: 0.2.0
-    contractVersion: 1
     arguments:
       datasource:
         type: string
@@ -727,6 +705,13 @@ executors:
       allowHandoff: true
       handoffIncludesInput: false
       timeoutMs: 120000
+    output:
+      container: rows
+      exposeRowFields: [probe_value]
+      labelsFrom: columns
+      totalRowsField: row_count
+      auditFields: [query_id]
+      errorField: error_code
 `);
   process.env.BOTMUX_COMMAND_EXECUTORS_FILE = registry;
   mkdirSync(join(root, '.botmux'), { recursive: true });
@@ -832,7 +817,7 @@ describe('Frozen Command host-owned route → callback → Data MCP flow', () =>
     writeFileSync(script, 'console.log(JSON.stringify({value:"ok"}));\n');
     const canonicalScript = realpathSync(script);
     writeFileSync(registry, `
-schemaVersion: 1
+schemaVersion: 2
 executors:
   - id: test.safe
     kind: script
@@ -841,8 +826,8 @@ executors:
     scriptArtifacts: [${JSON.stringify(canonicalScript)}]
     arguments:
       value: { type: string, required: true, maxLength: 32, accepts: [param] }
-    policy: { risk: read, schedulable: true, allowHandoff: false, timeoutMs: 5000, maxOutputBytes: 65536 }
-    output: { format: json, exposeFields: [value] }
+    policy: { schedulable: true, allowHandoff: false, timeoutMs: 5000, maxOutputBytes: 65536 }
+    output: { exposeFields: [value] }
 `);
     process.env.BOTMUX_COMMAND_EXECUTORS_FILE = registry;
     const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '查看执行器参数契约' });
@@ -875,28 +860,12 @@ executors:
     expect(mocks.validateCalls).toBe(1);
     expect(mocks.runCalls).toBe(1);
     expect(mocks.cardBodies).toHaveLength(1);
-    expect(mocks.cardBodies[0]).toContain('真实链路：');
+    expect(mocks.cardBodies[0]).toContain('probe');
+    expect(mocks.cardBodies[0]).toContain('22');
     expect(mocks.cardBodies[0]).not.toContain('确认执行');
   });
 
-  it('renders an opted-in table result as an interactive Feishu card on the direct host path', async () => {
-    const candidate = YAML.replace('output:\n', 'output:\n  format: table\n');
-    const pending = modules.lifecycle.prepareFrozenCommandTransition({
-      dataDir,
-      targetBotId: APP,
-      workingDir: root,
-      command: COMMAND,
-      action: 'approve',
-      actor: { openId: ACTOR_OPEN_ID, unionId: ACTOR_UNION_ID },
-      reason: '启用结构化表格结果',
-      candidateYaml: candidate,
-    });
-    modules.lifecycle.confirmFrozenCommandTransition({
-      dataDir,
-      targetBotId: APP,
-      token: pending.token,
-      actor: { openId: ACTOR_OPEN_ID, unionId: ACTOR_UNION_ID },
-    });
+  it('renders a builtin.table result as markdown inside an interactive Feishu card', async () => {
     const messageId = `om_direct_table_${Math.random().toString(36).slice(2)}`;
     await modules.daemon.__testOnly_handleNewTopic(
       ingressEvent(messageId, '@_bot /宿主闭环 11'),
@@ -906,13 +875,14 @@ executors:
     expect(mocks.messageTypes.at(-1)).toBe('interactive');
     const card = JSON.parse(mocks.cardBodies.at(-1)!) as any;
     expect(card.schema).toBe('2.0');
-    expect(card.body.elements.some((element: any) => element.tag === 'table')).toBe(true);
+    expect(card.body.elements.some((element: any) => element.tag === 'markdown')).toBe(true);
+    expect(mocks.cardBodies.at(-1)).toContain('probe');
     expect(mocks.cardBodies.at(-1)).not.toContain('SELECT');
     expect(mocks.cardBodies.at(-1)).not.toContain('query_id');
   });
 
   it('keeps format=text as a plain Feishu text message although the plugin carrier is markdown', async () => {
-    const candidate = YAML.replace('output:\n', 'output:\n  format: text\n');
+    const candidate = YAML.replace('  format: markdown', '  format: text');
     const pending = modules.lifecycle.prepareFrozenCommandTransition({
       dataDir,
       targetBotId: APP,
@@ -936,7 +906,8 @@ executors:
     );
 
     expect(mocks.messageTypes.at(-1)).toBe('text');
-    expect(mocks.cardBodies.at(-1)).toContain('真实链路：');
+    expect(mocks.cardBodies.at(-1)).toContain('probe_value');
+    expect(mocks.cardBodies.at(-1)).toContain('22');
   });
 
   it('routes an explicitly configured direct handoff through the existing session worker', async () => {
@@ -1017,7 +988,8 @@ executors:
     expect(mocks.validateCalls).toBe(1);
     expect(mocks.runCalls).toBe(1);
     expect(mocks.cardBodies).toHaveLength(1);
-    expect(mocks.cardBodies[0]).toContain('真实链路：');
+    expect(mocks.cardBodies[0]).toContain('probe');
+    expect(mocks.cardBodies[0]).toContain('22');
     expect(mocks.cardBodies[0]).not.toContain('确认执行');
   });
 
@@ -1097,7 +1069,7 @@ executors:
 
     expect(mocks.validateCalls).toBe(1);
     expect(mocks.runCalls).toBe(1);
-    expect(mocks.cardBodies.at(-1)).toContain('真实链路：');
+    expect(mocks.cardBodies.at(-1)).toContain('probe');
   });
 
   it('keeps an oncall chat member eligible for frozen-command direct execution when grant commands are restricted', async () => {
@@ -1107,7 +1079,7 @@ executors:
 
     expect(mocks.validateCalls).toBe(1);
     expect(mocks.runCalls).toBe(1);
-    expect(mocks.cardBodies.at(-1)).toContain('真实链路：');
+    expect(mocks.cardBodies.at(-1)).toContain('probe');
   });
 
   it('keeps an allowed chat-group member eligible for frozen-command direct execution when grant commands are restricted', async () => {
@@ -1122,7 +1094,7 @@ executors:
 
     expect(mocks.validateCalls).toBe(1);
     expect(mocks.runCalls).toBe(1);
-    expect(mocks.cardBodies.at(-1)).toContain('真实链路：');
+    expect(mocks.cardBodies.at(-1)).toContain('probe');
   });
 
   it('lets a grant-only visitor unknown natural-language command fall through as ordinary conversation', async () => {
@@ -1256,7 +1228,6 @@ executors:
   });
 
   it.each([
-    ['top-level', 'top-level'],
     ['structuredContent', 'structured'],
     ['content[].text JSON', 'text'],
     ['opaque metadata', 'malformed'],
@@ -1273,21 +1244,21 @@ executors:
     expect(mocks.runCalls).toBe(1);
   });
 
-  it.each([
-    ['raw HTML', 'html', 'plugin_tool_presentation_invalid'],
-    ['legacy text block', 'legacy-text-block', 'plugin_tool_presentation_invalid'],
-    ['wrong contract version', 'wrong-contract', 'plugin_tool_contract_mismatch'],
-  ] as const)('fails closed for %s without replay or model fallback', async (_label, shape, errorCode) => {
-    mocks.runResultShape = shape;
+  it('fails closed for raw HTML without replay or model fallback', async () => {
+    mocks.runResultShape = 'html';
     const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '运行命令' });
     const value = seedLegacyPendingRun(ds);
 
-    await modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP);
+    const result = await modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP);
     const failed = await waitForStatus(value.transition_id, 'failed');
-    expect(failed).toMatchObject({ errorCode });
+    expect(failed).toMatchObject({ status: 'failed', errorCode: 'renderer_output_unsafe' });
     expect(mocks.validateCalls).toBe(1);
     expect(mocks.runCalls).toBe(1);
-    expect(mocks.cardBodies.at(-1)).toContain('不会回退模型');
+    expect(result).toMatchObject({ toast: { type: 'info' } });
+    await vi.waitFor(() => {
+      expect(mocks.cardBodies.some(body => body.includes('固化命令未执行完成'))).toBe(true);
+    });
+    expect(mocks.cardBodies.every(body => !body.includes('<script>'))).toBe(true);
 
     await modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP);
     expect(mocks.validateCalls).toBe(1);

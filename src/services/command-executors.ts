@@ -19,7 +19,6 @@ import { parse as parseYaml } from 'yaml';
 import type { BotConfig } from '../bot-registry.js';
 import { assertValidPluginId } from '../core/plugins/ids.js';
 import { applySessionOwnerEnv } from '../utils/child-env.js';
-import { logger } from '../utils/logger.js';
 
 const EXECUTOR_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const ARGUMENT_NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
@@ -36,7 +35,7 @@ const MAX_STRING_ARGUMENT_LENGTH = 10_000;
 // Large plugin templates are administrator-authored literals. Keep every
 // dynamic source and all process/script arguments on the smaller limit.
 const MAX_PLUGIN_LITERAL_ARGUMENT_LENGTH = 200_000;
-const JSON_PATH_RE = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/;
+const JSON_PATH_RE = /^[\p{L}_][\p{L}\p{N}_]*(?:\.[\p{L}_][\p{L}\p{N}_]*)*$/u;
 const FORBIDDEN_PATH_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor']);
 const FORBIDDEN_PLUGIN_IDENTITY_ARGUMENTS = new Set([
   'caller',
@@ -85,9 +84,30 @@ export interface CommandExecutorArgument {
   accepts: ExecutorArgumentSource[];
 }
 
-export type CommandExecutorOutput =
-  | { format: 'json'; exposeFields: string[] }
-  | { format: 'json'; container: string; exposeRowFields: string[] };
+export interface CommandExecutorOutput {
+  /** `markdown` means the complete stdout/tool text. Any other value is a
+   * JSON field path containing markdown. */
+  content?: 'markdown' | string;
+  exposeFields?: string[];
+  container?: string;
+  exposeRowFields?: string[];
+  labels?: Record<string, string>;
+  labelsFrom?: string;
+  totalRowsField?: string;
+  auditFields: string[];
+  errorField?: string;
+  maxContentBytes?: number;
+}
+
+export interface CommandExecutorOutputResult {
+  projected: Record<string, unknown>;
+  rows: Array<Record<string, unknown>>;
+  columns: Array<{ key: string; label: string }>;
+  totalRows: number;
+  content?: string;
+  audit: Record<string, unknown>;
+  errorCode?: string;
+}
 
 export interface ProcessCommandExecutor {
   id: string;
@@ -113,8 +133,7 @@ export interface PluginToolCommandExecutor {
   plugin: string;
   tool: string;
   minimumVersion: string;
-  contractVersion?: number;
-  output?: CommandExecutorOutput;
+  output: CommandExecutorOutput;
   arguments: Record<string, CommandExecutorArgument>;
   policy: {
     schedulable: boolean;
@@ -130,7 +149,20 @@ export type CommandExecutor = ProcessCommandExecutor | PluginToolCommandExecutor
 export interface CommandExecutorRegistry {
   filePath: string;
   executors: Map<string, CommandExecutor>;
-  aliases: Map<string, string>;
+  renderers: Map<string, CommandRenderer>;
+}
+
+export interface CommandRenderer {
+  id: string;
+  executable: { realpath: string };
+  fixedArgs: string[];
+  scriptArtifacts: Array<{ realpath: string; sha256: string; size: number }>;
+  policy: {
+    timeoutMs: number;
+    maxInputBytes: number;
+    maxOutputBytes: number;
+  };
+  revision: string;
 }
 
 export interface CommandExecutorAuthoringSchema {
@@ -159,10 +191,19 @@ export interface ProcessExecutorResult {
   executorRevision: string;
   executionId: string;
   projected: Record<string, unknown>;
+  output: CommandExecutorOutputResult;
   stdoutBytes: number;
   truncated: boolean;
   exitCode: number;
   signal: NodeJS.Signals | null;
+  durationMs: number;
+}
+
+export interface CommandRendererResult {
+  rendererId: string;
+  rendererRevision: string;
+  markdown: string;
+  stdoutBytes: number;
   durationMs: number;
 }
 
@@ -347,12 +388,19 @@ function parseArgument(
 
 function parseOutput(value: unknown, executorId: string): CommandExecutorOutput {
   if (!isPlainObject(value)) throw new CommandExecutorError('executor_output_invalid', `${executorId}.output 必须是对象`);
-  onlyKeys(value, ['format', 'exposeFields', 'container', 'exposeRowFields'], `${executorId}.output`);
-  if (value.format !== 'json') throw new CommandExecutorError('executor_output_invalid', `${executorId}.output.format 首版只能是 json`);
+  onlyKeys(value, [
+    'content', 'exposeFields', 'container', 'exposeRowFields', 'labels', 'labelsFrom',
+    'totalRowsField', 'auditFields', 'errorField', 'maxContentBytes',
+  ], `${executorId}.output`);
   const flat = Array.isArray(value.exposeFields);
   const collection = value.container !== undefined || value.exposeRowFields !== undefined;
-  if (flat === collection) {
-    throw new CommandExecutorError('executor_output_invalid', `${executorId}.output 必须且只能选择 exposeFields 或 container+exposeRowFields`);
+  const hasContent = value.content !== undefined;
+  if (flat && collection) throw new CommandExecutorError('executor_output_invalid', `${executorId}.output 不能同时声明 exposeFields 和 container`);
+  if (!flat && !collection && !hasContent) {
+    throw new CommandExecutorError('executor_output_invalid', `${executorId}.output 必须声明 content、exposeFields 或 container+exposeRowFields`);
+  }
+  if (collection && (value.container === undefined || value.exposeRowFields === undefined)) {
+    throw new CommandExecutorError('executor_output_invalid', `${executorId}.output 的 container 与 exposeRowFields 必须同时声明`);
   }
   const parseFields = (candidate: unknown, field: string): string[] => {
     if (!Array.isArray(candidate) || candidate.length === 0 || candidate.length > MAX_PROJECTED_FIELDS) {
@@ -366,16 +414,60 @@ function parseOutput(value: unknown, executorId: string): CommandExecutorOutput 
     }
     return fields;
   };
-  if (flat) return { format: 'json', exposeFields: parseFields(value.exposeFields, `${executorId}.output.exposeFields`) };
-  const container = nonBlank(value.container, `${executorId}.output.container`, 128);
-  if (!JSON_PATH_RE.test(container)
-    || container.split('.').some(segment => FORBIDDEN_PATH_SEGMENTS.has(segment))) {
-    throw new CommandExecutorError('executor_output_invalid', `${executorId}.output.container 不合法`);
+  const parsePath = (candidate: unknown, field: string): string => {
+    const path = nonBlank(candidate, field, 128);
+    if (!JSON_PATH_RE.test(path) || path.split('.').some(segment => FORBIDDEN_PATH_SEGMENTS.has(segment))) {
+      throw new CommandExecutorError('executor_output_invalid', `${field} 不合法`);
+    }
+    return path;
+  };
+  const content = value.content === undefined
+    ? undefined
+    : value.content === 'markdown'
+      ? 'markdown'
+      : parsePath(value.content, `${executorId}.output.content`);
+  const exposeFields = flat
+    ? parseFields(value.exposeFields, `${executorId}.output.exposeFields`)
+    : undefined;
+  const container = collection ? parsePath(value.container, `${executorId}.output.container`) : undefined;
+  const exposeRowFields = collection
+    ? parseFields(value.exposeRowFields, `${executorId}.output.exposeRowFields`)
+    : undefined;
+  let labels: Record<string, string> | undefined;
+  if (value.labels !== undefined) {
+    if (!isPlainObject(value.labels) || Object.keys(value.labels).length > MAX_PROJECTED_FIELDS) {
+      throw new CommandExecutorError('executor_output_invalid', `${executorId}.output.labels 必须是最多 ${MAX_PROJECTED_FIELDS} 项的对象`);
+    }
+    labels = Object.fromEntries(Object.entries(value.labels).map(([key, label]) => [
+      parsePath(key, `${executorId}.output.labels.${key}`),
+      nonBlank(label, `${executorId}.output.labels.${key}`, 256),
+    ]));
+  }
+  if (labels && value.labelsFrom !== undefined) {
+    throw new CommandExecutorError('executor_output_invalid', `${executorId}.output 的 labels 与 labelsFrom 不能同时声明`);
+  }
+  if ((labels || value.labelsFrom !== undefined || value.totalRowsField !== undefined) && !flat && !collection) {
+    throw new CommandExecutorError('executor_output_invalid', `${executorId}.output 的表格元数据只能用于数据输出`);
+  }
+  const maxContentBytes = hasContent
+    ? positiveInteger(value.maxContentBytes, `${executorId}.output.maxContentBytes`, 1, 10 * 1024 * 1024)
+    : undefined;
+  if (!hasContent && value.maxContentBytes !== undefined) {
+    throw new CommandExecutorError('executor_output_invalid', `${executorId}.output.maxContentBytes 只能与 content 一起声明`);
   }
   return {
-    format: 'json',
-    container,
-    exposeRowFields: parseFields(value.exposeRowFields, `${executorId}.output.exposeRowFields`),
+    ...(content === undefined ? {} : { content }),
+    ...(exposeFields === undefined ? {} : { exposeFields }),
+    ...(container === undefined ? {} : { container }),
+    ...(exposeRowFields === undefined ? {} : { exposeRowFields }),
+    ...(labels === undefined ? {} : { labels }),
+    ...(value.labelsFrom === undefined ? {} : { labelsFrom: parsePath(value.labelsFrom, `${executorId}.output.labelsFrom`) }),
+    ...(value.totalRowsField === undefined ? {} : { totalRowsField: parsePath(value.totalRowsField, `${executorId}.output.totalRowsField`) }),
+    auditFields: value.auditFields === undefined
+      ? []
+      : parseFields(value.auditFields, `${executorId}.output.auditFields`),
+    ...(value.errorField === undefined ? {} : { errorField: parsePath(value.errorField, `${executorId}.output.errorField`) }),
+    ...(maxContentBytes === undefined ? {} : { maxContentBytes }),
   };
 }
 
@@ -399,9 +491,6 @@ function parseCommonPolicy(value: unknown, id: string): {
   timeoutMs: number;
 } {
   if (!isPlainObject(value)) throw new CommandExecutorError('executor_policy_invalid', `${id}.policy 必须是对象`);
-  if (value.risk !== undefined) {
-    logger.warn(`[frozen-command] ${id}.policy.risk 已废弃并被忽略；只读边界由 executor 登记人负责`);
-  }
   for (const field of ['schedulable', 'allowHandoff', 'handoffIncludesInput'] as const) {
     if (value[field] !== undefined && typeof value[field] !== 'boolean') {
       throw new CommandExecutorError('executor_policy_invalid', `${id}: ${field} 必须是布尔值`);
@@ -411,7 +500,7 @@ function parseCommonPolicy(value: unknown, id: string): {
     schedulable: value.schedulable === true,
     allowHandoff: value.allowHandoff === true,
     handoffIncludesInput: value.handoffIncludesInput === true,
-    timeoutMs: positiveInteger(value.timeoutMs, `${id}.policy.timeoutMs`, 100, 10 * 60_000),
+    timeoutMs: positiveInteger(value.timeoutMs ?? 120_000, `${id}.policy.timeoutMs`, 100, 10 * 60_000),
   };
 }
 
@@ -420,7 +509,7 @@ function parsePluginToolExecutor(
   id: string,
   index: number,
 ): PluginToolCommandExecutor {
-  onlyKeys(value, ['id', 'kind', 'plugin', 'tool', 'minimumVersion', 'contractVersion', 'arguments', 'policy', 'output'], `executors[${index}]`);
+  onlyKeys(value, ['id', 'kind', 'plugin', 'tool', 'minimumVersion', 'arguments', 'policy', 'output'], `executors[${index}]`);
   let pluginId: string;
   try {
     pluginId = assertValidPluginId(value.plugin, `${id}.plugin`);
@@ -435,16 +524,7 @@ function parsePluginToolExecutor(
   if (!STABLE_VERSION_RE.test(minimumVersion)) {
     throw new CommandExecutorError('executor_plugin_invalid', `${id}.minimumVersion 必须是稳定语义版本 x.y.z`);
   }
-  const contractVersion = value.contractVersion === undefined
-    ? undefined
-    : positiveInteger(value.contractVersion, `${id}.contractVersion`, 1, 1_000);
-  const output = value.output === undefined ? undefined : parseOutput(value.output, id);
-  if ((contractVersion === undefined) === (output === undefined)) {
-    throw new CommandExecutorError(
-      'executor_plugin_invalid',
-      `${id}: plugin-tool 必须且只能声明 contractVersion（富结果）或 output（普通 JSON 投影）`,
-    );
-  }
+  const output = parseOutput(value.output, id);
   const argumentsSchema = parseArguments(value.arguments, id, { allowLargePluginLiteral: true });
   const declaresIdentityArgument = Object.keys(argumentsSchema).some(isForbiddenPluginIdentityArgument);
   if (declaresIdentityArgument
@@ -457,15 +537,14 @@ function parsePluginToolExecutor(
   if (!isPlainObject(value.policy)) {
     throw new CommandExecutorError('executor_policy_invalid', `${id}.policy 必须是对象`);
   }
-  onlyKeys(value.policy, ['risk', 'schedulable', 'allowHandoff', 'handoffIncludesInput', 'timeoutMs'], `${id}.policy`);
+  onlyKeys(value.policy, ['schedulable', 'allowHandoff', 'handoffIncludesInput', 'timeoutMs'], `${id}.policy`);
   const normalized = {
     id,
     kind: 'plugin-tool',
     plugin: pluginId,
     tool,
     minimumVersion,
-    ...(contractVersion === undefined ? {} : { contractVersion }),
-    ...(output === undefined ? {} : { output }),
+    output,
     arguments: argumentsSchema,
     policy: parseCommonPolicy(value.policy, id),
   } satisfies Omit<PluginToolCommandExecutor, 'revision'>;
@@ -505,7 +584,7 @@ function parseProcessExecutor(
     }
   }
   if (!isPlainObject(value.policy)) throw new CommandExecutorError('executor_policy_invalid', `${id}.policy 必须是对象`);
-  onlyKeys(value.policy, ['risk', 'schedulable', 'allowHandoff', 'handoffIncludesInput', 'timeoutMs', 'maxOutputBytes'], `${id}.policy`);
+  onlyKeys(value.policy, ['schedulable', 'allowHandoff', 'handoffIncludesInput', 'timeoutMs', 'maxOutputBytes'], `${id}.policy`);
   const scriptPaths = value.scriptArtifacts ?? [];
   if (!Array.isArray(scriptPaths) || scriptPaths.length > MAX_ARTIFACTS) {
     throw new CommandExecutorError('executor_artifacts_invalid', `${id}.scriptArtifacts 最多 ${MAX_ARTIFACTS} 项`);
@@ -537,7 +616,7 @@ function parseProcessExecutor(
     scriptArtifacts,
     policy: {
       ...parseCommonPolicy(value.policy, id),
-      maxOutputBytes: positiveInteger(value.policy.maxOutputBytes, `${id}.policy.maxOutputBytes`, 1_024, 10 * 1024 * 1024),
+      maxOutputBytes: positiveInteger(value.policy.maxOutputBytes ?? 1024 * 1024, `${id}.policy.maxOutputBytes`, 1_024, 10 * 1024 * 1024),
     },
     output: parseOutput(value.output, id),
   } satisfies Omit<ProcessCommandExecutor, 'revision'>;
@@ -555,13 +634,67 @@ function parseExecutor(value: unknown, index: number): CommandExecutor {
   return parseProcessExecutor(value, id, index);
 }
 
+function parseRenderer(value: unknown, index: number): CommandRenderer {
+  if (!isPlainObject(value)) throw new CommandExecutorError('renderer_invalid', `renderers[${index}] 必须是对象`);
+  onlyKeys(value, ['id', 'executable', 'fixedArgs', 'scriptArtifacts', 'policy'], `renderers[${index}]`);
+  const id = nonBlank(value.id, `renderers[${index}].id`, 128);
+  if (!EXECUTOR_ID_RE.test(id) || id.startsWith('builtin.')) {
+    throw new CommandExecutorError('renderer_id_invalid', `非法 renderer id：${id}`);
+  }
+  if (!isPlainObject(value.executable)) throw new CommandExecutorError('renderer_path_invalid', `${id}.executable 必须是对象`);
+  onlyKeys(value.executable, ['realpath'], `${id}.executable`);
+  const executable = assertCanonicalRegularFile(
+    nonBlank(value.executable.realpath, `${id}.executable.realpath`, 4_096),
+    `${id}.executable.realpath`,
+    undefined,
+    false,
+  );
+  if (!Array.isArray(value.fixedArgs) || value.fixedArgs.length > 64) {
+    throw new CommandExecutorError('renderer_invalid_fixed_args', `${id}.fixedArgs 必须是最多 64 项的数组`);
+  }
+  const fixedArgs = value.fixedArgs.map((arg, argIndex) => nonBlank(arg, `${id}.fixedArgs[${argIndex}]`, 4_096));
+  const scriptPaths = value.scriptArtifacts ?? [];
+  if (!Array.isArray(scriptPaths) || scriptPaths.length === 0 || scriptPaths.length > MAX_ARTIFACTS) {
+    throw new CommandExecutorError('renderer_artifacts_invalid', `${id}.scriptArtifacts 必须有 1-${MAX_ARTIFACTS} 项`);
+  }
+  const scriptArtifacts = scriptPaths.map((path, artifactIndex) => {
+    const artifact = assertCanonicalRegularFile(
+      nonBlank(path, `${id}.scriptArtifacts[${artifactIndex}]`, 4_096),
+      `${id}.scriptArtifacts[${artifactIndex}]`,
+      MAX_ARTIFACT_BYTES,
+    );
+    return { realpath: artifact.realpath, sha256: sha256(artifact.bytes), size: artifact.bytes.length };
+  });
+  if (new Set(scriptArtifacts.map(item => item.realpath)).size !== scriptArtifacts.length) {
+    throw new CommandExecutorError('renderer_artifacts_invalid', `${id}.scriptArtifacts 禁止重复`);
+  }
+  const fixedPaths = new Set(fixedArgs.filter(isAbsolute).map(path => resolve(path)));
+  if (!scriptArtifacts.some(item => fixedPaths.has(item.realpath))) {
+    throw new CommandExecutorError('renderer_entry_artifact_missing', `${id}: fixedArgs 中的入口脚本必须声明在 scriptArtifacts`);
+  }
+  if (!isPlainObject(value.policy)) throw new CommandExecutorError('renderer_policy_invalid', `${id}.policy 必须是对象`);
+  onlyKeys(value.policy, ['timeoutMs', 'maxInputBytes', 'maxOutputBytes'], `${id}.policy`);
+  const normalized = {
+    id,
+    executable: { realpath: executable.realpath },
+    fixedArgs,
+    scriptArtifacts,
+    policy: {
+      timeoutMs: positiveInteger(value.policy.timeoutMs, `${id}.policy.timeoutMs`, 100, 10 * 60_000),
+      maxInputBytes: positiveInteger(value.policy.maxInputBytes, `${id}.policy.maxInputBytes`, 1_024, 10 * 1024 * 1024),
+      maxOutputBytes: positiveInteger(value.policy.maxOutputBytes, `${id}.policy.maxOutputBytes`, 1_024, 10 * 1024 * 1024),
+    },
+  } satisfies Omit<CommandRenderer, 'revision'>;
+  return { ...normalized, revision: sha256(canonicalJson(normalized)) };
+}
+
 export function commandExecutorRegistryPath(): string {
   return process.env.BOTMUX_COMMAND_EXECUTORS_FILE || join(homedir(), '.botmux', 'command-executors.yaml');
 }
 
 export function loadCommandExecutorRegistry(filePath = commandExecutorRegistryPath()): CommandExecutorRegistry {
   if (!existsSync(filePath)) {
-    return { filePath, executors: new Map(), aliases: new Map() };
+    return { filePath, executors: new Map(), renderers: new Map() };
   }
   const stat = lstatSync(filePath);
   if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 1024 * 1024) {
@@ -574,9 +707,9 @@ export function loadCommandExecutorRegistry(filePath = commandExecutorRegistryPa
     throw new CommandExecutorError('executor_registry_yaml_invalid', `执行器白名单 YAML 解析失败：${error instanceof Error ? error.message : String(error)}`);
   }
   if (!isPlainObject(parsed)) throw new CommandExecutorError('executor_registry_invalid', '执行器白名单必须是对象');
-  onlyKeys(parsed, ['schemaVersion', 'executors', 'aliases'], 'executor registry');
-  if (parsed.schemaVersion !== 1 && parsed.schemaVersion !== 2) {
-    throw new CommandExecutorError('executor_registry_version_unsupported', '执行器白名单 schemaVersion 必须是 1 或 2');
+  onlyKeys(parsed, ['schemaVersion', 'executors', 'renderers'], 'executor registry');
+  if (parsed.schemaVersion !== 2) {
+    throw new CommandExecutorError('executor_registry_version_unsupported', '执行器白名单仅支持 schemaVersion=2');
   }
   if (!Array.isArray(parsed.executors) || parsed.executors.length > MAX_EXECUTORS) {
     throw new CommandExecutorError('executor_registry_invalid', `executors 必须是最多 ${MAX_EXECUTORS} 项的数组`);
@@ -585,30 +718,33 @@ export function loadCommandExecutorRegistry(filePath = commandExecutorRegistryPa
   if (new Set(items.map(item => item.id)).size !== items.length) {
     throw new CommandExecutorError('executor_registry_duplicate', 'executor id 不能重复');
   }
-  const aliasesValue = parsed.aliases ?? {};
-  if (!isPlainObject(aliasesValue) || Object.keys(aliasesValue).length > MAX_EXECUTORS) {
-    throw new CommandExecutorError('executor_registry_invalid', `aliases 必须是最多 ${MAX_EXECUTORS} 项的对象`);
+  const rendererValues = parsed.renderers ?? [];
+  if (!Array.isArray(rendererValues) || rendererValues.length > MAX_EXECUTORS) {
+    throw new CommandExecutorError('executor_registry_invalid', `renderers 必须是最多 ${MAX_EXECUTORS} 项的数组`);
   }
-  const aliases = new Map(Object.entries(aliasesValue).map(([alias, target]) => {
-    if (!EXECUTOR_ID_RE.test(alias) || typeof target !== 'string' || !EXECUTOR_ID_RE.test(target)) {
-      throw new CommandExecutorError('executor_alias_invalid', `非法 executor alias：${alias}`);
-    }
-    if (!items.some(item => item.id === target)) {
-      throw new CommandExecutorError('executor_alias_invalid', `${alias} 指向不存在的 executor：${target}`);
-    }
-    return [alias, target];
-  }));
-  if ([...aliases.keys()].some(alias => items.some(item => item.id === alias))) {
-    throw new CommandExecutorError('executor_alias_invalid', 'executor alias 不能与 executor id 重名');
+  const renderers = rendererValues.map(parseRenderer);
+  if (new Set(renderers.map(item => item.id)).size !== renderers.length) {
+    throw new CommandExecutorError('renderer_registry_duplicate', 'renderer id 不能重复');
   }
-  return { filePath: realpathSync(filePath), executors: new Map(items.map(item => [item.id, item])), aliases };
+  return {
+    filePath: realpathSync(filePath),
+    executors: new Map(items.map(item => [item.id, item])),
+    renderers: new Map(renderers.map(item => [item.id, item])),
+  };
 }
 
 export function resolveCommandExecutor(executorId: string): CommandExecutor {
   const registry = loadCommandExecutorRegistry();
-  const executor = registry.executors.get(registry.aliases.get(executorId) ?? executorId);
+  const executor = registry.executors.get(executorId);
   if (!executor) throw new CommandExecutorError('executor_not_found', `执行器白名单中不存在：${executorId}`);
   return executor;
+}
+
+export function resolveCommandRenderer(rendererId: string): CommandRenderer | 'builtin.table' | 'builtin.content' {
+  if (rendererId === 'builtin.table' || rendererId === 'builtin.content') return rendererId;
+  const renderer = loadCommandExecutorRegistry().renderers.get(rendererId);
+  if (!renderer) throw new CommandExecutorError('renderer_not_found', `渲染器白名单中不存在：${rendererId}`);
+  return renderer;
 }
 
 export function isPluginToolCommandExecutor(executor: CommandExecutor): executor is PluginToolCommandExecutor {
@@ -755,7 +891,7 @@ export function projectCommandExecutorOutput(
 ): Record<string, unknown> {
   if (!isPlainObject(parsed)) throw new CommandExecutorError('executor_output_invalid', '执行器 stdout 必须是 JSON 对象');
   safeJsonDepth(parsed);
-  if ('exposeFields' in output) {
+  if (output.exposeFields) {
     const projected: Record<string, unknown> = {};
     for (const field of output.exposeFields) {
       assignProjectedPath(
@@ -766,18 +902,18 @@ export function projectCommandExecutorOutput(
     }
     return projected;
   }
-  const collectionOutput = output as Extract<CommandExecutorOutput, { container: string }>;
+  if (!output.container || !output.exposeRowFields) return {};
   const rawRows = projectedPathValue(
     parsed,
-    collectionOutput.container,
-    `执行器输出缺少容器：${collectionOutput.container}`,
+    output.container,
+    `执行器输出缺少容器：${output.container}`,
   );
   if (!Array.isArray(rawRows) || rawRows.length > MAX_PROJECTED_ROWS || rawRows.some(row => !isPlainObject(row))) {
-    throw new CommandExecutorError('executor_output_container_invalid', `执行器输出 ${collectionOutput.container} 必须是最多 ${MAX_PROJECTED_ROWS} 项的对象数组`);
+    throw new CommandExecutorError('executor_output_container_invalid', `执行器输出 ${output.container} 必须是最多 ${MAX_PROJECTED_ROWS} 项的对象数组`);
   }
   const rows = rawRows.map((row, index) => {
     const projected: Record<string, unknown> = {};
-    for (const field of collectionOutput.exposeRowFields) {
+    for (const field of output.exposeRowFields!) {
       assignProjectedPath(
         projected,
         field,
@@ -787,8 +923,81 @@ export function projectCommandExecutorOutput(
     return projected;
   });
   const projected: Record<string, unknown> = {};
-  assignProjectedPath(projected, collectionOutput.container, rows);
+  assignProjectedPath(projected, output.container, rows);
   return projected;
+}
+
+function optionalProjectedPath(value: Record<string, unknown>, path: string): unknown {
+  try {
+    return projectedPathValue(value, path, `执行器输出缺少字段：${path}`);
+  } catch (error) {
+    if (error instanceof CommandExecutorError && error.code === 'executor_output_field_missing') return undefined;
+    throw error;
+  }
+}
+
+export function materializeCommandExecutorOutput(
+  output: CommandExecutorOutput,
+  raw: unknown,
+): CommandExecutorOutputResult {
+  if (output.content === 'markdown') {
+    if (typeof raw !== 'string') throw new CommandExecutorError('executor_output_invalid', 'content: markdown 要求执行器输出 UTF-8 文本');
+    const bytes = Buffer.byteLength(raw, 'utf8');
+    if (bytes > output.maxContentBytes!) throw new CommandExecutorError('executor_content_limit', '执行器内容超过 maxContentBytes');
+    return { projected: {}, rows: [], columns: [], totalRows: 0, content: raw, audit: {} };
+  }
+  if (!isPlainObject(raw)) throw new CommandExecutorError('executor_output_invalid', '执行器输出必须是 JSON 对象');
+  safeJsonDepth(raw);
+  const projected = projectCommandExecutorOutput(output, raw);
+  const rows = output.container
+    ? (projectedPathValue(projected, output.container, `执行器输出缺少容器：${output.container}`) as Array<Record<string, unknown>>)
+    : output.exposeFields
+      ? [projected]
+      : [];
+  let labels = output.labels ?? {};
+  if (output.labelsFrom) {
+    const rawLabels = projectedPathValue(raw, output.labelsFrom, `执行器输出缺少字段：${output.labelsFrom}`);
+    if (!Array.isArray(rawLabels) || rawLabels.length > MAX_PROJECTED_FIELDS) {
+      throw new CommandExecutorError('executor_output_invalid', `${output.labelsFrom} 必须是列说明数组`);
+    }
+    labels = Object.fromEntries(rawLabels.map((item, index) => {
+      if (!isPlainObject(item) || typeof item.name !== 'string' || !item.name
+        || typeof item.description !== 'string' || item.description.length > 256) {
+        throw new CommandExecutorError('executor_output_invalid', `${output.labelsFrom}[${index}] 必须包含 name 和 description`);
+      }
+      return [item.name, item.description];
+    }));
+  }
+  const keys = output.container ? output.exposeRowFields! : output.exposeFields ?? [];
+  const columns = keys.map(key => ({ key, label: labels[key] ?? key }));
+  const rawTotalRows = output.totalRowsField ? projectedPathValue(raw, output.totalRowsField, `执行器输出缺少字段：${output.totalRowsField}`) : rows.length;
+  if (!Number.isSafeInteger(rawTotalRows) || (rawTotalRows as number) < rows.length) {
+    throw new CommandExecutorError('executor_output_invalid', '执行器输出总行数不合法');
+  }
+  if (output.totalRowsField) assignProjectedPath(projected, output.totalRowsField, rawTotalRows);
+  const audit = Object.fromEntries(output.auditFields.map(path => [path, projectedPathValue(raw, path, `执行器输出缺少字段：${path}`)]));
+  const rawError = output.errorField ? optionalProjectedPath(raw, output.errorField) : undefined;
+  if (rawError !== undefined && rawError !== null && typeof rawError !== 'string') {
+    throw new CommandExecutorError('executor_output_invalid', `${output.errorField} 必须是字符串或 null`);
+  }
+  let content: string | undefined;
+  if (output.content) {
+    const rawContent = projectedPathValue(raw, output.content, `执行器输出缺少字段：${output.content}`);
+    if (typeof rawContent !== 'string') throw new CommandExecutorError('executor_output_invalid', `${output.content} 必须是字符串`);
+    if (Buffer.byteLength(rawContent, 'utf8') > output.maxContentBytes!) {
+      throw new CommandExecutorError('executor_content_limit', '执行器内容超过 maxContentBytes');
+    }
+    content = rawContent;
+  }
+  return {
+    projected,
+    rows,
+    columns,
+    totalRows: rawTotalRows as number,
+    ...(content === undefined ? {} : { content }),
+    audit,
+    ...(typeof rawError === 'string' && rawError ? { errorCode: rawError } : {}),
+  };
 }
 
 function terminateProcessGroup(child: ChildProcess): void {
@@ -885,18 +1094,21 @@ export async function runProcessCommandExecutor(input: {
         } catch (error) {
           return finishError(new CommandExecutorError('executor_output_encoding', '执行器 stdout 不是有效 UTF-8', { cause: error }));
         }
-        let parsed: unknown;
-        try { parsed = JSON.parse(text); } catch (error) {
-          return finishError(new CommandExecutorError('executor_output_json', '执行器 stdout 不是有效 JSON', { cause: error }));
-        }
         try {
-          const projected = projectCommandExecutorOutput(input.executor.output, parsed);
+          let raw: unknown = text;
+          if (input.executor.output.content !== 'markdown') {
+            try { raw = JSON.parse(text); } catch (error) {
+              return finishError(new CommandExecutorError('executor_output_json', '执行器 stdout 不是有效 JSON', { cause: error }));
+            }
+          }
+          const output = materializeCommandExecutorOutput(input.executor.output, raw);
           settled = true;
           resolvePromise({
             executorId: input.executor.id,
             executorRevision: input.executor.revision,
             executionId,
-            projected,
+            projected: output.projected,
+            output,
             stdoutBytes,
             truncated: false,
             exitCode: exitCode ?? 0,
@@ -909,6 +1121,97 @@ export async function runProcessCommandExecutor(input: {
             : new CommandExecutorError('executor_output_invalid', error instanceof Error ? error.message : String(error)));
         }
       });
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}
+
+export function verifyCommandRendererArtifacts(renderer: CommandRenderer): void {
+  for (const expected of renderer.scriptArtifacts) {
+    const actual = assertCanonicalRegularFile(expected.realpath, `${renderer.id}.scriptArtifacts`, MAX_ARTIFACT_BYTES);
+    if (actual.bytes.length !== expected.size || sha256(actual.bytes) !== expected.sha256) {
+      throw new CommandExecutorError('renderer_artifact_changed', `渲染器 ${renderer.id} 的脚本制品已变化，必须重新确认依赖命令`);
+    }
+  }
+}
+
+export async function runCommandRenderer(input: {
+  renderer: CommandRenderer;
+  payload: unknown;
+  workingDir?: string;
+}): Promise<CommandRendererResult> {
+  verifyCommandRendererArtifacts(input.renderer);
+  const stdin = Buffer.from(JSON.stringify(input.payload), 'utf8');
+  if (stdin.length > input.renderer.policy.maxInputBytes) {
+    throw new CommandExecutorError('renderer_input_limit', `渲染器 ${input.renderer.id} 输入超过上限`);
+  }
+  const startedAt = Date.now();
+  const home = mkdtempSync(join(tmpdir(), 'botmux-renderer-'));
+  try {
+    return await new Promise<CommandRendererResult>((resolvePromise, rejectPromise) => {
+      const stdout: Buffer[] = [];
+      let stdoutBytes = 0;
+      let terminalError: CommandExecutorError | undefined;
+      let settled = false;
+      const child = spawn(input.renderer.executable.realpath, input.renderer.fixedArgs, {
+        cwd: input.workingDir || process.cwd(),
+        env: {
+          HOME: home,
+          TMPDIR: home,
+          PATH: '/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin',
+          LANG: 'C.UTF-8',
+          LC_ALL: 'C.UTF-8',
+        },
+        shell: false,
+        detached: process.platform !== 'win32',
+        stdio: ['pipe', 'pipe', 'pipe'],
+      });
+      const fail = (error: CommandExecutorError): void => {
+        if (settled) return;
+        settled = true;
+        rejectPromise(error);
+      };
+      const timer = setTimeout(() => {
+        terminalError = new CommandExecutorError('renderer_timeout', `渲染器 ${input.renderer.id} 超时`);
+        terminateProcessGroup(child);
+      }, input.renderer.policy.timeoutMs);
+      timer.unref?.();
+      child.stdout?.on('data', (chunk: Buffer | string) => {
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        stdoutBytes += buffer.length;
+        if (stdoutBytes > input.renderer.policy.maxOutputBytes) {
+          terminalError = new CommandExecutorError('renderer_output_limit', `渲染器 ${input.renderer.id} 输出超过上限`);
+          terminateProcessGroup(child);
+          return;
+        }
+        stdout.push(buffer);
+      });
+      child.stderr?.resume();
+      child.on('error', error => {
+        clearTimeout(timer);
+        fail(new CommandExecutorError('renderer_spawn_failed', `渲染器 ${input.renderer.id} 启动失败`, { cause: error }));
+      });
+      child.on('close', exitCode => {
+        clearTimeout(timer);
+        if (settled) return;
+        if (terminalError) return fail(terminalError);
+        if (exitCode !== 0) return fail(new CommandExecutorError('renderer_non_zero_exit', `渲染器 ${input.renderer.id} 退出码 ${String(exitCode)}`));
+        try {
+          const markdown = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(stdout));
+          settled = true;
+          resolvePromise({
+            rendererId: input.renderer.id,
+            rendererRevision: input.renderer.revision,
+            markdown,
+            stdoutBytes,
+            durationMs: Date.now() - startedAt,
+          });
+        } catch (error) {
+          fail(new CommandExecutorError('renderer_output_encoding', '渲染器 stdout 不是有效 UTF-8', { cause: error }));
+        }
+      });
+      child.stdin?.end(stdin);
     });
   } finally {
     rmSync(home, { recursive: true, force: true });

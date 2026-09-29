@@ -58,10 +58,10 @@ describe('Frozen Command business cards', () => {
 
     const rendered = renderFrozenCommandLarkReply({
       schemaVersion: 1,
-      format: 'table',
+      format: 'markdown',
       fallbackText: 'fallback',
       blocks: [
-        { type: 'markdown', markdown: '**经营日报** <script>alert(1)</script>' },
+        { type: 'markdown', markdown: '**经营日报**' },
         {
           type: 'table',
           columns: [{ key: 'merchant', label: '商户' }, { key: 'amount', label: '金额' }],
@@ -75,7 +75,12 @@ describe('Frozen Command business cards', () => {
     const parsed = JSON.parse(rendered.content) as any;
     expect(parsed.schema).toBe('2.0');
     expect(parsed.body.elements.some((element: any) => element.tag === 'table')).toBe(true);
-    expect(rendered.content).not.toContain('<script>');
+    expect(() => renderFrozenCommandLarkReply({
+      schemaVersion: 1,
+      format: 'markdown',
+      fallbackText: 'fallback',
+      blocks: [{ type: 'markdown', markdown: '<script>alert(1)</script>' }],
+    })).toThrowError(/原始 HTML/);
   });
 
   it('neutralizes nested mention/link injection and falls back when a card exceeds the byte budget', () => {
@@ -91,7 +96,7 @@ describe('Frozen Command business cards', () => {
 
     const table = renderFrozenCommandLarkReply({
       schemaVersion: 1,
-      format: 'table',
+      format: 'markdown',
       fallbackText: '安全回退',
       blocks: [{
         type: 'table',
@@ -108,7 +113,7 @@ describe('Frozen Command business cards', () => {
 
     const oversized = renderFrozenCommandLarkReply({
       schemaVersion: 1,
-      format: 'table',
+      format: 'markdown',
       fallbackText: '已降级',
       blocks: [{
         type: 'table',

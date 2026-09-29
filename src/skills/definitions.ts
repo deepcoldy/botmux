@@ -213,7 +213,6 @@ status: active
 name: 每日报告
 description: 获取最近 N 天的只读报告
 timezone: Asia/Shanghai
-executor: reporting.readonly
 params:
   - name: days
     label: 天数
@@ -221,12 +220,18 @@ params:
     min: 1
     max: 90
     default: 7
-input:
-  days: "{{days}}"
+steps:
+  - id: main
+    executor: reporting.readonly
+    input:
+      days: "{{days}}"
+    renderer: builtin.table
 output:
-  format: table
-  prefix: "近 N 天报告：\\n"
-  maxChars: 20000
+  format: markdown
+  rules:
+    - when: "{{q.main.row_count}} == 0"
+      show: { text: "近 {{cmd.args.days}} 天没有数据" }
+    - show: result
 \`\`\`
 
 支持的参数类型：
@@ -236,11 +241,11 @@ output:
 - \`enum\`：必须列出 values，可有 default；字符串由执行器按自身契约编码。
 - \`date\`：值为 \`YYYY-MM-DD\` 或定义期默认 \`today±N\`。
 
-参数按 YAML 中的顺序映射到位置参数，因此上例用法是 \`/每日报告 [天数]\`，调用示例为 \`/每日报告 30\`，不是 \`days=30\`。
+参数按 YAML 中的顺序映射到位置参数，因此上例用法是 \`/每日报告 [天数]\`，调用示例为 \`/每日报告 30\`，不是 \`days=30\`。当前阶段只允许一个 step，但必须使用最终形态的 \`steps[]\`；\`id\`、\`executor\`、\`input\`、\`renderer\` 都必填。
 
-\`output.format\` 支持 \`text\`（默认）、\`markdown\`、\`table\`、\`auto\`。中间展示块只允许 markdown/table；\`format: text\` 仍发送安全转义后的纯文本消息，其余格式由飞书卡片或 Web 展示层分别安全渲染。不要使用原始 HTML。
+\`output.format\` 只支持 \`markdown\`（默认）和 \`text\`。executor 只返回白名单投影后的数据或 content，renderer 再生成 Markdown；数据类执行器使用 \`builtin.table\` 或登记的 renderer，content 类执行器只能使用 \`builtin.content\`。不要使用原始 HTML。
 
-只有需要按结果选择展示或模型分析时才配置有序的 \`output.rules\`；第一条命中规则生效，每条规则必须且只能写 \`handoff\` 或 \`show\`。\`show: result\` 展示原结果，\`show: { text, format }\` 展示模板文字；没有规则或全部未命中时按 \`output.format\` 展示。条件可使用 \`q.*\`、\`run.*\` 与 \`cmd.*\`，handoff 能否执行仍受管理员白名单的 \`allowHandoff\` 限制。不要为新命令写 \`onError: fallback_llm\` 或 \`else\`。
+只有需要按结果选择展示或模型分析时才配置有序的 \`output.rules\`；第一条命中规则生效，每条规则必须且只能写 \`handoff\` 或 \`show\`。\`show: result\` 展示原结果，\`show: { text }\` 展示模板文字；没有规则或全部未命中时展示 renderer 结果。条件只能使用 \`q.<step-id>.*\`、\`run.status\`、\`run.<step-id>.*\` 与 \`cmd.*\`，handoff 能否执行仍受管理员白名单的 \`allowHandoff\` 限制。顶层 \`executor/input\`、\`output.text\`、\`prefix/suffix\`、\`else\`、\`onError\`、\`format: table|auto\` 都是旧协议，宿主会直接拒绝，不得生成。
 
 ## 安装步骤
 

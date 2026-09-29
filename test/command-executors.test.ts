@@ -60,8 +60,8 @@ executors:
       maxOutputBytes: 65536
     output:
 ${output === 'rows'
-    ? '      format: json\n      container: rows\n      exposeRowFields: [city, safe]'
-    : '      format: json\n      exposeFields: [value]'}
+    ? '      container: rows\n      exposeRowFields: [city, safe]'
+    : '      exposeFields: [value]'}
 `);
   const commandRoot = join(root, 'repo');
   mkdirSync(join(commandRoot, '.botmux', 'commands'), { recursive: true });
@@ -69,17 +69,19 @@ ${output === 'rows'
 schemaVersion: 2
 name: 回显
 description: 回显测试
-executor: test.echo
 params:
   - name: word
     type: string
     maxLength: 50
     pattern: "^[A-Za-z ]+$"
-input:
-  value: "{{word}}"
+steps:
+  - id: main
+    executor: test.echo
+    input:
+      value: "{{word}}"
+    renderer: builtin.table
 output:
-  text: "结果：{{result.value}}"
-onError: fail
+  format: text
 `);
   return { root, script, registry, commandRoot };
 }
@@ -100,13 +102,14 @@ executors:
     plugin: fixture-plugin
     tool: render_report
     minimumVersion: 1.2.3
-    contractVersion: 1
     arguments:
       report:
         type: string
         required: true
         maxLength: 100
         accepts: [literal]
+    output:
+      exposeFields: [report]
     policy:
       schedulable: true
       allowHandoff: false
@@ -135,7 +138,7 @@ executors:
     const fixture = setup();
     for (const locale of ['zh', 'en']) {
       const documentation = readFileSync(resolve(`docs-site/docs/${locale}/frozen-commands.md`), 'utf8');
-      const example = /```yaml\n(schemaVersion: 2\naliases:\n  builtin\.data-mcp\.readonly:[\s\S]*?)\n```/u.exec(documentation)?.[1];
+      const example = /```yaml\n(schemaVersion: 2\nexecutors:\n  - id: data\.query\.readonly[\s\S]*?)\n\nrenderers:/u.exec(documentation)?.[1];
       if (!example) throw new Error(`missing Data MCP registry example in ${locale} documentation`);
       writeFileSync(fixture.registry, example);
       expect(loadCommandExecutorRegistry(fixture.registry).executors.get('data.query.readonly'))
@@ -156,13 +159,14 @@ executors:
     plugin: fixture-plugin
     tool: render_report
     minimumVersion: 1.0.0
-    contractVersion: 1
     arguments:
       report:
         type: string
         required: true
         maxLength: ${maxLength}
         accepts: ${accepts}
+    output:
+      exposeFields: [report]
     policy:
       timeoutMs: 5000
 `;
@@ -172,11 +176,11 @@ executors:
     const lookup = lookupFrozenCommand({ workingDir: fixture.commandRoot, command: '/回显' });
     if (lookup.kind !== 'found') throw new Error(`unexpected lookup: ${lookup.kind}`);
     const definition = structuredClone(lookup.snapshot.definition);
-    definition.executor = executor.id;
+    definition.steps[0]!.executor = executor.id;
     definition.params = [];
-    definition.input = { report: 'x'.repeat(200_000) };
+    definition.steps[0]!.input = { report: 'x'.repeat(200_000) };
     expect(() => assertFrozenCommandExecutorContract(definition, executor)).not.toThrow();
-    definition.input.report = 'x'.repeat(200_001);
+    definition.steps[0]!.input.report = 'x'.repeat(200_001);
     expect(() => assertFrozenCommandExecutorContract(definition, executor)).toThrowError(/长度上限 200000/);
 
     writeFileSync(fixture.registry, pluginRegistry(200_001, '[literal]'));
@@ -195,7 +199,7 @@ executors:
     expect(() => loadCommandExecutorRegistry(processFixture.registry)).toThrowError(/1-10000/);
   });
 
-  it('supports registry aliases, ordinary JSON tools, and conservative policy defaults', () => {
+  it('rejects removed registry aliases and keeps conservative policy defaults', () => {
     const fixture = setup();
     writeFileSync(fixture.registry, `
 schemaVersion: 2
@@ -216,16 +220,17 @@ executors:
     policy:
       timeoutMs: 5000
     output:
-      format: json
       container: rows
       exposeRowFields: [name, total]
 `);
+    expect(() => loadCommandExecutorRegistry(fixture.registry)).toThrowError(/未知字段：aliases/);
+    writeFileSync(fixture.registry, readFileSync(fixture.registry, 'utf8')
+      .replace('aliases:\n  builtin.legacy.readonly: test.plugin.json\n', ''));
     const registry = loadCommandExecutorRegistry(fixture.registry);
-    expect(registry.aliases.get('builtin.legacy.readonly')).toBe('test.plugin.json');
     const executor = registry.executors.get('test.plugin.json')!;
     expect(executor).toMatchObject({
       kind: 'plugin-tool',
-      output: { format: 'json', container: 'rows', exposeRowFields: ['name', 'total'] },
+      output: { container: 'rows', exposeRowFields: ['name', 'total'] },
       policy: { schedulable: false, allowHandoff: false, handoffIncludesInput: false },
     });
   });
@@ -240,13 +245,14 @@ executors:
     plugin: fixture-plugin
     tool: render_report
     minimumVersion: 1.0.0
-    contractVersion: 1
     arguments:
       caller:
         type: string
         required: true
         maxLength: 100
         accepts: ["context:caller.open_id"]
+    output:
+      exposeFields: [result]
     policy:
       schedulable: true
       allowHandoff: false
@@ -273,13 +279,14 @@ executors:
     plugin: fixture-plugin
     tool: render_report
     minimumVersion: 1.0.0
-    contractVersion: 1
     arguments:
       ${identityName}:
         type: string
         required: false
         maxLength: 100
         accepts: [literal]
+    output:
+      exposeFields: [result]
     policy:
       timeoutMs: 5000
 `);
@@ -294,13 +301,14 @@ executors:
     plugin: fixture-plugin
     tool: render_report
     minimumVersion: 1.0.0
-    contractVersion: 1
     arguments:
       request_user_union_id:
         type: string
         required: true
         maxLength: 100
         accepts: [literal]
+    output:
+      exposeFields: [result]
     policy:
       schedulable: true
       allowHandoff: false
@@ -340,11 +348,11 @@ executors:
     const clone = () => structuredClone(base);
 
     const unknown = clone();
-    unknown.input.other = 'literal';
+    unknown.steps[0]!.input.other = 'literal';
     expect(() => assertFrozenCommandExecutorContract(unknown, executor)).toThrowError(/不接受 input/);
 
     const missing = clone();
-    delete missing.input.value;
+    delete missing.steps[0]!.input.value;
     expect(() => assertFrozenCommandExecutorContract(missing, executor)).toThrowError(/缺少 required input/);
 
     const type = clone();
@@ -357,14 +365,14 @@ executors:
     expect(() => assertFrozenCommandExecutorContract(source, literalOnly)).toThrowError(/不接受 param 来源/);
 
     const contextSource = clone();
-    contextSource.input.value = '{{caller.open_id}}';
+    contextSource.steps[0]!.input.value = '{{caller.open_id}}';
     const paramOnly = structuredClone(executor);
     paramOnly.arguments.value!.accepts = ['param'];
     expect(() => assertFrozenCommandExecutorContract(contextSource, paramOnly))
       .toThrowError(/不接受 context:caller\.open_id 来源/);
 
     const literalSource = clone();
-    literalSource.input.value = 'literal';
+    literalSource.steps[0]!.input.value = 'literal';
     expect(() => assertFrozenCommandExecutorContract(literalSource, executor))
       .toThrowError(/不接受 literal 来源/);
 
@@ -377,7 +385,7 @@ executors:
     expect(() => assertFrozenCommandExecutorContract(pattern, executor)).toThrowError(/pattern 必须与执行器一致/);
 
     const integerDefinition = clone();
-    integerDefinition.input.value = '{{days}}';
+    integerDefinition.steps[0]!.input.value = '{{days}}';
     integerDefinition.params = [{ name: 'days', type: 'integer', min: 1, max: 100 }];
     const integerExecutor = structuredClone(executor);
     integerExecutor.arguments.value = {
@@ -387,7 +395,7 @@ executors:
       .toThrowError(/范围 1-100 超出执行器 1-32/);
 
     const enumDefinition = clone();
-    enumDefinition.input.value = '{{mode}}';
+    enumDefinition.steps[0]!.input.value = '{{mode}}';
     enumDefinition.params = [{ name: 'mode', type: 'enum', values: ['safe', 'unsafe'] }];
     const enumExecutor = structuredClone(executor);
     enumExecutor.arguments.value = {
@@ -445,14 +453,14 @@ executors:
       ),
     );
     expect(() => loadCommandExecutorRegistry(fixture.registry))
-      .toThrowError(/必须且只能选择 exposeFields 或 container\+exposeRowFields/);
+      .toThrowError(/不能同时声明 exposeFields 和 container/);
   });
 
   it('projects nested fields without exposing their sibling values', async () => {
     const fixture = setup();
     writeFileSync(fixture.script, `console.log(JSON.stringify({ data: { user: { name: 'Visible', secret: 'hidden' } } }));\n`);
     writeFileSync(fixture.registry, `
-schemaVersion: 1
+schemaVersion: 2
 executors:
   - id: test.nested
     kind: script
@@ -461,13 +469,11 @@ executors:
     scriptArtifacts: [${JSON.stringify(fixture.script)}]
     arguments: {}
     policy:
-      risk: read
       schedulable: false
       allowHandoff: false
       timeoutMs: 5000
       maxOutputBytes: 65536
     output:
-      format: json
       exposeFields: [data.user.name]
 `);
     const executor = loadCommandExecutorRegistry(fixture.registry).executors.get('test.nested')!;
@@ -486,7 +492,7 @@ executors:
     const fakeLarkCli = join(fixture.root, 'lark-cli');
     writeFileSync(fakeLarkCli, '#!/bin/sh\n');
     writeFileSync(fixture.registry, `
-schemaVersion: 1
+schemaVersion: 2
 executors:
   - id: test.lark
     kind: process
@@ -494,13 +500,11 @@ executors:
     fixedArgs: [contact, search]
     arguments: {}
     policy:
-      risk: read
       schedulable: false
       allowHandoff: false
       timeoutMs: 5000
       maxOutputBytes: 65536
     output:
-      format: json
       exposeFields: [name]
 `);
     expect(() => loadCommandExecutorRegistry(fixture.registry)).toThrowError(/--as bot/);
@@ -515,7 +519,7 @@ printf '{"app":"%s","home":"%s","has_secret":%s}\n' "$LARKSUITE_CLI_APP_ID" "$HO
 `);
     chmodSync(fakeLarkCli, 0o700);
     writeFileSync(fixture.registry, `
-schemaVersion: 1
+schemaVersion: 2
 executors:
   - id: test.lark
     kind: process
@@ -523,13 +527,11 @@ executors:
     fixedArgs: [contact, search, --as, bot]
     arguments: {}
     policy:
-      risk: read
       schedulable: false
       allowHandoff: false
       timeoutMs: 5000
       maxOutputBytes: 65536
     output:
-      format: json
       exposeFields: [app, home, has_secret]
 `);
     const executor = loadCommandExecutorRegistry(fixture.registry).executors.get('test.lark')!;
@@ -584,7 +586,7 @@ setInterval(() => {}, 1000);
     const executable = join(fixture.root, 'tool-bin');
     writeFileSync(executable, 'version-one');
     writeFileSync(fixture.registry, `
-schemaVersion: 1
+schemaVersion: 2
 executors:
   - id: test.binary
     kind: process
@@ -592,13 +594,11 @@ executors:
     fixedArgs: [read]
     arguments: {}
     policy:
-      risk: read
       schedulable: false
       allowHandoff: false
       timeoutMs: 5000
       maxOutputBytes: 65536
     output:
-      format: json
       exposeFields: [value]
 `);
     const before = loadCommandExecutorRegistry(fixture.registry).executors.get('test.binary')!;
@@ -663,7 +663,7 @@ executors:
       dataDir: join(fixture.root, 'data'),
       workingDir: fixture.commandRoot,
     });
-    expect(result.text).toBe('结果：hello');
+    expect(result.text).toBe('value：hello');
     expect(result.executorId).toBe('test.echo');
     expect(result.executorRevision).toMatch(/^[a-f0-9]{64}$/);
   });
@@ -696,7 +696,7 @@ executors:
       },
       audit: { source: 'schedule', taskId: 'task_executor' },
     });
-    expect(result.text).toBe('结果：scheduled');
+    expect(result.text).toBe('value：scheduled');
   });
 
   it('rejects caller context that disagrees with the trusted caller identity', async () => {
@@ -706,12 +706,14 @@ executors:
 schemaVersion: 2
 name: 回显
 description: 身份测试
-executor: test.echo
-input:
-  value: "{{caller.open_id}}"
+steps:
+  - id: main
+    executor: test.echo
+    input:
+      value: "{{caller.open_id}}"
+    renderer: builtin.table
 output:
-  text: "结果：{{result.value}}"
-onError: fail
+  format: text
 `);
     const lookup = lookupFrozenCommand({ workingDir: fixture.commandRoot, command: '/回显' });
     if (lookup.kind !== 'found') throw new Error(`unexpected lookup: ${lookup.kind}`);

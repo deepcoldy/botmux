@@ -21,19 +21,20 @@ const ACTIVE = `
 schemaVersion: 2
 name: 生命周期测试
 description: 生命周期测试命令
-executor: test.plugin.readonly
 params:
   - name: value
     type: integer
     min: 1
     max: 90
     default: 7
-input:
-  sql: SELECT {{value}} AS probe_value
+steps:
+  - id: main
+    executor: test.plugin.readonly
+    input:
+      sql: SELECT {{value}} AS probe_value
+    renderer: builtin.table
 output:
-  prefix: "result: "
-  maxChars: 20000
-onError: fail
+  format: markdown
 `;
 
 function setup(): { root: string; dataDir: string; file: string } {
@@ -52,7 +53,6 @@ executors:
     plugin: fixture-plugin
     tool: render_report
     minimumVersion: 1.0.0
-    contractVersion: 1
     arguments:
       sql:
         type: string
@@ -64,6 +64,8 @@ executors:
       allowHandoff: true
       handoffIncludesInput: false
       timeoutMs: 5000
+    output:
+      exposeFields: [probe_value]
 `);
   vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', registry);
   return { root, dataDir, file };
@@ -96,7 +98,6 @@ executors:
     plugin: fixture-plugin
     tool: render_report
     minimumVersion: 1.0.0
-    contractVersion: 1
     arguments:
       sql:
         type: string
@@ -108,6 +109,8 @@ executors:
       allowHandoff: true
       handoffIncludesInput: false
       timeoutMs: 5000
+    output:
+      exposeFields: [probe_value]
 `);
   vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', registry);
 });
@@ -128,7 +131,7 @@ describe('Frozen Command lifecycle ledger', () => {
     writeFileSync(script, 'console.log(JSON.stringify({value:"ok"}));\n');
     const canonicalScript = realpathSync(script);
     const registryYaml = (maxLength: number) => `
-schemaVersion: 1
+schemaVersion: 2
 executors:
   - id: test.contract
     kind: script
@@ -142,8 +145,8 @@ executors:
         maxLength: ${maxLength}
         pattern: "^[a-z]+$"
         accepts: [param]
-    policy: { risk: read, schedulable: true, allowHandoff: false, timeoutMs: 5000, maxOutputBytes: 65536 }
-    output: { format: json, exposeFields: [value] }
+    policy: { schedulable: true, allowHandoff: false, timeoutMs: 5000, maxOutputBytes: 65536 }
+    output: { exposeFields: [value] }
 `;
     writeFileSync(registry, registryYaml(100));
     vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', registry);
@@ -151,12 +154,14 @@ executors:
 schemaVersion: 2
 name: contract
 description: contract test
-executor: test.contract
 params:
   - { name: word, type: string, maxLength: 100, pattern: "^[a-z]+$" }
-input: { value: "{{word}}" }
-output: { text: "{{result.value}}" }
-onError: fail
+steps:
+  - id: main
+    executor: test.contract
+    input: { value: "{{word}}" }
+    renderer: builtin.table
+output: { format: markdown }
 `;
     writeFileSync(registry, registryYaml(32));
     expect(() => prepareFrozenCommandTransition({

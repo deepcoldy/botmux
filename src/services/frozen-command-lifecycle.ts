@@ -500,7 +500,7 @@ export function evaluateFrozenCommandLifecycle(input: {
         logger.warn('[frozen-command] third-party executor binary drift detected; execution remains allowed by scheme B', {
           target_bot_id: record.targetBotId,
           command: record.command,
-          executor_id: snapshot.definition.executor,
+          executor_id: snapshot.definition.steps[0]!.executor,
           approved_binary_digest: record.executorBinaryDigest,
           current_binary_digest: currentBinaryDigest,
         });

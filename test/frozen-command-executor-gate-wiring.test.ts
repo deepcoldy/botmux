@@ -59,7 +59,6 @@ executors:
       timeoutMs: 5000
       maxOutputBytes: 65536
     output:
-      format: json
       exposeFields: [value]
 `);
     const commandRoot = join(root, 'repo');
@@ -68,17 +67,19 @@ executors:
 schemaVersion: 2
 name: 回显
 description: 回显测试
-executor: test.echo
 params:
   - name: word
     type: string
     maxLength: 50
     pattern: "^[A-Za-z ]+$"
-input:
-  value: "{{word}}"
+steps:
+  - id: main
+    executor: test.echo
+    input:
+      value: "{{word}}"
+    renderer: builtin.table
 output:
   format: text
-  text: "{{result.value}}"
   rules:
     - handoff:
         prompt: "请解释执行结果"
