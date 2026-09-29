@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { larkToolBindingPath, larkToolChildEnv, parseLarkToolInvocation as parseInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding } from '../src/core/lark-tool-binding.js';
 import { readLarkToolHelp, fakeLarkHelpScript } from './helpers/lark-tool-help.js';
-import { spawnSyncTsScript } from './helpers/ts-runner.js';
+import { nodeTsRunnerPrefix, spawnSyncTsScript } from './helpers/ts-runner.js';
 
 let dir: string;
 beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'lark-tool-binding-')); });
@@ -91,7 +91,10 @@ describe('managed lark-cli binding', () => {
     const bin = join(dir, 'bin'); mkdirSync(bin);
     const real = join(bin, 'lark-cli');
     writeFileSync(real, '#!/usr/bin/env node\n' + fakeLarkHelpScript() + 'process.stdout.write(process.env.LARKSUITE_CLI_APP_ID+"|"+process.argv.slice(2).join(" ")); process.exit(3);\n'); chmodSync(real, 0o755);
-    const env = { PATH: `${bin}:/usr/bin:/bin`, HOME: dir };
+    // setup-node installs outside /usr/bin on CI. Give the fixture its own
+    // Node entry so its shebang also works with no system directories on PATH.
+    symlinkSync(nodeTsRunnerPrefix().command, join(bin, 'node'));
+    const env = { PATH: bin, HOME: dir };
     prepareLarkToolEnv({ env, dataDir: dir, sessionId: 'session-a', appId: defaults.appId });
     const result = spawnSyncTsScript(join(process.cwd(), 'src/lark-tool-runner.ts'), [
       '--binding', larkToolBindingPath(dir, 'session-a'), '--', '--version',
