@@ -58,6 +58,8 @@ Agent 可在当前真人消息轮次调用 `botmux freeze executors` 查看只�
 
 下面先给出 Data MCP 作为普通插件工具的登记示例。SQL 对宿主是不透明载荷；参数编码、同字节校验和执行都由插件负责。身份不能出现在 `arguments` 中，只能由网关 `_meta` 注入。
 
+示例中的 `maxLength` 只是宿主侧的定义与登记上限，不代表服务端保证执行同等大小的 SQL。Data MCP 还会按 `MAX_SQL_BYTES` 校验 SQL 的 UTF-8 字节数（默认 20000 字节）；超限会在 validate 阶段返回 `sql_too_large`。包含中文等多字节字符时，字符数会小于字节数。
+
 ```yaml
 schemaVersion: 2
 aliases:

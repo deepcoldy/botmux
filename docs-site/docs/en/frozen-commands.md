@@ -58,6 +58,8 @@ A `plugin-tool` string argument that accepts only `literal` input may set `maxLe
 
 Data MCP is configured as an ordinary plugin tool. SQL is opaque to the host; literal encoding, byte-identical validation, and execution remain inside the plugin. Caller identity must not be declared in `arguments`; it arrives only through trusted gateway `_meta`.
 
+The example's `maxLength` is only the host-side definition and registry limit; it does not guarantee that the service will execute SQL of the same size. Data MCP also checks the SQL's UTF-8 byte length against `MAX_SQL_BYTES` (20,000 bytes by default) and returns `sql_too_large` during validation when exceeded. For multibyte characters such as Chinese text, the character count is lower than the byte count.
+
 ```yaml
 schemaVersion: 2
 aliases:
