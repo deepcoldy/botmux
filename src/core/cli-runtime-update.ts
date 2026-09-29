@@ -307,7 +307,7 @@ function versionFromText(raw: unknown): string | null {
 function normalizeUpdateCommand(value: unknown): string | null {
   if (typeof value !== 'string') return null;
   const command = value.trim();
-  if (!command || /^(?:manual(?: or unknown)?|unknown|unavailable|unsupported|none|n\/a)$/i.test(command)) return null;
+  if (!command || /^(?:manual(?: or unknown)?|standalone installer|unknown|unavailable|unsupported|none|n\/a)$/i.test(command)) return null;
   return command;
 }
 

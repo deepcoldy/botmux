@@ -373,14 +373,19 @@ describe('filterCliRuntimeUpdateEntriesForTargets', () => {
 });
 
 describe('probeCodexRuntimeUpdate', () => {
-  it.each(['internal', 'self'] as const)('does not treat doctor status as a %s update command', async (provider) => {
+  it.each([
+    { provider: 'internal', action: 'manual or unknown' },
+    { provider: 'internal', action: 'standalone installer' },
+    { provider: 'self', action: 'manual or unknown' },
+    { provider: 'self', action: 'standalone installer' },
+  ] as const)('does not treat $action as a $provider update command', async ({ provider, action }) => {
     const runFile = vi.fn(async (_bin: string, args: string[]) => args[0] === '--version'
       ? 'codex-cli 0.156.1'
       : JSON.stringify({
         codexVersion: '0.156.1',
         checks: [{ id: 'updates.status', details: {
           'latest version probe': '0.158.0',
-          'update action': 'manual or unknown',
+          'update action': action,
         } }],
       }));
     const fetchLatest = vi.fn();
@@ -389,20 +394,38 @@ describe('probeCodexRuntimeUpdate', () => {
     expect(fetchLatest).not.toHaveBeenCalled();
   });
 
-  it('keeps an unknown command unknown when the official version probe falls back to npm', async () => {
+  it.each(['manual or unknown', 'standalone installer'])('keeps %s unknown when the official version probe falls back to npm', async (action) => {
     const runFile = vi.fn(async (_bin: string, args: string[]) => args[0] === '--version'
       ? 'codex-cli 0.156.1'
       : JSON.stringify({
         codexVersion: '0.156.1',
         checks: [{ id: 'updates.status', details: {
           'latest version probe': 'HTTP 403 Forbidden',
-          'update action': 'manual or unknown',
+          'update action': action,
         } }],
       }));
     const fetchLatest = vi.fn(async () => '0.158.0');
     expect(await probeCodexRuntimeUpdate(runtimeTarget(), { runFile, fetchLatest }))
       .toMatchObject({ latest: '0.158.0', updateCommand: null });
     expect(fetchLatest).toHaveBeenCalledOnce();
+  });
+
+  // Real command labels from upstream doctor/updates.rs::update_action_label.
+  it.each([
+    'npm install -g @openai/codex',
+    'bun install -g @openai/codex',
+    'vp install -g @openai/codex',
+    'pnpm add -g @openai/codex',
+    'brew upgrade --cask codex',
+  ])('preserves the official doctor command %s', async (action) => {
+    const runFile = vi.fn(async (_bin: string, args: string[]) => args[0] === '--version'
+      ? 'codex-cli 0.156.1'
+      : JSON.stringify({ codexVersion: '0.156.1', checks: [{ id: 'updates.status', details: {
+        'latest version probe': '0.158.0', 'update action': action,
+      } }] }));
+    const result = await probeCodexRuntimeUpdate(runtimeTarget(), { runFile });
+    expect(result.updateCommand).toBe(action);
+    expect(buildCliRuntimeUpdateCard(updateEntry({ ...result }), { locale: 'en' })).toContain(action);
   });
 
   it('uses matching official doctor data without querying any registry', async () => {
@@ -1322,12 +1345,12 @@ describe('CLI runtime update store and card', () => {
       });
   });
 
-  it('rewrites a cached status label inside the TTL without probing or renotifying', async () => {
+  it.each(['manual or unknown', 'standalone installer'])('rewrites cached %s inside the TTL without probing or renotifying', async (action) => {
     const now = 1_500_000;
     const key = 'codex:/opt/codex';
     writeCliRuntimeUpdateStoreTo(dir, { entries: { [key]: updateEntry({
       binPath: '/opt/codex', installationPath: '/opt/codex',
-      updateCommand: 'manual or unknown', lastCheckedAt: now - 1_000,
+      updateCommand: action, lastCheckedAt: now - 1_000,
       lastNotifiedVersion: '0.144.3',
     }) } });
     const probe = vi.fn();
@@ -1346,7 +1369,7 @@ describe('CLI runtime update store and card', () => {
     });
   });
 
-  it.each(['manual or unknown', ' MANUAL OR UNKNOWN ', 'unknown', 'manual', 'unavailable', 'unsupported', 'none', 'n/a', '', null])(
+  it.each(['manual or unknown', ' MANUAL OR UNKNOWN ', 'standalone installer', ' STANDALONE INSTALLER ', 'unknown', 'manual', 'unavailable', 'unsupported', 'none', 'n/a', '', null])(
     'shows an explanation instead of the status label %s in both locales', (updateCommand) => {
       writeCliRuntimeUpdateStoreTo(dir, { entries: { codex: updateEntry({ updateCommand }) } });
       expect(readCliRuntimeUpdateStoreFrom(dir).entries.codex.updateCommand).toBeNull();
@@ -1359,14 +1382,19 @@ describe('CLI runtime update store and card', () => {
     },
   );
 
-  it.each(['zh', 'en'] as const)('renders migrated status and verified commands in the %s Dashboard', (locale) => {
+  it.each([
+    { locale: 'zh', action: 'manual or unknown' },
+    { locale: 'en', action: 'manual or unknown' },
+    { locale: 'zh', action: 'standalone installer' },
+    { locale: 'en', action: 'standalone installer' },
+  ] as const)('renders migrated $action and verified commands in the $locale Dashboard', ({ locale, action }) => {
     const translation = vi.spyOn(ui, 't').mockImplementation(createDashboardTranslator(locale));
     try {
-      writeCliRuntimeUpdateStoreTo(dir, { entries: { codex: updateEntry({ updateCommand: 'manual or unknown' }) } });
+      writeCliRuntimeUpdateStoreTo(dir, { entries: { codex: updateEntry({ updateCommand: action }) } });
       const entry = readCliRuntimeUpdateStoreFrom(dir).entries.codex;
       const html = renderToStaticMarkup(createElement(CliRuntimeUpdates, { entries: [entry] }));
       expect(html).toContain(locale === 'zh' ? '未识别出升级命令' : 'No update command was identified');
-      expect(html).not.toContain('manual or unknown');
+      expect(html).not.toContain(action);
       expect(html).not.toContain('codex update');
       const known = renderToStaticMarkup(createElement(CliRuntimeUpdates, {
         entries: [{ ...entry, updateCommand: 'brew upgrade --cask codex' }],
