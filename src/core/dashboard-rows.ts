@@ -1,3 +1,4 @@
+import type { WorkspaceMetadata } from './workspace-metadata.js';
 // src/core/dashboard-rows.ts
 //
 // Pure-data row composers shared between the dashboard IPC server (which
@@ -27,6 +28,7 @@ export interface SessionRow extends SessionMessagePreview {
   cliInstanceId?: string;
   cliInstanceSource?: string;
   creationSource?: string;
+  workspace?: WorkspaceMetadata | null;
   sessionId: string;
   larkAppId: string;
   botName: string;

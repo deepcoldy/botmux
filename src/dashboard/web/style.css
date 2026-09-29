@@ -35182,3 +35182,7 @@ a.card-menu-item {
 .group-serial-input-row > label { display: flex; align-items: center; gap: 6px; }
 .group-serial-input-row input { width: auto; }
 .group-serial-input-row > small { flex-basis: 100%; }
+
+/* Worktree grouping keeps existing virtualised heights. */
+.wb-worktree-hint { margin: 4px 12px; color: var(--text-2); font-size: 11px; line-height: 1.4; }
+.wb-session-rail:has(> .wb-worktree-hint) { grid-template-rows: 38px auto 38px minmax(0, 1fr); }

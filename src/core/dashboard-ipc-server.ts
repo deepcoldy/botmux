@@ -1,3 +1,4 @@
+import { resolveWorkspace } from './workspace-metadata.js';
 // src/core/dashboard-ipc-server.ts
 import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
 import { updateHandoffLiveCard } from './worker-pool.js';
@@ -1271,6 +1272,19 @@ ipcRoute('GET', '/api/sessions', (_req, res) => {
   // left detached, then closed history. Persisted-active must never be projected
   // through composeRowFromClosed: teardown uncertainty is not a close.
   jsonRes(res, 200, { sessions: composeDashboardSessionRows({ includeTokenUsage: false }) });
+});
+
+// Host-authenticated, session-bound lookup: callers cannot supply arbitrary paths.
+ipcRoute('GET', '/api/sessions/:sessionId/workspace', async (req, res, params) => {
+  if (!isTrustedHostIpcRequest(req)) return jsonRes(res, 403, { error: 'trusted_host_required' });
+  const ds = findActiveBySessionId(params.sessionId);
+  const persisted = ds?.session ?? sessionStore.listSessions().find(s => s.sessionId === params.sessionId);
+  if (!persisted) return jsonRes(res, 404, { error: 'not_found' });
+  const workingDir = ds ? ds.workingDir : persisted.workingDir;
+  const backend = ds?.initConfig?.backendType ?? persisted.backendType;
+  const force = new URL(req.url!, 'http://localhost').searchParams.get('force') === '1';
+  const workspace = await resolveWorkspace(workingDir ?? '', backend, force);
+  jsonRes(res, 200, { workingDir, workspace });
 });
 
 ipcRoute('GET', '/api/sessions/:sessionId', (_req, res, params) => {

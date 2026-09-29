@@ -181,7 +181,7 @@ import { WORKBENCH_DOCK_IMMERSIVE_HASH, WORKBENCH_IMMERSIVE_HASH } from './core/
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { getGitRepoInfo } from './core/session-row-enrichment.js';
+import type { WorkspaceMetadata } from './core/workspace-metadata.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
 import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, diskVersionAt, botmuxCliEntry, botmuxCliEntryAt, botmuxInstallRoot, bakedBinaryVersion } from './utils/install-info.js';
 import { formatRunningDaemonsRestartSummary } from './utils/daemon-version-display.js';
@@ -817,7 +817,17 @@ const terminalFrontProxy = createTerminalFrontProxy({
   // worker port or the daemon's own `/s/` proxy is refused by the worker.
   viewCapabilityForwardProof: viewToken => terminalViewForwardProof(SECRET, viewToken),
 });
-const sessionPresentation = createSessionPresentationCoordinator(aggregator, getGitRepoInfo);
+const sessionPresentation = createSessionPresentationCoordinator(aggregator, async () => null,
+  async (appId, row, options) => {
+    const daemon = registry.getByAppId(appId);
+    if (!daemon) return null;
+    const response = await fetchDaemonIpc(daemon.ipcPort,
+      `/api/sessions/${encodeURIComponent(String(row.sessionId))}/workspace${options.force ? '?force=1' : ''}`,
+      { signal: AbortSignal.timeout(10_000) });
+    if (!response.ok) return null; // Older daemons remain usable without metadata.
+    const body = await response.json() as { workingDir?: string; workspace?: WorkspaceMetadata };
+    return body.workingDir === row.workingDir ? body.workspace ?? null : null;
+  });
 const groupsMatrixSnapshot = createGroupsMatrixSnapshot(buildGroupsMatrix, {
   onRefreshError: error => logger.warn(`[dashboard] groups matrix refresh failed: ${String(error)}`),
 });
