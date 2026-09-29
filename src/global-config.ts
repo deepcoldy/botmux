@@ -175,6 +175,10 @@ export interface ScheduleDelegationGlobalConfig {
   defaultOnDispatchFromBotAppIds?: string[];
   /** Maximum distinct delegated tasks one target turn may commit. Default 64. */
   maxTasksPerTurn?: number;
+  /** Personal CLI scopes a delegated schedule may retain for future runs. */
+  runScopes?: Array<'bytedcli'>;
+  /** Let a delegated scheduled turn pause or remove its own task. Default off. */
+  selfManageEnabled?: boolean;
 }
 
 export const SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN = 64;
@@ -573,6 +577,13 @@ function readScheduleDelegation(raw: unknown): ScheduleDelegationGlobalConfig | 
   if (typeof value.runEnabled === 'boolean') out.runEnabled = value.runEnabled;
   const maxTasksPerTurn = readPositiveInteger(value.maxTasksPerTurn);
   if (maxTasksPerTurn !== undefined) out.maxTasksPerTurn = Math.min(maxTasksPerTurn, 1024);
+  if (Array.isArray(value.runScopes)) {
+    const runScopes = [...new Set(value.runScopes.filter(
+      (item): item is 'bytedcli' => item === 'bytedcli',
+    ))];
+    if (runScopes.length > 0) out.runScopes = runScopes;
+  }
+  if (typeof value.selfManageEnabled === 'boolean') out.selfManageEnabled = value.selfManageEnabled;
   if (Array.isArray(value.defaultOnDispatchFromBotAppIds)) {
     const appIds = [...new Set(value.defaultOnDispatchFromBotAppIds.filter(
       (item): item is string => typeof item === 'string' && /^cli_[A-Za-z0-9_-]{1,128}$/.test(item),

@@ -1,28 +1,27 @@
 import type { ScheduledTask } from '../types.js';
 import type { ScheduleAuthorityRecord } from '../services/schedule-authority-store.js';
+import { TRIGGER_USER_AUTH_TOOLS, type TriggerUserAuthTool } from '../services/trigger-user-auth.js';
 
 export interface DelegatedScheduleRuntimeDependencies {
   runEnabled: boolean;
-  triggerUserAuthEnabled: boolean;
+  hostRunScopes: readonly TriggerUserAuthTool[];
+  triggerUserAuthTools: readonly TriggerUserAuthTool[];
   adminOpenIds: readonly string[];
   resolveTargetOpenId: (unionId: string) => Promise<string | undefined>;
   listChatMemberOpenIds: (chatId: string) => Promise<readonly string[]>;
 }
 
-/** Re-authorize a delegated task at the last daemon-controlled boundary before
- * it can enter a worker queue. The returned task is deliberately anonymous:
- * control authority never becomes general-purpose user execution identity. */
-export async function authorizeDelegatedScheduleRun(
+export interface AuthorizedDelegatedScheduleRun {
+  task: ScheduledTask;
+  targetOpenId: string;
+}
+
+async function revalidateController(
   task: ScheduledTask,
   authority: ScheduleAuthorityRecord,
-  deps: DelegatedScheduleRuntimeDependencies,
-): Promise<ScheduledTask> {
-  if (authority.kind !== 'delegated') return task;
-  if (authority.state !== 'active') throw new Error(`schedule authority state is ${authority.state}`);
-  if (!deps.runEnabled) throw new Error('delegated schedule execution is revoked by host policy');
-  if (!deps.triggerUserAuthEnabled) {
-    throw new Error('delegated schedule requires triggerUserAuth isolation when runScopes is empty');
-  }
+  deps: Pick<DelegatedScheduleRuntimeDependencies,
+    'adminOpenIds' | 'resolveTargetOpenId' | 'listChatMemberOpenIds'>,
+): Promise<string> {
   if (!authority.controlOpenId || !authority.controlUnionId
     || !deps.adminOpenIds.includes(authority.controlOpenId)) {
     throw new Error('delegated schedule controller is no longer an allowed bot operator');
@@ -35,8 +34,45 @@ export async function authorizeDelegatedScheduleRun(
   if (!members.includes(authority.controlOpenId)) {
     throw new Error('delegated schedule controller is no longer a target chat member');
   }
-  if (authority.runScopes.length !== 0) {
-    throw new Error('delegated schedule run scopes are unsupported by this version');
+  return currentOpenId;
+}
+
+/** Re-authorize a delegated task at the last daemon-controlled boundary before
+ * it can enter a worker queue. The returned task is deliberately anonymous as
+ * a current actor; any allowed tool identity is published separately and only
+ * for the exact scheduled turn. */
+export async function authorizeDelegatedScheduleRun(
+  task: ScheduledTask,
+  authority: ScheduleAuthorityRecord,
+  deps: DelegatedScheduleRuntimeDependencies,
+): Promise<AuthorizedDelegatedScheduleRun> {
+  if (authority.kind !== 'delegated') throw new Error('schedule authority is not delegated');
+  if (authority.state !== 'active') throw new Error(`schedule authority state is ${authority.state}`);
+  if (!deps.runEnabled) throw new Error('delegated schedule execution is revoked by host policy');
+  if (!TRIGGER_USER_AUTH_TOOLS.every(tool => deps.triggerUserAuthTools.includes(tool))) {
+    throw new Error('delegated schedule requires triggerUserAuth isolation for every identity tool');
   }
-  return { ...task, ownerOpenId: undefined, ownerUnionId: undefined };
+  if (authority.runScopes.some(scope => !deps.hostRunScopes.includes(scope)
+    || !deps.triggerUserAuthTools.includes(scope))) {
+    throw new Error('delegated schedule run scope is no longer allowed by host policy');
+  }
+  if (authority.runScopes.length > 0 && !authority.credentialOpenId) {
+    throw new Error('delegated schedule credential identity is missing');
+  }
+  const targetOpenId = await revalidateController(task, authority, deps);
+  return { task: { ...task, ownerOpenId: undefined, ownerUnionId: undefined }, targetOpenId };
+}
+
+export async function authorizeDelegatedScheduleSelfManage(
+  authority: ScheduleAuthorityRecord,
+  deps: Pick<DelegatedScheduleRuntimeDependencies,
+    'adminOpenIds' | 'resolveTargetOpenId' | 'listChatMemberOpenIds'> & {
+      selfManageEnabled: boolean;
+    },
+): Promise<void> {
+  if (authority.kind !== 'delegated' || authority.state !== 'active'
+    || !authority.selfManage || !deps.selfManageEnabled) {
+    throw new Error('delegated schedule self-management is not allowed');
+  }
+  await revalidateController(authority.task, authority, deps);
 }

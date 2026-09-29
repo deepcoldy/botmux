@@ -3834,6 +3834,9 @@ export async function executeScheduledTask(
   activeSessions: Map<string, DaemonSession>,
   refreshCliVersion: RefreshCliVersion,
   additionalPrompt?: string,
+  runtime?: {
+    prepareTurnIdentity?: (session: DaemonSession, turnId: string) => void | Promise<void>;
+  },
 ): Promise<void> {
   // Resolve which bot to use — prefer the task's original bot so replies come from
   // the same account the user set up the schedule with.
@@ -4176,6 +4179,7 @@ export async function executeScheduledTask(
           activeSessions,
           refreshCliVersion,
           additionalPrompt,
+          runtime,
         );
       }
     }
@@ -4255,6 +4259,7 @@ export async function executeScheduledTask(
           turnId: scheduledTurnId,
           trustedCaller: scheduledTrustedCaller,
         });
+        await runtime?.prepareTurnIdentity?.(existing, scheduledTurnId);
         rememberLastCliInput(existing, task.prompt, input);
         if (silent) armSilentScheduledTurn(existing, scheduledTurnId);
         if (existing.worker && !existing.worker.killed) {
@@ -4386,6 +4391,7 @@ export async function executeScheduledTask(
     rememberLastCliInput(ds, task.prompt, prompt);
     if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
     try {
+      await runtime?.prepareTurnIdentity?.(ds, scheduledTurnId);
       forkWorker(ds, prompt, scheduledTurnId);
     } catch (err) {
       if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);

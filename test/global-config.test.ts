@@ -476,7 +476,8 @@ describe('global dashboard config', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       scheduleDelegation: { createEnabled: true, runEnabled: false,
         defaultOnDispatchFromBotAppIds: ['cli_orchestrator', 'bad', 'cli_orchestrator'],
-        maxTasksPerTurn: 128, ignored: true },
+        maxTasksPerTurn: 128, runScopes: ['bytedcli', 'lark-cli', 'unknown', 'bytedcli'],
+        selfManageEnabled: true, ignored: true },
     }));
     invalidateGlobalConfigCache();
     expect(readGlobalConfig().scheduleDelegation).toEqual({
@@ -484,6 +485,8 @@ describe('global dashboard config', () => {
       runEnabled: false,
       defaultOnDispatchFromBotAppIds: ['cli_orchestrator'],
       maxTasksPerTurn: 128,
+      runScopes: ['bytedcli'],
+      selfManageEnabled: true,
     });
   });
 

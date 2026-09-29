@@ -372,12 +372,14 @@ import {
   resumeSession,
   closeCliMismatchedSessionsForBot,
 } from './core/session-manager.js';
-import { publishTurnCliIdentity } from './core/turn-cli-identity.js';
+import { publishTurnCliIdentity, type DelegatedCliIdentity } from './core/turn-cli-identity.js';
 import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, scheduleCreateCapabilities, DISPATCH_USER_DELIVERY_ROUTE, DISPATCH_USER_DELIVERY_MAX_BYTES, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './core/dispatch-user-delegation.js';
 import { resolveUnionIdFromOpenId } from './im/lark/client.js';
 import { ScheduleAuthorityStore } from './services/schedule-authority-store.js';
 import { computeInputHash } from './utils/canonical-input-hash.js';
-import { authorizeDelegatedScheduleRun } from './core/schedule-delegated-runtime.js';
+import { authorizeDelegatedScheduleRun, authorizeDelegatedScheduleSelfManage } from './core/schedule-delegated-runtime.js';
+import { parseScheduledTurnId } from './core/scheduled-turn-provenance.js';
+import { TRIGGER_USER_AUTH_TOOLS } from './services/trigger-user-auth.js';
 import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempotentAsyncTurnOnWorkerExit, externalEventOpensOwnTopic } from './core/trigger-session.js';
 import {
   runIdempotencyFailClose,
@@ -3798,7 +3800,11 @@ function triggerUserAuthEnabledFor(ds: DaemonSession): boolean {
 }
 
 function prepareTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> | undefined {
-  return triggerUserAuthEnabledFor(ds) ? refreshTurnCliIdentity(ds, turnId) : undefined;
+  if (!triggerUserAuthEnabledFor(ds)) return;
+  if (turnId.startsWith('schedule:')) {
+    return prepareDelegatedScheduledTurnIdentity(ds, turnId).then(() => undefined);
+  }
+  return refreshTurnCliIdentity(ds, turnId);
 }
 
 async function dispatchUserForTurn(ds: DaemonSession, turnId: string) {
@@ -3828,6 +3834,63 @@ async function targetUserForDelegation(ds: DaemonSession, user: import('./core/d
   return resolved.openId;
 }
 
+function delegatedScheduleRuntimeDeps(appId: string) {
+  const botConfig = getBot(appId).config;
+  const triggerPolicy = botConfig.triggerUserAuth;
+  const schedulePolicy = readGlobalConfig().scheduleDelegation;
+  return {
+    runEnabled: schedulePolicy?.runEnabled !== false,
+    hostRunScopes: schedulePolicy?.runScopes ?? [],
+    triggerUserAuthTools: triggerPolicy?.enabled === true ? triggerPolicy.tools : [],
+    adminOpenIds: getDashboardAdminOpenIds(appId),
+    resolveTargetOpenId: async (unionId: string) => {
+      const resolved = await resolveTargetAppOpenId(appId, unionId);
+      return resolved.status === 'resolved' ? resolved.openId : undefined;
+    },
+    listChatMemberOpenIds: (chatId: string) => listChatMemberOpenIds(appId, chatId),
+  };
+}
+
+function delegatedScheduleCliIdentity(
+  authority: import('./services/schedule-authority-store.js').ScheduleAuthorityRecord,
+  targetOpenId: string,
+): DelegatedCliIdentity {
+  const credentialOpenId = authority.credentialOpenId ?? authority.controlOpenId;
+  if (!credentialOpenId) throw new Error('delegated schedule credential identity is missing');
+  return {
+    targetOpenId,
+    credentialOpenId,
+    tools: [...authority.runScopes],
+    dispatchRoot: authority.sourceMessageId ?? authority.task.rootMessageId ?? authority.task.chatId,
+  };
+}
+
+async function prepareDelegatedScheduledTurnIdentity(
+  ds: DaemonSession,
+  turnId: string,
+): Promise<boolean> {
+  const taskId = parseScheduledTurnId(turnId);
+  if (!taskId) return false;
+  const authority = scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId);
+  if (!authority) throw new Error('schedule authority record missing');
+  if (authority.kind !== 'delegated') return false;
+  const authorized = await authorizeDelegatedScheduleRun(
+    authority.task,
+    authority,
+    delegatedScheduleRuntimeDeps(ds.larkAppId),
+  );
+  await publishTurnCliIdentity({
+    botConfig: getBot(ds.larkAppId).config,
+    sessionDataDir: config.session.dataDir,
+    sessionId: ds.session.sessionId,
+    senderOpenId: undefined,
+    delegatedIdentity: delegatedScheduleCliIdentity(authority, authorized.targetOpenId),
+    locale: localeForBot(ds.larkAppId),
+    turnId,
+  });
+  return true;
+}
+
 async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promise<void> {
   let botConfig;
   try { botConfig = getBot(ds.larkAppId).config; } catch { return; }
@@ -3836,25 +3899,55 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
   const reply = pickTurnReplyTarget(ds.session, turnId);
   let delegatedIdentity: import('./core/turn-cli-identity.js').DelegatedCliIdentity | undefined;
   let delegationBlocked = false;
-  try {
-    const delegation = await dispatchUserForTurn(ds, turnId);
-    if (delegation) {
-      // Keep a denial tied to the originating task even if contact/membership
-      // lookup throws; never turn this back into "ask the peer bot to log in".
-      delegatedIdentity = {
-        credentialOpenId: delegation.authority.openId, tools: [], dispatchRoot: delegation.rootId,
-        denialReason: 'target_access_denied',
-      };
-      const targetOpenId = await targetUserForDelegation(ds, delegation.authority);
-      if (targetOpenId) delegatedIdentity = {
-        ...delegatedIdentity, targetOpenId, tools: delegation.authority.tools,
-        denialReason: undefined,
-      };
+  if (turnId.startsWith('schedule:')) {
+    const taskId = parseScheduledTurnId(turnId);
+    const authority = taskId ? scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId) : undefined;
+    if (!authority) {
+      delegationBlocked = true;
+    } else {
+      if (authority.kind !== 'delegated') return;
+      const credentialOpenId = authority.credentialOpenId ?? authority.controlOpenId;
+      if (credentialOpenId) {
+        delegatedIdentity = {
+          credentialOpenId,
+          tools: [],
+          dispatchRoot: authority.sourceMessageId ?? authority.task.rootMessageId ?? authority.task.chatId,
+          denialReason: 'target_access_denied',
+        };
+      }
+      try {
+        await prepareDelegatedScheduledTurnIdentity(ds, turnId);
+        return;
+      } catch (error) {
+        delegationBlocked = true;
+        if (delegatedIdentity) delegatedIdentity.denialReason = 'target_validation_unavailable';
+        logger.warn(
+          `[schedule-delegation] identity unavailable for ${ds.session.sessionId}: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     }
-  } catch (error) {
-    delegationBlocked = true;
-    if (delegatedIdentity) delegatedIdentity.denialReason = 'target_validation_unavailable';
-    logger.warn(`[dispatch-user] identity unavailable for ${ds.session.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+  } else {
+    try {
+      const delegation = await dispatchUserForTurn(ds, turnId);
+      if (delegation) {
+        // Keep a denial tied to the originating task even if contact/membership
+        // lookup throws; never turn this back into "ask the peer bot to log in".
+        delegatedIdentity = {
+          credentialOpenId: delegation.authority.openId, tools: [], dispatchRoot: delegation.rootId,
+          denialReason: 'target_access_denied',
+        };
+        const targetOpenId = await targetUserForDelegation(ds, delegation.authority);
+        if (targetOpenId) delegatedIdentity = {
+          ...delegatedIdentity, targetOpenId, tools: delegation.authority.tools,
+          denialReason: undefined,
+        };
+      }
+    } catch (error) {
+      delegationBlocked = true;
+      if (delegatedIdentity) delegatedIdentity.denialReason = 'target_validation_unavailable';
+      logger.warn(`[dispatch-user] identity unavailable for ${ds.session.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   await publishTurnCliIdentity({
     botConfig,
@@ -6722,6 +6815,11 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
       return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_disabled' });
     }
     const tools = bot.triggerUserAuth?.enabled === true ? bot.triggerUserAuth.tools : [];
+    const configuredScheduleRunScopes = delegationPolicy?.runScopes ?? [];
+    if (scheduleCreateRequested
+      && configuredScheduleRunScopes.some(scope => !tools.includes(scope))) {
+      return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_source_run_scope_unavailable' });
+    }
     const needsDelegation = targetAppIds.length > 0
       && (tools.length > 0 || scheduleCreateRequested);
     const directScheduleSource = !!active && active.turnId === turnId
@@ -6745,6 +6843,8 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
         scheduleCreate: {
           targetAppIds,
           targetChatId: chatId,
+          allowedRunScopes: configuredScheduleRunScopes,
+          allowSelfManage: delegationPolicy?.selfManageEnabled === true,
         },
       } : {}),
       resolveUnionId: resolveUnionIdFromOpenId,
@@ -6772,7 +6872,9 @@ ipcRoute('POST', DISPATCH_USER_DELIVERY_ROUTE, async (req, res) => {
     if (scheduleCreateDefaulted) {
       logger.info(
         `[schedule-delegation:audit] auto-attached schedule:create source=${ds.larkAppId} `
-        + `turn=${turnId ?? 'unknown'} chat=${chatId} targets=${targetAppIds.join(',')}`,
+        + `turn=${turnId ?? 'unknown'} chat=${chatId} targets=${targetAppIds.join(',')} `
+        + `runScopes=${configuredScheduleRunScopes.join(',') || 'none'} `
+        + `selfManage=${delegationPolicy?.selfManageEnabled === true}`,
       );
     }
     return jsonRes(res, 200, { ok: true, messageId });
@@ -6846,6 +6948,9 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
   let grantId: string;
   let sourceMessageId = turnId;
   let sourceSessionId = sessionId;
+  let credentialOpenId: string | undefined;
+  let persistentRunScopes: Array<'bytedcli'> = [];
+  let selfManage = false;
   const active = ds.activeInteractiveTurn;
   const direct = active?.turnId === turnId && active.caller.senderType === 'user'
     && !active.caller.source && active.caller.requestLarkAppId === ds.larkAppId;
@@ -6881,12 +6986,28 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       if (!capability.allowedExecutionPositions.includes(task.executionPosition)) {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_position_denied' });
       }
+      const targetPolicy = readGlobalConfig().scheduleDelegation;
+      const targetTriggerPolicy = getBot(ds.larkAppId).config.triggerUserAuth;
+      if (!targetTriggerPolicy?.enabled
+        || !TRIGGER_USER_AUTH_TOOLS.every(tool => targetTriggerPolicy.tools.includes(tool))) {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_target_identity_isolation_required' });
+      }
+      if (capability.allowedRunScopes.some(scope => !targetPolicy?.runScopes?.includes(scope)
+        || !targetTriggerPolicy.tools.includes(scope))) {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_run_scope_unsupported' });
+      }
+      if (capability.allowSelfManage === true && targetPolicy?.selfManageEnabled !== true) {
+        return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_self_manage_unsupported' });
+      }
       const resolved = await resolveTargetAppOpenId(ds.larkAppId, delegation.authority.unionId);
       if (resolved.status !== 'resolved') {
         return jsonRes(res, 403, { ok: false, error: 'schedule_delegation_identity_unresolved' });
       }
       controlOpenId = resolved.openId;
       controlUnionId = delegation.authority.unionId;
+      credentialOpenId = delegation.authority.openId;
+      persistentRunScopes = [...capability.allowedRunScopes];
+      selfManage = capability.allowSelfManage === true;
       grantId = `dispatch:${delegation.deliveryId}:${ds.larkAppId}`;
       sourceMessageId = delegation.messageId!;
       sourceSessionId = delegation.sourceSessionId;
@@ -6935,7 +7056,13 @@ ipcRoute('POST', SCHEDULE_DELEGATED_ADD_ROUTE, async (req, res) => {
       params: { ...baseParams, id: committedTaskId },
       grantId,
       requestHash,
-      control: { openId: controlOpenId, unionId: controlUnionId, runScopes: [] },
+      control: {
+        openId: controlOpenId,
+        unionId: controlUnionId,
+        credentialOpenId: credentialOpenId ?? controlOpenId,
+        runScopes: persistentRunScopes,
+        selfManage,
+      },
       sourceMessageId,
       sourceSessionId,
       targetTurnId: turnId,
@@ -6982,21 +7109,53 @@ ipcRoute('POST', SCHEDULE_MANAGED_MUTATE_ROUTE, async (req, res) => {
     && active.caller.requestLarkAppId === ds.larkAppId
     && !!active.caller.requestUserOpenId
     && getDashboardAdminOpenIds(ds.larkAppId).includes(active.caller.requestUserOpenId);
-  if (!verified.ok || (!hostAdmin && !currentHumanAdmin)) {
-    return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_current_human_required' });
+  const action = body.action;
+  const scheduledTaskId = turnId ? parseScheduledTurnId(turnId) : null;
+  const requestedId = typeof body.id === 'string' && /^[0-9a-z_]{1,50}$/.test(body.id) ? body.id : '';
+  const id = requestedId === 'self' && scheduledTaskId ? scheduledTaskId : requestedId;
+  if (!verified.ok) {
+    return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_origin_unproven' });
+  }
+  if (!id || !['update', 'remove', 'pause', 'resume', 'run'].includes(action)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_mutation' });
   }
   if (!scheduleAuthorityStore) {
     return jsonRes(res, 503, { ok: false, error: 'schedule_authority_store_unavailable' });
   }
-  const id = typeof body.id === 'string' && /^[0-9a-z_]{1,50}$/.test(body.id) ? body.id : '';
-  const action = body.action;
-  if (!id || !['update', 'remove', 'pause', 'resume', 'run'].includes(action)) {
-    return jsonRes(res, 400, { ok: false, error: 'invalid_schedule_mutation' });
-  }
   const appId = ds?.larkAppId ?? selfDaemonLarkAppId;
   if (!appId) return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_daemon_unbound' });
+  const potentialScheduledSelfManager = !!ds && scheduledTaskId === id
+    && (action === 'pause' || action === 'remove');
+  if (!hostAdmin && !currentHumanAdmin && !potentialScheduledSelfManager) {
+    return jsonRes(res, 403, { ok: false, error: 'schedule_mutation_current_human_required' });
+  }
   const authority = scheduleAuthorityStore?.getRecord(appId, id);
   if (!authority) return jsonRes(res, 404, { ok: false, error: 'schedule_not_found' });
+  const scheduledSelfManager = potentialScheduledSelfManager
+    && authority.kind === 'delegated'
+    && authority.selfManage;
+  if (potentialScheduledSelfManager && !scheduledSelfManager) {
+    return jsonRes(res, 403, { ok: false, error: 'delegated_schedule_self_manage_denied' });
+  }
+  if (scheduledSelfManager) {
+    try {
+      await authorizeDelegatedScheduleSelfManage(authority, {
+        selfManageEnabled: readGlobalConfig().scheduleDelegation?.selfManageEnabled === true,
+        adminOpenIds: getDashboardAdminOpenIds(appId),
+        resolveTargetOpenId: async unionId => {
+          const resolved = await resolveTargetAppOpenId(appId, unionId);
+          return resolved.status === 'resolved' ? resolved.openId : undefined;
+        },
+        listChatMemberOpenIds: chatId => listChatMemberOpenIds(appId, chatId),
+      });
+    } catch (error) {
+      return jsonRes(res, 403, {
+        ok: false,
+        error: 'delegated_schedule_self_manage_denied',
+        detail: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
   if (action === 'update' && authority.kind === 'delegated') {
     return jsonRes(res, 403, { ok: false, error: 'delegated_schedule_reauthorization_required' });
   }
@@ -28592,6 +28751,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   scheduler.setExecuteCallback(async (task, executionContext) => {
     const effectiveAppId = task.larkAppId ?? cfg.larkAppId;
     const authority = scheduleAuthorityStore?.getRecord(effectiveAppId, task.id);
+    let delegatedTask = false;
     if (!authority) {
       throw new Error('schedule authority record missing; refusing unregistered task');
     }
@@ -28599,20 +28759,16 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       throw new Error(`schedule authority state is ${authority.state}; refusing run`);
     }
     if (authority.kind === 'delegated') {
-      // Empty runScopes is an actual anonymous execution boundary, not merely
-      // "do not publish a fresh token". A governed wrapper is required so a
-      // reused session cannot fall through to an ambient machine login.
-      const botConfig = getBot(effectiveAppId).config;
-      task = await authorizeDelegatedScheduleRun(task, authority, {
-        runEnabled: readGlobalConfig().scheduleDelegation?.runEnabled !== false,
-        triggerUserAuthEnabled: botConfig.triggerUserAuth?.enabled === true,
-        adminOpenIds: getDashboardAdminOpenIds(effectiveAppId),
-        resolveTargetOpenId: async unionId => {
-          const resolved = await resolveTargetAppOpenId(effectiveAppId, unionId);
-          return resolved.status === 'resolved' ? resolved.openId : undefined;
-        },
-        listChatMemberOpenIds: chatId => listChatMemberOpenIds(effectiveAppId, chatId),
-      });
+      // Every identity entry is governed. Empty runScopes therefore publishes
+      // explicit denials, while a granted bytedcli scope is minted only for the
+      // exact scheduled turn after live controller revalidation.
+      const authorized = await authorizeDelegatedScheduleRun(
+        task,
+        authority,
+        delegatedScheduleRuntimeDeps(effectiveAppId),
+      );
+      task = authorized.task;
+      delegatedTask = true;
     }
     let targetResults: ScheduleRunTargetResult[] | undefined;
     let precondition: ScheduledTaskPreconditionObservation = {
@@ -28664,6 +28820,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
                   activeSessions,
                   refreshCliVersion,
                   additionalPrompt,
+                  delegatedTask ? {
+                    prepareTurnIdentity: (session, turnId) =>
+                      prepareTurnCliIdentity(session, turnId),
+                  } : undefined,
                 ),
               ),
             );

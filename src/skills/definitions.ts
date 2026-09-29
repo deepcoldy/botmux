@@ -82,6 +82,10 @@ botmux schedule remove <id>    # 删除
 botmux schedule run <id>       # 标记立即执行（< 30 秒内 daemon 会触发）
 \`\`\`
 
+委托创建且宿主启用了 self-management 的任务，在自己的 scheduled turn 内可用
+\`botmux schedule pause self\` 或 \`botmux schedule remove self\` 停止自己。
+\`self\` 不能用于 update/resume/run，也不能指向或管理其他任务。
+
 ## 典型用法
 
 **用户**："每天早上 9 点生成一下昨天的 PR 汇总"

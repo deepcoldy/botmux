@@ -9,6 +9,7 @@
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { ScheduledTask } from '../types.js';
+import type { TriggerUserAuthTool } from './trigger-user-auth.js';
 import { computeInputHash } from '../utils/canonical-input-hash.js';
 import { canonicalScheduleInput } from './schedule-store.js';
 import { openDatabaseSyncOrThrow, type DatabaseSyncLike } from './sqlite-compat.js';
@@ -19,7 +20,9 @@ export type ScheduleAuthorityState = 'active' | 'paused' | 'completed' | 'revoke
 export interface DelegatedScheduleControl {
   openId: string;
   unionId: string;
-  runScopes: readonly [];
+  credentialOpenId?: string;
+  runScopes?: readonly TriggerUserAuthTool[];
+  selfManage?: boolean;
 }
 
 export interface ScheduleAuthorityRecord {
@@ -28,7 +31,9 @@ export interface ScheduleAuthorityRecord {
   task: ScheduledTask;
   controlOpenId?: string;
   controlUnionId?: string;
-  runScopes: readonly [];
+  credentialOpenId?: string;
+  runScopes: readonly TriggerUserAuthTool[];
+  selfManage: boolean;
   grantId?: string;
   requestHash?: string;
   sourceMessageId?: string;
@@ -98,7 +103,9 @@ export class ScheduleAuthorityStore {
         canonical_hash TEXT NOT NULL,
         control_open_id TEXT,
         control_union_id TEXT,
+        credential_open_id TEXT,
         run_scopes_json TEXT NOT NULL DEFAULT '[]',
+        self_manage INTEGER NOT NULL DEFAULT 0 CHECK(self_manage IN (0,1)),
         grant_id TEXT,
         request_hash TEXT,
         source_message_id TEXT,
@@ -111,6 +118,15 @@ export class ScheduleAuthorityStore {
         UNIQUE (grant_id, request_hash)
       );
     `);
+    const columns = new Set((db.prepare('PRAGMA table_info(schedule_authority_tasks)').all() as Array<{
+      name?: unknown;
+    }>).flatMap(row => typeof row.name === 'string' ? [row.name] : []));
+    if (!columns.has('credential_open_id')) {
+      db.exec('ALTER TABLE schedule_authority_tasks ADD COLUMN credential_open_id TEXT;');
+    }
+    if (!columns.has('self_manage')) {
+      db.exec('ALTER TABLE schedule_authority_tasks ADD COLUMN self_manage INTEGER NOT NULL DEFAULT 0;');
+    }
     return new ScheduleAuthorityStore(db);
   }
 
@@ -176,7 +192,7 @@ export class ScheduleAuthorityStore {
   getRecord(appId: string, taskId: string): ScheduleAuthorityRecord | undefined {
     const row = this.db.prepare(`
       SELECT schema_version, kind, state, task_json, canonical_hash, control_open_id, control_union_id,
-             run_scopes_json, grant_id, request_hash, source_message_id,
+             credential_open_id, run_scopes_json, self_manage, grant_id, request_hash, source_message_id,
              source_session_id, target_turn_id, target_generation
       FROM schedule_authority_tasks WHERE app_id = ? AND task_id = ?
     `).get(appId, taskId) as Record<string, unknown> | undefined;
@@ -185,8 +201,13 @@ export class ScheduleAuthorityStore {
     let runScopes: unknown;
     try { runScopes = JSON.parse(String(row.run_scopes_json)); }
     catch { throw new Error('schedule_authority_run_scopes_corrupt'); }
-    if (!Array.isArray(runScopes) || runScopes.length !== 0) {
+    if (!Array.isArray(runScopes)
+      || runScopes.some(scope => scope !== 'bytedcli')
+      || new Set(runScopes).size !== runScopes.length) {
       throw new Error('schedule_authority_run_scopes_unsupported');
+    }
+    if (row.self_manage !== 0 && row.self_manage !== 1) {
+      throw new Error('schedule_authority_self_manage_corrupt');
     }
     const task = parseTask(row.task_json, appId);
     if (String(row.canonical_hash) !== taskHash(task)) {
@@ -198,7 +219,9 @@ export class ScheduleAuthorityStore {
       task,
       ...(typeof row.control_open_id === 'string' ? { controlOpenId: row.control_open_id } : {}),
       ...(typeof row.control_union_id === 'string' ? { controlUnionId: row.control_union_id } : {}),
-      runScopes: [],
+      ...(typeof row.credential_open_id === 'string' ? { credentialOpenId: row.credential_open_id } : {}),
+      runScopes: runScopes as TriggerUserAuthTool[],
+      selfManage: row.self_manage === 1,
       ...(typeof row.grant_id === 'string' ? { grantId: row.grant_id } : {}),
       ...(typeof row.request_hash === 'string' ? { requestHash: row.request_hash } : {}),
       ...(typeof row.source_message_id === 'string' ? { sourceMessageId: row.source_message_id } : {}),
@@ -287,13 +310,16 @@ export class ScheduleAuthorityStore {
       this.db.prepare(`
         INSERT INTO schedule_authority_tasks
           (schema_version, app_id, task_id, kind, state, task_json, canonical_hash,
-           control_open_id, control_union_id, run_scopes_json, grant_id,
+           control_open_id, control_union_id, credential_open_id, run_scopes_json, self_manage, grant_id,
            request_hash, source_message_id, source_session_id, target_turn_id,
            target_generation, created_at, updated_at)
-        VALUES (1, ?, ?, 'delegated', 'active', ?, ?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (1, ?, ?, 'delegated', 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         input.appId, input.task.id, JSON.stringify(input.task), taskHash(input.task),
-        input.control.openId, input.control.unionId, input.grantId, input.requestHash,
+        input.control.openId, input.control.unionId,
+        input.control.credentialOpenId ?? input.control.openId,
+        JSON.stringify(input.control.runScopes ?? []), input.control.selfManage === true ? 1 : 0,
+        input.grantId, input.requestHash,
         input.sourceMessageId, input.sourceSessionId, input.targetTurnId,
         input.targetGeneration, now, now,
       );

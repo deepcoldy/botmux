@@ -7871,7 +7871,10 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
   // delete or force-run any task. Host-terminal administration authenticates
   // to the owning daemon; neither path falls back to editing schedules.json.
   const mutationSession = await detectCurrentSession();
-  if (sub !== 'update' && mutationSession) {
+  const scheduledSelfManageCandidate = !!mutationSession?.turnId
+    && mutationSession.turnId.startsWith('schedule:')
+    && ['remove', 'rm', 'delete', 'del', 'pause', 'disable'].includes(sub);
+  if (sub !== 'update' && mutationSession && !scheduledSelfManageCandidate) {
     await detectAuthenticatedCurrentSession();
   }
   const managedMutation = async (

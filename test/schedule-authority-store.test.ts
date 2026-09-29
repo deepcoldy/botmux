@@ -59,7 +59,8 @@ describe('host-only schedule authority store', () => {
       grantId: 'dispatch:delivery-1:cli_target',
       requestHash: 'sha256:req1',
       task: task(),
-      control: { openId: 'ou_user_target', unionId: 'on_user', runScopes: [] as const },
+      control: { openId: 'ou_user_target', unionId: 'on_user', credentialOpenId: 'ou_user_source',
+        runScopes: ['bytedcli'] as const, selfManage: true },
       sourceMessageId: 'om_kickoff',
       sourceSessionId: 'source-session',
       targetTurnId: 'om_kickoff',
@@ -70,7 +71,8 @@ describe('host-only schedule authority store', () => {
     expect(store.commitDelegated(input)).toMatchObject({ ok: true, replay: true, task: { id: 'a1b2c3d4' } });
     expect(store.getRecord(APP, 'a1b2c3d4')).toMatchObject({
       kind: 'delegated', state: 'active', controlOpenId: 'ou_user_target',
-      controlUnionId: 'on_user', runScopes: [], targetGeneration: 3,
+      controlUnionId: 'on_user', credentialOpenId: 'ou_user_source',
+      runScopes: ['bytedcli'], selfManage: true, targetGeneration: 3,
     });
   });
 

@@ -6,6 +6,7 @@ import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.j
 import { scheduleCreateCapabilities } from '../src/core/dispatch-user-delegation.js';
 import { computeInputHash } from '../src/utils/canonical-input-hash.js';
 import { SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN } from '../src/global-config.js';
+import { TRIGGER_USER_AUTH_TOOLS } from '../src/services/trigger-user-auth.js';
 
 const source = ts.createSourceFile(
   'daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true,
@@ -47,6 +48,8 @@ function harness(overrides: Record<string, unknown> = {}) {
     selfDaemonLarkAppId: 'cli_target',
     jsonRes: (_res: unknown, status: number, value: unknown) => ({ status, value }),
     readGlobalConfig: () => ({ scheduleDelegation: { createEnabled: true } }),
+    getBot: () => ({ config: { triggerUserAuth: { enabled: true,
+      tools: ['lark-cli', 'bytedcli'] } } }),
     pickTurnReplyTarget: () => ({ rootMessageId: 'om_root' }),
     dispatchUserForTurn: async () => ({
       domain: 'botmux.dispatch-user.v2', deliveryId: 'delivery-1', messageId: turnId,
@@ -64,6 +67,7 @@ function harness(overrides: Record<string, unknown> = {}) {
     resolveUnionIdFromOpenId: async () => 'on_user',
     computeInputHash,
     SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
+    TRIGGER_USER_AUTH_TOOLS,
     scheduleAuthorityStore: {},
     createHash,
     scheduler: { commitDelegatedTask, addTask: vi.fn() },
@@ -81,10 +85,46 @@ describe('delegated schedule add route', () => {
       sourceMessageId: 'om_kickoff', sourceSessionId: 'source-session',
       targetTurnId: 'om_kickoff', targetGeneration: 7,
       maxTasksPerTurn: SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN,
-      control: { openId: 'ou_user_target', unionId: 'on_user', runScopes: [] },
+      control: { openId: 'ou_user_target', unionId: 'on_user',
+        credentialOpenId: 'ou_user_source', runScopes: [], selfManage: false },
       params: expect.objectContaining({ larkAppId: 'cli_target', chatId: 'oc_chat',
         executionPosition: 'topic', rootMessageId: 'om_root' }),
     }));
+  });
+
+  it('persists bytedcli run scope and self-management only when target policy supports both', async () => {
+    const h = harness();
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: {
+      createEnabled: true, runScopes: ['bytedcli'], selfManageEnabled: true,
+    } });
+    h.scope.dispatchUserForTurn = async () => ({
+      domain: 'botmux.dispatch-user.v2', deliveryId: 'delivery-1', messageId: 'om_kickoff',
+      sourceSessionId: 'source-session', sourceAppId: 'cli_source', sourceTurnId: 'om_human',
+      rootId: 'om_root', chatId: 'oc_chat', targetAppIds: ['cli_target'], issuedAt: Date.now(),
+      authority: { appId: 'cli_source', openId: 'ou_user_source', unionId: 'on_user', tools: ['bytedcli'],
+        capabilities: [{ action: 'schedule:create', targetAppId: 'cli_target', targetChatId: 'oc_chat',
+          allowedExecutionPositions: ['top-level', 'topic'], allowedRunScopes: ['bytedcli'],
+          allowSelfManage: true }] },
+    });
+    expect((await h.run()).status).toBe(201);
+    expect(h.commitDelegatedTask).toHaveBeenCalledWith(expect.objectContaining({
+      control: {
+        openId: 'ou_user_target', unionId: 'on_user', credentialOpenId: 'ou_user_source',
+        runScopes: ['bytedcli'], selfManage: true,
+      },
+    }));
+  });
+
+  it('rejects persistent scope when the target does not govern every identity tool', async () => {
+    const h = harness();
+    h.scope.getBot = () => ({ config: { triggerUserAuth: {
+      enabled: true, tools: ['bytedcli'],
+    } } });
+    expect(await h.run()).toMatchObject({
+      status: 403,
+      value: { error: 'schedule_delegation_target_identity_isolation_required' },
+    });
+    expect(h.commitDelegatedTask).not.toHaveBeenCalled();
   });
 
   it('returns a clear forbidden response when the turn task limit is exhausted', async () => {

@@ -24,8 +24,10 @@ const scheduleCreateCapabilitySchema = z.object({
   targetAppId: identity('cli_'),
   targetChatId: identity('oc_'),
   allowedExecutionPositions: z.array(z.enum(['top-level', 'topic'])).min(1).max(2),
-  /** First release deliberately carries no long-lived personal tool identity. */
-  allowedRunScopes: z.array(z.never()).max(0),
+  /** Persisted execution scopes are deliberately coarser than provider APIs. */
+  allowedRunScopes: z.array(z.literal('bytedcli')).max(1),
+  /** Fixed task-local lifecycle authority; absent on older v2 records. */
+  allowSelfManage: z.boolean().optional(),
 }).strict();
 const authorityV2Schema = z.object({
   appId: identity('cli_'),
@@ -109,6 +111,8 @@ export async function authorityForDispatch(input: {
   scheduleCreate?: {
     targetAppIds: string[];
     targetChatId: string;
+    allowedRunScopes?: Array<'bytedcli'>;
+    allowSelfManage?: boolean;
   };
   resolveUnionId: (appId: string, openId: string) => Promise<string | null>;
 }): Promise<DispatchUserAuthority | undefined> {
@@ -134,6 +138,8 @@ export async function authorityForDispatch(input: {
   if (!unionId) throw new Error('dispatch_user_identity_unresolved');
   const base = { appId: input.sourceAppId, openId: c.requestUserOpenId, unionId, tools: input.tools };
   if (!input.scheduleCreate) return authorityV1Schema.parse(base);
+  const allowedRunScopes = (input.scheduleCreate.allowedRunScopes ?? [])
+    .filter(scope => input.tools.includes(scope));
   return authorityV2Schema.parse({
     ...base,
     capabilities: input.scheduleCreate.targetAppIds.map(targetAppId => ({
@@ -141,7 +147,8 @@ export async function authorityForDispatch(input: {
       targetAppId,
       targetChatId: input.scheduleCreate!.targetChatId,
       allowedExecutionPositions: ['top-level', 'topic'] as const,
-      allowedRunScopes: [] as const,
+      allowedRunScopes,
+      ...(input.scheduleCreate!.allowSelfManage ? { allowSelfManage: true } : {}),
     })),
   });
 }

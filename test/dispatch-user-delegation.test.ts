@@ -90,6 +90,24 @@ describe('daemon-derived dispatch authority', () => {
     });
     expect(inherited).toBeUndefined();
   });
+  it('binds configured bytedcli run scope and self-management into the signed schedule capability', async () => {
+    const direct = await authorityForDispatch({
+      sourceAppId: 'cli_source', tools: ['bytedcli'],
+      caller: { senderType: 'user', requestLarkAppId: 'cli_source',
+        requestUserOpenId: 'ou_alice_source', requestUserUnionId: 'on_alice' },
+      scheduleCreate: { targetAppIds: ['cli_target'], targetChatId: 'oc_chat',
+        allowedRunScopes: ['bytedcli'], allowSelfManage: true },
+      resolveUnionId: async () => 'on_alice',
+    });
+    expect(direct && scheduleCreateCapabilities(direct)).toEqual([expect.objectContaining({
+      allowedRunScopes: ['bytedcli'], allowSelfManage: true,
+    })]);
+    const payloadV2 = { ...payload(), domain: 'botmux.dispatch-user.v2' as const, authority: direct! };
+    const signed = signDispatchUser(secret, payloadV2);
+    const changed = structuredClone(signed);
+    (changed.payload.authority as any).capabilities[0].allowedRunScopes = [];
+    expect(verifyDispatchUser(secret, changed)).toBeUndefined();
+  });
 });
 
 describe('message-bound signed delegation', () => {

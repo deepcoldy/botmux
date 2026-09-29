@@ -163,6 +163,32 @@ describe('dispatch user IPC end-to-end identity binding', () => {
     expect((await suppressed.run()).status).toBe(200);
     expect(await read()).toBeUndefined();
   });
+  it('binds configured bytedcli run scope and self-management into a default grant', async () => {
+    const h = harness();
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: {
+      createEnabled: true,
+      defaultOnDispatchFromBotAppIds: ['cli_source'],
+      runScopes: ['bytedcli'],
+      selfManageEnabled: true,
+    } });
+    expect((await h.run()).status).toBe(200);
+    const delegated = await read();
+    expect(delegated && scheduleCreateCapabilities(delegated.authority)).toEqual([
+      expect.objectContaining({ allowedRunScopes: ['bytedcli'], allowSelfManage: true }),
+    ]);
+  });
+  it('refuses persistent bytedcli scope when the source bot does not govern that tool', async () => {
+    const h = harness({ delegateScheduleCreate: true });
+    h.scope.getBot = () => ({ config: { triggerUserAuth: { enabled: true, tools: ['lark-cli'] } } });
+    h.scope.readGlobalConfig = () => ({ scheduleDelegation: {
+      createEnabled: true, runScopes: ['bytedcli'],
+    } });
+    expect(await h.run()).toMatchObject({
+      status: 403,
+      value: { error: 'schedule_delegation_source_run_scope_unavailable' },
+    });
+    expect(h.send).not.toHaveBeenCalled();
+  });
   it('refuses sending after the active turn changes during identity resolution', async () => {
     const h = harness(); delete h.ds.activeInteractiveTurn.caller.requestUserUnionId;
     h.scope.resolveUnionIdFromOpenId = async () => { h.ds.managedTurnOrigin.turnId = 'om_bob'; return 'on_alice'; };

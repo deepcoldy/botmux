@@ -268,6 +268,28 @@ beforeEach(() => {
 });
 
 describe('executeScheduledTask — silent thread fire', () => {
+  it('prepares an exact scheduled-turn identity before the worker is forked', async () => {
+    const active = new Map<string, DaemonSession>();
+    let prepared = false;
+    forkWorkerMock.mockImplementationOnce(() => { expect(prepared).toBe(true); });
+    const prepareTurnIdentity = vi.fn(async (session: DaemonSession, turnId: string) => {
+      expect(session.session.sessionId).toBe('sess-1');
+      expect(turnId).toMatch(/^schedule:task0001:/);
+      prepared = true;
+    });
+    await executeScheduledTask(
+      baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }),
+      active,
+      refreshCliVersion,
+      undefined,
+      { prepareTurnIdentity },
+    );
+    expect(prepareTurnIdentity).toHaveBeenCalledWith(
+      expect.objectContaining({ session: expect.objectContaining({ sessionId: 'sess-1' }) }),
+      expect.stringMatching(/^schedule:task0001:/),
+    );
+  });
+
   it('posts nothing, anchors at rootMessageId, arms the exact forked turn, wraps the prompt', async () => {
     const active = new Map<string, DaemonSession>();
     await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread', silent: true }), active, refreshCliVersion);

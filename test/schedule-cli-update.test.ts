@@ -56,22 +56,26 @@ function fixture() {
   return { root, dataDir, path, task, env, run, read: () => JSON.parse(readFileSync(path, 'utf8')) };
 }
 
-async function managed(f: ReturnType<typeof fixture>, customize?: (proof: ManagedOriginAttestation, index: number) => void) {
+async function managed(
+  f: ReturnType<typeof fixture>,
+  customize?: (proof: ManagedOriginAttestation, index: number) => void,
+  managedTurnId = 'om_live',
+) {
   seedPersistedSessionRows(f.dataDir, app, { [sid]: {
     sessionId: sid, status: 'active', larkAppId: app, chatId: 'oc_chat', rootMessageId: 'om_root',
     scope: 'thread', chatType: 'group', workingDir: f.root, cliId: 'codex',
-    quoteTargetId: 'om_live', lastCallerOpenId: 'ou_owner',
+    quoteTargetId: managedTurnId, lastCallerOpenId: 'ou_owner',
   } });
   let calls = 0;
   const server = createServer(async (req, res) => {
     let body = ''; for await (const chunk of req) body += chunk;
     const request = JSON.parse(body);
-    const proof: ManagedOriginAttestation = { sessionId: sid, turnId: 'om_live', callerOpenId: 'ou_owner',
+    const proof: ManagedOriginAttestation = { sessionId: sid, turnId: managedTurnId, callerOpenId: 'ou_owner',
       larkAppId: app, requiresCodexAppLedger: false, scheduleCreator: { ok: true, ownerUnionId: 'on_owner' } };
     calls++;
     customize?.(proof, calls);
     if (req.url === SCHEDULE_DELEGATED_ADD_ROUTE) {
-      if (proof.turnId !== 'om_live') {
+      if (proof.turnId !== managedTurnId) {
         res.statusCode = 409;
         return res.end(JSON.stringify({ ok: false, error: 'provenance changed before write' }));
       }
@@ -91,7 +95,7 @@ async function managed(f: ReturnType<typeof fixture>, customize?: (proof: Manage
       return res.end(JSON.stringify({ ok: true, task: created }));
     }
     if (req.url === SCHEDULE_MANAGED_MUTATE_ROUTE) {
-      if (proof.turnId !== 'om_live') {
+      if (proof.turnId !== managedTurnId) {
         res.statusCode = 409;
         return res.end(JSON.stringify({ ok: false, error: 'provenance changed before write' }));
       }
@@ -103,8 +107,11 @@ async function managed(f: ReturnType<typeof fixture>, customize?: (proof: Manage
         res.statusCode = 403;
         return res.end(JSON.stringify({ ok: false, error: 'current turn caller is not an allowed bot operator' }));
       }
+      const taskId = request.id === 'self'
+        ? /^schedule:([0-9a-z_]{1,50}):/.exec(managedTurnId)?.[1]
+        : request.id;
       const rows = f.read();
-      const current = rows[request.id];
+      const current = taskId ? rows[taskId] : undefined;
       if (!current) {
         res.statusCode = 404;
         return res.end(JSON.stringify({ ok: false, error: 'schedule_not_found' }));
@@ -113,7 +120,9 @@ async function managed(f: ReturnType<typeof fixture>, customize?: (proof: Manage
         res.statusCode = 409;
         return res.end(JSON.stringify({ ok: false, error: 'schedule_precondition_dashboard_update_required' }));
       }
-      rows[request.id] = { ...current, prompt: request.prompt };
+      if (request.action === 'remove') delete rows[taskId!];
+      else if (request.action === 'pause') rows[taskId!] = { ...current, enabled: false, disabledReason: 'manual' };
+      else rows[taskId!] = { ...current, prompt: request.prompt };
       writeFileSync(f.path, JSON.stringify(rows));
       return res.end(JSON.stringify({ ok: true }));
     }
@@ -127,7 +136,7 @@ async function managed(f: ReturnType<typeof fixture>, customize?: (proof: Manage
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const port = (server.address() as { port: number }).port;
   replaceManagedOriginCapabilityFile(managedOriginCapabilityPath(f.dataDir, sid, channel), JSON.stringify({
-    sessionId: sid, channelId: channel, capability, turnId: 'om_live', larkAppId: app, ipcPort: port,
+    sessionId: sid, channelId: channel, capability, turnId: managedTurnId, larkAppId: app, ipcPort: port,
   }));
   Object.assign(f.env, { BOTMUX_SESSION_ID: sid, BOTMUX_ORIGIN_CHANNEL_ID: channel, BOTMUX_READ_ISOLATION: '1' });
   f.env.BOTMUX_DAEMON_IPC_PORT = String(port);
@@ -185,6 +194,15 @@ describe('schedule CLI prompt updates', () => {
     expect(result.output).toContain('not an allowed bot operator');
     expect(result.output).not.toContain('unauthorized');
     expect(f.read()['11223344']).toBeUndefined();
+  });
+  it('lets a scheduled turn remove itself through the daemon without human creator auth', async () => {
+    const f = fixture();
+    const scheduledTurnId = `schedule:${f.task.id}:12345678-1234-1234-1234-123456789abc`;
+    await managed(f, undefined, scheduledTurnId);
+    const result = await f.run(['remove', 'self']);
+    expect(result.code, result.output).toBe(0);
+    expect(result.output).toContain('已删除任务 self');
+    expect(f.read()[f.task.id]).toBeUndefined();
   });
   it('uses the daemon proof when host ancestry is visible but bots.json is unavailable', async () => {
     const f = fixture(); const calls = await managed(f);

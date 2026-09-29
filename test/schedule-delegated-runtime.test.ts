@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { authorizeDelegatedScheduleRun } from '../src/core/schedule-delegated-runtime.js';
+import { authorizeDelegatedScheduleRun, authorizeDelegatedScheduleSelfManage } from '../src/core/schedule-delegated-runtime.js';
 import type { ScheduleAuthorityRecord } from '../src/services/schedule-authority-store.js';
 import type { ScheduledTask } from '../src/types.js';
 
@@ -12,12 +12,14 @@ const task: ScheduledTask = {
 };
 const authority: ScheduleAuthorityRecord = {
   kind: 'delegated', state: 'active', task,
-  controlOpenId: 'ou_user_target', controlUnionId: 'on_user', runScopes: [],
+  controlOpenId: 'ou_user_target', controlUnionId: 'on_user',
+  credentialOpenId: 'ou_user_source', runScopes: ['bytedcli'], selfManage: true,
 };
 
 const deps = () => ({
   runEnabled: true,
-  triggerUserAuthEnabled: true,
+  hostRunScopes: ['bytedcli'] as const,
+  triggerUserAuthTools: ['lark-cli', 'bytedcli'] as const,
   adminOpenIds: ['ou_user_target'],
   resolveTargetOpenId: vi.fn(async () => 'ou_user_target'),
   listChatMemberOpenIds: vi.fn(async () => ['ou_user_target']),
@@ -27,7 +29,8 @@ describe('delegated schedule runtime authorization', () => {
   it('rechecks operator and membership then strips generic human identity', async () => {
     const input = deps();
     await expect(authorizeDelegatedScheduleRun(task, authority, input)).resolves.toEqual({
-      ...task, ownerOpenId: undefined, ownerUnionId: undefined,
+      task: { ...task, ownerOpenId: undefined, ownerUnionId: undefined },
+      targetOpenId: 'ou_user_target',
     });
     expect(input.resolveTargetOpenId).toHaveBeenCalledWith('on_user');
     expect(input.listChatMemberOpenIds).toHaveBeenCalledWith('oc_chat');
@@ -35,7 +38,8 @@ describe('delegated schedule runtime authorization', () => {
 
   it.each([
     [{ runEnabled: false }, 'revoked by host policy'],
-    [{ triggerUserAuthEnabled: false }, 'requires triggerUserAuth isolation'],
+    [{ triggerUserAuthTools: ['bytedcli'] }, 'requires triggerUserAuth isolation'],
+    [{ hostRunScopes: [] }, 'run scope is no longer allowed'],
     [{ adminOpenIds: [] }, 'no longer an allowed bot operator'],
   ])('fails closed before dispatch for %o', async (patch, message) => {
     await expect(authorizeDelegatedScheduleRun(task, authority, { ...deps(), ...patch }))
@@ -49,5 +53,20 @@ describe('delegated schedule runtime authorization', () => {
     await expect(authorizeDelegatedScheduleRun(task, authority, {
       ...deps(), listChatMemberOpenIds: async () => [],
     })).rejects.toThrow('no longer a target chat member');
+  });
+
+  it('allows only explicitly enabled self-management after live controller checks', async () => {
+    await expect(authorizeDelegatedScheduleSelfManage(authority, {
+      selfManageEnabled: true,
+      adminOpenIds: ['ou_user_target'],
+      resolveTargetOpenId: async () => 'ou_user_target',
+      listChatMemberOpenIds: async () => ['ou_user_target'],
+    })).resolves.toBeUndefined();
+    await expect(authorizeDelegatedScheduleSelfManage(authority, {
+      selfManageEnabled: false,
+      adminOpenIds: ['ou_user_target'],
+      resolveTargetOpenId: async () => 'ou_user_target',
+      listChatMemberOpenIds: async () => ['ou_user_target'],
+    })).rejects.toThrow('self-management is not allowed');
   });
 });
