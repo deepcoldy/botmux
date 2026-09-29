@@ -788,7 +788,6 @@ executors:
 afterEach(() => {
   modules?.daemon.__testOnly_activeSessions.clear();
   modules?.workerPool.setActiveSessionsRegistry(undefined);
-  modules?.sessionStore.init();
   delete process.env.SESSION_DATA_DIR;
   delete process.env.BOTMUX_COMMAND_EXECUTORS_FILE;
   if (ORIGINAL_HOME === undefined) delete process.env.HOME;
