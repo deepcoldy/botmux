@@ -30,21 +30,120 @@ const server = new Server(
   },
 );
 
-server.setRequestHandler(ListToolsRequestSchema, request => request.params?.cursor
-  ? {
-      tools: [{ name: `${serverName}_unique`, description: `${serverName} unique`, inputSchema: { type: 'object' } }],
-    }
-  : {
-      tools: [{ name: 'echo', description: `${serverName} echo`, inputSchema: { type: 'object' } }],
-      nextCursor: 'second-page',
-    });
+const contractTool = serverName === 'data'
+  ? 'execute_frozen_query'
+  : serverName === 'report'
+    ? 'render_report'
+    : undefined;
+const jsonTool = serverName === 'json-report' ? 'read_report' : undefined;
 
-server.setRequestHandler(CallToolRequestSchema, request => ({
-  content: [{
-    type: 'text',
-    text: `${serverName}:${request.params.name}:${JSON.stringify(request.params.arguments ?? {})}:meta=${JSON.stringify(request.params._meta ?? {})}:session=${process.env.BOTMUX_SESSION_ID || ''}:token=${process.env.PRIVATE_MCP_TOKEN || ''}`,
-  }],
-}));
+server.setRequestHandler(ListToolsRequestSchema, request => (contractTool || jsonTool)
+  ? {
+      tools: [
+        { name: contractTool ?? jsonTool, description: 'execute frozen command', inputSchema: { type: 'object' } },
+      ],
+    }
+  : request.params?.cursor
+    ? {
+        tools: [{ name: `${serverName}_unique`, description: `${serverName} unique`, inputSchema: { type: 'object' } }],
+      }
+    : {
+        tools: [{ name: 'echo', description: `${serverName} echo`, inputSchema: { type: 'object' } }],
+        nextCursor: 'second-page',
+      });
+
+server.setRequestHandler(CallToolRequestSchema, request => {
+  if (contractTool) {
+    const args = request.params.arguments ?? {};
+    const trusted = request.params._meta?.botmuxTrustedCaller;
+    if (process.env.BOTMUX_SESSION_ID || !process.env.BOTMUX_EXECUTION_ID || trusted?.requestUserUnionId !== 'on_test') {
+      return { isError: true, content: [{ type: 'text', text: 'wrong_identity' }] };
+    }
+    if (request.params.name === contractTool) {
+      if (args.values?.days !== 30 || Object.hasOwn(args.values ?? {}, 'sql') || Object.hasOwn(args.values ?? {}, 'report')) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              contractVersion: 1,
+              status: 'error',
+              errorCode: 'invalid_request',
+              message: 'parameter values must be keyed by command parameter name',
+            }),
+          }],
+        };
+      }
+      if (args.payload?.sql?.includes('RETURN_VALIDATION_ERROR')) {
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              contractVersion: 1,
+              status: 'error',
+              errorCode: 'untrusted_caller',
+              message: 'raw plugin secret: missing execution context',
+            }),
+          }],
+        };
+      }
+      if (args.payload?.sql?.includes('RETURN_MATH_TEXT')) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          contractVersion: 1,
+          status: 'success',
+          fallbackText: 'a<b 且 c>d',
+          blocks: [{ type: 'markdown', markdown: 'a<b 且 c>d' }],
+        }) }] };
+      }
+      if (args.payload?.sql?.includes('RETURN_RAW_HTML')) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          contractVersion: 1,
+          status: 'success',
+          fallbackText: '<a href="https://evil.example">click</a>',
+          blocks: [{ type: 'markdown', markdown: '<a href="https://evil.example">click</a>' }],
+        }) }] };
+      }
+      return { content: [{ type: 'text', text: JSON.stringify({
+        contractVersion: 1,
+        status: 'success',
+        fallbackText: serverName === 'report' ? 'second-plugin-ok' : '12',
+        blocks: [{ type: 'markdown', markdown: serverName === 'report' ? 'second-plugin-ok' : '12' }],
+        meta: { queryId: 'q_fixture', totalRows: 1 },
+        data: {
+          rows: [{ amount: 12 }],
+          columns: [{ key: 'amount', label: 'amount' }],
+          totalRows: 1,
+        },
+      }) }] };
+    }
+    return { isError: true, content: [{ type: 'text', text: 'query_plan_sql_mismatch' }] };
+  }
+  if (jsonTool && request.params.name === jsonTool) {
+    const trusted = request.params._meta?.botmuxTrustedCaller;
+    if (trusted?.requestUserUnionId !== 'on_test') {
+      return { isError: true, content: [{ type: 'text', text: 'wrong_identity' }] };
+    }
+    return {
+      content: [{ type: 'text', text: 'report ready' }],
+      structuredContent: {
+        rows: [
+          {
+            name: request.params.arguments?.days === 31
+              ? '[点我领奖](http://evil.example) **bold** _italic_'
+              : `report-${request.params.arguments?.days}`,
+            total: 12,
+            secret: 'hidden',
+          },
+        ],
+      },
+    };
+  }
+  return {
+    content: [{
+      type: 'text',
+      text: `${serverName}:${request.params.name}:${JSON.stringify(request.params.arguments ?? {})}:meta=${JSON.stringify(request.params._meta ?? {})}:session=${process.env.BOTMUX_SESSION_ID || ''}:token=${process.env.PRIVATE_MCP_TOKEN || ''}:execution=${process.env.BOTMUX_EXECUTION_ID || ''}`,
+    }],
+  };
+});
 
 server.setRequestHandler(ListPromptsRequestSchema, () => ({
   prompts: [{ name: 'welcome', description: `${serverName} welcome` }],

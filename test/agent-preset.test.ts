@@ -31,6 +31,7 @@ describe('buildPreset — secret-free allow-list', () => {
       larkAppId: 'cli_xxx_secret_app',
       larkAppSecret: 'super-secret-value',
       allowedUsers: ['alice@example.com'],
+      frozenCommandAdmins: ['on_alice'],
       allowedChatGroups: ['oc_team'],
       oncallChats: ['oc_oncall'],
       workingDir: '/Users/alice/projects',
@@ -42,7 +43,7 @@ describe('buildPreset — secret-free allow-list', () => {
     expect(Object.keys(preset).sort()).toEqual(
       ['botmuxPreset', 'capability', 'cliId', 'guide', 'model', 'sourceName', 'teamRole'].sort(),
     );
-    for (const leaked of ['larkAppId', 'larkAppSecret', 'allowedUsers', 'allowedChatGroups', 'oncallChats', 'workingDir']) {
+    for (const leaked of ['larkAppId', 'larkAppSecret', 'allowedUsers', 'frozenCommandAdmins', 'allowedChatGroups', 'oncallChats', 'workingDir']) {
       expect(preset).not.toHaveProperty(leaked);
     }
     expect(preset).not.toHaveProperty('nativeSubagentRuntime');

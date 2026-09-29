@@ -498,6 +498,7 @@ export const CLONE_IDENTITY_KEYS = [
   'larkAppSecret',
   'brand',
   'allowedUsers',
+  'frozenCommandAdmins',
   'ownerOpenId',
 ] as const;
 

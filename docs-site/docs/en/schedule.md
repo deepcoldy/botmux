@@ -193,6 +193,8 @@ Supported CLIs are Codex, Claude Code, Grok and TraeX (the same gate as the trig
 
 > Execution behavior: the execution position determines the target first. With an explicit `--topic`, an active session in the target topic receives the prompt directly (no new worker); otherwise, a new worker starts in the task's saved working directory. Chat-top-level tasks select a session according to the bot/chat session mode. `--new-topic` uses a fresh session for every run; combined with `--silent`, it creates the topic only when the first `botmux send` needs to deliver content. A dedicated task topic creates the task's own topic on its first fire (a non-silent run posts a seed message anchored as the root; a silent run defers materialization to the first `botmux send`), and every later run is appended to that same session.
 
+> `--silent` suppresses only the task-start banner and normal successful output. Missing caller identity, unapproved or retired frozen commands, and execution failures are still delivered so a scheduled task cannot fail silently.
+
 ## Update a prompt in place
 
 Use `update` to change an existing task without deleting and recreating it:

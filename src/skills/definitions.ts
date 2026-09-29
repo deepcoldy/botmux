@@ -32,6 +32,7 @@ description: 在当前飞书/Lark 话题里创建、管理定时提醒（用 bot
 2. **继续当前话题必须显式传 --topic** —— 群内省略执行位置会默认发到群顶层；在当前话题运行时可省略 --chat-id / --root-msg-id，由 botmux 推断话题锚点
 3. 创建后把 task id 和下次执行时间回显给用户
 4. 如果用户是在编程会话里顺手说"以后每天X点都这样做"，先问他：是否希望到点以后自动在当前话题里继续
+5. **已安装的固化命令是例外**：如果 prompt 是 \`/<固化命令> [参数]\`，不要代替用户执行 \`botmux schedule add\`。请让真人在飞书里直接发送 canonical 形式 \`/schedule <规则> /<固化命令> [参数]\`；只有这个入口会记录任务创建人的可信 union_id，并在创建时校验命令状态与参数。CLI 创建的任务没有这份身份，插件执行器会按 fail-closed 拒绝。
 
 ## 支持的 schedule 格式
 
@@ -182,6 +183,105 @@ botmux session rename "排障｜支付链路超时"
 - 立即生效于 botmux 侧：Dashboard 各视图与 \`/sessions\` 列表；运行中的 CLI 若支持会 best-effort 同步原生会话名（resume picker），CLI 不在线或不支持时命令仍成功，回执会说明。
 - **飞书话题（omt）标题改不了**：开放平台没有话题改名接口，话题列表始终显示首条消息；本命令只改 botmux/Dashboard 标题，不要承诺"飞书里的话题名会变"。
 - **不要与 \`botmux-chat-rename\` 混用**：\`botmux chat rename\` 改的是**整个飞书群**的群名（话题群里是整个群，不是单个话题），影响所有话题和全部成员。只想规范当前任务标题时一律用 \`botmux session rename\`。
+`;
+
+const FROZEN_COMMAND_SKILL = `---
+name: botmux-freeze
+description: 把已经跑通并由用户确认正确的插件工具或白名单执行器调用固化成当前角色目录下的斜杠命令，也负责修改和废弃。用户说“把刚才这个固化成 /xxx”“安装固定命令”“freeze command”、要求修改/覆盖或废弃已有命令时触发。插件调用必须从本话题实际成功的工具记录提取，不得重新猜测内部载荷；确认卡不展示内部模板。
+---
+
+# botmux-freeze — 固化已跑通的插件或白名单能力
+
+用于已经在本话题里通过插件成功执行、且用户确认结果正确的调用，或管理员已经登记到执行器白名单中的稳定只读能力。不要把探索性问题、失败调用或需要临场判断的任务固化。
+
+## 不变量
+
+1. 插件工具调用只从本话题最近一次与用户所指业务问题对应的**实际成功工具调用**提取不透明载荷和样例结果；不得让模型重新生成一份内部模板代替录制。所有能力只能引用管理员白名单中真实存在的 executor id，不能生成或修改执行器白名单。
+2. 用户不需要看到内部模板。确认卡、回复、错误信息只展示业务说明、用法、样例结果和作用域。
+3. 会变化的业务输入必须参数化；例如“最近 7 天”应录为整数参数 \`days\`，默认 7，并设置合理 min/max。参数只能替换执行器允许的值，不能让用户提供任意表达式或内部对象名。
+4. 草稿只写到当前工作目录的 \`.botmux/frozen-command-drafts/<命令名>.yaml\`；**不要直接写** \`.botmux/commands/\`。命令属于当前角色/目录，不跨目录查找。
+5. 创建或修改只调用一次 \`botmux freeze apply\`，由宿主展示专用确认卡。用户只需点一次“确认创建/确认更新”；不要再让用户手工发送 \`/freeze approve\` 或 \`/freeze confirm\`，也不要叠加 \`botmux ask buttons\` 做第二次确认。
+6. 用户取消或确认过期时，宿主不会改动当前生效版本。修改场景下旧版本必须一直可用到确认成功。
+7. 覆盖同名命令时，专用确认卡必须明确展示“更新”以及旧/新定义 hash 摘要。
+8. 身份字段不得写入插件载荷；插件调用者身份由 BotMux Gateway metadata 注入。其它执行器只允许使用其白名单声明接受的系统上下文来源。
+
+## YAML 格式
+
+\`\`\`yaml
+schemaVersion: 2
+status: active
+name: 每日报告
+description: 获取最近 N 天的只读报告
+timezone: Asia/Shanghai
+executor: reporting.readonly
+params:
+  - name: days
+    label: 天数
+    type: integer
+    min: 1
+    max: 90
+    default: 7
+input:
+  days: "{{days}}"
+output:
+  format: table
+  prefix: "近 N 天报告：\\n"
+  maxChars: 20000
+\`\`\`
+
+支持的参数类型：
+
+- \`string\`：通用执行器可用，必须有 maxLength，可选 pattern；只有执行器白名单明确接受 \`param\` 来源时才能传入。
+- \`integer\`：必须有 min/max，可有 default；渲染为数字字面量。
+- \`enum\`：必须列出 values，可有 default；字符串由执行器按自身契约编码。
+- \`date\`：值为 \`YYYY-MM-DD\` 或定义期默认 \`today±N\`。
+
+参数按 YAML 中的顺序映射到位置参数，因此上例用法是 \`/每日报告 [天数]\`，调用示例为 \`/每日报告 30\`，不是 \`days=30\`。
+
+\`output.format\` 支持 \`text\`（默认）、\`markdown\`、\`table\`、\`auto\`。中间展示块只允许 markdown/table；\`format: text\` 仍发送安全转义后的纯文本消息，其余格式由飞书卡片或 Web 展示层分别安全渲染。不要使用原始 HTML。
+
+只有需要按结果选择展示或模型分析时才配置有序的 \`output.rules\`；第一条命中规则生效，每条规则必须且只能写 \`handoff\` 或 \`show\`。\`show: result\` 展示原结果，\`show: { text, format }\` 展示模板文字；没有规则或全部未命中时按 \`output.format\` 展示。条件可使用 \`q.*\`、\`run.*\` 与 \`cmd.*\`，handoff 能否执行仍受管理员白名单的 \`allowHandoff\` 限制。不要为新命令写 \`onError: fallback_llm\` 或 \`else\`。
+
+## 安装步骤
+
+1. 先调用 \`botmux freeze executors\` 读取宿主提供的安全参数契约，再确认目标 executor 已登记且本次 input 满足其字段、必填项、类型、来源与约束。插件场景从结构化工具记录提取最近一次成功调用的不透明载荷和样例结果；该命令不会返回 executable realpath、fixedArgs、scriptArtifacts 或插件私有配置。
+2. 将常量中真正需要用户每次调整的值替换为 \`{{param}}\`；固定业务口径（例如国家=泰国）保持常量。
+3. 明确参数类型、顺序、默认值和上下界；确保只读调用有明确的结果上限和时间范围。
+4. 检查当前目录是否已有同名已生效命令，用于区分创建和更新；不要覆盖它。
+5. 将候选 YAML 写到 \`.botmux/frozen-command-drafts/<命令名>.yaml\`，重新读取并核对 name、参数和内部载荷原文字节。不要执行外部能力作为安装副作用。
+6. 调用 \`botmux freeze apply /<命令> --file ".botmux/frozen-command-drafts/<命令名>.yaml" --reason "<安装或更新原因>"\`。宿主会冻结候选字节、定义 hash、目标 Bot、当前工作目录、真人身份和当前 revision，并展示一次性确认卡。
+7. 工具返回 \`awaiting_input\` 只表示确认卡已发送。此时停止操作，提示用户在卡片上确认；不要代替用户点击，也不要再发送任何 approve/confirm 命令。草稿可在卡片成功发出后清理，清理草稿不影响宿主已冻结的候选内容。
+8. 用户点击确认后，宿主原子发布候选版本并写审计；点击取消或超时则不改动当前生效版本。
+
+管理操作由宿主直接处理：
+
+## 业务人员自然语言入口（P0a）
+
+当用户用自然语言询问“有哪些固化命令 / 打开命令中心 / 我能运行什么”时，调用：
+
+\`botmux freeze list\`
+
+运行已安装的固化命令默认由宿主直达；只有命令定义显式配置并命中 \`output.rules\` 时，结果或执行失败才会交给模型，确认卡会明确提示这一点。用户可以发送精确的 \`/<命令名> [位置参数...]\`，或严格的单句 \`运行 /<命令名> [位置参数...]\`。如果一条消息因包含编号、清单、示例或其它讨论文本而进入模型，**不要**调用 \`botmux freeze run\` 或其它执行工具；只提示用户另发上述精确单句。这样可避免讨论中的命令示例被执行，也避免宿主直达后再出现第二张确认卡。
+
+创建、修改、废弃的自然语言入口：
+
+- 创建/修改按上面的草稿流程调用 \`botmux freeze apply\`。
+- 用户明确要求废弃唯一、精确命名的命令时，调用 \`botmux freeze rm /<命令> --reason "<原因>" [--replacement /<替代命令>]\`，然后让用户在专用卡片上确认。
+- 恢复与彻底撤销分别调用 \`botmux freeze restore\` / \`botmux freeze purge\`，同样只由用户点击一次专用卡片。命令 owner 与固化命令管理员都可发起彻底撤销；无可验证 owner 的旧命令仅管理员可接管。
+- 这些工具只提交候选变更；返回 \`awaiting_input\` 不代表变更已经生效。
+
+下列斜杠命令只保留给管理员排障/兼容，不作为业务人员主流程：
+
+- \`/freeze list\`：列出当前目录命令与用法。
+- \`/freeze list --all\`：同时列出已废弃/撤销的命令。
+- \`/freeze approve /<命令> --reason <原因>\`：兼容已直接写入 live 目录的旧流程，宿主改为返回一次性确认卡。
+- \`/freeze rm /<命令> --reason <原因> [--replacement /<替代命令>]\`：发起废弃并返回一次性确认卡。废弃只写 tombstone，不直接删除，因此后续同名调用会明确拒绝且不会落入模型。
+- \`/freeze restore /<命令> --reason <原因>\`：发起恢复并返回一次性确认卡，确认后生成新 revision。
+- \`/freeze purge /<命令> --reason <原因>\`：对已废弃命令发起不可逆撤销；确认后先提交 revoked 审计再删除 tombstone。
+- \`/freeze confirm <确认码>\`：仅供管理员排障旧卡，不向业务人员展示确认码。
+- 修改口径：重新跑通查询，再按本流程固化并覆盖旧文件。
+- 定时执行：让真人在飞书里直接发送 canonical 形式 \`/schedule <规则> /<命令> [参数]\`。不要代替用户执行 \`botmux schedule add\`；后者不会记录创建人的可信 union_id，插件执行器会按 fail-closed 拒绝。
+- 静默定时只抑制任务开始横幅和正常成功结果；身份缺失、未批准、已废弃或执行失败等异常仍会主动通知，不能把 \`--silent\` 当成吞掉错误。
 `;
 
 const HISTORY_SKILL = `---
@@ -1728,6 +1828,7 @@ export const WHITEBOARD_SKILL_NAME = 'botmux-whiteboard';
 export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-chat-rename', content: CHAT_RENAME_SKILL },
   { name: 'botmux-session-rename', content: SESSION_RENAME_SKILL },
+  { name: 'botmux-freeze', content: FROZEN_COMMAND_SKILL },
   { name: 'botmux-schedule', content: SCHEDULE_SKILL },
   { name: 'botmux-history', content: HISTORY_SKILL },
   { name: 'botmux-quoted', content: QUOTED_SKILL },
