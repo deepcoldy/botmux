@@ -152,6 +152,10 @@ export interface FrozenCommandDefinition {
   input: Record<string, string | number | boolean>;
   params: FrozenCommandParameter[];
   output: {
+    /** Presentation preference. The host keeps a structured result envelope
+     * and lets each transport render it; raw HTML is intentionally not part of
+     * the command definition because it is neither portable nor safe. */
+    format: 'text' | 'markdown' | 'table' | 'auto';
     text?: string;
     prefix?: string;
     suffix?: string;
@@ -169,6 +173,28 @@ export interface FrozenCommandDefinition {
   onError: 'fallback_llm' | 'fail';
 }
 
+export type FrozenCommandOutputScalar = string | number | boolean | null;
+
+export type FrozenCommandOutputBlock =
+  | { type: 'text'; text: string }
+  | { type: 'markdown'; markdown: string }
+  | {
+      type: 'table';
+      columns: Array<{ key: string; label: string }>;
+      rows: Array<Record<string, FrozenCommandOutputScalar>>;
+      totalRows: number;
+      truncated: boolean;
+    };
+
+/** Channel-neutral output kept by the frozen-command executor. Feishu renders
+ * it as a card today; a future Web surface can consume the same blocks without
+ * treating Feishu JSON or arbitrary HTML as the source of truth. */
+export interface FrozenCommandPresentation {
+  schemaVersion: 1;
+  fallbackText: string;
+  blocks: FrozenCommandOutputBlock[];
+}
+
 export interface FrozenCommandSnapshot {
   filePath: string;
   realpath: string;
@@ -180,6 +206,7 @@ export interface FrozenCommandExecutionResult {
   renderedSql?: string;
   referenceDate: string;
   text: string;
+  presentation: FrozenCommandPresentation;
   truncated: boolean;
   executorId: string;
   executorRevision?: string;
@@ -189,11 +216,12 @@ export interface FrozenCommandExecutionResult {
   businessResult?: {
     rows: Array<Record<string, string | number | boolean | bigint | null | undefined>>;
     totalRows: number;
+    columns?: Array<{ key: string; label: string }>;
   };
 }
 
 export type FrozenCommandScheduledOutput =
-  | { kind: 'deliver'; text: string }
+  | { kind: 'deliver'; text: string; presentation: FrozenCommandPresentation }
   | { kind: 'handoff'; prompt: string };
 
 export interface FrozenCommandNormalizedArgument {
@@ -635,10 +663,20 @@ function parseDefinition(raw: string, command: string): FrozenCommandDefinition 
   }
   const unused = params.filter(param => !referencedParams.includes(param.name));
   if (unused.length > 0) throw new FrozenCommandError('definition_unused_parameter', `参数未在 input 中使用：${unused.map(item => item.name).join(', ')}`);
-  let output: FrozenCommandDefinition['output'] = { maxChars: DEFAULT_MAX_OUTPUT_CHARS };
+  let output: FrozenCommandDefinition['output'] = {
+    format: 'text',
+    maxChars: DEFAULT_MAX_OUTPUT_CHARS,
+  };
   if (value.output !== undefined) {
     if (!isPlainObject(value.output)) throw new FrozenCommandError('definition_invalid_output', 'output 必须是对象');
-    onlyKeys(value.output, ['text', 'prefix', 'suffix', 'maxChars', 'when', 'handoff', 'else'], 'output');
+    onlyKeys(value.output, ['format', 'text', 'prefix', 'suffix', 'maxChars', 'when', 'handoff', 'else'], 'output');
+    const format = value.output.format ?? 'text';
+    if (format !== 'text' && format !== 'markdown' && format !== 'table' && format !== 'auto') {
+      throw new FrozenCommandError(
+        'definition_invalid_output',
+        'output.format 只能是 text、markdown、table 或 auto；HTML 由展示层安全渲染，不接受原始 HTML',
+      );
+    }
     const maxChars = value.output.maxChars ?? DEFAULT_MAX_OUTPUT_CHARS;
     if (!Number.isInteger(maxChars) || (maxChars as number) < 100 || (maxChars as number) > 100_000) {
       throw new FrozenCommandError('definition_invalid_output', 'output.maxChars 必须在 100-100000 之间');
@@ -673,6 +711,7 @@ function parseDefinition(raw: string, command: string): FrozenCommandDefinition 
       };
     }
     output = {
+      format,
       maxChars: maxChars as number,
       ...(typeof value.output.text === 'string' ? { text: value.output.text } : {}),
       ...(typeof value.output.prefix === 'string' ? { prefix: value.output.prefix } : {}),
@@ -1077,6 +1116,115 @@ export function frozenCommandResultText(result: Record<string, unknown>): string
   return rows.map((row, index) => `${index + 1}. ${renderRow(row)}`).join('\n');
 }
 
+const MAX_PRESENTATION_TABLE_ROWS = 50;
+const MAX_PRESENTATION_TABLE_COLUMNS = 20;
+const MAX_PRESENTATION_CELL_CHARS = 1_000;
+
+function outputScalar(
+  value: unknown,
+  maxChars: number,
+): { value: FrozenCommandOutputScalar; truncated: boolean } {
+  if (value === null || value === undefined) return { value: null, truncated: false };
+  if (typeof value === 'number' && Number.isFinite(value)) return { value, truncated: false };
+  if (typeof value === 'boolean') return { value, truncated: false };
+  const text = safeBusinessText(typeof value === 'string' ? value : String(value));
+  return text.length > maxChars
+    ? { value: `${text.slice(0, Math.max(0, maxChars - 1))}…`, truncated: true }
+    : { value: text, truncated: false };
+}
+
+function presentationColumns(
+  business: NonNullable<FrozenCommandExecutionResult['businessResult']>,
+): Array<{ key: string; label: string }> {
+  const labels = new Map((business.columns ?? []).map(column => [column.key, column.label]));
+  const keys = [...new Set([
+    ...(business.columns ?? []).map(column => column.key),
+    ...business.rows.flatMap(row => Object.keys(row)),
+  ])].filter(key => business.rows.some(row => Object.hasOwn(row, key)));
+  return keys.slice(0, MAX_PRESENTATION_TABLE_COLUMNS).map(key => ({
+    key,
+    label: safeBusinessText(labels.get(key) ?? key),
+  }));
+}
+
+/** Convert an execution result into the portable display contract. `text`
+ * remains the exact backwards-compatible fallback while rich transports use
+ * the structured blocks. */
+export function buildFrozenCommandPresentation(input: {
+  definition: FrozenCommandDefinition;
+  text: string;
+  businessResult?: FrozenCommandExecutionResult['businessResult'];
+}): FrozenCommandPresentation {
+  const { definition, text, businessResult } = input;
+  const format = definition.output.format;
+  const columns = businessResult ? presentationColumns(businessResult) : [];
+  const useTable = (format === 'table' || format === 'auto')
+    && !!businessResult
+    && businessResult.rows.length > 0
+    && columns.length > 0
+    && (format === 'table' || businessResult.rows.length > 1 || columns.length > 1);
+  if (useTable && businessResult) {
+    const rawPrefix = definition.output.prefix?.trim();
+    const rawSuffix = definition.output.suffix?.trim();
+    const prefix = rawPrefix?.slice(0, definition.output.maxChars);
+    const suffixBudget = Math.max(0, definition.output.maxChars - (prefix?.length ?? 0));
+    const suffix = rawSuffix?.slice(0, suffixBudget);
+    const maxCellChars = Math.max(20, Math.min(
+      MAX_PRESENTATION_CELL_CHARS,
+      Math.floor(definition.output.maxChars / Math.max(1, columns.length)),
+    ));
+    let presentationChars = (prefix?.length ?? 0)
+      + (suffix?.length ?? 0)
+      + columns.reduce((sum, column) => sum + column.label.length, 0);
+    let valueTruncated = (rawPrefix?.length ?? 0) > (prefix?.length ?? 0)
+      || (rawSuffix?.length ?? 0) > (suffix?.length ?? 0);
+    const visibleRows: Array<Record<string, FrozenCommandOutputScalar>> = [];
+    for (const sourceRow of businessResult.rows.slice(0, MAX_PRESENTATION_TABLE_ROWS)) {
+      const row: Record<string, FrozenCommandOutputScalar> = {};
+      let rowChars = 0;
+      for (const column of columns) {
+        const cell = outputScalar(sourceRow[column.key], maxCellChars);
+        row[column.key] = cell.value;
+        rowChars += String(cell.value ?? '').length;
+        valueTruncated ||= cell.truncated;
+      }
+      if (visibleRows.length > 0 && presentationChars + rowChars > definition.output.maxChars) break;
+      visibleRows.push(row);
+      presentationChars += rowChars;
+    }
+    const blocks: FrozenCommandOutputBlock[] = [];
+    if (prefix) {
+      blocks.push({ type: 'markdown', markdown: prefix });
+    }
+    blocks.push({
+      type: 'table',
+      columns,
+      rows: visibleRows,
+      totalRows: businessResult.totalRows,
+      truncated: businessResult.totalRows > visibleRows.length
+        || businessResult.rows.length > visibleRows.length
+        || (businessResult.columns?.length ?? columns.length) > columns.length
+        || valueTruncated,
+    });
+    if (suffix) {
+      blocks.push({ type: 'markdown', markdown: suffix });
+    }
+    return { schemaVersion: 1, fallbackText: text, blocks };
+  }
+  if (format === 'markdown') {
+    return {
+      schemaVersion: 1,
+      fallbackText: text,
+      blocks: [{ type: 'markdown', markdown: text }],
+    };
+  }
+  return {
+    schemaVersion: 1,
+    fallbackText: text,
+    blocks: [{ type: 'text', text }],
+  };
+}
+
 function frozenOutputContext(result: FrozenCommandExecutionResult): Record<string, unknown> {
   const business = result.businessResult;
   if (!business) {
@@ -1172,14 +1320,18 @@ function processBusinessResult(
     ? Object.values(projected).find(Array.isArray)
     : contextValue(projected, container);
   if (Array.isArray(candidate) && candidate.every(isPlainObject)) {
+    const keys = [...new Set(candidate.flatMap(row => Object.keys(row)))];
     return {
       rows: candidate as Array<Record<string, string | number | boolean | bigint | null | undefined>>,
       totalRows: candidate.length,
+      columns: keys.map(key => ({ key, label: safeBusinessText(key) })),
     };
   }
+  const keys = Object.keys(projected);
   return {
     rows: [projected as Record<string, string | number | boolean | bigint | null | undefined>],
     totalRows: 1,
+    columns: keys.map(key => ({ key, label: safeBusinessText(key) })),
   };
 }
 
@@ -1270,11 +1422,27 @@ export function resolveFrozenCommandScheduledOutput(
   result: FrozenCommandExecutionResult,
 ): FrozenCommandScheduledOutput {
   const { when, handoff, else: elseOutput } = definition.output;
-  if (!when || !handoff || !elseOutput) return { kind: 'deliver', text: result.text };
+  if (!when || !handoff || !elseOutput) {
+    return { kind: 'deliver', text: result.text, presentation: result.presentation };
+  }
   const context = frozenOutputContext(result);
   if (!evaluateFrozenCommandOutputCondition(when, result)) {
     const text = `${definition.output.prefix ?? ''}${renderFrozenOutputTemplate(elseOutput.text, context)}${definition.output.suffix ?? ''}`;
-    return { kind: 'deliver', text: truncateFrozenOutput(text, definition.output.maxChars) };
+    const rendered = truncateFrozenOutput(text, definition.output.maxChars);
+    return {
+      kind: 'deliver',
+      text: rendered,
+      presentation: {
+        schemaVersion: 1,
+        fallbackText: rendered,
+        blocks: [{
+          type: definition.output.format === 'markdown' ? 'markdown' : 'text',
+          ...(definition.output.format === 'markdown'
+            ? { markdown: rendered }
+            : { text: rendered }),
+        } as FrozenCommandOutputBlock],
+      },
+    };
   }
   const business = result.businessResult!;
   const limitedRows = business.rows.slice(0, handoff.maxRows);
@@ -1485,18 +1653,25 @@ export async function executeFrozenCommand(input: {
         exitCode: executed.exitCode,
         signal: executed.signal,
       }));
+      const text = truncateFrozenOutput(decorated, input.definition.output.maxChars);
+      const businessResult = processBusinessResult(
+        executed.projected,
+        'container' in executor.output ? executor.output.container : undefined,
+      );
       return {
         referenceDate: resolved.referenceDate,
-        text: truncateFrozenOutput(decorated, input.definition.output.maxChars),
+        text,
+        presentation: buildFrozenCommandPresentation({
+          definition: input.definition,
+          text,
+          businessResult,
+        }),
         truncated: decorated.length > input.definition.output.maxChars,
         executorId: executor.id,
         executorRevision: currentExecutorRevision,
         executionId: executed.executionId,
         projectedResult: executed.projected,
-        businessResult: processBusinessResult(
-          executed.projected,
-          'container' in executor.output ? executor.output.container : undefined,
-        ),
+        businessResult,
       };
     } catch (error) {
       logger.warn('[frozen-command:audit]', frozenCommandAuditRecord({
@@ -1589,16 +1764,29 @@ export async function executeFrozenCommand(input: {
       startedAt,
       truncated,
     }));
+    const resultText = truncateFrozenOutput(decorated, input.definition.output.maxChars);
+    const executionBusinessResult = businessResult
+      ? {
+          rows: businessResult.rows,
+          totalRows: businessResult.totalRows,
+          columns: [...businessResult.columnLabels.entries()].map(([key, label]) => ({ key, label })),
+        }
+      : undefined;
     return {
       renderedSql,
       referenceDate: rendered.referenceDate,
-      text: truncateFrozenOutput(decorated, input.definition.output.maxChars),
+      text: resultText,
+      presentation: buildFrozenCommandPresentation({
+        definition: input.definition,
+        text: resultText,
+        businessResult: executionBusinessResult,
+      }),
       truncated,
       executorId: BUILTIN_DATA_MCP_EXECUTOR_ID,
       executorRevision: currentExecutorRevision,
       ...(queryId ? { queryId } : {}),
-      ...(businessResult
-        ? { businessResult: { rows: businessResult.rows, totalRows: businessResult.totalRows } }
+      ...(executionBusinessResult
+        ? { businessResult: executionBusinessResult }
         : {}),
     };
   } catch (error) {

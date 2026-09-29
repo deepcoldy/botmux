@@ -109,6 +109,7 @@ import {
   userFacingFrozenCommandError,
 } from '../services/frozen-command.js';
 import { evaluateFrozenCommandLifecycle } from '../services/frozen-command-lifecycle.js';
+import { renderFrozenCommandLarkReply } from '../im/lark/frozen-command-card.js';
 import { createHeadlessRecord, headlessChatId, newHeadlessId, saveHeadlessSession } from '../services/headless-session-store.js';
 import {
   reconcileXpiSharedCwdRecovery,
@@ -4128,10 +4129,13 @@ export async function executeScheduledTask(
       workingDir: task.workingDir,
       command: frozenInvocation.cmd,
     });
-    const deliver = async (text: string): Promise<void> => {
+    const deliver = async (
+      text: string,
+      msgType: 'text' | 'interactive' = 'text',
+    ): Promise<void> => {
       const replyRoot = sharedTopicRootId ?? (anchor === task.chatId ? undefined : anchor);
-      if (replyRoot) await replyMessage(larkAppId, replyRoot, text, 'text', true);
-      else await sendMessage(larkAppId, task.chatId, text);
+      if (replyRoot) await replyMessage(larkAppId, replyRoot, text, msgType, true);
+      else await sendMessage(larkAppId, task.chatId, text, msgType);
     };
     if (lifecycle.kind === 'retired') {
       const payload = lifecycle.record.tombstonePayload;
@@ -4200,7 +4204,8 @@ export async function executeScheduledTask(
             })}`);
             return;
           }
-          await deliver(output.text);
+          const renderedReply = renderFrozenCommandLarkReply(output.presentation, task.workingDir);
+          await deliver(renderedReply.content, renderedReply.msgType);
           return;
         }
         frozenHandoffPrompt = output.prompt;

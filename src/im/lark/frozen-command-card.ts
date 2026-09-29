@@ -1,8 +1,13 @@
 import type { FrozenCommandActionRecord } from '../../services/frozen-command-action.js';
 import type {
+  FrozenCommandOutputBlock,
+  FrozenCommandPresentation,
+} from '../../services/frozen-command.js';
+import type {
   FrozenCommandLifecycleAction,
   FrozenCommandPreparedTransition,
 } from '../../services/frozen-command-lifecycle.js';
+import { buildCardBodyElements, createReplyCard } from './md-card.js';
 
 export const FROZEN_COMMAND_ACTION_CONFIRM = 'frozen_command_run_confirm' as const;
 export const FROZEN_COMMAND_ACTION_CANCEL = 'frozen_command_run_cancel' as const;
@@ -29,6 +34,55 @@ function escapeMd(value: string): string {
 
 function card(body: Record<string, unknown>): string {
   return JSON.stringify({ schema: '2.0', ...body });
+}
+
+export interface FrozenCommandLarkReply {
+  content: string;
+  msgType: 'text' | 'interactive';
+}
+
+function markdownTable(block: Extract<FrozenCommandOutputBlock, { type: 'table' }>): string {
+  const cell = (value: unknown): string => String(value ?? '—')
+    .replace(/\|/g, '\\|')
+    .replace(/[\r\n]+/g, ' ');
+  const header = `| ${block.columns.map(column => cell(column.label)).join(' | ')} |`;
+  const separator = `| ${block.columns.map(() => '---').join(' | ')} |`;
+  const rows = block.rows.map(row => `| ${block.columns.map(column => cell(row[column.key])).join(' | ')} |`);
+  const note = block.truncated
+    ? `\n\n共 ${block.totalRows} 行，仅展示前 ${block.rows.length} 行或前 ${block.columns.length} 列。`
+    : '';
+  return [header, separator, ...rows].join('\n') + note;
+}
+
+function sanitizeRichMarkdown(value: string): string {
+  return value.replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/** Render the channel-neutral frozen-command presentation for Feishu. Plain
+ * text keeps the legacy message shape; markdown/table output becomes a safe
+ * schema-v2 card through the shared markdown renderer (raw HTML is disabled
+ * there). */
+export function renderFrozenCommandLarkReply(
+  presentation: FrozenCommandPresentation,
+  workingDir = process.cwd(),
+): FrozenCommandLarkReply {
+  if (presentation.blocks.length === 1 && presentation.blocks[0]?.type === 'text') {
+    return { content: presentation.blocks[0].text, msgType: 'text' };
+  }
+  const elements = presentation.blocks.flatMap(block => {
+    if (block.type === 'text') {
+      return buildCardBodyElements(escapeMd(block.text), workingDir, 'disabled');
+    }
+    return buildCardBodyElements(
+      block.type === 'markdown' ? sanitizeRichMarkdown(block.markdown) : markdownTable(block),
+      workingDir,
+      'disabled',
+    );
+  });
+  if (elements.length === 0) {
+    return { content: presentation.fallbackText, msgType: 'text' };
+  }
+  return { content: JSON.stringify(createReplyCard(elements)), msgType: 'interactive' };
 }
 
 export function buildFrozenCommandCenterCard(input: {

@@ -159,6 +159,7 @@ import {
   FROZEN_COMMAND_ACTION_CONFIRM,
   FROZEN_COMMAND_LIFECYCLE_CANCEL,
   FROZEN_COMMAND_LIFECYCLE_CONFIRM,
+  renderFrozenCommandLarkReply,
   type FrozenCommandCenterRow,
 } from './im/lark/frozen-command-card.js';
 import * as messageQueue from './services/message-queue.js';
@@ -5844,7 +5845,8 @@ async function routeFrozenCommand(input: {
         stateRevisionId: lifecycle.record.stateRevisionId,
       },
     });
-    await input.reply(input.anchor, result.text, 'text', input.larkAppId);
+    const renderedReply = renderFrozenCommandLarkReply(result.presentation, input.workingDir);
+    await input.reply(input.anchor, renderedReply.content, renderedReply.msgType, input.larkAppId);
     return { kind: 'handled' };
   } catch (error) {
     if (shouldFallbackFrozenCommand(definition, error)) {
@@ -6483,11 +6485,12 @@ const handleCodexNotifierCardAction = createCodexNotifierCardActionHandler({
 async function deliverFrozenCommandActionResult(
   action: FrozenCommandActionRecord,
   content: string,
+  msgType: 'text' | 'interactive' = 'text',
 ): Promise<void> {
   if (action.scope === 'thread') {
-    await sessionReply(action.rootMessageId, content, 'text', action.targetBotId);
+    await sessionReply(action.rootMessageId, content, msgType, action.targetBotId);
   } else {
-    await sendMessage(action.targetBotId, action.chatId, content, 'text');
+    await sendMessage(action.targetBotId, action.chatId, content, msgType);
   }
 }
 
@@ -6568,9 +6571,10 @@ async function executeClaimedFrozenCommandAction(action: FrozenCommandActionReco
     if (!settled) throw new Error('action_settlement_conflict');
     const completed = getFrozenCommandAction(config.session.dataDir, action.id);
     if (!completed) throw new Error('action_record_missing_after_completion');
+    const renderedReply = renderFrozenCommandLarkReply(result.presentation, action.workingDir);
     await Promise.allSettled([
       patchFrozenCommandActionCard(completed),
-      deliverFrozenCommandActionResult(completed, result.text),
+      deliverFrozenCommandActionResult(completed, renderedReply.content, renderedReply.msgType),
     ]);
   } catch (error) {
     const errorCode = error instanceof FrozenCommandError ? error.code : 'execution_failed';

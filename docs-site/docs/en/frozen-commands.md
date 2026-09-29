@@ -5,13 +5,17 @@ Frozen commands turn a verified query or read-only script into a slash command. 
 ## Lifecycle and permissions
 
 - Creating or updating a command requires the same human to click the host confirmation card within 10 minutes. Writing YAML alone never authorizes execution.
-- The human who confirms creation becomes the owner and may update, retire, or restore the command.
-- Permanent revocation requires the command to be retired first and always requires a `frozenCommandAdmins` administrator.
+- The human who confirms creation becomes the owner and may update, retire, restore, or permanently revoke the command. Administrators may override; legacy commands without a verifiable owner still require an administrator claim.
+- Permanent revocation requires retirement first, is irreversible, and must be confirmed by the same human in the dedicated card.
 - Create, update, retire, restore, and revoke operations all require a reason between 1 and 500 characters.
 - In a group chat, mention the target bot. This also applies to administrative commands such as `/freeze list`.
 - When a bot enables `restrictGrantCommands`, visitors who can chat only through `chatGrants` or `globalGrants` cannot use `/freeze` or installed frozen commands. The restriction also covers natural-language direct execution and non-ASCII command names. Owners, `allowedUsers`, on-call users, and full-chat members keep their existing permission behavior.
 
 Live definitions are stored in `<working-directory>/.botmux/commands/*.yaml`; drafts use `<working-directory>/.botmux/frozen-command-drafts/*.yaml`. These files may contain business SQL. The botmux source repository ignores both paths at any directory depth; add the same rules to other working repositories. Copy sanitized definitions to a dedicated, access-controlled configuration repository if versioning is required.
+
+## Result presentation
+
+`output.format` accepts `text` (the backward-compatible default), `markdown`, `table`, or `auto`. The host stores a versioned text/Markdown/table structure rather than raw HTML: Feishu renders rich results as cards, while a future Web surface can render the same structure with its own HTML sanitizer. Tables display at most 50 rows and 20 columns; the complete plain-text form remains available as a fallback.
 
 ## Administrator executor allowlist
 

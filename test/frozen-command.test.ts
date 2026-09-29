@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { installLocalPlugin } from '../src/core/plugins/install.js';
 import {
   FrozenCommandError,
+  buildFrozenCommandPresentation,
   executeFrozenCommand,
   evaluateFrozenCommandOutputCondition,
   frozenCommandUsage,
@@ -246,7 +247,15 @@ describe('Frozen Commands definition and positional UX', () => {
       ...result,
       businessResult: { rows: [{ max_drop: 0.1, total: 120 }], totalRows: 1 },
     });
-    expect(normal).toEqual({ kind: 'deliver', text: '今日正常，合计 120' });
+    expect(normal).toMatchObject({
+      kind: 'deliver',
+      text: '今日正常，合计 120',
+      presentation: {
+        schemaVersion: 1,
+        fallbackText: '今日正常，合计 120',
+        blocks: [{ type: 'text', text: '今日正常，合计 120' }],
+      },
+    });
 
     expect(() => resolveFrozenCommandScheduledOutput(definition, {
       ...result,
@@ -272,6 +281,48 @@ describe('Frozen Commands definition and positional UX', () => {
     const lookup = lookupFrozenCommand({ workingDir: root, command: '/泰国上账' });
     expect(lookup.kind).toBe('invalid');
     if (lookup.kind === 'invalid') expect(lookup.error.code).toBe('definition_invalid_output');
+  });
+
+  it('parses portable output formats and rejects raw HTML', () => {
+    expect(fixture(BASE.replace('output:\n', 'output:\n  format: table\n')).definition.output.format)
+      .toBe('table');
+    const root = join(tmpdir(), `botmux-frozen-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    dirs.push(root);
+    mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
+    writeFileSync(
+      join(root, '.botmux', 'commands', '泰国上账.yaml'),
+      BASE.replace('output:\n', 'output:\n  format: html\n'),
+    );
+    const lookup = lookupFrozenCommand({ workingDir: root, command: '/泰国上账' });
+    expect(lookup.kind).toBe('invalid');
+    if (lookup.kind === 'invalid') expect(lookup.error.message).toContain('不接受原始 HTML');
+  });
+
+  it('builds a bounded channel-neutral table presentation with a text fallback', () => {
+    const { definition } = fixture(BASE.replace('output:\n', 'output:\n  format: table\n'));
+    const presentation = buildFrozenCommandPresentation({
+      definition,
+      text: '查询结果：\n金额：12',
+      businessResult: {
+        rows: [{ amount: 12, merchant: 'A' }, { amount: 18, merchant: 'B' }],
+        totalRows: 2,
+        columns: [{ key: 'amount', label: '金额' }, { key: 'merchant', label: '商户' }],
+      },
+    });
+    expect(presentation).toMatchObject({
+      schemaVersion: 1,
+      fallbackText: '查询结果：\n金额：12',
+      blocks: [
+        { type: 'markdown', markdown: '查询结果：' },
+        {
+          type: 'table',
+          columns: [{ key: 'amount', label: '金额' }, { key: 'merchant', label: '商户' }],
+          rows: [{ amount: 12, merchant: 'A' }, { amount: 18, merchant: 'B' }],
+          totalRows: 2,
+          truncated: false,
+        },
+      ],
+    });
   });
 
   it('uses column descriptions for multi-value rows and handles empty results', () => {

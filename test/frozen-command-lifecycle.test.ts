@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -339,7 +339,7 @@ onError: fail
     expect(updated.ownerUnionId).toBe(ACTOR.unionId);
   });
 
-  it('reserves irreversible revoke for an admin even when the actor is the owner', () => {
+  it('allows the command owner to irreversibly revoke after retirement', () => {
     const root = join(tmpdir(), `botmux-frozen-owner-revoke-${process.pid}-${Math.random().toString(36).slice(2)}`);
     roots.push(root);
     mkdirSync(root, { recursive: true });
@@ -372,9 +372,27 @@ onError: fail
       workingDir: root,
       command: '/生命周期测试',
       action: 'revoke',
+      actor: { openId: 'ou_other', unionId: 'on_other' },
+      reason: '非 owner 尝试彻底撤销',
+    })).toThrowError(/owner/);
+
+    const revoke = prepareFrozenCommandTransition({
+      dataDir,
+      targetBotId: BOT,
+      workingDir: root,
+      command: '/生命周期测试',
+      action: 'revoke',
       actor: ACTOR,
-      reason: 'owner 尝试彻底撤销',
-    })).toThrowError(/管理员/);
+      reason: 'owner 彻底撤销',
+    });
+    const revoked = confirmFrozenCommandTransition({
+      dataDir,
+      targetBotId: BOT,
+      token: revoke.token,
+      actor: ACTOR,
+    });
+    expect(revoked.state).toBe('revoked');
+    expect(existsSync(join(root, '.botmux', 'commands', '生命周期测试.yaml'))).toBe(false);
   });
 
   it('cancels a staged update without changing the current command and consumes the token', () => {

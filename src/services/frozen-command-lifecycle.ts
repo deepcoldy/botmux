@@ -561,19 +561,15 @@ export function prepareFrozenCommandTransition(input: {
   withDb(input.dataDir, db => transaction(db, () => {
     const current = selectRecord(db, input.targetBotId, key.commandPath, key.command);
     const definitionExists = existsSync(key.commandPath);
-    const requiresAdmin = input.action === 'revoke' || (current?.ownerUnionId
+    const requiresAdmin = current?.ownerUnionId
       ? current.ownerUnionId !== ownerActor
-      : current !== undefined || definitionExists);
+      : current !== undefined || definitionExists;
     if (requiresAdmin && !input.actorIsAdmin) {
       throw new FrozenCommandError(
-        input.action === 'revoke'
-          ? 'transition_admin_required'
-          : current?.ownerUnionId ? 'transition_owner_mismatch' : 'transition_owner_missing',
-        input.action === 'revoke'
-          ? `/${key.command} 的彻底撤销只能由固化命令管理员执行`
-          : current?.ownerUnionId
-            ? `只有 /${key.command} 的 owner 或固化命令管理员可以变更该命令`
-            : `/${key.command} 尚无可验证 owner，只能由固化命令管理员接管`,
+        current?.ownerUnionId ? 'transition_owner_mismatch' : 'transition_owner_missing',
+        current?.ownerUnionId
+          ? `只有 /${key.command} 的 owner 或固化命令管理员可以变更该命令`
+          : `/${key.command} 尚无可验证 owner，只能由固化命令管理员接管`,
       );
     }
     const ownerUnionId = current?.ownerUnionId ?? ownerActor;

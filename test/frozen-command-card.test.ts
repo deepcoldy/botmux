@@ -5,6 +5,7 @@ import {
   buildFrozenCommandLifecyclePreviewCard,
   buildFrozenCommandLifecycleStatusCard,
   buildFrozenCommandPreviewCard,
+  renderFrozenCommandLarkReply,
 } from '../src/im/lark/frozen-command-card.js';
 import type { FrozenCommandActionRecord } from '../src/services/frozen-command-action.js';
 
@@ -40,6 +41,34 @@ const action: FrozenCommandActionRecord = {
 };
 
 describe('Frozen Command business cards', () => {
+  it('keeps text output as text and renders markdown/table output as a safe Card 2.0 payload', () => {
+    expect(renderFrozenCommandLarkReply({
+      schemaVersion: 1,
+      fallbackText: 'plain',
+      blocks: [{ type: 'text', text: 'plain' }],
+    })).toEqual({ content: 'plain', msgType: 'text' });
+
+    const rendered = renderFrozenCommandLarkReply({
+      schemaVersion: 1,
+      fallbackText: 'fallback',
+      blocks: [
+        { type: 'markdown', markdown: '**经营日报** <script>alert(1)</script>' },
+        {
+          type: 'table',
+          columns: [{ key: 'merchant', label: '商户' }, { key: 'amount', label: '金额' }],
+          rows: [{ merchant: 'A|B', amount: 12 }],
+          totalRows: 1,
+          truncated: false,
+        },
+      ],
+    }, '/repo');
+    expect(rendered.msgType).toBe('interactive');
+    const parsed = JSON.parse(rendered.content) as any;
+    expect(parsed.schema).toBe('2.0');
+    expect(parsed.body.elements.some((element: any) => element.tag === 'table')).toBe(true);
+    expect(rendered.content).not.toContain('<script>');
+  });
+
   it('shows metadata only in the command center', () => {
     const rendered = buildFrozenCommandCenterCard({
       botLabel: '财务助手',

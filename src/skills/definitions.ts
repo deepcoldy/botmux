@@ -226,6 +226,7 @@ input:
   sql: |-
     SELECT ... WHERE dt >= today() - {{days}} LIMIT 100
 output:
+  format: table
   prefix: "近 N 天泰国上账：\\n"
   maxChars: 20000
 onError: fallback_llm
@@ -239,6 +240,8 @@ onError: fallback_llm
 - \`date\`：值为 \`YYYY-MM-DD\` 或定义期默认 \`today±N\`；渲染为 SQL 日期字符串。
 
 参数按 YAML 中的顺序映射到位置参数，因此上例用法是 \`/泰国上账 [天数]\`，调用示例为 \`/泰国上账 30\`，不是 \`days=30\`。
+
+\`output.format\` 支持 \`text\`（默认）、\`markdown\`、\`table\`、\`auto\`。优先使用结构化表格而不是原始 HTML；HTML 不进入命令定义，由飞书卡片或 Web 展示层分别安全渲染。
 
 ## 安装步骤
 
@@ -265,7 +268,7 @@ onError: fallback_llm
 
 - 创建/修改按上面的草稿流程调用 \`botmux freeze apply\`。
 - 用户明确要求废弃唯一、精确命名的命令时，调用 \`botmux freeze rm /<命令> --reason "<原因>" [--replacement /<替代命令>]\`，然后让用户在专用卡片上确认。
-- 恢复与彻底撤销分别调用 \`botmux freeze restore\` / \`botmux freeze purge\`，同样只由用户点击一次专用卡片。
+- 恢复与彻底撤销分别调用 \`botmux freeze restore\` / \`botmux freeze purge\`，同样只由用户点击一次专用卡片。命令 owner 与固化命令管理员都可发起彻底撤销；无可验证 owner 的旧命令仅管理员可接管。
 - 这些工具只提交候选变更；返回 \`awaiting_input\` 不代表变更已经生效。
 
 下列斜杠命令只保留给管理员排障/兼容，不作为业务人员主流程：

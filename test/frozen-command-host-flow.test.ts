@@ -11,12 +11,15 @@ const mocks = vi.hoisted(() => ({
   runCalls: 0,
   runResultShape: 'text' as 'top-level' | 'structured' | 'text' | 'malformed' | 'missing',
   cardBodies: [] as string[],
-  replyMessage: vi.fn(async (_app: string, _anchor: string, body: string) => {
+  messageTypes: [] as string[],
+  replyMessage: vi.fn(async (_app: string, _anchor: string, body: string, msgType = 'text') => {
     mocks.cardBodies.push(body);
+    mocks.messageTypes.push(msgType);
     return `om_card_${mocks.cardBodies.length}`;
   }),
-  sendMessage: vi.fn(async (_app: string, _chat: string, body: string) => {
+  sendMessage: vi.fn(async (_app: string, _chat: string, body: string, msgType = 'text') => {
     mocks.cardBodies.push(body);
+    mocks.messageTypes.push(msgType);
     return `om_card_${mocks.cardBodies.length}`;
   }),
   updateMessage: vi.fn(async () => undefined),
@@ -380,6 +383,7 @@ async function dispatchGrantGuestExistingThread(text: string): Promise<{
   const workerSend = vi.fn(() => true);
   ds.worker = { killed: false, send: workerSend };
   mocks.cardBodies.length = 0;
+  mocks.messageTypes.length = 0;
   mocks.validateCalls = 0;
   mocks.runCalls = 0;
 
@@ -774,6 +778,38 @@ executors:
     expect(mocks.cardBodies).toHaveLength(1);
     expect(mocks.cardBodies[0]).toContain('真实链路：');
     expect(mocks.cardBodies[0]).not.toContain('确认执行');
+  });
+
+  it('renders an opted-in table result as an interactive Feishu card on the direct host path', async () => {
+    const candidate = YAML.replace('output:\n', 'output:\n  format: table\n');
+    const pending = modules.lifecycle.prepareFrozenCommandTransition({
+      dataDir,
+      targetBotId: APP,
+      workingDir: root,
+      command: COMMAND,
+      action: 'approve',
+      actor: { openId: ACTOR_OPEN_ID, unionId: ACTOR_UNION_ID },
+      reason: '启用结构化表格结果',
+      candidateYaml: candidate,
+    });
+    modules.lifecycle.confirmFrozenCommandTransition({
+      dataDir,
+      targetBotId: APP,
+      token: pending.token,
+      actor: { openId: ACTOR_OPEN_ID, unionId: ACTOR_UNION_ID },
+    });
+    const messageId = `om_direct_table_${Math.random().toString(36).slice(2)}`;
+    await modules.daemon.__testOnly_handleNewTopic(
+      ingressEvent(messageId, '@_bot /宿主闭环 11'),
+      ingressContext(messageId, messageId),
+    );
+
+    expect(mocks.messageTypes.at(-1)).toBe('interactive');
+    const card = JSON.parse(mocks.cardBodies.at(-1)!) as any;
+    expect(card.schema).toBe('2.0');
+    expect(card.body.elements.some((element: any) => element.tag === 'table')).toBe(true);
+    expect(mocks.cardBodies.at(-1)).not.toContain('SELECT');
+    expect(mocks.cardBodies.at(-1)).not.toContain('query_id');
   });
 
   it('rejects a valid command definition that the current bot has not approved', async () => {
