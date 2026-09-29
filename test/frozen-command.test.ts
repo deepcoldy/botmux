@@ -628,7 +628,7 @@ executors:
       },
       turnId: 'om_turn', dataDir: join(home, '.botmux', 'data'),
     })).resolves.toMatchObject({
-      text: '步骤 main 执行失败：插件工具执行失败。',
+      text: '该部分暂时无法获取',
       steps: [{ status: 'error', error: { code: 'plugin_tool_execution_failed', executionFailure: true } }],
     });
   });

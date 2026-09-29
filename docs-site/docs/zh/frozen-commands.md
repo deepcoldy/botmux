@@ -7,6 +7,7 @@
 - 新建和更新必须由同一位真人在 10 分钟内确认；只写 YAML 不会获得执行权限。
 - 最终确认者是 owner。owner 与管理员可管理生命周期；彻底撤销不可逆，并需二次确认。
 - 修改命令、executor 或 renderer 会改变 revision，原批准立即失效，必须重新批准。
+- 本次多步骤升级会把执行器制品摘要改为列表口径：已有第三方执行器命令升级后首次检查可能出现一次预期的 binary drift 告警，按新 revision 重新批准即可。
 - 群聊里必须 @ 目标机器人；启用 `restrictGrantCommands` 时仍沿用 BotMux 的真实用户权限边界。
 - 命令定义位于 `<工作目录>/.botmux/commands/*.yaml`，候选位于 `.botmux/frozen-command-drafts/*.yaml`。其中可能包含业务 SQL，不应提交到公共源码仓库。
 
@@ -97,14 +98,14 @@ output:
     - show: result
 ```
 
-`steps[].id`、`executor`、`input`、`renderer` 都必填。数据 executor 使用 `builtin.table` 或登记的脚本 renderer；带 `content` 的 executor 只能使用 `builtin.content`。各步并行执行、互不传递数据，并同时受自己的 executor/renderer 超时与整条命令的总超时约束。`required` 默认 false：可选步骤失败时在原位置显示固定提示，其余步骤继续展示；必需步骤或任一闸门失败会让整条命令失败。
+`steps[].id`、`executor`、`input`、`renderer` 都必填，`status` 是保留 id。数据 executor 使用 `builtin.table` 或登记的脚本 renderer；带 `content` 的 executor 只能使用 `builtin.content`。各步并行执行、互不传递数据，同一条命令最多同时运行 3 步，并同时受自己的 executor/renderer 超时与整条命令的总超时约束。所有可预判闸门会在启动前检查；运行中出现闸门错误或必需步骤失败时，仍在运行或排队的步骤会被取消。`required` 默认 false：可选步骤失败时在原位置只显示“该部分暂时无法获取”，其余步骤继续展示。多步结果按定义顺序直接拼接并以空行分隔，不自动显示内部步骤 id。
 
 `output` 只允许：
 
 - `format: markdown | text`；省略时默认为 markdown；
 - `rules`：按顺序匹配，第一条命中即停止。每条规则必须且只能有 `handoff` 或 `show`。
 
-规则变量为 `q.<步骤 id>.*`、`run.status`、`run.<步骤 id>.*` 和 `cmd.*`。只要任一步失败，`run.status` 就是 `error`；每一步的状态和固定错误信息位于 `run.<步骤 id>.*`。没有规则或全部未命中时展示 renderer 的结果。`show: result` 展示结果；`show: {text: ...}` 展示安全插值后的文字。handoff 只携带 `allowHandoff: true` 的步骤数据，宿主固定注入命令上下文，错误只提供固定错误码与文案；定时能力则要求所有步骤都允许 `schedulable`。
+规则变量为 `q.<步骤 id>.*`、`run.status`、`run.<步骤 id>.*`，以及 `cmd.name`、`cmd.description`、`cmd.args.*`、`cmd.source`、`cmd.taskId`。只要任一步失败，`run.status` 就是 `error`；每一步只报告自己的状态和固定错误信息，成功步骤的 error 为空。引用失败步骤 `q.<id>.*` 的规则视为未命中并继续匹配。没有规则或全部未命中时展示 renderer 的结果。`show: result` 展示结果；`show: {text: ...}` 展示安全插值后的文字。handoff 只携带 `allowHandoff: true` 的步骤数据，宿主固定注入命令上下文，错误只提供固定错误码与文案；定时能力则要求所有步骤都允许 `schedulable`。
 
 旧字段不兼容并会直接拒绝，包括顶层 `executor` / `input`、`output.text`、`prefix` / `suffix`、`else`、`onError`、`format: table|auto`，以及白名单的 `risk`、`format: json`、`contractVersion`、`aliases`。
 

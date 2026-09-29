@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -23,7 +23,7 @@ function root(): string {
 
 function runner(path: string): string {
   writeFileSync(path, `
-import { existsSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 const [mode, id, expected = '0'] = process.argv.slice(2);
 if (mode === 'barrier') {
@@ -35,6 +35,37 @@ if (mode === 'barrier') {
   }
 }
 if (mode === 'slow') await new Promise(resolve => setTimeout(resolve, 1000));
+if (mode === 'fail-late') {
+  await new Promise(resolve => setTimeout(resolve, 150));
+  process.exit(7);
+}
+if (mode === 'fail-after-starts') {
+  writeFileSync(join(process.cwd(), '.started-' + id), '1');
+  const deadline = Date.now() + 1500;
+  while (readdirSync(process.cwd()).filter(name => name.startsWith('.started-')).length < Number(expected)) {
+    if (Date.now() >= deadline) process.exit(9);
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  process.exit(7);
+}
+if (mode === 'block') {
+  writeFileSync(join(process.cwd(), '.started-' + id), '1');
+  process.on('SIGTERM', () => {
+    writeFileSync(join(process.cwd(), '.cancelled-' + id), '1');
+    process.exit(0);
+  });
+  await new Promise(resolve => setTimeout(resolve, 5000));
+}
+if (mode === 'tracked') {
+  const marker = join(process.cwd(), '.running-' + id);
+  writeFileSync(marker, '1');
+  if (readdirSync(process.cwd()).filter(name => name.startsWith('.running-')).length > 3) {
+    writeFileSync(join(process.cwd(), '.over-limit'), '1');
+  }
+  await new Promise(resolve => setTimeout(resolve, 180));
+  if (existsSync(marker)) unlinkSync(marker);
+}
+if (mode === 'mark') writeFileSync(join(process.cwd(), '.started-' + id), '1');
 if (mode === 'fail') process.exit(7);
 console.log(JSON.stringify({ rows: [{ step: id, value: id + '-private' }], row_count: 1 }));
 `);
@@ -134,8 +165,8 @@ describe('Frozen Commands v2 multi-step execution', () => {
     });
     const result = await execute(fixture.dir, fixture.definition);
     expect(result.steps?.map(step => [step.id, step.status])).toEqual([['a', 'ok'], ['b', 'ok'], ['c', 'ok']]);
-    expect(result.text.indexOf('### a')).toBeLessThan(result.text.indexOf('### b'));
-    expect(result.text.indexOf('### b')).toBeLessThan(result.text.indexOf('### c'));
+    expect(result.text).not.toContain('### a');
+    expect(result.text).toBe(result.steps?.map(step => step.text).join('\n\n'));
     for (const id of ['a', 'b', 'c']) expect(existsSync(join(fixture.dir, `.started-${id}`))).toBe(true);
     const audits = logs.filter(row => row.event === 'frozen_command_execution');
     expect(audits.map(row => row.step_id)).toEqual(expect.arrayContaining(['a', 'b', 'c']));
@@ -170,12 +201,13 @@ describe('Frozen Commands v2 multi-step execution', () => {
   });
 
   it('keeps optional execution failures inline and exposes aggregate and per-step run status', async () => {
-    const rules = `    - when: "{{run.status}} == 'error' && {{run.b.status}} == 'error'"\n      show: { text: "b failed: {{run.b.error.code}}" }\n    - show: result`;
+    const rules = `    - when: "{{q.b.row_count}} == 0"\n      show: { text: "must not match" }\n    - when: "{{run.status}} == 'error' && {{run.b.status}} == 'error'"\n      show: { text: "b failed: {{run.b.error.code}}" }\n    - show: result`;
     const fixture = setup({ modes: { a: 'ok', b: 'fail', c: 'ok' }, rules });
     const result = await execute(fixture.dir, fixture.definition);
     expect(result.steps?.map(step => step.status)).toEqual(['ok', 'error', 'ok']);
-    expect(result.text).toContain('步骤 b 执行失败：');
-    expect(result.text).toContain('### c');
+    expect(result.text).toContain('该部分暂时无法获取');
+    expect(result.text).not.toContain('test.b');
+    expect(result.text).not.toContain('退出码');
     expect(resolveFrozenCommandOutput({
       definition: fixture.definition,
       rawArgs: '',
@@ -195,12 +227,22 @@ describe('Frozen Commands v2 multi-step execution', () => {
     expect(result.presentation.format).toBe('text');
   });
 
-  it('fails the whole command for required or gate failures', async () => {
-    const required = setup({ modes: { a: 'ok', b: 'fail', c: 'ok' }, required: true });
-    await expect(execute(required.dir, required.definition)).rejects.toMatchObject({
-      code: 'executor_non_zero_exit',
-      executionFailure: true,
-      stepResults: [{ status: 'ok' }, { status: 'error' }, { status: 'ok' }],
+  it('fails the whole command for required or gate failures and cancels running siblings', async () => {
+    const required = setup({ modes: { a: 'block', b: 'fail-after-starts', c: 'block' }, required: true });
+    const startedAt = Date.now();
+    let requiredFailure: unknown;
+    try {
+      await execute(required.dir, required.definition);
+    } catch (error) {
+      requiredFailure = error;
+    }
+    expect(requiredFailure).toMatchObject({ code: 'executor_non_zero_exit', executionFailure: true });
+    expect(Date.now() - startedAt).toBeLessThan(1500);
+    expect(requiredFailure).toMatchObject({
+      stepResults: expect.arrayContaining([
+        expect.objectContaining({ id: 'a', error: expect.objectContaining({ code: 'executor_cancelled' }) }),
+        expect.objectContaining({ id: 'c', error: expect.objectContaining({ code: 'executor_cancelled' }) }),
+      ]),
     });
 
     const gate = setup({ modes: { a: 'ok', b: 'ok', c: 'ok' } });
@@ -209,6 +251,115 @@ describe('Frozen Commands v2 multi-step execution', () => {
     await expect(execute(gate.dir, gate.definition, approvedRevision)).rejects.toMatchObject({
       code: 'executor_revision_changed',
       executionFailure: false,
+    });
+  });
+
+  it('keeps successful step errors empty when another required step fails', async () => {
+    const rules = `    - when: "{{run.status}} == 'error'"\n      handoff:\n        prompt: "a={{run.a.error.code}} b={{run.b.error.code}} c={{run.c.error.code}}"\n    - show: result`;
+    const policies = {
+      a: { schedulable: true, allowHandoff: true },
+      b: { schedulable: true, allowHandoff: true },
+      c: { schedulable: true, allowHandoff: true },
+    };
+    const fixture = setup({ modes: { a: 'ok', b: 'fail-late', c: 'ok' }, policies, required: true, rules });
+    let failure: unknown;
+    try {
+      await execute(fixture.dir, fixture.definition);
+    } catch (error) {
+      failure = error;
+    }
+    const output = resolveFrozenCommandOutput({
+      definition: fixture.definition,
+      rawArgs: '',
+      source: 'direct',
+      error: failure,
+    });
+    expect(output.kind).toBe('handoff');
+    if (output.kind === 'handoff') {
+      expect(output.prompt).toContain('a="" b="executor_non_zero_exit" c=""');
+    }
+  });
+
+  it('cancels queued steps and emits one audit row for every step after a required failure', async () => {
+    const dir = root();
+    const script = runner(join(dir, 'runner.mjs'));
+    const ids = ['a', 'b', 'c', 'd', 'e'];
+    const modes = { a: 'block', b: 'fail', c: 'block', d: 'mark', e: 'mark' };
+    const policies = Object.fromEntries(ids.map(id => [id, { schedulable: true, allowHandoff: false }]));
+    const registry = join(dir, 'command-executors.yaml');
+    writeFileSync(registry, registryYaml(script, modes, policies));
+    writeFileSync(join(dir, '.botmux', 'commands', '经营早报.yaml'), `
+schemaVersion: 2
+name: 经营早报
+description: 排队取消测试
+params: []
+steps:
+${ids.map(id => `  - { id: ${id}, executor: test.${id}, input: {}, renderer: builtin.table${id === 'b' ? ', required: true' : ''} }`).join('\n')}
+output: { format: markdown }
+`);
+    vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', registry);
+    const lookup = lookupFrozenCommand({ workingDir: dir, command: '/经营早报' });
+    if (lookup.kind !== 'found') throw new Error(`unexpected lookup: ${lookup.kind}`);
+    const audits: Array<Record<string, unknown>> = [];
+    vi.spyOn(logger, 'warn').mockImplementation((_message, context) => {
+      if (context && typeof context === 'object') audits.push(context as Record<string, unknown>);
+    });
+    let failure: unknown;
+    try {
+      await execute(dir, lookup.snapshot.definition);
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({
+      code: 'executor_non_zero_exit',
+      stepResults: expect.arrayContaining([
+        expect.objectContaining({ id: 'd', error: expect.objectContaining({ code: 'execution_cancelled' }) }),
+        expect.objectContaining({ id: 'e', error: expect.objectContaining({ code: 'execution_cancelled' }) }),
+      ]),
+    });
+    expect(existsSync(join(dir, '.started-d'))).toBe(false);
+    expect(existsSync(join(dir, '.started-e'))).toBe(false);
+    expect(new Set(audits.filter(row => row.event === 'frozen_command_execution').map(row => row.step_id))).toEqual(new Set(ids));
+  });
+
+  it('limits one command to three concurrently running steps', async () => {
+    const dir = root();
+    const script = runner(join(dir, 'runner.mjs'));
+    const ids = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
+    const modes = Object.fromEntries(ids.map(id => [id, 'tracked']));
+    const policies = Object.fromEntries(ids.map(id => [id, { schedulable: true, allowHandoff: false }]));
+    const registry = join(dir, 'command-executors.yaml');
+    writeFileSync(registry, registryYaml(script, modes, policies));
+    writeFileSync(join(dir, '.botmux', 'commands', '经营早报.yaml'), `
+schemaVersion: 2
+name: 经营早报
+description: 并发上限测试
+params: []
+steps:
+${ids.map(id => `  - { id: ${id}, executor: test.${id}, input: {}, renderer: builtin.table }`).join('\n')}
+output: { format: markdown }
+`);
+    vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', registry);
+    const lookup = lookupFrozenCommand({ workingDir: dir, command: '/经营早报' });
+    if (lookup.kind !== 'found') throw new Error(`unexpected lookup: ${lookup.kind}`);
+    const result = await execute(dir, lookup.snapshot.definition);
+    expect(result.steps?.map(step => step.id)).toEqual(ids);
+    expect(existsSync(join(dir, '.over-limit'))).toBe(false);
+    expect(readdirSync(dir).filter(name => name.startsWith('.running-'))).toEqual([]);
+  });
+
+  it('rejects the reserved status step id and removed cmd.executor namespace', () => {
+    const fixture = setup();
+    const commandPath = join(fixture.dir, '.botmux', 'commands', '经营早报.yaml');
+    writeFileSync(commandPath, commandYaml().replace('id: a', 'id: status'));
+    expect(lookupFrozenCommand({ workingDir: fixture.dir, command: '/经营早报' })).toMatchObject({
+      kind: 'invalid',
+      error: { code: 'definition_invalid_steps' },
+    });
+    writeFileSync(commandPath, commandYaml(false, `    - when: "{{cmd.executor}} == 'test.a'"\n      show: result`));
+    expect(lookupFrozenCommand({ workingDir: fixture.dir, command: '/经营早报' })).toMatchObject({
+      kind: 'invalid',
+      error: { code: 'definition_invalid_output' },
     });
   });
 
@@ -264,13 +415,21 @@ console.log(String.fromCharCode(96).repeat(3));
 `);
     const renderer = realpathSync(rendererPath);
     const registry = join(dir, 'command-executors.yaml');
-    writeFileSync(registry, `
+    const registryText = `
 schemaVersion: 2
 executors:
-  - id: data.query.readonly
+  - id: data.query.reg
     kind: process
     executable: { realpath: ${JSON.stringify(resolve(process.execPath))} }
-    fixedArgs: [${JSON.stringify(script)}, ok, data, "3"]
+    fixedArgs: [${JSON.stringify(script)}, ok, reg, "3"]
+    arguments:
+      sql: { flag: --sql, type: string, required: true, maxLength: 10000, accepts: [literal] }
+    output: { container: rows, exposeRowFields: [step, value], totalRowsField: row_count }
+    policy: { schedulable: true, allowHandoff: false, timeoutMs: 2000, maxOutputBytes: 65536 }
+  - id: data.query.top
+    kind: process
+    executable: { realpath: ${JSON.stringify(resolve(process.execPath))} }
+    fixedArgs: [${JSON.stringify(script)}, ok, top, "3"]
     arguments:
       sql: { flag: --sql, type: string, required: true, maxLength: 10000, accepts: [literal] }
     output: { container: rows, exposeRowFields: [step, value], totalRowsField: row_count }
@@ -289,7 +448,8 @@ renderers:
     fixedArgs: [${JSON.stringify(renderer)}]
     scriptArtifacts: [${JSON.stringify(renderer)}]
     policy: { timeoutMs: 2000, maxInputBytes: 1048576, maxOutputBytes: 60000 }
-`);
+`;
+    writeFileSync(registry, registryText);
     writeFileSync(join(dir, '.botmux', 'commands', '经营早报.yaml'), `
 schemaVersion: 2
 name: 经营早报
@@ -298,11 +458,11 @@ params:
   - { name: days, label: 天数, type: integer, min: 1, max: 90, default: 7 }
 steps:
   - id: reg
-    executor: data.query.readonly
+    executor: data.query.reg
     input: { sql: "SELECT dt, count() AS 注册数 … {{days}} …" }
     renderer: risk.trend-chart
   - id: top
-    executor: data.query.readonly
+    executor: data.query.top
     input: { sql: "SELECT 商户, 金额 … ORDER BY 金额 DESC LIMIT 10" }
     renderer: builtin.table
   - id: cal
@@ -323,7 +483,27 @@ output:
     const result = await execute(dir, lookup.snapshot.definition);
     expect(result.steps?.map(step => step.id)).toEqual(['reg', 'top', 'cal']);
     expect(result.text).toContain('```vega-lite');
-    expect(result.text.indexOf('### reg')).toBeLessThan(result.text.indexOf('### top'));
-    expect(result.text.indexOf('### top')).toBeLessThan(result.text.indexOf('### cal'));
+    expect(result.text).not.toContain('### reg');
+    expect(result.text).toBe(result.steps?.map(step => step.text).join('\n\n'));
+
+    const failedRegistry = join(dir, 'command-executors-reg-failed.yaml');
+    writeFileSync(failedRegistry, registryText.replace(
+      `fixedArgs: [${JSON.stringify(script)}, ok, reg, "3"]`,
+      `fixedArgs: [${JSON.stringify(script)}, fail, reg, "3"]`,
+    ));
+    vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', failedRegistry);
+    const failedRegResult = await execute(dir, lookup.snapshot.definition);
+    expect(failedRegResult.steps?.map(step => [step.id, step.status])).toEqual([
+      ['reg', 'error'],
+      ['top', 'ok'],
+      ['cal', 'ok'],
+    ]);
+    expect(failedRegResult.text).toContain('该部分暂时无法获取');
+    expect(() => resolveFrozenCommandOutput({
+      definition: lookup.snapshot.definition,
+      rawArgs: '',
+      source: 'direct',
+      result: failedRegResult,
+    })).not.toThrow();
   });
 });

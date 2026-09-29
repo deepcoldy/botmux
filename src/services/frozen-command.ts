@@ -99,6 +99,7 @@ const RELATIVE_DATE_RE = /^today(?:([+-])(\d{1,4}))?$/;
 const DEFAULT_TIMEZONE = 'Asia/Shanghai';
 const DEFAULT_MAX_OUTPUT_CHARS = 20_000;
 const PROCESS_EXECUTION_FAILURE_CODES = new Set([
+  'executor_cancelled',
   'executor_timeout',
   'executor_spawn_failed',
   'executor_non_zero_exit',
@@ -765,6 +766,9 @@ function parseDefinition(raw: string, command: string): FrozenCommandDefinition 
     onlyKeys(candidate, ['id', 'executor', 'input', 'renderer', 'required'], `steps[${index}]`);
     const id = nonBlank(candidate.id, `steps[${index}].id`, 64).trim();
     if (!PARAM_NAME_RE.test(id)) throw new FrozenCommandError('definition_invalid_steps', `steps[${index}].id 格式不合法`);
+    if (id === 'status') {
+      throw new FrozenCommandError('definition_invalid_steps', 'steps[].id 不能使用保留字 status');
+    }
     const executor = nonBlank(candidate.executor, `steps[${index}].executor`, 128).trim();
     const renderer = nonBlank(candidate.renderer, `steps[${index}].renderer`, 128).trim();
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(executor)
@@ -825,6 +829,7 @@ function parseDefinition(raw: string, command: string): FrozenCommandDefinition 
   const unused = params.filter(param => !referencedParams.includes(param.name));
   if (unused.length > 0) throw new FrozenCommandError('definition_unused_parameter', `参数未在 input 中使用：${unused.map(item => item.name).join(', ')}`);
   const stepIds = new Set(steps.map(step => step.id));
+  const parameterNames = new Set(params.map(param => param.name));
   const validateRuleNamespaces = (template: string, field: string): void => {
     for (const match of template.matchAll(OUTPUT_VARIABLE_RE)) {
       const path = match[1]!;
@@ -832,7 +837,8 @@ function parseDefinition(raw: string, command: string): FrozenCommandDefinition 
       const valid = (parts[0] === 'q' && parts.length >= 3 && stepIds.has(parts[1]!))
         || (parts[0] === 'run' && path === 'run.status')
         || (parts[0] === 'run' && parts.length >= 3 && stepIds.has(parts[1]!))
-        || (parts[0] === 'cmd' && parts.length >= 2);
+        || (parts[0] === 'cmd' && ['cmd.name', 'cmd.description', 'cmd.source', 'cmd.taskId'].includes(path))
+        || (parts[0] === 'cmd' && parts.length === 3 && parts[1] === 'args' && parameterNames.has(parts[2]!));
       if (!valid) {
         throw new FrozenCommandError('definition_invalid_output', `${field} 使用了非法变量命名空间：${path}`);
       }
@@ -1446,13 +1452,14 @@ export function resolveFrozenCommandOutput(input: {
   const runSteps = Object.fromEntries(definition.steps.map((step) => {
     const stepResult = resultSteps.find(candidate => candidate.id === step.id);
     const stepError = stepResult?.error;
+    const fallbackError = resultSteps.length === 0 ? safeError : undefined;
     return [step.id, {
       status: stepResult?.status ?? 'error',
       error: stepError ? {
         code: stepError.code,
         message: userFacingFrozenCommandError(stepError),
         transient: stepError.transient,
-      } : safeError ?? { code: '', message: '', transient: false },
+      } : fallbackError ?? { code: '', message: '', transient: false },
       executionId: stepResult?.executionId
         ?? result?.executionId
         ?? (error instanceof FrozenCommandError ? error.executionId : undefined)
@@ -1470,12 +1477,23 @@ export function resolveFrozenCommandOutput(input: {
       name: definition.name,
       description: definition.description,
       args: Object.fromEntries(normalized.args.map(argument => [argument.name, argument.value])),
-      executors: definition.steps.map(step => step.executor),
       source: input.source,
       taskId: input.taskId ?? '',
     },
   };
+  const failedStepIds = new Set(resultSteps
+    .filter(step => step.status === 'error')
+    .map(step => step.id));
   const matched = definition.output.rules.find((rule) => {
+    const templates = [
+      rule.when,
+      rule.handoff?.prompt,
+      rule.handoff?.data,
+      rule.show?.text,
+    ].filter((value): value is string => typeof value === 'string');
+    const referencesFailedStep = templates.some(template => [...template.matchAll(OUTPUT_VARIABLE_RE)]
+      .some(match => match[1]?.startsWith('q.') && failedStepIds.has(match[1].split('.')[1]!)));
+    if (referencesFailedStep) return false;
     // A show rule can only render a successful result. On failure it must not
     // swallow the original error or evaluate a q.* condition against an empty
     // result. Handoff rules remain eligible for execution-stage failures.
@@ -1762,6 +1780,7 @@ async function renderExecutorOutput(input: {
   workingDir?: string;
   executionId: string;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }): Promise<string> {
   const step = input.step;
   if (step.renderer === 'builtin.content') return sanitizeFrozenCommandMarkdown(input.output.content ?? '');
@@ -1773,6 +1792,7 @@ async function renderExecutorOutput(input: {
       renderer,
       workingDir: input.workingDir,
       timeoutMs: input.timeoutMs,
+      signal: input.signal,
       payload: {
         rows: input.output.rows,
         columns: input.output.columns,
@@ -1786,6 +1806,9 @@ async function renderExecutorOutput(input: {
     });
     return sanitizeFrozenCommandMarkdown(rendered.markdown);
   } catch (error) {
+    if (input.signal?.aborted) {
+      throw new FrozenCommandError('execution_cancelled', '固化命令执行已取消', undefined, true, false, input.executionId);
+    }
     logger.warn('[frozen-command:audit]', {
       event: 'renderer_failed',
       execution_id: input.executionId,
@@ -1856,6 +1879,7 @@ async function executeFrozenCommandStep(input: {
   normalizedArgs: FrozenCommandNormalizedArgument[];
   executionId: string;
   deadline: number;
+  signal: AbortSignal;
 }): Promise<FrozenCommandStepExecutionResult> {
   const { command, step, executor, renderer, resolved, executionId } = input;
   const rendererRevision = typeof renderer === 'string' ? renderer : renderer.revision;
@@ -1873,6 +1897,7 @@ async function executeFrozenCommandStep(input: {
         workingDir: command.workingDir,
         executionId,
         timeoutMs: remainingFrozenCommandBudget(input.deadline, executionId),
+        signal: input.signal,
       });
       executorOutput = executed.output;
       stdoutBytes = executed.stdoutBytes;
@@ -1884,8 +1909,15 @@ async function executeFrozenCommandStep(input: {
         executor.policy.timeoutMs,
       );
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      let timedOut = false;
+      const timeout = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, timeoutMs);
       timeout.unref?.();
+      const cancel = (): void => controller.abort();
+      input.signal.addEventListener('abort', cancel, { once: true });
+      if (input.signal.aborted) cancel();
       const gateway = new PluginMcpGateway([executor.plugin], {
         ...process.env,
         SESSION_DATA_DIR: command.dataDir,
@@ -1897,7 +1929,23 @@ async function executeFrozenCommandStep(input: {
       const client = new Client({ name: 'botmux-frozen-command', version: '1.0.0' });
       const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
       try {
-        await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
+        let rejectConnectAbort: ((reason: Error) => void) | undefined;
+        const connectAbort = new Promise<never>((_resolve, reject) => {
+          rejectConnectAbort = reject;
+        });
+        const abortConnect = (): void => rejectConnectAbort?.(new Error('plugin_tool_connect_aborted'));
+        controller.signal.addEventListener('abort', abortConnect, { once: true });
+        try {
+          await Promise.race([
+            Promise.all([
+              gateway.connect(serverTransport),
+              client.connect(clientTransport, { signal: controller.signal, timeout: timeoutMs, maxTotalTimeout: timeoutMs }),
+            ]),
+            connectAbort,
+          ]);
+        } finally {
+          controller.signal.removeEventListener('abort', abortConnect);
+        }
         const listed = await client.listTools(undefined, { signal: controller.signal, maxTotalTimeout: timeoutMs });
         const execute = toolName(listed.tools, executor.plugin, executor.tool);
         const descriptor = listed.tools.find(tool => tool.name === execute);
@@ -1924,7 +1972,10 @@ async function executeFrozenCommandStep(input: {
         executorOutput = materializeCommandExecutorOutput(executor.output, raw);
       } catch (error) {
         if (error instanceof FrozenCommandError || error instanceof CommandExecutorError) throw error;
-        if (controller.signal.aborted) {
+        if (input.signal.aborted) {
+          throw new FrozenCommandError('execution_cancelled', '固化命令执行已取消', undefined, true, false, executionId);
+        }
+        if (timedOut || controller.signal.aborted) {
           throw new FrozenCommandError('execution_timeout', '固化命令执行超时', undefined, true, true, executionId);
         }
         throw new FrozenCommandError(
@@ -1937,6 +1988,7 @@ async function executeFrozenCommandStep(input: {
         );
       } finally {
         clearTimeout(timeout);
+        input.signal.removeEventListener('abort', cancel);
         await Promise.allSettled([client.close(), gateway.close()]);
       }
     }
@@ -1953,6 +2005,7 @@ async function executeFrozenCommandStep(input: {
       workingDir: command.workingDir,
       executionId,
       timeoutMs: remainingFrozenCommandBudget(input.deadline, executionId),
+      signal: input.signal,
     });
     const businessResult = outputBusinessResult(executorOutput);
     logger.info('[frozen-command:audit]', frozenCommandAuditRecord({
@@ -2048,45 +2101,93 @@ export async function executeFrozenCommand(input: FrozenCommandExecutionInput): 
   const defaultTotalTimeoutMs = Math.max(...prepared.map(({ executor, renderer }) =>
     executor.policy.timeoutMs + (typeof renderer === 'string' ? 0 : renderer.policy.timeoutMs)));
   const deadline = Date.now() + Math.min(input.timeoutMs ?? defaultTotalTimeoutMs, 10 * 60_000);
-  const settled = await Promise.allSettled(prepared.map(item => executeFrozenCommandStep({
-    command: input,
-    step: item.step,
-    executor: item.executor,
-    renderer: item.renderer,
-    resolved: item.resolved,
-    normalizedArgs,
-    executionId,
-    deadline,
-  })));
-  const stepResults = settled.map((outcome, index): FrozenCommandStepExecutionResult => {
-    if (outcome.status === 'fulfilled') return outcome.value;
-    const step = prepared[index]!.step;
-    const error = normalizeFrozenStepError(outcome.reason, executionId);
-    return {
-      id: step.id,
-      executorId: prepared[index]!.executor.id,
-      executorRevision: prepared[index]!.executor.revision,
-      rendererId: step.renderer,
-      status: 'error',
-      text: `步骤 ${step.id} 执行失败：${userFacingFrozenCommandError(error)}`,
-      executionId,
-      error,
-    };
-  });
-  const gateFailure = stepResults.find(step => step.status === 'error' && !step.error?.executionFailure)?.error;
-  if (gateFailure) {
-    gateFailure.stepResults = stepResults;
-    throw gateFailure;
+  const controller = new AbortController();
+  const stepResults: Array<FrozenCommandStepExecutionResult | undefined> = new Array(prepared.length);
+  let nextIndex = 0;
+  let primaryFailure: FrozenCommandError | undefined;
+  const worker = async (): Promise<void> => {
+    while (!controller.signal.aborted) {
+      const index = nextIndex++;
+      if (index >= prepared.length) return;
+      const item = prepared[index]!;
+      try {
+        stepResults[index] = await executeFrozenCommandStep({
+          command: input,
+          step: item.step,
+          executor: item.executor,
+          renderer: item.renderer,
+          resolved: item.resolved,
+          normalizedArgs,
+          executionId,
+          deadline,
+          signal: controller.signal,
+        });
+      } catch (error) {
+        const normalized = normalizeFrozenStepError(error, executionId);
+        stepResults[index] = {
+          id: item.step.id,
+          executorId: item.executor.id,
+          executorRevision: item.executor.revision,
+          rendererId: item.step.renderer,
+          status: 'error',
+          text: '该部分暂时无法获取',
+          executionId,
+          error: normalized,
+        };
+        if (!normalized.executionFailure || item.step.required) {
+          primaryFailure ??= normalized;
+          controller.abort();
+        }
+      }
+    }
+  };
+  await Promise.all(Array.from(
+    { length: Math.min(3, prepared.length) },
+    () => worker(),
+  ));
+  if (primaryFailure) {
+    for (const [index, item] of prepared.entries()) {
+      if (stepResults[index]) continue;
+      const cancelled = new FrozenCommandError(
+        'execution_cancelled',
+        '固化命令执行已取消',
+        undefined,
+        true,
+        false,
+        executionId,
+      );
+      stepResults[index] = {
+        id: item.step.id,
+        executorId: item.executor.id,
+        executorRevision: item.executor.revision,
+        rendererId: item.step.renderer,
+        status: 'error',
+        text: '该部分暂时无法获取',
+        executionId,
+        error: cancelled,
+      };
+      logger.warn('[frozen-command:audit]', frozenCommandAuditRecord({
+        input,
+        executionId,
+        step: item.step,
+        executorRevision: item.executor.revision,
+        rendererRevision: typeof item.renderer === 'string' ? item.renderer : item.renderer.revision,
+        status: 'failed',
+        startedAt: Date.now(),
+        errorCode: cancelled.code,
+      }));
+    }
   }
-  const requiredFailure = stepResults.find((stepResult, index) =>
-    stepResult.status === 'error' && input.definition.steps[index]!.required)?.error;
-  if (requiredFailure) {
-    requiredFailure.stepResults = stepResults;
-    throw requiredFailure;
+  const completedStepResults = stepResults.filter(
+    (result): result is FrozenCommandStepExecutionResult => result !== undefined,
+  );
+  if (primaryFailure) {
+    primaryFailure.stepResults = completedStepResults;
+    throw primaryFailure;
   }
   const markdown = stepResults.length === 1
     ? stepResults[0]!.text
-    : stepResults.map(step => `### ${step.id}\n${step.text}`).join('\n\n');
+    : stepResults.map(step => step!.text).join('\n\n');
   const text = input.definition.output.format === 'text' ? markdownToPlainText(markdown) : markdown;
   const first = stepResults[0]!;
   return {
@@ -2099,7 +2200,7 @@ export async function executeFrozenCommand(input: FrozenCommandExecutionInput): 
     executionId,
     ...(stepResults.length === 1 && first.projectedResult ? { projectedResult: first.projectedResult } : {}),
     ...(stepResults.length === 1 && first.businessResult ? { businessResult: first.businessResult } : {}),
-    steps: stepResults,
+    steps: stepResults as FrozenCommandStepExecutionResult[],
   };
 }
 

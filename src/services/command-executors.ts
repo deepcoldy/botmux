@@ -1042,7 +1042,11 @@ export async function runProcessCommandExecutor(input: {
   workingDir?: string;
   executionId?: string;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }): Promise<ProcessExecutorResult> {
+  if (input.signal?.aborted) {
+    throw new CommandExecutorError('executor_cancelled', `执行器 ${input.executor.id} 已取消`);
+  }
   verifyCommandExecutorArtifacts(input.executor);
   const argv = buildCommandExecutorArgv(input.executor, input.values);
   const executionId = input.executionId ?? randomUUID();
@@ -1070,8 +1074,16 @@ export async function runProcessCommandExecutor(input: {
       const finishError = (error: CommandExecutorError): void => {
         if (settled) return;
         settled = true;
+        input.signal?.removeEventListener('abort', onAbort);
         rejectPromise(error);
       };
+      const onAbort = (): void => {
+        if (settled) return;
+        terminalError = new CommandExecutorError('executor_cancelled', `执行器 ${input.executor.id} 已取消`);
+        terminateProcessGroup(child);
+      };
+      input.signal?.addEventListener('abort', onAbort, { once: true });
+      if (input.signal?.aborted) onAbort();
       const timer = setTimeout(() => {
         terminalError = new CommandExecutorError('executor_timeout', `执行器 ${input.executor.id} 超时`);
         terminateProcessGroup(child);
@@ -1112,6 +1124,7 @@ export async function runProcessCommandExecutor(input: {
           }
           const output = materializeCommandExecutorOutput(input.executor.output, raw);
           settled = true;
+          input.signal?.removeEventListener('abort', onAbort);
           resolvePromise({
             executorId: input.executor.id,
             executorRevision: input.executor.revision,
@@ -1150,7 +1163,11 @@ export async function runCommandRenderer(input: {
   payload: unknown;
   workingDir?: string;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }): Promise<CommandRendererResult> {
+  if (input.signal?.aborted) {
+    throw new CommandExecutorError('renderer_cancelled', `渲染器 ${input.renderer.id} 已取消`);
+  }
   verifyCommandRendererArtifacts(input.renderer);
   const stdin = Buffer.from(JSON.stringify(input.payload), 'utf8');
   if (stdin.length > input.renderer.policy.maxInputBytes) {
@@ -1180,8 +1197,16 @@ export async function runCommandRenderer(input: {
       const fail = (error: CommandExecutorError): void => {
         if (settled) return;
         settled = true;
+        input.signal?.removeEventListener('abort', onAbort);
         rejectPromise(error);
       };
+      const onAbort = (): void => {
+        if (settled) return;
+        terminalError = new CommandExecutorError('renderer_cancelled', `渲染器 ${input.renderer.id} 已取消`);
+        terminateProcessGroup(child);
+      };
+      input.signal?.addEventListener('abort', onAbort, { once: true });
+      if (input.signal?.aborted) onAbort();
       const timer = setTimeout(() => {
         terminalError = new CommandExecutorError('renderer_timeout', `渲染器 ${input.renderer.id} 超时`);
         terminateProcessGroup(child);
@@ -1199,7 +1224,7 @@ export async function runCommandRenderer(input: {
       });
       child.stderr?.resume();
       child.stdin?.on('error', error => {
-        terminalError = new CommandExecutorError('renderer_stdin_failed', `渲染器 ${input.renderer.id} 无法读取输入`, { cause: error });
+        terminalError ??= new CommandExecutorError('renderer_stdin_failed', `渲染器 ${input.renderer.id} 无法读取输入`, { cause: error });
         terminateProcessGroup(child);
       });
       child.on('error', error => {
@@ -1214,6 +1239,7 @@ export async function runCommandRenderer(input: {
         try {
           const markdown = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(stdout));
           settled = true;
+          input.signal?.removeEventListener('abort', onAbort);
           resolvePromise({
             rendererId: input.renderer.id,
             rendererRevision: input.renderer.revision,
