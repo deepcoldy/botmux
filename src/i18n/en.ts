@@ -1715,6 +1715,7 @@ export const messages: Record<string, string> = {
   'cli_update.binary': 'Current binary: {path}',
   'cli_update.install_target': 'Install target: {path}',
   'cli_update.command': 'Run on the host: {command}',
+  'cli_update.command_unknown': 'No update command was identified. Upgrade this CLI using its original installation method.',
   'cli_update.manual_only': 'botmux only checks and notifies; it never installs automatically. Existing sessions are unaffected.',
   'cli_update.dashboard': 'Dashboard: {url}',
 

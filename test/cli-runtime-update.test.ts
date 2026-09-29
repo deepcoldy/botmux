@@ -1,4 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createElement } from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { CliRuntimeUpdates } from '../src/dashboard/web/settings-page.js';
+import { ui } from '../src/dashboard/web/ui.js';
+import { createDashboardTranslator } from '../src/dashboard/web/i18n.js';
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -368,6 +373,38 @@ describe('filterCliRuntimeUpdateEntriesForTargets', () => {
 });
 
 describe('probeCodexRuntimeUpdate', () => {
+  it.each(['internal', 'self'] as const)('does not treat doctor status as a %s update command', async (provider) => {
+    const runFile = vi.fn(async (_bin: string, args: string[]) => args[0] === '--version'
+      ? 'codex-cli 0.156.1'
+      : JSON.stringify({
+        codexVersion: '0.156.1',
+        checks: [{ id: 'updates.status', details: {
+          'latest version probe': '0.158.0',
+          'update action': 'manual or unknown',
+        } }],
+      }));
+    const fetchLatest = vi.fn();
+    const result = await probeCodexRuntimeUpdate(runtimeTarget({ provider }), { runFile, fetchLatest });
+    expect(result).toMatchObject({ current: '0.156.1', latest: '0.158.0', managed: true, updateCommand: null });
+    expect(fetchLatest).not.toHaveBeenCalled();
+  });
+
+  it('keeps an unknown command unknown when the official version probe falls back to npm', async () => {
+    const runFile = vi.fn(async (_bin: string, args: string[]) => args[0] === '--version'
+      ? 'codex-cli 0.156.1'
+      : JSON.stringify({
+        codexVersion: '0.156.1',
+        checks: [{ id: 'updates.status', details: {
+          'latest version probe': 'HTTP 403 Forbidden',
+          'update action': 'manual or unknown',
+        } }],
+      }));
+    const fetchLatest = vi.fn(async () => '0.158.0');
+    expect(await probeCodexRuntimeUpdate(runtimeTarget(), { runFile, fetchLatest }))
+      .toMatchObject({ latest: '0.158.0', updateCommand: null });
+    expect(fetchLatest).toHaveBeenCalledOnce();
+  });
+
   it('uses matching official doctor data without querying any registry', async () => {
     const runFile = vi.fn(async (_bin: string, args: string[]) => {
       if (args[0] === '--version') return 'codex-cli 0.144.1';
@@ -417,7 +454,7 @@ describe('probeCodexRuntimeUpdate', () => {
       current: '0.120.0',
       latest: '0.144.3',
       managed: true,
-      updateCommand: 'codex update',
+      updateCommand: null,
     });
     expect(fetchLatest).toHaveBeenCalledTimes(1);
   });
@@ -443,7 +480,7 @@ describe('probeCodexRuntimeUpdate', () => {
       current: '0.120.0',
       latest: '0.121.0',
       managed: true,
-      updateCommand: 'codex update',
+      updateCommand: null,
     });
     expect(fetchLatest).toHaveBeenCalledTimes(1);
   });
@@ -1283,6 +1320,66 @@ describe('CLI runtime update store and card', () => {
         updateCommand: null,
         sourceFingerprint: JSON.stringify(['auto', '']),
       });
+  });
+
+  it('rewrites a cached status label inside the TTL without probing or renotifying', async () => {
+    const now = 1_500_000;
+    const key = 'codex:/opt/codex';
+    writeCliRuntimeUpdateStoreTo(dir, { entries: { [key]: updateEntry({
+      binPath: '/opt/codex', installationPath: '/opt/codex',
+      updateCommand: 'manual or unknown', lastCheckedAt: now - 1_000,
+      lastNotifiedVersion: '0.144.3',
+    }) } });
+    const probe = vi.fn();
+    const notify = vi.fn();
+    const writeStore = vi.fn((store: CliRuntimeUpdateStore) => writeCliRuntimeUpdateStoreTo(dir, store));
+    await runCliRuntimeUpdateAudit({
+      now: () => now, targets: () => [runtimeTarget({ binPath: '/opt/codex' })],
+      readStore: () => readCliRuntimeUpdateStoreFrom(dir), writeStore, probe, notify,
+    });
+    expect(probe).not.toHaveBeenCalled();
+    expect(notify).not.toHaveBeenCalled();
+    expect(writeStore).toHaveBeenCalledOnce();
+    const persisted = JSON.parse(readFileSync(cliRuntimeUpdateStorePathIn(dir), 'utf8'));
+    expect(persisted.entries[key]).toMatchObject({
+      updateCommand: null, lastCheckedAt: now - 1_000, lastNotifiedVersion: '0.144.3',
+    });
+  });
+
+  it.each(['manual or unknown', ' MANUAL OR UNKNOWN ', 'unknown', 'manual', 'unavailable', 'unsupported', 'none', 'n/a', '', null])(
+    'shows an explanation instead of the status label %s in both locales', (updateCommand) => {
+      writeCliRuntimeUpdateStoreTo(dir, { entries: { codex: updateEntry({ updateCommand }) } });
+      expect(readCliRuntimeUpdateStoreFrom(dir).entries.codex.updateCommand).toBeNull();
+      for (const locale of ['zh', 'en'] as const) {
+        const card = buildCliRuntimeUpdateCard(updateEntry({ updateCommand }), { locale });
+        expect(card).toContain(locale === 'zh' ? '未识别出升级命令' : 'No update command was identified');
+        expect(card).not.toContain(locale === 'zh' ? '建议在宿主终端执行' : 'Run on the host:');
+        expect(card).not.toContain('codex update');
+      }
+    },
+  );
+
+  it.each(['zh', 'en'] as const)('renders migrated status and verified commands in the %s Dashboard', (locale) => {
+    const translation = vi.spyOn(ui, 't').mockImplementation(createDashboardTranslator(locale));
+    try {
+      writeCliRuntimeUpdateStoreTo(dir, { entries: { codex: updateEntry({ updateCommand: 'manual or unknown' }) } });
+      const entry = readCliRuntimeUpdateStoreFrom(dir).entries.codex;
+      const html = renderToStaticMarkup(createElement(CliRuntimeUpdates, { entries: [entry] }));
+      expect(html).toContain(locale === 'zh' ? '未识别出升级命令' : 'No update command was identified');
+      expect(html).not.toContain('manual or unknown');
+      expect(html).not.toContain('codex update');
+      const known = renderToStaticMarkup(createElement(CliRuntimeUpdates, {
+        entries: [{ ...entry, updateCommand: 'brew upgrade --cask codex' }],
+      }));
+      expect(known).toContain('<code>brew upgrade --cask codex</code>');
+      expect(known).not.toContain(locale === 'zh' ? '未识别出升级命令' : 'No update command was identified');
+      const current = renderToStaticMarkup(createElement(CliRuntimeUpdates, {
+        entries: [{ ...entry, updateAvailable: false }],
+      }));
+      expect(current).not.toContain(locale === 'zh' ? '未识别出升级命令' : 'No update command was identified');
+    } finally {
+      translation.mockRestore();
+    }
   });
 
   it('uses runtime display name in an owner-only reminder', () => {

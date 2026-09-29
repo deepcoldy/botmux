@@ -1718,6 +1718,7 @@ export const messages: Record<string, string> = {
   'cli_update.binary': '当前二进制：{path}',
   'cli_update.install_target': '安装位置：{path}',
   'cli_update.command': '建议在宿主终端执行：{command}',
+  'cli_update.command_unknown': '未识别出升级命令，请按该 CLI 原有的安装方式手动升级。',
   'cli_update.manual_only': 'botmux 只检查并提醒，不会自动安装；现有会话不受影响。',
   'cli_update.dashboard': 'Dashboard：{url}',
 
