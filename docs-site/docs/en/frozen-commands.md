@@ -65,7 +65,7 @@ executors:
     kind: plugin-tool
     plugin: data-mcp
     tool: execute_frozen_query
-    minimumVersion: 0.3.0
+    minimumVersion: 0.3.1
     contractVersion: 2
     arguments:
       sql:
