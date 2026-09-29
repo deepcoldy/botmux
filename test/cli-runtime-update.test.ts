@@ -410,6 +410,18 @@ describe('probeCodexRuntimeUpdate', () => {
     expect(fetchLatest).toHaveBeenCalledOnce();
   });
 
+  it.each([undefined, null, '', 42, { command: 'codex update' }])(
+    'does not guess a command from missing or malformed doctor action %j', async (action) => {
+      const result = await probeCodexRuntimeUpdate(runtimeTarget(), {
+        runFile: async (_bin, args) => args[0] === '--version' ? 'codex-cli 0.156.1'
+          : JSON.stringify({ codexVersion: '0.156.1', checks: [{ id: 'updates.status', details: {
+            'latest version probe': '0.158.0', 'update action': action,
+          } }] }),
+      });
+      expect(result).toMatchObject({ current: '0.156.1', latest: '0.158.0', managed: true, updateCommand: null });
+    },
+  );
+
   // Real command labels from upstream doctor/updates.rs::update_action_label.
   it.each([
     'npm install -g @openai/codex',
@@ -1345,6 +1357,75 @@ describe('CLI runtime update store and card', () => {
       });
   });
 
+  it.each(['manual or unknown', 'standalone installer'])('carries %s through probe, persisted cache and notification without suggesting it', async (action) => {
+    const now = 1_500_000;
+    const target = runtimeTarget({ binPath: '/opt/codex' });
+    const runFile = vi.fn(async (_bin: string, args: string[]) => args[0] === '--version'
+      ? 'codex-cli 0.156.1'
+      : JSON.stringify({ codexVersion: '0.156.1', checks: [{ id: 'updates.status', details: {
+        'latest version probe': '0.158.0', 'update action': action,
+      } }] }));
+    const cards: string[] = [];
+    const notify = vi.fn(async (entry: CliRuntimeUpdateEntry) => {
+      cards.push(buildCliRuntimeUpdateCard(entry, { locale: 'zh' }));
+    });
+    const deps = {
+      now: () => now, targets: () => [target],
+      readStore: () => readCliRuntimeUpdateStoreFrom(dir),
+      writeStore: (store: CliRuntimeUpdateStore) => writeCliRuntimeUpdateStoreTo(dir, store),
+      probe: (entry: CliRuntimeUpdateTarget) => probeCodexRuntimeUpdate(entry, { runFile }),
+      notify,
+    };
+    await runCliRuntimeUpdateAudit(deps);
+    const persisted = JSON.parse(readFileSync(cliRuntimeUpdateStorePathIn(dir), 'utf8'));
+    expect(persisted.entries['codex:/opt/codex']).toMatchObject({
+      updateCommand: null, current: '0.156.1', latest: '0.158.0',
+      lastCheckedAt: now, lastNotifiedVersion: '0.158.0',
+    });
+    expect(cards).toHaveLength(1);
+    expect(cards[0]).toContain('未识别出升级命令');
+    expect(cards[0]).not.toContain(action);
+    expect(cards[0]).not.toContain('建议在宿主终端执行');
+    const beforeSecondAudit = readFileSync(cliRuntimeUpdateStorePathIn(dir), 'utf8');
+    await runCliRuntimeUpdateAudit(deps);
+    expect(runFile).toHaveBeenCalledTimes(2);
+    expect(notify).toHaveBeenCalledOnce();
+    expect(readFileSync(cliRuntimeUpdateStorePathIn(dir), 'utf8')).toBe(beforeSecondAudit);
+  });
+
+  it.each([
+    { provider: 'internal', command: 'npm install -g @openai/codex' },
+    { provider: 'internal', command: 'bun install -g @openai/codex' },
+    { provider: 'internal', command: 'vp install -g @openai/codex' },
+    { provider: 'internal', command: 'pnpm add -g @openai/codex' },
+    { provider: 'internal', command: 'brew upgrade --cask codex' },
+    { provider: 'internal', command: 'codex update' },
+    { provider: 'self', command: 'self-codex update' },
+    { provider: 'self', command: '"/opt/standalone installer/codex" update' },
+  ] as const)('preserves cached $provider command $command without rewriting', async ({ provider, command }) => {
+    const now = 1_500_000;
+    const key = 'codex:/opt/codex';
+    writeCliRuntimeUpdateStoreTo(dir, { entries: { [key]: updateEntry({
+      provider, binPath: '/opt/codex', installationPath: '/opt/codex',
+      updateCommand: command, lastCheckedAt: now - 1_000, lastNotifiedVersion: '0.144.3',
+    }) } });
+    const before = readFileSync(cliRuntimeUpdateStorePathIn(dir), 'utf8');
+    const entry = readCliRuntimeUpdateStoreFrom(dir).entries[key];
+    expect(entry.updateCommand).toBe(command);
+    const card = JSON.parse(buildCliRuntimeUpdateCard(entry, { locale: 'en' }));
+    expect(card.elements[0].content).toContain(command);
+    expect(card.elements[0].content).not.toContain('No update command was identified');
+    const writeStore = vi.fn();
+    const probe = vi.fn();
+    await runCliRuntimeUpdateAudit({
+      now: () => now, targets: () => [runtimeTarget({ provider, binPath: '/opt/codex' })],
+      readStore: () => readCliRuntimeUpdateStoreFrom(dir), writeStore, probe,
+    });
+    expect(writeStore).not.toHaveBeenCalled();
+    expect(probe).not.toHaveBeenCalled();
+    expect(readFileSync(cliRuntimeUpdateStorePathIn(dir), 'utf8')).toBe(before);
+  });
+
   it.each(['manual or unknown', 'standalone installer'])('rewrites cached %s inside the TTL without probing or renotifying', async (action) => {
     const now = 1_500_000;
     const key = 'codex:/opt/codex';
@@ -1367,6 +1448,16 @@ describe('CLI runtime update store and card', () => {
     expect(persisted.entries[key]).toMatchObject({
       updateCommand: null, lastCheckedAt: now - 1_000, lastNotifiedVersion: '0.144.3',
     });
+    const afterMigration = readFileSync(cliRuntimeUpdateStorePathIn(dir), 'utf8');
+    writeStore.mockClear();
+    await runCliRuntimeUpdateAudit({
+      now: () => now, targets: () => [runtimeTarget({ binPath: '/opt/codex' })],
+      readStore: () => readCliRuntimeUpdateStoreFrom(dir), writeStore, probe, notify,
+    });
+    expect(writeStore).not.toHaveBeenCalled();
+    expect(probe).not.toHaveBeenCalled();
+    expect(notify).not.toHaveBeenCalled();
+    expect(readFileSync(cliRuntimeUpdateStorePathIn(dir), 'utf8')).toBe(afterMigration);
   });
 
   it.each(['manual or unknown', ' MANUAL OR UNKNOWN ', 'standalone installer', ' STANDALONE INSTALLER ', 'unknown', 'manual', 'unavailable', 'unsupported', 'none', 'n/a', '', null])(
