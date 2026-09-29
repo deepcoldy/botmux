@@ -2316,9 +2316,10 @@ export async function handleCommand(
               // before mutating any registry/store state, throwing when it
               // cannot verify it. Surface that so the active record is kept
               // for retry instead of being silently dropped.
-              closeResult = privateCard
-                ? await closeWorkerPoolSession(targetSessionId, { cardVisibility: 'private' })
-                : await closeWorkerPoolSession(targetSessionId);
+              const closeArgs: Parameters<typeof closeWorkerPoolSession> = privateCard
+                ? [targetSessionId, { cardVisibility: 'private' }]
+                : [targetSessionId];
+              closeResult = await closeWorkerPoolSession(...closeArgs);
             } catch (err) {
               return { status: 'teardown_failed' as const, err };
             }
