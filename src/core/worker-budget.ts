@@ -216,6 +216,14 @@ function cgroupCandidates(
     return {
       directory: posix.join(mount.mountPoint, relative),
       mountPoint: mount.mountPoint,
+      // hierarchyComplete is true only for a mount rooted at '/'. When the
+      // cgroup fs is bind-mounted from a nested sub-root (e.g. root '/docker'
+      // inside a container), ancestors ABOVE the mount point are not visible
+      // in this namespace, so we cannot prove there is no tighter limit
+      // toward the hierarchy root. A candidate that finds no finite limit on
+      // such a mount degrades to 'unavailable' (fail-open) instead of
+      // 'unlimited', and the ancestor walk stops at the mount point. This
+      // applies to v1 and v2 alike; v2 already behaved this way on master.
       hierarchyComplete: mount.root === '/',
     };
   }).sort((a, b) => Number(b.hierarchyComplete) - Number(a.hierarchyComplete));
