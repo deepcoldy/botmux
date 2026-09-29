@@ -374,7 +374,7 @@ describe('buildTurnReplyAskElements — askOptionLayout 受控', () => {
     }
   });
 
-  it('vertical：每个选项一行（单列 weighted 占满整行）', () => {
+  it('vertical：每个选项一行（单列 weighted、不被同排挤压）', () => {
     setAskOptionLayoutLookup((id) => id === 'app'
       ? { config: { askOptionLayout: 'vertical' } }
       : undefined);

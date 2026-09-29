@@ -691,7 +691,7 @@ function appendActionRows(
 ): void {
   if (layout === 'vertical') {
     // 竖放：一行一按钮。单列 column_set（flex_mode:'none' + weighted 列宽）让按钮
-    // 占满整行宽度，长选项标签不被同排按钮挤压。column_set 在旧版卡片 schema 同样
+    // 单列排布，长选项标签不被同排按钮挤压。column_set 在旧版卡片 schema 同样
     // 受支持，无需迁移 schema 2.0。
     for (const action of actions) {
       elements.push({

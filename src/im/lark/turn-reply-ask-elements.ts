@@ -17,7 +17,7 @@ export function buildTurnReplyAskElements(entry: ReplyCardAsk, locale: Locale = 
   const row = (buttons: Array<Record<string, any>>) => ({ tag: 'column_set', flex_mode: 'flow', columns: buttons.map(b => ({
     tag: 'column', width: 'auto', elements: [b],
   })) });
-  // vertical：与独立卡同款的一行一按钮（单列 weighted 占满整行）。内嵌形态是
+  // vertical：与独立卡同款的一行一按钮（单列 weighted、不被同排挤压）。内嵌形态是
   // Card JSON 2.0，字段形态与独立卡 1.0 不同，不能复用 appendActionRows。
   const verticalRow = (b: Record<string, any>) => ({
     tag: 'column_set', flex_mode: 'none', horizontal_spacing: 'small',

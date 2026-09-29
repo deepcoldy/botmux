@@ -1,8 +1,8 @@
 /**
  * `botmux ask` 选项按钮的 per-bot 布局：
  *
- *   compact  — 每行最多 4 个按钮的 `action` 行（历史形态，默认）
- *   vertical — 每行 1 个按钮，各自包在单列 `column_set` 里占满整行宽度，
+ *   compact  — 按行自动换行排列（独立卡为 `action` 行，实时卡内嵌为 `flow` 行）
+ *   vertical — 每行 1 个按钮，各自包在单列 `column_set` 里单列排布，
  *              长选项标签不被挤压换行
  *
  * 本模块是**叶子模块**（零 import）：ask-card.ts 在 daemon 进程内渲染卡片，
