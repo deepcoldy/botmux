@@ -232,10 +232,11 @@ async function loadModules() {
   const frozenCommand = await import('../src/services/frozen-command.js');
   const lifecycle = await import('../src/services/frozen-command-lifecycle.js');
   const actionStore = await import('../src/services/frozen-command-action.js');
+  const sessionStore = await import('../src/services/session-store.js');
   const ipc = await import('../src/core/dashboard-ipc-server.js');
   const types = await import('../src/core/types.js');
   const workerPool = await import('../src/core/worker-pool.js');
-  return { daemon, registry, frozenCommand, lifecycle, actionStore, ipc, types, workerPool };
+  return { daemon, registry, frozenCommand, lifecycle, actionStore, sessionStore, ipc, types, workerPool };
 }
 
 function hash(text: string): string {
@@ -747,6 +748,7 @@ executors:
   mkdirSync(join(root, '.botmux', 'commands'), { recursive: true });
   writeFileSync(join(root, '.botmux', 'commands', '宿主闭环.yaml'), YAML);
   modules = await loadModules();
+  modules.sessionStore.init(APP);
   modules.daemon.__testOnly_activeSessions.clear();
   modules.workerPool.setActiveSessionsRegistry(modules.daemon.__testOnly_activeSessions);
   const bot = modules.registry.registerBot({
@@ -786,6 +788,7 @@ executors:
 afterEach(() => {
   modules?.daemon.__testOnly_activeSessions.clear();
   modules?.workerPool.setActiveSessionsRegistry(undefined);
+  modules?.sessionStore.init();
   delete process.env.SESSION_DATA_DIR;
   delete process.env.BOTMUX_COMMAND_EXECUTORS_FILE;
   if (ORIGINAL_HOME === undefined) delete process.env.HOME;
