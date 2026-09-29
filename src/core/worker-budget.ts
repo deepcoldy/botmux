@@ -12,9 +12,9 @@ export const DEFAULT_MIN_AVAILABLE_MEMORY_FRACTION = 0.25;
  *  capacity. Without this cap a 248 GiB host demanded ~62 GiB free to start a
  *  single worker, rejecting spawns at 60 GiB available with zero PSI stall.
  *  On the host path this makes the default reserve uniformly 4 GiB; the
- *  fraction still scales small finite cgroup-v2 limits (e.g. an 8 GiB limit
- *  reserves 2 GiB). The live PSI gate (maxMemoryFullAvg10) remains the signal
- *  for genuine host-wide contention. */
+ *  fraction still scales small finite cgroup limits (v1 or v2, e.g. an 8 GiB
+ *  limit reserves 2 GiB). The live PSI gate (maxMemoryFullAvg10) remains the
+ *  signal for genuine host-wide contention. */
 export const DEFAULT_MIN_AVAILABLE_MEMORY_CAP_BYTES = 4 * 1024 ** 3;
 export const DEFAULT_MAX_MEMORY_FULL_AVG10 = 20;
 /**
@@ -25,9 +25,10 @@ export const DEFAULT_MAX_MEMORY_FULL_AVG10 = 20;
  */
 export const MARGINAL_AVAILABLE_MEMORY_MARGIN = 0.1;
 
-export type MemoryMetricSource = 'host' | 'cgroup-v2' | 'unavailable';
+export type MemoryMetricSource = 'host' | 'cgroup-v2' | 'cgroup-v1' | 'unavailable';
 
 export interface CgroupMemoryBoundary {
+  version: 1 | 2;
   totalMemoryBytes: number;
   availableMemoryBytes?: number;
   memoryFullAvg10?: number;
@@ -104,6 +105,25 @@ function parseCgroupValue(raw: string): number | 'max' | undefined {
   return Number.isSafeInteger(parsed) ? parsed : undefined;
 }
 
+/**
+ * cgroup v1 reports "no limit" as the page-counter sentinel
+ * 9223372036854771712 (= 2^63 - 4096), not a `max` token. It exceeds
+ * Number.MAX_SAFE_INTEGER, so a plain Number()+isSafeInteger parse would
+ * classify an unlimited hierarchy as a parse failure (degraded) instead of
+ * unlimited — silently dropping host protection on every bare-metal v1 host.
+ * Compare as BigInt and return 'max' for any sentinel-sized value.
+ */
+const CGROUP_V1_LIMIT_SENTINEL = 9223372036854771712n;
+
+function parseV1ByteValue(raw: string): number | 'max' | undefined {
+  const value = raw.trim();
+  if (value === 'max') return 'max';
+  if (!/^\d+$/.test(value)) return undefined;
+  const parsed = BigInt(value);
+  if (parsed >= CGROUP_V1_LIMIT_SENTINEL) return 'max';
+  return parsed <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(parsed) : undefined;
+}
+
 function parseInactiveFile(raw: string): number | undefined {
   const match = /^inactive_file\s+(\d+)$/m.exec(raw);
   if (!match) return undefined;
@@ -120,6 +140,26 @@ function parseUnifiedCgroupPath(raw: string): string | undefined {
   return undefined;
 }
 
+/**
+ * Find the cgroup-v1 membership record whose hierarchy owns the memory
+ * controller, e.g. `4:memory:/docker/demo` or `9:cpu,memory:/tenant/x`.
+ * Named hierarchies (`1:name=systemd:/...`) and co-mounted controllers
+ * without memory are ignored. An empty path means the cgroup root.
+ */
+function parseV1MemoryCgroupPath(raw: string): string | undefined {
+  for (const line of raw.split('\n')) {
+    const fields = line.trim().split(':');
+    if (fields.length !== 3) continue;
+    const [hierarchyId, controllers, path] = fields;
+    if (!/^\d+$/.test(hierarchyId) || hierarchyId === '0') continue;
+    const hasMemory = controllers.split(',').some(controller => controller === 'memory');
+    if (!hasMemory) continue;
+    if (path === '') return '/';
+    if (path.startsWith('/')) return posix.normalize(path);
+  }
+  return undefined;
+}
+
 function decodeMountInfoPath(value: string): string {
   return value.replace(/\\(040|011|012|134)/g, (_, code: string) => {
     if (code === '040') return ' ';
@@ -129,14 +169,25 @@ function decodeMountInfoPath(value: string): string {
   });
 }
 
-function parseCgroupMounts(raw: string): CgroupMount[] {
+type CgroupMountFilter =
+  | { fstype: 'cgroup2' }
+  | { fstype: 'cgroup'; controller: string };
+
+function parseCgroupMounts(raw: string, filter: CgroupMountFilter): CgroupMount[] {
   const mounts: CgroupMount[] = [];
   for (const line of raw.split('\n')) {
     const separator = line.indexOf(' - ');
     if (separator < 0) continue;
     const before = line.slice(0, separator).split(' ');
     const after = line.slice(separator + 3).split(' ');
-    if (before.length < 5 || after[0] !== 'cgroup2') continue;
+    if (before.length < 5 || after[0] !== filter.fstype) continue;
+    if (filter.fstype === 'cgroup') {
+      // cgroup-v1 super-block options list the co-mounted controllers, e.g.
+      // `cgroup cgroup rw,memory` or `cgroup cgroup rw,cpu,memory`. Named
+      // hierarchies carry `name=systemd` and never a bare controller name.
+      const superOptions = after.slice(2).flatMap(value => value.split(','));
+      if (!superOptions.includes(filter.controller)) continue;
+    }
     mounts.push({
       root: posix.normalize(decodeMountInfoPath(before[3])),
       mountPoint: posix.normalize(decodeMountInfoPath(before[4])),
@@ -170,40 +221,74 @@ function cgroupCandidates(
   }).sort((a, b) => Number(b.hierarchyComplete) - Number(a.hierarchyComplete));
 }
 
+interface CgroupFileNames {
+  limit: string;
+  current: string;
+  stat: string;
+  pressure: string;
+}
+
+const CGROUP_V2_FILES: CgroupFileNames = {
+  limit: 'memory.max',
+  current: 'memory.current',
+  stat: 'memory.stat',
+  pressure: 'memory.pressure',
+};
+
+const CGROUP_V1_FILES: CgroupFileNames = {
+  limit: 'memory.limit_in_bytes',
+  current: 'memory.usage_in_bytes',
+  stat: 'memory.stat',
+  pressure: 'memory.pressure',
+};
+
 function readBoundary(
+  version: 1 | 2,
   directory: string,
   memoryMax: number,
   hostTotalMemoryBytes: number,
   readFile: (path: string) => string,
   warnings: string[],
+  files: CgroupFileNames,
 ): CgroupMemoryBoundary | undefined {
   if (memoryMax > hostTotalMemoryBytes) return undefined;
   let availableMemoryBytes: number | undefined;
   try {
-    const current = parseCgroupValue(readFile(posix.join(directory, 'memory.current')));
+    const current = parseCgroupValue(readFile(posix.join(directory, files.current)));
     if (typeof current === 'number') {
       let inactiveFile = 0;
       try {
-        inactiveFile = parseInactiveFile(readFile(posix.join(directory, 'memory.stat'))) ?? 0;
+        inactiveFile = parseInactiveFile(readFile(posix.join(directory, files.stat))) ?? 0;
       } catch {}
       const workingSet = Math.max(0, current - Math.min(inactiveFile, current));
       availableMemoryBytes = Math.max(0, Math.min(memoryMax, memoryMax - workingSet));
     } else {
-      warnings.push(`${directory}/memory.current has no valid byte value`);
+      warnings.push(`${directory}/${files.current} has no valid byte value`);
     }
   } catch (error) {
-    warnings.push(`cannot read ${directory}/memory.current: ${error instanceof Error ? error.message : String(error)}`);
+    warnings.push(`cannot read ${directory}/${files.current}: ${error instanceof Error ? error.message : String(error)}`);
   }
 
+  // cgroup v1 has no standard per-cgroup PSI file (memory.pressure only exists
+  // on v2 or on vendor kernels that backported it). Its absence is normal and
+  // must NOT push a warning, and a finite v1 container must NOT fall back to
+  // /proc/pressure/memory: that file reports host-wide stall, not the
+  // container's, so a busy neighbour on the host would reject container spawns
+  // that have ample headroom against their own limit.
   let memoryFullAvg10: number | undefined;
   try {
-    memoryFullAvg10 = parseMemoryFullAvg10(readFile(posix.join(directory, 'memory.pressure')));
-    if (memoryFullAvg10 === undefined) warnings.push(`${directory}/memory.pressure has no valid full avg10 value`);
+    memoryFullAvg10 = parseMemoryFullAvg10(readFile(posix.join(directory, files.pressure)));
+    if (version === 2 && memoryFullAvg10 === undefined) {
+      warnings.push(`${directory}/${files.pressure} has no valid full avg10 value`);
+    }
   } catch (error) {
-    warnings.push(`cannot read ${directory}/memory.pressure: ${error instanceof Error ? error.message : String(error)}`);
+    if (version === 2) {
+      warnings.push(`cannot read ${directory}/${files.pressure}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   return {
+    version,
     totalMemoryBytes: memoryMax,
     ...(availableMemoryBytes !== undefined ? { availableMemoryBytes } : {}),
     ...(memoryFullAvg10 !== undefined ? { memoryFullAvg10 } : {}),
@@ -211,31 +296,18 @@ function readBoundary(
   };
 }
 
-function readCgroupMemoryPressure(
+function resolveCgroupMemoryHierarchy(
+  version: 1 | 2,
+  membershipPath: string,
+  mounts: CgroupMount[],
+  fallbackRoot: string,
   hostTotalMemoryBytes: number,
   readFile: (path: string) => string,
-  procRoot: string,
-  cgroupRoot: string,
+  files: CgroupFileNames,
+  parseLimit: (raw: string) => number | 'max' | undefined,
 ): CgroupMemoryResult {
-  let membershipRaw: string;
-  try {
-    membershipRaw = readFile(posix.join(procRoot, 'self/cgroup'));
-  } catch (error) {
-    return {
-      kind: 'unavailable',
-      warnings: [`cannot read ${posix.join(procRoot, 'self/cgroup')}: ${error instanceof Error ? error.message : String(error)}`],
-    };
-  }
-  const membershipPath = parseUnifiedCgroupPath(membershipRaw);
-  if (!membershipPath) return { kind: 'none' };
-
-  let mounts: CgroupMount[] = [];
-  try {
-    mounts = parseCgroupMounts(readFile(posix.join(procRoot, 'self/mountinfo')));
-  } catch {}
-
   const unavailableWarnings: string[] = [];
-  for (const candidate of cgroupCandidates(membershipPath, mounts, cgroupRoot)) {
+  for (const candidate of cgroupCandidates(membershipPath, mounts, fallbackRoot)) {
     const boundaries: CgroupMemoryBoundary[] = [];
     const warnings: string[] = [];
     let directory = candidate.directory;
@@ -243,19 +315,19 @@ function readCgroupMemoryPressure(
     while (directory === candidate.mountPoint || directory.startsWith(`${candidate.mountPoint}/`)) {
       let memoryMax: number | 'max' | undefined;
       try {
-        memoryMax = parseCgroupValue(readFile(posix.join(directory, 'memory.max')));
+        memoryMax = parseLimit(readFile(posix.join(directory, files.limit)));
       } catch (error) {
         complete = false;
-        warnings.push(`cannot read ${directory}/memory.max: ${error instanceof Error ? error.message : String(error)}`);
+        warnings.push(`cannot read ${directory}/${files.limit}: ${error instanceof Error ? error.message : String(error)}`);
         if (directory === candidate.mountPoint) break;
         directory = posix.dirname(directory);
         continue;
       }
       if (memoryMax === undefined) {
         complete = false;
-        warnings.push(`${directory}/memory.max has no valid byte value or max token`);
+        warnings.push(`${directory}/${files.limit} has no valid byte value or max token`);
       } else if (typeof memoryMax === 'number') {
-        const boundary = readBoundary(directory, memoryMax, hostTotalMemoryBytes, readFile, warnings);
+        const boundary = readBoundary(version, directory, memoryMax, hostTotalMemoryBytes, readFile, warnings, files);
         if (boundary) boundaries.push(boundary);
       }
       if (directory === candidate.mountPoint) break;
@@ -264,15 +336,45 @@ function readCgroupMemoryPressure(
     if (boundaries.length > 0 && candidate.hierarchyComplete) return { kind: 'finite', boundaries, warnings };
     if (boundaries.length > 0) warnings.push(`${candidate.mountPoint} does not expose finite ancestor limits`);
     if (complete && candidate.hierarchyComplete) return { kind: 'unlimited' };
-    if (complete) warnings.push(`${candidate.mountPoint} does not expose the full cgroup-v2 hierarchy`);
+    if (complete) warnings.push(`${candidate.mountPoint} does not expose the full cgroup-v${version} hierarchy`);
     unavailableWarnings.push(...warnings);
   }
   return {
     kind: 'unavailable',
     warnings: unavailableWarnings.length > 0
       ? unavailableWarnings
-      : ['cgroup-v2 memory hierarchy could not be resolved'],
+      : [`cgroup-v${version} memory hierarchy could not be resolved`],
   };
+}
+
+function readCgroupV2MemoryPressure(
+  hostTotalMemoryBytes: number,
+  readFile: (path: string) => string,
+  membershipRaw: string,
+  mounts: CgroupMount[],
+  cgroupRoot: string,
+): CgroupMemoryResult {
+  const membershipPath = parseUnifiedCgroupPath(membershipRaw);
+  if (!membershipPath) return { kind: 'none' };
+  return resolveCgroupMemoryHierarchy(
+    2, membershipPath, mounts, cgroupRoot, hostTotalMemoryBytes, readFile,
+    CGROUP_V2_FILES, parseCgroupValue,
+  );
+}
+
+function readCgroupV1MemoryPressure(
+  hostTotalMemoryBytes: number,
+  readFile: (path: string) => string,
+  membershipRaw: string,
+  mounts: CgroupMount[],
+  cgroupRoot: string,
+): CgroupMemoryResult {
+  const membershipPath = parseV1MemoryCgroupPath(membershipRaw);
+  if (!membershipPath) return { kind: 'none' };
+  return resolveCgroupMemoryHierarchy(
+    1, membershipPath, mounts, posix.join(cgroupRoot, 'memory'), hostTotalMemoryBytes, readFile,
+    CGROUP_V1_FILES, parseV1ByteValue,
+  );
 }
 
 function pressureFromBoundary(
@@ -280,17 +382,25 @@ function pressureFromBoundary(
   boundaries: CgroupMemoryBoundary[],
   warnings: string[],
 ): HostMemoryPressure {
+  const cgroupSource: MemoryMetricSource = boundary.version === 2 ? 'cgroup-v2' : 'cgroup-v1';
   return {
     totalMemoryBytes: boundary.totalMemoryBytes,
     ...(boundary.availableMemoryBytes !== undefined ? { availableMemoryBytes: boundary.availableMemoryBytes } : {}),
     ...(boundary.memoryFullAvg10 !== undefined ? { memoryFullAvg10: boundary.memoryFullAvg10 } : {}),
-    totalMemorySource: 'cgroup-v2',
-    availableMemorySource: boundary.availableMemoryBytes === undefined ? 'unavailable' : 'cgroup-v2',
-    memoryFullAvg10Source: boundary.memoryFullAvg10 === undefined ? 'unavailable' : 'cgroup-v2',
+    totalMemorySource: cgroupSource,
+    availableMemorySource: boundary.availableMemoryBytes === undefined ? 'unavailable' : cgroupSource,
+    memoryFullAvg10Source: boundary.memoryFullAvg10 === undefined ? 'unavailable' : cgroupSource,
     cgroupPath: boundary.cgroupPath,
     cgroupBoundaries: boundaries,
     warnings,
   };
+}
+
+function finiteCgroupPressure(result: Extract<CgroupMemoryResult, { kind: 'finite' }>): HostMemoryPressure {
+  const initial = result.boundaries.reduce((selected, boundary) => (
+    boundary.totalMemoryBytes < selected.totalMemoryBytes ? boundary : selected
+  ));
+  return pressureFromBoundary(initial, result.boundaries, result.warnings);
 }
 
 export function readHostMemoryPressure(options: MemoryPressureReadOptions = {}): HostMemoryPressure {
@@ -307,25 +417,56 @@ export function readHostMemoryPressure(options: MemoryPressureReadOptions = {}):
   }
 
   const procRoot = options.procRoot ?? '/proc';
-  const cgroup = readCgroupMemoryPressure(
-    totalMemoryBytes,
-    readFile,
-    procRoot,
-    options.cgroupRoot ?? '/sys/fs/cgroup',
-  );
-  if (cgroup.kind === 'finite') {
-    const initial = cgroup.boundaries.reduce((selected, boundary) => (
-      boundary.totalMemoryBytes < selected.totalMemoryBytes ? boundary : selected
-    ));
-    return pressureFromBoundary(initial, cgroup.boundaries, cgroup.warnings);
-  }
-  if (cgroup.kind === 'unavailable') {
+  const cgroupRoot = options.cgroupRoot ?? '/sys/fs/cgroup';
+
+  let membershipRaw: string;
+  try {
+    membershipRaw = readFile(posix.join(procRoot, 'self/cgroup'));
+  } catch (error) {
     return {
       totalMemoryBytes,
       totalMemorySource: 'host',
       availableMemorySource: 'unavailable',
       memoryFullAvg10Source: 'unavailable',
-      warnings: cgroup.warnings,
+      warnings: [`cannot read ${posix.join(procRoot, 'self/cgroup')}: ${error instanceof Error ? error.message : String(error)}`],
+    };
+  }
+
+  // mountinfo is read once and resolved against both hierarchy versions: a
+  // pure v1 host has no `0::` record, while a hybrid host may expose a cgroup2
+  // mount whose memory controller remains on v1 (memory.max then ENOENT).
+  let v2Mounts: CgroupMount[] = [];
+  let v1MemoryMounts: CgroupMount[] = [];
+  try {
+    const mountinfo = readFile(posix.join(procRoot, 'self/mountinfo'));
+    v2Mounts = parseCgroupMounts(mountinfo, { fstype: 'cgroup2' });
+    v1MemoryMounts = parseCgroupMounts(mountinfo, { fstype: 'cgroup', controller: 'memory' });
+  } catch {}
+
+  const v2 = readCgroupV2MemoryPressure(totalMemoryBytes, readFile, membershipRaw, v2Mounts, cgroupRoot);
+  if (v2.kind === 'finite') return finiteCgroupPressure(v2);
+  const v1 = readCgroupV1MemoryPressure(totalMemoryBytes, readFile, membershipRaw, v1MemoryMounts, cgroupRoot);
+  if (v1.kind === 'finite') return finiteCgroupPressure(v1);
+
+  // No finite container limit. Read host-wide /proc metrics only when a
+  // hierarchy positively proved unlimited (bare metal / unlimited cgroup),
+  // or when no memory-controller membership exists at all. If resolution
+  // merely degraded (kind 'unavailable'), host PSI must NOT be substituted
+  // for the missing container signal — that rejected healthy v1 containers
+  // whenever an unrelated tenant stressed the host (PSI ~35% at the gate).
+  const hierarchyProvedUnlimited = v2.kind === 'unlimited' || v1.kind === 'unlimited';
+  const noMemoryHierarchy = v2.kind === 'none' && v1.kind === 'none';
+  if (!hierarchyProvedUnlimited && !noMemoryHierarchy) {
+    const warnings = [
+      ...(v2.kind === 'unavailable' ? v2.warnings : []),
+      ...(v1.kind === 'unavailable' ? v1.warnings : []),
+    ];
+    return {
+      totalMemoryBytes,
+      totalMemorySource: 'host',
+      availableMemorySource: 'unavailable',
+      memoryFullAvg10Source: 'unavailable',
+      warnings: [...new Set(warnings)],
     };
   }
 
@@ -364,13 +505,14 @@ export function resolveWorkerPressurePolicy(
 ): ResolvedWorkerPressurePolicy {
   // With the cap equal to the host floor, the host reserve is uniformly the
   // 4 GiB spawn-cost floor. The fraction only still scales the reserve for
-  // small finite cgroup-v2 limits. See the cap constant for the production
-  // incident that an uncapped fraction caused.
+  // small finite cgroup limits (v1 or v2). See the cap constant for the
+  // production incident that an uncapped fraction caused.
   const fractionalReserve = Math.min(
     DEFAULT_MIN_AVAILABLE_MEMORY_CAP_BYTES,
     Math.max(1, Math.ceil(totalMemoryBytes * DEFAULT_MIN_AVAILABLE_MEMORY_FRACTION)),
   );
-  const defaultReserve = totalMemorySource === 'cgroup-v2'
+  const finiteCgroupLimit = totalMemorySource === 'cgroup-v2' || totalMemorySource === 'cgroup-v1';
+  const defaultReserve = finiteCgroupLimit
     ? fractionalReserve
     : Math.max(DEFAULT_MIN_AVAILABLE_MEMORY_BYTES, fractionalReserve);
   return {
@@ -399,7 +541,8 @@ export function evaluateWorkerAdmission(
 
   const evaluated = boundaries.map(boundary => {
     const candidate = pressureFromBoundary(boundary, boundaries, pressure.warnings);
-    const policy = resolveWorkerPressurePolicy(config, boundary.totalMemoryBytes, 'cgroup-v2');
+    const boundarySource: MemoryMetricSource = boundary.version === 2 ? 'cgroup-v2' : 'cgroup-v1';
+    const policy = resolveWorkerPressurePolicy(config, boundary.totalMemoryBytes, boundarySource);
     const availableScore = boundary.availableMemoryBytes === undefined
       ? Number.POSITIVE_INFINITY
       : (boundary.availableMemoryBytes - policy.minAvailableMemoryBytes) / Math.max(1, policy.minAvailableMemoryBytes);
@@ -420,10 +563,16 @@ export function evaluateWorkerAdmission(
   const effectivePressure: HostMemoryPressure = {
     ...selected.candidate,
     ...(available.candidate.availableMemoryBytes !== undefined
-      ? { availableMemoryBytes: available.candidate.availableMemoryBytes, availableMemorySource: 'cgroup-v2' as const }
+      ? {
+          availableMemoryBytes: available.candidate.availableMemoryBytes,
+          availableMemorySource: available.candidate.availableMemorySource,
+        }
       : { availableMemoryBytes: undefined, availableMemorySource: 'unavailable' as const }),
     ...(psi.candidate.memoryFullAvg10 !== undefined
-      ? { memoryFullAvg10: psi.candidate.memoryFullAvg10, memoryFullAvg10Source: 'cgroup-v2' as const }
+      ? {
+          memoryFullAvg10: psi.candidate.memoryFullAvg10,
+          memoryFullAvg10Source: psi.candidate.memoryFullAvg10Source,
+        }
       : { memoryFullAvg10: undefined, memoryFullAvg10Source: 'unavailable' as const }),
   };
   return {
