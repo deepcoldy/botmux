@@ -1889,6 +1889,7 @@ async function executeFrozenCommandStep(input: {
   let exitCode: number | undefined;
   let signal: NodeJS.Signals | null | undefined;
   try {
+    remainingFrozenCommandBudget(input.deadline, executionId);
     if (!isPluginToolCommandExecutor(executor)) {
       const executed = await runProcessCommandExecutor({
         executor,
@@ -1896,7 +1897,7 @@ async function executeFrozenCommandStep(input: {
         botConfig: command.botConfig,
         workingDir: command.workingDir,
         executionId,
-        timeoutMs: remainingFrozenCommandBudget(input.deadline, executionId),
+        timeoutMs: executor.policy.timeoutMs,
         signal: input.signal,
       });
       executorOutput = executed.output;
@@ -1904,10 +1905,7 @@ async function executeFrozenCommandStep(input: {
       exitCode = executed.exitCode;
       signal = executed.signal;
     } else {
-      const timeoutMs = Math.min(
-        remainingFrozenCommandBudget(input.deadline, executionId),
-        executor.policy.timeoutMs,
-      );
+      const timeoutMs = executor.policy.timeoutMs;
       const controller = new AbortController();
       let timedOut = false;
       const timeout = setTimeout(() => {
@@ -1976,7 +1974,7 @@ async function executeFrozenCommandStep(input: {
           throw new FrozenCommandError('execution_cancelled', '固化命令执行已取消', undefined, true, false, executionId);
         }
         if (timedOut || controller.signal.aborted) {
-          throw new FrozenCommandError('execution_timeout', '固化命令执行超时', undefined, true, true, executionId);
+          throw new FrozenCommandError('executor_timeout', `执行器 ${executor.id} 超时`, undefined, true, true, executionId);
         }
         throw new FrozenCommandError(
           'plugin_tool_unavailable',
@@ -1997,6 +1995,7 @@ async function executeFrozenCommandStep(input: {
         ?? PLUGIN_TOOL_ERROR_POLICY.execution_failed;
       throw new FrozenCommandError(policy.code, policy.message, undefined, true, policy.transient, executionId);
     }
+    remainingFrozenCommandBudget(input.deadline, executionId);
     const markdown = await renderExecutorOutput({
       definition: command.definition,
       step,
@@ -2004,7 +2003,7 @@ async function executeFrozenCommandStep(input: {
       normalizedArgs: input.normalizedArgs,
       workingDir: command.workingDir,
       executionId,
-      timeoutMs: remainingFrozenCommandBudget(input.deadline, executionId),
+      timeoutMs: typeof renderer === 'string' ? undefined : renderer.policy.timeoutMs,
       signal: input.signal,
     });
     const businessResult = outputBusinessResult(executorOutput);
@@ -2034,7 +2033,12 @@ async function executeFrozenCommandStep(input: {
       businessResult,
     };
   } catch (error) {
-    const normalized = normalizeFrozenStepError(error, executionId);
+    const caught = normalizeFrozenStepError(error, executionId);
+    const normalized = input.signal.aborted
+      && input.signal.reason === 'execution_timeout'
+      && ['executor_cancelled', 'execution_cancelled', 'renderer_cancelled'].includes(caught.code)
+      ? new FrozenCommandError('execution_timeout', '固化命令总执行时间超出限制', undefined, true, true, executionId)
+      : caught;
     logger.warn('[frozen-command:audit]', frozenCommandAuditRecord({
       input: command,
       executionId,
@@ -2100,8 +2104,15 @@ export async function executeFrozenCommand(input: FrozenCommandExecutionInput): 
   const normalizedArgs = normalizeFrozenCommandArguments({ definition: input.definition, rawArgs: input.rawArgs, now }).args;
   const defaultTotalTimeoutMs = Math.max(...prepared.map(({ executor, renderer }) =>
     executor.policy.timeoutMs + (typeof renderer === 'string' ? 0 : renderer.policy.timeoutMs)));
-  const deadline = Date.now() + Math.min(input.timeoutMs ?? defaultTotalTimeoutMs, 10 * 60_000);
+  const totalTimeoutMs = Math.min(input.timeoutMs ?? defaultTotalTimeoutMs, 10 * 60_000);
+  const deadline = Date.now() + totalTimeoutMs;
   const controller = new AbortController();
+  let totalTimedOut = false;
+  const totalTimeout = setTimeout(() => {
+    totalTimedOut = true;
+    controller.abort('execution_timeout');
+  }, totalTimeoutMs);
+  totalTimeout.unref?.();
   const stepResults: Array<FrozenCommandStepExecutionResult | undefined> = new Array(prepared.length);
   let nextIndex = 0;
   let primaryFailure: FrozenCommandError | undefined;
@@ -2123,7 +2134,10 @@ export async function executeFrozenCommand(input: FrozenCommandExecutionInput): 
           signal: controller.signal,
         });
       } catch (error) {
-        const normalized = normalizeFrozenStepError(error, executionId);
+        const caught = normalizeFrozenStepError(error, executionId);
+        const normalized = totalTimedOut && ['executor_cancelled', 'execution_cancelled', 'renderer_cancelled'].includes(caught.code)
+          ? new FrozenCommandError('execution_timeout', '固化命令总执行时间超出限制', undefined, true, true, executionId)
+          : caught;
         stepResults[index] = {
           id: item.step.id,
           executorId: item.executor.id,
@@ -2141,10 +2155,47 @@ export async function executeFrozenCommand(input: FrozenCommandExecutionInput): 
       }
     }
   };
-  await Promise.all(Array.from(
-    { length: Math.min(3, prepared.length) },
-    () => worker(),
-  ));
+  try {
+    await Promise.all(Array.from(
+      { length: Math.min(3, prepared.length) },
+      () => worker(),
+    ));
+  } finally {
+    clearTimeout(totalTimeout);
+  }
+  if (totalTimedOut) {
+    for (const [index, item] of prepared.entries()) {
+      if (stepResults[index]) continue;
+      const timedOut = new FrozenCommandError(
+        'execution_timeout',
+        '固化命令总执行时间超出限制',
+        undefined,
+        true,
+        true,
+        executionId,
+      );
+      stepResults[index] = {
+        id: item.step.id,
+        executorId: item.executor.id,
+        executorRevision: item.executor.revision,
+        rendererId: item.step.renderer,
+        status: 'error',
+        text: '该部分暂时无法获取',
+        executionId,
+        error: timedOut,
+      };
+      logger.warn('[frozen-command:audit]', frozenCommandAuditRecord({
+        input,
+        executionId,
+        step: item.step,
+        executorRevision: item.executor.revision,
+        rendererRevision: typeof item.renderer === 'string' ? item.renderer : item.renderer.revision,
+        status: 'failed',
+        startedAt: Date.now(),
+        errorCode: timedOut.code,
+      }));
+    }
+  }
   if (primaryFailure) {
     for (const [index, item] of prepared.entries()) {
       if (stepResults[index]) continue;

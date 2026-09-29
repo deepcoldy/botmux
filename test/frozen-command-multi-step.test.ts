@@ -72,7 +72,12 @@ console.log(JSON.stringify({ rows: [{ step: id, value: id + '-private' }], row_c
   return realpathSync(path);
 }
 
-function registryYaml(script: string, modes: Record<string, string>, policies: Record<string, { schedulable: boolean; allowHandoff: boolean }>): string {
+function registryYaml(
+  script: string,
+  modes: Record<string, string>,
+  policies: Record<string, { schedulable: boolean; allowHandoff: boolean }>,
+  executorTimeoutMs = 2000,
+): string {
   const entries = Object.keys(modes).map(id => `
   - id: test.${id}
     kind: script
@@ -88,7 +93,7 @@ function registryYaml(script: string, modes: Record<string, string>, policies: R
       schedulable: ${policies[id]!.schedulable}
       allowHandoff: ${policies[id]!.allowHandoff}
       handoffIncludesInput: false
-      timeoutMs: 2000
+      timeoutMs: ${executorTimeoutMs}
       maxOutputBytes: 65536`).join('');
   return `schemaVersion: 2\nexecutors:${entries}\n`;
 }
@@ -113,6 +118,7 @@ function setup(input: {
   policies?: Record<string, { schedulable: boolean; allowHandoff: boolean }>;
   required?: boolean;
   rules?: string;
+  executorTimeoutMs?: number;
 } = {}) {
   const dir = root();
   const script = runner(join(dir, 'runner.mjs'));
@@ -123,7 +129,7 @@ function setup(input: {
     c: { schedulable: true, allowHandoff: true },
   };
   const registry = join(dir, 'command-executors.yaml');
-  writeFileSync(registry, registryYaml(script, modes, policies));
+  writeFileSync(registry, registryYaml(script, modes, policies, input.executorTimeoutMs ?? 2000));
   writeFileSync(join(dir, '.botmux', 'commands', '经营早报.yaml'), commandYaml(input.required, input.rules));
   vi.stubEnv('BOTMUX_COMMAND_EXECUTORS_FILE', registry);
   const lookup = lookupFrozenCommand({ workingDir: dir, command: '/经营早报' });
@@ -173,8 +179,8 @@ describe('Frozen Commands v2 multi-step execution', () => {
     expect(new Set(audits.map(row => row.execution_id))).toEqual(new Set([result.executionId]));
   });
 
-  it('enforces one total deadline in addition to each executor deadline', async () => {
-    const fixture = setup({ modes: { a: 'slow', b: 'slow', c: 'slow' } });
+  it('reports execution_timeout when the total deadline expires before executor deadlines', async () => {
+    const fixture = setup({ modes: { a: 'slow', b: 'slow', c: 'slow' }, executorTimeoutMs: 5000 });
     const startedAt = Date.now();
     const result = await executeFrozenCommand({
       definition: fixture.definition,
@@ -191,6 +197,33 @@ describe('Frozen Commands v2 multi-step execution', () => {
       dataDir: join(fixture.dir, 'data'),
       workingDir: fixture.dir,
       timeoutMs: 150,
+    });
+    expect(Date.now() - startedAt).toBeLessThan(900);
+    expect(result.steps?.map(step => [step.status, step.error?.code])).toEqual([
+      ['error', 'execution_timeout'],
+      ['error', 'execution_timeout'],
+      ['error', 'execution_timeout'],
+    ]);
+  });
+
+  it('reports executor_timeout when executor deadlines expire before the total deadline', async () => {
+    const fixture = setup({ modes: { a: 'slow', b: 'slow', c: 'slow' }, executorTimeoutMs: 150 });
+    const startedAt = Date.now();
+    const result = await executeFrozenCommand({
+      definition: fixture.definition,
+      rawArgs: '',
+      targetLarkAppId: 'cli_test',
+      botConfig: { plugins: [], larkAppId: 'cli_test', larkAppSecret: 'secret' },
+      trustedCaller: {
+        requestUserOpenId: 'ou_test',
+        requestUserUnionId: 'on_test',
+        requestLarkAppId: 'cli_test',
+        senderType: 'user',
+      },
+      turnId: 'om_test',
+      dataDir: join(fixture.dir, 'data'),
+      workingDir: fixture.dir,
+      timeoutMs: 5000,
     });
     expect(Date.now() - startedAt).toBeLessThan(900);
     expect(result.steps?.map(step => [step.status, step.error?.code])).toEqual([

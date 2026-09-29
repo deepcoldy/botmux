@@ -1085,7 +1085,7 @@ export async function runProcessCommandExecutor(input: {
       input.signal?.addEventListener('abort', onAbort, { once: true });
       if (input.signal?.aborted) onAbort();
       const timer = setTimeout(() => {
-        terminalError = new CommandExecutorError('executor_timeout', `执行器 ${input.executor.id} 超时`);
+        terminalError ??= new CommandExecutorError('executor_timeout', `执行器 ${input.executor.id} 超时`);
         terminateProcessGroup(child);
       }, Math.min(input.timeoutMs ?? input.executor.policy.timeoutMs, input.executor.policy.timeoutMs));
       timer.unref?.();
@@ -1209,7 +1209,7 @@ export async function runCommandRenderer(input: {
       input.signal?.addEventListener('abort', onAbort, { once: true });
       if (input.signal?.aborted) onAbort();
       const timer = setTimeout(() => {
-        terminalError = new CommandExecutorError('renderer_timeout', `渲染器 ${input.renderer.id} 超时`);
+        terminalError ??= new CommandExecutorError('renderer_timeout', `渲染器 ${input.renderer.id} 超时`);
         terminateProcessGroup(child);
       }, Math.min(input.timeoutMs ?? input.renderer.policy.timeoutMs, input.renderer.policy.timeoutMs));
       timer.unref?.();
