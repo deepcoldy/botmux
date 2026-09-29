@@ -40,6 +40,7 @@
 - 显式请求发送给旧 daemon 时必须明确失败，不能静默创建 ownerless task。
 - 所有 CLI 写操作都必须经所属 Bot daemon 提交到权威库；daemon 或权威库不可用时明确失败，不回退为只写 `schedules.json`。
 - 首次升级迁移是一次性的宿主信任边界，后续未知 JSON 行不会被识别为 legacy。
+- 早期 authority schema 的 `UNIQUE(grant_id)` 在启动时通过 `BEGIN IMMEDIATE` table rebuild 原子迁移为 `UNIQUE(grant_id, request_hash)`；迁移保留完整任务行与 `(app_id, task_id)` 主键，历史库升级后同一 turn 才能安全创建多个任务。
 - 非沙箱测试只证明受管入口遵守协议。本设计不抵御与 daemon 同 UID、可任意读取或改写宿主密钥和 SQLite 权威库的进程；那属于操作系统隔离边界。
 - `scheduleDelegation.defaultOnDispatchFromBotAppIds` 可让指定来源 orchestrator 的每次受管 dispatch 默认请求该能力；`--no-delegate schedule:create` 可对单次派发降权。
 - v2 capability 没有独立的墙钟 TTL：它的寿命严格等于目标 Bot 的同一个 live dispatch turn。新 turn、worker generation 变化或来源记录不再匹配都会拒绝兑换；很长的 turn 会在其整个生命周期内保留创建权。

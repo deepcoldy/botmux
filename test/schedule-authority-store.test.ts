@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { __setScheduleAuthorityBeforeCommitTestHook, ScheduleAuthorityStore } from '../src/services/schedule-authority-store.js';
+import { DatabaseSync } from 'node:sqlite';
+import { __setScheduleAuthorityBeforeCommitTestHook, ScheduleAuthorityStore,
+  scheduleAuthorityDbPath } from '../src/services/schedule-authority-store.js';
+import { computeInputHash } from '../src/utils/canonical-input-hash.js';
+import { canonicalScheduleInput } from '../src/services/schedule-store.js';
 import type { ScheduledTask } from '../src/types.js';
 
 const APP = 'cli_target';
@@ -118,6 +122,80 @@ describe('host-only schedule authority store', () => {
     expect(store.commitDelegated(base)).toMatchObject({ ok: true, replay: true });
     expect(store.commitDelegated({ ...base, requestHash: 'hash-3', task: task('facefeed') }))
       .toEqual({ ok: false, error: 'grant_task_limit' });
+  });
+
+  it('rebuilds the legacy UNIQUE(grant_id) table before admitting multiple requests', () => {
+    const legacyDir = mkdtempSync(join(tmpdir(), 'schedule-authority-legacy-'));
+    const path = scheduleAuthorityDbPath(legacyDir);
+    const legacyDb = new DatabaseSync(path);
+    legacyDb.exec(`
+      CREATE TABLE schedule_authority_tasks (
+        schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+        app_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('legacy','direct','delegated')),
+        state TEXT NOT NULL CHECK(state IN ('active','paused','completed','revoked')),
+        task_json TEXT NOT NULL,
+        canonical_hash TEXT NOT NULL,
+        control_open_id TEXT,
+        control_union_id TEXT,
+        run_scopes_json TEXT NOT NULL DEFAULT '[]',
+        grant_id TEXT,
+        request_hash TEXT,
+        source_message_id TEXT,
+        source_session_id TEXT,
+        target_turn_id TEXT,
+        target_generation INTEGER,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (app_id, task_id),
+        UNIQUE (grant_id)
+      );
+    `);
+    const preserved = task('legacy01');
+    legacyDb.prepare(`
+      INSERT INTO schedule_authority_tasks
+        (schema_version, app_id, task_id, kind, state, task_json, canonical_hash,
+         run_scopes_json, created_at, updated_at)
+      VALUES (1, ?, ?, 'legacy', 'active', ?, ?, '[]', ?, ?)
+    `).run(
+      APP, preserved.id, JSON.stringify(preserved),
+      computeInputHash(canonicalScheduleInput(preserved)), preserved.createdAt, preserved.createdAt,
+    );
+    legacyDb.close();
+
+    let migrated: ScheduleAuthorityStore | undefined;
+    try {
+      migrated = ScheduleAuthorityStore.open(legacyDir);
+      migrated.initializeApp(APP, []);
+      expect(migrated.getRecord(APP, preserved.id)).toMatchObject({
+        kind: 'legacy', task: { id: preserved.id }, runScopes: [], selfManage: false,
+      });
+      const base = {
+        appId: APP, grantId: 'legacy-grant', requestHash: 'hash-1', task: task(),
+        control: { openId: 'ou_user', unionId: 'on_user', credentialOpenId: 'ou_source',
+          runScopes: ['bytedcli'] as const, selfManage: true },
+        sourceMessageId: 'om_1', sourceSessionId: 's1', targetTurnId: 'om_1', targetGeneration: 1,
+        maxTasksPerTurn: 64,
+      };
+      expect(migrated.commitDelegated(base)).toMatchObject({ ok: true, replay: false });
+      expect(migrated.commitDelegated({ ...base, requestHash: 'hash-2', task: task('deadbeef') }))
+        .toMatchObject({ ok: true, replay: false });
+      expect(migrated.commitDelegated(base)).toMatchObject({ ok: true, replay: true });
+      migrated.close(); migrated = undefined;
+
+      const verified = new DatabaseSync(path);
+      const schema = verified.prepare(`
+        SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'schedule_authority_tasks'
+      `).get() as { sql: string };
+      verified.close();
+      expect(schema.sql).toMatch(/PRIMARY KEY\s*\(app_id, task_id\)/i);
+      expect(schema.sql).toMatch(/UNIQUE\s*\(grant_id, request_hash\)/i);
+      expect(schema.sql).not.toMatch(/UNIQUE\s*\(grant_id\s*\)/i);
+    } finally {
+      migrated?.close();
+      rmSync(legacyDir, { recursive: true, force: true });
+    }
   });
 
   it('keeps pause, completion and revocation in protected state', () => {

@@ -390,7 +390,8 @@ describe('target daemon consumes signed message authority', () => {
     const { deliverDispatchWithUser, resolveDispatchUser, dispatchCallerFromReply } = await import('../src/core/dispatch-user-delegation.js');
     const { pickTurnReplyTarget } = await import('../src/core/reply-target.js');
     const source = ts.createSourceFile('daemon.ts', readFileSync('src/daemon.ts', 'utf8'), ts.ScriptTarget.Latest, true);
-    const code = ['dispatchUserForTurn', 'targetUserForDelegation', 'delegatedScheduleRuntimeDeps',
+    const code = ['triggerUserAuthEnabledFor', 'prepareTurnCliIdentity',
+      'dispatchUserForTurn', 'targetUserForDelegation', 'delegatedScheduleRuntimeDeps',
       'delegatedScheduleCliIdentity', 'prepareDelegatedScheduledTurnIdentity',
       'refreshTurnCliIdentity'].map(name => {
       const fn = source.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === name);
@@ -427,8 +428,16 @@ describe('target daemon consumes signed message authority', () => {
       },
       scheduleAuthorityStore: undefined,
     };
-    const run = new Function('scope', 'with (scope) { ' + code + '; return refreshTurnCliIdentity; }')(scopeValues);
-    return { ds, scopeValues, run: (turnId = 'om_kickoff') => run(ds, turnId), resolveTargetAppOpenId };
+    const handlers = new Function('scope', 'with (scope) { ' + code
+      + '; return { refreshTurnCliIdentity, prepareTurnCliIdentity }; }')(scopeValues);
+    return {
+      ds,
+      scopeValues,
+      run: (turnId = 'om_kickoff') => turnId.startsWith('schedule:')
+        ? handlers.prepareTurnCliIdentity(ds, turnId)
+        : handlers.refreshTurnCliIdentity(ds, turnId),
+      resolveTargetAppOpenId,
+    };
   }
   it.each(['live', 'restored'])('a proven human turn does not depend on the delegation store (%s)', async mode => {
     const h = await targetHarness();

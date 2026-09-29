@@ -80,6 +80,84 @@ function parseTask(raw: unknown, expectedAppId?: string): ScheduledTask {
   return task;
 }
 
+const AUTHORITY_TASK_COLUMNS = [
+  'schema_version', 'app_id', 'task_id', 'kind', 'state', 'task_json', 'canonical_hash',
+  'control_open_id', 'control_union_id', 'credential_open_id', 'run_scopes_json',
+  'self_manage', 'grant_id', 'request_hash', 'source_message_id', 'source_session_id',
+  'target_turn_id', 'target_generation', 'created_at', 'updated_at',
+] as const;
+
+function createAuthorityTasksTableSql(tableName: string, ifNotExists = false): string {
+  return `
+    CREATE TABLE ${ifNotExists ? 'IF NOT EXISTS ' : ''}${tableName} (
+      schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+      app_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      kind TEXT NOT NULL CHECK(kind IN ('legacy','direct','delegated')),
+      state TEXT NOT NULL CHECK(state IN ('active','paused','completed','revoked')),
+      task_json TEXT NOT NULL,
+      canonical_hash TEXT NOT NULL,
+      control_open_id TEXT,
+      control_union_id TEXT,
+      credential_open_id TEXT,
+      run_scopes_json TEXT NOT NULL DEFAULT '[]',
+      self_manage INTEGER NOT NULL DEFAULT 0 CHECK(self_manage IN (0,1)),
+      grant_id TEXT,
+      request_hash TEXT,
+      source_message_id TEXT,
+      source_session_id TEXT,
+      target_turn_id TEXT,
+      target_generation INTEGER,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (app_id, task_id),
+      UNIQUE (grant_id, request_hash)
+    );
+  `;
+}
+
+function authorityTasksTableSql(db: DatabaseSyncLike): string {
+  const row = db.prepare(`
+    SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'schedule_authority_tasks'
+  `).get() as { sql?: unknown } | undefined;
+  if (typeof row?.sql !== 'string') throw new Error('schedule_authority_schema_missing');
+  return row.sql;
+}
+
+function hasLegacySingleGrantUnique(db: DatabaseSyncLike): boolean {
+  const normalized = authorityTasksTableSql(db).replace(/\s+/g, ' ').toLowerCase();
+  return /unique\s*\(\s*grant_id\s*\)/.test(normalized);
+}
+
+/** SQLite cannot ALTER a table-level UNIQUE constraint. Early builds used
+ * UNIQUE(grant_id), which makes a live turn's second distinct request fail.
+ * Rebuild the table atomically after additive columns have been backfilled. */
+function migrateLegacyGrantUnique(db: DatabaseSyncLike): void {
+  if (!hasLegacySingleGrantUnique(db)) return;
+  const replacement = 'schedule_authority_tasks_grant_v2';
+  const columns = AUTHORITY_TASK_COLUMNS.join(', ');
+  db.exec('BEGIN IMMEDIATE;');
+  try {
+    // Re-check under the write lock: another opener may already have migrated.
+    if (!hasLegacySingleGrantUnique(db)) {
+      db.exec('COMMIT;');
+      return;
+    }
+    const occupied = db.prepare(`
+      SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?
+    `).get(replacement);
+    if (occupied) throw new Error('schedule_authority_migration_table_conflict');
+    db.exec(createAuthorityTasksTableSql(replacement));
+    db.exec(`INSERT INTO ${replacement} (${columns}) SELECT ${columns} FROM schedule_authority_tasks;`);
+    db.exec('DROP TABLE schedule_authority_tasks;');
+    db.exec(`ALTER TABLE ${replacement} RENAME TO schedule_authority_tasks;`);
+    db.exec('COMMIT;');
+  } catch (error) {
+    try { db.exec('ROLLBACK;'); } catch { /* no-op */ }
+    throw error;
+  }
+}
+
 export class ScheduleAuthorityStore {
   private constructor(private readonly db: DatabaseSyncLike) {}
 
@@ -93,31 +171,7 @@ export class ScheduleAuthorityStore {
         app_id TEXT PRIMARY KEY,
         initialized_at TEXT NOT NULL
       );
-      CREATE TABLE IF NOT EXISTS schedule_authority_tasks (
-        schema_version INTEGER NOT NULL CHECK(schema_version = 1),
-        app_id TEXT NOT NULL,
-        task_id TEXT NOT NULL,
-        kind TEXT NOT NULL CHECK(kind IN ('legacy','direct','delegated')),
-        state TEXT NOT NULL CHECK(state IN ('active','paused','completed','revoked')),
-        task_json TEXT NOT NULL,
-        canonical_hash TEXT NOT NULL,
-        control_open_id TEXT,
-        control_union_id TEXT,
-        credential_open_id TEXT,
-        run_scopes_json TEXT NOT NULL DEFAULT '[]',
-        self_manage INTEGER NOT NULL DEFAULT 0 CHECK(self_manage IN (0,1)),
-        grant_id TEXT,
-        request_hash TEXT,
-        source_message_id TEXT,
-        source_session_id TEXT,
-        target_turn_id TEXT,
-        target_generation INTEGER,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL,
-        PRIMARY KEY (app_id, task_id),
-        UNIQUE (grant_id, request_hash)
-      );
-    `);
+    ` + createAuthorityTasksTableSql('schedule_authority_tasks', true));
     const columns = new Set((db.prepare('PRAGMA table_info(schedule_authority_tasks)').all() as Array<{
       name?: unknown;
     }>).flatMap(row => typeof row.name === 'string' ? [row.name] : []));
@@ -127,6 +181,7 @@ export class ScheduleAuthorityStore {
     if (!columns.has('self_manage')) {
       db.exec('ALTER TABLE schedule_authority_tasks ADD COLUMN self_manage INTEGER NOT NULL DEFAULT 0;');
     }
+    migrateLegacyGrantUnique(db);
     return new ScheduleAuthorityStore(db);
   }
 

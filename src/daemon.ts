@@ -3899,55 +3899,25 @@ async function refreshTurnCliIdentity(ds: DaemonSession, turnId: string): Promis
   const reply = pickTurnReplyTarget(ds.session, turnId);
   let delegatedIdentity: import('./core/turn-cli-identity.js').DelegatedCliIdentity | undefined;
   let delegationBlocked = false;
-  if (turnId.startsWith('schedule:')) {
-    const taskId = parseScheduledTurnId(turnId);
-    const authority = taskId ? scheduleAuthorityStore?.getRecord(ds.larkAppId, taskId) : undefined;
-    if (!authority) {
-      delegationBlocked = true;
-    } else {
-      if (authority.kind !== 'delegated') return;
-      const credentialOpenId = authority.credentialOpenId ?? authority.controlOpenId;
-      if (credentialOpenId) {
-        delegatedIdentity = {
-          credentialOpenId,
-          tools: [],
-          dispatchRoot: authority.sourceMessageId ?? authority.task.rootMessageId ?? authority.task.chatId,
-          denialReason: 'target_access_denied',
-        };
-      }
-      try {
-        await prepareDelegatedScheduledTurnIdentity(ds, turnId);
-        return;
-      } catch (error) {
-        delegationBlocked = true;
-        if (delegatedIdentity) delegatedIdentity.denialReason = 'target_validation_unavailable';
-        logger.warn(
-          `[schedule-delegation] identity unavailable for ${ds.session.sessionId}: `
-          + `${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
+  try {
+    const delegation = await dispatchUserForTurn(ds, turnId);
+    if (delegation) {
+      // Keep a denial tied to the originating task even if contact/membership
+      // lookup throws; never turn this back into "ask the peer bot to log in".
+      delegatedIdentity = {
+        credentialOpenId: delegation.authority.openId, tools: [], dispatchRoot: delegation.rootId,
+        denialReason: 'target_access_denied',
+      };
+      const targetOpenId = await targetUserForDelegation(ds, delegation.authority);
+      if (targetOpenId) delegatedIdentity = {
+        ...delegatedIdentity, targetOpenId, tools: delegation.authority.tools,
+        denialReason: undefined,
+      };
     }
-  } else {
-    try {
-      const delegation = await dispatchUserForTurn(ds, turnId);
-      if (delegation) {
-        // Keep a denial tied to the originating task even if contact/membership
-        // lookup throws; never turn this back into "ask the peer bot to log in".
-        delegatedIdentity = {
-          credentialOpenId: delegation.authority.openId, tools: [], dispatchRoot: delegation.rootId,
-          denialReason: 'target_access_denied',
-        };
-        const targetOpenId = await targetUserForDelegation(ds, delegation.authority);
-        if (targetOpenId) delegatedIdentity = {
-          ...delegatedIdentity, targetOpenId, tools: delegation.authority.tools,
-          denialReason: undefined,
-        };
-      }
-    } catch (error) {
-      delegationBlocked = true;
-      if (delegatedIdentity) delegatedIdentity.denialReason = 'target_validation_unavailable';
-      logger.warn(`[dispatch-user] identity unavailable for ${ds.session.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
-    }
+  } catch (error) {
+    delegationBlocked = true;
+    if (delegatedIdentity) delegatedIdentity.denialReason = 'target_validation_unavailable';
+    logger.warn(`[dispatch-user] identity unavailable for ${ds.session.sessionId}: ${error instanceof Error ? error.message : String(error)}`);
   }
   await publishTurnCliIdentity({
     botConfig,
