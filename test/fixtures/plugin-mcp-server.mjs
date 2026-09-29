@@ -33,8 +33,7 @@ const server = new Server(
 server.setRequestHandler(ListToolsRequestSchema, request => serverName === 'data'
   ? {
       tools: [
-        { name: 'validate_sql_for_user', description: 'validate', inputSchema: { type: 'object' } },
-        { name: 'run_query_for_user', description: 'run', inputSchema: { type: 'object' } },
+        { name: 'execute_frozen_query', description: 'execute frozen query', inputSchema: { type: 'object' } },
       ],
     }
   : request.params?.cursor
@@ -46,7 +45,6 @@ server.setRequestHandler(ListToolsRequestSchema, request => serverName === 'data
         nextCursor: 'second-page',
       });
 
-let validatedSql;
 server.setRequestHandler(CallToolRequestSchema, request => {
   if (serverName === 'data') {
     const args = request.params.arguments ?? {};
@@ -54,25 +52,32 @@ server.setRequestHandler(CallToolRequestSchema, request => {
     if (process.env.BOTMUX_SESSION_ID || !process.env.BOTMUX_EXECUTION_ID || trusted?.requestUserUnionId !== 'on_test') {
       return { isError: true, content: [{ type: 'text', text: 'wrong_identity' }] };
     }
-    if (request.params.name === 'validate_sql_for_user') {
-      if (args.sql.includes('RETURN_VALIDATION_ERROR')) {
+    if (request.params.name === 'execute_frozen_query') {
+      if (args.payload?.sql?.includes('RETURN_VALIDATION_ERROR')) {
         return {
           content: [{
             type: 'text',
             text: JSON.stringify({
-              status: 'validation_error',
-              result_class: 'policy_error',
+              contractVersion: 1,
+              status: 'error',
+              errorCode: 'query_plan_session_required',
               message: 'missing execution context',
-              issues: [{ code: 'query_plan_session_required' }],
             }),
           }],
         };
       }
-      validatedSql = args.sql;
-      return { content: [{ type: 'text', text: JSON.stringify({ query_plan_id: 'qplan_fixture', sql: args.sql }) }] };
-    }
-    if (request.params.name === 'run_query_for_user' && args.query_plan_id === 'qplan_fixture' && args.sql === validatedSql) {
-      return { content: [{ type: 'text', text: JSON.stringify({ status: 'ok', sql: args.sql, data: [{ amount: 12 }] }) }] };
+      return { content: [{ type: 'text', text: JSON.stringify({
+        contractVersion: 1,
+        status: 'success',
+        fallbackText: '12',
+        blocks: [{ type: 'text', text: '12' }],
+        meta: { queryId: 'q_fixture', totalRows: 1 },
+        data: {
+          rows: [{ amount: 12 }],
+          columns: [{ key: 'amount', label: 'amount' }],
+          totalRows: 1,
+        },
+      }) }] };
     }
     return { isError: true, content: [{ type: 'text', text: 'query_plan_sql_mismatch' }] };
   }

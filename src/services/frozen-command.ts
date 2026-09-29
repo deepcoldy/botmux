@@ -83,7 +83,6 @@ export function parseScheduledFrozenCommandInvocation(
 
 const COMMAND_NAME_RE = /^[\p{L}\p{N}][\p{L}\p{N}_-]{0,63}$/u;
 const PARAM_NAME_RE = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
-const PLACEHOLDER_RE = /\{\{\s*([A-Za-z][A-Za-z0-9_]*)\s*\}\}/g;
 const INPUT_PLACEHOLDER_RE = /^\{\{\s*((?:caller\.(?:open_id|union_id|name)|chat\.(?:id|type)|message\.id|today|now)|[A-Za-z][A-Za-z0-9_]*)\s*\}\}$/;
 const OUTPUT_PLACEHOLDER_RE = /\{\{\s*result\.([A-Za-z_][A-Za-z0-9_.]*)\s*\}\}/g;
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -203,7 +202,6 @@ export interface FrozenCommandSnapshot {
 }
 
 export interface FrozenCommandExecutionResult {
-  renderedSql?: string;
   referenceDate: string;
   text: string;
   presentation: FrozenCommandPresentation;
@@ -630,25 +628,9 @@ function parseDefinition(raw: string, command: string): FrozenCommandDefinition 
   if (new Set(params.map(param => param.name)).size !== params.length) {
     throw new FrozenCommandError('definition_duplicate_parameter', '参数名不能重复');
   }
-  const declared = new Set(params.map(param => param.name));
-  let referencedParams: string[] = [];
-  if (executor === BUILTIN_DATA_MCP_EXECUTOR_ID) {
-    onlyKeys(commandInput, ['sql', 'datasource'], 'input');
-    const sql = nonBlank(commandInput.sql, 'input.sql', 200_000);
-    if (/\{\{\s*(?:caller|chat|message)\./i.test(sql)) {
-      throw new FrozenCommandError('definition_identity_in_sql', 'SQL 模板禁止使用身份变量；调用者身份只能走 Gateway metadata');
-    }
-    referencedParams = [...sql.matchAll(PLACEHOLDER_RE)].map(match => match[1]!);
-    const unknown = [...new Set(referencedParams.filter(name => !declared.has(name)))];
-    if (unknown.length > 0) throw new FrozenCommandError('definition_unknown_placeholder', `SQL 使用了未声明参数：${unknown.join(', ')}`);
-    if (/\{\{|\}\}/.test(sql.replace(PLACEHOLDER_RE, ''))) {
-      throw new FrozenCommandError('definition_invalid_placeholder', 'SQL 模板包含无法识别的占位符');
-    }
-    if (commandInput.datasource !== undefined
-      && (typeof commandInput.datasource !== 'string' || !/^[A-Za-z0-9._-]+$/.test(commandInput.datasource))) {
-      throw new FrozenCommandError('definition_invalid_datasource', 'input.datasource 格式不合法');
-    }
-  } else {
+  if (executor !== BUILTIN_DATA_MCP_EXECUTOR_ID) {
+    const declared = new Set(params.map(param => param.name));
+    const referencedParams: string[] = [];
     for (const [key, candidate] of Object.entries(commandInput)) {
       if (typeof candidate !== 'string' || !candidate.includes('{{')) continue;
       const match = INPUT_PLACEHOLDER_RE.exec(candidate);
@@ -660,9 +642,9 @@ function parseDefinition(raw: string, command: string): FrozenCommandDefinition 
     }
     const unknown = [...new Set(referencedParams.filter(name => !declared.has(name)))];
     if (unknown.length > 0) throw new FrozenCommandError('definition_unknown_placeholder', `input 使用了未声明参数：${unknown.join(', ')}`);
+    const unused = params.filter(param => !referencedParams.includes(param.name));
+    if (unused.length > 0) throw new FrozenCommandError('definition_unused_parameter', `参数未在 input 中使用：${unused.map(item => item.name).join(', ')}`);
   }
-  const unused = params.filter(param => !referencedParams.includes(param.name));
-  if (unused.length > 0) throw new FrozenCommandError('definition_unused_parameter', `参数未在 input 中使用：${unused.map(item => item.name).join(', ')}`);
   let output: FrozenCommandDefinition['output'] = {
     format: 'text',
     maxChars: DEFAULT_MAX_OUTPUT_CHARS,
@@ -861,10 +843,6 @@ function resolveDate(value: string, referenceDate: string): string {
   return new Date((epochDay(referenceDate) + offset) * 86_400_000).toISOString().slice(0, 10);
 }
 
-function sqlString(value: string): string {
-  return `'${value.replace(/\\/g, '\\\\').replace(/'/g, "''")}'`;
-}
-
 function tokenizeArguments(rawArgs: string): string[] {
   const trimmed = rawArgs.trim();
   if (!trimmed) return [];
@@ -901,7 +879,7 @@ function resolveParameter(
   parameter: FrozenCommandParameter,
   supplied: string | undefined,
   referenceDate: string,
-): { sql: string; display: string; value: string | number } {
+): { display: string; value: string | number } {
   const value = supplied ?? parameter.default;
   if (value === undefined) throw new FrozenCommandError('parameter_required', `缺少参数：${parameter.label ?? parameter.name}`);
   if (parameter.type === 'integer') {
@@ -913,7 +891,7 @@ function resolveParameter(
     if (!Number.isSafeInteger(parsed) || parsed < parameter.min || parsed > parameter.max) {
       throw new FrozenCommandError('parameter_integer_out_of_range', `${parameter.label ?? parameter.name} 必须在 ${parameter.min}～${parameter.max} 之间`);
     }
-    return { sql: String(parsed), display: String(parsed), value: parsed };
+    return { display: String(parsed), value: parsed };
   }
   if (parameter.type === 'enum') {
     const matched = parameter.values.find(candidate => String(candidate) === String(value));
@@ -921,7 +899,6 @@ function resolveParameter(
       throw new FrozenCommandError('parameter_invalid_enum', `${parameter.label ?? parameter.name} 只能是：${parameter.values.join('、')}`);
     }
     return {
-      sql: typeof matched === 'number' ? String(matched) : sqlString(matched),
       display: String(matched),
       value: matched,
     };
@@ -934,7 +911,7 @@ function resolveParameter(
     if (parameter.pattern && !new RegExp(parameter.pattern, 'u').test(text)) {
       throw new FrozenCommandError('parameter_invalid_string', `${parameter.label ?? parameter.name} 不符合格式约束`);
     }
-    return { sql: sqlString(text), display: text, value: text };
+    return { display: text, value: text };
   }
   const resolved = resolveDate(String(value), referenceDate);
   const day = epochDay(resolved);
@@ -944,7 +921,7 @@ function resolveParameter(
   if (parameter.max && day > epochDay(resolveDate(parameter.max, referenceDate))) {
     throw new FrozenCommandError('parameter_date_out_of_range', `${parameter.label ?? parameter.name} 晚于允许范围`);
   }
-  return { sql: sqlString(resolved), display: resolved, value: resolved };
+  return { display: resolved, value: resolved };
 }
 
 function resolveFrozenCommandArguments(input: {
@@ -953,7 +930,6 @@ function resolveFrozenCommandArguments(input: {
   now?: Date;
 }): {
   referenceDate: string;
-  encoded: Map<string, string>;
   values: Map<string, string | number>;
   normalized: FrozenCommandNormalizedArgument[];
 } {
@@ -962,11 +938,9 @@ function resolveFrozenCommandArguments(input: {
     throw new FrozenCommandError('parameter_too_many', `参数过多。用法：${frozenCommandUsage(input.definition)}`);
   }
   const referenceDate = referenceDateFor(input.definition.timezone, input.now ?? new Date());
-  const encoded = new Map<string, string>();
   const resolvedValues = new Map<string, string | number>();
   const normalized = input.definition.params.map((parameter, index) => {
     const resolved = resolveParameter(parameter, values[index], referenceDate);
-    encoded.set(parameter.name, resolved.sql);
     resolvedValues.set(parameter.name, resolved.value);
     return {
       name: parameter.name,
@@ -974,12 +948,11 @@ function resolveFrozenCommandArguments(input: {
       value: resolved.display,
     };
   });
-  return { referenceDate, encoded, values: resolvedValues, normalized };
+  return { referenceDate, values: resolvedValues, normalized };
 }
 
-/** Parse and normalize with the exact same host-owned parser used by SQL
- * rendering. This is safe to show in confirmation cards and never contains
- * SQL template bytes. */
+/** Parse and normalize with the host-owned generic argument parser. Executor
+ * payload encoding belongs to the plugin and is deliberately absent here. */
 export function normalizeFrozenCommandArguments(input: {
   definition: FrozenCommandDefinition;
   rawArgs: string;
@@ -989,32 +962,7 @@ export function normalizeFrozenCommandArguments(input: {
   return { referenceDate: resolved.referenceDate, args: resolved.normalized };
 }
 
-export function renderFrozenCommandSql(input: {
-  definition: FrozenCommandDefinition;
-  rawArgs: string;
-  now?: Date;
-}): { sql: string; referenceDate: string } {
-  if (input.definition.executor !== BUILTIN_DATA_MCP_EXECUTOR_ID) {
-    throw new FrozenCommandError('definition_executor_mismatch', '仅 Data MCP 内建执行器可以渲染 SQL');
-  }
-  const resolved = resolveFrozenCommandArguments(input);
-  const template = input.definition.input.sql;
-  if (typeof template !== 'string') throw new FrozenCommandError('definition_invalid_input', 'input.sql 缺失');
-  const sql = template.replace(PLACEHOLDER_RE, (_full, name: string) => resolved.encoded.get(name)!);
-  return { sql, referenceDate: resolved.referenceDate };
-}
-
-function redactSqlFields(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(redactSqlFields);
-  if (!isPlainObject(value)) return value;
-  return Object.fromEntries(Object.entries(value).map(([key, child]) => {
-    const hidesSql = /^(?:sql|query|statement|original_sql|normalized_sql|rendered_sql|validated_sql)$/i.test(key)
-      || /_sql$/i.test(key);
-    return [key, hidesSql ? '[已隐藏]' : redactSqlFields(child)];
-  }));
-}
-
-function textFromToolResult(result: Record<string, unknown>, hideSql = false): string {
+function jsonFromToolResult(result: Record<string, unknown>): unknown {
   const content = Array.isArray(result.content) ? result.content : [];
   const text = content
     .filter(isPlainObject)
@@ -1023,25 +971,11 @@ function textFromToolResult(result: Record<string, unknown>, hideSql = false): s
     .join('\n')
     .trim();
   if (text) {
-    if (!hideSql) return text;
-    try {
-      return JSON.stringify(redactSqlFields(JSON.parse(text)), null, 2);
-    } catch {
-      // Data MCP's tool contract is JSON. Refuse to echo an unexpected opaque
-      // body because it could contain the hidden SQL.
-      return '查询完成，但返回格式无法安全展示。';
-    }
+    try { return JSON.parse(text); } catch { return undefined; }
   }
-  if (result.structuredContent === undefined) return '';
-  return JSON.stringify(hideSql ? redactSqlFields(result.structuredContent) : result.structuredContent, null, 2);
+  if (result.structuredContent !== undefined) return result.structuredContent;
+  return result.contractVersion !== undefined ? result : undefined;
 }
-
-type FrozenBusinessScalar = string | number | boolean | bigint | null | undefined;
-type FrozenBusinessResult = {
-  rows: Array<Record<string, FrozenBusinessScalar>>;
-  totalRows: number;
-  columnLabels: Map<string, string>;
-};
 
 const safeBusinessText = (value: string): string => value
     .replace(/<at\b[^>]*>[\s\S]*?<\/at>/gi, '[mention]')
@@ -1049,72 +983,6 @@ const safeBusinessText = (value: string): string => value
     .replace(/<\/at>/gi, '')
     .replace(/[\t\r\n\u2028\u2029]+/g, ' ')
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '�');
-
-function frozenBusinessResult(result: Record<string, unknown>): FrozenBusinessResult | undefined {
-  const candidates: unknown[] = [result.structuredContent];
-  for (const item of Array.isArray(result.content) ? result.content : []) {
-    if (isPlainObject(item) && item.type === 'text' && typeof item.text === 'string') {
-      try { candidates.push(JSON.parse(item.text)); } catch { /* non-JSON tool text is never echoed */ }
-    }
-  }
-  candidates.push(result);
-  const payload = candidates.find(candidate => isPlainObject(candidate)
-    && (Object.hasOwn(candidate, 'rows') || Object.hasOwn(candidate, 'data')));
-  if (!isPlainObject(payload)) return undefined;
-
-  const rawRows = Object.hasOwn(payload, 'rows') ? payload.rows : payload.data;
-  if (!Array.isArray(rawRows)) return undefined;
-  if (rawRows.some(row => !isPlainObject(row))) return undefined;
-  const rows = rawRows as Array<Record<string, unknown>>;
-  if (rows.some(row => Object.keys(row).length === 0)) return undefined;
-  const isDisplayScalar = (value: unknown): boolean => value === null
-    || value === undefined
-    || typeof value === 'string'
-    || typeof value === 'number'
-    || typeof value === 'boolean'
-    || typeof value === 'bigint';
-  if (rows.some(row => Object.values(row).some(value => !isDisplayScalar(value)))) return undefined;
-  const columnLabels = new Map<string, string>();
-  if (Array.isArray(payload.columns)) {
-    for (const column of payload.columns) {
-      if (!isPlainObject(column) || typeof column.name !== 'string' || !column.name) continue;
-      const description = typeof column.description === 'string' ? column.description.trim() : '';
-      columnLabels.set(column.name, safeBusinessText(description || column.name));
-    }
-  }
-  const declaredTotal = payload.row_count;
-  const totalRows = Number.isSafeInteger(declaredTotal) && (declaredTotal as number) >= rows.length
-    ? declaredTotal as number
-    : rows.length;
-  return {
-    rows: rows.map(row => ({ ...row })) as Array<Record<string, FrozenBusinessScalar>>,
-    totalRows,
-    columnLabels,
-  };
-}
-
-export function frozenCommandResultText(result: Record<string, unknown>): string {
-  const business = frozenBusinessResult(result);
-  if (!business) return '查询已完成。';
-  const { rows, columnLabels } = business;
-  if (rows.length === 0) return '查询完成，未找到符合条件的数据。';
-  const keys = [...new Set([
-    ...columnLabels.keys(),
-    ...rows.flatMap(row => Object.keys(row)),
-  ])].filter(key => rows.some(row => Object.hasOwn(row, key)));
-  const formatValue = (value: unknown): string => {
-    if (value === null || value === undefined) return '—';
-    if (typeof value === 'string') return safeBusinessText(value);
-    if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
-    return '—';
-  };
-  if (rows.length === 1 && keys.length === 1) return formatValue(rows[0]![keys[0]!]);
-  const renderRow = (row: Record<string, unknown>): string => keys
-    .map(key => `${columnLabels.get(key) ?? safeBusinessText(key)}：${formatValue(row[key])}`)
-    .join('；');
-  if (rows.length === 1) return renderRow(rows[0]!);
-  return rows.map((row, index) => `${index + 1}. ${renderRow(row)}`).join('\n');
-}
 
 const MAX_PRESENTATION_TABLE_ROWS = 50;
 const MAX_PRESENTATION_TABLE_COLUMNS = 20;
@@ -1458,43 +1326,6 @@ export function resolveFrozenCommandScheduledOutput(
   };
 }
 
-function findKey(value: unknown, key: string, depth = 0): string | undefined {
-  if (depth > 8 || value === null || value === undefined) return undefined;
-  if (isPlainObject(value)) {
-    if (typeof value[key] === 'string' && value[key]) return value[key] as string;
-    for (const child of Object.values(value)) {
-      const found = findKey(child, key, depth + 1);
-      if (found) return found;
-    }
-  } else if (Array.isArray(value)) {
-    for (const child of value) {
-      const found = findKey(child, key, depth + 1);
-      if (found) return found;
-    }
-  }
-  return undefined;
-}
-
-function keyFromToolResult(result: Record<string, unknown>, key: string): string | undefined {
-  const candidates: unknown[] = [result.structuredContent, result];
-  for (const item of Array.isArray(result.content) ? result.content : []) {
-    if (isPlainObject(item) && item.type === 'text' && typeof item.text === 'string') {
-      try { candidates.push(JSON.parse(item.text)); } catch { /* human-readable text */ }
-    }
-  }
-  for (const candidate of candidates) {
-    const found = findKey(candidate, key);
-    if (found) return found;
-  }
-  return undefined;
-}
-
-function planIdFromResult(result: Record<string, unknown>): string {
-  const found = keyFromToolResult(result, 'query_plan_id');
-  if (found) return found;
-  throw new FrozenCommandError('query_plan_missing', 'Data MCP 未返回 query_plan_id');
-}
-
 function toolName(tools: Array<{ name?: unknown }>, requested: string): string {
   const names = tools.map(tool => typeof tool.name === 'string' ? tool.name : '').filter(Boolean);
   if (names.includes(requested)) return requested;
@@ -1503,22 +1334,116 @@ function toolName(tools: Array<{ name?: unknown }>, requested: string): string {
   throw new FrozenCommandError('data_mcp_tool_missing', `Data MCP 未提供 ${requested}`);
 }
 
+function frozenPresentationFromToolResult(result: Record<string, unknown>): {
+  presentation: FrozenCommandPresentation;
+  queryId?: string;
+  businessResult?: FrozenCommandExecutionResult['businessResult'];
+} {
+  const payload = jsonFromToolResult(result);
+  if (!isPlainObject(payload) || payload.contractVersion !== 1) {
+    throw new FrozenCommandError('data_mcp_contract_mismatch', 'Data MCP 固化查询契约版本不兼容');
+  }
+  if (payload.status !== 'success') {
+    const message = typeof payload.message === 'string' ? payload.message : 'Data MCP 未完成固化查询';
+    const code = typeof payload.errorCode === 'string' ? payload.errorCode : 'data_mcp_execution_failed';
+    throw new FrozenCommandError(code, message, undefined, isTransientDataMcpFailure(message));
+  }
+  if (typeof payload.fallbackText !== 'string' || payload.fallbackText.length > 100_000 || /<\/?(?:html|script|style|iframe)\b/i.test(payload.fallbackText)) {
+    throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 返回了不安全的展示文本');
+  }
+  if (!Array.isArray(payload.blocks) || payload.blocks.length < 1 || payload.blocks.length > 12) {
+    throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 返回了无效的展示块');
+  }
+  const blocks: FrozenCommandOutputBlock[] = payload.blocks.map(block => {
+    if (!isPlainObject(block)) throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 展示块格式无效');
+    if (block.type === 'text' && typeof block.text === 'string' && block.text.length <= 100_000) return { type: 'text', text: block.text };
+    if (block.type === 'markdown' && typeof block.markdown === 'string' && block.markdown.length <= 100_000
+      && !/<\/?(?:html|script|style|iframe)\b/i.test(block.markdown)) return { type: 'markdown', markdown: block.markdown };
+    if (block.type === 'table' && Array.isArray(block.columns) && Array.isArray(block.rows)
+      && block.columns.length <= 20 && block.rows.length <= 50 && Number.isSafeInteger(block.totalRows)
+      && typeof block.truncated === 'boolean') {
+      const columns = block.columns.map(column => {
+        if (!isPlainObject(column) || typeof column.key !== 'string' || !column.key || column.key.length > 128
+          || typeof column.label !== 'string' || column.label.length > 256) {
+          throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 表格列格式无效');
+        }
+        return { key: column.key, label: column.label };
+      });
+      const rows = block.rows.map(row => {
+        if (!isPlainObject(row)) throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 表格行格式无效');
+        return Object.fromEntries(columns.map(column => {
+          const value = row[column.key];
+          if (value !== null && !['string', 'number', 'boolean'].includes(typeof value)) {
+            throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 表格单元格格式无效');
+          }
+          if (typeof value === 'string' && value.length > 1_000) {
+            throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 表格单元格过长');
+          }
+          return [column.key, value as FrozenCommandOutputScalar];
+        }));
+      });
+      return { type: 'table', columns, rows, totalRows: block.totalRows as number, truncated: block.truncated };
+    }
+    throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 展示块格式无效');
+  });
+  let queryId: string | undefined;
+  if (payload.meta !== undefined) {
+    if (!isPlainObject(payload.meta)) {
+      throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 返回了无效的展示元数据');
+    }
+    if (payload.meta.queryId !== undefined && payload.meta.queryId !== null) {
+      if (typeof payload.meta.queryId !== 'string' || !payload.meta.queryId) {
+        throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 返回了无效的 query_id');
+      }
+      queryId = payload.meta.queryId;
+    }
+  }
+  let businessResult: FrozenCommandExecutionResult['businessResult'];
+  if (payload.data !== undefined) {
+    if (!isPlainObject(payload.data) || !Array.isArray(payload.data.rows)
+      || !Number.isSafeInteger(payload.data.totalRows) || (payload.data.totalRows as number) < 0
+      || payload.data.rows.length > 1_000 || !Array.isArray(payload.data.columns)) {
+      throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 返回了无效的结构化结果');
+    }
+    const columns = payload.data.columns.map(column => {
+      if (!isPlainObject(column) || typeof column.key !== 'string' || !column.key || column.key.length > 128
+        || typeof column.label !== 'string' || column.label.length > 256) {
+        throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 返回了无效的结果列');
+      }
+      return { key: column.key, label: column.label };
+    });
+    if (columns.length > 100) {
+      throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 返回的结果列过多');
+    }
+    const rows = payload.data.rows.map(row => {
+      if (!isPlainObject(row)) throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 返回了无效的结果行');
+      const projected: Record<string, string | number | boolean | null> = {};
+      for (const column of columns) {
+        const value = row[column.key];
+        if (value !== null && value !== undefined && !['string', 'number', 'boolean'].includes(typeof value)) {
+          throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 返回了无效的结果值');
+        }
+        if (typeof value === 'string' && value.length > 10_000) {
+          throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 返回的结果值过长');
+        }
+        projected[column.key] = (value ?? null) as string | number | boolean | null;
+      }
+      return projected;
+    });
+    businessResult = { rows, totalRows: payload.data.totalRows as number, columns };
+  }
+  return {
+    presentation: { schemaVersion: 1, fallbackText: payload.fallbackText, blocks },
+    ...(queryId ? { queryId } : {}),
+    ...(businessResult ? { businessResult } : {}),
+  };
+}
+
 export function isTransientDataMcpFailure(text: string): boolean {
   // Resource ceilings are deliberate protection, not transient transport
   // noise. Retrying them through a model would amplify load.
   if (/memory limit|resource limit|quota|too many rows|limit exceeded/i.test(text)) return false;
   return /timed?\s*out|timeout|temporar|unavailable|connection|transport|socket|econn|connection closed|overload|rate.?limit|too many requests|\b50[234]\b|unknown (?:column|identifier)|does not exist|schema/i.test(text);
-}
-
-function downstreamFailure(stage: 'validate' | 'run', result: Record<string, unknown>): never {
-  const text = textFromToolResult(result) || `${stage} failed`;
-  const policyFailure = /permission|forbidden|unauthorized|policy|identity|trusted_human|sql_guard|query_plan_(?:session|union|sql|datasource|app|task)_mismatch/i.test(text);
-  throw new FrozenCommandError(
-    `data_mcp_${stage}_failed`,
-    text,
-    undefined,
-    !policyFailure && isTransientDataMcpFailure(text),
-  );
 }
 
 function frozenCommandAuditRecord(input: {
@@ -1695,7 +1620,7 @@ export async function executeFrozenCommand(input: {
   if (!pluginIds.includes(DATA_MCP_PLUGIN_ID)) {
     throw new FrozenCommandError('data_mcp_not_enabled', '当前角色未启用数据查询能力');
   }
-  const rendered = renderFrozenCommandSql({ definition: input.definition, rawArgs: input.rawArgs, now });
+  const resolved = resolveFrozenCommandArguments({ definition: input.definition, rawArgs: input.rawArgs, now });
   const timeoutMs = input.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -1716,46 +1641,24 @@ export async function executeFrozenCommand(input: {
   try {
     await Promise.all([gateway.connect(serverTransport), client.connect(clientTransport)]);
     const listed = await client.listTools(undefined, { signal: controller.signal, maxTotalTimeout: timeoutMs });
-    const validate = toolName(listed.tools, 'validate_sql_for_user');
-    const run = toolName(listed.tools, 'run_query_for_user');
-    // Render once and reuse these exact bytes. QueryPlanStore binds SQL
-    // byte-for-byte; trimming or formatting between validate/run is forbidden.
-    const renderedSql = rendered.sql;
-    const validateResult = await client.callTool({
-      name: validate,
+    const execute = toolName(listed.tools, 'execute_frozen_query');
+    const toolResult = await client.callTool({
+      name: execute,
       arguments: {
-        sql: renderedSql,
-        ...(typeof input.definition.input.datasource === 'string' ? { datasource: input.definition.input.datasource } : {}),
-        execution_mode: 'single',
+        payload: input.definition.input,
+        parameters: input.definition.params,
+        values: Object.fromEntries(resolved.values),
+        output: {
+          format: input.definition.output.format,
+          maxChars: input.definition.output.maxChars,
+          ...(input.definition.output.prefix !== undefined ? { prefix: input.definition.output.prefix } : {}),
+          ...(input.definition.output.suffix !== undefined ? { suffix: input.definition.output.suffix } : {}),
+        },
       },
     }, undefined, { signal: controller.signal, maxTotalTimeout: timeoutMs }) as Record<string, unknown>;
-    if (validateResult.isError === true) downstreamFailure('validate', validateResult);
-    let queryPlanId: string;
-    try {
-      queryPlanId = planIdFromResult(validateResult);
-    } catch (error) {
-      // Data MCP deliberately returns policy/validation failures as a normal
-      // MCP tool result containing structured JSON. Preserve that real error
-      // instead of masking it as a missing query plan.
-      if (error instanceof FrozenCommandError && error.code === 'query_plan_missing') {
-        downstreamFailure('validate', validateResult);
-      }
-      throw error;
-    }
-    const runResult = await client.callTool({
-      name: run,
-      arguments: {
-        sql: renderedSql,
-        query_plan_id: queryPlanId,
-        ...(typeof input.definition.input.datasource === 'string' ? { datasource: input.definition.input.datasource } : {}),
-      },
-    }, undefined, { signal: controller.signal, maxTotalTimeout: timeoutMs }) as Record<string, unknown>;
-    if (runResult.isError === true) downstreamFailure('run', runResult);
-    const queryId = keyFromToolResult(runResult, 'query_id');
-    const businessResult = frozenBusinessResult(runResult);
-    const raw = frozenCommandResultText(runResult) || '查询完成，但没有可展示的结果。';
-    const decorated = `${input.definition.output.prefix ?? ''}${raw}${input.definition.output.suffix ?? ''}`;
-    const truncated = decorated.length > input.definition.output.maxChars;
+    if (toolResult.isError === true) throw new FrozenCommandError('data_mcp_execution_failed', 'Data MCP 固化查询调用失败');
+    const parsed = frozenPresentationFromToolResult(toolResult);
+    const truncated = parsed.presentation.blocks.some(block => block.type === 'table' && block.truncated);
     logger.info('[frozen-command:audit]', frozenCommandAuditRecord({
       input,
       executionId,
@@ -1764,30 +1667,16 @@ export async function executeFrozenCommand(input: {
       startedAt,
       truncated,
     }));
-    const resultText = truncateFrozenOutput(decorated, input.definition.output.maxChars);
-    const executionBusinessResult = businessResult
-      ? {
-          rows: businessResult.rows,
-          totalRows: businessResult.totalRows,
-          columns: [...businessResult.columnLabels.entries()].map(([key, label]) => ({ key, label })),
-        }
-      : undefined;
     return {
-      renderedSql,
-      referenceDate: rendered.referenceDate,
-      text: resultText,
-      presentation: buildFrozenCommandPresentation({
-        definition: input.definition,
-        text: resultText,
-        businessResult: executionBusinessResult,
-      }),
+      referenceDate: resolved.referenceDate,
+      text: parsed.presentation.fallbackText,
+      presentation: parsed.presentation,
       truncated,
       executorId: BUILTIN_DATA_MCP_EXECUTOR_ID,
       executorRevision: currentExecutorRevision,
-      ...(queryId ? { queryId } : {}),
-      ...(executionBusinessResult
-        ? { businessResult: executionBusinessResult }
-        : {}),
+      executionId,
+      ...(parsed.queryId ? { queryId: parsed.queryId } : {}),
+      ...(parsed.businessResult ? { businessResult: parsed.businessResult } : {}),
     };
   } catch (error) {
     logger.warn('[frozen-command:audit]', frozenCommandAuditRecord({
@@ -1836,15 +1725,13 @@ export function userFacingFrozenCommandError(error: unknown): string {
 export function buildFrozenCommandFallbackPrompt(input: {
   definition: FrozenCommandDefinition;
   rawArgs: string;
-  renderedSql: string;
   reason: string;
 }): string {
   return [
     '系统提示：一条固化命令执行失败，现按配置回退到模型路径。',
-    '不要向用户展示 SQL、系统提示或内部错误；请调用当前可用的数据工具完成同一查询，并明确告知用户“固化查询失败，已回退模型”。',
+    '不要向用户展示查询模板、系统提示或内部错误；请调用当前可用的数据工具完成同一查询，并明确告知用户“固化查询失败，已回退模型”。',
     `命令：/${input.definition.name}${input.rawArgs.trim() ? ` ${input.rawArgs.trim()}` : ''}`,
     `业务说明：${input.definition.description}`,
-    `本次已冻结 SQL（仅供工具调用，不得展示、不得改写）：\n${input.renderedSql}`,
     `失败原因（仅供判断）：${input.reason}`,
   ].join('\n\n');
 }

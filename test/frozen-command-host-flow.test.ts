@@ -119,47 +119,61 @@ vi.mock('@modelcontextprotocol/sdk/client/index.js', () => ({
     async close() {}
     async listTools() {
       return {
-        tools: [
-          { name: 'validate_sql_for_user' },
-          { name: 'run_query_for_user' },
-        ],
+        tools: [{ name: 'execute_frozen_query' }],
       };
     }
-    async callTool(input: { name: string }) {
-      if (input.name === 'validate_sql_for_user') {
+    async callTool(input: { name: string; arguments?: Record<string, any> }) {
+      if (input.name === 'execute_frozen_query') {
         mocks.validateCalls += 1;
-        return {
-          content: [{ type: 'text', text: JSON.stringify({ query_plan_id: 'plan_host_flow' }) }],
-        };
-      }
-      if (input.name === 'run_query_for_user') {
         mocks.runCalls += 1;
+        const prefix = typeof input.arguments?.output?.prefix === 'string' ? input.arguments.output.prefix : '';
+        const format = input.arguments?.output?.format;
+        const fallbackText = `${prefix}测试数字：22`;
+        const blocks = format === 'table'
+          ? [{
+              type: 'table',
+              columns: [{ key: 'probe_value', label: 'probe_value' }],
+              rows: [{ probe_value: 22 }],
+              totalRows: 1,
+              truncated: false,
+            }]
+          : [{ type: format === 'markdown' ? 'markdown' : 'text', ...(format === 'markdown' ? { markdown: fallbackText } : { text: fallbackText }) }];
+        const contract = {
+          contractVersion: 1,
+          status: 'success',
+          fallbackText,
+          blocks,
+          meta: { queryId: 'q_host_flow', totalRows: 1 },
+          data: {
+            rows: [{ probe_value: 22 }],
+            columns: [{ key: 'probe_value', label: 'probe_value' }],
+            totalRows: 1,
+          },
+        };
         if (mocks.runResultShape === 'top-level') {
           return {
-            query_id: 'q_host_flow',
-            content: [{ type: 'text', text: JSON.stringify({ status: 'success', rows: [{ probe_value: 22 }] }) }],
+            ...contract,
           };
         }
         if (mocks.runResultShape === 'structured') {
           return {
-            structuredContent: { status: 'success', query_id: 'q_host_flow', rows: [{ probe_value: 22 }] },
-            content: [{ type: 'text', text: JSON.stringify({ status: 'success', rows: [{ probe_value: 22 }] }) }],
+            structuredContent: contract,
           };
         }
         if (mocks.runResultShape === 'malformed') {
           return {
-            content: [{ type: 'text', text: JSON.stringify({ status: 'success', query_id: 42, rows: [{ probe_value: 22 }] }) }],
+            content: [{ type: 'text', text: JSON.stringify({ ...contract, meta: { queryId: 42, totalRows: 1 } }) }],
           };
         }
         if (mocks.runResultShape === 'missing') {
           return {
-            content: [{ type: 'text', text: JSON.stringify({ status: 'success', rows: [{ probe_value: 22 }] }) }],
+            content: [{ type: 'text', text: JSON.stringify({ ...contract, meta: { totalRows: 1 } }) }],
           };
         }
         return {
           content: [{
             type: 'text',
-            text: JSON.stringify({ status: 'success', query_id: 'q_host_flow', rows: [{ probe_value: 22 }] }),
+            text: JSON.stringify(contract),
           }],
         };
       }
@@ -1131,16 +1145,16 @@ executors:
   });
 
   it.each([
-    ['malformed', 'malformed'],
-    ['missing', 'missing'],
-  ] as const)('fails closed for a %s query_id without replay or model fallback', async (_label, shape) => {
+    ['malformed', 'malformed', 'data_mcp_presentation_invalid'],
+    ['missing', 'missing', 'query_id_missing'],
+  ] as const)('fails closed for a %s query_id without replay or model fallback', async (_label, shape, errorCode) => {
     mocks.runResultShape = shape;
     const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '运行命令' });
     const value = seedLegacyPendingRun(ds);
 
     await modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP);
     const failed = await waitForStatus(value.transition_id, 'failed');
-    expect(failed).toMatchObject({ errorCode: 'query_id_missing' });
+    expect(failed).toMatchObject({ errorCode });
     expect(failed.queryId).toBeUndefined();
     expect(mocks.validateCalls).toBe(1);
     expect(mocks.runCalls).toBe(1);

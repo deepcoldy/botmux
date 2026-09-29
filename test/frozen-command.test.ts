@@ -1,4 +1,4 @@
-import { mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -9,7 +9,6 @@ import {
   executeFrozenCommand,
   evaluateFrozenCommandOutputCondition,
   frozenCommandUsage,
-  frozenCommandResultText,
   listFrozenCommandSnapshots,
   lookupFrozenCommand,
   isTransientDataMcpFailure,
@@ -17,7 +16,6 @@ import {
   normalizeFrozenCommandArguments,
   parseNaturalLanguageFrozenCommandInvocation,
   parseScheduledFrozenCommandInvocation,
-  renderFrozenCommandSql,
   resolveFrozenCommandScheduledOutput,
   shouldFallbackFrozenCommand,
   userFacingFrozenCommandError,
@@ -69,6 +67,20 @@ onError: fallback_llm
 `;
 
 describe('Frozen Commands definition and positional UX', () => {
+  it('keeps query rendering and Data MCP query tools outside the host service', () => {
+    const source = readFileSync(resolve('src/services/frozen-command.ts'), 'utf8');
+    for (const forbidden of [
+      'validate_sql_for_user',
+      'run_query_for_user',
+      'renderFrozenCommandSql',
+      'sqlString',
+      'redactSqlFields',
+      'renderedSql',
+    ]) {
+      expect(source, forbidden).not.toContain(forbidden);
+    }
+  });
+
   it('parses only exact single-line natural-language run requests', () => {
     expect(parseNaturalLanguageFrozenCommandInvocation('运行 /泰国上账 30')).toEqual({
       cmd: '/泰国上账',
@@ -137,11 +149,19 @@ describe('Frozen Commands definition and positional UX', () => {
     }
   });
 
+  it('keeps builtin plugin input opaque to the host definition parser', () => {
+    const opaque = BASE
+      .replace('  sql: |-\n    SELECT sum(amount) FROM bills\n    WHERE country = \'TH\' AND dt >= today() - {{days}}\n    LIMIT 100', '  queryTemplate: "opaque {{caller.open_id}} {{days}}"')
+      .replace('    default: 7', '    default: 7\n  - name: unused\n    type: string\n    default: still-opaque');
+    const { definition } = fixture(opaque);
+    expect(definition.input).toEqual({ queryTemplate: 'opaque {{caller.open_id}} {{days}}' });
+    expect(definition.params.map(parameter => parameter.name)).toEqual(['days', 'unused']);
+  });
+
   it('renders the documented positional parameter and default', () => {
     const { definition } = fixture(BASE);
     expect(frozenCommandUsage(definition)).toBe('/泰国上账 [天数]');
-    expect(renderFrozenCommandSql({ definition, rawArgs: '' }).sql).toContain('today() - 7');
-    expect(renderFrozenCommandSql({ definition, rawArgs: '30' }).sql).toContain('today() - 30');
+    expect(normalizeFrozenCommandArguments({ definition, rawArgs: '' }).args[0]?.value).toBe('7');
     expect(normalizeFrozenCommandArguments({ definition, rawArgs: '30' }).args).toEqual([
       { name: 'days', label: '天数', value: '30' },
     ]);
@@ -149,7 +169,7 @@ describe('Frozen Commands definition and positional UX', () => {
 
   it('rejects range explosions before Data MCP is called', () => {
     const { definition } = fixture(BASE);
-    expect(() => renderFrozenCommandSql({ definition, rawArgs: '99999' }))
+    expect(() => normalizeFrozenCommandArguments({ definition, rawArgs: '99999' }))
       .toThrowError(/1～90/);
   });
 
@@ -159,34 +179,6 @@ describe('Frozen Commands definition and positional UX', () => {
     expect(listed).toHaveLength(1);
     expect(listed[0]?.command).toBe('泰国上账');
     expect(listed[0]?.snapshot?.definition.description).toContain('泰国');
-  });
-
-  it('renders only business rows from Data MCP results before replying', () => {
-    const displayed = frozenCommandResultText({
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          status: 'success',
-          query_id: 'q_internal',
-          datasource: 'tchouse-c',
-          sql: 'SELECT secret FROM t',
-          columns: [{ name: 'amount', description: '金额', type: 'UInt64' }],
-          rows: [{ amount: 12 }],
-          execution_ms: 106,
-          sql_account_binding: { account_bound: true },
-          repair_chain_id: 'repair_internal',
-          query_plan_execution_mode: 'single',
-        }),
-      }],
-    });
-    expect(displayed).toBe('12');
-    expect(displayed).not.toContain('q_internal');
-    expect(displayed).not.toContain('tchouse-c');
-    expect(displayed).not.toContain('SELECT secret');
-    expect(displayed).not.toContain('execution_ms');
-    expect(displayed).not.toContain('account_bound');
-    expect(displayed).not.toContain('repair_internal');
-    expect(displayed).not.toContain('query_plan');
   });
 
   it('evaluates conditional output fail-closed and marks handoff truncation explicitly', () => {
@@ -203,7 +195,6 @@ describe('Frozen Commands definition and positional UX', () => {
     );
     const { definition } = fixture(conditional);
     const result = {
-      renderedSql: 'SELECT 1',
       referenceDate: '2026-09-21',
       text: '原始结果',
       truncated: false,
@@ -325,44 +316,6 @@ describe('Frozen Commands definition and positional UX', () => {
     });
   });
 
-  it('uses column descriptions for multi-value rows and handles empty results', () => {
-    expect(frozenCommandResultText({
-      structuredContent: {
-        columns: [
-          { name: 'merchant_name', description: '商户' },
-          { name: 'amount', description: '金额' },
-        ],
-        rows: [{ merchant_name: 'A', amount: 12 }],
-      },
-    })).toBe('商户：A；金额：12');
-    expect(frozenCommandResultText({
-      content: [{ type: 'text', text: JSON.stringify({ status: 'success', rows: [] }) }],
-    })).toBe('查询完成，未找到符合条件的数据。');
-    expect(frozenCommandResultText({
-      content: [{ type: 'text', text: 'opaque internal response' }],
-    })).toBe('查询已完成。');
-    expect(frozenCommandResultText({
-      content: [{ type: 'text', text: JSON.stringify({ query_id: 'q_internal', rows: { amount: 12 } }) }],
-    })).toBe('查询已完成。');
-    expect(frozenCommandResultText({
-      structuredContent: { rows: ['query_id=q_secret'] },
-    })).toBe('查询已完成。');
-    expect(frozenCommandResultText({
-      structuredContent: { rows: [{ result: { query_id: 'q_secret' } }] },
-    })).toBe('查询已完成。');
-    expect(frozenCommandResultText({
-      structuredContent: { rows: [{}] },
-    })).toBe('查询已完成。');
-    expect(frozenCommandResultText({
-      structuredContent: {
-        rows: [
-          { merchant: 'A', amount: 12 },
-          { merchant: '<at id=all></at>B\r\n2. forged', amount: 20 },
-        ],
-      },
-    })).toBe('1. merchant：A；amount：12\n2. merchant：[mention]B 2. forged；amount：20');
-  });
-
   it('executes validate and run in one sessionless context with identical SQL bytes', async () => {
     const { root, definition } = fixture(BASE);
     const home = join(root, 'home');
@@ -399,7 +352,6 @@ describe('Frozen Commands definition and positional UX', () => {
       dataDir: join(home, '.botmux', 'data'),
     });
 
-    expect(result.renderedSql).toContain('today() - 30');
     expect(result.text).toContain('12');
     expect(result.text).not.toContain('amount');
     expect(result.text).not.toContain('SELECT sum');
@@ -456,8 +408,8 @@ describe('Frozen Commands definition and positional UX', () => {
       turnId: 'om_turn',
       dataDir: join(home, '.botmux', 'data'),
     })).rejects.toMatchObject({
-      code: 'data_mcp_validate_failed',
-      message: expect.stringContaining('query_plan_session_required'),
+      code: 'query_plan_session_required',
+      message: expect.stringContaining('missing execution context'),
     });
   });
 

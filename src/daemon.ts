@@ -129,7 +129,6 @@ import {
   normalizeFrozenCommandName,
   parseNaturalLanguageFrozenCommandInvocation,
   readFrozenCommandFileStatus,
-  renderFrozenCommandSql,
   shouldFallbackFrozenCommand,
   userFacingFrozenCommandError,
 } from './services/frozen-command.js';
@@ -5811,11 +5810,7 @@ async function routeFrozenCommand(input: {
     larkAppId: input.larkAppId,
   });
   const invocationNow = new Date();
-  let renderedSql: string | undefined;
   try {
-    if (definition.executor === 'builtin.data-mcp.readonly') {
-      renderedSql = renderFrozenCommandSql({ definition, rawArgs, now: invocationNow }).sql;
-    }
     const result = await executeFrozenCommand({
       definition,
       rawArgs,
@@ -5850,15 +5845,11 @@ async function routeFrozenCommand(input: {
     return { kind: 'handled' };
   } catch (error) {
     if (shouldFallbackFrozenCommand(definition, error)) {
-      // Transient fallback reuses the exact business SQL frozen for this
-      // invocation. It may retry that query, but must never regenerate one.
-      if (!renderedSql) throw error;
       return {
         kind: 'fallback',
         prompt: buildFrozenCommandFallbackPrompt({
           definition,
           rawArgs,
-          renderedSql,
           reason: error instanceof Error ? error.message : String(error),
         }),
       };
