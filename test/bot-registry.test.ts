@@ -1431,6 +1431,26 @@ describe('parseBotConfigsFromText — envelopeInjection cold read', () => {
   });
 });
 
+describe('parseBotConfigsFromText — dshProfile cold read', () => {
+  let mod: Awaited<ReturnType<typeof freshImport>>;
+
+  beforeEach(async () => {
+    mod = await freshImport();
+  });
+
+  it('trims valid dsh profiles, rejects unsafe names, and drops the field for other CLIs', () => {
+    const [dsh, invalid, otherCli] = mod.parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'dsh', larkAppSecret: 's', cliId: 'dsh', dshProfile: '  custom_profile-1  ' },
+      { larkAppId: 'invalid', larkAppSecret: 's', cliId: 'dsh', dshProfile: '../outside' },
+      { larkAppId: 'other', larkAppSecret: 's', cliId: 'codex', dshProfile: 'custom' },
+    ]));
+
+    expect(dsh.dshProfile).toBe('custom_profile-1');
+    expect(invalid.dshProfile).toBeUndefined();
+    expect(otherCli.dshProfile).toBeUndefined();
+  });
+});
+
 // ─── parseBotConfigsFromText — apiOnly (core-only / headless) ──────────────
 
 describe('parseBotConfigsFromText — apiOnly', () => {
@@ -2081,6 +2101,19 @@ describe('loadBotConfigs', () => {
     }]));
 
     expect(mod.loadBotConfigAtIndex(0).envelopeInjection).toBe('auto');
+  });
+
+  it('cold-reads dshProfile for the indexed daemon slot', () => {
+    process.env.BOTS_CONFIG = '/tmp/bots.json';
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(JSON.stringify([{
+      larkAppId: 'dsh_daemon',
+      larkAppSecret: 'secret',
+      cliId: 'dsh',
+      dshProfile: 'custom-profile',
+    }]));
+
+    expect(mod.loadBotConfigAtIndex(0).dshProfile).toBe('custom-profile');
   });
 
   it('does not register activation-pending bots before their critical scopes are ready', () => {

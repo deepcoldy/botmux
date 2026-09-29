@@ -151,6 +151,12 @@ export function normalizeDshRuntime(value: unknown): 'official' | 'tui' | undefi
   return value === 'official' || value === 'tui' ? value : undefined;
 }
 
+export function normalizeDshProfile(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const name = value.trim();
+  return /^[a-zA-Z0-9_-]+$/.test(name) ? name : undefined;
+}
+
 export function configureLarkClientHttpTimeout(client: unknown): void {
   const defaults = (client as { httpInstance?: { defaults?: { timeout?: number } } } | null)
     ?.httpInstance?.defaults;
@@ -3760,6 +3766,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       turnTimeoutMs: normalizeTurnTimeoutMs(entry.turnTimeoutMs),
       // dsh-only runtime variant; non-dsh CLIs drop it (same pattern as turnTimeoutMs).
       dshRuntime: entryCliId === 'dsh' ? normalizeDshRuntime(entry.dshRuntime) : undefined,
+      // dsh profile names match the Dashboard profile-create contract.
+      dshProfile: entryCliId === 'dsh' ? normalizeDshProfile(entry.dshProfile) : undefined,
       reasoningEffort: isConfigurableReasoningCliId(entryCliId)
         && isCodexReasoningEffort(entry.reasoningEffort)
         && cliModelSupportsReasoningEffort(

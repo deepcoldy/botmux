@@ -315,7 +315,7 @@ import {
   getBotName,
   type SessionRow,
 } from './dashboard-rows.js';
-import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
+import { getBotBrand, getBot, getBotOpenId, getOwnerOpenId, loadBotConfigs, readBotSkillPolicy, getBotTuiSlashAllow, updateBotNativeSubagentRuntime, MAX_TURN_TIMEOUT_MS, normalizeDshProfile, type BotConfig, type NativeSubagentRuntimeConfigState, type UsageDisplayMode, type MessageListenerConfig } from '../bot-registry.js';
 import { generateAuthUrl, tryHandleCallbackUrl, getFeedGroupAuthStatus, listAuthorizedUsers, FEED_GROUP_OAUTH_SCOPES, requestUserAuthorization } from '../utils/user-token.js';
 import { tokenStoreProtection, triggerUserAuthApplies, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from '../services/credential-bearing-mcp.js';
@@ -6936,6 +6936,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     turnTimeoutMs?: unknown;
     cliRuntime?: unknown;
     dshRuntime?: unknown;
+    dshProfile?: unknown;
   };
   try { body = await readJsonBody<typeof body>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
@@ -7022,6 +7023,21 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       return jsonRes(res, 400, { ok: false, error: 'invalid_dsh_runtime' });
     }
     nextDshRuntime = body.dshRuntime;
+  }
+  // dsh-only profile name. Empty clears to dsh's default; profile names use
+  // the same safe character set as the Dashboard profile-create endpoint.
+  const supportsDshProfile = selected.cliId === 'dsh';
+  const dshProfileFieldPresent = Object.prototype.hasOwnProperty.call(body, 'dshProfile');
+  let nextDshProfile: string | undefined;
+  if (supportsDshProfile && dshProfileFieldPresent && body.dshProfile !== null) {
+    if (typeof body.dshProfile !== 'string') {
+      return jsonRes(res, 400, { ok: false, error: 'invalid_dsh_profile' });
+    }
+    const trimmed = body.dshProfile.trim();
+    if (trimmed) {
+      nextDshProfile = normalizeDshProfile(trimmed);
+      if (!nextDshProfile) return jsonRes(res, 400, { ok: false, error: 'invalid_dsh_profile' });
+    }
   }
   const runtimeFieldPresent = Object.prototype.hasOwnProperty.call(body, 'cliRuntime');
   const currentSelectionKey = selectionKeyForBot(currentBotConfig.cliId, currentBotConfig.wrapperCli, currentBotConfig.cliLaunchMode);
@@ -7218,6 +7234,13 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
         if (nextDshRuntime !== undefined) entry.dshRuntime = nextDshRuntime;
         else delete entry.dshRuntime;
       }
+      // dsh-only profile: non-dsh always drops it; on dsh, presence controls
+      // write/clear while absence preserves older Dashboard clients' value.
+      if (!supportsDshProfile) delete entry.dshProfile;
+      else if (dshProfileFieldPresent) {
+        if (nextDshProfile !== undefined) entry.dshProfile = nextDshProfile;
+        else delete entry.dshProfile;
+      }
       if (entry.readIsolation === true &&
           !readIsolationEnforceableFor({ cliId: selected.cliId, cliPathOverride: effectivePath, wrapperCli: selected.wrapperCli, cliLaunchMode: selected.cliLaunchMode })) {
         delete entry.readIsolation;
@@ -7276,6 +7299,8 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
     // dsh-only runtime variant: same mirror semantics as turnTimeoutMs.
     if (!supportsDshRuntime) bot.config.dshRuntime = undefined;
     else if (dshRuntimeFieldPresent) bot.config.dshRuntime = nextDshRuntime;
+    if (!supportsDshProfile) bot.config.dshProfile = undefined;
+    else if (dshProfileFieldPresent) bot.config.dshProfile = nextDshProfile;
     if (readIsolationCleared) bot.config.readIsolation = false;
     if (codexBrowserCleared) bot.config.codexBrowser = undefined;
     if (isRemoteCliId(selected.cliId)) {
@@ -7302,6 +7327,7 @@ ipcRoute('PUT', '/api/bot-agent', async (req, res) => {
       nativeSubagentRuntime: bot.config.nativeSubagentRuntime ?? null,
       turnTimeoutMs: supportsTurnTimeout ? bot.config.turnTimeoutMs ?? null : null,
       dshRuntime: supportsDshRuntime ? bot.config.dshRuntime ?? null : null,
+      dshProfile: supportsDshProfile ? bot.config.dshProfile ?? null : null,
       selectionKey,
       // Number kept for compatibility with an older dashboard bundle; the residual
       // count rides alongside so a hot CLI switch cannot silently strand a remote
