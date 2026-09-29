@@ -2309,13 +2309,16 @@ export async function handleCommand(
             // Capture the closed-session card BEFORE closeWorkerPoolSession —
             // it reads the live session's identity off `current`.
             const card = buildClosedSessionCard(current, localeForBot(current.larkAppId));
+            const privateCard = getBot(current.larkAppId).config.privateCard === true;
             let closeResult;
             try {
               // closeWorkerPoolSession proves fail-closed backing teardown
               // before mutating any registry/store state, throwing when it
               // cannot verify it. Surface that so the active record is kept
               // for retry instead of being silently dropped.
-              closeResult = await closeWorkerPoolSession(targetSessionId);
+              closeResult = privateCard
+                ? await closeWorkerPoolSession(targetSessionId, { cardVisibility: 'private' })
+                : await closeWorkerPoolSession(targetSessionId);
             } catch (err) {
               return { status: 'teardown_failed' as const, err };
             }
@@ -2338,7 +2341,8 @@ export async function handleCommand(
                 residual: closeResult.residual,
               };
             }
-            return { status: 'closed' as const, current, card };
+            return { status: 'closed' as const, current, card, privateCard,
+              closedCardPatchQueued: closeResult.closedCardPatchQueued === true };
           });
           if (!closed) {
             await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
@@ -2393,14 +2397,25 @@ export async function handleCommand(
           // 执行 /close 的本人；若本命令从折叠到 chat-scope 的真实话题触发，则
           // invocationReplyTarget 让 helper 跳过无 thread 锚点的 ephemeral，回原话题。
           try {
-            await deliverEphemeralOrReply(
-              closed.current,
-              message.senderId,
-              closed.card,
-              'interactive',
-              () => sessionReply(rootId, closed.card, 'interactive'),
-              deps.invocationReplyTarget,
-            );
+            if (closed.privateCard) {
+              const { sendEphemeralCard } = await import('../im/lark/client.js');
+              for (const openId of resolvePrivateCardAudience(closed.current)) {
+                await sendEphemeralCard(closed.current.larkAppId, closed.current.chatId, openId, closed.card)
+                  .catch(err => logger.warn(`[${logTag}] private close card delivery failed: ${err}`));
+              }
+            } else if (closed.current.scope === 'chat' || !closed.closedCardPatchQueued) {
+              // A thread's live card already has its closing PATCH queued. Keep
+              // the fallback when no PATCH was queued, and preserve the separate
+              // operator confirmation for chat-scoped sessions.
+              await deliverEphemeralOrReply(
+                closed.current,
+                message.senderId,
+                closed.card,
+                'interactive',
+                () => sessionReply(rootId, closed.card, 'interactive'),
+                deps.invocationReplyTarget,
+              );
+            }
           } catch (err) {
             if (!removeWorktree) throw err;
             // The session is already durably closed. For an explicitly confirmed

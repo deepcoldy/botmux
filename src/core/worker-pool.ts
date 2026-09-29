@@ -7465,7 +7465,14 @@ export interface CloseResidual {
  * consumer needs one.
  */
 export type CloseSessionResult =
-  | { ok: true; outcome: 'closed'; alreadyClosed: boolean; known: boolean }
+  | {
+      ok: true;
+      outcome: 'closed';
+      alreadyClosed: boolean;
+      known: boolean;
+      /** The closing card entered the serialized PATCH queue; delivery is best-effort. */
+      closedCardPatchQueued?: true;
+    }
   | {
       ok: true;
       outcome: 'closed_with_residual';
@@ -7777,15 +7784,18 @@ export async function closeSession(
   // Shared-adopt closes only detach BotMux. Private close cards contain local
   // paths and resume commands, so neither bot policy nor clicked-card privacy
   // may be bypassed by this background PATCH path.
+  let closedCardPatchQueued = false;
   if (ds && !prepared.residual && !isSharedAdoptSession(ds)
       && opts?.cardVisibility !== 'private'
       && ds.streamCardId && ds.streamCardId !== CARD_POSTING_SENTINEL) {
     try {
       const botCfg = getBot(ds.larkAppId).config;
-      if (!botCfg.privateCard && larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly })) {
+      if (!botCfg.privateCard && !streamingCardDisabled(ds)
+          && larkTransportEnabled({ chatId: ds.chatId, apiOnly: botCfg.apiOnly })) {
         ds.pendingCardId = ds.streamCardId;
         ds.pendingCardJson = buildClosedSessionCard(ds, localeForBot(ds.larkAppId));
         if (!ds.cardPatchInFlight) flushCardPatch(ds);
+        closedCardPatchQueued = true;
       }
     } catch (error) {
       logger.warn(`[${sessionId.slice(0, 8)}] Could not freeze closed session card: ${error}`);
@@ -7937,7 +7947,10 @@ export async function closeSession(
       known,
     };
   }
-  return { ok: true, outcome: 'closed', alreadyClosed, known };
+  return {
+    ok: true, outcome: 'closed', alreadyClosed, known,
+    ...(closedCardPatchQueued ? { closedCardPatchQueued: true as const } : {}),
+  };
 }
 
 /**
