@@ -1339,6 +1339,7 @@ function frozenPresentationFromToolResult(result: Record<string, unknown>): {
   queryId?: string;
   businessResult?: FrozenCommandExecutionResult['businessResult'];
 } {
+  const containsRawHtml = (value: string): boolean => /<\s*\/?\s*[A-Za-z][^>]*>/u.test(value);
   const payload = jsonFromToolResult(result);
   if (!isPlainObject(payload) || payload.contractVersion !== 1) {
     throw new FrozenCommandError('data_mcp_contract_mismatch', 'Data MCP 固化查询契约版本不兼容');
@@ -1348,7 +1349,7 @@ function frozenPresentationFromToolResult(result: Record<string, unknown>): {
     const code = typeof payload.errorCode === 'string' ? payload.errorCode : 'data_mcp_execution_failed';
     throw new FrozenCommandError(code, message, undefined, isTransientDataMcpFailure(message));
   }
-  if (typeof payload.fallbackText !== 'string' || payload.fallbackText.length > 100_000 || /<\/?(?:html|script|style|iframe)\b/i.test(payload.fallbackText)) {
+  if (typeof payload.fallbackText !== 'string' || payload.fallbackText.length > 100_000 || containsRawHtml(payload.fallbackText)) {
     throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 返回了不安全的展示文本');
   }
   if (!Array.isArray(payload.blocks) || payload.blocks.length < 1 || payload.blocks.length > 12) {
@@ -1358,7 +1359,7 @@ function frozenPresentationFromToolResult(result: Record<string, unknown>): {
     if (!isPlainObject(block)) throw new FrozenCommandError('data_mcp_presentation_invalid', 'Data MCP 展示块格式无效');
     if (block.type === 'text' && typeof block.text === 'string' && block.text.length <= 100_000) return { type: 'text', text: block.text };
     if (block.type === 'markdown' && typeof block.markdown === 'string' && block.markdown.length <= 100_000
-      && !/<\/?(?:html|script|style|iframe)\b/i.test(block.markdown)) return { type: 'markdown', markdown: block.markdown };
+      && !containsRawHtml(block.markdown)) return { type: 'markdown', markdown: block.markdown };
     if (block.type === 'table' && Array.isArray(block.columns) && Array.isArray(block.rows)
       && block.columns.length <= 20 && block.rows.length <= 50 && Number.isSafeInteger(block.totalRows)
       && typeof block.truncated === 'boolean') {

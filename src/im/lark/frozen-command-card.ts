@@ -29,7 +29,32 @@ function escapeMd(value: string): string {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/([*_~`])/g, '\\$1');
+    .replace(/([*_~`\[\]\\|])/g, '\\$1');
+}
+
+const MAX_FROZEN_LARK_CARD_BYTES = 80 * 1024;
+const MAX_FROZEN_LARK_TEXT_BYTES = 20 * 1024;
+
+/** Feishu text messages still interpret literal `<at ...>` markup. Keep the
+ * channel-neutral contract unchanged, but neutralize tag delimiters at the
+ * transport boundary so query data can never create a mention. */
+function safeLarkText(value: string): string {
+  return value.replace(/</g, '＜').replace(/>/g, '＞');
+}
+
+function truncateUtf8(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value;
+  const suffix = '…';
+  const budget = maxBytes - Buffer.byteLength(suffix, 'utf8');
+  let bytes = 0;
+  let output = '';
+  for (const character of value) {
+    const width = Buffer.byteLength(character, 'utf8');
+    if (bytes + width > budget) break;
+    output += character;
+    bytes += width;
+  }
+  return `${output}${suffix}`;
 }
 
 function card(body: Record<string, unknown>): string {
@@ -42,9 +67,7 @@ export interface FrozenCommandLarkReply {
 }
 
 function markdownTable(block: Extract<FrozenCommandOutputBlock, { type: 'table' }>): string {
-  const cell = (value: unknown): string => String(value ?? '—')
-    .replace(/\|/g, '\\|')
-    .replace(/[\r\n]+/g, ' ');
+  const cell = (value: unknown): string => escapeMd(String(value ?? '—').replace(/[\r\n]+/g, ' '));
   const header = `| ${block.columns.map(column => cell(column.label)).join(' | ')} |`;
   const separator = `| ${block.columns.map(() => '---').join(' | ')} |`;
   const rows = block.rows.map(row => `| ${block.columns.map(column => cell(row[column.key])).join(' | ')} |`);
@@ -67,7 +90,10 @@ export function renderFrozenCommandLarkReply(
   workingDir = process.cwd(),
 ): FrozenCommandLarkReply {
   if (presentation.blocks.length === 1 && presentation.blocks[0]?.type === 'text') {
-    return { content: presentation.blocks[0].text, msgType: 'text' };
+    return {
+      content: truncateUtf8(safeLarkText(presentation.blocks[0].text), MAX_FROZEN_LARK_TEXT_BYTES),
+      msgType: 'text',
+    };
   }
   const elements = presentation.blocks.flatMap(block => {
     if (block.type === 'text') {
@@ -80,9 +106,19 @@ export function renderFrozenCommandLarkReply(
     );
   });
   if (elements.length === 0) {
-    return { content: presentation.fallbackText, msgType: 'text' };
+    return {
+      content: truncateUtf8(safeLarkText(presentation.fallbackText), MAX_FROZEN_LARK_TEXT_BYTES),
+      msgType: 'text',
+    };
   }
-  return { content: JSON.stringify(createReplyCard(elements)), msgType: 'interactive' };
+  const content = JSON.stringify(createReplyCard(elements));
+  if (Buffer.byteLength(content, 'utf8') > MAX_FROZEN_LARK_CARD_BYTES) {
+    return {
+      content: truncateUtf8(safeLarkText(presentation.fallbackText), MAX_FROZEN_LARK_TEXT_BYTES),
+      msgType: 'text',
+    };
+  }
+  return { content, msgType: 'interactive' };
 }
 
 export function buildFrozenCommandCenterCard(input: {

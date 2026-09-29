@@ -69,6 +69,48 @@ describe('Frozen Command business cards', () => {
     expect(rendered.content).not.toContain('<script>');
   });
 
+  it('neutralizes nested mention/link injection and falls back when a card exceeds the byte budget', () => {
+    const nestedMention = '<a<at>t id=all><</at>/a</at>t>';
+    const text = renderFrozenCommandLarkReply({
+      schemaVersion: 1,
+      fallbackText: nestedMention,
+      blocks: [{ type: 'text', text: nestedMention }],
+    });
+    expect(text.msgType).toBe('text');
+    expect(text.content).not.toContain('<at');
+
+    const table = renderFrozenCommandLarkReply({
+      schemaVersion: 1,
+      fallbackText: '安全回退',
+      blocks: [{
+        type: 'table',
+        columns: [{ key: 'merchant', label: '商户' }],
+        rows: [{ merchant: `${nestedMention} [点我领奖](http://evil) <font color=red>红</font>` }],
+        totalRows: 1,
+        truncated: false,
+      }],
+    });
+    expect(table.msgType).toBe('interactive');
+    expect(table.content).not.toContain('<at');
+    expect(table.content).not.toContain('[点我领奖](http://evil)');
+    expect(table.content).not.toContain('<font');
+
+    const oversized = renderFrozenCommandLarkReply({
+      schemaVersion: 1,
+      fallbackText: '已降级',
+      blocks: [{
+        type: 'table',
+        columns: Array.from({ length: 20 }, (_, index) => ({ key: `c${index}`, label: `列${index}` })),
+        rows: Array.from({ length: 50 }, () => Object.fromEntries(
+          Array.from({ length: 20 }, (_, index) => [`c${index}`, '中'.repeat(1_000)]),
+        )),
+        totalRows: 50,
+        truncated: false,
+      }],
+    });
+    expect(oversized).toEqual({ content: '已降级', msgType: 'text' });
+  });
+
   it('shows metadata only in the command center', () => {
     const rendered = buildFrozenCommandCenterCard({
       botLabel: '财务助手',

@@ -9,7 +9,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   validateCalls: 0,
   runCalls: 0,
-  runResultShape: 'text' as 'top-level' | 'structured' | 'text' | 'malformed' | 'missing',
+  runResultShape: 'text' as 'top-level' | 'structured' | 'text' | 'malformed' | 'missing' | 'html' | 'wrong-contract',
+  toolsAvailable: true,
   cardBodies: [] as string[],
   messageTypes: [] as string[],
   replyMessage: vi.fn(async (_app: string, _anchor: string, body: string, msgType = 'text') => {
@@ -119,7 +120,7 @@ vi.mock('@modelcontextprotocol/sdk/client/index.js', () => ({
     async close() {}
     async listTools() {
       return {
-        tools: [{ name: 'execute_frozen_query' }],
+        tools: mocks.toolsAvailable ? [{ name: 'execute_frozen_query' }] : [],
       };
     }
     async callTool(input: { name: string; arguments?: Record<string, any> }) {
@@ -139,10 +140,12 @@ vi.mock('@modelcontextprotocol/sdk/client/index.js', () => ({
             }]
           : [{ type: format === 'markdown' ? 'markdown' : 'text', ...(format === 'markdown' ? { markdown: fallbackText } : { text: fallbackText }) }];
         const contract = {
-          contractVersion: 1,
+          contractVersion: mocks.runResultShape === 'wrong-contract' ? 2 : 1,
           status: 'success',
-          fallbackText,
-          blocks,
+          fallbackText: mocks.runResultShape === 'html' ? '<font color=red>unsafe</font>' : fallbackText,
+          blocks: mocks.runResultShape === 'html'
+            ? [{ type: 'markdown', markdown: '<font color=red>unsafe</font>' }]
+            : blocks,
           meta: { queryId: 'q_host_flow', totalRows: 1 },
           data: {
             rows: [{ probe_value: 22 }],
@@ -652,6 +655,7 @@ beforeEach(async () => {
   mocks.validateCalls = 0;
   mocks.runCalls = 0;
   mocks.runResultShape = 'text';
+  mocks.toolsAvailable = true;
   mocks.cardBodies.length = 0;
   mocks.getMessageChatId.mockResolvedValue(CHAT);
   mocks.getChatMode.mockResolvedValue('group');
@@ -1147,6 +1151,8 @@ executors:
   it.each([
     ['malformed', 'malformed', 'data_mcp_presentation_invalid'],
     ['missing', 'missing', 'query_id_missing'],
+    ['raw HTML', 'html', 'data_mcp_presentation_invalid'],
+    ['wrong contract version', 'wrong-contract', 'data_mcp_contract_mismatch'],
   ] as const)('fails closed for a %s query_id without replay or model fallback', async (_label, shape, errorCode) => {
     mocks.runResultShape = shape;
     const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '运行命令' });
@@ -1163,6 +1169,18 @@ executors:
     await modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP);
     expect(mocks.validateCalls).toBe(1);
     expect(mocks.runCalls).toBe(1);
+  });
+
+  it('fails closed when the installed Data MCP plugin lacks execute_frozen_query', async () => {
+    mocks.toolsAvailable = false;
+    const ds = makeSession({ scope: 'thread', backendType: 'tmux', sourceText: '运行命令' });
+    const value = seedLegacyPendingRun(ds);
+
+    await modules.daemon.__testOnly_handleFrozenCommandCardAction(callbackData(value), APP);
+    const failed = await waitForStatus(value.transition_id, 'failed');
+    expect(failed).toMatchObject({ errorCode: 'data_mcp_tool_missing' });
+    expect(mocks.validateCalls).toBe(0);
+    expect(mocks.runCalls).toBe(0);
   });
 
   it('allows a trusted host tool runner to list using the exact active turn without a capability file', async () => {
