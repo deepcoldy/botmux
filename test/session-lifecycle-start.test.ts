@@ -6096,6 +6096,19 @@ describe('managed turn authority worker generations', () => {
     });
     expect(ds.scheduledTurnCallers?.get(scheduledTurnId)).toEqual(scheduledCaller);
 
+    // A fresh TUI reaches its initial idle prompt before the opening input is
+    // written. That provisional capability is revoked, then the worker
+    // republishes at the real write boundary. The caller tuple must survive
+    // this intermediate revoke even though live authority does not.
+    worker.emit('message', {
+      type: 'managed_turn_origin_revoked',
+      sessionId: ds.session.sessionId,
+      capability: 'scheduled-capability',
+      turnId: scheduledTurnId,
+    });
+    expect(ds.managedTurnOrigin).toBeUndefined();
+    expect(ds.scheduledTurnCallers?.get(scheduledTurnId)).toEqual(scheduledCaller);
+
     worker.emit('message', {
       type: 'managed_turn_origin',
       sessionId: ds.session.sessionId,
