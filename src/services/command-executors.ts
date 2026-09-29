@@ -32,6 +32,10 @@ const MAX_ARTIFACT_BYTES = 4 * 1024 * 1024;
 const MAX_JSON_DEPTH = 8;
 const MAX_PROJECTED_ROWS = 1_000;
 const MAX_PROJECTED_FIELDS = 64;
+const MAX_STRING_ARGUMENT_LENGTH = 10_000;
+// Large plugin templates are administrator-authored literals. Keep every
+// dynamic source and all process/script arguments on the smaller limit.
+const MAX_PLUGIN_LITERAL_ARGUMENT_LENGTH = 200_000;
 const JSON_PATH_RE = /^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/;
 const FORBIDDEN_PATH_SEGMENTS = new Set(['__proto__', 'prototype', 'constructor']);
 const FORBIDDEN_PLUGIN_IDENTITY_ARGUMENTS = new Set([
@@ -272,7 +276,11 @@ function parseAccepts(value: unknown, field: string): ExecutorArgumentSource[] {
   return [...new Set(accepts)];
 }
 
-function parseArgument(name: string, value: unknown): CommandExecutorArgument {
+function parseArgument(
+  name: string,
+  value: unknown,
+  options: { allowLargePluginLiteral: boolean },
+): CommandExecutorArgument {
   if (!ARGUMENT_NAME_RE.test(name) || !isPlainObject(value)) {
     throw new CommandExecutorError('executor_argument_invalid', `arguments.${name} 不合法`);
   }
@@ -284,7 +292,12 @@ function parseArgument(name: string, value: unknown): CommandExecutorArgument {
   const required = value.required === true;
   const accepts = parseAccepts(value.accepts, `arguments.${name}.accepts`);
   if (value.type === 'string') {
-    const maxLength = positiveInteger(value.maxLength ?? 1_000, `arguments.${name}.maxLength`, 1, 10_000);
+    const maxAllowedLength = options.allowLargePluginLiteral
+      && accepts.length === 1
+      && accepts[0] === 'literal'
+      ? MAX_PLUGIN_LITERAL_ARGUMENT_LENGTH
+      : MAX_STRING_ARGUMENT_LENGTH;
+    const maxLength = positiveInteger(value.maxLength ?? 1_000, `arguments.${name}.maxLength`, 1, maxAllowedLength);
     if (value.pattern !== undefined) {
       const pattern = nonBlank(value.pattern, `arguments.${name}.pattern`, 2_000);
       try { new RegExp(pattern, 'u'); } catch {
@@ -366,10 +379,17 @@ function parseOutput(value: unknown, executorId: string): CommandExecutorOutput 
   };
 }
 
-function parseArguments(value: unknown, id: string): Record<string, CommandExecutorArgument> {
+function parseArguments(
+  value: unknown,
+  id: string,
+  options: { allowLargePluginLiteral?: boolean } = {},
+): Record<string, CommandExecutorArgument> {
   if (!isPlainObject(value)) throw new CommandExecutorError('executor_argument_invalid', `${id}.arguments 必须是对象`);
   if (Object.keys(value).length > 32) throw new CommandExecutorError('executor_argument_invalid', `${id}.arguments 最多 32 项`);
-  return Object.fromEntries(Object.entries(value).map(([name, argument]) => [name, parseArgument(name, argument)]));
+  return Object.fromEntries(Object.entries(value).map(([name, argument]) => [
+    name,
+    parseArgument(name, argument, { allowLargePluginLiteral: options.allowLargePluginLiteral === true }),
+  ]));
 }
 
 function parseCommonPolicy(value: unknown, id: string): {
@@ -425,7 +445,7 @@ function parsePluginToolExecutor(
       `${id}: plugin-tool 必须且只能声明 contractVersion（富结果）或 output（普通 JSON 投影）`,
     );
   }
-  const argumentsSchema = parseArguments(value.arguments, id);
+  const argumentsSchema = parseArguments(value.arguments, id, { allowLargePluginLiteral: true });
   const declaresIdentityArgument = Object.keys(argumentsSchema).some(isForbiddenPluginIdentityArgument);
   if (declaresIdentityArgument
     || Object.values(argumentsSchema).some(argument => argument.accepts.some(source => source.startsWith('context:caller.')))) {

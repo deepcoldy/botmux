@@ -131,6 +131,70 @@ executors:
     expect(pluginVersionAtLeast('1.2.3-beta.1', '1.2.3')).toBe(false);
   });
 
+  it('loads the documented Data MCP registry example in both languages', () => {
+    const fixture = setup();
+    for (const locale of ['zh', 'en']) {
+      const documentation = readFileSync(resolve(`docs-site/docs/${locale}/frozen-commands.md`), 'utf8');
+      const example = /```yaml\n(schemaVersion: 2\naliases:\n  builtin\.data-mcp\.readonly:[\s\S]*?)\n```/u.exec(documentation)?.[1];
+      if (!example) throw new Error(`missing Data MCP registry example in ${locale} documentation`);
+      writeFileSync(fixture.registry, example);
+      expect(loadCommandExecutorRegistry(fixture.registry).executors.get('data.query.readonly'))
+        .toMatchObject({
+          kind: 'plugin-tool',
+          arguments: { sql: { accepts: ['literal'], maxLength: 100_000 } },
+        });
+    }
+  });
+
+  it('allows large plugin literals without widening dynamic or process arguments', () => {
+    const fixture = setup();
+    const pluginRegistry = (maxLength: number, accepts: string) => `
+schemaVersion: 2
+executors:
+  - id: test.plugin.readonly
+    kind: plugin-tool
+    plugin: fixture-plugin
+    tool: render_report
+    minimumVersion: 1.0.0
+    contractVersion: 1
+    arguments:
+      report:
+        type: string
+        required: true
+        maxLength: ${maxLength}
+        accepts: ${accepts}
+    policy:
+      timeoutMs: 5000
+`;
+
+    writeFileSync(fixture.registry, pluginRegistry(200_000, '[literal]'));
+    const executor = loadCommandExecutorRegistry(fixture.registry).executors.get('test.plugin.readonly')!;
+    const lookup = lookupFrozenCommand({ workingDir: fixture.commandRoot, command: '/回显' });
+    if (lookup.kind !== 'found') throw new Error(`unexpected lookup: ${lookup.kind}`);
+    const definition = structuredClone(lookup.snapshot.definition);
+    definition.executor = executor.id;
+    definition.params = [];
+    definition.input = { report: 'x'.repeat(200_000) };
+    expect(() => assertFrozenCommandExecutorContract(definition, executor)).not.toThrow();
+    definition.input.report = 'x'.repeat(200_001);
+    expect(() => assertFrozenCommandExecutorContract(definition, executor)).toThrowError(/长度上限 200000/);
+
+    writeFileSync(fixture.registry, pluginRegistry(200_001, '[literal]'));
+    expect(() => loadCommandExecutorRegistry(fixture.registry)).toThrowError(/1-200000/);
+
+    for (const accepts of ['[param]', '[literal, param]', '["context:chat.id"]']) {
+      writeFileSync(fixture.registry, pluginRegistry(10_001, accepts));
+      expect(() => loadCommandExecutorRegistry(fixture.registry)).toThrowError(/1-10000/);
+    }
+
+    const processFixture = setup();
+    const processRegistry = readFileSync(processFixture.registry, 'utf8')
+      .replace('maxLength: 50', 'maxLength: 10001')
+      .replace('accepts: [param, "context:caller.open_id"]', 'accepts: [literal]');
+    writeFileSync(processFixture.registry, processRegistry);
+    expect(() => loadCommandExecutorRegistry(processFixture.registry)).toThrowError(/1-10000/);
+  });
+
   it('supports registry aliases, ordinary JSON tools, and conservative policy defaults', () => {
     const fixture = setup();
     writeFileSync(fixture.registry, `

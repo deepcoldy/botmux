@@ -54,6 +54,8 @@ A `plugin-tool` entry declares a plugin id, tool name, minimum stable version, a
 
 During a trusted human turn, an agent may call `botmux freeze executors` for the read-only authoring contract. The response contains only executor ids and argument names, types, accepted sources, and constraints; it excludes executable paths, fixed arguments, and artifact paths/digests. Candidate definitions are checked against this complete contract before a confirmation card can be shown.
 
+A `plugin-tool` string argument that accepts only `literal` input may set `maxLength` up to 200000 for administrator-reviewed large templates. Arguments that accept `param` or `context` input, and all `process` / `script` arguments, remain capped at 10000.
+
 Data MCP is configured as an ordinary plugin tool. SQL is opaque to the host; literal encoding, byte-identical validation, and execution remain inside the plugin. Caller identity must not be declared in `arguments`; it arrives only through trusted gateway `_meta`.
 
 ```yaml
