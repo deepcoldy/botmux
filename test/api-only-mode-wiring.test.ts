@@ -888,15 +888,15 @@ describe('core-only entrypoint hardening (codex 4 P1s — source lock)', () => {
   it('passes tenant-stable actor identity into all frozen-command routing paths', () => {
     const routes = [...daemonSource.matchAll(/const frozen = await routeFrozenCommand\(\{([\s\S]*?)\n\s*\}\);/gu)]
       .map(match => match[1]);
-    expect(routes).toHaveLength(4);
+    // Slash and natural-language invocations now share one router per message
+    // topology, so only the top-level and thread entrypoints remain. Keep both
+    // source locks: consolidating the trigger parser must not drop the stable
+    // union_id at either IM boundary.
+    expect(routes).toHaveLength(2);
     expect(routes[0]).toContain('chatId,');
     expect(routes[0]).toContain('senderUnionId,');
-    expect(routes[1]).toContain('chatId,');
-    expect(routes[1]).toContain('senderUnionId,');
-    expect(routes[2]).toContain('chatId: effectiveThreadChatId,');
-    expect(routes[2]).toContain('senderUnionId: threadSenderUnionId,');
-    expect(routes[3]).toContain('chatId: effectiveThreadChatId,');
-    expect(routes[3]).toContain('senderUnionId: threadSenderUnionId,');
+    expect(routes[1]).toContain('chatId: effectiveThreadChatId,');
+    expect(routes[1]).toContain('senderUnionId: threadSenderUnionId,');
     expect(daemonSource).toContain(
       'actorIsAdmin: canManageFrozenCommands(input.larkAppId, input.senderUnionId),',
     );
