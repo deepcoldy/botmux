@@ -13,8 +13,10 @@ import { fakeLarkHelpScript } from './helpers/lark-tool-help.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import { publishTurnCliIdentity } from '../src/core/turn-cli-identity.js';
 import { clearLarkToolDelegations } from '../src/core/lark-tool-delegation.js';
+import { Client } from '@larksuiteoapi/node-sdk';
 
 let dir: string, previousDataDir: string, ipc: IpcServerHandle | undefined, session: any, binding: LarkToolBinding;
+const botToken = vi.fn<() => Promise<unknown>>();
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), 'ipc-lark-tool-')); previousDataDir = config.session.dataDir; config.session.dataDir = dir;
   binding = prepareLarkToolEnv({ env: { PATH: '/usr/bin:/bin' }, dataDir: dir, sessionId: 'tool-session', appId: 'cli_bound' });
@@ -25,6 +27,8 @@ beforeEach(async () => {
   };
   vi.spyOn(workerPool, 'findActiveBySessionId').mockImplementation(id => id === 'tool-session' ? session : undefined);
   vi.spyOn(bots, 'getBot').mockReturnValue({ config: { larkAppId: 'cli_bound', larkAppSecret: 'bound-secret' } } as any);
+  botToken.mockReset().mockResolvedValue('bound-bot-token');
+  vi.spyOn(bots, 'getBotClient').mockReturnValue({ tokenManager: { getTenantAccessToken: botToken } } as unknown as Client);
   vi.spyOn(identities, 'resolveVerifiedUserIdentity').mockResolvedValue({ openId: 'ou_sender', type: 'user' } as any);
   vi.spyOn(tokens, 'resolveUserToken').mockResolvedValue('bound-user-token');
   setIpcAuthSecret('host-test-key');
@@ -108,16 +112,57 @@ describe('session application identity route', () => {
   it('binds bot and current user without requiring triggerUserAuth configuration', async () => {
     const bot = await request('bot'); const raw = await bot.text();
     expect(bot.status).toBe(200);
-    expect(JSON.parse(raw)).toEqual({ ok: true, appId: 'cli_bound', mode: 'bot', credential: 'bound-secret' });
+    expect(JSON.parse(raw)).toEqual({ ok: true, appId: 'cli_bound', mode: 'bot', credentialType: 'tenant_access_token', credential: 'bound-bot-token' });
+    expect(bots.getBotClient).toHaveBeenCalledExactlyOnceWith('cli_bound');
     expect(tokens.resolveUserToken).not.toHaveBeenCalled();
     const user = await request('user');
-    expect(await user.json()).toEqual({ ok: true, appId: 'cli_bound', mode: 'user', credential: 'bound-user-token' });
+    expect(await user.json()).toEqual({ ok: true, appId: 'cli_bound', mode: 'user', credentialType: 'user_access_token', credential: 'bound-user-token' });
     expect(tokens.resolveUserToken).toHaveBeenCalledWith('cli_bound', 'bound-secret', 'feishu', 'ou_sender');
   });
   it('rejects another session key and an application mismatch', async () => {
     expect((await request('bot', '00'.repeat(32))).status).toBe(403);
     session.larkAppId = 'cli_other';
     expect((await request('bot')).status).toBe(403);
+    expect(botToken).not.toHaveBeenCalled();
+  });
+  it.each(['reject', 'empty'] as const)('refuses unavailable bot tokens without returning the app secret (%s)', async failure => {
+    if (failure === 'reject') botToken.mockRejectedValue(new Error('private provider details'));
+    else botToken.mockResolvedValue('');
+    const response = await request('bot');
+    expect(response.status).toBe(502);
+    expect(await response.json()).toEqual({ ok: false, error: 'lark_tool_bot_token_unavailable' });
+  });
+  it('refuses a bot token if the session closes during resolution', async () => {
+    botToken.mockImplementation(async () => { session.session.status = 'closed'; return 'late-token'; });
+    const response = await request('bot');
+    expect(response.status).toBe(403);
+    expect(await response.text()).not.toContain('late-token');
+  });
+  it('uses the app SDK cache until expiry and then returns a refreshed token', async () => {
+    let clock = Date.now();
+    const cache = new Map<string, { value: string; expires: number }>();
+    const post = vi.fn().mockResolvedValueOnce({ tenant_access_token: 'first-token', expire: 7200 })
+      .mockResolvedValueOnce({ tenant_access_token: 'refreshed-token', expire: 7200 });
+    const client = new Client({ appId: 'cli_bound', appSecret: 'bound-secret', domain: 'https://open.larksuite.com',
+      logger: { trace() {}, debug() {}, info() {}, warn() {}, error() {} },
+      httpInstance: { post } as unknown as Client['httpInstance'],
+      cache: {
+        get: (key, options) => {
+          const item = cache.get(`${options?.namespace}:${String(key)}`);
+          return item && item.expires > clock ? item.value : undefined;
+        },
+        set: (key, value, expires, options) => { cache.set(`${options?.namespace}:${String(key)}`, { value, expires }); return true; },
+      },
+    });
+    vi.mocked(bots.getBotClient).mockReturnValue(client);
+    expect(await (await request('bot')).json()).toMatchObject({ credential: 'first-token' });
+    expect(await (await request('bot')).json()).toMatchObject({ credential: 'first-token' });
+    expect(post).toHaveBeenCalledTimes(1);
+    expect(post).toHaveBeenCalledWith('https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal',
+      { app_id: 'cli_bound', app_secret: 'bound-secret' });
+    clock += 7200 * 1000;
+    expect(await (await request('bot')).json()).toMatchObject({ credential: 'refreshed-token' });
+    expect(post).toHaveBeenCalledTimes(2);
   });
   it('uses the same user path on macOS without process attestation', async () => {
     vi.spyOn(process, 'platform', 'get').mockReturnValue('darwin');
@@ -158,7 +203,7 @@ describe('session application identity route', () => {
   });
   it('runs the real tool process with only the selected application credentials', async () => {
     const real = join(dir, 'real-lark');
-    writeFileSync(real, '#!/usr/bin/env node\n' + fakeLarkHelpScript() + 'process.stdout.write([process.env.LARKSUITE_CLI_APP_ID,process.env.LARKSUITE_CLI_APP_SECRET,process.env.LARKSUITE_CLI_USER_ACCESS_TOKEN,process.argv.slice(2).join(" ")].map(x=>x||"").join("|"));\n'); chmodSync(real, 0o755);
+    writeFileSync(real, '#!/usr/bin/env node\n' + fakeLarkHelpScript() + 'process.stdout.write([process.env.LARKSUITE_CLI_APP_ID,process.env.LARKSUITE_CLI_APP_SECRET,process.env.LARKSUITE_CLI_TENANT_ACCESS_TOKEN,process.env.LARKSUITE_CLI_USER_ACCESS_TOKEN,process.argv.slice(2).join(" ")].map(x=>x||"").join("|"));\n'); chmodSync(real, 0o755);
     binding.realBinary = real; writeFileSync(larkToolBindingPath(dir, 'tool-session'), JSON.stringify(binding), { mode: 0o600 });
     const run = (args: string[]) => new Promise<{ code: number | null; out: string; err: string }>((resolve, reject) => {
       const child = spawnTsScript(join(process.cwd(), 'src/lark-tool-runner.ts'), ['--binding', larkToolBindingPath(dir, 'tool-session'), '--', ...args], {
@@ -169,8 +214,8 @@ describe('session application identity route', () => {
       child.on('error', reject); child.on('close', code => resolve({ code, out, err }));
     });
     const bot = await run(['docs', '+fetch']); expect(bot.code, bot.err).toBe(0);
-    expect(bot.out).toBe('cli_bound|bound-secret||docs +fetch --as bot');
+    expect(bot.out).toBe('cli_bound||bound-bot-token||docs +fetch --as bot');
     const user = await run(['docs', '+fetch', '--as=user']); expect(user.code, user.err).toBe(0);
-    expect(user.out).toBe('cli_bound||bound-user-token|docs +fetch --as user');
+    expect(user.out).toBe('cli_bound|||bound-user-token|docs +fetch --as user');
   });
 });

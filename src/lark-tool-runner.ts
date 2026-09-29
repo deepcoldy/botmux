@@ -24,9 +24,11 @@ async function main(): Promise<void> {
       body: payload, signal: AbortSignal.timeout(15_000),
     });
     const raw = await response.text();
-    const result = JSON.parse(raw) as { ok?: boolean; appId?: string; mode?: string; credential?: string; error?: string };
+    const result = JSON.parse(raw) as { ok?: boolean; appId?: string; mode?: string; credentialType?: string; credential?: string; error?: string };
     if (!response.ok || result.ok !== true) throw new Error(result.error ?? 'lark_tool_identity_unavailable');
-    if (result.appId !== binding.appId || result.mode !== invocation.mode || !result.credential) {
+    const credentialType = invocation.mode === 'bot' ? 'tenant_access_token' : 'user_access_token';
+    if (result.appId !== binding.appId || result.mode !== invocation.mode
+      || result.credentialType !== credentialType || typeof result.credential !== 'string' || !result.credential) {
       throw new Error('The lark-cli identity does not match this invocation');
     }
     identity = { mode: invocation.mode, credential: result.credential };

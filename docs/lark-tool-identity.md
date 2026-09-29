@@ -34,7 +34,11 @@ bot 读取失败后，agent 可根据任务与错误尝试 user。包装器不�
 
 工具启动前清除继承的旧应用/用户凭证变量，再注入本次 App ID、品牌及 bot 或 user 凭证。用户 token 不得跨应用使用，未知用户不会借用 owner 或机器默认账户。CLI 原有 stdout、stderr、退出码和工作目录保持。
 
+bot 调用从当前应用的 SDK 获取 tenant access token，复用其缓存和到期刷新，再通过 `LARKSUITE_CLI_TENANT_ACCESS_TOKEN` 交给工具；不向工具传递 App Secret，也不在会话启动时固定 token。凭证获取失败时拒绝执行。
+
 工具路径按合并后的 bot `env.PATH` 解析。参数取值类型和 `--as` 支持情况取自该 lark-cli 二进制的本地 `--help`，包括快捷命令和原生 API 命令；无法识别的参数在执行前报错，不能靠猜测删除业务参数。`event list/schema`、`doctor --offline` 等本地命令不取凭证，也不追加 `--as`。
+
+绑定入口、配置和 shell 启动路径使用真实目录路径。Linux 文件沙箱同时保留会话入口和 bot PATH，直接执行、sh、bash 以及通过符号链接配置的数据根使用同一绑定。
 
 已有 signed dispatch 验证通过的跨机器人任务保留其原请求者：新入口按原 turn 使用已验证的目标应用用户和工具许可，再查询目标应用自己的用户授权。目标访问/工具许可被拒、授权缺失或撤销时沿原任务回报阻塞；后续普通消息不继承该委派。
 

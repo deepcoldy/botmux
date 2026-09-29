@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { mkdirSync, readFileSync, lstatSync, rmSync } from 'node:fs';
+import { mkdirSync, readFileSync, lstatSync, realpathSync, rmSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
@@ -27,6 +27,12 @@ export interface LarkToolBinding {
 
 export function larkToolBindingPath(dataDir: string, sessionId: string): string {
   return join(sessionIdentityDataDir(dataDir, sessionId), LARK_TOOL_BINDING_FILE);
+}
+
+/** Materialize the root before deriving paths used in the sandbox namespace. */
+export function resolveLarkToolDataDir(dataDir: string): string {
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  return realpathSync(dataDir);
 }
 
 export function readLarkToolBinding(path: string): LarkToolBinding {
@@ -69,14 +75,15 @@ export function prepareLarkToolEnv(input: {
   effectivePath?: string;
   runner?: { command: string; args: string[] };
 }): LarkToolBinding {
-  const binDir = sessionIdentityBinDir(input.dataDir, input.sessionId);
-  const dataDir = sessionIdentityDataDir(input.dataDir, input.sessionId);
+  const rootDir = resolveLarkToolDataDir(input.dataDir);
+  const binDir = sessionIdentityBinDir(rootDir, input.sessionId);
+  const dataDir = sessionIdentityDataDir(rootDir, input.sessionId);
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const configDir = join(dataDir, 'lark-config');
   mkdirSync(configDir, { recursive: true, mode: 0o700 });
   mkdirSync(join(configDir, 'data'), { recursive: true, mode: 0o700 });
   const realBinary = findRealToolBinary('lark-cli', input.effectivePath ?? input.env.PATH, [binDir]);
-  const bindingPath = larkToolBindingPath(input.dataDir, input.sessionId);
+  const bindingPath = larkToolBindingPath(rootDir, input.sessionId);
   let prior: LarkToolBinding | undefined;
   try { prior = readLarkToolBinding(bindingPath); } catch { /* first binding */ }
   const binding: LarkToolBinding = {
@@ -87,8 +94,8 @@ export function prepareLarkToolEnv(input: {
       ? prior.accessKey : randomBytes(32).toString('hex'),
     // Install a refusing entry even if the CLI is absent: a later PATH change
     // must not expose a newly installed, unbound machine CLI.
-    realBinary: realBinary ?? '/__botmux_lark_cli_not_installed__',
-    configDir, dataDir: input.dataDir,
+    realBinary: realBinary ? realpathSync(realBinary) : '/__botmux_lark_cli_not_installed__',
+    configDir, dataDir: rootDir,
   };
   atomicWriteFileSync(bindingPath, JSON.stringify(binding), { mode: 0o600 });
   // New sessions use this entry instead of the legacy trigger-user wrapper.
@@ -112,7 +119,7 @@ export function prepareLarkToolEnv(input: {
   input.env.BOTMUX_IDENTITY_BIN = binDir;
   input.env.ZDOTDIR = zdotdir;
   input.env.BASH_ENV = bashEnv;
-  input.env.SESSION_DATA_DIR = input.dataDir;
+  input.env.SESSION_DATA_DIR = rootDir;
   input.env.BOTMUX_SESSION_ID = input.sessionId;
   input.env.BOTMUX_LARK_TOOL_BINDING = bindingPath;
   return binding;
@@ -146,7 +153,7 @@ export function larkToolChildEnv(
   env.LARKSUITE_CLI_BRAND = binding.brand;
   env.LARKSUITE_CLI_NO_UPDATE_NOTIFIER = '1';
   env.LARKSUITE_CLI_NO_SKILLS_NOTIFIER = '1';
-  if (identity?.mode === 'bot') env.LARKSUITE_CLI_APP_SECRET = identity.credential;
+  if (identity?.mode === 'bot') env.LARKSUITE_CLI_TENANT_ACCESS_TOKEN = identity.credential;
   if (identity?.mode === 'user') env.LARKSUITE_CLI_USER_ACCESS_TOKEN = identity.credential;
   return env;
 }

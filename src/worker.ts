@@ -23,7 +23,7 @@ import { atomicWriteFileSync } from './utils/atomic-write.js';
 import { join, basename, dirname, delimiter, relative, extname } from 'node:path';
 import { resolveBotmuxWrapperBinDir, prependBotmuxBin } from './core/botmux-wrapper.js';
 import { sessionIdentityBinDir, prepareTriggerUserCliEnv, publishActiveTurn, GIT_ASKPASS_BASENAME } from './core/cli-identity.js';
-import { prepareLarkToolEnv, usesLarkToolBinding, larkToolBindingPath } from './core/lark-tool-binding.js';
+import { prepareLarkToolEnv, usesLarkToolBinding, larkToolBindingPath, resolveLarkToolDataDir } from './core/lark-tool-binding.js';
 import { tokenStoreProtection } from './services/trigger-user-auth.js';
 import { installAidenCodexShim } from './services/aiden-codex-shim.js';
 import { scanCredentialBearingMcpServers, credentialBearingMcpAdvisory } from './services/credential-bearing-mcp.js';
@@ -17283,6 +17283,7 @@ async function spawnCli(
   }
   const perBotInjectEnv = botInjectedEnv(cfg.env, cfg.envPolicy);
   const boundLark = !!process.env.SESSION_DATA_DIR && usesLarkToolBinding(cfg, process.env.SESSION_DATA_DIR, isWorkflowWorker());
+  const identityDataDir = boundLark ? resolveLarkToolDataDir(process.env.SESSION_DATA_DIR!) : process.env.SESSION_DATA_DIR;
   if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(perBotInjectEnv);
   const cliExtra = cliAdapter.allowExtraArgs === false
     ? ''
@@ -17306,8 +17307,8 @@ async function spawnCli(
   if (cfg.chatType) identityShellEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
   if (cfg.rootMessageId?.startsWith('om_')) identityShellEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
   if ((cfg.triggerUserAuth?.enabled || boundLark) && process.env.SESSION_DATA_DIR) {
-    const dir = sessionIdentityBinDir(process.env.SESSION_DATA_DIR, cfg.sessionId);
-    identityShellEnv.SESSION_DATA_DIR = process.env.SESSION_DATA_DIR;
+    const dir = sessionIdentityBinDir(identityDataDir!, cfg.sessionId);
+    identityShellEnv.SESSION_DATA_DIR = identityDataDir!;
     identityShellEnv.BOTMUX_IDENTITY_BIN = dir;
     identityShellEnv.ZDOTDIR = join(dir, 'shell');
     identityShellEnv.BASH_ENV = join(dir, 'shell', 'bash_env.sh');
@@ -17321,7 +17322,7 @@ async function spawnCli(
     }
   }
   if (boundLark) {
-    identityShellEnv.BOTMUX_LARK_TOOL_BINDING = larkToolBindingPath(process.env.SESSION_DATA_DIR!, cfg.sessionId);
+    identityShellEnv.BOTMUX_LARK_TOOL_BINDING = larkToolBindingPath(identityDataDir!, cfg.sessionId);
     if (process.env.BOTMUX_DAEMON_IPC_PORT) identityShellEnv.BOTMUX_DAEMON_IPC_PORT = process.env.BOTMUX_DAEMON_IPC_PORT;
   }
   const args = cliAdapter.buildArgs({
@@ -17748,7 +17749,7 @@ async function spawnCli(
   }
   if (cliAdapter.id === 'ebsd') assertEbsdPerBotEnv(perBotInjectEnv);
   if (boundLark) {
-    const dir = sessionIdentityBinDir(process.env.SESSION_DATA_DIR!, cfg.sessionId);
+    const dir = childEnv.BOTMUX_IDENTITY_BIN!;
     perBotInjectEnv.PATH = [dir, ...(perBotInjectEnv.PATH ?? childEnv.PATH ?? '').split(':').filter(p => p !== dir)].join(':');
     perBotInjectEnv.BOTMUX_IDENTITY_BIN = dir;
     perBotInjectEnv.BOTMUX_LARK_TOOL_BINDING = childEnv.BOTMUX_LARK_TOOL_BINDING!;
@@ -18373,6 +18374,8 @@ async function spawnCli(
         cliBin: cliAdapter.resolvedBin,
         cliArgs: args,
         tempDir: canonical(sessionScratchDir),
+        effectivePath: perBotInjectEnv.PATH ?? childEnv.PATH,
+        identityBin: childEnv.BOTMUX_IDENTITY_BIN,
         trustedBotmuxCommandPaths: [defaultGatewayEntry().command],
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
         larkCliDataDir: childLarkDataRoot,

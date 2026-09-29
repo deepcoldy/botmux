@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, chmodSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync, chmodSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { larkToolBindingPath, larkToolChildEnv, parseLarkToolInvocation as parseInvocation, prepareLarkToolEnv, readLarkToolBinding, usesLarkToolBinding, hasLarkToolBinding } from '../src/core/lark-tool-binding.js';
@@ -7,7 +7,7 @@ import { readLarkToolHelp, fakeLarkHelpScript } from './helpers/lark-tool-help.j
 import { nodeTsRunnerPrefix, spawnSyncTsScript } from './helpers/ts-runner.js';
 
 let dir: string;
-beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'lark-tool-binding-')); });
+beforeEach(() => { dir = realpathSync(mkdtempSync(join(tmpdir(), 'lark-tool-binding-'))); });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 const defaults = { appId: 'cli_current', defaultAs: 'bot' as const };
 const parseLarkToolInvocation = (args: string[], binding: { appId: string; defaultAs: 'bot' | 'user' }) => {
@@ -66,13 +66,16 @@ describe('managed lark-cli binding', () => {
     expect(second.realBinary).toBe(real);
     expect(readLarkToolBinding(larkToolBindingPath(dir, 'session-a')).appId).toBe(defaults.appId);
     expect(readFileSync(join(first.configDir, 'config.json'), 'utf8')).not.toContain('appSecret');
-    const botEnv = larkToolChildEnv({ HOME: dir, HTTPS_PROXY: 'http://proxy', LARKSUITE_CLI_APP_ID: 'cli_other', LARKSUITE_CLI_USER_ACCESS_TOKEN: 'wrong-user' }, first, { mode: 'bot', credential: 'bot-secret' });
+    const botEnv = larkToolChildEnv({ HOME: dir, HTTPS_PROXY: 'http://proxy', LARKSUITE_CLI_APP_ID: 'cli_other', LARKSUITE_CLI_USER_ACCESS_TOKEN: 'wrong-user', LARKSUITE_CLI_APP_SECRET: 'wrong-secret' }, first, { mode: 'bot', credential: 'bot-token' });
     expect(botEnv.LARKSUITE_CLI_APP_ID).toBe(defaults.appId);
     expect(botEnv.LARKSUITE_CLI_BRAND).toBe('lark');
     expect(botEnv.LARKSUITE_CLI_USER_ACCESS_TOKEN).toBeUndefined();
+    expect(botEnv.LARKSUITE_CLI_APP_SECRET).toBeUndefined();
+    expect(botEnv.LARKSUITE_CLI_TENANT_ACCESS_TOKEN).toBe('bot-token');
     expect(botEnv.HTTPS_PROXY).toBe('http://proxy');
     const userEnv = larkToolChildEnv(botEnv, first, { mode: 'user', credential: 'own-user' });
     expect(userEnv.LARKSUITE_CLI_APP_SECRET).toBeUndefined();
+    expect(userEnv.LARKSUITE_CLI_TENANT_ACCESS_TOKEN).toBeUndefined();
     expect(userEnv.LARKSUITE_CLI_USER_ACCESS_TOKEN).toBe('own-user');
   });
   it('keeps the configured PATH when viewer setup repeats an RPC binding', () => {

@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -10,7 +10,10 @@ import { parseLarkToolInvocation, larkToolExecutionArgs } from '../src/core/lark
 import { spawnTsScript } from './helpers/ts-runner.js';
 
 const realCli = findRealToolBinary('lark-cli', process.env.PATH);
-describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials, dry-run only)', () => {
+const canIsolateNetwork = process.platform === 'linux' && spawnSync('bwrap', [
+  '--unshare-net', '--ro-bind', '/', '/', '--', '/bin/true',
+], { stdio: 'ignore', timeout: 5000 }).status === 0;
+describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials)', () => {
   let root: string, binding: LarkToolBinding, server: ReturnType<typeof createServer>, port: number, requests: string[];
   beforeEach(async () => {
     root = mkdtempSync(join(tmpdir(), 'real-lark-contract-')); requests = [];
@@ -19,7 +22,8 @@ describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials
       let raw = ''; for await (const chunk of req) raw += chunk;
       const mode = JSON.parse(raw).mode; requests.push(mode);
       res.setHeader('content-type', 'application/json');
-      res.end(JSON.stringify({ ok: true, appId: binding.appId, mode, credential: 'fake-not-a-live-credential' }));
+      res.end(JSON.stringify({ ok: true, appId: binding.appId, mode,
+        credentialType: mode === 'bot' ? 'tenant_access_token' : 'user_access_token', credential: 'fake-not-a-live-credential' }));
     });
     await new Promise<void>(r => server.listen(0, '127.0.0.1', r));
     port = (server.address() as { port: number }).port;
@@ -38,6 +42,17 @@ describe.skipIf(!realCli)('installed lark-cli command contract (fake credentials
       child.on('error', reject); child.on('close', code => resolveResult({ code, out, err }));
     });
   }
+  it.skipIf(!canIsolateNetwork)('resolves the injected bot token for a real API command before the isolated network rejects it', () => {
+    const env = larkToolChildEnv({ ...process.env, HOME: join(root, 'home') }, binding,
+      { mode: 'bot', credential: 'fake-not-a-live-token' });
+    const result = spawnSync('bwrap', ['--unshare-net', '--ro-bind', '/', '/', '--',
+      binding.realBinary, 'api', 'GET', '/open-apis/im/v1/messages/fake-message', '--as', 'bot'], {
+      env, encoding: 'utf8', timeout: 10_000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(4);
+    expect(JSON.parse(result.stderr)).toMatchObject({ identity: 'bot', error: { type: 'network' } });
+  });
   it('keeps keyword --as=user and dry-run intact through the real binary', async () => {
     const result = await run(['docs', '+fetch', '--doc', 'doc-fixture', '--scope', 'keyword', '--keyword', '--as=user', '--dry-run']);
     expect(result.code, result.err).toBe(0);

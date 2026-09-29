@@ -26,13 +26,13 @@ const assembly = ts.transpileModule(worker.slice(start, end), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText;
 const assemble = new Function('cfg', 'process', 'sessionIdentityBinDir', 'join', 'GIT_ASKPASS_BASENAME',
-  'effectiveAdapterSessionId', 'boundLark', 'larkToolBindingPath', `${assembly}\nreturn identityShellEnv;`);
+  'effectiveAdapterSessionId', 'boundLark', 'larkToolBindingPath', 'identityDataDir', `${assembly}\nreturn identityShellEnv;`);
 
 function workerShellEnv(sessionDataDir: string | undefined, enabled = true, tools = ['bytedcli'], boundLark = false): Record<string, string> {
   return assemble(
     { sessionId: 'botmux-session', chatId: 'oc_chat', larkAppId: 'cli_app', triggerUserAuth: { enabled, tools } },
     { env: sessionDataDir === undefined ? {} : { SESSION_DATA_DIR: sessionDataDir, BOTMUX_DAEMON_IPC_PORT: '12345' } },
-    sessionIdentityBinDir, join, GIT_ASKPASS_BASENAME, 'native-session', boundLark, larkToolBindingPath,
+    sessionIdentityBinDir, join, GIT_ASKPASS_BASENAME, 'native-session', boundLark, larkToolBindingPath, sessionDataDir,
   );
 }
 
