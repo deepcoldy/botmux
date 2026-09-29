@@ -494,6 +494,36 @@ renderers:
     expect(fallback.text).not.toContain('custom-renderer');
   });
 
+  it('falls back to builtin.table when a renderer exits successfully without output', async () => {
+    const { root, definition } = fixture();
+    const renderer = join(root, 'renderer-empty.mjs');
+    writeFileSync(renderer, 'process.stdin.resume(); process.stdin.on("end", () => process.exit(0));\n');
+    const rendererRealpath = realpathSync(renderer);
+    writeRegistry(root, `
+renderers:
+  - id: test.empty
+    executable: { realpath: ${JSON.stringify(resolve(process.execPath))} }
+    fixedArgs: [${JSON.stringify(rendererRealpath)}]
+    scriptArtifacts: [${JSON.stringify(rendererRealpath)}]
+    policy: { timeoutMs: 5000, maxInputBytes: 65536, maxOutputBytes: 65536 }
+`);
+    definition.steps[0]!.renderer = 'test.empty';
+    const home = installFixturePlugin(root, 'data-mcp', 'data', '0.1.0');
+    const result = await executeFrozenCommand({
+      definition,
+      rawArgs: '30',
+      targetLarkAppId: 'cli_test',
+      botConfig: { plugins: ['data-mcp'], larkAppId: 'cli_test', larkAppSecret: 'test-secret' },
+      trustedCaller: {
+        requestUserOpenId: 'ou_test', requestUserUnionId: 'on_test', requestLarkAppId: 'cli_test', senderType: 'user' as const,
+      },
+      turnId: 'om_turn', dataDir: join(home, '.botmux', 'data'), workingDir: root,
+    });
+
+    expect(result.text).toContain('amount');
+    expect(result.text).toContain('12');
+  });
+
   it('executes the raw Data MCP carrier with trusted identity and no SQL leakage', async () => {
     const { root, definition } = fixture();
     const home = installFixturePlugin(root, 'data-mcp', 'data', '0.1.0');

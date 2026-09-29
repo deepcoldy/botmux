@@ -1179,6 +1179,7 @@ export async function runCommandRenderer(input: {
     return await new Promise<CommandRendererResult>((resolvePromise, rejectPromise) => {
       const stdout: Buffer[] = [];
       let stdoutBytes = 0;
+      let stdinFinished = false;
       let terminalError: CommandExecutorError | undefined;
       let settled = false;
       const child = spawn(input.renderer.executable.realpath, input.renderer.fixedArgs, {
@@ -1223,6 +1224,9 @@ export async function runCommandRenderer(input: {
         stdout.push(buffer);
       });
       child.stderr?.resume();
+      child.stdin?.once('finish', () => {
+        stdinFinished = true;
+      });
       child.stdin?.on('error', error => {
         terminalError ??= new CommandExecutorError('renderer_stdin_failed', `渲染器 ${input.renderer.id} 无法读取输入`, { cause: error });
         terminateProcessGroup(child);
@@ -1235,7 +1239,11 @@ export async function runCommandRenderer(input: {
         clearTimeout(timer);
         if (settled) return;
         if (terminalError) return fail(terminalError);
+        if (!stdinFinished) {
+          return fail(new CommandExecutorError('renderer_stdin_failed', `渲染器 ${input.renderer.id} 在输入写完前退出`));
+        }
         if (exitCode !== 0) return fail(new CommandExecutorError('renderer_non_zero_exit', `渲染器 ${input.renderer.id} 退出码 ${String(exitCode)}`));
+        if (stdoutBytes === 0) return fail(new CommandExecutorError('renderer_output_empty', `渲染器 ${input.renderer.id} 未输出内容`));
         try {
           const markdown = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(stdout));
           settled = true;

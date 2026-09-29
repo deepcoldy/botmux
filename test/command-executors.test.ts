@@ -494,6 +494,26 @@ renderers:
     })).rejects.toMatchObject({ code: 'renderer_stdin_failed' });
   });
 
+  it('rejects a renderer that exits successfully with empty stdout', async () => {
+    const fixture = setup();
+    const rendererScript = join(fixture.root, 'renderer-empty.mjs');
+    writeFileSync(rendererScript, 'process.stdin.resume(); process.stdin.on("end", () => process.exit(0));\n');
+    writeFileSync(fixture.registry, `${readFileSync(fixture.registry, 'utf8')}
+renderers:
+  - id: test.empty
+    executable: { realpath: ${JSON.stringify(resolve(process.execPath))} }
+    fixedArgs: [${JSON.stringify(rendererScript)}]
+    scriptArtifacts: [${JSON.stringify(rendererScript)}]
+    policy: { timeoutMs: 5000, maxInputBytes: 65536, maxOutputBytes: 65536 }
+`);
+    const renderer = loadCommandExecutorRegistry(fixture.registry).renderers.get('test.empty')!;
+    await expect(runCommandRenderer({
+      renderer,
+      payload: { rows: [{ value: 'visible' }] },
+      workingDir: fixture.root,
+    })).rejects.toMatchObject({ code: 'renderer_output_empty' });
+  });
+
   it('rejects an output contract that mixes flat and collection projections', () => {
     const fixture = setup();
     writeFileSync(
