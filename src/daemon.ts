@@ -1,3 +1,4 @@
+import { deliverPublishedReport } from './core/report-publication.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
@@ -85,6 +86,7 @@ import {
   type VcMeetingConsumerProfileConfig,
 } from './bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from './im/lark/streaming-card-buttons.js';
+import { buildMarkdownCard } from './im/lark/md-card.js';
 import { setDisplayNameRefresher, findConfigField, applyConfigField } from './services/bot-config-store.js';
 import { registerPinStreamingCardChangeHandler } from './services/pin-streaming-card-change.js';
 import { getSkillFeedbackStore } from './services/skill-feedback-store.js';
@@ -4159,6 +4161,10 @@ async function sessionReply(
     return sendWithHookPolicy(chatId, content, msgType, opts?.uuid);
   }
 
+  if (opts?.placement === 'chat' && ds && opts.sourceSessionId === ds.session.sessionId) {
+    return sendWithHookPolicy(ds.chatId, content, msgType, opts.uuid);
+  }
+
   // Thread-scope (or unknown / legacy): reply in thread.
   if (opts?.replyTarget?.mode === 'plain') {
     throw new Error('plain frozen reply target is invalid for a thread-scoped session');
@@ -6766,13 +6772,15 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
     }
   } catch { /* missing/malformed registry fails closed below */ }
 
-  const decision = authorizeReportSessionRelayRequest({
+  const authorize = () => authorizeReportSessionRelayRequest({
     raw,
     trustedHost: isTrustedHostIpcRequest(req),
     session: ds
       ? {
           sessionId: ds.session.sessionId,
           larkAppId: ds.larkAppId,
+          chatId: ds.chatId,
+          promptInjection: sessionPromptInjection(ds),
           receiver: !!ds.session.vcMeetingReceiver,
           scope: ds.scope ?? ds.session.scope,
           rootMessageId: ds.session.rootMessageId,
@@ -6790,13 +6798,14 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
       dispatchReportBindingSecretPath(config.session.dataDir),
     ),
   });
+  const decision = authorize();
   if (!decision.ok) {
     return jsonRes(res, decision.status, { ok: false, error: decision.error });
   }
 
   const targetDaemon = findOnlineDaemon(decision.target.larkAppId);
-  if (!targetDaemon) {
-    return jsonRes(res, 503, { ok: false, error: 'orchestrator_daemon_offline' });
+  if (!targetDaemon && decision.delivery === 'relay') {
+      return jsonRes(res, 503, { ok: false, error: 'orchestrator_daemon_offline' });
   }
   const triggerMeta = {
     requestId: `report:${decision.source.sessionId}:${Date.now()}`,
@@ -6839,13 +6848,44 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
     }
   };
   try {
-    const delivered = await deliverReportSessionRelay({
-      decision,
-      triggerMeta,
-      fetchTarget: (path, init) => fetchDaemonIpc(targetDaemon.ipcPort, path, init),
+    const relay = (meta = triggerMeta) => deliverReportSessionRelay({
+      decision, triggerMeta: meta,
+      fetchTarget: (path, init) => {
+        if (!targetDaemon) throw new Error('orchestrator_daemon_offline');
+        return fetchDaemonIpc(targetDaemon.ipcPort, path, init);
+      },
       postProjectUpdate,
     });
-    return jsonRes(res, delivered.status, delivered.body);
+    const publication = decision.delivery === 'publish' || decision.delivery === 'publish-and-relay';
+    if (publication && (!ds || getBot(ds.larkAppId).config.privateCard
+      || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly }))) {
+      return jsonRes(res, 403, { ok: false, error: 'report_publication_unavailable' });
+    }
+    const delivered = publication ? await deliverPublishedReport({
+      dataDir: config.session.dataDir,
+      key: decision.deliveryKey!,
+      delivery: decision.delivery as 'publish' | 'publish-and-relay',
+      validate: () => {
+        const fresh = authorize();
+        if (findActiveBySessionId(ds!.session.sessionId) !== ds
+          || !fresh.ok || fresh.deliveryKey !== decision.deliveryKey) throw new Error('turn_provenance_stale');
+      },
+      publish: uuid => sessionReply(sessionAnchorId(ds!), buildMarkdownCard(decision.content, undefined, ''),
+        'interactive', ds!.larkAppId, ds!.managedTurnOrigin!.turnId, {
+          sourceSessionId: ds!.session.sessionId, uuid,
+          ...(decision.publishTo === 'chat' ? { placement: 'chat' as const } : {
+            replyTarget: { mode: 'thread' as const, rootMessageId: decision.dispatchRoot },
+          }),
+        }),
+      relay,
+      syncProject: () => postProjectUpdate(decision.target),
+    }) : await relay();
+    return jsonRes(res, delivered.status, {
+      ...delivered.body,
+      ...(publication ? { publicationTarget: decision.publishTo === 'chat'
+        ? { mode: 'top-level', chatId: ds!.chatId }
+        : { mode: 'thread', rootMessageId: decision.dispatchRoot, chatId: ds!.chatId } } : {}),
+    });
   } catch (error) {
     return jsonRes(res, 502, {
       ok: false,

@@ -19,6 +19,7 @@ import {
   activeConversationBotOpenIds,
   appendDispatchCompletionProtocol,
   appendDispatchReportProtocol,
+  appendDispatchReportProtocolWithDelivery,
   appendLegacyDispatchReportProtocol,
   buildDispatchCompletionBrief,
   stripDispatchCompletionProtocol,
@@ -155,6 +156,45 @@ describe('dispatch completion switch wiring', () => {
     expect(completion).toContain('botmux send --no-mention');
     expect(completion).toContain('除上述 botmux report 回报外');
     expect(completion).toContain('不要 @ 主 bot，不要新开话题');
+  });
+
+  it('preserves multiline guidance without inferring completion', () => {
+    const result = appendDispatchReportProtocol('review the locked commit', 'om_seed_exact');
+    expect(result).not.toContain('--status completed');
+    expect(result).toContain('--content-file');
+    expect(result).toContain('`\\n`');
+  });
+
+  it.each(['publish', 'publish-and-relay'] as const)(
+    'routes %s results directly without asking for a duplicate same-topic copy',
+    (resultDelivery) => {
+      const report = appendDispatchReportProtocolWithDelivery(
+        'review the locked commit',
+        'om_seed_exact',
+        resultDelivery,
+      );
+      expect(report).toContain(`--delivery ${resultDelivery}`);
+      const result = buildDispatchCompletionBrief({
+        brief: 'review the locked commit',
+        dispatchRootId: 'om_seed_exact',
+        exactReportRootEnabled: true,
+        sameTopicSendEnabled: true,
+        resultDelivery,
+      });
+      expect(result).not.toContain('botmux send --no-mention');
+    },
+  );
+
+  it('uses the exact relay for publish delivery even when the legacy feature switch is off', () => {
+    const result = buildDispatchCompletionBrief({
+      brief: 'compare the two merge requests',
+      dispatchRootId: 'om_seed_exact',
+      exactReportRootEnabled: false,
+      sameTopicSendEnabled: true,
+      resultDelivery: 'publish',
+    });
+    expect(result).toContain('botmux report --dispatch-root om_seed_exact --delivery publish');
+    expect(result).not.toContain('--legacy-dispatch');
   });
 
   it.each([

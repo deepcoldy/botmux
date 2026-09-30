@@ -96,12 +96,28 @@ export function appendLegacyDispatchReportProtocol(brief: string): string {
 
 /** Bind a stable local dispatch to its exact report destination. */
 export function appendDispatchReportProtocol(brief: string, dispatchRootId: string): string {
+  return appendDispatchReportProtocolWithDelivery(brief, dispatchRootId, 'relay');
+}
+
+export type DispatchResultDelivery = 'relay' | 'publish' | 'publish-and-relay';
+
+export function appendDispatchReportProtocolWithDelivery(
+  brief: string,
+  dispatchRootId: string,
+  delivery: DispatchResultDelivery,
+): string {
   const root = dispatchRootId.trim();
   if (!DISPATCH_ROOT_ID_RE.test(root)) throw new Error('dispatch report protocol requires a valid om_ root id');
+  const deliveryFlag = delivery === 'relay' ? '' : ` --delivery ${delivery}`;
   return brief.trimEnd()
     + '\n\n— 完成回报 —\n'
-    + `干完后在本话题运行 \`botmux report --dispatch-root ${root} "子项目完成 + 产出位置/摘要"\` `
-    + '把结果回报给原始主编排会话；不要在本话题 @ 主bot（那会另起一个没有上下文的新会话）。';
+    + `干完后运行 \`botmux report --dispatch-root ${root}${deliveryFlag} "子项目完成 + 产出位置/摘要"\`。`
+    + (delivery === 'relay'
+      ? '结果将回传到派单来源会话；不要在本话题 @ 来源 bot（那会另起一个没有上下文的新会话）。'
+      : delivery === 'publish'
+        ? '结果内容将保持 Markdown 结构发布到当前派单话题，不再回传来源会话。'
+        : '结果内容将保持 Markdown 结构发布到当前派单话题，并同时回传来源会话。')
+    + '\n多行、表格或代码块必须通过 stdin 或 `--content-file` 传入，不得把字面量 `\\n` 拼进位置参数。';
 }
 
 /** Additionally ask the assignee to leave a human-visible copy in the task topic. */
@@ -118,11 +134,13 @@ export function buildDispatchCompletionBrief(input: {
   dispatchRootId: string;
   exactReportRootEnabled: boolean;
   sameTopicSendEnabled: boolean;
+  resultDelivery?: DispatchResultDelivery;
 }): string {
-  const withReport = input.exactReportRootEnabled
-    ? appendDispatchReportProtocol(input.brief, input.dispatchRootId)
+  const resultDelivery = input.resultDelivery ?? 'relay';
+  const withReport = input.exactReportRootEnabled || resultDelivery !== 'relay'
+    ? appendDispatchReportProtocolWithDelivery(input.brief, input.dispatchRootId, resultDelivery)
     : appendLegacyDispatchReportProtocol(input.brief);
-  return input.sameTopicSendEnabled
+  return input.sameTopicSendEnabled && resultDelivery === 'relay'
     ? appendDispatchCompletionProtocol(withReport)
     : withReport;
 }

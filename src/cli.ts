@@ -12375,6 +12375,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --bot <spec>          兼容外部/旧链路；spec = open_id[:名字[:角色]]，不保证本机双向授权
   --brief <text>        子项目简报 / 追加内容；首个语义行写 @steer 可显式调整活跃 Codex App turn
   --brief-file <path>   从文件读取简报
+  --result-delivery <mode>  结果投递：relay（默认）|publish|publish-and-relay
   --steer               在简报前注入通用 @steer 指令；普通 dispatch 默认仍进入 Queue
   --repo <path>         预设子 bot 工作目录（绝对路径，需在子 bot 所在机器上存在）
   --standby             仅 --repo 待命，不派简报
@@ -12401,6 +12402,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const intoRoot = dispatchArgs.into;
   const standby = dispatchArgs.standby;
   const steer = dispatchArgs.steer;
+  const resultDelivery = dispatchArgs.resultDelivery ?? 'relay';
   const botSpecs = dispatchArgs.bots;
   const botAppSpecs = dispatchArgs.botApps;
 
@@ -12433,6 +12435,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   }
   if (!standby && !brief.trim()) {
     console.error('缺少简报。用 --brief 或 --brief-file 指定（仅 --standby 模式可省略）。');
+    process.exit(1);
+  }
+  if (!['relay', 'publish', 'publish-and-relay'].includes(resultDelivery)) {
+    console.error('--result-delivery 必须是 relay|publish|publish-and-relay。');
     process.exit(1);
   }
   if (steer) brief = withBotSteerDirective(brief);
@@ -12498,6 +12504,12 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     if (!parsedBotApps.some(item => item.appId === targetAppId)) parsedBotApps.push({ appId: targetAppId, role });
   }
 
+  if (resultDelivery !== 'relay' && (standby || botSpecs.length > 0 || parsedBotApps.length === 0
+    || parsedBotApps.some(item => botConfigs.find(cfg => cfg.larkAppId === item.appId)?.promptInjection === 'none'))) {
+    console.error('公开结果投递需要使用 --bot-app 派发实际任务，目标须启用默认提示注入；零注入模式使用自动回传。');
+    process.exit(1);
+  }
+
   try {
     await assertProjectDispatchPolicy({
       sessionId: sid,
@@ -12550,6 +12562,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     dispatchRootId,
     exactReportRootEnabled,
     sameTopicSendEnabled,
+    resultDelivery: resultDelivery as 'relay' | 'publish' | 'publish-and-relay',
   });
   let built;
   try {
@@ -12830,7 +12843,7 @@ async function cmdDispatch(rest: string[]): Promise<void> {
  */
 async function cmdReport(rest: string[]): Promise<void> {
   if (rest.includes('--help') || rest.includes('-h')) {
-    console.log(`botmux report — 交付回报（issue 待验收 / 交接 Review·进展·结果并保持自然会话位置）
+    console.log(`botmux report — 任务回报（状态同步 / 结果投递并保持自然会话位置）
 
 用法:
   botmux report --content-file <path>
@@ -12838,6 +12851,7 @@ async function cmdReport(rest: string[]): Promise<void> {
   botmux report --into <om_root> --content-file <path>
   botmux report --top-level "子项目X 完成，产出在 …"
   botmux report --dispatch-root <om_seed> "子项目X 完成，产出在 …"
+  botmux report --dispatch-root <om_seed> --delivery publish --content-file <path>
   botmux report "子项目X 完成，产出在 …" --legacy-dispatch
 
 说明:
@@ -12853,8 +12867,7 @@ async function cmdReport(rest: string[]): Promise<void> {
      dispatch 注册表命中时仍回到原主编排会话，并唤醒其已有上下文。
      legacy / 跨机器 dispatch 没有本机注册表时仍回退群顶层，避免在子话题唤醒无上下文会话。
 
-  代码 Review 交接建议明确写出：首次 Review / 复审、MR、本轮改动、验证、风险，
-  以及希望 Reviewer 采取的动作。
+  回报应明确写出任务类型、本轮改动、验证、风险和建议的下一步动作。
 
 选项:
   --content-file <path>  从文件读取回报内容
@@ -12862,6 +12875,9 @@ async function cmdReport(rest: string[]): Promise<void> {
   --top-level            显式发到当前群顶层（覆盖默认落点）
   --dispatch-root <id>   dispatch 注入的精确 seed；优先且不命中时 fail closed
   --recipient-root <id>  仅指定历史收件人来源根消息；校验失败不降级，不代替 --dispatch-root
+  --delivery <mode>      relay（默认，仅回传来源会话）|publish（仅发布到当前派单话题）|
+                         publish-and-relay（发布并回传来源会话）
+  --publish-to <target>  thread（默认，当前派单话题）|chat（当前群顶层）
   --status <状态>        同步子任务状态：pending|in_progress|blocked|completed|failed
   --progress <0-100>     同步子任务完成百分比
   --remaining <text>     同步该子任务待完成内容
@@ -12911,7 +12927,7 @@ async function cmdReport(rest: string[]): Promise<void> {
     process.exit(1);
   }
   const projectStatusRaw = argValue(rest, '--status')?.trim();
-  for (const flag of ['--status', '--progress', '--remaining', '--milestone']) {
+  for (const flag of ['--status', '--progress', '--remaining', '--milestone', '--delivery', '--publish-to']) {
     if (flagPresentButValueMissing(rest, flag)) {
       console.error(`${flag} 需要一个值。`);
       process.exit(1);
@@ -12929,6 +12945,19 @@ async function cmdReport(rest: string[]): Promise<void> {
   }
   const projectRemaining = argValue(rest, '--remaining')?.trim();
   const projectMilestone = argValue(rest, '--milestone')?.trim();
+  const reportDelivery = argValue(rest, '--delivery')?.trim() ?? 'relay';
+  if (!['relay', 'publish', 'publish-and-relay'].includes(reportDelivery)) {
+    console.error('--delivery 必须是 relay|publish|publish-and-relay。');
+    process.exit(1);
+  }
+
+  const publishTo = argValue(rest, '--publish-to');
+  if ((publishTo !== undefined && !['thread', 'chat'].includes(publishTo))
+    || (publishTo !== undefined && reportDelivery === 'relay')
+    || (reportDelivery !== 'relay' && (!explicitDispatchRoot || explicitInto || explicitTopLevel || legacyDispatch))) {
+    console.error('发布模式需要 --dispatch-root；--publish-to 仅支持 thread|chat，不能与 --into、--top-level 或 --legacy-dispatch 混用。');
+    process.exit(1);
+  }
 
   let content = '';
   const contentFile = argValue(rest, '--content-file');
@@ -13099,6 +13128,8 @@ async function cmdReport(rest: string[]): Promise<void> {
           ...(projectProgressRaw !== undefined ? { progress: Number(projectProgressRaw) } : {}),
           ...(projectRemaining ? { remaining: projectRemaining } : {}),
           ...(projectMilestone ? { milestone: projectMilestone } : {}),
+          ...(reportDelivery !== 'relay' ? { delivery: reportDelivery } : {}),
+          ...(publishTo ? { publishTo } : {}),
         },
       });
     } catch (err: any) {
@@ -13111,29 +13142,38 @@ async function cmdReport(rest: string[]): Promise<void> {
       && !explicitDispatchRoot) {
       // Ordinary topic/chat turn, not a registered dispatch.
     } else if (!response.ok || triggerBody?.ok !== true) {
-      console.error(`主编排会话回注失败: ${triggerBody?.error ?? `HTTP ${response.status}`}`);
+      console.error(JSON.stringify({ success: false, error: triggerBody?.error ?? `HTTP ${response.status}`,
+        ...(triggerBody?.publishedMessageId ? { publishedMessageId: triggerBody.publishedMessageId } : {}),
+        ...(triggerBody?.deliveryKey ? { deliveryKey: triggerBody.deliveryKey } : {}),
+      }));
       process.exit(1);
     } else {
       const target = triggerBody.reportTarget;
       console.log(JSON.stringify({
         success: true,
-        delivery: 'orchestrator-session',
-        reportedTo: target?.sessionId,
+        delivery: reportDelivery === 'publish' ? 'lark-message' : 'orchestrator-session',
+        reportedTo: reportDelivery === 'publish' ? triggerBody.publishedMessageId : target?.sessionId,
         viaRegistry: true,
-        recipient: {
+        recipient: reportDelivery === 'publish' ? {
+          kind: 'chat', chatId: s.chatId,
+        } : {
           kind: 'orchestrator-session',
           botAppId: target?.larkAppId,
           sessionId: target?.sessionId,
           ...(reportRecipient ? { openId: reportRecipient } : {}),
         },
         placementSource: 'dispatch-registry',
-        messageTarget: {
+        messageTarget: reportDelivery === 'publish' ? triggerBody.publicationTarget : {
           mode: 'orchestrator-session',
           sessionId: target?.sessionId,
           botAppId: target?.larkAppId,
         },
         triggerId: triggerBody.triggerId,
         projectSynced: triggerBody.projectSynced === true,
+        deliveryMode: reportDelivery,
+        ...(typeof triggerBody.publishedMessageId === 'string'
+          ? { publishedMessageId: triggerBody.publishedMessageId, publicationTarget: triggerBody.publicationTarget }
+          : {}),
       }));
       return;
     }
@@ -13141,7 +13181,7 @@ async function cmdReport(rest: string[]): Promise<void> {
 
   if (!reportRecipient) {
     console.error(
-      '找不到 Review / 回报接收者：本会话没有 creatorOpenId、ownerOpenId 或可用的历史发送者。\n' +
+      '找不到回报接收者：本会话没有 creatorOpenId、ownerOpenId 或可用的历史发送者。\n' +
       '若确需交接，请改用 `botmux send --mention <open_id:名字>` 明确指定接收者。');
     process.exit(1);
   }
