@@ -779,6 +779,38 @@ executors:
     expect(audit).not.toHaveProperty('raw_args');
   });
 
+  it('redacts valid arguments when another preflight gate rejects the invocation', async () => {
+    const marker = 'audit-secret-marker';
+    const yaml = BASE.replace(`    type: integer
+    min: 1
+    max: 90
+    default: 7`, `    type: string
+    default: fallback`);
+    const { root, definition } = fixture(yaml);
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+
+    await expect(executeFrozenCommand({
+      definition,
+      rawArgs: marker,
+      targetLarkAppId: 'cli_test',
+      botConfig: { plugins: ['data-mcp'], larkAppId: 'cli_test', larkAppSecret: 'secret' },
+      trustedCaller: undefined,
+      turnId: 'om_redacted',
+      dataDir: join(root, 'data'),
+    })).rejects.toMatchObject({ code: 'untrusted_caller' });
+
+    const audit = warn.mock.calls.find(([message, details]) =>
+      message === '[frozen-command:audit]'
+      && (details as Record<string, unknown>)?.event === 'frozen_command_invocation'
+      && (details as Record<string, unknown>)?.turn_id === 'om_redacted')?.[1];
+    expect(audit).toMatchObject({
+      status: 'rejected',
+      error_code: 'untrusted_caller',
+      normalized_params: [{ name: 'days', type: 'string', value: '[REDACTED]' }],
+    });
+    expect(JSON.stringify(audit)).not.toContain(marker);
+  });
+
   it('shows and audits output-rule configuration errors without suggesting a retry', () => {
     const { definition } = fixture(BASE.replace('  format: markdown', `  format: markdown
   rules:
