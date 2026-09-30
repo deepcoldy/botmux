@@ -49,6 +49,7 @@ import {
   resolveSessionTranscriptPath,
   cliSupportsNativeUsage,
 } from '../src/services/transcript-resolver.js';
+import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 
 const APP_ID = 'cli_testbot0001';
 
@@ -78,11 +79,36 @@ describe('resolveSessionTranscriptPath — sandboxed-bot BOT_HOME fallback', () 
   });
 
   afterEach(() => {
+    vi.restoreAllMocks();
     if (savedSessionDataDir === undefined) delete process.env.SESSION_DATA_DIR;
     else process.env.SESSION_DATA_DIR = savedSessionDataDir;
     if (savedCodexHome === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = savedCodexHome;
     for (const d of trash.splice(0)) rmSync(d, { recursive: true, force: true });
+  });
+
+  it.each([true, false])('refreshes an existing Codex path after rotation (fresh=%s)', fresh => {
+    const sid = 'aaaaaaaa-aaaa-7aaa-8aaa-aaaaaaaaaaaa';
+    const codexHome = join(base, 'custom-codex-home');
+    process.env.CODEX_HOME = codexHome;
+    const old = writeCodexRollout(codexHome, sid);
+    const query = { cliId: 'codex' as const, sessionId: sid, cliSessionId: sid };
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(100_000);
+    expect(resolveSessionTranscriptPath(query)?.path).toBe(old);
+    const nextDir = join(codexHome, 'sessions', '2026', '09', '30');
+    mkdirSync(nextDir, { recursive: true });
+    const next = join(nextDir, `rollout-2026-09-30T01-00-00-${sid}_bbbbbbbb-bbbb-7bbb-8bbb-bbbbbbbbbbbb.jsonl`);
+    writeFileSync(next, JSON.stringify({ type: 'session_meta', payload: { id: sid } }) + '\n');
+    const db = openDatabaseSyncOrThrow(join(codexHome, 'state_5.sqlite'));
+    try {
+      db.exec('CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT)');
+      db.prepare('INSERT INTO threads VALUES (?, ?)').run(sid, next);
+    } finally { db.close(); }
+    if (!fresh) {
+      expect(resolveSessionTranscriptPath(query)?.path).toBe(old);
+      clock.mockReturnValue(105_001);
+    }
+    expect(resolveSessionTranscriptPath({ ...query, fresh })?.path).toBe(next);
   });
 
   function writeBotHomeTranscript(sid: string): string {
