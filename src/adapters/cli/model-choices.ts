@@ -91,4 +91,5 @@ export const CLI_MODEL_CHOICES: Readonly<Record<CliId, readonly string[] | undef
     'MiniMax-M2.7',
     'MiniMax-M2.7-highspeed',
   ],
+  'remote-runner': undefined,
 };

@@ -93,11 +93,12 @@ describe('createCliAdapterSync factory', () => {
 
   it.each(ALL_CLI_IDS)('adapter for "%s" has resolvedBin set', (id) => {
     const adapter = createCliAdapterSync(id, `/opt/${id}`);
-    // Remote backends (riff/mojo) never have the worker spawn a local binary —
+    // Riff/Mojo never have the worker spawn a local binary —
     // riff is pure HTTP and MojoBackend shells out per turn from the backend, so
-    // their adapter deliberately reports an empty resolvedBin. Exempting them via
-    // the shared predicate keeps this loop honest for every local CLI.
-    if (isRemoteCliId(id)) expect(adapter.resolvedBin).toBe('');
+    // their adapters deliberately report an empty resolvedBin. Remote Runner is
+    // also off-box execution, but it intentionally launches a local provider
+    // bridge process, so its configured executable must remain observable.
+    if (isRemoteCliId(id) && id !== 'remote-runner') expect(adapter.resolvedBin).toBe('');
     // dsh joins the bundled-Node-runner group (upstream #858): its resolvedBin is
     // the node binary, not the pinned path.
     else if (id === 'codex-app' || id === 'mira' || id === 'mir' || id === 'dsh') expect(adapter.resolvedBin).toBe(process.execPath);

@@ -24,15 +24,7 @@ import {
   type RemoteRunnerCommand,
   type RemoteRunnerEvent,
 } from './remote-runner-protocol.js';
-
-export interface RemoteRunnerBackendConfig {
-  /** Optional fail-closed provider identity pin. */
-  expectedProvider?: string;
-  /** Capabilities required before start/resume. Defaults to the complete v1 set. */
-  requiredCapabilities?: readonly RemoteRunnerCapability[];
-  handshakeTimeoutMs?: number;
-  operationTimeoutMs?: number;
-}
+import type { RemoteRunnerConfig } from './remote-runner-config.js';
 
 type PendingRequest = {
   accept: (event: RemoteRunnerEvent) => boolean;
@@ -70,6 +62,7 @@ export class RemoteRunnerBackend implements SessionBackend {
   private killed = false;
   private closing = false;
   private closePrepared = false;
+  private closeOutcomeUncertain = false;
   private shutdownDetaching = false;
   private exitEmitted = false;
   private startupPromise: Promise<void> | null = null;
@@ -86,7 +79,7 @@ export class RemoteRunnerBackend implements SessionBackend {
   private accessUrlCb: ((url: string) => void) | null = null;
 
   constructor(
-    private readonly config: RemoteRunnerBackendConfig,
+    private readonly config: RemoteRunnerConfig,
     private readonly sessionId: string,
     initialState?: RemoteRunnerBackendState,
   ) {
@@ -162,12 +155,13 @@ export class RemoteRunnerBackend implements SessionBackend {
     this.activeTurnId = input.turnId;
     this.turnSettled = new Promise<void>(resolve => { this.settleTurn = resolve; });
     try {
-      await this.send(remoteRunnerCommand('turn', {
-        requestId: this.requestId('turn'),
+      const requestId = this.requestId('turn');
+      await this.request(remoteRunnerCommand('turn', {
+        requestId,
         turnId: input.turnId,
         content: input.content,
         ...(input.trustedCaller ? { trustedCaller: input.trustedCaller } : {}),
-      }));
+      }), event => event.type === 'status' && event.status === 'busy', this.operationTimeoutMs);
       return { submitted: true };
     } catch (error) {
       this.finishActiveTurn();
@@ -204,7 +198,7 @@ export class RemoteRunnerBackend implements SessionBackend {
   }
 
   async destroySession(): Promise<SessionDestroyResult> {
-    if (this.closePrepared) return { ok: true, ...(this.state?.agentThreadId ? { taskId: this.state.agentThreadId } : {}) };
+    if (this.closePrepared) return { ok: true };
     this.closing = true;
     try {
       if (!this.startupPromise) throw new Error('remote runner has not spawned');
@@ -217,20 +211,20 @@ export class RemoteRunnerBackend implements SessionBackend {
       if (event.type !== 'status' || event.status !== 'closed') throw new Error('provider did not confirm close');
       if (event.state) this.applyState(event.state);
       this.closePrepared = true;
-      return { ok: true, ...(this.state?.agentThreadId ? { taskId: this.state.agentThreadId } : {}) };
+      return { ok: true };
     } catch (error) {
+      this.closeOutcomeUncertain = true;
       return {
         ok: false,
         error: error instanceof Error ? error.message : String(error),
         recovery: 'uncertain',
         admission: 'fenced',
-        ...(this.state?.agentThreadId ? { taskId: this.state.agentThreadId } : {}),
       };
     }
   }
 
   async abortDestroySession(): Promise<SessionAbortDestroyResult> {
-    if (this.closePrepared || !this.child) {
+    if (this.closePrepared || this.closeOutcomeUncertain || !this.child) {
       return { admissionRestored: false, reason: 'remote runner close outcome is not reversible' };
     }
     this.closing = false;
@@ -252,11 +246,14 @@ export class RemoteRunnerBackend implements SessionBackend {
       );
       if (event.type !== 'status' || event.status !== 'detached') throw new Error('provider did not confirm detach');
       if (event.state) this.applyState(event.state);
-      return { ok: true, taskId: this.state?.agentThreadId ?? null };
+      // The generic shutdown coordinator's taskId field is legacy Riff/Mojo
+      // lineage.  Remote Runner lineage travels only through backendState, so
+      // never alias agentThreadId into Session.riffParentTaskId.
+      return { ok: true, taskId: null };
     } catch (error) {
       return {
         ok: false,
-        taskId: this.state?.agentThreadId ?? null,
+        taskId: null,
         error: error instanceof Error ? error.message : String(error),
       };
     }
@@ -264,10 +261,10 @@ export class RemoteRunnerBackend implements SessionBackend {
 
   abortShutdownDetach(): SessionShutdownDetachResult {
     if (!this.child || this.killed) {
-      return { ok: false, taskId: this.state?.agentThreadId ?? null, error: 'provider process is unavailable' };
+      return { ok: false, taskId: null, error: 'provider process is unavailable' };
     }
     this.shutdownDetaching = false;
-    return { ok: true, taskId: this.state?.agentThreadId ?? null };
+    return { ok: true, taskId: null };
   }
 
   commitShutdownDetach(): void { this.kill(); }
@@ -301,11 +298,15 @@ export class RemoteRunnerBackend implements SessionBackend {
           sessionId: this.sessionId,
           cwd: opts.cwd,
           state: this.state,
+          ...(opts.model ? { model: opts.model } : {}),
+          ...(opts.reasoningEffort ? { reasoningEffort: opts.reasoningEffort } : {}),
         })
       : remoteRunnerCommand('start', {
           requestId,
           sessionId: this.sessionId,
           cwd: opts.cwd,
+          ...(opts.model ? { model: opts.model } : {}),
+          ...(opts.reasoningEffort ? { reasoningEffort: opts.reasoningEffort } : {}),
         });
     const ready = await this.request(
       command,
@@ -421,9 +422,9 @@ export class RemoteRunnerBackend implements SessionBackend {
         return false;
       }
       if (state.generation === this.state.generation
-          && this.state.remoteSessionId && state.remoteSessionId
-          && this.state.remoteSessionId !== state.remoteSessionId) {
-        this.failProtocol('remote runner changed remote session without advancing generation');
+          && this.state.remoteSessionId
+          && state.remoteSessionId !== this.state.remoteSessionId) {
+        this.failProtocol('remote runner changed or cleared remote session without advancing generation');
         return false;
       }
     }

@@ -229,6 +229,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     launchShell: typeof j?.launchShell === 'string' ? j.launchShell : '',
     env: typeof j?.env === 'string' ? j.env : '',
     riff: j?.riff && typeof j.riff === 'object' ? j.riff : null,
+    remoteRunner: j?.remoteRunner && typeof j.remoteRunner === 'object' ? j.remoteRunner : null,
     skills: j?.skills && typeof j.skills === 'object' ? j.skills : null,
   };
 }

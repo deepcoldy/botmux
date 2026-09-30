@@ -83,6 +83,10 @@ export interface SpawnOpts {
    * Backends that execute `bin` directly (pty/tmux/zellij/zmx) ignore it.
    */
   cliBin?: string;
+  /** Provider-neutral model selection for structured remote runners. */
+  model?: string;
+  /** Provider-neutral reasoning effort for structured remote runners. */
+  reasoningEffort?: string;
 }
 
 export type AmbiguousSubmissionRecoveryFailure =

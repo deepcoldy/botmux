@@ -1139,7 +1139,7 @@ function queuePostSubmitNativeSessionTitle(title: string | undefined): boolean {
   if (!supportsPostSubmitRenameSessionTitle(cfg.cliId)) return false;
   if (codexRpcEngine || remoteWsUrl) return false;
   if (!cliAdapter?.buildSessionRenameCommand) return false;
-  if (effectiveBackendType === 'riff' || effectiveBackendType === 'mojo') return false;
+  if (isRemoteBackendType(effectiveBackendType)) return false;
   nativeSessionTitleRevision += 1;
   nativeSessionTitleAppliedThreadId = undefined;
   cfg.nativeSessionTitle = trimmed;
@@ -2396,7 +2396,7 @@ let closeRequested = false;
 let capturedSpawnCommand: string | null = null;
 let deferredTopicOutputTail = '';
 const reportedDeferredTopicRoots = new Set<string>();
-const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', opencode2: 'OpenCode 2', mimocode: 'MiMoCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', ebsd: 'ebsd', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro', riff: 'Riff', reasonix: 'Reasonix', dsh: 'DeepSeek Harness', 'dsh-tui': 'DeepSeek Harness TUI', mojo: 'Mojo', minimax: 'MiniMax' };
+const CLI_DISPLAY_NAMES: Record<string, string> = { 'claude-code': 'Claude', seed: 'Seed', relay: 'Relay', aiden: 'Aiden', coco: 'CoCo', codex: 'Codex', 'codex-app': 'Codex App', cursor: 'Cursor', gemini: 'Gemini', genius: 'Genius', opencode: 'OpenCode', opencode2: 'OpenCode 2', mimocode: 'MiMoCode', antigravity: 'Antigravity', mtr: 'MTR', hermes: 'Hermes', mira: 'Mira', mir: 'Mir CLI', traex: 'TRAE', pi: 'Pi', copilot: 'Copilot', 'oh-my-pi': 'Oh My Pi', ebsd: 'ebsd', kimi: 'Kimi', grok: 'Grok Build', 'kiro-cli': 'Kiro', riff: 'Riff', reasonix: 'Reasonix', dsh: 'DeepSeek Harness', 'dsh-tui': 'DeepSeek Harness TUI', mojo: 'Mojo', minimax: 'MiniMax', 'remote-runner': 'Remote Runner' };
 function cliName(): string {
   return (lastInitConfig?.cliRuntime?.source === 'configured'
     ? (lastInitConfig.cliRuntime.displayName?.trim() || lastInitConfig.cliRuntime.id)
@@ -2884,10 +2884,9 @@ async function runStartupCommands(): Promise<void> {
   if (lastInitConfig?.adoptMode) return;
   if (!backend) return;
   // 远端后端：generic startupCommands 是 PTY 语义（sendRawCommandLine = write 文本 +
-  // 200ms 后 write 回车），对 riff/mojo 每条会裂成两个独立远端 turn 并打乱血缘。
-  // riff 的初始化命令走自己的 riff.setupCommands（沙箱内执行）；mojo 无对应机制，
-  // 其环境准备由 --cloud 沙箱镜像负责。两者这里都必须跳过。
-  if (effectiveBackendType === 'riff' || effectiveBackendType === 'mojo') {
+  // 200ms 后 write 回车），对结构化远端后端每条会裂成两个独立 turn 并打乱血缘。
+  // Provider-specific initialization belongs in the provider implementation.
+  if (isRemoteBackendType(effectiveBackendType)) {
     log(`Skipping ${cmds.length} generic startup command(s) — ${effectiveBackendType} backend has no PTY to drive`);
     return;
   }
@@ -5291,7 +5290,7 @@ function stampMojoTurnMark(turnId: string | undefined, dispatchAttempt: number |
   mojoTurnMark = { turnId, dispatchAttempt, markTimeMs: Date.now() };
 }
 
-function deliverMojoTurnFinal(text: string): void {
+function deliverRemoteTurnFinal(text: string, exactTurnId?: string): void {
   if (!text.trim()) return;
   // A mark from an EARLIER turn must not gate this one: its window opened
   // before the previous turn's sends, which would suppress this answer for the
@@ -5299,12 +5298,12 @@ function deliverMojoTurnFinal(text: string): void {
   // deliver" (shouldSuppressBridgeEmit needs markTimeMs to suppress on sends),
   // which is the safe direction for a bug whose symptom is silence.
   const mark = mojoTurnMark && mojoTurnMark.turnId === currentBotmuxTurnId ? mojoTurnMark : null;
-  const turnId = mark?.turnId ?? currentBotmuxTurnId;
+  const turnId = exactTurnId ?? mark?.turnId ?? currentBotmuxTurnId;
   // Without a turn id the daemon cannot resolve a reply target, and lastUuid
   // would not dedupe a retry. Dropping is right: this can only be output that
   // belongs to no Lark turn.
   if (!turnId) {
-    log('Mojo final bridge skipped: no turn id for this answer');
+    log('Remote final bridge skipped: no turn id for this answer');
     return;
   }
   const dispatchAttempt = mark?.dispatchAttempt ?? currentBotmuxDispatchAttempt;
@@ -5323,7 +5322,7 @@ function deliverMojoTurnFinal(text: string): void {
   );
   if (shouldSuppressBridgeEmit(gateInput, undefined, markers, adoptMode, replyDeliveryMode())) {
     log(
-      `Mojo final bridge suppressed for turn ${turnId.substring(0, 12)} `
+      `Remote final bridge suppressed for turn ${turnId.substring(0, 12)} `
       + `(${isBridgeNothingToSendFinal(text) ? 'nothing-to-send sentinel' : 'model already called botmux send'})`,
     );
     // Same as the structured bridge: an explicit send IS this turn's reply, so
@@ -5344,7 +5343,7 @@ function deliverMojoTurnFinal(text: string): void {
     turnId,
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
   });
-  log(`Mojo final bridge delivered ${postContent.length} chars for turn ${turnId.substring(0, 12)}`);
+  log(`Remote final bridge delivered ${postContent.length} chars for turn ${turnId.substring(0, 12)}`);
 }
 
 function submitActivityEvidenceSince(
@@ -9622,7 +9621,7 @@ function sendTermActionOnce(target: SessionBackend, key: TermActionKey): void | 
 async function handleTermAction(key: TermActionKey): Promise<void> {
   // 远端后端：没有终端可驱动——把控制字符 write 进 riff/mojo 会变成一个内容为
   // ANSI 序列的 follow-up turn（^C 也不会 cancel 远端执行），必须整体拒绝。
-  if (effectiveBackendType === 'riff' || effectiveBackendType === 'mojo') {
+  if (isRemoteBackendType(effectiveBackendType)) {
     log(`term_action '${key}' ignored — ${effectiveBackendType} backend has no local terminal to drive`);
     return;
   }
@@ -9731,6 +9730,7 @@ async function handleExactTurnInterrupt(requestId: string, turnId: string): Prom
       || lastInitConfig?.codexRpcInput === true
       || effectiveBackendType === 'riff'
       || effectiveBackendType === 'mojo'
+      || effectiveBackendType === 'remote-runner'
       || !backend) {
     send({ type: 'turn_interrupt_result', requestId, turnId, delivered: false, reason: 'unsupported' });
     return;
@@ -11602,6 +11602,17 @@ function scheduleSpawnArgvTurnStartFailOpen(): void {
   spawnArgvTurnStartFailOpenTimer.unref?.();
 }
 
+let preserveActiveTurnAuthorityForReady = false;
+
+function markRemoteRunnerStartupReady(): void {
+  preserveActiveTurnAuthorityForReady = true;
+  try {
+    markPromptReady();
+  } finally {
+    preserveActiveTurnAuthorityForReady = false;
+  }
+}
+
 function markPromptReady(): void {
   // Screen probes and timeout fallbacks must honor the same startup evidence
   // as quiescence; a skeleton composer is not a ready CLI.
@@ -11729,7 +11740,13 @@ function markPromptReady(): void {
   // Quiescence is the terminal boundary for PTY adapters that do not emit an
   // explicit turn_terminal. Durable receivers keep authority until their exact
   // terminal receipt so an early screen-idle heuristic cannot release it.
-  if (!durableTurnInFlight) releaseActiveTurnAuthority('prompt_ready');
+  // A structured remote provider's startup `ready` proves only that its
+  // control channel can accept the opening turn.  It is not an execution
+  // terminal for that already-admitted Lark turn, so keep the exact caller
+  // authority until the provider later emits final/failure.
+  if (!durableTurnInFlight && !preserveActiveTurnAuthorityForReady) {
+    releaseActiveTurnAuthority('prompt_ready');
+  }
   isPromptReady = true;
   settleSessionRenameOnPrompt();
   // An old backend can still report idle while its async teardown is running.
@@ -12538,7 +12555,9 @@ async function flushPending(): Promise<void> {
   const rawInputReady = isPromptReady && pendingRawInputs.length > 0;
   const adoptInputReady = isPromptReady && lastInitConfig?.adoptMode === true && pendingAdoptMessages.length > 0;
   let supportedSessionRenameReady = sessionRenameReady;
-  const renameOnRemoteBackend = effectiveBackendType === 'riff' || effectiveBackendType === 'mojo';
+  const renameOnRemoteBackend = effectiveBackendType === 'riff'
+    || effectiveBackendType === 'mojo'
+    || effectiveBackendType === 'remote-runner';
   if (sessionRenameReady && (!cliAdapter.buildSessionRenameCommand || renameOnRemoteBackend)) {
     pendingSessionRename = null;
     supportedSessionRenameReady = false;
@@ -12865,7 +12884,23 @@ async function flushPending(): Promise<void> {
           );
           break;
         }
-        if (writeRpcEngine) {
+        if (writeBackend.submitTurn) {
+          submissionBackend = writeBackend;
+          if (!item.turnId) {
+            result = {
+              submitted: false,
+              failureReason: 'remote-runner requires an authenticated BotMux turn id',
+            };
+          } else {
+            prepareNormalWrite();
+            result = await writeBackend.submitTurn({
+              content: msg,
+              turnId: item.turnId,
+              ...(item.replyTurnId ? { replyTurnId: item.replyTurnId } : {}),
+              ...(item.trustedCaller ? { trustedCaller: item.trustedCaller } : {}),
+            });
+          }
+        } else if (writeRpcEngine) {
           if (item.taskContinuation
             && (item.turnId?.startsWith('bmx-continuation-') !== true
               || item.dispatchAttempt === undefined
@@ -14741,6 +14776,7 @@ async function spawnCli(
     sessionId: cfg.sessionId,
     backendType: effectiveBackend,
     backendConfig: riffBackendConfig,
+    remoteBackendState: cfg.remoteBackendState,
     herdrOwnershipScope: isolationRuntimeDataDir,
     persistentBackendTarget: cfg.persistentBackendTarget,
     // Old builds could place managed agents in a user's shared Herdr session.
@@ -17548,6 +17584,8 @@ async function spawnCli(
       // spawnBin may now be a launch wrapper (session scope / wrapperCli /
       // credential sandbox); the Herdr facade still needs the real CLI name.
       cliBin: cliAdapter.resolvedBin,
+      model: cfg.model,
+      reasoningEffort: cfg.reasoningEffort,
     });
   } catch (err) {
     cleanupCodexAppControlBootstrap();
@@ -18181,18 +18219,66 @@ async function spawnCli(
     log(`${cliName()} task finished — re-arming prompt-ready for queued follow-ups`);
     markPromptReady();
   });
-  // Headless final-answer bridge (mojo): deliver the turn's answer to the
+  // Headless final-answer bridge: deliver the turn's answer to the
   // thread when the agent produced one but never called `botmux send`. Same
   // generation fence as onTaskDone above — a late callback from a backend the
   // worker has already replaced must not post into the current turn.
-  backend.onTurnFinal?.((text) => {
+  backend.onTurnFinal?.((text, turnId) => {
     if (fatalWorkerErrorPending) return;
     if (backend !== observedBackend) return;
-    try {
-      deliverMojoTurnFinal(text);
-    } catch (err) {
-      log(`Mojo final bridge failed: ${err instanceof Error ? err.message : String(err)}`);
+    if (turnId && currentBotmuxTurnId && turnId !== currentBotmuxTurnId) {
+      log(`Ignored stale remote final for turn ${turnId.substring(0, 12)}`);
+      return;
     }
+    try {
+      deliverRemoteTurnFinal(text, turnId);
+    } catch (err) {
+      log(`Remote final bridge failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const completedTurnId = turnId ?? currentBotmuxTurnId;
+    if (completedTurnId) {
+      emitTurnTerminal(
+        completedTurnId,
+        'completed',
+        undefined,
+        currentBotmuxDispatchAttempt,
+      );
+    }
+  });
+  backend.onTurnFailure?.((failure) => {
+    if (fatalWorkerErrorPending || backend !== observedBackend) return;
+    if (currentBotmuxTurnId && failure.turnId !== currentBotmuxTurnId) {
+      log(`Ignored stale remote failure for turn ${failure.turnId.substring(0, 12)}`);
+      return;
+    }
+    send({
+      type: 'final_output',
+      content: failure.message,
+      lastUuid: failure.turnId,
+      turnId: failure.turnId,
+      dispatchAttempt: currentBotmuxDispatchAttempt,
+      turnFailed: true,
+    });
+    emitTurnTerminal(
+      failure.turnId,
+      failure.status,
+      failure.code,
+      currentBotmuxDispatchAttempt,
+      undefined,
+      failure.retryable,
+    );
+  });
+  backend.onBackendState?.((state) => {
+    if (backend !== observedBackend) return;
+    send({ type: 'remote_backend_state', state });
+  });
+  backend.onReady?.(() => {
+    if (backend !== observedBackend || fatalWorkerErrorPending) return;
+    if (effectiveBackendType === 'remote-runner') {
+      markRemoteRunnerStartupReady();
+      return;
+    }
+    markPromptReady();
   });
   // riff：任务 id 变更同步给 daemon 持久化，daemon 重启后 follow-up 血缘不断。
   backend.onTaskId?.((taskId) => {
@@ -18514,7 +18600,8 @@ async function spawnCli(
   // PTY output), and the first-prompt timeout only flushes for type-ahead
   // adapters, so isPromptReady would otherwise stay false until the ~15s
   // fallback and every first message would be needlessly delayed.
-  if (isRemoteBackendType(effectiveBackendType)) {
+  if (isRemoteBackendType(effectiveBackendType)
+    && effectiveBackendType !== 'remote-runner') {
     // BEFORE markPromptReady, which can flush a queued turn: a replacement
     // backend is built from the original init config, so a rotated — or cleared —
     // credential must be re-applied first or the queued turn runs against the

@@ -4,6 +4,7 @@ import { RemoteRunnerBackend } from '../src/adapters/backend/remote-runner-backe
 import type { RemoteRunnerBackendState } from '../src/adapters/backend/remote-runner-protocol.js';
 
 const referenceRunner = resolve('examples/remote-runner/reference-runner.mjs');
+const stalledCloseRunner = resolve('test/fixtures/remote-runner-stalled-close.mjs');
 const children: RemoteRunnerBackend[] = [];
 
 function createBackend(initialState?: RemoteRunnerBackendState): RemoteRunnerBackend {
@@ -98,7 +99,7 @@ describe('RemoteRunnerBackend', () => {
     await final;
     await expect(backend.prepareShutdownDetach()).resolves.toMatchObject({
       ok: true,
-      taskId: 'reference-thread:turn-detach',
+      taskId: null,
     });
     backend.commitShutdownDetach();
   });
@@ -109,5 +110,31 @@ describe('RemoteRunnerBackend', () => {
       provider: 'other',
       generation: 1,
     })).toThrow(/does not match/);
+  });
+
+  it('keeps admission fenced when cancellation has no confirmed outcome', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'stalled-close',
+      operationTimeoutMs: 100,
+    }, 'session-stalled');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    backend.spawn(process.execPath, [stalledCloseRunner], {
+      cwd: process.cwd(),
+      cols: 120,
+      rows: 40,
+      env: { ...process.env } as Record<string, string>,
+    });
+    await ready;
+
+    await expect(backend.destroySession()).resolves.toMatchObject({
+      ok: false,
+      recovery: 'uncertain',
+      admission: 'fenced',
+    });
+    await expect(backend.abortDestroySession()).resolves.toEqual({
+      admissionRestored: false,
+      reason: 'remote runner close outcome is not reversible',
+    });
   });
 });

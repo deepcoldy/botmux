@@ -89,6 +89,7 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
       // PTY-driven TUI variant of dsh; no skills dir of its own.
       'dsh-tui': 'none',
       mira: 'none', mir: 'none', copilot: 'none', kimi: 'none', riff: 'none',
+      'remote-runner': 'none',
       // minimax: `mmx text repl` is a tool-less chat loop (no shell/file
       // surface, no skillsDir); classifier sees no skillsDir / pluginDir → 'none'.
       minimax: 'none',

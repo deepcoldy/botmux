@@ -64,6 +64,7 @@ input.on('line', line => {
         return;
       }
       status = 'busy';
+      emit({ type: 'status', requestId: command.requestId, status, state });
       if (!state.agentThreadId) {
         state = { ...state, agentThreadId: `reference-thread:${command.turnId}` };
         emit({ type: 'lineage_changed', state });
