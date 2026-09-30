@@ -69,8 +69,9 @@ export interface TriggerRequest {
     status?: 'firing' | 'resolved' | string;
     waitForFinalOutput?: boolean;
     asyncReturnSessionId?: boolean;
-    /** Allow explicit botmux send in this async turn's existing real group.
-     * Final output still returns to the caller. Never persisted on the session. */
+    /** Permit explicit botmux send for messages authorized by this request in the
+     * existing real group. The caller determines message content and timing.
+     * Final output still returns to the caller. Defaults to false; turn-local. */
     allowChatMessages?: boolean;
     timeoutMs?: number;
     /** Connector-owner opt-in: drop the daemon-rendered final_output reply for

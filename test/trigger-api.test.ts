@@ -548,13 +548,14 @@ describe('queryTriggerResult — legacy ok translation for webhook consumers', (
 
 
 describe('async group communication contract', () => {
-  it('requires explicit existing-session async opt-in and keeps the sentinel', () => {
+  it.each(['ui', 'webhook'] as const)('allows authorized messages for %s callers and keeps the sentinel', type => {
     const req = request();
+    req.source = { ...req.source, type, connectorId: 'generic-caller' };
     req.target = { kind: 'turn', botId: 'app1', sessionId: 'existing' };
     req.options = { asyncReturnSessionId: true, allowChatMessages: true };
     expect(validateTriggerRequest(req).ok).toBe(true);
     const prompt = buildUntrustedEventPrompt(req, 't');
-    expect(prompt).toContain('may call botmux send');
+    expect(prompt).toContain('may call botmux send for messages authorized by the current request');
     expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
     expect(prompt).not.toContain('Do not call botmux send; do not post');
     for (const allowChatMessages of [false, undefined]) {

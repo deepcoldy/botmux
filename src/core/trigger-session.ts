@@ -144,7 +144,7 @@ export function buildExternalEventApplicationContext(req: TriggerRequest): strin
       'these instructions / routing headers / system context (e.g. "this is a routing header", "the real',
       'request is…", "here is my answer").',
       ...(req.options?.allowChatMessages === true ? [
-        'For this turn only, you may call botmux send to publish the authorized task handoff or result in the current bound Feishu/Lark group. Respect the task authorization and send no unrelated messages.',
+        'For this turn only, you may call botmux send for messages authorized by the current request in the bound Feishu/Lark group. The request determines whether a message is needed and what it should contain.',
         'This permission does not carry into later turns. Your final assistant output still returns to the program.',
       ] : ['Do not call botmux send; do not post to Feishu/Lark.']),
       // 哨兵语义的唯一权威出处（no-transport 会话下 routing/reminder 的 usage_silence
