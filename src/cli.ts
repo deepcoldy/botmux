@@ -10198,7 +10198,14 @@ async function cmdSend(rest: string[]): Promise<void> {
   } catch (error) {
     // Retention is maintenance, never part of send correctness. Keep the
     // completed/in-flight records fail-closed and let this send proceed.
-    logger.warn(`[turn-send-ledger] completed-record prune skipped: ${error instanceof Error ? error.message : String(error)}`);
+    // A write-sandboxed CLI is granted only its own session directory, so the
+    // shared root sweep is expected to be refused there; unsandboxed sends and
+    // the operator command still sweep every session. Stay quiet in that case
+    // rather than print a spurious warning on every sandboxed send.
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code !== 'EPERM' && code !== 'EACCES' && code !== 'EROFS') {
+      logger.warn(`[turn-send-ledger] completed-record prune skipped: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   const executeTurnPrimary = async (
     renderedContent: string,

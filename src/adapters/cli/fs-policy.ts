@@ -920,6 +920,14 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // session-scoped: sibling sessions' dirs are not exposed. The worker
   // pre-creates the dir so bwrap has a bind source.
   if (ctx.sessionId) push([`${sd}/statusline/${ctx.sessionId}`], 'readWrite', 'internal');
+  // turn-send-ledger: `botmux send` keeps its per-turn final-answer fence in
+  // `turn-send-ledger/<sessionId>/<hash>.json` (atomic tmp+rename plus a
+  // sibling `.lock`), so — like statusline — grant the per-session DIRECTORY.
+  // Never the shared root: it holds every session's fence, and write access
+  // there would let one session forge "final already sent" for another (its
+  // answer is then refused) or delete a record (its retry then duplicates).
+  // The worker pre-creates the dir so bwrap has a bind source.
+  if (ctx.sessionId) push([`${sd}/turn-send-ledger/${ctx.sessionId}`], 'readWrite', 'internal');
   // (schedules: stored PER BOT inside each BOT_HOME — the owner's dir is
   // already readWrite above and siblings' stores are denied by construction,
   // so the old shared data/schedules.json grant (and the cross-bot task-prompt
@@ -1031,6 +1039,8 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     if (ctx.sessionId) push([`${ctx.sessionDataDir}/turn-sends/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
     // statusline snapshot dir (see the larkTransport branch for why a dir, not a file).
     if (ctx.sessionId) push([`${ctx.sessionDataDir}/statusline/${ctx.sessionId}`], 'readWrite', 'internal');
+    // Own turn-send-ledger session dir (see the larkTransport branch).
+    if (ctx.sessionId) push([`${ctx.sessionDataDir}/turn-send-ledger/${ctx.sessionId}`], 'readWrite', 'internal');
     // NOTE: dashboard-daemons (sibling IPC port table) and .dashboard-secret/-token
     // are deliberately NOT re-allowed — a no-transport turn has no business
     // reaching sibling daemons, and the secret is the escalation vector.
