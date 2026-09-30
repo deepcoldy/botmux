@@ -1,4 +1,29 @@
-export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff' | 'mojo';
+import type {
+  RemoteRunnerBackendState,
+  RemoteRunnerTrustedCaller,
+} from './remote-runner-protocol.js';
+
+export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff' | 'mojo' | 'remote-runner';
+
+export interface BackendTurnInput {
+  content: string;
+  turnId: string;
+  replyTurnId?: string;
+  trustedCaller?: RemoteRunnerTrustedCaller;
+}
+
+export interface BackendTurnSubmission {
+  submitted: boolean;
+  failureReason?: string;
+}
+
+export interface BackendTurnFailure {
+  turnId: string;
+  code: string;
+  message: string;
+  status: 'failed' | 'ambiguous' | 'cancelled';
+  retryable: boolean;
+}
 
 /**
  * Durable identity of the backing resource owned by one Botmux session.
@@ -79,6 +104,10 @@ export interface SessionBackend {
   /** Returns false only when the backend can prove the write was not accepted.
    * Legacy implementations may return void on success. */
   write(data: string): void | boolean;
+  /** Provider-native structured turn submission. Backends that implement this
+   * bypass terminal keystroke adapters and receive the daemon-authenticated
+   * turn envelope directly. */
+  submitTurn?(input: BackendTurnInput): Promise<BackendTurnSubmission>;
   /**
    * Begin one logical adapter submission and return its recovery fence.
    * Backends with a persistent ambiguity journal may arm it here so all
@@ -174,7 +203,13 @@ export interface SessionBackend {
    * a backend must not pre-filter it. Optional — backends whose output the user
    * can already read in a terminal never implement it.
    */
-  onTurnFinal?(cb: (text: string) => void): void;
+  onTurnFinal?(cb: (text: string, turnId?: string) => void): void;
+  /** Exact provider-reported terminal failure for a submitted turn. */
+  onTurnFailure?(cb: (failure: BackendTurnFailure) => void): void;
+  /** Provider handshake/startup is complete and turns may be accepted. */
+  onReady?(cb: () => void): void;
+  /** Durable, provider-neutral lineage/runtime state changed. */
+  onBackendState?(cb: (state: RemoteRunnerBackendState) => void): void;
   /** Remote-session lineage updates — the worker forwards these to the daemon
    *  so the follow-up lineage survives daemon restarts. `null` clears the
    *  persisted lineage (follow-up failed → next message starts fresh). */
