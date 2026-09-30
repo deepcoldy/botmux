@@ -71,7 +71,8 @@ export interface TriggerRequest {
     asyncReturnSessionId?: boolean;
     /** Permit explicit botmux send for messages authorized by this request in the
      * existing real group. The caller determines message content and timing.
-     * Final output still returns to the caller. Defaults to false; turn-local. */
+     * Final output still returns to the caller. Defaults to false; turn-local.
+     * Cannot be combined with steer, which merges requests into one turn. */
     allowChatMessages?: boolean;
     timeoutMs?: number;
     /** Connector-owner opt-in: drop the daemon-rendered final_output reply for
@@ -307,8 +308,8 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   if (options.allowChatMessages !== undefined && typeof options.allowChatMessages !== 'boolean') {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.allowChatMessages must be a boolean' } };
   }
-  if (options.allowChatMessages === true && (target.kind !== 'turn' || !hasSessionId || !asyncReturnSessionId || waitForFinalOutput || source.type === 'headless')) {
-    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'allowChatMessages requires an async turn on an existing real group session' } };
+  if (options.allowChatMessages === true && (target.kind !== 'turn' || !hasSessionId || !asyncReturnSessionId || waitForFinalOutput || source.type === 'headless' || options.steer === true)) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'allowChatMessages requires an async turn on an existing real group session without steer' } };
   }
   if (options.timeoutMs !== undefined) {
     if (typeof options.timeoutMs !== 'number' || !Number.isFinite(options.timeoutMs) || options.timeoutMs < 1000 || options.timeoutMs > 300_000) {

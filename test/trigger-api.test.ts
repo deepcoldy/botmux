@@ -567,6 +567,7 @@ describe('async group communication contract', () => {
     for (const changes of [
       { options: { asyncReturnSessionId: true, allowChatMessages: 'true' } },
       { options: { waitForFinalOutput: true, allowChatMessages: true } },
+      { options: { asyncReturnSessionId: true, allowChatMessages: true, steer: true } },
       { target: { kind: 'turn', chatId: 'oc_real' } },
       { source: { type: 'headless', requestId: 'headless' } },
     ]) {

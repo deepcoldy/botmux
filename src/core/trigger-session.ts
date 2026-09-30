@@ -921,15 +921,12 @@ async function triggerSessionTurnAdmitted(
     }
   }
 
-  if (req.options?.allowChatMessages === true) {
-    const bound = req.target.sessionId ? activeBySessionId(deps.activeSessions, req.target.sessionId) : undefined;
-    if (req.source.type === 'headless' || !req.options.asyncReturnSessionId || req.options.waitForFinalOutput
-      || !bound || getBot(larkAppId).config.apiOnly === true
-      || !larkTransportEnabled({ chatId: bound.chatId, apiOnly: false })
-      || bound.chatType !== 'group' || bound.larkAppId !== larkAppId
-      || (req.target.chatId && req.target.chatId !== bound.chatId)) {
-      return { ok: false, errorCode: 'bad_request', error: 'allowChatMessages requires an existing real group session with Lark transport' };
-    }
+  // Shape checks also protect trusted callers that bypass HTTP validation.
+  if (req.options?.allowChatMessages === true && (req.target.kind !== 'turn'
+    || !req.target.sessionId || req.source.type === 'headless'
+    || !req.options.asyncReturnSessionId || req.options.waitForFinalOutput || req.options.steer
+    || getBot(larkAppId).config.apiOnly === true)) {
+    return { ok: false, errorCode: 'bad_request', error: 'allowChatMessages requires an async turn on an existing real group session without steer' };
   }
 
   const dryRun = !!req.options?.dryRun;
@@ -1168,6 +1165,18 @@ async function triggerSessionTurnAdmitted(
       // decision.kind === 'takeover' — an older-boot pre-dispatch reserved lease
       // for this same turn key. Re-claim via takeover at dispatch time below.
       turnIdempotencyTakeover = hit;
+    }
+  }
+
+  // Reuse durable receipts before requiring an active group. Only a new
+  // dispatch (including a reserved-lease takeover) needs a live binding.
+  if (req.options?.allowChatMessages === true) {
+    const bound = req.target.sessionId ? activeBySessionId(deps.activeSessions, req.target.sessionId) : undefined;
+    if (!bound
+      || !larkTransportEnabled({ chatId: bound.chatId, apiOnly: false })
+      || bound.chatType !== 'group' || bound.larkAppId !== larkAppId
+      || (req.target.chatId && req.target.chatId !== bound.chatId)) {
+      return { ok: false, errorCode: 'bad_request', error: 'allowChatMessages requires an existing real group session with Lark transport' };
     }
   }
 
