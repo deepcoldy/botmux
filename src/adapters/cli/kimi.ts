@@ -1,3 +1,4 @@
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
@@ -79,11 +80,7 @@ export function createKimiAdapter(pathOverride?: string): CliAdapter {
     readyPattern: undefined,
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,
-    modelChoices: [
-      'kimi-k2.5',
-      'kimi-k2.5-code',
-      'kimi-k2.7-code',
-    ],
+    modelChoices: CLI_MODEL_CHOICES['kimi'],
   };
 }
 

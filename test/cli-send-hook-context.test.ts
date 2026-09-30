@@ -5,8 +5,9 @@ import { dirname, join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { spawnSyncTsScript, spawnTsScript } from './helpers/ts-runner.js';
 import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
-import { startOutboxWatcher } from '../src/adapters/backend/sandbox.js';
+import { buildRelayHostEnv, startOutboxWatcher } from '../src/adapters/backend/sandbox.js';
 import {
+  ensureManagedOriginAttestationDirectory,
   managedOriginCapabilityPath,
   RELAY_ORIGIN_CAPABILITY_BASENAME,
   replaceManagedOriginCapabilityFile,
@@ -64,14 +65,14 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('envSessionId=${process.env.BOTMUX_SESSION_ID ??');
     expect(cmdSend).toContain('envLarkAppId=${process.env.BOTMUX_LARK_APP_ID ??');
     expect(cmdSend).toContain('originSessionId=${originSessionId ??');
-    expect(cmdSend).toContain('loadedSessions=${sessions.size}');
+    expect(cmdSend).toContain('reason=${resolved.reason}');
     expect(cmdSend).toContain("relayDir=${relayDir ? 'present' : 'absent'}");
     expect(cmdSend).toContain('readIsolation=${isolatedSendRequired ?');
     expect(cmdSend).toContain("capability=${isolatedCapabilityCtx ? 'present' : 'absent'}");
 
     const diagnosticStart = cmdSend.indexOf('session_lookup_miss');
     expect(diagnosticStart).toBeGreaterThanOrEqual(0);
-    const missingSessionAt = cmdSend.indexOf('未找到 session', diagnosticStart);
+    const missingSessionAt = cmdSend.indexOf('console.error(resolved.message)', diagnosticStart);
     expect(missingSessionAt).toBeGreaterThan(diagnosticStart);
     const diagnosticBlock = cmdSend.slice(diagnosticStart, missingSessionAt);
 
@@ -82,7 +83,7 @@ describe('cmdSend hook context wiring', () => {
       "process.env.BOTMUX_SESSION_ID ?? '-'",
       "process.env.BOTMUX_LARK_APP_ID ?? '-'",
       "originSessionId ?? '-'",
-      'sessions.size',
+      'resolved.reason',
       "relayDir ? 'present' : 'absent'",
       "isolatedSendRequired ? 'required' : kernelReadIsolationDetected ? 'detected' : 'off'",
       "isolatedCapabilityCtx ? 'present' : 'absent'",
@@ -107,7 +108,6 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('buildReplyLayoutHeader(replyLayout, layoutBody.heading, replyStyle)');
     expect(cmdSend).toContain('resolveReplyStyle(resolveReplyStyleConfig(s.larkAppId))');
     expect(cmdSend).toContain('createReplyCard([...elements], layoutHeader)');
-    expect(cmdSend).toContain('createReplyCard(elements, layoutHeader)');
     expect(cliSource).toContain('--layout result|progress|risk|blocked|handoff');
   });
 
@@ -162,6 +162,12 @@ describe('cmdSend hook context wiring', () => {
     expect(cliSource).toContain('?? turnReplyTarget?.senderOpenId');
     expect(cliSource).toContain('hasQuoteTargetSender: !!replyTargetSenderOpenId');
     expect(cliSource).toMatch(/mentions\.push\(\{ open_id: replyTargetSenderOpenId, name: '' \}\)/);
+  });
+
+  it('lets explicit recipients replace the implicit reply target in quote and footer routing', () => {
+    expect(cliSource).toContain('shouldSuppressImplicitReplyTarget({');
+    expect(cliSource).toContain('if (suppressImplicitReplyTarget) effectiveQuoteTargetId = undefined');
+    expect(cliSource).toContain('hasExplicitMention: mentions.length > 0');
   });
 
   it('gates the legacy global quote-sender fallback on NO currentTurnId — an exact-turn miss never borrows the advanced global slot (#750 cross-turn guard)', () => {
@@ -482,6 +488,12 @@ describe('cmdSend hook context wiring', () => {
 
   it('rejects a trusted host re-exec when its authorized Codex App ledger was already settled', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-send-host-ledger-gone-'));
+    const channelId = 'ef'.repeat(32);
+    ensureManagedOriginAttestationDirectory(dataDir, 'session', channelId);
+    replaceManagedOriginCapabilityFile(
+      managedOriginCapabilityPath(dataDir, 'session', channelId),
+      JSON.stringify({ sessionId: 'session', channelId, capability: 'cd'.repeat(32) }),
+    );
     seedPersistedSessionRows(dataDir, 'app-a', {
       session: {
         sessionId: 'session', chatId: 'oc_chat', rootMessageId: 'om_root',
@@ -493,21 +505,62 @@ describe('cmdSend hook context wiring', () => {
       const result = await runCli(
         ['send', 'must not downgrade', '--session-id', 'session', '--no-mention'],
         {
-          ...process.env,
-          SESSION_DATA_DIR: dataDir,
-          BOTMUX_SESSION_ID: 'session',
-          BOTMUX_TURN_ID: 'turn-settled',
-          BOTMUX_DISPATCH_ATTEMPT: '4',
-          BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+          ...buildRelayHostEnv({
+            ...process.env,
+            SESSION_DATA_DIR: dataDir,
+            BOTMUX_SESSION_ID: 'session',
+            BOTMUX_TURN_ID: 'turn-settled',
+            BOTMUX_ORIGIN_CHANNEL_ID: channelId,
+            BOTMUX_DISPATCH_ATTEMPT: '4',
+            BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+            BOTMUX_SEND_RELAY: '',
+            BOTMUX_WORKFLOW: '',
+            BOTMUX_LARK_APP_ID: '', BOTMUX_LARK_APP_SECRET: '',
+          }),
+          // startOutboxWatcher applies this only after authorize succeeds.
           BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER: '1',
-          BOTMUX_SEND_RELAY: '',
-          BOTMUX_WORKFLOW: '',
-          BOTMUX_LARK_APP_ID: '', BOTMUX_LARK_APP_SECRET: '',
         },
       );
       expect(result.code).toBe(2);
       expect(result.stderr).toContain('authorized Codex App origin session/turn-settled is no longer unsettled');
       expect(result.stderr).not.toContain('must not downgrade');
+    } finally {
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    { name: 'a matching numeric parent with a pane origin channel', workerPid: process.pid, readIsolated: '' },
+    { name: 'a different worker parent', workerPid: process.pid + 1, readIsolated: '' },
+    { name: 'an explicitly isolated child', workerPid: process.pid, readIsolated: '1' },
+  ])('does not accept a host relay flag from $name', async ({ workerPid, readIsolated }) => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-send-host-parent-'));
+    try {
+      const channelId = 'fe'.repeat(32);
+      ensureManagedOriginAttestationDirectory(dataDir, 'session', channelId);
+      seedPersistedSessionRows(dataDir, 'app-a', {
+        session: {
+          sessionId: 'session', chatId: 'oc_chat', rootMessageId: 'om_root',
+          title: 'isolated', status: 'active', createdAt: new Date(0).toISOString(),
+          larkAppId: 'app-a', cliId: 'codex', pid: workerPid,
+        },
+      });
+      const result = await runCli(
+        ['send', 'must not send', '--session-id', 'session', '--no-mention'],
+        {
+          ...process.env,
+          SESSION_DATA_DIR: dataDir,
+          BOTMUX_SESSION_ID: 'session',
+          BOTMUX_ORIGIN_CHANNEL_ID: channelId,
+          BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+          BOTMUX_SEND_RELAY: '',
+          BOTMUX_READ_ISOLATED: readIsolated,
+          BOTMUX_WORKFLOW: '',
+          BOTMUX_LARK_APP_ID: '', BOTMUX_LARK_APP_SECRET: '',
+        },
+      );
+      expect(result.code).toBe(2);
+      expect(result.stderr).toContain('read-isolated owning data-root locator is missing or ambiguous');
     } finally {
       rmSync(dataDir, { recursive: true, force: true });
     }
@@ -523,7 +576,7 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend.indexOf('const exactOriginDispatch = (() => {'))
       .toBeLessThan(cmdSend.indexOf("const { synthesizeVoiceOpus }"));
     expect(cmdSend.indexOf("exactOriginDispatch?.deliverySink === 'http_wait'"))
-      .toBeLessThan(cmdSend.indexOf("const { sendMessage, replyMessage, uploadImage, uploadFile"));
+      .toBeLessThan(cmdSend.indexOf("const { sendMessage, replyMessage"));
   });
 
   it('validates the exact document text path before reading content or invoking TTS/uploads', () => {
@@ -564,6 +617,62 @@ describe('cmdSend hook context wiring', () => {
     expect(docSend).not.toMatch(/delete\s+exactDocSession\.docCommentTargets/);
   });
 
+  it('checkpoints document comment chunks before each non-idempotent provider call', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    const docSendStart = cmdSend.indexOf('if (isOriginDocCommentTurn)', cmdSend.indexOf('// Read content from:'));
+    const mentionParsing = cmdSend.indexOf('// Parse mentions:', docSendStart);
+    const docSend = cmdSend.slice(docSendStart, mentionParsing);
+
+    expect(docSend).toContain('executeNonIdempotentSequence(');
+    expect(docSend).not.toMatch(/executeTurnPrimary\([\s\S]*?for \(let i = 0; i < chunks\.length; i\+\+\)/);
+    expect(docSend.indexOf('removeCommentReaction(')).toBeGreaterThan(docSend.indexOf('executeNonIdempotentSequence('));
+  });
+
+  it('rejects a non-final document-comment reply with actionable guidance before provider effects', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-doc-comment-final-only-'));
+    const dataDir = join(root, 'data');
+    const sessionId = 'sid_doc_comment_final_only';
+    const turnId = 'turn_doc_comment_final_only';
+    mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+    writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
+      sessionId, turnId,
+    }));
+    writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+      larkAppId: 'cli_test', larkAppSecret: 'test-secret', cliId: 'codex', replyCardMode: 'legacy',
+    }]));
+    seedPersistedSessionRows(dataDir, 'cli_test', { [sessionId]: {
+      sessionId, status: 'active', cliId: 'codex', larkAppId: 'cli_test',
+      chatId: 'doc:doc_test', rootMessageId: 'om_root', scope: 'thread', workingDir: root,
+      docCommentTargets: { [turnId]: {
+        fileToken: 'doc_test', fileType: 'docx', commentId: 'comment_test', turnId,
+      } },
+    } });
+    try {
+      const result = await runCli(
+        ['send', '--no-mention', '--response-kind', 'progress', 'interim comment'],
+        {
+          ...process.env,
+          HOME: root,
+          SESSION_DATA_DIR: dataDir,
+          BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: sessionId,
+          BOTMUX_LARK_APP_ID: 'cli_test',
+          BOTMUX_HOST_RELAY_AUTHORIZED: '',
+          BOTMUX_SEND_RELAY: '',
+          BOTMUX_WORKFLOW: '',
+        },
+      );
+      expect(result.code).toBe(2);
+      expect(result.stderr).toContain('文档评论轮只允许一条 final 回复，请使用 --response-kind final');
+      expect(result.stderr).not.toContain('Non-idempotent delivery sequences require a final response');
+      expect(result.stderr).not.toContain('Unexpected test');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('gates --mention-back by turn-window participant ambiguity (no group-stats round-trip)', () => {
     // 2+ distinct counterparts OR an incomplete window → block --mention-back and
     // hand the model explicit --mention candidates. Reads the persisted
@@ -592,7 +701,7 @@ describe('cmdSend hook context wiring', () => {
     );
     expect(cmdSend).toMatch(/const dispatch = async \([^)]*\): Promise<string> => \{[\s\S]*?dispatchAfterOriginGate\(/);
     expect(cmdSend).toMatch(
-      /const dispatchPrimary = async \([^)]*\): Promise<string> => \{\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*revalidateVcMeetingManagedSend\(\);/,
+      /const dispatchPrimaryUnlocked = async \([^)]*\): Promise<string> => \{\s*\/\/[^\n]*\n\s*\/\/[^\n]*\n\s*revalidateVcMeetingManagedSend\(\);/,
     );
     expect(cmdSend).toContain('recordVcMeetingPrimaryOutput(result.messageId, canonicalOutput.targetChatId);');
     expect(cmdSend.indexOf('recordVcMeetingPrimaryOutput(result.messageId'))
@@ -607,7 +716,7 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('if (!noMention && !isSlashSend && !vcMeetingManagedSendOrigin)');
     expect(cmdSend).toContain('if (!sendTopLevel && !vcMeetingManagedSendOrigin)');
     expect(cmdSend.indexOf('const managedPayloadError = managedVcSendPayloadError({'))
-      .toBeLessThan(cmdSend.indexOf("const { sendMessage, replyMessage, uploadImage, uploadFile"));
+      .toBeLessThan(cmdSend.indexOf("const { sendMessage, replyMessage"));
     expect(cmdSend.indexOf('const managedPayloadError = managedVcSendPayloadError({'))
       .toBeLessThan(cmdSend.indexOf("const { synthesizeVoiceOpus }"));
     expect(cmdSend.indexOf('const managedRenderedPayloadError = managedVcSendPayloadError({'))
@@ -618,7 +727,11 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain('const managedCustomCardError = managedVcCustomCardError(');
     expect(cmdSend).toMatch(/sessionQuoteTargetId: vcMeetingDeliveryReplyOrigin\s*\? undefined/);
     expect(cmdSend).toContain('const prepared = prepareVcMeetingListenerReply(proposedOutput);');
-    expect(cmdSend).toMatch(/canonicalOutput\.msgType,[\s\S]*?prepared\?\.providerKey/);
+    expect(cmdSend).toContain('const deliveryUuid = prepared?.providerKey ?? providerUuid;');
+    expect(cmdSend).toContain('voicePrimaryOutputChatId = canonicalOutput.targetChatId;');
+    expect(cmdSend).toContain('recordVcMeetingPrimaryOutput(messageId, voicePrimaryOutputChatId);');
+    expect(cmdSend).not.toContain('recordVcMeetingPrimaryOutput(messageId, targetChatId);');
+    expect(cmdSend).toMatch(/canonicalOutput\.msgType,[\s\S]*?deliveryUuid/);
     expect(cmdSend).toContain('...(prepared ? { suppressHook: true } : {})');
     expect(cmdSend).toContain('const managedProviderOptions = outboundMessageOptions(!!prepared);');
     expect(cmdSend).toContain('...(vcMeetingManagedSendOrigin ? { maxMessages: 1 } : {})');
@@ -631,7 +744,8 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).toContain("const responseKindOccurrences = rest.filter(token => token === '--response-kind' || token.startsWith('--response-kind=')).length");
     expect(cmdSend).toContain("responseKindOccurrences > 1");
     expect(cmdSend).toContain("flagPresentButValueMissing(rest, '--response-kind')");
-    expect(cmdSend).toContain("const effectiveResponseKind = responseKind ?? 'progress'");
+    expect(cmdSend).toMatch(/let effectiveResponseKind(?:: TurnSendKind)? = responseKind \?\? 'progress'/);
+    expect(cmdSend).toContain("if (responseKind === undefined) effectiveResponseKind = 'final'");
     expect(cmdSend).not.toContain('启用最终回答反馈后，必须显式指定 --response-kind progress|final');
     expect(cmdSend).toContain('无法确认本次提问者身份，不能发送带反馈控件的最终回答');
     // The requester-identity gate is scoped to the `requester` audience only.
@@ -649,12 +763,37 @@ describe('cmdSend hook context wiring', () => {
     expect(cmdSend).not.toContain('const deliveryTurnId = `send:${messageId}`');
     expect(cmdSend).not.toContain('--feedback-level');
     const primarySend = cmdSend.indexOf('messageId = await dispatchPrimary');
-    const feedbackIndex = cmdSend.indexOf('feedback indexing failed after delivery');
+    const deliveryIndex = cmdSend.indexOf('turn delivery indexing failed after delivery');
     expect(primarySend).toBeGreaterThanOrEqual(0);
-    expect(feedbackIndex).toBeGreaterThan(primarySend);
-    expect(cmdSend.slice(cmdSend.lastIndexOf('try {', feedbackIndex), feedbackIndex)).toContain('getSkillFeedbackStore');
-    expect(cmdSend).toContain('policy: feedbackPolicy');
-    expect(cmdSend).toContain('baseCard: feedbackBaseCard');
+    // The delivery record is written AFTER the message is actually sent.
+    expect(deliveryIndex).toBeGreaterThan(primarySend);
+    expect(cmdSend.slice(cmdSend.lastIndexOf('try {', deliveryIndex), deliveryIndex)).toContain('getSkillFeedbackStore');
+    // Turn-completion recording is gated on the response KIND, not on the
+    // feedback policy — feedback off must still produce a correlatable record.
+    expect(cmdSend).toContain("if (effectiveResponseKind === 'final' && !customCard && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
+    const oncallIndex = cmdSend.indexOf('recordOncallGroupDelivery(resolveDataDir()');
+    const completionIndex = cmdSend.indexOf("if (effectiveResponseKind === 'final' && !customCard && !pureFileSend && !pureVideoSend && !vcMeetingManagedSendOrigin && messageId)");
+    expect(oncallIndex).toBeGreaterThan(primarySend);
+    expect(oncallIndex).toBeLessThan(completionIndex);
+    // The feedback control (policy + card snapshot) rides along only when a
+    // policy actually applies; the record itself is unconditional.
+    expect(cmdSend).toContain('const carriesFeedbackControl = !!feedbackPolicy;');
+    expect(cmdSend).toContain("cardMode: carriesFeedbackControl ? 'feedback' : 'card'");
+    expect(cmdSend).toContain('...(carriesFeedbackControl ? { policy: feedbackPolicy } : {})');
+    expect(cmdSend).toContain('...(carriesFeedbackControl && feedbackBaseCard ? { baseCard: feedbackBaseCard } : {})');
     expect(cmdSend).toContain('buildFeedbackElement(feedbackPolicy)');
+  });
+
+  it('returns after a concurrent final replay before any post-primary side effects', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    const replayReturn = cmdSend.indexOf('if (turnPrimaryReplayed) {');
+    const oncallDelivery = cmdSend.indexOf('if (oncallGroupCard && messageId)');
+
+    expect(replayReturn).toBeGreaterThan(cmdSend.indexOf('messageId = await dispatchPrimary'));
+    expect(replayReturn).toBeLessThan(oncallDelivery);
+    expect(cmdSend.slice(replayReturn, oncallDelivery)).toContain('replayed: true');
+    expect(cmdSend.slice(replayReturn, oncallDelivery)).toContain('return;');
   });
 });

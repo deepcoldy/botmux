@@ -42,6 +42,7 @@ vi.mock('../src/im/lark/client.js', () => ({
 }));
 
 vi.mock('../src/im/lark/card-builder.js', () => ({
+  STREAMING_CARD_PATCH_VERSION: '1',
   // 8th positional arg is now `displayMode: 'hidden' | 'screenshot'` (4ed74e3
   // migrated cards from `expanded:boolean` to a tri-mode enum). The mock
   // surfaces it as `displayMode` so assertions can inspect the queued/sent
@@ -50,16 +51,19 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
     displayMode: args[7] ?? 'hidden',
     content: args[4],
     status: args[5],
-    silentIdle: args[19] === true,
+    silentIdle: args[19] === true || args[19] === 'silent',
   })),
   buildSessionCard: vi.fn(() => '{}'),
   getCliDisplayName: vi.fn(() => 'Claude'),
+  frozenIdleLabel: vi.fn((card: { idleLabel?: string; silentIdle?: boolean }) =>
+    card.idleLabel ?? (card.silentIdle ? 'silent' : undefined)),
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
   getBot: vi.fn(() => ({
     config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
     resolvedAllowedUsers: [],
+    resolvedBlockedUsers: [],
     botOpenId: 'ou_bot',
   })),
   getAllBots: vi.fn(() => []),
@@ -163,7 +167,14 @@ function makeDaemonSession(overrides?: Partial<DaemonSession>): DaemonSession {
 
 function makeToggleAction(cardNonce?: string, openMessageId?: string) {
   return {
-    action: { value: { action: 'toggle_stream', root_id: ROOT_ID, ...(cardNonce ? { card_nonce: cardNonce } : {}) } },
+    action: {
+      value: {
+        action: 'toggle_stream',
+        root_id: ROOT_ID,
+        stream_card_version: '1',
+        ...(cardNonce ? { card_nonce: cardNonce } : {}),
+      },
+    },
     operator: { open_id: 'ou_user' },
     ...(openMessageId ? { context: { open_message_id: openMessageId } } : {}),
   };

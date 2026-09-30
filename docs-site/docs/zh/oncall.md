@@ -2,6 +2,8 @@
 
 把机器人拉进 oncall / 值班 / 报警群，绑定一个项目目录后，群里**任何成员**都能 @ 机器人提问，无需选仓库、无需开新会话——直接进入这个项目目录开聊。特别适合值班群、报警群、跨团队答疑这类「很多人、随时问、都问同一个项目」的场景。
 
+> **拉群本身不等于授权**：bot 被拉进群不会自动放开对话权。群里任何人即问即答是 **oncall 绑定生效之后**才有的效果（或用裸 `/grant` 整群放开）；没绑 oncall、也没授权的限制态 bot，非名单成员 @ 它会被拦并触发授权申请卡。详见[权限与授权 · 入群不等于授权](/permissions#入群不等于授权)。
+
 ## 开启方式（三选一）
 
 可以**按群**单独开，也可以在 **Bot 配置里设默认**让所有群自动开。
@@ -14,7 +16,7 @@
 /oncall bind ~/projects/your-service
 ```
 
-把**当前 bot** 在本群锚定到该目录，发起人自动成为 owner。绑定**按 bot 计**——只影响这个 bot；多个 bot 一起绑用 `@bot1 @bot2 /oncall bind <path>`。适合临时拉个群就想立刻用。
+把**当前 bot** 在本群锚定到该目录。绑定**按 bot 计**——只影响这个 bot；多个 bot 一起绑用 `@bot1 @bot2 /oncall bind <path>`。需要操作权（owner / `allowedUsers`），适合临时拉个群就想立刻用。
 
 ### 方式二：按群开启（Dashboard）
 
@@ -43,14 +45,14 @@
 
 | 命令 | 说明 |
 |------|------|
-| `/oncall bind <path>` | 把当前 bot 在本群绑到某项目目录，发起人自动成为 owner（多 bot：`@bot1 @bot2 /oncall bind`） |
-| `/oncall unbind` | 解绑（仅 owner） |
+| `/oncall bind <path>` | 把当前 bot 在本群绑到某项目目录，需操作权（owner / `allowedUsers`；多 bot：`@bot1 @bot2 /oncall bind`） |
+| `/oncall unbind` | 解绑（需操作权） |
 | `/oncall status` | 查看当前绑定 |
 
 ## 权限分层
 
-- 群里**所有人**都能跟机器人对话（提问、查日志、读代码）
-- 只有 **owner** 能切换会话状态（`/cd`、`/restart`、`/close`、点流式卡片按钮）
+- oncall 绑定后，群里**所有人**都能跟机器人对话（提问、查日志、读代码），恒放行、不限额度
+- 只有 **owner / 管理员**（`allowedUsers`）能切换会话状态（`/cd`、`/restart`、`/close`、点流式卡片按钮）
 - 防止外部群成员误操作把会话搞乱
 
 > 想让半可信成员的**改动也不碰真实仓库**？开 [文件沙盒](/sandbox)——写操作全隔离、owner 审阅 diff 后才落盘。

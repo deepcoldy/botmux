@@ -1,3 +1,9 @@
+import {
+  WORKBENCH_SHELL_IMMERSIVE,
+  WORKBENCH_SHELL_PARAM,
+  type DashboardWorkbenchShell,
+} from '../../core/workbench-shell.js';
+
 export type DashboardClientShell = 'desktop' | 'mobile';
 
 const CLIENT_SHELL_PARAM = 'botmuxClientShell';
@@ -9,30 +15,71 @@ function normalizeClientShell(value: string | null): DashboardClientShell | null
     : null;
 }
 
+function normalizeWorkbenchShell(value: string | null): DashboardWorkbenchShell | null {
+  return value === WORKBENCH_SHELL_IMMERSIVE ? value : null;
+}
+
 /**
- * Upgrade a legacy hash-scoped shell marker into the durable URL query.
- * Returns the replacement URL, or null when no rewrite is needed/possible.
+ * Markers that must survive hash navigation. Both ride the hash on entry
+ * (login redirects strip the query, browsers keep the fragment) and get
+ * promoted into the durable URL query on boot by
+ * {@link canonicalDashboardClientShellUrl}.
+ */
+const DURABLE_SHELL_MARKERS: ReadonlyArray<{
+  param: string;
+  normalize: (value: string | null) => string | null;
+}> = [
+  { param: CLIENT_SHELL_PARAM, normalize: normalizeClientShell },
+  { param: WORKBENCH_SHELL_PARAM, normalize: normalizeWorkbenchShell },
+];
+
+/**
+ * Upgrade hash-scoped shell markers (client shell, immersive workbench) into
+ * the durable URL query. Returns the replacement URL, or null when no rewrite
+ * is needed/possible. A marker already present in the query is left alone.
  */
 export function canonicalDashboardClientShellUrl(href: string): string | null {
   try {
     const url = new URL(href);
-    if (normalizeClientShell(url.searchParams.get(CLIENT_SHELL_PARAM))) return null;
-
     const queryIndex = url.hash.indexOf('?');
     if (queryIndex < 0) return null;
-    const hashParams = new URLSearchParams(url.hash.slice(queryIndex + 1));
-    const shell = normalizeClientShell(hashParams.get(CLIENT_SHELL_PARAM));
-    if (!shell) return null;
-
     const hashPath = url.hash.slice(0, queryIndex) || '#/';
-    hashParams.delete(CLIENT_SHELL_PARAM);
+    const hashParams = new URLSearchParams(url.hash.slice(queryIndex + 1));
+
+    let moved = false;
+    for (const { param, normalize } of DURABLE_SHELL_MARKERS) {
+      if (normalize(url.searchParams.get(param))) continue;
+      const value = normalize(hashParams.get(param));
+      if (!value) continue;
+      hashParams.delete(param);
+      url.searchParams.set(param, value);
+      moved = true;
+    }
+    if (!moved) return null;
+
     const remainingHashQuery = hashParams.toString();
-    url.searchParams.set(CLIENT_SHELL_PARAM, shell);
     url.hash = remainingHashQuery ? `${hashPath}?${remainingHashQuery}` : hashPath;
     return url.toString();
   } catch {
     return null;
   }
+}
+
+/** Query-string form first (durable), hash form as the entry-time fallback. */
+function readDurableShellMarker<T extends string>(
+  param: string,
+  normalize: (value: string | null) => T | null,
+  search: string,
+  hash: string,
+): T | null {
+  const fromSearch = normalize(
+    new URLSearchParams(search.startsWith('?') ? search.slice(1) : search).get(param),
+  );
+  if (fromSearch) return fromSearch;
+
+  const queryIndex = hash.indexOf('?');
+  if (queryIndex < 0) return null;
+  return normalize(new URLSearchParams(hash.slice(queryIndex + 1)).get(param));
 }
 
 /**
@@ -46,17 +93,20 @@ export function readDashboardClientShell(
   search = typeof location === 'undefined' ? '' : location.search,
   hash = typeof location === 'undefined' ? '' : location.hash,
 ): DashboardClientShell | null {
-  const fromSearch = normalizeClientShell(
-    new URLSearchParams(search.startsWith('?') ? search.slice(1) : search)
-      .get(CLIENT_SHELL_PARAM),
-  );
-  if (fromSearch) return fromSearch;
+  return readDurableShellMarker(CLIENT_SHELL_PARAM, normalizeClientShell, search, hash);
+}
 
-  const queryIndex = hash.indexOf('?');
-  if (queryIndex < 0) return null;
-  return normalizeClientShell(
-    new URLSearchParams(hash.slice(queryIndex + 1)).get(CLIENT_SHELL_PARAM),
-  );
+/**
+ * Detect the immersive (chrome-less) Workbench entry — `/workbench`,
+ * `/workbench-ticket/<ticket>` and the CLI / card links land here. Unlike the
+ * client shell it only decides the Workbench surface: navigation filtering and
+ * route redirects stay client-shell-only (see `core/workbench-shell.ts`).
+ */
+export function readDashboardWorkbenchShell(
+  search = typeof location === 'undefined' ? '' : location.search,
+  hash = typeof location === 'undefined' ? '' : location.hash,
+): DashboardWorkbenchShell | null {
+  return readDurableShellMarker(WORKBENCH_SHELL_PARAM, normalizeWorkbenchShell, search, hash);
 }
 
 /** Workflow is deliberately outside the Botmux Desktop/Mobile integration. */

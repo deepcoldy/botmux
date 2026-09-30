@@ -27,6 +27,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { compileToBwrap, type FsPolicy } from '../cli/fs-policy.js';
 import { CA_BUNDLE_ENV_KEYS, PROXY_ENV_KEYS } from '../../utils/child-env.js';
 import { isStandaloneBinary } from '../../core/self-spawn.js';
+import { linuxIsolationLaunch, linuxIsolationLaunchViaArgsFile } from '../../core/linux-isolation.js';
 import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
@@ -159,7 +160,7 @@ function probeBubblewrapCredentialMasks(): HostCredentialIsolationMechanismProbe
   if (probe.status !== 0) {
     return { supported: false, mechanism: null, reason: 'bubblewrap is unavailable' };
   }
-  const runtime = spawnSync(executable, [
+  const launch = linuxIsolationLaunch(executable, [
     '--bind', '/', '/',
     '--proc', '/proc',
     '--tmpfs', '/tmp',
@@ -171,7 +172,8 @@ function probeBubblewrapCredentialMasks(): HostCredentialIsolationMechanismProbe
     '--die-with-parent',
     '--new-session',
     '--', '/bin/true',
-  ], { stdio: 'ignore', timeout: 5_000 });
+  ]);
+  const runtime = spawnSync(launch.bin, launch.args, { stdio: 'ignore', timeout: 5_000 });
   if (runtime.status === 0) return { supported: true, mechanism: 'bwrap', executable };
   return {
     supported: false,
@@ -221,10 +223,7 @@ export function prepareCredentialOnlySandbox(input: {
   if (process.platform !== 'linux' || !ensureSandboxDeps()) return null;
   const probe = probeBubblewrapCredentialMasks();
   if (!probe.supported || probe.mechanism !== 'bwrap') return null;
-  return {
-    bin: probe.executable,
-    args: buildCredentialOnlySandboxArgs(input),
-  };
+  return linuxIsolationLaunch(probe.executable, buildCredentialOnlySandboxArgs(input));
 }
 
 /** Re-expose trusted executable directories hidden below the fresh /run tmpfs. */
@@ -294,7 +293,18 @@ export function botmuxShimExecLine(): string {
   if (isStandaloneBinary()) {
     return `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} "$@"\n`;
   }
-  return `#!/bin/sh\nexec node ${JSON.stringify(distCliJs())} "$@"\n`;
+  // Pin the interpreter to this daemon's own `process.execPath` rather than a bare
+  // `node`. In-sandbox PATH is `/run/sbxbin:<canonicalExecDirs>:<host PATH>`, and
+  // that host tail can resolve `node` to a DIFFERENT build than the daemon runs on.
+  // MEASURED (2026-09-08): `node dist/cli.js send --help` under Node v18.20.4 exits
+  // 1 from the session store's SQLite gate before printing anything, so an
+  // in-sandbox `botmux send` fails outright. Pinning also makes Bun work here:
+  // execPath is then the bun binary, which runs dist/*.js and has bun:sqlite.
+  //
+  // Safe inside bwrap: `dirname(realpath(process.execPath))` is always bound and
+  // prepended to the sandbox PATH (see canonicalExecDirs / pushExecDir below), so
+  // the pinned absolute path resolves for the child that actually runs this shim.
+  return `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(distCliJs())} "$@"\n`;
 }
 
 /**
@@ -571,6 +581,16 @@ function reclaimMaskMounts(sessionRoot: string): void {
   reclaimMaskEntries(entries);
 }
 
+/** Remove the known-empty mode-000 mask before recursive traversal. rmdir
+ * needs write permission on its parent, not read permission on the mask itself.
+ * Keep the mask mode unchanged and never follow a replacement symlink. */
+function removeSandboxTree(sessionRoot: string): void {
+  try {
+    if (lstatSync(sessionRoot).isDirectory()) rmdirSync(join(sessionRoot, 'empty'));
+  } catch { /* absent or replaced */ }
+  try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
+}
+
 /** Spawn-setup rollback: reclaim the mountpoints we pre-created FROM THE
  *  IN-MEMORY accumulator (NOT the manifest — on the failure paths the manifest
  *  may never have been written, so reading it back would reclaim nothing and
@@ -580,7 +600,7 @@ function reclaimMaskMounts(sessionRoot: string): void {
  *  itself fails). */
 function rollbackSandboxSetup(sessionRoot: string, createdMasks: MaskMountEntry[]): void {
   reclaimMaskEntries(createdMasks);
-  try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
+  removeSandboxTree(sessionRoot);
 }
 
 /** Create a mask mountpoint on the host (all missing ancestors too), pushing
@@ -631,10 +651,12 @@ export const __testOnly_maskMounts = {
 };
 
 export interface DirectSandboxSpawn {
-  /** Replace the CLI binary with this (always 'bwrap'). */
+  /** Replace the CLI binary with this (the bwrap isolation launcher). */
   bin: string;
-  /** bwrap args + '--' + original (bin, ...args). */
+  /** Isolation launcher + bwrap args + '--' + original (bin, ...args). */
   args: string[];
+  /** Private NUL-separated bwrap options file used by compact tmux launches. */
+  argsFile?: string;
   /** Env overrides to merge into childEnv (HOME, PATH, BOTMUX_SEND_RELAY, proxies). */
   env: Record<string, string>;
   /** Outbox dir the daemon watcher must service. */
@@ -677,11 +699,17 @@ export function prepareDirectSandbox(opts: {
    *  breaks) or a namespace the policy never anchored. Absent/empty →
    *  unset in the child (default store, matching the policy's default resolution). */
   larkCliDataDir?: string | null;
+  /** Keep the large bwrap option list out of tmux's command parser. */
+  useBwrapArgsFile?: boolean;
 }): DirectSandboxSpawn | null {
   if (process.platform !== 'linux') return null;
   if (!ensureSandboxDeps()) return null;
 
-  const sessionRoot = join(canonical(opts.dataDir), 'sandboxes', opts.sessionId);
+  // Validate marker support before creating any session files or deny masks.
+  const launch = linuxIsolationLaunch('bwrap', []);
+
+  const dataDir = canonical(opts.dataDir);
+  const sessionRoot = join(dataDir, 'sandboxes', opts.sessionId);
   const outbox = join(sessionRoot, 'outbox');
   const shimBin = join(sessionRoot, 'shimbin');
   const empties = join(sessionRoot, 'empties');
@@ -836,6 +864,10 @@ export function prepareDirectSandbox(opts: {
   pushExecDir(opts.cliBin);      // the CLI binary
   const env: Record<string, string> = {
     HOME: opts.home,
+    // The worker mounts canonical paths. A symlinked host HOME/data root is
+    // not recreated in bwrap's fresh root, so inherited lexical paths cannot
+    // locate the owning session store or its per-bot schedule directory.
+    SESSION_DATA_DIR: dataDir,
     BOTMUX_SEND_RELAY: outbox,
     PATH: ['/run/sbxbin', ...canonicalExecDirs, process.env.PATH ?? ''].filter(Boolean).join(':'),
   };
@@ -884,18 +916,30 @@ export function prepareDirectSandbox(opts: {
   // unresolvable path falls back to the lexical form (bwrap will fail-closed).
   let execBin = opts.cliBin;
   try { execBin = realpathSync(opts.cliBin); } catch { /* keep lexical; spawn fails closed */ }
-  args.push('--', execBin, ...opts.cliArgs);
+  const command = [execBin, ...opts.cliArgs];
+  let compactLaunch: ReturnType<typeof linuxIsolationLaunchViaArgsFile> | null = null;
+  try {
+    compactLaunch = opts.useBwrapArgsFile
+      ? linuxIsolationLaunchViaArgsFile('bwrap', args, command, sessionRoot)
+      : null;
+  } catch (error) {
+    rollbackSandboxSetup(sessionRoot, createdMasks);
+    throw error;
+  }
+  if (!compactLaunch) args.push('--', ...command);
 
   return {
-    bin: 'bwrap',
-    args,
+    bin: compactLaunch?.bin ?? launch.bin,
+    args: compactLaunch?.args ?? [...launch.args, ...args],
+    ...(compactLaunch ? { argsFile: compactLaunch.argsFile } : {}),
     env,
     outbox,
     cleanup: () => {
+      compactLaunch?.cleanup();
       // Reclaim empty deny-mask mountpoints we created on the host BEFORE
       // dropping the manifest with the rest of the tree.
       reclaimMaskMounts(sessionRoot);
-      try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
+      removeSandboxTree(sessionRoot);
     },
   };
 }
@@ -920,7 +964,7 @@ export function attachSandboxOutbox(opts: { sessionId: string; dataDir: string }
       // Reclaim empty deny-mask mountpoints we created on the host BEFORE
       // dropping the manifest with the rest of the tree.
       reclaimMaskMounts(sessionRoot);
-      try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
+      removeSandboxTree(sessionRoot);
     },
   };
 }
@@ -975,7 +1019,7 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
     // BEFORE removing the tree (which holds the manifest). Only runs once we've
     // confirmed no live bwrap references the sid (liveSandboxSids above).
     reclaimMaskMounts(sessionRoot);
-    try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
+    removeSandboxTree(sessionRoot);
   }
 }
 
@@ -1005,11 +1049,13 @@ export interface RelayRequest {
 // (--chat-id/--into/--top-level), and --session-id are NOT allowlisted:
 // content/attachments come from validated outbox files, and session-id is
 // forced by the worker.
-const RELAY_FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash']);
+const RELAY_FLAGS_NOVAL = new Set(['--mention-back', '--no-mention', '--no-quote', '--voice', '--slash', '--urgent']);
 const RELAY_FLAGS_VAL = new Set([
   '--mention',
   '--quote',
   '--response-kind',
+  '--expected-link',
+  '--as',
   '--layout',
   '--plugin-card-action',
 ]);
@@ -1109,6 +1155,7 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       flags.push(f, v); i++; continue;
     }
     if (RELAY_FLAGS_NOVAL.has(f)) { flags.push(f); continue; }
+    if (/^--urgent=(app|sms|phone)$/.test(f)) { flags.push(f); continue; }
     if (RELAY_FLAGS_VAL.has(f)) {
       const v = rawFlags[i + 1];
       if (typeof v !== 'string') return { ok: false, error: `flag ${f} needs a string value` };
@@ -1118,6 +1165,17 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       if (v.startsWith('--')) return { ok: false, error: `flag ${f} value must not be a flag` };
       if (f === '--response-kind' && !['progress', 'final', 'auxiliary'].includes(v)) {
         return { ok: false, error: 'flag --response-kind must be progress, final, or auxiliary' };
+      }
+      if (f === '--expected-link') {
+        if (v.length > 8192) return { ok: false, error: 'flag --expected-link must be an http(s) URL' };
+        let url: URL;
+        try { url = new URL(v); } catch { return { ok: false, error: 'flag --expected-link must be an http(s) URL' }; }
+        if (!['http:', 'https:'].includes(url.protocol)) {
+          return { ok: false, error: 'flag --expected-link must be an http(s) URL' };
+        }
+      }
+      if (f === '--as' && !['independent', 'suggestion'].includes(v)) {
+        return { ok: false, error: 'flag --as must be independent or suggestion' };
       }
       if (f === '--layout' && !['result', 'progress', 'risk', 'blocked', 'handoff'].includes(v)) {
         return { ok: false, error: 'flag --layout must be result, progress, risk, blocked, or handoff' };
@@ -1220,6 +1278,11 @@ export function buildRelayHostEnv(
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...baseEnv };
   delete env.BOTMUX_SEND_RELAY;
+  // This channel locates the pane's read-isolation proof, not the host
+  // watcher's origin. Carrying it across re-exec misclassifies the host child
+  // as isolated. Durable origin still comes from authorize below; do not add
+  // a cmdSend exemption based on child-mutable env or namespace-local PIDs.
+  delete env.BOTMUX_ORIGIN_CHANNEL_ID;
   delete env.BOTMUX_CARD_PREPARED_CONTENT_FILE;
   delete env.BOTMUX_HOST_RELAY_REQUIRES_CODEX_APP_LEDGER;
   if (preparedContentFile) {

@@ -1,12 +1,19 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  WORKBENCH_DOCK_IMMERSIVE_ENTRY,
+  WORKBENCH_IMMERSIVE_ENTRY,
+  WORKBENCH_IMMERSIVE_HASH,
+  immersiveWorkbenchHash,
+} from '../../src/core/workbench-shell.js';
+import {
   canonicalDashboardClientShellUrl,
   dashboardClientShellRedirect,
   dashboardShellAllowsWebTerminal,
   isWebTerminalDashboardHash,
   isWorkflowDashboardHash,
   readDashboardClientShell,
+  readDashboardWorkbenchShell,
 } from '../../src/dashboard/web/client-shell.js';
 
 describe('dashboard client shell', () => {
@@ -86,5 +93,50 @@ describe('dashboard client shell', () => {
       '?botmuxClientShell=desktop',
     )).toBeNull();
     expect(dashboardClientShellRedirect('#/monitor-room', '')).toBeNull();
+  });
+});
+
+describe('immersive workbench shell marker', () => {
+  it('pins the shared entry constants the server redirects to', () => {
+    expect(WORKBENCH_IMMERSIVE_HASH).toBe('#/agent-workbench?botmuxWorkbenchShell=immersive');
+    expect(WORKBENCH_IMMERSIVE_ENTRY).toBe('/#/agent-workbench?botmuxWorkbenchShell=immersive');
+    expect(WORKBENCH_DOCK_IMMERSIVE_ENTRY).toBe('/#/agent-workbench-dock?botmuxWorkbenchShell=immersive');
+    expect(immersiveWorkbenchHash('#/agent-workbench/s%2F1'))
+      .toBe('#/agent-workbench/s%2F1?botmuxWorkbenchShell=immersive');
+  });
+
+  it('reads the marker from the durable query and from the entry-time hash', () => {
+    expect(readDashboardWorkbenchShell('?botmuxWorkbenchShell=immersive', '#/agent-workbench'))
+      .toBe('immersive');
+    expect(readDashboardWorkbenchShell('', '#/agent-workbench?botmuxWorkbenchShell=immersive'))
+      .toBe('immersive');
+    expect(readDashboardWorkbenchShell('', '#/agent-workbench')).toBeNull();
+    expect(readDashboardWorkbenchShell('?botmuxWorkbenchShell=full', '#/agent-workbench')).toBeNull();
+  });
+
+  it('is not a client shell: navigation, terminals and redirects stay unrestricted', () => {
+    expect(readDashboardClientShell('?botmuxWorkbenchShell=immersive', '#/agent-workbench')).toBeNull();
+    expect(dashboardShellAllowsWebTerminal('?botmuxWorkbenchShell=immersive', '#/sessions')).toBe(true);
+    expect(dashboardClientShellRedirect('#/workflows/run-1', '?botmuxWorkbenchShell=immersive')).toBeNull();
+  });
+
+  it('canonicalizes the hash marker into the durable query, alone or beside the client shell', () => {
+    expect(canonicalDashboardClientShellUrl(
+      'https://botmux.example.test/#/agent-workbench?botmuxWorkbenchShell=immersive',
+    )).toBe(
+      'https://botmux.example.test/?botmuxWorkbenchShell=immersive#/agent-workbench',
+    );
+    expect(canonicalDashboardClientShellUrl(
+      'https://botmux.example.test/#/agent-workbench-dock?botmuxClientShell=desktop&botmuxWorkbenchShell=immersive',
+    )).toBe(
+      'https://botmux.example.test/?botmuxClientShell=desktop&botmuxWorkbenchShell=immersive#/agent-workbench-dock',
+    );
+    // 已经在查询串里的标记不重复搬运；hash 里没有任何可搬的标记时不改写。
+    expect(canonicalDashboardClientShellUrl(
+      'https://botmux.example.test/?botmuxWorkbenchShell=immersive#/agent-workbench/s%2F1',
+    )).toBeNull();
+    expect(canonicalDashboardClientShellUrl(
+      'https://botmux.example.test/#/agent-workbench?botmuxWorkbenchShell=full',
+    )).toBeNull();
   });
 });

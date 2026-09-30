@@ -63,6 +63,30 @@ function makeThrowingStub(msg = 'boom', exitCode?: number): () => Promise<AskRes
 // ── 测试 ───────────────────────────────────────────────────────────────────────
 
 describe('runHook', () => {
+  it('freezes the live turn and attempt across Ask reconnect retries', async () => {
+    const resolveOrigin = vi.fn(() => ({ turnId: 'om_current', dispatchAttempt: 3 }));
+    const requests: Record<string, unknown>[] = [];
+    const post = async (body: Record<string, unknown>): Promise<AskResult> => {
+      requests.push({ ...body });
+      if (requests.length === 1) {
+        resolveOrigin.mockReturnValue({ turnId: 'om_next', dispatchAttempt: 4 });
+        throw Object.assign(new Error('restarting'), { retryable: true });
+      }
+      return makeAnsweredStub([['继续']])();
+    };
+    await runHook(claudeAskPayload, FULL_ENV, post, 'claude-code', undefined, undefined, resolveOrigin);
+    expect(resolveOrigin).toHaveBeenCalledExactlyOnceWith(FULL_ENV.BOTMUX_SESSION_ID);
+    expect(requests).toHaveLength(2);
+    expect(requests[0]).toEqual(requests[1]);
+    expect(requests[0]).toMatchObject({ originTurnId: 'om_current', originDispatchAttempt: 3 });
+  });
+
+  it('does not bind an Ask to the stale turn inherited in CLI environment', async () => {
+    const post = vi.fn(async (_body: Record<string, unknown>) => makeAnsweredStub([['继续']])());
+    await runHook(claudeAskPayload, { ...FULL_ENV, BOTMUX_TURN_ID: 'om_old' }, post,
+      'claude-code', undefined, undefined, () => null);
+    expect(post.mock.calls[0]?.[0]).not.toHaveProperty('originTurnId');
+  });
   describe('(a) Claude AskUserQuestion + answered stub → stdout 含答案', () => {
     it('formatAnswer 结果写入 stdout', async () => {
       const stub = makeAnsweredStub([['继续']]);

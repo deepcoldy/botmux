@@ -116,7 +116,7 @@ describe('dashboard update and restart action', () => {
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 
-  it('flags bootstrap-required when the fleet predates the shutdown protocol', async () => {
+  it('treats a protocol-bootstrap 409 as a generic restart failure', async () => {
     const fetchImpl = vi.fn()
       .mockResolvedValueOnce(json(200, {
         ok: true,
@@ -127,7 +127,6 @@ describe('dashboard update and restart action', () => {
       .mockResolvedValueOnce(json(409, {
         ok: false,
         error: 'bootstrap_shutdown_protocol_required',
-        unsafeDaemons: ['botmux-local', 'botmux-relay'],
       }));
 
     await expect(updateAndRestartBotmux(fetchImpl)).resolves.toEqual({
@@ -135,11 +134,8 @@ describe('dashboard update and restart action', () => {
       newVersion: '3.1.0',
       changed: true,
       restarted: false,
-      bootstrapRequired: true,
-      unsafeDaemons: ['botmux-local', 'botmux-relay'],
+      restartError: 'bootstrap_shutdown_protocol_required',
     });
-    // Distinct from a generic restart failure: no restartError is surfaced,
-    // so the UI shows the actionable bootstrap message instead.
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
 

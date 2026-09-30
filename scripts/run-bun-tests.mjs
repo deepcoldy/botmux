@@ -162,6 +162,13 @@ const TEST_TIMEOUT_MS = 180_000;
 // the real failure count. The wall's job is to stop a wedged file from holding the leg
 // open, not to truncate a file that is legitimately reporting many slow failures.
 const FILE_WALL_MS = TEST_TIMEOUT_MS * 4;
+// bun test does not force-exit. A file that printed `(pass)` / `(fail)` and
+// then goes silent is almost always waiting on a leftover handle (fifo, child)
+// after the last case — test/tmux-startup-storm-recovery.test.ts sat in that
+// state until FILE_WALL (720s) on CI after both cases had already passed.
+// Idle is one per-test timeout so a quiet-but-still-running next case is not
+// cut short; it only fires when NOTHING has been printed for that long.
+const POST_RESULT_IDLE_MS = TEST_TIMEOUT_MS;
 
 const all = collectTestFiles(TEST_DIR).sort();
 
@@ -383,20 +390,38 @@ function runOne(file) {
     });
     liveChildren.set(child, scratch);
     let out = '';
-    const cap = chunk => { if (out.length < 200_000) out += chunk; };
+    let lastOutputAt = Date.now();
+    let sawResult = false;
+    const cap = chunk => {
+      const text = typeof chunk === 'string' ? chunk : chunk.toString();
+      if (out.length < 200_000) out += text;
+      lastOutputAt = Date.now();
+      if (!sawResult && /^\s*\((?:pass|fail)\)/m.test(text)) sawResult = true;
+    };
     child.stdout.on('data', cap);
     child.stderr.on('data', cap);
     // Recorded so the close handler can say the output was CUT rather than complete.
     let wallKilled = false;
+    let idleKilled = false;
     const wall = setTimeout(() => { wallKilled = true; killTree(child, 'SIGKILL'); }, FILE_WALL_MS);
+    const idle = setInterval(() => {
+      if (sawResult && Date.now() - lastOutputAt >= POST_RESULT_IDLE_MS) {
+        idleKilled = true;
+        wallKilled = true;
+        killTree(child, 'SIGKILL');
+      }
+    }, 5_000);
+    idle.unref?.();
     child.on('error', err => {
       clearTimeout(wall);
+      clearInterval(idle);
       liveChildren.delete(child);
       removeScratch(scratch);
       resolve({ file, ok: false, out: `failed to launch bun: ${err.message}` });
     });
     child.on('close', (code, signal) => {
       clearTimeout(wall);
+      clearInterval(idle);
       liveChildren.delete(child);
       // Sweep whatever is LEFT in the child's process group. A test that spawns a
       // grandchild and only kills the intermediate process leaves the grandchild
@@ -415,7 +440,9 @@ function runOne(file) {
         // output itself: a reader (or a future me) counting `FAIL` lines from a killed
         // file would otherwise report a number that is silently too small.
         const truncated = wallKilled
-          ? `\n[runner] OUTPUT TRUNCATED: killed by the ${FILE_WALL_MS}ms per-file wall. `
+          ? `\n[runner] OUTPUT TRUNCATED: killed by the ${idleKilled
+            ? `${POST_RESULT_IDLE_MS}ms post-result idle`
+            : `${FILE_WALL_MS}ms per-file wall`}. `
             + 'Any failure count from this file is a LOWER BOUND — the run did not finish. '
             + `Re-run this file alone (optionally with a smaller --timeout than ${TEST_TIMEOUT_MS}ms) `
             + 'to see the complete set.\n'

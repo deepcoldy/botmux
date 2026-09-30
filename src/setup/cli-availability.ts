@@ -1,12 +1,15 @@
 import { isAbsolute } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { locateOnPath, rawCliExecutable, resolveCommand } from '../adapters/cli/registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { parseWrapperCli } from './cli-selection.js';
+import type { CliLaunchMode } from '../core/cli-launch-mode.js';
 
 export interface CliAvailabilityInput {
   cliId: CliId;
   cliPathOverride?: string;
   wrapperCli?: string;
+  cliLaunchMode?: CliLaunchMode;
 }
 
 export interface CliAvailability {
@@ -27,6 +30,7 @@ export function hasAgentLaunchConfigChanged(
     after.cliId !== before.cliId
     || (after.cliPathOverride ?? '') !== (before.cliPathOverride ?? '')
     || (after.wrapperCli ?? '') !== (before.wrapperCli ?? '')
+    || (after.cliLaunchMode ?? '') !== (before.cliLaunchMode ?? '')
   );
 }
 
@@ -52,27 +56,7 @@ function requiredCommand(input: CliAvailabilityInput): string | undefined {
   return rawCliExecutable(input.cliId, input.cliPathOverride);
 }
 
-/**
- * Check launch availability with the same shell-aware resolution used by the
- * worker.  The fast PATH check avoids shell startup in the common case; the
- * fallback still finds nvm/fnm/rc-only installs and the macOS ChatGPT/Codex
- * desktop app binary.
- */
-export function checkCliAvailability(
-  input: CliAvailabilityInput,
-  opts: { shellFallback?: boolean } = {},
-): CliAvailability {
-  let command: string | undefined;
-  try {
-    command = requiredCommand(input);
-  } catch (err) {
-    return {
-      available: false,
-      localExecutableRequired: true,
-      reason: err instanceof Error ? err.message : String(err),
-    };
-  }
-
+function checkCommand(command: string | undefined, opts: { shellFallback?: boolean }): CliAvailability {
   if (!command) return { available: true, localExecutableRequired: false };
 
   const direct = locateOnPath(command);
@@ -95,6 +79,64 @@ export function checkCliAvailability(
     command,
     reason: `找不到可执行文件「${command}」（自查：${probe}）`,
   };
+}
+
+function forgeDoctorAvailable(forge: CliAvailability): CliAvailability {
+  try {
+    execFileSync(forge.resolvedPath ?? forge.command ?? 'forge', ['doctor'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 15_000,
+      maxBuffer: 2 * 1024 * 1024,
+    });
+    return forge;
+  } catch (err: any) {
+    const detail = String(err?.stderr ?? err?.stdout ?? err?.message ?? err).trim();
+    return {
+      ...forge,
+      available: false,
+      reason: `forge doctor 检查失败${detail ? `：${detail.slice(0, 500)}` : ''}`,
+    };
+  }
+}
+
+/**
+ * Check launch availability with the same shell-aware resolution used by the
+ * worker.  The fast PATH check avoids shell startup in the common case; the
+ * fallback still finds nvm/fnm/rc-only installs and the macOS ChatGPT/Codex
+ * desktop app binary.
+ */
+export function checkCliAvailability(
+  input: CliAvailabilityInput,
+  opts: { shellFallback?: boolean } = {},
+): CliAvailability {
+  if (input.cliLaunchMode === 'forge-traex') {
+    if (input.cliId !== 'traex') {
+      return {
+        available: false,
+        localExecutableRequired: true,
+        reason: 'Forge x TraeX 只能用于 cliId "traex"',
+      };
+    }
+    const traex = checkCommand(requiredCommand({ cliId: 'traex' }), opts);
+    if (!traex.available) return traex;
+    const forge = checkCommand('forge', opts);
+    if (!forge.available) return forge;
+    return opts.shellFallback === false ? forge : forgeDoctorAvailable(forge);
+  }
+
+  let command: string | undefined;
+  try {
+    command = requiredCommand(input);
+  } catch (err) {
+    return {
+      available: false,
+      localExecutableRequired: true,
+      reason: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  return checkCommand(command, opts);
 }
 
 export function cliUnavailableMessage(input: CliAvailabilityInput, displayName?: string): string | undefined {

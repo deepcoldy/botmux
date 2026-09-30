@@ -57,7 +57,7 @@ function adapterDefaultPassthrough(): Set<string> {
  */
 const PREROUTING_COMMANDS = new Set([
   '/reply-mode', '/substitute', '/grant', '/revoke', '/introduce',
-  '/summary', '/t', '/topic', '/workflow', '/template',
+  '/summary', '/t', '/topic', '/workflow', '/template', '/tabs', '/tab',
 ]);
 
 /** 命令在 markdown 里是否作为一个 token 出现(命令语法允许尾随 : _ - ,须全部排除以免 /mcp 误配 /mcp:server)。 */

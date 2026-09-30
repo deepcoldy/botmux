@@ -60,6 +60,35 @@ export type OutgoingMention = {
   name?: string;
 };
 
+export function loadBotMentionIdentityMap(
+  dataDir: string,
+  appId: string,
+): { botEntries: BotMentionEntry[]; crossRef: Record<string, string> } {
+  let botEntries: BotMentionEntry[] = [];
+  let crossRef: Record<string, string> = {};
+  try {
+    const botInfoPath = join(dataDir, 'bots-info.json');
+    const parsedBotEntries = existsSync(botInfoPath)
+      ? JSON.parse(readFileSync(botInfoPath, 'utf-8'))
+      : [];
+    botEntries = Array.isArray(parsedBotEntries)
+      ? parsedBotEntries.filter((entry): entry is BotMentionEntry =>
+          !!entry
+          && typeof entry === 'object'
+          && typeof entry.larkAppId === 'string'
+          && (entry.botName === null || typeof entry.botName === 'string'))
+      : [];
+    const crossRefPath = join(dataDir, `bot-openids-${appId}.json`);
+    const parsedCrossRef = existsSync(crossRefPath)
+      ? JSON.parse(readFileSync(crossRefPath, 'utf-8'))
+      : {};
+    crossRef = parsedCrossRef && typeof parsedCrossRef === 'object' && !Array.isArray(parsedCrossRef)
+      ? parsedCrossRef
+      : {};
+  } catch { /* best-effort identity map */ }
+  return { botEntries, crossRef };
+}
+
 function knownBotNames(entries: BotMentionEntry[], selfAppId?: string): Set<string> {
   const names = new Set<string>();
   for (const entry of entries) {
@@ -130,19 +159,18 @@ export function stripCodeSpans(text: string): string {
  * --mention-back / prose @Name and are rendered separately). It must not wake a
  * bot: bot-to-bot routing should be explicit in the message body/--mention.
  *
- * When the reply explicitly targets a known bot (a handoff), this default
- * owner-courtesy ping is redundant noise, so it is suppressed entirely
- * (`sendTo: undefined`). To also loop a human in on a handoff, the caller opts
- * in explicitly via --mention-back / --mention <owner>, which land in
- * `mentions[]` and render regardless of this function — i.e. owner-addressing
- * is opt-IN for handoffs, not opt-out. Without an explicit bot target the
- * default addressing (owner / oncall last-caller) is unchanged.
+ * When the reply has any explicit recipient, this default owner/caller ping is
+ * redundant noise, so it is suppressed entirely (`sendTo: undefined`). The
+ * chosen --mention / --mention-back recipients land in `mentions[]` and render
+ * regardless of this function. Without an explicit recipient the default
+ * addressing (owner / oncall last-caller) is unchanged.
  */
 export function buildFooterAddressing(
   s: { ownerOpenId?: string; lastCallerOpenId?: string; lastCallerIsBot?: boolean },
   opts: {
     isOncall: boolean;
     isSubstitute?: boolean;
+    hasExplicitMention?: boolean;
     hasExplicitBotMention?: boolean;
     knownBotOpenIds?: Set<string>;
   },
@@ -151,10 +179,13 @@ export function buildFooterAddressing(
   const botIds = opts.knownBotOpenIds ?? new Set<string>();
   const ownerHuman = owner && !botIds.has(owner) ? owner : undefined;
 
-  // Explicit bot handoff → drop the default owner/caller courtesy ping. The
-  // message is addressed to another bot; a human who should see it is added
-  // explicitly (--mention-back) and rides in mentions[], not here.
-  if (opts.hasExplicitBotMention) return { sendTo: undefined, cc: [] };
+  // Any explicit recipient selection owns the entire addressing decision. Do
+  // not silently append the turn's caller merely because this send is a reply.
+  // The selected recipients render through mentions[] below; --mention-back
+  // explicitly includes the caller there when that is actually intended.
+  if (opts.hasExplicitMention || opts.hasExplicitBotMention) {
+    return { sendTo: undefined, cc: [] };
+  }
 
   if (!opts.isOncall && !opts.isSubstitute) return { sendTo: ownerHuman, cc: [] };
 

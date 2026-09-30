@@ -317,6 +317,86 @@ describe('extractScheduleModifiers (combined keywords)', () => {
   });
 });
 
+describe('extractScheduleModifiers (dedicated task-topic keyword)', () => {
+  it('strips leading 独立话题 / 专属话题 and resolves the task position', () => {
+    expect(extractScheduleModifiers('独立话题 检查服务状态')).toEqual({
+      deliver: 'origin',
+      executionPosition: 'task',
+      silent: false,
+      prompt: '检查服务状态',
+    });
+    expect(extractScheduleModifiers('每次专属话题：生成日报')).toEqual({
+      deliver: 'origin',
+      executionPosition: 'task',
+      silent: false,
+      prompt: '生成日报',
+    });
+    expect(extractScheduleModifiers('每日独立的话题 跑构建')).toEqual({
+      deliver: 'origin',
+      executionPosition: 'task',
+      silent: false,
+      prompt: '跑构建',
+    });
+  });
+
+  it('accepts english dedicated/task/own topic wording and keeps deliver origin', () => {
+    expect(extractScheduleModifiers('dedicated topic: check the queue')).toEqual({
+      deliver: 'origin',
+      executionPosition: 'task',
+      silent: false,
+      prompt: 'check the queue',
+    });
+    expect(extractScheduleModifiers('task topic - run build')).toEqual({
+      deliver: 'origin',
+      executionPosition: 'task',
+      silent: false,
+      prompt: 'run build',
+    });
+    expect(extractScheduleModifiers('own topic: poll CI status')).toEqual({
+      deliver: 'origin',
+      executionPosition: 'task',
+      silent: false,
+      prompt: 'poll CI status',
+    });
+    expect(extractScheduleModifiers('every run in its own topic: send the digest')).toEqual({
+      deliver: 'origin',
+      executionPosition: 'task',
+      silent: false,
+      prompt: 'send the digest',
+    });
+  });
+
+  it('combines with silent in either order (task position supports silent lazy materialization)', () => {
+    const expected = {
+      deliver: 'origin' as const,
+      executionPosition: 'task' as const,
+      silent: true,
+      prompt: '检查服务',
+    };
+    expect(extractScheduleModifiers('静默 独立话题 检查服务')).toEqual(expected);
+    expect(extractScheduleModifiers('专属话题 静默 检查服务')).toEqual(expected);
+  });
+
+  it('does not confuse the new-topic keyword with the task keyword', () => {
+    expect(extractScheduleModifiers('新话题 生成日报').executionPosition).toBe('new-topic');
+    expect(extractScheduleModifiers('独立话题 生成日报').executionPosition).toBe('task');
+    // 独立新话题 matches neither leading pattern — prompt stays untouched.
+    expect(extractScheduleModifiers('独立新话题汇总')).toEqual({
+      deliver: 'origin',
+      silent: false,
+      prompt: '独立新话题汇总',
+    });
+  });
+
+  it('task keyword with nothing after it is a no-op (degenerate)', () => {
+    expect(extractScheduleModifiers('独立话题')).toEqual({
+      deliver: 'origin',
+      silent: false,
+      prompt: '独立话题',
+    });
+  });
+});
+
 describe('Prompt cleaning', () => {
   it('removes 给我 prefix', () => {
     expectParse('每天9:00 给我查看状态', '0 9 * * *', '查看状态');

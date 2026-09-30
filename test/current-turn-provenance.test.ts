@@ -244,6 +244,46 @@ describe('resolveCurrentTurnProvenance', () => {
       })).toThrow(/已被禁用/);
     });
 
+    it('authenticates the exact live turn after its one-shot task auto-completes', () => {
+      writeMarker('sess-1', SCHED_TURN_ID);
+      writeSession({ quoteTargetId: undefined, lastCallerOpenId: undefined });
+      writeScheduledTask({
+        enabled: false,
+        disabledReason: 'once_completed',
+        parsed: { kind: 'once', runAt: '2026-09-20T03:00:00.000Z', display: 'once' },
+      });
+
+      expect(resolveCurrentTurnProvenance({
+        dataDir,
+        envSessionId: 'sess-1',
+        startPid: process.pid,
+        isScheduledTurnLive: turnId => turnId === SCHED_TURN_ID,
+      })).toMatchObject({
+        turnId: SCHED_TURN_ID,
+        callerOpenId: 'ou_task_owner',
+      });
+    });
+
+    it('exposes task_disabled structurally when exact liveness is absent', () => {
+      writeMarker('sess-1', SCHED_TURN_ID);
+      writeSession({ quoteTargetId: undefined, lastCallerOpenId: undefined });
+      writeScheduledTask({
+        enabled: false,
+        disabledReason: 'once_completed',
+        parsed: { kind: 'once', runAt: '2026-09-20T03:00:00.000Z', display: 'once' },
+      });
+
+      try {
+        resolveCurrentTurnProvenance({
+          dataDir, envSessionId: 'sess-1', startPid: process.pid,
+        });
+        throw new Error('expected provenance rejection');
+      } catch (error) {
+        expect(error).toBeInstanceOf(CurrentTurnProvenanceError);
+        expect((error as CurrentTurnProvenanceError).scheduledTurnAuthError).toBe('task_disabled');
+      }
+    });
+
     it('rejects a scheduled turn bound to a different chat', () => {
       writeMarker('sess-1', SCHED_TURN_ID);
       writeSession({ quoteTargetId: undefined, lastCallerOpenId: undefined });

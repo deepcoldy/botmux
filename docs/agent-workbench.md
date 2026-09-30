@@ -84,10 +84,12 @@ botmux dashboard
 工作台: http://<lan-ip>:7891/workbench?t=<token>
 
 # 已绑定中心平台 —— 不带 token，身份由平台注入 + SSO 认
-工作台: https://m-<machineId>.<平台域名>/#/agent-workbench
+工作台: https://m-<machineId>.<平台域名>/#/agent-workbench?botmuxWorkbenchShell=immersive
 ```
 
-两种形态浏览器打开都直达工作台（带 token 的 `/workbench` 会 302 到 `/#/agent-workbench`；不带 token 的直接就是 hash 路由，因为 `/workbench` 在无凭证时会被门禁 401）。
+两种形态浏览器打开都直达工作台（带 token 的 `/workbench` 会 302 到 `/#/agent-workbench?botmuxWorkbenchShell=immersive`；不带 token 的直接就是 hash 路由，因为 `/workbench` 在无凭证时会被门禁 401）。
+
+hash 里的 `botmuxWorkbenchShell=immersive` 是**沉浸式标记**：带着它进来的工作台是一整屏的无边框壳（没有 Dashboard 的顶栏和侧栏），`/dashboard` 卡片的「打开工作台」按钮、`botmux dashboard` 打印的链接、常驻链接和短票兑换这些直达入口都落在这种形态；从 Dashboard 侧边栏「驾驶舱」点进去的 `#/agent-workbench` 不带标记，保持正常壳，方便继续在侧栏间切换。页面加载后标记会被提升进查询串（`/?botmuxWorkbenchShell=immersive#/agent-workbench`），之后选中会话切换 hash 也不会丢。
 
 绑定平台后链接不再带 token 是有意的：走平台子域时 `?t=` 会被服务端压制成无效，token 对访问毫无贡献、只剩被转发截图的泄漏风险。注意判据是「**是否由中心平台托管**」而非「有没有远程基址」——自建反代与 Devbox 短链没有人注入身份，token 仍是唯一凭证，对它们摘 token 会摘成死链。那条带 token 的本地直连兜底链接默认不打印，需要时按命令输出里提示的参数取回（该参数不进 `--help`，避免 AI 顺手带上）。怀疑链接泄露时可用 `botmux dashboard rotate` 轮换 token，旧链接与已发出的卡片按钮立即作废。
 
@@ -97,10 +99,11 @@ botmux dashboard
 
 | 地址 | 打开什么 |
 |---|---|
-| `https://<dashboard>/#/agent-workbench` | 完整工作台 |
+| `https://<dashboard>/#/agent-workbench` | 完整工作台（带 Dashboard 侧栏，与侧边栏「驾驶舱」一致） |
+| `https://<dashboard>/#/agent-workbench?botmuxWorkbenchShell=immersive` | 完整工作台，沉浸式无边框壳 |
 | `https://<dashboard>/#/agent-workbench/<会话id>` | 完整工作台并定位到某个会话 |
 | `https://<dashboard>/#/agent-workbench-dock` | 会话坞（侧边栏形态） |
-| `https://<dashboard>/workbench`、`/workbench/dock` | 同上两个入口的无 `#` 跳板（自动 302） |
+| `https://<dashboard>/workbench`、`/workbench/dock` | 同上两个入口的无 `#` 跳板（自动 302 到沉浸式形态） |
 
 ### 3.4 手机加桌（PWA）
 

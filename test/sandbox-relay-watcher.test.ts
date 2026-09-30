@@ -20,6 +20,37 @@ afterEach(() => {
 });
 
 describe('sandbox relay watcher host handoff', () => {
+  it('re-execs send on the host with every expected link preserved', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-relay-expected-link-'));
+    roots.push(root);
+    const outbox = join(root, 'outbox');
+    mkdirSync(outbox);
+    const fixture = join(root, 'send-echo.mjs');
+    writeFileSync(fixture, `process.stdout.write(JSON.stringify({ argv: process.argv.slice(2) }));`);
+    const id = 'expected-link-1';
+    const first = 'https://example.test/problem';
+    const second = 'https://example.test/problem';
+    writeFileSync(join(outbox, `${id}.content`), `${first}\n${second}`);
+    writeFileSync(join(outbox, `${id}.req.json`), JSON.stringify({
+      contentFile: `${id}.content`,
+      flags: ['--expected-link', first, '--expected-link', second, '--no-mention'],
+    }));
+    const stop = startOutboxWatcher(outbox, { ...process.env }, 'forced-source', { cliPath: fixture });
+    try {
+      const responsePath = join(outbox, `${id}.res.json`);
+      await vi.waitFor(() => expect(existsSync(responsePath)).toBe(true), { timeout: 5_000 });
+      const response = JSON.parse(readFileSync(responsePath, 'utf8')) as { code: number; stdout: string; stderr: string };
+      expect(response.code, response.stderr).toBe(0);
+      const child = JSON.parse(response.stdout) as { argv: string[] };
+      expect(child.argv).toEqual([
+        'send', '--expected-link', first, '--expected-link', second, '--no-mention',
+        '--content-file', expect.any(String), '--session-id', 'forced-source',
+      ]);
+    } finally {
+      stop();
+    }
+  });
+
   it('re-execs dispatch on the host with a forced source session and bounded routing', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-relay-dispatch-'));
     roots.push(root);
@@ -134,6 +165,7 @@ describe('sandbox relay watcher host handoff', () => {
         preparedPath,
         localLinkMode: process.env.BOTMUX_CARD_LOCAL_LINK_MODE,
         relayEnv: process.env.BOTMUX_SEND_RELAY ?? null,
+        originChannel: process.env.BOTMUX_ORIGIN_CHANNEL_ID ?? null,
         sessionId: value('--session-id'),
       }));
     `);
@@ -153,6 +185,7 @@ describe('sandbox relay watcher host handoff', () => {
     const stop = startOutboxWatcher(outbox, {
       ...process.env,
       BOTMUX_SEND_RELAY: outbox,
+      BOTMUX_ORIGIN_CHANNEL_ID: 'ab'.repeat(32),
       BOTMUX_CARD_PREPARED_CONTENT_FILE: '/untrusted/stale-prepared.md',
     }, 'forced-session', { cliPath: fixture });
 
@@ -176,6 +209,7 @@ describe('sandbox relay watcher host handoff', () => {
         preparedPath: string;
         localLinkMode: string;
         relayEnv: string | null;
+        originChannel: string | null;
         sessionId: string;
       };
 
@@ -186,6 +220,7 @@ describe('sandbox relay watcher host handoff', () => {
         selected: 'PREPARED',
         localLinkMode: 'disabled',
         relayEnv: null,
+        originChannel: null,
         sessionId: 'forced-session',
       });
       expect(dirname(child.rawPath)).toBe(join(root, 'relay-staging'));

@@ -62,6 +62,25 @@ describe.skipIf(!REAL_TMUX)('tmux startup storm recovery (real tmux, shimmed dea
     return env;
   };
 
+  // bun's execFileSync timeout defaults to SIGTERM. A wedged `tmux kill-server`
+  // (or kill-session) that ignores TERM is the same shape as the storm itself
+  // and held this file until the 720s per-file wall after both cases passed.
+  const forceKillTmux = (args: string[], env: NodeJS.ProcessEnv, timeout = 2_000): void => {
+    try {
+      execFileSync(REAL_TMUX!, args, {
+        stdio: 'ignore',
+        env,
+        timeout,
+        killSignal: 'SIGKILL',
+      });
+    } catch { /* already gone or deadline */ }
+  };
+
+  const disposeBackend = (backend: TmuxPipeBackend, sessionName: string): void => {
+    try { backend.destroySession(); } catch { try { backend.kill(); } catch { /* already torn down */ } }
+    forceKillTmux(['kill-session', '-t', sessionName], realTmuxEnv());
+  };
+
   beforeAll(() => {
     workDir = mkdtempSync(join(tmpdir(), 'bmx-storm-'));
     shimDir = join(workDir, 'shim');
@@ -83,9 +102,28 @@ describe.skipIf(!REAL_TMUX)('tmux startup storm recovery (real tmux, shimmed dea
       '  if [ ! -e "$MARKER" ]; then',
       '    : > "$MARKER"',
       '    "$REAL" "$@"',
-      '    trap "exit 0" TERM',
-      '    sleep 30 &',
-      '    wait $!',
+      // The holder MUST NOT inherit the caller's stderr pipe. `spawnSync` kills
+      // this shim at its 5s deadline, but the backgrounded child survives that
+      // (the TERM trap fires in the SHELL, not in the child), reparents to init
+      // and keeps the inherited fd open. MEASURED: without the redirect the
+      // orphan holds `fd 2 -> socket:[...]`; with it, `fd 2 -> /dev/null`.
+      //
+      // This is HYGIENE, not a fix for CI run 34570428914. That run was
+      // originally read here as "both cases passed, then an orphan fd held the
+      // process open" — the log says otherwise: exactly ONE `(pass)` line, so
+      // the SECOND case never completed. A `sleep 30` also cannot hold a 180s
+      // idle timer open. Measured under the runner's own spawn shape
+      // (`stdio: ['ignore','pipe','pipe']`, waiting on 'close'), with and
+      // without the redirect: exit→close delta is 1ms either way. So the
+      // orphan is real and worth not leaking, but the wedge's cause is still
+      // open — see that run's log before blaming this shim.
+      '    sleep 30 >/dev/null 2>&1 &',
+      '    SLEEP_PID=$!',
+      // Reap the holder on the deadline kill so no stray `sleep` outlives the
+      // run at all. The redirect above still covers the window before this trap
+      // is installed (and a SIGKILL, which runs no trap).
+      '    trap "kill $SLEEP_PID 2>/dev/null; exit 0" TERM',
+      '    wait $SLEEP_PID',
       '    exit 0',
       '  fi',
       'fi',
@@ -112,13 +150,7 @@ describe.skipIf(!REAL_TMUX)('tmux startup storm recovery (real tmux, shimmed dea
     // is being torn down and PATH is already restored) — strip before killing.
     delete killEnv.TMUX;
     delete killEnv.TMUX_PANE;
-    try {
-      execFileSync(REAL_TMUX!, ['kill-server'], {
-        stdio: 'ignore',
-        env: killEnv,
-        timeout: 5000,
-      });
-    } catch { /* server already gone */ }
+    forceKillTmux(['kill-server'], killEnv);
     rmSync(workDir, { recursive: true, force: true });
   });
 
@@ -155,14 +187,7 @@ describe.skipIf(!REAL_TMUX)('tmux startup storm recovery (real tmux, shimmed dea
       // otherwise keep the private server busy. destroySession also drops the
       // session. Under bun test a leftover fifo handle after the first case
       // wedged the whole file until the 720s per-file wall.
-      try { backend.destroySession(); } catch { backend.kill(); }
-      try {
-        execFileSync(REAL_TMUX!, ['kill-session', '-t', SESSION_NAME], {
-          stdio: 'ignore',
-          env: realTmuxEnv(),
-          timeout: 5000,
-        });
-      } catch { /* already gone */ }
+      disposeBackend(backend, SESSION_NAME);
     }
   }, 25_000);
 
@@ -178,12 +203,7 @@ describe.skipIf(!REAL_TMUX)('tmux startup storm recovery (real tmux, shimmed dea
     try {
       expect(Date.now() - startedAt).toBeLessThan(4000);
     } finally {
-      backend.kill();
-      try {
-        execFileSync(REAL_TMUX!, ['kill-session', '-t', 'bmx-stormrep2'], {
-          stdio: 'ignore', env: realTmuxEnv(), timeout: 5000,
-        });
-      } catch { /* already gone */ }
+      disposeBackend(backend, 'bmx-stormrep2');
     }
   }, 15_000);
 });

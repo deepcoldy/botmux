@@ -32,3 +32,95 @@ describe('Saved Workflow template binding policy', () => {
     }, ['chatId'])).not.toThrow();
   });
 });
+
+describe('Saved Workflow botmux-schedule ownerOpenId binding policy', () => {
+  const CONTEXT_REFS = ['larkAppId', 'chatId', 'chatType', 'initiatorOpenId'] as const;
+
+  function scheduleDag(ownerOpenIdInput: unknown, includeOwner: boolean) {
+    const input: Record<string, unknown> = {
+      name: 'daily',
+      schedule: '0 9 * * *',
+      prompt: 'run it',
+      workingDir: '/workspace',
+      larkAppId: { $ref: 'context.larkAppId' },
+      chatId: { $ref: 'context.chatId' },
+      chatType: { $ref: 'context.chatType' },
+    };
+    if (includeOwner) input.ownerOpenId = ownerOpenIdInput;
+    return {
+      nodes: [{
+        id: 's',
+        type: 'host' as const,
+        executor: 'botmux-schedule' as const,
+        input,
+        depends: [],
+        inputs: [],
+        humanGate: { prompt: 'Create this schedule?' },
+      }],
+    };
+  }
+
+  it('accepts the exact context.initiatorOpenId $ref when the context is declared', () => {
+    expect(() => assertSavedWorkflowTemplateBindings(
+      scheduleDag({ $ref: 'context.initiatorOpenId' }, true),
+      {},
+      CONTEXT_REFS,
+    )).not.toThrow();
+  });
+
+  it('accepts an omitted ownerOpenId (ownerless / cross-app templates)', () => {
+    expect(() => assertSavedWorkflowTemplateBindings(
+      scheduleDag(undefined, false),
+      {},
+      ['larkAppId', 'chatId', 'chatType'],
+    )).not.toThrow();
+  });
+
+  it('throws when context.initiatorOpenId is not declared in contextRefs', () => {
+    expect(() => assertSavedWorkflowTemplateBindings(
+      scheduleDag({ $ref: 'context.initiatorOpenId' }, true),
+      {},
+      ['larkAppId', 'chatId', 'chatType'],
+    )).toThrow(/undeclared context initiatorOpenId/);
+  });
+
+  it('rejects a literal ownerOpenId value', () => {
+    expect(() => assertSavedWorkflowTemplateBindings(
+      scheduleDag('ou_literal', true),
+      {},
+      CONTEXT_REFS,
+    )).toThrow(/input\.ownerOpenId must be exact/);
+  });
+
+  it('rejects a ${params.x} string marker for ownerOpenId', () => {
+    expect(() => assertSavedWorkflowTemplateBindings(
+      scheduleDag('${params.owner}', true),
+      { owner: { type: 'string', required: true } },
+      CONTEXT_REFS,
+    )).toThrow(/input\.ownerOpenId must be exact/);
+  });
+
+  it('rejects a params $ref object for ownerOpenId', () => {
+    expect(() => assertSavedWorkflowTemplateBindings(
+      scheduleDag({ $ref: 'params.owner' }, true),
+      { owner: { type: 'string', required: true } },
+      CONTEXT_REFS,
+    )).toThrow(/input\.ownerOpenId must be exact/);
+  });
+
+  it('rejects a cross-node result $ref for ownerOpenId', () => {
+    expect(() => assertSavedWorkflowTemplateBindings(
+      scheduleDag({ $ref: 'upstream.result.owner' }, true),
+      {},
+      CONTEXT_REFS,
+    )).toThrow(/input\.ownerOpenId must be exact/);
+  });
+
+  it('rejects an exact $ref with an extra key for ownerOpenId', () => {
+    expect(() => assertSavedWorkflowTemplateBindings(
+      scheduleDag({ $ref: 'context.initiatorOpenId', extra: 1 }, true),
+      {},
+      CONTEXT_REFS,
+    )).toThrow(/input\.ownerOpenId must be exact/);
+  });
+});

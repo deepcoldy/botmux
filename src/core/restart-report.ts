@@ -9,7 +9,7 @@
 import { githubAuthHeaders, type GithubAuthResolveOptions } from './github-auth.js';
 import type { RestartKind } from '../services/restart-intent-store.js';
 import { claimRestartIntentForReport } from '../services/restart-intent-store.js';
-import { countActiveSessionsOnDisk } from '../services/session-store.js';
+import { countActiveSessionsOnDisk, SessionStoreSqliteUnavailableError } from '../services/session-store.js';
 import { botmuxVersion } from '../utils/install-info.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
 
@@ -88,6 +88,8 @@ export interface RestartReportWiring {
   /** Local host:port direct fallback link (set only when dashboardUrl is a
    *  central-platform link). */
   dashboardLocalUrl?: string | undefined;
+  /** Missing preserves the legacy behavior (send intentional-restart DMs). */
+  notifyOnRestart?: boolean;
   /** Send the interactive card as a p2p DM to the owner. */
   sendCard: (openId: string, cardJson: string) => Promise<void>;
   githubAuth?: GithubAuthResolveOptions;
@@ -126,10 +128,20 @@ export async function sendRestartReportIfPending(w: RestartReportWiring): Promis
   }
   if (claim.state !== 'claimed') return;
   const intent = claim.intent;
+  if (w.notifyOnRestart === false) {
+    log(`restart-report suppressed by maintenance.notifyOnRestart=false (kind=${intent.kind})`);
+    return;
+  }
   if (!w.ownerOpenId) { log('restart-report: no owner configured — skipping DM'); return; }
 
   const locale = localeForBot(w.primaryLarkAppId);
-  const sessionCount = countActiveSessionsOnDisk();
+  let sessionCount = 0;
+  try {
+    sessionCount = countActiveSessionsOnDisk();
+  } catch (err) {
+    if (!(err instanceof SessionStoreSqliteUnavailableError)) throw err;
+    log(`restart-report: session store unreadable — ${err.message}`);
+  }
   const version = botmuxVersion();
   let changelog: string | undefined;
   if (intent.kind === 'update' && intent.newVersion) {

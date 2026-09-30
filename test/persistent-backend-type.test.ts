@@ -27,6 +27,8 @@ import {
   probePersistentBackendTarget,
   killPersistentSession,
   probePersistentSessions,
+  probePersistentBackendTargets,
+  persistentBackendTargetKey,
   resolvePersistentBackendTarget,
   resolvePairedSpawnBackendType,
   resolveSpawnBackendType,
@@ -183,6 +185,35 @@ describe('shutdownBackendDisposition (shutdown freeze-once)', () => {
 });
 
 describe('probePersistentSessions', () => {
+  it('keeps identical ZMX names separate by directory and batches each directory once', () => {
+    const probe = vi.spyOn(ZmxBackend, 'probeSessions').mockImplementation(env => ({
+      ok: true,
+      sessions: env?.ZMX_DIR === '/tmp/zmx-a' ? ['bmx-same'] : [],
+      unhealthySessions: [], raw: '',
+    }));
+    try {
+      const a = { backendType: 'zmx' as const, sessionName: 'bmx-same', socketDir: '/tmp/zmx-a' };
+      const b = { ...a, socketDir: '/tmp/zmx-b' };
+      const snapshot = probePersistentBackendTargets([a, b, a, { ...a, sessionName: 'bmx-other' }]);
+      expect(snapshot.get(persistentBackendTargetKey(a))).toBe('exists');
+      expect(snapshot.get(persistentBackendTargetKey(b))).toBe('missing');
+      expect(snapshot.size).toBe(3);
+      expect(probe).toHaveBeenCalledTimes(2);
+    } finally { probe.mockRestore(); }
+  });
+
+  it('uses the persisted directory for workerless teardown and retains the ownership fence', () => {
+    const kill = vi.spyOn(ZmxBackend, 'killManagedSession').mockImplementation(() => {});
+    const target = { backendType: 'zmx' as const, sessionName: 'bmx-owned', socketDir: '/tmp/created-zmx' };
+    try {
+      expect(() => killPersistentBackendTarget(target)).toThrow(/session id/);
+      expect(kill).not.toHaveBeenCalled();
+      killPersistentBackendTarget(target, 'complete-session-id');
+      expect(kill).toHaveBeenCalledWith('bmx-owned', 'complete-session-id', undefined,
+        expect.objectContaining({ ZMX_DIR: '/tmp/created-zmx' }));
+    } finally { kill.mockRestore(); }
+  });
+
   it('classifies all ZMX names from one full-list snapshot', () => {
     const probe = vi.spyOn(ZmxBackend, 'probeSessions').mockReturnValue({
       ok: true,

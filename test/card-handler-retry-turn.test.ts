@@ -104,6 +104,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   withActiveSessionKeyLock: vi.fn(async (_m: any, _k: string, action: () => any) => action()),
   buildStreamingCardJson: vi.fn(),
   silentIdleCardFlag: vi.fn(() => false),
+  idleCardLabel: vi.fn(() => undefined),
 }));
 
 const rememberLastCliInputMock = vi.fn();

@@ -70,6 +70,35 @@ describe('global dashboard config', () => {
     expect(readGlobalConfig().dashboard).toEqual({ chatBotDiscovery: false });
   });
 
+  it('reads a MiniMax voice engine configuration', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      voice: {
+        engine: 'minimax',
+        speaker: 'voice-id',
+        minimax: { apiKey: 'key', model: 'speech-2.8-hd', region: 'cn' },
+      },
+    }));
+    invalidateGlobalConfigCache();
+
+    expect(readGlobalConfig().voice).toEqual({
+      engine: 'minimax',
+      speaker: 'voice-id',
+      minimax: { apiKey: 'key', model: 'speech-2.8-hd', region: 'cn' },
+    });
+  });
+
+  it('sanitizes a mistyped MiniMax region instead of routing on it', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      voice: { engine: 'minimax', minimax: { apiKey: 'key', region: 'cnn' } },
+    }));
+    invalidateGlobalConfigCache();
+
+    // 'cnn' 既不是 'cn' 也不是 'global'：丢弃该字段（适配器兜底 global），
+    // 而不是把脏值原样保留、静默打到海外端点。
+    expect(readGlobalConfig().voice?.minimax).toEqual({ apiKey: 'key' });
+    expect(readGlobalConfig().voice?.minimax?.region).toBeUndefined();
+  });
+
   it('reads dashboard.noVisibleOutputHint as a boolean (on)', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       dashboard: { noVisibleOutputHint: true },
@@ -166,6 +195,7 @@ describe('global dashboard config', () => {
   it('validates worker memory policy and preserves future sibling keys on update', () => {
     writeFileSync(globalConfigPath(), JSON.stringify({
       worker: {
+        memoryAdmissionEnabled: false,
         minAvailableMemoryBytes: 4 * 1024 ** 3,
         maxMemoryFullAvg10: 15.5,
         sessionMemoryMaxBytes: 8 * 1024 ** 3,
@@ -173,6 +203,7 @@ describe('global dashboard config', () => {
       },
     }));
     expect(readGlobalConfig().worker).toEqual({
+      memoryAdmissionEnabled: false,
       minAvailableMemoryBytes: 4 * 1024 ** 3,
       maxMemoryFullAvg10: 15.5,
       sessionMemoryMaxBytes: 8 * 1024 ** 3,
@@ -181,6 +212,7 @@ describe('global dashboard config', () => {
     const raw = JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
     expect(raw.worker.futurePolicy).toEqual({ version: 2 });
     expect(readGlobalConfig().worker?.maxMemoryFullAvg10).toBe(25);
+    expect(readGlobalConfig().worker?.memoryAdmissionEnabled).toBe(false);
 
     clearWorkerConfig();
     const cleared = JSON.parse(readFileSync(globalConfigPath(), 'utf8'));
@@ -486,5 +518,61 @@ describe('global dashboard config', () => {
     expect(raw.dashboard.publicReadOnly).toBe(false);
     expect(raw.dashboard.openTerminalInFeishu).toBe(true);
     expect(raw.dashboard.localCliOpenMode).toBe('attach');
+  });
+});
+
+describe('global sessionCleanup config', () => {
+  let home: string;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'botmux-session-cleanup-config-'));
+    vi.stubEnv('HOME', home);
+    mkdirSync(dirname(globalConfigPath()), { recursive: true });
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('reads a full sessionCleanup block', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: true, olderThanHours: 72, intervalMinutes: 30 },
+    }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({
+      enabled: true, olderThanHours: 72, intervalMinutes: 30,
+    });
+  });
+
+  it('drops an unsupported olderThanHours but keeps the rest', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: true, olderThanHours: 12, intervalMinutes: 15 },
+    }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({ enabled: true, intervalMinutes: 15 });
+  });
+
+  it('drops a sub-floor intervalMinutes and floors a fractional one', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: true, intervalMinutes: 1 },
+    }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({ enabled: true });
+
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: true, intervalMinutes: 90.7 },
+    }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().sessionCleanup).toEqual({ enabled: true, intervalMinutes: 90 });
+  });
+
+  it('ignores a non-object sessionCleanup', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ sessionCleanup: 'nope' }));
+    expect(readGlobalConfig().sessionCleanup).toBeUndefined();
+  });
+
+  it('drops a non-boolean enabled', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      sessionCleanup: { enabled: 'yes', olderThanHours: 24 },
+    }));
+    expect(readGlobalConfig().sessionCleanup).toEqual({ olderThanHours: 24 });
   });
 });

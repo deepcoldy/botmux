@@ -26,6 +26,26 @@ describe('parseWrapperCliEntry', () => {
     expect(parseWrapperCliEntry(text)).toBe('/opt/botmux/dist/cli.js');
   });
 
+  it('parses the PINNED form the daemon now writes (quoted absolute node)', () => {
+    // Current shape: `exec "<abs interpreter>" "<abs>/dist/cli.js" "$@"`. Keying
+    // this parser off the interpreter NAME would return null here, and a null
+    // silently degrades `botmux update` to the running process's own root — which
+    // under switch:here can be a DIFFERENT worktree than the wrapper points at.
+    const text = '#!/bin/sh\nexec "/usr/local/bin/node" "/opt/botmux/dist/cli.js" "$@"\n';
+    expect(parseWrapperCliEntry(text)).toBe('/opt/botmux/dist/cli.js');
+  });
+
+  it('parses a BUN-pinned wrapper (bun hosts dist/*.js and has bun:sqlite)', () => {
+    const text = '#!/bin/sh\nexec "/home/u/.bun/bin/bun" "/opt/botmux/dist/cli.js" "$@"\n';
+    expect(parseWrapperCliEntry(text)).toBe('/opt/botmux/dist/cli.js');
+  });
+
+  it('still returns null for a standalone-binary wrapper (no cli.js argument)', () => {
+    // `exec "<binary>" "$@"` — there is no dist/cli.js to find, and inventing one
+    // would send `botmux update` at a checkout that may not exist.
+    expect(parseWrapperCliEntry('#!/bin/sh\nexec "/home/u/.botmux/bin/botmux" "$@"\n')).toBeNull();
+  });
+
   it('does not mistake the trailing "$@" for the path', () => {
     const text = 'exec node "/a/b/dist/cli.js" "$@"';
     expect(parseWrapperCliEntry(text)).toBe('/a/b/dist/cli.js');

@@ -1,4 +1,4 @@
-export type TriggerSourceType = 'webhook' | 'ui' | 'workflow' | 'schedule' | 'vc_meeting';
+export type TriggerSourceType = 'webhook' | 'ui' | 'workflow' | 'schedule' | 'vc_meeting' | 'headless';
 export type TriggerTargetKind = 'turn' | 'workflow';
 export type TriggerAction = 'queued' | 'delivered' | 'dry_run' | 'ignored' | 'completed';
 export type TriggerAsyncStatus = 'pending' | 'completed';
@@ -38,7 +38,13 @@ export interface TriggerRequest {
   /** Trusted presentation chosen by the connector owner. Undefined keeps the
    * localized default topic seed; null suppresses the seed entirely. */
   presentation?: {
+    /** Hide only this trigger's thinking bubble; business notices and HTTP results remain available. */
+    thinking?: 'hidden';
     topicMessage?: string | null;
+    title?: string;
+    /** Connector-owned handoff UI: replace the native live card only when this
+     * exact input is committed by the worker. Never driven by group messages. */
+    liveCard?: 'on-start';
   };
   options?: {
     dryRun?: boolean;
@@ -56,8 +62,9 @@ export interface TriggerRequest {
      *  /api/trigger appending to the same session with the same key resolves to
      *  the SAME turn instead of injecting a second time — so a lost HTTP response
      *  on an existing-session append can't double-run. Mutually exclusive with
-     *  `idempotencyKey`; only valid with `target.sessionId` + asyncReturnSessionId
-     *  (no wait/dryRun). Non-empty, ≤200 chars. */
+     *  `idempotencyKey`; requires `target.sessionId` (no wait/dryRun).
+     *  Ordinary turns keep Lark delivery; async turns keep HTTP polling.
+     *  Non-empty, ≤200 chars. */
     turnIdempotencyKey?: string;
     status?: 'firing' | 'resolved' | string;
     waitForFinalOutput?: boolean;
@@ -74,6 +81,31 @@ export interface TriggerRequest {
     /** Per-turn reasoning effort. Same
      *  fresh-spawn-only semantics as `model`. */
     reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+    /** Authorize in-flight STEER for this turn (codex-app native `turn/steer`).
+     *
+     * Best-effort by construction — admission is decided inside the live runner
+     * (active turn present, steering window open, CLI supports it), so trigger
+     * ACCEPTANCE never fails for steer alone:
+     *  - On a FRESH turn it marks the opening root steerable; without a steerable
+     *    root a later follow-up can only queue serially (codex canSteer contract
+     *    requires BOTH the root and the follow-up head authorized).
+     *  - On an existing-session follow-up with a live active codex-app turn, the
+     *    runner injects the message INTO the active turn via turn/steer instead of
+     *    queueing it behind the turn.
+     *  - When no steerable turn is active (idle / already closing / dormant
+     *    worker / a non-codex CLI), it degrades to an ordinary queued follow-up.
+     *    Other CLIs keep their usual type-ahead queue behaviour.
+     *
+     * Result attribution for a merged steer group: codex emits ONE merged final
+     * for the group. The LAST accepted steer (the newest triggerId) owns that
+     * real final; every earlier member completes with the SAME content (no
+     * usage) once the group's real final lands, so polling any member's
+     * trigger-result resolves with the merged answer.
+     *
+     * Security posture is unchanged: POST /api/trigger is already the
+     * drive-my-own-turn surface (core-only loopback); steer authorizes mid-turn
+     * injection into the SAME tenant's turn, never a cross-session capability. */
+    steer?: boolean;
   };
 }
 
@@ -99,14 +131,15 @@ export type TriggerErrorCode =
   | 'no_output'
   | 'workflow_trigger_not_implemented';
 
-/** Four-state async lifecycle for `GET /api/sessions/:id/trigger-result`.
+/** Async lifecycle for `GET /api/sessions/:id/trigger-result`.
  *  Programmatic callers (task runners) branch on this instead of ok/action:
  *  - running:   turn still in flight — keep polling
  *  - completed: final output captured (see output.content)
  *  - failed:    session terminated without a captured output (soft terminal —
  *               may be a genuine failure OR a caller-initiated close/cancel)
+ *  - interrupted: caller stopped this exact turn; its session remains usable
  *  - not_found: no session record on disk (never existed / invalid id) */
-export type AsyncTriggerState = 'running' | 'completed' | 'failed' | 'not_found';
+export type AsyncTriggerState = 'running' | 'completed' | 'failed' | 'interrupted' | 'not_found';
 
 export interface TriggerResponse {
   ok: boolean;
@@ -153,6 +186,11 @@ export interface TriggerResponse {
   /** Echo of the caller's `options.turnIdempotencyKey`, when one was supplied
    *  (follow-up async turn on an existing session). */
   turnIdempotencyKey?: string;
+  /** Echo of `options.steer === true` on a request that was accepted for
+   *  dispatch. Actual native admission is best-effort inside the runner (see the
+   *  option's contract); this only confirms the daemon carried the
+   *  authorization, not that a turn/steer RPC has already been accepted. */
+  steer?: true;
   /** Inbound-webhook duplicate-delivery suppression outcome (webhook edge only;
    *  unrelated to the daemon-side `idempotencyKey` lease above).
    *  - `accepted`  — first delivery under this key; it was dispatched.
@@ -203,10 +241,16 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   // different runtime branch — which, for an idempotency turn, could skip the
   // reserved→attempting barrier and break at-most-once. Reject non-booleans so
   // the two layers can never diverge (codex #776 round-4).
-  for (const flag of ['waitForFinalOutput', 'asyncReturnSessionId', 'dryRun'] as const) {
+  for (const flag of ['waitForFinalOutput', 'asyncReturnSessionId', 'dryRun', 'steer'] as const) {
     if (options[flag] !== undefined && typeof options[flag] !== 'boolean') {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: `options.${flag} must be a boolean` } };
     }
+  }
+  // Steer authorizes mid-turn injection into a real dispatch — a dry run never
+  // dispatches, so the combination is meaningless (and would make fixture
+  // responses advertise an authorization the daemon did not act on).
+  if (options.steer === true && options.dryRun === true) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.steer is not supported with options.dryRun' } };
   }
   const waitForFinalOutput = options.waitForFinalOutput === true;
   const asyncReturnSessionId = options.asyncReturnSessionId === true;
@@ -232,12 +276,22 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
     if (!isRecord(raw.presentation)) {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation must be an object' } };
     }
+    if (raw.presentation.liveCard !== undefined && raw.presentation.liveCard !== 'on-start') {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.liveCard must be on-start' } };
+    }
+    if (raw.presentation.thinking !== undefined && raw.presentation.thinking !== 'hidden') {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.thinking must be hidden' } };
+    }
     const topicMessage = raw.presentation.topicMessage;
     if (topicMessage !== undefined && topicMessage !== null && typeof topicMessage !== 'string') {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.topicMessage must be a string or null' } };
     }
     if (typeof topicMessage === 'string' && (!topicMessage.trim() || Array.from(topicMessage.trim()).length > 200)) {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.topicMessage must contain 1 to 200 characters' } };
+    }
+    const title = raw.presentation.title;
+    if (title !== undefined && (typeof title !== 'string' || !title.trim() || Array.from(title.trim()).length > 200)) {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.title must contain 1 to 200 characters' } };
     }
   }
   if (waitForFinalOutput && target.kind !== 'turn') {
@@ -305,16 +359,11 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.turnIdempotencyKey must be a non-empty string (<=200 chars)' } };
     }
     // (Mutual exclusion with idempotencyKey is checked up-front, above.)
-    // Scope lock (follow-up turn only): the turn-level lease is implemented solely
-    // on the existing-session async-return append seam. It REQUIRES target.sessionId
-    // (that is the session whose turn is keyed) and asyncReturnSessionId, and must
-    // not be combined with wait/dryRun or a fresh-session target
-    // (rootMessageId/chatId without sessionId), which take other dispatch paths
-    // that don't hold this lease and would double-run on retry.
+    // Existing-session follow-ups only. Loud Lark turns use an independent
+    // dispatch receipt; async turns retain the HTTP result-store lease.
     if (
       target.kind !== 'turn'
       || !hasSessionId
-      || !asyncReturnSessionId
       || waitForFinalOutput
       || options.dryRun === true
     ) {
@@ -322,7 +371,7 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
         ok: false, status: 400,
         body: {
           ok: false, errorCode: 'bad_request',
-          error: 'options.turnIdempotencyKey is only supported for a follow-up async turn on an existing session (target.kind=turn, target.sessionId set, options.asyncReturnSessionId=true, no waitForFinalOutput/dryRun)',
+          error: 'options.turnIdempotencyKey is only supported for a follow-up turn on an existing session (target.kind=turn, target.sessionId set, no waitForFinalOutput/dryRun)',
         },
       };
     }

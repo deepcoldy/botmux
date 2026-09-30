@@ -89,6 +89,10 @@ describe('index-supervisor environment boundary', () => {
       ].join('\n'));
 
       vi.stubEnv('HOME', home);
+      vi.stubEnv('PATH', '/custom/cli-identity/old.bin:/usr/bin');
+      vi.stubEnv('BOTMUX_IDENTITY_BIN', '/custom/cli-identity/old.bin');
+      vi.stubEnv('ZDOTDIR', '/custom/cli-identity/old.bin/shell');
+      vi.stubEnv('BYTEDCLI_USER_CLOUD_JWT', 'unrelated-turn');
       vi.stubEnv('BOTMUX_DASHBOARD_FEISHU_H5_APP_ID', 'inherited-app-id');
       vi.stubEnv(FUTURE_H5_KEY, 'inherited-future-secret');
       vi.stubEnv(RESTART_MARKER, '1');
@@ -107,6 +111,10 @@ describe('index-supervisor environment boundary', () => {
       expect(observed[RESTART_MARKER]).toBeUndefined();
       expect(observed[RESTART_FALLBACK]).toBeUndefined();
       expect(observed[KEEP_KEY]).toBe('keep');
+      expect(observed.PATH).toBe('/usr/bin');
+      expect(observed.BOTMUX_IDENTITY_BIN).toBeUndefined();
+      expect(observed.ZDOTDIR).toBeUndefined();
+      expect(observed.BYTEDCLI_USER_CLOUD_JWT).toBeUndefined();
     } finally {
       vi.unstubAllEnvs();
       rmSync(home, { recursive: true, force: true });

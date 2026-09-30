@@ -7,6 +7,7 @@ export type ConnectorVerifyType = 'hmac-sha256' | 'token';
 export type ConnectorTargetMode = 'dynamic' | 'fixed' | 'new-group';
 export type ConnectorTargetKind = 'turn' | 'workflow';
 export type ConnectorTopicMessageMode = 'default' | 'custom' | 'template' | 'none';
+export type ConnectorLifecycleGroupNameMode = 'default' | 'fixed' | 'template';
 
 export interface ConnectorTopicMessageExtractor {
   path: string;
@@ -76,6 +77,14 @@ export interface ConnectorDefinition {
   // = events whose payload yields the same value at `dedupKey` share one group.
   lifecycleExtractors: null | {
     dedupKey: string;
+  };
+  /** Feishu chat name for `target.mode === 'new-group'`. Missing means the
+   *  historical default: `<connector name>: <dedup key or request id>`. */
+  lifecycleGroupName?: {
+    mode: ConnectorLifecycleGroupNameMode;
+    /** Fixed name, or a template using `{{source}}`, `{{dedupKey}}`,
+     *  `{{requestId}}`, or JSON body paths such as `{{alert.title}}`. */
+    text?: string;
   };
   /** Inbound duplicate-delivery suppression for an at-least-once upstream.
    *

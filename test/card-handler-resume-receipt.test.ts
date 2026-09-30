@@ -68,6 +68,7 @@ function configureBot(overrides: Record<string, unknown> = {}): void {
     ...overrides,
   }], null, 2));
   process.env.BOTS_CONFIG = cfg;
+  process.env.SESSION_DATA_DIR = dir;
 }
 
 function makeDs(cliId: string, cliSessionId?: string): DaemonSession {
@@ -110,6 +111,8 @@ function resumeAction(): any {
 
 async function fresh() {
   vi.resetModules();
+  const sessionStore = await import('../src/services/session-store.js');
+  sessionStore.init(APP_ID);
   const registry = await import('../src/bot-registry.js');
   const handler = await import('../src/im/lark/card-handler.js');
   const sessionManager = await import('../src/core/session-manager.js');

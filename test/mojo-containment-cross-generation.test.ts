@@ -35,6 +35,7 @@ import {
     type WeakContainmentHandle,
 } from '../src/core/mojo-containment.js';
 import { MOJO_TREE_NONCE_ENV, scanMojoTree } from '../src/adapters/backend/mojo-process-tree.js';
+import { killFixturePid, waitForPidFile } from './helpers/pid-file.js';
 
 const LINUX = process.platform === 'linux' && existsSync('/proc/self/stat');
 
@@ -43,7 +44,7 @@ const strays: number[] = [];
 
 beforeAll(() => { workDir = mkdtempSync(join(tmpdir(), 'mojo-xgen-')); });
 afterAll(() => {
-    for (const pid of strays) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
+    for (const pid of strays) killFixturePid(pid);
     rmSync(workDir, { recursive: true, force: true });
 });
 
@@ -90,9 +91,7 @@ async function spawnEscapedDescendant(nonce: string): Promise<{ parentPid: numbe
         timeout: 10_000,
     });
     expect(parent.status).toBe(0);
-    expect(await waitFor(() => existsSync(pidFile))).toBe(true);
-    const escapedPid = Number(readFileSync(pidFile, 'utf8').trim());
-    expect(Number.isInteger(escapedPid)).toBe(true);
+    const escapedPid = await waitForPidFile(pidFile);
     strays.push(escapedPid);
     // The pid file is written before `exec sleep`, so wait until it is really live.
     expect(await waitFor(() => alive(escapedPid))).toBe(true);
@@ -145,7 +144,7 @@ describe.skipIf(!LINUX)('a real escaped descendant survives generation replaceme
         expect(() => releaseContainmentHandle(verdict, dataDir)).toThrow();
         expect(hasUnprovenContainment('sess-xgen', dataDir)).toBe(true);
 
-        try { process.kill(escapedPid, 'SIGKILL'); } catch { /* gone */ }
+        killFixturePid(escapedPid);
     }, 30_000);
 
     it('SIGTERM alone is not proof; only a real kill retires the handle', async () => {
@@ -165,12 +164,12 @@ describe.skipIf(!LINUX)('a real escaped descendant survives generation replaceme
 
         // The probe traps TERM, so a DELIVERED signal changes nothing. This is why
         // `child.kill('SIGTERM')` returning true was never proof of teardown.
-        try { process.kill(escapedPid, 'SIGTERM'); } catch { /* gone */ }
+        killFixturePid(escapedPid, 'SIGTERM');
         await sleep(200);
         expect(alive(escapedPid)).toBe(true);
         expect(proveContainmentQuiescent(handle!, { scan: realScan }).proven).toBe(false);
 
-        try { process.kill(escapedPid, 'SIGKILL'); } catch { /* gone */ }
+        killFixturePid(escapedPid);
         // Not our child, so nothing here can reap it; wait for /proc to drop it.
         expect(await waitFor(() => !existsSync(`/proc/${escapedPid}`))).toBe(true);
 
@@ -210,6 +209,6 @@ describe.skipIf(!LINUX)('a real escaped descendant survives generation replaceme
         expect(weakHandleRootStillOriginal(real!)).toBe(true);
         expect(weakHandleRootStillOriginal(stale)).toBe(false);
 
-        try { process.kill(escapedPid, 'SIGKILL'); } catch { /* gone */ }
+        killFixturePid(escapedPid);
     }, 30_000);
 });

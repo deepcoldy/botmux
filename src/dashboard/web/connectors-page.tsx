@@ -7,6 +7,11 @@ import { useT } from './react-hooks.js';
 import { WebhookLogsContent } from './webhook-logs-page.js';
 import { copyText } from './clipboard.js';
 import { confirm } from './confirm-modal.js';
+import {
+  CONNECTOR_LIFECYCLE_GROUP_NAME_MAX_LENGTH,
+  isValidConnectorLifecycleGroupNameTemplate,
+} from '../../services/connector-lifecycle-group-name.js';
+import { SearchableGroupPicker } from './searchable-group-picker.js';
 
 interface Connector {
   id: string;
@@ -17,6 +22,7 @@ interface Connector {
     mode: 'dynamic' | 'fixed' | 'new-group';
     kind: 'turn' | 'workflow';
     botId: string;
+    botIds?: string[];
     chatId?: string;
     allowChats?: string[];
     workflowId?: string;
@@ -30,6 +36,10 @@ interface Connector {
   suppressFinalOutput?: boolean;
   loggingPolicy?: { storePayload: boolean; storeHeaders: boolean; retentionDays: number };
   lifecycleExtractors?: { dedupKey: string } | null;
+  lifecycleGroupName?: {
+    mode: 'default' | 'fixed' | 'template';
+    text?: string;
+  };
 }
 
 interface ConnectorTopicMessageExtractor {
@@ -53,6 +63,7 @@ interface GroupOpt {
 interface CreateForm {
   name: string;
   botId: string;
+  additionalBotIds: string[];
   kind: 'turn' | 'workflow';
   workflowId: string;
   mode: 'dynamic' | 'fixed' | 'new-group';
@@ -62,6 +73,8 @@ interface CreateForm {
   allowChats: string[];
   deduplicate: boolean;
   dedup: string;
+  groupNameMode: 'default' | 'fixed' | 'template';
+  groupNameText: string;
   instruction: string;
   topicMessageMode: 'default' | 'custom' | 'template' | 'none';
   topicMessageText: string;
@@ -93,6 +106,7 @@ export function replaceConnectorById<T extends { id: string }>(connectors: T[], 
 const emptyForm: CreateForm = {
   name: '',
   botId: '',
+  additionalBotIds: [],
   kind: 'turn',
   workflowId: '',
   mode: 'dynamic',
@@ -102,6 +116,8 @@ const emptyForm: CreateForm = {
   allowChats: [],
   deduplicate: false,
   dedup: '',
+  groupNameMode: 'default',
+  groupNameText: '',
   instruction: '',
   topicMessageMode: 'default',
   topicMessageText: '',
@@ -151,6 +167,25 @@ export function buildConnectorTopicMessageConfig(
   }
 }
 
+export function trimConnectorLifecycleGroupNameInput(text: string): string {
+  return Array.from(text).slice(0, CONNECTOR_LIFECYCLE_GROUP_NAME_MAX_LENGTH).join('');
+}
+
+export function buildConnectorLifecycleGroupNameConfig(
+  mode: CreateForm['groupNameMode'],
+  rawText: string,
+):
+  | { ok: true; value: NonNullable<Connector['lifecycleGroupName']> }
+  | { ok: false; error: 'connectors.errGroupName' | 'connectors.errGroupNameTemplate' } {
+  const text = rawText.trim();
+  if (mode === 'default') return { ok: true, value: { mode } };
+  if (!text) return { ok: false, error: 'connectors.errGroupName' };
+  if (mode === 'template' && !isValidConnectorLifecycleGroupNameTemplate(text)) {
+    return { ok: false, error: 'connectors.errGroupNameTemplate' };
+  }
+  return { ok: true, value: { mode, text } };
+}
+
 export function buildConnectorKindOptions(
   tr: (key: string) => string,
 ): Array<{ value: 'turn' | 'workflow'; label: string; disabled?: boolean }> {
@@ -162,6 +197,29 @@ export function buildConnectorKindOptions(
       disabled: true,
     },
   ];
+}
+
+export function normalizeConnectorBotIds(triggerBotId: string, extraBotIds: string[]): string[] {
+  return Array.from(new Set([triggerBotId, ...extraBotIds].map(id => id.trim()).filter(Boolean)));
+}
+
+export function additionalConnectorBotIds(triggerBotId: string, botIds: string[] | undefined): string[] {
+  return normalizeConnectorBotIds(triggerBotId, botIds ?? []).filter(id => id !== triggerBotId);
+}
+
+export function buildConnectorTargetBody(form: Pick<CreateForm,
+  'kind' | 'mode' | 'botId' | 'additionalBotIds' | 'chatId' | 'allowChats' | 'workflowId'
+>): Connector['target'] {
+  const target: Connector['target'] = { kind: form.kind, mode: form.mode, botId: form.botId };
+  if (form.mode === 'fixed' && form.chatId) target.chatId = form.chatId;
+  if (form.mode === 'dynamic') target.allowChats = form.allowChats;
+  if (form.kind === 'workflow' && form.workflowId) target.workflowId = form.workflowId;
+  if (form.mode === 'new-group') {
+    target.botIds = normalizeConnectorBotIds(form.botId, form.additionalBotIds);
+  } else {
+    target.botIds = [];
+  }
+  return target;
 }
 
 function webhookUrl(id: string): string {
@@ -188,123 +246,6 @@ function ConnectorDropdown<T extends string>(props: {
   );
 }
 
-function SearchableGroupPicker(props: {
-  id: string;
-  label: string;
-  groups: GroupOpt[];
-  value: string | string[];
-  multiple?: boolean;
-  allLabel?: string;
-  placeholder: string;
-  searchPlaceholder: string;
-  emptyLabel: string;
-  selectedCountLabel(count: number): string;
-  onChange(value: string | string[]): void;
-}): React.JSX.Element {
-  const rootRef = useRef<HTMLDivElement | null>(null);
-  const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState('');
-  const values = Array.isArray(props.value) ? props.value : (props.value ? [props.value] : []);
-  const valueSet = useMemo(() => new Set(values), [values]);
-  const normalizedQuery = query.trim().toLocaleLowerCase();
-  const filteredGroups = useMemo(() => {
-    if (!normalizedQuery) return props.groups;
-    return props.groups.filter(group => `${group.name} ${group.chatId}`.toLocaleLowerCase().includes(normalizedQuery));
-  }, [normalizedQuery, props.groups]);
-  const selectedLabel = props.multiple
-    ? (values.length === 0 ? props.allLabel || props.placeholder : props.selectedCountLabel(values.length))
-    : (props.groups.find(group => group.chatId === values[0])?.name || values[0] || props.placeholder);
-
-  useEffect(() => {
-    if (!open) return undefined;
-    const closeOnOutsideClick = (event: PointerEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
-    };
-    document.addEventListener('pointerdown', closeOnOutsideClick);
-    return () => document.removeEventListener('pointerdown', closeOnOutsideClick);
-  }, [open]);
-
-  function select(chatId: string): void {
-    if (!props.multiple) {
-      props.onChange(chatId);
-      setOpen(false);
-      setQuery('');
-      return;
-    }
-    props.onChange(valueSet.has(chatId) ? values.filter(id => id !== chatId) : [...values, chatId]);
-  }
-
-  return (
-    <div ref={rootRef} className={`connector-group-picker${open ? ' open' : ''}`}>
-      <button
-        id={props.id}
-        type="button"
-        className="connector-group-picker-trigger"
-        aria-label={props.label}
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        onClick={() => setOpen(current => !current)}
-      >
-        <span className={values.length || (props.multiple && props.allLabel) ? '' : 'muted'}>{selectedLabel}</span>
-        <span className="connector-group-picker-chevron" aria-hidden="true" />
-      </button>
-      {open ? (
-        <div className="connector-group-picker-popover">
-          <label className="connector-group-search" htmlFor={`${props.id}-search`}>
-            <span className="connector-group-search-icon" aria-hidden="true" />
-            <input
-              id={`${props.id}-search`}
-              type="search"
-              autoComplete="off"
-              autoFocus
-              value={query}
-              placeholder={props.searchPlaceholder}
-              onChange={event => setQuery(event.currentTarget.value)}
-              onKeyDown={event => {
-                if (event.key === 'Escape') {
-                  event.preventDefault();
-                  setOpen(false);
-                }
-              }}
-            />
-          </label>
-          <div className="connector-group-options" role="listbox" aria-label={props.label} aria-multiselectable={props.multiple || undefined}>
-            {props.multiple && props.allLabel && !normalizedQuery ? (
-              <button
-                type="button"
-                className={`connector-group-option connector-group-option-all${values.length === 0 ? ' selected' : ''}`}
-                role="option"
-                aria-selected={values.length === 0}
-                onClick={() => props.onChange([])}
-              >
-                <span className="connector-group-check" aria-hidden="true" />
-                <span><b>{props.allLabel}</b><small>{props.placeholder}</small></span>
-              </button>
-            ) : null}
-            {filteredGroups.map(group => {
-              const selected = valueSet.has(group.chatId);
-              return (
-                <button
-                  type="button"
-                  className={`connector-group-option${selected ? ' selected' : ''}`}
-                  role="option"
-                  aria-selected={selected}
-                  key={group.chatId}
-                  onClick={() => select(group.chatId)}
-                >
-                  <span className="connector-group-check" aria-hidden="true" />
-                  <span><b>{group.name || group.chatId}</b>{group.name ? <small>{group.chatId}</small> : null}</span>
-                </button>
-              );
-            })}
-            {!filteredGroups.length ? <p className="connector-group-empty">{props.emptyLabel}</p> : null}
-          </div>
-        </div>
-      ) : null}
-    </div>
-  );
-}
-
 function botGroups(groups: GroupOpt[], botId: string): GroupOpt[] {
   return groups.filter(g => g.bots.includes(botId));
 }
@@ -315,6 +256,7 @@ function formFromConnector(connector: Connector, groups: GroupOpt[]): CreateForm
   return {
     name: connector.name,
     botId: connector.target.botId,
+    additionalBotIds: additionalConnectorBotIds(connector.target.botId, connector.target.botIds),
     kind: connector.target.kind,
     workflowId: connector.target.workflowId || '',
     mode: connector.target.mode,
@@ -324,6 +266,8 @@ function formFromConnector(connector: Connector, groups: GroupOpt[]): CreateForm
     allowChats: connector.target.allowChats || [],
     deduplicate: Boolean(connector.lifecycleExtractors?.dedupKey),
     dedup: connector.lifecycleExtractors?.dedupKey || '',
+    groupNameMode: connector.lifecycleGroupName?.mode || 'default',
+    groupNameText: connector.lifecycleGroupName?.text || '',
     instruction: connector.promptEnvelope?.instruction || '',
     topicMessageMode: connector.topicMessage?.mode || 'default',
     topicMessageText: connector.topicMessage?.text || '',
@@ -366,6 +310,51 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
   const groupsForBot = useMemo(() => botGroups(groups, form.botId), [groups, form.botId]);
+  const additionalBotOptions = useMemo(() => bots.filter(bot => bot.larkAppId !== form.botId), [bots, form.botId]);
+  const additionalBotGroups = useMemo(
+    () => additionalBotOptions.map(bot => ({ chatId: bot.larkAppId, name: bot.botName || bot.larkAppId, bots: [] })),
+    [additionalBotOptions],
+  );
+  const additionalBotChips = useMemo(() => {
+    const selected = form.additionalBotIds
+      .map(id => additionalBotOptions.find(bot => bot.larkAppId === id))
+      .filter((bot): bot is BotOpt => Boolean(bot));
+    if (!selected.length) return undefined;
+    const visible = selected.slice(0, 4);
+    const overflow = selected.length - visible.length;
+    const botLabel = (bot: BotOpt) => bot.botName || bot.larkAppId;
+    const botTitle = (bot: BotOpt) => `${botLabel(bot)} (${bot.larkAppId})`;
+    const unselectBot = (event: React.MouseEvent, larkAppId: string) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setForm(cur => ({ ...cur, additionalBotIds: cur.additionalBotIds.filter(id => id !== larkAppId) }));
+    };
+    return (
+      <span className="connector-bot-picker-chips">
+        {visible.map(bot => (
+          <span key={bot.larkAppId} className="connector-bot-picker-chip" data-full={botTitle(bot)} title={botTitle(bot)}>
+            <span className="connector-bot-picker-chip-label">{botLabel(bot)}</span>
+            <span
+              className="connector-bot-picker-chip-remove"
+              aria-label={`取消选择 ${botLabel(bot)}`}
+              onClick={event => unselectBot(event, bot.larkAppId)}
+            >
+              &times;
+            </span>
+          </span>
+        ))}
+        {overflow > 0 ? (
+          <span
+            className="connector-bot-picker-chip connector-bot-picker-chip-overflow"
+            data-full={selected.slice(4).map(botTitle).join('\n')}
+            title={selected.slice(4).map(botTitle).join('\n')}
+          >
+            <span className="connector-bot-picker-chip-label">+{overflow}</span>
+          </span>
+        ) : null}
+      </span>
+    );
+  }, [additionalBotOptions, form.additionalBotIds]);
   const botOptions = useMemo(
     () => bots.length
       ? bots.map(bot => ({ value: bot.larkAppId, label: bot.botName }))
@@ -398,9 +387,11 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
         ? cur.chatId
         : (availableGroups[0]?.chatId ?? '');
       const allowSet = new Set(availableGroups.map(g => g.chatId));
+      const botSet = new Set(nextBots.map(b => b.larkAppId));
       return {
         ...cur,
         botId,
+        additionalBotIds: cur.additionalBotIds.filter(id => id !== botId && botSet.has(id)),
         chatId,
         allowChats: cur.allowChats.filter(id => allowSet.has(id)),
       };
@@ -443,6 +434,7 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
     const valid = new Set(groupsForBot.map(g => g.chatId));
     setForm(cur => ({
       ...cur,
+      additionalBotIds: cur.additionalBotIds.filter(id => id !== cur.botId),
       chatId: cur.chatId && valid.has(cur.chatId) ? cur.chatId : (groupsForBot[0]?.chatId ?? ''),
       allowChats: cur.allowChats.filter(id => valid.has(id)),
     }));
@@ -541,27 +533,34 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
       return;
     }
 
+    const chatId = form.manualChat ? form.manualChatId.trim() : form.chatId;
+    if (form.mode === 'fixed' && !chatId) {
+      setCreateMsg({ text: tr('connectors.errChat'), error: true });
+      return;
+    }
     const body: any = {
       name,
       enabled: editingConnector?.enabled ?? true,
-      target: { kind: form.kind, mode: form.mode, botId },
+      target: buildConnectorTargetBody({ ...form, chatId }),
       promptEnvelope: { sourceName: name, instruction: form.instruction.trim() },
       topicMessage: topicMessage.value,
       suppressFinalOutput: form.suppressFinalOutput,
       verify: { type: form.verify },
       loggingPolicy: { storePayload: form.storePayload, storeHeaders: true, retentionDays: 14 },
     };
-    if (form.mode === 'fixed') {
-      const chatId = form.manualChat ? form.manualChatId.trim() : form.chatId;
-      if (!chatId) { setCreateMsg({ text: tr('connectors.errChat'), error: true }); return; }
-      body.target.chatId = chatId;
-    } else if (form.mode === 'dynamic') {
-      body.target.allowChats = form.allowChats;
-    }
     if (form.mode === 'new-group') {
       const dedup = form.dedup.trim();
       if (form.deduplicate && !dedup) { setCreateMsg({ text: tr('connectors.errDedup'), error: true }); return; }
       body.lifecycleExtractors = form.deduplicate ? { dedupKey: dedup } : null;
+      const lifecycleGroupName = buildConnectorLifecycleGroupNameConfig(
+        form.groupNameMode,
+        form.groupNameText,
+      );
+      if (!lifecycleGroupName.ok) {
+        setCreateMsg({ text: tr(lifecycleGroupName.error), error: true });
+        return;
+      }
+      body.lifecycleGroupName = lifecycleGroupName.value;
     } else {
       body.lifecycleExtractors = null;
     }
@@ -637,8 +636,11 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
           workflowId: '',
           manualChatId: '',
           dedup: '',
+          groupNameMode: 'default',
+          groupNameText: '',
           secret: '',
           instruction: '',
+          additionalBotIds: [],
           topicMessageMode: 'default',
           topicMessageText: '',
           topicMessageExtractors: '{}',
@@ -778,7 +780,11 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
               label={tr('connectors.fBot')}
               value={form.botId}
               options={botOptions}
-              onChange={botId => patchForm({ botId })}
+              onChange={botId => setForm(cur => ({
+                ...cur,
+                botId,
+                additionalBotIds: cur.additionalBotIds.filter(id => id !== botId),
+              }))}
             />
           </div>
 
@@ -875,6 +881,28 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
           ) : null}
 
           {form.mode === 'new-group' ? (
+            <div className="cn-field cn-field-wide connector-extra-bots-field">
+              <FieldTitle help={tr('connectors.fExtraBotsHelp')}>
+                {tr('connectors.fExtraBots')}<span className="muted cn-optional">{tr('connectors.optional')}</span>
+              </FieldTitle>
+              <SearchableGroupPicker
+                id="cn-extra-bots"
+                className="connector-bot-picker"
+                label={tr('connectors.fExtraBots')}
+                groups={additionalBotGroups}
+                value={form.additionalBotIds}
+                multiple
+                placeholder={additionalBotOptions.length ? tr('botPicker.searchPlaceholder') : tr('botPicker.empty')}
+                selectedContent={additionalBotChips}
+                searchPlaceholder={tr('botPicker.searchPlaceholder')}
+                emptyLabel={additionalBotOptions.length ? tr('botPicker.noMatch') : tr('botPicker.empty')}
+                selectedCountLabel={count => tr('botPicker.selectedCount', { n: String(count) })}
+                onChange={additionalBotIds => patchForm({ additionalBotIds: additionalBotIds as string[] })}
+              />
+            </div>
+          ) : null}
+
+          {form.mode === 'new-group' ? (
             <div className="cn-field cn-field-wide connector-new-group-config">
               <FieldTitle>{tr('connectors.newGroupStrategy')}</FieldTitle>
               <div className="connector-strategy-options" role="radiogroup" aria-label={tr('connectors.newGroupStrategy')}>
@@ -907,6 +935,51 @@ function ConnectorsPage(props: { tab: ConnectorsTab }) {
                   <input id="cn-dedup" value={form.dedup} onChange={e => patchForm({ dedup: e.currentTarget.value })} placeholder={tr('connectors.fDedupPh')} />
                 </label>
               ) : null}
+              <div className="connector-group-name-config">
+                <FieldTitle help={tr('connectors.groupNameHint')}>
+                  {tr('connectors.groupName')}
+                </FieldTitle>
+                <div className="connector-group-name-options" role="radiogroup" aria-label={tr('connectors.groupName')}>
+                  {(['default', 'fixed', 'template'] as const).map(mode => {
+                    const labelSuffix = mode === 'default' ? 'Default' : mode === 'fixed' ? 'Fixed' : 'Template';
+                    return (
+                      <button
+                        key={mode}
+                        type="button"
+                        role="radio"
+                        aria-checked={form.groupNameMode === mode}
+                        className={`connector-group-name-option${form.groupNameMode === mode ? ' selected' : ''}`}
+                        onClick={() => patchForm({ groupNameMode: mode })}
+                      >
+                        <span className="connector-strategy-radio" aria-hidden="true" />
+                        <span>
+                          <b>{tr(`connectors.groupName${labelSuffix}`)}</b>
+                          <small>{tr(`connectors.groupName${labelSuffix}Hint`)}</small>
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+                {form.groupNameMode === 'fixed' || form.groupNameMode === 'template' ? (
+                  <label className="connector-group-name-input" htmlFor="cn-group-name">
+                    <input
+                      id="cn-group-name"
+                      type="text"
+                      value={form.groupNameText}
+                      onChange={event => patchForm({ groupNameText: trimConnectorLifecycleGroupNameInput(event.currentTarget.value) })}
+                      placeholder={tr(form.groupNameMode === 'template'
+                        ? 'connectors.groupNameTemplatePh'
+                        : 'connectors.groupNameFixedPh')}
+                    />
+                    <small>
+                      {tr(form.groupNameMode === 'template'
+                        ? 'connectors.groupNameTemplateHelp'
+                        : 'connectors.groupNameFixedHelp')}
+                      <span>{Array.from(form.groupNameText).length}/{CONNECTOR_LIFECYCLE_GROUP_NAME_MAX_LENGTH}</span>
+                    </small>
+                  </label>
+                ) : null}
+              </div>
               <p className="connector-new-group-note">{tr('connectors.newGroupNotice')}</p>
             </div>
           ) : null}
@@ -1111,6 +1184,12 @@ function CreatedPanel(props: { created: CreatedConnector; groupName(chatId: stri
             <pre><code>{`curl -X POST '${callUrl}' -H 'content-type: application/json' -d '{}'`}</code></pre>
             <p className="muted connector-created-help" dangerouslySetInnerHTML={{ __html: tr('connectors.usageDynamicNote') }} />
           </>
+        ) : c.isToken && c.mode === 'new-group' ? (
+          <>
+            <p className="muted connector-created-help">{tr('connectors.usageNewGroupLede')}</p>
+            <pre><code>{`curl -X POST '${callUrl}' -H 'content-type: application/json' -d '{}'`}</code></pre>
+            <p className="muted connector-created-help" dangerouslySetInnerHTML={{ __html: tr('connectors.usageNewGroupNote') }} />
+          </>
         ) : c.isToken ? (
           <>
             <p className="muted connector-created-help">{tr('connectors.usageTokenLede')}</p>
@@ -1146,6 +1225,7 @@ function ConnectorList(props: {
     <>
       {props.connectors.map(c => {
         const bot = props.bots.find(b => b.larkAppId === c.target.botId);
+        const targetBotIds = normalizeConnectorBotIds(c.target.botId, c.target.botIds ?? []);
         const url = webhookUrl(c.id);
         const isToken = (c.verify?.type ?? 'token') === 'token';
         const verifyBadge = isToken ? tr('connectors.badgeToken') : tr('connectors.badgeSign');
@@ -1164,6 +1244,9 @@ function ConnectorList(props: {
                   <span>{bot?.botName || c.target.botId}</span>
                   <span>{props.kindLabel(c.target.kind)}</span>
                   <span>{props.modeLabel(c.target.mode)}</span>
+                  {c.target.mode === 'new-group' && targetBotIds.length > 1 ? (
+                    <span>{tr('connectors.botCount', { count: String(targetBotIds.length) })}</span>
+                  ) : null}
                   {destLabel ? <span>{destLabel}</span> : null}
                   <span>{verifyBadge}</span>
                   <span>{c.loggingPolicy?.storePayload !== false ? tr('connectors.payloadLogged', { days: c.loggingPolicy?.retentionDays ?? 14 }) : tr('connectors.metadataOnly')}</span>
@@ -1178,6 +1261,13 @@ function ConnectorList(props: {
             {isToken ? <div className="muted connector-item-note" dangerouslySetInnerHTML={{ __html: tr('connectors.tokenHint') }} /> : null}
             {c.target.kind === 'workflow' ? <div className="muted connector-item-note">{tr('connectors.legacyWorkflowNote')}</div> : null}
             {c.target.mode === 'dynamic' ? <div className="muted connector-item-note" dangerouslySetInnerHTML={{ __html: tr('connectors.dynamicReqHint') }} /> : null}
+            {c.target.mode === 'new-group' && c.lifecycleGroupName?.mode && c.lifecycleGroupName.mode !== 'default' ? (
+              <div className="muted connector-item-note">
+                {tr(c.lifecycleGroupName.mode === 'template'
+                  ? 'connectors.groupNameListTemplate'
+                  : 'connectors.groupNameListFixed', { text: c.lifecycleGroupName.text || '' })}
+              </div>
+            ) : null}
             {c.promptEnvelope?.instruction ? <div className="muted connector-item-note">{tr('connectors.instructionPrefix')}{c.promptEnvelope.instruction}</div> : null}
             <div className="muted connector-item-note">
               {c.topicMessage?.mode === 'none'

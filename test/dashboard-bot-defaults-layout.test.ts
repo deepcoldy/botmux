@@ -21,6 +21,16 @@ describe('bot defaults focused layout', () => {
     expect(page).toContain('<RuntimeEnvironmentSection');
   });
 
+  it('keeps session-group lifecycle settings inside the existing session configuration', () => {
+    const panel = page.slice(page.indexOf('id="bd-panel-sessions"'), page.indexOf('id="bd-panel-security"'));
+    expect(panel).toContain('<SessionModeSection');
+    const mode = page.slice(page.indexOf('function SessionModeSection'), page.indexOf('type CommandTriggerCheck'));
+    expect(mode).toContain("p2p === 'group'");
+    expect(mode).toContain('<SessionGroupTagRow');
+    expect(mode).toContain('data-session-group-lifecycle');
+    expect(page.match(/<SessionGroupTagRow /g)).toHaveLength(1);
+  });
+
   it('lays task tiles out as a two-column waterfall so short tiles do not strand a gap', () => {
     // A row-major grid locks each row to its tallest tile, leaving dead space
     // under a short tile next to a tall one. BdTabGrid measures every tile and
@@ -108,6 +118,8 @@ describe('bot defaults focused layout', () => {
     expect(advanced).toContain('<BackendTypeSection');
     expect(advanced).toContain('<RuntimeEnvironmentSection');
     expect(advanced).toContain('<SessionOwnerReminderSection');
+    expect(advanced).toContain('<QuotaFallbackSection');
+    expect(sessions).not.toContain('<QuotaFallbackSection');
     // and the moved sections no longer sit in their old homes
     expect(advanced).not.toContain('<SessionCapSection');
     expect(common).not.toContain('<BackendTypeSection');
@@ -141,6 +153,16 @@ describe('bot defaults focused layout', () => {
     for (const key of ['tabCommon', 'tabSessions', 'tabSecurity', 'tabCards', 'tabAdvanced']) {
       expect(i18n.match(new RegExp(`'botDefaults\\.${key}'`, 'g'))).toHaveLength(2);
     }
+  });
+
+  it('keeps live-card button controls compact and responsive', () => {
+    expect(page).toContain('className="bd-card-button-grid" data-card-button-grid');
+    expect(page).toContain('className="bd-card-button-toggle"');
+    expect(cssRuleBody(css, '.bot-defaults-page .bd-card-button-grid'))
+      .toMatch(/grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\);/);
+    expect(cssRuleBody(css, '.bot-defaults-page .bd-card-button-toggle'))
+      .toMatch(/grid-template-columns:\s*minmax\(0,\s*1fr\) 36px;/);
+    expect(css).toMatch(/@media \(max-width: 620px\)[\s\S]*?\.bot-defaults-page \.bd-card-button-grid\s*\{[\s\S]*?grid-template-columns:\s*1fr;/);
   });
 
   it('places the Feishu description editor inside the profile header main column', () => {
@@ -191,6 +213,26 @@ describe('bot defaults focused layout', () => {
       expect(page).toContain(`value: '${state}'`);
     }
     for (const key of ['ownerReminderTitle', 'ownerReminderInterval', 'ownerReminderText', 'ownerReminderStates']) {
+      expect(i18n.match(new RegExp(`'botDefaults\\.${key}'`, 'g'))).toHaveLength(2);
+    }
+  });
+
+  it('offers quota fallback controls and a visible cycle error in advanced settings', () => {
+    expect(page).toContain('function QuotaFallbackSection');
+    expect(page).toContain('dataInput="quotaFallbackTarget"');
+    expect(page).toContain('data-input="quotaFallbackMessage"');
+    expect(page).toContain("res.body?.error === 'quota_fallback_cycle'");
+    expect(page).toContain("toast(text, { kind: 'error', duration: 8_000 })");
+    expect(page).toContain("bot.startupBlocked?.reason === 'quota_fallback_cycle'");
+    expect(page).toContain('data-startup-blocked');
+    expect(page).toContain("setActiveTab('advanced')");
+    expect(page).toContain('res.body.restartRequired');
+    expect(i18n).toContain("'botDefaults.startupBlockedBadge': '未启动'");
+    expect(i18n).toContain("'botDefaults.startupBlockedBadge': 'Not started'");
+    for (const key of [
+      'quotaFallbackTitle', 'quotaFallbackTarget', 'quotaFallbackCycle', 'quotaFallbackSave',
+      'startupBlockedBadge', 'startupBlockedTitle', 'startupBlockedHelp', 'metaOffline',
+    ]) {
       expect(i18n.match(new RegExp(`'botDefaults\\.${key}'`, 'g'))).toHaveLength(2);
     }
   });

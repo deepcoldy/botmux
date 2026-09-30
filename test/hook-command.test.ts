@@ -6,6 +6,7 @@ import {
   hookCommandFor,
   nativeSubagentRuntimeHookCommand,
   sessionReadyHookCommand,
+  statuslineHookCommand,
 } from '../src/adapters/hook-command.js';
 
 // 回归保护：hook 命令必须指向 cli.js（有 `hook` 子命令分发），
@@ -37,6 +38,19 @@ describe('sessionReadyHookCommand', () => {
   it('Node 路径与 cli 路径均加引号（容忍空格），无 cliId 参数', () => {
     const cmd = sessionReadyHookCommand();
     expect(cmd).toMatch(/^".+" ".+cli\.js" session-ready$/);
+  });
+});
+
+describe('statuslineHookCommand', () => {
+  it('指向 cli.js 而非 index-daemon.js，并以 statusline 子命令结尾', () => {
+    const cmd = statuslineHookCommand();
+    expect(cmd).toContain('cli.js');
+    expect(cmd).not.toContain('index-daemon');
+    expect(cmd.endsWith(' statusline')).toBe(true);
+  });
+
+  it('Node 路径与 cli 路径均加引号（容忍空格），无 cliId 参数', () => {
+    expect(statuslineHookCommand()).toMatch(/^".+" ".+cli\.js" statusline$/);
   });
 });
 

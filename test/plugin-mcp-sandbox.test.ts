@@ -8,6 +8,8 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
+import { isBunRuntime } from './helpers/ts-runner.js';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -67,7 +69,11 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
 
   afterEach(() => {
     vi.unstubAllEnvs();
-    rmSync(root, { recursive: true, force: true });
+    // prepareDirectSandbox() chmods its deny-mask sources to 000 under `root`, and
+    // a 000 directory cannot be traversed — so a plain recursive delete throws
+    // `EACCES: permission denied, rm` for any NON-root uid (measured: green as
+    // root, red on Node and Bun alike as a normal user, i.e. what CI runs as).
+    rmSandboxScratch(root);
   });
 
   it.each(['default', 'custom'] as const)(
@@ -240,7 +246,21 @@ describe.skipIf(process.platform !== 'linux' || !existsSync(builtCli) || !bwrapU
   // root (shared drive / ~/.local/bin symlink / fnm / nvm). Before the fix the
   // trusted `botmux` shim's `exec node` failed `not found` → MCP gateway exited
   // → Connection closed. The fix prepends dirname(realpath(process.execPath)).
-  it('resolves bare `node` under a hostile symlink-form host PATH (canonical exec dir prepended)', () => {
+  //
+  // NODE-ONLY, and not merely by preference: the fix under test is
+  // "prepend dirname(realpath(process.execPath))", and the probe then asserts
+  // bare `node` runs inside the sandbox. Under `bun test` process.execPath is the
+  // BUN binary, so the sandbox is granted bun's directory and the probe looks for
+  // a `node` that was never put there — exit 127. MEASURED on CI (runner node is
+  // /opt/hostedtoolcache/node/..., outside the /usr/bin the fixture keeps) and
+  // masked on a dev box that happens to have /usr/bin/node, which is why it reads
+  // as green locally under both runtimes.
+  //
+  // Granting bun's dir and probing for `bun` instead would NOT preserve the
+  // regression: the shim this protects execs `node` literally (see
+  // botmuxShimExecLine), so a bun-shaped probe would assert something production
+  // never does. The vitest/Node leg runs this for real; keep it there.
+  it.skipIf(isBunRuntime())('resolves bare `node` under a hostile symlink-form host PATH (canonical exec dir prepended) — Node-only: execPath is bun under `bun test`', () => {
     const botmuxHome = join(dataDir, '..');
     const botHome = join(botmuxHome, 'bots', 'cli_test');
     const outbox = join(dataDir, 'sandboxes', 'sid-path', 'outbox');

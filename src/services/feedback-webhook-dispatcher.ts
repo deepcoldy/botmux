@@ -152,19 +152,21 @@ export function startFeedbackWebhookDispatcher(options: {
     if (stopped || running) return;
     running = (async () => {
       const now = Date.now(), claimToken = randomUUID();
-      const rows = options.store.claimFeedbackOutbox({ now, limit: options.batchSize ?? 10, claimToken });
+      const claim = options.store.tryClaimFeedbackOutbox({ now, limit: options.batchSize ?? 10, claimToken });
+      if (!claim.done) return;
+      const rows = claim.rows;
       await Promise.all(rows.map(async row => {
         try {
           const secret = options.readSecret(row.destination.secretRef);
-          if (!secret) { options.store.rescheduleFeedbackOutbox(row.outboxId, claimToken, { now, nextAttemptAt: now, error: 'webhook_secret_missing', permanent: true }); return; }
+          if (!secret) { options.store.tryRescheduleFeedbackOutbox(row.outboxId, claimToken, { now, nextAttemptAt: now, error: 'webhook_secret_missing', permanent: true }); return; }
           const result = await dispatch({ destination: row.destination, event: row.event, secret, allowPrivateNetworks: options.allowPrivateNetworks, signal: controller.signal });
-          if (result.kind === 'delivered') { options.store.settleFeedbackOutboxDelivered(row.outboxId, claimToken, result.status ?? 200, new Date().toISOString()); return; }
+          if (result.kind === 'delivered') { options.store.trySettleFeedbackOutboxDelivered(row.outboxId, claimToken, result.status ?? 200, new Date().toISOString()); return; }
           const delay = result.kind === 'retry' ? computeRetryDelay({ attempts: row.attempts, retryAfter: result.retryAfter }) : 0;
-          options.store.rescheduleFeedbackOutbox(row.outboxId, claimToken, { now, nextAttemptAt: now + delay, error: result.error ?? `webhook_http_${result.status ?? 0}`, httpStatus: result.status, permanent: result.kind === 'failed' });
+          options.store.tryRescheduleFeedbackOutbox(row.outboxId, claimToken, { now, nextAttemptAt: now + delay, error: result.error ?? `webhook_http_${result.status ?? 0}`, httpStatus: result.status, permanent: result.kind === 'failed' });
         } catch (error) {
           options.onError?.(error);
           const delay = computeRetryDelay({ attempts: row.attempts });
-          options.store.rescheduleFeedbackOutbox(row.outboxId, claimToken, { now, nextAttemptAt: now + delay, error: String((error as Error)?.message ?? error).slice(0, 500), permanent: false });
+          options.store.tryRescheduleFeedbackOutbox(row.outboxId, claimToken, { now, nextAttemptAt: now + delay, error: String((error as Error)?.message ?? error).slice(0, 500), permanent: false });
         }
       }));
     })().finally(() => { running = undefined; });
@@ -173,7 +175,7 @@ export function startFeedbackWebhookDispatcher(options: {
   const installInterval = (): void => {
     if (stopped || timer) return;
     timer = setInterval(() => {
-      try { options.store.resetExpiredFeedbackOutboxClaims(Date.now(), options.staleClaimMs ?? 60_000); }
+      try { options.store.tryResetExpiredFeedbackOutboxClaims(Date.now(), options.staleClaimMs ?? 60_000); }
       catch (error) { options.onError?.(error); }
       void tick().catch(error => options.onError?.(error));
     }, options.intervalMs ?? 5_000);
@@ -186,7 +188,7 @@ export function startFeedbackWebhookDispatcher(options: {
     // webhooks never delivered until process restart). Report the bootstrap
     // failure but let the self-healing interval take over.
     try {
-      options.store.resetExpiredFeedbackOutboxClaims(Date.now(), options.staleClaimMs ?? 60_000);
+      options.store.tryResetExpiredFeedbackOutboxClaims(Date.now(), options.staleClaimMs ?? 60_000);
       await tick();
     } catch (error) {
       options.onError?.(error);

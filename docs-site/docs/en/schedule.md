@@ -1,11 +1,21 @@
 # Scheduled Tasks
 
-Supports three schedule types plus natural-language input, posting a follow-up message in **the original topic where the task was created** and executing it when due (no separate thread is opened; the working directory matches the one at creation time).
+Supports three schedule types plus natural-language input. Tasks run at their configured execution position when due. **In group chats, the default is chat top level, even when the task is created inside a topic.** To continue in the current topic, explicitly pass `--topic` when creating the task through the CLI, or select the original topic under **Execution position** in the Dashboard.
+
+There are four execution positions: **chat top level** (the default; all top-level tasks in one group share the chat-scope session context), **a specified topic** (`--topic`, bound to one existing topic), **a new topic per run** (`--new-topic`, every run stands alone), and **a dedicated task topic** (opt-in; each task owns its own topic session — see below).
 
 ## Two Ways to Create
 
 - **Slash command** (quick): `/schedule 每日17:50 帮我看看AI圈有什么新闻`
 - **Conversational trigger** (flexible): just tell the agent "add me a scheduled task to check deployment every day at 18:00", which automatically triggers the `botmux-schedule` skill.
+
+To create a task that stays in the current topic, run this inside its topic session:
+
+```bash
+botmux schedule add "0 18 * * *" "check deployment status" --topic
+```
+
+`--topic` can infer the anchor from the current topic session. Use `--root-msg-id <om_...>` to specify a target topic explicitly.
 
 ## Supported Formats
 
@@ -83,7 +93,7 @@ Click **Test precondition** to execute the current **unsaved** form content for 
 
 ## A New Topic Per Run
 
-By default every fire continues in **the original topic where the task was created**. To make each run land in a **brand-new topic** in the same chat with its own isolated session (ideal for daily-report style tasks where each run should stand alone), there are three ways:
+For chat-top-level execution, the bot/chat session mode determines how messages are organized. To explicitly make each run land in a **brand-new topic** in the same chat with its own isolated session (ideal for daily-report style tasks where each run should stand alone), there are three ways:
 
 ```bash
 # Slash command: prefix the prompt with the 新话题 ("new topic") keyword
@@ -96,11 +106,35 @@ botmux schedule add "每日17:30" "generate digest" --new-topic
 botmux schedule add "每日17:30" "generate digest" --deliver new-topic
 ```
 
-You can also edit a task on the Dashboard's **Schedules** page and use **Execution position** to choose the original topic, chat top level, or a new topic for every run.
+You can also edit a task on the Dashboard's **Schedules** page and use **Execution position** to choose the original topic, chat top level, a new topic for every run, or the task's dedicated topic.
+
+## A Dedicated Topic Per Task
+
+"A new topic per run" keeps every run of the same task unrelated; chat top level goes the other way, with all top-level tasks in one group sharing one chat-scope session. A **dedicated task topic** gives each task a topic session that belongs to it alone:
+
+- Every run of the same task lands in the **same topic**, so the context carries over — just like a topic-pinned task.
+- Different tasks in the same group use separate topics and are **isolated from one another, never sharing context** — a sentinel task and a daily-report task never end up in the same session history.
+- The topic is created **on the first fire**: a non-silent task posts a seed message (the "task started" banner) first, anchored as that topic's root; a silent task defers creation until the bot's first `botmux send`, exactly like "new topic per run" combined with silent.
+
+How to set it:
+
+- **Natural language**: prefix the prompt with the dedicated-topic keyword — `独立话题` / `专属话题` in Chinese, "dedicated topic" in English. It combines with the silent keyword in either order, for example:
+
+```bash
+/schedule 每日18:00 独立话题 summarize today's service health checks
+/schedule 工作日9:00 静默 专属话题 write the morning brief; speak up only on anomalies
+```
+
+- **Lark schedule card / Dashboard**: on the card, the execution-position button cycles **chat top level → new topic per run → dedicated task topic → chat top level**; the Dashboard **Schedules** form lets you pick the position directly.
+
+Limits and notes:
+
+- **Single-group tasks only**; a multi-group task cannot choose the dedicated task topic.
+- The per-task model behaves exactly like `--topic`: it applies only on the first fire that creates the session; later runs reuse the model that session started with (see the next section).
 
 ## Follow the Active Topic
 
-A topic-pinned task keeps firing into the topic it was created in; once that topic is closed and the conversation has moved on, reminders land where nobody is looking — and re-lighting a closed topic is one more topic session to carry. `--follow-active` makes the task re-resolve its target **at every fire**.
+A task explicitly pinned with `--topic` keeps firing into its specified topic; once that topic is closed and the conversation has moved on, reminders land where nobody is looking — and re-lighting a closed topic is one more topic session to carry. `--follow-active` makes the task re-resolve its target **at every fire**.
 
 ```bash
 # Created from inside a topic session: that topic is the starting point
@@ -123,6 +157,33 @@ Cross-topic notice: a plain topic-pinned task that fires somewhere other than it
 
 `--follow-active` only makes sense for topic execution and cannot be combined with `--top-level` / `--new-topic`. Tasks of this kind show a `↷跟随活跃话题` marker in `schedule list`.
 
+## A Model Per Task
+
+Under one bot, different tasks usually deserve different model tiers: a sentinel firing every 30 minutes runs fine on a cheap model, while the nightly code review is the one that needs the strongest. `--model` / `--reasoning-effort` give a task its own model without touching the bot config or any other task.
+
+```bash
+# Frequent sentinel: cheap model, low effort
+botmux schedule add "every 30m" "check service health, alert only on failure" \
+  --silent --model gpt-5.2 --reasoning-effort low
+
+# Once-a-day deep task: strongest model, highest effort
+botmux schedule add "0 9 * * *" "review every PR merged to master yesterday" \
+  --new-topic --model gpt-5.6-sol --reasoning-effort ultra
+```
+
+The Dashboard "Schedules" page has both fields too; empty means "follow the bot config".
+
+**Only a run that creates a session can apply the model.** Model and reasoning effort are CLI **process launch** arguments (`codex --model X -c model_reasoning_effort=Y`) and cannot be changed once the process is up. So:
+
+| Execution position | Effect |
+| --- | --- |
+| `--new-topic` | Every run starts a new session, so the model applies **every time** |
+| Dedicated task topic / `--topic` / `--top-level` | Applies on the run that creates the session; later runs reuse it with the model it started with |
+
+Use `--new-topic` when it must apply on every run. Both the CLI and the Dashboard say which case you are in when you save.
+
+Supported CLIs are Codex, Claude Code, Grok and TraeX (the same gate as the trigger API's `options.model`); a task on any other CLI ignores both fields at fire time and logs a warning. Which effort levels exist depends on the model (`gpt-5.6-sol` goes up to `ultra`, `gpt-5.5` stops at `xhigh`), and the Dashboard rejects an unsupported pairing on save. If the bot later switches CLI, or the model stops offering the level, the fire **drops that field and runs anyway** with a warning — stale configuration never skips a run.
+
 ## Management
 
 ```bash
@@ -130,4 +191,20 @@ Cross-topic notice: a plain topic-pinned task that fires somewhere other than it
 /schedule remove|enable|disable|run <id>
 ```
 
-> Execution behavior: when due, if the session in the original topic is still alive, the prompt is injected directly into the existing session (no new worker is started); otherwise a new worker is spun up to execute in the original working directory. A `--new-topic` task always opens a fresh topic + new session and never reuses a prior one.
+> Execution behavior: the execution position determines the target first. With an explicit `--topic`, an active session in the target topic receives the prompt directly (no new worker); otherwise, a new worker starts in the task's saved working directory. Chat-top-level tasks select a session according to the bot/chat session mode. `--new-topic` uses a fresh session for every run; combined with `--silent`, it creates the topic only when the first `botmux send` needs to deliver content. A dedicated task topic creates the task's own topic on its first fire (a non-silent run posts a seed message anchored as the root; a silent run defers materialization to the first `botmux send`), and every later run is appended to that same session.
+
+## Update a prompt in place
+
+Use `update` to change an existing task without deleting and recreating it:
+
+```bash
+botmux schedule update <id> --prompt-file report-prompt.md
+# For short prompts, use exactly one of these two input options.
+botmux schedule update <id> --prompt "The complete replacement prompt"
+```
+
+Files are read as UTF-8 with line breaks preserved. Only the prompt changes: the task ID, schedule, enabled state, execution position and run history remain intact. Updating does not trigger a run. Already dispatched runs keep their original prompt; subsequent runs use the replacement. Input or authorization failures do not delete the task. Updates use the same locked atomic storage as other task operations.
+
+For ownerless topics created by scheduled tasks, the host daemon authorizes the current caller without exposing bot configuration or credentials to the sandbox. Upgrade the CLI and daemon together: an older daemon without this authorization capability is rejected explicitly, without deleting the task or bypassing verification.
+
+A task bound to a protected precondition cannot be changed with `update`: the precondition records a hash of the task input, while its definition file is host-only and cannot be rebound from inside the sandbox. Rewriting the prompt would make every later fire fail validation and stop the task silently. Edit such tasks on the Dashboard scheduled-tasks page instead.

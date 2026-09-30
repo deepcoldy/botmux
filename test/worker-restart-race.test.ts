@@ -49,7 +49,7 @@ describe('worker restart P1 — drain reliable terminal before ambiguous emit', 
   it('onExit reuses the same shared drain helper (no divergent duplicate)', () => {
     // Both the CLI onExit path and the restart IPC path must drain identically;
     // the shared helper is the single source, so onExit calls it too.
-    const onExitAmbiguous = workerSource.indexOf("'ambiguous',\n        'cli_exit'");
+    const onExitAmbiguous = workerSource.search(/'ambiguous',\n\s+'cli_exit'/);
     expect(onExitAmbiguous).toBeGreaterThan(0);
     const before = workerSource.slice(onExitAmbiguous - 400, onExitAmbiguous);
     expect(before).toContain('drainReliableTerminalBeforeInterrupt()');

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 vi.mock('../src/adapters/backend/pty-backend.js', () => ({
   PtyBackend: class MockPtyBackend {},
@@ -52,6 +52,7 @@ import { TmuxBackend } from '../src/adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
 import { ZellijBackend } from '../src/adapters/backend/zellij-backend.js';
 import { ZmxBackend } from '../src/adapters/backend/zmx-backend.js';
+import * as zmxSetup from '../src/setup/ensure-zmx.js';
 import {
   backendSandboxCompatibilityError,
   isStrongManagedHerdrAgentName,
@@ -61,6 +62,8 @@ import {
 } from '../src/adapters/backend/session-backend-selector.js';
 
 describe('selectSessionBackend', () => {
+  afterEach(() => vi.restoreAllMocks());
+
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(TmuxBackend.hasSession).mockReset();
@@ -381,6 +384,10 @@ describe('selectSessionBackend', () => {
   });
 
   it('uses zmx tail signals, history snapshots, and send as a managed pipe backend', () => {
+    // Directory discovery belongs to ensure-zmx; backend selection must not
+    // depend on a locally installed zmx binary or the test runner's TMPDIR.
+    const socketDir = '/tmp/botmux-test-zmx';
+    const resolveSocketDir = vi.spyOn(zmxSetup, 'resolveZmxSocketDir').mockReturnValue(socketDir);
     vi.mocked(ZmxBackend.hasSession).mockReturnValue(true);
 
     const selected = selectSessionBackend({ sessionId: '9cfa0024-197d-4781-845b-c541dceb8980', backendType: 'zmx' });
@@ -393,6 +400,14 @@ describe('selectSessionBackend', () => {
       ownsSession: true,
       isReattach: true,
       sessionId: '9cfa0024-197d-4781-845b-c541dceb8980',
+      socketDir,
+    });
+    expect(resolveSocketDir).toHaveBeenCalledTimes(1);
+    expect(ZmxBackend.hasSession).toHaveBeenCalledWith(
+      'bmx-9cfa0024', expect.objectContaining({ ZMX_DIR: socketDir }),
+    );
+    expect(selected.persistentBackendTarget).toEqual({
+      backendType: 'zmx', sessionName: 'bmx-9cfa0024', socketDir,
     });
   });
 

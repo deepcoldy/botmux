@@ -24,7 +24,7 @@ describe('daemon Codex App workflow prompt lanes', () => {
     // 话题上下文 (topicThreadContext) 必须双 lane 下发：既进 legacy promptContent，
     // 也进 codex-app 结构化 sidecar codexAppMessageContext，否则 codex-app bot 静默丢话题历史。
     expect(block).toContain("const codexAppMessageContext = topicThreadContext + codexAppQuoteContext + (workflowGrillPrompt ?? '');");
-    expect(block).toContain('const promptContent = topicThreadContext + codexAppQuoteContext + codexAppApplicationContext + content;');
+    expect(block).toContain(': topicThreadContext + codexAppQuoteContext + codexAppApplicationContext + content;');
     expect(block).toContain('pendingCodexAppText: codexAppVisibleText');
     expect(source).toContain('codexAppText: ds.pendingCodexAppText');
     expect(block.match(/forkReservedInitialSession\(ds, availableBots, trustedCaller\)/g)).toHaveLength(2);
@@ -57,5 +57,14 @@ describe('daemon Codex App workflow prompt lanes', () => {
     );
     expect(block).toContain('if (ds?.pendingRepo || initialStartPending) {');
     expect(block).not.toContain('if (ds?.pendingRepo || ds?.pendingRepoCommitInFlight || initialStartPending)');
+  });
+
+  it('does not use the raw owner DM fallback for notifier card authorization', () => {
+    const block = region(
+      'const handleCodexNotifierCardAction',
+      'const cardDeps',
+    );
+    expect(block).toContain('getExpectedOwnerOpenId: getOwnerOpenId,');
+    expect(block).not.toContain('resolvePrimaryOwnerOpenId');
   });
 });

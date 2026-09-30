@@ -32,12 +32,31 @@ export function createHermesAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
-      if (pty.sendText && pty.sendSpecialKeys) {
-        pty.sendText(content);
+      // Bracketed paste on every backend that supports it. Hermes' prompt_toolkit
+      // TUI binds Keys.BracketedPaste (cli_tui_mixin._tui_handle_paste), so a
+      // single paste event inserts the whole multiline prompt as CONTENT while
+      // embedded \n stay inert; only the Enter afterwards submits.
+      //
+      // The old path used sendText (tmux `send-keys -l`), which replays the text
+      // as individual literal keystrokes and turns every embedded \n into an
+      // Enter key. On a cold start those keystrokes sit in the tty input queue
+      // while the TUI renders, then drain in a burst together with botmux's
+      // trailing Enter. Hermes' anti-paste guard (_RAPID_INPUT_ENTER_WINDOW_S,
+      // 50ms since the last buffer change, hermes-agent issue #10994) then
+      // classifies that Enter as a pasted newline: the whole opening prompt
+      // strands in the composer until a human presses Enter. pasteText is one
+      // O(1) event (tmux load-buffer + paste-buffer -d -p), so the last buffer
+      // change settles long before the 200ms-delayed Enter. Prompts past
+      // Hermes' paste-collapse threshold (>=5 newlines or >=2000 chars) become
+      // a `[Pasted text #n: … -> file]` placeholder that Hermes expands back
+      // to the full content at submit (cli._expand_paste_references), so the
+      // large opening envelope botmux sends is preserved verbatim.
+      if (pty.pasteText && pty.sendSpecialKeys) {
+        pty.pasteText(content);
         await delay(200);
         pty.sendSpecialKeys('Enter');
       } else {
-        pty.write(content);
+        pty.write(`\x1b[200~${content}\x1b[201~`);
         await delay(1000);
         pty.write('\r');
       }

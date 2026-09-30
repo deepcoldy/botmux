@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { computeViewportTop, pickChoice, truncateToWidth } from '../src/setup/interactive-select.js';
+import { computeViewportTop, matchesSelectItem, pickChoice, truncateToWidth } from '../src/setup/interactive-select.js';
 import {
   createOpenPlatformAppWithClient,
   listOpenPlatformApps,
@@ -72,6 +72,15 @@ describe('truncateToWidth', () => {
   it('counts CJK as double width', () => {
     expect(truncateToWidth('机器人列表', 10)).toBe('机器人列表'); // 宽 10 恰好放下
     expect(truncateToWidth('机器人列表很长', 8)).toBe('机器人…');
+  });
+});
+
+describe('matchesSelectItem', () => {
+  it('matches hidden search text used by cascaded CLI groups', () => {
+    const item = { label: 'TRAE CLI', submenu: true, searchText: 'traex TRAE CLI 2.0 coco TRAE CLI 1.0' };
+    expect(matchesSelectItem(item, 'TRAE')).toBe(true);
+    expect(matchesSelectItem(item, 'traex')).toBe(true);
+    expect(matchesSelectItem(item, 'codex')).toBe(false);
   });
 });
 

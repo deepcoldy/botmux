@@ -69,6 +69,12 @@ describe('findLaunchedCliPid()', () => {
     expect(findLaunchedCliPid(500, 'traex', 6, { childrenOf: (pid) => t[pid] ?? [], commOf: (pid) => c[pid] })).toBe(502);
   });
 
+  it('descends forge launcher → traex agent leaf', () => {
+    const t: Record<number, number[]> = { 700: [701], 701: [702], 702: [] };
+    const c: Record<number, string> = { 700: 'forge', 701: 'node', 702: 'traex' };
+    expect(findLaunchedCliPid(700, 'traex', 6, { childrenOf: (pid) => t[pid] ?? [], commOf: (pid) => c[pid] })).toBe(702);
+  });
+
   it('returns null when bwrap has not yet exec\'d traex (bounded retry re-runs)', () => {
     // At spawn, bwrap may not have forked the leaf yet — findLaunchedCliPid
     // returns null and the caller's bounded retry re-runs on a later tick.

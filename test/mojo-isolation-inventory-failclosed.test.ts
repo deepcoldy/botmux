@@ -22,12 +22,17 @@ vi.mock('../src/services/session-store.js', () => ({
   // Omitting any one fails the file at LINK time, before a single test runs (which
   // is why this file reported 0 executed rather than a normal failure).
   countActiveSessionsOnDisk: () => 0,
+  getSession: () => undefined,
   loadAllSessionsSnapshot: () => new Map(),
   applySessionCommandUnowned: () => ({ outcome: 'missing' }),
   readSessionRowUnowned: () => ({ outcome: 'missing' }),
   occupancyLeaseIsActive: () => false,
+  hostOccupancyLeaseHeld: () => false,
   readOccupancyLease: () => undefined,
-  readSessionRowCopiesAcrossStores: () => [],
+  readSessionRowCopiesAcrossStores: () => ({ matches: [], unreadableStores: 0 }),
+  SessionStoreSqliteUnavailableError: class SessionStoreSqliteUnavailableError extends Error {
+    override readonly name = 'SessionStoreSqliteUnavailableError';
+  },
   listSessionsStrict: () => {
     const err = new Error('session store unreadable');
     err.name = 'SessionStoreUnavailableError';

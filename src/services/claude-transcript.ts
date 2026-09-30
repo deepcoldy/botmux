@@ -15,6 +15,9 @@ import { existsSync, openSync, readSync, closeSync, statSync, readdirSync } from
 import { join } from 'node:path';
 import { baselineJsonlCursor } from './jsonl-cursor.js';
 import type { ModelFallbackState } from '../types.js';
+// cot-subject 只用语言内建、不引任何仓库模块，等价于内联，不违反本文件的
+// dependency-free 口径；独立成模块是为了和渲染层共用同一份字段优先级。
+import { boundSubjectForTransport, subjectFromInputObject } from './cot-subject.js';
 
 /** Subset of Claude Code's JSONL event shape we care about. */
 export interface TranscriptEvent {
@@ -30,7 +33,10 @@ export interface TranscriptEvent {
      * reasons such as `end_turn` / `stop_sequence` close the logical turn. */
     stop_reason?: string | null;
     /** Model that actually served this reply (e.g. `claude-opus-4-8`). Claude
-     *  Code writes the placeholder `<synthetic>` on API-error records. */
+     *  Code writes the placeholder `<synthetic>` on records no model produced:
+     *  API-error records (`isApiErrorMessage:true`) and the bridge-resume
+     *  placeholder (`isApiErrorMessage:false`, text "No response requested.",
+     *  usage all zero, no `requestId`) — see {@link isSyntheticNoModelReplyEvent}. */
     model?: string;
   };
   /** API-error records. When the model call fails, Claude Code writes a
@@ -504,6 +510,37 @@ function hasApiErrorSignature(ev: TranscriptEvent, pattern: RegExp): boolean {
   return pattern.test(apiErrorMessageText(ev));
 }
 
+/** Model placeholder Claude Code writes on assistant records no model produced. */
+export const SYNTHETIC_MODEL_PLACEHOLDER = '<synthetic>';
+
+/**
+ * A `type:"assistant"` record that Claude Code wrote WITHOUT calling the model
+ * and WITHOUT flagging it as an API error. Observed shape (Claude Code 2.1.263,
+ * bridge resume of a turn that was cut mid-flight):
+ *
+ *     {"type":"assistant","isApiErrorMessage":false,
+ *      "message":{"model":"<synthetic>","stop_reason":"stop_sequence",
+ *                 "content":[{"type":"text","text":"No response requested."}],
+ *                 "usage":{"input_tokens":0,"output_tokens":0,...}}}
+ *
+ * It is always preceded (same timestamp) by an `isMeta` user record
+ * "Continue from where you left off.", and it carries no `requestId`.
+ *
+ * Such a record has every attribute the queue reads as "the model's final
+ * answer" — visible text block, terminal `stop_reason`, not an API error — but
+ * the user's message was never answered. Treating it as `completed` closes the
+ * Lark turn silently (measured: 53 such records across 26 local sessions, 39 of
+ * them directly after a Lark-delivered user message, none surfaced anywhere).
+ * Only `message.model` distinguishes it from a real reply.
+ */
+export function isSyntheticNoModelReplyEvent(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  if (ev.isApiErrorMessage === true) return false;
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return false;
+  return ev.message?.model === SYNTHETIC_MODEL_PLACEHOLDER;
+}
+
 export function classifyClaudeTerminalEvent(
   ev: TranscriptEvent,
 ): ClaudeTerminalOutcome | undefined {
@@ -542,6 +579,14 @@ export function classifyClaudeTerminalEvent(
     return { status: 'ambiguous', errorCode: 'provider_unknown_error', retryable: false };
   }
   if (ev.type === 'system' && ev.subtype === 'turn_duration') return undefined;
+  // No model call happened, so nothing was answered; the input is still intact
+  // in the transcript, so a continuation can pick it up. `provider_` prefix on
+  // purpose: the daemon routes Claude execution failures (Wait-Mode settle,
+  // async sink, failure card) on that prefix, and the retry offer stays
+  // `caveated` — the cut turn may have run tools before it was resumed.
+  if (isSyntheticNoModelReplyEvent(ev)) {
+    return { status: 'failed', errorCode: 'provider_no_model_reply', retryable: true };
+  }
   const role = ev.message?.role ?? ev.type;
   if (role !== 'assistant') return undefined;
   const reason = ev.message?.stop_reason;
@@ -570,6 +615,146 @@ export function isClaudeTurnTerminalEvent(ev: TranscriptEvent): boolean {
     && reason.length > 0
     && reason !== 'tool_use'
     && reason !== 'pause_turn';
+}
+
+/** The launch-ack a background Agent/Task tool_result carries the moment it is
+ *  dispatched: the tool call returns immediately with "launched"/"in the
+ *  background" text and an `agentId:` line, and the real result only arrives
+ *  later as a re-injected `<task-notification>`. Anchored on both markers so an
+ *  ordinary synchronous tool_result that merely mentions "background" is not
+ *  mistaken for an async dispatch. */
+const BACKGROUND_LAUNCH_ACK_RE = /launched|in the background/i;
+const BACKGROUND_LAUNCH_AGENT_ID_RE = /\bagentId:\s*(\S+)/;
+
+/** Identify a background Agent/Task dispatch from an assistant event: returns
+ *  the tool_use ids that dispatched async work. Empty when the event dispatched
+ *  none. The launch-ack lives in the FOLLOWING user event's tool_result, so the
+ *  caller pairs this with {@link backgroundTaskDispatchAcks}. */
+export function backgroundTaskDispatchToolUseIds(ev: TranscriptEvent): string[] {
+  if (!ev || (ev as any).isSidechain === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const ids: string[] = [];
+  for (const block of content as any[]) {
+    if (block && block.type === 'tool_use' && typeof block.id === 'string'
+      && (block.name === 'Agent' || block.name === 'Task')) {
+      ids.push(block.id);
+    }
+  }
+  return ids;
+}
+
+/** Read a background launch-ack out of a user event's tool_result blocks. Maps
+ *  each async-dispatch tool_use_id to the durable agent id minted in its ack
+ *  text (the id `<task-notification>` later reports under `<task-id>`). Only
+ *  tool_results whose text carries BOTH the launch phrasing and an `agentId:`
+ *  line qualify, so a synchronous tool result is never counted. */
+export function backgroundTaskDispatchAcks(ev: TranscriptEvent): Array<{ toolUseId: string; agentId: string }> {
+  if (!ev || (ev as any).isSidechain === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'user') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const acks: Array<{ toolUseId: string; agentId: string }> = [];
+  for (const block of content as any[]) {
+    if (!block || block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue;
+    const text = stringifyToolResultContent(block.content);
+    if (!BACKGROUND_LAUNCH_ACK_RE.test(text)) continue;
+    const m = BACKGROUND_LAUNCH_AGENT_ID_RE.exec(text);
+    if (!m) continue;
+    acks.push({ toolUseId: block.tool_use_id, agentId: m[1] });
+  }
+  return acks;
+}
+
+/** A `<task-notification>` re-injected when a background agent stops. It is a
+ *  synthetic event whose payload STARTS WITH the tag — a tool_result that
+ *  merely contains the literal string (e.g. grep over this source) is not one.
+ *  Two on-disk shapes carry it: the legacy `role:user` event (text in
+ *  `message.content`) and the type-ahead `attachment(queued_command)` form
+ *  (text in `attachment.prompt`, `commandMode:'task-notification'`) that
+ *  current CLI builds write — mirroring {@link extractTurnStartText}.
+ *  `status` is the agent's terminal state; the same task-id may notify more
+ *  than once (a resumed agent stops again), so a completed/failed notice only
+ *  ever RETIRES a tracked id, it never adds one. */
+export function parseTaskNotification(ev: TranscriptEvent):
+  { taskId: string; toolUseId?: string; status: string } | undefined {
+  if (!ev) return undefined;
+  let text: string;
+  if (ev.type === 'attachment' && ev.attachment?.type === 'queued_command') {
+    const prompt = ev.attachment.prompt;
+    text = typeof prompt === 'string' ? prompt : stringifyUserContent(prompt);
+  } else {
+    const role = ev.message?.role ?? ev.type;
+    if (role !== 'user') return undefined;
+    const raw = ev.message?.content;
+    text = typeof raw === 'string'
+      ? raw
+      : Array.isArray(raw)
+        ? (raw.find((b: any) => b && b.type === 'text' && typeof b.text === 'string')?.text ?? '')
+        : '';
+  }
+  if (!text.trimStart().startsWith('<task-notification>')) return undefined;
+  const taskId = /<task-id>([^<]+)<\/task-id>/.exec(text)?.[1]?.trim();
+  if (!taskId) return undefined;
+  const toolUseId = /<tool-use-id>([^<]+)<\/tool-use-id>/.exec(text)?.[1]?.trim();
+  const status = /<status>([^<]+)<\/status>/.exec(text)?.[1]?.trim() ?? 'completed';
+  return { taskId, ...(toolUseId ? { toolUseId } : {}), status };
+}
+
+/** Live count of background Agent/Task dispatches whose completion notification
+ *  has not yet arrived, folded from a transcript event stream. The worker keeps
+ *  one per session and consults `pending()` at the PTY idle edge: while a main
+ *  turn is only idle because it is awaiting a background sub-agent, the session
+ *  card must stay `working` rather than freezing to idle (which Lark surfaces as
+ *  「已完成」). State is intentionally id-keyed, not a bare counter, so a
+ *  duplicate notification or a re-drained dispatch cannot double-count. */
+export class BackgroundTaskTracker {
+  /** agentId → toolUseId that dispatched it, for the ids still in flight. */
+  private readonly live = new Map<string, string>();
+  /** tool_use_id → agentId, so a dispatch seen before its ack can be paired. */
+  private readonly ackByToolUse = new Map<string, string>();
+  /** Dispatch tool_use ids awaiting their launch-ack (async not yet confirmed). */
+  private readonly awaitingAck = new Set<string>();
+
+  observe(ev: TranscriptEvent): void {
+    // A genuine user-typed prompt starts a new turn and supersedes any prior
+    // turn's background waits — whether it lands as a `role:user` event or the
+    // type-ahead `attachment(queued_command)` form the CLI writes when it
+    // dequeues a submission (a resumed agent's `<task-notification>` is
+    // synthetic and both predicates exclude it, so it never trips this).
+    // Resetting here bounds the tracker: even if a completion notification is
+    // somehow never parsed, the account cannot leak past the next real prompt
+    // and wedge the card in `working`.
+    if (isMeaningfulUserEvent(ev) || isMeaningfulQueuedCommand(ev)) {
+      this.reset();
+      return;
+    }
+    for (const toolUseId of backgroundTaskDispatchToolUseIds(ev)) {
+      const agentId = this.ackByToolUse.get(toolUseId);
+      if (agentId) this.live.set(agentId, toolUseId);
+      else this.awaitingAck.add(toolUseId);
+    }
+    for (const ack of backgroundTaskDispatchAcks(ev)) {
+      this.ackByToolUse.set(ack.toolUseId, ack.agentId);
+      if (this.awaitingAck.delete(ack.toolUseId)) this.live.set(ack.agentId, ack.toolUseId);
+    }
+    const note = parseTaskNotification(ev);
+    if (note) this.live.delete(note.taskId);
+  }
+
+  /** Number of background agents still in flight. */
+  pending(): number {
+    return this.live.size;
+  }
+
+  reset(): void {
+    this.live.clear();
+    this.ackByToolUse.clear();
+    this.awaitingAck.clear();
+  }
 }
 
 /** Extract the user-typed prompt text for a "turn start" event — works for
@@ -745,7 +930,9 @@ export function extractAssistantThinking(event: TranscriptEvent): string {
 
 /** Per-entry truncation caps for the CoT tool timeline. Tool args (Write
  *  contents, long prompts) and results (file reads, command output) can be
- *  hundreds of KB — the bubble only needs a recognisable preview. */
+ *  hundreds of KB — the bubble only needs a recognisable preview.
+ *  args 截断不再影响气泡标题：标题用的 `subject` 在截断之前从完整 input 上
+ *  单独提取（见 extractCotEntries）。 */
 const COT_TOOL_ARGS_MAX_CHARS = 600;
 const COT_TOOL_RESULT_MAX_CHARS = 800;
 
@@ -757,7 +944,14 @@ function truncateForCot(s: string, max: number): string {
  *  redeclared structurally here to keep this module dependency-free. */
 export type TranscriptCotEntry =
   | { kind: 'thinking'; text: string }
-  | { kind: 'tool_call'; id: string; name: string; args: string }
+  /** Interim assistant narration (a `text` block that is not the turn's
+   *  closing answer). Kept distinct from `thinking`: see CotEntry. */
+  | { kind: 'text'; text: string }
+  | {
+    kind: 'tool_call'; id: string; name: string; args: string;
+    /** 截断前从完整 input 提取的单行主题（≤1000）；无可用字段时不带此键。 */
+    subject?: string;
+  }
   | { kind: 'tool_result'; id: string; result: string };
 
 /** Flatten a tool_result block's content (string, or array of text blocks)
@@ -774,12 +968,21 @@ function stringifyToolResultContent(content: unknown): string {
 /**
  * Extract the CoT (thinking process) entries from one transcript event, in
  * content-block order:
- *   - assistant events → `thinking` blocks and `tool_use` blocks
- *     (id + name + JSON-stringified input, truncated);
+ *   - assistant events → `thinking` blocks, `text` blocks and `tool_use`
+ *     blocks (id + name + JSON-stringified input, truncated);
  *   - user events → `tool_result` blocks (tool_use_id + flattened text,
  *     truncated).
  * Returns [] for events carrying neither. Sidechain / error filtering is the
  * caller's job (bridge-turn-queue applies it before attribution).
+ *
+ * `text` blocks are the model's mid-turn narration. They are deliberately
+ * INCLUDED even though the turn's closing answer is a `text` block too: the
+ * transcript is consumed as a stream, so "is this the last one" is not
+ * knowable at extraction time, and a bubble that repeats the final answer at
+ * its tail is far cheaper than one that silently drops every interim line —
+ * without them a turn with extended thinking off (Claude Code's default)
+ * renders as a bare row of tool nodes. Per-entry length is left uncapped like
+ * `thinking`; the worker's accumulated cap bounds the payload.
  */
 export function extractCotEntries(event: TranscriptEvent): TranscriptCotEntry[] {
   const content = event.message?.content;
@@ -789,10 +992,18 @@ export function extractCotEntries(event: TranscriptEvent): TranscriptCotEntry[] 
     if (!block || typeof block !== 'object') continue;
     if (block.type === 'thinking' && typeof block.thinking === 'string' && block.thinking.length > 0) {
       entries.push({ kind: 'thinking', text: block.thinking });
+    } else if (block.type === 'text' && typeof block.text === 'string' && block.text.trim().length > 0) {
+      entries.push({ kind: 'text', text: block.text });
     } else if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
+      // 主题必须在 stringify + 截断之前从对象上取：截断后的 JSON 解析不出来。
+      const subject = boundSubjectForTransport(subjectFromInputObject(block.input));
       let args = '';
       try { args = block.input === undefined ? '' : JSON.stringify(block.input); } catch { /* unserialisable input — show none */ }
-      entries.push({ kind: 'tool_call', id: block.id, name: block.name, args: truncateForCot(args, COT_TOOL_ARGS_MAX_CHARS) });
+      entries.push({
+        kind: 'tool_call', id: block.id, name: block.name,
+        args: truncateForCot(args, COT_TOOL_ARGS_MAX_CHARS),
+        ...(subject ? { subject } : {}),
+      });
     } else if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
       const result = stringifyToolResultContent(block.content);
       entries.push({ kind: 'tool_result', id: block.tool_use_id, result: truncateForCot(result, COT_TOOL_RESULT_MAX_CHARS) });

@@ -7,17 +7,17 @@
  * Verifies:
  *   1. spawn() creates a herdr session + botmux agent, output reaches onData
  *   2. kill() detaches the backend; the herdr session keeps running
- *   3. A fresh HerdrBackend on the same name re-attaches (no `agent start`,
+ *   3. A fresh HerdrBackend on the same name re-attaches (no fresh CLI,
  *      pane content recoverable via `pane read`)
  *   4. destroySession() actually stops the herdr session
  *   5. listBotmuxSessions() enumerates bmx-* sessions
  *
  * Requires: `herdr` on PATH. Skips otherwise.
- * Run: pnpm vitest run test/herdr-backend.e2e.ts
+ * Run: bunx vitest run --project e2e test/herdr-backend.e2e.ts
  */
 import { describe, it, expect, afterAll, afterEach, beforeEach } from 'vitest';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
 
@@ -39,10 +39,10 @@ const ORIGINAL_HERDR_CONFIG_PATH = process.env.HERDR_CONFIG_PATH;
 process.env.XDG_CONFIG_HOME = FIXTURE_XDG_CONFIG_HOME;
 process.env.HERDR_CONFIG_PATH = FIXTURE_CONFIG;
 
-// Herdr >=0.7.5 only starts a known managed-agent kind. Keep this E2E
+// The managed launch verifies a known Herdr agent kind. Keep this E2E
 // independent of any real coding-agent install by presenting a canonical
 // `pi` executable whose process is still just /bin/bash. HERDR_AGENT is
-// Herdr's cross-platform process identity hint, so the facade can verify that
+// Herdr's cross-platform process identity hint, so detection can verify that
 // the lightweight fixture is the requested managed agent.
 writeFileSync(FAKE_MANAGED_AGENT, `#!/bin/bash
 export HERDR_AGENT=pi
@@ -67,8 +67,8 @@ afterAll(() => {
 
 /**
  * Hard reset for a test session. `herdr session stop` is asynchronous and
- * leaves agent metadata behind in the session dir — subsequent `agent start`
- * calls then fail with `agent_name_taken`. We follow `stop` with a forced
+ * leaves agent metadata behind in the session dir — subsequent agent naming
+ * can fail with `agent_name_taken`. We follow `stop` with a forced
  * sessions-dir wipe so each test sees a truly clean slate.
  */
 function hardResetSession(name: string) {
@@ -125,6 +125,77 @@ describe('HerdrBackend (e2e)', () => {
     expect(HerdrBackend.hasSession(TEST_SESSION)).toBe(true);
   }, TEST_TIMEOUT);
 
+  it.skipIf(!HerdrBackend.isAvailable())('a wrapped managed agent executes the wrapper and preserves CLI argv', async () => {
+    const backend = new HerdrBackend(TEST_SESSION);
+    try {
+      // No systemd service is required: the env assignment proves the explicit
+      // launcher ran the wrapper, and printf proves the CLI received its argv.
+      backend.spawn('/usr/bin/env', [
+        'BOTMUX_HERDR_E2E_MARKER=wrapper-ran',
+        FAKE_MANAGED_AGENT,
+        '-lc', 'printf "WRAPPED:%s\\n" "$BOTMUX_HERDR_E2E_MARKER"; sleep 30',
+      ], { ...spawnOpts(), cliBin: FAKE_MANAGED_AGENT });
+
+      await waitFor(
+        () => backend.captureCurrentScreen().includes('WRAPPED:wrapper-ran'),
+        10_000,
+        'wrapper environment and CLI argv reached the managed agent',
+      );
+      expect(backend.isReattach).toBe(false);
+      expect(HerdrBackend.hasSession(TEST_SESSION)).toBe(true);
+    } finally {
+      backend.destroySession();
+    }
+  }, TEST_TIMEOUT);
+
+  it.skipIf(!HerdrBackend.isAvailable())('runs the quoted launcher even when shell rc prepends a decoy CLI to PATH', async () => {
+    const decoyDir = join(FIXTURE_ROOT, 'decoy bin');
+    const decoyCli = join(decoyDir, 'pi');
+    const shellRc = join(FIXTURE_ROOT, 'pane.bashrc');
+    const shellLauncher = join(FIXTURE_ROOT, 'rc-shell');
+    const launcherTmpdir = join(FIXTURE_ROOT, "launcher's tmp");
+    mkdirSync(decoyDir, { recursive: true });
+    mkdirSync(launcherTmpdir, { recursive: true });
+    writeFileSync(decoyCli, '#!/bin/sh\necho DECOY\nexec /bin/sleep 30\n', { mode: 0o700 });
+    writeFileSync(shellRc, [
+      // Queue pane run while rc is still loading, then shadow the CLI by name.
+      '/bin/sleep 0.2',
+      `export PATH='${decoyDir}':"$PATH"`,
+      'printf "RC_PI=%s\\n" "$(command -v pi)"',
+      '',
+    ].join('\n'));
+    writeFileSync(shellLauncher, `#!/bin/sh\nexec /bin/bash --noprofile --rcfile '${shellRc}' -i\n`, { mode: 0o700 });
+    const originalConfig = readFileSync(FIXTURE_CONFIG, 'utf8');
+    const originalLauncherTmpdir = process.env.TMPDIR;
+    const backend = new HerdrBackend(TEST_SESSION);
+    try {
+      writeFileSync(FIXTURE_CONFIG, `[terminal]\ndefault_shell = "${shellLauncher}"\nshell_mode = "non_login"\n`);
+      // Exercise shell quoting as well as PATH shadowing. Herdr must preserve
+      // the one COMMAND argument containing this absolute launcher path.
+      process.env.TMPDIR = launcherTmpdir;
+      backend.spawn('/usr/bin/env', [
+        'BOTMUX_HERDR_E2E_MARKER=rc-wrapper-ran',
+        FAKE_MANAGED_AGENT,
+        '-lc', 'printf "EXPLICIT:%s\\n" "$BOTMUX_HERDR_E2E_MARKER"; sleep 30',
+      ], { ...spawnOpts(), cliBin: FAKE_MANAGED_AGENT });
+
+      await waitFor(
+        () => backend.captureCurrentScreen().includes('EXPLICIT:rc-wrapper-ran'),
+        10_000,
+        'explicit launcher bypassed the rc PATH decoy',
+      );
+      const screen = backend.captureCurrentScreen();
+      expect(screen).toContain(`RC_PI=${decoyCli}`);
+      expect(screen).not.toContain('DECOY');
+      expect(HerdrBackend.hasAgent(TEST_SESSION, 'botmux')).toBe(true);
+    } finally {
+      backend.destroySession();
+      if (originalLauncherTmpdir === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = originalLauncherTmpdir;
+      writeFileSync(FIXTURE_CONFIG, originalConfig);
+    }
+  }, TEST_TIMEOUT);
+
   it.skipIf(!HerdrBackend.isAvailable())('re-attach observes the same agent without spawning a new one', async () => {
     // Phase 1: create the session and let it produce a marker line.
     const be1 = new HerdrBackend(TEST_SESSION);
@@ -162,7 +233,7 @@ describe('HerdrBackend (e2e)', () => {
     // row when the server reboots. The old code reused that zombie row and
     // skipped `agent start`, so the resume:true respawn never ran the new CLI
     // (the pane showed only a shell prompt). Fix: killSession() now deletes the
-    // session, and a NON-reattach spawn always `agent start`s.
+    // session, and a NON-reattach spawn always runs the new CLI.
     const be1 = new HerdrBackend(TEST_SESSION);
     be1.spawn(FAKE_MANAGED_AGENT, ['-lc', 'echo FIRST_CLI; sleep 30'], spawnOpts());
     await waitFor(() => be1.captureCurrentScreen().includes('FIRST_CLI'), 10_000, 'FIRST_CLI ran');
@@ -247,9 +318,8 @@ describe('HerdrBackend (e2e)', () => {
     const exits: Array<[number | null, string | null]> = [];
     backend.onExit((code, signal) => exits.push([code, signal]));
 
-    // Herdr 0.7.5 deliberately requires a 3s stable/interactive window before
-    // `agent start` returns. Exit immediately after that window, then verify
-    // the bg `wait agent-status` / 500ms poll observes the disappearance.
+    // Stay alive long enough for automatic detection and naming to complete,
+    // then verify the bg wait agent-status / 500ms poll sees the disappearance.
     backend.spawn(FAKE_MANAGED_AGENT, ['-lc', 'echo BYE; sleep 4; exit 0'], spawnOpts());
 
     await waitFor(() => exits.length > 0, 15_000, 'onExit fired');

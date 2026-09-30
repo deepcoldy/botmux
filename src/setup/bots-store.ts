@@ -6,12 +6,20 @@
  */
 import { writeFileSync, renameSync, existsSync, readFileSync } from 'node:fs';
 import { withFileLockSync } from '../utils/file-lock.js';
+import { assertCodexInstanceConfigWrite } from '../services/codex-instance-config-guard.js';
+import { assertQuotaFallbackGraphAcyclic } from '../services/quota-fallback.js';
+import { assertChangedBotConfigInvariants } from '../services/bot-config-invariants.js';
 
 export function writeBotsJsonAtomic(botsJsonPath: string, bots: any[]): void {
   // PM2 start surfaces hold this same generation lock from snapshot through
   // post-start verification/rollback, so the ecosystem and its expected names
   // can never be built from different bots.json generations.
   withFileLockSync(botsJsonPath, () => {
+    const previous = existsSync(botsJsonPath) ? JSON.parse(readFileSync(botsJsonPath, 'utf8')) as any[] : [];
+    assertCodexInstanceConfigWrite(previous, bots);
+    assertChangedBotConfigInvariants(previous, bots);
+    // Clone/onboarding callers pass the exact generation they intend to save.
+    assertQuotaFallbackGraphAcyclic(bots);
     // 注意: tmp 必须在同一目录下 (同 fs), 否则 rename 可能跨文件系统失败.
     const tmp = botsJsonPath + '.tmp';
     writeFileSync(tmp, JSON.stringify(bots, null, 2) + '\n', { mode: 0o600 });

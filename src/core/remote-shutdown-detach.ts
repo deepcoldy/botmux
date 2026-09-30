@@ -220,6 +220,7 @@ function clearWorkerOwnership(ds: DaemonSession, worker: ChildProcess): void {
   ds.workerPort = null;
   ds.workerToken = null;
   ds.workerViewToken = null;
+  ds.workerCardViewToken = null;
   ds.managedTurnOrigin = undefined;
   ds.remoteShutdownState = undefined;
 }

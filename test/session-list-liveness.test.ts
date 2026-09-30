@@ -31,6 +31,13 @@ describe('botmux list session liveness', () => {
     )).toBe('keep');
   });
 
+  it('keeps empty headless sessions before their first worker turn', () => {
+    expect(sessionListDisposition(
+      { headless: { id: 'hl_1' } },
+      { hasPid: false, hasBackingSession: false },
+    )).toBe('keep');
+  });
+
   it('still prunes a never-started scratch row (no real-CLI markers, no pid/backing) silently', () => {
     expect(sessionListDisposition({}, { hasPid: false, hasBackingSession: false })).toBe('prune_scratch');
   });
@@ -46,6 +53,7 @@ describe('botmux list session liveness', () => {
     expect(isRealManagedSession({ cliId: 'codex' })).toBe(true);
     expect(isRealManagedSession({ lastCliInput: 'hi' })).toBe(true);
     expect(isRealManagedSession({ adoptedFrom: { source: 'tmux' } })).toBe(true);
+    expect(isRealManagedSession({ headless: { id: 'hl_1' } })).toBe(true);
     expect(isRealManagedSession({})).toBe(false);
   });
 });

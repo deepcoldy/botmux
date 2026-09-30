@@ -24,6 +24,39 @@ export interface OrdinaryTurnRecoveryState {
   /** True once the one user-visible warning has been scheduled. */
   warningDispatched?: boolean;
   cancelledByTurnId?: string;
+  /** Type-ahead successors admitted while the owner was still running, in
+   *  admission order. Claude runs them after the owner, so ownership moves to
+   *  the head of this list when the owner completes; a terminal for one of them
+   *  while the owner is still `running` means the owner's terminal was lost and
+   *  the successor is adopted on the spot. Absent when empty. */
+  queuedLogicalTurnIds?: string[];
+  /** Logical turns (owner or queued successor) whose fire was a silent
+   *  scheduled run. Frozen at admission from the daemon's runtime silent
+   *  registry and persisted here, because that registry does not survive a
+   *  daemon restart while a backoff timer or a delivered continuation does:
+   *  every continuation of such a turn must stay silent, and restore re-arms
+   *  the registry from this list before re-arming the timer. Pruned to the live
+   *  owner + queue on every commit; absent when empty (pre-upgrade archives have
+   *  no field and are read as loud, the pre-existing semantics). */
+  silentLogicalTurnIds?: string[];
+}
+
+/** The slot is held by the original logical turn itself, still running — no
+ *  continuation has been dispatched for it. Only then may a queued successor's
+ *  terminal mean "the owner's terminal was lost" and be adopted. */
+function ownerAwaitingOwnTerminal(state: OrdinaryTurnRecoveryState): boolean {
+  return state.status === 'running' && state.currentTurnId === state.logicalTurnId;
+}
+
+/** Bound on remembered type-ahead successors; older ones are forgotten first. */
+const MAX_QUEUED_LOGICAL_TURNS = 32;
+
+function withQueuedLogicalTurnIds(
+  state: OrdinaryTurnRecoveryState,
+  queued: readonly string[],
+): OrdinaryTurnRecoveryState {
+  const { queuedLogicalTurnIds: _dropped, ...rest } = state;
+  return queued.length > 0 ? { ...rest, queuedLogicalTurnIds: [...queued] } : rest;
 }
 
 export interface OrdinaryTurnRecoveryTerminal {
@@ -38,6 +71,48 @@ export interface OrdinaryTurnRecoveryDispatch {
   turnId: string;
   prompt: string;
   continuation: number;
+  /** The logical turn was a silent scheduled fire: the continuation must be
+   *  armed silent too. Read from the persisted state, never from runtime. */
+  silent: boolean;
+}
+
+export interface OrdinaryTurnBeginOptions {
+  /** Freeze "this fire is silent" onto the logical turn at admission. */
+  silent?: boolean;
+}
+
+function isSilentLogicalTurn(state: OrdinaryTurnRecoveryState, logicalTurnId: string): boolean {
+  return (state.silentLogicalTurnIds ?? []).includes(logicalTurnId);
+}
+
+/** Keep silent marks only for turns the state still tracks (owner + queue).
+ *  Applied at commit time, i.e. after a promotion/adoption has already chosen
+ *  the new owner, so the promoted turn's own mark is never dropped early. */
+function pruneSilentLogicalTurnIds(state: OrdinaryTurnRecoveryState): OrdinaryTurnRecoveryState {
+  const { silentLogicalTurnIds, ...rest } = state;
+  if (!silentLogicalTurnIds) return rest;
+  const live = new Set([state.logicalTurnId, ...(state.queuedLogicalTurnIds ?? [])]);
+  const kept = silentLogicalTurnIds.filter((id, index, all) => live.has(id) && all.indexOf(id) === index);
+  return kept.length > 0 ? { ...rest, silentLogicalTurnIds: kept } : rest;
+}
+
+/** Turn ids a daemon restore must re-arm in its runtime silent registry before
+ *  re-arming the recovery timer: every silent logical turn still tracked, plus
+ *  the delivered continuation of a silent owner (its id differs from the
+ *  logical id). Settled states are included on purpose: the registry keeps a
+ *  mark past turn_terminal so late idle/final events stay hushed, and a restart
+ *  right after a silent continuation settled must not turn those late events
+ *  loud. Marks are turn-exact and TTL/size bounded, so re-arming a finished id
+ *  can never hush another turn. */
+export function ordinaryTurnRecoverySilentTurnIds(
+  state: OrdinaryTurnRecoveryState | undefined,
+): string[] {
+  if (!state) return [];
+  const ids = [...(state.silentLogicalTurnIds ?? [])];
+  if (isSilentLogicalTurn(state, state.logicalTurnId) && state.currentTurnId !== state.logicalTurnId) {
+    ids.push(state.currentTurnId);
+  }
+  return ids;
 }
 
 export interface OrdinaryTurnRecoveryDeps<TTimer = unknown> {
@@ -46,6 +121,11 @@ export interface OrdinaryTurnRecoveryDeps<TTimer = unknown> {
   persist: (state: OrdinaryTurnRecoveryState) => void;
   enqueue: (dispatch: OrdinaryTurnRecoveryDispatch) => boolean;
   warn: (state: OrdinaryTurnRecoveryState) => void;
+  /** Identity for the next continuation of `logicalTurnId`. Return undefined
+   *  to keep the default `bmx-recovery-<random>` id. The daemon uses this to
+   *  keep a scheduled turn's `schedule:<taskId>:<uuid>` provenance on its
+   *  continuation, so the continuation authenticates exactly like the fire. */
+  mintContinuationTurnId?: (logicalTurnId: string, continuation: number) => string | undefined;
   now?: () => number;
   randomId?: () => string;
   backoffMs?: readonly number[];
@@ -87,7 +167,7 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
     if (this.state.status === 'backoff') this.armBackoff();
   }
 
-  begin(logicalTurnId: string): OrdinaryTurnRecoveryState {
+  begin(logicalTurnId: string, opts: OrdinaryTurnBeginOptions = {}): OrdinaryTurnRecoveryState {
     // Claude can accept type-ahead while the preceding turn is still running.
     // A session-level slot must keep owning that earlier terminal instead of
     // being overwritten by the queued successor; otherwise the earlier failed
@@ -95,7 +175,23 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
     // entered backoff (or reached a terminal state), a fresh admitted user turn
     // may replace it as before.
     if (this.state?.status === 'running' || this.state?.status === 'dispatching') {
-      return this.state;
+      // Remember the successor without disturbing the live owner. A persist
+      // failure here degrades to the old behaviour (successor not tracked).
+      const live = this.state;
+      const queued = live.queuedLogicalTurnIds ?? [];
+      if (logicalTurnId === live.currentTurnId || logicalTurnId === live.logicalTurnId
+        || queued.includes(logicalTurnId)) return live;
+      try {
+        const withQueue = withQueuedLogicalTurnIds(
+          live,
+          [...queued, logicalTurnId].slice(-MAX_QUEUED_LOGICAL_TURNS),
+        );
+        return this.commit(opts.silent
+          ? { ...withQueue, silentLogicalTurnIds: [...(withQueue.silentLogicalTurnIds ?? []), logicalTurnId] }
+          : withQueue);
+      } catch {
+        return live;
+      }
     }
     const wasBackoff = this.state?.status === 'backoff';
     this.cancelTimer();
@@ -105,6 +201,7 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
         currentTurnId: logicalTurnId,
         continuationsStarted: 0,
         status: 'running',
+        ...(opts.silent ? { silentLogicalTurnIds: [logicalTurnId] } : {}),
       });
     } catch (err) {
       if (wasBackoff) this.armBackoff();
@@ -116,9 +213,46 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
     current: OrdinaryTurnRecoveryState,
     terminal: OrdinaryTurnRecoveryTerminal,
   ): OrdinaryTurnRecoveryState {
-    if (terminal.turnId !== current.currentTurnId
-      || current.status !== 'running') return current;
-    if (terminal.status === 'completed') return this.commit({ ...current, status: 'completed' });
+    if (terminal.turnId !== current.currentTurnId) {
+      const queued = current.queuedLogicalTurnIds ?? [];
+      if (!queued.includes(terminal.turnId)) return current;
+      const remaining = withQueuedLogicalTurnIds(current, queued.filter(id => id !== terminal.turnId));
+      // The owner's own recovery is in flight (backoff timer, dispatching, or
+      // an already-delivered continuation that is still running) or the owner
+      // already settled: the successor ran on its own and is simply forgotten
+      // here — the delivered continuation keeps the slot.
+      if (!ownerAwaitingOwnTerminal(current)) return this.commit(remaining);
+      // The owner never reported a terminal (lost/missed) yet its successor
+      // did: the successor is the live turn now, and its terminal is handled
+      // exactly as an owner terminal would be.
+      const adopted = this.commit({
+        ...remaining,
+        logicalTurnId: terminal.turnId,
+        currentTurnId: terminal.turnId,
+        continuationsStarted: 0,
+        status: 'running',
+        nextAttemptAt: undefined,
+        lastErrorCode: undefined,
+        alertSentAt: undefined,
+        warningDispatched: undefined,
+      });
+      return this.onTerminal(adopted, terminal);
+    }
+    if (current.status !== 'running') return current;
+    if (terminal.status === 'completed') {
+      const [next, ...rest] = current.queuedLogicalTurnIds ?? [];
+      if (next === undefined) return this.commit({ ...current, status: 'completed' });
+      // Hand the slot to the type-ahead successor Claude is about to run, so
+      // its failure has a recovery consumer instead of only the fallback card.
+      // The silent marks ride along; commit prunes them to the new owner + queue.
+      return this.commit(withQueuedLogicalTurnIds({
+        logicalTurnId: next,
+        currentTurnId: next,
+        continuationsStarted: 0,
+        status: 'running',
+        ...(current.silentLogicalTurnIds ? { silentLogicalTurnIds: current.silentLogicalTurnIds } : {}),
+      }, rest));
+    }
     if (terminal.errorCode === 'provider_rate_limited') return current;
     if (terminal.status !== 'failed' || terminal.retryable !== true) {
       const next = {
@@ -207,7 +341,8 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       const live = this.state;
       if (!live || live.status !== 'backoff') return;
       const continuation = live.continuationsStarted + 1;
-      const turnId = `bmx-recovery-${this.randomId()}`;
+      const turnId = this.deps.mintContinuationTurnId?.(live.logicalTurnId, continuation)
+        ?? `bmx-recovery-${this.randomId()}`;
       // Persist the exact synthetic turn before handing it to IPC. If the
       // daemon crashes after this write, restore fails closed instead of
       // replaying a continuation whose external effects may already have
@@ -226,6 +361,7 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
           turnId,
           prompt: ORDINARY_TURN_RECOVERY_PROMPT,
           continuation,
+          silent: isSilentLogicalTurn(dispatching, dispatching.logicalTurnId),
         });
       } catch {
         enqueued = false;
@@ -260,7 +396,7 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
 
   private commit(state: OrdinaryTurnRecoveryState): OrdinaryTurnRecoveryState {
     const prior = this.state;
-    const next = { ...state };
+    const next = pruneSilentLogicalTurnIds({ ...state });
     this.state = next;
     try {
       this.deps.persist(next);
@@ -381,13 +517,20 @@ export function ordinaryTurnRecoveryHandlesTerminal(
   terminal: OrdinaryTurnRecoveryTerminal,
 ): boolean {
   const current = session.ordinaryTurnRecovery;
-  return attachedRecoveries.get(session.sessionId)?.session === session
-    && current?.currentTurnId === terminal.turnId;
+  if (attachedRecoveries.get(session.sessionId)?.session !== session || !current) return false;
+  if (current.currentTurnId === terminal.turnId) return true;
+  // A queued type-ahead successor is adopted by onTerminal only while the
+  // original owner itself is still running (no continuation dispatched); in any
+  // other state its terminal is merely forgotten and the fallback notice must
+  // stay in charge.
+  return ownerAwaitingOwnTerminal(current)
+    && (current.queuedLogicalTurnIds ?? []).includes(terminal.turnId);
 }
 
 export function beginOrdinaryTurnRecovery(
   session: OrdinaryTurnRecoverySession,
   logicalTurnId: string,
+  opts: OrdinaryTurnBeginOptions = {},
 ): OrdinaryTurnRecoveryState | undefined {
   const attached = attachedRecoveries.get(session.sessionId);
   if (!attached) return session.ordinaryTurnRecovery;
@@ -397,7 +540,7 @@ export function beginOrdinaryTurnRecovery(
   if (session.ordinaryTurnRecovery) {
     attached.coordinator.restore(session.ordinaryTurnRecovery);
   }
-  return attached.coordinator.begin(logicalTurnId);
+  return attached.coordinator.begin(logicalTurnId, opts);
 }
 
 export function cancelOrdinaryTurnRecoveryForUserInput(

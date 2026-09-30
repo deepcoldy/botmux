@@ -26,7 +26,7 @@ vi.mock('../src/config.js', () => ({
   },
 }));
 
-import { getProjectScanDir, getProjectScanDirs } from '../src/core/session-manager.js';
+import { getProjectScanDir, getProjectScanDirs, getSessionWorkingDir } from '../src/core/session-manager.js';
 
 const HOME = process.env.HOME ?? '/root';
 
@@ -112,5 +112,53 @@ describe('getProjectScanDirs (multi)', () => {
 
   it('falls back to global config workingDirs rooted at themselves (no bot)', () => {
     expect(getProjectScanDirs(undefined)).toEqual(['/global/repos']);
+  });
+});
+
+/**
+ * Unpinned-session dir resolution. A session with no `workingDir` of its own is
+ * exactly one that never went through the spawn-path resolver
+ * (resolvePinnedWorkingDir), so its fallback must match what that resolver
+ * would have pinned: the effective bot default FIRST, the legacy `workingDir`
+ * (which doubles as the repo-scan root) only after.
+ */
+describe('getSessionWorkingDir (unpinned fallback)', () => {
+  it('prefers the bot default over the legacy workingDir', () => {
+    mockGetBot.mockReturnValue({ config: { workingDir: '/repos', defaultWorkingDir: '/roles/beta' } });
+    expect(getSessionWorkingDir({ larkAppId: 'a1' } as any)).toBe('/roles/beta');
+  });
+
+  it('uses defaultOncall.workingDir when Oncall mode is on', () => {
+    mockGetBot.mockReturnValue({
+      config: { workingDir: '/repos', defaultOncall: { enabled: true, workingDir: '~/roles/oncall' } },
+    });
+    expect(getSessionWorkingDir({ larkAppId: 'a1' } as any)).toBe(`${HOME}/roles/oncall`);
+  });
+
+  it('ignores a DISABLED defaultOncall and keeps the legacy workingDir', () => {
+    mockGetBot.mockReturnValue({
+      config: { workingDir: '/repos', defaultOncall: { enabled: false, workingDir: '/roles/oncall' } },
+    });
+    expect(getSessionWorkingDir({ larkAppId: 'a1' } as any)).toBe('/repos');
+  });
+
+  it('never overrides an explicitly pinned session dir', () => {
+    mockGetBot.mockReturnValue({ config: { workingDir: '/repos', defaultWorkingDir: '/roles/beta' } });
+    expect(getSessionWorkingDir({ larkAppId: 'a1', workingDir: '~/pinned' } as any)).toBe(`${HOME}/pinned`);
+  });
+
+  // `defaultWorkingDir` + auto-worktree means "base to branch a worktree off",
+  // never "launch here" — handing it out as a plain fallback would drop the
+  // session straight into the shared repo.
+  it('does NOT hand out the bot default when auto-worktree is on', () => {
+    mockGetBot.mockReturnValue({
+      config: { workingDir: '/repos', defaultWorkingDir: '/base/repo', defaultWorkingDirAutoWorktree: true },
+    });
+    expect(getSessionWorkingDir({ larkAppId: 'a1' } as any)).toBe('/repos');
+  });
+
+  it('still lands on $HOME when the bot configures neither', () => {
+    mockGetBot.mockReturnValue({ config: {} });
+    expect(getSessionWorkingDir({ larkAppId: 'a1' } as any)).toBe(HOME);
   });
 });

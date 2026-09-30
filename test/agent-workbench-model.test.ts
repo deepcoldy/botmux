@@ -326,7 +326,7 @@ describe('Agent Workbench 六维分组', () => {
       expect(idsIn(perDimension, 'needs-you'), option.value).toEqual(['session-4', 'session-2']);
     }
     expect(WORKBENCH_GROUP_DIMENSIONS.map(option => option.value))
-      .toEqual(['status', 'bot', 'chat', 'kind', 'cli', 'time']);
+      .toEqual(['status', 'bot', 'chat', 'kind', 'cli', 'time', 'worktree']);
     expect(WORKBENCH_GROUP_DIMENSIONS.every(option => isWorkbenchGroupDimension(option.value))).toBe(true);
     for (const bad of ['repo', '', 'STATUS', null, 42, ['bot']]) {
       expect(isWorkbenchGroupDimension(bad), String(bad)).toBe(false);

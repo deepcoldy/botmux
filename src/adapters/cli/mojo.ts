@@ -22,6 +22,7 @@
  *
  * Empirically verified against @byted/mojo 1.0.10 (linux-x64).
  */
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 
 export function createMojoAdapter(_pathOverride?: string): CliAdapter {
@@ -71,13 +72,7 @@ export function createMojoAdapter(_pathOverride?: string): CliAdapter {
         // Verified via `mojo -p --model <bad>` → exit code 2, with the full list
         // printed to stderr. Kept static here for synchronous UI enumeration;
         // MojoBackend.probeModels() can refresh it from that stderr at runtime.
-        modelChoices: [
-            'doubao-seed-2.0-dogfooding',
-            'glm-5-turbo',
-            'gpt-5.4-2026-03-05',
-            'gpt-5.5-2026-04-24',
-            'gpt-5.5-ptu',
-        ],
+        modelChoices: CLI_MODEL_CHOICES['mojo'],
     };
 }
 

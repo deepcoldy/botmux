@@ -96,9 +96,11 @@ export interface BotmuxWrapperFile {
  * The wrapper files to materialize in ~/.botmux/bin. Always a POSIX `sh`
  * wrapper (used by macOS/Linux and Git Bash/WSL); on Windows additionally a
  * `botmux.cmd` so native shells (cmd.exe / PowerShell) resolve `botmux` —
- * without it `botmux send` from a Windows-native CLI session fails. The `.cmd`
- * pins the daemon's current Node binary so it never depends on a PATH-resolved
- * `node`. Both wrappers point at THIS daemon's dist/cli.js.
+ * without it `botmux send` from a Windows-native CLI session fails. BOTH the `sh`
+ * and `.cmd` wrappers pin the daemon's current interpreter (`process.execPath`)
+ * so neither depends on a PATH-resolved `node` — see the pinning note in the
+ * function body for the outage that proved the bare name unsafe. Both wrappers
+ * point at THIS daemon's dist/cli.js.
  *
  * ⚠️ COMPILED-BINARY MODE (`standalone: true`) — do not collapse these branches.
  * Under a `bun build --compile` executable there is no `cli.js` on disk: the
@@ -153,11 +155,26 @@ export function botmuxWrapperFiles(
     }
     return files;
   }
+  // Pin the interpreter to THIS daemon's own `process.execPath` instead of a bare
+  // `node`. A bare name is resolved by PATH at exec time, in whatever environment
+  // happens to invoke the wrapper — which is NOT the environment that wrote it.
+  // MEASURED failure (2026-09-08): a restart whose PATH put /usr/bin ahead of the
+  // fnm shims resolved `node` to v18.20.4, which has no `node:sqlite`; the session
+  // store's hard gate then killed all 55 bot daemons at boot (10 restarts each,
+  // then parked `errored`), and every Lark topic looked wiped even though all 57
+  // SQLite stores were intact. The supervisor survived, so it reported success
+  // while every child died. Pinning removes the PATH variable entirely: the
+  // interpreter that wrote the wrapper is the one that runs it.
+  //
+  // This also makes Bun a first-class host: under `bun dist/cli.js` execPath is
+  // the bun binary, and Bun runs dist/*.js plus provides bun:sqlite, so the very
+  // same wrapper shape works with no runtime-specific branch here.
+  const interpreter = nodePath;
   const files: BotmuxWrapperFile[] = [
-    { name: BOTMUX_WRAPPER_BASENAME, content: `#!/bin/sh\nexec node "${cliScript}" "$@"\n`, mode: 0o755 },
+    { name: BOTMUX_WRAPPER_BASENAME, content: `#!/bin/sh\nexec "${interpreter}" "${cliScript}" "$@"\n`, mode: 0o755 },
     {
       name: NATIVE_SUBAGENT_RUNTIME_HOOK_WRAPPER_BASENAME,
-      content: `#!/bin/sh\nexec node "${cliScript}" native-subagent-runtime-hook "$@"\n`,
+      content: `#!/bin/sh\nexec "${interpreter}" "${cliScript}" native-subagent-runtime-hook "$@"\n`,
       mode: 0o755,
     },
   ];

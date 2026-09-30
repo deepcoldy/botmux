@@ -13,6 +13,7 @@ import { describe, it, expect } from 'vitest';
 import {
   createGroupCompletionStatus,
   resolveBotRefs,
+  resolveChatMode,
   resolveKickoff,
   shouldWriteCreateGroupCompletionStatus,
 } from '../src/cli/create-group-resolver.js';
@@ -117,6 +118,28 @@ describe('resolveBotRefs', () => {
     const r = resolveBotRefs(['cli_claude_1'], [CFG_CLAUDE], [INFO_CLAUDE]);
     expect(r.larkAppIds).toEqual(['cli_claude_1']);
     expect(r.ambiguousWarnings).toEqual([]);
+  });
+});
+
+describe('resolveChatMode', () => {
+  it('omits chatMode when the flag is absent or blank', () => {
+    expect(resolveChatMode(undefined)).toEqual({ ok: true });
+    expect(resolveChatMode('')).toEqual({ ok: true });
+    expect(resolveChatMode('   ')).toEqual({ ok: true });
+  });
+
+  it('accepts group and topic, trimming and lowercasing', () => {
+    expect(resolveChatMode('group')).toEqual({ ok: true, chatMode: 'group' });
+    expect(resolveChatMode('topic')).toEqual({ ok: true, chatMode: 'topic' });
+    expect(resolveChatMode('  TOPIC ')).toEqual({ ok: true, chatMode: 'topic' });
+  });
+
+  it('rejects any other value (including p2p, which is not a creatable group)', () => {
+    for (const bad of ['p2p', 'thread', 'Topic Group', '话题']) {
+      const r = resolveChatMode(bad);
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error).toContain('--chat-mode');
+    }
   });
 });
 

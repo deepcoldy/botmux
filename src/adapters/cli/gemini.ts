@@ -1,3 +1,4 @@
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
@@ -52,7 +53,7 @@ export function createGeminiAdapter(pathOverride?: string): CliAdapter {
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,                // Ink renders in alternate screen buffer by default
     skillsDir: '~/.gemini/skills',
-    modelChoices: ['gemini-2.5-pro', 'gemini-2.5-flash'],
+    modelChoices: CLI_MODEL_CHOICES['gemini'],
   };
 }
 

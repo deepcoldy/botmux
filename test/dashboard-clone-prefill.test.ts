@@ -120,3 +120,30 @@ describe('clone native subagent runtime policy', () => {
     expect(cloned.nativeSubagentRuntime).toEqual(nativeSubagentRuntime);
   });
 });
+
+describe('clone launch-mode fields', () => {
+  it('does not retain a target Forge launch mode when the source bot is plain CLI', () => {
+    const cloned = cloneBotConfig(
+      { larkAppId: 'cli_source', cliId: 'codex' },
+      {
+        larkAppId: 'cli_target',
+        larkAppSecret: 'target-secret',
+        cliId: 'traex',
+        cliLaunchMode: 'forge-traex',
+      },
+    );
+
+    expect(cloned.cliId).toBe('codex');
+    expect(cloned.cliLaunchMode).toBeUndefined();
+  });
+
+  it('copies Forge x TraeX launch mode only when the source bot owns it', () => {
+    const cloned = cloneBotConfig(
+      { larkAppId: 'cli_source', cliId: 'traex', cliLaunchMode: 'forge-traex' },
+      { larkAppId: 'cli_target', larkAppSecret: 'target-secret', cliId: 'codex' },
+    );
+
+    expect(cloned.cliId).toBe('traex');
+    expect(cloned.cliLaunchMode).toBe('forge-traex');
+  });
+});

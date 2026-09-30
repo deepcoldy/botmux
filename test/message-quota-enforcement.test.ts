@@ -92,6 +92,7 @@ vi.mock('../src/services/team-groups-store.js', async () => {
 });
 
 import { registerBot, getBot } from '../src/bot-registry.js';
+import * as sessionStore from '../src/services/session-store.js';
 import { parseSlashCommandInvocation } from '../src/core/command-handler.js';
 import {
   enforceMessageQuotaForCliInput,
@@ -284,6 +285,21 @@ describe('message quota enforcement', () => {
     expect(mocks.consumeQuota).toHaveBeenCalledWith('quota_app', 'global:ou_global', undefined, undefined);
     expect(mocks.removeGlobalGrant).toHaveBeenCalledWith('quota_app', 'ou_global');
     expect(mocks.replyMessage).toHaveBeenCalled();
+  });
+
+  it('exhausted notice wording: default asks for /grant; grantRequestToOwnerDm says the next message re-applies', async () => {
+    mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: false, used: 5, limit: 5 });
+    await enforceMessageQuotaForCliInput('quota_app', 'oc_1', 'ou_chat', 'om_ex_default', 'om_anchor');
+    expect(mocks.buildQuotaExhaustedCard).toHaveBeenLastCalledWith('ou_chat', 5, expect.anything(), false);
+
+    getBot('quota_app').config.grantRequestToOwnerDm = true;
+    await enforceMessageQuotaForCliInput('quota_app', 'oc_1', 'ou_both', 'om_ex_reapply', 'om_anchor');
+    expect(mocks.buildQuotaExhaustedCard).toHaveBeenLastCalledWith('ou_both', 5, expect.anything(), true);
+
+    // autoGrantRequestCards=false 时下一条不会弹卡，文案不能承诺自动申请
+    getBot('quota_app').config.autoGrantRequestCards = false;
+    await enforceMessageQuotaForCliInput('quota_app', 'oc_9', 'ou_global', 'om_ex_nocards', 'om_anchor');
+    expect(mocks.buildQuotaExhaustedCard).toHaveBeenLastCalledWith('ou_global', 5, expect.anything(), false);
   });
 
   it('P1: explicit-unlimited grant is NOT re-capped by messageQuota.defaultLimit', async () => {
@@ -479,6 +495,8 @@ describe("p2pMode='group' 建群前扣费点：命令判定必须早于扣费", 
 
   beforeEach(() => {
     vi.clearAllMocks();
+    process.env.SESSION_DATA_DIR = mkdtempSync(join(tmpdir(), 'botmux-quota-p2p-'));
+    sessionStore.init(APP);
     mocks.beginCharge.mockReturnValue('fresh');
     mocks.consumeQuota.mockResolvedValue({ tracked: true, allow: true, exhausted: false, used: 1, limit: 3 });
     mocks.getGrantExpiresAt.mockReturnValue(undefined);

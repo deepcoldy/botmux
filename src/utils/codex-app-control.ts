@@ -43,6 +43,11 @@ import type { ScreenStatus } from '../types.js';
 export const CODEX_APP_CONTROL_BOOTSTRAP_ENV = 'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP';
 
 export const CODEX_APP_CONTROL_LINE_MAX_BYTES = 4_096;
+/**
+ * Maximum JSON-serialized payload for a cosmetic CoT marker. This leaves
+ * headroom in the control line for the signed marker envelope.
+ */
+export const CODEX_APP_CONTROL_COT_PAYLOAD_MAX_BYTES = 3_000;
 export const CODEX_APP_CONTROL_FINAL_MAX_BYTES = 1_048_576;
 export const CODEX_APP_CONTROL_FINAL_CHUNK_BYTES = 1_536;
 /** Keep control bootstrap/proof alive for the worker's existing cold-start cap. */

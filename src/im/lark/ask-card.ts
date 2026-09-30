@@ -1,3 +1,4 @@
+import { parseLinkDestination } from 'markdown-it/lib/helpers/index.mjs';
 import type {
   AskCardDispatcher,
   AskClickOutcome,
@@ -8,8 +9,10 @@ import { AskDispatchError } from '../../core/ask-types.js';
 import { getAskSnapshot, submitAsk, toggleAsk, tryResolveAsk } from '../../core/ask-broker.js';
 import { logger } from '../../utils/logger.js';
 import { t, localeForBot, type Locale } from '../../i18n/index.js';
+import { askOptionLayoutForBot, type AskOptionLayout } from './ask-option-layout.js';
 import { replyMessage, sendMessage, updateMessage } from './client.js';
 import { requestGrantForAskClicker } from './ask-grant-request.js';
+import { publishReplyCardAsk, replyCardAskCanAct } from '../../core/turn-reply-ask.js';
 
 /** 旧单选即答动作（保留兼容旧卡片回调；Task 5 新增 ask_submit 路径）。 */
 export const ASK_SELECT_ACTION = 'ask_select';
@@ -23,6 +26,8 @@ export const ASK_TOGGLE_ACTION = 'ask_toggle';
 const MAX_BUTTONS_PER_ACTION_ROW = 4;
 
 export interface AskCardActionData {
+  context?: { open_message_id?: string };
+  open_message_id?: string;
   operator?: { open_id?: string };
   action?: {
     value?: Record<string, unknown>;
@@ -39,6 +44,7 @@ export interface AskCardDispatcherDeps {
 /** 点击处理的可注入依赖。目前只有「未授权 → 弹授权卡」这一路（供单测替换）。 */
 export interface AskCardActionDeps {
   requestGrant?: typeof requestGrantForAskClicker;
+  larkAppId?: string;
 }
 
 export function createLarkAskCardDispatcher(
@@ -50,6 +56,13 @@ export function createLarkAskCardDispatcher(
 
   return {
     async send(ask) {
+      if (ask.replyCardTarget) {
+        try { return { messageId: await publishReplyCardAsk(ask) }; }
+        catch (err) {
+          const { retryable, detail } = classifyAskDispatchError(err);
+          throw new AskDispatchError(detail, retryable);
+        }
+      }
       const cardJson = buildAskCard(ask);
       // botmux 把 chat-scope session 的 routing anchor 也叫 rootMessageId,
       // 但在 chat-scope 下它实际是 chat_id (oc_...) 而非 message_id (om_...).
@@ -75,6 +88,7 @@ export function createLarkAskCardDispatcher(
       }
     },
     async onSettle(ask, result) {
+      if (ask.replyCardTarget) { await publishReplyCardAsk(ask, result); return; }
       if (!ask.cardMessageId) return;
       try {
         await update(ask.larkAppId, ask.cardMessageId, buildAskCard(ask, result));
@@ -199,6 +213,9 @@ export async function handleAskCardAction(
   if (!askId || !nonce || !by) {
     return staleToast(locale);
   }
+  const pending = getAskSnapshot(askId);
+  if (deps.larkAppId && pending && pending.larkAppId !== deps.larkAppId) return staleToast(locale);
+  if (pending?.replyCardTarget && !replyCardAskCanAct(pending, data.context?.open_message_id ?? data.open_message_id)) return staleToast(locale);
 
   /** unauthorized 不再是死胡同：复用对话路径的授权卡向 owner 申请，toast 告诉点击者
    *  「已申请、通过后再点一次」。其余 outcome 原样交给 toastForOutcome。 */
@@ -232,6 +249,7 @@ export async function handleAskCardAction(
     if (outcome !== 'toggled') return outcomeResponse(outcome);
     const updated = getAskSnapshot(askId);
     if (!updated) return staleToast(locale);
+    if (updated.replyCardTarget) return inlineAskResponse(updated);
     return JSON.parse(buildAskCard(updated)) as Record<string, unknown>;
   }
 
@@ -289,6 +307,10 @@ export async function handleAskCardAction(
 function armEmptyConfirmResponse(askId: string, locale?: Locale): Record<string, unknown> | undefined {
   const ask = getAskSnapshot(askId);
   if (!ask) return staleToast(locale);
+  if (ask.replyCardTarget) return {
+    ...inlineAskResponse(ask, undefined, true),
+    toast: { type: 'warning', content: t('card.ask.toast.empty_confirm_needed', undefined, locale) },
+  };
   return {
     card: {
       type: 'raw',
@@ -311,7 +333,12 @@ function armEmptyConfirmResponse(askId: string, locale?: Locale): Record<string,
 function settledCardResponse(askId: string, result: AskResult): Record<string, unknown> | undefined {
   const updated = getAskSnapshot(askId);
   if (!updated) return undefined;
+  if (updated.replyCardTarget) return inlineAskResponse(updated, result);
   return JSON.parse(buildAskCard(updated, result)) as Record<string, unknown>;
+}
+
+function inlineAskResponse(ask: PendingAsk, result?: AskResult, confirmEmptyArmed = false): Record<string, unknown> {
+  return { afterAck: async () => { await publishReplyCardAsk(ask, result, confirmEmptyArmed, true); } };
 }
 
 /**
@@ -328,6 +355,7 @@ function settledCardResponse(askId: string, result: AskResult): Record<string, u
  */
 export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confirmEmptyArmed?: boolean }): string {
   const locale = localeForBot(ask.larkAppId);
+  const optionLayout = askOptionLayoutForBot(ask.larkAppId);
   const deadline = new Date(ask.deadlineAt).toLocaleString('zh-CN');
   const status = result ? settleStatus(result, ask, locale) : undefined;
   const confirmEmptyArmed = !!opts?.confirmEmptyArmed && !status;
@@ -344,7 +372,19 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
   const elements: Array<Record<string, unknown>> = [metaDiv];
 
   if (status) {
-    // 已 settle：展示状态摘要，无可交互组件
+    // 已 settle：保留原问题内容，再展示状态摘要。审批卡若在点击后
+    // 只留下「已选择」，审批人就无法回看自己批准了什么。
+    elements.push({ tag: 'hr' });
+    for (let i = 0; i < ask.questions.length; i++) {
+      const q = ask.questions[i]!;
+      elements.push({
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(truncate(q.prompt, 512, locale))}`,
+        },
+      });
+    }
     elements.push({ tag: 'hr' });
     elements.push({
       tag: 'div',
@@ -365,7 +405,7 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeMd(truncate(q.prompt, 512, locale))}`,
+          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(truncate(q.prompt, 512, locale))}`,
         },
       });
 
@@ -392,7 +432,7 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
               key: opt.key,
             },
       }));
-      appendActionRows(elements, optionButtons);
+      appendActionRows(elements, optionButtons, optionLayout);
     }
 
     if (requiresSubmit) {
@@ -613,7 +653,17 @@ function templateForResult(result: AskResult): string {
   }
 }
 
-function approverSummary(_ask: PendingAsk, locale?: Locale): string {
+function approverSummary(ask: PendingAsk, locale?: Locale): string {
+  if (ask.answererOpenId) {
+    // XPI can resolve this id from union_id in another app. It is valid for the
+    // broker's callback authorization, but embedding it as an at/person card
+    // resource can make Lark reject the whole card with 230099. Keep ordinary
+    // same-app asks unchanged; only the three XPI origins use a neutral label.
+    if (ask.originKind?.startsWith('host_cross_principal_')) {
+      return t('card.ask.answerable_designated_member', undefined, locale);
+    }
+    return `<at id=${ask.answererOpenId}></at>`;
+  }
   // 答复权限 = canTalk：谁能在该群跟 bot 说话谁就能答。卡片统一显示「本群可对话成员」，
   // 不再按 open_id 列名单（鉴权在 broker 点击时按 canTalk 判定）。
   return t('card.ask.answerable_talk_members', undefined, locale);
@@ -634,7 +684,25 @@ function optionLabel(multiSelect: boolean, selected: boolean, label: string): st
   return `${selected ? '◉' : '○'} ${label}`;
 }
 
-function appendActionRows(elements: Array<Record<string, unknown>>, actions: Array<Record<string, unknown>>): void {
+function appendActionRows(
+  elements: Array<Record<string, unknown>>,
+  actions: Array<Record<string, unknown>>,
+  layout: AskOptionLayout,
+): void {
+  if (layout === 'vertical') {
+    // 竖放：一行一按钮。单列 column_set（flex_mode:'none' + weighted 列宽）让按钮
+    // 单列排布，长选项标签不被同排按钮挤压。column_set 在旧版卡片 schema 同样
+    // 受支持，无需迁移 schema 2.0。
+    for (const action of actions) {
+      elements.push({
+        tag: 'column_set',
+        flex_mode: 'none',
+        horizontal_spacing: 'small',
+        columns: [{ tag: 'column', width: 'weighted', weight: 1, elements: [action] }],
+      });
+    }
+    return;
+  }
   for (let i = 0; i < actions.length; i += MAX_BUTTONS_PER_ACTION_ROW) {
     elements.push({
       tag: 'action',
@@ -648,8 +716,33 @@ function truncate(s: string, maxChars: number, locale?: Locale): string {
   return `${s.slice(0, maxChars)}\n\n${t('common.truncated_short', undefined, locale)}`;
 }
 
+/** Keep labelled web links usable without enabling arbitrary question markup. */
+function escapeQuestion(s: string): string {
+  let cursor = 0;
+  let rendered = '';
+  for (const match of s.matchAll(/\[([^\]\r\n]+)\]\(/g)) {
+    const start = match.index!;
+    if (start < cursor || s[start - 1] === '!') continue;
+    const escapes = s.slice(0, start).match(/\\+$/)?.[0].length ?? 0;
+    if (escapes % 2) continue;
+    const destination = parseLinkDestination(s, start + match[0].length, s.length);
+    if (!destination.ok || s[destination.pos] !== ')') continue;
+    let url: URL;
+    try { url = new URL(destination.str); } catch { continue; }
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') continue;
+    // Parentheses are legal URL characters but must not terminate a Markdown link.
+    const href = url.href.replace(/\(/g, '%28').replace(/\)/g, '%29');
+    rendered += escapeMd(s.slice(cursor, start)) + `[${escapeMd(match[1]!)}](${href})`;
+    cursor = destination.pos + 1;
+  }
+  return rendered + escapeMd(s.slice(cursor));
+}
+
 function escapeMd(s: string): string {
-  return s.replace(/[*_~`\[\]\\]/g, (c) => `\\${c}`);
+  // A mention is structured Lark markup: escaping the underscore in its ID
+  // makes the entire card invalid. Keep complete user/bot mentions atomic.
+  return s.replace(/<at\s+id=(?:"ou_[\w-]+"|'ou_[\w-]+'|ou_[\w-]+)\s*><\/at>|[*_~`\[\]\\]/g,
+    (token) => token.startsWith('<at') ? token : `\\${token}`);
 }
 
 function short(s: string, n: number): string {

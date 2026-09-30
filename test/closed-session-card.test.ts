@@ -10,6 +10,7 @@ const botConfig = vi.hoisted(() => ({
   },
   cliPathOverride: '/opt/current-codex',
   wrapperCli: undefined as string | undefined,
+  cliLaunchMode: undefined as 'forge-traex' | undefined,
   model: undefined as string | undefined,
 }));
 
@@ -71,6 +72,7 @@ describe('buildClosedSessionCard — frozen runtime resume identity', () => {
     };
     botConfig.cliPathOverride = '/opt/current-codex';
     botConfig.wrapperCli = undefined;
+    botConfig.cliLaunchMode = undefined;
     botConfig.model = undefined;
   });
 
@@ -132,5 +134,19 @@ describe('buildClosedSessionCard — frozen runtime resume identity', () => {
     expect(content).not.toContain('Current Codex');
     expect(content).not.toContain('ttadk');
     expect(content).not.toContain('new-model');
+  });
+
+  it('prints Forge x TraeX resume command for a frozen Forge launch session', () => {
+    const ds = makeSession();
+    ds.session.cliId = 'traex';
+    ds.session.cliRuntime = undefined;
+    ds.session.cliPathOverride = undefined;
+    ds.session.cliLaunchMode = 'forge-traex';
+    ds.session.cliSessionId = 'trae-thread-1';
+
+    const content = markdown(buildClosedSessionCard(ds, 'en'));
+
+    expect(content).toContain("forge run --agent traex --agent-args 'resume trae-thread-1'");
+    expect(content).not.toContain('traex resume trae-thread-1');
   });
 });

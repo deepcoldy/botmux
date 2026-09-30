@@ -168,6 +168,17 @@ const CASES: Record<Exclude<TalkReason, 'none'>, ParityCase> = {
     human: true, bot: false,
     why: 'evaluateBotTalk 不传 chatType → p2pOpen 腿 fail-closed。飞书里 bot 之间不存在私聊，开着只是白扩边界。',
   },
+  blocked: {
+    // 否决腿（不是放行源）：在 allowedUser 命中之后、其余所有腿之前按 sender open_id 否决。
+    // 这里不布置任何放行腿——open 模式下它仍必须被拒，证明黑名单不依赖限制态；其余
+    // 放行腿 × blocked 的完整优先级矩阵见 test/blocked-users-talk.test.ts。
+    arrange: () => {
+      getBot(APP).resolvedBlockedUsers = [SENDER];
+    },
+    human: false, bot: false,
+    why: 'blocked 是纯增量否决腿：人/bot 同拒（sender open_id 维度，与 union / chat 均无关）；'
+      + 'evaluateBotTalk 独有的团队拉群 chat 维度腿在 reason===\'blocked\' 时也不复活（见 evaluateBotTalk）。',
+  },
 };
 
 describe('bot talk parity — bot 闸门与人侧 evaluateTalk 同源', () => {

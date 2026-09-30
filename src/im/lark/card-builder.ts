@@ -21,6 +21,8 @@ import {
   MAX_GRANT_QUOTA,
 } from '../../services/grant-policy.js';
 import { STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
+import type { StreamingCardButtonId } from './streaming-card-buttons.js';
+import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
 
 /** select_static 里代表「清回默认 / 未设置」的哨兵值（model / lang 下拉用）。 */
 export const CONFIG_UNSET = '__unset__';
@@ -41,7 +43,7 @@ export function contextCompactThreshold(): number {
 const CONFIG_CARD_BOOLEAN_GROUPS: ReadonlyArray<{ sec: string; keys: readonly string[] }> = [
   { sec: 'card.config.sec.card', keys: ['disableStreamingCard', 'silentTurnReactions', 'writableTerminalLinkInCard', 'privateCard'] },
   { sec: 'card.config.sec.autostart', keys: ['autoStartOnGroupJoin', 'autoStartOnNewTopic'] },
-  { sec: 'card.config.sec.security', keys: ['disableCliBypass', 'restrictGrantCommands', 'p2pOpen'] },
+  { sec: 'card.config.sec.security', keys: ['disableCliBypass', 'restrictGrantCommands', 'p2pOpen', 'grantRequestToOwnerDm'] },
 ];
 
 function configSelect(placeholder: string, initial: string, options: Array<{ text: string; value: string }>, value: Record<string, string>): any {
@@ -291,6 +293,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'genius': 'Genius',
   'opencode': 'OpenCode',
   'opencode2': 'OpenCode 2',
+  'mimocode': 'MiMoCode',
   'antigravity': 'Antigravity',
   'mtr': 'MTR',
   'hermes': 'Hermes',
@@ -309,6 +312,7 @@ const cliDisplayNames: Record<CliId, string> = {
   'dsh': 'DeepSeek Harness',
   'dsh-tui': 'DeepSeek Harness TUI',
   'mojo': 'Mojo',
+  'minimax': 'MiniMax',
 };
 
 export function getCliDisplayName(cliId: CliId): string {
@@ -600,15 +604,7 @@ export function buildForkPanelCard(
       elements: [{
         tag: 'table',
         page_size: 10,
-        row_height: 'low',
-        header_style: {
-          text_align: 'left',
-          text_size: 'normal',
-          background_style: 'grey',
-          text_color: 'default',
-          bold: true,
-          lines: 1,
-        },
+        ...TABLE_AUTO_ROW_STYLE,
         columns: [
           { name: 'instruction', display_name: t('card.fork_panel.col_instruction', undefined, locale), data_type: 'text', width: 'auto' },
           { name: 'status', display_name: t('card.fork_panel.col_status', undefined, locale), data_type: 'text', width: '90px' },
@@ -694,15 +690,7 @@ export function buildSlashListCard(
     elements.push({
       tag: 'table',
       page_size: 10,
-      row_height: 'low',
-      header_style: {
-        text_align: 'left',
-        text_size: 'normal',
-        background_style: 'grey',
-        text_color: 'default',
-        bold: true,
-        lines: 1,
-      },
+      ...TABLE_AUTO_ROW_STYLE,
       columns: [
         { name: 'cmd', display_name: t('slashlist.col_cmd', undefined, locale), data_type: 'lark_md', width: '200px' },
         { name: 'desc', display_name: t('slashlist.col_desc', undefined, locale), data_type: 'text', width: 'auto' },
@@ -849,16 +837,45 @@ export function truncateContent(content: string, locale?: Locale, maxBytes: numb
  *  card limit, leaving room for JSON escaping + the card's structural overhead. */
 const PRIVATE_SNAPSHOT_TEXT_MAX = 50_000;
 
+/** idle 状态下卡头的替代标签：
+ *  - 'silent'：本轮判定无需回复（worker terminal outputDisposition 'nothing_to_send'）；
+ *  - 'completed'：transcript 模式下最终回复卡已投递成功。
+ *  只对 idle 生效，其它状态一律忽略。 */
+export type IdleCardLabel = 'silent' | 'completed';
+
+/** 兼容旧调用：布尔 `true` 等价于 'silent'。 */
+function normalizeIdleLabel(v: boolean | IdleCardLabel | undefined): IdleCardLabel | undefined {
+  if (v === true) return 'silent';
+  if (v === 'silent' || v === 'completed') return v;
+  return undefined;
+}
+
+/** 冻结卡（FrozenCard）回读 idle 标签：新字段 `idleLabel` 优先；旧盘只有
+ *  `silentIdle: true` 时按 'silent' 处理。结构化参数，避免 card-builder 反向依赖 core。 */
+export function frozenIdleLabel(fc: { idleLabel?: IdleCardLabel; silentIdle?: boolean }): IdleCardLabel | undefined {
+  return fc.idleLabel ?? (fc.silentIdle ? 'silent' : undefined);
+}
+
 /** Header status label for a streaming/snapshot card. Shared by the live card
  *  and the private snapshot so the two never drift. */
-function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, silentIdle?: boolean): string {
+function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState | undefined, locale?: Locale, idleLabel?: boolean | IdleCardLabel): string {
   switch (status) {
     case 'starting': return t('card.status.starting', undefined, locale);
     case 'working': return t('card.status.working', undefined, locale);
-    // silentIdle: the turn completed as DELIBERATE silence (bare
+    // idleLabel 'silent': the turn completed as DELIBERATE silence (bare
     // nothing-to-send sentinel). Plain 「等待输入」 here is indistinguishable
     // from a hung session; say "handled, judged no reply needed" instead.
-    case 'idle': return t(silentIdle ? 'card.status.idle_silent' : 'card.status.idle', undefined, locale);
+    // 'completed': transcript 模式下最终回复卡已投递，卡头改「已完成」。
+    case 'idle': {
+      const label = normalizeIdleLabel(idleLabel);
+      return t(
+        label === 'completed' ? 'card.status.idle_completed'
+          : label === 'silent' ? 'card.status.idle_silent'
+            : 'card.status.idle',
+        undefined,
+        locale,
+      );
+    }
     case 'analyzing': return t('card.status.analyzing', undefined, locale);
     case 'stalled': return t('card.status.stalled', undefined, locale);
     case 'limited': return usageLimit?.retryReady
@@ -940,6 +957,8 @@ function pushStreamBody(
  * Quick-action buttons (Esc, ^C, Tab, Space, Enter, ←↑↓→, ½屏 ↑/↓) appear
  * whenever displayMode !== 'hidden'.
  */
+export const STREAMING_CARD_PATCH_VERSION = '1';
+
 export function buildStreamingCard(
   sessionId: string,
   rootId: string,
@@ -960,7 +979,8 @@ export function buildStreamingCard(
   usage?: CardUsageSnapshot,
   runtimeDisplayName?: string,
   serviceTierBadge?: string,
-  silentIdle?: boolean,
+  /** idle 卡头替代标签；布尔 `true` 兼容旧调用（= 'silent'）。见 {@link IdleCardLabel}。 */
+  silentIdle?: boolean | IdleCardLabel,
   /** Live per-bot `dshRuntime`. Only meaningful for cliId 'dsh': 'tui' means the
    *  worker spawns the PTY-driven dsh-tui adapter (a real interactive TUI that
    *  accepts a raw /compact), so the compact button must stay visible. Omitted ⇒
@@ -969,10 +989,17 @@ export function buildStreamingCard(
    *  never showed the button either), so a call site that forgets to pass it
    *  degrades to the status quo rather than to a broken button. */
   dshRuntime?: 'official' | 'tui',
+  hiddenButtons: readonly StreamingCardButtonId[] = [],
 ): string {
   const effectiveCliId = cliId ?? 'claude-code';
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(effectiveCliId);
-  const actionBase = { root_id: rootId, session_id: sessionId, cli_id: effectiveCliId, ...(cardNonce ? { card_nonce: cardNonce } : {}) };
+  const actionBase = {
+    root_id: rootId,
+    session_id: sessionId,
+    cli_id: effectiveCliId,
+    stream_card_version: STREAMING_CARD_PATCH_VERSION,
+    ...(cardNonce ? { card_nonce: cardNonce } : {}),
+  };
   const displayStatus = status === 'limited' && usageLimit?.retryReady ? 'retry_ready' : status;
 
   const elements: any[] = [];
@@ -990,30 +1017,33 @@ export function buildStreamingCard(
 
   // ── Main control row: display toggle, mode toggle, terminal, manage ─────
   const headerActions: any[] = [];
+  const hidden = new Set(hiddenButtons);
 
-  headerActions.push({
-    tag: 'button',
-    text: { tag: 'plain_text', content: t(displayMode === 'hidden' ? 'card.btn.show_output' : 'card.btn.hide_output', undefined, locale) },
-    type: 'default' as const,
-    value: { action: 'toggle_display', ...actionBase },
-  });
-  if (displayMode !== 'hidden') {
+  if (!hidden.has('output')) {
     headerActions.push({
       tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.export_text', undefined, locale) },
+      text: { tag: 'plain_text', content: t(displayMode === 'hidden' ? 'card.btn.show_output' : 'card.btn.hide_output', undefined, locale) },
       type: 'default' as const,
-      value: { action: 'export_text', ...actionBase },
+      value: { action: 'toggle_display', ...actionBase },
     });
+    if (displayMode !== 'hidden') {
+      headerActions.push({
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.export_text', undefined, locale) },
+        type: 'default' as const,
+        value: { action: 'export_text', ...actionBase },
+      });
+    }
+    if (displayMode === 'screenshot') {
+      headerActions.push({
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.refresh', undefined, locale) },
+        type: 'default' as const,
+        value: { action: 'refresh_screenshot', ...actionBase },
+      });
+    }
   }
-  if (displayMode === 'screenshot') {
-    headerActions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.refresh', undefined, locale) },
-      type: 'default' as const,
-      value: { action: 'refresh_screenshot', ...actionBase },
-    });
-  }
-  if (terminalUrl) {
+  if (terminalUrl && !hidden.has('terminal')) {
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.open_terminal', undefined, locale) },
@@ -1031,7 +1061,7 @@ export function buildStreamingCard(
       value: { action: 'retry_last_task', ...actionBase },
     });
   }
-  if (terminalUrl) {
+  if (terminalUrl && !hidden.has('writeLink')) {
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.get_write_link', undefined, locale) },
@@ -1055,7 +1085,7 @@ export function buildStreamingCard(
   //      resolvePassthroughCommands 对这些 CLI 返回空集拦住，按钮不能把那条路重新打开。
   // dsh 是运行时相关的：dshRuntime='tui' 跑的是 PTY 驱动的 dsh-tui（真交互 TUI），照常显示。
   // handler 侧另有一道同谓词的拒绝兜底（compact_session），两层都不依赖百分比。
-  if (!isRemoteCliId(cliId) && !cliHasNoRawPassthroughSurface(effectiveCliId, { dshRuntime })) {
+  if (!hidden.has('compact') && !isRemoteCliId(cliId) && !cliHasNoRawPassthroughSurface(effectiveCliId, { dshRuntime })) {
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.compact', undefined, locale) },
@@ -1068,7 +1098,7 @@ export function buildStreamingCard(
   // term_action ctrlc IPC 链路（与展开态 ^C 快捷键完全同款），中断当前 turn 但保留会话。
   // 仅在有 turn 可停的状态显示：idle 无 turn 可停；starting CLI 未起；limited turn 已失败。
   // remote CLI（riff/mojo）无终端可驱动、codex-app 无 PTY 输入通道，均隐藏。
-  if (!isRemoteCliId(cliId) && effectiveCliId !== 'codex-app'
+  if (!hidden.has('stop') && !isRemoteCliId(cliId) && effectiveCliId !== 'codex-app'
     && (status === 'working' || status === 'analyzing' || status === 'stalled')) {
     headerActions.push({
       tag: 'button',
@@ -1086,13 +1116,15 @@ export function buildStreamingCard(
         value: { action: 'takeover', ...actionBase },
       });
     }
-    headerActions.push({
-      tag: 'button',
-      text: { tag: 'plain_text', content: t('card.btn.disconnect', undefined, locale) },
-      type: 'danger' as const,
-      value: { action: 'disconnect', ...actionBase },
-    });
-  } else {
+    if (!hidden.has('close')) {
+      headerActions.push({
+        tag: 'button',
+        text: { tag: 'plain_text', content: t('card.btn.disconnect', undefined, locale) },
+        type: 'danger' as const,
+        value: { action: 'disconnect', ...actionBase },
+      });
+    }
+  } else if (!hidden.has('close')) {
     headerActions.push({
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.btn.close_session', undefined, locale) },
@@ -1100,7 +1132,25 @@ export function buildStreamingCard(
       value: { action: 'close', ...actionBase },
     });
   }
-  elements.push({ tag: 'action', actions: headerActions });
+  if (headerActions.length > 0) elements.push({ tag: 'action', actions: headerActions });
+  const effortControl = !adoptMode && usage?.reasoningControl;
+  if (effortControl && effortControl.choices.length > 0) {
+    // Display executor truth; keep CAS bound to the saved session setting.
+    const displayedEffort = effortControl.choices.find(effort => effort === usage?.reasoningEffort) ?? effortControl.selected;
+    elements.push({ tag: 'action', actions: [{
+      tag: 'select_static',
+      placeholder: { tag: 'plain_text', content: t('card.effort.select', undefined, locale) },
+      ...(displayedEffort ? { initial_option: displayedEffort } : {}),
+      options: effortControl.choices.map(effort => ({
+        text: { tag: 'plain_text', content: `${t('card.effort.select', undefined, locale)}: ${t(`card.effort.${effort}`, undefined, locale)}` },
+        value: effort,
+      })),
+      value: { action: 'set_reasoning_effort', ...actionBase, expected_effort: effortControl.selected ?? '' },
+    }] });
+    elements.push({ tag: 'note', elements: [{ tag: 'plain_text', content: t(
+      effortControl.pending ? 'card.effort.pending' : 'card.effort.scope', undefined, locale,
+    ) + (effortControl.pending && effortControl.selected ? ` (${effortControl.selected})` : '') }] });
+  }
 
   // ── Writable terminal link (opt-in) ─────────────────────────────────────
   // When the bot enables `writableTerminalLinkInCard`, embed the token-bearing
@@ -1178,7 +1228,10 @@ export function buildStreamingCard(
   }
 
   const card = {
-    config: { wide_screen_mode: true },
+    // Lark's ordinary message PATCH endpoint only updates cards whose original
+    // and replacement payloads both opt into shared updates. Streaming cards
+    // are group-visible mutable UI, so this is part of their wire contract.
+    config: { wide_screen_mode: true, update_multi: true },
     header: {
       title: { tag: 'plain_text', content: `🖥️ ${cliName}${serviceTierBadge ? ` ${serviceTierBadge}` : ''} · ${plainTitle(title)} — ${streamStatusLabel(status, usageLimit, locale, silentIdle)}` },
       template: STREAM_STATUS_TEMPLATE_MAP[displayStatus],
@@ -1345,10 +1398,13 @@ function worktreeMultiForm(worktreeOptions: Array<{ text: { tag: 'plain_text'; c
   };
 }
 
-/** Repo selection card. `multiPicker` (persisted per-bot via worktreeMultiPicker)
- *  flips the worktree control between an instant single-select dropdown (false)
- *  and the inline multi-select form (true). */
-export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale, multiPicker?: boolean): string {
+/** Render the repo selection card for an already-budgeted slice of the scan.
+ *  `multiPicker` (persisted per-bot via worktreeMultiPicker) flips the worktree
+ *  control between an instant single-select dropdown (false) and the inline
+ *  multi-select form (true). `hiddenCount` > 0 means the caller dropped that
+ *  many trailing projects to fit the card byte budget; the card then says so.
+ *  Callers go through buildRepoSelectCard, which owns the budget. */
+function renderRepoSelectCard(projects: ProjectInfo[], currentPath: string | undefined, rootMessageId: string | undefined, locale: Locale | undefined, multiPicker: boolean | undefined, hiddenCount: number): string {
   const currentMarker = t('card.repo.current_marker', undefined, locale);
   const options = projects.map((p, i) => {
     const currentTag = p.path === currentPath ? currentMarker : '';
@@ -1543,6 +1599,18 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
           },
         ],
       },
+      // Over-budget scans lose their tail (see buildRepoSelectCard). Say so, and
+      // point at `/repo <path|name>` — that resolves against a fresh scan, so it
+      // reaches a dropped project regardless of what this dropdown lists.
+      ...(hiddenCount > 0 ? [{
+        tag: 'note',
+        elements: [
+          {
+            tag: 'lark_md',
+            content: t('card.repo.truncated_hint', { shown: projects.length, total: projects.length + hiddenCount }, locale),
+          },
+        ],
+      }] : []),
       {
         tag: 'note',
         elements: [
@@ -1558,6 +1626,53 @@ export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: strin
   return JSON.stringify(card);
 }
 
+/** Byte budget for the repo picker card.
+ *
+ *  The Feishu card API rejects a payload past ~109 KB with error 230025 ("The
+ *  length of the message content reaches its limit."). Unlike the streaming
+ *  card there is no user-authored content to shorten here: the card carries one
+ *  select_static option per scanned project, so a broad scan root sets the size
+ *  on its own. A live 1174-project root (47 repos + 1127 worktrees) serialized
+ *  to 186 KB and the send threw — and because the picker is published after the
+ *  turn is durably admitted, the session was left waiting on a card that never
+ *  existed, with a restart rebuilding the same oversized card. Budgeting here is
+ *  what keeps that from being reachable at all.
+ *
+ *  Set below the observed cliff (~115 KB of card) rather than at it: the egress
+ *  stamp (stampBotmuxCallbackMarkers) grows the wire payload after this measures
+ *  it, the API envelope adds its own overhead, and non-ASCII project names cost
+ *  more bytes than characters. 80 KB still lists several hundred projects — far
+ *  past what anyone scrolls — and the overflow stays reachable by name. */
+export const REPO_SELECT_CARD_MAX_BYTES = 80_000;
+
+/** Repo selection card, capped at REPO_SELECT_CARD_MAX_BYTES.
+ *
+ *  Truncation takes the head of `projects` and never reorders or renumbers it:
+ *  option labels stay 1-based over the caller's own list, which is the same list
+ *  `/repo <N>` indexes through lastRepoScan, so a visible option means the same
+ *  thing before and after a truncation. The scanner sorts repos ahead of
+ *  worktrees, so in practice the tail that goes is worktrees. */
+export function buildRepoSelectCard(projects: ProjectInfo[], currentPath?: string, rootMessageId?: string, locale?: Locale, multiPicker?: boolean): string {
+  const render = (visible: number): string =>
+    renderRepoSelectCard(projects.slice(0, visible), currentPath, rootMessageId, locale, multiPicker, projects.length - visible);
+  const fits = (json: string): boolean => Buffer.byteLength(json, 'utf-8') <= REPO_SELECT_CARD_MAX_BYTES;
+
+  const full = render(projects.length);
+  if (fits(full)) return full;
+
+  // Largest head slice that fits. Option size varies (name, branch, path), so
+  // search rather than divide by an assumed per-option cost. Floor at 1: an
+  // empty dropdown would be a worse card than an over-budget one, and the
+  // publish sites degrade gracefully when a send is rejected anyway.
+  let lo = 1;
+  let hi = projects.length - 1;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (fits(render(mid))) lo = mid; else hi = mid - 1;
+  }
+  return render(lo);
+}
+
 // ─── 群内授权卡片 ─────────────────────────────────────────────────────────────
 
 export interface GrantCardOpts {
@@ -1571,13 +1686,24 @@ export interface GrantCardOpts {
   /** 当前卡片暂存的限制；缺省使用产品默认值。 */
   durationMs?: number;
   quota?: number;
+  /** 申请卡转投管理员私聊时的来源：'dm_p2p' = 申请人在私聊里申请；'dm_group' = 群里没有管理员。
+   *  缺省 = 卡片就在原会话里（原行为）。 */
+  delivery?: GrantCardDelivery;
+  /** delivery='dm_group' 时展示的来源群名（查不到时由调用方传占位）。 */
+  chatName?: string;
 }
+
+export type GrantCardDelivery = 'dm_p2p' | 'dm_group';
 
 /** 授权卡片：有效期与消息额度并列展示，owner 一次提交两项限制。 */
 export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
   const names = o.targets.map(t => `**${escapeMd(t.name)}**`).join('、');
   const single = o.targets[0];
-  const body = o.mode === 'request'
+  const body = o.mode === 'request' && o.delivery === 'dm_p2p'
+    ? t('card.grant.body_request_p2p', { name: escapeMd(single?.name ?? '') }, locale)
+    : o.mode === 'request' && o.delivery === 'dm_group'
+    ? t('card.grant.body_request_remote', { name: escapeMd(single?.name ?? ''), chat: escapeMd(o.chatName ?? '') }, locale)
+    : o.mode === 'request'
     ? t('card.grant.body_request', { name: escapeMd(single?.name ?? ''), owner: o.ownerOpenId }, locale)
     : o.targets.length > 1
       ? t('card.grant.body_owner_multi', { names, owner: o.ownerOpenId }, locale)
@@ -1593,6 +1719,9 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
     chat_id: o.chatId,
     nonce: o.nonce,
     mode: o.mode,
+    // 私聊转投的卡：处置时据此选终态文案，并回告原会话里的申请人（申请人看不到这张卡）。
+    ...(o.delivery ? { delivery: o.delivery } : {}),
+    ...(o.delivery === 'dm_group' && o.chatName ? { chat_name: o.chatName } : {}),
   };
   const button = (action: string, text: string, type: string): Record<string, unknown> => ({
     tag: 'button',
@@ -1605,8 +1734,11 @@ export function buildGrantCard(o: GrantCardOpts, locale?: Locale): string {
     action_type: 'form_submit',
     value: { action, ...v },
   });
+  const chatBtnKey = o.delivery === 'dm_p2p'
+    ? 'card.grant.btn_chat_p2p'
+    : o.delivery === 'dm_group' ? 'card.grant.btn_chat_remote' : 'card.grant.btn_chat';
   const grantButtons: Array<Record<string, unknown>> = [
-    button('grant_chat', t('card.grant.btn_chat', undefined, locale), 'primary'),
+    button('grant_chat', t(chatBtnKey, undefined, locale), 'primary'),
   ];
   if (o.mode === 'owner') {
     grantButtons.push(button('grant_global', t('card.grant.btn_global', undefined, locale), 'default'));
@@ -1740,10 +1872,42 @@ export function buildGrantNotifyCard(
   return JSON.stringify(card);
 }
 
-/** 额度用尽通知卡（@被授权人）：daemon 收回该 scope 授权后发到 session/线程。 */
-export function buildQuotaExhaustedCard(targetOpenId: string, limit: number, locale?: Locale): string {
+/** 申请卡转投管理员私聊后，给原会话里申请人的处置结果回告（申请人看不到那张卡）。
+ *  p2p 不 @（会话里只有 ta）；群里 @ 申请人。授权成功带额度/有效期后缀，拒绝不带。 */
+export function buildGrantRequesterNoticeCard(
+  outcome: 'chat' | 'global' | 'deny',
+  delivery: GrantCardDelivery,
+  targets: GrantTargetEntry[],
+  locale?: Locale,
+  quota?: number,
+  expiresAt?: number,
+): string {
+  let content: string;
+  if (delivery === 'dm_p2p') {
+    content = t(outcome === 'deny' ? 'card.grant.requester_denied_p2p' : 'card.grant.requester_granted_p2p', undefined, locale);
+  } else {
+    const at = renderGrantAtMentions(targets);
+    content = outcome === 'deny'
+      ? t('card.grant.requester_denied_chat', { at }, locale)
+      : t(outcome === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
+  }
+  if (outcome !== 'deny') {
+    if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
+    if (expiresAt !== undefined) content += t('card.grant.notify_expiry_suffix', { time: formatGrantExpiry(expiresAt, locale) }, locale);
+  }
+  const card = {
+    config: { wide_screen_mode: true },
+    elements: [{ tag: 'div', text: { tag: 'lark_md', content } }],
+  };
+  return JSON.stringify(card);
+}
+
+/** 额度用尽通知卡（@被授权人）：daemon 收回该 scope 授权后发到 session/线程。
+ *  `autoReapply`：开了 grantRequestToOwnerDm 时，下一条消息会自动再弹申请卡（私聊也会），
+ *  不必让被授权人去「联系 owner 重新 /grant」（私聊陌生人既不知道 owner 是谁也不会用 /grant）。 */
+export function buildQuotaExhaustedCard(targetOpenId: string, limit: number, locale?: Locale, autoReapply = false): string {
   const at = `<at id=${targetOpenId}></at>`;
-  const content = t('quota.exhausted_notify', { at, limit }, locale);
+  const content = t(autoReapply ? 'quota.exhausted_notify_reapply' : 'quota.exhausted_notify', { at, limit }, locale);
   const card = {
     config: { wide_screen_mode: true },
     elements: [{ tag: 'div', text: { tag: 'lark_md', content } }],
@@ -1958,13 +2122,19 @@ export function buildGrantResultCard(
   quota?: number,
   expiresAt?: number,
   targets?: string | string[] | GrantTargetEntry[],
+  origin?: { delivery?: GrantCardDelivery; chatName?: string },
 ): string {
   let content: string;
   const at = targets !== undefined ? renderGrantAtMentions(targets) : '';
   if (kind !== 'deny' && at) {
     // 授权成功且有被授权人：复用 notify 文案（{at} 已获授权，发消息 @ 我即可 + 额度/有效期后缀），
     // 让就地 patch 的原卡直接把授权成功通知 + @ping 合为一张。
-    content = t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
+    // 转投私聊的卡只有管理员看得到，「在本群」说法不成立，改用标明来源的文案。
+    content = kind === 'chat' && origin?.delivery === 'dm_p2p'
+      ? t('card.grant.notify_owner_p2p', { at }, locale)
+      : kind === 'chat' && origin?.delivery === 'dm_group'
+      ? t('card.grant.notify_owner_remote', { at, chat: escapeMd(origin.chatName ?? '') }, locale)
+      : t(kind === 'chat' ? 'card.grant.notify_chat' : 'card.grant.notify_global', { at }, locale);
     if (quota !== undefined && quota > 0) content += t('card.grant.notify_quota_suffix', { n: quota }, locale);
     if (expiresAt !== undefined) content += t('card.grant.notify_expiry_suffix', { time: formatGrantExpiry(expiresAt, locale) }, locale);
   } else {

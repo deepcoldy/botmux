@@ -34,6 +34,9 @@ type ScheduleRow = Record<string, any> & {
   preconditionSource?: 'inline' | 'file';
   preconditionScript?: string;
   preconditionFilePath?: string;
+  lastStatus?: 'running' | 'ok' | 'error' | 'skipped';
+  model?: string;
+  reasoningEffort?: string;
 };
 type ScheduleBotOption = {
   larkAppId: string;
@@ -77,6 +80,10 @@ type ScheduleRunLogPage = {
 export type PreconditionEditMode = 'keep' | 'inline' | 'file';
 type PreconditionHelpSource = 'inline' | 'file';
 const RUN_ACTION_MIN_PENDING_MS = 1000;
+/** Kept in sync with CODEX_REASONING_EFFORTS; which levels a given model
+ *  actually offers is decided server-side, which 400s an unusable pairing. */
+const SCHEDULE_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
+
 const SCHEDULE_RUN_LOG_PAGE_SIZE = 50;
 const SCHEDULE_RUN_HISTORY_PREVIEW_LIMIT = 50;
 const MAX_SCHEDULE_TARGET_CHATS = 5;
@@ -491,11 +498,12 @@ export function filterSchedules(rows: ScheduleRow[], filters: ScheduleFilters): 
     });
 }
 
-type SchedulePlacement = 'chat' | 'thread' | 'new-topic' | 'local';
+type SchedulePlacement = 'chat' | 'thread' | 'new-topic' | 'task' | 'local';
 
 export function scheduleExecutionPlacement(s: ScheduleRow): SchedulePlacement {
   if (s.deliver === 'local') return 'local';
   if (s.executionPosition === 'new-topic') return 'new-topic';
+  if (s.executionPosition === 'task') return s.rootMessageId ? 'thread' : 'task';
   if (s.executionPosition === 'topic') return s.rootMessageId ? 'thread' : 'chat';
   if (s.executionPosition === 'top-level') return 'chat';
   if (s.deliver === 'new-topic') return 'new-topic';
@@ -503,10 +511,26 @@ export function scheduleExecutionPlacement(s: ScheduleRow): SchedulePlacement {
   return s.rootMessageId ? 'thread' : 'chat';
 }
 
+/** Initial edit-form position. Storage identity wins over display placement:
+ * a materialized dedicated-task row projects to 'thread', but initializing the
+ * form to 'topic' would make saving any unrelated field PATCH
+ * executionPosition:'topic' and silently downgrade the dedicated task. */
+export function initialScheduleEditPosition(
+  editing: ScheduleRow | null,
+): 'top-level' | 'topic' | 'new-topic' | 'task' {
+  if (editing?.executionPosition === 'task') return 'task';
+  const placement = editing ? scheduleExecutionPlacement(editing) : 'chat';
+  if (placement === 'thread') return 'topic';
+  if (placement === 'task') return 'task';
+  if (placement === 'new-topic') return 'new-topic';
+  return 'top-level';
+}
+
 function placementLabel(s: ScheduleRow, tr: ReturnType<typeof useT>): string {
   const placement = scheduleExecutionPlacement(s);
   if (placement === 'local') return tr('schedules.deliveryLocal');
   if (placement === 'new-topic') return tr('schedules.deliveryNewTopic');
+  if (placement === 'task') return tr('schedulePos.webTaskLabel');
   return placement === 'thread'
     ? tr('schedules.deliveryThread')
     : tr('schedules.deliveryTopLevel');
@@ -1209,6 +1233,11 @@ function ScheduleRowCard(props: {
           ) : null}
           <span>{tr('schedules.delivery')}: {placementLabel(s, tr)}</span>
           {s.silent ? <span>🔇 {tr('schedules.silent')}</span> : null}
+          {s.model || s.reasoningEffort ? (
+            <span title={tr('schedules.modelChipHelp')}>
+              🧠 {[s.model, s.reasoningEffort].filter(Boolean).join(' · ')}
+            </span>
+          ) : null}
           {s.hasPrecondition ? (
             <span className={`schedule-precondition-chip${s.preconditionEnabled === false ? ' is-paused' : ''}`}>
               <i className="schedule-precondition-chip-icon" aria-hidden="true">⌘</i>
@@ -1226,8 +1255,9 @@ function ScheduleRowCard(props: {
         <div className="schedule-actions">
           <ActionButton
             op="run"
-            label={tr('schedules.runNow')}
+            label={s.lastStatus === 'running' ? tr('schedules.running') : tr('schedules.runNow')}
             pending={props.pending === runKey}
+            disabled={s.lastStatus === 'running'}
             feedback={props.feedback[runKey] ?? null}
             onClick={() => props.onAction(s.id, 'run')}
           />
@@ -1399,11 +1429,12 @@ function SchedulesPage() {
     preconditionScript?: string | null;
     preconditionFilePath?: string;
     silent: boolean;
-    executionPosition: 'top-level' | 'topic' | 'new-topic';
+    executionPosition: 'top-level' | 'topic' | 'new-topic' | 'task';
     rootMessageId: string;
     topicTitle: string;
     updateExecutionPosition: boolean;
     chatIds: string[]; larkAppId: string;
+    model: string; reasoningEffort: string;
   }): Promise<void> {
     setFormError(null);
     try {
@@ -1429,10 +1460,17 @@ function SchedulesPage() {
               : {}),
             ...(data.updateExecutionPosition ? {
               executionPosition: data.executionPosition,
-              rootMessageId: data.rootMessageId,
+              // A dedicated task topic owns its root lazily at first fire;
+              // sending the form's retained root would be 400 and could only
+              // adopt a foreign topic into the task.
+              ...(data.executionPosition === 'task' ? {} : { rootMessageId: data.rootMessageId }),
               topicTitle: data.topicTitle,
               chatIds: data.chatIds,
             } : {}),
+            // Always submitted, including empty: on the update path an empty
+            // string is how the form clears an override back to the bot's.
+            model: data.model,
+            reasoningEffort: data.reasoningEffort,
           }
         : {
             name: data.name,
@@ -1449,10 +1487,12 @@ function SchedulesPage() {
               ? { preconditionFilePath: data.preconditionFilePath }
               : {}),
             executionPosition: data.executionPosition,
-            rootMessageId: data.rootMessageId,
+            ...(data.executionPosition === 'task' ? {} : { rootMessageId: data.rootMessageId }),
             topicTitle: data.topicTitle,
             chatIds: data.chatIds,
             larkAppId: data.larkAppId,
+            model: data.model,
+            reasoningEffort: data.reasoningEffort,
           };
       const r = await fetch(url, {
         method,
@@ -1463,7 +1503,9 @@ function SchedulesPage() {
       if (!r.ok || body.ok === false) {
         throw new Error(body?.error === 'too_many_target_chats'
           ? tr('schedules.form.errTooManyChats', { limit: MAX_SCHEDULE_TARGET_CHATS })
-          : body?.error ?? `HTTP ${r.status}`);
+          : body?.error === 'multiple_chats_task_unsupported'
+            ? tr('schedulePos.webTaskMultiChatUnsupported')
+            : body?.error ?? `HTTP ${r.status}`);
       }
       setFormOpen(false);
       toast(
@@ -1588,6 +1630,7 @@ function ActionButton(props: {
   op: ScheduleAction;
   label: string;
   pending: boolean;
+  disabled?: boolean;
   feedback: ActionFeedback | null;
   onClick: () => void;
 }) {
@@ -1598,7 +1641,7 @@ function ActionButton(props: {
       type="button"
       className={`schedule-action-button${props.pending ? ' is-pending' : ''}${feedbackClass}`}
       data-op={props.op}
-      disabled={props.pending}
+      disabled={props.pending || props.disabled}
       onClick={props.onClick}
     >
       <span className="schedule-action-label">{actionLabel(props.op, props.label, props.pending, props.feedback, tr)}</span>
@@ -1647,12 +1690,15 @@ interface ScheduleFormData {
   preconditionScript?: string | null;
   preconditionFilePath?: string;
   silent: boolean;
-  executionPosition: 'top-level' | 'topic' | 'new-topic';
+  executionPosition: 'top-level' | 'topic' | 'new-topic' | 'task';
   rootMessageId: string;
   topicTitle: string;
   updateExecutionPosition: boolean;
   chatIds: string[];
   larkAppId: string;
+  /** Per-task model / effort. `''` means "use the bot's configuration". */
+  model: string;
+  reasoningEffort: string;
 }
 
 export function ScheduleFormModal(props: {
@@ -1692,13 +1738,14 @@ export function ScheduleFormModal(props: {
   const preconditionTestRunningRef = useRef(false);
   const preconditionTestRevisionRef = useRef(0);
   const [silent, setSilent] = useState(editing?.silent === true);
-  const [executionPosition, setExecutionPosition] = useState<'top-level' | 'topic' | 'new-topic'>(
-    editing && scheduleExecutionPlacement(editing) === 'thread'
-      ? 'topic'
-      : editing && scheduleExecutionPlacement(editing) === 'new-topic' ? 'new-topic' : 'top-level',
+  const [model, setModel] = useState(editing?.model ?? '');
+  const [reasoningEffort, setReasoningEffort] = useState<string>(editing?.reasoningEffort ?? '');
+  const [executionPosition, setExecutionPosition] = useState<'top-level' | 'topic' | 'new-topic' | 'task'>(
+    () => initialScheduleEditPosition(editing),
   );
   const initialChatIds = scheduleTargetChatIds(editing);
-  const initialTopicChatId = editing && scheduleExecutionPlacement(editing) === 'thread'
+  const initialTopicChatId = editing
+    && (scheduleExecutionPlacement(editing) === 'thread' || scheduleExecutionPlacement(editing) === 'task')
     ? initialChatIds[0] ?? ''
     : '';
   const [rootMessageId, setRootMessageId] = useState(editing?.rootMessageId ?? '');
@@ -1848,6 +1895,9 @@ export function ScheduleFormModal(props: {
   const topicChatCountInvalid = !localDelivery
     && executionPosition === 'topic'
     && chatIds.length > 1;
+  const taskChatCountInvalid = !localDelivery
+    && executionPosition === 'task'
+    && chatIds.length > 1;
   const rootMissing = touched
     && !localDelivery
     && executionPosition === 'topic'
@@ -1991,7 +2041,7 @@ export function ScheduleFormModal(props: {
   }
 
   function toggleChat(chatId: string, checked: boolean): void {
-    if (checked && executionPosition === 'topic') {
+    if (checked && (executionPosition === 'topic' || executionPosition === 'task')) {
       updateChatSelection([chatId]);
       return;
     }
@@ -2000,7 +2050,7 @@ export function ScheduleFormModal(props: {
       : chatIds.filter(value => value !== chatId));
   }
 
-  function updateExecutionPosition(next: 'top-level' | 'topic' | 'new-topic'): void {
+  function updateExecutionPosition(next: 'top-level' | 'topic' | 'new-topic' | 'task'): void {
     setExecutionPosition(next);
     if (
       next === 'topic'
@@ -2009,6 +2059,8 @@ export function ScheduleFormModal(props: {
     ) {
       setRootMessageId('');
     }
+    // Only per-run fresh topics force silent execution off; a dedicated task
+    // topic is a stable session and may run silently.
     if (next === 'new-topic') setSilent(false);
   }
 
@@ -2023,6 +2075,7 @@ export function ScheduleFormModal(props: {
     if (chatCountInvalid) return;
     if (!localDelivery && executionPosition === 'topic' && chatIds.length !== 1) return;
     if (!localDelivery && executionPosition === 'topic' && !rootMessageId.trim()) return;
+    if (!localDelivery && executionPosition === 'task' && chatIds.length !== 1) return;
     if (!canSubmitSchedule(schedule, editing?.schedule, tr, scheduleTimeZone)) return;
     const precondition = buildSchedulePreconditionFormFields({
       hasExisting: hasExistingPrecondition,
@@ -2053,6 +2106,8 @@ export function ScheduleFormModal(props: {
       updateExecutionPosition: !localDelivery,
       chatIds,
       larkAppId,
+      model: model.trim(),
+      reasoningEffort,
     });
   }
 
@@ -2418,7 +2473,7 @@ export function ScheduleFormModal(props: {
                 aria-label={tr('schedules.form.chatBinding')}
                 aria-expanded={chatPickerOpen}
                 aria-controls={chatPickerOpen ? 'schedule-chat-picker-panel' : undefined}
-                aria-invalid={chatMissing || topicChatCountInvalid || chatCountInvalid || undefined}
+                aria-invalid={chatMissing || topicChatCountInvalid || taskChatCountInvalid || chatCountInvalid || undefined}
                 aria-describedby={chatCountInvalid ? 'schedule-chat-limit-error' : undefined}
                 title={selectedChatLabels.join('\n')}
                 onClick={() => setChatPickerOpen(value => !value)}
@@ -2473,7 +2528,7 @@ export function ScheduleFormModal(props: {
                     className="schedule-chat-selector"
                     role="group"
                     aria-label={tr('schedules.form.chatBinding')}
-                    aria-invalid={chatMissing || topicChatCountInvalid || chatCountInvalid || undefined}
+                    aria-invalid={chatMissing || topicChatCountInvalid || taskChatCountInvalid || chatCountInvalid || undefined}
                     aria-describedby={chatCountInvalid ? 'schedule-chat-limit-error' : undefined}
                   >
                     {visibleSelectorOptions.length > 0 ? visibleSelectorOptions.map(group => {
@@ -2523,6 +2578,8 @@ export function ScheduleFormModal(props: {
               </small>
             ) : topicChatCountInvalid ? (
               <small className="schedule-form-error-inline">{tr('schedules.form.errTopicSingleChat')}</small>
+            ) : taskChatCountInvalid ? (
+              <small className="schedule-form-error-inline">{tr('schedulePos.webTaskMultiChatUnsupported')}</small>
             ) : null}
           </div>
         ) : null}
@@ -2568,13 +2625,26 @@ export function ScheduleFormModal(props: {
                 />
                 {tr('schedules.deliveryNewTopic')}
               </label>
+              <label title={chatIds.length > 1 ? tr('schedulePos.webTaskMultiChatUnsupported') : undefined}>
+                <input
+                  type="radio"
+                  name="executionPosition"
+                  value="task"
+                  checked={executionPosition === 'task'}
+                  disabled={chatIds.length > 1}
+                  onChange={() => updateExecutionPosition('task')}
+                />
+                {tr('schedulePos.webTaskLabel')}
+              </label>
             </div>
             <small className="schedule-form-help">
               {executionPosition === 'top-level'
                 ? tr('schedules.form.topLevelHelp')
                 : executionPosition === 'topic'
                   ? tr('schedules.form.topicHelp')
-                  : tr('schedules.form.newTopicHelp')}
+                  : executionPosition === 'task'
+                    ? tr('schedulePos.webTaskHint')
+                    : tr('schedules.form.newTopicHelp')}
             </small>
           </div>
         )}
@@ -2612,6 +2682,22 @@ export function ScheduleFormModal(props: {
             </small>
           </label>
         ) : null}
+        {!localDelivery && executionPosition === 'task' ? (
+          <label className="schedule-form-field">
+            <span className="schedule-form-label">{tr('schedulePos.webTaskTitle')}</span>
+            <input
+              type="text"
+              value={topicTitle}
+              onChange={e => setTopicTitle(e.target.value)}
+              placeholder={tr('schedules.form.topicTitlePlaceholder')}
+              maxLength={200}
+            />
+            <small className="schedule-form-help schedule-form-help-with-count">
+              {tr('schedulePos.webTaskTitleHelp')}
+              <span>{Array.from(topicTitle).length}/200</span>
+            </small>
+          </label>
+        ) : null}
         <label className="schedule-form-field schedule-form-toggle">
           <input
             type="checkbox"
@@ -2625,6 +2711,41 @@ export function ScheduleFormModal(props: {
         </label>
         {executionPosition === 'new-topic' && silent ? (
           <p className="schedule-form-help">{tr('schedules.form.silentNewTopicConflict')}</p>
+        ) : null}
+        <label className="schedule-form-field">
+          <span className="schedule-form-label">{tr('schedules.form.model')}</span>
+          <input
+            type="text"
+            value={model}
+            onChange={e => setModel(e.target.value)}
+            placeholder={tr('schedules.form.modelPlaceholder')}
+            autoComplete="off"
+            autoCapitalize="none"
+            spellCheck={false}
+          />
+          <small className="schedule-form-help">{tr('schedules.form.modelHelp')}</small>
+        </label>
+        <label className="schedule-form-field">
+          <span className="schedule-form-label">{tr('schedules.form.reasoningEffort')}</span>
+          <select
+            value={reasoningEffort}
+            onChange={e => setReasoningEffort(e.target.value)}
+          >
+            <option value="">{tr('schedules.form.reasoningEffortDefault')}</option>
+            {SCHEDULE_REASONING_EFFORTS.map(level => (
+              <option value={level} key={level}>{level}</option>
+            ))}
+          </select>
+          <small className="schedule-form-help">{tr('schedules.form.reasoningEffortHelp')}</small>
+        </label>
+        {(model.trim() || reasoningEffort) ? (
+          // Model / effort are CLI process launch arguments: only a fire that
+          // starts a process can apply them.
+          <p className="schedule-form-help">
+            {tr(executionPosition === 'new-topic'
+              ? 'schedules.form.modelFreshEveryRun'
+              : 'schedules.form.modelFirstRunOnly')}
+          </p>
         ) : null}
         {props.error ? (
           <p className="schedule-form-error">{props.error}</p>

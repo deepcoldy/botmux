@@ -2,6 +2,8 @@
 
 Add a bot to an on-call / duty / alert group and bind it to a project directory. Then **any member** of the group can @ the bot to ask questions — no need to pick a repository, no need to start a new session — going straight into that project directory to chat. Especially suited to "many people, asking anytime, all asking about the same project" scenarios like duty groups, alert groups, and cross-team Q&A.
 
+> **Adding the bot to a group is not authorization by itself**: being added writes no allowlist entry. Anyone-in-the-group Q&A takes effect only **once the on-call binding is in place** (or after a bare `/grant` opens the whole group); on an unbound, restricted bot, a non-listed member @-mentioning it is blocked and triggers a grant request card instead. See [Permissions & Access · Being added to a group is not authorization](/en/permissions#being-added-to-a-group-is-not-authorization).
+
 ## How to Enable (pick one of three)
 
 You can enable it **per group**, or set a default in the **bot config** so every group enables it automatically.
@@ -14,7 +16,7 @@ The fastest way — just send a line in the group:
 /oncall bind ~/projects/your-service
 ```
 
-This anchors **this bot** to that directory in the current group, and the initiator automatically becomes the owner. Binding is **per-bot** — it only affects this bot; bind several at once with `@bot1 @bot2 /oncall bind <path>`. Good for when you just spun up a group and want to use it immediately.
+This anchors **this bot** to that directory in the current group. Binding is **per-bot** — it only affects this bot; bind several at once with `@bot1 @bot2 /oncall bind <path>`. It requires operate rights (owner / `allowedUsers`). Good for when you just spun up a group and want to use it immediately.
 
 ### Option 2: Enable per group (Dashboard)
 
@@ -43,14 +45,14 @@ From then on, **all of the bot's unbound groups** automatically bind to this dir
 
 | Command | Description |
 |------|------|
-| `/oncall bind <path>` | Bind this bot to a project directory in the current group (multi-bot: `@bot1 @bot2 /oncall bind`); the initiator automatically becomes the owner |
-| `/oncall unbind` | Unbind (owner only) |
+| `/oncall bind <path>` | Bind this bot to a project directory in the current group; requires operate rights (owner / `allowedUsers`; multi-bot: `@bot1 @bot2 /oncall bind`) |
+| `/oncall unbind` | Unbind (operate rights required) |
 | `/oncall status` | View the current binding |
 
 ## Permission Tiers
 
-- **Everyone** in the group can talk to the bot (ask questions, check logs, read code)
-- Only the **owner** can switch session state (`/cd`, `/restart`, `/close`, clicking the streaming card buttons)
+- Once on-call is bound, **everyone** in the group can talk to the bot (ask questions, check logs, read code) — always allowed, never quota-limited
+- Only the **owner / admins** (`allowedUsers`) can switch session state (`/cd`, `/restart`, `/close`, clicking the streaming card buttons)
 - This prevents external group members from accidentally messing up the session
 
 > Want semi-trusted members' **changes to also never touch the real repo**? Enable the [File Sandbox](/en/sandbox) — all writes are isolated and only land after the owner reviews the diff.

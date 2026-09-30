@@ -1,10 +1,10 @@
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   PI_INITIAL_PROMPT_COMMAND,
   PI_INITIAL_PROMPT_FILE_ENV,
 } from './pi-initial-prompt-extension.js';
+import { PI_INITIAL_PROMPT_EXTENSION_SOURCE } from './pi-initial-prompt-extension-data.js';
 
 export const PI_INITIAL_PROMPT_ARG_BYTE_LIMIT = 4096;
 
@@ -37,13 +37,6 @@ export function piInitialPromptFilePath(sessionDataDir: string, sessionId: strin
   return join(piInitialPromptDir(sessionDataDir, sessionId), 'initial.prompt.md');
 }
 
-function piInitialPromptExtensionPath(): string {
-  const here = dirname(fileURLToPath(import.meta.url));
-  const compiled = resolve(here, 'pi-initial-prompt-extension.js');
-  if (existsSync(compiled)) return compiled;
-  return resolve(here, 'pi-initial-prompt-extension.ts');
-}
-
 export function preparePiInitialPromptArg(opts: {
   prompt: string;
   sessionId: string;
@@ -51,6 +44,7 @@ export function preparePiInitialPromptArg(opts: {
 }): {
   initialPromptArg: string;
   filePath?: string;
+  extensionPath?: string;
   readonlyRoot?: string;
   cleanupDir?: string;
   deferredInput?: {
@@ -72,14 +66,20 @@ export function preparePiInitialPromptArg(opts: {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const filePath = piInitialPromptFilePath(sessionDataDir, opts.sessionId);
   writeFileSync(filePath, opts.prompt, { encoding: 'utf8', mode: 0o600 });
+  // Pi 是独立进程，必须使用真实磁盘文件，不能传 Bun 内部的 /$bunfs 路径。
+  const extensionPath = join(dir, 'pi-initial-prompt-extension.mjs');
+  writeFileSync(extensionPath, PI_INITIAL_PROMPT_EXTENSION_SOURCE, {
+    encoding: 'utf8', mode: 0o600,
+  });
   return {
     initialPromptArg: `@${filePath}`,
     filePath,
+    extensionPath,
     readonlyRoot: dir,
     cleanupDir: dir,
     deferredInput: {
       content: PI_INITIAL_PROMPT_COMMAND,
-      additionalArgs: ['--extension', piInitialPromptExtensionPath()],
+      additionalArgs: ['--extension', extensionPath],
       env: { [PI_INITIAL_PROMPT_FILE_ENV]: filePath },
     },
   };

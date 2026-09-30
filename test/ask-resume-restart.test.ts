@@ -5,6 +5,7 @@ import { join } from 'node:path';
 
 import {
   registerAsk,
+  registerHostAsk,
   restorePersistedAsks,
   tryResolveAsk,
   setCardDispatcher,
@@ -205,6 +206,39 @@ describe('click → reattach (durable handoff — codex P1-1)', () => {
 });
 
 describe('card re-send when restart precedes cardMessageId (codex P1-2)', () => {
+  it('an undelivered host ask survives past its nominal timeout and starts timing after re-delivery', async () => {
+    let resolveFirstSend!: (value: { messageId?: string }) => void;
+    setCardDispatcher(mockDispatcher(() => new Promise((resolve) => {
+      resolveFirstSend = resolve;
+    })));
+    registerHostAsk(makeInput({
+      originKind: 'host_cross_principal_classification',
+      requestId: 'host-before-delivery',
+      backendSurvivesRestart: undefined,
+      timeoutMs: 20,
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(onlyPersisted().cardMessageId).toBeUndefined();
+
+    _resetForTest();
+    bindStore();
+    const d2 = mockDispatcher();
+    setCardDispatcher(d2);
+    setCanTalkChecker((_a, _c, openId) => openId === 'ou_owner');
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(1);
+
+    const reattached = registerHostAsk(makeInput({
+      originKind: 'host_cross_principal_classification',
+      requestId: 'host-before-delivery',
+      backendSurvivesRestart: undefined,
+      timeoutMs: 20,
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(d2.sendCalls).toHaveLength(1);
+    await expect(reattached).resolves.toMatchObject({ kind: 'timedOut' });
+    void resolveFirstSend;
+  });
+
   it('a restored ask without cardMessageId re-sends exactly one card on re-attach', async () => {
     // Dispatcher that never resolves a messageId → simulates restart before the
     // .then() that records cardMessageId runs.

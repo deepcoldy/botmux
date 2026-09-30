@@ -12,6 +12,14 @@ bun run daemon:logs          # 查看日志
 
 - 每次修改后需要 `bun run build` 然后 `bun run daemon:restart`
 
+⚠️ **别用裸 `node` 起 daemon —— 用 `bun run daemon:*`。** 会话存储硬依赖 SQLite 引擎
+（`node:sqlite` 需 Node ≥ 22.13，或任意 bun 的 `bun:sqlite`），而裸 `node` 由 exec 时的
+PATH 解析，那不是写它的环境：2026-09-08 某次 restart 的 PATH 把 `/usr/bin` 排在 fnm shim
+之前 ⟹ 解析成 v18.20.4 ⟹ **55 个 bot daemon 全部启动即崩**，飞书里所有话题看似全丢（57 个
+SQLite 库其实完好）。**supervisor 自身不需要 SQLite，所以它照常打印「✅ daemon 已重启」**
+—— 这个失败形状是记在这里的唯一理由：报成功、孩子全灭，看日志前无从分辨。
+现在 preflight 会在**拆掉现有 fleet 之前**按引擎能力拒绝（逃生阀 `BOTMUX_INTERPRETER=<abs>`）。
+
 **包管理器是 bun**（`packageManager: bun@1.4.2`，锁文件 `bun.lock`）。装依赖用 `bun install --frozen-lockfile`。
 
 ⚠️ `trustedDependencies: ["electron","node-pty"]` **不能删**：bun 默认**不跑依赖的生命周期脚本**，而 `node-pty` 要靠它 `node-gyp` 编出 `build/Release/pty.node` —— 少了这个，PTY 全废、编译版二进制也打不出来（`pty.node` 是被嵌进去的）。electron 的 postinstall 负责下载对应平台的二进制。
@@ -134,4 +142,4 @@ bun run switch:here && bun run daemon:restart
 - commit message 格式：`type(scope): 中文描述`。`type`（feat/fix/docs/chore 等）和 `scope`（模块名）保留英文，冒号后的描述用中文；同样**不带飞书真人名字与机器人协作花名**（见上「PR 规范」）
 - 日常 `git commit` + `git push` 不会触发发版；打 `v*` annotated tag 并 push 才发版（**仅在用户明确要求时**），CI 自动从 tag 提取版本号发布 npm + 创建 GitHub Release
 - **不要**手动修改 `package.json` 的 `version` 字段；tag message 用中文撰写，CI 会用作 Release body
-- **正式版（latest）必须从 master 出**：CI 校验被打 tag 的 commit 含最新 `origin/master`。非 master 分支灰度用 `-canary.N`/`-beta.N`/`-rc.N` 后缀（CI 自动路由到对应 npm dist-tag，其它 `-` 后缀兜底到 `next`，都不污染 latest）；验证 canary：`npm i -g botmux@canary`
+- **正式版（latest）必须从 master 出**：CI 校验被打 tag 的 commit 含最新 `origin/master`。非 master 分支灰度用 `-canary.N`/`-beta.N`/`-rc.N` 后缀（CI 自动路由到对应 npm dist-tag，其它 `-` 后缀兜底到 `next`，都不污染 latest）；验证 canary：`botmux update canary`（或 `npm i -g botmux@canary`）

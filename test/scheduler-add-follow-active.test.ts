@@ -86,3 +86,71 @@ describe('scheduler.addTask → schedule-store', () => {
       .toThrow('follow_active_requires_topic');
   });
 });
+
+describe('scheduler.addTask — task position (dedicated per-task topic)', () => {
+  const TASK_PARAMS = {
+    name: 'sentinel',
+    schedule: '*/30 * * * *',
+    parsed: { kind: 'cron' as const, expr: '*/30 * * * *', display: '*/30 * * * *' },
+    prompt: 'check',
+    workingDir: '/workspace/project',
+    chatId: 'oc_test_chat',
+    executionPosition: 'task' as const,
+    larkAppId: TEST_APP,
+  };
+
+  it('creates a rootless task-position task bound to thread scope without requiring a root', async () => {
+    const { store, scheduler } = await freshImport();
+    const task = scheduler.addTask({ ...TASK_PARAMS });
+    expect(task.executionPosition).toBe('task');
+    expect(task.scope).toBe('thread');
+    expect(task.rootMessageId).toBeUndefined();
+    expect(store.getTask(task.id, TEST_APP)).toMatchObject({
+      executionPosition: 'task',
+      scope: 'thread',
+      rootMessageId: undefined,
+    });
+  });
+
+  it('refuses a task-position task spanning multiple chats', async () => {
+    const { scheduler } = await freshImport();
+    expect(() => scheduler.addTask({ ...TASK_PARAMS, chatIds: ['oc_a', 'oc_b'] }))
+      .toThrow('multiple_chats_task_unsupported');
+  });
+
+  it('control: multiple chats remain rejected for ordinary topic execution too', async () => {
+    const { scheduler } = await freshImport();
+    expect(() => scheduler.addTask({ ...PARAMS, chatIds: ['oc_a', 'oc_b'] }))
+      .toThrow('multiple_chats_topic_unsupported');
+  });
+
+  it('never persists a caller-supplied root for a task-position task (the root is first-fire managed)', async () => {
+    const { store, scheduler } = await freshImport();
+    const task = scheduler.addTask({ ...TASK_PARAMS, rootMessageId: 'om_foreign' });
+    expect(task.rootMessageId).toBeUndefined();
+    expect(store.getTask(task.id, TEST_APP)?.rootMessageId).toBeUndefined();
+  });
+
+  it('refuses followActive for a task-position task exactly like other non-topic positions', async () => {
+    const { scheduler } = await freshImport();
+    expect(() => scheduler.addTask({ ...TASK_PARAMS, followActive: true }))
+      .toThrow('follow_active_requires_topic');
+  });
+});
+
+describe('scheduler.resolveTaskExecutionPosition — task position', () => {
+  async function resolve(overrides: Record<string, unknown>) {
+    vi.resetModules();
+    const { resolveTaskExecutionPosition } = await import('../src/core/scheduler.js');
+    return resolveTaskExecutionPosition(overrides as Parameters<typeof resolveTaskExecutionPosition>[0]);
+  }
+
+  it('stays task while the dedicated topic has not materialized', async () => {
+    expect(await resolve({ executionPosition: 'task', scope: 'thread' })).toBe('task');
+  });
+
+  it('resolves a materialized task (root written back) to the topic/thread branch', async () => {
+    expect(await resolve({ executionPosition: 'task', scope: 'thread', rootMessageId: 'om_task_root' })).toBe('topic');
+  });
+});
+

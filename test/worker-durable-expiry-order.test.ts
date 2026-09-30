@@ -162,8 +162,8 @@ describe('worker durable lease expiry ordering', () => {
     const terminalStart = workerSource.indexOf('function emitTurnTerminal(');
     const terminalEnd = workerSource.indexOf('\nfunction workerIpcPayload(', terminalStart);
     const terminal = workerSource.slice(terminalStart, terminalEnd);
-    expect(terminal).toContain('revokeManagedTurnOriginForTerminal(turnId, dispatchAttempt);');
-    expect(terminal.indexOf('revokeManagedTurnOriginForTerminal(turnId, dispatchAttempt);'))
+    expect(terminal).toContain("releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });");
+    expect(terminal.indexOf("releaseActiveTurnAuthority('turn_terminal', { turnId, dispatchAttempt });"))
       .toBeLessThan(terminal.indexOf("type: 'turn_terminal'"));
 
     const flushStartForRotation = workerSource.indexOf('async function flushPending(): Promise<void>');

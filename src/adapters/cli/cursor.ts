@@ -1,3 +1,4 @@
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
@@ -163,7 +164,7 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
     skillsDir: '~/.cursor/skills',
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,
-    modelChoices: ['auto', 'claude-4-sonnet', 'claude-4-opus', 'gpt-5'],
+    modelChoices: CLI_MODEL_CHOICES['cursor'],
   };
 }
 

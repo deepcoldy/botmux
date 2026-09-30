@@ -30,6 +30,17 @@ vi.mock('../src/services/session-store.js', () => ({
   updateSession: vi.fn((s: Session) => { store.set(s.sessionId, s); }),
   getSession: vi.fn((id: string) => store.get(id)),
   listSessions: vi.fn(() => [...store.values()]),
+  mutateOwnedSessionsAtomically: vi.fn((ids: readonly string[], mutate: (fresh: Map<string, Session>) => unknown) => {
+    const fresh = new Map<string, Session>();
+    for (const id of ids) {
+      const session = store.get(id);
+      if (!session) throw new Error(`atomic session mutation cannot find ${id}`);
+      fresh.set(id, structuredClone(session));
+    }
+    const result = mutate(fresh);
+    for (const [id, session] of fresh) store.set(id, session);
+    return { result, rows: fresh };
+  }),
   closeSession: vi.fn(),
   updateSessionPid: vi.fn(),
 }));
@@ -71,6 +82,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
   getCurrentCliVersion: vi.fn(() => 'test-cli-v1'),
   restoreUsageLimitRuntimeState: vi.fn(),
   ensureOrdinaryTurnRecoveryAttached: vi.fn(),
+  ensureReadonlyTaskContinuationAttached: vi.fn(),
   setActiveSessionIfActive: vi.fn((map: Map<string, any>, k: string, ds: any) => {
     if (map.has(k) && map.get(k) !== ds) return false;
     map.set(k, ds);
@@ -561,6 +573,26 @@ describe('spawnDashboardSession — backlog (待办池) parks without starting t
       mode: 'picker', prompt: 'OPENING_N', repoCardMessageId: 'om_old_picker',
     });
     expect(active.get(sessionKey('oc_later', APP))?.session.queuedPrompt).toBe('LATER_TASK');
+  });
+
+  it('prepares trigger-user identity before restored auto-worktree fork', async () => {
+    const pending: Session = {
+      sessionId: 'pending-auth-worktree', chatId: CHAT, rootMessageId: CHAT,
+      scope: 'chat', larkAppId: APP, title: 'restore auth', status: 'active',
+      createdAt: new Date('2026-01-01T00:00:00Z').toISOString(),
+      queued: true, queuedPrompt: 'OPENING_N', ownerOpenId: 'ou_owner',
+      pendingRepoSetup: {
+        mode: 'auto_worktree', prompt: 'OPENING_N', baseDir: '/tmp', turnId: 'om_original_turn',
+        force: true, worktreePath: '/tmp/shared-wt', branch: 'wt/shared', reuseExisting: true,
+      },
+    };
+    store.set(pending.sessionId, pending);
+    const prepareTurn = vi.fn(async () => {});
+
+    const active = new Map<string, DaemonSession>();
+    await restoreActiveSessions(active, new Set(), { prepareTurn });
+
+    expect(runAutoWorktreeCommitMock).toHaveBeenCalledWith(expect.objectContaining({ prepareTurn }));
   });
 
   it('contains detached auto-worktree recovery rejection and leaves the setup retryable', async () => {

@@ -170,4 +170,31 @@ describe('host-overload card actions across bot-scoped daemons', () => {
     // The nonce must be released so the owner can click the button again.
     expect(claimOverloadNonce(state.nonce, OVERLOAD_ACTION_CLEAN_STOPPED)).toBe(true);
   });
+
+  it('blocks non-owner from running overload sweep', async () => {
+    const state: OverloadCardState = {
+      nonce: 'nonce-non-owner',
+      load15: 30, cpu: 10, mem: 0.95, reasons: ['load'],
+      stopped: 5, idle: 9, cleanedN: -1, suspendedN: -1,
+    };
+    registerOverloadNonce(state.nonce);
+
+    const result = await handleCardAction({
+      operator: { open_id: 'ou_coowner' },
+      action: {
+        value: {
+          action: OVERLOAD_ACTION_CLEAN_STOPPED,
+          st: JSON.stringify(state),
+        },
+      },
+    }, {
+      activeSessions: new Map(),
+      sessionReply: vi.fn(async () => 'om_reply'),
+      lastRepoScan: new Map(),
+    } as any, 'cli_alert');
+
+    expect(result?.toast?.type).toBe('error');
+    expect(result?.toast?.content).toBe('仅 owner 可操作');
+    expect(fetchDaemonIpcMock).not.toHaveBeenCalled();
+  });
 });

@@ -357,6 +357,65 @@ describe('terminal proxy — on-demand wake (ensureWorkerPort)', () => {
     expect(res.status).toBe(502);
   });
 
+  it('renders a localized static page while an authorized session is starting', async () => {
+    proxy = await startTerminalProxy({
+      port: 0, host: '127.0.0.1',
+      resolvePort: () => undefined,
+      ensureWorkerPort: async () => undefined,
+      resolveSessionState: () => 'starting',
+      resolveStatusPageLocale: () => 'en',
+      authorizeStatusPage: (_sessionId, capability) => capability.viewToken === 'card-view',
+    });
+    const res = await fetch(
+      `http://127.0.0.1:${proxy.port}/s/sleeping/?viewToken=card-view`,
+    );
+    expect(res.status).toBe(503);
+    expect(res.headers.get('content-type')).toContain('text/html');
+    expect(res.headers.get('retry-after')).toBeNull();
+    const html = await res.text();
+    expect(html).toContain('Terminal is starting');
+    expect(html).toContain('<html lang="en">');
+    expect(html).toContain('Refresh this page later or reopen the Web Terminal from the latest card.');
+    expect(html).not.toContain('location.reload');
+    expect(html).not.toContain('<button');
+  });
+
+  it('renders a terminal-closed page only for an authorized card capability', async () => {
+    proxy = await startTerminalProxy({
+      port: 0, host: '127.0.0.1',
+      resolvePort: () => undefined,
+      ensureWorkerPort: async () => undefined,
+      resolveSessionState: () => 'closed',
+      authorizeStatusPage: (_sessionId, capability) => capability.viewToken === 'card-view',
+    });
+    const closed = await fetch(
+      `http://127.0.0.1:${proxy.port}/s/closed/?viewToken=card-view`,
+    );
+    expect(closed.status).toBe(410);
+    const closedHtml = await closed.text();
+    expect(closedHtml).toContain('该会话已关闭');
+    expect(closedHtml).not.toContain('<button');
+
+    const stale = await fetch(
+      `http://127.0.0.1:${proxy.port}/s/closed/?viewToken=stale`,
+    );
+    expect(stale.status).toBe(403);
+    expect(await stale.text()).toContain('终端链接已失效');
+  });
+
+  it('renders a not-found page for an unknown session', async () => {
+    proxy = await startTerminalProxy({
+      port: 0, host: '127.0.0.1',
+      resolvePort: () => undefined,
+      ensureWorkerPort: async () => undefined,
+      resolveSessionState: () => 'not-found',
+      authorizeStatusPage: () => false,
+    });
+    const res = await fetch(`http://127.0.0.1:${proxy.port}/s/missing/`);
+    expect(res.status).toBe(404);
+    expect(await res.text()).toContain('找不到该会话');
+  });
+
   it('collapses an ensureWorkerPort error to 502 (not a crash)', async () => {
     proxy = await startTerminalProxy({
       port: 0, host: '127.0.0.1',

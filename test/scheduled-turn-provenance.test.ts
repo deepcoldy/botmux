@@ -12,25 +12,39 @@ import { dirname, join } from 'node:path';
 
 import {
   authorizeScheduledTurn,
+  mintScheduledContinuationTurnId,
   parseScheduledTurnId,
   readScheduledTaskForProvenance,
+  trustedCallerForScheduledTask,
 } from '../src/core/scheduled-turn-provenance.js';
 import { botHomePath } from '../src/adapters/cli/read-isolation.js';
 
 const TASK_ID = 'abcdef12';
-const TURN_ID = `schedule:${TASK_ID}:12345678-1234-1234-1234-123456789abc`;
+const TURN_UUID = '12345678-1234-1234-1234-123456789abc';
+const TURN_ID = `schedule:${TASK_ID}:${TURN_UUID}`;
 
 describe('parseScheduledTurnId', () => {
   it('extracts the task id from a scheduled turn id', () => {
     expect(parseScheduledTurnId(TURN_ID)).toBe(TASK_ID);
   });
 
+  it('accepts workflow-derived long task ids (wf3_/wf_ idempotency keys)', () => {
+    const wf3 = `wf3_${'a'.repeat(46)}`;
+    expect(wf3).toHaveLength(50);
+    expect(parseScheduledTurnId(`schedule:${wf3}:${TURN_UUID}`)).toBe(wf3);
+    const wf = `wf_${'b'.repeat(47)}`;
+    expect(wf).toHaveLength(50);
+    expect(parseScheduledTurnId(`schedule:${wf}:${TURN_UUID}`)).toBe(wf);
+  });
+
   it('rejects human and malformed turn ids', () => {
     expect(parseScheduledTurnId('turn-1')).toBeNull();
     expect(parseScheduledTurnId('schedule:abc:def')).toBeNull();
-    // task id must be exactly 8 lowercase hex chars
-    expect(parseScheduledTurnId('schedule:short123:12345678-1234-1234-1234-123456789abc')).toBeNull();
+    // task id alphabet is [0-9a-z_], width 1..50 (8-hex legacy ids and
+    // wf_/wf3_ idempotency keys); hyphens/uppercase/over-long stay rejected
+    expect(parseScheduledTurnId('schedule:abc-def1:12345678-1234-1234-1234-123456789abc')).toBeNull();
     expect(parseScheduledTurnId('schedule:ABCDEF12:12345678-1234-1234-1234-123456789abc')).toBeNull();
+    expect(parseScheduledTurnId(`schedule:${'a'.repeat(51)}:12345678-1234-1234-1234-123456789abc`)).toBeNull();
     // no prefix smuggling
     expect(parseScheduledTurnId(`x${TURN_ID}`)).toBeNull();
     // uuid must be its canonical 8-4-4-4-12 hex shape
@@ -61,12 +75,12 @@ describe('authorizeScheduledTurn', () => {
     return join(botHomePath(dirname(dataDir), appId), 'schedules.json');
   }
 
-  function writeTask(over: Record<string, unknown> = {}): void {
+  function writeTask(over: Record<string, unknown> = {}, id: string = TASK_ID): void {
     const dir = dirname(schedulesPath());
     mkdirSync(dir, { recursive: true });
     writeFileSync(schedulesPath(), JSON.stringify({
-      [TASK_ID]: {
-        id: TASK_ID,
+      [id]: {
+        id,
         name: 't',
         chatId,
         larkAppId: appId,
@@ -108,6 +122,73 @@ describe('authorizeScheduledTurn', () => {
     expect(call()).toEqual({ error: 'task_disabled' });
   });
 
+  it('allows only the exact live turn of an auto-completed one-shot', () => {
+    writeTask({
+      enabled: false,
+      disabledReason: 'once_completed',
+      parsed: { kind: 'once', runAt: '2026-09-20T03:00:00.000Z', display: 'once' },
+    });
+    expect(authorizeScheduledTurn({
+      turnId: TURN_ID,
+      dataDir,
+      sessionLarkAppId: appId,
+      sessionChatId: chatId,
+      isOwnerAllowed: allow,
+      isScheduledTurnLive: turnId => turnId === TURN_ID,
+    })).toMatchObject({ ownerOpenId: owner, taskLarkAppId: appId });
+  });
+
+  it('rejects an auto-completed one-shot after its exact turn is no longer live', () => {
+    writeTask({
+      enabled: false,
+      disabledReason: 'once_completed',
+      parsed: { kind: 'once', runAt: '2026-09-20T03:00:00.000Z', display: 'once' },
+    });
+    expect(authorizeScheduledTurn({
+      turnId: TURN_ID,
+      dataDir,
+      sessionLarkAppId: appId,
+      sessionChatId: chatId,
+      isOwnerAllowed: allow,
+      isScheduledTurnLive: () => false,
+    })).toEqual({ error: 'task_disabled' });
+  });
+
+  it('rejects manual and legacy disabled tasks even when a turn is reported live', () => {
+    for (const disabledReason of ['manual', undefined] as const) {
+      writeTask({
+        enabled: false,
+        disabledReason,
+        parsed: { kind: 'once', runAt: '2026-09-20T03:00:00.000Z', display: 'once' },
+      });
+      expect(authorizeScheduledTurn({
+        turnId: TURN_ID,
+        dataDir,
+        sessionLarkAppId: appId,
+        sessionChatId: chatId,
+        isOwnerAllowed: allow,
+        isScheduledTurnLive: () => true,
+      })).toEqual({ error: 'task_disabled' });
+    }
+  });
+
+  it('rejects a different historical turn of the same one-shot task', () => {
+    writeTask({
+      enabled: false,
+      disabledReason: 'once_completed',
+      parsed: { kind: 'once', runAt: '2026-09-20T03:00:00.000Z', display: 'once' },
+    });
+    const historicalTurn = `schedule:${TASK_ID}:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee`;
+    expect(authorizeScheduledTurn({
+      turnId: historicalTurn,
+      dataDir,
+      sessionLarkAppId: appId,
+      sessionChatId: chatId,
+      isOwnerAllowed: allow,
+      isScheduledTurnLive: turnId => turnId === TURN_ID,
+    })).toEqual({ error: 'task_disabled' });
+  });
+
   it('rejects a task without ownerOpenId (legacy task cannot run workflows)', () => {
     writeTask({ ownerOpenId: undefined });
     expect(call()).toEqual({ error: 'task_owner_missing' });
@@ -139,6 +220,62 @@ describe('authorizeScheduledTurn', () => {
     expect(call()).toMatchObject({ ownerOpenId: owner, taskLarkAppId: appId });
   });
 
+  it('authorizes a scheduled turn carrying a wf3_<46hex> workflow task id', () => {
+    const longId = `wf3_${'1'.repeat(46)}`;
+    writeTask({}, longId);
+    expect(authorizeScheduledTurn({
+      turnId: `schedule:${longId}:${TURN_UUID}`,
+      dataDir,
+      sessionLarkAppId: appId,
+      sessionChatId: chatId,
+      isOwnerAllowed: allow,
+    })).toMatchObject({ ownerOpenId: owner, taskLarkAppId: appId });
+  });
+
+  it('authorizes a scheduled turn carrying a wf_<47hex> workflow task id', () => {
+    const longId = `wf_${'2'.repeat(47)}`;
+    writeTask({}, longId);
+    expect(authorizeScheduledTurn({
+      turnId: `schedule:${longId}:${TURN_UUID}`,
+      dataDir,
+      sessionLarkAppId: appId,
+      sessionChatId: chatId,
+      isOwnerAllowed: allow,
+    })).toMatchObject({ ownerOpenId: owner });
+  });
+
+  it('authorizes a multi-chat task from both the primary and a secondary chat', () => {
+    writeTask({ chatIds: [chatId, 'oc_second'] });
+    for (const presentingChatId of [chatId, 'oc_second']) {
+      expect(authorizeScheduledTurn({
+        turnId: TURN_ID, dataDir, sessionLarkAppId: appId,
+        sessionChatId: presentingChatId, isOwnerAllowed: allow,
+      })).toMatchObject({ ownerOpenId: owner });
+    }
+  });
+
+  it('rejects a multi-chat task presented from a chat outside its chatIds', () => {
+    writeTask({ chatIds: [chatId, 'oc_second'] });
+    expect(authorizeScheduledTurn({
+      turnId: TURN_ID, dataDir, sessionLarkAppId: appId,
+      sessionChatId: 'oc_third', isOwnerAllowed: allow,
+    })).toEqual({ error: 'binding_mismatch' });
+  });
+
+  it('rejects a forged-but-wellformed task id with task_not_found (parse is not authorization)', () => {
+    // A real task exists under TASK_ID; the widened turn-id parser accepts the
+    // forged id, but the per-bot store lookup finds no row, so no authority is
+    // granted.
+    writeTask();
+    expect(authorizeScheduledTurn({
+      turnId: `schedule:forged:${TURN_UUID}`,
+      dataDir,
+      sessionLarkAppId: appId,
+      sessionChatId: chatId,
+      isOwnerAllowed: allow,
+    })).toEqual({ error: 'task_not_found' });
+  });
+
   it('fails closed on a corrupt schedules.json', () => {
     mkdirSync(dirname(schedulesPath()), { recursive: true });
     writeFileSync(schedulesPath(), '{not json');
@@ -153,5 +290,66 @@ describe('authorizeScheduledTurn', () => {
       isOwnerAllowed: (app, openId) => { seen.push([app, openId]); return true; },
     });
     expect(seen).toEqual([[appId, owner]]);
+  });
+});
+
+describe('mintScheduledContinuationTurnId', () => {
+  it('keeps the task prefix so the continuation authenticates like the fire', () => {
+    const minted = mintScheduledContinuationTurnId(TURN_ID, () => 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+    expect(minted).toBe(`schedule:${TASK_ID}:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee`);
+    expect(parseScheduledTurnId(minted!)).toBe(TASK_ID);
+    expect(minted).not.toBe(TURN_ID);
+  });
+
+  it('mints a fresh uuid per continuation by default', () => {
+    const first = mintScheduledContinuationTurnId(TURN_ID)!;
+    const second = mintScheduledContinuationTurnId(TURN_ID)!;
+    expect(parseScheduledTurnId(first)).toBe(TASK_ID);
+    expect(parseScheduledTurnId(second)).toBe(TASK_ID);
+    expect(first).not.toBe(second);
+  });
+
+  it('declines for ordinary IM turns and malformed ids', () => {
+    expect(mintScheduledContinuationTurnId('om_x100')).toBeUndefined();
+    expect(mintScheduledContinuationTurnId('bmx-recovery-abc')).toBeUndefined();
+    expect(mintScheduledContinuationTurnId('schedule:abc:def')).toBeUndefined();
+  });
+});
+
+describe('trustedCallerForScheduledTask', () => {
+  const base = {
+    id: TASK_ID,
+    name: 'hourly',
+    prompt: 'do it',
+    chatId: 'oc_chat',
+    enabled: true,
+  } as any;
+
+  it('runs the turn as the task creator, binding the task id', () => {
+    expect(trustedCallerForScheduledTask({
+      ...base,
+      ownerOpenId: 'ou_owner',
+      ownerUnionId: 'on_owner',
+      creatorLarkAppId: 'cli_creator',
+      larkAppId: 'cli_target',
+    }, 'cli_session')).toEqual({
+      requestUserOpenId: 'ou_owner',
+      requestUserUnionId: 'on_owner',
+      requestLarkAppId: 'cli_creator',
+      source: 'schedule_creator',
+      taskId: TASK_ID,
+    });
+  });
+
+  it('falls back to the task app, then the session app, for the requesting app id', () => {
+    expect(trustedCallerForScheduledTask({ ...base, ownerUnionId: 'on_owner', larkAppId: 'cli_target' }, 'cli_session'))
+      .toEqual(expect.objectContaining({ requestLarkAppId: 'cli_target' }));
+    const sessionFallback = trustedCallerForScheduledTask({ ...base, ownerUnionId: 'on_owner' }, 'cli_session');
+    expect(sessionFallback).toEqual(expect.objectContaining({ requestLarkAppId: 'cli_session' }));
+    expect(sessionFallback).not.toHaveProperty('requestUserOpenId');
+  });
+
+  it('fails closed without a creator union id (legacy / bot-created task)', () => {
+    expect(trustedCallerForScheduledTask({ ...base, ownerOpenId: 'ou_owner' }, 'cli_session')).toBeUndefined();
   });
 });

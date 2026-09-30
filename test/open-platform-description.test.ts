@@ -127,6 +127,22 @@ describe('readBotDescriptionsOnOpenPlatform', () => {
     });
     expect(result).toMatchObject({ ok: false, reason: 'no_access' });
   });
+
+  // console cookie 过期后读描述会在第一笔 app/:id 就撞上 passport 登出信号，必须
+  // 归类 session_expired（dashboard 才弹重新扫码），而不是把裸的 HTTP 400 甩出去。
+  it('maps an expired web session (real HTTP 400 passport payload) to session_expired', async () => {
+    const result = await readBotDescriptionsOnOpenPlatform('cli_x', 'feishu', {
+      loadCookies: () => COOKIES,
+      clientFactory: fakeClient([], {
+        '/developers/v1/app/cli_x': new OpenPlatformApiError(
+          'HTTP 400 /developers/v1/app/cli_x',
+          { code: 99991641, msg: 'Something went wrong, please log in again.', error: { Code: 4101, LogoutReason: 15 } },
+          400,
+        ),
+      }),
+    });
+    expect(result).toMatchObject({ ok: false, reason: 'session_expired' });
+  });
 });
 
 describe('updateBotDescriptionsOnOpenPlatform', () => {
@@ -235,5 +251,30 @@ describe('updateBotDescriptionsOnOpenPlatform', () => {
     );
     expect(result).toMatchObject({ ok: false, reason: 'api_error' });
     expect(calls.every(call => !call.path.includes('/base_info/'))).toBe(true);
+  });
+
+  // 登录态可能在链路“中途”才失效：前面读取都成功，直到 base_info 写那笔才撞上
+  // passport 登出。必须仍归 session_expired（引导重新扫码），且没有建版/发布。
+  it('maps a mid-chain expired session (base_info write) to session_expired without publishing', async () => {
+    const calls: Call[] = [];
+    const result = await updateBotDescriptionsOnOpenPlatform(
+      'cli_x', { zh_cn: '中文新版', en_us: 'English new' }, 'feishu', {
+        loadCookies: () => COOKIES,
+        clientFactory: fakeClient(calls, {
+          '/developers/v1/app/cli_x': BASE_INFO,
+          '/developers/v1/visible/online/cli_x': ONLINE_VISIBLE,
+          '/developers/v1/app_version/list/cli_x': VERSION_LIST,
+          '/developers/v1/base_info/cli_x': new OpenPlatformApiError(
+            'HTTP 400 /developers/v1/base_info/cli_x',
+            { code: 99991641, msg: 'Something went wrong, please log in again.', error: { Code: 4101, LogoutReason: 40 } },
+            400,
+          ),
+        }),
+      },
+    );
+    expect(result).toMatchObject({ ok: false, reason: 'session_expired' });
+    // 写 base_info 已尝试并失败，但绝不能继续建版/发布。
+    expect(calls.some(call => call.path === '/developers/v1/base_info/cli_x')).toBe(true);
+    expect(calls.every(call => !call.path.includes('/app_version/create/') && !call.path.includes('/publish/commit/'))).toBe(true);
   });
 });

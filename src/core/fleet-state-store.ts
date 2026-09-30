@@ -47,6 +47,9 @@ export function parseFleetState(raw: unknown): FleetState | null {
   return {
     supervisorPid: Number.isSafeInteger(o.supervisorPid) ? (o.supervisorPid as number) : 0,
     supervisorStartedAt: typeof o.supervisorStartedAt === 'string' ? o.supervisorStartedAt : '',
+    ...(typeof o.supervisorProcessStart === 'string' ? { supervisorProcessStart: o.supervisorProcessStart } : {}),
+    ...(typeof o.supervisorPidNamespace === 'string' ? { supervisorPidNamespace: o.supervisorPidNamespace } : {}),
+    ...(typeof o.supervisorCommand === 'string' ? { supervisorCommand: o.supervisorCommand } : {}),
     ...(typeof o.supervisorEntry === 'string' ? { supervisorEntry: o.supervisorEntry } : {}),
     procs,
   };

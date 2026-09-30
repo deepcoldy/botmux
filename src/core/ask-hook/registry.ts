@@ -16,6 +16,8 @@ const REGISTRY: Record<string, HookAskAdapter> = {
   relay: claude,
   codex,
   opencode,
+  // MiMoCode is an OpenCode fork and emits the same question.asked payload.
+  mimocode: opencode,
   // opencode2 的 V2 插件在插件内把新事件流 payload 规范成与 V1 插件相同的
   // `{ hook_event_name: 'question.asked', question_id, session_id, tool_input }`
   // 形状再喂 `botmux hook opencode2`，所以复用同一个解析/作答适配器。

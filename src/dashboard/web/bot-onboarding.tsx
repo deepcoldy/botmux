@@ -11,6 +11,7 @@ export const OPEN_BOT_ONBOARDING_EVENT = 'botmux:open-bot-onboarding';
 /** 克隆源 Bot 里会被 cloneBotConfig 带过去、且表单里也有对应项的字段。 */
 export type CloneSourceDefaults = {
   cliId?: string;
+  cliLaunchMode?: 'forge-traex';
   workingDir?: string;
   dirMode?: 'card' | 'fixed';
   model?: string;
@@ -75,6 +76,7 @@ type CliOption = {
   available?: boolean;
   command?: string;
   availabilityReason?: string;
+  cliLaunchMode?: 'forge-traex';
   /** 静态模型候选（与 bot-defaults.ts 的 CliOption 对齐）。 */
   modelChoices?: readonly string[];
 };
@@ -274,13 +276,14 @@ function normalizeFormForOptions(form: OnboardingFormState, cliState: CliOptions
  */
 export function cloneSourceDefaultsFrom(source: {
   cliId?: string | null;
+  agentSelectionKey?: string | null;
   defaultWorkingDir?: string | null;
   workingDir?: string | null;
   model?: string | null;
 } | undefined): CloneSourceDefaults | undefined {
   if (!source) return undefined;
   return {
-    ...(source.cliId ? { cliId: source.cliId } : {}),
+    ...((source.agentSelectionKey || source.cliId) ? { cliId: source.agentSelectionKey || source.cliId! } : {}),
     ...(source.defaultWorkingDir
       ? { workingDir: source.defaultWorkingDir, dirMode: 'fixed' as const }
       : source.workingDir

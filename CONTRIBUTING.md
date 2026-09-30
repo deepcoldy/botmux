@@ -39,6 +39,7 @@ Lark WebSocket Events
     |
 Daemon (daemon.ts → core/ modules)
     |-- im/lark/event-dispatcher: event routing
+    |-- im/lark/transport/connection: WebSocket connection and failed-state recovery
     |-- im/lark/card-handler: card interactions
     |-- core/worker-pool: worker process pool
     |-- core/command-handler: slash commands
@@ -94,6 +95,7 @@ src/
     lark/
       client.ts             # Lark API wrapper
       event-dispatcher.ts   # Lark WebSocket event routing
+      transport/connection.ts # WebSocket connection, proxy and failed-state recovery
       card-handler.ts       # Lark card interaction handling
       card-builder.ts       # Lark interactive card builders
       message-parser.ts     # Lark event message parsing

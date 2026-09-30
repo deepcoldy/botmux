@@ -65,6 +65,7 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   gemini: 'gemini',
   opencode: 'opencode',
   opencode2: 'opencode2',
+  mimo: 'mimocode',
   mtr: 'mtr',
   hermes: 'hermes',
   pi: 'pi',
@@ -77,6 +78,8 @@ const CLI_COMM_MAP: Record<string, CliId> = {
   // The npm launcher appears as node/reasonix.js before its native child starts.
   reasonix: 'reasonix',
   'reasonix.js': 'reasonix',
+  agy: 'antigravity',
+  antigravity: 'antigravity',
 };
 
 /** Interpreters and native launchers that may hide the CLI identity in argv.

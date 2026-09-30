@@ -42,10 +42,15 @@ export const TRIGGER_USER_AUTH_TOOLS = ['lark-cli', 'bytedcli'] as const;
 export type TriggerUserAuthTool = typeof TRIGGER_USER_AUTH_TOOLS[number];
 
 /**
- * What happens when the current sender has not authorized this tool.
+ * Policy intent for a sender who has not authorized this tool.
  *
- * - `bot-identity` (default): let the tool run under the bot's own tenant
- *   identity where it can. Nothing personal is touched, nobody is interrupted.
+ * RETAINED FOR CONFIG COMPATIBILITY ONLY: neither governed tool currently
+ * degrades to a machine identity — bytedcli never had one, and lark-cli's
+ * bot-identity downgrade was removed with the per-person HOME model. Both
+ * values therefore resolve to a refusal (the refusal carries an authorization
+ * link), but the field is still parsed so stored configs keep validating.
+ *
+ * - `bot-identity` (default): legacy value; no longer degrades anything.
  * - `none`: the call fails and the sender is asked to authorize.
  *
  * Note there is no `device` / `machine-login` option — see the file header.
@@ -245,12 +250,14 @@ export function triggerUserAuthApplies(
 export type UnauthorizedOutcome = 'bot-identity' | 'fail';
 
 /**
- * Resolve what to do for `tool` when the current sender has no credentials.
+ * Resolve the configured policy intent for `tool` when the current sender has
+ * no credentials.
  *
- * `bytedcli` reports `fail` even under `fallback: 'bot-identity'` — not a
- * config violation, just the truth that it has no non-human identity to fall
- * back to. Reporting `bot-identity` there would produce a call that fails
- * anyway, with a misleading reason.
+ * Descriptive only: the turn publisher refuses unauthorized calls for BOTH
+ * tools today (see turn-cli-identity), so nothing in production branches on
+ * this result. It is kept because stored configs still carry the field and
+ * tests pin what was configured. `bytedcli` reports `fail` even under
+ * `fallback: 'bot-identity'` because it never had a non-human identity.
  */
 export function unauthorizedOutcomeFor(
   config: TriggerUserAuthConfig | null | undefined,

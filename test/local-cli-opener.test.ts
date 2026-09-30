@@ -280,6 +280,26 @@ describe('local-cli-opener', () => {
     });
   });
 
+  it('opens the persisted ZMX directory even when the caller selects another namespace', () => {
+    vi.stubEnv('ZMX_DIR', '/tmp/caller-zmx');
+    vi.stubEnv('TMPDIR', '/tmp/caller-tmp');
+    try {
+      const result = buildLocalCliOpenCommand(ds({
+        session: {
+          ...ds().session,
+          sessionId: 'abcdef123456',
+          backendType: 'zmx',
+          persistentBackendTarget: { backendType: 'zmx', sessionName: 'bmx-owned', socketDir: "/tmp/owner's zmx" },
+        },
+      }), { mode: 'attach' });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.command).toContain("__zmx-attach-managed 'bmx-owned' 'abcdef123456' '/tmp/owner'\\''s zmx'");
+        expect(result.command).not.toContain('/tmp/caller');
+      }
+    } finally { vi.unstubAllEnvs(); }
+  });
+
   it('attach mode delegates ZMX to the identity-verifying CLI helper with the complete session id', () => {
     vi.stubEnv('ZMX_DIR', '/tmp/zmx socket');
     vi.stubEnv('ZMX_SESSION', 'outer');

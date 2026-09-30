@@ -57,6 +57,7 @@ export const dashboardRoutes: DashboardRoute[] = [
   pageRoute('bot-defaults', '#/bot-defaults', () => import('./bot-defaults-page.js'), 'renderBotDefaultsPage'),
   pageRoute('skills', '#/skills', () => import('./skills-page.js'), 'renderSkillsPage'),
   pageRoute('customization', '#/customization', () => import('./customization-page.js'), 'renderCustomizationPage'),
+  pageRoute('message-listeners', '#/message-listeners', () => import('./message-listeners-page.js'), 'renderMessageListenersPage'),
   pageRoute('connectors-logs', '#/connectors/logs', () => import('./connectors-page.js'), 'renderConnectorsLogsPage'),
   pageRoute('webhook-logs', '#/webhook-logs', () => import('./connectors-page.js'), 'renderConnectorsLogsPage'),
   pageRoute('connectors', '#/connectors', () => import('./connectors-page.js'), 'renderConnectorsPage'),

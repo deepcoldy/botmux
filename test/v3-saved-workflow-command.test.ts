@@ -1,5 +1,7 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { parseV3SavedWorkflowCommand } from '../src/im/lark/v3-saved-workflow-command.js';
+import { stripBotMentions } from '../src/im/lark/message-parser.js';
 
 describe('parseV3SavedWorkflowCommand', () => {
   it('keeps ordinary ad-hoc goals out of the saved-command parser', () => {
@@ -100,5 +102,52 @@ describe('parseV3SavedWorkflowCommand', () => {
     const missing = parseV3SavedWorkflowCommand('/workflow run');
     expect(missing).toMatchObject({ kind: 'invalid' });
     expect(missing && 'error' in missing ? missing.error : '').toContain('/workflow new run ...');
+  });
+});
+
+describe('Saved Workflow commands after stripping this bot\'s own mentions (daemon pipeline)', () => {
+  // The daemon only strips LEADING mentions into cmdContent; a trailing `@bot`
+  // used to survive as literal text and become part of the saved display name
+  // ("读内存占用-全局 @steve") or the run reference, so the bare name no longer
+  // resolved. The daemon now applies stripBotMentions before parsing (same as the
+  // topic header, D8); this pins that composition.
+  const SELF = { botOpenId: 'ou_self_bot', larkAppId: 'cli_self_app' };
+  const self = { name: 'steve', openId: 'ou_self_bot' };
+  const human = { name: '张三', openId: 'ou_human' };
+  const parse = (text: string, mentions: Array<Record<string, unknown>> = [self]) =>
+    parseV3SavedWorkflowCommand(stripBotMentions(text, mentions, SELF));
+
+  it('keeps a trailing @bot out of the saved display name', () => {
+    expect(parse('/workflow save run-1 读内存占用-全局 --global @steve')).toEqual({
+      kind: 'save', source: 'run-1', displayName: '读内存占用-全局', global: true,
+      acknowledgeUnsafeLiterals: false, distill: false,
+    });
+    expect(parse('/workflow save last 读内存占用@steve')).toEqual({
+      kind: 'save', source: 'last', displayName: '读内存占用', global: false,
+      acknowledgeUnsafeLiterals: false, distill: false,
+    });
+  });
+
+  it('keeps a trailing @bot out of the run reference and params', () => {
+    expect(parse('/workflow run 读内存占用-全局 @steve')).toMatchObject({ kind: 'run', ref: '读内存占用-全局' });
+    expect(parse('/workflow run 周报 week=37 @steve')).toMatchObject({
+      kind: 'run', ref: '周报', rawParams: { week: '37' },
+    });
+  });
+
+  it('daemon strips this bot\'s mentions at every Saved Workflow command call site', () => {
+    const source = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
+    const callSites = [...source.matchAll(/await handleV3SavedWorkflowCommandIfAny\(\{([\s\S]*?)\n\s*\}\)\)/g)];
+    expect(callSites.length).toBeGreaterThanOrEqual(2);
+    for (const [, args] of callSites) {
+      expect(args).toMatch(/content:\s*stripBotMentions\(\s*cmdContent,/);
+    }
+  });
+
+  it('still parses a leading or mid-message @bot, and keeps other people\'s mentions as content', () => {
+    expect(parse('@steve /workflow show 读内存占用-全局')).toEqual({ kind: 'show', ref: '读内存占用-全局' });
+    expect(parse('/workflow save run-1 给 @张三 的 周报 @steve', [self, human])).toMatchObject({
+      kind: 'save', displayName: '给 @张三 的 周报',
+    });
   });
 });

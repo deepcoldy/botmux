@@ -29,10 +29,14 @@ import {
 } from '../src/adapters/backend/zmx-backend.js';
 import {
   parseZmxVersion,
+  parseZmxSocketDir,
+  resolveZmxSocketDir,
   probeZmxFunctional,
   probeZmxVersion,
   zmxEnv,
 } from '../src/setup/ensure-zmx.js';
+
+import { selectSessionBackend } from '../src/adapters/backend/session-backend-selector.js';
 
 const execFileSyncMock = vi.mocked(execFileSync);
 const tempDirs: string[] = [];
@@ -117,6 +121,45 @@ function waitForExit(
 }
 
 describe('zmx env/probe helpers', () => {
+  it('records the native socket directory once and preserves it across selection in another environment', () => {
+    execFileSyncMock.mockReturnValue('zmx\t\t0.7.1\nsocket_dir\t/tmp/created zmx\n' as never);
+    const first = selectSessionBackend({
+      sessionId: 'abcdef12-1111-2222-3333-444444444444', backendType: 'zmx', hasExistingSession: false,
+    });
+    expect(first.persistentBackendTarget).toEqual({
+      backendType: 'zmx', sessionName: 'bmx-abcdef12', socketDir: '/tmp/created zmx',
+    });
+    vi.stubEnv('ZMX_DIR', '/tmp/other-zmx');
+    const resumed = selectSessionBackend({
+      sessionId: 'abcdef12-1111-2222-3333-444444444444', backendType: 'zmx', hasExistingSession: true,
+      persistentBackendTarget: first.persistentBackendTarget,
+    });
+    expect(resumed.persistentBackendTarget).toEqual(first.persistentBackendTarget);
+    expect(execFileSyncMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses new targets when zmx does not report an absolute socket directory', () => {
+    expect(parseZmxSocketDir('socket_dir\t/tmp/zmx with spaces\n')).toBe('/tmp/zmx with spaces');
+    for (const output of ['zmx 0.7.1', 'zmx 0.7.1\nsocket_dir relative', 'zmx 0.7.1\nsocket_dir /tmp/bad\0dir']) {
+      execFileSyncMock.mockReturnValue(output as never);
+      expect(() => resolveZmxSocketDir()).toThrow(/socket_dir/);
+    }
+  });
+
+  it('applies the stored socket address after payload stripping without changing TMPDIR', () => {
+    const opts = {
+      cwd: '/tmp', cols: 80, rows: 24,
+      env: { TMPDIR: '/tmp/caller', ZMX_DIR: '/tmp/caller-zmx', ZMX_SESSION: 'outer' },
+      injectEnv: { ZMX_DIR: '/tmp/payload-zmx' },
+    };
+    const env = zmxControlEnv(opts, '/tmp/recorded-zmx');
+    expect(env.ZMX_DIR).toBe('/tmp/recorded-zmx');
+    expect(env.TMPDIR).toBe('/tmp/caller');
+    expect(env.ZMX_SESSION).toBeUndefined();
+    expect(opts.env.ZMX_DIR).toBe('/tmp/caller-zmx');
+    expect(zmxFreshSessionEnv(opts, '/tmp/recorded-zmx').ZMX_DIR).toBe('/tmp/recorded-zmx');
+  });
+
   it('strips inherited session vars but preserves the socket dir', () => {
     const env = zmxEnv({
       PATH: '/bin',
@@ -531,7 +574,7 @@ describe('zmx backend pure helpers', () => {
     const src = readFileSync(new URL('../src/adapters/backend/zmx-backend.ts', import.meta.url), 'utf-8');
     const spawnAt = src.indexOf("spawnSync('zmx', buildFreshAttachArgs(");
     expect(spawnAt).toBeGreaterThan(-1);
-    expect(src.slice(spawnAt, src.indexOf('});', spawnAt))).toContain('env: zmxFreshSessionEnv(opts)');
+    expect(src.slice(spawnAt, src.indexOf('});', spawnAt))).toContain('env: zmxFreshSessionEnv(opts, this.opts.socketDir)');
   });
 
   it('keeps the POSIX ZMX payload path sourced through the user shell with the argv sentinel', () => {

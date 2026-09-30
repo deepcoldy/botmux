@@ -34,7 +34,9 @@ import {
 } from './reply-card-footer-signature.js';
 import { buildFeedbackElement } from './skill-feedback-card.js';
 import type { FeedbackPolicy } from '../../services/feedback-policy.js';
+import type { StatuslineQuota } from '../../services/statusline-snapshot.js';
 import type { ReplyCardHeader } from './reply-card-style.js';
+import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
 
 export { REPLY_CARD_FOOTER_MARKER } from './reply-card-footer-signature.js';
 
@@ -100,6 +102,12 @@ export interface CardUsageSnapshot {
   model?: string;
   /** Latest executor-reported reasoning effort. */
   reasoningEffort?: string;
+  /** Session-only configuration; separate from the last executor-reported effort. */
+  reasoningControl?: {
+    choices: readonly import('../../services/codex-reasoning-effort.js').CodexReasoningEffort[];
+    selected?: string;
+    pending: boolean;
+  };
   /** Frozen TraeX backend variant selected for this session. */
   modelBackendVariant?: string;
   /** Claude model fallback in effect, rendered as its own notice line on the
@@ -108,6 +116,10 @@ export interface CardUsageSnapshot {
    *  by test/streaming-card-usage-arg.test.ts), so no call site can forget it.
    *  Not a usage metric, but the same class of runtime identity as `model`. */
   modelFallback?: ModelFallbackState;
+  /** Claude Code statusline 快照（`botmux statusline` 落盘，daemon 合并）。存在时
+   *  上下文段改渲染纯百分比 `ctx N%`，并追加 `5h N%` / `7d N%` 账号配额段。
+   *  缺省 / null ⇒ 与无 statusline 时逐字节相同（只看 `context`）。 */
+  quota?: StatuslineQuota | null;
 }
 
 export interface ReplyCardFooter {
@@ -419,9 +431,17 @@ export function contextOverCompactThreshold(
  *  window (⇒ no percentage to show). Shared so the footer text and
  *  {@link contextOverCompactThreshold} can never disagree on the value. */
 function contextPercentUsed(usage: CardUsageSnapshot): number | undefined {
-  return isNonNegativeFinite(usage.context?.percentUsed)
-    ? Math.min(100, Math.round(usage.context.percentUsed))
+  // statusline 给的 contextPercent 优先（Claude Code 的 transcript 本身没有窗口字段，
+  // 这是它唯一的百分比来源）；其余 CLI 仍走 transcript 的 percentUsed。
+  const pct = usage.quota?.contextPercent ?? usage.context?.percentUsed;
+  return isNonNegativeFinite(pct)
+    ? Math.min(100, Math.round(pct))
     : undefined;
+}
+
+/** 配额百分比（5h / 7d）：与上下文同口径 round + clamp；非法值 ⇒ undefined（省略该段）。 */
+function quotaPercent(value: unknown): number | undefined {
+  return isNonNegativeFinite(value) ? Math.min(100, Math.round(value)) : undefined;
 }
 
 export function cardUsageFooterSegment(
@@ -431,7 +451,18 @@ export function cardUsageFooterSegment(
   opts?: { compactHintThreshold?: number },
 ): string | null {
   const parts: string[] = [];
-  if (usage.context && isNonNegativeFinite(usage.context.usedTokens)) {
+  const quota = usage.quota ?? undefined;
+  const quotaPct = quota ? contextPercentUsed(usage) : undefined;
+  if (quota && quotaPct !== undefined) {
+    // statusline 路径（Claude Code）：只渲染纯百分比 `ctx 23%`——不带绝对值（statusline
+    // 的 used_percentage 与 transcript 的 usedTokens 口径不同，混排会自相矛盾）、不画
+    // 进度条、不渲染 resets_at。「建议压缩」提示与下方绝对值分支同源同阈值。
+    const overThreshold = contextOverCompactThreshold(usage, opts?.compactHintThreshold);
+    parts.push(
+      `${t('card.usage.ctx', undefined, locale)} ${quotaPct}%`
+      + (overThreshold ? ` · ${t('card.context.compact_hint', undefined, locale)}` : ''),
+    );
+  } else if (usage.context && isNonNegativeFinite(usage.context.usedTokens)) {
     const used = compactTokenCount(usage.context.usedTokens);
     const window = usage.context.windowTokens;
     const windowSuffix = isNonNegativeFinite(window) && window > 0
@@ -449,6 +480,15 @@ export function cardUsageFooterSegment(
       `${t('card.usage.context', undefined, locale)} ${used}${suffix}`
       + (overThreshold ? ` · ${t('card.context.compact_hint', undefined, locale)}` : ''),
     );
+  }
+  // 账号级配额（statusline 独有）：5h / 7d 滚动窗口用量，footer 与 streaming 都渲染——
+  // 它比 Token 累计更值得占 footer 的位置（用户关心的是「还能跑多久」）。
+  // 窗口已滚动的桶在读取端已被丢弃（readStatuslineSnapshot），这里只看是否有值。
+  if (quota) {
+    const fiveHour = quotaPercent(quota.fiveHourPercent);
+    if (fiveHour !== undefined) parts.push(`${t('card.usage.quota_5h', undefined, locale)} ${fiveHour}%`);
+    const sevenDay = quotaPercent(quota.sevenDayPercent);
+    if (sevenDay !== undefined) parts.push(`${t('card.usage.quota_7d', undefined, locale)} ${sevenDay}%`);
   }
   // Footer variant is context-only (keeps the cramped reply-card footer clean);
   // the token breakdown below is streaming-only.
@@ -601,6 +641,8 @@ export function buildReplyCardFooter(opts: {
   brand?: string;
   recipientOpenIds?: readonly string[];
   usage?: CardUsageSnapshot;
+  executionDurationMs?: number;
+  waitingDurationMs?: number;
   locale?: Locale;
 }): ReplyCardFooter | null {
   const parts: string[] = [];
@@ -610,6 +652,16 @@ export function buildReplyCardFooter(opts: {
   if (opts.usage) {
     const usageSeg = cardUsageFooterSegment(opts.usage, opts.locale);
     if (usageSeg) { parts.push(usageSeg); hasUsage = true; }
+  }
+  const durationMs = opts.executionDurationMs;
+  const hasDuration = typeof durationMs === 'number' && Number.isFinite(durationMs) && durationMs >= 0;
+  const waitingMs = opts.waitingDurationMs;
+  const hasWaiting = typeof waitingMs === 'number' && Number.isFinite(waitingMs) && waitingMs >= 0;
+  if (hasWaiting) {
+    parts.push(t('card.waiting_duration', { seconds: (waitingMs / 1000).toFixed(1) }, opts.locale));
+  }
+  if (hasDuration) {
+    parts.push(t('card.execution_duration', { seconds: (durationMs / 1000).toFixed(1) }, opts.locale));
   }
   const recipientOpenIds = [...new Set((opts.recipientOpenIds ?? []).filter(Boolean))];
   const hasRecipient = recipientOpenIds.length > 0;
@@ -631,9 +683,9 @@ export function buildReplyCardFooter(opts: {
   // plain link text with no mention, so it cannot trigger bot-to-bot pollution
   // and does not need the ownership marker (the parser already treats a bare
   // repo link as ordinary content, matching the long-standing "brand-only is
-  // undecidable, keep it" contract). Any footer carrying usage or a recipient
+  // undecidable, keep it" contract). Any footer carrying usage, timing, or a recipient
   // is still signed.
-  const signMarker = hasUsage || hasRecipient;
+  const signMarker = hasUsage || hasDuration || hasWaiting || hasRecipient;
   let signedContent: string;
   if (!signMarker) {
     signedContent = parts[0]; // brand-only — no marker
@@ -749,15 +801,7 @@ function buildTableFromTokens(tokens: Token[]): any | null {
   return {
     tag: 'table',
     page_size: Math.min(10, Math.max(1, rows.length || 1)),
-    row_height: 'low',
-    header_style: {
-      text_align: 'left',
-      text_size: 'normal',
-      background_style: 'grey',
-      text_color: 'default',
-      bold: true,
-      lines: 1,
-    },
+    ...TABLE_AUTO_ROW_STYLE,
     columns,
     rows,
   };
@@ -881,6 +925,7 @@ export function buildCardBodyElements(
   input: string,
   cwd = process.cwd(),
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
+  imageMode = 'fit_horizontal',
 ): any[] {
   if (!input) return [];
   // Recover model-escaped fences first so markdown-it can classify their
@@ -892,8 +937,9 @@ export function buildCardBodyElements(
   // image-looking lines inside ``` code blocks are left intact.
   const elements: any[] = [];
   const layoutBudget = { promotedHeadings: 0 };
-  for (const seg of splitImageRowSegments(input)) {
+  for (const seg of splitImageRowSegments(input, imageMode)) {
     if (seg.type === 'imgrow') elements.push(imageRowElement(seg.keys));
+    else if (seg.type === 'img') elements.push(singleImageLayout(seg.key, imageMode, seg.alt));
     else elements.push(...buildMarkdownElements(seg.content, layoutBudget));
   }
   return elements;
@@ -1003,9 +1049,30 @@ function buildMarkdownElements(
   return elements;
 }
 
-/** A single uploaded image rendered full-width (legacy single-image look). */
+// Existing multi-image rows retain their legacy payload for compatibility.
 function singleImgElement(imgKey: string): any {
   return { tag: 'img', img_key: imgKey, alt: { tag: 'plain_text', content: '' }, mode: 'fit_horizontal', preview: true };
+}
+
+/** Botmux width presets, not Feishu's square/cropping `size` presets. */
+function singleImageLayout(imgKey: string, mode: string, alt: string): any {
+  const img = {
+    tag: 'img', img_key: imgKey, alt: { tag: 'plain_text', content: alt },
+    scale_type: 'fit_horizontal', preview: true,
+  };
+  const columnCounts: Record<string, number> = { medium: 2, small: 3, tiny: 4 };
+  const count = columnCounts[mode];
+  if (!count) return img;
+  // Feishu normalizes unequal weights to 1. Use N equal columns instead:
+  // one image and N-1 empty columns. `none` preserves the fraction on narrow
+  // screens; fit_horizontal keeps the entire image without a fixed height.
+  return {
+    tag: 'column_set', flex_mode: 'none', horizontal_spacing: '0px',
+    columns: Array.from({ length: count }, (_, index) => ({
+      tag: 'column', width: 'weighted', weight: 1,
+      elements: index === 0 ? [img] : [],
+    })),
+  };
 }
 
 /**
@@ -1050,14 +1117,14 @@ const IMG_ROW_LINE = /^ {0,3}(?:!\[[^\]]*\]\([^)\s]+\)\s*){2,}$/;
  */
 const FEISHU_IMG_KEY = /^img_v\d+_[A-Za-z0-9_-]+$/i;
 
-type BodySegment = { type: 'text'; content: string } | { type: 'imgrow'; keys: string[] };
+type BodySegment = { type: 'text'; content: string } | { type: 'imgrow'; keys: string[] } | { type: 'img'; key: string; alt: string };
 
 /**
  * Split a markdown body into segments, pulling out lines that consist solely of
  * 2+ image tokens as `imgrow` segments (→ side-by-side row). Fence-aware: lines
  * inside ``` / ~~~ code blocks are never treated as image rows.
  */
-function splitImageRowSegments(input: string): BodySegment[] {
+function splitImageRowSegments(input: string, imageMode = 'fit_horizontal'): BodySegment[] {
   const segs: BodySegment[] = [];
   let buf: string[] = [];
   const flush = () => { if (buf.length) { segs.push({ type: 'text', content: buf.join('\n') }); buf = []; } };
@@ -1081,6 +1148,16 @@ function splitImageRowSegments(input: string): BodySegment[] {
       }
       buf.push(line);
       continue;
+    }
+    // Only promote standalone images for an explicit size override. Keep the
+    // legacy Markdown output, inline prose, code blocks, and image grids intact.
+    if (!fenceChar && imageMode !== 'fit_horizontal') {
+      const single = line.match(/^ {0,3}!\[([^\]]*)\]\(([^)\s]+)\)\s*$/);
+      if (single && FEISHU_IMG_KEY.test(single[2])) {
+        flush();
+        segs.push({ type: 'img', key: single[2], alt: single[1] });
+        continue;
+      }
     }
     if (!fenceChar && IMG_ROW_LINE.test(line)) {
       const keys = Array.from(line.matchAll(IMG_TOKEN_SRC), m => m[1]);
@@ -1112,14 +1189,17 @@ function splitImageRowSegments(input: string): BodySegment[] {
  * pre-pass turns multi-image lines into the actual `column_set` rows. This keeps
  * one rendering path: a caller that embeds `![](img_key)` directly and puts two
  * on a line (e.g. the menu poster) gets the same grid without using `--images`.
+ * `imageMode` overrides standalone single images only; inline Markdown images
+ * and side-by-side rows retain their existing layout.
  */
 export function buildImageCardElements(
   md: string,
   imageKeys: string[],
   cwd = process.cwd(),
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
+  imageMode?: string,
 ): any[] {
-  if (imageKeys.length === 0) return md ? buildCardBodyElements(md, cwd, localHomeLinkMode) : [];
+  if (imageKeys.length === 0) return md ? buildCardBodyElements(md, cwd, localHomeLinkMode, imageMode) : [];
 
   const used = new Set<number>();
   const keyAt = (idx: number): string | null =>
@@ -1150,7 +1230,7 @@ export function buildImageCardElements(
   const trailing = imageKeys.map((k, i) => (used.has(i) ? '' : `![](${k})`)).filter(Boolean).join('\n\n');
   if (trailing) resolved = resolved ? `${resolved}\n\n${trailing}` : trailing;
 
-  return buildCardBodyElements(resolved, cwd, localHomeLinkMode);
+  return buildCardBodyElements(resolved, cwd, localHomeLinkMode, imageMode);
 }
 
 /**
@@ -1224,6 +1304,8 @@ export function buildCanonicalFinalReplyCard(opts: {
   workingDir?: string;
   localHomeLinkMode?: LocalHomeLinkMode;
   usage?: CardUsageSnapshot;
+  executionDurationMs?: number;
+  waitingDurationMs?: number;
 }): string {
   const elements = opts.markdown
     ? buildCardBodyElements(opts.markdown, opts.workingDir, opts.localHomeLinkMode ?? 'filesystem')
@@ -1233,6 +1315,8 @@ export function buildCanonicalFinalReplyCard(opts: {
     brand: opts.brand,
     recipientOpenIds: opts.recipientOpenId ? [opts.recipientOpenId] : [],
     usage: opts.usage,
+    executionDurationMs: opts.executionDurationMs,
+    waitingDurationMs: opts.waitingDurationMs,
     locale: opts.locale,
   });
   if (footer) elements.push({ tag: 'hr' }, footer.element);
@@ -1274,6 +1358,8 @@ export function buildContextualReplyCard(opts: {
   workingDir?: string;
   localHomeLinkMode?: LocalHomeLinkMode;
   usage?: CardUsageSnapshot;
+  executionDurationMs?: number;
+  waitingDurationMs?: number;
   feedback?: { policy: FeedbackPolicy };
 }): string {
   const {
@@ -1322,6 +1408,8 @@ export function buildContextualReplyCard(opts: {
     recipientOpenIds: recipientOpenId ? [recipientOpenId] : [],
     usage,
     locale,
+    executionDurationMs: opts.executionDurationMs,
+    waitingDurationMs: opts.waitingDurationMs,
   });
   if (footer) {
     elements.push({ tag: 'hr' });

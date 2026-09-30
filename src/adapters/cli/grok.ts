@@ -1,5 +1,6 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
@@ -162,6 +163,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       larkAppId,
       noTransport,
       triggerUserAuth,
+      promptInjection,
     }) {
       const args: string[] = [];
       if (!disableCliBypass) {
@@ -209,7 +211,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
 
       // Claude: --append-system-prompt. Grok: --rules (append; docs alias).
       // Do NOT use --system-prompt-override — that replaces Grok's agent prompt.
-      args.push(
+      if (promptInjection !== 'none') args.push(
         '--rules',
         buildBotmuxSystemPromptText({
           locale,
@@ -383,10 +385,7 @@ export function createGrokAdapter(pathOverride?: string): CliAdapter {
       format: 'grok-hooks',
       sessionStartCommand: sessionReadyHookCommand(),
     },
-    modelChoices: [
-      'grok-4.6',
-      'grok-4.5',
-    ],
+    modelChoices: CLI_MODEL_CHOICES['grok'],
   };
 }
 

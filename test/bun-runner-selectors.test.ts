@@ -123,6 +123,78 @@ describe('bun leg selectors — this guard runs inside the leg it guards', () =>
   });
 });
 
+describe('no test file may use a vitest-only `expect.poll`', () => {
+  it('finds none across the whole suite', async () => {
+    // `expect.poll` exists in vitest but NOT in `bun:test` (measured on Bun 1.4:
+    // `typeof expect.poll === 'undefined'`), and unlike the module-registry APIs above
+    // the right fix is NOT to defer the file: the call sits on the SUCCESS path, so a
+    // deferred file loses real coverage of the thing it was checking. Rewriting it with
+    // `vi.waitFor` (shimmed under bun) or a plain deadline loop keeps the coverage on
+    // BOTH runners, which is why this is a prohibition rather than a selector entry.
+    //
+    // MEASURED: exactly this shipped in test/worker-kimi-effort.integration.test.ts and
+    // the only symptom was the advisory `bun test` leg going red with `expect.poll is not
+    // a function` — vitest, the required gate, stayed green, so the file's real coverage
+    // was fine while every unrelated PR's bun leg showed a red nobody owned.
+    //
+    // Scanned with the TypeScript AST for the same reason as the `each` guard below: a
+    // text pattern matches the prose that documents the ban (including this file).
+    const ts = await import('typescript');
+    const { readdirSync, readFileSync } = await import('node:fs');
+    const { join } = await import('node:path');
+
+    const excluded = new Set(['e2e-browser', 'node_modules', 'fixtures', '__snapshots__']);
+    const walk = (dir: string): string[] => {
+      const out: string[] = [];
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (!excluded.has(entry.name)) out.push(...walk(full));
+        } else if (/\.(test|spec)\.ts$/.test(entry.name)) {
+          out.push(full);
+        }
+      }
+      return out;
+    };
+
+    const files = walk('test');
+    // Guard the guard: an empty file list would make this pass vacuously.
+    expect(files.length).toBeGreaterThan(500);
+
+    const offenders: string[] = [];
+    for (const file of files) {
+      const source = readFileSync(file, 'utf8');
+      const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
+      const report = (node: import('typescript').Node): void => {
+        const { line } = sf.getLineAndCharacterOfPosition(node.getStart(sf));
+        offenders.push(`${file}:${line + 1}`);
+      };
+      const visit = (node: import('typescript').Node): void => {
+        // `expect.poll(…)`. The receiver must be the `expect` binding itself — a
+        // `poll()` on some other object is unrelated.
+        if (ts.isPropertyAccessExpression(node)
+          && node.name.text === 'poll'
+          && ts.isIdentifier(node.expression)
+          && node.expression.text === 'expect') {
+          report(node);
+        }
+        // `expect['poll'](…)`, the computed form of the same call.
+        if (ts.isElementAccessExpression(node)
+          && ts.isIdentifier(node.expression)
+          && node.expression.text === 'expect'
+          && node.argumentExpression
+          && (ts.isStringLiteral(node.argumentExpression) || ts.isNoSubstitutionTemplateLiteral(node.argumentExpression))
+          && node.argumentExpression.text === 'poll') {
+          report(node);
+        }
+        ts.forEachChild(node, visit);
+      };
+      visit(sf);
+    }
+    expect(offenders).toEqual([]);
+  });
+});
+
 describe('no test file may use a bare empty-array each row', () => {
   it('finds none across the whole suite', async () => {
     // A BARE `[]` row in `it.each([...])` spreads to ZERO arguments under `bun test`, so

@@ -1,6 +1,7 @@
 import { existsSync, statSync, openSync, readSync, closeSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { buildBotmuxSystemPromptText } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
@@ -198,7 +199,7 @@ export function createGeniusAdapter(pathOverride?: string): CliAdapter {
     injectsSessionContext: true,
     altScreen: true,
     skillsDir: `~/${GENIUS_SKILLS_DIR.slice(homedir().length + 1)}`,
-    modelChoices: ['gpt-5.5'],
+    modelChoices: CLI_MODEL_CHOICES['genius'],
   };
 }
 

@@ -15,9 +15,10 @@ const getBotMock = vi.fn();
 // A fake Lark client whose calls would resolve — so if the gate DIDN'T fire, the
 // primitive would "succeed" and the test's rejects.toThrow would fail.
 const fakeClient = {
+  request: vi.fn(async () => ({ code: 0 })),
   im: {
     v1: {
-      message: { create: vi.fn(async () => ({ code: 0, data: { message_id: 'om_x' } })), patch: vi.fn(async () => ({ code: 0 })) },
+      message: { create: vi.fn(async () => ({ code: 0, data: { message_id: 'om_x' } })), patch: vi.fn(async () => ({ code: 0 })), forward: vi.fn(async () => ({ code: 0, data: { message_id: 'om_fwd' } })) },
       pin: { create: vi.fn(async () => ({ code: 0 })), delete: vi.fn(async () => ({ code: 0 })) },
       messageReaction: { create: vi.fn(async () => ({ code: 0, data: { reaction_id: 'r' } })), delete: vi.fn(async () => ({ code: 0 })) },
     },
@@ -54,9 +55,10 @@ vi.mock('../src/bot-registry.js', async (importOriginal) => {
 });
 
 import {
-  sendMessage, replyMessage, updateMessage, deleteMessage,
+  sendMessage, replyMessage, forwardMessage, updateMessage, deleteMessage,
   pinMessage, unpinMessage,
   resolveCardKitId, updateCardStreamingSettings, updateCardStreamElementContent, patchCardStreamElement,
+  urgentMessage,
   addReaction, removeReaction, sendUserMessage, sendEphemeralCard,
   deleteEphemeralCard, uploadImage, uploadFile,
   LarkTransportDisabledError,
@@ -76,6 +78,8 @@ describe('assertLarkTransport — bot-level outbound gate', () => {
     getBotMock.mockReturnValue(bot(true));
     await expect(sendMessage(APIONLY, 'oc', 'hi')).rejects.toBeInstanceOf(LarkTransportDisabledError);
     await expect(replyMessage(APIONLY, 'om', 'hi')).rejects.toBeInstanceOf(LarkTransportDisabledError);
+    await expect(urgentMessage(APIONLY, 'om', ['ou_x'])).rejects.toBeInstanceOf(LarkTransportDisabledError);
+    await expect(forwardMessage(APIONLY, 'om', 'oc')).rejects.toBeInstanceOf(LarkTransportDisabledError);
     await expect(updateMessage(APIONLY, 'om', '{}')).rejects.toBeInstanceOf(LarkTransportDisabledError);
     await expect(resolveCardKitId(APIONLY, 'om')).rejects.toBeInstanceOf(LarkTransportDisabledError);
     await expect(updateCardStreamingSettings(APIONLY, 'card', {
@@ -104,6 +108,7 @@ describe('assertLarkTransport — bot-level outbound gate', () => {
   it('a normal bot is unaffected — sendMessage/updateMessage proceed to the client', async () => {
     getBotMock.mockReturnValue(bot(false));
     await expect(sendMessage(NORMAL, 'oc', 'hi')).resolves.toBeDefined();
+    await expect(forwardMessage(NORMAL, 'om', 'oc')).resolves.toBe('om_fwd');
     await expect(updateMessage(NORMAL, 'om', '{}')).resolves.toBeUndefined();
     await expect(resolveCardKitId(NORMAL, 'om')).resolves.toBe('card_x');
     await expect(updateCardStreamingSettings(NORMAL, 'card_x', {
@@ -119,6 +124,11 @@ describe('assertLarkTransport — bot-level outbound gate', () => {
       NORMAL, 'card_x', 'loader', { img_key: 'img_x' }, 3, 'u3',
     )).resolves.toBeUndefined();
     expect(fakeClient.im.v1.message.create).toHaveBeenCalled();
+    expect(fakeClient.im.v1.message.forward).toHaveBeenCalledWith({
+      path: { message_id: 'om' },
+      params: { receive_id_type: 'chat_id' },
+      data: { receive_id: 'oc' },
+    });
     expect(fakeClient.im.v1.message.patch).toHaveBeenCalled();
     expect(fakeClient.cardkit.v1.card.idConvert).toHaveBeenCalledWith({ data: { message_id: 'om' } });
     expect(fakeClient.cardkit.v1.card.settings).toHaveBeenCalledWith({

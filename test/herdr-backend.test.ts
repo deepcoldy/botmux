@@ -13,10 +13,11 @@
  *     `pane read` output, and emits exit once the agent vanishes from
  *     `agent list`.
  *
- * Run:  pnpm vitest run test/herdr-backend.test.ts
+ * Run:  bunx vitest run test/herdr-backend.test.ts
  */
 import { EventEmitter } from 'node:events';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { basename, dirname } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 vi.mock('node:child_process', () => ({
@@ -68,6 +69,17 @@ class FakePty {
 
 function makeFakePty(): FakePty { return new FakePty(); }
 
+/** Run `fn` with `process.platform` pinned, restoring the real descriptor. */
+function withPlatform<T>(platform: NodeJS.Platform, fn: () => T): T {
+  const descriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { configurable: true, value: platform });
+  try {
+    return fn();
+  } finally {
+    if (descriptor) Object.defineProperty(process, 'platform', descriptor);
+  }
+}
+
 function findCall(predicate: (args: string[]) => boolean): string[] | undefined {
   for (const call of mockedExecFileSync.mock.calls) {
     const args = (call[1] as string[]) ?? [];
@@ -92,12 +104,14 @@ function herdrCall(...needles: string[]): string[] | undefined {
  * Route mocked herdr CLI invocations to canned payloads. Anything not matched
  * returns "" (sleep, version probes, fire-and-forget writes).
  */
-function setHerdrResponses(handlers: Array<{ match: (args: string[]) => boolean; reply: () => string }>) {
+type HerdrResponseHandler = { match: (args: string[]) => boolean; reply: (args: string[]) => string };
+
+function setHerdrResponses(handlers: HerdrResponseHandler[]) {
   mockedExecFileSync.mockImplementation(((cmd: any, args: any) => {
     if (cmd !== 'herdr') return '' as any;
     const argv = args as string[];
     for (const h of handlers) {
-      if (h.match(argv)) return h.reply() as any;
+      if (h.match(argv)) return h.reply(argv) as any;
     }
     return '' as any;
   }) as any);
@@ -115,6 +129,53 @@ const WORKSPACE_CREATED_REPLY = (workspaceId: string, paneId: string) => JSON.st
     root_pane: { pane_id: paneId },
   },
 });
+
+const MANAGED_WORKSPACE = 'w_launch';
+const MANAGED_PANE = 'w_launch-1';
+
+/** Decode the one shell-quoted COMMAND argument so tests can inspect the file. */
+function paneLauncherPath(): string {
+  const call = herdrCall('pane', 'run');
+  expect(call).toHaveLength(6);
+  expect(call!.slice(0, 5)).toEqual(['--session', SESSION, 'pane', 'run', MANAGED_PANE]);
+  const command = call![5]!;
+  expect(command).toMatch(/^'\/.*'$/);
+  return command.slice(1, -1).replaceAll("'\"'\"'", "'");
+}
+
+function setManagedLaunchResponses(kind: string, overrides: HerdrResponseHandler[] = []) {
+  const captured = { pollCount: 0, launcherScript: '', launcherMode: 0 };
+  const liveAgent = { name: null, pane_id: MANAGED_PANE, agent: kind, agent_status: 'working' };
+  setHerdrResponses([
+    ...overrides,
+    { match: a => a.includes('--version'), reply: () => 'herdr 0.7.5\n' },
+    { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+    { match: a => a.includes('workspace') && a.includes('create'), reply: () => WORKSPACE_CREATED_REPLY(MANAGED_WORKSPACE, MANAGED_PANE) },
+    { match: a => a.includes('pane') && a.includes('run'), reply: () => '' },
+    {
+      match: a => a.includes('agent') && a.includes('list'),
+      reply: () => {
+        captured.pollCount++;
+        if (captured.pollCount === 1) {
+          const path = paneLauncherPath();
+          captured.launcherScript = readFileSync(path, 'utf8');
+          captured.launcherMode = statSync(path).mode & 0o777;
+          // Ignore a sibling's live agent and our pane's exited metadata while
+          // the shell is still loading rc files / Herdr has not detected us.
+          return JSON.stringify({ result: { agents: [
+            { ...liveAgent, name: 'sibling', pane_id: 'other-pane', agent: 'codex' },
+            { ...liveAgent, agent: 'codex', running: false },
+          ] } });
+        }
+        return JSON.stringify({ result: { agents: [liveAgent] } });
+      },
+    },
+    { match: a => a.includes('agent') && a.includes('rename'), reply: () => JSON.stringify({ result: {} }) },
+    { match: a => a.includes('agent') && a.includes('get'), reply: () => JSON.stringify({ result: { agent: { ...liveAgent, name: 'botmux' } } }) },
+    { match: a => a.includes('read'), reply: () => PANE_READ_REPLY('hello') },
+  ]);
+  return captured;
+}
 
 beforeEach(() => {
   mockedExecFileSync.mockReset();
@@ -304,134 +365,261 @@ describe('HerdrBackend connection surface', () => {
 // ─── spawn(): fresh / existing / external ──────────────────────────────────
 
 describe('HerdrBackend.spawn', () => {
-  it('Herdr 0.7.5: creates a workspace and starts the real Pi coding agent in its root pane', () => {
-    setHerdrResponses([
-      { match: a => a.includes('--version'), reply: () => 'herdr 0.7.5\n' },
-      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
-      { match: a => a.includes('workspace') && a.includes('create'), reply: () => WORKSPACE_CREATED_REPLY('w_pi', 'w_pi-1') },
-      { match: a => a.includes('agent') && a.includes('start'), reply: () => AGENT_GET_REPLY('w_pi-1') },
-      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('hello') },
-    ]);
+  it.each([
+    { label: 'prompt-file', prompt: '@/tmp/initial.prompt.md', explicitCliBin: true },
+    { label: 'multiline', prompt: 'line one\nline two', explicitCliBin: false },
+  ])('Herdr 0.7.5: accepts empty pane run output and preserves the Pi launch protocol with $label argv', ({ prompt, explicitCliBin }) => {
+    const captured = setManagedLaunchResponses('pi');
+    const cliBin = '/Users/test/.local/bin/node/bin/pi';
     const be = new HerdrBackend(SESSION);
-    be.spawn('/Users/test/.local/bin/node/bin/pi', ['--session-id', 'sid-1', 'line one\nline two'], {
-      cwd: '/work',
-      cols: 120,
-      rows: 30,
+    expect(() => be.spawn(cliBin, ['--session-id', 'sid-1', prompt], {
+      cwd: '/work', cols: 120, rows: 30,
       env: { PATH: '/usr/bin:/bin', BOTMUX_SESSION_ID: 'sid-1' },
-    });
+      cliBin: explicitCliBin ? cliBin : undefined,
+    })).not.toThrow();
 
-    const workspaceCall = herdrCall('workspace', 'create', '--cwd', '/work', '--label', 'botmux', '--no-focus');
-    expect(workspaceCall).toBeDefined();
-    const pathArg = workspaceCall!.find(arg => arg.startsWith('PATH='));
-    expect(pathArg).toMatch(/^PATH=.*botmux-herdr-launch-/);
-    expect(pathArg).toContain('/Users/test/.local/bin/node/bin:/usr/bin:/bin');
-    const launcherDir = pathArg!.slice('PATH='.length).split(':')[0]!;
-    expect(workspaceCall).toContain('BOTMUX_SESSION_ID=sid-1');
-
-    const startCall = herdrCall(
-      'agent', 'start', 'botmux',
-      '--kind', 'pi',
-      '--pane', 'w_pi-1',
-      '--timeout', '30000',
-    );
-    expect(startCall).toBeDefined();
-    expect(startCall).not.toContain('--cwd');
-    // Exact CLI args (including the multiline initial prompt) live in the
-    // short-lived launcher script. Herdr receives no control-character args.
-    expect(startCall).not.toContain('--session-id');
-    expect(startCall).not.toContain('line one\nline two');
-    expect(existsSync(launcherDir)).toBe(false);
-    be.kill();
-  });
-
-  it('Herdr 0.7.5: forwards safe Pi session and prompt-file args when the managed integration bypasses PATH', () => {
-    setHerdrResponses([
-      { match: a => a.includes('--version'), reply: () => 'herdr 0.7.5\n' },
-      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
-      { match: a => a.includes('workspace') && a.includes('create'), reply: () => WORKSPACE_CREATED_REPLY('w_pi', 'w_pi-1') },
-      { match: a => a.includes('agent') && a.includes('start'), reply: () => AGENT_GET_REPLY('w_pi-1') },
-      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('hello') },
+    expect(herdrCall('workspace', 'create')).toEqual([
+      '--session', SESSION, 'workspace', 'create',
+      '--cwd', '/work', '--label', 'botmux', '--no-focus',
+      '--env', 'PATH=/Users/test/.local/bin/node/bin:/usr/bin:/bin',
+      '--env', 'BOTMUX_SESSION_ID=sid-1',
     ]);
-    const be = new HerdrBackend(SESSION);
-    be.spawn('/Users/test/.local/bin/node/bin/pi', ['--session-id', 'sid-1', '@/tmp/initial.prompt.md'], {
-      cwd: '/work', cols: 120, rows: 30, env: { PATH: '/usr/bin:/bin' },
-    });
-
-    expect(herdrCall(
-      'agent', 'start', 'botmux',
-      '--kind', 'pi',
-      '--pane', 'w_pi-1',
-      '--timeout', '30000',
-      '--', '--session-id', 'sid-1', '@/tmp/initial.prompt.md',
-    )).toBeDefined();
-    be.kill();
-  });
-
-  it('Herdr 0.7.5: retries while a new workspace shell is not yet available', () => {
-    let startAttempts = 0;
-    mockedExecFileSync.mockImplementation(((cmd: any, args: any) => {
-      if (cmd !== 'herdr') return '' as any;
-      const argv = args as string[];
-      if (argv.includes('--version')) return 'herdr 0.7.5\n' as any;
-      if (argv[0] === 'session' && argv[1] === 'list') return EXISTING_SESSION_REPLY as any;
-      if (argv.includes('workspace') && argv.includes('create')) return WORKSPACE_CREATED_REPLY('w_race', 'w_race-1') as any;
-      if (argv.includes('agent') && argv.includes('start')) {
-        startAttempts++;
-        if (startAttempts < 3) {
-          const err: any = new Error('exit 1');
-          err.stdout = JSON.stringify({ error: { code: 'agent_pane_busy', message: 'agent target pane is not an available shell' } });
-          err.stderr = '';
-          throw err;
-        }
-        return AGENT_GET_REPLY('w_race-1') as any;
-      }
-      if (argv.includes('read')) return PANE_READ_REPLY('hello') as any;
-      return '' as any;
-    }) as any);
-
-    const be = new HerdrBackend(SESSION);
-    be.spawn('pi', [], { cwd: '/work', cols: 120, rows: 30, env: {} });
-
-    expect(startAttempts).toBe(3);
-    expect(herdrCall('workspace', 'close', 'w_race')).toBeUndefined();
+    const launcherPath = paneLauncherPath();
+    expect(basename(launcherPath)).toBe('pi');
+    expect(captured.launcherMode).toBe(0o700);
+    expect(captured.launcherScript).toContain(
+      "PATH='/Users/test/.local/bin/node/bin:/usr/bin:/bin'\nexport PATH\n"
+      + "exec '" + cliBin + "' '--session-id' 'sid-1' '" + prompt + "'\n",
+    );
+    expect(captured.pollCount).toBe(2);
+    expect(mockedExecFileSync.mock.calls.filter(call => call[0] === 'sleep')).toHaveLength(1);
+    expect(herdrCall('agent', 'rename')).toEqual([
+      '--session', SESSION, 'agent', 'rename', MANAGED_PANE, 'botmux',
+    ]);
+    expect(herdrCall('agent', 'get')).toEqual(['--session', SESSION, 'agent', 'get', 'botmux']);
+    const operations = mockedExecFileSync.mock.calls
+      .filter(call => call[0] === 'herdr' && (call[1] as string[])[0] === '--session')
+      .map(call => (call[1] as string[]).slice(2, 4).join(' '));
+    expect(operations).toEqual([
+      'workspace create', 'pane run', 'agent list', 'agent list', 'agent rename', 'agent get',
+    ]);
+    expect(herdrCall('agent', 'start')).toBeUndefined();
+    expect(existsSync(dirname(launcherPath))).toBe(false);
     be.kill();
   });
 
   it('Herdr 0.7.5: rejects unsupported launch wrappers before creating a workspace', () => {
-    setHerdrResponses([
-      { match: a => a.includes('--version'), reply: () => 'herdr 0.7.5\n' },
-      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
-    ]);
+    setManagedLaunchResponses('pi');
     const be = new HerdrBackend(SESSION);
 
     expect(() => be.spawn('/usr/local/bin/custom-pi-wrapper', [], {
       cwd: '/work', cols: 120, rows: 30, env: {},
     })).toThrow(/cannot launch executable "custom-pi-wrapper".*tmux backend/);
     expect(herdrCall('workspace', 'create')).toBeUndefined();
+    expect(herdrCall('pane', 'run')).toBeUndefined();
+    expect(herdrCall('agent', 'start')).toBeUndefined();
     be.kill();
   });
 
-  it('Herdr 0.7.5: closes the new workspace and surfaces upstream diagnostics when agent startup fails', () => {
-    mockedExecFileSync.mockImplementation(((cmd: any, args: any) => {
-      if (cmd !== 'herdr') return '' as any;
-      const argv = args as string[];
-      if (argv.includes('--version')) return 'herdr 0.7.5\n' as any;
-      if (argv[0] === 'session' && argv[1] === 'list') return EXISTING_SESSION_REPLY as any;
-      if (argv.includes('workspace') && argv.includes('create')) return WORKSPACE_CREATED_REPLY('w_failed', 'w_failed-1') as any;
-      if (argv.includes('agent') && argv.includes('start')) {
-        const err: any = new Error('exit 1');
-        err.stdout = JSON.stringify({ error: { code: 'agent_start_failed', message: 'pi exited before interactive' } });
-        err.stderr = '';
-        throw err;
-      }
-      return '' as any;
-    }) as any);
+  it.each([
+    { label: 'single-line', prompt: 'line one' },
+    { label: 'multiline', prompt: 'line one\nline two' },
+  ])('Herdr 0.7.5: explicitly runs the complete session-scope wrapper with a $label prompt', ({ prompt }) => {
+    const captured = setManagedLaunchResponses('claude');
+    const cliBin = '/home/test/.local/bin/claude';
+    const scopedArgs = [
+      'XDG_RUNTIME_DIR=/run/user/1000',
+      'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus',
+      'systemd-run', '--user', '--scope', '--quiet', '--collect',
+      '--unit=botmux-session-sid-1.scope', '--property=KillMode=control-group',
+      '--', cliBin, '--session-id', 'sid-1', '--append-system-prompt', prompt,
+    ];
+    const be = new HerdrBackend(SESSION);
+    withPlatform('linux', () => be.spawn('/usr/bin/env', scopedArgs, {
+      cwd: '/work', cols: 120, rows: 30,
+      env: { PATH: '/usr/bin:/bin', BOTMUX_SESSION_ID: 'sid-1' },
+      cliBin,
+    }));
+
+    const launcherPath = paneLauncherPath();
+    expect(basename(launcherPath)).toBe('claude');
+    expect(herdrCall('workspace', 'create')).toContain('PATH=/home/test/.local/bin:/usr/bin:/bin');
+    // Read during the first detection poll, while the launcher still exists.
+    expect(captured.launcherScript).toContain(
+      "PATH='/home/test/.local/bin:/usr/bin:/bin'\nexport PATH\n"
+      + "exec '/usr/bin/env' 'XDG_RUNTIME_DIR=/run/user/1000' 'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus' "
+      + "'systemd-run' '--user' '--scope' '--quiet' '--collect' "
+      + "'--unit=botmux-session-sid-1.scope' '--property=KillMode=control-group' "
+      + "'--' '" + cliBin + "' '--session-id' 'sid-1' '--append-system-prompt' '" + prompt + "'\n",
+    );
+    expect(captured.pollCount).toBe(2);
+    expect(herdrCall('agent', 'rename', MANAGED_PANE, 'botmux')).toBeDefined();
+    expect(herdrCall('agent', 'start')).toBeUndefined();
+    expect(existsSync(dirname(launcherPath))).toBe(false);
+    be.kill();
+  });
+
+  it('Herdr 0.7.5: rejects a wrapped unsupported CLI by its original executable name', () => {
+    setManagedLaunchResponses('claude');
     const be = new HerdrBackend(SESSION);
 
-    expect(() => be.spawn('pi', [], {
-      cwd: '/work', cols: 120, rows: 30, env: {},
-    })).toThrow(/agent_start_failed.*pi exited before interactive/);
-    expect(herdrCall('workspace', 'close', 'w_failed')).toBeDefined();
+    expect(() => be.spawn('/usr/bin/env', ['systemd-run', '--', '/opt/coco/bin/coco'], {
+      cwd: '/work', cols: 120, rows: 30, env: {}, cliBin: '/opt/coco/bin/coco',
+    })).toThrow(/cannot launch executable "coco".*tmux backend/);
+    expect(herdrCall('workspace', 'create')).toBeUndefined();
+    expect(herdrCall('pane', 'run')).toBeUndefined();
+    expect(herdrCall('agent', 'start')).toBeUndefined();
+    be.kill();
+  });
+
+  it('Herdr 0.7.5: explicitly runs the wrapped launcher on macOS too', () => {
+    const captured = setManagedLaunchResponses('claude');
+    const be = new HerdrBackend(SESSION);
+
+    withPlatform('darwin', () => be.spawn('/usr/local/bin/ttadk', ['claude', '--session-id', 'sid-1'], {
+      cwd: '/work', cols: 120, rows: 30, env: {}, cliBin: '/usr/local/bin/claude',
+    }));
+
+    expect(basename(paneLauncherPath())).toBe('claude');
+    expect(captured.launcherScript).toContain(
+      "exec '/usr/local/bin/ttadk' 'claude' '--session-id' 'sid-1'\n",
+    );
+    expect(herdrCall('agent', 'rename', MANAGED_PANE, 'botmux')).toBeDefined();
+    expect(herdrCall('agent', 'start')).toBeUndefined();
+    expect(existsSync(dirname(paneLauncherPath()))).toBe(false);
+    be.kill();
+  });
+
+  it('Herdr 0.7.5: rejects the wrong detected kind and closes only the new workspace', () => {
+    setManagedLaunchResponses('pi', [{
+      match: a => a.includes('agent') && a.includes('list'),
+      reply: () => JSON.stringify({ result: { agents: [
+        { name: null, pane_id: MANAGED_PANE, agent: 'codex', agent_status: 'idle' },
+      ] } }),
+    }]);
+    const be = new HerdrBackend(SESSION);
+
+    expect(() => be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {} }))
+      .toThrow(/detected "codex" instead of "pi" in pane w_launch-1/);
+    expect(herdrCall('workspace', 'close')).toEqual([
+      '--session', SESSION, 'workspace', 'close', MANAGED_WORKSPACE,
+    ]);
+    expect(herdrCall('agent', 'rename')).toBeUndefined();
+    expect(herdrCall('agent', 'start')).toBeUndefined();
+    expect(existsSync(dirname(paneLauncherPath()))).toBe(false);
+    be.kill();
+  });
+
+  it('Herdr 0.7.5: bounds detection polls by the remaining timeout and cleans up an unidentified pane', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(0);
+    let polls = 0;
+    setManagedLaunchResponses('pi', [{
+      match: a => a.includes('agent') && a.includes('list'),
+      reply: () => {
+        vi.setSystemTime(++polls === 1 ? 29_950 : 30_000);
+        return JSON.stringify({ result: { agents: [
+          { name: null, pane_id: MANAGED_PANE, agent: null },
+        ] } });
+      },
+    }]);
+    const be = new HerdrBackend(SESSION);
+
+    expect(() => be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {} }))
+      .toThrow(/did not detect "pi" in pane w_launch-1 within 30000 ms/);
+    const listCalls = mockedExecFileSync.mock.calls.filter(call => {
+      const args = call[1] as string[];
+      return args.includes('agent') && args.includes('list');
+    });
+    expect(listCalls).toHaveLength(2);
+    expect(listCalls.map(call => (call[2] as any).timeout)).toEqual([5000, 50]);
+    expect(herdrCall('workspace', 'close', MANAGED_WORKSPACE)).toBeDefined();
+    expect(herdrCall('agent', 'rename')).toBeUndefined();
+    expect(herdrCall('agent', 'start')).toBeUndefined();
+    expect(existsSync(dirname(paneLauncherPath()))).toBe(false);
+    be.kill();
+  });
+
+  it.each([
+    { operation: 'pane run', command: ['pane', 'run'], code: 'pane_write_failed' },
+    { operation: 'agent list', command: ['agent', 'list'], code: 'agent_list_failed' },
+    { operation: 'agent rename', command: ['agent', 'rename'], code: 'agent_name_taken' },
+    { operation: 'agent get', command: ['agent', 'get'], code: 'agent_not_found' },
+  ])('Herdr 0.7.5: surfaces $operation failures and removes the new workspace and launcher', ({ command, code }) => {
+    setManagedLaunchResponses('pi', [{
+      match: a => command.every(part => a.includes(part)),
+      reply: () => JSON.stringify({ error: { code, message: 'managed launch failed' } }),
+    }]);
+    const be = new HerdrBackend(SESSION);
+
+    expect(() => be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {} })).toThrow(code);
+    expect(herdrCall('workspace', 'close')).toEqual([
+      '--session', SESSION, 'workspace', 'close', MANAGED_WORKSPACE,
+    ]);
+    expect(herdrCall('agent', 'start')).toBeUndefined();
+    expect(existsSync(dirname(paneLauncherPath()))).toBe(false);
+    be.kill();
+  });
+
+  it.each([
+    { operation: 'pane run', command: ['pane', 'run'], code: 'pane_not_found' },
+    { operation: 'agent rename', command: ['agent', 'rename'], code: 'agent_name_taken' },
+  ])('Herdr 0.7.5: preserves stderr JSON when $operation exits with status 1 and empty stdout', ({ command, code }) => {
+    const stderr = JSON.stringify({ error: { code, message: 'managed launch failed' } });
+    setManagedLaunchResponses('pi', [{
+      match: a => command.every(part => a.includes(part)),
+      reply: () => {
+        throw Object.assign(new Error('Command failed: herdr'), { status: 1, stdout: '', stderr });
+      },
+    }]);
+    const be = new HerdrBackend(SESSION);
+
+    expect(() => be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {} }))
+      .toThrow(`failed: ${stderr}`);
+    expect(herdrCall('workspace', 'close')).toEqual([
+      '--session', SESSION, 'workspace', 'close', MANAGED_WORKSPACE,
+    ]);
+    expect(herdrCall('agent', 'start')).toBeUndefined();
+    expect(existsSync(dirname(paneLauncherPath()))).toBe(false);
+    be.kill();
+  });
+
+  it.each([
+    { label: 'missing agent', reply: JSON.stringify({ result: {} }) },
+    { label: 'different pane', reply: AGENT_GET_REPLY('other-pane') },
+  ])('Herdr 0.7.5: rejects a $label after rename and cleans up the new workspace', ({ reply }) => {
+    setManagedLaunchResponses('pi', [{
+      match: a => a.includes('agent') && a.includes('get'),
+      reply: () => reply,
+    }]);
+    const be = new HerdrBackend(SESSION);
+
+    expect(() => be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {} }))
+      .toThrow(/did not resolve to pane w_launch-1 after rename/);
+    expect(herdrCall('agent', 'rename', MANAGED_PANE, 'botmux')).toBeDefined();
+    expect(herdrCall('workspace', 'close', MANAGED_WORKSPACE)).toBeDefined();
+    expect(herdrCall('agent', 'start')).toBeUndefined();
+    expect(existsSync(dirname(paneLauncherPath()))).toBe(false);
+    be.kill();
+  });
+
+  it('Herdr 0.7.5: reports a detected working agent before a later authoritative idle transition', async () => {
+    setManagedLaunchResponses('pi');
+    const be = new HerdrBackend(SESSION);
+    const statuses: string[] = [];
+    be.spawn('pi', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    be.onAgentStatus(status => statuses.push(status));
+    await Promise.resolve();
+    expect(statuses).toEqual(['working']);
+
+    const idleWaitIndex = mockedSpawn.mock.calls.findIndex(call => {
+      const args = call[1] as string[];
+      return args.includes('agent-status') && args.includes('idle');
+    });
+    expect(idleWaitIndex).toBeGreaterThanOrEqual(0);
+    const idleWait = mockedSpawn.mock.results[idleWaitIndex]!.value as FakeChild;
+    idleWait.emit('exit', 0);
+    expect(statuses).toEqual(['working', 'idle']);
     be.kill();
   });
 

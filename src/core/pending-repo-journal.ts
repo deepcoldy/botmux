@@ -4,7 +4,10 @@ import * as sessionStore from '../services/session-store.js';
 
 export function stagePendingRepoSetup(
   ds: DaemonSession,
-  args: Pick<PendingRepoSetup, 'mode'> & Partial<Pick<PendingRepoSetup, 'baseDir' | 'turnId'>>,
+  args: Pick<PendingRepoSetup, 'mode'> & Partial<Pick<
+    PendingRepoSetup,
+    'baseDir' | 'turnId' | 'force' | 'worktreePath' | 'branch' | 'reuseExisting' | 'targetSubdir'
+  >>,
 ): void {
   const prior = {
     queued: ds.session.queued,
@@ -19,6 +22,11 @@ export function stagePendingRepoSetup(
     ...(ds.pendingRawInput ? { rawInput: ds.pendingRawInput } : {}),
     ...(args.turnId ? { turnId: args.turnId } : {}),
     ...(args.baseDir ? { baseDir: args.baseDir } : {}),
+    ...(args.force !== undefined ? { force: args.force } : {}),
+    ...(args.worktreePath ? { worktreePath: args.worktreePath } : {}),
+    ...(args.branch ? { branch: args.branch } : {}),
+    ...(args.reuseExisting !== undefined ? { reuseExisting: args.reuseExisting } : {}),
+    ...(args.targetSubdir ? { targetSubdir: args.targetSubdir } : {}),
     ...(ds.pendingCodexAppText !== undefined ? { codexAppText: ds.pendingCodexAppText } : {}),
     ...(ds.pendingCodexAppApplicationContext
       ? { codexAppApplicationContext: ds.pendingCodexAppApplicationContext }

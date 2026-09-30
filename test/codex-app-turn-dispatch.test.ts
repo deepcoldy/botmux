@@ -42,6 +42,13 @@ describe('CodexAppTurnDispatchQueue', () => {
     });
   });
 
+  it('resolves a runner reply id without trusting it to supply the delivery attempt', () => {
+    const queue = new CodexAppTurnDispatchQueue();
+    queue.reserve('turn-1', 7);
+    expect(queue.findByTurnId('turn-1')).toMatchObject({ turnId: 'turn-1', dispatchAttempt: 7 });
+    expect(queue.findByTurnId('missing')).toBeUndefined();
+  });
+
   it('rejects mismatched turn and attempt assertions without advancing the head', () => {
     const queue = new CodexAppTurnDispatchQueue();
     queue.reserve('turn-1', 7);

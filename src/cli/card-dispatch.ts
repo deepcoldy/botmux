@@ -1,5 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { normalizeInteractiveCardInput } from './send-dispatch.js';
+import { isHttpVirtualSession } from '../core/types.js';
 
 /**
  * `botmux card patch` — patch a previously-sent custom interactive card in
@@ -172,9 +173,9 @@ export function readCardPatchInput(
 // ─── transport verdict (unit-testable mirror of the cli.ts gates) ────────────
 
 /**
- * Whether a resolved session has NO Feishu transport: its chat is an HTTP
- * control-API virtual session (http_async_/http_wait_) or its owning bot is
- * core-only (apiOnly). This is the same verdict cli.ts's
+ * Whether a resolved session has NO Feishu transport: its chat is a virtual
+ * session (http_async_/http_wait_/headless_) or its owning bot is core-only
+ * (apiOnly). This is the same verdict cli.ts's
  * assertSessionTransportOrExit enforces with the real bot registry; exported
  * as a pure predicate (isApiOnly injected) so the gate logic is unit-testable
  * without importing cli.ts.
@@ -184,7 +185,7 @@ export function sessionHasNoFeishuTransport(
   isApiOnly: (larkAppId: string) => boolean,
 ): boolean {
   const chatId = session.chatId ?? '';
-  if (chatId.startsWith('http_async_') || chatId.startsWith('http_wait_')) return true;
+  if (isHttpVirtualSession(chatId)) return true;
   return !!session.larkAppId && isApiOnly(session.larkAppId);
 }
 

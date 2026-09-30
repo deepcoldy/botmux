@@ -15,7 +15,7 @@
 
 用独立命令 `botmux voice` 交互式配置（特意不和 `botmux setup` 混在一起）。配置写入全局 `~/.botmux/config.json` 的 `voice` 块，`botmux restart` 后生效。
 
-支持两类引擎，**按你的身份二选一**：
+支持三类引擎，**按你的身份 / 手上的服务三选一**：
 
 ### 字节租户：SAMI（语音合成大模型）
 
@@ -57,6 +57,24 @@ botmux restart        # 生效
 
 音色（voice）可选：OpenAI 默认 `alloy`，自建按服务支持的音色填。
 
+### MiniMax（海螺语音）
+
+有 [MiniMax 开放平台](https://platform.minimaxi.com) API key 的用户可直接用官方 T2A v2 语音合成，无需自建服务。
+
+**① 准备凭证**
+
+- 在 MiniMax 开放平台开通语音合成（T2A）能力，拿到一个 **API key**。
+- 确认接入区域：国内账号一般选「国内」（`api.minimaxi.com`）；海外账号选「国际」（`api.minimax.io`）。**key 与区域要匹配**，配错会报鉴权失败。
+
+**② 配置**
+
+```bash
+botmux voice          # 交互式：选 [3] MiniMax → 粘贴 API key → 选区域
+botmux restart        # 生效
+```
+
+模型默认 `speech-2.8-hd`，音色默认 `female-shaonv`，二者都可在配置时或配置文件里覆盖。若默认音色在你的账号下不可用（不同区域 / 模型开放的音色可能不同），按 MiniMax 控制台列出的系统音色 id 填一个即可。
+
 ## 系统依赖
 
 合成产物要编码成飞书语音气泡用的 opus 格式，依赖系统的 **opus-tools**（提供 `opusenc`）。**跑 `botmux voice` 配置时会自动检测，没装会询问并帮你装好**（沿用和 tmux 一致的包管理器 + sudo 逻辑）。也可手动安装：
@@ -96,6 +114,15 @@ botmux voice disable  # 关闭语音（移除配置，按钮随之消失）
     "engine": "openai",
     "speaker": "alloy",                            // 可选
     "openai": { "baseUrl": "https://api.openai.com/v1", "apiKey": "...", "model": "tts-1" }
+  }
+}
+
+// MiniMax（region: "cn" 国内 / "global" 国际，默认国际）
+{
+  "voice": {
+    "engine": "minimax",
+    "speaker": "female-shaonv",                   // 可选，默认 female-shaonv
+    "minimax": { "apiKey": "...", "region": "cn", "model": "speech-2.8-hd" }
   }
 }
 ```

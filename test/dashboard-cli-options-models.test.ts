@@ -36,6 +36,7 @@ describe('GET /api/cli-options/models — 400 分支（unknown_selection_key）'
     expect(isKnownSelectionKey('codex')).toBe(true);
     expect(isKnownSelectionKey('ttadk-x-claude')).toBe(true);
     expect(isKnownSelectionKey('aiden-x-claude')).toBe(true);
+    expect(isKnownSelectionKey('aiden-x-codex')).toBe(true);
   });
 });
 
@@ -58,6 +59,19 @@ describe('GET /api/cli-options/models — 200 响应 shape', () => {
     expect(body.models).toEqual([...TTADK_MODEL_SUGGESTIONS]);
     expect(body.source).toBe('static');
     expect(typeof body.detectedAt).toBe('number');
+  });
+
+  it('aiden-x-codex 返回 AIPROXY live 目录，不混入原生 Codex 静态模型', async () => {
+    const body = await buildModelChoicesResponse('aiden-x-codex', {
+      now: () => 1_700_000_000_001,
+      aidenCodexDetector: async () => ['deepseek-v4-pro', 'gpt-6-astra'],
+    });
+    expect(body).toEqual({
+      models: ['deepseek-v4-pro', 'gpt-6-astra'],
+      source: 'live',
+      detectedAt: 1_700_000_000_001,
+    });
+    expect(body.models).not.toContain('gpt-5.2');
   });
 
   it('未知 key 的响应构造也是 fail-soft（空 models + static），400 由路由在更外层拦截', async () => {

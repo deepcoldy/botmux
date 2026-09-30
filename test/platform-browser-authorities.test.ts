@@ -16,7 +16,7 @@ vi.mock('../src/platform/secure-host-file.js', () => ({
   UnsafeHostAuthorityFileError: class extends Error {},
 }));
 
-import { platformBrowserAuthorities } from '../src/platform/binding.js';
+import { platformBrowserAuthorities, platformTerminalBaseUrl } from '../src/platform/binding.js';
 import {
   ControlCsrfTokens,
   classifyManagementUpgrade,
@@ -36,6 +36,11 @@ function bindTo(platformUrl: string | null): void {
 
 describe('platformBrowserAuthorities', () => {
   beforeEach(() => readSecureHostFileSync.mockReset());
+
+  it('平台终端链接使用 t- 子域，避免卡片 /s 链接打到管理面被前门拒绝', () => {
+    bindTo('https://botmux.example.com');
+    expect(platformTerminalBaseUrl()).toBe(`https://t-${MACHINE_ID}.botmux.example.com`);
+  });
 
   it('终端 WS 升级派生 m-/t- 两个精确前缀 authority（host 形式，含平台 host）', () => {
     bindTo('https://botmux.example.com');

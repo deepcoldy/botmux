@@ -23,5 +23,6 @@ const USER_SCOPES: ReadonlySet<string> = new Set(
 /** Whether `scope` is a real Lark user scope. An empty catalog accepts
  *  everything, so a packaging problem cannot lock people out of /login. */
 export function isKnownLarkUserScope(scope: string): boolean {
-  return USER_SCOPES.size === 0 || USER_SCOPES.has(scope);
+  return USER_SCOPES.size === 0 || USER_SCOPES.has(scope)
+    || scope === 'im:chat' || scope === 'im:chat:readonly';
 }

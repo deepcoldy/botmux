@@ -17,6 +17,7 @@ import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { ZellijBackend } from '../adapters/backend/zellij-backend.js';
 import { ZmxBackend } from '../adapters/backend/zmx-backend.js';
+import { zmxEnv } from '../setup/ensure-zmx.js';
 import type { BackendType, PersistentBackendTarget, SessionProbe } from '../adapters/backend/types.js';
 import type { DaemonSession } from './types.js';
 import type { Session } from '../types.js';
@@ -247,6 +248,9 @@ export function managedTargetsForCliChange(
 }
 
 export function probePersistentBackendTarget(target: PersistentBackendTarget): SessionProbe {
+  if (target.backendType === 'zmx' && target.socketDir !== undefined) {
+    return ZmxBackend.probeSession(target.sessionName, zmxEnv(process.env, target.socketDir));
+  }
   if (target.backendType === 'herdr' && target.agentName) {
     return HerdrBackend.probeAgent(target.sessionName, target.agentName);
   }
@@ -263,6 +267,11 @@ export function killPersistentBackendTarget(
   target: PersistentBackendTarget,
   sessionId?: string,
 ): void {
+  if (target.backendType === 'zmx' && target.socketDir !== undefined) {
+    if (!sessionId) throw new Error('ZMX teardown requires the complete owning session id');
+    ZmxBackend.killManagedSession(target.sessionName, sessionId, undefined, zmxEnv(process.env, target.socketDir));
+    return;
+  }
   if (target.backendType === 'herdr' && target.agentName) {
     HerdrBackend.killAgent(target.sessionName, target.agentName);
     return;
@@ -288,12 +297,15 @@ export function probePersistentSession(backendType: PersistentBackendType, name:
 export function probePersistentSessions(
   backendType: PersistentBackendType,
   names: Iterable<string>,
+  socketDir?: string,
 ): ReadonlyMap<string, SessionProbe> {
   const uniqueNames = [...new Set(names)];
   const result = new Map<string, SessionProbe>();
 
   if (backendType === 'zmx') {
-    const snapshot = ZmxBackend.probeSessions();
+    const snapshot = socketDir === undefined
+      ? ZmxBackend.probeSessions()
+      : ZmxBackend.probeSessions(zmxEnv(process.env, socketDir));
     for (const name of uniqueNames) {
       result.set(
         name,
@@ -319,6 +331,48 @@ export function probePersistentSessions(
 
   for (const name of uniqueNames) {
     result.set(name, probePersistentSession(backendType, name));
+  }
+  return result;
+}
+
+/** Address identity for caches/batches; ownership still requires the session UUID. */
+export function persistentBackendTargetKey(target: PersistentBackendTarget): string {
+  return JSON.stringify([
+    target.backendType,
+    target.sessionName,
+    target.backendType === 'herdr' ? target.agentName ?? '' : '',
+    target.backendType === 'zmx' ? target.socketDir ?? '' : '',
+  ]);
+}
+
+/** One list per backend namespace, shared by CLI display and daemon restore. */
+export function probePersistentBackendTargets(
+  targets: Iterable<PersistentBackendTarget>,
+): ReadonlyMap<string, SessionProbe> {
+  const result = new Map<string, SessionProbe>();
+  const groups = new Map<string, Map<string, PersistentBackendTarget>>();
+  for (const target of targets) {
+    const key = persistentBackendTargetKey(target);
+    if (target.backendType === 'herdr' && target.agentName) {
+      if (!result.has(key)) result.set(key, probePersistentBackendTarget(target));
+      continue;
+    }
+    const socketDir = target.backendType === 'zmx' ? target.socketDir : undefined;
+    const groupKey = JSON.stringify([target.backendType, socketDir ?? '']);
+    const group = groups.get(groupKey) ?? new Map<string, PersistentBackendTarget>();
+    group.set(target.sessionName, target);
+    groups.set(groupKey, group);
+  }
+  for (const group of groups.values()) {
+    const target = group.values().next().value!;
+    const probes = probePersistentSessions(
+      target.backendType,
+      group.keys(),
+      target.backendType === 'zmx' ? target.socketDir : undefined,
+    );
+    for (const [name, item] of group) {
+      result.set(persistentBackendTargetKey(item), probes.get(name) ?? 'unknown');
+    }
   }
   return result;
 }

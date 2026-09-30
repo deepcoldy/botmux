@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, writeFileSync, statSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, statSync, rmSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { readRawConfig, writeRawConfigAtomic, findEntryIndex } from '../src/services/config-store.js';
@@ -24,5 +24,15 @@ describe('config-store', () => {
   it('findEntryIndex matches by larkAppId', async () => {
     expect(findEntryIndex(await readRawConfig(cfg), 'a1')).toBe(0);
     expect(findEntryIndex(await readRawConfig(cfg), 'nope')).toBe(-1);
+  });
+
+  it('rejects an impending quota fallback cycle before replacing the file', async () => {
+    const before = readFileSync(cfg, 'utf8');
+    const cyclic = [
+      { larkAppId: 'cli_a', quotaFallbackBot: { enabled: true, targetAppId: 'cli_b' } },
+      { larkAppId: 'cli_b', quotaFallbackBot: { enabled: true, targetAppId: 'cli_a' } },
+    ];
+    await expect(writeRawConfigAtomic(cfg, cyclic)).rejects.toThrow('cli_a -> cli_b -> cli_a');
+    expect(readFileSync(cfg, 'utf8')).toBe(before);
   });
 });

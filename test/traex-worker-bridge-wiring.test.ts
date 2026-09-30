@@ -23,7 +23,8 @@ describe('TRAE worker structured-bridge wiring', () => {
     const end = workerSource.indexOf('\n}\n', start);
     const body = workerSource.slice(start, end);
 
-    expect(body).toContain('if (structuredBridgeIsCodex()) return drainCodexRollout(path, offset);');
+    expect(body).toContain('drainCodexRollout(path, offset, codexBridgeDrainState)');
+    expect(body).toContain('codexBridgeDrainState = result.state;');
     // adoptMode is threaded into the TRAE drainer so it does not synthesise a
     // bare sentinel in adopt mode (where transcript text is posted verbatim).
     expect(body).toContain('if (structuredBridgeIsTraex())');
@@ -113,14 +114,22 @@ describe('TRAE worker structured-bridge wiring', () => {
     expect(body).toContain('traexHistorySidIsOwned(cliSessionId, ownedRollouts)');
   });
 
-  it('wires fresh-managed TRAE cliPid so writeInput can prove submit ownership', () => {
+  it('wires fresh-managed TRAE cliPid without populating the adopt-only fallback', () => {
     // Without this, backend.cliPid is unset for a normal TRAE PTY/tmux session
-    // and the ownership gate can never admit the session id (only adopt mode,
-    // via adoptCliPid, would). Both the sync and async(zellij) wiring sites must
-    // include traex alongside grok.
-    const matches = workerSource.match(/claudeDataDir \|\| cfg\.cliId === 'grok' \|\| cfg\.cliId === 'traex'/g) ?? [];
+    // and writeInput cannot prove the session id belongs to this process. The
+    // separate codexAdoptPendingPid fallback must stay adopt-only: populating it
+    // for a fresh spawn makes the 1s bridge poller run pid-fd discovery before
+    // the first submit. Start before the async launcher resolver so bwrap and
+    // forge-traex leaf-pid rewiring is covered alongside direct/zellij wiring.
+    const start = workerSource.indexOf('const startTraexLauncherPidResolve');
+    const end = workerSource.indexOf('// Bridge fallback:', start);
+    const wiring = workerSource.slice(start, end);
+    const matches = wiring.match(/claudeDataDir \|\| cfg\.cliId === 'grok' \|\| cfg\.cliId === 'traex'/g) ?? [];
     expect(matches.length).toBeGreaterThanOrEqual(2);
-    expect(workerSource.match(/codexAdoptPendingPid = wiredPid;/g)?.length).toBeGreaterThanOrEqual(2);
+    expect(wiring).toContain('.cliPid = realPid;');
+    expect(wiring).toContain('.cliPid = wiredPid;');
+    expect(wiring).not.toContain('codexAdoptPendingPid = realPid;');
+    expect(wiring).not.toContain('codexAdoptPendingPid = wiredPid;');
   });
 
   it('gates the TRAE INITIAL bridge attach on pid-fd ownership (adopt mode)', () => {
@@ -146,27 +155,29 @@ describe('TRAE worker structured-bridge wiring', () => {
     expect(ctx).toContain('traexHistorySidOwnedByCurrentPid(sid)');
   });
 
-  it('resolves the real traex leaf under an outer bwrap supervisor (sandbox pid)', () => {
+  it('resolves the real traex leaf under a launcher process', () => {
     // Under the file sandbox / credential-only bwrap, getChildPid() is the bwrap
     // supervisor, not traex. resolveTraexOwnershipPid BFS-descends to the leaf so
-    // the ownership gate can admit the id; gated on outerBwrapActive (sandbox OR
-    // credential-only bwrap, since both produce an outer supervisor).
+    // the ownership gate can admit the id. Forge x TraeX has the same launcher
+    // shape: the observed child is forge, while the rollout owner is traex.
     const start = workerSource.indexOf('function resolveTraexOwnershipPid');
     const body = workerSource.slice(start, workerSource.indexOf('\n}\n', start));
     expect(body).toContain("findLaunchedCliPid(candidatePid, 'traex')");
     expect(workerSource).toContain('const outerBwrapActive = sandboxRequested || credentialOnlyBwrap;');
+    expect(workerSource).toContain("const traexLauncherActive = outerBwrapActive || cfg.cliLaunchMode === 'forge-traex';");
+    expect(workerSource).toContain('lastSpawnTraexLauncherActive = traexLauncherActive;');
   });
 
   it('drives the sandbox leaf resolver as a BOUNDED RETRY (leaf may not be forked yet)', () => {
     // One-shot resolution loses the common case where bwrap has not exec'd traex
-    // at wire time. startTraexSandboxPidResolve reuses scheduleWrapperRealCliPid
-    // (the same bounded-retry + stale-backend guard as the wrapperCli resolver),
-    // and both the sync and zellij-async wiring sites kick it.
-    const start = workerSource.indexOf('const startTraexSandboxPidResolve');
+    // at wire time. The same is true for Forge spawning traex as an agent.
+    // startTraexLauncherPidResolve reuses scheduleWrapperRealCliPid (bounded
+    // retry + stale-backend guard), and both sync and zellij-async sites kick it.
+    const start = workerSource.indexOf('const startTraexLauncherPidResolve');
     const body = workerSource.slice(start, start + 900);
     expect(body).toContain('scheduleWrapperRealCliPid(launcherPid');
     expect(body).toContain("findLaunchedCliPid(lp, 'traex')");
-    const kicks = workerSource.match(/if \(cfg\.cliId === 'traex' && outerBwrapActive\) startTraexSandboxPidResolve\(/g) ?? [];
+    const kicks = workerSource.match(/if \(cfg\.cliId === 'traex' && traexLauncherActive\) startTraexLauncherPidResolve\(/g) ?? [];
     expect(kicks.length).toBeGreaterThanOrEqual(2);
   });
 
@@ -177,9 +188,20 @@ describe('TRAE worker structured-bridge wiring', () => {
     const end = workerSource.indexOf('\n}\n', start);
     const follower = workerSource.slice(start, end);
 
+    expect(follower).toContain('lastInitConfig?.adoptMode !== true');
+    expect(follower).toContain('TRAEX_BRIDGE_PID_PROBE_INTERVAL_MS');
     expect(follower).toContain('findTraexRolloutByPid(pid, currentSid)');
     expect(follower).toContain('persistCliSessionId(observed.cliSessionId);');
     expect(follower).toContain('codexBridgeNotifyCliSessionId(observed.cliSessionId);');
+  });
+
+  it('keeps fresh late-attach session-id based and reserves pid fallback for adopt', () => {
+    const timerStart = workerSource.indexOf('function codexBridgeStartTimer');
+    const timerEnd = workerSource.indexOf('function hermesBridgeAttach', timerStart);
+    const timer = workerSource.slice(timerStart, timerEnd);
+
+    expect(timer).toContain('pid: lastInitConfig?.adoptMode ? codexAdoptPendingPid : undefined');
+    expect(timer).not.toContain('\n          pid: codexAdoptPendingPid,');
   });
 
   it('does not silently swallow completed TRAE turns whose final text is empty', () => {

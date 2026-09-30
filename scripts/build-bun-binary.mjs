@@ -186,8 +186,10 @@ function runTool(argv) {
  *
  * Signing needs macOS (`codesign` is an Apple tool), so a darwin binary
  * cross-built from Linux stays unsigned — warn loudly rather than fail, since
- * release.yml builds darwin only on macOS (so the shipped path is always
- * signed) while `--all` on a Linux dev box is a legitimate workflow.
+ * release.yml builds darwin only on macOS while `--all` on a Linux dev box is a
+ * legitimate workflow. This function establishes a structurally valid
+ * preliminary signature. Stable releases replace it with the repository's
+ * Developer ID identity in `sign-darwin-binaries`; prereleases keep it ad-hoc.
  */
 function adhocResignDarwin(outfile) {
   if (process.platform !== 'darwin') {
@@ -213,9 +215,9 @@ async function buildOne({ target, out }) {
   const { platform, arch } = targetToPlatformArch(target);
   const { ptyNode, spawnHelper } = resolveNodePtyNative(platform, arch);
 
-  const entry = join(REPO_ROOT, 'dist', 'cli.js');
+  const entry = join(REPO_ROOT, 'dist', 'standalone-entry.js');
   if (!existsSync(entry)) {
-    throw new Error('dist/cli.js missing — run `bun run build` first (this bundles from dist/, it does not run tsc).');
+    throw new Error('dist/standalone-entry.js missing — run `bun run build` first (this bundles from dist/, it does not run tsc).');
   }
 
   const outfile = out ?? join(REPO_ROOT, 'dist-bin', target ? target.replace(/^bun-/, 'botmux-') : 'botmux');

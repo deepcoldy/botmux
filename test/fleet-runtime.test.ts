@@ -8,6 +8,8 @@ import {
   readFleetDaemonEnvFile,
   waitFleetOnline,
   resolveFleetDaemonEnv,
+  inspectSupervisorState,
+  liveSupervisorTarget,
 } from '../src/core/fleet-runtime.js';
 import { writeFleetState } from '../src/core/fleet-state-store.js';
 import { freshProc, type FleetState } from '../src/core/fleet-supervisor-policy.js';
@@ -56,8 +58,67 @@ describe('projectFleetStatus', () => {
   });
 });
 
+describe('inspectSupervisorState', () => {
+  const base: FleetState = {
+    supervisorPid: 61, supervisorStartedAt: 'T', supervisorEntry: '/opt/botmux',
+    supervisorProcessStart: 'boot-a:123', supervisorCommand: '/opt/botmux __supervisor', procs: [],
+  };
+  const runtime = (identity: string | undefined, command: string | undefined) => ({
+    readIdentity: () => identity, readCommandLine: () => command, pidExists: () => true,
+    readPidNamespace: () => undefined,
+  });
+
+  it('rejects the document incident shape: live pid belongs to an unrelated process', () => {
+    expect(inspectSupervisorState(base, runtime('boot-a:999', '[ksoftirqd/9]'))).toEqual({ status: 'stale' });
+  });
+
+  it('accepts only the exact persisted supervisor generation and command', () => {
+    expect(inspectSupervisorState(base, runtime('boot-a:123', '/opt/botmux __supervisor')).status).toBe('exact');
+    expect(inspectSupervisorState(base, runtime('boot-a:123', '/opt/other __supervisor'))).toEqual({ status: 'stale' });
+  });
+
+  it('rejects an otherwise identical supervisor from another PID namespace', () => {
+    const namespaced = { ...base, supervisorPidNamespace: 'pid:[100]' };
+    const deps = runtime('boot-a:123', '/opt/botmux __supervisor');
+    deps.readPidNamespace = () => 'pid:[999]';
+    expect(inspectSupervisorState(namespaced, deps)).toEqual({ status: 'stale' });
+  });
+
+  it('supports legacy state only when its recorded entry still identifies a supervisor', () => {
+    const legacy = { ...base, supervisorProcessStart: undefined, supervisorCommand: undefined };
+    expect(inspectSupervisorState(legacy, runtime('boot-a:123', '/opt/botmux __supervisor')).status).toBe('exact');
+    expect(inspectSupervisorState(legacy, runtime('boot-a:123', '[ksoftirqd/9]'))).toEqual({ status: 'stale' });
+  });
+
+  it('fails closed for old live state without enough process identity metadata', () => {
+    const malformed = { ...base, supervisorProcessStart: undefined, supervisorCommand: undefined, supervisorEntry: undefined };
+    expect(inspectSupervisorState(malformed, runtime('boot-a:123', '/opt/botmux __supervisor'))).toEqual({ status: 'unverifiable' });
+  });
+});
+
+describe('liveSupervisorTarget', () => {
+  it('fails closed on a live legacy pid with no supervisor identity metadata', () => {
+    const p = join(tmp(), 'fleet.json');
+    writeFleetState(p, {
+      supervisorPid: process.pid,
+      supervisorStartedAt: 'T',
+      procs: [],
+    });
+    const runtime = {
+      readIdentity: () => 'boot-a:123',
+      readCommandLine: () => '/opt/botmux __supervisor',
+      readPidNamespace: () => undefined,
+      pidExists: () => true,
+    };
+
+    expect(() => liveSupervisorTarget(p, runtime)).toThrow(
+      `fleet: 无法核验 supervisor pid ${process.pid} 的进程身份；为避免双实例，已中止操作`,
+    );
+  });
+});
+
 describe('readFleetStatus (path-injected)', () => {
-  it('reads and projects a state file', () => {
+  it('does not call an arbitrary live pid a supervisor without matching identity', () => {
     const p = join(tmp(), 'fleet.json');
     // Use our own pid so the liveness cross-check sees it alive.
     writeFleetState(p, {
@@ -66,7 +127,7 @@ describe('readFleetStatus (path-injected)', () => {
       procs: [online('botmux-0', process.pid)],
     });
     const status = readFleetStatus(p);
-    expect(status.supervisorAlive).toBe(true);
+    expect(status.supervisorAlive).toBe(false);
     expect(status.rows[0]).toMatchObject({ name: 'botmux-0', alive: true, status: 'online' });
   });
 
@@ -84,7 +145,7 @@ describe('waitFleetOnline', () => {
     expect(r).toMatchObject({ healthy: true, online: 0, expected: 0, pending: [] });
   });
 
-  it('returns healthy at once when the file already shows all online+alive', () => {
+  it('does not accept live member pids while the supervisor identity is stale', () => {
     const p = join(tmp(), 'fleet.json');
     // Two DISTINCT live pids (projection identity forbids a shared live pid):
     // our own pid and our parent's, both alive for the duration of the test.
@@ -93,8 +154,10 @@ describe('waitFleetOnline', () => {
       supervisorStartedAt: 'T',
       procs: [online('botmux-0', process.pid), online('botmux-1', process.ppid)],
     });
-    const r = waitFleetOnline(['botmux-0', 'botmux-1'], 2000, p);
-    expect(r).toMatchObject({ healthy: true, online: 2, expected: 2, pending: [] });
+    const r = waitFleetOnline(['botmux-0', 'botmux-1'], 0, p);
+    expect(r).toEqual({
+      healthy: false, online: 0, expected: 2, pending: ['botmux-0', 'botmux-1'],
+    });
   });
 
   it('times out reporting the pending (never-online) bots', () => {
@@ -108,8 +171,8 @@ describe('waitFleetOnline', () => {
     const r = waitFleetOnline(['botmux-0', 'botmux-1'], 300, p);
     expect(r.healthy).toBe(false);
     expect(r.expected).toBe(2);
-    expect(r.online).toBe(1);
-    expect(r.pending).toEqual(['botmux-1']);
+    expect(r.online).toBe(0);
+    expect(r.pending).toEqual(['botmux-0', 'botmux-1']);
   });
 
   it('times out when the state file is absent', () => {

@@ -102,7 +102,7 @@ describe('decideBackendGate (PTY 退役 hard gate)', () => {
 
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
-    expect(gate.indexOf('probeZmxVersion()')).toBeLessThan(gate.indexOf('probeOwnedZmxSession('));
+    expect(gate.indexOf('probeZmxRuntime(')).toBeLessThan(gate.indexOf('probeOwnedZmxSession('));
     expect(gate).toContain("resolvedZmxSessionProbe = 'unknown'");
     expect(gate).toContain('hasExistingSession = false');
     // ZMX must NOT opt into the indeterminate-existence exemption: an unproven
@@ -233,6 +233,40 @@ describe('backendGateUserMessage', () => {
     expect(msg).toContain('brew install neurosnap/tap/zmx');
     expect(msg).not.toContain('等待');
   });
+
+  it('for clone3 EPERM (seccomp) shows the sandbox fix, NOT any tmux install command', () => {
+    const reason = 'tmux new-session 启动失败：tmux 已安装，但当前运行环境（容器 seccomp/沙箱）禁止进程克隆（clone3 返回 EPERM / Operation not permitted），tmux server 无法启动';
+    const msg = backendGateUserMessage('tmux', reason);
+    expect(msg).toContain('tmux 不可用');
+    expect(msg).toContain(reason);
+    expect(msg).toContain('clone3');
+    expect(msg).toContain('seccomp');
+    expect(msg).toContain('BACKEND_TYPE=pty');
+    expect(msg).toContain('不跨 daemon 重启存活');
+    // No install guidance whatsoever — the binary is already installed.
+    expect(msg).not.toMatch(/install/i);
+    expect(msg).not.toContain('brew');
+    expect(msg).not.toContain('apt');
+  });
+
+  it('keeps the install guidance for an ENOENT (missing) tmux', () => {
+    const msg = backendGateUserMessage('tmux', 'tmux -V 启动失败：找不到 tmux 可执行文件（ENOENT）');
+    expect(msg).toContain('brew install tmux');
+    expect(msg).toContain('apt-get');
+    expect(msg).toContain('BACKEND_TYPE=pty');
+  });
+
+  it('keeps the generic guidance (with raw reason) for unclassified failures', () => {
+    const msg = backendGateUserMessage('tmux', 'tmux new-session 失败：server temporarily busy');
+    expect(msg).toContain('server temporarily busy');
+    expect(msg).toContain('brew install tmux');
+  });
+
+  it('does not apply the tmux env-denied wording to other backends', () => {
+    const msg = backendGateUserMessage('zmx', 'clone3 EPERM in some probe text');
+    expect(msg).toContain('brew install neurosnap/tap/zmx');
+    expect(msg).not.toContain('seccomp');
+  });
 });
 
 describe('persistent-backend filesystem-isolation gate', () => {
@@ -262,7 +296,7 @@ describe('persistent-backend filesystem-isolation gate', () => {
     expect(gate).not.toContain('effectiveReadIsolationRequested: cfg.readIsolation');
     expect(gate).not.toContain("type: 'user_notify'");
     const compatibilityCheck = gate.indexOf('backendSandboxCompatibilityError({');
-    const failure = gate.indexOf('throw new Error');
+    const failure = gate.indexOf('throw new Error(backendSandboxCompatibilityUserMessage(backendIsolationGate))');
     expect(compatibilityCheck).toBeGreaterThan(-1);
     expect(failure).toBeGreaterThan(compatibilityCheck);
     expect(gate).toContain(

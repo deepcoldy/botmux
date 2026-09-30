@@ -4,6 +4,9 @@
     "larkAppSecret": "your_secret_1",
     "cliId": "claude-code",
     "model": "sonnet",
+    "groupDefaultModels": {
+      "oc_xxx_team": { "claude-code": { "model": "opus", "reasoningEffort": "high" } }
+    },
     "disableCliBypass": true,
     "allowedUsers": ["alice@company.com"],
     "allowedChatGroups": ["oc_xxx_team"],

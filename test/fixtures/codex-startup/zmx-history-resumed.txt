@@ -1,0 +1,13 @@
+
+Earlier messages are available — press ctrl + t to view the full transcript
+
+• Previous conversation restored.
+
+⚠ `--dangerously-bypass-hook-trust` is enabled. Enabled hooks may run without review for this invocation.
+
+• You have 3 usage limit resets available. Run /usage to use one.
+
+
+› Ask Codex to do anything
+
+  custom-model medium · ~/Code/example · Ready · Context 78% used · weekly 45% left · 2.1M used

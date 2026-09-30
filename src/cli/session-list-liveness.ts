@@ -1,4 +1,5 @@
 export interface SessionListMarkers {
+  headless?: unknown;
   suspendedColdResume?: boolean;
   cliId?: unknown;
   lastCliInput?: unknown;
@@ -18,7 +19,7 @@ export type SessionListDisposition = 'keep' | 'prune_scratch';
  * abandoned /relay picker): it is a disposable scratch, safe to prune silently.
  */
 export function isRealManagedSession(session: SessionListMarkers): boolean {
-  return !!(session.cliId || session.lastCliInput || session.adoptedFrom);
+  return !!(session.headless || session.cliId || session.lastCliInput || session.adoptedFrom);
 }
 
 /**

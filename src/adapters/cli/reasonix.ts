@@ -2,6 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
 import type { CliAdapter, PtyHandle } from './types.js';
@@ -210,10 +211,7 @@ export function createReasonixAdapter(pathOverride?: string): CliAdapter {
     // so tmux has no scrollback available for transcript paging.
     altScreen: true,
     skillsDir: '~/.reasonix/skills',
-    modelChoices: [
-      'deepseek-flash/deepseek-v4-flash',
-      'deepseek-pro/deepseek-v4-pro',
-    ],
+    modelChoices: CLI_MODEL_CHOICES['reasonix'],
   };
 }
 

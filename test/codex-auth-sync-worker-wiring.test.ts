@@ -8,12 +8,25 @@ const dashboardIpc = readFileSync(new URL('../src/core/dashboard-ipc-server.ts',
 const dashboard = readFileSync(new URL('../src/dashboard.ts', import.meta.url), 'utf8');
 
 describe('codexAuthSync daemon → worker cold-spawn wiring', () => {
+  it('fences the instance pane and writes MCP configuration before RPC preparation starts its engine', () => {
+    const start = worker.indexOf('async function prepareCliPluginGenerationAndGateway(');
+    const end = worker.indexOf('async function startAndRecordSessionMcpGatewayHost(', start);
+    const prepare = worker.slice(start, end);
+    expect(prepare.indexOf('TmuxBackend.assertInstanceIdentity(')).toBeGreaterThan(0);
+    expect(prepare.indexOf('withFileLockSync(instanceConfig')).toBeGreaterThan(prepare.indexOf('TmuxBackend.assertInstanceIdentity('));
+    expect(prepare.indexOf('refreshCliPluginGeneration(cfg, adapter)')).toBeGreaterThan(prepare.indexOf('ensureGatewayEntry('));
+    expect(worker.match(/withFileLockSync\(instanceConfig/g)).toHaveLength(1);
+    const init = worker.slice(worker.indexOf('const rpcDecision = await orchestrateCodexRpcInit(msg,'));
+    expect(init.indexOf('await prepareCliPluginGenerationAndGateway(msg, adapter)')).toBeLessThan(init.indexOf('engage: () => engageCodexRpc(msg)'));
+  });
   it('declares and sends the policy through init IPC with shared fallback', () => {
     expect(types).toContain("codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode");
     const initStart = pool.indexOf('initMsg = {');
     const initEnd = pool.indexOf('worker.send(initMsg)', initStart);
     const init = pool.slice(initStart, initEnd);
-    expect(init).toContain("codexAuthSync: botCfg.codexAuthSync ?? 'shared'");
+    expect(init).toContain('codexAuthSync: ds.session.cliInstanceBinding');
+    expect(init).toContain(": botCfg.codexAuthSync ?? 'shared'");
+    expect(init).toContain('cliInstanceBinding: ds.session.cliInstanceBinding');
   });
 
   it('provisions auth inside the per-bot home redirect branch', () => {

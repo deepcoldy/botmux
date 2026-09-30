@@ -132,6 +132,24 @@ describe('selectReproduceLaunch (never surfaces sandbox wrapper)', () => {
     expect(r.args).toContain('--session-id');
   });
 
+  it('Forge x TraeX launch mode returns forge run with shell-quoted agent args', () => {
+    const r = selectReproduceLaunch({
+      baseBin: '/opt/traex',
+      baseArgs: ['resume', "thread's id"],
+      cliLaunchMode: 'forge-traex',
+      sandboxOn: false,
+      binResolver: (b) => `/usr/local/bin/${b}`,
+    });
+    expect(r.bin).toBe('/usr/local/bin/forge');
+    expect(r.args).toEqual([
+      'run',
+      '--agent',
+      'traex',
+      '--agent-args',
+      "'resume' 'thread'\\''s id'",
+    ]);
+  });
+
   it('wrapperCli set + sandbox ON: wrapper ignored (matches worker: wrapper vs bwrap mutually exclusive), base only', () => {
     const r = selectReproduceLaunch({
       ...base,
@@ -141,6 +159,18 @@ describe('selectReproduceLaunch (never surfaces sandbox wrapper)', () => {
     });
     expect(r.bin).toBe('/opt/claude');
     expect(r.args).toEqual(['--session-id', 's1']);
+  });
+
+  it('Forge x TraeX launch mode + sandbox ON returns the base CLI like the worker snapshot', () => {
+    const r = selectReproduceLaunch({
+      baseBin: '/opt/traex',
+      baseArgs: ['resume', 's1'],
+      cliLaunchMode: 'forge-traex',
+      sandboxOn: true,
+      binResolver: (b) => `/usr/local/bin/${b}`,
+    });
+    expect(r.bin).toBe('/opt/traex');
+    expect(r.args).toEqual(['resume', 's1']);
   });
 
   it('no wrapper, no sandbox: base CLI unchanged', () => {

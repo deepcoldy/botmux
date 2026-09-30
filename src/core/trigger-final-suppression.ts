@@ -39,12 +39,12 @@ export function inheritTriggerReplyAnchor(
   ds: DaemonSession,
   turnId: string,
   nowIso = new Date().toISOString(),
-): void {
-  if (ds.scope !== 'chat') return;
+): boolean {
+  if (ds.scope !== 'chat') return false;
   const anchor = ds.currentReplyTarget ?? ds.session.currentReplyTarget;
-  if (!anchor?.rootMessageId) return;
+  if (!anchor?.rootMessageId) return false;
   const targets = { ...(ds.session.replyTargets ?? {}) };
-  if (targets[turnId]) return;
+  if (targets[turnId]) return false;
   targets[turnId] = {
     rootMessageId: anchor.rootMessageId,
     updatedAt: nowIso,
@@ -53,6 +53,7 @@ export function inheritTriggerReplyAnchor(
   };
   ds.session.replyTargetsPrunedThrough = pruneReplyTargets(targets, ds.session.replyTargetsPrunedThrough);
   ds.session.replyTargets = targets;
+  return true;
 }
 
 function pruneTriggerFinalSuppression(ds: DaemonSession, now: number): void {

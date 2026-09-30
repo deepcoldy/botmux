@@ -36,6 +36,7 @@ import {
   extractTurnStartText,
   isClaudeTurnTerminalEvent,
   isTranscriptRateLimitEvent,
+  isSyntheticNoModelReplyEvent,
   classifyClaudeTerminalEvent,
   type ClaudeTerminalOutcome,
   type TranscriptEvent,
@@ -78,6 +79,9 @@ export interface BridgePendingTurn {
    *  jsonl alongside the assistant uuids. Lark turns don't need it because
    *  the user content is already known on the daemon side. */
   userUuid?: string;
+  /** A late text block after an empty terminal still belongs to the same
+   * native local input; reuse its captured reply address. */
+  replyContextTurnId?: string;
   /** A short substring of the Lark message that we expect to find inside
    *  the next matching `user` event's content. When set, only a user event
    *  whose stringified content contains this fingerprint is allowed to
@@ -161,9 +165,11 @@ export function isTruncatedMatch(recordedNorm: string, markContentNorm?: string)
 }
 
 export class BridgeTurnQueue {
+  constructor(private readonly onLocalTurnStarted?: (turn: BridgePendingTurn) => void) {}
   private seen = new Set<string>();
   private queue: BridgePendingTurn[] = [];
   private collecting: BridgePendingTurn | null = null;
+  private lastLocalTurnId?: string;
   /** Lark turns removed by the head-of-line drop, awaiting journal cleanup by
    *  the worker. This queue is pure (no fs), so it cannot clear the durable
    *  journal itself — it reports, the worker retires. Same contract as
@@ -221,6 +227,7 @@ export class BridgeTurnQueue {
    *  reliably attribute future events (e.g. baseline raced with a turn
    *  already in flight) and wants to clear the slate. */
   clearPending(): BridgePendingTurn[] {
+    this.lastLocalTurnId = undefined;
     const dropped = this.queue.splice(0);
     if (this.collecting && dropped.includes(this.collecting)) this.collecting = null;
     return dropped;
@@ -345,9 +352,37 @@ export class BridgeTurnQueue {
           continue;
         }
         const terminalOutcome = classifyClaudeTerminalEvent(ev);
-        if (ev.isApiErrorMessage === true) {
+        // The `<synthetic>` no-model-reply placeholder (see
+        // isSyntheticNoModelReplyEvent) takes the same exit as an API error:
+        // its "No response requested." text must not become the turn's reply,
+        // it must not synthesise a headless local turn, and the turn closes
+        // with the retryable failure the classifier produced. The exit is
+        // shared; the assignment below is NOT - see the two branches.
+        if (ev.isApiErrorMessage === true || isSyntheticNoModelReplyEvent(ev)) {
           if (this.collecting && terminalOutcome?.status !== 'rate_limited') {
-            this.collecting.terminalOutcome = terminalOutcome;
+            // The two signals that share this exit are NOT of equal authority,
+            // so they do not share an assignment operator (maintainer ruling on
+            // PR #1330):
+            if (ev.isApiErrorMessage === true) {
+              // An API-error line is authoritative execution metadata. When the
+              // connection drops mid-response, Claude force-closes the stream
+              // with an `end_turn` record whose text is a half-finished
+              // sentence, and that record has already written `completed` here.
+              // Letting the error win is what keeps the turn `failed` +
+              // retryable, which is the only thing ordinary-turn-recovery acts
+              // on (`status !== 'failed' || retryable !== true` → no
+              // continuation). Unconditional assignment, therefore.
+              this.collecting.terminalOutcome = terminalOutcome;
+            } else {
+              // The `<synthetic>` placeholder is the WEAKEST terminal signal
+              // there is - no model call happened at all (no requestId, usage
+              // all zero). It must not downgrade an already-`completed` turn:
+              // `emitReadyTurns` (`status !== 'completed' → continue`) would
+              // then withhold the real answer text AND let the daemon post a
+              // failure card for a turn that had in fact been answered. With no
+              // earlier terminal outcome it still records the failure.
+              this.collecting.terminalOutcome ??= terminalOutcome;
+            }
             this.collecting.terminalObserved = true;
           }
           continue;
@@ -368,6 +403,7 @@ export class BridgeTurnQueue {
             started: true,
             isLocal: true,
             userUuid: undefined,
+            replyContextTurnId: this.lastLocalTurnId,
             assistantUuids: [],
             sourceJsonlPath,
             markTimeMs: Date.now(),
@@ -376,6 +412,7 @@ export class BridgeTurnQueue {
           if (insertAt === -1) this.queue.push(headless);
           else this.queue.splice(insertAt, 0, headless);
           this.collecting = headless;
+          this.onLocalTurnStarted?.(headless);
         }
         if (hasVisibleText) this.collecting?.assistantUuids.push(uuid);
         if (this.collecting && onAssistantAttributed) {
@@ -520,6 +557,10 @@ export class BridgeTurnQueue {
       if (insertAt === -1) this.queue.push(localTurn);
       else this.queue.splice(insertAt, 0, localTurn);
       this.collecting = localTurn;
+      this.lastLocalTurnId = localTurn.turnId;
+      this.onLocalTurnStarted?.(localTurn);
+    } else {
+      this.lastLocalTurnId = undefined;
     }
   }
 

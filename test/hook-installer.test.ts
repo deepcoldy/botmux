@@ -507,6 +507,28 @@ describe('installHook — claude-settings', () => {
     expect(statSync(`${configPath}.botmux-inherited-env.json`).mode & 0o777).toBe(0o600);
   });
 
+  it('credential-source mode excludes auth keys from the inherited env and scrubs stale ones', () => {
+    const globalPath = join(tmpDir, '.claude-global', 'settings.json');
+    mkdirSync(join(tmpDir, '.claude-global'), { recursive: true });
+    mkdirSync(join(tmpDir, '.claude'), { recursive: true });
+    writeFileSync(globalPath, JSON.stringify({
+      env: { ANTHROPIC_API_KEY: 'shared-key', ANTHROPIC_AUTH_TOKEN: 'shared-token', HTTPS_PROXY: 'http://proxy.example' },
+    }));
+    // Previously inherited (before the bot got its own account) + a local one.
+    writeFileSync(configPath, JSON.stringify({ env: { ANTHROPIC_AUTH_TOKEN: 'old-inherited', CLAUDE_CODE_OAUTH_TOKEN: 'local', KEEP: '1' } }));
+    installHook('claude-code', {
+      configPath,
+      format: 'claude-settings' as const,
+      inheritClaudeEnvFrom: globalPath,
+      inheritClaudeEnvExclude: ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN'],
+    }, hookCommand);
+    const settings = JSON.parse(readFileSync(configPath, 'utf-8'));
+    expect(settings.env).toEqual({ KEEP: '1', HTTPS_PROXY: 'http://proxy.example' });
+    // Excluded keys are not recorded as inherited-from-shared.
+    const state = JSON.parse(readFileSync(`${configPath}.botmux-inherited-env.json`, 'utf-8'));
+    expect(state.keys).toEqual(['HTTPS_PROXY']);
+  });
+
   it('(c2) 已有同 hookCommand 的 PreToolUse entry 不会重复追加', () => {
     // 第一次安装
     installHook('claude-code', { configPath, format: 'claude-settings' }, hookCommand);
