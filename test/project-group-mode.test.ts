@@ -1,3 +1,4 @@
+import { buildProjectGroupStartedNoticeCard } from '../src/im/lark/project-group-card.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -77,7 +78,13 @@ describe('project group mode', () => {
       'om_card_1',
       expect.stringContaining('引导卡切换验收'),
     );
-    expect(f.cards.at(-1)).toContain('引导卡切换验收');
+    expect(f.transport.updateCard).toHaveBeenCalledWith(
+      'cli_coordinator', 'om_card_1', expect.stringContaining('项目已启动'),
+    );
+    const retiredGuide = vi.mocked(f.transport.updateCard).mock.calls
+      .filter(call => call[1] === 'om_card_1').at(-1)![2];
+    expect(retiredGuide).not.toContain('待启动');
+    expect(retiredGuide).not.toContain('直接执行');
     expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard).toBeUndefined();
   });
 
@@ -111,6 +118,47 @@ describe('project group mode', () => {
     );
     expect(f.transport.unpinMessage).toHaveBeenCalledTimes(2);
     expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard).toBeUndefined();
+  });
+
+  it('keeps the guide reference when updating its obsolete text fails and retries on refresh', async () => {
+    const f = fixture();
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId,
+      workerAppIds: ['cli_worker'],
+    });
+    await f.coordinator.ensureOnboardingCard(f.context, { coordinatorName: 'Bot', workerNames: [] });
+    vi.mocked(f.transport.updateCard).mockRejectedValueOnce(new Error('temporary_update_failure'));
+    await expect(f.coordinator.run(f.context, {
+      action: 'init', title: '启动测试', goal: '保留重试入口',
+    })).resolves.toMatchObject({ card: { messageId: 'om_card_2' } });
+    expect(readProjectGroup(f.dataDir, f.context.chatId)?.card?.messageId).toBe('om_card_2');
+    expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard?.messageId).toBe('om_card_1');
+    await f.coordinator.run(f.context, { action: 'refresh' });
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(2);
+    expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard).toBeUndefined();
+  });
+
+  it.each(['withdrawn', 'temporary_unpin_failure'])('keeps project startup successful when guide retirement hits %s', async reason => {
+    const f = fixture();
+    await writeGroupCollaborationMode(f.dataDir, {
+      chatId: f.context.chatId, mode: 'project', coordinatorAppId: f.context.larkAppId, workerAppIds: [],
+    });
+    await f.coordinator.ensureOnboardingCard(f.context, { coordinatorName: 'Bot', workerNames: [] });
+    if (reason === 'withdrawn') vi.mocked(f.transport.updateCard).mockRejectedValueOnce(new Error(reason));
+    else vi.mocked(f.transport.unpinMessage).mockRejectedValueOnce(new Error(reason));
+    await expect(f.coordinator.run(f.context, { action: 'init', title: 'Project', goal: 'Start' }))
+      .resolves.toMatchObject({ card: { messageId: 'om_card_2' } });
+    await f.coordinator.run(f.context, { action: 'refresh' });
+    expect(f.transport.sendCard).toHaveBeenCalledTimes(2);
+    expect(readGroupCollaborationMode(f.dataDir, f.context.chatId)?.onboardingCard).toBeUndefined();
+  });
+
+  it('renders the started notice in the requested locale without assuming pin success', () => {
+    const english = JSON.stringify(buildProjectGroupStartedNoticeCard('en'));
+    expect(english).toContain('Project started');
+    expect(english).toContain('do not need to send the start command again');
+    expect(english).not.toContain('pinned');
+    expect(JSON.stringify(buildProjectGroupStartedNoticeCard('zh'))).toContain('无需再次发送启动指令');
   });
 
   it('unpins and clears an unused onboarding guide when project mode is disabled', async () => {

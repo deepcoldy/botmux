@@ -1,3 +1,4 @@
+import { t, type Locale } from '../../i18n/index.js';
 import { threadAppLink, type Brand } from './lark-hosts.js';
 import { TABLE_AUTO_ROW_HEIGHT } from './table-style.js';
 import {
@@ -114,6 +115,16 @@ function heroElement(label: string, content: string, color: string, background: 
       { tag: 'markdown', content: `<font color='${color}'>**${label}**</font>`, text_align: 'left', text_size: 'notation' },
       { tag: 'markdown', content: `**${escapeMarkdown(content)}**`, text_align: 'left', text_size: 'heading-3' },
     ],
+  };
+}
+
+/** Replace an obsolete setup guide after the live progress card is published. */
+export function buildProjectGroupStartedNoticeCard(locale?: Locale): Record<string, unknown> {
+  return {
+    schema: '2.0',
+    config: { update_multi: true, summary: { content: t('project.started.summary', undefined, locale) } },
+    header: { template: 'blue', title: { tag: 'plain_text', content: t('project.started.title', undefined, locale) } },
+    body: { elements: [{ tag: 'markdown', content: t('project.started.body', undefined, locale) }] },
   };
 }
 
