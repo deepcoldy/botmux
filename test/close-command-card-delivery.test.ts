@@ -23,7 +23,7 @@ beforeEach(() => {
 afterEach(() => {
   workerPool.setActiveSessionsRegistry(new Map());
   config.session.dataDir = previousDataDir;
-  sessionStore.init();
+  sessionStore.init('app-close-command');
   vi.restoreAllMocks();
   rmSync(dataDir, { recursive: true, force: true });
 });
