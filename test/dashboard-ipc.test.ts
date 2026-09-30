@@ -2270,6 +2270,25 @@ describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
   });
   const persisted = (configPath: string) => JSON.parse(readFileSync(configPath, 'utf-8'))[0];
 
+  it('topic unavailable policy defaults to legacy and persists both choices with immediate readback', async () => {
+    await withBot('codex', async (base, configPath, appId) => {
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ topicUnavailablePolicy: 'legacy' });
+      const setPolicy = (value: unknown) => fetch(`${base}/api/bot-topic-unavailable-policy`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ topicUnavailablePolicy: value }),
+      });
+      for (const policy of ['stop', 'legacy']) {
+        const response = await setPolicy(policy);
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({ ok: true, topicUnavailablePolicy: policy });
+        expect(persisted(configPath).topicUnavailablePolicy).toBe(policy);
+        expect(getBot(appId).config.topicUnavailablePolicy).toBe(policy);
+        expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ topicUnavailablePolicy: policy });
+      }
+      expect((await setPolicy('unknown')).status).toBe(400);
+      expect(persisted(configPath).topicUnavailablePolicy).toBe('legacy');
+    });
+  });
+
   it('claude-code: GET 生效值缺省 send（不随 CLI 翻转），PUT transcript / send 都落盘，PUT 空串 unset 回缺省', async () => {
     await withBot('claude-code', async (base, configPath, appId) => {
       const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();

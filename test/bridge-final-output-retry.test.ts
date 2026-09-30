@@ -13,6 +13,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 
+const topicDetailMock = vi.fn(async () => ({ items: [{ message_id: 'om_root', deleted: true }] }));
 const updateMessageMock = vi.fn(async () => {});
 const addReactionMock = vi.fn(async () => 'reaction_id');
 const replyToDocCommentMock = vi.fn(async () => {});
@@ -24,6 +25,7 @@ const resolveAllowedUsersWithMapMock = vi.fn(async (_appId: string, entries: str
   entryStatus: new Map(entries.map(entry => [entry, 'resolved' as const])),
 }));
 vi.mock('../src/im/lark/client.js', () => ({
+  getMessageDetail: (...args: any[]) => topicDetailMock(...args),
   updateMessage: (...args: any[]) => updateMessageMock(...args),
   addReaction: (...args: any[]) => addReactionMock(...args),
   resolveAllowedUsersWithMap: (...args: any[]) => resolveAllowedUsersWithMapMock(...args),
@@ -562,6 +564,20 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(1));
     expect(sessionReply.mock.calls[0][4]).toBe('turn-1');
     expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('strict topic policy blocks automatic final output before publishing', async () => {
+    const current = getBot('app_test');
+    vi.mocked(getBot).mockReturnValue({ ...current, config: { ...current.config, topicUnavailablePolicy: 'stop' } } as any);
+    const sessionReply = vi.fn(async () => 'om_sent');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0, undefined, undefined, { mode: 'thread', rootMessageId: 'om_root' });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(topicDetailMock).toHaveBeenCalledWith('app_test', 'om_root');
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
   });
 
   it('turnFailed final_output on a session WITHOUT a human recipient @mentions the bot admin', async () => {

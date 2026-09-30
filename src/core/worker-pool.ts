@@ -1,4 +1,6 @@
 import { handoffCardClosed, handoffCardBlocksStreaming, applyHandoffCardEvent, type HandoffCardEvent } from './handoff-card-lifecycle.js';
+import { assertSendTopicsAvailable } from '../cli/topic-send-guard.js';
+import { getMessageDetail as getTopicMessageDetail } from '../im/lark/client.js';
 import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTriggerStreamingCard } from './trigger-streaming-card.js';
 import { sessionPromptInjection } from './prompt-injection.js';
 /**
@@ -38,7 +40,7 @@ import { persistStreamCardState, rememberLastCliInput } from './session-manager.
 import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
 import { resolveSessionLaunchModel, resolveSessionGroupSettings } from './session-model.js';
 import { effectiveReplyDelivery } from './reply-delivery.js';
-import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
+import { resolveSessionReplyTarget, fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
 import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName, type IdleCardLabel } from '../im/lark/card-builder.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
@@ -17236,6 +17238,13 @@ function deliverFinalOutput(
               : {}),
           }
         : codexAppSettlementReply ?? { uuid: bridgeFinalOutputUuid(ds, msg) };
+      if (!managedReceiver && getBot(ds.larkAppId).config.topicUnavailablePolicy === 'stop') {
+        const topicTarget = frozenReplyTarget ?? resolveSessionReplyTarget(ds, fallbackTurnId(ds, msg.replyTurnId ?? msg.turnId));
+        await assertSendTopicsAvailable(ds.larkAppId,
+          [topicTarget.mode === 'thread' || topicTarget.mode === 'quote' ? topicTarget.rootMessageId : undefined],
+          getTopicMessageDetail, 'stop');
+        if (!isStillOwned()) { onComplete?.(false); return; }
+      }
       if (!managedReceiver && (!msg.kind || msg.kind === 'bridge') && replyCardModeFor(ds, msg.turnId) !== 'legacy') {
         await flushTurnReplyTools(ds, msg.turnId, msg.dispatchAttempt).catch(error => {
           logger.warn(`[${t}] reply-card final tool flush: ${error.message}`);

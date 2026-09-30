@@ -22,6 +22,7 @@ const mocks = vi.hoisted(() => ({
   replyMessage: vi.fn(async () => 'om_reply'),
   sendMessage: vi.fn(async () => 'om_top'),
   getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
+  getMessageDetail: vi.fn(),
   topicRoots: new Map<string, string>(),
   topicQueues: new Map<string, Promise<void>>(),
 }));
@@ -33,7 +34,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
 
 vi.mock('../src/im/lark/client.js', async () => {
   const actual = await vi.importActual<any>('../src/im/lark/client.js');
-  return { ...actual, replyMessage: mocks.replyMessage, sendMessage: mocks.sendMessage, getChatMode: mocks.getChatMode };
+  return { ...actual, getMessageDetail: mocks.getMessageDetail, replyMessage: mocks.replyMessage, sendMessage: mocks.sendMessage, getChatMode: mocks.getChatMode };
 });
 
 vi.mock('../src/services/vc-meeting-listener-topic-store.js', () => ({
@@ -134,13 +135,41 @@ function seedReceiverSession(): DaemonSession {
 describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    mocks.replyMessage.mockResolvedValue('om_reply');
+    mocks.replyMessage.mockReset().mockResolvedValue('om_reply');
     mocks.sendMessage.mockResolvedValue('om_top');
     mocks.getChatMode.mockResolvedValue('group');
     mocks.topicRoots.clear();
     mocks.topicQueues.clear();
     activeSessions.clear();
     registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_o'] });
+  });
+
+  it('strict policy permits an available topic and disabling it restores legacy fallback', async () => {
+    registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', topicUnavailablePolicy: 'stop' });
+    seedSharedSession();
+    mocks.getMessageDetail.mockResolvedValue({ items: [{ message_id: 'om_quote', deleted: false }] });
+    await sessionReply(CHAT, 'reply', 'text', APP, 'turn-1', { quoteMessageId: 'om_quote' });
+    expect(mocks.replyMessage).toHaveBeenCalledTimes(1);
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    mocks.getMessageDetail.mockClear();
+    registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', topicUnavailablePolicy: 'legacy' });
+    mocks.replyMessage.mockRejectedValueOnce(new MessageWithdrawnError('om_quote'));
+    await sessionReply(CHAT, 'reply', 'text', APP, 'turn-2', { quoteMessageId: 'om_quote' });
+    expect(mocks.getMessageDetail).not.toHaveBeenCalled();
+    expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['deleted', 'network', 'race'] as const)('strict policy prevents automatic top-level fallback: %s', async failure => {
+    registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', topicUnavailablePolicy: 'stop' });
+    seedSharedSession();
+    mocks.getMessageDetail.mockImplementation(async (_app, id) => {
+      if (failure === 'network') throw new Error('network unavailable');
+      return { items: [{ message_id: id, deleted: failure === 'deleted' }] };
+    });
+    mocks.replyMessage.mockRejectedValueOnce(new MessageWithdrawnError('om_human_a'));
+    await expect(sessionReply(CHAT, 'answer', 'text', APP, 'turn-a', { quoteMessageId: 'om_human_a' })).rejects.toThrow();
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.replyMessage).toHaveBeenCalledTimes(failure === 'race' ? 1 : 0);
   });
 
   it('repo-card-style send (interactive, NO turnId) threads into the shared topic, not top-level', async () => {

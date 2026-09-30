@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { assertSendTopicsAvailable } from './cli/topic-send-guard.js';
 /**
  * CLI entry point for botmux.
  *
@@ -9759,7 +9760,9 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Re-challenge immediately before observable provider effects so lengthy
   // local parsing/card preparation cannot carry an old capability across a
   // worker restart, turn rotation, or Codex ledger settlement.
+  let checkSendTopics: (() => Promise<void>) | undefined;
   const revalidateIsolatedOriginBeforeEffect = async (): Promise<ManagedOriginAttestation | undefined> => {
+    await checkSendTopics?.();
     if (!isolatedAttestationContext || !isolatedManagedOriginCtx) return undefined;
     const fresh = await attestManagedOrigin({
       context: isolatedAttestationContext,
@@ -10226,6 +10229,37 @@ async function cmdSend(rest: string[]): Promise<void> {
     }));
     return;
   }
+  // Register bots so the downstream Lark client works. registerBot is
+  // idempotent, so all send paths reuse these same clients.
+  // envPinnedRiffBot is re-registered LAST so a remote env credential is never
+  // clobbered by a stale bots.json entry for the same app.
+  const { registerBot, loadBotConfigs, findOncallChatForAnyBot, getBot } = await import('./bot-registry.js');
+  try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
+  if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
+
+  const { getMessageDetail: getTopicMessageDetail } = await import('./im/lark/client.js');
+  // Source routing deliberately ignores explicit destination overrides.
+  const sourceTopicTarget = frozenTurnReplyTarget ?? resolveSendTarget({
+    topLevel: false, chatScope: s.scope === 'chat', chatId: s.chatId,
+    rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId,
+    replyTargetTurnId: turnReplyTarget?.turnId,
+    replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId,
+  });
+  checkSendTopics = async () => {
+    if (getBot(appId).config.topicUnavailablePolicy !== 'stop') return;
+    const scheduledRoot = reusableDeferredTopicRoot({
+      session: s as SessionData & { larkAppId: string },
+      binding: readDeferredTopicBinding(dataDir, s.sessionId),
+      explicitTopLevel: false,
+    });
+    await assertSendTopicsAvailable(appId, [
+      scheduledRoot,
+      !s.deferredScheduleRun && (sourceTopicTarget.mode === 'thread' || sourceTopicTarget.mode === 'quote')
+        ? sourceTopicTarget.rootMessageId : undefined,
+      sendInto,
+    ], getTopicMessageDetail, 'stop');
+  };
+  await checkSendTopics();
   // Resolve sender-scoped bot identities before the early voice return. Voice
   // used to skip the text path's XPI gate entirely, so an explicitly addressed
   // bot received an unclassified bot message that the receiver then dropped.
@@ -10569,14 +10603,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   });
   if (!mentionGate.ok) { console.error(mentionGate.error); process.exit(2); }
 
-  // Register bots so the downstream Lark client works. registerBot is
-  // idempotent, so all send paths reuse these same clients.
-  // envPinnedRiffBot is re-registered LAST so a remote env credential is never
-  // clobbered by a stale bots.json entry for the same app.
-  const { registerBot, loadBotConfigs, findOncallChatForAnyBot, getBot } = await import('./bot-registry.js');
   const { resolveRegularGroupMode } = await import('./services/chat-reply-mode-store.js');
-  try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
-  if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
 
   // ── --mention resolution + group-membership gate ──────────────────────────
   // Turn each raw --mention identifier into a { open_id, name } entry.
@@ -11090,6 +11117,9 @@ async function cmdSend(rest: string[]): Promise<void> {
           ? undefined
           : fenceIsolatedOriginBeforeEffect,
         beforeQuoteFallback: async () => {
+          if (getBot(appId).config.topicUnavailablePolicy === 'stop') {
+            throw new Error('TOPIC_SEND_BLOCKED: 引用目标已撤回，按机器人配置停止发送，不改发其他位置。');
+          }
           revalidateVcMeetingManagedSend();
           await revalidateIsolatedOriginBeforeEffect();
         },
