@@ -25,6 +25,7 @@ export type FleetProcessInspection =
 const BUILTIN_FLEET_ENTRY_MARKERS = {
   daemon: { token: '__daemon', script: 'index-daemon.js' },
   dashboard: { token: '__dashboard', script: 'index-dashboard.js' },
+  supervisor: { token: '__supervisor', script: 'index-supervisor.js' },
 } as const;
 
 function commandLineHasArg(commandLine: string, arg: string): boolean {
@@ -39,7 +40,7 @@ function commandLineHasArg(commandLine: string, arg: string): boolean {
  * token. Both markers survive upgrades and worktree switches.
  */
 export function builtinFleetEntryMatches(
-  entry: 'daemon' | 'dashboard',
+  entry: keyof typeof BUILTIN_FLEET_ENTRY_MARKERS,
   commandLine: string,
 ): boolean {
   const { token, script } = BUILTIN_FLEET_ENTRY_MARKERS[entry];

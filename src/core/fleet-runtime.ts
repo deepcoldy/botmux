@@ -25,6 +25,7 @@ import type { RestartEnvFallback } from './restart-env-refresh.js';
 import { stripDashboardH5Env } from '../utils/child-env.js';
 import { findQuotaFallbackCycles } from '../services/quota-fallback.js';
 import {
+  builtinFleetEntryMatches,
   inspectFleetProcess,
   signalAttestedFleetProcess,
   type FleetProcessAttestation,
@@ -259,8 +260,12 @@ export function resolveFleetMembers(): FleetBotSpec[] {
 }
 
 function supervisorCommandMatches(state: FleetState, commandLine: string): boolean {
-  if (!state.supervisorEntry || !commandLine.includes(state.supervisorEntry)) return false;
-  return state.supervisorEntry.includes('index-supervisor') || commandLine.includes('__supervisor');
+  if (state.supervisorEntry && !commandLine.includes(state.supervisorEntry)) return false;
+  // Pre-identity fleet-state rows have no persisted entry/command. Keep their
+  // one-release migration path narrow: require an exact built-in role marker;
+  // inspectFleetProcess still samples the process birth identity twice and the
+  // returned attestation rechecks both identity and command before signalling.
+  return builtinFleetEntryMatches('supervisor', commandLine);
 }
 
 export function inspectSupervisorState(
@@ -268,7 +273,6 @@ export function inspectSupervisorState(
   runtime: FleetProcessIdentityRuntime = fleetProcessIdentityRuntime,
 ): FleetProcessInspection {
   const pid = state?.supervisorPid ?? 0;
-  if (pid > 1 && !state.supervisorCommand && !state.supervisorEntry) return { status: 'unverifiable' };
   return inspectFleetProcess(
     pid,
     state.supervisorProcessStart,
