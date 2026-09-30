@@ -27,6 +27,7 @@ export interface ProjectCoordinatorTransport {
   unpinMessage(larkAppId: string, messageId: string): Promise<boolean>;
   resolveThreadId(larkAppId: string, dispatchRoot: string): Promise<string | null>;
   isMessageWithdrawn(error: unknown): boolean;
+  isMessageUpdateExpired(error: unknown): boolean;
   brand(larkAppId: string): Brand;
 }
 
@@ -169,7 +170,7 @@ export class ProjectCoordinator {
       await this.transport.updateCard(context.larkAppId, current.messageId,
         JSON.stringify(buildProjectGroupStartedNoticeCard(localeForBot(context.larkAppId))));
     } catch (error) {
-      if (!this.transport.isMessageWithdrawn(error)) {
+      if (!this.transport.isMessageWithdrawn(error) && !this.transport.isMessageUpdateExpired(error)) {
         logger.warn(`[project] Could not retire onboarding card ${current.messageId}; will retry on refresh: ${error}`);
         return;
       }
