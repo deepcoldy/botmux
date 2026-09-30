@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { appendFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,6 +13,12 @@ const FOREIGN = 'cccccccc-cccc-7ccc-8ccc-cccccccccccc';
 let home: string;
 const line = (value: unknown) => JSON.stringify(value) + '\n';
 const meta = (sid = SID) => line({ type: 'session_meta', payload: { id: sid } });
+
+function metaWithByteLength(id: string, bytes: number): string {
+  const record = { type: 'session_meta', payload: { id, base_instructions: { text: '' } } };
+  record.payload.base_instructions.text = 'x'.repeat(bytes - Buffer.byteLength(line(record)));
+  return line(record);
+}
 
 beforeEach(() => { home = mkdtempSync(join(tmpdir(), 'codex-generation-')); });
 afterEach(() => { rmSync(home, { recursive: true, force: true }); });
@@ -51,6 +57,26 @@ describe('Codex rollout generations', () => {
     index(stale);
     expect(findCodexRolloutBySessionId(SID, { codexHome: home })).toBe(stale);
   });
+
+  it.each([65_535, 65_536, 65_537, 70 * 1024])(
+    'keeps the indexed generation authoritative with a %i-byte session_meta line', bytes => {
+      // A large base_instructions payload is still a valid session_meta row.
+      // The index may point at an older filename, as in the small-header case.
+      const active = rollout('29', `_${GENERATION}`, SID, metaWithByteLength(SID, bytes));
+      rollout('30');
+      index(active);
+      expect(findCodexRolloutBySessionId(SID, { codexHome: home })).toBe(active);
+    },
+  );
+
+  it.each([false, true])(
+    'rejects a conflicting session_meta id even in a large header (noFollow=%s)', noFollow => {
+      const owned = rollout('29');
+      const foreign = rollout('30', `_${GENERATION}`, SID, metaWithByteLength(FOREIGN, 70 * 1024));
+      index(foreign);
+      expect(findCodexRolloutBySessionId(SID, { codexHome: home, noFollow })).toBe(owned);
+    },
+  );
 
   it.each(['absent', 'corrupt', 'missing table', 'missing file'])('falls back when the index is %s', state => {
     const old = rollout('29');
@@ -96,6 +122,41 @@ const T1 = '2026-09-30T01:00:01Z';
 const T2 = '2026-09-30T01:00:02Z';
 
 describe('Codex bridge replay across file generations', () => {
+  it.each(['missing', 'invalid', 'valid'] as const)(
+    'does not create a blocking local turn when replaying history with %s timestamps', timestampCase => {
+      const timestamp = timestampCase === 'missing' ? undefined
+        : timestampCase === 'invalid' ? 'not-a-timestamp' : T0;
+      const history = line({ timestamp, type: 'response_item', payload: {
+        type: 'message', role: 'user', content: [{ type: 'input_text', text: 'completed work' }],
+      } }) + line({ timestamp, type: 'event_msg', payload: {
+        type: 'task_complete', turn_id: 'completed-turn', last_agent_message: 'finished',
+      } });
+      const old = rollout('29', '', SID, meta() + history);
+      const next = rollout('30', `_${GENERATION}`, SID, meta() + history);
+      const clock = vi.spyOn(Date, 'now').mockReturnValue(Date.parse(T0));
+      try {
+        const q = new CodexBridgeQueue();
+        q.setLocalTurns(true, Date.parse(T0));
+        const consumed = drainCodexRollout(old, 0);
+        q.ingest(codexEventsWithStableIds(old, consumed.events));
+        expect(q.drainEmittable().map(turn => turn.finalText)).toEqual(['finished']);
+        expect(q.hasBlockingTurn()).toBe(false);
+        q.absorb(codexConsumedRolloutEvents(old, consumed.newOffset));
+
+        // Real polling drains happen at different wall-clock times. The same
+        // copied records must remain historical across those drains, including
+        // the parser's supported missing/invalid-timestamp fallback path.
+        clock.mockReturnValue(Date.parse(T0) + 1_000);
+        q.ingest(codexEventsWithStableIds(next, drainCodexRollout(next, 0).events));
+        expect(q.drainEmittable()).toEqual([]);
+        expect(q.hasBlockingTurn()).toBe(false);
+        expect(q.peek()).toEqual([]);
+      } finally {
+        clock.mockRestore();
+      }
+    },
+  );
+
   it('keeps a collecting turn and emits its new final exactly once despite copied user/start records', () => {
     const q = new CodexBridgeQueue();
     q.mark('delivery', 'continue work', Date.parse(T0));
