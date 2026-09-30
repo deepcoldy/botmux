@@ -20,6 +20,7 @@ import {
   findLatestJsonl,
   findJsonlContainingFingerprint,
   jsonlContainsFingerprint,
+  extractAssistantTurns,
   extractLastAssistantTurn,
   isMeaningfulUserEvent,
   readFirstEventTimestamp,
@@ -1102,6 +1103,20 @@ describe('isMeaningfulUserEvent', () => {
 });
 
 describe('extractLastAssistantTurn', () => {
+  it('extracts every completed turn while omitting an unfinished tail', () => {
+    expect(extractAssistantTurns([
+      userEv('first prompt'),
+      assistantEv('first reply'),
+      userEv('second prompt'),
+      assistantEv('second reply'),
+      userEv('still running'),
+      assistantToolUseEv(),
+    ])).toEqual([
+      { userText: 'first prompt', assistantText: 'first reply' },
+      { userText: 'second prompt', assistantText: 'second reply' },
+    ]);
+  });
+
   it('happy path: real prompt + multi-block assistant text + interleaved tool_use', () => {
     const turn = extractLastAssistantTurn([
       userEv('first prompt'),

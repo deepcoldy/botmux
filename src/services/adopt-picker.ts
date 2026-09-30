@@ -15,15 +15,19 @@
 import type { DaemonSession } from '../core/types.js';
 import type { AdoptableSession } from '../core/session-discovery.js';
 import type { ZellijAdoptableSession } from '../core/zellij-adopt-discovery.js';
+import type { OrcaAdoptableSession } from '../core/orca-adopt-discovery.js';
 import type { ResumableSession } from '../adapters/cli/types.js';
 import {
   discoverAdoptableSessions,
   excludeOwnedHerdrAdoptTargets,
 } from '../core/session-discovery.js';
 import { discoverAdoptableZellijSessions } from '../core/zellij-adopt-discovery.js';
+import { discoverAdoptableOrcaSessions } from '../core/orca-adopt-discovery.js';
+
+export type LiveAdoptableSession = AdoptableSession | ZellijAdoptableSession | OrcaAdoptableSession;
 
 export interface AdoptCandidates {
-  sessions: Array<AdoptableSession | ZellijAdoptableSession>;
+  sessions: LiveAdoptableSession[];
   resumable: ResumableSession[];
   /** The resume cap applied, so the card can show a truncation hint. */
   resumeLimit: number;
@@ -69,12 +73,14 @@ export async function collectAdoptCandidates(
   const zellij = runtimeExecutable
     ? discoverAdoptableZellijSessions(botCliId as any, runtimeExecutable)
     : discoverAdoptableZellijSessions(botCliId as any);
-  const sessions: Array<AdoptableSession | ZellijAdoptableSession> = [
+  const orca = await discoverAdoptableOrcaSessions(botCliId as any, runtimeExecutable);
+  const sessions: LiveAdoptableSession[] = [
     ...excludeOwnedHerdrAdoptTargets(
       tmuxAndHerdr,
       ownedHerdrTargets,
     ),
     ...zellij,
+    ...orca,
   ];
   // Resume needs the bot's own CLI binary, so only offer it when known.
   const resumable = botCliId

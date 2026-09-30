@@ -2671,6 +2671,16 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     const { discoverAdoptableSessions, discoverAdoptableSessionByTarget, excludeOwnedHerdrAdoptTargets } = await import('../../core/session-discovery.js');
     const { discoverAdoptableZellijSessions } = await import('../../core/zellij-adopt-discovery.js');
     async function resolveLive() {
+      if (entryKey!.startsWith('live:orca:')) {
+        const { discoverAdoptableOrcaSessionByHandle } = await import('../../core/orca-adopt-discovery.js');
+        const handle = entryKey!.slice('live:orca:'.length);
+        const target = await discoverAdoptableOrcaSessionByHandle(
+          handle,
+          botCfg.cliId,
+          botCfg.cliRuntime?.executable,
+        );
+        return target && adoptLiveKey(target) === entryKey ? target : undefined;
+      }
       // Zellij keys carry "live:zellij:" — resolve from the zellij backend.
       if (entryKey!.startsWith('live:zellij:')) {
         return discoverAdoptableZellijSessions(botCfg.cliId, botCfg.cliRuntime?.executable)

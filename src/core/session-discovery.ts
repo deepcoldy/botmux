@@ -10,10 +10,12 @@ import { homedir, platform } from 'node:os';
 import { basename, join } from 'node:path';
 import type { CliId } from '../adapters/cli/types.js';
 import { executableBasename } from '../adapters/cli/runtime.js';
+import { readClaudeSessionMeta } from '../services/claude-transcript.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
 import { findTraexRolloutByPid } from '../services/traex-transcript.js';
 import { tmuxEnv } from '../setup/ensure-tmux.js';
+import { validateOrcaAdoptTarget, type OrcaAdoptableSession } from './orca-adopt-discovery.js';
 
 // macOS 没有 /proc，所以走 ps/lsof/pgrep 兜底。Linux 仍优先走 /proc 快路径。
 const IS_LINUX = platform() === 'linux';
@@ -654,24 +656,7 @@ export function scheduleWrapperRealCliPid(launcherPid: number, deps: WrapperReal
   deps.schedule(tick, intervalMs);
 }
 
-/**
- * Try to read Claude Code session metadata from ~/.claude/sessions/<PID>.json.
- * Returns { sessionId, cwd, startedAt } or undefined.
- */
-export function readClaudeSessionMeta(pid: number): { sessionId?: string; cwd?: string; startedAt?: number } | undefined {
-  try {
-    const metaPath = join(homedir(), '.claude', 'sessions', `${pid}.json`);
-    const raw = readFileSync(metaPath, 'utf-8');
-    const data = JSON.parse(raw) as Record<string, unknown>;
-    return {
-      sessionId: typeof data.sessionId === 'string' ? data.sessionId : undefined,
-      cwd: typeof data.cwd === 'string' ? data.cwd : undefined,
-      startedAt: typeof data.startedAt === 'number' ? data.startedAt : undefined,
-    };
-  } catch {
-    return undefined;
-  }
-}
+export { readClaudeSessionMeta } from '../services/claude-transcript.js';
 
 
 function realpathMaybe(path: string): string {
@@ -926,7 +911,10 @@ function discoverHerdrAdoptableSessions(filterCliId?: CliId, filterExecutable?: 
   return results;
 }
 
-export function adoptTargetLabel(target: AdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>): string {
+export function adoptTargetLabel(target: AdoptableSession | OrcaAdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>): string {
+  if (target.source === 'orca') {
+    return `orca:${target.orcaTerminalHandle ?? '?'}`;
+  }
   if (target.source === 'herdr') {
     const sessionName = target.herdrSessionName ?? 'herdr';
     const pane = target.herdrPaneId ?? target.herdrTarget ?? target.herdrAgentName ?? 'agent';
@@ -1237,16 +1225,31 @@ export function validateHerdrAdoptTarget(
 }
 
 export function validateAdoptTarget(
-  target: AdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>,
+  target: AdoptableSession | OrcaAdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>,
   filterExecutable?: string,
 ): boolean {
   return validateAdoptTargetState(target, filterExecutable) === 'alive';
 }
 
 export function validateAdoptTargetState(
-  target: AdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>,
+  target: AdoptableSession | OrcaAdoptableSession | NonNullable<import('./types.js').DaemonSession['adoptedFrom']>,
   filterExecutable?: string,
 ): AdoptValidationResult {
+  if (target.source === 'orca') {
+    // Orca reports only an agent kind, so it cannot prove that a terminal is
+    // running the configured custom distribution. Keep restore as strict as
+    // initial discovery instead of silently widening the match after restart.
+    if (filterExecutable) return 'missing';
+    if (!target.orcaTerminalHandle || !target.orcaWorktreeId || !target.orcaAgentIdentity) return 'missing';
+    return validateOrcaAdoptTarget({
+      orcaTerminalHandle: target.orcaTerminalHandle,
+      orcaPtyId: target.orcaPtyId,
+      orcaIncarnationId: target.orcaIncarnationId,
+      orcaExecutionHostId: target.orcaExecutionHostId,
+      orcaWorktreeId: target.orcaWorktreeId,
+      orcaAgentIdentity: target.orcaAgentIdentity,
+    });
+  }
   if (target.source === 'herdr') {
     const pid = 'originalCliPid' in target
       ? target.originalCliPid

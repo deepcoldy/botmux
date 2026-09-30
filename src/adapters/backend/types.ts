@@ -1,4 +1,4 @@
-export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff' | 'mojo';
+export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff' | 'mojo' | 'orca';
 
 /**
  * Durable identity of the backing resource owned by one Botmux session.
@@ -313,6 +313,8 @@ export interface ObserveBackend extends SessionBackend {
   captureViewport(): string;
   /** Live pane dimensions, or null if the pane is gone. */
   getPaneSize(): { cols: number; rows: number } | null;
+  /** Notify viewers when an external pane changes geometry after attach. */
+  onPaneSizeChange?(cb: (size: { cols: number; rows: number }) => void): void;
   /** Cheap liveness probe. */
   isPaneAlive(): boolean;
   /**

@@ -4,6 +4,7 @@ import type { ProjectInfo } from '../../services/project-scanner.js';
 import type { CliId, ResumableSession } from '../../adapters/cli/types.js';
 import { adoptTargetKey, adoptTargetLabel, type AdoptableSession } from '../../core/session-discovery.js';
 import type { ZellijAdoptableSession } from '../../core/zellij-adopt-discovery.js';
+import type { OrcaAdoptableSession } from '../../core/orca-adopt-discovery.js';
 import type { CodexAppThreadSummary } from '../../services/codex-app-threads.js';
 import type { DisplayMode, StreamStatus } from '../../types.js';
 import type { CliUsageLimitState } from '../../utils/cli-usage-limit.js';
@@ -3002,7 +3003,14 @@ export interface AdoptPickerEntry {
  *  匹配"): (zellijSession, zellijPaneId) already uniquely identifies the pane.
  *  tmux/herdr keep adoptTargetKey (tmux includes pid, herdr does not) — tmux's
  *  confirm fast-path parses the trailing pid, and that path is unchanged. */
-export function adoptLiveKey(s: AdoptableSession | ZellijAdoptableSession): string {
+function isOrcaAdoptCandidate(
+  s: AdoptableSession | ZellijAdoptableSession | OrcaAdoptableSession,
+): s is OrcaAdoptableSession {
+  return 'source' in s && s.source === 'orca';
+}
+
+export function adoptLiveKey(s: AdoptableSession | ZellijAdoptableSession | OrcaAdoptableSession): string {
+  if (isOrcaAdoptCandidate(s)) return `live:orca:${s.orcaTerminalHandle}`;
   if ('zellijPaneId' in s) return `live:zellij:${s.zellijSession}/${s.zellijPaneId}`;
   return `live:${adoptTargetKey(s)}`;
 }
@@ -3016,16 +3024,18 @@ export function adoptLiveKey(s: AdoptableSession | ZellijAdoptableSession): stri
  *  CLI, so the caller knows it), and the user wants to see "Codex" on each
  *  history row rather than a blank. */
 export function buildAdoptEntries(
-  sessions: Array<AdoptableSession | ZellijAdoptableSession>,
+  sessions: Array<AdoptableSession | ZellijAdoptableSession | OrcaAdoptableSession>,
   resumable: ResumableSession[],
   resumeCliId?: CliId,
   runtimeDisplayName?: string,
 ): AdoptPickerEntry[] {
   const customName = runtimeDisplayName?.trim();
   const live: AdoptPickerEntry[] = sessions.map((s) => {
-    const zellij = 'zellijPaneId' in s;
     const project = s.cwd.split('/').pop() || s.cwd;
-    const target = zellij ? `${s.zellijSession}/${s.zellijPaneId}` : adoptTargetLabel(s);
+    let target: string | undefined;
+    if (isOrcaAdoptCandidate(s)) target = s.orcaTerminalTitle;
+    else if ('zellijPaneId' in s) target = `${s.zellijSession}/${s.zellijPaneId}`;
+    else target = adoptTargetLabel(s);
     return {
       key: adoptLiveKey(s),
       kind: 'live' as const,
@@ -3091,7 +3101,7 @@ function adoptPickerFilter(entries: AdoptPickerEntry[], query: string | undefine
  * knows to narrow via search instead of assuming they saw everything.
  */
 export function buildAdoptSelectCard(
-  sessions: Array<AdoptableSession | ZellijAdoptableSession>,
+  sessions: Array<AdoptableSession | ZellijAdoptableSession | OrcaAdoptableSession>,
   rootMessageId?: string,
   locale?: Locale,
   resumable?: ResumableSession[],

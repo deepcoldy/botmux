@@ -16,9 +16,10 @@
 import { realpathSync } from 'node:fs';
 import type { CliId } from '../adapters/cli/types.js';
 import {
-  readComm, readCwd, getChildPids, readClaudeSessionMeta, cliIdFromCommArgv, readCmdline,
+  readComm, readCwd, getChildPids, cliIdFromCommArgv, readCmdline,
   readProcessStartTime,
 } from './session-discovery.js';
+import { readClaudeSessionMeta } from '../services/claude-transcript.js';
 import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
 import { findTraexRolloutByPid } from '../services/traex-transcript.js';

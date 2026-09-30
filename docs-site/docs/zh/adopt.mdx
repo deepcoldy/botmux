@@ -1,19 +1,26 @@
 # 会话接入（Adopt）
 
-把**已经在本地 tmux 里跑着**的 CLI 进程无缝接入 botmux，在手机上通过飞书查看进度和交互。典型场景：公司电脑 tmux 里 Claude Code 写到一半要走，手机飞书发 `/adopt` 就能接着看、接着发。
+把**已经在 tmux、Zellij、Herdr 或 Orca 里跑着**的 CLI 进程无缝接入 botmux，在手机上通过飞书查看进度和交互。典型场景：公司电脑里的 CLI 写到一半要走，手机飞书发 `/adopt` 就能接着看、接着发。
 
 <video src="https://magic-builder.tos-cn-beijing.volces.com/uploads/1780421531476_adopt-video.aud.mp4" controls preload="metadata" style={{width:'100%',borderRadius:'8px'}}></video>
 
 ```
-/adopt              # 扫描本机 tmux，弹出选择卡片
+/adopt              # 扫描可接入会话，弹出选择卡片
 /adopt 0:2.0        # 直接接入指定 tmux pane（session:window.pane）
+/adopt orca:term_xxx # 直接接入指定 Orca terminal
 ```
 
 > 选择卡片只列**当前 bot 所绑 CLI** 的会话（Pi bot 不会列出 Codex/TRAE 的 pane），且排除 botmux 自己的 `bmx-*` 常驻会话。
 
+选择卡片的粗体标题统一显示工作区名，「位置」显示各后端自己的可读会话标识：tmux 为 `session:window.pane`，Zellij 为 `session/pane`，Orca 为终端标题。Orca 内部 handle 只用于点击确认和恢复校验，不展示给用户。
+
+Orca 会话通过当前环境已有的 `orca` 命令连接，自动复用 Orca 的本地或 SSH 路由，不需要另配 pairing。Web Terminal 采用无扰的文本屏幕快照：可以查看当前画面并输入，但暂不保留原终端的颜色、精确光标和鼠标模式。能在 Botmux 主机上精确绑定 CLI 进程与 transcript 时，正式回复仍按其它 adopt 来源回传；Trae、Claude Code 和 Codex 还会用 transcript 重建可滚动的用户/助手历史。
+
+MTR、Hermes 及其它未验证 CLI 目前只承诺基础终端接入：当前真实 TUI、飞书输入和 Web Terminal 仍可用，但不保证 transcript 正式回复或可滚动历史。这不是终端读写限制，而是 transcript 归属无法可靠证明：MTR 的 cwd fallback 在同目录多会话时可能歧义，外部启动的 Hermes 会话也没有 Botmux session 标记。Botmux 不会按“同目录最近会话”猜测，否则可能把另一个终端的对话展示出来。
+
 ## 它是「桥接」，不是接管
 
-adopt 采用**零打扰桥接**：botmux 只旁路观察 pane（`tmux pipe-pane` 读输出、`send-keys` 写输入），**从不 attach、不 zoom、不 group** 你本地的 tmux——你在 iTerm2 里的会话全程不受影响。
+adopt 采用**零打扰桥接**：botmux 只旁路观察并定向写入目标终端，**从不改变原终端的焦点、布局或尺寸**，本地终端和 Orca 界面全程不受影响。
 
 - **共享模式**：接入后，本地终端（如 iTerm2）和飞书双向同步——流式卡片实时显示终端输出，飞书聊天框输入直接透传到终端。本地 tmux 全程保持连接、毫发无损。
 - **安全断开**：点流式卡片上的「⏏ 断开」（或发 `/close`），botmux 退出观察、清掉自己这侧的 worker，**绝不结束你的 CLI**——原进程继续在你本地 tmux 里跑。
@@ -28,6 +35,7 @@ adopt 会话的生命周期在**你的机器上**，不归 botmux 管，因此�
 - **不能 resume**：adopt 会话不支持 `--resume` 重建。
 - **CLI 退出即结束**：adopt 模式下 botmux **不做自动重启**——被接入的 CLI 自己退出后，会话随之结束（卡片冻结、worker 收掉），不会像常驻会话那样重开。
 - **沙盒 bot 不能 adopt**：沙盒要包住一个从头启动的 CLI，无法套在一个已在跑的进程上（fail-closed 拒绝）。
+- **Orca 身份必须可验证**：目标至少要提供 incarnation 或 PTY 身份；缺少稳定身份时不会列出或恢复，避免 terminal handle 被复用后写入错误终端。
 - **daemon 重启后的恢复很谨慎**：重启时会先核对被接入的宿主 CLI 是否还活着——确认没了才关会话；探测结果不确定（瞬时失败）时保持会话关闭，**要等下一次 restore pass（例如再次重启 daemon）才重新验证**，不会在下一条消息到来时自动复验。
 
 ## 典型用法

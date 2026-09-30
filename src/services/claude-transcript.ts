@@ -11,13 +11,31 @@
  * The functions are pure (no fs.watch — that's the worker's wakeup concern)
  * to keep them unit-testable.
  */
-import { existsSync, openSync, readSync, closeSync, statSync, readdirSync } from 'node:fs';
+import { existsSync, openSync, readSync, closeSync, statSync, readdirSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { baselineJsonlCursor } from './jsonl-cursor.js';
 import type { ModelFallbackState } from '../types.js';
 // cot-subject 只用语言内建、不引任何仓库模块，等价于内联，不违反本文件的
 // dependency-free 口径；独立成模块是为了和渲染层共用同一份字段优先级。
 import { boundSubjectForTransport, subjectFromInputObject } from './cot-subject.js';
+
+/** Read the session identity published by one live Claude Code process. */
+export function readClaudeSessionMeta(
+  pid: number,
+): { sessionId?: string; cwd?: string; startedAt?: number } | undefined {
+  try {
+    const raw = readFileSync(join(homedir(), '.claude', 'sessions', `${pid}.json`), 'utf-8');
+    const data = JSON.parse(raw) as Record<string, unknown>;
+    return {
+      sessionId: typeof data.sessionId === 'string' ? data.sessionId : undefined,
+      cwd: typeof data.cwd === 'string' ? data.cwd : undefined,
+      startedAt: typeof data.startedAt === 'number' ? data.startedAt : undefined,
+    };
+  } catch {
+    return undefined;
+  }
+}
 
 /** Subset of Claude Code's JSONL event shape we care about. */
 export interface TranscriptEvent {
@@ -1144,25 +1162,28 @@ export interface AdoptPreamble {
   assistantText: string;
 }
 
-/** Walk the events forward and return the last *completed* user/assistant
+/** Walk the events forward and return every *completed* user/assistant
  *  exchange. "Completed" here means: a meaningful user prompt followed by
  *  at least one assistant event with visible text. tool_use / tool_result
  *  events do NOT reset the turn — they're intra-turn machinery, so a
  *  prompt → tool_use → tool_result → assistant text sequence still counts
- *  as a single turn. Returns null when there's no meaningful user yet, or
- *  the last user wasn't followed by any visible assistant text (Claude is
- *  mid-tool-use when /adopt fired).
- *
- *  Used by adopt-bridge to surface "the previous round" to the Lark thread
- *  so the user has context for continuing the conversation. */
-export function extractLastAssistantTurn(events: TranscriptEvent[]): AdoptPreamble | null {
+ *  as a single turn. An unfinished final user prompt is omitted. */
+function collectAssistantTurns(
+  events: TranscriptEvent[],
+): { turns: AdoptPreamble[]; lastMeaningfulTurnCompleted: boolean } {
+  const turns: AdoptPreamble[] = [];
   let userText: string | null = null;
   let assistantTexts: string[] = [];
+  const flush = () => {
+    if (userText === null || assistantTexts.length === 0) return;
+    turns.push({ userText, assistantText: assistantTexts.join('\n\n') });
+  };
 
   for (const ev of events) {
     if (!ev || typeof ev !== 'object') continue;
     if (isMeaningfulUserEvent(ev)) {
       // New turn boundary — reset the assistant accumulator.
+      flush();
       userText = stringifyUserContent(ev.message?.content);
       assistantTexts = [];
       continue;
@@ -1175,11 +1196,17 @@ export function extractLastAssistantTurn(events: TranscriptEvent[]): AdoptPreamb
     if (userText !== null) assistantTexts.push(text);
   }
 
-  if (userText === null || assistantTexts.length === 0) return null;
-  return {
-    userText,
-    assistantText: assistantTexts.join('\n\n'),
-  };
+  flush();
+  return { turns, lastMeaningfulTurnCompleted: userText !== null && assistantTexts.length > 0 };
+}
+
+export function extractAssistantTurns(events: TranscriptEvent[]): AdoptPreamble[] {
+  return collectAssistantTurns(events).turns;
+}
+
+export function extractLastAssistantTurn(events: TranscriptEvent[]): AdoptPreamble | null {
+  const collected = collectAssistantTurns(events);
+  return collected.lastMeaningfulTurnCompleted ? collected.turns.at(-1) ?? null : null;
 }
 
 /**

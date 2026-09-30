@@ -712,10 +712,10 @@ export interface DaemonSession {
    *  second, contradictory close event. Reset when a new process is forked. */
   exitEventEmitted?: boolean;
   /** Present when this session was created via /adopt (shared observation mode).
-   *  Either tmuxTarget (tmux) OR zellijSession+zellijPaneId (zellij) is set. */
+   *  The source-specific tmux, Zellij, Herdr, or Orca identity is set. */
   adoptedFrom?: {
     /** Source backend of the external session. Absent means legacy tmux metadata. */
-    source?: 'tmux' | 'herdr' | 'zellij';
+    source?: 'tmux' | 'herdr' | 'zellij' | 'orca';
     tmuxTarget?: string;       // e.g. "0:2.0" — user's original tmux pane
     zellijSession?: string;    // zellij session name (zellij backend)
     zellijPaneId?: string;     // e.g. "terminal_1" — observe/drive target
@@ -724,6 +724,13 @@ export interface DaemonSession {
     herdrPaneId?: string;
     herdrAgentName?: string;
     herdrTerminalId?: string;
+    orcaTerminalHandle?: string;
+    orcaPtyId?: string;
+    orcaIncarnationId?: string;
+    orcaExecutionHostId?: string;
+    orcaWorktreeId?: string;
+    orcaAgentIdentity?: string;
+    orcaPaneSizeVerified?: boolean;
     originalCliPid?: number;   // CLI process PID in the user's pane, when the source exposes one
     sessionId?: string;       // CLI session ID (for takeover/resume)
     cliId?: import('../adapters/cli/types.js').CliId;  // recognized CLI type

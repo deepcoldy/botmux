@@ -121,6 +121,50 @@ describe('buildAdoptSelectCard (V2 picker)', () => {
     expect(texts[0]).not.toContain('Session ID:');
   });
 
+  it('shows an Orca terminal title as Target while keeping its handle internal', () => {
+    const card = parse(buildAdoptSelectCard([{
+      source: 'orca',
+      orcaTerminalHandle: 'term_ea5b26db-18f8-4f88-a7f9-4af1fbe9c02f',
+      orcaPtyId: 'ssh:h@@pty:1',
+      orcaIncarnationId: 'inc_1',
+      orcaExecutionHostId: 'ssh:h',
+      orcaWorktreeId: 'repo::/work',
+      orcaAgentIdentity: 'claude',
+      orcaTerminalTitle: '修复登录问题',
+      cliId: 'claude-code',
+      cwd: '/Users/test/botmux-adopt-orca',
+      paneCols: 100,
+      paneRows: 40,
+      paneSizeVerified: true,
+    }], 'om_root', 'zh'));
+    const [text] = cardTexts(card);
+    expect(text).toContain('**botmux-adopt-orca**');
+    expect(text).toContain('位置: `修复登录问题`');
+    expect(text).not.toContain('term_ea5b26db');
+    const container = card.body.elements.find((e: any) => e.tag === 'interactive_container');
+    expect(container.behaviors[0].value.entry_key)
+      .toBe('live:orca:term_ea5b26db-18f8-4f88-a7f9-4af1fbe9c02f');
+  });
+
+  it('does not expose an Orca handle when the terminal has no readable title', () => {
+    const card = parse(buildAdoptSelectCard([{
+      source: 'orca',
+      orcaTerminalHandle: 'term_internal_uuid',
+      orcaPtyId: 'ssh:h@@pty:1',
+      orcaIncarnationId: 'inc_1',
+      orcaWorktreeId: 'repo::/work',
+      orcaAgentIdentity: 'claude',
+      cliId: 'claude-code',
+      cwd: '/Users/test/botmux-adopt-orca',
+      paneCols: 100,
+      paneRows: 40,
+      paneSizeVerified: true,
+    }], 'om_root', 'zh'));
+    const [text] = cardTexts(card);
+    expect(text).not.toContain('位置:');
+    expect(text).not.toContain('term_internal_uuid');
+  });
+
   it('renders a resume (history) session card with a hidden session id and a resume: key', () => {
     const card = parse(buildAdoptSelectCard(
       [],

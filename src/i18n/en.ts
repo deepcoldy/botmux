@@ -1696,6 +1696,8 @@ export const messages: Record<string, string> = {
 
   // Worker-side submit / notify messages
   'worker.codex_composer_conflict': 'The adopted Codex terminal already has an unsubmitted local draft. botmux left that draft untouched and did not append the Lark message. Submit or clear the local draft, then resend the Lark message.',
+  'worker.orca_composer_conflict': 'The adopted Orca terminal already has an unsubmitted local draft. Botmux left that draft untouched and did not write the Lark message. Submit or clear the local draft, then resend the message.',
+  'worker.orca_composer_check_failed': 'Botmux could not verify that the adopted Orca composer is empty, so it did not write the message. Check the Orca connection and retry.',
   'worker.transcriptLabel': 'conversation store',
   'worker.submit_impossible': '⚠️ Your last message was not safely written to {cliName}.\nReason: {reason}\nAddress the reason above and verify the terminal state before trying again.\nStart: {preview}',
   'worker.activation_submit_unconfirmed': '⚠️ Opening message submission remains unconfirmed\nStage: input submission\nError code: submit_unconfirmed\nBotMux has not confirmed in {transcriptLabel} that {cliName} received the opening message. It may still be running or may already have run. Later messages are waiting for this confirmation.\nOpen the Web terminal and inspect the original input and run state. If the original input is still unsubmitted, submit it there. BotMux will keep observing its receipt and release the queue when confirmation arrives.\nResending in chat only adds to the queue. If the terminal cannot recover, close this session and start again.\nOriginal message: {preview}',

@@ -69,7 +69,7 @@ import { roleLibraryRoot, roleLibrarySubtree } from './core/role-library.js';
 // Central no-transport predicate. Aliased because a local `const larkTransportEnabled`
 // (the role-library gate) already binds that name in one function scope.
 import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/types.js';
-import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, ClaudeModelFallbackTracker, BackgroundTaskTracker, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
+import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractAssistantTurns, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, ClaudeModelFallbackTracker, BackgroundTaskTracker, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { bridgePostText, composeFailedBridgeFallbackContent, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
@@ -329,6 +329,7 @@ import { withFileLockSync } from './utils/file-lock.js';
 import { TmuxPipeBackend } from './adapters/backend/tmux-pipe-backend.js';
 import { ZellijBackend, ZELLIJ_CONFIG_KDL } from './adapters/backend/zellij-backend.js';
 import { ZellijObserveBackend } from './adapters/backend/zellij-observe-backend.js';
+import { OrcaBackend, renderOrcaTranscriptHistory } from './adapters/backend/orca-backend.js';
 import { ZmxBackend } from './adapters/backend/zmx-backend.js';
 import {
   isCriticalInterruptKey,
@@ -5434,6 +5435,21 @@ function scheduleHerdrAdoptBridgeQuietEmit(): void {
   herdrAdoptBridgeQuietTimer.unref?.();
 }
 
+function setOrcaClaudeWebHistory(events: TranscriptEvent[]): void {
+  if (!(backend instanceof OrcaBackend) || lastInitConfig?.cliId !== 'claude-code') return;
+  const history = extractAssistantTurns(events).flatMap(turn => [
+    { kind: 'user', text: turn.userText },
+    { kind: 'assistant_final', text: turn.assistantText },
+  ]);
+  backend.setWebHistory(renderOrcaTranscriptHistory(history));
+}
+
+function refreshOrcaClaudeWebHistory(): void {
+  if (!(backend instanceof OrcaBackend) || !bridgeJsonlPath) return;
+  const paths = [...new Set([...bridgeSecondaryPaths.keys(), bridgeJsonlPath])];
+  setOrcaClaudeWebHistory(paths.flatMap(path => drainTranscript(path, 0).events));
+}
+
 function bridgeAbsorbBaseline(): void {
   if (!bridgeJsonlPath) return;
   if (!lastInitConfig?.adoptMode) {
@@ -5454,6 +5470,7 @@ function bridgeAbsorbBaseline(): void {
   bridgePendingTail = result.pendingTail;
   bridgeQueue.absorb(result.events);
   observeModelFallbackEvents(bridgeJsonlPath, result.events);
+  setOrcaClaudeWebHistory(result.events);
   bridgeBaselineDone = true;
   // After absorb (uuids registered as seen so they won't re-emit as a Lark
   // turn), surface the last completed user/assistant exchange to Lark as a
@@ -6501,6 +6518,7 @@ function bridgeDrainAndMaybeEmit(): void {
   if (!bridgeJsonlPath) return;
   bridgeIngest();
   emitReadyTurns();
+  refreshOrcaClaudeWebHistory();
   // Prune AFTER emit so a path is only retired once its turn has actually
   // been published. During non-idle ticks (fs.watch / 1s poll) we never
   // emit, so we never prune — the path stays put until idle resolves it.
@@ -7126,6 +7144,9 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     const result = structuredBridgeIngestPath(rolloutPath, 0);
     const cutoff = (codexAdoptStartMs ?? Date.now()) - 5_000;
     const { history, live } = splitCodexEventsByCutoff(result.events, cutoff);
+    if (backend instanceof OrcaBackend) {
+      backend.setWebHistory(renderOrcaTranscriptHistory([...history, ...live]));
+    }
     codexBridgeQueue.absorb(history);
     codexBridgeQueue.ingest(live);
     pruneExpiredStructuredHeadsAndEmit('structured split-live attach');
@@ -7774,6 +7795,9 @@ function codexBridgeIngest(opts: {
     maybeEmitCodexStructuredRateLimit(result.events);
   }
   if (result.events.length > 0) lastStructuredBridgeActivityAtMs = Date.now();
+  if (backend instanceof OrcaBackend) {
+    backend.appendWebHistory(renderOrcaTranscriptHistory(result.events));
+  }
   codexBridgeQueue.ingest(result.events);
   // After ingest so the latch's delivery re-kick observes the started turn —
   // the flush's own bridge mark must queue behind it, not ahead of it.
@@ -9051,27 +9075,28 @@ async function writeAdoptMessage(
   //     journal (a transparent pass-through on every non-ZMX backend).
   //   - raw sendText+Enter runs inside the same transaction for identical
   //     commit-journal atomicity.
+  // Refuse before prepareAdoptWrite marks the turn: this is a proven non-write,
+  // not an ambiguous submission. Orca refreshes draft state synchronously here
+  // so the first 700ms screen-poll window cannot append onto a local draft.
+  const composerConflict = adoptComposerConflict(adoptBackend);
+  if (composerConflict) {
+    log(`Refused ${lastInitConfig?.adoptSource ?? 'external'} adopt input: ${composerConflict}`);
+    scheduleSubmitFailureNotify(
+      content,
+      undefined,
+      t('worker.transcriptLabel'),
+      undefined,
+      composerConflict,
+      turnSeq,
+      { turnId, dispatchAttempt },
+      'failed',
+    );
+    return 'completed';
+  }
+
   if (isStructuredBridgeAdoptInputCli(lastInitConfig?.cliId) && cliAdapter) {
     const submissionBackend = adoptBackend;
     let recoveryFailureReason: string | undefined;
-    // Refuse adopt input while the local composer still holds an unsubmitted
-    // human draft, BEFORE any bridge attribution or terminal write — otherwise
-    // the Lark message would be appended onto the human's half-typed line.
-    const composerConflict = codexAdoptComposerConflict(submissionBackend);
-    if (composerConflict) {
-      log('Refused Codex adopt input because the local composer contains an unsubmitted draft');
-      scheduleSubmitFailureNotify(
-        content,
-        undefined,
-        t('worker.transcriptLabel'),
-        undefined,
-        composerConflict,
-        turnSeq,
-        { turnId, dispatchAttempt },
-        'failed',
-      );
-      return 'completed';
-    }
     try {
       const transaction = await runAmbiguousSubmissionTransaction(
         submissionBackend,
@@ -10938,7 +10963,13 @@ function adapterInputHandle(target: SessionBackend): PtyHandle {
     : target;
 }
 
-function codexAdoptComposerConflict(target: SessionBackend): string | undefined {
+function adoptComposerConflict(target: SessionBackend): string | undefined {
+  if (target instanceof OrcaBackend) {
+    const state = target.inspectDraftSync();
+    if (state === 'draft') return t('worker.orca_composer_conflict');
+    if (state === 'unknown') return t('worker.orca_composer_check_failed');
+    return undefined;
+  }
   if (lastInitConfig?.cliId !== 'codex' || !lastInitConfig.adoptMode) return undefined;
   const state = detectCodexComposerState(target.captureInputState?.());
   if (state !== 'draft') return undefined;
@@ -13983,6 +14014,51 @@ async function spawnCli(
     }
   }
   // ── Adopt mode: observe the user's existing terminal backend (no attach) ──
+  if (cfg.adoptMode && cfg.adoptSource === 'orca' && cfg.adoptOrcaIdentity) {
+    isTmuxMode = true;
+    isPipeMode = true;
+    isZellijMode = false;
+    const orcaBe = new OrcaBackend(
+      cfg.adoptOrcaIdentity,
+      cfg.cliId === 'traex',
+      cfg.adoptOrcaSizeVerified === true,
+    );
+    effectiveBackendType = 'orca';
+    backend = orcaBe;
+    cliLifetimeNonce++;
+    if (cfg.adoptCliPid) orcaBe.cliPid = cfg.adoptCliPid;
+    orcaBe.cliCwd = cfg.adoptCwd ?? cfg.workingDir;
+    orcaBe.onPaneSizeChange((size) => {
+      const frame = `\x1b]1989;scaled;${size.cols};${size.rows}\x07`;
+      for (const client of wsClients) {
+        if (client.readyState === WebSocket.OPEN) client.send(frame);
+      }
+    });
+    orcaBe.spawn('', [], {
+      cwd: cfg.workingDir,
+      cols: cfg.adoptPaneCols ?? PTY_COLS,
+      rows: cfg.adoptPaneRows ?? PTY_ROWS,
+      env: process.env as Record<string, string>,
+    });
+
+    setupAdoptTranscriptBridges(cfg);
+    setupAdoptInputAdapter(cfg);
+    setupAdoptIdleDetection(cfg, 'orca');
+    backend.onData(onPtyData);
+    backend.onExit((code, signal) => {
+      log(`Adopted Orca terminal ended (code: ${code}, signal: ${signal})`);
+      backend = null;
+      isPromptReady = false;
+      stopBridgeWatcher();
+      send({ type: 'claude_exit', code, signal, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt });
+    });
+    awaitingFirstPrompt = false;
+    renderer?.markNewTurn();
+    publishLocalProcessAttestation(cfg.adoptCliPid);
+    log(`Adopt mode (orca): observing ${cfg.adoptOrcaIdentity.terminalHandle}`);
+    return;
+  }
+
   if (cfg.adoptMode && cfg.adoptSource === 'herdr' && cfg.adoptHerdrSessionName && (cfg.adoptHerdrPaneId || cfg.adoptHerdrTarget)) {
     isTmuxMode = false;
     isPipeMode = true;
@@ -18957,16 +19033,23 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
         // (sent BEFORE the seed so the client resizes before rendering it).
         if (lastInitConfig?.adoptMode && isObserveBackend(backend)) {
           const sz = (backend as ObserveBackend).getPaneSize();
-          if (sz && sz.cols > 0 && sz.rows > 0) ws.send(`\x1b]1989;${sz.cols};${sz.rows}\x07`);
+          if (sz && sz.cols > 0 && sz.rows > 0) {
+            const sizeMode = backend instanceof OrcaBackend && backend.hasAuthoritativePaneSize()
+              ? 'scaled;'
+              : '';
+            ws.send(`\x1b]1989;${sizeMode}${sz.cols};${sz.rows}\x07`);
+          }
         }
-        const seed = usesHerdrSnapshotWebHistory() && scrollback.length > 0
-          ? scrollback
-          : chooseWebTerminalSeed({
-            canCapture: isPipeMode && isObserveBackend(backend),
-            capture: () => (backend as ObserveBackend).captureCurrentScreen(),
-            scrollback,
-            onError: log,
-          });
+        const seed = backend instanceof OrcaBackend
+          ? backend.captureWebHistory()
+          : usesHerdrSnapshotWebHistory() && scrollback.length > 0
+            ? scrollback
+            : chooseWebTerminalSeed({
+              canCapture: isPipeMode && isObserveBackend(backend),
+              capture: () => (backend as ObserveBackend).captureCurrentScreen(),
+              scrollback,
+              onError: log,
+            });
         // A capture-pane seed carries screen cells but no DECSET state: a fresh
         // client xterm never learns the CLI enabled mouse tracking (grok build:
         // 1003+1006), so clicks/double-clicks are silently swallowed instead of
@@ -19314,7 +19397,8 @@ if(!hasToken){
 //
 // 注意：这一整段在 worker.ts 的模板字符串里，注释和代码都不能出现反引号，
 // 也不能出现「美元号 + 左花括号」的插值起始序列，否则会把模板字符串截断。
-var _WB_FONT_MIN=9,_WB_FONT_MAX=15,_WB_FONT_BASE=14,_WB_FONT_ADVANCE=.6,_WB_TARGET_COLS=62;
+var _WB_FONT_MIN=9,_WB_FIXED_FONT_MIN=6,_WB_FIXED_FONT_MAX=20,_WB_FONT_MAX=15,_WB_FONT_BASE=14,_WB_FONT_ADVANCE=.6,_WB_TARGET_COLS=62;
+var _wbScaledFixed=false,_wbFixedCols=0,_wbFixedRows=0;
 function _wbAutoFontSize(width){
   if(!(width>0))return _WB_FONT_BASE;
   var ideal=width/(_WB_TARGET_COLS*_WB_FONT_ADVANCE);
@@ -19324,6 +19408,15 @@ function _wbAutoFontSize(width){
   // 硬边界：字号是这一页唯一的几何输入，任何异常宽度都不许把它推到读不了的档位。
   if(stepped<_WB_FONT_MIN)return _WB_FONT_MIN;
   if(stepped>_WB_FONT_MAX)return _WB_FONT_MAX;
+  return stepped;
+}
+function _wbFixedFontSize(width,cols){
+  if(!(width>0)||!(cols>0))return _WB_FONT_BASE;
+  var ideal=(width-15)/(cols*_WB_FONT_ADVANCE);
+  var capped=ideal>_WB_FIXED_FONT_MAX?_WB_FIXED_FONT_MAX:ideal;
+  var stepped=Math.round(capped*2)/2;
+  if(stepped<_WB_FIXED_FONT_MIN)return _WB_FIXED_FONT_MIN;
+  if(stepped>_WB_FIXED_FONT_MAX)return _WB_FIXED_FONT_MAX;
   return stepped;
 }
 function _wbTerminalWidth(){
@@ -19362,7 +19455,9 @@ try{
 // 首帧字号已经在 new Terminal 里按容器宽度定好了；这个函数负责后续尺寸变化
 // （转屏、iframe 改宽、分屏、地址栏收放）时复算。返回 true 表示字号真的换了档。
 function _wbApplyAutoFontSize(){
-  var next=_wbAutoFontSize(_wbTerminalWidth());
+  var next=_wbScaledFixed
+    ?_wbFixedFontSize(_wbTerminalWidth(),_wbFixedCols)
+    :_wbAutoFontSize(_wbTerminalWidth());
   if(term.options.fontSize===next)return false;
   term.options.fontSize=next;
   return true;
@@ -19655,8 +19750,10 @@ term.onData(function(d){
   _sendInput(d);
 });
 var fixedSize=false,_lastC=0,_lastR=0,_rzT=0;
-function _setFixedGrid(enabled){
+function _setFixedGrid(enabled,scaled){
   fixedSize=enabled;
+  _wbScaledFixed=enabled&&scaled===true;
+  if(!enabled){_wbFixedCols=0;_wbFixedRows=0;}
   var host=document.getElementById('terminal');
   host.classList.toggle('fixed-grid',enabled);
   if(!enabled){host.scrollTop=0;host.scrollLeft=0;}
@@ -19799,6 +19896,16 @@ if(typeof ResizeObserver!=='undefined'){
       _setFixedGrid(false);data=data.replace(_ho[0],'');
       try{fit.fit()}catch(ex){}
       _lastC=_lastR=0;sendResize();
+    }
+    // Orca supplies a text snapshot at the source grid. Keep its cell geometry
+    // fixed, but derive the font from the real column count so a 100+ column
+    // terminal fits a phone instead of inheriting the generic 62-column font.
+    var _sf=data.match(/\\x1b\\]1989;scaled;(\\d+);(\\d+)\\x07/);
+    if(_sf){
+      _wbFixedCols=+_sf[1];_wbFixedRows=+_sf[2];_setFixedGrid(true,true);
+      try{_wbApplyAutoFontSize()}catch(ex){}
+      if(_wbFixedCols>0&&_wbFixedRows>0){try{term.resize(_wbFixedCols,_wbFixedRows)}catch(ex){}}
+      _lastC=_wbFixedCols;_lastR=_wbFixedRows;data=data.replace(_sf[0],'');
     }
     // botmux OSC 1989: pin the xterm to the adopted pane's fixed size (the pane
     // can't be resized, so FitAddon-to-browser would wrap the snapshot lines).

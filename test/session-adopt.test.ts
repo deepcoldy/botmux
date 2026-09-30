@@ -42,7 +42,9 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   // zellij is pid-AGNOSTIC on purpose (see adoptLiveKey doc / fix 57dcbebbb):
   // the key must stay stable across a render→confirm pid shift.
   adoptLiveKey: vi.fn((s: any) =>
-    'zellijPaneId' in s
+    'orcaTerminalHandle' in s
+      ? `live:orca:${s.orcaTerminalHandle}`
+      : 'zellijPaneId' in s
       ? `live:zellij:${s.zellijSession}/${s.zellijPaneId}`
       : `live:tmux:${s.tmuxTarget}:${s.cliPid}`,
   ),
