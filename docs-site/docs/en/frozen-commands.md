@@ -30,7 +30,7 @@ executors:
         accepts: [literal]
     output:
       container: rows
-      exposeRowFields: [dt, channel, registrations]
+      exposeRowFields: all
       labelsFrom: columns
       totalRowsField: row_count
       auditFields: [query_id]
@@ -57,7 +57,7 @@ Executor kinds are `process`, `script`, and `plugin-tool`. `arguments.*.accepts`
 
 - `content: markdown`: the whole stdout/tool result is Markdown;
 - `content: <field path>` with optional `exposeFields`: a JSON field supplies content while projected data remains available to rules;
-- `exposeFields`, or `container` plus `exposeRowFields`: data only, rendered separately.
+- `exposeFields`, or `container` plus `exposeRowFields`: data only, rendered separately. A `plugin-tool` may set `exposeRowFields: all` to expose every returned column dynamically (up to 64 columns and 1000 rows); `process` and `script` executors must still list each field.
 
 Optional fields are `labels` / `labelsFrom`, `totalRowsField`, `auditFields`, `errorField`, and `maxContentBytes`. Undeclared fields cannot be displayed or referenced. A plugin-tool string accepted only from `literal` may be up to 200000 characters; dynamic and process/script arguments remain capped at 10000.
 

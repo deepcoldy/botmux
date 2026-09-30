@@ -148,6 +148,7 @@ executors:
         kind: 'plugin-tool',
         tool: 'frozen_query_raw',
         arguments: { sql: { accepts: ['literal'], maxLength: 100_000 } },
+        output: { container: 'rows', exposeRowFields: 'all' },
       });
       expect(executor).not.toHaveProperty('minimumVersion');
     }
@@ -445,6 +446,69 @@ executors:
     });
     expect(result.projected).toEqual({ rows: [{ city: 'Shenzhen', safe: 1 }] });
     expect(JSON.stringify(result.projected)).not.toContain('secret');
+  });
+
+  it('allows a plugin-tool to expose every returned row column', () => {
+    const fixture = setup();
+    writeFileSync(fixture.registry, `
+schemaVersion: 2
+executors:
+  - id: test.rows
+    kind: plugin-tool
+    plugin: fixture-plugin
+    tool: read_rows
+    arguments: {}
+    policy: { timeoutMs: 5000 }
+    output:
+      container: rows
+      exposeRowFields: all
+      labelsFrom: columns
+`);
+    const output = loadCommandExecutorRegistry(fixture.registry).executors.get('test.rows')!.output;
+    const result = materializeCommandExecutorOutput(output, {
+      rows: [{ 数据分区: '2026-09-29', 注册商户数: 12 }],
+      columns: [
+        { name: '数据分区', description: '统计分区' },
+        { name: '注册商户数', description: null },
+      ],
+    });
+    expect(result.rows).toEqual([{ 数据分区: '2026-09-29', 注册商户数: 12 }]);
+    expect(result.columns).toEqual([
+      { key: '数据分区', label: '统计分区' },
+      { key: '注册商户数', label: '注册商户数' },
+    ]);
+  });
+
+  it('rejects exposeRowFields: all for process and script executors', () => {
+    for (const kind of ['process', 'script']) {
+      const fixture = setup('rows');
+      const registry = readFileSync(fixture.registry, 'utf8')
+        .replace('kind: script', `kind: ${kind}`)
+        .replace('exposeRowFields: [city, safe]', 'exposeRowFields: all');
+      writeFileSync(fixture.registry, registry);
+      expect(() => loadCommandExecutorRegistry(fixture.registry)).toThrowError(/all 仅允许 plugin-tool/);
+    }
+  });
+
+  it('rejects more than 64 dynamically exposed plugin-tool columns', () => {
+    const fixture = setup();
+    writeFileSync(fixture.registry, `
+schemaVersion: 2
+executors:
+  - id: test.rows
+    kind: plugin-tool
+    plugin: fixture-plugin
+    tool: read_rows
+    arguments: {}
+    policy: { timeoutMs: 5000 }
+    output:
+      container: rows
+      exposeRowFields: all
+`);
+    const output = loadCommandExecutorRegistry(fixture.registry).executors.get('test.rows')!.output;
+    const row = Object.fromEntries(Array.from({ length: 65 }, (_, index) => [`field_${index}`, index]));
+    expect(() => materializeCommandExecutorOutput(output, { rows: [row] }))
+      .toThrowError(/输出列数不能超过 64/);
   });
 
   it('falls back to column names for null descriptions and truncates rows with a total', () => {

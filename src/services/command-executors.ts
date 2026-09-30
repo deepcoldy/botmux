@@ -90,7 +90,7 @@ export interface CommandExecutorOutput {
   content?: 'markdown' | string;
   exposeFields?: string[];
   container?: string;
-  exposeRowFields?: string[];
+  exposeRowFields?: string[] | 'all';
   labels?: Record<string, string>;
   labelsFrom?: string;
   totalRowsField?: string;
@@ -386,7 +386,11 @@ function parseArgument(
   throw new CommandExecutorError('executor_argument_invalid', `arguments.${name}.type 不支持`);
 }
 
-function parseOutput(value: unknown, executorId: string): CommandExecutorOutput {
+function parseOutput(
+  value: unknown,
+  executorId: string,
+  executorKind: CommandExecutor['kind'],
+): CommandExecutorOutput {
   if (!isPlainObject(value)) throw new CommandExecutorError('executor_output_invalid', `${executorId}.output 必须是对象`);
   onlyKeys(value, [
     'content', 'exposeFields', 'container', 'exposeRowFields', 'labels', 'labelsFrom',
@@ -431,7 +435,16 @@ function parseOutput(value: unknown, executorId: string): CommandExecutorOutput 
     : undefined;
   const container = collection ? parsePath(value.container, `${executorId}.output.container`) : undefined;
   const exposeRowFields = collection
-    ? parseFields(value.exposeRowFields, `${executorId}.output.exposeRowFields`)
+    ? value.exposeRowFields === 'all'
+      ? executorKind === 'plugin-tool'
+        ? 'all' as const
+        : (() => {
+          throw new CommandExecutorError(
+            'executor_output_invalid',
+            `${executorId}.output.exposeRowFields: all 仅允许 plugin-tool 使用`,
+          );
+        })()
+      : parseFields(value.exposeRowFields, `${executorId}.output.exposeRowFields`)
     : undefined;
   let labels: Record<string, string> | undefined;
   if (value.labels !== undefined) {
@@ -526,7 +539,7 @@ function parsePluginToolExecutor(
   if (minimumVersion !== undefined && !STABLE_VERSION_RE.test(minimumVersion)) {
     throw new CommandExecutorError('executor_plugin_invalid', `${id}.minimumVersion 必须是稳定语义版本 x.y.z`);
   }
-  const output = parseOutput(value.output, id);
+  const output = parseOutput(value.output, id, 'plugin-tool');
   const argumentsSchema = parseArguments(value.arguments, id, { allowLargePluginLiteral: true });
   const declaresIdentityArgument = Object.keys(argumentsSchema).some(isForbiddenPluginIdentityArgument);
   if (declaresIdentityArgument
@@ -620,7 +633,7 @@ function parseProcessExecutor(
       ...parseCommonPolicy(value.policy, id),
       maxOutputBytes: positiveInteger(value.policy.maxOutputBytes ?? 1024 * 1024, `${id}.policy.maxOutputBytes`, 1_024, 10 * 1024 * 1024),
     },
-    output: parseOutput(value.output, id),
+    output: parseOutput(value.output, id, value.kind),
   } satisfies Omit<ProcessCommandExecutor, 'revision'>;
   const revision = sha256(canonicalJson(normalized));
   return { ...normalized, revision };
@@ -887,6 +900,44 @@ function assignProjectedPath(target: Record<string, unknown>, path: string, valu
   current[segments.at(-1)!] = value;
 }
 
+function resolveProjectedRowFields(
+  output: CommandExecutorOutput,
+  parsed: Record<string, unknown>,
+  rawRows: Array<Record<string, unknown>>,
+): string[] {
+  if (output.exposeRowFields !== 'all') return output.exposeRowFields ?? [];
+  const fields: string[] = [];
+  const seen = new Set<string>();
+  const add = (candidate: unknown, location: string): void => {
+    if (typeof candidate !== 'string' || candidate.length === 0 || candidate.length > 128
+      || candidate.includes('\0') || FORBIDDEN_PATH_SEGMENTS.has(candidate)) {
+      throw new CommandExecutorError('executor_output_invalid', `${location} 含非法列名`);
+    }
+    if (seen.has(candidate)) return;
+    seen.add(candidate);
+    fields.push(candidate);
+    if (fields.length > MAX_PROJECTED_FIELDS) {
+      throw new CommandExecutorError('executor_output_invalid', `执行器输出列数不能超过 ${MAX_PROJECTED_FIELDS}`);
+    }
+  };
+  if (output.labelsFrom) {
+    const rawLabels = projectedPathValue(parsed, output.labelsFrom, `执行器输出缺少字段：${output.labelsFrom}`);
+    if (!Array.isArray(rawLabels)) {
+      throw new CommandExecutorError('executor_output_invalid', `${output.labelsFrom} 必须是列说明数组`);
+    }
+    rawLabels.forEach((item, index) => {
+      if (!isPlainObject(item)) {
+        throw new CommandExecutorError('executor_output_invalid', `${output.labelsFrom}[${index}] 必须包含 name`);
+      }
+      add(item.name, `${output.labelsFrom}[${index}].name`);
+    });
+  }
+  rawRows.forEach((row, rowIndex) => {
+    Object.keys(row).forEach(key => add(key, `${output.container}[${rowIndex}]`));
+  });
+  return fields;
+}
+
 export function projectCommandExecutorOutput(
   output: CommandExecutorOutput,
   parsed: unknown,
@@ -913,14 +964,14 @@ export function projectCommandExecutorOutput(
   if (!Array.isArray(rawRows) || rawRows.some(row => !isPlainObject(row))) {
     throw new CommandExecutorError('executor_output_container_invalid', `执行器输出 ${output.container} 必须是对象数组`);
   }
+  const fields = resolveProjectedRowFields(output, parsed, rawRows);
   const rows = rawRows.slice(0, MAX_PROJECTED_ROWS).map((row, index) => {
+    if (output.exposeRowFields === 'all') {
+      return Object.fromEntries(fields.map(field => [field, Object.hasOwn(row, field) ? row[field] : null]));
+    }
     const projected: Record<string, unknown> = {};
-    for (const field of output.exposeRowFields!) {
-      assignProjectedPath(
-        projected,
-        field,
-        projectedPathValue(row, field, `执行器输出第 ${index + 1} 行缺少字段：${field}`),
-      );
+    for (const field of fields) {
+      assignProjectedPath(projected, field, projectedPathValue(row, field, `执行器输出第 ${index + 1} 行缺少字段：${field}`));
     }
     return projected;
   });
@@ -977,7 +1028,9 @@ export function materializeCommandExecutorOutput(
       return [item.name, typeof item.description === 'string' && item.description ? item.description : item.name];
     }));
   }
-  const keys = output.container ? output.exposeRowFields! : output.exposeFields ?? [];
+  const keys = output.container
+    ? resolveProjectedRowFields(output, raw, sourceRows as Array<Record<string, unknown>>)
+    : output.exposeFields ?? [];
   const columns = keys.map(key => ({ key, label: labels[key] ?? key }));
   const sourceRowCount = Array.isArray(sourceRows) ? sourceRows.length : rows.length;
   const rawTotalRows = output.totalRowsField ? projectedPathValue(raw, output.totalRowsField, `执行器输出缺少字段：${output.totalRowsField}`) : sourceRowCount;

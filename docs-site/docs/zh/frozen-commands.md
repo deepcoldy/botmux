@@ -30,7 +30,7 @@ executors:
         accepts: [literal]
     output:
       container: rows
-      exposeRowFields: [dt, 渠道, 注册数]
+      exposeRowFields: all
       labelsFrom: columns
       totalRowsField: row_count
       auditFields: [query_id]
@@ -57,7 +57,7 @@ renderers:
 
 - `content: markdown`：整个 stdout/工具结果就是 Markdown；
 - `content: <字段路径>` 加可选 `exposeFields`：从 JSON 取内容，同时保留规则可用的数据；
-- `exposeFields`，或 `container` + `exposeRowFields`：只返回投影数据，由 renderer 展示。
+- `exposeFields`，或 `container` + `exposeRowFields`：只返回投影数据，由 renderer 展示。`plugin-tool` 可将 `exposeRowFields` 写成 `all`，按结果动态暴露全部列（最多 64 列、1000 行）；`process` 和 `script` 仍须逐列登记。
 
 可选字段还有 `labels` / `labelsFrom`、`totalRowsField`、`auditFields`、`errorField`、`maxContentBytes`。未登记字段不会展示，也不能被规则引用。plugin-tool 的纯 literal 字符串最长 200000；动态参数和 process/script 仍最多 10000。
 
