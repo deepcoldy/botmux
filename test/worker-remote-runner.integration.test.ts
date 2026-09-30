@@ -46,7 +46,12 @@ input.on('line', line => {
     const state = { version: 1, provider: 'test-provider', generation: 1, remoteSessionId: 'remote-1' };
     emit({ type: 'ready', requestId: command.requestId, state });
   } else if (command.type === 'turn') {
-    fs.writeFileSync(${JSON.stringify(dump)}, JSON.stringify(command));
+    fs.writeFileSync(${JSON.stringify(dump)}, JSON.stringify({
+      command,
+      sessionScope: process.env.BOTMUX_SESSION_SCOPE,
+      chatId: process.env.BOTMUX_CHAT_ID,
+      rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID,
+    }));
     const state = { version: 1, provider: 'test-provider', generation: 1, remoteSessionId: 'remote-1', agentThreadId: 'thread-1' };
     emit({ type: 'status', requestId: command.requestId, status: 'busy', state });
     emit({ type: 'lineage_changed', state });
@@ -137,14 +142,19 @@ input.on('line', line => {
     expect(messages.some(message => message.type === 'error')).toBe(false);
     expect(existsSync(dump)).toBe(true);
     expect(JSON.parse(readFileSync(dump, 'utf8'))).toMatchObject({
-      type: 'turn',
-      turnId: 'turn-remote-1',
-      content: 'remote hello',
-      trustedCaller: {
-        requestUserOpenId: 'ou_remote_user',
-        requestLarkAppId: 'app_remote_runner',
-        senderType: 'user',
+      command: {
+        type: 'turn',
+        turnId: 'turn-remote-1',
+        content: 'remote hello',
+        trustedCaller: {
+          requestUserOpenId: 'ou_remote_user',
+          requestLarkAppId: 'app_remote_runner',
+          senderType: 'user',
+        },
       },
+      sessionScope: 'thread',
+      chatId: 'oc_remote_runner',
+      rootMessageId: 'om_remote_runner',
     });
 
     child.send({ type: 'close', requestId: 'close-remote-1' } satisfies DaemonToWorker);

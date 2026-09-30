@@ -16095,6 +16095,7 @@ async function spawnCli(
   if (cfg.chatType) childEnv.BOTMUX_CHAT_TYPE = cfg.chatType;
   else delete childEnv.BOTMUX_CHAT_TYPE;
   childEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
+  childEnv.BOTMUX_SESSION_SCOPE = cfg.rootMessageId?.startsWith('om_') ? 'thread' : 'chat';
   if (perBotInjectEnv.BOTMUX_APPEND_SYSTEM_PROMPT) {
     childEnv.BOTMUX_APPEND_SYSTEM_PROMPT = perBotInjectEnv.BOTMUX_APPEND_SYSTEM_PROMPT;
   }
