@@ -89,6 +89,16 @@ describe('manager mutations with real durable state and a fake Lark transport', 
     expect(remote.description).toBe('Updated notes');
   });
 
+  it('preserves the original name when a deleted marker is restored by set', async () => {
+    await change('set');
+    const managed = remote.name;
+    remote.description = '';
+    await change('set');
+    expect(remote.name).toBe(managed);
+    await change('clear');
+    expect(remote.name).toBe('Project');
+  });
+
   it('does not activate or report success after a failed remote update', async () => {
     remote.failUpdate = true;
     expect(await change('set')).toMatchObject({ ok: false, reason: 'chat_update_failed' });

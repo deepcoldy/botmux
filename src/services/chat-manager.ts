@@ -4,7 +4,7 @@ import { withFileLock } from '../utils/file-lock.js';
 import { managerLockPath, parseManagerDescription, readManagerClaim, writeManagerClaim } from './chat-manager-state.js';
 
 export async function readManagerChat(app: string, chat: string) {
-  const res = await larkGet(getBotClient(app), `/open-apis/im/v1/chats/${encodeURIComponent(chat)}`);
+  const res = await larkGet(getBotClient(app), `/open-apis/im/v1/chats/${encodeURIComponent(chat)}`, {}, { timeoutMs: 3_000 });
   if (res.code !== 0) throw new Error('chat_read_failed');
   if (res.data?.chat_mode !== 'group' || res.data?.group_message_type === 'thread') {
     throw new Error('regular_group_only');
@@ -36,6 +36,7 @@ const publicErrors = new Set([
   'ambiguous_manager_marker', 'missing_bot_name', 'bot_name_too_long', 'invalid_app_id',
   'manager_already_set', 'not_current_manager', 'unowned_manager_marker', 'description_too_long',
   'chat_update_failed', 'chat_update_unconfirmed',
+  'human_turn_changed',
 ]);
 
 function failure(error: unknown): { ok: false; reason: string } {
@@ -74,6 +75,7 @@ function managedName(original: string, label: string): string {
  */
 export async function changeChatManager(
   app: string, chat: string, action: 'set' | 'clear', label: string,
+  stillCurrent: () => boolean = () => true,
 ): Promise<ManagerResult> {
   try {
     if (!/^[A-Za-z0-9_-]+$/.test(app)) throw new Error('invalid_app_id');
@@ -81,6 +83,7 @@ export async function changeChatManager(
       const remote = await readManagerChat(app, chat);
       const parsed = parseManagerDescription(remote.description);
       const local = readManagerClaim(app, chat);
+      if (!stillCurrent()) throw new Error('human_turn_changed');
       if (parsed.appId && parsed.appId !== app) {
         throw new Error(action === 'set' ? 'manager_already_set' : 'not_current_manager');
       }
@@ -97,11 +100,12 @@ export async function changeChatManager(
         ? `${remote.description}${remote.description ? '\n' : ''}[botmux:manager=${app}]`
         : parsed.humanText;
       if (Array.from(description).length > 100) throw new Error('description_too_long');
-      const name = action === 'set' ? managedName(remote.name, label)
+      const originalName = local && remote.name === local.managedName ? local.originalName : remote.name;
+      const name = action === 'set' ? managedName(originalName, label)
         : local && remote.name === local.managedName ? local.originalName : remote.name;
       if (action === 'set') writeManagerClaim({
         schemaVersion: 1, larkAppId: app, chatId: chat, enabled: true,
-        originalName: remote.name, managedName: name,
+        originalName, managedName: name,
       });
 
       const result = await getBotClient(app).im.v1.chat.update({

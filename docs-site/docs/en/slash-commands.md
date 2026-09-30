@@ -47,27 +47,17 @@ See [Session & Topic Model](/en/session-model) for the repository-picker and pin
 
 These forms create the topic and select a repository or create a worktree directly, without starting an empty session and switching it afterward. Send the task as the next message in the topic.
 
-## Group Manager (`/manager`)
+## Group manager (Agent tool)
 
-Mention exactly one target bot in a top-level message in a regular group:
+In a regular group, mention the target bot and ask it to run `botmux manager set`, `botmux manager clear`, or `botmux manager status`. The built-in `botmux-chat-manager` skill calls session-scoped IPC; this is not a daemon `/manager` slash command.
 
-| Command | Behavior |
-| --- | --- |
-| `/manager`, `/manager status` | Show the shared manager claim and whether this bot is enabled locally |
-| `/manager set` | Select this bot as manager and append ` · bot name` to the group name |
-| `/manager clear` | Clear this manager; restore the original name unless someone manually renamed the group |
+Mutations require the current human sender to explicitly authorize the action and belong to the target bot's administrator allowlist. A session owner, bot, scheduled task or stale turn is not a substitute. Only the current regular group is supported, excluding automatically managed session groups.
 
-Only the target bot's owner/allowedUsers may set or clear it; an otherwise open bot still requires an explicit administrator allowlist. Talk-authorized users may inspect status. Commands do not create CLI sessions and are not supported in DMs, independent topics, or automatically managed session groups.
+Managers answer talk-authorized top-level messages without a mention, yielding when another member is addressed (@all is not a handoff). The bot name is appended to the group title; clearing preserves manual renames. Existing ambient, never and reply-mode settings remain independent. Manager ownership is a group-level handoff, not a new mention mode or a guarantee that no other bot replies.
 
-The manager answers unmentioned, top-level regular-group messages from talk-authorized humans, but yields when only another member is mentioned. `@all` is not a redirect. Explicit mentions keep their existing behavior. This grants neither additional talk access nor operational permissions to humans or bots.
+Clear the old manager before setting the new one. Each manager-specific mention-free decision verifies the remote description marker with no stale fallback and requires local administrator opt-in. Description overflow is rejected without truncating human text.
 
-To switch, have the old bot's administrator send `@old-bot /manager clear`, then have the new bot's administrator send `@new-bot /manager set`. There is no forced takeover.
-
-Cross-host coordination uses `[botmux:manager=app-id]` in the group description plus a local administrator opt-in. Every manager-only unmentioned response reads the current remote marker; failed reads do not enable this extra addressing path. A marker alone cannot enable a bot. Descriptions exceeding 100 characters are rejected without truncating human text. Long display names retain a saved original for restoration; manual group renames are preserved.
-
-The bot's existing `/reply-mode` still applies. This feature does not create projects, dispatch tasks, share model contexts, or change other bots' reply locations. Independently configured `never`/`ambient` policies and message listeners remain effective after clearing the manager.
-
-Mutations sharing a data directory use a file lock. Lark descriptions have no cross-host conditional update, so simultaneous cross-host claims are not strongly consistent: perform clear/set serially and check `/manager status`. After network errors or `chat_update_unconfirmed`, inspect status before retrying. Local records live in `chat-managers/` under the data directory with file mode `0600`; back them up with that directory. A lost local record is not silently reconstructed from the remote marker.
+Lark has no cross-host conditional writes: concurrent claims are not strongly consistent. After network failures or `chat_update_unconfirmed`, inspect status before retrying. Local records are stored under `chat-managers/` in the data directory with mode 0600; include them in backups.
 
 ## 💬 Reply Mode (`/reply-mode`)
 

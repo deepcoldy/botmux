@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { readProcessStartIdentity, resolveSessionContext } from '../src/core/session-marker.js';
+import { findAuthenticatedAncestorSessionContext, readProcessStartIdentity, resolveSessionContext } from '../src/core/session-marker.js';
 import {
   managedOriginCapabilityPath,
   replaceManagedOriginCapabilityFile,
@@ -54,6 +54,18 @@ describe('resolveSessionContext()', () => {
     }));
     const ctx = resolveSessionContext(dir, 'env-sid', process.pid);
     expect(ctx).toEqual({ sessionId: 'env-sid', turnId: 'turn-9', dispatchAttempt: 2 });
+  });
+
+  it('exposes current-turn capability only through a birth-bound authenticated marker', () => {
+    const procStart = readProcessStartIdentity(process.pid);
+    expect(procStart).toBeTruthy();
+    const marker = { sessionId: 'env-sid', turnId: 'om_live', dispatchAttempt: 1,
+      capability: 'ab'.repeat(32), procStart };
+    writeMarker(process.pid, JSON.stringify(marker));
+    expect(findAuthenticatedAncestorSessionContext(dir, process.pid)).toMatchObject(marker);
+    expect(resolveSessionContext(dir, 'env-sid', process.pid)).not.toHaveProperty('capability');
+    writeMarker(process.pid, JSON.stringify({ ...marker, procStart: 'stale' }));
+    expect(() => findAuthenticatedAncestorSessionContext(dir, process.pid)).toThrow();
   });
 
   it.each([0, -1, 1.5, '2', Number.MAX_SAFE_INTEGER + 1])(

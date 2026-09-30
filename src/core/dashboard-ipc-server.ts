@@ -1,4 +1,5 @@
 // src/core/dashboard-ipc-server.ts
+import { canOperate } from '../im/lark/event-dispatcher.js';
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { execFileSync } from 'node:child_process';
 import { readFileSync, unlinkSync } from 'node:fs';
@@ -300,6 +301,8 @@ import {
 import { clearSessionPreviewTarget } from './session-preview-registry.js';
 import { ChatRenameCooldown, ChatRenameSerialQueue, normalizeLarkChatName } from './chat-rename.js';
 import { executeChatRename } from './chat-rename-operation.js';
+import { authorizeHumanManager } from './human-manager-authorization.js';
+import { changeChatManager, getChatManagerStatus } from '../services/chat-manager.js';
 import type { DaemonToWorker, ScheduledTask, ParsedSchedule, ScheduleExecutionPosition, Session } from '../types.js';
 import { sessionAnchorId, larkTransportEnabled, type DaemonSession } from './types.js';
 import { isRemoteBackendSession } from './persistent-backend.js';
@@ -768,7 +771,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|chat-manager)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -2056,6 +2059,34 @@ ipcRoute('POST', '/api/sessions/:sessionId/slash', async (req, res, params) => {
 
 const proactiveChatRenameCooldown = new ChatRenameCooldown();
 const chatRenameSerialQueue = new ChatRenameSerialQueue();
+
+/** Manager mutations require a current human instruction, even on trusted host IPC. */
+ipcRoute('POST', '/api/sessions/:sessionId/chat-manager', async (req, res, params) => {
+  const body = await readJsonBody<Record<string, unknown>>(req).catch(() => ({} as Record<string, unknown>));
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  if (sessionTransportDisabled(ds)) return jsonRes(res, 400, { ok: false, error: 'no_feishu_transport' });
+  if (ds.chatType !== 'group' || isSessionGroup(ds.chatId)) {
+    return jsonRes(res, 400, { ok: false, error: 'regular_group_only' });
+  }
+  if (body.action === 'status') return jsonRes(res, 200, await getChatManagerStatus(ds.larkAppId, ds.chatId));
+  if (body.action !== 'set' && body.action !== 'clear') return jsonRes(res, 400, { ok: false, error: 'invalid_action' });
+  const { getMessageDetail } = await import('../im/lark/client.js');
+  const { effectiveBotDisplayName } = await import('../bot-registry.js');
+  const human = await authorizeHumanManager({
+    sessionId: ds.session.sessionId, appId: ds.larkAppId, chatId: ds.chatId,
+    action: body.action, claim: body, targetOpenId: getBotOpenId(ds.larkAppId),
+    liveOrigin: () => findActiveBySessionId(params.sessionId)?.managedTurnOrigin,
+    readMessage: getMessageDetail,
+    canOperate: (app, chat, sender) => getBot(app).resolvedAllowedUsers.includes(sender) && canOperate(app, chat, sender),
+  });
+  if (!human.ok) return jsonRes(res, 403, human);
+  const result = await changeChatManager(ds.larkAppId, ds.chatId, body.action,
+    effectiveBotDisplayName(getBot(ds.larkAppId)), human.stillCurrent);
+  return jsonRes(res, result.ok ? 200 : 409, result);
+});
 
 /** Session-scoped external mutation used by the botmux-chat-rename Skill. */
 ipcRoute('POST', '/api/sessions/:sessionId/chat-rename', async (req, res, params) => {

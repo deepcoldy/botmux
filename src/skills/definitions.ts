@@ -1,3 +1,5 @@
+import { CHAT_MANAGER_SKILL } from './chat-manager.js';
+
 /**
  * Canonical skill definitions shipped with botmux.
  *
@@ -1650,6 +1652,7 @@ export const ASK_SKILL_NAME = 'botmux-ask';
 export const WHITEBOARD_SKILL_NAME = 'botmux-whiteboard';
 
 export const BUILTIN_SKILLS: SkillDef[] = [
+  { name: 'botmux-chat-manager', content: CHAT_MANAGER_SKILL },
   { name: 'botmux-chat-rename', content: CHAT_RENAME_SKILL },
   { name: 'botmux-schedule', content: SCHEDULE_SKILL },
   { name: 'botmux-history', content: HISTORY_SKILL },
