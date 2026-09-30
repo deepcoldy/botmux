@@ -1,7 +1,7 @@
 /** Real HTTP IPC router, authorization, journal and sessionReply; only the
  * provider and source daemon transport are replaced. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -39,11 +39,15 @@ const APP = 'cli_report_ipc';
 const CHAT = 'oc_report';
 const CAP = 'c'.repeat(64);
 let root: string;
+let sandbox: string;
 let server: IpcServerHandle;
 let ds: DaemonSession;
 const originalDataDir = config.session.dataDir;
 beforeEach(async () => {
-  root = mkdtempSync(join(tmpdir(), 'report-ipc-'));
+  sandbox = mkdtempSync(join(tmpdir(), 'report-ipc-'));
+  // The report binding secret lives beside dataDir, in a user-owned directory.
+  root = join(sandbox, 'data');
+  mkdirSync(root);
   config.session.dataDir = root;
   mocks.reply.mockReset().mockResolvedValue('om_reply');
   mocks.send.mockReset().mockResolvedValue('om_top');
@@ -73,7 +77,7 @@ beforeEach(async () => {
 afterEach(async () => {
   await server?.close(); setApp(undefined); setIpcAuthSecret(null);
   sessions.clear(); setActiveSessionsRegistry(undefined); config.session.dataDir = originalDataDir;
-  rmSync(root, { recursive: true, force: true });
+  rmSync(sandbox, { recursive: true, force: true });
 });
 async function report(overrides: Record<string, unknown> = {}) {
   const response = await fetch(`http://127.0.0.1:${server.port}/api/report-relay`, {
