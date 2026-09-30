@@ -201,6 +201,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     messageQuotaDefaultLimit: typeof j?.messageQuotaDefaultLimit === 'number' ? j.messageQuotaDefaultLimit : null,
     p2pMode: j?.p2pMode === 'thread' ? 'thread' : j?.p2pMode === 'group' ? 'group' : 'chat',
     envelopeInjection: j?.envelopeInjection === 'auto' ? 'auto' : 'off',
+    topicUnavailablePolicy: j?.topicUnavailablePolicy === 'stop' ? 'stop' : 'legacy',
     replyDelivery: j?.replyDelivery === 'transcript' ? 'transcript' : 'send',
     promptInjection: j?.promptInjection === 'none' ? 'none' : 'default',
     replyDeliveryDefault: j?.replyDeliveryDefault === 'transcript' ? 'transcript' : 'send',

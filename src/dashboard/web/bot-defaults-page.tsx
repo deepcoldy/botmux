@@ -4883,6 +4883,47 @@ export function EnvelopeInjectionSection(props: { bot: BotDefaultsRow; patchBot:
   );
 }
 
+function TopicUnavailablePolicySection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  async function save(value: 'legacy' | 'stop') {
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/topic-unavailable-policy`, { topicUnavailablePolicy: value });
+      if (!res.ok || !res.body.ok) throw new Error(responseErrorText(res));
+      props.patchBot(props.bot.larkAppId, { topicUnavailablePolicy: res.body.topicUnavailablePolicy });
+      setStatus({ text: tr('botDefaults.cardPrefSaved'), ok: true });
+    } catch (error) {
+      setStatus({ text: caughtErrorText(error) });
+    } finally { setBusy(false); }
+  }
+  return (
+    <div className="bd-subsection" data-topic-unavailable-policy>
+      <div className="bd-row">
+        <span>{tr('botDefaults.topicUnavailablePolicy')}</span>
+        <div className="bd-field-title">
+          <DropdownField<'legacy' | 'stop'>
+            dataInput="topic-unavailable-policy"
+            ariaLabel={tr('botDefaults.topicUnavailablePolicy')}
+            disabled={busy}
+            value={props.bot.topicUnavailablePolicy ?? 'legacy'}
+            options={[
+              { value: 'legacy', label: tr('botDefaults.topicUnavailableLegacy') },
+              { value: 'stop', label: tr('botDefaults.topicUnavailableStop') },
+            ]}
+            onChange={value => void save(value)}
+          />
+          <InfoTip>{tr(props.bot.topicUnavailablePolicy === 'stop'
+            ? 'botDefaults.topicUnavailableStopHelp' : 'botDefaults.topicUnavailableHelp')}</InfoTip>
+        </div>
+      </div>
+      <StatusSpan status={status} />
+    </div>
+  );
+}
+
 /** 最终回复投递方式：on = transcript（daemon 从 CLI 转写自动取最终回复，模型不再被
  *  要求 botmux send），off = send（模型自己 botmux send）。开关显示的是生效值：缺省
  *  为 send；两个方向都显式落盘。当前 CLI 没有转写采集通道时开关禁用并说明。 */
@@ -4923,6 +4964,7 @@ export function ReplyDeliverySection(props: { bot: BotDefaultsRow; patchBot: Pat
   return (
     <section className="bd-section" data-reply-delivery>
       <h3 className="bd-section-title">{tr('botDefaults.replyDelivery')}</h3>
+      <TopicUnavailablePolicySection {...props} />
       <ToggleRow
         checked={transcript}
         disabled={busy || !supported || props.bot.promptInjection === 'none'}

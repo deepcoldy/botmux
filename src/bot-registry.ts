@@ -1584,6 +1584,8 @@ export interface BotConfig {
   /** Skip Botmux prompt/skill/context injection and auto-forward final replies.
    * Existing prompt and skill customizations remain saved. */
   promptInjection?: 'default' | 'none';
+  /** Absent preserves existing routing; stop opts into source-topic checks. */
+  topicUnavailablePolicy?: 'legacy' | 'stop';
   /**
    * Whether each forwarded turn carries a `<sender type=… open_id=… name=…
    * email=… />` tag naming who spoke. Default ON (ABSENT ⇒ ON — only an
@@ -3850,6 +3852,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
       // 显式 send / transcript 都保留；缺省按 defaultReplyDeliveryFor 解析。
+      topicUnavailablePolicy: entry.topicUnavailablePolicy === 'stop' ? 'stop' : undefined,
       replyDelivery: entry.replyDelivery === 'transcript' || entry.replyDelivery === 'send' ? entry.replyDelivery : undefined,
       promptInjection: entry.promptInjection === 'none' ? 'none' : undefined,
       // Only the non-default hook mode is persisted; absent, 'off', and invalid

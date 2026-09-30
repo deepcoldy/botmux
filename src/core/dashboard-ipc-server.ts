@@ -6336,6 +6336,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     p2pMode,
     envelopeInjection,
     triggerUserAuth,
+    topicUnavailablePolicy: getBot(cachedLarkAppId).config.topicUnavailablePolicy === 'stop' ? 'stop' : 'legacy',
     replyDelivery,
     replyDeliveryDefault,
     replyDeliverySupported,
@@ -7540,6 +7541,20 @@ ipcRoute('PUT', '/api/bot-envelope-injection', async (req, res) => {
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
   jsonRes(res, 200, { ok: true, envelopeInjection: value ?? 'off' });
+});
+
+ipcRoute('PUT', '/api/bot-topic-unavailable-policy', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { topicUnavailablePolicy?: unknown };
+  try { body = await readJsonBody<{ topicUnavailablePolicy?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const value = body.topicUnavailablePolicy;
+  if (value !== 'legacy' && value !== 'stop') return jsonRes(res, 400, { ok: false, error: 'invalid_topic_unavailable_policy' });
+  const spec = findConfigField('topicUnavailablePolicy');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const result = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+  jsonRes(res, 200, { ok: true, topicUnavailablePolicy: getBot(cachedLarkAppId).config.topicUnavailablePolicy ?? 'legacy' });
 });
 
 // Per-bot 最终回复投递方式 replyDelivery。Body `{ replyDelivery: 'transcript'|'send'|'' }`:

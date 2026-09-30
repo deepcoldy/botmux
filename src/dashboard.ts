@@ -7629,6 +7629,23 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // Per-bot original-topic policy, proxied through the existing config store.
+    let mBotTopicUnavailablePolicy: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotTopicUnavailablePolicy = url.pathname.match(/^\/api\/bots\/([^/]+)\/topic-unavailable-policy$/))) {
+      const appId = decodeURIComponent(mBotTopicUnavailablePolicy[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-topic-unavailable-policy`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/reply-delivery — proxy to that bot's daemon.
     // Body `{ replyDelivery: 'transcript'|'send'|'' }` (''/other clears back to
     // the default send). 最终回复投递方式的 per-bot 开关；'send' 与 'transcript'

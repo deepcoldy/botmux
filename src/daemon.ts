@@ -207,6 +207,8 @@ import {
   storedSessionAnchorId,
   larkTransportEnabled,
 } from './core/types.js';
+import { assertSendTopicsAvailable } from './cli/topic-send-guard.js';
+import { getMessageDetail as getTopicMessageDetail } from './im/lark/client.js';
 import { computeSoloSessionForBot, effectiveReplyDelivery } from './core/reply-delivery.js';
 import {
   bindPrincipalLaneAdmissionKeys,
@@ -4056,9 +4058,12 @@ async function sessionReply(
     type: string,
     replyInThread: boolean,
     uuid?: string,
-  ): Promise<string> => persistPrincipalLaneOutbound(await (outboundOptions
-    ? replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext, outboundOptions)
-    : replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext)));
+  ): Promise<string> => {
+    await assertSendTopicsAvailable(appId, [messageId], getTopicMessageDetail, getBot(appId).config.topicUnavailablePolicy);
+    return persistPrincipalLaneOutbound(await (outboundOptions
+      ? replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext, outboundOptions)
+      : replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext)));
+  };
 
   // Chat-scope: post a plain message to the chat. No reply_in_thread → keeps
   // the conversation flat in 普通群. The card layer carries chatId in its button
@@ -4086,7 +4091,7 @@ async function sessionReply(
           opts.uuid,
         );
       } catch (err) {
-        if (!(err instanceof MessageWithdrawnError)) throw err;
+        if (!(err instanceof MessageWithdrawnError) || getBot(appId).config.topicUnavailablePolicy === 'stop') throw err;
         await opts.beforeQuoteFallback?.();
         logger.warn(
           `[routing] VC IM quote target withdrawn (${opts.quoteMessageId}); `

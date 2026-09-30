@@ -163,6 +163,7 @@ export type BotDefaultsRow = {
   envelopeInjection?: 'auto' | 'off' | null;
   /** 最终回复投递方式的**生效值**（显式配置，否则按 CLI 缺省）。'transcript' = daemon
    *  从 CLI 转写自动取最终回复，模型不再被要求 botmux send；'send' = 模型自己 botmux send。 */
+  topicUnavailablePolicy?: 'legacy' | 'stop';
   replyDelivery?: 'send' | 'transcript' | null;
   promptInjection?: 'default' | 'none';
   /** 当前 cliId 的缺省投递方式；目前统一为 'send'。 */
