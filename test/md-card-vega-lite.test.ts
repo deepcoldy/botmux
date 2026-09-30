@@ -10,6 +10,7 @@ import {
   type CardRenderDiagnostic,
 } from '../src/im/lark/md-card.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../src/im/lark/turn-reply-card-size.js';
+import { attachOncallGroupButton } from '../src/im/lark/oncall-group.js';
 
 const chart = (title: string, values: unknown[] = [{ d: 'a', v: 1 }, { d: 'b', v: 2 }]) => [
   '```vega-lite',
@@ -74,6 +75,25 @@ describe('buildCardBodyElements · vega-lite fences', () => {
         buildContextualReplyCard({ title: 't', assistantText: markdown, assistantLabel: 'bot', workingDir: '/', localHomeLinkMode: 'disabled' }),
       ]) {
         expect(turnReplyCardRequestBytes(json, `oc_${'0'.repeat(32)}`)).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
+      }
+    }
+  });
+
+  it('stays under 30KB after the daemon attaches the on-call button', () => {
+    // Reachable input from review: two ~366-row charts whose labels carry
+    // quotes and CJK, fitted inside the builder and then decorated.
+    const chatId = `oc_${'a'.repeat(32)}`;
+    const policy = { enabled: true, chatIds: [chatId] };
+    for (const rowsPerChart of [300, 340, 366, 380]) {
+      const values = Array.from({ length: rowsPerChart }, (_, i) => ({ d: `标签"${i}"`, v: i }));
+      const markdown = [chart('A', values), chart('B', values)].join('\n\n');
+      for (const built of [
+        buildCanonicalFinalReplyCard({ markdown, workingDir: '/', localHomeLinkMode: 'disabled' }),
+        buildContextualReplyCard({ title: 't', assistantText: markdown, assistantLabel: 'bot', workingDir: '/', localHomeLinkMode: 'disabled' }),
+      ]) {
+        const decorated = attachOncallGroupButton(built, policy, chatId, 'group');
+        expect(decorated).not.toBe(built);
+        expect(turnReplyCardRequestBytes(decorated, chatId)).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
       }
     }
   });

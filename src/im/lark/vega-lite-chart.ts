@@ -43,7 +43,7 @@ type Row = Record<string, Scalar>;
 
 export type VegaLiteConversion =
   | { ok: true; element: Record<string, unknown>; title?: string }
-  | { ok: false; reason: string; title?: string; rows?: Row[] };
+  | { ok: false; reason: string; title?: string; rows?: Row[]; totalRows?: number };
 
 const TOP_LEVEL_KEYS = new Set(['$schema', 'title', 'description', 'data', 'mark', 'encoding', 'width', 'height']);
 const ENCODING_CHANNELS = new Set(['x', 'y', 'color', 'theta']);
@@ -61,7 +61,7 @@ const FORBIDDEN_DEEP_KEYS: Record<string, string> = {
 };
 
 class Unsupported extends Error {
-  constructor(readonly reason: string, readonly rows?: Row[]) { super(reason); }
+  constructor(readonly reason: string, readonly rows?: Row[], readonly totalRows?: number) { super(reason); }
 }
 
 /** Reason codes embed fragments of the source JSON (keys, mark names). Keep
@@ -121,7 +121,7 @@ function readRows(data: unknown): Row[] {
     // Too many points to chart, but the leading rows are still worth showing.
     let head: Row[] | undefined;
     try { head = parseRows(data.values.slice(0, DEGRADED_TABLE_MAX_ROWS)); } catch { head = undefined; }
-    throw new Unsupported('too_many_data_points', head);
+    throw new Unsupported('too_many_data_points', head, data.values.length);
   }
   return parseRows(data.values);
 }
@@ -262,12 +262,16 @@ export function convertVegaLiteFence(source: string): VegaLiteConversion {
   if (!isPlainObject(spec)) return { ok: false, reason: 'spec_json_invalid' };
   const title = readTitle(spec.title);
   let rows: Row[] | undefined;
+  let totalRows: number | undefined;
   try {
     const forbidden = findForbiddenSpecKey(spec);
     if (forbidden) {
       // Keep inline rows for the degraded table only when they are plainly
       // readable; a spec that also points at remote data yields none.
-      try { rows = readRows(spec.data); } catch (rowError) { rows = rowError instanceof Unsupported ? rowError.rows : undefined; }
+      try { rows = readRows(spec.data); } catch (rowError) {
+        rows = rowError instanceof Unsupported ? rowError.rows : undefined;
+        totalRows = rowError instanceof Unsupported ? rowError.totalRows : undefined;
+      }
       throw new Unsupported(forbidden);
     }
     for (const key of Object.keys(spec)) {
@@ -279,7 +283,14 @@ export function convertVegaLiteFence(source: string): VegaLiteConversion {
   } catch (error) {
     const reason = error instanceof Unsupported ? error.reason : 'spec_invalid';
     const kept = rows ?? (error instanceof Unsupported ? error.rows : undefined);
-    return { ok: false, reason, ...(title ? { title } : {}), ...(kept ? { rows: kept } : {}) };
+    const total = totalRows ?? (error instanceof Unsupported ? error.totalRows : undefined);
+    return {
+      ok: false,
+      reason,
+      ...(title ? { title } : {}),
+      ...(kept ? { rows: kept } : {}),
+      ...(kept && total !== undefined ? { totalRows: total } : {}),
+    };
   }
 }
 
@@ -325,8 +336,10 @@ export function degradedVegaLiteElements(
     })),
     rows: visible.map(row => Object.fromEntries(keys.map((key, index) => [`c${index}`, plainCell(row[key])]))),
   });
-  if (rows.length > visible.length) {
-    elements.push({ tag: 'markdown', content: `<font color='grey'>共 ${rows.length} 行，仅展示前 ${visible.length} 行。</font>` });
+  // Report the source row count, not the rows we happened to keep.
+  const total = Math.max(result.totalRows ?? 0, rows.length);
+  if (total > visible.length) {
+    elements.push({ tag: 'markdown', content: `<font color='grey'>共 ${total} 行，仅展示前 ${visible.length} 行。</font>` });
   }
   return elements;
 }

@@ -8402,6 +8402,7 @@ import {
   buildImageCardElements,
   buildReplyCardFooter,
   buildCardBodyElements,
+  CARD_LATE_CHROME_RESERVE_BYTES,
   createReplyCard,
   fitChartsToCardBudget,
   extractFirstReplyCardHeading,
@@ -9089,7 +9090,7 @@ async function sendDryRun(rest: string[]): Promise<void> {
     : configuredLinkMode === 'lexical' ? 'lexical' : 'filesystem';
   const card = createReplyCard(buildCardBodyElements(content, process.cwd(), localHomeLinkMode, undefined, diagnostics));
   // Same sizing as a real send: Feishu request body incl. envelope.
-  const budget = fitChartsToCardBudget(card, { reserveBytes: 2_000, diagnostics });
+  const budget = fitChartsToCardBudget(card, { reserveBytes: CARD_LATE_CHROME_RESERVE_BYTES, diagnostics });
   reportCardRenderDiagnostics(diagnostics);
   if (!budget.fits) console.error(`botmux send --dry-run: 卡片请求体约 ${budget.bytes} 字节，超过飞书 30KB 上限，发送时可能被拒收`);
   console.log(JSON.stringify({ dryRun: true, bytes: budget.bytes, fits: budget.fits, diagnostics, card }, null, 2));
@@ -11600,7 +11601,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       // blocks delivery — the sender learns why on stderr.
       const budget = fitChartsToCardBudget(canonicalCard, {
         chatId: targetChatId,
-        reserveBytes: 2_000,
+        reserveBytes: CARD_LATE_CHROME_RESERVE_BYTES,
         diagnostics: renderDiagnostics,
       });
       reportCardRenderDiagnostics(renderDiagnostics);

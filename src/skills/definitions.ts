@@ -506,7 +506,7 @@ botmux send --videos /tmp/replay.mp4 --video-covers /tmp/cover.png --no-mention 
 
 - 数据只能用 \`data.values\` 内联（≤500 行，值为字符串 / 数字 / 布尔 / null）；\`data.url\`、\`transform\`、\`params\`、\`expr\`、\`signal\`、\`datasets\`、\`layer\` 等一律不支持。
 - \`mark\` 取 \`bar\` / \`line\` / \`area\` / \`point\` / \`arc\`；编码只用 \`x\` / \`y\` / \`color\` / \`theta\`（字段写 \`field\`、\`type\`、\`title\`，不支持 \`aggregate\` 等，先把数据聚合好再画）。
-- 饼图用 \`mark: arc\` + \`theta\`（数值）+ \`color\`（类别）；\`mark: {type: arc, innerRadius: 40}\` 是环图。
+- 饼图用 \`mark: arc\` + \`theta\`（数值）+ \`color\`（类别），不要写 \`x\`/\`y\`，\`theta\` 不带 \`title\`；\`mark: {type: arc, innerRadius: 40}\` 是环图。
 - \`x\`/\`y\` 的 \`title\` 是坐标轴标题，\`color\` 的 \`title\` 是图例标题；\`temporal\` 不解析日期，按给定顺序当类别画，先排好序。
 - 每张卡片最多 5 个图表；整张卡片的飞书请求体上限是 30KB，放不下时图表会逐级降级（图表 → 50 行表 → 10 行表 → 只留说明）。不支持或降级的图表在 stderr 给出原因；消息照常发出。发之前可以用 \`--dry-run\` 看 \`bytes\` / \`fits\`。
 

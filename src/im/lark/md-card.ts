@@ -46,6 +46,13 @@ import {
   type VegaLiteConversion,
 } from './vega-lite-chart.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
+import { logger } from '../../utils/logger.js';
+
+/** Room kept for chrome that callers attach *after* a card is built and
+ * fitted — today the on-call group button (≈483B of request body), added by
+ * `attachOncallGroupButton` in both `botmux send` and the daemon. Reserved
+ * unconditionally; it costs nothing when no button is attached. */
+export const CARD_LATE_CHROME_RESERVE_BYTES = 2_000;
 
 export type { CardRenderDiagnostic } from './vega-lite-chart.js';
 
@@ -1178,6 +1185,20 @@ export function fitChartsToCardBudget(
   }
 }
 
+/** Budget pass for cards built inside this module and delivered by the
+ * daemon. Reserves room for late chrome (on-call button) and makes chart
+ * degradation or an unfixable overflow observable in the daemon log. */
+function fitBuiltCard(card: { body?: { elements?: any[] } }, label: string): void {
+  const diagnostics: CardRenderDiagnostic[] = [];
+  const result = fitChartsToCardBudget(card, { reserveBytes: CARD_LATE_CHROME_RESERVE_BYTES, diagnostics });
+  if (!result.fits) {
+    logger.warn(`[card] ${label}: request body ~${result.bytes}B still exceeds Feishu's 30KB card limit after chart degradation`);
+  }
+  if (diagnostics.length > 0) {
+    logger.warn(`[card] ${label}: degraded charts: ${diagnostics.map(item => item.reason).join(', ')}`);
+  }
+}
+
 // Existing multi-image rows retain their legacy payload for compatibility.
 function singleImgElement(imgKey: string): any {
   return { tag: 'img', img_key: imgKey, alt: { tag: 'plain_text', content: '' }, mode: 'fit_horizontal', preview: true };
@@ -1399,6 +1420,8 @@ export function hasMarkdown(text: string): boolean {
  * suppressed, else custom. When brand, usage, and recipient are all absent the
  * whole footer (HR included) is omitted.
  */
+// No production send path calls buildMarkdownCard today (tests only); the
+// budget pass is kept so a future caller cannot reopen the 30KB gap.
 export function buildMarkdownCard(
   md: string,
   recipientOpenId?: string,
@@ -1421,7 +1444,7 @@ export function buildMarkdownCard(
     elements.push(footer.element);
   }
   const card = createReplyCard(elements);
-  fitChartsToCardBudget(card);
+  fitBuiltCard(card, 'markdown_card');
   return JSON.stringify(card);
 }
 
@@ -1453,7 +1476,7 @@ export function buildCanonicalFinalReplyCard(opts: {
   });
   if (footer) elements.push({ tag: 'hr' }, footer.element);
   const card = createReplyCard(elements);
-  fitChartsToCardBudget(card);
+  fitBuiltCard(card, 'final_reply');
   return JSON.stringify(card);
 }
 
@@ -1551,6 +1574,6 @@ export function buildContextualReplyCard(opts: {
   }
 
   const card = createReplyCard(elements);
-  fitChartsToCardBudget(card);
+  fitBuiltCard(card, 'contextual_reply');
   return JSON.stringify(card);
 }

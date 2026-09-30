@@ -71,7 +71,7 @@ The card body is a **live screenshot (image)** of the terminal, not text renderi
 A ` ```vega-lite ` fence in a `botmux send` body renders as a native Feishu Card 2.0 chart; other channels such as a Web view can render the same Vega-Lite directly. Supported subset:
 
 - Inline `data.values` only, at most 500 rows, values are string / number / boolean / null.
-- `mark`: `bar` (horizontal when only x is quantitative), `line`, `area`, `point`, `arc` (pie; `innerRadius > 0` for a donut).
+- `mark`: `bar` (horizontal when only x is quantitative), `line`, `area`, `point`, `arc` (pie; `innerRadius > 0` for a donut). A pie takes only `theta` (value) + `color` (category); `x`/`y` are rejected and `theta` has no `title`.
 - Encoding channels: `x`, `y`, `color` (series), `theta` (pie value); each channel accepts only `field`, `type`, `title`. `x`/`y` titles become axis titles and the `color` title becomes the legend title. `type: temporal` is not parsed as a date: values are shown as categories in the given order, so sort them first.
 - At most 5 charts per card. The real limit is Feishu's **30KB card message request body** (including the envelope and the re-serialized `content`): once the card is assembled, charts that do not fit step down chart → 50-row data table → 10-row data table → notice only until the card fits. A single spec source is also capped at 30KB for parsing.
 

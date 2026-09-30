@@ -119,6 +119,10 @@ describe('convertVegaLiteFence', () => {
     expect(tooMany).toMatchObject({ ok: false, reason: 'too_many_data_points' });
     // The leading rows survive for the degraded table.
     expect(tooMany.ok === false && tooMany.rows?.length).toBe(50);
+    expect(tooMany.ok === false && tooMany.totalRows).toBe(MAX_VEGA_LITE_ROWS + 1);
+    // The notice reports the source row count even when shown at 10 rows.
+    const notice = degradedVegaLiteElements(tooMany as Extract<typeof tooMany, { ok: false }>, 10).at(-1) as { content: string };
+    expect(notice.content).toContain(`共 ${MAX_VEGA_LITE_ROWS + 1} 行，仅展示前 10 行`);
   });
 
   it('keeps readable inline rows for the degraded table, but none for remote-only data', () => {
