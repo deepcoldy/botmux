@@ -250,5 +250,11 @@ describe('Frozen Command business cards', () => {
     expect(buildFrozenCommandLifecycleStatusCard({
       command: '旧日报', action: 'retire', status: 'cancelled',
     })).toMatchObject({ header: { template: 'grey' } });
+    expect(buildFrozenCommandLifecycleStatusCard({
+      command: '日报', action: 'approve', updating: false, status: 'confirmed',
+    })).toMatchObject({ header: { title: { content: '创建完成' } } });
+    expect(buildFrozenCommandLifecycleStatusCard({
+      command: '日报', action: 'approve', updating: true, status: 'confirmed',
+    })).toMatchObject({ header: { title: { content: '更新完成' } } });
   });
 });

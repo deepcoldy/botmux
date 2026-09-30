@@ -315,6 +315,7 @@ output: { format: markdown }
       actor: ACTOR,
       actorIsAdmin: true,
     });
+    expect(initial.confirmedUpdating).toBe(false);
     const candidate = ACTIVE.replace('SELECT {{value}} AS probe_value', 'SELECT {{value}} + 1 AS probe_value');
     const pending = prepareFrozenCommandTransition({
       dataDir: input.dataDir,
@@ -346,6 +347,7 @@ output: { format: markdown }
       token: pending.token,
       actor: ACTOR,
     });
+    expect(updated.confirmedUpdating).toBe(true);
     expect(updated.ownerUnionId).toBe(ACTOR.unionId);
     expect(updated.state).toBe('active');
     expect(readFileSync(input.file, 'utf8')).toBe(candidate);

@@ -5885,18 +5885,26 @@ async function routeFrozenCommand(input: {
     larkAppId: input.larkAppId,
   });
   const invocationNow = new Date();
+  const trustedCaller = trustedCallerForTurn(
+    input.larkAppId,
+    input.senderOpenId,
+    input.senderUnionId,
+    input.senderIsBot,
+  );
+  const outputAudit = {
+    targetLarkAppId: input.larkAppId,
+    trustedCaller,
+    turnId: input.turnId,
+    ...(lifecycle.record.specHash ? { specHash: lifecycle.record.specHash } : {}),
+    stateRevisionId: lifecycle.record.stateRevisionId,
+  };
   try {
     const result = await executeFrozenCommand({
       definition,
       rawArgs,
       targetLarkAppId: input.larkAppId,
       botConfig: getBot(input.larkAppId).config,
-      trustedCaller: trustedCallerForTurn(
-        input.larkAppId,
-        input.senderOpenId,
-        input.senderUnionId,
-        input.senderIsBot,
-      ),
+      trustedCaller,
       turnId: input.turnId,
       dataDir: config.session.dataDir,
       now: invocationNow,
@@ -5921,6 +5929,7 @@ async function routeFrozenCommand(input: {
       source: 'direct',
       result,
       now: invocationNow,
+      audit: outputAudit,
     });
     if (output.kind === 'handoff') return output;
     const renderedReply = renderFrozenCommandLarkReply(output.presentation, input.workingDir);
@@ -5934,6 +5943,7 @@ async function routeFrozenCommand(input: {
         source: 'direct',
         error,
         now: invocationNow,
+        audit: outputAudit,
       });
       if (output.kind === 'handoff') return output;
     } catch (decisionError) {
@@ -6648,17 +6658,25 @@ async function executeClaimedFrozenCommandAction(action: FrozenCommandActionReco
     if (JSON.stringify(normalized) !== JSON.stringify(action.normalizedArgs)) {
       throw new FrozenCommandError('command_preview_changed', '命令参数已变化，请重新发起');
     }
+    const trustedCaller = {
+      requestUserOpenId: action.actorOpenId,
+      requestUserUnionId: action.actorUnionId,
+      requestLarkAppId: action.targetBotId,
+      senderType: 'user' as const,
+    };
+    const outputAudit = {
+      targetLarkAppId: action.targetBotId,
+      trustedCaller,
+      turnId: `frozen-action:${action.id}`,
+      specHash: action.specHash,
+      stateRevisionId: action.revisionId,
+    };
     const result = await executeFrozenCommand({
       definition: lookup.snapshot.definition,
       rawArgs: action.rawArgs,
       targetLarkAppId: action.targetBotId,
       botConfig: getBot(action.targetBotId).config,
-      trustedCaller: {
-        requestUserOpenId: action.actorOpenId,
-        requestUserUnionId: action.actorUnionId,
-        requestLarkAppId: action.targetBotId,
-        senderType: 'user',
-      },
+      trustedCaller,
       turnId: `frozen-action:${action.id}`,
       dataDir: config.session.dataDir,
       workingDir: action.workingDir,
@@ -6679,6 +6697,7 @@ async function executeClaimedFrozenCommandAction(action: FrozenCommandActionReco
       rawArgs: action.rawArgs,
       source: 'confirmed',
       result,
+      audit: outputAudit,
     });
     const renderedReply = output.kind === 'deliver'
       ? renderFrozenCommandLarkReply(output.presentation, action.workingDir)
@@ -6700,11 +6719,24 @@ async function executeClaimedFrozenCommandAction(action: FrozenCommandActionReco
     const lookup = lookupFrozenCommand({ workingDir: action.workingDir, command: action.command });
     if (lookup.kind === 'found') {
       try {
+        const trustedCaller = {
+          requestUserOpenId: action.actorOpenId,
+          requestUserUnionId: action.actorUnionId,
+          requestLarkAppId: action.targetBotId,
+          senderType: 'user' as const,
+        };
         const output = resolveFrozenCommandOutput({
           definition: lookup.snapshot.definition,
           rawArgs: action.rawArgs,
           source: 'confirmed',
           error,
+          audit: {
+            targetLarkAppId: action.targetBotId,
+            trustedCaller,
+            turnId: `frozen-action:${action.id}`,
+            specHash: action.specHash,
+            stateRevisionId: action.revisionId,
+          },
         });
         if (output.kind === 'handoff') {
           handoffConfirmedFrozenCommandAction(action, output.prompt);
@@ -6801,6 +6833,7 @@ async function handleFrozenCommandCardAction(
           data: buildFrozenCommandLifecycleStatusCard({
             command: record.command,
             action: record.confirmedAction ?? 'approve',
+            updating: record.confirmedUpdating,
             status: 'confirmed',
           }),
         },

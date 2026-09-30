@@ -20,6 +20,7 @@ import {
   sanitizeFrozenCommandMarkdown,
   userFacingFrozenCommandError,
 } from '../src/services/frozen-command.js';
+import { logger } from '../src/utils/logger.js';
 
 const dirs: string[] = [];
 
@@ -242,6 +243,20 @@ executors:
     writeFileSync(join(deprecatedRoot, '.botmux', 'commands', '泰国上账.yaml'), `${BASE}\nonError: fallback_llm\n`);
     const deprecated = lookupFrozenCommand({ workingDir: deprecatedRoot, command: '/泰国上账' });
     expect(deprecated).toMatchObject({ kind: 'invalid', error: { message: expect.stringContaining('onError 已废弃') } });
+
+    const aggregatedRoot = join(tmpdir(), `botmux-frozen-deprecated-all-${process.pid}`);
+    dirs.push(aggregatedRoot);
+    mkdirSync(join(aggregatedRoot, '.botmux', 'commands'), { recursive: true });
+    const aggregatedYaml = BASE
+      .replace('steps:\n', 'executor: test.plugin.readonly\ninput: {}\nonError: fallback_llm\nsteps:\n')
+      .replace('  format: markdown', '  format: markdown\n  prefix: legacy\n  suffix: legacy\n  else: legacy');
+    writeFileSync(join(aggregatedRoot, '.botmux', 'commands', '泰国上账.yaml'), aggregatedYaml);
+    const aggregated = lookupFrozenCommand({ workingDir: aggregatedRoot, command: '/泰国上账' });
+    expect(aggregated).toMatchObject({ kind: 'invalid', error: { code: 'definition_deprecated_field' } });
+    if (aggregated.kind !== 'invalid') throw new Error('expected deprecated definition');
+    for (const field of ['executor', 'input', 'onError', 'output.prefix', 'output.suffix', 'output.else']) {
+      expect(aggregated.error.message).toContain(`${field} 已废弃`);
+    }
   });
 
   it('requires exactly one rule action and a step-qualified q namespace', () => {
@@ -731,6 +746,94 @@ executors:
     expect(isTransientPluginToolFailure('memory limit exceeded')).toBe(false);
     expect(userFacingFrozenCommandError(new FrozenCommandError('provider_validation_failed', 'private template')))
       .not.toContain('private template');
+  });
+
+  it('audits rejected arguments without recording their values', async () => {
+    const { root, definition } = fixture();
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    await expect(executeFrozenCommand({
+      definition,
+      rawArgs: '0',
+      targetLarkAppId: 'cli_test',
+      botConfig: { plugins: ['data-mcp'], larkAppId: 'cli_test', larkAppSecret: 'secret' },
+      trustedCaller: {
+        requestUserOpenId: 'ou_test', requestUserUnionId: 'on_test', requestLarkAppId: 'cli_test', senderType: 'user',
+      },
+      turnId: 'om_rejected',
+      dataDir: join(root, 'data'),
+      audit: { source: 'direct', specHash: 'spec', stateRevisionId: 'revision' },
+    })).rejects.toMatchObject({ code: 'parameter_integer_out_of_range' });
+
+    const audit = warn.mock.calls.find(([message, details]) =>
+      message === '[frozen-command:audit]'
+      && (details as Record<string, unknown>)?.event === 'frozen_command_invocation')?.[1] as Record<string, unknown>;
+    expect(audit).toMatchObject({
+      status: 'rejected',
+      phase: 'preflight',
+      command: '泰国上账',
+      caller_open_id: 'ou_test',
+      turn_id: 'om_rejected',
+      error_code: 'parameter_integer_out_of_range',
+      normalized_params: [],
+    });
+    expect(audit).not.toHaveProperty('raw_args');
+  });
+
+  it('shows and audits output-rule configuration errors without suggesting a retry', () => {
+    const { definition } = fixture(BASE.replace('  format: markdown', `  format: markdown
+  rules:
+    - when: "{{q.main.amount}} > 0"
+      show: result`));
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const result = {
+      ...successResult(),
+      projectedResult: { amount: '1164', row_count: 1 },
+      steps: [{
+        id: 'main',
+        executorId: 'test.plugin.readonly',
+        executorRevision: 'revision',
+        rendererId: 'builtin.table',
+        status: 'ok' as const,
+        text: 'amount：1164',
+        executionId: 'exec-v2',
+        projectedResult: { amount: '1164', row_count: 1 },
+        businessResult: { rows: [{ amount: '1164' }], totalRows: 1 },
+      }],
+    };
+
+    let caught: unknown;
+    try {
+      resolveFrozenCommandOutput({
+        definition,
+        rawArgs: '7',
+        source: 'direct',
+        result,
+        audit: {
+          targetLarkAppId: 'cli_test',
+          trustedCaller: {
+            requestUserOpenId: 'ou_test', requestUserUnionId: 'on_test', requestLarkAppId: 'cli_test', senderType: 'user',
+          },
+          turnId: 'om_rule',
+          specHash: 'spec',
+          stateRevisionId: 'revision',
+        },
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toMatchObject({ code: 'conditional_output_type_mismatch' });
+    expect(userFacingFrozenCommandError(caught)).toBe('固化命令输出规则配置错误，请联系维护方。');
+    const audit = warn.mock.calls.find(([message, details]) =>
+      message === '[frozen-command:audit]'
+      && (details as Record<string, unknown>)?.event === 'frozen_command_output_decision')?.[1];
+    expect(audit).toMatchObject({
+      status: 'failed',
+      execution_id: 'exec-v2',
+      command: '泰国上账',
+      caller_open_id: 'ou_test',
+      turn_id: 'om_rule',
+      error_code: 'conditional_output_type_mismatch',
+    });
   });
 
   it('lists definitions without SQL and rejects symlink definitions', () => {

@@ -358,9 +358,13 @@ export function buildFrozenCommandLifecyclePreviewCard(input: {
 export function buildFrozenCommandLifecycleStatusCard(input: {
   command: string;
   action: FrozenCommandLifecycleAction;
+  updating?: boolean;
   status: 'confirmed' | 'cancelled' | 'expired' | 'failed';
 }): Record<string, unknown> {
-  const presentation = lifecyclePresentation({ action: input.action });
+  const presentation = lifecyclePresentation({
+    action: input.action,
+    ...(input.updating ? { expectedRevisionId: 'existing' } : {}),
+  });
   const state = input.status === 'confirmed'
     ? { title: `${presentation.verb}完成`, template: 'green', text: `/${input.command} 已完成${presentation.verb}。` }
     : input.status === 'cancelled'

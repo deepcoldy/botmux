@@ -58,6 +58,7 @@ export interface FrozenCommandLifecycleRecord {
   sourceYaml?: string;
   updatedAt: string;
   confirmedAction?: FrozenCommandLifecycleAction;
+  confirmedUpdating?: boolean;
 }
 
 export type FrozenCommandGate =
@@ -894,6 +895,7 @@ export function confirmFrozenCommandTransition(input: {
     return {
       ...selectRecord(db, pending.target_bot_id, pending.command_path, pending.command)!,
       confirmedAction: pending.action,
+      confirmedUpdating: pending.action === 'approve' && pending.expected_revision_id !== null,
     };
   }));
   // State + audit commit first. A crash or write failure leaves a more

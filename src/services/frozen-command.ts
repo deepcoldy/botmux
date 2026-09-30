@@ -337,6 +337,14 @@ export interface FrozenCommandExecutionAuditContext {
   taskId?: string;
 }
 
+export interface FrozenCommandOutputDecisionAuditContext {
+  targetLarkAppId: string;
+  trustedCaller?: TrustedCaller;
+  turnId: string;
+  specHash?: string;
+  stateRevisionId?: string;
+}
+
 export type FrozenCommandLookup =
   | { kind: 'missing'; command: string }
   | { kind: 'invalid'; command: string; error: FrozenCommandError }
@@ -733,8 +741,24 @@ function parseDefinition(raw: string, command: string): FrozenCommandDefinition 
     input: 'input 已废弃，请改用 steps[].input',
     onError: 'onError 已废弃，请改用 output.rules',
   };
-  for (const [field, message] of Object.entries(deprecatedTopLevelFields)) {
-    if (Object.hasOwn(value, field)) throw new FrozenCommandError('definition_deprecated_field', message);
+  const deprecatedOutputFields: Record<string, string> = {
+    text: 'output.text 已废弃，请改用 output.rules[].show',
+    prefix: 'output.prefix 已废弃，请改用 output.rules[].show',
+    suffix: 'output.suffix 已废弃，请改用 output.rules[].show',
+    else: 'output.else 已废弃，请改用有序 output.rules',
+    when: 'output.when 已废弃，请改用 output.rules[].when',
+    handoff: 'output.handoff 已废弃，请改用 output.rules[].handoff',
+  };
+  const deprecatedMessages = Object.entries(deprecatedTopLevelFields)
+    .filter(([field]) => Object.hasOwn(value, field))
+    .map(([, message]) => message);
+  if (isPlainObject(value.output)) {
+    deprecatedMessages.push(...Object.entries(deprecatedOutputFields)
+      .filter(([field]) => Object.hasOwn(value.output as Record<string, unknown>, field))
+      .map(([, message]) => message));
+  }
+  if (deprecatedMessages.length > 0) {
+    throw new FrozenCommandError('definition_deprecated_field', deprecatedMessages.join('；'));
   }
   onlyKeys(value, [
     'schemaVersion', 'status', 'name', 'description', 'timezone', 'steps', 'params',
@@ -847,17 +871,6 @@ function parseDefinition(raw: string, command: string): FrozenCommandDefinition 
   let output: FrozenCommandDefinition['output'] = { format: 'markdown', rules: [] };
   if (value.output !== undefined) {
     if (!isPlainObject(value.output)) throw new FrozenCommandError('definition_invalid_output', 'output 必须是对象');
-    const deprecatedOutputFields: Record<string, string> = {
-      text: 'output.text 已废弃，请改用 output.rules[].show',
-      prefix: 'output.prefix 已废弃，请改用 output.rules[].show',
-      suffix: 'output.suffix 已废弃，请改用 output.rules[].show',
-      else: 'output.else 已废弃，请改用有序 output.rules',
-      when: 'output.when 已废弃，请改用 output.rules[].when',
-      handoff: 'output.handoff 已废弃，请改用 output.rules[].handoff',
-    };
-    for (const [field, message] of Object.entries(deprecatedOutputFields)) {
-      if (Object.hasOwn(value.output, field)) throw new FrozenCommandError('definition_deprecated_field', message);
-    }
     onlyKeys(value.output, ['format', 'rules'], 'output');
     const format = value.output.format ?? 'markdown';
     if (format !== 'text' && format !== 'markdown') {
@@ -1411,7 +1424,7 @@ function truncateFrozenHandoff(body: string, notice: string, maxChars: number): 
   return `${body.slice(0, keep)}${reserved}`;
 }
 
-export function resolveFrozenCommandOutput(input: {
+export interface FrozenCommandOutputResolutionInput {
   definition: FrozenCommandDefinition;
   rawArgs: string;
   source: 'direct' | 'confirmed' | 'schedule';
@@ -1419,7 +1432,10 @@ export function resolveFrozenCommandOutput(input: {
   result?: FrozenCommandExecutionResult;
   error?: unknown;
   now?: Date;
-}): FrozenCommandResolvedOutput {
+  audit?: FrozenCommandOutputDecisionAuditContext;
+}
+
+function resolveFrozenCommandOutputInternal(input: FrozenCommandOutputResolutionInput): FrozenCommandResolvedOutput {
   const { definition, result, error } = input;
   if ((result === undefined) === (error === undefined)) {
     throw new FrozenCommandError('output_decision_invalid', '输出决策必须且只能包含执行结果或执行错误');
@@ -1595,6 +1611,33 @@ export function resolveFrozenCommandOutput(input: {
   return { kind: 'deliver', text: result!.text, presentation: result!.presentation };
 }
 
+export function resolveFrozenCommandOutput(input: FrozenCommandOutputResolutionInput): FrozenCommandResolvedOutput {
+  try {
+    return resolveFrozenCommandOutputInternal(input);
+  } catch (error) {
+    if (input.audit && error !== input.error) {
+      logger.warn('[frozen-command:audit]', {
+        event: 'frozen_command_output_decision',
+        status: 'failed',
+        execution_id: input.result?.executionId
+          ?? (input.error instanceof FrozenCommandError ? input.error.executionId : undefined)
+          ?? (error instanceof FrozenCommandError ? error.executionId : undefined),
+        target_bot_id: input.audit.targetLarkAppId,
+        command: input.definition.name,
+        spec_hash: input.audit.specHash,
+        state_revision_id: input.audit.stateRevisionId,
+        source: input.source,
+        task_id: input.taskId ?? input.audit.trustedCaller?.taskId,
+        caller_open_id: input.audit.trustedCaller?.requestUserOpenId,
+        caller_union_id: input.audit.trustedCaller?.requestUserUnionId,
+        turn_id: input.audit.turnId,
+        error_code: error instanceof FrozenCommandError ? error.code : 'output_decision_failed',
+      });
+    }
+    throw error;
+  }
+}
+
 function toolName(tools: Array<{ name?: unknown }>, pluginId: string, requested: string): string {
   const names = tools.map(tool => typeof tool.name === 'string' ? tool.name : '').filter(Boolean);
   if (names.includes(requested)) return requested;
@@ -1608,6 +1651,22 @@ export function isTransientPluginToolFailure(text: string): boolean {
   // noise. Retrying them through a model would amplify load.
   if (/memory limit|resource limit|quota|too many rows|limit exceeded/i.test(text)) return false;
   return /timed?\s*out|timeout|temporar|unavailable|connection|transport|socket|econn|connection closed|overload|rate.?limit|too many requests|\b50[234]\b/i.test(text);
+}
+
+function redactedFrozenCommandParams(input: {
+  definition: FrozenCommandDefinition;
+  rawArgs: string;
+  now?: Date;
+}): Array<{ name: string; type: string; value: '[REDACTED]' }> {
+  try {
+    return normalizeFrozenCommandArguments(input).args.map(item => ({
+      name: item.name,
+      type: input.definition.params.find(param => param.name === item.name)?.type ?? 'unknown',
+      value: '[REDACTED]',
+    }));
+  } catch {
+    return [];
+  }
 }
 
 function frozenCommandAuditRecord(input: {
@@ -1633,22 +1692,7 @@ function frozenCommandAuditRecord(input: {
   errorCode?: string;
   outputAudit?: Record<string, unknown>;
 }): Record<string, unknown> {
-  let normalizedParams: Array<{ name: string; type: string; value: '[REDACTED]' }> = [];
-  try {
-    const normalized = normalizeFrozenCommandArguments({
-      definition: input.input.definition,
-      rawArgs: input.input.rawArgs,
-      now: input.input.now,
-    }).args;
-    normalizedParams = normalized.map(item => ({
-      name: item.name,
-      type: input.input.definition.params.find(param => param.name === item.name)?.type ?? 'unknown',
-      value: '[REDACTED]',
-    }));
-  } catch {
-    // Invalid arguments still need an audit row; never let audit formatting
-    // replace the actual parser error.
-  }
+  const normalizedParams = redactedFrozenCommandParams(input.input);
   return {
     event: 'frozen_command_execution',
     execution_id: input.executionId,
@@ -2054,54 +2098,83 @@ async function executeFrozenCommandStep(input: {
 }
 
 export async function executeFrozenCommand(input: FrozenCommandExecutionInput): Promise<FrozenCommandExecutionResult> {
-  if (!input.trustedCaller
-    || (input.trustedCaller.senderType !== 'user' && input.trustedCaller.source !== 'schedule_creator')) {
-    throw new FrozenCommandError('untrusted_caller', '无法确认调用者身份，已拒绝执行');
-  }
-  if (input.botConfig.larkAppId !== input.targetLarkAppId) {
-    throw new FrozenCommandError('executor_identity_mismatch', '目标 Bot 与执行身份不一致，已拒绝执行');
-  }
   const now = input.now ?? new Date();
   const executionId = randomUUID();
-  const currentExecutorRevision = frozenCommandExecutorRevision(input.definition);
-  if (input.expectedExecutorRevision && input.expectedExecutorRevision !== currentExecutorRevision) {
-    throw new FrozenCommandError('executor_revision_changed', '执行器配置或脚本已变化，命令必须重新确认');
-  }
-  const scheduled = input.trustedCaller.source === 'schedule_creator';
-  const pluginIds = resolveEffectivePluginIds(input.botConfig, readGlobalConfig());
-  const prepared = input.definition.steps.map((step) => {
-    const executor = resolveCommandExecutor(step.executor);
-    if (scheduled && !executor.policy.schedulable) {
-      throw new FrozenCommandError('executor_schedule_denied', `步骤 ${step.id} 的执行器 ${executor.id} 不允许用于定时任务`);
-    }
-    if (isPluginToolCommandExecutor(executor)) {
-      if (!pluginIds.includes(executor.plugin)) throw new FrozenCommandError('plugin_tool_not_enabled', `当前角色未启用插件 ${executor.plugin}`);
-      const installed = getInstalledPlugin(executor.plugin);
-      if (!installed) throw new FrozenCommandError('plugin_tool_not_installed', `插件 ${executor.plugin} 未安装`);
-      if (executor.minimumVersion && !pluginVersionAtLeast(installed.version, executor.minimumVersion)) {
-        throw new FrozenCommandError('plugin_tool_version_unsupported', `插件 ${executor.plugin} 版本不满足最低要求 ${executor.minimumVersion}`);
+  const { currentExecutorRevision, prepared, normalizedArgs } = (() => {
+    try {
+      if (!input.trustedCaller
+        || (input.trustedCaller.senderType !== 'user' && input.trustedCaller.source !== 'schedule_creator')) {
+        throw new FrozenCommandError('untrusted_caller', '无法确认调用者身份，已拒绝执行');
       }
-      if (!installed.contributions?.mcp) throw new FrozenCommandError('plugin_tool_gateway_missing', `插件 ${executor.plugin} 未声明 MCP 工具入口`);
-    } else {
-      verifyCommandExecutorArtifacts(executor);
+      const trustedCaller = input.trustedCaller;
+      if (input.botConfig.larkAppId !== input.targetLarkAppId) {
+        throw new FrozenCommandError('executor_identity_mismatch', '目标 Bot 与执行身份不一致，已拒绝执行');
+      }
+      const executorRevision = frozenCommandExecutorRevision(input.definition);
+      if (input.expectedExecutorRevision && input.expectedExecutorRevision !== executorRevision) {
+        throw new FrozenCommandError('executor_revision_changed', '执行器配置或脚本已变化，命令必须重新确认');
+      }
+      const args = normalizeFrozenCommandArguments({ definition: input.definition, rawArgs: input.rawArgs, now }).args;
+      const scheduled = trustedCaller.source === 'schedule_creator';
+      const pluginIds = resolveEffectivePluginIds(input.botConfig, readGlobalConfig());
+      const resolvedSteps = input.definition.steps.map((step) => {
+        const executor = resolveCommandExecutor(step.executor);
+        if (scheduled && !executor.policy.schedulable) {
+          throw new FrozenCommandError('executor_schedule_denied', `步骤 ${step.id} 的执行器 ${executor.id} 不允许用于定时任务`);
+        }
+        if (isPluginToolCommandExecutor(executor)) {
+          if (!pluginIds.includes(executor.plugin)) throw new FrozenCommandError('plugin_tool_not_enabled', `当前角色未启用插件 ${executor.plugin}`);
+          const installed = getInstalledPlugin(executor.plugin);
+          if (!installed) throw new FrozenCommandError('plugin_tool_not_installed', `插件 ${executor.plugin} 未安装`);
+          if (executor.minimumVersion && !pluginVersionAtLeast(installed.version, executor.minimumVersion)) {
+            throw new FrozenCommandError('plugin_tool_version_unsupported', `插件 ${executor.plugin} 版本不满足最低要求 ${executor.minimumVersion}`);
+          }
+          if (!installed.contributions?.mcp) throw new FrozenCommandError('plugin_tool_gateway_missing', `插件 ${executor.plugin} 未声明 MCP 工具入口`);
+        } else {
+          verifyCommandExecutorArtifacts(executor);
+        }
+        const renderer = resolveCommandRenderer(step.renderer);
+        if (typeof renderer !== 'string') verifyCommandRendererArtifacts(renderer);
+        return {
+          step,
+          executor,
+          renderer,
+          resolved: resolveExecutorInput({
+            definition: input.definition,
+            step,
+            rawArgs: input.rawArgs,
+            trustedCaller,
+            context: input.context,
+            now,
+          }),
+        };
+      });
+      return { currentExecutorRevision: executorRevision, prepared: resolvedSteps, normalizedArgs: args };
+    } catch (error) {
+      logger.warn('[frozen-command:audit]', {
+        event: 'frozen_command_invocation',
+        execution_id: executionId,
+        status: 'rejected',
+        phase: 'preflight',
+        target_bot_id: input.targetLarkAppId,
+        command: input.definition.name,
+        spec_hash: input.audit?.specHash,
+        state_revision_id: input.audit?.stateRevisionId,
+        source: input.audit?.source ?? 'direct',
+        task_id: input.audit?.taskId ?? input.trustedCaller?.taskId,
+        caller_open_id: input.trustedCaller?.requestUserOpenId,
+        caller_union_id: input.trustedCaller?.requestUserUnionId,
+        turn_id: input.turnId,
+        normalized_params: redactedFrozenCommandParams({
+          definition: input.definition,
+          rawArgs: input.rawArgs,
+          now,
+        }),
+        error_code: error instanceof FrozenCommandError ? error.code : 'execution_failed',
+      });
+      throw error;
     }
-    const renderer = resolveCommandRenderer(step.renderer);
-    if (typeof renderer !== 'string') verifyCommandRendererArtifacts(renderer);
-    return {
-      step,
-      executor,
-      renderer,
-      resolved: resolveExecutorInput({
-        definition: input.definition,
-        step,
-        rawArgs: input.rawArgs,
-        trustedCaller: input.trustedCaller!,
-        context: input.context,
-        now,
-      }),
-    };
-  });
-  const normalizedArgs = normalizeFrozenCommandArguments({ definition: input.definition, rawArgs: input.rawArgs, now }).args;
+  })();
   const defaultTotalTimeoutMs = Math.max(...prepared.map(({ executor, renderer }) =>
     executor.policy.timeoutMs + (typeof renderer === 'string' ? 0 : renderer.policy.timeoutMs)));
   const totalTimeoutMs = Math.min(input.timeoutMs ?? defaultTotalTimeoutMs, 10 * 60_000);
@@ -2259,6 +2332,7 @@ export function userFacingFrozenCommandError(error: unknown): string {
   if (!(error instanceof FrozenCommandError)) return '固化命令执行失败，请稍后重试。';
   if (error.code === 'plugin_tool_unavailable') return '插件工具暂时不可用，请稍后重试。';
   if (SAFE_PLUGIN_TOOL_ERROR_CODES.has(error.code)) return error.message;
+  if (error.code.startsWith('conditional_output_')) return '固化命令输出规则配置错误，请联系维护方。';
   if (/^(?:parameter_|definition_|executor_|context_value_missing$|untrusted_caller$|execution_timeout$)/.test(error.code)) {
     return error.message;
   }

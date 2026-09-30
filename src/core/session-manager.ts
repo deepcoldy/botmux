@@ -4228,6 +4228,13 @@ export async function executeScheduledTask(
           taskId: task.id,
           result,
           now: invocationNow,
+          audit: {
+            targetLarkAppId: larkAppId,
+            trustedCaller: scheduledTrustedCaller,
+            turnId: scheduledTurnId,
+            ...(lifecycle.record.specHash ? { specHash: lifecycle.record.specHash } : {}),
+            stateRevisionId: lifecycle.record.stateRevisionId,
+          },
         });
         if (output.kind === 'deliver') {
           if (silent) {
@@ -4255,6 +4262,13 @@ export async function executeScheduledTask(
             taskId: task.id,
             error,
             now: invocationNow,
+            audit: {
+              targetLarkAppId: larkAppId,
+              trustedCaller: scheduledTrustedCaller,
+              turnId: scheduledTurnId,
+              ...(lifecycle.record.specHash ? { specHash: lifecycle.record.specHash } : {}),
+              stateRevisionId: lifecycle.record.stateRevisionId,
+            },
           });
           if (output.kind === 'handoff') {
             frozenHandoffPrompt = output.prompt;
