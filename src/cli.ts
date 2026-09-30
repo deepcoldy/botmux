@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { assertSendTopicsAvailable } from './cli/topic-send-guard.js';
+import { assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError } from './cli/topic-send-guard.js';
 /**
  * CLI entry point for botmux.
  *
@@ -9818,7 +9818,10 @@ async function cmdSend(rest: string[]): Promise<void> {
   // local parsing/card preparation cannot carry an old capability across a
   // worker restart, turn rotation, or Codex ledger settlement.
   let checkSendTopics: (() => Promise<void>) | undefined;
+  let resetTopicLookup: (() => void) | undefined;
+  let topicEffectChecked = false;
   const revalidateIsolatedOriginBeforeEffect = async (): Promise<ManagedOriginAttestation | undefined> => {
+    if (!topicEffectChecked) { resetTopicLookup?.(); topicEffectChecked = true; }
     await checkSendTopics?.();
     if (!isolatedAttestationContext || !isolatedManagedOriginCtx) return undefined;
     const fresh = await attestManagedOrigin({
@@ -10309,6 +10312,9 @@ async function cmdSend(rest: string[]): Promise<void> {
     replyTargetTurnId: turnReplyTarget?.turnId,
     replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId,
   });
+  const topicLookup = createTopicMessageLookupCache(getTopicMessageDetail);
+  resetTopicLookup = topicLookup.clear;
+  topicEffectChecked = false;
   checkSendTopics = async () => {
     if (getBot(appId).config.topicUnavailablePolicy !== 'stop') return;
     const scheduledRoot = reusableDeferredTopicRoot({
@@ -10321,7 +10327,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       !s.deferredScheduleRun && (sourceTopicTarget.mode === 'thread' || sourceTopicTarget.mode === 'quote')
         ? sourceTopicTarget.rootMessageId : undefined,
       sendInto,
-    ], getTopicMessageDetail, 'stop');
+    ], topicLookup.lookup, 'stop');
   };
   await checkSendTopics();
   // Resolve sender-scoped bot identities before the early voice return. Voice
@@ -10371,9 +10377,6 @@ async function cmdSend(rest: string[]): Promise<void> {
   // same thread/chat the session would normally reply to.
   if (asVoice) {
     if (!content.trim()) { console.error('--voice 需要要朗读的文字'); process.exit(1); }
-    const { registerBot, loadBotConfigs } = await import('./bot-registry.js');
-    try { for (const cfg of loadBotConfigs()) registerBot(cfg); } catch { /* */ }
-  if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
     const { uploadFile, sendMessage, replyMessage } = await import('./im/lark/client.js');
     const { synthesizeVoiceOpus } = await import('./services/voice/index.js');
     const { rmSync } = await import('node:fs');
@@ -10512,8 +10515,9 @@ async function cmdSend(rest: string[]): Promise<void> {
           : {}),
       }));
     } catch (e: any) {
-      console.error(`语音发送失败：${describeSendFailure(e)}`);
       if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* */ } }
+      if (e instanceof TopicSendError) throw e;
+      console.error(`语音发送失败：${describeSendFailure(e)}`);
       process.exit(1);
     }
     if (dir) { try { rmSync(dir, { recursive: true, force: true }); } catch { /* */ } }
@@ -11182,7 +11186,7 @@ async function cmdSend(rest: string[]): Promise<void> {
           : fenceIsolatedOriginBeforeEffect,
         beforeQuoteFallback: async () => {
           if (getBot(appId).config.topicUnavailablePolicy === 'stop') {
-            throw new Error('TOPIC_SEND_BLOCKED: 引用目标已撤回，按机器人配置停止发送，不改发其他位置。');
+            throw new TopicSendError('TOPIC_SEND_BLOCKED', '引用目标已撤回，按机器人配置停止发送，不改发其他位置。');
           }
           revalidateVcMeetingManagedSend();
           await revalidateIsolatedOriginBeforeEffect();
@@ -11970,6 +11974,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         : {}),
     }));
   } catch (err: any) {
+    if (err instanceof TopicSendError) throw err;
     console.error(`发送失败: ${describeSendFailure(err)}`);
     process.exit(1);
   }
@@ -16869,7 +16874,15 @@ switch (command) {
     process.exitCode = await runObserveCommand(process.argv.slice(3));
     break;
   }
-  case 'send':     await cmdSend(process.argv.slice(3)); break;
+  case 'send': {
+    try { await cmdSend(process.argv.slice(3)); }
+    catch (error) {
+      if (!(error instanceof TopicSendError)) throw error;
+      console.error(`botmux send refused: ${error.message}`);
+      process.exitCode = 2;
+    }
+    break;
+  }
   case 'auth':     await cmdAuth(process.argv.slice(3)); break;
   case 'tabs':     await cmdTabs(process.argv.slice(3)); break;
   case 'card':     await cmdCard(process.argv.slice(3)); break;

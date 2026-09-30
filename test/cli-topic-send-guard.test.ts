@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, it, expect, vi } from 'vitest';
-import { assertSendTopicsAvailable } from '../src/cli/topic-send-guard.js';
+import { assertSendTopicsAvailable, createTopicMessageLookupCache } from '../src/cli/topic-send-guard.js';
 describe('topic send guard', () => {
   it.each([undefined, 'legacy'] as const)('preserves legacy behavior without extra queries for %s', async policy => {
     const get = vi.fn(async () => { throw new Error('network'); });
@@ -42,6 +42,26 @@ describe('topic send guard', () => {
     expect(registration).toBeGreaterThan(source.lastIndexOf('const appId = s.larkAppId!', guard));
     expect(pinned).toBeLessThan(guard);
     expect(guard).toBeLessThan(check);
+  });
+  it.each([{ code: 230011 }, { response: { data: { code: 230011 } } }, { name: 'MessageWithdrawnError' }])(
+    'classifies provider withdrawal as permanent: %j', async error => {
+      await expect(assertSendTopicsAvailable('app', ['root'], async () => { throw error; }, 'stop'))
+        .rejects.toMatchObject({ name: 'TopicSendError', code: 'TOPIC_SEND_BLOCKED' });
+    });
+  it('shares successful checks only within one delivery, with expiry and an explicit fence refresh', async () => {
+    const get = vi.fn(async (_app: string, id: string) => ({ items: [{ message_id: id, deleted: false }] }));
+    const now = vi.spyOn(Date, 'now').mockReturnValue(1000);
+    try {
+      const cache = createTopicMessageLookupCache(get);
+      await cache.lookup('app', 'root'); await cache.lookup('app', 'root');
+      expect(get).toHaveBeenCalledTimes(1);
+      cache.clear(); await cache.lookup('app', 'root');
+      expect(get).toHaveBeenCalledTimes(2);
+      now.mockReturnValue(2001); await cache.lookup('app', 'root');
+      await cache.lookup('other-app', 'root');
+      await createTopicMessageLookupCache(get).lookup('app', 'root');
+      expect(get).toHaveBeenCalledTimes(5);
+    } finally { now.mockRestore(); }
   });
   it('leaves unthreaded broadcasts alone', async () => {
     const get = vi.fn();
