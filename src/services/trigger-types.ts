@@ -69,6 +69,9 @@ export interface TriggerRequest {
     status?: 'firing' | 'resolved' | string;
     waitForFinalOutput?: boolean;
     asyncReturnSessionId?: boolean;
+    /** Allow explicit botmux send in this async turn's existing real group.
+     * Final output still returns to the caller. Never persisted on the session. */
+    allowChatMessages?: boolean;
     timeoutMs?: number;
     /** Connector-owner opt-in: drop the daemon-rendered final_output reply for
      * this loud trigger's turn. The streaming card / start notice still show;
@@ -299,6 +302,12 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
   }
   if (waitForFinalOutput && asyncReturnSessionId) {
     return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'waitForFinalOutput and asyncReturnSessionId cannot be used together' } };
+  }
+  if (options.allowChatMessages !== undefined && typeof options.allowChatMessages !== 'boolean') {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.allowChatMessages must be a boolean' } };
+  }
+  if (options.allowChatMessages === true && (target.kind !== 'turn' || !hasSessionId || !asyncReturnSessionId || waitForFinalOutput || source.type === 'headless')) {
+    return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'allowChatMessages requires an async turn on an existing real group session' } };
   }
   if (options.timeoutMs !== undefined) {
     if (typeof options.timeoutMs !== 'number' || !Number.isFinite(options.timeoutMs) || options.timeoutMs < 1000 || options.timeoutMs > 300_000) {

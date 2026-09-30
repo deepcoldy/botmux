@@ -705,3 +705,37 @@ describe('exact trigger presentation keeps the persisted reply destination', () 
     }
   });
 });
+
+
+describe('async opt-in group messages', () => {
+  it.each(['codex-app', 'claude'])('scopes permission to one %s turn, retaining idempotency', async cliId => {
+    mockGetBot.mockReturnValue({ config: { cliId, apiOnly: false } });
+    const ds = existingDs({ chatId: 'oc_real', worker: { killed: false, send: vi.fn() } as any });
+    ds.session.chatId = 'oc_real';
+    const active = activeWith(ds);
+    const req = followUpReq('chat-on'); req.options!.allowChatMessages = true;
+    const first = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(first.ok).toBe(true);
+    const second = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(second.triggerId).toBe(first.triggerId);
+    expect(mockSendWorkerInput).toHaveBeenCalledTimes(1);
+    expect(JSON.stringify(mockSendWorkerInput.mock.calls[0])).toContain('may call botmux send');
+    const normal = followUpReq('chat-default');
+    await triggerSessionTurn(normal, { larkAppId: APP, activeSessions: active });
+    expect(JSON.stringify(mockSendWorkerInput.mock.calls[1])).toContain('Do not call botmux send; do not post');
+    req.options!.allowChatMessages = false;
+    expect((await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active })).errorCode).toBe('idempotency_conflict');
+  });
+  it.each(['virtual', 'headless', 'apiOnly', 'p2p', 'missing', 'mismatched-chat', 'wrong-bot'])('rejects %s before dispatch', async kind => {
+    mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: kind === 'apiOnly' } });
+    const ds = existingDs({ chatId: kind === 'virtual' ? CHAT : kind === 'headless' ? 'headless_test' : 'oc_real',
+      chatType: kind === 'p2p' ? 'p2p' : 'group', worker: { killed: false, send: vi.fn() } as any });
+    if (kind === 'wrong-bot') ds.larkAppId = 'other';
+    const req = followUpReq('invalid'); req.options!.allowChatMessages = true;
+    if (kind === 'mismatched-chat') req.target.chatId = 'oc_other';
+    const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: kind === 'missing' ? new Map() : activeWith(ds) });
+    expect(result.ok).toBe(false);
+    expect(mockSendWorkerInput).not.toHaveBeenCalled();
+    expect(mockForkWorker).not.toHaveBeenCalled();
+  });
+});

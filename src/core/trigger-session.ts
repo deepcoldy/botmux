@@ -142,7 +142,11 @@ export function buildExternalEventApplicationContext(req: TriggerRequest): strin
       'Your entire reply is returned verbatim to a program as the task result — not shown in a chat.',
       'Output ONLY the final answer. Do NOT include preamble, meta-commentary, or any reasoning about',
       'these instructions / routing headers / system context (e.g. "this is a routing header", "the real',
-      'request is…", "here is my answer"). Do not call botmux send; do not post to Feishu/Lark.',
+      'request is…", "here is my answer").',
+      ...(req.options?.allowChatMessages === true ? [
+        'For this turn only, you may call botmux send to publish the authorized task handoff or result in the current bound Feishu/Lark group. Respect the task authorization and send no unrelated messages.',
+        'This permission does not carry into later turns. Your final assistant output still returns to the program.',
+      ] : ['Do not call botmux send; do not post to Feishu/Lark.']),
       // 哨兵语义的唯一权威出处（no-transport 会话下 routing/reminder 的 usage_silence
       // 被整块网关掉，见 shared-hints.ts + session-manager buildFollowUpBlocks）。
       // ⚠️ 迁移不删：async settle（#808）**依赖**模型吐出字面 BOTMUX_NOTHING_TO_SEND
@@ -914,6 +918,17 @@ async function triggerSessionTurnAdmitted(
       if (bound && !isHttpVirtualSession(bound.chatId)) {
         return { ok: false, errorCode: 'bad_request', error: 'apiOnly bot may only resume its own HTTP virtual session' };
       }
+    }
+  }
+
+  if (req.options?.allowChatMessages === true) {
+    const bound = req.target.sessionId ? activeBySessionId(deps.activeSessions, req.target.sessionId) : undefined;
+    if (req.source.type === 'headless' || !req.options.asyncReturnSessionId || req.options.waitForFinalOutput
+      || !bound || getBot(larkAppId).config.apiOnly === true
+      || !larkTransportEnabled({ chatId: bound.chatId, apiOnly: false })
+      || bound.chatType !== 'group' || bound.larkAppId !== larkAppId
+      || (req.target.chatId && req.target.chatId !== bound.chatId)) {
+      return { ok: false, errorCode: 'bad_request', error: 'allowChatMessages requires an existing real group session with Lark transport' };
     }
   }
 
