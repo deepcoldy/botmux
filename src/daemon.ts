@@ -22642,13 +22642,19 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
     if (sgEntry?.lastSessionId) {
       const prevSession = sessionStore.getSession(sgEntry.lastSessionId);
       if (prevSession?.status === 'closed') {
-        const resumed = await resumeSession(sgEntry.lastSessionId, activeSessions);
-        if (resumed.ok) {
-          touchSessionGroup(chatId);
-          logger.info(`[session-group] resumed session=${sgEntry.lastSessionId.substring(0, 8)} in chat=${chatId.substring(0, 12)}`);
-          return handleThreadReply(data, ctx);
+        // /dismiss retries operate on the closed row. Resuming here would
+        // invalidate every confirmation before the sessionless route sees it.
+        const { parsed: preview } = parseEventMessage(data, createImgNumberer());
+        const command = parseSlashCommandInvocation(stripLeadingMentions(preview.content, preview.mentions));
+        if (command?.cmd !== '/dismiss') {
+          const resumed = await resumeSession(sgEntry.lastSessionId, activeSessions);
+          if (resumed.ok) {
+            touchSessionGroup(chatId);
+            logger.info(`[session-group] resumed session=${sgEntry.lastSessionId.substring(0, 8)} in chat=${chatId.substring(0, 12)}`);
+            return handleThreadReply(data, ctx);
+          }
+          logger.warn(`[session-group] resume failed (${resumed.error}) chat=${chatId.substring(0, 12)}; spawning fresh session`);
         }
-        logger.warn(`[session-group] resume failed (${resumed.error}) chat=${chatId.substring(0, 12)}; spawning fresh session`);
       }
     }
   }

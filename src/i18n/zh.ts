@@ -318,6 +318,19 @@ export const messages: Record<string, string> = {
 
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.no_active_session': '当前话题没有活跃的会话。',
+  'cmd.close.tag_updated': '🏷️ 当前群已移入「{name}」。',
+  'cmd.close.tag_failed': '⚠️ 会话已关闭，但标签切换未完成；群聊与历史保留，请检查标签授权或手动调整分组。',
+  'cmd.dismiss.owner_only': '⚠️ 仅建群用户本人且具备 Bot 操作权限时可以解散会话群。',
+  'cmd.dismiss.unsupported': '⚠️ /dismiss 仅支持当前 Bot 创建的专属会话群顶层，不适用于私聊、普通群、子话题或接入的共享会话。',
+  'cmd.dismiss.usage': '用法：发送 `/dismiss`，阅读影响说明后再发送返回的确认命令。',
+  'cmd.dismiss.confirm': '⚠️ 将关闭当前会话并解散整个会话群，所有群成员都会受影响，无法通过恢复会话重建原群。代码和 worktree 不会删除。\n\n确认继续，请发送：\n`{command}`\n\n只想关闭会话并保留群聊，请用 `/close`。',
+  'cmd.dismiss.other_sessions': '⚠️ 群里还有其它活跃会话，未解散群。请先逐一处理其它会话，再发送 /dismiss。',
+  'cmd.dismiss.changed': '⚠️ 群的会话状态发生变化，未解散群。请重新发送 /dismiss 确认。',
+  'cmd.dismiss.close_failed': '⚠️ 未能确认当前会话安全关闭，未解散群。请检查会话状态后重试。',
+  'cmd.dismiss.residual': '⚠️ 会话关闭后仍有未确认清理的运行时残留，未解散群。请先人工检查。',
+  'cmd.dismiss.disband_failed': '⚠️ 当前会话已关闭，但飞书未确认群解散。请检查 Bot 是否有群主或创建者代群主权限，再发送 /dismiss 重试。',
+  'cmd.dismiss.dismissed': '✅ 当前会话已关闭，会话群已解散。代码和 worktree 保留。',
+  'cmd.dismiss.unavailable': '⚠️ 无法确认操作结果，未继续解散。请检查群及会话状态后重试 /dismiss。',
   'cmd.close.refused': '⚠️ 会话关闭失败：远端会话未能确认取消，已保留 active 记录以便重试（{error}）。远端会话可能仍在运行，请稍后重试 /close。',
   'cmd.close.refused_with_task': '⚠️ 会话关闭失败：远端会话未能确认取消，已保留 active 记录以便重试（{error}）。远端会话 id：`{taskId}`。远端会话可能仍在运行，请稍后重试 /close。',
   'cmd.insight.operator_only': '⚠️ 仅授权用户（allowedUsers）可以使用 /insight。',
@@ -802,6 +815,7 @@ export const messages: Record<string, string> = {
 
   // ─── /help ───────────────────────────────────────────────────────────────
   'help.heading_session': '📌 会话管理：',
+  'help.dismiss': '/dismiss    - 二次确认后关闭会话并解散专属会话群',
   'help.close': '/close      - 关闭当前会话，终止 {cliName} 进程',
   'help.cleanup_wt': '/cleanup-wt <ID> - 重试失败的 worktree 清理任务',
   'help.lane': '/lane status|close - 查看或安全关闭本人的独立 lane（关闭前会保护未提交和未推送成果）',

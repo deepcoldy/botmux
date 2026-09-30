@@ -457,8 +457,8 @@ export async function disbandChat(
   const client = getBotClient(larkAppId);
   try {
     const res: any = await (client as any).im.v1.chat.delete({ path: { chat_id: chatId } });
-    if (res.code !== 0 && res.code !== undefined) {
-      return { ok: false, error: `${res.msg ?? 'unknown'} (code: ${res.code})` };
+    if (res?.code !== 0) {
+      return { ok: false, error: `${res?.msg ?? 'missing API success acknowledgement'} (code: ${res?.code})` };
     }
     return { ok: true };
   } catch (e: any) {

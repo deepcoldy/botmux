@@ -7914,6 +7914,82 @@ describe('PUT /api/bot-agent', () => {
     }
   });
 
+  it('persists, validates, cold-reads and clears dshProfile through bots.json', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-dsh-profile-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-agent-dsh-profile-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'dsh',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const url = `http://127.0.0.1:${handle.port}/api/bot-agent`;
+
+      const invalid = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '', dshProfile: '../outside' }),
+      });
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toMatchObject({ error: 'invalid_dsh_profile' });
+
+      const saved = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '', dshProfile: '  custom-profile_1  ' }),
+      });
+      expect(saved.status).toBe(200);
+      expect(await saved.json()).toMatchObject({ ok: true, dshProfile: 'custom-profile_1' });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].dshProfile).toBe('custom-profile_1');
+      expect(getBot(appId).config.dshProfile).toBe('custom-profile_1');
+      expect(botRegistry.loadBotConfigAtIndex(0).dshProfile).toBe('custom-profile_1');
+
+      // Old clients omit the field; retain the configured profile on dsh.
+      const preserved = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '' }),
+      });
+      expect(preserved.status).toBe(200);
+      expect(await preserved.json()).toMatchObject({ dshProfile: 'custom-profile_1' });
+
+      const cleared = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '', dshProfile: '   ' }),
+      });
+      expect(cleared.status).toBe(200);
+      expect(await cleared.json()).toMatchObject({ dshProfile: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].dshProfile).toBeUndefined();
+      expect(getBot(appId).config.dshProfile).toBeUndefined();
+
+      await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'dsh', model: '', dshProfile: 'custom' }),
+      });
+      const switched = await fetch(url, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ cliId: 'claude-code', model: '' }),
+      });
+      expect(switched.status).toBe(200);
+      expect(await switched.json()).toMatchObject({ dshProfile: null });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0].dshProfile).toBeUndefined();
+      expect(getBot(appId).config.dshProfile).toBeUndefined();
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('rejects an unsettled Codex App session before config/readIsolation mutation or close', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-pending-ipc-'));
     const dataDir = join(dir, 'data');

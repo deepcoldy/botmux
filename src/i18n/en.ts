@@ -319,6 +319,19 @@ export const messages: Record<string, string> = {
 
   // ─── Command responses ───────────────────────────────────────────────────
   'cmd.no_active_session': 'No active session in this topic.',
+  'cmd.close.tag_updated': '🏷️ This chat is now in “{name}”.',
+  'cmd.close.tag_failed': '⚠️ The session is closed, but its tag update did not complete. The chat and history are kept; check tag authorization or adjust the groups manually.',
+  'cmd.dismiss.owner_only': '⚠️ Only the human who created this session group, with Bot operator permission, may dismiss it.',
+  'cmd.dismiss.unsupported': '⚠️ /dismiss only supports the top level of a dedicated session group created by this Bot, not DMs, ordinary groups, topics or adopted sessions.',
+  'cmd.dismiss.usage': 'Send `/dismiss`, read the impact notice, then send the returned confirmation command.',
+  'cmd.dismiss.confirm': '⚠️ This closes the current session and disbands the entire group for all members. Resuming cannot recreate the original group. Code and worktrees are kept.\n\nTo continue, send:\n`{command}`\n\nUse `/close` to close the session while keeping the group.',
+  'cmd.dismiss.other_sessions': '⚠️ Other active sessions remain in this group; it was not disbanded. Handle those sessions first, then retry /dismiss.',
+  'cmd.dismiss.changed': '⚠️ The group session changed; it was not disbanded. Send /dismiss again to confirm.',
+  'cmd.dismiss.close_failed': '⚠️ Safe session closure could not be verified; the group was not disbanded. Check the session before retrying.',
+  'cmd.dismiss.residual': '⚠️ Runtime resources remain unverified after closure; the group was not disbanded. Inspect the residuals first.',
+  'cmd.dismiss.disband_failed': '⚠️ The session is closed, but Feishu did not confirm group deletion. Check the Bot owner/creator operate-as-owner permission, then retry /dismiss.',
+  'cmd.dismiss.dismissed': '✅ The session is closed and its group disbanded. Code and worktrees are kept.',
+  'cmd.dismiss.unavailable': '⚠️ The operation could not be verified; no further deletion was attempted. Check the group and session before retrying /dismiss.',
   'cmd.close.refused': '⚠️ Could not close the session because remote cancellation was not proven ({error}). The active record was kept for retry; the remote session may still be running. Retry /close later.',
   'cmd.close.refused_with_task': '⚠️ Could not close the session because remote cancellation was not proven ({error}). The active record was kept for retry. Remote session id: `{taskId}`. The remote session may still be running; retry /close later.',
   'cmd.insight.operator_only': '⚠️ Only authorized users (allowedUsers) can use /insight.',
@@ -804,6 +817,7 @@ export const messages: Record<string, string> = {
 
   // ─── /help ───────────────────────────────────────────────────────────────
   'help.heading_session': '📌 Session management:',
+  'help.dismiss': '/dismiss    - Confirm, close and disband a dedicated session group',
   'help.close': '/close      - Close current session, kill {cliName}',
   'help.cleanup_wt': '/cleanup-wt <ID> - Retry a failed worktree cleanup job',
   'help.lane': '/lane status|close - Inspect or safely close your isolated lane (protects uncommitted and unpushed work)',

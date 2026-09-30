@@ -17,6 +17,7 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/stop` | Interrupt the current turn while keeping the session; same as the streaming card's Stop button |
 | `/restart` | Restart the CLI process (preserving the session context) |
 | `/close` | Close the session and send a recoverable card (including the CLI's own resume command) |
+| `/dismiss` | Top level of a dedicated session group only: after confirmation, closes the session and disbands the whole group (the creator with operator permission only; code and worktrees are kept; not supported in DMs, ordinary groups, subtopics, or adopted sessions). To keep the chat, use `/close` |
 | `/cleanup-wt <ID>` | Retry a persisted worktree cleanup after a final removal failure; revalidates authorization, active sessions, worktree identity, and safety state before deleting |
 | `/fork <task>` | Fork the current session with full context into a new sub-topic of the same topic group; the source session keeps running untouched (Claude family, Codex terminal, or TraeX terminal mode) |
 | `/forklist` | Re-post the current session's forked-task panel with live/closed status and links to the child topics |

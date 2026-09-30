@@ -5275,7 +5275,12 @@ function SessionModeSection(props: {
         onChange={next => void saveP2p(next)}
       >
         <div className="bd-mode-group-side"><StatusSpan status={p2pStatus} attr={{ 'data-p2p-status': '' }} /></div>
-        {p2p === 'group' ? <SessionGroupTagRow bot={props.bot} /> : null}
+        {p2p === 'group' ? (
+          <>
+            <SessionGroupTagRow bot={props.bot} />
+            <p className="bd-section-note" data-session-group-lifecycle>{tr('botDefaults.sgLifecycleHint')}</p>
+          </>
+        ) : null}
       </ModeOptionGroup>
 
       <ModeOptionGroup
@@ -6127,7 +6132,7 @@ function repairStatusText(tr: ReturnType<typeof useT>, item: RedirectRepairItem)
 export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
   const tr = useT();
   const [status, setStatus] = useState<
-    { authorized: boolean; tagMode: string; tagName: string; defaultTagName: string } | null
+    { authorized: boolean; tagMode: string; tagName: string; closedTagName: string; defaultTagName: string } | null
   >(null);
   const [authBusy, setAuthBusy] = useState(false);
   const [modeBusy, setModeBusy] = useState(false);
@@ -6137,6 +6142,9 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
   const [nameInput, setNameInput] = useState('');
   const [nameBusy, setNameBusy] = useState(false);
   const [nameStatus, setNameStatus] = useState<StatusMessage>(null);
+  const [closedNameInput, setClosedNameInput] = useState('');
+  const [closedNameBusy, setClosedNameBusy] = useState(false);
+  const [closedNameStatus, setClosedNameStatus] = useState<StatusMessage>(null);
   // Remote-callback paste fallback (mirrors groups-page / sessions-page): when
   // set, the overlay is shown so a browser that can't reach the daemon's
   // 127.0.0.1:9768 loopback (远程 VM / 中心化平台 m-* 子域访问) can still finish
@@ -6166,10 +6174,14 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
           authorized: !!res.body.authorized,
           tagMode: String(res.body.tagMode ?? 'feed-group'),
           tagName,
+          closedTagName: String(res.body.closedTagName ?? ''),
           defaultTagName: String(res.body.defaultTagName ?? ''),
         });
         // 只有首屏/切 bot 才回填输入框——授权轮询期间用户可能正在里面打字。
-        if (syncNameInput) setNameInput(tagName);
+        if (syncNameInput) {
+          setNameInput(tagName);
+          setClosedNameInput(String(res.body.closedTagName ?? ''));
+        }
         return !!res.body.authorized;
       }
     } catch { /* transient */ }
@@ -6197,6 +6209,9 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
     setNameInput('');
     setNameBusy(false);
     setNameStatus(null);
+    setClosedNameInput('');
+    setClosedNameBusy(false);
+    setClosedNameStatus(null);
     void fetchStatus(generation, true);
     return () => {
       lifecycle.current.mounted = false;
@@ -6219,6 +6234,7 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
           authorized: s?.authorized ?? false,
           tagMode: String(res.body.tagMode),
           tagName: String(res.body.tagName ?? s?.tagName ?? ''),
+          closedTagName: String(res.body.closedTagName ?? s?.closedTagName ?? ''),
           defaultTagName: String(res.body.defaultTagName ?? s?.defaultTagName ?? ''),
         }));
       } else {
@@ -6236,40 +6252,45 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
   /** 标签名保存（失焦 / 回车）。留空 = 清除配置回默认名，所以空串也要发请求。
    *  与 saveMode 同一条 per-bot 写入通路（PUT session-group-tag-config），同样用
    *  generation 挡掉切 bot 后才回来的慢响应。 */
-  async function saveName(): Promise<void> {
+  async function saveName(field: 'name' | 'closedName' = 'name'): Promise<void> {
     const generation = lifecycle.current.generation;
-    const next = nameInput.trim();
+    const isClosedName = field === 'closedName';
+    const setInput = isClosedName ? setClosedNameInput : setNameInput;
+    const setBusy = isClosedName ? setClosedNameBusy : setNameBusy;
+    const setFeedback = isClosedName ? setClosedNameStatus : setNameStatus;
+    const next = (isClosedName ? closedNameInput : nameInput).trim();
     // 与已保存值一致就别打接口了——失焦事件比真正的改动频繁得多。
-    if (next === (status?.tagName ?? '')) {
-      setNameInput(next);
+    if (next === ((isClosedName ? status?.closedTagName : status?.tagName) ?? '')) {
+      setInput(next);
       return;
     }
-    setNameBusy(true);
-    setNameStatus(null);
+    setBusy(true);
+    setFeedback(null);
     setErr(null);
     try {
-      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-config`, { name: next });
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/session-group-tag-config`, { [field]: next });
       if (!lifecycle.current.mounted || generation !== lifecycle.current.generation) return;
       if (res.ok && res.body.ok) {
-        const saved = String(res.body.tagName ?? '');
+        const saved = String(res.body[isClosedName ? 'closedTagName' : 'tagName'] ?? '');
         setStatus(s => ({
           authorized: s?.authorized ?? false,
           tagMode: String(res.body.tagMode ?? s?.tagMode ?? 'feed-group'),
-          tagName: saved,
+          tagName: String(res.body.tagName ?? s?.tagName ?? ''),
+          closedTagName: String(res.body.closedTagName ?? s?.closedTagName ?? ''),
           defaultTagName: String(res.body.defaultTagName ?? s?.defaultTagName ?? ''),
         }));
         // 服务端可能做了 trim/截断——回填成真正存下来的那个值。
-        setNameInput(saved);
-        setNameStatus({ text: tr('botDefaults.sgTagNameSaved'), ok: true });
+        setInput(saved);
+        setFeedback({ text: tr('botDefaults.sgTagNameSaved'), ok: true });
       } else {
-        setNameStatus({ text: responseErrorText(res), ok: false });
+        setFeedback({ text: responseErrorText(res), ok: false });
       }
     } catch (e: any) {
       if (lifecycle.current.mounted && generation === lifecycle.current.generation) {
-        setNameStatus({ text: caughtErrorText(e), ok: false });
+        setFeedback({ text: caughtErrorText(e), ok: false });
       }
     } finally {
-      if (lifecycle.current.mounted && generation === lifecycle.current.generation) setNameBusy(false);
+      if (lifecycle.current.mounted && generation === lifecycle.current.generation) setBusy(false);
     }
   }
 
@@ -6540,6 +6561,32 @@ export function SessionGroupTagRow(props: { bot: BotDefaultsRow }) {
             <small className="bd-sg-tag-name-hint">
               {tr('botDefaults.sgTagNameHint', { name: status?.defaultTagName ?? '' })}
             </small>
+          </div>
+        ) : null}
+        {tagMode === 'feed-group' ? (
+          <div className="bd-sg-tag-name" data-sg-closed-tag-name-row>
+            <label htmlFor="sg-closed-tag-name-input">{tr('botDefaults.sgClosedTagName')}</label>
+            <input
+              id="sg-closed-tag-name-input"
+              type="text"
+              data-input="sessionGroupClosedTagName"
+              aria-label={tr('botDefaults.sgClosedTagName')}
+              maxLength={MAX_SG_TAG_NAME_LENGTH}
+              value={closedNameInput}
+              disabled={closedNameBusy || !status}
+              onChange={event => {
+                setClosedNameInput(event.currentTarget.value);
+                setClosedNameStatus(null);
+              }}
+              onBlur={() => void saveName('closedName')}
+              onKeyDown={event => {
+                if (event.key !== 'Enter') return;
+                event.preventDefault();
+                event.currentTarget.blur();
+              }}
+            />
+            <StatusSpan status={closedNameStatus} attr={{ 'data-sg-closed-tag-name-status': '' }} />
+            <small className="bd-sg-tag-name-hint">{tr('botDefaults.sgClosedTagNameHint')}</small>
           </div>
         ) : null}
         {tagMode === 'feed-group' && repairFeedback ? (

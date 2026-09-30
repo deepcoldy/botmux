@@ -91,6 +91,7 @@ import {
   persistActiveRemoteLineagesExactBatch,
   findActiveSessionsByRoot,
   findActiveSessionsByWorkingDirStrict,
+  findActiveSessionsByChatStrict,
   SessionStoreUnmigratedError,
   repairMissingChatScope,
   loadAllSessionsSnapshot,
@@ -4203,6 +4204,68 @@ describe('Multi-bot isolation', () => {
 });
 
 // ─── findActiveSessionsByRoot() — cross-bot lookup ───────────────────────
+
+describe('findActiveSessionsByChatStrict()', () => {
+  it('includes chat and thread sessions across bots but excludes closed and other groups', () => {
+    init('app-A');
+    const a = createSession('oc_target', 'oc_target', 'A', 'group', 'chat');
+    createSession('oc_other', 'oc_other', 'Other', 'group', 'chat');
+    init('app-B');
+    const b = createSession('oc_target', 'om_topic', 'B', 'group', 'thread');
+    const closed = createSession('oc_target', 'om_closed', 'Closed', 'group', 'thread');
+    closeSession(closed.sessionId);
+    expect(findActiveSessionsByChatStrict('oc_target').map(s => s.sessionId).sort()).toEqual([a.sessionId, b.sessionId].sort());
+  });
+  it('refuses incomplete store enumeration', () => {
+    init('app-A'); fsControl.failReaddir = true;
+    expect(() => findActiveSessionsByChatStrict('oc_target')).toThrow(/simulated readdir denial/);
+  });
+  it('retains the owning bot for legacy peer rows without larkAppId', () => {
+    init('app-A');
+    const session = createSession('oc_target', 'oc_target', 'A', 'group', 'chat');
+    init('app-B');
+    const db = new DatabaseSync(join(tempDir, 'session-stores', 'app-A', 'sessions.db'));
+    try {
+      const { larkAppId: _appId, ...legacy } = session;
+      db.prepare('UPDATE sessions SET row = ? WHERE session_id = ?').run(JSON.stringify(legacy), session.sessionId);
+    } finally { db.close(); }
+    expect(findActiveSessionsByChatStrict('oc_target')).toEqual([
+      expect.objectContaining({ sessionId: session.sessionId, larkAppId: 'app-A' }),
+    ]);
+  });
+  it('refuses malformed active rows in a peer store', () => {
+    init('app-A');
+    const session = createSession('oc_target', 'oc_target', 'A', 'group', 'chat');
+    init('app-B');
+    const db = new DatabaseSync(join(tempDir, 'session-stores', 'app-A', 'sessions.db'));
+    try {
+      db.prepare('UPDATE sessions SET row = ? WHERE session_id = ?').run('{"status":"active","chatId":"oc_target"}', session.sessionId);
+    } finally { db.close(); }
+    expect(() => findActiveSessionsByChatStrict('oc_target')).toThrow(/malformed active session row/i);
+  });
+
+  it('refuses an unmigrated known peer and an inconclusive bot inventory', () => {
+    init('app-B');
+    writeFileSync(join(tempDir, 'sessions-app-A.json'), '{not parsed by cross-process readers');
+    const botsPath = join(tempDir, 'bots.json');
+    const saved = process.env.BOTS_CONFIG;
+    process.env.BOTS_CONFIG = botsPath;
+    try {
+      expect(() => findActiveSessionsByChatStrict('oc_target')).toThrow(/cannot read bots\.json/);
+      writeFileSync(botsPath, '{invalid');
+      expect(() => findActiveSessionsByChatStrict('oc_target')).toThrow(/not valid JSON/);
+      writeFileSync(botsPath, JSON.stringify({ bots: [{ larkAppId: 'app-A' }, { larkAppId: 'app-B' }] }));
+      expect(() => findActiveSessionsByChatStrict('oc_target')).toThrow(SessionStoreUnmigratedError);
+      // Removed bots' abandoned JSON is not a pending migration.
+      writeFileSync(botsPath, JSON.stringify({ bots: [{ larkAppId: 'app-B' }] }));
+      expect(findActiveSessionsByChatStrict('oc_target')).toEqual([]);
+      expect(existsSync(join(tempDir, 'session-stores', 'app-A', 'sessions.db'))).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = saved;
+    }
+  });
+});
 
 describe('findActiveSessionsByWorkingDirStrict()', () => {
   it('finds active sessions across stores by canonical worktree path', () => {
