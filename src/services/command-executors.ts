@@ -132,7 +132,7 @@ export interface PluginToolCommandExecutor {
   kind: 'plugin-tool';
   plugin: string;
   tool: string;
-  minimumVersion: string;
+  minimumVersion?: string;
   output: CommandExecutorOutput;
   arguments: Record<string, CommandExecutorArgument>;
   policy: {
@@ -520,8 +520,10 @@ function parsePluginToolExecutor(
   if (!TOOL_NAME_RE.test(tool)) {
     throw new CommandExecutorError('executor_plugin_invalid', `${id}.tool 不合法`);
   }
-  const minimumVersion = nonBlank(value.minimumVersion, `${id}.minimumVersion`, 64);
-  if (!STABLE_VERSION_RE.test(minimumVersion)) {
+  const minimumVersion = value.minimumVersion === undefined
+    ? undefined
+    : nonBlank(value.minimumVersion, `${id}.minimumVersion`, 64);
+  if (minimumVersion !== undefined && !STABLE_VERSION_RE.test(minimumVersion)) {
     throw new CommandExecutorError('executor_plugin_invalid', `${id}.minimumVersion 必须是稳定语义版本 x.y.z`);
   }
   const output = parseOutput(value.output, id);
@@ -543,7 +545,7 @@ function parsePluginToolExecutor(
     kind: 'plugin-tool',
     plugin: pluginId,
     tool,
-    minimumVersion,
+    ...(minimumVersion === undefined ? {} : { minimumVersion }),
     output,
     arguments: argumentsSchema,
     policy: parseCommonPolicy(value.policy, id),

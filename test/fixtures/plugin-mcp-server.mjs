@@ -31,10 +31,12 @@ const server = new Server(
 );
 
 const contractTool = serverName === 'data'
-  ? 'execute_frozen_query'
-  : serverName === 'report'
-    ? 'render_report'
-    : undefined;
+  ? 'frozen_query_raw'
+  : serverName === 'legacy-data'
+    ? 'execute_frozen_query'
+    : serverName === 'report'
+      ? 'render_report'
+      : undefined;
 const jsonTool = serverName === 'json-report' ? 'read_report' : undefined;
 
 server.setRequestHandler(ListToolsRequestSchema, request => (contractTool || jsonTool)

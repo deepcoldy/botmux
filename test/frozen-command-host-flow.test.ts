@@ -121,13 +121,13 @@ vi.mock('@modelcontextprotocol/sdk/client/index.js', () => ({
     async listTools() {
       return {
         tools: mocks.toolsAvailable ? [{
-          name: 'execute_frozen_query',
+          name: 'frozen_query_raw',
           inputSchema: { type: 'object', properties: { payload: {}, parameters: {}, values: {} } },
         }] : [],
       };
     }
     async callTool(input: { name: string; arguments?: Record<string, any> }) {
-      if (input.name === 'execute_frozen_query') {
+      if (input.name === 'frozen_query_raw') {
         mocks.validateCalls += 1;
         mocks.runCalls += 1;
         const contract = mocks.runResultShape === 'html'
@@ -687,7 +687,7 @@ executors:
   - id: test.plugin.readonly
     kind: plugin-tool
     plugin: data-mcp
-    tool: execute_frozen_query
+    tool: frozen_query_raw
     minimumVersion: 0.2.0
     arguments:
       datasource:

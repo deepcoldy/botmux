@@ -21,8 +21,7 @@ executors:
   - id: data.query.readonly
     kind: plugin-tool
     plugin: data-mcp
-    tool: execute_frozen_query
-    minimumVersion: 0.4.1
+    tool: frozen_query_raw
     arguments:
       sql:
         type: string
@@ -52,7 +51,7 @@ renderers:
       maxOutputBytes: 60000
 ```
 
-支持 `process`、`script`、`plugin-tool` 三类 executor。`arguments.*.accepts` 明确值可来自 `literal`、`param` 或可信 `context:*`。plugin-tool 禁止声明 `open_id`、`union_id`、`user_id`、`email` 等身份参数，也禁止 `context:caller.*`；真实调用人只由一次性网关通过 `_meta` 注入。
+支持 `process`、`script`、`plugin-tool` 三类 executor。`arguments.*.accepts` 明确值可来自 `literal`、`param` 或可信 `context:*`。plugin-tool 禁止声明 `open_id`、`union_id`、`user_id`、`email` 等身份参数，也禁止 `context:caller.*`；真实调用人只由一次性网关通过 `_meta` 注入。能力以工具是否存在为准，`minimumVersion` 仅作可选附加校验；不写时不检查插件版本。
 
 `output` 有三种模式：
 
@@ -62,7 +61,7 @@ renderers:
 
 可选字段还有 `labels` / `labelsFrom`、`totalRowsField`、`auditFields`、`errorField`、`maxContentBytes`。未登记字段不会展示，也不能被规则引用。plugin-tool 的纯 literal 字符串最长 200000；动态参数和 process/script 仍最多 10000。
 
-Data MCP 插件 0.4.1 的 `execute_frozen_query` 只返回 `rows`、`columns`、`row_count`、`query_id`、`error_code`；参数编码、同字节 validate/run 和 `_meta` 身份仍由插件保证。宿主不理解 SQL。服务端还会按 `MAX_SQL_BYTES` 校验参数替换后的最终 SQL（默认 20000 个 UTF-8 字节），超限在审计日志中记录 `sql_too_large`，固化命令对用户只显示固定错误。
+Data MCP 插件 0.4.2 的 `frozen_query_raw` 只返回 `rows`、`columns`、`row_count`、`query_id`、`error_code`；参数编码、同字节 validate/run 和 `_meta` 身份仍由插件保证。宿主不理解 SQL。服务端还会按 `MAX_SQL_BYTES` 校验参数替换后的最终 SQL（默认 20000 个 UTF-8 字节），超限在审计日志中记录 `sql_too_large`，固化命令对用户只显示固定错误。
 
 ## 命令定义
 

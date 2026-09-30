@@ -143,11 +143,13 @@ executors:
       const example = /```yaml\n(schemaVersion: 2\nexecutors:\n  - id: data\.query\.readonly[\s\S]*?)\n\nrenderers:/u.exec(documentation)?.[1];
       if (!example) throw new Error(`missing Data MCP registry example in ${locale} documentation`);
       writeFileSync(fixture.registry, example);
-      expect(loadCommandExecutorRegistry(fixture.registry).executors.get('data.query.readonly'))
-        .toMatchObject({
-          kind: 'plugin-tool',
-          arguments: { sql: { accepts: ['literal'], maxLength: 100_000 } },
-        });
+      const executor = loadCommandExecutorRegistry(fixture.registry).executors.get('data.query.readonly');
+      expect(executor).toMatchObject({
+        kind: 'plugin-tool',
+        tool: 'frozen_query_raw',
+        arguments: { sql: { accepts: ['literal'], maxLength: 100_000 } },
+      });
+      expect(executor).not.toHaveProperty('minimumVersion');
     }
   });
 

@@ -56,7 +56,7 @@ executors:
   - id: test.plugin.readonly
     kind: plugin-tool
     plugin: data-mcp
-    tool: execute_frozen_query
+    tool: frozen_query_raw
     minimumVersion: 0.1.0
     arguments:
       sql:
@@ -196,7 +196,7 @@ executors:
   - id: data.query.readonly
     kind: plugin-tool
     plugin: data-mcp
-    tool: execute_frozen_query
+    tool: frozen_query_raw
     minimumVersion: 0.4.0
     arguments:
       sql: {type: string, required: true, maxLength: 100000, accepts: [literal]}
@@ -293,7 +293,7 @@ executors:
   - id: test.plugin.readonly
     kind: plugin-tool
     plugin: data-mcp
-    tool: execute_frozen_query
+    tool: frozen_query_raw
     minimumVersion: 0.1.0
     arguments:
       sql: { type: string, required: true, maxLength: 10000, accepts: [literal] }
@@ -541,6 +541,63 @@ renderers:
     expect(result.text).toContain('12');
     expect(result.text).not.toContain('SELECT sum');
     expect(result.projectedResult).toEqual({ rows: [{ amount: 12 }], row_count: 1 });
+  });
+
+  it('uses tool presence as the capability gate when minimumVersion is omitted', async () => {
+    const { root, definition } = fixture();
+    const registry = join(root, 'command-executors.yaml');
+    writeFileSync(registry, readFileSync(registry, 'utf8').replace('    minimumVersion: 0.1.0\n', ''));
+    const home = installFixturePlugin(root, 'data-mcp', 'data', '0.0.1');
+
+    await expect(executeFrozenCommand({
+      definition,
+      rawArgs: '30',
+      targetLarkAppId: 'cli_test',
+      botConfig: { plugins: ['data-mcp'], larkAppId: 'cli_test', larkAppSecret: 'test-secret' },
+      trustedCaller: {
+        requestUserOpenId: 'ou_test', requestUserUnionId: 'on_test', requestLarkAppId: 'cli_test', senderType: 'user',
+      },
+      turnId: 'om_turn',
+      dataDir: join(home, '.botmux', 'data'),
+    })).resolves.toMatchObject({ projectedResult: { rows: [{ amount: 12 }], row_count: 1 } });
+  });
+
+  it('fails closed when the registered tool is absent even if the retired tool exists', async () => {
+    const { root, definition } = fixture();
+    const home = installFixturePlugin(root, 'data-mcp', 'legacy-data', '0.4.2');
+
+    await expect(executeFrozenCommand({
+      definition,
+      rawArgs: '30',
+      targetLarkAppId: 'cli_test',
+      botConfig: { plugins: ['data-mcp'], larkAppId: 'cli_test', larkAppSecret: 'test-secret' },
+      trustedCaller: {
+        requestUserOpenId: 'ou_test', requestUserUnionId: 'on_test', requestLarkAppId: 'cli_test', senderType: 'user',
+      },
+      turnId: 'om_turn',
+      dataDir: join(home, '.botmux', 'data'),
+    })).rejects.toMatchObject({
+      code: 'plugin_tool_missing',
+      message: '插件缺少所需工具 frozen_query_raw',
+      executionFailure: false,
+    });
+  });
+
+  it('rejects an installed plugin below an explicit minimumVersion', async () => {
+    const { root, definition } = fixture();
+    const home = installFixturePlugin(root, 'data-mcp', 'data', '0.0.9');
+
+    await expect(executeFrozenCommand({
+      definition,
+      rawArgs: '30',
+      targetLarkAppId: 'cli_test',
+      botConfig: { plugins: ['data-mcp'], larkAppId: 'cli_test', larkAppSecret: 'test-secret' },
+      trustedCaller: {
+        requestUserOpenId: 'ou_test', requestUserUnionId: 'on_test', requestLarkAppId: 'cli_test', senderType: 'user',
+      },
+      turnId: 'om_turn',
+      dataDir: join(home, '.botmux', 'data'),
+    })).rejects.toMatchObject({ code: 'plugin_tool_version_unsupported', executionFailure: false });
   });
 
   it('connects an ordinary JSON MCP tool without host-specific code', async () => {

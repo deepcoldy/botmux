@@ -21,8 +21,7 @@ executors:
   - id: data.query.readonly
     kind: plugin-tool
     plugin: data-mcp
-    tool: execute_frozen_query
-    minimumVersion: 0.4.1
+    tool: frozen_query_raw
     arguments:
       sql:
         type: string
@@ -52,7 +51,7 @@ renderers:
       maxOutputBytes: 60000
 ```
 
-Executor kinds are `process`, `script`, and `plugin-tool`. `arguments.*.accepts` admits `literal`, `param`, or trusted `context:*` sources. A plugin-tool must not declare identity arguments such as `open_id`, `union_id`, `user_id`, or `email`, nor any `context:caller.*` source. The one-shot gateway injects the verified caller only through `_meta`.
+Executor kinds are `process`, `script`, and `plugin-tool`. `arguments.*.accepts` admits `literal`, `param`, or trusted `context:*` sources. A plugin-tool must not declare identity arguments such as `open_id`, `union_id`, `user_id`, or `email`, nor any `context:caller.*` source. The one-shot gateway injects the verified caller only through `_meta`. Capability is determined by tool presence; `minimumVersion` is only an optional additional check, and omitting it disables plugin-version validation.
 
 `output` supports three modes:
 
@@ -62,7 +61,7 @@ Executor kinds are `process`, `script`, and `plugin-tool`. `arguments.*.accepts`
 
 Optional fields are `labels` / `labelsFrom`, `totalRowsField`, `auditFields`, `errorField`, and `maxContentBytes`. Undeclared fields cannot be displayed or referenced. A plugin-tool string accepted only from `literal` may be up to 200000 characters; dynamic and process/script arguments remain capped at 10000.
 
-Data MCP 0.4.1 `execute_frozen_query` returns only `rows`, `columns`, `row_count`, `query_id`, and `error_code`. Parameter encoding, byte-identical validate/run, and `_meta` identity remain plugin responsibilities; the host does not interpret SQL. The service also enforces `MAX_SQL_BYTES` on rendered SQL (20000 UTF-8 bytes by default). An oversized query records `sql_too_large` in service audit logs while users receive only a fixed host error.
+Data MCP 0.4.2 `frozen_query_raw` returns only `rows`, `columns`, `row_count`, `query_id`, and `error_code`. Parameter encoding, byte-identical validate/run, and `_meta` identity remain plugin responsibilities; the host does not interpret SQL. The service also enforces `MAX_SQL_BYTES` on rendered SQL (20000 UTF-8 bytes by default). An oversized query records `sql_too_large` in service audit logs while users receive only a fixed host error.
 
 ## Command definition
 

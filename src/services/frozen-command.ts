@@ -1600,7 +1600,7 @@ function toolName(tools: Array<{ name?: unknown }>, pluginId: string, requested:
   if (names.includes(requested)) return requested;
   const candidates = names.filter(name => name === `${pluginId}__${requested}`);
   if (candidates.length === 1) return candidates[0]!;
-  throw new FrozenCommandError('plugin_tool_missing', `插件 ${pluginId} 未提供工具 ${requested}`);
+  throw new FrozenCommandError('plugin_tool_missing', `插件缺少所需工具 ${requested}`);
 }
 
 export function isTransientPluginToolFailure(text: string): boolean {
@@ -2078,7 +2078,7 @@ export async function executeFrozenCommand(input: FrozenCommandExecutionInput): 
       if (!pluginIds.includes(executor.plugin)) throw new FrozenCommandError('plugin_tool_not_enabled', `当前角色未启用插件 ${executor.plugin}`);
       const installed = getInstalledPlugin(executor.plugin);
       if (!installed) throw new FrozenCommandError('plugin_tool_not_installed', `插件 ${executor.plugin} 未安装`);
-      if (!pluginVersionAtLeast(installed.version, executor.minimumVersion)) {
+      if (executor.minimumVersion && !pluginVersionAtLeast(installed.version, executor.minimumVersion)) {
         throw new FrozenCommandError('plugin_tool_version_unsupported', `插件 ${executor.plugin} 版本不满足最低要求 ${executor.minimumVersion}`);
       }
       if (!installed.contributions?.mcp) throw new FrozenCommandError('plugin_tool_gateway_missing', `插件 ${executor.plugin} 未声明 MCP 工具入口`);

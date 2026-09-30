@@ -299,7 +299,7 @@ executors:
   - id: test.plugin.readonly
     kind: plugin-tool
     plugin: data-mcp
-    tool: execute_frozen_query
+    tool: frozen_query_raw
     minimumVersion: 0.1.0
     arguments:
       sql:
