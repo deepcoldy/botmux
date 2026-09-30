@@ -149,19 +149,21 @@ export function buildDispatchCompletionBrief(input: {
  * dispatch binding. Never strip user-authored XML or arbitrary instructions. */
 export function stripDispatchCompletionProtocol(content: string, dispatchRoot: string): string {
   const trimmed = content.trimEnd();
-  for (const exactReportRootEnabled of [true, false]) {
-    for (const sameTopicSendEnabled of [true, false]) {
-      const suffix = buildDispatchCompletionBrief({ brief: '', dispatchRootId: dispatchRoot,
-        exactReportRootEnabled, sameTopicSendEnabled });
-      // Rich-post parsing drops empty paragraphs and trims each line. Accept
-      // that exact representation too; an optional role footer is task data.
-      const postSuffix = '\n' + suffix.split('\n').map(line => line.trim()).filter(Boolean).join('\n');
-      for (const candidate of [suffix, postSuffix]) {
-        const start = trimmed.lastIndexOf(candidate);
-        if (start < 0) continue;
-        const tail = trimmed.slice(start + candidate.length);
-        if (tail === '' || /^\n{1,2}分工：\n(?:·[^\n]+(?:\n|$))+$/.test(tail)) {
-          return trimmed.slice(0, start) + tail;
+  for (const resultDelivery of ['relay', 'publish', 'publish-and-relay'] as const) {
+    for (const exactReportRootEnabled of [true, false]) {
+      for (const sameTopicSendEnabled of [true, false]) {
+        const suffix = buildDispatchCompletionBrief({ brief: '', dispatchRootId: dispatchRoot,
+          exactReportRootEnabled, sameTopicSendEnabled, resultDelivery });
+        // Rich-post parsing drops empty paragraphs and trims each line. Accept
+        // that exact representation too; an optional role footer is task data.
+        const postSuffix = '\n' + suffix.split('\n').map(line => line.trim()).filter(Boolean).join('\n');
+        for (const candidate of [suffix, postSuffix]) {
+          const start = trimmed.lastIndexOf(candidate);
+          if (start < 0) continue;
+          const tail = trimmed.slice(start + candidate.length);
+          if (tail === '' || /^\n{1,2}分工：\n(?:·[^\n]+(?:\n|$))+$/.test(tail)) {
+            return trimmed.slice(0, start) + tail;
+          }
         }
       }
     }

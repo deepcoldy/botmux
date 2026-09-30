@@ -331,7 +331,7 @@ export async function sendMessage(
 
     if (res.code !== 0) {
       if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(chatId);
-      throw new Error(`Failed to send message: ${res.msg} (code: ${res.code})`);
+      throw Object.assign(new Error(`Failed to send message: ${res.msg} (code: ${res.code})`), { code: res.code });
     }
 
     const messageId = res.data?.message_id;
@@ -394,7 +394,7 @@ export async function replyMessage(
 
     if (res.code !== 0) {
       if (res.code === LARK_CODE_MESSAGE_WITHDRAWN) throw new MessageWithdrawnError(messageId);
-      throw new Error(`Failed to reply message: ${res.msg} (code: ${res.code})`);
+      throw Object.assign(new Error(`Failed to reply message: ${res.msg} (code: ${res.code})`), { code: res.code });
     }
 
     const replyId = res.data?.message_id;

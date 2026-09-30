@@ -79,6 +79,18 @@ function authorize(
 }
 
 describe('report session relay authorization', () => {
+  it('binds delivery keys to content so changed content cannot replay an old receipt', () => {
+    const raw = { sessionId: 'session-source', dispatchRoot: 'om_dispatch',
+      originCapability: CAPABILITY, delivery: 'publish', content: 'first result' };
+    const first = authorize({ raw });
+    const retry = authorize({ raw: { ...raw } });
+    const changed = authorize({ raw: { ...raw, content: 'corrected result' } });
+    expect(first.ok && retry.ok && changed.ok).toBe(true);
+    if (!first.ok || !retry.ok || !changed.ok) throw new Error('authorization failed');
+    expect(first.deliveryKey).toBe(retry.deliveryKey);
+    expect(changed.deliveryKey).not.toBe(first.deliveryKey);
+  });
+
   it('authorizes the current isolated thread session and derives both identities server-side', () => {
     expect(authorize()).toEqual({
       ok: true,

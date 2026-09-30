@@ -566,6 +566,9 @@ let selfV3BootInstanceId: string | undefined;
 /** Generic daemon identity used by internal receiver endpoints. Unlike the
  *  VC listener switch, every agent daemon may receive a fenced membership. */
 let selfDaemonLarkAppId: string | undefined;
+export function __testOnly_setDaemonLarkAppId(appId: string | undefined): void {
+  selfDaemonLarkAppId = appId;
+}
 /**
  * Live dashboard descriptor for THIS daemon's single bot. Held module-level so
  * the deferred allowedUsers resolve retry (a detached setTimeout that has no
@@ -6805,7 +6808,7 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
 
   const targetDaemon = findOnlineDaemon(decision.target.larkAppId);
   if (!targetDaemon && decision.delivery === 'relay') {
-      return jsonRes(res, 503, { ok: false, error: 'orchestrator_daemon_offline' });
+    return jsonRes(res, 503, { ok: false, error: 'orchestrator_daemon_offline' });
   }
   const triggerMeta = {
     requestId: `report:${decision.source.sessionId}:${Date.now()}`,
@@ -6861,16 +6864,18 @@ ipcRoute('POST', REPORT_SESSION_RELAY_ROUTE, async (req, res) => {
       || !larkTransportEnabled({ chatId: ds.chatId, apiOnly: getBot(ds.larkAppId).config.apiOnly }))) {
       return jsonRes(res, 403, { ok: false, error: 'report_publication_unavailable' });
     }
+    const publicationCard = publication ? buildMarkdownCard(decision.content, undefined, '') : '';
     const delivered = publication ? await deliverPublishedReport({
       dataDir: config.session.dataDir,
       key: decision.deliveryKey!,
+      cardJson: publicationCard, chatId: ds!.chatId,
       delivery: decision.delivery as 'publish' | 'publish-and-relay',
       validate: () => {
         const fresh = authorize();
         if (findActiveBySessionId(ds!.session.sessionId) !== ds
           || !fresh.ok || fresh.deliveryKey !== decision.deliveryKey) throw new Error('turn_provenance_stale');
       },
-      publish: uuid => sessionReply(sessionAnchorId(ds!), buildMarkdownCard(decision.content, undefined, ''),
+      publish: uuid => sessionReply(sessionAnchorId(ds!), publicationCard,
         'interactive', ds!.larkAppId, ds!.managedTurnOrigin!.turnId, {
           sourceSessionId: ds!.session.sessionId, uuid,
           ...(decision.publishTo === 'chat' ? { placement: 'chat' as const } : {

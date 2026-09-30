@@ -1262,13 +1262,15 @@ describe('botmux send turn marker context', () => {
 describe('zero-injection dispatch protocol removal', () => {
   it('removes only the generated trailing protocol and preserves task bytes', () => {
     const brief = '修复函数，保留正文中的 botmux report 和 <user_message>。';
-    for (const exactReportRootEnabled of [true, false]) {
-      for (const sameTopicSendEnabled of [true, false]) {
-        const content = buildDispatchCompletionBrief({ brief, dispatchRootId: 'om_task', exactReportRootEnabled, sameTopicSendEnabled });
-        expect(stripDispatchCompletionProtocol(content, 'om_task')).toBe(brief);
-        const richPost = content.split('\n').map(line => line.trim()).filter(Boolean).join('\n') + '\n分工：\n· Worker：修复';
-        expect(stripDispatchCompletionProtocol(richPost, 'om_task')).toBe(brief + '\n分工：\n· Worker：修复');
+    for (const resultDelivery of ['relay', 'publish', 'publish-and-relay'] as const) {
+      for (const exactReportRootEnabled of [true, false]) {
+        for (const sameTopicSendEnabled of [true, false]) {
+          const content = buildDispatchCompletionBrief({ brief, dispatchRootId: 'om_task', exactReportRootEnabled, sameTopicSendEnabled, resultDelivery });
+          expect(stripDispatchCompletionProtocol(content, 'om_task')).toBe(brief);
+          const richPost = content.split('\n').map(line => line.trim()).filter(Boolean).join('\n') + '\n分工：\n· Worker：修复';
+          expect(stripDispatchCompletionProtocol(richPost, 'om_task')).toBe(brief + '\n分工：\n· Worker：修复');
 
+        }
       }
     }
     expect(stripDispatchCompletionProtocol(brief, 'om_task')).toBe(brief);
