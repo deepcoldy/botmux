@@ -57,6 +57,8 @@ describe('redactChildEnv()', () => {
       LARK_APP_ID: 'cli_bot',
       LARK_APP_SECRET: 'secret',
       ONCALL_SERVICE_SECRET: 'oncall-secret',
+      NODE_CHANNEL_FD: '3',
+      NODE_CHANNEL_SERIALIZATION_MODE: 'json',
       CLAUDECODE: '1',
       KEEP: 'v',
       PATH: '/usr/bin',
@@ -69,6 +71,8 @@ describe('redactChildEnv()', () => {
     expect('LARK_APP_ID' in out).toBe(false);
     expect('LARK_APP_SECRET' in out).toBe(false);
     expect('ONCALL_SERVICE_SECRET' in out).toBe(false);
+    expect('NODE_CHANNEL_FD' in out).toBe(false);
+    expect('NODE_CHANNEL_SERIALIZATION_MODE' in out).toBe(false);
     expect(REDACTED_CHILD_ENV_KEYS).toContain('ONCALL_SERVICE_SECRET');
     expect('CLAUDECODE' in out).toBe(false);
     // Unrelated vars pass through untouched.
