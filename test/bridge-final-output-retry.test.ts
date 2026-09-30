@@ -576,8 +576,29 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0, undefined, undefined, { mode: 'thread', rootMessageId: 'om_root' });
     await vi.advanceTimersByTimeAsync(10);
     expect(topicDetailMock).toHaveBeenCalledWith('app_test', 'om_root');
+    const lookups = topicDetailMock.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(topicDetailMock).toHaveBeenCalledTimes(lookups);
+    expect(ds.agentAttention).toMatchObject({ kind: 'blocked', reason: expect.stringContaining('TOPIC_SEND_BLOCKED') });
     expect(sessionReply).not.toHaveBeenCalled();
     expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+  });
+
+  it('shares the automatic final precheck with the provider send boundary', async () => {
+    const current = getBot('app_test');
+    vi.mocked(getBot).mockReturnValue({ ...current, config: { ...current.config, topicUnavailablePolicy: 'stop' } } as any);
+    topicDetailMock.mockResolvedValueOnce({ items: [{ message_id: 'om_root', deleted: false }] });
+    const sessionReply = vi.fn(async (...args: any[]) => {
+      await args[5].topicMessageLookup('app_test', 'om_root');
+      return 'om_sent';
+    });
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const before = topicDetailMock.mock.calls.length;
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(makeDs(), finalOutputMsg(), 'tag', 0, undefined, undefined, { mode: 'thread', rootMessageId: 'om_root' });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(topicDetailMock.mock.calls.length - before).toBe(1);
   });
 
   it('turnFailed final_output on a session WITHOUT a human recipient @mentions the bot admin', async () => {

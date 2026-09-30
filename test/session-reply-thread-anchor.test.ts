@@ -74,6 +74,7 @@ vi.mock('../src/services/vc-meeting-listener-topic-store.js', () => ({
   }),
 }));
 
+import { createTopicMessageLookupCache } from '../src/cli/topic-send-guard.js';
 import { registerBot } from '../src/bot-registry.js';
 import { activeSessionKey, sessionKey } from '../src/core/types.js';
 import { __testOnly_sessionReply as sessionReply, __testOnly_activeSessions as activeSessions } from '../src/daemon.js';
@@ -170,6 +171,24 @@ describe('sessionReply chat-scope chokepoint — shared fold-back anchoring', ()
     await expect(sessionReply(CHAT, 'answer', 'text', APP, 'turn-a', { quoteMessageId: 'om_human_a' })).rejects.toThrow();
     expect(mocks.sendMessage).not.toHaveBeenCalled();
     expect(mocks.replyMessage).toHaveBeenCalledTimes(failure === 'race' ? 1 : 0);
+  });
+
+  it('reuses a worker precheck only inside the same delivery', async () => {
+    registerBot({ larkAppId: APP, larkAppSecret: 's', cliId: 'claude-code', allowedUsers: [], topicUnavailablePolicy: 'stop' });
+    const ds = seedSharedSession({ rootMessageId: 'om_topic', turnId: 'turn-1', updatedAt: NOW });
+    mocks.getMessageDetail.mockResolvedValue({ items: [{ message_id: 'om_topic', deleted: false }] });
+    const cache = createTopicMessageLookupCache(mocks.getMessageDetail);
+    await cache.lookup(APP, 'om_topic');
+    await sessionReply(CHAT, 'result', 'text', APP, 'turn-1', {
+      sourceSessionId: ds.session.sessionId, topicMessageLookup: cache.lookup,
+    });
+    expect(mocks.getMessageDetail).toHaveBeenCalledTimes(1);
+    expect(mocks.replyMessage).toHaveBeenCalledTimes(1);
+    // A separate send must query again; no process-wide cache can mask withdrawal.
+    mocks.getMessageDetail.mockResolvedValue({ items: [{ message_id: 'om_topic', deleted: true }] });
+    await expect(sessionReply(CHAT, 'next', 'text', APP, 'turn-1')).rejects.toThrow('TOPIC_SEND_BLOCKED');
+    expect(mocks.getMessageDetail).toHaveBeenCalledTimes(2);
+    expect(mocks.replyMessage).toHaveBeenCalledTimes(1);
   });
 
   it('repo-card-style send (interactive, NO turnId) threads into the shared topic, not top-level', async () => {

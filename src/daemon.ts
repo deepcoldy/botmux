@@ -4054,7 +4054,7 @@ async function sessionReply(
     replyInThread: boolean,
     uuid?: string,
   ): Promise<string> => {
-    await assertSendTopicsAvailable(appId, [messageId], getTopicMessageDetail, getBot(appId).config.topicUnavailablePolicy);
+    await assertSendTopicsAvailable(appId, [messageId], opts?.topicMessageLookup ?? getTopicMessageDetail, getBot(appId).config.topicUnavailablePolicy);
     return persistPrincipalLaneOutbound(await (outboundOptions
       ? replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext, outboundOptions)
       : replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext)));

@@ -1407,7 +1407,7 @@ export async function getMessageDetail(
     with_sender_name: 'true',
   }, options);
   if (res.code !== 0) {
-    throw new Error(`Failed to get message: ${res.msg} (code: ${res.code})`);
+    throw Object.assign(new Error(`Failed to get message: ${res.msg} (code: ${res.code})`), { code: res.code });
   }
   return res.data;
 }
