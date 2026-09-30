@@ -39,7 +39,10 @@ describe('send --dry-run', () => {
     expect(output.diagnostics).toEqual([]);
     expect(output.card.schema).toBe('2.0');
     expect(output.card.body.elements.map((element: { tag: string }) => element.tag)).toEqual(['markdown', 'chart']);
-    expect(output.bytes).toBe(Buffer.byteLength(JSON.stringify(output.card)));
+    // Sized like the Feishu request (envelope + re-serialized content), so
+    // strictly larger than the bare card JSON.
+    expect(output.bytes).toBeGreaterThan(Buffer.byteLength(JSON.stringify(output.card)));
+    expect(output.fits).toBe(true);
   });
 
   it('accepts positional content', () => {
@@ -54,6 +57,13 @@ describe('send --dry-run', () => {
     expect(result.status).toBe(0);
     expect(result.stderr).toContain('图表「远程」已降级为数据表（data_url_not_allowed）');
     expect(JSON.parse(result.stdout).diagnostics).toEqual([{ kind: 'chart_degraded', reason: 'data_url_not_allowed', title: '远程' }]);
+  });
+
+  it('previews post-JSON bodies the same way a real send extracts them', () => {
+    const post = JSON.stringify({ zh_cn: { content: [[{ tag: 'text', text: '**加粗**' }]] } });
+    const result = run(['send', '--dry-run', '--content-file', '@body'], post);
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout).card.body.elements[0]).toMatchObject({ tag: 'markdown', content: '**加粗**' });
   });
 
   it('refuses custom cards and empty bodies', () => {

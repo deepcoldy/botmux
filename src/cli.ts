@@ -8403,6 +8403,7 @@ import {
   buildReplyCardFooter,
   buildCardBodyElements,
   createReplyCard,
+  fitChartsToCardBudget,
   extractFirstReplyCardHeading,
   prepareCardMarkdown,
   type CardRenderDiagnostic,
@@ -9076,7 +9077,7 @@ async function sendDryRun(rest: string[]): Promise<void> {
     const pos = positionals(rest, ['--dry-run', '--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash']);
     content = pos.length > 0 ? pos.join(' ') : await readStdin();
   }
-  content = stripTrailingOaiMemoryCitation(content);
+  content = extractCardText(stripTrailingOaiMemoryCitation(content));
   if (!content.trim()) {
     console.error('botmux send --dry-run: 正文为空');
     process.exit(2);
@@ -9087,9 +9088,11 @@ async function sendDryRun(rest: string[]): Promise<void> {
     ? 'disabled'
     : configuredLinkMode === 'lexical' ? 'lexical' : 'filesystem';
   const card = createReplyCard(buildCardBodyElements(content, process.cwd(), localHomeLinkMode, undefined, diagnostics));
-  const json = JSON.stringify(card);
+  // Same sizing as a real send: Feishu request body incl. envelope.
+  const budget = fitChartsToCardBudget(card, { reserveBytes: 2_000, diagnostics });
   reportCardRenderDiagnostics(diagnostics);
-  console.log(JSON.stringify({ dryRun: true, bytes: Buffer.byteLength(json, 'utf8'), diagnostics, card }, null, 2));
+  if (!budget.fits) console.error(`botmux send --dry-run: 卡片请求体约 ${budget.bytes} 字节，超过飞书 30KB 上限，发送时可能被拒收`);
+  console.log(JSON.stringify({ dryRun: true, bytes: budget.bytes, fits: budget.fits, diagnostics, card }, null, 2));
 }
 
 async function cmdSend(rest: string[]): Promise<void> {
@@ -11507,8 +11510,7 @@ async function cmdSend(rest: string[]): Promise<void> {
       const elements = (md || imageKeys.length > 0)
         ? buildImageCardElements(md, imageKeys, process.cwd(), localHomeLinkMode, imageMode, renderDiagnostics)
         : [];
-      // Degradation never blocks delivery; the sender learns why on stderr.
-      reportCardRenderDiagnostics(renderDiagnostics);
+
 
       // Footer: de-emphasized markdown (v2 dropped the `note` tag). Use small
       // text size + grey font tag so it reads like a footnote below the hr.
@@ -11593,6 +11595,16 @@ async function cmdSend(rest: string[]): Promise<void> {
         canonicalCard.body.elements.splice(footerIndex >= 0 ? footerIndex : canonicalCard.body.elements.length, 0, feedbackElement);
         feedbackBaseCard = canonicalCard as unknown as Record<string, unknown>;
       }
+      // Fit charts to Feishu's 30KB request limit on the fully assembled card;
+      // the reserve covers the on-call button attached below. Degradation never
+      // blocks delivery — the sender learns why on stderr.
+      const budget = fitChartsToCardBudget(canonicalCard, {
+        chatId: targetChatId,
+        reserveBytes: 2_000,
+        diagnostics: renderDiagnostics,
+      });
+      reportCardRenderDiagnostics(renderDiagnostics);
+      if (!budget.fits) console.error(`botmux send: 卡片请求体约 ${budget.bytes} 字节，超过飞书 30KB 上限，可能被拒收`);
       const replyCardJson = withOncallGroup(JSON.stringify(canonicalCard));
       if (feedbackBaseCard && oncallGroupCard) feedbackBaseCard = oncallGroupCard;
       const replyStore = new TurnReplyCardStore(resolveDataDir());

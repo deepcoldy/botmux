@@ -507,7 +507,8 @@ botmux send --videos /tmp/replay.mp4 --video-covers /tmp/cover.png --no-mention 
 - 数据只能用 \`data.values\` 内联（≤500 行，值为字符串 / 数字 / 布尔 / null）；\`data.url\`、\`transform\`、\`params\`、\`expr\`、\`signal\`、\`datasets\`、\`layer\` 等一律不支持。
 - \`mark\` 取 \`bar\` / \`line\` / \`area\` / \`point\` / \`arc\`；编码只用 \`x\` / \`y\` / \`color\` / \`theta\`（字段写 \`field\`、\`type\`、\`title\`，不支持 \`aggregate\` 等，先把数据聚合好再画）。
 - 饼图用 \`mark: arc\` + \`theta\`（数值）+ \`color\`（类别）；\`mark: {type: arc, innerRadius: 40}\` 是环图。
-- 每张卡片最多 5 个图表。不支持或超限的图表会降级成一行说明 + 原始数据表，并在 stderr 给出原因；消息照常发出。
+- \`x\`/\`y\` 的 \`title\` 是坐标轴标题，\`color\` 的 \`title\` 是图例标题；\`temporal\` 不解析日期，按给定顺序当类别画，先排好序。
+- 每张卡片最多 5 个图表；整张卡片的飞书请求体上限是 30KB，放不下时图表会逐级降级（图表 → 50 行表 → 10 行表 → 只留说明）。不支持或降级的图表在 stderr 给出原因；消息照常发出。发之前可以用 \`--dry-run\` 看 \`bytes\` / \`fits\`。
 
 ~~~bash
 botmux send --no-mention <<'EOF'
@@ -521,7 +522,7 @@ EOF
 
 ### 发送前自查：--dry-run
 
-\`botmux send --dry-run\`（正文照常用位置参数 / stdin / \`--content-file\`）不发送任何消息，只把正文按卡片渲染后输出 JSON：\`{dryRun, bytes, diagnostics, card}\`。\`diagnostics\` 列出被降级的图表及原因。它只渲染正文，不上传图片/附件、不解析 @、不加页脚，也不需要会话。
+\`botmux send --dry-run\`（正文照常用位置参数 / stdin / \`--content-file\`）不发送任何消息，只把正文按卡片渲染后输出 JSON：\`{dryRun, bytes, fits, diagnostics, card}\`，\`bytes\` 按飞书真实请求体计算。\`diagnostics\` 列出被降级的图表及原因。它只渲染正文，不上传图片/附件、不解析 @、不加页脚，也不需要会话。
 
 ### 原始飞书/Lark 卡片 JSON
 

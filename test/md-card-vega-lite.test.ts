@@ -1,5 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { buildCardBodyElements, buildImageCardElements, type CardRenderDiagnostic } from '../src/im/lark/md-card.js';
+import {
+  buildCanonicalFinalReplyCard,
+  buildCardBodyElements,
+  buildContextualReplyCard,
+  buildImageCardElements,
+  buildMarkdownCard,
+  createReplyCard,
+  fitChartsToCardBudget,
+  type CardRenderDiagnostic,
+} from '../src/im/lark/md-card.js';
+import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../src/im/lark/turn-reply-card-size.js';
 
 const chart = (title: string, values: unknown[] = [{ d: 'a', v: 1 }, { d: 'b', v: 2 }]) => [
   '```vega-lite',
@@ -43,14 +53,67 @@ describe('buildCardBodyElements · vega-lite fences', () => {
     expect(elements.at(-1)?.tag).toBe('table');
   });
 
-  it('degrades charts once their combined size exceeds the card budget', () => {
+  it('fits every card builder under the 30KB request limit, degrading charts step by step', () => {
+    // Deterministic pseudo-random specs: many rows, long labels, quotes and
+    // backslashes (double-escaped in the request body), several fences, and
+    // fences that degrade on their own.
+    let seed = 42;
+    const rand = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+    const label = (n: number) => `标签"\\${'x'.repeat(Math.floor(rand() * 40))}-${n}`;
+    for (let trial = 0; trial < 40; trial++) {
+      const fences = Array.from({ length: 1 + Math.floor(rand() * 6) }, (_, f) => {
+        const count = 1 + Math.floor(rand() * 520);
+        const values = Array.from({ length: count }, (_, i) => ({ d: label(i), v: i, c: rand() > 0.5 ? 'A' : 'B' }));
+        const mark = rand() > 0.8 ? 'rect' : 'bar';
+        return ['```vega-lite', JSON.stringify({ title: `T${trial}-${f}`, data: { values }, mark, encoding: { x: { field: 'd' }, y: { field: 'v' }, color: { field: 'c' } } }), '```'].join('\n');
+      }).filter(fence => Buffer.byteLength(fence) < 30 * 1024);
+      const markdown = `## 报表 ${trial}\n\n${fences.join('\n\n')}`;
+      for (const json of [
+        buildMarkdownCard(markdown, 'ou_x', undefined, 'zh', '/', 'disabled'),
+        buildCanonicalFinalReplyCard({ markdown, workingDir: '/', localHomeLinkMode: 'disabled' }),
+        buildContextualReplyCard({ title: 't', assistantText: markdown, assistantLabel: 'bot', workingDir: '/', localHomeLinkMode: 'disabled' }),
+      ]) {
+        expect(turnReplyCardRequestBytes(json, `oc_${'0'.repeat(32)}`)).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
+      }
+    }
+  });
+
+  it('keeps small charts intact and reports charts it had to shrink', () => {
+    const small = buildMarkdownCard(chart('S'), undefined, '', 'zh', '/', 'disabled');
+    expect(JSON.parse(small).body.elements.some((element: { tag: string }) => element.tag === 'chart')).toBe(true);
+    const bulky = Array.from({ length: 480 }, (_, i) => ({ d: `day-${i}-${'"\\'.repeat(8)}`, v: i }));
+    const card = createReplyCard(buildCardBodyElements(chart('Big', bulky), '/', 'disabled'));
     const diagnostics: CardRenderDiagnostic[] = [];
-    const bulky = Array.from({ length: 400 }, (_, i) => ({ d: `day-${i}-${'x'.repeat(40)}`, v: i }));
-    const source = [chart('B0', bulky), chart('B1', bulky), chart('B2', bulky)].join('\n\n');
-    const elements = buildCardBodyElements(source, '/', 'disabled', undefined, diagnostics);
-    expect(elements.filter(element => element.tag === 'chart').length).toBeLessThan(3);
-    expect(diagnostics.map(item => item.reason)).toContain('chart_budget_exceeded');
-    expect(Buffer.byteLength(JSON.stringify(elements.filter(element => element.tag === 'chart')))).toBeLessThanOrEqual(60 * 1024);
+    const result = fitChartsToCardBudget(card, { diagnostics });
+    expect(result.fits).toBe(true);
+    expect(result.bytes).toBeLessThanOrEqual(TURN_REPLY_CARD_MAX_BYTES);
+    expect(card.body.elements.some((element: { tag: string }) => element.tag === 'chart')).toBe(false);
+    // The data survives as a table.
+    expect(card.body.elements.some((element: { tag: string }) => element.tag === 'table')).toBe(true);
+    expect(diagnostics).toEqual([{ kind: 'chart_degraded', reason: 'card_budget_exceeded', title: 'Big' }]);
+  });
+
+  it('keeps shrinking degraded tables down to the notice when even 50 rows do not fit', () => {
+    const wide = Array.from({ length: 50 }, (_, i) => Object.fromEntries(
+      Array.from({ length: 10 }, (_, c) => [`col${c}`, `${i}-${'宽'.repeat(12)}`]),
+    ));
+    const fence = ['```vega-lite', JSON.stringify({ title: 'W', data: { values: wide }, mark: 'rect' }), '```'].join('\n');
+    expect(Buffer.byteLength(fence)).toBeLessThan(30 * 1024);
+    const card = createReplyCard(buildCardBodyElements(`${fence}\n\n${fence}`, '/', 'disabled'));
+    const result = fitChartsToCardBudget(card);
+    expect(result.fits).toBe(true);
+    const tables = card.body.elements.filter((element: { tag: string }) => element.tag === 'table');
+    // Two 50-row tables of this width cannot both fit in 30KB, so the pass
+    // must have taken at least one fence past stage 1.
+    expect(tables.some((table: { rows: unknown[] }) => table.rows.length <= 10)).toBe(true);
+  });
+
+  it('never touches elements that did not come from a chart fence', () => {
+    const table = `| a |\n| - |\n${Array.from({ length: 800 }, (_, i) => `| ${'x'.repeat(40)}${i} |`).join('\n')}`;
+    const card = createReplyCard(buildCardBodyElements(table, '/', 'disabled'));
+    const before = JSON.stringify(card);
+    expect(fitChartsToCardBudget(card).fits).toBe(false);
+    expect(JSON.stringify(card)).toBe(before);
   });
 
   it('threads diagnostics through the image-aware entry used by botmux send', () => {

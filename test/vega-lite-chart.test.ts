@@ -78,8 +78,35 @@ describe('convertVegaLiteFence', () => {
     ['unsupported mark', spec({ mark: 'rect' }), 'mark_rect_not_supported'],
     ['non-scalar value', spec({ data: { values: [{ d: 'a', v: [1] }] } }), 'data_value_invalid'],
     ['arc without color', spec({ mark: 'arc', encoding: { theta: { field: 'v' } } }), 'arc_requires_theta_and_color'],
+    ['tooltip channel', spec({ encoding: { x: { field: 'd' }, y: { field: 'v' }, tooltip: { field: 'v' } } }), 'encoding_tooltip_not_supported'],
+    ['theta title', JSON.stringify({ data: { values: rows }, mark: 'arc', encoding: { theta: { field: 'v', title: 't' }, color: { field: 'd' } } }), 'encoding_theta_title_not_supported'],
   ])('degrades %s', (_label, source, reason) => {
     expect(convertVegaLiteFence(source)).toMatchObject({ ok: false, reason });
+  });
+
+  it('maps channel titles to VChart axes and legend titles', () => {
+    const result = convertVegaLiteFence(JSON.stringify({
+      data: { values: [{ d: 'a', v: 1, c: 'TH' }] }, mark: 'line',
+      encoding: { x: { field: 'd', title: '日期' }, y: { field: 'v', title: '金额' }, color: { field: 'c', title: '国家' } },
+    }));
+    expect(result.ok && result.element.chart_spec).toMatchObject({
+      axes: [{ orient: 'bottom', title: { visible: true, text: '日期' } }, { orient: 'left', title: { visible: true, text: '金额' } }],
+      legends: { visible: true, title: { visible: true, text: '国家' } },
+    });
+  });
+
+  it('treats data columns named like forbidden keys as plain data', () => {
+    const values = [{ url: '/home', params: 'a', expr: 'b', hits: 100 }];
+    const result = convertVegaLiteFence(JSON.stringify({ data: { values }, mark: 'bar', encoding: { x: { field: 'url' }, y: { field: 'hits' } } }));
+    expect(result.ok).toBe(true);
+    // …while a forbidden key beside the rows is still caught.
+    expect(convertVegaLiteFence(JSON.stringify({ data: { values, url: 'http://x' }, mark: 'bar' }))).toMatchObject({ ok: false, reason: 'data_url_not_allowed' });
+  });
+
+  it('keeps reason codes inert even when they quote the source', () => {
+    const result = convertVegaLiteFence(spec({ mark: { type: "ba'r\n<X>" } }));
+    expect(result).toMatchObject({ ok: false });
+    expect(result.ok === false && result.reason).toMatch(/^[A-Za-z0-9_$?-]+$/);
   });
 
   it('rejects invalid JSON, oversize specs and too many rows', () => {
@@ -88,7 +115,10 @@ describe('convertVegaLiteFence', () => {
     const big = spec({ description: 'x'.repeat(MAX_VEGA_LITE_SPEC_BYTES) });
     expect(convertVegaLiteFence(big)).toMatchObject({ ok: false, reason: 'spec_too_large' });
     const many = Array.from({ length: MAX_VEGA_LITE_ROWS + 1 }, (_, i) => ({ d: String(i), v: i }));
-    expect(convertVegaLiteFence(spec({ data: { values: many } }))).toMatchObject({ ok: false, reason: 'too_many_data_points' });
+    const tooMany = convertVegaLiteFence(spec({ data: { values: many } }));
+    expect(tooMany).toMatchObject({ ok: false, reason: 'too_many_data_points' });
+    // The leading rows survive for the degraded table.
+    expect(tooMany.ok === false && tooMany.rows?.length).toBe(50);
   });
 
   it('keeps readable inline rows for the degraded table, but none for remote-only data', () => {
