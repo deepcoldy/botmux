@@ -32,6 +32,7 @@ import {
   normaliseForFingerprint,
   isMeaningfulUserEvent,
   isMeaningfulQueuedCommand,
+  isScheduledTurnStartEvent,
   isPureToolResultUserEvent,
   extractTurnStartText,
   isClaudeTurnTerminalEvent,
@@ -74,6 +75,18 @@ export interface BridgePendingTurn {
    *  "🖥️ 终端本地对话" header — otherwise the user would see an orphan
    *  reply with no prompt for context. Lark-driven turns keep this unset. */
   isLocal?: boolean;
+  /** Set for a turn opened by Claude Code's BUILT-IN scheduler
+   *  (CronCreate): the opening user record is `isMeta:true` with
+   *  `turnOrigin:"scheduled"`. Such a turn stays `isLocal` (no Lark
+   *  fingerprint, no CoT card, no durable journal), but unlike terminal
+   *  typing its final answer is auto-forwarded to the originating Lark
+   *  thread — the fire was scheduled on the user's behalf. Explicit
+   *  `botmux send` dedup and BOTMUX_NOTHING_TO_SEND silence still apply. */
+  isScheduled?: boolean;
+  /** Lark turn id this scheduled turn's final should anchor to (chat-scope
+   *  topic routing). Captured as the latest marked Lark turn at fire time.
+   *  Unused in thread scope, where the session root is the anchor. */
+  replyAnchorTurnId?: string;
   /** Transcript uuid of the user event that started this turn. Stored for
    *  local turns so emit can fetch the user-typed content from the source
    *  jsonl alongside the assistant uuids. Lark turns don't need it because
@@ -170,6 +183,10 @@ export class BridgeTurnQueue {
   private queue: BridgePendingTurn[] = [];
   private collecting: BridgePendingTurn | null = null;
   private lastLocalTurnId?: string;
+  /** Turn id of the most recent real Lark mark. A built-in scheduled fire
+   *  has no Lark fingerprint of its own, so its reply anchors to this turn's
+   *  topic (chat scope). Thread-scope sessions ignore it and use the root. */
+  private lastMarkedTurnId?: string;
   /** Lark turns removed by the head-of-line drop, awaiting journal cleanup by
    *  the worker. This queue is pure (no fs), so it cannot clear the durable
    *  journal itself — it reports, the worker retires. Same contract as
@@ -220,6 +237,7 @@ export class BridgeTurnQueue {
       markTimeMs,
       ...(opts?.restoredFromJournal ? { restoredFromJournal: true } : {}),
     });
+    this.lastMarkedTurnId = turnId;
     return turnId;
   }
 
@@ -300,6 +318,15 @@ export class BridgeTurnQueue {
       this.seen.add(uuid);
       const role = ev.message?.role ?? ev.type;
       if (role === 'user') {
+        // Built-in CronCreate fire: isMeta + turnOrigin:"scheduled". It is
+        // NOT a meaningful human event (fingerprint matching must never bind a
+        // pending Lark mark to the scheduler's prompt), but it DOES open a
+        // real model turn whose final belongs in the originating Lark thread.
+        // Handle it before the isMeaningfulUserEvent filter below.
+        if (isScheduledTurnStartEvent(ev)) {
+          this.handleScheduledTurnStart(uuid, ev, sourceJsonlPath);
+          continue;
+        }
         // Skip ALL non-meaningful user events: tool_result (intra-turn
         // machinery), `<command-name>/clear</command-name>` and other
         // slash-command wrappers (Claude rewrites them after /clear /
@@ -439,6 +466,54 @@ export class BridgeTurnQueue {
         }
       }
     }
+  }
+
+  /** Built-in CronCreate fire handler. Like a local-terminal turn it matches
+   *  no Lark fingerprint, but it is user-scheduled rather than ambient typing,
+   *  so the worker forwards its final (isScheduled) and anchors the reply to
+   *  the most recent Lark turn's topic. Pending Lark marks stay unstarted —
+   *  the scheduler's prompt must never fingerprint-bind them. */
+  private handleScheduledTurnStart(uuid: string, ev: TranscriptEvent, sourceJsonlPath?: string): void {
+    // Same transcript-order closeout as a real turn start.
+    if (this.collecting?.dispatchAttempt !== undefined && !this.collecting.terminalObserved) {
+      this.collecting.terminalObserved = true;
+      this.collecting = null;
+    }
+    if (this.collecting
+      && !this.collecting.terminalObserved
+      && this.collecting.assistantUuids.length === 0) {
+      const idx = this.queue.indexOf(this.collecting);
+      if (idx >= 0) this.queue.splice(idx, 1);
+      if (!this.collecting.isLocal) this.droppedNeedingJournalClear.push(this.collecting);
+      this.collecting = null;
+    }
+    const tsParsed = ev.timestamp ? Date.parse(ev.timestamp) : NaN;
+    const eventTimeMs = Number.isFinite(tsParsed) ? tsParsed : Date.now();
+    // scheduledFireId is unique per fire and always present; fall back to the
+    // record uuid only defensively.
+    const fireId = typeof ev.scheduledFireId === 'string' && ev.scheduledFireId
+      ? ev.scheduledFireId
+      : uuid;
+    const scheduledTurn: BridgePendingTurn = {
+      turnId: `scheduled-${fireId}`,
+      started: true,
+      isLocal: true,
+      isScheduled: true,
+      replyAnchorTurnId: this.lastMarkedTurnId,
+      // Inherit the previous local turn's reply context (zero-injection
+      // sessions capture it daemon-side via terminal_turn_started).
+      replyContextTurnId: this.lastLocalTurnId,
+      userUuid: uuid,
+      assistantUuids: [],
+      sourceJsonlPath,
+      markTimeMs: eventTimeMs,
+    };
+    const insertAt = this.queue.findIndex(t => !t.started);
+    if (insertAt === -1) this.queue.push(scheduledTurn);
+    else this.queue.splice(insertAt, 0, scheduledTurn);
+    this.collecting = scheduledTurn;
+    this.lastLocalTurnId = scheduledTurn.turnId;
+    this.onLocalTurnStarted?.(scheduledTurn);
   }
 
   /** Shared turn-start handler. Called for both `role:user` and

@@ -70,6 +70,22 @@ export interface TranscriptEvent {
   originalModel?: string;
   fallbackModel?: string;
   apiRefusalCategory?: string;
+  /** Claude Code writes `isMeta:true` on internal user records (tool results,
+   *  slash-command wrappers, compact summaries). Most are NOT real prompts and
+   *  stay filtered by isMeaningfulUserEvent, but the built-in scheduler's fire
+   *  record additionally carries `turnOrigin:"scheduled"` and DOES start a
+   *  real model turn — see {@link isScheduledTurnStartEvent}. */
+  isMeta?: boolean;
+  /** Turn-origin discriminator written by Claude Code ≥2.1.x. The built-in
+   *  CronCreate scheduler fires turns as user records with
+   *  `turnOrigin:"scheduled"` (plus `scheduledTaskId` / `scheduledFireId`). */
+  turnOrigin?: string;
+  scheduledTaskId?: string;
+  scheduledFireId?: string;
+  /** Sidechain (sub-agent / Task tool) records and compact-boundary summary
+   *  records — both excluded from meaningful turn attribution. */
+  isSidechain?: boolean;
+  isCompactSummary?: boolean;
   /** Claude Code ≥2.1.259 stamps this on a `model_refusal_fallback` copied into
    *  a FORKED session: the record is history the fork inherited, and the switch
    *  it describes does NOT apply to this conversation. Treated as positive
@@ -1112,6 +1128,33 @@ export function isMeaningfulUserEvent(ev: TranscriptEvent | null | undefined): b
   const text = normaliseForFingerprint(stringifyUserContent(content));
   if (text.length === 0) return false;
   if (SYNTHETIC_USER_PREFIXES.some(p => text.startsWith(p))) return false;
+  return true;
+}
+
+/** True when a `type:'user'` event is the fire record of a Claude Code
+ *  **built-in** CronCreate scheduled turn: `isMeta:true` +
+ *  `turnOrigin:"scheduled"` (and a `scheduledFireId`). These records are
+ *  deliberately excluded from isMeaningfulUserEvent — they are scheduler
+ *  machinery, not human typing — but they DO open a genuine model turn whose
+ *  final answer the user expects in the originating Lark thread. The bridge
+ *  attribution queue gives them their own turn class instead of dropping them
+ *  into the silent local-headless bucket.
+ *
+ *  Kept narrow (must require the discriminator + fire id) so ordinary isMeta
+ *  records (tool results, `<command-name>` wrappers, compact summaries) never
+ *  grow a deliverable turn. Distinct from botmux's own native scheduler
+ *  (`botmux schedule add`), whose turns arrive with daemon-assigned
+ *  `schedule:<taskId>:<uuid>` ids and never touch this path. */
+export function isScheduledTurnStartEvent(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'user') return false;
+  if (ev.isMeta !== true) return false;
+  if (ev.turnOrigin !== 'scheduled') return false;
+  // Require the fire identity: every real CronCreate fire carries it, and it
+  // rules out lookalike synthetic records that happen to set turnOrigin.
+  if (typeof ev.scheduledFireId !== 'string' || ev.scheduledFireId.length === 0) return false;
+  if (ev.isSidechain === true || ev.isCompactSummary === true) return false;
   return true;
 }
 

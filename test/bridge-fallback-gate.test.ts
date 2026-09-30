@@ -601,6 +601,52 @@ describe('shouldSuppressBridgeEmit', () => {
     expect(shouldSuppressBridgeEmit(turn(100, true), 200, [], false)).toBe(true);
   });
 
+  describe('built-in scheduled turns (isScheduled)', () => {
+    it('a scheduled turn with a real answer and no send is forwarded', () => {
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true, finalText: '波次进度：r01 全部 rankable' },
+        200, [], false,
+      )).toBe(false);
+    });
+
+    it('still suppressed in adopt mode never comes up, and ambient local typing without isScheduled stays silent', () => {
+      // Regression guard: the isScheduled bypass must not weaken the
+      // local-typing gate for ordinary isLocal turns.
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, finalText: 'pwd' }, 200, [], false,
+      )).toBe(true);
+    });
+
+    it('deliberate NOTHING_TO_SEND silence still suppresses a scheduled turn', () => {
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true, finalText: BRIDGE_NOTHING_TO_SEND_SENTINEL },
+        200, [], false,
+      )).toBe(true);
+    });
+
+    it('an explicit final botmux send in-window dedups the scheduled fallback', () => {
+      const body = '波次进度：r01 全部 rankable';
+      const markers: BridgeSendMarker[] = [
+        { sentAtMs: 150, responseKind: 'final', ...buildBridgeSendMarkerContent(body)! },
+      ];
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true, finalText: body },
+        200, markers, false,
+      )).toBe(true);
+    });
+
+    it('a materially longer scheduled final is still delivered despite a progress send', () => {
+      const longFinal = '完整简报：' + 'r01 七个 trial 全部 rankable，' .repeat(20);
+      const markers: BridgeSendMarker[] = [
+        { sentAtMs: 150, ...buildBridgeSendMarkerContent('进展中')! },
+      ];
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true, finalText: longFinal },
+        200, markers, false,
+      )).toBe(false);
+    });
+  });
+
   describe('transcript mode — final is the delivery channel, not a fallback (F1)', () => {
     // Markers MUST come from the real builder: hand-writing { sentAtMs,
     // contentLength } always produces the structured shape and would test the

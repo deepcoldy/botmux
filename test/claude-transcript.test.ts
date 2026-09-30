@@ -22,6 +22,7 @@ import {
   jsonlContainsFingerprint,
   extractLastAssistantTurn,
   isMeaningfulUserEvent,
+  isScheduledTurnStartEvent,
   readFirstEventTimestamp,
   findJsonlsContainingExactContent,
   splitTranscriptEventsByCutoff,
@@ -1098,6 +1099,40 @@ describe('isMeaningfulUserEvent', () => {
   });
   it('rejects assistant-role events', () => {
     expect(isMeaningfulUserEvent(assistantEv('hi'))).toBe(false);
+  });
+});
+
+describe('isScheduledTurnStartEvent', () => {
+  const fire = (extra: Record<string, unknown> = {}): TranscriptEvent =>
+    userEv('cron prompt', {
+      isMeta: true,
+      turnOrigin: 'scheduled',
+      scheduledTaskId: 'task-1',
+      scheduledFireId: 'fire-uuid-1',
+      ...extra,
+    });
+  it('recognises a real CronCreate fire record', () => {
+    expect(isScheduledTurnStartEvent(fire())).toBe(true);
+  });
+  it('stays excluded from meaningful human input (no fingerprint bind)', () => {
+    expect(isMeaningfulUserEvent(fire())).toBe(false);
+  });
+  it('rejects a plain isMeta record without turnOrigin scheduled', () => {
+    expect(isScheduledTurnStartEvent(userEv('x', { isMeta: true }))).toBe(false);
+  });
+  it('rejects turnOrigin scheduled without a fire id', () => {
+    expect(isScheduledTurnStartEvent(
+      userEv('x', { isMeta: true, turnOrigin: 'scheduled' }),
+    )).toBe(false);
+  });
+  it('rejects sidechain / compact records', () => {
+    expect(isScheduledTurnStartEvent(fire({ isSidechain: true }))).toBe(false);
+    expect(isScheduledTurnStartEvent(fire({ isCompactSummary: true }))).toBe(false);
+  });
+  it('rejects assistant / nullish events', () => {
+    expect(isScheduledTurnStartEvent(assistantEv('hi'))).toBe(false);
+    expect(isScheduledTurnStartEvent(null)).toBe(false);
+    expect(isScheduledTurnStartEvent(undefined)).toBe(false);
   });
 });
 

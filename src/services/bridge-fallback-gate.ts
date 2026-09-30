@@ -229,6 +229,12 @@ export interface BridgeGateInput {
   /** Zero-injection sessions forward real terminal answers through the same
    * delivery channel. Keep local attribution for failure/empty-turn filtering. */
   forwardLocalFinal?: boolean;
+  /** A Claude Code built-in scheduled turn (CronCreate fire). It is attributed
+   *  as a local turn (no Lark fingerprint) but its final is auto-forwarded
+   *  into the originating Lark thread, so it must bypass the ambient
+   *  local-typing suppression — while the NOTHING_TO_SEND check above and the
+   *  send-marker dedup below still apply exactly as for ordinary turns. */
+  isScheduled?: boolean;
   /** Transcript final text for this turn, when available. Lets structured
    *  send markers distinguish final-answer sends from earlier progress sends. */
   finalText?: string;
@@ -365,7 +371,10 @@ export function shouldSuppressBridgeEmit(
 ): boolean {
   if (adoptMode) return false;
   if (isBridgeNothingToSendFinal(turn.finalText)) return true;
-  if (turn.isLocal && !turn.forwardLocalFinal) return true;
+  // Built-in scheduled turns are isLocal but user-scheduled: their final
+  // belongs in the Lark thread. The marker rules below still dedup an explicit
+  // `botmux send` and the NOTHING_TO_SEND check above already ran.
+  if (turn.isLocal && !turn.forwardLocalFinal && !turn.isScheduled) return true;
   if (turn.isLocal && turn.forwardLocalFinal && turn.terminalStatus
     && turn.terminalStatus !== 'completed') return true;
   if (turn.markTimeMs === undefined) return false;

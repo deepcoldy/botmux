@@ -44,6 +44,20 @@ function toolResult(uuid: string): TranscriptEvent {
     message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'ok' }] as any },
   };
 }
+/** Claude Code built-in CronCreate fire record: isMeta user event with
+ *  turnOrigin:"scheduled", exactly as written to the transcript. */
+function scheduledFire(uuid: string, opts: { fireId?: string; content?: string } = {}): TranscriptEvent {
+  const ev: TranscriptEvent = {
+    type: 'user',
+    uuid,
+    isMeta: true,
+    turnOrigin: 'scheduled',
+    scheduledTaskId: 'task-1',
+    scheduledFireId: opts.fireId ?? `fire-${uuid}`,
+    message: { role: 'user', content: opts.content ?? `<scheduled fire ${uuid}>` },
+  };
+  return ev;
+}
 
 describe('BridgeTurnQueue', () => {
   it('drops historical assistant events absorbed at attach', () => {
@@ -1339,6 +1353,96 @@ describe('BridgeTurnQueue', () => {
       expect(drainAt).toBeLessThan(earlyReturnAt);
       // ...and it must actually retire the journal entry, not just log.
       expect(fn.slice(drainAt, earlyReturnAt)).toContain('journalBridgeTurnClear(');
+    });
+  });
+
+  // ── Built-in CronCreate scheduled turns (turnOrigin:"scheduled") ─────────
+  describe('built-in scheduled turn fires', () => {
+    it('mints a scheduled turn from the isMeta fire record and collects its answer', () => {
+      const q = new BridgeTurnQueue();
+      q.ingest([scheduledFire('sf1'), assistant('sa1', 'scheduled briefing')]);
+      const ready = q.drainEmittable();
+      expect(ready).toHaveLength(1);
+      expect(ready[0].turnId).toBe('scheduled-fire-sf1');
+      expect(ready[0].isLocal).toBe(true);
+      expect(ready[0].isScheduled).toBe(true);
+      expect(ready[0].userUuid).toBe('sf1');
+      expect(ready[0].assistantUuids).toEqual(['sa1']);
+    });
+
+    it('does NOT bind a pending Lark mark to the scheduler prompt', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('om_1', makeFingerprint('real user question'));
+      q.ingest([scheduledFire('sf1'), assistant('sa1', 'scheduled briefing')]);
+      const ready = q.drainEmittable();
+      // The scheduled turn emits; the Lark mark remains unstarted, still
+      // waiting for its real user line.
+      expect(ready).toHaveLength(1);
+      expect(ready[0].isScheduled).toBe(true);
+      const pending = q.peek().find(t => t.turnId === 'om_1');
+      expect(pending?.started).toBe(false);
+    });
+
+    it('anchors the scheduled reply to the latest marked Lark turn', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('om_1', makeFingerprint('first question'));
+      q.ingest([
+        user('u1', 'first question full text'),
+        assistant('a1', 'first answer'),
+      ]);
+      q.drainEmittable();
+      q.mark('om_2', makeFingerprint('second question'));
+      // Fire lands while om_2 is queued — anchor still resolves to om_2
+      // (latest mark), even though om_2 never bound.
+      q.ingest([scheduledFire('sf1'), assistant('sa1', 'scheduled briefing')]);
+      const [turn] = q.drainEmittable();
+      expect(turn.isScheduled).toBe(true);
+      expect(turn.replyAnchorTurnId).toBe('om_2');
+    });
+
+    it('is ignored without scheduledFireId and falls back to normal local handling', () => {
+      const q = new BridgeTurnQueue();
+      const fake: TranscriptEvent = {
+        type: 'user',
+        uuid: 'x1',
+        isMeta: true,
+        turnOrigin: 'scheduled',
+        message: { role: 'user', content: 'no fire id' },
+      };
+      q.ingest([fake, assistant('a1', 'reply')]);
+      // Not a scheduled turn; treated as any non-meaningful isMeta record →
+      // the assistant becomes a headless local turn.
+      const ready = q.drainEmittable();
+      expect(ready[0].isScheduled).toBeUndefined();
+      expect(ready[0].turnId).toBe('local-headless-a1');
+    });
+
+    it('real chronology: system fire marker + user fire + answer + turn_duration, then a bound Lark turn', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('om_1', makeFingerprint('do the thing'));
+      // The system record precedes the isMeta user record in the transcript.
+      const sysFire: TranscriptEvent = {
+        type: 'system', subtype: 'scheduled_task_fire', uuid: 'sys1',
+        cron: '*/30 * * * *',
+      } as unknown as TranscriptEvent;
+      q.ingest([
+        sysFire,
+        scheduledFire('sf1', { fireId: 'fire-A' }),
+        assistant('sa1', '09:30 进度：无新分'),
+        { type: 'system', subtype: 'turn_duration', uuid: 'td1' },
+      ]);
+      // Worker drains at an idle boundary.
+      const ready = q.drainEmittable({ terminalBoundary: true });
+      expect(ready).toHaveLength(1);
+      expect(ready[0].turnId).toBe('scheduled-fire-A');
+      expect(ready[0].assistantUuids).toEqual(['sa1']);
+      expect(ready[0].terminalObserved).toBe(true);
+      // Pending Lark mark is intact and binds when its real prompt lands.
+      q.ingest([user('u1', 'do the thing now'), assistant('a1', 'done')]);
+      const next = q.drainEmittable({ terminalBoundary: true });
+      expect(next).toHaveLength(1);
+      expect(next[0].turnId).toBe('om_1');
+      expect(next[0].assistantUuids).toEqual(['a1']);
     });
   });
 });
