@@ -149,6 +149,16 @@ const PROVIDER_RE = /^[a-z][a-z0-9._-]{0,63}$/;
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
 const REQUEST_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const ERROR_CODE_RE = /^[a-z][a-z0-9._-]{0,127}$/;
+const SENSITIVE_STATE_KEY_PARTS = [
+  'token',
+  'secret',
+  'password',
+  'cookie',
+  'credential',
+  'authorization',
+  'privatekey',
+  'accesskey',
+] as const;
 
 function record(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
@@ -161,9 +171,12 @@ function validJson(value: unknown, depth = 0): value is JsonValue {
   if (typeof value === 'number') return Number.isFinite(value);
   if (Array.isArray(value)) return value.every(item => validJson(item, depth + 1));
   const object = record(value);
-  return !!object && Object.entries(object).every(
-    ([key, item]) => key.length <= 256 && validJson(item, depth + 1),
-  );
+  return !!object && Object.entries(object).every(([key, item]) => {
+    const normalizedKey = key.replace(/[^a-z0-9]/gi, '').toLowerCase();
+    return key.length <= 256
+      && !SENSITIVE_STATE_KEY_PARTS.some(part => normalizedKey.includes(part))
+      && validJson(item, depth + 1);
+  });
 }
 
 function nonEmptyString(value: unknown, maxLength: number): string | undefined {

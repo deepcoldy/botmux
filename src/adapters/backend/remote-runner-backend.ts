@@ -144,13 +144,25 @@ export class RemoteRunnerBackend implements SessionBackend {
       if (!this.startupPromise) throw new Error('remote runner has not spawned');
       await this.startupPromise;
     } catch (error) {
-      return { submitted: false, failureReason: error instanceof Error ? error.message : String(error) };
+      return {
+        submitted: false,
+        submissionDisposition: 'untouched',
+        failureReason: error instanceof Error ? error.message : String(error),
+      };
     }
     if (!this.child || this.killed || this.closing || this.shutdownDetaching || !this.ready) {
-      return { submitted: false, failureReason: 'remote runner is not accepting turns' };
+      return {
+        submitted: false,
+        submissionDisposition: 'untouched',
+        failureReason: 'remote runner is not accepting turns',
+      };
     }
     if (this.activeTurnId) {
-      return { submitted: false, failureReason: `remote runner turn ${this.activeTurnId} is still active` };
+      return {
+        submitted: false,
+        submissionDisposition: 'untouched',
+        failureReason: `remote runner turn ${this.activeTurnId} is still active`,
+      };
     }
     this.activeTurnId = input.turnId;
     this.turnSettled = new Promise<void>(resolve => { this.settleTurn = resolve; });
@@ -164,8 +176,16 @@ export class RemoteRunnerBackend implements SessionBackend {
       }), event => event.type === 'status' && event.status === 'busy', this.operationTimeoutMs);
       return { submitted: true };
     } catch (error) {
-      this.finishActiveTurn();
-      return { submitted: false, failureReason: error instanceof Error ? error.message : String(error) };
+      const reason = error instanceof Error ? error.message : String(error);
+      // Once the command entered the provider pipe, a missing ACK cannot prove
+      // that execution did not start. Retire this provider generation and emit
+      // an exact ambiguous terminal before any successor can be admitted.
+      this.failProtocol(`turn acknowledgement failed: ${reason}`);
+      return {
+        submitted: false,
+        submissionDisposition: 'dirty_unknown',
+        failureReason: reason,
+      };
     }
   }
 

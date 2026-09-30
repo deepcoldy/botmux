@@ -13,8 +13,8 @@ function createBackend(initialState?: RemoteRunnerBackendState): RemoteRunnerBac
   return backend;
 }
 
-function spawnBackend(backend: RemoteRunnerBackend): void {
-  backend.spawn(process.execPath, [referenceRunner], {
+function spawnBackend(backend: RemoteRunnerBackend, runner = referenceRunner): void {
+  backend.spawn(process.execPath, [runner], {
     cwd: process.cwd(),
     cols: 120,
     rows: 40,
@@ -135,6 +135,32 @@ describe('RemoteRunnerBackend', () => {
     await expect(backend.abortDestroySession()).resolves.toEqual({
       admissionRestored: false,
       reason: 'remote runner close outcome is not reversible',
+    });
+  });
+
+  it('classifies a missing turn ACK as ambiguous and retires the provider', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'stalled-close',
+      operationTimeoutMs: 100,
+    }, 'session-stalled-turn');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const failure = once<{ status: string; turnId: string }>(cb => {
+      backend.onTurnFailure(value => cb(value));
+    });
+    spawnBackend(backend, stalledCloseRunner);
+    await ready;
+
+    await expect(backend.submitTurn({
+      turnId: 'turn-stalled',
+      content: 'may have crossed the pipe',
+    })).resolves.toMatchObject({
+      submitted: false,
+      submissionDisposition: 'dirty_unknown',
+    });
+    await expect(failure).resolves.toMatchObject({
+      turnId: 'turn-stalled',
+      status: 'ambiguous',
     });
   });
 });

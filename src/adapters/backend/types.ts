@@ -15,6 +15,8 @@ export interface BackendTurnInput {
 export interface BackendTurnSubmission {
   submitted: boolean;
   failureReason?: string;
+  /** Whether a rejected submission provably stayed local or may have executed. */
+  submissionDisposition?: 'untouched' | 'dirty_unknown';
 }
 
 export interface BackendTurnFailure {

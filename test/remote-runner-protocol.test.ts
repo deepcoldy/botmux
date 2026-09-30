@@ -48,6 +48,12 @@ describe('remote runner protocol', () => {
       generation: 1,
       providerState: { value: 'x'.repeat(70 * 1024) },
     })).toBeUndefined();
+    expect(normalizeRemoteRunnerBackendState({
+      version: 1,
+      provider: 'reference',
+      generation: 1,
+      providerState: { nested: { accessToken: 'must-not-persist' } },
+    })).toBeUndefined();
   });
 
   it('parses only the closed event vocabulary', () => {
