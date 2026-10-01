@@ -1860,6 +1860,8 @@ export interface BotConfig {
   chatReplyModes?: { [chatId: string]: ChatReplyMode };
   /** Per-chat @ 策略：chat_id → 该群的 mention 模式，覆盖 per-bot `regularGroupMentionMode`。由 /mention-mode 写入。 */
   chatMentionModes?: { [chatId: string]: GroupMentionMode };
+  /** Per-chat override of `soloGroupMentionBypass`; explicit true/false wins over the bot default. */
+  chatSoloGroupMentionBypass?: { [chatId: string]: boolean };
   /** Per-chat per-user grants: chat_id → 被授权的 open_id 列表。仅放行 canTalk，不给管理命令权。 */
   chatGrants?: { [chatId: string]: string[] };
   /**
@@ -2245,11 +2247,13 @@ export interface BotConfig {
    *                               multi-bot / multi-person groups: a default
    *                               responder that yields when you address someone
    *                               else.
-   * Governs the shared-topic fold-back + the top-level @ gate. `new-topic` /
-   * 话题群 topics own their own thread and continue without @ regardless (that
-   * is the mode's defining behavior, not affected by this policy).
+   * Governs the shared-topic fold-back and the @ gate in regular/topic groups.
+   * The separate single-human/single-bot exception is controlled by
+   * `soloGroupMentionBypass` / `chatSoloGroupMentionBypass`.
    */
   regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
+  /** Allow the single-human/single-bot group exception to the @ policy (default true). */
+  soloGroupMentionBypass?: boolean;
   /**
    * 允许 `botmux send --mention` @ 群内任意成员（用完整邮箱 / 手机号 / union_id /
    * open_id 指定），而不仅是本轮触发者（--mention-back）。默认 false：关闭时
@@ -3553,6 +3557,15 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (Object.keys(out).length > 0) chatMentionModes = out;
     }
 
+    let chatSoloGroupMentionBypass: { [chatId: string]: boolean } | undefined;
+    if (entry.chatSoloGroupMentionBypass && typeof entry.chatSoloGroupMentionBypass === 'object' && !Array.isArray(entry.chatSoloGroupMentionBypass)) {
+      const out: { [chatId: string]: boolean } = {};
+      for (const [cid, enabled] of Object.entries(entry.chatSoloGroupMentionBypass)) {
+        if (cid.trim() && typeof enabled === 'boolean') out[cid] = enabled;
+      }
+      if (Object.keys(out).length > 0) chatSoloGroupMentionBypass = out;
+    }
+
     // chatGrants：只保留 { [chatId:string]: string[] }，逐项校验 typeof === 'string'，
     // 丢弃空列表。未配置或全部非法 → undefined。
     let chatGrants: { [chatId: string]: string[] } | undefined;
@@ -3915,6 +3928,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       defaultWorkingDirAutoWorktree: entry.defaultWorkingDirAutoWorktree === true || undefined,
       chatReplyModes,
       chatMentionModes,
+      chatSoloGroupMentionBypass,
       chatGrants,
       globalGrants,
       // 只落显式 true（undefined = 关），与 restrictGrantCommands 同款，保持 bots.json 干净。
@@ -4046,6 +4060,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         || entry.regularGroupMentionMode === 'ambient'
         ? entry.regularGroupMentionMode
         : undefined,
+      soloGroupMentionBypass: entry.soloGroupMentionBypass === false ? false : undefined,
       substituteMode,
       // 文档订阅默认触发范围。只 'all' 有意义；'mention-only'（默认）归一化为
       // undefined 让 bots.json 保持干净。
