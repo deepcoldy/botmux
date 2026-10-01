@@ -18,6 +18,7 @@ const modes: NetworkMode[] = ['allow', 'block', 'allowlist', 'denylist'];
 const addresses = ['93.184.216.34', '10.77.0.1', '2606:4700::100', 'fd55::1'];
 const port = 18087;
 let directory: string;
+let nftBinary: string;
 const servers: Server[] = [];
 
 // source tests import the BUILT sandbox, so the production re-exec entry path
@@ -26,7 +27,7 @@ async function run(policy: SandboxNetworkPolicy, source: string, onData?: (pid: 
   const { prepareDirectSandbox } = await import('../dist/adapters/backend/sandbox.js');
   const script = join(directory, `probe-${Math.random()}.mjs`);
   writeFileSync(script, source);
-  const paths = ['/usr', '/etc', dirname(realpathSync(process.execPath)), directory];
+  const paths = ['/usr', '/etc', dirname(realpathSync(process.execPath)), dirname(nftBinary), ...(process.env.LD_LIBRARY_PATH ?? '').split(':').filter(path => path.startsWith('/')), directory];
   const sbx = prepareDirectSandbox({ sessionId: `network-${Math.random()}`, dataDir: directory,
     networkPolicy: policy, policy: { net: true, writeRegexes: [], rules: [...new Set(paths)].map(path => ({ path, access: path === directory ? 'readWrite' : 'readOnly', source: 'baseline' })) },
     chdir: directory, home: directory, cliBin: process.execPath, cliArgs: [script],
@@ -74,6 +75,9 @@ describe.skipIf(!enabled)('real Linux sandbox network boundary', () => {
     // own these addresses. Installing them is documented in the test guide.
     const ip = spawnSync('ip', ['-j', 'address', 'show', 'dev', 'lo'], { encoding: 'utf8' });
     if (!addresses.every(address => ip.stdout.includes(address))) throw new Error('run only in the isolated fixture network namespace');
+    const nft = spawnSync('/bin/sh', ['-c', 'command -v nft'], { encoding: 'utf8' });
+    if (nft.status !== 0) throw new Error('nft is required for an actual privilege-denial test');
+    nftBinary = realpathSync(nft.stdout.trim());
     directory = mkdtempSync(join(tmpdir(), 'botmux-network-test-'));
     for (const address of addresses) {
       const server = createServer(socket => socket.end('ok'));
@@ -98,8 +102,8 @@ describe.skipIf(!enabled)('real Linux sandbox network boundary', () => {
     } finally { await new Promise<void>(resolve => host.close(() => resolve())); }
   });
   it('cannot create a new user namespace or modify nftables', async () => {
-    const source = `import {spawnSync} from 'node:child_process';const a=spawnSync('unshare',['-Urn','true']);const b=spawnSync('nft',['flush','ruleset']);console.log(JSON.stringify([a.status===0,b.status===0]));`;
-    expect(await run({ version: 1, public: { mode: 'allow' }, private: { mode: 'block' } }, source)).toEqual([false,false]);
+    const source = `import {spawnSync} from 'node:child_process';const a=spawnSync('unshare',['-Urn','true']);const b=spawnSync(${JSON.stringify(nftBinary)},['flush','ruleset']);console.log(JSON.stringify([a.status===0,b.status===0,!a.error,!b.error,/Operation not permitted/.test(b.stderr?.toString() ?? "")]));`;
+    expect(await run({ version: 1, public: { mode: 'allow' }, private: { mode: 'block' } }, source)).toEqual([false,false,true,true,true]);
   });
   it('fresh lifetimes install the same frozen policy after restart', async () => {
     const policy: SandboxNetworkPolicy = { version: 1, public: { mode: 'block' }, private: { mode: 'allow' } };
@@ -174,6 +178,7 @@ describe.skipIf(!enabled)('real Linux sandbox network boundary', () => {
     })).rejects.toThrow('sandbox exited');
     const running = (pid: string) => { try { return !readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ')[1]!.startsWith('Z '); } catch { return false; } };
     for (let i = 0; i < 40 && observed.some(running); i++) await new Promise(resolve => setTimeout(resolve, 50));
+    expect(observed).toHaveLength(2);
     expect(observed.every(pid => !running(pid))).toBe(true);
   });
 });
