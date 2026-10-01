@@ -179,6 +179,7 @@ import {
 import {
   readGlobalConfig,
   isCrossPrincipalInterruptionEnabled,
+  isMultiTopicOrchestrationEnabled,
   isWorkflowFeatureEnabled,
 } from './global-config.js';
 import {
@@ -14460,6 +14461,7 @@ async function spawnCli(
     // daemon's authoritative decision. The daemon-side gate is unaffected either
     // way; this keeps the in-pane defense-in-depth honest on the riff path too.
     mergedEnv.BOTMUX_WORKFLOW_ENABLED = isWorkflowFeatureEnabled() ? 'true' : 'false';
+    mergedEnv.BOTMUX_MULTI_TOPIC_ENABLED = isMultiTopicOrchestrationEnabled() ? 'true' : 'false';
     // Re-freeze the no-transport capability keys AFTER the merge: a stale or
     // attacker-shaped backendConfig.env / per-bot env merges LAST and would
     // otherwise override the frozen values, restoring send capability for a
@@ -16092,6 +16094,7 @@ async function spawnCli(
   // subcommand agrees with the daemon that spawned it, independent of stale
   // rcfile/tmux env (mirrors the chatBotDiscovery injection above).
   childEnv.BOTMUX_WORKFLOW_ENABLED = isWorkflowFeatureEnabled() ? 'true' : 'false';
+  childEnv.BOTMUX_MULTI_TOPIC_ENABLED = isMultiTopicOrchestrationEnabled() ? 'true' : 'false';
   if (cliAdapter.injectsReadyHook) childEnv.BOTMUX_READY_COMMAND = sessionReadyHookCommand();
   // Claude Code statusline 链：botmux 的进程级 --settings 会遮蔽用户自己的 statusLine
   // （单值、不合并），这里按 Claude 的优先级把它找回来，交给 `botmux statusline` 在落盘

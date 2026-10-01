@@ -21,7 +21,7 @@ import {
   isVcMeetingAgentGloballyEnabled,
   vcMeetingAgentGlobalListenerBotAppId,
 } from './config.js';
-import { readGlobalConfig, repoPickerScanOptions, isWorkflowFeatureEnabled } from './global-config.js';
+import { readGlobalConfig, repoPickerScanOptions, isMultiTopicOrchestrationEnabled, isWorkflowFeatureEnabled } from './global-config.js';
 import { buildDashboardUrls, reportDashboardUrls } from './core/dashboard-url.js';
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { reloadExactDaemonBotConfig } from './core/daemon-config-fence.js';
@@ -6563,6 +6563,20 @@ ipcRoute('POST', DISPATCH_REPORT_REGISTER_ROUTE, async (req, res) => {
   if (!verified.ok) return jsonRes(res, 403, { ok: false, error: verified.error });
   if (!ds || !ds.larkAppId || ds.larkAppId !== selfDaemonLarkAppId) {
     return jsonRes(res, 403, { ok: false, error: 'session_identity_incomplete' });
+  }
+
+  // Machine-wide multi-topic orchestration kill-switch. This daemon route is
+  // the authoritative sink that actually creates a new sub-project topic: the
+  // CLI never sends the seed itself, it posts here and the daemon performs the
+  // send below. The route lives in the narrow untrusted-auth aperture, so a
+  // sandboxed / read-isolated CLI holding its own session's rotating capability
+  // can reach it directly (networked sandboxes keep loopback), which the
+  // CLI-side gate in cmdDispatch cannot cover for a hand-rolled POST. Mirror the
+  // workflow feature's daemon-side 409. Appending to an existing topic via
+  // `dispatch --into` never reaches this route, so only new-topic creation is
+  // refused.
+  if (!isMultiTopicOrchestrationEnabled()) {
+    return jsonRes(res, 409, { ok: false, error: 'multi_topic_disabled' });
   }
 
   const stringArray = (value: unknown): string[] => Array.isArray(value)
