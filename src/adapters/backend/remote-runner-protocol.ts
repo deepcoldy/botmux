@@ -49,6 +49,39 @@ export interface RemoteRunnerBackendState {
   providerState?: JsonObject;
 }
 
+/**
+ * Provider-reported usage at one durable remote turn boundary.
+ *
+ * These fields intentionally mirror BotMux's native card usage facts without
+ * exposing a provider transcript format. Every metric is optional by way of a
+ * nullable group and must come from the provider's authoritative runtime; a
+ * provider must never estimate missing values.
+ */
+export interface RemoteRunnerUsageSnapshot {
+  context: {
+    usedTokens: number;
+    windowTokens?: number;
+    percentUsed?: number;
+  } | null;
+  tokens: {
+    in: number;
+    out: number;
+  } | null;
+  turnTokens?: {
+    in: number;
+    out: number;
+  } | null;
+  model?: string;
+  reasoningEffort?: string;
+  modelBackendVariant?: string;
+}
+
+/** Generation fence plus the latest provider-native usage snapshot. */
+export interface RemoteRunnerUsageReport {
+  generation: number;
+  snapshot: RemoteRunnerUsageSnapshot;
+}
+
 export interface RemoteRunnerTrustedCaller {
   requestUserOpenId?: string;
   requestUserUnionId?: string;
@@ -132,6 +165,8 @@ export type RemoteRunnerEvent =
       turnId: string;
       content: string;
       state?: RemoteRunnerBackendState;
+      /** Optional additive v1 field. Older BotMux versions safely ignore it. */
+      usage?: RemoteRunnerUsageReport;
     })
   | (RemoteRunnerEventBase & {
       type: 'failure';
@@ -260,6 +295,97 @@ function stateField(raw: Record<string, unknown>): RemoteRunnerBackendState | un
   return normalizeRemoteRunnerBackendState(raw.state) ?? null;
 }
 
+function nonNegativeInteger(value: unknown): number | undefined {
+  return Number.isSafeInteger(value) && Number(value) >= 0 ? Number(value) : undefined;
+}
+
+function normalizeTokenPair(value: unknown): { in: number; out: number } | undefined {
+  const raw = record(value);
+  if (!raw) return undefined;
+  const input = nonNegativeInteger(raw.in);
+  const output = nonNegativeInteger(raw.out);
+  if (input === undefined || output === undefined) return undefined;
+  return { in: input, out: output };
+}
+
+export function normalizeRemoteRunnerUsageReport(
+  value: unknown,
+): RemoteRunnerUsageReport | undefined {
+  const raw = record(value);
+  if (!raw) return undefined;
+  const generation = nonNegativeInteger(raw.generation);
+  const snapshotRaw = record(raw.snapshot);
+  if (generation === undefined || !snapshotRaw) return undefined;
+
+  let context: RemoteRunnerUsageSnapshot['context'];
+  if (snapshotRaw.context === null) {
+    context = null;
+  } else {
+    const contextRaw = record(snapshotRaw.context);
+    const usedTokens = nonNegativeInteger(contextRaw?.usedTokens);
+    if (!contextRaw || usedTokens === undefined) return undefined;
+    const windowTokens = contextRaw.windowTokens === undefined
+      ? undefined
+      : nonNegativeInteger(contextRaw.windowTokens);
+    if (contextRaw.windowTokens !== undefined
+        && (windowTokens === undefined || windowTokens === 0)) return undefined;
+    const percentUsed = contextRaw.percentUsed;
+    if (percentUsed !== undefined
+        && (typeof percentUsed !== 'number'
+          || !Number.isFinite(percentUsed)
+          || percentUsed < 0
+          || percentUsed > 100)) return undefined;
+    context = {
+      usedTokens,
+      ...(windowTokens !== undefined ? { windowTokens } : {}),
+      ...(percentUsed !== undefined ? { percentUsed } : {}),
+    };
+  }
+
+  let tokens: RemoteRunnerUsageSnapshot['tokens'];
+  if (snapshotRaw.tokens === null) {
+    tokens = null;
+  } else {
+    tokens = normalizeTokenPair(snapshotRaw.tokens) ?? null;
+    if (tokens === null) return undefined;
+  }
+
+  let turnTokens: RemoteRunnerUsageSnapshot['turnTokens'];
+  if (snapshotRaw.turnTokens === null) {
+    turnTokens = null;
+  } else if (snapshotRaw.turnTokens !== undefined) {
+    turnTokens = normalizeTokenPair(snapshotRaw.turnTokens);
+    if (!turnTokens) return undefined;
+  }
+
+  const model = snapshotRaw.model === undefined
+    ? undefined
+    : nonEmptyString(snapshotRaw.model, 256);
+  const reasoningEffort = snapshotRaw.reasoningEffort === undefined
+    ? undefined
+    : nonEmptyString(snapshotRaw.reasoningEffort, 64);
+  const modelBackendVariant = snapshotRaw.modelBackendVariant === undefined
+    ? undefined
+    : nonEmptyString(snapshotRaw.modelBackendVariant, 64);
+  if ((snapshotRaw.model !== undefined && !model)
+      || (snapshotRaw.reasoningEffort !== undefined && !reasoningEffort)
+      || (snapshotRaw.modelBackendVariant !== undefined && !modelBackendVariant)) {
+    return undefined;
+  }
+
+  return {
+    generation,
+    snapshot: {
+      context,
+      tokens,
+      ...(turnTokens !== undefined ? { turnTokens } : {}),
+      ...(model ? { model } : {}),
+      ...(reasoningEffort ? { reasoningEffort } : {}),
+      ...(modelBackendVariant ? { modelBackendVariant } : {}),
+    },
+  };
+}
+
 export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | undefined {
   const raw = record(value);
   if (!raw || !validBase(raw) || typeof raw.type !== 'string') return undefined;
@@ -302,8 +428,13 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
     }
     const state = stateField(raw);
     if (state === null) return undefined;
+    const usage = raw.usage === undefined
+      ? undefined
+      : normalizeRemoteRunnerUsageReport(raw.usage);
+    if (raw.usage !== undefined && !usage) return undefined;
     return { protocol: REMOTE_RUNNER_PROTOCOL, version: REMOTE_RUNNER_PROTOCOL_VERSION,
-      type: 'final', turnId, content: raw.content, ...(state ? { state } : {}) };
+      type: 'final', turnId, content: raw.content,
+      ...(state ? { state } : {}), ...(usage ? { usage } : {}) };
   }
 
   if (raw.type === 'failure') {

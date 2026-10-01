@@ -18277,6 +18277,10 @@ async function spawnCli(
     if (backend !== observedBackend) return;
     send({ type: 'remote_backend_state', state });
   });
+  backend.onUsageSnapshot?.((usage) => {
+    if (backend !== observedBackend) return;
+    send({ type: 'remote_usage', usage });
+  });
   backend.onReady?.(() => {
     if (backend !== observedBackend || fatalWorkerErrorPending) return;
     if (effectiveBackendType === 'remote-runner') {

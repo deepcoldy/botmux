@@ -109,7 +109,10 @@ import { ZmxBackend } from '../adapters/backend/zmx-backend.js';
 import { zmxEnv } from '../setup/ensure-zmx.js';
 import type { PersistentBackendTarget } from '../adapters/backend/types.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
-import { normalizeRemoteRunnerBackendState } from '../adapters/backend/remote-runner-protocol.js';
+import {
+  normalizeRemoteRunnerBackendState,
+  normalizeRemoteRunnerUsageReport,
+} from '../adapters/backend/remote-runner-protocol.js';
 import type { RemoteRunnerConfig } from '../adapters/backend/remote-runner-config.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
 import {
@@ -359,6 +362,19 @@ export function getDaemonSessionUsageSnapshot(
       ?? ds.adoptedFrom?.cliId
       ?? getBot(ds.larkAppId).config.cliId
     ) as CliId;
+    const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
+    if (backendType === 'remote-runner') {
+      const usage = normalizeRemoteRunnerUsageReport(ds.session.remoteRunnerUsage);
+      const state = normalizeRemoteRunnerBackendState(ds.session.remoteBackendState);
+      if (usage && state && usage.generation === state.generation) {
+        return usage.snapshot;
+      }
+      // A Remote Runner transcript lives behind the provider boundary. Falling
+      // through to the daemon-host resolver would inspect the wrong filesystem
+      // and can only produce noise or, worse, collide with an unrelated local
+      // session id.
+      return { context: null, tokens: null };
+    }
     const snapshot = getSessionUsageSnapshot({
       cliId: resolvedCliId,
       sessionId: ds.session.sessionId,
@@ -468,6 +484,10 @@ export function getDaemonStreamingCardUsageSnapshot(
     effectiveCliId,
     { fresh: opts?.fresh ?? false },
   );
+  const remoteRunner = (ds.initConfig?.backendType ?? ds.session.backendType) === 'remote-runner';
+  const remoteModel = remoteRunner ? snapshot.model?.trim() : undefined;
+  const remoteReasoningEffort = remoteRunner ? snapshot.reasoningEffort?.trim() : undefined;
+  const remoteModelBackendVariant = remoteRunner ? snapshot.modelBackendVariant?.trim() : undefined;
   // Model normally comes from an explicitly-wired executor runtime (TRAE/Codex
   // set ds.activeModel) or launch config. Grok's native snapshot is the one
   // exception: its signals.json exposes a stable user-facing primaryModelId.
@@ -477,9 +497,14 @@ export function getDaemonStreamingCardUsageSnapshot(
   const grokReasoningEffort = effectiveCliId === 'grok' ? snapshot.reasoningEffort?.trim() : undefined;
   return {
     ...snapshot,
-    ...(runtimeModel ? { model: runtimeModel } : grokModel ? { model: grokModel } : {}),
-    ...(reasoningEffort ? { reasoningEffort } : grokReasoningEffort ? { reasoningEffort: grokReasoningEffort } : {}),
-    ...(modelBackendVariant ? { modelBackendVariant } : {}),
+    ...(remoteModel ? { model: remoteModel }
+      : runtimeModel ? { model: runtimeModel }
+        : grokModel ? { model: grokModel } : {}),
+    ...(remoteReasoningEffort ? { reasoningEffort: remoteReasoningEffort }
+      : reasoningEffort ? { reasoningEffort }
+        : grokReasoningEffort ? { reasoningEffort: grokReasoningEffort } : {}),
+    ...(remoteModelBackendVariant ? { modelBackendVariant: remoteModelBackendVariant }
+      : modelBackendVariant ? { modelBackendVariant } : {}),
     ...(modelFallback ? { modelFallback } : {}),
     ...(reasoningControl ? { reasoningControl } : {}),
   };
@@ -15368,15 +15393,51 @@ function setupWorkerHandlers(
           logger.error(`[${t}] Ignored remote backend state that changed or cleared its session id without advancing generation`);
           break;
         }
+        const priorUsage = ds.session.remoteRunnerUsage;
         ds.session.remoteBackendState = state;
+        if (priorUsage && priorUsage.generation !== state.generation) {
+          ds.session.remoteRunnerUsage = undefined;
+        }
         try {
           sessionStore.updateSession(ds.session);
         } catch (err) {
           ds.session.remoteBackendState = prior;
+          ds.session.remoteRunnerUsage = priorUsage;
           logger.error(
             `[${t}] Failed to persist remote backend state: ${err instanceof Error ? err.message : String(err)}`,
           );
         }
+        break;
+      }
+
+      case 'remote_usage': {
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored remote usage from stale worker generation`);
+          break;
+        }
+        const usage = normalizeRemoteRunnerUsageReport(msg.usage);
+        const state = normalizeRemoteRunnerBackendState(ds.session.remoteBackendState);
+        if (!usage || !state || usage.generation !== state.generation) {
+          logger.error(`[${t}] Ignored invalid or stale remote usage snapshot`);
+          break;
+        }
+        if (JSON.stringify(ds.session.remoteRunnerUsage) === JSON.stringify(usage)) break;
+        const priorUsage = ds.session.remoteRunnerUsage;
+        ds.session.remoteRunnerUsage = usage;
+        try {
+          sessionStore.updateSession(ds.session);
+        } catch (err) {
+          ds.session.remoteRunnerUsage = priorUsage;
+          logger.error(
+            `[${t}] Failed to persist remote usage snapshot: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          break;
+        }
+        scheduleActiveRuntimePatch(ds);
         break;
       }
 

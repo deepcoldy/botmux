@@ -1,7 +1,10 @@
 import { resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { RemoteRunnerBackend } from '../src/adapters/backend/remote-runner-backend.js';
-import type { RemoteRunnerBackendState } from '../src/adapters/backend/remote-runner-protocol.js';
+import type {
+  RemoteRunnerBackendState,
+  RemoteRunnerUsageReport,
+} from '../src/adapters/backend/remote-runner-protocol.js';
 
 const referenceRunner = resolve('examples/remote-runner/reference-runner.mjs');
 const stalledCloseRunner = resolve('test/fixtures/remote-runner-stalled-close.mjs');
@@ -36,7 +39,9 @@ describe('RemoteRunnerBackend', () => {
     const ready = once<void>(cb => backend.onReady(cb));
     const states: RemoteRunnerBackendState[] = [];
     const progress: string[] = [];
+    const usage: RemoteRunnerUsageReport[] = [];
     backend.onBackendState(state => states.push(state));
+    backend.onUsageSnapshot(snapshot => usage.push(snapshot));
     backend.onData(data => progress.push(data));
     spawnBackend(backend);
     await ready;
@@ -62,6 +67,14 @@ describe('RemoteRunnerBackend', () => {
       remoteSessionId: 'reference:session-1',
       agentThreadId: 'reference-thread:turn-1',
     });
+    expect(usage).toEqual([expect.objectContaining({
+      generation: 1,
+      snapshot: expect.objectContaining({
+        context: { usedTokens: 11, windowTokens: 1000, percentUsed: 1.1 },
+        tokens: { in: 8, out: 3 },
+        model: 'reference-model',
+      }),
+    })]);
   });
 
   it('projects remote terminal snapshots and forwards input and resize', async () => {

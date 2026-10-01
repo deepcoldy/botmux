@@ -58,6 +58,34 @@ provider 可以额外声明三项通用终端能力：
 
 完整命令与事件联合类型见 [`src/adapters/backend/remote-runner-protocol.ts`](../src/adapters/backend/remote-runner-protocol.ts)。可运行示例见 [`examples/remote-runner/reference-runner.mjs`](../examples/remote-runner/reference-runner.mjs)。
 
+### 可选运行用量
+
+provider 可以在 `final` 事件上附带可选 `usage`，把远端运行时已经确认的上下文、累计 token、单轮 token 和实际模型交给 BotMux：
+
+```json
+{
+  "type": "final",
+  "turnId": "turn-1",
+  "content": "done",
+  "usage": {
+    "generation": 3,
+    "snapshot": {
+      "context": { "usedTokens": 7274, "windowTokens": 258400, "percentUsed": 3 },
+      "tokens": { "in": 7230, "out": 44 },
+      "turnTokens": { "in": 7230, "out": 44 },
+      "model": "example-model",
+      "reasoningEffort": "high"
+    }
+  }
+}
+```
+
+- `generation` 必须等于当前远端 compute generation；旧 generation 的快照会被拒绝。
+- `context` 和 `tokens` 必须显式为对象或 `null`。缺失指标保持缺失，不得由 provider 估算。
+- BotMux 严格校验非负整数、上下文百分比和运行时标签，然后把快照交给普通卡片的同一套 usage renderer。
+- 这是 v1 的可选 additive 字段：旧 provider 不上报时行为不变，旧 BotMux 会忽略该字段，因此无需增加 capability 或升级协议版本。
+- 最近一次通过校验的快照会随 Session 持久化；远端 generation 前进时自动清除，避免恢复后显示旧计算资源的数据。
+
 ## 持久化状态
 
 ```json

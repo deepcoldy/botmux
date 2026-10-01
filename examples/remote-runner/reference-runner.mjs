@@ -95,7 +95,22 @@ input.on('line', line => {
       screen = `reference: ${command.content}`;
       emitScreen();
       status = 'ready';
-      emit({ type: 'final', turnId: command.turnId, content: command.content, state });
+      emit({
+        type: 'final',
+        turnId: command.turnId,
+        content: command.content,
+        state,
+        usage: {
+          generation: state.generation,
+          snapshot: {
+            context: { usedTokens: 11, windowTokens: 1000, percentUsed: 1.1 },
+            tokens: { in: 8, out: 3 },
+            turnTokens: { in: 8, out: 3 },
+            model: 'reference-model',
+            reasoningEffort: 'medium',
+          },
+        },
+      });
       return;
     }
     case 'cancel':

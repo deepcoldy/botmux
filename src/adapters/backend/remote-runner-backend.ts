@@ -17,12 +17,14 @@ import {
   REMOTE_RUNNER_PROTOCOL_VERSION,
   encodeRemoteRunnerCommand,
   normalizeRemoteRunnerBackendState,
+  normalizeRemoteRunnerUsageReport,
   parseRemoteRunnerEventLine,
   remoteRunnerCommand,
   type RemoteRunnerBackendState,
   type RemoteRunnerCapability,
   type RemoteRunnerCommand,
   type RemoteRunnerEvent,
+  type RemoteRunnerUsageReport,
 } from './remote-runner-protocol.js';
 import type { RemoteRunnerConfig } from './remote-runner-config.js';
 
@@ -82,6 +84,7 @@ export class RemoteRunnerBackend implements SessionBackend {
   private turnFailureCb: ((failure: BackendTurnFailure) => void) | null = null;
   private readyCb: (() => void) | null = null;
   private stateCb: ((state: RemoteRunnerBackendState) => void) | null = null;
+  private usageCb: ((usage: RemoteRunnerUsageReport) => void) | null = null;
   private accessUrlCb: ((url: string) => void) | null = null;
 
   constructor(
@@ -234,6 +237,9 @@ export class RemoteRunnerBackend implements SessionBackend {
   onBackendState(cb: (state: RemoteRunnerBackendState) => void): void {
     this.stateCb = cb;
     if (this.state) queueMicrotask(() => cb(this.state!));
+  }
+  onUsageSnapshot(cb: (usage: RemoteRunnerUsageReport) => void): void {
+    this.usageCb = cb;
   }
   onAccessUrl(cb: (url: string) => void): void { this.accessUrlCb = cb; }
 
@@ -443,6 +449,14 @@ export class RemoteRunnerBackend implements SessionBackend {
     if (event.type === 'final') {
       if (!this.acceptActiveTurn(event.turnId)) return;
       if (event.state && !this.applyState(event.state)) return;
+      if (event.usage) {
+        const usage = normalizeRemoteRunnerUsageReport(event.usage);
+        if (!usage || usage.generation !== this.state?.generation) {
+          this.failProtocol('remote runner emitted usage for an invalid backend generation');
+          return;
+        }
+        this.usageCb?.(usage);
+      }
       this.turnFinalCb?.(event.content, event.turnId);
       this.finishActiveTurn();
       this.taskDoneCb?.();

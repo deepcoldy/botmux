@@ -7,7 +7,10 @@ import type { BotSkillPolicy } from './core/skills/types.js';
 import type { MojoConfig, MojoLivePatch, MojoSessionIdentity } from './adapters/backend/mojo-types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
 import type { RemoteRunnerConfig } from './adapters/backend/remote-runner-config.js';
-import type { RemoteRunnerBackendState } from './adapters/backend/remote-runner-protocol.js';
+import type {
+  RemoteRunnerBackendState,
+  RemoteRunnerUsageReport,
+} from './adapters/backend/remote-runner-protocol.js';
 import type { CliUsageLimitState } from './utils/cli-usage-limit.js';
 import type { VcMeetingActivityType } from './vc-agent/types.js';
 import type { CodexServiceTierSnapshot } from './services/codex-service-tier.js';
@@ -695,6 +698,8 @@ export interface Session {
   riffParentTaskId?: string;
   /** Provider-neutral remote compute and native-agent lineage. Never contains credentials. */
   remoteBackendState?: RemoteRunnerBackendState;
+  /** Latest generation-fenced usage confirmed by a Remote Runner provider. */
+  remoteRunnerUsage?: RemoteRunnerUsageReport;
   /**
    * Crash journal for an explicit Mojo remote close.
    *
@@ -2176,6 +2181,7 @@ export type WorkerToDaemon =
   | { type: 'riff_access_url'; accessUrl: string; directAccessUrl?: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'riff_task_id'; taskId: string | null }
   | { type: 'remote_backend_state'; state: RemoteRunnerBackendState }
+  | { type: 'remote_usage'; usage: RemoteRunnerUsageReport }
   | {
       type: 'remote_shutdown_result';
       requestId: string;

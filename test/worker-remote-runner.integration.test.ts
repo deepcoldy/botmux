@@ -59,7 +59,19 @@ input.on('line', line => {
     // The worker publishes screen cards on a 2s cadence. Keep the synthetic
     // turn alive beyond one full cadence so both Vitest and Bun observe the
     // screen_update before the structured final retires the turn.
-    setTimeout(() => emit({ type: 'final', turnId: command.turnId, content: 'REMOTE_OK', state }), 2500);
+    setTimeout(() => emit({
+      type: 'final', turnId: command.turnId, content: 'REMOTE_OK', state,
+      usage: {
+        generation: 1,
+        snapshot: {
+          context: { usedTokens: 240, windowTokens: 1000, percentUsed: 24 },
+          tokens: { in: 200, out: 40 },
+          turnTokens: { in: 25, out: 10 },
+          model: 'remote-model',
+          reasoningEffort: 'high',
+        },
+      },
+    }), 2500);
   } else if (command.type === 'detach') {
     emit({ type: 'status', requestId: command.requestId, status: 'detached' });
   } else if (command.type === 'cancel') {
@@ -141,6 +153,17 @@ input.on('line', line => {
         type: 'final_output',
         turnId: 'turn-remote-1',
         content: 'REMOTE_OK',
+      }),
+      expect.objectContaining({
+        type: 'remote_usage',
+        usage: expect.objectContaining({
+          generation: 1,
+          snapshot: expect.objectContaining({
+            context: { usedTokens: 240, windowTokens: 1000, percentUsed: 24 },
+            tokens: { in: 200, out: 40 },
+            model: 'remote-model',
+          }),
+        }),
       }),
       expect.objectContaining({
         type: 'screen_update',

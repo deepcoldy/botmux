@@ -102,6 +102,46 @@ describe('remote runner protocol', () => {
     }))).toBeUndefined();
   });
 
+  it('accepts authoritative usage on final and rejects malformed metrics', () => {
+    const base = {
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'final',
+      turnId: 'turn-usage',
+      content: 'done',
+    } as const;
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      ...base,
+      usage: {
+        generation: 3,
+        snapshot: {
+          context: { usedTokens: 7274, windowTokens: 258400, percentUsed: 2.815 },
+          tokens: { in: 7230, out: 44 },
+          turnTokens: { in: 7230, out: 44 },
+          model: 'GPT-5.4',
+          reasoningEffort: 'high',
+        },
+      },
+    }))).toMatchObject({
+      type: 'final',
+      usage: {
+        generation: 3,
+        snapshot: {
+          context: { usedTokens: 7274, windowTokens: 258400 },
+          tokens: { in: 7230, out: 44 },
+          model: 'GPT-5.4',
+        },
+      },
+    });
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      ...base,
+      usage: {
+        generation: 3,
+        snapshot: { context: { usedTokens: -1 }, tokens: null },
+      },
+    }))).toBeUndefined();
+  });
+
   it('ships a runnable reference provider covering hello/start/turn/status/detach', async () => {
     const child = spawn(process.execPath, [resolve('examples/remote-runner/reference-runner.mjs')], {
       stdio: ['pipe', 'pipe', 'inherit'],
@@ -163,6 +203,10 @@ describe('remote runner protocol', () => {
         content: 'hello',
         state: {
           agentThreadId: 'reference-thread:turn-1',
+        },
+        usage: {
+          generation: 1,
+          snapshot: { model: 'reference-model' },
         },
       });
 

@@ -1,6 +1,7 @@
 import type {
   RemoteRunnerBackendState,
   RemoteRunnerTrustedCaller,
+  RemoteRunnerUsageReport,
 } from './remote-runner-protocol.js';
 
 export type BackendType = 'pty' | 'tmux' | 'herdr' | 'zellij' | 'zmx' | 'riff' | 'mojo' | 'remote-runner';
@@ -216,6 +217,8 @@ export interface SessionBackend {
   onReady?(cb: () => void): void;
   /** Durable, provider-neutral lineage/runtime state changed. */
   onBackendState?(cb: (state: RemoteRunnerBackendState) => void): void;
+  /** Provider-native usage observed at a generation-fenced turn boundary. */
+  onUsageSnapshot?(cb: (usage: RemoteRunnerUsageReport) => void): void;
   /** Remote-session lineage updates — the worker forwards these to the daemon
    *  so the follow-up lineage survives daemon restarts. `null` clears the
    *  persisted lineage (follow-up failed → next message starts fresh). */
