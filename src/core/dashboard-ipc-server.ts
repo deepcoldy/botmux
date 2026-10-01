@@ -6321,6 +6321,8 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     codexAuthSync,
     envPolicy: (() => { try { return getBot(cachedLarkAppId).config.envPolicy ?? { mode: 'inherit' }; } catch { return { mode: 'inherit' }; } })(),
     sandboxPaths: sandboxStore.getBotSandboxPaths(cachedLarkAppId) ?? null,
+    sandboxNetworkPolicy: (() => { try { return getBot(cachedLarkAppId).config.sandboxNetworkPolicy ?? null; } catch { return null; } })(),
+    sandboxNetworkPolicyPlatform: process.platform,
     readIsolation: sandboxStore.getBotReadIsolation(cachedLarkAppId),
     // Full enforceability (adapter support + no wrapperCli + macOS) — the UI
     // disables the toggle wherever the worker would fail-close on it.
@@ -8212,6 +8214,16 @@ ipcRoute('PUT', '/api/bot-sandbox', async (req, res) => {
 // precedence layer of the FsPolicy — an empty/absent tier falls back to the
 // deny-by-default baseline. Passing all-empty CLEARS the field. next-session
 // 生效：running sessions keep their spawn-time policy, only new spawns re-read it.
+ipcRoute('PUT', '/api/bot-sandbox-network-policy', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { policy?: unknown };
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => key !== 'policy') || !Object.hasOwn(body, 'policy')) return jsonRes(res, 400, { ok: false, error: 'policy_required' });
+  const result = await applyConfigField(cachedLarkAppId, findConfigField('sandboxNetworkPolicy')!, body.policy);
+  if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+  jsonRes(res, 200, { ok: true, sandboxNetworkPolicy: getBot(cachedLarkAppId).config.sandboxNetworkPolicy ?? null });
+});
+
 ipcRoute('PUT', '/api/bot-sandbox-paths', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: { readWrite?: unknown; readOnly?: unknown; deny?: unknown };

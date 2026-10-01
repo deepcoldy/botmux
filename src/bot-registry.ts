@@ -1,3 +1,4 @@
+import { parseSandboxNetworkPolicy } from './core/sandbox-network-policy.js';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { normalizeCodexInstancePool, registerCodexInstanceBot, clearCodexInstanceBots, validateCodexInstanceRoster } from './services/codex-instance-pool.js';
 import { readFileSync, existsSync, statSync } from 'node:fs';
@@ -1710,6 +1711,7 @@ export interface BotConfig {
    * rely only on already-mounted local inputs.
    */
   sandboxNetwork?: boolean;
+  sandboxNetworkPolicy?: import('./core/sandbox-network-policy.js').SandboxNetworkPolicy;
   /**
    * LEGACY read-isolation flag (pre fs-policy). The unified sandbox is
    * deny-by-default, so cross-bot read isolation is inherent — this flag is
@@ -3886,6 +3888,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       sandboxHidePaths: normalizeStringList(entry.sandboxHidePaths),
       sandboxReadonlyPaths: normalizeStringList(entry.sandboxReadonlyPaths),
       sandboxNetwork: typeof entry.sandboxNetwork === 'boolean' ? entry.sandboxNetwork : undefined,
+      ...(entry.sandboxNetworkPolicy !== undefined ? { sandboxNetworkPolicy: parseSandboxNetworkPolicy(entry.sandboxNetworkPolicy) } : {}),
       readIsolation: entry.readIsolation === true,
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
       backendType: entry.backendType,

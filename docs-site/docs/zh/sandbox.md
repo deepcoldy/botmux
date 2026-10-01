@@ -102,6 +102,75 @@
 
 会添加 `--unshare-net`，让 CLI 在无宿主网络的命名空间里运行。这个开关很硬：模型/API 访问、包管理器、git remote、代理都可能不可用，除非该 CLI 能完全依赖已经挂载好的本地输入工作。
 
+## 分区目标 IP 网络策略（显式启用）
+
+`sandboxNetworkPolicy` 将公网与内网分开管理。未配置时，`sandboxNetwork` 布尔值和历史会话行为保持不变；显式策略优先于该布尔值。新策略仅适用于 **Linux x64/arm64、本地 PTY、oncall 文件沙箱**。Docker 容器还必须允许创建用户/网络/PID 命名空间及命名空间内 nftables。macOS、scratch、持久终端、远程后端、adopt 和外部 App Server 均拒绝启动，不能给已有进程补装边界。
+
+```json
+{
+  "sandbox": true,
+  "backendType": "pty",
+  "sandboxNetworkPolicy": {
+    "version": 1,
+    "public": { "mode": "allow" },
+    "private": {
+      "mode": "allowlist",
+      "rules": [{ "cidr": "10.20.0.0/16", "protocol": "tcp", "ports": [443] }]
+    },
+    "dnsServers": ["1.1.1.1"]
+  }
+}
+```
+
+| 模式 | 行为 |
+|---|---|
+| `allow` | 放行该区域全部目标地址 |
+| `block` | 阻断该区域全部目标地址 |
+| `allowlist` | 仅放行任一规则匹配的目标；空列表全部阻断 |
+| `denylist` | 阻断任一规则匹配的目标，其余放行；空列表全部放行 |
+
+两个区域可独立组合。先按实际目标地址分区，再执行该区域规则；规则之间为“任一匹配”，没有最长前缀覆盖或后项反转。跨区域 CIDR（如 `0.0.0.0/0`）只在所属区域内匹配。只接受 IP 和 CIDR，主机位会规范化；IPv4 映射 IPv6 地址与对应 IPv4 共用规则。规则省略 `protocol`/`ports` 时匹配全部协议/端口；`protocol` 仅接受 `tcp`/`udp`，`ports` 为 1–65535 整数列表，必须同时指定协议。域名、URL、通配符、端口范围及其它协议选择器会报错。
+
+“内网”采用保守的非公网分类：IPv4 的 RFC1918、回环、链路本地、CGNAT、未指定、文档/测试、保留、组播空间；IPv6 的 `2000::/3` 之外全部空间，以及 `2001::/23`、`2001:db8::/32`、`2002::/16`、`3fff::/20`。这包含 ULA、回环、链路本地、组播、IPv4 翻译/过渡地址。IPv4 的完整集合见 `src/core/sandbox-network-policy.ts` 的 `PRIVATE_V4`；此静态分类保守处理特殊用途，不实时推导路由或 DNS 后缀。
+
+执行边界是任务实际发出的 **IP 数据包目标地址**。nftables 安装在新的网络命名空间中，随后才用通用 `slirp4netns` 接通网络；不依赖 HTTP_PROXY，也不修改宿主防火墙、Docker 或任何代理产品配置。直接 socket、改写/删除代理变量、IPv4 映射地址均受同一规则约束；DNS 结果变化、HTTP 重定向到另一个地址会重新受目标规则约束。模型 API 需要的目标 CIDR、端口和 DNS 必须获准。
+
+该策略不解释加密流量或允许地址提供的应用功能。**不支持受限策略经上游代理再次解析目的地**：继承的 HTTP/HTTPS/ALL proxy 配置会被拒绝，环境变量不会被悄悄改写。允许的服务器或隧道端点本身是授权出口；请不要将可转发到任意目的地的服务列为可信目标。需要按代理后的业务地址、域名或 HTTP 请求控制访问时，本策略不能兑现该保证，不能将代理地址白名单等同于最终地址白名单。
+
+命名空间自己的 `127.0.0.1`/`::1` 为本地进程通信保留，与宿主回环不同。宿主回环映射、转发器网关别名及宿主 DNS 转发始终关闭；IPv6 邻居发现只开放必要的链路控制报文。任务不能创建宿主 Unix socket，不能调用 setns/unshare 或 io_uring 绕过过滤，也没有网络管理能力；`socketpair` 等进程内部 IPC 保留。宿主 MCP Gateway/Unix IPC 无法同时兑现该边界时，启动会明确拒绝；文件 outbox 中转仍保留。
+
+`dnsServers` 是独立、显式的 DNS 能力：这些 IP 的 TCP/UDP 53 优先于区域规则放行，最多 8 个；不能使用回环或转发器别名。缺省为空，不委托宿主 DNS。DNS 服务收到查询本身属于获准访问；最终业务连接仍按解析出的实际地址过滤。阻断所有外部通信时不要配置此能力。
+
+需自行提供 iproute2 的 `ip`、`nft`、带 `--disable-host-loopback` 和 `--disable-dns` 的 `slirp4netns`，以及支持 `--disable-userns`/`--add-seccomp-fd` 的 bwrap。不会自动安装新网络工具。依赖缺失、命名空间/nft/转发器初始化失败均拒绝任务；转发器退出会终止该任务生命周期。无未过滤的回退路径。
+
+Dashboard 的安全页可保存 JSON 策略；状态表示“已配置，下个新会话采用”，不代表正在运行的会话已经切换。也可在宿主 CLI 使用：
+
+```bash
+botmux sandbox-network-policy check policy.json
+botmux sandbox-network-policy set <appId> policy.json
+botmux sandbox-network-policy clear <appId>
+```
+
+`set`/`clear` 经目标在线 daemon 的认证配置接口原子写入；沙箱/会话内不得修改宿主策略。IM 的 `/config sandboxNetworkPolicy <JSON>` 使用同一校验/持久化入口。策略深拷贝到会话和 workflow 快照，fork/重启/恢复继续使用原策略；编辑机器人配置只影响新会话。清除后新会话回到原 `sandboxNetwork` 行为。
+
+### 隔离 Linux 验证
+
+先 `bun run build`，然后在专用测试目录的外层网络命名空间中准备测试地址。下面只修改该新命名空间，不修改宿主网络：
+
+```bash
+unshare -Urn sh -c '
+  set -e
+  ip link set lo up
+  ip addr add 93.184.216.34/32 dev lo
+  ip addr add 10.77.0.1/32 dev lo
+  ip -6 addr add 2606:4700::100/128 dev lo nodad
+  ip -6 addr add fd55::1/128 dev lo nodad
+  BOTMUX_NETWORK_POLICY_INTEGRATION=1 bun run test test/sandbox-network-linux.test.ts
+'
+```
+
+测试默认跳过；显式启用后，依赖或内核能力缺失会失败，不能把跳过当作边界验证通过。设置 `BOTMUX_NETWORK_TEST_BINARY` 为 `build:bun` 产物的绝对路径后，还会验证单文件自重执行；未设置时仅该编译态用例跳过。`Sandbox network boundary` CI 在相关 PR 中构建真实二进制并执行全部边界用例。模型请求用隔离 HTTP 测试服务，不调用真实供应商。
+
 ## 注意事项
 
 1. **仅 Linux**：依赖 bwrap + overlayfs（非 root 自动用 fuse-overlayfs，依赖开沙盒时自动装）；Mac（sandbox-exec）暂未支持。

@@ -256,6 +256,7 @@ describe('forkSession — frozen launch posture inheritance', () => {
       sandboxHidePaths: ['/hide/me'],
       sandboxReadonlyPaths: ['/ro/here'],
       sandboxNetwork: false,
+      sandboxNetworkPolicy: { version: 1, public: { mode: 'block' }, private: { mode: 'allowlist', rules: [{ cidr: '10.0.0.0/8' }] } },
     });
     registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
 
@@ -268,6 +269,8 @@ describe('forkSession — frozen launch posture inheritance', () => {
     expect(child.sandboxHidePaths).toEqual(['/hide/me']);
     expect(child.sandboxReadonlyPaths).toEqual(['/ro/here']);
     expect(child.sandboxNetwork).toBe(false);
+    expect(child.sandboxNetworkPolicy).toEqual(src.session.sandboxNetworkPolicy);
+    expect(child.sandboxNetworkPolicy).not.toBe(src.session.sandboxNetworkPolicy);
   });
 
   // ── childOwnerOpenId: an admin forking someone else's session is stamped as

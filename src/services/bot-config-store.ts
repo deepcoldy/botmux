@@ -1,3 +1,4 @@
+import { parseSandboxNetworkPolicy, networkPolicySupportError } from '../core/sandbox-network-policy.js';
 /**
  * `/config` 远程编辑 bot 运营字段。与 oncall-store / grant-prefs-store / brand-store
  * 同款：跨进程文件锁 + bots.json 原子写（rmwBotEntry），外加内存 registry 同步——
@@ -145,6 +146,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'canTalkDaemonCommands', configKey: 'canTalkDaemonCommands', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseCanTalkDaemonCommandsInput, hint: '把列出的 daemon 命令权限从 canOperate（仅管理员）降到 canTalk（对话放行即可用），如 /status /help；仅认 daemon 命令，透传命令无效；unset 回全部仅管理员' },
   { key: 'startupCommands', configKey: 'startupCommands', kind: 'stringList', effect: 'next-session', clearable: true, parseList: parseStartupCommandsInput, hint: '开会话后、首条消息前自动发给 CLI 的命令（逗号/换行分隔，可带参数，如 /effort ultracode）；unset 回不发' },
   { key: 'envPolicy', configKey: 'envPolicy', kind: 'json', effect: 'next-session', clearable: true, hint: '进程环境继承策略 JSON：{"mode":"strict","inherit":["HTTPS_PROXY"]}；默认 inherit 兼容旧行为。仅变量名，不填值；下次 worker 冷启动生效，旧 pane 策略不匹配时拒绝复用；unset 恢复默认' },
+  { key: 'sandboxNetworkPolicy', configKey: 'sandboxNetworkPolicy', kind: 'json', effect: 'next-session', clearable: true, hint: 'Linux 本地 PTY oncall 沙箱的公网/内网目标 IP 策略；version=1，public/private 各含 mode: allow|block|allowlist|denylist 和 rules[{cidr,protocol?,ports?}]；不支持域名或宿主 MCP/Unix IPC；下个新会话生效，unset 恢复 sandboxNetwork' },
   { key: 'env', configKey: 'env', kind: 'json', effect: 'next-session', clearable: true, hint: 'per-bot 环境变量 JSON（如 {"ANTHROPIC_BASE_URL":"…","ANTHROPIC_AUTH_TOKEN":"…"} 让本 bot 走 GLM/第三方服务商，或设 HTTPS_PROXY）；注入到本 bot 的 CLI 进程，下个会话生效；值不显示（脱敏）；unset 清除' },
   { key: 'codexAuthSync', configKey: 'codexAuthSync', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['shared', 'isolated'], hint: 'Codex 鉴权策略：shared=保持旧行为（非沙箱直接使用全局 ~/.codex；沙箱冷启动同步全局 auth 到 per-bot CODEX_HOME）｜isolated=无论是否启用沙箱都使用 per-bot CODEX_HOME，绝不复制全局凭证，需在该目录单独执行 codex login --with-api-key' },
   { key: 'credentialsSourceDir', configKey: 'credentialsSourceDir', kind: 'dir', effect: 'next-session', clearable: true, hint: 'CLI 凭证来源目录（如 ~/accounts/acct-b，内按 CLI 分子目录：claude/.credentials.json）：沙箱 bot 每次冷启动从这里复制凭证，而不是用本机共享登录；来源不可用即拒绝启动、绝不回退共享登录；目前仅支持 claude-code；完全未开沙箱的 bot 不生效（仍用全局登录），已开沙箱却无法重定向数据目录（wrapperCli / adapter 不支持 / 缺 SESSION_DATA_DIR）则拒绝启动；token 刷新由外部负责；unset 回共享登录' },
@@ -297,6 +299,13 @@ async function applyConfigFieldInternal(
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
   if (spec.configKey === 'envPolicy' && value !== null) {
     try { value = normalizeEnvPolicy(value); } catch { return { ok: false, reason: 'invalid_env_policy' }; }
+  }
+  if (spec.configKey === 'sandboxNetworkPolicy' && value !== null) {
+    try {
+      value = parseSandboxNetworkPolicy(value);
+      const reason = networkPolicySupportError({ platform: process.platform, backendType: bot.config.backendType ?? 'pty', sandbox: bot.config.sandbox, policy: value });
+      if (reason) return { ok: false, reason };
+    } catch (error) { return { ok: false, reason: (error as Error).message }; }
   }
   const previousPinStreamingCard = spec.configKey === 'pinStreamingCard'
     ? bot.config.pinStreamingCard === true
@@ -769,6 +778,7 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
     case 'json': {
       try {
         const parsed = JSON.parse(s);
+        if (spec.configKey === 'sandboxNetworkPolicy') return { ok: true, value: parseSandboxNetworkPolicy(parsed) };
         if (spec.configKey === 'oncallGroup') return { ok: true, value: normalizeOncallGroupPolicy(parsed) };
         if (spec.configKey === 'skills') {
           const policy = readBotSkillPolicy(parsed);

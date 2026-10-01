@@ -116,8 +116,10 @@ export type BotDefaultsRow = {
     gitHost?: string;
     gitTokenExchangeUrl?: string;
   } | null;
-  /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer).
-   *  null/absent = none configured (pure deny-by-default baseline). */
+  /** Opt-in policy, configured for future sessions; absence retains legacy behavior. */
+  sandboxNetworkPolicy?: import('../../core/sandbox-network-policy.js').SandboxNetworkPolicy | null;
+  sandboxNetworkPolicyPlatform?: string | null;
+  /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer). */
   sandboxPaths?: { readWrite: string[]; readOnly: string[]; deny: string[] } | null;
   /** Whether the unified file sandbox ALSO applies cross-bot read isolation for
    *  this bot's sessions — true when the CLI (claude/codex) + platform (macOS/Linux)

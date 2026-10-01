@@ -7385,6 +7385,14 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    const networkPolicyRoute = url.pathname.match(/^\/api\/bots\/([^/]+)\/sandbox-network-policy$/);
+    if (req.method === 'PUT' && networkPolicyRoute) {
+      const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(chunk as Buffer);
+      const upstream = await proxyToDaemon(decodeURIComponent(networkPolicyRoute[1]), '/api/bot-sandbox-network-policy', {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: Buffer.concat(chunks).toString('utf8'),
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' }); res.end(await upstream.text()); return;
+    }
     // PUT /api/bots/:appId/sandbox-paths — proxy to that bot's daemon.
     // Body `{ readWrite?: string[]; readOnly?: string[]; deny?: string[] }`.
     let mBotSandboxPaths: RegExpMatchArray | null;

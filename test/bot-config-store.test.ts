@@ -141,6 +141,28 @@ describe('bot-config store', () => {
     expect(readConfig().promptInjection).toBeUndefined();
   });
 
+  it('network policy strictly validates and persists atomically; clear restores legacy network', async () => {
+    const { registry, store } = await loaded({ sandbox: true, backendType: 'pty', sandboxNetwork: false });
+    const spec = store.findConfigField('sandboxNetworkPolicy')!;
+    const policy = { version: 1, public: { mode: 'allow' }, private: { mode: 'block' } };
+    expect(store.coerceConfigValue(spec, JSON.stringify(policy))).toMatchObject({ ok: true, value: policy });
+    expect(store.coerceConfigValue(spec, JSON.stringify({ ...policy, public: { mode: 'allowlist', rules: [{ cidr: 'example.org' }] } }))).toMatchObject({ ok: false });
+    // Linux-only runtime support is a deliberate gate, not a silent no-op.
+    if (process.platform !== 'linux') {
+      expect(await store.applyConfigField('app_default', spec, policy)).toMatchObject({ ok: false });
+      expect(readConfig()).not.toHaveProperty('sandboxNetworkPolicy');
+      return;
+    }
+    expect((await store.applyConfigField('app_default', spec, policy)).ok).toBe(true);
+    expect(readConfig().sandboxNetworkPolicy).toEqual(policy);
+    expect(registry.getBot('app_default').config.sandboxNetworkPolicy).toEqual(policy);
+    expect(await store.applyConfigField('app_default', store.findConfigField('backendType')!, 'tmux')).toMatchObject({ ok: false });
+    expect(readConfig().backendType).toBe('pty');
+    expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('sandboxNetworkPolicy');
+    expect(readConfig().sandboxNetwork).toBe(false);
+  });
+
   it('CONFIG_FIELDS have unique keys and include allowedUsers', async () => {
     const { store } = await freshModules();
     const keys = store.CONFIG_FIELDS.map(f => f.key);

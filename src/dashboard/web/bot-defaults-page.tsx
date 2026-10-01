@@ -1157,7 +1157,7 @@ function BotDefaultsCard(props: {
           <BdTabGrid>
             {/* riff 在远端沙箱执行、本地无 CLI 进程，文件沙盒对它无意义（worker 侧已旁路）。 */}
             {bot.cliId !== 'riff' ? (
-              <section className="bd-tile"><SandboxSection bot={bot} patchBot={patchBot} /></section>
+              <section className="bd-tile"><SandboxSection bot={bot} patchBot={patchBot} /><NetworkPolicySection bot={bot} patchBot={patchBot} /></section>
             ) : null}
             {bot.cliId === 'codex' ? (
               <section className="bd-tile"><CodexAuthSection bot={bot} patchBot={patchBot} /></section>
@@ -7951,4 +7951,37 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
 
 export function renderBotDefaultsPage(root: HTMLElement): PageDisposer {
   return mountReactPage(root, <BotDefaultsPage />);
+}
+
+
+export function NetworkPolicySection({ bot, patchBot }: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [text, setText] = useState(JSON.stringify(bot.sandboxNetworkPolicy ?? { version: 1, public: { mode: 'allow' }, private: { mode: 'block' } }, null, 2));
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+  const supported = bot.sandboxNetworkPolicyPlatform === 'linux' && (bot.backendType ?? 'pty') === 'pty' && (bot.sandboxMode === 'oncall' || bot.sandboxMode == null && bot.sandbox === true);
+  useEffect(() => { if (bot.sandboxNetworkPolicy) setText(JSON.stringify(bot.sandboxNetworkPolicy, null, 2)); }, [bot.sandboxNetworkPolicy]);
+  async function save(clear: boolean) {
+    setBusy(true); setStatus(null);
+    try {
+      const policy = clear ? null : JSON.parse(text);
+      const result = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/sandbox-network-policy`, { policy });
+      if (!result.ok) throw new Error(result.body.error ?? 'Save failed');
+      patchBot(bot.larkAppId, { sandboxNetworkPolicy: result.body.sandboxNetworkPolicy });
+      setStatus({ ok: true, text: tr('botDefaults.networkSaved') });
+    } catch (error) { setStatus({ ok: false, text: (error as Error).message }); }
+    finally { setBusy(false); }
+  }
+  return <section className="bd-section" data-network-policy="">
+    <h3>{tr('botDefaults.networkPolicy')}</h3>
+    <p className="bd-section-note">{tr('botDefaults.networkPolicyHelp')}</p>
+    <p className="bd-section-note">{supported ? tr('botDefaults.networkRequirements') : tr('botDefaults.networkUnsupported')}</p>
+    <p className="bd-section-note">{bot.sandboxNetworkPolicy ? tr('botDefaults.networkConfigured') : tr('botDefaults.networkLegacy')}</p>
+    <textarea aria-label={tr('botDefaults.networkPolicy')} value={text} onChange={event => setText(event.target.value)} disabled={busy || !supported} rows={12} style={{ width: '100%', fontFamily: 'monospace' }} />
+    <div className="actions bd-section-actions">
+      <button className="primary" type="button" disabled={busy || !supported} onClick={() => void save(false)}>{tr('botDefaults.networkSave')}</button>
+      <button type="button" disabled={busy || !bot.sandboxNetworkPolicy} onClick={() => void save(true)}>{tr('botDefaults.networkClear')}</button>
+      <StatusSpan status={status} />
+    </div>
+  </section>;
 }

@@ -1,3 +1,4 @@
+import { parseSandboxNetworkPolicy } from '../../core/sandbox-network-policy.js';
 /**
  * Shared v3 bot resolution — selector → BotConfig → BotSnapshot.
  *
@@ -90,6 +91,7 @@ export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotS
     ...(bot.sandboxHidePaths?.length ? { sandboxHidePaths: [...bot.sandboxHidePaths] } : {}),
     ...(bot.sandboxReadonlyPaths?.length ? { sandboxReadonlyPaths: [...bot.sandboxReadonlyPaths] } : {}),
     ...(bot.sandboxNetwork === false ? { sandboxNetwork: false } : {}),
+    ...(bot.sandboxNetworkPolicy ? { sandboxNetworkPolicy: structuredClone(bot.sandboxNetworkPolicy) } : {}),
     workingDir: botWorkingDir(bot, workingDirOverride),
   };
 }
@@ -157,6 +159,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
     'sandboxHidePaths',
     'sandboxReadonlyPaths',
     'sandboxNetwork',
+    'sandboxNetworkPolicy',
     'workingDir',
   ]);
   const snapshots = new Map<string, BotSnapshot>();
@@ -242,6 +245,7 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
       ...(obj.sandboxHidePaths !== undefined ? { sandboxHidePaths: [...obj.sandboxHidePaths as string[]] } : {}),
       ...(obj.sandboxReadonlyPaths !== undefined ? { sandboxReadonlyPaths: [...obj.sandboxReadonlyPaths as string[]] } : {}),
       ...(obj.sandboxNetwork !== undefined ? { sandboxNetwork: obj.sandboxNetwork as boolean } : {}),
+      ...(obj.sandboxNetworkPolicy !== undefined ? { sandboxNetworkPolicy: parseSandboxNetworkPolicy(obj.sandboxNetworkPolicy) } : {}),
       workingDir: obj.workingDir,
     });
   }

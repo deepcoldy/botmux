@@ -114,3 +114,40 @@ to add `--unshare-net` and run the CLI without host network access. This is a bl
 ## Pairs with On-Call
 
 The file sandbox + [On-Call Mode](/en/oncall) is the standard combo: on-call opens the bot to a whole group to @ at will, and the sandbox guarantees their changes **never touch the real repo** and **only land after the owner reviews each one**. The default pairing for semi-trusted, many-people, change-anytime on-call scenarios.
+
+## Destination IP policy (explicit opt-in)
+
+`sandboxNetworkPolicy` independently configures public and private address space. Without it, existing `sandboxNetwork` values and historical sessions keep their behavior. An explicit policy takes precedence over the boolean. Supported only for **Linux x64/arm64, local PTY, oncall file sandbox**. Docker must permit user/network/PID namespaces and namespace-local nftables. macOS, scratch, persistent terminals, remote backends, adopt and external App Servers are rejected.
+
+```json
+{
+  "sandbox": true,
+  "backendType": "pty",
+  "sandboxNetworkPolicy": {
+    "version": 1,
+    "public": { "mode": "allow" },
+    "private": { "mode": "allowlist", "rules": [{ "cidr": "10.20.0.0/16", "protocol": "tcp", "ports": [443] }] },
+    "dnsServers": ["1.1.1.1"]
+  }
+}
+```
+
+Each zone supports `allow` (all destinations), `block` (none), `allowlist` (any matching rule; empty blocks all), or `denylist` (deny any matching rule; empty permits all). Classify the actual address first, then evaluate that zone. Rules have union semantics, with no longest-prefix or last-rule overrides. A cross-zone CIDR only matches within its containing zone.
+
+Rules accept IP/CIDR only; host bits normalize. IPv4-mapped IPv6 addresses share IPv4 rules. Omitted protocol/ports matches all protocols/ports; optional protocol accepts TCP/UDP, and optional ports requires protocol and an integer list 1–65535. Domains, URLs, wildcards, port ranges and other protocol selectors are rejected.
+
+Private means conservative non-public space: RFC1918, IPv4 loopback, link-local, CGNAT, unspecified, reserved, documentation/test and multicast ranges (full list: `PRIVATE_V4` in `src/core/sandbox-network-policy.ts`); IPv6 outside `2000::/3`, plus `2001::/23`, `2001:db8::/32`, `2002::/16` and `3fff::/20`. This includes ULA, loopback, link-local, multicast and translation/transition space. Classification is static, independent of DNS suffix or current routing.
+
+The boundary filters **actual destination IP packets** using nftables in a fresh namespace before connecting a generic slirp4netns link. Direct sockets, changed/deleted proxy variables, IPv4 mappings, changed DNS answers and redirected connections receive the same kernel filtering. Model endpoints and DNS must be explicitly permitted. It does not modify the host firewall, Docker or any proxy product configuration.
+
+Restricted policies do not support upstream proxy destination re-resolution; inherited HTTP/HTTPS/ALL proxy configuration is rejected rather than rewritten. This is address enforcement, not inspection of encrypted application traffic. An allowed server or tunnel endpoint is an authorized exit: do not allow arbitrary forwarding services when requiring final application destination restrictions. Domain/HTTP rules or final destinations hidden behind a proxy cannot be enforced by this policy.
+
+Namespace-local loopback remains available for local IPC, distinct from host loopback. Host loopback aliases and slirp DNS forwarding are always disabled. Only required IPv6 neighbor discovery control packets are exempted. Task socket creation is restricted to Internet families; host Unix sockets, setns/unshare, compat syscall ABI and io_uring are blocked, while process-local socketpair IPC remains. Host MCP Gateway/Unix IPC combinations fail closed; the file outbox relay remains available.
+
+Optional `dnsServers` grants explicit TCP/UDP port 53 access before zone evaluation (max 8 IPs, excluding loopback and slirp aliases). Default is empty, without host DNS delegation. DNS queries are themselves an authorized capability; resulting application connections still receive destination filtering. Omit DNS capability to block all external communication.
+
+Provide iproute2 `ip`, nft, slirp4netns supporting `--disable-host-loopback`/`--disable-dns`, and bwrap supporting `--disable-userns`/`--add-seccomp-fd`. No network dependency auto-install occurs. Initialization failures abort launch; a link failure terminates the task lifetime. There is no unfiltered fallback.
+
+Dashboard Security saves JSON and shows configured-for-new-sessions status. Host CLI supports `botmux sandbox-network-policy check <file>`, `set <appId> <file>` and `clear <appId>`. Mutations require an online authenticated owning daemon; isolated/session CLIs cannot modify host policy. IM `/config sandboxNetworkPolicy <JSON>` shares validation and atomic persistence. Session/workflow snapshots are deep copies; fork/restart/restore retains the frozen policy. Clearing affects new sessions and restores the legacy boolean behavior.
+
+See the Chinese page's isolated Linux test command. `test/sandbox-network-linux.test.ts` is opt-in (`BOTMUX_NETWORK_POLICY_INTEGRATION=1`); explicit runs fail if dependencies or kernel capabilities are unavailable. A skipped run is not boundary validation. Set `BOTMUX_NETWORK_TEST_BINARY` to the absolute compiled binary path to include the self-reexec case. The Sandbox network boundary CI runs the complete matrix and binary test for relevant PRs. Model requests use an isolated HTTP fixture rather than a live provider.

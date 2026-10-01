@@ -6767,6 +6767,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   stop        停止 daemon（默认不停止插件 service；--with-plugin 显式停止 mode=auto 的插件 service）
   restart     重启 daemon（同样接受 --companion-secret-file / --companion-bot；--with-plugin 显式先停再启动 auto service）
   logs        查看/跟随 daemon 日志（--lines N, --bot <0-based-index|name|appId>, --no-follow 只打印不跟随）
+  sandbox-network-policy check <JSON文件> | set <appId> <JSON文件> | clear <appId>
+              配置 Linux 本地 PTY oncall 公网/内网目标 IP 策略，下个新会话生效
   model-proxy serve --config <path>
               启动有鉴权的本机模型协议入口（Chat Completions 子集）
   env-policy get|set <JSON>|unset [--bot <name|appId>]
@@ -15575,6 +15577,7 @@ if (__entrySubcommand) {
   else if (__entrySubcommand === 'worker') await import('./worker.js');
   else if (__entrySubcommand === 'supervisor') await import('./index-supervisor.js');
   else if (__entrySubcommand === 'dashboard') await import('./index-dashboard.js');
+  else if (__entrySubcommand === 'sandbox-network-runner') await import('./sandbox-network-runner.js');
   else if (__entrySubcommand === 'plugin-supervisor') await import('./index-plugin-supervisor.js');
   // CLI-adapter runners. Same mechanism, different role: these ARE the CLI session
   // process an adapter launches, not a fleet member. Without these branches the
@@ -16637,6 +16640,24 @@ switch (command) {
   }
   case 'upgrade':
   case 'update':  await cmdUpgrade(process.argv.slice(3)); break;
+  case 'sandbox-network-policy': {
+    const args = process.argv.slice(3);
+    const { parseSandboxNetworkPolicy } = await import('./core/sandbox-network-policy.js');
+    if (args[0] === 'check' && args[1]) {
+      console.log(JSON.stringify(parseSandboxNetworkPolicy(JSON.parse(readFileSync(args[1], 'utf8'))), null, 2));
+      break;
+    }
+    if (isolatedCliProcess() || isSessionScopedCliProcess()) throw new Error('沙箱/会话内不能修改宿主网络策略');
+    if (!['set', 'clear'].includes(args[0]) || !args[1] || args[0] === 'set' && !args[2]) throw new Error('用法：botmux sandbox-network-policy check <JSON文件> | set <appId> <JSON文件> | clear <appId>');
+    const daemon = listOnlineDaemons().find(d => d.larkAppId === args[1]);
+    if (!daemon) throw new Error('目标 daemon 不在线；请先启动后再修改策略');
+    const policy = args[0] === 'clear' ? null : parseSandboxNetworkPolicy(JSON.parse(readFileSync(args[2], 'utf8')));
+    const response = await fetchDaemonIpc(daemon.ipcPort, '/api/bot-sandbox-network-policy', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ policy }) });
+    const result = await response.json() as { ok?: boolean; error?: string; sandboxNetworkPolicy?: unknown };
+    if (!response.ok || !result.ok) throw new Error(result.error ?? `HTTP ${response.status}`);
+    console.log(JSON.stringify({ ok: true, sandboxNetworkPolicy: result.sandboxNetworkPolicy, effect: 'next-session' }));
+    break;
+  }
   case 'dashboard': await cmdDashboard(process.argv.slice(3)); break;
   case 'bind': {
     // `botmux bind <code>` — 把本机绑定到中心化平台

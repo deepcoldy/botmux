@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { networkPolicySupportError, networkProxyError } from './core/sandbox-network-policy.js';
 import { GOAL_ENV } from './workflows/v3/contract.js';
 import { supportsZeroPromptInjection } from './core/prompt-injection.js';
 import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
@@ -14548,6 +14549,13 @@ async function spawnCli(
   if (cfg.envPolicy?.mode === 'strict' && ['herdr', 'mojo', 'riff'].includes(cfg.backendType)) {
     throw new Error('envPolicy strict currently supports pty, tmux, zellij and zmx backends');
   }
+  const networkError = networkPolicySupportError({
+    platform: process.platform, backendType: cfg.backendType, sandbox: cfg.sandbox,
+    adopt: cfg.adoptMode, existingEndpoint: cfg.existingAppServerEndpoint, policy: cfg.sandboxNetworkPolicy,
+  });
+  if (networkError) throw new Error(networkError);
+  const proxyError = networkProxyError(cfg.sandboxNetworkPolicy, { ...process.env, ...cfg.env });
+  if (proxyError) throw new Error(proxyError);
   const spawnGeneration = ++cliSpawnGeneration;
   if (cfg.cliInstanceBinding && cfg.cliInstanceBinding.source !== 'legacy' && cfg.backendType === 'tmux') {
     TmuxBackend.assertInstanceIdentity(TmuxBackend.sessionName(cfg.sessionId), codexInstanceIdentity(cfg.cliInstanceBinding, cfg.cliRuntime));
@@ -15172,6 +15180,8 @@ async function spawnCli(
     // locally, so the local sandbox stays on rather than being skipped.
     log('mojo runs tools locally (cloud not enabled, or localDaemon set) — keeping the local sandbox engaged');
   }
+  const effectiveNetworkError = networkPolicySupportError({ platform: process.platform, backendType: effectiveBackendType, sandbox: sandboxMode, policy: cfg.sandboxNetworkPolicy });
+  if (effectiveNetworkError) throw new Error(effectiveNetworkError);
   const scratchRequested = sandboxMode === 'scratch';
   const sandboxRequested = sandboxMode !== 'off';
   if (scratchRequested && process.platform !== 'linux' && process.platform !== 'darwin') {
@@ -17363,7 +17373,7 @@ async function spawnCli(
       hostOnlyDenyPaths,
       mandatoryDenyRegexes,
       mandatoryReadOnlyPaths,
-      net: cfg.sandboxNetwork !== false,
+      net: cfg.sandboxNetworkPolicy ? true : cfg.sandboxNetwork !== false,
       // Claude Code saves ~/.claude.json atomically via a PID/random-suffixed
       // sibling — only relevant when the data dir is NOT redirected to BOT_HOME.
       writeRegexes: process.platform === 'darwin' && !willRedirectCliData && claudeDataDir
@@ -17459,6 +17469,7 @@ async function spawnCli(
           + `use the default store. The real keystore is still denied/carve-out'd by policy (no leak).`);
       }
       const sbx = prepareDirectSandbox({
+        networkPolicy: cfg.sandboxNetworkPolicy,
         sessionId: cfg.sessionId,
         dataDir,
         policy,

@@ -9856,6 +9856,7 @@ export async function forkSession(
   childSession.sandboxHidePaths = ds.session.sandboxHidePaths;
   childSession.sandboxReadonlyPaths = ds.session.sandboxReadonlyPaths;
   childSession.sandboxNetwork = ds.session.sandboxNetwork;
+  childSession.sandboxNetworkPolicy = ds.session.sandboxNetworkPolicy ? structuredClone(ds.session.sandboxNetworkPolicy) : undefined;
   childSession.reasoningEffort = ds.session.reasoningEffort;
   childSession.modelBackendVariant = ds.session.modelBackendVariant;
   childSession.model = ds.session.model;
@@ -11877,6 +11878,7 @@ export function forkWorker(
       ds.session.sandboxHidePaths = botCfg.sandboxHidePaths ?? [];
       ds.session.sandboxReadonlyPaths = botCfg.sandboxReadonlyPaths ?? [];
       ds.session.sandboxNetwork = botCfg.sandboxNetwork !== false;
+      ds.session.sandboxNetworkPolicy = botCfg.sandboxNetworkPolicy ? structuredClone(botCfg.sandboxNetworkPolicy) : undefined;
       if (ds.session.sandbox === 'scratch') {
         ds.session.sandboxScratch = {
           storage: normalizeScratchStorage(botCfg.scratchStorage),
@@ -12336,6 +12338,7 @@ export function forkWorker(
     sandboxHidePaths: ds.session.sandboxHidePaths ?? [],
     sandboxReadonlyPaths: ds.session.sandboxReadonlyPaths ?? [],
     sandboxNetwork: ds.session.sandboxNetwork !== false,
+    sandboxNetworkPolicy: ds.session.sandboxNetworkPolicy ? structuredClone(ds.session.sandboxNetworkPolicy) : undefined,
     // Per-bot local read isolation (enforced worker-side; the worker gates it).
     // Sibling data needs no app-id enumeration: per-bot dirs are denied wholesale
     // and per-bot session files by filename pattern (see buildV2DenyPaths).

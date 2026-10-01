@@ -2917,6 +2917,7 @@ async function ensureVcMeetingReceiverSession(
     session.sandboxHidePaths = receiverSandboxed ? (bot.config.sandboxHidePaths ?? []) : [];
     session.sandboxReadonlyPaths = receiverSandboxed ? (bot.config.sandboxReadonlyPaths ?? []) : [];
     session.sandboxNetwork = receiverSandboxed ? (bot.config.sandboxNetwork !== false) : true;
+    session.sandboxNetworkPolicy = bot.config.sandboxNetworkPolicy ? structuredClone(bot.config.sandboxNetworkPolicy) : undefined;
     session.backendType = isolation.backendType;
     sessionStore.updateSession(session);
 
@@ -20036,6 +20037,7 @@ function cloneIndependentLaunchPosture(source: Session, child: Session): void {
   child.sandboxHidePaths = source.sandboxHidePaths;
   child.sandboxReadonlyPaths = source.sandboxReadonlyPaths;
   child.sandboxNetwork = source.sandboxNetwork;
+  child.sandboxNetworkPolicy = source.sandboxNetworkPolicy ? structuredClone(source.sandboxNetworkPolicy) : undefined;
   child.reasoningEffort = source.reasoningEffort;
   child.modelBackendVariant = source.modelBackendVariant;
   child.model = source.model;

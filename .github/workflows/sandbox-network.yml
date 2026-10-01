@@ -1,0 +1,61 @@
+name: Sandbox network boundary
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/sandbox-network.yml'
+      - 'src/core/sandbox-network-*'
+      - 'src/core/linux-isolation.ts'
+      - 'src/core/self-spawn.ts'
+      - 'src/sandbox-network-runner.ts'
+      - 'src/adapters/backend/sandbox.ts'
+      - 'src/adapters/cli/fs-policy.ts'
+      - 'src/cli.ts'
+      - 'test/sandbox-network-*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sandbox-network-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  network-boundary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.2
+      - name: Install kernel test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap nftables slirp4netns iproute2
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - run: bun install --frozen-lockfile
+      - run: bun run build
+      - name: Build the real single-file entry
+        run: bun scripts/build-bun-binary.mjs --target bun-linux-x64 --out "$RUNNER_TEMP/botmux-network-test"
+      - name: Enforce IPv4, IPv6, PTY and binary boundaries
+        env:
+          BOTMUX_NETWORK_POLICY_INTEGRATION: '1'
+        run: |
+          export BOTMUX_NETWORK_TEST_BINARY="$RUNNER_TEMP/botmux-network-test"
+          # All fixture addresses and firewall rules belong to this NEW outer
+          # namespace. No host firewall changes or real provider requests.
+          unshare -Urn sh -c '
+            set -eu
+            ip link set lo up
+            ip addr add 93.184.216.34/32 dev lo
+            ip addr add 10.77.0.1/32 dev lo
+            ip -6 addr add 2606:4700::100/128 dev lo nodad
+            ip -6 addr add fd55::1/128 dev lo nodad
+            bun run test test/sandbox-network-linux.test.ts
+          '
