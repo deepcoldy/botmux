@@ -1136,6 +1136,39 @@ describe('isScheduledTurnStartEvent', () => {
     expect(isScheduledTurnStartEvent(null)).toBe(false);
     expect(isScheduledTurnStartEvent(undefined)).toBe(false);
   });
+
+  // Legacy fire records (Claude Code ≤2.1.280) carry no turnOrigin; they mark
+  // the prompt with promptSource:"system". The predicate must accept that
+  // shape while staying strict about isMeta and the mandatory fire id.
+  it('recognises a LEGACY fire: isMeta + promptSource system, no turnOrigin', () => {
+    const legacy = userEv('cron prompt', {
+      isMeta: true,
+      promptSource: 'system',
+      scheduledTaskId: 'task-1',
+      scheduledFireId: 'fire-legacy-1',
+    });
+    expect(isScheduledTurnStartEvent(legacy)).toBe(true);
+  });
+  it('rejects a turnOrigin other than scheduled even with a fire id', () => {
+    expect(isScheduledTurnStartEvent(fire({ turnOrigin: 'human' }))).toBe(false);
+  });
+  it('rejects a non-isMeta record even when promptSource is system and a fire id exists', () => {
+    const sneaky = userEv('cron prompt', {
+      promptSource: 'system',
+      scheduledFireId: 'fire-x',
+    });
+    expect(isScheduledTurnStartEvent(sneaky)).toBe(false);
+  });
+  it('rejects a legacy-shaped isMeta+system record without a fire id', () => {
+    expect(isScheduledTurnStartEvent(
+      userEv('x', { isMeta: true, promptSource: 'system' }),
+    )).toBe(false);
+  });
+  it('requires promptSource system for a legacy (no-turnOrigin) isMeta record', () => {
+    expect(isScheduledTurnStartEvent(
+      userEv('x', { isMeta: true, scheduledFireId: 'fire-y' }),
+    )).toBe(false);
+  });
 });
 
 describe('cronCreateToolUseIds / cronCreateAcks', () => {

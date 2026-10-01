@@ -180,16 +180,23 @@ export function isTruncatedMatch(recordedNorm: string, markContentNorm?: string)
 }
 
 export class BridgeTurnQueue {
-  constructor(private readonly onLocalTurnStarted?: (turn: BridgePendingTurn) => void) {}
+  constructor(
+    private readonly onLocalTurnStarted?: (turn: BridgePendingTurn) => void,
+    /** Fired ONCE per CronCreate call, when its tool_result ack resolves the
+     *  scheduled task id: hands the worker the (taskId → create-time topic
+     *  anchor) pair so it can persist it across worker restarts. `undefined`
+     *  anchor means the task was created with no Lark context (local turn). */
+    private readonly onScheduledTaskAnchored?: (taskId: string, anchor: string | undefined) => void,
+  ) {}
   private seen = new Set<string>();
   private queue: BridgePendingTurn[] = [];
   private collecting: BridgePendingTurn | null = null;
   private lastLocalTurnId?: string;
   /** Turn id of the most recent Lark turn that actually STARTED (its user
-   *  event arrived and fingerprint-bound a mark). A built-in scheduled fire
-   *  has no Lark turn of its own; its reply anchors here. Only updated at
-   *  bind time — a queued-but-unstarted mark from another topic must NOT
-   *  move the anchor before its turn has really begun. */
+   *  event arrived and fingerprint-bound a mark). Used as the create-time
+   *  anchor when a CronCreate call is not itself inside a Lark or scheduled
+   *  turn. Only updated at bind time — a queued-but-unstarted mark from
+   *  another topic must NOT move it before that turn has really begun. */
   private lastLarkTurnId?: string;
   /** CronCreate tool_use block ids awaiting their tool_result ack, each
    *  carrying the Lark anchor captured at the moment of the CALL. The
@@ -197,9 +204,12 @@ export class BridgeTurnQueue {
    *  anchor is filed under it in {@link scheduledTaskAnchors}. */
   private pendingCronCreates = new Map<string, string | undefined>();
   /** scheduledTaskId → Lark topic anchor captured when the task was CREATED.
-   *  Fires of that task anchor here, NOT to whatever topic is current at fire
-   *  time — without this, a task created in topic A would post its results
-   *  into topic B after any later message in B. */
+   *  Fires of a KNOWN task anchor here (a stored `undefined` means "created
+   *  from a local turn, no topic"), NOT to whatever topic is current at fire
+   *  time. An UNKNOWN task (no CronCreate/ack observed this process and
+   *  nothing restored) gets NO anchor — never a later topic's anchor, which
+   *  would route cross-topic after a restart. Restored by the worker from the
+   *  durable anchor store on startup. */
   private scheduledTaskAnchors = new Map<string, string | undefined>();
   /** Lark turns removed by the head-of-line drop, awaiting journal cleanup by
    *  the worker. This queue is pure (no fs), so it cannot clear the durable
@@ -502,20 +512,46 @@ export class BridgeTurnQueue {
   }
 
   /** Pair CronCreate tool_result acks with their earlier tool_use calls and
-   *  file the call-time topic anchor under the scheduled task id. */
+   *  file the call-time topic anchor under the scheduled task id.
+   *
+   *  Must-fix: only accept an ack whose tool_use_id matches a PENDING
+   *  CronCreate call. An unrelated Read/Bash tool_result whose text merely
+   *  CONTAINS the literal "Scheduled recurring job task-A …" (e.g. grepping a
+   *  log) must not overwrite task-A's anchor — without the has() check it
+   *  would be filed under undefined and reroute A's next fire to the wrong
+   *  topic. */
   private handleCronCreateAcks(ev: TranscriptEvent): void {
     for (const ack of cronCreateAcks(ev)) {
+      if (!this.pendingCronCreates.has(ack.toolUseId)) continue;
       const anchor = this.pendingCronCreates.get(ack.toolUseId);
       this.pendingCronCreates.delete(ack.toolUseId);
       this.scheduledTaskAnchors.set(ack.taskId, anchor);
+      try { this.onScheduledTaskAnchored?.(ack.taskId, anchor); } catch { /* observer only */ }
     }
+  }
+
+  /** Restore task→anchor pairs from the worker's durable store after a
+   *  restart. Does not overwrite a pair established THIS process (a live
+   *  re-create wins over stale disk), and never creates an anchor for a task
+   *  the store doesn't know. */
+  restoreScheduledTaskAnchors(restored: ReadonlyMap<string, string | undefined>): void {
+    for (const [taskId, anchor] of restored) {
+      if (!this.scheduledTaskAnchors.has(taskId)) {
+        this.scheduledTaskAnchors.set(taskId, anchor);
+      }
+    }
+  }
+
+  /** Test/inspection helper: the anchor recorded for a known task. */
+  scheduledTaskAnchor(taskId: string): string | undefined {
+    return this.scheduledTaskAnchors.get(taskId);
   }
 
   /** Built-in CronCreate fire handler. Like a local-terminal turn it matches
    *  no Lark fingerprint, but it is user-scheduled rather than ambient typing,
    *  so the worker forwards its final (isScheduled) and anchors the reply to
-   *  the most recent Lark turn's topic. Pending Lark marks stay unstarted —
-   *  the scheduler's prompt must never fingerprint-bind them. */
+   *  the topic captured when THIS task was created. Pending Lark marks stay
+   *  unstarted — the scheduler's prompt must never fingerprint-bind them. */
   private handleScheduledTurnStart(uuid: string, ev: TranscriptEvent, sourceJsonlPath?: string): void {
     // Same transcript-order closeout as a real turn start.
     if (this.collecting?.dispatchAttempt !== undefined && !this.collecting.terminalObserved) {
@@ -537,14 +573,20 @@ export class BridgeTurnQueue {
     const fireId = typeof ev.scheduledFireId === 'string' && ev.scheduledFireId
       ? ev.scheduledFireId
       : uuid;
-    // Route to the topic captured when THIS task was created, not to whatever
-    // topic is most recent at fire time. Fall back to the latest started Lark
-    // turn only when the create/ack is missing (old transcript / restart that
-    // lost in-memory state); undefined means "no anchor", and the worker omits
-    // replyTurnId so the daemon uses its default routing.
-    const anchor = typeof ev.scheduledTaskId === 'string' && ev.scheduledTaskId
-      ? this.scheduledTaskAnchors.get(ev.scheduledTaskId) ?? this.lastLarkTurnId
-      : this.lastLarkTurnId;
+    // Route to the topic captured when THIS task was created. The anchor is
+    // taken STRICTLY from the task map (live CronCreate/ack or restored from
+    // the durable store). An unknown task — no create/ack observed this
+    // process and nothing restored — gets NO anchor: borrowing lastLarkTurnId
+    // here would route a pre-attach task into whatever topic happened to be
+    // most recent, which after a worker restart is exactly the cross-topic
+    // leak this class guards against. The worker omits replyTurnId and the
+    // daemon falls back to its default routing.
+    const taskId = typeof ev.scheduledTaskId === 'string' && ev.scheduledTaskId
+      ? ev.scheduledTaskId
+      : undefined;
+    const anchor = taskId && this.scheduledTaskAnchors.has(taskId)
+      ? this.scheduledTaskAnchors.get(taskId)
+      : undefined;
     const scheduledTurn: BridgePendingTurn = {
       turnId: `scheduled-${fireId}`,
       started: true,

@@ -1410,7 +1410,14 @@ describe('BridgeTurnQueue', () => {
       expect(pending?.started).toBe(false);
     });
 
-    it('falls back to the latest STARTED Lark turn; an unstarted mark never moves the anchor', () => {
+    it('gives an UNKNOWN task no anchor even when a Lark turn (started or unstarted) is latest', () => {
+      // Round-3 Must fix: after a worker re-attach the task map is whatever
+      // was restored from disk. A fire whose task is NOT in the map — created
+      // before this worker ever observed it and absent from the durable store
+      // — must NEVER borrow the most recent Lark turn's topic. Borrowing would
+      // route the fire into whatever topic happened to be active after the
+      // restart (the cross-topic leak). It omits replyTurnId instead and lets
+      // the daemon pick its default routing.
       const q = new BridgeTurnQueue();
       q.mark('om_1', makeFingerprint('first question'));
       q.ingest([
@@ -1418,15 +1425,13 @@ describe('BridgeTurnQueue', () => {
         assistant('a1', 'first answer'),
       ]);
       q.drainEmittable({ terminalBoundary: true });
-      // A NEW mark is queued for topic B but its real user line never lands
-      // (it stays unstarted). A fire must NOT anchor to it — its user event
-      // has not happened, and anchoring to it would route into the wrong
-      // topic as well as invert the gate's send window.
+      // A newer, still-unstarted mark must not move the anchor either.
       q.mark('om_2', makeFingerprint('second question'));
-      q.ingest([scheduledFire('sf1'), assistant('sa1', 'scheduled briefing')]);
+      // Fire of a task this queue has never seen a CronCreate/ack for.
+      q.ingest([scheduledFire('sf1', { taskId: 'ghost-task' }), assistant('sa1', 'scheduled briefing')]);
       const [turn] = q.drainEmittable();
       expect(turn.isScheduled).toBe(true);
-      expect(turn.replyAnchorTurnId).toBe('om_1');
+      expect(turn.replyAnchorTurnId).toBeUndefined();
     });
 
     it('anchors a task created inside a Lark turn to THAT turn for every later fire', () => {
@@ -1576,6 +1581,165 @@ describe('BridgeTurnQueue', () => {
         /remainingPending\.length > 0 && remainingPending\[0\]\.started\s*\n\s*\?\s*remainingPending\[0\]\.markTimeMs/,
       );
       expect(fn).toMatch(/if\s*\(!turn\.isScheduled && turn\.isLocal/);
+      // (3) The local-card visibility branch must exclude scheduled turns —
+      //     a fire is isLocal but must be rendered/forwarded, not hidden.
+      expect(fn).toMatch(/if\s*\(turn\.isLocal && !turn\.isScheduled/);
+      // (4) final_output injects the create-time anchor as replyTurnId only
+      //     for a scheduled turn outside zero-injection mode, so the daemon
+      //     posts it into the task's originating topic.
+      expect(fn).toMatch(
+        /\.\.\.\(turn\.isScheduled && !zeroPromptTerminalSync\(\) && turn\.replyAnchorTurnId\s*\n\s*\?\s*\{ replyTurnId: turn\.replyAnchorTurnId \}/,
+      );
+    });
+
+    // ── Round-3 review: ack spoofing + durable-anchor recovery ──────────────
+
+    it('an unrelated tool_result merely CONTAINING a job ack text does not overwrite the anchor', () => {
+      // Must fix A: handleCronCreateAcks must pair the ack's tool_use_id with
+      // a PENDING CronCreate call. Here task jobA is created and anchored in
+      // topic A. Later, in topic B, an unrelated Read tool_result whose text
+      // happens to contain "Scheduled recurring job jobA …" must NOT be
+      // accepted as jobA's ack (it is not the CronCreate result) and must not
+      // clobber jobA's anchor to undefined / reroute it to B.
+      const anchored: Array<[string, string | undefined]> = [];
+      const q = new BridgeTurnQueue(undefined, (taskId, anchor) => anchored.push([taskId, anchor]));
+      q.mark('om_A', makeFingerprint('create cron in A'));
+      q.ingest([
+        user('uA', 'create cron in A full text'),
+        cronCreateCall('cc-A'),
+        cronCreateAck('cc-A', 'jobA'),
+        assistant('aA', 'scheduled'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+      expect(q.scheduledTaskAnchor('jobA')).toBe('om_A');
+      const persistsAfterCreate = anchored.length;
+
+      // Topic B: a normal Lark turn runs an unrelated Read whose RESULT text
+      // quotes the jobA ack line (e.g. the agent greps its own transcript).
+      const spoofRead: TranscriptEvent = {
+        type: 'assistant',
+        uuid: 'readCall',
+        message: { role: 'assistant', content: [{ type: 'tool_use', id: 'read-1', name: 'Read', input: {} }] as any },
+      };
+      const spoofResult: TranscriptEvent = {
+        type: 'user',
+        uuid: 'readResult',
+        message: { role: 'user', content: [{
+          type: 'tool_result',
+          tool_use_id: 'read-1',
+          content: 'some log excerpt:\nScheduled recurring job jobA (7,37 * * * *). Use CronDelete to cancel sooner.',
+        }] as any },
+      };
+      q.mark('om_B', makeFingerprint('grep logs in B'));
+      q.ingest([
+        user('uB', 'grep logs in B full text'),
+        spoofRead,
+        spoofResult,
+        assistant('aB', 'found it'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+
+      // No new anchor event fired for jobA, and its stored anchor is intact.
+      expect(anchored.length).toBe(persistsAfterCreate);
+      expect(q.scheduledTaskAnchor('jobA')).toBe('om_A');
+      // jobA's next fire still routes to A, not B.
+      q.ingest([scheduledFire('fire2', { taskId: 'jobA' }), assistant('sa2', 'A update')]);
+      const [turn] = q.drainEmittable({ terminalBoundary: true });
+      expect(turn.replyAnchorTurnId).toBe('om_A');
+    });
+
+    it('a spoofed ack CANNOT register a brand-new task anchor', () => {
+      // Defence in depth on Must fix A: without any pending CronCreate call,
+      // a tool_result that looks exactly like an ack registers nothing.
+      const anchored: Array<[string, string | undefined]> = [];
+      const q = new BridgeTurnQueue(undefined, (taskId, anchor) => anchored.push([taskId, anchor]));
+      q.ingest([cronCreateAck('never-called-id', 'jobX')]);
+      expect(q.scheduledTaskAnchor('jobX')).toBeUndefined();
+      expect(anchored).toHaveLength(0);
+    });
+
+    it('restored anchors survive a fresh worker queue and are NOT rerouted by later other-topic traffic', () => {
+      // Must fix B: simulate worker recovery. The "old worker" observed jobA's
+      // CronCreate/ack in topic A; the persisted map is handed to a NEW queue
+      // instance (the new worker has no in-memory state). Topic B then sees
+      // activity, and jobA's first post-restart fire must still anchor to A.
+      const old = new BridgeTurnQueue();
+      old.mark('om_A', makeFingerprint('cron in A'));
+      old.ingest([
+        user('uA', 'cron in A full text'),
+        cronCreateCall('cc-A'),
+        cronCreateAck('cc-A', 'jobA'),
+        assistant('aA', 'ok'),
+      ]);
+      old.drainEmittable({ terminalBoundary: true });
+      expect(old.scheduledTaskAnchor('jobA')).toBe('om_A');
+
+      // The worker would persist jobA→om_A; a brand-new queue restores it.
+      const restored = new Map<string, string | undefined>([['jobA', 'om_A']]);
+      const fresh = new BridgeTurnQueue();
+      fresh.restoreScheduledTaskAnchors(restored);
+
+      // After re-attach, topic B gets a fully-bound turn BEFORE jobA fires.
+      fresh.mark('om_B', makeFingerprint('later question in B'));
+      fresh.ingest([
+        user('uB', 'later question in B full text'),
+        assistant('aB', 'answer B'),
+      ]);
+      fresh.drainEmittable({ terminalBoundary: true });
+
+      fresh.ingest([scheduledFire('f1', { taskId: 'jobA' }), assistant('s1', 'A report')]);
+      const [turn] = fresh.drainEmittable({ terminalBoundary: true });
+      expect(turn.isScheduled).toBe(true);
+      expect(turn.replyAnchorTurnId).toBe('om_A');
+    });
+
+    it('a restored null anchor (local-created task) stays unanchored after other-topic traffic', () => {
+      // Must fix B corner: a task created from a local-terminal turn is
+      // persisted with anchor=null to prove it WAS observed. Recovery must
+      // keep it anchorless (daemon default routing), not borrow topic B.
+      const fresh = new BridgeTurnQueue();
+      fresh.restoreScheduledTaskAnchors(new Map<string, string | undefined>([['jobLocal', undefined]]));
+      fresh.mark('om_B', makeFingerprint('some B question'));
+      fresh.ingest([
+        user('uB', 'some B question full text'),
+        assistant('aB', 'answer'),
+      ]);
+      fresh.drainEmittable({ terminalBoundary: true });
+      fresh.ingest([scheduledFire('f1', { taskId: 'jobLocal' }), assistant('s1', 'report')]);
+      const [turn] = fresh.drainEmittable({ terminalBoundary: true });
+      expect(turn.isScheduled).toBe(true);
+      expect(turn.replyAnchorTurnId).toBeUndefined();
+    });
+
+    it('a CronCreate issued DURING a scheduled turn inherits that turn’s topic anchor', () => {
+      // Anchor propagation across scheduled turns: a re-created task inside a
+      // fire of jobA keeps reporting into jobA's create-time topic A.
+      const q = new BridgeTurnQueue();
+      q.restoreScheduledTaskAnchors(new Map<string, string | undefined>([['jobA', 'om_A']]));
+      q.ingest([
+        scheduledFire('f1', { taskId: 'jobA' }),
+        cronCreateCall('cc-B'),
+        cronCreateAck('cc-B', 'jobB'),
+        assistant('s1', 'rescheduled as jobB'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+      expect(q.scheduledTaskAnchor('jobB')).toBe('om_A');
+      q.ingest([scheduledFire('f2', { taskId: 'jobB' }), assistant('s2', 'B→A report')]);
+      const [turn] = q.drainEmittable({ terminalBoundary: true });
+      expect(turn.replyAnchorTurnId).toBe('om_A');
+    });
+
+    it('accepts the one-shot ack phrasing and anchors identically', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('om_A', makeFingerprint('remind me once'));
+      q.ingest([
+        user('uA', 'remind me once full text'),
+        cronCreateCall('cc-1'),
+        cronCreateAck('cc-1', 'jobOne', 'oneshot'),
+        assistant('aA', 'will do'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+      expect(q.scheduledTaskAnchor('jobOne')).toBe('om_A');
     });
   });
 });

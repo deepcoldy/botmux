@@ -76,10 +76,18 @@ export interface TranscriptEvent {
    *  record additionally carries `turnOrigin:"scheduled"` and DOES start a
    *  real model turn — see {@link isScheduledTurnStartEvent}. */
   isMeta?: boolean;
-  /** Turn-origin discriminator written by Claude Code ≥2.1.x. The built-in
+  /** Turn-origin discriminator written by Claude Code ≥2.1.281. The built-in
    *  CronCreate scheduler fires turns as user records with
-   *  `turnOrigin:"scheduled"` (plus `scheduledTaskId` / `scheduledFireId`). */
+   *  `turnOrigin:"scheduled"` (plus `scheduledTaskId` / `scheduledFireId`).
+   *  Older builds (≤2.1.280) omit it; those fires are recognised via
+   *  `promptSource === "system"` — see {@link isScheduledTurnStartEvent}. */
   turnOrigin?: string;
+  /** Provenance of a user record. Built-in scheduler fire records on older
+   *  Claude Code builds (≤2.1.280) carry `promptSource:"system"` but no
+   *  turnOrigin. NOTE this field is NOT unique to scheduler fires (cross-
+   *  session messages, task_notification on some builds also set it), so it
+   *  is only consulted after the isMeta guard AND with scheduledFireId set. */
+  promptSource?: string;
   scheduledTaskId?: string;
   scheduledFireId?: string;
   /** Sidechain (sub-agent / Task tool) records and compact-boundary summary
@@ -1183,27 +1191,46 @@ export function cronCreateAcks(ev: TranscriptEvent | null | undefined):
 }
 
 /** True when a `type:'user'` event is the fire record of a Claude Code
- *  **built-in** CronCreate scheduled turn: `isMeta:true` +
- *  `turnOrigin:"scheduled"` (and a `scheduledFireId`). These records are
+ *  **built-in** CronCreate scheduled turn. Two transcript shapes qualify:
+ *
+ *   - Claude Code ≥2.1.281: `isMeta:true` + `turnOrigin:"scheduled"`;
+ *   - Claude Code ≤2.1.280: `isMeta:true` + `promptSource:"system"` with
+ *     NO `turnOrigin`.
+ *
+ *  Both additionally require a non-empty `scheduledFireId`. These records are
  *  deliberately excluded from isMeaningfulUserEvent — they are scheduler
  *  machinery, not human typing — but they DO open a genuine model turn whose
- *  final answer the user expects in the originating Lark thread. The bridge
- *  attribution queue gives them their own turn class instead of dropping them
- *  into the silent local-headless bucket.
+ *  final answer the user expects in the originating Lark thread.
  *
- *  Kept narrow (must require the discriminator + fire id) so ordinary isMeta
- *  records (tool results, `<command-name>` wrappers, compact summaries) never
- *  grow a deliverable turn. Distinct from botmux's own native scheduler
- *  (`botmux schedule add`), whose turns arrive with daemon-assigned
+ *  The guards are deliberately tight (validated against 820 real session
+ *  transcripts): the isMeta check MUST precede the promptSource fallback —
+ *  many non-scheduler records (incl. task_notification) carry
+ *  `promptSource:"system"` with isMeta NOT true; and scheduledFireId is
+ *  mandatory — cross-session-message records are isMeta:true +
+ *  promptSource:"system" but have no fire id. A future build that drops
+ *  scheduledFireId fails closed (silent bucket, never mis-delivered). A
+ *  present turnOrigin other than "scheduled" (human/sdk/task_notification)
+ *  is rejected outright. Distinct from botmux's own native scheduler
+ *  (`botmux schedule add`), whose turns carry daemon-assigned
  *  `schedule:<taskId>:<uuid>` ids and never touch this path. */
 export function isScheduledTurnStartEvent(ev: TranscriptEvent | null | undefined): boolean {
   if (!ev || typeof ev !== 'object') return false;
   const role = ev.message?.role ?? ev.type;
   if (role !== 'user') return false;
+  // Hard guard: only internal meta records. Must stay ahead of the
+  // promptSource fallback below.
   if (ev.isMeta !== true) return false;
-  if (ev.turnOrigin !== 'scheduled') return false;
+  if (ev.turnOrigin !== undefined) {
+    // Newer builds stamp the discriminator explicitly.
+    if (ev.turnOrigin !== 'scheduled') return false;
+  } else {
+    // Older builds (≤2.1.280) omit turnOrigin; recognise the fire via
+    // promptSource. isMeta already passed; scheduledFireId still required.
+    if (ev.promptSource !== 'system') return false;
+  }
   // Require the fire identity: every real CronCreate fire carries it, and it
-  // rules out lookalike synthetic records that happen to set turnOrigin.
+  // rules out isMeta + promptSource:'system' lookalikes (cross-session
+  // messages) that happen to lack it.
   if (typeof ev.scheduledFireId !== 'string' || ev.scheduledFireId.length === 0) return false;
   if (ev.isSidechain === true || ev.isCompactSummary === true) return false;
   return true;
