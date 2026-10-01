@@ -6313,11 +6313,124 @@ async function prepareLiveRemoteWorkerClose(
   return { ok: true, ...(taskId ? { taskId } : {}) };
 }
 
+type RemoteRunnerExplicitCloseWake = (
+  ds: DaemonSession,
+  wakeRequestId: string,
+) => Promise<boolean>;
+type RemoteRunnerCloseFork = typeof forkWorker;
+const REMOTE_RUNNER_CLOSE_WAKE_TIMEOUT_MS = 45_000;
+const REMOTE_RUNNER_CLOSE_WAKE_POLL_MS = 50;
+
 /**
- * Generic remote providers can prove cancellation only through their live,
- * handshaken worker.  Persisted provider state is intentionally opaque to the
- * daemon, so a worker-less row is fenced instead of guessing how to call a
- * provider-specific control plane.
+ * Materialize only the generic provider control channel for an explicit close.
+ *
+ * The empty prompt is load-bearing: the worker receives its normal init/resume
+ * frame with the persisted opaque backend state, but no model turn.  The close
+ * IPC is sent synchronously after this function returns, so Node cannot admit a
+ * competing turn in between; every external close route already owns the bot
+ * mutation gate.  Refuse sessions with unsettled durable input anyway — an
+ * empty recovery fork may otherwise promote an activation tail, which would
+ * execute user work while the caller is trying to abandon the session.
+ */
+async function wakeRemoteRunnerWorkerForExplicitClose(
+  ds: DaemonSession,
+  wakeRequestId: string,
+  forkImpl: RemoteRunnerCloseFork = forkWorker,
+): Promise<boolean> {
+  if (ds.worker && !ds.worker.killed) return true;
+  if (findActiveBySessionId(ds.session.sessionId) !== ds) return false;
+  if (!normalizeRemoteRunnerBackendState(ds.session.remoteBackendState)) return false;
+  if (isSessionTransferring(ds)
+      || hasProtectedSessionMutationOwnership(ds)
+      || ds.pendingRawInput
+      || ds.pendingFollowUpInput) {
+    logger.warn(
+      `[${tag(ds)}] Refused control-only remote runner wake while durable input or transfer is unsettled`,
+    );
+    return false;
+  }
+
+  let admission: WorkerForkAdmission | undefined;
+  try {
+    // forkWorker centrally rejects every remote-retirement fence. Lift only
+    // THIS wake fence for the synchronous empty fork, then restore it before
+    // any child event or competing turn can run on the event loop.
+    if (ds.remoteCloseState?.requestId !== wakeRequestId
+        || ds.remoteCloseState.phase !== 'preparing') return false;
+    ds.remoteCloseState = undefined;
+    const accepted = forkImpl(ds, '', true, {
+      // A close request must not leave a delayed wake callback behind after it
+      // has already returned failure. This also disables marginal-memory
+      // reclaim/re-entry, which shares the same explicit no-defer gate.
+      deferDuringDeviceIsolation: false,
+      onAdmission: value => { admission = value; },
+    });
+    if (!ds.remoteCloseState) {
+      ds.remoteCloseState = { phase: 'preparing', requestId: wakeRequestId };
+    }
+    if (!accepted || admission !== 'accepted' || !ds.worker || ds.worker.killed) {
+      logger.warn(
+        `[${tag(ds)}] Control-only remote runner wake was not synchronously admitted `
+        + `(admission=${admission ?? 'none'})`,
+      );
+      return false;
+    }
+  } catch (err) {
+    if (!ds.remoteCloseState) {
+      ds.remoteCloseState = { phase: 'preparing', requestId: wakeRequestId };
+    }
+    logger.warn(
+      `[${tag(ds)}] Control-only remote runner wake failed: `
+      + `${err instanceof Error ? err.message : String(err)}`,
+    );
+    return false;
+  }
+
+  const worker = ds.worker;
+  const deadline = Date.now() + REMOTE_RUNNER_CLOSE_WAKE_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (findActiveBySessionId(ds.session.sessionId) !== ds
+        || ds.session.status !== 'active'
+        || ds.worker !== worker
+        || worker.killed) return false;
+    if (ds.workerReady === true) {
+      logger.info(`[${tag(ds)}] Woke remote runner control worker for explicit close`);
+      return true;
+    }
+    await new Promise(resolve => setTimeout(resolve, REMOTE_RUNNER_CLOSE_WAKE_POLL_MS));
+  }
+  logger.warn(`[${tag(ds)}] Timed out waiting for remote runner control worker readiness`);
+  return false;
+}
+
+let remoteRunnerExplicitCloseWakeImpl: RemoteRunnerExplicitCloseWake =
+  (ds, wakeRequestId) => wakeRemoteRunnerWorkerForExplicitClose(ds, wakeRequestId);
+
+export async function __testOnly_wakeRemoteRunnerWorkerForExplicitClose(
+  ds: DaemonSession,
+  forkImpl: RemoteRunnerCloseFork,
+): Promise<boolean> {
+  const wakeRequestId = `test-wake:${randomUUID()}`;
+  ds.remoteCloseState = { phase: 'preparing', requestId: wakeRequestId };
+  try {
+    return await wakeRemoteRunnerWorkerForExplicitClose(ds, wakeRequestId, forkImpl);
+  } finally {
+    if (ds.remoteCloseState?.requestId === wakeRequestId) ds.remoteCloseState = undefined;
+  }
+}
+
+export function __testOnly_setRemoteRunnerExplicitCloseWake(
+  impl?: RemoteRunnerExplicitCloseWake,
+): void {
+  remoteRunnerExplicitCloseWakeImpl = impl
+    ?? ((ds, wakeRequestId) => wakeRemoteRunnerWorkerForExplicitClose(ds, wakeRequestId));
+}
+
+/**
+ * Generic remote providers prove cancellation only through a live, handshaken
+ * worker. Persisted provider state remains opaque to the daemon: a dormant row
+ * is resumed through the same public worker/provider protocol, never decoded or
+ * cancelled with provider-specific control-plane calls here.
  */
 async function prepareRemoteRunnerExplicitClose(
   ds: DaemonSession | undefined,
@@ -6330,19 +6443,65 @@ async function prepareRemoteRunnerExplicitClose(
   if ((ds && isSharedAdoptSession(ds)) || isSharedAdoptPersistedSession(session)) {
     return { ok: true };
   }
-  if (!ds?.worker || ds.worker.killed) {
-    return {
-      ok: false,
-      error: 'remote_runner_worker_missing',
-      retryable: true,
-    };
-  }
   if (!stored || stored.status !== 'active') {
     return {
       ok: false,
       error: 'remote_runner_row_inconsistent',
       retryable: true,
     };
+  }
+  if (!ds?.worker || ds.worker.killed) {
+    if (!ds) {
+      return {
+        ok: false,
+        error: 'remote_runner_worker_missing',
+        retryable: true,
+      };
+    }
+    // A live worker may still be in the pre-ready window before its provider
+    // state is persisted; its destroySession() can safely await that startup.
+    // A worker-less wake has no such runtime authority, so it must start only
+    // from a valid opaque durable state and must never create a new provider
+    // session merely to close it.
+    if (!normalizeRemoteRunnerBackendState(stored.remoteBackendState)) {
+      return {
+        ok: false,
+        error: 'remote_runner_row_inconsistent',
+        retryable: true,
+      };
+    }
+    const wakeRequestId = `remote-runner-wake:${randomUUID()}`;
+    if (ds.remoteCloseState) {
+      return {
+        ok: false,
+        error: ds.remoteCloseState.phase === 'uncertain'
+          ? 'remote_runner_close_reconciliation_required'
+          : 'remote_runner_worker_close_failed',
+        retryable: ds.remoteCloseState.phase !== 'uncertain',
+        ...(ds.remoteCloseState.phase === 'uncertain'
+          ? { recovery: 'uncertain' as const }
+          : {}),
+      };
+    }
+    ds.remoteCloseState = { phase: 'preparing', requestId: wakeRequestId };
+    let woke = false;
+    try {
+      woke = await remoteRunnerExplicitCloseWakeImpl(ds, wakeRequestId);
+    } catch (err) {
+      logger.warn(
+        `[${tag(ds)}] Remote runner control-worker wake threw: `
+        + `${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      if (ds.remoteCloseState?.requestId === wakeRequestId) ds.remoteCloseState = undefined;
+    }
+    if (!woke || !ds.worker || ds.worker.killed || ds.workerReady !== true) {
+      return {
+        ok: false,
+        error: 'remote_runner_worker_missing',
+        retryable: true,
+      };
+    }
   }
   return prepareLiveRemoteWorkerClose(ds, 'remote-runner');
 }

@@ -54,7 +54,9 @@ vi.mock('../src/utils/logger.js', () => ({
 }));
 
 import {
+  __testOnly_setRemoteRunnerExplicitCloseWake,
   __testOnly_setupWorkerHandlers,
+  __testOnly_wakeRemoteRunnerWorkerForExplicitClose,
   closeSession,
   initWorkerPool,
   setActiveSessionsRegistry,
@@ -63,6 +65,37 @@ import * as sessionStore from '../src/services/session-store.js';
 
 let dataDir: string;
 let previousDataDir: string;
+
+function createFakeWorker(): EventEmitter & {
+  killed: boolean;
+  send: ReturnType<typeof vi.fn>;
+  exitCode: number | null;
+  signalCode: string | null;
+  kill: ReturnType<typeof vi.fn>;
+} {
+  const worker = Object.assign(new EventEmitter(), {
+    killed: false,
+    exitCode: null as number | null,
+    signalCode: null as string | null,
+    kill: vi.fn(),
+    send: vi.fn(),
+  });
+  worker.send.mockImplementation((message: { type: string; requestId?: string }) => {
+    if (message.type === 'close' && message.requestId) {
+      queueMicrotask(() => worker.emit('message', {
+        type: 'close_result',
+        requestId: message.requestId,
+        ok: true,
+      }));
+    } else if (message.type === 'close_commit') {
+      queueMicrotask(() => {
+        worker.exitCode = 0;
+        worker.emit('exit', 0, null);
+      });
+    }
+  });
+  return worker;
+}
 
 function createFixture(liveWorker: boolean): {
   ds: DaemonSession;
@@ -82,31 +115,7 @@ function createFixture(liveWorker: boolean): {
   };
   sessionStore.updateSession(session);
 
-  const worker = liveWorker
-    ? Object.assign(new EventEmitter(), {
-        killed: false,
-        exitCode: null,
-        signalCode: null,
-        kill: vi.fn(),
-        send: vi.fn(),
-      })
-    : null;
-  if (worker) {
-    worker.send.mockImplementation((message: { type: string; requestId?: string }) => {
-      if (message.type === 'close' && message.requestId) {
-        queueMicrotask(() => worker.emit('message', {
-          type: 'close_result',
-          requestId: message.requestId,
-          ok: true,
-        }));
-      } else if (message.type === 'close_commit') {
-        queueMicrotask(() => {
-          worker.exitCode = 0;
-          worker.emit('exit', 0, null);
-        });
-      }
-    });
-  }
+  const worker = liveWorker ? createFakeWorker() : null;
   const ds = {
     larkAppId: 'app',
     chatId: session.chatId,
@@ -136,6 +145,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  __testOnly_setRemoteRunnerExplicitCloseWake();
   setActiveSessionsRegistry(new Map());
   config.session.dataDir = previousDataDir;
   sessionStore.init('test-app');
@@ -161,8 +171,21 @@ describe('remote runner explicit close', () => {
     });
   });
 
+  it('allows a live pre-ready worker to close before backend state is persisted', async () => {
+    const { ds } = createFixture(true);
+    ds.session.remoteBackendState = undefined;
+    sessionStore.updateSession(ds.session);
+
+    await expect(closeSession(ds.session.sessionId)).resolves.toMatchObject({
+      ok: true,
+      outcome: 'closed',
+    });
+    expect(sessionStore.getSession(ds.session.sessionId)?.status).toBe('closed');
+  });
+
   it('fails closed for a worker-less active row with opaque provider state', async () => {
     const { ds } = createFixture(false);
+    __testOnly_setRemoteRunnerExplicitCloseWake(async () => false);
 
     await expect(closeSession(ds.session.sessionId)).resolves.toEqual({
       ok: false,
@@ -170,6 +193,82 @@ describe('remote runner explicit close', () => {
       error: 'remote_runner_worker_missing',
       retryable: true,
     });
+    expect(sessionStore.getSession(ds.session.sessionId)?.status).toBe('active');
+  });
+
+  it('wakes a control-only worker before closing a dormant remote session', async () => {
+    const { ds } = createFixture(false);
+    const wake = vi.fn(async (target: DaemonSession) => {
+      const worker = createFakeWorker();
+      target.worker = worker as never;
+      target.workerReady = true;
+      __testOnly_setupWorkerHandlers(target, worker as never);
+      return true;
+    });
+    __testOnly_setRemoteRunnerExplicitCloseWake(wake);
+
+    await expect(closeSession(ds.session.sessionId)).resolves.toMatchObject({
+      ok: true,
+      outcome: 'closed',
+    });
+    expect(wake).toHaveBeenCalledTimes(1);
+    expect(wake).toHaveBeenCalledWith(ds, expect.stringMatching(/^remote-runner-wake:/));
+    expect(sessionStore.getSession(ds.session.sessionId)?.status).toBe('closed');
+  });
+
+  it('uses an empty, non-deferred resume fork for the control-only wake', async () => {
+    const { ds } = createFixture(false);
+    const fork = vi.fn((
+      target: DaemonSession,
+      prompt: unknown,
+      resume: unknown,
+      opts: { deferDuringDeviceIsolation?: boolean; onAdmission?: (value: 'accepted') => void },
+    ) => {
+      const worker = createFakeWorker();
+      target.worker = worker as never;
+      target.workerReady = true;
+      opts.onAdmission?.('accepted');
+      return true;
+    });
+
+    await expect(
+      __testOnly_wakeRemoteRunnerWorkerForExplicitClose(ds, fork as never),
+    ).resolves.toBe(true);
+    expect(fork).toHaveBeenCalledTimes(1);
+    expect(fork.mock.calls[0]?.[1]).toBe('');
+    expect(fork.mock.calls[0]?.[2]).toBe(true);
+    expect(fork.mock.calls[0]?.[3]).toMatchObject({
+      deferDuringDeviceIsolation: false,
+      onAdmission: expect.any(Function),
+    });
+  });
+
+  it('refuses a control-only wake while durable queued work is unsettled', async () => {
+    const { ds } = createFixture(false);
+    ds.session.queued = true;
+    sessionStore.updateSession(ds.session);
+    const fork = vi.fn(() => true);
+
+    await expect(
+      __testOnly_wakeRemoteRunnerWorkerForExplicitClose(ds, fork as never),
+    ).resolves.toBe(false);
+    expect(fork).not.toHaveBeenCalled();
+    expect(ds.remoteCloseState).toBeUndefined();
+  });
+
+  it('clears the wake admission fence when control-worker materialization throws', async () => {
+    const { ds } = createFixture(false);
+    __testOnly_setRemoteRunnerExplicitCloseWake(async () => {
+      throw new Error('wake exploded');
+    });
+
+    await expect(closeSession(ds.session.sessionId)).resolves.toEqual({
+      ok: false,
+      alreadyClosed: false,
+      error: 'remote_runner_worker_missing',
+      retryable: true,
+    });
+    expect(ds.remoteCloseState).toBeUndefined();
     expect(sessionStore.getSession(ds.session.sessionId)?.status).toBe('active');
   });
 });
