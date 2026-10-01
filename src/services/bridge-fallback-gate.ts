@@ -394,6 +394,14 @@ export function shouldSuppressBridgeEmit(
   }
   const markersInWindow = inWindow.filter(m => m.replyCardResponseKind === undefined
     || m.replyCardResponseKind === 'final');
+  // A built-in scheduled turn whose final text hasn't been read yet must not be
+  // declared "already delivered" on a progress/legacy marker alone: that marker
+  // may be a short progress note followed by the real (materially longer)
+  // final, and suppressing here would swallow it before the length comparison
+  // can run. Defer — the caller re-evaluates WITH finalText. An explicit
+  // responseKind:'final' marker above already returned true, so a declared
+  // final send still dedups even pre-text.
+  if (turn.isScheduled && turn.finalText === undefined) return false;
   // A trailing sentinel line is the model's explicit "I have nothing more to
   // send" signal. Split the two prose+sentinel cases by whether the model
   // ALREADY sent this turn:

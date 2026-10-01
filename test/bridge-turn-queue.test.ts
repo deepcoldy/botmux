@@ -46,17 +46,44 @@ function toolResult(uuid: string): TranscriptEvent {
 }
 /** Claude Code built-in CronCreate fire record: isMeta user event with
  *  turnOrigin:"scheduled", exactly as written to the transcript. */
-function scheduledFire(uuid: string, opts: { fireId?: string; content?: string } = {}): TranscriptEvent {
+function scheduledFire(uuid: string, opts: { fireId?: string; content?: string; taskId?: string } = {}): TranscriptEvent {
   const ev: TranscriptEvent = {
     type: 'user',
     uuid,
     isMeta: true,
     turnOrigin: 'scheduled',
-    scheduledTaskId: 'task-1',
+    scheduledTaskId: opts.taskId ?? 'task-1',
     scheduledFireId: opts.fireId ?? `fire-${uuid}`,
     message: { role: 'user', content: opts.content ?? `<scheduled fire ${uuid}>` },
   };
   return ev;
+}
+/** Assistant tool_use block calling the built-in CronCreate. */
+function cronCreateCall(blockId: string): TranscriptEvent {
+  return {
+    type: 'assistant',
+    uuid: `caller-${blockId}`,
+    message: {
+      role: 'assistant',
+      content: [{ type: 'tool_use', id: blockId, name: 'CronCreate', input: { cron: '7,37 * * * *' } }] as any,
+    },
+  };
+}
+/** User tool_result ack carrying the scheduled task id, as Claude writes it. */
+function cronCreateAck(blockId: string, taskId: string, kind: 'recurring' | 'oneshot' = 'recurring'): TranscriptEvent {
+  const verb = kind === 'recurring' ? 'recurring' : 'one-shot';
+  return {
+    type: 'user',
+    uuid: `ack-${taskId}`,
+    message: {
+      role: 'user',
+      content: [{
+        type: 'tool_result',
+        tool_use_id: blockId,
+        content: `Scheduled ${verb} job ${taskId} (7,37 * * * *). Use CronDelete to cancel sooner.`,
+      }] as any,
+    },
+  };
 }
 
 describe('BridgeTurnQueue', () => {
@@ -1383,21 +1410,105 @@ describe('BridgeTurnQueue', () => {
       expect(pending?.started).toBe(false);
     });
 
-    it('anchors the scheduled reply to the latest marked Lark turn', () => {
+    it('falls back to the latest STARTED Lark turn; an unstarted mark never moves the anchor', () => {
       const q = new BridgeTurnQueue();
       q.mark('om_1', makeFingerprint('first question'));
       q.ingest([
         user('u1', 'first question full text'),
         assistant('a1', 'first answer'),
       ]);
-      q.drainEmittable();
+      q.drainEmittable({ terminalBoundary: true });
+      // A NEW mark is queued for topic B but its real user line never lands
+      // (it stays unstarted). A fire must NOT anchor to it — its user event
+      // has not happened, and anchoring to it would route into the wrong
+      // topic as well as invert the gate's send window.
       q.mark('om_2', makeFingerprint('second question'));
-      // Fire lands while om_2 is queued — anchor still resolves to om_2
-      // (latest mark), even though om_2 never bound.
       q.ingest([scheduledFire('sf1'), assistant('sa1', 'scheduled briefing')]);
       const [turn] = q.drainEmittable();
       expect(turn.isScheduled).toBe(true);
-      expect(turn.replyAnchorTurnId).toBe('om_2');
+      expect(turn.replyAnchorTurnId).toBe('om_1');
+    });
+
+    it('anchors a task created inside a Lark turn to THAT turn for every later fire', () => {
+      const q = new BridgeTurnQueue();
+      // Topic A: user asks something, the turn calls CronCreate, gets the ack.
+      q.mark('om_A', makeFingerprint('create a cron please'));
+      q.ingest([
+        user('uA', 'create a cron please full text'),
+        cronCreateCall('block-1'),
+        cronCreateAck('block-1', 'jobA'),
+        assistant('aA', 'scheduled it'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+      // A fire of jobA — even with no recent other activity — anchors to A.
+      q.ingest([scheduledFire('sf1', { taskId: 'jobA' }), assistant('sa1', 'jobA result')]);
+      let ready = q.drainEmittable({ terminalBoundary: true });
+      expect(ready[0].replyAnchorTurnId).toBe('om_A');
+    });
+
+    it('keeps the create-time topic when OTHER topics receive messages before a fire', () => {
+      const q = new BridgeTurnQueue();
+      // Task created inside topic A.
+      q.mark('om_A', makeFingerprint('set up cron in A'));
+      q.ingest([
+        user('uA', 'set up cron in A full text'),
+        cronCreateCall('block-1'),
+        cronCreateAck('block-1', 'jobA'),
+        assistant('aA', 'ok'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+      // Later, topic B gets a fully-bound Lark turn.
+      q.mark('om_B', makeFingerprint('unrelated question in B'));
+      q.ingest([
+        user('uB', 'unrelated question in B full text'),
+        assistant('aB', 'answer in B'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+      // jobA fires: result MUST go to A (the create-time topic), not B.
+      q.ingest([scheduledFire('sf1', { taskId: 'jobA' }), assistant('sa1', 'jobA result')]);
+      const ready = q.drainEmittable({ terminalBoundary: true });
+      expect(ready[0].isScheduled).toBe(true);
+      expect(ready[0].replyAnchorTurnId).toBe('om_A');
+    });
+
+    it('tracks two tasks independently by scheduledTaskId across interleaved topics', () => {
+      const q = new BridgeTurnQueue();
+      q.mark('om_A', makeFingerprint('cron alpha'));
+      q.ingest([
+        user('uA', 'cron alpha full text'),
+        cronCreateCall('block-a'),
+        cronCreateAck('block-a', 'jobA'),
+        assistant('aA', 'a scheduled'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+      q.mark('om_B', makeFingerprint('cron beta'));
+      q.ingest([
+        user('uB', 'cron beta full text'),
+        cronCreateCall('block-b'),
+        cronCreateAck('block-b', 'jobB'),
+        assistant('aB', 'b scheduled'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+      // Fire B first, then A; each anchors to its own create-time topic.
+      q.ingest([scheduledFire('sfB', { taskId: 'jobB' }), assistant('sB', 'B result')]);
+      q.ingest([scheduledFire('sfA', { taskId: 'jobA' }), assistant('sA', 'A result')]);
+      const ready = q.drainEmittable({ terminalBoundary: true });
+      expect(ready.map(t => t.replyAnchorTurnId)).toEqual(['om_B', 'om_A']);
+    });
+
+    it('has no anchor when the task was created before the queue saw any Lark turn', () => {
+      const q = new BridgeTurnQueue();
+      // CronCreate runs in a local-terminal turn (no Lark turn involved).
+      q.ingest([
+        user('uL', 'typed locally'),
+        cronCreateCall('block-1'),
+        cronCreateAck('block-1', 'jobA'),
+        assistant('aL', 'scheduled locally'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+      q.ingest([scheduledFire('sf1', { taskId: 'jobA' }), assistant('sa1', 'result')]);
+      const [turn] = q.drainEmittable({ terminalBoundary: true });
+      expect(turn.replyAnchorTurnId).toBeUndefined();
     });
 
     it('is ignored without scheduledFireId and falls back to normal local handling', () => {
@@ -1443,6 +1554,28 @@ describe('BridgeTurnQueue', () => {
       expect(next).toHaveLength(1);
       expect(next[0].turnId).toBe('om_1');
       expect(next[0].assistantUuids).toEqual(['a1']);
+    });
+
+    it('worker.ts bounds the send window by a STARTED pending turn and skips the pre-text gate for scheduled', () => {
+      // Must-fix regression for two of the review findings:
+      //  (1) A scheduled turn is inserted AHEAD of an unstarted Lark mark.
+      //      Using that mark's early flush-time markTimeMs as the window
+      //      upper bound inverts [later, earlier) into an empty range, so the
+      //      turn's real final `botmux send` escapes suppression and posts a
+      //      duplicate. nextPendingMarkTimeMs must require remaining[0].started
+      //      (mirroring the codex bridge).
+      //  (2) The pre-text suppression gate must skip scheduled turns, else a
+      //      short progress send swallows the later long final before the
+      //      transcript text is read.
+      const source = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+      const fn = source.slice(
+        source.indexOf('function emitReadyTurns('),
+        source.indexOf('function emitReadyCodexTurns('),
+      );
+      expect(fn).toMatch(
+        /remainingPending\.length > 0 && remainingPending\[0\]\.started\s*\n\s*\?\s*remainingPending\[0\]\.markTimeMs/,
+      );
+      expect(fn).toMatch(/if\s*\(!turn\.isScheduled && turn\.isLocal/);
     });
   });
 });

@@ -1131,6 +1131,57 @@ export function isMeaningfulUserEvent(ev: TranscriptEvent | null | undefined): b
   return true;
 }
 
+/** Claude Code's built-in CronCreate tool name. Its tool_result ack carries
+ *  the session-scoped job id that later fire records report as
+ *  `scheduledTaskId`. */
+export const CLAUDE_CRON_CREATE_TOOL = 'CronCreate';
+
+/** Assistant-event tool_use block ids that called the built-in CronCreate.
+ *  The scheduled job id only comes back in the FOLLOWING user tool_result, so
+ *  the caller pairs this with {@link cronCreateAcks} — same dispatch/ack split
+ *  as background Task dispatches. */
+export function cronCreateToolUseIds(ev: TranscriptEvent | null | undefined): string[] {
+  if (!ev || (ev as any).isSidechain === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const ids: string[] = [];
+  for (const block of content as any[]) {
+    if (block && block.type === 'tool_use' && typeof block.id === 'string'
+      && block.name === CLAUDE_CRON_CREATE_TOOL) {
+      ids.push(block.id);
+    }
+  }
+  return ids;
+}
+
+/** Parse the CronCreate ack: "Scheduled recurring job 08e02324 (...)." for
+ *  recurring jobs and "Scheduled one-shot job ..." for one-shot jobs. Maps the
+ *  ack back to its tool_use block id so the anchor captured at call time can be
+ *  filed under the returned task id. Tolerant of minor wording changes but
+ *  requires the "Scheduled … job <id>" shape so unrelated tool_results never
+ *  register a task. */
+const CRON_CREATE_ACK_TASK_ID_RE = /Scheduled[^\n]{0,40}?\bjob\s+([0-9A-Za-z_-]{4,})\b/i;
+
+export function cronCreateAcks(ev: TranscriptEvent | null | undefined):
+  Array<{ toolUseId: string; taskId: string }> {
+  if (!ev || (ev as any).isSidechain === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'user') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const acks: Array<{ toolUseId: string; taskId: string }> = [];
+  for (const block of content as any[]) {
+    if (!block || block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue;
+    const text = stringifyToolResultContent(block.content);
+    const m = CRON_CREATE_ACK_TASK_ID_RE.exec(text);
+    if (!m) continue;
+    acks.push({ toolUseId: block.tool_use_id, taskId: m[1] });
+  }
+  return acks;
+}
+
 /** True when a `type:'user'` event is the fire record of a Claude Code
  *  **built-in** CronCreate scheduled turn: `isMeta:true` +
  *  `turnOrigin:"scheduled"` (and a `scheduledFireId`). These records are

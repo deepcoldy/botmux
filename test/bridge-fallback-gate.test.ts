@@ -645,6 +645,47 @@ describe('shouldSuppressBridgeEmit', () => {
         200, markers, false,
       )).toBe(false);
     });
+
+    it('does NOT suppress a scheduled turn before its final text is read, even with an in-window send', () => {
+      // Must-fix regression: the worker runs a pre-text gate for every ready
+      // turn. For a scheduled turn a short progress note is a legit in-window
+      // marker, but suppressing here drops the real (longer) final that is only
+      // produced afterwards — the materially-longer check never runs because
+      // there is no finalText to compare. Without finalText the gate must defer
+      // the decision; the caller re-runs with the transcript final.
+      const progress: BridgeSendMarker[] = [
+        { sentAtMs: 150, ...buildBridgeSendMarkerContent('进展中，稍后汇报')! },
+      ];
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true },
+        200, progress, false,
+      )).toBe(false);
+      // Same in an OPEN window (no next boundary yet): a legacy marker with no
+      // content length must likewise not pre-suppress without the final.
+      const legacy: BridgeSendMarker[] = [{ sentAtMs: 150, messageId: 'om_x' }];
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true },
+        undefined, legacy, false,
+      )).toBe(false);
+      // …and under transcript delivery too.
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true },
+        200, progress, false, 'transcript',
+      )).toBe(false);
+    });
+
+    it('an explicit final marker STILL suppresses a scheduled turn even without finalText', () => {
+      // A declared --response-kind final is an unconditional delivery signal;
+      // the no-finalText deferral must not resurrect a duplicate when the model
+      // explicitly marked its send as final.
+      const finalMarker: BridgeSendMarker[] = [
+        { sentAtMs: 150, responseKind: 'final', ...buildBridgeSendMarkerContent('最终简报')! },
+      ];
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true },
+        200, finalMarker, false,
+      )).toBe(true);
+    });
   });
 
   describe('transcript mode — final is the delivery channel, not a fallback (F1)', () => {

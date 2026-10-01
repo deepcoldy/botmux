@@ -23,6 +23,8 @@ import {
   extractLastAssistantTurn,
   isMeaningfulUserEvent,
   isScheduledTurnStartEvent,
+  cronCreateToolUseIds,
+  cronCreateAcks,
   readFirstEventTimestamp,
   findJsonlsContainingExactContent,
   splitTranscriptEventsByCutoff,
@@ -1133,6 +1135,52 @@ describe('isScheduledTurnStartEvent', () => {
     expect(isScheduledTurnStartEvent(assistantEv('hi'))).toBe(false);
     expect(isScheduledTurnStartEvent(null)).toBe(false);
     expect(isScheduledTurnStartEvent(undefined)).toBe(false);
+  });
+});
+
+describe('cronCreateToolUseIds / cronCreateAcks', () => {
+  const callEv = (blockId: string, name = 'CronCreate'): TranscriptEvent => ({
+    type: 'assistant',
+    uuid: `call-${blockId}`,
+    message: { role: 'assistant', content: [{ type: 'tool_use', id: blockId, name }] as any },
+  } as TranscriptEvent);
+  const resultEv = (blockId: string, text: string): TranscriptEvent => ({
+    type: 'user',
+    uuid: `res-${blockId}`,
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: blockId, content: text }] as any },
+  } as TranscriptEvent);
+
+  it('collects CronCreate tool_use block ids and ignores other tools', () => {
+    expect(cronCreateToolUseIds(callEv('b1'))).toEqual(['b1']);
+    expect(cronCreateToolUseIds(callEv('b2', 'Read'))).toEqual([]);
+    expect(cronCreateToolUseIds(assistantEv('hi'))).toEqual([]);
+    expect(cronCreateToolUseIds(null)).toEqual([]);
+  });
+
+  it('parses the recurring and one-shot ack task ids', () => {
+    const recurring = resultEv('b1', 'Scheduled recurring job 08e02324 (7,37 * * * *). Use CronDelete to cancel sooner.');
+    const oneshot = resultEv('b2', 'Scheduled one-shot job abc_12-3 (2026-10-01 ...). Use CronDelete to cancel sooner.');
+    expect(cronCreateAcks(recurring)).toEqual([{ toolUseId: 'b1', taskId: '08e02324' }]);
+    expect(cronCreateAcks(oneshot)).toEqual([{ toolUseId: 'b2', taskId: 'abc_12-3' }]);
+  });
+
+  it('ignores unrelated tool_results and array-of-block content', () => {
+    expect(cronCreateAcks(resultEv('b1', 'tool ran successfully'))).toEqual([]);
+    const arrayContent: TranscriptEvent = {
+      type: 'user',
+      uuid: 'res-x',
+      message: {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'b9',
+          content: [{ type: 'text', text: 'Scheduled recurring job de137a7b (x).' }],
+        }] as any,
+      },
+    } as TranscriptEvent;
+    expect(cronCreateAcks(arrayContent)).toEqual([{ toolUseId: 'b9', taskId: 'de137a7b' }]);
+    expect(cronCreateAcks(assistantEv('hi'))).toEqual([]);
+    expect(cronCreateAcks(null)).toEqual([]);
   });
 });
 

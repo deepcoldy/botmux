@@ -33,6 +33,8 @@ import {
   isMeaningfulUserEvent,
   isMeaningfulQueuedCommand,
   isScheduledTurnStartEvent,
+  cronCreateToolUseIds,
+  cronCreateAcks,
   isPureToolResultUserEvent,
   extractTurnStartText,
   isClaudeTurnTerminalEvent,
@@ -183,10 +185,22 @@ export class BridgeTurnQueue {
   private queue: BridgePendingTurn[] = [];
   private collecting: BridgePendingTurn | null = null;
   private lastLocalTurnId?: string;
-  /** Turn id of the most recent real Lark mark. A built-in scheduled fire
-   *  has no Lark fingerprint of its own, so its reply anchors to this turn's
-   *  topic (chat scope). Thread-scope sessions ignore it and use the root. */
-  private lastMarkedTurnId?: string;
+  /** Turn id of the most recent Lark turn that actually STARTED (its user
+   *  event arrived and fingerprint-bound a mark). A built-in scheduled fire
+   *  has no Lark turn of its own; its reply anchors here. Only updated at
+   *  bind time — a queued-but-unstarted mark from another topic must NOT
+   *  move the anchor before its turn has really begun. */
+  private lastLarkTurnId?: string;
+  /** CronCreate tool_use block ids awaiting their tool_result ack, each
+   *  carrying the Lark anchor captured at the moment of the CALL. The
+   *  scheduled task id only comes back in the ack text, at which point the
+   *  anchor is filed under it in {@link scheduledTaskAnchors}. */
+  private pendingCronCreates = new Map<string, string | undefined>();
+  /** scheduledTaskId → Lark topic anchor captured when the task was CREATED.
+   *  Fires of that task anchor here, NOT to whatever topic is current at fire
+   *  time — without this, a task created in topic A would post its results
+   *  into topic B after any later message in B. */
+  private scheduledTaskAnchors = new Map<string, string | undefined>();
   /** Lark turns removed by the head-of-line drop, awaiting journal cleanup by
    *  the worker. This queue is pure (no fs), so it cannot clear the durable
    *  journal itself — it reports, the worker retires. Same contract as
@@ -237,7 +251,6 @@ export class BridgeTurnQueue {
       markTimeMs,
       ...(opts?.restoredFromJournal ? { restoredFromJournal: true } : {}),
     });
-    this.lastMarkedTurnId = turnId;
     return turnId;
   }
 
@@ -338,6 +351,10 @@ export class BridgeTurnQueue {
         // accidentally contains the fingerprint substring start the
         // wrong turn.
         if (!isMeaningfulUserEvent(ev)) {
+          // Resolve any CronCreate ack carried by this tool_result batch: file
+          // the call-time topic anchor under the returned scheduledTaskId.
+          // Runs before the early `continue` below.
+          this.handleCronCreateAcks(ev);
           // Pure tool_result events are intra-turn tool output — never a
           // turn boundary, but the CoT observer wants them for the tool
           // timeline of the currently-collecting turn.
@@ -363,6 +380,22 @@ export class BridgeTurnQueue {
         this.handleTurnStart(uuid, ev, sourceJsonlPath);
       } else if (role === 'assistant') {
         if ((ev as any).isSidechain === true) continue;
+        // Capture CronCreate calls with the topic anchor of the turn that is
+        // running them: when the ack returns the task id, fires of that task
+        // route back to THIS topic even if other topics receive messages
+        // before the first fire.
+        for (const toolUseId of cronCreateToolUseIds(ev)) {
+          // Anchor precedence: a Lark turn currently running → that turn;
+          // a scheduled turn currently running → its own inherited topic
+          // anchor (a task (re)created during a scheduled run belongs in that
+          // same topic); otherwise the latest started Lark turn; else none.
+          const anchor = this.collecting && !this.collecting.isLocal
+            ? this.collecting.turnId
+            : this.collecting?.isScheduled
+              ? this.collecting.replyAnchorTurnId
+              : this.lastLarkTurnId;
+          this.pendingCronCreates.set(toolUseId, anchor);
+        }
         // The rate_limit API-error record (isApiErrorMessage + error:'rate_limit')
         // is type:"assistant" with a human text block, but it is not a model
         // reply — the worker surfaces it as a `limited` state via
@@ -468,6 +501,16 @@ export class BridgeTurnQueue {
     }
   }
 
+  /** Pair CronCreate tool_result acks with their earlier tool_use calls and
+   *  file the call-time topic anchor under the scheduled task id. */
+  private handleCronCreateAcks(ev: TranscriptEvent): void {
+    for (const ack of cronCreateAcks(ev)) {
+      const anchor = this.pendingCronCreates.get(ack.toolUseId);
+      this.pendingCronCreates.delete(ack.toolUseId);
+      this.scheduledTaskAnchors.set(ack.taskId, anchor);
+    }
+  }
+
   /** Built-in CronCreate fire handler. Like a local-terminal turn it matches
    *  no Lark fingerprint, but it is user-scheduled rather than ambient typing,
    *  so the worker forwards its final (isScheduled) and anchors the reply to
@@ -494,12 +537,20 @@ export class BridgeTurnQueue {
     const fireId = typeof ev.scheduledFireId === 'string' && ev.scheduledFireId
       ? ev.scheduledFireId
       : uuid;
+    // Route to the topic captured when THIS task was created, not to whatever
+    // topic is most recent at fire time. Fall back to the latest started Lark
+    // turn only when the create/ack is missing (old transcript / restart that
+    // lost in-memory state); undefined means "no anchor", and the worker omits
+    // replyTurnId so the daemon uses its default routing.
+    const anchor = typeof ev.scheduledTaskId === 'string' && ev.scheduledTaskId
+      ? this.scheduledTaskAnchors.get(ev.scheduledTaskId) ?? this.lastLarkTurnId
+      : this.lastLarkTurnId;
     const scheduledTurn: BridgePendingTurn = {
       turnId: `scheduled-${fireId}`,
       started: true,
       isLocal: true,
       isScheduled: true,
-      replyAnchorTurnId: this.lastMarkedTurnId,
+      replyAnchorTurnId: anchor,
       // Inherit the previous local turn's reply context (zero-injection
       // sessions capture it daemon-side via terminal_turn_started).
       replyContextTurnId: this.lastLocalTurnId,
@@ -635,6 +686,10 @@ export class BridgeTurnQueue {
       this.lastLocalTurnId = localTurn.turnId;
       this.onLocalTurnStarted?.(localTurn);
     } else {
+      // A real Lark mark bound to its user event: it becomes the topic anchor
+      // for any CronCreate task scheduled inside the turn and for fires whose
+      // create/ack state is unavailable.
+      this.lastLarkTurnId = this.collecting?.turnId;
       this.lastLocalTurnId = undefined;
     }
   }

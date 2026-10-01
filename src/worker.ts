@@ -6570,7 +6570,17 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
   // a send credit into turn N's window via shouldSuppressBridgeEmit.
   const markers = adoptMode ? [] : readSendMarkers();
   const remainingPending = bridgeQueue.peek();
-  const nextPendingMarkTimeMs = remainingPending.length > 0 ? remainingPending[0].markTimeMs : undefined;
+  // Only a STARTED pending turn can bound the last ready turn's send window.
+  // An unstarted mark's user event hasn't landed, so it has produced no sends
+  // to leak backwards — and under type-ahead its markTimeMs is the early
+  // flush-time mark, often EARLIER than a ready turn that was inserted ahead
+  // of it (a built-in scheduled fire or a local turn). Using it then inverts
+  // the window [ready.markTimeMs, earlier) and excludes every real marker,
+  // letting an explicit final `botmux send` escape suppression → duplicate.
+  // Mirrors the codex bridge's identical guard below.
+  const nextPendingMarkTimeMs = remainingPending.length > 0 && remainingPending[0].started
+    ? remainingPending[0].markTimeMs
+    : undefined;
   const cache = new Map<string, ReturnType<typeof drainTranscript>>();
   // Turns suppressed as GENUINE SILENCE — see emitReadyCodexTurns for the full
   // rationale. Tracked by object identity across this function's two loops so
@@ -6583,9 +6593,16 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
     // provider error through transcript fallback (regardless of send markers).
     if (turn.terminalOutcome && turn.terminalOutcome.status !== 'completed') continue;
     const nextBoundaryMs = (i + 1 < ready.length ? ready[i + 1].markTimeMs : nextPendingMarkTimeMs);
-    if (turn.isLocal && !zeroPromptTerminalSync() && shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, isScheduled: turn.isScheduled }, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
-      const reason = turn.isScheduled ? 'scheduled turn already sent / silent' : 'local-typed';
-      log(`Bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (${reason})`);
+    // Built-in scheduled turns MUST NOT run this pre-text gate: without
+    // finalText the gate treats "any in-window marker" as already-delivered
+    // (empty final is covered by a single progress send), so a turn that sent
+    // a short progress note and then produced its real long final gets
+    // suppressed here before the text is even read — the materially-longer
+    // check at the gate below can never run. Scheduled turns are always
+    // evaluated AFTER the transcript text is available, where NOTHING_TO_SEND
+    // and send-marker dedup (incl. the length comparison) have the final.
+    if (!turn.isScheduled && turn.isLocal && !zeroPromptTerminalSync() && shouldSuppressBridgeEmit({ markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, isScheduled: turn.isScheduled }, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
+      log(`Bridge fallback suppressed for turn ${turn.turnId.substring(0, 8)} (local-typed)`);
       continue;
     }
 
