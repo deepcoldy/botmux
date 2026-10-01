@@ -81,6 +81,18 @@ A few boundaries:
 - The header's `/repo wt` does not accept the numeric form (numbers only mean something on the picker card); the in-session `/repo wt <N|project name> [branch]` still does.
 - A standalone mid-session `/repo` still takes the rest of the line, unlike the single-token rule inside the header.
 
+## Group manager (Agent tool)
+
+In a regular group, mention the target bot and ask it to run `botmux manager set`, `botmux manager clear`, or `botmux manager status`. The built-in `botmux-chat-manager` skill calls session-scoped IPC; this is not a daemon `/manager` slash command.
+
+Mutations require the current human sender to explicitly authorize the action and belong to the target bot's administrator allowlist. A session owner, bot, scheduled task or stale turn is not a substitute. Only the current regular group is supported, excluding automatically managed session groups.
+
+Managers answer talk-authorized top-level messages without a mention, yielding when another member is addressed (@all is not a handoff). The bot name is appended to the group title; clearing preserves manual renames. Existing ambient, never and reply-mode settings remain independent. Manager ownership is a group-level handoff, not a new mention mode or a guarantee that no other bot replies.
+
+Clear the old manager before setting the new one. Each manager-specific mention-free decision verifies the remote description marker with no stale fallback and requires local administrator opt-in. Description overflow is rejected without truncating human text.
+
+Lark has no cross-host conditional writes: concurrent claims are not strongly consistent. After network failures or `chat_update_unconfirmed`, inspect status before retrying. Local records are stored under `chat-managers/` in the data directory with mode 0600; include them in backups.
+
 ## 💬 Reply Mode (`/reply-mode`)
 
 Controls how the bot opens a session when @mentioned. No argument (or `status`) shows the current mode; changing it needs `canOperate`, viewing needs `canTalk`. In group chats you must @ the target bot (in multi-bot groups, @ the specific bot). Only regular groups and 1:1 DMs are supported; topic groups need no setting (they're already topics) and the command is rejected there.

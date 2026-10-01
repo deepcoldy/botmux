@@ -3485,6 +3485,7 @@ function publishSandboxRelayCapability(opts: { failClosed?: boolean } = {}): boo
 
   sandboxRelayCapability = capability;
   sandboxPolicyCapability = policyCapability;
+  writeCliPidMarker();
   if (sessionId) {
     send({
       type: 'managed_turn_origin',
@@ -3684,7 +3685,10 @@ function writeCliPidMarker(): void {
         turnId: currentBotmuxTurnId ?? null,
         dispatchAttempt: currentBotmuxDispatchAttempt ?? null,
         ...(procStart ? { procStart } : {}),
-      }));
+        ...(sandboxRelayCapability && sandboxRelayCapability.turnId === currentBotmuxTurnId
+          && sandboxRelayCapability.dispatchAttempt === currentBotmuxDispatchAttempt
+          ? { capability: sandboxRelayCapability.token } : {}),
+      }), { mode: 0o600, followTargetSymlink: false });
     } catch (err: any) {
       log(`Failed to update CLI PID marker ${markerPath}: ${err?.message ?? err}`);
     }

@@ -49,6 +49,7 @@ import { autoInviteOwnerOnGroupJoin } from '../../services/groups-store.js';
 import { tryHandleReplyModeCommand } from './reply-mode-command.js';
 import { tryHandleChatTabsCommand } from './chat-tabs-command.js';
 import { tryHandleMentionModeCommand } from './mention-mode-command.js';
+import { isChatManager } from '../../services/chat-manager.js';
 import { tryHandleSubstituteCommand } from './substitute-command.js';
 import { buildGrantCard } from './card-builder.js';
 import { openPending, isThrottled, clearPending, tryReserveOwnerDmSlot, releaseOwnerDmSlot } from './grant-pending.js';
@@ -2386,6 +2387,13 @@ export async function checkGroupMessageAccess(
   logger.debug(`Check group message access: mentioned=${mentioned}, isAllowed=${isAllowed}`);
   if (mentioned) {
     return isAllowed ? 'allowed' : 'not_allowed';
+  }
+
+  // An owner-selected manager adds top-level addressing only, not permissions
+  // or ownership of independent topics. Explicit mentions keep their usual path.
+  if (isAllowed && message.chat_type === 'group' && !message.root_id && !message.thread_id
+    && !mentionsAnotherMember(larkAppId, message) && await isChatManager(larkAppId, chatId)) {
+    return 'allowed';
   }
 
   // No @mention — only allow if sender is the sole human in the group

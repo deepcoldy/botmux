@@ -20,9 +20,11 @@ export interface AncestorSessionContext {
 
 interface IdentityBoundSessionMarker extends AncestorSessionContext {
   procStart?: string;
+  capability?: string;
 }
 
 export interface AuthenticatedAncestorSessionContext extends AncestorSessionContext {
+  capability?: string;
   markerPid: number;
   procStart: string;
 }
@@ -75,7 +77,7 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
   if (!text.startsWith('{')) return { sessionId: text };
   try {
     const parsed = JSON.parse(text) as {
-      sessionId?: unknown; turnId?: unknown; dispatchAttempt?: unknown; procStart?: unknown;
+      sessionId?: unknown; turnId?: unknown; dispatchAttempt?: unknown; procStart?: unknown; capability?: unknown;
     };
     const dispatchAttempt = parseDispatchAttempt(parsed.dispatchAttempt);
     return {
@@ -83,6 +85,7 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
       ...(typeof parsed.turnId === 'string' ? { turnId: parsed.turnId } : {}),
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
       ...(typeof parsed.procStart === 'string' ? { procStart: parsed.procStart } : {}),
+      ...(typeof parsed.capability === 'string' ? { capability: parsed.capability } : {}),
     };
   } catch {
     return { sessionId: '' };
@@ -134,6 +137,7 @@ export function findAuthenticatedAncestorSessionContext(
         turnId: marker.turnId,
         ...(marker.dispatchAttempt !== undefined ? { dispatchAttempt: marker.dispatchAttempt } : {}),
         markerPid: pid,
+        ...(marker.capability ? { capability: marker.capability } : {}),
         procStart: marker.procStart,
       };
     }
