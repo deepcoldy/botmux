@@ -8,7 +8,7 @@
  *  - "查看更早 N 条话题回复" or "N 条话题回复" → topic mode
  *  - "N 条回复" (without "话题") → regular inline reply mode
  */
-import { describe, it, beforeAll, afterAll } from 'vitest';
+import { describe, it, beforeAll, afterAll } from './midscene-suite.js';
 import type { Browser, Page, BrowserContext } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
 import { existsSync } from 'node:fs';
@@ -58,7 +58,7 @@ describe('group chat topic reply mode', () => {
     await browser?.close();
   });
 
-  it('bot uses topic replies (话题回复) in regular group', async () => {
+  it('bot uses topic replies in a regular group', async () => {
     const msg = testMessage('topic-mode');
     await sendMentionMessage(page, agent, 'Claude', msg);
 

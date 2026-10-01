@@ -1,0 +1,13 @@
+cases:
+  - name: Claude basic bot flow
+    tags: [bot, smoke, ci-core]
+    steps:
+      - feishu.runScenario: { scenario: bot-claude-basic }
+  - name: Codex basic bot flow
+    tags: [bot, smoke, ci-core]
+    steps:
+      - feishu.runScenario: { scenario: bot-codex-basic }
+  - name: Codex prompt submission
+    tags: [bot, codex, ci-core]
+    steps:
+      - feishu.runScenario: { scenario: bot-codex-prompt }

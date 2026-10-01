@@ -12,7 +12,7 @@
  *
  * 这个 case 等价于"模型必须主动加载 botmux-send skill 并按 skill 里的示例办事"。
  */
-import { describe, it, beforeAll, afterAll } from 'vitest';
+import { describe, it, beforeAll, afterAll } from './midscene-suite.js';
 import type { Browser, Page, BrowserContext } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
 import { existsSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
@@ -47,7 +47,7 @@ function makeImage(label: string, fillColor: string, outPath: string): void {
   writeFileSync(outPath, canvas.toBuffer('image/png'));
 }
 
-describe('botmux send 图文混排（image+text mixing via ![](img:N)）', () => {
+describe('botmux send image and text mixing via ![](img:N)', () => {
   let browser: Browser;
   let context: BrowserContext;
   let page: Page;
@@ -93,7 +93,7 @@ describe('botmux send 图文混排（image+text mixing via ![](img:N)）', () =>
     }
   });
 
-  it('模型用 botmux send + ![](img:N) 占位符把两张图穿插进 markdown 正文', async () => {
+  it('uses botmux send placeholders to interleave two images with Markdown', async () => {
     await navigateToMessenger(page);
     await openChat(page, agent, 'Claude');
 

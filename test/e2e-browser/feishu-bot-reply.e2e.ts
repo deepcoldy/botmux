@@ -2,7 +2,7 @@
  * Basic smoke test: send a message to a bot → bot replies.
  * Navigates to messenger → opens Claude chat → sends message.
  */
-import { describe, it, beforeAll, afterAll } from 'vitest';
+import { describe, it, beforeAll, afterAll } from './midscene-suite.js';
 import type { Browser, Page, BrowserContext } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
 import { existsSync } from 'node:fs';

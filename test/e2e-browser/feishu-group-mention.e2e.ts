@@ -5,7 +5,7 @@
  *  1. No @mention → no bot responds at all
  *  2. @mention a specific bot → only that bot responds
  */
-import { describe, it, beforeAll, afterAll } from 'vitest';
+import { describe, it, beforeAll, afterAll } from './midscene-suite.js';
 import type { Browser, Page, BrowserContext } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
 import { existsSync } from 'node:fs';
@@ -67,7 +67,7 @@ describe('feishu group @mention routing', () => {
     await page.waitForTimeout(30_000);
 
     // Scroll to bottom to see latest state
-    await agent.aiScroll(undefined, { direction: 'down', scrollType: 'untilBottom' });
+    await agent.aiAct('滚动群聊消息区域到底部，显示最新消息');
     await page.waitForTimeout(1000);
 
     // Verify: no bot created a thread/topic reply under this message.
@@ -81,7 +81,7 @@ describe('feishu group @mention routing', () => {
 
   it('@mention a single bot → only that bot responds', async () => {
     // Ensure we're back at the bottom of the group chat with fresh state
-    await agent.aiScroll(undefined, { direction: 'down', scrollType: 'untilBottom' });
+    await agent.aiAct('滚动群聊消息区域到底部，显示最新消息');
     await page.waitForTimeout(2000);
 
     const msg = testMessage('mention-one');

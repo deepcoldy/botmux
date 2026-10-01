@@ -45,6 +45,10 @@
     "test": "vitest run --project unit",
     "test:all": "vitest run",
     "test:e2e": "vitest run --project e2e",
+    "test:midscene": "midscene-test test/midscene --result-dir midscene_run/dashboard/results",
+    "test:midscene:feishu": "bun run test:e2e-browser",
+    "test:midscene:nodes": "midscene-test nodes test/midscene && midscene-test nodes test/e2e-browser",
+    "test:midscene:typecheck": "tsc -p test/midscene/tsconfig.json --noEmit && tsc -p test/e2e-browser/tsconfig.json --noEmit",
     "test:bun": "node scripts/run-bun-tests.mjs",
     "test:bun:self-check": "node scripts/run-bun-tests.mjs --self-check",
     "test:bench": "tsx scripts/bench-tests.ts",
@@ -88,7 +92,8 @@
     "@napi-rs/canvas": "^0.1.65"
   },
   "devDependencies": {
-    "@midscene/web": "^1.7.6",
+    "@midscene/test": "1.13.1",
+    "@midscene/web": "1.13.1",
     "@playwright/test": "^1.58.2",
     "@types/markdown-it": "^14.1.2",
     "@types/node": "^22.0.0",

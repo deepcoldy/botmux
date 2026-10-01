@@ -8,7 +8,7 @@
  * Per requirements: scheduled tasks MUST reply into the original topic thread so
  * the user sees a coherent conversation, not a new thread per run.
  */
-import { describe, it, beforeAll, afterAll } from 'vitest';
+import { describe, it, beforeAll, afterAll } from './midscene-suite.js';
 import type { Browser, Page, BrowserContext } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
 import { existsSync } from 'node:fs';

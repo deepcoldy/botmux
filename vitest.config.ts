@@ -10,12 +10,9 @@ import { defineConfig } from 'vitest/config';
  *           ONLY this project, so the default test command is fast and needs no
  *           real CLI binaries or browser.
  *
- *   e2e   — *.e2e.ts. Spawns real CLIs (claude/codex/…) and drives the Feishu
- *           web UI via a shared daemon + single logged-in browser session, so
- *           the files MUST run sequentially (fileParallelism: false) to avoid
- *           interfering with each other. Opt-in only — see the `test:*` scripts
- *           in package.json. globalSetup sweeps stale botmux schedule tasks when
- *           BOTMUX_E2E=1 (set by scripts/run-e2e.ts).
+ *   e2e   — CLI-focused *.e2e.ts files. Feishu browser scenarios under
+ *           test/e2e-browser are registered with @midscene/test instead and are
+ *           deliberately excluded from Vitest.
  *
  * Run everything: `vitest run` (both projects). Default `pnpm test` scopes to
  * `--project unit`.
@@ -41,6 +38,7 @@ export default defineConfig({
         test: {
           name: 'e2e',
           include: ['test/**/*.e2e.ts'],
+          exclude: ['test/e2e-browser/**', 'node_modules/**'],
           fileParallelism: false,
           testTimeout: 60_000,
           hookTimeout: 360_000,

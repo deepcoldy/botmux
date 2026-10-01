@@ -11,7 +11,7 @@
  * This tests the full bot-mention signal pipeline:
  *   User → @Aiden → Aiden worker → signal file → daemon → CoCo worker → reply
  */
-import { describe, it, beforeAll, afterAll } from 'vitest';
+import { describe, it, beforeAll, afterAll } from './midscene-suite.js';
 import type { Browser, Page, BrowserContext } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
 import { existsSync } from 'node:fs';

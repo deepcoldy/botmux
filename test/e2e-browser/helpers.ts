@@ -129,7 +129,28 @@ export function createAgent(page: Page): PlaywrightAgent {
 /** Navigate to the messenger page and wait for it to load. */
 export async function navigateToMessenger(page: Page): Promise<void> {
   await page.goto(getMessengerUrl(), { waitUntil: 'domcontentloaded' });
-  await page.waitForTimeout(3000);
+  try {
+    // The saved account can render either the English ("Messenger - Feishu",
+    // "Search"/"Messenger") or Chinese ("消息 - 飞书", "搜索"/"消息") UI, so do
+    // not gate on a single language. Require: we stayed out of the login redirect
+    // and the messenger shell rendered (a known title token + a search affordance).
+    await page.waitForFunction(
+      () => {
+        const title = document.title;
+        const titleReady = /messenger|飞书|lark/i.test(title);
+        const body = document.body?.innerText ?? '';
+        const searchReady = /search|搜索/i.test(body);
+        const messengerReady = /messenger|消息/i.test(body);
+        return titleReady && searchReady && messengerReady;
+      },
+      null,
+      { timeout: 30_000 },
+    );
+  } catch {
+    throw new Error(
+      `Feishu Messenger did not finish loading (URL: ${page.url()}, title: ${await page.title()}). Check the saved account selection and authenticated browser state.`,
+    );
+  }
 }
 
 /**
@@ -137,15 +158,36 @@ export async function navigateToMessenger(page: Page): Promise<void> {
  * Works for both bot private chats ("Claude") and group chats.
  * Falls back to Feishu search (Ctrl+K) if not visible in sidebar.
  */
+/**
+ * Display name of the Botmux bot conversation in Feishu.
+ *
+ * The test account also has same-named *native* Feishu AI agents (labelled
+ * 智能体, e.g. a DM literally named "codex"/"claude") that never reply to
+ * botmux traffic. The Botmux-backed bots are the conversations explicitly
+ * named `[Botmux]<Name>` with a 机器人/Bot badge. Opening the bare name makes
+ * the visual agent click the native agent, so always resolve and match the
+ * prefixed bot conversation.
+ */
+export function botChatName(botName: string): string {
+  return botName.startsWith('[Botmux]') ? botName : `[Botmux]${botName}`;
+}
+
 export async function openChat(
   page: Page,
   agent: PlaywrightAgent,
-  chatName: string,
+  botName: string,
 ): Promise<void> {
+  // Match the Botmux-backed bot conversation, never the same-named native AI
+  // agent. The display name is `[Botmux]<Name>` and it carries a Bot badge
+  // (机器人), whereas the native agent is labelled 智能体 and has no prefix.
+  const chatName = botChatName(botName);
   // Try clicking directly first
   try {
     await agent.aiAct(
-      `在左侧"消息"列表中或者"消息"列表的置顶会话中，点击名称完全匹配"${chatName}"的对话（群聊或私聊入口，不是话题里的消息）`,
+      `在左侧"消息"列表或其置顶会话中，点击 Botmux 机器人的私聊会话 ` +
+        `"${chatName}"（名称以 [Botmux] 开头、带"机器人/Bot"徽标）。` +
+        `不要点同名的原生智能体（名称只有"${botName}"、带"智能体"徽标、没有 [Botmux] 前缀），` +
+        '也不要点话题里的消息或群聊。',
     );
   } catch {
     // Chat not visible in sidebar — use search to find it
@@ -154,15 +196,17 @@ export async function openChat(
     await page.keyboard.type(chatName);
     await page.waitForTimeout(2000);
     await agent.aiAct(
-      `在搜索结果中，点击名称为"${chatName}"的群聊或对话`,
+      `在搜索结果中点击 Botmux 机器人会话 "${chatName}"（[Botmux] 前缀、机器人徽标），` +
+        `不要点名称仅为"${botName}"的原生智能体。`,
     );
     // Close search overlay if still open
     await page.keyboard.press('Escape');
     await page.waitForTimeout(500);
   }
-  // Wait for chat to load — verify by checking the chat header
+  // Wait for chat to load — the header must show the prefixed bot name (this
+  // also guards against having opened the native agent).
   await agent.aiWaitFor(
-    `右侧聊天区域顶部标题栏显示"${chatName}"`,
+    `右侧聊天区域顶部标题栏显示 Botmux 机器人会话名"${chatName}"，而不是名称仅为"${botName}"的原生智能体`,
     { timeoutMs: 15_000, checkIntervalMs: 3_000 },
   );
 }
@@ -309,16 +353,24 @@ export async function openThreadForMessage(
     );
   }
 
-  // Step 1: Switch to the 「话题」filter tab on the left-middle column.
-  // After this, the middle column shows the topic list (not the message list).
+  // Step 1: Switch to the 「话题 / Topics」filter tab on the left-middle
+  // column. The saved Feishu account can render either the Chinese UI (tab
+  // labelled 「话题」) or the English UI (tab labelled "Topics" / "Topic
+  // chats"), so the instruction accepts either label instead of demanding the
+  // literal Chinese characters (which made the agent refuse to click when the
+  // UI was English). After this, the middle column shows the topic list.
   await agent.aiAct(
-    '点击飞书左侧中间那一列顶部的"话题"筛选入口（图标是📇/方框，文字就是"话题"两个字）。' +
-      '不要点"话题群"、不要点"消息"、不要点"@我"、不要点"未读"、也不要点"标签"。' +
-      '点击后，中间那一列应切换成"话题"列表',
+    'Click the "Topics" filter tab at the top of the left-middle column ' +
+      '(Chinese UI: the tab labelled 「话题」; English UI: the tab labelled ' +
+      '"Topics" or "Topic chats"). Its icon looks like an index-card/contact ' +
+      'card (📇/▯). It is NOT "Messages/消息", NOT "@mentions/@我", NOT ' +
+      '"Unread/未读", NOT "Labels/标签". After clicking, the middle column ' +
+      'switches to the topics list.',
   );
   await agent.aiWaitFor(
-    '左侧中间那一列顶部显示当前筛选是"话题"（比如标题栏显示"话题"二字），' +
-      '并且中间列是一个话题条目列表（而不是普通的"消息"列表）',
+    'The middle column is now a list of topic/thread entries (a topic list, ' +
+      'not the ordinary message/chats list). The active filter tab is Topics ' +
+      '(「话题」in Chinese).',
     { timeoutMs: 15_000, checkIntervalMs: 2_000 },
   );
 
@@ -517,9 +569,8 @@ export async function waitForCodexSideResponse(
 export async function scrollThreadToBottom(
   agent: PlaywrightAgent,
 ): Promise<void> {
-  await agent.aiScroll(
-    '主内容区（页面右侧大块、宽版非窄侧栏）当前正在显示的测试话题',
-    { direction: 'down', scrollType: 'untilBottom' },
+  await agent.aiAct(
+    '滚动主内容区（页面右侧大块、宽版非窄侧栏）当前正在显示的测试话题到底部，显示最新回复和回复输入框',
   );
 }
 
