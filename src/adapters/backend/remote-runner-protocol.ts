@@ -108,6 +108,7 @@ export type RemoteRunnerCommand =
       sessionId: string;
       cwd: string;
       model?: string;
+      modelBackendVariant?: 'standard' | 'max';
       reasoningEffort?: string;
     })
   | (RemoteRunnerCommandBase & {
@@ -116,6 +117,7 @@ export type RemoteRunnerCommand =
       cwd: string;
       state: RemoteRunnerBackendState;
       model?: string;
+      modelBackendVariant?: 'standard' | 'max';
       reasoningEffort?: string;
     })
   | (RemoteRunnerCommandBase & {

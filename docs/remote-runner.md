@@ -44,6 +44,11 @@ provider 的 stderr 只用于诊断，不参与协议。stdout 出现未知事�
 4. 每个 `turn` 必须先返回同一 `requestId` 的 `status: busy`，该 ACK 才表示 provider 已接受执行。
 5. provider 用 `progress` 流式输出，并以 `final` 或带 `turnId` 的 `failure` 结束该轮。
 
+`start` / `resume` 可选携带 `model`、`modelBackendVariant`（`standard|max`）和
+`reasoningEffort`。这些字段是 Bot 默认值或新 Session 启动覆盖，provider 应只在
+底层运行时明确支持时使用；缺省时保持 provider 自身默认。三项都是 v1 additive
+字段，旧 provider 可以忽略。
+
 ### 可选远端终端
 
 provider 可以额外声明三项通用终端能力：

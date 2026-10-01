@@ -17590,6 +17590,7 @@ async function spawnCli(
       // credential sandbox); the Herdr facade still needs the real CLI name.
       cliBin: cliAdapter.resolvedBin,
       model: cfg.model,
+      modelBackendVariant: cfg.modelBackendVariant,
       reasoningEffort: cfg.reasoningEffort,
     });
   } catch (err) {

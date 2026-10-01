@@ -65,9 +65,10 @@ export function isCodexReasoningCliId(cliId: string | undefined): boolean {
   return cliId === 'codex' || cliId === 'codex-app';
 }
 
-/** Backend variants are currently a TraeX-only launch capability. */
+/** Backend variants are a TraeX launch capability, either local or delegated
+ * through the provider-neutral Remote Runner start/resume contract. */
 export function isBackendVariantCliId(cliId: string | undefined): boolean {
-  return cliId === 'traex';
+  return cliId === 'traex' || cliId === 'remote-runner';
 }
 
 export function isConfigurableReasoningCliId(cliId: string | undefined): boolean {
@@ -110,7 +111,7 @@ export function reasoningEffortsForCliModel(
   model: string | undefined,
 ): readonly CodexReasoningEffort[] {
   if (cliId === 'grok') return grokReasoningEffortsForModel(model);
-  if (cliId === 'traex') return traexReasoningEffortsForModel(model);
+  if (cliId === 'traex' || cliId === 'remote-runner') return traexReasoningEffortsForModel(model);
   if (isCodexReasoningCliId(cliId)) return codexReasoningEffortsForModel(model);
   if (cliId === 'claude-code') return claudeReasoningEffortsForModel(model);
   if (cliId === 'kimi') {

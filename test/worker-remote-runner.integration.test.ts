@@ -30,6 +30,7 @@ describe('remote runner worker wiring', () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-worker-'));
     tempDirs.push(root);
     const dump = join(root, 'turn.json');
+    const startDump = join(root, 'start.json');
     const provider = join(root, 'provider.mjs');
     writeFileSync(provider, `#!/usr/bin/env node
 import fs from 'node:fs';
@@ -43,6 +44,7 @@ input.on('line', line => {
   if (command.type === 'hello') {
     emit({ type: 'hello', requestId: command.requestId, provider: 'test-provider', capabilities: ['start','resume','turn','cancel','detach','status','terminal_screen'] });
   } else if (command.type === 'start') {
+    fs.writeFileSync(${JSON.stringify(startDump)}, JSON.stringify(command));
     const state = { version: 1, provider: 'test-provider', generation: 1, remoteSessionId: 'remote-1' };
     emit({ type: 'ready', requestId: command.requestId, state });
   } else if (command.type === 'turn') {
@@ -123,6 +125,9 @@ input.on('line', line => {
       cliPathOverride: provider,
       backendType: 'remote-runner',
       backendConfig: { expectedProvider: 'test-provider', requiredCapabilities: ['start','resume','turn','cancel','detach','status','terminal_screen'] },
+      model: 'GPT-5.6-Sol',
+      modelBackendVariant: 'max',
+      reasoningEffort: 'xhigh',
       prompt: 'remote hello',
       turnId: 'turn-remote-1',
       trustedCaller: {
@@ -172,6 +177,12 @@ input.on('line', line => {
     ]));
     expect(messages.some(message => message.type === 'error')).toBe(false);
     expect(existsSync(dump)).toBe(true);
+    expect(JSON.parse(readFileSync(startDump, 'utf8'))).toMatchObject({
+      type: 'start',
+      model: 'GPT-5.6-Sol',
+      modelBackendVariant: 'max',
+      reasoningEffort: 'xhigh',
+    });
     expect(JSON.parse(readFileSync(dump, 'utf8'))).toMatchObject({
       command: {
         type: 'turn',

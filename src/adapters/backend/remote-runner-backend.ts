@@ -363,6 +363,7 @@ export class RemoteRunnerBackend implements SessionBackend {
           cwd: opts.cwd,
           state: this.state,
           ...(opts.model ? { model: opts.model } : {}),
+          ...(opts.modelBackendVariant ? { modelBackendVariant: opts.modelBackendVariant } : {}),
           ...(opts.reasoningEffort ? { reasoningEffort: opts.reasoningEffort } : {}),
         })
       : remoteRunnerCommand('start', {
@@ -370,6 +371,7 @@ export class RemoteRunnerBackend implements SessionBackend {
           sessionId: this.sessionId,
           cwd: opts.cwd,
           ...(opts.model ? { model: opts.model } : {}),
+          ...(opts.modelBackendVariant ? { modelBackendVariant: opts.modelBackendVariant } : {}),
           ...(opts.reasoningEffort ? { reasoningEffort: opts.reasoningEffort } : {}),
         });
     const ready = await this.request(

@@ -88,6 +88,8 @@ export interface SpawnOpts {
   cliBin?: string;
   /** Provider-neutral model selection for structured remote runners. */
   model?: string;
+  /** Provider-neutral model backend variant for structured remote runners. */
+  modelBackendVariant?: 'standard' | 'max';
   /** Provider-neutral reasoning effort for structured remote runners. */
   reasoningEffort?: string;
 }
