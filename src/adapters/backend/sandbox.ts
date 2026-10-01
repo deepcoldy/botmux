@@ -801,7 +801,11 @@ export function prepareDirectSandbox(opts: {
     args.push('--cap-drop', 'ALL', '--disable-userns', '--add-seccomp-fd', '5');
     const resolver = join(sessionRoot, 'resolv.conf');
     writeFileSync(resolver, (opts.networkPolicy.dnsServers ?? []).map(ip => `nameserver ${ip}`).join('\n') + '\n', { mode: 0o600 });
-    args.push('--ro-bind', resolver, '/etc/resolv.conf');
+    // systemd-resolved links /etc/resolv.conf into /run, which the sandbox
+    // masks with a fresh tmpfs. Recreate only the resolved parent and bind our
+    // explicit DNS file there, without exposing the host resolver directory.
+    const resolverTarget = canonical('/etc/resolv.conf');
+    args.push('--dir', dirname(resolverTarget), '--ro-bind', resolver, resolverTarget);
   }
   // Shim bin at a fixed path under the fresh /run tmpfs — appended after the
   // rule mounts (later mount wins over the tmpfs). PATH points here first.
