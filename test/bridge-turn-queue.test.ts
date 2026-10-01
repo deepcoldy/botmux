@@ -1743,6 +1743,43 @@ describe('BridgeTurnQueue', () => {
       q.drainEmittable({ terminalBoundary: true });
       expect(q.scheduledTaskAnchor('jobOne')).toBe('om_A');
     });
+
+    it('scheduledTaskAnchorsSnapshot exposes the full map with local-created tasks as turnId null', () => {
+      // Round-4 daemon pin: the IPC snapshot is the worker's authoritative
+      // full state; an undefined anchor (task created in a local turn) must
+      // serialize as explicit null so the daemon pins nothing but still knows
+      // the task exists (and can drop it on a later absent-task snapshot).
+      const q = new BridgeTurnQueue();
+      q.ingest([cronCreateCall('cc-loc'), cronCreateAck('cc-loc', 'jobLocal')]);
+      q.mark('om_A', makeFingerprint('cron in A'));
+      q.ingest([
+        user('uA', 'cron in A full text'),
+        cronCreateCall('cc-A'),
+        cronCreateAck('cc-A', 'jobA'),
+        assistant('aA', 'ok'),
+      ]);
+      q.drainEmittable({ terminalBoundary: true });
+      const snap = q.scheduledTaskAnchorsSnapshot()
+        .sort((a, b) => a.taskId.localeCompare(b.taskId));
+      expect(snap).toEqual([
+        { taskId: 'jobA', turnId: 'om_A' },
+        { taskId: 'jobLocal', turnId: null },
+      ]);
+    });
+
+    it('restored anchors appear in the snapshot handed to the daemon after re-attach', () => {
+      const q = new BridgeTurnQueue();
+      q.restoreScheduledTaskAnchors(new Map<string, string | undefined>([
+        ['jobA', 'om_A'],
+        ['jobLocal', undefined],
+      ]));
+      const snap = q.scheduledTaskAnchorsSnapshot()
+        .sort((a, b) => a.taskId.localeCompare(b.taskId));
+      expect(snap).toEqual([
+        { taskId: 'jobA', turnId: 'om_A' },
+        { taskId: 'jobLocal', turnId: null },
+      ]);
+    });
   });
 });
 

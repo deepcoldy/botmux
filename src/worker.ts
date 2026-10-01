@@ -4777,7 +4777,10 @@ let bridgeOffset = 0;
 let bridgePendingTail = '';
 const bridgeQueue = new BridgeTurnQueue(
   notifyTerminalTurnStarted,
-  (taskId, anchor) => persistScheduledTaskAnchor(taskId, anchor),
+  (taskId, anchor) => {
+    persistScheduledTaskAnchor(taskId, anchor);
+    syncCronTaskAnchorsToDaemon();
+  },
 );
 /** Counts background Agent/Task dispatches whose completion notification has
  *  not yet arrived. Consulted at the PTY idle edge (markPromptReady): a main
@@ -5185,6 +5188,19 @@ function persistScheduledTaskAnchor(taskId: string, anchor: string | undefined):
   }
 }
 
+/** Push the worker's full task→turnId anchor snapshot to the daemon, which
+ *  mirrors it onto the session and pins the referenced replyTargets records
+ *  against its 32-entry eviction. Full snapshot (not deltas) keeps the two
+ *  sides self-healing after either side restarts. Best-effort: a missed sync
+ *  only loses the eviction exemption; the worker file stays authoritative. */
+function syncCronTaskAnchorsToDaemon(): void {
+  try {
+    send({ type: 'cron_task_anchors_sync', anchors: bridgeQueue.scheduledTaskAnchorsSnapshot() });
+  } catch (err: any) {
+    log(`Cron task anchor sync failed (${err.message})`);
+  }
+}
+
 /** One-shot: seed the queue's task→anchor map from disk before any live
  *  transcript events are ingested, so a worker re-attaching to a long-lived
  *  Claude process keeps the create-time topic for every surviving cron task. */
@@ -5195,9 +5211,13 @@ function restoreScheduledTaskAnchorsOnce(): void {
   const path = scheduledTaskAnchorsFilePath();
   if (!path) return;
   const restored = readScheduledTaskAnchors(path);
-  if (restored.size === 0) return;
-  bridgeQueue.restoreScheduledTaskAnchors(restored);
-  log(`Bridge restored ${restored.size} scheduled task anchor(s) from disk`);
+  if (restored.size > 0) {
+    bridgeQueue.restoreScheduledTaskAnchors(restored);
+    log(`Bridge restored ${restored.size} scheduled task anchor(s) from disk`);
+  }
+  // Re-assert the pins on the daemon even when the file is empty: a fresh
+  // worker's empty authoritative snapshot must not leave stale pins behind.
+  syncCronTaskAnchorsToDaemon();
 }
 
 function journalBridgeTurnMark(entry: {

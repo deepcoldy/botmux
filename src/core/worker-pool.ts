@@ -39,7 +39,7 @@ import { persistStreamCardState, rememberLastCliInput } from './session-manager.
 import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
 import { resolveSessionLaunchModel, resolveSessionGroupSettings } from './session-model.js';
 import { effectiveReplyDelivery } from './reply-delivery.js';
-import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
+import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
 import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName, type IdleCardLabel } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
@@ -13063,6 +13063,25 @@ function setupWorkerHandlers(
       case 'worker_ipc_ready':
         // Consumed by the standalone bootstrap listener installed at spawn.
         break;
+      case 'cron_task_anchors_sync': {
+        // Full-snapshot mirror of the worker's live built-in CronCreate
+        // task→create-turn map. The referenced replyTargets records are
+        // exempt from the 32-entry LRU eviction so a scheduled report fired
+        // long after creation still resolves to its original topic. The
+        // enclosing `ds.worker !== worker` guard already rejects snapshots
+        // from a replaced generation.
+        if (!Array.isArray(msg.anchors)) break;
+        const incoming = msg.anchors
+          .filter((a): a is { taskId: string; turnId: string | null } =>
+            !!a && typeof a.taskId === 'string'
+            && (a.turnId === null || typeof a.turnId === 'string'));
+        const { anchors } = reconcileCronTaskReplyAnchors(
+          ds.session.cronTaskReplyAnchors, incoming,
+        );
+        ds.session.cronTaskReplyAnchors = anchors;
+        sessionStore.updateSession(ds.session);
+        break;
+      }
       case 'persistent_backend_target': {
         ds.session.persistentBackendTarget = msg.target;
         sessionStore.updateSession(ds.session);

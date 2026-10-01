@@ -551,6 +551,14 @@ export class BridgeTurnQueue {
     return this.scheduledTaskAnchors.get(taskId);
   }
 
+  /** Full taskId → create-time turnId snapshot (undefined anchor renders as
+   *  null), used to sync the durable map to the daemon so it can pin the
+   *  referenced replyTargets records against its 32-entry eviction. */
+  scheduledTaskAnchorsSnapshot(): Array<{ taskId: string; turnId: string | null }> {
+    return [...this.scheduledTaskAnchors.entries()]
+      .map(([taskId, turnId]) => ({ taskId, turnId: turnId ?? null }));
+  }
+
   /** Built-in CronCreate fire handler. Like a local-terminal turn it matches
    *  no Lark fingerprint, but it is user-scheduled rather than ambient typing,
    *  so the worker forwards its final (isScheduled) and anchors the reply to
