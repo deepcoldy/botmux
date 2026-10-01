@@ -1190,11 +1190,20 @@ describe('cronCreateToolUseIds / cronCreateAcks', () => {
     expect(cronCreateToolUseIds(null)).toEqual([]);
   });
 
-  it('parses the recurring and one-shot ack task ids', () => {
+  it('parses the recurring and one-shot ack task ids using REAL CLI wording', () => {
     const recurring = resultEv('b1', 'Scheduled recurring job 08e02324 (7,37 * * * *). Use CronDelete to cancel sooner.');
-    const oneshot = resultEv('b2', 'Scheduled one-shot job abc_12-3 (2026-10-01 ...). Use CronDelete to cancel sooner.');
+    // Real one-shot success text uses TASK, not job (Claude Code 2.1.276/2.1.284).
+    const oneshotTask = resultEv('b2', 'Scheduled one-shot task bf15f538 (34 18 20 9 *). Use CronDelete to cancel sooner.');
     expect(cronCreateAcks(recurring)).toEqual([{ toolUseId: 'b1', taskId: '08e02324' }]);
-    expect(cronCreateAcks(oneshot)).toEqual([{ toolUseId: 'b2', taskId: 'abc_12-3' }]);
+    expect(cronCreateAcks(oneshotTask)).toEqual([{ toolUseId: 'b2', taskId: 'bf15f538' }]);
+  });
+
+  it('still accepts the older "one-shot job" wording and rejects lookalikes', () => {
+    const oneshotLegacy = resultEv('b3', 'Scheduled one-shot job abc_12-3 (2026-10-01 ...). Use CronDelete to cancel sooner.');
+    expect(cronCreateAcks(oneshotLegacy)).toEqual([{ toolUseId: 'b3', taskId: 'abc_12-3' }]);
+    // A different noun must not match (defence in depth beyond the pending gate).
+    expect(cronCreateAcks(resultEv('b4', 'Scheduled one-shot thing 02b077c4 (x)'))).toEqual([]);
+    expect(cronCreateAcks(resultEv('b5', 'Scheduled recurring task 02b077c4 (x)'))).toEqual([]);
   });
 
   it('ignores unrelated tool_results and array-of-block content', () => {

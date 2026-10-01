@@ -360,11 +360,15 @@ export class BridgeTurnQueue {
         // assistant text after them, and (b) let a synthetic line that
         // accidentally contains the fingerprint substring start the
         // wrong turn.
+        // Resolve CronCreate acks BEFORE the meaningful/non-meaningful split.
+        // Real acks are pure tool_result batches (non-meaningful), but if a
+        // future build appends a text block to the same event it becomes
+        // meaningful and would otherwise skip ack pairing. The handler is
+        // idempotent (a paired call is deleted immediately) and gated on a
+        // pending CronCreate tool_use id, so calling it on every user event
+        // is safe and cheap.
+        this.handleCronCreateAcks(ev);
         if (!isMeaningfulUserEvent(ev)) {
-          // Resolve any CronCreate ack carried by this tool_result batch: file
-          // the call-time topic anchor under the returned scheduledTaskId.
-          // Runs before the early `continue` below.
-          this.handleCronCreateAcks(ev);
           // Pure tool_result events are intra-turn tool output — never a
           // turn boundary, but the CoT observer wants them for the tool
           // timeline of the currently-collecting turn.

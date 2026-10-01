@@ -69,9 +69,11 @@ function cronCreateCall(blockId: string): TranscriptEvent {
     },
   };
 }
-/** User tool_result ack carrying the scheduled task id, as Claude writes it. */
+/** User tool_result ack carrying the scheduled task id, as Claude writes it.
+ *  Note the REAL noun differs by kind: recurring prints "… recurring job",
+ *  one-shot prints "… one-shot TASK" (verified on Claude Code 2.1.276/2.1.284). */
 function cronCreateAck(blockId: string, taskId: string, kind: 'recurring' | 'oneshot' = 'recurring'): TranscriptEvent {
-  const verb = kind === 'recurring' ? 'recurring' : 'one-shot';
+  const phrase = kind === 'recurring' ? 'recurring job' : 'one-shot task';
   return {
     type: 'user',
     uuid: `ack-${taskId}`,
@@ -80,7 +82,7 @@ function cronCreateAck(blockId: string, taskId: string, kind: 'recurring' | 'one
       content: [{
         type: 'tool_result',
         tool_use_id: blockId,
-        content: `Scheduled ${verb} job ${taskId} (7,37 * * * *). Use CronDelete to cancel sooner.`,
+        content: `Scheduled ${phrase} ${taskId} (7,37 * * * *). Use CronDelete to cancel sooner.`,
       }] as any,
     },
   };
