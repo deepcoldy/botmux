@@ -9,13 +9,24 @@ export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 export type JsonObject = { [key: string]: JsonValue };
 
-export const REMOTE_RUNNER_CAPABILITIES = [
+export const REMOTE_RUNNER_BASE_CAPABILITIES = [
   'start',
   'resume',
   'turn',
   'cancel',
   'detach',
   'status',
+] as const;
+
+export const REMOTE_RUNNER_TERMINAL_CAPABILITIES = [
+  'terminal_screen',
+  'terminal_input',
+  'terminal_resize',
+] as const;
+
+export const REMOTE_RUNNER_CAPABILITIES = [
+  ...REMOTE_RUNNER_BASE_CAPABILITIES,
+  ...REMOTE_RUNNER_TERMINAL_CAPABILITIES,
 ] as const;
 
 export type RemoteRunnerCapability = typeof REMOTE_RUNNER_CAPABILITIES[number];
@@ -82,7 +93,9 @@ export type RemoteRunnerCommand =
     })
   | (RemoteRunnerCommandBase & { type: 'cancel' })
   | (RemoteRunnerCommandBase & { type: 'detach' })
-  | (RemoteRunnerCommandBase & { type: 'status' });
+  | (RemoteRunnerCommandBase & { type: 'status' })
+  | (RemoteRunnerCommandBase & { type: 'terminal_input'; data: string })
+  | (RemoteRunnerCommandBase & { type: 'terminal_resize'; cols: number; rows: number });
 
 interface RemoteRunnerEventBase {
   protocol: typeof REMOTE_RUNNER_PROTOCOL;
@@ -136,6 +149,14 @@ export type RemoteRunnerEvent =
   | (RemoteRunnerEventBase & {
       type: 'lineage_changed';
       state: RemoteRunnerBackendState;
+    })
+  | (RemoteRunnerEventBase & {
+      type: 'terminal_screen';
+      generation: number;
+      sequence: number;
+      cols: number;
+      rows: number;
+      snapshot: string;
     })
   | (RemoteRunnerEventBase & {
       type: 'status';
@@ -318,6 +339,27 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
     }
     return { protocol: REMOTE_RUNNER_PROTOCOL, version: REMOTE_RUNNER_PROTOCOL_VERSION,
       type: 'access_url', url };
+  }
+
+  if (raw.type === 'terminal_screen') {
+    if (!Number.isSafeInteger(raw.generation) || Number(raw.generation) < 0
+        || !Number.isSafeInteger(raw.sequence) || Number(raw.sequence) < 0
+        || !Number.isSafeInteger(raw.cols) || Number(raw.cols) < 1 || Number(raw.cols) > 1000
+        || !Number.isSafeInteger(raw.rows) || Number(raw.rows) < 1 || Number(raw.rows) > 1000
+        || typeof raw.snapshot !== 'string'
+        || Buffer.byteLength(raw.snapshot, 'utf8') > MAX_REMOTE_RUNNER_LINE_BYTES) {
+      return undefined;
+    }
+    return {
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'terminal_screen',
+      generation: Number(raw.generation),
+      sequence: Number(raw.sequence),
+      cols: Number(raw.cols),
+      rows: Number(raw.rows),
+      snapshot: raw.snapshot,
+    };
   }
 
   if (raw.type === 'status') {

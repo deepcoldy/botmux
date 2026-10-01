@@ -64,6 +64,40 @@ describe('RemoteRunnerBackend', () => {
     });
   });
 
+  it('projects remote terminal snapshots and forwards input and resize', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'reference',
+      requiredCapabilities: [
+        'start', 'resume', 'turn', 'cancel', 'detach', 'status',
+        'terminal_screen', 'terminal_input', 'terminal_resize',
+      ],
+    }, 'session-terminal');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const output: string[] = [];
+    backend.onData(data => output.push(data));
+    spawnBackend(backend);
+    await ready;
+
+    const initialDeadline = Date.now() + 3_000;
+    while (!backend.captureCurrentScreen().includes('reference runner ready')
+      && Date.now() < initialDeadline) {
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 10));
+    }
+    expect(backend.captureCurrentScreen()).toContain('reference runner ready');
+    expect(backend.write('typed remotely')).toBe(true);
+    backend.resize(132, 48);
+
+    const deadline = Date.now() + 3_000;
+    while ((!backend.captureCurrentScreen().includes('typed remotely')
+      || backend.getPaneSize()?.cols !== 132) && Date.now() < deadline) {
+      await new Promise(resolveDelay => setTimeout(resolveDelay, 10));
+    }
+    expect(backend.captureCurrentScreen()).toContain('typed remotely');
+    expect(backend.getPaneSize()).toEqual({ cols: 132, rows: 48 });
+    expect(output.join('')).toContain('\u001b[2J\u001b[H');
+  });
+
   it('resumes an existing state instead of creating a fresh remote lineage', async () => {
     const initialState: RemoteRunnerBackendState = {
       version: 1,

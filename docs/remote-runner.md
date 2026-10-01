@@ -11,7 +11,10 @@
   "cliPathOverride": "/opt/example/bin/my-remote-runner",
   "remoteRunner": {
     "expectedProvider": "example-cloud",
-    "requiredCapabilities": ["start", "resume", "turn", "cancel", "detach", "status"],
+    "requiredCapabilities": [
+      "start", "resume", "turn", "cancel", "detach", "status",
+      "terminal_screen", "terminal_input", "terminal_resize"
+    ],
     "handshakeTimeoutMs": 30000,
     "operationTimeoutMs": 20000
   },
@@ -40,6 +43,18 @@ provider 的 stderr 只用于诊断，不参与协议。stdout 出现未知事�
 3. provider 返回同一 `requestId` 的 `ready` 和最新 `state` 后，BotMux 才提交首轮输入。
 4. 每个 `turn` 必须先返回同一 `requestId` 的 `status: busy`，该 ACK 才表示 provider 已接受执行。
 5. provider 用 `progress` 流式输出，并以 `final` 或带 `turnId` 的 `failure` 结束该轮。
+
+### 可选远端终端
+
+provider 可以额外声明三项通用终端能力：
+
+- `terminal_screen`：发送带 `generation`、单调 `sequence`、`cols`、`rows` 的完整 `terminal_screen` 快照。BotMux 会以清屏回原点的方式把快照送入既有终端解析链路，因此飞书流式卡片和本地 CLI 使用同一套 screen renderer。
+- `terminal_input`：BotMux 把 Web Terminal 或卡片控制产生的原始终端字节作为 `terminal_input` 命令转发；provider 用同一 `requestId` 的 `status` 确认接收。
+- `terminal_resize`：BotMux 把终端列数和行数作为 `terminal_resize` 命令转发；provider 调整远端 PTY/tmux 后以 `status` 确认。
+
+终端能力是显示和人工交互通道，不替代 turn 生命周期。任务是否完成仍必须由 `final` / `failure` 决定；`terminal_screen` 的内容不能被 BotMux 解析成业务终态。每个 screen 都携带远端 compute generation：旧 generation 的迟到画面会被忽略，领先于持久状态的画面会触发 fail-closed。
+
+未配置这些 capability 时，`RemoteRunnerBackend` 保持原来的 headless 行为；默认必需 capability 仍只有 `start`、`resume`、`turn`、`cancel`、`detach` 和 `status`，避免升级 BotMux 后强制旧 provider 同步支持终端。
 
 完整命令与事件联合类型见 [`src/adapters/backend/remote-runner-protocol.ts`](../src/adapters/backend/remote-runner-protocol.ts)。可运行示例见 [`examples/remote-runner/reference-runner.mjs`](../examples/remote-runner/reference-runner.mjs)。
 

@@ -4,9 +4,16 @@ import readline from 'node:readline';
 
 const protocol = 'botmux.remote-runner';
 const version = 1;
-const capabilities = ['start', 'resume', 'turn', 'cancel', 'detach', 'status'];
+const capabilities = [
+  'start', 'resume', 'turn', 'cancel', 'detach', 'status',
+  'terminal_screen', 'terminal_input', 'terminal_resize',
+];
 let state;
 let status = 'starting';
+let screen = '';
+let screenSequence = 0;
+let cols = 120;
+let rows = 40;
 
 function emit(event) {
   process.stdout.write(`${JSON.stringify({ protocol, version, ...event })}\n`);
@@ -21,6 +28,17 @@ function fail(command, code, message) {
     message,
     status: 'failed',
     retryable: false,
+  });
+}
+
+function emitScreen() {
+  emit({
+    type: 'terminal_screen',
+    generation: state?.generation ?? 0,
+    sequence: screenSequence++,
+    cols,
+    rows,
+    snapshot: screen,
   });
 }
 
@@ -48,6 +66,8 @@ input.on('line', line => {
       status = 'ready';
       emit({ type: 'lineage_changed', state });
       emit({ type: 'ready', requestId: command.requestId, state });
+      screen = 'reference runner ready';
+      emitScreen();
       return;
     case 'resume':
       if (!command.state || command.state.provider !== 'reference') {
@@ -57,6 +77,8 @@ input.on('line', line => {
       state = command.state;
       status = 'ready';
       emit({ type: 'ready', requestId: command.requestId, state });
+      screen = 'reference runner resumed';
+      emitScreen();
       return;
     case 'turn': {
       if (status !== 'ready' || !state) {
@@ -70,6 +92,8 @@ input.on('line', line => {
         emit({ type: 'lineage_changed', state });
       }
       emit({ type: 'progress', turnId: command.turnId, content: `reference: ${command.content}` });
+      screen = `reference: ${command.content}`;
+      emitScreen();
       status = 'ready';
       emit({ type: 'final', turnId: command.turnId, content: command.content, state });
       return;
@@ -83,6 +107,17 @@ input.on('line', line => {
       emit({ type: 'status', requestId: command.requestId, status, state });
       return;
     case 'status':
+      emit({ type: 'status', requestId: command.requestId, status, state });
+      return;
+    case 'terminal_input':
+      screen += command.data;
+      emitScreen();
+      emit({ type: 'status', requestId: command.requestId, status, state });
+      return;
+    case 'terminal_resize':
+      cols = command.cols;
+      rows = command.rows;
+      emitScreen();
       emit({ type: 'status', requestId: command.requestId, status, state });
       return;
     default:

@@ -13,7 +13,7 @@ import type {
 } from './types.js';
 import {
   MAX_REMOTE_RUNNER_LINE_BYTES,
-  REMOTE_RUNNER_CAPABILITIES,
+  REMOTE_RUNNER_BASE_CAPABILITIES,
   REMOTE_RUNNER_PROTOCOL_VERSION,
   encodeRemoteRunnerCommand,
   normalizeRemoteRunnerBackendState,
@@ -56,7 +56,13 @@ export class RemoteRunnerBackend implements SessionBackend {
   private outputBuffer = '';
   private stderrBytes = 0;
   private provider: string | null = null;
+  private readonly providerCapabilities = new Set<RemoteRunnerCapability>();
   private state: RemoteRunnerBackendState | undefined;
+  private terminalSnapshot = '';
+  private terminalGeneration = -1;
+  private terminalSequence = -1;
+  private terminalCols: number | null = null;
+  private terminalRows: number | null = null;
   private activeTurnId: string | null = null;
   private ready = false;
   private killed = false;
@@ -83,7 +89,7 @@ export class RemoteRunnerBackend implements SessionBackend {
     private readonly sessionId: string,
     initialState?: RemoteRunnerBackendState,
   ) {
-    this.requiredCapabilities = config.requiredCapabilities ?? REMOTE_RUNNER_CAPABILITIES;
+    this.requiredCapabilities = config.requiredCapabilities ?? REMOTE_RUNNER_BASE_CAPABILITIES;
     this.handshakeTimeoutMs = boundedTimeout(config.handshakeTimeoutMs, 15_000);
     this.operationTimeoutMs = boundedTimeout(config.operationTimeoutMs, 30_000);
     if (initialState) {
@@ -134,9 +140,18 @@ export class RemoteRunnerBackend implements SessionBackend {
     void this.startupPromise.catch(error => this.failProtocol(error.message));
   }
 
-  write(_data: string): boolean {
-    // Structured remote turns must never be degraded into terminal bytes.
-    return false;
+  write(data: string): boolean {
+    if (!this.ready || !this.child || !this.providerCapabilities.has('terminal_input')) return false;
+    if (!data || Buffer.byteLength(data, 'utf8') > MAX_REMOTE_RUNNER_LINE_BYTES) return false;
+    const requestId = this.requestId('terminal-input');
+    void this.request(
+      remoteRunnerCommand('terminal_input', { requestId, data }),
+      event => event.type === 'status',
+      this.operationTimeoutMs,
+    ).catch(error => {
+      logger.warn(`[remote-runner] terminal input was not acknowledged: ${error instanceof Error ? error.message : error}`);
+    });
+    return true;
   }
 
   async submitTurn(input: BackendTurnInput): Promise<BackendTurnSubmission> {
@@ -189,7 +204,19 @@ export class RemoteRunnerBackend implements SessionBackend {
     }
   }
 
-  resize(_cols: number, _rows: number): void {}
+  resize(cols: number, rows: number): void {
+    if (!this.ready || !this.child || !this.providerCapabilities.has('terminal_resize')) return;
+    if (!Number.isSafeInteger(cols) || cols < 1 || cols > 1000
+        || !Number.isSafeInteger(rows) || rows < 1 || rows > 1000) return;
+    const requestId = this.requestId('terminal-resize');
+    void this.request(
+      remoteRunnerCommand('terminal_resize', { requestId, cols, rows }),
+      event => event.type === 'status',
+      this.operationTimeoutMs,
+    ).catch(error => {
+      logger.warn(`[remote-runner] terminal resize was not acknowledged: ${error instanceof Error ? error.message : error}`);
+    });
+  }
 
   onData(cb: (data: string) => void): void { this.dataCb = cb; }
   onExit(cb: (code: number | null, signal: string | null) => void): void { this.exitCb = cb; }
@@ -206,7 +233,12 @@ export class RemoteRunnerBackend implements SessionBackend {
   }
   onAccessUrl(cb: (url: string) => void): void { this.accessUrlCb = cb; }
 
-  captureCurrentScreen(): string { return this.outputBuffer; }
+  captureCurrentScreen(): string { return this.terminalSnapshot || this.outputBuffer; }
+  getPaneSize(): { cols: number; rows: number } | null {
+    return this.terminalCols && this.terminalRows
+      ? { cols: this.terminalCols, rows: this.terminalRows }
+      : null;
+  }
   getChildPid(): number | null { return this.child?.pid ?? null; }
   getBackendState(): RemoteRunnerBackendState | undefined { return this.state; }
 
@@ -306,6 +338,8 @@ export class RemoteRunnerBackend implements SessionBackend {
     }
     const missing = this.requiredCapabilities.filter(capability => !hello.capabilities.includes(capability));
     if (missing.length > 0) throw new Error(`remote runner is missing required capabilities: ${missing.join(', ')}`);
+    this.providerCapabilities.clear();
+    for (const capability of hello.capabilities) this.providerCapabilities.add(capability);
     if (this.state && this.state.provider !== hello.provider) {
       throw new Error(`remote runner state provider ${this.state.provider} does not match handshake ${hello.provider}`);
     }
@@ -367,6 +401,24 @@ export class RemoteRunnerBackend implements SessionBackend {
     }
     if (event.type === 'access_url') {
       this.accessUrlCb?.(event.url);
+      return;
+    }
+    if (event.type === 'terminal_screen') {
+      const currentGeneration = this.state?.generation;
+      if (currentGeneration !== undefined && event.generation < currentGeneration) return;
+      if (currentGeneration !== undefined && event.generation > currentGeneration) {
+        this.failProtocol('remote runner terminal screen is ahead of durable state generation');
+        return;
+      }
+      if (event.generation < this.terminalGeneration
+          || (event.generation === this.terminalGeneration && event.sequence <= this.terminalSequence)) return;
+      this.terminalGeneration = event.generation;
+      this.terminalSequence = event.sequence;
+      this.terminalCols = event.cols;
+      this.terminalRows = event.rows;
+      this.terminalSnapshot = event.snapshot;
+      this.outputBuffer = event.snapshot;
+      this.dataCb?.(`\u001b[2J\u001b[H${event.snapshot}`);
       return;
     }
     if (event.type === 'progress') {
@@ -448,7 +500,15 @@ export class RemoteRunnerBackend implements SessionBackend {
         return false;
       }
     }
+    const generationAdvanced = this.state !== undefined && state.generation > this.state.generation;
     this.state = state;
+    if (generationAdvanced) {
+      this.terminalSnapshot = '';
+      this.terminalGeneration = state.generation;
+      this.terminalSequence = -1;
+      this.terminalCols = null;
+      this.terminalRows = null;
+    }
     this.stateCb?.(state);
     return true;
   }

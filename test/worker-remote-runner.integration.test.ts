@@ -26,7 +26,7 @@ async function waitFor(predicate: () => boolean, describeFailure: () => string):
 }
 
 describe('remote runner worker wiring', () => {
-  it('passes trusted turn input and persists provider state without a terminal adapter', async () => {
+  it('passes trusted turn input, persists provider state, and projects a terminal screen', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-worker-'));
     tempDirs.push(root);
     const dump = join(root, 'turn.json');
@@ -41,7 +41,7 @@ const input = readline.createInterface({ input: process.stdin, crlfDelay: Infini
 input.on('line', line => {
   const command = JSON.parse(line);
   if (command.type === 'hello') {
-    emit({ type: 'hello', requestId: command.requestId, provider: 'test-provider', capabilities: ['start','resume','turn','cancel','detach','status'] });
+    emit({ type: 'hello', requestId: command.requestId, provider: 'test-provider', capabilities: ['start','resume','turn','cancel','detach','status','terminal_screen'] });
   } else if (command.type === 'start') {
     const state = { version: 1, provider: 'test-provider', generation: 1, remoteSessionId: 'remote-1' };
     emit({ type: 'ready', requestId: command.requestId, state });
@@ -55,7 +55,8 @@ input.on('line', line => {
     const state = { version: 1, provider: 'test-provider', generation: 1, remoteSessionId: 'remote-1', agentThreadId: 'thread-1' };
     emit({ type: 'status', requestId: command.requestId, status: 'busy', state });
     emit({ type: 'lineage_changed', state });
-    emit({ type: 'final', turnId: command.turnId, content: 'REMOTE_OK', state });
+    emit({ type: 'terminal_screen', generation: 1, sequence: 0, cols: 120, rows: 40, snapshot: 'REMOTE_TMUX_SCREEN' });
+    setTimeout(() => emit({ type: 'final', turnId: command.turnId, content: 'REMOTE_OK', state }), 700);
   } else if (command.type === 'detach') {
     emit({ type: 'status', requestId: command.requestId, status: 'detached' });
   } else if (command.type === 'cancel') {
@@ -106,7 +107,7 @@ input.on('line', line => {
       cliId: 'remote-runner',
       cliPathOverride: provider,
       backendType: 'remote-runner',
-      backendConfig: { expectedProvider: 'test-provider' },
+      backendConfig: { expectedProvider: 'test-provider', requiredCapabilities: ['start','resume','turn','cancel','detach','status','terminal_screen'] },
       prompt: 'remote hello',
       turnId: 'turn-remote-1',
       trustedCaller: {
@@ -137,6 +138,10 @@ input.on('line', line => {
         type: 'final_output',
         turnId: 'turn-remote-1',
         content: 'REMOTE_OK',
+      }),
+      expect.objectContaining({
+        type: 'screen_update',
+        content: expect.stringContaining('REMOTE_TMUX_SCREEN'),
       }),
     ]));
     expect(messages.some(message => message.type === 'error')).toBe(false);

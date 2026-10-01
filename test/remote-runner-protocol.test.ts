@@ -73,6 +73,35 @@ describe('remote runner protocol', () => {
     }))).toBeUndefined();
   });
 
+  it('validates generation-fenced terminal screen snapshots', () => {
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'terminal_screen',
+      generation: 2,
+      sequence: 7,
+      cols: 120,
+      rows: 40,
+      snapshot: '\u001b[32mremote tmux\u001b[0m',
+    }))).toMatchObject({
+      type: 'terminal_screen',
+      generation: 2,
+      sequence: 7,
+      cols: 120,
+      rows: 40,
+    });
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'terminal_screen',
+      generation: 2,
+      sequence: -1,
+      cols: 120,
+      rows: 40,
+      snapshot: 'invalid',
+    }))).toBeUndefined();
+  });
+
   it('ships a runnable reference provider covering hello/start/turn/status/detach', async () => {
     const child = spawn(process.execPath, [resolve('examples/remote-runner/reference-runner.mjs')], {
       stdio: ['pipe', 'pipe', 'inherit'],
