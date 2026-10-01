@@ -143,9 +143,11 @@ export class RemoteRunnerBackend implements SessionBackend {
   write(data: string): boolean {
     if (!this.ready || !this.child || !this.providerCapabilities.has('terminal_input')) return false;
     if (!data || Buffer.byteLength(data, 'utf8') > MAX_REMOTE_RUNNER_LINE_BYTES) return false;
+    const generation = this.state?.generation;
+    if (generation === undefined) return false;
     const requestId = this.requestId('terminal-input');
     void this.request(
-      remoteRunnerCommand('terminal_input', { requestId, data }),
+      remoteRunnerCommand('terminal_input', { requestId, generation, data }),
       event => event.type === 'status',
       this.operationTimeoutMs,
     ).catch(error => {
@@ -208,9 +210,11 @@ export class RemoteRunnerBackend implements SessionBackend {
     if (!this.ready || !this.child || !this.providerCapabilities.has('terminal_resize')) return;
     if (!Number.isSafeInteger(cols) || cols < 1 || cols > 1000
         || !Number.isSafeInteger(rows) || rows < 1 || rows > 1000) return;
+    const generation = this.state?.generation;
+    if (generation === undefined) return;
     const requestId = this.requestId('terminal-resize');
     void this.request(
-      remoteRunnerCommand('terminal_resize', { requestId, cols, rows }),
+      remoteRunnerCommand('terminal_resize', { requestId, generation, cols, rows }),
       event => event.type === 'status',
       this.operationTimeoutMs,
     ).catch(error => {
@@ -416,9 +420,18 @@ export class RemoteRunnerBackend implements SessionBackend {
       this.terminalSequence = event.sequence;
       this.terminalCols = event.cols;
       this.terminalRows = event.rows;
-      this.terminalSnapshot = event.snapshot;
-      this.outputBuffer = event.snapshot;
-      this.dataCb?.(`\u001b[2J\u001b[H${event.snapshot}`);
+      // `tmux capture-pane -p` returns LF-separated rows.  A PTY normally
+      // delivers CRLF; feeding bare LF into xterm keeps the previous column and
+      // renders a diagonal/stair-step screen.  Normalize complete snapshots at
+      // this transport boundary so the existing local terminal renderer sees
+      // the same newline contract for local and remote tmux.
+      const snapshot = event.snapshot
+        .replace(/\r\n/g, '\n')
+        .replace(/\r/g, '\n')
+        .replace(/\n/g, '\r\n');
+      this.terminalSnapshot = snapshot;
+      this.outputBuffer = snapshot;
+      this.dataCb?.(`\u001b[2J\u001b[H${snapshot}`);
       return;
     }
     if (event.type === 'progress') {

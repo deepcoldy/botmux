@@ -85,6 +85,7 @@ describe('RemoteRunnerBackend', () => {
       await new Promise(resolveDelay => setTimeout(resolveDelay, 10));
     }
     expect(backend.captureCurrentScreen()).toContain('reference runner ready');
+    expect(backend.captureCurrentScreen()).toContain('ready\r\nline two');
     expect(backend.write('typed remotely')).toBe(true);
     backend.resize(132, 48);
 
@@ -96,6 +97,7 @@ describe('RemoteRunnerBackend', () => {
     expect(backend.captureCurrentScreen()).toContain('typed remotely');
     expect(backend.getPaneSize()).toEqual({ cols: 132, rows: 48 });
     expect(output.join('')).toContain('\u001b[2J\u001b[H');
+    expect(output.join('')).toContain('ready\r\nline two');
   });
 
   it('resumes an existing state instead of creating a fresh remote lineage', async () => {

@@ -66,7 +66,7 @@ input.on('line', line => {
       status = 'ready';
       emit({ type: 'lineage_changed', state });
       emit({ type: 'ready', requestId: command.requestId, state });
-      screen = 'reference runner ready';
+      screen = 'reference runner ready\nline two';
       emitScreen();
       return;
     case 'resume':
@@ -110,11 +110,19 @@ input.on('line', line => {
       emit({ type: 'status', requestId: command.requestId, status, state });
       return;
     case 'terminal_input':
+      if (command.generation !== state?.generation) {
+        fail(command, 'stale_terminal_generation', 'terminal input generation mismatch');
+        return;
+      }
       screen += command.data;
       emitScreen();
       emit({ type: 'status', requestId: command.requestId, status, state });
       return;
     case 'terminal_resize':
+      if (command.generation !== state?.generation) {
+        fail(command, 'stale_terminal_generation', 'terminal resize generation mismatch');
+        return;
+      }
       cols = command.cols;
       rows = command.rows;
       emitScreen();

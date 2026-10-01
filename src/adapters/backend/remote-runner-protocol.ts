@@ -94,8 +94,8 @@ export type RemoteRunnerCommand =
   | (RemoteRunnerCommandBase & { type: 'cancel' })
   | (RemoteRunnerCommandBase & { type: 'detach' })
   | (RemoteRunnerCommandBase & { type: 'status' })
-  | (RemoteRunnerCommandBase & { type: 'terminal_input'; data: string })
-  | (RemoteRunnerCommandBase & { type: 'terminal_resize'; cols: number; rows: number });
+  | (RemoteRunnerCommandBase & { type: 'terminal_input'; generation: number; data: string })
+  | (RemoteRunnerCommandBase & { type: 'terminal_resize'; generation: number; cols: number; rows: number });
 
 interface RemoteRunnerEventBase {
   protocol: typeof REMOTE_RUNNER_PROTOCOL;

@@ -49,8 +49,8 @@ provider 的 stderr 只用于诊断，不参与协议。stdout 出现未知事�
 provider 可以额外声明三项通用终端能力：
 
 - `terminal_screen`：发送带 `generation`、单调 `sequence`、`cols`、`rows` 的完整 `terminal_screen` 快照。BotMux 会以清屏回原点的方式把快照送入既有终端解析链路，因此飞书流式卡片和本地 CLI 使用同一套 screen renderer。
-- `terminal_input`：BotMux 把 Web Terminal 或卡片控制产生的原始终端字节作为 `terminal_input` 命令转发；provider 用同一 `requestId` 的 `status` 确认接收。
-- `terminal_resize`：BotMux 把终端列数和行数作为 `terminal_resize` 命令转发；provider 调整远端 PTY/tmux 后以 `status` 确认。
+- `terminal_input`：BotMux 把 Web Terminal 或卡片控制产生的原始终端字节与当前 `generation` 作为 `terminal_input` 命令转发；provider 只接受与当前 compute generation 相同的输入，并用同一 `requestId` 的 `status` 确认接收。
+- `terminal_resize`：BotMux 把终端列数、行数和当前 `generation` 作为 `terminal_resize` 命令转发；provider 只调整同一 generation 的远端 PTY/tmux，再以 `status` 确认。
 
 终端能力是显示和人工交互通道，不替代 turn 生命周期。任务是否完成仍必须由 `final` / `failure` 决定；`terminal_screen` 的内容不能被 BotMux 解析成业务终态。每个 screen 都携带远端 compute generation：旧 generation 的迟到画面会被忽略，领先于持久状态的画面会触发 fail-closed。
 
