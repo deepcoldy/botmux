@@ -9,8 +9,9 @@
  * guide telling the receiving agent how to apply it.
  *
  * It deliberately omits everything identity- or deployment-specific:
- * larkAppId / larkAppSecret / allowedUsers / allowedChatGroups / oncallChats /
- * workingDir. Those must be supplied by each bot's own owner. The safety
+ * larkAppId / larkAppSecret / allowedUsers / frozenCommandAdmins /
+ * allowedChatGroups / oncallChats / workingDir. Those must be supplied by each
+ * bot's own owner. The safety
  * guarantee lives in `buildPreset`, which copies an explicit allow-list of
  * fields and NEVER spreads its input, so a caller passing a full bot config
  * (secrets and all) still produces a clean preset.
@@ -70,7 +71,7 @@ export const PRESET_GUIDE = [
   '本文件是一个 botmux「Agent 预设」(agent preset)，由 `botmux preset export` 生成。',
   '它携带某个机器人「可安全分享」的配置：使用的 CLI 适配器(cliId)、模型(model)、团队角色 persona(teamRole)、能力标签(capability)。',
   '',
-  '它【不包含任何凭证或部署信息】——没有 larkAppId / larkAppSecret / allowedUsers / allowedChatGroups / workingDir。',
+  '它【不包含任何凭证或部署信息】——没有 larkAppId / larkAppSecret / allowedUsers / frozenCommandAdmins / allowedChatGroups / workingDir。',
   '因此单凭本文件无法登录、无法冒充原机器人，这是有意为之。',
   '',
   '如果你是一个 AI agent，请按下面的步骤帮用户用这份预设配置他自己的 botmux 机器人：',

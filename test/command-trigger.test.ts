@@ -32,7 +32,7 @@ describe('reserved command tables', () => {
   // 替换成只有 getBot 的假模块，图里任何一处静态具名 import 在 bun 腿的 ESM
   // 链接期就会 SyntaxError（vitest 容忍、bun 不容忍）。故拆到无 mock 的文件里。
 
-  it('classifies daemon / passthrough / force-topic / free commands', () => {
+  it('classifies daemon / passthrough / force-topic / frozen-command / free commands', () => {
     expect(DAEMON_COMMANDS.has('/stop')).toBe(true);
     expect(reservedCommandKind('/close')).toBe('daemon');
     expect(reservedCommandKind('/stop')).toBe('daemon');
@@ -40,6 +40,8 @@ describe('reserved command tables', () => {
     expect(reservedCommandKind('/clear')).toBe('passthrough');
     expect(reservedCommandKind('/t')).toBe('force-topic');
     expect(reservedCommandKind('/topic')).toBe('force-topic');
+    expect(reservedCommandKind('/freeze')).toBe('frozen-command');
+    expect(DAEMON_COMMANDS.has('/freeze')).toBe(false);
     expect(reservedCommandKind('/solve')).toBe(null);
   });
 
@@ -148,11 +150,12 @@ describe('matchCommandTrigger', () => {
   it('fails closed on reserved commands smuggled into the whitelist', () => {
     mockGetBot.mockReturnValue(botWith({
       enabled: true,
-      commands: ['/close', '/clear', '/t', '/solve'],
+      commands: ['/close', '/clear', '/t', '/freeze', '/solve'],
     }));
     expect(matchCommandTrigger('app', 'oc_a', '/close')).toBeUndefined();
     expect(matchCommandTrigger('app', 'oc_a', '/clear')).toBeUndefined();
     expect(matchCommandTrigger('app', 'oc_a', '/t')).toBeUndefined();
+    expect(matchCommandTrigger('app', 'oc_a', '/freeze')).toBeUndefined();
     expect(matchCommandTrigger('app', 'oc_a', '/solve')).toBeDefined();
   });
 

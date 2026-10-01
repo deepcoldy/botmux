@@ -15,6 +15,7 @@ import {
   parseAskOptions,
   parseAskTimeoutSeconds,
 } from '../src/core/ask-args.js';
+import { rejectsFrozenCommandLifecycleAsk } from '../src/core/frozen-command-guidance.js';
 
 describe('parseAskOptions', () => {
   it('parses bare keys with key==label', () => {
@@ -163,6 +164,77 @@ describe('normalizeAskDispatch', () => {
     const bare = normalizeAskDispatch(['--options', 'yes,no', 'p']);
     const explicit = normalizeAskDispatch(['buttons', '--options', 'yes,no', 'p']);
     expect(bare.rest).toEqual(explicit.rest);
+  });
+});
+
+describe('rejectsFrozenCommandLifecycleAsk', () => {
+  it('rejects the generic confirmation shape that caused duplicate approval cards', () => {
+    expect(rejectsFrozenCommandLifecycleAsk(
+      '确认安装固化命令 /近30天注册且激活商户数 吗？',
+      [
+        { key: 'confirm', label: '确认安装' },
+        { key: 'cancel', label: '取消' },
+      ],
+    )).toBe(true);
+  });
+
+  it('rejects update and retirement approvals in English and Chinese', () => {
+    expect(rejectsFrozenCommandLifecycleAsk(
+      '是否确认更新这个固定查询？',
+      [{ key: 'yes', label: '继续' }, { key: 'no', label: '取消' }],
+    )).toBe(true);
+    expect(rejectsFrozenCommandLifecycleAsk(
+      'Approve update of this frozen command?',
+      [{ key: 'approve', label: 'Approve' }, { key: 'cancel', label: 'Cancel' }],
+    )).toBe(true);
+  });
+
+  it.each([
+    '把刚才的查询固化成 /泰国上账，确认吗？',
+    '确认把刚才这个固化为 /泰国上账？',
+    'Confirm creating frozen command /thai?',
+    'Confirm updating frozen command /thai?',
+  ])('rejects explicit lifecycle wording: %s', prompt => {
+    expect(rejectsFrozenCommandLifecycleAsk(
+      prompt,
+      [{ key: 'yes', label: '确认' }, { key: 'no', label: '取消' }],
+    )).toBe(true);
+  });
+
+  it.each([
+    '是否确认安装 /泰国上账 这个命令？',
+    '要把 /泰国上账 废弃吗？',
+  ])('rejects ambiguous slash wording only for a known frozen command: %s', prompt => {
+    const options = [{ key: 'yes', label: '确认' }, { key: 'no', label: '取消' }];
+    expect(rejectsFrozenCommandLifecycleAsk(prompt, options)).toBe(false);
+    expect(rejectsFrozenCommandLifecycleAsk(prompt, options, new Set(['/泰国上账']))).toBe(true);
+  });
+
+  it('does not block ordinary questions or non-lifecycle discussions', () => {
+    expect(rejectsFrozenCommandLifecycleAsk(
+      '确认发布普通报告吗？',
+      [{ key: 'confirm', label: '确认' }, { key: 'cancel', label: '取消' }],
+    )).toBe(false);
+    expect(rejectsFrozenCommandLifecycleAsk(
+      '你是否了解固化命令？',
+      [{ key: 'yes', label: '了解' }, { key: 'no', label: '不了解' }],
+    )).toBe(false);
+    expect(rejectsFrozenCommandLifecycleAsk(
+      '确认更新 /api/users 接口吗？',
+      [{ key: 'yes', label: '确认' }, { key: 'no', label: '取消' }],
+    )).toBe(false);
+    for (const prompt of [
+      '确认删除 /tmp 下的临时文件吗？',
+      '要不要新增 /schedule 定时任务？',
+      '是否创建 /release 分支？',
+      '要修改 /opt 的权限吗？',
+      '确认恢复 /data 目录的备份？',
+    ]) {
+      expect(rejectsFrozenCommandLifecycleAsk(
+        prompt,
+        [{ key: 'yes', label: '确认' }, { key: 'no', label: '取消' }],
+      )).toBe(false);
+    }
   });
 });
 

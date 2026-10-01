@@ -417,6 +417,9 @@ export interface DaemonSession {
      * only in memory so an approved XPI suggestion can replay the owner's
      * actual request instead of duplicating transport context. */
     userPrompt?: string;
+    /** SHA-256 of the exact user-authored text that opened this turn. Kept
+     * in-memory and turn-bound so model payloads cannot invent audit content. */
+    sourceContentHash?: string;
     /** Stable authenticated task/session owner, when distinct from the caller
      * that happened to start the current CLI turn. */
     controller?: import('../types.js').TrustedCaller;

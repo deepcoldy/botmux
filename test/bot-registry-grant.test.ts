@@ -1,8 +1,33 @@
 import { describe, it, expect } from 'vitest';
-import { parseBotConfigsFromText, getConfiguredOwnerOpenId, getOwnerOpenId, getDashboardAdminOpenIds, registerBot } from '../src/bot-registry.js';
+import { canManageFrozenCommands, parseBotConfigsFromText, getConfiguredOwnerOpenId, getOwnerOpenId, getDashboardAdminOpenIds, registerBot } from '../src/bot-registry.js';
 import { GRANT_DURATION_OPTIONS } from '../src/services/grant-policy.js';
 
 describe('bot-registry grant additions', () => {
+  it('parses frozenCommandAdmins as strict union_ids and defaults mutation authority to nobody', () => {
+    const [configured, absent, empty] = parseBotConfigsFromText(JSON.stringify([
+      { larkAppId: 'fc-admin-configured', larkAppSecret: 's', frozenCommandAdmins: ['on_admin_a', 'on_admin_b'] },
+      { larkAppId: 'fc-admin-absent', larkAppSecret: 's' },
+      { larkAppId: 'fc-admin-empty', larkAppSecret: 's', frozenCommandAdmins: [] },
+    ]));
+    expect(configured.frozenCommandAdmins).toEqual(['on_admin_a', 'on_admin_b']);
+    expect(absent.frozenCommandAdmins).toBeUndefined();
+    expect(empty.frozenCommandAdmins).toBeUndefined();
+
+    expect(() => parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'fc-admin-invalid', larkAppSecret: 's', frozenCommandAdmins: ['ou_app_scoped'],
+    }]))).toThrow(/frozenCommandAdmins\[0\].*union_id/);
+    expect(() => parseBotConfigsFromText(JSON.stringify([{
+      larkAppId: 'fc-admin-duplicate', larkAppSecret: 's', frozenCommandAdmins: ['on_same', 'on_same'],
+    }]))).toThrow(/frozenCommandAdmins\[1\].*duplicates/);
+
+    registerBot(configured);
+    registerBot(absent);
+    expect(canManageFrozenCommands(configured.larkAppId, 'on_admin_a')).toBe(true);
+    expect(canManageFrozenCommands(configured.larkAppId, 'on_outsider')).toBe(false);
+    expect(canManageFrozenCommands(configured.larkAppId, 'ou_wrong_kind')).toBe(false);
+    expect(canManageFrozenCommands(absent.larkAppId, 'on_admin_a')).toBe(false);
+  });
+
   it('parseBotConfigsFromText preserves & filters chatReplyModes (four-state incl. chat-topic)', () => {
     const cfgs = parseBotConfigsFromText(JSON.stringify([{
       larkAppId: 'rm1', larkAppSecret: 's',
