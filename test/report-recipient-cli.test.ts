@@ -153,6 +153,61 @@ function expectRecipient(result: Awaited<ReturnType<typeof runReport>>, openId: 
 }
 
 describe('report CLI recipient root and authenticated relay', () => {
+  it.each(['thread', 'chat'] as const)('publishes through the daemon with an accurate %s receipt', async publishTo => {
+    const publicationTarget = publishTo === 'chat'
+      ? { mode: 'top-level', chatId: CHAT }
+      : { mode: 'thread', rootMessageId: THREAD, chatId: CHAT };
+    const result = await runReport({
+      args: ['--dispatch-root', THREAD, '--delivery', 'publish', '--publish-to', publishTo],
+      relayStatus: 200, relayBody: { ok: true, publishedMessageId: 'om_result', publicationTarget },
+    });
+    expect(result.status).toBe(0);
+    expect(result.requests[0].body).toMatchObject({ delivery: 'publish', publishTo, dispatchRoot: THREAD });
+    expect(result.output).toMatchObject({
+      delivery: 'lark-message', reportedTo: 'om_result', recipient: { kind: 'chat', chatId: CHAT },
+      messageTarget: publicationTarget, publicationTarget,
+    });
+    expect(result.output.recipient.sessionId).toBeUndefined();
+    expect(result.outbound).toBeUndefined();
+  });
+
+  it('returns both destinations when publishing and relaying', async () => {
+    const result = await runReport({
+      args: ['--dispatch-root', THREAD, '--delivery', 'publish-and-relay'],
+      relayStatus: 200, relayBody: {
+        ok: true, publishedMessageId: 'om_result',
+        publicationTarget: { mode: 'thread', rootMessageId: THREAD, chatId: CHAT },
+        reportTarget: { sessionId: 'orchestrator', larkAppId: 'cli_reviewer' },
+      },
+    });
+    expect(result.status).toBe(0);
+    expect(result.requests[0].body).toMatchObject({ delivery: 'publish-and-relay' });
+    expect(result.output).toMatchObject({ reportedTo: 'orchestrator', publishedMessageId: 'om_result', deliveryMode: 'publish-and-relay' });
+    expect(result.outbound).toBeUndefined();
+  });
+
+  it('preserves the published receipt when relay fails and never falls back to another send', async () => {
+    const result = await runReport({
+      args: ['--dispatch-root', THREAD, '--delivery', 'publish-and-relay'],
+      relayStatus: 502, relayBody: { ok: false, error: 'report_relay_failed', publishedMessageId: 'om_result', deliveryKey: 'delivery-key' },
+    });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('"publishedMessageId":"om_result"');
+    expect(result.stderr).toContain('"deliveryKey":"delivery-key"');
+    expect(result.outbound).toBeUndefined();
+  });
+
+  it.each([
+    ['--delivery'], ['--delivery', 'invalid'], ['--delivery', 'publish'],
+    ['--publish-to', 'chat'], ['--dispatch-root', THREAD, '--delivery', 'publish', '--publish-to', 'other'],
+    ...['--top-level', '--legacy-dispatch', '--into=om_other'].map(flag => ['--dispatch-root', THREAD, '--delivery', 'publish', flag]),
+  ])('rejects invalid publication arguments before delivery: %j', async (...args) => {
+    const result = await runReport({ args });
+    expect(result.status).toBe(1);
+    expect(result.requests).toHaveLength(0);
+    expect(result.outbound).toBeUndefined();
+  });
+
   it('mentions the task reviewer while staying in the user-created thread after implicit relay miss', async () => {
     const result = await runReport({ recipientRoot: SEED });
     expectRecipient(result, REVIEWER);

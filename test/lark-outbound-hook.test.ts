@@ -25,6 +25,13 @@ vi.mock('../src/services/hook-runner.js', () => ({
 import { replyMessage, sendMessage, urgentMessage } from '../src/im/lark/client.js';
 
 describe('Lark outbound hook provider replay suppression', () => {
+  it.each(['create', 'reply'] as const)('preserves the provider rejection code from %s for report recovery', async method => {
+    mocks[method].mockResolvedValueOnce({ code: 230002, msg: 'bot not in chat' });
+    const action = method === 'create' ? sendMessage('app', 'oc_chat', 'body') : replyMessage('app', 'om_root', 'body');
+    await expect(action).rejects.toMatchObject({ code: 230002 });
+    expect(mocks.emitHookEvent).not.toHaveBeenCalled();
+  });
+
   beforeEach(() => {
     mocks.create.mockReset().mockResolvedValue({ code: 0, data: { message_id: 'om_send' } });
     mocks.reply.mockReset().mockResolvedValue({ code: 0, data: { message_id: 'om_reply' } });

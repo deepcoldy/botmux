@@ -90,6 +90,11 @@ docker run --rm \
     tar -xJf /tmp/node.tar.xz -C /opt/node --strip-components=1
     export PATH="/opt/node/bin:$PATH"
     node --version
+    # The Node distribution already includes matching headers. Reuse them so
+    # node-gyp does not download them again through its HTTP client at install.
+    test -f /opt/node/include/node/node.h
+    test -f /opt/node/include/node/config.gypi
+    export npm_config_nodedir=/opt/node
     npm install -g bun@1.4.2 --loglevel=error
     bun --version
 
