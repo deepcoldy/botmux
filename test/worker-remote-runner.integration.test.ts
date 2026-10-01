@@ -56,7 +56,10 @@ input.on('line', line => {
     emit({ type: 'status', requestId: command.requestId, status: 'busy', state });
     emit({ type: 'lineage_changed', state });
     emit({ type: 'terminal_screen', generation: 1, sequence: 0, cols: 120, rows: 40, snapshot: 'REMOTE_TMUX_SCREEN' });
-    setTimeout(() => emit({ type: 'final', turnId: command.turnId, content: 'REMOTE_OK', state }), 700);
+    // The worker publishes screen cards on a 2s cadence. Keep the synthetic
+    // turn alive beyond one full cadence so both Vitest and Bun observe the
+    // screen_update before the structured final retires the turn.
+    setTimeout(() => emit({ type: 'final', turnId: command.turnId, content: 'REMOTE_OK', state }), 2500);
   } else if (command.type === 'detach') {
     emit({ type: 'status', requestId: command.requestId, status: 'detached' });
   } else if (command.type === 'cancel') {
