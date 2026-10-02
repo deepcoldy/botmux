@@ -5840,7 +5840,7 @@ const PRINCIPAL_LANE_RUNTIME_KEYS = [
   'wrapperCli', 'agentFrozen', 'model', 'reasoningEffort', 'modelBackendVariant',
   'backendType', 'mojoIdentity', 'mojoIdentityHostDefault',
   'sandbox', 'sandboxPaths', 'sandboxHidePaths',
-  'sandboxReadonlyPaths', 'sandboxNetwork',
+  'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy',
 ] as const satisfies readonly (keyof Session)[];
 
 function copyPrincipalLaneRuntimeConfig(source: Session, target: Session): void {

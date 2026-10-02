@@ -155,7 +155,7 @@ botmux sandbox-network-policy clear <appId>
 
 ### 隔离 Linux 验证
 
-先 `bun run build`，然后在专用测试目录的外层网络命名空间中准备测试地址。下面只修改该新命名空间，不修改宿主网络：
+先 `bun run build`，然后在专用测试目录的外层网络命名空间中准备测试地址。网关测试在外层 loopback 的 `10.0.2.3` 及主机 loopback 地址监听服务，确保删除网关拒绝规则时能观察到实际连接。下面只修改新命名空间，不修改宿主网络：
 
 ```bash
 unshare -Urn sh -c '
@@ -163,6 +163,7 @@ unshare -Urn sh -c '
   ip link set lo up
   ip addr add 93.184.216.34/32 dev lo
   ip addr add 10.77.0.1/32 dev lo
+  ip addr add 10.0.2.3/32 dev lo
   ip -6 addr add 2606:4700::100/128 dev lo nodad
   ip -6 addr add fd55::1/128 dev lo nodad
   BOTMUX_NETWORK_POLICY_INTEGRATION=1 bun run test test/sandbox-network-linux.test.ts

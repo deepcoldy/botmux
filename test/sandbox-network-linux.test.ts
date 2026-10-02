@@ -23,14 +23,14 @@ const servers: Server[] = [];
 
 // source tests import the BUILT sandbox, so the production re-exec entry path
 // and compiled JS implementation are exercised, rather than a test wrapper.
-async function run(policy: SandboxNetworkPolicy, source: string, onData?: (pid: number, text: string) => void, runtime: 'default' | 'pty' | 'binary' = 'default') {
+async function run(policy: SandboxNetworkPolicy, source: string, onData?: (pid: number, text: string) => void, runtime: 'default' | 'pty' | 'binary' = 'default', data?: unknown) {
   const { prepareDirectSandbox } = await import('../dist/adapters/backend/sandbox.js');
   const script = join(directory, `probe-${Math.random()}.mjs`);
   writeFileSync(script, source);
   const paths = ['/usr', '/etc', dirname(realpathSync(process.execPath)), dirname(nftBinary), ...(process.env.LD_LIBRARY_PATH ?? '').split(':').filter(path => path.startsWith('/')), directory];
   const sbx = prepareDirectSandbox({ sessionId: `network-${Math.random()}`, dataDir: directory,
     networkPolicy: policy, policy: { net: true, writeRegexes: [], rules: [...new Set(paths)].map(path => ({ path, access: path === directory ? 'readWrite' : 'readOnly', source: 'baseline' })) },
-    chdir: directory, home: directory, cliBin: process.execPath, cliArgs: [script],
+    chdir: directory, home: directory, cliBin: process.execPath, cliArgs: [script, JSON.stringify(data ?? null)],
   });
   if (!sbx) throw new Error('sandbox setup failed');
   const env = { ...process.env, ...sbx.env } as Record<string, string>;
@@ -74,12 +74,15 @@ describe.skipIf(!enabled)('real Linux sandbox network boundary', () => {
     // Refuse a normal host invocation; only the isolated fixture namespace can
     // own these addresses. Installing them is documented in the test guide.
     const ip = spawnSync('ip', ['-j', 'address', 'show', 'dev', 'lo'], { encoding: 'utf8' });
-    if (!addresses.every(address => ip.stdout.includes(address))) throw new Error('run only in the isolated fixture network namespace');
+    if (![...addresses, '10.0.2.3'].every(address => ip.stdout.includes(address))) throw new Error('run only in the isolated fixture network namespace');
     const nft = spawnSync('/bin/sh', ['-c', 'command -v nft'], { encoding: 'utf8' });
     if (nft.status !== 0) throw new Error('nft is required for an actual privilege-denial test');
     nftBinary = realpathSync(nft.stdout.trim());
     directory = mkdtempSync(join(tmpdir(), 'botmux-network-test-'));
-    for (const address of addresses) {
+    // --disable-dns may forward .3 as an ordinary destination. Serve that
+    // address in the OUTER loopback so a missing gateway drop is observable;
+    // also listen on host loopback for versions that retain alias translation.
+    for (const address of [...addresses, '10.0.2.3', '127.0.0.1', '::1']) {
       const server = createServer(socket => socket.end('ok'));
       await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(port, address, resolve); }); servers.push(server);
     }
@@ -97,13 +100,25 @@ describe.skipIf(!enabled)('real Linux sandbox network boundary', () => {
     const socketPath = join(directory, 'host.sock'); const host = createServer(socket => socket.end());
     await new Promise<void>(resolve => host.listen(socketPath, resolve));
     try {
-      const source = `import {connect} from 'node:net'; const attempt=options=>new Promise(resolve=>{const s=connect(options);let done=false;const end=x=>{if(done)return;done=true;s.destroy();resolve(x)};s.setTimeout(250,()=>end(false));s.on('error',()=>end(false));s.on('connect',()=>end(true));}); console.log(JSON.stringify(await Promise.all([{host:'::ffff:10.77.0.1',port:${port}},{host:'10.0.2.2',port:${port}},{host:'10.0.2.3',port:53},{path:${JSON.stringify(socketPath)}}].map(attempt))));`;
-      expect(await run({ version: 1, public: { mode: 'allow' }, private: { mode: 'block' } }, source)).toEqual([false,false,false,false]);
+      const source = `import {connect} from 'node:net'; const attempt=options=>new Promise(resolve=>{const s=connect(options);let done=false;const end=x=>{if(done)return;done=true;s.destroy();resolve(x)};s.setTimeout(250,()=>end(false));s.on('error',()=>end(false));s.on('connect',()=>end(true));}); console.log(JSON.stringify(await Promise.all([{host:'::ffff:10.77.0.1',port:${port}},{host:'10.0.2.2',port:${port}},{host:'10.0.2.3',port:53},{path:JSON.parse(process.argv[2])}].map(attempt))));`;
+      expect(await run({ version: 1, public: { mode: 'allow' }, private: { mode: 'block' } }, source, undefined, 'default', socketPath)).toEqual([false,false,false,false]);
     } finally { await new Promise<void>(resolve => host.close(() => resolve())); }
   });
+  it('blocks gateway aliases even when private access is allowed', async () => {
+    const source = `import {connect} from 'node:net';
+const attempt=host=>new Promise(resolve=>{const s=connect({host,port:18087});let done=false;const end=x=>{if(done)return;done=true;s.destroy();resolve(x)};s.setTimeout(300,()=>end(false));s.on('error',()=>end(false));s.on('connect',()=>end(true));});
+console.log(JSON.stringify(await Promise.all(['10.77.0.1','10.0.2.2','10.0.2.3','fd00::2','::ffff:10.0.2.2','::ffff:10.0.2.3'].map(attempt))));`;
+    expect(await run({ version: 1, public: { mode: 'allow' }, private: { mode: 'allow' } }, source))
+      .toEqual([true,false,false,false,false,false]);
+  });
+  it('passes probe paths as data, including quotes and Unicode line separators', async () => {
+    const value = `host'"\\path\u2028\u2029;throw new Error('injected')`;
+    expect(await run({ version: 1, public: { mode: 'block' }, private: { mode: 'block' } },
+      'console.log(JSON.stringify(JSON.parse(process.argv[2])))', undefined, 'default', value)).toBe(value);
+  });
   it('cannot create a new user namespace or modify nftables', async () => {
-    const source = `import {spawnSync} from 'node:child_process';const a=spawnSync('unshare',['-Urn','true']);const b=spawnSync(${JSON.stringify(nftBinary)},['flush','ruleset']);console.log(JSON.stringify([a.status===0,b.status===0,!a.error,!b.error,/Operation not permitted/.test(b.stderr?.toString() ?? "")]));`;
-    expect(await run({ version: 1, public: { mode: 'allow' }, private: { mode: 'block' } }, source)).toEqual([false,false,true,true,true]);
+    const source = `import {spawnSync} from 'node:child_process';const a=spawnSync('unshare',['-Urn','true']);const b=spawnSync(JSON.parse(process.argv[2]),['flush','ruleset']);console.log(JSON.stringify([a.status===0,b.status===0,!a.error,!b.error,/Operation not permitted/.test(b.stderr?.toString() ?? "")]));`;
+    expect(await run({ version: 1, public: { mode: 'allow' }, private: { mode: 'block' } }, source, undefined, 'default', nftBinary)).toEqual([false,false,true,true,true]);
   });
   it('fresh lifetimes install the same frozen policy after restart', async () => {
     const policy: SandboxNetworkPolicy = { version: 1, public: { mode: 'block' }, private: { mode: 'allow' } };

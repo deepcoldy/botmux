@@ -11,6 +11,12 @@ on:
       - 'src/adapters/backend/sandbox.ts'
       - 'src/adapters/cli/fs-policy.ts'
       - 'src/cli.ts'
+      - 'src/worker.ts'
+      - 'src/core/worker-pool.ts'
+      - 'src/daemon.ts'
+      - 'src/services/**'
+      - 'src/workflows/**'
+      - 'src/types.ts'
       - 'test/sandbox-network-*'
 
 permissions:
@@ -55,6 +61,7 @@ jobs:
             ip link set lo up
             ip addr add 93.184.216.34/32 dev lo
             ip addr add 10.77.0.1/32 dev lo
+            ip addr add 10.0.2.3/32 dev lo
             ip -6 addr add 2606:4700::100/128 dev lo nodad
             ip -6 addr add fd55::1/128 dev lo nodad
             bun run test test/sandbox-network-linux.test.ts

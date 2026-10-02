@@ -58,7 +58,11 @@ describe('network policy', () => {
   it('emits one namespace-local ruleset and accepts only explicit DNS capability', () => {
     const rules = compileNetworkNft(parseSandboxNetworkPolicy({ ...base, dnsServers: ['1.1.1.1'] }));
     expect(rules).toContain('table inet botmux_network'); expect(rules).not.toContain('flush ruleset');
-    expect(rules.indexOf('10.0.2.3')).toBeLessThan(rules.indexOf('jump private'));
+    for (const gatewayDrop of ['ip daddr { 10.0.2.2, 10.0.2.3 } drop', 'ip6 daddr fd00::/64 drop']) {
+      expect(rules).toContain(gatewayDrop);
+      expect(rules.indexOf(gatewayDrop)).toBeLessThan(rules.indexOf('jump private'));
+      expect(rules.indexOf(gatewayDrop)).toBeLessThan(rules.indexOf('jump public'));
+    }
     expect(rules).toContain('ip daddr 1.1.1.1 udp dport 53 accept');
   });
   // Evaluate the emitted classic BPF against seccomp_data, including native

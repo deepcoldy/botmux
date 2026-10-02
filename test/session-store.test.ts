@@ -1406,6 +1406,39 @@ describe('principal lane durable store', () => {
     } finally { db.close(); }
   });
 
+  it('freezes the network policy in shadow lanes and restores it without the XPI ingress flag', () => {
+    const source = sourceSession('root-shadow-network', 'on_source', 'ou_source');
+    source.backendType = 'pty';
+    source.sandbox = true;
+    source.sandboxNetwork = true;
+    source.sandboxNetworkPolicy = {
+      version: 1, public: { mode: 'allow' },
+      private: { mode: 'allowlist', rules: [{ cidr: '10.77.0.1', protocol: 'tcp', ports: [443] }] },
+      dnsServers: ['1.1.1.1'],
+    };
+    const frozen = structuredClone(source.sandboxNetworkPolicy);
+    updateSession(source);
+    expect(ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' }, now,
+    }).status).toBe('ready');
+    const shadow = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' }, now,
+    });
+    if (shadow.status !== 'ready') throw new Error('expected ready shadow lane');
+    expect(shadow.session).toMatchObject({ sandbox: true, sandboxNetwork: true, sandboxNetworkPolicy: frozen });
+    // Mutate the actual stored source, including nested arrays: copying only
+    // the outer object must not weaken the child policy.
+    const storedSource = getOwnedSession(source.sessionId)!;
+    storedSource.sandboxNetworkPolicy!.private.rules![0]!.ports!.push(80);
+    storedSource.sandboxNetworkPolicy!.dnsServers!.push('8.8.8.8');
+    updateSession(storedSource);
+    expect(shadow.session.sandboxNetworkPolicy).toEqual(frozen);
+    init(appId);
+    expect(getOwnedSession(shadow.session.sessionId)?.sandboxNetworkPolicy).toEqual(frozen);
+  });
+
   it('publishes one isolated worktree proof atomically and hydrates only that shadow cwd', async () => {
     const source = sourceSession('root-worktree', 'on_source', 'ou_source');
     const sourceReady = ensurePrincipalLaneSource({
