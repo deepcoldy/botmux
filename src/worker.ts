@@ -18214,9 +18214,10 @@ async function spawnCli(
   }
   backend.onScreenResync?.((snapshot) => {
     if (observedBackend !== backend) return;
-    log(`${effectiveBackendType} observer recovered — rebasing screen state from history`);
     if (effectiveBackendType === 'remote-runner') {
       relayRemoteRunnerWebSnapshot(snapshot);
+    } else {
+      log(`${effectiveBackendType} observer recovered — rebasing screen state from history`);
     }
     scheduleBackendScreenResync(snapshot, `${effectiveBackendType} observer recovery`);
   });

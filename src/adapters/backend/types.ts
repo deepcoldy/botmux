@@ -144,10 +144,10 @@ export interface SessionBackend {
   /**
    * Replace the worker's derived screen state with an authoritative snapshot.
    *
-   * Live-only observers use this after reconnecting: output may have been
-   * produced while the observer was offline, so replaying only subsequent
-   * chunks would leave idle detection and cards permanently stale. This is a
-   * reset/rebase signal, not another incremental PTY chunk.
+   * Snapshot-native backends use this for bounded viewport updates; live-only
+   * observers also use it after reconnecting, when output may have been
+   * produced while the observer was offline. This is a reset/rebase signal,
+   * not another incremental PTY chunk.
    */
   onScreenResync?(cb: (snapshot: string) => void): void;
   onExit(cb: (code: number | null, signal: string | null) => void): void;
