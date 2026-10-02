@@ -26,7 +26,11 @@ async function waitFor(predicate: () => boolean, describeFailure: () => string):
   throw new Error(describeFailure());
 }
 
-async function readTerminalSeed(port: number, viewToken: string): Promise<string> {
+async function readTerminalSeed(
+  port: number,
+  viewToken: string,
+  resize?: { cols: number; rows: number },
+): Promise<string> {
   return await new Promise<string>((resolvePromise, rejectPromise) => {
     const frames: string[] = [];
     const socket = new WebSocket(
@@ -36,6 +40,9 @@ async function readTerminalSeed(port: number, viewToken: string): Promise<string
       socket.close();
       rejectPromise(new Error(`remote runner terminal seed timed out: ${frames.join('')}`));
     }, 5_000);
+    socket.on('open', () => {
+      if (resize) socket.send(JSON.stringify({ type: 'resize', ...resize }));
+    });
     socket.on('message', data => {
       frames.push(String(data));
       if (frames.join('').includes('REMOTE_TMUX_SCREEN_NEW')) {
@@ -57,21 +64,22 @@ describe('remote runner worker wiring', () => {
     tempDirs.push(root);
     const dump = join(root, 'turn.json');
     const startDump = join(root, 'start.json');
+    const resizeDump = join(root, 'resize.log');
     const provider = join(root, 'provider.mjs');
     writeFileSync(provider, `#!/usr/bin/env node
 import fs from 'node:fs';
 import readline from 'node:readline';
 const protocol = 'botmux.remote-runner';
 const version = 1;
+const state = { version: 1, provider: 'test-provider', generation: 1, remoteSessionId: 'remote-1' };
 const emit = event => process.stdout.write(JSON.stringify({ protocol, version, ...event }) + '\\n');
 const input = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 input.on('line', line => {
   const command = JSON.parse(line);
   if (command.type === 'hello') {
-    emit({ type: 'hello', requestId: command.requestId, provider: 'test-provider', capabilities: ['start','resume','turn','cancel','detach','status','terminal_screen'] });
+    emit({ type: 'hello', requestId: command.requestId, provider: 'test-provider', capabilities: ['start','resume','turn','cancel','detach','status','terminal_screen','terminal_resize'] });
   } else if (command.type === 'start') {
     fs.writeFileSync(${JSON.stringify(startDump)}, JSON.stringify(command));
-    const state = { version: 1, provider: 'test-provider', generation: 1, remoteSessionId: 'remote-1' };
     emit({ type: 'ready', requestId: command.requestId, state });
   } else if (command.type === 'turn') {
     fs.writeFileSync(${JSON.stringify(dump)}, JSON.stringify({
@@ -80,7 +88,7 @@ input.on('line', line => {
       chatId: process.env.BOTMUX_CHAT_ID,
       rootMessageId: process.env.BOTMUX_ROOT_MESSAGE_ID,
     }));
-    const state = { version: 1, provider: 'test-provider', generation: 1, remoteSessionId: 'remote-1', agentThreadId: 'thread-1' };
+    state.agentThreadId = 'thread-1';
     emit({ type: 'status', requestId: command.requestId, status: 'busy', state });
     emit({ type: 'lineage_changed', state });
     emit({ type: 'terminal_screen', generation: 1, sequence: 0, cols: 120, rows: 40, snapshot: 'REMOTE_TMUX_SCREEN_OLD' });
@@ -107,6 +115,9 @@ input.on('line', line => {
     emit({ type: 'status', requestId: command.requestId, status: 'closed' });
   } else if (command.type === 'status') {
     emit({ type: 'status', requestId: command.requestId, status: 'ready' });
+  } else if (command.type === 'terminal_resize') {
+    fs.appendFileSync(${JSON.stringify(resizeDump)}, command.cols + 'x' + command.rows + '\\n');
+    emit({ type: 'status', requestId: command.requestId, status: 'ready', state });
   }
 });
 `);
@@ -208,9 +219,13 @@ input.on('line', line => {
     if (!ready || ready.type !== 'ready' || !ready.port || !ready.viewToken) {
       throw new Error(`remote runner worker did not publish a Web Terminal: ${JSON.stringify(messages)}`);
     }
-    const seed = await readTerminalSeed(ready.port, ready.viewToken);
+    const seed = await readTerminalSeed(ready.port, ready.viewToken, { cols: 60, rows: 49 });
+    expect(seed).toContain('\x1b]1989;120;40\x07');
     expect(seed).toContain('REMOTE_TMUX_SCREEN_NEW');
     expect(seed).not.toContain('REMOTE_TMUX_SCREEN_OLD');
+    await new Promise<void>(resolveDelay => setTimeout(resolveDelay, 150));
+    expect(existsSync(resizeDump)).toBe(false);
+
     expect(existsSync(dump)).toBe(true);
     expect(JSON.parse(readFileSync(startDump, 'utf8'))).toMatchObject({
       type: 'start',

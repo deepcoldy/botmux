@@ -8690,7 +8690,16 @@ function relayRemoteRunnerWebSnapshot(snapshot: string): void {
   scrollback = renderHerdrWebHistory(frame);
   const payload = `\x1b]1989;history;0\x07${scrollback}`;
   for (const ws of wsClients) {
-    if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+    if (ws.readyState !== WebSocket.OPEN) continue;
+    // A view-capability client is a follower: it may inspect the authoritative
+    // remote grid but must not resize that shared TUI. Keep its xterm pinned to
+    // the provider-reported pane size so a narrow browser does not wrap the
+    // snapshot locally after its resize request is rejected below.
+    if (!authedClients.has(ws) && effectiveBackendType === 'remote-runner') {
+      const size = backend?.getPaneSize?.();
+      if (size) ws.send(`\x1b]1989;${size.cols};${size.rows}\x07`);
+    }
+    ws.send(payload);
   }
 }
 
@@ -19395,6 +19404,15 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
           const sz = (backend as ObserveBackend).getPaneSize();
           if (sz && sz.cols > 0 && sz.rows > 0) ws.send(`\x1b]1989;${sz.cols};${sz.rows}\x07`);
         }
+        // Remote Runner exposes one shared provider-side TUI. A read-only view
+        // follows that grid instead of becoming a resize owner; otherwise merely
+        // opening a narrow card link can shrink the remote tmux and every later
+        // screenshot. A write-capability client keeps the existing responsive
+        // resize semantics.
+        if (!hasWrite && effectiveBackendType === 'remote-runner') {
+          const sz = backend?.getPaneSize?.() ?? { cols: renderCols, rows: renderRows };
+          ws.send(`\x1b]1989;${sz.cols};${sz.rows}\x07`);
+        }
         const seed = usesHerdrSnapshotWebHistory() && scrollback.length > 0
           ? scrollback
           : chooseWebTerminalSeed({
@@ -19422,7 +19440,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
             if (msg.type === 'resize' && msg.cols > 0 && msg.rows > 0) {
               const result = herdrWebBinding.resize(msg.cols, msg.rows);
               applyHerdrWebBindingResult(ws, result);
-              if (!result.backend) {
+              if (!result.backend && (hasWrite || effectiveBackendType !== 'remote-runner')) {
                 backend?.resize(msg.cols, msg.rows);
               }
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
@@ -19450,6 +19468,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
 
         ws.on('close', () => {
           wsClients.delete(ws);
+          authedClients.delete(ws);
           herdrWebBindings.delete(ws);
           const promoted = herdrWebBinding.release() as WebSocket | null;
           if (promoted?.readyState === WebSocket.OPEN) {
