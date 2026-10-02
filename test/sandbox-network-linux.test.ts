@@ -143,11 +143,13 @@ console.log(JSON.stringify(await Promise.all(['10.77.0.1','10.0.2.2','10.0.2.3',
   it('explicit proxy trust filters the exit but delegates proxied business destinations', async () => {
     let proxyHits = 0;
     const privateServer = httpServer((_req, res) => res.end('private-via-trusted-exit'));
-    // Generic HTTP forwarder: no provider or proxy-product behavior. Both the
-    // forwarder and private target live exclusively in the outer namespace.
+    // Generic HTTP forwarding fixture for one fixed destination: no provider
+    // or proxy-product behavior, and no arbitrary test-server outbound URL.
+    // Both the forwarder and target live exclusively in the outer namespace.
     const proxy = httpServer((req, res) => {
       proxyHits++;
-      const upstream = httpRequest(req.url!, reply => reply.pipe(res));
+      if (req.url !== 'http://10.77.0.1:18089/') { res.statusCode = 403; res.end(); return; }
+      const upstream = httpRequest('http://10.77.0.1:18089/', reply => reply.pipe(res));
       upstream.on('error', () => { res.statusCode = 502; res.end(); });
       upstream.end();
     });
