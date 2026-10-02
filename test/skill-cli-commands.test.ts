@@ -84,4 +84,18 @@ describe('botmux skill session command', () => {
   it('refuses to run without a session id', () => {
     expect(runSkillSessionCommand(['list'], {}).stderr).toContain('missing BOTMUX_SESSION_ID');
   });
+
+  it('reports a corrupt manifest as unreadable, not not-found', () => {
+    write(join(dataDir, 'skill-manifests', 'broken.json'), '{ nope');
+    const res = runSkillSessionCommand(['show', 'deploy'], { BOTMUX_SESSION_ID: 'broken' });
+    expect(res.code).toBe(1);
+    expect(res.stderr).toContain('corrupt');
+    expect(res.stderr).not.toContain('not found');
+  });
+
+  it('still reports a genuinely absent manifest as not found', () => {
+    const res = runSkillSessionCommand(['show', 'deploy'], { BOTMUX_SESSION_ID: 'absent' });
+    expect(res.code).toBe(2);
+    expect(res.stderr).toContain('manifest not found');
+  });
 });
