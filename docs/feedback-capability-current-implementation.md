@@ -73,7 +73,7 @@ Core 只接受三种语义：
 - 总开关默认关闭。
 - `apiOnly` bot 不展示反馈。
 - `audience` 默认 `requester`：鉴权主体固定为 delivery 中保存的 requester subject。正常 final 路径优先使用精确 turn sender；当该身份不可得时，当前实现会退化到已确认的 session owner/footer recipient，因此不是所有路径都能保证等同于“本次消息发送者”。
-- `audience: "reviewers"` 用于 bot 触发的自动分析场景（如 Oncall/告警监听，本次 turn 的发送者是另一个 bot、没有单一真人 owner）：改由发送时冻结的 `reviewers` 名单鉴权，名单里任一可信真人身份点击即放行，与是否存在真人 requester 无关。名单可填写 `ou_`、`on_` 或完整邮箱；邮箱会在发卡时解析为当前应用的 `open_id`，回调仍保持零网络鉴权。
+- `audience: "reviewers"` 用于 bot 触发的自动分析场景（如 Oncall/告警监听，本次 turn 的发送者是另一个 bot、没有单一真人 owner）：改由发送时冻结的 `reviewers` 名单鉴权，名单里任一可信真人身份点击即放行，与是否存在真人 requester 无关。名单可填写 `ou_`、`on_` 或完整邮箱；邮箱会在发卡时解析为当前应用的 `open_id`，回调仍保持零网络鉴权。名单为空时仍展示反馈按钮，但所有点击都会被拒绝。
 - `audience: "everyone"` 允许任意具有平台核验 operator 身份的点击者反馈，不要求 requester，也不需要 `reviewers` 名单。该模式会扩大反馈写入范围，应只用于群成员都可信的场景。
 - `allowReselect` 默认 `false`；只有显式设置 `true` 才允许改选。
 - 说明框默认开启、非必填，默认最大 1000 字。
@@ -86,8 +86,8 @@ Core 只接受三种语义：
 - 按钮 2–4 个，key 唯一，只允许 `[a-z0-9_-]+`。
 - 负向原因最多 6 个。
 - 说明最大长度 1–2000。
-- `audience` 仅接受 `requester` / `reviewers` / `everyone`。`reviewers` 名单每项必须是 `ou_`（app 内 open_id）、`on_`（跨 app union_id）或完整邮箱，最多 50 项且不重复。邮箱在发送时用当前 bot 凭证解析为 `ou_` 后才写入策略快照；解析不到时丢弃该项，全部无法解析则 fail closed、不展示反馈。跨 app 场景应优先使用 `on_`（`ou_` 是 app-scoped、不可跨 app 复制）。
-- `audience: "reviewers"` 与 `reviewers` 名单必须同时成立：`reviewers` audience 缺名单，或 `requester` / `everyone` audience 却带名单，都会 fail closed（分层配置合并后仍按整体校验，任一层非法即不展示反馈）。
+- `audience` 仅接受 `requester` / `reviewers` / `everyone`。`reviewers` 名单每项必须是 `ou_`（app 内 open_id）、`on_`（跨 app union_id）或完整邮箱，最多 50 项且不重复。邮箱在发送时用当前 bot 凭证解析为 `ou_` 后才写入策略快照；解析不到时丢弃该项，全部无法解析时保留空名单和反馈按钮，但点击鉴权仍 fail closed。跨 app 场景应优先使用 `on_`（`ou_` 是 app-scoped、不可跨 app 复制）。
+- `audience: "reviewers"` 允许缺省或清空 `reviewers`，此时按钮可见但没有任何用户能提交反馈；`requester` / `everyone` audience 带非空名单仍会被判为无效策略。
 - 不允许配置任意 Lark card JSON；配置仅包含受约束的领域字段。
 
 ## 4. 分层配置模型
@@ -166,7 +166,7 @@ built-in defaults
 
 - 名单项为 `ou_`（app 内 open_id）、`on_`（跨 app union_id）或完整邮箱；跨 app 优先用 `on_`。邮箱在发卡时解析为当前应用的 `ou_`，未解析成功的项不会写入快照。
 - 名单随 delivery 快照冻结：后续改名单只影响新卡，旧卡仍按发送时名单鉴权。
-- `audience` 与 `reviewers` 可分散在不同层（team/bot/chat）提供，合并后按整体校验；`reviewers` audience 缺名单会 fail closed。
+- `audience` 与 `reviewers` 可分散在不同层（team/bot/chat）提供，合并后按整体校验；`reviewers` audience 缺名单时仍展示按钮，但所有点击都会 fail closed。
 
 ### 4.5 everyone audience 示例
 

@@ -132,9 +132,9 @@ describe('feedback policy', () => {
       expect(policy.reviewers).toEqual(['alice@example.com', 'on_bob']);
     });
 
-    it('fails closed when the reviewers audience has an empty allowlist', () => {
-      expect(() => normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers' })).toThrow(/non-empty/);
-      expect(() => normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers', reviewers: [] })).toThrow(/non-empty/);
+    it('keeps an empty reviewers allowlist visible but fail-closed at callback time', () => {
+      expect(normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers' }).reviewers).toEqual([]);
+      expect(normalizeFeedbackPolicy({ enabled: true, audience: 'reviewers', reviewers: [] }).reviewers).toEqual([]);
     });
 
     it('rejects a reviewers allowlist paired with a non-reviewers audience', () => {
