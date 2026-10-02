@@ -140,7 +140,26 @@ Private means conservative non-public space: RFC1918, IPv4 loopback, link-local,
 
 The boundary filters **actual destination IP packets** using nftables in a fresh namespace before connecting a generic slirp4netns link. Direct sockets, changed/deleted proxy variables, IPv4 mappings, changed DNS answers and redirected connections receive the same kernel filtering. Model endpoints and DNS must be explicitly permitted. It does not modify the host firewall, Docker or any proxy product configuration.
 
-Restricted policies do not support upstream proxy destination re-resolution; inherited HTTP/HTTPS/ALL proxy configuration is rejected rather than rewritten. This is address enforcement, not inspection of encrypted application traffic. An allowed server or tunnel endpoint is an authorized exit: do not allow arbitrary forwarding services when requiring final application destination restrictions. Domain/HTTP rules or final destinations hidden behind a proxy cannot be enforced by this policy.
+Restricted policies reject inherited HTTP/HTTPS/ALL proxy configuration by default without rewriting environment variables. Explicit `proxyMode: "trusted-egress"` delegates business destination control to an approved exit. `proxyMode: "reject"` rejects proxy environment variables even when both zones allow all traffic. An omitted field keeps the previous behavior, including proxy compatibility when both zones use `allow`.
+
+**Trusting an exit does not restrict destinations behind it.** Kernel rules still filter the actual proxy IP/port: unauthorized exits and direct private connections remain blocked. An approved proxy can reach any address it can access, including private addresses blocked for the client. Final model destinations, domain/CONNECT/HTTP rules and proxy-side DNS belong to the deployment-layer proxy ACL. This option does not create or configure a proxy, inject environment variables, or guarantee a CLI uses it. `NO_PROXY` and deleted/changed proxy variables do not change actual IP enforcement.
+
+For a deployment-provided proxy, a new local PTY session can use:
+
+```json
+{
+  "sandbox": true,
+  "backendType": "pty",
+  "sandboxNetworkPolicy": {
+    "version": 1,
+    "proxyMode": "trusted-egress",
+    "public": { "mode": "block" },
+    "private": { "mode": "allowlist", "rules": [{ "cidr": "10.20.0.10", "protocol": "tcp", "ports": [8080] }] }
+  }
+}
+```
+
+Authorize client DNS separately if the proxy hostname requires resolution. The proxy must have a routable endpoint; host loopback, Unix sockets and slirp gateway aliases remain blocked. To restrict final business destinations, configure the proxy's own ACL or use direct egress.
 
 Namespace-local loopback remains available for local IPC, distinct from host loopback. Host loopback aliases and slirp DNS forwarding are always disabled. Only required IPv6 neighbor discovery control packets are exempted. Task socket creation is restricted to Internet families; host Unix sockets, setns/unshare, compat syscall ABI and io_uring are blocked, while process-local socketpair IPC remains. Host MCP Gateway/Unix IPC combinations fail closed; the file outbox relay remains available.
 
@@ -149,5 +168,13 @@ Optional `dnsServers` grants explicit TCP/UDP port 53 access before zone evaluat
 Provide iproute2 `ip`, nft, slirp4netns supporting `--disable-host-loopback`/`--disable-dns`, and bwrap supporting `--disable-userns`/`--add-seccomp-fd`. No network dependency auto-install occurs. Initialization failures abort launch; a link failure terminates the task lifetime. There is no unfiltered fallback.
 
 Dashboard Security saves JSON and shows configured-for-new-sessions status. Host CLI supports `botmux sandbox-network-policy check <file>`, `set <appId> <file>` and `clear <appId>`. Mutations require an online authenticated owning daemon; isolated/session CLIs cannot modify host policy. IM `/config sandboxNetworkPolicy <JSON>` shares validation and atomic persistence. Session/workflow snapshots are deep copies; fork/restart/restore retains the frozen policy. Clearing affects new sessions and restores the legacy boolean behavior.
+
+### Persistent sessions and migration
+
+Existing tmux sessions cannot gain the boundary by setting policy JSON. The tmux server creates new pane processes, while restore only attaches to a surviving pane without rerunning CLI arguments. The current namespace/link supervisor belongs to a local PTY worker lifetime; worker loss terminates that task, unlike a persistent pane. Opening the backend gate or persisting a JSON field would not prove enforcement. tmux/zellij/herdr/zmx, adopt and existing external App Servers remain explicitly unsupported; no automatic backend switch or policy downgrade occurs.
+
+Keep the legacy configuration to retain an existing persistent session without claiming the new boundary, or explicitly select local `backendType: "pty"` with `sandbox: true` and create a new session. Deployment-provided proxies can then use explicit trusted-egress and endpoint rules, delegating final destinations to the proxy. Native Codex CLI supports a new PTY session; this does not migrate a running tmux pane in place. Bot edits affect new sessions only; existing/fork/restored snapshots stay frozen. Resuming CLI history in a newly launched process is distinct from reattaching a live pane and must establish a fresh boundary.
+
+Persistent boundary support needs a separate change: enforcement before shell/CLI launch; an authenticated policy digest, namespace identity and supervisor generation tied to the actual pane/CLI PID; verification of live evidence on worker/daemon restore with missing/mismatched evidence rejected; a supervisor lifetime independent of the worker, with link death terminating associated tasks; safe cleanup, pane replacement, concurrent restore and adopt handling. Acceptance must exercise real tmux fresh/reattach, worker/daemon restart, link failure, tampered/stale evidence, cross-session isolation and IPv4/IPv6. Stored configuration or session names are insufficient proof.
 
 See the Chinese page's isolated Linux test command. `test/sandbox-network-linux.test.ts` is opt-in (`BOTMUX_NETWORK_POLICY_INTEGRATION=1`); explicit runs fail if dependencies or kernel capabilities are unavailable. A skipped run is not boundary validation. Set `BOTMUX_NETWORK_TEST_BINARY` to the absolute compiled binary path to include the self-reexec case. The Sandbox network boundary CI runs the complete matrix and binary test for relevant PRs. Model requests use an isolated HTTP fixture rather than a live provider.

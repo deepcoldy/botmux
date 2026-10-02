@@ -2,13 +2,13 @@
  * with the fixture addresses installed on lo; never adds host firewall rules.
  * bun run build && BOTMUX_NETWORK_POLICY_INTEGRATION=1 bun run test test/sandbox-network-linux.test.ts
  */
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { createServer, type Server } from 'node:net';
 import { mkdtempSync, writeFileSync, rmSync, realpathSync, readFileSync, readlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawnTsScript } from './helpers/ts-runner.js';
-import { createServer as httpServer } from 'node:http';
+import { createServer as httpServer, request as httpRequest } from 'node:http';
 import { createSocket } from 'node:dgram';
 import { spawn, spawnSync } from 'node:child_process';
 import type { SandboxNetworkPolicy, NetworkMode } from '../src/core/sandbox-network-policy.js';
@@ -139,6 +139,38 @@ console.log(JSON.stringify(await Promise.all(['10.77.0.1','10.0.2.2','10.0.2.3',
       expect(await run({ version: 1, public: { mode: 'allowlist', rules: [{ cidr: addresses[0], protocol: 'tcp', ports: [18088] }] }, private: { mode: 'block' } }, source)).toEqual(['approved-model-response', false]);
       expect(privateHits).toBe(0);
     } finally { for (const server of [publicServer, privateServer]) server.closeAllConnections(); await Promise.all([publicServer, privateServer].map(server => new Promise<void>(resolve => server.close(() => resolve())))); }
+  });
+  it('explicit proxy trust filters the exit but delegates proxied business destinations', async () => {
+    let proxyHits = 0;
+    const privateServer = httpServer((_req, res) => res.end('private-via-trusted-exit'));
+    // Generic HTTP forwarder: no provider or proxy-product behavior. Both the
+    // forwarder and private target live exclusively in the outer namespace.
+    const proxy = httpServer((req, res) => {
+      proxyHits++;
+      const upstream = httpRequest(req.url!, reply => reply.pipe(res));
+      upstream.on('error', () => { res.statusCode = 502; res.end(); });
+      upstream.end();
+    });
+    await new Promise<void>(resolve => privateServer.listen(18089, '10.77.0.1', resolve));
+    await new Promise<void>(resolve => proxy.listen(18090, '93.184.216.34', resolve));
+    vi.stubEnv('HTTPS_PROXY', 'http://93.184.216.34:18090');
+    const policy: SandboxNetworkPolicy = { version: 1,
+      public: { mode: 'allowlist', rules: [{ cidr: '93.184.216.34', protocol: 'tcp', ports: [18090] }] },
+      private: { mode: 'block' }, proxyMode: 'trusted-egress' };
+    const source = `import {request} from 'node:http';
+const get=(url,path)=>new Promise(resolve=>{const req=request(url,{...(path?{path}:{}),timeout:300},res=>{let body='';res.on('data',chunk=>body+=chunk);res.on('end',()=>resolve(body))});req.on('timeout',()=>req.destroy());req.on('error',()=>resolve(false));req.end()});
+console.log(JSON.stringify([await get('http://10.77.0.1:18089/'),await get(process.env.HTTPS_PROXY,'http://10.77.0.1:18089/'),process.env.HTTPS_PROXY]));`;
+    try {
+      await expect(run({ ...policy, proxyMode: 'reject' }, source)).rejects.toThrow('upstream proxy');
+      expect(await run(policy, source)).toEqual([false,'private-via-trusted-exit','http://93.184.216.34:18090']);
+      expect(await run({ ...policy, public: { mode: 'block' } }, source))
+        .toEqual([false,false,'http://93.184.216.34:18090']);
+      expect(proxyHits).toBe(1);
+    } finally {
+      vi.unstubAllEnvs();
+      await Promise.all([new Promise<void>(resolve => proxy.close(() => resolve())),
+        new Promise<void>(resolve => privateServer.close(() => resolve()))]);
+    }
   });
   it('changed DNS answers cannot move an allowed connection into private space', async () => {
     const dns = createSocket('udp4'); let query = 0;

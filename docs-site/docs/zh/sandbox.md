@@ -135,7 +135,29 @@
 
 执行边界是任务实际发出的 **IP 数据包目标地址**。nftables 安装在新的网络命名空间中，随后才用通用 `slirp4netns` 接通网络；不依赖 HTTP_PROXY，也不修改宿主防火墙、Docker 或任何代理产品配置。直接 socket、改写/删除代理变量、IPv4 映射地址均受同一规则约束；DNS 结果变化、HTTP 重定向到另一个地址会重新受目标规则约束。模型 API 需要的目标 CIDR、端口和 DNS 必须获准。
 
-该策略不解释加密流量或允许地址提供的应用功能。**不支持受限策略经上游代理再次解析目的地**：继承的 HTTP/HTTPS/ALL proxy 配置会被拒绝，环境变量不会被悄悄改写。允许的服务器或隧道端点本身是授权出口；请不要将可转发到任意目的地的服务列为可信目标。需要按代理后的业务地址、域名或 HTTP 请求控制访问时，本策略不能兑现该保证，不能将代理地址白名单等同于最终地址白名单。
+该策略不解释加密流量或允许地址提供的应用功能。受限策略默认拒绝继承的 HTTP/HTTPS/ALL proxy 配置，环境变量不会被悄悄改写。可显式设置 `proxyMode: "trusted-egress"`，将代理后的业务目标控制委托给获准出口；`proxyMode: "reject"` 则明确拒绝这些代理环境变量，包括公网和内网全部放行的策略。字段缺省时保留原行为（两区均 `allow` 不拒绝代理）。
+
+**信任出口不等于限制代理后的目标**：内核仍过滤客户端实际连接的代理 IP/端口，未经授权的代理出口和直接内网连接继续被拒绝；但获准代理可以替客户端访问任何它能访问的地址，包括客户端策略禁止的内网。最终模型地址、域名、CONNECT/HTTP 请求及代理端 DNS 由部署层代理自身控制。本字段不创建代理、不填入环境变量、不修改具体代理产品配置，也不保证 CLI 会使用代理。`NO_PROXY` 和任务自行删改代理变量均不改变实际 IP 边界。
+
+例如，代理环境变量由部署层提供，Botmux 仅信任已批准的内网出口：
+
+```json
+{
+  "sandbox": true,
+  "backendType": "pty",
+  "sandboxNetworkPolicy": {
+    "version": 1,
+    "proxyMode": "trusted-egress",
+    "public": { "mode": "block" },
+    "private": {
+      "mode": "allowlist",
+      "rules": [{ "cidr": "10.20.0.10", "protocol": "tcp", "ports": [8080] }]
+    }
+  }
+}
+```
+
+示例只有代理端点可连接；如果代理域名需要客户端解析，应另外显式授权 DNS。代理必须是命名空间可路由的 IP，宿主 `127.0.0.1`、Unix socket 和 slirp 网关别名不能借此开放。要求最终业务目标也受约束时，必须先在部署层限制代理转发范围，或选择直接出口。
 
 命名空间自己的 `127.0.0.1`/`::1` 为本地进程通信保留，与宿主回环不同。宿主回环映射、转发器网关别名及宿主 DNS 转发始终关闭；IPv6 邻居发现只开放必要的链路控制报文。任务不能创建宿主 Unix socket，不能调用 setns/unshare 或 io_uring 绕过过滤，也没有网络管理能力；`socketpair` 等进程内部 IPC 保留。宿主 MCP Gateway/Unix IPC 无法同时兑现该边界时，启动会明确拒绝；文件 outbox 中转仍保留。
 
@@ -152,6 +174,21 @@ botmux sandbox-network-policy clear <appId>
 ```
 
 `set`/`clear` 经目标在线 daemon 的认证配置接口原子写入；沙箱/会话内不得修改宿主策略。IM 的 `/config sandboxNetworkPolicy <JSON>` 使用同一校验/持久化入口。策略深拷贝到会话和 workflow 快照，fork/重启/恢复继续使用原策略；编辑机器人配置只影响新会话。清除后新会话回到原 `sandboxNetwork` 行为。
+
+### 持久会话的兼容边界与迁移
+
+现有 tmux 会话不能通过填入新策略直接收紧。`TmuxBackend.spawn` 创建 pane 时由 tmux server 启动进程；恢复时只 attach 存活 pane，不重跑 CLI 的启动参数。当前 namespace/link 监督器随本地 PTY 的 worker 生命周期运行；worker 消失会关闭链路并终止任务，这与持久 pane 跨 worker 重启存活的约定不同。仅放开后端校验或保存一个 policy JSON，无法证明存活进程真的处于原边界中。因此本 PR 保持 tmux/zellij/herdr/zmx、adopt 和已有外部 App Server 的显式拒绝，不静默切换后端或取消策略。
+
+| 当前需要 | 可选择的迁移方式 | 实际结果 |
+|---|---|---|
+| 保留现有持久会话 | 暂不配置 `sandboxNetworkPolicy` | 保留旧运行方式；不能宣称已启用新边界 |
+| 现在启用客户端 IP 边界 | 配置本地 `backendType: "pty"` 与 `sandbox: true`，创建新会话 | 启动前建立 namespace/nft/link；worker 退出即终止该生命周期 |
+| PTY 必须通过部署层代理到模型服务 | 上述新会话 + 显式 `trusted-egress` + 代理实际 IP/端口规则 | 客户端出口受约束；代理后的业务目标由代理控制 |
+| 持久会话与最终代理目标都需限制 | 等待独立的持久边界支持，并部署代理自身 ACL | 本 PR 尚不能兑现；不移除拒绝门禁 |
+
+原生 Codex CLI 可选择新 PTY 会话；这不等于已运行的 Codex tmux pane 可原地迁移。编辑 Bot 配置只作用于新会话，旧会话/fork/恢复仍使用冻结快照。CLI 自身持久化的历史恢复与 tmux 活进程恢复是两回事；启动新 CLI 恢复历史时仍须重新建立新边界。
+
+后续持久后端需求应独立实现并验收：在启动 shell/CLI 前建立边界；为每代 pane/真实 CLI PID 绑定不可由任务改写的策略摘要、namespace 身份与监督器代际；daemon/worker 重启后核验这些证据及实际存活状态，缺失或不符时拒绝附着；由独立监督器管理 namespace/nft/link 的持久生命周期，转发器死亡必须终止关联任务；清理、pane 替换、并发恢复与 adopt 均不能复用过期证明。验收需真实 tmux、新建/重附着、worker/daemon 重启、转发器死亡、篡改/旧证明、跨会话与 IPv4/IPv6 回归，不能以存储字段或 session 名称代替边界证明。
 
 ### 隔离 Linux 验证
 

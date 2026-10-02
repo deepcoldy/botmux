@@ -10,6 +10,9 @@ export interface SandboxNetworkPolicy {
   private: NetworkZone;
   /** Explicit DNS capability: these addresses may receive TCP/UDP port 53. */
   dnsServers?: string[];
+  /** Explicitly delegate proxied business destinations to an approved exit.
+   * Kernel rules still constrain the actual proxy endpoint; env is unchanged. */
+  proxyMode?: 'reject' | 'trusted-egress';
 }
 
 // Conservative non-public space, including transition/translation addresses.
@@ -68,7 +71,7 @@ export function networkZone(address: string): 'public' | 'private' {
 }
 
 export function parseSandboxNetworkPolicy(raw: unknown): SandboxNetworkPolicy {
-  const obj = object(raw, ['version', 'public', 'private', 'dnsServers'], 'sandboxNetworkPolicy');
+  const obj = object(raw, ['version', 'public', 'private', 'dnsServers', 'proxyMode'], 'sandboxNetworkPolicy');
   if (obj.version !== 1) throw new Error('sandboxNetworkPolicy.version must be 1');
   const zone = (rawZone: unknown, label: string): NetworkZone => {
     const z = object(rawZone, ['mode', 'rules'], label);
@@ -87,12 +90,13 @@ export function parseSandboxNetworkPolicy(raw: unknown): SandboxNetworkPolicy {
     return { mode, ...(rules ? { rules } : {}) };
   };
   if (obj.dnsServers !== undefined && (!Array.isArray(obj.dnsServers) || obj.dnsServers.length > 8 || !obj.dnsServers.every(ip => typeof ip === 'string' && isIP(ip) && !ip.includes('%') && !ip.includes('/')))) throw new Error('dnsServers must contain at most 8 IP addresses');
+  if (obj.proxyMode !== undefined && obj.proxyMode !== 'reject' && obj.proxyMode !== 'trusted-egress') throw new Error('proxyMode must be reject or trusted-egress');
   const dnsServers = (obj.dnsServers as string[] | undefined)?.map(ip => {
     const address = parseAddress(ip).cidr.split('/')[0]!;
     if (['10.0.2.2', '10.0.2.3', '127.0.0.0/8', '::1', 'fd00::/64'].some(c => addressMatches(address, c))) throw new Error('DNS cannot use loopback or the network gateway aliases');
     return address;
   });
-  return { version: 1, public: zone(obj.public, 'public'), private: zone(obj.private, 'private'), ...(dnsServers ? { dnsServers } : {}) };
+  return { version: 1, public: zone(obj.public, 'public'), private: zone(obj.private, 'private'), ...(dnsServers ? { dnsServers } : {}), ...(obj.proxyMode !== undefined ? { proxyMode: obj.proxyMode as 'reject' | 'trusted-egress' } : {}) };
 }
 
 export function networkPolicyAllows(policy: SandboxNetworkPolicy, ip: string, protocol: 'tcp' | 'udp', port: number): boolean {
@@ -147,9 +151,11 @@ export function networkPolicySupportError(input: { platform: string; backendType
   if (input.sandbox !== true && input.sandbox !== 'oncall') return 'sandboxNetworkPolicy requires sandbox oncall';
 }
 
-/** Reject known upstream proxy configurations rather than imply a guarantee
- * about hidden/re-resolved application destinations. Keep env semantics intact. */
+/** Default to rejecting proxy configuration for restricted policies. An
+ * explicit trusted-egress mode delegates business destination control to that
+ * exit, while namespace rules continue to filter its actual endpoint IP. */
 export function networkProxyError(policy: SandboxNetworkPolicy | undefined, env: Record<string, string | undefined>): string | undefined {
-  if (!policy || policy.public.mode === 'allow' && policy.private.mode === 'allow') return;
-  if (['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'].some(key => !!env[key])) return 'restricted sandboxNetworkPolicy does not support upstream proxy destination re-resolution; use direct permitted egress';
+  if (!policy || policy.proxyMode === 'trusted-egress') return;
+  if (policy.proxyMode === undefined && policy.public.mode === 'allow' && policy.private.mode === 'allow') return;
+  if (['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'].some(key => !!env[key])) return 'restricted sandboxNetworkPolicy does not support upstream proxy destination re-resolution; use direct permitted egress or explicitly delegate destination control with proxyMode trusted-egress';
 }

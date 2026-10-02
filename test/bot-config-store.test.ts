@@ -141,10 +141,10 @@ describe('bot-config store', () => {
     expect(readConfig().promptInjection).toBeUndefined();
   });
 
-  it('network policy strictly validates and persists atomically; clear restores legacy network', async () => {
+  it.each([undefined, 'reject', 'trusted-egress'])('network policy with proxyMode %s persists atomically; clear restores legacy network', async proxyMode => {
     const { registry, store } = await loaded({ sandbox: true, backendType: 'pty', sandboxNetwork: false });
     const spec = store.findConfigField('sandboxNetworkPolicy')!;
-    const policy = { version: 1, public: { mode: 'allow' }, private: { mode: 'block' } };
+    const policy = { version: 1, public: { mode: 'allow' }, private: { mode: 'block' }, ...(proxyMode !== undefined ? { proxyMode } : {}) };
     expect(store.coerceConfigValue(spec, JSON.stringify(policy))).toMatchObject({ ok: true, value: policy });
     expect(store.coerceConfigValue(spec, JSON.stringify({ ...policy, public: { mode: 'allowlist', rules: [{ cidr: 'example.org' }] } }))).toMatchObject({ ok: false });
     // Linux-only runtime support is a deliberate gate, not a silent no-op.

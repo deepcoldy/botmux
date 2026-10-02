@@ -26,7 +26,7 @@ describe('network policy', () => {
     expect(parseSandboxNetworkPolicy({ ...base, private: { mode: 'allowlist', rules: [{ cidr: '::ffff:10.2.3.4/104' }] } }).private.rules![0]!.cidr).toBe('10.0.0.0/8');
   });
   it.each([
-    { ...base, version: 2 }, { ...base, public: { mode: 'whitelist' } }, { ...base, proxy: 'http://proxy' },
+    { ...base, proxyMode: 'allow' }, { ...base, proxyMode: true }, { ...base, version: 2 }, { ...base, public: { mode: 'whitelist' } }, { ...base, proxy: 'http://proxy' },
     { ...base, public: { mode: 'allow', rules: [] } }, { ...base, private: { mode: 'allowlist', rules: [{ cidr: 'example.org' }] } },
     { ...base, private: { mode: 'allowlist', rules: [{ cidr: '10.0.0.0/33' }] } },
     { ...base, private: { mode: 'allowlist', rules: [{ cidr: '10.0.0.0/8', ports: [80] }] } },
@@ -97,6 +97,24 @@ describe('network policy', () => {
     expect(networkProxyError(p, { NO_PROXY: '*' })).toBeUndefined();
     expect(networkProxyError(undefined, env)).toBeUndefined();
     expect(networkProxyError(parseSandboxNetworkPolicy({ ...base, private: { mode: 'allow' } }), env)).toBeUndefined();
+  });
+  it.each(['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'])('requires explicit exit trust for %s without rewriting env or kernel rules', key => {
+    const env = { [key]: 'http://93.184.216.34:18090', NO_PROXY: '*' };
+    const original = structuredClone(env);
+    const restricted = parseSandboxNetworkPolicy(base);
+    const trusted = parseSandboxNetworkPolicy({ ...base, proxyMode: 'trusted-egress' });
+    expect(networkProxyError(restricted, env)).toBeTruthy();
+    expect(networkProxyError(trusted, env)).toBeUndefined();
+    expect(trusted.proxyMode).toBe('trusted-egress');
+    expect(compileNetworkNft(trusted)).toBe(compileNetworkNft(restricted));
+    expect(env).toEqual(original);
+    expect(networkProxyError(parseSandboxNetworkPolicy({ ...base, private: { mode: 'allow' }, proxyMode: 'reject' }), env)).toBeTruthy();
+  });
+  it('freezes explicit proxy delegation with the session workflow policy', () => {
+    const policy = parseSandboxNetworkPolicy({ ...base, proxyMode: 'trusted-egress' });
+    const snapshot = workflowSandboxInitFields({ sandbox: true, sandboxNetworkPolicy: policy });
+    policy.proxyMode = 'reject';
+    expect(snapshot.sandboxNetworkPolicy?.proxyMode).toBe('trusted-egress');
   });
   it('unknown socket syscall ABI fails closed', () => expect(() => networkSocketFilter('ia32')).toThrow());
 });
