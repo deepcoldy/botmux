@@ -104,7 +104,7 @@
 
 ## 分区目标 IP 网络策略（显式启用）
 
-`sandboxNetworkPolicy` 将公网与内网分开管理。未配置时，`sandboxNetwork` 布尔值和历史会话行为保持不变；显式策略优先于该布尔值。新策略仅适用于 **Linux x64/arm64、本地 PTY、oncall 文件沙箱**。Docker 容器还必须允许创建用户/网络/PID 命名空间及命名空间内 nftables。macOS、scratch、持久终端、远程后端、adopt 和外部 App Server 均拒绝启动，不能给已有进程补装边界。
+`sandboxNetworkPolicy` 将公网与内网分开管理。未配置时，`sandboxNetwork` 布尔值和历史会话行为保持不变；显式策略优先于该布尔值。新策略仅适用于 **Linux x64/arm64、本地 PTY、oncall 文件沙箱**。Docker 容器还必须允许创建用户/网络/PID 命名空间及命名空间内 nftables。macOS、scratch、持久终端、远程后端、adopt 和外部 App Server 均拒绝启动，不能给已有进程补装边界。**这是策略支持范围，不等于部署运行器已验收；standalone Bun + 原生 Codex 必须先通过下述新建/恢复模型回合验收，不能只因网络测试通过就迁移现有 tmux 部署。**
 
 ```json
 {
@@ -182,11 +182,27 @@ botmux sandbox-network-policy clear <appId>
 | 当前需要 | 可选择的迁移方式 | 实际结果 |
 |---|---|---|
 | 保留现有持久会话 | 暂不配置 `sandboxNetworkPolicy` | 保留旧运行方式；不能宣称已启用新边界 |
-| 现在启用客户端 IP 边界 | 配置本地 `backendType: "pty"` 与 `sandbox: true`，创建新会话 | 启动前建立 namespace/nft/link；worker 退出即终止该生命周期 |
-| PTY 必须通过部署层代理到模型服务 | 上述新会话 + 显式 `trusted-egress` + 代理实际 IP/端口规则 | 客户端出口受约束；代理后的业务目标由代理控制 |
+| 计划启用客户端 IP 边界 | 先通过目标镜像的原生 PTY 新建/恢复模型回合验收，再配置 `backendType: "pty"` 与 `sandbox: true` 并创建新会话 | 运行器验收未完成前，不能建议现有部署切 PTY；边界随后在启动前建立 |
+| 已验收的 PTY 必须经部署层代理到模型服务 | 上述验收后的新会话 + 显式 `trusted-egress` + 代理实际 IP/端口规则 | 客户端出口受约束；代理后的业务目标由代理控制 |
 | 持久会话与最终代理目标都需限制 | 等待独立的持久边界支持，并部署代理自身 ACL | 本 PR 尚不能兑现；不移除拒绝门禁 |
 
-原生 Codex CLI 可选择新 PTY 会话；这不等于已运行的 Codex tmux pane 可原地迁移。编辑 Bot 配置只作用于新会话，旧会话/fork/恢复仍使用冻结快照。CLI 自身持久化的历史恢复与 tmux 活进程恢复是两回事；启动新 CLI 恢复历史时仍须重新建立新边界。
+PTY 是当前新策略允许的后端，不代表 standalone Bun + 原生 Codex 的部署模型回合已经跑通；已有 tmux pane 也不能原地迁移。编辑 Bot 配置只作用于新会话，旧会话/fork/恢复仍使用冻结快照。CLI 自身持久化的历史恢复与 tmux 活进程恢复是两回事；启动新 CLI 恢复历史时仍须重新建立新边界。
+
+#### 部署前运行器验收（当前存在独立阻塞）
+
+迁移方报告了网络策略尚未参与的运行器失败：共享镜像中 Botmux 3.20.0 原生 Bun standalone + Codex 0.159.3，在 `sandbox: false`、`backendType: "pty"` 的新 HTTP virtual turn 中，`pty.spawn` 返回 PID 后约 15 ms 收到 `exitCode: 0 / signal: 1 (SIGHUP)`，输入尚未提交；相同参数经 Python PTY 启动 Codex 则保持存活。**这是迁移方的实跑报告，本 PR 未在同一镜像/版本组合独立复现，也没有修复或归因该运行器问题。** 短期保留原生 tmux，不以关闭网络策略或放宽权限冒充 PTY 兼容修复。
+
+另一个独立报告是 HTTP virtual/noTransport tmux 在无 server 时产生 `probe: unknown` 而被原生门禁拒绝。当前代码可验证：`worker.ts` 的 policy-off 迁移分支对 `noTransportSession && tmux` 生效，`unknown` 经状态机拒绝，不能当作已证明缺失而跳过；普通 transport-enabled、策略关闭且无旧 provenance 的会话不受这条 noTransport 分支约束（其它显式隔离或旧 provenance 仍可能触发门禁）。这不是新网络策略导致的失败，也不能推广为全部 tmux 会话不可用；本 PR 不绕过原门禁。
+
+现有网络 CI 的 PTY 用例用普通运行时管理真实 PTY，standalone 用例另行验证网络 runner 自重执行；两者组合不等于 standalone worker 的 Codex 回合测试。`test/pty-native-smoke.test.ts` / `src/cli/pty-smoke.ts` 还刻意不构建 `tty.ReadStream` 包装，不能代替生产 `PtyBackend` 的存活及提交验收。本 PR 的本地/内核绿不能解除上述部署阻塞。
+
+启用网络策略前，目标镜像必须完成以下前置验收并保存结果：
+
+1. 固定镜像及 Botmux/Bun/Codex 实际版本，使用原生 standalone worker 和生产 `PtyBackend`，不以 Python PTY、自定义 runtime 或绕过 ReadStream 的 helper 代替。先在 `sandbox: false` 下验证原生运行器，再在 oncall + 网络策略下验证。
+2. 新建会话须保持存活直到 prompt ready，实际提交输入并得到完整模型回合及可回读结果；记录 PID、ready/submit/response 时间及退出 code/signal。spawn 返回 PID、短暂存活或退出 0 均不构成成功。
+3. 恢复已保存的 Codex 历史，由新 worker/CLI 建立新 PTY 并完成下一模型回合；验证恢复身份、提交与结果回读。PTY 不承诺活进程跨 worker 重启存活，不把它写成 tmux reattach。
+4. HTTP virtual/noTransport 与正常 transport 形状分别用隔离测试装配验收；IM 发送调用用测试替身拒绝并计数为 0，不发真实消息。模型可先使用协议兼容的本地 fixture，但须标明 fixture 与实际模型验收的区别；DNS、部署层代理及最终目标 ACL 应另行验证。
+5. 单独验证 tmux 无 server/探测 unknown 的失败与已有 server 的路径，保留 tri-state 门禁语义；不得通过把 unknown 强制当 missing 或改成虚假 transport-enabled 来消除阻塞。未通过时继续保留原 tmux 部署，将运行器和 noTransport 问题作为独立修复需求。
 
 后续持久后端需求应独立实现并验收：在启动 shell/CLI 前建立边界；为每代 pane/真实 CLI PID 绑定不可由任务改写的策略摘要、namespace 身份与监督器代际；daemon/worker 重启后核验这些证据及实际存活状态，缺失或不符时拒绝附着；由独立监督器管理 namespace/nft/link 的持久生命周期，转发器死亡必须终止关联任务；清理、pane 替换、并发恢复与 adopt 均不能复用过期证明。验收需真实 tmux、新建/重附着、worker/daemon 重启、转发器死亡、篡改/旧证明、跨会话与 IPv4/IPv6 回归，不能以存储字段或 session 名称代替边界证明。
 
