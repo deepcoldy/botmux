@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import WebSocket from 'ws';
 import { spawnTsScript } from './helpers/ts-runner.js';
 import type { DaemonToWorker, WorkerToDaemon } from '../src/types.js';
 
@@ -23,6 +24,31 @@ async function waitFor(predicate: () => boolean, describeFailure: () => string):
     await new Promise<void>(resolveDelay => setTimeout(resolveDelay, 50));
   }
   throw new Error(describeFailure());
+}
+
+async function readTerminalSeed(port: number, viewToken: string): Promise<string> {
+  return await new Promise<string>((resolvePromise, rejectPromise) => {
+    const frames: string[] = [];
+    const socket = new WebSocket(
+      `ws://127.0.0.1:${port}/?viewToken=${encodeURIComponent(viewToken)}`,
+    );
+    const timer = setTimeout(() => {
+      socket.close();
+      rejectPromise(new Error(`remote runner terminal seed timed out: ${frames.join('')}`));
+    }, 5_000);
+    socket.on('message', data => {
+      frames.push(String(data));
+      if (frames.join('').includes('REMOTE_TMUX_SCREEN_NEW')) {
+        clearTimeout(timer);
+        socket.close();
+        resolvePromise(frames.join(''));
+      }
+    });
+    socket.on('error', error => {
+      clearTimeout(timer);
+      rejectPromise(error);
+    });
+  });
 }
 
 describe('remote runner worker wiring', () => {
@@ -57,7 +83,8 @@ input.on('line', line => {
     const state = { version: 1, provider: 'test-provider', generation: 1, remoteSessionId: 'remote-1', agentThreadId: 'thread-1' };
     emit({ type: 'status', requestId: command.requestId, status: 'busy', state });
     emit({ type: 'lineage_changed', state });
-    emit({ type: 'terminal_screen', generation: 1, sequence: 0, cols: 120, rows: 40, snapshot: 'REMOTE_TMUX_SCREEN' });
+    emit({ type: 'terminal_screen', generation: 1, sequence: 0, cols: 120, rows: 40, snapshot: 'REMOTE_TMUX_SCREEN_OLD' });
+    setTimeout(() => emit({ type: 'terminal_screen', generation: 1, sequence: 1, cols: 120, rows: 40, snapshot: 'REMOTE_TMUX_SCREEN_NEW' }), 100);
     // The worker publishes screen cards on a 2s cadence. Keep the synthetic
     // turn alive beyond one full cadence so both Vitest and Bun observe the
     // screen_update before the structured final retires the turn.
@@ -176,6 +203,14 @@ input.on('line', line => {
       }),
     ]));
     expect(messages.some(message => message.type === 'error')).toBe(false);
+    const ready = messages.find(message => message.type === 'ready');
+    expect(ready?.type).toBe('ready');
+    if (!ready || ready.type !== 'ready' || !ready.port || !ready.viewToken) {
+      throw new Error(`remote runner worker did not publish a Web Terminal: ${JSON.stringify(messages)}`);
+    }
+    const seed = await readTerminalSeed(ready.port, ready.viewToken);
+    expect(seed).toContain('REMOTE_TMUX_SCREEN_NEW');
+    expect(seed).not.toContain('REMOTE_TMUX_SCREEN_OLD');
     expect(existsSync(dump)).toBe(true);
     expect(JSON.parse(readFileSync(startDump, 'utf8'))).toMatchObject({
       type: 'start',

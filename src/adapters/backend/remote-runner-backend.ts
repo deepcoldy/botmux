@@ -78,6 +78,7 @@ export class RemoteRunnerBackend implements SessionBackend {
   private settleTurn: (() => void) | null = null;
   private readonly pendingRequests = new Map<string, PendingRequest>();
   private dataCb: ((data: string) => void) | null = null;
+  private screenResyncCb: ((snapshot: string) => void) | null = null;
   private exitCb: ((code: number | null, signal: string | null) => void) | null = null;
   private taskDoneCb: (() => void) | null = null;
   private turnFinalCb: ((text: string, turnId?: string) => void) | null = null;
@@ -226,6 +227,14 @@ export class RemoteRunnerBackend implements SessionBackend {
   }
 
   onData(cb: (data: string) => void): void { this.dataCb = cb; }
+  onScreenResync(cb: (snapshot: string) => void): void {
+    this.screenResyncCb = cb;
+    if (this.terminalSnapshot) {
+      queueMicrotask(() => {
+        if (this.screenResyncCb === cb) cb(this.terminalSnapshot);
+      });
+    }
+  }
   onExit(cb: (code: number | null, signal: string | null) => void): void { this.exitCb = cb; }
   onTaskDone(cb: () => void): void { this.taskDoneCb = cb; }
   onTurnFinal(cb: (text: string, turnId?: string) => void): void { this.turnFinalCb = cb; }
@@ -436,10 +445,17 @@ export class RemoteRunnerBackend implements SessionBackend {
       const snapshot = event.snapshot
         .replace(/\r\n/g, '\n')
         .replace(/\r/g, '\n')
+        .replace(/\n$/, '')
         .replace(/\n/g, '\r\n');
       this.terminalSnapshot = snapshot;
       this.outputBuffer = snapshot;
-      this.dataCb?.(`\u001b[2J\u001b[H${snapshot}`);
+      // terminal_screen is an authoritative full viewport, not another PTY
+      // byte delta.  Appending successive screens to onData makes the worker's
+      // replay buffer retain one stale TUI frame per poll; after a refresh,
+      // scrolling then reveals a stack of duplicated full-screen UIs.  Route
+      // it through the SessionBackend snapshot/rebase channel instead.  Plain
+      // progress events remain incremental onData output.
+      this.screenResyncCb?.(snapshot);
       return;
     }
     if (event.type === 'progress') {

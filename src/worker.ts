@@ -8676,6 +8676,24 @@ function relayHerdrWebSnapshot(snapshot: string): void {
   }
 }
 
+/** Replace, rather than append, one Remote Runner full-screen snapshot.
+ *
+ * Remote Runner providers publish the complete current viewport.  Replaying
+ * those frames through onPtyData would retain one mostly-overlapping TUI screen
+ * per poll in `scrollback`; a page refresh would faithfully replay that bogus
+ * history and scrolling would expose duplicated UI frames.  Reuse the existing
+ * snapshot-aware browser control frame so every connected xterm resets to one
+ * bounded viewport.  This is O(cols * rows) and independent of session age.
+ */
+function relayRemoteRunnerWebSnapshot(snapshot: string): void {
+  const frame = mergeHerdrWebSnapshot(null, snapshot, null, MAX_SCROLLBACK).state;
+  scrollback = renderHerdrWebHistory(frame);
+  const payload = `\x1b]1989;history;0\x07${scrollback}`;
+  for (const ws of wsClients) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(payload);
+  }
+}
+
 function applyHerdrWebBindingResult(
   ws: WebSocket,
   result: ReturnType<HerdrWebTerminalBinding['resize']>,
@@ -18197,6 +18215,9 @@ async function spawnCli(
   backend.onScreenResync?.((snapshot) => {
     if (observedBackend !== backend) return;
     log(`${effectiveBackendType} observer recovered — rebasing screen state from history`);
+    if (effectiveBackendType === 'remote-runner') {
+      relayRemoteRunnerWebSnapshot(snapshot);
+    }
     scheduleBackendScreenResync(snapshot, `${effectiveBackendType} observer recovery`);
   });
   backend.onAccessUrl?.((url) => {
