@@ -1241,7 +1241,7 @@ humanGate：
 
 export const ASK_SKILL = `---
 name: botmux-ask
-description: 在当前飞书/Lark 话题里向用户发起阻塞式选择题并等待回答。触发场景：你需要用户在多个明确选项中做选择、确认风险动作、决定继续/回滚/中止，且后续命令需要拿到机器可解析的答案。使用 botmux ask buttons，stdout 只返回选中的 key，适合 shell 脚本和 CLI agent 继续执行。
+description: 在当前飞书/Lark 话题里向用户发起阻塞式选择题并等待回答。触发场景：你需要用户在多个明确选项中做选择、确认风险动作、决定继续/回滚/中止，且后续命令需要拿到机器可解析的答案。使用 botmux ask buttons，单题返回选中的 key，多题可用 --questions-file 返回 JSON；支持推荐项预选与整卡提交。
 ---
 
 # botmux-ask — 阻塞式向用户提问
@@ -1259,8 +1259,21 @@ description: 在当前飞书/Lark 话题里向用户发起阻塞式选择题并�
 ## 不要用
 
 - 只是给用户汇报进展：用 \`botmux send\`
-- 需要自由文本长回答：v0.1.7 不支持，先用 \`botmux send\` 问用户
+- 无法提供有意义选项的长篇开放问题：直接向用户提问；选择卡也支持话题文字答复，用 JSON 的 comment 读取
 - workflow 节点审批：workflow 已经有 humanGate / decision，不要套两层 ask
+
+## 多题与推荐项预选
+
+需求澄清时把当前可独立回答的问题放进同一张卡，用户换选后点底部“提交”。将 JSON 数组保存到绝对路径，再运行 \`botmux ask buttons --questions-file /absolute/round.json --json --timeout 3600\`；文件模式总是返回 JSON，与 \`--options\`、\`--multi\` 和位置问题文本互斥。
+
+\`\`\`json
+[
+  {"prompt":"先覆盖哪些入口？","multiSelect":false,"options":[{"key":"editor","label":"当前编辑页（推荐）"},{"key":"all","label":"所有入口"}],"defaultSelectedKeys":["editor"]},
+  {"prompt":"验证哪些状态？","multiSelect":true,"options":[{"key":"pending","label":"待确认（推荐）"},{"key":"done","label":"已确认（推荐）"}],"defaultSelectedKeys":["pending","done"]}
+]
+\`\`\`
+
+每题的 \`defaultSelectedKeys\` 必须来自选项，单选最多一项；空数组表示无预选，也保留提交按钮。默认选择不是用户回答，必须等真人提交；超时或失效不能当作接受推荐。\`answers[i]\` 对应第 i 题。若用户文字回复，读取 \`comment\`，不得把未提交的推荐项混入答案。CLI 与 daemon 需同时升级才支持此功能。
 
 ## Canonical 用法
 
