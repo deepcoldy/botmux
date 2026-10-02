@@ -188,6 +188,10 @@ botmux sandbox-network-policy clear <appId>
 
 PTY 是当前新策略允许的后端，不代表 standalone Bun + 原生 Codex 的部署模型回合已经跑通；已有 tmux pane 也不能原地迁移。编辑 Bot 配置只作用于新会话，旧会话/fork/恢复仍使用冻结快照。CLI 自身持久化的历史恢复与 tmux 活进程恢复是两回事；启动新 CLI 恢复历史时仍须重新建立新边界。
 
+旧 Codex 会话还需单独验收实际工具目录。当前 `src/adapters/cli/codex.ts` 为新建会话传 `-C workingDir`，resume/fork 则复用不含 `-C` 的基础参数，可能继续使用 Codex 自己保存的原 cwd。只更新 BotConfig 或冻结 Session 的 `workingDir`，不能证明模型工具根目录已迁移。网络目标过滤本身不验证 cwd；与 oncall 文件边界、工作区根及工具上下文组合时，必须核对它们是否一致。
+
+迁移方报告曾以 Codex 0.159.3 原生 app-server `thread/resume` 的 `cwd` 参数完成一次性目录迁移：9 条旧 cwd 记录保留 transcript 前缀、模型、审批及 sandbox 参数，同一 Codex ID 冷恢复后的实际 Python 工具验证了新 cwd。这是外部实跑证据，本分支未执行该迁移，也不据此保证其它版本行为；本 PR 不修复 adapter、不自动改写 Codex 历史或在线部署。
+
 #### 部署前运行器验收（当前存在独立阻塞）
 
 迁移方报告了网络策略尚未参与的运行器失败：共享镜像中 Botmux 3.20.0 原生 Bun standalone + Codex 0.159.3，在 `sandbox: false`、`backendType: "pty"` 的新 HTTP virtual turn 中，`pty.spawn` 返回 PID 后约 15 ms 收到 `exitCode: 0 / signal: 1 (SIGHUP)`，输入尚未提交；相同参数经 Python PTY 启动 Codex 则保持存活。**这是迁移方的实跑报告，本 PR 未在同一镜像/版本组合独立复现，也没有修复或归因该运行器问题。** 短期保留原生 tmux，不以关闭网络策略或放宽权限冒充 PTY 兼容修复。
@@ -200,7 +204,7 @@ PTY 是当前新策略允许的后端，不代表 standalone Bun + 原生 Codex 
 
 1. 固定镜像及 Botmux/Bun/Codex 实际版本，使用原生 standalone worker 和生产 `PtyBackend`，不以 Python PTY、自定义 runtime 或绕过 ReadStream 的 helper 代替。先在 `sandbox: false` 下验证原生运行器，再在 oncall + 网络策略下验证。
 2. 新建会话须保持存活直到 prompt ready，实际提交输入并得到完整模型回合及可回读结果；记录 PID、ready/submit/response 时间及退出 code/signal。spawn 返回 PID、短暂存活或退出 0 均不构成成功。
-3. 恢复已保存的 Codex 历史，由新 worker/CLI 建立新 PTY 并完成下一模型回合；验证恢复身份、提交与结果回读。PTY 不承诺活进程跨 worker 重启存活，不把它写成 tmux reattach。
+3. 恢复已保存的 Codex 历史，由新 worker/CLI 建立新 PTY 并完成下一模型回合；验证恢复身份、提交与结果回读。要求模型实际工具在未先执行 `cd`、未覆盖工具 cwd 的情况下回读 `pwd` 或 Python `os.getcwd()`，保存工具执行结果，按规范化路径核对预期工作根、Session 快照及文件策略根；不能只检查 Botmux JSON、模型文字回答或提示词。目录迁移还须确认原 Codex ID、transcript 前缀、模型/审批/sandbox 参数保持预期；cwd 不符时验收失败，目录修复作为独立迁移处理。PTY 不承诺活进程跨 worker 重启存活，不把它写成 tmux reattach。
 4. HTTP virtual/noTransport 与正常 transport 形状分别用隔离测试装配验收；IM 发送调用用测试替身拒绝并计数为 0，不发真实消息。模型可先使用协议兼容的本地 fixture，但须标明 fixture 与实际模型验收的区别；DNS、部署层代理及最终目标 ACL 应另行验证。
 5. 单独验证 tmux 无 server/探测 unknown 的失败与已有 server 的路径，保留 tri-state 门禁语义；不得通过把 unknown 强制当 missing 或改成虚假 transport-enabled 来消除阻塞。未通过时继续保留原 tmux 部署，将运行器和 noTransport 问题作为独立修复需求。
 
