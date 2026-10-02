@@ -59,6 +59,70 @@ export function isTmuxServerLevelErrorText(stderrText: string): boolean {
 }
 
 /**
+ * True when the connection failure is specifically "the socket file does not
+ * exist" (ENOENT on connect). This is still a server-level error (see
+ * {@link isTmuxServerLevelErrorText}) — on its own it cannot tell "no server at
+ * all" from "a live server whose socket was cleaned from /tmp" — but it is the
+ * ONLY shape a cold machine produces: a reboot wipes /tmp (macOS /private/tmp,
+ * Linux tmpfs / boot-time tmpfiles), so before anything has started a server
+ * every probe reads exactly this. A server that merely exited leaves its socket
+ * file behind and reads "no server running" instead.
+ */
+export function isTmuxSocketMissingErrorText(stderrText: string): boolean {
+  return /error connecting to .*\(No such file or directory\)/i.test(stderrText);
+}
+
+/**
+ * Evidence that NO tmux process (server or client) of the current user is
+ * visible. Used ONLY by {@link TmuxBackend.serverAbsentOnColdMachine} to break the
+ * read-isolation cold-start tie; it is a heuristic (a renamed tmux binary or a
+ * server in another PID namespace is invisible to it), so it must never feed
+ * the general probeSession that kill-verify / close / wake paths consume.
+ *
+ * Deliberately coarse and fail-closed:
+ *   - matches ANY tmux process of this uid (any socket, client or server), so a
+ *     live server whose socket was deleted is never missed, whatever its argv
+ *     or proctitle looks like on this platform;
+ *   - returns false (⇒ caller stays 'unknown') whenever `ps` fails, times out,
+ *     prints nothing parseable, or the uid is unavailable.
+ * A concurrent sibling probe's short-lived client can make this false — that
+ * only keeps today's 'unknown', the safe direction.
+ */
+export function noTmuxProcessForCurrentUser(): boolean {
+  // Both real and effective uid: a setuid launcher must not let a server owned
+  // by the other one slip past the comparison.
+  const uids = new Set<number>();
+  if (typeof process.getuid === 'function') uids.add(process.getuid());
+  if (typeof process.geteuid === 'function') uids.add(process.geteuid());
+  if (uids.size === 0) return false;
+  let out: string;
+  try {
+    out = execFileSync('ps', ['-A', '-o', 'uid=,comm='], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 3000,
+    });
+  } catch {
+    return false;
+  }
+  if (typeof out !== 'string') return false;
+  let rows = 0;
+  for (const line of out.split('\n')) {
+    const m = /^\s*(\d+)\s+(.+?)\s*$/.exec(line);
+    if (!m) continue;
+    rows++;
+    if (!uids.has(Number(m[1]))) continue;
+    // Prefix, not equality: on Linux tmux renames its threads via
+    // prctl(PR_SET_NAME) ("tmux: server", "tmux: client"); macOS keeps "tmux"
+    // (or the full path). Over-matching only keeps 'unknown'.
+    if (basename(m[2]!).startsWith('tmux')) return false;
+  }
+  // `ps -A` always lists at least this process itself; zero parseable rows
+  // means the output format is not what we expect — no evidence either way.
+  return rows > 0;
+}
+
+/**
  * True when a thrown exec*Sync error represents the caller's own `timeout`
  * deadline firing — regardless of the exit-status shape Node attached.
  *
@@ -207,6 +271,36 @@ export class TmuxBackend implements SessionBackend {
       }
       return 'unknown';
     }
+  }
+
+  /**
+   * Cold-machine check for the read-isolation pre-spawn gate ONLY (see
+   * resolveReadIsolationPaneProbe). True when the default server's socket file
+   * does not exist ("error connecting to <socket> (No such file or directory)")
+   * AND no tmux process of this user is visible — the state a reboot leaves
+   * (/tmp wiped) before anything has started a server.
+   *
+   * A server that merely exited leaves its socket behind and reads "no server
+   * running" ⇒ probeSession already answers 'missing'. Anything else — a live
+   * reply, timeout, spawn failure, ECONNREFUSED, lost server, any visible tmux
+   * process, a failing `ps` — is false (stay inconclusive).
+   */
+  static serverAbsentOnColdMachine(): boolean {
+    try {
+      execFileSync('tmux', ['list-sessions'], {
+        stdio: ['ignore', 'ignore', 'pipe'],
+        env: tmuxEnv(),
+        timeout: 3000,
+      });
+      return false;
+    } catch (e: any) {
+      if (isExecTimeoutError(e)) return false;
+      if (!e || typeof e.status !== 'number' || e.signal) return false;
+      const stderrText = (e.stderr?.toString?.() ?? '').trim();
+      if (!isTmuxSocketMissingErrorText(stderrText)) return false;
+    }
+    // ps AFTER tmux: a server started in between has a visible process.
+    return noTmuxProcessForCurrentUser();
   }
 
   /** Kill a named tmux session (no-op if it doesn't exist). */

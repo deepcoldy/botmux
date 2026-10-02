@@ -36,6 +36,7 @@ import {
   isolatedPaneOriginChannel,
   isolatedPaneReattachSafe,
   evaluatePersistentPaneMigration,
+  resolveReadIsolationPaneProbe,
   executePersistentPaneMigration,
   type PersistentPaneMigrationEffects,
   persistentTeardownKillKind,
@@ -15021,8 +15022,20 @@ async function spawnCli(
     // (paneProbe) into the state machine, which fail-closes on `unknown` for EVERY
     // backend (refuse-inconclusive-probe) — no longer only ZMX, and no longer
     // collapsed into "dead" (which would clear a still-confined pane's provenance).
-    const paneProbe = zmxOwnedProbe?.probe
+    const rawPaneProbe = zmxOwnedProbe?.probe
       ?? (persistentTarget ? probePersistentBackendTarget(persistentTarget) : 'missing');
+    // Cold machine (reboot wiped the tmux socket, no tmux process visible): the
+    // pane provably died with the box — let the gate cold-spawn instead of
+    // refusing forever. Scoped to this gate only; see resolveReadIsolationPaneProbe.
+    const resolvedPaneProbe = resolveReadIsolationPaneProbe(
+      rawPaneProbe,
+      effectiveBackendType,
+      () => TmuxBackend.serverAbsentOnColdMachine(),
+    );
+    const paneProbe = resolvedPaneProbe.probe;
+    if (resolvedPaneProbe.coldServerAbsent) {
+      log(`[read-isolation] tmux socket missing and no tmux process visible (cold machine) — treating pane of ${cfg.sessionId} as gone`);
+    }
     if (
       effectiveBackendType === 'zmx'
       && resolvedZmxSessionProbe !== 'exists'
