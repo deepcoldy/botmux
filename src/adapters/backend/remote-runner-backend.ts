@@ -29,6 +29,7 @@ import {
 import type { RemoteRunnerConfig } from './remote-runner-config.js';
 
 type PendingRequest = {
+  command: RemoteRunnerCommand;
   accept: (event: RemoteRunnerEvent) => boolean;
   resolve: (event: RemoteRunnerEvent) => void;
   reject: (error: Error) => void;
@@ -58,7 +59,7 @@ export class RemoteRunnerBackend implements SessionBackend {
   private outputBuffer = '';
   private stderrBytes = 0;
   private provider: string | null = null;
-  private readonly providerCapabilities = new Set<RemoteRunnerCapability>();
+  private readonly providerCapabilities = new Set<string>();
   private state: RemoteRunnerBackendState | undefined;
   private terminalSnapshot = '';
   private terminalGeneration = -1;
@@ -72,6 +73,8 @@ export class RemoteRunnerBackend implements SessionBackend {
   private closePrepared = false;
   private closeOutcomeUncertain = false;
   private shutdownDetaching = false;
+  private shutdownDetachRemoteFencePossible = false;
+  private activeTurnRequestId: string | null = null;
   private exitEmitted = false;
   private startupPromise: Promise<void> | null = null;
   private turnSettled: Promise<void> = Promise.resolve();
@@ -187,16 +190,35 @@ export class RemoteRunnerBackend implements SessionBackend {
     }
     this.activeTurnId = input.turnId;
     this.turnSettled = new Promise<void>(resolve => { this.settleTurn = resolve; });
+    const requestId = this.requestId('turn');
+    this.activeTurnRequestId = requestId;
     try {
-      const requestId = this.requestId('turn');
-      await this.request(remoteRunnerCommand('turn', {
+      const acknowledgement = await this.request(remoteRunnerCommand('turn', {
         requestId,
         turnId: input.turnId,
         content: input.content,
         ...(input.trustedCaller ? { trustedCaller: input.trustedCaller } : {}),
       }), event => event.type === 'status' && event.status === 'busy', this.operationTimeoutMs);
+      if (this.activeTurnRequestId === requestId) this.activeTurnRequestId = null;
+      if (acknowledgement.type === 'failure') {
+        const failure: BackendTurnFailure = {
+          turnId: acknowledgement.turnId ?? input.turnId,
+          code: acknowledgement.code,
+          message: acknowledgement.message,
+          status: acknowledgement.status,
+          retryable: acknowledgement.retryable,
+        };
+        // Let submitTurn resolve first so the worker records the accepted
+        // delivery before the terminal callback closes the same logical turn.
+        setImmediate(() => {
+          if (!this.killed && this.activeTurnId === failure.turnId) {
+            this.emitTurnFailure(failure);
+          }
+        });
+      }
       return { submitted: true };
     } catch (error) {
+      if (this.activeTurnRequestId === requestId) this.activeTurnRequestId = null;
       const reason = error instanceof Error ? error.message : String(error);
       // Once the command entered the provider pipe, a missing ACK cannot prove
       // that execution did not start. Retire this provider generation and emit
@@ -309,7 +331,20 @@ export class RemoteRunnerBackend implements SessionBackend {
     try {
       if (!this.startupPromise) throw new Error('remote runner has not spawned');
       await this.startupPromise;
+      if (!this.providerCapabilities.has('detach')
+          || !this.providerCapabilities.has('reattach')) {
+        this.shutdownDetaching = false;
+        return {
+          ok: false,
+          taskId: null,
+          error: 'remote runner does not support transactional detach',
+        };
+      }
       await this.withTimeout(this.turnSettled, this.operationTimeoutMs, 'active turn did not settle before detach');
+      // From this point a transport failure cannot prove whether the provider
+      // installed its detach fence. abortShutdownDetach must positively
+      // reattach before local admission can be restored.
+      this.shutdownDetachRemoteFencePossible = true;
       const event = await this.request(
         remoteRunnerCommand('detach', { requestId: this.requestId('detach') }),
         candidate => candidate.type === 'status' && candidate.status === 'detached',
@@ -330,12 +365,36 @@ export class RemoteRunnerBackend implements SessionBackend {
     }
   }
 
-  abortShutdownDetach(): SessionShutdownDetachResult {
+  async abortShutdownDetach(): Promise<SessionShutdownDetachResult> {
     if (!this.child || this.killed) {
       return { ok: false, taskId: null, error: 'provider process is unavailable' };
     }
-    this.shutdownDetaching = false;
-    return { ok: true, taskId: null };
+    if (!this.shutdownDetachRemoteFencePossible) {
+      this.shutdownDetaching = false;
+      return { ok: true, taskId: null };
+    }
+    try {
+      const event = await this.request(
+        remoteRunnerCommand('reattach', { requestId: this.requestId('reattach') }),
+        candidate => candidate.type === 'status' && candidate.status === 'ready',
+        this.operationTimeoutMs,
+      );
+      if (event.type !== 'status' || event.status !== 'ready') {
+        throw new Error('provider did not confirm reattach');
+      }
+      if (event.state && !this.applyState(event.state)) {
+        throw new Error('provider returned invalid state while reattaching');
+      }
+      this.shutdownDetachRemoteFencePossible = false;
+      this.shutdownDetaching = false;
+      return { ok: true, taskId: null };
+    } catch (error) {
+      return {
+        ok: false,
+        taskId: null,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
   }
 
   commitShutdownDetach(): void { this.kill(); }
@@ -480,16 +539,43 @@ export class RemoteRunnerBackend implements SessionBackend {
       this.taskDoneCb?.();
       return;
     }
-    if (event.type === 'failure' && event.turnId) {
-      if (!this.acceptActiveTurn(event.turnId)) return;
-      this.emitTurnFailure({
-        turnId: event.turnId,
-        code: event.code,
-        message: event.message,
-        status: event.status,
-        retryable: event.retryable,
-      });
-      return;
+    if (event.type === 'failure') {
+      // A provider may reject a turn before its status:busy ACK. Correlate that
+      // definitive terminal through requestId (or the sole active turn request)
+      // so submitTurn does not time out and misclassify it as dirty_unknown.
+      const pendingTurnRequestId = event.requestId
+        ?? (event.turnId ? this.activeTurnRequestId : null)
+        ?? undefined;
+      const pending = pendingTurnRequestId
+        ? this.pendingRequests.get(pendingTurnRequestId)
+        : undefined;
+      if (pending?.command.type === 'turn') {
+        const turnId = pending.command.turnId;
+        if ((event.turnId && event.turnId !== turnId) || !this.acceptActiveTurn(turnId)) {
+          this.failProtocol('remote runner emitted a failure with mismatched turn acknowledgement');
+          return;
+        }
+        clearTimeout(pending.timer);
+        this.pendingRequests.delete(pendingTurnRequestId!);
+        this.activeTurnRequestId = null;
+        pending.resolve(event);
+        return;
+      }
+      if (event.turnId) {
+        if (event.requestId) {
+          this.failProtocol('remote runner emitted a turn failure for an unrelated request');
+          return;
+        }
+        if (!this.acceptActiveTurn(event.turnId)) return;
+        this.emitTurnFailure({
+          turnId: event.turnId,
+          code: event.code,
+          message: event.message,
+          status: event.status,
+          retryable: event.retryable,
+        });
+        return;
+      }
     }
 
     const id = 'requestId' in event ? event.requestId : undefined;
@@ -504,6 +590,9 @@ export class RemoteRunnerBackend implements SessionBackend {
     }
     clearTimeout(pending.timer);
     this.pendingRequests.delete(id);
+    if (pending.command.type === 'turn' && this.activeTurnRequestId === id) {
+      this.activeTurnRequestId = null;
+    }
     if (event.type === 'failure') pending.reject(new Error(`${event.code}: ${event.message}`));
     else pending.resolve(event);
   }
@@ -571,7 +660,7 @@ export class RemoteRunnerBackend implements SessionBackend {
         reject(new Error(`remote runner ${command.type} timed out`));
       }, timeoutMs);
       timer.unref?.();
-      this.pendingRequests.set(command.requestId, { accept, resolve, reject, timer });
+      this.pendingRequests.set(command.requestId, { command, accept, resolve, reject, timer });
       void this.send(command).catch(error => {
         const pending = this.pendingRequests.get(command.requestId);
         if (!pending) return;

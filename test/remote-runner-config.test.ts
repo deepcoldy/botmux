@@ -8,12 +8,12 @@ describe('remote runner config surface', () => {
   it('normalizes protocol expectations without accepting provider-specific data', () => {
     expect(normalizeRemoteRunnerConfig({
       expectedProvider: 'example-provider',
-      requiredCapabilities: ['start', 'resume', 'turn', 'cancel'],
+      requiredCapabilities: ['start', 'resume', 'turn', 'cancel', 'reattach'],
       handshakeTimeoutMs: 2_000,
       operationTimeoutMs: 5_000,
     })).toEqual({
       expectedProvider: 'example-provider',
-      requiredCapabilities: ['start', 'resume', 'turn', 'cancel'],
+      requiredCapabilities: ['start', 'resume', 'turn', 'cancel', 'reattach'],
       handshakeTimeoutMs: 2_000,
       operationTimeoutMs: 5_000,
     });

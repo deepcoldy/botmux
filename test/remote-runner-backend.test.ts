@@ -1,5 +1,5 @@
 import { resolve } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { RemoteRunnerBackend } from '../src/adapters/backend/remote-runner-backend.js';
 import type {
   RemoteRunnerBackendState,
@@ -8,6 +8,8 @@ import type {
 
 const referenceRunner = resolve('examples/remote-runner/reference-runner.mjs');
 const stalledCloseRunner = resolve('test/fixtures/remote-runner-stalled-close.mjs');
+const stalledReattachRunner = resolve('test/fixtures/remote-runner-stalled-reattach.mjs');
+const preAckFailureRunner = resolve('test/fixtures/remote-runner-pre-ack-failure.mjs');
 const children: RemoteRunnerBackend[] = [];
 
 function createBackend(initialState?: RemoteRunnerBackendState): RemoteRunnerBackend {
@@ -157,6 +159,59 @@ describe('RemoteRunnerBackend', () => {
     backend.commitShutdownDetach();
   });
 
+  it('reattaches the provider before restoring admission after an aborted detach', async () => {
+    const backend = createBackend();
+    const ready = once<void>(cb => backend.onReady(cb));
+    spawnBackend(backend);
+    await ready;
+
+    await expect(backend.prepareShutdownDetach()).resolves.toMatchObject({ ok: true });
+    await expect(backend.abortShutdownDetach()).resolves.toEqual({ ok: true, taskId: null });
+
+    const final = once<{ text: string }>(cb => backend.onTurnFinal(text => cb({ text })));
+    await expect(backend.submitTurn({ turnId: 'turn-after-abort', content: 'still live' }))
+      .resolves.toEqual({ submitted: true });
+    await expect(final).resolves.toEqual({ text: 'still live' });
+  });
+
+  it('refuses transactional detach before touching a provider without reattach', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'stalled-close',
+      requiredCapabilities: ['start', 'resume', 'turn', 'cancel', 'detach', 'status'],
+      operationTimeoutMs: 100,
+    }, 'session-no-reattach');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    spawnBackend(backend, stalledCloseRunner);
+    await ready;
+
+    await expect(backend.prepareShutdownDetach()).resolves.toEqual({
+      ok: false,
+      taskId: null,
+      error: 'remote runner does not support transactional detach',
+    });
+    await expect(backend.abortShutdownDetach()).resolves.toEqual({ ok: true, taskId: null });
+  });
+
+  it('keeps admission fenced when provider reattach is not acknowledged', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'stalled-reattach',
+      operationTimeoutMs: 100,
+    }, 'session-stalled-reattach');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    spawnBackend(backend, stalledReattachRunner);
+    await ready;
+
+    await expect(backend.prepareShutdownDetach()).resolves.toMatchObject({ ok: true });
+    await expect(backend.abortShutdownDetach()).resolves.toMatchObject({
+      ok: false,
+      error: expect.stringContaining('reattach timed out'),
+    });
+    await expect(backend.submitTurn({ turnId: 'turn-must-stay-fenced', content: 'blocked' }))
+      .resolves.toMatchObject({ submitted: false, submissionDisposition: 'untouched' });
+  });
+
   it('fails closed when persisted state belongs to another provider', () => {
     expect(() => new RemoteRunnerBackend({ expectedProvider: 'reference' }, 'session-1', {
       version: 1,
@@ -168,6 +223,7 @@ describe('RemoteRunnerBackend', () => {
   it('keeps admission fenced when cancellation has no confirmed outcome', async () => {
     const backend = new RemoteRunnerBackend({
       expectedProvider: 'stalled-close',
+      requiredCapabilities: ['start', 'resume', 'turn', 'cancel', 'detach', 'status'],
       operationTimeoutMs: 100,
     }, 'session-stalled');
     children.push(backend);
@@ -194,6 +250,7 @@ describe('RemoteRunnerBackend', () => {
   it('classifies a missing turn ACK as ambiguous and retires the provider', async () => {
     const backend = new RemoteRunnerBackend({
       expectedProvider: 'stalled-close',
+      requiredCapabilities: ['start', 'resume', 'turn', 'cancel', 'detach', 'status'],
       operationTimeoutMs: 100,
     }, 'session-stalled-turn');
     children.push(backend);
@@ -215,5 +272,37 @@ describe('RemoteRunnerBackend', () => {
       turnId: 'turn-stalled',
       status: 'ambiguous',
     });
+  });
+
+  it('correlates a provider failure before the busy ACK and keeps the generation usable', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'pre-ack-failure',
+      operationTimeoutMs: 100,
+    }, 'session-pre-ack-failure');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const failures: Array<{ turnId: string; code: string; status: string }> = [];
+    const order: string[] = [];
+    backend.onTurnFailure(failure => {
+      failures.push(failure);
+      order.push('failure');
+    });
+    spawnBackend(backend, preAckFailureRunner);
+    await ready;
+
+    await expect(backend.submitTurn({ turnId: 'turn-rejected', content: 'reject me' }))
+      .resolves.toEqual({ submitted: true });
+    order.push('submitted');
+    await vi.waitFor(() => expect(failures).toEqual([expect.objectContaining({
+      turnId: 'turn-rejected',
+      code: 'provider_rejected',
+      status: 'failed',
+    })]));
+    expect(order).toEqual(['submitted', 'failure']);
+
+    const final = once<{ text: string }>(cb => backend.onTurnFinal(text => cb({ text })));
+    await expect(backend.submitTurn({ turnId: 'turn-recovered', content: 'continue' }))
+      .resolves.toEqual({ submitted: true });
+    await expect(final).resolves.toEqual({ text: 'recovered' });
   });
 });

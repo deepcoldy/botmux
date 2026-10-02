@@ -12,7 +12,7 @@
   "remoteRunner": {
     "expectedProvider": "example-cloud",
     "requiredCapabilities": [
-      "start", "resume", "turn", "cancel", "detach", "status",
+      "start", "resume", "turn", "cancel", "detach", "reattach", "status",
       "terminal_screen", "terminal_input", "terminal_resize"
     ],
     "handshakeTimeoutMs": 30000,
@@ -44,10 +44,25 @@ provider 的 stderr 只用于诊断，不参与协议。stdout 出现未知事�
 4. 每个 `turn` 必须先返回同一 `requestId` 的 `status: busy`，该 ACK 才表示 provider 已接受执行。
 5. provider 用 `progress` 流式输出，并以 `final` 或带 `turnId` 的 `failure` 结束该轮。
 
+如果 provider 在 `status: busy` 前就能确定该轮失败，应返回携带原 `requestId` 的 `failure`；
+`turnId` 可以同时携带，也可以由 BotMux 从原命令精确恢复。这个结果是已关联的明确失败，不会被当作
+ACK 超时或未知执行结果，且不会毒化后续 turn。
+
+`hello.capabilities` 是可扩展字符串集合。BotMux 只检查配置声明的
+`requiredCapabilities`，对名称合法但当前版本未知的 provider capability 保持透传和忽略，
+使 provider 可以在不破坏旧客户端的情况下增加能力。未知事件类型仍会按协议错误关闭。
+
+`detach` 与 `reattach` 共同构成默认生命周期能力：当持久化阶段失败时，
+BotMux 会发送 `reattach`，且只有收到同一 `requestId` 的 `status: ready` 后才重新开放写入。
+显式配置旧 capability 子集但缺少 `reattach` 的 provider 会在发送 `detach` 前被拒绝，避免本地恢复后远端仍保持 detached。
+
 `start` / `resume` 可选携带 `model`、`modelBackendVariant`（`standard|max`）和
 `reasoningEffort`。这些字段是 Bot 默认值或新 Session 启动覆盖，provider 应只在
 底层运行时明确支持时使用；缺省时保持 provider 自身默认。三项都是 v1 additive
 字段，旧 provider 可以忽略。
+
+Remote Runner 的 reasoning 选择使用 BotMux 通用的 `low|medium|high|xhigh|max|ultra`
+词表，不套用某个本地 CLI 的模型表；provider 负责接受、忽略或用结构化 `failure` 拒绝不支持的组合。
 
 ### 可选远端终端
 
@@ -116,6 +131,8 @@ provider 可以在 `final` 事件上附带可选 `usage`，把远端运行时已
 
 - 显式关闭使用两阶段流程：BotMux 先发送 `cancel`，收到 `status: closed` 后持久化关闭，再提交本地 worker 退出。取消结果未知时会保持会话和写入门禁，不会伪装成已关闭。
 - Daemon 正常退出使用 `detach`：provider 应等待当前 turn 收敛并返回 `status: detached`，不得取消可恢复的远端状态。
+- 如果 shutdown 在持久化阶段失败，BotMux 使用 `reattach` 回滚已经确认的 `detach`；回滚没有得到
+  `status: ready` 时继续保持写入门禁，不把未知状态伪装成已恢复。
 - 当前 worker 不存在时，BotMux 不会猜测 provider 的控制面 API，也不会直接把仍为 active 的记录改成 closed；应先恢复同一 provider worker，再执行显式关闭。
 
 ## Reference runner
@@ -124,9 +141,11 @@ provider 可以在 `final` 事件上附带可选 `usage`，把远端运行时已
 
 ```bash
 printf '%s\n' \
-  '{"protocol":"botmux.remote-runner","version":1,"type":"hello","requestId":"h1","sessionId":"demo","requiredCapabilities":["start","resume","turn","cancel","detach","status"]}' \
+  '{"protocol":"botmux.remote-runner","version":1,"type":"hello","requestId":"h1","sessionId":"demo","requiredCapabilities":["start","resume","turn","cancel","detach","reattach","status"]}' \
   '{"protocol":"botmux.remote-runner","version":1,"type":"start","requestId":"s1","sessionId":"demo","cwd":"/tmp"}' \
   '{"protocol":"botmux.remote-runner","version":1,"type":"turn","requestId":"t1","turnId":"turn-1","content":"hello"}' \
+  '{"protocol":"botmux.remote-runner","version":1,"type":"detach","requestId":"d1"}' \
+  '{"protocol":"botmux.remote-runner","version":1,"type":"reattach","requestId":"r1"}' \
   | node examples/remote-runner/reference-runner.mjs
 ```
 

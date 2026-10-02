@@ -59,6 +59,114 @@ async function readTerminalSeed(
 }
 
 describe('remote runner worker wiring', () => {
+  it('passes persisted provider state to resume after a worker restart', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-resume-'));
+    tempDirs.push(root);
+    const commandsPath = join(root, 'commands.jsonl');
+    const provider = join(root, 'provider.mjs');
+    writeFileSync(provider, `#!/usr/bin/env node
+import fs from 'node:fs';
+import readline from 'node:readline';
+const protocol = 'botmux.remote-runner';
+const version = 1;
+const emit = event => process.stdout.write(JSON.stringify({ protocol, version, ...event }) + '\\n');
+readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on('line', line => {
+  const command = JSON.parse(line);
+  fs.appendFileSync(${JSON.stringify(commandsPath)}, JSON.stringify(command) + '\\n');
+  if (command.type === 'hello') {
+    emit({
+      type: 'hello', requestId: command.requestId, provider: 'resume-provider',
+      capabilities: ['start','resume','turn','cancel','detach','reattach','status','provider_future_feature'],
+    });
+  } else if (command.type === 'resume') {
+    emit({ type: 'ready', requestId: command.requestId, state: command.state });
+  } else if (command.type === 'turn') {
+    emit({ type: 'status', requestId: command.requestId, status: 'busy' });
+    emit({ type: 'final', turnId: command.turnId, content: 'RESUMED_OK' });
+  } else if (command.type === 'cancel') {
+    emit({ type: 'status', requestId: command.requestId, status: 'closed' });
+  }
+});
+`);
+    chmodSync(provider, 0o755);
+    const dataDir = join(root, 'data');
+    const botsPath = join(root, 'bots.json');
+    writeFileSync(botsPath, JSON.stringify([{
+      larkAppId: 'app_remote_resume',
+      larkAppSecret: 'secret',
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+      cliPathOverride: provider,
+      remoteRunner: { expectedProvider: 'resume-provider' },
+    }]));
+    const persistedState = {
+      version: 1 as const,
+      provider: 'resume-provider',
+      generation: 7,
+      remoteSessionId: 'compute-7',
+      agentThreadId: 'thread-stable',
+      providerState: { runtimeSubpath: 'sessions/seven' },
+    };
+
+    const messages: WorkerToDaemon[] = [];
+    const logs: string[] = [];
+    const child = spawnTsScript(resolve('src/worker.ts'), [], {
+      cwd: resolve('.'),
+      env: {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTS_CONFIG: botsPath,
+        BOTMUX_SESSION_ID: 'sid-remote-resume',
+        LARK_APP_ID: 'app_remote_resume',
+        LARK_APP_SECRET: 'secret',
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+    children.push(child);
+    child.stdout?.on('data', chunk => logs.push(String(chunk)));
+    child.stderr?.on('data', chunk => logs.push(String(chunk)));
+    child.on('message', raw => messages.push(raw as WorkerToDaemon));
+
+    child.send({
+      type: 'init',
+      sessionId: 'sid-remote-resume',
+      chatId: 'oc_remote_resume',
+      rootMessageId: 'om_remote_resume',
+      workingDir: root,
+      cliId: 'remote-runner',
+      cliPathOverride: provider,
+      backendType: 'remote-runner',
+      backendConfig: { expectedProvider: 'resume-provider' },
+      remoteBackendState: persistedState,
+      prompt: 'resume this turn',
+      turnId: 'turn-after-worker-restart',
+      larkAppId: 'app_remote_resume',
+      larkAppSecret: 'secret',
+    } satisfies DaemonToWorker);
+
+    await waitFor(
+      () => messages.some(message => message.type === 'turn_terminal'
+        && message.turnId === 'turn-after-worker-restart'
+        && message.status === 'completed'),
+      () => `remote runner resume turn did not complete\n${logs.join('')}\n${JSON.stringify(messages)}`,
+    );
+    const commands = readFileSync(commandsPath, 'utf8')
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line));
+    expect(commands.some(command => command.type === 'start')).toBe(false);
+    expect(commands.find(command => command.type === 'resume')).toMatchObject({
+      sessionId: 'sid-remote-resume',
+      state: persistedState,
+    });
+    expect(messages).toContainEqual(expect.objectContaining({
+      type: 'final_output',
+      turnId: 'turn-after-worker-restart',
+      content: 'RESUMED_OK',
+    }));
+  });
+
   it('passes trusted turn input, persists provider state, and projects a terminal screen', async () => {
     const root = mkdtempSync(join(tmpdir(), 'botmux-remote-runner-worker-'));
     tempDirs.push(root);

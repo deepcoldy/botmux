@@ -3,6 +3,9 @@ export const CODEX_COMMON_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4
 export const GROK_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 4);
 export const GROK_COMMON_REASONING_EFFORTS = GROK_REASONING_EFFORTS.slice(0, 3);
 export const TRAEX_COMMON_REASONING_EFFORTS = CODEX_REASONING_EFFORTS.slice(0, 3);
+/** Remote providers validate what they support. BotMux transports its generic
+ * reasoning vocabulary without borrowing any one provider's model catalog. */
+export const REMOTE_RUNNER_REASONING_EFFORTS = CODEX_REASONING_EFFORTS;
 /** Claude Code's `--effort` flag parses exactly low|medium|high|xhigh|max —
  *  `ultra` is codex/traex-only and Claude answers it with an unknown-value
  *  warning. Spelled out rather than sliced off CODEX_REASONING_EFFORTS: the two
@@ -111,7 +114,8 @@ export function reasoningEffortsForCliModel(
   model: string | undefined,
 ): readonly CodexReasoningEffort[] {
   if (cliId === 'grok') return grokReasoningEffortsForModel(model);
-  if (cliId === 'traex' || cliId === 'remote-runner') return traexReasoningEffortsForModel(model);
+  if (cliId === 'remote-runner') return REMOTE_RUNNER_REASONING_EFFORTS;
+  if (cliId === 'traex') return traexReasoningEffortsForModel(model);
   if (isCodexReasoningCliId(cliId)) return codexReasoningEffortsForModel(model);
   if (cliId === 'claude-code') return claudeReasoningEffortsForModel(model);
   if (cliId === 'kimi') {

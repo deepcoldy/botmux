@@ -90,8 +90,10 @@ describe('TraeX model-aware reasoning efforts', () => {
     expect(cliModelSupportsReasoningEffort('traex', 'custom-model', 'medium')).toBe(true);
     expect(cliModelSupportsReasoningEffort('traex', 'custom-model', 'xhigh')).toBe(false);
     expect(reasoningEffortsForCliModel('remote-runner', 'GPT-5.6-Sol'))
-      .toEqual(['low', 'medium', 'high', 'xhigh', 'ultra']);
+      .toEqual(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
     expect(cliModelSupportsReasoningEffort('remote-runner', 'GPT-5.6-Sol', 'xhigh')).toBe(true);
+    expect(reasoningEffortsForCliModel('remote-runner', 'provider-specific-model'))
+      .toEqual(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
   });
 });
 

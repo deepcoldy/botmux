@@ -6,7 +6,9 @@ const protocol = 'botmux.remote-runner';
 const version = 1;
 const capabilities = [
   'start', 'resume', 'turn', 'cancel', 'detach', 'status',
-  'terminal_screen', 'terminal_input', 'terminal_resize',
+  'terminal_screen', 'terminal_input', 'terminal_resize', 'reattach',
+  // Unknown additive capabilities are intentionally safe for older clients.
+  'reference_future_capability',
 ];
 let state;
 let status = 'starting';
@@ -119,6 +121,14 @@ input.on('line', line => {
       return;
     case 'detach':
       status = 'detached';
+      emit({ type: 'status', requestId: command.requestId, status, state });
+      return;
+    case 'reattach':
+      if (status !== 'detached') {
+        fail(command, 'not_detached', 'reference runner is not detached');
+        return;
+      }
+      status = 'ready';
       emit({ type: 'status', requestId: command.requestId, status, state });
       return;
     case 'status':

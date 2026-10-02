@@ -56,16 +56,40 @@ describe('remote runner protocol', () => {
     })).toBeUndefined();
   });
 
-  it('parses only the closed event vocabulary', () => {
+  it('keeps event types closed while accepting additive provider capabilities', () => {
     const event = parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,
       version: REMOTE_RUNNER_PROTOCOL_VERSION,
       type: 'hello',
       requestId: 'hello-1',
       provider: 'reference',
-      capabilities: [...REMOTE_RUNNER_CAPABILITIES],
+      capabilities: [...REMOTE_RUNNER_CAPABILITIES, 'provider_future_feature'],
     }));
     expect(event).toMatchObject({ type: 'hello', requestId: 'hello-1', provider: 'reference' });
+    expect(event?.type === 'hello' ? event.capabilities : []).toContain('provider_future_feature');
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'hello',
+      requestId: 'hello-invalid-capability',
+      provider: 'reference',
+      capabilities: ['start', 'INVALID CAPABILITY'],
+    }))).toBeUndefined();
+    const preAckFailure = parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'failure',
+      requestId: 'turn-request-1',
+      code: 'provider_rejected',
+      message: 'rejected before busy acknowledgement',
+      status: 'failed',
+      retryable: true,
+    }));
+    expect(preAckFailure).toMatchObject({
+      type: 'failure',
+      requestId: 'turn-request-1',
+    });
+    expect(preAckFailure).not.toHaveProperty('turnId');
     expect(parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,
       version: REMOTE_RUNNER_PROTOCOL_VERSION,
@@ -214,6 +238,10 @@ describe('remote runner protocol', () => {
       await waitFor(() => events.some(event => event.type === 'status' && event.requestId === 'status-1'));
       send(remoteRunnerCommand('detach', { requestId: 'detach-1' }));
       await waitFor(() => events.some(event => event.type === 'status' && event.status === 'detached'));
+      send(remoteRunnerCommand('reattach', { requestId: 'reattach-1' }));
+      await waitFor(() => events.some(event => event.type === 'status'
+        && event.requestId === 'reattach-1'
+        && event.status === 'ready'));
     } finally {
       child.kill('SIGTERM');
     }

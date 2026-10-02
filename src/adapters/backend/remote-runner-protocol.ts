@@ -15,6 +15,7 @@ export const REMOTE_RUNNER_BASE_CAPABILITIES = [
   'turn',
   'cancel',
   'detach',
+  'reattach',
   'status',
 ] as const;
 
@@ -128,6 +129,7 @@ export type RemoteRunnerCommand =
     })
   | (RemoteRunnerCommandBase & { type: 'cancel' })
   | (RemoteRunnerCommandBase & { type: 'detach' })
+  | (RemoteRunnerCommandBase & { type: 'reattach' })
   | (RemoteRunnerCommandBase & { type: 'status' })
   | (RemoteRunnerCommandBase & { type: 'terminal_input'; generation: number; data: string })
   | (RemoteRunnerCommandBase & { type: 'terminal_resize'; generation: number; cols: number; rows: number });
@@ -150,7 +152,9 @@ export type RemoteRunnerEvent =
       type: 'hello';
       requestId: string;
       provider: string;
-      capabilities: RemoteRunnerCapability[];
+      /** Unknown valid names are retained so older BotMux clients remain
+       * forward-compatible with additive provider capabilities. */
+      capabilities: string[];
     })
   | (RemoteRunnerEventBase & {
       type: 'ready';
@@ -202,7 +206,7 @@ export type RemoteRunnerEvent =
       state?: RemoteRunnerBackendState;
     });
 
-const CAPABILITY_SET: ReadonlySet<string> = new Set(REMOTE_RUNNER_CAPABILITIES);
+const CAPABILITY_RE = /^[a-z][a-z0-9._-]{0,63}$/;
 const PROVIDER_RE = /^[a-z][a-z0-9._-]{0,63}$/;
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
 const REQUEST_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -398,14 +402,13 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
     if (!id || !provider || !PROVIDER_RE.test(provider) || !Array.isArray(raw.capabilities)) {
       return undefined;
     }
-    const capabilities = raw.capabilities.filter(
-      (item): item is RemoteRunnerCapability => typeof item === 'string' && CAPABILITY_SET.has(item),
-    );
-    if (capabilities.length !== raw.capabilities.length || new Set(capabilities).size !== capabilities.length) {
+    const capabilities = raw.capabilities.map(item => nonEmptyString(item, 64));
+    if (capabilities.some(item => !item || !CAPABILITY_RE.test(item))
+        || new Set(capabilities).size !== capabilities.length) {
       return undefined;
     }
     return { protocol: REMOTE_RUNNER_PROTOCOL, version: REMOTE_RUNNER_PROTOCOL_VERSION,
-      type: 'hello', requestId: id, provider, capabilities };
+      type: 'hello', requestId: id, provider, capabilities: capabilities as string[] };
   }
 
   if (raw.type === 'ready' || raw.type === 'lineage_changed') {

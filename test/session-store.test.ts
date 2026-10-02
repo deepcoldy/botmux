@@ -75,6 +75,7 @@ import {
   createSession,
   createSessionWithOwnedMutation,
   getSession,
+  getSessionFresh,
   getOwnedSession,
   listSessions,
   listSessionsStrict,
@@ -3180,6 +3181,52 @@ describe('createSession()', () => {
     const data = readPersistedRows(tempDir, 'test-app');
     expect(data[session.sessionId]).toBeDefined();
     expect(data[session.sessionId].title).toBe('Persisted');
+  });
+
+  it('round-trips provider-neutral remote state and usage across store reloads', () => {
+    const session = createSession('chat-remote', 'root-remote', 'Remote Runner');
+    session.backendType = 'remote-runner';
+    session.remoteBackendState = {
+      version: 1,
+      provider: 'example-provider',
+      generation: 4,
+      remoteSessionId: 'compute-4',
+      agentThreadId: 'thread-stable',
+      providerState: { runtimeSubpath: 'sessions/four' },
+    };
+    session.remoteRunnerUsage = {
+      generation: 4,
+      snapshot: {
+        context: { usedTokens: 12, windowTokens: 100, percentUsed: 12 },
+        tokens: { in: 10, out: 2 },
+        model: 'provider-model',
+        reasoningEffort: 'provider-effort',
+      },
+    };
+    updateSession(session);
+
+    init('other-app');
+    init('test-app');
+    expect(getSessionFresh(session.sessionId)).toMatchObject({
+      backendType: 'remote-runner',
+      remoteBackendState: {
+        version: 1,
+        provider: 'example-provider',
+        generation: 4,
+        remoteSessionId: 'compute-4',
+        agentThreadId: 'thread-stable',
+        providerState: { runtimeSubpath: 'sessions/four' },
+      },
+      remoteRunnerUsage: {
+        generation: 4,
+        snapshot: {
+          context: { usedTokens: 12, windowTokens: 100, percentUsed: 12 },
+          tokens: { in: 10, out: 2 },
+          model: 'provider-model',
+          reasoningEffort: 'provider-effort',
+        },
+      },
+    });
   });
 
   it('should default chatType to undefined when not provided', () => {
