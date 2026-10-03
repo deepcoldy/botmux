@@ -614,6 +614,32 @@ describe('v3 ephemeral pool', () => {
     await promise;
   });
 
+  it('fails fast without sending /goal when the CLI exits before first prompt readiness', async () => {
+    const worker = new ScriptedWorker();
+    const factory = factoryFor(worker);
+    const req = request();
+    const pool = createEphemeralPool({
+      factory,
+      workerPath: '/tmp/worker.js',
+      resolveLarkAppSecret: () => 'secret',
+    });
+
+    const promise = pool.runNode(req);
+    await waitFor(() => factory.lastOpts !== undefined);
+    await worker.waitForInit();
+    worker.emitMessage({ type: 'ready', port: 3001, token: 'tok' });
+    worker.emitMessage({ type: 'claude_exit', code: 1, signal: null });
+
+    expect(worker.rawInputs).toEqual([]);
+    await waitFor(() => worker.kills.includes('SIGTERM'));
+    worker.emitExit(1);
+
+    await expect(promise).resolves.toMatchObject({
+      status: 'fail',
+      manifestPath: req.env[GOAL_ENV.MANIFEST_PATH],
+    });
+  });
+
   it('buildGoalCommand uses a short native /goal line that points to file-backed instructions', () => {
     const cmd = buildGoalCommand(request());
     expect(cmd.startsWith(`${GOAL_COMMAND} `)).toBe(true);

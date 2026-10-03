@@ -137,3 +137,30 @@ describe('TmuxBackend.killSession', () => {
     );
   });
 });
+
+describe('TmuxBackend.sessionChildPid', () => {
+  it('returns the pane pid when tmux reports a numeric child pid', () => {
+    mockedExecFileSync.mockImplementation((() => Buffer.from('12345\n')) as any);
+
+    expect(TmuxBackend.sessionChildPid(NAME)).toBe(12345);
+    expect(mockedExecFileSync).toHaveBeenCalledWith(
+      'tmux',
+      ['display-message', '-p', '-t', NAME, '#{pane_pid}'],
+      expect.objectContaining({
+        encoding: 'utf8',
+        timeout: 3000,
+      }),
+    );
+  });
+
+  it('returns null when the pane pid is absent, malformed, or unqueryable', () => {
+    mockedExecFileSync.mockImplementationOnce((() => Buffer.from('not-a-pid\n')) as any);
+    expect(TmuxBackend.sessionChildPid(NAME)).toBeNull();
+
+    mockedExecFileSync.mockImplementationOnce((() => Buffer.from('0\n')) as any);
+    expect(TmuxBackend.sessionChildPid(NAME)).toBeNull();
+
+    mockedExecFileSync.mockImplementationOnce((() => { throw new Error('tmux unavailable'); }) as any);
+    expect(TmuxBackend.sessionChildPid(NAME)).toBeNull();
+  });
+});

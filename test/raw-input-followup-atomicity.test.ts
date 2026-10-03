@@ -144,7 +144,7 @@ describe('worker raw_input delivery', () => {
   // assertion. Kept comfortably ahead of the last anchor below (the previous
   // 7000 left ~2 chars of slack, so any added line broke these tests for
   // reasons that had nothing to do with what they check).
-  const region = caseRegion(workerSrc, 'async function deliverRawInput', 7600);
+  const region = caseRegion(workerSrc, 'async function deliverRawInput', 8400);
 
   it('enqueues followUpContent strictly AFTER the awaited command send (incl. Enter)', () => {
     const sendIdx = region.indexOf('await sendRawCommandLineWithRecoveryFence(');
@@ -615,6 +615,19 @@ describe('post-settle restart fence', () => {
     expect(rawShift).toBeGreaterThan(fence);
     expect(writeStructuredInput).toBeGreaterThan(fence);
     expect(writeInput).toBeGreaterThan(fence);
+  });
+
+  it('raw_input first-write path shares the bare-shell guard before writing slash commands', () => {
+    const raw = caseRegion(workerSrc, 'async function deliverRawInput(', 3600);
+    const detector = raw.indexOf('if (await detectBareShellLaunch())');
+    const workflowFatal = raw.indexOf('workflow goal worker refused to send /goal into a bare shell', detector);
+    const queueFallback = raw.indexOf('pendingRawInputs.push(msg);', detector);
+    const writer = raw.indexOf('const writeRawInput = async', detector);
+
+    expect(detector).toBeGreaterThanOrEqual(0);
+    expect(workflowFatal).toBeGreaterThan(detector);
+    expect(queueFallback).toBeGreaterThan(detector);
+    expect(writer).toBeGreaterThan(queueFallback);
   });
 
   it('flushPendingInjections re-checks cliRestartInProgress AFTER the awaited detector, BEFORE the shift', () => {
