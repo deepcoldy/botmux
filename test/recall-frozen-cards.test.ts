@@ -1,3 +1,4 @@
+import { pendingStartingCardPublication } from '../src/core/starting-card-publication.js';
 /**
  * Unit tests for recallFrozenCards (worker-pool.ts).
  *
@@ -660,6 +661,7 @@ describe('postTurnStartingCard', () => {
     activate(ds);
 
     const post = postTurnStartingCard(ds, sessionReply, 'om_turn_1');
+    expect(pendingStartingCardPublication(ds)).toBeDefined();
     expect(sessionReply).toHaveBeenCalledTimes(1);
     expect(buildStreamingCardMock.mock.calls[0]?.[5]).toBe('starting');
 

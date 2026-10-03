@@ -1,3 +1,4 @@
+import { trackStartingCardPublication } from './starting-card-publication.js';
 import { handoffCardClosed, handoffCardBlocksStreaming, applyHandoffCardEvent, type HandoffCardEvent } from './handoff-card-lifecycle.js';
 import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTriggerStreamingCard } from './trigger-streaming-card.js';
 import { sessionPromptInjection } from './prompt-injection.js';
@@ -3916,6 +3917,9 @@ export async function postTurnStartingCard(
   // durable reply card. Start both before awaiting either to preserve the
   // terminal card's synchronous generation/sentinel fence during slow POSTs.
   const statusPost = postTurnStartingStatusCard(ds, sessionReply, turnId);
+  // Track each POST separately: one rejection must not release the other card.
+  trackStartingCardPublication(ds, replyPost);
+  trackStartingCardPublication(ds, statusPost);
   const [replyPosted, statusPosted] = await Promise.all([replyPost, statusPost]);
   return replyPosted || statusPosted;
 }
