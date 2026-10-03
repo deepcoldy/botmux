@@ -171,4 +171,16 @@ describe('CardStreamStore', () => {
     await expect(store.write('cs_00000000000000000000000000000000', binding, async () => undefined))
       .rejects.toThrow('未找到卡片流');
   }));
+  it('reuses the persisted message in every lease after restart and uses the new binding on reanchor', async () => withStore(async (store, dir) => {
+    const messages: string[] = [];
+    const observe = async (lease: import('../src/services/card-stream-store.js').CardStreamSequenceLease) => { messages.push(lease.messageId); };
+    const first = await store.open(binding, 'card_1', observe);
+    const resumed = new CardStreamStore(dir);
+    await resumed.write(first.record.streamId, binding, observe);
+    const moved = await resumed.reanchor(first.record.streamId, binding, { ...binding, messageId: 'om_next' }, 'card_2', observe);
+    await resumed.finish(moved.current.streamId, binding, observe);
+    expect(messages).toEqual(['om_card', 'om_card', 'om_next', 'om_next']);
+    await expect(resumed.write(first.record.streamId, binding, observe)).rejects.toThrow('迁移');
+  }));
+
 });

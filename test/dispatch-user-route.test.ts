@@ -6,6 +6,7 @@ import { Readable } from 'node:stream';
 import ts from 'typescript';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { authorityForDispatch, dispatchCallerFromReply, deliverDispatchWithUser, resolveDispatchUser, DISPATCH_USER_DELIVERY_MAX_BYTES } from '../src/core/dispatch-user-delegation.js';
+import { fallbackTurnId, frozenReplyContextForTurn } from '../src/core/reply-target.js';
 import { authorizeSessionScopedIpc } from '../src/core/daemon-ipc-session-auth.js';
 import { readJsonBody, JsonBodyTooLargeError } from '../src/core/dashboard-ipc-server.js';
 
@@ -14,7 +15,12 @@ const route = source.statements.find(node => ts.isExpressionStatement(node) && t
   && node.expression.expression.getText(source) === 'ipcRoute'
   && node.expression.arguments[1]?.getText(source) === 'DISPATCH_USER_DELIVERY_ROUTE') as ts.ExpressionStatement;
 const handler = (route.expression as ts.CallExpression).arguments[2];
-const code = ts.transpileModule('const handler = ' + handler.getText(source), {
+const sourceGuards = ['sourceTopicWriteOptions', 'sessionTopicWriteOptions'].map(name => {
+  const declaration = source.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === name);
+  if (!declaration) throw new Error('Missing source guard: ' + name);
+  return declaration.getText(source);
+}).join('\n');
+const code = ts.transpileModule(sourceGuards + '\nconst handler = ' + handler.getText(source), {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
 }).outputText;
 const secret = 'test-host-secret';
@@ -43,6 +49,7 @@ function harness(overrides: Record<string, unknown> = {}, isHost = false) {
     getBot: () => ({ config: { triggerUserAuth: { enabled: true, tools: ['bytedcli'] } } }),
     dispatchUserForTurn: vi.fn(async () => undefined),
     targetUserForDelegation: vi.fn(async () => 'ou_alice_target'),
+    fallbackTurnId, frozenReplyContextForTurn,
     authorityForDispatch, dispatchCallerFromReply, pickTurnReplyTarget: () => undefined,
     resolveUnionIdFromOpenId, replyMessage: send, deliverDispatchWithUser,
     config: { session: { dataDir } }, loadOrCreateDashboardSecret: () => secret, dispatchReportBindingSecretPath: () => '',
@@ -87,7 +94,8 @@ describe('dispatch user IPC end-to-end identity binding', () => {
     expect(await h.run()).toEqual({ status: 200, value: { ok: true, messageId: 'om_kickoff' } });
     expect((await read())?.authority.openId).toBe('ou_alice');
     expect((await read())?.sourceTurnId).toBe('om_human');
-    expect(h.send).toHaveBeenCalledExactlyOnceWith('cli_source', 'om_root', expect.any(String), 'post', true);
+    expect(h.send).toHaveBeenCalledExactlyOnceWith('cli_source', 'om_root', expect.any(String), 'post', true,
+      undefined, undefined, expect.objectContaining({ beforeWrite: expect.any(Function) }));
   });
   it('rejects a stale capability before any message or identity write', async () => {
     const h = harness({ originCapability: 'stale' });

@@ -4111,6 +4111,9 @@ export async function executeScheduledTask(
           anchor = task.rootMessageId;
           isContinuation = true;
         } catch (err: any) {
+          // A failed source lookup or reply must not silently retarget a
+          // retained-topic schedule under the opt-in stop policy.
+          if (bot.config.topicUnavailablePolicy === 'stop') throw err;
           logger.warn(`[scheduler] Failed to reply in original thread ${task.rootMessageId} (${err.message}); falling back to new thread`);
           anchor = await sendMessage(larkAppId, task.chatId, t('scheduler.task_started', { name: task.name }, localeForBot(larkAppId)));
         }

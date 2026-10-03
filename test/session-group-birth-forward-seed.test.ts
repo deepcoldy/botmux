@@ -44,6 +44,7 @@ const mocks = vi.hoisted(() => {
     replyMessage: vi.fn(async () => 'om_reply'),
     sendMessage: vi.fn(async () => 'om_intro'),
     forwardMessage: vi.fn(async () => 'om_forwarded'),
+    getMessageDetail: vi.fn(),
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
     getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
     resolveSender: vi.fn(async (_appId: string, openId?: string) => (
@@ -100,6 +101,7 @@ vi.mock('../src/im/lark/client.js', async () => {
     replyMessage: mocks.replyMessage,
     sendMessage: mocks.sendMessage,
     forwardMessage: (...args: any[]) => mocks.forwardMessage(...args),
+    getMessageDetail: mocks.getMessageDetail,
     getChatMode: mocks.getChatMode,
     getChatNameAndMode: mocks.getChatNameAndMode,
     getChatInfo: vi.fn(async () => ({ userCount: 1, botCount: 1 })),
@@ -142,6 +144,7 @@ vi.mock('../src/services/session-group-title.js', async () => {
   return { ...actual, scheduleSessionGroupTitle: (...args: any[]) => mocks.scheduleSessionGroupTitle(...args) };
 });
 
+import { TopicSendError } from '../src/cli/topic-send-guard.js';
 import { registerBot, getBot } from '../src/bot-registry.js';
 import {
   __testOnly_activeSessions as activeSessions,
@@ -275,6 +278,7 @@ beforeEach(() => {
     return { extraResources: [] };
   });
   mocks.createGroupWithBots.mockResolvedValue(createGroupResult());
+  mocks.getMessageDetail.mockReset().mockImplementation(async (_app, id) => ({ items: [{ message_id: id, deleted: false }] }));
 
   const workDir = join(mocks.dataDir, 'workdir');
   mkdirSync(workDir, { recursive: true });
@@ -289,6 +293,75 @@ beforeEach(() => {
     sessionGroup: { tag: { mode: 'off' }, avatar: 'off' },
   } as any);
   getBot(APP).resolvedAllowedUsers = [OWNER];
+});
+
+describe('会话群出生：原来源停止策略', () => {
+  let unavailable: boolean;
+  let writes: string[];
+  beforeEach(() => {
+    unavailable = false; writes = [];
+    getBot(APP).config.topicUnavailablePolicy = 'stop';
+    mocks.getMessageDetail.mockImplementation(async (_app, id) => ({ items: [{ message_id: id, deleted: unavailable }] }));
+    mocks.sendMessage.mockImplementation(async (...args: any[]) => {
+      await args[6]?.beforeWrite?.(); writes.push('intro'); return 'om_intro';
+    });
+  });
+  const noWorker = () => {
+    expect(mocks.createdSessions).toEqual([]); expect(mocks.forkWorker).not.toHaveBeenCalled();
+    expect(mocks.scheduleSessionGroupTitle).not.toHaveBeenCalled();
+  };
+  it.each(['deleted', 'unknown', 'network'] as const)('does not create a group for %s source evidence', async state => {
+    mocks.getMessageDetail.mockImplementation(async (_app, id) => {
+      if (state === 'network') throw new Error('read failed');
+      return { items: [{ message_id: id, ...(state === 'deleted' ? { deleted: true } : {}) }] };
+    });
+    await expect(handleNewTopic(mergeForwardDmEvent(), dmCtx(DM_MSG))).rejects.toBeInstanceOf(TopicSendError);
+    expect(mocks.createGroupWithBots).not.toHaveBeenCalled(); expect(mocks.forwardMessage).not.toHaveBeenCalled();
+    expect(writes).toEqual([]); noWorker();
+  });
+  it('retains the frozen DM source when it changes during group creation', async () => {
+    const ctx = dmCtx(DM_MSG);
+    mocks.createGroupWithBots.mockImplementationOnce(async () => {
+      unavailable = true; ctx.messageId = 'om_replacement'; return createGroupResult();
+    });
+    await expect(handleNewTopic(mergeForwardDmEvent(), ctx)).rejects.toBeInstanceOf(TopicSendError);
+    expect(mocks.createGroupWithBots).toHaveBeenCalledTimes(1); expect(mocks.forwardMessage).not.toHaveBeenCalled();
+    expect(mocks.getMessageDetail.mock.calls.every(([, id]) => id === DM_MSG)).toBe(true);
+    expect(writes).toEqual([]); noWorker();
+  });
+  it('does not turn a shared forward guard rejection into an inline excerpt', async () => {
+    mocks.forwardMessage.mockRejectedValueOnce(new TopicSendError('TOPIC_SEND_CHECK_FAILED', 'uncertain original'));
+    await expect(handleNewTopic(mergeForwardDmEvent(), dmCtx(DM_MSG))).rejects.toBeInstanceOf(TopicSendError);
+    expect(writes).toEqual([]); noWorker();
+    // The admission wrapper may acknowledge the failure at the original DM.
+    expect(mocks.replyMessage.mock.calls.every(([, id]) => id === DM_MSG)).toBe(true);
+  });
+  it('also guards intro writes when origin forwarding is disabled', async () => {
+    getBot(APP).config.sessionGroup!.forwardOrigin = false;
+    mocks.sendMessage.mockImplementation(async (...args: any[]) => {
+      unavailable = true; await args[6]?.beforeWrite?.(); writes.push('intro'); return 'om_intro';
+    });
+    await expect(handleNewTopic(mergeForwardDmEvent(), dmCtx(DM_MSG))).rejects.toBeInstanceOf(TopicSendError);
+    expect(mocks.forwardMessage).not.toHaveBeenCalled(); expect(writes).toEqual([]); noWorker();
+  });
+  it('rechecks original source for each queued intro attempt', async () => {
+    mocks.sendMessage.mockImplementation(async (...args: any[]) => {
+      await args[6]?.beforeWrite?.(); writes.push('attempt'); unavailable = true;
+      await args[6]?.beforeWrite?.(); writes.push('retry'); return 'om_intro';
+    });
+    await expect(handleNewTopic(mergeForwardDmEvent(), dmCtx(DM_MSG))).rejects.toBeInstanceOf(TopicSendError);
+    expect(writes).toEqual(['attempt']); noWorker();
+  });
+  it('does not start a Worker if source becomes unavailable during the DM receipt', async () => {
+    mocks.replyMessage.mockImplementationOnce(async () => { unavailable = true; return 'om_receipt'; });
+    await expect(handleNewTopic(mergeForwardDmEvent(), dmCtx(DM_MSG))).rejects.toBeInstanceOf(TopicSendError);
+    expect(writes).toEqual(['intro']); expect(getSessionGroup(BORN_GROUP)).toBeDefined(); noWorker();
+  });
+  it('allows an available source through the existing recursive birth path', async () => {
+    await handleNewTopic(mergeForwardDmEvent(), dmCtx(DM_MSG));
+    expect(writes).toEqual(['intro']); expect(mocks.createdSessions).toHaveLength(1);
+    expect(mocks.getMessageDetail).toHaveBeenCalledWith(APP, DM_MSG, { userCardContent: false, timeoutMs: 10000 });
+  });
 });
 
 describe('会话群出生：转发消息集合种子', () => {

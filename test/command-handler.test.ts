@@ -309,6 +309,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
   getChatModeStrict: vi.fn(async () => 'topic' as const),
   getMessageThreadId: vi.fn(async () => 'omt_child'),
+  getMessageDetail: vi.fn(),
   // privateCard /relay picker: chat-scope 普通群 sends the picker ephemeral
   // (visible-to-invoker) via this. Default resolves to a fake ephemeral id;
   // scenarios override with mockRejectedValueOnce to exercise the fallback.
@@ -613,7 +614,7 @@ import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensur
 import * as sessionStore from '../src/services/session-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import * as scheduler from '../src/core/scheduler.js';
-import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, getChatModeStrict, getMessageThreadId, UserTokenMissingError } from '../src/im/lark/client.js';
+import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, getChatModeStrict, getMessageThreadId, getMessageDetail, UserTokenMissingError } from '../src/im/lark/client.js';
 import { buildAdoptSelectCard, buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
 import { getAllBots, getBot, findOncallChat, effectiveDefaultWorkingDir } from '../src/bot-registry.js';
@@ -1753,6 +1754,138 @@ describe('handleCommand', () => {
     vi.mocked(sessionStore.getOwnedSession).mockReturnValue(undefined);
     vi.mocked(sessionStore.listSessions).mockReturnValue([]);
     vi.mocked(resumeSession).mockReset();
+  });
+
+  describe('/fork source protection', () => {
+    const writes: string[] = [];
+    beforeEach(() => {
+      writes.length = 0;
+      vi.mocked(getBot).mockImplementation((id: string) => {
+        const bot = defaultGetBot(id);
+        return { ...bot, config: { ...bot.config, topicUnavailablePolicy: 'stop' } } as any;
+      });
+      vi.mocked(getMessageDetail).mockReset().mockImplementation(async (_app, id) => ({
+        items: [{ message_id: id, deleted: false, ...(id === 'msg_001' ? { root_id: ROOT_ID } : {}) }],
+      }) as any);
+      // Execute the actual captured guard; a parameter-only assertion would
+      // miss callbacks that read mutable state or skip source queries.
+      vi.mocked(replyMessage).mockImplementation(async (...args) => {
+        await args[7]?.beforeWrite?.(); writes.push('reply'); return 'om_new_panel';
+      });
+      vi.mocked(sendMessage).mockImplementation(async (...args) => {
+        await args[6]?.beforeWrite?.(); writes.push('send'); return 'om_child_seed';
+      });
+    });
+    const parent = (scope: 'chat' | 'thread' = 'thread') => makeDaemonSession({ scope,
+      session: makeSession({ scope, forkPanelCardId: 'om_old_panel' }) });
+
+    it.each(['deleted', 'unknown', 'error'] as const)('keeps the old panel when the source is %s', async mode => {
+      vi.mocked(getMessageDetail).mockImplementation(async (_app, id) => {
+        if (mode === 'error') throw new Error('read timeout');
+        return { items: [{ message_id: id, ...(mode === 'unknown' ? {} : { deleted: true }) }] } as any;
+      });
+      const ds = parent();
+      await handleCommand('/forklist', ROOT_ID, makeLarkMessage('/forklist'), makeDeps(ds), LARK_APP_ID);
+      expect(writes).toEqual([]); expect(sendMessage).not.toHaveBeenCalled();
+      expect(replyMessage).toHaveBeenCalledTimes(1); expect(deleteMessage).not.toHaveBeenCalled();
+      expect(ds.session.forkPanelCardId).toBe('om_old_panel');
+    });
+    it('does not switch to another reply or flat send after a provider error', async () => {
+      vi.mocked(replyMessage).mockImplementation(async (...args) => {
+        await args[7]?.beforeWrite?.(); throw new Error('provider timeout');
+      });
+      const ds = parent();
+      await handleCommand('/forklist', ROOT_ID, makeLarkMessage('/forklist'), makeDeps(ds), LARK_APP_ID);
+      expect(replyMessage).toHaveBeenCalledTimes(1); expect(sendMessage).not.toHaveBeenCalled();
+      expect(deleteMessage).not.toHaveBeenCalled();
+    });
+    it('only recalls the stale panel after confirmation of its replacement', async () => {
+      vi.mocked(deleteMessage).mockImplementation(async () => { writes.push('delete'); return true; });
+      const ds = parent();
+      await handleCommand('/forklist', ROOT_ID, makeLarkMessage('/forklist'), makeDeps(ds), LARK_APP_ID);
+      expect(writes).toEqual(['reply', 'delete']); expect(ds.session.forkPanelCardId).toBe('om_new_panel');
+      expect(getMessageDetail).toHaveBeenCalledWith(LARK_APP_ID, ROOT_ID, expect.objectContaining({ timeoutMs: 10000 }));
+    });
+    it('does not treat a chat anchor as a message root', async () => {
+      const ds = parent('chat'); ds.session.rootMessageId = CHAT_ID;
+      vi.mocked(getMessageDetail).mockImplementation(async (_app, id) => ({ items: [{ message_id: id, deleted: false }] }) as any);
+      await handleCommand('/forklist', ROOT_ID, makeLarkMessage('/forklist'), makeDeps(ds), LARK_APP_ID);
+      expect(writes).toEqual(['reply']);
+      expect(vi.mocked(getMessageDetail).mock.calls.map(([, id]) => id)).toEqual(['msg_001']);
+    });
+    it.each(['', CHAT_ID])('refuses a thread with invalid source root %s', async root => {
+      const ds = parent(); ds.session.rootMessageId = root;
+      await handleCommand('/forklist', ROOT_ID, makeLarkMessage('/forklist'), makeDeps(ds), LARK_APP_ID);
+      expect(writes).toEqual([]); expect(deleteMessage).not.toHaveBeenCalled();
+    });
+    it('retains legacy panel fallback and does not query source state', async () => {
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+      vi.mocked(replyMessage).mockRejectedValue(new Error('expired reply window'));
+      const ds = parent();
+      await handleCommand('/forklist', ROOT_ID, makeLarkMessage('/forklist'), makeDeps(ds), LARK_APP_ID);
+      expect(replyMessage).toHaveBeenCalledTimes(2); expect(writes).toEqual(['send']);
+      expect(getMessageDetail).not.toHaveBeenCalled();
+    });
+    it.each([ROOT_ID, CHAT_ID])('preserves legacy chat fallback for anchor %s', async rootId => {
+      vi.mocked(getBot).mockImplementation(defaultGetBot as any);
+      vi.mocked(replyMessage).mockRejectedValueOnce(new Error('preferred reply failed'));
+      const ds = parent('chat'); ds.session.rootMessageId = rootId;
+      await handleCommand('/forklist', ROOT_ID, makeLarkMessage('/forklist'), makeDeps(ds), LARK_APP_ID);
+      expect(vi.mocked(replyMessage).mock.calls.map(([, id]) => id))
+        .toEqual(rootId === ROOT_ID ? ['msg_001', ROOT_ID] : ['msg_001']);
+      expect(writes).toEqual([rootId === ROOT_ID ? 'reply' : 'send']);
+      expect(getMessageDetail).not.toHaveBeenCalled();
+    });
+    it.each(['codex', 'claude-code'] as const)('freezes the %s command source before attachment preparation', async cliId => {
+      const ds = parent(); ds.session.cliId = cliId;
+      const message = makeLarkMessage('/fork image', { msgType: 'post', threadId: 'omt_parent',
+        rawPostContent: JSON.stringify({ content: [[{ tag: 'img', image_key: 'img_original' }]] }) });
+      const { downloadResources } = await import('../src/core/session-manager.js');
+      vi.mocked(downloadResources).mockImplementationOnce(async () => {
+        message.messageId = 'om_later_command'; ds.session.rootMessageId = 'om_later_root';
+        return { attachments: [], needLogin: false };
+      });
+      vi.mocked(getMessageDetail).mockImplementation(async (_app, id) => ({ items: [{ message_id: id, deleted: id === ROOT_ID,
+        ...(id === 'msg_001' ? { root_id: ROOT_ID } : {}) }] }) as any);
+      const result = await startForkSubtopicSession('image', ds, message, LARK_APP_ID);
+      expect(result).toEqual({ ok: false, error: 'topic_creation_failed', orphanTopic: false });
+      expect(writes).toEqual([]); expect(forkSession).not.toHaveBeenCalled(); expect(deleteMessage).not.toHaveBeenCalled();
+      expect(vi.mocked(getMessageDetail).mock.calls.map(([, id]) => id)).toEqual(['msg_001', ROOT_ID]);
+    });
+    it('rechecks the frozen source when the transport retries the seed', async () => {
+      let unavailable = false;
+      vi.mocked(getMessageDetail).mockImplementation(async (_app, id) => ({ items: [{ message_id: id, deleted: unavailable }] }) as any);
+      vi.mocked(sendMessage).mockImplementation(async (...args) => {
+        await args[6]?.beforeWrite?.(); writes.push('attempt'); unavailable = true;
+        await args[6]?.beforeWrite?.(); writes.push('retry'); return 'om_should_not_send';
+      });
+      const result = await startForkSubtopicSession('task', parent(), makeLarkMessage('/fork task', { threadId: 'omt_parent' }), LARK_APP_ID);
+      expect(result.ok).toBe(false); expect(writes).toEqual(['attempt']); expect(forkSession).not.toHaveBeenCalled();
+    });
+    it.each(['thread lookup', 'bot lookup'] as const)('rechecks the source after %s before starting fork', async lookup => {
+      let unavailable = false;
+      vi.mocked(getMessageDetail).mockImplementation(async (_app, id) => ({ items: [{ message_id: id, deleted: unavailable }] }) as any);
+      if (lookup === 'thread lookup') {
+        vi.mocked(getMessageThreadId).mockImplementationOnce(async () => { unavailable = true; return 'omt_child'; });
+      } else {
+        vi.mocked(getAvailableBots).mockImplementationOnce(async () => { unavailable = true; return []; });
+      }
+      const ds = parent();
+      const result = await startForkSubtopicSession('task', ds, makeLarkMessage('/fork task', { threadId: 'omt_parent' }), LARK_APP_ID);
+      expect(result).toEqual({ ok: false, error: 'fork_subtopic_failed', orphanTopic: false });
+      expect(writes).toEqual(['send']);
+      expect(forkSession).not.toHaveBeenCalled();
+      expect(deleteMessage).toHaveBeenCalledExactlyOnceWith(LARK_APP_ID, 'om_child_seed');
+      expect(ds.session.forkPanelCardId).toBe('om_old_panel');
+    });
+    it('keeps the original command as the source of the post-fork panel refresh', async () => {
+      let forked = false;
+      vi.mocked(forkSession).mockImplementationOnce(async () => { forked = true; return { ok: true, childSessionId: 'child-sess-1' }; });
+      vi.mocked(sessionStore.getSession).mockReturnValue(makeSession({ sessionId: 'child-sess-1' }));
+      vi.mocked(getMessageDetail).mockImplementation(async (_app, id) => ({ items: [{ message_id: id, deleted: forked && id === 'msg_001' }] }) as any);
+      const result = await startForkSubtopicSession('task', parent(), makeLarkMessage('/fork task', { threadId: 'omt_parent' }), LARK_APP_ID);
+      expect(result.ok).toBe(true); expect(writes).toEqual(['send']); expect(deleteMessage).not.toHaveBeenCalled();
+    });
   });
 
   describe('/fork sub-topic', () => {

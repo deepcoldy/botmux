@@ -19,7 +19,7 @@
  *
  * Run:  pnpm vitest run test/daemon-ordinary-ingress-failure-notice.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const mocks = vi.hoisted(() => {
   const dataDir = `${process.env.TMPDIR ?? '/tmp'}/botmux-ingress-notice-${process.pid}`;
@@ -33,6 +33,7 @@ const mocks = vi.hoisted(() => {
     dataDir,
     replyMessage: vi.fn(async () => 'om_reply'),
     sendMessage: vi.fn(async () => 'om_top'),
+    getMessageDetail: vi.fn(),
     addReaction: vi.fn(async () => 'reaction_received'),
     getChatMode: vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p'),
     getChatNameAndMode: vi.fn(async () => ({ name: null, mode: 'group' as const })),
@@ -118,6 +119,7 @@ vi.mock('../src/im/lark/client.js', async () => {
     ...actual,
     replyMessage: mocks.replyMessage,
     sendMessage: mocks.sendMessage,
+    getMessageDetail: mocks.getMessageDetail,
     addReaction: mocks.addReaction,
     getChatMode: mocks.getChatMode,
     getChatNameAndMode: mocks.getChatNameAndMode,
@@ -181,6 +183,7 @@ import {
   __testOnly_resolveXpiHumanOpenId as resolveXpiHumanOpenId,
   __testOnly_restoreSessionsAndScheduleStartupRecovery as restoreSessionsAndScheduleStartupRecovery,
 } from '../src/daemon.js';
+import { getActiveSessionsRegistry, setActiveSessionsRegistry } from '../src/core/worker-pool.js';
 import { XpiSharedCwdQueueFullError } from '../src/core/xpi-shared-cwd-admission.js';
 import {
   findPendingAskByAnchor,
@@ -674,6 +677,201 @@ describe('ordinary ingress terminal failure → actionable notice', () => {
     expect(child.ownerOpenId).not.toBe('ou_foreign_source_app');
     expect(child.creatorOpenId).not.toBe('ou_foreign_source_app');
     expect(child.lastCallerOpenId).not.toBe('ou_foreign_source_app');
+  });
+
+
+  describe('independent request source across asynchronous preparation', () => {
+    let previousXpi: string | undefined;
+    let previousRegistry: ReturnType<typeof getActiveSessionsRegistry>;
+    let unavailable: Set<string>;
+    let writes: string[];
+    const SOURCE = 'om_independent_proposal';
+    const ROOT = 'om_proposal_root';
+
+    beforeEach(() => {
+      previousXpi = process.env.BOTMUX_XPI_ENABLED;
+      previousRegistry = getActiveSessionsRegistry();
+      setActiveSessionsRegistry(activeSessions);
+      process.env.BOTMUX_XPI_ENABLED = 'true';
+      getBot(APP).config.topicUnavailablePolicy = 'stop';
+      unavailable = new Set();
+      writes = [];
+      mocks.getMessageDetail.mockReset().mockImplementation(async (_app, id) => ({
+        items: [{ message_id: id, deleted: unavailable.has(id), ...(id === SOURCE ? { root_id: ROOT } : {}) }],
+      }));
+      mocks.sendMessage.mockImplementation(async (...args: any[]) => {
+        await args[6]?.beforeWrite?.();
+        writes.push(args[2]);
+        return 'om_top';
+      });
+    });
+
+    afterEach(() => {
+      for (const ds of activeSessions.values()) clearTimeout(ds.crossPrincipalWaitTimer);
+      setActiveSessionsRegistry(previousRegistry);
+      if (previousXpi === undefined) delete process.env.BOTMUX_XPI_ENABLED;
+      else process.env.BOTMUX_XPI_ENABLED = previousXpi;
+    });
+
+    function seedIndependent() {
+      const ds = seedThreadSession('om_unrelated_owner_root', 'seeded') as any;
+      ds.workingDir = `${mocks.dataDir}/xpi-source-parent`;
+      mkdirSync(ds.workingDir, { recursive: true });
+      const childDir = `${mocks.dataDir}/xpi-source-child`;
+      mkdirSync(childDir, { recursive: true });
+      ds.managedTurnOrigin = { turnId: 'unrelated-owner-turn', dispatchAttempt: 8, capability: 'owner-capability' };
+      const record = {
+        version: 1, id: 'xpi_source_guard', ownerTurnId: 'unrelated-owner-turn',
+        owner: { requestLarkAppId: APP, requestUserOpenId: OWNER, senderType: 'user' },
+        proposer: { requestLarkAppId: APP, requestUserOpenId: 'ou_proposer', senderType: 'user' },
+        phase: 'preparing_independent', independentWorkingDir: childDir,
+        messages: [{ turnId: SOURCE, replyRootId: ROOT, inThread: true,
+          text: 'check separately', userPrompt: 'check separately', createdAt: NOW }],
+      };
+      ds.session.crossPrincipalInterruptions = [record];
+      mocks.sessions.set(ds.session.sessionId, ds.session);
+      return { ds, record };
+    }
+
+    it.each(['withdrawn', 'unknown', 'lookup failed'])(
+      'retains the original request without creating a root when its source is %s', async kind => {
+        const { ds, record } = seedIndependent();
+        if (kind === 'withdrawn') unavailable.add(SOURCE);
+        if (kind === 'unknown') mocks.getMessageDetail.mockResolvedValue({ items: [] });
+        if (kind === 'lookup failed') mocks.getMessageDetail.mockRejectedValue(new Error('lookup unavailable'));
+        await driveCrossPrincipalInterruptions(ds);
+        expect(writes).toEqual([]);
+        expect(mocks.createSession).not.toHaveBeenCalled();
+        expect(mocks.forkWorker).not.toHaveBeenCalled();
+        expect(ds.session.crossPrincipalInterruptions).toEqual([record]);
+      });
+
+    it('checks the provider root even while the original reply remains available', async () => {
+      const { ds } = seedIndependent();
+      unavailable.add(ROOT);
+      await driveCrossPrincipalInterruptions(ds);
+      expect(mocks.getMessageDetail.mock.calls.map(([, id]) => id)).toEqual([SOURCE, ROOT]);
+      expect(writes).toEqual([]);
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+    });
+
+    it('keeps the proposer source frozen while resolving a cross-app identity', async () => {
+      const { ds, record } = seedIndependent();
+      Object.assign(record.proposer, { requestLarkAppId: 'foreign-app', requestUserUnionId: 'on_proposer' });
+      mocks.resolveTargetAppOpenId.mockImplementation(async () => {
+        record.messages[0].turnId = 'om_replacement';
+        record.messages[0].replyRootId = 'om_unrelated_owner_root';
+        unavailable.add(SOURCE);
+        return { status: 'resolved', openId: 'ou_target_proposer' };
+      });
+      await driveCrossPrincipalInterruptions(ds);
+      expect(mocks.resolveTargetAppOpenId).toHaveBeenCalled();
+      expect(writes).toEqual([]);
+      expect(mocks.getMessageDetail.mock.calls.map(([, id]) => id)).not.toContain('om_replacement');
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+    });
+
+    it('rechecks the same source on each transport attempt', async () => {
+      const { ds, record } = seedIndependent();
+      mocks.sendMessage.mockImplementation(async (...args: any[]) => {
+        await args[6].beforeWrite();
+        // First provider attempt is rate-limited and produces no confirmed id.
+        unavailable.add(SOURCE);
+        await args[6].beforeWrite();
+        writes.push(args[2]);
+        return 'om_top';
+      });
+      await driveCrossPrincipalInterruptions(ds);
+      expect(writes).toEqual([]);
+      expect(record).not.toHaveProperty('independentRootMessageId');
+      expect(mocks.createSession).not.toHaveBeenCalled();
+    });
+
+    it('retains a confirmed root after source failure and resumes without publishing another', async () => {
+      const { ds, record } = seedIndependent();
+      mocks.sendMessage.mockImplementation(async (...args: any[]) => {
+        await args[6].beforeWrite();
+        writes.push(args[2]);
+        unavailable.add(SOURCE);
+        return 'om_top';
+      });
+      await driveCrossPrincipalInterruptions(ds);
+      expect(record).toHaveProperty('independentRootMessageId', 'om_top');
+      expect(mocks.createSession).not.toHaveBeenCalled();
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      unavailable.clear();
+      await driveCrossPrincipalInterruptions(ds);
+      expect(writes).toHaveLength(1);
+      expect(mocks.createSession).toHaveBeenCalledTimes(1);
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not stage an executable opening when source fails during bot lookup', async () => {
+      const { ds, record } = seedIndependent();
+      mocks.getAvailableBots.mockImplementation(async () => { unavailable.add(SOURCE); return []; });
+      await driveCrossPrincipalInterruptions(ds);
+      const child = [...activeSessions.values()].find(item => item !== ds)!;
+      expect(child).toBeDefined();
+      expect(child.pendingPrompt).toBeUndefined();
+      expect(child.session.queuedPrompt).toBeUndefined();
+      expect(mocks.forkWorker).not.toHaveBeenCalled();
+      expect(ds.session.crossPrincipalInterruptions).toEqual([record]);
+      unavailable.clear();
+      mocks.getAvailableBots.mockResolvedValue([]);
+      await driveCrossPrincipalInterruptions(ds);
+      expect(mocks.createSession).toHaveBeenCalledTimes(1);
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not infer the proposer source from the owner turn or its current root', async () => {
+      const { ds } = seedIndependent();
+      unavailable.add('om_unrelated_owner_root');
+      await driveCrossPrincipalInterruptions(ds);
+      expect(writes).toHaveLength(1);
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+      // Public-context/terminal-notice reads may inspect the old thread.
+      // Only outbound source checks carry the strict lookup options.
+      expect(mocks.getMessageDetail.mock.calls.filter(call => call[2]?.timeoutMs === 10000).map(([, id]) => id))
+        .not.toContain('om_unrelated_owner_root');
+    });
+
+    it('uses an explicit thread root for a synthetic turn instead of querying an execution id', async () => {
+      const { ds, record } = seedIndependent();
+      record.messages[0].turnId = 'execution-turn';
+      unavailable.add(ROOT);
+      await driveCrossPrincipalInterruptions(ds);
+      expect(mocks.getMessageDetail.mock.calls.map(([, id]) => id)).toEqual([ROOT]);
+      expect(writes).toEqual([]);
+    });
+
+    it('keeps explicit unthreaded synthetic input separate from a historical reply root', async () => {
+      const { ds, record } = seedIndependent();
+      record.messages[0].turnId = 'execution-turn';
+      record.messages[0].inThread = false;
+      unavailable.add(ROOT);
+      await driveCrossPrincipalInterruptions(ds);
+      expect(mocks.getMessageDetail.mock.calls.filter(call => call[2]?.timeoutMs === 10000)).toEqual([]);
+      expect(writes).toHaveLength(1);
+    });
+
+    it('retains a restored request with missing source evidence in stop mode', async () => {
+      const { ds, record } = seedIndependent();
+      record.messages = [{ turnId: 'execution-turn', text: 'old input', userPrompt: 'old input', createdAt: NOW }] as any;
+      await driveCrossPrincipalInterruptions(ds);
+      expect(mocks.getMessageDetail).not.toHaveBeenCalled();
+      expect(writes).toEqual([]);
+      expect(ds.session.crossPrincipalInterruptions).toEqual([record]);
+    });
+
+    it('preserves legacy behavior without source lookups', async () => {
+      const { ds } = seedIndependent();
+      getBot(APP).config.topicUnavailablePolicy = 'legacy';
+      unavailable.add(SOURCE);
+      await driveCrossPrincipalInterruptions(ds);
+      expect(mocks.getMessageDetail.mock.calls.filter(call => call[2]?.timeoutMs === 10000)).toEqual([]);
+      expect(writes).toHaveLength(1);
+      expect(mocks.forkWorker).toHaveBeenCalledTimes(1);
+    });
   });
 
   it('fails a live legacy bot send closed without addressing protocol traffic back to bots', async () => {
@@ -1435,6 +1633,7 @@ describe('XPI cross-app human classification identity', () => {
     setCardDispatcher(createLarkAskCardDispatcher({
       replyMessage: mocks.replyMessage,
       sendMessage: mocks.sendMessage,
+    getMessageDetail: mocks.getMessageDetail,
       updateMessage: vi.fn(async () => undefined),
     }));
     setCanTalkChecker(() => true);

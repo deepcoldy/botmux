@@ -2284,7 +2284,15 @@ describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
         expect(getBot(appId).config.topicUnavailablePolicy).toBe(policy);
         expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ topicUnavailablePolicy: policy });
       }
-      expect((await setPolicy('unknown')).status).toBe(400);
+      for (const invalid of ['unknown', undefined, null, 0, {}, []]) {
+        expect((await setPolicy(invalid)).status).toBe(400);
+      }
+      for (const body of ['null', '[]', '3', '{']) {
+        const invalid = await fetch(`${base}/api/bot-topic-unavailable-policy`, {
+          method: 'PUT', headers: { 'content-type': 'application/json' }, body,
+        });
+        expect(invalid.status).toBe(400);
+      }
       expect(persisted(configPath).topicUnavailablePolicy).toBe('legacy');
     });
   });

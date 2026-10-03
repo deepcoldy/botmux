@@ -32,7 +32,9 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId, ResumableSession } from '../adapters/cli/types.js';
 import { resolveCliRuntime, runtimeInstallationKey, snapshotCliRuntime } from '../adapters/cli/runtime.js';
 import { RPC_CAPABLE_CLIS } from '../codex-rpc-lifecycle.js';
-import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, uploadFile, uploadImage, UserTokenMissingError } from '../im/lark/client.js';
+import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, resolveUserUnionId, getChatModeStrict, getMessageThreadId, getMessageDetail, uploadFile, uploadImage, UserTokenMissingError } from '../im/lark/client.js';
+import type { OutboundMessageOptions } from '../im/lark/client.js';
+import { assertSendTopicsAvailable, TopicSendError } from '../cli/topic-send-guard.js';
 import { prepareForkTopic } from '../im/lark/fork-topic.js';
 import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-hosts.js';
 import { claimPairing } from '../services/pairing-store.js';
@@ -6317,6 +6319,22 @@ export async function startResumeImportSession(
   await sessionReply(sessionAnchorId(ds), t('cmd.adopt.resume_success', { cliName, project, title: target.title || target.cliSessionId.slice(0, 8) }, loc));
 }
 
+/** Freeze the command's source before attachment preparation or panel delivery. */
+function forkSourceWriteOptions(
+  appId: string, parentDs: DaemonSession, sourceMessageId?: string,
+): OutboundMessageOptions | undefined {
+  if (getBot(appId).config.topicUnavailablePolicy !== 'stop') return undefined;
+  const threadBound = (parentDs.session.scope ?? parentDs.scope ?? 'thread') !== 'chat';
+  const rootId = threadBound ? parentDs.session.rootMessageId : undefined;
+  return { beforeWrite: async () => {
+    if ((threadBound && (!rootId || rootId.startsWith('oc_'))) || sourceMessageId?.startsWith('oc_')) {
+      throw new TopicSendError('TOPIC_SEND_CHECK_FAILED', '缺少原话题消息依据，暂停发送。');
+    }
+    await assertSendTopicsAvailable(appId, [sourceMessageId, rootId],
+      (id, messageId) => getMessageDetail(id, messageId, { userCardContent: false, timeoutMs: 10000 }), 'stop');
+  } };
+}
+
 type ForkSubtopicResult =
   | { ok: true; childSessionId: string; anchorId: string; link: string }
   | { ok: false; error: string; orphanTopic: boolean };
@@ -6349,6 +6367,7 @@ export async function startForkSubtopicSession(
     type: senderIsBot ? 'bot' : 'user',
     ...(message.senderName ? { name: message.senderName } : {}),
   };
+  const sourceOptions = forkSourceWriteOptions(appId, parentDs, message.messageId);
   let anchorId: string | undefined;
 
   const recallAnchor = async (): Promise<boolean> => {
@@ -6398,7 +6417,9 @@ export async function startForkSubtopicSession(
         ]],
       },
     });
-    anchorId = await sendMessage(appId, chatId, seedPost, 'post');
+    anchorId = sourceOptions
+      ? await sendMessage(appId, chatId, seedPost, 'post', undefined, undefined, sourceOptions)
+      : await sendMessage(appId, chatId, seedPost, 'post');
     const childThreadId = (await getMessageThreadId(appId, anchorId)) ?? undefined;
 
     const childIntro = t('cmd.fork.child_intro', {
@@ -6409,6 +6430,9 @@ export async function startForkSubtopicSession(
     const availableBots = await getAvailableBots(appId, chatId);
     const childCliId = parentSession.cliLaunchSnapshot?.cliId ?? parentSession.cliId ?? botCfg.cliId;
     const { forkSession } = await import('./worker-pool.js');
+    // Seed publication may outlive its source during thread/bot lookup.
+    // Recheck before handing the first executable task to the child session.
+    if (sourceOptions?.beforeWrite) await sourceOptions.beforeWrite();
     const forkResult = await forkSession(
       parentSession.sessionId,
       chatId,
@@ -6460,7 +6484,7 @@ export async function startForkSubtopicSession(
       }
     }
     try {
-      await upsertForkPanelCard(parentDs, loc);
+      await upsertForkPanelCard(parentDs, loc, { sourceOptions });
     } catch (err) {
       logger.warn(
         `[${parentSession.sessionId.substring(0, 8)}] /fork panel refresh failed: `
@@ -6493,7 +6517,7 @@ export async function startForkSubtopicSession(
 async function upsertForkPanelCard(
   parentDs: DaemonSession,
   loc: Locale,
-  opts?: { allowEmpty?: boolean; preferredReplyToMessageId?: string },
+  opts?: { allowEmpty?: boolean; preferredReplyToMessageId?: string; sourceOptions?: OutboundMessageOptions },
 ): Promise<void> {
   const appId = parentDs.larkAppId;
   const chatId = parentDs.chatId;
@@ -6515,44 +6539,26 @@ async function upsertForkPanelCard(
   if (children.length === 0 && !opts?.allowEmpty) return;
 
   const staleCardId = parentDs.session.forkPanelCardId;
-  if (staleCardId) {
-    try {
-      await deleteMessage(appId, staleCardId);
-    } catch {
-      // It may already be withdrawn or past Lark's recall window. Posting the
-      // fresh panel is still more useful than keeping the command silent.
-    }
-  }
-
-  // Post the panel. Primary: reply-in-thread to the session's root message so
-  // the panel anchors to this conversation. Fallback: if that reply fails (the
-  // most common cause is the root message aging past Lark's reply window —
-  // surfaces as HTTP 400 — but also covers a withdrawn root), post the card flat
-  // to the chat instead. The panel IS the user-visible output of /forklist, so a
-  // swallowed failure looks like the command silently did nothing; the flat send
-  // keeps it visible. Only if BOTH transports fail do we give up (and warn).
+  const sourceOptions = opts?.sourceOptions
+    ?? forkSourceWriteOptions(appId, parentDs, opts?.preferredReplyToMessageId);
+  const stopOnFailure = getBot(appId).config.topicUnavailablePolicy === 'stop';
   const cardBody = buildForkPanelCard(children, loc);
-  // Reply targets are tried in order, then a flat send as the last resort:
-  //   1) the FRESH triggering command message (when /forklist or /fork passes
-  //      it) — a just-arrived message is never past Lark's reply window, and in
-  //      a 话题群 it keeps the panel inside the current topic;
-  //   2) the session root message — the historical target, but it can age past
-  //      the reply window (HTTP 400) or be withdrawn;
-  //   3) a flat chat sendMessage — always delivers, though in a 话题群 it starts
-  //      a new sibling topic rather than threading. The panel is the user-visible
-  //      output of /forklist, so a visible-but-flat panel beats silent nothing.
+  // Legacy may try another reply target or a flat send. Stop keeps the original
+  // target and error, including inconclusive provider/network failures.
+  const rootId = parentDs.session.rootMessageId?.startsWith('oc_')
+    ? undefined : parentDs.session.rootMessageId;
   const replyTargets: string[] = [];
   if (opts?.preferredReplyToMessageId) replyTargets.push(opts.preferredReplyToMessageId);
-  if (parentDs.session.rootMessageId
-    && parentDs.session.rootMessageId !== opts?.preferredReplyToMessageId) {
-    replyTargets.push(parentDs.session.rootMessageId);
-  }
+  if (rootId && rootId !== opts?.preferredReplyToMessageId) replyTargets.push(rootId);
   let cardId: string | undefined;
   for (const target of replyTargets) {
     try {
-      cardId = await replyMessage(appId, target, cardBody, 'interactive', true);
+      cardId = sourceOptions
+        ? await replyMessage(appId, target, cardBody, 'interactive', true, undefined, undefined, sourceOptions)
+        : await replyMessage(appId, target, cardBody, 'interactive', true);
       break;
     } catch (replyErr) {
+      if (stopOnFailure) throw replyErr;
       logger.warn(
         `[fork-panel] reply to ${target} failed `
         + `(${replyErr instanceof Error ? replyErr.message : replyErr})`,
@@ -6562,8 +6568,11 @@ async function upsertForkPanelCard(
   if (!cardId) {
     logger.warn('[fork-panel] all reply targets failed; falling back to a flat chat message');
     try {
-      cardId = await sendMessage(appId, chatId, cardBody, 'interactive');
+      cardId = sourceOptions
+        ? await sendMessage(appId, chatId, cardBody, 'interactive', undefined, undefined, sourceOptions)
+        : await sendMessage(appId, chatId, cardBody, 'interactive');
     } catch (sendErr) {
+      if (stopOnFailure) throw sendErr;
       logger.warn(
         `[fork-panel] failed to post panel card via both reply and flat send: `
         + `${sendErr instanceof Error ? sendErr.message : sendErr}`,
@@ -6571,6 +6580,11 @@ async function upsertForkPanelCard(
     }
   }
   if (cardId) {
+    // Keep the old panel until a replacement has a provider-confirmed id.
+    if (staleCardId && staleCardId !== cardId) {
+      try { await deleteMessage(appId, staleCardId); }
+      catch { /* Already withdrawn or past the recall window. */ }
+    }
     // Local guard: a write-store failure here must not bubble to /forklist's
     // outer catch (which would look like the command errored even though the
     // panel already posted). Losing only the stale-card id just means the next
