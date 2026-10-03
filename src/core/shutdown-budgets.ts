@@ -49,6 +49,13 @@ export const BOT_TURN_MUTATION_SHUTDOWN_ACQUIRE_TIMEOUT_MS = 1_000;
 export const REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS = 1_000;
 export const REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS = 1_000;
 
+/** A provider terminal is not yet user-visible completion: the daemon still
+ * has to deliver the final reply to the external IM sink. Keep this as a
+ * separate outer-shutdown reserve so a long active turn cannot consume the
+ * final-delivery window. The ordinary final pipeline retries at 0s, +5s and
+ * +15s, so 20s covers its complete scheduling backoff. */
+export const REMOTE_SHUTDOWN_FINAL_OUTPUT_DRAIN_TIMEOUT_MS = 20_000;
+
 /** Scheduling/logging slack inside the supervisor-visible daemon budget. */
 export const DAEMON_SHUTDOWN_OVERHEAD_MS = 2_000;
 export const DAEMON_WORKER_EXIT_GRACE_MS = 3_000;
@@ -91,6 +98,7 @@ export function deriveShutdownBudgets(remoteDrainTimeoutMs: number): ShutdownBud
     BOT_TURN_MUTATION_SHUTDOWN_ACQUIRE_TIMEOUT_MS
     + REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS
     + remoteDrainTimeoutMs
+    + REMOTE_SHUTDOWN_FINAL_OUTPUT_DRAIN_TIMEOUT_MS
     + REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS
     + Math.max(REMOTE_ADMISSION_RESTORE_TIMEOUT_MS, DAEMON_WORKER_EXIT_GRACE_MS)
     + DAEMON_SHUTDOWN_OVERHEAD_MS;

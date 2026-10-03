@@ -59,6 +59,13 @@ export function frozenDisplayMode(fc: FrozenCard): DisplayMode {
 export interface DaemonSession {
   session: Session;
   worker: ChildProcess | null;   // fork'd worker process
+  /** User-visible final replies that the daemon accepted from a worker but has
+   * not finished delivering yet. Graceful remote shutdown keeps the exact
+   * worker generation fenced until these promises settle, so a provider final
+   * cannot be lost between remote turn completion and daemon exit. In-memory
+   * only; entries are registered and removed by the final-output delivery
+   * pipeline. */
+  finalOutputDeliveriesInFlight?: Set<Promise<void>>;
   /** True after the current worker generation has completed init. Kept
    * separate from workerPort because backends without a Web Terminal still
    * emit screen/idle/screenshot updates and support native local attach. */

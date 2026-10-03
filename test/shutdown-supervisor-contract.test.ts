@@ -17,6 +17,7 @@ import {
   REMOTE_ADMISSION_RESTORE_TIMEOUT_MS,
   REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS,
   REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+  REMOTE_SHUTDOWN_FINAL_OUTPUT_DRAIN_TIMEOUT_MS,
   REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS,
 } from '../src/core/shutdown-budgets.js';
 import { DAEMON_GRACEFUL_EXIT_CODE } from '../src/core/supervisor-shutdown-protocol.js';
@@ -60,12 +61,13 @@ describe('graceful shutdown supervisor contract', () => {
       BOT_TURN_MUTATION_SHUTDOWN_ACQUIRE_TIMEOUT_MS
       + REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS
       + REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS
+      + REMOTE_SHUTDOWN_FINAL_OUTPUT_DRAIN_TIMEOUT_MS
       + REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS
       + Math.max(REMOTE_ADMISSION_RESTORE_TIMEOUT_MS, DAEMON_WORKER_EXIT_GRACE_MS)
       + DAEMON_SHUTDOWN_OVERHEAD_MS,
     );
-    expect(DAEMON_SHUTDOWN_MAX_MS).toBeLessThanOrEqual(28_000);
-    expect(FLEET_DAEMON_KILL_TIMEOUT_MS).toBe(29_000);
+    expect(DAEMON_SHUTDOWN_MAX_MS).toBeLessThanOrEqual(48_000);
+    expect(FLEET_DAEMON_KILL_TIMEOUT_MS).toBe(49_000);
     expect(FLEET_DAEMON_EXIT_WAIT_MS).toBe(DEFAULT_FLEET_DAEMON_EXIT_WAIT_MS);
   });
 
@@ -88,7 +90,7 @@ describe('graceful shutdown supervisor contract', () => {
   it('derives every outer wait budget from a widened remote drain', () => {
     const widenedDrainMs = 3_660_000;
     const budgets = deriveShutdownBudgets(widenedDrainMs);
-    expect(budgets.daemonShutdownMaxMs).toBe(widenedDrainMs + 16_000);
+    expect(budgets.daemonShutdownMaxMs).toBe(widenedDrainMs + 36_000);
     expect(budgets.fleetDaemonKillTimeoutMs).toBe(budgets.daemonShutdownMaxMs + 1_000);
     expect(budgets.fleetDaemonExitWaitMs).toBeGreaterThan(
       budgets.fleetDaemonKillTimeoutMs + FLEET_SUCCESSOR_SETTLE_MS,
@@ -118,9 +120,9 @@ describe('graceful shutdown supervisor contract', () => {
     expect(child.status, String(child.stderr)).toBe(0);
     expect(JSON.parse(String(child.stdout))).toEqual({
       REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS: 3_660_000,
-      DAEMON_SHUTDOWN_MAX_MS: 3_676_000,
-      FLEET_DAEMON_KILL_TIMEOUT_MS: 3_677_000,
-      FLEET_DAEMON_EXIT_WAIT_MS: 3_681_500,
+      DAEMON_SHUTDOWN_MAX_MS: 3_696_000,
+      FLEET_DAEMON_KILL_TIMEOUT_MS: 3_697_000,
+      FLEET_DAEMON_EXIT_WAIT_MS: 3_701_500,
     });
   });
 

@@ -295,6 +295,10 @@ import {
   ensurePrincipalLaneInboundTurnBinding,
 } from './core/worker-pool.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
+import {
+  allFinalOutputDeliveryCount,
+  snapshotAllFinalOutputDeliveries,
+} from './core/final-output-delivery-drain.js';
 import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
@@ -29196,9 +29200,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // within the shared absolute deadline:
     //   (1) every worker IPC channel disconnected — no NEW terminal message can
     //       be delivered; and
-    //   (2) every in-flight Codex App final-settlement resolved — an already
-    //       delivered final_output whose handler is awaiting network delivery
-    //       has finished its cb.onTurnTerminal (which synchronously enqueues).
+    //   (2) every in-flight final delivery resolved — both ordinary bridge
+    //       replies and Codex App settlements awaiting network delivery have
+    //       finished before their worker generation can disappear.
     // If either fence is not quiescent by the deadline we DO NOT close admission
     // (closing it would refuse a terminal a still-live producer may yet emit —
     // strictly worse than the pre-feature behaviour). We keep admission open,
@@ -29241,12 +29245,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     const disconnectQuiesced = await waitAllWithin(producerClosed, shutdownDeadlineMs);
 
     // Settlement fence: only meaningful once IPC is confirmed disconnected (no
-    // new settlement can be created). Await the snapshot, then re-read the count
-    // — 0 confirms every in-flight settlement (and its enqueue) has completed.
+    // new settlement or ordinary final delivery can be created). Await both
+    // snapshots, then re-read both counts — 0 confirms every daemon-owned
+    // external delivery and terminal enqueue has completed.
     let settlementQuiesced = false;
     if (disconnectQuiesced) {
-      await waitAllWithin(snapshotCodexAppFinalSettlements(), shutdownDeadlineMs);
-      settlementQuiesced = codexAppFinalSettlementCount() === 0;
+      await waitAllWithin([
+        ...snapshotCodexAppFinalSettlements(),
+        ...snapshotAllFinalOutputDeliveries(),
+      ], shutdownDeadlineMs);
+      settlementQuiesced = codexAppFinalSettlementCount() === 0
+        && allFinalOutputDeliveryCount() === 0;
     }
 
     if (disconnectQuiesced && settlementQuiesced) {

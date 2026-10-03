@@ -20,6 +20,7 @@ import {
   type PreparedRemoteShutdown,
 } from '../src/core/remote-shutdown-detach.js';
 import { sendWorkerInput } from '../src/core/worker-pool.js';
+import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
 import * as sessionStore from '../src/services/session-store.js';
 import { mutatePersistedSessionRow } from './helpers/session-store-disk.js';
 
@@ -209,6 +210,66 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
       'remote_shutdown_prepare',
       'remote_shutdown_commit',
     ]);
+  });
+
+  it('keeps the prepared remote generation fenced until its final reply delivery settles', async () => {
+    const f = fixture(undefined, (worker, message) => {
+      if (message.type === 'remote_shutdown_prepare') {
+        queueMicrotask(() => worker.emit('message', {
+          type: 'remote_shutdown_result',
+          requestId: message.requestId,
+          phase: 'prepare',
+          ok: true,
+          taskId: null,
+        }));
+      }
+    }, 'remote-runner');
+    const finishDelivery = beginFinalOutputDelivery(f.ds);
+    let prepared = false;
+    const preparing = prepareRemoteSessionForShutdown(f.ds, {
+      finalOutputDrainTimeoutMs: 1_000,
+    }).then(result => {
+      prepared = true;
+      return result;
+    });
+
+    await vi.waitFor(() => {
+      expect(f.messages.map(message => message.type)).toEqual(['remote_shutdown_prepare']);
+    });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    expect(prepared).toBe(false);
+    expect(f.ds.remoteShutdownState).toMatchObject({ phase: 'preparing' });
+
+    finishDelivery();
+    await expect(preparing).resolves.toMatchObject({ ok: true, fence: 'prepared' });
+  });
+
+  it('keeps the remote fence explicit when final reply delivery misses its drain budget', async () => {
+    const f = fixture(undefined, (worker, message) => {
+      if (message.type === 'remote_shutdown_prepare') {
+        queueMicrotask(() => worker.emit('message', {
+          type: 'remote_shutdown_result',
+          requestId: message.requestId,
+          phase: 'prepare',
+          ok: true,
+          taskId: null,
+        }));
+      }
+    }, 'remote-runner');
+    const finishDelivery = beginFinalOutputDelivery(f.ds);
+
+    const result = await prepareRemoteSessionForShutdown(f.ds, {
+      finalOutputDrainTimeoutMs: 5,
+    });
+    finishDelivery();
+
+    expect(result).toMatchObject({
+      ok: false,
+      fence: 'possible',
+      error: 'final_output_delivery_drain_timeout',
+      expectedAbortTaskId: null,
+    });
+    expect(f.ds.remoteShutdownState).toMatchObject({ phase: 'preparing' });
   });
 
   it('retains only the ambiguous session fence and restores an unrelated prepared peer', async () => {

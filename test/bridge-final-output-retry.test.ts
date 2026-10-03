@@ -1588,6 +1588,35 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.lastBridgeEmittedUuid).toBeUndefined();
   });
 
+  it('keeps a shutdown drain registration until an ordinary bridge final finishes delivery', async () => {
+    let resolveReply!: (messageId: string) => void;
+    const sessionReply = vi.fn(() => new Promise<string>(resolve => {
+      resolveReply = resolve;
+    }));
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      ...finalOutputMsg(),
+      sessionId: ds.session.sessionId,
+    });
+    await vi.advanceTimersByTimeAsync(1);
+
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    expect(ds.finalOutputDeliveriesInFlight?.size).toBe(1);
+
+    resolveReply('om_reply');
+    await vi.waitFor(() => {
+      expect(ds.finalOutputDeliveriesInFlight).toBeUndefined();
+    });
+  });
+
   it('drops final_output whose worker sessionId does not match the daemon session', async () => {
     const sessionReply = vi.fn(async () => 'om_reply');
     initWorkerPool({

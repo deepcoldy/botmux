@@ -131,6 +131,7 @@ import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery } from '../im/lark/oncall-group.js';
+import { beginFinalOutputDelivery } from './final-output-delivery-drain.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -16539,14 +16540,7 @@ function setupWorkerHandlers(
         if (msg.turnId.startsWith('mlrp_turn_')) {
           markMessageListenerRunPreviewRunning(msg.turnId);
         }
-        deliverFinalOutput(
-          ds,
-          msg,
-          t,
-          0,
-          undefined,
-          ownsLifecycleMutation,
-        );
+        deliverFinalOutputWithShutdownDrain(ds, msg, t, ownsLifecycleMutation);
         break;
       }
 
@@ -16821,6 +16815,32 @@ function setupWorkerHandlers(
 
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
 const codexAppFinalSettlementInFlight = new Map<string, Promise<boolean>>();
+
+/** Ordinary bridge finals are daemon-owned external effects. Keep one exact
+ * shutdown drain registration alive across all bounded retry attempts; the
+ * provider terminal alone must not allow its worker generation to retire while
+ * attempt 0 is still queued on the event loop. */
+function deliverFinalOutputWithShutdownDrain(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
+  t: string,
+  isStillOwned: () => boolean,
+): void {
+  const finishDrain = beginFinalOutputDelivery(ds);
+  try {
+    deliverFinalOutput(
+      ds,
+      msg,
+      t,
+      0,
+      () => finishDrain(),
+      isStillOwned,
+    );
+  } catch (error) {
+    finishDrain();
+    throw error;
+  }
+}
 
 // ─── HTTP steer-group fan-out (options.steer → codex-app native turn/steer) ──
 //
