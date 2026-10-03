@@ -46,6 +46,63 @@ import {
 
 type ShellKindUnderTest = 'bash' | 'zsh' | 'sh' | 'fish';
 
+describe('host session scope reaches the pane', () => {
+  it.each(['thread', 'chat', undefined])('passes host scope %s and rejects inherited or configured replacements', (scope) => {
+    const dir = mkdtempSync(join(tmpdir(), 'session-scope-pane-'));
+    try {
+      const result = spawnSync('/bin/sh', [
+        '-c', shellWrapperScript(dir), '_', dir,
+        ...buildBotmuxEnvAssignments(
+          { BOTMUX_SESSION_ID: 'fresh-session', BOTMUX_SESSION_SCOPE: scope },
+          { BOTMUX_SESSION_SCOPE: 'configured-stale' },
+        ),
+        '/bin/sh', '-c', 'printf "%s\\n%s\\n" "${BOTMUX_SESSION_SCOPE-unset}" "$BOTMUX_SESSION_ID"',
+      ], {
+        encoding: 'utf8',
+        env: { PATH: '/usr/bin:/bin', BOTMUX_SESSION_SCOPE: 'inherited-stale', BOTMUX_SESSION_ID: 'old-session' },
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toBe(`${scope ?? 'unset'}\nfresh-session\n`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  const hasTmux = !spawnSync('tmux', ['-V']).error;
+  it.skipIf(!hasTmux)('replaces stale server scope for thread and chat panes and clears it for an unscoped pane', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'session-scope-tmux-'));
+    const socket = `bmx-scope-${process.pid}-${Date.now()}`;
+    const clientEnv = { PATH: process.env.PATH, HOME: dir };
+    const runTmux = (args: string[], env: NodeJS.ProcessEnv = clientEnv) => {
+      const result = spawnSync('tmux', ['-L', socket, ...args], { env, encoding: 'utf8', timeout: 10_000 });
+      expect(result.status, result.stderr || String(result.error ?? '')).toBe(0);
+    };
+    try {
+      runTmux(['-f', '/dev/null', 'new-session', '-d', '-s', 'holder', '/bin/sleep', '60'],
+        { ...clientEnv, BOTMUX_SESSION_SCOPE: 'stale-server' });
+      const probe = join(dir, 'probe');
+      writeFileSync(probe, '#!/bin/sh\nprintf "%s\\n%s\\n" "${BOTMUX_SESSION_SCOPE-unset}" "$BOTMUX_SESSION_ID" > "$1"\ntmux -L "$2" wait-for -S "$3"\n', { mode: 0o755 });
+      for (const [index, scope] of ['thread', 'chat', undefined].entries()) {
+        const resultPath = join(dir, `result-${index}`);
+        const signal = `done-${index}`;
+        runTmux(['new-session', '-d', '-s', `probe-${index}`,
+          ...shellCommandArgv({ shell: '/bin/sh', flags: [] }, shellWrapperScript(dir), [
+            dir,
+            ...buildBotmuxEnvAssignments({ BOTMUX_SESSION_ID: `session-${index}`, BOTMUX_SESSION_SCOPE: scope }),
+            probe, resultPath, socket, signal,
+          ]),
+        ]);
+        runTmux(['wait-for', signal]);
+        expect(readFileSync(resultPath, 'utf8')).toBe(`${scope ?? 'unset'}\nsession-${index}\n`);
+      }
+    } finally {
+      spawnSync('tmux', ['-L', socket, 'kill-server'], { env: clientEnv, timeout: 10_000 });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+
 describe('Aiden Codex pane launch', () => {
   it.each(['high', 'xhigh', 'max', 'ultra'])('carries %s through wrapper selection, pane env and the executable shim', (effort) => {
     const dir = mkdtempSync(join(tmpdir(), 'aiden-pane-'));

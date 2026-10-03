@@ -357,6 +357,7 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // botmux ask/hooks use these to locate the daemon and route back to the
   // current session/thread. The worker refreshes them per pane/turn.
   'BOTMUX_SESSION_ID',
+  'BOTMUX_SESSION_SCOPE',
   'BOTMUX_CHAT_ID',
   // Session-scoped plugin MCP relay. The worker owns the credential-bearing
   // Gateway; the CLI and its native MCP launcher receive only this socket
@@ -504,8 +505,8 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
  * botmux ever sets, same contract as GROK_HOME; BOTS_CONFIG /
  * SESSION_DATA_DIR / BOTMUX_LARK_LIST_BOTS_API_* are documented ambient or
  * ecosystem-block config). The reverse also holds: session/sandbox routing
- * keys the pane transport never carries (BOTMUX_SESSION_SCOPE,
- * BOTMUX_SEND_RELAY) still need scrubbing here. Every entry below is
+ * keys the pane transport never carries (BOTMUX_SEND_RELAY) still need
+ * scrubbing here. Every entry below is
  * session-scoped BY CONSTRUCTION: the daemon/worker computes and injects it
  * per session AFTER every boundary scrub, and no ambient/env-file channel for
  * it exists.
