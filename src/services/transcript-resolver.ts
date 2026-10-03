@@ -28,7 +28,7 @@ export interface TranscriptPathQuery {
    *  (CLI-data-redirected) bots whose transcripts live under
    *  `<botmuxHome>/bots/<appId>/claude` instead of the global data dir. */
   larkAppId?: string;
-  /** Bypass a cached miss for lazily-created transcripts. */
+  /** Bypass a cached miss; for Codex also refresh a possibly rotated path. */
   fresh?: boolean;
 }
 
@@ -42,6 +42,7 @@ const SESSION_PATH_CACHE_MAX_ENTRIES = 1024;
 /** A missed lookup (transcript not on disk yet) is retried only after this
  *  window — fresh sessions otherwise trigger a directory scan per row render. */
 const PATH_MISS_RETRY_MS = 30_000;
+const CODEX_PATH_HIT_TTL_MS = 5_000;
 
 export function __resetTranscriptResolverCacheForTest(): void {
   sessionPathCache.clear();
@@ -277,14 +278,14 @@ function codexRolloutInHome(
   };
   let path = cachedTranscriptPathLookup(
     key,
-    null,
+    CODEX_PATH_HIT_TTL_MS,
     lookup,
-    { retryMiss: q.fresh },
+    { retryMiss: q.fresh, refreshHit: q.fresh },
   );
   // Positive entries were historically cached forever. Refresh immediately if
   // the file vanished or was replaced by a symlink/non-regular node.
   if (path && candidateMtime(path) === null) {
-    path = cachedTranscriptPathLookup(key, null, lookup, { refreshHit: true, retryMiss: true });
+    path = cachedTranscriptPathLookup(key, CODEX_PATH_HIT_TTL_MS, lookup, { refreshHit: true, retryMiss: true });
   }
   return candidateMtime(path) === null ? null : path;
 }
