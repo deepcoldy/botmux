@@ -229,8 +229,9 @@ export function recordCompleted(
 ): void {
   // Serialize with recordFailedStrict on the same per-session lock so a
   // completed proof and a dispatch_unknown failure can't interleave-clobber.
-  // Completed is the STRONGER evidence: it always wins (a late completed
-  // overwrites a previously-written dispatch_unknown — the turn did finish).
+  // A completed proof can replace an ambiguous dispatch_unknown outcome.
+  // An explicit worker failure or caller interrupt is already terminal; a
+  // late transcript/fallback must not promote either to a successful result.
   ensureDir();
   withFileLockSync(getFilePath(sessionId), () => {
     const file = load(sessionId);
@@ -239,7 +240,8 @@ export function recordCompleted(
     // An acknowledged explicit interrupt is the caller-selected terminal
     // boundary. A late transcript final may have been emitted concurrently
     // with Ctrl+C, but must not rewrite the externally observed cancellation.
-    if (prev?.status === 'interrupted') return;
+    if (prev?.status === 'interrupted'
+      || (prev?.status === 'failed' && prev.reason === 'turn_terminal')) return;
     file.results[triggerId] = {
       status: 'completed',
       createdAt: prev?.createdAt ?? completedAt,

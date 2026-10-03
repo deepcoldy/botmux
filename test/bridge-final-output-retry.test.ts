@@ -3556,6 +3556,35 @@ describe('Worker turn_terminal routing', () => {
     expect(sessionReply.mock.calls[1][4]).toBe('other-turn');
   });
 
+  it.each([
+    { silent: false, notice: 'Model service refused this turn', expected: 1 },
+    { silent: true, notice: 'Model service refused this turn', expected: 0 },
+    { silent: false, notice: undefined, expected: 0 },
+  ])('handles suppressed trigger failure diagnostics without leaking partial text: %j', async ({ silent, notice, expected }) => {
+    const ds = makeDs();
+    ds.suppressedTriggerFinalTurns = new Map([['trg_failed', Date.now()]]);
+    if (silent) ds.silentScheduledTurns = new Map([['trg_failed', Date.now()]]);
+    const sessionReply = vi.fn(async () => 'om_failure');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const output: Extract<WorkerToDaemon, { type: 'final_output' }> = {
+      type: 'final_output', sessionId: ds.session.sessionId,
+      turnId: 'trg_failed', lastUuid: 'failed-uuid',
+      content: 'INTERNAL_PARTIAL_RECEIPT\nModel service refused this turn',
+      turnFailed: true, turnFailureNotice: notice,
+    };
+    (ds.worker as any).emit('message', output);
+    await new Promise(r => setTimeout(r, 10));
+    expect(sessionReply).toHaveBeenCalledTimes(expected);
+    if (expected) {
+      expect(sessionReply.mock.calls[0][1]).toContain(notice);
+      expect(sessionReply.mock.calls[0][1]).not.toContain('INTERNAL_PARTIAL_RECEIPT');
+      (ds.worker as any).emit('message', output);
+      await new Promise(r => setTimeout(r, 10));
+      expect(sessionReply).toHaveBeenCalledTimes(1);
+    }
+  });
+
   it('keeps a newer silent retry armed when stale output and terminal arrive first', async () => {
     const ds = makeDs();
     ds.suppressedFinalOutputTurns = new Map([['delivery-stable-key', 2]]);

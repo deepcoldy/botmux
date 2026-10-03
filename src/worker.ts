@@ -227,7 +227,7 @@ import {
   setCodexAppThreadName,
 } from './services/codex-app-threads.js';
 import { buildBotmuxLarkNativeSessionTitle } from './core/session-title.js';
-import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult, type CodexDrainState } from './services/codex-transcript.js';
+import { CODEX_QUOTA_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, drainCodexRollout, findCodexRolloutBySessionId, findCodexRolloutByPid, findCodexRolloutSetByPid, codexHistorySidIsOwned, splitCodexEventsByCutoff, extractLastCodexTurn, codexSessionIdFromRolloutPath, isCodexRateLimitEvent, scanCodexThreadSettings, readLatestCodexRuntime, type CodexBridgeEvent, type CodexDrainResult, type CodexDrainState } from './services/codex-transcript.js';
 import { CodexServiceTierTracker, resolveCodexServiceTierSnapshot } from './services/codex-service-tier.js';
 import { WORKER_IPC_HANDLER_READY_EVENT } from './worker-ipc-preload.js';
 import { drainTraexRollout, findTraexRolloutBySessionId, findTraexRolloutByPid, findTraexRolloutSetByPid, readLatestTraexRuntime, traexHistorySidIsOwned, type TraexDrainResult, type TraexRuntimeSnapshot } from './services/traex-transcript.js';
@@ -5137,7 +5137,11 @@ function emptyCompletedBridgeFallbackContent(): string {
 
 function failedBridgeFailureText(errorCode?: string, summary?: string): string {
   const reason = summary || t('worker.failed_reason_unavailable');
-  const key = errorCode === CODEX_INVALID_REQUEST_ERROR_CODE
+  const key = errorCode === CODEX_QUOTA_ERROR_CODE
+    ? 'worker.empty_final_failed_quota'
+    : errorCode === CODEX_RATE_LIMIT_ERROR_CODE
+      ? 'worker.empty_final_failed_rate_limit'
+    : errorCode === CODEX_INVALID_REQUEST_ERROR_CODE
     ? 'worker.empty_final_failed_invalid_request'
     : errorCode === CODEX_AUTH_ERROR_CODE
       ? 'worker.empty_final_failed_auth'
@@ -8469,7 +8473,11 @@ function emitReadyCodexTurns(): void {
       // Failure-fallback notice (not a model answer): lets the daemon add a
       // human @mention so e.g. a model-gateway outage doesn't scroll by
       // silently in bot-to-bot sessions.
-      ...(fallbackKind === 'failed' ? { turnFailed: true } : {}),
+      ...(fallbackKind === 'failed' ? {
+        turnFailed: true,
+        turnFailureCode: turn.terminalErrorCode || 'worker_turn_failed',
+        turnFailureNotice: failedBridgeFailureText(turn.terminalErrorCode, turn.terminalErrorSummary),
+      } : {}),
     });
   }
   for (const turn of ready) {

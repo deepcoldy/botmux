@@ -226,6 +226,104 @@ describe('async-HTTP settle-on-terminal (daemon turn_terminal handler)', () => {
     expect(ds.idempotentAsyncTurns!.get('turn-bare')).toBeDefined(); // convergence entry intact
   });
 
+  it.each(['codex', 'traex', 'claude-code'])('settles %s failed fallback as failure, never completed text', async cliId => {
+    const ds = makeDs(); ds.session.cliId = cliId;
+    ds.asyncTriggerResults = new Map([['failure', { status: 'pending' } as any]]);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId, turnId: 'failure', lastUuid: 'failure',
+      content: 'redacted diagnostic', turnFailed: true, turnFailureCode: 'codex_quota_exceeded',
+    });
+    await vi.waitFor(() => expect(ds.asyncTriggerResults!.get('failure')?.status).toBe('failed'));
+    expect(recordTerminalFailureStrictMock).toHaveBeenCalledWith(ds.session.sessionId, 'failure', expect.any(Number), 'app_test', 'codex_quota_exceeded');
+    expect(recordCompletedMock).not.toHaveBeenCalled();
+    expect(ds.failedIdleTurnId).toBe('failure');
+    (ds.worker as any).emit('message', { type: 'final_output', sessionId: ds.session.sessionId,
+      turnId: 'failure', lastUuid: 'late-output', content: 'late output' });
+    await Promise.resolve();
+    expect(ds.asyncTriggerResults!.get('failure')?.status).toBe('failed');
+    expect(recordCompletedMock).not.toHaveBeenCalled();
+  });
+
+  it('retains failure semantics for an older worker without a structured failure code', async () => {
+    const ds = makeDs();
+    ds.asyncTriggerResults = new Map([['legacy-failure', { status: 'pending' } as any]]);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId, turnId: 'legacy-failure',
+      lastUuid: 'legacy-failure', content: 'diagnostic', turnFailed: true,
+    });
+    await vi.waitFor(() => expect(ds.asyncTriggerResults!.get('legacy-failure')?.status).toBe('failed'));
+    expect(recordCompletedMock).not.toHaveBeenCalled();
+    expect(recordTerminalFailureStrictMock).toHaveBeenCalledWith(
+      ds.session.sessionId, 'legacy-failure', expect.any(Number), 'app_test', 'worker_turn_failed',
+    );
+  });
+
+  it('rejects wait-mode failed fallback without returning a successful response', async () => {
+    const ds = makeDs(); const resolve = vi.fn(), reject = vi.fn();
+    ds.pendingWaitPromises = new Map([['failure', { resolve, reject }]]);
+    ds.currentTurnId = 'newer'; ds.replyCardRunningTurnId = 'newer';
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', { type: 'final_output', sessionId: ds.session.sessionId,
+      turnId: 'failure', lastUuid: 'failure', content: 'diagnostic', turnFailed: true, turnFailureCode: 'codex_connection_failed' });
+    await vi.waitFor(() => expect(reject).toHaveBeenCalled());
+    expect(resolve).not.toHaveBeenCalled(); expect(ds.failedIdleTurnId).toBeUndefined();
+  });
+
+  it('does not leak late output into chat after rejecting an HTTP waiter', async () => {
+    const ds = makeDs();
+    const reject = vi.fn();
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    ds.pendingWaitPromises = new Map([['wait-failure', { resolve: vi.fn(), reject }]]);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const emit = (msg: any) => (ds.worker as any).emit('message', {
+      type: 'final_output', sessionId: ds.session.sessionId, turnId: 'wait-failure', ...msg,
+    });
+    emit({ lastUuid: 'failure', content: 'diagnostic', turnFailed: true });
+    await vi.waitFor(() => expect(reject).toHaveBeenCalledOnce());
+    emit({ lastUuid: 'late-final', content: 'late model output' });
+    emit({ lastUuid: 'late-diagnostic', content: 'diagnostic', turnFailed: true });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
+  it.each(['completed', 'interrupted'])('preserves an already %s result and its idle label', async status => {
+    const ds = makeDs();
+    ds.asyncTriggerResults = new Map([['settled', { status } as any]]);
+    ds.completedIdleTurnId = status === 'completed' ? 'settled' : undefined;
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', { type: 'final_output', sessionId: ds.session.sessionId,
+      turnId: 'settled', lastUuid: 'late-failure', content: 'diagnostic', turnFailed: true });
+    await Promise.resolve();
+    expect(ds.asyncTriggerResults.get('settled')?.status).toBe(status);
+    expect(ds.failedIdleTurnId).toBeUndefined();
+    expect(ds.completedIdleTurnId).toBe(status === 'completed' ? 'settled' : undefined);
+    expect(recordTerminalFailureStrictMock).not.toHaveBeenCalled();
+  });
+
+  it('does not mark a card failed when durable completion won the race', async () => {
+    const ds = makeDs();
+    ds.asyncTriggerResults = new Map([['settled', { status: 'pending' } as any]]);
+    recordTerminalFailureStrictMock.mockReturnValueOnce('already_completed');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', { type: 'final_output', sessionId: ds.session.sessionId,
+      turnId: 'settled', lastUuid: 'late-failure', content: 'diagnostic', turnFailed: true });
+    await vi.waitFor(() => expect(recordTerminalFailureStrictMock).toHaveBeenCalled());
+    expect(ds.asyncTriggerResults.has('settled')).toBe(false);
+    expect(ds.failedIdleTurnId).toBeUndefined();
+  });
+
+  it('settles native failed terminals even when no fallback text is emitted', async () => {
+    const ds = makeDs(); ds.session.cliId = 'codex';
+    ds.asyncTriggerResults = new Map([['native-failed', { status: 'pending' } as any]]);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    (ds.worker as any).emit('message', terminalMsg('native-failed', { status: 'failed', errorCode: 'codex_quota_exceeded' }));
+    await vi.waitFor(() => expect(ds.asyncTriggerResults!.get('native-failed')?.status).toBe('failed'));
+    expect(recordCompletedMock).not.toHaveBeenCalled();
+  });
+
   it('settles a failed terminal immediately and persists its provider code', async () => {
     const ds = makeDs();
     ds.asyncTriggerResults = new Map([['turn-failed', { status: 'pending' } as any]]);

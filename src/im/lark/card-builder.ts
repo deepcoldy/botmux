@@ -841,12 +841,12 @@ const PRIVATE_SNAPSHOT_TEXT_MAX = 50_000;
  *  - 'silent'：本轮判定无需回复（worker terminal outputDisposition 'nothing_to_send'）；
  *  - 'completed'：transcript 模式下最终回复卡已投递成功。
  *  只对 idle 生效，其它状态一律忽略。 */
-export type IdleCardLabel = 'silent' | 'completed';
+export type IdleCardLabel = 'silent' | 'completed' | 'failed';
 
 /** 兼容旧调用：布尔 `true` 等价于 'silent'。 */
 function normalizeIdleLabel(v: boolean | IdleCardLabel | undefined): IdleCardLabel | undefined {
   if (v === true) return 'silent';
-  if (v === 'silent' || v === 'completed') return v;
+  if (v === 'silent' || v === 'completed' || v === 'failed') return v;
   return undefined;
 }
 
@@ -869,7 +869,8 @@ function streamStatusLabel(status: StreamStatus, usageLimit: CliUsageLimitState 
     case 'idle': {
       const label = normalizeIdleLabel(idleLabel);
       return t(
-        label === 'completed' ? 'card.status.idle_completed'
+        label === 'failed' ? 'card.status.idle_failed'
+          : label === 'completed' ? 'card.status.idle_completed'
           : label === 'silent' ? 'card.status.idle_silent'
             : 'card.status.idle',
         undefined,

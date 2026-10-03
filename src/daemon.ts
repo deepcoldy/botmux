@@ -5390,6 +5390,7 @@ function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
   // baked into the frozen card above; live cards return to normal labels.
   ds.silentIdleTurnId = undefined;
   ds.completedIdleTurnId = undefined;
+  ds.failedIdleTurnId = undefined;
   // Lineage anchor for the deliberate-silence label: a turn_terminal that lands
   // AFTER this point belongs to an older turn (type-ahead admits the follow-up
   // while the previous turn is still running) and must not relabel this card.

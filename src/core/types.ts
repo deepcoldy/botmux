@@ -41,7 +41,7 @@ export interface FrozenCard {
   silentIdle?: boolean;
   /** 冻结时的 idle 卡头标签：'silent' = 判定无需回复；'completed' = transcript
    *  模式下最终回复卡已投递。新写入以此为准，`silentIdle` 仅为读旧盘保留。 */
-  idleLabel?: 'silent' | 'completed';
+  idleLabel?: 'silent' | 'completed' | 'failed';
 }
 
 /** Resolve effective display mode for a frozen card.
@@ -423,6 +423,7 @@ export interface DaemonSession {
    *  idle 时卡头显示「已完成」而非「等待输入」。清理点与 `silentIdleTurnId`
    *  完全一致（每个新轮次入口）。内存态，不落盘。 */
   completedIdleTurnId?: string;
+  failedIdleTurnId?: string;
   /** turnId of the most recently STARTED turn (beginNewTurn and both
    *  worker-exited re-fork branches). Lineage anchor for `silentIdleTurnId`: a
    *  turn_terminal that lands after a NEWER turn already opened — the normal
@@ -601,6 +602,8 @@ export interface DaemonSession {
   /** Wait Mode / HTTP Sync integration: pending Promise handlers for synchronous
    *  webhook triggers waiting for a response in this session. Key is turnId. */
   pendingWaitPromises?: Map<string, { resolve: (text: string) => void; reject?: (err: Error) => void }>;
+  /** Bounded HTTP terminal tombstones: late outputs cannot fall through to IM. */
+  settledHttpTerminalTurns?: Set<string>;
   /** Async webhook trigger state keyed by triggerId. `sessionId` polling reads
    *  `latestAsyncTriggerId`; callers that need exact-match semantics can also
    *  pass the triggerId returned by the initial async activation response. */

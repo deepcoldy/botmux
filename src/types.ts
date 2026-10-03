@@ -2091,6 +2091,11 @@ export type WorkerToDaemon =
        *  recipient (bot-to-bot dispatch), so model-service outages don't pass
        *  silently. Presentation-only — never affects turn settlement. */
       turnFailed?: boolean;
+      /** Structured failed terminal accompanying the diagnostic; never model text. */
+      turnFailureCode?: string;
+      /** Redacted terminal diagnostic only, without partial model text. May
+       * surface as auxiliary failure UI when a loud trigger hides its answer. */
+      turnFailureNotice?: string;
       userText?: string;
       /** Two-phase Codex App final settlement; daemon persists before ACKing worker. */
       codexAppSettlement?: {

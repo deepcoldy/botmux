@@ -1223,6 +1223,7 @@ export function silentIdleCardFlag(ds: DaemonSession): boolean {
  *  卡头照旧「等待输入」。两个 turnId 在每个新轮次入口一起清理，正常不会同时
  *  存在；万一同时存在，「已完成」更贴近事实（回复确实发出去了）。 */
 export function idleCardLabel(ds: DaemonSession): IdleCardLabel | undefined {
+  if (ds.failedIdleTurnId) return 'failed';
   if (ds.completedIdleTurnId) return 'completed';
   if (ds.silentIdleTurnId) return 'silent';
   return undefined;
@@ -12919,9 +12920,12 @@ function setupWorkerHandlers(
   const managedFinalOutputSuppressed = (
     turnId?: string,
     dispatchAttempt?: number,
+    terminalDiagnostic = false,
   ): boolean => {
     if (isSilentScheduledTurn(ds, turnId)) return true;
-    if (isTriggerFinalSuppressed(ds, turnId)) return true;
+    // Loud triggers suppress model replies, not a redacted runtime failure.
+    // Scheduled silence and managed/attempt ownership remain authoritative.
+    if (!terminalDiagnostic && isTriggerFinalSuppressed(ds, turnId)) return true;
     // Only a genuinely meeting-driven turn is subject to the durable meeting-send
     // policy; a plain user turn on this session posts through the ordinary path
     // (see isMeetingDrivenTurn).
@@ -13126,6 +13130,8 @@ function setupWorkerHandlers(
         // Compatibility/fallback: a commit also proves receipt if the earlier
         // receipt ACK was delayed or dropped on the reverse IPC channel.
         completeOrdinaryImDelivery(ds, msg.turnId, workerGeneration);
+        ds.failedIdleTurnId = undefined;
+        ds.settledHttpTerminalTurns?.delete(msg.turnId);
         commitTriggerStreamingCard(ds, msg.turnId, (target, title, turnId) => {
           if (!managedAuxUiSuppressed(turnId) && !streamingCardDisabled(target, turnId)
             && !getBot(target.larkAppId).config.privateCard) {
@@ -15374,13 +15380,15 @@ function setupWorkerHandlers(
           );
         }
         let nonLarkFailureHandled = false;
-        if (isClaudeProviderFailure && !ds.session.vcMeetingReceiver) {
+        if ((isClaudeProviderFailure || msg.status === 'failed' || msg.status === 'ambiguous')
+          && !ds.session.vcMeetingReceiver) {
           const failureCode = msg.errorCode ?? msg.status;
           const waitPromise = ds.pendingWaitPromises?.get(msg.turnId);
           if (waitPromise) {
             nonLarkFailureHandled = true;
+            rememberHttpTerminal(ds, msg.turnId);
             ds.pendingWaitPromises?.delete(msg.turnId);
-            const failure = new Error(`Claude turn failed: ${failureCode}`);
+            const failure = new Error(`${isClaudeProviderFailure ? 'Claude' : 'Worker'} turn failed: ${failureCode}`);
             if (waitPromise.reject) waitPromise.reject(failure);
             else waitPromise.resolve(`ERROR: ${failure.message}`);
             logger.info(
@@ -15394,6 +15402,7 @@ function setupWorkerHandlers(
             || virtualDeliverySinkForChatId(ds.chatId) === 'http_async';
           if (asyncSink) {
             nonLarkFailureHandled = true;
+            rememberHttpTerminal(ds, msg.turnId);
             const failedAt = Date.now();
             if (asyncResult?.status === 'completed') {
               // final_output is stronger and may have settled immediately before
@@ -16153,10 +16162,18 @@ function setupWorkerHandlers(
         if (!msg.content || !msg.content.trim()) break;
         if (shouldDropMismatchedFinalOutput(ds, msg, t)) break;
         if (shouldDropMismatchedHermesFinalOutput(ds, msg, t)) break;
-        if (managedFinalOutputSuppressed(msg.turnId, msg.dispatchAttempt)) {
+        const triggerFailureNotice = msg.turnFailed === true
+          && isTriggerFinalSuppressed(ds, msg.turnId)
+          ? msg.turnFailureNotice?.trim()
+          : undefined;
+        if (managedFinalOutputSuppressed(msg.turnId, msg.dispatchAttempt, Boolean(triggerFailureNotice))
+          || (triggerFailureNotice && managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt))) {
           logger.debug(`[${t}] final_output captured/discarded for silent turn ${msg.turnId.substring(0, 8)}`);
           break;
         }
+        // Keep suppressed partial answers and machine receipts out of chat.
+        // Older workers lacking a separate diagnostic retain fail-closed silence.
+        const finalOutput = triggerFailureNotice ? { ...msg, content: triggerFailureNotice } : msg;
         if (!msg.sessionId) {
           logger.warn(`[${t}] final_output missing sessionId; accepting for compatibility (session=${ds.session.sessionId}, turn=${msg.turnId.substring(0, 8)})`);
         }
@@ -16186,7 +16203,7 @@ function setupWorkerHandlers(
         }
         deliverFinalOutput(
           ds,
-          msg,
+          finalOutput,
           t,
           0,
           undefined,
@@ -16808,6 +16825,7 @@ function markTurnReplyDelivered(
   msg: Extract<WorkerToDaemon, { type: 'final_output' }>,
   effectiveCliId: string | undefined,
 ): void {
+  if (msg.turnFailed) return;
   if (msg.kind && msg.kind !== 'bridge') return;
   if (ds.session.vcMeetingReceiver) return;
   if (effectiveReplyDelivery(ds.larkAppId, effectiveCliId, sessionPromptInjection(ds)) !== 'transcript') return;
@@ -16815,6 +16833,20 @@ function markTurnReplyDelivered(
   ds.completedIdleTurnId = msg.turnId;
   // 卡已 idle 就立即重刷卡头；仍在 working 则等下一次状态边沿自然带上标签。
   // 卡已冻结 / 禁用流式卡时 scheduleActiveRuntimePatch 自行 no-op。
+  if (ds.lastScreenStatus === 'idle') scheduleActiveRuntimePatch(ds);
+}
+
+function rememberHttpTerminal(ds: DaemonSession, turnId: string): void {
+  const turns = ds.settledHttpTerminalTurns ??= new Set<string>();
+  turns.add(turnId);
+  while (turns.size > 256) turns.delete(turns.values().next().value!);
+}
+
+function markFailedTurnIdle(ds: DaemonSession, turnId: string): void {
+  const latestTurn = ds.replyCardRunningTurnId ?? ds.currentTurnId;
+  if (latestTurn && latestTurn !== turnId) return;
+  ds.failedIdleTurnId = turnId;
+  ds.completedIdleTurnId = undefined;
   if (ds.lastScreenStatus === 'idle') scheduleActiveRuntimePatch(ds);
 }
 
@@ -16854,6 +16886,55 @@ function deliverFinalOutput(
   // output, resolve the Promise immediately, and DO NOT send it to Lark.
   // Dedicated receivers are structurally pinned to their audited listener
   // action and may never be diverted into these generic host-side sinks.
+  if (!managedReceiver && ds.settledHttpTerminalTurns?.has(msg.turnId)) {
+    onComplete?.(true);
+    return;
+  }
+  if (msg.turnFailed && !managedReceiver) {
+    // Older workers mark failed fallbacks without a structured provider code.
+    const failureCode = msg.turnFailureCode || 'worker_turn_failed';
+    const failedWait = ds.pendingWaitPromises?.get(msg.turnId);
+    const failedAsync = ds.asyncTriggerResults?.get(msg.turnId);
+    if (failedAsync?.status === 'completed' || failedAsync?.status === 'interrupted') {
+      rememberHttpTerminal(ds, msg.turnId);
+      onComplete?.(true);
+      return;
+    }
+    if (failedWait || failedAsync) {
+      let completedAlready = false;
+      if (failedWait) {
+        ds.pendingWaitPromises?.delete(msg.turnId);
+        const error = new Error(`Worker turn failed: ${failureCode}`);
+        if (failedWait.reject) failedWait.reject(error);
+        else failedWait.resolve(`ERROR: ${error.message}`);
+      }
+      if (failedAsync) {
+        const failedAt = Date.now();
+        failedAsync.status = 'failed';
+        failedAsync.failedAt = failedAt;
+        failedAsync.errorCode = 'trigger_failed';
+        failedAsync.terminalErrorCode = failureCode;
+        try {
+          const outcome = asyncTriggerStore.recordTerminalFailureStrict(
+            ds.session.sessionId, msg.turnId, failedAt, ds.larkAppId, failureCode,
+          );
+          if (outcome === 'already_completed') {
+            completedAlready = true;
+            ds.asyncTriggerResults?.delete(msg.turnId);
+          }
+        } catch (error) {
+          logger.error(`[${t}] Failed to persist structured failure: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      if (!completedAlready) markFailedTurnIdle(ds, msg.turnId);
+      rememberHttpTerminal(ds, msg.turnId);
+      ds.idempotentAsyncTurns?.delete(msg.turnId);
+      ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+      onComplete?.(true);
+      return;
+    }
+    if (ds.completedIdleTurnId !== msg.turnId) markFailedTurnIdle(ds, msg.turnId);
+  }
   const waitPromise = managedReceiver ? undefined : ds.pendingWaitPromises?.get(msg.turnId);
   if (waitPromise) {
     waitPromise.resolve(msg.content);
@@ -16869,9 +16950,9 @@ function deliverFinalOutput(
     // Ctrl+C can race a final already buffered by the CLI; never resurrect that
     // turn as completed in memory (which would otherwise beat the durable
     // interrupted record during trigger-result resolution).
-    if (asyncResult.status === 'interrupted') {
+    if (asyncResult.status === 'interrupted' || asyncResult.status === 'failed') {
       ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
-      logger.info(`[${t}] Ignored final_output for interrupted Async HTTP turn (turn ${msg.turnId.substring(0, 8)})`);
+      logger.info(`[${t}] Ignored final_output for terminal Async HTTP turn (turn ${msg.turnId.substring(0, 8)})`);
       onComplete?.(true);
       return;
     }

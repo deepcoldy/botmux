@@ -158,6 +158,7 @@ export interface TriggerResponse {
   };
   message?: string;
   errorCode?: TriggerErrorCode;
+  terminalErrorCode?: string;
   error?: string;
   /** Structured recovery metadata when a v2 definition is no longer runnable. */
   reason?: LegacyWorkflowRetirementReason;
