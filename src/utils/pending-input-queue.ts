@@ -259,16 +259,17 @@ export function shouldArmSpawnArgvInitialPromptBusy(opts: {
   return true;
 }
 
-/** Stop this batch when the adapter is serial-only or either side of the queue
- *  boundary is durable. A message can arrive while writeInput is awaiting its
- *  receipt; `isFlushing` admits it to the queue so the active drain can see it,
- *  but a serial adapter must leave it there until the next real idle edge. */
+/** Stop this batch when back-to-back writes are disabled or either side of the
+ *  queue boundary is durable. A message can arrive while writeInput is awaiting
+ *  its receipt; `isFlushing` admits it to the queue so the active drain can see
+ *  it, but an opted-in adapter must leave it there until the next real idle
+ *  edge. */
 export function shouldStopPendingBatch(
   written: PendingCliInput,
   next: PendingCliInput | undefined,
-  adapterSupportsTypeAhead = true,
+  allowBackToBackWrites = true,
 ): boolean {
-  return !adapterSupportsTypeAhead
+  return !allowBackToBackWrites
     || written.dispatchAttempt !== undefined
     || next?.dispatchAttempt !== undefined
     || !!written.queuedActivationToken
