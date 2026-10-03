@@ -1,3 +1,4 @@
+import * as registrationStore from '../src/services/idempotency-store.js';
 /**
  * P2: daemon-side retry of `final_output` on transient Lark failures.
  *
@@ -3790,5 +3791,44 @@ describe('Worker turn_terminal routing', () => {
       turnId: 'om_replacement',
     });
     expect(onCliExit).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('keyed turn input-commit observation', () => {
+  it('records only matching live commit ACKs and leaves write failures unknown', async () => {
+    const ds = makeDs();
+    ds.workerGeneration = ds.session.workerGeneration = 1;
+    ds.idempotentAsyncTurns = new Map([['trg_keyed', {
+      ownerLarkAppId: ds.larkAppId, key: 'original-key', kind: 'turn', workerGeneration: 1,
+    }]]);
+    const record = vi.spyOn(registrationStore, 'recordTurnInputCommit').mockReturnValue(true);
+    initWorkerPool({ sessionReply: vi.fn(async () => 'om_reply'), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const worker = ds.worker as any;
+    __testOnly_setupWorkerHandlers(ds, worker, undefined, 1);
+    try {
+      worker.emit('message', { type: 'turn_input_received', turnId: 'trg_keyed' });
+      worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_other' });
+      await Promise.resolve();
+      expect(record).not.toHaveBeenCalled();
+      worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_keyed' });
+      await Promise.resolve();
+      expect(record).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        ownerLarkAppId: ds.larkAppId, sessionId: ds.session.sessionId, triggerId: 'trg_keyed',
+        key: 'original-key', workerGeneration: 1, ownerBootId: expect.any(String),
+      }));
+      record.mockImplementationOnce(() => { throw new Error('disk full'); });
+      worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_keyed' });
+      await Promise.resolve();
+      expect(ds.idempotentAsyncTurns.has('trg_keyed')).toBe(true);
+      ds.workerGeneration = ds.session.workerGeneration = 2;
+      worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_keyed' });
+      await Promise.resolve();
+      expect(record).toHaveBeenCalledTimes(2);
+      ds.worker = new EventEmitter() as any;
+      worker.emit('message', { type: 'turn_input_committed', turnId: 'trg_keyed' });
+      await Promise.resolve();
+      expect(record).toHaveBeenCalledTimes(2);
+    } finally { record.mockRestore(); }
   });
 });

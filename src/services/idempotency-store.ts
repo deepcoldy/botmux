@@ -62,6 +62,9 @@ export interface IdempotencyRecord {
   /** Dispatch seam this lease governs (see IdempotencyKind). Omitted on legacy
    *  pre-#71 records → read as 'fresh'. */
   kind?: IdempotencyKind;
+  /** Durable observation of the exact worker input-commit ACK, not proof of a
+   * model response or successful business outcome. Absent on older records. */
+  inputCommit?: { workerGeneration: number; observedAt: number };
 }
 
 export type ClaimResult =
@@ -126,8 +129,13 @@ function withKeyLock<T>(fp: string, fn: () => T): T {
 /** Read + validate. undefined only when ABSENT. Present-but-corrupt THROWS
  *  (on the claim path an unreadable record is NOT provably absent). */
 function readRecord(fp: string): IdempotencyRecord | undefined {
-  if (!existsSync(fp)) return undefined;
-  const data = JSON.parse(readFileSync(fp, 'utf-8')) as IdempotencyRecord;
+  let raw: string;
+  try { raw = readFileSync(fp, 'utf-8'); }
+  catch (error: any) {
+    if (error?.code === 'ENOENT') return undefined;
+    throw error;
+  }
+  const data = JSON.parse(raw) as IdempotencyRecord;
   if (
     !data || typeof data !== 'object'
     || typeof data.ownerLarkAppId !== 'string'
@@ -135,8 +143,17 @@ function readRecord(fp: string): IdempotencyRecord | undefined {
     || typeof data.triggerId !== 'string'
     || typeof data.requestHash !== 'string'
     || typeof data.ownerBootId !== 'string'
-    || typeof data.revision !== 'number'
+    || !Number.isSafeInteger(data.revision) || data.revision < 1
+    || !Number.isFinite(data.createdAt) || !Number.isFinite(data.updatedAt)
     || (data.state !== 'reserved' && data.state !== 'attempting')
+    || (data.kind !== undefined && data.kind !== 'fresh' && data.kind !== 'turn')
+    || (data.inputCommit !== undefined && (
+      data.kind !== 'turn' || data.state !== 'attempting'
+      || !data.inputCommit || typeof data.inputCommit !== 'object'
+      || !Number.isSafeInteger(data.inputCommit.workerGeneration)
+      || data.inputCommit.workerGeneration < 1
+      || !Number.isFinite(data.inputCommit.observedAt)
+    ))
   ) {
     throw new Error(`corrupt idempotency record: ${fp}`);
   }
@@ -168,6 +185,33 @@ export function lookup(ownerLarkAppId: string, key: string, kind: IdempotencyKin
   if (!rec) return undefined;
   if (rec.ownerLarkAppId !== ownerLarkAppId) return undefined;
   return rec;
+}
+
+/** Record only an exact live turn ACK against an existing attempting fence.
+ * Missing, replaced or conflicting evidence never grants permission to retry.
+ * Duplicate ACKs keep the first observation and do not churn the revision. */
+export function recordTurnInputCommit(input: {
+  ownerLarkAppId: string; key: string; sessionId: string; triggerId: string;
+  ownerBootId: string; workerGeneration: number; observedAt: number;
+}): boolean {
+  if (!Number.isSafeInteger(input.workerGeneration) || input.workerGeneration < 1
+    || !Number.isFinite(input.observedAt)) return false;
+  return withKeyLock(fileFor(input.ownerLarkAppId, input.key, 'turn'), () => {
+    const fp = fileFor(input.ownerLarkAppId, input.key, 'turn');
+    const current = readRecord(fp);
+    if (!current || current.kind !== 'turn' || current.state !== 'attempting'
+      || current.ownerLarkAppId !== input.ownerLarkAppId
+      || current.sessionId !== input.sessionId || current.triggerId !== input.triggerId
+      || current.ownerBootId !== input.ownerBootId) return false;
+    if (current.inputCommit) return current.inputCommit.workerGeneration === input.workerGeneration;
+    writeRecord(fp, {
+      ...current,
+      revision: current.revision + 1,
+      updatedAt: input.observedAt,
+      inputCommit: { workerGeneration: input.workerGeneration, observedAt: input.observedAt },
+    });
+    return true;
+  });
 }
 
 /**

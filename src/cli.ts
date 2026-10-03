@@ -16643,6 +16643,26 @@ switch (command) {
   case 'preview': await cmdPreview(process.argv.slice(3)); break;
   case 'continuation': await cmdContinuation(process.argv.slice(3)); break;
   case 'schedule': await cmdSchedule(process.argv[3] ?? '', process.argv.slice(4)); break;
+  case 'trigger-registration': {
+    try {
+      if (process.env.BOTMUX_SEND_RELAY || findAncestorSessionId()) throw new Error('Host context required');
+      const { parseTriggerRegistrationCommand } = await import('./cli/trigger-registration.js');
+      const command = parseTriggerRegistrationCommand(process.argv.slice(3));
+      const daemon = findDaemon(command.larkAppId);
+      if (!daemon) throw new Error('Bot daemon is unavailable');
+      const response = await fetchDaemonIpc(daemon.ipcPort, command.path,
+        { method: 'GET', signal: AbortSignal.timeout(15_000) }, loadDaemonIpcSecret());
+      const body = await response.json() as { ok?: boolean; schemaVersion?: number; larkAppId?: string; sessionId?: string };
+      if (response.ok && (body.ok !== true || body.schemaVersion !== 1
+        || body.larkAppId !== command.larkAppId || body.sessionId !== command.sessionId)) throw new Error('Registration observation identity mismatch');
+      console.log(JSON.stringify(body));
+      if (!response.ok) process.exitCode = 1;
+    } catch (error) {
+      console.error(`botmux trigger-registration: ${error instanceof Error ? error.message : String(error)}`);
+      process.exitCode = 1;
+    }
+    break;
+  }
   case 'ask': {
     // `botmux ask buttons --options ...` → sub='buttons', rest=['--options', ...]
     // `botmux ask --options ...`         → sub='',        rest=['--options', ...]  (bare alias)

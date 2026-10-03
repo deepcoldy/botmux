@@ -29,6 +29,7 @@ import { reclaimIdleWorkersForAdmissionAfterTurnDrain } from './idle-worker-swee
 import { createWorkerStderrRing, WORKER_ERROR_MARKER, type WorkerStderrRing } from './worker-stderr-ring.js';
 import * as sessionStore from '../services/session-store.js';
 import * as asyncTriggerStore from '../services/async-trigger-store.js';
+import { recordTurnInputCommit } from '../services/idempotency-store.js';
 import { drainCodexRollout, findCodexRolloutBySessionId } from '../services/codex-transcript.js';
 import {
   markMessageListenerRunPreviewFailed,
@@ -13126,6 +13127,23 @@ function setupWorkerHandlers(
         // Compatibility/fallback: a commit also proves receipt if the earlier
         // receipt ACK was delayed or dropped on the reverse IPC channel.
         completeOrdinaryImDelivery(ds, msg.turnId, workerGeneration);
+        const registeredTurn = ds.idempotentAsyncTurns?.get(msg.turnId);
+        if (registeredTurn?.kind === 'turn'
+          && registeredTurn.ownerLarkAppId === ds.larkAppId
+          && registeredTurn.workerGeneration === workerGeneration
+          && !registeredTurn.postBarrierFault) {
+          try {
+            recordTurnInputCommit({
+              ownerLarkAppId: ds.larkAppId, key: registeredTurn.key,
+              sessionId: ds.session.sessionId, triggerId: msg.turnId,
+              ownerBootId: getDaemonBootId(), workerGeneration, observedAt: Date.now(),
+            });
+          } catch {
+            // A failed observation write leaves inputCommitted unknown. Keep
+            // the attempting fence and the normal turn lifecycle intact.
+            logger.warn('Could not persist keyed turn input-commit observation');
+          }
+        }
         commitTriggerStreamingCard(ds, msg.turnId, (target, title, turnId) => {
           if (!managedAuxUiSuppressed(turnId) && !streamingCardDisabled(target, turnId)
             && !getBot(target.larkAppId).config.privateCard) {
