@@ -10949,3 +10949,37 @@ describe('PUT /api/bot-card-prefs — tool result preference', () => {
     }
   });
 });
+
+
+describe('host interaction context observation', () => {
+  it('authenticates the real IPC route and reads current native talk policy', async () => {
+    const app = 'cli_interaction_test';
+    const sessionId = 'interaction-session';
+    registerBot({ larkAppId: app, larkAppSecret: 'fixture-secret', allowedUsers: ['ou_owner'] });
+    getBot(app).resolvedAllowedUsers = ['ou_owner'];
+    const previous = workerPool.getActiveSessionsRegistry();
+    workerPool.setActiveSessionsRegistry(new Map([['interaction', {
+      larkAppId: app, chatType: 'group',
+      session: { sessionId, larkAppId: app, status: 'active', chatId: 'oc_origin',
+        scope: 'thread', rootMessageId: 'om_origin', ownerOpenId: 'ou_owner' },
+    } as any]]));
+    try {
+      setLarkAppId(app); setIpcAuthSecret(TEST_IPC_SECRET);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const path = `/api/sessions/${sessionId}/interaction-context`;
+      const body = JSON.stringify({ larkAppId: app, chatId: 'oc_forged', ownerOpenId: 'ou_forged' });
+      const denied = await requestJson(handle.port, path, { method: 'POST', body });
+      expect(denied.status).toBe(401);
+      const query = () => requestJson(handle!.port, path, { method: 'POST', body,
+        headers: { ...trustedHostHeaders('POST', path, handle!.port), 'content-type': 'application/json' } });
+      const permitted = await query();
+      expect(permitted.status).toBe(200);
+      expect(permitted.json.context).toMatchObject({ sessionId, ownerOpenId: 'ou_owner', actorOpenId: 'ou_owner',
+        chatId: 'oc_origin', rootMessageId: 'om_origin', canTalk: true });
+      getBot(app).config.allowedUsers = ['ou_other'];
+      getBot(app).resolvedAllowedUsers = ['ou_other'];
+      expect((await query()).json.context.canTalk).toBe(false);
+      expect(permitted.bodyText).not.toContain('forged');
+    } finally { workerPool.setActiveSessionsRegistry(previous ?? new Map()); }
+  });
+});
