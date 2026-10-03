@@ -5,6 +5,15 @@ import {
   DAEMON_SHUTDOWN_MAX_MS,
   DAEMON_SHUTDOWN_OVERHEAD_MS,
   DAEMON_WORKER_EXIT_GRACE_MS,
+  DEFAULT_FLEET_DAEMON_EXIT_WAIT_MS,
+  DEFAULT_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+  deriveShutdownBudgets,
+  FLEET_DAEMON_EXIT_WAIT_MS,
+  FLEET_DAEMON_KILL_TIMEOUT_MS,
+  FLEET_SUCCESSOR_SETTLE_MS,
+  MAX_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+  MIN_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+  parseRemoteShutdownDrainTimeoutMs,
   REMOTE_ADMISSION_RESTORE_TIMEOUT_MS,
   REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS,
   REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
@@ -13,6 +22,7 @@ import {
 import { DAEMON_GRACEFUL_EXIT_CODE } from '../src/core/supervisor-shutdown-protocol.js';
 import { PM2_GRACEFUL_EXIT_CODE } from '../src/pm2-graceful-exit.js';
 import { FLEET_GRACEFUL_EXIT_CODE } from '../src/core/fleet-supervisor-policy.js';
+import { spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
 
 const cli = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
 const daemon = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
@@ -45,6 +55,7 @@ describe('graceful shutdown supervisor contract', () => {
   });
 
   it('keeps the outer daemon shutdown budget within bounds', () => {
+    expect(REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS).toBe(DEFAULT_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS);
     expect(DAEMON_SHUTDOWN_MAX_MS).toBe(
       BOT_TURN_MUTATION_SHUTDOWN_ACQUIRE_TIMEOUT_MS
       + REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS
@@ -54,6 +65,63 @@ describe('graceful shutdown supervisor contract', () => {
       + DAEMON_SHUTDOWN_OVERHEAD_MS,
     );
     expect(DAEMON_SHUTDOWN_MAX_MS).toBeLessThanOrEqual(28_000);
+    expect(FLEET_DAEMON_KILL_TIMEOUT_MS).toBe(29_000);
+    expect(FLEET_DAEMON_EXIT_WAIT_MS).toBe(DEFAULT_FLEET_DAEMON_EXIT_WAIT_MS);
+  });
+
+  it('strictly parses the provider-neutral remote drain override', () => {
+    expect(parseRemoteShutdownDrainTimeoutMs(undefined)).toBe(
+      DEFAULT_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+    );
+    expect(parseRemoteShutdownDrainTimeoutMs(String(MIN_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS))).toBe(
+      MIN_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+    );
+    expect(parseRemoteShutdownDrainTimeoutMs(String(MAX_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS))).toBe(
+      MAX_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+    );
+    for (const value of ['', '0', '11999', '12.5', ' 12000', '12000 ', '+12000', '01']) {
+      expect(() => parseRemoteShutdownDrainTimeoutMs(value), value).toThrow();
+    }
+    expect(() => parseRemoteShutdownDrainTimeoutMs('86400001')).toThrow();
+  });
+
+  it('derives every outer wait budget from a widened remote drain', () => {
+    const widenedDrainMs = 3_660_000;
+    const budgets = deriveShutdownBudgets(widenedDrainMs);
+    expect(budgets.daemonShutdownMaxMs).toBe(widenedDrainMs + 16_000);
+    expect(budgets.fleetDaemonKillTimeoutMs).toBe(budgets.daemonShutdownMaxMs + 1_000);
+    expect(budgets.fleetDaemonExitWaitMs).toBeGreaterThan(
+      budgets.fleetDaemonKillTimeoutMs + FLEET_SUCCESSOR_SETTLE_MS,
+    );
+    expect(budgets.fleetDaemonExitWaitMs).toBeGreaterThan(DEFAULT_FLEET_DAEMON_EXIT_WAIT_MS);
+  });
+
+  it('applies the override to module-level daemon, supervisor, and CLI budgets', () => {
+    const child = spawnSyncTsEvalWithRepoImports(`
+      import {
+        REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+        DAEMON_SHUTDOWN_MAX_MS,
+        FLEET_DAEMON_KILL_TIMEOUT_MS,
+        FLEET_DAEMON_EXIT_WAIT_MS,
+      } from './src/core/shutdown-budgets.js';
+      process.stdout.write(JSON.stringify({
+        REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+        DAEMON_SHUTDOWN_MAX_MS,
+        FLEET_DAEMON_KILL_TIMEOUT_MS,
+        FLEET_DAEMON_EXIT_WAIT_MS,
+      }));
+    `, {
+      cwd: process.cwd(),
+      env: { ...process.env, BOTMUX_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS: '3660000' },
+      encoding: 'utf8',
+    });
+    expect(child.status, String(child.stderr)).toBe(0);
+    expect(JSON.parse(String(child.stdout))).toEqual({
+      REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS: 3_660_000,
+      DAEMON_SHUTDOWN_MAX_MS: 3_676_000,
+      FLEET_DAEMON_KILL_TIMEOUT_MS: 3_677_000,
+      FLEET_DAEMON_EXIT_WAIT_MS: 3_681_500,
+    });
   });
 
   // ─── Migrated fleet commands (supervisor, not pm2) ──────────────────────────
