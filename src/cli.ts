@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError } from './cli/topic-send-guard.js';
+import { assertMessageTopicAvailable, assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from './cli/topic-send-guard.js';
 /**
  * CLI entry point for botmux.
  *
@@ -9866,12 +9866,8 @@ async function cmdSend(rest: string[]): Promise<void> {
   // Re-challenge immediately before observable provider effects so lengthy
   // local parsing/card preparation cannot carry an old capability across a
   // worker restart, turn rotation, or Codex ledger settlement.
-  let checkSendTopics: (() => Promise<void>) | undefined;
-  let resetTopicLookup: (() => void) | undefined;
-  let topicEffectChecked = false;
-  const revalidateIsolatedOriginBeforeEffect = async (): Promise<ManagedOriginAttestation | undefined> => {
-    if (!topicEffectChecked) { resetTopicLookup?.(); topicEffectChecked = true; }
-    await checkSendTopics?.();
+  let checkSendTopics: ((lookup?: TopicMessageLookup) => Promise<void>) | undefined;
+  const revalidateIsolatedOrigin = async (): Promise<ManagedOriginAttestation | undefined> => {
     if (!isolatedAttestationContext || !isolatedManagedOriginCtx) return undefined;
     const fresh = await attestManagedOrigin({
       context: isolatedAttestationContext,
@@ -9903,8 +9899,17 @@ async function cmdSend(rest: string[]): Promise<void> {
     }
     return fresh;
   };
-  const fenceIsolatedOriginBeforeEffect = async (): Promise<void> => {
-    await revalidateIsolatedOriginBeforeEffect();
+  const revalidateIsolatedOriginBeforeEffect = async (
+    lookup?: TopicMessageLookup,
+  ): Promise<ManagedOriginAttestation | undefined> => {
+    await checkSendTopics?.(lookup);
+    return revalidateIsolatedOrigin();
+  };
+  const fenceIsolatedOriginBeforeEffect = async (lookup?: TopicMessageLookup): Promise<void> => {
+    await revalidateIsolatedOriginBeforeEffect(lookup);
+  };
+  const fenceIsolatedOrigin = async (): Promise<void> => {
+    await revalidateIsolatedOrigin();
   };
   const isolatedHookOrigin = isolatedAttestationContext?.ipcPortFallback
     && isolatedManagedOriginCtx
@@ -9922,17 +9927,16 @@ async function cmdSend(rest: string[]): Promise<void> {
   // behavior, but bind it to a fresh challenge of this command's original
   // protected claim. The Lark client treats fence failure as hook-only loss so
   // an already-delivered primary is never reported failed and duplicated.
-  const outboundMessageOptions = (suppressHook = false) =>
-    suppressHook
+  const outboundMessageOptions = (suppressHook = false) => ({
+    beforeWrite: fenceIsolatedOriginBeforeEffect,
+    ...(suppressHook
       ? { suppressHook: true as const }
       : isolatedAttestationContext
         ? isolatedHookOrigin
-          ? {
-              beforeHook: fenceIsolatedOriginBeforeEffect,
-              hookOrigin: isolatedHookOrigin,
-            }
+          ? { beforeHook: fenceIsolatedOriginBeforeEffect, hookOrigin: isolatedHookOrigin }
           : { suppressHook: true as const }
-        : undefined;
+        : {}),
+  });
 
   // A document-comment turn has exactly one supported observable effect: a
   // plain text reply to its frozen origin target.  Validate the complete shape
@@ -10354,29 +10358,37 @@ async function cmdSend(rest: string[]): Promise<void> {
   if (envPinnedRiffBot) { try { registerBot(envPinnedRiffBot); } catch { /* */ } }
 
   const { getMessageDetail: getTopicMessageDetail } = await import('./im/lark/client.js');
+  const lookupTopic: TopicMessageLookup = (app, id) =>
+    getTopicMessageDetail(app, id, { userCardContent: false, timeoutMs: 10000 });
   // Source routing deliberately ignores explicit destination overrides.
-  const sourceTopicTarget = frozenTurnReplyTarget ?? resolveSendTarget({
-    topLevel: false, chatScope: s.scope === 'chat', chatId: s.chatId,
-    rootMessageId: s.rootMessageId, replyTargetRootId: turnReplyTarget?.rootMessageId,
-    replyTargetTurnId: turnReplyTarget?.turnId,
-    replyTargetQuoteOnly: turnReplyTarget?.quoteOnly, currentTurnId,
+  // Destination overrides do not transfer the source's policy or identity.
+  const topicSourceSession = originSession ?? s;
+  const topicSourceTurnId = originSession ? originTurnId : currentTurnId;
+  const topicSourceTurn = pickTurnReplyTarget(topicSourceSession, topicSourceTurnId);
+  const sourceTopicTarget = exactOriginDispatch?.replyTarget ?? resolveSendTarget({
+    topLevel: false, chatScope: topicSourceSession.scope === 'chat', chatId: topicSourceSession.chatId,
+    rootMessageId: topicSourceSession.rootMessageId, replyTargetRootId: topicSourceTurn?.rootMessageId,
+    replyTargetTurnId: topicSourceTurn?.turnId,
+    replyTargetQuoteOnly: topicSourceTurn?.quoteOnly, currentTurnId: topicSourceTurnId,
   });
-  const topicLookup = createTopicMessageLookupCache(getTopicMessageDetail);
-  resetTopicLookup = topicLookup.clear;
-  topicEffectChecked = false;
-  checkSendTopics = async () => {
-    if (getBot(appId).config.topicUnavailablePolicy !== 'stop') return;
-    const scheduledRoot = reusableDeferredTopicRoot({
-      session: s as SessionData & { larkAppId: string },
-      binding: readDeferredTopicBinding(dataDir, s.sessionId),
-      explicitTopLevel: false,
-    });
-    await assertSendTopicsAvailable(appId, [
-      scheduledRoot,
-      !s.deferredScheduleRun && (sourceTopicTarget.mode === 'thread' || sourceTopicTarget.mode === 'quote')
-        ? sourceTopicTarget.rootMessageId : undefined,
-      sendInto,
-    ], topicLookup.lookup, 'stop');
+  checkSendTopics = async (lookup = createTopicMessageLookupCache(lookupTopic).lookup) => {
+    const sourceAppId = topicSourceSession.larkAppId ?? appId;
+    if (getBot(sourceAppId).config.topicUnavailablePolicy === 'stop') {
+      const scheduledRoot = reusableDeferredTopicRoot({
+        session: { ...topicSourceSession, larkAppId: sourceAppId },
+        binding: readDeferredTopicBinding(dataDir, topicSourceSession.sessionId),
+        explicitTopLevel: false,
+      });
+      await assertSendTopicsAvailable(sourceAppId, [scheduledRoot],
+        lookup, 'stop');
+      if (!topicSourceSession.deferredScheduleRun && sourceTopicTarget.mode !== 'plain') {
+        await assertMessageTopicAvailable(sourceAppId, sourceTopicTarget.rootMessageId,
+          lookup);
+      }
+    }
+    await assertSendTopicsAvailable(appId, [sendInto],
+      lookup,
+      getBot(appId).config.topicUnavailablePolicy);
   };
   await checkSendTopics();
   // Resolve sender-scoped bot identities before the early voice return. Voice
@@ -10478,15 +10490,15 @@ async function cmdSend(rest: string[]): Promise<void> {
                 msgType: canonicalOutput.msgType,
                 uuid: deliveryUuid,
                 sendRoot: async (body, type, uuid) => {
-                  await revalidateIsolatedOriginBeforeEffect();
+                  await revalidateIsolatedOrigin();
                   return sendMessage(appId, targetChatId, body, type, uuid, undefined, managedProviderOptions);
                 },
                 sendTitleSeed: async (title, uuid) => {
-                  await revalidateIsolatedOriginBeforeEffect();
-                  return sendMessage(appId, targetChatId, title, 'text', uuid);
+                  await revalidateIsolatedOrigin();
+                  return sendMessage(appId, targetChatId, title, 'text', uuid, undefined, outboundMessageOptions(true));
                 },
                 replyRoot: async (root, body, type, uuid) => {
-                  await revalidateIsolatedOriginBeforeEffect();
+                  await revalidateIsolatedOrigin();
                   return replyMessage(appId, root, body, type, true, uuid, undefined, managedProviderOptions);
                 },
               })
@@ -10509,7 +10521,7 @@ async function cmdSend(rest: string[]): Promise<void> {
                   replyTargetQuoteOnly: turnReplyTarget?.quoteOnly,
                   currentTurnId,
                 });
-            await revalidateIsolatedOriginBeforeEffect();
+            await revalidateIsolatedOrigin();
             deliveredMessageId = canonicalTarget.mode === 'plain'
               ? await sendMessage(
                   appId, canonicalTarget.chatId, canonicalOutput.content, canonicalOutput.msgType,
@@ -11022,7 +11034,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         msgType,
         uuid,
         sendRoot: async (body, type, rootUuid) => {
-          await revalidateIsolatedOriginBeforeEffect();
+          await revalidateIsolatedOrigin();
           return sendMessage(
             appId,
             targetChatId,
@@ -11037,11 +11049,11 @@ async function cmdSend(rest: string[]): Promise<void> {
         // its first reply. Do not emit a user outbound hook for presentation-
         // only seed text; the alert itself still goes through the hook path.
         sendTitleSeed: async (title, rootUuid) => {
-          await revalidateIsolatedOriginBeforeEffect();
-          return sendMessage(appId, targetChatId, title, 'text', rootUuid);
+          await revalidateIsolatedOrigin();
+          return sendMessage(appId, targetChatId, title, 'text', rootUuid, undefined, outboundMessageOptions(true));
         },
         replyRoot: async (root, body, type, replyUuid) => {
-          await revalidateIsolatedOriginBeforeEffect();
+          await revalidateIsolatedOrigin();
           return replyMessage(
             appId,
             root,
@@ -11060,7 +11072,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         return deferred.messageId;
       }
     }
-    await revalidateIsolatedOriginBeforeEffect();
+    await revalidateIsolatedOrigin();
     return sendTarget.mode === 'plain'
       ? await sendMessage(
           appId,
@@ -11088,7 +11100,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     uuid?: string,
     suppressHook?: boolean,
   ): Promise<string> => {
-    await revalidateIsolatedOriginBeforeEffect();
+    await revalidateIsolatedOrigin();
     return dispatchAfterOriginGate(content, msgType, uuid, suppressHook);
   };
   const recordBridgeSendMarker = (sentAtMs: number, messageId: string, sentContent: string): void => {
@@ -11230,9 +11242,10 @@ async function cmdSend(rest: string[]): Promise<void> {
               );
             }
           : dispatchAfterOriginGate,
+        beforeWrite: fenceIsolatedOriginBeforeEffect,
         beforeEffect: originAlreadyRevalidated
           ? undefined
-          : fenceIsolatedOriginBeforeEffect,
+          : fenceIsolatedOrigin,
         beforeQuoteFallback: async () => {
           if (getBot(appId).config.topicUnavailablePolicy === 'stop') {
             throw new TopicSendError('TOPIC_SEND_BLOCKED', '引用目标已撤回，按机器人配置停止发送，不改发其他位置。');
@@ -11737,7 +11750,10 @@ async function cmdSend(rest: string[]): Promise<void> {
             send: (body, uuid) => dispatchPrimaryUnlocked(body, 'interactive', undefined, uuid ?? providerUuid),
             patch: async (id, body) => {
               const { updateMessage } = await import('./im/lark/client.js');
-              await updateMessage(appId, id, body);
+              await updateMessage(appId, id, body, { beforeWrite: async lookup => {
+                await revalidateIsolatedOriginBeforeEffect(lookup);
+                revalidateVcMeetingManagedSend();
+              } });
             },
             isWithdrawn: error => error instanceof MessageWithdrawnError,
             render: record => buildTurnReplyCard(record, {
@@ -12073,6 +12089,7 @@ async function cmdCard(rest: string[]): Promise<void> {
             input.content,
             input.sequence,
             input.uuid,
+            input.messageId,
           ),
           patchElement: input => patchCardStreamElement(
             input.larkAppId,
@@ -12081,6 +12098,7 @@ async function cmdCard(rest: string[]): Promise<void> {
             input.partialElement,
             input.sequence,
             input.uuid,
+            input.messageId,
           ),
         });
         const authority = { sessionId: sid, larkAppId, chatId: session.chatId };
@@ -12168,6 +12186,7 @@ async function cmdCard(rest: string[]): Promise<void> {
         input.content,
         input.sequence,
         input.uuid,
+        input.messageId,
       ),
       patchElement: input => patchCardStreamElement(
         input.larkAppId,
@@ -12176,6 +12195,7 @@ async function cmdCard(rest: string[]): Promise<void> {
         input.partialElement,
         input.sequence,
         input.uuid,
+        input.messageId,
       ),
     });
     const deps = {
@@ -12187,6 +12207,7 @@ async function cmdCard(rest: string[]): Promise<void> {
         ),
       resolveCardId: resolveCardKitId,
       updateSettings: async (input: {
+        messageId: string;
         larkAppId: string;
         cardId: string;
         streamingMode: boolean;
@@ -12196,6 +12217,7 @@ async function cmdCard(rest: string[]): Promise<void> {
         print?: { frequencyMs: number; step: number; strategy: 'fast' };
       }) => updateCardStreamingSettings(input.larkAppId, input.cardId, input),
       updateElementContent: async (input: {
+        messageId: string;
         larkAppId: string;
         cardId: string;
         elementId: string;
@@ -12209,6 +12231,7 @@ async function cmdCard(rest: string[]): Promise<void> {
         input.content,
         input.sequence,
         input.uuid,
+        input.messageId,
       ),
       moveRuntimeBinding: (previousStreamId: string, currentStreamId: string) =>
         runtimeBridge.reanchor(previousStreamId, currentStreamId, authority),
@@ -13133,6 +13156,28 @@ async function cmdReport(rest: string[]): Promise<void> {
   if (!s.larkAppId) { console.error(`session ${sid} 缺少 larkAppId`); process.exit(1); }
   const sessions = loadSessions();
 
+  // Destination overrides cannot erase the original session/turn source.
+  const reportOrigin = reportContext?.sessionId && reportContext.sessionId !== sid
+    ? await requireSessionById(reportContext.sessionId) : s;
+  const reportOriginTurnId = reportContext?.sessionId === reportOrigin.sessionId
+    ? reportContext.turnId : undefined;
+  const reportOriginTurn = pickTurnReplyTarget(reportOrigin, reportOriginTurnId);
+  const reportSourceAppId = reportOrigin.larkAppId!;
+  const reportSource = resolveSendTarget({
+    topLevel: false, chatScope: (reportOrigin.scope ?? 'thread') === 'chat', chatId: reportOrigin.chatId,
+    rootMessageId: reportOrigin.rootMessageId, replyTargetRootId: reportOriginTurn?.rootMessageId,
+    replyTargetTurnId: reportOriginTurn?.turnId,
+    replyTargetQuoteOnly: reportOriginTurn?.quoteOnly, currentTurnId: reportOriginTurnId,
+  });
+  const reportWriteOptions = { beforeWrite: async () => {
+    const { getBot } = await import('./bot-registry.js');
+    if (getBot(reportSourceAppId).config.topicUnavailablePolicy !== 'stop' || reportSource.mode === 'plain') return;
+    const { getMessageDetail } = await import('./im/lark/client.js');
+    await assertMessageTopicAvailable(reportSourceAppId, reportSource.rootMessageId,
+      (appId, id) => getMessageDetail(appId, id, { userCardContent: false, timeoutMs: 10000 }));
+  } };
+
+
   const { readPeerCrossRef } = await import('./services/peer-cross-ref-store.js');
   let recipientResolution: ReturnType<typeof resolveReportRecipientForSession>;
   try {
@@ -13209,7 +13254,7 @@ async function cmdReport(rest: string[]): Promise<void> {
               alreadyInReview: result.alreadyInReview,
               ...(url ? { issueUrl: url } : {}),
             }),
-            'interactive',
+            'interactive', undefined, undefined, reportWriteOptions,
           );
           delivered = true;
         } catch (e: any) {
@@ -13339,7 +13384,7 @@ async function cmdReport(rest: string[]): Promise<void> {
   try {
     let msgId: string;
     if (placement.target.mode === 'plain') {
-      msgId = await sendMessage(appId, placement.target.chatId, postJson, 'post');
+      msgId = await sendMessage(appId, placement.target.chatId, postJson, 'post', undefined, undefined, reportWriteOptions);
     } else {
       msgId = await replyMessage(
         appId,
@@ -13347,6 +13392,7 @@ async function cmdReport(rest: string[]): Promise<void> {
         postJson,
         'post',
         placement.target.mode === 'thread',
+        undefined, undefined, reportWriteOptions,
       );
     }
     const messageTarget = placement.target.mode === 'plain'

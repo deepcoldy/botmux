@@ -305,6 +305,7 @@ export interface CardStreamDeps {
   getMessageRoute: (larkAppId: string, messageId: string) => Promise<CardMessageRoute>;
   resolveCardId: (larkAppId: string, messageId: string) => Promise<string>;
   updateSettings: (input: {
+    messageId: string;
     larkAppId: string;
     cardId: string;
     streamingMode: boolean;
@@ -314,6 +315,7 @@ export interface CardStreamDeps {
     print?: { frequencyMs: number; step: number; strategy: 'fast' };
   }) => Promise<void>;
   updateElementContent: (input: {
+    messageId: string;
     larkAppId: string;
     cardId: string;
     elementId: string;
