@@ -134,7 +134,7 @@ describe('graceful shutdown supervisor contract', () => {
     const end = cli.indexOf('async function cmdRestart()', start);
     const stop = cli.slice(start, end);
     const lock = stop.indexOf('withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET');
-    const call = stop.indexOf('stopFleet()', lock);
+    const call = stop.indexOf('stopFleet(FLEET_DAEMON_EXIT_WAIT_MS)', lock);
     expect(lock).toBeGreaterThanOrEqual(0);
     expect(call).toBeGreaterThan(lock);
     expect(stop).not.toContain("runPm2(['stop'");
@@ -156,7 +156,7 @@ describe('graceful shutdown supervisor contract', () => {
     const firstAwait = restart.indexOf('await ');
     const consume = restart.indexOf('consumeRestartIntentTo(');
     const writeIntent = restart.indexOf('writeRestartAttemptIntentTo(', consume);
-    const restartFleet = restart.indexOf('restartFleet({ refreshPersistedEnv, readFailureFallback })', writeIntent);
+    const restartFleet = restart.indexOf('restartFleet({', writeIntent);
     const health = restart.indexOf('waitFleetOnline(', restartFleet);
     const removeOnFail = restart.indexOf('removeRestartIntentAttemptTo(', health);
     const commit = restart.indexOf('commitRestartIntentAttemptTo(', health);
@@ -174,6 +174,7 @@ describe('graceful shutdown supervisor contract', () => {
     expect(restart).not.toContain("runPm2(['start'");
     expect(restart).not.toContain('ecosystemConfig(');
     expect(restart).toContain('health.healthy');
+    expect(restart).toContain('timeoutMs: FLEET_DAEMON_EXIT_WAIT_MS');
   });
 
   it('uses the generation-locked best-effort clear after dashboard update locks are released', () => {
@@ -222,7 +223,8 @@ describe('graceful shutdown supervisor contract', () => {
       cli.indexOf('/**\n * Bring a SINGLE bot'),
     );
     expect(cmdStart).toContain('startFleetViaSupervisor()');
-    expect(cmdRestart).toContain('restartFleet({ refreshPersistedEnv, readFailureFallback })');
+    expect(cmdRestart).toContain('restartFleet({');
+    expect(cmdRestart).toContain('timeoutMs: FLEET_DAEMON_EXIT_WAIT_MS');
     expect(startBot).toContain('startBotViaSupervisor(');
     expect(stopBot).toContain('stopBotViaSupervisor(');
     for (const [label, region] of [['start', cmdStart], ['restart', cmdRestart], ['start-bot', startBot], ['stop-bot', stopBot]] as const) {

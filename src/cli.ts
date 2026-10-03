@@ -2863,7 +2863,7 @@ async function cmdStop(): Promise<void> {
     await withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET, async () => {
       cleanupLegacyPm2('stop'); // reap any pre-migration pm2 God still holding botmux procs
       const { stopFleet } = await import('./core/fleet-runtime.js');
-      const result = stopFleet();
+      const result = stopFleet(FLEET_DAEMON_EXIT_WAIT_MS);
       if (result.action === 'not-running') {
         cleanupStaleDaemonDescriptors();
         if (includePluginServices) await stopPluginServicesForCli(undefined, { autoOnly: true });
@@ -2944,7 +2944,11 @@ async function cmdRestart(): Promise<void> {
       const { restartFleet, fleetMemberNames, waitFleetOnline } = await import('./core/fleet-runtime.js');
       let health: ReturnType<typeof waitFleetOnline>;
       try {
-        const r = restartFleet({ refreshPersistedEnv, readFailureFallback });
+        const r = restartFleet({
+          timeoutMs: FLEET_DAEMON_EXIT_WAIT_MS,
+          refreshPersistedEnv,
+          readFailureFallback,
+        });
         if (r.stop.action === 'timeout') {
           throw new Error(
             `[restart] 旧 supervisor (pid ${r.stop.supervisorPid}) 未在超时时间内退出；已 SIGKILL 后仍存活，中止重启。`,
