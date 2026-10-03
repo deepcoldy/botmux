@@ -25,6 +25,9 @@ export interface AskApiBody {
   /** Caller kind ('hook' | 'explicit' | …) namespacing the identity so an
    *  explicit `botmux ask` can't re-claim a hook ask's card. Optional. */
   originKind?: string;
+  /** Correlates a Claude Bash permission card with an exact single-line command.
+   * Presentation only; never grants authority or changes answer permissions. */
+  permissionCommandHash?: string;
 }
 
 export type AskApiBodyError =
@@ -44,7 +47,8 @@ export type AskApiBodyError =
   | 'bad_question_shape'
   | 'bad_multiSelect'
   | 'bad_requestId'
-  | 'bad_originKind';
+  | 'bad_originKind'
+  | 'bad_permissionCommandHash';
 
 /** 校验单个 option 对象，返回解析后的 AskOption 或错误码。 */
 function parseOption(o: unknown): AskOption | AskApiBodyError {
@@ -111,6 +115,10 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     }
     requestId = r.requestId;
   }
+  if (r.permissionCommandHash !== undefined
+    && (typeof r.permissionCommandHash !== 'string' || !/^[a-f0-9]{64}$/.test(r.permissionCommandHash))) {
+    return { error: 'bad_permissionCommandHash' };
+  }
   let originKind: string | undefined;
   if (r.originKind !== undefined) {
     if (typeof r.originKind !== 'string' || !r.originKind.trim() || r.originKind.length > 32) {
@@ -157,6 +165,7 @@ export function parseAskBody(raw: unknown): AskApiBody | { error: AskApiBodyErro
     timeoutMs: r.timeoutMs,
     ...(requestId !== undefined ? { requestId } : {}),
     ...(originKind !== undefined ? { originKind } : {}),
+    ...(typeof r.permissionCommandHash === 'string' ? { permissionCommandHash: r.permissionCommandHash } : {}),
   };
 }
 

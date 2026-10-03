@@ -12,6 +12,7 @@ import {
   setCanTalkChecker,
   setAskPersistStore,
   _resetForTest,
+  listPendingAsks,
 } from '../src/core/ask-broker.js';
 import { createAskPersistStore, askKeyFor, dispatchUuidForKey, ASK_STORE_SENTINEL, type PersistedAsk } from '../src/core/ask-persist-store.js';
 import type { AskCardDispatcher, AskResult, CreateAskInput, PendingAsk } from '../src/core/ask-types.js';
@@ -103,6 +104,28 @@ function onlyPersisted(): PersistedAsk {
 }
 
 describe('ask persistence (injected store)', () => {
+  it('preserves permission correlation across restart but dormant/disconnected cards do not cover a screen', async () => {
+    const permissionCommandHash = 'a'.repeat(64);
+    const input = makeInput({permissionCommandHash});
+    setCardDispatcher(mockDispatcher());
+    const controller = new AbortController();
+    const first = registerAsk(input, controller.signal);
+    await new Promise(r => setTimeout(r, 5));
+    expect(listPendingAsks()[0]).toMatchObject({permissionCommandHash, hookWaiting: true});
+    controller.abort(); await first;
+    expect(listPendingAsks()[0].hookWaiting).toBe(false);
+    expect(onlyPersisted().permissionCommandHash).toBe(permissionCommandHash);
+    _resetForTest(); bindStore(); setCardDispatcher(mockDispatcher());
+    expect(restorePersistedAsks(Date.now(), 'cli_app')).toBe(1);
+    expect(listPendingAsks()[0]).toMatchObject({permissionCommandHash, hookWaiting: false});
+    const reattached = registerAsk(input);
+    expect(listPendingAsks()[0].hookWaiting).toBe(true);
+    setCanTalkChecker(() => true);
+    const live = listPendingAsks()[0];
+    tryResolveAsk({askId: live.askId, nonce: live.nonce, selected: 'no', by: 'ou_owner'});
+    await reattached;
+  });
+
   it('registerAsk writes a durable record; answering removes it', async () => {
     setCardDispatcher(mockDispatcher());
     const p = registerAsk(makeInput());
