@@ -7587,10 +7587,13 @@ ipcRoute('PUT', '/api/bot-envelope-injection', async (req, res) => {
 
 ipcRoute('PUT', '/api/bot-topic-unavailable-policy', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
-  let body: { topicUnavailablePolicy?: unknown };
-  try { body = await readJsonBody<{ topicUnavailablePolicy?: unknown }>(req); }
+  let body: unknown;
+  try { body = await readJsonBody<unknown>(req); }
   catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
-  const value = body.topicUnavailablePolicy;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_topic_unavailable_policy' });
+  }
+  const value = (body as Record<string, unknown>).topicUnavailablePolicy;
   if (value !== 'legacy' && value !== 'stop') return jsonRes(res, 400, { ok: false, error: 'invalid_topic_unavailable_policy' });
   const spec = findConfigField('topicUnavailablePolicy');
   if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });

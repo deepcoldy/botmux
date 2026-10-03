@@ -430,6 +430,33 @@ describe('report session relay fallback target', () => {
 });
 
 describe('report session relay delivery', () => {
+  it.each(['first', 'fallback'] as const)('does not emit a trigger when the source check fails at %s', async failure => {
+    const authorized = authorize();
+    if (!authorized.ok) throw new Error('invalid fixture');
+    const calls: string[] = [];
+    const error = new Error('source unavailable');
+    let checks = 0;
+    let unavailable = failure === 'first';
+    let projectUpdates = 0;
+    await expect(deliverReportSessionRelay({
+      decision: { ...authorized, targetChatId: 'oc_original', targetScope: 'chat' },
+      triggerMeta: { requestId: 'report:1', receivedAt: '2026-08-07T07:00:00.000Z' },
+      beforeWrite: async () => { checks++; if (unavailable) throw error; },
+      fetchTarget: async path => {
+        calls.push(path);
+        if (path === '/api/trigger') return { ok: false, status: 404, json: async () => ({ errorCode: 'session_not_found' }) };
+        unavailable = true;
+        return { ok: true, status: 200, json: async () => ({ sessions: [{
+          sessionId: 'session-current', larkAppId: 'cli_orchestrator', chatId: 'oc_original', scope: 'chat', status: 'idle',
+        }] }) };
+      },
+      postProjectUpdate: async () => { projectUpdates++; return { projectSynced: true }; },
+    })).rejects.toBe(error);
+    expect(calls).toEqual(failure === 'first' ? [] : ['/api/trigger', '/api/sessions']);
+    expect(checks).toBe(failure === 'first' ? 1 : 2);
+    expect(projectUpdates).toBe(0);
+  });
+
   it.each([
     { name: '403', response: { ok: false, status: 403, body: { ok: false, errorCode: 'forbidden' } } },
     { name: '500', response: { ok: false, status: 500, body: { ok: false, errorCode: 'trigger_failed' } } },

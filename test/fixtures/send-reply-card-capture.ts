@@ -32,6 +32,13 @@ const topicLookups = new Map<string, number>();
     const body = typeof config.data === 'string' ? JSON.parse(config.data) : config.data;
     console.log('CAPTURE_REPLY=' + JSON.stringify({ method, path: url.pathname, body }));
     data = { code: 0, data: { message_id: 'om_separate_message' } };
+  } else if (url.pathname.includes('/im/v1/messages/') && process.env.BOTMUX_TEST_TOPIC_STATE) {
+    const state = process.env.BOTMUX_TEST_TOPIC_STATE;
+    data = { code: 0, data: { items: state === 'missing' ? [] : [{
+      message_id: url.pathname.split('/').at(-1),
+      ...(state === 'unknown' ? {} : { deleted: state === 'deleted' }),
+      body: { content: '{"text":"hello"}' },
+    }] } };
   } else if (url.pathname.includes('/im/v1/messages/') && process.env.BOTMUX_TEST_TOPIC_STATES) {
     const id = url.pathname.split('/').at(-1)!;
     const states = JSON.parse(process.env.BOTMUX_TEST_TOPIC_STATES);
