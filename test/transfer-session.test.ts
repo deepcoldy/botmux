@@ -1181,6 +1181,7 @@ describe('transferSession', () => {
       'cli_app_test',
       'om_old_card',
       expect.any(String),
+      { beforeWrite: expect.any(Function) },
     );
     const closedCard = JSON.parse(updateMessageMock.mock.calls[0][2]);
     expect(closedCard.header.title.content).toContain('会话已关闭');

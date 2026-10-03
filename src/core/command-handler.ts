@@ -1606,7 +1606,7 @@ export async function handleCotCommand(
         await updateTurnReplyCard(ds, update.turnId, {
           kind: 'tools', tools: publicReplyCardTools(update.entries, getBot(larkAppId).config.thinkingCardToolResult !== false),
           activity: publicReplyCardActivity(update.entries),
-        }, (body, type, uuid) => deps.sessionReply(rootId, body, type, larkAppId, update.turnId, { uuid }),
+        }, (body, type, uuid, beforeWrite) => deps.sessionReply(rootId, body, type, larkAppId, update.turnId, { uuid, beforeWrite }),
         { dispatchAttempt: update.dispatchAttempt, forceVisible: true });
         return;
       }

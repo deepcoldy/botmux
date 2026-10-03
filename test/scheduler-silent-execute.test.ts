@@ -159,7 +159,7 @@ vi.mock('../src/core/worker-pool.js', () => ({
 }));
 
 const BOT = {
-  config: { larkAppId: 'cli_app_test', cliId: 'claude-code', cliPathOverride: undefined, defaultWorkingDir: '/tmp' },
+  config: { larkAppId: 'cli_app_test', cliId: 'claude-code', cliPathOverride: undefined, defaultWorkingDir: '/tmp', topicUnavailablePolicy: 'legacy' as 'legacy' | 'stop' },
   botName: 'TestBot',
   botOpenId: 'ou_bot',
 };
@@ -198,6 +198,7 @@ import { recordDispatchInputCommit, foldableChatSessionAppIds } from '../src/cor
 import { sessionKey } from '../src/core/types.js';
 import { writeDeferredTopicBinding, removeDeferredTopicBinding } from '../src/core/deferred-topic-binding.js';
 import { config } from '../src/config.js';
+import { TopicSendError } from '../src/cli/topic-send-guard.js';
 import {
   __testOnly_activeSessions as daemonActiveSessions,
   __testOnly_promoteMaterializedTaskPositionSession as promoteTaskPositionSession,
@@ -238,6 +239,7 @@ function forkedPayload(): any {
 }
 
 beforeEach(() => {
+  BOT.config.topicUnavailablePolicy = 'legacy';
   store.clear();
   sessionSeq = 0;
   forkWorkerMock.mockClear();
@@ -256,6 +258,28 @@ beforeEach(() => {
   getMessageThreadIdMock.mockClear();
   getMessageThreadIdMock.mockResolvedValue('omt_target_thread');
   delete (BOT.config as typeof BOT.config & { regularGroupReplyMode?: string }).regularGroupReplyMode;
+});
+
+describe('retained-topic scheduled send policy', () => {
+  it.each(['TOPIC_SEND_BLOCKED', 'TOPIC_SEND_CHECK_FAILED', 'network'] as const)(
+    'does not escape into a new topic or start a worker after %s under stop', async kind => {
+      BOT.config.topicUnavailablePolicy = 'stop';
+      const failure = kind === 'network' ? new Error('provider unavailable') : new TopicSendError(kind, 'original topic unavailable');
+      replyMessageMock.mockRejectedValueOnce(failure);
+      const active = new Map<string, DaemonSession>();
+      await expect(executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread' }), active, refreshCliVersion))
+        .rejects.toBe(failure);
+      expect(sendMessageMock).not.toHaveBeenCalled();
+      expect(forkWorkerMock).not.toHaveBeenCalled(); expect(sendWorkerInputMock).not.toHaveBeenCalled();
+      expect(active.size).toBe(0); expect(store.size).toBe(0);
+    },
+  );
+  it('preserves the legacy fallback after a failed retained-topic reply', async () => {
+    replyMessageMock.mockRejectedValueOnce(new Error('withdrawn'));
+    const active = new Map<string, DaemonSession>();
+    await executeScheduledTask(baseTask({ rootMessageId: ROOT, scope: 'thread' }), active, refreshCliVersion);
+    expect(sendMessageMock).toHaveBeenCalledOnce(); expect(forkWorkerMock).toHaveBeenCalledOnce();
+  });
 });
 
 describe('executeScheduledTask — silent thread fire', () => {

@@ -21,7 +21,10 @@ import { isSubstituteTurn } from './reply-target.js';
 import { isSilentScheduledTurn } from './silent-schedule-turns.js';
 import { isDocNativeSession, larkTransportEnabled, sessionAnchorId, type DaemonSession } from './types.js';
 
-export type ReplyCardSender = (content: string, msgType: string, uuid: string) => Promise<string>;
+/** Every native write, including overflow files, retains the record owner's gate. */
+export type ReplyCardSender = (
+  content: string, msgType: string, uuid: string, beforeWrite: () => void | Promise<void>,
+) => Promise<string>;
 const modes = new WeakMap<DaemonSession, Map<string, TurnReplyCardMode>>();
 const processStartedAtMs = Date.now();
 
@@ -91,8 +94,12 @@ export async function updateTurnReplyCard(
   const key = replyCardKey(ds, turnId, options.dispatchAttempt);
   const store = new TurnReplyCardStore(config.session.dataDir);
   const session = ds.session;
+  const chatId = ds.chatId;
+  const anchor = sessionAnchorId(ds);
   const beforeEffect = () => {
     if (ds.session !== session || session.status === 'closed' || options.owns?.() === false
+      || ds.larkAppId !== key.larkAppId || ds.session.sessionId !== key.sessionId
+      || ds.chatId !== chatId || sessionAnchorId(ds) !== anchor
       || getBot(ds.larkAppId).config.apiOnly || isSilentScheduledTurn(ds, turnId)) {
       throw new Error('Reply-card turn no longer owns delivery');
     }
@@ -114,7 +121,8 @@ export async function updateTurnReplyCard(
   }
   const transport = {
     usage,
-    beforeEffect, send: (body, uuid) => send(body, 'interactive', uuid), patch: (messageId, card) => updateMessage(ds.larkAppId, messageId, card),
+    beforeEffect, send: (body, uuid) => send(body, 'interactive', uuid, beforeEffect),
+    patch: (messageId, card) => updateMessage(ds.larkAppId, messageId, card, { beforeWrite: beforeEffect }),
     isWithdrawn: error => error instanceof MessageWithdrawnError,
     forceVisible: options.forceVisible || ds.cotForced,
     render: (record: import('../services/turn-reply-card.js').TurnReplyCardRecord) => {
@@ -132,7 +140,7 @@ export async function updateTurnReplyCard(
       atomicWriteFileSync(file, text, { mode: 0o600, followTargetSymlink: false });
       const fileKey = await uploadFile(ds.larkAppId, file);
       beforeEffect();
-      return send(JSON.stringify({ file_key: fileKey }), 'file', uuid);
+      return send(JSON.stringify({ file_key: fileKey }), 'file', uuid, beforeEffect);
     },
   } satisfies import('../services/turn-reply-card.js').TurnReplyCardTransport;
   for (let attempt = 0; ; attempt++) {

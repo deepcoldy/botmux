@@ -647,7 +647,7 @@ describe('closed live card lifecycle', () => {
       expect(workerPool.scheduleCardPatch(ds, 'late-working-card')).toBe(false);
       release();
       await vi.waitFor(() => expect(patch).toHaveBeenCalledTimes(2));
-      expect(patch).toHaveBeenLastCalledWith('app-close-card', 'om_live', 'closed-card');
+      expect(patch).toHaveBeenLastCalledWith('app-close-card', 'om_live', 'closed-card', { beforeWrite: expect.any(Function) });
       expect(sessionStore.getSession(session.sessionId)?.status).toBe('closed');
     } finally { release(); config.session.dataDir = previousDataDir; }
   });
