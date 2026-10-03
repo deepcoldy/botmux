@@ -502,9 +502,8 @@ export function buildSessionCard(
 
 /**
  * Build the "session closed" card shown after `/close` (or the close button).
- * Local sessions surface a Resume button + a copyable terminal command so the
- * user has an obvious path back. Explicitly closed remote sessions omit both:
- * their remote lineage was retired and the next message must start fresh.
+ * Surfaces a Resume button + a copyable terminal command so the user has an
+ * obvious path back instead of just a dead-end status text.
  *
  * The terminal command is the *CLI's own* resume invocation (e.g.
  * `claude --resume <id>`), built by the per-CLI adapter's
@@ -526,48 +525,42 @@ export function buildSessionClosedCard(
   locale?: Locale,
   runtimeDisplayName?: string,
   resumeStartsFresh?: boolean,
-  resumeUnsupported?: boolean,
 ): string {
   const cliName = runtimeDisplayName?.trim() || getCliDisplayName(cliId ?? 'claude-code');
   const actionBase = { root_id: rootId, session_id: sessionId, cli_id: cliId ?? 'claude-code' };
   const dirLine = workingDir ? `\n${t('card.body.working_dir', undefined, locale)}\`${escapeMd(workingDir)}\`` : '';
-  const cmdBlock = resumeUnsupported
-    ? t('card.body.remote_session_closed', undefined, locale)
-    : cliResumeCommand
-      ? `${t('card.body.click_resume_or_run', undefined, locale)}\n\`\`\`\n${cliResumeCommand}\n\`\`\``
-      : resumeStartsFresh
-        // The CLI can only resume a precise session id and none was persisted:
-        // resuming reactivates the topic's message route, but the next spawn
-        // starts a FRESH session — say so instead of implying history is back.
-        ? t('card.body.resume_starts_fresh', { cliName: escapeMd(cliName) }, locale)
-        : `${t('card.body.click_resume_only', undefined, locale)}\n${t('card.body.cli_no_cli_resume', { cliName: escapeMd(cliName) }, locale)}`;
+  const cmdBlock = cliResumeCommand
+    ? `${t('card.body.click_resume_or_run', undefined, locale)}\n\`\`\`\n${cliResumeCommand}\n\`\`\``
+    : resumeStartsFresh
+      // The CLI can only resume a precise session id and none was persisted:
+      // resuming reactivates the topic's message route, but the next spawn
+      // starts a FRESH session — say so instead of implying history is back.
+      ? t('card.body.resume_starts_fresh', { cliName: escapeMd(cliName) }, locale)
+      : `${t('card.body.click_resume_only', undefined, locale)}\n${t('card.body.cli_no_cli_resume', { cliName: escapeMd(cliName) }, locale)}`;
   const body =
     `**${escapeMd(title || cliName)}**\n` +
     `${t('card.body.cli_terminated', { cliName: escapeMd(cliName) }, locale)}${cmdBlock}` +
     dirLine;
-  const elements: unknown[] = [
-    { tag: 'markdown', content: body },
-  ];
-  if (!resumeUnsupported) {
-    elements.push({
-      tag: 'action',
-      actions: [
-        {
-          tag: 'button',
-          text: { tag: 'plain_text', content: t('card.btn.resume_session', undefined, locale) },
-          type: 'primary',
-          value: { action: 'resume', ...actionBase },
-        },
-      ],
-    });
-  }
   const card = {
     config: { wide_screen_mode: true },
     header: {
       title: { tag: 'plain_text', content: t('card.status.session_closed', undefined, locale) },
       template: 'grey',
     },
-    elements,
+    elements: [
+      { tag: 'markdown', content: body },
+      {
+        tag: 'action',
+        actions: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: t('card.btn.resume_session', undefined, locale) },
+            type: 'primary',
+            value: { action: 'resume', ...actionBase },
+          },
+        ],
+      },
+    ],
   };
   return JSON.stringify(card);
 }

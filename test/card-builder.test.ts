@@ -2046,15 +2046,16 @@ describe('buildSessionClosedCard', () => {
     expect(resumeBtn.type).toBe('primary');
   });
 
-  it('omits Resume for an explicitly closed remote session', () => {
+  it('keeps Resume available for a closed remote session', () => {
     const card = parse(buildSessionClosedCard(
       'sess-remote', 'om_root_remote', 'remote topic', 'remote-runner', '/srv/app',
-      null, 'en', undefined, false, true,
+      null, 'en', 'Remote Runner', false,
     ));
-    const md = findMarkdownContent(card);
-    expect(md).toContain('cannot be resumed');
-    expect(md).toContain('Send a new message');
-    expect(card.elements.some((element: any) => element.tag === 'action')).toBe(false);
+    const action = card.elements.find((element: any) => element.tag === 'action');
+    const resumeBtn = action.actions.find((item: any) => item.value?.action === 'resume');
+    expect(resumeBtn).toBeDefined();
+    expect(resumeBtn.value.session_id).toBe('sess-remote');
+    expect(resumeBtn.type).toBe('primary');
   });
 
   it('escapes a configured runtime name in markdown copy', () => {

@@ -62,11 +62,6 @@ function markdown(cardJson: string): string {
   return card.elements.find((element) => element.tag === 'markdown')?.content ?? '';
 }
 
-function hasResumeAction(cardJson: string): boolean {
-  const card = JSON.parse(cardJson) as { elements: Array<{ actions?: Array<{ value?: { action?: string } }> }> };
-  return card.elements.some(element => element.actions?.some(action => action.value?.action === 'resume'));
-}
-
 describe('buildClosedSessionCard — frozen runtime resume identity', () => {
   beforeEach(() => {
     botConfig.cliRuntime = {
@@ -139,18 +134,6 @@ describe('buildClosedSessionCard — frozen runtime resume identity', () => {
     expect(content).not.toContain('Current Codex');
     expect(content).not.toContain('ttadk');
     expect(content).not.toContain('new-model');
-  });
-
-  it('renders an explicitly closed remote session as terminal and non-resumable', () => {
-    const ds = makeSession();
-    ds.session.cliId = 'remote-runner';
-    ds.session.backendType = 'remote-runner';
-
-    const card = buildClosedSessionCard(ds, 'zh');
-
-    expect(markdown(card)).toContain('无法恢复');
-    expect(markdown(card)).toContain('直接发送新消息');
-    expect(hasResumeAction(card)).toBe(false);
   });
 
   it('prints Forge x TraeX resume command for a frozen Forge launch session', () => {

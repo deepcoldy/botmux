@@ -11,7 +11,6 @@
 
 import type { SessionRow } from '../core/dashboard-rows.js';
 import { backendSupportsWebTerminal } from '../adapters/backend/capabilities.js';
-import { isRemoteSessionDescriptor } from '../core/remote-cli-ids.js';
 import type {
   ButtonState,
   PaginationMeta,
@@ -242,7 +241,6 @@ export function paginate<T>(
 /** Build the detail-card DTO with the full action matrix. */
 export function composeDetail(row: SessionRow, _nowMs?: number): SessionDetailDto {
   const isClosed = row.status === 'closed';
-  const remoteResumeUnsupported = isClosed && isRemoteSessionDescriptor(row);
   const isStarting = row.status === 'starting';
   const canCloseNow = !isClosed && !isStarting;
   const supportsWebTerminal = row.backendType === undefined
@@ -257,14 +255,7 @@ export function composeDetail(row: SessionRow, _nowMs?: number): SessionDetailDt
   const locateMode: LocateMode = row.scope === 'chat' ? 'openChat' : 'openTopic';
 
   const actions: SessionActionMatrix = {
-    resume: isClosed && !remoteResumeUnsupported
-      ? { enabled: true }
-      : {
-          enabled: false,
-          reasonKey: remoteResumeUnsupported
-            ? 'sessions.action.resume.remoteUnsupported'
-            : 'sessions.action.resume.onlyClosed',
-        },
+    resume: isClosed ? { enabled: true } : { enabled: false, reasonKey: 'sessions.action.resume.onlyClosed' },
     close: canCloseNow ? { enabled: true } : {
       enabled: false,
       reasonKey: isStarting ? 'sessions.action.close.starting' : 'sessions.action.close.alreadyClosed',

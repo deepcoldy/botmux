@@ -5,7 +5,6 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { store } from '../src/dashboard/web/store.js';
 import { SessionsKanbanView, type SessionsKanbanCallbacks, type SessionsKanbanState } from '../src/dashboard/web/sessions-kanban.js';
 import {
-  canResumeSession,
   canRestartSession,
   CLI_FILTER_OPTIONS,
   SESSION_STATUS_OPTIONS,
@@ -556,13 +555,6 @@ describe('dashboard sessions filters', () => {
     expect(canRestartSession({ status: 'idle', adopt: true })).toBe(false);
     expect(canRestartSession({ status: 'starting', pendingRepo: true })).toBe(false);
     expect(canRestartSession({ status: 'idle', adopt: false, cliId: 'riff' })).toBe(false);
-  });
-
-  it('only allows closed local sessions to resume', () => {
-    expect(canResumeSession({ status: 'closed', cliId: 'codex' })).toBe(true);
-    expect(canResumeSession({ status: 'idle', cliId: 'codex' })).toBe(false);
-    expect(canResumeSession({ status: 'closed', cliId: 'remote-runner' })).toBe(false);
-    expect(canResumeSession({ status: 'closed', cliId: 'codex', backendType: 'remote-runner' })).toBe(false);
   });
 
   it('formats session location labels for group chats and direct chats', () => {

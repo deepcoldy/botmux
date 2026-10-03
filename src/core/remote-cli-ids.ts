@@ -23,12 +23,3 @@ export function isRemoteBackendId(type: string): boolean {
 export function isRemoteCliId(cliId: string | undefined): boolean {
   return cliId !== undefined && REMOTE_CLI_IDS.has(cliId);
 }
-
-/** True when a persisted/live session descriptor belongs to any remote backend. */
-export function isRemoteSessionDescriptor(session: {
-  cliId?: string;
-  backendType?: string;
-}): boolean {
-  return isRemoteCliId(session.cliId)
-    || (session.backendType !== undefined && isRemoteBackendId(session.backendType));
-}
