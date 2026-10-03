@@ -4244,9 +4244,11 @@ export async function handleCommand(
             const result = await resumeSession(managedTarget.sessionId, activeSessions);
             if (result.ok) {
               const cliName = sessionCliDisplayName(result.ds);
-              const resumeMsg = resumeStartsFresh(result.ds.session)
-                ? t('card.action.resume_success_fresh', { cliName }, localeForBot(result.ds.larkAppId))
-                : t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
+              const resumeMsg = result.recoveryPending
+                ? t('card.action.resume_started_remote', { cliName }, localeForBot(result.ds.larkAppId))
+                : resumeStartsFresh(result.ds.session)
+                  ? t('card.action.resume_success_fresh', { cliName }, localeForBot(result.ds.larkAppId))
+                  : t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
               await sessionReply(rootId, resumeMsg);
             } else if (result.error === 'not_closed') {
               await sessionReply(rootId, t('card.action.resume_not_closed', undefined, loc));
@@ -4261,6 +4263,10 @@ export async function handleCommand(
               await sessionReply(rootId, t('card.action.resume_deferred_unmaterialized', undefined, loc));
             } else if (result.error === 'resume_cancelled') {
               await sessionReply(rootId, t('card.action.resume_cancelled', undefined, loc));
+            } else if (result.error === 'resume_start_failed') {
+              await sessionReply(rootId, t('card.action.resume_start_failed', undefined, loc));
+            } else if (result.error === 'resume_reconciliation_required') {
+              await sessionReply(rootId, t('card.action.resume_reconciliation_required', undefined, loc));
             } else {
               await sessionReply(rootId, t('cmd.adopt.resume_not_found', undefined, loc));
             }

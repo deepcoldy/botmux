@@ -416,6 +416,23 @@ describe('shouldSuppressBridgeEmit', () => {
     )).toBe(false);
   });
 
+  it('never lets a terminal-independent outbound message replace the turn final', () => {
+    const final = 'final answer';
+    const marker: BridgeSendMarker = {
+      sentAtMs: 200,
+      responseKind: 'progress',
+      terminalIndependent: true,
+      contentLength: normalise(final).length,
+      previewText: final,
+    };
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: final },
+      500,
+      [marker],
+      false,
+    )).toBe(false);
+  });
+
   it('non-adopt: managed-card final suppresses; managed-card progress/auxiliary does not', () => {
     const fallback = 'A materially different and longer English summary text that the '
       + 'terminal transcription fallback would otherwise double post onto the thread today.';

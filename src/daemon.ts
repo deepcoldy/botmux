@@ -457,6 +457,7 @@ import { sendSessionOwnerThreadNotification } from './services/session-owner-not
 import {
   getSessionPersistentBackendType,
   isRemoteBackendSession,
+  isRemoteBackendType,
   killPersistentBackendTarget,
   killPersistentSession,
   probePersistentBackendTarget,
@@ -3454,8 +3455,8 @@ function scheduleDeferredScheduleSettlement(
   // Remote backends (riff / mojo) report their turn boundary over the network,
   // so allow the same longer grace as the screen-only path instead of the 300ms
   // local-filesystem one.
-  const remoteTerminal = ds.session.backendType === 'riff'
-    || ds.session.backendType === 'mojo';
+  const remoteTerminal = ds.session.backendType !== undefined
+    && isRemoteBackendType(ds.session.backendType);
   const delayMs = context.source === 'terminal'
     ? (remoteTerminal ? 1_500 : 300)
     : 1_500;
@@ -20904,7 +20905,7 @@ function coldStartPassthroughCommands(larkAppId: string): ReadonlySet<string> {
 function fastToggleUnsupportedBackend(ds: DaemonSession | undefined): boolean {
   if (!ds) return false;
   const backendType = ds.initConfig?.backendType ?? ds.session.backendType;
-  if (backendType === 'riff' || backendType === 'mojo') return true;
+  if (backendType !== undefined && isRemoteBackendType(backendType)) return true;
   return ds.initConfig?.codexRpcInput === true;
 }
 

@@ -2046,6 +2046,18 @@ describe('buildSessionClosedCard', () => {
     expect(resumeBtn.type).toBe('primary');
   });
 
+  it('keeps Resume available for a closed remote session', () => {
+    const card = parse(buildSessionClosedCard(
+      'sess-remote', 'om_root_remote', 'remote topic', 'remote-runner', '/srv/app',
+      null, 'en', 'Remote Runner', false,
+    ));
+    const action = card.elements.find((element: any) => element.tag === 'action');
+    const resumeBtn = action.actions.find((item: any) => item.value?.action === 'resume');
+    expect(resumeBtn).toBeDefined();
+    expect(resumeBtn.value.session_id).toBe('sess-remote');
+    expect(resumeBtn.type).toBe('primary');
+  });
+
   it('escapes a configured runtime name in markdown copy', () => {
     const card = parse(buildSessionClosedCard(
       'sess-5', 'om_root', '', 'codex', undefined, null, 'en',

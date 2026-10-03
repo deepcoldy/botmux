@@ -3933,7 +3933,11 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   const botCfg = ds.larkAppId ? getBot(ds.larkAppId).config : undefined;
   const cliName = sessionConfiguredRuntimeDisplayName(ds.session, botCfg?.cliRuntime)
     ?? getCliDisplayName(cliId ?? botCfg?.cliId ?? 'claude-code');
-  const notice = JSON.stringify({ text: `🔄 会话已通过命令行恢复，发条消息继续与 ${cliName} 对话。` });
+  const notice = JSON.stringify({
+    text: result.recoveryPending
+      ? `🔄 ${cliName} 远程恢复已启动，正在创建新的运行环境并恢复原会话。`
+      : `🔄 会话已通过命令行恢复，发条消息继续与 ${cliName} 对话。`,
+  });
   const postResumeNotice = async (): Promise<void> => {
     if (!ds.larkAppId) return;
     if (!sessionTransportDisabled(ds)) {
@@ -3977,10 +3981,9 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
     void postResumeNotice();
   }
 
-  // Report the EFFECTIVE action, not the raw request flag: only fork when wake
-  // was asked AND there's no live worker to clobber. (resumeSession always hands
-  // back a worker:null ds today, so this matches `wake` in practice — but
-  // reporting the action keeps the response honest if the guard ever broadens.)
+  // Report the EFFECTIVE action, not the raw request flag. Remote Runner resume
+  // materializes its provider immediately inside resumeSession, so an optional
+  // wake request only applies when that path did not already create a worker.
   const woke = wake && (!ds.worker || ds.worker.killed);
   if (woke) {
     forkWorker(ds, '', true);
@@ -3989,6 +3992,7 @@ ipcRoute('POST', '/api/sessions/:sessionId/resume', async (req, res, params) => 
   jsonRes(res, 200, {
     ok: true,
     sessionId,
+    recoveryPending: result.recoveryPending === true,
     wake: woke,
     title: ds.session.title,
     chatId: ds.chatId,

@@ -3185,9 +3185,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           // the adapter can only resume a precise cliSessionId and none was
           // persisted, the next spawn starts a FRESH session — say so instead
           // of claiming history is back.
-          const resumeMsg = resumeStartsFresh(result.ds.session)
-            ? t('card.action.resume_success_fresh', { cliName }, localeForBot(result.ds.larkAppId))
-            : t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
+          const resumeMsg = result.recoveryPending
+            ? t('card.action.resume_started_remote', { cliName }, localeForBot(result.ds.larkAppId))
+            : resumeStartsFresh(result.ds.session)
+              ? t('card.action.resume_success_fresh', { cliName }, localeForBot(result.ds.larkAppId))
+              : t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
           // Restore the ORIGINAL live streaming card (🖥️ header + usage line +
           // 显示输出/终端/操作链接/关闭会话) as a WITHDRAW-then-REPOST when live
           // cards are enabled. Card-off bots only withdraw the stale closed card
@@ -3250,6 +3252,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           await sessionReply(rootId, t('card.action.resume_deferred_unmaterialized', undefined, locDsResume));
         } else if (result.error === 'resume_cancelled') {
           await sessionReply(rootId, t('card.action.resume_cancelled', undefined, locDsResume));
+        } else if (result.error === 'resume_start_failed') {
+          await sessionReply(rootId, t('card.action.resume_start_failed', undefined, locDsResume));
+        } else if (result.error === 'resume_reconciliation_required') {
+          await sessionReply(rootId, t('card.action.resume_reconciliation_required', undefined, locDsResume));
         }
       }
     }

@@ -473,7 +473,7 @@ export function localSandboxApplies(
     env?: Record<string, string>;
   },
 ): boolean {
-  if (backendType === 'riff') return false;
+  if (backendType === 'riff' || backendType === 'remote-runner') return false;
   if (backendType === 'mojo') {
     return !isMojoFullyRemote(remoteExecution);
   }

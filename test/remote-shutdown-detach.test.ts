@@ -56,7 +56,7 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
   function fixture(
     initialTaskId: string | undefined,
     onSend: (worker: FakeWorker, message: any) => void,
-    backendType: 'riff' | 'mojo' = 'riff',
+    backendType: 'riff' | 'mojo' | 'remote-runner' = 'riff',
   ): { ds: DaemonSession; worker: FakeWorker; messages: any[] } {
     const session = sessionStore.createSession('oc_riff', 'om_riff', 'riff shutdown', 'group');
     session.larkAppId = 'app';
@@ -170,6 +170,45 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
     expect(f.ds.worker).toBeNull();
     expect(f.ds.workerViewToken).toBeNull();
     expect(f.ds.workerCardViewToken).toBeNull();
+  });
+
+  it('detaches a generic remote runner without aliasing its state into Riff lineage', async () => {
+    const f = fixture(undefined, (worker, message) => {
+      if (message.type === 'remote_shutdown_prepare') {
+        queueMicrotask(() => worker.emit('message', {
+          type: 'remote_shutdown_result',
+          requestId: message.requestId,
+          phase: 'prepare',
+          ok: true,
+          taskId: null,
+        }));
+      }
+    }, 'remote-runner');
+    f.ds.session.remoteBackendState = {
+      version: 1,
+      provider: 'test-provider',
+      generation: 2,
+      remoteSessionId: 'remote-2',
+      agentThreadId: 'thread-1',
+    };
+    sessionStore.updateSession(f.ds.session);
+
+    const prepared = asPrepared(await prepareRemoteSessionForShutdown(f.ds));
+    expect(prepared.taskId).toBeNull();
+    expect(persistPreparedRemoteShutdown(f.ds, prepared)).toEqual({ ok: true });
+    const persisted = sessionStore.getSessionFresh(f.ds.session.sessionId);
+    expect(persisted?.riffParentTaskId).toBeUndefined();
+    expect(persisted).toMatchObject({
+      remoteBackendState: {
+        remoteSessionId: 'remote-2',
+        agentThreadId: 'thread-1',
+      },
+    });
+    expect(commitPreparedRemoteShutdown(f.ds, prepared)).toBe(true);
+    expect(f.messages.map(message => message.type)).toEqual([
+      'remote_shutdown_prepare',
+      'remote_shutdown_commit',
+    ]);
   });
 
   it('retains only the ambiguous session fence and restores an unrelated prepared peer', async () => {

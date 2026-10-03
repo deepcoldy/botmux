@@ -3507,8 +3507,8 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
 export async function resumeSession(
   sessionId: string,
   activeSessions: Map<string, DaemonSession>,
-): Promise<{ ok: true; ds: DaemonSession }
-| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled'; activeSessionId?: string }> {
+): Promise<{ ok: true; ds: DaemonSession; recoveryPending?: true }
+| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled' | 'resume_start_failed' | 'resume_reconciliation_required'; activeSessionId?: string }> {
   let session = sessionStore.getSession(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
@@ -3534,6 +3534,8 @@ export async function resumeSession(
   if (session.title?.startsWith('Adopt:') || isSharedAdoptPersistedSession(session)) {
     return { ok: false, error: 'adopt_unsupported' };
   }
+  let remoteRunnerResume = session.backendType === 'remote-runner'
+    || session.cliId === 'remote-runner';
 
   const scope: 'thread' | 'chat' = session.scope === 'chat' ? 'chat' : 'thread';
   const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
@@ -3554,6 +3556,8 @@ export async function resumeSession(
     return { ok: false as const, error: 'adopt_unsupported' as const };
   }
   session = latest;
+  remoteRunnerResume = session.backendType === 'remote-runner'
+    || session.cliId === 'remote-runner';
 
   // In-memory occupant check. A daemon-command scratch (e.g. an unconfirmed
   // `/relay` picker, a bare `/help`) parks a worker:null placeholder at this
@@ -3726,8 +3730,47 @@ export async function resumeSession(
     }
     return { ok: false, error: 'resume_cancelled' };
   }
+  if (remoteRunnerResume) {
+    // Local sessions may stay worker-less until the next message. A remote
+    // Resume button has stronger semantics: start the provider immediately so
+    // it can materialize a replacement remote generation (for example a new
+    // sandbox) from the persisted opaque state. Merely flipping the durable row
+    // to active recreates the ghost-active failure this path is meant to avoid.
+    let admission: 'accepted' | 'deferred' | 'rejected' | undefined;
+    let started = false;
+    try {
+      started = forkWorker(ds, '', { resume: true }, {
+        deferDuringDeviceIsolation: false,
+        onAdmission: value => { admission = value; },
+      });
+    } catch (error) {
+      logger.warn(
+        `Remote resume ${sessionId.substring(0, 8)} failed to start: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (!started || admission !== 'accepted' || !ds.worker || ds.worker.killed) {
+      // No provider process was synchronously admitted, so no remote recovery
+      // can be in flight. Restore the row to closed through the authoritative
+      // close path before reporting failure; callers must never observe a
+      // successful Resume with no provider owner.
+      const rollback = await closeSession(sessionId);
+      if (!rollback.ok) {
+        logger.error(
+          `Remote resume ${sessionId.substring(0, 8)} could not restore the durable closed row: `
+          + rollback.error,
+        );
+        return { ok: false, error: 'resume_reconciliation_required' };
+      }
+      return { ok: false, error: 'resume_start_failed' };
+    }
+  }
   logger.info(`Resumed session ${sessionId.substring(0, 8)} (scope: ${scope}, anchor: ${anchor.substring(0, 12)})`);
-  return { ok: true, ds };
+  return {
+    ok: true,
+    ds,
+    ...(remoteRunnerResume ? { recoveryPending: true as const } : {}),
+  };
   });
 }
 

@@ -93,7 +93,9 @@ describe('worker remote retirement protocol', () => {
     expect(start).toBeGreaterThanOrEqual(0);
     expect(end).toBeGreaterThan(start);
     expect(workerPoolSource).toContain('MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS');
-    expect(prepare).toContain("backendType === 'mojo'\n      ? MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS\n      : 23_000");
+    expect(prepare).toContain("backendType === 'mojo'\n      ? MOJO_EXPLICIT_CLOSE_RESULT_TIMEOUT_MS\n      : backendType === 'remote-runner'");
+    expect(prepare).toContain("Math.min(305_000, Math.max(5_000, remoteRunnerOperationTimeoutMs! + 5_000))");
+    expect(prepare).toContain(': 23_000;');
   });
 
   it('refuses request-less Riff suspend before teardown or process exit', () => {

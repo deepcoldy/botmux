@@ -7746,6 +7746,55 @@ describe('PUT /api/bot-agent', () => {
     }
   });
 
+  it('persists Remote Runner model variant and reasoning effort for provider start', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-remote-runner-ipc-'));
+    const configPath = join(dir, 'bots.json');
+    const appId = 'test-remote-runner-agent-app';
+    const prevBotsConfig = process.env.BOTS_CONFIG;
+    try {
+      process.env.BOTS_CONFIG = configPath;
+      writeFileSync(configPath, JSON.stringify([{
+        larkAppId: appId,
+        larkAppSecret: 'secret',
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+      }], null, 2));
+      loadBotConfigs().forEach((c: any) => registerBot(c));
+      setLarkAppId(appId);
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+
+      const response = await fetch(`http://127.0.0.1:${handle.port}/api/bot-agent`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          cliId: 'remote-runner',
+          model: 'GPT-5.6-Sol',
+          modelBackendVariant: 'max',
+          reasoningEffort: 'xhigh',
+        }),
+      });
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({
+        ok: true,
+        cliId: 'remote-runner',
+        model: 'GPT-5.6-Sol',
+        modelBackendVariant: 'max',
+        reasoningEffort: 'xhigh',
+      });
+      expect(JSON.parse(readFileSync(configPath, 'utf-8'))[0]).toMatchObject({
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+        model: 'GPT-5.6-Sol',
+        modelBackendVariant: 'max',
+        reasoningEffort: 'xhigh',
+      });
+    } finally {
+      if (prevBotsConfig === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = prevBotsConfig;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('persists, validates and clears the dsh turn timeout through bots.json', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-agent-tt-ipc-'));
     const configPath = join(dir, 'bots.json');
