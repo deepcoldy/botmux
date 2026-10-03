@@ -10,6 +10,7 @@ const referenceRunner = resolve('examples/remote-runner/reference-runner.mjs');
 const stalledCloseRunner = resolve('test/fixtures/remote-runner-stalled-close.mjs');
 const stalledReattachRunner = resolve('test/fixtures/remote-runner-stalled-reattach.mjs');
 const preAckFailureRunner = resolve('test/fixtures/remote-runner-pre-ack-failure.mjs');
+const outboundRunner = resolve('test/fixtures/remote-runner-outbound.mjs');
 const children: RemoteRunnerBackend[] = [];
 
 function createBackend(initialState?: RemoteRunnerBackendState): RemoteRunnerBackend {
@@ -77,6 +78,85 @@ describe('RemoteRunnerBackend', () => {
         model: 'reference-model',
       }),
     })]);
+  });
+
+  it('returns a host-governed result for provider-requested outbound messages', async () => {
+    const backend = createBackend();
+    const ready = once<void>(cb => backend.onReady(cb));
+    const requested: Array<{ operationId: string; content: string }> = [];
+    backend.onOutboundMessage(async message => {
+      requested.push({ operationId: message.operationId, content: message.content });
+      return { outcome: 'delivered', messageId: 'om_reference_progress' };
+    });
+    spawnBackend(backend);
+    await ready;
+
+    const final = once<{ text: string; turnId?: string }>(cb => {
+      backend.onTurnFinal((text, turnId) => cb({ text, turnId }));
+    });
+    await expect(backend.submitTurn({
+      turnId: 'turn-outbound',
+      content: 'request-outbound',
+    })).resolves.toEqual({ submitted: true });
+
+    await expect(final).resolves.toEqual({
+      text: JSON.stringify({ outcome: 'delivered', messageId: 'om_reference_progress' }),
+      turnId: 'turn-outbound',
+    });
+    expect(requested).toEqual([{
+      operationId: 'reference-outbound-1',
+      content: 'reference progress',
+    }]);
+  });
+
+  it('deduplicates one outbound operation id and rejects payload conflicts', async () => {
+    const backend = new RemoteRunnerBackend({ expectedProvider: 'outbound-test' }, 'session-outbound-dedupe');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const delivery = vi.fn(async () => ({
+      outcome: 'delivered' as const,
+      messageId: 'om_deduped',
+    }));
+    backend.onOutboundMessage(delivery);
+    spawnBackend(backend, outboundRunner);
+    await ready;
+
+    const duplicateFinal = once<string>(cb => backend.onTurnFinal(cb));
+    await backend.submitTurn({ turnId: 'turn-duplicate', content: 'duplicate' });
+    const duplicateResults = JSON.parse(await duplicateFinal) as Array<{ result: { outcome: string } }>;
+    expect(duplicateResults.map(item => item.result.outcome)).toEqual(['delivered', 'delivered']);
+    expect(delivery).toHaveBeenCalledTimes(1);
+
+    const conflictFinal = once<string>(cb => backend.onTurnFinal(cb));
+    await backend.submitTurn({ turnId: 'turn-conflict', content: 'conflict' });
+    const conflictResults = JSON.parse(await conflictFinal) as Array<{ result: { outcome: string; code?: string } }>;
+    expect(conflictResults.map(item => item.result.outcome).sort()).toEqual(['delivered', 'rejected']);
+    expect(conflictResults).toContainEqual(expect.objectContaining({
+      result: expect.objectContaining({ code: 'operation_id_conflict' }),
+    }));
+    expect(delivery).toHaveBeenCalledTimes(2);
+  });
+
+  it('limits unique outbound messages per turn before invoking the host', async () => {
+    const backend = new RemoteRunnerBackend({ expectedProvider: 'outbound-test' }, 'session-outbound-rate');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const delivery = vi.fn(async message => ({
+      outcome: 'delivered' as const,
+      messageId: `om_${message.operationId}`,
+    }));
+    backend.onOutboundMessage(delivery);
+    spawnBackend(backend, outboundRunner);
+    await ready;
+
+    const final = once<string>(cb => backend.onTurnFinal(cb));
+    await backend.submitTurn({ turnId: 'turn-rate', content: 'rate' });
+    const results = JSON.parse(await final) as Array<{ result: { outcome: string; code?: string } }>;
+    expect(delivery).toHaveBeenCalledTimes(10);
+    expect(results.filter(item => item.result.outcome === 'delivered')).toHaveLength(10);
+    expect(results).toContainEqual(expect.objectContaining({
+      result: expect.objectContaining({ outcome: 'rejected', code: 'outbound_rate_limited' }),
+    }));
   });
 
   it('projects remote terminal snapshots and forwards input and resize', async () => {

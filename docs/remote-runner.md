@@ -13,7 +13,7 @@
     "expectedProvider": "example-cloud",
     "requiredCapabilities": [
       "start", "resume", "turn", "cancel", "detach", "reattach", "status",
-      "terminal_screen", "terminal_input", "terminal_resize"
+      "terminal_screen", "terminal_input", "terminal_resize", "outbound_message"
     ],
     "handshakeTimeoutMs": 30000,
     "operationTimeoutMs": 20000
@@ -78,6 +78,45 @@ provider 可以额外声明三项通用终端能力：
 未配置这些 capability 时，`RemoteRunnerBackend` 保持原来的 headless 行为；默认必需 capability 仍只有 `start`、`resume`、`turn`、`cancel`、`detach` 和 `status`，避免升级 BotMux 后强制旧 provider 同步支持终端。
 
 完整命令与事件联合类型见 [`src/adapters/backend/remote-runner-protocol.ts`](../src/adapters/backend/remote-runner-protocol.ts)。可运行示例见 [`examples/remote-runner/reference-runner.mjs`](../examples/remote-runner/reference-runner.mjs)。
+
+### 可选主动消息
+
+声明 `outbound_message` 后，provider 可以在一个仍为 active 的 turn 内请求 BotMux 向该 turn 的当前会话位置发送非终态正文。该能力只表达内容和寻址意图，不接受 chat、topic root、Bot 身份或任意用户 ID；真实路由、mention 门禁、卡片渲染、hook 和平台调用继续由 BotMux 的普通 `send` 链路负责。
+
+```json
+{
+  "type": "outbound_message",
+  "operationId": "progress-1",
+  "turnId": "turn-1",
+  "generation": 3,
+  "content": "已完成依赖检查，继续执行验证。",
+  "responseKind": "progress",
+  "mention": "none"
+}
+```
+
+- `content` 使用 BotMux Markdown；普通文本是其子集，单条最多 32 KiB。
+- `responseKind` 仅允许 `progress|auxiliary`，不能借此声明 turn 最终完成；`final|failure` 仍是唯一终态。
+- `mention` 仅允许 `none|requester`。`requester` 仍要通过当前 turn 的精确回复对象与多参与者门禁，provider 不能提供 open_id。
+- `turnId` 必须等于 active turn，`generation` 必须等于当前 backend state；迟到或跨代事件会 fail-closed。
+- `operationId` 在单 turn 内幂等：同 key 同 payload 复用第一次结果，同 key 不同 payload 被拒绝；每 turn 最多接受 10 个不同 operation。
+
+BotMux 完成宿主侧尝试后会写回 `outbound_message_result` 命令：
+
+```json
+{
+  "type": "outbound_message_result",
+  "requestId": "outbound-message-result:...",
+  "operationId": "progress-1",
+  "turnId": "turn-1",
+  "generation": 3,
+  "result": { "outcome": "delivered", "messageId": "om_xxx" }
+}
+```
+
+结果为 `delivered|rejected|unknown`。`unknown` 表示平台可能已经接受消息但 BotMux 无法证明结果，provider 必须把它交给调用方且不得自动重放。结果命令本身是一次宿主到 provider 的结算通知，不要求 provider 再发 ACK；provider 无法把结果交给远端调用方时，应以当前 turn 的 `failure` 明确收口。
+
+主动消息写入独立的非终态发送标记，不会代替或抑制随后正常到达的 turn `final/failure`。该 capability 同样不属于默认必需集合，只有显式配置它的部署才会在握手时要求 provider 支持。
 
 ### 可选运行用量
 

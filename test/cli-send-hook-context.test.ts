@@ -579,6 +579,21 @@ describe('cmdSend hook context wiring', () => {
       .toBeLessThan(cmdSend.indexOf("const { sendMessage, replyMessage"));
   });
 
+  it('keeps Remote Runner outbound sends host-only, route-frozen, and non-terminal', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    const guard = cmdSend.indexOf('if (remoteRunnerOutbound)');
+    const providerImport = cmdSend.indexOf("const { sendMessage, replyMessage");
+    expect(guard).toBeGreaterThan(0);
+    expect(guard).toBeLessThan(providerImport);
+    expect(cmdSend.slice(guard, providerImport)).toContain('trustedRelayCtx.sessionId !== sid');
+    expect(cmdSend.slice(guard, providerImport)).toContain("['progress', 'auxiliary']");
+    expect(cmdSend.slice(guard, providerImport)).toContain('sendTopLevel || overrideChatId || sendInto');
+    expect(cmdSend.slice(guard, providerImport)).toContain('mentionArgs.length > 0');
+    expect(cmdSend).toContain('...(remoteRunnerOutbound ? { terminalIndependent: true } : {})');
+  });
+
   it('validates the exact document text path before reading content or invoking TTS/uploads', () => {
     const cmdSendStart = cliSource.indexOf('async function cmdSend(');
     const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);

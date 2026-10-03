@@ -126,6 +126,48 @@ describe('remote runner protocol', () => {
     }))).toBeUndefined();
   });
 
+  it('accepts only bounded non-terminal outbound message intents', () => {
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'outbound_message',
+      operationId: 'outbound-1',
+      turnId: 'turn-1',
+      generation: 3,
+      content: 'still working',
+      responseKind: 'progress',
+      mention: 'requester',
+    }))).toMatchObject({
+      type: 'outbound_message',
+      operationId: 'outbound-1',
+      generation: 3,
+      responseKind: 'progress',
+      mention: 'requester',
+    });
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'outbound_message',
+      operationId: 'outbound-2',
+      turnId: 'turn-1',
+      generation: 3,
+      content: 'not allowed',
+      responseKind: 'final',
+      mention: 'none',
+    }))).toBeUndefined();
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'outbound_message',
+      operationId: 'outbound-3',
+      turnId: 'turn-1',
+      generation: 3,
+      content: 'x'.repeat(33 * 1024),
+      responseKind: 'auxiliary',
+      mention: 'none',
+    }))).toBeUndefined();
+  });
+
   it('accepts authoritative usage on final and rejects malformed metrics', () => {
     const base = {
       protocol: REMOTE_RUNNER_PROTOCOL,
