@@ -200,7 +200,7 @@ describe('worker pipe initial screen ordering', () => {
 
     expect(deferIdx).toBeGreaterThan(-1);
     expect(deferIdx).toBeLessThan(drainIdx);
-    expect(adopt).toContain("deferPromptReadyWhileBusy(`${label} adopt-idle`, backend)");
+    expect(adopt).toContain("deferPromptReadyWhileBusy(`${label} adopt-idle`, idleBackend)");
   });
 
   it('gates the first-prompt soft timeout through shouldReleaseFirstPromptTimeout with a hard cap', () => {
@@ -728,15 +728,17 @@ describe('worker pipe initial screen ordering', () => {
     expect(hook).toContain("status === 'working'");
     expect(hook).toContain('isPromptReady = false;');
 
-    const helperStart = source.indexOf("const drainBridgesThenMarkReady = (");
+    const helperStart = source.indexOf('const drainBridges = ()');
     const helperEnd = source.indexOf('// Set up idle detection.', helperStart);
     const helper = source.slice(helperStart, helperEnd);
     const claudeDrain = helper.indexOf('bridgeDrainAndMaybeEmit();');
     const structuredDrain = helper.indexOf('codexBridgeDrainAndMaybeEmit();');
-    const ready = helper.indexOf('markPromptReady();');
+    const composedDrain = helper.indexOf('drainBridges();', structuredDrain);
+    const ready = helper.indexOf('markReadyFromEvidence(evidenceSource);', composedDrain);
     expect(claudeDrain).toBeGreaterThan(-1);
     expect(structuredDrain).toBeGreaterThan(claudeDrain);
-    expect(ready).toBeGreaterThan(structuredDrain);
+    expect(composedDrain).toBeGreaterThan(structuredDrain);
+    expect(ready).toBeGreaterThan(composedDrain);
   });
 
   it('hard-gates an unavailable persistent backend instead of silently falling back to pty', () => {

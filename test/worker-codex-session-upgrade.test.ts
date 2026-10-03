@@ -77,6 +77,7 @@ function harness() {
     hookReviewInputHold: false,
     bareShellCheckInProgress: false,
     ambiguousSubmissionRecoveryHold: undefined,
+    currentInputDeliveryQuarantine: vi.fn(() => null),
     submitFailureChains: { size: () => 0 },
     queuedActivationReceipts: { size: () => 0 },
     codexAppTurnLiveness: { hasActiveTurn: () => false },

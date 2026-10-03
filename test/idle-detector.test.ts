@@ -387,6 +387,21 @@ describe('IdleDetector: static capacity-queue pre-idle latch', () => {
     detector.dispose();
   });
 
+  it('holds the TraeX 0.207 queued-next-turn screen until the composer redraws', () => {
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    detector.feed('\x1b[2K⠋ Any second now…\nQueued for next turn\nesc to interrupt\nContext 65% left');
+    vi.advanceTimersByTime(10_000);
+    expect(idleCb).not.toHaveBeenCalled();
+
+    detector.feed('\x1b[2K› Ask TraeCode CLI to do anything\nContext 65% left');
+    vi.advanceTimersByTime(2_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
   it('holds the full queue notice busy, with or without the at-position suffix', () => {
     const detector = new IdleDetector(traexAdapter);
     const idleCb = vi.fn();

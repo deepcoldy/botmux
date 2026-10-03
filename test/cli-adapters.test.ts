@@ -3171,12 +3171,10 @@ describe('busyPattern', () => {
     //   spinner frames:  "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     //   working labels:  "Working…", "Thinking…", "Pondering…",
     //                    "Working it out…" (full rotation in traex.ts)
-    //   queue strings:   "Queued for capacity",
+    //   queue strings:   "Queued for capacity", "Queued for next turn",
     //                    "Too many requests right now. You're in the queue."
     //   idle composer:   "Ask TraeCode CLI to do anything" + "100% context left"
-    // TraeX forked from Codex and DELETED the "esc to interrupt" footer hint
-    // (0 hits across all releases + the 94MB TUI logs), so the Codex
-    // pattern's second anchor is invalid here.
+    // TraeX 0.207.x also restored the line-anchored "esc to interrupt" hint.
     const busy = createTraexAdapter('/bin/traex').busyPattern;
     expect(busy).toBeDefined();
     // Spinner-anchored working labels: "<braille frame> <label>".
@@ -3188,6 +3186,7 @@ describe('busyPattern', () => {
     // braille frame in front of the label, and the label is part of the
     // compiled-in spinner string table.
     expect(busy!.test('⠋ Queued for capacity')).toBe(true);
+    expect(busy!.test('⠋ Queued for next turn')).toBe(true);
     // Standalone capacity-queue strings — the queue screen may render
     // statically (no animating spinner), so no frame anchor is required.
     // Line-anchored: bare line, indented line, and `at position N` suffix
@@ -3195,12 +3194,15 @@ describe('busyPattern', () => {
     expect(busy!.test('Queued for capacity')).toBe(true);
     expect(busy!.test('  Queued for capacity')).toBe(true);
     expect(busy!.test('Queued for capacity at position 3.')).toBe(true);
+    expect(busy!.test('Queued for next turn')).toBe(true);
+    expect(busy!.test('  esc to interrupt')).toBe(true);
     expect(busy!.test("Too many requests right now. You're in the queue.")).toBe(true);
     expect(busy!.test("Too many requests right now. You're in the queue at position 3.")).toBe(true);
     // Mid-sentence prose quotes must NOT match — the line anchor is the
     // discriminator for the standalone arms (the braille frame for the
     // spinner arms).
     expect(busy!.test('The status line says Queued for capacity right now')).toBe(false);
+    expect(busy!.test('The status line says Queued for next turn right now')).toBe(false);
     expect(busy!.test("It printed Too many requests right now. You're in the queue. and stopped")).toBe(false);
     // Idle composer must NOT match.
     expect(busy!.test('› Ask TraeCode CLI to do anything                        100% context left')).toBe(false);
@@ -3222,10 +3224,13 @@ describe('busyPattern', () => {
     expect(staticBusy!.test('  Queued for capacity')).toBe(true);
     expect(staticBusy!.test('Queued for capacity at position 3.')).toBe(true);
     expect(staticBusy!.test('⠋ Queued for capacity')).toBe(true);
+    expect(staticBusy!.test('Queued for next turn')).toBe(true);
+    expect(staticBusy!.test('esc to interrupt')).toBe(true);
     expect(staticBusy!.test("Too many requests right now. You're in the queue.")).toBe(true);
     expect(staticBusy!.test("Too many requests right now. You're in the queue at position 3.")).toBe(true);
     // Mid-sentence prose quotes must NOT latch.
     expect(staticBusy!.test('The status line says Queued for capacity right now')).toBe(false);
+    expect(staticBusy!.test('The status line says Queued for next turn right now')).toBe(false);
     expect(staticBusy!.test("It printed Too many requests right now. You're in the queue. and stopped")).toBe(false);
     // Idle composer must NOT latch.
     expect(staticBusy!.test('› Ask TraeCode CLI to do anything                        100% context left')).toBe(false);
@@ -3331,7 +3336,9 @@ describe('readyPattern', () => {
     // on this opt-in being present, so pin it (the worker reads it === true).
     const adapter = createTraexAdapter('/bin/traex');
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
-    expect(adapter.supportsTypeAhead).toBe(true);
+    expect(adapter.supportsTypeAhead).toBe(false);
+    expect(adapter.postTerminalPromptFence).toBe(true);
+    expect(adapter.quarantineUnconfirmedSubmits).toBe(true);
   });
 
   it('hermes defers the first-prompt timeout without type-ahead', () => {

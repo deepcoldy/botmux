@@ -407,7 +407,11 @@ import { tmuxEnv, probeTmuxFunctionalWithRetry } from './setup/ensure-tmux.js';
 import { probeZmxRuntime, zmxEnv } from './setup/ensure-zmx.js';
 import type { PersistentBackendTarget } from './adapters/backend/types.js';
 import { tmuxRestartJitterMs } from './core/tmux-recovery.js';
-import { IdleDetector, stripAnsiScreenText } from './utils/idle-detector.js';
+import {
+  IdleDetector,
+  stripAnsiScreenText,
+  type IdleEvidenceSource,
+} from './utils/idle-detector.js';
 import { busyProbeRegion } from './utils/busy-probe.js';
 import {
   StuckDetector,
@@ -8473,6 +8477,10 @@ function emitReadyCodexTurns(): void {
     });
   }
   for (const turn of ready) {
+    releaseInputDeliveryQuarantineForStructuredTerminal(
+      turn.turnId,
+      turn.dispatchAttempt,
+    );
     retireRpcLifecycleFromStructuredTerminal({
       turnId: turn.turnId,
       ...(turn.dispatchAttempt !== undefined
@@ -9119,6 +9127,7 @@ async function writeAdoptMessage(
   if (isStructuredBridgeAdoptInputCli(lastInitConfig?.cliId) && cliAdapter) {
     const submissionBackend = adoptBackend;
     let recoveryFailureReason: string | undefined;
+    let deliveryQuarantine: InputDeliveryQuarantine | null = null;
     // Refuse adopt input while the local composer still holds an unsubmitted
     // human draft, BEFORE any bridge attribution or terminal write — otherwise
     // the Lark message would be appended onto the human's half-typed line.
@@ -9168,6 +9177,12 @@ async function writeAdoptMessage(
         if (recoveryFailureReason) {
           notifyAmbiguousSubmissionRecovery(recoveryFailureReason, { turnId, dispatchAttempt });
         } else {
+          if (!result?.failureReason) {
+            deliveryQuarantine = armInputDeliveryQuarantine(
+              submissionBackend,
+              { turnId, dispatchAttempt },
+            );
+          }
           scheduleSubmitFailureNotify(
             content,
             result?.recheck,
@@ -9178,6 +9193,12 @@ async function writeAdoptMessage(
             { turnId, dispatchAttempt },
             'failed',
             true,
+            () => {
+              releaseInputDeliveryQuarantine(
+                deliveryQuarantine,
+                'authoritative deferred adopt-submit evidence',
+              );
+            },
           );
         }
       }
@@ -11019,6 +11040,79 @@ let ambiguousSubmissionRecoveryHold: {
   item: PendingCliInput;
 } | null = null;
 
+/** A submit whose adapter receipt stayed unknown may already be parked inside
+ * the TUI. Keep later inputs in BotMux until exact evidence confirms that turn
+ * or a restart replaces this backend generation. Unlike the ZMX recovery hold
+ * above, the ambiguous item itself is retired and is never replayed. */
+interface InputDeliveryQuarantine {
+  backend: SessionBackend;
+  generation: number;
+  turnId?: string;
+  dispatchAttempt?: number;
+}
+let inputDeliveryQuarantine: InputDeliveryQuarantine | null = null;
+
+function currentInputDeliveryQuarantine(): InputDeliveryQuarantine | null {
+  const quarantine = inputDeliveryQuarantine;
+  if (!quarantine) return null;
+  if (quarantine.backend === backend && quarantine.generation === cliSpawnGeneration) {
+    return quarantine;
+  }
+  inputDeliveryQuarantine = null;
+  log('Cleared stale input-delivery quarantine after backend generation change');
+  return null;
+}
+
+function armInputDeliveryQuarantine(
+  target: SessionBackend,
+  item: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt'>,
+): InputDeliveryQuarantine | null {
+  if (cliAdapter?.quarantineUnconfirmedSubmits !== true || backend !== target) return null;
+  const quarantine: InputDeliveryQuarantine = {
+    backend: target,
+    generation: cliSpawnGeneration,
+    ...(item.turnId ? { turnId: item.turnId } : {}),
+    ...(item.dispatchAttempt !== undefined
+      ? { dispatchAttempt: item.dispatchAttempt }
+      : {}),
+  };
+  inputDeliveryQuarantine = quarantine;
+  log(
+    `Quarantined input delivery for backend generation ${quarantine.generation} `
+    + `after unconfirmed submit turn=${quarantine.turnId ?? '-'} `
+    + `attempt=${quarantine.dispatchAttempt ?? '-'}`,
+  );
+  return quarantine;
+}
+
+function releaseInputDeliveryQuarantine(
+  quarantine: InputDeliveryQuarantine | null | undefined,
+  reason: string,
+  opts: { redriveTerminal?: boolean } = {},
+): boolean {
+  if (!quarantine || inputDeliveryQuarantine !== quarantine) return false;
+  inputDeliveryQuarantine = null;
+  log(`Released input-delivery quarantine (${reason})`);
+  if (opts.redriveTerminal) {
+    queueMicrotask(() => idleDetector?.fireIdle());
+  }
+  return true;
+}
+
+function releaseInputDeliveryQuarantineForStructuredTerminal(
+  turnId: string,
+  dispatchAttempt?: number,
+): void {
+  const quarantine = currentInputDeliveryQuarantine();
+  if (!quarantine || quarantine.turnId !== turnId
+    || quarantine.dispatchAttempt !== dispatchAttempt) return;
+  releaseInputDeliveryQuarantine(
+    quarantine,
+    'exact structured terminal',
+    { redriveTerminal: true },
+  );
+}
+
 /** Queue an external control action behind any in-flight ZMX text transaction
  * without opening a new composer journal. This keeps card quick-actions from
  * landing between adapter text chunks and their submit key. */
@@ -11610,6 +11704,11 @@ function markPromptReady(): void {
     log('Ignoring non-PTY prompt-ready while bare-shell launch block is active');
     return;
   }
+  if (currentInputDeliveryQuarantine()) {
+    log('Ignoring prompt-ready while input delivery is quarantined');
+    idleDetector?.reset();
+    return;
+  }
   if (isPromptReady) {
     stopStructuredStartGraceRecheck();
     return;  // guard against duplicate calls
@@ -12173,6 +12272,7 @@ function scheduleSubmitFailureNotify(
         // send marker — proves the turn actually progressed, so the chain is
         // cancelled here and now: no more timers, no unconfirmed warning.
         if (action.evidence === 'structured-transcript' || action.evidence === 'botmux-send') {
+          onConfirmed?.();
           log(`Deferred recheck saw ${action.evidence} success evidence — cancelling chain, no warning. preview="${preview}"`);
           return;
         }
@@ -12447,6 +12547,10 @@ async function flushPending(): Promise<void> {
     ambiguousSubmissionRecoveryHold = null;
   }
   if (ambiguousSubmissionRecoveryHold?.backend === backend) return;
+  if (currentInputDeliveryQuarantine()) {
+    log(`Holding ${pendingMessages.length} pending message(s) behind unconfirmed input delivery`);
+    return;
+  }
   if (!hasPendingInputForFlush()) return;  // nothing to flush — keep isPromptReady
   if (sessionRenameInFlight()) return;  // wait for /rename to finish before any user input
   if (commandLineWritesPending > 0) return;  // do not splice into text -> Enter
@@ -12525,8 +12629,10 @@ async function flushPending(): Promise<void> {
   // turn/start, not the Codex App runner's ordered turn/steer contract.
   const claudeBridgeActive = !!bridgeJsonlPath && !lastInitConfig?.adoptMode;
   const codexBridgeActive = codexBridgeFallbackActive();
+  const runtimeSupportsTypeAhead =
+    cliAdapter.supportsTypeAhead === true || codexAppRuntimeTypeAheadReady();
   const typeAheadAllowed = pendingInputAllowsTypeAhead(
-    cliAdapter.supportsTypeAhead === true || codexAppRuntimeTypeAheadReady(),
+    runtimeSupportsTypeAhead,
     durableTurnInFlight,
     pendingMessages[0],
     directRpcTurnBlocksTypeAhead(),
@@ -12839,6 +12945,7 @@ async function flushPending(): Promise<void> {
       // worker — exactly the failure mode this change is closing. Contain it.
       let submissionBackend: SessionBackend | null = null;
       let recoveryFailureReason: string | undefined;
+      let deliveryQuarantine: InputDeliveryQuarantine | null = null;
       const handleStaleWriteContinuation = (errorCode: string): void => {
         const disposition = settleStaleWriteContinuation(
           item,
@@ -13206,6 +13313,9 @@ async function flushPending(): Promise<void> {
           codexAppReadyAuthority,
           codexAppLivenessHandle,
         );
+        if (!result.failureReason && !recoveryFailureReason && submissionBackend) {
+          deliveryQuarantine = armInputDeliveryQuarantine(submissionBackend, item);
+        }
         const codexAppSafeNonSubmission = result.submissionDisposition === 'untouched'
           || result.submissionDisposition === 'flushed_invalid';
         if (tracksCodexAppLiveness && !codexAppSafeNonSubmission) {
@@ -13268,6 +13378,13 @@ async function flushPending(): Promise<void> {
             turnSeq,
             item,
             'failed',
+            false,
+            () => {
+              releaseInputDeliveryQuarantine(
+                deliveryQuarantine,
+                'authoritative deferred submit evidence',
+              );
+            },
           );
           if (!result.failureReason && result.recheck) {
             observeQueuedActivationReceipt(item, result.recheck);
@@ -13280,6 +13397,7 @@ async function flushPending(): Promise<void> {
         if (!recoveryFailureReason && codexAppSafeNonSubmission) {
           requeueUnsubmittedQueuedActivation(item);
         }
+        if (deliveryQuarantine) break;
       } else if (item.queuedActivationToken) {
         // The daemon keeps the exact journal and route reservation until this
         // adapter-level boundary. IPC loss may replay at-least-once; an early
@@ -13303,7 +13421,7 @@ async function flushPending(): Promise<void> {
       // Keep that optimization only within one authenticated principal: a
       // different sender must wait for this turn's terminal boundary.
       if (activeTurnBlocks(pendingMessages[0] ?? {})) break;
-      if (shouldStopPendingBatch(item, pendingMessages[0])) break;
+      if (shouldStopPendingBatch(item, pendingMessages[0], runtimeSupportsTypeAhead)) break;
     }
   } finally {
     isFlushing = false;
@@ -13789,11 +13907,32 @@ function wireIdleDetectorBusyTransition(detector: IdleDetector, label: string): 
 function setupAdoptIdleDetection(cfg: Extract<DaemonToWorker, { type: 'init' }>, label: string): void {
   idleDetector = new IdleDetector(adoptIdleAdapter(cfg));
   wireIdleDetectorBusyTransition(idleDetector, `${label} adopt mode`);
-  idleDetector.onIdle(() => {
-    if (backend && deferPromptReadyWhileBusy(`${label} adopt-idle`, backend)) return;
+  idleDetector.onIdle(async (evidenceSource) => {
+    const idleBackend = backend;
+    if (evidenceSource === 'external'
+      && cliAdapter?.postTerminalPromptFence === true
+      && renderer) {
+      try {
+        await renderer.writeAndFlush('');
+      } catch (err: any) {
+        log(`${label} adopt external-idle renderer settle failed: ${err.message}`);
+      }
+      if (backend !== idleBackend) return;
+    }
     log(`Prompt detected (idle) — ${label} adopt mode`);
-    try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
-    try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
+    const drainBridges = (): void => {
+      try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
+      try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
+    };
+    if (evidenceSource === 'external'
+      && cliAdapter?.postTerminalPromptFence === true) {
+      drainBridges();
+      if (idleBackend && postTerminalPromptFenceHolds(evidenceSource, idleBackend)) return;
+      markPromptReady();
+      return;
+    }
+    if (idleBackend && deferPromptReadyWhileBusy(`${label} adopt-idle`, idleBackend)) return;
+    drainBridges();
     markPromptReady();
   });
 }
@@ -13822,6 +13961,54 @@ function captureBackendScreen(be: Pick<SessionBackend, 'captureCurrentScreen' | 
 
 function canCaptureBusyPatternScreen(be: Pick<SessionBackend, 'captureCurrentScreen' | 'captureViewport'>): boolean {
   return !!(be.captureCurrentScreen || be.captureViewport || renderer);
+}
+
+function lastPatternIndex(pattern: RegExp | undefined, text: string): number {
+  if (!pattern || !text) return -1;
+  const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`;
+  const scan = new RegExp(pattern.source, flags);
+  let last = -1;
+  for (let match = scan.exec(text); match; match = scan.exec(text)) {
+    last = match.index;
+    if (match[0].length === 0) scan.lastIndex += 1;
+  }
+  return last;
+}
+
+/** A transcript terminal closes the logical turn, but selected PTY adapters
+ * require an independently observed composer before they accept successors.
+ * Apply this only to authoritative local viewports; ZMX/history snapshots can
+ * contain stale scrollback and therefore retain the structured-terminal path.
+ *
+ * Compare the last busy and composer markers in the bounded viewport tail so a
+ * fresh composer redraw can retire older spinner text, while a later queue line
+ * still wins over a prompt that belongs to the submitted message above it. */
+function postTerminalPromptFenceHolds(
+  evidenceSource: IdleEvidenceSource,
+  be: SessionBackend,
+): boolean {
+  if (evidenceSource !== 'external'
+    || cliAdapter?.postTerminalPromptFence !== true
+    || !backendScreenEvidenceIsAuthoritativeForMutation()) return false;
+  const composerPattern = cliAdapter.staticBusyClearPattern ?? cliAdapter.readyPattern;
+  if (!composerPattern) return false;
+  try {
+    const screen = busyProbeRegion(captureBackendScreen(be));
+    const busyAt = lastPatternIndex(cliAdapter.busyPattern, screen);
+    const composerAt = lastPatternIndex(composerPattern, screen);
+    if (composerAt >= 0 && composerAt > busyAt) return false;
+    log(
+      `${cliName()} external-idle: structured terminal observed without a newer `
+      + `PTY composer (busy=${busyAt >= 0}, composer=${composerAt >= 0}); `
+      + 'holding prompt ready',
+    );
+    idleDetector?.reset();
+    return true;
+  } catch (err: any) {
+    log(`${cliName()} external-idle composer fence capture failed: ${err.message}`);
+    idleDetector?.reset();
+    return true;
+  }
 }
 
 function deferPromptReadyWhileBusy(source: string, be: SessionBackend): boolean {
@@ -18077,15 +18264,21 @@ async function spawnCli(
   // advance bridge attribution. Both screen-idle and authoritative Herdr status
   // must preserve this ordering.
   const observedBackend = backend;
-  const drainBridgesThenMarkReady = (evidenceSource?: string): void => {
+  const drainBridges = (): void => {
     if (bridgeJsonlPath) {
       try { bridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Bridge emit error: ${err.message}`); }
     }
     if (codexBridgeFallbackActive()) {
       try { codexBridgeDrainAndMaybeEmit(); } catch (err: any) { log(`Codex bridge emit error: ${err.message}`); }
     }
+  };
+  const markReadyFromEvidence = (evidenceSource?: string): void => {
     if (evidenceSource === 'screen') markPromptReadyFromPty(observedBackend);
     else markPromptReady();
+  };
+  const drainBridgesThenMarkReady = (evidenceSource?: string): void => {
+    drainBridges();
+    markReadyFromEvidence(evidenceSource);
   };
 
   // Set up idle detection. Remote backends (riff / mojo) have no PTY output and
@@ -18116,15 +18309,34 @@ async function spawnCli(
           log('Screen settle barrier degraded after bounded retries; finalizing from the last successful snapshot');
         }
       }
-      // Pi's transcript final (assistant_final) is persisted asynchronously
-      // from the TUI clearing its `Working...` busy marker — either order
-      // occurs. An external idle landing while the authoritative viewport
-      // still shows busy must defer exactly like a screen idle, or the card
-      // flips to 等待输入 mid-turn. Scoped to Pi: Grok/Codex own their idle
-      // via reliableTurnTerminal / lifecycle blocking, and their busy markers
-      // legitimately lag behind the transcript final. deferPromptReadyWhileBusy
-      // itself fail-opens on non-authoritative screens (ZMX), so a stale
-      // `Working...` in ZMX history can never block a structured terminal.
+      // xterm-headless parses renderer.write() asynchronously. A transcript
+      // terminal can arrive in the same tick as the TUI's busy redraw; drain
+      // queued render bytes before the post-terminal composer fence inspects
+      // the viewport, or it can see the stale pre-submit prompt.
+      if (evidenceSource === 'external'
+        && cliAdapter?.postTerminalPromptFence === true
+        && renderer) {
+        try {
+          await renderer.writeAndFlush('');
+        } catch (err: any) {
+          log(`${cliName()} external-idle renderer settle failed: ${err.message}`);
+        }
+      }
+      // Selected PTY adapters (TraeX) split logical terminal from composer
+      // readiness. Their structured terminal must not publish prompt-ready
+      // until the authoritative viewport shows a newer real composer.
+      if (evidenceSource === 'external'
+        && cliAdapter?.postTerminalPromptFence === true) {
+        // Business completion is independent from PTY readiness: publish the
+        // structured final/terminal now, then fence only prompt-ready/input.
+        drainBridges();
+        if (idleBackend && postTerminalPromptFenceHolds(evidenceSource, idleBackend)) return;
+        markReadyFromEvidence(evidenceSource);
+        return;
+      }
+      // Pi/OMP/EBSD transcript finals can also precede clearing their busy
+      // marker. Defer on that explicit marker, while other reliable-terminal
+      // CLIs retain their established immediate terminal behavior.
       const busyGuardedIdle = evidenceSource === 'screen'
         || (evidenceSource === 'external'
           && (structuredBridgeIsPi() || structuredBridgeIsOmp() || structuredBridgeIsEbsd()));
@@ -18596,6 +18808,7 @@ function killCli(opts: {
   // remaining cleanup is synchronous today, but generation ownership must not
   // depend on that implementation detail.
   cliSpawnGeneration++;
+  inputDeliveryQuarantine = null;
   currentCliCredentialIsolated = false;
   stopNativeSessionTitleSync();
   stopSessionMcpGatewayHost();

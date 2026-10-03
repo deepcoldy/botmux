@@ -259,13 +259,17 @@ export function shouldArmSpawnArgvInitialPromptBusy(opts: {
   return true;
 }
 
-/** Once either side of a queue boundary is durable, stop this batch and wait
- *  for the next reliable idle edge before writing the following turn. */
+/** Stop this batch when the adapter is serial-only or either side of the queue
+ *  boundary is durable. A message can arrive while writeInput is awaiting its
+ *  receipt; `isFlushing` admits it to the queue so the active drain can see it,
+ *  but a serial adapter must leave it there until the next real idle edge. */
 export function shouldStopPendingBatch(
   written: PendingCliInput,
   next: PendingCliInput | undefined,
+  adapterSupportsTypeAhead = true,
 ): boolean {
-  return written.dispatchAttempt !== undefined
+  return !adapterSupportsTypeAhead
+    || written.dispatchAttempt !== undefined
     || next?.dispatchAttempt !== undefined
     || !!written.queuedActivationToken
     || !!next?.queuedActivationToken

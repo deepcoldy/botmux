@@ -103,13 +103,14 @@ export const TRAE_MIGRATION_DONE_MARKERS = [
  *    "Thinking…", "Reasoning through it…", "Mulling it over…",
  *    "Pondering…", "Working it out…", "Piecing it together…".
  *  - Spinner label set 2 (approval/working/queue): "Reviewing approval
- *    request", "Working…", "Working on it…", "Queued for capacity".
+ *    request", "Working…", "Working on it…", "Queued for capacity",
+ *    "Queued for next turn".
  *  - Standalone queue notice: "Too many requests right now. You're in the
  *    queue."
  *
- * TraeX forked from Codex and DELETED the "esc to interrupt" footer hint —
- * `grep -a -c "esc to interrupt"` returns 0 across every local release and
- * the 94MB TUI logs — so the Codex pattern's second anchor is invalid here.
+ * Older local releases had deleted Codex's "esc to interrupt" footer, but
+ * TraeX 0.207.x renders it again while a turn is active. Keep it line-anchored
+ * with the standalone queue states so quoted prose does not become busy proof.
  *
  * Three branches:
  *  1. Spinner-anchored labels: "<braille frame><space><label>". The frame
@@ -161,12 +162,15 @@ const TRAEX_SPINNER_LABELS = [
   'Working…',
   'Working on it…',
   'Queued for capacity',
+  'Queued for next turn',
 ] as const;
 
-/** Line-anchored standalone capacity-queue strings. Shared by the active
+/** Line-anchored standalone busy/queue strings. Shared by the active
  *  busy pattern and the pre-idle static latch (see below). */
 const TRAEX_QUEUE_STATIC_ARMS = [
   'Queued for capacity',
+  'Queued for next turn',
+  'esc to interrupt',
   "Too many requests right now\\. You're in the queue",
 ];
 
@@ -440,12 +444,19 @@ export function createTraexAdapter(pathOverride?: string): CliAdapter {
     startupPendingPattern: /│[ \t]+(?:model|directory):[ \t]+loading\b/,
     startupReadyPattern: /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/,
     systemHints: BOTMUX_SHELL_HINTS,
-    // TRAE 0.200+ shares Codex's type-ahead behaviour: input submitted while
-    // a turn is running is parked and merged into the active turn.
-    supportsTypeAhead: true,
+    // TraeX 0.207.x can display a parked message without durably appending it
+    // to history.jsonl, especially after transcript/TUI state desynchronizes.
+    // Keep PTY delivery serial until the real composer is visible.
+    supportsTypeAhead: false,
     // task_complete in the per-session rollout is an explicit durable turn
     // boundary; worker.ts drains it independently of screen-idle detection.
     reliableTurnTerminal: true,
+    // task_complete closes the business turn, not the TUI generation. Require
+    // a real ›/❯ composer on authoritative PTY screens before releasing input.
+    postTerminalPromptFence: true,
+    // A missing history receipt is ambiguous: block successors in this backend
+    // generation and never replay the unconfirmed message automatically.
+    quarantineUnconfirmedSubmits: true,
     // TRAE's trust/advisory startup screens can accept stdin before the real
     // composer exists, so the worker's 15s soft fallback must wait for the
     // prompt marker. A hard cap in the worker still prevents permanent hangs.
