@@ -110,7 +110,10 @@ export const BotSnapshotSchema = z.object({
   displayName: z.string().optional(),
   workingDir: z.string().optional(),
   cliPathOverride: z.string().optional(),
-  sandbox: z.boolean().optional(),
+  sandbox: z.union([z.boolean(), z.enum(['off', 'oncall', 'scratch'])]).optional(),
+  scratchStorage: z.enum(['tmpfs', 'disk']).optional(),
+  scratchTmpfsSizeMb: z.number().positive().optional(),
+  scratchDenyPaths: z.array(z.string()).optional(),
   // New three-tier fs-policy lists (deny-by-default). Frozen alongside the
   // legacy fields so a historical run's sandbox policy matches what a normal
   // session would build — omitting it would silently drop the readWrite tier +

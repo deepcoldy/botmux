@@ -31,6 +31,12 @@ export interface PtyHandle {
    *  can read `~/.claude/sessions/<pid>.json` to follow Claude's authoritative
    *  current session id (which can rotate on resume / mid-session). */
   cliPid?: number;
+  /** Authoritative terminal snapshots, when supported by an observe backend. */
+  captureCurrentScreen?(): string;
+  captureInputState?(): {
+    viewport: string;
+    cursor: { x: number; y: number };
+  } | null;
   /**
    * An explicitly selected remote Codex App Server thread. When set, Codex
    * history-submit verification accepts only this session id instead of

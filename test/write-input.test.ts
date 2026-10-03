@@ -93,6 +93,7 @@ import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, platform } from 'node:os';
 import { dirname, join } from 'node:path';
 import { codexHistoryPath } from '../src/services/codex-paths.js';
+import { codexTerminalSessionIsBound } from '../src/services/codex-terminal-session.js';
 
 // ── Speed: collapse the adapters' real-time submit waits ───────────────────
 // writeInput()'s submit-confirmation polls the (memfs-mocked, synchronous)
@@ -1665,6 +1666,94 @@ describe('genius writeInput submission confirmation', () => {
 });
 
 describe('codex writeInput submission confirmation', () => {
+  it('uses live footer identity for consecutive messages without adding any status command', async () => {
+    resetCodexHistory();
+    let sid = '01a0ec3d-3751-7882-9b25-49bc90078561';
+    const other = '01a0ec3d-3751-7882-9b25-49bc90078562';
+    let pasted = '';
+    const sendText = vi.fn();
+    const keys: string[] = [];
+    const pty: PtyHandle = {
+      cliPid: 43212, write: vi.fn(), sendText,
+      captureCurrentScreen: vi.fn(() => ''),
+      captureInputState: () => ({
+        viewport: `\n› Ask Codex to do anything\n\n  GPT-6 · Context 79% used · ${sid} ⠋\n  ← for agents · ? for shortcuts`,
+        cursor: { x: 2, y: 1 },
+      }),
+      pasteText(text) { pasted = text; },
+      sendSpecialKeys(key) { keys.push(key); appendCodexHistory(pasted, sid); },
+    };
+    const adapter = createCodexAdapter('/bin/codex');
+    expect(await adapter.writeInput(pty, 'first')).toEqual({ submitted: true, cliSessionId: sid });
+    sid = other;
+    expect(await adapter.writeInput(pty, 'second')).toEqual({ submitted: true, cliSessionId: other });
+    expect(keys).toEqual(['Enter', 'Enter']);
+    expect(sendText).not.toHaveBeenCalled();
+    expect(pty.captureCurrentScreen).not.toHaveBeenCalled();
+  });
+
+  it('confirms daemon-backed tmux input against its live footer, rejecting another pane with identical text', async () => {
+    resetCodexHistory();
+    const sid = '01a0ec3d-3751-7882-9b25-49bc90078561';
+    const foreign = '01a0ec3d-3751-7882-9b25-49bc90078562';
+    let pasted = '';
+    const calls: string[] = [];
+    const pty: PtyHandle = {
+      cliPid: 43212,
+      write() { throw new Error('Unexpected raw write'); },
+      captureInputState: () => ({
+        viewport: `\n› Ask Codex to do anything\n\n  GPT-6 · Context 79% used · ${sid} ⠋\n  ← for agents · ? for shortcuts`,
+        cursor: { x: 2, y: 1 },
+      }),
+      sendText(text) { calls.push(text); },
+      sendSpecialKeys(key) {
+        calls.push(key);
+        appendCodexHistory(pasted, foreign);
+        appendCodexHistory(pasted, sid);
+      },
+      pasteText(text) { pasted = text; calls.push('paste:' + text); },
+    };
+    const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
+    expect(result).toEqual({ submitted: true, cliSessionId: sid });
+    expect(calls).toEqual(['paste:hi', 'Enter']);
+    expect(codexTerminalSessionIsBound(pty, sid)).toBe(true);
+    expect(codexTerminalSessionIsBound(pty, foreign)).toBe(false);
+  });
+
+  it('explains the missing footer ID without writing a command or the message', async () => {
+    resetCodexHistory();
+    const pty: PtyHandle = {
+      cliPid: 43212,
+      write: vi.fn(), pasteText: vi.fn(), sendText: vi.fn(), sendSpecialKeys: vi.fn(),
+      captureInputState: () => ({
+        viewport: '\n› Ask Codex to do anything\n\n  GPT-6 · Context 79% used\n  ← for agents · ? for shortcuts',
+        cursor: { x: 2, y: 1 },
+      }),
+    };
+    const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
+    expect(result?.submitted).toBe(false);
+    if (!result || result.submitted !== false) throw new Error('Expected a rejected submission');
+    expect(result.failureReason).toContain('/statusline');
+    expect(result.failureReason).toContain('thread-id');
+    expect(pty.write).not.toHaveBeenCalled();
+    expect(pty.pasteText).not.toHaveBeenCalled();
+    expect(pty.sendText).not.toHaveBeenCalled();
+    expect(pty.sendSpecialKeys).not.toHaveBeenCalled();
+  });
+
+  it('does not paste a message when the daemon-backed terminal identity is unavailable', async () => {
+    const pasteText = vi.fn();
+    const sendText = vi.fn();
+    const pty: PtyHandle = {
+      cliPid: 43212, write: vi.fn(), pasteText, sendText, sendSpecialKeys: vi.fn(),
+      captureCurrentScreen: () => '', captureInputState: () => null,
+    };
+    const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
+    expect(result).toMatchObject({ submitted: false, failureReason: expect.any(String) });
+    expect(sendText).not.toHaveBeenCalled();
+    expect(pasteText).not.toHaveBeenCalled();
+  });
+
   it('buildArgs resumes with the persisted Codex thread id', () => {
     resetCodexHistory();
     const adapter = createCodexAdapter('/bin/codex');

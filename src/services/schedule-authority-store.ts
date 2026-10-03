@@ -131,31 +131,19 @@ function hasLegacySingleGrantUnique(db: DatabaseSyncLike): boolean {
 
 /** SQLite cannot ALTER a table-level UNIQUE constraint. Early builds used
  * UNIQUE(grant_id), which makes a live turn's second distinct request fail.
- * Rebuild the table atomically after additive columns have been backfilled. */
+ * Called inside the schema transaction, after additive columns are backfilled. */
 function migrateLegacyGrantUnique(db: DatabaseSyncLike): void {
   if (!hasLegacySingleGrantUnique(db)) return;
   const replacement = 'schedule_authority_tasks_grant_v2';
   const columns = AUTHORITY_TASK_COLUMNS.join(', ');
-  db.exec('BEGIN IMMEDIATE;');
-  try {
-    // Re-check under the write lock: another opener may already have migrated.
-    if (!hasLegacySingleGrantUnique(db)) {
-      db.exec('COMMIT;');
-      return;
-    }
-    const occupied = db.prepare(`
-      SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?
-    `).get(replacement);
-    if (occupied) throw new Error('schedule_authority_migration_table_conflict');
-    db.exec(createAuthorityTasksTableSql(replacement));
-    db.exec(`INSERT INTO ${replacement} (${columns}) SELECT ${columns} FROM schedule_authority_tasks;`);
-    db.exec('DROP TABLE schedule_authority_tasks;');
-    db.exec(`ALTER TABLE ${replacement} RENAME TO schedule_authority_tasks;`);
-    db.exec('COMMIT;');
-  } catch (error) {
-    try { db.exec('ROLLBACK;'); } catch { /* no-op */ }
-    throw error;
-  }
+  const occupied = db.prepare(`
+    SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?
+  `).get(replacement);
+  if (occupied) throw new Error('schedule_authority_migration_table_conflict');
+  db.exec(createAuthorityTasksTableSql(replacement));
+  db.exec(`INSERT INTO ${replacement} (${columns}) SELECT ${columns} FROM schedule_authority_tasks;`);
+  db.exec('DROP TABLE schedule_authority_tasks;');
+  db.exec(`ALTER TABLE ${replacement} RENAME TO schedule_authority_tasks;`);
 }
 
 export class ScheduleAuthorityStore {
@@ -165,24 +153,34 @@ export class ScheduleAuthorityStore {
     const path = scheduleAuthorityDbPath(dataDir);
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     const db = openDatabaseSyncOrThrow(path);
-    db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000;');
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS schedule_authority_apps (
-        app_id TEXT PRIMARY KEY,
-        initialized_at TEXT NOT NULL
-      );
-    ` + createAuthorityTasksTableSql('schedule_authority_tasks', true));
-    const columns = new Set((db.prepare('PRAGMA table_info(schedule_authority_tasks)').all() as Array<{
-      name?: unknown;
-    }>).flatMap(row => typeof row.name === 'string' ? [row.name] : []));
-    if (!columns.has('credential_open_id')) {
-      db.exec('ALTER TABLE schedule_authority_tasks ADD COLUMN credential_open_id TEXT;');
+    try {
+      db.exec('PRAGMA busy_timeout=5000; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
+      // Inspect and migrate under the same write lock. Otherwise parallel
+      // openers can both observe a missing column and attempt the same ALTER.
+      db.exec('BEGIN IMMEDIATE;');
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS schedule_authority_apps (
+          app_id TEXT PRIMARY KEY,
+          initialized_at TEXT NOT NULL
+        );
+      ` + createAuthorityTasksTableSql('schedule_authority_tasks', true));
+      const columns = new Set((db.prepare('PRAGMA table_info(schedule_authority_tasks)').all() as Array<{
+        name?: unknown;
+      }>).flatMap(row => typeof row.name === 'string' ? [row.name] : []));
+      if (!columns.has('credential_open_id')) {
+        db.exec('ALTER TABLE schedule_authority_tasks ADD COLUMN credential_open_id TEXT;');
+      }
+      if (!columns.has('self_manage')) {
+        db.exec('ALTER TABLE schedule_authority_tasks ADD COLUMN self_manage INTEGER NOT NULL DEFAULT 0;');
+      }
+      migrateLegacyGrantUnique(db);
+      db.exec('COMMIT;');
+      return new ScheduleAuthorityStore(db);
+    } catch (error) {
+      try { db.exec('ROLLBACK;'); } catch { /* no transaction or already rolled back */ }
+      try { db.close(); } catch { /* preserve the initialization error */ }
+      throw error;
     }
-    if (!columns.has('self_manage')) {
-      db.exec('ALTER TABLE schedule_authority_tasks ADD COLUMN self_manage INTEGER NOT NULL DEFAULT 0;');
-    }
-    migrateLegacyGrantUnique(db);
-    return new ScheduleAuthorityStore(db);
   }
 
   close(): void { this.db.close(); }

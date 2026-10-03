@@ -36,6 +36,12 @@ interface HerdrBackendOptions {
 const POLL_INTERVAL_MS = 500;
 const READ_LINES = 10_000;
 const MAX_AGENT_PROBE_FAILURES = 3;
+// While `agent list` keeps failing (keep-alive), re-confirm liveness through
+// `session list` at most once per this window. Without it every
+// MAX_AGENT_PROBE_FAILURES-th failed poll (1.5s at POLL_INTERVAL_MS=500) fires
+// another `session list` — extra load on the very herdr server that is already
+// struggling, multiplied by every worker sharing that host.
+const SESSION_PROBE_CONFIRM_MIN_INTERVAL_MS = 5_000;
 // Inter-attempt sleep while waiting for `herdr server` to come up.
 // Synchronous (execFileSync 'sleep') because spawn() must stay sync.
 const SERVER_BOOT_POLL_MS = 100;
@@ -348,6 +354,10 @@ export class HerdrBackend implements SessionBackend {
   private cols = 200;
   private rows = 50;
   private agentProbeFailures = 0;
+  /** Earliest wall-clock time a keep-alive `session list` confirmation may run
+   *  again (backoff for sustained `agent list` failures; see
+   *  SESSION_PROBE_CONFIRM_MIN_INTERVAL_MS). 0 = probe immediately. */
+  private sessionProbeAllowedAfterMs = 0;
   private webAttach: pty.IPty | null = null;
   private webCursorTerminal: InstanceType<typeof Terminal> | null = null;
   private webCursor: HerdrWebTerminalCursor | null = null;
@@ -1000,10 +1010,48 @@ export class HerdrBackend implements SessionBackend {
     if (agents === null) {
       this.agentProbeFailures++;
       if (this.agentProbeFailures < MAX_AGENT_PROBE_FAILURES) return;
-      this.handleExit(0, null);
+      // `agent list` failing is a PROBE failure — a busy shared herdr server or
+      // socket contention under concurrent daemons — not evidence that the CLI
+      // died. Reporting an exit here kills a healthy CLI and visibly restarts
+      // the session (first-turn launches are especially exposed: the spawn's
+      // own detection/rename `agent list` calls contend with the very first
+      // polls). Confirm through an independent channel before declaring exit:
+      // the whole host session vanishing means the pane — and the CLI with it —
+      // is really gone. Otherwise keep polling; a real exit still surfaces via
+      // the row-absence path below once a list call succeeds again.
+      this.agentProbeFailures = 0;
+      // Throttle the extra `session list` confirmation while failures PERSIST:
+      // the first threshold of a streak probes immediately (so a genuinely
+      // vanished session is still detected fast), but each keep-alive
+      // confirmation backs off the next one by
+      // SESSION_PROBE_CONFIRM_MIN_INTERVAL_MS. The cost is bounded exit-detection
+      // delay — the same "delay beats false kill" trade-off the keep-alive
+      // itself makes on a shared herdr host — and a single healthy `agent list`
+      // below re-arms immediate probing.
+      const now = Date.now();
+      if (now < this.sessionProbeAllowedAfterMs) return;
+      const sessionProbe = HerdrBackend.probeSession(this.sessionName);
+      if (sessionProbe === 'missing') {
+        logger.warn(`[herdr-backend] agent list failed ${MAX_AGENT_PROBE_FAILURES}x and session ${this.sessionName} is gone; reporting CLI exit`);
+        this.handleExit(0, null);
+        return;
+      }
+      this.sessionProbeAllowedAfterMs = now + SESSION_PROBE_CONFIRM_MIN_INTERVAL_MS;
+      if (sessionProbe === 'unknown') {
+        // Both probes failed: we know nothing about the session's fate. On a
+        // shared herdr host the likeliest cause is server overload, not a
+        // dead CLI, so we deliberately keep the CLI alive — trading
+        // exit-detection delay for not killing a healthy CLI. A real exit
+        // still surfaces via the row-absence path below once `agent list`
+        // succeeds again.
+        logger.warn(`[herdr-backend] agent list failed ${MAX_AGENT_PROBE_FAILURES}x for session ${this.sessionName} and the session-list confirmation failed too (probe unknown); keeping the CLI alive — trading exit-detection delay for not killing a healthy CLI on a shared herdr host`);
+      } else {
+        logger.warn(`[herdr-backend] agent list failed ${MAX_AGENT_PROBE_FAILURES}x for session ${this.sessionName} but the session still exists; keeping the CLI alive and re-confirming at most every ${Math.round(SESSION_PROBE_CONFIRM_MIN_INTERVAL_MS / 1000)}s`);
+      }
       return;
     }
     this.agentProbeFailures = 0;
+    this.sessionProbeAllowedAfterMs = 0;
     // Exit detection. Verified against herdr v0.6.6: when the CLI process exits,
     // herdr DROPS the agent row from `agent list` (it does NOT keep a
     // running:false tombstone). So the primary signal is "our agent is no

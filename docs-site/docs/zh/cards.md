@@ -99,6 +99,19 @@ botmux 在飞书里的「存在感」分四层，各自独立开关：
 
 > ⚠️ 原始卡片**只允许纯展示 + open_url 跳转按钮**：任何会触发回调的控件——回调按钮（带 `value`）、下拉 / 人员选择、日期时间选择、输入框、表单提交——都会被拒绝。这是防止自定义卡片伪造交互回调。
 
+## 在消息里画图表（vega-lite）
+
+`botmux send` 正文中的 ` ```vega-lite ` 代码块会渲染成飞书 Card 2.0 原生图表；同一段 Vega-Lite 在 Web 等其它通道可直接渲染。支持的子集：
+
+- 数据只能用 `data.values` 内联，最多 500 行，值为字符串 / 数字 / 布尔 / null。
+- `mark`：`bar`（按哪个轴是数值自动识别横向条形）、`line`、`area`、`point`、`arc`（饼图；`innerRadius > 0` 为环图）。饼图只写 `theta`（数值）+ `color`（类别），带 `x`/`y` 会被拒绝，`theta` 也不支持 `title`。
+- 编码通道：`x`、`y`、`color`（分组）、`theta`（饼图数值）；每个通道只认 `field`、`type`、`title`。`x`/`y` 的 `title` 成为坐标轴标题，`color` 的 `title` 成为图例标题。`type: temporal` 不做日期解析，日期按给定顺序当作类别展示，请先排好序。
+- 每张卡片最多 5 个图表。真正的边界是飞书卡片消息的**整个请求体 ≤ 30KB**（含消息信封、`content` 二次序列化）：卡片组装完成后若超限，图表按"图表 → 50 行数据表 → 10 行数据表 → 只留说明"逐级降级，直到放得下。单个 spec 源码另有 30KB 的解析上限。
+
+安全规则：宿主只从认识的字段**重新组装** VChart spec，不透传原始 JSON。`data.url`、`transform`、`params`、`expr`、`signal`、`datasets`、`layer` 等一律拒绝。不支持或超限时降级为一行说明加原始数据表（纯文本单元格，不会渲染成链接或 @），并在 `botmux send` 的 stderr 给出原因，消息照常发出。
+
+`botmux send --dry-run` 可在发送前查看渲染结果：输出 `{dryRun, bytes, fits, diagnostics, card}`（`bytes` 按飞书真实请求体计算），不发送、不需要会话；只渲染正文，不上传图片/附件、不解析 @、不加页脚。
+
 ## 发送后更新卡片（card patch）
 
 `botmux send --card-file/--card-json` 成功后会输出 `{"success":true,"messageId":"om_...",...}`。用 `botmux card patch` 可以按这个 messageId **原地更新**同一张卡片——不发新消息、不换群/话题，适合做进度卡片：

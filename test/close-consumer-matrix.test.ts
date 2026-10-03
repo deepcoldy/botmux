@@ -74,6 +74,11 @@ const CONSUMERS: Record<string, Rule> = {
     count: 3,
   },
   // ── user surfaces: must render refusal AND residual ──────────────────────
+  'core/dismiss-command.ts::dismissSessionGroup::closeSession': {
+    category: 'user_surface',
+    why: '/dismiss returns refusal/residual details to the command handler and '
+      + 'preserves the group unless closure is known and clean; test/dismiss-command.test.ts covers both.',
+  },
   'core/command-handler.ts::handleCommand::closeSession': {
     category: 'user_surface',
     why: '/close, /lane close, shared-adopt /detach and /disconnect, and same-daemon '

@@ -903,7 +903,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     ...(larkTransport ? [`${sd}/dashboard-daemons`] : []),
     `${sd}/bots-info.json`,     // bot display names / avatars for <available_bots> + recipient rendering
     `${sd}/bot-openids-${app}.json`,  // OWN routing cross-ref (sibling ones stay denied)
-    // own sessions-<self>.json + attachments/<self> already pushed above (readOnly)
+    // own session-stores/<self> + attachments/<self> already pushed above (readOnly)
   ], 'readOnly', 'internal');
   // turn-sends: the CLI APPENDS its OWN dedup marker to
   // `turn-sends/<sessionId>.jsonl` (write, not read). Grant the SINGLE file, not
@@ -920,6 +920,14 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
   // session-scoped: sibling sessions' dirs are not exposed. The worker
   // pre-creates the dir so bwrap has a bind source.
   if (ctx.sessionId) push([`${sd}/statusline/${ctx.sessionId}`], 'readWrite', 'internal');
+  // turn-send-ledger: `botmux send` keeps its per-turn final-answer fence in
+  // `turn-send-ledger/<sessionId>/<hash>.json` (atomic tmp+rename plus a
+  // sibling `.lock`), so — like statusline — grant the per-session DIRECTORY.
+  // Never the shared root: it holds every session's fence, and write access
+  // there would let one session forge "final already sent" for another (its
+  // answer is then refused) or delete a record (its retry then duplicates).
+  // The worker pre-creates the dir so bwrap has a bind source.
+  if (ctx.sessionId) push([`${sd}/turn-send-ledger/${ctx.sessionId}`], 'readWrite', 'internal');
   // (schedules: stored PER BOT inside each BOT_HOME — the owner's dir is
   // already readWrite above and siblings' stores are denied by construction,
   // so the old shared data/schedules.json grant (and the cross-bot task-prompt
@@ -1031,6 +1039,8 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     if (ctx.sessionId) push([`${ctx.sessionDataDir}/turn-sends/${ctx.sessionId}.jsonl`], 'readWrite', 'internal');
     // statusline snapshot dir (see the larkTransport branch for why a dir, not a file).
     if (ctx.sessionId) push([`${ctx.sessionDataDir}/statusline/${ctx.sessionId}`], 'readWrite', 'internal');
+    // Own turn-send-ledger session dir (see the larkTransport branch).
+    if (ctx.sessionId) push([`${ctx.sessionDataDir}/turn-send-ledger/${ctx.sessionId}`], 'readWrite', 'internal');
     // NOTE: dashboard-daemons (sibling IPC port table) and .dashboard-secret/-token
     // are deliberately NOT re-allowed — a no-transport turn has no business
     // reaching sibling daemons, and the secret is the escalation vector.
@@ -1363,7 +1373,7 @@ export function compileToBwrap(policy: FsPolicy, opts: CompileBwrapOpts): BwrapC
 // ───────────────────────────── legacy config migration ───────────────────────
 
 export interface LegacySandboxFields {
-  sandbox?: boolean;
+  sandbox?: boolean | 'off' | 'oncall' | 'scratch';
   readIsolation?: boolean;
   sandboxReadonlyPaths?: readonly string[];
   sandboxHidePaths?: readonly string[];
@@ -1371,7 +1381,9 @@ export interface LegacySandboxFields {
 }
 
 export interface MigratedSandboxFields {
-  sandbox: boolean;
+  // Tri-state preserved: a scratch bot carrying legacy path fields must NOT
+  // be silently downgraded to oncall(boolean true) by the migration.
+  sandbox: boolean | 'oncall' | 'scratch';
   sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] };
 }
 
@@ -1388,7 +1400,14 @@ export function migrateLegacySandboxFields(entry: LegacySandboxFields & { sandbo
     || (entry.sandboxReadonlyPaths?.length ?? 0) > 0
     || (entry.sandboxHidePaths?.length ?? 0) > 0
     || (entry.readDenyExtraPaths?.length ?? 0) > 0;
-  const sandbox = entry.sandbox === true || entry.readIsolation === true;
+  // Preserve the tri-state: only oncall representations collapse to boolean
+  // true; 'scratch' passes through unchanged (the old path lists are irrelevant
+  // to scratch's full-root COW, but the mode itself must not be downgraded).
+  const sandbox: boolean | 'oncall' | 'scratch' = entry.sandbox === 'scratch'
+    ? 'scratch'
+    : (entry.sandbox === true
+      || entry.sandbox === 'oncall'
+      || entry.readIsolation === true);
   if (!hasLegacy) return null; // plain `sandbox: true` needs no path migration
   const readOnly = [...(entry.sandboxReadonlyPaths ?? [])];
   const deny = [...(entry.sandboxHidePaths ?? []), ...(entry.readDenyExtraPaths ?? [])];

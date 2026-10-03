@@ -700,7 +700,7 @@ describe('exact trigger presentation keeps the persisted reply destination', () 
       if (mode === 'async') expect(ds.asyncTriggerResults?.has(turnId)).toBe(true);
     } finally {
       vi.mocked(sessionStore.updateSession).mockReset();
-      nativeStore.init(undefined, { owner: false });
+      nativeStore.init(APP, { owner: false });
       config.session.dataDir = previousDir;
     }
   });

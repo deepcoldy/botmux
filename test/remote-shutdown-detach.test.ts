@@ -49,7 +49,7 @@ describe('Remote graceful daemon-shutdown detach coordinator', () => {
   afterEach(() => {
     vi.restoreAllMocks();
     config.session.dataDir = previousDataDir;
-    sessionStore.init();
+    sessionStore.init('test-app');
     rmSync(dataDir, { recursive: true, force: true });
   });
 

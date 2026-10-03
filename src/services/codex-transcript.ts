@@ -250,6 +250,7 @@ export interface CodexBridgeEvent {
  *  keep this module dependency-free. */
 export type CodexCotEntry =
   | { kind: 'thinking'; text: string }
+  | { kind: 'text'; text: string }
   | {
     kind: 'tool_call'; id: string; name: string; args: string;
     /** 截断前从原始 arguments / input / action 提取的单行主题（≤1000）；

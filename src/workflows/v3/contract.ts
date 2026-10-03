@@ -161,8 +161,12 @@ export interface BotSnapshot {
   cliPathOverride?: string;
   model?: string;
   /** Frozen per-bot sandbox policy. Workflow workers must not silently lose
-   *  these fields when spawning outside the main forkWorker path. */
-  sandbox?: boolean;
+   *  these fields when spawning outside the main forkWorker path. Tri-state:
+   *  'oncall' (fs-policy whitelist) or 'scratch' (full-root COW). */
+  sandbox?: boolean | 'off' | 'oncall' | 'scratch';
+  scratchStorage?: 'tmpfs' | 'disk';
+  scratchTmpfsSizeMb?: number;
+  scratchDenyPaths?: string[];
   /** New three-tier fs-policy lists (deny-by-default). Carried alongside the
    *  legacy fields so a workflow worker builds the SAME policy as a normal
    *  session; without it the readWrite tier + user-expressed deny are lost. */

@@ -20,7 +20,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks();
   config.session.dataDir = previousDataDir;
-  sessionStore.init();
+  sessionStore.init('app-principal-lane-callbacks');
   rmSync(dataDir, { recursive: true, force: true });
 });
 

@@ -3,6 +3,11 @@ import { normalizeCodexInstancePool, registerCodexInstanceBot, clearCodexInstanc
 import { readFileSync, existsSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { underReadIsolation } from './adapters/cli/read-isolation.js';
+import {
+  normalizeSandboxMode,
+  normalizeScratchStorage,
+  type SandboxMode,
+} from './adapters/cli/sandbox-mode.js';
 import type { BackendType } from './adapters/backend/types.js';
 import { normalizeMojoConfig, type MojoConfig } from './adapters/backend/mojo-types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
@@ -54,6 +59,11 @@ import {
   normalizeReplyStyleConfig,
   type ReplyStyleConfig,
 } from './im/lark/reply-card-style.js';
+import {
+  normalizeAskOptionLayout,
+  setAskOptionLayoutLookup,
+  type AskOptionLayout,
+} from './im/lark/ask-option-layout.js';
 import { cliModelSupportsReasoningEffort, isBackendVariantCliId, isConfigurableReasoningCliId, isCodexReasoningEffort } from './services/codex-reasoning-effort.js';
 import {
   normalizeNativeSubagentRuntimePolicy,
@@ -144,6 +154,12 @@ export function normalizeTurnTimeoutMs(value: unknown): number | undefined {
  */
 export function normalizeDshRuntime(value: unknown): 'official' | 'tui' | undefined {
   return value === 'official' || value === 'tui' ? value : undefined;
+}
+
+export function normalizeDshProfile(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const name = value.trim();
+  return /^[a-zA-Z0-9_-]+$/.test(name) ? name : undefined;
 }
 
 export function configureLarkClientHttpTimeout(client: unknown): void {
@@ -1390,6 +1406,8 @@ export interface SessionGroupConfig {
      * 回落链见 services/feed-group-tagger.ts 的 resolveSessionTagName。
      */
     name?: string;
+    /** Destination personal feed group after successful /close. Empty = disabled. */
+    closedName?: string;
   };
   /**
    * Distinctive built-in group avatar for session groups — the zero-permission
@@ -1635,13 +1653,37 @@ export interface BotConfig {
    */
   triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig;
   /**
-   * Run this bot's CLI inside a per-session file sandbox (unified three-tier
-   * whitelist, deny-by-default; Linux bwrap + macOS Seatbelt with identical
-   * semantics — see adapters/cli/fs-policy.ts). The agent can read/write the
-   * project + its own BOT_HOME, read the system toolchain baseline, and touch
-   * NOTHING else. Env BOTMUX_SANDBOX=1 forces it on regardless (testing).
+   * Local file sandbox selection.
+   *   true/"oncall" — per-session deny-by-default three-tier whitelist
+   *     (Linux bwrap + macOS Seatbelt, identical semantics; see
+   *     adapters/cli/fs-policy.ts): the agent can read/write the project + its
+   *     own BOT_HOME, read the system toolchain baseline, and touch NOTHING
+   *     else. For sharing a bot with semi-trusted users.
+   *   "scratch" — Linux-only full-root COW overlay: the agent reads the whole
+   *     real filesystem natively but every write goes to a per-session
+   *     throwaway upper and never reaches the host. No confidentiality
+   *     boundary; for the owner's own disposable experiments. See
+   *     docs/design/2026-09-21-sandbox-scratch-mode.md.
+   *   false/"off"/missing — no local file isolation.
+   * Env BOTMUX_SANDBOX=1 forces oncall, BOTMUX_SANDBOX=scratch forces scratch
+   * (testing/global).
    */
-  sandbox?: boolean;
+  sandbox?: boolean | 'oncall' | 'scratch' | 'off';
+  /**
+   * Scratch-mode upper storage (ignored by the other modes). "tmpfs" (default):
+   * the upper lives in RAM and dies with the machine; "disk": it survives a
+   * daemon restart for cold resume and is deleted when the session ends.
+   */
+  scratchStorage?: 'tmpfs' | 'disk';
+  /** Cap for the tmpfs upper in MB (tmpfs storage only). 0/missing = kernel
+   *  default (~half of RAM). */
+  scratchTmpfsSizeMb?: number;
+  /**
+   * Extra paths hidden inside a scratch sandbox ON TOP OF the full-root view
+   * (mode-000 masks). The fixed transport-credential masks are always applied
+   * and needn't be listed. Only meaningful with sandbox: "scratch".
+   */
+  scratchDenyPaths?: string[];
   /**
    * User增量 three-tier path lists layered ON TOP of the baseline preset
    * (never replacing it). Deepest matching rule wins, so nested black/white
@@ -1972,6 +2014,12 @@ export interface BotConfig {
    * cannot drift halfway through a long-lived pane.
    */
   replyStyle?: ReplyStyleConfig;
+  /**
+   * `botmux ask` 选项按钮布局：'compact'（默认，按行自动换行）或 'vertical'
+   * （每行 1 个，长标签更易读）。手改的非法值在读取时 fail-soft 回退 compact，
+   * 不影响发卡；卡片在 daemon 进程内渲染，改动即时生效，无需重启 worker。
+   */
+  askOptionLayout?: AskOptionLayout;
   /**
    * Where to show native Context / Token usage for this bot's Session cards:
    *   • `'streaming'` (default / unset) → in the live streaming card body
@@ -2320,6 +2368,10 @@ export function __testOnly_resetBotRegistry(): void {
 // Wire the i18n lookup so `localeForBot()` can resolve per-bot locale without
 // a hard import cycle between `i18n` and `bot-registry`.
 setBotLookup((id) => bots.get(id));
+
+// 同理给 ask 卡片选项布局注册 lookup：ask-card.ts 经 turn-reply-ask.ts 间接依赖
+// 本模块，不能反向 import，只能由这里把 bots 表推进去。
+setAskOptionLayoutLookup((id) => bots.get(id));
 
 /** Path of the bot config file we loaded (so `/oncall` can persist bindings back). */
 let loadedConfigPath: string | undefined;
@@ -3346,13 +3398,39 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
     if (cliRuntime && entry.cliPathOverride !== cliRuntime.executable) {
       throw new Error(`Bot config [${i}]: cliPathOverride must exactly match cliRuntime.executable`);
     }
+    // Resolve the sandbox tri-state ONCE (throws on a typo'd mode — never
+    // silently unsandboxed); every check/project site below uses this value.
+    let sandboxMode: SandboxMode = 'off';
+    try {
+      sandboxMode = normalizeSandboxMode(entry.sandbox);
+    } catch (e) {
+      throw new Error(`Bot config [${i}]: ${(e as Error).message}`);
+    }
+    const scratchStorage = entry.scratchStorage !== undefined
+      ? normalizeScratchStorage(entry.scratchStorage)
+      : undefined;
+    if (scratchStorage !== undefined) {
+      try {
+        if (typeof scratchStorage === 'string' && scratchStorage !== 'tmpfs' && scratchStorage !== 'disk') {
+          throw new Error(`invalid scratchStorage: ${JSON.stringify(entry.scratchStorage)}`);
+        }
+      } catch (e) {
+        throw new Error(`Bot config [${i}]: ${(e as Error).message}`);
+      }
+    }
+    const scratchTmpfsSizeMb = typeof entry.scratchTmpfsSizeMb === 'number'
+      && Number.isFinite(entry.scratchTmpfsSizeMb)
+      && entry.scratchTmpfsSizeMb > 0
+      ? Math.floor(entry.scratchTmpfsSizeMb)
+      : undefined;
+    const scratchDenyPaths = normalizeStringList(entry.scratchDenyPaths);
     validateCliLaunchModeConfig({
       cliId: entryCliId,
       cliLaunchMode,
       wrapperCli: entry.wrapperCli,
       cliRuntime: entry.cliRuntime,
       cliPathOverride: entry.cliPathOverride,
-      sandbox: entry.sandbox,
+      sandbox: sandboxMode,
       readIsolation: entry.readIsolation,
     }, `Bot config [${i}]`);
     const existingAppServer = normalizeExistingAppServerConfig(
@@ -3379,7 +3457,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (existingAppServer) {
         throw new Error(`Bot config [${i}]: codexBrowser cannot be combined with existingAppServer`);
       }
-      if (entry.sandbox === true || entry.readIsolation === true) {
+      if (sandboxMode !== 'off' || entry.readIsolation === true) {
         throw new Error(`Bot config [${i}]: codexBrowser cannot be combined with sandbox or readIsolation`);
       }
     }
@@ -3393,7 +3471,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (typeof entry.wrapperCli === 'string' && entry.wrapperCli.trim()) {
         throw new Error(`Bot config [${i}]: existingAppServer cannot be combined with wrapperCli`);
       }
-      if (entry.sandbox === true || entry.readIsolation === true) {
+      if (sandboxMode !== 'off' || entry.readIsolation === true) {
         throw new Error(`Bot config [${i}]: existingAppServer cannot be combined with sandbox or readIsolation`);
       }
     }
@@ -3605,6 +3683,13 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       logger.warn(`[bot-registry:${entry.larkAppId}] ${warning}`);
     }
 
+    // 冷读线程化：写侧（PUT → rmwBotEntry）只保证落盘与热更新；daemon 重启后
+    // 配置能活下来的唯一通路是 parser 在这里把磁盘字段读进 BotConfig。
+    const normalizedAskOptionLayout = normalizeAskOptionLayout(entry.askOptionLayout);
+    for (const warning of normalizedAskOptionLayout.warnings) {
+      logger.warn(`[bot-registry:${entry.larkAppId}] ${warning}`);
+    }
+
     const skills = readBotSkillPolicy(entry.skills);
     // Presence is semantic for plugins: [] is an exact "none" override, while
     // an absent field inherits the machine defaults.
@@ -3736,6 +3821,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       turnTimeoutMs: normalizeTurnTimeoutMs(entry.turnTimeoutMs),
       // dsh-only runtime variant; non-dsh CLIs drop it (same pattern as turnTimeoutMs).
       dshRuntime: entryCliId === 'dsh' ? normalizeDshRuntime(entry.dshRuntime) : undefined,
+      // dsh profile names match the Dashboard profile-create contract.
+      dshProfile: entryCliId === 'dsh' ? normalizeDshProfile(entry.dshProfile) : undefined,
       reasoningEffort: isConfigurableReasoningCliId(entryCliId)
         && isCodexReasoningEffort(entry.reasoningEffort)
         && cliModelSupportsReasoningEffort(
@@ -3752,6 +3839,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // 显式 send / transcript 都保留；缺省按 defaultReplyDeliveryFor 解析。
       replyDelivery: entry.replyDelivery === 'transcript' || entry.replyDelivery === 'send' ? entry.replyDelivery : undefined,
       promptInjection: entry.promptInjection === 'none' ? 'none' : undefined,
+      // Only the non-default hook mode is persisted; absent, 'off', and invalid
+      // values all retain the historical inline behavior.
+      envelopeInjection: entry.envelopeInjection === 'auto' ? 'auto' : undefined,
       codexBrowser,
       codexRpcInput: entry.codexRpcInput === true,
       existingAppServer,
@@ -3760,7 +3850,12 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       credentialsSourceDir,
       codexInstancePool,
       ...(triggerUserAuth ? { triggerUserAuth } : {}),
-      sandbox: entry.sandbox === true,
+      // Wire representation stays backwards compatible: oncall = legacy `true`;
+      // only scratch is a string; off serializes as false.
+      sandbox: sandboxMode === 'oncall' ? true : sandboxMode === 'scratch' ? 'scratch' : false,
+      scratchStorage,
+      scratchTmpfsSizeMb,
+      scratchDenyPaths,
       sandboxPaths: entry.sandboxPaths && typeof entry.sandboxPaths === 'object' && !Array.isArray(entry.sandboxPaths)
         ? {
             readWrite: normalizeStringList(entry.sandboxPaths.readWrite),
@@ -3849,6 +3944,9 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // means "use default botmux brand". Don't trim-to-undefined here.
       brandLabel: typeof entry.brandLabel === 'string' ? entry.brandLabel : undefined,
       replyStyle: normalizedReplyStyle.config,
+      // 稀疏语义与写侧一致：缺省/非法值 → undefined（compact 行为）；显式
+      // vertical（或手改的 compact）原样读出。
+      askOptionLayout: normalizedAskOptionLayout.layout,
       // Persist only a non-default usage-display mode; 'streaming' (default) and
       // an absent key both mean streaming. Legacy showUsageInCardFooter:false is
       // still honored on read (see normalizeUsageDisplay) but never re-emitted.

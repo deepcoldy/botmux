@@ -38,14 +38,13 @@ import type { HolderReason } from './session-store-copy.js';
 export type { UnownedRowApply, UnownedRowRead } from './session-store.js';
 export type { HolderReason } from './session-store-copy.js';
 
-type HostTarget = { sessionId: string; larkAppId?: string };
+type HostTarget = { sessionId: string; larkAppId: string };
 
 /**
  * Fresh descriptor → reason. Missing file is NOT "old version".
  * Unreadable registry is treated as offline (no reason).
  */
-export function probeHolder(larkAppId: string | undefined, dataDir: string): HolderReason | undefined {
-  if (!larkAppId) return undefined;
+export function probeHolder(larkAppId: string, dataDir: string): HolderReason | undefined {
   let daemon;
   try { daemon = findOnlineDaemon(larkAppId, dataDir); }
   catch { return undefined; }

@@ -10,7 +10,7 @@ import { fetchDaemonIpc, loadDaemonIpcSecret } from '../core/daemon-ipc-auth.js'
 import { findOnlineDaemon } from '../utils/daemon-discovery.js';
 import { loadAllSessionsSnapshot } from './session-store.js';
 import { applySessionCommandAsHost } from './session-command-host.js';
-import { formatStoreHoldMessage, formatUnmigratedMessage } from './session-store-copy.js';
+import { SESSION_ROW_MISSING_APP_ID, formatStoreHoldMessage, formatUnmigratedMessage } from './session-store-copy.js';
 import { knownBotAppIds } from './known-bot-app-ids.js';
 
 export type WhiteboardScope = 'chat' | 'project' | 'custom';
@@ -464,30 +464,31 @@ async function unbindSessionWhiteboard(
   dataDir: string,
 ): Promise<UnbindResult> {
   const larkAppId = session.larkAppId;
-  if (larkAppId) {
-    try {
-      const daemon = findOnlineDaemon(larkAppId, dataDir);
-      if (daemon) {
-        const res = await fetchDaemonIpc(
-          daemon.ipcPort,
-          `/api/sessions/${encodeURIComponent(session.sessionId)}/whiteboard`,
-          {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ whiteboardId: null, expectWhiteboardId: boardId }),
-            signal: AbortSignal.timeout(UNBIND_IPC_TIMEOUT_MS),
-          },
-          loadDaemonIpcSecret(),
-        );
-        // Any HTTP answer is terminal — the daemon is alive and authoritative.
-        if (res.status === 409) return { status: 'already_changed' };
-        if (res.ok) return { status: 'cleared' };
-        return { status: 'unresolved' };
-      }
-    } catch { /* connection failed: the re-probe below decides whether we may write */ }
-  }
+  // Snapshot rows always carry the store's appId (loadAllSessionsSnapshot
+  // stamps it); a row without one names no store and is left alone.
+  if (!larkAppId) return { status: 'unresolved', reason: SESSION_ROW_MISSING_APP_ID };
+  try {
+    const daemon = findOnlineDaemon(larkAppId, dataDir);
+    if (daemon) {
+      const res = await fetchDaemonIpc(
+        daemon.ipcPort,
+        `/api/sessions/${encodeURIComponent(session.sessionId)}/whiteboard`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ whiteboardId: null, expectWhiteboardId: boardId }),
+          signal: AbortSignal.timeout(UNBIND_IPC_TIMEOUT_MS),
+        },
+        loadDaemonIpcSecret(),
+      );
+      // Any HTTP answer is terminal — the daemon is alive and authoritative.
+      if (res.status === 409) return { status: 'already_changed' };
+      if (res.ok) return { status: 'cleared' };
+      return { status: 'unresolved' };
+    }
+  } catch { /* connection failed: the re-probe below decides whether we may write */ }
   const published = applySessionCommandAsHost(
-    { sessionId: session.sessionId, ...(larkAppId ? { larkAppId } : {}) },
+    { sessionId: session.sessionId, larkAppId },
     { type: 'whiteboard', whiteboardId: null, expectWhiteboardId: boardId },
     { dataDir },
   );

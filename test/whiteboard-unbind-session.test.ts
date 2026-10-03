@@ -43,7 +43,7 @@ vi.mock('../src/core/daemon-ipc-auth.js', () => ({
 
 import { createWhiteboard, deleteWhiteboard } from '../src/services/whiteboard-store.js';
 
-function seedBoundSession(appId: string | undefined, boardId: string): void {
+function seedBoundSession(appId: string, boardId: string): void {
   seedPersistedSessionRows(tempDir, appId, {
     s1: {
       sessionId: 's1',
@@ -169,16 +169,4 @@ describe('deleteWhiteboard session unbind', () => {
     expect(readPersistedSessionRows(tempDir, 'app1').s1.whiteboardId).toBe(board.id);
   });
 
-  it('writes a legacy row that carries no larkAppId without probing any daemon', async () => {
-    const board = createWhiteboard({ id: 'delete_legacy', title: 't', larkAppId: 'app1', chatId: 'c1' });
-    // Pre-per-bot row in the flat store: no daemon runs a store without an
-    // appId, so there is no owner to defer to.
-    seedBoundSession(undefined, board.id);
-    ipc.daemon = { larkAppId: 'app1', ipcPort: 18765 };
-
-    const result = await deleteWhiteboard(board.id);
-    expect(result).toMatchObject({ clearedSessions: 1, unresolvedSessions: 0 });
-    expect(ipc.fetches).toEqual([]);
-    expect(readPersistedSessionRows(tempDir).s1.whiteboardId).toBeUndefined();
-  });
 });

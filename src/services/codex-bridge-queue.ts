@@ -136,6 +136,10 @@ export class CodexBridgeQueue {
    *  feeds the native CoT (thinking process) message. Never affects
    *  attribution or lifecycle; exceptions are swallowed at the call site. */
   private cotObserver?: (entries: readonly CodexCotEntry[], turn: CodexPendingTurn) => void;
+  /** A steer can retire a collecting turn without producing its terminal or
+   * any CoT on the successor. Let the UI close that exact abandoned timeline;
+   * this notification is not evidence that the work completed. */
+  private cotSupersededObserver?: (turn: CodexPendingTurn) => void;
   private localTurnsEnabled = false;
   private bufferedUnmatched: CodexBridgeEvent[] = [];
   private lastClosedAssistantFinalTimeMs: number | undefined;
@@ -506,6 +510,10 @@ export class CodexBridgeQueue {
     this.cotObserver = fn;
   }
 
+  setCotSupersededObserver(fn: (turn: CodexPendingTurn) => void): void {
+    this.cotSupersededObserver = fn;
+  }
+
   /** Process newly-appended events. Idempotent on uuid: events with seen
    *  uuids are skipped, so callers can replay safely. */
   ingest(events: CodexBridgeEvent[]): void {
@@ -710,9 +718,13 @@ export class CodexBridgeQueue {
         && !this.isProvisionalTaskStart(this.collecting)
         && !isDistinctNativeTurn
         && ev.preserveCollecting !== true) {
-        const idx = this.queue.indexOf(this.collecting);
+        const superseded = this.collecting;
+        const idx = this.queue.indexOf(superseded);
         if (idx >= 0) this.queue.splice(idx, 1);
         this.collecting = null;
+        if (idx >= 0) {
+          try { this.cotSupersededObserver?.(superseded); } catch { /* cosmetic only */ }
+        }
       }
 
       if (willStartNext) {

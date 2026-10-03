@@ -37,6 +37,24 @@ import type { FeedbackPolicy } from '../../services/feedback-policy.js';
 import type { StatuslineQuota } from '../../services/statusline-snapshot.js';
 import type { ReplyCardHeader } from './reply-card-style.js';
 import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
+import {
+  DEGRADED_TABLE_MAX_ROWS,
+  VEGA_LITE_FENCE_LANGS,
+  convertVegaLiteFence,
+  degradedVegaLiteElements,
+  type CardRenderDiagnostic,
+  type VegaLiteConversion,
+} from './vega-lite-chart.js';
+import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
+import { logger } from '../../utils/logger.js';
+
+/** Room kept for chrome that callers attach *after* a card is built and
+ * fitted — today the on-call group button (≈483B of request body), added by
+ * `attachOncallGroupButton` in both `botmux send` and the daemon. Reserved
+ * unconditionally; it costs nothing when no button is attached. */
+export const CARD_LATE_CHROME_RESERVE_BYTES = 2_000;
+
+export type { CardRenderDiagnostic } from './vega-lite-chart.js';
 
 export { REPLY_CARD_FOOTER_MARKER } from './reply-card-footer-signature.js';
 
@@ -47,6 +65,33 @@ const MAX_LOCAL_HOME_LINK_REPAIRS = 256;
  *  split one prose buffer into another element, so six keeps ordinary cards
  *  bounded while still covering the sections in a typical result report. */
 const MAX_PROMOTED_CARD_HEADINGS = 6;
+/** Feishu recommends at most five charts per card. Byte size is not budgeted
+ * here: the only real limit is the 30KB card request body, which can only be
+ * measured once the whole card exists (see `fitChartsToCardBudget`). */
+const MAX_CARD_CHARTS = 5;
+
+interface CardLayoutBudget {
+  promotedHeadings: number;
+  charts: number;
+  diagnostics?: CardRenderDiagnostic[];
+}
+
+/** Every element produced for one ```vega-lite fence is tagged with the same
+ * group so the post-assembly budget pass can step it down without re-parsing.
+ * Stage 0 = chart, 1 = notice + 50-row table, 2 = notice + 10-row table,
+ * 3 = notice only. */
+interface ChartGroup {
+  stage: 0 | 1 | 2 | 3;
+  degraded: Extract<VegaLiteConversion, { ok: false }>;
+  diagnostics?: CardRenderDiagnostic[];
+}
+const chartGroups = new WeakMap<object, ChartGroup>();
+const STAGE_ROWS = [DEGRADED_TABLE_MAX_ROWS, DEGRADED_TABLE_MAX_ROWS, 10, 0] as const;
+
+function tagChartGroup(elements: any[], group: ChartGroup): any[] {
+  for (const element of elements) chartGroups.set(element, group);
+  return elements;
+}
 
 /** Canonical chrome for ordinary Bot Session reply cards. The CLI send path
  *  and daemon final-output fallback both spread this object so layout cannot
@@ -926,6 +971,7 @@ export function buildCardBodyElements(
   cwd = process.cwd(),
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
   imageMode = 'fit_horizontal',
+  diagnostics?: CardRenderDiagnostic[],
 ): any[] {
   if (!input) return [];
   // Recover model-escaped fences first so markdown-it can classify their
@@ -936,7 +982,7 @@ export function buildCardBodyElements(
   // else flows through the markdown element builder unchanged. Fence-aware so
   // image-looking lines inside ``` code blocks are left intact.
   const elements: any[] = [];
-  const layoutBudget = { promotedHeadings: 0 };
+  const layoutBudget: CardLayoutBudget = { promotedHeadings: 0, charts: 0, diagnostics };
   for (const seg of splitImageRowSegments(input, imageMode)) {
     if (seg.type === 'imgrow') elements.push(imageRowElement(seg.keys));
     else if (seg.type === 'img') elements.push(singleImageLayout(seg.key, imageMode, seg.alt));
@@ -947,7 +993,7 @@ export function buildCardBodyElements(
 
 function buildMarkdownElements(
   input: string,
-  layoutBudget: { promotedHeadings: number },
+  layoutBudget: CardLayoutBudget,
 ): any[] {
   if (!input) return [];
   input = unescapeFenceLines(input);
@@ -1012,6 +1058,15 @@ function buildMarkdownElements(
       continue;
     }
 
+    if (t.type === 'fence' && VEGA_LITE_FENCE_LANGS.has((t.info || '').trim().split(/\s+/)[0]!.toLowerCase())) {
+      // A chart fence becomes a native Card 2.0 chart, or a notice plus a
+      // plain-text data table — never the raw spec (see vega-lite-chart.ts).
+      flushBuf();
+      elements.push(...buildVegaLiteElements(t.content, layoutBudget));
+      i++;
+      continue;
+    }
+
     if (t.type === 'fence' || t.type === 'code_block') {
       const fence = t.markup || '```';
       const info = (t.info || '').trim();
@@ -1047,6 +1102,101 @@ function buildMarkdownElements(
 
   flushBuf();
   return elements;
+}
+
+function buildVegaLiteElements(source: string, layoutBudget: CardLayoutBudget): any[] {
+  let result = convertVegaLiteFence(source);
+  if (result.ok) {
+    const rows = (result.element.chart_spec as { data: { values: Record<string, string | number | boolean | null>[] } }).data.values;
+    const fallback = { ok: false as const, reason: 'card_budget_exceeded', ...(result.title ? { title: result.title } : {}), rows };
+    if (layoutBudget.charts < MAX_CARD_CHARTS) {
+      layoutBudget.charts++;
+      return tagChartGroup([result.element], { stage: 0, degraded: fallback, diagnostics: layoutBudget.diagnostics });
+    }
+    // Over the per-card chart count: keep the data as a table.
+    result = { ...fallback, reason: 'too_many_charts' };
+  }
+  layoutBudget.diagnostics?.push({
+    kind: 'chart_degraded',
+    reason: result.reason,
+    ...(result.title ? { title: result.title } : {}),
+  });
+  const group: ChartGroup = { stage: 1, degraded: result };
+  return tagChartGroup(degradedVegaLiteElements(result), group);
+}
+
+/** Placeholder `receive_id` for sizing when the target chat is not known;
+ * real chat ids have the same length. */
+const SIZING_CHAT_ID = `oc_${'0'.repeat(32)}`;
+
+export interface CardBudgetResult {
+  /** Request body bytes after fitting, measured like the Feishu API call. */
+  bytes: number;
+  /** False when the card is still over budget after every chart group has
+   * been stepped down (i.e. the excess is not chart content). */
+  fits: boolean;
+}
+
+/**
+ * Step chart groups down (chart → 50-row table → 10-row table → notice) until
+ * the card's request body fits Feishu's 30KB card limit. Measures the real
+ * request (`turnReplyCardRequestBytes`: callback markers, envelope and the
+ * second JSON serialization of `content`), not the bare card JSON. Only
+ * elements produced for ```vega-lite fences are touched; the card is edited in
+ * place. `reserveBytes` leaves room for chrome added after this call.
+ */
+export function fitChartsToCardBudget(
+  card: { body?: { elements?: any[] } },
+  opts: { chatId?: string; reserveBytes?: number; diagnostics?: CardRenderDiagnostic[] } = {},
+): CardBudgetResult {
+  const elements = card.body?.elements;
+  const limit = TURN_REPLY_CARD_MAX_BYTES - (opts.reserveBytes ?? 0);
+  const measure = () => turnReplyCardRequestBytes(JSON.stringify(card), opts.chatId ?? SIZING_CHAT_ID);
+  let bytes = measure();
+  if (!elements || bytes <= limit) return { bytes, fits: bytes <= limit };
+  for (;;) {
+    // Collect contiguous runs belonging to one group that can still shrink.
+    const runs: Array<{ group: ChartGroup; start: number; end: number; size: number }> = [];
+    for (let index = 0; index < elements.length; index++) {
+      const group = chartGroups.get(elements[index]);
+      if (!group || group.stage >= 3) continue;
+      let end = index;
+      while (end + 1 < elements.length && chartGroups.get(elements[end + 1]) === group) end++;
+      runs.push({ group, start: index, end, size: Buffer.byteLength(JSON.stringify(elements.slice(index, end + 1)), 'utf8') });
+      index = end;
+    }
+    if (runs.length === 0) return { bytes, fits: false };
+    const largest = runs.reduce((best, run) => (run.size > best.size ? run : best));
+    const { group } = largest;
+    if (group.stage === 0) {
+      const sink = opts.diagnostics ?? group.diagnostics;
+      sink?.push({
+        kind: 'chart_degraded',
+        reason: 'card_budget_exceeded',
+        ...(group.degraded.title ? { title: group.degraded.title } : {}),
+      });
+      group.degraded = { ...group.degraded, reason: 'card_budget_exceeded' };
+    }
+    group.stage = (group.stage + 1) as ChartGroup['stage'];
+    const replacement = tagChartGroup(degradedVegaLiteElements(group.degraded, STAGE_ROWS[group.stage]), group);
+    elements.splice(largest.start, largest.end - largest.start + 1, ...replacement);
+    bytes = measure();
+    if (bytes <= limit) return { bytes, fits: true };
+  }
+}
+
+/** Budget pass for cards built inside this module and delivered by the
+ * daemon. Reserves room for late chrome (on-call button) and makes chart
+ * degradation or an unfixable overflow observable in the daemon log. */
+function fitBuiltCard(card: { body?: { elements?: any[] } }, label: string): void {
+  const diagnostics: CardRenderDiagnostic[] = [];
+  const result = fitChartsToCardBudget(card, { reserveBytes: CARD_LATE_CHROME_RESERVE_BYTES, diagnostics });
+  if (!result.fits) {
+    logger.warn(`[card] ${label}: request body ~${result.bytes}B still exceeds Feishu's 30KB card limit after chart degradation`);
+  }
+  if (diagnostics.length > 0) {
+    logger.warn(`[card] ${label}: degraded charts: ${diagnostics.map(item => item.reason).join(', ')}`);
+  }
 }
 
 // Existing multi-image rows retain their legacy payload for compatibility.
@@ -1198,8 +1348,9 @@ export function buildImageCardElements(
   cwd = process.cwd(),
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
   imageMode?: string,
+  diagnostics?: CardRenderDiagnostic[],
 ): any[] {
-  if (imageKeys.length === 0) return md ? buildCardBodyElements(md, cwd, localHomeLinkMode, imageMode) : [];
+  if (imageKeys.length === 0) return md ? buildCardBodyElements(md, cwd, localHomeLinkMode, imageMode, diagnostics) : [];
 
   const used = new Set<number>();
   const keyAt = (idx: number): string | null =>
@@ -1230,7 +1381,7 @@ export function buildImageCardElements(
   const trailing = imageKeys.map((k, i) => (used.has(i) ? '' : `![](${k})`)).filter(Boolean).join('\n\n');
   if (trailing) resolved = resolved ? `${resolved}\n\n${trailing}` : trailing;
 
-  return buildCardBodyElements(resolved, cwd, localHomeLinkMode, imageMode);
+  return buildCardBodyElements(resolved, cwd, localHomeLinkMode, imageMode, diagnostics);
 }
 
 /**
@@ -1269,6 +1420,8 @@ export function hasMarkdown(text: string): boolean {
  * suppressed, else custom. When brand, usage, and recipient are all absent the
  * whole footer (HR included) is omitted.
  */
+// No production send path calls buildMarkdownCard today (tests only); the
+// budget pass is kept so a future caller cannot reopen the 30KB gap.
 export function buildMarkdownCard(
   md: string,
   recipientOpenId?: string,
@@ -1290,7 +1443,9 @@ export function buildMarkdownCard(
     elements.push({ tag: 'hr' });
     elements.push(footer.element);
   }
-  return JSON.stringify(createReplyCard(elements));
+  const card = createReplyCard(elements);
+  fitBuiltCard(card, 'markdown_card');
+  return JSON.stringify(card);
 }
 
 /** Build the canonical final-answer card. Streaming/progress/session cards
@@ -1320,7 +1475,9 @@ export function buildCanonicalFinalReplyCard(opts: {
     locale: opts.locale,
   });
   if (footer) elements.push({ tag: 'hr' }, footer.element);
-  return JSON.stringify(createReplyCard(elements));
+  const card = createReplyCard(elements);
+  fitBuiltCard(card, 'final_reply');
+  return JSON.stringify(card);
 }
 
 /** Prefix every line with `> ` so Feishu's markdown widget renders it as a
@@ -1416,5 +1573,7 @@ export function buildContextualReplyCard(opts: {
     elements.push(footer.element);
   }
 
-  return JSON.stringify(createReplyCard(elements));
+  const card = createReplyCard(elements);
+  fitBuiltCard(card, 'contextual_reply');
+  return JSON.stringify(card);
 }

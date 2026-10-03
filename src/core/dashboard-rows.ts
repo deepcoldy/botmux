@@ -1,3 +1,4 @@
+import type { WorkspaceMetadata } from './workspace-metadata.js';
 // src/core/dashboard-rows.ts
 //
 // Pure-data row composers shared between the dashboard IPC server (which
@@ -27,6 +28,7 @@ export interface SessionRow extends SessionMessagePreview {
   cliInstanceId?: string;
   cliInstanceSource?: string;
   creationSource?: string;
+  workspace?: WorkspaceMetadata | null;
   sessionId: string;
   larkAppId: string;
   botName: string;
@@ -56,6 +58,8 @@ export interface SessionRow extends SessionMessagePreview {
    *  locate, so the dashboard offers "open chat" (feishuChatLink) instead.
    *  Absent on rows from older daemons → callers keep the locate behavior. */
   scope?: 'thread' | 'chat';
+  /** Explicit whiteboard binding; absent when the session is unbound. */
+  whiteboardId?: Session['whiteboardId'];
   headless?: Session['headless'];
   title?: string;
   titleUpdatedAt?: string;
@@ -314,6 +318,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     rootMessageId: ds.session.rootMessageId,
     lastInputFromBot: ds.session.quoteTargetSenderIsBot === true,
     scope: ds.session.scope,
+    whiteboardId: ds.session.whiteboardId,
     headless: ds.session.headless,
     title: ds.session.title,
     titleUpdatedAt: ds.session.titleUpdatedAt,
@@ -378,6 +383,7 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     rootMessageId: s.rootMessageId,
     lastInputFromBot: s.quoteTargetSenderIsBot === true,
     scope: s.scope,
+    whiteboardId: s.whiteboardId,
     headless: s.headless,
     title: s.title,
     titleUpdatedAt: s.titleUpdatedAt,
@@ -431,6 +437,7 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     rootMessageId: s.rootMessageId,
     lastInputFromBot: s.quoteTargetSenderIsBot === true,
     scope: s.scope,
+    whiteboardId: s.whiteboardId,
     headless: s.headless,
     title: s.title,
     titleUpdatedAt: s.titleUpdatedAt,

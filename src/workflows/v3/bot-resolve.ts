@@ -76,7 +76,14 @@ export function botToSnapshot(bot: BotConfig, workingDirOverride?: string): BotS
     cliId: bot.cliId,
     ...((instance.cliPathOverride ?? bot.cliPathOverride) ? { cliPathOverride: instance.cliPathOverride ?? bot.cliPathOverride } : {}),
     ...(bot.model ? { model: bot.model } : {}),
-    ...(bot.sandbox === true ? { sandbox: true } : {}),
+    ...(bot.sandbox === true || bot.sandbox === 'oncall'
+      ? { sandbox: true }
+      : bot.sandbox === 'scratch' ? { sandbox: 'scratch' } : {}),
+    ...(bot.sandbox === 'scratch' ? {
+      ...(bot.scratchStorage ? { scratchStorage: bot.scratchStorage } : {}),
+      ...(bot.scratchTmpfsSizeMb ? { scratchTmpfsSizeMb: bot.scratchTmpfsSizeMb } : {}),
+      ...(bot.scratchDenyPaths?.length ? { scratchDenyPaths: [...bot.scratchDenyPaths] } : {}),
+    } : {}),
     ...(sandboxPathsSnapshot(bot.sandboxPaths) ? { sandboxPaths: sandboxPathsSnapshot(bot.sandboxPaths)! } : {}),
     ...(bot.sandboxHidePaths?.length ? { sandboxHidePaths: [...bot.sandboxHidePaths] } : {}),
     ...(bot.sandboxReadonlyPaths?.length ? { sandboxReadonlyPaths: [...bot.sandboxReadonlyPaths] } : {}),
@@ -221,7 +228,11 @@ export function parseFrozenBotSnapshots(raw: unknown, dag?: V3Dag): Map<string, 
       cliId: obj.cliId as BotSnapshot['cliId'],
       ...(obj.cliPathOverride !== undefined ? { cliPathOverride: obj.cliPathOverride as string } : {}),
       ...(obj.model !== undefined ? { model: obj.model as string } : {}),
-      ...(obj.sandbox !== undefined ? { sandbox: obj.sandbox as boolean } : {}),
+      ...(obj.sandbox === 'scratch' ? { sandbox: 'scratch' as const }
+        : obj.sandbox === true || obj.sandbox === 'oncall' ? { sandbox: true as const } : {}),
+      ...(obj.scratchStorage !== undefined ? { scratchStorage: obj.scratchStorage as 'tmpfs' | 'disk' } : {}),
+      ...(obj.scratchTmpfsSizeMb !== undefined ? { scratchTmpfsSizeMb: obj.scratchTmpfsSizeMb as number } : {}),
+      ...(Array.isArray(obj.scratchDenyPaths) ? { scratchDenyPaths: [...obj.scratchDenyPaths as string[]] } : {}),
       ...(parsedSandboxPaths ? { sandboxPaths: parsedSandboxPaths } : {}),
       ...(obj.sandboxHidePaths !== undefined ? { sandboxHidePaths: [...obj.sandboxHidePaths as string[]] } : {}),
       ...(obj.sandboxReadonlyPaths !== undefined ? { sandboxReadonlyPaths: [...obj.sandboxReadonlyPaths as string[]] } : {}),

@@ -126,6 +126,8 @@ import {
   sessionConfiguredRuntimeDisplayName,
 } from './cli-runtime-display.js';
 import { isSessionGroup } from '../services/session-groups-store.js';
+import { tagClosedSessionGroup } from '../services/feed-group-tagger.js';
+import { dismissSessionGroup } from './dismiss-command.js';
 import { resumeStartsFresh } from '../services/resume-fresh-policy.js';
 import { retryCooldownRemaining, markRetryAttempt } from '../services/failed-turn-retry.js';
 import { readGroupCollaborationMode, writeGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
@@ -155,7 +157,7 @@ export { DAEMON_COMMANDS, PASSTHROUGH_COMMANDS };
  * card buttons routable, but for these that record is a phantom conversation
  * that pollutes the dashboard's session list. Handle them without a session.
  */
-export const SESSIONLESS_DAEMON_COMMANDS = new Set(['/group', '/g', '/project', '/list-slash-command', '/slash', '/botconfig', '/dashboard', '/sessions', '/skills', '/vc-auth', '/watch-comment', '/issue', '/cleanup-wt']);
+export { SESSIONLESS_DAEMON_COMMANDS } from './command-schema.js';
 
 const SLASH_GROUP_NAME_MAX_UTF16_LENGTH = 50;
 
@@ -184,7 +186,7 @@ export function formatSlashGroupName(name: string, prefix = ''): string {
  * worker:null session just to handle it, polluting the dashboard. (Same class
  * of fix as the `/card` / `/term` special cases in daemon.ts.)
  */
-export const EXISTING_SESSION_ONLY_DAEMON_COMMANDS = new Set(['/lane', '/stop', '/rename', '/fork', '/forklist', '/quote']);
+export { EXISTING_SESSION_ONLY_DAEMON_COMMANDS } from './command-schema.js';
 
 function cliSelectionSnapshot(cliId: CliId): SessionCliLaunchSnapshotV1 {
   const runtime = snapshotCliRuntime(resolveCliRuntime({
@@ -309,12 +311,9 @@ export function resolvePassthroughCommands(larkAppId?: string, cliIdOverride?: s
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-export interface SlashCommandInvocation {
-  cmd: string;
-  content: string;
-}
-
-const MULTILINE_COMMANDS = new Set(['/schedule', '/role', '/fork']);
+// 斜杠命令的解析与分类住在 ./command-router.js（leaf，纯函数，schema 驱动）；这里重新导出，
+// 让既有调用方（daemon.ts、cli、event-dispatcher、tests）在同一个模块面上拿到它。
+export { parseSlashCommandInvocation, type SlashCommandInvocation } from './command-router.js';
 
 // `validateWorkingDir` now lives in ./working-dir.js (leaf module the CLI can
 // import without the daemon graph); re-exported here for existing callers.
@@ -484,11 +483,9 @@ function buildCloseWorktreeConfirmCard(args: {
 // for existing callers, same as `validateWorkingDir` above.
 export { resolveRepoSelection } from './repo-selection.js';
 
-// 话题指令头解析器住在 ./topic-header.js（leaf，纯函数）；这里重新导出，让原本
-// 找 `parseForceTopicInvocation` 的调用方在同一个模块面上拿到它的升级版。
-//
-// 主路由由 `parseTopicHeader` 负责可读标题与指令头；旧解析器只保留为
-// `/th`、`/tw`、`/t here|worktree` 生命周期兼容面的纯函数与测试入口。
+// 话题指令头解析器住在 ./topic-header.js（leaf，纯函数）；这里重新导出，让命令面上的
+// 调用方在同一个模块面上拿到它。`/th` `/tw` `/t here|worktree` 生命周期变体同样由它解析
+//（`header.lifecycle`），不再有第二份正则。
 export {
   parseTopicHeader,
   isTopicHeader,
@@ -501,61 +498,6 @@ export {
   type TopicHeaderParse,
   type TopicHeaderDirective,
 } from './topic-header.js';
-
-export type ForceTopicMode = 'default' | 'here' | 'worktree';
-
-/** Parse lifecycle aliases retained by the worktree command surface. */
-export function parseForceTopicInvocation(content: string): { prompt: string; mode: ForceTopicMode } | null {
-  const trimmed = content.trimStart();
-  const alias = /^\/(th|tw)(?:\s+([\s\S]*))?$/i.exec(trimmed);
-  if (alias) return {
-    prompt: (alias[2] ?? '').trim(),
-    mode: alias[1]!.toLowerCase() === 'tw' ? 'worktree' : 'here',
-  };
-  const match = /^\/(t|topic)(?:\s+([\s\S]*))?$/i.exec(trimmed);
-  if (!match) return null;
-  const rawPrompt = (match[2] ?? '').trim();
-  const variant = /^(here|worktree)(?:\s+([\s\S]*))?$/i.exec(rawPrompt);
-  return variant
-    ? {
-        prompt: (variant[2] ?? '').trim(),
-        mode: variant[1]!.toLowerCase() === 'worktree' ? 'worktree' : 'here',
-      }
-    : { prompt: rawPrompt, mode: 'default' };
-}
-
-/** Parse a user-authored slash command after leading @mentions have already
- *  been stripped. Messages that look like command examples or command lists
- *  are intentionally left for the CLI instead of being intercepted by the
- *  daemon; otherwise discussion text such as `/adopt <pane>` can accidentally
- *  trigger real daemon actions. */
-export function parseSlashCommandInvocation(content: string): SlashCommandInvocation | null {
-  // trim BOTH ends: a trailing newline/space rides into the returned `content`
-  // and, for a passthrough command relayed verbatim to the CLI (raw_input), gets
-  // typed as a literal trailing newline — which breaks the CLI's slash-command
-  // detection (it sees a multi-line message, not a `/cmd`). Internal newlines for
-  // MULTILINE_COMMANDS are preserved (trim only touches the ends).
-  const trimmed = content.trim();
-  if (!trimmed.startsWith('/')) return null;
-
-  const lines = trimmed.split(/\r?\n/);
-  const firstLine = (lines[0] ?? '').trimEnd();
-  const [cmdRaw] = firstLine.split(/\s+/);
-  const cmd = cmdRaw?.toLowerCase();
-  if (!cmd) return null;
-
-  // Treat angle-bracket placeholders as documentation, not an invocation.
-  if (/<[^>\r\n]+>/.test(firstLine)) return null;
-
-  const restNonBlank = lines.slice(1).map(l => l.trim()).filter(Boolean);
-  if (restNonBlank.length > 0) {
-    // A list of slash commands is almost certainly discussion / planning text.
-    if (restNonBlank.some(l => l.startsWith('/'))) return null;
-    if (!MULTILINE_COMMANDS.has(cmd)) return null;
-  }
-
-  return { cmd, content: trimmed };
-}
 
 function tag(ds: DaemonSession): string {
   return ds.session.sessionId.substring(0, 8);
@@ -2177,6 +2119,36 @@ export async function handleCommand(
         break;
       }
 
+      case '/dismiss': {
+        const appId = larkAppId ?? ds?.larkAppId;
+        const chatId = message.chatId ?? ds?.chatId;
+        if (!appId || !chatId || message.senderType !== 'user' || !message.senderId
+          || !canOperate(appId, chatId, message.senderId, message.senderUnionId)) {
+          await sessionReply(rootId, t('cmd.dismiss.owner_only', undefined, loc));
+          break;
+        }
+        const parsed = /^\/dismiss(?:\s+--confirm=([a-f0-9]{64}))?\s*$/i.exec(message.content.trim());
+        if (!parsed) {
+          await sessionReply(rootId, t('cmd.dismiss.usage', undefined, loc));
+          break;
+        }
+        const result = await dismissSessionGroup({
+          larkAppId: appId, chatId, rootId, senderId: message.senderId,
+          confirmedState: parsed[1], activeSessions,
+        });
+        if (result.status === 'dismissed') {
+          // The deleted group cannot receive the receipt; notify privately.
+          try { await sendUserMessage(appId, message.senderId, t('cmd.dismiss.dismissed', undefined, loc)); }
+          catch (err) { logger.warn(`[dismiss] private receipt failed: ${err}`); }
+        } else {
+          const reply = result.status === 'confirm'
+            ? t('cmd.dismiss.confirm', { command: `/dismiss --confirm=${result.state}` }, loc)
+            : t(`cmd.dismiss.${result.status}`, undefined, loc);
+          await sessionReply(rootId, reply + ('detail' in result && result.detail ? `\n${result.detail}` : ''));
+        }
+        break;
+      }
+
       case '/close': {
         const closeArg = message.content.replace(/^\/close\s*/i, '').trim();
         const closeTokens = closeArg.split(/\s+/).filter(Boolean);
@@ -2309,13 +2281,17 @@ export async function handleCommand(
             // Capture the closed-session card BEFORE closeWorkerPoolSession —
             // it reads the live session's identity off `current`.
             const card = buildClosedSessionCard(current, localeForBot(current.larkAppId));
+            const privateCard = getBot(current.larkAppId).config.privateCard === true;
             let closeResult;
             try {
               // closeWorkerPoolSession proves fail-closed backing teardown
               // before mutating any registry/store state, throwing when it
               // cannot verify it. Surface that so the active record is kept
               // for retry instead of being silently dropped.
-              closeResult = await closeWorkerPoolSession(targetSessionId);
+              const closeArgs: Parameters<typeof closeWorkerPoolSession> = privateCard
+                ? [targetSessionId, { cardVisibility: 'private' }]
+                : [targetSessionId];
+              closeResult = await closeWorkerPoolSession(...closeArgs);
             } catch (err) {
               return { status: 'teardown_failed' as const, err };
             }
@@ -2338,7 +2314,8 @@ export async function handleCommand(
                 residual: closeResult.residual,
               };
             }
-            return { status: 'closed' as const, current, card };
+            return { status: 'closed' as const, current, card, privateCard,
+              closedCardPatchQueued: closeResult.closedCardPatchQueued === true };
           });
           if (!closed) {
             await sessionReply(rootId, t('cmd.no_active_session', undefined, loc));
@@ -2389,18 +2366,38 @@ export async function handleCommand(
             );
             break;
           }
+          // Run only after a clean explicit close, never on crash/restart/refusal.
+          // The already-closed session and its receipt do not wait for OAuth/IM.
+          void tagClosedSessionGroup(closed.current.larkAppId, closed.current.chatId, targetSessionId)
+            .then(async result => {
+              if (result.status === 'skipped') return;
+              await sessionReply(rootId, result.status === 'updated'
+                ? t('cmd.close.tag_updated', { name: result.name }, loc)
+                : t('cmd.close.tag_failed', undefined, loc));
+            }).catch(err => logger.warn(`[${logTag}] close tag notification failed: ${err}`));
           // 「会话已关闭」卡片优先「仅自己可见」：普通群顶层走 ephemeral 只发给
           // 执行 /close 的本人；若本命令从折叠到 chat-scope 的真实话题触发，则
           // invocationReplyTarget 让 helper 跳过无 thread 锚点的 ephemeral，回原话题。
           try {
-            await deliverEphemeralOrReply(
-              closed.current,
-              message.senderId,
-              closed.card,
-              'interactive',
-              () => sessionReply(rootId, closed.card, 'interactive'),
-              deps.invocationReplyTarget,
-            );
+            if (closed.privateCard) {
+              const { sendEphemeralCard } = await import('../im/lark/client.js');
+              for (const openId of resolvePrivateCardAudience(closed.current)) {
+                await sendEphemeralCard(closed.current.larkAppId, closed.current.chatId, openId, closed.card)
+                  .catch(err => logger.warn(`[${logTag}] private close card delivery failed: ${err}`));
+              }
+            } else if (closed.current.scope === 'chat' || !closed.closedCardPatchQueued) {
+              // A thread's live card already has its closing PATCH queued. Keep
+              // the fallback when no PATCH was queued, and preserve the separate
+              // operator confirmation for chat-scoped sessions.
+              await deliverEphemeralOrReply(
+                closed.current,
+                message.senderId,
+                closed.card,
+                'interactive',
+                () => sessionReply(rootId, closed.card, 'interactive'),
+                deps.invocationReplyTarget,
+              );
+            }
           } catch (err) {
             if (!removeWorktree) throw err;
             // The session is already durably closed. For an explicitly confirmed
@@ -3506,6 +3503,8 @@ export async function handleCommand(
         break;
       }
 
+      // 两条入口在 classifySlash 之后直接派发 /sessions，进不到这个 case。
+      // 留着是 schema↔switch 对齐守卫的锚点，删了测试会红。
       case '/sessions': {
         const chatId = ds?.chatId ?? message.chatId ?? '';
         await handleGroupSessionsCommand(message, rootId, chatId, deps, larkAppId);
@@ -5609,6 +5608,7 @@ export async function handleCommand(
         break;
       }
 
+      // 前置特判已派发 /card。case 是 schema↔switch 对齐守卫的锚点，两条入口都不可达。
       case '/card': {
         // Existing-session path. New topics route /card via handleCardCommand at
         // the router (so no phantom session is created). off/on work without a
@@ -5623,6 +5623,7 @@ export async function handleCommand(
         break;
       }
 
+      // 前置特判已派发 /cot。case 是 schema↔switch 对齐守卫的锚点，两条入口都不可达。
       case '/cot': {
         // Existing-session path. New topics route /cot via handleCotCommand at
         // the router (so no phantom session is created). All subcommands work
@@ -5703,6 +5704,7 @@ export async function handleCommand(
         break;
       }
 
+      // 前置特判已派发 /term。case 是 schema↔switch 对齐守卫的锚点，两条入口都不可达。
       case '/term': {
         // Existing-session path. New topics route /term via handleTermLinkCommand
         // at the router (daemon.ts) so no phantom worker=null session is created.
@@ -5788,6 +5790,7 @@ export async function handleCommand(
         const help = [
           t('help.heading_session', undefined, loc),
           t('help.close', { cliName }, loc),
+          t('help.dismiss', undefined, loc),
           t('help.cleanup_wt', undefined, loc),
           t('help.lane', undefined, loc),
           t('help.stop', { cliName }, loc),

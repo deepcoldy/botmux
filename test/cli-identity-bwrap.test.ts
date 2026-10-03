@@ -1,16 +1,33 @@
 /**
- * Linux bubblewrap regression for trigger-user identity refreshes.
+ * Production-policy regression for trigger-user identity refreshes.
  *
  * Identity files are written atomically (tmp + rename), so each update gets a
  * new inode. A persistent sandbox must bind the per-session directory: binding
  * the file itself would pin the inode that existed when the pane was spawned.
+ * The harness deliberately runs buildFsPolicy → compileToBwrap so it also locks
+ * down the production authorization shape, not only bubblewrap's mount behavior.
  */
 import { describe, expect, it } from 'vitest';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { sessionIdentityPath, writeSessionIdentity } from '../src/core/cli-identity.js';
+import { buildFsPolicy, compileToBwrap } from '../src/adapters/cli/fs-policy.js';
+import { sessionIdentityBinDir, sessionIdentityPath, writeSessionIdentity } from '../src/core/cli-identity.js';
+import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
+
+const USRMERGE = ['/bin', '/lib', '/lib64', '/sbin', '/lib32', '/libx32'];
 
 function bwrapUsable(): boolean {
   if (process.platform !== 'linux') return false;
@@ -37,48 +54,148 @@ async function pollFor(predicate: () => boolean, what: string, timeoutMs = 10_00
   }
 }
 
+interface IdentityPolicyHarness {
+  root: string;
+  ctlDir: string;
+  dataDir: string;
+  sessionId: string;
+  identityPath: string;
+  sessionDir: string;
+  args: string[];
+}
+
+function compileIdentityPolicy(): IdentityPolicyHarness {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'botmux-identity-bwrap-')));
+  const homeDir = join(root, 'home');
+  const botmuxHome = join(homeDir, '.botmux');
+  const dataDir = join(botmuxHome, 'data');
+  const botHome = join(botmuxHome, 'bots', 'cli_app');
+  const workingDir = join(root, 'project');
+  const ctlDir = join(root, 'control');
+  const emptyDir = join(root, 'masks', 'empty');
+  const emptiesDir = join(root, 'masks', 'files');
+  for (const dir of [botHome, workingDir, ctlDir, emptyDir, emptiesDir]) {
+    mkdirSync(dir, { recursive: true });
+  }
+
+  const sessionId = 'sess-live';
+  const identityPath = writeSessionIdentity(dataDir, sessionId, {
+    tool: 'lark-cli', appId: 'cli_app', userAccessToken: 'token-first',
+  });
+  const sessionDir = sessionIdentityBinDir(dataDir, sessionId);
+  const policy = buildFsPolicy({
+    platform: 'linux',
+    homeDir,
+    botmuxHome,
+    sessionDataDir: dataDir,
+    sessionId,
+    workingDir,
+    currentAppId: 'cli_app',
+    botHome,
+    redirectedCliData: true,
+    execPaths: [dirname(realpathSync(process.execPath))],
+    userPaths: { readWrite: [ctlDir] },
+    net: true,
+    writeRegexes: [],
+  });
+
+  // Mirror the worker's impure preparation: only existing grants survive,
+  // while denies remain so reachable masks are still compiled fail-closed.
+  policy.rules = policy.rules.filter(rule => rule.access === 'deny' || existsSync(rule.path));
+  const symlinks: { path: string; target: string }[] = [];
+  for (const path of USRMERGE) {
+    try {
+      if (lstatSync(path).isSymbolicLink()) symlinks.push({ path, target: readlinkSync(path) });
+    } catch { /* absent on this distro */ }
+  }
+  const filePaths = new Set<string>();
+  for (const rule of policy.rules) {
+    if (rule.access !== 'deny') continue;
+    try { if (statSync(rule.path).isFile()) filePaths.add(rule.path); } catch { /* absent → dir mask */ }
+  }
+  const compiled = compileToBwrap(policy, {
+    symlinks,
+    emptyDir,
+    emptiesDir,
+    filePaths,
+    chdir: workingDir,
+  });
+  chmodSync(emptyDir, 0o000);
+  for (const file of compiled.emptyFiles) writeFileSync(file.path, '', { mode: 0o000 });
+  for (const mount of compiled.maskMounts) {
+    if (existsSync(mount.path)) continue;
+    if (!mount.path.startsWith(`${root}/`)) {
+      throw new Error(`refusing to create a test mask mount outside scratch: ${mount.path}`);
+    }
+    if (mount.kind === 'file') {
+      mkdirSync(dirname(mount.path), { recursive: true });
+      writeFileSync(mount.path, '');
+    } else {
+      mkdirSync(mount.path, { recursive: true });
+    }
+  }
+  return { root, ctlDir, dataDir, sessionId, identityPath, sessionDir, args: compiled.args };
+}
+
+function compiledBinds(args: string[]): Array<{ mode: '--bind' | '--ro-bind'; source: string; target: string }> {
+  const result: Array<{ mode: '--bind' | '--ro-bind'; source: string; target: string }> = [];
+  for (let i = 0; i < args.length - 2; i += 1) {
+    const mode = args[i];
+    if (mode !== '--bind' && mode !== '--ro-bind') continue;
+    result.push({ mode, source: args[i + 1]!, target: args[i + 2]! });
+    i += 2;
+  }
+  return result;
+}
+
+describe('compileToBwrap × trigger-user identity', () => {
+  it('emits one read-only session-directory bind and no mutable file binds', () => {
+    const harness = compileIdentityPolicy();
+    try {
+      const identityRoot = join(harness.dataDir, 'cli-identity');
+      const identityBinds = compiledBinds(harness.args).filter(bind =>
+        bind.target === identityRoot || bind.target.startsWith(`${identityRoot}/`));
+      expect(identityBinds).toEqual([
+        { mode: '--ro-bind', source: harness.sessionDir, target: harness.sessionDir },
+      ]);
+      expect(identityBinds.some(bind =>
+        bind.target.includes('/.data/') || bind.target.endsWith('/turn') || bind.target.endsWith('.env')))
+        .toBe(false);
+    } finally {
+      rmSandboxScratch(harness.root);
+    }
+  });
+});
+
 describe.skipIf(!bwrapUsable())('bwrap persistent pane × trigger-user identity', () => {
-  it('reads the identity inode atomically replaced after sandbox spawn', async () => {
-    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-identity-bwrap-'));
-    const ctlDir = mkdtempSync(join(tmpdir(), 'botmux-identity-ctl-'));
-    const sessionId = 'sess-live';
-    const identityPath = writeSessionIdentity(dataDir, sessionId, {
-      tool: 'lark-cli', appId: 'cli_app', userAccessToken: 'token-first',
-    });
-    const identityDir = dirname(identityPath);
-    const sessionDir = dirname(identityDir);
-    const firstInode = statSync(identityPath).ino;
+  it('reads an atomically replaced identity through the production directory bind', async () => {
+    const harness = compileIdentityPolicy();
+    const firstInode = statSync(harness.identityPath).ino;
     const script = [
-      `printf ready > ${JSON.stringify(join(ctlDir, 'ready'))}`,
-      `while [ ! -f ${JSON.stringify(join(ctlDir, 'go'))} ]; do sleep 0.05; done`,
-      `cat ${JSON.stringify(identityPath)} > ${JSON.stringify(join(ctlDir, 'out'))}`,
+      `printf ready > ${JSON.stringify(join(harness.ctlDir, 'ready'))}`,
+      `while [ ! -f ${JSON.stringify(join(harness.ctlDir, 'go'))} ]; do sleep 0.05; done`,
+      `cat ${JSON.stringify(harness.identityPath)} > ${JSON.stringify(join(harness.ctlDir, 'out'))}`,
     ].join('\n');
     const pane = spawn('bwrap', [
-      '--unshare-user', '--die-with-parent',
-      '--tmpfs', '/', '--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
-      '--ro-bind', '/usr', '/usr',
-      '--ro-bind-try', '/lib', '/lib',
-      '--ro-bind-try', '/lib64', '/lib64',
-      '--ro-bind', sessionDir, sessionDir,
-      '--bind', ctlDir, ctlDir,
+      ...harness.args,
       '/usr/bin/sh', '-c', script,
     ], { stdio: ['ignore', 'inherit', 'inherit'] });
 
     try {
-      await pollFor(() => existsSync(join(ctlDir, 'ready')), 'sandbox reader ready');
-      writeSessionIdentity(dataDir, sessionId, {
+      await pollFor(() => existsSync(join(harness.ctlDir, 'ready')), 'sandbox reader ready');
+      writeSessionIdentity(harness.dataDir, harness.sessionId, {
         tool: 'lark-cli', appId: 'cli_app', userAccessToken: 'token-second',
       });
-      expect(statSync(sessionIdentityPath(dataDir, sessionId, 'lark-cli')).ino).not.toBe(firstInode);
-      writeFileSync(join(ctlDir, 'go'), '1');
-      await pollFor(() => existsSync(join(ctlDir, 'out')), 'sandbox identity read');
-      const body = readFileSync(join(ctlDir, 'out'), 'utf8');
+      expect(statSync(sessionIdentityPath(harness.dataDir, harness.sessionId, 'lark-cli')).ino)
+        .not.toBe(firstInode);
+      writeFileSync(join(harness.ctlDir, 'go'), '1');
+      await pollFor(() => existsSync(join(harness.ctlDir, 'out')), 'sandbox identity read');
+      const body = readFileSync(join(harness.ctlDir, 'out'), 'utf8');
       expect(body).toContain('token-second');
       expect(body).not.toContain('token-first');
     } finally {
       try { pane.kill('SIGKILL'); } catch { /* already gone */ }
-      rmSync(dataDir, { recursive: true, force: true });
-      rmSync(ctlDir, { recursive: true, force: true });
+      rmSandboxScratch(harness.root);
     }
   });
 });

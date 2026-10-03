@@ -139,7 +139,7 @@ function readFromStore(
   if (unmigrated.length > 0 && !hit) {
     // No row in ready stores, and at least one bot is still on JSON — the
     // session may live there. Fail with unmigrated rather than a silent miss.
-    if (!envAppId || unmigrated.includes(envAppId) || unmigrated.includes('')) {
+    if (!envAppId || unmigrated.includes(envAppId)) {
       return {
         ok: false,
         reason: 'unmigrated',

@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, unlinkSync } from 'node:fs';
-import { basename, join } from 'node:path';
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, unlinkSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { FileLockTimeoutError, withFileLock } from '../utils/file-lock.js';
 
@@ -60,6 +60,21 @@ export type TurnSendLedgerInspection = Pick<TurnSendLedgerKey, 'larkAppId' | 'se
 export const TURN_SEND_LEDGER_COMPLETED_RETENTION_MS = 30 * 24 * 60 * 60_000;
 const TURN_SEND_LEDGER_PRUNE_INTERVAL_MS = 24 * 60 * 60_000;
 const TURN_SEND_LEDGER_PRUNE_MARKER = '.completed-prune';
+const TURN_SEND_LEDGER_RECORD_RE = /^[a-f0-9]{32}\.json$/;
+// Session ids become a directory name. The leading alphanumeric rules out `.`,
+// `..` and the dot-prefixed prune marker/lock files at the ledger root.
+const TURN_SEND_LEDGER_SESSION_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+/**
+ * Per-session record directory. Records live under
+ * `turn-send-ledger/<sessionId>/` so a write-sandboxed CLI can be granted its
+ * OWN session's directory only (see fs-policy): the shared root would let one
+ * session forge or delete another session's final fence.
+ */
+export function turnSendLedgerSessionDir(dataDir: string, sessionId: string): string {
+  if (!TURN_SEND_LEDGER_SESSION_RE.test(sessionId)) throw new Error('Invalid turn-send ledger session id');
+  return join(dataDir, 'turn-send-ledger', sessionId);
+}
 
 /**
  * Cross-process final-answer fence for every primary `botmux send` path.
@@ -84,8 +99,29 @@ export class TurnSendLedger {
     ])).digest('hex').slice(0, 32);
   }
 
-  private path(key: TurnSendLedgerKey): string {
+  sessionDirectory(sessionId: string): string {
+    if (!TURN_SEND_LEDGER_SESSION_RE.test(sessionId)) throw new Error('Invalid turn-send ledger session id');
+    return join(this.directory, sessionId);
+  }
+
+  recordPath(key: TurnSendLedgerKey): string {
+    return join(this.sessionDirectory(key.sessionId), `${this.id(key)}.json`);
+  }
+
+  /** Pre-session-directory layout (flat under the root). Read-only fallback so
+   *  records written before the upgrade keep fencing, and stay inspectable and
+   *  prunable; every new write goes to {@link recordPath}. */
+  private legacyPath(key: TurnSendLedgerKey): string {
     return join(this.directory, `${this.id(key)}.json`);
+  }
+
+  private ensureSessionDirectory(key: TurnSendLedgerKey): void {
+    const sessionDirectory = this.sessionDirectory(key.sessionId);
+    mkdirSync(sessionDirectory, { recursive: true, mode: 0o700 });
+    for (const directory of [this.directory, sessionDirectory]) {
+      const stat = lstatSync(directory);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('Unsafe turn-send ledger directory');
+    }
   }
 
   private fingerprint(content: string): string {
@@ -121,29 +157,67 @@ export class TurnSendLedger {
   }
 
   private readPath(path: string): TurnSendLedgerRecord {
-    const directoryStat = lstatSync(this.directory);
+    const parent = dirname(path);
+    for (const directory of parent === this.directory ? [this.directory] : [this.directory, parent]) {
+      const stat = lstatSync(directory);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error('Unsafe turn-send ledger record');
+    }
     const fileStat = lstatSync(path);
-    if (directoryStat.isSymbolicLink() || fileStat.isSymbolicLink() || !fileStat.isFile()) {
+    if (fileStat.isSymbolicLink() || !fileStat.isFile()) {
       throw new Error('Unsafe turn-send ledger record');
     }
     const file = basename(path);
-    if (!/^[a-f0-9]{32}\.json$/.test(file)) throw new Error('Invalid turn-send ledger filename');
-    const record = JSON.parse(readFileSync(path, 'utf8')) as TurnSendLedgerRecord;
-    return this.validateRecord(record, file.slice(0, -'.json'.length));
+    if (!TURN_SEND_LEDGER_RECORD_RE.test(file)) throw new Error('Invalid turn-send ledger filename');
+    const record = this.validateRecord(
+      JSON.parse(readFileSync(path, 'utf8')) as TurnSendLedgerRecord,
+      file.slice(0, -'.json'.length),
+    );
+    if (parent !== this.directory && record.sessionId !== basename(parent)) {
+      throw new Error('Turn-send ledger record is filed under another session');
+    }
+    return record;
+  }
+
+  private existingPath(key: TurnSendLedgerKey): string | undefined {
+    const path = this.recordPath(key);
+    if (existsSync(path)) return path;
+    const legacy = this.legacyPath(key);
+    return existsSync(legacy) ? legacy : undefined;
   }
 
   private read(key: TurnSendLedgerKey): TurnSendLedgerRecord | undefined {
-    const path = this.path(key);
-    if (!existsSync(path)) return undefined;
-    return this.readPath(path);
+    const path = this.existingPath(key);
+    return path ? this.readPath(path) : undefined;
   }
 
   private write(key: TurnSendLedgerKey, record: TurnSendLedgerRecord): void {
-    atomicWriteFileSync(this.path(key), JSON.stringify(record), {
+    atomicWriteFileSync(this.recordPath(key), JSON.stringify(record), {
       mode: 0o600,
       followTargetSymlink: false,
       durable: true,
     });
+    // The session-directory copy is now authoritative; drop the legacy one so
+    // inspect/prune never see two states for one turn.
+    rmSync(this.legacyPath(key), { force: true });
+  }
+
+  /** Every record file: legacy flat ones plus one level of session directories. */
+  private recordPaths(): string[] {
+    const paths: string[] = [];
+    for (const name of readdirSync(this.directory).sort()) {
+      const path = join(this.directory, name);
+      if (TURN_SEND_LEDGER_RECORD_RE.test(name)) {
+        paths.push(path);
+        continue;
+      }
+      if (!TURN_SEND_LEDGER_SESSION_RE.test(name)) continue;
+      const stat = lstatSync(path);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) continue;
+      for (const file of readdirSync(path).filter(entry => TURN_SEND_LEDGER_RECORD_RE.test(entry)).sort()) {
+        paths.push(join(path, file));
+      }
+    }
+    return paths;
   }
 
   private inspection(record: TurnSendLedgerRecord): TurnSendLedgerInspection {
@@ -180,8 +254,8 @@ export class TurnSendLedger {
       throw new Error('Unsafe turn-send ledger directory');
     }
     const records: TurnSendLedgerInspection[] = [];
-    for (const file of readdirSync(this.directory).filter(name => /^[a-f0-9]{32}\.json$/.test(name)).sort()) {
-      const record = this.readPath(join(this.directory, file));
+    for (const path of this.recordPaths()) {
+      const record = this.readPath(path);
       if (filter.larkAppId && record.larkAppId !== filter.larkAppId) continue;
       if (filter.sessionId && record.sessionId !== filter.sessionId) continue;
       if (filter.turnId && record.turnId !== filter.turnId) continue;
@@ -202,8 +276,9 @@ export class TurnSendLedger {
     if (outcome !== 'delivered' && outcome !== 'not-delivered') {
       throw new Error('Unknown turn-send recovery outcome');
     }
-    if (!existsSync(this.path(key))) throw new Error('Turn-send ledger record not found');
-    return withFileLock(this.path(key), async () => {
+    if (!this.existingPath(key)) throw new Error('Turn-send ledger record not found');
+    this.ensureSessionDirectory(key);
+    return withFileLock(this.recordPath(key), async () => {
       const record = this.read(key);
       const sequence = record?.nonIdempotentSequence;
       if (!record || record.final || sequence?.inFlightStep === undefined) {
@@ -227,8 +302,7 @@ export class TurnSendLedger {
     const cutoffMs = nowMs - TURN_SEND_LEDGER_COMPLETED_RETENTION_MS;
     let removed = 0;
     let retained = 0;
-    for (const file of readdirSync(this.directory).filter(name => /^[a-f0-9]{32}\.json$/.test(name))) {
-      const path = join(this.directory, file);
+    for (const path of this.recordPaths()) {
       try {
         await withFileLock(path, async () => {
           if (!existsSync(path)) return;
@@ -306,9 +380,8 @@ export class TurnSendLedger {
     kind: TurnSendKind,
     renderedContent: string,
   ): Promise<TurnSendLedgerResult | undefined> {
-    mkdirSync(this.directory, { recursive: true, mode: 0o700 });
-    if (lstatSync(this.directory).isSymbolicLink()) throw new Error('Unsafe turn-send ledger directory');
-    return withFileLock(this.path(key), async () => {
+    this.ensureSessionDirectory(key);
+    return withFileLock(this.recordPath(key), async () => {
       const final = this.read(key)?.final;
       if (!final || kind === 'auxiliary') return undefined;
       if (kind === 'progress') {
@@ -327,9 +400,8 @@ export class TurnSendLedger {
     renderedContent: string,
     dispatch: (providerUuid?: string) => Promise<string>,
   ): Promise<TurnSendLedgerResult> {
-    mkdirSync(this.directory, { recursive: true, mode: 0o700 });
-    if (lstatSync(this.directory).isSymbolicLink()) throw new Error('Unsafe turn-send ledger directory');
-    return withFileLock(this.path(key), async () => {
+    this.ensureSessionDirectory(key);
+    return withFileLock(this.recordPath(key), async () => {
       const record = this.read(key) ?? { ...key, version: 1 as const };
       if (!record.final && record.nonIdempotentSequence) {
         const step = record.nonIdempotentSequence.inFlightStep;
@@ -383,9 +455,8 @@ export class TurnSendLedger {
     if (kind !== 'final') throw new Error('分块投递只允许 final 回复；请使用 --response-kind final');
     if (!Number.isSafeInteger(stepCount) || stepCount <= 0) throw new Error('Non-idempotent delivery sequence must contain at least one step');
     if (!messageId) throw new Error('Missing non-idempotent delivery message ID');
-    mkdirSync(this.directory, { recursive: true, mode: 0o700 });
-    if (lstatSync(this.directory).isSymbolicLink()) throw new Error('Unsafe turn-send ledger directory');
-    return withFileLock(this.path(key), async () => {
+    this.ensureSessionDirectory(key);
+    return withFileLock(this.recordPath(key), async () => {
       const record = this.read(key) ?? { ...key, version: 1 as const };
       const fingerprint = this.fingerprint(renderedContent);
       if (record.final) {

@@ -89,13 +89,13 @@ function deadPid(): number {
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'session-occupancy-'));
-  init();
+  init('test-app');
   loggerMock.logger.warn.mockClear();
   loggerMock.logger.error.mockClear();
 });
 
 afterEach(() => {
-  init();
+  init('test-app');
   try { rmSync(tempDir, { recursive: true, force: true }); } catch { /* ignore */ }
 });
 
@@ -317,7 +317,7 @@ describe('load() claims occupancy in the same IMMEDIATE transaction', () => {
     seedPersistedSessionRows(tempDir, 'appA', { s1: row('s1', { larkAppId: 'appA' }) });
     init('appA');
     listSessions();
-    init();
+    init('test-app');
     const path = sessionStorePath(tempDir, 'appA');
     const setup = new DatabaseSync(path);
     setup.exec('DROP TABLE occupancy');

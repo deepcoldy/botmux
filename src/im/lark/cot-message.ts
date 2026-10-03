@@ -103,14 +103,14 @@ function rememberRecentState(ds: DaemonSession, state: CotState): void {
 }
 
 /**
- * 新 turn 的 thinking 到来时，上一轮的气泡若还活着（已创建、未收尾），必须在这里
+ * 新 turn 的 thinking 到来，或队列确认 steer 替换旧 turn 时，旧气泡若还活着，必须在这里
  * 主动收尾，而不是把 state 一丢了之：丢掉之后没有任何路径会再给它 RUN_FINISHED——
  * 它自己的 turn_terminal 已经（或将要）因 state 被替换而找不到对象，气泡就永远停在
  * 「执行中」。实测触发场景：上一轮跑得久，用户 type-ahead 发了下一条，Claude 无缝
  * 接着跑，两轮之间没有 idle 边沿。
  *
- * 下一轮的 thinking 已经出现，本身就证明上一轮结束了，所以按 done 收尾；若上一轮
- * 曾经推送失败（disabled），走显式 complete 让它停止转圈。
+ * done 只表示旧时间线的展示结束，不证明旧任务执行成功；steer 会把工作合入新回合。
+ * 若上一轮曾经推送失败（disabled），走显式 complete 让它停止转圈。
  */
 function settleSupersededState(ds: DaemonSession, state: CotState): void {
   if (state.settled) return;
@@ -667,6 +667,26 @@ export function handleCotThinkingUpdate(
   }
   state.pendingEntries = msg.entries;
   void pump(ds, state);
+  return true;
+}
+
+/** Retire only the timeline that a confirmed steer replaced. The worker sends
+ * its final cumulative update first, so the pump drains remaining results
+ * before RUN_FINISHED. No new bubble is created and no task is settled here. */
+export function handleCotThinkingSuperseded(
+  ds: DaemonSession,
+  msg: Extract<WorkerToDaemon, { type: 'thinking_superseded' }>,
+): boolean {
+  if (msg.sessionId !== ds.session.sessionId) return false;
+  const key = turnKeyOf(msg);
+  if (ds.lastThinkingUpdate && turnKeyOf(ds.lastThinkingUpdate) === key) {
+    ds.lastThinkingUpdate = undefined;
+  }
+  let state = states.get(ds);
+  if (state?.turnKey !== key) state = recentStates.get(ds)?.get(msg.turnId);
+  if (!state || state.turnKey !== key) return false;
+  // Still close a created bubble if /cot was turned off after its last update.
+  settleSupersededState(ds, state);
   return true;
 }
 

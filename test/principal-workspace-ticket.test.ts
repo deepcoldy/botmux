@@ -161,7 +161,7 @@ function insertTicketRow(
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'principal-workspace-ticket-'));
-  init();
+  init(appId);
   __testOnly_setBeforePrincipalWorkspaceEnqueueCommit(undefined);
   __testOnly_setAfterPrincipalWorkspaceEnqueueCommit(undefined);
 });
@@ -194,7 +194,7 @@ describe('principal workspace durable enqueue', () => {
 
   it('serializes two processes into one monotonic group FIFO', async () => {
     const lane = setupLane();
-    init();
+    init(appId);
     const childCode = (turnId: string) => `
       import { init, enqueuePrincipalWorkspaceTicket } from './src/services/session-store.js';
       import { createPrincipalLaneDispatchContext } from './src/core/principal-lane-dispatch.js';
