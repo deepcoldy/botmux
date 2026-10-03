@@ -25,9 +25,17 @@ export const REMOTE_RUNNER_TERMINAL_CAPABILITIES = [
   'terminal_resize',
 ] as const;
 
+/** Optional provider-to-host message delivery.  It is deliberately not part
+ * of {@link REMOTE_RUNNER_BASE_CAPABILITIES}: existing providers must not be
+ * forced to implement a chat-facing side channel when upgrading BotMux. */
+export const REMOTE_RUNNER_OUTBOUND_CAPABILITIES = [
+  'outbound_message',
+] as const;
+
 export const REMOTE_RUNNER_CAPABILITIES = [
   ...REMOTE_RUNNER_BASE_CAPABILITIES,
   ...REMOTE_RUNNER_TERMINAL_CAPABILITIES,
+  ...REMOTE_RUNNER_OUTBOUND_CAPABILITIES,
 ] as const;
 
 export type RemoteRunnerCapability = typeof REMOTE_RUNNER_CAPABILITIES[number];
@@ -92,6 +100,32 @@ export interface RemoteRunnerTrustedCaller {
   senderType?: 'user' | 'bot';
 }
 
+export type RemoteRunnerOutboundResponseKind = 'progress' | 'auxiliary';
+export type RemoteRunnerOutboundMention = 'none' | 'requester';
+
+/** A non-terminal message request emitted by a provider for the active turn.
+ * Routing is intentionally absent: BotMux derives the only legal destination
+ * from the authenticated session/turn that owns the backend. */
+export interface RemoteRunnerOutboundMessage {
+  operationId: string;
+  turnId: string;
+  generation: number;
+  content: string;
+  responseKind: RemoteRunnerOutboundResponseKind;
+  mention: RemoteRunnerOutboundMention;
+}
+
+export type RemoteRunnerOutboundMessageResult =
+  | {
+      outcome: 'delivered';
+      messageId: string;
+    }
+  | {
+      outcome: 'rejected' | 'unknown';
+      code: string;
+      message: string;
+    };
+
 interface RemoteRunnerCommandBase {
   protocol: typeof REMOTE_RUNNER_PROTOCOL;
   version: typeof REMOTE_RUNNER_PROTOCOL_VERSION;
@@ -131,6 +165,13 @@ export type RemoteRunnerCommand =
   | (RemoteRunnerCommandBase & { type: 'detach' })
   | (RemoteRunnerCommandBase & { type: 'reattach' })
   | (RemoteRunnerCommandBase & { type: 'status' })
+  | (RemoteRunnerCommandBase & {
+      type: 'outbound_message_result';
+      operationId: string;
+      turnId: string;
+      generation: number;
+      result: RemoteRunnerOutboundMessageResult;
+    })
   | (RemoteRunnerCommandBase & { type: 'terminal_input'; generation: number; data: string })
   | (RemoteRunnerCommandBase & { type: 'terminal_resize'; generation: number; cols: number; rows: number });
 
@@ -165,6 +206,15 @@ export type RemoteRunnerEvent =
       type: 'progress';
       turnId: string;
       content: string;
+    })
+  | (RemoteRunnerEventBase & {
+      type: 'outbound_message';
+      operationId: string;
+      turnId: string;
+      generation: number;
+      content: string;
+      responseKind: RemoteRunnerOutboundResponseKind;
+      mention: RemoteRunnerOutboundMention;
     })
   | (RemoteRunnerEventBase & {
       type: 'final';
@@ -211,6 +261,7 @@ const PROVIDER_RE = /^[a-z][a-z0-9._-]{0,63}$/;
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/;
 const REQUEST_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const ERROR_CODE_RE = /^[a-z][a-z0-9._-]{0,127}$/;
+export const MAX_REMOTE_RUNNER_OUTBOUND_MESSAGE_BYTES = 32 * 1024;
 const SENSITIVE_STATE_KEY_PARTS = [
   'token',
   'secret',
@@ -440,6 +491,32 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
     return { protocol: REMOTE_RUNNER_PROTOCOL, version: REMOTE_RUNNER_PROTOCOL_VERSION,
       type: 'final', turnId, content: raw.content,
       ...(state ? { state } : {}), ...(usage ? { usage } : {}) };
+  }
+
+  if (raw.type === 'outbound_message') {
+    const operationId = nonEmptyString(raw.operationId, 256);
+    const turnId = nonEmptyString(raw.turnId, 256);
+    if (!operationId || !ID_RE.test(operationId)
+        || !turnId || !ID_RE.test(turnId)
+        || !Number.isSafeInteger(raw.generation) || Number(raw.generation) < 0
+        || typeof raw.content !== 'string'
+        || !raw.content.trim()
+        || Buffer.byteLength(raw.content, 'utf8') > MAX_REMOTE_RUNNER_OUTBOUND_MESSAGE_BYTES
+        || !['progress', 'auxiliary'].includes(String(raw.responseKind))
+        || !['none', 'requester'].includes(String(raw.mention))) {
+      return undefined;
+    }
+    return {
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'outbound_message',
+      operationId,
+      turnId,
+      generation: Number(raw.generation),
+      content: raw.content,
+      responseKind: raw.responseKind as RemoteRunnerOutboundResponseKind,
+      mention: raw.mention as RemoteRunnerOutboundMention,
+    };
   }
 
   if (raw.type === 'failure') {

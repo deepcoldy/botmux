@@ -9129,6 +9129,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     return;
   }
   const ancestorCtx = findAncestorSessionContext();
+  const remoteRunnerOutbound = rest.includes('--remote-runner-outbound');
   // Workflow subagents cannot own chat-facing effects: those belong to a
   // hostExecutor so retries/resumes can reconcile them. Keep this gate ahead
   // of both the sandbox relay and VC-origin store reads; neither path may turn
@@ -9818,6 +9819,33 @@ async function cmdSend(rest: string[]): Promise<void> {
     process.exit(2);
   }
 
+  // Host-only re-exec for provider-requested interim output.  The public
+  // Remote Runner event deliberately carries no destination override; freeze
+  // that contract again at the final CLI boundary so a forged flag cannot turn
+  // this path into cross-chat delivery or a richer platform side effect.
+  if (remoteRunnerOutbound) {
+    const mentionDecisionCount = Number(mentionBack) + Number(noMention);
+    if (!trustedRelayCtx
+      || trustedRelayCtx.sessionId !== sid
+      || !currentTurnId
+      || trustedRelayCtx.turnId !== currentTurnId) {
+      console.error('botmux send refused: --remote-runner-outbound requires the owning worker\'s live turn authority');
+      process.exit(2);
+    }
+    if (responseKind === undefined || !['progress', 'auxiliary'].includes(responseKind)) {
+      console.error('botmux send refused: --remote-runner-outbound requires --response-kind progress|auxiliary');
+      process.exit(2);
+    }
+    if (sendTopLevel || overrideChatId || sendInto || explicitQuote !== undefined || noQuote
+      || customCardRequested || asVoice || isSlashSend || asChoice || replyLayout
+      || images.length > 0 || files.length > 0 || videos.length > 0 || videoCovers.length > 0
+      || mentionArgs.length > 0 || mentionDecisionCount !== 1
+      || attention.requested || urgent.requested || expectedLinks.length > 0) {
+      console.error('botmux send refused: --remote-runner-outbound supports only current-session Markdown with one none/requester mention decision');
+      process.exit(2);
+    }
+  }
+
   // A proof is a point-in-time liveness check, not a five-second send lease.
   // Re-challenge immediately before observable provider effects so lengthy
   // local parsing/card preparation cannot carry an old capability across a
@@ -9983,7 +10011,7 @@ async function cmdSend(rest: string[]): Promise<void> {
   let content = '';
   let customCard: Record<string, unknown> | undefined;
   if (customCardRequested) {
-    const unexpectedText = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent']);
+    const unexpectedText = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--remote-runner-outbound']);
     if (unexpectedText.length > 0) {
       console.error('botmux send: --card-file/--card-json 发送自定义卡片时不接受正文参数；卡片内容请写入 JSON');
       process.exit(2);
@@ -10061,7 +10089,7 @@ async function cmdSend(rest: string[]): Promise<void> {
     if (!existsSync(contentFile)) { console.error(`文件不存在: ${contentFile}`); process.exit(1); }
     content = readFileSync(contentFile, 'utf-8');
   } else {
-    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash']);
+    const pos = positionals(rest, ['--card', '--text', '--top-level', '--no-quote', '--mention-back', '--no-mention', '--anyway', '--voice', '--attention', '--urgent', '--slash', '--remote-runner-outbound']);
     if (pos.length > 0) {
       content = pos.join(' ');
     } else {
@@ -11028,6 +11056,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         ...(originTurnId ? { turnId: originTurnId } : {}),
         ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
         ...(unifiedReplyUsed ? { replyCardResponseKind: effectiveResponseKind } : {}),
+        ...(remoteRunnerOutbound ? { terminalIndependent: true } : {}),
       };
       Object.assign(marker, buildBridgeSendMarkerContent(sentContent));
       const line = JSON.stringify(marker) + '\n';

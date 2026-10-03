@@ -7,6 +7,7 @@ const version = 1;
 const capabilities = [
   'start', 'resume', 'turn', 'cancel', 'detach', 'status',
   'terminal_screen', 'terminal_input', 'terminal_resize', 'reattach',
+  'outbound_message',
   // Unknown additive capabilities are intentionally safe for older clients.
   'reference_future_capability',
 ];
@@ -16,6 +17,7 @@ let screen = '';
 let screenSequence = 0;
 let cols = 120;
 let rows = 40;
+let pendingOutboundTurn;
 
 function emit(event) {
   process.stdout.write(`${JSON.stringify({ protocol, version, ...event })}\n`);
@@ -41,6 +43,26 @@ function emitScreen() {
     cols,
     rows,
     snapshot: screen,
+  });
+}
+
+function finishTurn(command, content = command.content) {
+  status = 'ready';
+  emit({
+    type: 'final',
+    turnId: command.turnId,
+    content,
+    state,
+    usage: {
+      generation: state.generation,
+      snapshot: {
+        context: { usedTokens: 11, windowTokens: 1000, percentUsed: 1.1 },
+        tokens: { in: 8, out: 3 },
+        turnTokens: { in: 8, out: 3 },
+        model: 'reference-model',
+        reasoningEffort: 'medium',
+      },
+    },
   });
 }
 
@@ -96,23 +118,33 @@ input.on('line', line => {
       emit({ type: 'progress', turnId: command.turnId, content: `reference: ${command.content}` });
       screen = `reference: ${command.content}`;
       emitScreen();
-      status = 'ready';
-      emit({
-        type: 'final',
-        turnId: command.turnId,
-        content: command.content,
-        state,
-        usage: {
+      if (command.content === 'request-outbound') {
+        pendingOutboundTurn = command;
+        emit({
+          type: 'outbound_message',
+          operationId: 'reference-outbound-1',
+          turnId: command.turnId,
           generation: state.generation,
-          snapshot: {
-            context: { usedTokens: 11, windowTokens: 1000, percentUsed: 1.1 },
-            tokens: { in: 8, out: 3 },
-            turnTokens: { in: 8, out: 3 },
-            model: 'reference-model',
-            reasoningEffort: 'medium',
-          },
-        },
-      });
+          content: 'reference progress',
+          responseKind: 'progress',
+          mention: 'none',
+        });
+        return;
+      }
+      finishTurn(command);
+      return;
+    }
+    case 'outbound_message_result': {
+      if (!pendingOutboundTurn
+          || command.operationId !== 'reference-outbound-1'
+          || command.turnId !== pendingOutboundTurn.turnId
+          || command.generation !== state?.generation) {
+        fail(command, 'outbound_result_mismatch', 'outbound result does not match the pending operation');
+        return;
+      }
+      const turn = pendingOutboundTurn;
+      pendingOutboundTurn = undefined;
+      finishTurn(turn, JSON.stringify(command.result));
       return;
     }
     case 'cancel':

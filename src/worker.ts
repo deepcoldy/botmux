@@ -122,6 +122,7 @@ import {
   type PendingCliInput,
 } from './utils/pending-input-queue.js';
 import { remoteWorkerShutdownInputBlocker } from './core/remote-worker-shutdown-readiness.js';
+import { sendRemoteRunnerOutboundMessage } from './services/remote-runner-outbound-send.js';
 import { ReadyGate, shouldArmReadyGate } from './utils/ready-gate.js';
 import { shouldRunStartupCommandsOnSpawn, shouldDeferInitialPromptForStartup } from './core/startup-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
@@ -5344,6 +5345,48 @@ function deliverRemoteTurnFinal(text: string, exactTurnId?: string): void {
     ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
   });
   log(`Remote final bridge delivered ${postContent.length} chars for turn ${turnId.substring(0, 12)}`);
+}
+
+async function deliverRemoteRunnerOutboundMessage(
+  message: import('./adapters/backend/remote-runner-protocol.js').RemoteRunnerOutboundMessage,
+): Promise<import('./adapters/backend/remote-runner-protocol.js').RemoteRunnerOutboundMessageResult> {
+  const authority = activeTurnAuthority.identity();
+  if (!sessionId || !lastInitConfig
+    || message.turnId !== currentBotmuxTurnId
+    || authority.turnId !== message.turnId
+    || (authority.dispatchAttempt !== undefined
+      && authority.dispatchAttempt !== currentBotmuxDispatchAttempt)) {
+    return {
+      outcome: 'rejected',
+      code: 'outbound_turn_stale',
+      message: 'The outbound message no longer belongs to the worker\'s active turn.',
+    };
+  }
+
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    SESSION_DATA_DIR: process.env.SESSION_DATA_DIR ?? config.session.dataDir,
+    BOTMUX_LARK_APP_ID: lastInitConfig.larkAppId,
+    BOTMUX_CHAT_ID: lastInitConfig.chatId,
+    BOTMUX_SESSION_SCOPE: lastInitConfig.rootMessageId?.startsWith('om_') ? 'thread' : 'chat',
+    BOTMUX_ROOT_MESSAGE_ID: lastInitConfig.rootMessageId,
+    BOTMUX_REPLY_STYLE: JSON.stringify(lastInitConfig.replyStyle ?? {}),
+  };
+  const pinnedConfig = resolveChildBotsConfig(
+    lastInitConfig.loadedBotsConfigPath,
+    lastInitConfig.loadedBotsConfigProvenance,
+  );
+  if (pinnedConfig) env.BOTS_CONFIG = pinnedConfig;
+  else delete env.BOTS_CONFIG;
+
+  return sendRemoteRunnerOutboundMessage(message, {
+    sessionId,
+    turnId: message.turnId,
+    ...(currentBotmuxDispatchAttempt !== undefined
+      ? { dispatchAttempt: currentBotmuxDispatchAttempt }
+      : {}),
+    env,
+  });
 }
 
 function submitActivityEvidenceSince(
@@ -18281,6 +18324,16 @@ async function spawnCli(
         currentBotmuxDispatchAttempt,
       );
     }
+  });
+  backend.onOutboundMessage?.(async (message) => {
+    if (fatalWorkerErrorPending || backend !== observedBackend) {
+      return {
+        outcome: 'rejected',
+        code: 'outbound_backend_stale',
+        message: 'The backend generation that requested this message is no longer active.',
+      };
+    }
+    return deliverRemoteRunnerOutboundMessage(message);
   });
   backend.onTurnFailure?.((failure) => {
     if (fatalWorkerErrorPending || backend !== observedBackend) return;

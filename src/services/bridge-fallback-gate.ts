@@ -206,6 +206,10 @@ export interface BridgeSendMarker {
   dispatchAttempt?: number;
   /** Present only for opted-in managed replies; legacy marker semantics stay intact. */
   replyCardResponseKind?: 'progress' | 'final' | 'auxiliary';
+  /** The send is explicitly an interim side effect and must never stand in for
+   * the turn's eventual final/failure delivery. Remote Runner outbound_message
+   * uses this while ordinary historical `botmux send` keeps its old heuristic. */
+  terminalIndependent?: true;
   contentLength?: number;
   /** Bounded, whitespace-compacted copy for dashboard session previews.
    *  The fallback gate still uses contentLength only. */
@@ -371,7 +375,8 @@ export function shouldSuppressBridgeEmit(
   if (turn.markTimeMs === undefined) return false;
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
-  const inWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper);
+  const inWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper
+    && m.terminalIndependent !== true);
   // An explicit `botmux send --response-kind final` already delivered this
   // turn's final answer to Lark. The unified-reply path also writes
   // replyCardResponseKind='final'; the plain (non-unified) path writes only

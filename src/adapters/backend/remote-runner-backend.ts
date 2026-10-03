@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { spawn as spawnProcess, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { logger } from '../../utils/logger.js';
 import type {
@@ -24,6 +24,8 @@ import {
   type RemoteRunnerCapability,
   type RemoteRunnerCommand,
   type RemoteRunnerEvent,
+  type RemoteRunnerOutboundMessage,
+  type RemoteRunnerOutboundMessageResult,
   type RemoteRunnerUsageReport,
 } from './remote-runner-protocol.js';
 import type { RemoteRunnerConfig } from './remote-runner-config.js';
@@ -35,6 +37,13 @@ type PendingRequest = {
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
 };
+
+type OutboundOperation = {
+  fingerprint: string;
+  result: Promise<RemoteRunnerOutboundMessageResult>;
+};
+
+const MAX_OUTBOUND_MESSAGES_PER_TURN = 10;
 
 function boundedTimeout(value: number | undefined, fallback: number): number {
   if (!Number.isSafeInteger(value) || value! < 100 || value! > 300_000) return fallback;
@@ -80,12 +89,16 @@ export class RemoteRunnerBackend implements SessionBackend {
   private turnSettled: Promise<void> = Promise.resolve();
   private settleTurn: (() => void) | null = null;
   private readonly pendingRequests = new Map<string, PendingRequest>();
+  private readonly outboundOperations = new Map<string, OutboundOperation>();
+  private outboundOperationCount = 0;
+  private outboundResultWrites = 0;
   private dataCb: ((data: string) => void) | null = null;
   private screenResyncCb: ((snapshot: string) => void) | null = null;
   private exitCb: ((code: number | null, signal: string | null) => void) | null = null;
   private taskDoneCb: (() => void) | null = null;
   private turnFinalCb: ((text: string, turnId?: string) => void) | null = null;
   private turnFailureCb: ((failure: BackendTurnFailure) => void) | null = null;
+  private outboundMessageCb: ((message: RemoteRunnerOutboundMessage) => Promise<RemoteRunnerOutboundMessageResult>) | null = null;
   private readyCb: (() => void) | null = null;
   private stateCb: ((state: RemoteRunnerBackendState) => void) | null = null;
   private usageCb: ((usage: RemoteRunnerUsageReport) => void) | null = null;
@@ -189,6 +202,9 @@ export class RemoteRunnerBackend implements SessionBackend {
       };
     }
     this.activeTurnId = input.turnId;
+    this.outboundOperations.clear();
+    this.outboundOperationCount = 0;
+    this.outboundResultWrites = 0;
     this.turnSettled = new Promise<void>(resolve => { this.settleTurn = resolve; });
     const requestId = this.requestId('turn');
     this.activeTurnRequestId = requestId;
@@ -261,6 +277,9 @@ export class RemoteRunnerBackend implements SessionBackend {
   onTaskDone(cb: () => void): void { this.taskDoneCb = cb; }
   onTurnFinal(cb: (text: string, turnId?: string) => void): void { this.turnFinalCb = cb; }
   onTurnFailure(cb: (failure: BackendTurnFailure) => void): void { this.turnFailureCb = cb; }
+  onOutboundMessage(
+    cb: (message: RemoteRunnerOutboundMessage) => Promise<RemoteRunnerOutboundMessageResult>,
+  ): void { this.outboundMessageCb = cb; }
   onReady(cb: () => void): void {
     this.readyCb = cb;
     if (this.ready) queueMicrotask(cb);
@@ -523,8 +542,16 @@ export class RemoteRunnerBackend implements SessionBackend {
       this.dataCb?.(event.content);
       return;
     }
+    if (event.type === 'outbound_message') {
+      this.handleOutboundMessage(event);
+      return;
+    }
     if (event.type === 'final') {
       if (!this.acceptActiveTurn(event.turnId)) return;
+      if (this.outboundResultWrites > 0) {
+        this.failProtocol('remote runner emitted final before an outbound message result was returned');
+        return;
+      }
       if (event.state && !this.applyState(event.state)) return;
       if (event.usage) {
         const usage = normalizeRemoteRunnerUsageReport(event.usage);
@@ -603,6 +630,80 @@ export class RemoteRunnerBackend implements SessionBackend {
     return false;
   }
 
+  private outboundFingerprint(message: RemoteRunnerOutboundMessage): string {
+    return createHash('sha256').update(JSON.stringify([
+      message.turnId,
+      message.generation,
+      message.content,
+      message.responseKind,
+      message.mention,
+    ])).digest('hex');
+  }
+
+  private handleOutboundMessage(message: RemoteRunnerOutboundMessage): void {
+    if (!this.providerCapabilities.has('outbound_message')) {
+      this.failProtocol('remote runner emitted outbound_message without advertising the capability');
+      return;
+    }
+    if (!this.acceptActiveTurn(message.turnId)) return;
+    if (message.generation !== this.state?.generation) {
+      this.failProtocol('remote runner outbound message belongs to another backend generation');
+      return;
+    }
+
+    const fingerprint = this.outboundFingerprint(message);
+    const existing = this.outboundOperations.get(message.operationId);
+    let result: Promise<RemoteRunnerOutboundMessageResult>;
+    if (existing) {
+      result = existing.fingerprint === fingerprint
+        ? existing.result
+        : Promise.resolve({
+            outcome: 'rejected',
+            code: 'operation_id_conflict',
+            message: 'The outbound operation id was reused with a different payload.',
+          });
+    } else if (this.outboundOperationCount >= MAX_OUTBOUND_MESSAGES_PER_TURN) {
+      result = Promise.resolve({
+        outcome: 'rejected',
+        code: 'outbound_rate_limited',
+        message: `A remote turn may emit at most ${MAX_OUTBOUND_MESSAGES_PER_TURN} outbound messages.`,
+      });
+    } else {
+      this.outboundOperationCount++;
+      const callback = this.outboundMessageCb;
+      result = callback
+        ? Promise.resolve().then(() => callback(message)).catch((error): RemoteRunnerOutboundMessageResult => ({
+            outcome: 'unknown',
+            code: 'outbound_delivery_unknown',
+            message: (error instanceof Error ? error.message : String(error)).slice(0, 4096)
+              || 'Outbound delivery failed with an unknown result.',
+          }))
+        : Promise.resolve({
+            outcome: 'rejected',
+            code: 'outbound_delivery_unavailable',
+            message: 'The BotMux host did not install an outbound message handler.',
+          });
+      this.outboundOperations.set(message.operationId, { fingerprint, result });
+    }
+
+    this.outboundResultWrites++;
+    void result.then(async (settled) => {
+      await this.send(remoteRunnerCommand('outbound_message_result', {
+        requestId: this.requestId('outbound-message-result'),
+        operationId: message.operationId,
+        turnId: message.turnId,
+        generation: message.generation,
+        result: settled,
+      }));
+    }).catch(error => {
+      this.failProtocol(
+        `remote runner outbound message result could not be returned: ${error instanceof Error ? error.message : error}`,
+      );
+    }).finally(() => {
+      this.outboundResultWrites = Math.max(0, this.outboundResultWrites - 1);
+    });
+  }
+
   private emitTurnFailure(failure: BackendTurnFailure): void {
     this.turnFailureCb?.(failure);
     this.finishActiveTurn();
@@ -611,6 +712,9 @@ export class RemoteRunnerBackend implements SessionBackend {
 
   private finishActiveTurn(): void {
     this.activeTurnId = null;
+    this.outboundOperations.clear();
+    this.outboundOperationCount = 0;
+    this.outboundResultWrites = 0;
     const settle = this.settleTurn;
     this.settleTurn = null;
     settle?.();
