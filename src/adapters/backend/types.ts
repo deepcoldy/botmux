@@ -252,7 +252,7 @@ export interface SessionBackend {
    * writes, drain every write accepted before the fence, and return the exact
    * final lineage without cancelling it. The daemon persists that lineage
    * before telling the worker it may exit. */
-  prepareShutdownDetach?(): Promise<SessionShutdownDetachResult>;
+  prepareShutdownDetach?(drainTimeoutMs?: number): Promise<SessionShutdownDetachResult>;
   /** Restore admission/streaming when the daemon cannot complete a prepared
    * shutdown detach (for example, lineage persistence failed). */
   abortShutdownDetach?(): SessionShutdownDetachResult | Promise<SessionShutdownDetachResult>;

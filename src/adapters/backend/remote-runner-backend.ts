@@ -345,7 +345,7 @@ export class RemoteRunnerBackend implements SessionBackend {
 
   commitDestroySession(): void { this.kill(); }
 
-  async prepareShutdownDetach(): Promise<SessionShutdownDetachResult> {
+  async prepareShutdownDetach(drainTimeoutMs?: number): Promise<SessionShutdownDetachResult> {
     this.shutdownDetaching = true;
     try {
       if (!this.startupPromise) throw new Error('remote runner has not spawned');
@@ -359,7 +359,11 @@ export class RemoteRunnerBackend implements SessionBackend {
           error: 'remote runner does not support transactional detach',
         };
       }
-      await this.withTimeout(this.turnSettled, this.operationTimeoutMs, 'active turn did not settle before detach');
+      await this.withTimeout(
+        this.turnSettled,
+        drainTimeoutMs ?? this.operationTimeoutMs,
+        'active turn did not settle before detach',
+      );
       // From this point a transport failure cannot prove whether the provider
       // installed its detach fence. abortShutdownDetach must positively
       // reattach before local admission can be restored.

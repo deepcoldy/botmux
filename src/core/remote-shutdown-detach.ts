@@ -206,7 +206,7 @@ function requestPhase(
     worker.on('message', onMessage);
     worker.once('exit', onExit);
     const message: DaemonToWorker = phase === 'prepare'
-      ? { type: 'remote_shutdown_prepare', requestId }
+      ? { type: 'remote_shutdown_prepare', requestId, drainTimeoutMs: timeoutMs }
       : { type: 'remote_shutdown_abort', requestId };
     if (!send(worker, message)) {
       finish({ ok: false, taskId: null, error: `remote_shutdown_${phase}_send_failed` });

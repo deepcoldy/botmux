@@ -22659,7 +22659,7 @@ process.on('message', async (raw: unknown) => {
         shutdownDetachRequestId = msg.requestId;
         shutdownDetachPhase = 'preparing';
         try {
-          result = await backend?.prepareShutdownDetach?.()
+          result = await backend?.prepareShutdownDetach?.(msg.drainTimeoutMs)
             ?? { ok: false, taskId: null, error: 'shutdown_detach_unsupported' };
         } catch (err) {
           result = {

@@ -11,6 +11,7 @@ const stalledCloseRunner = resolve('test/fixtures/remote-runner-stalled-close.mj
 const stalledReattachRunner = resolve('test/fixtures/remote-runner-stalled-reattach.mjs');
 const preAckFailureRunner = resolve('test/fixtures/remote-runner-pre-ack-failure.mjs');
 const outboundRunner = resolve('test/fixtures/remote-runner-outbound.mjs');
+const delayedTurnRunner = resolve('test/fixtures/remote-runner-delayed-turn.mjs');
 const children: RemoteRunnerBackend[] = [];
 
 function createBackend(initialState?: RemoteRunnerBackendState): RemoteRunnerBackend {
@@ -233,6 +234,25 @@ describe('RemoteRunnerBackend', () => {
     await backend.submitTurn({ turnId: 'turn-detach', content: 'keep me' });
     await final;
     await expect(backend.prepareShutdownDetach()).resolves.toMatchObject({
+      ok: true,
+      taskId: null,
+    });
+    backend.commitShutdownDetach();
+  });
+
+  it('lets the shutdown drain deadline outlive the ordinary operation timeout', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'delayed-turn',
+      operationTimeoutMs: 100,
+    }, 'session-delayed-turn');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    spawnBackend(backend, delayedTurnRunner);
+    await ready;
+
+    await expect(backend.submitTurn({ turnId: 'turn-delayed', content: 'wait' }))
+      .resolves.toEqual({ submitted: true });
+    await expect(backend.prepareShutdownDetach(1_000)).resolves.toEqual({
       ok: true,
       taskId: null,
     });

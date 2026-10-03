@@ -127,7 +127,10 @@ describe('worker remote retirement protocol', () => {
     const rawCount = prepare.indexOf('pendingRawInputs: pendingRawInputs.length', readiness);
     const initFence = prepare.indexOf('initPromptMaterialized', readiness);
     const refusal = prepare.indexOf('worker_inputs_not_drained:', readiness);
-    const backendPrepare = prepare.indexOf('backend?.prepareShutdownDetach?.()', refusal);
+    const backendPrepare = prepare.indexOf(
+      'backend?.prepareShutdownDetach?.(msg.drainTimeoutMs)',
+      refusal,
+    );
     const remotePrepareGate = prepare.indexOf('if (!isRemoteBackendType(effectiveBackendType))');
 
     expect(readiness).toBeGreaterThanOrEqual(0);
@@ -137,6 +140,7 @@ describe('worker remote retirement protocol', () => {
     expect(rawCount).toBeGreaterThan(queueCount);
     expect(refusal).toBeGreaterThan(rawCount);
     expect(backendPrepare).toBeGreaterThan(refusal);
+    expect(prepare).toContain('msg.drainTimeoutMs');
 
     const commitStart = workerSource.indexOf("case 'remote_shutdown_commit':", prepareEnd);
     const commitEnd = workerSource.indexOf("case 'remote_shutdown_abort':", commitStart);

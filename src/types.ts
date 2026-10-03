@@ -1745,7 +1745,7 @@ type DaemonToWorkerBase =
   | { type: 'close_commit'; requestId: string }
   | { type: 'close_abort'; requestId: string }
   /** Fence new remote writes, drain accepted writes, and report exact lineage. */
-  | { type: 'remote_shutdown_prepare'; requestId: string }
+  | { type: 'remote_shutdown_prepare'; requestId: string; drainTimeoutMs?: number }
   /** Final lineage is durable; detach the worker generation. */
   | { type: 'remote_shutdown_commit'; requestId: string }
   /** Shutdown could not commit; restore remote write admission. */
