@@ -468,6 +468,11 @@ import {
 import type { PersistentBackendTarget } from './adapters/backend/types.js';
 import { handleCardAction, runAutoWorktreeCommit } from './im/lark/card-handler.js';
 import { createPluginCardActionGateway } from './core/plugins/card-actions/gateway.js';
+import { createInputCaptureStore } from './core/plugins/input-capture/store.js';
+import { createInputCaptureRuntime, setInputCaptureRuntime, stopInputCaptureRuntimes } from './core/plugins/input-capture/runtime.js';
+import { deliverCapturedInput } from './core/plugins/input-capture/gateway.js';
+import { captureInboundText } from './im/lark/input-capture.js';
+import { readPluginRegistry } from './services/plugin-registry-store.js';
 import { setIssueActivate } from './im/lark/issue-command-deps.js';
 import { startIssueOutboxPump } from './services/issue-outbox-pump.js';
 import type { CardActionData, CardHandlerDeps } from './im/lark/card-handler.js';
@@ -28334,7 +28339,29 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
     // Build the dispatcher now for authorization replay, but start it only
     // after restore has published every durable route owner.
+    const inputCapture = createInputCaptureRuntime({
+      larkAppId: cfg.larkAppId,
+      store: createInputCaptureStore(config.session.dataDir, cfg.larkAppId),
+      session(id) {
+        const ds = [...activeSessions.values()].find(item => item.larkAppId === cfg.larkAppId && item.session.sessionId === id);
+        if (!ds || ds.session.vcMeetingReceiver || !['chat', 'thread'].includes(ds.scope)) return undefined;
+        return { sessionId: id, larkAppId: ds.larkAppId, chatId: ds.chatId,
+          anchor: ds.scope === 'chat' ? ds.chatId : ds.session.rootMessageId,
+          ownerOpenId: ds.ownerOpenId ?? ds.session.ownerOpenId ?? '', active: ds.session.status === 'active' };
+      },
+      pluginEnabled: id => resolveEffectivePluginIds(getBot(cfg.larkAppId).config, readGlobalConfig()).includes(id)
+        && !!readPluginRegistry().plugins[id]?.contributions?.cardActions,
+      canTalk: (session, actor, memberUnionId) => evaluateAskAnswerTalk(cfg.larkAppId, session.chatId, actor,
+        [...activeSessions.values()].find(item => item.larkAppId === cfg.larkAppId && item.session.sessionId === session.sessionId)?.chatType,
+        { memberUnionId }),
+      deliver: deliverCapturedInput,
+      warn: () => logger.warn('[input-capture] delivery pending; retained for reconciliation'),
+    });
+    setInputCaptureRuntime(cfg.larkAppId, inputCapture);
+    inputCapture.start();
     const botEventHandlers: EventHandlers = {
+      captureHumanInput: data => captureInboundText(data, inputCapture,
+        id => isKnownPeerBot(config.session.dataDir, cfg.larkAppId, id)),
       handleCardAction: (data, appId) => withBotTurnAdmission(
         appId,
         () => cardActionPluginGateway.dispatch(data, appId),
@@ -29072,6 +29099,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // completed/failed/cancelled after the fact). Keep the queue and dispatcher
     // live through worker teardown.
     await (await import('./services/constrained-invocation/daemon.js')).closeConstrainedInvocations();
+    await waitAllWithin([stopInputCaptureRuntimes()], shutdownDeadlineMs);
     stopMaintenance();
     vcMeetingTerminalReconciler?.stop();
     clearInterval(vcMeetingDeliveryLeaseTimer);

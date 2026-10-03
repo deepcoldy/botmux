@@ -583,7 +583,7 @@ function normalizeApiMessageContent(msgType: string, rawContent: string): string
 }
 
 /** Resolve post body from either wrapped {"zh_cn":{title,content}} or unwrapped {title,content} format */
-function resolvePostBody(parsed: any): { title: string; content: any[] } {
+export function resolvePostBody(parsed: any): { title: string; content: any[] } {
   // Unwrapped: has content array directly
   if (Array.isArray(parsed.content)) {
     return { title: parsed.title ?? '', content: parsed.content };
@@ -764,6 +764,20 @@ function joinPostNodeText(parts: string[]): string {
  *  dispatched; paths the hook doesn't cover still get this safe placeholder
  *  instead of the raw {"file_key":...} JSON. */
 export const AUDIO_PLACEHOLDER = '[语音]';
+
+/** Authored text only: file names, media placeholders and forwarded content are
+ * resource metadata, not statements by the sender. Ordinary rendering is unchanged. */
+export function extractAuthoredMessageText(msgType: string, rawContent: string, mentions?: RawEventData['message']['mentions']): string {
+  if (msgType === 'text') return extractTextContent(msgType, rawContent, mentions);
+  if (msgType !== 'post') return '';
+  const { title, content } = resolvePostBody(JSON.parse(rawContent));
+  const body = content.map(paragraph => {
+    const nodes = Array.isArray(paragraph) ? paragraph : [paragraph];
+    return joinPostNodeText(nodes.filter(node => !['img', 'image', 'file', 'media', 'audio'].includes(node?.tag))
+      .map(node => renderPostNode(node)));
+  }).filter(Boolean).join('\n');
+  return title ? `${title}\n${body}` : body;
+}
 
 function extractTextContent(msgType: string, rawContent: string, mentions?: RawEventData['message']['mentions'], numberer?: ImgNumberer): string {
   try {
