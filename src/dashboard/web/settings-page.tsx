@@ -2005,7 +2005,7 @@ function UpdateCard(props: {
   );
 }
 
-function CliRuntimeUpdates(props: { entries: CliRuntimeUpdateStatus[] }) {
+export function CliRuntimeUpdates(props: { entries: CliRuntimeUpdateStatus[] }) {
   const tr = useT();
   return (
     <div className="cli-runtime-updates">
@@ -2030,6 +2030,8 @@ function CliRuntimeUpdates(props: { entries: CliRuntimeUpdateStatus[] }) {
             <code>{entry.binPath}</code>
             {entry.updateAvailable && entry.updateCommand ? (
               <small>{tr('update.runtimeCommand')}: <code>{entry.updateCommand}</code></small>
+            ) : entry.updateAvailable ? (
+              <small>{tr('update.runtimeCommandUnknown')}</small>
             ) : null}
           </li>
         ))}
