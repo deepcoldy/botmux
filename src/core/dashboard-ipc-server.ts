@@ -3875,7 +3875,9 @@ function workingDirForSession(sessionId: string): string | undefined {
 }
 
 /**
- * Reactivate a closed session — counterpart to `/close`. Used by both the
+ * Reactivate a resumable closed session — counterpart to `/close` for local
+ * backends. Explicitly closed remote lineage-owning sessions are rejected.
+ * Used by both the
  * "▶️ 恢复会话" card button (via card-handler) and the `botmux resume <id>`
  * CLI command (via this HTTP route). The CLI route also drops a notice into
  * the original Lark thread so users see why the session is alive again.

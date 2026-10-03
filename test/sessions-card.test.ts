@@ -471,6 +471,25 @@ describe('buildSessionsDetailCard (slice 2a)', () => {
     expect(resumeBtn.confirm).toBeDefined();
   });
 
+  it('closed remote session renders a disabled Resume affordance with guidance', () => {
+    const detail = detailFor({
+      sessionId: 'sess_remote_closed',
+      status: 'closed',
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+    });
+    const parsed = JSON.parse(buildSessionsDetailCard(detail, baseOpts));
+    const actionRow = (parsed.elements as any[]).find((element: any) => element.tag === 'action');
+    const resumeBtn = (actionRow.actions as any[]).find(
+      (action: any) => action.text?.content?.includes('恢复'),
+    );
+
+    expect(detail.actions.resume.enabled).toBe(false);
+    expect(resumeBtn.disabled).toBe(true);
+    expect(resumeBtn.value).toBeUndefined();
+    expect(JSON.stringify(parsed)).toContain('发送新消息创建新会话');
+  });
+
   it('disabled close (starting status) → reason note renders the starting copy', () => {
     const detail = detailFor({ sessionId: 'sess_starting', status: 'starting' });
     expect(detail.actions.close.enabled).toBe(false);
@@ -1666,6 +1685,35 @@ describe('handleSessionsCardAction', () => {
       // No POST was issued — security matrix gate worked.
       const postCalls = requestSpy.mock.calls.filter((c: any[]) => (c[0] as any).method === 'POST');
       expect(postCalls).toHaveLength(0);
+    });
+
+    it('closed remote state replay → guidance toast and 0 POST', async () => {
+      const remoteRow = row({
+        sessionId: 'sess_remote',
+        status: 'closed',
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+      });
+      const requestSpy = vi.fn(async (req: any) => {
+        if (req.method === 'GET') return { status: 200, body: { sessions: [remoteRow] }, raw: '' };
+        throw new Error('POST should not be called');
+      });
+      const deps = {
+        createClient: vi.fn(() => ({ request: requestSpy } as any)),
+        getOwnerOpenId: () => INVOKER,
+        locale: 'zh' as const,
+        nowMs: () => 2_000_000,
+      };
+
+      const result = await handleSessionsCardAction(
+        makeAction({ action: SESSIONS_ACTION_RESUME, invoker_open_id: INVOKER, session_id: 'sess_remote' }),
+        LARK_APP_ID,
+        deps as any,
+      );
+
+      expect(result.toast?.type).toBe('error');
+      expect(result.toast?.content).toContain('发送新消息创建新会话');
+      expect(requestSpy.mock.calls.filter((call: any[]) => call[0].method === 'POST')).toHaveLength(0);
     });
 
     it('POST 500 → toast resume_failed, no card', async () => {

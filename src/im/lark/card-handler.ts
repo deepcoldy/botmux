@@ -3246,6 +3246,8 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           await sessionReply(rootId, t('card.action.resume_anchor_occupied', { detail }, locDsResume));
         } else if (result.error === 'adopt_unsupported') {
           await sessionReply(rootId, t('card.action.resume_adopt_unsupported', undefined, locDsResume));
+        } else if (result.error === 'remote_unsupported') {
+          await sessionReply(rootId, t('card.action.resume_remote_unsupported', undefined, locDsResume));
         } else if (result.error === 'deferred_unmaterialized') {
           await sessionReply(rootId, t('card.action.resume_deferred_unmaterialized', undefined, locDsResume));
         } else if (result.error === 'resume_cancelled') {

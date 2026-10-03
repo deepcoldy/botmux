@@ -74,6 +74,7 @@ export const messages: Record<string, string> = {
   'card.body.click_resume_only': 'Click "Resume Session" to continue.',
   'card.body.cli_no_cli_resume': '_{cliName} cannot resume a specific session from the CLI; you can resume here in Lark._',
   'card.body.resume_starts_fresh': 'Click "Resume Session" to reactivate this topic\'s message route; but {cliName} has no precisely resumable history session — your next message starts a **fresh session** without the old context.',
+  'card.body.remote_session_closed': 'This remote-backend session was explicitly closed and cannot be resumed. Send a new message in this topic to create a new session.',
   'card.body.working_dir': '📁 Working dir:',
   'card.body.choose_label': 'Choice:',
   'card.usage_limit.retry_at': '⚠️ {cliName} usage limit has been reached. Try again after {retryLabel}.',
@@ -1102,6 +1103,7 @@ export const messages: Record<string, string> = {
   'card.action.resume_anchor_occupied': '⚠️ This topic already has a newer session{detail}; cannot resume the older one.',
   'card.action.resume_anchor_holder': ' (holder: {short})',
   'card.action.resume_adopt_unsupported': '⚠️ Adopted sessions cannot be resumed.',
+  'card.action.resume_remote_unsupported': '⚠️ Explicitly closed remote-backend sessions cannot be resumed. Send a new message in this topic to create a new session.',
   'card.action.resume_deferred_unmaterialized': '⚠️ This silent scheduled run never created a topic. Its hidden session is audit-only and cannot be resumed.',
   'card.action.resume_cancelled': '⚠️ The session was closed while resume was committing; resume was cancelled.',
   'card.action.disconnected': '⏏ Disconnected. The original CLI is untouched.',
@@ -1381,6 +1383,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.terminal.disabled.noPort': 'Web Terminal port is not available (not started or already closed)',
   'card.dashboard.sessions.terminal.disabled.unsupported': 'This backend does not provide a Web Terminal',
   'card.dashboard.sessions.resume.disabled.onlyClosed': 'Only closed sessions can be resumed',
+  'card.dashboard.sessions.resume.disabled.remoteUnsupported': 'Explicitly closed remote-backend sessions cannot be resumed; send a new message in the original topic to create a new session',
 
   // ─── Public /sessions current-group card ────────────────────────────────
   'card.group_sessions.title': '🧭 Topics in this group',

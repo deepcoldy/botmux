@@ -133,6 +133,23 @@ describe('/sessions current-group card', () => {
     expect(visible).not.toContain('session-secret');
   });
 
+  it('does not offer resume for an explicitly closed remote session', () => {
+    const card = buildGroupSessionsCard(
+      [row({
+        status: 'closed',
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+      })],
+      {
+        larkAppId: APP, chatId: CHAT, invokerOpenId: USER, canResume: true,
+        locale: 'en', page: 1, timeZone: 'UTC',
+      },
+      NOW,
+    );
+
+    expect(card).not.toContain(GROUP_SESSIONS_ACTION_RESUME);
+  });
+
   it('uses a locked legacy locate callback without rendering the session id', () => {
     const card = JSON.parse(buildGroupSessionsCard(
       [row({ feishuThreadLink: undefined })],
@@ -355,6 +372,28 @@ describe('/sessions current-group card', () => {
       getDashboardAdminOpenIds: () => [USER],
       locale: 'en',
     });
+    expect(result.toast?.type).toBe('error');
+    expect((client as any).request).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not POST resume when the fresh closed row belongs to a remote backend', async () => {
+    const client = clientWith([row({
+      status: 'closed',
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+    })]);
+    const result = await handleGroupSessionsCardAction(callback({
+      action: GROUP_SESSIONS_ACTION_RESUME,
+      invoker_open_id: USER,
+      chat_id: CHAT,
+      session_id: 'session-secret',
+    }), APP, {
+      createClient: () => client,
+      getMessageChatId: vi.fn(async () => CHAT),
+      getDashboardAdminOpenIds: () => [USER],
+      locale: 'en',
+    });
+
     expect(result.toast?.type).toBe('error');
     expect((client as any).request).toHaveBeenCalledTimes(1);
   });

@@ -345,6 +345,21 @@ describe('card-handler resume receipt', () => {
     expect(textReceipt(sessionReply)).toContain('会话已恢复');
   });
 
+  it('explains that an explicitly closed remote session needs a new message', async () => {
+    const { handler, workerPool, resumeSession: mockedResume } = await fresh();
+    const ds = makeDs('remote-runner');
+    mockedResume.mockResolvedValue({ ok: false, error: 'remote_unsupported' });
+    const sessionReply = vi.fn(async () => 'om_reply');
+    const deps = activeDeps(ds, sessionReply);
+    workerPool.setActiveSessionsRegistry(deps.activeSessions);
+
+    await handler.handleCardAction(resumeAction(), deps, APP_ID);
+
+    expect(repostedCardCount(sessionReply)).toBe(0);
+    expect(textReceipt(sessionReply)).toContain('无法恢复');
+    expect(textReceipt(sessionReply)).toContain('直接发送新消息');
+  });
+
   it('does not repost a live card when streaming cards are disabled for the chat', async () => {
     configureBot({ noCardChats: [CHAT_ID] });
     const { handler, workerPool, resumeSession: mockedResume } = await fresh();

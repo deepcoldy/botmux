@@ -58,6 +58,7 @@ import {
   CLI_FILTER_OPTIONS,
   ICON,
   SESSION_STATUS_OPTIONS,
+  canResumeSession,
   canRestartSession,
   cssToken,
   deriveSessionBoardColumn,
@@ -2236,6 +2237,7 @@ function Drawer(props: {
   const row = props.row;
   const terminal = row ? terminalHref(row) : null;
   const closed = !!row && row.status === 'closed';
+  const canResume = !!row && canResumeSession(row);
   const canTakeover = !!row && !closed && !!terminal;
   return (
     <dialog
@@ -2274,6 +2276,8 @@ function Drawer(props: {
                   id="resume-btn"
                   type="button"
                   className="primary drawer-btn-primary"
+                  disabled={!canResume}
+                  title={canResume ? undefined : t('sessions.remoteResumeUnsupported')}
                   onClick={async event => { if (await props.resumeSession(row, event.currentTarget)) props.onClose(); }}
                 >
                   {t('sessions.resume')}

@@ -134,6 +134,14 @@ describe('session-card-model · composeDetail action matrix (M5 extended)', () =
     expect(closed.actions.resume.enabled).toBe(true);
     expect(closed.actions.close.enabled).toBe(false);
 
+    const closedRemote = composeDetail(makeRow({
+      status: 'closed',
+      cliId: 'remote-runner',
+      backendType: 'remote-runner',
+    }));
+    expect(closedRemote.actions.resume.enabled).toBe(false);
+    expect(closedRemote.actions.resume.reasonKey).toBe('sessions.action.resume.remoteUnsupported');
+
     // working → resume=false, close=true
     const working = composeDetail(makeRow({ status: 'working', webPort: 7100 }));
     expect(working.actions.resume.enabled).toBe(false);

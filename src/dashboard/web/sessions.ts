@@ -6,7 +6,7 @@ import {
   ui,
 } from './ui.js';
 import { CLI_OPTIONS } from '../../setup/bot-config-editor.js';
-import { isRemoteCliId } from '../../core/remote-cli-ids.js';
+import { isRemoteCliId, isRemoteSessionDescriptor } from '../../core/remote-cli-ids.js';
 import { sessionTerminalHref } from './session-terminal.js';
 import { copyText } from './clipboard.js';
 import { toast } from './toast.js';
@@ -476,6 +476,10 @@ export function canRestartSession(s: any): boolean {
   // the server's 409 (remote_restart_unsupported): a riff worker refuses the
   // IPC, and a mojo worker executes it — cancelling the remote session.
   return s.status !== 'closed' && !s.adopt && !s.pendingRepo && !isRemoteCliId(s.cliId);
+}
+
+export function canResumeSession(s: any): boolean {
+  return s.status === 'closed' && !isRemoteSessionDescriptor(s);
 }
 
 export interface PickerBot { larkAppId: string; botName: string; }

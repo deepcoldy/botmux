@@ -461,28 +461,34 @@ export function buildSessionsDetailCard(
 
   // 3) close OR resume — mutually exclusive based on row status.
   //    closed → resume button replaces close; otherwise → close stays.
-  const isClosed = detail.actions.resume.enabled === true;
+  const isClosed = detail.status === 'closed';
   let writeButton: Record<string, unknown>;
   if (isClosed) {
-    // Resume button: green primary, confirm dialog.
+    const resumeEnabled = detail.actions.resume.enabled === true;
     writeButton = {
       tag: 'button',
       text: { tag: 'plain_text', content: t('card.dashboard.sessions.btn.resume', undefined, opts.locale) },
       type: 'primary',
-      value: {
+    };
+    if (resumeEnabled) {
+      writeButton.value = {
         action: SESSIONS_ACTION_RESUME,
         invoker_open_id: opts.invokerOpenId,
         session_id: detail.sessionId,
         ...backNav,
-      },
-      confirm: {
+      };
+      writeButton.confirm = {
         title: { tag: 'plain_text', content: t('card.dashboard.sessions.confirm.resume.title', undefined, opts.locale) },
         text: {
           tag: 'plain_text',
           content: t('card.dashboard.sessions.confirm.resume.text', { title: detail.title }, opts.locale),
         },
-      },
-    };
+      };
+    } else {
+      writeButton.disabled = true;
+      const reasonKey = mapResumeDisabledReason(detail.actions.resume.reasonKey);
+      if (reasonKey) reasonNotes.push({ key: reasonKey });
+    }
   } else {
     const closeEnabled = detail.actions.close.enabled === true;
     writeButton = {
@@ -582,6 +588,8 @@ function mapResumeDisabledReason(reasonKey: string | undefined): string | undefi
   switch (reasonKey) {
     case 'sessions.action.resume.onlyClosed':
       return 'card.dashboard.sessions.resume.disabled.onlyClosed';
+    case 'sessions.action.resume.remoteUnsupported':
+      return 'card.dashboard.sessions.resume.disabled.remoteUnsupported';
     default:
       return undefined;
   }

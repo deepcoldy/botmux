@@ -6571,6 +6571,8 @@ async function cmdResume(): Promise<void> {
     console.error('❌ daemon 中找不到该会话（可能已被清理）。');
   } else if (errCode === 'adopt_unsupported') {
     console.error('❌ adopt 接管会话不支持 resume。');
+  } else if (errCode === 'remote_unsupported') {
+    console.error('❌ 已显式关闭的远程后端会话无法 resume；请在原话题直接发送新消息创建新会话。');
   } else if (errCode === 'deferred_unmaterialized') {
     console.error('❌ 该静默定时轮次未创建话题，隐藏会话只保留审计记录，不能 resume。');
   } else if (errCode === 'resume_cancelled') {
@@ -6792,8 +6794,9 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
   delete <id>      关闭指定会话（支持 ID 前缀匹配）
   delete all       关闭所有活跃会话
   delete stopped   清理所有进程已退出的僵尸会话
-  resume <id>      恢复一个已关闭的会话（支持 ID 前缀匹配）— 会话标记回 active，
-                   下条消息会以 --resume 重新拉起 CLI 进程
+  resume <id>      恢复一个支持恢复的已关闭会话（支持 ID 前缀匹配）— 会话标记回 active，
+                   下条消息会以 --resume 重新拉起 CLI 进程；远程后端显式关闭后不可恢复，
+                   请在原话题直接发送新消息创建新会话
   suspend <id|all>     挂起活跃会话：杀 CLI/pane 但会话保持 active，下条消息冷启动续上下文
        --bot <appId>   挂起该 bot 的全部活跃会话
        --isolated      挂起所有读隔离 bot（凭证轮换后用；下次冷启动自动同步最新凭证）

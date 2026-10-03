@@ -207,7 +207,7 @@ afterEach(() => {
 });
 
 function makeClosedSession(overrides: Partial<Parameters<typeof sessionStore.createSession>[0]> & {
-  scope?: 'thread' | 'chat'; larkAppId?: string; workingDir?: string; cliId?: any;
+  scope?: 'thread' | 'chat'; larkAppId?: string; workingDir?: string; cliId?: any; backendType?: any;
 } = {}): ReturnType<typeof sessionStore.createSession> {
   const s = sessionStore.createSession(
     overrides.chatId ?? 'oc_chat1',
@@ -218,6 +218,7 @@ function makeClosedSession(overrides: Partial<Parameters<typeof sessionStore.cre
   s.larkAppId = overrides.larkAppId ?? 'app_test';
   s.workingDir = overrides.workingDir ?? '/tmp/proj';
   s.cliId = overrides.cliId ?? 'claude-code';
+  s.backendType = overrides.backendType;
   s.scope = overrides.scope ?? 'thread';
   sessionStore.updateSession(s);
   sessionStore.closeSession(s.sessionId);
@@ -268,6 +269,22 @@ describe('resumeSession', () => {
       const r = await resumeSession(s.sessionId, new Map());
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.error).toBe('adopt_unsupported');
+    });
+
+    it.each([
+      ['remote CLI id', { cliId: 'remote-runner' }],
+      ['remote backend stamp', { cliId: 'codex', backendType: 'remote-runner' }],
+    ])('keeps an explicitly closed %s closed instead of creating a ghost-active row', async (_name, identity) => {
+      const closed = makeClosedSession(identity);
+      const map = new Map<string, DaemonSession>();
+
+      await expect(resumeSession(closed.sessionId, map)).resolves.toEqual({
+        ok: false,
+        error: 'remote_unsupported',
+      });
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
+      expect(map.size).toBe(0);
+      expect(closeSession).not.toHaveBeenCalled();
     });
 
     it('Plan B: a closed meeting-agent session resumes as an ordinary chat session (no vc_receiver_managed refusal)', async () => {

@@ -25,6 +25,7 @@ import { scheduleTimeZone } from '../../utils/timezone.js';
 import { getMessageChatId as defaultGetMessageChatId } from './client.js';
 import type { CardActionData } from './card-handler.js';
 import { STREAM_STATUS_TEMPLATE_ICON, STREAM_STATUS_TEMPLATE_MAP } from './stream-status-palette.js';
+import { isRemoteSessionDescriptor } from '../../core/remote-cli-ids.js';
 
 export const GROUP_SESSIONS_ACTION_REFRESH = 'group_sessions_refresh' as const;
 export const GROUP_SESSIONS_ACTION_PAGE = 'group_sessions_page' as const;
@@ -192,7 +193,7 @@ export function buildGroupSessionsCard(
         };
       }
       const rowActions: Record<string, unknown>[] = [button];
-      if (row.status === 'closed' && opts.canResume === true) {
+      if (row.status === 'closed' && opts.canResume === true && !isRemoteSessionDescriptor(row)) {
         rowActions.push({
           tag: 'button',
           text: { tag: 'plain_text', content: t('card.group_sessions.resume', undefined, opts.locale) },
@@ -356,7 +357,7 @@ export async function handleGroupSessionsCardAction(
   if (action === GROUP_SESSIONS_ACTION_RESUME) {
     const sessionId = value.session_id;
     const row = sessionId ? scoped.rows.find(candidate => candidate.sessionId === sessionId) : undefined;
-    if (!row || row.status !== 'closed') {
+    if (!row || row.status !== 'closed' || isRemoteSessionDescriptor(row)) {
       return error('card.group_sessions.resume_unavailable', undefined, locale);
     }
     try {

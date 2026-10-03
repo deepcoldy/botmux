@@ -77,6 +77,7 @@ export const messages: Record<string, string> = {
   'card.body.click_resume_only': '点击「恢复会话」继续。',
   'card.body.cli_no_cli_resume': '{cliName} 不支持从命令行精确恢复指定会话，可在飞书内 resume。',
   'card.body.resume_starts_fresh': '点击「恢复会话」可重新激活本话题的消息路由；但 {cliName} 没有可精确恢复的历史会话，下次对话将**新起干净会话**，旧上下文不会带回。',
+  'card.body.remote_session_closed': '远程后端会话已被显式关闭，无法恢复。请在本话题直接发送新消息创建新会话。',
   'card.body.working_dir': '📁 工作目录：',
   'card.body.choose_label': '选择:',
   'card.usage_limit.retry_at': '⚠️ 当前已达到 {cliName} 使用限额。请在 {retryLabel} 后再试。',
@@ -1103,6 +1104,7 @@ export const messages: Record<string, string> = {
   'card.action.resume_anchor_occupied': '⚠️ 当前话题已有新会话{detail}，无法恢复旧会话。',
   'card.action.resume_anchor_holder': '（占用者：{short}）',
   'card.action.resume_adopt_unsupported': '⚠️ adopt 接管会话不支持 resume。',
+  'card.action.resume_remote_unsupported': '⚠️ 已显式关闭的远程后端会话无法恢复。请在本话题直接发送新消息创建新会话。',
   'card.action.resume_deferred_unmaterialized': '⚠️ 该静默定时轮次未创建话题，隐藏会话只保留审计记录，无法恢复。',
   'card.action.resume_cancelled': '⚠️ 恢复过程中会话被关闭，本次恢复已取消。',
   'card.action.disconnected': '⏏ 已断开，原 CLI 会话不受影响',
@@ -1384,6 +1386,7 @@ export const messages: Record<string, string> = {
   'card.dashboard.sessions.terminal.disabled.noPort': '会话尚无 Web 终端端口（未启动或已关闭）',
   'card.dashboard.sessions.terminal.disabled.unsupported': '当前后端不提供 Web 终端',
   'card.dashboard.sessions.resume.disabled.onlyClosed': '仅可恢复已关闭的会话',
+  'card.dashboard.sessions.resume.disabled.remoteUnsupported': '远程后端会话显式关闭后无法恢复；请在原话题发送新消息创建新会话',
 
   // ─── Public /sessions current-group card ───────────────────────────────
   'card.group_sessions.title': '🧭 本群话题',

@@ -4987,6 +4987,45 @@ describe('PUT /api/bot-read-isolation', () => {
 });
 
 describe('POST /api/sessions/:sessionId/resume', () => {
+  it('rejects an explicitly closed remote session without reactivating it', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-remote-resume-'));
+    const prevConfigDataDir = config.session.dataDir;
+    const previousRegistry = workerPool.getActiveSessionsRegistry();
+    const registry = new Map<string, any>();
+    let handle: IpcServerHandle | undefined;
+    try {
+      config.session.dataDir = dataDir;
+      sessionStore.init('test-app');
+      workerPool.setActiveSessionsRegistry(registry);
+
+      const session = sessionStore.createSession('oc_remote_resume', 'om_remote_resume', 'closed remote', 'group');
+      Object.assign(session, {
+        scope: 'thread',
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+        workingDir: process.cwd(),
+      });
+      sessionStore.updateSession(session);
+      sessionStore.closeSession(session.sessionId);
+
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const res = await fetch(`http://127.0.0.1:${handle.port}/api/sessions/${session.sessionId}/resume`, {
+        method: 'POST',
+      });
+
+      expect(res.status).toBe(409);
+      expect(await res.json()).toMatchObject({ ok: false, error: 'remote_unsupported' });
+      expect(sessionStore.getSession(session.sessionId)?.status).toBe('closed');
+      expect(registry.size).toBe(0);
+    } finally {
+      await handle?.close();
+      workerPool.setActiveSessionsRegistry(previousRegistry ?? new Map());
+      sessionStore.init('test-app');
+      config.session.dataDir = prevConfigDataDir;
+      rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
   it('treats a null JSON body as empty and still resumes the closed session', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'dashboard-ipc-resume-null-body-'));
     const prevConfigDataDir = config.session.dataDir;

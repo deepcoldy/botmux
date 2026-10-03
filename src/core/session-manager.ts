@@ -100,6 +100,7 @@ import { chatAppLink, threadAppLink, normalizeBrand } from '../im/lark/lark-host
 import { writePromptContext } from '../services/prompt-context-store.js';
 import { hasInstalledPromptHookCached } from '../adapters/hook-installer.js';
 import { isSharedAdoptPersistedSession, isSharedAdoptSession } from './shared-adopt.js';
+import { isRemoteSessionDescriptor } from './remote-cli-ids.js';
 import { readGroupCollaborationMode } from '../services/group-collaboration-mode-store.js';
 import { createHeadlessRecord, headlessChatId, newHeadlessId, saveHeadlessSession } from '../services/headless-session-store.js';
 import {
@@ -3500,6 +3501,8 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
  *                          a fresh thread session); refuse rather than clobber
  *   - 'adopt_unsupported' — adopt sessions are torn down by /close and have
  *                          no resume semantics
+ *   - 'remote_unsupported' — explicit close retires a remote lineage, so the
+ *                          closed Botmux row cannot be reactivated
  *   - 'deferred_unmaterialized' — a silent fresh-topic run finished without
  *                          publishing, so it has no conversation to resume
  *   - 'resume_cancelled' — a concurrent close won while resume was committing
@@ -3508,7 +3511,7 @@ export async function resumeSession(
   sessionId: string,
   activeSessions: Map<string, DaemonSession>,
 ): Promise<{ ok: true; ds: DaemonSession }
-| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled'; activeSessionId?: string }> {
+| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'remote_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled'; activeSessionId?: string }> {
   let session = sessionStore.getSession(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
@@ -3534,6 +3537,12 @@ export async function resumeSession(
   if (session.title?.startsWith('Adopt:') || isSharedAdoptPersistedSession(session)) {
     return { ok: false, error: 'adopt_unsupported' };
   }
+  // Explicit close is terminal for remote lineage-owning backends. Re-marking
+  // the Botmux row active would create a ghost session with no remote owner;
+  // the next ordinary inbound message must create a fresh logical session.
+  if (isRemoteSessionDescriptor(session)) {
+    return { ok: false, error: 'remote_unsupported' };
+  }
 
   const scope: 'thread' | 'chat' = session.scope === 'chat' ? 'chat' : 'thread';
   const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
@@ -3552,6 +3561,9 @@ export async function resumeSession(
   }
   if (latest.title?.startsWith('Adopt:') || isSharedAdoptPersistedSession(latest)) {
     return { ok: false as const, error: 'adopt_unsupported' as const };
+  }
+  if (isRemoteSessionDescriptor(latest)) {
+    return { ok: false as const, error: 'remote_unsupported' as const };
   }
   session = latest;
 

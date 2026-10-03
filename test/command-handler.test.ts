@@ -6471,6 +6471,29 @@ describe('handleCommand', () => {
       expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).not.toContain('tmux pane');
     });
 
+    it('does not reactivate an explicitly closed remote managed session through /adopt', async () => {
+      const scratch = makeDaemonSession({
+        hasHistory: false,
+        session: makeSession({ sessionId: 'scratch-session', cliId: undefined }),
+      });
+      const closed = makeSession({
+        sessionId: 'remote-session-id',
+        status: 'closed',
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+      });
+      vi.mocked(sessionStore.getOwnedSession).mockReturnValueOnce(closed);
+      vi.mocked(resumeSession).mockResolvedValueOnce({ ok: false, error: 'remote_unsupported' });
+      const deps = makeDeps(scratch);
+
+      await handleCommand('/adopt', ROOT_ID, makeLarkMessage('/adopt remote-session-id'), deps, LARK_APP_ID);
+
+      expect(resumeSession).toHaveBeenCalledWith('remote-session-id', deps.activeSessions);
+      const reply = String((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]);
+      expect(reply).toContain('无法恢复');
+      expect(reply).toContain('直接发送新消息');
+    });
+
     it('does not move a managed session from another topic through /adopt', async () => {
       const scratch = makeDaemonSession({
         hasHistory: false,
