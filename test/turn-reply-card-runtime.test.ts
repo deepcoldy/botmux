@@ -8,6 +8,7 @@ import { getBot } from '../src/bot-registry.js';
 import { replyCardModeFor, updateTurnReplyCard, settleTurnReplyCards, queueTurnReplyTools, flushTurnReplyTools } from '../src/core/turn-reply-card.js';
 import { updateMessage } from '../src/im/lark/client.js';
 import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
+import { writeRoleReplyPrivately } from '../src/core/role-resolver.js';
 import type { CotEntry } from '../src/types.js';
 import { replyCardPresentation } from '../src/im/lark/turn-reply-card.js';
 
@@ -41,6 +42,21 @@ describe('reply-card runtime eligibility and recovery', () => {
   });
   afterEach(() => { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
 
+  it.each([false, true])('private replies bypass dynamic cards with an existing reservation=%s', async reserved => {
+    const ds = session();
+    Object.assign(ds.session, { larkAppId: ds.larkAppId, chatType: 'group', scope: 'thread' });
+    if (reserved) expect(replyCardModeFor(ds)).toBe('unified');
+    writeRoleReplyPrivately(ds.larkAppId, ds.chatId, true);
+    ds.cotForced = true;
+    const send = vi.fn(async () => 'om_reply');
+    expect(replyCardModeFor(ds)).toBe('legacy');
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'final', text: 'answer', card: '{}', source: 'bridge' }, send);
+    expect(send).not.toHaveBeenCalled();
+    expect(updateMessage).not.toHaveBeenCalled();
+    writeRoleReplyPrivately(ds.larkAppId, ds.chatId, false);
+    expect(replyCardModeFor(ds, 'om_next')).toBe('unified');
+  });
   it.each([false, true, undefined])('applies tool result preference %s to rendering and persisted flushes', async enabled => {
     bot.config.thinkingCardToolResult = enabled;
     expect(replyCardPresentation(bot.config, 'oc_mode').showToolResults).toBe(enabled !== false);
