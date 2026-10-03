@@ -159,6 +159,9 @@ export interface BotSnapshot {
   larkAppId: string;
   cliId: CliId;
   cliPathOverride?: string;
+  /** Frozen configured launch prefix.  Workflow workers must use
+   *  the same gateway/runtime selection as ordinary bot sessions. */
+  wrapperCli?: string;
   model?: string;
   /** Frozen per-bot sandbox policy. Workflow workers must not silently lose
    *  these fields when spawning outside the main forkWorker path. Tri-state:

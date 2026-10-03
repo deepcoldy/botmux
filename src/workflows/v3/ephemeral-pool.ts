@@ -244,6 +244,7 @@ async function runNodeImpl(
     cliInstanceBinding: req.botSnapshot.cliInstanceBinding,
     cliRuntime: req.botSnapshot.cliRuntime,
     cliPathOverride: req.botSnapshot.cliPathOverride,
+    wrapperCli: req.botSnapshot.wrapperCli,
     model: req.botSnapshot.model,
     // Workflow workers require CLI bypass permissions by product contract.
     // Restricted bots are rejected before a BotSnapshot is created.
