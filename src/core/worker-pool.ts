@@ -17438,6 +17438,10 @@ function deliverFinalOutput(
         // The original topic cannot receive a notice. Surface the failure on the
         // existing Dashboard attention channel without changing the send route.
         ds.agentAttention = { kind: 'blocked', reason: err.message, at: Date.now() };
+        // Push the needs-you row immediately; the owner-reminder sweep would
+        // surface it eventually, but the Dashboard must not wait for the next
+        // row refresh to light up.
+        publishAttentionPatch(ds);
         emitSessionLifecycleHook(ds, 'session.requires_attention', {
           reason: 'topic_send_blocked', message: err.message, turnId: msg.turnId,
         });

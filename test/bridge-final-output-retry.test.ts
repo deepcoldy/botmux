@@ -12,6 +12,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
+import { dashboardEventBus } from '../src/core/dashboard-events.js';
 
 const topicDetailMock = vi.fn(async () => ({ items: [{ message_id: 'om_root', deleted: true }] }));
 const updateMessageMock = vi.fn(async () => {});
@@ -572,16 +573,26 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     const sessionReply = vi.fn(async () => 'om_sent');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
     const ds = makeDs();
-    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
-    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0, undefined, undefined, { mode: 'thread', rootMessageId: 'om_root' });
-    await vi.advanceTimersByTimeAsync(10);
-    expect(topicDetailMock).toHaveBeenCalledWith('app_test', 'om_root');
-    const lookups = topicDetailMock.mock.calls.length;
-    await vi.advanceTimersByTimeAsync(30000);
-    expect(topicDetailMock).toHaveBeenCalledTimes(lookups);
-    expect(ds.agentAttention).toMatchObject({ kind: 'blocked', reason: expect.stringContaining('TOPIC_SEND_BLOCKED') });
-    expect(sessionReply).not.toHaveBeenCalled();
-    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    // The blocked state must be pushed to Dashboard immediately, not wait for the
+    // next row refresh (every other attention raise in worker-pool calls
+    // publishAttentionPatch alongside the in-memory flag).
+    const patches: any[] = [];
+    const off = dashboardEventBus.subscribe(event => {
+      if (event.type === 'session.update' && event.body.sessionId === ds.session.sessionId) patches.push(event.body.patch);
+    });
+    try {
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0, undefined, undefined, { mode: 'thread', rootMessageId: 'om_root' });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(topicDetailMock).toHaveBeenCalledWith('app_test', 'om_root');
+      const lookups = topicDetailMock.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(30000);
+      expect(topicDetailMock).toHaveBeenCalledTimes(lookups);
+      expect(ds.agentAttention).toMatchObject({ kind: 'blocked', reason: expect.stringContaining('TOPIC_SEND_BLOCKED') });
+      expect(patches.some(patch => patch.agentAttention?.kind === 'blocked')).toBe(true);
+      expect(sessionReply).not.toHaveBeenCalled();
+      expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    } finally { off(); }
   });
 
   it('shares the automatic final precheck with the provider send boundary', async () => {
