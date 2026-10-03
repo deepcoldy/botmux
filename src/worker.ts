@@ -13797,7 +13797,14 @@ async function flushPending(): Promise<void> {
       // Keep that optimization only within one authenticated principal: a
       // different sender must wait for this turn's terminal boundary.
       if (activeTurnBlocks(pendingMessages[0] ?? {})) break;
-      if (shouldStopPendingBatch(item, pendingMessages[0], runtimeSupportsTypeAhead)) break;
+      // Only adapters that explicitly couple serial delivery to their
+      // post-terminal composer fence stop after one ordinary write. Preserve
+      // master's same-batch behavior for every other non-type-ahead adapter.
+      if (shouldStopPendingBatch(
+        item,
+        pendingMessages[0],
+        cliAdapter.postTerminalPromptFence !== true,
+      )) break;
     }
   } finally {
     isFlushing = false;

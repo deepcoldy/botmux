@@ -560,6 +560,19 @@ describe('worker structured-turn status wiring', () => {
     expect(adoptFence).toBeGreaterThan(adoptDrain);
   });
 
+  it('limits ordinary flush batches only for post-terminal-fence adapters', () => {
+    const flush = functionSlice('flushPending', 'sendToPty');
+    const batchStop = flush.indexOf('if (shouldStopPendingBatch(');
+    const serialOptIn = flush.indexOf(
+      'cliAdapter.postTerminalPromptFence !== true',
+      batchStop,
+    );
+    expect(batchStop).toBeGreaterThanOrEqual(0);
+    expect(serialOptIn).toBeGreaterThan(batchStop);
+    expect(flush.slice(batchStop, serialOptIn))
+      .not.toContain('runtimeSupportsTypeAhead');
+  });
+
   it('quarantines unconfirmed adapter submits without replaying them or their successors', () => {
     const flush = functionSlice('flushPending', 'sendToPty');
     const preflight = flush.indexOf('currentInputDeliveryQuarantine()');
