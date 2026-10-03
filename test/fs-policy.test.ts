@@ -361,6 +361,8 @@ describe('buildFsPolicy', () => {
     // schedules moved into per-bot BOT_HOMEs: the legacy shared path is no
     // longer granted (own store rides the BOT_HOME rw; sibling stores denied).
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedules.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedule-authority.sqlite').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedule-authority.sqlite-wal').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_other/schedules.json').access).toBe('none'); // sibling store
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_other.json').access).toBe('none');
     // sibling session stores stay deny-by-default: neither the store DIR nor any

@@ -169,6 +169,27 @@ export interface SessionCleanupGlobalConfig {
   intervalMinutes?: number;
 }
 
+/** Host policy for delegating creation of persistent scheduled work across bots.
+ * Creation is opt-in and independent from triggerUserAuth.  Disabling execution
+ * is a separate emergency revocation switch so stopping new grants does not
+ * silently change the meaning of already committed tasks. */
+export interface ScheduleDelegationGlobalConfig {
+  /** Allow a directly authenticated human turn to request schedule:create. Default off. */
+  createEnabled?: boolean;
+  /** Allow already committed delegated schedules to run. Missing means on. */
+  runEnabled?: boolean;
+  /** Source orchestrator app ids whose managed dispatches request schedule:create by default. */
+  defaultOnDispatchFromBotAppIds?: string[];
+  /** Maximum distinct delegated tasks one target turn may commit. Default 64. */
+  maxTasksPerTurn?: number;
+  /** Personal CLI scopes a delegated schedule may retain for future runs. */
+  runScopes?: Array<'bytedcli'>;
+  /** Let a delegated scheduled turn pause or remove its own task. Default off. */
+  selfManageEnabled?: boolean;
+}
+
+export const SCHEDULE_DELEGATION_DEFAULT_MAX_TASKS_PER_TURN = 64;
+
 export interface GlobalConfig {
   lang?: Locale;
   /** Machine-wide default prefix for groups created via `/group` or `/g`.
@@ -242,6 +263,8 @@ export interface GlobalConfig {
    *  Stored lenient here; final IANA validity is enforced on write
    *  (settings-write-applier) and re-checked at resolve time. */
   scheduleTimeZone?: string;
+  /** Machine-wide cross-bot schedule delegation policy. */
+  scheduleDelegation?: ScheduleDelegationGlobalConfig;
 }
 
 export interface GlobalSkillConfig {
@@ -556,6 +579,30 @@ function readWorker(raw: unknown): WorkerConfig | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+function readScheduleDelegation(raw: unknown): ScheduleDelegationGlobalConfig | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const value = raw as Record<string, unknown>;
+  const out: ScheduleDelegationGlobalConfig = {};
+  if (typeof value.createEnabled === 'boolean') out.createEnabled = value.createEnabled;
+  if (typeof value.runEnabled === 'boolean') out.runEnabled = value.runEnabled;
+  const maxTasksPerTurn = readPositiveInteger(value.maxTasksPerTurn);
+  if (maxTasksPerTurn !== undefined) out.maxTasksPerTurn = Math.min(maxTasksPerTurn, 1024);
+  if (Array.isArray(value.runScopes)) {
+    const runScopes = [...new Set(value.runScopes.filter(
+      (item): item is 'bytedcli' => item === 'bytedcli',
+    ))];
+    if (runScopes.length > 0) out.runScopes = runScopes;
+  }
+  if (typeof value.selfManageEnabled === 'boolean') out.selfManageEnabled = value.selfManageEnabled;
+  if (Array.isArray(value.defaultOnDispatchFromBotAppIds)) {
+    const appIds = [...new Set(value.defaultOnDispatchFromBotAppIds.filter(
+      (item): item is string => typeof item === 'string' && /^cli_[A-Za-z0-9_-]{1,128}$/.test(item),
+    ))];
+    if (appIds.length > 0) out.defaultOnDispatchFromBotAppIds = appIds;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 function readGlobalSkills(raw: unknown): GlobalSkillConfig | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const r = raw as Record<string, unknown>;
@@ -815,6 +862,8 @@ export function readGlobalConfig(): GlobalConfig {
   if (typeof raw.scheduleTimeZone === 'string' && raw.scheduleTimeZone.trim()) {
     out.scheduleTimeZone = raw.scheduleTimeZone.trim();
   }
+  const scheduleDelegation = readScheduleDelegation(raw.scheduleDelegation);
+  if (scheduleDelegation) out.scheduleDelegation = scheduleDelegation;
   readCache = { path, value: out, at: Date.now() };
   return out;
 }

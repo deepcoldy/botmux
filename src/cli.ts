@@ -241,7 +241,7 @@ import {
 } from './workflows/v3/session-relay-client.js';
 import { fetchDaemonIpc, loadDaemonIpcSecret } from './core/daemon-ipc-auth.js';
 import { REPORT_SESSION_RELAY_ROUTE } from './core/report-session-relay.js';
-import { DISPATCH_USER_DELIVERY_ROUTE } from './core/dispatch-user-delegation.js';
+import { DISPATCH_USER_DELIVERY_ROUTE, SCHEDULE_DELEGATED_ADD_ROUTE, SCHEDULE_MANAGED_MUTATE_ROUTE } from './core/dispatch-user-delegation.js';
 import { DISPATCH_REPORT_REGISTER_ROUTE } from './core/dispatch-report-binding.js';
 import { isRetryableAskHttpStatus } from './core/ask-types.js';
 import { linuxIsolationDetected } from './core/linux-isolation.js';
@@ -6990,13 +6990,15 @@ interface CurrentSession {
 
 /** Detect current session info from ancestor marker + live daemon / store. */
 async function detectCurrentSession(): Promise<CurrentSession | null> {
-  const sid = findAncestorSessionId();
+  const ancestor = findAncestorSessionContext();
+  const sid = ancestor?.sessionId ?? null;
   if (!sid) return null;
   const resolved = await resolveSessionById(sid, { dataDir: resolveDataDir() });
   if (!resolved.ok) return null;
   const s = resolved.session;
   return {
     sessionId: s.sessionId,
+    turnId: ancestor?.turnId,
     chatId: s.chatId,
     rootMessageId: s.rootMessageId,
     workingDir: s.workingDir,
@@ -7154,18 +7156,6 @@ async function detectAuthenticatedCurrentSession(): Promise<CurrentSession | nul
     ownerOpenId: provenance.callerOpenId,
     ownerUnionId,
   };
-}
-
-/** Re-attest at the effect boundary; detached calls must not acquire authority. */
-async function revalidateScheduleCreator(current: CurrentSession | null): Promise<CurrentSession | null> {
-  if (!current) return null;
-  const fresh = await detectAuthenticatedCurrentSession();
-  if (!fresh || fresh.sessionId !== current.sessionId || fresh.turnId !== current.turnId
-    || fresh.larkAppId !== current.larkAppId || fresh.ownerOpenId !== current.ownerOpenId
-    || fresh.ownerUnionId !== current.ownerUnionId) {
-    throw new Error('schedule creator provenance changed before write');
-  }
-  return fresh;
 }
 
 /** Pick a value from --flag <value> or --flag=value style args. */
@@ -7675,7 +7665,9 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     }
 
     const cur = await detectCurrentSession();
-    let authenticatedCur = await detectAuthenticatedCurrentSession();
+    let creatorAuthError: unknown;
+    try { await detectAuthenticatedCurrentSession(); }
+    catch (error) { creatorAuthError = error; }
     const explicitTaskId = argValue(rest, '--id');
     if (rest.includes('--id') && !explicitTaskId) {
       console.error('--id 需要一个 8 位小写十六进制任务 ID。');
@@ -7689,12 +7681,10 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     const explicitRootMessageId = argValue(rest, '--root-msg-id');
     const rootMessageId = explicitRootMessageId
       ?? (chatId && chatId === cur?.chatId ? cur.rootMessageId : undefined);
-    // Owner resolution mirrors the store-scope resolution above (flag →
-    // session marker → daemon-injected env): a sandboxed session without a
-    // readable marker must still stamp its own bot as owner, or the task
-    // would land in this bot's store as OWNERLESS — which only the primary
-    // daemon executes — and never fire (codex review P1).
-    const larkAppId = cliScopeAppId;
+    // Resolve the daemon that owns the authoritative task store. A bare host
+    // terminal uses the primary bot selected above; managed sessions stay
+    // pinned to their own app.
+    const larkAppId = cliScopeAppId ?? scheduleStore.getScheduleScope() ?? undefined;
     const workingDir = argValue(rest, '--workdir') ?? cur?.workingDir ?? process.cwd();
     const name = argValue(rest, '--name') ?? (promptArg.length > 20 ? promptArg.slice(0, 20) + '…' : promptArg);
     const legacyDeliver = argValue(rest, '--deliver') as 'origin' | 'local' | 'new-topic' | undefined;
@@ -7781,51 +7771,75 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
 
     let task;
     try {
-      // Identity-bearing task fields are a write authority. Re-attest at the
-      // effect boundary so a turn rotation cannot carry an earlier proof into
-      // a later schedule write. If the first lookup was ownerless, do not
-      // opportunistically gain an identity at this later point.
-      authenticatedCur = await revalidateScheduleCreator(authenticatedCur);
-      task = scheduler.addTask({
-        id: explicitTaskId,
-        name,
-        schedule: rawSchedule,
-        parsed,
-        prompt: promptArg,
-        workingDir,
-        chatId,
-        // Only topic execution keeps the captured root; at top-level the root
-        // is dropped so toggles can never pull execution back into the
-        // originating (e.g. adopted) topic.
-        rootMessageId: executionPosition === 'topic' ? rootMessageId : undefined,
-        larkAppId,
-        creatorChatId: cur?.chatId,
-        creatorRootMessageId: cur?.rootMessageId,
-        creatorLarkAppId: cur?.larkAppId,
-        // Stamp the creator (sandboxed session owner) so the task's scheduled
-        // turns can authenticate workflow commands as them. The daemon
-        // re-checks the owner is still allowed at every run mutation.
-        // Creator identity is authority-bearing. It comes only from the
-        // procStart-bound live ancestor marker, never BOTMUX_SESSION_ID or
-        // BOTMUX_OWNER_OPEN_ID environment fallbacks. The app equality guard
-        // prevents an authenticated session from lending app-scoped open_id to
-        // an explicitly selected different bot store.
-        ownerOpenId: authenticatedCur && authenticatedCur.larkAppId === larkAppId
-          ? authenticatedCur.ownerOpenId
-          : undefined,
-        ownerUnionId: authenticatedCur && authenticatedCur.larkAppId === larkAppId
-          ? authenticatedCur.ownerUnionId
-          : undefined,
-        chatType: cur?.chatType === 'p2p' ? 'p2p' : 'topic_group',
-        scope,
-        executionPosition,
-        topicTitle,
-        deliver,
-        silent,
-        followActive: wantsFollowActive ? true : undefined,
-        model,
-        reasoningEffort,
-      });
+      // A bot-authored current turn cannot satisfy the direct-human creator
+      // resolver. Give the owning daemon one chance to consume a signed,
+      // message-bound schedule:create capability. The daemon derives identity
+      // and scope from live state; this request contains task input only.
+      if (cur?.sessionId && larkAppId && cur.larkAppId === larkAppId) {
+        const delegatedTaskId = explicitTaskId ?? randomBytes(4).toString('hex');
+        let response: Response | undefined;
+        try {
+          response = await postCurrentSessionDaemonRoute({
+            path: SCHEDULE_DELEGATED_ADD_ROUTE,
+            sessionId: cur.sessionId,
+            larkAppId,
+            body: { task: {
+              id: delegatedTaskId,
+              name,
+              schedule: rawSchedule,
+              prompt: promptArg,
+              workingDir,
+              chatId,
+              rootMessageId: executionPosition === 'topic' ? rootMessageId : undefined,
+              executionPosition,
+              larkAppId,
+              deliver,
+              silent,
+              model,
+              reasoningEffort,
+              ...(wantsFollowActive ? { followActive: true } : {}),
+              ...(topicTitle ? { topicTitle } : {}),
+            } },
+          });
+        } catch (error) {
+          if (creatorAuthError) throw creatorAuthError;
+          throw error;
+        }
+        if (response) {
+          const body = await response.json() as { ok?: boolean; task?: any; error?: string; detail?: string };
+          if (!response.ok || body.ok !== true || !body.task) {
+            if (creatorAuthError) throw creatorAuthError;
+            throw new Error(body.detail ?? body.error ?? `HTTP ${response.status}`);
+          }
+          task = body.task;
+        }
+      }
+      if (!cur && larkAppId) {
+        const hostTaskId = explicitTaskId ?? randomBytes(4).toString('hex');
+        const response = await postCurrentSessionDaemonRoute({
+          path: SCHEDULE_DELEGATED_ADD_ROUTE,
+          sessionId: '',
+          larkAppId,
+          body: { task: {
+            id: hostTaskId, name, schedule: rawSchedule, prompt: promptArg,
+            workingDir, chatId,
+            rootMessageId: executionPosition === 'topic' ? rootMessageId : undefined,
+            executionPosition, larkAppId, silent, model, reasoningEffort,
+            deliver,
+            ...(wantsFollowActive ? { followActive: true } : {}),
+            ...(topicTitle ? { topicTitle } : {}),
+          } },
+        });
+        const body = await response.json() as { ok?: boolean; task?: any; error?: string; detail?: string };
+        if (!response.ok || body.ok !== true || !body.task) {
+          throw new Error(body.detail ?? body.error ?? `HTTP ${response.status}`);
+        }
+        task = body.task;
+      }
+      if (!task) {
+        if (creatorAuthError) throw creatorAuthError;
+        throw new Error('无法确定可用的 Bot daemon；定时任务未创建。');
+      }
     } catch (err) {
       // Sandboxed sessions can only write their OWN bot's store — a cross-bot
       // `--lark-app-id` (or a scope pointing at another bot) fails closed here.
@@ -7863,42 +7877,61 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     process.exit(1);
   }
 
-  // Id-addressed op missed the bound store: locate the id across every
-  // READABLE bot store (bare-terminal admin usage) and rebind the scope to the
-  // owning bot for this one-shot process. Sandboxed callers cannot read
-  // sibling stores, so they stay confined to their own tasks by construction.
-  const retargetIfElsewhere = (): boolean => {
-    const hit = scheduleStore.findTaskAcrossBots(id, allBotAppIds());
-    if (!hit || hit.appId === scheduleStore.getScheduleScope()) return false;
-    scheduleStore.setScheduleScope(hit.appId);
-    console.log(`（任务属于 bot ${hit.appId} 的存储）`);
-    return true;
+  // Persistent task-management actions are distinct from schedule:create.
+  // In a managed session every mutation needs its own current-human proof; a
+  // bot-authored dispatch turn cannot reuse its create grant to alter, resume,
+  // delete or force-run any task. Host-terminal administration authenticates
+  // to the owning daemon; neither path falls back to editing schedules.json.
+  const mutationSession = await detectCurrentSession();
+  const scheduledSelfManageCandidate = !!mutationSession?.turnId
+    && mutationSession.turnId.startsWith('schedule:')
+    && ['remove', 'rm', 'delete', 'del', 'pause', 'disable'].includes(sub);
+  if (sub !== 'update' && mutationSession && !scheduledSelfManageCandidate) {
+    await detectAuthenticatedCurrentSession();
+  }
+  const managedMutation = async (
+    action: 'update' | 'remove' | 'pause' | 'resume' | 'run',
+    extra: Record<string, unknown> = {},
+  ): Promise<void> => {
+    let mutationAppId = mutationSession?.larkAppId ?? cliScopeAppId
+      ?? scheduleStore.getScheduleScope() ?? undefined;
+    if (!mutationSession) {
+      const hit = scheduleStore.findTaskAcrossBots(id, allBotAppIds());
+      if (hit) {
+        mutationAppId = hit.appId;
+        scheduleStore.setScheduleScope(hit.appId);
+      }
+    }
+    if (!mutationAppId) throw new Error('无法确定任务所属 Bot；未执行任何修改。');
+    if (!mutationSession) {
+      try {
+        if (!findDaemon(mutationAppId)?.ipcPort || !loadDaemonIpcSecret()) {
+          throw new Error('daemon unavailable');
+        }
+      } catch {
+        throw new Error('当前 Bot daemon 不在线；未执行任何定时任务修改。');
+      }
+    }
+    let response: Response;
+    try {
+      response = await postCurrentSessionDaemonRoute({
+        path: SCHEDULE_MANAGED_MUTATE_ROUTE,
+        sessionId: mutationSession?.sessionId ?? '',
+        larkAppId: mutationAppId,
+        body: { action, id, larkAppId: mutationAppId, ...extra },
+      });
+    } catch (error) {
+      throw new Error(`无法连接当前 Bot daemon；未执行任何定时任务修改：${error instanceof Error ? error.message : String(error)}`);
+    }
+    const body = await response.json() as { ok?: boolean; error?: string };
+    if (!response.ok || body.ok !== true) throw new Error(body.error ?? `HTTP ${response.status}`);
   };
 
   switch (sub) {
     case 'update': {
       const prompt = readSchedulePromptUpdate(rest);
-      const authenticatedCur = await detectAuthenticatedCurrentSession();
-      if (!scheduleStore.getTask(id) && !retargetIfElsewhere()) {
-        throw new Error(`未找到任务 ${id}`);
-      }
-      if (authenticatedCur && authenticatedCur.larkAppId !== scheduleStore.getScheduleScope()) {
-        throw new Error('沙盒会话只能管理自己 bot 的任务。');
-      }
-      await revalidateScheduleCreator(authenticatedCur);
-      // A protected precondition sidecar records a hash of the task's canonical
-      // input (prompt included) and lives in a host-only directory the sandboxed
-      // CLI can neither read nor rebind. Rewriting the prompt here would leave
-      // the stored hash stale, so every later fire fails resolution with
-      // canonical_input_mismatch and the task silently stops forever. Dashboard
-      // edits go through updateTaskWithOptionalPrecondition, which rebinds; the
-      // CLI must refuse instead of reporting success.
-      const bound = scheduleStore.getTask(id);
-      if (bound?.preconditionRef) {
-        throw new Error(`任务 ${id} 绑定了守护前置条件（precondition），CLI 更新会破坏其安全绑定导致任务停止执行；请在 Dashboard 的定时任务页修改提示词。`);
-      }
-      const result = scheduler.updateTask(id, { prompt });
-      if (!result.ok) throw new Error(`无法更新任务 ${id}: ${result.error}`);
+      await detectAuthenticatedCurrentSession();
+      await managedMutation('update', { prompt });
       console.log(`✅ 已更新任务 ${id} 的 prompt；后续执行生效，未触发补跑。`);
       break;
     }
@@ -7906,42 +7939,27 @@ async function cmdSchedule(sub: string, rest: string[]): Promise<void> {
     case 'rm':
     case 'delete':
     case 'del': {
-      let ok = scheduler.removeTask(id);
-      if (!ok && retargetIfElsewhere()) ok = scheduler.removeTask(id);
-      if (ok) console.log(`已删除任务 ${id}`);
-      else { console.error(`未找到任务 ${id}`); process.exit(1); }
+      await managedMutation('remove');
+      console.log(`已删除任务 ${id}`);
       break;
     }
     case 'pause':
     case 'disable': {
-      let ok = scheduler.disableTask(id);
-      if (!ok && retargetIfElsewhere()) ok = scheduler.disableTask(id);
-      if (ok) console.log(`已暂停任务 ${id}`);
-      else { console.error(`未找到任务 ${id}`); process.exit(1); }
+      await managedMutation('pause');
+      console.log(`已暂停任务 ${id}`);
       break;
     }
     case 'resume':
     case 'enable': {
-      let ok = scheduler.enableTask(id);
-      if (!ok && retargetIfElsewhere()) ok = scheduler.enableTask(id);
-      if (ok) console.log(`已恢复任务 ${id}`);
-      else { console.error(`未找到任务 ${id}`); process.exit(1); }
+      await managedMutation('resume');
+      console.log(`已恢复任务 ${id}`);
       break;
     }
     case 'run':
       // Running requires the daemon (executeCallback is daemon-side).
       // CLI can only mark a task to run ASAP; daemon's next tick picks it up.
       {
-        let task = scheduleStore.getTask(id);
-        if (!task && retargetIfElsewhere()) task = scheduleStore.getTask(id);
-        if (!task) { console.error(`未找到任务 ${id}`); process.exit(1); }
-        const requested = scheduleStore.requestRunNow(id);
-        if (!requested.ok) {
-          console.error(requested.error === 'already_running'
-            ? `任务 ${id} 正在运行，未重复触发`
-            : `未找到任务 ${id}`);
-          process.exit(1);
-        }
+        await managedMutation('run');
         console.log(`已标记任务 ${id} 下次 tick 立即执行（< 30s）`);
       }
       break;
@@ -8674,7 +8692,7 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
   }
   const allowedFlags = new Set([
     '--title', '--bot-app', '--chat-id', '--steer',
-    '--brief', '--brief-file', '--session-id',
+    '--brief', '--brief-file', '--session-id', '--delegate', '--no-delegate',
   ]);
   const unsupportedFlags = [...new Set(rest
     .filter(token => token.startsWith('--'))
@@ -8701,7 +8719,7 @@ async function relayDispatch(rest: string[], relayDir: string): Promise<void> {
     brief = readFileSync(briefFile, 'utf8');
   }
   const flags: string[] = [];
-  for (const flag of ['--title', '--bot-app', '--chat-id'] as const) {
+  for (const flag of ['--title', '--bot-app', '--chat-id', '--delegate', '--no-delegate'] as const) {
     for (const value of argValues(rest, flag)) flags.push(flag, value);
   }
   if (rest.includes('--steer')) flags.push('--steer');
@@ -12452,6 +12470,10 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   --brief <text>        子项目简报 / 追加内容；首个语义行写 @steer 可显式调整活跃 Codex App turn
   --brief-file <path>   从文件读取简报
   --steer               在简报前注入通用 @steer 指令；普通 dispatch 默认仍进入 Queue
+  --delegate schedule:create
+                        请求把当前真人回合的 schedule 创建权限委托给目标 Bot 当前派发 turn（需宿主策略开启）
+  --no-delegate schedule:create
+                        本次派发不附带来源 Bot 配置的默认 schedule 创建权限
   --repo <path>         预设子 bot 工作目录（绝对路径，需在子 bot 所在机器上存在）
   --standby             仅 --repo 待命，不派简报
   --into <root_id>      回到已有话题线程追加（与 --title/种子互斥）
@@ -12487,6 +12509,8 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   const steer = dispatchArgs.steer;
   const botSpecs = dispatchArgs.bots;
   const botAppSpecs = dispatchArgs.botApps;
+  const delegateScheduleCreate = dispatchArgs.delegates?.includes('schedule:create') === true;
+  const suppressScheduleCreate = dispatchArgs.noDelegates?.includes('schedule:create') === true;
 
   let brief = dispatchArgs.brief ?? '';
   if (briefFile) {
@@ -12509,6 +12533,22 @@ async function cmdDispatch(rest: string[]): Promise<void> {
   }
   if (standby && steer) {
     console.error('--standby 与 --steer 不能同用（待命模式没有简报可调整当前 turn）。');
+    process.exit(1);
+  }
+  if (dispatchArgs.delegates?.some(value => value !== 'schedule:create')) {
+    console.error('--delegate 当前只支持 schedule:create。');
+    process.exit(1);
+  }
+  if (dispatchArgs.noDelegates?.some(value => value !== 'schedule:create')) {
+    console.error('--no-delegate 当前只支持 schedule:create。');
+    process.exit(1);
+  }
+  if (delegateScheduleCreate && suppressScheduleCreate) {
+    console.error('--delegate schedule:create 与 --no-delegate schedule:create 不能同时使用。');
+    process.exit(1);
+  }
+  if (delegateScheduleCreate && (standby || botSpecs.length > 0 || botAppSpecs.length === 0)) {
+    console.error('--delegate schedule:create 仅支持带 --bot-app 的非 standby 受管派发。');
     process.exit(1);
   }
   if (botAppSpecs.length > 0 && repo) {
@@ -12654,7 +12694,9 @@ async function cmdDispatch(rest: string[]): Promise<void> {
     const response = await postCurrentSessionDaemonRoute({
       path: DISPATCH_USER_DELIVERY_ROUTE, sessionId: sid, larkAppId: appId,
       body: { rootId, chatId: targetChatId, content,
-        targetAppIds: parsedBotApps.map(item => item.appId), hasLegacyBots: legacyBots.length > 0 },
+        targetAppIds: parsedBotApps.map(item => item.appId), hasLegacyBots: legacyBots.length > 0,
+        ...(delegateScheduleCreate ? { delegateScheduleCreate: true } : {}),
+        ...(suppressScheduleCreate ? { suppressScheduleCreate: true } : {}) },
     });
     const result: any = await response.json();
     if (!response.ok || result?.ok !== true || typeof result.messageId !== 'string') {

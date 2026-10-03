@@ -82,6 +82,10 @@ botmux schedule remove <id>    # 删除
 botmux schedule run <id>       # 标记立即执行（< 30 秒内 daemon 会触发）
 \`\`\`
 
+委托创建且宿主启用了 self-management 的任务，在自己的 scheduled turn 内可用
+\`botmux schedule pause self\` 或 \`botmux schedule remove self\` 停止自己。
+\`self\` 不能用于 update/resume/run，也不能指向或管理其他任务。
+
 ## 典型用法
 
 **用户**："每天早上 9 点生成一下昨天的 PR 汇总"
@@ -1462,6 +1466,10 @@ description: 多 bot 长期项目编排。仅当任务同时需要「多个 bot 
 \`\`\`bash
 botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder" --bot "<reviewer_open_id>:名字:reviewer" --repo "<工作目录>" --brief-file /tmp/brief-X.md
 \`\`\`
+若任务明确要求目标 Bot 创建持久定时任务，改用稳定 \`--bot-app\` 派发并显式加
+\`--delegate schedule:create\`；该权限必须由当前真人回合和宿主策略共同批准，
+只允许目标 Bot 在本群创建一个任务，不能转委托。普通派发不要附带此参数。
+
 **简报必须写清子 bot 的「完成协议」**，否则收不齐：
 - 你的飞书任务 ID 是 <task_guid>；
 - 干完用 **lark-task** 把该任务标记完成、并把产出（链接/摘要）挂到任务评论或附件；
