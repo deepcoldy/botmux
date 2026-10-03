@@ -1,3 +1,4 @@
+import type { OutboundMessageOptions } from '../../im/lark/client.js';
 import type {
   HostExecutorRegistry,
   ProviderReconciler,
@@ -10,19 +11,21 @@ import {
 } from './botmux-schedule.js';
 import {
   feishuSendExecutor,
+  createFeishuSendExecutor,
   parseFeishuSendInput,
 } from './feishu-send.js';
 import {
   feishuReplyExecutor,
+  createFeishuReplyExecutor,
   parseFeishuReplyInput,
 } from './feishu-reply.js';
-import { feishuImReconciler } from './feishu-im.js';
+import { feishuImReconciler, createFeishuImReconciler } from './feishu-im.js';
 export type {
   HostExecutorRegistry,
   RegisteredHostExecutor,
 } from '../v3/runtime-host-contract.js';
 
-export function createDefaultHostExecutorRegistry(): HostExecutorRegistry {
+export function createDefaultHostExecutorRegistry(options?: OutboundMessageOptions): HostExecutorRegistry {
   return new Map([
     [
       'botmux-schedule',
@@ -34,23 +37,23 @@ export function createDefaultHostExecutorRegistry(): HostExecutorRegistry {
     [
       'feishu-send',
       {
-        executor: feishuSendExecutor,
+        executor: options ? createFeishuSendExecutor(options) : feishuSendExecutor,
         parseInput: parseFeishuSendInput,
       } satisfies RegisteredHostExecutor,
     ],
     [
       'feishu-reply',
       {
-        executor: feishuReplyExecutor,
+        executor: options ? createFeishuReplyExecutor(options) : feishuReplyExecutor,
         parseInput: parseFeishuReplyInput,
       } satisfies RegisteredHostExecutor,
     ],
   ]);
 }
 
-export function createDefaultProviderReconcilers(): Map<string, ProviderReconciler> {
+export function createDefaultProviderReconcilers(options?: OutboundMessageOptions): Map<string, ProviderReconciler> {
   return new Map([
     [botmuxScheduleReconciler.provider, botmuxScheduleReconciler],
-    [feishuImReconciler.provider, feishuImReconciler],
+    [feishuImReconciler.provider, options ? createFeishuImReconciler(options) : feishuImReconciler],
   ]);
 }

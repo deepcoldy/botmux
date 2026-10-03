@@ -13,7 +13,7 @@ export type SendMessageFn = (
   msgType?: string,
   uuid?: string,
   hookContext?: Record<string, unknown>,
-  options?: { suppressHook?: boolean; beforeHook?: () => void | Promise<void>; hookOrigin?: ManagedHookOrigin },
+  options?: { beforeWrite?: () => void | Promise<void>; suppressHook?: boolean; beforeHook?: () => void | Promise<void>; hookOrigin?: ManagedHookOrigin },
 ) => Promise<string>;
 
 export type ReplyMessageFn = (
@@ -24,7 +24,7 @@ export type ReplyMessageFn = (
   replyInThread?: boolean,
   uuid?: string,
   hookContext?: Record<string, unknown>,
-  options?: { suppressHook?: boolean; beforeHook?: () => void | Promise<void>; hookOrigin?: ManagedHookOrigin },
+  options?: { beforeWrite?: () => void | Promise<void>; suppressHook?: boolean; beforeHook?: () => void | Promise<void>; hookOrigin?: ManagedHookOrigin },
 ) => Promise<string>;
 
 export type DispatchPrimaryDeps = {
@@ -372,6 +372,8 @@ export type DispatchPrimaryOptions = {
   /** Revalidate any side-effect authority after an awaited quote failure and
    * immediately before the fallback creates a top-level message. */
   beforeQuoteFallback?: () => void | Promise<void>;
+  /** Passed into the transport gate, including its queued retries. */
+  beforeWrite?: () => void | Promise<void>;
   /** Revalidate managed authority immediately before each provider call. */
   beforeEffect?: () => void | Promise<void>;
   onQuoteWithdrawn?: (messageId: string) => void;
@@ -396,6 +398,15 @@ export async function dispatchPrimaryMessage(
     };
   }
 
+  const hookOptions = opts.suppressHook
+    ? { suppressHook: true as const }
+    : opts.beforeHook
+      ? {
+          beforeHook: opts.beforeHook,
+          ...(opts.hookOrigin ? { hookOrigin: opts.hookOrigin } : {}),
+        }
+      : undefined;
+  const writeOptions = opts.beforeWrite ? { ...hookOptions, beforeWrite: opts.beforeWrite } : hookOptions;
   try {
     await opts.beforeEffect?.();
     const args = [
@@ -407,16 +418,8 @@ export async function dispatchPrimaryMessage(
       opts.uuid,
       opts.hookContext,
     ] as const;
-    const hookOptions = opts.suppressHook
-      ? { suppressHook: true as const }
-      : opts.beforeHook
-        ? {
-            beforeHook: opts.beforeHook,
-            ...(opts.hookOrigin ? { hookOrigin: opts.hookOrigin } : {}),
-          }
-        : undefined;
-    const messageId = hookOptions
-      ? await deps.replyMessage(...args, hookOptions)
+    const messageId = writeOptions
+      ? await deps.replyMessage(...args, writeOptions)
       : await deps.replyMessage(...args);
     return { messageId, primaryQuotedId: opts.quoteTargetId };
   } catch (err: any) {
@@ -429,37 +432,9 @@ export async function dispatchPrimaryMessage(
       else await opts.beforeEffect?.();
       opts.onQuoteWithdrawn?.(opts.quoteTargetId);
       return {
-        messageId: await (opts.suppressHook
-          ? deps.sendMessage(
-              opts.appId,
-              opts.targetChatId,
-              opts.content,
-              opts.msgType,
-              opts.uuid,
-              opts.hookContext,
-              { suppressHook: true },
-            )
-          : opts.beforeHook
-            ? deps.sendMessage(
-                opts.appId,
-                opts.targetChatId,
-                opts.content,
-                opts.msgType,
-                opts.uuid,
-                opts.hookContext,
-                {
-                  beforeHook: opts.beforeHook,
-                  ...(opts.hookOrigin ? { hookOrigin: opts.hookOrigin } : {}),
-                },
-              )
-            : deps.sendMessage(
-                opts.appId,
-                opts.targetChatId,
-                opts.content,
-                opts.msgType,
-                opts.uuid,
-                opts.hookContext,
-              )),
+        messageId: await (writeOptions
+          ? deps.sendMessage(opts.appId, opts.targetChatId, opts.content, opts.msgType, opts.uuid, opts.hookContext, writeOptions)
+          : deps.sendMessage(opts.appId, opts.targetChatId, opts.content, opts.msgType, opts.uuid, opts.hookContext)),
         primaryQuotedId: null,
       };
     }

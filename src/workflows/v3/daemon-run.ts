@@ -1,3 +1,4 @@
+import { chatBoundWorkflowWriteOptions } from './botmux-host-policy.js';
 /**
  * Daemon-driven v3 run — the Feishu-product execution path (vs `cli-run.ts`'s
  * dev/dogfood terminal path).  Mirrors v0.2's `driveWorkflowRun`, but for the
@@ -868,14 +869,15 @@ export async function driveV3Run(runId: string, deps: V3DaemonRunDeps): Promise<
 
   const runNode = (deps.makeRunNode ?? defaultMakeRunNode)(resolveLarkAppSecret);
   const dag = context.dag;
+  const imWriteOptions = chatBoundWorkflowWriteOptions(context.resolvedWorkflowData);
 
   // suspend mode → no resolveGate (runtime writes the wait + returns awaitingGate).
   const runtimeDeps: V3RuntimeDeps = {
     runNode,
     validateManifest,
     resolveBotSnapshot,
-    hostExecutors: createDefaultHostExecutorRegistry(),
-    hostReconcilers: createDefaultProviderReconcilers(),
+    hostExecutors: createDefaultHostExecutorRegistry(imWriteOptions),
+    hostReconcilers: createDefaultProviderReconcilers(imWriteOptions),
   };
   const opts: V3RuntimeOptions = {
     baseDir,

@@ -1,3 +1,4 @@
+import type { OutboundMessageOptions } from '../../im/lark/client.js';
 import { z } from 'zod';
 
 import { sendMessage, MessageWithdrawnError } from '../../im/lark/client.js';
@@ -37,84 +38,90 @@ export function parseFeishuSendInput(input: unknown): FeishuSendInput {
   return FeishuSendInputSchema.parse(input);
 }
 
-export const feishuSendExecutor: SideEffectingExecutor<FeishuSendInput, FeishuSendOutput> = {
-  provider: 'feishu-im',
-  idempotencyTtlMs: PROVIDER_TTL_MS['feishu-im'],
+export function createFeishuSendExecutor(options?: OutboundMessageOptions): SideEffectingExecutor<FeishuSendInput, FeishuSendOutput> {
+  return {
+    provider: 'feishu-im',
+    idempotencyTtlMs: PROVIDER_TTL_MS['feishu-im'],
 
-  canonicalInput(input) {
-    return {
-      // receive_id + receive_id_type fully identify the destination.  We
-      // pin receive_id_type to 'chat_id' because that's all
-      // `client.sendMessage` supports today; future variants would extend
-      // this canonical shape.
-      receive_id: input.chatId,
-      receive_id_type: 'chat_id',
-      msg_type: input.msgType ?? 'text',
-      content: input.content,
-      // larkAppId is part of "who sends" — different bots writing the
-      // same content to the same chat are distinct effects.
-      larkAppId: input.larkAppId,
-    };
-  },
-
-  async invoke(input, idempotencyKey) {
-    const messageId = await sendMessage(
-      input.larkAppId,
-      input.chatId,
-      input.content,
-      input.msgType ?? 'text',
-      idempotencyKey,
-    );
-    return {
-      output: { messageId },
-      externalRefs: { messageId },
-    };
-  },
-
-  classifyError(err) {
-    return classifyFeishuError(err);
-  },
-};
-
-export const feishuSendReconciler: ProviderReconciler = {
-  provider: 'feishu-im',
-  requiresEffectInput: true,
-
-  canonicalInput(input) {
-    return feishuSendExecutor.canonicalInput(input as FeishuSendInput);
-  },
-
-  async idempotentSubmit(idempotencyKey, input) {
-    let parsed: FeishuSendInput;
-    try {
-      parsed = parseFeishuSendInput(input);
-    } catch (err) {
+    canonicalInput(input) {
       return {
-        ok: false,
-        errorCode: 'InputValidationFailed',
-        errorClass: 'manual',
-        errorMessage: err instanceof Error ? err.message : String(err),
-        evidence: { source: 'idempotentSubmit', reason: 'invalid_effect_input' },
+        // receive_id + receive_id_type fully identify the destination.  We
+        // pin receive_id_type to 'chat_id' because that's all
+        // `client.sendMessage` supports today; future variants would extend
+        // this canonical shape.
+        receive_id: input.chatId,
+        receive_id_type: 'chat_id',
+        msg_type: input.msgType ?? 'text',
+        content: input.content,
+        // larkAppId is part of "who sends" — different bots writing the
+        // same content to the same chat are distinct effects.
+        larkAppId: input.larkAppId,
       };
-    }
+    },
 
-    try {
-      const { externalRefs } = await feishuSendExecutor.invoke(parsed, idempotencyKey);
+    async invoke(input, idempotencyKey) {
+      const args = [input.larkAppId, input.chatId, input.content, input.msgType ?? 'text', idempotencyKey] as const;
+      const messageId = options
+        ? await sendMessage(...args, undefined, options)
+        : await sendMessage(...args);
       return {
-        ok: true,
-        externalRefs,
-        evidence: { source: 'idempotentSubmit', externalRefs },
+        output: { messageId },
+        externalRefs: { messageId },
       };
-    } catch (err) {
-      const classification = classifyFeishuError(err) ?? defaultFeishuClassification(err);
-      return {
-        ok: false,
-        ...classification,
-        evidence: { source: 'idempotentSubmit' },
-      };
-    }
-  },
-};
+    },
+
+    classifyError(err) {
+      return classifyFeishuError(err);
+    },
+  };
+}
+
+export const feishuSendExecutor = createFeishuSendExecutor();
+
+export function createFeishuSendReconciler(options?: OutboundMessageOptions): ProviderReconciler {
+  const executor = createFeishuSendExecutor(options);
+  return {
+    provider: 'feishu-im',
+    requiresEffectInput: true,
+
+    canonicalInput(input) {
+      return executor.canonicalInput(input as FeishuSendInput);
+    },
+
+    async idempotentSubmit(idempotencyKey, input) {
+      let parsed: FeishuSendInput;
+      try {
+        parsed = parseFeishuSendInput(input);
+      } catch (err) {
+        return {
+          ok: false,
+          errorCode: 'InputValidationFailed',
+          errorClass: 'manual',
+          errorMessage: err instanceof Error ? err.message : String(err),
+          evidence: { source: 'idempotentSubmit', reason: 'invalid_effect_input' },
+        };
+      }
+
+      try {
+        const { externalRefs } = await executor.invoke(parsed, idempotencyKey);
+        return {
+          ok: true,
+          externalRefs,
+          evidence: { source: 'idempotentSubmit', externalRefs },
+        };
+      } catch (err) {
+        const classification = classifyFeishuError(err) ?? defaultFeishuClassification(err);
+        return {
+          ok: false,
+          ...classification,
+          evidence: { source: 'idempotentSubmit' },
+        };
+      }
+    },
+  };
+}
+
+export const feishuSendReconciler = createFeishuSendReconciler();
 
 // ─── Error classification (shared with feishu-reply) ────────────────────────
 

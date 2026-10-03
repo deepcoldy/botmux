@@ -958,3 +958,75 @@ describe('superseded turn (type-ahead: next turn starts before the previous one 
     expect(complete![0].params ?? complete![0].data).toMatchObject({ reason: 'error' });
   });
 });
+
+
+describe('CoT stop policy', () => {
+  function stopPolicy() {
+    vi.mocked(getBot).mockReturnValue({ config: { cotEnabled: true, topicUnavailablePolicy: 'stop' } } as any);
+    let unavailable = false;
+    request.mockImplementation(async (req: any) => {
+      if (req.method === 'GET') {
+        const id = req.url.split('/').at(-1);
+        return { code: 0, data: { items: [{ message_id: id, deleted: id === 'om_root1' && unavailable,
+          ...(id === 'om_cot_msg1' ? { root_id: 'om_root1' } : {}) }] } };
+      }
+      if (req.method === 'POST' && req.url === '/open-apis/im/v1/message_cot') {
+        return { code: 0, data: { cot_id: 'cot1', message_id: 'om_cot_msg1' } };
+      }
+      return { code: 0, data: {} };
+    });
+    return (value: boolean) => { unavailable = value; };
+  }
+  it('does not create a thinking bubble for a withdrawn source topic', async () => {
+    const unavailable = stopPolicy(); unavailable(true);
+    const ds = makeDs(); handleCotThinkingUpdate(ds, upd([think('private')]));
+    await vi.waitFor(() => expect(handleCotThinkingUpdate(ds, upd([think('private')]))).toBe(false));
+    expect(request.mock.calls.every(([req]) => req.method === 'GET')).toBe(true);
+    expect(existsSync(orphanDir)).toBe(false);
+  });
+  it('blocks append and completion and retains the marker until the original topic can be observed', async () => {
+    const unavailable = stopPolicy(); const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('first')]));
+    await vi.waitFor(() => expect(pushedEvents().some(e => e.content.delta === 'first')).toBe(true));
+    unavailable(true); request.mockClear();
+    handleCotThinkingUpdate(ds, upd([think('first'), think('second')]));
+    await vi.waitFor(() => expect(handleCotThinkingUpdate(ds, upd([think('first'), think('second')]))).toBe(false));
+    await settleCotMessageForShutdown(ds);
+    expect(request.mock.calls.every(([req]) => req.method === 'GET')).toBe(true);
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(true);
+    await sweepOrphanCotMessages('app1');
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(true);
+    expect(request.mock.calls.every(([req]) => req.method === 'GET')).toBe(true);
+    unavailable(false); request.mockClear(); await sweepOrphanCotMessages('app1');
+    expect(request.mock.calls.filter(([req]) => req.method !== 'GET').map(([req]) => req.method)).toEqual(['PUT', 'POST']);
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
+  });
+  it('does not degrade an unproven thread anchor to a top-level bubble', async () => {
+    stopPolicy(); const ds = makeDs({ session: { rootMessageId: 'unproven-thread' } });
+    handleCotThinkingUpdate(ds, upd([think('private')], 'scheduled'));
+    await vi.waitFor(() => expect(handleCotThinkingUpdate(ds, upd([think('private')], 'scheduled'))).toBe(false));
+    expect(request).not.toHaveBeenCalled();
+  });
+  it('does not consume the recovery marker when a write loses the race after a successful check', async () => {
+    stopPolicy(); const ds = makeDs();
+    handleCotThinkingUpdate(ds, upd([think('first')]));
+    await vi.waitFor(() => expect(pushedEvents().some(e => e.content.delta === 'first')).toBe(true));
+    const original = request.getMockImplementation()!;
+    request.mockImplementation(async (req: any) => req.method === 'GET'
+      ? original(req) : { code: 230011, msg: 'withdrawn' });
+    await settleCotMessageForShutdown(ds);
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(true);
+  });
+
+  it('keeps an orphan marker when the provider reports withdrawal after the root lookup', async () => {
+    stopPolicy(); mkdirSync(orphanDir, { recursive: true });
+    writeFileSync(join(orphanDir, 'cot1.json'), JSON.stringify({ larkAppId: 'app1', cotId: 'cot1', messageId: 'om_cot_msg1' }));
+    const original = request.getMockImplementation()!;
+    request.mockImplementation(async (req: any) => req.method === 'GET'
+      ? original(req) : { code: 230011, msg: 'withdrawn' });
+    await sweepOrphanCotMessages('app1');
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(true);
+    expect(request.mock.calls.filter(([req]) => req.method !== 'GET').map(([req]) => req.method)).toEqual(['PUT']);
+  });
+
+});
