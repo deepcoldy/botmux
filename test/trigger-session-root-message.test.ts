@@ -380,6 +380,27 @@ describe('triggerSessionTurn rootMessageId target', () => {
     expect(activeSessions.get(sessionKey('om_new_topic', APP))?.scope).toBe('thread');
   });
 
+  it('forces an explicit topic seed into its own thread in a regular chat-mode group', async () => {
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockGetBot.mockReturnValue({
+      config: { larkAppId: APP, cliId: 'claude-code', workingDir: '/tmp', groupReplyMode: 'chat' },
+      botName: 'Bot', botOpenId: 'ou_bot',
+    });
+    const incumbent = existingDs({ scope: 'chat' });
+    incumbent.session.rootMessageId = CHAT;
+    const activeSessions = new Map<string, DaemonSession>([[sessionKey(CHAT, APP), incumbent]]);
+    const req = request({ rootMessageId: undefined });
+    req.presentation = { topicMessage: 'Background job' };
+
+    const result = await triggerSessionTurn(req, { larkAppId: APP, activeSessions });
+
+    expect(result).toMatchObject({ ok: true, target: { sessionId: 'sess_new' } });
+    expect(mockSendMessage).toHaveBeenCalledWith(APP, CHAT, 'Background job');
+    expect(mockCreateSession).toHaveBeenCalledWith(CHAT, 'om_new_topic', '[External] alerts', 'group', undefined, { source: 'http' });
+    expect(activeSessions.get(sessionKey(CHAT, APP))).toBe(incumbent);
+    expect(activeSessions.get(sessionKey('om_new_topic', APP))?.scope).toBe('thread');
+  });
+
   it('suppresses the topic seed and keeps a topicless automation session chat-scoped', async () => {
     const req = request({ rootMessageId: undefined });
     req.presentation = { topicMessage: null };

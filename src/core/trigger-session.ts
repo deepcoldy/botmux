@@ -924,6 +924,8 @@ async function triggerSessionTurnAdmitted(
     : buildUntrustedEventPrompt(req, triggerId);
   const prompt = promptForSession();
   const topicMessage = buildExternalEventTopicMessage(req, larkAppId);
+  const hasExplicitTopicMessage = typeof req.presentation?.topicMessage === 'string'
+    && req.presentation.topicMessage.trim().length > 0;
   const codexAppText = buildExternalEventVisibleText(req, larkAppId);
   const codexAppApplicationContext = buildExternalEventApplicationContext(req);
   const codexAppMessageContext = buildExternalEventDataContext(req, triggerId);
@@ -1205,6 +1207,7 @@ async function triggerSessionTurnAdmitted(
   // it always routes to that thread anchor after daemon-side chat ownership check.
   const regularGroupMode: ChatReplyMode = httpVirtual ? 'chat' : resolveRegularGroupMode(larkAppId, chatId);
   if (!ds && !req.target.sessionId && !rootMessageId && !httpVirtual
+      && !hasExplicitTopicMessage
       && (regularGroupMode !== 'new-topic' || topicMessage === null)) {
     ds = deps.activeSessions.get(sessionKey(chatId, larkAppId));
   }
@@ -1695,7 +1698,7 @@ async function triggerSessionTurnAdmitted(
   let anchor = rootMessageId || chatId;
   const shouldOpenOwnTopic = !rootMessageId
     && !httpVirtual
-    && externalEventOpensOwnTopic(chatMode, regularGroupMode);
+    && (hasExplicitTopicMessage || externalEventOpensOwnTopic(chatMode, regularGroupMode));
   if (shouldOpenOwnTopic && topicMessage !== null) {
     anchor = await sendMessage(larkAppId, chatId, topicMessage);
     scope = 'thread';
