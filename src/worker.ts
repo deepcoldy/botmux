@@ -103,7 +103,7 @@ import {
   READ_ONLY_REMOTE_SCROLL_WINDOW_MS,
   ReadOnlyRemoteScrollLimiter,
 } from './utils/web-terminal-scroll.js';
-import { aidenCodexResumeNeedsRedraw, CodexUpdateDialogGuard, codexUpdateDialogSafeKeys } from './utils/codex-update-dialog.js';
+import { aidenCodexResumeNeedsRedraw, CodexUpdateDialogGuard, dismissCodexUpdatePicker } from './utils/codex-update-dialog.js';
 import { EffortConfirmDialogGuard, isEffortLevelCommand } from './utils/effort-confirm-dialog.js';
 import { installStdioEpipeGuard, isIgnorableStreamError } from './utils/stdio-epipe-guard.js';
 import { resolveDarwinCodexCaBundle } from './utils/darwin-ca-bundle.js';
@@ -10137,6 +10137,7 @@ const AIDEN_CODEX_UPDATE_MAX_ATTEMPTS = 3;
 let aidenCodexUpdateLastActionAt = 0;
 let aidenCodexUpdateAttempts = 0;
 let aidenCodexUpdateLimitNotified = false;
+let aidenCodexUpdateRecovering = false;
 // Auto-confirm Claude Code's mid-session "Change effort level?" Yes/No dialog.
 // Armed only by botmux's own `/effort <level>` passthrough (see deliverRawInput)
 // and disarmed on match, timeout, or CLI respawn — never inspects idle screens.
@@ -10190,6 +10191,7 @@ function dismissAidenCodexUpdateDialog(data: string, source: 'stream' | 'screen'
   // Cancel any ready match from an earlier partial menu redraw before it can
   // flush the first queued Lark message into the picker.
   idleDetector?.reset();
+  if (aidenCodexUpdateRecovering) return true;
   if (aidenCodexUpdateAttempts >= AIDEN_CODEX_UPDATE_MAX_ATTEMPTS) {
     if (source === 'screen' && !aidenCodexUpdateLimitNotified) {
       aidenCodexUpdateLimitNotified = true;
@@ -10202,28 +10204,32 @@ function dismissAidenCodexUpdateDialog(data: string, source: 'stream' | 'screen'
     }
     return true;
   }
-
-  const keys = codexUpdateDialogSafeKeys(data);
-  if (!keys || Date.now() - aidenCodexUpdateLastActionAt < AIDEN_CODEX_UPDATE_RETRY_MS) return true;
-
-  aidenCodexUpdateLastActionAt = Date.now();
+  if (Date.now() - aidenCodexUpdateLastActionAt < AIDEN_CODEX_UPDATE_RETRY_MS) return true;
+  const target = backend;
+  const generation = cliSpawnGeneration;
+  if (!target) return true;
+  aidenCodexUpdateRecovering = true;
   let delivered = false;
-  try {
-    if (backend && 'sendSpecialKeys' in backend) {
-      delivered = (backend as any).sendSpecialKeys(...keys) !== false;
-    } else {
-      const input = keys.map(key => key === 'Down' ? '\x1b[B' : key === 'Up' ? '\x1b[A' : '\r').join('');
-      delivered = backend?.write(input) === true;
-    }
-  } catch (error) {
-    log(`Codex startup update dialog navigation failed; will retry: ${error instanceof Error ? error.message : String(error)}`);
-  }
-  if (!delivered) {
-    aidenCodexUpdateLastActionAt = 0;
-    return true;
-  }
-  aidenCodexUpdateAttempts += 1;
-  log(`Codex startup update dialog detected behind Aiden, selecting the non-upgrade option (${keys.join('+')}, attempt ${aidenCodexUpdateAttempts}/${AIDEN_CODEX_UPDATE_MAX_ATTEMPTS})...`);
+  aidenCodexUpdateLastActionAt = Date.now();
+  // Retain fresh-viewport confirmation: never batch navigation and Enter.
+  void dismissCodexUpdatePicker({
+    isCurrent: () => backend === target && cliSpawnGeneration === generation && awaitingFirstPrompt,
+    capture: () => captureBackendScreen(target),
+    send: key => {
+      const accepted = 'sendSpecialKeys' in target
+        ? (target as any).sendSpecialKeys(key) !== false
+        : target.write(key === 'Down' ? '\x1b[B' : '\r') === true;
+      if (accepted && !delivered) {
+        delivered = true;
+        aidenCodexUpdateAttempts += 1;
+      }
+      return accepted;
+    },
+  }).then(result => log(`Codex startup update dialog recovery: ${result}`))
+    .catch(error => log(`Codex startup update dialog recovery failed: ${error instanceof Error ? error.message : String(error)}`))
+    .finally(() => {
+      if (backend === target && cliSpawnGeneration === generation) aidenCodexUpdateRecovering = false;
+    });
   return true;
 }
 
@@ -18701,6 +18707,7 @@ function killCli(opts: {
   aidenCodexUpdateLastActionAt = 0;
   aidenCodexUpdateAttempts = 0;
   aidenCodexUpdateLimitNotified = false;
+  aidenCodexUpdateRecovering = false;
   disarmEffortConfirm();
   appRunnerControlDecoder.reset();
 }
