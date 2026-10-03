@@ -1879,6 +1879,8 @@ export interface ModelFallbackState {
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
   | { type: 'worker_ipc_ready' }
+  /** An interruption adopted an executing turn; retain its output visibility. */
+  | { type: 'active_turn_envelope_changed'; previousTurnId: string; turnId: string }
   | {
       type: 'ready';
       /** Bound Web Terminal port, or 0 when the worker is ready but this

@@ -3513,6 +3513,32 @@ describe('Worker turn_terminal routing', () => {
     expect(sessionReply.mock.calls[0][1]).toBe('ordinary notice');
   });
 
+  it('keeps an internal receipt private after human interruption while preserving progress and later replies', async () => {
+    const ds = makeDs();
+    ds.suppressedTriggerFinalTurns = new Map([['trg_background', Date.now()]]);
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+    const emit = (msg: WorkerToDaemon) => (ds.worker as any).emit('message', msg);
+
+    emit({ type: 'active_turn_envelope_changed', previousTurnId: 'trg_background', turnId: 'om_human_update' });
+    emit({ type: 'active_turn_envelope_changed', previousTurnId: 'om_human_update', turnId: 'om_second_update' });
+    const receipt = 'TASK_RESULT {"status":"completed"}';
+    emit({ type: 'final_output', sessionId: ds.session.sessionId,
+      content: receipt, lastUuid: 'private-receipt', turnId: 'om_second_update' });
+    await Promise.resolve();
+    expect(sessionReply).not.toHaveBeenCalled();
+
+    emit({ type: 'user_notify', message: 'Background task completed', turnId: 'om_second_update' });
+    await Promise.resolve();
+    expect(sessionReply).toHaveBeenCalledTimes(1);
+    emit({ type: 'final_output', sessionId: ds.session.sessionId,
+      content: 'Answer to a later question', lastUuid: 'later-answer', turnId: 'om_later_question' });
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledTimes(2));
+    expect(sessionReply.mock.calls[1][1]).toContain('Answer to a later question');
+    expect(sessionReply.mock.calls.some(call => String(call[1]).includes('TASK_RESULT'))).toBe(false);
+  });
+
   it('drops only the final_output of a suppressed trigger turn while other turns and its aux UI stay loud', async () => {
     const ds = makeDs();
     // A loud connector opted into suppressFinalOutput; trigger-session armed this

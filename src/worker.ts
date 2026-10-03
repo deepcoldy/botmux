@@ -3259,7 +3259,10 @@ let currentBotmuxTurnId: string | undefined;
 let currentBotmuxDispatchAttempt: number | undefined;
 let currentVcMeetingImTurnOrigin: VcMeetingImTurnOrigin | undefined;
 let durableTurnInFlight = false;
-const activeTurnAuthority = new ActiveTurnAuthority();
+const activeTurnAuthority = new ActiveTurnAuthority((previousTurnId, turnId) => {
+  // Ordered IPC reaches the daemon before any output attributed to the steer.
+  send({ type: 'active_turn_envelope_changed', previousTurnId, turnId });
+});
 
 function turnAuthorityIdentity(input: {
   turnId?: string;
