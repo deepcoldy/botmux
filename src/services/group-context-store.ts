@@ -51,6 +51,12 @@ export interface GroupContextMessageInput {
   text: string;
   /** 毫秒时间戳。 */
   createTime: number;
+  /**
+   * 平台给出的最后编辑时间（ms）。只在平台真有这个值时填，没有就留空、**不伪造**。
+   * 双方都带版本时，store 用它拒绝更旧的正文（乱序编辑 / 过期回填）；任一方没有则无法
+   * 消歧，按到达顺序追加。
+   */
+  updateTime?: number;
   /** 附件只存引用，不存内容。 */
   resourceRefs: GroupContextResourceRef[];
   /** 观察视角：是哪个 app 看到的这条消息。 */
@@ -135,7 +141,7 @@ const DEFAULT_LIST_LIMIT = 200;
 const MAX_LIST_LIMIT = 2000;
 /** 每多少次插入做一次自动淘汰检查（淘汰本身也会按阈值判断，这里只是省掉每次都 COUNT）。 */
 const AUTO_PRUNE_EVERY = 64;
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 interface AppHandle {
   db: DatabaseSyncLike;
@@ -226,6 +232,14 @@ function migrate(db: DatabaseSyncLike): void {
         PRAGMA user_version=1;
       `);
     }
+    const afterV1 = Number((db.prepare('PRAGMA user_version').get() as any)?.user_version ?? 0);
+    if (afterV1 < 2) {
+      // v2：平台编辑时间，用于拒绝更旧版本的正文。旧库补列，历史行保持 NULL（= 未知版本）。
+      db.exec(`
+        ALTER TABLE messages ADD COLUMN update_time INTEGER;
+        PRAGMA user_version=2;
+      `);
+    }
     db.exec('COMMIT;');
   } catch (err) {
     try { db.exec('ROLLBACK;'); } catch { /* ignore */ }
@@ -267,6 +281,7 @@ function rowToRecord(row: any, latestRevision: number): GroupContextMessageRecor
     msgType: row.msg_type,
     text: row.text,
     createTime: Number(row.create_time),
+    updateTime: row.update_time == null ? undefined : Number(row.update_time),
     resourceRefs,
     sourceAppId: row.source_app_id,
     deleted: Number(row.deleted) === 1,
@@ -276,7 +291,13 @@ function rowToRecord(row: any, latestRevision: number): GroupContextMessageRecor
   };
 }
 
-/** 只补空缺的元数据（senderName / rootId / threadId / parentId），不改正文、不改 seq。 */
+/** 平台版本号：只接受正数毫秒时间戳，其它一律当「未知」。 */
+function normalizeVersion(value: unknown): number | undefined {
+  const n = Math.trunc(Number(value));
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+/** 只补空缺的元数据（senderName / rootId / threadId / parentId / update_time），不改正文、不改 seq。 */
 function enrichLatestRow(db: DatabaseSyncLike, prev: any, incoming: GroupContextMessageInput): void {
   const sets: string[] = [];
   const params: unknown[] = [];
@@ -290,6 +311,13 @@ function enrichLatestRow(db: DatabaseSyncLike, prev: any, incoming: GroupContext
   fill('root_id', prev.root_id, incoming.rootId);
   fill('thread_id', prev.thread_id, incoming.threadId);
   fill('parent_id', prev.parent_id, incoming.parentId);
+  // 版本号只补空缺或往前推，绝不回退（同正文而版本更新 = 平台记了一次无文本变化的编辑）。
+  const incomingVersion = normalizeVersion(incoming.updateTime);
+  const prevVersion = normalizeVersion(prev.update_time);
+  if (incomingVersion !== undefined && (prevVersion === undefined || incomingVersion > prevVersion)) {
+    sets.push('update_time = ?');
+    params.push(incomingVersion);
+  }
   if (sets.length === 0) return;
   params.push(Number(prev.seq));
   db.prepare(`UPDATE messages SET ${sets.join(', ')} WHERE seq = ?`).run(...params);
@@ -320,11 +348,16 @@ export function upsertGroupContextMessage(
   db.exec('BEGIN IMMEDIATE;');
   try {
     const prev = latestRow(db, chatId, messageId);
-    if (prev && (prev.content_hash === hash || (Number(prev.deleted) === 1 && !message.deleted))) {
-      // 两种情况都不分配新 seq：
+    const incomingVersion = normalizeVersion(message.updateTime);
+    const prevVersion = prev ? normalizeVersion(prev.update_time) : undefined;
+    const staleVersion = incomingVersion !== undefined && prevVersion !== undefined && incomingVersion < prevVersion;
+    if (prev && (prev.content_hash === hash || (Number(prev.deleted) === 1 && !message.deleted) || staleVersion)) {
+      // 三种情况都不分配新 seq：
       //  a) 同正文重复（飞书重推 / history 回填与实时事件重叠）；
       //  b) 已有 tombstone，又来了一条「未删除」形态（history 旧数据、乱序到达的原消息）——
-      //     撤回是终态，绝不被旧数据复活。
+      //     撤回是终态，绝不被旧数据复活；
+      //  c) 双方都带平台 update_time 且来的这条更旧（乱序编辑 / 过期回填）——拒绝回退正文。
+      //     任一方没有版本号就无法消歧，不走这里，按到达顺序追加（不伪造版本）。
       // 但 history 回填可能带来实时事件缺的元数据（senderName、root/thread/parent），
       // 原地补全到最新 revision 上，不制造无意义 revision。
       enrichLatestRow(db, prev, message);
@@ -335,14 +368,15 @@ export function upsertGroupContextMessage(
     const res = db.prepare(`
       INSERT INTO messages (
         chat_id, message_id, revision, root_id, thread_id, parent_id,
-        sender_id, sender_type, sender_name, msg_type, text, create_time,
+        sender_id, sender_type, sender_name, msg_type, text, create_time, update_time,
         resource_refs, source_app_id, deleted, deleted_at, content_hash, observed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       chatId, messageId, revision,
       message.rootId || null, message.threadId || null, message.parentId || null,
       message.senderId ?? '', message.senderType ?? 'unknown', message.senderName ?? null,
       message.msgType ?? 'unknown', message.text ?? '', Math.trunc(Number(message.createTime) || 0),
+      incomingVersion ?? null,
       JSON.stringify(message.resourceRefs ?? []), message.sourceAppId ?? larkAppId,
       message.deleted ? 1 : 0, message.deletedAt ?? null, hash, now,
     );

@@ -98,6 +98,9 @@ export function normalizeGroupContextEvent(larkAppId: string, data: any): GroupC
   const senderType = normalizeSenderType(sender?.sender_type);
   const msgType: string = typeof message.message_type === 'string' ? message.message_type : 'unknown';
   const createTime = Math.trunc(Number(message.create_time) || 0);
+  // 平台给了 update_time 才填（编辑事件 / history 带），没有就留空，不拿 create_time 冒充。
+  const updateTimeRaw = Math.trunc(Number(message.update_time));
+  const updateTime = Number.isFinite(updateTimeRaw) && updateTimeRaw > 0 ? updateTimeRaw : undefined;
 
   let text = '';
   let resourceRefs: GroupContextMessageInput['resourceRefs'] = [];
@@ -125,6 +128,7 @@ export function normalizeGroupContextEvent(larkAppId: string, data: any): GroupC
     msgType,
     text,
     createTime,
+    ...(updateTime !== undefined ? { updateTime } : {}),
     resourceRefs,
     sourceAppId: larkAppId,
   };

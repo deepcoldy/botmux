@@ -133,6 +133,23 @@ describe('写入', () => {
     expect(getGroupContextMessage(APP, CHAT, 'om_1')?.senderType).toBe('unknown');
   });
 
+  it('message.update_time 有值才记 updateTime；没有不伪造', () => {
+    ingestGroupContextEvent(APP, event({ messageId: 'om_u1' }));
+    expect(getGroupContextMessage(APP, CHAT, 'om_u1')?.updateTime).toBeUndefined();
+    const e = event({ messageId: 'om_u2', text: 'edited' });
+    (e.message as any).update_time = '1700000000999';
+    ingestGroupContextEvent(APP, e);
+    expect(getGroupContextMessage(APP, CHAT, 'om_u2')?.updateTime).toBe(1700000000999);
+  });
+
+  it('带版本的乱序编辑：更旧的 update_time 不覆盖本地已有的新版本', () => {
+    const newer = event({ messageId: 'om_e', text: 'v1' }); (newer.message as any).update_time = '200';
+    const older = event({ messageId: 'om_e', text: 'v0' }); (older.message as any).update_time = '100';
+    expect(ingestGroupContextEvent(APP, newer)).toBe('stored');
+    expect(ingestGroupContextEvent(APP, older)).toBe('duplicate');
+    expect(getGroupContextMessage(APP, CHAT, 'om_e')).toMatchObject({ text: 'v1', revision: 0 });
+  });
+
   it('话题回复保留 rootId / threadId', () => {
     ingestGroupContextEvent(APP, event({ rootId: 'om_root', threadId: 'omt_1' }));
     expect(getGroupContextMessage(APP, CHAT, 'om_1')).toMatchObject({ rootId: 'om_root', threadId: 'omt_1' });

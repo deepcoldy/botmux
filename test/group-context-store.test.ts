@@ -166,6 +166,96 @@ describe('history 回填与实时事件的交错', () => {
   });
 });
 
+describe('平台 update_time 版本：乱序编辑', () => {
+  it('实时先到 v1(200)，history 后回填 v0(100)：拒绝回退，最新仍是 v1，不加行', () => {
+    const v1 = upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'v1', updateTime: 200 }));
+    const stale = upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'v0', updateTime: 100, senderName: 'Alex' }));
+    expect(stale.inserted).toBe(false);
+    expect(stale.seq).toBe(v1.seq);
+    const row = getGroupContextMessage(APP, CHAT, 'om_1');
+    expect(row).toMatchObject({ text: 'v1', revision: 0, updateTime: 200, senderName: 'Alex' });
+    expect(getGroupContextHead(APP, CHAT).count).toBe(1);
+  });
+
+  it('正序 v0(100) → v1(200)：正常追加 revision，updateTime 落库', () => {
+    upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'v0', updateTime: 100 }));
+    const r = upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'v1', updateTime: 200 }));
+    expect(r.inserted).toBe(true);
+    expect(getGroupContextMessage(APP, CHAT, 'om_1')).toMatchObject({ text: 'v1', revision: 1, updateTime: 200 });
+    expect(listGroupContextMessages(APP, CHAT).messages.map(m => [m.text, m.updateTime])).toEqual([['v0', 100], ['v1', 200]]);
+  });
+
+  it('任一方没有版本号：无法消歧，按到达顺序追加（不伪造版本）', () => {
+    upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'v1', updateTime: 200 }));
+    const r = upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'v0' }));
+    expect(r.inserted).toBe(true);
+    expect(getGroupContextMessage(APP, CHAT, 'om_1')).toMatchObject({ text: 'v0', revision: 1, updateTime: undefined });
+    upsertGroupContextMessage(APP, msg({ messageId: 'om_2', text: 'a' }));
+    const r2 = upsertGroupContextMessage(APP, msg({ messageId: 'om_2', text: 'b', updateTime: 50 }));
+    expect(r2.inserted).toBe(true);
+  });
+
+  it('同正文同版本：不加行；同正文更新版本：只把 update_time 往前推，不回退', () => {
+    const a = upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'x', updateTime: 100 }));
+    expect(upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'x', updateTime: 100 })).inserted).toBe(false);
+    expect(upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'x', updateTime: 300 })).inserted).toBe(false);
+    expect(getGroupContextMessage(APP, CHAT, 'om_1')).toMatchObject({ seq: a.seq, updateTime: 300 });
+    expect(upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'x', updateTime: 150 })).inserted).toBe(false);
+    expect(getGroupContextMessage(APP, CHAT, 'om_1')?.updateTime).toBe(300);
+    // 实时无版本、history 带版本：补空缺
+    upsertGroupContextMessage(APP, msg({ messageId: 'om_2', text: 'y' }));
+    upsertGroupContextMessage(APP, msg({ messageId: 'om_2', text: 'y', updateTime: 500 }));
+    expect(getGroupContextMessage(APP, CHAT, 'om_2')?.updateTime).toBe(500);
+    expect(getGroupContextHead(APP, CHAT).count).toBe(2);
+  });
+
+  it('非法版本号（0 / 负数 / NaN）按未知处理', () => {
+    upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'v1', updateTime: 200 }));
+    const r = upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'v0', updateTime: 0 }));
+    expect(r.inserted).toBe(true);
+    expect(getGroupContextMessage(APP, CHAT, 'om_1')?.updateTime).toBeUndefined();
+  });
+
+  it('tombstone 仍是终态：带更新版本号的未删除形态也不能复活', () => {
+    upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'bye', updateTime: 100 }));
+    markGroupContextMessageDeleted(APP, CHAT, 'om_1', { deletedAt: 5 });
+    expect(upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'bye edited', updateTime: 900 })).inserted).toBe(false);
+    expect(getGroupContextMessage(APP, CHAT, 'om_1')?.deleted).toBe(true);
+  });
+});
+
+describe('schema 迁移', () => {
+  it('v1 库（无 update_time 列）打开后自动补列，旧行 updateTime 为未知', async () => {
+    const { openDatabaseSyncOrThrow } = await import('../src/services/sqlite-compat.js');
+    const { mkdirSync } = await import('node:fs');
+    const { dirname } = await import('node:path');
+    const path = groupContextDbPath(APP);
+    mkdirSync(dirname(path), { recursive: true });
+    const db = openDatabaseSyncOrThrow(path);
+    db.exec(`
+      CREATE TABLE messages (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT NOT NULL, message_id TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 0, root_id TEXT, thread_id TEXT, parent_id TEXT,
+        sender_id TEXT NOT NULL, sender_type TEXT NOT NULL, sender_name TEXT, msg_type TEXT NOT NULL,
+        text TEXT NOT NULL, create_time INTEGER NOT NULL, resource_refs TEXT NOT NULL DEFAULT '[]',
+        source_app_id TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0, deleted_at INTEGER,
+        content_hash TEXT NOT NULL, observed_at INTEGER NOT NULL
+      );
+      CREATE UNIQUE INDEX ux_messages_chat_msg_rev ON messages(chat_id, message_id, revision);
+      CREATE TABLE chat_meta (chat_id TEXT PRIMARY KEY, pruned_through_seq INTEGER NOT NULL DEFAULT 0, pruned_count INTEGER NOT NULL DEFAULT 0);
+      INSERT INTO messages (chat_id, message_id, revision, sender_id, sender_type, msg_type, text, create_time, source_app_id, content_hash, observed_at)
+        VALUES ('${CHAT}', 'om_old', 0, 'ou_x', 'user', 'text', 'legacy', 1, '${APP}', 'h', 1);
+      PRAGMA user_version=1;
+    `);
+    db.close();
+    const row = getGroupContextMessage(APP, CHAT, 'om_old');
+    expect(row).toMatchObject({ text: 'legacy', updateTime: undefined });
+    const r = upsertGroupContextMessage(APP, msg({ messageId: 'om_old', text: 'edited', updateTime: 42 }));
+    expect(r.inserted).toBe(true);
+    expect(getGroupContextMessage(APP, CHAT, 'om_old')).toMatchObject({ text: 'edited', updateTime: 42 });
+  });
+});
+
 describe('tombstone（撤回/删除）', () => {
   it('撤回后 history 旧数据 / 乱序到达的原消息不能复活 tombstone', () => {
     upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'bye' }));
