@@ -251,10 +251,6 @@ describe('SQLite durable coordination contract', () => {
     expect(await store.readOutbox('message-ambiguous')).toMatchObject({
       state: 'ambiguous', attempts: 1, lastError: 'delivery attempt lease expired before receipt',
     });
-    expect(await store.retryOutboxAttempt({
-      attempt: begun.attempt, visibleAt: 20, error: 'late retry classification',
-    })).toEqual({ kind: 'stale' });
-
     // Exact delayed receipt may still settle the same attempt. A different claim epoch cannot.
     now = 13;
     expect(await store.completeOutboxAttempt({

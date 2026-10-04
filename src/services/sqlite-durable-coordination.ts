@@ -645,9 +645,9 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
     state: 'pending' | 'ambiguous' | 'delivered',
     options: { visibleAt?: number; receiptJson?: string; error?: string },
   ): OutboxMutationResult {
-    const eligibleState = state === 'delivered'
-      ? "state IN ('attempting', 'ambiguous')"
-      : "state = 'attempting'";
+    // Re-opening an ambiguous attempt is an explicit reconciliation action by
+    // the trusted caller. The automatic pump never invokes this transition.
+    const eligibleState = "state IN ('attempting', 'ambiguous')";
     const result = this.db.prepare(
       `UPDATE durable_outbox
           SET state = ?, visible_at = COALESCE(?, visible_at),
