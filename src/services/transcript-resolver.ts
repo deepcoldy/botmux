@@ -12,6 +12,7 @@ import { config } from '../config.js';
 import { scratchViewPath, persistedScratchMappings, type ScratchPathMapping } from './scratch-host-view.js';
 import { cocoEventsPathForSession } from './coco-transcript.js';
 import { findCursorTranscriptByChatId } from './cursor-transcript.js';
+import { antigravityTranscriptPath } from './antigravity-transcript.js';
 import { findTraexRolloutBySessionId, findTraexSessionIdByBotmuxSessionId } from './traex-transcript.js';
 import { findPiTranscriptBySessionId } from './pi-transcript.js';
 import { findGrokUpdatesBySessionId } from './grok-transcript.js';
@@ -432,14 +433,13 @@ export function resolveSessionTranscriptPath(q: TranscriptPathQuery): ResolvedTr
       return path ? { path, kind: 'pi' } : null;
     }
     case 'antigravity': {
-      // Validate the CLI session id before interpolating it into a path (every
-      // other branch resolves by scanning a data dir; this one builds the path
-      // directly). Conservative charset rules out traversal / separators, and
-      // existsSync keeps the null-when-absent contract the other branches honor.
-      if (!q.cliSessionId || !/^[A-Za-z0-9._-]+$/.test(q.cliSessionId)) return null;
-      const pReal = join(homedir(), '.gemini', 'antigravity-cli', 'brain', q.cliSessionId, '.system_generated', 'logs', 'transcript.jsonl');
-      const p = v(pReal);
-      return existsSync(p) ? { path: p, kind: 'antigravity' } : null;
+      // The conversation id is interpolated into the brain path; the helper
+      // validates the charset (traversal / separators). Read it through the
+      // per-session scratch overlay like every other host-derived root, and
+      // existsSync keeps the null-when-absent contract every branch honors.
+      const pReal = antigravityTranscriptPath(q.cliSessionId);
+      const p = pReal ? v(pReal) : null;
+      return p && existsSync(p) ? { path: p, kind: 'antigravity' } : null;
     }
     default:
       return null;

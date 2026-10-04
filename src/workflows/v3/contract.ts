@@ -154,6 +154,7 @@ export function isV3SupportedCli(cliId: CliId): boolean {
  * fully-hermetic replay we can revisit, but not at the cost of secrets on disk.
  */
 export interface BotSnapshot {
+  envPolicy?: import('../../core/env-policy.js').EnvPolicy;
   cliInstanceBinding?: import('../../services/codex-instance-pool.js').SessionCliInstanceBindingV1;
   cliRuntime?: import('../../adapters/cli/runtime.js').CliRuntimeSnapshot;
   larkAppId: string;
@@ -174,6 +175,7 @@ export interface BotSnapshot {
   sandboxHidePaths?: string[];
   sandboxReadonlyPaths?: string[];
   sandboxNetwork?: boolean;
+  sandboxNetworkPolicy?: import('../../core/sandbox-network-policy.js').SandboxNetworkPolicy;
   /** The resolved working directory for this run. */
   workingDir: string;
 }

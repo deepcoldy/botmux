@@ -2784,3 +2784,17 @@ describe('parseBotConfigsFromText — askOptionLayout 冷读', () => {
     expect(mod.loadBotConfigAtIndex(0).askOptionLayout).toBe('vertical');
   });
 });
+
+
+describe('network policy configuration loading', () => {
+  it('rejects invalid handwritten policy without dropping it', async () => {
+    const mod = await freshImport();
+    expect(() => mod.parseBotConfigsFromText(JSON.stringify([makeCfg({ sandboxNetworkPolicy: { version: 1, public: { mode: 'allow' }, private: { mode: 'typo' } } })]))).toThrow();
+  });
+  it('normalizes a valid policy and preserves legacy false independently', async () => {
+    const mod = await freshImport();
+    const [config] = mod.parseBotConfigsFromText(JSON.stringify([makeCfg({ sandbox: true, sandboxNetwork: false, sandboxNetworkPolicy: { version: 1, public: { mode: 'allowlist', rules: [{ cidr: '8.8.8.8' }] }, private: { mode: 'block' } } })]));
+    expect(config.sandboxNetwork).toBe(false);
+    expect(config.sandboxNetworkPolicy!.public.rules![0]!.cidr).toBe('8.8.8.8/32');
+  });
+});

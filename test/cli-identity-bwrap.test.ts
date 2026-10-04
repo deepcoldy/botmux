@@ -24,7 +24,12 @@ import {
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { buildFsPolicy, compileToBwrap } from '../src/adapters/cli/fs-policy.js';
-import { sessionIdentityBinDir, sessionIdentityPath, writeSessionIdentity } from '../src/core/cli-identity.js';
+import {
+  ensureSessionIdentityPlaceholders,
+  sessionIdentityBinDir,
+  sessionIdentityPath,
+  writeSessionIdentity,
+} from '../src/core/cli-identity.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
 
 const USRMERGE = ['/bin', '/lib', '/lib64', '/sbin', '/lib32', '/libx32'];
@@ -79,6 +84,7 @@ function compileIdentityPolicy(): IdentityPolicyHarness {
   }
 
   const sessionId = 'sess-live';
+  ensureSessionIdentityPlaceholders(dataDir, sessionId, ['lark-cli', 'bytedcli']);
   const identityPath = writeSessionIdentity(dataDir, sessionId, {
     tool: 'lark-cli', appId: 'cli_app', userAccessToken: 'token-first',
   });

@@ -20,6 +20,8 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import { basename, dirname } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+// Command assertions use the bare name whether or not this host has herdr on PATH.
+vi.mock('../src/utils/herdr-executable.js', () => ({ herdrExecutable: () => 'herdr' }));
 vi.mock('node:child_process', () => ({
   execFileSync: vi.fn(),
   spawn: vi.fn(),
@@ -31,7 +33,7 @@ vi.mock('node-pty', () => ({
 
 import { execFileSync, spawn } from 'node:child_process';
 import * as pty from 'node-pty';
-import { HerdrBackend } from '../src/adapters/backend/herdr-backend.js';
+import { HerdrBackend, __testOnly_resetHerdrAgentWaitProbe } from '../src/adapters/backend/herdr-backend.js';
 
 const mockedExecFileSync = vi.mocked(execFileSync);
 const mockedSpawn = vi.mocked(spawn);
@@ -178,6 +180,7 @@ function setManagedLaunchResponses(kind: string, overrides: HerdrResponseHandler
 }
 
 beforeEach(() => {
+  __testOnly_resetHerdrAgentWaitProbe();
   mockedExecFileSync.mockReset();
   mockedSpawn.mockReset();
   mockedPtySpawn.mockReset();
@@ -812,6 +815,37 @@ describe('HerdrBackend.spawn', () => {
     be.kill();
   });
 
+  it('launchedNewCli is true only when spawn() launched the CLI itself', () => {
+    // The worker's startup guard keys on this: a freshly launched CLI may be
+    // reported idle while still booting, but a re-attached or adopted CLI was
+    // already running, so its first Herdr status stays authoritative.
+    setManagedLaunchResponses('claude');
+    const fresh = new HerdrBackend(SESSION);
+    expect(fresh.launchedNewCli).toBe(false);
+    fresh.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    expect(fresh.launchedNewCli).toBe(true);
+    fresh.kill();
+
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('agent') && a.includes('list'), reply: () => AGENT_LIST_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('') },
+    ]);
+    const reattached = new HerdrBackend(SESSION, { isReattach: true });
+    reattached.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    expect(reattached.isReattach).toBe(true);
+    expect(reattached.launchedNewCli).toBe(false);
+    reattached.kill();
+
+    const adopted = new HerdrBackend(SESSION, {
+      externalTarget: { sessionName: SESSION, target: '1-1', paneId: '1-1' },
+    });
+    adopted.spawn('', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    expect(adopted.launchedNewCli).toBe(false);
+    adopted.kill();
+  });
+
   it('external target adopt: uses externalTarget paneId, never spawns server or agent', () => {
     setHerdrResponses([
       { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
@@ -1223,6 +1257,49 @@ describe('HerdrBackend callbacks', () => {
     be.kill();
   });
 
+  it('backs an unchanged pane off to 5 s and returns to 500 ms on new output or input', () => {
+    let paneText = 'idle';
+    setHerdrResponses([
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('agent') && a.includes('list'), reply: () => AGENT_LIST_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY(paneText) },
+    ]);
+    vi.useFakeTimers();
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const seen: string[] = [];
+    be.onData(d => seen.push(d));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+    const reads = () => mockedExecFileSync.mock.calls.filter(call => (call[1] as string[]).includes('read')).length;
+
+    // Six unchanged polls at 500 ms, then 1 s, 2 s, 4 s and a 5 s cap.
+    const start = reads();
+    vi.advanceTimersByTime(3_000);
+    expect(reads() - start).toBe(6);
+    vi.advanceTimersByTime(1_000 + 2_000 + 4_000 + 5_000);
+    expect(reads() - start).toBe(10);
+    vi.advanceTimersByTime(10_000);
+    expect(reads() - start).toBe(12);
+
+    // Output that appears while backed off arrives within one capped interval,
+    // and the cadence is fast again right after it.
+    paneText = 'idle!';
+    vi.advanceTimersByTime(5_000);
+    expect(seen).toEqual(['!']);
+    const afterOutput = reads();
+    vi.advanceTimersByTime(1_000);
+    expect(reads() - afterOutput).toBe(2);
+
+    // Input pulls a backed-off poll in to 500 ms.
+    vi.advanceTimersByTime(30_000);
+    const beforeInput = reads();
+    be.write('hi');
+    vi.advanceTimersByTime(500);
+    expect(reads() - beforeInput).toBe(1);
+
+    be.kill();
+  });
+
   it('onData fresh-spawn baseline: lastText starts empty so listeners see initial output', () => {
     // Counterpart to the reattach test: a fresh spawn keeps lastText='' so
     // listeners attached *before* spawn don't miss output the agent emitted
@@ -1530,6 +1607,155 @@ describe('HerdrBackend callbacks', () => {
     be.kill();
     // kill() tears down the live cohort.
     for (const w of thirdCohort) expect(w.child.killed).toBe(true);
+  });
+
+  // Herdr 0.9 dropped `wait agent-status`; `agent wait --until …` replaces it.
+  const AGENT_WAIT_HELP = 'Usage: herdr agent wait <TARGET> [OPTIONS]\n      --until <STATUS>\n      --timeout <MS>\n';
+  class FakeAgentWait extends FakeChild {
+    readonly stdout = Object.assign(new EventEmitter(), { setEncoding: vi.fn() });
+    finish(code: number, status?: string): void {
+      if (status) this.stdout.emit('data', JSON.stringify({ result: { agent: { agent_status: status } } }));
+      this.emit('close', code, null);
+    }
+  }
+  function captureAgentWaits(): Array<{ until: string[]; child: FakeAgentWait }> {
+    const waits: Array<{ until: string[]; child: FakeAgentWait }> = [];
+    mockedSpawn.mockImplementation(((_cmd: any, args: any) => {
+      const argv = args as string[];
+      if (argv.includes('agent') && argv.includes('wait')) {
+        const child = new FakeAgentWait();
+        waits.push({ until: argv.flatMap((arg, i) => argv[i - 1] === '--until' ? [arg] : []).sort(), child });
+        return child;
+      }
+      if (argv.includes('agent-status')) throw new Error('legacy `wait agent-status` must not be used when `agent wait` exists');
+      return makeFakeChild();
+    }) as any);
+    return waits;
+  }
+
+  it('status watcher (agent wait): one child watches every other status and re-arms without the matched one', () => {
+    const waits = captureAgentWaits();
+    let paneText = 'baseline';
+    setHerdrResponses([
+      { match: a => a.includes('wait') && a.includes('--help'), reply: () => AGENT_WAIT_HELP },
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('agent') && a.includes('list'), reply: () => AGENT_LIST_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY(paneText) },
+    ]);
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const seen: string[] = [];
+    const statuses: string[] = [];
+    be.onData(d => seen.push(d));
+    be.onAgentStatus(status => statuses.push(status));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    expect(waits.map(w => w.until)).toEqual([['blocked', 'done', 'idle', 'working']]);
+
+    paneText = 'baseline result';
+    waits[0]!.child.finish(0, 'done');
+    expect(seen).toEqual([' result']);
+    expect(statuses).toEqual(['done']);
+    expect(waits.map(w => w.until)).toEqual([
+      ['blocked', 'done', 'idle', 'working'],
+      ['blocked', 'idle', 'working'],
+    ]);
+
+    waits[1]!.child.finish(0, 'working');
+    expect(statuses).toEqual(['done', 'working']);
+    expect(waits[2]!.until).toEqual(['blocked', 'done', 'idle']);
+
+    be.kill();
+    expect(waits[2]!.child.killed).toBe(true);
+  });
+
+  it('status watcher (agent wait): a wait that resolves because the CLI died reports the exit, not idle', () => {
+    // Herdr resolves the wait with the dead CLI's last idle/done state before
+    // dropping its row. Announcing idle would release queued Lark input into
+    // the bare shell left in the pane.
+    const waits = captureAgentWaits();
+    let agentGone = false;
+    setHerdrResponses([
+      { match: a => a.includes('wait') && a.includes('--help'), reply: () => AGENT_WAIT_HELP },
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('agent') && a.includes('list'), reply: () => agentGone ? JSON.stringify({ result: { agents: [] } }) : AGENT_LIST_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('x') },
+    ]);
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const statuses: string[] = [];
+    const exits: Array<[number | null, string | null]> = [];
+    be.onAgentStatus(status => statuses.push(status));
+    be.onExit((code, signal) => exits.push([code, signal]));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    agentGone = true;
+    waits[0]!.child.finish(0, 'idle');
+    expect(statuses).toEqual([]);
+    expect(exits).toEqual([[0, null]]);
+    expect(waits).toHaveLength(1);
+    be.kill();
+  });
+
+  it('status watcher (agent wait): an unconfirmed status is re-checked instead of announced', () => {
+    vi.useFakeTimers();
+    const waits = captureAgentWaits();
+    let listFails = true;
+    setHerdrResponses([
+      { match: a => a.includes('wait') && a.includes('--help'), reply: () => AGENT_WAIT_HELP },
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      {
+        match: a => a.includes('agent') && a.includes('list'),
+        reply: () => { if (listFails) throw new Error('busy'); return AGENT_LIST_REPLY('1-1'); },
+      },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('x') },
+    ]);
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const statuses: string[] = [];
+    be.onAgentStatus(status => statuses.push(status));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    waits[0]!.child.finish(0, 'idle');
+    expect(statuses).toEqual([]);
+    expect(waits).toHaveLength(1);
+
+    // The previous status is re-armed, so Herdr returns idle again for a second check.
+    listFails = false;
+    vi.advanceTimersByTime(500);
+    expect(waits.map(w => w.until)).toEqual([
+      ['blocked', 'done', 'idle', 'working'],
+      ['blocked', 'done', 'idle', 'working'],
+    ]);
+    waits[1]!.child.finish(0, 'idle');
+    expect(statuses).toEqual(['idle']);
+    expect(waits[2]!.until).toEqual(['blocked', 'done', 'working']);
+    be.kill();
+  });
+
+  it('status watcher (agent wait): a timed-out or failed wait reports no status; a vanished agent emits onExit', () => {
+    const waits = captureAgentWaits();
+    let agentGone = false;
+    setHerdrResponses([
+      { match: a => a.includes('wait') && a.includes('--help'), reply: () => AGENT_WAIT_HELP },
+      { match: a => a[0] === 'session' && a[1] === 'list', reply: () => EXISTING_SESSION_REPLY },
+      { match: a => a.includes('agent') && a.includes('get'), reply: () => AGENT_GET_REPLY('1-1') },
+      { match: a => a.includes('agent') && a.includes('list'), reply: () => agentGone ? JSON.stringify({ result: { agents: [] } }) : AGENT_LIST_REPLY('1-1') },
+      { match: a => a.includes('read') && (a.includes('agent') || a.includes('pane')), reply: () => PANE_READ_REPLY('x') },
+    ]);
+    const be = new HerdrBackend(SESSION, { isReattach: true });
+    const statuses: string[] = [];
+    const exits: Array<[number | null, string | null]> = [];
+    be.onAgentStatus(status => statuses.push(status));
+    be.onExit((code, signal) => exits.push([code, signal]));
+    be.spawn('claude', [], { cwd: '/work', cols: 80, rows: 24, env: {} });
+
+    agentGone = true;
+    waits[0]!.child.finish(1);
+    expect(statuses).toEqual([]);
+    expect(exits).toEqual([[0, null]]);
+    expect(waits).toHaveLength(1);
+    be.kill();
   });
 
   it('status watcher: instant non-zero exit on a vanished agent emits onExit and does NOT re-arm (storm guard)', () => {

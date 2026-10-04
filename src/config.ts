@@ -151,13 +151,14 @@ export function resolveCompanionStartupConfig(env: NodeJS.ProcessEnv = process.e
  */
 export function resolveChatBotDiscoveryConfig(env: NodeJS.ProcessEnv = process.env): ChatBotDiscoveryConfig {
   const envFlag = env.BOTMUX_LARK_LIST_BOTS_API_ENABLED;
+  const timeoutMs = Number(env.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS);
   const listBotsApiEnabled =
     envFlag != null && envFlag !== ''
       ? envFlag.toLowerCase() === 'true'
       : readGlobalConfig().dashboard?.chatBotDiscovery !== false; // default ON
   return {
     listBotsApiEnabled,
-    listBotsApiTimeoutMs: Number(env.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS) || 3_000,
+    listBotsApiTimeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 3_000,
   };
 }
 

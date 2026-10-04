@@ -179,3 +179,71 @@ describe('schedule CLI prompt updates', () => {
       expect(readFileSync(f.path, 'utf8')).toBe(before);
     });
 });
+
+describe('work calendar CLI configuration and persisted manual intent', () => {
+  it('lists the bundled CN region, coverage and official source without a local calendar file', async () => {
+    const f = fixture();
+    const listed = await f.run(['calendars']);
+    expect(listed.code, listed.output).toBe(0);
+    const cn = listed.output.split('\n').filter(line => line.startsWith('{')).map(line => JSON.parse(line)).find(row => row.name === 'cn');
+    expect(cn).toMatchObject({ name: 'cn', kind: 'builtin', region: 'CN', dataVersion: '2026.1',
+      timeZone: 'Asia/Shanghai', coverage: { start: '2026-01-01', end: '2026-12-31' },
+      source: { authority: '国务院办公厅', documentNo: '国办发明电〔2025〕7号' } });
+    const updated = await f.run(['update', f.task.id, '--calendar', 'cn']);
+    expect(updated.code, updated.output).toBe(0);
+    expect(f.read()[f.task.id]).toMatchObject({ calendar: 'cn', ownerOpenId: f.task.ownerOpenId });
+    const rest = await f.run(['update', f.task.id, '--calendar-day-type', 'restday']);
+    expect(rest.code, rest.output).toBe(0);
+    expect(f.read()[f.task.id]).toMatchObject({ calendar: 'cn', calendarDayType: 'restday' });
+    const invalid = await f.run(['update', f.task.id, '--calendar-day-type', 'weekend']);
+    expect(invalid.code).not.toBe(0);
+    expect(f.read()[f.task.id].calendarDayType).toBe('restday');
+    const local = join(f.root, '.botmux', 'bots', app, 'work-calendars.json');
+    writeFileSync(local, JSON.stringify({ version: 1, calendars: { cn: {} } }));
+    const shadowed = await f.run(['calendars']);
+    expect(shadowed.code, shadowed.output).toBe(0);
+    expect(shadowed.output).toContain('reserved_builtin_calendar');
+    expect((await f.run(['update', f.task.id, '--calendar', 'none'])).code).toBe(0);
+    expect(f.read()[f.task.id].calendarDayType).toBeUndefined();
+  });
+  it('binds, reads in another process and clears a calendar without changing routing/owner', async () => {
+    const f = fixture();
+    const before = f.read()[f.task.id];
+    const updated = await f.run(['update', f.task.id, '--calendar', 'demo']);
+    expect(updated.code, updated.output).toBe(0);
+    expect(f.read()[f.task.id]).toMatchObject({ ...before, calendar: 'demo' });
+    const definitions = JSON.parse(readFileSync(new URL('./fixtures/work-calendar/demo.json', import.meta.url), 'utf8'));
+    writeFileSync(join(f.root, '.botmux', 'bots', app, 'work-calendars.json'), JSON.stringify(definitions));
+    const list = await f.run(['list']);
+    expect(list.code, list.output).toBe(0);
+    expect(list.output).toContain('calendar: demo');
+    expect(list.output).toContain('nextEligibleRunAt');
+    const calendars = await f.run(['calendars']);
+    expect(calendars.code, calendars.output).toBe(0);
+    expect(calendars.output).toContain('"name":"demo"');
+    expect((await f.run(['resume', f.task.id])).code).toBe(0);
+    const requested = await f.run(['run', f.task.id]);
+    expect(requested.code, requested.output).toBe(0);
+    expect(f.read()[f.task.id].manualRunRequested).toBe(true);
+    const cleared = await f.run(['update', f.task.id, '--calendar', 'none']);
+    expect(cleared.code, cleared.output).toBe(0);
+    expect(f.read()[f.task.id].calendar).toBeUndefined();
+    expect(f.read()[f.task.id].ownerUnionId).toBe(before.ownerUnionId);
+  });
+  it('adds with --calendar and preserves exact prompt bytes', async () => {
+    const f = fixture();
+    const added = await f.run(['add', '0 9 * * *', 'fixture prompt', '--id', 'aabbcc01', '--calendar', 'demo', '--calendar-day-type', 'restday', '--chat-id', 'fixture_chat', '--new-topic', '--workdir', f.root]);
+    expect(added.code, added.output).toBe(0);
+    expect(f.read().aabbcc01).toMatchObject({ calendar: 'demo', calendarDayType: 'restday', prompt: 'fixture prompt', executionPosition: 'new-topic', larkAppId: app });
+  });
+  it('refuses run on a paused task and tells the user to resume first', async () => {
+    const f = fixture();
+    expect((await f.run(['pause', f.task.id])).code).toBe(0);
+    const paused = f.read()[f.task.id];
+    const result = await f.run(['run', f.task.id]);
+    expect(result.code).not.toBe(0);
+    expect(result.output).toContain('已暂停');
+    expect(result.output).toContain('先恢复');
+    expect(f.read()[f.task.id]).toEqual(paused);
+  });
+});

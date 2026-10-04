@@ -7,6 +7,8 @@
  * determined later by validating BOTMUX_GOAL_MANIFEST_PATH.
  */
 
+import { buildBotWorkerEnv } from '../../core/env-policy.js';
+import { getBot } from '../../bot-registry.js';
 import { statSync } from 'node:fs';
 import { appendFile, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -50,6 +52,8 @@ export interface EphemeralPoolDeps {
    * secret by the frozen larkAppId at spawn time.
    */
   resolveLarkAppSecret(larkAppId: string): string | undefined | Promise<string | undefined>;
+  /** Resolve configured values at spawn time; never persist them in snapshots. */
+  resolveBotEnv?: (larkAppId: string) => Record<string, string> | undefined;
   factory?: WorkerProcessFactory;
   workerPath?: string;
   quiesceMs?: number;
@@ -79,7 +83,7 @@ export function createEphemeralPool(deps: EphemeralPoolDeps): { runNode: RunNode
 }
 
 type RunNodeInternalDeps = Required<Pick<EphemeralPoolDeps, 'factory' | 'workerPath' | 'quiesceMs' | 'cancelGraceMs' | 'manifestPollMs' | 'manifestSettleMs'>> &
-  Pick<EphemeralPoolDeps, 'resolveLarkAppSecret'>;
+  Pick<EphemeralPoolDeps, 'resolveLarkAppSecret' | 'resolveBotEnv'>;
 
 async function runNodeImpl(
   req: RunNodeRequest,
@@ -148,7 +152,7 @@ async function runNodeImpl(
         // "only daemon/dashboard carry the marker" invariant — harmless today
         // (the worker doesn't read the graceful helper and its CLI children go
         // through redactChildEnv), but this keeps the boundary honest.
-        ...stripPm2GracefulExitMarker(process.env),
+        ...stripPm2GracefulExitMarker(buildBotWorkerEnv(process.env, req.botSnapshot.envPolicy)),
         ...req.env,
         [GOAL_ENV.V3_MARKER]: '1',
         BOTMUX_WORKFLOW: '1',
@@ -245,6 +249,9 @@ async function runNodeImpl(
     cliRuntime: req.botSnapshot.cliRuntime,
     cliPathOverride: req.botSnapshot.cliPathOverride,
     model: req.botSnapshot.model,
+    envPolicy: req.botSnapshot.envPolicy,
+    env: deps.resolveBotEnv ? deps.resolveBotEnv(req.botSnapshot.larkAppId)
+      : (() => { try { return getBot(req.botSnapshot.larkAppId).config.env; } catch { return undefined; } })(),
     // Workflow workers require CLI bypass permissions by product contract.
     // Restricted bots are rejected before a BotSnapshot is created.
     disableCliBypass: false,

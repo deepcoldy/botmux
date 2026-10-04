@@ -78,7 +78,7 @@ describe('credentialsSourceDir daemon → worker cold-spawn wiring', () => {
     const head = worker.lastIndexOf('if (willReattachPersistent && persistentSessionName', gate);
     expect(gate - head).toBeLessThan(200);
     const block = worker.slice(gate, worker.indexOf('// A pane created before asymmetric control framing', gate));
-    expect(block).toContain("if (launchedWith !== (credentialSourceDir ?? null)) {");
+    expect(block).toContain("if (launchedWith !== (credentialSourceDir ?? null) || envPolicyChanged) {");
     expect(block).toContain("if (postKillProbe !== 'missing') {");
     expect(block).toContain('willReattachPersistent = selectedBackend.isReattach === true;');
     expect(block).toMatch(/if \(willReattachPersistent\) \{\s*throw new Error/);

@@ -140,6 +140,8 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     scratchTmpfsSizeMb: typeof j?.scratchTmpfsSizeMb === 'number' ? j.scratchTmpfsSizeMb : null,
     scratchDenyPaths: Array.isArray(j?.scratchDenyPaths) ? j.scratchDenyPaths.filter((x: unknown) => typeof x === 'string') : null,
     scratchSupported: j?.scratchSupported === true,
+    sandboxNetworkPolicy: j?.sandboxNetworkPolicy ?? null,
+    sandboxNetworkPolicyPlatform: j?.sandboxNetworkPolicyPlatform ?? null,
     sandboxPaths: (j?.sandboxPaths && typeof j.sandboxPaths === 'object' && !Array.isArray(j.sandboxPaths))
       ? {
           readWrite: Array.isArray(j.sandboxPaths.readWrite) ? j.sandboxPaths.readWrite.filter((x: unknown) => typeof x === 'string') : [],
@@ -201,6 +203,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     messageQuotaDefaultLimit: typeof j?.messageQuotaDefaultLimit === 'number' ? j.messageQuotaDefaultLimit : null,
     p2pMode: j?.p2pMode === 'thread' ? 'thread' : j?.p2pMode === 'group' ? 'group' : 'chat',
     envelopeInjection: j?.envelopeInjection === 'auto' ? 'auto' : 'off',
+    topicUnavailablePolicy: j?.topicUnavailablePolicy === 'stop' ? 'stop' : 'legacy',
     replyDelivery: j?.replyDelivery === 'transcript' ? 'transcript' : 'send',
     promptInjection: j?.promptInjection === 'none' ? 'none' : 'default',
     replyDeliveryDefault: j?.replyDeliveryDefault === 'transcript' ? 'transcript' : 'send',

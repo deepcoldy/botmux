@@ -255,7 +255,10 @@ describe('P2 worker onTaskDone generation fence', () => {
     );
     expect(setup).toBeGreaterThanOrEqual(0);
     expect(handlersStart).toBeGreaterThan(setup);
-    const region = workerSource.slice(setup, setup + 9000);
+    // The merged worker now carries both upstream strict-env/network handlers
+    // and Remote Runner outbound/final settlement before the shared onExit.
+    // Keep the source contract bounded, but large enough to cover that handler.
+    const region = workerSource.slice(setup, setup + 12_000);
 
     const agentStatus = region.indexOf('.onAgentStatus((status)');
     const taskDone = region.indexOf('backend.onTaskDone?.(()');
@@ -272,11 +275,9 @@ describe('P2 worker onTaskDone generation fence', () => {
       ['onTurnFinal', turnFinal],
       ['onExit', onExit],
     ] as const) {
-      // 900-char window (matches the sibling onTaskDone test above): the merged
-      // onTaskDone body keeps BOTH the fatalWorkerErrorPending guard and the
-      // 8-line generation-fence rationale comment, so the fence sits ~684 chars
-      // in — just past the old 700 window.
-      expect(region.slice(start, start + 900), name)
+      // Keep enough source after each callback anchor to include its rationale
+      // comments and the actual generation fence.
+      expect(region.slice(start, start + 1400), name)
         .toContain('backend !== observedBackend');
     }
   });

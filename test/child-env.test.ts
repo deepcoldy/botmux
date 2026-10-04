@@ -684,16 +684,16 @@ describe('session CLI home scrub call sites', () => {
     expect(read('worker.ts')).not.toContain('scrubWorkflowWorkerEnv(process.env)');
   });
 
-  it('every CLI-child spawn boundary builds its env from redactChildEnv (source pin)', () => {
+  it('every CLI-child spawn boundary uses the shared inheritance and redaction builder (source pin)', () => {
     // The H5 secret leak was a missing KEY, not a missing call — but the deny
     // list only protects boundaries that actually route through it. Pin the
     // non-obvious ones: the daemon-side one-shot that titles a session group,
     // and worker.ts's own child/engine envs.
     const oneShot = read('services/session-group-title.ts');
     const fn = oneShot.slice(oneShot.indexOf('export function buildOneShotEnv('));
-    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('redactChildEnv(process.env)');
+    expect(fn.slice(0, fn.indexOf('\n}'))).toContain('buildSessionChildEnv(process.env, envPolicy)');
     const worker = read('worker.ts');
-    expect(worker).toContain('const childEnv = redactChildEnv(process.env)');
+    expect(worker).toContain('const childEnv = buildSessionChildEnv(process.env, cfg.envPolicy)');
     // The zellij web-terminal viewer used the raw process.env (zellijEnv only
     // drops ZELLIJ*), unlike the tmux viewer whose tmuxEnv folds in
     // REDACTED_CHILD_ENV_KEYS.

@@ -854,6 +854,8 @@ function setupBotState(opts?: {
   restrictGrantCommands?: boolean;
   regularGroupReplyMode?: 'chat' | 'new-topic' | 'shared' | 'chat-topic';
   signedChatDefaults?: boolean;
+  soloGroupMentionBypass?: boolean;
+  chatSoloGroupMentionBypass?: Record<string, boolean>;
 	  regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
 	  autoStartOnNewTopic?: boolean;
 	  autoGrantRequestCards?: boolean;
@@ -893,6 +895,8 @@ function setupBotState(opts?: {
       restrictGrantCommands: opts?.restrictGrantCommands,
       regularGroupReplyMode: opts?.regularGroupReplyMode,
       signedChatDefaults: opts?.signedChatDefaults,
+      soloGroupMentionBypass: opts?.soloGroupMentionBypass,
+      chatSoloGroupMentionBypass: opts?.chatSoloGroupMentionBypass,
       regularGroupMentionMode: opts?.regularGroupMentionMode,
       autoStartOnNewTopic: opts?.autoStartOnNewTopic,
       autoGrantRequestCards: opts?.autoGrantRequestCards,
@@ -6419,6 +6423,7 @@ describe('managed Agent clone owner boundary', () => {
       'grantExpiryState',
       'sessionGroup',
       'chatReplyModes',
+      'chatSoloGroupMentionBypass',
       'chatFeedbackPolicies',
       'noCardChats',
       'quotaFallbackBot',
@@ -6504,6 +6509,15 @@ describe('managed Agent clone owner boundary', () => {
     for (const key of ['brand', 'allowedUsers', 'ownerOpenId']) {
       expect(target).not.toHaveProperty(key);
     }
+  });
+
+  it('clones the solo-group bot default without copying source chat overrides', () => {
+    const target = cloneBotConfig({
+      larkAppId: 'cli_source', soloGroupMentionBypass: false,
+      chatSoloGroupMentionBypass: { oc_source: true },
+    }, { larkAppId: 'cli_target', larkAppSecret: 'target-secret' });
+    expect(target.soloGroupMentionBypass).toBe(false);
+    expect(target).not.toHaveProperty('chatSoloGroupMentionBypass');
   });
 });
 
@@ -9461,6 +9475,153 @@ describe('startLarkEventDispatcher — 长连接死后自愈 (reconnect-exhauste
     expect(ws.start).toHaveBeenCalledTimes(1);
 
     vi.useRealTimers();
+  });
+});
+
+describe('solo-group mention bypass configuration', () => {
+  const CHAT = 'chat-solo-policy';
+  let handlers: ReturnType<typeof makeHandlers>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    __resetChatStatsForTest();
+    _resetGrantPending();
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetChatInfo.mockResolvedValue({ userCount: 1, botCount: 1 });
+    handlers = makeHandlers();
+  });
+
+  function start(opts: Parameters<typeof setupBotState>[0] = {}) {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupReplyMode: 'chat', ...opts });
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  }
+
+  async function send(opts: Partial<Parameters<typeof makeUserMessageEvent>[0]> = {}) {
+    const event = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID, chatId: CHAT, content: JSON.stringify({ text: 'hello' }), ...opts,
+    });
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+    return event;
+  }
+
+  describe.each([false, true])('owns a session: %s', ownsSession => {
+    it.each([
+      { label: 'legacy default', config: {}, allowed: true },
+      { label: 'explicitly enabled', config: { soloGroupMentionBypass: true }, allowed: true },
+      { label: 'bot opt-out', config: { soloGroupMentionBypass: false }, allowed: false },
+      { label: 'chat opt-out', config: { chatSoloGroupMentionBypass: { [CHAT]: false } }, allowed: false },
+      { label: 'chat opt-in overrides bot opt-out', config: { soloGroupMentionBypass: false, chatSoloGroupMentionBypass: { [CHAT]: true } }, allowed: true },
+      { label: 'another chat does not override this chat', config: { soloGroupMentionBypass: false, chatSoloGroupMentionBypass: { other_chat: true } }, allowed: false },
+    ])('$label', async ({ config, allowed }) => {
+      handlers.isSessionOwner.mockReturnValue(ownsSession);
+      start(config);
+      const event = await send();
+      const handler = ownsSession ? handlers.handleThreadReply : handlers.handleNewTopic;
+      expect(handler).toHaveBeenCalledTimes(allowed ? 1 : 0);
+      if (allowed) expect(handler).toHaveBeenCalledWith(event, expect.objectContaining({ anchor: CHAT }));
+      expect(ownsSession ? handlers.handleNewTopic : handlers.handleThreadReply).not.toHaveBeenCalled();
+      if (!allowed) {
+        expect(mockReplyMessage).not.toHaveBeenCalled();
+        expect(mockGetChatInfo).not.toHaveBeenCalled();
+      }
+    });
+
+    it('still accepts an explicit @ after opting out', async () => {
+      handlers.isSessionOwner.mockReturnValue(ownsSession);
+      start({ soloGroupMentionBypass: false });
+      await send({ mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }] });
+      expect(ownsSession ? handlers.handleThreadReply : handlers.handleNewTopic).toHaveBeenCalledOnce();
+    });
+
+    it('does not grant talk access when the bypass is enabled', async () => {
+      handlers.isSessionOwner.mockReturnValue(ownsSession);
+      start({ soloGroupMentionBypass: true, allowedUsers: ['ou_other_owner'] });
+      await send();
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    });
+  });
+
+  it.each(['text', 'image'])('new-topic: an earlier @ does not authorize a later top-level %s message', async messageType => {
+    start({ regularGroupReplyMode: 'new-topic', regularGroupMentionMode: 'topic', soloGroupMentionBypass: false });
+    await send({ messageId: 'msg-solo-seed', mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }] });
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'msg-solo-seed');
+    handlers.handleNewTopic.mockClear();
+    mockReplyMessage.mockClear();
+    await send({ messageId: 'msg-solo-later', messageType, content: JSON.stringify(messageType === 'image' ? { image_key: 'img_example' } : { text: 'hello again' }) });
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
+
+  describe.each(['group', 'topic'] as const)('%s chat with an owned thread', chatMode => {
+    it.each(['always', 'topic', 'never', 'ambient'] as const)('respects %s after opting out', async mentionMode => {
+      mockGetChatMode.mockResolvedValue(chatMode);
+      handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === 'owned-solo-root');
+      start({ soloGroupMentionBypass: false, regularGroupMentionMode: mentionMode });
+      await send({ rootId: 'owned-solo-root', threadId: 'owned-solo-root' });
+      expect(handlers.handleThreadReply).toHaveBeenCalledTimes(mentionMode === 'always' ? 0 : 1);
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    });
+  });
+
+  it.each(['never', 'ambient'] as const)('keeps explicit %s top-level replies enabled', async mentionMode => {
+    start({ soloGroupMentionBypass: false, regularGroupMentionMode: mentionMode });
+    await send();
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+  });
+
+  it('keeps the per-chat @ policy independent of the bypass', async () => {
+    start({ soloGroupMentionBypass: false, regularGroupMentionMode: 'never', chatMentionModes: { [CHAT]: 'always' } });
+    await send();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it.each(['shared', 'chat-topic'] as const)('%s: ignores unmentioned top-level messages even with an existing group session', async regularGroupReplyMode => {
+    handlers.isSessionOwner.mockImplementation((anchor: string) => anchor === CHAT);
+    start({ soloGroupMentionBypass: false, regularGroupReplyMode });
+    await send();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('keeps explicit message listeners enabled', async () => {
+    start({
+      soloGroupMentionBypass: false,
+      messageListeners: {
+        [CHAT]: {
+          enabled: true, prompt: 'Process matching messages',
+          senderPolicy: { mode: 'include_only', includeSenderOpenIds: [USER_OPEN_ID], includeSenderTypes: ['user'] },
+          messagePolicy: { includeMsgTypes: ['text'], scope: 'top_level' },
+          replyPolicy: { mode: 'thread', sessionMode: 'per_message' },
+        },
+      },
+    });
+    const event = await send();
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      messageListener: expect.objectContaining({ senderOpenId: USER_OPEN_ID }),
+    }));
+  });
+
+  it('keeps explicitly enabled new-topic auto-start independent', async () => {
+    mockGetChatMode.mockResolvedValue('topic');
+    start({ soloGroupMentionBypass: false, autoStartOnNewTopic: true });
+    await send();
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+  });
+
+  it('does not require @ in DMs after opting out', async () => {
+    mockGetChatMode.mockResolvedValue('p2p');
+    start({ soloGroupMentionBypass: false, p2pMode: 'chat' });
+    await send({ chatType: 'p2p' });
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
   });
 });
 

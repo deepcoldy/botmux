@@ -6,6 +6,7 @@ import * as pty from 'node-pty';
 import xtermHeadless from '@xterm/headless';
 import type { BackendType, SessionBackend, SpawnOpts, SessionProbe } from './types.js';
 import { logger } from '../../utils/logger.js';
+import { herdrExecutable } from '../../utils/herdr-executable.js';
 
 const { Terminal } = xtermHeadless;
 
@@ -30,10 +31,17 @@ interface HerdrBackendOptions {
 }
 
 // Slow output-streaming poll. We deliberately avoid the original 250ms tick:
-// herdr exposes `wait agent-status`, which we use to fire an immediate read on
+// herdr exposes status waits, which we use to fire an immediate read on
 // every idle/working/blocked transition. The 500ms timer is a fallback for the
 // in-the-middle-of-working case where output streams without a status flip.
 const POLL_INTERVAL_MS = 500;
+// An unchanged pane backs the poll off by doubling up to IDLE_POLL_MAX_MS, so
+// idle topics stop costing two Herdr CLI processes (list + 10k-line read) every
+// 0.5 s. New output, input sent to the pane, or a status transition returns to
+// POLL_INTERVAL_MS at once. Exit stays prompt while backed off: the status
+// wait returns as soon as the agent process goes away, which wakes the poll.
+const IDLE_POLLS_BEFORE_BACKOFF = 6;
+const IDLE_POLL_MAX_MS = 5_000;
 const READ_LINES = 10_000;
 const MAX_AGENT_PROBE_FAILURES = 3;
 // While `agent list` keeps failing (keep-alive), re-confirm liveness through
@@ -46,8 +54,8 @@ const SESSION_PROBE_CONFIRM_MIN_INTERVAL_MS = 5_000;
 // Synchronous (execFileSync 'sleep') because spawn() must stay sync.
 const SERVER_BOOT_POLL_MS = 100;
 const SERVER_BOOT_DEADLINE_MS = 5000;
-// `herdr wait agent-status` blocks until the requested status, or succeeds
-// immediately when that status is already current. We cap it so a long-stuck
+// A status wait blocks until one of the requested statuses, or succeeds
+// immediately when one of them is already current. We cap it so a long-stuck
 // agent still re-arms the watcher and we never accumulate an
 // indefinitely-orphaned subprocess on process teardown.
 const STATUS_WAIT_TIMEOUT_MS = 30_000;
@@ -55,9 +63,9 @@ const STATUS_WAIT_TIMEOUT_MS = 30_000;
 // new pane. Input readiness remains gated by the worker's onAgentStatus hook.
 const PANE_AGENT_START_TIMEOUT_MS = 30_000;
 const PANE_AGENT_DETECTION_POLL_MS = 100;
-// Watch the full useful lifecycle, not just settled statuses. Herdr's
-// `wait agent-status --status X` is level-triggered: when the pane is already
-// in X it succeeds immediately. After one status wins we therefore exclude it
+// Watch the full useful lifecycle, not just settled statuses. Herdr's status
+// waits are level-triggered: when the pane is already in X they succeed
+// immediately. After one status wins we therefore exclude it
 // from the next cohort until another lifecycle status wins. Watching `working`
 // is what re-enables `done`/`blocked`/`idle` for the following turn without
 // hot-looping on the settled state between turns.
@@ -96,7 +104,7 @@ export interface HerdrWebTerminalCursor {
 
 function tryJsonCommand(args: string[], opts?: { timeout?: number; input?: string; env?: NodeJS.ProcessEnv }): JsonCommandResult {
   try {
-    const out = execFileSync('herdr', args, {
+    const out = execFileSync(herdrExecutable(), args, {
       encoding: 'utf-8',
       input: opts?.input,
       stdio: opts?.input === undefined ? ['ignore', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
@@ -132,7 +140,7 @@ function requiredJsonCommand(
 ): any {
   let raw = '';
   try {
-    raw = execFileSync('herdr', args, {
+    raw = execFileSync(herdrExecutable(), args, {
       encoding: 'utf-8',
       input: opts?.input,
       stdio: opts?.input === undefined ? ['ignore', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe'],
@@ -166,7 +174,7 @@ function requiredJsonCommand(
 
 function herdrUsesManagedAgentFacade(): boolean {
   try {
-    const out = execFileSync('herdr', ['--version'], {
+    const out = execFileSync(herdrExecutable(), ['--version'], {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 3000,
@@ -258,7 +266,7 @@ function sharedServerEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 
 function runHerdr(args: string[], opts?: { timeout?: number; input?: string }): boolean {
   try {
-    execFileSync('herdr', args, {
+    execFileSync(herdrExecutable(), args, {
       input: opts?.input,
       stdio: opts?.input === undefined ? 'ignore' : ['pipe', 'ignore', 'ignore'],
       timeout: opts?.timeout ?? 5000,
@@ -295,6 +303,39 @@ function agentRowExited(agent: any): boolean {
     || agent?.running === false;
 }
 
+let agentWaitSupported: boolean | undefined;
+
+/** Whether this Herdr has `agent wait --until` (probed once per process). */
+function supportsAgentWait(): boolean {
+  if (agentWaitSupported === undefined) {
+    try {
+      const help = execFileSync(herdrExecutable(), ['agent', 'wait', '--help'], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 3000,
+      });
+      agentWaitSupported = typeof help === 'string' && help.includes('--until');
+    } catch {
+      agentWaitSupported = false;
+    }
+  }
+  return agentWaitSupported;
+}
+
+export function __testOnly_resetHerdrAgentWaitProbe(): void {
+  agentWaitSupported = undefined;
+}
+
+/** The status an `agent wait --until …` call matched, from its JSON stdout. */
+function agentWaitStatus(stdout: string, watched: readonly WatchedStatus[]): WatchedStatus | undefined {
+  try {
+    const status = JSON.parse(stdout.trim())?.result?.agent?.agent_status;
+    return watched.find(candidate => candidate === status);
+  } catch {
+    return undefined;
+  }
+}
+
 function extractReadText(raw: any): string {
   return typeof raw?.result?.read?.text === 'string' ? raw.result.read.text : '';
 }
@@ -309,7 +350,7 @@ function extractReadText(raw: any): string {
  */
 function readHerdrTextCommand(args: string[]): string {
   try {
-    const raw = execFileSync('herdr', args, {
+    const raw = execFileSync(herdrExecutable(), args, {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 5000,
@@ -339,6 +380,8 @@ function longestSuffixPrefix(previous: string, next: string): number {
 export class HerdrBackend implements SessionBackend {
   private serverProcess: ChildProcess | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
+  private pollDelayMs = POLL_INTERVAL_MS;
+  private unchangedPolls = 0;
   private statusWaitProcesses: ChildProcess[] = [];
   private readonly dataCbs: Array<(d: string) => void> = [];
   private readonly snapshotCbs: Array<(snapshot: string) => void> = [];
@@ -389,7 +432,7 @@ export class HerdrBackend implements SessionBackend {
 
   static isAvailable(): boolean {
     try {
-      execFileSync('herdr', ['--version'], { stdio: 'ignore', timeout: 3000 });
+      execFileSync(herdrExecutable(), ['--version'], { stdio: 'ignore', timeout: 3000 });
       return true;
     } catch {
       return false;
@@ -502,6 +545,13 @@ export class HerdrBackend implements SessionBackend {
     return this.actuallyReattached;
   }
 
+  /** True only when spawn() launched the CLI process itself. Re-attaching to a
+   *  surviving agent or adopting an external pane observes a CLI that was
+   *  already running, so Herdr's status for it is not a boot-time guess. */
+  get launchedNewCli(): boolean {
+    return this.started && !this.actuallyReattached && !this.opts.externalTarget;
+  }
+
   spawn(bin: string, args: string[], opts: SpawnOpts): void {
     this.cols = opts.cols;
     this.rows = opts.rows;
@@ -597,6 +647,7 @@ export class HerdrBackend implements SessionBackend {
   }
 
   write(data: string): boolean {
+    this.wakePolling();
     if (this.exited) return false;
     const target = this.paneId ?? this.agentName;
     return runHerdr(
@@ -606,10 +657,12 @@ export class HerdrBackend implements SessionBackend {
   }
 
   sendText(text: string): boolean {
+    this.wakePolling();
     return this.write(text);
   }
 
   sendSpecialKeys(...keys: string[]): boolean {
+    this.wakePolling();
     if (this.exited) return false;
     const target = this.paneId ?? this.agentName;
     return runHerdr(
@@ -765,7 +818,7 @@ export class HerdrBackend implements SessionBackend {
     const serverEnv = this.opts.ownsSession === false
       ? sharedServerEnv(process.env)
       : this.childEnv;
-    this.serverProcess = spawn('herdr', ['--session', this.sessionName, 'server'], {
+    this.serverProcess = spawn(herdrExecutable(), ['--session', this.sessionName, 'server'], {
       stdio: 'ignore',
       detached: true,
       env: serverEnv,
@@ -895,7 +948,7 @@ export class HerdrBackend implements SessionBackend {
       allowProposedApi: true,
     });
     try {
-      const attach = pty.spawn('herdr', [
+      const attach = pty.spawn(herdrExecutable(), [
         '--session', this.sessionName,
         'agent', 'attach', target,
       ], {
@@ -995,13 +1048,47 @@ export class HerdrBackend implements SessionBackend {
 
   private startPolling(): void {
     this.stopPolling();
-    this.pollTimer = setInterval(() => this.poll(), POLL_INTERVAL_MS);
-    this.pollTimer.unref?.();
+    this.pollDelayMs = POLL_INTERVAL_MS;
+    this.unchangedPolls = 0;
+    this.schedulePoll();
+  }
+
+  private schedulePoll(): void {
+    if (this.exited) return;
+    const timer = setTimeout(() => {
+      this.pollTimer = null;
+      try {
+        this.poll();
+      } finally {
+        // Keep the chain alive even if poll() throws (setInterval never
+        // stopped on a throwing tick). poll() may already have re-armed
+        // through wakePolling().
+        if (this.pollTimer === null) this.schedulePoll();
+      }
+    }, this.pollDelayMs);
+    timer.unref?.();
+    this.pollTimer = timer;
   }
 
   private stopPolling(): void {
-    if (this.pollTimer) clearInterval(this.pollTimer);
+    if (this.pollTimer) clearTimeout(this.pollTimer);
     this.pollTimer = null;
+  }
+
+  /** Return to the fast cadence; a pending backed-off poll is pulled in. */
+  private wakePolling(): void {
+    this.unchangedPolls = 0;
+    if (this.pollDelayMs === POLL_INTERVAL_MS) return;
+    this.pollDelayMs = POLL_INTERVAL_MS;
+    if (this.pollTimer) {
+      this.stopPolling();
+      this.schedulePoll();
+    }
+  }
+
+  private noteUnchangedPoll(): void {
+    if (++this.unchangedPolls < IDLE_POLLS_BEFORE_BACKOFF) return;
+    this.pollDelayMs = Math.min(this.pollDelayMs * 2, IDLE_POLL_MAX_MS);
   }
 
   private poll(): void {
@@ -1074,7 +1161,11 @@ export class HerdrBackend implements SessionBackend {
   private readAndEmitDelta(): void {
     if (this.exited) return;
     const next = this.readRecentAnsi();
-    if (!next || next === this.lastText) return;
+    if (!next || next === this.lastText) {
+      this.noteUnchangedPoll();
+      return;
+    }
+    this.wakePolling();
     for (const cb of this.snapshotCbs) {
       try { cb(next); } catch { /* listener crash shouldn't kill polling */ }
     }
@@ -1096,9 +1187,16 @@ export class HerdrBackend implements SessionBackend {
   }
 
   /**
-   * Spawn one `herdr wait agent-status` child per useful status other than the
-   * current one. The first to fire wins → we read+emit, tear down the losers,
-   * and re-arm while excluding the winning (now-current) status.
+   * Watch for the next lifecycle status other than the current one. The first
+   * watcher to fire wins → we read+emit, tear down the losers, and re-arm while
+   * excluding the winning (now-current) status.
+   *
+   * Herdr 0.9 (verified on 0.9.1 and 0.9.3) has `agent wait <pane> --until S…`
+   * and no longer has `wait agent-status <pane> --status S`: that command
+   * fails instantly ("unknown command"), which turned every watcher into a
+   * 500 ms spawn-and-list loop with no status ever reported. One `agent wait`
+   * child watches every status at once; a Herdr without it keeps one child
+   * per status.
    *
    * Excluding the current status is essential because Herdr waits are
    * level-triggered. Re-arming the same status immediately would make a pane
@@ -1111,88 +1209,127 @@ export class HerdrBackend implements SessionBackend {
     const paneTarget = this.paneId ?? this.agentName;
     if (!paneTarget) return;
     this.stopStatusWatcher();
+    const watched = WATCHED_STATUSES.filter(status => status !== currentStatus);
     const cohort: ChildProcess[] = [];
     const armedAt = Date.now();
-    for (const status of WATCHED_STATUSES) {
-      if (status === currentStatus) continue;
-      const child = spawn('herdr', [
-        '--session', this.sessionName,
-        'wait', 'agent-status', paneTarget,
-        '--status', status,
-        '--timeout', String(STATUS_WAIT_TIMEOUT_MS),
-      ], { stdio: ['ignore', 'ignore', 'ignore'] });
-      cohort.push(child);
 
-      child.on('exit', (code) => {
-        // Only the first child to finish (across the cohort) drives the
-        // re-arm cycle; later finishers in the same cohort are dropped.
-        if (!this.statusWaitProcesses.includes(child)) return;
-        const wasFirstExit = this.statusWaitProcesses === cohort;
-        // Drop this child from the active cohort.
-        this.statusWaitProcesses = this.statusWaitProcesses.filter(c => c !== child);
-        if (!wasFirstExit || this.exited) return;
-        // First exit in this cohort — tear down siblings, then read+re-arm.
-        this.stopStatusWatcher();
-        this.readAndEmitDelta();
+    const settle = (child: ChildProcess, code: number | null, status: WatchedStatus | undefined) => {
+      // Only the first child to finish (across the cohort) drives the
+      // re-arm cycle; later finishers in the same cohort are dropped.
+      if (!this.statusWaitProcesses.includes(child)) return;
+      const wasFirstExit = this.statusWaitProcesses === cohort;
+      // Drop this child from the active cohort.
+      this.statusWaitProcesses = this.statusWaitProcesses.filter(c => c !== child);
+      if (!wasFirstExit || this.exited) return;
+      // First exit in this cohort — tear down siblings, then read+re-arm.
+      this.stopStatusWatcher();
+      this.readAndEmitDelta();
 
-        // code 0 means the watched status is now current. Re-arm immediately,
-        // but exclude that status from the next cohort: Herdr returns success
-        // immediately while a status remains current, so including it again is
-        // the level-triggered success storm this state machine prevents.
-        if (code === 0) {
-          for (const cb of this.agentStatusCbs) {
-            try { cb(status); } catch { /* listener crash shouldn't kill watcher */ }
-          }
-          this.startStatusWatcher(status);
-          return;
-        }
-
-        // Non-zero storm guard: when the agent's pane has gone away (the CLI
-        // exited), `herdr wait agent-status` returns code 1 within MILLISECONDS
-        // rather than after the 30s timeout. The old code re-armed on every non-0 code
-        // synchronously, so a dead pane spun a tight spawn loop (thousands of
-        // `herdr wait` children/sec) that starved the 500ms poll timer → the
-        // session never reported its exit and hung. So for a non-zero code we
-        // first distinguish "real long timeout" (child lived a meaningful
-        // fraction of the window — agent still working, re-arm normally) from
-        // "instant return" (pane likely gone — check liveness; only re-arm via
-        // a deferred timer, never synchronously, so poll() can run and we can't
-        // spin). Verified on v0.6.6: the exited agent's row disappears from
-        // `agent list`.
-        const elapsed = Date.now() - armedAt;
-        const returnedInstantly = elapsed < STATUS_WAIT_TIMEOUT_MS / 2;
-        if (returnedInstantly) {
-          const agents = this.listAgents();
-          if (agents !== null) {
-            const matching = agents.find(a => a?.pane_id === this.paneId || a?.name === this.agentName);
-            const exited = matching ? agentRowExited(matching) : true;
-            if (exited) {
-              const exitCode = typeof matching?.exit_code === 'number' ? matching.exit_code : 0;
-              this.handleExit(exitCode, null);
-              return;
-            }
-          }
-          // Agent still alive but the wait returned instantly (transient
-          // herdr hiccup). Re-arm on a later tick, never synchronously, so we
-          // can't spin: the deferred timer yields the loop to poll(). unref
-          // so we never hold the event loop open.
-          if (this.exited) return;
+      // code 0 means the watched status is now current. Re-arm immediately,
+      // but exclude that status from the next cohort: Herdr returns success
+      // immediately while a status remains current, so including it again is
+      // the level-triggered success storm this state machine prevents.
+      if (code === 0 && status) {
+        // A wait also resolves when the CLI dies: Herdr reports its last
+        // idle/done state, then drops the row. idle/done release queued input
+        // into the pane, which must never reach the bare shell left behind, so
+        // only announce a status for an agent that is still listed.
+        const agents = this.listAgents();
+        if (agents === null) {
+          // Unconfirmed. Waits are level-triggered, so re-arming with the
+          // previous status returns this one again for another check.
           const t = setTimeout(() => {
             if (!this.exited) this.startStatusWatcher(currentStatus);
           }, POLL_INTERVAL_MS);
           t.unref?.();
           return;
         }
-        // A real long-timeout after ~30s: preserve the last winning status so
-        // the periodic timeout itself cannot re-introduce a level-triggered
-        // waiter for the unchanged current state.
-        this.startStatusWatcher(currentStatus);
-      });
-      child.on('error', () => {
-        // `herdr` missing or unspawnable: drop from cohort. Timer-based poll
-        // still acts as the fallback signal.
-        this.statusWaitProcesses = this.statusWaitProcesses.filter(c => c !== child);
-      });
+        const matching = agents.find(a => a?.pane_id === this.paneId || a?.name === this.agentName);
+        if (!matching || agentRowExited(matching)) {
+          const exitCode = typeof matching?.exit_code === 'number' ? matching.exit_code : 0;
+          this.handleExit(exitCode, null);
+          return;
+        }
+        this.wakePolling();
+        for (const cb of this.agentStatusCbs) {
+          try { cb(status); } catch { /* listener crash shouldn't kill watcher */ }
+        }
+        this.startStatusWatcher(status);
+        return;
+      }
+
+      // Non-zero storm guard: when the agent's pane has gone away (the CLI
+      // exited), a status wait returns within MILLISECONDS rather than after
+      // the 30s timeout. The old code re-armed on every non-0 code
+      // synchronously, so a dead pane spun a tight spawn loop (thousands of
+      // wait children/sec) that starved the 500ms poll timer → the session
+      // never reported its exit and hung. So for a non-zero code we first
+      // distinguish "real long timeout" (child lived a meaningful fraction of
+      // the window — agent still working, re-arm normally) from "instant
+      // return" (pane likely gone — check liveness; only re-arm via a deferred
+      // timer, never synchronously, so poll() can run and we can't spin).
+      // Verified on v0.6.6: the exited agent's row disappears from `agent list`.
+      const elapsed = Date.now() - armedAt;
+      const returnedInstantly = elapsed < STATUS_WAIT_TIMEOUT_MS / 2;
+      if (returnedInstantly) {
+        const agents = this.listAgents();
+        if (agents !== null) {
+          const matching = agents.find(a => a?.pane_id === this.paneId || a?.name === this.agentName);
+          const exited = matching ? agentRowExited(matching) : true;
+          if (exited) {
+            const exitCode = typeof matching?.exit_code === 'number' ? matching.exit_code : 0;
+            this.handleExit(exitCode, null);
+            return;
+          }
+        }
+        // Agent still alive but the wait returned instantly (transient
+        // herdr hiccup). Re-arm on a later tick, never synchronously, so we
+        // can't spin: the deferred timer yields the loop to poll(). unref
+        // so we never hold the event loop open.
+        if (this.exited) return;
+        const t = setTimeout(() => {
+          if (!this.exited) this.startStatusWatcher(currentStatus);
+        }, POLL_INTERVAL_MS);
+        t.unref?.();
+        return;
+      }
+      // A real long-timeout after ~30s: preserve the last winning status so
+      // the periodic timeout itself cannot re-introduce a level-triggered
+      // waiter for the unchanged current state.
+      this.startStatusWatcher(currentStatus);
+    };
+    // `herdr` missing or unspawnable: drop from cohort. Timer-based poll
+    // still acts as the fallback signal.
+    const drop = (child: ChildProcess) => () => {
+      this.statusWaitProcesses = this.statusWaitProcesses.filter(c => c !== child);
+    };
+
+    if (supportsAgentWait()) {
+      const child = spawn(herdrExecutable(), [
+        '--session', this.sessionName,
+        'agent', 'wait', paneTarget,
+        ...watched.flatMap(status => ['--until', status]),
+        '--timeout', String(STATUS_WAIT_TIMEOUT_MS),
+      ], { stdio: ['ignore', 'pipe', 'ignore'] });
+      let stdout = '';
+      child.stdout?.setEncoding('utf8');
+      child.stdout?.on('data', (chunk: string) => { stdout += chunk; });
+      // `close` (not `exit`) so the matched status in stdout is complete.
+      child.on('close', (code) => settle(child, code, code === 0 ? agentWaitStatus(stdout, watched) : undefined));
+      child.on('error', drop(child));
+      cohort.push(child);
+    } else {
+      for (const status of watched) {
+        const child = spawn(herdrExecutable(), [
+          '--session', this.sessionName,
+          'wait', 'agent-status', paneTarget,
+          '--status', status,
+          '--timeout', String(STATUS_WAIT_TIMEOUT_MS),
+        ], { stdio: ['ignore', 'ignore', 'ignore'] });
+        child.on('exit', (code) => settle(child, code, status));
+        child.on('error', drop(child));
+        cohort.push(child);
+      }
     }
     this.statusWaitProcesses = cohort;
   }

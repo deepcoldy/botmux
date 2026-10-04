@@ -73,6 +73,10 @@ export interface SpawnOpts {
    * merges them into the child env. Already sanitized (see sanitizePerBotEnv).
    */
   injectEnv?: Record<string, string>;
+  /** Strict panes launch with env -i and skip user shell startup profiles. */
+  strictEnv?: boolean;
+  /** Worker verified the surviving generation's policy stamp. */
+  strictEnvReattach?: boolean;
   /**
    * Per-bot shell override (BotConfig.launchShell). When set, the persistent
    * backends (tmux/zellij/zmx) launch the CLI under this shell instead of `$SHELL`

@@ -1,3 +1,4 @@
+import { parseSandboxNetworkPolicy } from './core/sandbox-network-policy.js';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { normalizeCodexInstancePool, registerCodexInstanceBot, clearCodexInstanceBots, validateCodexInstanceRoster } from './services/codex-instance-pool.js';
 import { readFileSync, existsSync, statSync } from 'node:fs';
@@ -40,6 +41,7 @@ import type { BotSkillPolicy, SkillSelector } from './core/skills/types.js';
 import { normalizeStartupCommandList } from './core/startup-commands.js';
 import { DAEMON_COMMANDS } from './core/passthrough-commands.js';
 import { sanitizePerBotEnv } from './core/per-bot-env.js';
+import { normalizeEnvPolicy, type EnvPolicy } from './core/env-policy.js';
 import { normalizeCredentialsSourceDir } from './services/cli-credential-source.js';
 import { resolveBotmuxConfigDir, resolveBotsConfigFile, type BotsConfigProvenance } from './core/config-dir.js';
 import { normalizeSubstituteMode } from './services/substitute-mode-normalize.js';
@@ -1588,6 +1590,8 @@ export interface BotConfig {
   /** Skip Botmux prompt/skill/context injection and auto-forward final replies.
    * Existing prompt and skill customizations remain saved. */
   promptInjection?: 'default' | 'none';
+  /** Absent preserves existing routing; stop opts into source-topic checks. */
+  topicUnavailablePolicy?: 'legacy' | 'stop';
   /**
    * Whether each forwarded turn carries a `<sender type=… open_id=… name=…
    * email=… />` tag naming who spoke. Default ON (ABSENT ⇒ ON — only an
@@ -1711,6 +1715,7 @@ export interface BotConfig {
    * rely only on already-mounted local inputs.
    */
   sandboxNetwork?: boolean;
+  sandboxNetworkPolicy?: import('./core/sandbox-network-policy.js').SandboxNetworkPolicy;
   /**
    * LEGACY read-isolation flag (pre fs-policy). The unified sandbox is
    * deny-by-default, so cross-bot read isolation is inherent — this flag is
@@ -1867,6 +1872,8 @@ export interface BotConfig {
   chatReplyModes?: { [chatId: string]: ChatReplyMode };
   /** Per-chat @ 策略：chat_id → 该群的 mention 模式，覆盖 per-bot `regularGroupMentionMode`。由 /mention-mode 写入。 */
   chatMentionModes?: { [chatId: string]: GroupMentionMode };
+  /** Per-chat override of `soloGroupMentionBypass`; explicit true/false wins over the bot default. */
+  chatSoloGroupMentionBypass?: { [chatId: string]: boolean };
   /** Per-chat per-user grants: chat_id → 被授权的 open_id 列表。仅放行 canTalk，不给管理命令权。 */
   chatGrants?: { [chatId: string]: string[] };
   /**
@@ -1997,6 +2004,8 @@ export interface BotConfig {
    * the shared tmux/zellij server env. Missing/empty → undefined.
    */
   env?: Record<string, string>;
+  /** Explicit process inheritance policy; missing retains historical behavior. */
+  envPolicy?: EnvPolicy;
   /**
    * Optional per-bot priority skill policy. Missing means botmux does not alter
    * the underlying CLI's native skill discovery or spawn arguments.
@@ -2252,11 +2261,13 @@ export interface BotConfig {
    *                               multi-bot / multi-person groups: a default
    *                               responder that yields when you address someone
    *                               else.
-   * Governs the shared-topic fold-back + the top-level @ gate. `new-topic` /
-   * 话题群 topics own their own thread and continue without @ regardless (that
-   * is the mode's defining behavior, not affected by this policy).
+   * Governs the shared-topic fold-back and the @ gate in regular/topic groups.
+   * The separate single-human/single-bot exception is controlled by
+   * `soloGroupMentionBypass` / `chatSoloGroupMentionBypass`.
    */
   regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
+  /** Allow the single-human/single-bot group exception to the @ policy (default true). */
+  soloGroupMentionBypass?: boolean;
   /**
    * 允许 `botmux send --mention` @ 群内任意成员（用完整邮箱 / 手机号 / union_id /
    * open_id 指定），而不仅是本轮触发者（--mention-back）。默认 false：关闭时
@@ -3560,6 +3571,15 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       if (Object.keys(out).length > 0) chatMentionModes = out;
     }
 
+    let chatSoloGroupMentionBypass: { [chatId: string]: boolean } | undefined;
+    if (entry.chatSoloGroupMentionBypass && typeof entry.chatSoloGroupMentionBypass === 'object' && !Array.isArray(entry.chatSoloGroupMentionBypass)) {
+      const out: { [chatId: string]: boolean } = {};
+      for (const [cid, enabled] of Object.entries(entry.chatSoloGroupMentionBypass)) {
+        if (cid.trim() && typeof enabled === 'boolean') out[cid] = enabled;
+      }
+      if (Object.keys(out).length > 0) chatSoloGroupMentionBypass = out;
+    }
+
     // chatGrants：只保留 { [chatId:string]: string[] }，逐项校验 typeof === 'string'，
     // 丢弃空列表。未配置或全部非法 → undefined。
     let chatGrants: { [chatId: string]: string[] } | undefined;
@@ -3682,6 +3702,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
 
     // env：per-bot 环境变量（如代理 / 第三方服务商端点 ANTHROPIC_BASE_URL+AUTH_TOKEN）。
     // sanitizePerBotEnv 过滤非法/保留键、字符串化基本类型；空 → undefined（保持 bots.json 干净）。
+    const envPolicy = normalizeEnvPolicy(entry.envPolicy);
     const sanitizedEnv = sanitizePerBotEnv(entry.env);
     const env = Object.keys(sanitizedEnv).length > 0 ? sanitizedEnv : undefined;
 
@@ -3844,6 +3865,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       disableCliBypass: entry.disableCliBypass === true,
       codexAppCleanInput: entry.codexAppCleanInput === true || undefined,
       // 显式 send / transcript 都保留；缺省按 defaultReplyDeliveryFor 解析。
+      topicUnavailablePolicy: entry.topicUnavailablePolicy === 'stop' ? 'stop' : undefined,
       replyDelivery: entry.replyDelivery === 'transcript' || entry.replyDelivery === 'send' ? entry.replyDelivery : undefined,
       promptInjection: entry.promptInjection === 'none' ? 'none' : undefined,
       // Only the non-default hook mode is persisted; absent, 'off', and invalid
@@ -3876,6 +3898,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       sandboxHidePaths: normalizeStringList(entry.sandboxHidePaths),
       sandboxReadonlyPaths: normalizeStringList(entry.sandboxReadonlyPaths),
       sandboxNetwork: typeof entry.sandboxNetwork === 'boolean' ? entry.sandboxNetwork : undefined,
+      ...(entry.sandboxNetworkPolicy !== undefined ? { sandboxNetworkPolicy: parseSandboxNetworkPolicy(entry.sandboxNetworkPolicy) } : {}),
       readIsolation: entry.readIsolation === true,
       readDenyExtraPaths: normalizeStringList(entry.readDenyExtraPaths),
       backendType: entry.backendType,
@@ -3925,6 +3948,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       defaultWorkingDirAutoWorktree: entry.defaultWorkingDirAutoWorktree === true || undefined,
       chatReplyModes,
       chatMentionModes,
+      chatSoloGroupMentionBypass,
       chatGrants,
       globalGrants,
       // 只落显式 true（undefined = 关），与 restrictGrantCommands 同款，保持 bots.json 干净。
@@ -3945,6 +3969,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       tuiSlashAllow,
       startupCommands,
       env,
+      envPolicy,
       skills,
       plugins,
       lang: isLocale(entry.lang) ? entry.lang : undefined,
@@ -4056,6 +4081,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         || entry.regularGroupMentionMode === 'ambient'
         ? entry.regularGroupMentionMode
         : undefined,
+      soloGroupMentionBypass: entry.soloGroupMentionBypass === false ? false : undefined,
       substituteMode,
       // 文档订阅默认触发范围。只 'all' 有意义；'mention-only'（默认）归一化为
       // undefined 让 bots.json 保持干净。

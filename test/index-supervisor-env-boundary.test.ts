@@ -24,8 +24,9 @@ vi.mock('../src/core/fleet-supervisor.js', () => {
     FleetSupervisor: class {
       async stopAll(): Promise<void> {}
       async drainCommands(): Promise<void> {}
-      start(): void {
+      start(): boolean {
         boundary.envAtFleetStart = { ...process.env };
+        return true;
       }
     },
   };

@@ -1,3 +1,4 @@
+import { normalizeCalendarBinding, normalizeCalendarDayType, listWorkCalendars, previewTaskCalendar } from '../services/work-calendar.js';
 import { resolveWorkspace } from './workspace-metadata.js';
 // src/core/dashboard-ipc-server.ts
 import { parseHandoffCardEvent } from './handoff-card-lifecycle.js';
@@ -4299,6 +4300,11 @@ function parseSchedulePreconditionWrite(
 
 export interface ScheduleRow {
   id: string;
+  calendar?: string;
+  calendarDayType?: import('../services/work-calendar.js').CalendarDayType;
+  lastCalendarCheck?: ScheduledTask['lastCalendarCheck'];
+  nextEligibleRunAt?: string | null;
+  calendarCheck?: ScheduledTask['lastCalendarCheck'];
   name: string;
   schedule: string;
   parsed: ParsedSchedule;
@@ -4493,6 +4499,10 @@ function schedulePreconditionProjection(
 
 function composeScheduleRow(t: ScheduledTask): ScheduleRow {
   return {
+    calendar: t.calendar,
+    calendarDayType: t.calendar ? t.calendarDayType ?? 'workday' : undefined,
+    lastCalendarCheck: t.lastCalendarCheck,
+    ...previewTaskCalendar(t, t.larkAppId ?? cachedLarkAppId),
     id: t.id,
     name: t.name,
     schedule: t.schedule,
@@ -4523,6 +4533,11 @@ function composeScheduleRow(t: ScheduledTask): ScheduleRow {
     feishuChatLink: feishuChatLink(t.chatId, getBotBrand(t.larkAppId)),
   };
 }
+
+ipcRoute('GET', '/api/schedules/calendars', (_req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { ok: false, error: 'larkAppId_not_set' });
+  jsonRes(res, 200, listWorkCalendars(cachedLarkAppId));
+});
 
 ipcRoute('GET', '/api/schedules', (_req, res) => {
   // Filter to tasks owned by this daemon's bot (multi-bot setups run one
@@ -4700,6 +4715,12 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
   const prompt = typeof b.prompt === 'string' ? b.prompt : '';
   const chatTargets = parseScheduleChatTargets(b, true)!;
   const rootMessageId = typeof b.rootMessageId === 'string' ? b.rootMessageId.trim() : '';
+  let calendar: string | undefined;
+  try { calendar = normalizeCalendarBinding(b.calendar); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'calendar' }); }
+  let calendarDayType: import('../services/work-calendar.js').CalendarDayType;
+  try { calendarDayType = normalizeCalendarDayType(b.calendarDayType); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'calendarDayType' }); }
   const precondition = parseSchedulePreconditionWrite(b, 'create');
   if (!precondition.ok) {
     return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: precondition.field });
@@ -4828,6 +4849,8 @@ ipcRoute('POST', '/api/schedules', async (req, res) => {
       deliver,
       silent,
       followActive: followActive || undefined,
+      calendar,
+      calendarDayType,
       model: modelWrite.model ?? undefined,
       reasoningEffort: modelWrite.reasoningEffort ?? undefined,
     }, cachedLarkAppId, precondition.create);
@@ -4849,7 +4872,8 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
   }
   const b = body as Record<string, unknown>;
   const updates: {
-    name?: string; prompt?: string; schedule?: string;
+    name?: string; prompt?: string; schedule?: string; calendar?: string | null;
+    calendarDayType?: import('../services/work-calendar.js').CalendarDayType | null;
     deliver?: 'origin' | 'new-topic'; silent?: boolean;
     executionPosition?: ScheduleExecutionPosition; rootMessageId?: string; topicTitle?: string;
     chatId?: string; chatIds?: readonly string[] | null;
@@ -4862,6 +4886,14 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
   if (chatTargets?.ok) {
     updates.chatId = chatTargets.chatId;
     updates.chatIds = chatTargets.chatIds.length > 1 ? chatTargets.chatIds : null;
+  }
+  if (b.calendar !== undefined) {
+    try { updates.calendar = normalizeCalendarBinding(b.calendar) ?? null; }
+    catch { return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'calendar' }); }
+  }
+  if (b.calendarDayType !== undefined) {
+    try { updates.calendarDayType = normalizeCalendarDayType(b.calendarDayType); }
+    catch { return jsonRes(res, 400, { ok: false, error: 'invalid_field', field: 'calendarDayType' }); }
   }
   const precondition = parseSchedulePreconditionWrite(b, 'update');
   if (!precondition.ok) {
@@ -4964,6 +4996,13 @@ ipcRoute('PATCH', '/api/schedules/:id', async (req, res, p) => {
   }
   if (!result.ok) return jsonRes(res, 400, result);
   const task = result.task ?? scheduleStore.getTask(p.id);
+  if (task && (updates.calendar !== undefined || updates.calendarDayType !== undefined)) {
+    const row = composeScheduleRow(task);
+    dashboardEventBus.publish({ type: 'schedule.updated', body: { id: p.id, patch: {
+      calendar: row.calendar ?? null, calendarDayType: row.calendarDayType ?? null,
+      calendarCheck: row.calendarCheck ?? null, nextEligibleRunAt: row.nextEligibleRunAt ?? null,
+    } } });
+  }
   if (precondition.supplied) {
     const projection: ReturnType<typeof schedulePreconditionProjection> = task
       ? schedulePreconditionProjection(task)
@@ -6221,13 +6260,12 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
       canTalkDaemonCommands = cfg.canTalkDaemonCommands.join(' ');
     }
   } catch { /* none */ }
-  // Per-bot env → pretty JSON for the dashboard textarea. The dashboard is
-  // owner-authenticated, so showing the real values here is acceptable (same
-  // as editing bots.json directly); the chat-facing /config get masks them.
-  let env = '';
+  // Values are write-only in Dashboard; expose names for policy diagnosis.
+  const env = '';
+  let envKeys: string[] = [];
   try {
     const e = getBot(cachedLarkAppId).config.env;
-    if (e && typeof e === 'object' && Object.keys(e).length) env = JSON.stringify(e, null, 2);
+    if (e && typeof e === 'object') envKeys = Object.keys(e).sort();
   } catch { /* none */ }
   // defaultWorkingDir — the "仅默认目录" mode source. Mutually exclusive with
   // defaultOncall in the dashboard 3-way selector; the frontend derives the
@@ -6285,7 +6323,10 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     scratchDenyPaths: (() => { try { return getBot(cachedLarkAppId).config.scratchDenyPaths ?? null; } catch { return null; } })(),
     scratchSupported: process.platform === 'linux' || process.platform === 'darwin',
     codexAuthSync,
+    envPolicy: (() => { try { return getBot(cachedLarkAppId).config.envPolicy ?? { mode: 'inherit' }; } catch { return { mode: 'inherit' }; } })(),
     sandboxPaths: sandboxStore.getBotSandboxPaths(cachedLarkAppId) ?? null,
+    sandboxNetworkPolicy: (() => { try { return getBot(cachedLarkAppId).config.sandboxNetworkPolicy ?? null; } catch { return null; } })(),
+    sandboxNetworkPolicyPlatform: process.platform,
     readIsolation: sandboxStore.getBotReadIsolation(cachedLarkAppId),
     // Full enforceability (adapter support + no wrapperCli + macOS) — the UI
     // disables the toggle wherever the worker would fail-close on it.
@@ -6340,6 +6381,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     p2pMode,
     envelopeInjection,
     triggerUserAuth,
+    topicUnavailablePolicy: getBot(cachedLarkAppId).config.topicUnavailablePolicy === 'stop' ? 'stop' : 'legacy',
     replyDelivery,
     replyDeliveryDefault,
     replyDeliverySupported,
@@ -6360,6 +6402,7 @@ ipcRoute('GET', '/api/bot-default-oncall', async (_req, res) => {
     canTalkDaemonCommands,
     launchShell: getBot(cachedLarkAppId).config.launchShell ?? '',
     env,
+    envKeys,
     riff: redactRiffForClient(getBot(cachedLarkAppId).config.riff),
     summaryRange: summaryRangeFromBotConfig(getBot(cachedLarkAppId).config),
     skills: getBot(cachedLarkAppId).config.skills ?? null,
@@ -7546,6 +7589,20 @@ ipcRoute('PUT', '/api/bot-envelope-injection', async (req, res) => {
   jsonRes(res, 200, { ok: true, envelopeInjection: value ?? 'off' });
 });
 
+ipcRoute('PUT', '/api/bot-topic-unavailable-policy', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { topicUnavailablePolicy?: unknown };
+  try { body = await readJsonBody<{ topicUnavailablePolicy?: unknown }>(req); }
+  catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  const value = body.topicUnavailablePolicy;
+  if (value !== 'legacy' && value !== 'stop') return jsonRes(res, 400, { ok: false, error: 'invalid_topic_unavailable_policy' });
+  const spec = findConfigField('topicUnavailablePolicy');
+  if (!spec) return jsonRes(res, 500, { ok: false, error: 'spec_missing' });
+  const result = await applyConfigField(cachedLarkAppId, spec, value);
+  if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+  jsonRes(res, 200, { ok: true, topicUnavailablePolicy: getBot(cachedLarkAppId).config.topicUnavailablePolicy ?? 'legacy' });
+});
+
 // Per-bot 最终回复投递方式 replyDelivery。Body `{ replyDelivery: 'transcript'|'send'|'' }`:
 //   • 'transcript' → daemon 从 CLI 转写自动取本轮最后的 assistant 文本发最终回复卡，
 //     模型不再被要求 botmux send；仅 claude-code 与结构化转写白名单 CLI 支持，其它
@@ -7798,10 +7855,23 @@ ipcRoute('PUT', '/api/bot-env', async (req, res) => {
   }
   const r = await applyConfigField(cachedLarkAppId, spec, value);
   if (!r.ok) return jsonRes(res, 400, { ok: false, error: r.reason });
-  jsonRes(res, 200, { ok: true, env: value ? JSON.stringify(value, null, 2) : '' });
+  jsonRes(res, 200, { ok: true, env: '', envKeys: value ? Object.keys(value).sort() : [] });
 });
 
 // Codex credential policy: shared global login or an independent per-bot CODEX_HOME.
+ipcRoute('PUT', '/api/bot-env-policy', async (req, res) => {
+  if (!cachedLarkAppId) { jsonRes(res, 503, { error: 'larkAppId_not_set' }); return; }
+  let body: { envPolicy?: unknown };
+  try { body = await readJsonBody<{ envPolicy?: unknown }>(req); }
+  catch { jsonRes(res, 400, { error: 'invalid JSON' }); return; }
+  const spec = findConfigField('envPolicy')!;
+  const c = body.envPolicy === null ? { ok: true as const, value: null } : coerceConfigValue(spec, JSON.stringify(body.envPolicy));
+  if (!c.ok) { jsonRes(res, 400, { error: 'invalid environment policy' }); return; }
+  const r = await applyConfigField(cachedLarkAppId, spec, c.value);
+  if (!r.ok) { jsonRes(res, 400, { error: r.reason }); return; }
+  jsonRes(res, 200, { ok: true, envPolicy: c.value });
+});
+
 ipcRoute('PUT', '/api/bot-codex-auth-sync', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: { codexAuthSync?: unknown };
@@ -8148,6 +8218,16 @@ ipcRoute('PUT', '/api/bot-sandbox', async (req, res) => {
 // precedence layer of the FsPolicy — an empty/absent tier falls back to the
 // deny-by-default baseline. Passing all-empty CLEARS the field. next-session
 // 生效：running sessions keep their spawn-time policy, only new spawns re-read it.
+ipcRoute('PUT', '/api/bot-sandbox-network-policy', async (req, res) => {
+  if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
+  let body: { policy?: unknown };
+  try { body = await readJsonBody(req); } catch { return jsonRes(res, 400, { ok: false, error: 'bad_json' }); }
+  if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => key !== 'policy') || !Object.hasOwn(body, 'policy')) return jsonRes(res, 400, { ok: false, error: 'policy_required' });
+  const result = await applyConfigField(cachedLarkAppId, findConfigField('sandboxNetworkPolicy')!, body.policy);
+  if (!result.ok) return jsonRes(res, 400, { ok: false, error: result.reason });
+  jsonRes(res, 200, { ok: true, sandboxNetworkPolicy: getBot(cachedLarkAppId).config.sandboxNetworkPolicy ?? null });
+});
+
 ipcRoute('PUT', '/api/bot-sandbox-paths', async (req, res) => {
   if (!cachedLarkAppId) return jsonRes(res, 503, { error: 'larkAppId_not_set' });
   let body: { readWrite?: unknown; readOnly?: unknown; deny?: unknown };

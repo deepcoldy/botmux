@@ -619,3 +619,18 @@ describe('trusted schedule precondition configuration', () => {
     expect(listTasks(APP_ID)).toHaveLength(0);
   });
 });
+
+it('rebinds the protected Bash input after a Dashboard calendar edit', () => {
+  const task = createTaskWithOptionalPrecondition(createParams(), APP_ID, {
+    enabled: true, source: { kind: 'inline', script: 'printf 1' },
+  });
+  expect(updateTaskWithOptionalPrecondition(task.id, { calendar: 'demo' }, APP_ID)).toMatchObject({ ok: true });
+  const after = getTask(task.id)!;
+  expect(after.calendar).toBe('demo');
+  expect(resolveSchedulePrecondition(after, APP_ID)).toMatchObject({ kind: 'configured', enabled: true });
+  expect(updateTaskWithOptionalPrecondition(task.id, { calendarDayType: 'restday' }, APP_ID)).toMatchObject({ ok: true });
+  expect(getTask(task.id)?.calendarDayType).toBe('restday');
+  expect(resolveSchedulePrecondition(getTask(task.id)!, APP_ID)).toMatchObject({ kind: 'configured', enabled: true });
+  expect(updateTaskWithOptionalPrecondition(task.id, { calendar: null }, APP_ID)).toMatchObject({ ok: true });
+  expect(resolveSchedulePrecondition(getTask(task.id)!, APP_ID)).toMatchObject({ kind: 'configured' });
+});

@@ -210,7 +210,7 @@ function cliSelectionSnapshot(cliId: CliId): SessionCliLaunchSnapshotV1 {
   };
 }
 
-function cliSelectionSecurityError(botCfg: { env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean }, cliId: string, promptInjection: PromptInjection): string | undefined {
+function cliSelectionSecurityError(botCfg: { env?: Record<string, string>; backendType?: string; riff?: unknown; codexRpcInput?: boolean; sandbox?: boolean | 'off' | 'oncall' | 'scratch' }, cliId: string, promptInjection: PromptInjection): string | undefined {
   if (promptInjection === 'none' && !supportsZeroPromptInjection(cliId, botCfg)) return 'zero prompt injection requires a CLI with automatic final reply capture';
   if (cliId === 'riff') return 'Riff requires bot-level backend configuration and cannot be selected per session';
   if (botCfg.env && Object.keys(botCfg.env).length > 0) return 'CLI-selected sessions cannot use bot env';

@@ -520,6 +520,10 @@ describe('worker structured-turn status wiring', () => {
       source.indexOf('idleDetector.onIdle(async (evidenceSource)'),
       source.indexOf('drainBridgesThenMarkReady(evidenceSource);'),
     );
+    expect(callback).toContain('cliAdapter?.postTerminalPromptFence === true');
+    expect(callback).toContain('postTerminalPromptFenceHolds(evidenceSource, idleBackend)');
+    expect(callback.indexOf('drainBridges();'))
+      .toBeLessThan(callback.indexOf('postTerminalPromptFenceHolds(evidenceSource, idleBackend)'));
     // Pi's assistant_final is persisted asynchronously from the TUI clearing
     // Working... — an external idle landing while the authoritative viewport
     // still shows busy must defer exactly like a screen idle.
@@ -546,6 +550,39 @@ describe('worker structured-turn status wiring', () => {
     // so a deferred ZMX turn can never be pinned by the probe loop.
     const probe = functionSlice('scheduleBusyPatternIdleProbe', 'spawnCli');
     expect(probe).toContain('if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;');
+
+    const adopt = functionSlice('setupAdoptIdleDetection', 'seedBackendScreen');
+    expect(adopt).toContain("evidenceSource === 'external'");
+    expect(adopt).toContain('cliAdapter?.postTerminalPromptFence === true');
+    const adoptDrain = adopt.indexOf('drainBridges();');
+    const adoptFence = adopt.indexOf('postTerminalPromptFenceHolds(evidenceSource, idleBackend)');
+    expect(adoptDrain).toBeGreaterThanOrEqual(0);
+    expect(adoptFence).toBeGreaterThan(adoptDrain);
+  });
+
+  it('quarantines unconfirmed adapter submits without replaying them or their successors', () => {
+    const flush = functionSlice('flushPending', 'sendToPty');
+    const preflight = flush.indexOf('currentInputDeliveryQuarantine()');
+    const typeAhead = flush.indexOf('const typeAheadAllowed');
+    const arm = flush.indexOf('armInputDeliveryQuarantine(submissionBackend, item)');
+    const warning = flush.indexOf('scheduleSubmitFailureNotify(', arm);
+    const stop = flush.indexOf('if (deliveryQuarantine) break', warning);
+    expect(preflight).toBeGreaterThanOrEqual(0);
+    expect(preflight).toBeLessThan(typeAhead);
+    expect(arm).toBeGreaterThan(typeAhead);
+    expect(warning).toBeGreaterThan(arm);
+    expect(stop).toBeGreaterThan(warning);
+    expect(flush.slice(arm, stop)).not.toContain('pendingMessages.unshift(item)');
+
+    const ready = functionSlice('markPromptReady', 'persistCliSessionId');
+    expect(ready).toContain('currentInputDeliveryQuarantine()');
+    expect(ready).toContain('Ignoring prompt-ready while input delivery is quarantined');
+
+    const emit = functionSlice('emitReadyCodexTurns', 'stopCodexBridge');
+    expect(emit).toContain('releaseInputDeliveryQuarantineForStructuredTerminal(');
+
+    const teardown = functionSlice('killCli', 'stopOwnedSessionScope');
+    expect(teardown).toContain('inputDeliveryQuarantine = null');
   });
 
   it('flushes an OMP trailing candidate only after a complete quiet tick and non-busy viewport', () => {

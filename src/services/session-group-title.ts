@@ -14,8 +14,7 @@
 import { execFile } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { getBot } from '../bot-registry.js';
-import { redactChildEnv } from '../utils/child-env.js';
-import { sanitizePerBotEnv } from '../core/per-bot-env.js';
+import { botInjectedEnv, buildSessionChildEnv, type EnvPolicy } from '../core/env-policy.js';
 import { buildWrappedLaunch, wrapperLaunchEnv } from '../setup/cli-selection.js';
 import { renameChat } from './groups-store.js';
 import {
@@ -87,10 +86,10 @@ export function resolveOneShotCommand(
   return { argv: [...template] };
 }
 
-export function buildOneShotEnv(botEnv: unknown): NodeJS.ProcessEnv {
+export function buildOneShotEnv(botEnv: unknown, envPolicy?: EnvPolicy): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
-    ...redactChildEnv(process.env),
-    ...sanitizePerBotEnv(botEnv),
+    ...buildSessionChildEnv(process.env, envPolicy),
+    ...botInjectedEnv(botEnv, envPolicy),
   };
   // Never let the one-shot inherit a botmux session identity (redundant with
   // the marker scrub above, kept as an explicit invariant).
@@ -182,7 +181,7 @@ export function scheduleSessionGroupTitle(opts: {
       const prompt = buildTitlePrompt(userText, maxLen, localeForBot(larkAppId));
 
       const runOnce = () => new Promise<string>((resolve, reject) => {
-        const env = { ...buildOneShotEnv(cfg.env), ...wrapperEnv };
+        const env = { ...buildOneShotEnv(cfg.env, cfg.envPolicy), ...wrapperEnv };
         const child = execFile(argv[0], [...argv.slice(1), prompt], {
           timeout: TITLE_TIMEOUT_MS,
           maxBuffer: 1024 * 1024,

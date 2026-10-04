@@ -3,7 +3,8 @@ import { randomUUID } from 'node:crypto';
 import * as scheduleStore from '../services/schedule-store.js';
 import type { ScheduleReasoningEffort } from '../services/schedule-store.js';
 import { removeSchedulePrecondition } from '../services/schedule-precondition-store.js';
-import { removeScheduleRunLogs } from '../services/schedule-run-log-store.js';
+import { checkTaskCalendar, manualCalendarCheck, normalizeCalendarBinding, normalizeCalendarDayType } from '../services/work-calendar.js';
+import { appendScheduleRunLog, removeScheduleRunLogs } from '../services/schedule-run-log-store.js';
 import type { ScheduledTaskPreconditionOutcome } from '../services/schedule-precondition-gate.js';
 import { scheduleTimeZone, zonedTomorrowAt } from '../utils/timezone.js';
 import { emitHookEvent } from '../services/hook-runner.js';
@@ -533,8 +534,9 @@ async function tick(): Promise<void> {
     const nextMs = new Date(nextRunAt).getTime();
     if (nextMs > now) continue;
 
-    // Recurring: fast-forward if stale beyond grace window
-    if (task.parsed.kind !== 'once') {
+    // Fast-forward stale automatic occurrences. A durable manual request must
+    // reach claimRun, which consumes it, instead of leaking into a future tick.
+    if (task.parsed.kind !== 'once' && !task.manualRunRequested) {
       const grace = computeGraceSeconds(task.parsed);
       if ((now - nextMs) / 1000 > grace) {
         const newNext = computeNextRun(task.parsed, new Date(now).toISOString());
@@ -560,6 +562,39 @@ async function tick(): Promise<void> {
     });
     if (!claim.ok) continue;
     const claimedTask = claim.task;
+    if (claimedTask.manualRunRequested) executionContext.trigger = 'dashboard';
+    // Admission uses the locked task snapshot, before any Bash gate/model/message.
+    const calendarCheck = executionContext.trigger === 'scheduler'
+      ? checkTaskCalendar(claimedTask, claimedTask.larkAppId ?? ownerAppId ?? scheduleStore.getScheduleScope() ?? undefined)
+      : manualCalendarCheck(claimedTask);
+    if (calendarCheck && calendarCheck.status !== 'bypassed' && !calendarCheck.matches) {
+      scheduleStore.markCalendarBlocked(claimedTask.id, calendarCheck, executionContext.runId);
+      const status = calendarCheck.status === 'error' ? 'error' : 'skipped';
+      logger.info(`[scheduler] Calendar ${calendarCheck.calendar}: ${calendarCheck.reason} (${calendarCheck.date ?? 'unknown date'}), task ${claimedTask.id} ${status}`);
+      const appId = claimedTask.larkAppId ?? ownerAppId ?? scheduleStore.getScheduleScope();
+      if (appId) {
+        try {
+          appendScheduleRunLog({
+            id: executionContext.runId, taskId: claimedTask.id, trigger: 'scheduler',
+            startedAt: executionContext.startedAt, finishedAt: new Date().toISOString(),
+            durationMs: Date.now() - Date.parse(executionContext.startedAt),
+            outcome: status === 'skipped' ? 'calendar_skipped' : 'error',
+            precondition: 'not_checked', additionalPrompt: false,
+            calendarCheck, errorCode: status === 'error' ? calendarCheck.reason : undefined,
+          }, appId);
+        } catch (error) { logger.warn(`[scheduler] Calendar log unavailable: ${String(error)}`); }
+      }
+      dashboardEventBus.publish({ type: 'schedule.fired', body: {
+        id: claimedTask.id, runAt: Date.now(), status, calendarCheck,
+        error: status === 'error' ? calendarCheck.reason : undefined,
+      } });
+      emitScheduleFiredHook(claimedTask, status, status === 'error' ? calendarCheck.reason : undefined);
+      continue;
+    }
+    if (calendarCheck) {
+      claimedTask.lastCalendarCheck = calendarCheck;
+      scheduleStore.updateTask(claimedTask.id, { lastCalendarCheck: calendarCheck });
+    }
     logger.info(`[scheduler] Task "${claimedTask.name}" (${claimedTask.id}) triggered (kind=${claimedTask.parsed.kind})`);
 
     if (executeCallback) {
@@ -607,7 +642,7 @@ export function planCronRealign(
 ): Array<{ id: string; nextRunAt: string }> {
   const updates: Array<{ id: string; nextRunAt: string }> = [];
   for (const task of tasks) {
-    if (!task.enabled || task.parsed.kind !== 'cron') continue;
+    if (!task.enabled || task.manualRunRequested || task.parsed.kind !== 'cron') continue;
     if (!belongs(task)) continue;
     const next = computeNextRun(task.parsed);
     if (next && next !== task.nextRunAt) updates.push({ id: task.id, nextRunAt: next });
@@ -691,6 +726,8 @@ export function assertScheduleChatTargetLimit(chatIds: readonly string[], previo
 export function addTask(params: {
   id?: string;
   preconditionRef?: string;
+  calendar?: string;
+  calendarDayType?: import('../services/work-calendar.js').CalendarDayType;
   name: string;
   schedule: string;
   prompt: string;
@@ -733,6 +770,11 @@ export function addTask(params: {
       });
   assertScheduleChatTargetLimit(targets.chatIds ?? [targets.chatId]);
   const parsed = params.parsed ?? parseSchedule(params.schedule);
+  const calendar = normalizeCalendarBinding(params.calendar);
+  const dayType = normalizeCalendarDayType(params.calendarDayType);
+  if (!calendar && dayType === 'restday') throw new Error('calendar_required');
+  const calendarDayType = calendar && dayType === 'restday' ? dayType : undefined;
+  if (calendar && parsed.kind === 'once') throw new Error('calendar_once_unsupported');
   const nextRunAt = computeNextRun(parsed) ?? undefined;
   const executionPosition: ScheduleExecutionPosition = params.executionPosition
     ?? (params.deliver === 'new-topic'
@@ -764,6 +806,8 @@ export function addTask(params: {
   const task = scheduleStore.createTask({
     id: params.id,
     preconditionRef: params.preconditionRef,
+    calendar,
+    calendarDayType,
     name: params.name,
     schedule: params.schedule,
     parsed,
@@ -833,9 +877,11 @@ export function removeTask(id: string): boolean {
 export function enableTask(id: string): boolean {
   const task = scheduleStore.getTask(id);
   if (!task) return false;
+  // Repeating resume must not move a pending manual request to a future tick.
+  if (task.enabled && task.manualRunRequested) return true;
   const next = computeNextRun(task.parsed);
   scheduleStore.updateTask(id, {
-    enabled: true, disabledReason: undefined, nextRunAt: next ?? undefined,
+    enabled: true, disabledReason: undefined, nextRunAt: next ?? undefined, manualRunRequested: undefined,
   });
   return true;
 }
@@ -843,7 +889,7 @@ export function enableTask(id: string): boolean {
 export function disableTask(id: string): boolean {
   const task = scheduleStore.getTask(id);
   if (!task) return false;
-  scheduleStore.updateTask(id, { enabled: false, disabledReason: 'manual' });
+  scheduleStore.updateTask(id, { enabled: false, disabledReason: 'manual', manualRunRequested: undefined });
   return true;
 }
 
@@ -891,6 +937,8 @@ export function runNow(id: string): { ok: boolean; error?: string } {
   });
   if (!claim.ok) return claim;
   const claimedTask = claim.task;
+  claimedTask.lastCalendarCheck = manualCalendarCheck(claimedTask);
+  if (claimedTask.lastCalendarCheck) scheduleStore.updateTask(id, { lastCalendarCheck: claimedTask.lastCalendarCheck });
   // Don't block the caller — fire on next tick. `Promise.resolve().then`
   // coerces a synchronous throw from executeCallback into a rejection so the
   // error path always runs and we don't leak a 500 to the IPC client.
@@ -919,14 +967,14 @@ export function setEnabled(id: string, enabled: boolean): { ok: boolean; error?:
   const task = scheduleStore.getTask(id);
   if (!task) return { ok: false, error: 'not_found' };
   if (task.enabled === enabled
-    && (enabled || task.disabledReason === 'manual')) return { ok: true };
+    && (enabled || (task.disabledReason === 'manual' && !task.manualRunRequested))) return { ok: true };
   if (enabled) {
     const next = computeNextRun(task.parsed);
     scheduleStore.updateTask(id, {
-      enabled: true, disabledReason: undefined, nextRunAt: next ?? undefined,
+      enabled: true, disabledReason: undefined, nextRunAt: next ?? undefined, manualRunRequested: undefined,
     });
   } else {
-    scheduleStore.updateTask(id, { enabled: false, disabledReason: 'manual' });
+    scheduleStore.updateTask(id, { enabled: false, disabledReason: 'manual', manualRunRequested: undefined });
   }
   dashboardEventBus.publish({
     type: 'schedule.updated',
@@ -1006,6 +1054,8 @@ export function updateTask(
   id: string,
   updates: {
     name?: string;
+    calendar?: string | null;
+    calendarDayType?: import('../services/work-calendar.js').CalendarDayType | null;
     prompt?: string;
     schedule?: string;
     deliver?: 'origin' | 'new-topic';
@@ -1025,8 +1075,33 @@ export function updateTask(
   const task = scheduleStore.getTask(id);
   if (!task) return { ok: false, error: 'not_found' };
 
+  let calendar: string | undefined;
+  try { calendar = updates.calendar === undefined ? task.calendar : normalizeCalendarBinding(updates.calendar); }
+  catch { return { ok: false, error: 'invalid_calendar_name' }; }
+  let calendarDayType: import('../services/work-calendar.js').CalendarDayType | undefined;
+  try {
+    const dayType = normalizeCalendarDayType(updates.calendarDayType !== undefined ? updates.calendarDayType : updates.calendar !== undefined && !calendar ? undefined : task.calendarDayType);
+    if (!calendar && dayType === 'restday') return { ok: false, error: 'calendar_required' };
+    calendarDayType = calendar && dayType === 'restday' ? dayType : undefined;
+  } catch { return { ok: false, error: 'invalid_calendar_day_type' }; }
+  if (calendar) {
+    try {
+      const effectiveParsed = updates.schedule !== undefined ? parseSchedule(updates.schedule) : task.parsed;
+      if (effectiveParsed.kind === 'once') return { ok: false, error: 'calendar_once_unsupported' };
+    } catch (error) {
+      return { ok: false, error: `invalid_schedule: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  }
   const patch: Record<string, unknown> = {};
   const eventPatch: Record<string, unknown> = {};
+  if (updates.calendar !== undefined || updates.calendarDayType !== undefined) {
+    patch.calendar = calendar;
+    patch.calendarDayType = calendarDayType;
+    eventPatch.calendarDayType = calendarDayType ?? null;
+    patch.lastCalendarCheck = undefined;
+    eventPatch.calendar = calendar ?? null;
+    eventPatch.lastCalendarCheck = null;
+  }
   if (updates.name !== undefined) patch.name = updates.name;
   if (updates.prompt !== undefined) patch.prompt = updates.prompt;
   if (updates.silent !== undefined) {
@@ -1164,6 +1239,7 @@ export function updateTask(
     patch.parsed = parsed;
     const next = computeNextRun(parsed);
     patch.nextRunAt = next ?? undefined;
+    patch.manualRunRequested = undefined;
   }
 
   if (!scheduleStore.updateTask(id, patch)) return { ok: false, error: 'not_found' };

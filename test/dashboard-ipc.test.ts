@@ -2270,6 +2270,25 @@ describe('PUT /api/bot-reply-delivery — 最终回复投递方式', () => {
   });
   const persisted = (configPath: string) => JSON.parse(readFileSync(configPath, 'utf-8'))[0];
 
+  it('topic unavailable policy defaults to legacy and persists both choices with immediate readback', async () => {
+    await withBot('codex', async (base, configPath, appId) => {
+      expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ topicUnavailablePolicy: 'legacy' });
+      const setPolicy = (value: unknown) => fetch(`${base}/api/bot-topic-unavailable-policy`, {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ topicUnavailablePolicy: value }),
+      });
+      for (const policy of ['stop', 'legacy']) {
+        const response = await setPolicy(policy);
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({ ok: true, topicUnavailablePolicy: policy });
+        expect(persisted(configPath).topicUnavailablePolicy).toBe(policy);
+        expect(getBot(appId).config.topicUnavailablePolicy).toBe(policy);
+        expect(await (await fetch(`${base}/api/bot-default-oncall`)).json()).toMatchObject({ topicUnavailablePolicy: policy });
+      }
+      expect((await setPolicy('unknown')).status).toBe(400);
+      expect(persisted(configPath).topicUnavailablePolicy).toBe('legacy');
+    });
+  });
+
   it('claude-code: GET 生效值缺省 send（不随 CLI 翻转），PUT transcript / send 都落盘，PUT 空串 unset 回缺省', async () => {
     await withBot('claude-code', async (base, configPath, appId) => {
       const initial = await (await fetch(`${base}/api/bot-default-oncall`)).json();
@@ -5848,6 +5867,78 @@ describe('POST/PATCH /api/schedules — per-task model & effort', () => {
       expect(after.model).toBeUndefined();
       expect(after.reasoningEffort).toBeUndefined();
     });
+  });
+});
+
+describe('POST/PATCH /api/schedules — local work calendar', () => {
+  it('persists and reads the calendar, rejects bad bindings/once and clears with null', async () => {
+    const app = 'cli_calendar_api_test';
+    const dir = mkdtempSync(join(tmpdir(), 'dashboard-calendar-api-'));
+    const previous = config.session.dataDir;
+    const previousZone = process.env.BOTMUX_SCHEDULE_TIMEZONE;
+    let local: IpcServerHandle | undefined;
+    try {
+      config.session.dataDir = join(dir, 'data');
+      process.env.BOTMUX_SCHEDULE_TIMEZONE = 'Asia/Shanghai';
+      scheduleStore.setScheduleScope(app);
+      setLarkAppId(app);
+      registerBot({ larkAppId: app, larkAppSecret: '', cliId: 'gemini', apiOnly: true });
+      const { workCalendarPath } = await import('../src/services/work-calendar.js');
+      const fixture = JSON.parse(readFileSync(new URL('./fixtures/work-calendar/demo.json', import.meta.url), 'utf8'));
+      mkdirSync(join(dir, 'bots', app), { recursive: true });
+      writeFileSync(workCalendarPath(app), JSON.stringify(fixture));
+      local = await startIpcServer({ port: 0, host: '127.0.0.1' });
+      const base = `http://127.0.0.1:${local.port}`;
+      const catalog = await (await fetch(`${base}/api/schedules/calendars`)).json();
+      expect(catalog.calendars.find((row: any) => row.id === 'cn')).toMatchObject({ displayNames: { zh: '中国法定工作日历', en: 'China Statutory Work Calendar' } });
+      expect(catalog.calendars.some((row: any) => row.id === 'demo')).toBe(true);
+      const create = (body: Record<string, unknown>) => fetch(`${base}/api/schedules`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: 'fixture', schedule: '0 9 * * *', prompt: 'fixture', chatId: 'fixture_chat', ...body }),
+      });
+      const response = await create({ calendar: 'demo' });
+      expect(response.status).toBe(200);
+      const task = (await response.json()).task;
+      expect(task.calendar).toBe('demo');
+      expect(scheduleStore.getTask(task.id)?.calendar).toBe('demo');
+      const patch = (body: Record<string, unknown>) => fetch(`${base}/api/schedules/${task.id}`, {
+        method: 'PATCH', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      });
+      expect((await create({ calendar: '../bad' })).status).toBe(400);
+      expect((await create({ calendar: 'demo', schedule: '30m' })).status).toBe(400);
+      expect((await patch({ calendar: 42 })).status).toBe(400);
+      expect((await patch({ calendarDayType: 'weekend' })).status).toBe(400);
+      expect((await create({ calendarDayType: 'restday' })).status).toBe(400);
+      expect((await patch({ calendarDayType: 'restday' })).status).toBe(200);
+      expect(scheduleStore.getTask(task.id)?.calendarDayType).toBe('restday');
+      expect((await patch({ calendarDayType: 'workday' })).status).toBe(200);
+      expect((await patch({ schedule: '30m' })).status).toBe(400);
+      // Readback uses the persisted raw next trigger and the calendar's own zone.
+      scheduleStore.updateTask(task.id, { nextRunAt: '2028-01-08T01:00:00.000Z' });
+      const listed = (await (await fetch(`${base}/api/schedules`)).json()).schedules.find((row: any) => row.id === task.id);
+      expect(listed).toMatchObject({ calendar: 'demo', nextEligibleRunAt: '2028-01-08T01:00:00.000Z' });
+      // Built-in CN works through the same API and does not read the corrupt local extension file.
+      writeFileSync(workCalendarPath(app), '{broken');
+      const cn = await patch({ calendar: 'cn' });
+      expect(cn.status).toBe(200);
+      expect((await cn.json()).task).toMatchObject({ calendar: 'cn', calendarCheck: { timeZone: 'Asia/Shanghai' } });
+      writeFileSync(workCalendarPath(app), JSON.stringify(fixture));
+      // Missing definitions remain diagnostic and never change unbound tasks.
+      const missing = await patch({ calendar: 'absent' });
+      expect((await missing.json()).task).toMatchObject({ calendar: 'absent', calendarCheck: { reason: 'calendar_missing' } });
+      const cleared = await patch({ calendar: null });
+      expect(cleared.status).toBe(200);
+      expect((await cleared.json()).task.calendar).toBeUndefined();
+      expect(scheduleStore.getTask(task.id)?.calendar).toBeUndefined();
+      expect(scheduleStore.getTask(task.id)?.calendarDayType).toBeUndefined();
+    } finally {
+      if (local) await local.close();
+      config.session.dataDir = previous;
+      if (previousZone === undefined) delete process.env.BOTMUX_SCHEDULE_TIMEZONE;
+      else process.env.BOTMUX_SCHEDULE_TIMEZONE = previousZone;
+      scheduleStore.setScheduleScope('cli_ipc_test_bot001');
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

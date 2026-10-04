@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   checkWorkerAdmission,
   DEFAULT_MAX_MEMORY_FULL_AVG10,
-  DEFAULT_MIN_AVAILABLE_MEMORY_BYTES,
   DEFAULT_MIN_AVAILABLE_MEMORY_CAP_BYTES,
   evaluateWorkerAdmission,
   readHostMemoryPressure,
@@ -91,7 +90,7 @@ describe('worker memory admission', () => {
       cgroupPath: '/sys/fs/cgroup/docker/demo',
       warnings: [],
     });
-    expect(resolveWorkerPressurePolicy(undefined, pressure.totalMemoryBytes, pressure.totalMemorySource).minAvailableMemoryBytes).toBe(2 * GIB);
+    expect(resolveWorkerPressurePolicy(undefined, pressure.totalMemoryBytes).minAvailableMemoryBytes).toBe(2 * GIB);
   });
 
   it('uses a finite cgroup ancestor when the leaf is unlimited', () => {
@@ -219,26 +218,54 @@ describe('worker memory admission', () => {
     })).allowed).toBe(false);
   });
 
-  it('caps the default reserve at the 4 GiB spawn-cost floor instead of scaling with host capacity', () => {
-    // The cap must never drift below the host floor, or the host Math.max leg
-    // would silently revive a sub-floor fractional reserve.
-    expect(DEFAULT_MIN_AVAILABLE_MEMORY_CAP_BYTES).toBeGreaterThanOrEqual(DEFAULT_MIN_AVAILABLE_MEMORY_BYTES);
-    // host: max(4 GiB floor, min(4 GiB cap, 25% of total)) — uniformly 4 GiB
+  it('caps the default reserve at the 4 GiB spawn-cost cap instead of scaling with host capacity', () => {
+    expect(DEFAULT_MIN_AVAILABLE_MEMORY_CAP_BYTES).toBe(4 * 1024 ** 3);
+    // Host RAM and finite cgroup limits share one formula: min(4 GiB cap, 25%
+    // of the total). ≥16 GiB stays at the cap; smaller boxes scale down.
     for (const [totalGiB, expectedGiB] of [
-      [8, 4], [16, 4], [32, 4], [64, 4], [248, 4],
+      [2, 0.5], [4, 1], [8, 2], [16, 4], [32, 4], [64, 4], [248, 4],
     ] as const) {
       expect(
-        resolveWorkerPressurePolicy(undefined, totalGiB * GIB, 'host').minAvailableMemoryBytes,
+        resolveWorkerPressurePolicy(undefined, totalGiB * GIB).minAvailableMemoryBytes,
       ).toBe(expectedGiB * GIB);
     }
-    // cgroup-v2: min(4 GiB cap, 25% of the finite limit) with no host floor
-    for (const [totalGiB, expectedGiB] of [
-      [8, 2], [16, 4], [32, 4], [64, 4], [248, 4],
-    ] as const) {
-      expect(
-        resolveWorkerPressurePolicy(undefined, totalGiB * GIB, 'cgroup-v2').minAvailableMemoryBytes,
-      ).toBe(expectedGiB * GIB);
+  });
+
+  it('never defaults to a host reserve the host can never satisfy', () => {
+    // A flat 4 GiB host floor exceeds the whole RAM of a sub-4 GiB VPS, so
+    // MemAvailable can never reach it and every worker fork was rejected.
+    for (const totalGiB of [1, 2, 3, 3.7, 4, 4.5, 6, 8, 12]) {
+      const reserve = resolveWorkerPressurePolicy(undefined, totalGiB * GIB).minAvailableMemoryBytes;
+      expect(reserve).toBeLessThanOrEqual(totalGiB * GIB / 2);
     }
+  });
+
+  it('admits a worker on a sub-4 GiB host that has room for one more CLI', () => {
+    // Field shape: 3.7 GiB VPS, 2.2 GiB MemAvailable, no finite cgroup above
+    // the daemon, PSI idle. The old flat 4 GiB host floor rejected this fork —
+    // and every later one — even though a CLI worker peaks at ~0.6 GiB RSS.
+    const roomy = evaluateWorkerAdmission(hostPressure({
+      totalMemoryBytes: Math.round(3.7 * GIB),
+      availableMemoryBytes: Math.round(2.2 * GIB),
+      availableMemorySource: 'host',
+      memoryFullAvg10: 0,
+      memoryFullAvg10Source: 'host',
+    }));
+    expect(roomy.allowed).toBe(true);
+    expect(roomy.reasons).toEqual([]);
+
+    // The scaled reserve still blocks a genuinely drained small host.
+    const drained = evaluateWorkerAdmission(hostPressure({
+      totalMemoryBytes: Math.round(3.7 * GIB),
+      availableMemoryBytes: Math.round(0.5 * GIB),
+      availableMemorySource: 'host',
+      memoryFullAvg10: 0,
+      memoryFullAvg10Source: 'host',
+    }));
+    expect(drained.allowed).toBe(false);
+    expect(drained.reasons).toEqual([
+      'available memory 0.5 GiB is below the reserved 0.9 GiB',
+    ]);
   });
 
   it('admits a worker with tens of GiB free on a huge host while PSI stays healthy', () => {
@@ -725,7 +752,7 @@ describe('cgroup-v1 memory admission', () => {
       [8, 2], [16, 4], [32, 4],
     ] as const) {
       expect(
-        resolveWorkerPressurePolicy(undefined, totalGiB * GIB, 'cgroup-v1').minAvailableMemoryBytes,
+        resolveWorkerPressurePolicy(undefined, totalGiB * GIB).minAvailableMemoryBytes,
       ).toBe(expectedGiB * GIB);
     }
     // A named hierarchy without the bare memory controller is not a v1 member.

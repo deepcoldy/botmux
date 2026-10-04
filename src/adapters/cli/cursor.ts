@@ -19,6 +19,12 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'cursor',
+    // Whole ~/.cursor (chats store.db + projects agent-transcripts + skills):
+    // a directory-level readWrite bind under the sandbox, so the host daemon
+    // reads the same transcript the CLI writes (zero-prompt final harvest) and
+    // store.db keeps working fcntl locks. The worker pre-creates the dir at
+    // spawn (bwrap cannot bind a missing source) — see pre-create block.
+    authPaths: ['~/.cursor'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
     buildArgs({ resume, resumeSessionId, initialPrompt, model, disableCliBypass }) {

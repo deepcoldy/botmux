@@ -481,6 +481,7 @@ export const CLONE_EXCLUDED_KEYS = [
   'grantExpiryState',
   'sessionGroup',
   'chatReplyModes',
+  'chatSoloGroupMentionBypass',
   'chatFeedbackPolicies',
   'noCardChats',
   'quotaFallbackBot',

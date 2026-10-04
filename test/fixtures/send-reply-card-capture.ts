@@ -18,6 +18,8 @@ if (stubbedLargeUpload) {
   syncBuiltinESMExports();
 }
 
+const topicLookups = new Map<string, number>();
+
 (defaultHttpInstance as any).defaults.adapter = async (config: any) => {
   const url = new URL(config.url, 'https://open.feishu.cn');
   const method = String(config.method).toUpperCase();
@@ -30,6 +32,18 @@ if (stubbedLargeUpload) {
     const body = typeof config.data === 'string' ? JSON.parse(config.data) : config.data;
     console.log('CAPTURE_REPLY=' + JSON.stringify({ method, path: url.pathname, body }));
     data = { code: 0, data: { message_id: 'om_separate_message' } };
+  } else if (url.pathname.includes('/im/v1/messages/') && process.env.BOTMUX_TEST_TOPIC_STATES) {
+    const id = url.pathname.split('/').at(-1)!;
+    const states = JSON.parse(process.env.BOTMUX_TEST_TOPIC_STATES);
+    const count = (topicLookups.get(id) ?? 0) + 1;
+    topicLookups.set(id, count);
+    console.log('CAPTURE_TOPIC=' + JSON.stringify({ id, count }));
+    const state = states[id] ?? 'live';
+    if (state === 'error') throw new Error('topic lookup unavailable');
+    data = state === 'withdrawn-code' ? { code: 230011, msg: 'withdrawn' }
+      : { code: 0, data: { items: [{ message_id: id, chat_id: 'oc_test',
+        deleted: state === 'withdrawn' || (state === 'withdraw-after-preflight' && count > 1),
+        body: { content: '{"text":"hello"}' } }] } };
   } else if (url.pathname.includes('/im/v1/messages/')) {
     data = { code: 0, data: { items: [{ message_id: 'om_turn', body: { content: '{"text":"hello"}' } }] } };
   } else if (url.pathname.includes('/im/v1/chats/')) {

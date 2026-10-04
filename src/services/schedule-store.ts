@@ -87,6 +87,8 @@ export class IdempotencyConflictError extends Error {
  * whichever of `parsed.runAt`/`parsed.minutes`/`parsed.expr` applies).
  */
 export function canonicalScheduleInput(t: {
+  calendar?: string;
+  calendarDayType?: import('./work-calendar.js').CalendarDayType;
   name: string;
   schedule: string;
   parsed?: ParsedSchedule;
@@ -113,6 +115,8 @@ export function canonicalScheduleInput(t: {
 }): unknown {
   const targets = normalizeScheduleChatTargets({ chatId: t.chatId, chatIds: t.chatIds });
   return {
+    calendar: t.calendar,
+    calendarDayType: t.calendar && t.calendarDayType !== 'workday' ? t.calendarDayType : undefined,
     name: t.name,
     schedule: t.schedule,
     parsed: t.parsed
@@ -339,6 +343,11 @@ function migrate(raw: any): ScheduledTask | null {
 
   return {
     id: raw.id,
+    // Preserve malformed bindings so runtime fails closed instead of dropping the gate.
+    calendar: raw.calendar,
+    calendarDayType: raw.calendarDayType,
+    lastCalendarCheck: raw.lastCalendarCheck,
+    manualRunRequested: raw.manualRunRequested === true ? true : undefined,
     preconditionRef: typeof raw.preconditionRef === 'string' && raw.preconditionRef
       ? raw.preconditionRef
       : undefined,
@@ -590,6 +599,8 @@ function assertValidTaskId(id: string): void {
 export function createTask(params: {
   id?: string;
   preconditionRef?: string;
+  calendar?: string;
+  calendarDayType?: import('./work-calendar.js').CalendarDayType;
   name: string;
   schedule: string;
   parsed: ParsedSchedule;
@@ -653,6 +664,8 @@ export function createTask(params: {
     const task: ScheduledTask = {
       id,
       preconditionRef: params.preconditionRef,
+      calendar: params.calendar,
+      calendarDayType: params.calendarDayType,
       name: params.name,
       schedule: params.schedule,
       parsed: params.parsed,
@@ -705,7 +718,7 @@ export function removeTask(id: string, appId?: string): boolean {
 export function updateTask(
   id: string,
   updates: Partial<Pick<ScheduledTask,
-    'enabled' | 'disabledReason' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastRunId' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
+    'calendar' | 'calendarDayType' | 'lastCalendarCheck' | 'manualRunRequested' | 'enabled' | 'disabledReason' | 'lastRunAt' | 'nextRunAt' | 'lastStatus' | 'lastRunId' | 'lastError' | 'lastDeliveryError' | 'repeat' | 'rootMessageId' | 'scope' | 'executionPosition' | 'topicTitle' | 'chatType' | 'deliver' | 'name' | 'prompt' | 'schedule' | 'parsed' | 'silent' | 'workingDir' | 'followActive' | 'preconditionRef' | 'chatId' | 'model' | 'reasoningEffort'
   >> & { chatIds?: readonly string[] | null },
   appId?: string,
 ): boolean {
@@ -761,12 +774,14 @@ export function claimRun(
     if (task.lastStatus === 'running') {
       return { result: { ok: false, error: 'already_running' } as const, changed: false };
     }
+    const manualRunRequested = task.manualRunRequested;
+    delete task.manualRunRequested;
     Object.assign(task, claim, {
       lastStatus: 'running' as const,
       lastError: undefined,
       lastDeliveryError: undefined,
     });
-    return { result: { ok: true, task } as const, changed: true };
+    return { result: { ok: true, task: { ...task, manualRunRequested } } as const, changed: true };
   }, appId);
 }
 
@@ -775,14 +790,18 @@ export function requestRunNow(
   id: string,
   nextRunAt = new Date().toISOString(),
   appId?: string,
-): { ok: true } | { ok: false; error: 'not_found' | 'already_running' } {
-  return mutateTasks<{ ok: true } | { ok: false; error: 'not_found' | 'already_running' }>(working => {
+): { ok: true } | { ok: false; error: 'not_found' | 'already_running' | 'disabled' } {
+  return mutateTasks<{ ok: true } | { ok: false; error: 'not_found' | 'already_running' | 'disabled' }>(working => {
     const task = working.get(id);
     if (!task) return { result: { ok: false, error: 'not_found' } as const, changed: false };
     if (task.lastStatus === 'running') {
       return { result: { ok: false, error: 'already_running' } as const, changed: false };
     }
+    if (task.enabled === false) {
+      return { result: { ok: false, error: 'disabled' } as const, changed: false };
+    }
     task.nextRunAt = nextRunAt;
+    task.manualRunRequested = true;
     return { result: { ok: true } as const, changed: true };
   }, appId);
 }
@@ -1007,4 +1026,17 @@ export function startExternalWriteWatcher(): void {
   } catch (err: any) {
     logger.warn(`[schedule-store] Failed to start file watcher: ${err.message}`);
   }
+}
+
+/** Settle a calendar block without counting a model run. Matching claims only. */
+export function markCalendarBlocked(id: string, check: NonNullable<ScheduledTask['lastCalendarCheck']>, runId: string): void {
+  mutateTasks(working => {
+    const task = working.get(id);
+    if (!task || task.lastRunId !== runId) return { result: undefined, changed: false };
+    task.lastStatus = check.status === 'error' ? 'error' : 'skipped';
+    task.lastCalendarCheck = check;
+    task.lastError = check.status === 'error' ? check.reason : undefined;
+    task.lastDeliveryError = undefined;
+    return { result: undefined, changed: true };
+  });
 }

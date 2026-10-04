@@ -116,7 +116,12 @@ async function main(): Promise<void> {
   process.on('SIGHUP', () => void drain());
 
   logger.info(`[supervisor] starting fleet: ${botCount} bot(s) + dashboard`);
-  supervisor.start(members);
+  if (!supervisor.start(members)) {
+    // Another live supervisor already owns the fleet (two `botmux start`s
+    // overlapped, e.g. the autostart watchdog and a slow first start). It keeps
+    // supervising; this duplicate has spawned nothing and simply leaves.
+    process.exit(0);
+  }
   // Keep the process alive supervising; children + timers hold the event loop.
 }
 

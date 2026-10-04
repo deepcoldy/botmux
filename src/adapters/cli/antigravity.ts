@@ -59,6 +59,7 @@ import { findAntigravityConversationId } from '../../services/antigravity-discov
 
 const HISTORY_PATH = join(homedir(), '.gemini', 'antigravity-cli', 'history.jsonl');
 
+
 function currentFileSize(path: string): number {
   if (!existsSync(path)) return 0;
   try { return statSync(path).size; } catch { return 0; }
@@ -268,7 +269,11 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'antigravity',
-    authPaths: ['~/.gemini/oauth_creds.json', '~/.gemini/antigravity-cli/antigravity-oauth-token'],
+    // Whole ~/.gemini (oauth + antigravity-cli brain transcripts + history):
+    // a directory-level readWrite bind under the sandbox so the host daemon
+    // drains the same transcript the CLI writes. The worker pre-creates the
+    // dir at spawn (bwrap cannot bind a missing source).
+    authPaths: ['~/.gemini'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
     modelChoices: CLI_MODEL_CHOICES['antigravity'],
 

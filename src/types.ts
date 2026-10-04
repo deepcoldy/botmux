@@ -825,6 +825,15 @@ export interface Session {
    */
   replyTargetsPrunedThrough?: string;
   /**
+   * Daemon-side mirror of the worker's live built-in CronCreate
+   * taskId → create-time Lark turnId map (synced from the worker, which
+   * persists its own copy). The distinct non-null turnIds here are EXEMPT
+   * from replyTargets eviction so a scheduled fire still routes into the
+   * topic its task was created in even after 32+ newer turns (or a daemon
+   * restart). Local-terminal-created tasks carry turnId null and pin nothing.
+   */
+  cronTaskReplyAnchors?: Record<string, { turnId: string | null; createdAtMs: number }>;
+  /**
    * Durable receiver acknowledgement keyed by the exact inbound Lark
    * message_id. A receipt is written only after the worker has committed that
    * turn to its CLI input queue (or an adopt backend accepted the write).
@@ -1113,6 +1122,7 @@ export interface Session {
   sandboxReadonlyPaths?: string[];
   /** Network access decision recorded alongside `sandbox` at session creation. */
   sandboxNetwork?: boolean;
+  sandboxNetworkPolicy?: import('./core/sandbox-network-policy.js').SandboxNetworkPolicy;
   /** Persisted adopt metadata — allows adopt sessions to survive daemon restarts.
    *  Either tmuxTarget (tmux backend) OR zellijSession+zellijPaneId (zellij). */
   adoptedFrom?: {
@@ -1401,6 +1411,12 @@ export type ScheduleExecutionPosition = 'top-level' | 'topic' | 'new-topic' | 't
 
 export interface ScheduledTask {
   id: string;
+  /** Optional per-bot work-calendar name; filters automatic recurring dispatch only. */
+  calendar?: string;
+  calendarDayType?: import('./services/work-calendar.js').CalendarDayType;
+  lastCalendarCheck?: import('./services/work-calendar.js').CalendarCheck;
+  /** Durable CLI run-now request; consumed atomically when claiming a run. */
+  manualRunRequested?: boolean;
   /** Opaque pointer to a daemon-owned Bash precondition sidecar. The script is
    *  never stored in this sandbox-writable task row. Absence does not prove
    *  that no condition exists: runtime always checks the sidecar by task id. */
@@ -1722,7 +1738,7 @@ export interface PendingRepoSetup {
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
   | { type: 'worker_ipc_probe' }
-  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; credentialsSourceDir?: string; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig; existingAppServerEndpoint?: string; startupCommands?: string[]; env?: Record<string, string>; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean | 'off' | 'oncall' | 'scratch'; scratchStorage?: 'tmpfs' | 'disk'; scratchTmpfsSizeMb?: number; scratchDenyPaths?: string[]; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig | RemoteRunnerConfig; remoteBackendState?: RemoteRunnerBackendState; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; replyDelivery?: 'send' | 'transcript'; promptInjection?: 'default' | 'none'; solo?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
+  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; credentialsSourceDir?: string; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig; existingAppServerEndpoint?: string; startupCommands?: string[]; envPolicy?: import('./core/env-policy.js').EnvPolicy; env?: Record<string, string>; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean | 'off' | 'oncall' | 'scratch'; scratchStorage?: 'tmpfs' | 'disk'; scratchTmpfsSizeMb?: number; scratchDenyPaths?: string[]; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; sandboxNetworkPolicy?: import('./core/sandbox-network-policy.js').SandboxNetworkPolicy; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig | RemoteRunnerConfig; remoteBackendState?: RemoteRunnerBackendState; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; replyDelivery?: 'send' | 'transcript'; promptInjection?: 'default' | 'none'; solo?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
   /** `model` rides along on every turn for the SAME reason the restart IPC carries
    *  it: the crash-loop park recovery respawns the CLI from inside the worker on
    *  the next message, with no restart IPC to refresh the snapshot. Same
@@ -1915,6 +1931,14 @@ export type WorkerToDaemon =
   /** A live native terminal turn in a zero-injection session. Freeze its
    * reply destination before newer IM inputs can replace the sender. */
   | { type: 'terminal_turn_started'; turnId: string; startedAtMs: number; replyContextTurnId?: string }
+  /** Full-snapshot sync of the worker's live built-in CronCreate
+   *  taskId → create-time Lark turnId map. Sent once after every anchor
+   *  change (a CronCreate ack pairs) and once after the worker re-attaches
+   *  and restores anchors from disk. The daemon mirrors it onto the session
+   *  and exempts the referenced turnIds from replyTargets eviction, so a
+   *  scheduled fire still routes into its originating topic after 32+ newer
+   *  turns. turnId null = task created from a local-terminal turn. */
+  | { type: 'cron_task_anchors_sync'; anchors: Array<{ taskId: string; turnId: string | null }> }
   /** Transport-only receipt for ordinary Lark IM delivery. Emitted
    * synchronously when the live worker's IPC handler claims the exact turn,
    * before slow startup work; input-queue ownership is acknowledged separately

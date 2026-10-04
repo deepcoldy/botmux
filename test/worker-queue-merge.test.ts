@@ -243,6 +243,11 @@ describe('durable turn queue boundary', () => {
       { content: 'user turn' },
       { content: 'delivery', dispatchAttempt: 1 },
     )).toBe(true);
+    expect(shouldStopPendingBatch(
+      { content: 'serial turn 1' },
+      { content: 'serial turn 2' },
+      false,
+    )).toBe(true);
     expect(shouldStopPendingBatch({ content: 'user 1' }, { content: 'user 2' })).toBe(false);
   });
 

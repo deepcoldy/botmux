@@ -1157,7 +1157,7 @@ function BotDefaultsCard(props: {
           <BdTabGrid>
             {/* riff 在远端沙箱执行、本地无 CLI 进程，文件沙盒对它无意义（worker 侧已旁路）。 */}
             {bot.cliId !== 'riff' ? (
-              <section className="bd-tile"><SandboxSection bot={bot} patchBot={patchBot} /></section>
+              <section className="bd-tile"><SandboxSection bot={bot} patchBot={patchBot} /><NetworkPolicySection bot={bot} patchBot={patchBot} /></section>
             ) : null}
             {bot.cliId === 'codex' ? (
               <section className="bd-tile"><CodexAuthSection bot={bot} patchBot={patchBot} /></section>
@@ -1553,6 +1553,7 @@ function RuntimeEnvironmentSection(props: { bot: BotDefaultsRow; patchBot: Patch
     <section className="bd-section bd-runtime-env">
       <h3 className="bd-section-title">{tr('botDefaults.sectionRuntimeEnv')}</h3>
       <LaunchShellSection bot={props.bot} patchBot={props.patchBot} />
+      <EnvPolicySection bot={props.bot} patchBot={props.patchBot} />
       <EnvSection bot={props.bot} patchBot={props.patchBot} />
     </section>
   );
@@ -4883,6 +4884,47 @@ export function EnvelopeInjectionSection(props: { bot: BotDefaultsRow; patchBot:
   );
 }
 
+function TopicUnavailablePolicySection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<StatusMessage>(null);
+  async function save(value: 'legacy' | 'stop') {
+    setBusy(true);
+    setStatus(null);
+    try {
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/topic-unavailable-policy`, { topicUnavailablePolicy: value });
+      if (!res.ok || !res.body.ok) throw new Error(responseErrorText(res));
+      props.patchBot(props.bot.larkAppId, { topicUnavailablePolicy: res.body.topicUnavailablePolicy });
+      setStatus({ text: tr('botDefaults.cardPrefSaved'), ok: true });
+    } catch (error) {
+      setStatus({ text: caughtErrorText(error) });
+    } finally { setBusy(false); }
+  }
+  return (
+    <div className="bd-subsection" data-topic-unavailable-policy>
+      <div className="bd-row">
+        <span>{tr('botDefaults.topicUnavailablePolicy')}</span>
+        <div className="bd-field-title">
+          <DropdownField<'legacy' | 'stop'>
+            dataInput="topic-unavailable-policy"
+            ariaLabel={tr('botDefaults.topicUnavailablePolicy')}
+            disabled={busy}
+            value={props.bot.topicUnavailablePolicy ?? 'legacy'}
+            options={[
+              { value: 'legacy', label: tr('botDefaults.topicUnavailableLegacy') },
+              { value: 'stop', label: tr('botDefaults.topicUnavailableStop') },
+            ]}
+            onChange={value => void save(value)}
+          />
+          <InfoTip>{tr(props.bot.topicUnavailablePolicy === 'stop'
+            ? 'botDefaults.topicUnavailableStopHelp' : 'botDefaults.topicUnavailableHelp')}</InfoTip>
+        </div>
+      </div>
+      <StatusSpan status={status} />
+    </div>
+  );
+}
+
 /** 最终回复投递方式：on = transcript（daemon 从 CLI 转写自动取最终回复，模型不再被
  *  要求 botmux send），off = send（模型自己 botmux send）。开关显示的是生效值：缺省
  *  为 send；两个方向都显式落盘。当前 CLI 没有转写采集通道时开关禁用并说明。 */
@@ -4923,6 +4965,7 @@ export function ReplyDeliverySection(props: { bot: BotDefaultsRow; patchBot: Pat
   return (
     <section className="bd-section" data-reply-delivery>
       <h3 className="bd-section-title">{tr('botDefaults.replyDelivery')}</h3>
+      <TopicUnavailablePolicySection {...props} />
       <ToggleRow
         checked={transcript}
         disabled={busy || !supported || props.bot.promptInjection === 'none'}
@@ -7062,13 +7105,47 @@ function LaunchShellSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) 
   );
 }
 
-function EnvSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+export function EnvPolicySection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   const tr = useT();
-  const [value, setValue] = useState(typeof props.bot.env === 'string' ? props.bot.env : '');
+  const [mode, setMode] = useState<'inherit' | 'strict'>(props.bot.envPolicy?.mode ?? 'inherit');
+  const [names, setNames] = useState((props.bot.envPolicy?.inherit ?? []).join(', '));
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    setMode(props.bot.envPolicy?.mode ?? 'inherit');
+    setNames((props.bot.envPolicy?.inherit ?? []).join(', '));
+  }, [props.bot.larkAppId, props.bot.envPolicy]);
+  async function save(): Promise<void> {
+    setBusy(true);
+    setStatus(null);
+    try {
+      const envPolicy = { mode, ...(mode === 'strict' ? { inherit: names.split(/[\s,]+/).filter(Boolean) } : {}) };
+      const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/env-policy`, { envPolicy });
+      if (res.ok && res.body.ok) {
+        props.patchBot(props.bot.larkAppId, { envPolicy });
+        setStatus({ text: tr('botDefaults.envPolicySaved'), ok: true });
+      } else setStatus({ text: tr('botDefaults.envPolicyInvalid') });
+    } catch { setStatus({ text: tr('botDefaults.envPolicyInvalid') }); }
+    finally { setBusy(false); }
+  }
+  return <div className="bd-subsection">
+    <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.envPolicyHelp')}>{tr('botDefaults.envPolicyLabel')}</FieldTitle></h4>
+    <select data-input="envPolicyMode" value={mode} disabled={busy} onChange={e => setMode(e.currentTarget.value as 'inherit' | 'strict')}>
+      <option value="inherit">{tr('botDefaults.envPolicyInherit')}</option>
+      <option value="strict">{tr('botDefaults.envPolicyStrict')}</option>
+    </select>
+    {mode === 'strict' && <input data-input="envPolicyNames" value={names} disabled={busy} placeholder="HTTPS_PROXY, NODE_EXTRA_CA_CERTS" onChange={e => setNames(e.currentTarget.value)} />}
+    <div className="actions"><button className="primary" type="button" data-action="save-env-policy" disabled={busy} onClick={() => void save()}>{tr('botDefaults.envPolicySave')}</button><StatusSpan status={status} /></div>
+  </div>;
+}
+
+export function EnvSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [value, setValue] = useState('');
   const [status, setStatus] = useState<StatusMessage>(null);
   const [busy, setBusy] = useState(false);
 
-  useEffect(() => setValue(typeof props.bot.env === 'string' ? props.bot.env : ''), [props.bot.env]);
+  useEffect(() => setValue(''), [props.bot.larkAppId]);
 
   async function save(): Promise<void> {
     setStatus(null);
@@ -7076,9 +7153,9 @@ function EnvSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
     try {
       const res = await sendJson('PUT', `/api/bots/${encodeURIComponent(props.bot.larkAppId)}/env`, { env: value });
       if (res.ok && res.body.ok) {
-        const next = typeof res.body.env === 'string' ? res.body.env : '';
+        const next = ''; // Never echo stored values, including older daemon responses.
         setValue(next);
-        props.patchBot(props.bot.larkAppId, { env: next });
+        props.patchBot(props.bot.larkAppId, { env: next, envKeys: Array.isArray(res.body.envKeys) ? res.body.envKeys : [] });
         setStatus({ text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true });
       } else {
         setStatus({ text: `✗ ${responseErrorText(res)}` });
@@ -7093,6 +7170,8 @@ function EnvSection(props: { bot: BotDefaultsRow; patchBot: PatchBot }) {
   return (
     <div className="bd-subsection">
       <h4 className="bd-subsection-title"><FieldTitle help={tr('botDefaults.envHelp')}>{tr('botDefaults.sectionEnv')}</FieldTitle></h4>
+      <p>{tr('botDefaults.envStoredNames', { names: (props.bot.envKeys ?? []).join(', ') || '∅' })}</p>
+      <p className="muted">{tr('botDefaults.envWriteOnly')}</p>
       <textarea
         data-input="env"
         rows={5}
@@ -7872,4 +7951,37 @@ export function GrantSection(props: { bot: BotDefaultsRow; patchBot: PatchBot })
 
 export function renderBotDefaultsPage(root: HTMLElement): PageDisposer {
   return mountReactPage(root, <BotDefaultsPage />);
+}
+
+
+export function NetworkPolicySection({ bot, patchBot }: { bot: BotDefaultsRow; patchBot: PatchBot }) {
+  const tr = useT();
+  const [text, setText] = useState(JSON.stringify(bot.sandboxNetworkPolicy ?? { version: 1, public: { mode: 'allow' }, private: { mode: 'block' } }, null, 2));
+  const [status, setStatus] = useState<StatusMessage>(null);
+  const [busy, setBusy] = useState(false);
+  const supported = bot.sandboxNetworkPolicyPlatform === 'linux' && (bot.backendType ?? 'pty') === 'pty' && (bot.sandboxMode === 'oncall' || bot.sandboxMode == null && bot.sandbox === true);
+  useEffect(() => { if (bot.sandboxNetworkPolicy) setText(JSON.stringify(bot.sandboxNetworkPolicy, null, 2)); }, [bot.sandboxNetworkPolicy]);
+  async function save(clear: boolean) {
+    setBusy(true); setStatus(null);
+    try {
+      const policy = clear ? null : JSON.parse(text);
+      const result = await sendJson('PUT', `/api/bots/${encodeURIComponent(bot.larkAppId)}/sandbox-network-policy`, { policy });
+      if (!result.ok) throw new Error(result.body.error ?? 'Save failed');
+      patchBot(bot.larkAppId, { sandboxNetworkPolicy: result.body.sandboxNetworkPolicy });
+      setStatus({ ok: true, text: tr('botDefaults.networkSaved') });
+    } catch (error) { setStatus({ ok: false, text: (error as Error).message }); }
+    finally { setBusy(false); }
+  }
+  return <section className="bd-section" data-network-policy="">
+    <h3>{tr('botDefaults.networkPolicy')}</h3>
+    <p className="bd-section-note">{tr('botDefaults.networkPolicyHelp')}</p>
+    <p className="bd-section-note">{supported ? tr('botDefaults.networkRequirements') : tr('botDefaults.networkUnsupported')}</p>
+    <p className="bd-section-note">{bot.sandboxNetworkPolicy ? tr('botDefaults.networkConfigured') : tr('botDefaults.networkLegacy')}</p>
+    <textarea aria-label={tr('botDefaults.networkPolicy')} value={text} onChange={event => setText(event.target.value)} disabled={busy || !supported} rows={12} style={{ width: '100%', fontFamily: 'monospace' }} />
+    <div className="actions bd-section-actions">
+      <button className="primary" type="button" disabled={busy || !supported} onClick={() => void save(false)}>{tr('botDefaults.networkSave')}</button>
+      <button type="button" disabled={busy || !bot.sandboxNetworkPolicy} onClick={() => void save(true)}>{tr('botDefaults.networkClear')}</button>
+      <StatusSpan status={status} />
+    </div>
+  </section>;
 }

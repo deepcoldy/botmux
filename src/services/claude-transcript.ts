@@ -70,6 +70,30 @@ export interface TranscriptEvent {
   originalModel?: string;
   fallbackModel?: string;
   apiRefusalCategory?: string;
+  /** Claude Code writes `isMeta:true` on internal user records (tool results,
+   *  slash-command wrappers, compact summaries). Most are NOT real prompts and
+   *  stay filtered by isMeaningfulUserEvent, but the built-in scheduler's fire
+   *  record additionally carries `turnOrigin:"scheduled"` and DOES start a
+   *  real model turn — see {@link isScheduledTurnStartEvent}. */
+  isMeta?: boolean;
+  /** Turn-origin discriminator written by Claude Code ≥2.1.281. The built-in
+   *  CronCreate scheduler fires turns as user records with
+   *  `turnOrigin:"scheduled"` (plus `scheduledTaskId` / `scheduledFireId`).
+   *  Older builds (≤2.1.280) omit it; those fires are recognised via
+   *  `promptSource === "system"` — see {@link isScheduledTurnStartEvent}. */
+  turnOrigin?: string;
+  /** Provenance of a user record. Built-in scheduler fire records on older
+   *  Claude Code builds (≤2.1.280) carry `promptSource:"system"` but no
+   *  turnOrigin. NOTE this field is NOT unique to scheduler fires (cross-
+   *  session messages, task_notification on some builds also set it), so it
+   *  is only consulted after the isMeta guard AND with scheduledFireId set. */
+  promptSource?: string;
+  scheduledTaskId?: string;
+  scheduledFireId?: string;
+  /** Sidechain (sub-agent / Task tool) records and compact-boundary summary
+   *  records — both excluded from meaningful turn attribution. */
+  isSidechain?: boolean;
+  isCompactSummary?: boolean;
   /** Claude Code ≥2.1.259 stamps this on a `model_refusal_fallback` copied into
    *  a FORKED session: the record is history the fork inherited, and the switch
    *  it describes does NOT apply to this conversation. Treated as positive
@@ -1112,6 +1136,108 @@ export function isMeaningfulUserEvent(ev: TranscriptEvent | null | undefined): b
   const text = normaliseForFingerprint(stringifyUserContent(content));
   if (text.length === 0) return false;
   if (SYNTHETIC_USER_PREFIXES.some(p => text.startsWith(p))) return false;
+  return true;
+}
+
+/** Claude Code's built-in CronCreate tool name. Its tool_result ack carries
+ *  the session-scoped job id that later fire records report as
+ *  `scheduledTaskId`. */
+export const CLAUDE_CRON_CREATE_TOOL = 'CronCreate';
+
+/** Assistant-event tool_use block ids that called the built-in CronCreate.
+ *  The scheduled job id only comes back in the FOLLOWING user tool_result, so
+ *  the caller pairs this with {@link cronCreateAcks} — same dispatch/ack split
+ *  as background Task dispatches. */
+export function cronCreateToolUseIds(ev: TranscriptEvent | null | undefined): string[] {
+  if (!ev || (ev as any).isSidechain === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'assistant') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const ids: string[] = [];
+  for (const block of content as any[]) {
+    if (block && block.type === 'tool_use' && typeof block.id === 'string'
+      && block.name === CLAUDE_CRON_CREATE_TOOL) {
+      ids.push(block.id);
+    }
+  }
+  return ids;
+}
+
+/** Parse the CronCreate success ack. Real Claude Code (2.1.276 / 2.1.284,
+ *  and a scan of 821 local session transcripts) uses DISTINCT nouns:
+ *   - recurring: "Scheduled recurring job 02b077c4 (Every hour at :11) ..."
+ *   - one-shot:  "Scheduled one-shot task bf15f538 (34 18 20 9 *) ..."
+ *  An earlier regex only accepted `job`, so 13/16 real one-shot creates in
+ *  the corpus never paired and their fires routed as unknown tasks. The
+ *  `one-shot job` alternative stays for older builds that printed it. The
+ *  caller gates acceptance on a pending CronCreate tool_use id, so a quoted
+ *  ack inside unrelated output can never register a task; the tight shape
+ *  here is defence in depth. */
+const CRON_CREATE_ACK_TASK_ID_RE =
+  /Scheduled\s+(?:recurring\s+job|one-shot\s+(?:job|task))\s+([0-9A-Za-z_-]{4,})\b/i;
+
+export function cronCreateAcks(ev: TranscriptEvent | null | undefined):
+  Array<{ toolUseId: string; taskId: string }> {
+  if (!ev || (ev as any).isSidechain === true) return [];
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'user') return [];
+  const content = ev.message?.content;
+  if (!Array.isArray(content)) return [];
+  const acks: Array<{ toolUseId: string; taskId: string }> = [];
+  for (const block of content as any[]) {
+    if (!block || block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue;
+    const text = stringifyToolResultContent(block.content);
+    const m = CRON_CREATE_ACK_TASK_ID_RE.exec(text);
+    if (!m) continue;
+    acks.push({ toolUseId: block.tool_use_id, taskId: m[1] });
+  }
+  return acks;
+}
+
+/** True when a `type:'user'` event is the fire record of a Claude Code
+ *  **built-in** CronCreate scheduled turn. Two transcript shapes qualify:
+ *
+ *   - Claude Code ≥2.1.281: `isMeta:true` + `turnOrigin:"scheduled"`;
+ *   - Claude Code ≤2.1.280: `isMeta:true` + `promptSource:"system"` with
+ *     NO `turnOrigin`.
+ *
+ *  Both additionally require a non-empty `scheduledFireId`. These records are
+ *  deliberately excluded from isMeaningfulUserEvent — they are scheduler
+ *  machinery, not human typing — but they DO open a genuine model turn whose
+ *  final answer the user expects in the originating Lark thread.
+ *
+ *  The guards are deliberately tight (validated against 820 real session
+ *  transcripts): the isMeta check MUST precede the promptSource fallback —
+ *  many non-scheduler records (incl. task_notification) carry
+ *  `promptSource:"system"` with isMeta NOT true; and scheduledFireId is
+ *  mandatory — cross-session-message records are isMeta:true +
+ *  promptSource:"system" but have no fire id. A future build that drops
+ *  scheduledFireId fails closed (silent bucket, never mis-delivered). A
+ *  present turnOrigin other than "scheduled" (human/sdk/task_notification)
+ *  is rejected outright. Distinct from botmux's own native scheduler
+ *  (`botmux schedule add`), whose turns carry daemon-assigned
+ *  `schedule:<taskId>:<uuid>` ids and never touch this path. */
+export function isScheduledTurnStartEvent(ev: TranscriptEvent | null | undefined): boolean {
+  if (!ev || typeof ev !== 'object') return false;
+  const role = ev.message?.role ?? ev.type;
+  if (role !== 'user') return false;
+  // Hard guard: only internal meta records. Must stay ahead of the
+  // promptSource fallback below.
+  if (ev.isMeta !== true) return false;
+  if (ev.turnOrigin !== undefined) {
+    // Newer builds stamp the discriminator explicitly.
+    if (ev.turnOrigin !== 'scheduled') return false;
+  } else {
+    // Older builds (≤2.1.280) omit turnOrigin; recognise the fire via
+    // promptSource. isMeta already passed; scheduledFireId still required.
+    if (ev.promptSource !== 'system') return false;
+  }
+  // Require the fire identity: every real CronCreate fire carries it, and it
+  // rules out isMeta + promptSource:'system' lookalikes (cross-session
+  // messages) that happen to lack it.
+  if (typeof ev.scheduledFireId !== 'string' || ev.scheduledFireId.length === 0) return false;
+  if (ev.isSidechain === true || ev.isCompactSummary === true) return false;
   return true;
 }
 

@@ -67,7 +67,7 @@ import { hasTriggeredMessage, markMessageTriggered, _resetCacheForTest as _reset
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
 import { ensureSignedChatDefault } from '../../services/signed-chat-defaults.js';
 import { getSessionGroup } from '../../services/session-groups-store.js';
-import { resolveRegularGroupMode, resolveGroupMentionMode, type GroupMentionMode } from '../../services/chat-reply-mode-store.js';
+import { resolveRegularGroupMode, resolveGroupMentionMode, isSoloGroupMentionBypassEnabled, type GroupMentionMode } from '../../services/chat-reply-mode-store.js';
 import { buildSummaryCommandPrompt, type SummaryChatKind, type SummaryCommandMatch, type SummaryCommandRuntimeContext } from './summary-command.js';
 import { DEFAULT_SUMMARY_PROMPT, summaryRangeFromBotConfig } from '../../services/summary-range-store.js';
 import { isSubstituteEnabledForChat } from '../../services/substitute-chat-toggle-store.js';
@@ -2372,7 +2372,7 @@ async function sendGrantRequestToApproverDm(o: {
 
 /**
  * Check group message addressing:
- * - 'allowed'     -> sender is allowed, bot was @mentioned or solo group
+ * - 'allowed'     -> sender is allowed, bot was @mentioned or enabled solo-group bypass applies
  * - 'not_allowed' -> bot was @mentioned but sender is not in allowlist
  * - 'ignore'      -> not addressed to bot at all
  */
@@ -2388,16 +2388,15 @@ export async function checkGroupMessageAccess(
     return isAllowed ? 'allowed' : 'not_allowed';
   }
 
-  // No @mention — only allow if sender is the sole human in the group
-  // AND this is the only bot in the chat. With multiple bots, require @mention
-  // to disambiguate.
+  // No @mention — the enabled solo-group bypass requires both a sole human
+  // and a sole bot. With multiple bots, require @mention to disambiguate.
   //
   // 若消息 @ 了别的具体成员（mentionsAnotherMember），群必然不是 1人1bot——
   // 只有群成员能被 @，多出的那个 @ 本身就是人数变化的证据。上游可能还抱着
   // 陈旧缓存 {1,1}（刚拉了新 bot 的 TTL 窗口），这会直接跳过人数查询落到
   // 'ignore'，挡住「用户 @ 新 bot、老 bot 跟着回复」。群聊 @ 策略 never/ambient
   // 在调用方（relax 条款）已先行结算，这里不受影响。
-  if (isAllowed && !mentionsAnotherMember(larkAppId, message)) {
+  if (isAllowed && isSoloGroupMentionBypassEnabled(larkAppId, chatId) && !mentionsAnotherMember(larkAppId, message)) {
     const { userCount, botCount } = await getGroupStats(larkAppId, chatId);
     logger.debug(`Group user count: ${userCount}, bot count: ${botCount}`);
     if (userCount <= 1 && botCount <= 1) {
@@ -4730,7 +4729,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // Permission gating — same shape as before, just keyed on
       // `ownsSession` (anchor-aware) instead of "rootId presence":
       //
-      //   ownsSession + 1v1 group → relax (no @mention required)
+      //   ownsSession + 1v1 group → relax when solo-group bypass is enabled
       //   ownsSession + multi     → require @mention
       //   !ownsSession (group)    → require @mention + allowlist
       //   p2p                     → allowlist only
@@ -4738,13 +4737,14 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       let commandTrigger: CommandTriggerMatch | undefined;
       if (chatType === 'group') {
         const mentionMode = resolveGroupMentionMode(larkAppId, chatId);
+        const soloGroupMentionBypass = isSoloGroupMentionBypassEnabled(larkAppId, chatId);
         // 消息里 @ 了别的具体成员,就已经证明群不是 1人1bot（只有群成员能被 @）——
         // 此刻末条 solo 放行必然不成立,而 stats 只被末条消费,直接跳过这次（可能
         // 昂贵的）人数查询。这在「刚拉了新 bot、用户 @ 新 bot」窗口里尤为重要：
         // 拦截老 bot 的同时不再为它反复刷新陈旧缓存。
         const mentionsOther = mentionsAnotherMember(larkAppId, message);
         let stats: { userCount: number; botCount: number } | null = null;
-        if (ownsSession && !replyRootId && !mentionsOther && mentionMode !== 'never') {
+        if (soloGroupMentionBypass && ownsSession && !replyRootId && !mentionsOther && mentionMode !== 'never') {
           stats = await getGroupStats(larkAppId, chatId);
         }
         // 免@ 斜杠命令（commandTriggers）：与「群聊 @ 策略」正交 —— 它不放开整个群
@@ -4805,7 +4805,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // 多人群里旁人不 @ 也会触发 bot）。现在与普通群共用同一套「群聊 @ 策略」:
         // 默认 'always' 在多人群里必须 @，想要话题内免@续话就把 mentionMode 配成
         // 'topic'（下方条款已同时覆盖话题群 thread 与普通群 shared topic），
-        // 'never'/'ambient' 亦按各自语义生效。1人1bot 的 solo 群仍走末条放行。
+        // 'never'/'ambient' 亦按各自语义生效。1人1bot 群在 solo 开关启用时走末条放行。
         // 注：pairedForwardSeed 仅在 never/ambient 模式下产生，且 ambient redirect
         // 已在配对前排除，故 isAllowed=true 时下方 never/ambient 条款必然放行；
         // 不在此单独加 clause，以免 isAllowed=false 时绕过权限检查。
@@ -4820,7 +4820,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           || (isAllowed && mentionMode === 'ambient' && !mentionsOther)
           || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id && !mentionsOther)
           || commandTriggerRelax
-          || (ownsSession && isAllowed && !!stats && !mentionsOther && stats.userCount <= 1 && stats.botCount <= 1);
+          || (soloGroupMentionBypass && ownsSession && isAllowed && !!stats && !mentionsOther && stats.userCount <= 1 && stats.botCount <= 1);
         if (commandTriggerRelax) {
           logger.info(
             `[command-trigger:${larkAppId}] ${commandTrigger?.cmd} 免@ 命中` +

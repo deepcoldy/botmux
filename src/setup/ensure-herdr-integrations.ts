@@ -24,6 +24,7 @@ import { resolveHerdrTraexPluginConfig } from '../config.js';
 import { withFileLock } from '../utils/file-lock.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { redactChildEnv } from '../utils/child-env.js';
+import { herdrExecutable } from '../utils/herdr-executable.js';
 
 /**
  * Env for every `herdr` invocation in this file.
@@ -112,7 +113,7 @@ function probeHerdrVersion(): string | undefined {
 }
 
 function herdrSupportsPlugins(): { ok: true } | { ok: false; version?: string } {
-  const probe = spawnSync('herdr', ['plugin', '--help'], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000, encoding: 'utf-8', env: herdrChildEnv() });
+  const probe = spawnSync(herdrExecutable(), ['plugin', '--help'], { stdio: ['ignore', 'pipe', 'pipe'], timeout: 5000, encoding: 'utf-8', env: herdrChildEnv() });
   if (probe.status === 0) return { ok: true };
   return { ok: false, version: probeHerdrVersion() };
 }
@@ -209,7 +210,7 @@ function listInstalledIntegrations(): Set<string> | undefined {
 }
 
 function spawnHerdr(args: string[], timeout = 60_000): { ok: true; stdout: string } | { ok: false; reason: string; stdout: string } {
-  const result = spawnSync('herdr', args, {
+  const result = spawnSync(herdrExecutable(), args, {
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout,
     encoding: 'utf-8',
@@ -256,7 +257,7 @@ export function spawnHerdrAsync(args: string[], timeout = 60_000): Promise<{ ok:
     // WHOLE group (herdr + any git/npm/install-script it spawned) rather than just the
     // direct child — which could otherwise keep writing the plugin dir / ~/.trae in the
     // background and race a retry. POSIX only; Windows would need a different teardown.
-    const child = spawn('herdr', args, { stdio: ['ignore', 'pipe', 'pipe'], detached: true, env: herdrChildEnv() });
+    const child = spawn(herdrExecutable(), args, { stdio: ['ignore', 'pipe', 'pipe'], detached: true, env: herdrChildEnv() });
     timer = setTimeout(() => {
       timedOut = true;
       try { if (child.pid) process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch { /* gone */ } }

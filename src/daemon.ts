@@ -207,6 +207,8 @@ import {
   storedSessionAnchorId,
   larkTransportEnabled,
 } from './core/types.js';
+import { assertSendTopicsAvailable } from './cli/topic-send-guard.js';
+import { getMessageDetail as getTopicMessageDetail } from './im/lark/client.js';
 import { computeSoloSessionForBot, effectiveReplyDelivery } from './core/reply-delivery.js';
 import {
   bindPrincipalLaneAdmissionKeys,
@@ -2920,6 +2922,7 @@ async function ensureVcMeetingReceiverSession(
     session.sandboxHidePaths = receiverSandboxed ? (bot.config.sandboxHidePaths ?? []) : [];
     session.sandboxReadonlyPaths = receiverSandboxed ? (bot.config.sandboxReadonlyPaths ?? []) : [];
     session.sandboxNetwork = receiverSandboxed ? (bot.config.sandboxNetwork !== false) : true;
+    session.sandboxNetworkPolicy = bot.config.sandboxNetworkPolicy ? structuredClone(bot.config.sandboxNetworkPolicy) : undefined;
     session.backendType = isolation.backendType;
     sessionStore.updateSession(session);
 
@@ -4061,9 +4064,12 @@ async function sessionReply(
     type: string,
     replyInThread: boolean,
     uuid?: string,
-  ): Promise<string> => persistPrincipalLaneOutbound(await (outboundOptions
-    ? replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext, outboundOptions)
-    : replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext)));
+  ): Promise<string> => {
+    await assertSendTopicsAvailable(appId, [messageId], opts?.topicMessageLookup ?? getTopicMessageDetail, getBot(appId).config.topicUnavailablePolicy);
+    return persistPrincipalLaneOutbound(await (outboundOptions
+      ? replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext, outboundOptions)
+      : replyMessage(appId, messageId, body, type, replyInThread, uuid, hookContext)));
+  };
 
   // Chat-scope: post a plain message to the chat. No reply_in_thread → keeps
   // the conversation flat in 普通群. The card layer carries chatId in its button
@@ -4091,7 +4097,7 @@ async function sessionReply(
           opts.uuid,
         );
       } catch (err) {
-        if (!(err instanceof MessageWithdrawnError)) throw err;
+        if (!(err instanceof MessageWithdrawnError) || getBot(appId).config.topicUnavailablePolicy === 'stop') throw err;
         await opts.beforeQuoteFallback?.();
         logger.warn(
           `[routing] VC IM quote target withdrawn (${opts.quoteMessageId}); `
@@ -20036,6 +20042,7 @@ function cloneIndependentLaunchPosture(source: Session, child: Session): void {
   child.sandboxHidePaths = source.sandboxHidePaths;
   child.sandboxReadonlyPaths = source.sandboxReadonlyPaths;
   child.sandboxNetwork = source.sandboxNetwork;
+  child.sandboxNetworkPolicy = source.sandboxNetworkPolicy ? structuredClone(source.sandboxNetworkPolicy) : undefined;
   child.reasoningEffort = source.reasoningEffort;
   child.modelBackendVariant = source.modelBackendVariant;
   child.model = source.model;
@@ -28703,6 +28710,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           finishedAt,
           durationMs: Math.max(0, Date.parse(finishedAt) - Date.parse(executionContext.startedAt)),
           additionalPrompt: precondition.additionalPrompt,
+          calendarCheck: task.lastCalendarCheck,
           ...(errorDetails?.errorCode ? { errorCode: errorDetails.errorCode } : {}),
           ...(errorDetails?.error !== undefined ? { error: errorDetails.error } : {}),
           ...(targetResults !== undefined ? { targetResults } : {}),

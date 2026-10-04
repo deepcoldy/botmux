@@ -1,4 +1,6 @@
 import { handoffCardClosed, handoffCardBlocksStreaming, applyHandoffCardEvent, type HandoffCardEvent } from './handoff-card-lifecycle.js';
+import { assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../cli/topic-send-guard.js';
+import { getMessageDetail as getTopicMessageDetail } from '../im/lark/client.js';
 import { commitTriggerStreamingCard, discardTriggerStreamingCard, hasPendingTriggerStreamingCard } from './trigger-streaming-card.js';
 import { sessionPromptInjection } from './prompt-injection.js';
 import { sandboxBoolValue, normalizeSandboxMode, normalizeScratchStorage } from '../adapters/cli/sandbox-mode.js';
@@ -39,7 +41,7 @@ import { persistStreamCardState, rememberLastCliInput } from './session-manager.
 import { spawnWorker, isStandaloneBinary, WORKER_ENTRY_SUBCOMMAND } from './self-spawn.js';
 import { resolveSessionLaunchModel, resolveSessionGroupSettings } from './session-model.js';
 import { effectiveReplyDelivery } from './reply-delivery.js';
-import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, rehomeReplyTargetState, replyTargetKey } from './reply-target.js';
+import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
 import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
 import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName, type IdleCardLabel } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
@@ -66,6 +68,7 @@ import {
   type MojoLivePatch,
 } from '../adapters/backend/mojo-types.js';
 import { sanitizePerBotEnv } from './per-bot-env.js';
+import { buildBotWorkerEnv } from './env-policy.js';
 import { normalizeExistingAppServerEndpoint } from './existing-app-server.js';
 import {
   isExistingAppServerSharedAdoptPersistedSession,
@@ -814,6 +817,8 @@ function syncWorkerDisplayMode(ds: DaemonSession): void {
 // ─── Callbacks set by daemon at startup ─────────────────────────────────────
 
 export interface WorkerSessionReplyOptions {
+  /** Per-delivery lookup cache, shared only across this send pipeline. */
+  topicMessageLookup?: TopicMessageLookup;
   uuid?: string;
   quoteMessageId?: string;
   beforeQuoteFallback?: () => void | Promise<void>;
@@ -10130,6 +10135,7 @@ export async function forkSession(
   childSession.sandboxHidePaths = ds.session.sandboxHidePaths;
   childSession.sandboxReadonlyPaths = ds.session.sandboxReadonlyPaths;
   childSession.sandboxNetwork = ds.session.sandboxNetwork;
+  childSession.sandboxNetworkPolicy = ds.session.sandboxNetworkPolicy ? structuredClone(ds.session.sandboxNetworkPolicy) : undefined;
   childSession.reasoningEffort = ds.session.reasoningEffort;
   childSession.modelBackendVariant = ds.session.modelBackendVariant;
   childSession.model = ds.session.model;
@@ -12151,6 +12157,7 @@ export function forkWorker(
       ds.session.sandboxHidePaths = botCfg.sandboxHidePaths ?? [];
       ds.session.sandboxReadonlyPaths = botCfg.sandboxReadonlyPaths ?? [];
       ds.session.sandboxNetwork = botCfg.sandboxNetwork !== false;
+      ds.session.sandboxNetworkPolicy = botCfg.sandboxNetworkPolicy ? structuredClone(botCfg.sandboxNetworkPolicy) : undefined;
       if (ds.session.sandbox === 'scratch') {
         ds.session.sandboxScratch = {
           storage: normalizeScratchStorage(botCfg.scratchStorage),
@@ -12282,7 +12289,7 @@ export function forkWorker(
   const botmuxBinDir = resolveBotmuxWrapperBinDir(process.env);
   const pathWithBotmux = prependBotmuxBin(botmuxBinDir, process.env.PATH);
 
-  const forkEnv = workerForkEnv(process.env);
+  const forkEnv = workerForkEnv(buildBotWorkerEnv(process.env, botCfg.envPolicy));
   // Dequeue only after every earlier launch-preparation write has finished.
   // The exact input remains journaled until the worker confirms its adapter
   // submission boundary; daemon send/ready are intentionally too early.
@@ -12590,6 +12597,7 @@ export function forkWorker(
     // ANTHROPIC_BASE_URL/AUTH_TOKEN for a GLM/3rd-party bot). Adopt sessions are
     // observed, not driven, so forkAdoptWorker intentionally omits it.
     env: ds.session.cliLaunchSnapshot || ds.session.cliInstanceBinding ? undefined : botCfg.env,
+    envPolicy: botCfg.envPolicy,
     // Freeze the normalized sparse reply style at worker spawn. Both the
     // session-rendered botmux-send guide and the CLI card renderer consume the
     // same env snapshot, so a dashboard edit cannot split their behavior inside
@@ -12609,6 +12617,7 @@ export function forkWorker(
     sandboxHidePaths: ds.session.sandboxHidePaths ?? [],
     sandboxReadonlyPaths: ds.session.sandboxReadonlyPaths ?? [],
     sandboxNetwork: ds.session.sandboxNetwork !== false,
+    sandboxNetworkPolicy: ds.session.sandboxNetworkPolicy ? structuredClone(ds.session.sandboxNetworkPolicy) : undefined,
     // Per-bot local read isolation (enforced worker-side; the worker gates it).
     // Sibling data needs no app-id enumeration: per-bot dirs are denied wholesale
     // and per-bot session files by filename pattern (see buildV2DenyPaths).
@@ -13363,6 +13372,25 @@ function setupWorkerHandlers(
       case 'worker_ipc_ready':
         // Consumed by the standalone bootstrap listener installed at spawn.
         break;
+      case 'cron_task_anchors_sync': {
+        // Full-snapshot mirror of the worker's live built-in CronCreate
+        // task→create-turn map. The referenced replyTargets records are
+        // exempt from the 32-entry LRU eviction so a scheduled report fired
+        // long after creation still resolves to its original topic. The
+        // enclosing `ds.worker !== worker` guard already rejects snapshots
+        // from a replaced generation.
+        if (!Array.isArray(msg.anchors)) break;
+        const incoming = msg.anchors
+          .filter((a): a is { taskId: string; turnId: string | null } =>
+            !!a && typeof a.taskId === 'string'
+            && (a.turnId === null || typeof a.turnId === 'string'));
+        const { anchors } = reconcileCronTaskReplyAnchors(
+          ds.session.cronTaskReplyAnchors, incoming,
+        );
+        ds.session.cronTaskReplyAnchors = anchors;
+        sessionStore.updateSession(ds.session);
+        break;
+      }
       case 'persistent_backend_target': {
         ds.session.persistentBackendTarget = msg.target;
         sessionStore.updateSession(ds.session);
@@ -17272,6 +17300,7 @@ function deliverFinalOutput(
   }
   const cb = requireCallbacks();
   const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+  let topicMessageLookup: TopicMessageLookup | undefined;
   const scopedReply = (
     content: string,
     msgType?: string,
@@ -17283,7 +17312,7 @@ function deliverFinalOutput(
     msgType,
     ds.larkAppId,
     fallbackTurnId(ds, turnId),
-    { ...opts, sourceSessionId: ds.session.sessionId },
+    { ...opts, sourceSessionId: ds.session.sessionId, ...(topicMessageLookup ? { topicMessageLookup } : {}) },
   );
   setTimeout(async () => {
     if (!isStillOwned()) {
@@ -17698,6 +17727,14 @@ function deliverFinalOutput(
               : {}),
           }
         : codexAppSettlementReply ?? { uuid: bridgeFinalOutputUuid(ds, msg) };
+      if (!managedReceiver && getBot(ds.larkAppId).config.topicUnavailablePolicy === 'stop') {
+        topicMessageLookup = createTopicMessageLookupCache(getTopicMessageDetail).lookup;
+        const topicTarget = frozenReplyTarget ?? resolveSessionReplyTarget(ds, fallbackTurnId(ds, msg.replyTurnId ?? msg.turnId));
+        await assertSendTopicsAvailable(ds.larkAppId,
+          [topicTarget.mode === 'thread' || topicTarget.mode === 'quote' ? topicTarget.rootMessageId : undefined],
+          topicMessageLookup, 'stop');
+        if (!isStillOwned()) { onComplete?.(false); return; }
+      }
       if (!managedReceiver && (!msg.kind || msg.kind === 'bridge') && replyCardModeFor(ds, msg.turnId) !== 'legacy') {
         await flushTurnReplyTools(ds, msg.turnId, msg.dispatchAttempt).catch(error => {
           logger.warn(`[${t}] reply-card final tool flush: ${error.message}`);
@@ -17775,6 +17812,21 @@ function deliverFinalOutput(
         // session and consume only this turn's automatic delivery retry.
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
         onComplete?.(true);
+        return;
+      }
+      if (err instanceof TopicSendError && err.code === 'TOPIC_SEND_BLOCKED') {
+        // The original topic cannot receive a notice. Surface the failure on the
+        // existing Dashboard attention channel without changing the send route.
+        ds.agentAttention = { kind: 'blocked', reason: err.message, at: Date.now() };
+        // Push the needs-you row immediately; the owner-reminder sweep would
+        // surface it eventually, but the Dashboard must not wait for the next
+        // row refresh to light up.
+        publishAttentionPatch(ds);
+        emitSessionLifecycleHook(ds, 'session.requires_attention', {
+          reason: 'topic_send_blocked', message: err.message, turnId: msg.turnId,
+        });
+        logger.warn(`[${t}] Final output stopped: ${err.message}`);
+        onComplete?.(false);
         return;
       }
       if (err instanceof MessageWithdrawnError) {
@@ -17975,7 +18027,7 @@ export function forkAdoptWorker(
   const rawAdoptCwd = adopted.cwd ?? ds.workingDir ?? process.cwd();
   const adoptCwd = rawAdoptCwd && existsSync(rawAdoptCwd) ? rawAdoptCwd : homedir();
   if (adoptCwd !== rawAdoptCwd) logger.warn(`[${t}] adopt cwd "${rawAdoptCwd}" does not exist — falling back to ${adoptCwd}`);
-  const forkEnv = workerForkEnv(process.env);
+  const forkEnv = workerForkEnv(buildBotWorkerEnv(process.env, botCfg.envPolicy));
   // Node: fork `dist/worker.js`. Standalone binary: re-exec THIS binary with the
   // hidden `__worker` subcommand over the same IPC channel (see self-spawn.ts).
   const worker = spawnWorker({
@@ -18154,6 +18206,7 @@ export function forkAdoptWorker(
     // The worker's adopt branch picks the backend from whichever is present.
     backendType: adoptBackendType,
     adoptMode: true,
+    envPolicy: botCfg.envPolicy,
     adoptSource: adopted.source ?? adoptBackendType,
     adoptTmuxTarget: adopted.tmuxTarget,
     adoptHerdrSessionName: adopted.herdrSessionName,

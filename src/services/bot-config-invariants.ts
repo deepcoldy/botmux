@@ -1,7 +1,10 @@
+import { parseSandboxNetworkPolicy } from '../core/sandbox-network-policy.js';
 export type BotConfigInvariantError =
   | 'codex_browser_requires_codex_app'
   | 'codex_browser_config_conflict'
-  | 'existing_app_server_sandbox_conflict';
+  | 'existing_app_server_sandbox_conflict'
+  | 'invalid_sandbox_network_policy'
+  | 'sandbox_network_policy_requires_local_pty_oncall';
 
 function codexBrowserEnabled(entry: any): boolean {
   return entry?.codexBrowser === true
@@ -17,6 +20,10 @@ function sandboxEngaged(entry: any): boolean {
 /** Cross-field invariants shared by every bots.json writer. */
 export function botConfigInvariantError(entry: any): BotConfigInvariantError | undefined {
   if (!entry || typeof entry !== 'object') return undefined;
+  if (entry.sandboxNetworkPolicy !== undefined) {
+    try { parseSandboxNetworkPolicy(entry.sandboxNetworkPolicy); } catch { return 'invalid_sandbox_network_policy'; }
+    if ((entry.sandbox !== true && entry.sandbox !== 'oncall') || (entry.backendType ?? 'pty') !== 'pty' || entry.existingAppServer) return 'sandbox_network_policy_requires_local_pty_oncall';
+  }
   if (codexBrowserEnabled(entry)) {
     if (entry.cliId !== 'codex-app') return 'codex_browser_requires_codex_app';
     if (entry.existingAppServer || sandboxEngaged(entry) || entry.readIsolation === true) {
