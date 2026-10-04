@@ -276,6 +276,25 @@ function rowToRecord(row: any, latestRevision: number): GroupContextMessageRecor
   };
 }
 
+/** 只补空缺的元数据（senderName / rootId / threadId / parentId），不改正文、不改 seq。 */
+function enrichLatestRow(db: DatabaseSyncLike, prev: any, incoming: GroupContextMessageInput): void {
+  const sets: string[] = [];
+  const params: unknown[] = [];
+  const fill = (col: string, current: unknown, next: unknown) => {
+    if ((current == null || current === '') && typeof next === 'string' && next.length > 0) {
+      sets.push(`${col} = ?`);
+      params.push(next);
+    }
+  };
+  fill('sender_name', prev.sender_name, incoming.senderName);
+  fill('root_id', prev.root_id, incoming.rootId);
+  fill('thread_id', prev.thread_id, incoming.threadId);
+  fill('parent_id', prev.parent_id, incoming.parentId);
+  if (sets.length === 0) return;
+  params.push(Number(prev.seq));
+  db.prepare(`UPDATE messages SET ${sets.join(', ')} WHERE seq = ?`).run(...params);
+}
+
 function latestRow(db: DatabaseSyncLike, chatId: string, messageId: string): any | undefined {
   return db.prepare(
     'SELECT * FROM messages WHERE chat_id = ? AND message_id = ? ORDER BY revision DESC LIMIT 1',
@@ -301,7 +320,14 @@ export function upsertGroupContextMessage(
   db.exec('BEGIN IMMEDIATE;');
   try {
     const prev = latestRow(db, chatId, messageId);
-    if (prev && prev.content_hash === hash) {
+    if (prev && (prev.content_hash === hash || (Number(prev.deleted) === 1 && !message.deleted))) {
+      // 两种情况都不分配新 seq：
+      //  a) 同正文重复（飞书重推 / history 回填与实时事件重叠）；
+      //  b) 已有 tombstone，又来了一条「未删除」形态（history 旧数据、乱序到达的原消息）——
+      //     撤回是终态，绝不被旧数据复活。
+      // 但 history 回填可能带来实时事件缺的元数据（senderName、root/thread/parent），
+      // 原地补全到最新 revision 上，不制造无意义 revision。
+      enrichLatestRow(db, prev, message);
       db.exec('COMMIT;');
       return { seq: Number(prev.seq), revision: Number(prev.revision), inserted: false };
     }

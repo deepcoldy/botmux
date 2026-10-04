@@ -139,7 +139,56 @@ describe('upsert / seq 分配', () => {
   });
 });
 
+describe('history 回填与实时事件的交错', () => {
+  it('实时事件缺 senderName，history 同正文带 senderName：原地补全，不分配新 seq / revision', () => {
+    const live = upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'same' }));
+    const fill = upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'same', senderName: 'Alex', rootId: 'om_root' }));
+    expect(fill.inserted).toBe(false);
+    expect(fill.seq).toBe(live.seq);
+    const row = getGroupContextMessage(APP, CHAT, 'om_1');
+    expect(row).toMatchObject({ revision: 0, senderName: 'Alex', rootId: 'om_root', text: 'same' });
+    expect(getGroupContextHead(APP, CHAT).count).toBe(1);
+  });
+
+  it('补全只填空缺：已有 senderName 不被后来的覆盖，正文变化仍正常升 revision', () => {
+    upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'v0', senderName: 'Alex' }));
+    upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'v0', senderName: 'Someone Else' }));
+    expect(getGroupContextMessage(APP, CHAT, 'om_1')?.senderName).toBe('Alex');
+    const edit = upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'v1' }));
+    expect(edit.inserted).toBe(true);
+    expect(getGroupContextMessage(APP, CHAT, 'om_1')).toMatchObject({ revision: 1, text: 'v1' });
+  });
+
+  it('反复喂同一条 history 记录不产生任何新行', () => {
+    upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'x', senderName: 'A' }));
+    for (let i = 0; i < 5; i++) upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'x', senderName: 'A' }));
+    expect(getGroupContextHead(APP, CHAT).count).toBe(1);
+  });
+});
+
 describe('tombstone（撤回/删除）', () => {
+  it('撤回后 history 旧数据 / 乱序到达的原消息不能复活 tombstone', () => {
+    upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'bye' }));
+    const t = markGroupContextMessageDeleted(APP, CHAT, 'om_1', { deletedAt: 5 });
+    // history 回填：同正文、未删除形态
+    const r1 = upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'bye', senderName: 'Alex' }));
+    expect(r1.inserted).toBe(false);
+    expect(r1.seq).toBe(t.seq);
+    // 乱序：一条正文还不同的旧版本晚到
+    const r2 = upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'older draft' }));
+    expect(r2.inserted).toBe(false);
+    const row = getGroupContextMessage(APP, CHAT, 'om_1');
+    expect(row).toMatchObject({ deleted: true, text: 'bye', senderName: 'Alex' });
+    expect(getGroupContextHead(APP, CHAT).count).toBe(2);
+  });
+
+  it('从未观察到的消息先收到撤回、后收到原消息：仍保持 tombstone', () => {
+    markGroupContextMessageDeleted(APP, CHAT, 'om_late');
+    const r = upsertGroupContextMessage(APP, msg({ messageId: 'om_late', text: 'late original' }));
+    expect(r.inserted).toBe(false);
+    expect(getGroupContextMessage(APP, CHAT, 'om_late')?.deleted).toBe(true);
+  });
+
   it('删除以新 revision 记录，get 返回 deleted=true 且保留最后正文', () => {
     upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'bye' }));
     const t = markGroupContextMessageDeleted(APP, CHAT, 'om_1', { deletedAt: 1_700_000_999_000 });
