@@ -10,7 +10,7 @@ import { atomicWriteFileSync } from '../../utils/atomic-write.js';
 import { join } from 'node:path';
 import { getBot, getAllBots, getBotOpenId, findOncallChat, getOwnerOpenId, loadBotConfigs, vcMeetingAgentConfigActive, type BotState } from '../../bot-registry.js';
 import { config, isVcMeetingAgentGloballyEnabled, vcMeetingAgentGlobalListenerBotAppId } from '../../config.js';
-import { getChatInfo, getChatMode, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
+import { getChatInfo, getChatMode, getChatModeStrict, getCachedChatMode, getChatName, getUserProfile, getMessageDetail, listChatMessagesUntil, resolveSiblingBotBySenderOpenId, resolveUnionIdFromOpenId, replyMessage, sendMessage, sendUserMessage, isHumanOpenId, updateMessage } from './client.js';
 import { listChats } from '../../services/groups-store.js';
 import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
@@ -4003,7 +4003,9 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // self return / mention gate 之前，让没被 @ 的消息也进共享记录。它自带开关
       // （默认关）与错误隔离，永不抛出、不推进 seen-message 去重、不启动 worker；
       // 下面的唤醒 / 权限判定完全不受它影响。
-      if (chatType === 'group') ingestGroupContextEvent(larkAppId, data);
+      // 编辑事件走 processMessageUpdatedEvent 时已按「确认过的群类型」采集过（或判定不采集），
+      // 这里不再二次处理，避免用回落猜测的 chat_type 把查不到群类型的编辑也收进去。
+      if (chatType === 'group' && !data.__groupContextHandled) ingestGroupContextEvent(larkAppId, data);
 
       // Bot-originated messages — bots historically only post inside threads
       // (their own thread replies). With chat-scope sessions a bot can also
@@ -5076,15 +5078,20 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
 
       // 群聊上下文共享：编辑后的正文也要进旁听记录，而且必须在下面各种早退
       //（bot/卡片刷新、未 @、已触发过）之前——这些编辑不触发任务，但记录要更新。
-      // im.message.get 条目不带 chat_type，先用 getChatMode 确认是群：DM 不采集。
-      // 只记录、不派发；失败不影响编辑补 @ 流程。回读条目自带 update_time，store
-      // 据此拒绝更旧的正文回灌。
+      // im.message.get 条目不带 chat_type，群类型必须**确认**：缓存里有已确认值就用，
+      // 否则走 getChatModeStrict（失败返回 'unknown'，不猜 group）。只在 group/topic
+      // 时收集；p2p 或查不到一律不采集。只记录、不派发；失败不影响编辑补 @ 流程。
+      // 回读条目自带 update_time，store 据此拒绝更旧的正文回灌。
+      // 无论下面采不采集，都标记「已处理」：后续若走到 processMessageEvent，那里的采集
+      // 不再重复执行（也不会用回落的 chat_type 收进群类型未确认的编辑）。
+      data.__groupContextHandled = true;
       try {
         const editedChatId: string | undefined = data.message?.chat_id;
         if (editedChatId && data.message.chat_type !== 'p2p' && isGroupContextEnabled(larkAppId, editedChatId)) {
-          const mode = await getChatMode(larkAppId, editedChatId);
+          const mode = getCachedChatMode(larkAppId, editedChatId) ?? await getChatModeStrict(larkAppId, editedChatId);
           if (mode === 'p2p') data.message.chat_type = 'p2p';
-          else ingestGroupContextEvent(larkAppId, data);
+          else if (mode === 'group' || mode === 'topic') ingestGroupContextEvent(larkAppId, data);
+          else logger.debug(`[message-updated:${larkAppId}] chat mode unconfirmed, group-context skipped msg=${messageId.substring(0, 12)}`);
         }
       } catch (err) {
         logger.debug(`[message-updated:${larkAppId}] group-context ingest skipped msg=${messageId.substring(0, 12)}: ${err}`);

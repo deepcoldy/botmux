@@ -82,6 +82,7 @@ const mockResolveSiblingBot = vi.fn(async () => ({ ok: false, reason: 'default_n
   { ok: true; larkAppId: string; botName: string; senderOpenId: string } | { ok: false; reason: string }));
 const mockGetChatMode = vi.fn(async () => 'topic' as 'group' | 'topic' | 'p2p');
 const mockGetCachedChatMode = vi.fn(() => undefined as 'group' | 'topic' | 'p2p' | undefined);
+const mockGetChatModeStrict = vi.fn(async () => 'group' as 'group' | 'topic' | 'p2p' | 'unknown');
 const mockGetChatInfo = vi.fn(async () => ({ userCount: 1, botCount: 1 }));
 const mockReplyMessage = vi.fn(async () => 'msg-id');
 const mockUpdateMessage = vi.fn(async () => true);
@@ -105,6 +106,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   getChatInfo: (...args: any[]) => mockGetChatInfo(...args),
   getChatMode: (...args: any[]) => mockGetChatMode(...args),
   getCachedChatMode: (...args: any[]) => mockGetCachedChatMode(...args),
+  getChatModeStrict: (...args: any[]) => mockGetChatModeStrict(...args),
   listChatBotMembers: (...args: any[]) => mockListChatBotMembers(...args),
   resolveSiblingBotBySenderOpenId: (...args: any[]) => mockResolveSiblingBot(...args),
   replyMessage: (...args: any[]) => mockReplyMessage(...args),
@@ -10708,6 +10710,8 @@ describe('im.message.receive_v1 — 群聊上下文静默旁听（不改唤醒�
     await realMkdir(pathJoin(gcDataDir, 'group-context'), { recursive: true });
     vi.stubEnv('SESSION_DATA_DIR', gcDataDir);
     setGroupContextSettingsResolver(() => ({ enabled: true, maxContextChars: 4000 }));
+    mockGetChatModeStrict.mockReset().mockResolvedValue('group');
+    mockGetCachedChatMode.mockReset().mockReturnValue(undefined);
     setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'never' });
     handlers = makeHandlers();
     mockFindOncallChat.mockReturnValue(undefined);
@@ -10833,22 +10837,45 @@ describe('im.message.receive_v1 — 群聊上下文静默旁听（不改唤醒�
     expect(handlers.handleNewTopic.mock.calls.length + handlers.handleThreadReply.mock.calls.length).toBe(callsAfterTrigger);
   });
 
-  it('编辑事件：DM（getChatMode=p2p）不采集', async () => {
-    mockGetChatMode.mockResolvedValueOnce('p2p');
+  it('编辑事件：DM（getChatModeStrict=p2p）不采集', async () => {
+    mockGetChatModeStrict.mockResolvedValueOnce('p2p');
     mockGetMessageDetail.mockResolvedValueOnce({ items: [gcReadbackItem({ messageId: 'msg-gc-edit-dm', text: 'dm edit', chatId: 'chat-dm-1' })] });
     await capturedHandlers['im.message.updated_v1'](gcUpdatedEvent('msg-gc-edit-dm', 'evt-gc-dm'));
     await flushEventWork();
     expect(listGroupContextMessages(MY_APP_ID, 'chat-dm-1').messages).toHaveLength(0);
   });
 
+  it('编辑事件：群类型查询失败（unknown）→ 零旁听写入，但原编辑流程照常', async () => {
+    mockGetCachedChatMode.mockReturnValueOnce(undefined);
+    mockGetChatModeStrict.mockResolvedValueOnce('unknown');
+    mockGetMessageDetail.mockResolvedValueOnce({ items: [gcReadbackItem({ messageId: 'msg-gc-edit-unk', text: '@BotA 查不到群类型', mentioned: true })] });
+    await capturedHandlers['im.message.updated_v1'](gcUpdatedEvent('msg-gc-edit-unk', 'evt-gc-unk'));
+    await flushEventWork();
+    expect(listGroupContextMessages(MY_APP_ID, GC_CHAT).messages.map(m => m.messageId)).not.toContain('msg-gc-edit-unk');
+    // 原流程：补 @ 的编辑照常触发一次任务（它走的是 getChatMode 分支，与采集无关）
+    expect(handlers.handleNewTopic.mock.calls.length + handlers.handleThreadReply.mock.calls.length).toBe(1);
+  });
+
+  it('编辑事件：缓存里已有已确认的群类型时不再走 strict 查询', async () => {
+    mockGetCachedChatMode.mockReturnValueOnce('topic');
+    mockGetChatModeStrict.mockClear();
+    mockGetMessageDetail.mockResolvedValueOnce({ items: [gcReadbackItem({ messageId: 'msg-gc-edit-cached', text: 'cached mode', senderType: 'app' })] });
+    await capturedHandlers['im.message.updated_v1'](gcUpdatedEvent('msg-gc-edit-cached', 'evt-gc-cached'));
+    await flushEventWork();
+    expect(getGroupContextMessage(MY_APP_ID, GC_CHAT, 'msg-gc-edit-cached')?.text).toBe('cached mode');
+    expect(mockGetChatModeStrict).not.toHaveBeenCalled();
+  });
+
   it('编辑事件：开关关闭时不查群类型也不写', async () => {
     setGroupContextSettingsResolver(() => ({ enabled: false }));
     mockGetChatMode.mockClear();
+    mockGetChatModeStrict.mockClear();
     mockGetMessageDetail.mockResolvedValueOnce({ items: [gcReadbackItem({ messageId: 'msg-gc-edit-off', text: 'off', senderType: 'app' })] });
     await capturedHandlers['im.message.updated_v1'](gcUpdatedEvent('msg-gc-edit-off', 'evt-gc-off'));
     await flushEventWork();
     expect(listGroupContextMessages(MY_APP_ID, GC_CHAT).messages).toHaveLength(0);
     expect(mockGetChatMode).not.toHaveBeenCalled();
+    expect(mockGetChatModeStrict).not.toHaveBeenCalled();
   });
 
   it('im.message.recalled_v1 → tombstone revision', async () => {
