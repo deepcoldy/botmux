@@ -21,7 +21,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { mkdirSync } from 'node:fs';
+import { chmodSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
@@ -176,8 +176,13 @@ function open(larkAppId: string): AppHandle {
   const existing = handles.get(larkAppId);
   if (existing) return existing;
   const path = groupContextDbPath(larkAppId);
-  mkdirSync(join(path, '..'), { recursive: true });
+  // 群正文是私密数据：目录 0700、主文件 0600（在 WAL 初始化前收紧，-wal/-shm 由 SQLite
+  // 按主文件权限创建），和交付 ledger / 设置文件的私有权限一致，别落成默认 0644。
+  mkdirSync(join(path, '..'), { recursive: true, mode: 0o700 });
   const db = openDatabaseSyncOrThrow(path);
+  try { chmodSync(path, 0o600); } catch (err) {
+    logger.warn(`[group-context-store] chmod 0600 failed for ${path}: ${err}`);
+  }
   // busy_timeout 先于一切（含 WAL 切换的写锁）。
   db.exec(`PRAGMA busy_timeout=${BUSY_TIMEOUT_MS};`);
   try { db.exec('PRAGMA journal_mode=WAL;'); } catch (err) {

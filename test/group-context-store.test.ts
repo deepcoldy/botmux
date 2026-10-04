@@ -435,6 +435,22 @@ describe('淘汰与 retentionGap', () => {
   });
 });
 
+describe('文件权限', () => {
+  it('目录 0700、主文件 0600（非 Windows）', async () => {
+    if (process.platform === 'win32') return;
+    const { statSync } = await import('node:fs');
+    const { dirname } = await import('node:path');
+    upsertGroupContextMessage(APP, msg({ messageId: 'om_1' }));
+    const path = groupContextDbPath(APP);
+    expect(statSync(dirname(path)).mode & 0o777).toBe(0o700);
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    // WAL 副文件若已出现，不能比主文件更宽
+    for (const suffix of ['-wal', '-shm']) {
+      try { expect(statSync(path + suffix).mode & 0o077).toBe(0); } catch { /* 尚未创建 */ }
+    }
+  });
+});
+
 describe('持久化 / 多进程', () => {
   it('重开（模拟重启）后记录与 seq 连续', () => {
     const a = upsertGroupContextMessage(APP, msg({ messageId: 'om_1' }));
