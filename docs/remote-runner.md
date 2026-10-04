@@ -176,7 +176,7 @@ provider 可以在 `final` 事件上附带可选 `usage`，把远端运行时已
 - 同一 generation 不得更换 `remoteSessionId`，generation 不得倒退；BotMux 会拒绝违反单调性的状态。
 - `providerState` 是最多 64 KiB、深度受限的普通 JSON。它可以保存恢复定位信息，但不得保存任何凭据。
 - provider 可通过 `lineage_changed` 在 turn 执行期间更新状态，也可在 `final`、`ready`、`status` 中附带状态。BotMux 在接受后立即持久化。
-- 普通 daemon/worker 重启发送 `resumeMode: "reattach"`（省略时同义），允许接管仍存活的远端资源；用户显式关闭后点击恢复发送 `resumeMode: "rebuild"`，provider 必须新建远端资源并在 `ready` 中推进 `generation`。重建未进入 ready 就退出时，BotMux 在远端 lineage 未变化的前提下把逻辑 Session 恢复为 closed；若 lineage 已变化则保持保护状态并要求显式对账，不能伪装成恢复成功。
+- 普通 daemon/worker 重启发送 `resumeMode: "reattach"`（省略时同义），允许接管仍存活的远端资源；用户显式关闭后点击恢复发送 `resumeMode: "rebuild"`，provider 必须新建远端资源并在 `ready` 中推进 `generation`。Node worker 或其 Remote Runner backend 在新的 ready state 落盘前退出时，BotMux 会在远端 lineage 未变化的前提下把逻辑 Session 恢复为 closed，并回收仅剩的本地 worker；若 lineage 已变化则保持保护状态并要求显式对账，不能伪装成恢复成功。
 
 ## 关闭与进程退出
 

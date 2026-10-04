@@ -342,6 +342,30 @@ describe('resumeSession', () => {
       expect(closeSession).not.toHaveBeenCalledWith(closed.sessionId);
     });
 
+    it('returns an admitted remote resume to closed when the backend exits after worker ready', async () => {
+      const closed = makeClosedSession({
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+      });
+      const map = new Map<string, DaemonSession>();
+      let onRemoteBackendStartupExit: (() => boolean) | undefined;
+      vi.mocked(forkWorker).mockImplementationOnce((ds: any, _prompt: any, _resume: any, opts: any) => {
+        ds.worker = { killed: false };
+        opts?.onAdmission?.('accepted');
+        onRemoteBackendStartupExit = opts?.onRemoteBackendStartupExit;
+        return true;
+      });
+
+      const result = await resumeSession(closed.sessionId, map);
+      expect(result.ok).toBe(true);
+      expect(onRemoteBackendStartupExit).toBeTypeOf('function');
+      expect(onRemoteBackendStartupExit?.()).toBe(true);
+
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
+      expect(map.size).toBe(0);
+      expect(closeSession).not.toHaveBeenCalledWith(closed.sessionId);
+    });
+
     it('reports reconciliation when a rejected remote resume cannot be closed again', async () => {
       const closed = makeClosedSession({
         cliId: 'remote-runner',

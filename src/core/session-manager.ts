@@ -3775,6 +3775,7 @@ export async function resumeSession(
         deferDuringDeviceIsolation: false,
         onAdmission: value => { admission = value; },
         onPreReadyExit: () => { rollbackUnstartedRemoteResume(); },
+        onRemoteBackendStartupExit: rollbackUnstartedRemoteResume,
       });
     } catch (error) {
       logger.warn(

@@ -749,6 +749,11 @@ type WorkerStartupState = {
   ready: boolean;
   failureNotified: boolean;
   onPreReadyExit?: () => void;
+  /** Explicit Remote Runner rebuilds cross two readiness boundaries: the Node
+   * worker can initialize before the provider returns its rebuild `ready`
+   * state. Keep this callback armed across worker `ready` and consume it only
+   * when the backend either publishes that state or exits first. */
+  onRemoteBackendStartupExit?: () => boolean;
   /** Init turn attribution frozen at fork. A durable VC delivery is dispatched
    *  (queued) into a not-yet-ready worker; if that worker dies before ready
    *  (fork ENOENT, syntax/import crash, abrupt exit) the fork-level `error` and
@@ -11508,6 +11513,9 @@ export type ForkWorkerOptions = {
   onAdmission?: (admission: WorkerForkAdmission) => void;
   /** Called once when an admitted worker exits before its ready boundary. */
   onPreReadyExit?: () => void;
+  /** Called once when an admitted Remote Runner worker survives startup but
+   * its backend exits before publishing the rebuilt backend state. */
+  onRemoteBackendStartupExit?: () => boolean;
   deferDuringDeviceIsolation?: boolean;
   /**
    * Internal: this call is the single re-entry after a marginal-admission
@@ -12453,6 +12461,7 @@ export function forkWorker(
     initTurnId: initAttributionTurnId,
     initDispatchAttempt,
     onPreReadyExit: opts.onPreReadyExit,
+    onRemoteBackendStartupExit: opts.onRemoteBackendStartupExit,
   };
 
   // A fork-level failure (spawn ENOENT, etc.) emits 'error'; without a handler
@@ -15116,6 +15125,19 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Suppressed stale claude_exit lifecycle continuation`);
           break;
         }
+        let remoteBackendStartupReconciled = false;
+        if (isRemoteBackendSession(ds) && startupState.onRemoteBackendStartupExit) {
+          const reconcile = startupState.onRemoteBackendStartupExit;
+          startupState.onRemoteBackendStartupExit = undefined;
+          try {
+            remoteBackendStartupReconciled = reconcile() === true;
+          } catch (error) {
+            logger.error(
+              `[${t}] Failed to reconcile remote backend startup exit: `
+              + `${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
         const suppressExitUi = managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt);
 
         if (msg.codexAppActiveWriter === true && effectiveCliId === 'codex-app') {
@@ -15199,6 +15221,16 @@ function setupWorkerHandlers(
         // context-less replacement, so treating a mojo backend exit as a local
         // CLI crash silently destroyed remote context (fourth-round review).
         if (isRemoteBackendSession(ds)) {
+          if (remoteBackendStartupReconciled) {
+            logger.warn(
+              `[${t}] Remote backend exited before rebuild readiness; restored the durable closed row`,
+            );
+            // The backend is already gone and the explicit-resume row has been
+            // restored to closed. Retire the otherwise-idle Node worker and do
+            // not emit the generic "remote restart unsupported" guidance.
+            retireWorkerProcessOnly(ds, 'remote_rebuild_startup_failed');
+            break;
+          }
           const retirementPhase = remoteRetirementAdmissionPhase(ds);
           logger.warn(
             `[${t}] Remote backend exited; automatic restart is unsupported`
@@ -15440,6 +15472,10 @@ function setupWorkerHandlers(
         }
         try {
           sessionStore.updateSession(ds.session);
+          // RemoteRunnerBackend publishes its normalized ready state before
+          // firing onReady. For an explicit rebuild this is the durable proof
+          // that the provider crossed its second (backend) startup boundary.
+          startupState.onRemoteBackendStartupExit = undefined;
         } catch (err) {
           ds.session.remoteBackendState = prior;
           ds.session.remoteRunnerUsage = priorUsage;
