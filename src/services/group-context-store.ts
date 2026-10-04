@@ -350,7 +350,11 @@ export function upsertGroupContextMessage(
     const prev = latestRow(db, chatId, messageId);
     const incomingVersion = normalizeVersion(message.updateTime);
     const prevVersion = prev ? normalizeVersion(prev.update_time) : undefined;
-    const staleVersion = incomingVersion !== undefined && prevVersion !== undefined && incomingVersion < prevVersion;
+    // 版本新旧只约束「正文」。撤回（deleted=true）压过任何正文版本：撤回事件本身不带编辑时间，
+    // markGroupContextMessageDeleted 复制的是读到的旧版本号，若此时另一 writer 刚写入更新的
+    // 正文，按版本拒绝就会把撤回弄丢。tombstone 一旦写入即终态（上面的 b 分支守住）。
+    const staleVersion = !message.deleted
+      && incomingVersion !== undefined && prevVersion !== undefined && incomingVersion < prevVersion;
     if (prev && (prev.content_hash === hash || (Number(prev.deleted) === 1 && !message.deleted) || staleVersion)) {
       // 三种情况都不分配新 seq：
       //  a) 同正文重复（飞书重推 / history 回填与实时事件重叠）；
@@ -413,8 +417,11 @@ export function markGroupContextMessageDeleted(
       messageId, chatId, senderId: '', senderType: 'unknown', msgType: 'unknown', text: '',
       createTime: opts.deletedAt ?? Date.now(), resourceRefs: [], sourceAppId: opts.sourceAppId ?? larkAppId,
     };
+  // 不带上读到的 updateTime：撤回没有自己的编辑版本，复制旧快照只会在并发写入时被当成
+  //「过期正文」。版本号留空，tombstone 行的 update_time 为 NULL（= 未知版本）。
+  const { updateTime: _ignored, ...withoutVersion } = base;
   return upsertGroupContextMessage(larkAppId, {
-    ...base,
+    ...withoutVersion,
     deleted: true,
     deletedAt: opts.deletedAt ?? base.deletedAt ?? Date.now(),
   });

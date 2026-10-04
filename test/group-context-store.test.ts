@@ -216,6 +216,26 @@ describe('平台 update_time 版本：乱序编辑', () => {
     expect(getGroupContextMessage(APP, CHAT, 'om_1')?.updateTime).toBeUndefined();
   });
 
+  it('撤回压过正文版本：活正文 updateTime=200 后送 deleted + updateTime=100，latest 必须是 tombstone', () => {
+    upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'live', updateTime: 200 }));
+    const t = upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'live', updateTime: 100, deleted: true, deletedAt: 7 }));
+    expect(t.inserted).toBe(true);
+    expect(getGroupContextMessage(APP, CHAT, 'om_1')).toMatchObject({ deleted: true, deletedAt: 7, revision: 1 });
+    // 之后更高版本的正文也不能复活
+    expect(upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'live again', updateTime: 900 })).inserted).toBe(false);
+    expect(getGroupContextMessage(APP, CHAT, 'om_1')?.deleted).toBe(true);
+  });
+
+  it('markGroupContextMessageDeleted 不复制旧版本号：tombstone 行 updateTime 为空，并发写入的新正文也压不过它', () => {
+    upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'v1', updateTime: 100 }));
+    upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'v2', updateTime: 300 }));
+    const t = markGroupContextMessageDeleted(APP, CHAT, 'om_1', { deletedAt: 9 });
+    expect(t.inserted).toBe(true);
+    const row = getGroupContextMessage(APP, CHAT, 'om_1');
+    expect(row).toMatchObject({ deleted: true, text: 'v2', updateTime: undefined });
+    expect(upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'v3', updateTime: 400 })).inserted).toBe(false);
+  });
+
   it('tombstone 仍是终态：带更新版本号的未删除形态也不能复活', () => {
     upsertGroupContextMessage(APP, msg({ messageId: 'om_1', text: 'bye', updateTime: 100 }));
     markGroupContextMessageDeleted(APP, CHAT, 'om_1', { deletedAt: 5 });
