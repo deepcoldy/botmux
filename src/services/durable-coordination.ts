@@ -8,6 +8,8 @@
  * 使用注入时钟，远程数据库实现应在事务内使用数据库时间，不能信任不同 worker 的墙钟。
  */
 
+export const DURABLE_COORDINATION_CONTRACT_VERSION = 1 as const;
+
 export type DurableJson =
   | null
   | boolean
