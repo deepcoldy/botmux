@@ -77,6 +77,9 @@ export interface SpawnOpts {
   strictEnv?: boolean;
   /** Worker verified the surviving generation's policy stamp. */
   strictEnvReattach?: boolean;
+  /** Why a Remote Runner state is being resumed. Explicit reactivation may
+   * require the provider to replace a resource that was previously cancelled. */
+  remoteResumeMode?: 'reattach' | 'rebuild';
   /**
    * Per-bot shell override (BotConfig.launchShell). When set, the persistent
    * backends (tmux/zellij/zmx) launch the CLI under this shell instead of `$SHELL`

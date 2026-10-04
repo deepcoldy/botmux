@@ -3737,11 +3737,44 @@ export async function resumeSession(
     // sandbox) from the persisted opaque state. Merely flipping the durable row
     // to active recreates the ghost-active failure this path is meant to avoid.
     let admission: 'accepted' | 'deferred' | 'rejected' | undefined;
+    const preResumeRemoteState = JSON.stringify(session.remoteBackendState ?? null);
+    const rollbackUnstartedRemoteResume = (): boolean => {
+      const current = sessionStore.getOwnedSession(sessionId);
+      if (!current || current.status !== 'active') return current?.status === 'closed';
+      if (JSON.stringify(current.remoteBackendState ?? null) !== preResumeRemoteState) {
+        logger.error(
+          `Remote resume ${sessionId.substring(0, 8)} changed lineage before startup failed; `
+          + 'leaving the row active for explicit reconciliation',
+        );
+        return false;
+      }
+      try {
+        sessionStore.closeSession(sessionId);
+      } catch (error) {
+        logger.error(
+          `Remote resume ${sessionId.substring(0, 8)} could not restore the durable closed row: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+        return false;
+      }
+      const closed = sessionStore.getOwnedSession(sessionId);
+      if (!closed || closed.status !== 'closed') return false;
+      Object.assign(ds.session, closed);
+      for (const [registeredKey, candidate] of activeSessions) {
+        if (candidate === ds) activeSessions.delete(registeredKey);
+      }
+      dashboardEventBus.publish({
+        type: 'session.update',
+        body: { sessionId, patch: { status: 'closed', workerPid: null, webPort: null } },
+      });
+      return true;
+    };
     let started = false;
     try {
-      started = forkWorker(ds, '', { resume: true }, {
+      started = forkWorker(ds, '', { resume: true, remoteResumeMode: 'rebuild' }, {
         deferDuringDeviceIsolation: false,
         onAdmission: value => { admission = value; },
+        onPreReadyExit: () => { rollbackUnstartedRemoteResume(); },
       });
     } catch (error) {
       logger.warn(
@@ -3751,15 +3784,10 @@ export async function resumeSession(
     }
     if (!started || admission !== 'accepted' || !ds.worker || ds.worker.killed) {
       // No provider process was synchronously admitted, so no remote recovery
-      // can be in flight. Restore the row to closed through the authoritative
-      // close path before reporting failure; callers must never observe a
-      // successful Resume with no provider owner.
-      const rollback = await closeSession(sessionId);
-      if (!rollback.ok) {
-        logger.error(
-          `Remote resume ${sessionId.substring(0, 8)} could not restore the durable closed row: `
-          + rollback.error,
-        );
+      // can be in flight. Restore the row directly instead of calling the
+      // generic close path: that path may wake a worker-less remote session to
+      // cancel it, which would create a second rebuild attempt during rollback.
+      if (!rollbackUnstartedRemoteResume()) {
         return { ok: false, error: 'resume_reconciliation_required' };
       }
       return { ok: false, error: 'resume_start_failed' };

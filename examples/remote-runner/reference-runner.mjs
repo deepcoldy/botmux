@@ -98,7 +98,13 @@ input.on('line', line => {
         fail(command, 'state_provider_mismatch', 'reference runner cannot resume foreign state');
         return;
       }
-      state = command.state;
+      state = command.resumeMode === 'rebuild'
+        ? {
+            ...command.state,
+            generation: command.state.generation + 1,
+            remoteSessionId: `reference:${command.sessionId}:generation-${command.state.generation + 1}`,
+          }
+        : command.state;
       status = 'ready';
       emit({ type: 'ready', requestId: command.requestId, state });
       screen = 'reference runner resumed';

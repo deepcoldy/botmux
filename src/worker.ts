@@ -14678,7 +14678,7 @@ async function spawnCli(
   // These backends currently start user shell processes before our command,
   // or run tools through a separate local/cloud launcher. Refuse to claim a
   // boundary until those launch protocols can express an empty initial env.
-  if (cfg.envPolicy?.mode === 'strict' && ['herdr', 'mojo', 'riff'].includes(cfg.backendType)) {
+  if (cfg.envPolicy?.mode === 'strict' && ['herdr', 'mojo', 'riff', 'remote-runner'].includes(cfg.backendType)) {
     throw new Error('envPolicy strict currently supports pty, tmux, zellij and zmx backends');
   }
   const networkError = networkPolicySupportError({
@@ -18305,6 +18305,7 @@ async function spawnCli(
       launchShell: lastInitConfig?.launchShell,
       strictEnv: cfg.envPolicy?.mode === 'strict',
       strictEnvReattach: willReattachPersistent,
+      remoteResumeMode: cfg.remoteResumeMode,
       // spawnBin may now be a launch wrapper (session scope / wrapperCli /
       // credential sandbox); the Herdr facade still needs the real CLI name.
       cliBin: cliAdapter.resolvedBin,

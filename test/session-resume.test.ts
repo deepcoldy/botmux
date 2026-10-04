@@ -283,7 +283,7 @@ describe('resumeSession', () => {
         ds.worker = { killed: false };
         opts?.onAdmission?.('accepted');
         expect(prompt).toBe('');
-        expect(resume).toEqual({ resume: true });
+        expect(resume).toEqual({ resume: true, remoteResumeMode: 'rebuild' });
         return true;
       });
 
@@ -313,9 +313,33 @@ describe('resumeSession', () => {
         ok: false,
         error: 'resume_start_failed',
       });
-      expect(closeSession).toHaveBeenCalledWith(closed.sessionId);
+      expect(closeSession).not.toHaveBeenCalledWith(closed.sessionId);
       expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
       expect(map.size).toBe(0);
+    });
+
+    it('returns an admitted remote resume to closed when the worker exits before ready', async () => {
+      const closed = makeClosedSession({
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+      });
+      const map = new Map<string, DaemonSession>();
+      let onPreReadyExit: (() => void) | undefined;
+      vi.mocked(forkWorker).mockImplementationOnce((ds: any, _prompt: any, _resume: any, opts: any) => {
+        ds.worker = { killed: false };
+        opts?.onAdmission?.('accepted');
+        onPreReadyExit = opts?.onPreReadyExit;
+        return true;
+      });
+
+      const result = await resumeSession(closed.sessionId, map);
+      expect(result.ok).toBe(true);
+      expect(onPreReadyExit).toBeTypeOf('function');
+      onPreReadyExit?.();
+
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
+      expect(map.size).toBe(0);
+      expect(closeSession).not.toHaveBeenCalledWith(closed.sessionId);
     });
 
     it('reports reconciliation when a rejected remote resume cannot be closed again', async () => {
@@ -325,15 +349,16 @@ describe('resumeSession', () => {
       });
       const map = new Map<string, DaemonSession>();
       wp.registry = map;
-      vi.mocked(forkWorker).mockImplementationOnce((_ds: any, _prompt: any, _resume: any, opts: any) => {
+      vi.mocked(forkWorker).mockImplementationOnce((ds: any, _prompt: any, _resume: any, opts: any) => {
+        ds.session.remoteBackendState = {
+          version: 1,
+          provider: 'reference',
+          generation: 2,
+          remoteSessionId: 'replacement',
+        };
+        sessionStore.updateSession(ds.session);
         opts?.onAdmission?.('rejected');
         return true;
-      });
-      vi.mocked(closeSession).mockResolvedValueOnce({
-        ok: false,
-        alreadyClosed: false,
-        error: 'remote_runner_close_reconciliation_required',
-        retryable: true,
       });
 
       await expect(resumeSession(closed.sessionId, map)).resolves.toEqual({

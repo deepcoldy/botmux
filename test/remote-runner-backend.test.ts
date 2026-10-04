@@ -12,6 +12,7 @@ const stalledReattachRunner = resolve('test/fixtures/remote-runner-stalled-reatt
 const preAckFailureRunner = resolve('test/fixtures/remote-runner-pre-ack-failure.mjs');
 const outboundRunner = resolve('test/fixtures/remote-runner-outbound.mjs');
 const delayedTurnRunner = resolve('test/fixtures/remote-runner-delayed-turn.mjs');
+const reviewCasesRunner = resolve('test/fixtures/remote-runner-review-cases.mjs');
 const children: RemoteRunnerBackend[] = [];
 
 function createBackend(initialState?: RemoteRunnerBackendState): RemoteRunnerBackend {
@@ -216,6 +217,54 @@ describe('RemoteRunnerBackend', () => {
     expect(backend.getBackendState()).toEqual(initialState);
   });
 
+  it('requires an explicit closed-session rebuild to advance the remote generation', async () => {
+    const initialState: RemoteRunnerBackendState = {
+      version: 1,
+      provider: 'reference',
+      generation: 7,
+      remoteSessionId: 'reference:cancelled',
+      agentThreadId: 'reference-thread:old',
+    };
+    const backend = createBackend(initialState);
+    const ready = once<void>(cb => backend.onReady(cb));
+    backend.spawn(process.execPath, [referenceRunner], {
+      cwd: process.cwd(),
+      cols: 120,
+      rows: 40,
+      env: { ...process.env } as Record<string, string>,
+      remoteResumeMode: 'rebuild',
+    });
+    await ready;
+
+    expect(backend.getBackendState()).toMatchObject({
+      generation: 8,
+      remoteSessionId: 'reference:session-1:generation-8',
+      agentThreadId: 'reference-thread:old',
+    });
+  });
+
+  it('fails closed when a rebuild provider reports the cancelled generation as ready', async () => {
+    const initialState: RemoteRunnerBackendState = {
+      version: 1,
+      provider: 'review-cases',
+      generation: 7,
+      remoteSessionId: 'review-cases:cancelled',
+    };
+    const backend = new RemoteRunnerBackend({ expectedProvider: 'review-cases' }, 'session-stale-rebuild', initialState);
+    children.push(backend);
+    const exited = once<void>(cb => backend.onExit(() => cb()));
+    backend.spawn(process.execPath, [reviewCasesRunner], {
+      cwd: process.cwd(),
+      cols: 120,
+      rows: 40,
+      env: { ...process.env } as Record<string, string>,
+      remoteResumeMode: 'rebuild',
+    });
+
+    await exited;
+    expect(backend.getBackendState()).toEqual(initialState);
+  });
+
   it('confirms provider cancellation before reporting a successful close', async () => {
     const backend = createBackend();
     const ready = once<void>(cb => backend.onReady(cb));
@@ -404,5 +453,164 @@ describe('RemoteRunnerBackend', () => {
     await expect(backend.submitTurn({ turnId: 'turn-recovered', content: 'continue' }))
       .resolves.toEqual({ submitted: true });
     await expect(final).resolves.toEqual({ text: 'recovered' });
+  });
+
+  it.each(['post-ack-failure-both', 'post-ack-failure-turn'])(
+    'delivers an acknowledged %s as the provider terminal failure',
+    async content => {
+      const backend = new RemoteRunnerBackend({ expectedProvider: 'review-cases' }, `session-${content}`);
+      children.push(backend);
+      const ready = once<void>(cb => backend.onReady(cb));
+      const failures: Array<{ turnId: string; code: string }> = [];
+      backend.onTurnFailure(failure => failures.push(failure));
+      spawnBackend(backend, reviewCasesRunner);
+      await ready;
+
+      await expect(backend.submitTurn({ turnId: `turn-${content}`, content }))
+        .resolves.toEqual({ submitted: true });
+      await vi.waitFor(() => expect(failures).toEqual([expect.objectContaining({
+        turnId: `turn-${content}`,
+        code: 'provider_failed',
+      })]));
+    },
+  );
+
+  it('rejects a post-ACK failure that omits turnId', async () => {
+    const backend = new RemoteRunnerBackend({ expectedProvider: 'review-cases' }, 'session-request-only');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const failures: Array<{ code: string }> = [];
+    backend.onTurnFailure(failure => failures.push(failure));
+    spawnBackend(backend, reviewCasesRunner);
+    await ready;
+
+    await expect(backend.submitTurn({ turnId: 'turn-request-only', content: 'post-ack-failure-request' }))
+      .resolves.toEqual({ submitted: true });
+    await vi.waitFor(() => expect(failures).toEqual([expect.objectContaining({
+      code: 'remote_runner_protocol_error',
+    })]));
+  });
+
+  it.each(['pre-busy-progress', 'pre-busy-outbound', 'pre-busy-final'])(
+    'fails closed on %s before the provider accepts the turn',
+    async content => {
+      const backend = new RemoteRunnerBackend({ expectedProvider: 'review-cases' }, `session-${content}`);
+      children.push(backend);
+      const ready = once<void>(cb => backend.onReady(cb));
+      const progress: string[] = [];
+      const outbound = vi.fn(async () => ({ outcome: 'delivered' as const, messageId: 'om_too_early' }));
+      const failures: Array<{ code: string }> = [];
+      backend.onData(value => progress.push(value));
+      backend.onOutboundMessage(outbound);
+      backend.onTurnFailure(failure => failures.push(failure));
+      spawnBackend(backend, reviewCasesRunner);
+      await ready;
+
+      await expect(backend.submitTurn({ turnId: `turn-${content}`, content }))
+        .resolves.toMatchObject({ submitted: false, submissionDisposition: 'dirty_unknown' });
+      await vi.waitFor(() => expect(failures).toEqual([expect.objectContaining({
+        code: 'remote_runner_protocol_error',
+      })]));
+      expect(progress).toEqual([]);
+      expect(outbound).not.toHaveBeenCalled();
+    },
+  );
+
+  it('fences duplicate, stale, and future terminal snapshots', async () => {
+    const backend = new RemoteRunnerBackend({
+      expectedProvider: 'review-cases',
+      requiredCapabilities: [
+        'start', 'resume', 'turn', 'cancel', 'detach', 'reattach', 'status', 'terminal_screen',
+      ],
+    }, 'session-screen-fences');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const failures: Array<{ code: string }> = [];
+    backend.onTurnFailure(failure => failures.push(failure));
+    spawnBackend(backend, reviewCasesRunner);
+    await ready;
+
+    let final = once<string>(cb => backend.onTurnFinal(cb));
+    await backend.submitTurn({ turnId: 'turn-sequence', content: 'screen-sequence' });
+    await final;
+    expect(backend.captureCurrentScreen()).toBe('fresh');
+
+    final = once<string>(cb => backend.onTurnFinal(cb));
+    await backend.submitTurn({ turnId: 'turn-stale', content: 'screen-stale-generation' });
+    await final;
+    expect(backend.captureCurrentScreen()).toBe('fresh');
+
+    await backend.submitTurn({ turnId: 'turn-future', content: 'screen-future-generation' });
+    await vi.waitFor(() => expect(failures).toEqual([expect.objectContaining({
+      code: 'remote_runner_protocol_error',
+    })]));
+  });
+
+  it('fails closed when final usage belongs to a future generation', async () => {
+    const backend = new RemoteRunnerBackend({ expectedProvider: 'review-cases' }, 'session-usage-fence');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const usage: RemoteRunnerUsageReport[] = [];
+    const failures: Array<{ code: string }> = [];
+    backend.onUsageSnapshot(value => usage.push(value));
+    backend.onTurnFailure(failure => failures.push(failure));
+    spawnBackend(backend, reviewCasesRunner);
+    await ready;
+
+    await backend.submitTurn({ turnId: 'turn-usage', content: 'usage-future-generation' });
+    await vi.waitFor(() => expect(failures).toEqual([expect.objectContaining({
+      code: 'remote_runner_protocol_error',
+    })]));
+    expect(usage).toEqual([]);
+  });
+
+  it.each([
+    ['session-no-outbound', 'unadvertised-outbound'],
+    ['session-outbound-generation', 'outbound-future-generation'],
+    ['session-final-before-result', 'final-before-result'],
+  ])('fails closed for outbound protocol guard %s', async (sessionId, content) => {
+    const backend = new RemoteRunnerBackend({ expectedProvider: 'review-cases' }, sessionId);
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const failures: Array<{ code: string }> = [];
+    const delivery = vi.fn(() => new Promise<never>(() => {}));
+    backend.onTurnFailure(failure => failures.push(failure));
+    backend.onOutboundMessage(delivery);
+    spawnBackend(backend, reviewCasesRunner);
+    await ready;
+
+    await backend.submitTurn({ turnId: `turn-${content}`, content });
+    await vi.waitFor(() => expect(failures).toEqual([expect.objectContaining({
+      code: 'remote_runner_protocol_error',
+    })]));
+    if (content !== 'final-before-result') expect(delivery).not.toHaveBeenCalled();
+  });
+
+  it('keeps outbound result accounting scoped to its originating turn', async () => {
+    const backend = new RemoteRunnerBackend({ expectedProvider: 'review-cases' }, 'session-cross-turn');
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const resolvers = new Map<string, (value: { outcome: 'delivered'; messageId: string }) => void>();
+    const failures: Array<{ turnId: string; code: string }> = [];
+    const finals: string[] = [];
+    backend.onOutboundMessage(message => new Promise(resolveValue => {
+      resolvers.set(message.operationId, resolveValue);
+    }));
+    backend.onTurnFailure(failure => failures.push(failure));
+    backend.onTurnFinal(text => finals.push(text));
+    spawnBackend(backend, reviewCasesRunner);
+    await ready;
+
+    await backend.submitTurn({ turnId: 'turn-old', content: 'cross-turn-one' });
+    await vi.waitFor(() => expect(failures).toContainEqual(expect.objectContaining({ code: 'first_failed' })));
+    await backend.submitTurn({ turnId: 'turn-new', content: 'cross-turn-two' });
+    await vi.waitFor(() => expect(resolvers.has('new-operation')).toBe(true));
+    resolvers.get('old-operation')?.({ outcome: 'delivered', messageId: 'om_old' });
+
+    await vi.waitFor(() => expect(failures).toContainEqual(expect.objectContaining({
+      turnId: 'turn-new',
+      code: 'remote_runner_protocol_error',
+    })));
+    expect(finals).toEqual([]);
   });
 });

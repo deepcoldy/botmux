@@ -151,6 +151,9 @@ export type RemoteRunnerCommand =
       sessionId: string;
       cwd: string;
       state: RemoteRunnerBackendState;
+      /** `rebuild` means the prior remote resource was explicitly cancelled;
+       * the provider must create a new generation before reporting ready. */
+      resumeMode?: 'reattach' | 'rebuild';
       model?: string;
       modelBackendVariant?: 'standard' | 'max';
       reasoningEffort?: string;
@@ -199,7 +202,7 @@ export type RemoteRunnerEvent =
     })
   | (RemoteRunnerEventBase & {
       type: 'ready';
-      requestId?: string;
+      requestId: string;
       state: RemoteRunnerBackendState;
     })
   | (RemoteRunnerEventBase & {
@@ -466,10 +469,10 @@ export function parseRemoteRunnerEvent(value: unknown): RemoteRunnerEvent | unde
     const state = normalizeRemoteRunnerBackendState(raw.state);
     if (!state) return undefined;
     if (raw.type === 'ready') {
-      const id = raw.requestId === undefined ? undefined : requestId(raw);
-      if (raw.requestId !== undefined && !id) return undefined;
+      const id = requestId(raw);
+      if (!id) return undefined;
       return { protocol: REMOTE_RUNNER_PROTOCOL, version: REMOTE_RUNNER_PROTOCOL_VERSION,
-        type: 'ready', state, ...(id ? { requestId: id } : {}) };
+        type: 'ready', requestId: id, state };
     }
     return { protocol: REMOTE_RUNNER_PROTOCOL, version: REMOTE_RUNNER_PROTOCOL_VERSION,
       type: 'lineage_changed', state };

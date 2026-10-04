@@ -26,6 +26,8 @@
 
 未配置 `cliPathOverride` 时，BotMux 从 `PATH` 查找 `botmux-remote-runner`。`remoteRunner` 只保存协议预期，不应包含 token、cookie 或账号凭据；provider 凭据应通过受限权限文件或部署环境注入。
 
+`envPolicy.mode: "strict"` 不支持 `remote-runner`：BotMux 可以收窄本机 provider 子进程的环境，但无法证明 provider 背后的远端进程同样满足 strict 环境契约，因此启动会 fail closed。
+
 ## 传输与握手
 
 BotMux 启动一个 provider 子进程，通过 stdin 逐行写入命令，通过 stdout 逐行读取事件。每行都是一个完整 JSON 对象，必须携带：
@@ -34,19 +36,27 @@ BotMux 启动一个 provider 子进程，通过 stdin 逐行写入命令，通�
 {"protocol":"botmux.remote-runner","version":1,"type":"..."}
 ```
 
-provider 的 stderr 只用于诊断，不参与协议。stdout 出现未知事件、非法 JSON、版本不匹配、超过 4 MiB 的单行或无关联响应时，BotMux 会关闭该 provider 并按不确定结果处理在途 turn。
+provider 的 stderr 不参与协议；BotMux 只累计其字节数用于错误摘要，不转发或保存正文。stdout 出现未知事件、非法 JSON、版本不匹配、超过 4 MiB 的单行或无关联响应时，BotMux 会关闭该 provider 并按不确定结果处理在途 turn。
 
 启动顺序固定为：
 
 1. BotMux 发送 `hello`，provider 返回同一 `requestId` 的 `hello`，声明 `provider` 和 capabilities。
 2. 新会话发送 `start`；有持久化状态时发送 `resume`。
-3. provider 返回同一 `requestId` 的 `ready` 和最新 `state` 后，BotMux 才提交首轮输入。
+3. provider 返回同一 `requestId` 的 `ready` 和最新 `state` 后，BotMux 才提交首轮输入；`ready.requestId` 必填。
 4. 每个 `turn` 必须先返回同一 `requestId` 的 `status: busy`，该 ACK 才表示 provider 已接受执行。
 5. provider 用 `progress` 流式输出，并以 `final` 或带 `turnId` 的 `failure` 结束该轮。
 
 如果 provider 在 `status: busy` 前就能确定该轮失败，应返回携带原 `requestId` 的 `failure`；
 `turnId` 可以同时携带，也可以由 BotMux 从原命令精确恢复。这个结果是已关联的明确失败，不会被当作
 ACK 超时或未知执行结果，且不会毒化后续 turn。
+
+`resume.resumeMode` 区分两种恢复：缺省或 `reattach` 表示 daemon/worker 重启后接管仍存活的远端资源；
+`rebuild` 表示用户显式关闭后重新打开，旧远端资源已被取消，provider 必须创建新资源、推进
+`generation`，并在可能时保留 `agentThreadId`。BotMux 会拒绝未推进 generation 的 rebuild `ready`。
+
+`status: busy` 前不得发送 `progress`、`outbound_message` 或 `final`。ACK 后的终态 `failure`
+必须携带 `turnId`；可以同时重复原 turn 的 `requestId`，但该值必须精确匹配。只带 `requestId`
+的 post-ACK failure 不足以作为终态关联依据，会被视为协议错误。
 
 `hello.capabilities` 是可扩展字符串集合。BotMux 只检查配置声明的
 `requiredCapabilities`，对名称合法但当前版本未知的 provider capability 保持透传和忽略，
@@ -75,7 +85,7 @@ provider 可以额外声明三项通用终端能力：
 
 终端能力是显示和人工交互通道，不替代 turn 生命周期。任务是否完成仍必须由 `final` / `failure` 决定；`terminal_screen` 的内容不能被 BotMux 解析成业务终态。每个 screen 都携带远端 compute generation：旧 generation 的迟到画面会被忽略，领先于持久状态的画面会触发 fail-closed。
 
-未配置这些 capability 时，`RemoteRunnerBackend` 保持原来的 headless 行为；默认必需 capability 仍只有 `start`、`resume`、`turn`、`cancel`、`detach` 和 `status`，避免升级 BotMux 后强制旧 provider 同步支持终端。
+未配置这些 capability 时，`RemoteRunnerBackend` 保持原来的 headless 行为；默认必需 capability 为 `start`、`resume`、`turn`、`cancel`、`detach`、`reattach` 和 `status`，避免升级 BotMux 后强制旧 provider 同步支持终端。
 
 完整命令与事件联合类型见 [`src/adapters/backend/remote-runner-protocol.ts`](../src/adapters/backend/remote-runner-protocol.ts)。可运行示例见 [`examples/remote-runner/reference-runner.mjs`](../examples/remote-runner/reference-runner.mjs)。
 
@@ -117,6 +127,7 @@ BotMux 完成宿主侧尝试后会写回 `outbound_message_result` 命令：
 结果为 `delivered|rejected|unknown`。`unknown` 表示平台可能已经接受消息但 BotMux 无法证明结果，provider 必须把它交给调用方且不得自动重放。结果命令本身是一次宿主到 provider 的结算通知，不要求 provider 再发 ACK；provider 无法把结果交给远端调用方时，应以当前 turn 的 `failure` 明确收口。
 
 主动消息写入独立的非终态发送标记，不会代替或抑制随后正常到达的 turn `final/failure`。该 capability 同样不属于默认必需集合，只有显式配置它的部署才会在握手时要求 provider 支持。
+成功 `final` 必须等待当前 turn 的所有 `outbound_message_result` 写回；失败终态立即收口，迟到结果不会影响后续 turn。
 
 ### 可选运行用量
 
@@ -165,6 +176,7 @@ provider 可以在 `final` 事件上附带可选 `usage`，把远端运行时已
 - 同一 generation 不得更换 `remoteSessionId`，generation 不得倒退；BotMux 会拒绝违反单调性的状态。
 - `providerState` 是最多 64 KiB、深度受限的普通 JSON。它可以保存恢复定位信息，但不得保存任何凭据。
 - provider 可通过 `lineage_changed` 在 turn 执行期间更新状态，也可在 `final`、`ready`、`status` 中附带状态。BotMux 在接受后立即持久化。
+- 普通 daemon/worker 重启发送 `resumeMode: "reattach"`（省略时同义），允许接管仍存活的远端资源；用户显式关闭后点击恢复发送 `resumeMode: "rebuild"`，provider 必须新建远端资源并在 `ready` 中推进 `generation`。重建未进入 ready 就退出时，BotMux 在远端 lineage 未变化的前提下把逻辑 Session 恢复为 closed；若 lineage 已变化则保持保护状态并要求显式对账，不能伪装成恢复成功。
 
 ## 关闭与进程退出
 

@@ -129,11 +129,10 @@ const CONSUMERS: Record<string, Rule> = {
   },
   'core/session-manager.ts::resumeSession::closeSession': {
     category: 'user_surface',
-    why: 'Three calls close only worker:null daemon-command scratch/registration '
-      + 'losers with no remote lineage. The fourth compensates a synchronously '
-      + 'rejected Remote Runner resume and branches on the exact close result: a '
-      + 'refusal becomes resume_reconciliation_required for every UI/CLI caller.',
-    count: 4,
+    why: 'All three calls close only worker:null daemon-command scratch/registration '
+      + 'losers with no remote lineage. A rejected Remote Runner rebuild now rolls '
+      + 'the row back directly, so it cannot recursively wake a second provider.',
+    count: 3,
   },
   'core/session-manager.ts::spawnDashboardSession::closeSession': {
     category: 'impossible_by_invariant',

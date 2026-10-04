@@ -76,6 +76,7 @@ export class RemoteRunnerBackend implements SessionBackend {
   private terminalCols: number | null = null;
   private terminalRows: number | null = null;
   private activeTurnId: string | null = null;
+  private activeTurnAccepted = false;
   private ready = false;
   private killed = false;
   private closing = false;
@@ -91,7 +92,7 @@ export class RemoteRunnerBackend implements SessionBackend {
   private readonly pendingRequests = new Map<string, PendingRequest>();
   private readonly outboundOperations = new Map<string, OutboundOperation>();
   private outboundOperationCount = 0;
-  private outboundResultWrites = 0;
+  private readonly outboundResultWrites = new Map<string, number>();
   private dataCb: ((data: string) => void) | null = null;
   private screenResyncCb: ((snapshot: string) => void) | null = null;
   private exitCb: ((code: number | null, signal: string | null) => void) | null = null;
@@ -202,9 +203,10 @@ export class RemoteRunnerBackend implements SessionBackend {
       };
     }
     this.activeTurnId = input.turnId;
+    this.activeTurnAccepted = false;
     this.outboundOperations.clear();
     this.outboundOperationCount = 0;
-    this.outboundResultWrites = 0;
+    this.outboundResultWrites.clear();
     this.turnSettled = new Promise<void>(resolve => { this.settleTurn = resolve; });
     const requestId = this.requestId('turn');
     this.activeTurnRequestId = requestId;
@@ -215,7 +217,6 @@ export class RemoteRunnerBackend implements SessionBackend {
         content: input.content,
         ...(input.trustedCaller ? { trustedCaller: input.trustedCaller } : {}),
       }), event => event.type === 'status' && event.status === 'busy', this.operationTimeoutMs);
-      if (this.activeTurnRequestId === requestId) this.activeTurnRequestId = null;
       if (acknowledgement.type === 'failure') {
         const failure: BackendTurnFailure = {
           turnId: acknowledgement.turnId ?? input.turnId,
@@ -453,6 +454,7 @@ export class RemoteRunnerBackend implements SessionBackend {
           sessionId: this.sessionId,
           cwd: opts.cwd,
           state: this.state,
+          ...(opts.remoteResumeMode ? { resumeMode: opts.remoteResumeMode } : {}),
           ...(opts.model ? { model: opts.model } : {}),
           ...(opts.modelBackendVariant ? { modelBackendVariant: opts.modelBackendVariant } : {}),
           ...(opts.reasoningEffort ? { reasoningEffort: opts.reasoningEffort } : {}),
@@ -471,6 +473,11 @@ export class RemoteRunnerBackend implements SessionBackend {
       this.handshakeTimeoutMs,
     );
     if (ready.type !== 'ready') throw new Error('remote runner did not become ready');
+    if (opts.remoteResumeMode === 'rebuild'
+        && this.state
+        && ready.state.generation <= this.state.generation) {
+      throw new Error('remote runner rebuild did not advance the backend generation');
+    }
     if (!this.applyState(ready.state)) throw new Error('remote runner ready state is invalid');
     this.ready = true;
     this.readyCb?.();
@@ -541,7 +548,7 @@ export class RemoteRunnerBackend implements SessionBackend {
       return;
     }
     if (event.type === 'progress') {
-      if (!this.acceptActiveTurn(event.turnId)) return;
+      if (!this.acceptAcknowledgedTurn(event.turnId)) return;
       this.outputBuffer = `${this.outputBuffer}${event.content}`.slice(-MAX_REMOTE_RUNNER_LINE_BYTES);
       this.dataCb?.(event.content);
       return;
@@ -551,8 +558,8 @@ export class RemoteRunnerBackend implements SessionBackend {
       return;
     }
     if (event.type === 'final') {
-      if (!this.acceptActiveTurn(event.turnId)) return;
-      if (this.outboundResultWrites > 0) {
+      if (!this.acceptAcknowledgedTurn(event.turnId)) return;
+      if ((this.outboundResultWrites.get(event.turnId) ?? 0) > 0) {
         this.failProtocol('remote runner emitted final before an outbound message result was returned');
         return;
       }
@@ -593,11 +600,11 @@ export class RemoteRunnerBackend implements SessionBackend {
         return;
       }
       if (event.turnId) {
-        if (event.requestId) {
+        if (event.requestId && event.requestId !== this.activeTurnRequestId) {
           this.failProtocol('remote runner emitted a turn failure for an unrelated request');
           return;
         }
-        if (!this.acceptActiveTurn(event.turnId)) return;
+        if (!this.acceptAcknowledgedTurn(event.turnId)) return;
         this.emitTurnFailure({
           turnId: event.turnId,
           code: event.code,
@@ -621,8 +628,9 @@ export class RemoteRunnerBackend implements SessionBackend {
     }
     clearTimeout(pending.timer);
     this.pendingRequests.delete(id);
-    if (pending.command.type === 'turn' && this.activeTurnRequestId === id) {
-      this.activeTurnRequestId = null;
+    if (pending.command.type === 'turn' && this.activeTurnRequestId === id
+        && event.type === 'status' && event.status === 'busy') {
+      this.activeTurnAccepted = true;
     }
     if (event.type === 'failure') pending.reject(new Error(`${event.code}: ${event.message}`));
     else pending.resolve(event);
@@ -631,6 +639,13 @@ export class RemoteRunnerBackend implements SessionBackend {
   private acceptActiveTurn(turnId: string): boolean {
     if (this.activeTurnId === turnId) return true;
     this.failProtocol(`remote runner event turn ${turnId} does not match active turn`);
+    return false;
+  }
+
+  private acceptAcknowledgedTurn(turnId: string): boolean {
+    if (!this.acceptActiveTurn(turnId)) return false;
+    if (this.activeTurnAccepted) return true;
+    this.failProtocol(`remote runner emitted a turn event before the busy acknowledgement`);
     return false;
   }
 
@@ -649,7 +664,7 @@ export class RemoteRunnerBackend implements SessionBackend {
       this.failProtocol('remote runner emitted outbound_message without advertising the capability');
       return;
     }
-    if (!this.acceptActiveTurn(message.turnId)) return;
+    if (!this.acceptAcknowledgedTurn(message.turnId)) return;
     if (message.generation !== this.state?.generation) {
       this.failProtocol('remote runner outbound message belongs to another backend generation');
       return;
@@ -690,8 +705,13 @@ export class RemoteRunnerBackend implements SessionBackend {
       this.outboundOperations.set(message.operationId, { fingerprint, result });
     }
 
-    this.outboundResultWrites++;
+    this.outboundResultWrites.set(
+      message.turnId,
+      (this.outboundResultWrites.get(message.turnId) ?? 0) + 1,
+    );
     void result.then(async (settled) => {
+      if (this.activeTurnId !== message.turnId
+          || this.state?.generation !== message.generation) return;
       await this.send(remoteRunnerCommand('outbound_message_result', {
         requestId: this.requestId('outbound-message-result'),
         operationId: message.operationId,
@@ -700,11 +720,16 @@ export class RemoteRunnerBackend implements SessionBackend {
         result: settled,
       }));
     }).catch(error => {
-      this.failProtocol(
-        `remote runner outbound message result could not be returned: ${error instanceof Error ? error.message : error}`,
-      );
+      if (this.activeTurnId === message.turnId) {
+        this.failProtocol(
+          `remote runner outbound message result could not be returned: ${error instanceof Error ? error.message : error}`,
+        );
+      }
     }).finally(() => {
-      this.outboundResultWrites = Math.max(0, this.outboundResultWrites - 1);
+      const pending = this.outboundResultWrites.get(message.turnId);
+      if (pending === undefined) return;
+      if (pending <= 1) this.outboundResultWrites.delete(message.turnId);
+      else this.outboundResultWrites.set(message.turnId, pending - 1);
     });
   }
 
@@ -715,10 +740,13 @@ export class RemoteRunnerBackend implements SessionBackend {
   }
 
   private finishActiveTurn(): void {
+    const turnId = this.activeTurnId;
     this.activeTurnId = null;
+    this.activeTurnAccepted = false;
+    this.activeTurnRequestId = null;
     this.outboundOperations.clear();
     this.outboundOperationCount = 0;
-    this.outboundResultWrites = 0;
+    if (turnId) this.outboundResultWrites.delete(turnId);
     const settle = this.settleTurn;
     this.settleTurn = null;
     settle?.();

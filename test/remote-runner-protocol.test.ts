@@ -75,6 +75,12 @@ describe('remote runner protocol', () => {
       provider: 'reference',
       capabilities: ['start', 'INVALID CAPABILITY'],
     }))).toBeUndefined();
+    expect(parseRemoteRunnerEventLine(JSON.stringify({
+      protocol: REMOTE_RUNNER_PROTOCOL,
+      version: REMOTE_RUNNER_PROTOCOL_VERSION,
+      type: 'ready',
+      state: { version: 1, provider: 'reference', generation: 1 },
+    }))).toBeUndefined();
     const preAckFailure = parseRemoteRunnerEventLine(JSON.stringify({
       protocol: REMOTE_RUNNER_PROTOCOL,
       version: REMOTE_RUNNER_PROTOCOL_VERSION,
@@ -95,6 +101,21 @@ describe('remote runner protocol', () => {
       version: REMOTE_RUNNER_PROTOCOL_VERSION,
       type: 'surprise',
     }))).toBeUndefined();
+  });
+
+  it('carries an explicit rebuild intent on closed-session resume', () => {
+    expect(remoteRunnerCommand('resume', {
+      requestId: 'resume-1',
+      sessionId: 'session-1',
+      cwd: '/tmp/work',
+      state: { version: 1, provider: 'reference', generation: 7 },
+      resumeMode: 'rebuild',
+    })).toMatchObject({
+      type: 'resume',
+      requestId: 'resume-1',
+      resumeMode: 'rebuild',
+      state: { generation: 7 },
+    });
   });
 
   it('validates generation-fenced terminal screen snapshots', () => {

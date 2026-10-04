@@ -9,7 +9,7 @@ const paths = [
   { name: 'adopt', config: { adoptMode: true, adoptTarget: 'external-pane' }, error: 'cannot control an adopted process' },
   { name: 'external App Server', config: { existingAppServerEndpoint: 'ws://127.0.0.1:1', cliSessionId: 'thread_probe' }, error: 'cannot control an adopted process' },
   { name: 'Forge', config: { cliLaunchMode: 'forge-traex' }, error: 'cannot control an adopted process' },
-  ...['herdr', 'mojo', 'riff'].map(backendType => ({ name: backendType, config: { backendType }, error: 'currently supports pty, tmux, zellij and zmx' })),
+  ...['herdr', 'mojo', 'riff', 'remote-runner'].map(backendType => ({ name: backendType, config: { backendType }, error: 'currently supports pty, tmux, zellij and zmx' })),
 ];
 
 describe('strict unsupported launches fail closed through real worker IPC', () => {
