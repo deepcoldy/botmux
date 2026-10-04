@@ -63,7 +63,7 @@ import {
 import { ForwardFollowupBuffer } from './forward-followup-buffer.js';
 import { listForwardFollowups, putForwardFollowup, removeForwardFollowup } from './forward-followup-store.js';
 import { claimMessageOnce, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
-import { ingestGroupContextEvent, ingestGroupContextRecall } from '../../services/group-context-ingest.js';
+import { ingestGroupContextEvent, ingestGroupContextRecall, isGroupContextEnabled } from '../../services/group-context-ingest.js';
 import { hasTriggeredMessage, markMessageTriggered, _resetCacheForTest as _resetTriggeredMessagesForTest } from '../../services/triggered-message-store.js';
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
 import { ensureSignedChatDefault } from '../../services/signed-chat-defaults.js';
@@ -5072,6 +5072,22 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // <p> 段落，需先还原为普通 text 消息形态。
       if (!data.message.content && current.body?.content) {
         data.message.content = unwrapEditedTextContent(current.body.content);
+      }
+
+      // 群聊上下文共享：编辑后的正文也要进旁听记录，而且必须在下面各种早退
+      //（bot/卡片刷新、未 @、已触发过）之前——这些编辑不触发任务，但记录要更新。
+      // im.message.get 条目不带 chat_type，先用 getChatMode 确认是群：DM 不采集。
+      // 只记录、不派发；失败不影响编辑补 @ 流程。回读条目自带 update_time，store
+      // 据此拒绝更旧的正文回灌。
+      try {
+        const editedChatId: string | undefined = data.message?.chat_id;
+        if (editedChatId && data.message.chat_type !== 'p2p' && isGroupContextEnabled(larkAppId, editedChatId)) {
+          const mode = await getChatMode(larkAppId, editedChatId);
+          if (mode === 'p2p') data.message.chat_type = 'p2p';
+          else ingestGroupContextEvent(larkAppId, data);
+        }
+      } catch (err) {
+        logger.debug(`[message-updated:${larkAppId}] group-context ingest skipped msg=${messageId.substring(0, 12)}: ${err}`);
       }
 
       // 只处理人类消息：bot/app 编辑自己的消息（含卡片刷新）不触发任务。

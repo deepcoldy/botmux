@@ -46,6 +46,11 @@ export function setGroupContextSettingsResolver(fn: GroupContextSettingsResolver
   resolver = fn ?? (() => undefined);
 }
 
+/** 调用方在做任何有成本的准备（比如查群类型）之前先问一句，关着就别花这个钱。 */
+export function isGroupContextEnabled(larkAppId: string, chatId: string): boolean {
+  return !!resolveSettings(larkAppId, chatId)?.enabled;
+}
+
 function resolveSettings(larkAppId: string, chatId: string): GroupContextSettings | undefined {
   try {
     return resolver(larkAppId, chatId);

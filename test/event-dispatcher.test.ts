@@ -10772,6 +10772,85 @@ describe('im.message.receive_v1 — 群聊上下文静默旁听（不改唤醒�
     expect(listGroupContextMessages(MY_APP_ID, GC_CHAT).messages).toHaveLength(0);
   });
 
+  function gcReadbackItem(opts: { messageId: string; text: string; chatId?: string; senderType?: string; senderOpenId?: string; mentioned?: boolean; updateTime?: string }) {
+    return {
+      message_id: opts.messageId,
+      chat_id: opts.chatId ?? GC_CHAT,
+      msg_type: 'text',
+      body: { content: JSON.stringify({ text: opts.text }) },
+      create_time: '1700000000000',
+      update_time: opts.updateTime ?? '1700000001000',
+      mentions: opts.mentioned ? [{ key: '@_bot_a', name: 'BotA', id: MY_OPEN_ID, id_type: 'open_id' }] : undefined,
+      sender: { id: opts.senderOpenId ?? USER_OPEN_ID, id_type: 'open_id', sender_type: opts.senderType ?? 'user' },
+    };
+  }
+  const gcUpdatedEvent = (messageId: string, eventId: string) => ({
+    header: { event_id: eventId },
+    message: { message_id: messageId },
+  });
+
+  it('编辑事件：未 @ 的人类编辑进记录（新 revision），不触发任务', async () => {
+    const ev = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID, content: JSON.stringify({ text: 'v0' }),
+      messageId: 'msg-gc-edit-h', chatId: GC_CHAT, chatType: 'group',
+    });
+    await capturedHandlers['im.message.receive_v1'](ev);
+    await flushEventWork();
+    const callsBefore = handlers.handleNewTopic.mock.calls.length + handlers.handleThreadReply.mock.calls.length;
+    mockGetMessageDetail.mockResolvedValueOnce({ items: [gcReadbackItem({ messageId: 'msg-gc-edit-h', text: 'v1 edited' })] });
+    await capturedHandlers['im.message.updated_v1'](gcUpdatedEvent('msg-gc-edit-h', 'evt-gc-h'));
+    await flushEventWork();
+    expect(getGroupContextMessage(MY_APP_ID, GC_CHAT, 'msg-gc-edit-h')).toMatchObject({ text: 'v1 edited', revision: 1, updateTime: 1700000001000 });
+    expect(handlers.handleNewTopic.mock.calls.length + handlers.handleThreadReply.mock.calls.length).toBe(callsBefore);
+  });
+
+  it('编辑事件：bot 卡片刷新也进记录，CLI handler 不调用', async () => {
+    mockGetMessageDetail.mockResolvedValueOnce({ items: [gcReadbackItem({
+      messageId: 'msg-gc-edit-bot', text: '进度 80%', senderType: 'app', senderOpenId: OTHER_BOT_OPEN_ID,
+    })] });
+    await capturedHandlers['im.message.updated_v1'](gcUpdatedEvent('msg-gc-edit-bot', 'evt-gc-b'));
+    await flushEventWork();
+    expect(getGroupContextMessage(MY_APP_ID, GC_CHAT, 'msg-gc-edit-bot')).toMatchObject({ text: '进度 80%', senderType: 'bot', senderId: OTHER_BOT_OPEN_ID });
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('编辑事件：已触发过的 @ 消息被编辑 → 记录更新、不再触发第二次', async () => {
+    const ev = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID, content: JSON.stringify({ text: '@BotA 帮我修一下' }),
+      messageId: 'msg-gc-edit-trig', chatId: GC_CHAT, chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+    await capturedHandlers['im.message.receive_v1'](ev);
+    await flushEventWork();
+    const callsAfterTrigger = handlers.handleNewTopic.mock.calls.length + handlers.handleThreadReply.mock.calls.length;
+    expect(callsAfterTrigger).toBeGreaterThan(0);
+    mockGetMessageDetail.mockResolvedValueOnce({ items: [gcReadbackItem({ messageId: 'msg-gc-edit-trig', text: '@BotA 帮我修一下，顺便加测试', mentioned: true })] });
+    await capturedHandlers['im.message.updated_v1'](gcUpdatedEvent('msg-gc-edit-trig', 'evt-gc-t'));
+    await flushEventWork();
+    expect(getGroupContextMessage(MY_APP_ID, GC_CHAT, 'msg-gc-edit-trig')?.text).toContain('顺便加测试');
+    expect(getGroupContextMessage(MY_APP_ID, GC_CHAT, 'msg-gc-edit-trig')?.revision).toBe(1);
+    expect(handlers.handleNewTopic.mock.calls.length + handlers.handleThreadReply.mock.calls.length).toBe(callsAfterTrigger);
+  });
+
+  it('编辑事件：DM（getChatMode=p2p）不采集', async () => {
+    mockGetChatMode.mockResolvedValueOnce('p2p');
+    mockGetMessageDetail.mockResolvedValueOnce({ items: [gcReadbackItem({ messageId: 'msg-gc-edit-dm', text: 'dm edit', chatId: 'chat-dm-1' })] });
+    await capturedHandlers['im.message.updated_v1'](gcUpdatedEvent('msg-gc-edit-dm', 'evt-gc-dm'));
+    await flushEventWork();
+    expect(listGroupContextMessages(MY_APP_ID, 'chat-dm-1').messages).toHaveLength(0);
+  });
+
+  it('编辑事件：开关关闭时不查群类型也不写', async () => {
+    setGroupContextSettingsResolver(() => ({ enabled: false }));
+    mockGetChatMode.mockClear();
+    mockGetMessageDetail.mockResolvedValueOnce({ items: [gcReadbackItem({ messageId: 'msg-gc-edit-off', text: 'off', senderType: 'app' })] });
+    await capturedHandlers['im.message.updated_v1'](gcUpdatedEvent('msg-gc-edit-off', 'evt-gc-off'));
+    await flushEventWork();
+    expect(listGroupContextMessages(MY_APP_ID, GC_CHAT).messages).toHaveLength(0);
+    expect(mockGetChatMode).not.toHaveBeenCalled();
+  });
+
   it('im.message.recalled_v1 → tombstone revision', async () => {
     const ev = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID, content: JSON.stringify({ text: '发错了' }),
