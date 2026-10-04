@@ -41,7 +41,7 @@ import {
   buildEventSubDeepLink,
   buildScopeDeepLink,
 } from '../../setup/verify-permissions.js';
-import { automateOpenPlatformSetup, MESSAGE_UPDATED_EVENT, ensureAppEventSubscriptions, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest, inspectUnderReviewConfigHints } from '../../setup/open-platform-automation.js';
+import { automateOpenPlatformSetup, MESSAGE_UPDATED_EVENT, MESSAGE_RECALLED_EVENT, ensureAppEventSubscriptions, probeVcMeetingEventSubscription, readDefaultScopeManifest, filterScopeManifest, inspectUnderReviewConfigHints } from '../../setup/open-platform-automation.js';
 import { type Brand, larkHosts, normalizeBrand } from './lark-hosts.js';
 import { tryHandleGrantCommand } from './grant-command.js';
 import { tryHandleInviteCommand } from './invite-command.js';
@@ -898,6 +898,72 @@ export async function ensureMessageUpdatedEventSubscribed(larkAppId: string): Pr
     }
   } catch (err: any) {
     logger.debug(`[${larkAppId}] message-updated event subscription check errored: ${err?.message ?? err}`);
+  }
+}
+
+/** 撤回事件订阅的启动补齐结果：`covered=false` 时真实群里的撤回不会推到本 bot。 */
+export interface MessageRecalledSubscriptionStatus {
+  /** 配置回读包含 im.message.recalled_v1 且为长连接。发布生效与实际推送仍未验证。 */
+  covered: boolean;
+  reason:
+    | 'subscribed'            // 已有配置包含事件，本次未更新
+    | 'update_submitted'      // 本次补订阅成功且回读完整（仍需发布版本）
+    | 'readback_incomplete'   // 回读缺事件或非长连接
+    | 'session_unavailable'   // 开放平台登录态 / API 不可用
+    | 'skipped_brand'         // 非 feishu 品牌，不做
+    | 'error';
+  updateSubmitted: boolean;
+  missingEvents: string[];
+  detail?: string;
+}
+
+/**
+ * 启动时只补 im.message.recalled_v1 这一个事件，走缓存的开放平台登录态；绝不跑完整 setup。
+ * 与 ensureMessageUpdatedEventSubscribed 同一套 best-effort 口径，但把结果返回给调用方：
+ * 群聊上下文共享需要知道「撤回有没有覆盖」，没覆盖就得在状态里标出来，不能装作记录完整。
+ */
+export async function ensureMessageRecalledEventSubscribed(larkAppId: string): Promise<MessageRecalledSubscriptionStatus> {
+  const bot = getBot(larkAppId);
+  if (normalizeBrand(bot.config.brand) !== 'feishu') {
+    return { covered: false, reason: 'skipped_brand', updateSubmitted: false, missingEvents: [MESSAGE_RECALLED_EVENT] };
+  }
+  try {
+    const result = await ensureAppEventSubscriptions(larkAppId, [MESSAGE_RECALLED_EVENT]);
+    const updateStatus = result.updateSubmitted ? '更新请求已成功返回' : '无成功返回的更新请求';
+    if (!result.ok) {
+      logger.info(
+        `[${larkAppId}] im.message.recalled_v1 配置检查未完成（${result.reason}，${updateStatus}）：` +
+        `请检查开放平台登录态和事件订阅配置；群聊上下文共享收不到撤回事件，被撤回的消息会留在记录里。`,
+      );
+      return { covered: false, reason: 'session_unavailable', updateSubmitted: false, missingEvents: [MESSAGE_RECALLED_EVENT], detail: result.reason };
+    }
+    if (!result.eventModeReady || result.missingEvents.length > 0) {
+      logger.info(
+        `[${larkAppId}] im.message.recalled_v1 配置回读不完整（longConnection=${result.eventModeReady}, ` +
+        `missing=${result.missingEvents.join(',')}，${updateStatus}）：请在开放平台检查事件和长连接配置；` +
+        `群聊上下文共享收不到撤回事件。发布生效及实际推送未验证，不影响正常消息。`,
+      );
+      return {
+        covered: false, reason: 'readback_incomplete', updateSubmitted: result.updateSubmitted,
+        missingEvents: result.missingEvents.length > 0 ? [...result.missingEvents] : [],
+        detail: `longConnection=${result.eventModeReady}`,
+      };
+    }
+    if (result.updateSubmitted) {
+      logger.info(
+        `[${larkAppId}] im.message.recalled_v1 更新请求已成功返回，配置回读包含事件且为长连接；` +
+        `启动流程不会自动发布，请在开放平台检查并发布应用版本；发布生效及实际推送未验证。`,
+      );
+      return { covered: true, reason: 'update_submitted', updateSubmitted: true, missingEvents: [] };
+    }
+    logger.info(
+      `[${larkAppId}] im.message.recalled_v1 已有配置包含事件且为长连接，本次未更新；` +
+      `发布生效及实际推送未验证，撤回未进记录时请检查已发布版本的事件订阅。`,
+    );
+    return { covered: true, reason: 'subscribed', updateSubmitted: false, missingEvents: [] };
+  } catch (err: any) {
+    logger.debug(`[${larkAppId}] message-recalled event subscription check errored: ${err?.message ?? err}`);
+    return { covered: false, reason: 'error', updateSubmitted: false, missingEvents: [MESSAGE_RECALLED_EVENT], detail: String(err?.message ?? err) };
   }
 }
 
