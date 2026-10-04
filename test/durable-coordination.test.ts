@@ -265,6 +265,23 @@ describe('SQLite durable coordination contract', () => {
       attempt: { ...begun.attempt, claimEpoch: begun.attempt.claimEpoch + 1 },
       receipt: { platformMessageId: 'om_wrong' },
     })).toEqual({ kind: 'stale' });
+
+    await store.enqueueOutbox({
+      lease,
+      message: {
+        messageId: 'message-explicit-ambiguous', sessionKey: 'session-1', payload: { text: 'later' },
+        visibleAt: 14, createdAt: 2,
+      },
+    });
+    const nextReservation = await store.reserveNextOutbox({ workerId: 'sender-a', leaseDurationMs: 10 });
+    const nextAttempt = await store.beginOutboxAttempt({ reservation: nextReservation! });
+    if (nextAttempt.kind !== 'applied') throw new Error('expected explicit ambiguous attempt');
+    expect(await store.markOutboxAmbiguous({
+      attempt: nextAttempt.attempt, error: 'transport outcome unknown',
+    })).toMatchObject({ kind: 'applied', record: { state: 'ambiguous' } });
+    expect(await store.completeOutboxAttempt({
+      attempt: nextAttempt.attempt, receipt: { platformMessageId: 'om_delayed' },
+    })).toMatchObject({ kind: 'applied', record: { state: 'delivered' } });
     await store.close();
   });
 

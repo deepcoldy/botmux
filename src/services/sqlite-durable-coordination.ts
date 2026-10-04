@@ -652,7 +652,9 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
       `UPDATE durable_outbox
           SET state = ?, visible_at = COALESCE(?, visible_at),
               receipt_json = COALESCE(?, receipt_json), last_error = ?,
-              claim_owner = NULL, claim_until = NULL, updated_at = ?
+              claim_owner = CASE WHEN ? = 1 THEN claim_owner ELSE NULL END,
+              claim_until = CASE WHEN ? = 1 THEN claim_until ELSE NULL END,
+              updated_at = ?
         WHERE message_id = ? AND ${eligibleState}
           AND claim_owner = ? AND claim_epoch = ? AND attempts = ?`,
     ).run(
@@ -660,6 +662,8 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
       options.visibleAt ?? null,
       options.receiptJson ?? null,
       options.error ?? null,
+      state === 'ambiguous' ? 1 : 0,
+      state === 'ambiguous' ? 1 : 0,
       now,
       attempt.record.messageId,
       attempt.workerId,
