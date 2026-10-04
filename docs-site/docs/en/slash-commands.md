@@ -33,6 +33,7 @@ Just send these commands directly in a topic, and the daemon intercepts and hand
 | `/sessions` | List this bot's active topic sessions in the current group and jump directly back to a topic (legacy sessions use a safe locate fallback) |
 | `/dashboard [module]` | Open Dashboard control cards in Feishu (sessions/schedules/groups/settings/help, etc.) |
 | `@bot /project enable\|status\|roles\|disable` | Enable, inspect, configure agent roles, or leave project-group mode in the current ordinary group (owner/allowedUsers only; does not consume a session slot) |
+| `@bot /context-sharing on\|off\|status` | Enable, disable, or inspect passive context sharing for the current group (off by default; owner/allowedUsers only; creates no session or extra model turn) |
 | `/insight` | owner-only: instantly posts a "session insight summary" card for the current session (aggregate metrics + rule suggestions; action-span detail / per-turn reconciliation / conversation replay live on the Dashboard "Insights" page) |
 | `/vc prepare <meeting link or number>` | Use the current regular group as a meeting-prep chat and reuse the same Agent session during the meeting |
 | `/introduce` | Register the bots in this chat with each other by `open_id`, so they can @-mention one another precisely when collaborating |
@@ -268,6 +269,24 @@ On every project turn, the coordinator receives Botmux's fixed project-state pro
 - `@bot /project disable`: leave project-group mode; an unused guide is unpinned, while existing project state is retained for a later re-enable.
 
 The command works only in ordinary groups and only for the Bot's owner/allowedUsers. Repeating `enable` preserves any worker subset and auto-enrollment policy already curated in Dashboard. Dashboard can disable “automatically enroll new bots”; when disabled, the explicit worker list remains unchanged. Dashboard also lists the same project agents and deep-links to their group-role editors; both entry points share one role source of truth.
+
+## 🧠 Group Context Sharing
+
+In a real Lark group, mention any bot managed by this deployment:
+
+```text
+@bot /context-sharing on
+@bot /context-sharing status
+@bot /context-sharing off
+```
+
+The switch is group-wide and off by default. Once enabled, bots managed by this deployment passively retain published messages from the group. A bot that was not mentioned stays asleep. On its next activation under the existing mention policy, it receives attributed background it missed. The switch does not change mention routing or create a model turn or session merely to deliver background.
+
+Only a human owner/member of that bot's `allowedUsers` can inspect or change the switch; ordinary talk grants and other bots do not qualify. DMs and API virtual sessions are unsupported. Sessions configured with `promptInjection=none` explicitly do not receive automatic background.
+
+By default, injected background is bounded to 24,000 characters per turn, while stored group observations are retained for 30 days or 10,000 messages. Injected background counts toward the activated model's input tokens, but passive observation does not call a model. Scope is limited to published group messages and resource references; it excludes DMs, hidden reasoning, unpublished tool results, and private files. If platform backfill is incomplete because of history limits, permissions, or retention, the background carries an incomplete-range marker instead of presenting the gap as complete history.
+
+`status` and successful enable responses also show a recall-event subscription diagnostic. Only a `subscribed` reason means the app configuration was verified to include `im.message.recalled_v1`; this does not promise 100% push delivery. `update_submitted` means an update was submitted but still requires publishing a new app version in Lark Developer Console. Unknown, unavailable-login, or stale results mean historical background may temporarily retain recalled messages; inspect that event subscription and retry. Disabling performs no subscription check or setup action.
 
 ## 📄 Feishu Doc Comment Entry
 

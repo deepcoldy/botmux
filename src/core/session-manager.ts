@@ -11,6 +11,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { expandHome, validateWorkingDir } from './working-dir.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
+import { groupContextEpoch, groupContextForPrompt } from '../services/group-context-prompt.js';
 import * as scheduleStore from '../services/schedule-store.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
@@ -1172,6 +1173,7 @@ function buildCodexAppTurnInput(opts: {
   availableBotsBlock?: string;
   chatContextPolicyBlock?: string;
   chatContextBlock?: string;
+  groupHistoryBlock?: string;
   applicationContextBlock?: string;
   messageContextBlock?: string;
   bufferedFollowUpsBlock?: string;
@@ -1188,6 +1190,7 @@ function buildCodexAppTurnInput(opts: {
   addCodexAppContext(additionalContext, 'botmux_available_bots', opts.availableBotsBlock ?? '', 'untrusted');
   addCodexAppContext(additionalContext, 'botmux_chat_context_policy', opts.chatContextPolicyBlock ?? '', 'application');
   addCodexAppContext(additionalContext, 'botmux_chat_context', opts.chatContextBlock ?? '', 'untrusted');
+  addCodexAppContext(additionalContext, 'botmux_group_history', opts.groupHistoryBlock ?? '', 'untrusted');
   addCodexAppContext(additionalContext, 'botmux_application_context', opts.applicationContextBlock ?? '', 'application');
   addCodexAppContext(additionalContext, 'botmux_message_context', opts.messageContextBlock ?? '', 'untrusted');
   addCodexAppContext(additionalContext, 'botmux_buffered_followups', opts.bufferedFollowUpsBlock ?? '', 'untrusted');
@@ -1242,6 +1245,28 @@ function inputPromptInjection(sessionId: string, larkAppId?: string, cliId?: str
   return zeroPromptInjectionForBot(larkAppId, cliId) ? 'none' : 'default';
 }
 
+/** Only an already-authorized, message-bound group activation may add history. */
+function backgroundForInput(sessionId: string, cliId: string | undefined, opts?: {
+  larkAppId?: string; chatId?: string; turnId?: string; promptInjection?: PromptInjection;
+}) {
+  if (!opts?.larkAppId || !opts.chatId?.startsWith('oc_') || !opts.turnId
+    || sessionIsNoTransport(opts.larkAppId, opts.chatId)
+    || zeroPromptInjectionForBot(opts.larkAppId, cliId, opts.promptInjection)) return undefined;
+  const nativeId = sessionStore.getSession(sessionId)?.cliSessionId;
+  return groupContextForPrompt({
+    appId: opts.larkAppId, chatId: opts.chatId, turnId: opts.turnId, sessionId,
+    epoch: groupContextEpoch(sessionId, nativeId, cliId, opts.turnId),
+    promptInjection: opts.promptInjection,
+  });
+}
+
+function mergeBackgroundAttachments(current: LarkAttachment[] | undefined, background: LarkAttachment[] | undefined): LarkAttachment[] | undefined {
+  if (!background?.length) return current;
+  const merged = new Map((current ?? []).map(item => [item.path, item]));
+  for (const item of background) if (!merged.has(item.path)) merged.set(item.path, item);
+  return [...merged.values()];
+}
+
 /** opening 构建选项。在原有 larkAppId/chatId/whiteboardId 等之外，新增 hook 模式
  *  （#794 后续）所需的 turnId 与 sessionBackendType：turnId 是 opening 轮的权威
  *  turnId（= 发给 worker 的 turnId，最终成为 managedTurnOrigin.turnId），用于
@@ -1253,6 +1278,7 @@ type NewTopicOpts = {
   whiteboardId?: string;
   substituteTrigger?: SubstituteTrigger;
   chatContext?: ChatContext;
+  sharedGroupContext?: string;
   turnId?: string;
   sessionBackendType?: BackendType;
   /** replyDelivery=transcript 且本轮是 solo 会话（daemon 算好的 ds.soloSession）：
@@ -1264,7 +1290,7 @@ type NewTopicOpts = {
 };
 
 type NewTopicBlockKey = 'routing' | 'skill' | 'identity' | 'credentials' | 'sessionId' | 'role'
-  | 'summaryMemory' | 'whiteboard' | 'chatContextPolicy' | 'chatContext'
+  | 'summaryMemory' | 'whiteboard' | 'chatContextPolicy' | 'chatContext' | 'groupHistory'
   | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments'
   | 'mentions' | 'availableBots';
 
@@ -1294,7 +1320,7 @@ function buildNewTopicBlocks(
     // service-user 适配器（ebsd）自带完整外壳，不参与分块：包成单块返回，
     // join 后与历史字符串逐字一致；hook 模式下该块不在 ENVELOPE_KEYS 里，
     // 全部留在 PTY 文本（且 service-user 适配器本就不满足 hook 模式前置条件）。
-    return [{ key: 'userMessage', text: buildServiceUserPrompt([userMessage, ...(followUps ?? [])].join('\n\n')) }];
+    return [{ key: 'userMessage', text: buildServiceUserPrompt([opts?.sharedGroupContext, userMessage, ...(followUps ?? [])].filter(Boolean).join('\n\n')) }];
   }
   // Non-Claude CLIs receive the botmux routing hints inline via the prompt
   // (Claude Code builds its own via --append-system-prompt). Source hints
@@ -1426,6 +1452,7 @@ function buildNewTopicBlocks(
   if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
   if (chatContextPolicyBlock) blocks.push({ key: 'chatContextPolicy', text: chatContextPolicyBlock });
   if (chatContextBlock) blocks.push({ key: 'chatContext', text: chatContextBlock });
+  if (opts?.sharedGroupContext) blocks.push({ key: 'groupHistory', text: opts.sharedGroupContext });
 
   blocks.push({ key: 'userMessage', text: userBlock });
 
@@ -1502,6 +1529,7 @@ export function buildNewTopicCliInput(
     codexAppFollowUps?: string[];
     codexAppFollowUpContexts?: string[];
     chatContext?: ChatContext;
+    sharedGroupContext?: string;
     /** Host-resolved identity for this turn. Only the caller knows where the
      *  turn came from, so it is passed in rather than derived here. */
     trustedCaller?: CliTurnPayload['trustedCaller'];
@@ -1516,6 +1544,11 @@ export function buildNewTopicCliInput(
   },
 ): CliTurnPayload {
   opts = { ...opts, promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, cliId) };
+  const background = backgroundForInput(sessionId, cliId, opts);
+  if (background) {
+    opts = { ...opts, sharedGroupContext: background.body };
+    attachments = mergeBackgroundAttachments(attachments, background.attachments);
+  }
   // 调用点漏传 locale 时回落该 bot 的 per-bot 语言（与 buildFollowUpCliInput /
   // buildReforkCliInput 同一兜底）；bot 未配 lang 时 localeForBot 即进程默认，
   // 与旧行为一致。否则首轮按 bot 语言、续轮回落进程默认会造成同会话语言混排。
@@ -1591,6 +1624,7 @@ export function buildNewTopicCliInput(
       availableBotsBlock,
       chatContextPolicyBlock,
       chatContextBlock,
+      groupHistoryBlock: opts?.sharedGroupContext,
       applicationContextBlock: opts?.codexAppApplicationContext,
       messageContextBlock: opts?.codexAppMessageContext,
       bufferedFollowUpsBlock: opts?.codexAppFollowUpContexts?.filter(Boolean).join('\n\n'),
@@ -1604,7 +1638,7 @@ export function buildNewTopicCliInput(
  * Mirrors buildNewTopicPrompt structure but for subsequent messages.
  * Session ID is omitted for adopt mode and CLIs with injectsSessionContext.
  */
-type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'reminder' | 'whiteboard' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
+type FollowUpBlockKey = 'sessionId' | 'role' | 'summaryMemory' | 'reminder' | 'whiteboard' | 'groupHistory' | 'userMessage' | 'sender' | 'substitute' | 'senderNote' | 'attachments' | 'mentions';
 
 /**
  * 按既有顺序构造 follow-up 的各个块。inline 模式直接 join；hook 模式
@@ -1628,6 +1662,7 @@ type FollowUpOpts = {
   codexAppText?: string;
   codexAppApplicationContext?: string;
   codexAppMessageContext?: string;
+  sharedGroupContext?: string;
   /** 会话冻结的后端类型（ds.session.backendType）。riff 等远端后端没有本地
    *  Claude hook 进程，强制 inline 模式。 */
   sessionBackendType?: BackendType;
@@ -1711,6 +1746,8 @@ function buildFollowUpBlocks(
   }
   if (whiteboardBlock) blocks.push({ key: 'whiteboard', text: whiteboardBlock });
 
+  if (opts?.sharedGroupContext) blocks.push({ key: 'groupHistory', text: opts.sharedGroupContext });
+
   // bare（transcript + solo）：裸文本 + `[附件]`/`[@提及]` 行，附件/提及已折进正文，
   // 下面的 sender / senderNote / attachments / mentions 块一并跳过；substitute 保留。
   // hook 模式（#794 后续）：PTY 文本只保留用户正文，不再包 <user_message> 外壳。
@@ -1763,7 +1800,7 @@ export function buildFollowUpContent(
     && !zeroPromptInjectionForBot(opts.larkAppId, opts.cliId, opts.promptInjection)
     && createCliAdapterSync(opts.cliId, opts.cliPathOverride).inputEnvelope === 'service-user'
   ) {
-    return buildServiceUserPrompt(content);
+    return buildServiceUserPrompt([opts?.sharedGroupContext, content].filter(Boolean).join('\n\n'));
   }
   return buildFollowUpBlocks(content, sessionId, opts).map((b) => b.text).join('\n\n');
 }
@@ -1874,6 +1911,12 @@ export function buildFollowUpCliInput(
   opts?: FollowUpOpts,
 ): CliTurnPayload {
   opts = { ...opts, promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, opts?.cliId) };
+  const background = backgroundForInput(sessionId, opts.cliId, opts);
+  if (background) opts = {
+    ...opts, sharedGroupContext: background.body,
+    attachments: mergeBackgroundAttachments(opts.attachments, background.attachments),
+  };
+  opts = { ...opts, promptInjection: opts?.promptInjection ?? inputPromptInjection(sessionId, opts?.larkAppId, opts?.cliId) };
   // 兜底 locale：活 worker 普通续轮、worker-null re-fork、XPI 重放、文档评论等
   // 调用点若漏传，首轮（buildNewTopicCliInput 已按 per-bot 语言渲染）与续轮就会
   // 语言混排。统一在此按 bot 配置补齐；bot 未配 lang 时即进程默认，与旧行为一致。
@@ -1936,6 +1979,7 @@ export function buildFollowUpCliInput(
       mentionBlock,
       applicationContextBlock: opts.codexAppApplicationContext,
       messageContextBlock: opts.codexAppMessageContext,
+      groupHistoryBlock: opts.sharedGroupContext,
       attachments: opts.attachments,
     }),
   };
@@ -1954,6 +1998,18 @@ export function buildFollowUpCliInput(
  * carries over, but the format avoids any wording that would prompt the
  * model to call `botmux send` / route through botmux tooling.
  */
+export function buildGroupContextBridgeInput(content: string, sessionId: string, opts: {
+  larkAppId?: string; chatId?: string; turnId?: string; cliId?: CliId; promptInjection?: PromptInjection;
+  attachments?: LarkAttachment[]; mentions?: LarkMention[]; selfMention?: { name?: string | null; openId?: string | null }; locale?: Locale;
+}): string {
+  // Native commands are not model activations and must remain raw commands.
+  const background = /^\s*[/!]/.test(content) ? undefined : backgroundForInput(sessionId, opts.cliId, opts);
+  return buildBridgeInputContent(content, {
+    ...opts, sharedGroupContext: background?.body,
+    attachments: mergeBackgroundAttachments(opts.attachments, background?.attachments),
+  });
+}
+
 export function buildBridgeInputContent(
   content: string,
   opts?: {
@@ -1961,6 +2017,7 @@ export function buildBridgeInputContent(
     mentions?: LarkMention[];
     selfMention?: { name?: string | null; openId?: string | null };
     locale?: Locale;
+    sharedGroupContext?: string;
   },
 ): string {
   const selfMention = opts?.selfMention;
@@ -2006,7 +2063,7 @@ export function buildBridgeInputContent(
     return out;
   };
 
-  const parts: string[] = [stripLeadingSelfMentions(content)];
+  const parts: string[] = [opts?.sharedGroupContext, stripLeadingSelfMentions(content)].filter((part): part is string => part !== undefined);
 
   if (opts?.attachments && opts.attachments.length > 0) {
     const lines = opts.attachments.map(a => `- ${a.name} (${a.path})`);
@@ -2105,7 +2162,9 @@ export function buildReforkCliInput(
   const locale = opts?.locale ?? localeForBot(ds.larkAppId);
   if (ds.adoptedFrom) {
     return {
-      content: buildBridgeInputContent(content, {
+      content: buildGroupContextBridgeInput(content, ds.session.sessionId, {
+        larkAppId: ds.larkAppId, chatId: ds.chatId, turnId: opts?.turnId, cliId: opts?.cliId,
+        promptInjection: sessionPromptInjection(ds),
         attachments: opts?.attachments,
         mentions: opts?.mentions,
         selfMention: opts?.selfMention,

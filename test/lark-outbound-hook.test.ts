@@ -5,7 +5,12 @@ const mocks = vi.hoisted(() => ({
   reply: vi.fn(),
   request: vi.fn(),
   emitHookEvent: vi.fn(),
+  sharing: false,
+  observePublished: vi.fn(),
 }));
+
+vi.mock('../src/services/group-context-settings-store.js', () => ({ getGroupContextSettings: () => ({ enabled: mocks.sharing }) }));
+vi.mock('../src/services/group-context-runtime.js', () => ({ observePublishedGroupMessage: mocks.observePublished }));
 
 vi.mock('../src/bot-registry.js', () => ({
   getBotClient: () => ({
@@ -30,6 +35,8 @@ describe('Lark outbound hook provider replay suppression', () => {
     mocks.reply.mockReset().mockResolvedValue({ code: 0, data: { message_id: 'om_reply' } });
     mocks.request.mockReset().mockResolvedValue({ code: 0 });
     mocks.emitHookEvent.mockReset();
+    mocks.sharing = false;
+    mocks.observePublished.mockReset();
   });
 
   it('keeps the ordinary first-send hook', async () => {
@@ -41,6 +48,26 @@ describe('Lark outbound hook provider replay suppression', () => {
       uuid: 'stable-uuid',
       sessionId: 'sid',
     }));
+  });
+
+  it('records published content without relying on self-message echo only when opted in', async () => {
+    await sendMessage('app', 'oc_chat', 'not recorded');
+    expect(mocks.observePublished).not.toHaveBeenCalled();
+    mocks.sharing = true;
+    await sendMessage('app', 'oc_chat', 'shared conclusion');
+    expect(mocks.observePublished).toHaveBeenCalledWith('app', expect.objectContaining({
+      message_id: 'om_send', chat_id: 'oc_chat', body: { content: '{"text":"shared conclusion"}' },
+    }));
+    mocks.reply.mockResolvedValue({ code: 0, data: { message_id: 'om_reply', chat_id: 'oc_chat' } });
+    await replyMessage('app', 'om_parent', 'shared reply');
+    expect(mocks.observePublished).toHaveBeenLastCalledWith('app', expect.objectContaining({ message_id: 'om_reply', chat_id: 'oc_chat' }));
+  });
+
+  it('does not turn a recording failure into a failed send or a duplicate publication', async () => {
+    mocks.sharing = true;
+    mocks.observePublished.mockImplementation(() => { throw new Error('disk busy'); });
+    await expect(sendMessage('app', 'oc_chat', 'answer')).resolves.toBe('om_send');
+    expect(mocks.create).toHaveBeenCalledOnce();
   });
 
   it('does not repeat send/reply hooks while reconciling an accepted provider UUID', async () => {

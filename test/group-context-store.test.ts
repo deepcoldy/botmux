@@ -446,7 +446,13 @@ describe('文件权限', () => {
     expect(statSync(path).mode & 0o777).toBe(0o600);
     // WAL 副文件若已出现，不能比主文件更宽
     for (const suffix of ['-wal', '-shm']) {
-      try { expect(statSync(path + suffix).mode & 0o077).toBe(0); } catch { /* 尚未创建 */ }
+      let mode: number;
+      try { mode = statSync(path + suffix).mode; }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue;
+        throw error;
+      }
+      expect(mode & 0o077).toBe(0);
     }
   });
 });

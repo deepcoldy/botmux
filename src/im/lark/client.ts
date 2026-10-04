@@ -11,6 +11,7 @@ import { BoundedMap } from '../../utils/bounded-map.js';
 import { resolveUserToken } from '../../utils/user-token.js';
 import { listObservedBots } from '../../services/observed-bots-store.js';
 import { getBotCapability } from '../../services/bot-profile-store.js';
+import { getGroupContextSettings } from '../../services/group-context-settings-store.js';
 import { resolveTeamRoleFile } from '../../core/role-resolver.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { canonicalMobileKey, isMobileEntry, normalizeMobileEntry } from '../../setup/bot-config-editor.js';
@@ -295,6 +296,20 @@ async function emitOutboundHookIfAllowed(
   }
 }
 
+async function recordPublishedGroupContext(larkAppId: string, data: any, body: string, msgType: string, chatId?: string): Promise<void> {
+  const groupId = chatId ?? data?.chat_id;
+  if (typeof groupId !== 'string' || !getGroupContextSettings(larkAppId, groupId).enabled) return;
+  try {
+    // Lazy import avoids a parser/client initialization cycle and costs nothing
+    // in the default-off path. Only successfully published group content enters.
+    const { observePublishedGroupMessage } = await import('../../services/group-context-runtime.js');
+    observePublishedGroupMessage(larkAppId, {
+      ...data, chat_id: groupId, msg_type: msgType, body: { content: body },
+      sender: { id: getBot(larkAppId)?.botOpenId ?? larkAppId, sender_type: 'app', sender_name: getBot(larkAppId)?.botName },
+    });
+  } catch { logger.warn('[group-context] outbound observation failed; publication remains successful'); }
+}
+
 export async function sendMessage(
   larkAppId: string,
   chatId: string,
@@ -337,6 +352,7 @@ export async function sendMessage(
     const messageId = res.data?.message_id;
     if (!messageId) throw new Error('No message_id in response');
     logger.info(`Sent message ${messageId} to chat ${chatId}`);
+    await recordPublishedGroupContext(larkAppId, res.data, body, msgType, chatId);
     await emitOutboundHookIfAllowed(options, 'outbound.send', {
         ...hookContext,
         larkAppId,
@@ -400,6 +416,8 @@ export async function replyMessage(
     const replyId = res.data?.message_id;
     if (!replyId) throw new Error('No message_id in reply response');
     logger.info(`Replied ${replyId} to message ${messageId} [msgType=${msgType}, replyInThread=${replyInThread}]`);
+    await recordPublishedGroupContext(larkAppId, { ...res.data, parent_id: messageId }, body, msgType,
+      typeof hookContext?.chatId === 'string' ? hookContext.chatId : undefined);
     await emitOutboundHookIfAllowed(options, 'outbound.reply', {
         ...hookContext,
         larkAppId,
@@ -1490,7 +1508,7 @@ export async function getMessageThreadId(
  * token authorized for this bot), which is what the paths without a per-turn
  * sender still rely on.
  */
-export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string, senderOpenId?: string): Promise<void> {
+export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string, senderOpenId?: string, options?: { allowUserTokenFallback?: boolean }): Promise<void> {
   // apiOnly hard-gate BEFORE the app→user token fallback. Without this, the
   // App Token attempt (getBotClient) throws LarkTransportDisabledError, gets
   // caught below as a "failed app download", and silently falls through to the
@@ -1508,6 +1526,9 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
     logger.info(`Downloaded ${type} ${fileKey} → ${savePath}`);
     return;
   } catch (appErr: any) {
+    // Passive history is only entitled to the observing app's visibility.
+    // It must never borrow a historical sender's OAuth credentials.
+    if (options?.allowUserTokenFallback === false) throw appErr;
     // AxiosError status can be at various paths depending on SDK version
     const status = appErr?.response?.status ?? appErr?.response?.statusCode
       ?? appErr?.status ?? appErr?.statusCode;

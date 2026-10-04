@@ -10727,6 +10727,52 @@ describe('im.message.receive_v1 — 群聊上下文静默旁听（不改唤醒�
     await realRm(gcDataDir, { recursive: true, force: true });
   });
 
+  it('只与另一 bot 讨论和更正，随后本 bot 的唯一一次激活自动收到完整来源链', async () => {
+    const chatId = 'oc_group_context_acceptance';
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'always' });
+    mockReadFileSync.mockImplementation((path: unknown) => String(path).endsWith('group-context-settings.json')
+      ? JSON.stringify({ schemaVersion: 1, configs: { [chatId]: { enabled: true, maxContextChars: 8000, retentionDays: 30, maxMessages: 10000 } } })
+      : '[]');
+    await realMkdir(pathJoin(gcDataDir, 'group-context-delivery'), { recursive: true });
+    const now = Date.now();
+    const otherMention = [{ key: '@_peer', name: 'Peer', id: { open_id: OTHER_BOT_OPEN_ID } }];
+    for (const [messageId, text, offset] of [
+      ['om_plan_a', '先安排蒸汽火车', 30],
+      ['om_correction', '更正：取消蒸汽火车，保留瀑布', 10],
+    ] as const) {
+      const event = makeUserMessageEvent({ senderOpenId: USER_OPEN_ID, chatId, chatType: 'group', messageId, content: JSON.stringify({ text }), mentions: otherMention });
+      event.message.create_time = String(now - offset);
+      await capturedHandlers['im.message.receive_v1'](event);
+      await flushEventWork();
+    }
+    await capturedHandlers['im.message.receive_v1']({
+      message: { message_id: 'om_peer_opinion', chat_id: chatId, chat_type: 'group', message_type: 'text', create_time: String(now - 20), content: JSON.stringify({ text: '同行建议：可以多坐一段火车' }) },
+      sender: { sender_type: 'app', sender_id: { open_id: OTHER_BOT_OPEN_ID } },
+    });
+    await flushEventWork();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+
+    const { prepareGroupContextForTurn } = await import('../src/services/group-context-runtime.js');
+    const { buildNewTopicCliInput } = await import('../src/core/session-manager.js');
+    let input: ReturnType<typeof buildNewTopicCliInput> | undefined;
+    handlers.handleNewTopic.mockImplementationOnce(async (data, ctx) => {
+      await prepareGroupContextForTurn({ appId: MY_APP_ID, chatId, turnId: ctx.messageId, query: '最终方案', createTime: now });
+      input = buildNewTopicCliInput('最终方案', 'gc-acceptance-session', 'codex-app', undefined, undefined, undefined, undefined, undefined, undefined, 'zh', undefined,
+        { larkAppId: MY_APP_ID, chatId, turnId: ctx.messageId });
+    });
+    const trigger = makeUserMessageEvent({ senderOpenId: USER_OPEN_ID, chatId, chatType: 'group', messageId: 'om_final_request', content: '{"text":"最终方案"}', mentions: [{ key: '@_self', name: 'Self', id: { open_id: MY_OPEN_ID } }] });
+    trigger.message.create_time = String(now);
+    await capturedHandlers['im.message.receive_v1'](trigger);
+    await vi.waitFor(() => expect(input).toBeDefined());
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
+    expect(input!.content).toContain('取消蒸汽火车，保留瀑布');
+    expect(input!.content).toContain('同行建议');
+    expect(input!.content).toContain('sender_type="bot"');
+    expect(input!.codexAppInput?.text).toBe('最终方案');
+    expect(JSON.stringify(input!.codexAppInput?.additionalContext)).toContain('取消蒸汽火车');
+  });
+
   it('没 @ 本 bot 的群消息：进共享记录（唤醒与否仍由原路由决定，本钩子不参与）', async () => {
     const ev = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
