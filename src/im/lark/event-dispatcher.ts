@@ -63,6 +63,7 @@ import {
 import { ForwardFollowupBuffer } from './forward-followup-buffer.js';
 import { listForwardFollowups, putForwardFollowup, removeForwardFollowup } from './forward-followup-store.js';
 import { claimMessageOnce, _resetCacheForTest as _resetSeenMessagesForTest } from '../../services/seen-message-store.js';
+import { ingestGroupContextEvent, ingestGroupContextRecall } from '../../services/group-context-ingest.js';
 import { hasTriggeredMessage, markMessageTriggered, _resetCacheForTest as _resetTriggeredMessagesForTest } from '../../services/triggered-message-store.js';
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
 import { ensureSignedChatDefault } from '../../services/signed-chat-defaults.js';
@@ -3998,6 +3999,11 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       const chatType = (message.chat_type === 'p2p' ? 'p2p' : 'group') as 'group' | 'p2p';
       const messageId = message.message_id;
 
+      // 群聊上下文共享：静默旁听写入（group-context-ingest），放在任何 sender 分支 /
+      // self return / mention gate 之前，让没被 @ 的消息也进共享记录。它自带开关
+      // （默认关）与错误隔离，永不抛出、不推进 seen-message 去重、不启动 worker；
+      // 下面的唤醒 / 权限判定完全不受它影响。
+      if (chatType === 'group') ingestGroupContextEvent(larkAppId, data);
 
       // Bot-originated messages — bots historically only post inside threads
       // (their own thread replies). With chat-scope sessions a bot can also
@@ -5245,6 +5251,16 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
     // 消息编辑（修改已发送消息）。只在编辑后补 @ 了本 bot 且该消息从未触发过任务时
     // 当作延迟首次 @ 处理，见 processMessageUpdatedEvent。投递层用 event_id 去重，
     // 刻意不走 message_id claim（原消息已 claim 过同 id）。
+    // 消息撤回：只给群聊上下文共享记录写 tombstone（group-context-ingest 自带开关与
+    // 错误隔离），不影响任何会话 / 任务状态。recall 幂等，无需 message_id claim。
+    'im.message.recalled_v1': (data: any) => {
+      const ev = data?.event ?? data;
+      ingestGroupContextRecall(larkAppId, {
+        chatId: ev?.chat_id ?? ev?.message?.chat_id,
+        messageId: ev?.message_id ?? ev?.message?.message_id,
+        recallTime: ev?.recall_time,
+      });
+    },
     'im.message.updated_v1': (data: any) => {
       const eventMessage = data?.message ?? data?.event?.message;
       const eventKey = `im.message.updated_v1:${larkAppId}:${eventIdForKey(data) ?? eventMessage?.message_id ?? unkeyableEventKey()}`;

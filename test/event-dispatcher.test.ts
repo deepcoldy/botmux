@@ -10,7 +10,7 @@
  *
  * Run:  pnpm vitest run test/event-dispatcher.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { createHmac } from 'node:crypto';
 import * as Lark from '@larksuiteoapi/node-sdk';
 
@@ -10681,5 +10681,106 @@ describe('chat.bot_added observer hook', () => {
     capturedHandlers['im.chat.member.bot.added_v1']({ chat_id: 'chat-blank', operator_id: { open_id: USER_OPEN_ID } });
     await flushEventWork();
     expect(runGroupJoinCommandMock).not.toHaveBeenCalled();
+  });
+});
+
+// ─── 群聊上下文共享：静默旁听写入（group-context-ingest 挂在 processMessageEvent 的 gate 之前）──
+import { mkdir as realMkdir, rm as realRm } from 'node:fs/promises';
+import { tmpdir as osTmpdir } from 'node:os';
+import { join as pathJoin } from 'node:path';
+import { setGroupContextSettingsResolver, _resetGroupContextIngestForTest } from '../src/services/group-context-ingest.js';
+import { getGroupContextMessage, listGroupContextMessages, _resetGroupContextStoreForTest } from '../src/services/group-context-store.js';
+
+describe('im.message.receive_v1 — 群聊上下文静默旁听（不改唤醒规则）', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+  let gcDataDir: string;
+  const GC_CHAT = 'chat-group-context';
+
+  beforeEach(async () => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    _resetGroupContextStoreForTest();
+    _resetGroupContextIngestForTest();
+    // node:fs 的 mkdirSync 在本文件被 mock 成 no-op，store 开库前要的目录用真实 fs/promises 建好。
+    gcDataDir = pathJoin(osTmpdir(), `botmux-gc-dispatch-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+    await realMkdir(pathJoin(gcDataDir, 'group-context'), { recursive: true });
+    vi.stubEnv('SESSION_DATA_DIR', gcDataDir);
+    setGroupContextSettingsResolver(() => ({ enabled: true, maxContextChars: 4000 }));
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'never' });
+    handlers = makeHandlers();
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('group');
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    markForwardFollowupsSessionsReady(MY_APP_ID);
+  });
+
+  afterEach(async () => {
+    _resetGroupContextStoreForTest();
+    _resetGroupContextIngestForTest();
+    vi.unstubAllEnvs();
+    await realRm(gcDataDir, { recursive: true, force: true });
+  });
+
+  it('没 @ 本 bot 的群消息：进共享记录（唤醒与否仍由原路由决定，本钩子不参与）', async () => {
+    const ev = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '蒸汽小火车不坐了' }),
+      messageId: 'msg-gc-1',
+      chatId: GC_CHAT,
+      chatType: 'group',
+    });
+    await capturedHandlers['im.message.receive_v1'](ev);
+    await flushEventWork();
+    expect(getGroupContextMessage(MY_APP_ID, GC_CHAT, 'msg-gc-1')).toMatchObject({
+      text: '蒸汽小火车不坐了', senderId: USER_OPEN_ID, senderType: 'user', sourceAppId: MY_APP_ID,
+    });
+  });
+
+  it('其它 bot 发的群消息也进记录（sender_type=app → bot）', async () => {
+    const ev = {
+      message: {
+        message_id: 'msg-gc-bot', chat_id: GC_CHAT, chat_type: 'group', message_type: 'text',
+        content: JSON.stringify({ text: '我建议保留瀑布小缆车' }),
+      },
+      sender: { sender_type: 'app', sender_id: { open_id: OTHER_BOT_OPEN_ID } },
+    };
+    await capturedHandlers['im.message.receive_v1'](ev);
+    await flushEventWork();
+    expect(getGroupContextMessage(MY_APP_ID, GC_CHAT, 'msg-gc-bot')).toMatchObject({ senderType: 'bot', senderId: OTHER_BOT_OPEN_ID });
+  });
+
+  it('p2p 私聊不进记录', async () => {
+    const ev = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID, content: JSON.stringify({ text: 'dm' }),
+      messageId: 'msg-gc-p2p', chatId: 'chat-p2p-x', chatType: 'p2p',
+    });
+    await capturedHandlers['im.message.receive_v1'](ev);
+    await flushEventWork();
+    expect(listGroupContextMessages(MY_APP_ID, 'chat-p2p-x').messages).toHaveLength(0);
+  });
+
+  it('开关关闭时零写入', async () => {
+    setGroupContextSettingsResolver(() => ({ enabled: false }));
+    const ev = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID, content: JSON.stringify({ text: 'off' }),
+      messageId: 'msg-gc-off', chatId: GC_CHAT, chatType: 'group',
+    });
+    await capturedHandlers['im.message.receive_v1'](ev);
+    await flushEventWork();
+    expect(listGroupContextMessages(MY_APP_ID, GC_CHAT).messages).toHaveLength(0);
+  });
+
+  it('im.message.recalled_v1 → tombstone revision', async () => {
+    const ev = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID, content: JSON.stringify({ text: '发错了' }),
+      messageId: 'msg-gc-recall', chatId: GC_CHAT, chatType: 'group',
+    });
+    await capturedHandlers['im.message.receive_v1'](ev);
+    await flushEventWork();
+    expect(typeof capturedHandlers['im.message.recalled_v1']).toBe('function');
+    capturedHandlers['im.message.recalled_v1']({ message_id: 'msg-gc-recall', chat_id: GC_CHAT, recall_time: '1700000009000' });
+    expect(getGroupContextMessage(MY_APP_ID, GC_CHAT, 'msg-gc-recall')).toMatchObject({ deleted: true, text: '发错了', deletedAt: 1700000009000 });
   });
 });
