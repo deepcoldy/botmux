@@ -2181,6 +2181,45 @@ describe('im.message.receive_v1 — message_id dedupe (re-push protection)', () 
   });
 });
 
+describe('im.message.receive_v1 — durable inbox shadow ACK boundary', () => {
+  it('returns to the SDK before enqueue and never blocks the existing route on a slow provider', async () => {
+    capturedHandlers = {};
+    __resetAnchorQueues();
+    __resetEventClaimsForTest();
+    _resetGrantPending();
+    setupBotState();
+    const handlers = makeHandlers();
+    let resolveEnqueue!: (value: { kind: 'inserted' }) => void;
+    const enqueueInbox = vi.fn(() => new Promise<{ kind: 'inserted' }>(resolve => {
+      resolveEnqueue = resolve;
+    }));
+    startLarkEventDispatcher(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      { enqueueInbox } as any,
+    );
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA durable shadow' }),
+      rootId: 'root-durable-shadow',
+      messageId: 'om_durable_shadow',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    const returned = capturedHandlers['im.message.receive_v1'](event);
+    expect(returned).toBeUndefined();
+    expect(enqueueInbox).not.toHaveBeenCalled();
+
+    await flushEventWork();
+    expect(enqueueInbox).toHaveBeenCalledOnce();
+    expect(handlers.handleThreadReply).toHaveBeenCalledOnce();
+    resolveEnqueue({ kind: 'inserted' });
+    await flushEventWork();
+  });
+});
+
 describe('message listener polling backfill', () => {
   let handlers: ReturnType<typeof makeHandlers>;
 

@@ -28899,6 +28899,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         cfg.larkAppSecret,
         botEventHandlers,
         normalizeBrand(cfg.brand),
+        durableCoordinationRuntime?.store,
       ));
     }
 
