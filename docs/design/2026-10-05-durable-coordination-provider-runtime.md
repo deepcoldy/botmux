@@ -58,6 +58,8 @@ A settlement bridge follows the authoritative outbox row after fenced enqueue un
 
 A Session-output bridge now exact-writes the latest full Session snapshot, then enqueues the frozen outbox message with that same fresh lease proof and returns the authoritative settlement. It validates the output Session key before either mutation and never falls back to direct transport on coordination failure. Daemon/final-drain wiring remains disabled.
 
+A final-output bridge synchronously joins the existing daemon final-drain before starting those asynchronous mutations and releases it only after terminal shared-store settlement or a proven pre-enqueue/local-wait failure. The reusable bridge is present, but ordinary worker output call sites have not switched to it yet.
+
 The Lark adapter now defines a frozen, versioned single-message envelope without wiring it into the daemon. It binds the app, send chat or reply parent, reply mode, message type/content, stable provider UUID and JSON hook context. It reuses the existing send/reply clients, Feishu error classifier and one-hour provider TTL. Retry is allowed only for classified retryable failures while the UUID window still has a safety margin; otherwise the result is ambiguous.
 
 Session/epoch authority is revalidated immediately before provider invocation. Protected hook capability is never persisted: the current owner must dynamically provide `beforeHook` and `hookOrigin` for the first attempt. UUID reconciliation suppresses later hooks. A withdrawn reply remains ambiguous instead of silently falling back to top-level send under the same UUID, because provider dedupe does not bind the reply parent. Attachments, multi-message sequences, card patches and non-IM effects remain outside this envelope.
