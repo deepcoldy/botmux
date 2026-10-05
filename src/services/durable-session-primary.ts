@@ -3,6 +3,7 @@ import { sessionKey, storedSessionAnchorId } from '../core/types.js';
 import type {
   DurableJson,
   DurableSessionRecord,
+  SessionLease,
 } from './durable-coordination.js';
 import type {
   DurableSessionFacade,
@@ -36,6 +37,7 @@ export type DurableLarkSessionAdmissionResult =
   | {
       kind: 'committed';
       receipt: DurableLarkAdmissionReceipt;
+      lease: SessionLease;
       record: DurableSessionRecord;
     }
   | Exclude<DurableSessionFacadeWriteResult, { kind: 'written' | 'unchanged' }>;
@@ -154,6 +156,7 @@ export async function admitDurableLarkSession(input: {
       lease: written.lease,
       record: written.record,
     }),
+    lease: written.lease,
     record: written.record,
   };
 }
