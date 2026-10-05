@@ -534,6 +534,40 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(complete).toHaveBeenCalledExactlyOnceWith(false);
   });
 
+  it.each([['codex', false], ['claude-code', true]] as const)(
+    'persists the actual downgraded %s bridge card with an existing message=%s', async (cliId, existing) => {
+      vi.useRealTimers();
+      getBot('app_test').config.replyCardMode = 'unified';
+      const ds = makeDs();
+      ds.adoptedFrom = undefined;
+      ds.session.cliId = cliId;
+      ds.currentTurnId = 'om_image_turn';
+      const sessionReply = vi.fn(async () => 'om_image_reply');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const { updateTurnReplyCard } = await import('../src/core/turn-reply-card.js');
+      if (existing) await updateTurnReplyCard(ds, ds.currentTurnId, { kind: 'start' }, sessionReply);
+      const error = new Error('ErrCode: 200570; card contains invalid image keys (code: 230099)');
+      if (existing) updateMessageMock.mockRejectedValueOnce(error);
+      else sessionReply.mockRejectedValueOnce(error);
+      const complete = vi.fn();
+      const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+      deliver(ds, { ...finalOutputMsg(), turnId: ds.currentTurnId, kind: 'bridge', content: 'Answer. ![Preview](img_v3_rejected)' }, 'tag', 0, complete);
+      await vi.waitFor(() => expect(complete).toHaveBeenCalledExactlyOnceWith(true, 'om_image_reply'));
+      const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+      const record = new TurnReplyCardStore('/tmp/test-sessions').read({
+        larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId,
+      });
+      expect(record?.finalCard).toContain('[Image omitted]');
+      expect(record?.lastCard).not.toContain('![Preview]');
+      expect(record?.finalDelivered).toBe(true);
+      await updateTurnReplyCard(ds, ds.currentTurnId, { kind: 'terminal', phase: 'completed' }, sessionReply);
+      expect(updateMessageMock.mock.calls.at(-1)?.[2]).toContain('Answer.');
+      expect(updateMessageMock.mock.calls.at(-1)?.[2]).not.toContain('![Preview]');
+      expect(sessionReply).toHaveBeenCalledTimes(existing ? 1 : 2);
+      expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    },
+  );
+
   it.each(['bridge', 'explicit'] as const)('keeps the %s answer and Oncall source in the existing reply card', async source => {
     vi.useRealTimers();
     const bot = getBot('app_test');

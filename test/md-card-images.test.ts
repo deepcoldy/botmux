@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import MarkdownIt from 'markdown-it';
 import type Token from 'markdown-it/lib/token.mjs';
 import { buildCanonicalFinalReplyCard, buildContextualReplyCard, buildImageCardElements, omitReplyCardImages, prepareCardMarkdown } from '../src/im/lark/md-card.js';
+import { replyWithImageFallback } from '../src/im/lark/card-image-fallback.js';
 
 const parser = new MarkdownIt();
 
@@ -119,6 +120,31 @@ describe('reply cards with unsupported images', () => {
     expect(fallback).toContain('Test Bot');
     expect(fallback).toContain('`![Example](img_v3_example)`');
     expect(fallback).toContain('```md\\n![Example](img_v3_example)\\n```');
+    expect(omitReplyCardImages(fallback)).toBe(fallback);
+  });
+
+  it.each([false, true])('delivers rejected table images as descriptions with body images=%s', async withBodyImage => {
+    const card = buildCanonicalFinalReplyCard({ markdown: [
+      'Ready.',
+      ...(withBodyImage ? ['![Preview](img_v3_rejected_body)'] : []),
+      '| Preview | Example |\n| --- | --- |\n| Body ![Preview](img_v3_rejected_table) | `![Example](img_v3_example)` |',
+    ].join('\n\n') });
+    const sent: string[] = [];
+    const result = await replyWithImageFallback(card, 'interactive', async body => {
+      sent.push(body);
+      if (body.includes('![Preview]')) {
+        throw new Error('Failed to reply message: ErrCode: 200570; card contains invalid image keys (code: 230099)');
+      }
+      return 'om_reply';
+    });
+    expect(result).toBe('om_reply');
+    expect(sent).toHaveLength(2);
+    const fallback = sent[1];
+    expect(fallback).toContain('"tag":"table"');
+    expect(fallback).toContain('Ready.');
+    expect(fallback).toContain('Body [Image omitted] [Preview]');
+    expect(fallback).toContain('`![Example](img_v3_example)`');
+    expect(fallback).not.toContain('![Preview]');
     expect(omitReplyCardImages(fallback)).toBe(fallback);
   });
 });

@@ -22,12 +22,12 @@ function isInvalidImageKeyError(error: unknown): boolean {
 /** A definitive rejection has no accepted message to duplicate. Retry once
  * with image descriptions, through the same fenced sender and stable UUID.
  * Remember this downgrade across the caller's transient-error retries. */
-export async function replyWithImageFallback(
+export async function replyWithImageFallback<T>(
   content: string,
   msgType: string | undefined,
-  send: (content: string) => Promise<string>,
+  send: (content: string) => Promise<T>,
   state: ReplyImageState = { omitImages: false },
-): Promise<string> {
+): Promise<T> {
   if (msgType !== 'interactive') return send(content);
   if (state.omitImages) return send(omitReplyCardImages(content));
   try {

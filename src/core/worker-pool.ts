@@ -17392,22 +17392,17 @@ function deliverFinalOutput(
     turnId?: string,
     opts?: Omit<WorkerSessionReplyOptions, 'sourceSessionId'>,
   ) => {
-    const send = (body: string): Promise<string> => {
-      if (!isStillOwned() || ds.session.status === 'closed') {
-        return Promise.reject(new Error('Final output ownership changed or session closed'));
-      }
-      return cb.sessionReply(
-        sessionAnchorId(ds),
-        body,
-        msgType,
-        ds.larkAppId,
-        fallbackTurnId(ds, turnId),
-        { ...opts, sourceSessionId: ds.session.sessionId, ...(topicMessageLookup ? { topicMessageLookup } : {}) },
-      );
-    };
-    // Managed VC replies freeze an audited canonical payload and must recheck
-    // membership before another attempt. Leave that delivery contract intact.
-    return managedReceiver ? send(content) : replyWithImageFallback(content, msgType, send, imageFallback);
+    if (!isStillOwned() || ds.session.status === 'closed') {
+      return Promise.reject(new Error('Final output ownership changed or session closed'));
+    }
+    return cb.sessionReply(
+      sessionAnchorId(ds),
+      content,
+      msgType,
+      ds.larkAppId,
+      fallbackTurnId(ds, turnId),
+      { ...opts, sourceSessionId: ds.session.sessionId, ...(topicMessageLookup ? { topicMessageLookup } : {}) },
+    );
   };
   setTimeout(async () => {
     if (!isStillOwned()) {
@@ -17845,14 +17840,19 @@ function deliverFinalOutput(
             frozenReplyTarget ? { uuid, replyTarget: frozenReplyTarget } : { uuid }),
           { dispatchAttempt: msg.dispatchAttempt, owns: isStillOwned })
         : undefined;
-      const messageId = unifiedReply?.messageId ?? await scopedReply(
-        canonicalOutput.content,
+      const sendFinal = (content: string) => scopedReply(
+        content,
         canonicalOutput.msgType,
         msg.replyTurnId ?? msg.turnId,
         frozenReplyTarget && !managedReceiver
           ? { ...deliveryReplyOptions, replyTarget: frozenReplyTarget }
           : deliveryReplyOptions,
       );
+      // Unified cards persist their own image downgrade. Managed VC replies
+      // retain their audited payload; only legacy replies use this fallback.
+      const messageId = unifiedReply?.messageId ?? await (managedReceiver
+        ? sendFinal(canonicalOutput.content)
+        : replyWithImageFallback(canonicalOutput.content, canonicalOutput.msgType, sendFinal, imageFallback));
       if (!isStillOwned()) { onComplete?.(true); return; }
       recordPrimaryOutput(messageId);
       const explicit = unifiedReply?.record.finalSource === 'explicit' ? unifiedReply.record : undefined;

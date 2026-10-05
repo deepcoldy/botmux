@@ -968,8 +968,8 @@ export function omitReplyCardImages(cardJson: string): string {
   let card: unknown;
   try { card = JSON.parse(cardJson); } catch { return cardJson; }
   let changed = false;
-  const visit = (value: unknown): unknown => {
-    if (Array.isArray(value)) return value.map(visit);
+  const visit = (value: unknown, markdownFields?: ReadonlySet<string>): unknown => {
+    if (Array.isArray(value)) return value.map(child => visit(child, markdownFields));
     if (!value || typeof value !== 'object') return value;
     if ('tag' in value && value.tag === 'img') {
       changed = true;
@@ -979,14 +979,19 @@ export function omitReplyCardImages(cardJson: string): string {
           ? alt.content : '';
       return { tag: 'markdown', content: `[Image omitted] ${md.utils.escapeHtml(text).replace(/[\\`*_[\]<>!]/g, '\\$&')}`.trim() };
     }
+    const tableFields = 'tag' in value && value.tag === 'table' && 'columns' in value && Array.isArray(value.columns)
+      ? new Set<string>(value.columns.flatMap((column: unknown) =>
+        column && typeof column === 'object' && 'data_type' in column && column.data_type === 'lark_md'
+          && 'name' in column && typeof column.name === 'string' ? [column.name] : []))
+      : undefined;
     return Object.fromEntries(Object.entries(value).map(([key, child]) => {
-      if ('tag' in value && (value.tag === 'markdown' || value.tag === 'lark_md')
-        && key === 'content' && typeof child === 'string') {
+      if (typeof child === 'string' && (markdownFields?.has(key)
+        || ('tag' in value && (value.tag === 'markdown' || value.tag === 'lark_md') && key === 'content'))) {
         const content = normalizeCardImages(child, true);
         if (content !== child) changed = true;
         return [key, content];
       }
-      return [key, visit(child)];
+      return [key, visit(child, key === 'rows' ? tableFields : undefined)];
     }));
   };
   const result = visit(card);
