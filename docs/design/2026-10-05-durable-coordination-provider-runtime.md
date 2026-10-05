@@ -36,11 +36,11 @@ The provider inherits the daemon environment because it is selected by the opera
 
 `shadow` starts the provider, verifies the exact public contract, and keeps the process alive through daemon shutdown. After the Lark SDK callback has returned to the ACK path, `im.message.receive_v1` is also mirrored into the durable inbox with a stable message-derived `eventId` and the existing raw chat ingress lane as `partitionKey`.
 
-The mirror runs beside the current SQLite route. A slow or failed provider is logged but does not block that route; a duplicate is accepted, while a conflicting duplicate is surfaced as an error. The mirror does not claim or process durable rows and does not change Session ownership. Message edits, polling backfill and non-message event families remain outside this first ingestion slice.
+The mirror runs beside the current SQLite route. A slow or failed provider is logged but does not block that route; a duplicate is accepted, while a conflicting duplicate is surfaced as an error. A boot-unique shadow consumer claims mirrored rows, revalidates the Lark app/message identity and routing partition, and marks valid rows completed. It performs no user-visible routing or output and does not change Session ownership. Invalid envelopes are retried with a bounded delay so schema drift remains visible instead of being acknowledged. Provider failures leave claims recoverable after their lease, and daemon shutdown stops the consumer before closing the provider. Message edits, polling backfill and non-message event families remain outside this ingestion slice.
 
 `primary` fails closed until all three runtime stages are present:
 
-1. a durable inbox claim loop that replaces, rather than mirrors, the local route;
+1. a primary inbox handler that replaces, rather than mirrors, the local route;
 2. an asynchronous fenced Session facade;
 3. a durable outbox pump with explicit attempt/receipt reconciliation.
 
@@ -52,4 +52,4 @@ Graceful daemon shutdown requests provider `close` and bounds the response. Fata
 
 ## Verification
 
-Tests cover handshake compatibility, round-trip calls, redacted retryable errors, malformed results, timeouts, disabled defaults, primary fail-closed behavior, and shadow lifecycle cleanup. The existing durable contract suite continues to cover state-machine semantics independently of transport.
+Tests cover handshake compatibility, round-trip calls, redacted retryable errors, malformed results, timeouts, disabled defaults, primary fail-closed behavior, shadow claim/validation/retry, lifecycle cleanup, and recovery after a transient bootstrap poll failure. The existing durable contract suite continues to cover state-machine semantics independently of transport.

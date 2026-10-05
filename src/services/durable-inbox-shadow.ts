@@ -1,4 +1,5 @@
 import type {
+  InboxClaim,
   DurableInboxEvent,
   DurableInboxStore,
   DurableInsertResult,
@@ -10,6 +11,56 @@ export interface DurableLarkMessageEnvelope {
   type: 'lark.im.message.receive_v1';
   larkAppId: string;
   event: DurableJson;
+}
+
+export interface DurableLarkMessageObservation {
+  eventId: string;
+  partitionKey: string;
+  larkAppId: string;
+  messageId: string;
+  attempts: number;
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+/** Validate the shadow row independently from the live Lark route. A row that
+ * cannot prove the same stable message identity is retried instead of being
+ * silently acknowledged, so schema drift remains visible before `primary` is
+ * enabled. */
+export function observeDurableLarkMessageClaim(claim: InboxClaim): DurableLarkMessageObservation {
+  const payload = record(claim.event.payload);
+  const event = record(payload?.event);
+  const message = record(event?.message);
+  const larkAppId = payload?.larkAppId;
+  const messageId = message?.message_id;
+  if (payload?.version !== 1
+      || payload.type !== 'lark.im.message.receive_v1'
+      || typeof larkAppId !== 'string'
+      || !larkAppId.startsWith('cli_')
+      || larkAppId.length > 256
+      || typeof messageId !== 'string'
+      || !messageId.startsWith('om_')
+      || messageId.length > 256) {
+    throw new Error(`durable Lark inbox event ${claim.event.eventId} has an invalid shadow envelope`);
+  }
+  const expectedEventId = `im.message.receive_v1:${larkAppId}:${messageId}`;
+  if (claim.event.eventId !== expectedEventId) {
+    throw new Error(`durable Lark inbox event ${claim.event.eventId} has a mismatched message identity`);
+  }
+  if (!claim.event.partitionKey.startsWith(`lark-message-routing:${larkAppId}:`)) {
+    throw new Error(`durable Lark inbox event ${claim.event.eventId} has a mismatched routing partition`);
+  }
+  return {
+    eventId: claim.event.eventId,
+    partitionKey: claim.event.partitionKey,
+    larkAppId,
+    messageId,
+    attempts: claim.attempts,
+  };
 }
 
 function jsonValue(value: unknown): DurableJson {

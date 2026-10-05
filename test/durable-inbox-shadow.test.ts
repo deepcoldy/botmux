@@ -3,6 +3,7 @@ import type { DurableInboxStore } from '../src/services/durable-coordination.js'
 import {
   durableLarkMessageEvent,
   enqueueDurableLarkMessage,
+  observeDurableLarkMessageClaim,
 } from '../src/services/durable-inbox-shadow.js';
 
 describe('durable Lark inbox shadow', () => {
@@ -57,5 +58,45 @@ describe('durable Lark inbox shadow', () => {
     });
     expect(first.payload).toEqual(second.payload);
     expect(first.createdAt).not.toBe(second.createdAt);
+  });
+
+  it('revalidates stable message identity after a durable claim', () => {
+    const event = durableLarkMessageEvent({
+      larkAppId: 'cli_1',
+      eventId: 'im.message.receive_v1:cli_1:om_1',
+      partitionKey: 'lark-message-routing:cli_1:oc_1',
+      data: { message: { message_id: 'om_1' } },
+      now: 10,
+    });
+    expect(observeDurableLarkMessageClaim({
+      event,
+      workerId: 'worker-1',
+      claimEpoch: 1,
+      claimUntil: 100,
+      attempts: 1,
+    })).toEqual({
+      eventId: event.eventId,
+      partitionKey: event.partitionKey,
+      larkAppId: 'cli_1',
+      messageId: 'om_1',
+      attempts: 1,
+    });
+  });
+
+  it('rejects a claimed envelope whose durable event id does not match the message', () => {
+    const event = durableLarkMessageEvent({
+      larkAppId: 'cli_1',
+      eventId: 'im.message.receive_v1:cli_1:om_wrong',
+      partitionKey: 'lark-message-routing:cli_1:oc_1',
+      data: { message: { message_id: 'om_1' } },
+      now: 10,
+    });
+    expect(() => observeDurableLarkMessageClaim({
+      event,
+      workerId: 'worker-1',
+      claimEpoch: 1,
+      claimUntil: 100,
+      attempts: 1,
+    })).toThrow(/mismatched message identity/);
   });
 });
