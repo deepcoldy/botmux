@@ -175,7 +175,7 @@ describe('real CLI send into a running reply card', () => {
           turnId: key.turnId,
           target: { kind: 'reply', messageId: 'om_root', replyInThread: true },
           msgType: 'interactive',
-          providerUuid: expect.stringMatching(/^bts_/),
+          providerUuid: expect.stringMatching(/^dps_/),
         },
       });
       expect(requests[0].body.content).toContain('Durable final');

@@ -1,4 +1,20 @@
+import { createHash } from 'node:crypto';
 import type { DurableLarkOutboxTarget } from '../services/durable-lark-outbox.js';
+
+export function durablePrimaryFinalProviderUuid(input: {
+  larkAppId: string;
+  scope: 'thread' | 'chat';
+  anchor: string;
+  turnId: string;
+}): string {
+  return `dps_${createHash('sha256').update(JSON.stringify([
+    input.larkAppId,
+    input.scope,
+    input.anchor,
+    input.turnId,
+    'final',
+  ])).digest('hex').slice(0, 32)}`;
+}
 
 export interface DurableSessionSendInput {
   sessionId: string;

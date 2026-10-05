@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { dispatchDurableSessionMessage } from '../src/cli/durable-session-send.js';
+import { dispatchDurableSessionMessage, durablePrimaryFinalProviderUuid } from '../src/cli/durable-session-send.js';
 
 const input = {
   sessionId: 'session-1',
@@ -12,6 +12,22 @@ const input = {
 };
 
 describe('durable Session send client', () => {
+  it('derives final provider identity from the logical conversation rather than local Session UUID', () => {
+    const common = {
+      larkAppId: 'cli_test',
+      scope: 'thread' as const,
+      anchor: 'om_root',
+      turnId: 'om_turn',
+    };
+    expect(durablePrimaryFinalProviderUuid(common)).toBe(
+      durablePrimaryFinalProviderUuid({ ...common }),
+    );
+    expect(durablePrimaryFinalProviderUuid(common)).not.toBe(
+      durablePrimaryFinalProviderUuid({ ...common, anchor: 'om_other' }),
+    );
+    expect(durablePrimaryFinalProviderUuid(common)).toMatch(/^dps_[a-f0-9]{32}$/);
+  });
+
   it('returns the daemon-settled provider message id', async () => {
     const post = vi.fn(async () => new Response(JSON.stringify({
       ok: true,

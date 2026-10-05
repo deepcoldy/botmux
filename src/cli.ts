@@ -164,7 +164,7 @@ import {
   PM2_DAEMON_RESTART_DELAY_MS,
 } from './core/shutdown-budgets.js';
 import { describeSendFailure, dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
-import { dispatchDurableSessionMessage } from './cli/durable-session-send.js';
+import { dispatchDurableSessionMessage, durablePrimaryFinalProviderUuid } from './cli/durable-session-send.js';
 import { buildCardPatchSuccessOutput, CARD_COMMAND_USAGE, CARD_PATCH_USAGE, cardPatchArgsWantHelp, executeCardPatch, parseCardPatchArgs, readCardPatchInput } from './cli/card-dispatch.js';
 import {
   buildCardStreamSuccessOutput,
@@ -11344,7 +11344,14 @@ async function cmdSend(rest: string[]): Promise<void> {
         target: durableTarget,
         content: canonicalOutput.content,
         msgType: canonicalOutput.msgType,
-        providerUuid: uuid ?? `dms_${randomUUID().replace(/-/g, '')}`,
+        providerUuid: effectiveResponseKind === 'final'
+          ? durablePrimaryFinalProviderUuid({
+              larkAppId: appId,
+              scope: s.scope === 'chat' ? 'chat' : 'thread',
+              anchor: s.scope === 'chat' ? s.chatId : s.rootMessageId,
+              turnId: currentTurnId,
+            })
+          : uuid ?? `dms_${randomUUID().replace(/-/g, '')}`,
         hookContext,
       });
       primaryQuotedId = canonicalOutput.quoteTargetId ?? null;
