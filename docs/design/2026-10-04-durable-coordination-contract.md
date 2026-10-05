@@ -123,6 +123,8 @@ Durable outbox pump 严格复用合同已有的副作用边界：先 reserve，�
 
 Pump 本身不包含 Lark 语义。Lark adapter 使用版本化 envelope 冻结 app、send chat 或 reply parent、`replyInThread`、message type/content、稳定 provider UUID 与 JSON hook context；outbox row 的 message id 必须与 envelope identity 一致。UUID 限制沿用现有 Feishu 合同（URL-safe、最多 50 字符），去重 TTL 复用 `PROVIDER_TTL_MS['feishu-im']` 的 1 小时，并在到期前保留 60 秒 guard，超出窗口后不再自动 retry。
 
+`enqueueDurableOutboxWithSettlement` 在 fenced enqueue 后返回一个权威 settlement Promise。它轮询 store 中的 outbox row，直到 `delivered` 或 `ambiguous`；不依赖进程内 pump observer，因此另一副本 takeover 后完成的投递也能释放原进程的 final-drain 等待。duplicate 会跟随现有 row，conflict/stale lease 不启动等待；shutdown abort 只终止本地等待，不改写 durable row 状态。
+
 Adapter 复用现有 `sendMessage` / `replyMessage`、`classifyFeishuError` 和 outbound hook fencing。Session/epoch authority 在每次 provider 调用前重新验证；首次尝试只有拿到动态 hook authority 才发 hook，后续 UUID reconciliation 一律 `suppressHook`，避免 provider 去重成功时重复本地 hook。持久 payload 只保存普通 JSON hook context，不保存 IPC capability；`hookOrigin` 与 `beforeHook` 必须由当前 owner 在投递时重新证明。父消息已撤回时不能拿同一个 UUID 改投 top-level send：Feishu UUID 去重不把 parent 纳入 key，这样 retarget 可能静默返回旧父消息下的结果；adapter 因此保持 ambiguous，新的 fallback 必须重新取得 authority 并创建新的 outbox identity。
 
 现有 final delivery drain、turn idempotency 和 outbound hook fencing 应作为接线依赖复用，而不是平行实现第二套回执。当前 adapter 仍未接入 daemon；附件、多条分块消息、卡片 patch 与非 IM 副作用继续留在现有路径，不能被这份单消息 envelope 偷偷概括。
@@ -195,3 +197,5 @@ Adapter 复用现有 `sendMessage` / `replyMessage`、`classifyFeishuError` 和 
 - 同分区 FIFO、单调时间戳和 ACK timeout 后 tail 不越序；
 - enqueue failure、activation callback failure 与 leadership-lost lifecycle；
 - drain-before-release、lost callback-before-release，以及覆盖 release 的单一 shutdown deadline。
+
+`test/durable-outbox-settlement.test.ts` 覆盖 fenced enqueue、跨副本 pending→attempting→delivered、duplicate/ambiguous、conflict/stale lease 与本地 abort 不篡改 durable row。
