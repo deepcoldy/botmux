@@ -51,6 +51,21 @@ function boundedTimeout(value: number | undefined, fallback: number): number {
 }
 
 /**
+ * Convert text newlines to the PTY contract expected by xterm without
+ * disturbing standalone carriage returns used for in-place progress redraws.
+ * `previousEndsWithCr` covers a CRLF pair split across two progress events.
+ */
+function normalizeIncrementalTerminalNewlines(
+  value: string,
+  previousEndsWithCr: boolean,
+): string {
+  const normalized = value.replace(/\r?\n/g, '\r\n');
+  return previousEndsWithCr && value.startsWith('\n')
+    ? normalized.slice(1)
+    : normalized;
+}
+
+/**
  * Provider-neutral, JSONL-speaking remote execution backend.
  *
  * The child is a control-plane provider, not the model CLI itself. It owns the
@@ -549,8 +564,17 @@ export class RemoteRunnerBackend implements SessionBackend {
     }
     if (event.type === 'progress') {
       if (!this.acceptAcknowledgedTurn(event.turnId)) return;
-      this.outputBuffer = `${this.outputBuffer}${event.content}`.slice(-MAX_REMOTE_RUNNER_LINE_BYTES);
-      this.dataCb?.(event.content);
+      // Providers send structured progress text rather than PTY bytes and may
+      // therefore use ordinary LF-separated lines. xterm treats LF as
+      // line-feed only (the cursor keeps its current column), producing a
+      // diagonal/stair-step display. Normalize at this provider-neutral
+      // terminal boundary while preserving existing CRLF and bare CR redraws.
+      const content = normalizeIncrementalTerminalNewlines(
+        event.content,
+        this.outputBuffer.endsWith('\r'),
+      );
+      this.outputBuffer = `${this.outputBuffer}${content}`.slice(-MAX_REMOTE_RUNNER_LINE_BYTES);
+      this.dataCb?.(content);
       return;
     }
     if (event.type === 'outbound_message') {

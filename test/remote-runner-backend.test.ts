@@ -5,6 +5,7 @@ import type {
   RemoteRunnerBackendState,
   RemoteRunnerUsageReport,
 } from '../src/adapters/backend/remote-runner-protocol.js';
+import { TerminalRenderer } from '../src/utils/terminal-renderer.js';
 
 const referenceRunner = resolve('examples/remote-runner/reference-runner.mjs');
 const stalledCloseRunner = resolve('test/fixtures/remote-runner-stalled-close.mjs');
@@ -199,6 +200,42 @@ describe('RemoteRunnerBackend', () => {
     expect(snapshots.at(-1)).toContain('typed remotely');
     expect(output.join('')).not.toContain('\u001b[2J\u001b[H');
     expect(output.join('')).not.toContain('ready\r\nline two');
+  });
+
+  it('normalizes provider progress newlines to PTY CRLF across event boundaries', async () => {
+    const backend = new RemoteRunnerBackend(
+      { expectedProvider: 'review-cases' },
+      'session-progress-newlines',
+    );
+    children.push(backend);
+    const ready = once<void>(cb => backend.onReady(cb));
+    const output: string[] = [];
+    backend.onData(data => output.push(data));
+    spawnBackend(backend, reviewCasesRunner);
+    await ready;
+
+    const final = once<string>(cb => backend.onTurnFinal(cb));
+    await expect(backend.submitTurn({
+      turnId: 'turn-progress-newlines',
+      content: 'progress-newlines',
+    })).resolves.toEqual({ submitted: true });
+    await expect(final).resolves.toBe('done');
+
+    expect(output).toEqual([
+      'line one\r\nline two\r\nline three\r',
+      '\nline four',
+    ]);
+    expect(output.join('')).toBe('line one\r\nline two\r\nline three\r\nline four');
+    expect(backend.captureCurrentScreen()).toBe(output.join(''));
+
+    const renderer = new TerminalRenderer(80, 10);
+    try {
+      await renderer.writeAndFlush(output.join(''));
+      expect(renderer.rawSnapshot({ preserveFormatting: true }))
+        .toBe('line one\nline two\nline three\nline four');
+    } finally {
+      renderer.dispose();
+    }
   });
 
   it('resumes an existing state instead of creating a fresh remote lineage', async () => {
