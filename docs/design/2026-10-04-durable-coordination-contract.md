@@ -99,6 +99,10 @@ outbox: pending ──reserve──> reserved ──begin──> attempting ─�
 
 Session shadow projection 只包含版本、稳定 `sessionId`、应用与路由 anchor、scope、active/closed 生命周期和时间戳。标题、prompt、owner、工作目录、附件、token、CLI/provider lineage 与终端状态都不复制；这些字段在形成明确的多副本合同前仍只属于现有 Session store。Facade 按 stable session key 顺序化并合并排队更新，执行 `acquire lease → read revision → CAS write`，显式返回 occupied、conflict 和 stale lease。不同 key 可并行；优雅退出有界等待并释放本 boot 持有的 lease。
 
+Primary admission 不能复用 shadow 的 last-write-wins 合并：两个 inbox event 若被合并为一次写入，前一事件会拿到后一事件的 revision，形成伪 receipt。Facade 因此额外提供 `writeExact`：同 Session key 严格 FIFO，每个事件独立 acquire/read/CAS 并返回实际 `SessionLease + DurableSessionRecord`，即使重试后的值完全相同也强制递增 revision。原有 `write` 的 shadow 合并语义保持不变。
+
+`DurablePrimarySessionProjection` 保存现有 Session store 的完整持久 `Session` JSON 和当前 admission identity。它不新增 runtime-only worker token 或进程对象；内容边界等同现有 Session row。每次 canonical admission 先用 `writeExact` 提交完整 snapshot，再从该次返回的 lease epoch 与 record revision 构造 `DurableLarkAdmissionReceipt`。restore parser 会重算 Session routing key，并校验 event/app/partition/message identity；损坏或错路由 snapshot fail closed。
+
 第一版挂接范围刻意只覆盖普通飞书新会话在 SQLite 更新和 `activeSessions` 注册都成功之后的 shadow 写入。竞态失败的 scratch Session、全量 `persistRow`、多行事务、恢复、关闭和批量 lineage 写入尚未挂接；因此这一版不能用作完整 Session 事实源，也不能解除 `primary` 门禁。
 
 Primary consumer 的 dispatch callback 必须返回 `committed` 或带有有界原因的 `ignored`。`committed` 不再接受裸状态词，必须携带版本化 `DurableLarkAdmissionReceipt`：它把 inbox 的 `eventId`、`partitionKey` 和 App identity 绑定到 durable store 返回的 Session key、lease epoch、record revision 与 store timestamp。consumer 会在 complete inbox claim 前重新校验全部字段；复制自另一事件的 receipt、缺失 epoch/revision 的伪回执，以及只把任务追加到进程内 Promise queue 的 `{ kind: 'committed' }` 都进入 retry，不能冒充 durable admission。
@@ -143,6 +147,13 @@ Adapter 复用现有 `sendMessage` / `replyMessage`、`classifyFeishuError` 和 
 - occupied、conflict、stale lease 显式结果；
 - 有界 stop 与 lease release；
 - thread/chat stable key 以及敏感/高频字段不进入 shadow projection。
+
+`test/durable-session-primary.test.ts` 额外覆盖：
+
+- 完整 Session JSON 与 admission identity 的 round-trip / routing key 重校验；
+- 同 Session 并发 event 的 exact FIFO revision 与 event-bound receipt；
+- 同事件 retry 也产生新 revision，不把旧 revision 冒充本次写入；
+- receipt 不携带 owner、workingDir、title 等 Session payload 字段。
 
 `test/durable-inbox-primary-consumer.test.ts` 覆盖：
 
