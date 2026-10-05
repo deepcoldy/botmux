@@ -79,7 +79,7 @@ outbox: pending ──reserve──> reserved ──begin──> attempting ─�
 - 不改变现有单 daemon 默认配置。
 - 不增加具体远程数据库依赖、连接信息或部署语义。
 
-后续接入按小步完成：当前 `shadow` 已在 ACK 后镜像 `im.message.receive_v1` 到 durable inbox，并由无用户可见副作用的 shadow consumer 完成 claim、身份校验和 complete；现有 SQLite 路径仍负责真实处理。异步 `DurableSessionFacade` 也已接入普通飞书新会话的成功提交点，但只镜像审计后的最小 projection，不接管同步 Session API。provider-neutral primary consumer 已实现 claim/renew/dispatch receipt/complete/retry 状态机，但尚未接入 daemon。下一步是补齐 ingress 与真实 durable admission 边界，再实现 durable outbox pump。每一步都必须保留关闭开关和现有 SQLite 行为回归。
+后续接入按小步完成：当前 `shadow` 已在 ACK 后镜像 `im.message.receive_v1` 到 durable inbox，并由无用户可见副作用的 shadow consumer 完成 claim、身份校验和 complete；现有 SQLite 路径仍负责真实处理。异步 `DurableSessionFacade` 也已接入普通飞书新会话的成功提交点，但只镜像审计后的最小 projection，不接管同步 Session API。provider-neutral primary consumer 与 durable outbox pump 的状态机均已实现，但尚未接入 daemon。下一步是补齐 ingress、真实 durable admission 和 Lark payload/receipt adapter。每一步都必须保留关闭开关和现有 SQLite 行为回归。
 
 Session shadow projection 只包含版本、稳定 `sessionId`、应用与路由 anchor、scope、active/closed 生命周期和时间戳。标题、prompt、owner、工作目录、附件、token、CLI/provider lineage 与终端状态都不复制；这些字段在形成明确的多副本合同前仍只属于现有 Session store。Facade 按 stable session key 顺序化并合并排队更新，执行 `acquire lease → read revision → CAS write`，显式返回 occupied、conflict 和 stale lease。不同 key 可并行；优雅退出有界等待并释放本 boot 持有的 lease。
 
@@ -94,6 +94,10 @@ Primary daemon 接线仍有三个硬门禁：
 3. `processMessageEvent` 当前在 canonical handler 真正完成 durable admission 前就释放 raw ingress lane。Primary 接线必须暴露真实 admission receipt，不能把“已排进内存队列”当作 `committed`。
 
 这三项与 durable outbox 未完成前，`BOTMUX_COORDINATION_MODE=primary` 继续拒绝启动。
+
+Durable outbox pump 严格复用合同已有的副作用边界：先 reserve，再在任何 transport 调用之前提交 `beginOutboxAttempt`。callback 只有三类显式结果：带 receipt 的 delivered；带 `no_side_effect` 或 `stable_target_idempotency` 证明的 safe retry；以及 ambiguous。callback 抛错、超时、非法结果或缺少安全证明的 retry 一律进入 ambiguous，不自动重发。Attempt timeout 小于 reservation lease 的一半，使正常 settlement 有独立余量；晚到成功只作为观测信号，不能把已经 ambiguous 的 attempt 改写成 delivered。
+
+Pump 本身不包含 Lark 语义。后续 adapter 必须冻结 receive target、reply parent、message type/content、稳定 UUID 与 hook origin，并在 stable UUID 的服务端去重窗口内重新证明 retry 仍安全；超出窗口或无法读回 receipt 时保持 ambiguous。现有 final delivery drain、turn idempotency 和 outbound hook fencing 应作为接线依赖复用，而不是平行实现第二套回执。
 
 非内置 store 通过独立 JSONL provider 进程接入，握手、配置和 fail-closed 边界见 [durable coordination provider runtime](./2026-10-05-durable-coordination-provider-runtime.md)。该进程边界只承载公共合同，不允许把具体数据库或部署平台语义引入 daemon。
 
@@ -125,3 +129,11 @@ Primary daemon 接线仍有三个硬门禁：
 - 长 dispatch claim renew 与最新 claim proof；
 - stale renewal 触发 abort，且不 complete、不 retry；
 - bounded shutdown 中止未结算 dispatch，不伪造完成回执。
+
+`test/durable-outbox-pump.test.ts` 覆盖：
+
+- begin attempt 先于 transport callback，成功 receipt 结算 delivered；
+- 只有显式安全证明允许 retry，非法证明降级 ambiguous；
+- transport throw、timeout 与未知结果默认 ambiguous；
+- timeout 后迟到成功不覆盖 ambiguous；
+- stale begin、瞬时 reserve 失败与 bounded shutdown。
