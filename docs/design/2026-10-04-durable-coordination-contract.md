@@ -79,7 +79,11 @@ outbox: pending ──reserve──> reserved ──begin──> attempting ─�
 - 不改变现有单 daemon 默认配置。
 - 不增加具体远程数据库依赖、连接信息或部署语义。
 
-后续接入按小步完成：当前 `shadow` 已在 ACK 后镜像 `im.message.receive_v1` 到 durable inbox，并由无用户可见副作用的 shadow consumer 完成 claim、身份校验和 complete；现有 SQLite 路径仍负责真实处理。下一步迁移 Session 状态调用面和 primary inbox handler，最后启用 durable outbox pump。每一步都必须保留关闭开关和现有 SQLite 行为回归。
+后续接入按小步完成：当前 `shadow` 已在 ACK 后镜像 `im.message.receive_v1` 到 durable inbox，并由无用户可见副作用的 shadow consumer 完成 claim、身份校验和 complete；现有 SQLite 路径仍负责真实处理。异步 `DurableSessionFacade` 也已接入普通飞书新会话的成功提交点，但只镜像审计后的最小 projection，不接管同步 Session API。下一步是 primary inbox handler 和 durable outbox pump。每一步都必须保留关闭开关和现有 SQLite 行为回归。
+
+Session shadow projection 只包含版本、稳定 `sessionId`、应用与路由 anchor、scope、active/closed 生命周期和时间戳。标题、prompt、owner、工作目录、附件、token、CLI/provider lineage 与终端状态都不复制；这些字段在形成明确的多副本合同前仍只属于现有 Session store。Facade 按 stable session key 顺序化并合并排队更新，执行 `acquire lease → read revision → CAS write`，显式返回 occupied、conflict 和 stale lease。不同 key 可并行；优雅退出有界等待并释放本 boot 持有的 lease。
+
+第一版挂接范围刻意只覆盖普通飞书新会话在 SQLite 更新和 `activeSessions` 注册都成功之后的 shadow 写入。竞态失败的 scratch Session、全量 `persistRow`、多行事务、恢复、关闭和批量 lineage 写入尚未挂接；因此这一版不能用作完整 Session 事实源，也不能解除 `primary` 门禁。
 
 非内置 store 通过独立 JSONL provider 进程接入，握手、配置和 fail-closed 边界见 [durable coordination provider runtime](./2026-10-05-durable-coordination-provider-runtime.md)。该进程边界只承载公共合同，不允许把具体数据库或部署平台语义引入 daemon。
 
@@ -95,3 +99,11 @@ outbox: pending ──reserve──> reserved ──begin──> attempting ─�
 - outbox safe retry、稳定 message id、迟到 receipt；
 - attempting 超时进入 ambiguous 而非自动重放；
 - SQLite reopen 后状态和 epoch 保持。
+
+`test/durable-session-facade.test.ts` 与 `test/durable-session-shadow.test.ts` 额外覆盖：
+
+- lease/read/revision-CAS 与 unchanged 去重；
+- 同 key 顺序化、排队更新 last-write-wins 合并和跨 key 并行；
+- occupied、conflict、stale lease 显式结果；
+- 有界 stop 与 lease release；
+- thread/chat stable key 以及敏感/高频字段不进入 shadow projection。

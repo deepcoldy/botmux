@@ -80,7 +80,7 @@ export async function initializeDurableCoordinationRuntime(
   if (mode === 'disabled') return undefined;
   if (mode === 'primary') {
     throw new Error(
-      'BOTMUX_COORDINATION_MODE=primary is unavailable until durable inbox, Session facade, and outbox pump wiring is complete',
+      'BOTMUX_COORDINATION_MODE=primary is unavailable until primary inbox, complete Session ownership, and outbox pump wiring are complete',
     );
   }
   const store = await ExternalDurableCoordinationStore.connect(providerConfig(env));
