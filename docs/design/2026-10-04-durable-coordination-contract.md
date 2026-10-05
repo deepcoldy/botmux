@@ -127,6 +127,8 @@ Pump 本身不包含 Lark 语义。Lark adapter 使用版本化 envelope 冻结 
 
 `enqueueDurableLarkSessionOutput` 把 Session 与 output 绑在同一 fencing 证明上：先 exact-write 最新完整 Session snapshot，取得新 lease/record，再用该 lease enqueue frozen outbox message，最后返回跨副本 settlement。outbox `sessionKey` 在任何写入前必须与 canonical Session key 一致；Session occupied/conflict/stale 时不创建 output，outbox conflict/stale 显式返回，不能回退到直接 transport。
 
+`enqueueDurableLarkFinalOutput` 在任何异步 Session/outbox 操作前同步注册现有 daemon final-output drain fence。只有 outbox 权威 settlement 到达 `delivered`/`ambiguous`，或 pre-enqueue 明确失败/本地等待被 abort，才释放 fence；因此 shutdown snapshot 不会漏掉正在写 Session 或等待另一副本投递的 final output。
+
 Adapter 复用现有 `sendMessage` / `replyMessage`、`classifyFeishuError` 和 outbound hook fencing。Session/epoch authority 在每次 provider 调用前重新验证；首次尝试只有拿到动态 hook authority 才发 hook，后续 UUID reconciliation 一律 `suppressHook`，避免 provider 去重成功时重复本地 hook。持久 payload 只保存普通 JSON hook context，不保存 IPC capability；`hookOrigin` 与 `beforeHook` 必须由当前 owner 在投递时重新证明。父消息已撤回时不能拿同一个 UUID 改投 top-level send：Feishu UUID 去重不把 parent 纳入 key，这样 retarget 可能静默返回旧父消息下的结果；adapter 因此保持 ambiguous，新的 fallback 必须重新取得 authority 并创建新的 outbox identity。
 
 现有 final delivery drain、turn idempotency 和 outbound hook fencing 应作为接线依赖复用，而不是平行实现第二套回执。当前 adapter 仍未接入 daemon；附件、多条分块消息、卡片 patch 与非 IM 副作用继续留在现有路径，不能被这份单消息 envelope 偷偷概括。
@@ -203,3 +205,5 @@ Adapter 复用现有 `sendMessage` / `replyMessage`、`classifyFeishuError` 和 
 `test/durable-outbox-settlement.test.ts` 覆盖 fenced enqueue、跨副本 pending→attempting→delivered、duplicate/ambiguous、conflict/stale lease 与本地 abort 不篡改 durable row。
 
 `test/durable-lark-session-output.test.ts` 覆盖 Session-before-outbox 顺序、同一 epoch fencing、权威 settlement、跨 Session target 预写拒绝，以及 Session occupied/outbox conflict/stale containment。
+
+`test/durable-lark-final-output.test.ts` 覆盖 final-drain 同步注册、terminal settlement 后释放、pre-enqueue failure 与 shutdown abort 的有界释放。
