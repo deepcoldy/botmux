@@ -48,13 +48,17 @@ The consumer is intentionally not constructed by the daemon. The live Lark path 
 
 A provider-neutral durable outbox pump is also present without daemon wiring. It reserves independent Session heads concurrently, commits `attempting` before invoking transport, and accepts only delivered, explicitly safe retry, or ambiguous outcomes. Exceptions, timeouts and malformed retry proofs become ambiguous. Timed-out callbacks may report a late result for reconciliation, but the automatic pump never turns that observation into a delivered receipt.
 
-The pump does not construct Lark payloads and does not assume that every transport failure is retryable. A later Lark adapter must bind stable UUID lifetime, target/reply identity, content, outbound-hook fencing and receipt readback. Until ingress admission, Session coverage and that adapter are integrated, the runtime remains shadow-only.
+The Lark adapter now defines a frozen, versioned single-message envelope without wiring it into the daemon. It binds the app, send chat or reply parent, reply mode, message type/content, stable provider UUID and JSON hook context. It reuses the existing send/reply clients, Feishu error classifier and one-hour provider TTL. Retry is allowed only for classified retryable failures while the UUID window still has a safety margin; otherwise the result is ambiguous.
+
+Session/epoch authority is revalidated immediately before provider invocation. Protected hook capability is never persisted: the current owner must dynamically provide `beforeHook` and `hookOrigin` for the first attempt. UUID reconciliation suppresses later hooks. A withdrawn reply remains ambiguous instead of silently falling back to top-level send under the same UUID, because provider dedupe does not bind the reply parent. Attachments, multi-message sequences, card patches and non-IM effects remain outside this envelope.
+
+The adapter still is not constructed by the daemon. Until ingress admission, complete Session coverage and this envelope are integrated with the pump and existing final-delivery drain, the runtime remains shadow-only.
 
 `primary` fails closed until all three runtime stages are present:
 
 1. a primary inbox handler that replaces, rather than mirrors, the local route;
 2. complete asynchronous fenced Session ownership and mutation coverage (the current narrow shadow projection is insufficient);
-3. a durable outbox adapter with explicit Lark attempt/receipt reconciliation (the generic pump alone is insufficient).
+3. full daemon wiring from Session output to the durable Lark envelope/pump and existing final-delivery drain (the adapter remains disabled here).
 
 This prevents a deployment from enabling multiple independent SQLite writers by setting one premature flag. A later change must remove the `primary` gate only together with the complete data path and its failure tests.
 
@@ -64,4 +68,4 @@ Graceful daemon shutdown requests provider `close` and bounds the response. Fata
 
 ## Verification
 
-Tests cover handshake compatibility, round-trip calls, redacted retryable errors, malformed results, timeouts, disabled defaults, primary fail-closed behavior, shadow claim/validation/retry, lifecycle cleanup, and recovery after a transient bootstrap poll failure. Session facade tests additionally cover per-key serialization/coalescing, cross-key independence, revision CAS, occupied/conflict/stale outcomes, bounded stop/release, and the audited projection field set. Primary consumer tests cover committed/ignored receipts, invalid envelopes and receipts, dispatch retry, claim renewal/loss, abort behavior and bounded shutdown. Outbox pump tests cover begin-before-side-effect ordering, delivered receipts, safe retry proofs, ambiguous defaults, timeout/late result fencing, stale reservations and shutdown. The existing durable contract suite continues to cover state-machine semantics independently of transport.
+Tests cover handshake compatibility, round-trip calls, redacted retryable errors, malformed results, timeouts, disabled defaults, primary fail-closed behavior, shadow claim/validation/retry, lifecycle cleanup, and recovery after a transient bootstrap poll failure. Session facade tests additionally cover per-key serialization/coalescing, cross-key independence, revision CAS, occupied/conflict/stale outcomes, bounded stop/release, and the audited projection field set. Primary consumer tests cover committed/ignored receipts, invalid envelopes and receipts, dispatch retry, claim renewal/loss, abort behavior and bounded shutdown. Outbox pump tests cover begin-before-side-effect ordering, delivered receipts, safe retry proofs, ambiguous defaults, timeout/late result fencing, stale reservations and shutdown. Lark adapter tests cover frozen identity, UUID TTL retry, hook fencing/suppression, withdrawn-parent containment, authority aborts and corrupt envelopes. The existing durable contract suite continues to cover state-machine semantics independently of transport.
