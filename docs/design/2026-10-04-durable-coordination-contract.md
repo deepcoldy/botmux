@@ -107,6 +107,8 @@ Primary admission 不能复用 shadow 的 last-write-wins 合并：两个 inbox 
 
 Primary consumer 的 dispatch callback 必须返回 `committed` 或带有有界原因的 `ignored`。`committed` 不再接受裸状态词，必须携带版本化 `DurableLarkAdmissionReceipt`：它把 inbox 的 `eventId`、`partitionKey` 和 App identity 绑定到 durable store 返回的 Session key、lease epoch、record revision 与 store timestamp。consumer 会在 complete inbox claim 前重新校验全部字段；复制自另一事件的 receipt、缺失 epoch/revision 的伪回执，以及只把任务追加到进程内 Promise queue 的 `{ kind: 'committed' }` 都进入 retry，不能冒充 durable admission。
 
+`DurableLarkCanonicalDispatch` 把 consumer callback 与 canonical handler 的返回值收敛成同一边界：handler 必须显式返回 `admitted + Session snapshot` 或 `ignored + bounded reason`。admitted 路径通过 full Session exact admission 后才返回 committed receipt；ignored 不写 Session。claim 已 abort、handler 返回 queued/未知结果、Session occupied/conflict/stale 或 provider error 全部抛错给 consumer retry，不能降级成内存接纳。
+
 这份 receipt 只证明 canonical Session mutation 已在 fenced owner 下提交，不代表整轮执行完成，也不保存 owner id、prompt、用户身份或 provider 凭据。未来 daemon handler 必须从实际 Session lease 与 CAS write 返回值构造它；当前 live route 尚未接入。长 dispatch 会续租 inbox claim；续租 stale 或失败立即触发 `AbortSignal`，之后既不 complete 也不 retry，由 claim 到期后交给新 owner。普通 dispatch 失败在仍持有 claim 时进入延迟 retry；不同 slot 可以并发领取不同 partition，同一 partition 的排他性仍由 store 保证。
 
 Primary daemon 接线仍有三个硬门禁：
@@ -166,6 +168,8 @@ Adapter 复用现有 `sendMessage` / `replyMessage`、`classifyFeishuError` 和 
 - bounded shutdown 中止未结算 dispatch，不伪造完成回执。
 
 `test/durable-lark-admission.test.ts` 覆盖 receipt 的 lease/record 构造、JSON round-trip、inbox identity 重校验，以及非法 epoch/revision/timestamp 与 Session key mismatch。
+
+`test/durable-lark-canonical-dispatch.test.ts` 覆盖 admitted→Session CAS→receipt、显式 ignored 不写 Session，以及 abort、非法 handler 结果与 Session conflict 的 fail-closed 行为。
 
 `test/durable-outbox-pump.test.ts` 覆盖：
 
