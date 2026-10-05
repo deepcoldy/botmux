@@ -189,12 +189,9 @@ export async function sweepOrphanCotMessages(selfLarkAppId: string): Promise<voi
         // complete below, since an un-terminated bubble spins on「执行中」
         // forever, which is strictly worse than an unannotated one.
         //
-        // The note ends in RUN_FINISHED, which already auto-completes the CoT
-        // server-side (verified: a later append is refused as terminal), so
-        // the complete below is redundant on the happy path. It is kept
-        // deliberately: it is idempotent, it is the ONLY terminator when the
-        // note fails, and dropping it would rewrite pre-existing assertions
-        // for a saving on a fire-and-forget startup path that blocks nothing.
+        // Use the error completion endpoint after the notice. RUN_FINISHED
+        // would label this abandoned progress stream as completed even though
+        // the external CLI can still be executing the original task.
         try {
           await c.request({
             method: 'PUT',
@@ -212,7 +209,7 @@ export async function sweepOrphanCotMessages(selfLarkAppId: string): Promise<voi
         await c.request({
           method: 'POST',
           url: `/open-apis/im/v1/message_cot/complete/${encodeURIComponent(rec.cotId)}`,
-          params: { message_id: rec.messageId, reason: 'done' },
+          params: { message_id: rec.messageId, reason: 'error' },
           timeout: COT_REQUEST_TIMEOUT_MS,
         } as any);
         logger.info(`[cot] orphan closed cot=${rec.cotId}`);
@@ -265,7 +262,9 @@ function ev(eventType: string, content: unknown): CotEvent {
 
 /**
  * Terminal batch for a bubble the daemon is abandoning mid-turn: a visible
- *「因重启中断」node followed by RUN_FINISHED(interrupted).
+ * A restart notice without RUN_FINISHED: Feishu treats that event as completed
+ * even when its free-form content contains status=interrupted. The caller uses
+ * the explicit error completion endpoint after appending the notice.
  *
  * Shared by both abandonment paths so they render identically:
  *   - graceful shutdown (still holds the in-memory state), and
@@ -282,7 +281,6 @@ function interruptedNoticeEvents(larkAppId: string, lastReasoningId?: string): C
     ev('REASONING_MESSAGE_START', { messageId: mid, role: 'reasoning' }),
     ev('REASONING_MESSAGE_CONTENT', { messageId: mid, delta: t('cot.interrupted', {}, localeForBot(larkAppId)) }),
     ev('REASONING_MESSAGE_END', { messageId: mid }),
-    ev('RUN_FINISHED', { threadId: 'cot-interrupted', runId: mid, status: 'interrupted' }),
   ];
 }
 
@@ -719,11 +717,8 @@ export async function settleCotMessageForShutdown(ds: DaemonSession): Promise<vo
   try {
     if (!state.disabled) {
       await apiAppend(ds, state, interruptedNoticeEvents(ds.larkAppId, state.lastReasoningId));
-    } else {
-      // A mid-turn failure already disabled pushes for this turn; appending
-      // would fail too. Just terminate so it stops spinning.
-      await apiComplete(ds, state, 'error');
     }
+    await apiComplete(ds, state, 'error');
   } catch {
     // Notice failed — still terminate, for the same reason the sweep does:
     // an unannotated closed bubble beats one that spins forever.

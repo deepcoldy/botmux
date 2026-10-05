@@ -761,7 +761,7 @@ describe('orphan markers & sweep (daemon restart mid-turn)', () => {
     await sweepOrphanCotMessages('app1');
     const complete = request.mock.calls.find(([req]) => String(req.url).includes('/message_cot/complete/cot_prev'));
     expect(complete).toBeTruthy();
-    expect(complete![0].params).toEqual({ message_id: 'om_prev', reason: 'done' });
+    expect(complete![0].params).toEqual({ message_id: 'om_prev', reason: 'error' });
     expect(readdirSync(orphanDir)).toEqual([]);
   });
 
@@ -793,8 +793,7 @@ describe('orphan markers & sweep (daemon restart mid-turn)', () => {
     expect(kinds).toEqual(['note', 'complete']);
     const note = pushedEvents();
     expect(note.some(e => e.type === 'REASONING_MESSAGE_CONTENT' && /重启/.test(e.content.delta))).toBe(true);
-    expect(note.at(-1)!.type).toBe('RUN_FINISHED');
-    expect(note.at(-1)!.content.status).toBe('interrupted');
+    expect(note.some(e => e.type === 'RUN_FINISHED')).toBe(false);
   });
 
   it('sweep still completes the bubble when the interrupted note fails', async () => {
@@ -821,8 +820,9 @@ describe('settleCotMessageForShutdown (graceful daemon restart)', () => {
     await settleCotMessageForShutdown(ds);
     const evs = pushedEvents();
     expect(evs.some(e => e.type === 'REASONING_MESSAGE_CONTENT' && /重启/.test(e.content.delta))).toBe(true);
-    expect(evs.at(-1)!.type).toBe('RUN_FINISHED');
-    expect(evs.at(-1)!.content.status).toBe('interrupted');
+    expect(evs.some(e => e.type === 'RUN_FINISHED')).toBe(false);
+    expect(request.mock.calls.some(([req]) => req.method === 'POST'
+      && String(req.url).includes('/message_cot/complete/') && req.params.reason === 'error')).toBe(true);
     // Marker cleared → the next generation's sweep must not annotate it twice.
     expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
   });
