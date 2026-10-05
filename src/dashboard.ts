@@ -582,12 +582,51 @@ dashboardSessions.onEnd(identity => {
   endDashboardAuthSession(identity.authSessionId);
 });
 
-function tcpPortAvailable(host: string, port: number): Promise<boolean> {
+function tcpPortAvailable(host: string, port: number, timeoutMs = 2_000): Promise<boolean> {
   return new Promise((resolve) => {
-    const probe = createTcpServer();
-    probe.once('error', () => resolve(false));
+    let settled = false;
+    let listened = false;
+    const trackedSockets = new Set<import('node:net').Socket>();
+
+    const destroyTracked = () => {
+      for (const s of trackedSockets) {
+        try { s.destroy(); } catch { /* ignore */ }
+      }
+      trackedSockets.clear();
+    };
+
+    const finish = (result: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      destroyTracked();
+      try { (probe as any).closeAllConnections?.(); } catch { /* ignore */ }
+      try { probe.close(); } catch { /* ignore */ }
+      resolve(result);
+    };
+
+    const timer = setTimeout(() => {
+      // If probe.listen succeeded but probe.close hung on lingering connections,
+      // the port was bindable.
+      finish(listened);
+    }, timeoutMs);
+    // Unref'd so the probe timer alone doesn't hold the event loop; the dashboard boot
+    // already maintains persistent ref'd handles (oauthCallbackServer, registry, etc.).
+    timer.unref?.();
+
+    const probe = createTcpServer((socket) => {
+      // Any connection arriving during the availability probe must be destroyed
+      // immediately. This server only checks port availability; it never handles traffic.
+      trackedSockets.add(socket);
+      try { socket.destroy(); } catch { /* ignore */ }
+    });
+    probe.unref?.();
+    probe.once('error', () => finish(false));
     probe.listen(port, host, () => {
-      probe.close(() => resolve(true));
+      listened = true;
+      destroyTracked();
+      try { (probe as any).closeAllConnections?.(); } catch { /* ignore */ }
+      probe.close(() => finish(true));
     });
   });
 }
@@ -8434,6 +8473,10 @@ const listenPendingWarn = setInterval(() => {
     + ' — platform tunnel not started yet. Likely a starved event loop (check this process\'s CPU)'
     + ' or a loopback occupant on the port; a bounded release failure will surface as an error below.',
   );
+  if (waitedS >= 60) {
+    logger.error(`[dashboard] still not listening after ${waitedS}s — exiting so the supervisor restarts the dashboard.`);
+    process.exit(1);
+  }
 }, LISTEN_PENDING_WARN_MS);
 listenPendingWarn.unref();
 listenWithProbe({
