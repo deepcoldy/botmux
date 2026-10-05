@@ -18,12 +18,12 @@ BotMux 当前把入站去重、同会话串行、Session 状态和投递回执�
 
 ## ACK 边界
 
-Lark WebSocket handler 当前依赖 `claimMessageOnce` 与 `setImmediate` 之间没有 `await`：同一 chat 的事件按到达顺序进入 raw ingress lane，并在 SDK 的 ACK 预算内返回。远程协调调用不能进入这段同步热路径。
+Lark WebSocket handler 当前依赖 `claimMessageOnce` 与 `setImmediate` 之间没有 `await`：同一 chat 的事件按到达顺序进入 raw ingress lane，并在 SDK 的 ACK 预算内返回。这个约束继续适用于现有 SQLite 路径和 shadow mirror；shadow 的远程协调调用不能进入同步热路径。
 
-后续接线必须保持两层：
+Shadow 路径保持两层：
 
 ```text
-WS callback
+WS callback (shadow)
   ├─ 同步本地 quick claim（只用于挡当前进程重推）
   ├─ 同步 schedule + 返回 ACK
   └─ setImmediate 后 durable enqueue(eventId, partitionKey, payload)
@@ -34,7 +34,23 @@ WS callback
                        └─ enqueue outbox
 ```
 
-本地 quick claim 不是分布式正确性来源；跨副本幂等由 durable inbox 唯一键提供。ACK 后 enqueue 失败时，调用方必须可见地重试或进入降级策略，不能把本地 quick claim 当作已经持久接收。
+本地 quick claim 不是分布式正确性来源；跨副本幂等由 durable inbox 唯一键提供。ACK 后 enqueue 失败时，调用方必须可见地重试或进入降级策略，不能把本地 quick claim 当作已经持久接收。因此这条 shadow 路径不能直接升级为 primary。
+
+Primary 路径必须把 durable enqueue 移到 ACK 之前，并且同一个 Lark App 同一时刻只能有一个 WS ingress owner：
+
+```text
+App ingress lease leader
+  └─ owns the only active WS client for this App
+       └─ WS callback
+            ├─ validate stable app/message/partition identity
+            ├─ await durable enqueue within the ACK budget
+            ├─ inserted/duplicate → return ACK
+            └─ timeout/conflict/provider failure/lease loss → reject, let Lark redeliver
+```
+
+`DurableLarkPrimaryIngress` 复用 Session lease 的 epoch fencing，但使用保留的 App 级 key。leader 在本地单调时钟证明接近过期前停止接纳；renew stale、provider error、durable enqueue error 或 conflict 都会立即失去本地领导权并中止 WS lifecycle signal。`onLeadershipAcquired` 和 `onLeadershipLost` 是未来 daemon 接线唯一允许启停 WS client 的边界，优雅退出会先 drain 已接纳的分区写入并完成 lost callback，再释放 lease；整个过程共享同一个 shutdown deadline。
+
+同一 `partitionKey` 在 API 入口同步挂入 FIFO。即使 ACK wait 超时，实际 enqueue 仍保留在 tail 中，因此 N+1 不能越过仍在进行的 N；Lark 重推最终只会得到 duplicate。客户端 `createdAt` 只在一个进程生命周期内严格递增，不能冒充跨 leader epoch 的数据库全序。跨 epoch 若未来需要严格全序，仍必须增加 store-generated sequence 或等价证明。
 
 ## 接口与状态机
 
@@ -79,7 +95,7 @@ outbox: pending ──reserve──> reserved ──begin──> attempting ─�
 - 不改变现有单 daemon 默认配置。
 - 不增加具体远程数据库依赖、连接信息或部署语义。
 
-后续接入按小步完成：当前 `shadow` 已在 ACK 后镜像 `im.message.receive_v1` 到 durable inbox，并由无用户可见副作用的 shadow consumer 完成 claim、身份校验和 complete；现有 SQLite 路径仍负责真实处理。异步 `DurableSessionFacade` 也已接入普通飞书新会话的成功提交点，但只镜像审计后的最小 projection，不接管同步 Session API。provider-neutral primary consumer 与 durable outbox pump 的状态机均已实现，但尚未接入 daemon。下一步是补齐 ingress、真实 durable admission 和 Lark payload/receipt adapter。每一步都必须保留关闭开关和现有 SQLite 行为回归。
+后续接入按小步完成：当前 `shadow` 已在 ACK 后镜像 `im.message.receive_v1` 到 durable inbox，并由无用户可见副作用的 shadow consumer 完成 claim、身份校验和 complete；现有 SQLite 路径仍负责真实处理。异步 `DurableSessionFacade` 也已接入普通飞书新会话的成功提交点，但只镜像审计后的最小 projection，不接管同步 Session API。provider-neutral primary consumer、durable outbox pump、Lark payload/receipt adapter，以及 App 级 primary ingress leader/ACK 前 enqueue 状态机均已实现，但都尚未组成 daemon 的真实 primary 路径。每一步都必须保留关闭开关和现有 SQLite 行为回归。
 
 Session shadow projection 只包含版本、稳定 `sessionId`、应用与路由 anchor、scope、active/closed 生命周期和时间戳。标题、prompt、owner、工作目录、附件、token、CLI/provider lineage 与终端状态都不复制；这些字段在形成明确的多副本合同前仍只属于现有 Session store。Facade 按 stable session key 顺序化并合并排队更新，执行 `acquire lease → read revision → CAS write`，显式返回 occupied、conflict 和 stale lease。不同 key 可并行；优雅退出有界等待并释放本 boot 持有的 lease。
 
@@ -89,11 +105,11 @@ Primary consumer 的 dispatch callback 必须返回 `committed` 或带有有界�
 
 Primary daemon 接线仍有三个硬门禁：
 
-1. 当前 mirror 在 WS ACK 后才 enqueue；真实 primary 必须证明 ACK 前 durable enqueue 成功，或先写入等价的本地 durable spool。仅靠 ACK 后 fire-and-forget 会留下已 ACK 但未入库的丢消息窗口。
-2. 多副本不得各自无序接收同一 App 的 WS 事件。需要单 ingress owner，或等价的上游序号/数据库定序证明，再把事件交给 partition claim。
+1. daemon 必须只在 `DurableLarkPrimaryIngress` 领导权回调内启停该 App 的 WS client，并用 `enqueueBeforeAck` 替换、而不是旁路镜像现有 message callback；新增组件本身尚未改变 live route。
+2. handler 必须只在 durable inbox 返回 inserted/duplicate 后 ACK；timeout、conflict、provider failure 和 lease loss 必须保持可重推，不能回退到 ACK 后 fire-and-forget。
 3. `processMessageEvent` 当前在 canonical handler 真正完成 durable admission 前就释放 raw ingress lane。Primary 接线必须暴露真实 admission receipt，不能把“已排进内存队列”当作 `committed`。
 
-这三项与 durable outbox 未完成前，`BOTMUX_COORDINATION_MODE=primary` 继续拒绝启动。
+这三项与 durable outbox daemon 接线完成前，`BOTMUX_COORDINATION_MODE=primary` 继续拒绝启动。
 
 Durable outbox pump 严格复用合同已有的副作用边界：先 reserve，再在任何 transport 调用之前提交 `beginOutboxAttempt`。callback 只有三类显式结果：带 receipt 的 delivered；带 `no_side_effect` 或 `stable_target_idempotency` 证明的 safe retry；以及 ambiguous。callback 抛错、超时、非法结果或缺少安全证明的 retry 一律进入 ambiguous，不自动重发。Attempt timeout 小于 reservation lease 的一半，使正常 settlement 有独立余量；晚到成功只作为观测信号，不能把已经 ambiguous 的 attempt 改写成 delivered。
 
@@ -150,3 +166,11 @@ Adapter 复用现有 `sendMessage` / `replyMessage`、`classifyFeishuError` 和 
 - withdrawn reply 不在同一 UUID 下 retarget；
 - provider 前 authority/abort 失败证明 no-side-effect；
 - corrupt payload containment。
+
+`test/durable-lark-primary-ingress.test.ts` 额外覆盖：
+
+- App lease acquire/occupied standby、按配置续租和 stale/error 失去领导权；
+- stable app/message/partition identity 校验，以及 inserted/duplicate/conflict ACK 边界；
+- 同分区 FIFO、单调时间戳和 ACK timeout 后 tail 不越序；
+- enqueue failure、activation callback failure 与 leadership-lost lifecycle；
+- drain-before-release、lost callback-before-release，以及覆盖 release 的单一 shutdown deadline。
