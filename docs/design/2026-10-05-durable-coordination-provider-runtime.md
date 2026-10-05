@@ -68,6 +68,8 @@ The adapter still is not constructed by the daemon. Until ingress admission, com
 
 A provider-neutral primary Lark ingress component now owns the disabled-state admission boundary. It reuses the fenced lease primitive under an application-scoped reserved key, exposes leadership callbacks as the only future WS start/stop boundary, and awaits durable inbox insertion before the SDK callback may ACK. An occupied lease remains standby. A stale renewal, provider failure, conflicting duplicate, or enqueue failure drops local leadership and aborts the lifecycle signal.
 
+Inbox ordering no longer treats caller `createdAt` as cross-leader authority. The store must allocate an insertion sequence transactionally and use it for every per-partition earlier fence. The SQLite reference uses an autoincrement side table with deterministic legacy backfill; remote providers must use a database sequence/identity or equivalent serialization point.
+
 Admission is serialized per raw routing partition at API entry. An ACK timeout rejects the callback but leaves the real enqueue in the partition tail, so redelivery cannot let N+1 overtake N and a later successful first write becomes a duplicate. Graceful stop drains admitted writes and leadership cleanup before lease release, all under one shutdown deadline. Client timestamps only order one process lifetime; the component does not claim a strict total order across leader epochs without a store-generated sequence.
 
 This ingress component is not constructed by the daemon and does not alter the live Lark route. `primary` therefore remains fail-closed.

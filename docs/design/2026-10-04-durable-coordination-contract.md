@@ -9,7 +9,7 @@ BotMux 当前把入站去重、同会话串行、Session 状态和投递回执�
 ## 不变量
 
 1. 入站平台事件以稳定 `eventId` 幂等；同键同 payload 是 duplicate，同键不同 payload 是 conflict。
-2. inbox 使用 `partitionKey` 保序。同一分区同一时刻最多一个有效 claim，不同分区可并行。
+2. inbox 使用 `partitionKey` 保序。同一分区同一时刻最多一个有效 claim，不同分区可并行；分区内顺序必须由 store 在插入事务中分配，不能信任不同 leader 的客户端时间戳或 event id 字典序。
 3. 逻辑 Session 由 owner lease 保护；每次过期接管或释放后重领都会递增 `epoch`。所有 Session 写入和 outbox 创建必须携带未过期的 `(sessionKey, ownerId, epoch)`。
 4. 租约时间由 store 自己决定。本地实现使用注入时钟；远程实现必须在事务内使用服务端时间，不能信任不同 worker 的墙钟。
 5. Session 状态使用 revision compare-and-set，避免新 owner 的更新被旧快照覆盖。
@@ -62,6 +62,8 @@ App ingress lease leader
 - Outbox：fenced enqueue、reserve、begin attempt、delivered/retry/ambiguous 结算。
 
 SQLite 参考实现位于 `src/services/sqlite-durable-coordination.ts`，使用独立 schema 和短事务。长 turn 不持有数据库事务，只持有可续租的 Session lease。
+
+SQLite inbox 使用独立的 autoincrement order 表，在 event insert 的同一事务内分配全局 sequence；claim 的 per-partition earlier fence 与候选排序都使用该 sequence。旧 version-1 数据库首次打开时按已有 `created_at,event_id` 做一次确定性 backfill，之后所有新事件不再依赖客户端时间。远程 provider 必须用数据库 sequence/identity 或等价的事务序号实现同一语义。
 
 ```text
 inbox:  queued ──claim──> claimed ──complete──> completed
