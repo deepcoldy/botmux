@@ -16902,6 +16902,33 @@ function setupWorkerHandlers(
 const FINAL_OUTPUT_RETRY_BACKOFF_MS = [0, 5000, 15000];  // immediate, +5s, +15s
 const codexAppFinalSettlementInFlight = new Map<string, Promise<boolean>>();
 
+export interface DurableBridgeFinalOutputRequest {
+  daemonSession: DaemonSession;
+  turnId: string;
+  content: string;
+  msgType: string;
+  providerUuid: string;
+  target:
+    | { kind: 'send'; chatId: string }
+    | { kind: 'reply'; messageId: string; replyInThread: boolean };
+}
+
+export type DurableBridgeFinalOutputResult =
+  | { kind: 'delivered'; messageId: string }
+  | { kind: 'ambiguous'; error: string };
+
+type DurableBridgeFinalOutputHandler = (
+  request: DurableBridgeFinalOutputRequest,
+) => Promise<DurableBridgeFinalOutputResult>;
+
+let durableBridgeFinalOutputHandler: DurableBridgeFinalOutputHandler | undefined;
+
+export function setDurableBridgeFinalOutputHandler(
+  handler: DurableBridgeFinalOutputHandler | undefined,
+): void {
+  durableBridgeFinalOutputHandler = handler;
+}
+
 /** Ordinary bridge finals are daemon-owned external effects. Keep one exact
  * shutdown drain registration alive across all bounded retry attempts; the
  * provider terminal alone must not allow its worker generation to retire while
@@ -17798,15 +17825,49 @@ function deliverFinalOutput(
           logger.warn(`[${t}] reply-card final tool flush: ${error.message}`);
         });
       }
-      const unifiedReply = !managedReceiver && (!msg.kind || msg.kind === 'bridge')
-        ? await updateTurnReplyCard(ds, msg.turnId, {
-            kind: 'final', text: safeAssistantText, card: cardJson, source: 'bridge',
-            ...(feedbackPolicy && feedback ? { feedback: { policy: feedbackPolicy, requesterSubjectId: feedbackRequesterSubjectId } } : {}),
-          }, (body, type, uuid) => scopedReply(body, type, msg.replyTurnId ?? msg.turnId,
-            frozenReplyTarget ? { uuid, replyTarget: frozenReplyTarget } : { uuid }),
-          { dispatchAttempt: msg.dispatchAttempt, owns: isStillOwned })
+      const durableReplyTarget = frozenReplyTarget
+        ?? resolveSessionReplyTarget(ds, fallbackTurnId(ds, msg.replyTurnId ?? msg.turnId));
+      const durableTarget = durableReplyTarget.mode === 'plain'
+        ? { kind: 'send' as const, chatId: durableReplyTarget.chatId }
+        : {
+            kind: 'reply' as const,
+            messageId: durableReplyTarget.rootMessageId,
+            replyInThread: durableReplyTarget.mode === 'thread',
+          };
+      const durableDelivery = durableBridgeFinalOutputHandler
+        && !managedReceiver
+        && !preparedListenerReply
+        ? await durableBridgeFinalOutputHandler({
+            daemonSession: ds,
+            turnId: msg.turnId,
+            content: canonicalOutput.content,
+            msgType: canonicalOutput.msgType,
+            providerUuid: deliveryReplyOptions.uuid,
+            target: durableTarget,
+          })
         : undefined;
-      const messageId = unifiedReply?.messageId ?? await scopedReply(
+      if (durableDelivery?.kind === 'ambiguous') {
+        ds.agentAttention = {
+          kind: 'blocked',
+          reason: `Durable final output is ambiguous: ${durableDelivery.error}`,
+          at: Date.now(),
+        };
+        publishAttentionPatch(ds);
+        logger.error(`[${t}] Durable final_output ambiguous: ${durableDelivery.error}`);
+        onComplete?.(false);
+        return;
+      }
+      const unifiedReply = durableDelivery
+        ? undefined
+        : !managedReceiver && (!msg.kind || msg.kind === 'bridge')
+          ? await updateTurnReplyCard(ds, msg.turnId, {
+              kind: 'final', text: safeAssistantText, card: cardJson, source: 'bridge',
+              ...(feedbackPolicy && feedback ? { feedback: { policy: feedbackPolicy, requesterSubjectId: feedbackRequesterSubjectId } } : {}),
+            }, (body, type, uuid) => scopedReply(body, type, msg.replyTurnId ?? msg.turnId,
+              frozenReplyTarget ? { uuid, replyTarget: frozenReplyTarget } : { uuid }),
+            { dispatchAttempt: msg.dispatchAttempt, owns: isStillOwned })
+          : undefined;
+      const messageId = durableDelivery?.messageId ?? unifiedReply?.messageId ?? await scopedReply(
         canonicalOutput.content,
         canonicalOutput.msgType,
         msg.replyTurnId ?? msg.turnId,

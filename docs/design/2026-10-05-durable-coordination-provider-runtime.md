@@ -54,17 +54,17 @@ The consumer is intentionally not constructed by the daemon. The live Lark path 
 
 A provider-neutral durable outbox pump is also present without daemon wiring. It reserves independent Session heads concurrently, commits `attempting` before invoking transport, and accepts only delivered, explicitly safe retry, or ambiguous outcomes. Exceptions, timeouts and malformed retry proofs become ambiguous. Timed-out callbacks may report a late result for reconciliation, but the automatic pump never turns that observation into a delivered receipt.
 
-A settlement bridge follows the authoritative outbox row after fenced enqueue until `delivered` or `ambiguous`. It deliberately polls the shared store instead of trusting a process-local pump callback, so delivery completed by a takeover replica still releases the originating final-output drain. Aborting a local wait never mutates the durable row. The bridge is not wired into the daemon yet.
+A settlement bridge follows the authoritative outbox row after fenced enqueue until `delivered` or `ambiguous`. It deliberately polls the shared store instead of trusting a process-local pump callback, so delivery completed by a takeover replica still releases the originating final-output drain. Aborting a local wait never mutates the durable row. Its ordinary final-output call site is present behind the closed primary gate described below.
 
-A Session-output bridge now exact-writes the latest full Session snapshot, then enqueues the frozen outbox message with that same fresh lease proof and returns the authoritative settlement. It validates the output Session key before either mutation and never falls back to direct transport on coordination failure. Daemon/final-drain wiring remains disabled.
+A Session-output bridge now exact-writes the latest full Session snapshot, then enqueues the frozen outbox message with that same fresh lease proof and returns the authoritative settlement. It validates the output Session key before either mutation and never falls back to direct transport on coordination failure. The daemon call site remains unreachable while the primary gate is closed.
 
-A final-output bridge synchronously joins the existing daemon final-drain before starting those asynchronous mutations and releases it only after terminal shared-store settlement or a proven pre-enqueue/local-wait failure. The reusable bridge is present, but ordinary worker output call sites have not switched to it yet.
+A final-output bridge synchronously joins the existing daemon final-drain before starting those asynchronous mutations and releases it only after terminal shared-store settlement or a proven pre-enqueue/local-wait failure. Ordinary worker output uses it only inside the gated primary path; disabled and shadow modes retain direct delivery.
 
 The Lark adapter now defines a frozen, versioned single-message envelope without wiring it into the daemon. It binds the app, send chat or reply parent, reply mode, message type/content, stable provider UUID and JSON hook context. It reuses the existing send/reply clients, Feishu error classifier and one-hour provider TTL. Retry is allowed only for classified retryable failures while the UUID window still has a safety margin; otherwise the result is ambiguous.
 
 Session/epoch authority is revalidated immediately before provider invocation. Protected hook capability is never persisted: the current owner must dynamically provide `beforeHook` and `hookOrigin` for the first attempt. UUID reconciliation suppresses later hooks. A withdrawn reply remains ambiguous instead of silently falling back to top-level send under the same UUID, because provider dedupe does not bind the reply parent. Attachments, multi-message sequences, card patches and non-IM effects remain outside this envelope.
 
-The adapter still is not constructed by the daemon. Until ingress admission, complete Session coverage and this envelope are integrated with the pump and existing final-delivery drain, the runtime remains shadow-only.
+The daemon constructs the adapter only inside the gated primary path. Until complete Session and non-ordinary output coverage join the existing final-delivery drain, configuration alone cannot enter that path.
 
 A provider-neutral primary Lark ingress component now owns the disabled-state admission boundary. It reuses the fenced lease primitive under an application-scoped reserved key, exposes leadership callbacks as the only future WS start/stop boundary, and awaits durable inbox insertion before the SDK callback may ACK. An occupied lease remains standby. A stale renewal, provider failure, conflicting duplicate, or enqueue failure drops local leadership and aborts the lifecycle signal.
 
@@ -72,15 +72,21 @@ Inbox ordering no longer treats caller `createdAt` as cross-leader authority. Th
 
 Admission is serialized per raw routing partition at API entry. An ACK timeout rejects the callback but leaves the real enqueue in the partition tail, so redelivery cannot let N+1 overtake N and a later successful first write becomes a duplicate. Graceful stop drains admitted writes and leadership cleanup before lease release, all under one shutdown deadline. Client timestamps only order one process lifetime; the component does not claim a strict total order across leader epochs without a store-generated sequence.
 
-This ingress component is not constructed by the daemon and does not alter the live Lark route. `primary` therefore remains fail-closed.
+This ingress component is constructed only inside the gated primary path and does not alter disabled or shadow routes. `primary` therefore remains fail-closed.
 
-`DurableLarkPrimaryRuntime` now composes the disabled-state ingress leader, primary inbox consumer, canonical Session admission bridge, durable outbox pump and Session facade around one store. Consumer and pump start before ingress leadership may start WS. Graceful stop uses one absolute budget and orders `ingress/WS cleanup → inbox drain → outbox drain → Session lease release`; fatal termination aborts every component. The daemon still does not construct this runtime, so the primary gate remains closed.
+`DurableLarkPrimaryRuntime` now composes the disabled-state ingress leader, primary inbox consumer, canonical Session admission bridge, durable outbox pump and Session facade around one store. Consumer and pump start before ingress leadership may start WS. Graceful stop uses one absolute budget and orders `ingress/WS cleanup → inbox drain → outbox drain → Session lease release`; fatal termination aborts every component. The daemon constructs it only after an explicit in-process primary proof, which it intentionally does not grant yet.
 
-`primary` fails closed until all three runtime stages are present:
+The daemon wiring is now present behind the still-closed primary factory gate. It builds one reusable Lark event runtime after Session restore, lets only the ingress lease leader connect WS, and makes the WS message callback await durable inbox enqueue instead of invoking the legacy route. Claimed rows re-enter the same routing/permission/canonical handlers without a WS connection and resolve the exact admitted Session snapshot. Leadership loss closes the client before lease release.
 
-1. daemon wiring that starts the sole Lark WS client from the ingress leadership callbacks and replaces, rather than mirrors, the local message route with enqueue-before-ACK admission;
-2. complete asynchronous fenced Session ownership and mutation coverage (the current narrow shadow projection is insufficient);
-3. full daemon wiring from Session output to the durable Lark envelope/pump and existing final-delivery drain (the adapter remains disabled here).
+Ordinary bridge `final_output` also has a disabled primary hook: it freezes the existing reply target/card/provider UUID, exact-writes the current turn's Session snapshot, enqueues outbox under that epoch, waits for shared-store settlement, then continues the existing delivery bookkeeping with the provider message id. A turn-id check prevents an ultra-fast final from reusing the prior input's Session admission. Legacy/shadow keep the existing direct transport byte-for-byte.
+
+Primary initialization still requires an explicit in-process `allowPrimary` proof and the daemon intentionally does not pass it yet. Remaining blockers are model-initiated `botmux send`/non-ordinary output coverage, sessionless commands and pre-session grant/hall replies, delayed forward-followup durable admission, and end-to-end failover evidence. The dormant runtime rejects these unsupported side effects instead of completing their inbox claims as ignored; setting only `BOTMUX_COORDINATION_MODE=primary` therefore continues to fail closed.
+
+`primary` fails closed until all three runtime stages are complete:
+
+1. daemon wiring that starts the sole Lark WS client from the ingress leadership callbacks and replaces, rather than mirrors, the local message route with enqueue-before-ACK admission (implemented behind the gate here);
+2. complete asynchronous fenced Session ownership and mutation coverage beyond the current inbound/final snapshots;
+3. durable coverage for non-ordinary output and pre-session side effects, followed by end-to-end failover verification.
 
 This prevents a deployment from enabling multiple independent SQLite writers by setting one premature flag. A later change must remove the `primary` gate only together with the complete data path and its failure tests.
 

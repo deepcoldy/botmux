@@ -87,6 +87,18 @@ describe('durable coordination runtime configuration', () => {
     await runtime?.close();
   });
 
+  it('starts primary only when the fully-wired daemon explicitly opts in', async () => {
+    const { command, args } = providerCommand();
+    const runtime = await initializeDurableCoordinationRuntime({
+      ...process.env,
+      BOTMUX_COORDINATION_MODE: 'primary',
+      BOTMUX_COORDINATION_PROVIDER_BIN: command,
+      BOTMUX_COORDINATION_PROVIDER_ARGS_JSON: JSON.stringify(args),
+    }, { allowPrimary: true });
+    expect(runtime?.mode).toBe('primary');
+    await runtime?.close();
+  });
+
   it('rejects relative provider executables before spawn', async () => {
     await expect(initializeDurableCoordinationRuntime({
       BOTMUX_COORDINATION_MODE: 'shadow',
