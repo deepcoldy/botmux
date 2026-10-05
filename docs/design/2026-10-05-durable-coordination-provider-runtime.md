@@ -42,6 +42,10 @@ The shadow runtime also owns a provider-neutral `DurableSessionFacade`. It creat
 
 Only a narrow versioned projection is eligible for this stage: session id, application id, routing anchor, scope, active/closed status and lifecycle timestamps. Prompt content, titles, identities, paths, attachments, tokens and provider/terminal state are excluded. The daemon invokes this mirror only after an ordinary Lark session has committed to SQLite and won active-session registration. It is therefore shadow evidence, not a complete Session source: restore, close, multi-row transactions, lineage batches and the synchronous Session API remain SQLite-only.
 
+A provider-neutral primary inbox consumer now defines the later claim-to-admission state machine without enabling it. Multiple boot-scoped slots can process independent partitions. Each claim is revalidated before dispatch, renewed while dispatch is active, and completed only after a `committed` or explicitly `ignored` receipt. Dispatch errors retry only while ownership is still proven. A stale/failed renewal aborts the callback and leaves the row for lease-expiry recovery; bounded shutdown likewise never fabricates a completion.
+
+The consumer is intentionally not constructed by the daemon. The live Lark path still acknowledges before the shadow enqueue, and the current message router releases its raw lane before the canonical handler proves durable admission. Multi-replica ingress ordering also lacks a single-owner or upstream-sequence proof. These are primary correctness blockers, not rollout toggles.
+
 `primary` fails closed until all three runtime stages are present:
 
 1. a primary inbox handler that replaces, rather than mirrors, the local route;
@@ -56,4 +60,4 @@ Graceful daemon shutdown requests provider `close` and bounds the response. Fata
 
 ## Verification
 
-Tests cover handshake compatibility, round-trip calls, redacted retryable errors, malformed results, timeouts, disabled defaults, primary fail-closed behavior, shadow claim/validation/retry, lifecycle cleanup, and recovery after a transient bootstrap poll failure. Session facade tests additionally cover per-key serialization/coalescing, cross-key independence, revision CAS, occupied/conflict/stale outcomes, bounded stop/release, and the audited projection field set. The existing durable contract suite continues to cover state-machine semantics independently of transport.
+Tests cover handshake compatibility, round-trip calls, redacted retryable errors, malformed results, timeouts, disabled defaults, primary fail-closed behavior, shadow claim/validation/retry, lifecycle cleanup, and recovery after a transient bootstrap poll failure. Session facade tests additionally cover per-key serialization/coalescing, cross-key independence, revision CAS, occupied/conflict/stale outcomes, bounded stop/release, and the audited projection field set. Primary consumer tests cover committed/ignored receipts, invalid envelopes and receipts, dispatch retry, claim renewal/loss, abort behavior and bounded shutdown. The existing durable contract suite continues to cover state-machine semantics independently of transport.

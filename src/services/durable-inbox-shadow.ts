@@ -21,6 +21,11 @@ export interface DurableLarkMessageObservation {
   attempts: number;
 }
 
+export interface DurableLarkMessageClaim extends DurableLarkMessageObservation {
+  /** 原始 receive_v1 event；只在完整身份校验通过后暴露给 consumer。 */
+  data: DurableJson;
+}
+
 function record(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -32,6 +37,17 @@ function record(value: unknown): Record<string, unknown> | undefined {
  * silently acknowledged, so schema drift remains visible before `primary` is
  * enabled. */
 export function observeDurableLarkMessageClaim(claim: InboxClaim): DurableLarkMessageObservation {
+  const parsed = parseDurableLarkMessageClaim(claim);
+  const { data: _data, ...observation } = parsed;
+  return observation;
+}
+
+/**
+ * Validate and unwrap one durable Lark event for a real consumer. Keeping this
+ * beside the shadow observer guarantees both modes enforce the same stable
+ * app/message/partition identity before any handler can see the payload.
+ */
+export function parseDurableLarkMessageClaim(claim: InboxClaim): DurableLarkMessageClaim {
   const payload = record(claim.event.payload);
   const event = record(payload?.event);
   const message = record(event?.message);
@@ -60,6 +76,7 @@ export function observeDurableLarkMessageClaim(claim: InboxClaim): DurableLarkMe
     larkAppId,
     messageId,
     attempts: claim.attempts,
+    data: payload.event as DurableJson,
   };
 }
 
