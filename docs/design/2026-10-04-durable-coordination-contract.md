@@ -97,7 +97,11 @@ Primary daemon 接线仍有三个硬门禁：
 
 Durable outbox pump 严格复用合同已有的副作用边界：先 reserve，再在任何 transport 调用之前提交 `beginOutboxAttempt`。callback 只有三类显式结果：带 receipt 的 delivered；带 `no_side_effect` 或 `stable_target_idempotency` 证明的 safe retry；以及 ambiguous。callback 抛错、超时、非法结果或缺少安全证明的 retry 一律进入 ambiguous，不自动重发。Attempt timeout 小于 reservation lease 的一半，使正常 settlement 有独立余量；晚到成功只作为观测信号，不能把已经 ambiguous 的 attempt 改写成 delivered。
 
-Pump 本身不包含 Lark 语义。后续 adapter 必须冻结 receive target、reply parent、message type/content、稳定 UUID 与 hook origin，并在 stable UUID 的服务端去重窗口内重新证明 retry 仍安全；超出窗口或无法读回 receipt 时保持 ambiguous。现有 final delivery drain、turn idempotency 和 outbound hook fencing 应作为接线依赖复用，而不是平行实现第二套回执。
+Pump 本身不包含 Lark 语义。Lark adapter 使用版本化 envelope 冻结 app、send chat 或 reply parent、`replyInThread`、message type/content、稳定 provider UUID 与 JSON hook context；outbox row 的 message id 必须与 envelope identity 一致。UUID 限制沿用现有 Feishu 合同（URL-safe、最多 50 字符），去重 TTL 复用 `PROVIDER_TTL_MS['feishu-im']` 的 1 小时，并在到期前保留 60 秒 guard，超出窗口后不再自动 retry。
+
+Adapter 复用现有 `sendMessage` / `replyMessage`、`classifyFeishuError` 和 outbound hook fencing。Session/epoch authority 在每次 provider 调用前重新验证；首次尝试只有拿到动态 hook authority 才发 hook，后续 UUID reconciliation 一律 `suppressHook`，避免 provider 去重成功时重复本地 hook。持久 payload 只保存普通 JSON hook context，不保存 IPC capability；`hookOrigin` 与 `beforeHook` 必须由当前 owner 在投递时重新证明。父消息已撤回时不能拿同一个 UUID 改投 top-level send：Feishu UUID 去重不把 parent 纳入 key，这样 retarget 可能静默返回旧父消息下的结果；adapter 因此保持 ambiguous，新的 fallback 必须重新取得 authority 并创建新的 outbox identity。
+
+现有 final delivery drain、turn idempotency 和 outbound hook fencing 应作为接线依赖复用，而不是平行实现第二套回执。当前 adapter 仍未接入 daemon；附件、多条分块消息、卡片 patch 与非 IM 副作用继续留在现有路径，不能被这份单消息 envelope 偷偷概括。
 
 非内置 store 通过独立 JSONL provider 进程接入，握手、配置和 fail-closed 边界见 [durable coordination provider runtime](./2026-10-05-durable-coordination-provider-runtime.md)。该进程边界只承载公共合同，不允许把具体数据库或部署平台语义引入 daemon。
 
@@ -137,3 +141,12 @@ Pump 本身不包含 Lark 语义。后续 adapter 必须冻结 receive target、
 - transport throw、timeout 与未知结果默认 ambiguous；
 - timeout 后迟到成功不覆盖 ambiguous；
 - stale begin、瞬时 reserve 失败与 bounded shutdown。
+
+`test/durable-lark-outbox.test.ts` 覆盖：
+
+- frozen send/reply identity、row/envelope 一致性与 UUID 长度；
+- 首次 hook authority、重试 suppressHook 与 provider receipt；
+- 网络错误在 UUID TTL 内 safe retry，临近过期保持 ambiguous；
+- withdrawn reply 不在同一 UUID 下 retarget；
+- provider 前 authority/abort 失败证明 no-side-effect；
+- corrupt payload containment。
