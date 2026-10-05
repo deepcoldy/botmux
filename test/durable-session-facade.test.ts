@@ -101,6 +101,7 @@ describe('durable session facade', () => {
 
     await expect(facade.write('session-a', { status: 'active' })).resolves.toMatchObject({
       kind: 'written',
+      lease: { sessionKey: 'session-a', ownerId: 'facade-boot-1', epoch: 1 },
       record: { revision: 1 },
       coalescedCount: 1,
     });
@@ -154,6 +155,49 @@ describe('durable session facade', () => {
     await expect(third).resolves.toMatchObject({ kind: 'written', coalescedCount: 2 });
     expect(store.writeSession).toHaveBeenCalledTimes(2);
     expect(records.get('session-a')).toMatchObject({ revision: 2, value: { order: 3 } });
+    await facade.stop();
+  });
+
+  it('preserves every exact admission write in FIFO order and returns its lease proof', async () => {
+    const { store, records } = fakeStore();
+    const firstAcquire = deferred<SessionLeaseAcquisition>();
+    const defaultAcquire = store.acquireSessionLease.getMockImplementation();
+    vi.mocked(store.acquireSessionLease)
+      .mockImplementationOnce(() => firstAcquire.promise)
+      .mockImplementation(defaultAcquire!);
+    const facade = createDurableSessionFacade({ store, ownerId: 'facade-exact-boot' });
+
+    const first = facade.writeExact('session-a', { event: 1 });
+    const second = facade.writeExact('session-a', { event: 2 });
+    const third = facade.writeExact('session-a', { event: 3 });
+    firstAcquire.resolve({
+      kind: 'acquired',
+      lease: {
+        sessionKey: 'session-a',
+        ownerId: 'facade-exact-boot',
+        epoch: 1,
+        leaseUntil: 60_000,
+      },
+    });
+
+    await expect(first).resolves.toMatchObject({
+      kind: 'written',
+      lease: { epoch: 1 },
+      record: { revision: 1, value: { event: 1 } },
+      coalescedCount: 1,
+    });
+    await expect(second).resolves.toMatchObject({
+      kind: 'written',
+      record: { revision: 2, value: { event: 2 } },
+      coalescedCount: 1,
+    });
+    await expect(third).resolves.toMatchObject({
+      kind: 'written',
+      record: { revision: 3, value: { event: 3 } },
+      coalescedCount: 1,
+    });
+    expect(store.writeSession).toHaveBeenCalledTimes(3);
+    expect(records.get('session-a')).toMatchObject({ revision: 3, value: { event: 3 } });
     await facade.stop();
   });
 
@@ -309,5 +353,15 @@ describe('durable session facade', () => {
       epoch: 1,
       leaseUntil: 60_000,
     });
+  });
+
+  it('validates the stop budget before closing admission', async () => {
+    const { store } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'facade-stop-validation' });
+
+    expect(() => facade.stop(-1)).toThrow(/timeoutMs/);
+    await expect(facade.writeExact('session-a', { still: 'accepted' }))
+      .resolves.toMatchObject({ kind: 'written', record: { revision: 1 } });
+    await facade.stop();
   });
 });
