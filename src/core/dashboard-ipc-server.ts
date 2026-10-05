@@ -13,6 +13,7 @@ import { readFileSync, unlinkSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { logger } from '../utils/logger.js';
+import type { DurableLarkOutboxTarget } from '../services/durable-lark-outbox.js';
 import { cliAuthBind, loadDashboardSecret, verifyHmac } from '../dashboard/auth.js';
 import { UnsafeHostAuthorityFileError } from '../platform/secure-host-file.js';
 import { WORKFLOW_DAEMON_IPC_ROUTE_PREFIX } from '../workflows/v3/daemon-ipc-auth.js';
@@ -310,6 +311,30 @@ export function setCrossPrincipalInterruptionDisableHandler(
   handler: (() => number | Promise<number>) | null,
 ): void {
   crossPrincipalInterruptionDisableHandler = handler;
+}
+
+export interface DurableSessionSendRequest {
+  daemonSession: DaemonSession;
+  turnId: string;
+  target: DurableLarkOutboxTarget;
+  content: string;
+  msgType: string;
+  providerUuid: string;
+  hookContext?: Record<string, unknown>;
+}
+
+export type DurableSessionSendResult =
+  | { kind: 'delivered'; messageId: string }
+  | { kind: 'ambiguous'; error: string };
+
+let durableSessionSendHandler: ((
+  request: DurableSessionSendRequest,
+) => Promise<DurableSessionSendResult>) | null = null;
+
+export function setDurableSessionSendHandler(
+  handler: ((request: DurableSessionSendRequest) => Promise<DurableSessionSendResult>) | null,
+): void {
+  durableSessionSendHandler = handler;
 }
 import {
   composeRowFromActive,
@@ -856,7 +881,7 @@ function routeHasNarrowUntrustedAuth(method: string, pathname: string): boolean 
   // 该会话的 rotating per-turn
   // capability 并绑定到 URL 里的 sessionId（同 /api/asks 姿势）——capability 只
   // 证明「我是这个会话当前这一轮的 CLI」，选不了别的会话。
-  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|rename|project|project-dispatch-policy|continuation|auth-request|auth-status)$/.test(pathname)) return true;
+  if (method === 'POST' && /^\/api\/sessions\/[^/]+\/(?:slash|cd|close|preview|chat-rename|rename|project|project-dispatch-policy|continuation|durable-send|auth-request|auth-status)$/.test(pathname)) return true;
   // UserPromptSubmit hook 的 envelope claim：沙箱内 hook 读不到 host secret，
   // 走 body 里的 per-turn capability；handler 内 sessionCliIpcAuth 绑定到 URL 的
   // sessionId + 按 managedTurnOrigin.turnId 权威取（同 /close 姿势）。
@@ -1444,6 +1469,53 @@ ipcRoute('GET', '/api/sessions/:sessionId/usage', (_req, res, params) => {
   const ds = findActiveBySessionId(params.sessionId);
   if (!ds) return jsonRes(res, 404, { error: 'not_found' });
   jsonRes(res, 200, { usage: getDaemonReplyCardUsageSnapshot(ds) });
+});
+
+/** Session-bound single-message delivery through the primary durable outbox.
+ * The short-lived CLI never receives store credentials or a lease proof. */
+ipcRoute('POST', '/api/sessions/:sessionId/durable-send', async (req, res, params) => {
+  const body = await readJsonBody<Record<string, unknown>>(req)
+    .catch(() => undefined);
+  if (!body) return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  const ds = findActiveBySessionId(params.sessionId);
+  const auth = sessionCliIpcAuth(req, ds, params.sessionId, body);
+  if (!auth.ok) return jsonRes(res, 403, { ok: false, error: auth.error });
+  if (!ds || ds.session.status === 'closed') {
+    return jsonRes(res, 404, { ok: false, error: 'session_not_active' });
+  }
+  if (!durableSessionSendHandler) {
+    return jsonRes(res, 409, { ok: false, error: 'durable_primary_unavailable' });
+  }
+  const target = body.target;
+  const hookContext = body.hookContext;
+  if (typeof body.turnId !== 'string'
+      || typeof body.content !== 'string'
+      || typeof body.msgType !== 'string'
+      || typeof body.providerUuid !== 'string'
+      || !target || typeof target !== 'object' || Array.isArray(target)
+      || (hookContext !== undefined
+        && (!hookContext || typeof hookContext !== 'object' || Array.isArray(hookContext)))) {
+    return jsonRes(res, 400, { ok: false, error: 'invalid_durable_send' });
+  }
+  try {
+    const result = await durableSessionSendHandler({
+      daemonSession: ds,
+      turnId: body.turnId,
+      target: target as DurableLarkOutboxTarget,
+      content: body.content,
+      msgType: body.msgType,
+      providerUuid: body.providerUuid,
+      ...(hookContext === undefined ? {} : { hookContext: hookContext as Record<string, unknown> }),
+    });
+    return result.kind === 'delivered'
+      ? jsonRes(res, 200, { ok: true, ...result })
+      : jsonRes(res, 409, { ok: false, ...result });
+  } catch (error) {
+    return jsonRes(res, 409, {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 });
 
 /** Canonical daemon-side close used by the dashboard and `botmux delete`.

@@ -164,6 +164,7 @@ import {
   PM2_DAEMON_RESTART_DELAY_MS,
 } from './core/shutdown-budgets.js';
 import { describeSendFailure, dispatchPrimaryMessage, findStdinAliasAttachment, normalizeInteractiveCardInput, sendFileAttachments, sendVideoAttachments, shouldSendAsPureVideo, validateSlashSend, validateVideoAttachments } from './cli/send-dispatch.js';
+import { dispatchDurableSessionMessage } from './cli/durable-session-send.js';
 import { buildCardPatchSuccessOutput, CARD_COMMAND_USAGE, CARD_PATCH_USAGE, cardPatchArgsWantHelp, executeCardPatch, parseCardPatchArgs, readCardPatchInput } from './cli/card-dispatch.js';
 import {
   buildCardStreamSuccessOutput,
@@ -5626,7 +5627,7 @@ async function cmdSuspend(): Promise<void> {
 async function postSessionCliIpc(
   ipcPort: number,
   sessionId: string,
-  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation',
+  route: 'slash' | 'cd' | 'close' | 'preview' | 'chat-rename' | 'rename' | 'project' | 'continuation' | 'durable-send',
   payload: Record<string, unknown>,
 ): Promise<Response> {
   const requestBody: Record<string, unknown> = { ...payload };
@@ -9729,6 +9730,22 @@ async function cmdSend(rest: string[]): Promise<void> {
     console.error(`botmux send refused for a managed VC turn: ${managedControlError}`);
     process.exit(2);
   }
+  const durableCoordinationPrimary = process.env.BOTMUX_COORDINATION_MODE === 'primary';
+  if (durableCoordinationPrimary && (
+    asVoice
+    || images.length > 0
+    || files.length > 0
+    || videoAttachments.length > 0
+    || attention.requested
+    || urgent.requested
+    || !!vcMeetingManagedSendOrigin
+  )) {
+    console.error(
+      'botmux send: durable primary 当前只支持单条文本/卡片消息；'
+      + '语音、附件、attention、urgent 和 managed VC 输出尚未接入 durable outbox',
+    );
+    process.exit(2);
+  }
   if (customCardRequested && asVoice) {
     console.error('botmux send: --card-file/--card-json 不能与 --voice 混用');
     process.exit(2);
@@ -11282,6 +11299,57 @@ async function cmdSend(rest: string[]): Promise<void> {
       throw new Error(`VC listener assistant reply refused (${prepared.reason}): ${prepared.detail}`);
     }
     const canonicalOutput = prepared?.canonicalOutput ?? proposedOutput;
+    if (durableCoordinationPrimary) {
+      if (!currentTurnId) {
+        throw new Error('durable primary send requires a bound current turn');
+      }
+      if (prepared) {
+        throw new Error('durable primary send does not yet support managed listener output');
+      }
+      if (deferredBinding && !deferredRoot) {
+        throw new Error('durable primary send cannot materialize a deferred topic root yet');
+      }
+      const durableTarget = canonicalOutput.quoteTargetId
+        ? {
+            kind: 'reply' as const,
+            messageId: canonicalOutput.quoteTargetId,
+            replyInThread: false,
+          }
+        : deferredRoot
+          ? { kind: 'reply' as const, messageId: deferredRoot, replyInThread: true }
+          : sendTarget.mode === 'plain'
+            ? { kind: 'send' as const, chatId: canonicalOutput.targetChatId }
+            : {
+                kind: 'reply' as const,
+                messageId: sendTarget.rootMessageId,
+                replyInThread: sendTarget.mode === 'thread',
+              };
+      const durableIpcPort = resolveDaemonIpcPort(
+        undefined,
+        process.env.BOTMUX_DAEMON_IPC_PORT,
+      );
+      if (!durableIpcPort) {
+        throw new Error('durable primary send requires the owning daemon IPC port');
+      }
+      const messageId = await dispatchDurableSessionMessage({
+        post: (sessionId, route, payload) => postSessionCliIpc(
+          durableIpcPort,
+          sessionId,
+          route,
+          payload,
+        ),
+      }, {
+        sessionId: sid,
+        turnId: currentTurnId,
+        target: durableTarget,
+        content: canonicalOutput.content,
+        msgType: canonicalOutput.msgType,
+        providerUuid: uuid ?? `dms_${randomUUID().replace(/-/g, '')}`,
+        hookContext,
+      });
+      primaryQuotedId = canonicalOutput.quoteTargetId ?? null;
+      return messageId;
+    }
     if (prepared?.outputMismatch) {
       console.error(
         `⚠️ VC listener reply output_mismatch action=${prepared.ref.actionId} `
@@ -11830,7 +11898,8 @@ async function cmdSend(rest: string[]): Promise<void> {
       // relay). Match the daemon's sandbox exclusion instead of reviving it.
       const replyCardSandboxed = s.sandbox === true || s.sandbox === 'oncall' || s.sandbox === 'scratch' || process.env.BOTMUX_READ_ISOLATION === '1'
         || process.env.BOTMUX_SANDBOX === '1';
-      const canUseReplyCard = replyKey && !privateReplyEnabled(s) && !replyCardSandboxed && !sendTopLevel && !overrideChatId && !sendInto
+      const canUseReplyCard = replyKey && !durableCoordinationPrimary
+        && !privateReplyEnabled(s) && !replyCardSandboxed && !sendTopLevel && !overrideChatId && !sendInto
         && !vcMeetingManagedSendOrigin && !attention.requested && !explicitQuote && !noQuote
         && effectiveResponseKind !== 'auxiliary' && onlyRequesterMentions && !containsLarkAtTag(text)
         && (effectiveResponseKind === 'final' || (imageKeys.length === 0 && files.length === 0 && videoAttachments.length === 0));

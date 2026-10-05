@@ -5,7 +5,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, setExactChatGrantHandler, setCrossPrincipalInterruptionDisableHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, __testOnly_resetManagedOriginRuntimeAuthState, __testOnly_setNativeSubagentRuntimeNonceStore, type IpcServerHandle,
+import { ipcRoute, startIpcServer, setLarkAppId, setIpcAuthSecret, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, setExactChatGrantHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionSendHandler, armCoreOnlyReadinessGate, setCoreOnlyReady, __testOnly_resetCoreOnlyReadiness, __testOnly_resetManagedOriginRuntimeAuthState, __testOnly_setNativeSubagentRuntimeNonceStore, type IpcServerHandle,
   __testOnly_agentSwitchBeforePreCloseVerify,
 } from '../src/core/dashboard-ipc-server.js';
 import { rmwBotEntry } from '../src/services/config-store.js';
@@ -201,6 +201,7 @@ afterEach(async () => {
   resetAskBrokerForTest();
   setExactChatGrantHandler(null);
   setCrossPrincipalInterruptionDisableHandler(null);
+  setDurableSessionSendHandler(null);
   clearMessageListenerRunPreviewStore();
 });
 
@@ -4081,6 +4082,94 @@ describe('POST /api/sessions/:sessionId/close', () => {
     expect(res.status).toBe(200);
     const body = await res.json();
     expect(body.ok).toBe(true);
+  });
+});
+
+describe('POST /api/sessions/:sessionId/durable-send', () => {
+  it('authenticates the Session and returns only the daemon-settled message id', async () => {
+    const active = {
+      session: {
+        sessionId: 'session-durable-send',
+        rootMessageId: 'om_root',
+        chatId: 'oc_chat',
+        scope: 'thread',
+        title: 'fixture',
+        status: 'active',
+        createdAt: Date.now(),
+        larkAppId: 'cli_test',
+      },
+      larkAppId: 'cli_test',
+      chatId: 'oc_chat',
+      chatType: 'group',
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
+    const deliver = vi.fn(async () => ({ kind: 'delivered' as const, messageId: 'om_outbox' }));
+    setDurableSessionSendHandler(deliver);
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const path = '/api/sessions/session-durable-send/durable-send';
+      const payload = {
+        turnId: 'om_turn',
+        target: { kind: 'reply', messageId: 'om_root', replyInThread: true },
+        content: '{"schema":"2.0"}',
+        msgType: 'interactive',
+        providerUuid: 'bts_fixture',
+        hookContext: { sessionId: 'session-durable-send' },
+      };
+      const response = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...trustedHostHeaders('POST', path, handle.port),
+        },
+        body: JSON.stringify(payload),
+      });
+
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({
+        ok: true,
+        kind: 'delivered',
+        messageId: 'om_outbox',
+      });
+      expect(deliver).toHaveBeenCalledWith({
+        daemonSession: active,
+        ...payload,
+      });
+    } finally {
+      findSpy.mockRestore();
+    }
+  });
+
+  it('fails closed when the durable handler is unavailable', async () => {
+    const active = {
+      session: { sessionId: 'session-durable-send', status: 'active' },
+    } as any;
+    const findSpy = vi.spyOn(workerPool, 'findActiveBySessionId').mockReturnValue(active);
+    setIpcAuthSecret(TEST_IPC_SECRET);
+    try {
+      handle = await startIpcServer({ port: 0, host: '127.0.0.1', authRequired: true });
+      const path = '/api/sessions/session-durable-send/durable-send';
+      const response = await fetch(`http://127.0.0.1:${handle.port}${path}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...trustedHostHeaders('POST', path, handle.port),
+        },
+        body: JSON.stringify({
+          turnId: 'om_turn',
+          target: { kind: 'reply', messageId: 'om_root', replyInThread: true },
+          content: 'hello',
+          msgType: 'text',
+          providerUuid: 'bts_fixture',
+        }),
+      });
+
+      expect(response.status).toBe(409);
+      expect(await response.json()).toEqual({ ok: false, error: 'durable_primary_unavailable' });
+    } finally {
+      findSpy.mockRestore();
+    }
   });
 });
 

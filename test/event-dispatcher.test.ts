@@ -1154,7 +1154,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime.close();
   });
 
-  it('fails closed on sessionless commands before replying or completing the claim', async () => {
+  it('suppresses sessionless commands before replying and safely completes the claim', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
     mockGetChatMode.mockResolvedValue('group');
     mockReplyMessage.mockClear();
@@ -1169,8 +1169,10 @@ describe('Lark event dispatcher — durable primary processor', () => {
       mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
     });
 
-    await expect(processPrimary(runtime, data, 'msg-primary-command'))
-      .rejects.toThrow('durable primary does not yet support sessionless commands');
+    await expect(processPrimary(runtime, data, 'msg-primary-command')).resolves.toEqual({
+      kind: 'ignored',
+      reason: 'durable primary suppressed unsupported sessionless commands',
+    });
     expect(mockReplyMessage).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();

@@ -62,6 +62,16 @@ describe('per-bot environment policy', () => {
     expect(env.BOTMUX_GOAL_PATH === '/test/goal').toBe(true);
     expect(env.BOTMUX_WORKFLOW === '1').toBe(true);
   });
+  it('carries the durable primary classification and owning daemon port through strict mode', () => {
+    const worker = buildBotWorkerEnv({
+      BOTMUX_COORDINATION_MODE: 'primary',
+      BOTMUX_DAEMON_IPC_PORT: '7951',
+    }, strict);
+    const child = buildSessionChildEnv(worker, strict);
+    expect(worker.BOTMUX_COORDINATION_MODE).toBe('primary');
+    expect(child.BOTMUX_COORDINATION_MODE).toBe('primary');
+    expect(child.BOTMUX_DAEMON_IPC_PORT).toBe('7951');
+  });
   it.each([null, [], 'strict', { mode: 'strcit' }, { mode: 'strict', inherit: ['*'] }, { mode: 'strict', inherit: ['KEY=value-sentinel'] }, { mode: 'strict', inherit: ['BOTMUX_OWNER_OPEN_ID'] }, { mode: 'strict', inherit: ['CODEX_HOME'] }, { mode: 'strict', inherit: ['GH_TOKEN'] }, { mode: 'strict', extra: 'secret-sentinel' }, { mode: 'inherit', inherit: ['AUTH'] }].map(raw => ({ raw })))('rejects invalid policies without echoing user input (%#)', ({ raw }) => {
     let error = '';
     try { normalizeEnvPolicy(raw); } catch (e) { error = String(e); }

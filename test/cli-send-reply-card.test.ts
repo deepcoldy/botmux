@@ -105,4 +105,110 @@ describe('real CLI send into a running reply card', () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 35_000);
+
+  it('routes a primary-mode final through daemon durable IPC without direct Lark delivery or card PATCH', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-send-durable-'));
+    const dataDir = join(root, 'data');
+    try {
+      mkdirSync(join(dataDir, '.botmux-cli-pids'), { recursive: true });
+      writeFileSync(join(dataDir, '.botmux-cli-pids', String(process.pid)), JSON.stringify({
+        sessionId: key.sessionId,
+        turnId: key.turnId,
+      }));
+      writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+        larkAppId: key.larkAppId,
+        larkAppSecret: 'test-secret',
+        cliId: 'claude-code',
+        replyCardMode: 'unified',
+      }]));
+      seedPersistedSessionRows(dataDir, key.larkAppId, { [key.sessionId]: {
+        ...key,
+        status: 'active',
+        cliId: 'claude-code',
+        chatId: 'oc_test',
+        rootMessageId: 'om_root',
+        scope: 'thread',
+        chatType: 'group',
+        workingDir: root,
+        replyTargets: { [key.turnId]: {
+          updatedAt: new Date().toISOString(),
+          senderOpenId: 'ou_requester',
+          participants: [{ openId: 'ou_requester', isBot: false }],
+        } },
+        turnReplyContexts: { [key.turnId]: {
+          target: { mode: 'thread', rootMessageId: 'om_root' },
+          replyTargetSenderOpenId: 'ou_requester',
+          replyTargetSenderIsBot: false,
+        } },
+      } });
+
+      const result = spawnSyncTsScript(fixture, [
+        'send', '--no-mention', '--response-kind', 'final', 'Durable final',
+      ], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        env: {
+          PATH: process.env.PATH,
+          HOME: root,
+          SESSION_DATA_DIR: dataDir,
+          BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: key.sessionId,
+          BOTMUX_TURN_ID: key.turnId,
+          BOTMUX_LARK_APP_ID: key.larkAppId,
+          BOTMUX_COORDINATION_MODE: 'primary',
+          BOTMUX_DAEMON_IPC_PORT: '7951',
+          BOTMUX_TEST_DURABLE_SEND: '1',
+        },
+        encoding: 'utf8',
+        timeout: 30_000,
+      });
+
+      expect(result.status, String(result.stderr)).toBe(0);
+      expect(String(result.stdout)).not.toContain('CAPTURE_REPLY=');
+      const requests = String(result.stdout).split('\n')
+        .filter(line => line.startsWith('CAPTURE_DURABLE='))
+        .map(line => JSON.parse(line.slice('CAPTURE_DURABLE='.length)));
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).toMatchObject({
+        method: 'POST',
+        path: `/api/sessions/${key.sessionId}/durable-send`,
+        body: {
+          turnId: key.turnId,
+          target: { kind: 'reply', messageId: 'om_root', replyInThread: true },
+          msgType: 'interactive',
+          providerUuid: expect.stringMatching(/^bts_/),
+        },
+      });
+      expect(requests[0].body.content).toContain('Durable final');
+      expect(String(result.stdout)).toContain('"messageId":"om_durable_message"');
+
+      const attachment = join(root, 'attachment.txt');
+      writeFileSync(attachment, 'must not upload');
+      const blocked = spawnSyncTsScript(fixture, [
+        'send', '--no-mention', '--response-kind', 'auxiliary', '--files', attachment,
+        'Unsupported multi-effect send',
+      ], {
+        cwd: fileURLToPath(new URL('..', import.meta.url)),
+        env: {
+          PATH: process.env.PATH,
+          HOME: root,
+          SESSION_DATA_DIR: dataDir,
+          BOTS_CONFIG: join(root, 'bots.json'),
+          BOTMUX_SESSION_ID: key.sessionId,
+          BOTMUX_TURN_ID: key.turnId,
+          BOTMUX_LARK_APP_ID: key.larkAppId,
+          BOTMUX_COORDINATION_MODE: 'primary',
+          BOTMUX_DAEMON_IPC_PORT: '7951',
+          BOTMUX_TEST_DURABLE_SEND: '1',
+        },
+        encoding: 'utf8',
+        timeout: 30_000,
+      });
+      expect(blocked.status).toBe(2);
+      expect(String(blocked.stderr)).toContain('durable primary 当前只支持单条文本/卡片消息');
+      expect(String(blocked.stdout)).not.toContain('CAPTURE_DURABLE=');
+      expect(String(blocked.stdout)).not.toContain('CAPTURE_REPLY=');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 35_000);
 });

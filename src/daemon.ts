@@ -325,7 +325,7 @@ import {
   allFinalOutputDeliveryCount,
   snapshotAllFinalOutputDeliveries,
 } from './core/final-output-delivery-drain.js';
-import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler } from './core/dashboard-ipc-server.js';
+import { AbortDeadlineError, hasExactSafeJsonKeys, ipcRoute, isTrustedHostIpcRequest, JsonBodyTooLargeError, jsonRes, readJsonBody, runWithAbortDeadline, setBotName, setLarkAppId, startIpcServer, setBotRenamer, setBotAvatarChanger, setBotDescriptionManager, armCoreOnlyReadinessGate, setCoreOnlyReady, setSupervisorShutdownHandler, setCrossPrincipalInterruptionDisableHandler, setDurableSessionSendHandler, type DurableSessionSendRequest, type DurableSessionSendResult } from './core/dashboard-ipc-server.js';
 import { setDeviceIsolationDaemonIdentity } from './core/device-isolation-daemon.js';
 import { currentDeviceIsolationFreezeLease } from './core/device-isolation-activation.js';
 import { reconcileContainmentHandlesOnBoot } from './core/mojo-containment.js';
@@ -27686,12 +27686,14 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   installDaemonRejectionGuard(logger);
 
   // Optional provider-neutral coordination process. `shadow` proves the
-  // configured provider speaks the public contract and keeps its connection
-  // alive for later staged wiring; it does not replace the SQLite Session path.
-  // `primary` remains fail-closed in the runtime factory until inbox, Session
-  // facade and outbox pump are all wired, so a deployment cannot accidentally
-  // scale two independent SQLite owners by setting one premature flag.
-  const durableCoordinationRuntime = await initializeDurableCoordinationRuntime();
+  // configured provider speaks the public contract without replacing the live
+  // route. `primary` is explicitly admitted only here, where ingress,
+  // canonical Session admission, CLI/bridge output and the outbox pump are
+  // assembled under one shutdown boundary.
+  const durableCoordinationRuntime = await initializeDurableCoordinationRuntime(
+    process.env,
+    { allowPrimary: true },
+  );
   const durablePrimaryRuntimes: DurableLarkPrimaryRuntime[] = [];
   const durablePrimaryRuntimeByApp = new Map<string, DurableLarkPrimaryRuntime>();
   const durableSessionFacade = durableCoordinationRuntime?.mode === 'shadow'
@@ -29224,7 +29226,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
 
   for (const startDispatcher of startEventDispatchers) startDispatcher();
   if (durableCoordinationRuntime?.mode === 'primary') {
-    setDurableBridgeFinalOutputHandler(async request => {
+    const deliverDurablePrimaryMessage = async (
+      request: DurableSessionSendRequest,
+    ): Promise<DurableSessionSendResult> => {
       const runtime = durablePrimaryRuntimeByApp.get(request.daemonSession.larkAppId);
       if (!runtime) throw new Error('durable primary output runtime is unavailable');
       const canonicalKey = sessionKey(
@@ -29247,10 +29251,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         content: request.content,
         msgType: request.msgType,
         providerUuid: request.providerUuid,
-        hookContext: {
-          sessionId: request.daemonSession.session.sessionId,
-          turnId: request.turnId,
-        },
+        hookContext: request.hookContext,
       });
       const output = await enqueueDurableLarkFinalOutput({
         daemonSession: request.daemonSession,
@@ -29283,10 +29284,19 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       if (typeof providerMessageId !== 'string' || !providerMessageId.startsWith('om_')) {
         return { kind: 'ambiguous', error: 'delivered outbox receipt lacks provider message id' };
       }
-      return { kind: 'delivered', messageId: providerMessageId };
-    });
+      return { kind: 'delivered' as const, messageId: providerMessageId };
+    };
+    setDurableBridgeFinalOutputHandler(request => deliverDurablePrimaryMessage({
+      ...request,
+      hookContext: {
+        sessionId: request.daemonSession.session.sessionId,
+        turnId: request.turnId,
+      },
+    }));
+    setDurableSessionSendHandler(deliverDurablePrimaryMessage);
   } else {
     setDurableBridgeFinalOutputHandler(undefined);
+    setDurableSessionSendHandler(null);
   }
   xpiSessionStoreBusyNoticeReadyApps.add(cfg.larkAppId);
   // The restore preflight only records structured diagnostics. Human-readable
@@ -30137,6 +30147,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       }
     }
     setDurableBridgeFinalOutputHandler(undefined);
+    setDurableSessionSendHandler(null);
     await durableInboxShadowConsumer?.stop(remainingBudget());
     const durableSessionStop = await durableSessionFacade?.stop(remainingBudget());
     if (durableSessionStop?.kind === 'timed_out') {
@@ -30207,6 +30218,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(docCommentPollTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
     setDurableBridgeFinalOutputHandler(undefined);
+    setDurableSessionSendHandler(null);
     for (const runtime of durablePrimaryRuntimes) runtime.terminate();
     durableInboxShadowConsumer?.terminate();
     durableSessionFacade?.terminate();

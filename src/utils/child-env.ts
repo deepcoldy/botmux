@@ -431,6 +431,10 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // session-scoped, capability-gated routes (v3 workflow relay, vc-agent).
   // A port marker, not a credential — every route authenticates independently.
   'BOTMUX_DAEMON_IPC_PORT',
+  // Deployment-wide coordination mode. In primary mode the in-session CLI
+  // must route botmux send through the owning daemon instead of calling the
+  // provider directly. This is classification only; IPC auth remains required.
+  'BOTMUX_COORDINATION_MODE',
   // Fail-closed classification hint for macOS read isolation. This is never
   // authority; cmdSend also checks the host-owned marker + live challenge.
   'BOTMUX_READ_ISOLATED',

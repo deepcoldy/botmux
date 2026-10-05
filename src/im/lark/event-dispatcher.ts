@@ -4023,9 +4023,12 @@ export function createLarkEventDispatcherRuntime(
     return { kind: 'admitted', session };
   };
 
-  const unsupportedPrimarySideEffect = (feature: string): never => {
-    throw new Error(`durable primary does not yet support ${feature}`);
-  };
+  const ignoredUnsupportedPrimarySideEffect = (
+    feature: string,
+  ): DurableLarkCanonicalHandlerResult => ({
+    kind: 'ignored',
+    reason: `durable primary suppressed unsupported ${feature}`,
+  });
 
   const isUnsupportedPrimarySessionlessCommand = (
     message: any,
@@ -4122,7 +4125,7 @@ export function createLarkEventDispatcherRuntime(
           } catch {
             return;
           }
-          if (primary) unsupportedPrimarySideEffect('self-sent /close events');
+          if (primary) return ignoredUnsupportedPrimarySideEffect('self-sent /close events');
           const ctx = await decideRouting(larkAppId, message);
           const routedCtx = { ...ctx, chatId, messageId, chatType, larkAppId };
           // Serialize per anchor so back-to-back messages to the same thread
@@ -4161,7 +4164,7 @@ export function createLarkEventDispatcherRuntime(
               isBotMentioned(larkAppId, message, undefined) &&
               !hallEchoReplied.has(`${larkAppId}::${senderOpenId}`)
             ) {
-              if (primary) unsupportedPrimarySideEffect('platform hall echo replies');
+              if (primary) return ignoredUnsupportedPrimarySideEffect('platform hall echo replies');
               hallEchoReplied.add(`${larkAppId}::${senderOpenId}`);
               void sendMessage(larkAppId, chatId, `<at user_id="${senderOpenId}"></at> 已登记`, 'text')
                 .then(() => logger.info(`[${larkAppId}] hall echo reply sent to ${senderOpenId.substring(0, 12)}`))
@@ -4277,7 +4280,7 @@ export function createLarkEventDispatcherRuntime(
               if (!seedBotTalk.allowed) {
                 // 黑名单 bot 静默吞掉：不自动开工、不发授权卡、不做 sibling 自愈。
                 if (seedBotTalk.reason === 'blocked') return;
-                if (primary) unsupportedPrimarySideEffect('grant request cards');
+                if (primary) return ignoredUnsupportedPrimarySideEffect('grant request cards');
                 logger.info(
                   `[auto-start:新话题] ${chatId.substring(0, 12)} 其他机器人开新话题但未授权（restricted）→ 发授权卡不自动开工 ` +
                   `msg=${messageId.substring(0, 12)} sender=${senderOpenId?.substring(0, 12) ?? '-'}`,
@@ -4384,7 +4387,7 @@ export function createLarkEventDispatcherRuntime(
             logger.info(`Lazy sibling cross-ref backfill: ${sibling.botName} → ${senderOpenId?.substring(0, 12)} (was cold; skipping /grant)`);
           } else {
             logger.info(`Foreign bot @mention not a known sibling (${sibling.reason}); sending grant request card`);
-            if (primary) unsupportedPrimarySideEffect('grant request cards');
+            if (primary) return ignoredUnsupportedPrimarySideEffect('grant request cards');
             await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data);
             return;
           }
@@ -4410,7 +4413,7 @@ export function createLarkEventDispatcherRuntime(
       // 人的 union_id：平台团队成员 talk-免grant 腿（isPlatformTeamMember）要用。
       const humanSenderUnionId = sender?.sender_id?.union_id as string | undefined;
       if (primary && isUnsupportedPrimarySessionlessCommand(message, senderOpenId)) {
-        unsupportedPrimarySideEffect('sessionless commands');
+        return ignoredUnsupportedPrimarySideEffect('sessionless commands');
       }
       // defaultOncall 自动绑定必须在 canTalk 权限判断前完成，否则已开 defaultOncall
       // 的群首次 @bot 时 oncallChats 中还没有该 chat → evaluateTalk 判无权限 → 误弹
@@ -4949,7 +4952,7 @@ export function createLarkEventDispatcherRuntime(
           if (access === 'not_allowed') {
             // 入口 A：无权限者 @bot → 弹授权申请卡（@owner），代替「无操作权限」。
             // 覆盖 ownsSession 真假两种情况，但绝不把该消息喂进已有 session。
-            if (primary) unsupportedPrimarySideEffect('grant request cards');
+            if (primary) return ignoredUnsupportedPrimarySideEffect('grant request cards');
             await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data);
             logger.debug(`Ignoring group message from non-allowed user: ${senderOpenId} (grant request card path)`);
             return;
@@ -4990,7 +4993,7 @@ export function createLarkEventDispatcherRuntime(
         // 才把申请卡转投 owner 自己的私聊（owner 维度节流），申请人只收到一句中性回执，
         // 授权后重放这条消息；blocked / autoGrantRequestCards=false / 节流中仍静默。
         if (getBot(larkAppId).config.grantRequestToOwnerDm === true) {
-          if (primary) unsupportedPrimarySideEffect('grant request cards');
+          if (primary) return ignoredUnsupportedPrimarySideEffect('grant request cards');
           await maybeSendGrantRequestCard(larkAppId, message, chatId, senderOpenId, data);
           return;
         }

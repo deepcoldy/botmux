@@ -97,7 +97,7 @@ outbox: pending ──reserve──> reserved ──begin──> attempting ─�
 - 不改变现有单 daemon 默认配置。
 - 不增加具体远程数据库依赖、连接信息或部署语义。
 
-后续接入按小步完成：当前 `shadow` 已在 ACK 后镜像 `im.message.receive_v1` 到 durable inbox，并由无用户可见副作用的 shadow consumer 完成 claim、身份校验和 complete；现有 SQLite 路径仍负责真实处理。异步 `DurableSessionFacade` 也已接入普通飞书新会话的成功提交点，但只镜像审计后的最小 projection，不接管同步 Session API。provider-neutral primary consumer、durable outbox pump、Lark payload/receipt adapter，以及 App 级 primary ingress leader/ACK 前 enqueue 状态机均已实现，但都尚未组成 daemon 的真实 primary 路径。每一步都必须保留关闭开关和现有 SQLite 行为回归。
+后续接入按小步完成：`shadow` 在 ACK 后镜像 `im.message.receive_v1` 到 durable inbox，并由无用户可见副作用的 shadow consumer 完成 claim、身份校验和 complete；现有 SQLite 路径仍负责真实处理。`primary` 则把 provider-neutral consumer、durable outbox pump、Lark payload/receipt adapter，以及 App 级 ingress leader/ACK 前 enqueue 状态机组成 daemon 的真实路径。默认仍为 `disabled`，disabled/shadow 的现有行为保持回归覆盖。
 
 Session shadow projection 只包含版本、稳定 `sessionId`、应用与路由 anchor、scope、active/closed 生命周期和时间戳。标题、prompt、owner、工作目录、附件、token、CLI/provider lineage 与终端状态都不复制；这些字段在形成明确的多副本合同前仍只属于现有 Session store。Facade 按 stable session key 顺序化并合并排队更新，执行 `acquire lease → read revision → CAS write`，显式返回 occupied、conflict 和 stale lease。不同 key 可并行；优雅退出有界等待并释放本 boot 持有的 lease。
 
@@ -105,21 +105,21 @@ Primary admission 不能复用 shadow 的 last-write-wins 合并：两个 inbox 
 
 `DurablePrimarySessionProjection` 保存现有 Session store 的完整持久 `Session` JSON 和当前 admission identity。它不新增 runtime-only worker token 或进程对象；内容边界等同现有 Session row。每次 canonical admission 先用 `writeExact` 提交完整 snapshot，再从该次返回的 lease epoch 与 record revision 构造 `DurableLarkAdmissionReceipt`。restore parser 会重算 Session routing key，并校验 event/app/partition/message identity；损坏或错路由 snapshot fail closed。
 
-第一版挂接范围刻意只覆盖普通飞书新会话在 SQLite 更新和 `activeSessions` 注册都成功之后的 shadow 写入。竞态失败的 scratch Session、全量 `persistRow`、多行事务、恢复、关闭和批量 lineage 写入尚未挂接；因此这一版不能用作完整 Session 事实源，也不能解除 `primary` 门禁。
+Shadow projection 刻意只覆盖普通飞书新会话在 SQLite 更新和 `activeSessions` 注册都成功之后的审计写入。竞态失败的 scratch Session、全量 `persistRow`、多行事务、恢复、关闭和批量 lineage 写入不属于这个最小 projection；因此 shadow 本身不能用作完整 Session 事实源。Primary 不复用该 projection，而是每次 admission/output 写入完整持久 Session snapshot。
 
 Primary consumer 的 dispatch callback 必须返回 `committed` 或带有有界原因的 `ignored`。`committed` 不再接受裸状态词，必须携带版本化 `DurableLarkAdmissionReceipt`：它把 inbox 的 `eventId`、`partitionKey` 和 App identity 绑定到 durable store 返回的 Session key、lease epoch、record revision 与 store timestamp。consumer 会在 complete inbox claim 前重新校验全部字段；复制自另一事件的 receipt、缺失 epoch/revision 的伪回执，以及只把任务追加到进程内 Promise queue 的 `{ kind: 'committed' }` 都进入 retry，不能冒充 durable admission。
 
 `DurableLarkCanonicalDispatch` 把 consumer callback 与 canonical handler 的返回值收敛成同一边界：handler 必须显式返回 `admitted + Session snapshot` 或 `ignored + bounded reason`。admitted 路径通过 full Session exact admission 后才返回 committed receipt；ignored 不写 Session。claim 已 abort、handler 返回 queued/未知结果、Session occupied/conflict/stale 或 provider error 全部抛错给 consumer retry，不能降级成内存接纳。
 
-这份 receipt 只证明 canonical Session mutation 已在 fenced owner 下提交，不代表整轮执行完成，也不保存 owner id、prompt、用户身份或 provider 凭据。未来 daemon handler 必须从实际 Session lease 与 CAS write 返回值构造它；当前 live route 尚未接入。长 dispatch 会续租 inbox claim；续租 stale 或失败立即触发 `AbortSignal`，之后既不 complete 也不 retry，由 claim 到期后交给新 owner。普通 dispatch 失败在仍持有 claim 时进入延迟 retry；不同 slot 可以并发领取不同 partition，同一 partition 的排他性仍由 store 保证。
+这份 receipt 只证明 canonical Session mutation 已在 fenced owner 下提交，不代表整轮执行完成，也不保存 owner id、prompt、用户身份或 provider 凭据。Primary daemon handler 从实际 Session lease 与 CAS write 返回值构造它。长 dispatch 会续租 inbox claim；续租 stale 或失败立即触发 `AbortSignal`，之后既不 complete 也不 retry，由 claim 到期后交给新 owner。普通 dispatch 失败在仍持有 claim 时进入延迟 retry；不同 slot 可以并发领取不同 partition，同一 partition 的排他性仍由 store 保证。
 
-Primary daemon 接线仍有三个硬门禁：
+Primary daemon 接线满足三个硬门禁：
 
-1. daemon 必须只在 `DurableLarkPrimaryIngress` 领导权回调内启停该 App 的 WS client，并用 `enqueueBeforeAck` 替换、而不是旁路镜像现有 message callback；新增组件本身尚未改变 live route。
+1. daemon 只在 `DurableLarkPrimaryIngress` 领导权回调内启停该 App 的 WS client，并用 `enqueueBeforeAck` 替换、而不是旁路镜像现有 message callback。
 2. handler 必须只在 durable inbox 返回 inserted/duplicate 后 ACK；timeout、conflict、provider failure 和 lease loss 必须保持可重推，不能回退到 ACK 后 fire-and-forget。
-3. `processMessageEvent` 当前在 canonical handler 真正完成 durable admission 前就释放 raw ingress lane。Primary 接线必须暴露真实 admission receipt，不能把“已排进内存队列”当作 `committed`。
+3. `processMessageEvent` 在 primary 下等待 canonical handler，并返回真实 admission receipt，不能把“已排进内存队列”当作 `committed`。
 
-这三项与 durable outbox daemon 接线完成前，`BOTMUX_COORDINATION_MODE=primary` 继续拒绝启动。
+Runtime factory 默认仍拒绝 `primary`；只有完成上述组装的 daemon 调用点显式传入 `allowPrimary`。普通 worker final 与单消息 `botmux send` 均经 Session exact-write、outbox 和权威 settlement；多副作用形态的限制见 provider runtime 文档。
 
 Durable outbox pump 严格复用合同已有的副作用边界：先 reserve，再在任何 transport 调用之前提交 `beginOutboxAttempt`。callback 只有三类显式结果：带 receipt 的 delivered；带 `no_side_effect` 或 `stable_target_idempotency` 证明的 safe retry；以及 ambiguous。callback 抛错、超时、非法结果或缺少安全证明的 retry 一律进入 ambiguous，不自动重发。Attempt timeout 小于 reservation lease 的一半，使正常 settlement 有独立余量；晚到成功只作为观测信号，不能把已经 ambiguous 的 attempt 改写成 delivered。
 
@@ -133,7 +133,7 @@ Pump 本身不包含 Lark 语义。Lark adapter 使用版本化 envelope 冻结 
 
 Adapter 复用现有 `sendMessage` / `replyMessage`、`classifyFeishuError` 和 outbound hook fencing。Session/epoch authority 在每次 provider 调用前重新验证；首次尝试只有拿到动态 hook authority 才发 hook，后续 UUID reconciliation 一律 `suppressHook`，避免 provider 去重成功时重复本地 hook。持久 payload 只保存普通 JSON hook context，不保存 IPC capability；`hookOrigin` 与 `beforeHook` 必须由当前 owner 在投递时重新证明。父消息已撤回时不能拿同一个 UUID 改投 top-level send：Feishu UUID 去重不把 parent 纳入 key，这样 retarget 可能静默返回旧父消息下的结果；adapter 因此保持 ambiguous，新的 fallback 必须重新取得 authority 并创建新的 outbox identity。
 
-现有 final delivery drain、turn idempotency 和 outbound hook fencing 应作为接线依赖复用，而不是平行实现第二套回执。当前 adapter 仍未接入 daemon；附件、多条分块消息、卡片 patch 与非 IM 副作用继续留在现有路径，不能被这份单消息 envelope 偷偷概括。
+现有 final delivery drain、turn idempotency 和 outbound hook fencing 作为接线依赖复用，而不是平行实现第二套回执。Primary 已接入单消息 adapter；附件、多条分块消息、卡片 patch 与非 IM 副作用不被这份 envelope 偷偷概括，当前版本会在这些形态产生任何外部副作用前显式拒绝。
 
 非内置 store 通过独立 JSONL provider 进程接入，握手、配置和 fail-closed 边界见 [durable coordination provider runtime](./2026-10-05-durable-coordination-provider-runtime.md)。该进程边界只承载公共合同，不允许把具体数据库或部署平台语义引入 daemon。
 
