@@ -415,6 +415,7 @@ export class TmuxPipeBackend implements SessionBackend {
       // been upgraded since the session was originally created, and options
       // like set-clipboard / window-size largest are idempotent to re-apply.
       this.applySessionOptions();
+      this.restoreDetachedOwnedSessionSize();
     }
 
     // Step 1: create the fifo. mkfifo is POSIX; linux/darwin both have it.
@@ -1193,6 +1194,31 @@ export class TmuxPipeBackend implements SessionBackend {
         execSync(`tmux set-option -t ${t} window-size largest`, { stdio: 'ignore', env, timeout: 5000 });
       }
     } catch { /* session may not be ready yet — benign */ }
+  }
+
+  /**
+   * Repair geometry left behind by an old Web Terminal viewer before this
+   * worker reattaches. A detached owned session has no human client whose
+   * layout we could disrupt, so the worker's configured render dimensions are
+   * authoritative. An attached session is left untouched.
+   */
+  private restoreDetachedOwnedSessionSize(): void {
+    try {
+      const attached = execFileSync(
+        'tmux',
+        ['display-message', '-p', '-t', this.paneTarget, '#{session_attached}'],
+        {
+          encoding: 'utf-8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+          timeout: 2000,
+          env: tmuxEnv(),
+        },
+      ).trim();
+      if (attached === '0') this.resize(this.cols, this.rows);
+    } catch {
+      // Reattach already proved the pane exists. Geometry repair is best-effort
+      // and must not turn a transient tmux control failure into session loss.
+    }
   }
 
   /** Snapshot the full pane history WITH ANSI escapes (`-S - -E -`).
