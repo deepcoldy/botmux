@@ -435,6 +435,10 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // must route botmux send through the owning daemon instead of calling the
   // provider directly. This is classification only; IPC auth remains required.
   'BOTMUX_COORDINATION_MODE',
+  // Optional shared state root owned by a remote-runner implementation. The
+  // public daemon only transports the absolute path; provider-specific layout
+  // and credentials remain outside BotMux.
+  'BOTMUX_REMOTE_RUNNER_STATE_ROOT',
   // Fail-closed classification hint for macOS read isolation. This is never
   // authority; cmdSend also checks the host-owned marker + live challenge.
   'BOTMUX_READ_ISOLATED',
