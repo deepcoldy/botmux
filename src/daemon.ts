@@ -103,6 +103,7 @@ import { resolveRegularGroupMode } from './services/chat-reply-mode-store.js';
 import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescriptionsOnOpenPlatform, updateBotDescriptionsOnOpenPlatform } from './services/open-platform-rename.js';
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
+import { initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
 import { shouldRecordFailedTurn, buildFailedTurnRecord } from './services/failed-turn-retry.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
@@ -27510,6 +27511,20 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // is a backstop for the next missed `.catch`, not permission to omit them.
   installDaemonRejectionGuard(logger);
 
+  // Optional provider-neutral coordination process. `shadow` proves the
+  // configured provider speaks the public contract and keeps its connection
+  // alive for later staged wiring; it does not replace the SQLite Session path.
+  // `primary` remains fail-closed in the runtime factory until inbox, Session
+  // facade and outbox pump are all wired, so a deployment cannot accidentally
+  // scale two independent SQLite owners by setting one premature flag.
+  const durableCoordinationRuntime = await initializeDurableCoordinationRuntime();
+  if (durableCoordinationRuntime) {
+    logger.info(
+      `[durable-coordination] ${durableCoordinationRuntime.mode} provider ready: `
+      + durableCoordinationRuntime.provider,
+    );
+  }
+
   // Repair a shared tmux server polluted by an older botmux immediately on
   // daemon startup. This must not depend on restoring/spawning a bmx-* session:
   // a user-held tmux server can outlive every botmux pane and still leak stale
@@ -29804,6 +29819,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     flushIdentityCacheSync();
 
     try { sessionStore.releaseOccupancyLease({ bootId: getDaemonBootId() }); } catch { /* exit handler retries */ }
+    try {
+      await durableCoordinationRuntime?.close();
+    } catch (error) {
+      logger.warn(
+        `[durable-coordination] provider close failed during shutdown: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+      durableCoordinationRuntime?.terminate();
+    }
     removePidFile();
     process.exit(gracefulProcessExitCode());
       },
@@ -29845,6 +29869,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(sessionOwnerReminderTimer);
     clearInterval(docCommentPollTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
+    durableCoordinationRuntime?.terminate();
     try { sessionStore.releaseOccupancyLease({ bootId: getDaemonBootId() }); } catch { /* best effort */ }
     removeDaemonDescriptor(cfg.larkAppId, desc.bootInstanceId);
     // Plain-exit path (uncaught fatal, manual process.exit) bypasses the

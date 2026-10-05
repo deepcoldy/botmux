@@ -81,6 +81,8 @@ outbox: pending ──reserve──> reserved ──begin──> attempting ─�
 
 后续接入按小步完成：先在 ACK 后增加可选 durable inbox，再迁移 Session 状态调用面，最后启用 durable outbox pump。每一步都必须保留关闭开关和现有 SQLite 行为回归。
 
+非内置 store 通过独立 JSONL provider 进程接入，握手、配置和 fail-closed 边界见 [durable coordination provider runtime](./2026-10-05-durable-coordination-provider-runtime.md)。该进程边界只承载公共合同，不允许把具体数据库或部署平台语义引入 daemon。
+
 ## 验证
 
 `test/durable-coordination.test.ts` 覆盖：
