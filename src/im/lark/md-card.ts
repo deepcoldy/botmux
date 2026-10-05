@@ -25,6 +25,7 @@ import { randomBytes } from 'node:crypto';
 import { resolve } from 'node:path';
 import MarkdownIt from 'markdown-it';
 import type Token from 'markdown-it/lib/token.mjs';
+import StateInline from 'markdown-it/lib/rules_inline/state_inline.mjs';
 import { t, type Locale } from '../../i18n/index.js';
 import type { ModelFallbackState } from '../../types.js';
 import {
@@ -59,6 +60,13 @@ export type { CardRenderDiagnostic } from './vega-lite-chart.js';
 export { REPLY_CARD_FOOTER_MARKER } from './reply-card-footer-signature.js';
 
 const md = new MarkdownIt({ html: false, linkify: false, breaks: false });
+// This parser only classifies images for removal. Include schemes such as
+// file: that the HTML renderer rejects but Feishu may still treat as images.
+const imageScanMd = new MarkdownIt({ html: false, linkify: false, breaks: false });
+imageScanMd.validateLink = () => true;
+const imageRuleParser = new MarkdownIt();
+imageRuleParser.inline.ruler.enableOnly('image');
+const parseImage = imageRuleParser.inline.ruler.getRules('')[0];
 const MAX_LOCAL_HOME_LINK_REPAIRS = 256;
 /** Keep structured replies readable without letting heading-heavy model output
  *  multiply schema-v2 body elements without bound. Each promoted heading can
@@ -890,6 +898,101 @@ function unescapeFenceLines(input: string): string {
   return input.replace(/^[ ]{0,3}(?:\\`){3,}[^\n`]*$/gm, m => m.replace(/\\`/g, '`'));
 }
 
+/** Source markers let CommonMark identify actual image references without
+ * rewriting code examples, escaped syntax, or the surrounding Markdown. */
+function cardImageReferences(input: string): Array<{ position: number; source: string }> {
+  if (!input.includes('![')) return [];
+  const prefix = chooseLinkMarkerPrefix(input);
+  const positions: number[] = [];
+  const marked = input.replace(/\\.|!\[/gs, (match: string, offset: number) => {
+    if (match !== '![') return match;
+    const id = positions.push(offset) - 1;
+    return `${prefix}${id}x![`;
+  });
+  const marker = new RegExp(`${escapeRegExp(prefix)}(\\d+)x$`);
+  const images: Array<{ position: number; source: string }> = [];
+  const inspect = (tokens: Token[]): void => {
+    for (let i = 0; i < tokens.length; i++) {
+      const token = tokens[i];
+      if (token.type === 'image') {
+        const match = tokens[i - 1]?.content.match(marker);
+        if (match) images.push({ position: positions[Number(match[1])], source: token.attrGet('src') ?? '' });
+      }
+      if (token.children) inspect(token.children);
+    }
+  };
+  inspect(imageScanMd.parse(marked, {}));
+  return images.sort((a, b) => a.position - b.position);
+}
+
+/** Resolve real Markdown images, preserving code examples and untouched source.
+ * The image-only rule supplies exact source spans; the full parser above
+ * decides which occurrences are actually images rather than literal code. */
+export async function resolveCardMarkdownImages(
+  input: string,
+  resolveSource: (source: string) => Promise<string | undefined>,
+): Promise<string> {
+  input = unescapeFenceLines(input);
+  const references = cardImageReferences(input);
+  if (!references.length) return input;
+  const env: Record<string, unknown> = {};
+  imageScanMd.parse(input, env);
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const reference of references) {
+    if (reference.position < cursor || FEISHU_IMG_KEY.test(reference.source)) continue;
+    const state = new StateInline(input, imageScanMd, env, []);
+    state.pos = reference.position;
+    if (!parseImage(state, false)) continue;
+    const token = state.tokens.at(-1);
+    if (token?.type !== 'image' || token.attrGet('src') !== reference.source) continue;
+    const key = await resolveSource(reference.source);
+    if (!key || !FEISHU_IMG_KEY.test(key)) continue;
+    parts.push(input.slice(cursor, reference.position), `![${token.content}](${key})`);
+    cursor = state.pos;
+  }
+  return parts.join('') + input.slice(cursor);
+}
+
+function normalizeCardImages(input: string, omitAll = false): string {
+  const unsupported = new Set(cardImageReferences(input)
+    .filter(image => omitAll || !FEISHU_IMG_KEY.test(image.source)).map(image => image.position));
+  return input.replace(/!\[/g, (match: string, offset: number) =>
+    unsupported.has(offset) ? '[Image omitted] [' : match);
+}
+
+/** Last-resort image-free version of a rejected reply card. Keep the card
+ * envelope, text, tables, code and controls so existing delivery accounting
+ * can continue to use the same message type and provider UUID. */
+export function omitReplyCardImages(cardJson: string): string {
+  let card: unknown;
+  try { card = JSON.parse(cardJson); } catch { return cardJson; }
+  let changed = false;
+  const visit = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(visit);
+    if (!value || typeof value !== 'object') return value;
+    if ('tag' in value && value.tag === 'img') {
+      changed = true;
+      const alt = 'alt' in value ? value.alt : undefined;
+      const text = typeof alt === 'string' ? alt
+        : alt && typeof alt === 'object' && 'content' in alt && typeof alt.content === 'string'
+          ? alt.content : '';
+      return { tag: 'markdown', content: `[Image omitted] ${md.utils.escapeHtml(text).replace(/[\\`*_[\]<>!]/g, '\\$&')}`.trim() };
+    }
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => {
+      if ('tag' in value && (value.tag === 'markdown' || value.tag === 'lark_md')
+        && key === 'content' && typeof child === 'string') {
+        const content = normalizeCardImages(child, true);
+        if (content !== child) changed = true;
+        return [key, content];
+      }
+      return [key, visit(child)];
+    }));
+  };
+  const result = visit(card);
+  return changed ? JSON.stringify(result) : cardJson;
+}
+
 /** Normalize source bytes that must be settled before the card is rendered. */
 export function prepareCardMarkdown(
   input: string,
@@ -977,6 +1080,9 @@ export function buildCardBodyElements(
   // Recover model-escaped fences first so markdown-it can classify their
   // contents as code before local-link normalization inspects link tokens.
   input = prepareCardMarkdown(input, cwd, localHomeLinkMode);
+  // Only sanitize at the rendering boundary: sandbox relay preparation runs
+  // before --images uploads resolve img:N placeholders to real image keys.
+  input = normalizeCardImages(input);
   // Pre-pass: a line that is nothing but 2+ images renders as a side-by-side
   // image row (column_set) instead of stacked full-width images. Everything
   // else flows through the markdown element builder unchanged. Fence-aware so
@@ -1262,8 +1368,7 @@ const IMG_ROW_LINE = /^ {0,3}(?:!\[[^\]]*\]\([^)\s]+\)\s*){2,}$/;
  * such key is promoted to a native `img` row — a model reply may emit a
  * `![](https://…) ![](…)` URL line (or other non-key src like `img_v2foo.png`),
  * and a native `img` element with a non-key as its "img_key" makes Feishu reject
- * the whole card. Non-key lines fall through to the markdown widget unchanged
- * (same as before this feature existed).
+ * the whole card. Non-key images are downgraded before this layout pass.
  */
 const FEISHU_IMG_KEY = /^img_v\d+_[A-Za-z0-9_-]+$/i;
 
@@ -1543,7 +1648,7 @@ export function buildContextualReplyCard(opts: {
     const u = userText.trim();
     elements.push({
       tag: 'markdown',
-      content: `**👤 ${t('card.you', undefined, locale)}**\n\n${quoteLines(u || t('common.empty_paren', undefined, locale))}`,
+      content: normalizeCardImages(`**👤 ${t('card.you', undefined, locale)}**\n\n${quoteLines(u || t('common.empty_paren', undefined, locale))}`),
     });
   }
 

@@ -16,6 +16,7 @@ import { dashboardEventBus } from '../src/core/dashboard-events.js';
 
 const topicDetailMock = vi.fn(async () => ({ items: [{ message_id: 'om_root', deleted: true }] }));
 const updateMessageMock = vi.fn(async () => {});
+const uploadImageMock = vi.fn(async (_appId: string, _image: string | Buffer) => 'img_v3_uploaded_preview');
 const addReactionMock = vi.fn(async () => 'reaction_id');
 const replyToDocCommentMock = vi.fn(async () => {});
 const removeCommentReactionMock = vi.fn(async () => {});
@@ -28,6 +29,7 @@ const resolveAllowedUsersWithMapMock = vi.fn(async (_appId: string, entries: str
 vi.mock('../src/im/lark/client.js', () => ({
   getMessageDetail: (...args: any[]) => topicDetailMock(...args),
   updateMessage: (...args: any[]) => updateMessageMock(...args),
+  uploadImage: (appId: string, image: string | Buffer) => uploadImageMock(appId, image),
   addReaction: (...args: any[]) => addReactionMock(...args),
   resolveAllowedUsersWithMap: (...args: any[]) => resolveAllowedUsersWithMapMock(...args),
   removeReaction: vi.fn(async () => {}),
@@ -258,6 +260,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     await __testOnly_closeSkillFeedbackStores();
     vi.useFakeTimers();
     vi.clearAllMocks();
+    uploadImageMock.mockReset().mockResolvedValue('img_v3_uploaded_preview');
     resolveAllowedUsersWithMapMock.mockImplementation(async (_appId: string, entries: string[]) => ({
       resolved: entries,
       map: new Map(entries.map(entry => [entry, entry])),
@@ -284,6 +287,251 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     rmSync('/tmp/test-sessions', { recursive: true, force: true });
     clearMessageListenerRunPreviewStore();
     vi.useRealTimers();
+  });
+
+  it.each(['bridge', 'local-turn', 'local-turn-headless'] as const)(
+    'forwards %s screenshot replies without exposing a local path as an image key', async kind => {
+      const sessionReply = vi.fn(async (_anchor: string, card: string) => {
+        if (card.includes('![Preview](/tmp/preview.png)')) {
+          throw new Error('card contains invalid image keys');
+        }
+        return 'om_reply';
+      });
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.session.cliId = 'codex';
+      if (kind === 'bridge') ds.adoptedFrom = undefined;
+      const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+      deliver(ds, { ...finalOutputMsg(), kind, content: 'Ready.\n\n![Preview](/tmp/preview.png)', userText: 'Show preview' }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(sessionReply).toHaveBeenCalledOnce();
+      expect(sessionReply.mock.calls[0][1]).toContain('Ready.');
+      expect(sessionReply.mock.calls[0][1]).toContain('[Image omitted]');
+      expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    },
+  );
+
+  it.each(['bridge', 'local-turn', 'local-turn-headless'] as const)('uploads an adopted session screenshot before delivering the %s card', async kind => {
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=', 'base64');
+    const image = '/tmp/test-sessions/preview.png';
+    writeFileSync(image, png);
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp/test-sessions', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.workingDir = '/tmp/test-sessions';
+    ds.session.cliId = 'codex';
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), kind, content: `Ready.\n\n![Preview](${image})` }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledOnce());
+    expect(uploadImageMock).toHaveBeenCalledExactlyOnceWith('app_test', png);
+    expect(sessionReply.mock.calls[0][1]).toContain('![Preview](img_v3_uploaded_preview)');
+    expect(sessionReply.mock.calls[0][1]).not.toContain('[Image omitted]');
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('uploads a Claude adopt preamble screenshot but never uploads paths from its quoted user text', async () => {
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII=', 'base64');
+    writeFileSync('/tmp/test-sessions/preview.png', png);
+    writeFileSync('/tmp/test-sessions/input.png', png);
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp/test-sessions', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.workingDir = '/tmp/test-sessions';
+    if (!ds.worker) throw new Error('Missing fixture worker');
+    __testOnly_setupWorkerHandlers(ds, ds.worker);
+    ds.worker.emit('message', {
+      type: 'adopt_preamble', turnId: 'turn-adopt',
+      userText: 'Check ![Input](input.png)', assistantText: 'Ready. ![Preview](preview.png)',
+    });
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledOnce());
+    expect(uploadImageMock).toHaveBeenCalledExactlyOnceWith('app_test', png);
+    expect(sessionReply.mock.calls[0][1]).toContain('![Preview](img_v3_uploaded_preview)');
+    expect(sessionReply.mock.calls[0][1]).toContain('[Image omitted] [Input]');
+  });
+
+  it.each(['non-adopted', 'sandbox', 'read-isolation', 'remote', 'api-only'])(
+    'does not add host image uploads to %s sessions', async mode => {
+      writeFileSync('/tmp/test-sessions/preview.png', Buffer.from('89504e470d0a1a0a', 'hex'));
+      const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+      initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp/test-sessions', getActiveCount: () => 1, closeSession: vi.fn() });
+      const ds = makeDs();
+      ds.workingDir = '/tmp/test-sessions';
+      if (mode === 'non-adopted') ds.adoptedFrom = undefined;
+      if (mode === 'sandbox') ds.session.sandbox = true;
+      if (mode === 'remote') ds.session.backendType = 'remote-runner';
+      const bot = getBot('app_test');
+      if (mode === 'read-isolation') bot.config.readIsolation = true;
+      if (mode === 'api-only') bot.config.apiOnly = true;
+      vi.mocked(getBot).mockReturnValue(bot);
+      const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+      deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](preview.png)' }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(uploadImageMock).not.toHaveBeenCalled();
+      expect(sessionReply).toHaveBeenCalledOnce();
+      expect(sessionReply.mock.calls[0][1]).toContain('Ready.');
+    },
+  );
+
+  it('reuses the uploaded key and UUID after a final-output send failure', async () => {
+    writeFileSync('/tmp/test-sessions/preview.png', Buffer.from('89504e470d0a1a0a', 'hex'));
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error('network error')).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp/test-sessions', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.workingDir = '/tmp/test-sessions';
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](preview.png)' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(uploadImageMock).toHaveBeenCalledOnce();
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls[0][1]).toContain('img_v3_uploaded_preview');
+    expect(sessionReply.mock.calls[1][1]).toBe(sessionReply.mock.calls[0][1]);
+    expect(sessionReply.mock.calls[1][5].uuid).toBe(sessionReply.mock.calls[0][5].uuid);
+  });
+
+  it('delivers the body when the automatic image upload fails', async () => {
+    writeFileSync('/tmp/test-sessions/preview.png', Buffer.from('89504e470d0a1a0a', 'hex'));
+    uploadImageMock.mockRejectedValueOnce(new Error('upload failed'));
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp/test-sessions', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.workingDir = '/tmp/test-sessions';
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](preview.png)' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(uploadImageMock).toHaveBeenCalledOnce();
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(sessionReply.mock.calls[0][1]).toContain('Ready.');
+    expect(sessionReply.mock.calls[0][1]).toContain('[Image omitted]');
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+  });
+
+  it('does not send a completed upload after the adopted worker loses ownership', async () => {
+    writeFileSync('/tmp/test-sessions/preview.png', Buffer.from('89504e470d0a1a0a', 'hex'));
+    let owned = true;
+    uploadImageMock.mockImplementationOnce(async () => {
+      owned = false;
+      return 'img_v3_uploaded_preview';
+    });
+    const sessionReply = vi.fn(async () => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp/test-sessions', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.workingDir = '/tmp/test-sessions';
+    const complete = vi.fn();
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](preview.png)' }, 'tag', 0, complete, () => owned);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(uploadImageMock).toHaveBeenCalledOnce();
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    expect(complete).toHaveBeenCalledExactlyOnceWith(false);
+  });
+
+  it('forwards an adopt preamble with local screenshots in both sides of the exchange', async () => {
+    const sessionReply = vi.fn(async (_anchor: string, _card: string) => 'om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.cliId = 'codex';
+    if (!ds.worker) throw new Error('Missing fixture worker');
+    __testOnly_setupWorkerHandlers(ds, ds.worker);
+    ds.worker.emit('message', {
+      type: 'adopt_preamble', turnId: 'turn-adopt',
+      userText: 'Check ![Input](/tmp/input.png)',
+      assistantText: 'Ready. ![Preview](/tmp/preview.png)',
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    const card = sessionReply.mock.calls[0][1];
+    expect(card).toContain('Ready.');
+    expect(card).toContain('Check');
+    expect(card).not.toContain('![Input]');
+    expect(card).not.toContain('![Preview]');
+  });
+
+  it('downgrades only rejected image keys and retries the image-free card with the same UUID', async () => {
+    const invalidImage = { response: { status: 400, data: {
+      code: 230099, msg: 'Failed to create card content, ErrCode: 200570; ErrMsg: card contains invalid image keys',
+    } } };
+    const sessionReply = vi.fn()
+      .mockRejectedValueOnce(invalidImage)
+      .mockRejectedValueOnce(new Error('network error'))
+      .mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    const complete = vi.fn();
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](img_v3_rejected)' }, 'tag', 0, complete);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledTimes(3);
+    expect(sessionReply.mock.calls[0][1]).toContain('![Preview](img_v3_rejected)');
+    for (const call of sessionReply.mock.calls.slice(1)) {
+      expect(call[1]).toContain('Ready.');
+      expect(call[1]).toContain('[Image omitted]');
+      expect(call[1]).not.toContain('![Preview]');
+      expect(call[2]).toBe('interactive');
+      expect(call[5].uuid).toBe(sessionReply.mock.calls[0][5].uuid);
+    }
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    expect(complete).toHaveBeenCalledExactlyOnceWith(true, 'om_reply');
+  });
+
+  it.each([
+    { response: { status: 400, data: { code: 230099, msg: 'Invalid card schema' } } },
+    { response: { status: 400, data: { code: 230001, msg: 'Invalid request' } } },
+    { response: { status: 400, data: { code: 230099, msg: 'ErrCode: 200571; card contains invalid image keys' } } },
+    new Error('Request failed with status code 400'),
+    new Error('card contains invalid image keys'),
+  ])('does not treat an unrelated rejection as permission to downgrade images: %j', async error => {
+    const sessionReply = vi.fn().mockRejectedValueOnce(error).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](img_v3_key)' }, 'tag', 0);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls[1][1]).toBe(sessionReply.mock.calls[0][1]);
+  });
+
+  it('uses the same image-free fallback for an adopt preamble and a flattened SDK error', async () => {
+    const sessionReply = vi.fn().mockRejectedValueOnce(new Error(
+      'Failed to reply message: ErrCode: 200570; ErrMsg: card contains invalid image keys (code: 230099)',
+    )).mockResolvedValue('om_reply');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    if (!ds.worker) throw new Error('Missing fixture worker');
+    __testOnly_setupWorkerHandlers(ds, ds.worker);
+    ds.worker.emit('message', {
+      type: 'adopt_preamble', turnId: 'turn-adopt', userText: 'Show preview',
+      assistantText: 'Ready. ![Preview](img_v3_rejected)',
+    });
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+    expect(sessionReply.mock.calls[1][1]).toContain('[Image omitted]');
+    expect(sessionReply.mock.calls[1][1]).toContain('Ready.');
+    expect(sessionReply.mock.calls[1][1]).not.toContain('![Preview]');
+    expect(sessionReply.mock.calls[1][4]).toBe('turn-adopt');
+  });
+
+  it('does not send the image fallback after the worker loses ownership', async () => {
+    let owned = true;
+    const sessionReply = vi.fn(async () => {
+      owned = false;
+      throw new Error('Failed to reply message: ErrCode: 200570; card contains invalid image keys (code: 230099)');
+    });
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    const complete = vi.fn();
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+    deliver(ds, { ...finalOutputMsg(), content: 'Ready. ![Preview](img_v3_key)' }, 'tag', 0, complete, () => owned);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sessionReply).toHaveBeenCalledOnce();
+    expect(ds.lastBridgeEmittedUuid).toBeUndefined();
+    expect(complete).toHaveBeenCalledExactlyOnceWith(false);
   });
 
   it.each(['bridge', 'explicit'] as const)('keeps the %s answer and Oncall source in the existing reply card', async source => {

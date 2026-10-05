@@ -1597,18 +1597,18 @@ const EXT_TO_FILE_TYPE: Record<string, string> = {
   '.ppt': 'ppt', '.pptx': 'ppt',
 };
 
-export async function uploadImage(larkAppId: string, imagePath: string): Promise<string> {
+export async function uploadImage(larkAppId: string, imagePath: string | Buffer): Promise<string> {
   assertLarkTransport(larkAppId, 'uploadImage');
   return executeWithLarkGate(larkAppId, 'uploadImage', async () => {
     const c = getBotUploadClient(larkAppId);
-    const buf = readFileSync(imagePath);
+    const buf = Buffer.isBuffer(imagePath) ? imagePath : readFileSync(imagePath);
     // SDK returns { image_key } directly (not wrapped in { code, data })
     const res = await c.im.v1.image.create({
       data: { image_type: 'message', image: buf },
     });
     const imageKey = res?.image_key;
     if (!imageKey) throw new Error(`Failed to upload image: no image_key in response (${JSON.stringify(res)})`);
-    logger.info(`Uploaded image ${imagePath} → ${imageKey}`);
+    logger.info(`Uploaded image ${Buffer.isBuffer(imagePath) ? '(buffer)' : imagePath} → ${imageKey}`);
     return imageKey;
   });
 }
