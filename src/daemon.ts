@@ -97,6 +97,7 @@ import { renameBotOnOpenPlatform, changeBotAvatarOnOpenPlatform, readBotDescript
 import { migrateSandboxConfigAtStartup } from './services/sandbox-migration.js';
 import * as sessionStore from './services/session-store.js';
 import { initializeDurableCoordinationRuntime } from './services/durable-coordination-runtime.js';
+import { startDurableInboxShadowConsumer } from './services/durable-inbox-shadow-consumer.js';
 import { shouldRecordFailedTurn, buildFailedTurnRecord } from './services/failed-turn-retry.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
@@ -27073,11 +27074,32 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // facade and outbox pump are all wired, so a deployment cannot accidentally
   // scale two independent SQLite owners by setting one premature flag.
   const durableCoordinationRuntime = await initializeDurableCoordinationRuntime();
+  const durableInboxShadowConsumer = durableCoordinationRuntime
+    ? startDurableInboxShadowConsumer({
+      store: durableCoordinationRuntime.store,
+      workerId: `shadow-inbox:${getDaemonBootId()}`,
+      onObserved: observation => {
+        logger.debug(
+          `[durable-inbox:${observation.larkAppId}] shadow observed ${observation.eventId} `
+          + `(attempt=${observation.attempts})`,
+        );
+      },
+      onError: error => {
+        logger.warn(
+          `[durable-inbox] shadow consumer error: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+      },
+    })
+    : undefined;
   if (durableCoordinationRuntime) {
     logger.info(
       `[durable-coordination] ${durableCoordinationRuntime.mode} provider ready: `
       + durableCoordinationRuntime.provider,
     );
+    void durableInboxShadowConsumer?.ready.then(() => {
+      logger.info('[durable-inbox] shadow consumer ready');
+    });
   }
 
   // Repair a shared tmux server polluted by an older botmux immediately on
@@ -29305,6 +29327,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // Dispatcher stop always receives the hard-clamped remaining budget (never
     // its internal 5s default), success or failure path alike.
     await feedbackWebhookDispatcher?.stop(remainingBudget());
+    await durableInboxShadowConsumer?.stop(remainingBudget());
 
     // Flush any pending identity-cache writes before exit. The cache uses a
     // 2s debounce on disk persistence to dedupe writes from chatty groups; on
@@ -29362,6 +29385,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     clearInterval(sessionOwnerReminderTimer);
     clearInterval(docCommentPollTimer);
     if (memoryDiagnostics) clearInterval(memoryDiagnostics);
+    durableInboxShadowConsumer?.terminate();
     durableCoordinationRuntime?.terminate();
     try { sessionStore.releaseOccupancyLease({ bootId: getDaemonBootId() }); } catch { /* best effort */ }
     removeDaemonDescriptor(cfg.larkAppId, desc.bootInstanceId);
