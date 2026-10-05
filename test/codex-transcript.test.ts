@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mkdtempSync, writeFileSync, appendFileSync, rmSync, statSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { CODEX_AUTH_ERROR_CODE, CODEX_CONNECTION_ERROR_CODE, CODEX_INVALID_REQUEST_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE, CODEX_TASK_FAILED_ERROR_CODE, CODEX_UPSTREAM_ERROR_CODE, codexTaskFailureCode, drainCodexRollout, codexSessionIdFromRolloutPath, findCodexRolloutBySessionId, findCodexSessionIdByBotmuxSessionId, codexHistorySidIsOwned, isCodexRateLimitEvent, isExactCodexOutputLimitError, splitCodexEventsByCutoff, extractLastCodexTurn, scanCodexThreadSettings, readLatestCodexRuntime, codexCotEntriesFromResponseItem, type CodexBridgeEvent } from '../src/services/codex-transcript.js';
 
 let dir: string;
@@ -58,6 +59,103 @@ function assistantMessageResponseItem(text: string, phase?: string, ts = '2026-0
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), 'codex-transcript-'));
   path = join(dir, 'rollout.jsonl');
+});
+
+describe('Codex environment updates in adopted turns', () => {
+  const nativeTurnId = 'native-active-turn';
+  const environment = '<environment_context>\n  <current_date>2026-10-06</current_date>\n  <timezone>Asia/Singapore</timezone>\n</environment_context>';
+  const metadata = (kinds: readonly string[]) => ({
+    turn_id: nativeTurnId,
+    content_item_kinds: kinds,
+  });
+
+  it.each([
+    ['structured', metadata(['environments.environment_context'])],
+    ['legacy', undefined],
+  ])('keeps the original thinking timeline and final reply for a %s environment update', (_name, contextMetadata) => {
+    const now = Date.parse('2026-04-29T07:00:00.000Z');
+    const q = new CodexBridgeQueue(() => now);
+    const retired: string[] = [];
+    const thinkingTurns: string[] = [];
+    q.setLocalTurns(true, now);
+    q.mark('lark-turn', 'Keep working', now);
+    q.setCotSupersededObserver(turn => retired.push(turn.turnId));
+    q.setCotObserver((_entries, turn) => thinkingTurns.push(turn.turnId));
+    const prompt = userResponseItem('Keep working');
+    const context = userResponseItem(environment, '2026-04-29T07:00:02.000Z');
+    writeFileSync(path, [
+      { timestamp: '2026-04-29T07:00:00.000Z', type: 'event_msg', payload: { type: 'task_started', turn_id: nativeTurnId } },
+      { ...prompt, payload: { ...prompt.payload, internal_chat_message_metadata_passthrough: metadata(['user.text']) } },
+    ].map(ev).join(''));
+    const initial = drainCodexRollout(path, 0);
+    q.ingest(initial.events);
+    appendFileSync(path, [
+      { ...context, payload: { ...context.payload, ...(contextMetadata ? { internal_chat_message_metadata_passthrough: contextMetadata } : {}) } },
+      { timestamp: '2026-04-29T07:00:03.000Z', type: 'response_item', payload: { type: 'function_call', name: 'read_file', call_id: 'read-1', arguments: '{}' } },
+    ].map(ev).join(''));
+    const update = drainCodexRollout(path, initial.newOffset, initial.state);
+    q.ingest(update.events);
+    expect(retired).toEqual([]);
+    expect(thinkingTurns).toEqual(['lark-turn']);
+    expect(q.peek()).toMatchObject([{ turnId: 'lark-turn', sourceTurnId: nativeTurnId }]);
+    expect(q.hasBlockingTurn()).toBe(true);
+    expect(q.drainEmittable()).toEqual([]);
+
+    appendFileSync(path, ev({ timestamp: '2026-04-29T07:00:04.000Z', type: 'event_msg',
+      payload: { type: 'task_complete', turn_id: nativeTurnId, last_agent_message: 'Finished' } }));
+    q.ingest(drainCodexRollout(path, update.newOffset, update.state).events);
+    expect(q.drainEmittable()).toMatchObject([{ turnId: 'lark-turn', finalText: 'Finished' }]);
+    expect(q.hasBlockingTurn()).toBe(false);
+  });
+
+  it.each([
+    ['typed environment example', environment, metadata(['user.text'])],
+    ['mixed user and environment content', environment, metadata(['environments.environment_context', 'user.text'])],
+    ['unknown content kind', environment, metadata(['future.content'])],
+    ['empty content kinds', environment, metadata([])],
+    ['malformed content kinds', environment, { content_item_kinds: 'environments.environment_context' }],
+    ['legacy local input', 'Keep working on the next part', undefined],
+    ['legacy incomplete wrapper', '<environment_context>', undefined],
+    ['legacy quoted block with a request', `${environment}\nExplain this configuration`, undefined],
+    ['legacy request between blocks', `${environment}\nExplain this\n${environment}`, undefined],
+  ])('preserves real input and steer behavior for %s', (_name, text, contextMetadata) => {
+    const now = Date.parse('2026-04-29T07:00:00.000Z');
+    const q = new CodexBridgeQueue(() => now);
+    const retired: string[] = [];
+    q.setLocalTurns(true, now);
+    q.mark('lark-turn', 'Keep working', now);
+    q.setCotSupersededObserver(turn => retired.push(turn.turnId));
+    const successor = userResponseItem(text, '2026-04-29T07:00:02.000Z');
+    writeFileSync(path, [userResponseItem('Keep working'),
+      { ...successor, payload: { ...successor.payload, ...(contextMetadata ? { internal_chat_message_metadata_passthrough: contextMetadata } : {}) } },
+    ].map(ev).join(''));
+    q.ingest(drainCodexRollout(path, 0).events);
+    expect(retired).toEqual(['lark-turn']);
+    expect(q.peek()).toMatchObject([{ isLocal: true, userText: text }]);
+  });
+
+  it('attributes a real same-native-turn Lark steer after an environment update', () => {
+    const now = Date.parse('2026-04-29T07:00:00.000Z');
+    const q = new CodexBridgeQueue(() => now);
+    const retired: string[] = [];
+    q.setLocalTurns(true, now);
+    q.mark('first', 'First request', now);
+    q.mark('second', 'Additional request', now);
+    q.setCotSupersededObserver(turn => retired.push(turn.turnId));
+    const rows = [
+      ['First request', ['user.text']],
+      [environment, ['environments.environment_context']],
+      ['Additional request', ['user.text']],
+    ] as const;
+    writeFileSync(path, rows.map(([text, kinds]) => {
+      const item = userResponseItem(text);
+      return ev({ ...item, payload: { ...item.payload, internal_chat_message_metadata_passthrough: metadata(kinds) } });
+    }).join(''));
+    q.ingest(drainCodexRollout(path, 0).events);
+    expect(retired).toEqual(['first']);
+    expect(q.peek()).toMatchObject([{ turnId: 'second' }]);
+    expect(q.peek()[0].isLocal).not.toBe(true);
+  });
 });
 
 afterEach(() => {
