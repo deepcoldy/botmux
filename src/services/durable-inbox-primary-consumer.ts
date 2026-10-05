@@ -4,9 +4,13 @@ import {
   parseDurableLarkMessageClaim,
   type DurableLarkMessageClaim,
 } from './durable-inbox-shadow.js';
+import {
+  parseDurableLarkAdmissionReceipt,
+  type DurableLarkAdmissionReceipt,
+} from './durable-lark-admission.js';
 
 export type DurableInboxPrimaryDispatchResult =
-  | { kind: 'committed' }
+  | { kind: 'committed'; receipt: DurableLarkAdmissionReceipt }
   | { kind: 'ignored'; reason: string };
 
 export interface DurableInboxPrimaryDispatchContext {
@@ -88,9 +92,11 @@ function timeoutPromise(ms: number): { promise: Promise<false>; cancel(): void }
  * Provider-neutral durable inbox handler for a later primary route.
  *
  * The dispatch callback must return only after the event is durably classified
- * as committed or ignored. Merely appending work to an in-memory queue is not a
- * commit receipt. A stale/failed claim renewal aborts the callback and prevents
- * complete/retry mutations, leaving the row recoverable after its lease.
+ * as committed or ignored. A committed result includes the fenced Session
+ * epoch/revision receipt and is revalidated against the claimed inbox identity.
+ * Merely appending work to an in-memory queue is not a commit receipt. A
+ * stale/failed claim renewal aborts the callback and prevents complete/retry
+ * mutations, leaving the row recoverable after its lease.
  *
  * This service deliberately does not wire itself into the daemon. The Lark ACK
  * path must first prove pre-ACK durable enqueue and the existing message router
@@ -173,6 +179,9 @@ export function startDurableInboxPrimaryConsumer(
       if (result.kind !== 'committed' && result.kind !== 'ignored') {
         throw new Error('durable inbox primary dispatch returned an invalid receipt');
       }
+      const validatedResult: DurableInboxPrimaryDispatchResult = result.kind === 'committed'
+        ? { kind: 'committed', receipt: parseDurableLarkAdmissionReceipt(result.receipt, message) }
+        : result;
       if (result.kind === 'ignored' && (!result.reason.trim() || result.reason.length > 512)) {
         throw new Error('durable inbox primary ignored result requires a bounded reason');
       }
@@ -182,7 +191,7 @@ export function startDurableInboxPrimaryConsumer(
         return;
       }
       try {
-        options.onCommitted?.({ message, result });
+        options.onCommitted?.({ message, result: validatedResult });
       } catch (error) {
         reportError(new Error(
           `durable inbox primary commit observer failed for ${claim.event.eventId}: `

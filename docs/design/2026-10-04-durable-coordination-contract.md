@@ -101,7 +101,9 @@ Session shadow projection 只包含版本、稳定 `sessionId`、应用与路由
 
 第一版挂接范围刻意只覆盖普通飞书新会话在 SQLite 更新和 `activeSessions` 注册都成功之后的 shadow 写入。竞态失败的 scratch Session、全量 `persistRow`、多行事务、恢复、关闭和批量 lineage 写入尚未挂接；因此这一版不能用作完整 Session 事实源，也不能解除 `primary` 门禁。
 
-Primary consumer 的 dispatch callback 必须返回 `committed` 或带有有界原因的 `ignored`，且只有 durable admission 已经提交后才能返回 `committed`。把任务追加到进程内 Promise queue 不构成 receipt。长 dispatch 会续租 inbox claim；续租 stale 或失败立即触发 `AbortSignal`，之后既不 complete 也不 retry，由 claim 到期后交给新 owner。普通 dispatch 失败在仍持有 claim 时进入延迟 retry；不同 slot 可以并发领取不同 partition，同一 partition 的排他性仍由 store 保证。
+Primary consumer 的 dispatch callback 必须返回 `committed` 或带有有界原因的 `ignored`。`committed` 不再接受裸状态词，必须携带版本化 `DurableLarkAdmissionReceipt`：它把 inbox 的 `eventId`、`partitionKey` 和 App identity 绑定到 durable store 返回的 Session key、lease epoch、record revision 与 store timestamp。consumer 会在 complete inbox claim 前重新校验全部字段；复制自另一事件的 receipt、缺失 epoch/revision 的伪回执，以及只把任务追加到进程内 Promise queue 的 `{ kind: 'committed' }` 都进入 retry，不能冒充 durable admission。
+
+这份 receipt 只证明 canonical Session mutation 已在 fenced owner 下提交，不代表整轮执行完成，也不保存 owner id、prompt、用户身份或 provider 凭据。未来 daemon handler 必须从实际 Session lease 与 CAS write 返回值构造它；当前 live route 尚未接入。长 dispatch 会续租 inbox claim；续租 stale 或失败立即触发 `AbortSignal`，之后既不 complete 也不 retry，由 claim 到期后交给新 owner。普通 dispatch 失败在仍持有 claim 时进入延迟 retry；不同 slot 可以并发领取不同 partition，同一 partition 的排他性仍由 store 保证。
 
 Primary daemon 接线仍有三个硬门禁：
 
@@ -145,10 +147,14 @@ Adapter 复用现有 `sendMessage` / `replyMessage`、`classifyFeishuError` 和 
 `test/durable-inbox-primary-consumer.test.ts` 覆盖：
 
 - committed/ignored receipt 后才 complete；
+- committed receipt 必须绑定当前 event/app/partition 与正数 Session epoch/revision；
+- 裸 committed 和复制自另一 inbox event 的 receipt 进入 retry；
 - 非法 envelope、dispatch failure 和非法 receipt 进入 retry；
 - 长 dispatch claim renew 与最新 claim proof；
 - stale renewal 触发 abort，且不 complete、不 retry；
 - bounded shutdown 中止未结算 dispatch，不伪造完成回执。
+
+`test/durable-lark-admission.test.ts` 覆盖 receipt 的 lease/record 构造、JSON round-trip、inbox identity 重校验，以及非法 epoch/revision/timestamp 与 Session key mismatch。
 
 `test/durable-outbox-pump.test.ts` 覆盖：
 
