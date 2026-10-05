@@ -9,7 +9,7 @@ import {
 export type DurableCoordinationMode = 'disabled' | 'shadow' | 'primary';
 
 export interface DurableCoordinationRuntime {
-  mode: 'shadow';
+  mode: 'shadow' | 'primary';
   provider: string;
   store: DurableCoordinationStore;
   close(): Promise<void>;
@@ -75,12 +75,13 @@ function providerConfig(env: NodeJS.ProcessEnv): ExternalDurableCoordinationStor
 
 export async function initializeDurableCoordinationRuntime(
   env: NodeJS.ProcessEnv = process.env,
+  options: { allowPrimary?: boolean } = {},
 ): Promise<DurableCoordinationRuntime | undefined> {
   const mode = modeFromEnv(env);
   if (mode === 'disabled') return undefined;
-  if (mode === 'primary') {
+  if (mode === 'primary' && options.allowPrimary !== true) {
     throw new Error(
-      'BOTMUX_COORDINATION_MODE=primary is unavailable until primary inbox, complete Session ownership, and outbox pump wiring are complete',
+      'BOTMUX_COORDINATION_MODE=primary is unavailable until the daemon primary data path is explicitly enabled',
     );
   }
   const store = await ExternalDurableCoordinationStore.connect(providerConfig(env));

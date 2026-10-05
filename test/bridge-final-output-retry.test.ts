@@ -301,6 +301,8 @@ describe('Bridge final_output delivery (P2 retry)', () => {
   });
 
   afterEach(async () => {
+    const { setDurableBridgeFinalOutputHandler } = await import('../src/core/worker-pool.js');
+    setDurableBridgeFinalOutputHandler(undefined);
     __testOnly_resetOrdinaryImDeliveries();
     const { __testOnly_closeSkillFeedbackStores } = await import('../src/services/skill-feedback-store.js');
     await __testOnly_closeSkillFeedbackStores();
@@ -588,6 +590,59 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
     },
   );
+
+  it('routes ordinary bridge final output through the durable handler without direct sessionReply', async () => {
+    const sessionReply = vi.fn(async () => 'om_direct_should_not_run');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const {
+      __testOnly_deliverFinalOutput: deliver,
+      setDurableBridgeFinalOutputHandler,
+    } = await import('../src/core/worker-pool.js');
+    const durable = vi.fn(async () => ({ kind: 'delivered' as const, messageId: 'om_durable' }));
+    setDurableBridgeFinalOutputHandler(durable);
+    const ds = makeDs();
+    const onComplete = vi.fn();
+
+    deliver(ds, finalOutputMsg(), 'tag', 0, onComplete, () => true,
+      { mode: 'thread', rootMessageId: 'om_root' });
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(durable).toHaveBeenCalledWith(expect.objectContaining({
+      daemonSession: ds,
+      turnId: 'turn-1',
+      providerUuid: expect.stringMatching(/^bf_/),
+      target: { kind: 'reply', messageId: 'om_root', replyInThread: true },
+      msgType: 'interactive',
+    }));
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(onComplete).toHaveBeenCalledWith(true, 'om_durable');
+  });
+
+  it('fails closed on an ambiguous durable settlement without falling back to direct delivery', async () => {
+    const sessionReply = vi.fn(async () => 'om_direct_should_not_run');
+    initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const {
+      __testOnly_deliverFinalOutput: deliver,
+      setDurableBridgeFinalOutputHandler,
+    } = await import('../src/core/worker-pool.js');
+    setDurableBridgeFinalOutputHandler(vi.fn(async () => ({
+      kind: 'ambiguous' as const,
+      error: 'provider result unknown',
+    })));
+    const ds = makeDs();
+    const onComplete = vi.fn();
+
+    deliver(ds, finalOutputMsg(), 'tag', 0, onComplete, () => true,
+      { mode: 'thread', rootMessageId: 'om_root' });
+    await vi.advanceTimersByTimeAsync(10);
+
+    expect(sessionReply).not.toHaveBeenCalled();
+    expect(ds.agentAttention).toMatchObject({
+      kind: 'blocked',
+      reason: 'Durable final output is ambiguous: provider result unknown',
+    });
+    expect(onComplete).toHaveBeenCalledWith(false);
+  });
 
   it.each(['bridge', 'explicit'] as const)('keeps the %s answer and Oncall source in the existing reply card', async source => {
     vi.useRealTimers();
