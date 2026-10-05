@@ -5,7 +5,12 @@ import type {
   InboxClaim,
   InboxClaimMutationResult,
 } from '../src/services/durable-coordination.js';
-import { startDurableInboxPrimaryConsumer } from '../src/services/durable-inbox-primary-consumer.js';
+import {
+  startDurableInboxPrimaryConsumer,
+  type DurableInboxPrimaryDispatchResult,
+} from '../src/services/durable-inbox-primary-consumer.js';
+import type { DurableLarkMessageClaim } from '../src/services/durable-inbox-shadow.js';
+import { durableLarkAdmissionReceipt } from '../src/services/durable-lark-admission.js';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -35,6 +40,31 @@ function claim(messageId: string, payload?: unknown): InboxClaim {
     claimEpoch: 1,
     claimUntil: 60_000,
     attempts: 1,
+  };
+}
+
+function committed(message: DurableLarkMessageClaim): Extract<
+  DurableInboxPrimaryDispatchResult,
+  { kind: 'committed' }
+> {
+  const sessionKey = `${message.messageId}::${message.larkAppId}`;
+  return {
+    kind: 'committed',
+    receipt: durableLarkAdmissionReceipt({
+      message,
+      lease: {
+        sessionKey,
+        ownerId: 'session-owner-boot',
+        epoch: 3,
+        leaseUntil: 60_000,
+      },
+      record: {
+        sessionKey,
+        revision: 5,
+        value: { status: 'active' },
+        updatedAt: 10_000,
+      },
+    }),
   };
 }
 
@@ -72,16 +102,20 @@ describe('durable inbox primary consumer', () => {
       completed,
     });
     const dispatch = vi.fn(async message => message.messageId === 'om_commit'
-      ? { kind: 'committed' as const }
+      ? committed(message)
       : { kind: 'ignored' as const, reason: 'not addressed to this bot' });
     const commits: string[] = [];
+    const receipts: number[] = [];
     const consumer = startDurableInboxPrimaryConsumer({
       store,
       workerId: 'primary-boot',
       concurrency: 1,
       intervalMs: 60_000,
       dispatch,
-      onCommitted: ({ message }) => commits.push(message.messageId),
+      onCommitted: ({ message, result }) => {
+        commits.push(message.messageId);
+        if (result.kind === 'committed') receipts.push(result.receipt.sessionRevision);
+      },
     });
     await consumer.ready;
 
@@ -95,6 +129,7 @@ describe('durable inbox primary consumer', () => {
       'im.message.receive_v1:cli_test:om_ignore',
     ]);
     expect(commits).toEqual(['om_commit', 'om_ignore']);
+    expect(receipts).toEqual([5]);
     expect(store.completeInboxClaim).toHaveBeenCalledTimes(2);
     expect(store.retryInboxClaim).not.toHaveBeenCalled();
     await consumer.stop();
@@ -164,7 +199,7 @@ describe('durable inbox primary consumer', () => {
         workerId: 'primary-boot',
         concurrency: 1,
         intervalMs: 10,
-        dispatch: async () => ({ kind: 'committed' }),
+        dispatch: async message => committed(message),
         onError: error => errors.push(error),
       });
       await consumer.ready;
@@ -196,6 +231,49 @@ describe('durable inbox primary consumer', () => {
     await consumer.stop();
   });
 
+  it('refuses a bare committed marker without a fenced Session receipt', async () => {
+    const retried: Array<{ claim: InboxClaim; visibleAt: number }> = [];
+    const store = inboxStore({ claims: [claim('om_bare_commit')], retried });
+    const consumer = startDurableInboxPrimaryConsumer({
+      store,
+      workerId: 'primary-boot',
+      concurrency: 1,
+      intervalMs: 60_000,
+      dispatch: async () => ({ kind: 'committed' } as never),
+    });
+    await consumer.ready;
+
+    expect(store.completeInboxClaim).not.toHaveBeenCalled();
+    expect(retried).toHaveLength(1);
+    await consumer.stop();
+  });
+
+  it('refuses a committed receipt copied from another inbox event', async () => {
+    const retried: Array<{ claim: InboxClaim; visibleAt: number }> = [];
+    const store = inboxStore({ claims: [claim('om_expected')], retried });
+    const consumer = startDurableInboxPrimaryConsumer({
+      store,
+      workerId: 'primary-boot',
+      concurrency: 1,
+      intervalMs: 60_000,
+      dispatch: async message => {
+        const result = committed(message);
+        return {
+          ...result,
+          receipt: {
+            ...result.receipt,
+            eventId: 'im.message.receive_v1:cli_test:om_other',
+          },
+        };
+      },
+    });
+    await consumer.ready;
+
+    expect(store.completeInboxClaim).not.toHaveBeenCalled();
+    expect(retried).toHaveLength(1);
+    await consumer.stop();
+  });
+
   it('does not retry a completed row when the observer callback fails', async () => {
     const store = inboxStore({ claims: [claim('om_observer')] });
     const errors: unknown[] = [];
@@ -204,7 +282,7 @@ describe('durable inbox primary consumer', () => {
       workerId: 'primary-boot',
       concurrency: 1,
       intervalMs: 60_000,
-      dispatch: async () => ({ kind: 'committed' }),
+      dispatch: async message => committed(message),
       onCommitted: () => { throw new Error('observer unavailable'); },
       onError: error => errors.push(error),
     });
@@ -222,7 +300,7 @@ describe('durable inbox primary consumer', () => {
       const completed: InboxClaim[] = [];
       const store = inboxStore({ claims: [claim('om_long')], completed });
       const started = deferred<void>();
-      const admission = deferred<{ kind: 'committed' }>();
+      const admission = deferred<void>();
       const consumer = startDurableInboxPrimaryConsumer({
         store,
         workerId: 'primary-boot',
@@ -230,16 +308,16 @@ describe('durable inbox primary consumer', () => {
         intervalMs: 60_000,
         leaseDurationMs: 3_000,
         renewalIntervalMs: 1_000,
-        dispatch: () => {
+        dispatch: message => {
           started.resolve();
-          return admission.promise;
+          return admission.promise.then(() => committed(message));
         },
       });
 
       await started.promise;
       await vi.advanceTimersByTimeAsync(1_000);
       expect(store.renewInboxClaim).toHaveBeenCalledOnce();
-      admission.resolve({ kind: 'committed' });
+      admission.resolve();
       await consumer.ready;
 
       expect(completed).toHaveLength(1);
@@ -257,14 +335,14 @@ describe('durable inbox primary consumer', () => {
       vi.mocked(store.renewInboxClaim).mockResolvedValue({ kind: 'stale' });
       const started = deferred<void>();
       const aborted = deferred<void>();
-      const dispatch = vi.fn(async (_message, { signal }) => {
+      const dispatch = vi.fn(async (message, { signal }) => {
         started.resolve();
         await new Promise<void>(resolve => {
           if (signal.aborted) return resolve();
           signal.addEventListener('abort', () => resolve(), { once: true });
         });
         aborted.resolve();
-        return { kind: 'committed' as const };
+        return committed(message);
       });
       const errors: unknown[] = [];
       const consumer = startDurableInboxPrimaryConsumer({
@@ -301,13 +379,13 @@ describe('durable inbox primary consumer', () => {
       workerId: 'primary-boot',
       concurrency: 1,
       intervalMs: 60_000,
-      dispatch: async (_message, { signal }) => {
+      dispatch: async (message, { signal }) => {
         started.resolve();
         await new Promise<void>(resolve => {
           signal.addEventListener('abort', () => resolve(), { once: true });
         });
         sawAbort.resolve();
-        return { kind: 'committed' };
+        return committed(message);
       },
     });
 
