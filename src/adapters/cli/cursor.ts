@@ -1,3 +1,5 @@
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
@@ -10,6 +12,12 @@ import { delay } from '../../utils/timing.js';
  *  settle + throttle than later writes. Tracked by identity so the warmup state
  *  is shared across adapter instances. Mirrors claude-code's first-write guard. */
 const cursorFirstWriteSeen = new WeakSet<PtyHandle>();
+
+/** botmux ships its built-in skills as a plugin here and injects it per-session via
+ *  `--plugin-dir` (see buildArgs). Kept out of the global `~/.cursor/skills` so a
+ *  user's standalone `cursor-agent` does not see (and mis-fire) them. Single source
+ *  of truth for both the adapter's `pluginDir` field and the spawn-time flag. */
+export const CURSOR_PLUGIN_DIR = join(homedir(), '.botmux', 'cursor-plugin');
 
 export function createCursorAdapter(pathOverride?: string): CliAdapter {
   // resolvedBin is lazy: setup constructs adapters only to read static
@@ -27,7 +35,7 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.cursor'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ resume, resumeSessionId, initialPrompt, model, disableCliBypass }) {
+    buildArgs({ resume, resumeSessionId, initialPrompt, model, disableCliBypass, skillPluginDir, promptInjection }) {
       // --trust pre-answers the "Workspace Trust Required" startup dialog.
       // Without it, the first spawn in a never-trusted directory (= every
       // fresh-worktree topic) blocks on that dialog; the dialog sits silent,
@@ -46,6 +54,10 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
       if (!disableCliBypass) base.push('--force');
       if (model && model.trim()) {
         base.push('--model', model.trim());
+      }
+      if (promptInjection !== 'none') {
+        base.push('--plugin-dir', CURSOR_PLUGIN_DIR);
+        if (skillPluginDir) base.push('--plugin-dir', skillPluginDir);
       }
       if (!resume) {
         if (initialPrompt) base.push(initialPrompt);
@@ -167,7 +179,8 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
     readyPattern: /→\s+(?:Plan, search, build anything|Add a follow-up)/,
     deferFirstPromptTimeoutUntilReady: true,
     supportsTypeAhead: true,
-    skillsDir: '~/.cursor/skills',
+    pluginDir: CURSOR_PLUGIN_DIR,
+    skillDelivery: { nativeKind: 'claude-plugin', supportsScopedSession: true, supportsExclusive: false },
     systemHints: BOTMUX_SHELL_HINTS,
     altScreen: true,
     modelChoices: CLI_MODEL_CHOICES['cursor'],

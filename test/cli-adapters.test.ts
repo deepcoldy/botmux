@@ -32,7 +32,7 @@ import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
-import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
+import { createCursorAdapter, CURSOR_PLUGIN_DIR } from '../src/adapters/cli/cursor.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter, isOpenCodeSessionId } from '../src/adapters/cli/opencode.js';
@@ -1876,6 +1876,39 @@ describe('cursor buildArgs', () => {
     // Guard against over-broad matching: the arrow-prefixed composer glyph is
     // required, so unrelated screen text with the phrase must not false-match.
     expect(adapter.readyPattern?.test('Plan, search, build anything')).toBe(false);
+  });
+
+  it('injects built-in plugin-dir by default and supports session-scoped skillPluginDir', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-cursor',
+      resume: false,
+      skillPluginDir: '/tmp/runtime-skills/sess-cursor/claude-plugin',
+    });
+    expect(args).toContain('--plugin-dir');
+    const pluginIndices = args.flatMap((arg, i) => (arg === '--plugin-dir' ? [i] : []));
+    expect(pluginIndices.length).toBe(2);
+    expect(args[pluginIndices[0] + 1]).toBe(CURSOR_PLUGIN_DIR);
+    expect(args[pluginIndices[1] + 1]).toBe('/tmp/runtime-skills/sess-cursor/claude-plugin');
+  });
+
+  it('omits --plugin-dir when promptInjection is none', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-cursor',
+      resume: false,
+      skillPluginDir: '/tmp/runtime-skills/sess-cursor/claude-plugin',
+      promptInjection: 'none',
+    });
+    expect(args).not.toContain('--plugin-dir');
+  });
+
+  it('declares dynamic pluginDir and claude-plugin skillDelivery capabilities without global skillsDir', () => {
+    expect(adapter.pluginDir).toBe(CURSOR_PLUGIN_DIR);
+    expect(adapter.skillsDir).toBeUndefined();
+    expect(adapter.skillDelivery).toEqual({
+      nativeKind: 'claude-plugin',
+      supportsScopedSession: true,
+      supportsExclusive: false,
+    });
   });
 });
 

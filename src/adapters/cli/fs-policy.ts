@@ -367,7 +367,7 @@ function commonHomeBaseline(h: string): FsRule[] {
     // Scratch/caches every CLI + spawned tool needs.
     rw(`${h}/.cache`), rw(`${h}/.npm`), rw(`${h}/.local/state`),
     // The daemon-written botmux wrapper (head of PATH) + skill plugin dir.
-    ro(`${h}/.botmux/bin`), ro(`${h}/.botmux/claude-plugin`),
+    ro(`${h}/.botmux/bin`), ro(`${h}/.botmux/claude-plugin`), ro(`${h}/.botmux/cursor-plugin`),
     // Installed-plugin registry. Secret-free BY CONTRACT: `assertPublicPluginRegistry`
     // refuses to persist a record carrying `command`/`env`/`url`/`headers`, and a
     // plugin's real MCP descriptor lives in its own `private/mcp.json` — which stays
@@ -893,6 +893,7 @@ export function buildFsPolicy(ctx: FsPolicyContext): FsPolicy {
     `${bh}/.dashboard-port`,    // dashboard port (owner term-link; harmless port int)
     `${bh}/bin`,                // the daemon-written `botmux` wrapper (head of PATH)
     `${bh}/claude-plugin`,      // skill/plugin dir (claude --plugin-dir); no secrets
+    `${bh}/cursor-plugin`,      // skill/plugin dir (cursor --plugin-dir); no secrets
     `${bh}/omp-plugin`,         // skill/plugin dir (omp --plugin-dir); no secrets
     `${bh}/pi-skills`,          // skill dir (pi --skill); no secrets
     `${bh}/lark-scopes.json`,   // static scope catalog

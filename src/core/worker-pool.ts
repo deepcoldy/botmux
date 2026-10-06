@@ -4864,9 +4864,10 @@ export function ensureCliEnv(cliId: CliId, cliPathOverride?: string): void {
 const GLOBAL_CLAUDE_SKILLS_DIR = '~/.claude/skills';
 const GLOBAL_PI_SKILLS_DIR = '~/.pi/agent/skills';
 const GLOBAL_OMP_SKILLS_DIR = '~/.omp/agent/skills';
+const GLOBAL_CURSOR_SKILLS_DIR = '~/.cursor/skills';
 
 /** Unconditionally sweep botmux-owned skills out of the user's global
- *  `~/.claude/skills`, `~/.pi/agent/skills`, and `~/.omp/agent/skills`. botmux owns the `botmux-` namespace
+ *  `~/.claude/skills`, `~/.pi/agent/skills`, `~/.omp/agent/skills`, and `~/.cursor/skills`. botmux owns the `botmux-` namespace
  *  there and injects its skills per-session dynamically, so anything matching is a
  *  leak that would otherwise surface (and mis-fire) in the user's standalone CLI.
  *  Idempotent & best-effort — safe to call repeatedly. */
@@ -4874,6 +4875,7 @@ export function sweepGlobalBotmuxSkills(): void {
   removeGlobalBotmuxSkills(GLOBAL_CLAUDE_SKILLS_DIR);
   removeGlobalBotmuxSkills(GLOBAL_PI_SKILLS_DIR);
   removeGlobalBotmuxSkills(GLOBAL_OMP_SKILLS_DIR);
+  removeGlobalBotmuxSkills(GLOBAL_CURSOR_SKILLS_DIR);
 }
 
 let globalBotmuxSkillsCleaned = false;
