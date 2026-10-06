@@ -328,9 +328,10 @@ describe('independent turn terminal receipt', () => {
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
     (ds.worker as any).emit('message', terminalMsg('om_turn_retry'));
-    await vi.advanceTimersByTimeAsync(0);
-    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1000);
+    // Drain promise continuations and the retry timer as one deterministic
+    // queue. Bun does not guarantee that advanceTimersByTimeAsync(0) resumes
+    // the zero-delay attempt before this assertion, unlike Node/V8.
+    await vi.runAllTimersAsync();
     expect(sessionReplyMock).toHaveBeenCalledTimes(2);
     expect((sessionReplyMock.mock.calls[0]?.[5] as any).uuid)
       .toBe((sessionReplyMock.mock.calls[1]?.[5] as any).uuid);
