@@ -2,6 +2,12 @@ import { describe, expect, it, vi } from 'vitest';
 import type { DurableCoordinationStore } from '../src/services/durable-coordination.js';
 import { startDurableLarkPrimaryRuntime } from '../src/services/durable-lark-primary-runtime.js';
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(next => { resolve = next; });
+  return { promise, resolve };
+}
+
 function store(order: string[]): DurableCoordinationStore {
   return {
     acquireSessionLease: vi.fn(async input => ({
@@ -78,6 +84,76 @@ describe('durable Lark primary runtime', () => {
 
     expect(() => runtime.stop(-1)).toThrow(/timeoutMs/);
     expect(runtime.status()).toEqual({ kind: 'leader', epoch: 1 });
+    await runtime.stop();
+  });
+
+  it('settles an exact delivered result that arrives after timeout ambiguity', async () => {
+    const order: string[] = [];
+    const durableStore = store(order);
+    const delivered = deferred<{ kind: 'delivered'; receipt: { providerMessageId: string } }>();
+    const record = {
+        messageId: 'message-late',
+        sessionKey: 'session-late',
+        payload: { text: 'hello' },
+        visibleAt: 1,
+        createdAt: 1,
+        state: 'reserved' as const,
+        originEpoch: 1,
+        attempts: 0,
+        updatedAt: 1,
+    };
+    const reservation = {
+        record,
+        workerId: 'outbox-boot:0',
+        claimEpoch: 1,
+        claimUntil: 1_001,
+    };
+    const attempt = {
+        ...reservation,
+        record: { ...record, state: 'attempting' as const, attempts: 1 },
+        attempt: 1,
+    };
+    durableStore.reserveNextOutbox = vi.fn()
+      .mockResolvedValueOnce(reservation)
+      .mockResolvedValue(undefined);
+    durableStore.beginOutboxAttempt = vi.fn(async () => ({
+      kind: 'applied' as const,
+      record: attempt.record,
+      attempt,
+    }));
+    durableStore.markOutboxAmbiguous = vi.fn(async () => ({
+      kind: 'applied' as const,
+      record: { ...attempt.record, state: 'ambiguous' as const },
+    }));
+    durableStore.completeOutboxAttempt = vi.fn(async () => ({
+      kind: 'applied' as const,
+      record: { ...attempt.record, state: 'delivered' as const },
+    }));
+    const onError = vi.fn();
+    const runtime = startDurableLarkPrimaryRuntime({
+      store: durableStore,
+      larkAppId: 'cli_test',
+      outboxWorkerId: 'outbox-boot',
+      outboxReservationLeaseMs: 1_000,
+      outboxAttemptTimeoutMs: 100,
+      outboxIntervalMs: 60_000,
+      handleCanonical: async () => ({ kind: 'ignored', reason: 'fixture' }),
+      deliverOutbox: async () => await delivered.promise,
+      onError,
+    });
+
+    await runtime.ready;
+    expect(durableStore.markOutboxAmbiguous).toHaveBeenCalledOnce();
+    expect(durableStore.completeOutboxAttempt).not.toHaveBeenCalled();
+
+    delivered.resolve({ kind: 'delivered', receipt: { providerMessageId: 'om_late' } });
+    await vi.waitFor(() => {
+      expect(durableStore.completeOutboxAttempt).toHaveBeenCalledWith({
+        attempt,
+        receipt: { providerMessageId: 'om_late' },
+      });
+    });
+    expect(onError).not.toHaveBeenCalled();
     await runtime.stop();
   });
 });

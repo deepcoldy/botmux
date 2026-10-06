@@ -1,4 +1,4 @@
-import type { DurableCoordinationStore } from './durable-coordination.js';
+import type { DurableCoordinationStore, OutboxAttempt } from './durable-coordination.js';
 import {
   createDurableLarkCanonicalDispatch,
   type DurableLarkCanonicalDispatchOptions,
@@ -17,6 +17,7 @@ import {
 } from './durable-lark-primary-ingress.js';
 import {
   startDurableOutboxPump,
+  type DurableOutboxDeliveryResult,
   type DurableOutboxPump,
   type DurableOutboxPumpOptions,
   type DurableOutboxPumpStopResult,
@@ -42,6 +43,8 @@ export interface DurableLarkPrimaryRuntimeOptions {
   ingressElectionIntervalMs?: number;
   inboxIntervalMs?: number;
   outboxIntervalMs?: number;
+  outboxReservationLeaseMs?: number;
+  outboxAttemptTimeoutMs?: number;
   shutdownMs?: number;
 }
 
@@ -76,6 +79,9 @@ export function startDurableLarkPrimaryRuntime(
   options: DurableLarkPrimaryRuntimeOptions,
 ): DurableLarkPrimaryRuntime {
   const shutdownMs = boundedInteger(options.shutdownMs ?? 10_000, 'shutdownMs', 0, 300_000);
+  const reportError = (error: unknown): void => {
+    try { options.onError?.(error); } catch { /* observers cannot alter reconciliation */ }
+  };
   const session = createDurableSessionFacade({
     store: options.store,
     ...(options.sessionOwnerId ? { ownerId: options.sessionOwnerId } : {}),
@@ -91,15 +97,36 @@ export function startDurableLarkPrimaryRuntime(
     ...(options.inboxWorkerId ? { workerId: options.inboxWorkerId } : {}),
     ...(options.inboxIntervalMs === undefined ? {} : { intervalMs: options.inboxIntervalMs }),
     shutdownMs,
-    onError: options.onError,
+    onError: reportError,
   });
   const outbox = startDurableOutboxPump({
     store: options.store,
     deliver: options.deliverOutbox,
     ...(options.outboxWorkerId ? { workerId: options.outboxWorkerId } : {}),
     ...(options.outboxIntervalMs === undefined ? {} : { intervalMs: options.outboxIntervalMs }),
+    ...(options.outboxReservationLeaseMs === undefined
+      ? {}
+      : { reservationLeaseMs: options.outboxReservationLeaseMs }),
+    ...(options.outboxAttemptTimeoutMs === undefined
+      ? {}
+      : { attemptTimeoutMs: options.outboxAttemptTimeoutMs }),
     shutdownMs,
-    onError: options.onError,
+    onError: reportError,
+    onLateResult: (attempt: OutboxAttempt, result: DurableOutboxDeliveryResult | Error) => {
+      // Timeout already committed ambiguous. Only an exact delivered receipt
+      // may reconcile that same attempt; late retry/error outcomes stay closed.
+      if (result instanceof Error || result.kind !== 'delivered') return;
+      void options.store.completeOutboxAttempt({ attempt, receipt: result.receipt }).then(
+        mutation => {
+          if (mutation.kind === 'stale') {
+            reportError(new Error(
+              `durable outbox late receipt lost attempt ${attempt.record.messageId}`,
+            ));
+          }
+        },
+        reportError,
+      );
+    },
   });
   const ingress = startDurableLarkPrimaryIngress({
     store: options.store,
@@ -111,7 +138,7 @@ export function startDurableLarkPrimaryRuntime(
     shutdownMs,
     onLeadershipAcquired: options.onLeadershipAcquired,
     onLeadershipLost: options.onLeadershipLost,
-    onError: options.onError,
+    onError: reportError,
   });
   let stopPromise: Promise<DurableLarkPrimaryRuntimeStopResult> | undefined;
   const ready = Promise.all([inbox.ready, outbox.ready, ingress.ready]).then(() => undefined);
