@@ -9139,6 +9139,26 @@ function applyHerdrWebBindingResult(
   }
 }
 
+/** Keep already-connected read-only viewers aligned with an owned tmux grid.
+ *
+ * A read-only socket never drives the shared pane, but a writable socket may
+ * resize it later. Without a fresh pin those existing followers keep rendering
+ * at their connection-time dimensions until they reload the page. TmuxPipeBackend
+ * resize/getPaneSize are synchronous, so publish the authoritative post-resize
+ * grid rather than trusting the browser request.
+ */
+function broadcastOwnedTmuxReadOnlyFollowerGrid(): void {
+  if (effectiveBackendType !== 'tmux' || !isPipeMode || lastInitConfig?.adoptMode) return;
+  const size = backend?.getPaneSize?.();
+  if (!size) return;
+  const payload = `\x1b]1989;follower;${size.cols};${size.rows}\x07`;
+  for (const client of wsClients) {
+    if (client.readyState === WebSocket.OPEN && !authedClients.has(client)) {
+      client.send(payload);
+    }
+  }
+}
+
 /**
  * /restart replaces a managed Herdr backend without closing browser sockets.
  * Restore every viewer in connection order so the previous oldest surviving
@@ -20228,6 +20248,7 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               applyHerdrWebBindingResult(ws, result);
               if (!result.backend && !readOnlyFollowsBackendGrid) {
                 backend?.resize(msg.cols, msg.rows);
+                broadcastOwnedTmuxReadOnlyFollowerGrid();
               }
             } else if (msg.type === 'input' && typeof msg.data === 'string') {
               // Mouse protocols can encode approvals/actions as well as wheel input.

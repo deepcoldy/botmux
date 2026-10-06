@@ -41,9 +41,10 @@ function paneSize(sessionName: string): string {
   }
 }
 
-function openSocket(url: string): Promise<WebSocket> {
+function openSocket(url: string, frames?: string[]): Promise<WebSocket> {
   return new Promise((resolvePromise, rejectPromise) => {
     const socket = new WebSocket(url);
+    socket.on('message', data => frames?.push(String(data)));
     const timer = setTimeout(() => rejectPromise(new Error('Web Terminal socket timeout')), 5_000);
     socket.once('open', () => {
       clearTimeout(timer);
@@ -119,19 +120,30 @@ setInterval(() => {}, 1_000);
     const ready = await readyPromise;
     await waitFor(() => paneSize(tmuxSession) === '160x50', `initial pane size: ${paneSize(tmuxSession)}`);
 
+    const readFrames: string[] = [];
     const readSocket = await openSocket(
       `ws://127.0.0.1:${ready.port}/?viewToken=${encodeURIComponent(ready.viewToken!)}`,
+      readFrames,
+    );
+    await waitFor(
+      () => readFrames.join('').includes('\x1b]1989;160;50\x07'),
+      `read-only initial grid pin missing: ${JSON.stringify(readFrames)}`,
     );
     readSocket.send(JSON.stringify({ type: 'resize', cols: 60, rows: 56 }));
     await new Promise<void>(resolveDelay => setTimeout(resolveDelay, 250));
     expect(paneSize(tmuxSession)).toBe('160x50');
-    readSocket.close();
+    expect(readFrames.join('')).not.toContain('\x1b]1989;follower;60;56\x07');
 
     const writeSocket = await openSocket(
       `ws://127.0.0.1:${ready.port}/?token=${encodeURIComponent(ready.token)}`,
     );
     writeSocket.send(JSON.stringify({ type: 'resize', cols: 100, rows: 40 }));
     await waitFor(() => paneSize(tmuxSession) === '100x40', `writable pane size: ${paneSize(tmuxSession)}`);
+    await waitFor(
+      () => readFrames.join('').includes('\x1b]1989;follower;100;40\x07'),
+      `read-only follower did not receive writable grid update: ${JSON.stringify(readFrames)}`,
+    );
+    readSocket.close();
     writeSocket.close();
 
     const childExit = new Promise<void>(resolveExit => child.once('exit', () => resolveExit()));

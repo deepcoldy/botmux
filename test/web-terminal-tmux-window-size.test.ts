@@ -30,6 +30,7 @@ describe('web terminal tmux attach sizing', () => {
     expect(sharedRelay).toContain('if (readOnlyFollowsBackendGrid)')
     expect(sharedRelay).toContain('backend?.getPaneSize?.() ?? { cols: renderCols, rows: renderRows }')
     expect(sharedRelay).toContain('if (!result.backend && !readOnlyFollowsBackendGrid)')
+    expect(sharedRelay).toContain('broadcastOwnedTmuxReadOnlyFollowerGrid()')
     expect(sharedRelay).not.toContain("hasWrite || effectiveBackendType !== 'remote-runner'")
   })
 })
