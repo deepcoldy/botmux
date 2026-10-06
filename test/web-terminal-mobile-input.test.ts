@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
+import { formatMobileInputModeOsc } from '../src/services/web-terminal-settings-store.js';
 
 const workerSource = (): string => readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
 
@@ -672,9 +673,77 @@ describe('手机 Web 终端输入栏', () => {
     expect(page.bar.getAttribute('data-mode')).toBe('buffer');
   });
 
-  it('输入模式切换绝不使用 Local Storage（多设备由服务端保持一致）', () => {
+  it('客户端线协议：_wbSyncMobileInputMode 将模式切换序列化为 JSON 发往服务端', () => {
     const source = workerSource();
-    expect(source).not.toMatch(/localStorage\.(get|set)Item\([^)]*mode/i);
-    expect(source).not.toMatch(/localStorage\.(get|set)Item\([^)]*mobile/i);
+    const match = source.match(/var _wbSyncMobileInputMode=(function\(m\)\{[\s\S]*?\});/);
+    expect(match, 'worker.ts 中必须定义 _wbSyncMobileInputMode').not.toBeNull();
+
+    const sent: string[] = [];
+    const mockWs = {
+      readyState: 1,
+      send: (data: string) => sent.push(data),
+    };
+
+    const createSyncFn = new Function('ws_', `return (${match![1]});`) as (ws_: unknown) => (m: string) => void;
+    const syncFn = createSyncFn(mockWs);
+
+    syncFn('live');
+    expect(sent).toEqual([JSON.stringify({ type: 'mobile_input_mode', mode: 'live' })]);
+
+    sent.length = 0;
+    syncFn('buffer');
+    expect(sent).toEqual([JSON.stringify({ type: 'mobile_input_mode', mode: 'buffer' })]);
+
+    // WebSocket 未就绪时不发送且不抛出异常
+    const closedSync = createSyncFn({ readyState: 0, send: () => {} });
+    expect(() => closedSync('live')).not.toThrow();
+  });
+
+  it('服务端到客户端线协议：页面正则严格匹配 OSC 1989 格式并提取模式', () => {
+    const source = workerSource();
+    expect(source).toContain('_mim=data.match(/\\\\x1b\\\\]1989;mobile_input_mode;(live|buffer)\\\\x07/);');
+
+    // 页面运行态下转义层消耗后的实际正则表达式
+    const browserRegex = /\x1b\]1989;mobile_input_mode;(live|buffer)\x07/;
+
+    const liveOsc = formatMobileInputModeOsc('live');
+    const bufferOsc = formatMobileInputModeOsc('buffer');
+
+    expect(liveOsc).toBe('\x1b]1989;mobile_input_mode;live\x07');
+    expect(bufferOsc).toBe('\x1b]1989;mobile_input_mode;buffer\x07');
+
+    const mLive = `data-start${liveOsc}data-end`.match(browserRegex);
+    expect(mLive).not.toBeNull();
+    expect(mLive![1]).toBe('live');
+
+    const mBuffer = bufferOsc.match(browserRegex);
+    expect(mBuffer).not.toBeNull();
+    expect(mBuffer![1]).toBe('buffer');
+
+    expect('something else'.match(browserRegex)).toBeNull();
+    expect('\x1b]1989;mobile_input_mode;invalid\x07'.match(browserRegex)).toBeNull();
+  });
+
+  it('服务端线协议分发：合法 mobile_input_mode 消息更新存储并向其他已授权客户端广播', () => {
+    const source = workerSource();
+    expect(source).toContain("msg.type === 'mobile_input_mode' && (msg.mode === 'buffer' || msg.mode === 'live')");
+    expect(source).toMatch(/msg\.type === 'mobile_input_mode'[\s\S]*?if \(!authedClients\.has\(ws\)\) return;/);
+    expect(source).toMatch(/client !== ws && authedClients\.has\(client\)/);
+  });
+
+  it('输入模式切换绝不使用 Local Storage（仅工具栏位置记忆使用 localStorage）', () => {
+    const source = workerSource();
+    const storageCalls = [...source.matchAll(/localStorage\.[a-zA-Z]+/g)].map(m => m[0]);
+    expect(storageCalls.length).toBeGreaterThan(0);
+    for (const call of storageCalls) {
+      expect(['localStorage.getItem', 'localStorage.setItem']).toContain(call);
+    }
+
+    const storageLines = source.split('\n').filter(line => line.includes('localStorage.'));
+    for (const line of storageLines) {
+      expect(line).toContain('_toolbarPositionKey');
+      expect(line).not.toMatch(/mode|mobile|input|buffer|live/i);
+    }
+    expect(source).not.toContain('sessionStorage');
   });
 });

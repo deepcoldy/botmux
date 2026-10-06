@@ -108,6 +108,7 @@ import {
   ReadOnlyRemoteScrollLimiter,
 } from './utils/web-terminal-scroll.js';
 import {
+  formatMobileInputModeOsc,
   getWebTerminalInputMode,
   setWebTerminalInputMode,
   type WebTerminalInputMode,
@@ -19888,9 +19889,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       const localTerminalBackend = effectiveBackendType === 'pty'
         || effectiveBackendType === 'tmux'
         || effectiveBackendType === 'zellij';
+      // 避免手机 Webview 或浏览器缓存包含动态首态（如动态 initialMobileInputMode）的 HTML
       res.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
-        'Cache-Control': 'no-cache',
+        'Cache-Control': 'no-store',
       });
       res.end(getTerminalHtml(hasWrite, platformReadonly || platformReadonlyHint, loginUrl, forceRemoteScroll, localTerminalBackend, allowReadOnlyRemoteScroll));
     });
@@ -19974,9 +19976,15 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
       // frame #1 of a connection as control, so PTY output can never be mistaken
       // for it. Nothing awaits between `wsClients.add` above and this send.
       try { ws.send(terminalWriteFrame(hasWrite)); } catch { /* already closing */ }
-      const currentInputMode = getWebTerminalInputMode();
-      if (hasWrite && currentInputMode) {
-        try { ws.send(`\x1b]1989;mobile_input_mode;${currentInputMode}\x07`); } catch { /* already closing */ }
+      const currentInputMode = getWebTerminalInputMode(sessionId);
+      if (hasWrite) {
+        // 带内 OSC 1989 序列：仅下发移动端输入模式 UI 呈现（缓冲上屏 vs 实时输入）。
+        // 安全边界说明：
+        // ① 该帧仅控制客户端工具栏/输入框交互逻辑，不携带或授予任何服务端写权限；
+        // ② 服务端终端输入转发严格受 authedClients 门禁保护；终端内进程若伪造该字节流，
+        //    最多改变前端输入面板交互形态，无法越权写入或绕过授权检查；
+        // ③ 模式帧格式与现有 _hh/_hf/_ho/_fs 同族，遵循相同 OSC 1989 设计规范。
+        try { ws.send(formatMobileInputModeOsc(currentInputMode)); } catch { /* already closing */ }
       }
       // A signed Dashboard grant is fixed-expiry — for READ scope as much as
       // for write (P1-5). Even if the central proxy's socket invalidation is
@@ -20256,10 +20264,10 @@ function startWebServer(host: string, preferredPort?: number): Promise<number> {
               backend?.write(msg.data);
             } else if (msg.type === 'mobile_input_mode' && (msg.mode === 'buffer' || msg.mode === 'live')) {
               if (!authedClients.has(ws)) return;
-              setWebTerminalInputMode(msg.mode);
+              setWebTerminalInputMode(msg.mode, sessionId);
               for (const client of wsClients) {
                 if (client !== ws && authedClients.has(client) && client.readyState === WebSocket.OPEN) {
-                  try { client.send(`\x1b]1989;mobile_input_mode;${msg.mode}\x07`); } catch { /* ignore */ }
+                  try { client.send(formatMobileInputModeOsc(msg.mode)); } catch { /* ignore */ }
                 }
               }
             }
@@ -20295,7 +20303,7 @@ function getTerminalHtml(
   forceRemoteScroll = false,
   localTerminalBackend = false,
   allowReadOnlyRemoteScroll = false,
-  initialMobileInputMode: WebTerminalInputMode = getWebTerminalInputMode(),
+  initialMobileInputMode: WebTerminalInputMode = getWebTerminalInputMode(sessionId),
 ): string {
   const label = sessionId.substring(0, 8);
   return `<!DOCTYPE html>
@@ -21063,6 +21071,8 @@ if(typeof ResizeObserver!=='undefined'){
     // can't be resized, so FitAddon-to-browser would wrap the snapshot lines).
     var _fs=data.match(/\\x1b\\]1989;(\\d+);(\\d+)\\x07/);
     if(_fs){_setFixedGrid(true);var _c=+_fs[1],_r=+_fs[2];if(_c>0&&_r>0){try{term.resize(_c,_r)}catch(ex){}}data=data.replace(_fs[0],'')}
+    // botmux OSC 1989: 移动端输入模式呈现同步（buffer 缓冲 / live 实时）。
+    // 纯显示/交互态控制帧，不改变服务端权限门禁。
     var _mim=data.match(/\\x1b\\]1989;mobile_input_mode;(live|buffer)\\x07/);
     if(_mim){data=data.replace(_mim[0],'');if(_wbSetMobileInputMode){try{_wbSetMobileInputMode(_mim[1]);}catch(ex){}}if(!data)return;}
     // Intercept OSC 52 clipboard sequence from tmux (set-clipboard on)
