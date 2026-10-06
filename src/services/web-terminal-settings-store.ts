@@ -23,13 +23,15 @@ const MAX_STORED_SESSIONS = 500;
 
 export const MOBILE_INPUT_MODE_OSC_PREFIX = '\x1b]1989;mobile_input_mode;';
 export const MOBILE_INPUT_MODE_OSC_SUFFIX = '\x07';
+export const MOBILE_INPUT_MODE_OSC_PATTERN = '\\x1b\\]1989;mobile_input_mode;(live|buffer)\\x07';
+export const MOBILE_INPUT_MODE_OSC_REGEX = new RegExp(MOBILE_INPUT_MODE_OSC_PATTERN);
 
 export function formatMobileInputModeOsc(mode: WebTerminalInputMode): string {
   return `${MOBILE_INPUT_MODE_OSC_PREFIX}${mode}${MOBILE_INPUT_MODE_OSC_SUFFIX}`;
 }
 
 export function parseMobileInputModeOsc(data: string): { mode: WebTerminalInputMode; cleaned: string } | null {
-  const match = data.match(/\x1b\]1989;mobile_input_mode;(live|buffer)\x07/);
+  const match = data.match(MOBILE_INPUT_MODE_OSC_REGEX);
   if (!match) return null;
   return {
     mode: match[1] as WebTerminalInputMode,
@@ -38,20 +40,13 @@ export function parseMobileInputModeOsc(data: string): { mode: WebTerminalInputM
 }
 
 export function resolveSettingsOptions(
-  sessionIdOrOptions?: string | WebTerminalSettingsOptions,
-  maybeDataDir?: string,
+  optionsOrSessionId?: string | WebTerminalSettingsOptions,
 ): { sessionId?: string; dataDir?: string } {
-  if (typeof sessionIdOrOptions === 'object' && sessionIdOrOptions !== null) {
-    return sessionIdOrOptions;
+  if (typeof optionsOrSessionId === 'string') {
+    return { sessionId: optionsOrSessionId };
   }
-  if (maybeDataDir !== undefined) {
-    return { sessionId: sessionIdOrOptions, dataDir: maybeDataDir };
-  }
-  if (typeof sessionIdOrOptions === 'string') {
-    if (sessionIdOrOptions.includes('/') || sessionIdOrOptions.includes('\\')) {
-      return { dataDir: sessionIdOrOptions };
-    }
-    return { sessionId: sessionIdOrOptions };
+  if (typeof optionsOrSessionId === 'object' && optionsOrSessionId !== null) {
+    return optionsOrSessionId;
   }
   return {};
 }
@@ -62,10 +57,9 @@ function resolveSettingsFilePath(dataDir?: string): string {
 }
 
 export function getWebTerminalInputMode(
-  sessionIdOrOptions?: string | WebTerminalSettingsOptions,
-  maybeDataDir?: string,
+  optionsOrSessionId?: string | WebTerminalSettingsOptions,
 ): WebTerminalInputMode {
-  const { sessionId, dataDir } = resolveSettingsOptions(sessionIdOrOptions, maybeDataDir);
+  const { sessionId, dataDir } = resolveSettingsOptions(optionsOrSessionId);
   try {
     const filePath = resolveSettingsFilePath(dataDir);
     if (!existsSync(filePath)) return 'buffer';
@@ -83,11 +77,10 @@ export function getWebTerminalInputMode(
 
 export function setWebTerminalInputMode(
   mode: WebTerminalInputMode,
-  sessionIdOrOptions?: string | WebTerminalSettingsOptions,
-  maybeDataDir?: string,
+  optionsOrSessionId?: string | WebTerminalSettingsOptions,
 ): void {
   const normalized: WebTerminalInputMode = mode === 'live' ? 'live' : 'buffer';
-  const { sessionId, dataDir } = resolveSettingsOptions(sessionIdOrOptions, maybeDataDir);
+  const { sessionId, dataDir } = resolveSettingsOptions(optionsOrSessionId);
   try {
     const filePath = resolveSettingsFilePath(dataDir);
     mkdirSync(dirname(filePath), { recursive: true });
@@ -108,6 +101,8 @@ export function setWebTerminalInputMode(
     existing.mobileInputMode = normalized;
     if (sessionId) {
       existing.sessions = existing.sessions ?? {};
+      // 先 delete 再赋值，使当前 key 移动到键序末尾，维持真正的 LRU 淘汰顺序
+      delete existing.sessions[sessionId];
       existing.sessions[sessionId] = normalized;
       const keys = Object.keys(existing.sessions);
       if (keys.length > MAX_STORED_SESSIONS) {

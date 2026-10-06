@@ -110,6 +110,7 @@ import {
 import {
   formatMobileInputModeOsc,
   getWebTerminalInputMode,
+  MOBILE_INPUT_MODE_OSC_REGEX,
   setWebTerminalInputMode,
   type WebTerminalInputMode,
 } from './services/web-terminal-settings-store.js';
@@ -20561,6 +20562,7 @@ var localTerminalBackend=${localTerminalBackend};
 var readOnlyRemoteScroll=${allowReadOnlyRemoteScroll};
 var _wbInitialMobileInputMode=${JSON.stringify(initialMobileInputMode)};
 var _wbSetMobileInputMode=null;
+var _wbMimRegex=new RegExp(${JSON.stringify(MOBILE_INPUT_MODE_OSC_REGEX.source)});
 var _wbSyncMobileInputMode=function(m){try{if(ws_&&ws_.readyState===1){ws_.send(JSON.stringify({type:'mobile_input_mode',mode:m}));}}catch(_e){}};
 if(!hasToken){
   if(platformReadonly){var _lb=document.getElementById('login-banner');_lb.classList.add('show');}
@@ -21072,8 +21074,8 @@ if(typeof ResizeObserver!=='undefined'){
     var _fs=data.match(/\\x1b\\]1989;(\\d+);(\\d+)\\x07/);
     if(_fs){_setFixedGrid(true);var _c=+_fs[1],_r=+_fs[2];if(_c>0&&_r>0){try{term.resize(_c,_r)}catch(ex){}}data=data.replace(_fs[0],'')}
     // botmux OSC 1989: 移动端输入模式呈现同步（buffer 缓冲 / live 实时）。
-    // 纯显示/交互态控制帧，不改变服务端权限门禁。
-    var _mim=data.match(/\\x1b\\]1989;mobile_input_mode;(live|buffer)\\x07/);
+    // 纯显示/交互态控制帧，不改变服务端权限门禁。使用服务端共享正则编译实例。
+    var _mim=data.match(_wbMimRegex);
     if(_mim){data=data.replace(_mim[0],'');if(_wbSetMobileInputMode){try{_wbSetMobileInputMode(_mim[1]);}catch(ex){}}if(!data)return;}
     // Intercept OSC 52 clipboard sequence from tmux (set-clipboard on)
     var m=data.match(/\\x1b\\]52;[^;]*;([A-Za-z0-9+/=]+)(?:\\x07|\\x1b\\\\)/);

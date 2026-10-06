@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { formatMobileInputModeOsc } from '../src/services/web-terminal-settings-store.js';
+import { formatMobileInputModeOsc, MOBILE_INPUT_MODE_OSC_REGEX } from '../src/services/web-terminal-settings-store.js';
 
 const workerSource = (): string => readFileSync(join(process.cwd(), 'src/worker.ts'), 'utf8');
 
@@ -699,12 +699,14 @@ describe('手机 Web 终端输入栏', () => {
     expect(() => closedSync('live')).not.toThrow();
   });
 
-  it('服务端到客户端线协议：页面正则严格匹配 OSC 1989 格式并提取模式', () => {
+  it('服务端到客户端线协议：页面使用服务端共享 MOBILE_INPUT_MODE_OSC_REGEX 编译并提取模式', () => {
     const source = workerSource();
-    expect(source).toContain('_mim=data.match(/\\\\x1b\\\\]1989;mobile_input_mode;(live|buffer)\\\\x07/);');
+    // 页面内通过统一导出的 MOBILE_INPUT_MODE_OSC_REGEX.source 编译 _wbMimRegex
+    expect(source).toContain('var _wbMimRegex=new RegExp(${JSON.stringify(MOBILE_INPUT_MODE_OSC_REGEX.source)});');
+    expect(source).toContain('var _mim=data.match(_wbMimRegex);');
 
-    // 页面运行态下转义层消耗后的实际正则表达式
-    const browserRegex = /\x1b\]1989;mobile_input_mode;(live|buffer)\x07/;
+    // 页面运行态下实例化的正则对象
+    const browserRegex = new RegExp(MOBILE_INPUT_MODE_OSC_REGEX.source);
 
     const liveOsc = formatMobileInputModeOsc('live');
     const bufferOsc = formatMobileInputModeOsc('buffer');
@@ -731,8 +733,14 @@ describe('手机 Web 终端输入栏', () => {
     expect(source).toMatch(/client !== ws && authedClients\.has\(client\)/);
   });
 
-  it('输入模式切换绝不使用 Local Storage（仅工具栏位置记忆使用 localStorage）', () => {
+  it('输入模式切换绝不使用客户端本地存储（仅浮动工具栏位置使用 localStorage）', () => {
     const source = workerSource();
+    // 杜绝 sessionStorage / indexedDB / WebSQL 等任何其他客户端持久化机制
+    expect(source).not.toContain('sessionStorage');
+    expect(source).not.toContain('indexedDB');
+    expect(source).not.toContain('openDatabase');
+
+    // 严密审计全部 localStorage API 调用
     const storageCalls = [...source.matchAll(/localStorage\.[a-zA-Z]+/g)].map(m => m[0]);
     expect(storageCalls.length).toBeGreaterThan(0);
     for (const call of storageCalls) {
@@ -740,10 +748,10 @@ describe('手机 Web 终端输入栏', () => {
     }
 
     const storageLines = source.split('\n').filter(line => line.includes('localStorage.'));
+    expect(storageLines.length).toBe(2);
     for (const line of storageLines) {
       expect(line).toContain('_toolbarPositionKey');
-      expect(line).not.toMatch(/mode|mobile|input|buffer|live/i);
+      expect(line).not.toMatch(/mode|mobile|input|buffer|live|setting/i);
     }
-    expect(source).not.toContain('sessionStorage');
   });
 });
