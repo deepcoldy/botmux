@@ -209,8 +209,11 @@ export interface DurableOutboxStore {
   enqueueOutbox(input: EnqueueOutboxInput): Promise<DurableInsertResult | { kind: 'stale_lease' }>;
   reserveNextOutbox(input: ReserveOutboxInput): Promise<OutboxReservation | undefined>;
   beginOutboxAttempt(input: BeginOutboxAttemptInput): Promise<BeginOutboxAttemptResult>;
+  /** 精确 attempt 的 delivered receipt 可以结算 attempting 或 ambiguous。 */
   completeOutboxAttempt(input: CompleteOutboxAttemptInput): Promise<OutboxMutationResult>;
+  /** 自动 safe-retry 只允许从 attempting 回到 pending；绝不能重开 ambiguous。 */
   retryOutboxAttempt(input: RetryOutboxAttemptInput): Promise<OutboxMutationResult>;
+  /** 只有当前 attempting attempt 可以进入 ambiguous。 */
   markOutboxAmbiguous(input: MarkOutboxAmbiguousInput): Promise<OutboxMutationResult>;
   readOutbox(messageId: string): Promise<DurableOutboxRecord | undefined>;
 }

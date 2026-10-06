@@ -69,6 +69,39 @@ describe('SQLite durable coordination contract', () => {
     await store.close();
   });
 
+  it('rejects stale lease renewal and both Session CAS mismatch legs', async () => {
+    let now = 1;
+    const store = makeStore(() => now);
+    const first = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-existing', ownerId: 'worker-a', leaseDurationMs: 10,
+    }));
+    await store.writeSession({ lease: first, expectedRevision: null, value: { revision: 1 } });
+    expect(await store.writeSession({
+      lease: first, expectedRevision: 2, value: { revision: 2 },
+    })).toMatchObject({ kind: 'conflict', current: { revision: 1 } });
+
+    const missing = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-missing', ownerId: 'worker-a', leaseDurationMs: 10,
+    }));
+    expect(await store.writeSession({
+      lease: missing, expectedRevision: 1, value: { impossible: true },
+    })).toEqual({ kind: 'conflict' });
+
+    now = 11;
+    expect(await store.renewSessionLease({ lease: first, leaseDurationMs: 10 }))
+      .toEqual({ kind: 'stale' });
+    const takeover = acquired(await store.acquireSessionLease({
+      sessionKey: 'session-existing', ownerId: 'worker-b', leaseDurationMs: 10,
+    }));
+    expect(takeover.epoch).toBe(2);
+    expect(await store.renewSessionLease({ lease: first, leaseDurationMs: 10 }))
+      .toEqual({ kind: 'stale' });
+    now = 12;
+    expect(await store.renewSessionLease({ lease: takeover, leaseDurationMs: 10 }))
+      .toMatchObject({ kind: 'applied', lease: { ownerId: 'worker-b', epoch: 2, leaseUntil: 22 } });
+    await store.close();
+  });
+
   it('deduplicates inbox events and serializes each partition without blocking others', async () => {
     let now = 10;
     const store = makeStore(() => now);
@@ -131,6 +164,28 @@ describe('SQLite durable coordination contract', () => {
     expect(await store.completeInboxClaim(retried!)).toEqual({ kind: 'applied' });
     expect(await store.claimNextInbox({ workerId: 'worker-c', leaseDurationMs: 20 }))
       .toMatchObject({ event: { eventId: 'event-later' } });
+    await store.close();
+  });
+
+  it('rejects inbox renewal after expiry or takeover', async () => {
+    let now = 1;
+    const store = makeStore(() => now);
+    await store.enqueueInbox({
+      eventId: 'event-renew', partitionKey: 'chat-a', payload: {}, visibleAt: 0, createdAt: 1,
+    });
+    const first = await store.claimNextInbox({ workerId: 'worker-a', leaseDurationMs: 10 });
+    if (!first) throw new Error('expected first inbox claim');
+    now = 11;
+    expect(await store.renewInboxClaim({ claim: first, leaseDurationMs: 10 }))
+      .toEqual({ kind: 'stale' });
+    const takeover = await store.claimNextInbox({ workerId: 'worker-b', leaseDurationMs: 10 });
+    if (!takeover) throw new Error('expected inbox takeover');
+    expect(takeover.claimEpoch).toBe(2);
+    expect(await store.renewInboxClaim({ claim: first, leaseDurationMs: 10 }))
+      .toEqual({ kind: 'stale' });
+    now = 12;
+    expect(await store.renewInboxClaim({ claim: takeover, leaseDurationMs: 10 }))
+      .toMatchObject({ kind: 'applied', claim: { workerId: 'worker-b', claimEpoch: 2, claimUntil: 22 } });
     await store.close();
   });
 
@@ -251,8 +306,21 @@ describe('SQLite durable coordination contract', () => {
     expect(await store.readOutbox('message-ambiguous')).toMatchObject({
       state: 'ambiguous', attempts: 1, lastError: 'delivery attempt lease expired before receipt',
     });
-    // Exact delayed receipt may still settle the same attempt. A different claim epoch cannot.
+    expect(await store.retryOutboxAttempt({
+      attempt: begun.attempt, visibleAt: 30, error: 'must not reopen result-unknown work',
+    })).toEqual({ kind: 'stale' });
+    expect(await store.markOutboxAmbiguous({
+      attempt: begun.attempt, error: 'already ambiguous',
+    })).toEqual({ kind: 'stale' });
+    expect(await store.readOutbox('message-ambiguous')).toMatchObject({
+      state: 'ambiguous', attempts: 1,
+    });
+    // Exact delayed receipt may still settle the same attempt. A different claim epoch/attempt cannot.
     now = 13;
+    expect(await store.completeOutboxAttempt({
+      attempt: { ...begun.attempt, attempt: begun.attempt.attempt + 1 },
+      receipt: { platformMessageId: 'om_wrong_attempt' },
+    })).toEqual({ kind: 'stale' });
     expect(await store.completeOutboxAttempt({
       attempt: begun.attempt, receipt: { platformMessageId: 'om_late' },
     })).toMatchObject({ kind: 'applied', record: { state: 'delivered' } });
@@ -275,6 +343,9 @@ describe('SQLite durable coordination contract', () => {
     expect(await store.markOutboxAmbiguous({
       attempt: nextAttempt.attempt, error: 'transport outcome unknown',
     })).toMatchObject({ kind: 'applied', record: { state: 'ambiguous' } });
+    expect(await store.retryOutboxAttempt({
+      attempt: nextAttempt.attempt, visibleAt: 40, error: 'must stay ambiguous',
+    })).toEqual({ kind: 'stale' });
     expect(await store.completeOutboxAttempt({
       attempt: nextAttempt.attempt, receipt: { platformMessageId: 'om_delayed' },
     })).toMatchObject({ kind: 'applied', record: { state: 'delivered' } });
