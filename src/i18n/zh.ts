@@ -1192,7 +1192,7 @@ export const messages: Record<string, string> = {
   'worker.failed_reason_unavailable': '未提供可安全展示的错误摘要',
   'worker.silent_turn_receipt': '🪧 本轮已处理完毕：我判定这条消息无需回复（自动回执）。如需我必须回话，请再 @ 我并明确要求答复。',
   'worker.turn_terminal_receipt.completed': '✓ 本轮已结束 · 等待输入',
-  'worker.turn_terminal_receipt.silent': '✓ 本轮已结束 · 无需回复 · 等待输入',
+  'worker.turn_terminal_receipt.silent': '✓ 本轮已结束 · AI 判断无需发消息 · 等待输入',
   'worker.turn_terminal_receipt.stopped': '⚠ 本轮已停止 · 未正常结束',
   'worker.empty_final_failed': '⚠️ {cliName} 本轮执行失败：{reason}\n完整错误已保留在 Web 终端和 daemon 日志中；排除问题后请重发消息。',
   'worker.empty_final_failed_invalid_request': '⚠️ {cliName} 请求被拒绝：{reason}\n请检查 CLI、模型网关和工具 schema 配置，修复后重发消息。',
