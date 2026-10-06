@@ -3,8 +3,9 @@ import { vol } from 'memfs';
 import { homedir } from 'node:os';
 import { resolveReplyImages, type ReplyImageState } from '../src/im/lark/reply-images.js';
 
-vi.mock('node:fs', async () => {
-  const { fs } = await import('memfs');
+vi.mock('node:fs', () => {
+  // Bun deadlocks on await import inside a mock factory; require works in both runners.
+  const { fs }: typeof import('memfs') = require('memfs');
   return { ...fs, default: fs };
 });
 
