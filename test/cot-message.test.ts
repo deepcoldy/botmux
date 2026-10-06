@@ -695,13 +695,23 @@ describe('finalizeCotMessage', () => {
     expect(request.mock.calls.length).toBe(putCount);
   });
 
-  it('maps non-completed terminals to interrupted', async () => {
+  it.each(['failed', 'cancelled', 'ambiguous'] as const)('closes %s terminals through the error endpoint', async status => {
     const ds = makeDs();
     handleCotThinkingUpdate(ds, upd([think('step 1')]));
     await flush();
-    finalizeCotMessage(ds, 'om_turn1', 'cancelled');
+    finalizeCotMessage(ds, 'om_turn1', status);
     await flush();
-    expect(pushedEvents().at(-1)!.content.status).toBe('interrupted');
+    expect(pushedEvents().some(event => event.type === 'RUN_FINISHED')).toBe(false);
+    const complete = request.mock.calls.filter(([req]) => String(req.url).includes('/message_cot/complete/'));
+    expect(complete).toHaveLength(1);
+    expect(complete[0][0].params).toEqual({ message_id: 'om_cot_msg1', reason: 'error' });
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
+    const calls = request.mock.calls.length;
+    finalizeCotMessage(ds, 'om_turn1', status);
+    abortCotMessage(ds);
+    await settleCotMessageForShutdown(ds);
+    await flush();
+    expect(request.mock.calls.length).toBe(calls);
   });
 
   it('returns false for unknown turns and disabled states', async () => {
@@ -885,9 +895,11 @@ describe('abortCotMessage (worker died without turn_terminal)', () => {
     expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(true);
     abortCotMessage(ds);
     await flush();
-    const last = pushedEvents().at(-1)!;
-    expect(last.type).toBe('RUN_FINISHED');
-    expect(last.content.status).toBe('interrupted');
+    expect(pushedEvents().some(event => event.type === 'RUN_FINISHED')).toBe(false);
+    expect(pushedEvents().some(event => event.content.delta === t('cot.worker_disconnected', {}, localeForBot('app1')))).toBe(true);
+    const complete = request.mock.calls.find(([req]) => String(req.url).includes('/message_cot/complete/'));
+    expect(complete?.[0].params).toEqual({ message_id: 'om_cot_msg1', reason: 'error' });
+    expect(request.mock.calls.at(-1)).toBe(complete);
     expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
     // Idempotent: a repeat abort (or a late finalize) pushes nothing new.
     const calls = request.mock.calls.length;

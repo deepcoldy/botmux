@@ -5225,7 +5225,9 @@ function codexAdoptJournalPath(): string | undefined {
 
 function checkpointCodexAdoptRecovery(): void {
   const path = codexAdoptJournalPath();
-  if (!path || !codexBridgeRolloutPath) return;
+  // The first attach must consume the previous generation's journal before a
+  // new pre-path input or an early empty drain can replace it.
+  if (!path || !codexBridgeRolloutPath || !codexAdoptRecoveryAttempted) return;
   try { checkpointCodexAdoptTurns(path, codexBridgeRolloutPath, codexBridgeQueue); }
   catch (error: unknown) { log(`Codex adopt checkpoint failed: ${error instanceof Error ? error.message : String(error)}`); }
 }
@@ -7453,10 +7455,10 @@ function codexBridgeAttach(rolloutPath: string, mode: 'baseline-existing' | 'bas
     const cutoff = (codexAdoptStartMs ?? Date.now()) - 5_000;
     const journalPath = codexAdoptJournalPath();
     const recover = journalPath && !codexAdoptRecoveryAttempted;
-    if (journalPath) codexAdoptRecoveryAttempted = true;
     const { history, live, restored } = recover
       ? restoreCodexAdoptTurns(journalPath, rolloutPath, codexBridgeQueue, result.events, cutoff)
       : { ...splitCodexEventsByCutoff(result.events, cutoff), restored: 0 };
+    if (journalPath) codexAdoptRecoveryAttempted = true;
     codexBridgeQueue.absorb(history);
     codexBridgeQueue.ingest(live);
     if (restored > 0) log(`Codex adopt restored ${restored} pending turn(s) without re-submitting input`);

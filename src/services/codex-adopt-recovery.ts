@@ -8,6 +8,7 @@ export function checkpointCodexAdoptTurns(path: string, rolloutPath: string, que
   const entries = queue.peek().flatMap(turn => {
     if (turn.isLocal || turn.dispatchAttempt !== undefined || turn.finalText !== undefined
       || turn.markTimeMs === undefined || !turn.contentFingerprint) return [];
+    // Codex recovery drains from byte zero, then filters by timestamps rather than offsetAtMark.
     return [{ turnId: turn.turnId, markTimeMs: turn.markTimeMs,
       fingerprint: turn.contentFingerprint, jsonlPath: rolloutPath, offsetAtMark: 0 }];
   });
@@ -25,13 +26,14 @@ export function restoreCodexAdoptTurns(
   path: string, rolloutPath: string, queue: CodexBridgeQueue,
   events: readonly CodexBridgeEvent[], cutoffMs: number, nowMs = Date.now(),
 ): { history: CodexBridgeEvent[]; live: CodexBridgeEvent[]; restored: number } {
-  // An input already accepted by this generation owns its current attribution.
-  if (queue.size() !== 0) return { ...splitCodexEventsByCutoff(events, cutoffMs), restored: 0 };
+  // New pre-attach inputs stay in place behind the restored marks. A duplicate
+  // message belongs to this generation, including any durable delivery attempt.
+  const existing = new Set(queue.peek().map(turn => turn.turnId));
   const entries = selectRestorableBridgeTurns(readBridgeTurnJournal(path), { currentJsonlPath: rolloutPath, nowMs })
-    .flatMap(entry => Number.isFinite(entry.markTimeMs) && entry.markTimeMs <= nowMs
+    .flatMap(entry => !existing.has(entry.turnId) && Number.isFinite(entry.markTimeMs) && entry.markTimeMs <= nowMs
       && typeof entry.fingerprint === 'string' && entry.fingerprint.length > 0
       ? [{ ...entry, fingerprint: entry.fingerprint }] : []);
-  for (const entry of entries) queue.mark(entry.turnId, entry.fingerprint, entry.markTimeMs);
+  queue.restorePendingTurns(entries);
   const replayCutoff = Math.min(cutoffMs, ...entries.map(entry => entry.markTimeMs - 5_000));
   const { history, live } = splitCodexEventsByCutoff(events, replayCutoff);
   return { history, live: live.filter(event => event.kind !== 'cot' || event.timestampMs >= cutoffMs), restored: entries.length };

@@ -1808,6 +1808,7 @@ export const messages: Record<string, string> = {
   'cot.tool.result_done': '✓ 已完成',
   'cot.thinking_placeholder': '思考中…',
   'cot.interrupted': '⚠️ 服务重启，进度同步暂时中断；CLI 任务可能仍在运行，请以最终回复为准。',
+  'cot.worker_disconnected': '⚠️ 执行器连接中断，进度同步已停止；CLI 任务可能仍在运行，请查看终端或等待最终回复。',
   'submitDiag.logged_out': '⚠️ 消息没有进入模型：{cliName} 停在登录/鉴权页面\n阶段：输入提交\n错误码：submit_unconfirmed\n终端当前停在 {cliName} 的登录或鉴权页面（要求先登录，或登录态已失效），这条消息没有进入模型。CLI 自身登录与飞书授权是两层，互不代表。\n请打开 Web 终端完成登录后，再重发这条消息。\n原消息：{preview}',
   'submitDiag.interactive_menu': '⚠️ 消息没有进入模型：{cliName} 停在等待键盘选择的界面\n阶段：输入提交\n错误码：submit_unconfirmed\n终端当前停在需要键盘选择的界面（更新、数据迁移、hooks review 或确认框等），这条消息没有进入模型。\n请打开 Web 终端完成选择，或按 Esc 取消该界面后再重发；BotMux 不会替你做选择。\n原消息：{preview}',
   'submitDiag.draft_parked': '⚠️ 消息已粘贴但没有提交：正文停在 {cliName} 输入框\n阶段：输入提交\n错误码：submit_unconfirmed\n消息正文已经粘贴进输入框（显示为 [Pasted Content …]），但没有按 Enter 提交，因此没有进入模型。\n请打开 Web 终端按 Enter 提交；若确认不需要执行，再回到飞书重发。\n原消息：{preview}',

@@ -23,7 +23,10 @@ describe('worker structured-turn status wiring', () => {
     const attach = source.slice(source.indexOf('function codexBridgeAttach('), source.indexOf('function codexBridgeAttach(') + 4_000);
     expect(attach).toContain('!codexAdoptRecoveryAttempted');
     expect(attach).toContain('codexAdoptRecoveryAttempted = true');
+    expect(attach.indexOf('codexAdoptRecoveryAttempted = true')).toBeGreaterThan(attach.indexOf('restoreCodexAdoptTurns('));
     expect(attach.indexOf('restoreCodexAdoptTurns(')).toBeLessThan(attach.indexOf('codexBridgeQueue.absorb(history)'));
+    const checkpoint = functionSlice('checkpointCodexAdoptRecovery', 'scheduledTaskAnchorsFilePath');
+    expect(checkpoint).toContain('!codexAdoptRecoveryAttempted');
   });
   it('rejects a prompt heuristic before publishing ready or clearing in-flight input', () => {
     const body = functionSlice('markPromptReady', 'persistCliSessionId');
