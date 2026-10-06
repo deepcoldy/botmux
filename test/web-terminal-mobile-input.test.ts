@@ -79,6 +79,7 @@ interface MobileHarness {
   rootProperty(name: string): string | undefined;
   viewportResizeCount(): number;
   setWriteState: ((value: boolean | null) => void) | null;
+  setInputMode?: ((mode: string) => void) | null;
 }
 
 function bootMobileInput(options: {
@@ -87,6 +88,8 @@ function bootMobileInput(options: {
   barHeight?: number;
   barRectHeight?: number;
   textareaScrollHeight?: number;
+  initialMode?: 'buffer' | 'live';
+  onSyncMode?: (mode: string) => void;
 }): MobileHarness {
   const source = workerSource();
   const formStart = source.indexOf('<form id="mobile-input-bar"');
@@ -157,7 +160,9 @@ function bootMobileInput(options: {
     'onViewportResize',
     'ResizeObserver',
     '_wbMobileWriteState',
-    `${extractMobileInputScript(source)}\nreturn {setWriteState:_wbMobileWriteState};`,
+    '_wbInitialMobileInputMode',
+    '_wbSyncMobileInputMode',
+    `${extractMobileInputScript(source)}\nreturn {setWriteState:_wbMobileWriteState,setInputMode:_wbSetMobileInputMode};`,
   )(
     true,
     true,
@@ -169,7 +174,12 @@ function bootMobileInput(options: {
     () => { resizeCount += 1; },
     ResizeObserverStub,
     null,
-  ) as { setWriteState: ((value: boolean | null) => void) | null };
+    options.initialMode,
+    options.onSyncMode,
+  ) as {
+    setWriteState: ((value: boolean | null) => void) | null;
+    setInputMode: ((mode: string) => void) | null;
+  };
 
   for (const callback of resizeObservers) callback();
   return {
@@ -181,6 +191,7 @@ function bootMobileInput(options: {
     rootProperty: name => rootProperties.get(name),
     viewportResizeCount: () => resizeCount,
     setWriteState: result.setWriteState,
+    setInputMode: result.setInputMode,
   };
 }
 
@@ -622,5 +633,48 @@ describe('手机 Web 终端输入栏', () => {
       expect(rule, selector).toContain('user-select:none');
       expect(rule, selector).toContain('-webkit-touch-callout:none');
     }
+  });
+
+  it('记住沿用上一次设置：若服务端记录为 live，初始即为「发送」和「实时」', () => {
+    const page = bootMobileInput({ wsHasWrite: true, initialMode: 'live' });
+    const send = page.controls.find(c => c.id === 'mobile-send');
+    const mode = page.controls.find(c => c.id === 'mobile-mode');
+    expect(send?.textContent).toBe('发送');
+    expect(mode?.textContent).toBe('实时');
+    expect(page.bar.getAttribute('data-mode')).toBe('live');
+  });
+
+  it('切换输入模式时触发多设备同步钩子，向服务端同步最新状态', () => {
+    const synced: string[] = [];
+    const page = bootMobileInput({ wsHasWrite: true, onSyncMode: m => synced.push(m) });
+    const mode = page.controls.find(c => c.id === 'mobile-mode');
+    mode?.dispatch('click');
+    expect(synced).toEqual(['live']);
+    mode?.dispatch('click');
+    expect(synced).toEqual(['live', 'buffer']);
+  });
+
+  it('多设备实时一致：收到服务端广播的其他设备切换事件时即时切换', () => {
+    const page = bootMobileInput({ wsHasWrite: true });
+    const send = page.controls.find(c => c.id === 'mobile-send');
+    const mode = page.controls.find(c => c.id === 'mobile-mode');
+    expect(send?.textContent).toBe('上屏');
+    expect(mode?.textContent).toBe('缓冲');
+
+    page.setInputMode?.('live');
+    expect(send?.textContent).toBe('发送');
+    expect(mode?.textContent).toBe('实时');
+    expect(page.bar.getAttribute('data-mode')).toBe('live');
+
+    page.setInputMode?.('buffer');
+    expect(send?.textContent).toBe('上屏');
+    expect(mode?.textContent).toBe('缓冲');
+    expect(page.bar.getAttribute('data-mode')).toBe('buffer');
+  });
+
+  it('输入模式切换绝不使用 Local Storage（多设备由服务端保持一致）', () => {
+    const source = workerSource();
+    expect(source).not.toMatch(/localStorage\.(get|set)Item\([^)]*mode/i);
+    expect(source).not.toMatch(/localStorage\.(get|set)Item\([^)]*mobile/i);
   });
 });
