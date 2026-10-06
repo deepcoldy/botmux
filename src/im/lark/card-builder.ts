@@ -31,6 +31,31 @@ export const CONFIG_UNSET = '__unset__';
  *  缺省或非法时使用）。readGlobalConfig 自带 2s TTL 缓存，每次卡片构建调用成本极低。 */
 export const DEFAULT_CONTEXT_COMPACT_THRESHOLD = 80;
 
+export type TurnTerminalReceiptKind = 'completed' | 'silent' | 'stopped';
+
+/** Independent, low-visual-weight terminal marker for legacy/send sessions.
+ * It is deliberately headerless and action-free: the answer/progress messages
+ * keep their own presentation while this final strip only answers whether the
+ * agent is still working or has returned control to the user. */
+export function buildTurnTerminalReceiptCard(
+  kind: TurnTerminalReceiptKind,
+  locale?: Locale,
+): string {
+  return JSON.stringify({
+    schema: '2.0',
+    config: { update_multi: true, width_mode: 'default' },
+    body: {
+      direction: 'vertical',
+      padding: '8px 12px 8px 12px',
+      elements: [{
+        tag: 'markdown',
+        text_size: 'notation_small_v2',
+        content: `<font color='grey'>${t(`worker.turn_terminal_receipt.${kind}`, undefined, locale)}</font>`,
+      }],
+    },
+  });
+}
+
 /** 上下文占用百分比阈值：读 global-config 的 dashboard.contextCompactThreshold，
  *  校验 finite 且 1..100，否则回退默认 80（与 readDashboard 的 lenient 读法一致）。 */
 export function contextCompactThreshold(): number {

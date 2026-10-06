@@ -1,0 +1,317 @@
+/**
+ * Lifecycle coverage for the independent bottom-of-thread terminal strip.
+ * These tests drive the real worker IPC handler so the receipt cannot regress
+ * into a prompt convention that depends on the model emitting visible output.
+ */
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
+
+const botConfig: Record<string, unknown> = {
+  larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'traex',
+};
+
+vi.mock('../src/im/lark/client.js', () => ({
+  updateMessage: vi.fn(async () => {}),
+  addReaction: vi.fn(async () => 'reaction_id'),
+  removeReaction: vi.fn(async () => {}),
+  sendUserMessage: vi.fn(async () => {}),
+  deleteMessage: vi.fn(async () => {}),
+  getChatInfo: vi.fn(),
+  MessageWithdrawnError: class MessageWithdrawnError extends Error {
+    constructor(id: string) { super(`withdrawn: ${id}`); this.name = 'MessageWithdrawnError'; }
+  },
+}));
+
+vi.mock('../src/im/lark/card-builder.js', () => ({
+  buildStreamingCard: vi.fn(() => '{}'),
+  buildSessionCard: vi.fn(() => '{}'),
+  buildTuiPromptCard: vi.fn(() => '{}'),
+  buildTuiPromptResolvedCard: vi.fn(() => '{}'),
+  buildTurnTerminalReceiptCard: vi.fn((kind: string) => JSON.stringify({ kind })),
+  getCliDisplayName: vi.fn(() => 'TraeX'),
+}));
+
+vi.mock('../src/bot-registry.js', () => ({
+  getBot: vi.fn(() => ({
+    config: botConfig,
+    resolvedAllowedUsers: [],
+    botOpenId: 'ou_bot',
+    botName: 'TestBot',
+  })),
+  getAllBots: vi.fn(() => []),
+  getBotClient: vi.fn(),
+  getBotBrand: vi.fn(() => undefined),
+  resolveBrandLabel: vi.fn(() => undefined),
+  resolveReplyDelivery: vi.fn(() => botConfig.replyDelivery),
+  normalizeUsageDisplay: vi.fn(() => 'footer'),
+  resolveUsageDisplay: vi.fn(() => 'footer'),
+}));
+
+vi.mock('../src/config.js', () => ({
+  config: {
+    web: { externalHost: 'localhost' },
+    session: { dataDir: '/tmp/test-terminal-receipt' },
+    daemon: { backendType: 'pty', cliId: 'traex' },
+  },
+}));
+
+vi.mock('../src/services/session-store.js', () => ({
+  registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
+  cleanupSessionBridgeSendMarkers: vi.fn(),
+  cleanupSessionBridgeSendMarkersNow: vi.fn(),
+  closeSession: vi.fn(),
+  updateSession: vi.fn(),
+  createSession: vi.fn(),
+  updateSessionPid: vi.fn(),
+}));
+
+vi.mock('@larksuiteoapi/node-sdk', () => ({
+  Client: class { constructor() {} },
+  WSClient: class { start() {} },
+  EventDispatcher: class { register() {} },
+  LoggerLevel: { info: 2 },
+}));
+
+import {
+  initWorkerPool,
+  __testOnly_setupWorkerHandlers,
+  recordTurnExplicitMention,
+} from '../src/core/worker-pool.js';
+import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
+import { armSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
+import { buildTurnTerminalReceiptCard } from '../src/im/lark/card-builder.js';
+import type { DaemonSession } from '../src/core/types.js';
+import type { WorkerToDaemon } from '../src/types.js';
+
+function makeDs(): DaemonSession {
+  const fakeWorker = new EventEmitter() as any;
+  fakeWorker.killed = false;
+  fakeWorker.send = vi.fn();
+  fakeWorker.kill = vi.fn();
+  fakeWorker.pid = 99999;
+  fakeWorker.stdout = new EventEmitter();
+  fakeWorker.stderr = new EventEmitter();
+  return {
+    session: {
+      sessionId: 'sid-terminal-receipt',
+      rootMessageId: 'om_root',
+      chatId: 'oc_chat',
+      title: 'fixture',
+      status: 'active' as any,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      pid: null,
+      chatType: 'group',
+      cliId: 'traex',
+    },
+    worker: fakeWorker,
+    workerPort: 0,
+    workerToken: 'tok',
+    larkAppId: 'app_test',
+    chatId: 'oc_chat',
+    chatType: 'group',
+    scope: 'thread',
+    spawnedAt: Date.now(),
+    cliVersion: '1',
+    lastMessageAt: Date.now(),
+    hasHistory: false,
+  } as any;
+}
+
+function bindLarkTurn(ds: DaemonSession, turnId: string, root = 'om_exact_root'): void {
+  ds.session.turnReplyContexts = {
+    ...(ds.session.turnReplyContexts ?? {}),
+    [turnId]: { target: { mode: 'thread', rootMessageId: root } },
+  };
+  ds.currentTurnId = turnId;
+}
+
+function terminalMsg(
+  turnId: string,
+  extra: Partial<Extract<WorkerToDaemon, { type: 'turn_terminal' }>> = {},
+): Extract<WorkerToDaemon, { type: 'turn_terminal' }> {
+  return {
+    type: 'turn_terminal',
+    sessionId: 'sid-terminal-receipt',
+    turnId,
+    status: 'completed',
+    ...extra,
+  };
+}
+
+const sessionReplyMock = vi.fn(async () => 'om_terminal_receipt');
+
+describe('independent turn terminal receipt', () => {
+  beforeEach(() => {
+    for (const key of Object.keys(botConfig)) delete botConfig[key];
+    Object.assign(botConfig, {
+      larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'traex',
+    });
+    sessionReplyMock.mockReset();
+    sessionReplyMock.mockResolvedValue('om_terminal_receipt' as any);
+    (buildTurnTerminalReceiptCard as any).mockClear();
+    initWorkerPool({
+      sessionReply: sessionReplyMock,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    } as any);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.clearAllMocks();
+  });
+
+  it('posts one completed strip for an ordinary Lark turn', async () => {
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_done');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('om_turn_done'));
+
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
+    expect(buildTurnTerminalReceiptCard).toHaveBeenCalledWith('completed', expect.anything());
+    const call = sessionReplyMock.mock.calls[0] as any[];
+    expect(call[2]).toBe('interactive');
+    expect(call[4]).toBe('om_turn_done');
+    expect(call[5]?.replyTarget).toEqual({ mode: 'thread', rootMessageId: 'om_exact_root' });
+    expect(call[5]?.uuid).toMatch(/^tr_[0-9a-f]{47}$/);
+  });
+
+  it('turn ending with nothing_to_send posts the compact silent strip, not the legacy text receipt', async () => {
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_silent');
+    recordTurnExplicitMention(ds, 'om_turn_silent', true);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('om_turn_silent', {
+      outputDisposition: 'nothing_to_send',
+    }));
+
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
+    expect(buildTurnTerminalReceiptCard).toHaveBeenCalledWith('silent', expect.anything());
+    expect(sessionReplyMock.mock.calls[0]?.[2]).toBe('interactive');
+  });
+
+  it('posts a stopped strip for a cancelled turn', async () => {
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_cancelled');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('om_turn_cancelled', { status: 'cancelled' }));
+
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
+    expect(buildTurnTerminalReceiptCard).toHaveBeenCalledWith('stopped', expect.anything());
+  });
+
+  it('waits for the same-turn fallback answer before posting the strip', async () => {
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_ordered');
+    const finishAnswer = beginFinalOutputDelivery(ds, 'om_turn_ordered');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('om_turn_ordered'));
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+
+    finishAnswer();
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
+  });
+
+  it('deduplicates duplicate terminal events with one stable provider UUID', async () => {
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_duplicate');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('om_turn_duplicate', { dispatchAttempt: 1 }));
+    (ds.worker as any).emit('message', terminalMsg('om_turn_duplicate', { dispatchAttempt: 2 }));
+
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
+    expect(ds.terminalReceiptTurnIds?.has('om_turn_duplicate')).toBe(true);
+  });
+
+  it('does not append a stale awaiting-input strip after a newer turn starts', async () => {
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_old');
+    const finishAnswer = beginFinalOutputDelivery(ds, 'om_turn_old');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('om_turn_old'));
+    ds.currentTurnId = 'om_turn_new';
+    finishAnswer();
+
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    expect(ds.terminalReceiptTurnIds?.has('om_turn_old')).toBe(true);
+  });
+
+  it.each([
+    ['card-off', { disableStreamingCard: true }],
+    ['private-card', { privateCard: true }],
+    ['transcript delivery', { replyDelivery: 'transcript' }],
+  ])('keeps %s sessions on their existing UI contract', async (_label, override) => {
+    Object.assign(botConfig, override);
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_excluded');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('om_turn_excluded'));
+
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+
+  it('does not duplicate the terminal UI of unified reply-card mode', async () => {
+    Object.assign(botConfig, { cliId: 'codex', replyCardMode: 'unified' });
+    const ds = makeDs();
+    ds.session.cliId = 'codex';
+    bindLarkTurn(ds, 'om_turn_unified');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('om_turn_unified'));
+
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+  });
+
+  it('excludes silent schedules, VC receivers, and turns without a frozen Lark context', async () => {
+    const schedule = makeDs();
+    bindLarkTurn(schedule, 'schedule:task:fire');
+    armSilentScheduledTurn(schedule, 'schedule:task:fire');
+    __testOnly_setupWorkerHandlers(schedule, schedule.worker as any);
+    (schedule.worker as any).emit('message', terminalMsg('schedule:task:fire'));
+
+    const vc = makeDs();
+    (vc.session as any).vcMeetingReceiver = true;
+    bindLarkTurn(vc, 'om_turn_vc');
+    __testOnly_setupWorkerHandlers(vc, vc.worker as any);
+    (vc.worker as any).emit('message', terminalMsg('om_turn_vc'));
+
+    const api = makeDs();
+    api.currentTurnId = 'trigger-api';
+    __testOnly_setupWorkerHandlers(api, api.worker as any);
+    (api.worker as any).emit('message', terminalMsg('trigger-api'));
+
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+
+  it('retries transport failure with the same UUID', async () => {
+    vi.useFakeTimers();
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_retry');
+    sessionReplyMock
+      .mockRejectedValueOnce(new Error('lark timeout'))
+      .mockResolvedValueOnce('om_terminal_receipt' as any);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('om_turn_retry'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sessionReplyMock).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(sessionReplyMock).toHaveBeenCalledTimes(2);
+    expect((sessionReplyMock.mock.calls[0]?.[5] as any).uuid)
+      .toBe((sessionReplyMock.mock.calls[1]?.[5] as any).uuid);
+  });
+});

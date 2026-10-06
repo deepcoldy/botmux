@@ -66,6 +66,10 @@ export interface DaemonSession {
    * only; entries are registered and removed by the final-output delivery
    * pipeline. */
   finalOutputDeliveriesInFlight?: Set<Promise<void>>;
+  /** Same delivery registrations grouped by their exact turn. Terminal-state
+   * receipts wait on only their own turn, so a slow sibling cannot reorder the
+   * visible answer/receipt pair or block an unrelated completion marker. */
+  finalOutputDeliveriesByTurn?: Map<string, Set<Promise<void>>>;
   /** True after the current worker generation has completed init. Kept
    * separate from workerPort because backends without a Web Terminal still
    * emit screen/idle/screenshot updates and support native local attach. */
@@ -504,13 +508,14 @@ export interface DaemonSession {
    *  daemon 在构建 CLI 输入前按轮重算（resolveSoloSessionForTurn）；send 模式恒为
    *  false 且不发额外 API。内存态，不持久化——重启后首轮重算即可。 */
   soloSession?: boolean;
-  /** Dedupe guard: turnIds whose silent-turn auto receipt was already posted
-   *  (dispatchAttempt replays must not double-post). A bounded FIFO Set, not a
-   *  single slot: replays can interleave with other turns (A₁ → B → A₂), and a
-   *  one-slot guard would let A₂ re-post. An entry is claimed BEFORE the reply
-   *  is sent and released if that send fails, so a later replay can compensate
-   *  instead of losing the closure permanently. */
+  /** Backward-compatible dedupe for old sessions that lack a frozen per-turn
+   *  Lark reply context and therefore still use the legacy explicit-@ silent
+   *  receipt. New ordinary Lark turns use terminalReceiptTurnIds instead. */
   silentReceiptTurnIds?: Set<string>;
+  /** Dedupe guard for the independent terminal-state strip. Claimed before
+   *  waiting for the answer delivery and retained when a newer turn supersedes
+   *  it; released only after all bounded send attempts fail. */
+  terminalReceiptTurnIds?: Set<string>;
   /** Latest model reported by the live executor. In-memory and rehydrated from
    *  the CLI transcript after worker restart; unlike Session.model it follows
    *  in-session `/model` switches. */

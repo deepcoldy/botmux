@@ -44,7 +44,7 @@ import { resolveSessionLaunchModel, resolveSessionGroupSettings } from './sessio
 import { effectiveReplyDelivery } from './reply-delivery.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
 import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
-import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, getCliDisplayName, type IdleCardLabel } from '../im/lark/card-builder.js';
+import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
@@ -135,7 +135,7 @@ import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
 import { scrubWorkflowWorkerEnv } from '../utils/child-env.js';
 import { resolveFeedbackPolicyForDelivery, resolveFeedbackTeamId } from '../services/feedback-policy-resolver.js';
 import { attachOncallGroupButton, recordOncallGroupDelivery } from '../im/lark/oncall-group.js';
-import { beginFinalOutputDelivery } from './final-output-delivery-drain.js';
+import { beginFinalOutputDelivery, waitForTurnFinalOutputDeliveryDrain } from './final-output-delivery-drain.js';
 
 /** A random id minted once per daemon process (this lifetime). Stamped onto
  *  isolated persistent panes so a suspend→resume reattach (same id) is
@@ -1272,12 +1272,23 @@ const TURN_EXPLICIT_MENTION_MAX = 64;
 /** Posted-receipt memory. Bounded for the same reason as the origin FIFO, and
  *  larger than any plausible replay window within one session's lifetime. */
 const SILENT_RECEIPT_DEDUPE_MAX = 64;
+const TERMINAL_RECEIPT_DEDUPE_MAX = 64;
+const TERMINAL_RECEIPT_RETRY_BACKOFF_MS = [0, 1000, 5000] as const;
 
 /** Provider-level idempotency key for the receipt. A transport timeout can be
  *  commit-unknown: retrying with the same uuid lets Lark collapse the duplicate
  *  even after the in-memory claim is deliberately released for compensation. */
 function silentTurnReceiptUuid(sessionId: string, turnId: string): string {
   return `sr_${createHash('sha256')
+    .update(`${sessionId}\0${turnId}`, 'utf8')
+    .digest('hex')
+    .slice(0, 47)}`;
+}
+
+/** Provider UUID stays stable across dispatch replay and bounded transport
+ * retries. A commit-unknown timeout therefore cannot duplicate the strip. */
+function turnTerminalReceiptUuid(sessionId: string, turnId: string): string {
+  return `tr_${createHash('sha256')
     .update(`${sessionId}\0${turnId}`, 'utf8')
     .digest('hex')
     .slice(0, 47)}`;
@@ -16024,7 +16035,9 @@ function setupWorkerHandlers(
           // The RECEIPT is owed regardless of lineage — a dispatched task must
           // report its final status even if a newer turn has since opened.
           const posted = ds.silentReceiptTurnIds ?? (ds.silentReceiptTurnIds = new Set());
-          if (explicitMention && !posted.has(msg.turnId)) {
+          if (explicitMention
+            && !ds.session.turnReplyContexts?.[msg.turnId]
+            && !posted.has(msg.turnId)) {
             // Claim BEFORE sending so a replay racing this await cannot double-post;
             // release on failure so a later replay can still close the loop.
             posted.add(msg.turnId);
@@ -16042,6 +16055,95 @@ function setupWorkerHandlers(
               recordTurnExplicitMention(ds, msg.turnId, true);
               logger.warn(`[${t}] Failed to post silent-turn receipt for ${msg.turnId.substring(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
             });
+          }
+        }
+        // Independent terminal-state strip for ordinary Lark turns in the
+        // legacy/send UI. This is daemon-owned lifecycle output: it does not
+        // depend on the model remembering to call `botmux send`, and a bare
+        // BOTMUX_NOTHING_TO_SEND terminal still reaches this path.
+        //
+        // The exact inbound reply context is both the routing source and the
+        // proof this was a Lark turn. HTTP/API/local-terminal turns have no such
+        // context and must not gain a surprise Feishu side effect. Unified
+        // reply cards already show their terminal phase; card-off/private/doc/
+        // meeting/silent-schedule paths retain their existing low-noise UI.
+        const terminalReplyContext = ds.session.turnReplyContexts?.[msg.turnId];
+        const terminalReceiptKind: TurnTerminalReceiptKind = msg.status === 'completed'
+          ? (msg.outputDisposition === 'nothing_to_send' ? 'silent' : 'completed')
+          : 'stopped';
+        const shouldPostTerminalReceipt = !!terminalReplyContext
+          && !recoveryHandled
+          && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)
+          && !ds.session.vcMeetingReceiver
+          && !streamingCardDisabled(ds, msg.turnId)
+          && !botCfg.privateCard
+          && replyCardModeFor(ds, msg.turnId) === 'legacy'
+          && effectiveReplyDelivery(ds.larkAppId, effectiveCliId, sessionPromptInjection(ds)) === 'send';
+        if (shouldPostTerminalReceipt && terminalReplyContext) {
+          const settled = ds.terminalReceiptTurnIds ?? (ds.terminalReceiptTurnIds = new Set());
+          if (!settled.has(msg.turnId)) {
+            // Claim before waiting: duplicate terminal IPC and dispatchAttempt
+            // replay cannot race two strips into the same thread.
+            settled.add(msg.turnId);
+            trimOldest(settled, TERMINAL_RECEIPT_DEDUPE_MAX);
+            const replyTarget = { ...terminalReplyContext.target };
+            const receiptUuid = turnTerminalReceiptUuid(ds.session.sessionId, msg.turnId);
+            // Keep graceful shutdown fenced across the answer drain and the
+            // receipt's own bounded retry pipeline. This registration is
+            // intentionally session-only; adding it to the same per-turn set
+            // would make the receipt wait on itself forever.
+            const finishReceiptDrain = beginFinalOutputDelivery(ds);
+            void (async () => {
+              try {
+                // A transcript fallback final can still be in-flight when the
+                // ordered terminal IPC arrives. Never let the strip overtake it.
+                await waitForTurnFinalOutputDeliveryDrain(ds, msg.turnId);
+                for (let attempt = 0; attempt < TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length; attempt++) {
+                  const delayMs = TERMINAL_RECEIPT_RETRY_BACKOFF_MS[attempt];
+                  if (delayMs > 0) await new Promise<void>(resolve => setTimeout(resolve, delayMs));
+                  // Type-ahead guard: if a newer turn started while the answer
+                  // or retry waited, a bottom-of-chat "awaiting input" strip
+                  // would lie. Keep the claim so a replay cannot resurrect it.
+                  if (!ownsLifecycleMutation()
+                    || (ds.currentTurnId && ds.currentTurnId !== msg.turnId)) {
+                    logger.debug(
+                      `[${t}] Skipped stale terminal receipt for ${msg.turnId.substring(0, 8)}`,
+                    );
+                    return;
+                  }
+                  try {
+                    await scopedReply(
+                      buildTurnTerminalReceiptCard(
+                        terminalReceiptKind,
+                        localeForBot(ds.larkAppId),
+                      ),
+                      'interactive',
+                      msg.turnId,
+                      { uuid: receiptUuid, replyTarget },
+                    );
+                    return;
+                  } catch (err) {
+                    if (attempt + 1 === TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length) throw err;
+                    logger.warn(
+                      `[${t}] Terminal receipt retry ${attempt + 1} for `
+                      + `${msg.turnId.substring(0, 8)}: `
+                      + `${err instanceof Error ? err.message : String(err)}`,
+                    );
+                  }
+                }
+              } catch (err) {
+                // No attempt was confirmed. Release the in-memory claim so a
+                // durable replay may compensate; the stable provider UUID
+                // collapses commit-unknown retries at Lark.
+                settled.delete(msg.turnId);
+                logger.warn(
+                  `[${t}] Failed to post terminal receipt for ${msg.turnId.substring(0, 8)}: `
+                  + `${err instanceof Error ? err.message : String(err)}`,
+                );
+              } finally {
+                finishReceiptDrain();
+              }
+            })();
           }
         }
         if (msg.turnId.startsWith('mlrp_turn_') && msg.status !== 'completed') {
@@ -16936,7 +17038,7 @@ function deliverFinalOutputWithShutdownDrain(
   t: string,
   isStillOwned: () => boolean,
 ): void {
-  const finishDrain = beginFinalOutputDelivery(ds);
+  const finishDrain = beginFinalOutputDelivery(ds, msg.turnId);
   try {
     deliverFinalOutput(
       ds,
