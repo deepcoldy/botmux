@@ -189,6 +189,36 @@ describe('SQLite durable coordination contract', () => {
     await store.close();
   });
 
+  it('fences stale inbox tokens after the same worker reclaims an expired event', async () => {
+    let now = 1;
+    const store = makeStore(() => now);
+    await store.enqueueInbox({
+      eventId: 'event-same-worker-reclaim', partitionKey: 'chat-a', payload: {}, visibleAt: 0, createdAt: 1,
+    });
+    const first = await store.claimNextInbox({ workerId: 'worker-a', leaseDurationMs: 10 });
+    if (!first) throw new Error('expected first inbox claim');
+
+    now = 11;
+    const reclaimed = await store.claimNextInbox({ workerId: 'worker-a', leaseDurationMs: 10 });
+    if (!reclaimed) throw new Error('expected same-worker inbox reclaim');
+    expect(reclaimed).toMatchObject({ workerId: 'worker-a', claimEpoch: 2, attempts: 2, claimUntil: 21 });
+
+    now = 12;
+    expect(await store.renewInboxClaim({ claim: first, leaseDurationMs: 10 }))
+      .toEqual({ kind: 'stale' });
+    expect(await store.completeInboxClaim(first)).toEqual({ kind: 'stale' });
+    expect(await store.retryInboxClaim({ claim: first, visibleAt: 30 }))
+      .toEqual({ kind: 'stale' });
+
+    const renewed = await store.renewInboxClaim({ claim: reclaimed, leaseDurationMs: 10 });
+    expect(renewed).toMatchObject({
+      kind: 'applied', claim: { workerId: 'worker-a', claimEpoch: 2, claimUntil: 22 },
+    });
+    if (renewed.kind !== 'applied') throw new Error('expected reclaimed inbox renewal');
+    expect(await store.completeInboxClaim(renewed.claim)).toEqual({ kind: 'applied' });
+    await store.close();
+  });
+
   it('fences outbox creation and keeps a stable message id across safe retries', async () => {
     let now = 100;
     const store = makeStore(() => now);
