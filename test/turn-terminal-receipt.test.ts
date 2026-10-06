@@ -319,7 +319,6 @@ describe('independent turn terminal receipt', () => {
   });
 
   it('retries transport failure with the same UUID', async () => {
-    vi.useFakeTimers();
     const ds = makeDs();
     bindLarkTurn(ds, 'om_turn_retry');
     sessionReplyMock
@@ -328,11 +327,13 @@ describe('independent turn terminal receipt', () => {
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
     (ds.worker as any).emit('message', terminalMsg('om_turn_retry'));
-    // Drain promise continuations and the retry timer as one deterministic
-    // queue. Bun does not guarantee that advanceTimersByTimeAsync(0) resumes
-    // the zero-delay attempt before this assertion, unlike Node/V8.
-    await vi.runAllTimersAsync();
-    expect(sessionReplyMock).toHaveBeenCalledTimes(2);
+    // Use the production one-second retry delay here. Bun and Node advance
+    // promise continuations around fake timers differently, which made this
+    // transport assertion runtime-dependent even though the retry was sound.
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(2), {
+      timeout: 2_500,
+      interval: 20,
+    });
     expect((sessionReplyMock.mock.calls[0]?.[5] as any).uuid)
       .toBe((sessionReplyMock.mock.calls[1]?.[5] as any).uuid);
   });
