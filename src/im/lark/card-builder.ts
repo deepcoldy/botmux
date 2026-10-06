@@ -31,7 +31,7 @@ export const CONFIG_UNSET = '__unset__';
  *  缺省或非法时使用）。readGlobalConfig 自带 2s TTL 缓存，每次卡片构建调用成本极低。 */
 export const DEFAULT_CONTEXT_COMPACT_THRESHOLD = 80;
 
-export type TurnTerminalReceiptKind = 'completed' | 'silent' | 'stopped';
+export type TurnTerminalReceiptKind = 'completed' | 'silent';
 
 /** Independent, low-visual-weight terminal marker for legacy/send sessions.
  * It is deliberately headerless and action-free: the answer/progress messages

@@ -27,6 +27,7 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   buildSessionCard: vi.fn(() => '{}'),
   buildTuiPromptCard: vi.fn(() => '{}'),
   buildTuiPromptResolvedCard: vi.fn(() => '{}'),
+  buildTurnFailedCard: vi.fn(() => JSON.stringify({ failure: true })),
   buildTurnTerminalReceiptCard: vi.fn((kind: string) => JSON.stringify({ kind })),
   getCliDisplayName: vi.fn(() => 'TraeX'),
 }));
@@ -39,6 +40,7 @@ vi.mock('../src/bot-registry.js', () => ({
     botName: 'TestBot',
   })),
   getAllBots: vi.fn(() => []),
+  getOwnerOpenId: vi.fn(() => undefined),
   getBotClient: vi.fn(),
   getBotBrand: vi.fn(() => undefined),
   resolveBrandLabel: vi.fn(() => undefined),
@@ -79,7 +81,7 @@ import {
 } from '../src/core/worker-pool.js';
 import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
 import { armSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
-import { buildTurnTerminalReceiptCard } from '../src/im/lark/card-builder.js';
+import { buildTurnFailedCard, buildTurnTerminalReceiptCard } from '../src/im/lark/card-builder.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 
@@ -149,6 +151,7 @@ describe('independent turn terminal receipt', () => {
     });
     sessionReplyMock.mockReset();
     sessionReplyMock.mockResolvedValue('om_terminal_receipt' as any);
+    (buildTurnFailedCard as any).mockClear();
     (buildTurnTerminalReceiptCard as any).mockClear();
     initWorkerPool({
       sessionReply: sessionReplyMock,
@@ -194,16 +197,34 @@ describe('independent turn terminal receipt', () => {
     expect(sessionReplyMock.mock.calls[0]?.[2]).toBe('interactive');
   });
 
-  it('posts a stopped strip for a cancelled turn', async () => {
+  it('keeps an ambiguous failure on the existing failure-card UI without adding a strip', async () => {
     const ds = makeDs();
-    bindLarkTurn(ds, 'om_turn_cancelled');
+    bindLarkTurn(ds, 'om_turn_ambiguous');
     __testOnly_setupWorkerHandlers(ds, ds.worker as any);
 
-    (ds.worker as any).emit('message', terminalMsg('om_turn_cancelled', { status: 'cancelled' }));
+    (ds.worker as any).emit('message', terminalMsg('om_turn_ambiguous', {
+      status: 'ambiguous',
+      errorCode: 'cli_exit',
+    }));
 
     await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
-    expect(buildTurnTerminalReceiptCard).toHaveBeenCalledWith('stopped', expect.anything());
+    expect(buildTurnFailedCard).toHaveBeenCalledTimes(1);
+    expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
   });
+
+  it.each(['failed', 'cancelled'] as const)(
+    'does not append a terminal strip for a %s turn',
+    async status => {
+      const ds = makeDs();
+      bindLarkTurn(ds, `om_turn_${status}`);
+      __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+      (ds.worker as any).emit('message', terminalMsg(`om_turn_${status}`, { status }));
+
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+    },
+  );
 
   it('waits for the same-turn fallback answer before posting the strip', async () => {
     const ds = makeDs();

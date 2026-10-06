@@ -16068,10 +16068,11 @@ function setupWorkerHandlers(
         // reply cards already show their terminal phase; card-off/private/doc/
         // meeting/silent-schedule paths retain their existing low-noise UI.
         const terminalReplyContext = ds.session.turnReplyContexts?.[msg.turnId];
-        const terminalReceiptKind: TurnTerminalReceiptKind = msg.status === 'completed'
+        const terminalReceiptKind: TurnTerminalReceiptKind | undefined = msg.status === 'completed'
           ? (msg.outputDisposition === 'nothing_to_send' ? 'silent' : 'completed')
-          : 'stopped';
-        const shouldPostTerminalReceipt = !!terminalReplyContext
+          : undefined;
+        const shouldPostTerminalReceipt = terminalReceiptKind !== undefined
+          && !!terminalReplyContext
           && !recoveryHandled
           && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)
           && !ds.session.vcMeetingReceiver
@@ -16079,7 +16080,7 @@ function setupWorkerHandlers(
           && !botCfg.privateCard
           && replyCardModeFor(ds, msg.turnId) === 'legacy'
           && effectiveReplyDelivery(ds.larkAppId, effectiveCliId, sessionPromptInjection(ds)) === 'send';
-        if (shouldPostTerminalReceipt && terminalReplyContext) {
+        if (shouldPostTerminalReceipt && terminalReplyContext && terminalReceiptKind) {
           const settled = ds.terminalReceiptTurnIds ?? (ds.terminalReceiptTurnIds = new Set());
           if (!settled.has(msg.turnId)) {
             // Claim before waiting: duplicate terminal IPC and dispatchAttempt

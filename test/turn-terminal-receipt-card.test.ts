@@ -4,8 +4,7 @@ import { buildTurnTerminalReceiptCard } from '../src/im/lark/card-builder.js';
 describe('buildTurnTerminalReceiptCard', () => {
   it.each([
     ['completed', '✓ 本轮已结束 · 等待输入'],
-    ['silent', '✓ 本轮已结束 (AI判断无需回复)'],
-    ['stopped', '⚠ 本轮已停止 · 未正常结束'],
+    ['silent', '✓ 本轮已结束（AI 判断无需回复） · 等待输入'],
   ] as const)('renders a compact %s card', (kind, expected) => {
     const card = JSON.parse(buildTurnTerminalReceiptCard(kind, 'zh'));
     expect(card).toMatchObject({
