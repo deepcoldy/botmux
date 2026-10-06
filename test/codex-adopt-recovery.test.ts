@@ -65,12 +65,41 @@ describe('adopted Codex turn recovery', () => {
       .toMatchObject([{ turnId: 'om_original', finalText: 'Finished' }]);
   });
 
-  it('keeps existing attribution when this generation already accepted an input', () => {
+  it('restores an older turn before a new input marked ahead of the first attach', () => {
     checkpoint();
     const queue = new CodexBridgeQueue(() => 20_000);
     queue.mark('om_new', 'New input', 20_000);
+    const current = queue.peek()[0];
+    const result = restoreCodexAdoptTurns(path, rollout, queue, events, 20_000, 20_000);
+    expect(result.restored).toBe(1);
+    expect(queue.peek().map(t => t.turnId)).toEqual(['om_original', 'om_new']);
+    expect(queue.peek()[1]).toBe(current);
+    queue.absorb(result.history);
+    queue.ingest(result.live);
+    expect(queue.drainEmittable()).toMatchObject([{ turnId: 'om_original', finalText: 'Finished' }]);
+    queue.ingest([event('user', 31_000, 'New input'), event('assistant_final', 32_000, 'New answer')]);
+    expect(queue.drainEmittable()).toMatchObject([{ turnId: 'om_new', finalText: 'New answer' }]);
+  });
+
+  it('lets genuine steering retire the restored turn without losing the new attribution', () => {
+    checkpoint();
+    const queue = new CodexBridgeQueue(() => 20_000);
+    queue.mark('om_new', 'New input', 20_000);
+    const result = restoreCodexAdoptTurns(path, rollout, queue,
+      [start, event('user', 21_000, 'New input'), final], 20_000, 20_000);
+    queue.absorb(result.history);
+    queue.ingest(result.live);
+    expect(queue.drainEmittable()).toMatchObject([{ turnId: 'om_new', finalText: 'Finished' }]);
+  });
+
+  it('keeps this generation as the owner of an already marked message', () => {
+    checkpoint();
+    const queue = new CodexBridgeQueue(() => 20_000);
+    queue.mark('om_original', start.text, 20_000, 2);
+    const current = queue.peek()[0];
     expect(restoreCodexAdoptTurns(path, rollout, queue, events, 20_000, 20_000).restored).toBe(0);
-    expect(queue.peek().map(t => t.turnId)).toEqual(['om_new']);
+    expect(queue.peek()).toEqual([current]);
+    expect(queue.peek()[0]).toBe(current);
   });
 
   it('does not steal durable deliveries from their recovery owner', () => {

@@ -873,9 +873,10 @@ function isCodexEnvironmentUpdate(metadata: unknown, text: string): boolean {
       && kinds.every((kind: unknown) => kind === 'environments.environment_context');
   }
   const trimmed = text.trim();
+  const opening = '<environment_context>';
   const closing = '</environment_context>';
-  return trimmed.startsWith('<environment_context>')
-    && trimmed.endsWith(closing)
+  return trimmed.length >= opening.length + closing.length
+    && trimmed.startsWith(opening)
     && trimmed.indexOf(closing) === trimmed.length - closing.length;
 }
 
