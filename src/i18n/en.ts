@@ -1191,7 +1191,7 @@ export const messages: Record<string, string> = {
   'worker.failed_reason_unavailable': 'no error summary was safe to display',
   'worker.silent_turn_receipt': '🪧 Turn handled: I judged this message needs no reply (auto receipt). If you need an answer, @ me again and ask explicitly.',
   'worker.turn_terminal_receipt.completed': '✓ Turn ended · Awaiting input',
-  'worker.turn_terminal_receipt.silent': '✓ Turn ended · AI chose not to send a reply · Awaiting input',
+  'worker.turn_terminal_receipt.silent': '✓ Turn ended (AI determined no reply was needed)',
   'worker.turn_terminal_receipt.stopped': '⚠ Turn stopped · Did not finish normally',
   'worker.empty_final_failed': '⚠️ {cliName} failed this turn: {reason}\nThe complete error remains available in the web terminal and daemon logs. Resolve the issue, then resend the message.',
   'worker.empty_final_failed_invalid_request': '⚠️ The {cliName} request was rejected: {reason}\nCheck the CLI, model gateway, and tool schema configuration, then resend the message.',
