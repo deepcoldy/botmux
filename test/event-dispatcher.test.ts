@@ -189,6 +189,7 @@ import {
 // grant-pending is a real (unmocked) module-level table; reset it per test so the
 // grant-card throttle state never leaks across cases (it backs the @blocked card path).
 import { getPendingGrantLimits, _resetForTest as _resetGrantPending } from '../src/im/lark/grant-pending.js';
+import { hasTriggeredMessage } from '../src/services/triggered-message-store.js';
 import { logger } from '../src/utils/logger.js';
 import { config } from '../src/config.js';
 import { __resetPeerCrossRefCacheForTest } from '../src/services/peer-cross-ref-store.js';
@@ -10291,6 +10292,94 @@ describe('im.message.updated_v1 — 编辑消息补 @（延迟首次 @）', () =
       },
     };
   }
+
+  function grantEvents(messageId: string, inThread = false) {
+    const text = '@_bot_a /grant @_target';
+    const rootId = inThread ? 'om_grant_topic_root' : undefined;
+    const threadId = inThread ? 'omt_grant_topic' : undefined;
+    const readback = makeReadbackItem({ messageId, text, mentioned: true, rootId, threadId });
+    readback.mentions!.push({ key: '@_target', name: 'Target', id: 'ou_target', id_type: 'open_id' });
+    const receive = makeUserMessageEvent({
+      messageId, rootId, threadId, chatId: 'chat-edit', chatType: 'group', senderOpenId: USER_OPEN_ID,
+      content: readback.body.content,
+      mentions: readback.mentions!.map(m => ({ ...m, id: { open_id: m.id } })),
+    });
+    mockGetMessageDetail.mockResolvedValue({ items: [readback] });
+    return { receive, updated: makeUpdatedEvent(messageId, `evt-${messageId}`) };
+  }
+
+  describe.each([
+    ['claude-code', 'group', 'new-topic'],
+    ['codex', 'group', 'chat'],
+    ['codex', 'group', 'chat-topic'],
+    ['claude-code', 'topic', 'new-topic'],
+    ['codex', 'p2p', 'chat'],
+  ] as const)('grant cross-event dedupe (%s / %s / %s)', (cliId, chatMode, replyMode) => {
+    it.each(['receive-first', 'updated-first'] as const)('%s sends one card for unchanged content', async order => {
+      const state = setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupReplyMode: replyMode });
+      state.config.cliId = cliId;
+      mockGetChatMode.mockResolvedValue(chatMode);
+      mockReplyMessage.mockClear();
+      const messageId = `om_grant_${cliId}_${chatMode}_${order}`;
+      const events = grantEvents(messageId, replyMode === 'chat-topic');
+      if (chatMode === 'p2p') events.receive.message.chat_type = 'p2p';
+      const sequence = order === 'receive-first' ? ['receive', 'updated'] as const : ['updated', 'receive'] as const;
+      for (const kind of sequence) {
+        await capturedHandlers[`im.message.${kind}_v1`](events[kind]);
+        await flushEventWork();
+      }
+      // Also cover ordinary receive redelivery and another update event ID.
+      await capturedHandlers['im.message.receive_v1'](events.receive);
+      await capturedHandlers['im.message.updated_v1']({ ...events.updated, event_id: 'evt-redelivery' });
+      await flushEventWork();
+      expect(mockReplyMessage).toHaveBeenCalledOnce();
+      expect(mockReplyMessage).toHaveBeenCalledWith(MY_APP_ID, messageId, expect.any(String), 'interactive');
+      expect(hasTriggeredMessage(MY_APP_ID, messageId)).toBe(true);
+      expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+      expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    });
+  });
+
+  it('dedupes concurrent grant events in separate ingress lanes while send is pending', async () => {
+    mockReplyMessage.mockClear();
+    let finishSend!: (id: string) => void;
+    mockReplyMessage.mockImplementationOnce(() => new Promise<string>(resolve => { finishSend = resolve; }));
+    const events = grantEvents('om_grant_concurrent');
+    capturedHandlers['im.message.receive_v1'](events.receive);
+    await flushEventWork();
+    try {
+      expect(mockReplyMessage).toHaveBeenCalledOnce();
+      // A chatless updated event uses a different raw lane from receive.
+      capturedHandlers['im.message.updated_v1']({ ...events.updated, message: { message_id: 'om_grant_concurrent' } });
+      await flushEventWork();
+      expect(mockReplyMessage).toHaveBeenCalledOnce();
+    } finally {
+      finishSend('om_card');
+      await flushEventWork();
+    }
+  });
+
+  it('allows an ignored grant to execute when an edit first adds the bot mention', async () => {
+    mockReplyMessage.mockClear();
+    const messageId = 'om_grant_add_mention';
+    const events = grantEvents(messageId);
+    const unaddressed = {
+      ...events.receive,
+      message: {
+        ...events.receive.message,
+        content: JSON.stringify({ text: '/grant @_target' }),
+        mentions: [{ key: '@_target', name: 'Target', id: { open_id: 'ou_target' } }],
+      },
+    };
+    await capturedHandlers['im.message.receive_v1'](unaddressed);
+    await flushEventWork();
+    expect(hasTriggeredMessage(MY_APP_ID, messageId)).toBe(false);
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+    await capturedHandlers['im.message.updated_v1'](events.updated);
+    await flushEventWork();
+    expect(mockReplyMessage).toHaveBeenCalledOnce();
+    expect(hasTriggeredMessage(MY_APP_ID, messageId)).toBe(true);
+  });
 
   it('事件本身不带 mentions → 回读到补了 @ 的权威消息 → 触发一次新话题', async () => {
     const messageId = 'om_edit_add_mention';
