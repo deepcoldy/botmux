@@ -1,7 +1,7 @@
 import { CLI_MODEL_CHOICES } from './model-choices.js';
 import { resolveCommand } from './registry.js';
 import { BOTMUX_SHELL_HINTS } from './shared-hints.js';
-import type { CliAdapter, PtyHandle } from './types.js';
+import { TMUX_INITIAL_PROMPT_ARG_BUDGET, type CliAdapter, type PtyHandle } from './types.js';
 
 import { delay } from '../../utils/timing.js';
 
@@ -69,10 +69,13 @@ export function createCursorAdapter(pathOverride?: string): CliAdapter {
     },
 
     // Cursor accepts a positional prompt and does not hand it to the TUI until
-    // authentication and startup have completed. Keep the opening turn on that
-    // path: writing it to the PTY after the worker's bounded startup timeout can
-    // otherwise feed the prompt into a still-active browser-login flow.
+    // authentication and startup have completed. Keep short opening turns on
+    // that path: writing them to the PTY after the worker's bounded startup
+    // timeout can otherwise feed the prompt into a still-active browser-login
+    // flow. Over-limit prompts defer to the post-start queue, which waits for
+    // readyPattern (composer mounted) before typing.
     passesInitialPromptViaArgs: true,
+    maxInitialPromptArgBytes: TMUX_INITIAL_PROMPT_ARG_BUDGET,
 
     buildResumeCommand({ cliSessionId }) {
       // Cursor's chat id is opaque and not derivable from botmux's sessionId;

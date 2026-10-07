@@ -1859,6 +1859,9 @@ describe('cursor buildArgs', () => {
 
   it('delivers the opening prompt through argv and enables post-ready type-ahead', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    // Positional prompt is inside the tmux launch command. 8192 matches
+    // OpenCode: short turns stay on argv; longer ones defer until readyPattern.
+    expect(adapter.maxInitialPromptArgBytes).toBe(8192);
     expect(adapter.readyPattern?.test('  → Plan, search, build anything')).toBe(true);
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
     expect(adapter.supportsTypeAhead).toBe(true);
@@ -1959,6 +1962,11 @@ describe('gemini buildArgs', () => {
 
   it('passesInitialPromptViaArgs is true', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
+  });
+
+  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
+    // -i bakes the full first prompt into argv, same tmux ceiling as OpenCode.
+    expect(adapter.maxInitialPromptArgBytes).toBe(8192);
   });
 
   it('does not include session id', () => {
@@ -2813,6 +2821,11 @@ describe('mtr buildArgs', () => {
 
   it('passesInitialPromptViaArgs is true', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
+  });
+
+  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
+    // `--prompt` bakes the full first prompt into argv, same budget as OpenCode.
+    expect(adapter.maxInitialPromptArgBytes).toBe(8192);
   });
 });
 
@@ -3906,6 +3919,8 @@ describe('grok buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: sid, resume: false, initialPrompt: 'hello grok' });
     expect(args[args.length - 1]).toBe('hello grok');
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    // Tighter than 8192: `--rules` is already in the tmux command.
+    expect(adapter.maxInitialPromptArgBytes).toBe(4096);
   });
 
   it('resumes with --resume using resumeSessionId when available', () => {

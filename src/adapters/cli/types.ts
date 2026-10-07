@@ -106,6 +106,20 @@ export interface McpGatewayInstallSpec {
   readonly format: 'codex-toml' | 'claude-json';
 }
 
+/** UTF-8 budget for a first prompt baked into tmux launch argv.
+ *  tmux 3.3a rejects the whole `new-session` command around 16 KB (~12 KB ok,
+ *  16,384 "command too long"). 8 KB plus a ~3.5 KB shell wrapper stays under
+ *  that ceiling when the launch argv is mostly this prompt (routing envelope
+ *  included). Adapters that also bake a large non-prompt arg need a tighter
+ *  budget — Grok's `--rules` uses {@link GROK_TMUX_INITIAL_PROMPT_ARG_BUDGET}. */
+export const TMUX_INITIAL_PROMPT_ARG_BUDGET = 8192;
+
+/** Grok bakes `buildBotmuxSystemPromptText` via `--rules` (~4.5 KB, more with
+ *  a skill catalog) into the same tmux command as the positional user turn.
+ *  An 8192-byte user prompt on top of that and the shell wrapper crosses the
+ *  ~16 KB ceiling. 4096 keeps the sum near 14 KB. */
+export const GROK_TMUX_INITIAL_PROMPT_ARG_BUDGET = 4096;
+
 export interface CliAdapter {
   /** Unique identifier */
   readonly id: string;
