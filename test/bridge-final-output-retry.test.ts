@@ -120,6 +120,12 @@ vi.mock('../src/services/frozen-card-store.js', () => ({
   saveFrozenCards: vi.fn(),
 }));
 
+vi.mock('../src/services/session-lifecycle-hooks.js', () => ({
+  emitSessionLifecycleHook: vi.fn(() => true),
+  emitSessionStateTransitionHook: vi.fn(() => true),
+  setSessionLifecycleShutdown: vi.fn(),
+}));
+
 vi.mock('@larksuiteoapi/node-sdk', () => ({
   Client: class { constructor() {} },
   WSClient: class { start() {} },
@@ -138,6 +144,7 @@ import {
   setActiveSessionsRegistry,
 } from '../src/core/worker-pool.js';
 import { MessageWithdrawnError } from '../src/im/lark/client.js';
+import { emitSessionLifecycleHook } from '../src/services/session-lifecycle-hooks.js';
 import { activeSessionKey, type DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 import { EventEmitter } from 'node:events';
@@ -3661,6 +3668,7 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     // (sid-final-out/turn-1) hid that in the first iteration.
     ds.session.sessionId = '01234567-89ab-4def-8234-56789abcdef0';
     const productionMsg = { ...finalOutputMsg(), turnId: 'om_x100b63519db838a4b32f' };
+    vi.mocked(emitSessionLifecycleHook).mockClear();
     const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
     __testOnly_deliverFinalOutput(ds, productionMsg, 'tag', 0, complete);
 
@@ -3687,6 +3695,13 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(ds.lastBridgeEmittedUuid).toBe('01234567-89ab-4def-8234-56789abcdef0:uuid-1');
     expect(complete).toHaveBeenCalledWith(true);
     expect(ds.agentAttention).toMatchObject({ kind: 'blocked' });
+    // External lifecycle channel must see the block, matching the
+    // TOPIC_SEND_BLOCKED branch (operators may route on session.requires_attention).
+    expect(emitSessionLifecycleHook).toHaveBeenCalledWith(
+      ds,
+      'session.requires_attention',
+      expect.objectContaining({ reason: 'content_audit_blocked', turnId: productionMsg.turnId }),
+    );
     expect(closeSession).not.toHaveBeenCalled();
   });
 
