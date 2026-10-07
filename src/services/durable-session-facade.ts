@@ -6,6 +6,7 @@ import type {
   DurableSessionStateStore,
   SessionLease,
 } from './durable-coordination.js';
+import { canonicalJson } from '../utils/canonical-input-hash.js';
 
 export type DurableSessionFacadeStore = DurableSessionLeaseStore & DurableSessionStateStore;
 
@@ -93,7 +94,13 @@ function cloneDurableJson(value: DurableJson): DurableJson {
 }
 
 function sameDurableJson(left: DurableJson, right: DurableJson): boolean {
-  return JSON.stringify(left) === JSON.stringify(right);
+  return canonicalJson(left) === canonicalJson(right);
+}
+
+function sameSessionLease(left: SessionLease | undefined, right: SessionLease): boolean {
+  return left?.sessionKey === right.sessionKey
+    && left.ownerId === right.ownerId
+    && left.epoch === right.epoch;
 }
 
 function timeoutPromise(ms: number): { promise: Promise<false>; cancel(): void } {
@@ -136,42 +143,77 @@ export function createDurableSessionFacade(
   let terminated = false;
   let stopPromise: Promise<DurableSessionFacadeStopResult> | undefined;
 
+  const isStopping = (): boolean => !accepting || terminated;
+
+  const releaseLaneLease = async (lane: SessionLane, lease: SessionLease): Promise<boolean> => {
+    try {
+      const result = await options.store.releaseSessionLease(lease);
+      if (result.kind !== 'applied' && result.kind !== 'stale') return false;
+      if (sameSessionLease(lane.lease, lease)) lane.lease = undefined;
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const stopAfterReleasing = async (
+    lane: SessionLane,
+    lease: SessionLease,
+    coalescedCount: number,
+  ): Promise<DurableSessionFacadeWriteResult> => {
+    await releaseLaneLease(lane, lease);
+    return { kind: 'stopped', coalescedCount };
+  };
+
   const performWrite = async (
     lane: SessionLane,
     value: DurableJson,
     coalescedCount: number,
   ): Promise<DurableSessionFacadeWriteResult> => {
-    if (terminated) return { kind: 'stopped', coalescedCount };
-    const acquired = await options.store.acquireSessionLease({
-      sessionKey: lane.sessionKey,
-      ownerId,
-      leaseDurationMs,
-    });
+    if (isStopping()) return { kind: 'stopped', coalescedCount };
+    let acquired;
+    try {
+      acquired = await options.store.acquireSessionLease({
+        sessionKey: lane.sessionKey,
+        ownerId,
+        leaseDurationMs,
+      });
+    } catch (error) {
+      if (isStopping()) return { kind: 'stopped', coalescedCount };
+      throw error;
+    }
     if (acquired.kind === 'occupied') {
       lane.lease = undefined;
+      if (isStopping()) return { kind: 'stopped', coalescedCount };
       return { ...acquired, coalescedCount };
     }
     lane.lease = acquired.lease;
-    if (terminated) return { kind: 'stopped', coalescedCount };
+    if (isStopping()) return await stopAfterReleasing(lane, acquired.lease, coalescedCount);
 
-    const current = await options.store.readSession(lane.sessionKey);
-    if (terminated) return { kind: 'stopped', coalescedCount };
-    if (current && sameDurableJson(current.value, value)) {
-      return { kind: 'unchanged', record: current, coalescedCount };
+    try {
+      const current = await options.store.readSession(lane.sessionKey);
+      if (isStopping()) return await stopAfterReleasing(lane, acquired.lease, coalescedCount);
+      if (current && sameDurableJson(current.value, value)) {
+        return { kind: 'unchanged', record: current, coalescedCount };
+      }
+      const written = await options.store.writeSession({
+        lease: acquired.lease,
+        expectedRevision: current?.revision ?? null,
+        value,
+      });
+      if (isStopping()) return await stopAfterReleasing(lane, acquired.lease, coalescedCount);
+      if (written.kind === 'written') {
+        return { kind: 'written', record: written.record, coalescedCount };
+      }
+      if (written.kind === 'conflict') {
+        return { kind: 'conflict', current: written.current, coalescedCount };
+      }
+      lane.lease = undefined;
+      return { kind: 'stale_lease', coalescedCount };
+    } catch (error) {
+      if (isStopping()) return await stopAfterReleasing(lane, acquired.lease, coalescedCount);
+      throw error;
     }
-    const written = await options.store.writeSession({
-      lease: acquired.lease,
-      expectedRevision: current?.revision ?? null,
-      value,
-    });
-    if (written.kind === 'written') {
-      return { kind: 'written', record: written.record, coalescedCount };
-    }
-    if (written.kind === 'conflict') {
-      return { kind: 'conflict', current: written.current, coalescedCount };
-    }
-    lane.lease = undefined;
-    return { kind: 'stale_lease', coalescedCount };
   };
 
   const runLane = async (lane: SessionLane): Promise<void> => {
@@ -200,24 +242,32 @@ export function createDurableSessionFacade(
   const releaseLeases = async (
     deadline: number,
   ): Promise<{ timedOut: boolean; unreleased: string[] }> => {
-    const entries = [...lanes.values()].filter(lane => !!lane.lease);
+    const entries = [...lanes.values()].flatMap(lane => lane.lease ? [{ lane, lease: lane.lease }] : []);
     if (entries.length === 0) return { timedOut: false, unreleased: [] };
-    const releases = Promise.allSettled(entries.map(async lane => {
-      const lease = lane.lease;
-      if (!lease) return;
-      const result = await options.store.releaseSessionLease(lease);
-      if (result.kind === 'applied' || result.kind === 'stale') lane.lease = undefined;
+    const releases = Promise.allSettled(entries.map(async ({ lane, lease }) => {
+      await releaseLaneLease(lane, lease);
     }));
     const remaining = Math.max(0, deadline - Date.now());
     if (remaining === 0) {
-      return { timedOut: true, unreleased: entries.map(lane => lane.sessionKey) };
+      const settled = await Promise.race([
+        releases.then(() => true as const),
+        new Promise<false>(resolve => setTimeout(() => resolve(false), 0)),
+      ]);
+      return {
+        timedOut: !settled,
+        unreleased: entries
+          .filter(({ lane, lease }) => sameSessionLease(lane.lease, lease))
+          .map(({ lane }) => lane.sessionKey),
+      };
     }
     const timeout = timeoutPromise(remaining);
     const settled = await Promise.race([releases.then(() => true as const), timeout.promise]);
     timeout.cancel();
     return {
       timedOut: !settled,
-      unreleased: entries.filter(lane => !!lane.lease).map(lane => lane.sessionKey),
+      unreleased: entries
+        .filter(({ lane, lease }) => sameSessionLease(lane.lease, lease))
+        .map(({ lane }) => lane.sessionKey),
     };
   };
 
@@ -260,9 +310,7 @@ export function createDurableSessionFacade(
           ]);
           timeout.cancel();
         }
-        const release = drained
-          ? await releaseLeases(deadline)
-          : { timedOut: true, unreleased: [...lanes.values()].filter(lane => !!lane.lease).map(lane => lane.sessionKey) };
+        const release = await releaseLeases(deadline);
         const pendingSessionKeys = [...lanes.values()]
           .filter(lane => !!lane.running || !!lane.pending)
           .map(lane => lane.sessionKey);

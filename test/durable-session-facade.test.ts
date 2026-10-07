@@ -1,3 +1,6 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type {
   DurableJson,
@@ -10,6 +13,7 @@ import {
   createDurableSessionFacade,
   type DurableSessionFacadeStore,
 } from '../src/services/durable-session-facade.js';
+import { SqliteDurableCoordinationStore } from '../src/services/sqlite-durable-coordination.js';
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -56,6 +60,37 @@ function fakeStore() {
 }
 
 describe('durable session facade', () => {
+  it('uses canonical equality across a real SQLite round trip', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-durable-session-facade-'));
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 1 });
+    const facade = createDurableSessionFacade({
+      store,
+      ownerId: 'facade-real-store',
+      leaseDurationMs: 10_000,
+    });
+    try {
+      await expect(facade.write('session-real', { z: 1, a: 2 })).resolves.toMatchObject({
+        kind: 'written', record: { revision: 1 },
+      });
+      await expect(facade.write('session-real', { z: 1, a: 2 })).resolves.toMatchObject({
+        kind: 'unchanged', record: { revision: 1 },
+      });
+      await expect(facade.write('session-real', { z: 2, a: 2 })).resolves.toMatchObject({
+        kind: 'written', record: { revision: 2 },
+      });
+      await expect(store.readSession('session-real')).resolves.toMatchObject({
+        revision: 2, value: { a: 2, z: 2 },
+      });
+      await expect(facade.stop()).resolves.toEqual({
+        kind: 'stopped', pendingSessionKeys: [], unreleasedSessionKeys: [],
+      });
+    } finally {
+      facade.terminate();
+      await store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('acquires, reads, CAS-writes, skips unchanged values, and releases on stop', async () => {
     const { store } = fakeStore();
     const facade = createDurableSessionFacade({
@@ -236,5 +271,43 @@ describe('durable session facade', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it('stops queued writes and releases an in-flight lease after drain timeout', async () => {
+    const { store } = fakeStore();
+    const blockedWrite = deferred<WriteSessionResult>();
+    const defaultWrite = store.writeSession.getMockImplementation();
+    vi.mocked(store.writeSession)
+      .mockImplementationOnce(() => blockedWrite.promise)
+      .mockImplementation(defaultWrite!);
+    const facade = createDurableSessionFacade({ store, ownerId: 'facade-stop-race' });
+
+    const first = facade.write('session-stop', { order: 1 });
+    await vi.waitFor(() => expect(store.writeSession).toHaveBeenCalledOnce());
+    const second = facade.write('session-stop', { order: 2 });
+    const stopping = facade.stop(25);
+
+    await expect(stopping).resolves.toEqual({
+      kind: 'timed_out',
+      pendingSessionKeys: ['session-stop'],
+      unreleasedSessionKeys: [],
+    });
+    blockedWrite.resolve({
+      kind: 'written',
+      record: {
+        sessionKey: 'session-stop', revision: 1, value: { order: 1 }, updatedAt: 1,
+      },
+    });
+
+    await expect(first).resolves.toEqual({ kind: 'stopped', coalescedCount: 1 });
+    await expect(second).resolves.toEqual({ kind: 'stopped', coalescedCount: 1 });
+    expect(store.acquireSessionLease).toHaveBeenCalledOnce();
+    expect(store.releaseSessionLease).toHaveBeenCalledTimes(2);
+    expect(store.releaseSessionLease).toHaveBeenCalledWith({
+      sessionKey: 'session-stop',
+      ownerId: 'facade-stop-race',
+      epoch: 1,
+      leaseUntil: 60_000,
+    });
   });
 });
