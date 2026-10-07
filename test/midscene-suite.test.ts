@@ -6,7 +6,9 @@ import {
 
 describe('Midscene Test Feishu scenario registry', () => {
   it('maps every migrated YAML scenario to an existing browser case', async () => {
-    await expect(validateFeishuScenarioRegistry()).resolves.toBeUndefined();
+    await validateFeishuScenarioRegistry();
+    // Repeated attempts must register every suite even with a cached module.
+    await validateFeishuScenarioRegistry();
     expect(FEISHU_SCENARIOS).toHaveLength(17);
   });
 });

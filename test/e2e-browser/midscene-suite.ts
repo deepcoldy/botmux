@@ -131,7 +131,6 @@ const SCENARIO_TARGETS: Record<FeishuScenario, ScenarioTarget> = {
 
 let collectingSuites: RegisteredSuite[] | undefined;
 let activeSuite: RegisteredSuite | undefined;
-let suiteLoadSequence = 0;
 
 export function describe(name: string, register: () => void): void {
   if (!collectingSuites) {
@@ -173,15 +172,15 @@ function requireActiveSuite(): RegisteredSuite {
 }
 
 async function loadSuites(moduleName: string): Promise<RegisteredSuite[]> {
+  // Import once, then register anew for every attempt. Bun caches modules even
+  // when an import URL has a different query string. Explicit registration
+  // gives retries fresh hook closures without relying on runtime cache rules.
+  const moduleUrl = new URL(moduleName, import.meta.url);
+  const { registerMidsceneSuites } = await import(moduleUrl.href);
   const suites: RegisteredSuite[] = [];
   collectingSuites = suites;
   try {
-    // Each Midscene retry needs its own hook closures. A timed-out attempt may
-    // still be running its finally block when the runner starts the retry;
-    // reusing the module would let that cleanup close the new browser.
-    const moduleUrl = new URL(moduleName, import.meta.url);
-    moduleUrl.searchParams.set('suite-load', String(++suiteLoadSequence));
-    await import(moduleUrl.href);
+    registerMidsceneSuites();
   } finally {
     collectingSuites = undefined;
     activeSuite = undefined;
