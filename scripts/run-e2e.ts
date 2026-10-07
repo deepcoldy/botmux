@@ -39,13 +39,35 @@ try {
   console.warn(`[run-e2e] schedule sweep skipped: ${(error as Error).message}`);
 }
 
+let mockServer: import('../test/helpers/mock-llm-server/index.js').MockLlmServer | null = null;
+const useMockLlm = process.argv.includes('--mock-llm') || process.env.BOTMUX_MOCK_LLM === 'true' || process.env.BOTMUX_MOCK_LLM === '1';
+
+if (useMockLlm) {
+  const { MockLlmServer } = await import('../test/helpers/mock-llm-server/index.js');
+  const port = Number(process.env.MOCK_LLM_PORT ?? 9999);
+  const mode = (process.env.MOCK_LLM_MODE ?? 'synthetic') as any;
+  mockServer = new MockLlmServer({ port, mode, verbose: true });
+  const { baseUrl } = await mockServer.start();
+  console.log(`[run-e2e] Mock LLM Server started at ${baseUrl} (mode=${mode})`);
+  process.env.ANTHROPIC_BASE_URL = baseUrl;
+  process.env.ANTHROPIC_API_KEY = 'mock-key';
+  process.env.OPENAI_BASE_URL = `${baseUrl}/v1`;
+  process.env.OPENAI_API_KEY = 'mock-key';
+}
+
+const forwardedArgs = process.argv.slice(2).filter((arg) => arg !== '--mock-llm');
+
 const child = spawn(
   'midscene-test',
-  ['test/e2e-browser', '--result-dir', runDir, ...process.argv.slice(2)],
+  ['test/e2e-browser', '--result-dir', runDir, ...forwardedArgs],
   { stdio: 'inherit', env: process.env, shell: false }
 );
 
-child.on('exit', (code, signal) => {
+child.on('exit', async (code, signal) => {
+  if (mockServer) {
+    await mockServer.stop();
+  }
   if (signal) process.kill(process.pid, signal);
   else process.exit(code ?? 1);
 });
+
