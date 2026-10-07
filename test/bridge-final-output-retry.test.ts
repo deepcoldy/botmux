@@ -3655,8 +3655,14 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     });
 
     const ds = makeDs();
+    // Use PRODUCTION-LENGTH ids: randomUUID sessionId (36) + om_ turnId (~35).
+    // Naive concatenation would build an 80+ char dedupe uuid, which Feishu
+    // hard-rejects at 50 — defeating this very notice. The fixture's short ids
+    // (sid-final-out/turn-1) hid that in the first iteration.
+    ds.session.sessionId = '01234567-89ab-4def-8234-56789abcdef0';
+    const productionMsg = { ...finalOutputMsg(), turnId: 'om_x100b63519db838a4b32f' };
     const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
-    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0, complete);
+    __testOnly_deliverFinalOutput(ds, productionMsg, 'tag', 0, complete);
 
     await vi.advanceTimersByTimeAsync(0);
     // Even after the full backoff window elapses, attempts stay at 2:
@@ -3666,16 +3672,19 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(sessionReply).toHaveBeenCalledTimes(2);
 
     // The second call is the audit-safe notice (plain text), carrying the code
-    // and a stable dedup uuid — never the rejected answer body.
+    // and a dedup uuid that respects Feishu's 50-char hard cap — never the
+    // rejected answer body.
     const noticeCall = sessionReply.mock.calls[1];
     expect(noticeCall[2]).toBe('text');
     expect(String(noticeCall[1])).toContain('230028');
     expect(String(noticeCall[1])).not.toContain('final answer');
-    expect(noticeCall[5].uuid).toContain('audit-blocked');
+    const noticeUuid = noticeCall[5].uuid as string;
+    expect(noticeUuid.startsWith('ab_')).toBe(true);
+    expect(noticeUuid.length).toBe(50);
 
     // The turn settles (identical retransmits cannot pass the audit) and the
     // dashboard attention row is lit.
-    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    expect(ds.lastBridgeEmittedUuid).toBe('01234567-89ab-4def-8234-56789abcdef0:uuid-1');
     expect(complete).toHaveBeenCalledWith(true);
     expect(ds.agentAttention).toMatchObject({ kind: 'blocked' });
     expect(closeSession).not.toHaveBeenCalled();

@@ -18,8 +18,18 @@ function auditError(code: number, msg = 'contain sensitive data: EMAIL_ADDRESS')
 }
 
 describe('lark content audit classification', () => {
+  // Literal lock: a self-referential "iterate the set" test stays green if a
+  // code is silently removed. Pin the exact membership; changes to the set must
+  // touch this list.
+  const EXPECTED_AUDIT_CODES = [11248, 11312, 18054, 230028];
+
+  it('pins the exact audit/DLP code set (no silent adds or drops)', () => {
+    expect([...LARK_CONTENT_AUDIT_ERROR_CODES].sort((a, b) => a - b))
+      .toEqual(EXPECTED_AUDIT_CODES);
+  });
+
   it('classifies every documented audit/DLP code as a permanent rejection', () => {
-    for (const code of LARK_CONTENT_AUDIT_ERROR_CODES) {
+    for (const code of EXPECTED_AUDIT_CODES) {
       expect(isLarkContentAuditError(auditError(code))).toBe(true);
       expect(larkErrorCode(auditError(code))).toBe(code);
     }
@@ -27,6 +37,16 @@ describe('lark content audit classification', () => {
 
   it('tolerates the code carried directly on the error object', () => {
     expect(isLarkContentAuditError({ code: 230028 })).toBe(true);
+  });
+
+  it('recognizes the 2xx-body (code: NNN) message-tail shape', () => {
+    // client.ts throws plain Errors with the business code only in the message
+    // when HTTP is 200 but res.code !== 0 — no response.data, no .code field.
+    const tail = new Error('some api failure (code: 230028)');
+    expect(larkErrorCode(tail)).toBe(230028);
+    expect(isLarkContentAuditError(tail)).toBe(true);
+    expect(larkErrorCode(new Error('unrelated failure'))).toBeUndefined();
+    expect(larkErrorCode(new Error('malformed (code: abc)'))).toBeUndefined();
   });
 
   it('does not misclassify transient or unrelated failures', () => {

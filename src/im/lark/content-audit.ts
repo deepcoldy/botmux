@@ -1,3 +1,5 @@
+import { extractLarkBusinessCode } from './api-gate.js';
+
 /**
  * 飞书内容安全审计类拒收。
  *
@@ -10,6 +12,9 @@
  * - 11312:  messages do not pass the audit（消息内容不合法）
  * - 11248:  message is sensitive（消息内容涉及敏感信息）
  * - 18054:  create message content fail（提示检查敏感信息）
+ *
+ * 注意：新增/删除这里的码必须同步更新 test/content-audit-send-failure.test.ts
+ * 里的字面量断言——遍历集合自身的测试锁不住码集变化。
  */
 export const LARK_CONTENT_AUDIT_ERROR_CODES: ReadonlySet<number> = new Set([
   230028,
@@ -18,13 +23,10 @@ export const LARK_CONTENT_AUDIT_ERROR_CODES: ReadonlySet<number> = new Set([
   18054,
 ]);
 
-/** Extract the Lark business error code from an SDK/Axios-shaped rejection
- *  (and tolerate code carried directly on the error object). */
+/** Lark business code from an SDK/Axios rejection, including the 2xx-body
+ *  `(code: NNN)` message-tail shape that client.ts uses when res.code!==0. */
 export function larkErrorCode(err: unknown): number | undefined {
-  if (!err || typeof err !== 'object') return undefined;
-  const candidate = (err as { response?: { data?: { code?: unknown } }; code?: unknown })
-    ?.response?.data?.code ?? (err as { code?: unknown })?.code;
-  return typeof candidate === 'number' ? candidate : undefined;
+  return extractLarkBusinessCode(err);
 }
 
 /** Whether a send failure is the platform's content audit permanently

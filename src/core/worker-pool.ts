@@ -17952,18 +17952,31 @@ function deliverFinalOutput(
         );
         const locale = localeForBot(ds.larkAppId);
         const notice = tr('worker.final_output_content_audit_blocked', { code: String(auditCode ?? 'unknown') }, locale);
+        // Feishu IM uuid hard cap is 50 chars; raw sessionId(36)+turnId(~35)
+        // concatenation is 80+ and would itself be rejected (silently defeating
+        // this very notice) or truncated so multiple blocks share one dedupe key.
+        // Hash the composite to a stable 50-char token.
+        const noticeUuid = `ab_${createHash('sha256')
+          .update(`audit-blocked:${ds.session.sessionId}:${msg.turnId}`)
+          .digest('hex')
+          .slice(0, 47)}`;
         try {
           await scopedReply(
             notice,
             'text',
             msg.replyTurnId ?? msg.turnId,
-            { uuid: `audit-blocked:${ds.session.sessionId}:${msg.turnId}` },
+            { uuid: noticeUuid },
           );
         } catch (noticeError) {
           logger.warn(`[${t}] content-audit notice delivery failed: ${noticeError instanceof Error ? noticeError.message : String(noticeError)}`);
         }
         ds.agentAttention = { kind: 'blocked', reason: `content audit ${auditCode ?? 'unknown'}`, at: Date.now() };
         publishAttentionPatch(ds);
+        emitSessionLifecycleHook(ds, 'session.requires_attention', {
+          reason: 'content_audit_blocked',
+          message: `Lark content audit ${auditCode ?? 'unknown'} rejected the final reply`,
+          turnId: msg.turnId,
+        });
         // Same content can never be delivered as-is; settle like an explicit
         // withdrawal instead of leaving the turn open for identical retransmits.
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
