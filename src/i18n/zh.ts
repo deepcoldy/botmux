@@ -1188,6 +1188,7 @@ export const messages: Record<string, string> = {
   'worker.raw_input_failed_recovery': '⚠️ Slash 命令未能确认送达 {cliName}，同一条消息中紧随其后的正文没有继续提交。\n原因：{reason}',
   'worker.raw_input_failed_command_only_recovery': '⚠️ Slash 命令未能确认送达 {cliName}。\n原因：{reason}',
   'worker.empty_final_completed': '⚠️ {cliName} 已报告本轮处理完成，但 botmux 没有从终端记录里捕获到最终文本，也没有追踪到本轮的回复。若你已经通过改道发送（--top-level / --into / --override-chat）回复过，可忽略本提示；否则请打开 Web 终端查看最后输出，或直接重发消息让会话继续。',
+  'worker.final_output_content_audit_blocked': '⚠️ 本轮回复被飞书内容安全审计拦截（错误码 {code}，通常因正文含邮箱、手机号、证件号等敏感信息），消息未送达，也不会按原内容自动重试。完整回答仍保留在 Web 终端中，可打开终端查看；如需发到群里，请脱敏（删除或打码敏感信息）后重发。',
   'worker.bridge_restored_turn_notice': '⚠️ 本轮曾因 botmux 重启中断，以下是从终端记录恢复的该轮输出（可能不完整）：',
   'worker.failed_reason_unavailable': '未提供可安全展示的错误摘要',
   'worker.silent_turn_receipt': '🪧 本轮已处理完毕：我判定这条消息无需回复（自动回执）。如需我必须回话，请再 @ 我并明确要求答复。',

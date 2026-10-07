@@ -131,6 +131,7 @@ import { recordQuarantinedLauncherEnvKeys } from './mojo-launcher-env-quarantine
 import { freezeMojoIdentityForSession } from './mojo-session-identity.js';
 import { getBot, getAllBots, getOwnerOpenId, loadBotConfigs, resolveBrandLabel, getLoadedConfigPath, getLoadedConfigProvenance, resolveUsageDisplay } from '../bot-registry.js';
 import { resolveHiddenStreamingCardButtons } from '../im/lark/streaming-card-buttons.js';
+import { isLarkContentAuditError, larkErrorCode } from '../im/lark/content-audit.js';
 import { resolvePricingConfig, type ResolvedModelPricing } from '../services/model-pricing.js';
 import { RestartCoordinator, type RestartObserver } from './restart-coordinator.js';
 import { runtimeBuildIdentity } from '../utils/runtime-build-id.js';
@@ -17933,6 +17934,38 @@ function deliverFinalOutput(
       if (err instanceof ReplyCardWithdrawnError) {
         // Withdrawing one answer is not closing the conversation. Preserve the
         // session and consume only this turn's automatic delivery retry.
+        ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
+        onComplete?.(true);
+        return;
+      }
+      if (isLarkContentAuditError(err)) {
+        // The platform PERMANENTLY rejected this payload (tenant DLP / content
+        // audit: e.g. an email address or phone number in the answer). Retrying
+        // unchanged cannot succeed and only burns 22s of backoff while leaving
+        // the thread with zero signal — the CoT bubble already says "done".
+        // Post a fixed, audit-safe notice (never the rejected body), settle the
+        // turn, and light the dashboard attention row.
+        const auditCode = larkErrorCode(err);
+        logger.error(
+          `[${t}] Bridge final_output rejected by Lark content audit code=${auditCode ?? 'unknown'} `
+          + `(turn ${msg.turnId.substring(0, 8)}); not retrying`,
+        );
+        const locale = localeForBot(ds.larkAppId);
+        const notice = tr('worker.final_output_content_audit_blocked', { code: String(auditCode ?? 'unknown') }, locale);
+        try {
+          await scopedReply(
+            notice,
+            'text',
+            msg.replyTurnId ?? msg.turnId,
+            { uuid: `audit-blocked:${ds.session.sessionId}:${msg.turnId}` },
+          );
+        } catch (noticeError) {
+          logger.warn(`[${t}] content-audit notice delivery failed: ${noticeError instanceof Error ? noticeError.message : String(noticeError)}`);
+        }
+        ds.agentAttention = { kind: 'blocked', reason: `content audit ${auditCode ?? 'unknown'}`, at: Date.now() };
+        publishAttentionPatch(ds);
+        // Same content can never be delivered as-is; settle like an explicit
+        // withdrawal instead of leaving the turn open for identical retransmits.
         ds.lastBridgeEmittedUuid = finalOutputDedupeKey(ds, msg);
         onComplete?.(true);
         return;

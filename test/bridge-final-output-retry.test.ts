@@ -3632,6 +3632,55 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(closeSession).not.toHaveBeenCalled();
   });
 
+  it('treats a Lark content-audit rejection as permanent: no retries, visible notice, settled', async () => {
+    const auditError = {
+      isAxiosError: true,
+      name: 'AxiosError',
+      message: 'Request failed with status code 400',
+      config: { method: 'post', url: 'https://open.feishu.cn/open-apis/im/v1/messages' },
+      response: { status: 400, data: { code: 230028, msg: 'contain sensitive data: EMAIL_ADDRESS' } },
+    };
+    // Primary reply is audit-rejected; the follow-up notice (same reply channel) succeeds.
+    const sessionReply = vi
+      .fn()
+      .mockRejectedValueOnce(auditError)
+      .mockResolvedValueOnce('om_notice');
+    const closeSession = vi.fn();
+    const complete = vi.fn();
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession,
+    });
+
+    const ds = makeDs();
+    const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+    __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0, complete);
+
+    await vi.advanceTimersByTimeAsync(0);
+    // Even after the full backoff window elapses, attempts stay at 2:
+    // rejected primary + one audit notice, never a same-payload retry.
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(sessionReply).toHaveBeenCalledTimes(2);
+
+    // The second call is the audit-safe notice (plain text), carrying the code
+    // and a stable dedup uuid — never the rejected answer body.
+    const noticeCall = sessionReply.mock.calls[1];
+    expect(noticeCall[2]).toBe('text');
+    expect(String(noticeCall[1])).toContain('230028');
+    expect(String(noticeCall[1])).not.toContain('final answer');
+    expect(noticeCall[5].uuid).toContain('audit-blocked');
+
+    // The turn settles (identical retransmits cannot pass the audit) and the
+    // dashboard attention row is lit.
+    expect(ds.lastBridgeEmittedUuid).toBe(SCOPED_DEDUPE_KEY);
+    expect(complete).toHaveBeenCalledWith(true);
+    expect(ds.agentAttention).toMatchObject({ kind: 'blocked' });
+    expect(closeSession).not.toHaveBeenCalled();
+  });
+
   it('MessageWithdrawnError aborts retries, commits dedup, and closes session', async () => {
     const sessionReply = vi.fn().mockRejectedValue(new MessageWithdrawnError('om_root'));
     const closeSession = vi.fn();
