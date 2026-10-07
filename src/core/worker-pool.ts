@@ -105,6 +105,9 @@ import { handleCotThinkingUpdate, handleCotThinkingSuperseded, finalizeCotMessag
 import { replyCardModeFor, updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools, settleTurnReplyCards } from './turn-reply-card.js';
 import { captureTerminalReplyContext } from './terminal-reply-context.js';
 import { ReplyCardWithdrawnError } from '../services/turn-reply-card.js';
+import { readGroupContextAuthorOrigin } from '../services/group-context-publication.js';
+import { bindGroupContextWorkerGeneration, readGroupContextDeliveryBinding, hasPreparedGroupContext, type GroupContextDeliveryBinding } from '../services/group-context-delivery-store.js';
+import { groupContextEpoch, commitGroupContextDispatchIntoPayload } from '../services/group-context-prompt.js';
 import { replyToDocComment, chunkCommentText, unsubscribeDocFile, removeCommentReaction } from '../im/lark/doc-comment.js';
 import { listDocSubscriptionsForSession, removeDocSubscription } from '../services/doc-subs-store.js';
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
@@ -824,6 +827,8 @@ function syncWorkerDisplayMode(ds: DaemonSession): void {
 // ─── Callbacks set by daemon at startup ─────────────────────────────────────
 
 export interface WorkerSessionReplyOptions {
+  /** Bound native author of this public model output; runtime notices omit it. */
+  groupContextAuthorOrigin?: GroupContextDeliveryBinding;
   /** Per-delivery lookup cache, shared only across this send pipeline. */
   topicMessageLookup?: TopicMessageLookup;
   uuid?: string;
@@ -885,6 +890,14 @@ export interface WorkerPoolCallbacks {
     terminal: Extract<WorkerToDaemon, { type: 'turn_terminal' }>,
     context: { workerGeneration: number },
   ) => void | Promise<void>;
+  /** The live worker generation proved that this exact input entered the
+   * native conversation. Fenced to the current generation before delivery;
+   * consumers cover shared background here instead of waiting for a terminal. */
+  onNativeInputConsumed?: (
+    ds: DaemonSession,
+    receipt: Extract<WorkerToDaemon, { type: 'native_input_consumed' }>,
+    context: { workerGeneration: number },
+  ) => void;
   /** Worker-authoritative deterministic rejection handoff. Returning true
    * means the daemon durably took ownership, so the original delivery record
    * may be cleared without emitting the ambiguous-failure terminal. */
@@ -10932,6 +10945,9 @@ export function sendWorkerInput(
     }
   }
 
+  // Real delivery boundary: subtract background sources covered while this
+  // turn waited (FIFO / staged tail) and freeze what is actually sent.
+  commitGroupContextDispatch(ds, normalized, effectiveTurnId);
   const codexAppInput = codexAppInputForSession(
     ds,
     normalized.codexAppInput,
@@ -11788,7 +11804,9 @@ export function forkWorker(
   }
 
   const promptPayload = typeof promptInput === 'string' ? { content: promptInput } : promptInput;
-  const prompt = promptPayload.content;
+  // Re-read after the group background is committed at the real execution
+  // boundary below (after every defer/queue/admission return).
+  let prompt = promptPayload.content;
   // R4-B1: the frozen steer authorization rides on the CliTurnPayload (computed
   // once by the daemon at admission, COPIED here). A bare-string promptInput or a
   // system/recovery opening carries no flag ⇒ forced serial. Never re-inferred.
@@ -12199,6 +12217,12 @@ export function forkWorker(
   // existing worker. A failed reservation leaves the old worker untouched;
   // a successful reservation immediately invalidates any late old-worker ACK.
   const workerGeneration = reserveWorkerGeneration(ds);
+  bindPreparedGroupContextWorker(ds, initAttributionTurnId, workerGeneration);
+  // A fork carries the opening/queued input straight into the worker init, so
+  // this (past every XPI/defer/admission return, at the reserved generation)
+  // is its delivery boundary; sendWorkerInput is not on this path.
+  commitGroupContextDispatch(ds, promptPayload, initAttributionTurnId);
+  prompt = promptPayload.content;
   onWorkerGenerationReserved?.(workerGeneration);
   if (initAttributionTurnId?.startsWith('om_')) {
     ensurePrincipalLaneInboundTurnBinding(ds, initAttributionTurnId, workerGeneration);
@@ -13445,6 +13469,24 @@ function setupWorkerHandlers(
         }
         discardTriggerStreamingCard(ds, msg.turnId);
         await rejectOrdinaryImDelivery(ds, msg.turnId, workerGeneration, msg);
+        break;
+      }
+      case 'native_input_consumed': {
+        // Only the live generation's own evidence may cover shared background.
+        // A replaced worker's late receipt proves nothing about the replacement.
+        if (
+          ds.worker !== worker
+          || ds.workerGeneration !== workerGeneration
+          || ds.session.workerGeneration !== workerGeneration
+        ) {
+          logger.warn(`[${t}] Ignored native_input_consumed from stale worker generation`);
+          break;
+        }
+        try {
+          cb.onNativeInputConsumed?.(ds, msg, { workerGeneration });
+        } catch (err) {
+          logger.warn(`[${t}] native input receipt handler failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
         break;
       }
       case 'turn_input_committed': {
@@ -17382,6 +17424,13 @@ function deliverFinalOutput(
   }
   const cb = requireCallbacks();
   const effectiveCliId = ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+  const groupContextAuthorOrigin = !msg.turnFailed && (!msg.kind || msg.kind === 'bridge')
+    ? readGroupContextAuthorOrigin({
+        appId: ds.larkAppId, chatId: ds.chatId, sessionId: ds.session.sessionId, turnId: msg.turnId,
+        nativeSessionId: ds.session.cliSessionId,
+        cliId: ds.session.cliLaunchSnapshot?.cliId ?? effectiveCliId,
+        workerGeneration: ds.session.workerGeneration,
+      }) : undefined;
   let topicMessageLookup: TopicMessageLookup | undefined;
   const scopedReply = (
     content: string,
@@ -17394,7 +17443,8 @@ function deliverFinalOutput(
     msgType,
     ds.larkAppId,
     fallbackTurnId(ds, turnId),
-    { ...opts, sourceSessionId: ds.session.sessionId, ...(topicMessageLookup ? { topicMessageLookup } : {}) },
+    { ...opts, sourceSessionId: ds.session.sessionId, ...(topicMessageLookup ? { topicMessageLookup } : {}),
+      ...(groupContextAuthorOrigin ? { groupContextAuthorOrigin } : {}) },
   );
   setTimeout(async () => {
     if (!isStillOwned()) {
@@ -17952,11 +18002,51 @@ function deliverFinalOutput(
 export const __testOnly_deliverFinalOutput = deliverFinalOutput;
 export const __testOnly_setupWorkerHandlers = setupWorkerHandlers;
 export const __testOnly_reserveWorkerGeneration = reserveWorkerGeneration;
+export const __testOnly_bindPreparedGroupContextWorker = bindPreparedGroupContextWorker;
 export const __testOnly_finishTurnReactions = finishTurnReactions;
 export const __testOnly_finalOutputDedupeKey = finalOutputDedupeKey;
 export const __testOnly_retireTerminalizedCodexAppLedgerEntriesForRecovery = retireTerminalizedCodexAppLedgerEntriesForRecovery;
 
 // ─── Fork adopt worker ──────────────────────────────────────────────────────
+
+/** The real delivery boundary for shared group background. Prompt assembly
+ * and queueing carry the frozen bundle; here, immediately before the payload
+ * reaches a worker, sources covered in the meantime (a previous turn's input
+ * receipt landed while this one waited in a FIFO) are subtracted in place and
+ * the dispatched snapshot is persisted, so a retry of this dispatch and its
+ * receipt describe exactly what was sent. Never throws; the payload is left
+ * untouched when nothing is prepared or bound for this turn. */
+function commitGroupContextDispatch(ds: DaemonSession, payload: CliTurnPayload, turnId: string | undefined): void {
+  if (!turnId || !ds.chatId?.startsWith('oc_')) return;
+  try {
+    if (!hasPreparedGroupContext(ds.larkAppId, ds.chatId, turnId)) return;
+    const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+    commitGroupContextDispatchIntoPayload(payload, {
+      appId: ds.larkAppId, chatId: ds.chatId, turnId, sessionId: ds.session.sessionId,
+      epoch: groupContextEpoch(ds.session.sessionId, ds.session.cliSessionId, cliId, turnId),
+      ...(ds.session.workerGeneration !== undefined ? { workerGeneration: ds.session.workerGeneration } : {}),
+    });
+  } catch (error) {
+    logger.warn(`[${tag(ds)}] group-context dispatch commit skipped: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+export const __testOnly_commitGroupContextDispatch = commitGroupContextDispatch;
+
+/** Prompt assembly can precede reservation. Bind only at this real execution
+ * boundary so a replacement never inherits another worker's pending outputs. */
+function bindPreparedGroupContextWorker(ds: DaemonSession, turnId: string | undefined, workerGeneration: number): void {
+  if (!turnId || ds.workerGeneration !== workerGeneration || ds.session.workerGeneration !== workerGeneration) return;
+  try {
+    const cliId = ds.session.cliLaunchSnapshot?.cliId ?? ds.session.cliId ?? getBot(ds.larkAppId).config.cliId;
+    const epoch = groupContextEpoch(ds.session.sessionId, ds.session.cliSessionId, cliId, turnId);
+    const provisionalEpoch = groupContextEpoch(ds.session.sessionId, undefined, cliId, turnId);
+    const binding = readGroupContextDeliveryBinding(ds.larkAppId, ds.chatId, turnId, undefined, epoch)
+      ?? (epoch !== provisionalEpoch ? readGroupContextDeliveryBinding(ds.larkAppId, ds.chatId, turnId, undefined, provisionalEpoch) : undefined);
+    if (binding?.sessionId === ds.session.sessionId && (binding.epoch === epoch || binding.epoch === provisionalEpoch)) {
+      bindGroupContextWorkerGeneration(binding, workerGeneration);
+    }
+  } catch { logger.warn('[group-context] reserved worker binding unavailable; background may repeat'); }
+}
 
 export function reserveWorkerGeneration(ds: DaemonSession): number {
   const previousDaemonGeneration = ds.workerGeneration;
@@ -18084,6 +18174,7 @@ export function forkAdoptWorker(
   // Reserve before replacing an existing bridge worker for the same reason as
   // forkWorker: persistence failure must leave the old lifetime untouched.
   const workerGeneration = reserveWorkerGeneration(ds);
+  bindPreparedGroupContextWorker(ds, opts?.turnId, workerGeneration);
   opts?.onWorkerGenerationReserved?.(workerGeneration);
 
   // Guard against double-fork
@@ -18225,6 +18316,10 @@ export function forkAdoptWorker(
   // captured it — so adopt must forward the pid + cwd like the other
   // transcript-backed CLIs.
   const isStructuredBridge = isStructuredBridgeAdoptCli(adoptedCliId);
+  // Adopt re-forks carry the turn's bridge-formatted input in the init
+  // message; this is that path's delivery boundary for group background.
+  const adoptPrompt = { content: opts?.prompt ?? '' };
+  commitGroupContextDispatch(ds, adoptPrompt, opts?.turnId);
   const adoptBackendType = adopted.source === 'herdr' ? 'herdr' : adopted.zellijPaneId ? 'zellij' : 'tmux';
 
   if (!ds.session.terminalCardEpoch) {
@@ -18261,7 +18356,7 @@ export function forkAdoptWorker(
     // live-worker follow-up. Content is already bridge-formatted by the caller
     // (buildReforkCliInput → buildBridgeInputContent), so no <user_message>
     // wrapper leaks into the user's un-injected external CLI.
-    prompt: opts?.prompt ?? '',
+    prompt: adoptPrompt.content,
     turnId: opts?.turnId,
     ...(opts?.atMostOnce ? { atMostOnce: true } : {}),
     ...(opts?.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),

@@ -138,6 +138,7 @@ import { isPlatformTeamBot } from '../services/platform-team-store.js';
 import { projectCoordinator } from '../services/project-coordinator-runtime.js';
 import { deleteWorktreeCleanupJob, getWorktreeCleanupJob, putWorktreeCleanupJob } from '../services/worktree-cleanup-store.js';
 import { runProjectGroupSlashCommand } from './project-group-command.js';
+import { runGroupContextSlashCommand } from './group-context-command.js';
 
 // ─── Exported constants ──────────────────────────────────────────────────────
 
@@ -4437,6 +4438,77 @@ export async function handleCommand(
         break;
       }
 
+      case '/context-sharing': {
+        const appId = larkAppId ?? ds?.larkAppId;
+        const chatId = message.chatId ?? ds?.chatId;
+        if (!appId) {
+          await sessionReply(rootId, t('cmd.context_sharing.no_bot', undefined, loc));
+          break;
+        }
+        if (!chatId) {
+          await sessionReply(rootId, t('cmd.context_sharing.no_chat', undefined, loc));
+          break;
+        }
+
+        let result;
+        try {
+          const bot = getBot(appId);
+          result = await runGroupContextSlashCommand({
+            content: message.content,
+            larkAppId: appId,
+            chatId,
+            senderId: message.senderId,
+            senderIsBot: message.senderType !== 'user'
+              || isKnownPeerBot(config.session.dataDir, appId, message.senderId),
+            resolvedAllowedUsers: bot.resolvedAllowedUsers,
+          }, {
+            dataDir: config.session.dataDir,
+            getChatMode: getChatModeStrict,
+          });
+        } catch (error) {
+          await sessionReply(rootId, t('cmd.context_sharing.failed', {
+            reason: error instanceof Error ? error.message : String(error),
+          }, loc));
+          break;
+        }
+
+        if (result.kind === 'error') {
+          const errorKey = {
+            usage: 'cmd.context_sharing.usage',
+            unexpected_arguments: 'cmd.context_sharing.unexpected_arguments',
+            invalid_chat: 'cmd.context_sharing.invalid_chat',
+            chat_lookup_failed: 'cmd.context_sharing.chat_lookup_failed',
+            group_required: 'cmd.context_sharing.group_required',
+            no_owner: 'cmd.context_sharing.no_owner',
+            not_admin: 'cmd.context_sharing.not_admin',
+          }[result.error];
+          await sessionReply(rootId, t(errorKey, { value: result.detail ?? '' }, loc));
+          break;
+        }
+
+        if (result.kind === 'status') {
+          const recallNote = t(`cmd.context_sharing.recall.${result.recall.state}`, undefined, loc)
+            + (result.recall.stale ? `\n${t('cmd.context_sharing.recall.stale', undefined, loc)}` : '');
+          await sessionReply(rootId, t(result.settings.enabled
+            ? 'cmd.context_sharing.status_on'
+            : 'cmd.context_sharing.status_off', {
+            max: String(result.settings.maxContextChars),
+          }, loc) + `\n\n${recallNote}`);
+          break;
+        }
+
+        const responseKey = result.enabled
+          ? (result.changed ? 'cmd.context_sharing.enabled' : 'cmd.context_sharing.already_enabled')
+          : (result.changed ? 'cmd.context_sharing.disabled' : 'cmd.context_sharing.already_disabled');
+        const recallNote = result.enabled && result.recall
+          ? `\n\n${t(`cmd.context_sharing.recall.${result.recall.state}`, undefined, loc)}`
+            + (result.recall.stale ? `\n${t('cmd.context_sharing.recall.stale', undefined, loc)}` : '')
+          : '';
+        await sessionReply(rootId, t(responseKey, { max: String(result.settings.maxContextChars) }, loc) + recallNote);
+        logger.info(`[${logTag}] /context-sharing ${result.enabled ? 'on' : 'off'} chat=${chatId}`);
+        break;
+      }
+
       case '/project': {
         const appId = larkAppId ?? ds?.larkAppId;
         const chatId = message.chatId ?? ds?.chatId;
@@ -5891,6 +5963,7 @@ export async function handleCommand(
           t('help.heading_group', undefined, loc),
           t('help.group', undefined, loc),
           t('help.project', undefined, loc),
+          t('help.context_sharing', undefined, loc),
           '',
           t('help.list_slash', undefined, loc),
           t('help.help', undefined, loc),

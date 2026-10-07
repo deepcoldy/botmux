@@ -31,6 +31,7 @@ interface RawEventData {
     chat_id: string;
     chat_type: string;
     create_time: string;
+    update_time?: string;
     mentions?: Array<{
       key: string;       // e.g. "@_user_1"
       name: string;      // display name
@@ -555,9 +556,15 @@ export function parseEventMessage(
   return { parsed, resources };
 }
 
-export function parseApiMessage(msg: any, numberer?: ImgNumberer): LarkMessage {
+/** `resolveMentions`: render `@_user_N` placeholders with the message's own
+ *  structured `mentions[]` (the REST list/get shapes carry them) exactly as the
+ *  event parser does, instead of dropping them. Opt-in: default output is
+ *  unchanged for every existing caller. */
+export function parseApiMessage(msg: any, numberer?: ImgNumberer, options?: { resolveMentions?: boolean }): LarkMessage {
   const msgType = msg.msg_type ?? 'text';
   const rawContent = msg.body?.content ?? '';
+  const mentions = options?.resolveMentions && Array.isArray(msg.mentions) && msg.mentions.length > 0
+    ? msg.mentions as RawEventData['message']['mentions'] : undefined;
   // sender_name is only present when the fetch opted in via with_sender_name=true
   // (all client.ts message read paths do). Covers bot senders too — the one case
   // local rosters can't resolve for third-party bots.
@@ -572,9 +579,111 @@ export function parseApiMessage(msg: any, numberer?: ImgNumberer): LarkMessage {
     ...(senderName ? { senderName } : {}),
     msgType,
     ...(msgType === 'post' ? { rawPostContent: rawContent } : {}),
-    content: extractTextContent(msgType, normalizeApiMessageContent(msgType, rawContent), undefined, numberer),
+    content: extractTextContent(msgType, normalizeApiMessageContent(msgType, rawContent), mentions, numberer),
     createTime: msg.create_time ?? '',
   };
+}
+
+/** Structured mention evidence from either Lark shape, for observers that
+ *  must compare representations across live events and history reads. */
+export function structuredMentionRefs(mentions: unknown): Array<{ key: string; name: string; openId?: string; appId?: string; userId?: string; unionId?: string }> | undefined {
+  if (!Array.isArray(mentions) || !mentions.length) return undefined;
+  const out = mentions.flatMap((m: any) => {
+    if (!m || typeof m.key !== 'string' || typeof m.name !== 'string' || !m.key || !m.name) return [];
+    const identity = mentionIdentity(m);
+    const openId = mentionOpenId(m); const appId = mentionAppId(m);
+    return [{ key: m.key, name: m.name, ...(openId ? { openId } : {}), ...(appId ? { appId } : {}),
+      ...(identity.userId ? { userId: identity.userId } : {}), ...(identity.unionId ? { unionId: identity.unionId } : {}) }];
+  });
+  return out.length ? out : undefined;
+}
+
+/** The body as the platform stores it, with `@_user_N` placeholders left in
+ *  place, for message types whose rendered text depends on the mention list.
+ *  Live events and history reads of one platform version share this form
+ *  regardless of whether a `mentions[]` list was attached, so it is the
+ *  canonical identity of the body; undefined for other message types. */
+export function rawPlaceholderText(msgType: string, rawContent: string): string | undefined {
+  try {
+    if (msgType === 'text') {
+      const parsed = JSON.parse(rawContent);
+      const text = typeof parsed?.text === 'string' ? parsed.text : rawContent;
+      return text.trim();
+    }
+    if (msgType === 'post') return postCanonicalBody(JSON.parse(rawContent));
+    return undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export const POST_CANONICAL_PREFIX = '{"post":';
+
+/** A post's identity as a typed node sequence: text nodes keep their literal
+ *  text, `at` nodes carry only their target id, other nodes their rendering.
+ *  Node boundaries are preserved, so literal prose can never collide with a
+ *  mention marker, and both observation paths (event with a top-level
+ *  `mentions[]`, history without one) derive the same body from the content. */
+function postCanonicalBody(parsed: any): string {
+  const { title, content } = resolvePostBody(parsed);
+  const paragraphs = content.map((paragraph: any[]) => (Array.isArray(paragraph) ? paragraph : [paragraph]).map((node: any) => {
+    if (node?.tag === 'at') return { at: postAtTargetId(node) };
+    if (node?.tag === 'text') return { t: String(node.text ?? '') };
+    return { x: renderPostNode(node) };
+  }));
+  return `${POST_CANONICAL_PREFIX}${JSON.stringify({ title: String(title ?? ''), content: paragraphs })}}`;
+}
+
+function postAtTargetId(node: any): string {
+  return typeof node?.user_id === 'string' && node.user_id ? node.user_id : `name:${String(node?.user_name ?? 'unknown')}`;
+}
+
+/** Target ids of a post's `at` nodes in document order, from its canonical body. */
+export function postCanonicalMentionOrder(canonical: string): string[] | undefined {
+  if (!canonical.startsWith(POST_CANONICAL_PREFIX)) return undefined;
+  try {
+    const parsed = JSON.parse(canonical).post;
+    const order: string[] = [];
+    for (const paragraph of parsed.content ?? []) for (const node of paragraph) if (typeof node?.at === 'string') order.push(node.at);
+    return order;
+  } catch { return undefined; }
+}
+
+/** Mention identities of a post, derived from its inline `at` nodes in
+ *  document order (the one source both observation paths share). A top-level
+ *  `mentions[]` list, when present, only enriches the entry whose id matches
+ *  the node target (display name, typed app/union/user ids); it never defines
+ *  the order or the set. Keys are `@_at:<target id>`. */
+export function postMentionRefs(rawContent: string, topLevel?: unknown): Array<{ key: string; name: string; openId?: string; appId?: string; userId?: string; unionId?: string }> | undefined {
+  try {
+    const { content } = resolvePostBody(JSON.parse(rawContent));
+    const enrich = new Map<string, { name: string; openId?: string; appId?: string; userId?: string; unionId?: string }>();
+    for (const m of Array.isArray(topLevel) ? topLevel : []) {
+      if (!m || typeof m !== 'object') continue;
+      const identity = mentionIdentity(m); const openId = mentionOpenId(m); const appId = mentionAppId(m);
+      const entry = { name: String((m as any).name ?? ''), ...(openId ? { openId } : {}), ...(appId ? { appId } : {}),
+        ...(identity.userId ? { userId: identity.userId } : {}), ...(identity.unionId ? { unionId: identity.unionId } : {}) };
+      for (const id of [openId, appId, identity.userId, identity.unionId]) if (id) enrich.set(id, entry);
+    }
+    const out: Array<{ key: string; name: string; openId?: string; appId?: string; userId?: string; unionId?: string }> = [];
+    const seen = new Set<string>();
+    for (const paragraph of content) {
+      for (const node of Array.isArray(paragraph) ? paragraph : [paragraph]) {
+        if (node?.tag !== 'at') continue;
+        const target = postAtTargetId(node);
+        if (seen.has(target)) continue;
+        seen.add(target);
+        const known = enrich.get(target);
+        const name = String(node.user_name ?? known?.name ?? 'unknown');
+        if (known) { out.push({ key: `@_at:${target}`, ...known, name }); continue; }
+        const openId = typeof node.user_id === 'string' && node.user_id ? node.user_id : undefined;
+        out.push({ key: `@_at:${target}`, name, ...(openId ? { openId } : {}) });
+      }
+    }
+    return out.length ? out : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function normalizeApiMessageContent(msgType: string, rawContent: string): string {
@@ -1330,7 +1439,7 @@ export function mergeCardText(textA: string, textB: string): string {
  */
 export async function resolveMergedCardContent(
   larkAppId: string, messageId: string, numberer?: ImgNumberer,
-): Promise<{ text: string; structuredContent: string; resources: MessageResource[] } | null> {
+): Promise<{ text: string; structuredContent: string; resources: MessageResource[]; updateTime?: number } | null> {
   const [aRes, bRes] = await Promise.all([
     getMessageDetail(larkAppId, messageId, { userCardContent: false }).catch(() => null),
     getMessageDetail(larkAppId, messageId, { userCardContent: true }).catch(() => null),
@@ -1339,6 +1448,8 @@ export async function resolveMergedCardContent(
   const bContent = bRes?.items?.[0]?.body?.content;
   if (!aContent && !bContent) return null;
   const structuredContent = (bContent ?? aContent)!;
+  const structuredMessage = bContent != null ? bRes?.items?.[0] : aRes?.items?.[0];
+  const updateTime = Number(structuredMessage?.update_time);
   // Resources BEFORE text so the shared numberer assigns [图片 N] in attachment
   // order and the text extraction below reuses those numbers (same ordering
   // contract as parseEventMessage / buildForwardedTree). Callers that don't
@@ -1351,7 +1462,8 @@ export async function resolveMergedCardContent(
   // Carry the structured card JSON (B preferred) alongside the merged text so
   // resource extraction (image_key/file_key) keeps working — extractResources
   // walks elements/body, extractCardContent short-circuits on the text key.
-  return { text: merged, structuredContent, resources };
+  return { text: merged, structuredContent, resources,
+    ...(Number.isFinite(updateTime) && updateTime > 0 ? { updateTime } : {}) };
 }
 
 /**
@@ -1362,13 +1474,14 @@ export async function resolveMergedCardContent(
  * by the live daemon path so forwarded cards reach the model fully parsed.
  */
 export async function resolveEventCard(data: RawEventData, larkAppId: string): Promise<void> {
-  let resolved: { text: string; structuredContent: string } | null = null;
+  let resolved: Awaited<ReturnType<typeof resolveMergedCardContent>> = null;
   try {
     resolved = await resolveMergedCardContent(larkAppId, data.message.message_id);
   } catch { /* fall through to local unwrap */ }
   if (resolved) {
     const structured = (() => { try { return JSON.parse(resolved!.structuredContent); } catch { return {}; } })();
     data.message.content = JSON.stringify({ ...structured, [RESOLVED_TEXT_KEY]: resolved.text });
+    if (resolved.updateTime !== undefined) data.message.update_time = String(resolved.updateTime);
     return;
   }
   unwrapUserDsl(data);

@@ -112,6 +112,20 @@ function currentFileSize(path: string): number {
 interface HistoryMatch {
   found: boolean;
   cliSessionId?: string;
+  /** True only when the matched line's session id passed a POSITIVE ownership
+   *  check (explicit expected thread id, or an available owned-rollout set that
+   *  contains it). An unfiltered match or one accepted because enumeration was
+   *  unavailable is a submit confirmation, not proof that THIS pane consumed
+   *  the input. */
+  ownershipProven?: boolean;
+}
+
+function historyMatchResult(match: HistoryMatch): { submitted: true; cliSessionId?: string; ownershipProven?: true } {
+  return {
+    submitted: true,
+    ...(match.cliSessionId ? { cliSessionId: match.cliSessionId } : {}),
+    ...(match.ownershipProven ? { ownershipProven: true } : {}),
+  };
 }
 
 function readCliSessionId(parsed: unknown): string | undefined {
@@ -137,9 +151,11 @@ function historyTextMatches(actual: string, expected: string): boolean {
  *  owned rollout fd that appears AFTER its history line can still be accepted on
  *  a later poll. */
 type HistorySidFilter = (cliSessionId: string | undefined) => boolean;
+/** Positive ownership predicate; see HistoryMatch.ownershipProven. */
+type HistorySidProof = (cliSessionId: string | undefined) => boolean;
 
 function matchHistoryDelta(
-  path: string, fromByte: number, expectedText: string, acceptSid?: HistorySidFilter,
+  path: string, fromByte: number, expectedText: string, acceptSid?: HistorySidFilter, proveSid?: HistorySidProof,
 ): HistoryMatch {
   if (!existsSync(path)) return { found: false };
   let size: number;
@@ -164,7 +180,7 @@ function matchHistoryDelta(
         // collision). Keep scanning — the owned line may be later in this delta
         // or arrive on a subsequent poll.
         if (acceptSid && !acceptSid(cliSessionId)) continue;
-        return { found: true, cliSessionId };
+        return { found: true, cliSessionId, ownershipProven: !!proveSid && proveSid(cliSessionId) };
       }
     } catch {
       // Ignore partial/non-JSON lines. A later poll will see the completed
@@ -175,11 +191,11 @@ function matchHistoryDelta(
 }
 
 async function waitForHistoryAppend(
-  path: string, fromByte: number, expectedText: string, timeoutMs: number, acceptSid?: HistorySidFilter,
+  path: string, fromByte: number, expectedText: string, timeoutMs: number, acceptSid?: HistorySidFilter, proveSid?: HistorySidProof,
 ): Promise<HistoryMatch> {
   const deadline = Date.now() + scaleMs(timeoutMs);
   while (Date.now() < deadline) {
-    const match = matchHistoryDelta(path, fromByte, expectedText, acceptSid);
+    const match = matchHistoryDelta(path, fromByte, expectedText, acceptSid, proveSid);
     if (match.found) return match;
     await delay(100);
   }
@@ -504,6 +520,19 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
             return owned.has(sid.toLowerCase());
           }
           : undefined;
+      // Positive ownership only: the explicit expected thread, or an owned
+      // rollout set that is available AND contains the line's session. The
+      // enumeration-unavailable and unfiltered acceptances above keep their
+      // submit semantics but never prove that this pane consumed the input.
+      const proveSid: HistorySidProof | undefined = expectedRemoteSid
+        ? (sid) => !!sid && sid.toLowerCase() === expectedRemoteSid.toLowerCase()
+        : cliPid
+          ? (sid) => {
+            if (!sid) return false;
+            const owned = findCodexRolloutSetByPid(cliPid);
+            return !!owned && owned.has(sid.toLowerCase());
+          }
+          : undefined;
 
       try {
         if (pty.pasteText) {
@@ -522,29 +551,19 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       if (!trySendEnter()) return { submitted: false };
 
       for (let attempt = 0; attempt < 3; attempt++) {
-        const match = await waitForHistoryAppend(historyPath, baseByte, content, 800, acceptSid);
-        if (match.found) {
-          return match.cliSessionId
-            ? { submitted: true, cliSessionId: match.cliSessionId }
-            : { submitted: true };
-        }
+        const match = await waitForHistoryAppend(historyPath, baseByte, content, 800, acceptSid, proveSid);
+        if (match.found) return historyMatchResult(match);
         if (!trySendEnter()) return { submitted: false };
       }
-      const match = await waitForHistoryAppend(historyPath, baseByte, content, 800, acceptSid);
-      if (match.found) {
-        return match.cliSessionId
-          ? { submitted: true, cliSessionId: match.cliSessionId }
-          : { submitted: true };
-      }
+      const match = await waitForHistoryAppend(historyPath, baseByte, content, 800, acceptSid, proveSid);
+      if (match.found) return historyMatchResult(match);
       // In-band budget exhausted. Hand the worker a recheck closure: a
       // slow-startup Codex (or one whose first turn is delayed by a heavy
       // initial prompt) may still append our marker after the retries gave
       // up, and the worker re-scans on a delay before warning the user.
       const recheck = () => {
-        const late = matchHistoryDelta(historyPath, baseByte, content, acceptSid);
-        return late.found
-          ? { submitted: true, cliSessionId: late.cliSessionId }
-          : false;
+        const late = matchHistoryDelta(historyPath, baseByte, content, acceptSid, proveSid);
+        return late.found ? historyMatchResult(late) : false;
       };
       return { submitted: false, recheck };
     },

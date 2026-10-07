@@ -45,6 +45,9 @@ export const BOT_BASELINE_APP_EVENTS = [
 /** 消息编辑事件名（用户「修改」已发送消息时推送）。 */
 export const MESSAGE_UPDATED_EVENT = 'im.message.updated_v1';
 
+/** 消息撤回事件名（撤回已发送消息时推送）。群聊上下文共享据此给记录写 tombstone。 */
+export const MESSAGE_RECALLED_EVENT = 'im.message.recalled_v1';
+
 /**
  * Best-effort app events: subscribed alongside the baseline but NEVER part of
  * the fail-closed verification (missingBaselineEvents / MANAGED_VERIFIED_EVENT_COUNT).
@@ -62,6 +65,10 @@ export const BOT_OPTIONAL_APP_EVENTS = [
   // 的 managed activation 校验打回。新建 bot 会随清单一起订阅；存量 bot 由启动时的
   // ensureMessageUpdatedEventSubscribed 经缓存开放平台登录态增量补订阅。
   MESSAGE_UPDATED_EVENT,
+  // 消息撤回：只服务群聊上下文共享的 tombstone，缺订阅时记录里撤回的消息会一直保留
+  //（dispatcher 对缺订阅同样静默降级）。存量 bot 由启动时的
+  // ensureMessageRecalledEventSubscribed 增量补订阅，并返回是否覆盖的状态。
+  MESSAGE_RECALLED_EVENT,
 ] as const;
 
 /** 缺了它 daemon 完全收不到消息——回读确认失败时整个自动配置 fail-closed。 */

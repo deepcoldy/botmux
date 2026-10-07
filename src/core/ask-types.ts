@@ -6,6 +6,8 @@
  * (`botmux ask buttons` subcommand) — no runtime cross-imports.
  */
 
+import type { GroupContextDeliveryBinding } from '../services/group-context-delivery-store.js';
+
 /** A single selectable option on an ask card. `key` is the stable identifier
  *  returned via stdout; `label` is the human-facing button text. When the user
  *  writes `--options "yes,no"`, `key === label`. With `--options "yes=继续"`,
@@ -88,7 +90,10 @@ export interface AskJsonOutput {
  *  v0.1.8 变更：`options`/`prompt` 字段替换为 `questions: ReadonlyArray<AskQuestion>`。 */
 export interface CreateAskInput {
   /** Daemon-bound presentation target; never accepted directly from CLI JSON. */
-  replyCardTarget?: { turnId: string; dispatchAttempt?: number };
+  replyCardTarget?: { turnId: string; dispatchAttempt?: number;
+    /** Frozen by authenticated daemon admission; never accepted from CLI JSON. */
+    groupContextAuthorOrigin?: GroupContextDeliveryBinding;
+  };
   larkAppId: string;
   chatId: string;
   /** thread-scope ask → root message_id; chat-scope ask → null. */

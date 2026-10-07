@@ -24,6 +24,7 @@ import {
 /** 设计 §10 的字母表：命令 / 子命令 / 透传 / 冷启动 / 未注册 / 多行豁免 / 占位符 / 中文 / latin / 引号 / 大小写。 */
 const ALPHABET = [
   '/cd', '/repo', 'wt', '/rename', '/sessions', '/card', '/cot', '/term', '/vc-auth',
+  '/context-sharing',
   '/compact', '/model', '/goal', '/foo', '/schedule', '/role', '/fork', '/watch-comment', 'list',
   '<pane>', '中文', 'latin', '"x y"', '/T',
 ];
@@ -87,6 +88,12 @@ function normalizeNext(d: SlashRouteDecision): unknown {
 
 /** §9 有意变化名单：返回 true 表示这组 (输入, 老决策, 新决策) 是登记过的变化。 */
 const INTENTIONAL: Array<(input: SlashRouteInput, legacy: any, next: any) => boolean> = [
+  // 群上下文开关是新增的 sessionless daemon 命令；冻结 oracle 继续把它视为 unknown slash。
+  (input, legacy, next) =>
+    input.text.trim().toLowerCase().startsWith('/context-sharing')
+    && legacy.kind === 'forward' && legacy.reason === 'unknown_slash'
+    && next.kind === 'daemon' && next.cmd === '/context-sharing'
+    && next.sessionPolicy === 'sessionless',
   // PR-2：thread 入口的 /card /cot 与新话题入口对齐为前置特判（原先走 daemon 分支，无会话时预建幽灵会话）。
   (input, legacy, next) =>
     input.context === 'thread'

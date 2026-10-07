@@ -11,6 +11,8 @@ import { BoundedMap } from '../../utils/bounded-map.js';
 import { resolveUserToken } from '../../utils/user-token.js';
 import { listObservedBots } from '../../services/observed-bots-store.js';
 import { getBotCapability } from '../../services/bot-profile-store.js';
+import { getGroupContextSettings } from '../../services/group-context-settings-store.js';
+import type { GroupContextDeliveryBinding } from '../../services/group-context-delivery-store.js';
 import { resolveTeamRoleFile } from '../../core/role-resolver.js';
 import { type Brand, larkHosts, normalizeBrand, sdkDomain } from './lark-hosts.js';
 import { canonicalMobileKey, isMobileEntry, normalizeMobileEntry } from '../../setup/bot-config-editor.js';
@@ -264,6 +266,8 @@ const listBotsApiFailures = new Map<string, { reason: string; expiresAt: number 
  * the param and get exactly the pre-Step-6 behavior.
  */
 export interface OutboundMessageOptions {
+  /** Exact native author, supplied only for model-authored public content. */
+  groupContextAuthorOrigin?: GroupContextDeliveryBinding;
   /** The provider request is reconciling an already-attempted stable UUID.
    * Lark deduplicates the message, but the local outbound hook is a separate
    * side effect and must not be fired twice. */
@@ -293,6 +297,53 @@ async function emitOutboundHookIfAllowed(
   } else {
     emitHookEvent(event, payload);
   }
+}
+
+async function recordPublishedGroupContext(larkAppId: string, data: any, body: string, msgType: string, chatId?: string,
+  groupContextAuthorOrigin?: GroupContextDeliveryBinding,
+  conversation?: import('../../services/group-context-runtime.js').GroupContextPublicationContext,
+  replyTargetId?: string): Promise<void> {
+  const groupId = chatId ?? data?.chat_id
+    ?? (groupContextAuthorOrigin?.appId === larkAppId ? groupContextAuthorOrigin.chatId : undefined);
+  if (typeof groupId !== 'string' || !getGroupContextSettings(larkAppId, groupId).enabled) return;
+  try {
+    // Lazy import avoids a parser/client initialization cycle and costs nothing
+    // in the default-off path. Only successfully published group content enters.
+    const { observePublishedGroupMessage } = await import('../../services/group-context-runtime.js');
+    if (replyTargetId) {
+      let target: import('../../services/group-context-store.js').GroupContextMessageRecord | undefined;
+      try {
+        const { getGroupContextMessage } = await import('../../services/group-context-store.js');
+        target = getGroupContextMessage(larkAppId, groupId, replyTargetId);
+      } catch { /* A missing local observation leaves the destination unknown. */ }
+      const receiptThreadId = typeof data?.thread_id === 'string' && data.thread_id ? data.thread_id : undefined;
+      const receiptRootId = typeof data?.root_id === 'string' && data.root_id ? data.root_id : undefined;
+      const threadId = receiptThreadId ?? target?.threadId;
+      // Omitting reply_in_thread inherits an existing topic. A starter may
+      // retain its original main scope while now carrying native thread_id.
+      // Historical main scope does not prove the current destination: someone
+      // may have opened a topic since that observation. Await native evidence.
+      const scope = threadId || target?.conversationScope === 'thread' || conversation?.conversationScope === 'thread'
+        ? 'thread' : undefined;
+      const targetMatches = !receiptThreadId || !target?.threadId || receiptThreadId === target.threadId;
+      // Replying to a nested message does not make that message the root. Only
+      // a known main message is safe to treat as a freshly created topic seed.
+      const rootId = receiptRootId ?? (targetMatches
+        ? target?.conversationScope === 'main' ? target.messageId
+          : target?.threadId || target?.conversationScope === 'thread' ? target?.rootId : undefined
+        : undefined);
+      conversation = {
+        ...(scope ? { conversationScope: scope } : {}),
+        ...(scope === 'thread' && rootId ? { rootId } : {}),
+        ...(threadId ? { threadId } : {}),
+      };
+    }
+    const message = {
+      ...data, chat_id: groupId, msg_type: msgType, body: { content: body },
+      sender: { id: getBot(larkAppId)?.botOpenId ?? larkAppId, sender_type: 'app', sender_name: getBot(larkAppId)?.botName },
+    };
+    observePublishedGroupMessage(larkAppId, message, groupContextAuthorOrigin, conversation);
+  } catch { logger.warn('[group-context] outbound observation failed; publication remains successful'); }
 }
 
 export async function sendMessage(
@@ -337,6 +388,7 @@ export async function sendMessage(
     const messageId = res.data?.message_id;
     if (!messageId) throw new Error('No message_id in response');
     logger.info(`Sent message ${messageId} to chat ${chatId}`);
+    await recordPublishedGroupContext(larkAppId, res.data, body, msgType, chatId, options?.groupContextAuthorOrigin, { conversationScope: 'main' });
     await emitOutboundHookIfAllowed(options, 'outbound.send', {
         ...hookContext,
         larkAppId,
@@ -400,6 +452,9 @@ export async function replyMessage(
     const replyId = res.data?.message_id;
     if (!replyId) throw new Error('No message_id in reply response');
     logger.info(`Replied ${replyId} to message ${messageId} [msgType=${msgType}, replyInThread=${replyInThread}]`);
+    await recordPublishedGroupContext(larkAppId, { ...res.data, parent_id: messageId }, body, msgType,
+      typeof hookContext?.chatId === 'string' ? hookContext.chatId : undefined, options?.groupContextAuthorOrigin,
+      replyInThread ? { conversationScope: 'thread' } : {}, messageId);
     await emitOutboundHookIfAllowed(options, 'outbound.reply', {
         ...hookContext,
         larkAppId,
@@ -1242,7 +1297,10 @@ export async function deleteEphemeralCard(larkAppId: string, messageId: string):
   });
 }
 
-export async function updateMessage(larkAppId: string, messageId: string, cardJson: string): Promise<void> {
+export interface MessageUpdateAcknowledgement { update_time?: string | number }
+export function updateMessage(larkAppId: string, messageId: string, cardJson: string): Promise<void>;
+export function updateMessage(larkAppId: string, messageId: string, cardJson: string, returnAcknowledgement: true): Promise<MessageUpdateAcknowledgement | undefined>;
+export async function updateMessage(larkAppId: string, messageId: string, cardJson: string, returnAcknowledgement = false): Promise<MessageUpdateAcknowledgement | void> {
   assertLarkTransport(larkAppId, 'updateMessage');
   return executeWithLarkGate(larkAppId, 'updateMessage', async () => {
     const c = getBotClient(larkAppId);
@@ -1267,6 +1325,7 @@ export async function updateMessage(larkAppId: string, messageId: string, cardJs
       if (res.code === LARK_CODE_MESSAGE_UPDATE_EXPIRED) throw new MessageUpdateExpiredError(messageId);
       throw new Error(`Failed to update message: ${res.msg} (code: ${res.code})`);
     }
+    if (returnAcknowledgement) return res.data;
   });
 }
 
@@ -1490,7 +1549,7 @@ export async function getMessageThreadId(
  * token authorized for this bot), which is what the paths without a per-turn
  * sender still rely on.
  */
-export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string, senderOpenId?: string): Promise<void> {
+export async function downloadMessageResource(larkAppId: string, messageId: string, fileKey: string, type: 'image' | 'file', savePath: string, senderOpenId?: string, options?: { allowUserTokenFallback?: boolean }): Promise<void> {
   // apiOnly hard-gate BEFORE the app→user token fallback. Without this, the
   // App Token attempt (getBotClient) throws LarkTransportDisabledError, gets
   // caught below as a "failed app download", and silently falls through to the
@@ -1508,6 +1567,9 @@ export async function downloadMessageResource(larkAppId: string, messageId: stri
     logger.info(`Downloaded ${type} ${fileKey} → ${savePath}`);
     return;
   } catch (appErr: any) {
+    // Passive history is only entitled to the observing app's visibility.
+    // It must never borrow a historical sender's OAuth credentials.
+    if (options?.allowUserTokenFallback === false) throw appErr;
     // AxiosError status can be at various paths depending on SDK version
     const status = appErr?.response?.status ?? appErr?.response?.statusCode
       ?? appErr?.status ?? appErr?.statusCode;
@@ -2077,6 +2139,16 @@ export async function listMessagesByThreadId(larkAppId: string, threadId: string
 }
 
 export async function listThreadMessages(larkAppId: string, chatId: string, rootMessageId: string, pageSize: number = 50): Promise<any[]> {
+  return (await listThreadMessagesWithContext(larkAppId, chatId, rootMessageId, pageSize)).messages;
+}
+
+/** Preserve whether membership was proved by a native thread container. A
+ * root-only chat scan also matches ordinary quoted replies, so is not proof. */
+export async function listThreadMessagesWithContext(larkAppId: string, chatId: string, rootMessageId: string, pageSize: number = 50): Promise<{
+  messages: any[];
+  threadId?: string;
+  verifiedThread: boolean;
+}> {
   const c = getBotClient(larkAppId);
 
   // Resolve the thread_id (omt_xxx) from a known thread reply.
@@ -2084,10 +2156,10 @@ export async function listThreadMessages(larkAppId: string, chatId: string, root
   const threadId = await resolveThreadId(c, rootMessageId);
 
   if (threadId) {
-    return listByThread(c, threadId, pageSize);
+    return { messages: await listByThread(c, threadId, pageSize), threadId, verifiedThread: true };
   }
   // Fallback: scan chat messages and filter by root_id
-  return listByChatFilter(c, chatId, rootMessageId, pageSize);
+  return { messages: await listByChatFilter(c, chatId, rootMessageId, pageSize), verifiedThread: false };
 }
 
 /** Get the thread_id (omt_xxx) from the root message via message.get. */

@@ -1684,9 +1684,9 @@ describe('codex writeInput submission confirmation', () => {
       sendSpecialKeys(key) { keys.push(key); appendCodexHistory(pasted, sid); },
     };
     const adapter = createCodexAdapter('/bin/codex');
-    expect(await adapter.writeInput(pty, 'first')).toEqual({ submitted: true, cliSessionId: sid });
+    expect(await adapter.writeInput(pty, 'first')).toEqual({ submitted: true, cliSessionId: sid, ownershipProven: true });
     sid = other;
-    expect(await adapter.writeInput(pty, 'second')).toEqual({ submitted: true, cliSessionId: other });
+    expect(await adapter.writeInput(pty, 'second')).toEqual({ submitted: true, cliSessionId: other, ownershipProven: true });
     expect(keys).toEqual(['Enter', 'Enter']);
     expect(sendText).not.toHaveBeenCalled();
     expect(pty.captureCurrentScreen).not.toHaveBeenCalled();
@@ -1714,7 +1714,8 @@ describe('codex writeInput submission confirmation', () => {
       pasteText(text) { pasted = text; calls.push('paste:' + text); },
     };
     const result = await createCodexAdapter('/bin/codex').writeInput(pty, 'hi');
-    expect(result).toEqual({ submitted: true, cliSessionId: sid });
+    // The live footer identity is positive ownership evidence.
+    expect(result).toEqual({ submitted: true, cliSessionId: sid, ownershipProven: true });
     expect(calls).toEqual(['paste:hi', 'Enter']);
     expect(codexTerminalSessionIsBound(pty, sid)).toBe(true);
     expect(codexTerminalSessionIsBound(pty, foreign)).toBe(false);

@@ -179,6 +179,16 @@ export function isTruncatedMatch(recordedNorm: string, markContentNorm?: string)
   return markContentNorm.endsWith(recordedNorm);
 }
 
+/** How a transcript user/queued-command record bound a pending Lark turn.
+ *  `fullContentMatch` is true only when the record's normalised text contains
+ *  the ENTIRE normalised marked content — the one binding strong enough to
+ *  prove that this exact input (envelope included) entered the conversation.
+ *  Fingerprint-prefix and truncation binds remain attribution heuristics. */
+export interface BridgeTurnStartEvidence {
+  fullContentMatch: boolean;
+  sourceJsonlPath?: string;
+}
+
 export class BridgeTurnQueue {
   constructor(
     private readonly onLocalTurnStarted?: (turn: BridgePendingTurn) => void,
@@ -187,6 +197,10 @@ export class BridgeTurnQueue {
      *  anchor) pair so it can persist it across worker restarts. `undefined`
      *  anchor means the task was created with no Lark context (local turn). */
     private readonly onScheduledTaskAnchored?: (taskId: string, anchor: string | undefined) => void,
+    /** Fired when a pending Lark turn is started by a transcript record, with
+     *  the strength of that binding. Durable receipts must only act on
+     *  `fullContentMatch`. */
+    private readonly onLarkTurnStarted?: (turn: BridgePendingTurn, evidence: BridgeTurnStartEvidence) => void,
   ) {}
   private seen = new Set<string>();
   private queue: BridgePendingTurn[] = [];
@@ -672,12 +686,14 @@ export class BridgeTurnQueue {
     const eventTimeMs = Number.isFinite(tsParsed) ? tsParsed : Date.now();
     const next = this.queue.find(t => !t.started);
     let consumedNext = false;
+    let fullContentMatch = false;
     if (next) {
       if (next.contentFingerprint) {
         // Both sides normalised (whitespace-collapsed + trimmed) before
         // the substring check so a transcript line that preserved newlines
         // still matches a fingerprint built from the same text.
         const userText = normaliseForFingerprint(extractTurnStartText(ev));
+        fullContentMatch = !!next.contentNormalized && userText.includes(next.contentNormalized);
         if (userText.includes(next.contentFingerprint)) {
           next.started = true;
           if (!next.sourceJsonlPath) next.sourceJsonlPath = sourceJsonlPath;
@@ -712,6 +728,9 @@ export class BridgeTurnQueue {
         this.collecting = next;
         consumedNext = true;
       }
+    }
+    if (consumedNext && next) {
+      this.onLarkTurnStarted?.(next, { fullContentMatch, ...(sourceJsonlPath ? { sourceJsonlPath } : {}) });
     }
     if (!consumedNext) {
       // The user event neither fingerprint-matched nor proved a truncation of a

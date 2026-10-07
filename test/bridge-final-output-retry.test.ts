@@ -15,6 +15,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { config } from '../src/config.js';
 import { normalizeFeedbackPolicy } from '../src/services/feedback-policy.js';
 import { dashboardEventBus } from '../src/core/dashboard-events.js';
+import { bindGroupContextDelivery, readGroupContextDeliveryBinding, writePreparedGroupContext } from '../src/services/group-context-delivery-store.js';
+import { groupContextEpoch } from '../src/services/group-context-prompt.js';
 
 const topicDetailMock = vi.fn(async () => ({ items: [{ message_id: 'om_root', deleted: true }] }));
 const updateMessageMock = vi.fn(async () => {});
@@ -292,6 +294,54 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     rmSync(config.session.dataDir, { recursive: true, force: true });
     clearMessageListenerRunPreviewStore();
     vi.useRealTimers();
+  });
+
+  it.each([undefined, 'native_before_fork'])('binds prepared native input to its reserved worker before execution (native=%s)', async nativeSessionId => {
+    const ds = makeDs();
+    ds.session.cliId = 'claude-code';
+    ds.session.cliSessionId = nativeSessionId;
+    ds.session.workerGeneration = 3;
+    ds.workerGeneration = 3;
+    const binding = { appId: ds.larkAppId, chatId: ds.chatId, sessionId: ds.session.sessionId, turnId: 'om_prepared', workerGeneration: 2,
+      epoch: groupContextEpoch(ds.session.sessionId, nativeSessionId, 'claude-code', 'om_prepared') };
+    writePreparedGroupContext({ ...binding, createdAt: Date.now(), body: '', includedSeqs: [], throughSeq: 0, incomplete: false }, config.session.dataDir);
+    bindGroupContextDelivery(binding, config.session.dataDir);
+    const workerPool = await import('../src/core/worker-pool.js') as any;
+    expect(workerPool.__testOnly_bindPreparedGroupContextWorker).toBeTypeOf('function');
+    workerPool.__testOnly_bindPreparedGroupContextWorker(ds, 'om_prepared', 3);
+    expect(readGroupContextDeliveryBinding(binding.appId, binding.chatId, binding.turnId, config.session.dataDir))
+      .toEqual({ ...binding, workerGeneration: 3 });
+    ds.session.cliSessionId = 'replacement_native';
+    ds.session.workerGeneration = 4;
+    ds.workerGeneration = 4;
+    if (nativeSessionId) {
+      workerPool.__testOnly_bindPreparedGroupContextWorker(ds, 'om_prepared', 4);
+      expect(readGroupContextDeliveryBinding(binding.appId, binding.chatId, binding.turnId, config.session.dataDir)?.workerGeneration).toBe(3);
+    }
+  });
+
+  it('binds an adopted bridge input before its real reservation callback can dispatch', async () => {
+    initWorkerPool({ sessionReply: vi.fn(async () => 'unused'), getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
+    const ds = makeDs();
+    ds.session.cliId = 'claude-code';
+    ds.session.cliSessionId = 'native_adopted';
+    ds.session.workerGeneration = 2;
+    ds.workerGeneration = 2;
+    const binding = { appId: ds.larkAppId, chatId: ds.chatId, sessionId: ds.session.sessionId, turnId: 'om_adopted', workerGeneration: 2,
+      epoch: groupContextEpoch(ds.session.sessionId, ds.session.cliSessionId, 'claude-code', 'om_adopted') };
+    writePreparedGroupContext({ ...binding, createdAt: Date.now(), body: '', includedSeqs: [], throughSeq: 0, incomplete: false }, config.session.dataDir);
+    bindGroupContextDelivery(binding, config.session.dataDir);
+    const stopBeforeSpawn = new Error('test stops before worker spawn');
+    let recordedGeneration: number | undefined;
+    const { forkAdoptWorker } = await import('../src/core/worker-pool.js');
+    expect(() => forkAdoptWorker(ds, { prompt: 'prepared native input', turnId: binding.turnId,
+      onWorkerGenerationReserved: generation => {
+        expect(generation).toBe(3);
+        recordedGeneration = readGroupContextDeliveryBinding(binding.appId, binding.chatId, binding.turnId, config.session.dataDir, binding.epoch)?.workerGeneration;
+        throw stopBeforeSpawn;
+      } })).toThrow(stopBeforeSpawn);
+    expect(recordedGeneration).toBe(3);
+    expect(ds.worker?.kill).not.toHaveBeenCalled();
   });
 
   it.each(['bridge', 'explicit'] as const)('keeps the %s answer and Oncall source in the existing reply card', async source => {
@@ -906,6 +956,27 @@ describe('Bridge final_output delivery (P2 retry)', () => {
       initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
       return sessionReply;
     }
+
+    it('carries the exact native author into final publication and omits it after an epoch change', async () => {
+      const sessionReply = armTranscript();
+      const ds = makeDs();
+      ds.session.cliId = 'claude-code';
+      ds.session.cliSessionId = 'native_final';
+      ds.session.workerGeneration = 1;
+      const binding = { appId: ds.larkAppId, chatId: ds.chatId, sessionId: ds.session.sessionId, turnId: 'turn-1', workerGeneration: 1,
+        epoch: groupContextEpoch(ds.session.sessionId, ds.session.cliSessionId, ds.session.cliId, 'turn-1') };
+      writePreparedGroupContext({ ...binding, createdAt: Date.now(), body: '', includedSeqs: [], throughSeq: 0, incomplete: false }, config.session.dataDir);
+      bindGroupContextDelivery(binding, config.session.dataDir);
+      const { __testOnly_deliverFinalOutput } = await import('../src/core/worker-pool.js') as any;
+      __testOnly_deliverFinalOutput(ds, finalOutputMsg(), 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply.mock.calls[0]?.[5]?.groupContextAuthorOrigin).toEqual(binding);
+      sessionReply.mockClear();
+      ds.session.cliSessionId = 'replacement_native';
+      __testOnly_deliverFinalOutput(ds, { ...finalOutputMsg(), assistantMsgUuid: 'second-final' }, 'tag', 0);
+      await vi.advanceTimersByTimeAsync(10);
+      expect(sessionReply.mock.calls[0]?.[5]?.groupContextAuthorOrigin).toBeUndefined();
+    });
 
     it('marks the turn only AFTER the canonical send succeeds', async () => {
       const sessionReply = armTranscript();

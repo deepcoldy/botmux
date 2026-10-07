@@ -14,7 +14,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { BridgeTurnQueue, makeFingerprint, isTruncatedMatch } from '../src/services/bridge-turn-queue.js';
+import { BridgeTurnQueue, makeFingerprint, isTruncatedMatch, normaliseForFingerprint } from '../src/services/bridge-turn-queue.js';
 import { shouldSuppressBridgeEmit, type BridgeSendMarker } from '../src/services/bridge-fallback-gate.js';
 import type { TranscriptEvent } from '../src/services/claude-transcript.js';
 
@@ -1825,3 +1825,44 @@ describe('BridgeTurnQueue — bare (solo transcript) input fingerprint', () => {
 function makeFingerprintFull(message: string): string {
   return message.replace(/\s+/g, ' ').trim();
 }
+
+// ── Native consumption evidence for shared group background ───────────────────
+// Only a transcript record whose normalised text contains the WHOLE marked
+// content proves that the dispatched input (envelope included) entered the
+// conversation. Fingerprint-prefix and truncation binds still attribute the
+// reply but must not be reported as consumption evidence.
+describe('onLarkTurnStarted evidence', () => {
+  const marked = '<shared_group_context>history</shared_group_context>\n<user_message>看一下图库</user_message>';
+  function queueWith(record: (turn: { turnId: string }, evidence: { fullContentMatch: boolean; sourceJsonlPath?: string }) => void) {
+    return new BridgeTurnQueue(undefined, undefined, record);
+  }
+
+  it('reports a full-content match with the source transcript path', () => {
+    const seen: unknown[] = [];
+    const q = queueWith((turn, evidence) => seen.push([turn.turnId, evidence]));
+    q.mark('om_turn', makeFingerprint(marked), Date.now(), normaliseForFingerprint(marked));
+    q.ingest([user('u1', marked)], '/claude/projects/x/abcd-session.jsonl');
+    expect(seen).toEqual([['om_turn', { fullContentMatch: true, sourceJsonlPath: '/claude/projects/x/abcd-session.jsonl' }]]);
+  });
+
+  it('reports fingerprint-only and truncated binds as non-proof', () => {
+    const seen: boolean[] = [];
+    const q = queueWith((_turn, evidence) => seen.push(evidence.fullContentMatch));
+    q.mark('om_prefix', makeFingerprint(marked), Date.now(), normaliseForFingerprint(marked));
+    // Same 30-char head, different tail: attribution heuristic, not proof.
+    q.ingest([user('u1', '<shared_group_context>history</shared_group_context>\n<user_message>看一下别的</user_message>')]);
+    q.mark('om_truncated', makeFingerprint(marked), Date.now(), normaliseForFingerprint(marked));
+    // Claude persisted only the surviving tail of the envelope.
+    q.ingest([assistant('a1', 'reply'), user('u2', '<user_message>看一下图库</user_message>')]);
+    expect(seen).toEqual([false, false]);
+  });
+
+  it('does not report local or legacy unfingerprinted turns as full matches', () => {
+    const seen: boolean[] = [];
+    const q = queueWith((_turn, evidence) => seen.push(evidence.fullContentMatch));
+    q.ingest([user('local', 'pwd')]);
+    q.mark('om_legacy');
+    q.ingest([user('u1', marked)]);
+    expect(seen).toEqual([false]);
+  });
+});

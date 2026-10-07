@@ -52,6 +52,9 @@ export interface PtyHandle {
 export type SubmitRecheckResult = boolean | {
   submitted: boolean;
   cliSessionId?: string;
+  /** Positive native ownership of the matched record (see the Codex adapter).
+   *  Absent means "submitted, but not proven to be THIS pane's conversation". */
+  ownershipProven?: boolean;
 };
 
 /** What the adapter can prove about a failed runner-protocol write.
@@ -390,6 +393,8 @@ export interface CliAdapter {
   ): Promise<void | {
     submitted: boolean;
     cliSessionId?: string;
+    /** Positive native ownership of the submit evidence; see SubmitRecheckResult. */
+    ownershipProven?: boolean;
     submissionDisposition?: RunnerSubmissionDisposition;
     /** Non-transient reason when the adapter knows submission is impossible
      *  without waiting for transcript confirmation (for example an unsupported
