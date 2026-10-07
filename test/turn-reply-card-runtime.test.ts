@@ -9,6 +9,7 @@ import { replyCardModeFor, updateTurnReplyCard, settleTurnReplyCards, queueTurnR
 import { updateMessage } from '../src/im/lark/client.js';
 import { TurnReplyCardStore } from '../src/services/turn-reply-card.js';
 import type { CotEntry } from '../src/types.js';
+import { replyCardPresentation } from '../src/im/lark/turn-reply-card.js';
 
 vi.mock('../src/config.js', () => ({ config: { session: { dataDir: '' } } }));
 vi.mock('../src/core/cost-calculator.js', () => ({ getSessionUsageSnapshot: vi.fn(() => ({ context: null, tokens: null })) }));
@@ -39,6 +40,25 @@ describe('reply-card runtime eligibility and recovery', () => {
     vi.mocked(updateMessage).mockClear();
   });
   afterEach(() => { vi.unstubAllEnvs(); rmSync(dir, { recursive: true, force: true }); });
+
+  it.each([false, true, undefined])('applies tool result preference %s to rendering and persisted flushes', async enabled => {
+    bot.config.thinkingCardToolResult = enabled;
+    expect(replyCardPresentation(bot.config, 'oc_mode').showToolResults).toBe(enabled !== false);
+    const ds = session();
+    const send = vi.fn(async () => 'om_reply');
+    await updateTurnReplyCard(ds, 'om_mode', { kind: 'start' }, send);
+    queueTurnReplyTools(ds, { turnId: 'om_mode', entries: [
+      { kind: 'tool_call', id: 'read', name: 'Read', args: '{}', subject: 'README.md' },
+      { kind: 'tool_result', id: 'read', result: 'RESULT_BODY_MARKER' },
+    ] }, send, () => true);
+    await flushTurnReplyTools(ds, 'om_mode');
+    const stored = new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: 'om_mode' });
+    expect(stored?.tools).toHaveLength(1);
+    expect(stored?.tools[0]?.result).toBe(enabled === false ? undefined : 'RESULT_BODY_MARKER');
+    const patched = vi.mocked(updateMessage).mock.calls.at(-1)![2];
+    expect(patched.includes('RESULT_BODY_MARKER')).toBe(enabled !== false);
+    expect(patched).toContain('README.md');
+  });
 
   it.each(['claude-code', 'codex'] as const)('keeps sandboxed %s turns entirely on the default path', async cliId => {
     const ds = session();

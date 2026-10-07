@@ -62,6 +62,17 @@ prompt 是到点时会被执行的内容，就像用户新开一个话题向你�
 botmux schedule list
 \`\`\`
 
+### 修改提示词
+
+修改已有任务的 prompt 必须原地更新，不要先删除再创建：
+
+\`\`\`
+botmux schedule update <id> --prompt-file <UTF-8 文件路径>
+botmux schedule update <id> --prompt "新的完整提示词"
+\`\`\`
+
+两种输入方式只能选一种。更新成功保留任务 ID、执行时间、启停状态、每次新话题设置和运行记录；已开始的执行沿用原 prompt，后续执行使用新版，不会自动补跑。文件读取、身份验证或写入失败时保留旧任务，先排查错误，不要通过删除任务重试。旧版本没有 update 时先升级，不要把修改降级为先删后建。若提示任务绑定了守护前置条件（precondition），说明该任务只能在 Dashboard 修改，不要删除重建，告知用户去 Dashboard 的定时任务页编辑。
+
 ### 管理
 
 \`\`\`
@@ -70,6 +81,10 @@ botmux schedule resume <id>    # 恢复
 botmux schedule remove <id>    # 删除
 botmux schedule run <id>       # 标记立即执行（< 30 秒内 daemon 会触发）
 \`\`\`
+
+委托创建且宿主启用了 self-management 的任务，在自己的 scheduled turn 内可用
+\`botmux schedule pause self\` 或 \`botmux schedule remove self\` 停止自己。
+\`self\` 不能用于 update/resume/run，也不能指向或管理其他任务。
 
 ## 典型用法
 
@@ -309,6 +324,8 @@ description: 向飞书话题发送消息。用户在飞书上阅读看不到终�
 
 **核心规则**：用户在飞书上阅读，看不到你的终端输出。想让用户看到的内容**必须**通过 \`botmux send\` 发送。
 
+**话题不可用时遵循机器人配置**：默认保持原有发送和兜底行为。返回 \`TOPIC_SEND_BLOCKED\` 时停止发送，不得改用其他位置绕过；返回 \`TOPIC_SEND_CHECK_FAILED\` 表示查询失败，不代表话题已失效，可以重试原话题查询。
+
 **发送成功判定 & 不要重发**：\`botmux send\` 退出码为 0（返回 \`{"success":true,...}\`）就代表消息**已经送达**用户——即使你的终端里看不到任何回执，也不用再发一遍。发完 \`botmux send\` 后，本轮「终端没有可见文本、直接安静结束」是正常且预期的。如果之后看到类似「你上一条回复没有可见输出，请继续并产出用户可见回复」这样的提示，那是底层 CLI（Claude Code 等）的误判——**不要重发**，只有当 \`botmux send\` 自己报错（非零退出或打印「发送失败」）时才需要重试。
 
 **格式自动处理**：普通回复统一用飞书卡片（schema 2.0）发送；单句纯文本仍保持轻量正文，Markdown 标题和表格转换为独立组件，代码块由富文本组件原生渲染。**该用 md 就用 md**——结构化内容不要手撸成纯文本或 ASCII 表格。
@@ -488,6 +505,30 @@ botmux send --files /tmp/report.pdf "报告已生成，请查收附件。"
 \`\`\`bash
 botmux send --videos /tmp/replay.mp4 --video-covers /tmp/cover.png --no-mention "RRH replay preview"
 \`\`\`
+
+### 图表（vega-lite）
+
+正文里的 \`\`\`vega-lite 代码块会渲染成飞书原生图表（柱状 / 条形 / 折线 / 面积 / 散点 / 饼或环图），Web 等其它通道可以直接用同一段 Vega-Lite 渲染。只支持一个子集：
+
+- 数据只能用 \`data.values\` 内联（≤500 行，值为字符串 / 数字 / 布尔 / null）；\`data.url\`、\`transform\`、\`params\`、\`expr\`、\`signal\`、\`datasets\`、\`layer\` 等一律不支持。
+- \`mark\` 取 \`bar\` / \`line\` / \`area\` / \`point\` / \`arc\`；编码只用 \`x\` / \`y\` / \`color\` / \`theta\`（字段写 \`field\`、\`type\`、\`title\`，不支持 \`aggregate\` 等，先把数据聚合好再画）。
+- 饼图用 \`mark: arc\` + \`theta\`（数值）+ \`color\`（类别），不要写 \`x\`/\`y\`，\`theta\` 不带 \`title\`；\`mark: {type: arc, innerRadius: 40}\` 是环图。
+- \`x\`/\`y\` 的 \`title\` 是坐标轴标题，\`color\` 的 \`title\` 是图例标题；\`temporal\` 不解析日期，按给定顺序当类别画，先排好序。
+- 每张卡片最多 5 个图表；整张卡片的飞书请求体上限是 30KB，放不下时图表会逐级降级（图表 → 50 行表 → 10 行表 → 只留说明）。不支持或降级的图表在 stderr 给出原因；消息照常发出。发之前可以用 \`--dry-run\` 看 \`bytes\` / \`fits\`。
+
+~~~bash
+botmux send --no-mention <<'EOF'
+## 近 5 天上账
+\`\`\`vega-lite
+{"title":"近 5 天上账（万 THB）","data":{"values":[{"d":"09-28","v":18},{"d":"09-29","v":14}]},
+ "mark":"bar","encoding":{"x":{"field":"d","type":"ordinal"},"y":{"field":"v","type":"quantitative"}}}
+\`\`\`
+EOF
+~~~
+
+### 发送前自查：--dry-run
+
+\`botmux send --dry-run\`（正文照常用位置参数 / stdin / \`--content-file\`）不发送任何消息，只把正文按卡片渲染后输出 JSON：\`{dryRun, bytes, fits, diagnostics, card}\`，\`bytes\` 按飞书真实请求体计算。\`diagnostics\` 列出被降级的图表及原因。它只渲染正文，不上传图片/附件、不解析 @、不加页脚，也不需要会话。
 
 ### 原始飞书/Lark 卡片 JSON
 
@@ -1427,6 +1468,10 @@ description: 多 bot 长期项目编排。仅当任务同时需要「多个 bot 
 \`\`\`bash
 botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder" --bot "<reviewer_open_id>:名字:reviewer" --repo "<工作目录>" --brief-file /tmp/brief-X.md
 \`\`\`
+若任务明确要求目标 Bot 创建持久定时任务，改用稳定 \`--bot-app\` 派发并显式加
+\`--delegate schedule:create\`；该权限必须由当前真人回合和宿主策略共同批准，
+只允许目标 Bot 在本群创建一个任务，不能转委托。普通派发不要附带此参数。
+
 **简报必须写清子 bot 的「完成协议」**，否则收不齐：
 - 你的飞书任务 ID 是 <task_guid>；
 - 干完用 **lark-task** 把该任务标记完成、并把产出（链接/摘要）挂到任务评论或附件；
@@ -1577,7 +1622,7 @@ botmux workflow architect <runId>
 
 > 编排好的流程是这样，对吗？确认就开跑。
 
-用户确认 → \`botmux workflow approve-dag <runId>\`，然后 \`botmux workflow start <runId>\` 交 daemon 驱动开跑（**别用 \`botmux v3 run\`**——那是 dev 终端路径，没有飞书审批卡）。daemon 路径下，节点的 \`risk_gate\`（humanGate）执行期会在本话题**弹审批卡**，用户点「通过/拒绝」才继续；daemon 重启也能恢复待审批的卡。要改：需求要改 → \`botmux workflow revise-spec <runId>\`（退回 grilling，原 DAG 作废）重走 grill→spec→architect；需求没变、只是流程不满意 → \`botmux workflow revise-dag <runId>\`（退回 spec_approved）重跑 architect 重编。
+用户确认 → \`botmux workflow approve-dag <runId> [--working-dir <任务目录>]\`。可选 \`--working-dir\` 在首次 Gate-2 批准时冻结所有节点的工作目录；省略时使用各机器人的配置目录。已发布 run 重试复用原快照，后传目录不覆盖已有运行。然后 \`botmux workflow start <runId>\` 交 daemon 驱动开跑（**别用 \`botmux v3 run\`**——那是 dev 终端路径，没有飞书审批卡）。daemon 路径下，节点的 \`risk_gate\`（humanGate）执行期会在本话题**弹审批卡**，用户点「通过/拒绝」才继续；daemon 重启也能恢复待审批的卡。要改：需求要改 → \`botmux workflow revise-spec <runId>\`（退回 grilling，原 DAG 作废）重走 grill→spec→architect；需求没变、只是流程不满意 → \`botmux workflow revise-dag <runId>\`（退回 spec_approved）重跑 architect 重编。
 
 ## 关键纪律
 - 全程飞书一问一答，用 botmux send 对话。

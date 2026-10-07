@@ -69,4 +69,68 @@ describe('Codex worker structured-bridge wiring', () => {
     expect(guard).toContain('codexBridgePendingSessionId = undefined;');
     expect(guard).toContain('codexBridgeStartTimer();');
   });
+
+  it('antigravity ticker delegates the pending/rotation decision to the pure decideAntigravityTickerAction', () => {
+    // Behaviour of the /new lazy-create race (pending B kept when pid returns
+    // retired A; rotate when B's file appears; clear only on SID provenance)
+    // is covered in test/antigravity-bridge-decision.test.ts. Here assert the
+    // worker ticker routes through it and acts on each action kind.
+    const anchor = workerSource.indexOf('Antigravity has no /adopt bridge');
+    expect(anchor).toBeGreaterThan(0);
+    const branchIdx = workerSource.lastIndexOf('if (structuredBridgeIsAntigravity()) {', anchor);
+    const branch = workerSource.slice(branchIdx, branchIdx + 3200);
+    expect(branch).toContain('decideAntigravityTickerAction({');
+    expect(branch).toContain("action.kind === 'rotate'");
+    expect(branch).toContain("action.kind === 'bind-initial'");
+    expect(branch).toContain("action.kind === 'clear-pending'");
+    expect(branch).toContain('flushAntigravityTrailingFinal: true');
+  });
+
+  it('releases the antigravity provisional final only from a guarded ready+not-busy quiet tick with no pending background task', () => {
+    const fnStart = workerSource.indexOf('function maybeFlushAntigravityTrailingFinalOnQuietTick');
+    expect(fnStart).toBeGreaterThan(0);
+    const fnEnd = workerSource.indexOf('/** 将 Codex 的结构化 429', fnStart);
+    const fn = workerSource.slice(fnStart, fnEnd);
+    // Two-tick unchanged-offset latch…
+    expect(fn).toContain('antigravityQuietCandidateKey');
+    // …and BOTH screen conditions (ready marker present, busy marker absent).
+    expect(fn).toContain('cliAdapter.busyPattern.test(busyProbeRegion(screen))');
+    expect(fn).toContain('cliAdapter.readyPattern.test(stripAnsiScreenText(screen))');
+    // …plus the transcript-level pending-task veto.
+    expect(fn).toContain('antigravityBridgeState.hasPendingTask');
+    expect(fn).toContain('codexBridgeIngest({ flushAntigravityTrailingFinal: true })');
+    // The flush is driven from the 1s ticker.
+    expect(workerSource).toContain('maybeFlushAntigravityTrailingFinalOnQuietTick();');
+  });
+
+  it('does not fire the idle detector from an antigravity transcript final (screen owns its turn boundary)', () => {
+    const fnStart = workerSource.indexOf('function codexBridgeIngest');
+    const fnEnd = workerSource.indexOf('function maybeFlushOmpTrailingFinalOnQuietTick', fnStart);
+    const fn = workerSource.slice(fnStart, fnEnd);
+    expect(fn).toContain('!structuredBridgeIsAntigravity()');
+  });
+
+  it('notifies the bridge when the antigravity pid observer resolves a conversation id', () => {
+    const fnStart = workerSource.indexOf('function observeAntigravityCliSessionId');
+    expect(fnStart).toBeGreaterThan(0);
+    const fnEnd = workerSource.indexOf('const SUBMIT_DEFERRED_RECHECK_MS', fnStart);
+    const fn = workerSource.slice(fnStart, fnEnd);
+    expect(fn).toContain('if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(cid);');
+  });
+
+  it('spawnCli re-checks zero-prompt capability with the RESOLVED sandbox mode (env BOTMUX_SANDBOX=scratch is not on cfg)', () => {
+    // The capability gate at config/command time cannot see the machine-wide
+    // BOTMUX_SANDBOX switch (it is never materialised into cfg). spawnCli
+    // resolves the real mode via resolveSandboxMode → sandboxMode; it must feed
+    // that resolved value back into supportsZeroPromptInjection so a
+    // zero-prompt cursor/antigravity under the scratch COW overlay throws
+    // instead of silently dropping every reply.
+    const anchor = workerSource.indexOf('const scratchRequested = sandboxMode === ');
+    expect(anchor).toBeGreaterThan(0);
+    // The re-check lives after the resolved mode is known in spawnCli.
+    const region = workerSource.slice(anchor, anchor + 2000);
+    expect(region).toContain("cfg.promptInjection === 'none' && !supportsZeroPromptInjection(cfg.cliId, {");
+    expect(region).toContain('sandbox: sandboxMode');
+    expect(region).toContain('backendType: effectiveBackendType');
+  });
 });

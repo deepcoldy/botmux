@@ -416,6 +416,23 @@ describe('shouldSuppressBridgeEmit', () => {
     )).toBe(false);
   });
 
+  it('never lets a terminal-independent outbound message replace the turn final', () => {
+    const final = 'final answer';
+    const marker: BridgeSendMarker = {
+      sentAtMs: 200,
+      responseKind: 'progress',
+      terminalIndependent: true,
+      contentLength: normalise(final).length,
+      previewText: final,
+    };
+    expect(shouldSuppressBridgeEmit(
+      { ...turn(100), finalText: final },
+      500,
+      [marker],
+      false,
+    )).toBe(false);
+  });
+
   it('non-adopt: managed-card final suppresses; managed-card progress/auxiliary does not', () => {
     const fallback = 'A materially different and longer English summary text that the '
       + 'terminal transcription fallback would otherwise double post onto the thread today.';
@@ -599,6 +616,93 @@ describe('shouldSuppressBridgeEmit', () => {
 
   it('non-adopt: isLocal turn always suppressed (skip web-terminal echo to Lark)', () => {
     expect(shouldSuppressBridgeEmit(turn(100, true), 200, [], false)).toBe(true);
+  });
+
+  describe('built-in scheduled turns (isScheduled)', () => {
+    it('a scheduled turn with a real answer and no send is forwarded', () => {
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true, finalText: '波次进度：r01 全部 rankable' },
+        200, [], false,
+      )).toBe(false);
+    });
+
+    it('still suppressed in adopt mode never comes up, and ambient local typing without isScheduled stays silent', () => {
+      // Regression guard: the isScheduled bypass must not weaken the
+      // local-typing gate for ordinary isLocal turns.
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, finalText: 'pwd' }, 200, [], false,
+      )).toBe(true);
+    });
+
+    it('deliberate NOTHING_TO_SEND silence still suppresses a scheduled turn', () => {
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true, finalText: BRIDGE_NOTHING_TO_SEND_SENTINEL },
+        200, [], false,
+      )).toBe(true);
+    });
+
+    it('an explicit final botmux send in-window dedups the scheduled fallback', () => {
+      const body = '波次进度：r01 全部 rankable';
+      const markers: BridgeSendMarker[] = [
+        { sentAtMs: 150, responseKind: 'final', ...buildBridgeSendMarkerContent(body)! },
+      ];
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true, finalText: body },
+        200, markers, false,
+      )).toBe(true);
+    });
+
+    it('a materially longer scheduled final is still delivered despite a progress send', () => {
+      const longFinal = '完整简报：' + 'r01 七个 trial 全部 rankable，' .repeat(20);
+      const markers: BridgeSendMarker[] = [
+        { sentAtMs: 150, ...buildBridgeSendMarkerContent('进展中')! },
+      ];
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true, finalText: longFinal },
+        200, markers, false,
+      )).toBe(false);
+    });
+
+    it('does NOT suppress a scheduled turn before its final text is read, even with an in-window send', () => {
+      // Must-fix regression: the worker runs a pre-text gate for every ready
+      // turn. For a scheduled turn a short progress note is a legit in-window
+      // marker, but suppressing here drops the real (longer) final that is only
+      // produced afterwards — the materially-longer check never runs because
+      // there is no finalText to compare. Without finalText the gate must defer
+      // the decision; the caller re-runs with the transcript final.
+      const progress: BridgeSendMarker[] = [
+        { sentAtMs: 150, ...buildBridgeSendMarkerContent('进展中，稍后汇报')! },
+      ];
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true },
+        200, progress, false,
+      )).toBe(false);
+      // Same in an OPEN window (no next boundary yet): a legacy marker with no
+      // content length must likewise not pre-suppress without the final.
+      const legacy: BridgeSendMarker[] = [{ sentAtMs: 150, messageId: 'om_x' }];
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true },
+        undefined, legacy, false,
+      )).toBe(false);
+      // …and under transcript delivery too.
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true },
+        200, progress, false, 'transcript',
+      )).toBe(false);
+    });
+
+    it('an explicit final marker STILL suppresses a scheduled turn even without finalText', () => {
+      // A declared --response-kind final is an unconditional delivery signal;
+      // the no-finalText deferral must not resurrect a duplicate when the model
+      // explicitly marked its send as final.
+      const finalMarker: BridgeSendMarker[] = [
+        { sentAtMs: 150, responseKind: 'final', ...buildBridgeSendMarkerContent('最终简报')! },
+      ];
+      expect(shouldSuppressBridgeEmit(
+        { markTimeMs: 100, isLocal: true, isScheduled: true },
+        200, finalMarker, false,
+      )).toBe(true);
+    });
   });
 
   describe('transcript mode — final is the delivery channel, not a fallback (F1)', () => {

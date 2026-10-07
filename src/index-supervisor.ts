@@ -58,6 +58,7 @@ async function main(): Promise<void> {
   const { fleetStatePath, fleetDistDir, fleetLogDir, fleetCommandPath, resolveFleetBots, resolveFleetMembers, resolveFleetDaemonEnv, fleetDaemonNodeArgs } = await import('./core/fleet-runtime.js');
   const { drainFleetCommands } = await import('./core/fleet-command-queue.js');
   const { logger } = await import('./utils/logger.js');
+  const { FLEET_DAEMON_KILL_TIMEOUT_MS } = await import('./core/shutdown-budgets.js');
 
   // Every supervised member: the bot daemons from bots.json PLUS the dashboard.
   // The dashboard is always present (mirrors the old pm2 ecosystem, which always
@@ -74,6 +75,7 @@ async function main(): Promise<void> {
     cwd: configDir,
     daemonNodeArgs: fleetDaemonNodeArgs(),
     logDir: fleetLogDir(),
+    killTimeoutMs: FLEET_DAEMON_KILL_TIMEOUT_MS,
     log: (m) => logger.info(`[supervisor] ${m}`),
   });
 
@@ -114,7 +116,12 @@ async function main(): Promise<void> {
   process.on('SIGHUP', () => void drain());
 
   logger.info(`[supervisor] starting fleet: ${botCount} bot(s) + dashboard`);
-  supervisor.start(members);
+  if (!supervisor.start(members)) {
+    // Another live supervisor already owns the fleet (two `botmux start`s
+    // overlapped, e.g. the autostart watchdog and a slow first start). It keeps
+    // supervising; this duplicate has spawned nothing and simply leaves.
+    process.exit(0);
+  }
   // Keep the process alive supervising; children + timers hold the event loop.
 }
 

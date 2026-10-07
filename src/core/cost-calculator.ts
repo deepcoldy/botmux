@@ -20,6 +20,7 @@ import {
   isMeaningfulUserEvent,
   type TranscriptEvent,
 } from '../services/claude-transcript.js';
+import { readAntigravityTokenUsage } from '../services/antigravity-usage.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -1310,6 +1311,10 @@ function readSessionUsage(q: SessionTokenUsageQuery): UsageReadResult | null {
     );
     if (!checkpointPath || !existsSync(checkpointPath)) return null;
     return readSessionTokenAggregateCached(checkpointPath, 'aiden', { fresh: q.fresh });
+  }
+  if (q.cliId === 'antigravity') {
+    if (!q.cliSessionId) return null;
+    return readAntigravityTokenUsage(q.cliSessionId) as UsageReadResult | null;
   }
   const resolved = resolveSessionTranscriptPath(q);
   if (!resolved || !existsSync(resolved.path)) return null;

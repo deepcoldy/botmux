@@ -295,10 +295,10 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   return serialized;
 }
 
-export function replyCardPresentation(config: Pick<BotConfig, 'cotEnabled' | 'noCotChats' | 'hiddenStreamingCardButtons'>, chatId: string): Pick<TurnReplyCardPresentation, 'showProcess' | 'showToolResults' | 'canStop'> {
+export function replyCardPresentation(config: Pick<BotConfig, 'cotEnabled' | 'thinkingCardToolResult' | 'noCotChats' | 'hiddenStreamingCardButtons'>, chatId: string): Pick<TurnReplyCardPresentation, 'showProcess' | 'showToolResults' | 'canStop'> {
   return {
     showProcess: config.cotEnabled !== false && !config.noCotChats?.includes(chatId),
-    showToolResults: true,
+    showToolResults: config.thinkingCardToolResult !== false,
     canStop: !config.hiddenStreamingCardButtons?.includes('stop'),
   };
 }

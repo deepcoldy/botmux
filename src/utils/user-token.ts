@@ -392,42 +392,15 @@ export async function resolveUserToken(
 
 const DEFAULT_PORT = 9768;
 /**
- * Read-only document access, requested by every `/login`.
- *
- * "Open the doc I linked" is a basic expectation of an assistant, and it failed
- * until now: the default set was three IM scopes chosen when the only consumer
- * was chat-image download, so an authorized user still got
- * `99991679 missing_scope` on the first document they asked about.
- *
- * These seven form one closed loop — a link opens, a name is findable, a wiki
- * URL resolves to its token, and docs and sheets both read. Dropping any one
- * produces a plausible-but-broken assistant: docx without wiki, for instance,
- * fails on the wiki links most internal documents actually use.
- *
- * Read-only on purpose. A write scope turns "the agent misread something" into
- * "the agent edited your document", and nothing here needs to write; when a
- * write really is wanted, the missing-scope path asks for it explicitly. Same
- * reasoning excludes contact (reads the whole company directory), calendar, and
- * file download — none are needed to read a document.
- *
- * Every name is validated against setup/lark-scopes.json: a typo does not
- * degrade, it makes the authorize URL fail outright with 20043.
+ * 普通登录只申请消息读取、资源访问和授权续期。
+ * 飞书会校验授权链接里的每个 scope；默认捆绑文档权限会让仅开通消息能力的
+ * 应用在授权页直接失败（20027），连基础登录也无法完成。其它能力通过
+ * `/login --scope ...` 或专项入口按需追加，不根据已有 token 隐式扩大申请范围。
  */
-export const DOC_READ_OAUTH_SCOPES = [
-  'docx:document:readonly',        // new-style doc body
-  'docs:document.content:read',    // legacy doc body
-  'drive:drive.metadata:readonly', // title / mtime / type
-  'drive:drive.search:readonly',   // find a file by name
-  'wiki:wiki:readonly',            // wiki node -> obj_token
-  'sheets:spreadsheet:read',
-  'sheets:spreadsheet.meta:read',
-];
-
 const DEFAULT_SCOPES = [
   'im:message:readonly',
   'im:resource',
   'offline_access',
-  ...DOC_READ_OAUTH_SCOPES,
 ].join(' ');
 
 type UserAuthorizationPollResult =

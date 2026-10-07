@@ -86,6 +86,7 @@ interface DashboardSettings {
   whiteboard: { enabled: boolean };
   workflow: { enabled: boolean };
   sessionCleanup: { enabled: boolean; olderThanHours: IdleCleanupHours; intervalMinutes: number };
+  multiTopic: { enabled: boolean };
   remoteAccess: boolean;
   /** OAuth 回跳基址；'' = 未配置（退回 127.0.0.1 粘贴流程）。 */
   oauthRedirectBase: string;
@@ -133,6 +134,8 @@ interface UpdateStatus {
   updateCommand: string | null;
   node: NodeCheck;
   installs: { entries: InstallEntry[]; multiple: boolean };
+  runningDaemons?: Array<{ larkAppId: string; version?: string }>;
+  runningDaemonRestartHint?: string;
 }
 interface ReleaseNote { version: string; name: string; body: string; url: string; publishedAt: string | null }
 
@@ -246,6 +249,7 @@ function parseSettings(s: any): DashboardSettings {
         ? Math.floor(s.sessionCleanup.intervalMinutes)
         : 60,
     },
+    multiTopic: { enabled: s?.multiTopic?.enabled !== false },
     remoteAccess: s?.remoteAccess === true,
     oauthRedirectBase: typeof s?.oauthRedirectBase === 'string' ? s.oauthRedirectBase : '',
     scheduleTimeZone: typeof s?.scheduleTimeZone === 'string' ? s.scheduleTimeZone : '',
@@ -953,6 +957,17 @@ function SettingsBody(props: {
             disabled={dis || savingKey === 'workflow'}
             onChange={value => {
               void props.onSave('workflow', { workflow: { enabled: value } }, s => ({ ...s, workflow: { enabled: value } }));
+            }}
+          />
+        </SettingsBlock>
+        <SettingsBlock title={tr('settings.sectionMultiTopic')}>
+          <ToggleRow
+            title={tr('settings.multiTopicEnable')}
+            help={tr('settings.multiTopicEnableHelp')}
+            checked={settings.multiTopic.enabled}
+            disabled={dis || savingKey === 'multiTopic'}
+            onChange={value => {
+              void props.onSave('multiTopic', { multiTopic: { enabled: value } }, s => ({ ...s, multiTopic: { enabled: value } }));
             }}
           />
         </SettingsBlock>
@@ -1949,6 +1964,7 @@ function UpdateCard(props: {
           <span>{tr('update.current')}: <strong>v{s.current}</strong></span>{' '}
           <UpdateBadge status={s} />
         </p>
+        {s.runningDaemonRestartHint ? <p className="hint-warn">{s.runningDaemonRestartHint}</p> : null}
         {!s.node.ok ? <p className="hint-warn">{tr('update.nodeWarn', { version: s.node.version, required: s.node.required })}</p> : null}
         {!s.localDevInstall && !s.updateSupported ? <p className="hint-warn">{tr('update.unsupportedInstall')}</p> : null}
         {s.localDevInstall ? <p className="hint">{s.localDevUpdatable ? tr('update.localDevUpdatable') : tr('update.localDev')}</p> : null}

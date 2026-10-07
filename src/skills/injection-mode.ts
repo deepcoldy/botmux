@@ -1,9 +1,9 @@
 /**
  * Built-in skill injection mode — how botmux's own bridge skills
  * (botmux-send / botmux-schedule / …) reach a CLI that only supports a GLOBAL
- * skills directory (codex/gemini/opencode/cursor/coco/traex/pi/oh-my-pi/mtr/
+ * skills directory (codex/gemini/opencode/cursor/coco/traex/mtr/
  * kiro-cli/genius/grok — everything with an adapter `skillsDir`, i.e. no per-session
- * `--plugin-dir` injection like Claude Code).
+ * injection like Claude Code, Pi, or Oh My Pi).
  *
  * Three modes, resolved from per-bot `skillInjection` (bots.json) → machine-wide
  * `skills.builtinInjection` (config.json) → the `prompt` default:
@@ -30,7 +30,7 @@ import { createCliAdapterSync } from '../adapters/cli/registry.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { Locale } from '../i18n/index.js';
 import { escapeXmlText } from '../utils/xml.js';
-import { isWorkflowFeatureEnabled } from '../global-config.js';
+import { isMultiTopicOrchestrationEnabled, isWorkflowFeatureEnabled } from '../global-config.js';
 import {
   BUILTIN_SKILLS,
   WORKFLOW_FEATURE_SKILLS,
@@ -48,13 +48,16 @@ import { renderBotmuxSendSkill } from './reply-style-guide.js';
  *  their historical position (right after `botmux-handoff`) when the machine-wide
  *  workflow switch is ON. Splicing rather than appending keeps the ENABLED-path
  *  catalog byte-for-byte identical to before the family was factored out; when
- *  the switch is OFF the family is simply absent. `botmux-orchestrate` is part of
- *  BUILTIN_SKILLS and is never gated here. */
-function baseBuiltinSkills(workflowEnabled: boolean): typeof BUILTIN_SKILLS {
-  if (!workflowEnabled) return [...BUILTIN_SKILLS];
-  const anchor = BUILTIN_SKILLS.findIndex((s) => s.name === 'botmux-handoff');
-  const at = anchor >= 0 ? anchor + 1 : BUILTIN_SKILLS.length;
-  return [...BUILTIN_SKILLS.slice(0, at), ...WORKFLOW_FEATURE_SKILLS, ...BUILTIN_SKILLS.slice(at)];
+ *  the switch is OFF the family is simply absent. The independent multi-topic
+ *  switch similarly filters `botmux-orchestrate`. */
+function baseBuiltinSkills(workflowEnabled: boolean, multiTopicEnabled: boolean): typeof BUILTIN_SKILLS {
+  const builtins = multiTopicEnabled
+    ? [...BUILTIN_SKILLS]
+    : BUILTIN_SKILLS.filter(skill => skill.name !== 'botmux-orchestrate');
+  if (!workflowEnabled) return builtins;
+  const anchor = builtins.findIndex((s) => s.name === 'botmux-handoff');
+  const at = anchor >= 0 ? anchor + 1 : builtins.length;
+  return [...builtins.slice(0, at), ...WORKFLOW_FEATURE_SKILLS, ...builtins.slice(at)];
 }
 
 export type SkillInjectionMode = 'global' | 'prompt' | 'off';
@@ -106,6 +109,7 @@ export function shouldInstallGlobalSkills(skillsDir: string): boolean {
   const target = expandHome(skillsDir);
   try {
     for (const b of loadBotConfigs()) {
+      if (b.promptInjection === 'none') continue;
       if (resolveSkillInjectionMode(b.skillInjection) !== 'global') continue;
       let sd: string | undefined;
       try { sd = createCliAdapterSync(b.cliId, b.cliPathOverride).skillsDir; } catch { continue; }
@@ -118,11 +122,12 @@ export function shouldInstallGlobalSkills(skillsDir: string): boolean {
 /**
  * How a CLI delivers botmux skills, for the dashboard control (and any other
  * consumer that must branch on skill-delivery capability):
- *  - 'dynamic': per-session `--plugin-dir` injection — the claude-family
- *    (claude-code / seed / relay), which set `pluginDir`. Not configurable: they
- *    always inject dynamically, no global leak. The mode knobs don't apply.
+ *  - 'dynamic': per-session injection — the claude-family (`--plugin-dir`,
+ *    claude-code / seed / relay / oh-my-pi) and pi (`--skill`), which set `pluginDir`.
+ *    Not configurable: they always inject dynamically, no global leak.
+ *    The mode knobs don't apply.
  *  - 'global': a shared global skills dir (`skillsDir`) — codex/gemini/opencode/
- *    cursor/coco/traex/pi/oh-my-pi/mtr/kiro-cli/genius/grok — where
+ *    cursor/coco/traex/mtr/kiro-cli/genius/grok — where
  *    global|prompt|off applies.
  *  - 'none': neither — the CLI has no skill mechanism (antigravity/aiden/hermes/
  *    mir/mira/codex-app), so there's nothing to configure.
@@ -179,9 +184,12 @@ export function builtinSkillEntries(opts: {
    *  (`isWorkflowFeatureEnabled`); when off, the botmux-workflow family is not
    *  advertised. Explicit for tests. */
   workflowEnabled?: boolean;
+  /** Machine-wide multi-topic orchestration switch. Explicit for tests. */
+  multiTopicEnabled?: boolean;
 }): BuiltinSkillEntry[] {
   const workflowEnabled = opts.workflowEnabled ?? isWorkflowFeatureEnabled();
-  let defs = baseBuiltinSkills(workflowEnabled);
+  const multiTopicEnabled = opts.multiTopicEnabled ?? isMultiTopicOrchestrationEnabled();
+  let defs = baseBuiltinSkills(workflowEnabled, multiTopicEnabled);
   if (!opts.asksViaHook) defs.push({ name: ASK_SKILL_NAME, content: ASK_SKILL });
   if (opts.whiteboardEnabled) defs.push({ name: WHITEBOARD_SKILL_NAME, content: WHITEBOARD_SKILL });
   if (opts.excludeRoutingCovered) defs = defs.filter((d) => !FULLY_ROUTING_COVERED_SKILLS.has(d.name));
@@ -202,7 +210,7 @@ export function builtinSkillContent(
   env: Record<string, string | undefined> = process.env,
 ): string | undefined {
   const all = [
-    ...baseBuiltinSkills(isWorkflowFeatureEnabled()),
+    ...baseBuiltinSkills(isWorkflowFeatureEnabled(), isMultiTopicOrchestrationEnabled(env)),
     { name: ASK_SKILL_NAME, content: ASK_SKILL },
     { name: WHITEBOARD_SKILL_NAME, content: WHITEBOARD_SKILL },
   ];

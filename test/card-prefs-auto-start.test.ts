@@ -84,6 +84,52 @@ describe('card-prefs store — 主动开工 fields', () => {
     return JSON.parse(readFileSync(configPath, 'utf-8'))[0];
   }
 
+  it('preserves legacy CoT opt-out across unrelated edits and migrates only an explicit toggle', async () => {
+    writeConfig({ thinkingCard: false });
+    const { registry, store, botConfigStore } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    expect(store.getBotCardPrefs('app_default').cotEnabled).toBe(false);
+    const unrelated = await store.updateBotCardPrefs('app_default', { privateCard: true });
+    expect(unrelated).toMatchObject({ ok: true, prefs: { cotEnabled: false } });
+    expect(readConfig().thinkingCard).toBe(false);
+    const on = await store.updateBotCardPrefs('app_default', { cotEnabled: true });
+    expect(on).toMatchObject({ ok: true, prefs: { cotEnabled: true } });
+    expect(readConfig().thinkingCard).toBeUndefined();
+    expect(registry.loadBotConfigs()[0].cotEnabled).not.toBe(false);
+    // Old command syntax remains usable and writes the canonical preference.
+    await botConfigStore.applyConfigField('app_default', botConfigStore.findConfigField('thinkingCard')!, false);
+    expect(registry.loadBotConfigs()[0].cotEnabled).toBe(false);
+  });
+
+  it('canonical CoT booleans override legacy values and config enable survives cold loading', async () => {
+    writeConfig({ thinkingCard: false, cotEnabled: true });
+    const { registry, botConfigStore } = await freshModules();
+    expect(registry.loadBotConfigs()[0].cotEnabled).not.toBe(false);
+    writeConfig({ thinkingCard: false });
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    await botConfigStore.applyConfigField('app_default', botConfigStore.findConfigField('cotEnabled')!, true);
+    expect(readConfig().thinkingCard).toBeUndefined();
+    expect(registry.loadBotConfigs()[0].cotEnabled).not.toBe(false);
+    writeConfig({ thinkingCard: true, cotEnabled: false });
+    expect(registry.loadBotConfigs()[0].cotEnabled).toBe(false);
+  });
+
+  it('persists per-bot exclusions, keeps them on unrelated saves, and clears them', async () => {
+    writeConfig();
+    const { registry, store } = await freshModules();
+    registry.loadBotConfigs().forEach(c => registry.registerBot(c));
+    expect(store.getBotCardPrefs('app_default').autoStartExcludedChats).toEqual([]);
+    await store.updateBotCardPrefs('app_default', { autoStartExcludedChats: ['oc_quiet'] });
+    await store.updateBotCardPrefs('app_default', { autoStartOnNewTopic: true });
+    expect(readConfig().autoStartExcludedChats).toEqual(['oc_quiet']);
+    expect(registry.loadBotConfigs()[0].autoStartExcludedChats).toEqual(['oc_quiet']);
+    expect(registry.getBot('app_default').config.autoStartExcludedChats).toEqual(['oc_quiet']);
+    expect(store.getBotCardPrefs('app_default').autoStartExcludedChats).toEqual(['oc_quiet']);
+    await store.updateBotCardPrefs('app_default', { autoStartExcludedChats: [] });
+    expect(readConfig().autoStartExcludedChats).toBeUndefined();
+    expect(store.getBotCardPrefs('app_default').autoStartExcludedChats).toEqual([]);
+  });
+
   it('defaults to false/empty when unset (FR-10)', async () => {
     writeConfig();
     const { registry, store } = await freshModules();

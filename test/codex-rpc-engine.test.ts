@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterEach } from 'vitest';
 import { chmodSync, mkdirSync, writeFileSync, existsSync, rmSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
@@ -14,15 +14,27 @@ beforeAll(() => { chmodSync(FIXTURE, 0o755); });
 
 type EngineDependencies = NonNullable<ConstructorParameters<typeof CodexRpcEngine>[1]>;
 
+// The fixture is spawned `detached` + `unref()`ed, so only engine.stop() kills it.
+// Tests call stop() on their last line; if an assertion throws first, the fake
+// app-server outlives vitest as an orphan holding a port. Stop every engine after
+// each test regardless of outcome (stop() is idempotent).
+const liveEngines = new Set<CodexRpcEngine>();
+afterEach(() => {
+  for (const engine of liveEngines) engine.stop();
+  liveEngines.clear();
+});
+
 function makeEngine(
   over: Partial<ConstructorParameters<typeof CodexRpcEngine>[0]> = {},
   dependencies?: EngineDependencies,
 ) {
-  return new CodexRpcEngine({
+  const engine = new CodexRpcEngine({
     cliBin: FIXTURE, cwd: tmpdir(), env: process.env,
     sessionId: `test-${Math.round(performance.now())}-${over.sessionId ?? ''}`,
     ...over,
   }, dependencies);
+  liveEngines.add(engine);
+  return engine;
 }
 const owner = (turnId: string, dispatchAttempt?: number) => ({
   turnId,
@@ -30,6 +42,24 @@ const owner = (turnId: string, dispatchAttempt?: number) => ({
 });
 
 describe('CodexRpcEngine — happy-path lifecycle against a fake app-server', () => {
+  it('runs a strict app-server with approved auth and identity but no unknown host credential', async () => {
+    const { buildSessionChildEnv, botInjectedEnv } = await import('../src/core/env-policy.js');
+    const { applySessionOwnerEnv } = await import('../src/utils/child-env.js');
+    const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'rpc-env-probe-'));
+    const path = join(dir, 'report');
+    const policy = { mode: 'strict' as const };
+    const env = { ...buildSessionChildEnv({ PATH: process.env.PATH, HOME: dir, UNLISTED_CLOUD_CREDENTIAL: 'host-sentinel' }, policy),
+      ...botInjectedEnv({ OPENAI_API_KEY: 'rpc-sentinel' }, policy), CODEX_HOME: '/test/rpc/codex', FAKE_ENV_PROBE_PATH: path };
+    applySessionOwnerEnv(env, 'ou_rpc');
+    const engine = makeEngine({ env });
+    try {
+      await engine.start();
+      for (const [key, ok] of Object.entries(JSON.parse(readFileSync(path, 'utf8')))) expect(ok, key).toBe(true);
+    } finally { engine.stop(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('passes exact argv and env to the model-owning app-server through a portable spawn seam', async () => {
     const launches: Array<{ command: string; args: string[]; options: SpawnOptions }> = [];
     const childEnv = { ...process.env, BOTMUX_SESSION_ID: 'rpc-spawn-capture' };

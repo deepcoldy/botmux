@@ -44,6 +44,9 @@ import {
 } from '../../services/customization-store.js';
 import {
   PROMPT_FRAGMENTS,
+  PROMPT_STAGES,
+  BLOCK_META,
+  fragmentStages,
   getFragmentSpec,
   validateFragmentOverride,
 } from '../../skills/prompt-fragments.js';
@@ -131,17 +134,33 @@ function cmdPrompt(args: string[]): CustomizeCommandResult {
   switch (action) {
     case undefined:
     case 'list': {
-      const lines = PROMPT_FRAGMENTS.map((f) => {
-        const ov = state.promptOverrides?.[locale]?.[f.key];
-        const cond = f.kind === 'conditional' ? (state.conditionalLines?.[f.key]) : undefined;
-        const tags: string[] = [];
-        if (ov !== undefined) tags.push('已改');
-        if (f.kind === 'placeholder') tags.push(`占位符:${(f.placeholders ?? []).join(',')}`);
-        if (f.kind === 'conditional') tags.push(cond === undefined ? '条件行:跟随默认' : `条件行:强制${cond ? '开' : '关'}`);
-        const tag = tags.length ? `  [${tags.join(' ')}]` : '';
-        return `${f.key}\t(${f.block}) ${f.label}${tag}`;
-      });
-      return ok(`# prompt 片段（locale=${locale}）\n` + lines.join('\n'));
+      const stageLabel = new Map(PROMPT_STAGES.map((s) => [s.id, s.label]));
+      const out: string[] = [`# prompt 片段（locale=${locale}）`];
+      for (const stage of PROMPT_STAGES) {
+        const frags = PROMPT_FRAGMENTS.filter((f) => f.stage === stage.id);
+        if (frags.length === 0) continue;
+        out.push('', `## 阶段：${stage.label}（${stage.id}）`);
+        let lastBlock = '';
+        for (const f of frags) {
+          if (f.block !== lastBlock) {
+            const meta = BLOCK_META[f.block];
+            out.push(` [${meta?.label ?? f.block}]`);
+            lastBlock = f.block;
+          }
+          const ov = state.promptOverrides?.[locale]?.[f.key];
+          const cond = f.kind === 'conditional' ? (state.conditionalLines?.[f.key]) : undefined;
+          const tags: string[] = [];
+          if (ov !== undefined) tags.push('已改');
+          if (f.stages && f.stages.length > 0) {
+            tags.push(`也注入:${f.stages.map((s) => stageLabel.get(s) ?? s).join(',')}`);
+          }
+          if (f.kind === 'placeholder') tags.push(`占位符:${(f.placeholders ?? []).join(',')}`);
+          if (f.kind === 'conditional') tags.push(cond === undefined ? '条件行:跟随默认' : `条件行:强制${cond ? '开' : '关'}`);
+          const tag = tags.length ? `  [${tags.join(' ')}]` : '';
+          out.push(`  ${f.key}  ${f.label}${tag}`);
+        }
+      }
+      return ok(out.join('\n'));
     }
     case 'show': {
       const key = rest[0];
@@ -152,8 +171,11 @@ function cmdPrompt(args: string[]): CustomizeCommandResult {
       const shipped = shippedText(key, locale);
       const lines = [
         `key: ${key}`,
-        spec ? `block: ${spec.block}  label: ${spec.label}  kind: ${spec.kind}` : 'block: (未在目录中，仍可覆盖)',
+        spec
+          ? `stage: ${fragmentStages(spec).join('+')}  block: ${spec.block}（${BLOCK_META[spec.block]?.label ?? spec.block}）  label: ${spec.label}  kind: ${spec.kind}`
+          : 'block: (未在目录中，仍可覆盖)',
       ];
+      if (spec?.gateLabel) lines.push(`注入条件: ${spec.gateLabel}`);
       if (ov !== undefined) {
         lines.push('--- 你的覆盖（当前生效） ---', effective, '--- 出厂默认 ---', shipped);
       } else {

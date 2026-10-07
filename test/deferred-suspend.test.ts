@@ -3,8 +3,11 @@
 // runPendingSuspendIfSettled 兑现。这里钉住兑现函数的状态门控与幂等；
 // 排队半边（IPC 路由）见 ipc-suspend-route.test.ts。
 import { describe, expect, it, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { once } from 'node:events';
+import { spawnTsEval } from './helpers/ts-runner.js';
+import { dirname, join } from 'node:path';
 
 vi.mock('../src/services/session-store.js', () => ({
   registerSessionBridgeSendMarkerCleanupFence: vi.fn(),
@@ -12,6 +15,7 @@ vi.mock('../src/services/session-store.js', () => ({
   cleanupSessionBridgeSendMarkersNow: vi.fn(),
   updateSessionPid: vi.fn(),
   updateSession: vi.fn(),
+  getSession: vi.fn(),
 }));
 vi.mock('../src/core/dashboard-events.js', () => ({
   dashboardEventBus: { publish: vi.fn() },
@@ -28,7 +32,18 @@ vi.mock('../src/utils/logger.js', () => ({
 import {
   __testOnly_runPendingSuspendIfSettled as runPendingSuspendIfSettled,
   suspendWorker,
+  setSessionReasoningEffort,
+  sendWorkerInput,
+  __testOnly_resetOrdinaryImDeliveries,
+  sessionReasoningControl,
+  __testOnly_sessionAgentConfig as sessionAgentConfig,
 } from '../src/core/worker-pool.js';
+vi.mock('../src/services/codex-transcript.js', async orig => ({
+  ...await orig<typeof import('../src/services/codex-transcript.js')>(),
+  findCodexRolloutBySessionId: vi.fn(() => new URL('../package.json', import.meta.url).pathname),
+  drainCodexRollout: vi.fn(() => ({ events: [{ kind: 'assistant_final' }], newOffset: 1, pendingTail: '' })),
+}));
+import { drainCodexRollout, findCodexRolloutBySessionId } from '../src/services/codex-transcript.js';
 import { logger } from '../src/utils/logger.js';
 
 function fakeWorker() {
@@ -263,5 +278,217 @@ describe('queued suspend claim lifecycle', () => {
 
     expect(worker.send).toHaveBeenCalledWith({ type: 'suspend' });
     expect(ds.pendingSuspendReason).toBeUndefined();
+  });
+});
+
+
+describe('session reasoning effort changes', () => {
+  function session(status = 'idle') {
+    const pair = busySession(status, { pending: undefined });
+    Object.assign(pair.ds.session, { cliId: 'codex', cliSessionId: 'native-original', reasoningEffort: 'ultra' });
+    Object.assign(pair.ds.initConfig, { cliId: 'codex', wrapperCli: 'aiden x codex', model: 'gpt-5.6-sol' });
+    Object.assign(pair.ds, { workerReady: true, activeReasoningEffort: 'ultra' });
+    return pair;
+  }
+
+  it('finds an isolated Codex rollout in bot home without falling back from a bound instance', async () => {
+    const native = await vi.importActual<typeof import('../src/services/codex-transcript.js')>('../src/services/codex-transcript.js');
+    const { ds } = session();
+    ds.larkAppId = 'app_effort_isolated';
+    ds.session.sessionId = 'sid-isolated-effort';
+    ds.session.cliSessionId = 'isolated-native';
+    ds.initConfig.codexAuthSync = 'isolated';
+    delete ds.initConfig.wrapperCli;
+    const botHome = join(dirname(process.env.SESSION_DATA_DIR!), 'bots', ds.larkAppId, 'codex');
+    mkdirSync(join(botHome, 'sessions'), { recursive: true });
+    const rollout = join(botHome, 'sessions', 'rollout-isolated-native.jsonl');
+    writeFileSync(rollout, JSON.stringify({ type: 'event_msg', timestamp: '2026-01-01T00:00:00Z',
+      payload: { type: 'task_complete', turn_id: 'turn', last_agent_message: 'Done' } }) + '\n');
+    vi.mocked(findCodexRolloutBySessionId).mockImplementation((_sid, opts) => opts?.codexHome === botHome ? rollout : undefined);
+    vi.mocked(drainCodexRollout).mockImplementationOnce(native.drainCodexRollout);
+    try {
+      expect(sessionReasoningControl(ds)).toBeDefined();
+      expect(setSessionReasoningEffort(ds, 'high')).toBe('saved');
+      expect(findCodexRolloutBySessionId).toHaveBeenCalledWith('isolated-native', { codexHome: botHome, noFollow: true });
+      expect(ds.session.reasoningEffort).toBe('high');
+    } finally {
+      vi.mocked(findCodexRolloutBySessionId).mockImplementation(() => new URL('../package.json', import.meta.url).pathname);
+      rmSync(botHome, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['no-worker', 'not-ready', 'inactive', 'raw-input', 'follow-up'])('preserves in-flight work at the %s boundary', boundary => {
+    const { ds, worker } = session();
+    if (boundary === 'no-worker') ds.worker = null;
+    if (boundary === 'not-ready') ds.workerReady = false;
+    if (boundary === 'inactive') ds.session.status = 'closed';
+    if (boundary === 'raw-input') ds.pendingRawInput = { content: 'queued' };
+    if (boundary === 'follow-up') ds.pendingFollowUpInput = { content: 'queued' };
+    expect(setSessionReasoningEffort(ds, 'high')).toBe('busy');
+    expect(ds.session.reasoningEffort).toBe('ultra');
+    expect(worker.send).not.toHaveBeenCalled();
+  });
+
+  it('waits while the native transcript has a partially written next event', () => {
+    const { ds, worker } = session();
+    vi.mocked(drainCodexRollout).mockReturnValueOnce({ events: [{ kind: 'assistant_final', text: 'done', timestampMs: 1 }], newOffset: 1, pendingTail: '{"type":' });
+    expect(setSessionReasoningEffort(ds, 'high')).toBe('busy');
+    expect(ds.session.reasoningEffort).toBe('ultra');
+    expect(worker.send).not.toHaveBeenCalled();
+  });
+
+  it('waits for an ordinary IM input to commit even when the last screen and transcript are idle', async () => {
+    const registry = await import('../src/bot-registry.js');
+    const bot = vi.spyOn(registry, 'getBot').mockReturnValue({ config: { cliId: 'codex' } } as any);
+    const { ds, worker } = session();
+    Object.assign(ds, { larkAppId: 'app_pending_effort', chatId: 'oc_pending', scope: 'chat', workerGeneration: 1 });
+    Object.assign(ds.session, { workerGeneration: 1, chatId: ds.chatId });
+    try {
+      expect(sendWorkerInput(ds, 'next task', 'om_pending_effort')).toBe(true);
+      worker.send.mockClear();
+      expect(setSessionReasoningEffort(ds, 'high')).toBe('busy');
+      expect(ds.session.reasoningEffort).toBe('ultra');
+      expect(worker.send).not.toHaveBeenCalled();
+    } finally {
+      __testOnly_resetOrdinaryImDeliveries();
+      bot.mockRestore();
+    }
+  });
+
+  it('does not offer an Aiden control with an instance binding', () => {
+    const { ds } = session();
+    ds.session.cliInstanceBinding = { source: 'pool', codexHome: '/unused-bound-home' };
+    expect(sessionReasoningControl(ds)).toBeUndefined();
+    expect(setSessionReasoningEffort(ds, 'high')).toBe('unsupported');
+  });
+
+  it('saves without retiring the worker and clears pending only after the new effort is observed', () => {
+    const { ds, worker } = session();
+    expect(setSessionReasoningEffort(ds, 'high')).toBe('saved');
+    expect(ds.session).toMatchObject({ reasoningEffort: 'high', cliSessionId: 'native-original', status: 'active' });
+    expect(ds.session.suspendedColdResume).toBeUndefined();
+    expect(ds.activeReasoningEffort).toBe('ultra');
+    expect(sessionReasoningControl(ds)).toMatchObject({ selected: 'high', pending: true });
+    expect(setSessionReasoningEffort(ds, 'high')).toBe('saved');
+    expect(setSessionReasoningEffort(ds, 'low')).toBe('saved');
+    expect(ds.worker).toBe(worker);
+    expect(worker.send).not.toHaveBeenCalled();
+    ds.activeReasoningEffort = 'low';
+    expect(sessionReasoningControl(ds)?.pending).toBe(false);
+  });
+
+  it('keeps a running preview process reachable across repeated changes', async () => {
+    const child = spawnTsEval(`
+      const { createServer } = await import('node:http');
+      const server = createServer((_, res) => res.end('preview-alive'));
+      process.on('message', msg => { if (msg.type === 'suspend') server.close(() => process.exit(0)); });
+      server.listen(0, '127.0.0.1', () => process.send({ port: server.address().port }));
+    `, { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+    try {
+      const [{ port }] = await once(child, 'message');
+      const { ds } = session();
+      ds.worker = child;
+      ds.workerPort = port;
+      ds.session.previewTarget = { url: `http://127.0.0.1:${port}` };
+      const preview = structuredClone(ds.session.previewTarget);
+      const pid = child.pid;
+      for (const effort of ['high', 'low', 'low']) {
+        expect(setSessionReasoningEffort(ds, effort)).toBe('saved');
+        expect(await (await fetch(preview.url)).text()).toBe('preview-alive');
+        expect(ds.worker.pid).toBe(pid);
+        expect(ds.workerPort).toBe(port);
+        expect(ds.session.previewTarget).toEqual(preview);
+      }
+    } finally {
+      if (child.exitCode === null) { const exited = once(child, 'exit'); child.kill(); await exited; }
+    }
+  });
+
+  it('updates the selected CLI snapshot used by a later cold launch', async () => {
+    const { ds } = session();
+    ds.session.cliLaunchSnapshot = { state: 'resolved', cliId: 'codex', reasoningEffort: 'ultra', startupCommands: [] };
+    expect(setSessionReasoningEffort(ds, 'high')).toBe('saved');
+    const restored = { ...ds, session: JSON.parse(JSON.stringify(ds.session)), worker: null };
+    expect(sessionAgentConfig(restored, { cliId: 'codex', model: 'gpt-5.6-sol', reasoningEffort: 'ultra' }).reasoningEffort).toBe('high');
+    const { updateSession } = await import('../src/services/session-store.js');
+    vi.mocked(updateSession).mockImplementationOnce(() => { throw new Error('disk full'); });
+    expect(() => setSessionReasoningEffort(ds, 'low')).toThrow('disk full');
+    expect(ds.session.reasoningEffort).toBe('high');
+    expect(ds.session.cliLaunchSnapshot.reasoningEffort).toBe('high');
+  });
+
+  it('reads only the bound instance history and fails closed when that history is missing', async () => {
+    const native = await vi.importActual<typeof import('../src/services/codex-transcript.js')>('../src/services/codex-transcript.js');
+    const dir = mkdtempSync(join(tmpdir(), 'effort-instance-'));
+    const oldHome = process.env.CODEX_HOME;
+    try {
+      const { ds } = session();
+      delete ds.initConfig.wrapperCli;
+      const boundHome = join(dir, 'bound');
+      const globalHome = join(dir, 'global');
+      process.env.CODEX_HOME = globalHome;
+      ds.session.cliInstanceBinding = { source: 'pool', codexHome: boundHome };
+      for (const home of [boundHome, globalHome]) {
+        mkdirSync(join(home, 'sessions'), { recursive: true });
+        writeFileSync(join(home, 'sessions', 'rollout-test-native-original.jsonl'), JSON.stringify({
+          type: 'event_msg', timestamp: '2026-01-01T00:00:00Z',
+          payload: { type: 'task_complete', turn_id: 'test-turn', last_agent_message: 'Done' },
+        }) + '\n');
+      }
+      vi.mocked(findCodexRolloutBySessionId).mockImplementationOnce(native.findCodexRolloutBySessionId);
+      vi.mocked(drainCodexRollout).mockImplementationOnce(native.drainCodexRollout);
+      expect(setSessionReasoningEffort(ds, 'high')).toBe('saved');
+      expect(findCodexRolloutBySessionId).toHaveBeenLastCalledWith('native-original', { codexHome: boundHome, noFollow: true });
+      rmSync(join(boundHome, 'sessions'), { recursive: true });
+      vi.mocked(findCodexRolloutBySessionId).mockImplementationOnce(native.findCodexRolloutBySessionId);
+      expect(setSessionReasoningEffort(ds, 'low')).toBe('busy');
+      expect(ds.session.reasoningEffort).toBe('high');
+    } finally {
+      if (oldHome === undefined) delete process.env.CODEX_HOME; else process.env.CODEX_HOME = oldHome;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['working', 'analyzing', 'starting', 'limited', 'waiting_input'])('does not change or interrupt %s', status => {
+    const { ds, worker } = session(status);
+    expect(setSessionReasoningEffort(ds, 'high')).toBe('busy');
+    expect(ds.session.reasoningEffort).toBe('ultra');
+    expect(worker.send).not.toHaveBeenCalled();
+  });
+
+  it.each(['adoptedFrom', 'codexRpcInput', 'backendType', 'wrapperCli', 'sandbox', 'readIsolation'])('refuses an unsupported %s path', field => {
+    const { ds, worker } = session();
+    if (field === 'adoptedFrom') ds.session.adoptedFrom = { pane: 'external' };
+    else ds.initConfig[field] = { codexRpcInput: true, backendType: 'riff', wrapperCli: 'other codex', sandbox: true, readIsolation: true }[field];
+    expect(setSessionReasoningEffort(ds, 'high')).toBe('unsupported');
+    expect(worker.send).not.toHaveBeenCalled();
+    expect(ds.session.reasoningEffort).toBe('ultra');
+  });
+
+  it('rejects unsupported effort and protects queued work even with an idle screen', () => {
+    const { ds, worker } = session();
+    expect(setSessionReasoningEffort(ds, 'typo')).toBe('invalid');
+    ds.initConfig.model = 'gpt-5.5';
+    expect(setSessionReasoningEffort(ds, 'ultra')).toBe('invalid');
+    ds.session.queued = true;
+    expect(setSessionReasoningEffort(ds, 'high')).toBe('busy');
+    expect(worker.send).not.toHaveBeenCalled();
+  });
+
+  it('does not trust an idle screen while native history still has an unfinished turn', () => {
+    const { ds, worker } = session();
+    vi.mocked(drainCodexRollout).mockReturnValueOnce({ events: [{ kind: 'user', text: 'ongoing', uuid: 'u', timestampMs: 1 }], newOffset: 1, pendingTail: '' });
+    expect(setSessionReasoningEffort(ds, 'high')).toBe('busy');
+    expect(worker.send).not.toHaveBeenCalled();
+    expect(ds.session.reasoningEffort).toBe('ultra');
+  });
+
+  it('does not retire a worker if saving the new selection fails', async () => {
+    const { updateSession } = await import('../src/services/session-store.js');
+    const { ds, worker } = session();
+    vi.mocked(updateSession).mockImplementationOnce(() => { throw new Error('disk full'); });
+    expect(() => setSessionReasoningEffort(ds, 'high')).toThrow('disk full');
+    expect(ds.session.reasoningEffort).toBe('ultra');
+    expect(worker.send).not.toHaveBeenCalled();
   });
 });

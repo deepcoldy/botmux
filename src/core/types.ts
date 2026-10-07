@@ -59,10 +59,47 @@ export function frozenDisplayMode(fc: FrozenCard): DisplayMode {
 export interface DaemonSession {
   session: Session;
   worker: ChildProcess | null;   // fork'd worker process
+  /** User-visible final replies that the daemon accepted from a worker but has
+   * not finished delivering yet. Graceful remote shutdown keeps the exact
+   * worker generation fenced until these promises settle, so a provider final
+   * cannot be lost between remote turn completion and daemon exit. In-memory
+   * only; entries are registered and removed by the final-output delivery
+   * pipeline. */
+  finalOutputDeliveriesInFlight?: Set<Promise<void>>;
   /** True after the current worker generation has completed init. Kept
    * separate from workerPort because backends without a Web Terminal still
    * emit screen/idle/screenshot updates and support native local attach. */
   workerReady?: boolean;
+  /** True while the CURRENT CLI generation's prompt is known idle/ready.
+   *  Set by the worker's `prompt_ready` IPC; cleared on spawn / restart /
+   *  `claude_exit` / worker retirement. Deliberately NOT cleared by the
+   *  worker's `ready` IPC: `prompt_ready` frequently arrives BEFORE `ready`
+   *  (riff / mojo synthesize the first one inside spawnCli, fast TUIs under
+   *  Herdr do too), so clearing on `ready` would erase a just-set value.
+   *  In-memory only — never persisted; a daemon restart re-derives it from the
+   *  respawned worker's `prompt_ready`.
+   *  COVERAGE BOUNDARY: only daemon-initiated CLI restarts clear this. A CLI
+   *  restart the worker starts on its own (codex-app RPC recovery, stale runner
+   *  reload, …) is invisible to the daemon, so during that window `cliReady`
+   *  can stay a stale `true`. Consumers MUST tolerate that false positive —
+   *  treat it as a hint, never as proof that the prompt is live.
+   *  See docs/design/2026-09-11-command-router.md §5 (SessionPhase). */
+  cliReady?: boolean;
+  /** Monotonic count of `prompt_ready` observations for this session within one
+   *  daemon boot. NEVER cleared (a clear of `cliReady` leaves it untouched), so
+   *  a waiter can capture it and wait for the NEXT set rather than observing a
+   *  stale `cliReady === true`. Needed by the runtime cascade sequencer:
+   *  a `raw_input` sent while the CLI is busy is queued into the composer, and
+   *  the `prompt_ready` that follows belongs to the PREVIOUS turn — a boolean
+   *  cannot tell the two apart.
+   *  See docs/design/2026-09-11-command-router.md §5 / §6. */
+  cliReadyGeneration?: number;
+  /** runtime 级联定序器（daemon 的 runPassthroughCascade）在飞：同 anchor 后到的普通消息 /
+   *  单条透传排进 `cascadeDeferred`，定序器收尾时按到达顺序重入 handleThreadReply；第二条级联
+   *  fail closed。`parsed` / `resources` 是首过 preamble（parse、merge_forward 展开、语音转写）
+   *  之后的快照，重入用它代替重新 parse。In-memory only. */
+  cascadeInFlight?: boolean;
+  cascadeDeferred?: Array<{ data: unknown; ctx: unknown; parsed?: unknown; resources?: unknown }>;
   workerPort: number | null;     // HTTP port for xterm.js
   workerToken: string | null;    // write token for xterm.js
   /** Independent read-only xterm capability. Optional for hydrated/legacy
@@ -96,6 +133,16 @@ export interface DaemonSession {
   };
   larkAppId: string;
   chatId: string;
+  /**
+   * Daemon-internal routing identity for one validated principal lane.
+   *
+   * This is deliberately in-memory and is populated only after the durable
+   * principal-lane binding has passed the authority/materialization checks.
+   * It may be a virtual value, so it must never be handed to a Lark send API.
+   * `sessionAnchorId()` remains the visible delivery anchor; registry/lock/
+   * worker-liveness ownership uses `runtimeSessionAnchorId()` instead.
+   */
+  runtimeRoutingAnchor?: string;
   chatType: 'group' | 'p2p';    // p2p chats need reply_in_thread to create topics
   /** Routing scope:
    *   'thread' → routing key = session.rootMessageId, replies use reply_in_thread=true
@@ -416,6 +463,22 @@ export interface DaemonSession {
    * daemon-minted schedule turn id and never persisted. The worker can name a
    * turn id but cannot add or change the identity behind it. */
   scheduledTurnCallers?: Map<string, TrustedCaller>;
+  /** Exact principal-lane turn/generation that still owns the worker until a
+   * matching terminal or proven worker exit. Unlike activeInteractiveTurn,
+   * the worker's earlier managed-origin revoke must not clear this FIFO fence,
+   * and a delayed callback from a retired generation must not release it. */
+  principalLaneRunningTurn?: {
+    turnId: string;
+    workerGeneration: number;
+  };
+  /** Runtime-only wake-up for a durable principal-lane FIFO head whose worker
+   * fork was rejected before IPC. The turn id fences a stale timer from
+   * dispatching a successor after the queue head changes. */
+  principalLaneDispatchRetry?: {
+    turnId: string;
+    attempt: number;
+    timer?: ReturnType<typeof setTimeout>;
+  };
   /** Host-owned classification/approval driver currently attached to disk state. */
   crossPrincipalInterruptionDriving?: boolean;
   /** Runtime wake-up for the bounded wait until the current owner turn ends. */
@@ -539,6 +602,8 @@ export interface DaemonSession {
   cardPatchInFlight?: boolean;    // true while a card PATCH is in-flight
   pendingCardJson?: string;       // queued card JSON — flushed when in-flight PATCH completes (latest wins)
   pendingCardId?: string;         // card message_id captured at schedule time — prevents stale reads when streamCardId changes between schedule and flush
+  pendingCardUserInitiated?: boolean; // latest queued PATCH came from an explicit card action; failures are surfaced at warn level
+  lastStreamingCardPatchWarnAt?: number; // in-memory warning throttle for repeated user-visible PATCH failures
   frozenCards?: Map<string, FrozenCard>;  // nonce → FrozenCard (historical cards' cached state for toggle)
   /** Wait Mode / HTTP Sync integration: pending Promise handlers for synchronous
    *  webhook triggers waiting for a response in this session. Key is turnId. */
@@ -778,10 +843,13 @@ export function claimCurrentRepoCard(ds: DaemonSession, cardMessageId: string | 
   return current;
 }
 
-/** Resolve the routing anchor for an active session — chatId for chat-scope
- *  sessions, rootMessageId for thread-scope. Used to compute `sessionKey()` at
- *  storage and lookup time. */
-export function sessionAnchorId(ds: DaemonSession): string {
+/** Resolve the visible delivery anchor for an active session — chatId for
+ * chat-scope sessions, rootMessageId for thread-scope. Principal lanes may use
+ * a different runtime ownership anchor; never infer registry ownership from
+ * this value. */
+export function sessionAnchorId(
+  ds: Pick<DaemonSession, 'session' | 'scope' | 'chatId'>,
+): string {
   const deferredAnchor = ds.session.deferredScheduleRun?.routingAnchor;
   if (deferredAnchor) return deferredAnchor;
   return ds.scope === 'chat' ? ds.chatId : ds.session.rootMessageId;
@@ -797,13 +865,30 @@ export function storedSessionAnchorId(
     ?? (session.scope === 'chat' ? session.chatId : session.rootMessageId);
 }
 
-/** Storage key for the daemon-owned activeSessions map. A VC meeting agent is
- * now an ordinary chat-scope session in its listener group (Plan B): it is keyed
- * by the normal `(chatId, appId)` slot so plain IM and meeting transcripts both
- * fold into the one session. The `vcMeetingReceiver` marker is retained as pure
- * delivery/meeting-output metadata and no longer affects routing. */
+/** Principal-lane-only routing identity. Do not use this as a Lark send target:
+ * the value may be virtual and has no corresponding message/chat in Lark. */
+export function principalLaneRoutingAnchorId(
+  session: Pick<Session, 'scope' | 'chatId' | 'rootMessageId' | 'deferredScheduleRun' | 'principalLane'>,
+): string {
+  return session.principalLane?.routingAnchor ?? storedSessionAnchorId(session);
+}
+
+/** Resolve the daemon's live ownership anchor. Principal-lane sessions receive
+ * an explicit virtual anchor only after their durable authority is validated;
+ * every legacy/non-lane session falls back byte-for-byte to sessionAnchorId().
+ * Never use this return value as a Lark reply/send target. */
+export function runtimeSessionAnchorId(
+  ds: Pick<DaemonSession, 'runtimeRoutingAnchor' | 'session' | 'scope' | 'chatId'>,
+): string {
+  return ds.runtimeRoutingAnchor ?? sessionAnchorId(ds);
+}
+
+/** Storage key for the daemon-owned activeSessions map. A validated principal
+ * lane uses its explicit runtime anchor; every other session keeps the existing
+ * visible `(anchor, appId)` key. A VC meeting agent remains an ordinary
+ * chat-scope session in its listener group. */
 export function activeSessionKey(ds: DaemonSession): string {
-  return sessionKey(sessionAnchorId(ds), ds.larkAppId);
+  return sessionKey(runtimeSessionAnchorId(ds), ds.larkAppId);
 }
 
 /** A session whose only IM surface is a Feishu document comment thread.

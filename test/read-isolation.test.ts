@@ -1040,8 +1040,12 @@ describe('worker capability carve-out ordering', () => {
   });
 
   it('carves back only the prepared Pi session prompt directory after masking the shared root', () => {
-    expect(strippedSource).toContain('readonlyRoots: keepExisting([');
-    expect(strippedSource).toContain('...piInitialPromptReadonlyRoots,');
+    // Pi prompt + skill delivery roots must ride the session-owned channel, not
+    // readonlyRoots (which no-transport turns drop inside the data dir).
+    expect(strippedSource).toMatch(
+      /sessionOwnedReadonlyRoots: keepExisting\(\[\s*\.\.\.\(cfg\.skillReadonlyRoots \?\? \[\]\),\s*\.\.\.piInitialPromptReadonlyRoots,\s*\]\)/,
+    );
+    expect(strippedSource).not.toMatch(/readonlyRoots: keepExisting\(\[[^\]]*\.\.\.piInitialPromptReadonlyRoots/);
     expect(strippedSource).not.toContain(
       'cfg.skillReadonlyRoots = [...(cfg.skillReadonlyRoots ?? []), ...prepared.readonlyRoots]',
     );

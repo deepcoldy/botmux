@@ -2,10 +2,12 @@
  * Put `~/.botmux/bin` on the user's PATH by writing their shell's startup file.
  *
  * WHY THIS EXISTS
- * `npm i -g botmux` has no `bin` field (removed with the Node fallback — see
- * postinstall-bin.mjs), so the ONLY `botmux` command is the launcher written to
- * `~/.botmux/bin/botmux`. If that directory is not on PATH, a successful install
- * still leaves the user with `botmux: command not found`.
+ * The package's `bin` is a sh launcher the package manager links onto PATH, but
+ * that only covers installs done BY a package manager: `install.sh` (the curl
+ * route) has no manager involved, and the postinstall launcher at
+ * `~/.botmux/bin/botmux` is what gives a multi-Node-version box ONE unambiguous
+ * global botmux. If that directory is not on PATH, those routes still leave the
+ * user with `botmux: command not found` — which is what this file prevents.
  *
  * Both installers used to just PRINT a hint, and the hint was:
  *

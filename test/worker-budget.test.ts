@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   checkWorkerAdmission,
   DEFAULT_MAX_MEMORY_FULL_AVG10,
-  DEFAULT_MIN_AVAILABLE_MEMORY_BYTES,
   DEFAULT_MIN_AVAILABLE_MEMORY_CAP_BYTES,
   evaluateWorkerAdmission,
   readHostMemoryPressure,
@@ -31,6 +30,19 @@ function fixtureReader(files: Record<string, string>): (path: string) => string 
     throw new Error(`missing fixture: ${path}`);
   };
 }
+
+// Like fixtureReader but records every probed path so tests can assert that
+// host-wide files were deliberately NOT substituted for container metrics.
+function recordingReader(files: Record<string, string>) {
+  return vi.fn((path: string): string => {
+    if (path in files) return files[path];
+    throw new Error(`missing fixture: ${path}`);
+  });
+}
+
+const V1_MEMORY_MOUNTINFO = '35 29 0:31 / /sys/fs/cgroup/memory rw,nosuid,nodev,noexec,relatime shared:16 - cgroup cgroup rw,memory';
+const V1_SENTINEL = '9223372036854771712';
+const V1_ROOT = '/sys/fs/cgroup/memory';
 
 describe('worker memory admission', () => {
   it('parses host MemAvailable and memory full PSI fixtures', () => {
@@ -78,7 +90,7 @@ describe('worker memory admission', () => {
       cgroupPath: '/sys/fs/cgroup/docker/demo',
       warnings: [],
     });
-    expect(resolveWorkerPressurePolicy(undefined, pressure.totalMemoryBytes, pressure.totalMemorySource).minAvailableMemoryBytes).toBe(2 * GIB);
+    expect(resolveWorkerPressurePolicy(undefined, pressure.totalMemoryBytes).minAvailableMemoryBytes).toBe(2 * GIB);
   });
 
   it('uses a finite cgroup ancestor when the leaf is unlimited', () => {
@@ -206,26 +218,54 @@ describe('worker memory admission', () => {
     })).allowed).toBe(false);
   });
 
-  it('caps the default reserve at the 4 GiB spawn-cost floor instead of scaling with host capacity', () => {
-    // The cap must never drift below the host floor, or the host Math.max leg
-    // would silently revive a sub-floor fractional reserve.
-    expect(DEFAULT_MIN_AVAILABLE_MEMORY_CAP_BYTES).toBeGreaterThanOrEqual(DEFAULT_MIN_AVAILABLE_MEMORY_BYTES);
-    // host: max(4 GiB floor, min(4 GiB cap, 25% of total)) — uniformly 4 GiB
+  it('caps the default reserve at the 4 GiB spawn-cost cap instead of scaling with host capacity', () => {
+    expect(DEFAULT_MIN_AVAILABLE_MEMORY_CAP_BYTES).toBe(4 * 1024 ** 3);
+    // Host RAM and finite cgroup limits share one formula: min(4 GiB cap, 25%
+    // of the total). ≥16 GiB stays at the cap; smaller boxes scale down.
     for (const [totalGiB, expectedGiB] of [
-      [8, 4], [16, 4], [32, 4], [64, 4], [248, 4],
+      [2, 0.5], [4, 1], [8, 2], [16, 4], [32, 4], [64, 4], [248, 4],
     ] as const) {
       expect(
-        resolveWorkerPressurePolicy(undefined, totalGiB * GIB, 'host').minAvailableMemoryBytes,
+        resolveWorkerPressurePolicy(undefined, totalGiB * GIB).minAvailableMemoryBytes,
       ).toBe(expectedGiB * GIB);
     }
-    // cgroup-v2: min(4 GiB cap, 25% of the finite limit) with no host floor
-    for (const [totalGiB, expectedGiB] of [
-      [8, 2], [16, 4], [32, 4], [64, 4], [248, 4],
-    ] as const) {
-      expect(
-        resolveWorkerPressurePolicy(undefined, totalGiB * GIB, 'cgroup-v2').minAvailableMemoryBytes,
-      ).toBe(expectedGiB * GIB);
+  });
+
+  it('never defaults to a host reserve the host can never satisfy', () => {
+    // A flat 4 GiB host floor exceeds the whole RAM of a sub-4 GiB VPS, so
+    // MemAvailable can never reach it and every worker fork was rejected.
+    for (const totalGiB of [1, 2, 3, 3.7, 4, 4.5, 6, 8, 12]) {
+      const reserve = resolveWorkerPressurePolicy(undefined, totalGiB * GIB).minAvailableMemoryBytes;
+      expect(reserve).toBeLessThanOrEqual(totalGiB * GIB / 2);
     }
+  });
+
+  it('admits a worker on a sub-4 GiB host that has room for one more CLI', () => {
+    // Field shape: 3.7 GiB VPS, 2.2 GiB MemAvailable, no finite cgroup above
+    // the daemon, PSI idle. The old flat 4 GiB host floor rejected this fork —
+    // and every later one — even though a CLI worker peaks at ~0.6 GiB RSS.
+    const roomy = evaluateWorkerAdmission(hostPressure({
+      totalMemoryBytes: Math.round(3.7 * GIB),
+      availableMemoryBytes: Math.round(2.2 * GIB),
+      availableMemorySource: 'host',
+      memoryFullAvg10: 0,
+      memoryFullAvg10Source: 'host',
+    }));
+    expect(roomy.allowed).toBe(true);
+    expect(roomy.reasons).toEqual([]);
+
+    // The scaled reserve still blocks a genuinely drained small host.
+    const drained = evaluateWorkerAdmission(hostPressure({
+      totalMemoryBytes: Math.round(3.7 * GIB),
+      availableMemoryBytes: Math.round(0.5 * GIB),
+      availableMemorySource: 'host',
+      memoryFullAvg10: 0,
+      memoryFullAvg10Source: 'host',
+    }));
+    expect(drained.allowed).toBe(false);
+    expect(drained.reasons).toEqual([
+      'available memory 0.5 GiB is below the reserved 0.9 GiB',
+    ]);
   });
 
   it('admits a worker with tens of GiB free on a huge host while PSI stays healthy', () => {
@@ -442,5 +482,290 @@ describe('tierWorkerAdmission (allowed / marginal / hard)', () => {
     });
     expect(decision.allowed).toBe(false);
     expect(tierWorkerAdmission(decision)).toBe('marginal');
+  });
+});
+
+describe('cgroup-v1 memory admission', () => {
+  it('admits a finite v1 container with headroom and never consults host PSI', () => {
+    // Reproduction of the reported shape: v1 container limited to 16 GiB with
+    // 2 GiB in use, host with tens of GiB free but full PSI avg10 at 35.85%.
+    // Before v1 support the reader fell through to /proc/pressure/memory and
+    // hard-blocked the spawn on host-wide stall that was not the container's.
+    const readFile = recordingReader({
+      '/proc/self/cgroup': [
+        '11:perf_event:/',
+        '10:devices:/user.slice',
+        '4:memory:/docker/demo',
+        '1:name=systemd:/docker/demo',
+      ].join('\n'),
+      '/proc/self/mountinfo': V1_MEMORY_MOUNTINFO,
+      [`${V1_ROOT}/docker/demo/memory.limit_in_bytes`]: String(16 * GIB),
+      [`${V1_ROOT}/docker/demo/memory.usage_in_bytes`]: String(2 * GIB),
+      [`${V1_ROOT}/docker/demo/memory.stat`]: 'inactive_file 0\n',
+      [`${V1_ROOT}/docker/memory.limit_in_bytes`]: V1_SENTINEL,
+      [`${V1_ROOT}/memory.limit_in_bytes`]: V1_SENTINEL,
+      '/proc/meminfo': 'MemAvailable:    67108864 kB\n',
+      '/proc/pressure/memory': 'full avg10=35.85 avg60=10.00 avg300=5.00 total=2\n',
+    });
+    const decision = checkWorkerAdmission(undefined, {
+      platform: 'linux',
+      totalMemoryBytes: 256 * GIB,
+      readFile,
+    });
+    expect(decision.allowed).toBe(true);
+    expect(decision.reasons).toEqual([]);
+    expect(decision.pressure).toMatchObject({
+      totalMemoryBytes: 16 * GIB,
+      availableMemoryBytes: 14 * GIB,
+      totalMemorySource: 'cgroup-v1',
+      availableMemorySource: 'cgroup-v1',
+      memoryFullAvg10: undefined,
+      memoryFullAvg10Source: 'unavailable',
+      cgroupPath: `${V1_ROOT}/docker/demo`,
+    });
+    expect(decision.pressure.cgroupBoundaries?.[0]).toMatchObject({ version: 1 });
+    expect(decision.pressure.warnings).toEqual([]);
+    // Standard v1 has no per-cgroup PSI file: probing the container's own
+    // memory.pressure (and finding it absent) is fine, but host
+    // meminfo/PSI must never be pulled in, and the missing file must not warn.
+    const probed = readFile.mock.calls.map(call => call[0]);
+    expect(probed).toContain(`${V1_ROOT}/docker/demo/memory.pressure`);
+    expect(probed).not.toContain('/proc/meminfo');
+    expect(probed).not.toContain('/proc/pressure/memory');
+    expect(decision.policy.minAvailableMemoryBytes).toBe(4 * GIB);
+  });
+
+  it('blocks a finite v1 container that is genuinely drained (hard tier), without PSI', () => {
+    const readFile = fixtureReader({
+      '/proc/self/cgroup': '9:cpu,memory:/docker/demo\n1:name=systemd:/docker/demo\n',
+      '/proc/self/mountinfo': V1_MEMORY_MOUNTINFO,
+      [`${V1_ROOT}/docker/demo/memory.limit_in_bytes`]: String(16 * GIB),
+      [`${V1_ROOT}/docker/demo/memory.usage_in_bytes`]: String(15.5 * GIB),
+      [`${V1_ROOT}/docker/demo/memory.stat`]: 'inactive_file 0\n',
+      [`${V1_ROOT}/docker/memory.limit_in_bytes`]: V1_SENTINEL,
+      [`${V1_ROOT}/memory.limit_in_bytes`]: V1_SENTINEL,
+      '/proc/pressure/memory': 'full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n',
+    });
+    const decision = checkWorkerAdmission(undefined, {
+      platform: 'linux',
+      totalMemoryBytes: 256 * GIB,
+      readFile,
+    });
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasons).toEqual([
+      'available memory 0.5 GiB is below the reserved 4.0 GiB',
+    ]);
+    expect(tierWorkerAdmission(decision)).toBe('hard');
+  });
+
+  it('honours the tightest finite v1 ancestor even when the leaf is roomy', () => {
+    const readFile = fixtureReader({
+      '/proc/self/cgroup': '4:memory:/tenant/session\n',
+      '/proc/self/mountinfo': V1_MEMORY_MOUNTINFO,
+      [`${V1_ROOT}/tenant/session/memory.limit_in_bytes`]: String(16 * GIB),
+      [`${V1_ROOT}/tenant/session/memory.usage_in_bytes`]: String(2 * GIB),
+      [`${V1_ROOT}/tenant/session/memory.stat`]: 'inactive_file 0\n',
+      [`${V1_ROOT}/tenant/memory.limit_in_bytes`]: String(8 * GIB),
+      [`${V1_ROOT}/tenant/memory.usage_in_bytes`]: String(7 * GIB),
+      [`${V1_ROOT}/tenant/memory.stat`]: 'inactive_file 0\n',
+      [`${V1_ROOT}/memory.limit_in_bytes`]: V1_SENTINEL,
+      '/proc/pressure/memory': 'full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n',
+    });
+    const pressure = readHostMemoryPressure({
+      platform: 'linux',
+      totalMemoryBytes: 64 * GIB,
+      readFile,
+    });
+    expect(pressure.cgroupBoundaries).toHaveLength(2);
+    const decision = evaluateWorkerAdmission(pressure);
+    expect(decision.allowed).toBe(false);
+    expect(decision.pressure.totalMemoryBytes).toBe(8 * GIB);
+    expect(decision.reasons).toEqual(['available memory 1.0 GiB is below the reserved 2.0 GiB']);
+  });
+
+  it('uses backported per-cgroup v1 PSI when the file exists, at the boundary only', () => {
+    const files = {
+      '/proc/self/cgroup': '4:memory:/docker/demo\n',
+      '/proc/self/mountinfo': V1_MEMORY_MOUNTINFO,
+      [`${V1_ROOT}/docker/demo/memory.limit_in_bytes`]: String(16 * GIB),
+      [`${V1_ROOT}/docker/demo/memory.usage_in_bytes`]: String(2 * GIB),
+      [`${V1_ROOT}/docker/demo/memory.stat`]: 'inactive_file 0\n',
+      [`${V1_ROOT}/docker/demo/memory.pressure`]: 'full avg10=35.00 avg60=10.00 avg300=5.00 total=2\n',
+      [`${V1_ROOT}/docker/memory.limit_in_bytes`]: V1_SENTINEL,
+      [`${V1_ROOT}/memory.limit_in_bytes`]: V1_SENTINEL,
+      // Host PSI calm AND never read; the block comes from the cgroup file.
+      '/proc/pressure/memory': 'full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n',
+    };
+    const blocked = checkWorkerAdmission(undefined, {
+      platform: 'linux',
+      totalMemoryBytes: 256 * GIB,
+      readFile: fixtureReader(files),
+    });
+    expect(blocked.allowed).toBe(false);
+    expect(blocked.reasons).toEqual(['memory full PSI avg10 35.00% reached 20.00%']);
+    expect(blocked.pressure.memoryFullAvg10Source).toBe('cgroup-v1');
+    expect(tierWorkerAdmission(blocked)).toBe('hard');
+
+    // Same container, same host PSI (now critical), no backported file:
+    // admitted — host stall must not act as container stall.
+    const { [`${V1_ROOT}/docker/demo/memory.pressure`]: _drop, ...withoutCgroupPsi } = files;
+    void _drop;
+    const hostCritical = {
+      ...withoutCgroupPsi,
+      '/proc/pressure/memory': 'full avg10=99.00 avg60=90.00 avg300=80.00 total=9\n',
+    };
+    const admitted = checkWorkerAdmission(undefined, {
+      platform: 'linux',
+      totalMemoryBytes: 256 * GIB,
+      readFile: fixtureReader(hostCritical),
+    });
+    expect(admitted.allowed).toBe(true);
+    expect(admitted.pressure.memoryFullAvg10).toBeUndefined();
+  });
+
+  it('subtracts inactive_file from memory.usage_in_bytes like the v2 working set', () => {
+    const pressure = readHostMemoryPressure({
+      platform: 'linux',
+      totalMemoryBytes: 64 * GIB,
+      readFile: fixtureReader({
+        '/proc/self/cgroup': '4:memory:/docker/demo\n',
+        '/proc/self/mountinfo': V1_MEMORY_MOUNTINFO,
+        [`${V1_ROOT}/docker/demo/memory.limit_in_bytes`]: String(8 * GIB),
+        [`${V1_ROOT}/docker/demo/memory.usage_in_bytes`]: String(5 * GIB),
+        [`${V1_ROOT}/docker/demo/memory.stat`]: `anon ${2 * GIB}\ninactive_file ${3 * GIB}\n`,
+        [`${V1_ROOT}/docker/memory.limit_in_bytes`]: V1_SENTINEL,
+        [`${V1_ROOT}/memory.limit_in_bytes`]: V1_SENTINEL,
+      }),
+    });
+    expect(pressure.availableMemoryBytes).toBe(6 * GIB);
+  });
+
+  it('falls back to host protection on a v1 host whose whole hierarchy is unlimited', () => {
+    // Bare-metal / unlimited-v1 shape (observed on the live fleet host): the
+    // sentinel at every level must parse as 'max', not as a degraded read
+    // (it exceeds Number.MAX_SAFE_INTEGER), so host PSI protection survives.
+    const scope = '/user.slice/user-0.slice/user@0.service/app.slice/botmux-session.scope';
+    const limitFiles: Record<string, string> = {};
+    const parts = scope.split('/').filter(Boolean);
+    for (let i = 1; i <= parts.length; i += 1) {
+      limitFiles[`${V1_ROOT}/${parts.slice(0, i).join('/')}/memory.limit_in_bytes`] = V1_SENTINEL;
+    }
+    limitFiles[`${V1_ROOT}/memory.limit_in_bytes`] = V1_SENTINEL;
+    const pressure = readHostMemoryPressure({
+      platform: 'linux',
+      totalMemoryBytes: 32 * GIB,
+      readFile: fixtureReader({
+        '/proc/self/cgroup': `4:memory:${scope}\n1:name=systemd:${scope}\n`,
+        '/proc/self/mountinfo': V1_MEMORY_MOUNTINFO,
+        ...limitFiles,
+        '/proc/meminfo': 'MemTotal:       33554432 kB\nMemAvailable:   12582912 kB\n',
+        '/proc/pressure/memory': 'full avg10=3.00 avg60=0.00 avg300=0.00 total=0\n',
+      }),
+    });
+    expect(pressure).toMatchObject({
+      totalMemoryBytes: 32 * GIB,
+      availableMemoryBytes: 12 * GIB,
+      memoryFullAvg10: 3,
+      totalMemorySource: 'host',
+      availableMemorySource: 'host',
+      memoryFullAvg10Source: 'host',
+    });
+    expect(pressure.cgroupBoundaries).toBeUndefined();
+    expect(pressure.warnings).toEqual([]);
+  });
+
+  it('uses v1 limits on a hybrid host when the cgroup2 hierarchy lacks memory.max', () => {
+    // Hybrid: 0:: membership exists (so the v2 parser runs first) but the v2
+    // mount has no memory controller; memory lives on the v1 hierarchy.
+    const pressure = readHostMemoryPressure({
+      platform: 'linux',
+      totalMemoryBytes: 64 * GIB,
+      readFile: fixtureReader({
+        '/proc/self/cgroup': '0::/docker/demo\n4:memory:/docker/demo\n',
+        '/proc/self/mountinfo': [
+          '29 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup rw',
+          V1_MEMORY_MOUNTINFO,
+        ].join('\n'),
+        [`${V1_ROOT}/docker/demo/memory.limit_in_bytes`]: String(8 * GIB),
+        [`${V1_ROOT}/docker/demo/memory.usage_in_bytes`]: String(2 * GIB),
+        [`${V1_ROOT}/docker/demo/memory.stat`]: 'inactive_file 0\n',
+        [`${V1_ROOT}/docker/memory.limit_in_bytes`]: V1_SENTINEL,
+        [`${V1_ROOT}/memory.limit_in_bytes`]: V1_SENTINEL,
+      }),
+    });
+    expect(pressure).toMatchObject({
+      totalMemoryBytes: 8 * GIB,
+      availableMemoryBytes: 6 * GIB,
+      totalMemorySource: 'cgroup-v1',
+    });
+  });
+
+  it('does not substitute host metrics when a finite v1 hierarchy is unreadable', () => {
+    // mountinfo missing -> fallback candidate is not hierarchy-complete; the
+    // finite files it can see must not be trusted, and host PSI must not be
+    // read either (fail-open, never host-for-container substitution).
+    const readFile = recordingReader({
+      '/proc/self/cgroup': '4:memory:/docker/demo\n',
+      [`${V1_ROOT}/docker/demo/memory.limit_in_bytes`]: String(8 * GIB),
+      [`${V1_ROOT}/docker/demo/memory.usage_in_bytes`]: String(7 * GIB),
+      [`${V1_ROOT}/docker/demo/memory.stat`]: 'inactive_file 0\n',
+      [`${V1_ROOT}/docker/memory.limit_in_bytes`]: V1_SENTINEL,
+      [`${V1_ROOT}/memory.limit_in_bytes`]: V1_SENTINEL,
+      '/proc/meminfo': 'MemAvailable: 1 kB\n',
+      '/proc/pressure/memory': 'full avg10=99.00 avg60=0.00 avg300=0.00 total=0\n',
+    });
+    const pressure = readHostMemoryPressure({
+      platform: 'linux',
+      totalMemoryBytes: 32 * GIB,
+      readFile,
+    });
+    expect(pressure.totalMemorySource).toBe('host');
+    expect(pressure.availableMemoryBytes).toBeUndefined();
+    expect(pressure.availableMemorySource).toBe('unavailable');
+    expect(pressure.memoryFullAvg10).toBeUndefined();
+    expect(pressure.warnings.join('\n')).toContain('does not expose the full cgroup-v1 hierarchy');
+    const probed = readFile.mock.calls.map(call => call[0]);
+    expect(probed).not.toContain('/proc/meminfo');
+    expect(probed).not.toContain('/proc/pressure/memory');
+    expect(evaluateWorkerAdmission(pressure).allowed).toBe(true);
+  });
+
+  it('treats a root v1 membership with a sentinel limit as unlimited host', () => {
+    const pressure = readHostMemoryPressure({
+      platform: 'linux',
+      totalMemoryBytes: 32 * GIB,
+      readFile: fixtureReader({
+        '/proc/self/cgroup': '4:memory:/\n',
+        '/proc/self/mountinfo': V1_MEMORY_MOUNTINFO,
+        [`${V1_ROOT}/memory.limit_in_bytes`]: V1_SENTINEL,
+        '/proc/meminfo': 'MemAvailable:    8388608 kB\n',
+        '/proc/pressure/memory': 'full avg10=1.00 avg60=0.00 avg300=0.00 total=0\n',
+      }),
+    });
+    expect(pressure.totalMemorySource).toBe('host');
+    expect(pressure.availableMemoryBytes).toBe(8 * GIB);
+    expect(pressure.warnings).toEqual([]);
+  });
+
+  it('scales the v1 container reserve like v2 and ignores named hierarchies', () => {
+    for (const [totalGiB, expectedGiB] of [
+      [8, 2], [16, 4], [32, 4],
+    ] as const) {
+      expect(
+        resolveWorkerPressurePolicy(undefined, totalGiB * GIB).minAvailableMemoryBytes,
+      ).toBe(expectedGiB * GIB);
+    }
+    // A named hierarchy without the bare memory controller is not a v1 member.
+    const pressure = readHostMemoryPressure({
+      platform: 'linux',
+      totalMemoryBytes: 32 * GIB,
+      readFile: fixtureReader({
+        '/proc/self/cgroup': '1:name=systemd:/\n',
+        '/proc/self/mountinfo': V1_MEMORY_MOUNTINFO,
+        '/proc/meminfo': 'MemAvailable:    8388608 kB\n',
+        '/proc/pressure/memory': 'full avg10=1.00 avg60=0.00 avg300=0.00 total=0\n',
+      }),
+    });
+    expect(pressure.totalMemorySource).toBe('host');
   });
 });

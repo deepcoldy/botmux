@@ -387,6 +387,21 @@ describe('IdleDetector: static capacity-queue pre-idle latch', () => {
     detector.dispose();
   });
 
+  it('holds the TraeX 0.207 queued-next-turn screen until the composer redraws', () => {
+    const detector = new IdleDetector(traexAdapter);
+    const idleCb = vi.fn();
+    detector.onIdle(idleCb);
+
+    detector.feed('\x1b[2K⠋ Any second now…\nQueued for next turn\nesc to interrupt\nContext 65% left');
+    vi.advanceTimersByTime(10_000);
+    expect(idleCb).not.toHaveBeenCalled();
+
+    detector.feed('\x1b[2K› Ask TraeCode CLI to do anything\nContext 65% left');
+    vi.advanceTimersByTime(2_500);
+    expect(idleCb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
   it('holds the full queue notice busy, with or without the at-position suffix', () => {
     const detector = new IdleDetector(traexAdapter);
     const idleCb = vi.fn();
@@ -779,6 +794,22 @@ describe('IdleDetector: quiescence detection', () => {
     expect(cb).not.toHaveBeenCalled();
 
     // Advance past spinner guard (3000ms) + buffer (200ms)
+    vi.advanceTimersByTime(3500);
+    expect(cb).toHaveBeenCalledTimes(1);
+    detector.dispose();
+  });
+
+  it('delays idle for 8-dot braille spinner frames (Ink / Antigravity ⣷)', () => {
+    const detector = new IdleDetector(makeCli());
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    // Feed 8-dot braille spinner character (⣷ = U+28F7)
+    detector.feed('⣷ Running command...');
+
+    vi.advanceTimersByTime(2000);
+    expect(cb).not.toHaveBeenCalled();
+
     vi.advanceTimersByTime(3500);
     expect(cb).toHaveBeenCalledTimes(1);
     detector.dispose();

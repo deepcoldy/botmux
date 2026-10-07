@@ -21,7 +21,7 @@ import type { CliId } from '../src/adapters/cli/types.js';
 import { LAUNCH_MODEL_CLI_IDS, botAcceptsLaunchModel } from '../src/core/launch-model-capability.js';
 
 /** 只有后端（不是 buildArgs）把模型带出去的 CLI —— 探测看不见，必须显式记账。 */
-const BACKEND_CARRIED: ReadonlySet<CliId> = new Set<CliId>(['mojo']);
+const BACKEND_CARRIED: ReadonlySet<CliId> = new Set<CliId>(['mojo', 'remote-runner']);
 
 const PROBE_OPTS = {
   sessionId: 'sid-launch-model-probe',

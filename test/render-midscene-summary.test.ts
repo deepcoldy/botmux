@@ -1,7 +1,35 @@
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { renderSummary } from '../scripts/render-midscene-summary.mjs';
 
 describe('Midscene CI summary', () => {
+  it('does not report success when a successful Feishu step has no summary', () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'botmux-summary-'));
+    try {
+      writeFileSync(path.join(root, 'summary.json'), JSON.stringify({
+        status: 'success',
+        summary: { total: 1, passed: 1, failed: 0, notRun: 0 },
+        projects: [{ name: 'dashboard-smoke', cases: [{ name: 'Dashboard', status: 'success' }] }],
+      }));
+      const output = path.join(root, 'output.md');
+      execFileSync(process.execPath, [
+        'scripts/render-midscene-summary.mjs',
+        '--results', root,
+        '--feishu-results', path.join(root, 'missing-feishu'),
+        '--artifact-name', 'report',
+        '--test-outcome', 'success',
+        '--feishu-outcome', 'success',
+        '--output', output,
+      ]);
+      expect(readFileSync(output, 'utf8')).toContain('Botmux × Midscene · failed');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('renders native case results and the report artifact link', () => {
     const markdown = renderSummary({
       artifactName: 'midscene-feishu-report',

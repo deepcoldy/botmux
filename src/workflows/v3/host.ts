@@ -444,6 +444,7 @@ export function authorizeAdHocRun(
   runDir: string,
   bots: BotConfig[],
   now: Date = new Date(),
+  opts: { workingDirOverride?: string } = {},
 ): AdHocRunAuthorizationResult {
   // The outer host lock prevents Gate-2 from racing any grill RMW / architect
   // attempt. The inner envelope lock serializes this producer with all other
@@ -502,6 +503,7 @@ export function authorizeAdHocRun(
       // never the first unrelated entry in bots.json. Standalone/dev runs have
       // no binding and retain the legacy first-supported fallback.
       defaultSelector: cur.chatBinding?.larkAppId,
+      workingDirOverride: opts.workingDirOverride,
     });
 
     const dagPath = join(runDir, 'dag.json');
@@ -692,13 +694,17 @@ export async function cmdWorkflowHost(
     case 'approve-dag': {
       const runId = requireRunId(rest);
       const runDir = guardedRunDir(runId);
+      const workingDirOverride = argValue(rest, '--working-dir');
+      if (rest.includes('--working-dir') && (!workingDirOverride?.trim() || workingDirOverride.startsWith('--'))) {
+        throw new Error('--working-dir requires a non-empty path');
+      }
       const now = new Date();
       // An already-published replay must not depend on today's bots.json just
       // to acknowledge the same Gate-2 decision. The in-lock reader remains
       // authoritative; this read only decides whether bot snapshots are needed.
       const before = readRunEnvelope(runDir, runId);
       const bots = before.kind === 'missing' ? (deps.loadBots ?? loadBotConfigs)() : [];
-      const authorized = authorizeAdHocRun(runDir, bots, now);
+      const authorized = authorizeAdHocRun(runDir, bots, now, { workingDirOverride });
       const { state } = hostApproveDag(runDir, now);
       const dagPath = authorized.dagPath;
       console.log(JSON.stringify({ runId, status: state.status, dagPath }, null, 2));

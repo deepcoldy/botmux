@@ -1624,7 +1624,11 @@ describe('XPI cross-app human classification identity', () => {
       expect(ds.session.crossPrincipalInterruptions).toEqual([
         expect.objectContaining({ phase: 'awaiting_owner' }),
       ]);
-      expect(repliedText()).toContain('建议已暂存，将在当前任务结束后由原任务发起人确认。');
+      // The proposer notice is sent in the background after the queue is saved;
+      // awaiting the driver only guarantees the state transition has completed.
+      await vi.waitFor(() => {
+        expect(repliedText()).toContain('建议已暂存，将在当前任务结束后由原任务发起人确认。');
+      });
       expect(repliedText()).not.toContain('消息已暂存，不会打断当前任务。');
     } finally {
       if (ds.crossPrincipalWaitTimer) clearTimeout(ds.crossPrincipalWaitTimer);
@@ -1976,7 +1980,9 @@ function failRepliesMatching(predicate: (content: string) => boolean, message: s
 describe('durable admission then failing status reply → no resend advice (PR #846 review)', () => {
   const resendNotice = () => tr('daemon.ordinary_ingress_failed', undefined, localeForBot(APP));
   const admittedNotice = () => tr('daemon.ordinary_ingress_admitted_reply_failed', undefined, localeForBot(APP));
-  const chooseRepoNotice = () => tr('daemon.choose_repo_first', undefined, localeForBot(APP));
+  // 这些用例里的 pendingRepo 会话从没发过选仓卡（repoCardMessageId 缺席），daemon 的待选仓
+  // 回复走不指卡片的那条文案；有卡时才是 daemon.choose_repo_first。
+  const chooseRepoNotice = () => tr('daemon.choose_repo_no_card', undefined, localeForBot(APP));
 
   beforeEach(() => {
     vi.clearAllMocks();

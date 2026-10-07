@@ -38,8 +38,13 @@ export interface TriggerRequest {
   /** Trusted presentation chosen by the connector owner. Undefined keeps the
    * localized default topic seed; null suppresses the seed entirely. */
   presentation?: {
+    /** Hide only this trigger's thinking bubble; business notices and HTTP results remain available. */
+    thinking?: 'hidden';
     topicMessage?: string | null;
     title?: string;
+    /** Connector-owned handoff UI: replace the native live card only when this
+     * exact input is committed by the worker. Never driven by group messages. */
+    liveCard?: 'on-start';
   };
   options?: {
     dryRun?: boolean;
@@ -57,8 +62,9 @@ export interface TriggerRequest {
      *  /api/trigger appending to the same session with the same key resolves to
      *  the SAME turn instead of injecting a second time — so a lost HTTP response
      *  on an existing-session append can't double-run. Mutually exclusive with
-     *  `idempotencyKey`; only valid with `target.sessionId` + asyncReturnSessionId
-     *  (no wait/dryRun). Non-empty, ≤200 chars. */
+     *  `idempotencyKey`; requires `target.sessionId` (no wait/dryRun).
+     *  Ordinary turns keep Lark delivery; async turns keep HTTP polling.
+     *  Non-empty, ≤200 chars. */
     turnIdempotencyKey?: string;
     status?: 'firing' | 'resolved' | string;
     waitForFinalOutput?: boolean;
@@ -270,6 +276,12 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
     if (!isRecord(raw.presentation)) {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation must be an object' } };
     }
+    if (raw.presentation.liveCard !== undefined && raw.presentation.liveCard !== 'on-start') {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.liveCard must be on-start' } };
+    }
+    if (raw.presentation.thinking !== undefined && raw.presentation.thinking !== 'hidden') {
+      return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.thinking must be hidden' } };
+    }
     const topicMessage = raw.presentation.topicMessage;
     if (topicMessage !== undefined && topicMessage !== null && typeof topicMessage !== 'string') {
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'presentation.topicMessage must be a string or null' } };
@@ -347,16 +359,11 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
       return { ok: false, status: 400, body: { ok: false, errorCode: 'bad_request', error: 'options.turnIdempotencyKey must be a non-empty string (<=200 chars)' } };
     }
     // (Mutual exclusion with idempotencyKey is checked up-front, above.)
-    // Scope lock (follow-up turn only): the turn-level lease is implemented solely
-    // on the existing-session async-return append seam. It REQUIRES target.sessionId
-    // (that is the session whose turn is keyed) and asyncReturnSessionId, and must
-    // not be combined with wait/dryRun or a fresh-session target
-    // (rootMessageId/chatId without sessionId), which take other dispatch paths
-    // that don't hold this lease and would double-run on retry.
+    // Existing-session follow-ups only. Loud Lark turns use an independent
+    // dispatch receipt; async turns retain the HTTP result-store lease.
     if (
       target.kind !== 'turn'
       || !hasSessionId
-      || !asyncReturnSessionId
       || waitForFinalOutput
       || options.dryRun === true
     ) {
@@ -364,7 +371,7 @@ export function validateTriggerRequest(raw: unknown): { ok: true; request: Trigg
         ok: false, status: 400,
         body: {
           ok: false, errorCode: 'bad_request',
-          error: 'options.turnIdempotencyKey is only supported for a follow-up async turn on an existing session (target.kind=turn, target.sessionId set, options.asyncReturnSessionId=true, no waitForFinalOutput/dryRun)',
+          error: 'options.turnIdempotencyKey is only supported for a follow-up turn on an existing session (target.kind=turn, target.sessionId set, no waitForFinalOutput/dryRun)',
         },
       };
     }

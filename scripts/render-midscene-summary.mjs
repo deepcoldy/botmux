@@ -270,16 +270,23 @@ async function main() {
   const siteManifest = options['site-manifest']
     ? JSON.parse(await readFile(options['site-manifest'], 'utf8'))
     : null;
-  const markdown = renderSummary({
+  const testOutcome = required(options, 'test-outcome');
+  const missingResults = [];
+  if (testOutcome === 'success' && !summary) missingResults.push('Dashboard');
+  if (options['feishu-outcome'] === 'success' && !feishuLatest) missingResults.push('Feishu');
+  let markdown = renderSummary({
     summary: combinedSummary,
     artifactName: required(options, 'artifact-name'),
-    testOutcome: required(options, 'test-outcome'),
+    testOutcome: missingResults.length > 0 ? 'failure' : testOutcome,
     runUrl,
     pagesUrl: options['pages-url'],
     feishuOutcome: options['feishu-outcome'],
     skippedCases,
     evidenceCases: siteManifest?.cases ?? [],
   });
+  if (missingResults.length > 0) {
+    markdown += `\nMissing native summary for a successful step: ${missingResults.join(', ')}. The run cannot be reported as passed.\n`;
+  }
   await appendFile(required(options, 'output'), markdown);
 }
 

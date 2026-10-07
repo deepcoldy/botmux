@@ -107,8 +107,20 @@ bun run switch:here && bun run daemon:restart
 - `skills/` — 开箱即用的 Skill 定义 + installer
 - `core/types.ts` — `DaemonSession` 是核心类型，所有模块从此导入
 - `core/` — `worker-pool`、`command-handler`、`session-manager`、`cost-calculator`、`scheduler`
+- `core/command-schema.ts` / `command-router.ts` / `session-phase.ts` / `cli-idle-wait.ts` — 斜杠命令的**分类层**（见下节「命令路由」）
 - `im/lark/` — 飞书：事件路由（`event-dispatcher`）、卡片（`card-builder`/`card-handler`）、API（`client`）、消息解析（`message-parser`）
 - `utils/` — `idle-detector`（CLI 空闲检测）、`terminal-renderer`（xterm.js 截屏）、`logger`
+
+## 命令路由（改斜杠命令判定必读）
+
+daemon 两条入口（`handleNewTopicAdmitted` / `handleThreadReplyAdmitted`）对斜杠命令只做一次
+`classifySlash(...)`（`src/core/command-router.ts`，纯函数），之后按决策执行；设计与决策记录见
+`docs/design/2026-09-11-command-router.md`（§15 是逐期的执行记录）。改动时守住三件事：
+
+- **命令注册只在 `src/core/command-schema.ts`**：名字/别名、会话政策（无会话时预建 / 不建 / 只对已有会话）、两条入口的前置特判位置、多行豁免、help 键。`DAEMON_COMMANDS` 等五个集合都从这张表推导，别再手写集合或在入口里加 `if (cmd === '/xxx')`。加命令 = 加一行 + `handleCommand` 加 case，`test/command-schema.test.ts` 会红到两边对齐。
+- **路由判定的任何变化都会让 `test/command-router-oracle-diff.test.ts` 变红**：它把 `test/legacy-oracle/` 里冻结的老判定（零 src import）与新路由器在 ≈269 万组输入上逐字差分。红了先判断是回归还是有意变化；有意变化要同时登记到差分测试的 `INTENTIONAL` 名单和设计文档 §9 的有意变化表，别去改 oracle。
+- **话题指令头也只在 `src/core/topic-header.ts` 解析**：`/t` `/topic` 与生命周期别名 `/th` `/tw`（= `/t here|worktree`）、`/repo wt <目标> [分支]` 都由它给出 `TopicHeader`，入口不做正则预判；相斥组合（生命周期变体 + `/repo`）由 `topic-spec.ts` 拒绝，不做静默优先级。
+- **会话相位**（`session-phase.ts`）由现有旗标推导，`ds.cliReady` / `cliReadyGeneration` 只由 worker 的 `prompt_ready` 置位、不由 `ready` 清零；runtime 级联（`cli-idle-wait.ts` + daemon 的 `runPassthroughCascade`）只在 PTY 家族后端、非 adopt 会话上跑。
 
 ## 飞书 owner 身份边界（setup/onboarding 改动必读）
 
@@ -142,4 +154,4 @@ bun run switch:here && bun run daemon:restart
 - commit message 格式：`type(scope): 中文描述`。`type`（feat/fix/docs/chore 等）和 `scope`（模块名）保留英文，冒号后的描述用中文；同样**不带飞书真人名字与机器人协作花名**（见上「PR 规范」）
 - 日常 `git commit` + `git push` 不会触发发版；打 `v*` annotated tag 并 push 才发版（**仅在用户明确要求时**），CI 自动从 tag 提取版本号发布 npm + 创建 GitHub Release
 - **不要**手动修改 `package.json` 的 `version` 字段；tag message 用中文撰写，CI 会用作 Release body
-- **正式版（latest）必须从 master 出**：CI 校验被打 tag 的 commit 含最新 `origin/master`。非 master 分支灰度用 `-canary.N`/`-beta.N`/`-rc.N` 后缀（CI 自动路由到对应 npm dist-tag，其它 `-` 后缀兜底到 `next`，都不污染 latest）；验证 canary：`npm i -g botmux@canary`
+- **正式版（latest）必须从 master 出**：CI 校验被打 tag 的 commit 含最新 `origin/master`。非 master 分支灰度用 `-canary.N`/`-beta.N`/`-rc.N` 后缀（CI 自动路由到对应 npm dist-tag，其它 `-` 后缀兜底到 `next`，都不污染 latest）；验证 canary：`botmux update canary`（或 `npm i -g botmux@canary`）

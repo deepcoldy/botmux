@@ -11,7 +11,7 @@
 import { getBot } from '../bot-registry.js';
 import { deleteMessage } from '../im/lark/client.js';
 import type { DaemonSession } from './types.js';
-import { sessionAnchorId } from './types.js';
+import { activeSessionKey, sessionAnchorId } from './types.js';
 import { persistStreamCardState } from './session-manager.js';
 import {
   buildStreamingCardJson,
@@ -41,6 +41,7 @@ export async function reconcileResumedStreamingCard(
   const fence = {
     session: ds.session,
     larkAppId: ds.larkAppId,
+    runtimeKey: activeSessionKey(ds),
     anchorId: sessionAnchorId(ds),
     expectedPriorCardId: priorCardId,
   };

@@ -46,6 +46,9 @@ describe('tmuxKeyToBytes', () => {
 });
 
 describe('kdlString', () => {
+  it('keeps multiline values inside one quoted KDL argument', () => {
+    expect(kdlString('a\nb\rc')).toBe('"a\\nb\\rc"');
+  });
   it('escapes backslashes and quotes', () => {
     expect(kdlString('a"b\\c')).toBe('"a\\"b\\\\c"');
   });

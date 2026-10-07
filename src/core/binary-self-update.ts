@@ -28,9 +28,9 @@
  * ── THE KEY INSIGHT: BOTH INSTALLERS SHIP THE SAME BINARY ─────────────────────
  * It is tempting to think “npm users update with npm, curl users update with
  * curl”, i.e. that the two installers produce different artifacts. They do not.
- * `npm i -g botmux` has NO `bin` field any more (removed in #1047): it downloads
- * a platform subpackage and its postinstall writes `~/.botmux/bin/botmux` as a
- * launcher that `exec`s that subpackage's compiled binary. `install.sh` downloads
+ * `npm i -g botmux` downloads a platform subpackage; its `bin` is a sh launcher
+ * that resolves and `exec`s that subpackage's compiled binary, and its postinstall
+ * additionally writes `~/.botmux/bin/botmux` as a launcher onto the same binary. `install.sh` downloads
  * the very same compiled binary from the GitHub Release. Same bytes, different
  * location — which is exactly why classifying by MODULE GRAPH cannot work (both
  * report `/`) and classifying by LOCATION can.

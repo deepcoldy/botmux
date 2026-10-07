@@ -778,6 +778,31 @@ export type PersistentPaneMigrationDecision =
    *  skips on `unknown` instead (no gratuitous start-failures on probe flakiness). */
   | { action: 'refuse-inconclusive-probe' };
 
+/**
+ * Break the cold-machine tie for the read-isolation pre-spawn gate.
+ *
+ * After a reboot /tmp is wiped, so the tmux socket file does not exist and the
+ * liveness probe reads 'unknown' (a connection-level error is deliberately
+ * never 'missing' — #962). evaluatePersistentPaneMigration fail-closes on
+ * 'unknown', the refused session never starts a tmux server, and so every
+ * isolated session on the machine is refused until something unrelated starts
+ * one. Only here — not in the general probe that kill-verify / close / wake
+ * paths consume — an 'unknown' tmux probe is upgraded to 'missing' when the
+ * caller's cold-machine check (TmuxBackend.serverAbsentOnColdMachine) confirms the
+ * socket is gone AND no tmux process is visible. `exists` / `missing` and every
+ * non-tmux backend pass through untouched; the check is not even invoked then.
+ */
+export function resolveReadIsolationPaneProbe(
+  paneProbe: SessionProbe,
+  backendType: string,
+  serverAbsentOnColdMachine: () => boolean,
+): { probe: SessionProbe; coldServerAbsent: boolean } {
+  if (paneProbe !== 'unknown' || backendType !== 'tmux') return { probe: paneProbe, coldServerAbsent: false };
+  let absent = false;
+  try { absent = serverAbsentOnColdMachine() === true; } catch { absent = false; }
+  return absent ? { probe: 'missing', coldServerAbsent: true } : { probe: 'unknown', coldServerAbsent: false };
+}
+
 export function evaluatePersistentPaneMigration(
   input: PersistentPaneMigrationInput,
 ): PersistentPaneMigrationDecision {

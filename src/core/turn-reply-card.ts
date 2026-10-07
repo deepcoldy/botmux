@@ -3,6 +3,7 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { config } from '../config.js';
 import { sandboxEnabled } from '../adapters/backend/sandbox.js';
+import { sandboxBoolValue } from '../adapters/cli/sandbox-mode.js';
 import { getBot } from '../bot-registry.js';
 import { normalizeUsageDisplay } from '../bot-registry.js';
 import { getSessionUsageSnapshot } from './cost-calculator.js';
@@ -36,8 +37,14 @@ export function replyCardSandboxBlocked(ds: DaemonSession): boolean {
   // outside the sandbox allow-list. Check before cached or persisted modes;
   // otherwise the daemon creates a card the sandboxed sender cannot update.
   // Live workers keep their frozen isolation state when bot settings change.
-  return (ds.session.sandbox ?? ds.initConfig?.sandbox ?? cfg.sandbox) === true
-    || ds.initConfig?.sandbox === true
+  // Tri-state with FROZEN PRECEDENCE preserved (the ?? chain): an explicit
+  // false/'off' on the session or initConfig means this session was created
+  // unsandboxed and must not retroactively block when the live bot toggle is
+  // later turned on. Only when no frozen value exists do we fall back to the
+  // live cfg. sandboxBoolValue accepts 'scratch' as well as oncall/true.
+  const frozenSandbox = ds.session.sandbox ?? ds.initConfig?.sandbox ?? cfg.sandbox;
+  return sandboxBoolValue(frozenSandbox)
+    || sandboxBoolValue(ds.initConfig?.sandbox)
     || (ds.initConfig?.readIsolation ?? cfg.readIsolation) === true
     || sandboxEnabled();
 }
@@ -178,7 +185,7 @@ export async function flushTurnReplyTools(ds: DaemonSession, turnId: string, dis
   const cfg = getBot(ds.larkAppId).config;
   const visible = ds.cotForced || replyCardPresentation(cfg, ds.chatId).showProcess;
   const work = updateTurnReplyCard(ds, turnId, {
-    kind: 'tools', tools: visible ? publicReplyCardTools(next.msg.entries, true) : [],
+    kind: 'tools', tools: visible ? publicReplyCardTools(next.msg.entries, cfg.thinkingCardToolResult !== false) : [],
     activity: visible ? publicReplyCardActivity(next.msg.entries) : [],
   }, next.send, { dispatchAttempt, owns: next.owns }).then(() => undefined);
   let running = toolFlushes.get(ds);

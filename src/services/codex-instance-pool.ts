@@ -163,7 +163,7 @@ export function newSessionCodexInstanceState(bot: BotConfig, source: SessionCrea
 export function legacyCodexInstanceBinding(session: Session, bot: BotConfig, botHome: string): SessionCliInstanceBindingV1 | undefined {
   if (session.cliInstanceBinding || session.creationSource === 'external' || session.cliLaunchSnapshot || session.adoptedFrom || (session.cliId ?? bot.cliId) !== 'codex') return undefined;
   if (session.wrapperCli || bot.wrapperCli || bot.env?.CODEX_HOME) invalid(`legacy session ${session.sessionId}: home is ambiguous`);
-  const isolated = bot.codexAuthSync === 'isolated' || session.sandbox === true;
+  const isolated = bot.codexAuthSync === 'isolated' || (session.sandbox === true || session.sandbox === 'oncall' || session.sandbox === 'scratch');
   const home = isolated ? join(botHome, 'codex') : join(homedir(), '.codex');
   return { version: 1, source: 'legacy', instanceId: null, cliId: 'codex', codexHome: home,
     authMode: isolated ? (bot.codexAuthSync === 'isolated' ? 'isolated' : 'shared') : 'global' };

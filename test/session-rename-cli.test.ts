@@ -12,6 +12,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { seedPersistedSessionRows } from './helpers/session-store-disk.js';
 import { spawnTsScript } from './helpers/ts-runner.js';
 
 const CLI_PATH = join(__dirname, '..', 'src', 'cli.ts');
@@ -75,7 +76,9 @@ function makeRoot(): { root: string; home: string; dataDir: string } {
 }
 
 function seedSessionAndDaemon(dataDir: string, port: number): void {
-  writeFileSync(join(dataDir, `sessions-${APP}.json`), JSON.stringify({
+  // Cross-process readers only open SQLite. A leftover sessions-*.json is
+  // unmigrated and must not be the fixture the rename command looks up.
+  seedPersistedSessionRows(dataDir, APP, {
     [SID]: {
       sessionId: SID,
       chatId: 'oc_cli_session_rename',
@@ -85,7 +88,7 @@ function seedSessionAndDaemon(dataDir: string, port: number): void {
       createdAt: new Date().toISOString(),
       larkAppId: APP,
     },
-  }));
+  });
   mkdirSync(join(dataDir, 'dashboard-daemons'), { recursive: true });
   writeFileSync(join(dataDir, 'dashboard-daemons', `${APP}.json`), JSON.stringify({
     larkAppId: APP,

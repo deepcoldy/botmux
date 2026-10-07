@@ -18,6 +18,16 @@ import { createServer } from 'node:http';
 import { WebSocketServer } from 'ws';
 import { appendFileSync, writeFileSync } from 'node:fs';
 
+if (process.env.FAKE_ENV_PROBE_PATH) {
+  const e = process.env;
+  writeFileSync(e.FAKE_ENV_PROBE_PATH, JSON.stringify({
+    hostAbsent: !('UNLISTED_CLOUD_CREDENTIAL' in e),
+    authPresent: e.OPENAI_API_KEY === 'rpc-sentinel',
+    homePinned: e.CODEX_HOME === '/test/rpc/codex',
+    ownerPinned: e.BOTMUX_OWNER_OPEN_ID === 'ou_rpc',
+  }));
+}
+
 const listenArg = process.argv[process.argv.indexOf('--listen') + 1] || '';
 const m = listenArg.match(/ws:\/\/127\.0\.0\.1:(\d+)/);
 const port = m ? Number(m[1]) : 0;

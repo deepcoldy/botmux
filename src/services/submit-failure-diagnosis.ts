@@ -63,6 +63,8 @@ const INTERACTIVE_MENU_RULES: readonly ScreenRule[] = [
   { id: 'interactive_menu:press_enter', re: /press enter to continue/i },
   { id: 'interactive_menu:update_now', re: /update now/i },
   { id: 'interactive_menu:trust_files', re: /trust the files/i },
+  { id: 'interactive_menu:trust_this_folder', re: /trust this folder/i },
+  { id: 'interactive_menu:trust_and_continue', re: /trust and continue/i },
   // 行首编号选择光标
   { id: 'interactive_menu:numbered_cursor', re: /(?:^|[\n\r])\s*[›❯]\s*\d+\s*[.)]/ },
 ];
