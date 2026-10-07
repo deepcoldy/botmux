@@ -283,6 +283,27 @@ describe('independent turn terminal receipt', () => {
     expect(sessionReplyMock).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['card-off', { disableStreamingCard: true }],
+    ['private-card', { privateCard: true }],
+    ['transcript delivery', { replyDelivery: 'transcript' }],
+    ['no-card chat', { noCardChats: ['oc_chat'] }],
+  ])('keeps the legacy explicit-@ silent receipt in %s sessions', async (_label, override) => {
+    Object.assign(botConfig, override);
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_excluded_silent');
+    recordTurnExplicitMention(ds, 'om_turn_excluded_silent', true);
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('om_turn_excluded_silent', {
+      outputDisposition: 'nothing_to_send',
+    }));
+
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
+    expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+    expect(sessionReplyMock.mock.calls[0]?.[2]).toBe('text');
+  });
+
   it('does not duplicate the terminal UI of unified reply-card mode', async () => {
     Object.assign(botConfig, { cliId: 'codex', replyCardMode: 'unified' });
     const ds = makeDs();

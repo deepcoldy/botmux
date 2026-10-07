@@ -16001,6 +16001,24 @@ function setupWorkerHandlers(
             logger.info(`[${t}] Settled async HTTP turn ${msg.turnId.substring(0, 8)} completed (empty output; nothing-to-send)`);
           }
         }
+        // Resolve the terminal-strip route once and share it with the legacy
+        // silent-turn receipt below. A frozen Lark context alone is not enough:
+        // card-off/private/transcript turns deliberately skip the strip and
+        // must retain their pre-existing explicit-@ text receipt instead;
+        // managed turns remain suppressed by the existing gate below.
+        const terminalReplyContext = ds.session.turnReplyContexts?.[msg.turnId];
+        const terminalReceiptKind: TurnTerminalReceiptKind | undefined = msg.status === 'completed'
+          ? (msg.outputDisposition === 'nothing_to_send' ? 'silent' : 'completed')
+          : undefined;
+        const shouldPostTerminalReceipt = terminalReceiptKind !== undefined
+          && !!terminalReplyContext
+          && !recoveryHandled
+          && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)
+          && !ds.session.vcMeetingReceiver
+          && !streamingCardDisabled(ds, msg.turnId)
+          && !botCfg.privateCard
+          && replyCardModeFor(ds, msg.turnId) === 'legacy'
+          && effectiveReplyDelivery(ds.larkAppId, effectiveCliId, sessionPromptInjection(ds)) === 'send';
         // Deliberate-silence closure (positive evidence only — the same
         // 'nothing_to_send' contract as the async settle above):
         //   ① mark the session so every idle-card rebuild renders
@@ -16036,7 +16054,7 @@ function setupWorkerHandlers(
           // report its final status even if a newer turn has since opened.
           const posted = ds.silentReceiptTurnIds ?? (ds.silentReceiptTurnIds = new Set());
           if (explicitMention
-            && !ds.session.turnReplyContexts?.[msg.turnId]
+            && !shouldPostTerminalReceipt
             && !posted.has(msg.turnId)) {
             // Claim BEFORE sending so a replay racing this await cannot double-post;
             // release on failure so a later replay can still close the loop.
@@ -16067,19 +16085,6 @@ function setupWorkerHandlers(
         // context and must not gain a surprise Feishu side effect. Unified
         // reply cards already show their terminal phase; card-off/private/doc/
         // meeting/silent-schedule paths retain their existing low-noise UI.
-        const terminalReplyContext = ds.session.turnReplyContexts?.[msg.turnId];
-        const terminalReceiptKind: TurnTerminalReceiptKind | undefined = msg.status === 'completed'
-          ? (msg.outputDisposition === 'nothing_to_send' ? 'silent' : 'completed')
-          : undefined;
-        const shouldPostTerminalReceipt = terminalReceiptKind !== undefined
-          && !!terminalReplyContext
-          && !recoveryHandled
-          && !managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)
-          && !ds.session.vcMeetingReceiver
-          && !streamingCardDisabled(ds, msg.turnId)
-          && !botCfg.privateCard
-          && replyCardModeFor(ds, msg.turnId) === 'legacy'
-          && effectiveReplyDelivery(ds.larkAppId, effectiveCliId, sessionPromptInjection(ds)) === 'send';
         if (shouldPostTerminalReceipt && terminalReplyContext && terminalReceiptKind) {
           const settled = ds.terminalReceiptTurnIds ?? (ds.terminalReceiptTurnIds = new Set());
           if (!settled.has(msg.turnId)) {
