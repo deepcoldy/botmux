@@ -79,6 +79,17 @@ describe('daemon IPC session-scoped fallback', () => {
     })).toEqual({ ok: true });
   });
 
+  it('overrides a stale project-card root with the live chat route', () => {
+    const ask = { sessionId: 'session-a', larkAppId: 'app-a', chatId: 'chat-a', rootMessageId: 'om_project_card', requestId: 'req-a' };
+    const bound = bindSessionScopedIpcIdentity(ask, {
+      sessionId: 'session-a', larkAppId: 'app-a', chatId: 'chat-a', rootMessageId: null,
+    });
+    expect(bound).toEqual({ ...ask, rootMessageId: null });
+    expect(bindSessionScopedIpcIdentity(ask, {
+      sessionId: 'session-a', larkAppId: 'app-a', chatId: 'chat-a', rootMessageId: 'om_live_topic',
+    })).toEqual({ ...ask, rootMessageId: 'om_live_topic' });
+  });
+
   it('binds ask and hook routing fields to the authenticated session', () => {
     const bound = bindSessionScopedIpcIdentity({
       sessionId: 'session-b',

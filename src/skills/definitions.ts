@@ -1206,8 +1206,10 @@ humanGate：
 
 export const ASK_SKILL = `---
 name: botmux-ask
-description: 在当前飞书/Lark 话题里向用户发起阻塞式选择题并等待回答。触发场景：你需要用户在多个明确选项中做选择、确认风险动作、决定继续/回滚/中止，且后续命令需要拿到机器可解析的答案。使用 botmux ask buttons，stdout 只返回选中的 key，适合 shell 脚本和 CLI agent 继续执行。
+description: 在当前飞书/Lark 会话里向用户发起阻塞式选择题并等待回答。触发场景：你需要用户在多个明确选项中做选择、确认风险动作、决定继续/回滚/中止，且后续命令需要拿到机器可解析的答案。使用 botmux ask buttons，stdout 只返回选中的 key，适合 shell 脚本和 CLI agent 继续执行。
 ---
+
+发送位置跟随真实会话：群级（chat）会话发到群主消息流，话题级（thread）会话发到对应话题。群级会话允许没有 BOTMUX_ROOT_MESSAGE_ID；不要用项目卡或其他消息 ID 补填该变量。缺少身份变量时先核对当前会话，不猜测身份或发送位置。
 
 # botmux-ask — 阻塞式向用户提问
 

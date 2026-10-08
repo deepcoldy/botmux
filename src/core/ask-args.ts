@@ -145,10 +145,13 @@ export function findMissingAskEnv(
     'BOTMUX_SESSION_ID',
     'BOTMUX_CHAT_ID',
     'BOTMUX_LARK_APP_ID',
-    'BOTMUX_ROOT_MESSAGE_ID',
   ];
   for (const k of required) {
     if (!env[k] || !env[k]!.trim()) return k;
+  }
+  // Chat sessions have no message root; worker intentionally omits it.
+  if (env.BOTMUX_SESSION_SCOPE !== 'chat' && !env.BOTMUX_ROOT_MESSAGE_ID?.trim()) {
+    return 'BOTMUX_ROOT_MESSAGE_ID';
   }
   return null;
 }

@@ -6728,16 +6728,17 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
         error: verified.error,
       });
     }
-    // A session capability authenticates exactly one daemon session; it does
-    // not let the caller choose another bot/chat/root. Bind every observable
-    // ask route to that authenticated session before registering the card.
+  }
+  // Authentication and routing are separate: host HMAC callers must also use
+  // the live session route, never a stale/manually supplied project-card root.
+  if (askSession) {
     boundAsk = bindSessionScopedIpcIdentity(parsed, {
-      sessionId: askSession!.session.sessionId,
-      larkAppId: askSession!.larkAppId,
-      chatId: askSession!.chatId,
-      rootMessageId: askSession!.session.scope === 'chat'
+      sessionId: askSession.session.sessionId,
+      larkAppId: askSession.larkAppId,
+      chatId: askSession.chatId,
+      rootMessageId: askSession.session.scope === 'chat'
         ? null
-        : askSession!.session.rootMessageId,
+        : askSession.session.rootMessageId,
     });
   }
   if (askSession?.session.vcMeetingReceiver) {

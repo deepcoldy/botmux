@@ -26,6 +26,7 @@ afterEach(() => {
 function runAsk(
   dataDir: string,
   args = ['ask', 'buttons', '--options', 'yes,no', '请作答'],
+  env: NodeJS.ProcessEnv = {},
 ): Promise<{ status: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawnTsScript(
@@ -39,6 +40,7 @@ function runAsk(
           BOTMUX_CHAT_ID: 'oc_test',
           BOTMUX_LARK_APP_ID: 'cli_test',
           BOTMUX_ROOT_MESSAGE_ID: 'om_test',
+          ...env,
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       },
@@ -56,6 +58,45 @@ function runAsk(
 }
 
 describe('botmux ask — CLI boundary', () => {
+  it.each([undefined, 'om_project_card'])('chat scope sends a top-level ask with root=%s', async (root) => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-chat-'));
+    tempDirs.push(dataDir);
+    let requestBody: Record<string, unknown> | undefined;
+    const server = createServer(async (req, res) => {
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      requestBody = JSON.parse(body);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ kind: 'answered', answers: [['yes']], by: 'ou_test', comment: null }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const registryDir = join(dataDir, 'dashboard-daemons');
+      mkdirSync(registryDir, { recursive: true });
+      writeFileSync(join(registryDir, 'cli_test.json'), JSON.stringify({
+        larkAppId: 'cli_test', ipcPort: (server.address() as AddressInfo).port, lastHeartbeat: Date.now(),
+      }));
+      const result = await runAsk(dataDir, undefined, {
+        BOTMUX_SESSION_SCOPE: 'chat', BOTMUX_ROOT_MESSAGE_ID: root,
+      });
+      expect(result).toEqual({ status: 0, stdout: 'yes\n', stderr: '' });
+      expect(requestBody).toMatchObject({ chatId: 'oc_test', sessionId: 'sess_test', rootMessageId: null });
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close(err => err ? reject(err) : resolve()));
+    }
+  });
+
+  it('thread scope rejects a missing root before contacting the daemon', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-thread-'));
+    tempDirs.push(dataDir);
+    const result = await runAsk(dataDir, undefined, {
+      BOTMUX_SESSION_SCOPE: 'thread', BOTMUX_ROOT_MESSAGE_ID: undefined,
+    });
+    expect(result.status).toBe(2);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('BOTMUX_ROOT_MESSAGE_ID');
+  });
+
   it('--multi 发送多选问题并输出逗号分隔的 keys', async () => {
     const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-cli-'));
     tempDirs.push(dataDir);
