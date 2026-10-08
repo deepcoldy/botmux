@@ -218,7 +218,7 @@ describe('Agent Workbench 未读账本 seen.v1', () => {
 });
 
 describe('Agent Workbench 分组维度 group-dim.v1', () => {
-  it('只接受白名单里的六个维度，脏值当没存过', () => {
+  it('只接受白名单里的七个维度，脏值当没存过', () => {
     const storage = new MemoryStorage();
     expect(loadWorkbenchGroupDimension(storage)).toBeNull();
 
@@ -229,13 +229,13 @@ describe('Agent Workbench 分组维度 group-dim.v1', () => {
     // 全局偏好，一条记录，不分会话。
     expect([...storage.values.keys()]).toEqual([GROUP_DIMENSION_KEY]);
     // 裸字符串存盘，不套 JSON —— 读的那头正是这么认的。
-    expect(storage.values.get(GROUP_DIMENSION_KEY)).toBe('time');
+    expect(storage.values.get(GROUP_DIMENSION_KEY)).toBe('worktree');
 
     // 白名单外的值不写盘，也不许把已存的选择覆盖掉。
     for (const bad of ['repo', '', 'STATUS', 'bot ']) {
       expect(saveWorkbenchGroupDimension(storage, bad as WorkbenchGroupDimension), bad).toBe(false);
     }
-    expect(loadWorkbenchGroupDimension(storage)).toBe('time');
+    expect(loadWorkbenchGroupDimension(storage)).toBe('worktree');
 
     // 别人写坏的存量记录读回 null，调用方回落到默认的 status。
     for (const raw of ['repo', '', 'STATUS', '{"dimension":"bot"}', '["bot"]', 'null']) {

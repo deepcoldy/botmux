@@ -150,12 +150,47 @@ describe('clearSessionIdentity', () => {
     expect(existsSync(sessionIdentityPath(dir, SESSION, 'bytedcli'))).toBe(true);
   });
 
+  it('removes the matching pre-#1543 identity without disturbing other legacy files', () => {
+    const identityDir = join(dir, 'cli-identity');
+    mkdirSync(identityDir, { recursive: true });
+    const stale = join(identityDir, `${SESSION}.lark-cli.env`);
+    const otherTool = join(identityDir, `${SESSION}.bytedcli.env`);
+    const otherSession = join(identityDir, 'sess-other.lark-cli.env');
+    writeFileSync(stale, 'live-token');
+    writeFileSync(otherTool, 'other-tool-token');
+    writeFileSync(otherSession, 'other-session-token');
+
+    clearSessionIdentity(dir, SESSION, 'lark-cli');
+
+    expect(existsSync(stale)).toBe(false);
+    expect(existsSync(otherTool)).toBe(true);
+    expect(existsSync(otherSession)).toBe(true);
+  });
+
   it('clears every tool on teardown', () => {
     writeSessionIdentity(dir, SESSION, { tool: 'lark-cli', appId: 'a', userAccessToken: 'tok' });
     writeSessionIdentity(dir, SESSION, { tool: 'bytedcli', cloudJwt: 'jwt' });
     clearAllSessionIdentities(dir, SESSION);
     expect(existsSync(sessionIdentityPath(dir, SESSION, 'lark-cli'))).toBe(false);
     expect(existsSync(sessionIdentityPath(dir, SESSION, 'bytedcli'))).toBe(false);
+  });
+
+  it('clears every pre-#1543 identity and turn marker on teardown', () => {
+    const identityDir = join(dir, 'cli-identity');
+    mkdirSync(identityDir, { recursive: true });
+    const legacyPaths = [
+      join(identityDir, `${SESSION}.lark-cli.env`),
+      join(identityDir, `${SESSION}.bytedcli.env`),
+      join(identityDir, `${SESSION}.turn`),
+    ];
+    for (const path of legacyPaths) writeFileSync(path, 'stale');
+    const unrelated = join(identityDir, `${SESSION}.unknown.env`);
+    writeFileSync(unrelated, 'keep');
+
+    clearAllSessionIdentities(dir, SESSION);
+
+    for (const path of legacyPaths) expect(existsSync(path)).toBe(false);
+    expect(existsSync(unrelated)).toBe(true);
   });
 });
 

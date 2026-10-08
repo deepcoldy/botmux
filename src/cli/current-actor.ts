@@ -12,6 +12,30 @@ export interface CurrentActorDocument {
   actor: {
     email: string;
   };
+  /**
+   * The conversation this turn is in (`chat_id`).
+   *
+   * Published because the gate is the one channel that reaches a client through
+   * the daemon's own verification, and a consumer that must record WHICH
+   * conversation a human act came from otherwise has nothing attested to record:
+   * `BOTMUX_CHAT_ID` is exported into the CLI too, but the environment is
+   * writable by whoever spawned the process, so a value read from it is the
+   * caller's claim rather than the daemon's statement. The same value is already
+   * in the CLI's environment, so publishing it here adds no new exposure — it
+   * only makes it attested rather than claimed.
+   */
+  chatId: string;
+  /**
+   * The daemon's identity for this exact turn (`managedTurnOrigin.turnId`).
+   *
+   * On a human message turn this IS the triggering Lark `message_id`: the
+   * ingress paths bind `session.quoteTargetId` to that message id, and
+   * `current-turn-provenance` refuses a turn whose marker disagrees with it.
+   * On a scheduled/system turn it is a daemon-minted id instead. Either way it
+   * is daemon-issued, unguessable and unique per turn, which is what a consumer
+   * needs in order to make one human act authorize exactly one thing.
+   */
+  turnId: string;
 }
 export interface ResolveCurrentActorOptions {
   ipcPort: number;
@@ -171,6 +195,13 @@ function isCurrentActorDocument(value: unknown): value is CurrentActorDocument {
   if (Object.keys(fields).length !== 1 || typeof fields.email !== 'string'
     || fields.email !== fields.email.trim()
     || fields.email !== fields.email.toLowerCase()) return false;
+  // Required, not optional: a document that omits them is the older shape, and
+  // a consumer that recorded `undefined` as the conversation or the turn would
+  // be recording a value nobody attested. Refusing here makes the older daemon
+  // say "this actor could not be verified" rather than handing back a document
+  // whose locators silently do not exist.
+  if (typeof document.chatId !== 'string' || document.chatId.length === 0
+    || typeof document.turnId !== 'string' || document.turnId.length === 0) return false;
   try { return normalizeActorEmail(fields.email) === fields.email; }
   catch { return false; }
 }
@@ -178,8 +209,14 @@ function isCurrentActorDocument(value: unknown): value is CurrentActorDocument {
 /**
  * Ask the owning daemon for the current human actor. The daemon identifies the
  * HTTP client through the live loopback socket, proves that process belongs to
- * the exact live CLI/worker generation, and reads sender identity from its
- * in-memory turn state. Environment values are routing hints only.
+ * the exact live CLI/worker generation, and reads sender identity AND the
+ * conversation/turn locators from its in-memory turn state. Environment values
+ * are routing hints only.
+ *
+ * The returned document is all-or-nothing: a daemon that cannot attest the
+ * actor, or that predates the locators, produces a `blocked` response rather
+ * than a `verified` one. A caller may therefore treat a resolved document as
+ * "this act belongs to this actor, in this conversation, on this turn".
  */
 export async function resolveCurrentActor(
   options: ResolveCurrentActorOptions,

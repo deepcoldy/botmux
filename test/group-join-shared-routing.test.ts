@@ -107,7 +107,7 @@ async function loadModules() {
   const collaborationModeStore = await import('../src/services/group-collaboration-mode-store.js');
   const daemon = await import('../src/daemon.js');
   const types = await import('../src/core/types.js');
-  sessionStore.init();
+  sessionStore.init('test-app');
   const policy = await import('../src/core/trusted-session-controller.js');
   const interruptions = await import('../src/core/cross-principal-interruption-store.js');
   return { collaborationModeStore, daemon, registry, types, policy, interruptions, sessionStore };
@@ -1535,7 +1535,7 @@ it('recovers a thrown dispatcher failure and accepts the displayed suggestion la
   vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
   mocks.registerHostAsk.mockReset().mockRejectedValueOnce(new Error('dispatcher unavailable'));
   await modules.daemon.__testOnly_driveCrossPrincipalInterruptions(ds);
-  const persisted = modules.sessionStore.readSessionRowFromDisk(ds.session.sessionId, ds.larkAppId);
+  const persisted = modules.sessionStore.readSessionRowFromDisk(ds.session.sessionId, 'test-app');
   expect(persisted?.crossPrincipalInterruptions?.[0]).toMatchObject({ id: record.id, confirmationRetryCount: 1 });
   // Simulate restoring the queue from disk, then let its retry deadline fire.
   ds.session.crossPrincipalInterruptions = persisted!.crossPrincipalInterruptions;

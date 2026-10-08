@@ -32,7 +32,7 @@ import { createAidenAdapter } from '../src/adapters/cli/aiden.js';
 import { createCocoAdapter } from '../src/adapters/cli/coco.js';
 import { createCodexAdapter } from '../src/adapters/cli/codex.js';
 import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
-import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
+import { createCursorAdapter, CURSOR_PLUGIN_DIR } from '../src/adapters/cli/cursor.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createGeniusAdapter } from '../src/adapters/cli/genius.js';
 import { createOpenCodeAdapter, isOpenCodeSessionId } from '../src/adapters/cli/opencode.js';
@@ -93,11 +93,12 @@ describe('createCliAdapterSync factory', () => {
 
   it.each(ALL_CLI_IDS)('adapter for "%s" has resolvedBin set', (id) => {
     const adapter = createCliAdapterSync(id, `/opt/${id}`);
-    // Remote backends (riff/mojo) never have the worker spawn a local binary —
+    // Riff/Mojo never have the worker spawn a local binary —
     // riff is pure HTTP and MojoBackend shells out per turn from the backend, so
-    // their adapter deliberately reports an empty resolvedBin. Exempting them via
-    // the shared predicate keeps this loop honest for every local CLI.
-    if (isRemoteCliId(id)) expect(adapter.resolvedBin).toBe('');
+    // their adapters deliberately report an empty resolvedBin. Remote Runner is
+    // also off-box execution, but it intentionally launches a local provider
+    // bridge process, so its configured executable must remain observable.
+    if (isRemoteCliId(id) && id !== 'remote-runner') expect(adapter.resolvedBin).toBe('');
     // dsh joins the bundled-Node-runner group (upstream #858): its resolvedBin is
     // the node binary, not the pinned path.
     else if (id === 'codex-app' || id === 'mira' || id === 'mir' || id === 'dsh') expect(adapter.resolvedBin).toBe(process.execPath);
@@ -1858,6 +1859,9 @@ describe('cursor buildArgs', () => {
 
   it('delivers the opening prompt through argv and enables post-ready type-ahead', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    // Positional prompt is inside the tmux launch command. 8192 matches
+    // OpenCode: short turns stay on argv; longer ones defer until readyPattern.
+    expect(adapter.maxInitialPromptArgBytes).toBe(8192);
     expect(adapter.readyPattern?.test('  → Plan, search, build anything')).toBe(true);
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
     expect(adapter.supportsTypeAhead).toBe(true);
@@ -1875,6 +1879,39 @@ describe('cursor buildArgs', () => {
     // Guard against over-broad matching: the arrow-prefixed composer glyph is
     // required, so unrelated screen text with the phrase must not false-match.
     expect(adapter.readyPattern?.test('Plan, search, build anything')).toBe(false);
+  });
+
+  it('injects built-in plugin-dir by default and supports session-scoped skillPluginDir', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-cursor',
+      resume: false,
+      skillPluginDir: '/tmp/runtime-skills/sess-cursor/claude-plugin',
+    });
+    expect(args).toContain('--plugin-dir');
+    const pluginIndices = args.flatMap((arg, i) => (arg === '--plugin-dir' ? [i] : []));
+    expect(pluginIndices.length).toBe(2);
+    expect(args[pluginIndices[0] + 1]).toBe(CURSOR_PLUGIN_DIR);
+    expect(args[pluginIndices[1] + 1]).toBe('/tmp/runtime-skills/sess-cursor/claude-plugin');
+  });
+
+  it('omits --plugin-dir when promptInjection is none', () => {
+    const args = adapter.buildArgs({
+      sessionId: 'sess-cursor',
+      resume: false,
+      skillPluginDir: '/tmp/runtime-skills/sess-cursor/claude-plugin',
+      promptInjection: 'none',
+    });
+    expect(args).not.toContain('--plugin-dir');
+  });
+
+  it('declares dynamic pluginDir and claude-plugin skillDelivery capabilities alongside a discoverable skillsDir', () => {
+    expect(adapter.pluginDir).toBe(CURSOR_PLUGIN_DIR);
+    expect(adapter.skillsDir).toBe('~/.cursor/skills');
+    expect(adapter.skillDelivery).toEqual({
+      nativeKind: 'claude-plugin',
+      supportsScopedSession: true,
+      supportsExclusive: false,
+    });
   });
 });
 
@@ -1958,6 +1995,11 @@ describe('gemini buildArgs', () => {
 
   it('passesInitialPromptViaArgs is true', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
+  });
+
+  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
+    // -i bakes the full first prompt into argv, same tmux ceiling as OpenCode.
+    expect(adapter.maxInitialPromptArgBytes).toBe(8192);
   });
 
   it('does not include session id', () => {
@@ -2813,6 +2855,11 @@ describe('mtr buildArgs', () => {
   it('passesInitialPromptViaArgs is true', () => {
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
   });
+
+  it('declares maxInitialPromptArgBytes to guard tmux command-too-long', () => {
+    // `--prompt` bakes the full first prompt into argv, same budget as OpenCode.
+    expect(adapter.maxInitialPromptArgBytes).toBe(8192);
+  });
 });
 
 describe('hermes buildArgs', () => {
@@ -3171,12 +3218,10 @@ describe('busyPattern', () => {
     //   spinner frames:  "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     //   working labels:  "Working…", "Thinking…", "Pondering…",
     //                    "Working it out…" (full rotation in traex.ts)
-    //   queue strings:   "Queued for capacity",
+    //   queue strings:   "Queued for capacity", "Queued for next turn",
     //                    "Too many requests right now. You're in the queue."
     //   idle composer:   "Ask TraeCode CLI to do anything" + "100% context left"
-    // TraeX forked from Codex and DELETED the "esc to interrupt" footer hint
-    // (0 hits across all releases + the 94MB TUI logs), so the Codex
-    // pattern's second anchor is invalid here.
+    // TraeX 0.207.x also restored the line-anchored "esc to interrupt" hint.
     const busy = createTraexAdapter('/bin/traex').busyPattern;
     expect(busy).toBeDefined();
     // Spinner-anchored working labels: "<braille frame> <label>".
@@ -3188,6 +3233,7 @@ describe('busyPattern', () => {
     // braille frame in front of the label, and the label is part of the
     // compiled-in spinner string table.
     expect(busy!.test('⠋ Queued for capacity')).toBe(true);
+    expect(busy!.test('⠋ Queued for next turn')).toBe(true);
     // Standalone capacity-queue strings — the queue screen may render
     // statically (no animating spinner), so no frame anchor is required.
     // Line-anchored: bare line, indented line, and `at position N` suffix
@@ -3195,12 +3241,15 @@ describe('busyPattern', () => {
     expect(busy!.test('Queued for capacity')).toBe(true);
     expect(busy!.test('  Queued for capacity')).toBe(true);
     expect(busy!.test('Queued for capacity at position 3.')).toBe(true);
+    expect(busy!.test('Queued for next turn')).toBe(true);
+    expect(busy!.test('  esc to interrupt')).toBe(true);
     expect(busy!.test("Too many requests right now. You're in the queue.")).toBe(true);
     expect(busy!.test("Too many requests right now. You're in the queue at position 3.")).toBe(true);
     // Mid-sentence prose quotes must NOT match — the line anchor is the
     // discriminator for the standalone arms (the braille frame for the
     // spinner arms).
     expect(busy!.test('The status line says Queued for capacity right now')).toBe(false);
+    expect(busy!.test('The status line says Queued for next turn right now')).toBe(false);
     expect(busy!.test("It printed Too many requests right now. You're in the queue. and stopped")).toBe(false);
     // Idle composer must NOT match.
     expect(busy!.test('› Ask TraeCode CLI to do anything                        100% context left')).toBe(false);
@@ -3222,10 +3271,13 @@ describe('busyPattern', () => {
     expect(staticBusy!.test('  Queued for capacity')).toBe(true);
     expect(staticBusy!.test('Queued for capacity at position 3.')).toBe(true);
     expect(staticBusy!.test('⠋ Queued for capacity')).toBe(true);
+    expect(staticBusy!.test('Queued for next turn')).toBe(true);
+    expect(staticBusy!.test('esc to interrupt')).toBe(true);
     expect(staticBusy!.test("Too many requests right now. You're in the queue.")).toBe(true);
     expect(staticBusy!.test("Too many requests right now. You're in the queue at position 3.")).toBe(true);
     // Mid-sentence prose quotes must NOT latch.
     expect(staticBusy!.test('The status line says Queued for capacity right now')).toBe(false);
+    expect(staticBusy!.test('The status line says Queued for next turn right now')).toBe(false);
     expect(staticBusy!.test("It printed Too many requests right now. You're in the queue. and stopped")).toBe(false);
     // Idle composer must NOT latch.
     expect(staticBusy!.test('› Ask TraeCode CLI to do anything                        100% context left')).toBe(false);
@@ -3331,7 +3383,9 @@ describe('readyPattern', () => {
     // on this opt-in being present, so pin it (the worker reads it === true).
     const adapter = createTraexAdapter('/bin/traex');
     expect(adapter.deferFirstPromptTimeoutUntilReady).toBe(true);
-    expect(adapter.supportsTypeAhead).toBe(true);
+    expect(adapter.supportsTypeAhead).toBe(false);
+    expect(adapter.postTerminalPromptFence).toBe(true);
+    expect(adapter.quarantineUnconfirmedSubmits).toBe(true);
   });
 
   it('hermes defers the first-prompt timeout without type-ahead', () => {
@@ -3898,6 +3952,8 @@ describe('grok buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: sid, resume: false, initialPrompt: 'hello grok' });
     expect(args[args.length - 1]).toBe('hello grok');
     expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    // Tighter than 8192: `--rules` is already in the tmux command.
+    expect(adapter.maxInitialPromptArgBytes).toBe(4096);
   });
 
   it('resumes with --resume using resumeSessionId when available', () => {

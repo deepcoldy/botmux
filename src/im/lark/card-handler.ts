@@ -100,7 +100,7 @@ import { buildTurnContinuePrompt } from '../../services/turn-failure-notice.js';
 import { loadFrozenCards, saveFrozenCards } from '../../services/frozen-card-store.js';
 import { resumeStartsFresh } from '../../services/resume-fresh-policy.js';
 import { cliHasNoRawPassthroughSurface } from '../../core/passthrough-commands.js';
-import { forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, canCommitStreamingCardPublication, continuePublishedStreamingCardPinChain, idleCardLabel, dshRuntimeForSession, postFreshStreamingCard, type WorkerSessionReplyOptions } from '../../core/worker-pool.js';
+import { setSessionReasoningEffort, forkWorker, sendWorkerInput, sendWorkerSessionInput, killWorker, closeSession as closeWorkerPoolSession, teardownAuthoritativePersistentBackingBeforeClose, scheduleCardPatch, parkStreamCard, clearUsageLimitState, cardUsageLimit, writableTerminalLinkFor, workerHasInitialized, sessionSupportsWebTerminal, readableTerminalUrlFor, resolvePrivateCardAudience, deliverWriteLinkCard, deliverEphemeralOrReply, CARD_POSTING_SENTINEL, requestSessionRestart, isSessionTransferring, getDaemonStreamingCardUsageSnapshot, withActiveSessionKeyLock, buildStreamingCardJson, canCommitStreamingCardPublication, continuePublishedStreamingCardPinChain, idleCardLabel, dshRuntimeForSession, type WorkerSessionReplyOptions, postFreshStreamingCard } from '../../core/worker-pool.js';
 import { reconcileResumedStreamingCard } from '../../core/resume-streaming-card.js';
 import { getSessionWorkingDir, buildNewTopicCliInput, getAvailableBots, persistStreamCardState, resumeSession, rememberLastCliInput, ensureSessionWhiteboard } from '../../core/session-manager.js';
 import { markInitialUserTurnPending } from '../../core/initial-user-turn.js';
@@ -131,7 +131,7 @@ import {
 } from '../../services/local-cli-opener.js';
 import { hasProtectedSessionMutationOwnership } from '../../core/session-mutation-guard.js';
 import { persistPendingRepoCardMessageId } from '../../core/pending-repo-journal.js';
-import { runDetachedBotTurnAdmission, withBotTurnAdmission, withBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
+import { runDetachedBotTurnAdmission, withBotTurnAdmission, withBotTurnMutation, tryWithBotTurnMutation } from '../../core/bot-turn-mutation-gate.js';
 import { isSharedAdoptSession } from '../../core/shared-adopt.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────
@@ -1060,7 +1060,13 @@ export async function runAutoWorktreeCommit(deps: {
     const error = e instanceof Error ? e.message : String(e);
     logger.error(`[${tag(ds)}] auto-worktree commit failed (session recoverable on next message): ${error}`);
     if (force && ds.pendingRepo) {
-      await notify(`⚠️ worktree 创建失败，任务仍在等待中。可发送 \`/tw\` 重试，或发送 \`/repo\` 选择/直接启动仓库。\n${error}`);
+      // 显式 worktree（`/tw` 或头部 `/repo wt`）失败 fail closed：会话停在 pendingRepo，而这条
+      // 路径从没发过选仓卡，所以把下一步说清楚——在话题内发 `/repo …` 选仓即可，消息已暂存。
+      // （不提示「重发 /tw」：thread 入口不识别生命周期别名，那样发会被当普通输入暂存。）
+      try {
+        await notify(t('cmd.repo.worktree_failed', { error }, localeForBot(larkAppId)));
+        await notify(t('daemon.choose_repo_no_card', undefined, localeForBot(larkAppId)));
+      } catch { /* best-effort */ }
     }
   } finally {
     ds.worktreeCreating = false;
@@ -2426,7 +2432,7 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
     );
   }
 
-  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'retry_turn', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'stop_turn', 'compact_session', 'quote_confirm'].includes(value.action);
+  const isSensitive = value?.action && ['restart', 'close', 'resume', 'skip_repo', 'repo_manual_submit', 'repo_worktree_submit', 'worktree_toggle_mode', 'retry_last_task', 'retry_turn', 'get_write_link', 'open_local_terminal', 'open_local_cli', 'toggle_stream', 'toggle_display', 'export_text', 'term_action', 'refresh_screenshot', 'takeover', 'disconnect', 'tui_keys', 'tui_text_input', 'wf_approve', 'wf_reject', 'wf_cancel', 'stop_turn', 'compact_session', 'quote_confirm', 'set_reasoning_effort'].includes(value.action);
   if (isSensitive) {
     const rootId = value?.root_id;
     // activeSessions is keyed by sessionKey(anchor, larkAppId) — `${anchor}::${larkAppId}`
@@ -2896,6 +2902,34 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
       return { toast: { type: 'success', content: t('card.voice.toast_wait', undefined, locDs) } };
     }
 
+    if (actionType === 'set_reasoning_effort') {
+      const loc = localeForBot(ds?.larkAppId ?? larkAppId);
+      const warning = (key: string) => ({
+        toast: { type: 'warning', content: t(key, undefined, loc) },
+        // A rejected dropdown selection must not keep displaying the unsaved value.
+        ...(ds && ds.streamCardId === cardMessageId ? {
+          card: { type: 'raw' as const, data: JSON.parse(buildStreamingCardJson(ds, ds.session.suspendedColdResume ? 'idle' : undefined)) },
+        } : {}),
+      });
+      if (!ds || !operatorOpenId || !canOperate(ds.larkAppId, ds.chatId, operatorOpenId)) {
+        return warning('card.effort.unavailable');
+      }
+      const mutation = await tryWithBotTurnMutation(ds.larkAppId, 1000, () => {
+        const current = getSessionByActionValue(activeSessions, rootId, ds.larkAppId, value.session_id, actionType);
+        if (current !== ds || value.session_id !== ds.session.sessionId
+          || !cardMessageId || cardMessageId !== ds.streamCardId
+          || value.card_nonce !== ds.streamCardNonce
+          || value.expected_effort !== (ds.session.reasoningEffort ?? '')) return 'stale' as const;
+        return setSessionReasoningEffort(ds, data.action?.option);
+      });
+      if (!mutation.acquired) return warning('card.effort.busy');
+      if (mutation.value !== 'saved') return warning(`card.effort.${mutation.value}`);
+      return {
+        toast: { type: 'success', content: t('card.effort.saved', undefined, loc) },
+        card: { type: 'raw' as const, data: JSON.parse(buildStreamingCardJson(ds, ds.session.suspendedColdResume ? 'idle' : undefined)) },
+      };
+    }
+
     if (actionType === 'restart' && ds) {
       // Adopt sessions: hard-reject. botmux never owned the user's CLI;
       // restarting would mean killing their tmux pane / Claude process,
@@ -3041,7 +3075,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           // SIGKILL backstop, which blows past Lark's ~3s card-ACK window and
           // surfaces the client-side "code: 300000" toast. The logical close is
           // synchronous; the worker is killed in the background.
-          closeResult = await closeWorkerPoolSession(targetSessionId, { awaitWorkerExit: false });
+          closeResult = await closeWorkerPoolSession(targetSessionId, {
+            awaitWorkerExit: false,
+            cardVisibility: value?.visibility === 'private' ? 'private' : 'public',
+          });
         } catch (err) {
           logger.error(`[${tag(current)}] Refused close because backing teardown was not verified: ${err}`);
           return { status: 'teardown_failed' as const, err };
@@ -3148,9 +3185,11 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           // the adapter can only resume a precise cliSessionId and none was
           // persisted, the next spawn starts a FRESH session — say so instead
           // of claiming history is back.
-          const resumeMsg = resumeStartsFresh(result.ds.session)
-            ? t('card.action.resume_success_fresh', { cliName }, localeForBot(result.ds.larkAppId))
-            : t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
+          const resumeMsg = result.recoveryPending
+            ? t('card.action.resume_started_remote', { cliName }, localeForBot(result.ds.larkAppId))
+            : resumeStartsFresh(result.ds.session)
+              ? t('card.action.resume_success_fresh', { cliName }, localeForBot(result.ds.larkAppId))
+              : t('card.action.resume_success', { cliName }, localeForBot(result.ds.larkAppId));
           // Restore the ORIGINAL live streaming card (🖥️ header + usage line +
           // 显示输出/终端/操作链接/关闭会话) as a WITHDRAW-then-REPOST when live
           // cards are enabled. Card-off bots only withdraw the stale closed card
@@ -3213,6 +3252,10 @@ export async function handleCardAction(data: CardActionData, deps: CardHandlerDe
           await sessionReply(rootId, t('card.action.resume_deferred_unmaterialized', undefined, locDsResume));
         } else if (result.error === 'resume_cancelled') {
           await sessionReply(rootId, t('card.action.resume_cancelled', undefined, locDsResume));
+        } else if (result.error === 'resume_start_failed') {
+          await sessionReply(rootId, t('card.action.resume_start_failed', undefined, locDsResume));
+        } else if (result.error === 'resume_reconciliation_required') {
+          await sessionReply(rootId, t('card.action.resume_reconciliation_required', undefined, locDsResume));
         }
       }
     }

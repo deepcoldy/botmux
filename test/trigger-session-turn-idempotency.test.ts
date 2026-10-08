@@ -92,6 +92,10 @@ import { triggerSessionTurn, reconcileIdempotencyLeasesOnBoot, convergeIdempoten
 import * as asyncTriggerStore from '../src/services/async-trigger-store.js';
 import * as idempotencyStore from '../src/services/idempotency-store.js';
 import { sessionKey } from '../src/core/types.js';
+import { commitTriggerStreamingCard } from '../src/core/trigger-streaming-card.js';
+import { resolveSessionReplyTarget } from '../src/core/reply-target.js';
+import * as sessionStore from '../src/services/session-store.js';
+import { config } from '../src/config.js';
 
 const APP = 'local_riff';
 const SID = 'sess_existing';
@@ -140,6 +144,7 @@ beforeEach(() => {
   mockGetBot.mockImplementation(() => ({ config: { cliId: 'codex-app', apiOnly: true } }));
   forkShouldThrow = false; sendShouldRefuse = false; queuedActivationGateActive = false;
   mockForkWorker.mockClear(); mockSendWorkerInput.mockClear(); mockCloseSession.mockClear();
+  mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: true } });
 });
 afterEach(() => {
   if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR; else process.env.SESSION_DATA_DIR = prevDataDir;
@@ -565,5 +570,138 @@ describe('turn-level idempotency — codex #818 P1 regressions', () => {
     expect(ds.idempotentAsyncTurns?.size ?? 0).toBe(0); // stale fault entry cleared
     expect(mockSendWorkerInput).not.toHaveBeenCalled();
     void realRFS;
+  });
+});
+
+
+describe('visible handoff dispatch to a reused session', () => {
+  it.each(['ordinary', 'async', 'suppressed', 'dormant'] as const)(
+    '%s dispatch commits the card using the actual worker input id', async mode => {
+      mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: false } });
+      const chatId = 'oc_handoff';
+      const ds = existingDs({ chatId, worker: mode === 'dormant' ? null : { killed: false, send: vi.fn() } as any });
+      ds.session.chatId = chatId;
+      const req = followUpReq(undefined);
+      req.options = mode === 'async' ? { asyncReturnSessionId: true }
+        : mode === 'suppressed' ? { suppressFinalOutput: true } : undefined;
+      req.presentation = { liveCard: 'on-start', title: '接手任务' };
+      const res = await triggerSessionTurn(req, { larkAppId: APP,
+        activeSessions: new Map([[sessionKey(chatId, APP), ds]]) });
+      expect(res.ok).toBe(true);
+      const turnId = mode === 'dormant' ? mockForkWorker.mock.calls[0][2].turnId
+        : mockSendWorkerInput.mock.calls[0][2];
+      expect(turnId).toBe(res.triggerId);
+      const start = vi.fn();
+      expect(start).not.toHaveBeenCalled();
+      expect(commitTriggerStreamingCard(ds, turnId, start)).toBe(true);
+      expect(start).toHaveBeenCalledExactlyOnceWith(ds, '接手任务', turnId);
+      expect(commitTriggerStreamingCard(ds, turnId, start)).toBe(false);
+    });
+
+  it('leaves an ordinary input without handoff presentation unchanged', async () => {
+    mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: false } });
+    const ds = existingDs({ chatId: 'oc_handoff', worker: { killed: false, send: vi.fn() } as any });
+    ds.session.chatId = 'oc_handoff';
+    const req = followUpReq(undefined); req.options = undefined;
+    const res = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map([[sessionKey(ds.chatId, APP), ds]]) });
+    expect(res.ok).toBe(true);
+    expect(mockSendWorkerInput.mock.calls[0][2]).toBeUndefined();
+    expect(commitTriggerStreamingCard(ds, res.triggerId, vi.fn())).toBe(false);
+  });
+});
+
+describe('recovery thinking presentation', () => {
+  it('validates the explicit thinking option and retains normal requests', () => {
+    const req = followUpReq('presentation');
+    expect(validateTriggerRequest(req).ok).toBe(true);
+    expect(validateTriggerRequest({ ...req, presentation: { thinking: 'hidden' } }).ok).toBe(true);
+    expect(validateTriggerRequest({ ...req, presentation: { thinking: true } }).ok).toBe(false);
+  });
+
+  it('bounds restored hidden turns while recording the exact new worker input', async () => {
+    const ds = existingDs({ worker: { killed: false, send: vi.fn() } as any });
+    ds.session.hiddenThinkingTurns = Array.from({ length: 256 }, (_, i) => `old_${i}`);
+    const req = followUpReq(undefined);
+    req.presentation = { thinking: 'hidden' };
+    const res = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: activeWith(ds) });
+    expect(res.ok).toBe(true);
+    expect(ds.session.hiddenThinkingTurns).toHaveLength(256);
+    expect(ds.session.hiddenThinkingTurns).not.toContain('old_0');
+    expect(ds.session.hiddenThinkingTurns.at(-1)).toBe(res.triggerId);
+    expect(mockSendWorkerInput.mock.calls.at(-1)?.[2]).toBe(res.triggerId);
+  });
+
+  it.each([true, false])('preserves async receipts and ordinary turns with live worker=%s', async live => {
+    const ds = existingDs({ worker: live ? { killed: false, send: vi.fn() } as any : null });
+    const active = activeWith(ds);
+    const req = followUpReq('hidden-recovery'); req.presentation = { thinking: 'hidden' };
+    const first = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(first.ok).toBe(true);
+    expect(ds.session.hiddenThinkingTurns).toEqual([first.triggerId]);
+    expect(ds.asyncTriggerResults?.has(first.triggerId!)).toBe(true);
+    const repeated = await triggerSessionTurn(req, { larkAppId: APP, activeSessions: active });
+    expect(repeated.triggerId).toBe(first.triggerId);
+    expect(ds.session.hiddenThinkingTurns).toEqual([first.triggerId]);
+    const normal = await triggerSessionTurn(followUpReq('normal'), { larkAppId: APP, activeSessions: active });
+    expect(normal.ok).toBe(true);
+    expect(ds.session.hiddenThinkingTurns).not.toContain(normal.triggerId);
+    expect(ds.suppressedTriggerFinalTurns?.has(first.triggerId!)).not.toBe(true);
+  });
+});
+
+
+describe('exact trigger presentation keeps the persisted reply destination', () => {
+  const cases = [true, false].flatMap(live => ['ordinary', 'wait', 'async'].flatMap(mode =>
+    ['live', 'hidden', 'both', 'suppressed', 'plain', 'default'].map(presentation => ({ live, mode, presentation }))));
+  it.each(cases)('$mode / $presentation / live=$live', async ({ live, mode, presentation }) => {
+    const nativeStore = await vi.importActual<typeof import('../src/services/session-store.js')>('../src/services/session-store.js');
+    const previousDir = config.session.dataDir;
+    config.session.dataDir = tempDir;
+    nativeStore.init(APP);
+    vi.mocked(sessionStore.updateSession).mockImplementation(nativeStore.updateSession);
+    const ds = existingDs({ chatId: 'oc_shared', worker: live ? { killed: false, send: vi.fn() } as any : null });
+    ds.session.chatId = ds.chatId;
+    if (presentation !== 'plain') ds.session.currentReplyTarget = ds.currentReplyTarget = {
+      turnId: 'om_origin', rootMessageId: 'om_shared', updatedAt: new Date().toISOString(),
+    };
+    mockGetBot.mockReturnValue({ config: { cliId: 'codex-app', apiOnly: false } });
+    const req = followUpReq(undefined);
+    req.options = mode === 'wait' ? { waitForFinalOutput: true } : mode === 'async' ? { asyncReturnSessionId: true } : {};
+    if (presentation !== 'default') req.presentation = presentation === 'hidden' ? { thinking: 'hidden' }
+      : presentation === 'both' ? { thinking: 'hidden', liveCard: 'on-start' } : { liveCard: 'on-start' };
+    if (presentation === 'suppressed') req.options.suppressFinalOutput = true;
+    try {
+      const pending = triggerSessionTurn(req, { larkAppId: APP, activeSessions: new Map([[sessionKey(ds.chatId, APP), ds]]) });
+      if (mode === 'wait') {
+        await vi.waitFor(() => expect(ds.pendingWaitPromises?.size).toBe(1));
+        for (const waiter of ds.pendingWaitPromises!.values()) waiter.resolve('HTTP result');
+      }
+      const result = await pending;
+      expect(result.ok).toBe(true);
+      const input = live ? mockSendWorkerInput.mock.calls[0][2] : mockForkWorker.mock.calls[0][2];
+      const turnId = typeof input === 'string' ? input : input?.turnId;
+      if (mode === 'ordinary' && presentation === 'default' && live) {
+        expect(turnId).toBeUndefined();
+        expect(ds.session.replyTargets).toBeUndefined();
+        return;
+      }
+      expect(turnId).toBe(result.triggerId);
+      const expected = presentation === 'plain' ? { mode: 'plain', chatId: ds.chatId }
+        : { mode: 'thread', rootMessageId: 'om_shared' };
+      expect(resolveSessionReplyTarget(ds, turnId)).toEqual(expected);
+      // Reopen SQLite to prove the standalone sender sees the same exact-turn anchor.
+      nativeStore.init(APP);
+      const persisted = nativeStore.getOwnedSession(ds.session.sessionId)!;
+      expect(persisted).toBeDefined();
+      expect(resolveSessionReplyTarget({ ...ds, currentReplyTarget: undefined, session: persisted }, turnId)).toEqual(expected);
+      expect(persisted.hiddenThinkingTurns?.includes(turnId)).toBe(['hidden', 'both'].includes(presentation) ? true : undefined);
+      expect(ds.suppressedTriggerFinalTurns?.has(turnId) === true).toBe(presentation === 'suppressed' && mode === 'ordinary');
+      if (mode === 'wait') expect(result.output?.content).toBe('HTTP result');
+      if (mode === 'async') expect(ds.asyncTriggerResults?.has(turnId)).toBe(true);
+    } finally {
+      vi.mocked(sessionStore.updateSession).mockReset();
+      nativeStore.init(APP, { owner: false });
+      config.session.dataDir = previousDir;
+    }
   });
 });

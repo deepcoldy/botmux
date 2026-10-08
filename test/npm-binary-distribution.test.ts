@@ -135,6 +135,8 @@ describe('package.json — lockfile safety and packaging', () => {
       expect(paths, `${entry} must not ship: it imports node-pty, which is not a dependency`).not.toContain(entry);
     }
     expect(paths.filter(p => p.startsWith('dist/'))).toEqual([]);
+    expect(paths.filter(p => p.startsWith('public-api/'))).toEqual([]);
+    expect(manifest.exports).toBeUndefined();
     // The pm2 ecosystem file names dist/index-daemon.js as its `script`. Nothing in
     // the source tree reads it (the supervisor replaced pm2), so its only remaining
     // effect is telling a human to start the broken form by hand.

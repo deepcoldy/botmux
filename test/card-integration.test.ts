@@ -141,7 +141,7 @@ vi.mock('../src/core/worker-pool.js', async (importOriginal) => {
   const orig = await importOriginal<typeof import('../src/core/worker-pool.js')>();
   return {
     ...orig,
-    closeSession: vi.fn((sessionId: string) => orig.closeSession(sessionId)),
+    closeSession: vi.fn((...args: Parameters<typeof orig.closeSession>) => orig.closeSession(...args)),
     forkWorker: vi.fn(),
     killWorker: vi.fn(),
     initWorkerPool: vi.fn(),
@@ -797,6 +797,7 @@ describe('Card integration: full event flow', () => {
       } as any);
       try {
         const ds = makeDaemonSession();
+        ds.streamCardId = 'om_live';
         const sessions = new Map<string, DaemonSession>();
         const sKey = activeSessionKey(ds);
         sessions.set(sKey, ds);
@@ -823,6 +824,7 @@ describe('Card integration: full event flow', () => {
           (c: any[]) => typeof c[1] === 'string' && c[1].includes('"type":"closed"'),
         );
         expect(groupClosed).toBeUndefined();
+        expect(fakeLark.patches).toHaveLength(0);
       } finally {
         vi.mocked(botRegMod.getBot).mockReturnValue({
           config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },
@@ -848,6 +850,7 @@ describe('Card integration: full event flow', () => {
       } as any);
       try {
         const ds = makeDaemonSession();
+        ds.streamCardId = 'om_live';
         const sessions = new Map<string, DaemonSession>();
         const sKey = activeSessionKey(ds);
         sessions.set(sKey, ds);
@@ -873,6 +876,7 @@ describe('Card integration: full event flow', () => {
           (c: any[]) => typeof c[1] === 'string' && c[1].includes('"type":"closed"'),
         );
         expect(groupClosed).toBeUndefined();
+        expect(fakeLark.patches).toHaveLength(0);
       } finally {
         vi.mocked(botRegMod.getBot).mockReturnValue({
           config: { larkAppId: 'app_test', larkAppSecret: 'secret', cliId: 'claude-code' },

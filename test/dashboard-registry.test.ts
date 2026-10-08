@@ -33,6 +33,22 @@ describe('DaemonRegistry', () => {
     expect(reg.getByAppId('appA')?.ipcPort).toBe(7892);
     expect(reg.getByAppId('appA')?.bootInstanceId).toBe(bootInstanceId);
     expect(reg.getByAppId('appA')?.workflowIpcProtocol).toBe('v1');
+    expect(reg.getByAppId('appA')?.sessionStoreProtocol).toBeUndefined();
+    expect(reg.getByAppId('appA')?.botmuxVersion).toBeUndefined();
+    reg.stop();
+  });
+
+  it('copies sessionStoreProtocol and botmuxVersion from a fresh descriptor', async () => {
+    writeFileSync(join(dir, 'appA.json'), JSON.stringify({
+      larkAppId: 'appA', botName: 'appA', botIndex: 0, ipcPort: 7892,
+      pid: 1, startedAt: Date.now(), lastHeartbeat: Date.now(),
+      sessionStoreProtocol: 'occupancy-v1',
+      botmuxVersion: '3.20.0',
+    }));
+    const reg = new DaemonRegistry(dir);
+    await reg.start();
+    expect(reg.getByAppId('appA')?.sessionStoreProtocol).toBe('occupancy-v1');
+    expect(reg.getByAppId('appA')?.botmuxVersion).toBe('3.20.0');
     reg.stop();
   });
 

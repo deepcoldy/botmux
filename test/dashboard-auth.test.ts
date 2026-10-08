@@ -875,14 +875,11 @@ describe('decideDashboardAuth — protected surface', () => {
   });
 
   it('GET /api/schedules/:id/logs without token → deny401', () => {
-    const d = decideDashboardAuth({
-      method: 'GET',
-      pathname: '/api/schedules/sched-1/logs',
-      hasTokenParam: false,
-      presentedToken: undefined,
-      activeToken: TOK,
-    });
-    expect(d.kind).toBe('deny401');
+    for (const pathname of ['/api/schedules/sched-1/logs', '/api/schedules/calendars']) {
+      const d = decideDashboardAuth({ method: 'GET', pathname, hasTokenParam: false,
+        presentedToken: undefined, activeToken: TOK });
+      expect(d.kind).toBe('deny401');
+    }
   });
 
   it('GET /api/v3 run list/detail without token → deny401', () => {

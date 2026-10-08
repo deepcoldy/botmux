@@ -40,6 +40,7 @@ describe('buildDocCommentPrompt', () => {
     expect(prompt).toContain('这个结论有什么依据');
     expect(prompt).toContain('先使用当前可用的飞书文档工具');
     expect(prompt).toContain('不要调用文档评论、回复或 reaction API');
+    expect(prompt).toContain('botmux send --response-kind final');
     expect(prompt).toContain('默认进入“仅文档”模式');
     expect(prompt).toContain('不要读取或引用本机上的其它项目');
   });
@@ -56,6 +57,7 @@ describe('buildDocCommentPrompt', () => {
 
     expect(prompt).toContain('https://larksuite.com/sheet/sheet_token');
     expect(prompt).toContain('Answer the current comment using the document as the primary context.');
+    expect(prompt).toContain('botmux send --response-kind final');
   });
 });
 
@@ -89,6 +91,7 @@ describe('clean Codex App document-comment input', () => {
 
     expect(application).toContain('Botmux 文档评论轮次规则');
     expect(application).toContain('原评论串投递和表情由 Botmux 统一负责');
+    expect(application).toContain('botmux send --response-kind final');
     expect(application).not.toContain(promptInput.question);
     expect(message).toContain('https://feishu.cn/docx/doc_clean_123');
     expect(message).toContain(promptInput.selectedText);

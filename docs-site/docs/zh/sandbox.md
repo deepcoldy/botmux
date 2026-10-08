@@ -102,6 +102,133 @@
 
 会添加 `--unshare-net`，让 CLI 在无宿主网络的命名空间里运行。这个开关很硬：模型/API 访问、包管理器、git remote、代理都可能不可用，除非该 CLI 能完全依赖已经挂载好的本地输入工作。
 
+## 分区目标 IP 网络策略（显式启用）
+
+`sandboxNetworkPolicy` 将公网与内网分开管理。未配置时，`sandboxNetwork` 布尔值和历史会话行为保持不变；显式策略优先于该布尔值。新策略仅适用于 **Linux x64/arm64、本地 PTY、oncall 文件沙箱**。Docker 容器还必须允许创建用户/网络/PID 命名空间及命名空间内 nftables。macOS、scratch、持久终端、远程后端、adopt 和外部 App Server 均拒绝启动，不能给已有进程补装边界。**这是策略支持范围，不等于部署运行器已验收；standalone Bun + 原生 Codex 必须先通过下述新建/恢复模型回合验收，不能只因网络测试通过就迁移现有 tmux 部署。**
+
+```json
+{
+  "sandbox": true,
+  "backendType": "pty",
+  "sandboxNetworkPolicy": {
+    "version": 1,
+    "public": { "mode": "allow" },
+    "private": {
+      "mode": "allowlist",
+      "rules": [{ "cidr": "10.20.0.0/16", "protocol": "tcp", "ports": [443] }]
+    },
+    "dnsServers": ["1.1.1.1"]
+  }
+}
+```
+
+| 模式 | 行为 |
+|---|---|
+| `allow` | 放行该区域全部目标地址 |
+| `block` | 阻断该区域全部目标地址 |
+| `allowlist` | 仅放行任一规则匹配的目标；空列表全部阻断 |
+| `denylist` | 阻断任一规则匹配的目标，其余放行；空列表全部放行 |
+
+两个区域可独立组合。先按实际目标地址分区，再执行该区域规则；规则之间为“任一匹配”，没有最长前缀覆盖或后项反转。跨区域 CIDR（如 `0.0.0.0/0`）只在所属区域内匹配。只接受 IP 和 CIDR，主机位会规范化；IPv4 映射 IPv6 地址与对应 IPv4 共用规则。规则省略 `protocol`/`ports` 时匹配全部协议/端口；`protocol` 仅接受 `tcp`/`udp`，`ports` 为 1–65535 整数列表，必须同时指定协议。域名、URL、通配符、端口范围及其它协议选择器会报错。
+
+“内网”采用保守的非公网分类：IPv4 的 RFC1918、回环、链路本地、CGNAT、未指定、文档/测试、保留、组播空间；IPv6 的 `2000::/3` 之外全部空间，以及 `2001::/23`、`2001:db8::/32`、`2002::/16`、`3fff::/20`。这包含 ULA、回环、链路本地、组播、IPv4 翻译/过渡地址。IPv4 的完整集合见 `src/core/sandbox-network-policy.ts` 的 `PRIVATE_V4`；此静态分类保守处理特殊用途，不实时推导路由或 DNS 后缀。
+
+执行边界是任务实际发出的 **IP 数据包目标地址**。nftables 安装在新的网络命名空间中，随后才用通用 `slirp4netns` 接通网络；不依赖 HTTP_PROXY，也不修改宿主防火墙、Docker 或任何代理产品配置。直接 socket、改写/删除代理变量、IPv4 映射地址均受同一规则约束；DNS 结果变化、HTTP 重定向到另一个地址会重新受目标规则约束。模型 API 需要的目标 CIDR、端口和 DNS 必须获准。
+
+该策略不解释加密流量或允许地址提供的应用功能。受限策略默认拒绝继承的 HTTP/HTTPS/ALL proxy 配置，环境变量不会被悄悄改写。可显式设置 `proxyMode: "trusted-egress"`，将代理后的业务目标控制委托给获准出口；`proxyMode: "reject"` 则明确拒绝这些代理环境变量，包括公网和内网全部放行的策略。字段缺省时保留原行为（两区均 `allow` 不拒绝代理）。
+
+**信任出口不等于限制代理后的目标**：内核仍过滤客户端实际连接的代理 IP/端口，未经授权的代理出口和直接内网连接继续被拒绝；但获准代理可以替客户端访问任何它能访问的地址，包括客户端策略禁止的内网。最终模型地址、域名、CONNECT/HTTP 请求及代理端 DNS 由部署层代理自身控制。本字段不创建代理、不填入环境变量、不修改具体代理产品配置，也不保证 CLI 会使用代理。`NO_PROXY` 和任务自行删改代理变量均不改变实际 IP 边界。
+
+例如，代理环境变量由部署层提供，Botmux 仅信任已批准的内网出口：
+
+```json
+{
+  "sandbox": true,
+  "backendType": "pty",
+  "sandboxNetworkPolicy": {
+    "version": 1,
+    "proxyMode": "trusted-egress",
+    "public": { "mode": "block" },
+    "private": {
+      "mode": "allowlist",
+      "rules": [{ "cidr": "10.20.0.10", "protocol": "tcp", "ports": [8080] }]
+    }
+  }
+}
+```
+
+示例只有代理端点可连接；如果代理域名需要客户端解析，应另外显式授权 DNS。代理必须是命名空间可路由的 IP，宿主 `127.0.0.1`、Unix socket 和 slirp 网关别名不能借此开放。要求最终业务目标也受约束时，必须先在部署层限制代理转发范围，或选择直接出口。
+
+命名空间自己的 `127.0.0.1`/`::1` 为本地进程通信保留，与宿主回环不同。宿主回环映射、转发器网关别名及宿主 DNS 转发始终关闭；IPv6 邻居发现只开放必要的链路控制报文。任务不能创建宿主 Unix socket，不能调用 setns/unshare 或 io_uring 绕过过滤，也没有网络管理能力；`socketpair` 等进程内部 IPC 保留。宿主 MCP Gateway/Unix IPC 无法同时兑现该边界时，启动会明确拒绝；文件 outbox 中转仍保留。
+
+`dnsServers` 是独立、显式的 DNS 能力：这些 IP 的 TCP/UDP 53 优先于区域规则放行，最多 8 个；不能使用回环或转发器别名。缺省为空，不委托宿主 DNS。DNS 服务收到查询本身属于获准访问；最终业务连接仍按解析出的实际地址过滤。阻断所有外部通信时不要配置此能力。
+
+需自行提供 iproute2 的 `ip`、`nft`、带 `--disable-host-loopback` 和 `--disable-dns` 的 `slirp4netns`，以及支持 `--disable-userns`/`--add-seccomp-fd` 的 bwrap。不会自动安装新网络工具。依赖缺失、命名空间/nft/转发器初始化失败均拒绝任务；转发器退出会终止该任务生命周期。无未过滤的回退路径。
+
+Dashboard 的安全页可保存 JSON 策略；状态表示“已配置，下个新会话采用”，不代表正在运行的会话已经切换。也可在宿主 CLI 使用：
+
+```bash
+botmux sandbox-network-policy check policy.json
+botmux sandbox-network-policy set <appId> policy.json
+botmux sandbox-network-policy clear <appId>
+```
+
+`set`/`clear` 经目标在线 daemon 的认证配置接口原子写入；沙箱/会话内不得修改宿主策略。IM 的 `/config sandboxNetworkPolicy <JSON>` 使用同一校验/持久化入口。策略深拷贝到会话和 workflow 快照，fork/重启/恢复继续使用原策略；编辑机器人配置只影响新会话。清除后新会话回到原 `sandboxNetwork` 行为。
+
+### 持久会话的兼容边界与迁移
+
+现有 tmux 会话不能通过填入新策略直接收紧。`TmuxBackend.spawn` 创建 pane 时由 tmux server 启动进程；恢复时只 attach 存活 pane，不重跑 CLI 的启动参数。当前 namespace/link 监督器随本地 PTY 的 worker 生命周期运行；worker 消失会关闭链路并终止任务，这与持久 pane 跨 worker 重启存活的约定不同。仅放开后端校验或保存一个 policy JSON，无法证明存活进程真的处于原边界中。因此本 PR 保持 tmux/zellij/herdr/zmx、adopt 和已有外部 App Server 的显式拒绝，不静默切换后端或取消策略。
+
+| 当前需要 | 可选择的迁移方式 | 实际结果 |
+|---|---|---|
+| 保留现有持久会话 | 暂不配置 `sandboxNetworkPolicy` | 保留旧运行方式；不能宣称已启用新边界 |
+| 计划启用客户端 IP 边界 | 先通过目标镜像的原生 PTY 新建/恢复模型回合验收，再配置 `backendType: "pty"` 与 `sandbox: true` 并创建新会话 | 运行器验收未完成前，不能建议现有部署切 PTY；边界随后在启动前建立 |
+| 已验收的 PTY 必须经部署层代理到模型服务 | 上述验收后的新会话 + 显式 `trusted-egress` + 代理实际 IP/端口规则 | 客户端出口受约束；代理后的业务目标由代理控制 |
+| 持久会话与最终代理目标都需限制 | 等待独立的持久边界支持，并部署代理自身 ACL | 本 PR 尚不能兑现；不移除拒绝门禁 |
+
+PTY 是当前新策略允许的后端，不代表 standalone Bun + 原生 Codex 的部署模型回合已经跑通；已有 tmux pane 也不能原地迁移。编辑 Bot 配置只作用于新会话，旧会话/fork/恢复仍使用冻结快照。CLI 自身持久化的历史恢复与 tmux 活进程恢复是两回事；启动新 CLI 恢复历史时仍须重新建立新边界。
+
+旧 Codex 会话还需单独验收实际工具目录。当前 `src/adapters/cli/codex.ts` 为新建会话传 `-C workingDir`，resume/fork 则复用不含 `-C` 的基础参数，可能继续使用 Codex 自己保存的原 cwd。只更新 BotConfig 或冻结 Session 的 `workingDir`，不能证明模型工具根目录已迁移。网络目标过滤本身不验证 cwd；与 oncall 文件边界、工作区根及工具上下文组合时，必须核对它们是否一致。
+
+迁移方报告曾以 Codex 0.159.3 原生 app-server `thread/resume` 的 `cwd` 参数完成一次性目录迁移：9 条旧 cwd 记录保留 transcript 前缀、模型、审批及 sandbox 参数，同一 Codex ID 冷恢复后的实际 Python 工具验证了新 cwd。这是外部实跑证据，本分支未执行该迁移，也不据此保证其它版本行为；本 PR 不修复 adapter、不自动改写 Codex 历史或在线部署。
+
+#### 部署前运行器验收（当前存在独立阻塞）
+
+迁移方报告了网络策略尚未参与的运行器失败：共享镜像中 Botmux 3.20.0 原生 Bun standalone + Codex 0.159.3，在 `sandbox: false`、`backendType: "pty"` 的新 HTTP virtual turn 中，`pty.spawn` 返回 PID 后约 15 ms 收到 `exitCode: 0 / signal: 1 (SIGHUP)`，输入尚未提交；相同参数经 Python PTY 启动 Codex 则保持存活。**这是迁移方的实跑报告，本 PR 未在同一镜像/版本组合独立复现，也没有修复或归因该运行器问题。** 短期保留原生 tmux，不以关闭网络策略或放宽权限冒充 PTY 兼容修复。
+
+另一个独立报告是 HTTP virtual/noTransport tmux 在无 server 时产生 `probe: unknown` 而被原生门禁拒绝。当前代码可验证：`worker.ts` 的 policy-off 迁移分支对 `noTransportSession && tmux` 生效，`unknown` 经状态机拒绝，不能当作已证明缺失而跳过；普通 transport-enabled、策略关闭且无旧 provenance 的会话不受这条 noTransport 分支约束（其它显式隔离或旧 provenance 仍可能触发门禁）。这不是新网络策略导致的失败，也不能推广为全部 tmux 会话不可用；本 PR 不绕过原门禁。
+
+现有网络 CI 的 PTY 用例用普通运行时管理真实 PTY，standalone 用例另行验证网络 runner 自重执行；两者组合不等于 standalone worker 的 Codex 回合测试。`test/pty-native-smoke.test.ts` / `src/cli/pty-smoke.ts` 还刻意不构建 `tty.ReadStream` 包装，不能代替生产 `PtyBackend` 的存活及提交验收。本 PR 的本地/内核绿不能解除上述部署阻塞。
+
+启用网络策略前，目标镜像必须完成以下前置验收并保存结果：
+
+1. 固定镜像及 Botmux/Bun/Codex 实际版本，使用原生 standalone worker 和生产 `PtyBackend`，不以 Python PTY、自定义 runtime 或绕过 ReadStream 的 helper 代替。先在 `sandbox: false` 下验证原生运行器，再在 oncall + 网络策略下验证。
+2. 新建会话须保持存活直到 prompt ready，实际提交输入并得到完整模型回合及可回读结果；记录 PID、ready/submit/response 时间及退出 code/signal。spawn 返回 PID、短暂存活或退出 0 均不构成成功。
+3. 恢复已保存的 Codex 历史，由新 worker/CLI 建立新 PTY 并完成下一模型回合；验证恢复身份、提交与结果回读。要求模型实际工具在未先执行 `cd`、未覆盖工具 cwd 的情况下回读 `pwd` 或 Python `os.getcwd()`，保存工具执行结果，按规范化路径核对预期工作根、Session 快照及文件策略根；不能只检查 Botmux JSON、模型文字回答或提示词。目录迁移还须确认原 Codex ID、transcript 前缀、模型/审批/sandbox 参数保持预期；cwd 不符时验收失败，目录修复作为独立迁移处理。PTY 不承诺活进程跨 worker 重启存活，不把它写成 tmux reattach。
+4. HTTP virtual/noTransport 与正常 transport 形状分别用隔离测试装配验收；IM 发送调用用测试替身拒绝并计数为 0，不发真实消息。模型可先使用协议兼容的本地 fixture，但须标明 fixture 与实际模型验收的区别；DNS、部署层代理及最终目标 ACL 应另行验证。
+5. 单独验证 tmux 无 server/探测 unknown 的失败与已有 server 的路径，保留 tri-state 门禁语义；不得通过把 unknown 强制当 missing 或改成虚假 transport-enabled 来消除阻塞。未通过时继续保留原 tmux 部署，将运行器和 noTransport 问题作为独立修复需求。
+
+后续持久后端需求应独立实现并验收：在启动 shell/CLI 前建立边界；为每代 pane/真实 CLI PID 绑定不可由任务改写的策略摘要、namespace 身份与监督器代际；daemon/worker 重启后核验这些证据及实际存活状态，缺失或不符时拒绝附着；由独立监督器管理 namespace/nft/link 的持久生命周期，转发器死亡必须终止关联任务；清理、pane 替换、并发恢复与 adopt 均不能复用过期证明。验收需真实 tmux、新建/重附着、worker/daemon 重启、转发器死亡、篡改/旧证明、跨会话与 IPv4/IPv6 回归，不能以存储字段或 session 名称代替边界证明。
+
+### 隔离 Linux 验证
+
+先 `bun run build`，然后在专用测试目录的外层网络命名空间中准备测试地址。网关测试在外层 loopback 的 `10.0.2.3` 及主机 loopback 地址监听服务，确保删除网关拒绝规则时能观察到实际连接。下面只修改新命名空间，不修改宿主网络：
+
+```bash
+unshare -Urn sh -c '
+  set -e
+  ip link set lo up
+  ip addr add 93.184.216.34/32 dev lo
+  ip addr add 10.77.0.1/32 dev lo
+  ip addr add 10.0.2.3/32 dev lo
+  ip -6 addr add 2606:4700::100/128 dev lo nodad
+  ip -6 addr add fd55::1/128 dev lo nodad
+  BOTMUX_NETWORK_POLICY_INTEGRATION=1 bun run test test/sandbox-network-linux.test.ts
+'
+```
+
+测试默认跳过；显式启用后，依赖或内核能力缺失会失败，不能把跳过当作边界验证通过。设置 `BOTMUX_NETWORK_TEST_BINARY` 为 `build:bun` 产物的绝对路径后，还会验证单文件自重执行；未设置时仅该编译态用例跳过。`Sandbox network boundary` CI 在相关 PR 中构建真实二进制并执行全部边界用例。模型请求用隔离 HTTP 测试服务，不调用真实供应商。
+
 ## 注意事项
 
 1. **仅 Linux**：依赖 bwrap + overlayfs（非 root 自动用 fuse-overlayfs，依赖开沙盒时自动装）；Mac（sandbox-exec）暂未支持。

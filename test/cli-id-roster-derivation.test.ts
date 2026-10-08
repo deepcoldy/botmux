@@ -72,9 +72,9 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
     // adapter classified 'global' turns this red.
     const EXPECTED: Readonly<Record<CliId, SkillInjectionSupport>> = {
       // per-session --plugin-dir (claude family, oh-my-pi) or --skill (pi)
-      'claude-code': 'dynamic', seed: 'dynamic', relay: 'dynamic', pi: 'dynamic', 'oh-my-pi': 'dynamic',
+      'claude-code': 'dynamic', seed: 'dynamic', relay: 'dynamic', pi: 'dynamic', 'oh-my-pi': 'dynamic', cursor: 'dynamic',
       // shared global skills dir → global|prompt|off all apply
-      coco: 'global', codex: 'global', cursor: 'global', gemini: 'global',
+      coco: 'global', codex: 'global', gemini: 'global',
       genius: 'global', opencode: 'global', mtr: 'global', traex: 'global',
       // Added by upstream #821; shares ~/.config/opencode/skills with opencode,
       // so the shared-root dedup below covers it.
@@ -89,6 +89,7 @@ describe('native skill discovery reaches every CLI that ships skills', () => {
       // PTY-driven TUI variant of dsh; no skills dir of its own.
       'dsh-tui': 'none',
       mira: 'none', mir: 'none', copilot: 'none', kimi: 'none', riff: 'none',
+      'remote-runner': 'none',
       // minimax: `mmx text repl` is a tool-less chat loop (no shell/file
       // surface, no skillsDir); classifier sees no skillsDir / pluginDir → 'none'.
       minimax: 'none',

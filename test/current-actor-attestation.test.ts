@@ -103,7 +103,11 @@ describe('daemon current actor attestation', () => {
       procRoot,
     })).resolves.toMatchObject({
       ok: true,
-      document: { actor: { email: 'current.user@example.com' } },
+      document: {
+        actor: { email: 'current.user@example.com' },
+        chatId: 'oc_chat',
+        turnId: 'om_turn',
+      },
     });
     expect(resolveIdentity).toHaveBeenCalledWith('cli_app', 'ou_current');
   });

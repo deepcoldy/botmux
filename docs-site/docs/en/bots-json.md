@@ -57,6 +57,7 @@ There are many fields, listed below grouped by purpose. The vast majority are **
 | `launchShell` | Shell used to launch the CLI, overriding the daemon's `$SHELL`: a shell name (`zsh` / `bash` / `fish` / `sh`) or an absolute path (e.g. `/usr/bin/zsh`). For when the login `$SHELL` (e.g. bash) has an rcfile that `exec`-trampolines into another shell (`exec zsh`), pre-empting the CLI under botmux's `bash -i` launch so the session never starts (bare-shell `parse error`) — pinning it launches under that shell directly, bypassing the skipped rcfile. **Note**: PATH / nvm / pnpm must then live in the chosen shell's rcfiles (e.g. `.zshrc` / `.zprofile`, or `~/.config/fish/config.fish` for fish). fish is a first-class launch shell: `launchShell: "fish"` and absolute fish paths (e.g. `/usr/bin/fish`) are supported, and the desktop PATH probe reads fish when `$SHELL` is fish, so fish users don't need to mirror PATH / env into `.bashrc` / `.zshrc`. Empty = use `$SHELL`. Takes effect next session for shell-wrapped persistent backends (`tmux` / `zellij` / `zmx`); `pty` execs the CLI directly and is unaffected. Also configurable in the dashboard ("Bot defaults → Launch shell") or via `/config launchShell <value>` |
 | `lang` | The bot's UI language, `zh` / `en`; leave empty to fall back to the `BOTMUX_LANG` / `LANG` environment variable |
 | `customPassthroughCommands` | On top of the fixed passthrough allowlist and the current CLI adapter's default-allowed commands, additionally pass through slash commands to the underlying CLI, e.g. `["/export"]` (Claude Code / Codex default-allow `/goal`). Auto-normalized (a missing `/` is added, lowercased, only `[a-z0-9:_-]` kept, deduplicated); entries that would shadow a botmux daemon command (e.g. `/status`) are dropped and have no effect even if configured. Use `/list-slash-command` to view the full allowlist. See [Slash commands](/en/slash-commands) |
+| `envPolicy` | Explicit process inheritance policy: inherit by default; strict retains only baseline, approved names and this bot env (see below). |
 | `env` | Per-bot process environment variables `{ "KEY": "value" }`, injected into this bot's CLI process. Most common use: run a bot on GLM / a third-party Anthropic·OpenAI-compatible provider (see example below); also handy for `HTTPS_PROXY` or a CLI feature flag. Values accept string / number / boolean; botmux-reserved keys (`BOTMUX_`, `LARK_APP_`, …) are ignored. Injected **per session** (effective from the next session), never written to the shared tmux server env, so it can't leak across bots. Also editable in the dashboard ("Bot defaults → Environment variables") |
 | `quotaFallbackBot` | Optional handoff after the CLI exhausts its quota: `{ "enabled": true, "targetAppId": "cli_...", "kinds"?: ["usage", "rate"], "message"?: "..." }`. Off by default; editable under Dashboard "Bot Configuration → Advanced." See below |
 | `codexAppCleanInput` | **Experimental**, and only effective for Botmux-managed sessions whose actual CLI is `codex-app`. When `true`, the visible / persisted text `UserMessage` contains only the user's original input while message-level Botmux context primarily moves to `additionalContext`. Defaults to off, takes effect on the next turn dispatch, and does not rewrite existing history. See details below |
@@ -141,7 +142,7 @@ Run one bot on a GLM Coding Plan (or any Anthropic-compatible provider) while an
 - For GLM in China, use `https://open.bigmodel.cn/api/anthropic` for `ANTHROPIC_BASE_URL`.
 - For an OpenAI-protocol CLI like Codex, set `OPENAI_BASE_URL` / `OPENAI_API_KEY` (the provider's OpenAI-compatible endpoint) instead of `ANTHROPIC_*`.
 - **Isolation**: env is injected per-session into the CLI process, consistently across backends (tmux / zellij inject it per-pane, never into the shared server env), so one bot's provider config can't leak into another's.
-- **Security**: values live in `bots.json` and the process environment in plaintext — not a secret vault; chat surfaces like `/config get` mask the values (the owner-authenticated dashboard editor shows real values).
+- **Security**: values live in `bots.json` and the process environment in plaintext — not a secret vault; chat configuration queries mask values and Dashboard returns names only.
 - Takes effect from the next **session**.
 
 ### Clean Codex App input (experimental)
@@ -431,3 +432,40 @@ The following fields are written by botmux itself and persisted into `bots.json`
 | `noCardChats` | The "don't send streaming cards in this group" list written by `/card off\|on` |
 
 > **Configuration precedence**: the `BOTS_CONFIG` environment variable → `~/.botmux/bots.json`. Run `botmux restart` after editing to take effect.
+
+
+### Strict process environment inheritance (opt in)
+
+![Dashboard strict inheritance and write-only environment example](/img/strict-env-policy-dashboard.png)
+
+Omit `envPolicy` or use `{ "mode": "inherit" }` to retain historical host inheritance and mandatory credential/session-marker filtering. Strict mode uses exact approved names:
+
+```json
+{
+  "envPolicy": { "mode": "strict", "inherit": ["HTTPS_PROXY", "NODE_EXTRA_CA_CERTS", "TOOLCHAIN_ROOT"] },
+  "env": { "OPENAI_API_KEY": "<this bot's model credential>" }
+}
+```
+
+The fixed baseline contains PATH, HOME, user identity, temporary directories, standard locale, terminal and XDG paths; see `src/core/env-policy.ts` for the complete list. `inherit` adds exact names without wildcards. Proxy, CA, toolchain and model-auth variables require explicit approval here or this bot's `env`. Configured `env` wins over inherited values and stays per child/pane. Botmux injects its own identity/control variables; reserved names including `BOTMUX*`, `__OWNER_OPEN_ID` and `CODEX_HOME` cannot be overridden or inherited as user grants. Non-reserved adapter variables such as `TRAE_HOME` and `CLI_EXTRA_ARGS` also require an explicit `inherit` grant or a value in this bot's `env`. Process-level `GROK_HOME`, `DSH_HOME` and `LARKSUITE_CLI_DATA_DIR` may be explicitly inherited. Mandatory sensitive-variable filtering remains enforced in strict mode.
+
+Set the policy in Dashboard under “Process environment inheritance”, with `botmux env-policy set '{"mode":"strict","inherit":["HTTPS_PROXY"]}'` with --bot to select the target bot, or `/botconfig set envPolicy {"mode":"strict"}`. Unset restores historical inheritance. Malformed policies, unknown fields and reserved names fail closed.
+
+**Combining network policies:** When using a version that provides `sandboxNetworkPolicy`, the `HTTPS_PROXY` example above must also satisfy this table. An exact environment grant controls whether a value reaches the CLI; it does not authorize network access or silently remove/rewrite a proxy.
+
+| Network configuration | HTTP/HTTPS/ALL proxy and lowercase equivalents |
+| --- | --- |
+| No network policy; or omitted `proxyMode` with both zones set to `allow` | No network-policy proxy rejection; strict mode still requires an `inherit` grant or this bot's explicit `env` |
+| Omitted `proxyMode` with either zone set to `block`, `allowlist` or `denylist` | Non-empty proxy values reject launch, including inherited and per-bot configured values |
+| `proxyMode: "reject"` | Non-empty proxy values reject launch even when both zones use `allow` |
+| `proxyMode: "trusted-egress"` | Explicitly granted proxies may remain; rules must permit the actual proxy endpoint IP/port; final model destinations, proxy DNS and CONNECT/HTTP rules belong to deployment-layer proxy ACLs |
+
+`trusted-egress` neither creates a proxy, grants environment variables nor guarantees the CLI uses it. Authorizing an exit does not restrict destinations behind it. If a model requires a proxy, do not simply remove its `inherit` grant to pass validation: explicitly trust the exit and configure endpoint rules plus deployment-layer ACLs, or first establish direct model authentication, permitted destination CIDRs/ports and DNS. Network policies still require Linux, a fresh local PTY and `sandbox: true` / `"oncall"`; persistent backends such as tmux, adopt and external App Servers remain rejected regardless of `trusted-egress` or `envPolicy`. See [network sandbox documentation](sandbox.md).
+
+Online changes apply on the next **worker cold start**. The offline terminal command updates bots.json; an already running daemon must be restarted to reload an offline edit. CLI restarts within a live worker retain its frozen policy. Persistent restore compares a secret-free policy fingerprint: absent, corrupt or mismatched strict generations must terminate with a confirmed missing probe before cold start; unconfirmed teardown refuses launch. Environment already read by a live CLI cannot be revoked through a hot update.
+
+Strict mode covers Botmux-owned PTY, tmux, tmux-pipe, zellij, zmx, local Codex/TraeX RPC App Servers and title subprocesses. tmux/zellij exec `/usr/bin/env -i` directly and skip `launchShell` profiles. zmx uses a fixed shell without user profiles and an empty-environment exec. Supply PATH/nvm/mise configuration explicitly. Shared-server globals are not cleared wholesale; existing mandatory sensitive-variable scrubbing still applies. Strict panes reset inherited environments and granted credentials never seed shared globals. Strict panes default to `TERM=xterm-256color` when it is absent and preserve explicitly configured values. v3 workflows freeze the secret-free policy and resolve per-bot env at execution time rather than persist credentials into bot snapshots.
+
+Herdr, Riff, Mojo, Forge launch mode, adopted processes and externally owned App Servers cannot currently establish this boundary, so strict mode refuses those paths. Shells/profiles deliberately invoked by a CLI, credential/config files, OS file permissions and cloud identities remain outside this feature. Per-bot CODEX_HOME, codexAuthSync and file sandbox behavior remain independent.
+
+Dashboard reads only configured names. Its env form is write-only: saving replaces the complete map and saving blank clears it. Strict sessions do not return credential-bearing reproduction commands. Diagnostics show names/policy only. Explicit bot values are still plaintext in bots.json and process environments; this is not a secret vault.

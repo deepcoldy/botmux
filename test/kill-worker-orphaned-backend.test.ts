@@ -171,7 +171,7 @@ describe('killStalePids — ZMX CLI-change cleanup', () => {
       expect(zmxKill).toHaveBeenCalledWith(EXPECTED_NAME, orphan.sessionId, undefined,
         expect.objectContaining({ ZMX_DIR: '/tmp/orphan-zmx' }));
     } finally {
-      sessionStore.init();
+      sessionStore.init('zmx-directory-cleanup-test');
       config.daemon.backendType = previousBackendType;
       if (previousDataDirEnv === undefined) delete process.env.SESSION_DATA_DIR;
       else process.env.SESSION_DATA_DIR = previousDataDirEnv;
@@ -221,7 +221,7 @@ describe('killStalePids — ZMX CLI-change cleanup', () => {
       expect(zmxKill).toHaveBeenCalledTimes(1);
       expect(zmxKill).toHaveBeenCalledWith(EXPECTED_NAME, SID);
     } finally {
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.daemon.cliId = previousCliId;
       config.daemon.backendType = previousBackendType;
       if (previousDataDirEnv === undefined) delete process.env.SESSION_DATA_DIR;
@@ -257,7 +257,7 @@ describe('killStalePids — ZMX CLI-change cleanup', () => {
       expect(zmxKill).toHaveBeenNthCalledWith(1, 'bmx-33333333', firstId);
       expect(zmxKill).toHaveBeenNthCalledWith(2, 'bmx-44444444', secondId);
     } finally {
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.daemon.cliId = previousCliId;
       config.daemon.backendType = previousBackendType;
       if (previousDataDirEnv === undefined) delete process.env.SESSION_DATA_DIR;
@@ -316,7 +316,7 @@ describe('killStalePids — ZMX CLI-change cleanup', () => {
       expect(zmxKill).toHaveBeenNthCalledWith(1, 'bmx-11111111', firstId);
       expect(zmxKill).toHaveBeenNthCalledWith(2, 'bmx-22222222', secondId);
     } finally {
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.daemon.cliId = previousCliId;
       config.daemon.backendType = previousBackendType;
       if (previousDataDirEnv === undefined) delete process.env.SESSION_DATA_DIR;
@@ -442,7 +442,7 @@ describe('killStalePids — shared Herdr orphan cleanup', () => {
       );
       expect(herdrKill).not.toHaveBeenCalledWith('botmux');
     } finally {
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.daemon.cliId = previousCliId;
       config.daemon.backendType = previousBackendType;
       if (previousDataDirEnv === undefined) delete process.env.SESSION_DATA_DIR;
@@ -511,7 +511,7 @@ describe('killStalePids — shared Herdr orphan cleanup', () => {
         ]),
       );
     } finally {
-      sessionStore.init();
+      sessionStore.init('test-app');
       config.daemon.cliId = previousCliId;
       config.daemon.backendType = previousBackendType;
       if (previousDataDirEnv === undefined) delete process.env.SESSION_DATA_DIR;

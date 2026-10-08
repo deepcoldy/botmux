@@ -90,14 +90,15 @@ describe('inspectSupervisorState', () => {
     expect(inspectSupervisorState(legacy, runtime('boot-a:123', '[ksoftirqd/9]'))).toEqual({ status: 'stale' });
   });
 
-  it('fails closed for old live state without enough process identity metadata', () => {
+  it('supports pre-identity state only when the live command is a built-in supervisor entry', () => {
     const malformed = { ...base, supervisorProcessStart: undefined, supervisorCommand: undefined, supervisorEntry: undefined };
-    expect(inspectSupervisorState(malformed, runtime('boot-a:123', '/opt/botmux __supervisor'))).toEqual({ status: 'unverifiable' });
+    expect(inspectSupervisorState(malformed, runtime('boot-a:123', '/opt/botmux __supervisor')).status).toBe('exact');
+    expect(inspectSupervisorState(malformed, runtime('boot-a:123', '/opt/other __daemon'))).toEqual({ status: 'stale' });
   });
 });
 
 describe('liveSupervisorTarget', () => {
-  it('fails closed on a live legacy pid with no supervisor identity metadata', () => {
+  it('migrates a pre-identity state row after attesting the built-in supervisor command', () => {
     const p = join(tmp(), 'fleet.json');
     writeFleetState(p, {
       supervisorPid: process.pid,
@@ -107,6 +108,27 @@ describe('liveSupervisorTarget', () => {
     const runtime = {
       readIdentity: () => 'boot-a:123',
       readCommandLine: () => '/opt/botmux __supervisor',
+      readPidNamespace: () => undefined,
+      pidExists: () => true,
+    };
+
+    expect(liveSupervisorTarget(p, runtime)).toEqual({
+      pid: process.pid,
+      processStart: 'boot-a:123',
+      commandLine: '/opt/botmux __supervisor',
+    });
+  });
+
+  it('still fails closed when a pre-identity supervisor command is unreadable', () => {
+    const p = join(tmp(), 'fleet.json');
+    writeFleetState(p, {
+      supervisorPid: process.pid,
+      supervisorStartedAt: 'T',
+      procs: [],
+    });
+    const runtime = {
+      readIdentity: () => 'boot-a:123',
+      readCommandLine: () => undefined,
       readPidNamespace: () => undefined,
       pidExists: () => true,
     };

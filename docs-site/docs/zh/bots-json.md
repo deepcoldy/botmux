@@ -57,6 +57,7 @@
 | `launchShell` | 启动 CLI 用的 shell，覆盖 daemon 的 `$SHELL`：填 shell 名（`zsh` / `bash` / `fish` / `sh`）或绝对路径（如 `/usr/bin/zsh`）。用于登录 `$SHELL`（如 bash）的 rc 文件里有 `exec zsh` 之类跳转、在 botmux 的 `bash -i` 启动里把 CLI 顶掉、导致会话起不来（裸壳里 `parse error`）的场景——指定后直接用它启动、绕开被跳过的 rc。**注意**：PATH / nvm / pnpm 等要放进所选 shell 的 rc（如 `.zshrc` / `.zprofile`，fish 用户写 `~/.config/fish/config.fish`）。fish 是一等启动 shell：`launchShell: "fish"` 和 fish 绝对路径（如 `/usr/bin/fish`）都支持，`$SHELL` 为 fish 时桌面 PATH 探测也会读 fish，所以 fish 用户无需把 PATH / 环境变量回填到 `.bashrc` / `.zshrc`。下个会话对需要 shell 包装的持久后端（`tmux` / `zellij` / `zmx`）生效；`pty` 直接 exec CLI，本就不受影响。也可在 dashboard「机器人默认设置 → 启动 Shell」或 `/config launchShell <值>` 配置 |
 | `lang` | 该 bot 的界面语言 `zh` / `en`；留空回落 `BOTMUX_LANG` / `LANG` 环境变量 |
 | `customPassthroughCommands` | 在固定透传白名单和当前 CLI adapter 默认放行命令之上，额外放行透传给底层 CLI 的 slash 命令，如 `["/export"]`（Claude Code / Codex 的 `/goal` 已默认放行）。自动归一化（缺失的 `/` 自动补、转小写、仅留 `[a-z0-9:_-]`、去重）；会遮蔽 botmux daemon 命令（如 `/status`）的项会被丢弃，配了也不生效。用 `/list-slash-command` 查看完整放行清单。见 [斜杠命令](/slash-commands) |
+| `envPolicy` | 显式进程继承策略：默认 inherit；strict 只保留运行基线、获准名称和本 bot env（见下文）。 |
 | `env` | 该 bot 的进程环境变量 `{ "KEY": "值" }`，注入到这个 bot 的 CLI 进程。最常见用途：让某个 bot 跑 GLM / 第三方 Anthropic·OpenAI 兼容服务商（见下方示例），也可设 `HTTPS_PROXY` 或 CLI 专属开关。值支持字符串 / 数字 / 布尔；`BOTMUX_` / `LARK_APP_` 等 botmux 保留键会被忽略。按**会话**注入（下个新会话生效），不写入共享 tmux server 全局、不会串到别的 bot。也可在 dashboard「机器人默认设置 → 环境变量」配置 |
 | `quotaFallbackBot` | CLI 额度耗尽后的可选自动交接：`{ "enabled": true, "targetAppId": "cli_...", "kinds"?: ["usage", "rate"], "message"?: "..." }`。默认关闭；可在 Dashboard「Bot 配置 → 高级」编辑。详见下方 |
 | `codexAppCleanInput` | **实验性**，且仅对 Botmux 托管、实际运行 `codex-app` 的 session 生效。设为 `true` 后，Codex App 的可见 / 持久化文本 `UserMessage` 只保留用户原始输入，消息级 Botmux 上下文主要改走 `additionalContext`；默认关闭，从下一次 turn 派发生效，不改已有历史。详见下方说明 |
@@ -145,7 +146,7 @@ Dashboard 保存后无需重启 daemon。模型、思考强度分别选择“继
 - GLM 国内站把 `ANTHROPIC_BASE_URL` 换成 `https://open.bigmodel.cn/api/anthropic`。
 - 给 Codex 这类 OpenAI 协议 CLI 接入时，填 `OPENAI_BASE_URL` / `OPENAI_API_KEY`（服务商的 OpenAI 兼容端点）而非 `ANTHROPIC_*`。
 - **隔离**：env 按会话注入到 CLI 进程，全后端一致（tmux / zellij 经每个 pane 注入，绝不写共享 server 全局），所以一个 bot 的服务商配置不会串到别的 bot。
-- **安全**：值以明文存在 `bots.json` 与进程环境，不是密钥保险箱；`/config get` 等聊天面会脱敏显示（dashboard 编辑器 owner 鉴权后显示原值）。
+- **安全**：值以明文存在 `bots.json` 与进程环境，不是密钥保险箱；聊天配置查询会脱敏显示，Dashboard 只回读变量名。
 - 改完下个**新会话**生效。
 
 ### Codex App 纯净输入（实验性）
@@ -442,3 +443,50 @@ Dashboard 的“会议角色预设”提供本地内置模板库，当前包含�
 | `noCardChats` | `/card off\|on` 写入的「该群不发流式卡片」名单 |
 
 > **配置优先级**：`BOTS_CONFIG` 环境变量 → `~/.botmux/bots.json`。改完跑 `botmux restart` 生效。
+
+
+### 严格进程环境继承（显式启用）
+
+![Dashboard 严格继承与只写环境配置示意](/img/strict-env-policy-dashboard.png)
+
+默认不填写 `envPolicy`，或设置 `{ "mode": "inherit" }`：继续继承宿主环境，并保留已有的飞书应用凭证、Dashboard H5、GitHub daemon token、Claude 会话标记等强制过滤。严格模式使用精确变量名白名单：
+
+```json
+{
+  "envPolicy": {
+    "mode": "strict",
+    "inherit": ["HTTPS_PROXY", "NODE_EXTRA_CA_CERTS", "TOOLCHAIN_ROOT"]
+  },
+  "env": { "OPENAI_API_KEY": "<本 bot 的模型凭证>" }
+}
+```
+
+| 层 | 规则 |
+| --- | --- |
+| 系统基线 | `PATH`、`HOME`、`USER`、`LOGNAME`、`SHELL`、临时目录、标准 locale、终端和 XDG 路径；完整固定列表见 `src/core/env-policy.ts` |
+| 额外继承 | `inherit` 仅填精确变量名，无通配符；未知宿主凭证不会自动继承。代理、CA、工具链和模型认证需要在这里获准或通过本 bot 的 `env` 配置 |
+| 本 bot 注入 | `env` 覆盖同名继承值，只进入该 bot 的 CLI/pane，不写入共享 server。严格模式仍过滤强制敏感变量 |
+| 内部身份 | Botmux 最后注入会话、owner、鉴权目录和控制变量；`BOTMUX*`、`__OWNER_OPEN_ID`、`CODEX_HOME` 等不能通过 `env` 或 `inherit` 冒充。进程级 `GROK_HOME`、`DSH_HOME`、`LARKSUITE_CLI_DATA_DIR` 可显式继承 |
+
+`TRAE_HOME`、`CLI_EXTRA_ARGS` 等非保留适配器环境项也不会自动继承宿主值；如需沿用，须在 `inherit` 中逐项获准，或在本 bot 的 `env` 中配置。
+
+可在 Dashboard「机器人默认设置 → 进程环境继承」配置，或执行 `botmux env-policy set '{"mode":"strict","inherit":["HTTPS_PROXY"]}'`（用 --bot 选择目标 bot）；会话内也可使用 `/botconfig set envPolicy {"mode":"strict"}`。`unset` 恢复默认继承。格式错误、未知字段和保留变量名会拒绝保存/加载，不静默降级。
+
+**与网络策略组合：** 使用支持 `sandboxNetworkPolicy` 的版本时，上述 `HTTPS_PROXY` 示例还需满足下表。严格继承的精确授权只决定环境值能否到达 CLI，不会替代网络许可，也不会悄悄删除或改写代理。
+
+| 网络配置 | HTTP/HTTPS/ALL proxy 及小写同名项 |
+| --- | --- |
+| 未配置网络策略；或 `proxyMode` 缺省且 `public` / `private` 均为 `allow` | 不因网络策略拒绝；严格模式仍须 `inherit` 获准或本 bot 的 `env` 明确配置 |
+| `proxyMode` 缺省且任一区域为 `block`、`allowlist` 或 `denylist` | 非空代理值会被明确拒绝启动，包括继承和本 bot 的 `env` |
+| `proxyMode: "reject"` | 即使两区均 `allow`，非空代理值也会拒绝启动 |
+| `proxyMode: "trusted-egress"` | 可保留显式获准的代理值；网络规则必须允许客户端实际连接的代理 IP / 端口；最终模型目标、代理端 DNS、CONNECT/HTTP 规则由部署层代理 ACL 控制 |
+
+`trusted-egress` 不创建代理、不自动授权环境变量、不保证 CLI 会使用代理；允许代理出口不等于限制代理后的业务目标。若模型依赖代理，不能只删掉 `inherit` 中的代理名称来让配置通过：应显式选择可信出口并配置出口规则与部署层 ACL，或先准备可直连的模型认证、获准目标 CIDR / 端口和 DNS，再移除代理授权。网络策略仍要求 Linux、新建本地 PTY 及 `sandbox: true` / `"oncall"`；tmux 等持久后端、adopt 和外部 App Server 的拒绝门禁不会因 `trusted-egress` 或 `envPolicy` 放开。详见[网络沙箱说明](sandbox.md)。
+
+在线策略修改在**下次 worker 冷启动**生效；离线终端命令只更新 bots.json，daemon 下次启动时读取。活跃 worker 内的 CLI 重启/自动恢复沿用其已冻结策略。daemon 重启恢复持久 pane 时比较无秘密值的策略指纹；旧 pane 没有严格策略记录、记录损坏或获准列表变化时，先关闭并确认消失再冷启动，确认失败则拒绝启动。CLI 已读取的环境不能被热更新撤回。
+
+严格模式覆盖 Botmux 自己启动的 PTY、tmux、tmux-pipe、zellij、zmx，以及本机 Codex/TraeX RPC App Server 和标题生成子进程。tmux/zellij 不加载 `launchShell` 的启动 profile，而是直接以 `/usr/bin/env -i` 启动 CLI；zmx 使用无 profile 的固定启动 shell 和空环境 exec。PATH/nvm/mise 等须由运行基线或本 bot 的显式配置提供。共享 server 不做全局清空，沿用已有敏感项清理；严格 pane 的 exec 会清空继承，获准凭证也不会写回 server 全局。严格 pane 未提供 `TERM` 时使用 `xterm-256color`，显式配置的值保留。v3 workflow 冻结无秘密的策略并在运行时读取本 bot 配置的 env，不把凭证写入 bot snapshot。
+
+Herdr、Riff、Mojo、Forge 启动模式、adopt 外部进程和外部 App Server 尚不能建立同一启动边界，显式严格模式会拒绝这些路径。用户主动执行的 shell/profile、CLI 自己读取的配置和凭证文件、全局文件权限与云端账号不在环境继承策略的隔离范围内。`codexAuthSync`、per-bot `CODEX_HOME` 与文件沙箱维持独立行为；严格模式不替代它们。
+
+Dashboard 只回读已配置的变量名；`env` 是只写表单，保存会替换整个 map，空白保存会清除。严格会话的「复现命令」不返回包含认证环境的命令；日志和策略诊断只展示名称/模式。`bots.json` 与进程环境仍可能以明文持有本 bot 明确配置的值，这不是秘密保险箱。

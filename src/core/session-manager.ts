@@ -12,6 +12,7 @@ import { expandHome, validateWorkingDir } from './working-dir.js';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import * as scheduleStore from '../services/schedule-store.js';
+import { updateRuntimeTaskState } from './scheduler.js';
 import * as messageQueue from '../services/message-queue.js';
 import { downloadMessageResource, listChatBotMembers, UserTokenMissingError } from '../im/lark/client.js';
 import { logger } from '../utils/logger.js';
@@ -1323,7 +1324,7 @@ function buildNewTopicBlocks(
   // nothing to the prompt. Claude-family (injectsSessionContext) inject skills
   // via --plugin-dir, so they're excluded.
   let skillBlock = '';
-  if (!adapter.injectsSessionContext && adapter.skillsDir) {
+  if (!adapter.injectsSessionContext && adapter.skillsDir && !adapter.pluginDir) {
     const mode = resolveSkillInjectionModeForApp(opts?.larkAppId);
     if (mode === 'prompt') {
       // history/quoted/bots are fully covered by <botmux_routing>; send stays in
@@ -2709,7 +2710,7 @@ export async function restoreActiveSessions(
       // as an ordinary session, NOT an adopt row. Doing the conversion here (not
       // via a worker-pool side-effect after announceSessionRow) keeps daemon
       // orchestration state consistent.
-      let adoptBotCfg: { sandbox?: boolean; readIsolation?: boolean; apiOnly?: boolean } = {};
+      let adoptBotCfg: { sandbox?: boolean | 'off' | 'oncall' | 'scratch'; readIsolation?: boolean; apiOnly?: boolean } = {};
       try { adoptBotCfg = getBot(session.larkAppId ?? '').config; } catch { /* unknown bot → only the frozen decision matters */ }
       if (adoptSandboxBlocked(adoptBotCfg, session)) {
         logger.warn(`[${session.sessionId.substring(0, 8)}] isolated/no-transport session persisted as adopt — converting to cold-start (a sandbox / apiOnly bot can't wrap a live external CLI)`);
@@ -3035,7 +3036,7 @@ export async function restoreActiveSessions(
       // registers at the real om_ key (sessionAnchorId reads the cleared
       // marker + thread scope) instead of the stable virtual slot.
       if (binding.routingAnchor.startsWith('schedule-task:')) {
-        scheduleStore.updateTask(
+        updateRuntimeTaskState(
           session.deferredScheduleRun.taskId,
           { rootMessageId: binding.rootMessageId },
           larkAppId,
@@ -3507,8 +3508,8 @@ export async function ensureTerminalWorkerPort(ds: DaemonSession): Promise<numbe
 export async function resumeSession(
   sessionId: string,
   activeSessions: Map<string, DaemonSession>,
-): Promise<{ ok: true; ds: DaemonSession }
-| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled'; activeSessionId?: string }> {
+): Promise<{ ok: true; ds: DaemonSession; recoveryPending?: true }
+| { ok: false; error: 'not_found' | 'not_closed' | 'anchor_occupied' | 'adopt_unsupported' | 'deferred_unmaterialized' | 'resume_cancelled' | 'resume_start_failed' | 'resume_reconciliation_required'; activeSessionId?: string }> {
   let session = sessionStore.getSession(sessionId);
   if (!session) return { ok: false, error: 'not_found' };
   if (session.status !== 'closed') return { ok: false, error: 'not_closed' };
@@ -3534,6 +3535,8 @@ export async function resumeSession(
   if (session.title?.startsWith('Adopt:') || isSharedAdoptPersistedSession(session)) {
     return { ok: false, error: 'adopt_unsupported' };
   }
+  let remoteRunnerResume = session.backendType === 'remote-runner'
+    || session.cliId === 'remote-runner';
 
   const scope: 'thread' | 'chat' = session.scope === 'chat' ? 'chat' : 'thread';
   const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
@@ -3554,6 +3557,8 @@ export async function resumeSession(
     return { ok: false as const, error: 'adopt_unsupported' as const };
   }
   session = latest;
+  remoteRunnerResume = session.backendType === 'remote-runner'
+    || session.cliId === 'remote-runner';
 
   // In-memory occupant check. A daemon-command scratch (e.g. an unconfirmed
   // `/relay` picker, a bare `/help`) parks a worker:null placeholder at this
@@ -3726,8 +3731,76 @@ export async function resumeSession(
     }
     return { ok: false, error: 'resume_cancelled' };
   }
+  if (remoteRunnerResume) {
+    // Local sessions may stay worker-less until the next message. A remote
+    // Resume button has stronger semantics: start the provider immediately so
+    // it can materialize a replacement remote generation (for example a new
+    // sandbox) from the persisted opaque state. Merely flipping the durable row
+    // to active recreates the ghost-active failure this path is meant to avoid.
+    let admission: 'accepted' | 'deferred' | 'rejected' | undefined;
+    const preResumeRemoteState = JSON.stringify(session.remoteBackendState ?? null);
+    const rollbackUnstartedRemoteResume = (): boolean => {
+      const current = sessionStore.getOwnedSession(sessionId);
+      if (!current || current.status !== 'active') return current?.status === 'closed';
+      if (JSON.stringify(current.remoteBackendState ?? null) !== preResumeRemoteState) {
+        logger.error(
+          `Remote resume ${sessionId.substring(0, 8)} changed lineage before startup failed; `
+          + 'leaving the row active for explicit reconciliation',
+        );
+        return false;
+      }
+      try {
+        sessionStore.closeSession(sessionId);
+      } catch (error) {
+        logger.error(
+          `Remote resume ${sessionId.substring(0, 8)} could not restore the durable closed row: `
+          + `${error instanceof Error ? error.message : String(error)}`,
+        );
+        return false;
+      }
+      const closed = sessionStore.getOwnedSession(sessionId);
+      if (!closed || closed.status !== 'closed') return false;
+      Object.assign(ds.session, closed);
+      for (const [registeredKey, candidate] of activeSessions) {
+        if (candidate === ds) activeSessions.delete(registeredKey);
+      }
+      dashboardEventBus.publish({
+        type: 'session.update',
+        body: { sessionId, patch: { status: 'closed', workerPid: null, webPort: null } },
+      });
+      return true;
+    };
+    let started = false;
+    try {
+      started = forkWorker(ds, '', { resume: true, remoteResumeMode: 'rebuild' }, {
+        deferDuringDeviceIsolation: false,
+        onAdmission: value => { admission = value; },
+        onPreReadyExit: () => { rollbackUnstartedRemoteResume(); },
+        onRemoteBackendStartupExit: rollbackUnstartedRemoteResume,
+      });
+    } catch (error) {
+      logger.warn(
+        `Remote resume ${sessionId.substring(0, 8)} failed to start: `
+        + `${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (!started || admission !== 'accepted' || !ds.worker || ds.worker.killed) {
+      // No provider process was synchronously admitted, so no remote recovery
+      // can be in flight. Restore the row directly instead of calling the
+      // generic close path: that path may wake a worker-less remote session to
+      // cancel it, which would create a second rebuild attempt during rollback.
+      if (!rollbackUnstartedRemoteResume()) {
+        return { ok: false, error: 'resume_reconciliation_required' };
+      }
+      return { ok: false, error: 'resume_start_failed' };
+    }
+  }
   logger.info(`Resumed session ${sessionId.substring(0, 8)} (scope: ${scope}, anchor: ${anchor.substring(0, 12)})`);
-  return { ok: true, ds };
+  return {
+    ok: true,
+    ds,
+    ...(remoteRunnerResume ? { recoveryPending: true as const } : {}),
+  };
   });
 }
 
@@ -3833,6 +3906,9 @@ export async function executeScheduledTask(
   activeSessions: Map<string, DaemonSession>,
   refreshCliVersion: RefreshCliVersion,
   additionalPrompt?: string,
+  runtime?: {
+    prepareTurnIdentity?: (session: DaemonSession, turnId: string) => void | Promise<void>;
+  },
 ): Promise<void> {
   // Resolve which bot to use — prefer the task's original bot so replies come from
   // the same account the user set up the schedule with.
@@ -3862,7 +3938,12 @@ export async function executeScheduledTask(
   // Runs before position/scope resolution so the rest of the fire path sees
   // an ordinary retained-topic / new-topic task.
   const taskBeforeFollowActive = task;
-  task = applyFollowActive(task);
+  const persistLanding = (id: string, rootMessageId: string, appId?: string) => {
+    if (!updateRuntimeTaskState(id, { rootMessageId }, appId)) {
+      throw new Error(`schedule task ${id} no longer exists`);
+    }
+  };
+  task = applyFollowActive(task, { persist: persistLanding });
   const followActiveFreshTopic = followActiveOpenedFreshTopic(taskBeforeFollowActive, task);
 
   const { getChatMode, sendMessage, replyMessage } = await import('../im/lark/client.js');
@@ -3935,7 +4016,7 @@ export async function executeScheduledTask(
       // next fire stays here (step 3) instead of opening one more topic. A
       // silent fresh topic has no real root yet (deferred until the first
       // `botmux send`), so it is not recorded and the next fire re-resolves.
-      if (followActiveFreshTopic) recordFollowActiveFreshTopic(taskBeforeFollowActive, anchor);
+      if (followActiveFreshTopic) recordFollowActiveFreshTopic(taskBeforeFollowActive, anchor, persistLanding);
     }
   } else if (executionPosition === 'task') {
     // Dedicated per-task topic, first fire: the task has no materialized root
@@ -3990,7 +4071,7 @@ export async function executeScheduledTask(
           // Write the root straight into the task row (store call, not the
           // scheduler wrapper/event bus): every later fire resolves to this
           // exact thread and resumes the session created below.
-          scheduleStore.updateTask(task.id, { rootMessageId: seed }, larkAppId);
+          updateRuntimeTaskState(task.id, { rootMessageId: seed }, larkAppId);
           return { anchor: seed, rootMessageId: seed, isContinuation: false };
         },
       );
@@ -4170,6 +4251,7 @@ export async function executeScheduledTask(
           activeSessions,
           refreshCliVersion,
           additionalPrompt,
+          runtime,
         );
       }
     }
@@ -4249,6 +4331,7 @@ export async function executeScheduledTask(
           turnId: scheduledTurnId,
           trustedCaller: scheduledTrustedCaller,
         });
+        await runtime?.prepareTurnIdentity?.(existing, scheduledTurnId);
         rememberLastCliInput(existing, task.prompt, input);
         if (silent) armSilentScheduledTurn(existing, scheduledTurnId);
         if (existing.worker && !existing.worker.killed) {
@@ -4380,6 +4463,7 @@ export async function executeScheduledTask(
     rememberLastCliInput(ds, task.prompt, prompt);
     if (silent) armSilentScheduledTurn(ds, scheduledTurnId);
     try {
+      await runtime?.prepareTurnIdentity?.(ds, scheduledTurnId);
       forkWorker(ds, prompt, scheduledTurnId);
     } catch (err) {
       if (silent) disarmSilentScheduledTurn(ds, scheduledTurnId);

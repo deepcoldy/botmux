@@ -403,6 +403,17 @@ function installClaudeSettings(
   removeBotmuxAskHookGroups(existingHooks, 'PreToolUse', hookCommand);
   existingHooks['PreToolUse'] = [...(existingHooks['PreToolUse'] ?? []), newGroup];
 
+  // 终端权限确认桥：bypassPermissions 下 Claude 仍会为内置安全检查（如「Dangerous rm
+  // operation on possibly-empty variable path」）弹终端确认框，飞书侧看不到 → 会话
+  // 静默卡死。PermissionRequest 恰在弹框时触发，同一个 `botmux hook` 把它转成飞书
+  // 允许/拒绝卡片。不写 matcher = 所有工具；AskUserQuestion 由 hook 客户端自行分流。
+  // timeout 900s 必须大于 hook 客户端的权限等待上限（cli.ts PERMISSION_MAX_TIMEOUT_MS），
+  // 让客户端先到点给出「拒绝」裁决，而不是被 Claude 杀掉后回落到终端弹框。
+  existingHooks['PermissionRequest'] = [
+    ...(existingHooks['PermissionRequest'] ?? []),
+    { hooks: [{ type: 'command', command: hookCommand, timeout: 900 }] },
+  ];
+
   // SessionStart 就绪 hook（幂等替换旧的 botmux 条目）
   if (sessionStartCommand) {
     removeBotmuxReadyHookGroups(existingHooks, 'SessionStart');

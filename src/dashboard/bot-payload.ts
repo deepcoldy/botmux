@@ -6,6 +6,7 @@ import type { CliRuntimeConfig } from '../adapters/cli/runtime.js';
 import type { CliLaunchMode } from '../core/cli-launch-mode.js';
 import { GRANT_DURATION_OPTIONS } from '../services/grant-policy.js';
 import { normalizeSparseReplyStyleConfig } from './reply-style.js';
+import { normalizeAskOptionLayout } from '../im/lark/ask-option-layout.js';
 import { parseTriggerUserAuthConfig, type TriggerUserAuthConfig } from '../services/trigger-user-auth.js';
 import type { NativeSubagentRuntimePolicy } from '../services/native-subagent-runtime-policy.js';
 import { normalizeQuotaFallbackBotConfig } from '../services/quota-fallback.js';
@@ -125,7 +126,22 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     // Private Bot Defaults payload only. Keep the persisted shape sparse and
     // drop malformed hand edits field-by-field before they reach form state.
     replyStyle: normalizeSparseReplyStyleConfig(j?.replyStyle).config ?? null,
-    sandbox: j?.sandbox === true,
+    // 同上：非法手改值 fail-soft 丢掉，缺省（compact）以 null 表达。
+    askOptionLayout: normalizeAskOptionLayout(j?.askOptionLayout).layout ?? null,
+    sandbox: j?.sandbox === true || j?.sandbox === 'oncall' || j?.sandbox === 'scratch',
+    sandboxMode: j?.sandboxMode === 'off' || j?.sandboxMode === 'oncall' || j?.sandboxMode === 'scratch'
+      ? j.sandboxMode
+      : (j?.sandbox === 'scratch' ? 'scratch' : j?.sandbox === true || j?.sandbox === 'oncall' ? 'oncall' : 'off'),
+    scratchStorage: j?.scratchStorage === 'disk' || j?.scratchStorage === 'tmpfs' ? j.scratchStorage : null,
+    // tmpfs-vs-disk selection exists only on Linux (full-root overlay). On
+    // macOS scratch is always APFS clonefile COW (disk-backed, swap-backed);
+    // the UI hides the storage segmented control there.
+    scratchStorageSelectable: process.platform === 'linux',
+    scratchTmpfsSizeMb: typeof j?.scratchTmpfsSizeMb === 'number' ? j.scratchTmpfsSizeMb : null,
+    scratchDenyPaths: Array.isArray(j?.scratchDenyPaths) ? j.scratchDenyPaths.filter((x: unknown) => typeof x === 'string') : null,
+    scratchSupported: j?.scratchSupported === true,
+    sandboxNetworkPolicy: j?.sandboxNetworkPolicy ?? null,
+    sandboxNetworkPolicyPlatform: j?.sandboxNetworkPolicyPlatform ?? null,
     sandboxPaths: (j?.sandboxPaths && typeof j.sandboxPaths === 'object' && !Array.isArray(j.sandboxPaths))
       ? {
           readWrite: Array.isArray(j.sandboxPaths.readWrite) ? j.sandboxPaths.readWrite.filter((x: unknown) => typeof x === 'string') : [],
@@ -187,6 +203,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     messageQuotaDefaultLimit: typeof j?.messageQuotaDefaultLimit === 'number' ? j.messageQuotaDefaultLimit : null,
     p2pMode: j?.p2pMode === 'thread' ? 'thread' : j?.p2pMode === 'group' ? 'group' : 'chat',
     envelopeInjection: j?.envelopeInjection === 'auto' ? 'auto' : 'off',
+    topicUnavailablePolicy: j?.topicUnavailablePolicy === 'stop' ? 'stop' : 'legacy',
     replyDelivery: j?.replyDelivery === 'transcript' ? 'transcript' : 'send',
     promptInjection: j?.promptInjection === 'none' ? 'none' : 'default',
     replyDeliveryDefault: j?.replyDeliveryDefault === 'transcript' ? 'transcript' : 'send',
@@ -215,6 +232,7 @@ export function botDefaultsPayload(bot: DashboardBotDescriptor, j?: any, error?:
     launchShell: typeof j?.launchShell === 'string' ? j.launchShell : '',
     env: typeof j?.env === 'string' ? j.env : '',
     riff: j?.riff && typeof j.riff === 'object' ? j.riff : null,
+    remoteRunner: j?.remoteRunner && typeof j.remoteRunner === 'object' ? j.remoteRunner : null,
     skills: j?.skills && typeof j.skills === 'object' ? j.skills : null,
   };
 }

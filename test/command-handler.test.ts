@@ -8,6 +8,15 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+vi.mock('../src/services/feed-group-tagger.js', () => ({
+  tagClosedSessionGroup: vi.fn(async () => ({ status: 'skipped' })),
+}));
+import { tagClosedSessionGroup } from '../src/services/feed-group-tagger.js';
+
+
+vi.mock('../src/core/dismiss-command.js', () => ({ dismissSessionGroup: vi.fn(async () => ({ status: 'confirm', state: 'a'.repeat(64) })) }));
+import { dismissSessionGroup } from '../src/core/dismiss-command.js';
+
 // ─── Mock external modules ──────────────────────────────────────────────────
 
 // Command routing must not load or start a native terminal through transitive imports.
@@ -116,6 +125,7 @@ vi.mock('../src/services/lark-cli-auth.js', () => ({
 }));
 
 vi.mock('../src/bot-registry.js', () => ({
+  normalizeUsageDisplay: (cfg: { usageDisplay?: string }) => cfg.usageDisplay ?? 'streaming',
   getBot: vi.fn((id: string = 'app-1') => ({
     botName: id === 'app-2' ? 'Codex' : 'Claude',
     config: {
@@ -276,6 +286,8 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
 }));
 
 vi.mock('../src/im/lark/client.js', () => ({
+  updateMessage: vi.fn(async () => {}),
+  MessageWithdrawnError: class extends Error {},
   UserTokenMissingError: class UserTokenMissingError extends Error {
     constructor(message: string) {
       super(message);
@@ -284,6 +296,7 @@ vi.mock('../src/im/lark/client.js', () => ({
   },
   deleteMessage: vi.fn(async () => true),
   sendMessage: vi.fn(async () => 'card-msg-id'),
+  sendUserMessage: vi.fn(async () => 'private-msg-id'),
   uploadImage: vi.fn(async () => 'img_uploaded'),
   // /relay picker replies land anchored at the invocation message / 话题 via
   // replyMessage (reply-at-invocation), not sessionReply. Args mirror the
@@ -570,7 +583,7 @@ vi.mock('../src/im/lark/cot-message.js', () => ({
 
 // ─── Imports (after mocks) ──────────────────────────────────────────────────
 
-import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, cliHasNoRawPassthroughSurface, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, parseForceTopicInvocation, parseTopicHeader, isTopicHeader, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
+import { DAEMON_COMMANDS, SESSIONLESS_DAEMON_COMMANDS, EXISTING_SESSION_ONLY_DAEMON_COMMANDS, PASSTHROUGH_COMMANDS, cliHasNoRawPassthroughSurface, resolvePassthroughCommands, resolveAdapterDefaultPassthroughCommands, handleCommand, handleCardCommand, handleCotCommand, handleTermLinkCommand, parseSlashCommandInvocation, startAdoptSession, startResumeImportSession, startCodexAppThreadSession, startForkSubtopicSession } from '../src/core/command-handler.js';
 import { setCardMode } from '../src/services/card-mode-store.js';
 import { setChatStreamingCardPin } from '../src/services/pin-streaming-card-mode-store.js';
 import { setCotMode } from '../src/services/cot-mode-store.js';
@@ -600,7 +613,7 @@ import { getSessionWorkingDir, buildNewTopicPrompt, buildNewTopicCliInput, ensur
 import * as sessionStore from '../src/services/session-store.js';
 import * as scheduleStore from '../src/services/schedule-store.js';
 import * as scheduler from '../src/core/scheduler.js';
-import { deleteMessage, sendMessage, replyMessage, listChatBotMembers, getChatModeStrict, getMessageThreadId, UserTokenMissingError } from '../src/im/lark/client.js';
+import { deleteMessage, sendMessage, sendUserMessage, replyMessage, listChatBotMembers, getChatModeStrict, getMessageThreadId, UserTokenMissingError } from '../src/im/lark/client.js';
 import { buildAdoptSelectCard, buildSlashListCard, buildSessionClosedCard } from '../src/im/lark/card-builder.js';
 import { createGroupWithBots } from '../src/services/group-creator.js';
 import { getAllBots, getBot, findOncallChat, effectiveDefaultWorkingDir } from '../src/bot-registry.js';
@@ -767,7 +780,7 @@ function mockCodexAppBot(): void {
 
 describe('DAEMON_COMMANDS set', () => {
   it('should contain all expected commands', () => {
-    const expected = ['/close', '/cleanup-wt', '/lane', '/stop', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/project', '/group', '/g', '/relay', '/quote', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/sessions', '/vc-auth', '/issue', '/cli'];
+    const expected = ['/dismiss', '/close', '/cleanup-wt', '/lane', '/stop', '/restart', '/status', '/retry', '/help', '/cd', '/repo', '/rename', '/schedule', '/role', '/botconfig', '/skills', '/pair', '/login', '/adopt', '/detach', '/disconnect', '/oncall', '/project', '/group', '/g', '/relay', '/quote', '/fork', '/forklist', '/card', '/cot', '/term', '/list-slash-command', '/slash', '/subscribe-lark-doc', '/watch-comment', '/vc', '/insight', '/dashboard', '/sessions', '/vc-auth', '/issue', '/cli'];
     for (const cmd of expected) {
       expect(DAEMON_COMMANDS.has(cmd), `Expected DAEMON_COMMANDS to contain ${cmd}`).toBe(true);
     }
@@ -804,7 +817,7 @@ describe('DAEMON_COMMANDS set', () => {
     // bot 发送方和 `/t /tabs ...` 会建出 phantom session 后静默失效。
     // /fork 与 /issue 仍是一等 daemon 命令；/subscribe-lark-doc 保持原本的
     // 按文件 API 订阅命令语义，不做别名。
-    expect(DAEMON_COMMANDS.size).toBe(42);
+    expect(DAEMON_COMMANDS.size).toBe(43);
     expect(DAEMON_COMMANDS.has('/tabs')).toBe(false);
     expect(DAEMON_COMMANDS.has('/tab')).toBe(false);
   });
@@ -1681,78 +1694,11 @@ describe('parseSlashCommandInvocation', () => {
   });
 });
 
-describe('parseTopicHeader（取代 parseForceTopicInvocation 的路由元命令判定）', () => {
-  /** 只关心「是不是 force-topic + 正文是什么」——这是旧 parseForceTopicInvocation 的全部契约。 */
-  function forceTopic(content: string): { prompt: string } | null {
-    const parsed = parseTopicHeader(content);
-    return isTopicHeader(parsed) ? { prompt: parsed.prompt } : null;
-  }
-
-  it('parses /t with prompt', () => {
-    expect(forceTopic('/t 帮我看看 X')).toEqual({ prompt: '帮我看看 X' });
-  });
-
-  it('parses /topic with prompt', () => {
-    expect(forceTopic('/topic 帮我看看 Y')).toEqual({ prompt: '帮我看看 Y' });
-  });
-
-  it('parses bare /t and bare /topic with an empty prompt', () => {
-    expect(forceTopic('/t')).toEqual({ prompt: '' });
-    expect(forceTopic('/topic')).toEqual({ prompt: '' });
-  });
-
-  it('is case-insensitive on the sentinel itself', () => {
-    expect(forceTopic('/T hello')).toEqual({ prompt: 'hello' });
-    expect(forceTopic('/Topic hello')).toEqual({ prompt: 'hello' });
-  });
-
-  it('preserves multiline prompt content verbatim after the sentinel', () => {
-    expect(forceTopic('/t line1\nline2\nline3')).toEqual({ prompt: 'line1\nline2\nline3' });
-
-  });
-
-  it('retains cwd and worktree lifecycle aliases', () => {
-    expect(parseForceTopicInvocation('/t here 检查实现')).toEqual({ prompt: '检查实现', mode: 'here' });
-    expect(parseForceTopicInvocation('/topic worktree 检查实现')).toEqual({ prompt: '检查实现', mode: 'worktree' });
-    expect(parseForceTopicInvocation('/th 检查实现')).toEqual({ prompt: '检查实现', mode: 'here' });
-    expect(parseForceTopicInvocation('/tw 检查实现')).toEqual({ prompt: '检查实现', mode: 'worktree' });
-  });
-
-  it('does not match similar prefixes', () => {
-    expect(forceTopic('/tea is good')).toBeNull();
-    expect(forceTopic('/talk to me')).toBeNull();
-    expect(forceTopic('/topical')).toBeNull();
-  });
-
-  it('tolerates leading whitespace', () => {
-    expect(forceTopic('  /t hello')).toEqual({ prompt: 'hello' });
-
-  });
-
-  it('returns null for non-slash text', () => {
-    expect(forceTopic('hello world')).toBeNull();
-    expect(forceTopic('')).toBeNull();
-  });
-
-  it('does not collide with parseSlashCommandInvocation outputs', () => {
-    // /close, /restart, /repo etc. must NOT be claimed as force-topic invocations.
-    expect(forceTopic('/close')).toBeNull();
-    expect(forceTopic('/restart')).toBeNull();
-    expect(forceTopic('/repo 1')).toBeNull();
-  });
-
-  it('刻意的行为变化：/t 之前的文字现在是可读标题，不再判为非 force-topic', () => {
-    // 旧 parseForceTopicInvocation 要求 `/t` 在第 0 位，`hello /t world` 返回 null。
-    // 新语法把 `/t` 之前的文字当标题（飞书话题列表显示的是原消息，bot 改不了标题，
-    // 所以可读文字必须排在最前）。护栏在 topic-header 的单测里：标题不得含 `/` 开头的
-    // token、不超过 3 行、归一化后不超过 200 字，否则仍判为非 force-topic。
-    expect(parseTopicHeader('hello /t world')).toMatchObject({ ok: true, title: 'hello', prompt: 'world' });
-  });
-});
-
 describe('handleCommand', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.mocked(tagClosedSessionGroup).mockResolvedValue({ status: 'skipped' });
+    vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'confirm', state: 'a'.repeat(64) });
     vi.mocked(closeSession).mockImplementation(async (sessionId: string) => {
       // Model the authoritative close lifecycle's dashboard contract. The
       // command must delegate this side effect instead of publishing a second
@@ -2667,7 +2613,69 @@ describe('handleCommand', () => {
     });
   });
 
+  describe('/dismiss', () => {
+    it('registers as sessionless and routes confirmation without spawning a session', async () => {
+      const deps = makeDeps();
+      expect(SESSIONLESS_DAEMON_COMMANDS.has('/dismiss')).toBe(true);
+      await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss', { chatId: CHAT_ID }), deps, LARK_APP_ID);
+      expect(dismissSessionGroup).toHaveBeenCalledWith(expect.objectContaining({ chatId: CHAT_ID, rootId: CHAT_ID, confirmedState: undefined }));
+      expect(deps.sessionReply).toHaveBeenCalledWith(CHAT_ID, expect.stringContaining('/dismiss --confirm='), undefined, LARK_APP_ID, 'msg_001');
+      expect(tagClosedSessionGroup).not.toHaveBeenCalled();
+    });
+    it('rejects bot callers and non-operators before destructive handling', async () => {
+      await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss', { chatId: CHAT_ID, senderType: 'app' }), makeDeps(), LARK_APP_ID);
+      vi.mocked(canOperate).mockReturnValueOnce(false);
+      await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss', { chatId: CHAT_ID }), makeDeps(), LARK_APP_ID);
+      expect(dismissSessionGroup).not.toHaveBeenCalled();
+    });
+    it('reports successful deletion privately rather than to the deleted group', async () => {
+      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'dismissed' });
+      const deps = makeDeps();
+      await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss --confirm=' + 'a'.repeat(64), { chatId: CHAT_ID }), deps, LARK_APP_ID);
+      expect(sendUserMessage).toHaveBeenCalledWith(LARK_APP_ID, 'ou_sender', expect.stringContaining('已解散'));
+      expect(deps.sessionReply).not.toHaveBeenCalled();
+    });
+    it('rejects unsupported arguments without executing', async () => {
+      await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss --yes', { chatId: CHAT_ID }), makeDeps(), LARK_APP_ID);
+      expect(dismissSessionGroup).not.toHaveBeenCalled();
+    });
+    it('surfaces residual details without reporting deletion success', async () => {
+      vi.mocked(dismissSessionGroup).mockResolvedValue({ status: 'residual', detail: 'remote-survivor' });
+      const deps = makeDeps();
+      await handleCommand('/dismiss', CHAT_ID, makeLarkMessage('/dismiss', { chatId: CHAT_ID }), deps, LARK_APP_ID);
+      expect(deps.sessionReply).toHaveBeenCalledWith(CHAT_ID, expect.stringContaining('remote-survivor'), undefined, LARK_APP_ID, 'msg_001');
+      expect(sendUserMessage).not.toHaveBeenCalled();
+    });
+  });
+
   describe('/close', () => {
+    it('updates the group tag only after clean close and does not wait to deliver the close card', async () => {
+      const ds = makeDaemonSession();
+      const deps = makeDeps(ds);
+      let release!: (value: Awaited<ReturnType<typeof tagClosedSessionGroup>>) => void;
+      vi.mocked(tagClosedSessionGroup).mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), deps, LARK_APP_ID);
+      expect(tagClosedSessionGroup).toHaveBeenCalledWith(LARK_APP_ID, CHAT_ID, ds.session.sessionId);
+      expect(vi.mocked(closeSession).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(tagClosedSessionGroup).mock.invocationCallOrder[0]);
+      expect(deliverEphemeralOrReply).toHaveBeenCalled();
+      release({ status: 'failed' });
+      await vi.waitFor(() => expect(vi.mocked(deps.sessionReply).mock.calls.some(call =>
+        typeof call[1] === 'string' && call[1].includes('标签切换未完成'))).toBe(true));
+      expect(deps.activeSessions.size).toBe(0);
+    });
+
+    it('does not migrate tags when close fails or leaves a residual', async () => {
+      vi.mocked(closeSession).mockResolvedValueOnce({ ok: false, error: 'unproven' } as never);
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), makeDeps(makeDaemonSession()), LARK_APP_ID);
+      expect(tagClosedSessionGroup).not.toHaveBeenCalled();
+      vi.mocked(closeSession).mockResolvedValueOnce({
+        ok: true, outcome: 'closed_with_residual', alreadyClosed: false, known: true,
+        residual: { reason: 'local_subtree_boundary_unproven' },
+      } as never);
+      await handleCommand('/close', ROOT_ID, makeLarkMessage('/close'), makeDeps(makeDaemonSession()), LARK_APP_ID);
+      expect(tagClosedSessionGroup).not.toHaveBeenCalled();
+    });
+
     it('treats an existing App Server adopt as a BotMux-only disconnect', async () => {
       const ds = makeDaemonSession({
         session: makeSession({
@@ -5867,6 +5875,14 @@ describe('handleCommand', () => {
     // exactly what was refused" needs no guessing — and no giant default set
     // that makes every person approve permissions they will never use.
     describe('/login --scope', () => {
+      it('passes an explicit document scope and the requesting user to OAuth', async () => {
+        const deps = makeDeps(makeDaemonSession());
+        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login --scope docx:document:readonly'), deps, LARK_APP_ID);
+        expect(generateAuthUrl).toHaveBeenCalledWith(
+          'app-1', 'secret-1', 'feishu', ['docx:document:readonly'], 'ou_sender',
+        );
+      });
+
       it('builds an authorization URL carrying the requested scopes', async () => {
         const deps = makeDeps(makeDaemonSession());
         await handleCommand('/login', ROOT_ID, makeLarkMessage('/login --scope docx:document:write_only'), deps, LARK_APP_ID);
@@ -8610,6 +8626,50 @@ describe('/cot — thinking-process message switch (operator / canOperate)', () 
     expect(ds.cotForced).toBe(true);
     expect(handleCotThinkingUpdate).not.toHaveBeenCalled();
     expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('下个 turn');
+  });
+
+  it('/cot show unified mid-turn does not restore hidden results to disk', async () => {
+    const fs = await import('node:fs');
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const { tmpdir } = await vi.importActual<typeof import('node:os')>('node:os');
+    const { join } = await import('node:path');
+    const { config } = await import('../src/config.js');
+    const { TurnReplyCardStore } = await import('../src/services/turn-reply-card.js');
+    const { updateTurnReplyCard, queueTurnReplyTools, flushTurnReplyTools } = await import('../src/core/turn-reply-card.js');
+    const restore = (['existsSync', 'statSync', 'mkdirSync'] as const).map(key => {
+      const mock = vi.mocked(fs[key]);
+      const previous = mock.getMockImplementation();
+      mock.mockImplementation(realFs[key] as any);
+      return () => mock.mockImplementation(previous as any);
+    });
+    const dir = realFs.mkdtempSync(join(tmpdir(), 'cot-show-unified-'));
+    const previousDir = config.session.dataDir;
+    config.session.dataDir = dir;
+    try {
+      botWith({ cotEnabled: true, thinkingCardToolResult: false, replyCardMode: 'unified', usageDisplay: 'off' });
+      const ds = makeDaemonSession();
+      ds.currentTurnId = 'om_cot_hidden';
+      ds.lastThinkingUpdate = { turnId: ds.currentTurnId, entries: [
+        { kind: 'tool_call', id: 'read', name: 'Read', args: '{}', subject: 'README.md' },
+        { kind: 'tool_result', id: 'read', result: 'HIDDEN_RESULT_BODY' },
+      ] };
+      const deps = makeDeps(ds);
+      const send = vi.fn(async () => 'om_unified');
+      await updateTurnReplyCard(ds, ds.currentTurnId, { kind: 'start' }, send);
+      queueTurnReplyTools(ds, ds.lastThinkingUpdate, send, () => true);
+      await flushTurnReplyTools(ds, ds.currentTurnId);
+      const disk = () => new TurnReplyCardStore(dir).read({ larkAppId: ds.larkAppId, sessionId: ds.session.sessionId, turnId: ds.currentTurnId! });
+      expect(disk()?.tools).toHaveLength(1);
+      expect(disk()?.tools[0]).not.toHaveProperty('result');
+      await handleCotCommand(ROOT_ID, LARK_APP_ID, CHAT_ID, 'ou_owner', '/cot show', deps);
+      expect(ds.cotForced).toBe(true);
+      expect(disk()?.tools).toHaveLength(1);
+      expect(disk()?.tools[0]).not.toHaveProperty('result');
+    } finally {
+      config.session.dataDir = previousDir;
+      restore.forEach(reset => reset());
+      realFs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

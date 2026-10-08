@@ -479,7 +479,7 @@ afterEach(() => {
   vi.restoreAllMocks();
   setActiveSessionsRegistry(new Map());
   config.session.dataDir = previousDataDir;
-  sessionStore.init();
+  sessionStore.init('test-app');
   rmSync(dataDir, { recursive: true, force: true });
   rmSync(workerRoot, { recursive: true, force: true });
 });

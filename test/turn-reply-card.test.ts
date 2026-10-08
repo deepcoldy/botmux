@@ -39,6 +39,100 @@ describe('one reply card per turn', () => {
   });
   afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
+  it.each([false, true])('persists an image-free final after provider rejection with an existing card=%s', async existing => {
+    if (existing) await store.update(key, { kind: 'start' }, io);
+    const send = io.send;
+    const patch = io.patch;
+    const rejectImages = (content: string) => {
+      if (content.includes('![Preview]')) {
+        throw new Error('ErrCode: 200570; card contains invalid image keys (code: 230099)');
+      }
+    };
+    io.send = vi.fn(async (content, uuid) => { rejectImages(content); return send(content, uuid); });
+    io.patch = vi.fn(async (id, content) => { rejectImages(content); return patch(id, content); });
+    const final = await store.update(key, finalEvent('Answer. ![Preview](img_v3_rejected)', 'bridge'), io);
+    expect(final.delivered).toBe(true);
+    expect(final.card).toContain('Answer.');
+    expect(final.card).toContain('[Image omitted]');
+    expect(final.record.finalCard).not.toContain('![Preview]');
+    expect(final.record.lastCard).toBe(final.card);
+    expect(cards.size).toBe(1);
+    if (!existing) {
+      expect(vi.mocked(io.send).mock.calls.map(call => call[1])).toEqual([final.messageId, final.messageId]);
+      expect(io.patch).not.toHaveBeenCalled();
+    }
+    const recovered = new TurnReplyCardStore(dir);
+    const terminal = await recovered.update(key, { kind: 'terminal', phase: 'completed' }, io);
+    expect(terminal.messageId).toBe(final.messageId);
+    expect(terminal.card).not.toContain('![Preview]');
+    expect(terminal.card).toContain('Answer.');
+    expect(terminal.record.finalDelivered).toBe(true);
+    expect(terminal.record.lastCard).toBe(cards.get(final.messageId ?? ''));
+    expect(cards.size).toBe(1);
+  });
+
+  it.each([false, true])('recovers an unknown image-free delivery result with an existing card=%s', async existing => {
+    if (existing) await store.update(key, { kind: 'start' }, io);
+    const send = io.send;
+    const patch = io.patch;
+    const requests: { content: string; identity: string }[] = [];
+    let disconnect = true;
+    const deliver = async (content: string, identity: string) => {
+      requests.push({ content, identity });
+      if (content.includes('![Preview]')) {
+        throw new Error('ErrCode: 200570; card contains invalid image keys (code: 230099)');
+      }
+      if (existing) await patch(identity, content);
+      else await send(content, identity);
+      if (disconnect) { disconnect = false; throw new Error('connection reset after acceptance'); }
+      return identity;
+    };
+    io.send = (content, uuid) => deliver(content, uuid);
+    io.patch = async (id, content) => { await deliver(content, id); };
+    const event = finalEvent('Answer. ![Preview](img_v3_rejected)', 'bridge');
+    await expect(store.update(key, event, io)).rejects.toThrow('connection reset');
+    expect(store.read(key)?.finalDelivered).not.toBe(true);
+    const recovered = new TurnReplyCardStore(dir);
+    const final = await recovered.update(key, event, io);
+    expect(requests).toHaveLength(3);
+    expect(requests[2].identity).toBe(requests[1].identity);
+    // POST retries freeze the exact body; PATCH may refresh elapsed time.
+    if (!existing) expect(requests[2]).toEqual(requests[1]);
+    expect(requests[2].content).not.toContain('![Preview]');
+    expect(requests[2].content).toContain('Answer.');
+    expect(final.record.finalCard).not.toContain('![Preview]');
+    expect(final.record.lastCard).toBe(requests[2].content);
+    expect(cards.size).toBe(1);
+    expect(final.record.finalDelivered).toBe(true);
+  });
+
+  it.each([false, true])('rechecks ownership before an image fallback with an existing card=%s', async existing => {
+    if (existing) await store.update(key, { kind: 'start' }, io);
+    let owned = true;
+    io.beforeEffect = () => { if (!owned) throw new Error('stale worker'); };
+    const reject = vi.fn(async () => {
+      owned = false;
+      throw new Error('ErrCode: 200570; card contains invalid image keys (code: 230099)');
+    });
+    io.send = reject;
+    io.patch = reject;
+    await expect(store.update(key, finalEvent('Answer. ![Preview](img_v3_rejected)'), io)).rejects.toThrow('stale worker');
+    expect(reject).toHaveBeenCalledOnce();
+    expect(store.read(key)?.finalDelivered).not.toBe(true);
+  });
+
+  it('keeps the exact pending body after an unrelated card rejection', async () => {
+    const send = io.send;
+    io.send = vi.fn().mockRejectedValueOnce(new Error('Invalid card schema (code: 230099)')).mockImplementation(send);
+    const event = finalEvent('Answer. ![Preview](img_v3_valid)');
+    await expect(store.update(key, event, io)).rejects.toThrow('Invalid card schema');
+    const pending = store.read(key)?.pendingCreate;
+    expect(pending?.content).toContain('![Preview](img_v3_valid)');
+    const final = await new TurnReplyCardStore(dir).update(key, event, io);
+    expect(vi.mocked(io.send).mock.calls[1]).toEqual(vi.mocked(io.send).mock.calls[0]);
+    expect(final.record.finalCard).toContain('![Preview](img_v3_valid)');
+  });
+
   it('updates tools, progress and final in the original message, then preserves it for the next turn', async () => {
     const start = await store.update(key, { kind: 'start' }, io);
     await store.update(key, { kind: 'progress', text: '正在检查仓库' }, io);

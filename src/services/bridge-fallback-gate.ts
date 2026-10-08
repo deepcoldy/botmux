@@ -206,10 +206,20 @@ export interface BridgeSendMarker {
   dispatchAttempt?: number;
   /** Present only for opted-in managed replies; legacy marker semantics stay intact. */
   replyCardResponseKind?: 'progress' | 'final' | 'auxiliary';
+  /** The send is explicitly an interim side effect and must never stand in for
+   * the turn's eventual final/failure delivery. Remote Runner outbound_message
+   * uses this while ordinary historical `botmux send` keeps its old heuristic. */
+  terminalIndependent?: true;
   contentLength?: number;
   /** Bounded, whitespace-compacted copy for dashboard session previews.
    *  The fallback gate still uses contentLength only. */
   previewText?: string;
+}
+
+/** Only an explicit final response proves completion; progress, auxiliary,
+ *  and legacy markers without responseKind must not retire a pending turn. */
+export function isFinalBridgeSendMarker(marker: Pick<BridgeSendMarker, 'responseKind'>): boolean {
+  return marker.responseKind === 'final';
 }
 
 export interface BridgeGateInput {
@@ -223,6 +233,12 @@ export interface BridgeGateInput {
   /** Zero-injection sessions forward real terminal answers through the same
    * delivery channel. Keep local attribution for failure/empty-turn filtering. */
   forwardLocalFinal?: boolean;
+  /** A Claude Code built-in scheduled turn (CronCreate fire). It is attributed
+   *  as a local turn (no Lark fingerprint) but its final is auto-forwarded
+   *  into the originating Lark thread, so it must bypass the ambient
+   *  local-typing suppression — while the NOTHING_TO_SEND check above and the
+   *  send-marker dedup below still apply exactly as for ordinary turns. */
+  isScheduled?: boolean;
   /** Transcript final text for this turn, when available. Lets structured
    *  send markers distinguish final-answer sends from earlier progress sends. */
   finalText?: string;
@@ -359,13 +375,17 @@ export function shouldSuppressBridgeEmit(
 ): boolean {
   if (adoptMode) return false;
   if (isBridgeNothingToSendFinal(turn.finalText)) return true;
-  if (turn.isLocal && !turn.forwardLocalFinal) return true;
+  // Built-in scheduled turns are isLocal but user-scheduled: their final
+  // belongs in the Lark thread. The marker rules below still dedup an explicit
+  // `botmux send` and the NOTHING_TO_SEND check above already ran.
+  if (turn.isLocal && !turn.forwardLocalFinal && !turn.isScheduled) return true;
   if (turn.isLocal && turn.forwardLocalFinal && turn.terminalStatus
     && turn.terminalStatus !== 'completed') return true;
   if (turn.markTimeMs === undefined) return false;
   const lower = turn.markTimeMs;
   const upper = nextBoundaryMs ?? Number.POSITIVE_INFINITY;
-  const inWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper);
+  const inWindow = markers.filter(m => m.sentAtMs >= lower && m.sentAtMs < upper
+    && m.terminalIndependent !== true);
   // An explicit `botmux send --response-kind final` already delivered this
   // turn's final answer to Lark. The unified-reply path also writes
   // replyCardResponseKind='final'; the plain (non-unified) path writes only
@@ -373,12 +393,20 @@ export function shouldSuppressBridgeEmit(
   // terminal-transcription fallback in both cases, otherwise the same answer
   // is double-posted (e.g. Chinese answer sent, then an English summary).
   // Managed-card progress/auxiliary markers are not final deliveries.
-  if (inWindow.some(m => m.responseKind === 'final'
+  if (inWindow.some(m => isFinalBridgeSendMarker(m)
       && (m.replyCardResponseKind === undefined || m.replyCardResponseKind === 'final'))) {
     return true;
   }
   const markersInWindow = inWindow.filter(m => m.replyCardResponseKind === undefined
     || m.replyCardResponseKind === 'final');
+  // A built-in scheduled turn whose final text hasn't been read yet must not be
+  // declared "already delivered" on a progress/legacy marker alone: that marker
+  // may be a short progress note followed by the real (materially longer)
+  // final, and suppressing here would swallow it before the length comparison
+  // can run. Defer — the caller re-evaluates WITH finalText. An explicit
+  // responseKind:'final' marker above already returned true, so a declared
+  // final send still dedups even pre-text.
+  if (turn.isScheduled && turn.finalText === undefined) return false;
   // A trailing sentinel line is the model's explicit "I have nothing more to
   // send" signal. Split the two prose+sentinel cases by whether the model
   // ALREADY sent this turn:
@@ -423,9 +451,9 @@ export function shouldSuppressBridgeEmit(
  * visible outcome. Emit a diagnostic fallback only for that narrow case.
  *
  * Scope note (shared path): this gate feeds worker.ts:emitReadyCodexTurns,
- * which is shared by every structured-bridge CLI (Codex / Traex / Cursor / Pi /
- * Grok / Hermes / Mtr / Coco). In practice only two of them can produce an
- * empty-finalText `assistant_final` that reaches here:
+ * which is shared by every structured-bridge CLI (Codex / Traex / Cursor /
+ * Antigravity / Pi / Grok / Hermes / Mtr / Coco). In practice only two of
+ * them can produce an empty-finalText `assistant_final` that reaches here:
  *   - Traex — `task_complete` with an empty `last_agent_message`
  *     (terminalStatus undefined → treated as completed below);
  *   - Grok  — `turn_completed` + stop_reason `end_turn` where the post-tool

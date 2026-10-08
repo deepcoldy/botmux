@@ -66,6 +66,38 @@ describe('OrdinaryTurnRecoveryCoordinator', () => {
     }));
   });
 
+  it('waits for asynchronous scheduled-turn identity preparation before enqueue', async () => {
+    const scheduled: Array<() => void> = [];
+    const persisted: OrdinaryTurnRecoveryState[] = [];
+    const enqueue = vi.fn(() => true);
+    let release!: () => void;
+    const prepare = vi.fn(() => new Promise<void>(resolve => { release = resolve; }));
+    const coordinator = new OrdinaryTurnRecoveryCoordinator({
+      schedule: (_delayMs, run) => { scheduled.push(run); return run; },
+      cancel: vi.fn(),
+      persist: value => { persisted.push(structuredClone(value)); },
+      prepare,
+      enqueue,
+      warn: vi.fn(),
+      now: () => 1_000,
+      randomId: () => 'prepared',
+      backoffMs: [2_000],
+    });
+    coordinator.onTerminal(state(), {
+      turnId: 'om_original', status: 'failed', retryable: true,
+      errorCode: 'provider_unexpected_eof',
+    });
+    scheduled[0]();
+    expect(prepare).toHaveBeenCalledOnce();
+    expect(enqueue).not.toHaveBeenCalled();
+    expect(persisted.at(-1)?.status).toBe('dispatching');
+    release();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(enqueue).toHaveBeenCalledOnce();
+    expect(persisted.at(-1)?.status).toBe('running');
+  });
+
   it('allows exactly two continuations then raises one exhaustion warning', () => {
     const timers: Array<() => void> = [];
     const warn = vi.fn();

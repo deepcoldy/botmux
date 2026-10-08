@@ -127,7 +127,7 @@ describe('createGroupWithBots', () => {
     expect(mockSendMessage).toHaveBeenCalledWith(
       CREATOR,
       'oc_team',
-      `<at user_id="${USER_OPEN_ID}"></at>`,
+      expect.stringMatching(new RegExp(`^<at user_id="${USER_OPEN_ID}"></at> (群已创建|The group is ready)`)),
       'text',
     );
     expect(result.ownerTransferredTo).toBe(USER_OPEN_ID);
