@@ -618,6 +618,39 @@ describe('Bridge final_output delivery (P2 retry)', () => {
     expect(onComplete).toHaveBeenCalledWith(true, 'om_durable');
   });
 
+  it('keeps the reply-card write fence on the non-primary final path', async () => {
+    vi.useRealTimers();
+    const bot = getBot('app_test');
+    Object.assign(bot.config, { replyCardMode: 'unified', apiOnly: false });
+    vi.mocked(getBot).mockReturnValue(bot);
+    let beforeWrite: (() => void | Promise<void>) | undefined;
+    const sessionReply = vi.fn(async (...args: any[]) => {
+      beforeWrite = args[5]?.beforeWrite;
+      return 'om_reply';
+    });
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/tmp',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    ds.adoptedFrom = undefined;
+    const onComplete = vi.fn();
+    const { __testOnly_deliverFinalOutput: deliver } = await import('../src/core/worker-pool.js');
+
+    deliver(ds, { ...finalOutputMsg(), kind: 'bridge', turnId: 'om_fenced_final' },
+      'tag', 0, onComplete, () => true);
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledOnce());
+
+    expect(beforeWrite).toBeTypeOf('function');
+    bot.config.apiOnly = true;
+    await expect(Promise.resolve().then(() => beforeWrite!()))
+      .rejects.toThrow('Reply-card turn no longer owns delivery');
+    bot.config.apiOnly = false;
+    expect(onComplete).toHaveBeenCalledWith(true, 'om_reply');
+  });
+
   it('fails closed on an ambiguous durable settlement without falling back to direct delivery', async () => {
     const sessionReply = vi.fn(async () => 'om_direct_should_not_run');
     initWorkerPool({ sessionReply, getSessionWorkingDir: () => '/tmp', getActiveCount: () => 1, closeSession: vi.fn() });
