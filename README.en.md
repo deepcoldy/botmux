@@ -148,3 +148,5 @@ External applications can use experimental [model proxy mode](docs/model-proxy.m
 - 📄 **License**: [MIT](LICENSE)
 
 <p align="center">If it's useful, drop a ⭐ Star → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>
+
+[Group creation options and defaults](docs/guide/group-creation.md)

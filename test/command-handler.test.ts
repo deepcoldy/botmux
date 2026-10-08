@@ -6996,6 +6996,27 @@ describe('handleCommand', () => {
     const mockedListBots = vi.mocked(listChatBotMembers);
     const mockedSend = vi.mocked(sendMessage);
 
+    it('applies opt-in defaults using the deployment registry, even without a source-chat peer', async () => {
+      vi.mocked(getBot).mockImplementation(((id: string) => {
+        const bot = defaultGetBot(id);
+        return { ...bot, config: { ...bot.config, groupCreation: { agents: ['Codex'], tag: 'Work', avatar: 'name' } } };
+      }) as any);
+      const deps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project'), deps, LARK_APP_ID);
+      expect(mockedCreate.mock.calls[0][0]).toMatchObject({
+        larkAppIds: ['app-1', 'app-2'], name: 'Project',
+        customization: { tag: 'Work', avatar: 'name', userOpenId: 'ou_sender' },
+      });
+      expect(mockedListBots).not.toHaveBeenCalled();
+    });
+
+    it('rejects unresolved configured agents before creating any group', async () => {
+      const deps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project --agents Missing'), deps, LARK_APP_ID);
+      expect(mockedCreate).not.toHaveBeenCalled();
+      expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('Missing');
+    });
+
     it('creates a solo group (creator only) when no bots are @-mentioned', async () => {
       const ds = makeDaemonSession();
       const deps = makeDeps(ds);

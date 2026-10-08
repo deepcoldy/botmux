@@ -34,6 +34,9 @@ export interface CreateGroupOpts {
    *  (Lark rejects self-invite). May be empty (creator-only chat). */
   larkAppIds: string[];
   name?: string;
+  /** Opt-in decorations; the personal tag requires the invoking user's open_id
+   * in this creator app's scope. Failures never discard an existing chat. */
+  customization?: { tag?: string; avatar?: 'name' | 'off'; userOpenId: string };
   /** Chat topology at creation time. 'topic' creates a 话题群; omit to let
    *  Feishu use its default 普通群 ('group'). Fixed for the chat's lifetime —
    *  it cannot be changed afterwards through this API. */
@@ -104,6 +107,7 @@ export interface CreateGroupResult {
   roleProfileBootstrapError: string | null;
   kickoffMessageId: string | null;
   kickoffError: string | null;
+  customization?: { tagError?: string; avatarError?: string };
 }
 
 export interface TransferGroupOwnerOpts {
@@ -157,6 +161,19 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     chatMode: opts.chatMode,
   });
   opts.onChatCreated?.(r.chatId);
+  const customization: CreateGroupResult['customization'] = opts.customization ? {} : undefined;
+  if (opts.customization?.avatar === 'name') {
+    try {
+      const { applyGroupNameAvatar } = await import('./group-name-avatar.js');
+      await applyGroupNameAvatar(opts.creatorLarkAppId, r.chatId, opts.name ?? '');
+    } catch (err: any) { customization!.avatarError = err?.message ?? String(err); }
+  }
+  if (opts.customization?.tag) {
+    try {
+      const { addCreatedChatToFeedGroup } = await import('./feed-group-tagger.js');
+      await addCreatedChatToFeedGroup(opts.creatorLarkAppId, r.chatId, opts.customization.userOpenId, opts.customization.tag);
+    } catch (err: any) { customization!.tagError = err?.message ?? String(err); }
+  }
   for (let i = 0; i < otherBots.length; i += BOT_BATCH) {
     const batch = otherBots.slice(i, i + BOT_BATCH);
     let added = await addBotToChat(opts.creatorLarkAppId, r.chatId, batch);
@@ -404,5 +421,6 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     roleProfileBootstrapError,
     kickoffMessageId,
     kickoffError,
+    ...(customization ? { customization } : {}),
   };
 }

@@ -1,3 +1,4 @@
+import { parseGroupCreationArgs, resolveGroupCreationAgents, type GroupCreationArgs } from '../services/group-creation-options.js';
 /**
  * Command handler — processes /slash commands from users.
  * Extracted from daemon.ts for modularity.
@@ -4672,17 +4673,27 @@ export async function handleCommand(
         for (const m of mentions) {
           if (m.name) rawArgs = rawArgs.split(`@${m.name}`).join(' ');
         }
-        let roleProfileId: string | undefined;
-        const roleProfileArg = rawArgs.match(/(?:^|\s)--role-profile(?:=|\s+)(\S+)/);
-        if (roleProfileArg) {
-          if (!isValidRoleProfileId(roleProfileArg[1])) {
-            await sessionReply(rootId, t('role.profile.invalid', undefined, loc));
-            break;
+        let groupArgs: GroupCreationArgs;
+        let configuredAgentIds: string[] = [];
+        try {
+          groupArgs = parseGroupCreationArgs(rawArgs, getBot(creatorAppId).config.groupCreation);
+          // Explicit @ mentions retain their existing invite/election semantics.
+          // Defaults fill an unmentioned command; --agents adds explicit peers.
+          if (groupArgs.agents?.length && (mentionedBotAppIds.length === 0 || /(?:^|\s)--agents(?:=|\s)/.test(rawArgs))) {
+            const p = join(config.session.dataDir, 'bots-info.json');
+            const bots = existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')) : [];
+            configuredAgentIds = resolveGroupCreationAgents(groupArgs.agents, bots);
           }
-          roleProfileId = roleProfileArg[1];
-          rawArgs = rawArgs.replace(roleProfileArg[0], ' ');
+        } catch (err: any) {
+          await sessionReply(rootId, t('cmd.group.invalid_options', { reason: err?.message ?? String(err) }, loc));
+          break;
         }
-        const firstLine = rawArgs.split(/\r?\n/).map(s => s.trim()).find(Boolean) ?? '';
+        const { roleProfileId } = groupArgs;
+        if (roleProfileId && !isValidRoleProfileId(roleProfileId)) {
+          await sessionReply(rootId, t('role.profile.invalid', undefined, loc));
+          break;
+        }
+        const firstLine = groupArgs.name;
         let baseGroupName: string;
         if (firstLine) {
           baseGroupName = firstLine;
@@ -4695,7 +4706,7 @@ export async function handleCommand(
 
         // Bots to invite: every @-mentioned bot (creator filtered out internally
         // by the service). Empty mentions → solo group (creator only).
-        const larkAppIdsForGroup = mentionedBotAppIds.length > 0 ? mentionedBotAppIds : [creatorAppId];
+        const larkAppIdsForGroup = [...new Set([creatorAppId, ...mentionedBotAppIds, ...configuredAgentIds])];
 
         try {
           const { createGroupWithBots } = await import('../services/group-creator.js');
@@ -4707,6 +4718,9 @@ export async function handleCommand(
             transferOwnerTo: senderOpenId,
             notifyOwnerOpenId: senderOpenId,
             roleProfileId,
+            ...((groupArgs.tag || groupArgs.avatar === 'name') ? {
+              customization: { tag: groupArgs.tag, avatar: groupArgs.avatar, userOpenId: senderOpenId },
+            } : {}),
           });
           // Prefer the shareable join link (others can click to *join*); fall
           // back to the member-only applink URL when Lark's link API failed.
@@ -4715,6 +4729,8 @@ export async function handleCommand(
           // Partial failures are non-fatal — the chat exists; surface them as
           // hints so the user knows whether to expect to be auto-invited.
           const hints: string[] = [];
+          if (result.customization?.avatarError) hints.push(t('cmd.group.avatar_failed', { reason: result.customization.avatarError }, loc));
+          if (result.customization?.tagError) hints.push(t('cmd.group.tag_failed', { reason: result.customization.tagError }, loc));
           if (result.invalidUserIds.includes(senderOpenId)) {
             hints.push(t('cmd.group.warn_invite_rejected', undefined, loc));
           } else if (result.transferError) {

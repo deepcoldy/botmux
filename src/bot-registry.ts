@@ -1,3 +1,4 @@
+import { parseGroupCreationDefaults, type GroupCreationDefaults } from './services/group-creation-options.js';
 import { parseSandboxNetworkPolicy } from './core/sandbox-network-policy.js';
 import * as Lark from '@larksuiteoapi/node-sdk';
 import { normalizeCodexInstancePool, registerCodexInstanceBot, clearCodexInstanceBots, validateCodexInstanceRoster } from './services/codex-instance-pool.js';
@@ -1442,6 +1443,8 @@ export interface BotConfig {
   /** Final-answer feedback policy. Missing/disabled is intentionally inert. */
   feedback?: FeedbackPolicyInput | FeedbackPolicy;
   oncallGroup?: OncallGroupPolicy;
+  /** Opt-in defaults for explicit /g group creation. */
+  groupCreation?: GroupCreationDefaults;
   /** Per-chat final-answer feedback overrides, scoped to this bot app id. */
   chatFeedbackPolicies?: Record<string, FeedbackPolicyInput>;
   feedbackWebhooks?: { destinations: FeedbackWebhookDestination[] };
@@ -3809,6 +3812,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       // upload etc. already degrade gracefully on an empty secret.
       larkAppSecret: entry.larkAppSecret ?? '',
       apiOnly: entry.apiOnly === true || undefined,
+      groupCreation: entry.groupCreation === undefined ? undefined : parseGroupCreationDefaults(entry.groupCreation),
       oncallGroup: entry.oncallGroup === undefined ? undefined : normalizeOncallGroupPolicy(entry.oncallGroup),
       feedback: entry.feedback === undefined
         ? undefined

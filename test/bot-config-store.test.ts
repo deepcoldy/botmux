@@ -188,6 +188,22 @@ describe('bot-config store', () => {
     expect(store.coerceConfigValue(spec, '{"enabled":true,"audience":"all"}')).toEqual({ ok: false, reason: 'invalid_json' });
   });
 
+  it('validates, persists, cold-loads and clears opt-in /g defaults', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('groupCreation')!;
+    const value = { agents: ['cli_review_app'], tag: 'Work', avatar: 'name' };
+    const parsed = store.coerceConfigValue(spec, JSON.stringify(value));
+    expect(parsed).toEqual({ ok: true, value });
+    if (!parsed.ok) throw new Error(parsed.reason);
+    expect(await store.applyConfigField('app_default', spec, parsed.value)).toMatchObject({ ok: true });
+    expect(readConfig().groupCreation).toEqual(value);
+    expect(registry.loadBotConfigs()[0].groupCreation).toEqual(value);
+    expect(registry.getBot('app_default').config.groupCreation).toEqual(value);
+    expect(store.coerceConfigValue(spec, '{"agents":"bad"}').ok).toBe(false);
+    await store.applyConfigField('app_default', spec, null);
+    expect(readConfig().groupCreation).toBeUndefined();
+  });
+
   it('persists Oncall button settings without changing feedback or chat overrides', async () => {
     const original = { feedback: { enabled: true, allowReselect: true }, chatFeedbackPolicies: { oc_a: { enabled: false } } };
     const { registry, store } = await loaded(original);

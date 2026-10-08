@@ -199,3 +199,5 @@ botmux 不重新实现记忆、上下文管理、工具调用、权限体系—�
 - 📄 **License**：[MIT](LICENSE)
 
 <p align="center">好用的话，顺手点个 ⭐ Star 吧 → <a href="https://github.com/deepcoldy/botmux">deepcoldy/botmux</a></p>
+
+[建群参数与默认配置](docs/guide/group-creation.md)
