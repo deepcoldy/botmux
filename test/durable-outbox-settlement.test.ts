@@ -85,6 +85,33 @@ describe('durable outbox settlement', () => {
     await expect(accepted.settlement).resolves.toMatchObject({ kind: 'ambiguous' });
   });
 
+  it('removes each abort listener after a normal polling interval completes', async () => {
+    vi.useFakeTimers();
+    try {
+      const durableStore = store();
+      vi.mocked(durableStore.readOutbox)
+        .mockResolvedValueOnce(row('pending'))
+        .mockResolvedValueOnce(row('delivered'));
+      const controller = new AbortController();
+      const add = vi.spyOn(controller.signal, 'addEventListener');
+      const remove = vi.spyOn(controller.signal, 'removeEventListener');
+      const settlement = waitForDurableOutboxSettlement({
+        store: durableStore,
+        messageId: 'outbox-1',
+        intervalMs: 10,
+        signal: controller.signal,
+      });
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(10);
+      await expect(settlement).resolves.toMatchObject({ kind: 'delivered' });
+      expect(add).toHaveBeenCalledTimes(1);
+      expect(remove).toHaveBeenCalledTimes(1);
+      expect(remove).toHaveBeenCalledWith('abort', add.mock.calls[0][1]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each(['conflict', 'stale_lease'] as const)('does not start settlement after %s', async kind => {
     const durableStore = store();
     vi.mocked(durableStore.enqueueOutbox).mockResolvedValue({ kind } as never);

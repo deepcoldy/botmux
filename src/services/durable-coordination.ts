@@ -113,6 +113,7 @@ export interface DurableOutboxMessage {
   sessionKey: string;
   payload: DurableJson;
   visibleAt: number;
+  /** 仅用于观测和幂等窗口；同 Session FIFO 必须由 store 的插入序号决定。 */
   createdAt: number;
 }
 

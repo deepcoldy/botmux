@@ -14,7 +14,8 @@ BotMux 当前把入站去重、同会话串行、Session 状态和投递回执�
 4. 租约时间由 store 自己决定。本地实现使用注入时钟；远程实现必须在事务内使用服务端时间，不能信任不同 worker 的墙钟。
 5. Session 状态使用 revision compare-and-set，避免新 owner 的更新被旧快照覆盖。
 6. outbox 先 reserve，再显式 begin attempt。`reserved` 尚未越过副作用边界，租约过期后可以重新领取；`attempting` 已可能产生外部副作用，租约过期后只能进入 `ambiguous`，不能自动重放。
-7. confirmed receipt 可以结算精确的旧 attempt；不同 claim epoch 或 attempt number 的迟到结果必须被拒绝。
+7. 同一 Session 的 outbox 严格按 store 在插入事务中分配的序号投递；`createdAt` 和 `messageId` 都是客户端输入，不能作为跨副本 FIFO 的事实源。
+8. confirmed receipt 可以结算精确的旧 attempt；不同 claim epoch 或 attempt number 的迟到结果必须被拒绝。
 
 ## ACK 边界
 
@@ -63,7 +64,7 @@ App ingress lease leader
 
 SQLite 参考实现位于 `src/services/sqlite-durable-coordination.ts`，使用独立 schema 和短事务。长 turn 不持有数据库事务，只持有可续租的 Session lease。
 
-SQLite inbox 使用独立的 autoincrement order 表，在 event insert 的同一事务内分配全局 sequence；claim 的 per-partition earlier fence 与候选排序都使用该 sequence。旧 version-1 数据库首次打开时按已有 `created_at,event_id` 做一次确定性 backfill，之后所有新事件不再依赖客户端时间。远程 provider 必须用数据库 sequence/identity 或等价的事务序号实现同一语义。
+SQLite inbox 和 outbox 分别使用独立的 autoincrement order 表，在 row insert 的同一事务内分配全局 sequence；inbox 的 per-partition earlier fence、outbox 的 per-Session earlier fence 与候选排序都使用对应 sequence。旧 version-1 数据库首次打开时分别按已有 `created_at,event_id` 和 `created_at,message_id` 做一次确定性 backfill，之后所有新事件和消息不再依赖客户端时间。远程 provider 必须用数据库 sequence/identity 或等价的事务序号实现同一语义。
 
 ```text
 inbox:  queued ──claim──> claimed ──complete──> completed
@@ -128,6 +129,8 @@ Pump 本身不包含 Lark 语义。Lark adapter 使用版本化 envelope 冻结 
 `enqueueDurableOutboxWithSettlement` 在 fenced enqueue 后返回一个权威 settlement Promise。它轮询 store 中的 outbox row，直到 `delivered` 或 `ambiguous`；不依赖进程内 pump observer，因此另一副本 takeover 后完成的投递也能释放原进程的 final-drain 等待。duplicate 会跟随现有 row，conflict/stale lease 不启动等待；shutdown abort 只终止本地等待，不改写 durable row 状态。
 
 `enqueueDurableLarkSessionOutput` 把 Session 与 output 绑在同一 fencing 证明上：先 exact-write 最新完整 Session snapshot，取得新 lease/record，再用该 lease enqueue frozen outbox message，最后返回跨副本 settlement。outbox `sessionKey` 在任何写入前必须与 canonical Session key 一致；Session occupied/conflict/stale 时不创建 output，outbox conflict/stale 显式返回，不能回退到直接 transport。
+
+Session write 与 outbox enqueue 是两个短事务，二者之间的进程硬崩不能伪装成原子提交。调用侧因此必须把 final 的 provider UUID 绑定到逻辑 app/scope/anchor/turn，而不是本地 Session UUID，并在 owning daemon 连接中断或启动期 5xx 时做有界重试。重试携带完全相同的 turn、payload 与 UUID：若首轮尚未 enqueue，重试补齐 outbox；若首轮已 enqueue 或已投递，message id 唯一键与 provider UUID 会返回 duplicate/原 provider receipt；`ambiguous`、payload conflict 与非重试状态始终 fail closed。
 
 `enqueueDurableLarkFinalOutput` 在任何异步 Session/outbox 操作前同步注册现有 daemon final-output drain fence。只有 outbox 权威 settlement 到达 `delivered`/`ambiguous`，或 pre-enqueue 明确失败/本地等待被 abort，才释放 fence；因此 shutdown snapshot 不会漏掉正在写 Session 或等待另一副本投递的 final output。
 
@@ -205,6 +208,8 @@ Adapter 复用现有 `sendMessage` / `replyMessage`、`classifyFeishuError` 和 
 - drain-before-release、lost callback-before-release，以及覆盖 release 的单一 shutdown deadline。
 
 `test/durable-outbox-settlement.test.ts` 覆盖 fenced enqueue、跨副本 pending→attempting→delivered、duplicate/ambiguous、conflict/stale lease 与本地 abort 不篡改 durable row。
+
+`test/cli-durable-session-send.test.ts` 覆盖逻辑会话稳定 final UUID、daemon 连接丢失/启动期 5xx 的同 payload 有界重试，以及 durable ambiguous 不重试。
 
 `test/durable-lark-session-output.test.ts` 覆盖 Session-before-outbox 顺序、同一 epoch fencing、权威 settlement、跨 Session target 预写拒绝，以及 Session occupied/outbox conflict/stale containment。
 

@@ -109,6 +109,12 @@ CREATE TABLE IF NOT EXISTS durable_outbox (
 );
 CREATE INDEX IF NOT EXISTS durable_outbox_claim_idx
   ON durable_outbox(state, visible_at, created_at, message_id);
+CREATE TABLE IF NOT EXISTS durable_outbox_order (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id TEXT NOT NULL UNIQUE
+);
+INSERT OR IGNORE INTO durable_outbox_order(message_id)
+  SELECT message_id FROM durable_outbox ORDER BY created_at, message_id;
 `;
 
 type LeaseRow = {
@@ -559,7 +565,12 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
         input.message.createdAt,
         now,
       );
-      if (Number(inserted.changes) === 1) return { kind: 'inserted' as const };
+      if (Number(inserted.changes) === 1) {
+        this.db.prepare(
+          'INSERT INTO durable_outbox_order(message_id) VALUES(?)',
+        ).run(input.message.messageId);
+        return { kind: 'inserted' as const };
+      }
       const current = this.db.prepare(
         'SELECT session_key, payload_hash FROM durable_outbox WHERE message_id = ?',
       ).get(input.message.messageId) as { session_key: string; payload_hash: string };
@@ -593,18 +604,17 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
       ).run(now, now);
       const candidate = this.db.prepare(
         `SELECT o.message_id FROM durable_outbox o
+          JOIN durable_outbox_order current_order ON current_order.message_id = o.message_id
           WHERE o.visible_at <= ?
             AND (o.state = 'pending' OR (o.state = 'reserved' AND o.claim_until <= ?))
             AND NOT EXISTS (
               SELECT 1 FROM durable_outbox earlier
+               JOIN durable_outbox_order earlier_order ON earlier_order.message_id = earlier.message_id
                WHERE earlier.session_key = o.session_key
                  AND earlier.state != 'delivered'
-                 AND (
-                   earlier.created_at < o.created_at
-                   OR (earlier.created_at = o.created_at AND earlier.message_id < o.message_id)
-                 )
+                 AND earlier_order.sequence < current_order.sequence
             )
-          ORDER BY o.visible_at, o.created_at, o.message_id
+          ORDER BY o.visible_at, current_order.sequence
           LIMIT 1`,
       ).get(now, now) as { message_id: string } | undefined;
       if (!candidate) return undefined;

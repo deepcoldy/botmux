@@ -48,12 +48,19 @@ function abortError(signal: AbortSignal): Error {
 function wait(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.reject(abortError(signal));
   return new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
+    const cleanup = (): void => signal?.removeEventListener('abort', onAbort);
+    const timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
     timer.unref?.();
-    signal?.addEventListener('abort', () => {
+    const onAbort = (): void => {
+      if (!signal) return;
       clearTimeout(timer);
+      cleanup();
       reject(abortError(signal));
-    }, { once: true });
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 
