@@ -218,6 +218,32 @@ describe('independent turn terminal receipt', () => {
     expect(sessionReplyMock).not.toHaveBeenCalled();
   });
 
+  it('treats a suppression sentinel as completed when an explicit body was sent', async () => {
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_explicit_then_sentinel');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: 'om_turn_explicit_then_sentinel',
+      messageId: 'om_answer_card',
+      responseKind: 'final',
+      terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+    (ds.worker as any).emit('message', terminalMsg('om_turn_explicit_then_sentinel', {
+      outputDisposition: 'nothing_to_send',
+    }));
+
+    await vi.waitFor(() => expect(updateMessage).toHaveBeenCalledWith(
+      'app_test',
+      'om_answer_card',
+      expect.stringContaining('"terminal":"completed"'),
+    ));
+    expect(ds.silentIdleTurnId).toBeUndefined();
+    expect(buildTurnTerminalReceiptCard).not.toHaveBeenCalled();
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+
   it('appends the strip when the last carrier is not patchable', async () => {
     const ds = makeDs();
     bindLarkTurn(ds, 'om_turn_file');

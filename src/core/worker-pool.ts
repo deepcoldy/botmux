@@ -16057,8 +16057,12 @@ function setupWorkerHandlers(
         // must retain their pre-existing explicit-@ text receipt instead;
         // managed turns remain suppressed by the existing gate below.
         const terminalReplyContext = ds.session.turnReplyContexts?.[msg.turnId];
+        const terminalCarrier = ds.turnTerminalCarriers?.get(msg.turnId);
         const terminalReceiptKind: TurnTerminalReceiptKind | undefined = msg.status === 'completed'
-          ? (msg.outputDisposition === 'nothing_to_send' ? 'silent' : 'completed')
+          // A successful explicit send is visible output even though the
+          // model's final assistant block is the required suppression sentinel.
+          // Only a genuinely bodyless turn may claim "AI determined no reply".
+          ? (msg.outputDisposition === 'nothing_to_send' && !terminalCarrier ? 'silent' : 'completed')
           : undefined;
         const shouldPostTerminalReceipt = terminalReceiptKind !== undefined
           && !!terminalReplyContext
@@ -16082,6 +16086,7 @@ function setupWorkerHandlers(
         //     it must never re-trigger the bot (or a peer bot) that went quiet.
         if (msg.status === 'completed'
           && msg.outputDisposition === 'nothing_to_send'
+          && !terminalCarrier
           && !ds.session.vcMeetingReceiver) {
           // Consume the origin record ONLY when this attempt could actually post:
           // a suppressed attempt that ate the record would leave a later,
