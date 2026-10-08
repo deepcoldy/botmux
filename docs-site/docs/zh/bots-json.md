@@ -237,7 +237,7 @@ Dashboard 保存后无需重启 daemon。模型、思考强度分别选择“继
 
 | 字段 | 说明 |
 |------|------|
-| `brandLabel` | 卡片底部品牌文案。`undefined`=默认 `botmux` 链接；`""`=隐藏；其它字符串=原样渲染（支持 markdown）。纯样式，不影响路由 / 权限 |
+| `brandLabel` | 卡片底部品牌文案。`undefined`=默认 `Powered by [botmux](https://github.com/deepcoldy/botmux) with :LOVE:`；`""`=隐藏；其它字符串=原样渲染（支持 markdown）。纯样式，不影响路由 / 权限 |
 | `showUsageInCardFooter` | 回复卡片页脚是否展示 Agent CLI 原生提供的 Context / Token 用量。缺省 / `true`=展示，`false`=同时隐藏两项；单项数据缺失时仍只省略缺失项。仅控制卡片展示，不停止 Usage Ledger 或其它统计 |
 | `modelBackendVariant` 显示 | 已冻结的 TraeX 后端变体只显示在实时流式 session 卡片的运行时标识中；回复卡片页脚只显示 Context / Token 用量，不展示该变体 |
 | `disableStreamingCard` | `true` 时彻底不发实时流式 session 卡片（web 终端仍跑、最终答复仍经 `botmux send` 到达，只是没有自动刷新的状态卡）。给嫌实时卡吵的用户 |

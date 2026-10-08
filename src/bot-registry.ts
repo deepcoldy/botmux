@@ -2013,7 +2013,7 @@ export interface BotConfig {
   skills?: BotSkillPolicy;
   /**
    * Custom footer brand label for cards this bot sends. Three states:
-   *   • `undefined` (unset)  → default `[botmux](github)` link
+   *   • `undefined` (unset)  → default `Powered by [botmux](https://github.com/deepcoldy/botmux) with :LOVE:`
    *   • `''` (empty)         → brand suppressed (footer shows only 发送给 if any)
    *   • any other string     → rendered verbatim (markdown allowed)
    * Resolved via {@link resolveBrandLabel}. Pure cosmetic — does not affect

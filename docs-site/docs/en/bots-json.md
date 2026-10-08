@@ -234,7 +234,7 @@ This option addresses one narrow gap: Codex running through Botmux's app-server 
 
 | Field | Description |
 |------|------|
-| `brandLabel` | Branding text at the bottom of the card. `undefined` = default `botmux` link; `""` = hidden; any other string = rendered as-is (supports markdown). Purely cosmetic, does not affect routing / permissions |
+| `brandLabel` | Branding text at the bottom of the card. `undefined` = default `Powered by [botmux](https://github.com/deepcoldy/botmux) with :LOVE:`; `""` = hidden; any other string = rendered as-is (supports markdown). Purely cosmetic, does not affect routing / permissions |
 | `showUsageInCardFooter` | Whether reply-card footers show native Context / Token usage from the Agent CLI. Missing / `true` = show; `false` = hide both metrics. A missing individual metric is still omitted independently. This controls card display only and does not disable the Usage Ledger or other accounting |
 | `modelBackendVariant` display | A frozen TraeX backend variant appears only in the runtime identity on the live streaming session card. Reply-card footers show Context / Token usage only; they do not show the variant |
 | `disableStreamingCard` | When `true`, no real-time streaming session card is sent at all (the Web Terminal still runs and the final reply still arrives via `botmux send`, there's just no auto-refreshing status card). For users who find the real-time card noisy |
