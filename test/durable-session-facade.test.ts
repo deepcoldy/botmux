@@ -201,6 +201,46 @@ describe('durable session facade', () => {
     await facade.stop();
   });
 
+  it('builds exact FIFO values from the leased current record without a read-merge-write gap', async () => {
+    const { store, records } = fakeStore();
+    const firstAcquire = deferred<SessionLeaseAcquisition>();
+    const defaultAcquire = store.acquireSessionLease.getMockImplementation();
+    vi.mocked(store.acquireSessionLease)
+      .mockImplementationOnce(() => firstAcquire.promise)
+      .mockImplementation(defaultAcquire!);
+    const facade = createDurableSessionFacade({ store, ownerId: 'facade-current-boot' });
+
+    const first = facade.writeExactFromCurrent('session-a', current => ({
+      events: [...((current?.value as { events?: number[] } | undefined)?.events ?? []), 1],
+    }));
+    const second = facade.writeExactFromCurrent('session-a', current => ({
+      events: [...((current?.value as { events?: number[] } | undefined)?.events ?? []), 2],
+    }));
+    firstAcquire.resolve({
+      kind: 'acquired',
+      lease: {
+        sessionKey: 'session-a',
+        ownerId: 'facade-current-boot',
+        epoch: 1,
+        leaseUntil: 60_000,
+      },
+    });
+
+    await expect(first).resolves.toMatchObject({
+      kind: 'written',
+      record: { revision: 1, value: { events: [1] } },
+    });
+    await expect(second).resolves.toMatchObject({
+      kind: 'written',
+      record: { revision: 2, value: { events: [1, 2] } },
+    });
+    expect(records.get('session-a')).toMatchObject({
+      revision: 2,
+      value: { events: [1, 2] },
+    });
+    await facade.stop();
+  });
+
   it('surfaces occupied, conflict, and stale lease results without retrying blindly', async () => {
     const occupied = fakeStore();
     vi.mocked(occupied.store.acquireSessionLease).mockResolvedValue({

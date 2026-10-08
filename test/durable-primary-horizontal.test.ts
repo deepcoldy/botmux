@@ -96,6 +96,7 @@ describe('durable primary horizontal failover', () => {
         facade: firstLeader.session,
         store: stores[firstLeaderIndex],
         inbound: {
+          eventType: 'lark.im.message.receive_v1',
           eventId: 'im.message.receive_v1:cli_horizontal:om_event_0',
           partitionKey: 'lark-message-routing:cli_horizontal:oc_chat_0',
           larkAppId: 'cli_horizontal',
@@ -147,6 +148,7 @@ describe('durable primary horizontal failover', () => {
           facade: survivor.session,
           store: stores[survivorIndex],
           inbound: {
+            eventType: 'lark.im.message.receive_v1',
             eventId: `im.message.receive_v1:cli_horizontal:${messageId}`,
             partitionKey: `lark-message-routing:cli_horizontal:oc_chat_${i}`,
             larkAppId: 'cli_horizontal',

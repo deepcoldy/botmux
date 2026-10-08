@@ -61,6 +61,7 @@ function store() {
 }
 
 const inbound = {
+  eventType: 'lark.im.message.receive_v1' as const,
   eventId: 'im.message.receive_v1:cli_test:om_input',
   partitionKey: 'lark-message-routing:cli_test:oc_chat',
   larkAppId: 'cli_test', messageId: 'om_input', attempts: 1,

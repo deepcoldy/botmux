@@ -9,6 +9,10 @@ import type {
 import { createDurableSessionFacade, type DurableSessionFacadeStore } from '../src/services/durable-session-facade.js';
 import type { DurableLarkMessageClaim } from '../src/services/durable-inbox-shadow.js';
 import { enqueueDurableLarkSessionOutput } from '../src/services/durable-lark-session-output.js';
+import {
+  admitDurableLarkSession,
+  parseDurablePrimarySessionRecord,
+} from '../src/services/durable-session-primary.js';
 
 function session(): Session {
   return {
@@ -17,12 +21,13 @@ function session(): Session {
   };
 }
 
-function inbound(): DurableLarkMessageClaim {
+function inbound(messageId = 'om_input'): DurableLarkMessageClaim {
   return {
-    eventId: 'im.message.receive_v1:cli_test:om_input',
+    eventType: 'lark.im.message.receive_v1',
+    eventId: `im.message.receive_v1:cli_test:${messageId}`,
     partitionKey: 'lark-message-routing:cli_test:oc_chat',
-    larkAppId: 'cli_test', messageId: 'om_input', attempts: 1,
-    data: { message: { message_id: 'om_input' } },
+    larkAppId: 'cli_test', messageId, attempts: 1,
+    data: { message: { message_id: messageId } },
   };
 }
 
@@ -85,6 +90,33 @@ describe('durable Lark Session output', () => {
     expect(order).toEqual(['session', 'outbox:9']);
     if (result.kind !== 'accepted') throw new Error('expected accepted output');
     await expect(result.settlement).resolves.toMatchObject({ kind: 'delivered' });
+    await facade.stop();
+  });
+
+  it('delivers turn N after type-ahead turn N+1 has already committed', async () => {
+    const { store } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'output-type-ahead-boot' });
+    await admitDurableLarkSession({ facade, message: inbound('om_n'), session: session() });
+    await admitDurableLarkSession({ facade, message: inbound('om_n_plus_1'), session: session() });
+    const beforeOutput = await store.readSession('om_root::cli_test');
+    expect(parseDurablePrimarySessionRecord(beforeOutput!).admissions.map(entry => entry.messageId))
+      .toEqual(['om_n', 'om_n_plus_1']);
+
+    const result = await enqueueDurableLarkSessionOutput({
+      facade,
+      store,
+      inbound: inbound('om_n'),
+      session: session(),
+      message: outbox('pending'),
+    });
+
+    expect(result.kind).toBe('accepted');
+    expect(store.enqueueOutbox).toHaveBeenCalledOnce();
+    if (result.kind !== 'accepted') throw new Error('expected accepted output');
+    await expect(result.settlement).resolves.toMatchObject({ kind: 'delivered' });
+    const afterOutput = await store.readSession('om_root::cli_test');
+    expect(new Set(parseDurablePrimarySessionRecord(afterOutput!).admissions.map(entry => entry.messageId)))
+      .toEqual(new Set(['om_n', 'om_n_plus_1']));
     await facade.stop();
   });
 

@@ -90,6 +90,7 @@ import { DROPPED_REACTION_EMOJI_TYPE } from '../../core/pending-response.js';
 import type { DurableInboxStore } from '../../services/durable-coordination.js';
 import {
   enqueueDurableLarkMessage,
+  type DurableLarkMessageEventType,
   type DurableLarkMessageClaim,
 } from '../../services/durable-inbox-shadow.js';
 import type {
@@ -3886,6 +3887,7 @@ export interface LarkEventDispatcherRuntime {
 export interface LarkEventDispatcherRuntimeOptions {
   enqueuePrimary?: (input: {
     eventId: string;
+    eventType?: DurableLarkMessageEventType;
     partitionKey: string;
     data: unknown;
   }) => Promise<unknown>;
@@ -5043,7 +5045,8 @@ export function createLarkEventDispatcherRuntime(
       }
       const payload = { data, ctx, ownsSession } satisfies PendingForwardTopicPayload;
       const groupMentionMode = resolveGroupMentionMode(larkAppId, chatId);
-      const shouldDelayTopicSeed = usesForwardFollowupDelay(groupMentionMode)
+      const shouldDelayTopicSeed = config.daemon.forwardFollowupWaitMs > 0
+        && usesForwardFollowupDelay(groupMentionMode)
         && !pairedForwardSeed
         && !isControlCommand
         && !!senderOpenId
@@ -5174,7 +5177,10 @@ export function createLarkEventDispatcherRuntime(
    *
    * 语义因此是「一次延迟的首次 @」，而不是「编辑即重新执行」。
    */
-  async function processMessageUpdatedEvent(rawData: any): Promise<void> {
+  async function processMessageUpdatedEvent(
+    rawData: any,
+    primary?: PrimaryProcessContext,
+  ): Promise<DurableLarkCanonicalHandlerResult | void> {
     try {
       const eventMessage = rawData?.message ?? rawData?.event?.message;
       const messageId: string | undefined = eventMessage?.message_id;
@@ -5247,9 +5253,10 @@ export function createLarkEventDispatcherRuntime(
         if (unionId) data.sender.sender_id.union_id = unionId;
       }
       // 复用完整消息处理链路：权限/@ 闸、mention 策略、路由、会话派发全部与新消息一致。
-      await processMessageEvent(data);
+      return await processMessageEvent(data, undefined, primary);
     } catch (err) {
       logger.error(`Error handling message updated event: ${err}`);
+      if (primary) throw err;
     }
   }
 
@@ -5419,13 +5426,22 @@ export function createLarkEventDispatcherRuntime(
     'im.message.updated_v1': (data: any) => {
       const eventMessage = data?.message ?? data?.event?.message;
       const eventKey = `im.message.updated_v1:${larkAppId}:${eventIdForKey(data) ?? eventMessage?.message_id ?? unkeyableEventKey()}`;
+      const ingressAnchor = rawMessageIngressAnchor(larkAppId, eventMessage);
+      if (runtimeOptions.enqueuePrimary) {
+        return runtimeOptions.enqueuePrimary({
+          eventId: eventKey,
+          eventType: 'lark.im.message.updated_v1',
+          partitionKey: ingressAnchor,
+          data,
+        }).then(() => undefined);
+      }
       // 事件常不带 chat_id（字段不可靠）；缺时 rawMessageIngressAnchor 收敛到 __chatless__
       // 全局泳道，读回权威消息后再在 processMessageEvent 内按真实 anchor 串行。
       scheduleAckSafeEvent(
         eventKey,
         () => serializeByAnchor(
-          rawMessageIngressAnchor(larkAppId, eventMessage),
-          () => processMessageUpdatedEvent(data),
+          ingressAnchor,
+          () => processMessageUpdatedEvent(data).then(() => undefined),
         ),
         'message updated event',
       );
@@ -5522,9 +5538,12 @@ export function createLarkEventDispatcherRuntime(
       if (message.larkAppId !== larkAppId) {
         throw new Error('durable primary message belongs to another Lark application');
       }
+      const primary = { message, context };
       const result = await serializeByAnchor(
         message.partitionKey,
-        () => processMessageEvent(message.data, undefined, { message, context }),
+        () => message.eventType === 'lark.im.message.updated_v1'
+          ? processMessageUpdatedEvent(message.data, primary)
+          : processMessageEvent(message.data, undefined, primary),
         0,
       );
       return result ?? { kind: 'ignored', reason: 'message was filtered before canonical admission' };

@@ -42,6 +42,7 @@ function session(overrides: Partial<Session> = {}): Session {
 
 function message(messageId: string): DurableLarkMessageClaim {
   return {
+    eventType: 'lark.im.message.receive_v1',
     eventId: `im.message.receive_v1:cli_test:${messageId}`,
     partitionKey: 'lark-message-routing:cli_test:oc_chat',
     larkAppId: 'cli_test',
@@ -108,7 +109,21 @@ describe('durable primary Session admission', () => {
         partitionKey: 'lark-message-routing:cli_test:oc_chat',
         messageId: 'om_current',
       },
+      admissions: [{ messageId: 'om_current' }],
     });
+  });
+
+  it('reads a version-1 primary record written before admission history was added', () => {
+    const projected = durablePrimarySessionProjection(session(), message('om_legacy'));
+    const value = projected.value as Record<string, unknown>;
+    delete value.admissions;
+    const parsed = parseDurablePrimarySessionRecord({
+      sessionKey: projected.sessionKey,
+      revision: 1,
+      value: projected.value,
+      updatedAt: 10_000,
+    });
+    expect(parsed.admissions).toEqual([parsed.admission]);
   });
 
   it('commits concurrent events as exact FIFO revisions and mints event-bound receipts', async () => {
@@ -133,8 +148,69 @@ describe('durable primary Session admission', () => {
     });
     expect(store.writeSession).toHaveBeenCalledTimes(2);
     expect(parseDurablePrimarySessionRecord(records.get('om_root::cli_test')!))
-      .toMatchObject({ admission: { messageId: 'om_2' } });
+      .toMatchObject({
+        admission: { messageId: 'om_2' },
+        admissions: [{ messageId: 'om_1' }, { messageId: 'om_2' }],
+      });
     await facade.stop();
+  });
+
+  it('keeps the earlier turn admission after a type-ahead turn commits', async () => {
+    const { store, records } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'primary-type-ahead-boot' });
+
+    await admitDurableLarkSession({ facade, message: message('om_n'), session: session() });
+    await admitDurableLarkSession({
+      facade,
+      message: message('om_n_plus_1'),
+      session: session({ lastMessageAt: '2026-10-05T00:02:00.000Z' }),
+    });
+
+    const parsed = parseDurablePrimarySessionRecord(records.get('om_root::cli_test')!);
+    expect(parsed.admissions.find(entry => entry.messageId === 'om_n')).toMatchObject({
+      eventId: 'im.message.receive_v1:cli_test:om_n',
+    });
+    expect(parsed.admissions.find(entry => entry.messageId === 'om_n_plus_1')).toMatchObject({
+      eventId: 'im.message.receive_v1:cli_test:om_n_plus_1',
+    });
+    await facade.stop();
+  });
+
+  it('bounds admission history while retaining the newest 64 turns', async () => {
+    const { store, records } = fakeStore();
+    const facade = createDurableSessionFacade({ store, ownerId: 'primary-bounded-boot' });
+
+    for (let index = 0; index < 65; index += 1) {
+      await admitDurableLarkSession({
+        facade,
+        message: message(`om_${index}`),
+        session: session({ lastMessageAt: `2026-10-05T00:02:${String(index).padStart(2, '0')}.000Z` }),
+      });
+    }
+
+    const parsed = parseDurablePrimarySessionRecord(records.get('om_root::cli_test')!);
+    expect(parsed.admissions).toHaveLength(64);
+    expect(parsed.admissions[0]?.messageId).toBe('om_1');
+    expect(parsed.admissions.at(-1)?.messageId).toBe('om_64');
+    await facade.stop();
+  });
+
+  it('accepts the durable identity of a message-updated first-mention turn', () => {
+    const updated: DurableLarkMessageClaim = {
+      ...message('om_edited'),
+      eventType: 'lark.im.message.updated_v1',
+      eventId: 'im.message.updated_v1:cli_test:evt_edit_1',
+    };
+    const projected = durablePrimarySessionProjection(session(), updated);
+    expect(parseDurablePrimarySessionRecord({
+      sessionKey: projected.sessionKey,
+      revision: 1,
+      value: projected.value,
+      updatedAt: 10_000,
+    }).admission).toMatchObject({
+      eventId: 'im.message.updated_v1:cli_test:evt_edit_1',
+      messageId: 'om_edited',
+    });
   });
 
   it('forces a new revision for a retried exact event and keeps sensitive Session fields out of the receipt', async () => {

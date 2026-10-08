@@ -6,7 +6,10 @@ import type {
   DurableSessionLeaseStore,
   SessionLease,
 } from './durable-coordination.js';
-import { durableLarkMessageEvent } from './durable-inbox-shadow.js';
+import {
+  durableLarkMessageEvent,
+  type DurableLarkMessageEventType,
+} from './durable-inbox-shadow.js';
 
 export type DurableLarkPrimaryIngressStore = DurableInboxStore & DurableSessionLeaseStore;
 
@@ -33,6 +36,7 @@ export interface DurableLarkPrimaryIngress {
   status(): DurableLarkPrimaryIngressStatus;
   enqueueBeforeAck(input: {
     eventId: string;
+    eventType?: DurableLarkMessageEventType;
     partitionKey: string;
     data: unknown;
   }): Promise<Exclude<DurableInsertResult, { kind: 'conflict' }>>;
@@ -93,7 +97,13 @@ function waitWithTimeout<T>(promise: Promise<T>, timeoutMs: number, error: Error
 
 function larkMessageId(value: unknown): string | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  const message = (value as Record<string, unknown>).message;
+  const envelope = value as Record<string, unknown>;
+  const nested = envelope.event;
+  const message = envelope.message ?? (
+    nested && typeof nested === 'object' && !Array.isArray(nested)
+      ? (nested as Record<string, unknown>).message
+      : undefined
+  );
   if (!message || typeof message !== 'object' || Array.isArray(message)) return undefined;
   const messageId = (message as Record<string, unknown>).message_id;
   return typeof messageId === 'string' ? messageId : undefined;
@@ -285,8 +295,16 @@ export function startDurableLarkPrimaryIngress(
         throw new Error('durable Lark ingress partition does not match the application');
       }
       const messageId = larkMessageId(input.data);
+      const eventType = input.eventType ?? 'lark.im.message.receive_v1';
+      const expectedReceiveEventId = `im.message.receive_v1:${larkAppId}:${messageId}`;
+      const expectedUpdatedPrefix = `im.message.updated_v1:${larkAppId}:`;
       if (!messageId || !messageId.startsWith('om_') || messageId.length > 256
-          || eventId !== `im.message.receive_v1:${larkAppId}:${messageId}`) {
+          || (eventType !== 'lark.im.message.receive_v1'
+            && eventType !== 'lark.im.message.updated_v1')
+          || (eventType === 'lark.im.message.receive_v1' && eventId !== expectedReceiveEventId)
+          || (eventType === 'lark.im.message.updated_v1'
+            && (!eventId.startsWith(expectedUpdatedPrefix)
+              || eventId.length === expectedUpdatedPrefix.length))) {
         throw new Error('durable Lark ingress event does not match the application message identity');
       }
       const wallNow = now();
@@ -296,6 +314,7 @@ export function startDurableLarkPrimaryIngress(
       const createdAt = Math.max(wallNow, lastCreatedAt + 1);
       event = durableLarkMessageEvent({
         larkAppId,
+        eventType,
         eventId,
         partitionKey,
         data: input.data,

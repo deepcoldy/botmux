@@ -10,6 +10,10 @@ import { canonicalJson } from '../utils/canonical-input-hash.js';
 
 export type DurableSessionFacadeStore = DurableSessionLeaseStore & DurableSessionStateStore;
 
+export type DurableSessionExactValueBuilder = (
+  current: DurableSessionRecord | undefined,
+) => DurableJson;
+
 export type DurableSessionFacadeWriteResult =
   | { kind: 'written'; lease: SessionLease; record: DurableSessionRecord; coalescedCount: number }
   | { kind: 'unchanged'; lease: SessionLease; record: DurableSessionRecord; coalescedCount: number }
@@ -40,6 +44,11 @@ export interface DurableSessionFacade {
   write(sessionKey: string, value: DurableJson): Promise<DurableSessionFacadeWriteResult>;
   /** Admission writes are FIFO and are never merged across distinct events. */
   writeExact(sessionKey: string, value: DurableJson): Promise<DurableSessionFacadeWriteResult>;
+  /** Build one exact FIFO value from the leased current record inside the Session lane. */
+  writeExactFromCurrent(
+    sessionKey: string,
+    buildValue: DurableSessionExactValueBuilder,
+  ): Promise<DurableSessionFacadeWriteResult>;
   stop(timeoutMs?: number): Promise<DurableSessionFacadeStopResult>;
   terminate(): void;
 }
@@ -52,14 +61,17 @@ export interface DurableSessionFacadeOptions {
   shutdownMs?: number;
 }
 
-interface PendingWrite {
-  mode: 'coalesced' | 'exact';
-  value: DurableJson;
+interface PendingWriteBase {
   waiters: Array<{
     resolve: (result: DurableSessionFacadeWriteResult) => void;
     reject: (error: unknown) => void;
   }>;
 }
+
+type PendingWrite = PendingWriteBase & (
+  | { mode: 'coalesced' | 'exact'; value: DurableJson }
+  | { mode: 'exact-current'; buildValue: DurableSessionExactValueBuilder }
+);
 
 interface SessionLane {
   sessionKey: string;
@@ -95,6 +107,10 @@ function cloneDurableJson(value: DurableJson): DurableJson {
   const encoded = JSON.stringify(value);
   if (encoded === undefined) throw new Error('durable session value is not JSON-serializable');
   return JSON.parse(encoded) as DurableJson;
+}
+
+function cloneDurableSessionRecord(record: DurableSessionRecord): DurableSessionRecord {
+  return { ...record, value: cloneDurableJson(record.value) };
 }
 
 function sameDurableJson(left: DurableJson, right: DurableJson): boolean {
@@ -171,9 +187,8 @@ export function createDurableSessionFacade(
 
   const performWrite = async (
     lane: SessionLane,
-    value: DurableJson,
+    batch: PendingWrite,
     coalescedCount: number,
-    mode: PendingWrite['mode'],
   ): Promise<DurableSessionFacadeWriteResult> => {
     if (isStopping()) return { kind: 'stopped', coalescedCount };
     let acquired;
@@ -198,7 +213,10 @@ export function createDurableSessionFacade(
     try {
       const current = await options.store.readSession(lane.sessionKey);
       if (isStopping()) return await stopAfterReleasing(lane, acquired.lease, coalescedCount);
-      if (mode === 'coalesced' && current && sameDurableJson(current.value, value)) {
+      const value = batch.mode === 'exact-current'
+        ? cloneDurableJson(batch.buildValue(current ? cloneDurableSessionRecord(current) : undefined))
+        : batch.value;
+      if (batch.mode === 'coalesced' && current && sameDurableJson(current.value, value)) {
         return { kind: 'unchanged', lease: acquired.lease, record: current, coalescedCount };
       }
       const written = await options.store.writeSession({
@@ -226,7 +244,7 @@ export function createDurableSessionFacade(
       const batch = lane.pending.shift()!;
       let result: DurableSessionFacadeWriteResult;
       try {
-        result = await performWrite(lane, batch.value, batch.waiters.length, batch.mode);
+        result = await performWrite(lane, batch, batch.waiters.length);
       } catch (error) {
         for (const waiter of batch.waiters) waiter.reject(error);
         continue;
@@ -312,6 +330,24 @@ export function createDurableSessionFacade(
       }
       return new Promise<DurableSessionFacadeWriteResult>((resolve, reject) => {
         lane!.pending.push({ mode: 'exact', value, waiters: [{ resolve, reject }] });
+        startLane(lane!);
+      });
+    },
+    writeExactFromCurrent: (rawSessionKey, buildValue) => {
+      const sessionKey = validateSessionKey(rawSessionKey);
+      if (typeof buildValue !== 'function') {
+        return Promise.reject(new Error('durable exact Session value builder must be a function'));
+      }
+      if (!accepting || terminated) {
+        return Promise.resolve({ kind: 'stopped', coalescedCount: 1 });
+      }
+      let lane = lanes.get(sessionKey);
+      if (!lane) {
+        lane = { sessionKey, pending: [] };
+        lanes.set(sessionKey, lane);
+      }
+      return new Promise<DurableSessionFacadeWriteResult>((resolve, reject) => {
+        lane!.pending.push({ mode: 'exact-current', buildValue, waiters: [{ resolve, reject }] });
         startLane(lane!);
       });
     },

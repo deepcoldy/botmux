@@ -102,9 +102,9 @@ outbox: pending ──reserve──> reserved ──begin──> attempting ─�
 
 Session shadow projection 只包含版本、稳定 `sessionId`、应用与路由 anchor、scope、active/closed 生命周期和时间戳。标题、prompt、owner、工作目录、附件、token、CLI/provider lineage 与终端状态都不复制；这些字段在形成明确的多副本合同前仍只属于现有 Session store。Facade 按 stable session key 顺序化并合并排队更新，执行 `acquire lease → read revision → CAS write`，显式返回 occupied、conflict 和 stale lease。不同 key 可并行；优雅退出有界等待并释放本 boot 持有的 lease。
 
-Primary admission 不能复用 shadow 的 last-write-wins 合并：两个 inbox event 若被合并为一次写入，前一事件会拿到后一事件的 revision，形成伪 receipt。Facade 因此额外提供 `writeExact`：同 Session key 严格 FIFO，每个事件独立 acquire/read/CAS 并返回实际 `SessionLease + DurableSessionRecord`，即使重试后的值完全相同也强制递增 revision。原有 `write` 的 shadow 合并语义保持不变。
+Primary admission 不能复用 shadow 的 last-write-wins 合并：两个 inbox event 若被合并为一次写入，前一事件会拿到后一事件的 revision，形成伪 receipt。Facade 因此额外提供 `writeExact`：同 Session key 严格 FIFO，每个事件独立 acquire/read/CAS 并返回实际 `SessionLease + DurableSessionRecord`，即使重试后的值完全相同也强制递增 revision。需要保留已有 per-turn 状态时使用 `writeExactFromCurrent`，builder 只在 lane 已取得 lease 并读到当前 revision 后执行，避免调用方 read→merge→write 的竞态。原有 `write` 的 shadow 合并语义保持不变。
 
-`DurablePrimarySessionProjection` 保存现有 Session store 的完整持久 `Session` JSON 和当前 admission identity。它不新增 runtime-only worker token 或进程对象；内容边界等同现有 Session row。每次 canonical admission 先用 `writeExact` 提交完整 snapshot，再从该次返回的 lease epoch 与 record revision 构造 `DurableLarkAdmissionReceipt`。restore parser 会重算 Session routing key，并校验 event/app/partition/message identity；损坏或错路由 snapshot fail closed。
+`DurablePrimarySessionProjection` 保存现有 Session store 的完整持久 `Session` JSON、兼容旧 reader 的最新单值 `admission`，以及按最老到最新排列、最多 64 项的 `admissions`。后者让同一 Session 的 N+1 已入会时，N 的 final 仍能按自己的 turn 找到 event/app/partition/message identity；重复 turn 会更新而不是复制，超出界限时淘汰最旧项。它不新增 runtime-only worker token 或进程对象；内容边界等同现有 Session row。每次 canonical admission 在 exact lane 内读取并合并 history，再从该次返回的 lease epoch 与 record revision 构造 `DurableLarkAdmissionReceipt`。restore parser 兼容没有 `admissions` 的 version-1 记录，重算 Session routing key，并校验全部 admission identity；损坏或错路由 snapshot fail closed。
 
 Shadow projection 刻意只覆盖普通飞书新会话在 SQLite 更新和 `activeSessions` 注册都成功之后的审计写入。竞态失败的 scratch Session、全量 `persistRow`、多行事务、恢复、关闭和批量 lineage 写入不属于这个最小 projection；因此 shadow 本身不能用作完整 Session 事实源。Primary 不复用该 projection，而是每次 admission/output 写入完整持久 Session snapshot。
 
@@ -116,7 +116,7 @@ Primary consumer 的 dispatch callback 必须返回 `committed` 或带有有界�
 
 Primary daemon 接线满足三个硬门禁：
 
-1. daemon 只在 `DurableLarkPrimaryIngress` 领导权回调内启停该 App 的 WS client，并用 `enqueueBeforeAck` 替换、而不是旁路镜像现有 message callback。
+1. daemon 只在 `DurableLarkPrimaryIngress` 领导权回调内启停该 App 的 WS client，并用 `enqueueBeforeAck` 替换、而不是旁路镜像现有 receive/update message callback。
 2. handler 必须只在 durable inbox 返回 inserted/duplicate 后 ACK；timeout、conflict、provider failure 和 lease loss 必须保持可重推，不能回退到 ACK 后 fire-and-forget。
 3. `processMessageEvent` 在 primary 下等待 canonical handler，并返回真实 admission receipt，不能把“已排进内存队列”当作 `committed`。
 
@@ -165,6 +165,8 @@ Adapter 复用现有 `sendMessage` / `replyMessage`、`classifyFeishuError` 和 
 
 - 完整 Session JSON 与 admission identity 的 round-trip / routing key 重校验；
 - 同 Session 并发 event 的 exact FIFO revision 与 event-bound receipt；
+- type-ahead 后旧 turn admission 仍可查、64 项上限和旧 version-1 单值兼容；
+- `im.message.updated_v1` 首次补 @ 的 admission identity；
 - 同事件 retry 也产生新 revision，不把旧 revision 冒充本次写入；
 - receipt 不携带 owner、workingDir、title 等 Session payload 字段。
 
@@ -203,6 +205,7 @@ Adapter 复用现有 `sendMessage` / `replyMessage`、`classifyFeishuError` 和 
 
 - App lease acquire/occupied standby、按配置续租和 stale/error 失去领导权；
 - stable app/message/partition identity 校验，以及 inserted/duplicate/conflict ACK 边界；
+- `im.message.updated_v1` 与 receive 使用同一 ingress fencing；
 - 同分区 FIFO、单调时间戳和 ACK timeout 后 tail 不越序；
 - enqueue failure、activation callback failure 与 leadership-lost lifecycle；
 - drain-before-release、lost callback-before-release，以及覆盖 release 的单一 shutdown deadline。
@@ -211,6 +214,6 @@ Adapter 复用现有 `sendMessage` / `replyMessage`、`classifyFeishuError` 和 
 
 `test/cli-durable-session-send.test.ts` 覆盖逻辑会话稳定 final UUID、daemon 连接丢失/启动期 5xx 的同 payload 有界重试，以及 durable ambiguous 不重试。
 
-`test/durable-lark-session-output.test.ts` 覆盖 Session-before-outbox 顺序、同一 epoch fencing、权威 settlement、跨 Session target 预写拒绝，以及 Session occupied/outbox conflict/stale containment。
+`test/durable-lark-session-output.test.ts` 覆盖 Session-before-outbox 顺序、同一 epoch fencing、type-ahead N+1 入会后 N 仍精确 enqueue 一次、权威 settlement、跨 Session target 预写拒绝，以及 Session occupied/outbox conflict/stale containment。
 
 `test/durable-lark-final-output.test.ts` 覆盖 final-drain 同步注册、terminal settlement 后释放、pre-enqueue failure 与 shutdown abort 的有界释放。

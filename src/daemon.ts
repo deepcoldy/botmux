@@ -29237,8 +29237,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       );
       const current = await durableCoordinationRuntime.store.readSession(canonicalKey);
       if (!current) throw new Error('durable primary Session snapshot is unavailable');
-      const { admission } = parseDurablePrimarySessionRecord(current);
-      if (admission.messageId !== request.turnId) {
+      const { admissions } = parseDurablePrimarySessionRecord(current);
+      const admission = admissions.find(entry => entry.messageId === request.turnId);
+      if (!admission) {
         throw new Error(
           `durable primary Session snapshot is not committed for turn ${request.turnId}`,
         );
@@ -29258,6 +29259,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         facade: runtime.session,
         store: durableCoordinationRuntime.store,
         inbound: {
+          eventType: admission.eventId.startsWith('im.message.updated_v1:')
+            ? 'lark.im.message.updated_v1'
+            : 'lark.im.message.receive_v1',
           eventId: admission.eventId,
           partitionKey: admission.partitionKey,
           larkAppId: admission.larkAppId,

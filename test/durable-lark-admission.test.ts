@@ -7,6 +7,7 @@ import {
 
 function message(overrides: Partial<DurableLarkMessageClaim> = {}): DurableLarkMessageClaim {
   return {
+    eventType: 'lark.im.message.receive_v1',
     eventId: 'im.message.receive_v1:cli_test:om_message',
     partitionKey: 'lark-message-routing:cli_test:oc_chat',
     larkAppId: 'cli_test',

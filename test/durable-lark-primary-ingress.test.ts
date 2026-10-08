@@ -199,6 +199,29 @@ describe('durable Lark primary ingress', () => {
     await ingress.stop();
   });
 
+  it('persists a message-updated event under the same fenced primary ingress', async () => {
+    const store = fakeStore();
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+    });
+    await ingress.ready;
+
+    await expect(ingress.enqueueBeforeAck({
+      eventType: 'lark.im.message.updated_v1',
+      eventId: 'im.message.updated_v1:cli_test:evt_edit_1',
+      partitionKey: 'lark-message-routing:cli_test:oc_chat',
+      data: { event_id: 'evt_edit_1', message: { message_id: 'om_1', chat_id: 'oc_chat' } },
+    })).resolves.toEqual({ kind: 'inserted' });
+    expect(store.enqueueInbox).toHaveBeenCalledWith(expect.objectContaining({
+      eventId: 'im.message.updated_v1:cli_test:evt_edit_1',
+      payload: expect.objectContaining({ type: 'lark.im.message.updated_v1' }),
+    }));
+    await ingress.stop();
+  });
+
   it('keeps a timed-out enqueue in the partition tail so the next event cannot overtake it', async () => {
     const store = fakeStore();
     const first = deferred<DurableInsertResult>();

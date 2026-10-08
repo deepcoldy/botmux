@@ -1082,6 +1082,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
     data: ReturnType<typeof makeUserMessageEvent>,
     messageId: string,
   ) => runtime.processDurableMessage({
+    eventType: 'lark.im.message.receive_v1',
     eventId: `im.message.receive_v1:${MY_APP_ID}:${messageId}`,
     partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
     larkAppId: MY_APP_ID,
@@ -1129,6 +1130,49 @@ describe('Lark event dispatcher — durable primary processor', () => {
     expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
     runtime.close();
   });
+
+  it.each(['never', 'ambient'] as const)(
+    'dispatches a %s topic seed immediately when the durable primary wait is disabled',
+    async mentionMode => {
+      config.daemon.forwardFollowupWaitMs = 0;
+      setupBotState({
+        allowedUsers: [USER_OPEN_ID],
+        regularGroupMentionMode: mentionMode,
+      });
+      mockGetChatMode.mockResolvedValue('topic');
+      const handlers = makeHandlers();
+      handlers.handleNewTopic.mockImplementation(async (_data: any, ctx: any) => {
+        ctx.ingressAdmission = { admitted: true };
+      });
+      handlers.resolveDurableSession = vi.fn(() => ({
+        sessionId: `session-primary-${mentionMode}`,
+        chatId: 'chat-primary',
+        rootMessageId: `msg-primary-${mentionMode}`,
+        scope: 'thread',
+        title: 'Primary',
+        status: 'active',
+        createdAt: '2026-10-06T00:00:00.000Z',
+        larkAppId: MY_APP_ID,
+      }));
+      const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+      const messageId = `msg-primary-${mentionMode}`;
+      const data = makeUserMessageEvent({
+        senderOpenId: USER_OPEN_ID,
+        content: JSON.stringify({ text: '@BotA forwarded report' }),
+        messageId,
+        chatId: 'chat-primary',
+        chatType: 'group',
+        mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+      });
+
+      await expect(processPrimary(runtime, data, messageId)).resolves.toMatchObject({
+        kind: 'admitted',
+        session: { sessionId: `session-primary-${mentionMode}` },
+      });
+      expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+      runtime.close();
+    },
+  );
 
   it('completes a side-effect-free unaddressed message as ignored', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupMentionMode: 'always' });
@@ -1240,6 +1284,99 @@ describe('Lark event dispatcher — durable primary processor', () => {
     release();
     await callback;
     expect(acked).toBe(true);
+    runtime.close();
+  });
+
+  it('routes message-updated WS events through durable ingress instead of the legacy path', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    const handlers = makeHandlers();
+    const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+    const runtime = createLarkEventDispatcherRuntime(
+      MY_APP_ID,
+      'secret',
+      handlers,
+      'feishu',
+      undefined,
+      { enqueuePrimary },
+    );
+    runtime.connect();
+    const data = {
+      event_id: 'evt-primary-edit',
+      message: { message_id: 'om_primary_edit', chat_id: 'chat-primary' },
+    };
+
+    await capturedHandlers['im.message.updated_v1'](data);
+
+    expect(enqueuePrimary).toHaveBeenCalledWith({
+      eventId: `im.message.updated_v1:${MY_APP_ID}:evt-primary-edit`,
+      eventType: 'lark.im.message.updated_v1',
+      partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
+      data,
+    });
+    expect(mockGetMessageDetail).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    runtime.close();
+  });
+
+  it('durably admits an edited message that first adds the bot mention', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID], regularGroupReplyMode: 'new-topic' });
+    mockGetChatMode.mockResolvedValue('group');
+    mockGetMessageDetail.mockResolvedValue({ items: [{
+      message_id: 'om_primary_edit_claim',
+      chat_id: 'chat-primary',
+      msg_type: 'text',
+      body: { content: JSON.stringify({ text: '@BotA please start' }) },
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: MY_OPEN_ID, id_type: 'open_id' }],
+      sender: { id: USER_OPEN_ID, id_type: 'open_id', sender_type: 'user' },
+    }] });
+    const handlers = makeHandlers();
+    handlers.handleNewTopic.mockImplementation(async (_data: any, ctx: any) => {
+      ctx.ingressAdmission = { admitted: true };
+    });
+    handlers.resolveDurableSession = vi.fn(() => ({
+      sessionId: 'session-primary-edit',
+      chatId: 'chat-primary',
+      rootMessageId: 'om_primary_edit_claim',
+      scope: 'thread',
+      title: 'Primary edit',
+      status: 'active',
+      createdAt: '2026-10-06T00:00:00.000Z',
+      larkAppId: MY_APP_ID,
+    }));
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = {
+      event_id: 'evt-primary-edit-claim',
+      message: { message_id: 'om_primary_edit_claim', chat_id: 'chat-primary' },
+    };
+
+    await expect(runtime.processDurableMessage({
+      eventType: 'lark.im.message.updated_v1',
+      eventId: `im.message.updated_v1:${MY_APP_ID}:evt-primary-edit-claim`,
+      partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
+      larkAppId: MY_APP_ID,
+      messageId: 'om_primary_edit_claim',
+      attempts: 1,
+      data,
+    }, {
+      claim: {
+        event: {
+          eventId: `im.message.updated_v1:${MY_APP_ID}:evt-primary-edit-claim`,
+          partitionKey: `lark-message-routing:${MY_APP_ID}:chat-primary`,
+          payload: {},
+          visibleAt: 1,
+          createdAt: 1,
+        },
+        workerId: 'primary-worker',
+        claimEpoch: 1,
+        claimUntil: 60_000,
+        attempts: 1,
+      },
+      signal: new AbortController().signal,
+    })).resolves.toMatchObject({
+      kind: 'admitted',
+      session: { sessionId: 'session-primary-edit' },
+    });
+    expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
     runtime.close();
   });
 });

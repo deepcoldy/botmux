@@ -75,11 +75,34 @@ describe('durable Lark inbox shadow', () => {
       claimUntil: 100,
       attempts: 1,
     })).toEqual({
+      eventType: 'lark.im.message.receive_v1',
       eventId: event.eventId,
       partitionKey: event.partitionKey,
       larkAppId: 'cli_1',
       messageId: 'om_1',
       attempts: 1,
+    });
+  });
+
+  it('persists and revalidates a message-updated event for primary processing', () => {
+    const event = durableLarkMessageEvent({
+      larkAppId: 'cli_1',
+      eventType: 'lark.im.message.updated_v1',
+      eventId: 'im.message.updated_v1:cli_1:evt_edit_1',
+      partitionKey: 'lark-message-routing:cli_1:oc_1',
+      data: { event_id: 'evt_edit_1', message: { message_id: 'om_1', chat_id: 'oc_1' } },
+      now: 10,
+    });
+    expect(observeDurableLarkMessageClaim({
+      event,
+      workerId: 'worker-1',
+      claimEpoch: 1,
+      claimUntil: 100,
+      attempts: 1,
+    })).toMatchObject({
+      eventType: 'lark.im.message.updated_v1',
+      eventId: 'im.message.updated_v1:cli_1:evt_edit_1',
+      messageId: 'om_1',
     });
   });
 
