@@ -393,10 +393,68 @@ function itemCompletedAgentText(item: unknown): string {
  * events, these append records contain both the original tool call and its
  * returned content, in model order. Normalize the array-shaped tool output to
  * the string shape understood by the shared Codex CoT extractor. */
-function traexHistoryCotEntries(payload: any): CodexBridgeEvent['cotEntries'] {
-  if (payload?.operation !== 'append' || !Array.isArray(payload.items)) return [];
+function traexDisplayCompletions(payload: any, sourceSessionId?: string): any[] {
+  if (payload?.operation !== 'append' || !Array.isArray(payload.display_completions)) return [];
+  return payload.display_completions.filter((completion: any) =>
+    completion && typeof completion === 'object'
+    && typeof completion.turn_id === 'string' && completion.turn_id
+    && completion.turn_id === payload.turn_id
+    && (!sourceSessionId || completion.thread_id === sourceSessionId));
+}
+
+function traexHistoryCotEntries(payload: any, sourceSessionId?: string): CodexBridgeEvent['cotEntries'] {
+  if (payload?.operation !== 'append') return [];
+  const modelItems = Array.isArray(payload.items) ? payload.items : [];
+  const displayReasoning = new Map<string, any>();
+  for (const completion of traexDisplayCompletions(payload, sourceSessionId)) {
+    const item = completion.item;
+    if (item?.type !== 'Reasoning' || typeof item.id !== 'string' || !item.id) continue;
+    const summary = Array.isArray(item.summary_text)
+      ? item.summary_text.filter((text: unknown) => typeof text === 'string' && text.length > 0)
+      : [];
+    const raw = Array.isArray(item.raw_content)
+      ? item.raw_content.filter((text: unknown) => typeof text === 'string' && text.length > 0)
+      : [];
+    if (summary.length === 0 && raw.length === 0) continue;
+    displayReasoning.set(item.id, {
+      type: 'reasoning',
+      id: item.id,
+      summary: summary.map((text: string) => ({ type: 'summary_text', text })),
+      content: raw.map((text: string) => ({ type: 'reasoning_text', text })),
+    });
+  }
+  const modelReasoningIndices = new Map<string, number>();
+  for (const [index, item] of modelItems.entries()) {
+    if (item?.type === 'reasoning' && typeof item.id === 'string') {
+      modelReasoningIndices.set(item.id, index);
+    }
+  }
+  const reasoningItems = Array.from(displayReasoning.values());
+  const firstAnchor = reasoningItems.find(item => modelReasoningIndices.has(item.id));
+  let insertionIndex = firstAnchor ? modelReasoningIndices.get(firstAnchor.id)! : 0;
+  const reasoningInsertions = new Map<number, any[]>();
+  for (const item of reasoningItems) {
+    const modelIndex = modelReasoningIndices.get(item.id);
+    if (modelIndex !== undefined) {
+      insertionIndex = modelIndex + 1;
+    } else {
+      const insertion = reasoningInsertions.get(insertionIndex) ?? [];
+      insertion.push(item);
+      reasoningInsertions.set(insertionIndex, insertion);
+    }
+  }
+  const items = modelItems.flatMap((item: any, index: number) => {
+    const display = item?.type === 'reasoning' ? displayReasoning.get(item.id) : undefined;
+    const normalized = display ? {
+      ...item,
+      summary: display.summary.length > 0 ? display.summary : item.summary,
+      content: display.content.length > 0 ? display.content : item.content,
+    } : item;
+    return [...(reasoningInsertions.get(index) ?? []), normalized];
+  });
+  items.push(...(reasoningInsertions.get(modelItems.length) ?? []));
   const entries: NonNullable<CodexBridgeEvent['cotEntries']> = [];
-  for (const rawItem of payload.items) {
+  for (const rawItem of items) {
     if (!rawItem || typeof rawItem !== 'object') continue;
     let item = rawItem;
     if ((rawItem.type === 'function_call_output' || rawItem.type === 'custom_tool_call_output')
@@ -614,14 +672,10 @@ function* completeTraexRolloutRecords(
     if (!line) continue;
     let entry: any;
     try { entry = JSON.parse(line); } catch { continue; }
-    if (entry?.type === 'history_mutation'
-      && entry.payload?.operation === 'append'
-      && Array.isArray(entry.payload.display_completions)) {
+    const completions = new Set(traexDisplayCompletions(entry?.payload, sourceSessionId));
+    if (entry?.type === 'history_mutation' && completions.size > 0) {
       for (const [displayIndex, completion] of entry.payload.display_completions.entries()) {
-        if (!completion || typeof completion !== 'object'
-          || typeof completion.turn_id !== 'string' || !completion.turn_id
-          || completion.turn_id !== entry.payload.turn_id
-          || (sourceSessionId && completion.thread_id !== sourceSessionId)
+        if (!completions.has(completion)
           || !['UserMessage', 'AgentMessage'].includes(completion.item?.type)) continue;
         yield {
           entry: {
@@ -734,7 +788,7 @@ export function drainTraexRollout(
     // those too would duplicate nodes. One mutation can carry parallel calls
     // or results; preserve their item order in one cosmetic event.
     if (!probe && obj.type === 'history_mutation') {
-      const cotEntries = traexHistoryCotEntries(payload);
+      const cotEntries = traexHistoryCotEntries(payload, sourceSessionId);
       if (cotEntries && cotEntries.length > 0) {
         if (sourceTurnId) bindPreservedLegacyPredecessor(sourceTurnId, base);
         events.push({ ...base, kind: 'cot', text: '', cotEntries, ...(sourceTurnId ? { sourceTurnId } : {}) });

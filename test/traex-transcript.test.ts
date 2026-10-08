@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { CodexBridgeQueue } from '../src/services/codex-bridge-queue.js';
 import { CODEX_CONNECTION_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE } from '../src/services/codex-transcript.js';
 import {
+  bridgePostText,
   isBridgeNothingToSendFinal,
   shouldEmitEmptyCompletedBridgeFallback,
   structuredFallbackKind,
@@ -695,6 +696,203 @@ describe('drainTraexRollout', () => {
       kind: 'tool_result',
       result: expect.stringMatching(/^.{800}…$/s),
     });
+  });
+
+  it.each(
+    ['legacy', 'canonical'].flatMap(dialect =>
+      ['Text', 'text', 'output_text'].flatMap(blockType =>
+        (['send', 'transcript'] as const).map(mode => ({ dialect, blockType, mode })))),
+  )('preserves normal Markdown output: $dialect / $blockType / $mode', ({ dialect, blockType, mode }) => {
+    const answer = '# Result\n\n| Key | Value |\n| --- | --- |\n| status | OK |\n\n```ts\nconst value = "✓";\n```\n';
+    const input = {
+      type: 'UserMessage', id: 'normal-user',
+      content: [{ type: 'text', text: 'format the result' }],
+    };
+    const assistant = {
+      type: 'AgentMessage', id: 'normal-answer', phase: 'final_answer',
+      content: [{ type: blockType, text: answer }],
+    };
+    const inputRecord = dialect === 'canonical' ? canonicalCompletion(input) : itemCompleted(input);
+    const answerRecord = dialect === 'canonical' ? canonicalCompletion(assistant) : itemCompleted(assistant);
+    writeFileSync(path, line(inputRecord) + line(answerRecord) + line(taskComplete()));
+    const queue = new CodexBridgeQueue();
+    queue.mark('normal-turn', 'format the result', 0);
+    const events = drainTraexRollout(path, 0).events;
+    queue.ingest(events);
+    const ready = queue.drainEmittable();
+    expect(ready).toEqual([
+      expect.objectContaining({ turnId: 'normal-turn', finalText: answer }),
+    ]);
+    expect(structuredFallbackKind(ready[0], undefined, [], false, false, mode)).toBe('final');
+    expect(bridgePostText(ready[0].finalText ?? '', false)).toBe(answer);
+    queue.ingest(events);
+    expect(queue.drainEmittable()).toEqual([]);
+  });
+
+  it.each(['legacy', 'canonical'])('normalizes thinking and tool outputs once: %s', dialect => {
+    const reasoning = {
+      type: 'reasoning', id: 'output-reasoning',
+      summary: [{ type: 'summary_text', text: 'Inspect inputs' }, { type: 'summary_text', text: 'Compare results' }],
+    };
+    const input = {
+      type: 'UserMessage', id: 'output-user',
+      content: [{ type: 'text', text: 'inspect outputs' }],
+    };
+    const toolItems = [
+      { type: 'function_call', call_id: 'output-tool', name: 'exec_command', arguments: '{"cmd":"pwd"}' },
+      {
+        type: 'function_call_output', call_id: 'output-tool',
+        output: dialect === 'canonical' ? 'first line\nsecond line\n' : [
+          { type: 'input_text', text: 'first line\n' }, { type: 'output_text', text: 'second line\n' },
+        ],
+      },
+    ];
+    const mutation = dialect === 'canonical'
+      ? {
+          ...canonicalCompletion({
+            type: 'Reasoning', id: reasoning.id,
+            summary_text: ['Inspect inputs', 'Compare results'], raw_content: [],
+          }),
+          payload: {
+            ...canonicalCompletion({
+              type: 'Reasoning', id: reasoning.id,
+              summary_text: ['Inspect inputs', 'Compare results'], raw_content: [],
+            }).payload,
+            items: [{ ...reasoning, summary: [] }, ...toolItems],
+          },
+        }
+      : historyAppend([reasoning, ...toolItems]);
+    writeFileSync(path, line(dialect === 'canonical' ? canonicalCompletion(input) : itemCompleted(input))
+      + line(mutation) + line(taskComplete('done')));
+    const observed: unknown[] = [];
+    const queue = new CodexBridgeQueue();
+    queue.setCotObserver(entries => observed.push(...entries));
+    queue.mark('output-turn', 'inspect outputs', 0);
+    const events = drainTraexRollout(path, 0).events;
+    queue.ingest(events);
+    queue.ingest(events);
+    expect(observed).toEqual([
+      { kind: 'thinking', text: 'Inspect inputs\n\nCompare results' },
+      { kind: 'tool_call', id: 'output-tool', name: 'exec_command', args: '{"cmd":"pwd"}', subject: 'pwd' },
+      { kind: 'tool_result', id: 'output-tool', result: 'first line\nsecond line\n' },
+    ]);
+    expect(queue.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'output-turn', finalText: 'done' }),
+    ]);
+  });
+
+  it('accepts display-only thinking without duplicating its raw mirror', () => {
+    const display = {
+      type: 'Reasoning', id: 'display-thinking', summary_text: ['Visible summary'], raw_content: [],
+    };
+    const mutation = canonicalCompletion(display);
+    writeFileSync(path, line(mutation));
+    expect(drainTraexRollout(path, 0).events.flatMap(event => event.cotEntries ?? [])).toEqual([
+      { kind: 'thinking', text: 'Visible summary' },
+    ]);
+    const mirrored = {
+      ...mutation,
+      payload: {
+        ...mutation.payload,
+        items: [{
+          type: 'reasoning', id: display.id,
+          summary: [{ type: 'summary_text', text: 'Visible summary' }],
+        }],
+      },
+    };
+    writeFileSync(path, line(mirrored));
+    expect(drainTraexRollout(path, 0).events.flatMap(event => event.cotEntries ?? [])).toEqual([
+      { kind: 'thinking', text: 'Visible summary' },
+    ]);
+  });
+
+  it.each([
+    { ids: ['first'], expected: ['First', 'Second', 'Third', 'tool_call'] },
+    { ids: ['second'], expected: ['First', 'Second', 'Third', 'tool_call'] },
+    { ids: ['first', 'third'], expected: ['First', 'Second', 'Third', 'tool_call'] },
+    { ids: [], expected: ['First', 'Second', 'Third', 'tool_call'] },
+  ])('preserves mixed reasoning order with model anchors $ids', ({ ids, expected }) => {
+    const summaries = [
+      { id: 'first', text: 'First' },
+      { id: 'second', text: 'Second' },
+      { id: 'third', text: 'Third' },
+    ];
+    const mutation = canonicalCompletion({
+      type: 'Reasoning', id: 'first', summary_text: ['First'], raw_content: [],
+    });
+    writeFileSync(path, line({
+      ...mutation,
+      payload: {
+        ...mutation.payload,
+        display_completions: summaries.map(({ id, text }) => ({
+          ...mutation.payload.display_completions[0],
+          item: { type: 'Reasoning', id, summary_text: [text], raw_content: [] },
+        })),
+        items: [
+          ...ids.map(id => ({ type: 'reasoning', id, summary: [] })),
+          { type: 'function_call', call_id: 'ordered-tool', name: 'exec_command', arguments: '{}' },
+        ],
+      },
+    }));
+    const entries = drainTraexRollout(path, 0).events.flatMap(event => event.cotEntries ?? []);
+    expect(entries.map(entry => entry.kind === 'thinking' ? entry.text : entry.kind)).toEqual(expected);
+  });
+
+  it('preserves a legacy reasoning summary when its canonical mirror has only raw content', () => {
+    const mutation = canonicalCompletion({
+      type: 'Reasoning', id: 'summary-priority', summary_text: [], raw_content: ['Raw fallback'],
+    });
+    writeFileSync(path, line({
+      ...mutation,
+      payload: {
+        ...mutation.payload,
+        items: [{
+          type: 'reasoning', id: 'summary-priority',
+          summary: [{ type: 'summary_text', text: 'Visible summary' }],
+          content: [{ type: 'reasoning_text', text: 'Raw fallback' }],
+        }],
+      },
+    }));
+    expect(drainTraexRollout(path, 0).events.flatMap(event => event.cotEntries ?? [])).toEqual([
+      { kind: 'thinking', text: 'Visible summary' },
+    ]);
+  });
+
+  it('reads canonical reasoning when the mutation contains no model items', () => {
+    const mutation = canonicalCompletion({
+      type: 'Reasoning', id: 'no-model-items', summary_text: ['Visible summary'], raw_content: [],
+    });
+    const { items, ...payload } = mutation.payload;
+    writeFileSync(path, line({ ...mutation, payload }));
+    expect(drainTraexRollout(path, 0).events.flatMap(event => event.cotEntries ?? [])).toEqual([
+      { kind: 'thinking', text: 'Visible summary' },
+    ]);
+  });
+
+  it.each(['foreign-session', 'foreign-turn'])('keeps unrelated display reasoning out of tool output: %s', invalid => {
+    const mutation = canonicalCompletion({
+      type: 'Reasoning', id: 'unrelated-summary', summary_text: ['Unrelated summary'], raw_content: [],
+    });
+    const completion = mutation.payload.display_completions[0];
+    if (invalid === 'foreign-session') completion.thread_id = 'other-session';
+    else completion.turn_id = 'other-turn';
+    writeFileSync(path, line(mutation));
+    expect(drainTraexRollout(path, 0).events).toEqual([]);
+  });
+
+  it('prefers canonical summary text and keeps reasoning probes side-effect free', () => {
+    const mutation = canonicalCompletion({
+      type: 'Reasoning', id: 'summary-blocks',
+      summary_text: ['Visible summary', null, 123, '', 'Second paragraph'],
+      raw_content: ['Raw fallback'],
+    });
+    writeFileSync(path, line(mutation));
+    expect(drainTraexRollout(path, 0, { probe: true }).events).toEqual([]);
+    const result = drainTraexRollout(path, 0);
+    expect(result.events.flatMap(event => event.cotEntries ?? [])).toEqual([
+      { kind: 'thinking', text: 'Visible summary\n\nSecond paragraph' },
+    ]);
+    expect(drainTraexRollout(path, result.newOffset).events).toEqual([]);
   });
 
   it('closes tool calls whose output has no displayable text', () => {

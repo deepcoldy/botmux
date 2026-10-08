@@ -1,5 +1,24 @@
 # TraeX rollout compatibility
 
+## Compatibility contract
+
+The reader supports both legacy and canonical TraeX records without requiring
+users to select a version-specific delivery mode. It normalizes their inputs and
+outputs into the existing BotMux turn and CoT events.
+
+| Output | Legacy representation | Canonical representation | Normalized behavior |
+| --- | --- | --- | --- |
+| User input | `user_message` or `item_completed.UserMessage` | `display_completions[].UserMessage` | Bind one input to its turn |
+| Final reply | `agent_message`, `item_completed.AgentMessage`, or terminal text | `display_completions[].AgentMessage` or terminal text | Preserve Markdown, newlines, tables, and code blocks |
+| Thinking | `reasoning.summary` / `reasoning.content` | `Reasoning.summary_text` / `Reasoning.raw_content` | Prefer visible summaries; emit one same-record mirrored item |
+| Tool calls | `items` containing function/custom/web-search calls | The same model/tool `items` | Preserve call identity, order, and subject |
+| Tool results | Array-shaped text blocks or text strings | Array-shaped text blocks or text strings | Normalize text blocks without flattening newlines |
+| Terminal status | `task_complete` / `turn_aborted` | The same terminal events | Preserve existing success, failure, and cancellation handling |
+
+There is no new notification or delivery mechanism in this change. The `send`
+and `transcript` paths keep their existing behavior; failed turns are one
+compatibility regression case, not the primary purpose.
+
 ## Verified release boundary
 
 Released Linux x86_64 binaries were checked with an isolated CLI home and a
@@ -47,9 +66,11 @@ model/tool `items`:
 }
 ```
 
-Only validated `UserMessage` and `AgentMessage` completions enter the existing
-input/mirror and assistant-recovery paths. Raw `items` with `role: user` remain
-insufficient input evidence because they also contain runtime injections.
+Validated `UserMessage` and `AgentMessage` completions enter the existing
+input/mirror and assistant-recovery paths. Validated `Reasoning` summaries are
+merged with their same-ID model items without duplicate thinking output. Raw
+`items` with `role: user` remain insufficient input evidence because they also
+contain runtime injections.
 
 `task_complete` remains the terminal boundary. Its non-null `error` produces a
 failed turn regardless of whether `last_agent_message` is empty. Once its user
@@ -71,7 +92,8 @@ bun run test test/traex-transcript.test.ts \
 bun run build
 ```
 
-The regression fixtures are synthetic. They cover canonical input and final
-recovery, output-limit and malformed-function-call failures, mixed-dialect
-mirrors, same-offset replay, delayed binding, foreign identities, partial lines,
-and existing legacy behavior.
+The regression fixtures are synthetic. They cover normal replies in both
+delivery modes; `Text`, `text`, and `output_text` blocks; Markdown tables and code
+blocks; thinking-summary preference; array/string tool results; mixed-dialect
+mirrors; same-offset replay; delayed binding; foreign identities; partial lines;
+and existing success, failure, cancellation, and deliberate-silence behavior.
