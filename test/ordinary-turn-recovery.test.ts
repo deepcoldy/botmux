@@ -7,6 +7,7 @@ import {
   handleOrdinaryTurnRecoveryTerminal,
   ordinaryTurnRecoveryHandlesTerminal,
   ordinaryTurnRecoverySilentTurnIds,
+  PREMATURE_COMPLETION_RECOVERY_PROMPT,
   requireOrdinaryTurnRecoveryAttention,
   ORDINARY_TURN_RECOVERY_PROMPT,
   OrdinaryTurnRecoveryCoordinator,
@@ -64,6 +65,125 @@ describe('OrdinaryTurnRecoveryCoordinator', () => {
       continuationsStarted: 1,
       status: 'running',
     }));
+  });
+
+  it('freezes and forwards the original turn authority to the continuation', () => {
+    const timers: Array<() => void> = [];
+    const enqueue = vi.fn(() => true);
+    const coordinator = new OrdinaryTurnRecoveryCoordinator({
+      schedule: (_delayMs, run) => { timers.push(run); return run; },
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue,
+      warn: vi.fn(),
+      randomId: () => 'authority',
+      backoffMs: [2_000],
+    });
+    const trustedCaller = {
+      requestLarkAppId: 'app',
+      requestUserOpenId: 'ou_user',
+      requestUserUnionId: 'on_user',
+      senderType: 'user' as const,
+    };
+
+    const running = coordinator.begin('om_original', { trustedCaller });
+    coordinator.onTerminal(running, {
+      turnId: 'om_original',
+      status: 'failed',
+      errorCode: 'premature_completion',
+      retryable: true,
+    });
+    timers[0]();
+
+    expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({
+      trustedCaller,
+    }));
+  });
+
+  it('switches to the queued successor authority before dispatching its continuation', () => {
+    const timers: Array<() => void> = [];
+    const enqueue = vi.fn(() => true);
+    const coordinator = new OrdinaryTurnRecoveryCoordinator({
+      schedule: (_delayMs, run) => { timers.push(run); return run; },
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue,
+      warn: vi.fn(),
+      randomId: () => 'queued-authority',
+      backoffMs: [2_000],
+    });
+    const callerA = {
+      requestLarkAppId: 'app',
+      requestUserOpenId: 'ou_A',
+      senderType: 'user' as const,
+    };
+    const callerB = {
+      requestLarkAppId: 'app',
+      requestUserOpenId: 'ou_B',
+      senderType: 'user' as const,
+    };
+
+    let current = coordinator.begin('om_A', {
+      trustedCaller: callerA,
+      recoveryPolicy: 'premature_completion_only',
+    });
+    current = coordinator.begin('om_B', {
+      trustedCaller: callerB,
+      recoveryPolicy: 'premature_completion_only',
+    });
+    expect(current.queuedTurnAuthorities).toEqual({
+      om_B: { trustedCaller: callerB },
+    });
+
+    current = coordinator.onTerminal(current, { turnId: 'om_A', status: 'completed' });
+    expect(current).toEqual(expect.objectContaining({
+      logicalTurnId: 'om_B',
+      currentTurnId: 'om_B',
+      trustedCaller: callerB,
+    }));
+    expect(current.queuedTurnAuthorities).toBeUndefined();
+
+    coordinator.onTerminal(current, {
+      turnId: 'om_B',
+      status: 'failed',
+      errorCode: 'premature_completion',
+      retryable: true,
+    });
+    timers[0]();
+
+    expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({
+      logicalTurnId: 'om_B',
+      trustedCaller: callerB,
+    }));
+    expect(enqueue).not.toHaveBeenCalledWith(expect.objectContaining({
+      trustedCaller: callerA,
+    }));
+  });
+
+  it('clears stale owner authority when a legacy queued successor has no authority snapshot', () => {
+    const coordinator = new OrdinaryTurnRecoveryCoordinator({
+      schedule: vi.fn(),
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue: vi.fn(() => true),
+      warn: vi.fn(),
+    });
+    const callerA = {
+      requestLarkAppId: 'app',
+      requestUserOpenId: 'ou_A',
+      senderType: 'user' as const,
+    };
+
+    const promoted = coordinator.onTerminal(state({
+      trustedCaller: callerA,
+      queuedLogicalTurnIds: ['om_B'],
+    }), {
+      turnId: 'om_original',
+      status: 'completed',
+    });
+
+    expect(promoted.logicalTurnId).toBe('om_B');
+    expect(promoted.trustedCaller).toBeUndefined();
   });
 
   it('waits for asynchronous scheduled-turn identity preparation before enqueue', async () => {
@@ -138,6 +258,158 @@ describe('OrdinaryTurnRecoveryCoordinator', () => {
     expect(current.status).toBe('exhausted');
     expect(duplicate).toEqual(current);
     expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses a dedicated prompt and permits only one premature-completion continuation', () => {
+    const timers: Array<() => void> = [];
+    const enqueue = vi.fn(() => true);
+    const warn = vi.fn();
+    const coordinator = new OrdinaryTurnRecoveryCoordinator({
+      schedule: (_delayMs, run) => { timers.push(run); return run; },
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue,
+      warn,
+      now: () => 1_000,
+      randomId: () => 'premature-once',
+      backoffMs: [2_000, 8_000],
+    });
+
+    let current = coordinator.onTerminal(state(), {
+      turnId: 'om_original',
+      status: 'failed',
+      errorCode: 'premature_completion',
+      retryable: true,
+    });
+    expect(current).toMatchObject({
+      status: 'backoff',
+      recoveryKind: 'premature_completion',
+    });
+    timers.shift()!();
+    expect(enqueue).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: PREMATURE_COMPLETION_RECOVERY_PROMPT,
+      continuation: 1,
+    }));
+
+    current = coordinator.onTerminal(
+      state({
+        currentTurnId: 'bmx-recovery-premature-once',
+        continuationsStarted: 1,
+        recoveryKind: 'premature_completion',
+      }),
+      {
+        turnId: 'bmx-recovery-premature-once',
+        status: 'failed',
+        errorCode: 'provider_unexpected_eof',
+        retryable: true,
+      },
+    );
+
+    expect(current.status).toBe('exhausted');
+    expect(timers).toHaveLength(0);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it('exhausts a recovery turn that repeats the premature-completion failure', () => {
+    const schedule = vi.fn();
+    const warn = vi.fn();
+    const coordinator = new OrdinaryTurnRecoveryCoordinator({
+      schedule,
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue: vi.fn(() => true),
+      warn,
+      backoffMs: [2_000, 8_000],
+    });
+
+    const exhausted = coordinator.onTerminal(state({
+      currentTurnId: 'bmx-recovery-once',
+      continuationsStarted: 1,
+      recoveryKind: 'premature_completion',
+      recoveryPolicy: 'premature_completion_only',
+    }), {
+      turnId: 'bmx-recovery-once',
+      status: 'failed',
+      errorCode: 'premature_completion',
+      retryable: true,
+    });
+
+    expect(exhausted).toEqual(expect.objectContaining({
+      status: 'exhausted',
+      continuationsStarted: 1,
+      recoveryKind: 'premature_completion',
+    }));
+    expect(schedule).not.toHaveBeenCalled();
+    expect(warn).toHaveBeenCalledOnce();
+  });
+
+  it('does not take over ordinary provider failures under the TraeX-only policy', () => {
+    const schedule = vi.fn();
+    const warn = vi.fn();
+    const coordinator = new OrdinaryTurnRecoveryCoordinator({
+      schedule,
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue: vi.fn(() => true),
+      warn,
+    });
+    const current = coordinator.begin('om_original', {
+      recoveryPolicy: 'premature_completion_only',
+    });
+
+    expect(coordinator.onTerminal(current, {
+      turnId: 'om_original',
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+    })).toMatchObject({
+      status: 'cancelled',
+      lastErrorCode: 'provider_server_error',
+      recoveryPolicy: 'premature_completion_only',
+    });
+    expect(schedule).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('hands the TraeX-only policy to a queued successor after an ordinary provider failure', () => {
+    const coordinator = new OrdinaryTurnRecoveryCoordinator({
+      schedule: vi.fn(),
+      cancel: vi.fn(),
+      persist: vi.fn(),
+      enqueue: vi.fn(() => true),
+      warn: vi.fn(),
+    });
+    const callerA = {
+      requestLarkAppId: 'app',
+      requestUserOpenId: 'ou_A',
+      senderType: 'user' as const,
+    };
+    const callerB = {
+      requestLarkAppId: 'app',
+      requestUserOpenId: 'ou_B',
+      senderType: 'user' as const,
+    };
+
+    expect(coordinator.onTerminal(state({
+      recoveryPolicy: 'premature_completion_only',
+      trustedCaller: callerA,
+      queuedLogicalTurnIds: ['om_next'],
+      queuedTurnAuthorities: {
+        om_next: { trustedCaller: callerB },
+      },
+    }), {
+      turnId: 'om_original',
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+    })).toEqual({
+      logicalTurnId: 'om_next',
+      currentTurnId: 'om_next',
+      continuationsStarted: 0,
+      status: 'running',
+      recoveryPolicy: 'premature_completion_only',
+      trustedCaller: callerB,
+    });
   });
 
   it('cancels pending recovery when a new user turn arrives', () => {
@@ -286,8 +558,18 @@ describe('OrdinaryTurnRecoveryCoordinator', () => {
       randomId: () => 'one',
       backoffMs: [2_000, 8_000],
     });
-    coordinator.restore(state());
-    const queued = coordinator.begin('om_type_ahead');
+    const callerA = {
+      requestLarkAppId: 'app',
+      requestUserOpenId: 'ou_A',
+      senderType: 'user' as const,
+    };
+    const callerB = {
+      requestLarkAppId: 'app',
+      requestUserOpenId: 'ou_B',
+      senderType: 'user' as const,
+    };
+    coordinator.restore(state({ trustedCaller: callerA }));
+    const queued = coordinator.begin('om_type_ahead', { trustedCaller: callerB });
 
     const next = coordinator.onTerminal(queued, {
       turnId: 'om_type_ahead', status: 'failed', errorCode: 'provider_server_error', retryable: true,
@@ -296,6 +578,7 @@ describe('OrdinaryTurnRecoveryCoordinator', () => {
       logicalTurnId: 'om_type_ahead',
       currentTurnId: 'om_type_ahead',
       status: 'backoff',
+      trustedCaller: callerB,
     }));
     expect(next.queuedLogicalTurnIds).toBeUndefined();
     expect(schedule).toHaveBeenCalledTimes(1);

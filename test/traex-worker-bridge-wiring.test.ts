@@ -218,4 +218,21 @@ describe('TRAE worker structured-bridge wiring', () => {
     expect(body).toContain('emptyCompletedBridgeFallbackContent()');
     expect(body).not.toContain('if (!turn.finalText) continue;');
   });
+
+  it('withholds a guarded premature final before delivery and emits one retryable terminal', () => {
+    const start = workerSource.indexOf('function emitReadyCodexTurns');
+    const end = workerSource.indexOf('\n}\n\nfunction stopCodexBridge', start);
+    const body = workerSource.slice(start, end);
+    const classify = body.indexOf('shouldRecoverPrematureCompletion({');
+    const withhold = body.indexOf('prematureCompletionTurns.add(turn)', classify);
+    const finalOutput = body.indexOf("type: 'final_output'", withhold);
+    const terminal = body.indexOf('emitTurnTerminal(', finalOutput);
+
+    expect(classify).toBeGreaterThanOrEqual(0);
+    expect(withhold).toBeGreaterThan(classify);
+    expect(finalOutput).toBeGreaterThan(withhold);
+    expect(terminal).toBeGreaterThan(finalOutput);
+    expect(body.slice(terminal)).toContain('PREMATURE_COMPLETION_ERROR_CODE');
+    expect(body.slice(terminal)).toContain('prematureCompletionTurns.has(turn) ? true : undefined');
+  });
 });

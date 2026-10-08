@@ -3309,6 +3309,145 @@ describe('ordinary Claude semantic recovery', () => {
         && message?.turnId?.startsWith('bmx-recovery-'))).toHaveLength(2);
   });
 
+  it('continues a guarded TraeX premature completion exactly once with inherited authority', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const sessionReply = vi.fn(async () => 'om_warning');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    const trustedCaller = {
+      requestLarkAppId: 'app_test',
+      requestUserOpenId: 'ou_user',
+      requestUserUnionId: 'on_user',
+      senderType: 'user' as const,
+    };
+    forkWorker(ds, { content: 'fix it', trustedCaller }, 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_original' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_original' });
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'failed',
+      errorCode: 'premature_completion',
+      retryable: true,
+    });
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    const recoveries = vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-recovery-'));
+    expect(recoveries).toHaveLength(1);
+    expect(recoveries[0]).toEqual(expect.objectContaining({
+      content: expect.stringContaining('[BOTMUX_PREMATURE_COMPLETION_RECOVERY]'),
+      trustedCaller,
+    }));
+    expect(recoveries[0].content).not.toContain('fix it');
+    expect(sessionReply).not.toHaveBeenCalled();
+
+    worker.emit('message', { type: 'turn_input_received', turnId: recoveries[0].turnId });
+    worker.emit('message', { type: 'turn_input_committed', turnId: recoveries[0].turnId });
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: recoveries[0].turnId,
+      status: 'completed',
+    });
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      status: 'completed',
+      continuationsStarted: 1,
+      recoveryKind: 'premature_completion',
+    }));
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.type === 'message'
+        && message?.turnId?.startsWith('bmx-recovery-'))).toHaveLength(1);
+  });
+
+  it('cancels a guarded TraeX retry when a newer user turn is admitted during backoff', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    initWorkerPool({
+      sessionReply: vi.fn(async () => 'om_warning'),
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'fix it', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'failed',
+      errorCode: 'premature_completion',
+      retryable: true,
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ds.session.ordinaryTurnRecovery?.status).toBe('backoff');
+
+    expect(sendWorkerInput(ds, 'new direction', 'om_new')).toBe(true);
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      logicalTurnId: 'om_new',
+      currentTurnId: 'om_new',
+      continuationsStarted: 0,
+      status: 'running',
+    }));
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.turnId?.startsWith('bmx-recovery-'))).toHaveLength(0);
+  });
+
+  it('leaves ordinary TraeX provider failures on the existing structured failure path', async () => {
+    vi.useFakeTimers();
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const sessionReply = vi.fn(async () => 'om_warning');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs();
+    forkWorker(ds, 'task', 'om_original');
+    const worker = forkMock.mock.results.at(-1)!.value;
+    worker.emit('message', { type: 'turn_input_received', turnId: 'om_original' });
+    worker.emit('message', { type: 'turn_input_committed', turnId: 'om_original' });
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_original',
+      status: 'failed',
+      errorCode: 'provider_server_error',
+      retryable: true,
+    });
+    await vi.advanceTimersByTimeAsync(20_000);
+
+    expect(ds.session.ordinaryTurnRecovery).toEqual(expect.objectContaining({
+      status: 'cancelled',
+      lastErrorCode: 'provider_server_error',
+      recoveryPolicy: 'premature_completion_only',
+    }));
+    expect(vi.mocked(worker.send).mock.calls
+      .map(call => call[0])
+      .filter(message => message?.turnId?.startsWith('bmx-recovery-'))).toHaveLength(0);
+    expect(sessionReply).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['codex', {}],
     ['claude-code', { adoptedFrom: { sessionId: 'external' } }],
@@ -3378,6 +3517,41 @@ describe('ordinary Claude semantic recovery', () => {
       kind: 'blocked',
       reason: expect.stringContaining('provider_unexpected_eof'),
     }));
+  });
+
+  it('posts a failure card when an adopted TraeX premature completion has no recovery consumer', async () => {
+    vi.mocked(getBot).mockImplementation(() => defaultBot({ cliId: 'traex' }));
+    const sessionReply = vi.fn(async () => 'om_warning');
+    initWorkerPool({
+      sessionReply,
+      getSessionWorkingDir: () => '/repo',
+      getActiveCount: () => 1,
+      closeSession: vi.fn(),
+    });
+    const ds = makeDs({
+      adoptedFrom: { sessionId: 'external', cliId: 'traex', cwd: '/repo' },
+    } as any);
+    forkWorker(ds, 'fix it', 'om_adopted_premature');
+    const worker = forkMock.mock.results.at(-1)!.value;
+
+    worker.emit('message', {
+      type: 'turn_terminal',
+      sessionId: ds.session.sessionId,
+      turnId: 'om_adopted_premature',
+      status: 'failed',
+      errorCode: 'premature_completion',
+      retryable: true,
+    });
+
+    await vi.waitFor(() => expect(sessionReply).toHaveBeenCalledWith(
+      'om_root',
+      expect.stringContaining('premature_completion'),
+      'interactive',
+      'app_test',
+      'om_adopted_premature',
+      { sourceSessionId: 'sid-start-test' },
+    ));
+    expect(ds.session.ordinaryTurnRecovery).toBeUndefined();
   });
 
   // The failure card must not become a SECOND notice for a failure the user can

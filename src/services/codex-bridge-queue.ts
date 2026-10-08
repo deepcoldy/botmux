@@ -70,6 +70,14 @@ export interface CodexPendingTurn {
   dispatchAttempt?: number;
   started: boolean;
   contentFingerprint?: string;
+  /** Exact worker input retained only for the lifetime of this pending turn.
+   *  Completion guards use it to distinguish an execution request from a
+   *  question or plan-only request; restored legacy marks intentionally omit
+   *  it rather than guessing from a short fingerprint. */
+  requestText?: string;
+  /** Positive evidence that the structured transcript attributed at least one
+   *  tool call/result to this turn. Absence means no observed tool activity. */
+  toolActivityObserved?: boolean;
   /** Wall-clock millis when mark() was called. The emit gate uses this as
    *  the lower bound of the "did `botmux send` happen for this turn?"
    *  window. Optional only for legacy / test-injected turns. */
@@ -264,6 +272,7 @@ export class CodexBridgeQueue {
       dispatchAttempt,
       started: false,
       contentFingerprint: makeFingerprint(message),
+      requestText: message,
       markTimeMs,
       unconfirmedAttributionStartedAtMs: markTimeMs,
     });
@@ -649,10 +658,15 @@ export class CodexBridgeQueue {
       // collecting; history replay / unmatched events are dropped (never
       // buffered — a late replay into the wrong turn is worse than a gap).
       const target = this.targetForNativeEvent(ev);
-      if (target && this.cotObserver && ev.cotEntries && ev.cotEntries.length > 0) {
+      if (target && ev.cotEntries && ev.cotEntries.length > 0) {
         if (target.sourceSessionId && ev.sourceSessionId && target.sourceSessionId !== ev.sourceSessionId) return;
         if (!target.sourceTurnId && ev.sourceTurnId) target.sourceTurnId = ev.sourceTurnId;
-        try { this.cotObserver(ev.cotEntries, target); } catch { /* cosmetic channel — never break attribution */ }
+        if (ev.cotEntries.some(entry => entry.kind === 'tool_call' || entry.kind === 'tool_result')) {
+          target.toolActivityObserved = true;
+        }
+        if (this.cotObserver) {
+          try { this.cotObserver(ev.cotEntries, target); } catch { /* cosmetic channel — never break attribution */ }
+        }
       }
       return;
     }

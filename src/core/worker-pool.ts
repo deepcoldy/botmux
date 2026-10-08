@@ -643,6 +643,7 @@ import {
   requireOrdinaryTurnRecoveryAttention,
   type OrdinaryTurnRecoveryDispatch,
 } from '../services/ordinary-turn-recovery.js';
+import { PREMATURE_COMPLETION_ERROR_CODE } from '../services/premature-completion-guard.js';
 import {
   attachReadonlyTaskContinuation,
   beginReadonlyTaskContinuationDelivery,
@@ -1674,7 +1675,8 @@ function ordinaryTurnRecoveryEligible(
   ds: DaemonSession,
   botCfg = getBot(ds.larkAppId).config,
 ): boolean {
-  return sessionCliId(ds, botCfg) === 'claude-code'
+  const cliId = sessionCliId(ds, botCfg);
+  return (cliId === 'claude-code' || cliId === 'traex')
     && ds.session.status === 'active'
     && !isSharedAdoptSession(ds)
     && !ds.session.vcMeetingReceiver
@@ -1714,6 +1716,9 @@ function ordinaryTurnRecoveryWarning(
   state: NonNullable<Session['ordinaryTurnRecovery']>,
   locale: ReturnType<typeof localeForBot>,
 ): string {
+  if (state.status === 'exhausted' && state.recoveryKind === 'premature_completion') {
+    return tr('worker.premature_completion_recovery_exhausted', undefined, locale);
+  }
   if (state.status === 'exhausted' && state.continuationsStarted >= 2) {
     return tr('worker.ordinary_recovery_exhausted', undefined, locale);
   }
@@ -1816,7 +1821,16 @@ export function ensureOrdinaryTurnRecoveryAttached(
       const scheduledTaskId = parseScheduledTurnId(dispatch.logicalTurnId);
       const trustedCaller = scheduledTaskId
         ? scheduledContinuationTrustedCaller(ds, scheduledTaskId)
-        : undefined;
+        : dispatch.trustedCaller;
+      const promptPayload = trustedCaller || dispatch.trustedController
+        ? {
+            content: dispatch.prompt,
+            ...(trustedCaller ? { trustedCaller } : {}),
+            ...(dispatch.trustedController
+              ? { trustedController: dispatch.trustedController }
+              : {}),
+          }
+        : dispatch.prompt;
       // Silence comes from the frozen per-turn attribute in the persisted
       // state, not from the runtime registry (which a daemon restart empties).
       const silent = dispatch.silent;
@@ -1826,15 +1840,20 @@ export function ensureOrdinaryTurnRecoveryAttached(
         if (!ds.worker || ds.worker.killed || ds.worker.connected === false) {
           enqueued = forkWorker(
             ds,
-            trustedCaller ? { content: dispatch.prompt, trustedCaller } : dispatch.prompt,
+            promptPayload,
             { resume: true, turnId: dispatch.turnId },
           );
         } else {
           enqueued = sendWorkerInput(
             ds,
-            dispatch.prompt,
+            promptPayload,
             dispatch.turnId,
-            trustedCaller ? { trustedCaller } : {},
+            {
+              ...(trustedCaller ? { trustedCaller } : {}),
+              ...(dispatch.trustedController
+                ? { trustedController: dispatch.trustedController }
+                : {}),
+            },
           );
         }
       } catch (err) {
@@ -10889,7 +10908,12 @@ function rollbackWorkerForkPreInit(
 function recordAdmittedOrdinaryUserTurn(
   ds: DaemonSession,
   turnId: string,
-  opts: { beginRecovery: boolean; dispatchAttempt?: number },
+  opts: {
+    beginRecovery: boolean;
+    dispatchAttempt?: number;
+    trustedCaller?: TrustedCaller;
+    trustedController?: TrustedCaller;
+  },
 ): void {
   const priorRecoveryStatus = ds.session.ordinaryTurnRecovery?.status;
   const priorReadonlyStatus = ds.session.readonlyTaskContinuation?.status;
@@ -10902,6 +10926,15 @@ function recordAdmittedOrdinaryUserTurn(
         // here, and only the persisted copy survives a restart.
         const state = beginOrdinaryTurnRecovery(ds.session, turnId, {
           silent: isSilentScheduledTurn(ds, turnId),
+          ...(sessionCliId(ds, getBot(ds.larkAppId).config) === 'traex'
+            ? { recoveryPolicy: 'premature_completion_only' as const }
+            : {}),
+          ...(opts.trustedCaller
+            ? { trustedCaller: opts.trustedCaller }
+            : {}),
+          ...(opts.trustedController
+            ? { trustedController: opts.trustedController }
+            : {}),
         });
         recoveryBookkeepingSucceeded = state?.logicalTurnId === turnId
           && state.currentTurnId === turnId;
@@ -10990,6 +11023,7 @@ export function sendWorkerInput(
      * The dormant-fork path rides `atMostOnce` on the fork init instead. */
     atMostOnce?: true;
     trustedCaller?: TrustedCaller;
+    trustedController?: TrustedCaller;
   } = {},
 ): boolean {
   const remoteRetirementPhase = remoteRetirementAdmissionPhase(ds);
@@ -11017,7 +11051,9 @@ export function sendWorkerInput(
   const transferGate = transferInputGates.get(ds);
   if ((!ds.worker || ds.worker.killed) && !transferGate) return false;
   const normalized = typeof payload === 'string' ? { content: payload } : payload;
-  const trustedController = trustedSessionController(ds);
+  const trustedCaller = opts.trustedCaller;
+  const trustedController = opts.trustedController
+    ?? trustedSessionController(ds);
   const bot = getBot(ds.larkAppId);
   const effectiveCliId = sessionCliId(ds, bot.config);
   const effectiveTurnId = turnId ?? (effectiveCliId === 'codex-app'
@@ -11064,7 +11100,7 @@ export function sendWorkerInput(
           // tail's frozen payload so promote/repark/restore COPY it verbatim
           // (admission computed once; never re-inferred downstream).
           ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
-          ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
+          ...(trustedCaller ? { trustedCaller } : {}),
           ...(trustedController ? { trustedController } : {}),
         },
         turnId: queuedTurnId,
@@ -11080,6 +11116,8 @@ export function sendWorkerInput(
         ...(opts.dispatchAttempt !== undefined
           ? { dispatchAttempt: opts.dispatchAttempt }
           : {}),
+        ...(trustedCaller ? { trustedCaller } : {}),
+        ...(trustedController ? { trustedController } : {}),
       });
       return true;
     } catch (err) {
@@ -11140,10 +11178,10 @@ export function sendWorkerInput(
     ...(codexAppDispatchId ? { codexAppDispatchId } : {}),
     ...(opts.codexAppSteerable ? { codexAppSteerable: true } : {}),
     ...(opts.atMostOnce ? { atMostOnce: true } : {}),
-    ...(opts.trustedCaller ? { trustedCaller: opts.trustedCaller } : {}),
+    ...(trustedCaller ? { trustedCaller } : {}),
     ...(trustedController ? { trustedController } : {}),
     ...(normalized.rerouteEnvelope ? { rerouteEnvelope: normalized.rerouteEnvelope } : {}),
-    ...(opts.dispatchAttempt === undefined && isSerialGroupInput(ds, opts.trustedCaller)
+    ...(opts.dispatchAttempt === undefined && isSerialGroupInput(ds, trustedCaller)
       ? { queueAfterActiveTurn: true as const } : {}),
     ...(vcMeetingImTurnOrigin
       ? { vcMeetingImTurnOrigin }
@@ -11182,12 +11220,14 @@ export function sendWorkerInput(
     );
     return false;
   }
-  rememberScheduledTurnCaller(ds, effectiveTurnId ?? routingTurnId, opts.trustedCaller);
+  rememberScheduledTurnCaller(ds, effectiveTurnId ?? routingTurnId, trustedCaller);
   {
     const admittedTurnId = effectiveTurnId ?? routingTurnId ?? `admitted-turn-${randomUUID()}`;
     recordAdmittedOrdinaryUserTurn(ds, admittedTurnId, {
       beginRecovery: true,
       ...(opts.dispatchAttempt !== undefined ? { dispatchAttempt: opts.dispatchAttempt } : {}),
+      ...(trustedCaller ? { trustedCaller } : {}),
+      ...(trustedController ? { trustedController } : {}),
     });
   }
   return true;
@@ -11550,6 +11590,12 @@ export function promoteQueuedActivationTail(
       beginRecovery: true,
       ...(head.dispatchAttempt !== undefined
         ? { dispatchAttempt: head.dispatchAttempt }
+        : {}),
+      ...(exactInput.trustedCaller
+        ? { trustedCaller: exactInput.trustedCaller }
+        : {}),
+      ...(exactInput.trustedController
+        ? { trustedController: exactInput.trustedController }
         : {}),
     });
   } catch (err) {
@@ -13007,6 +13053,8 @@ export function forkWorker(
       ...(initDispatchAttempt !== undefined
         ? { dispatchAttempt: initDispatchAttempt }
         : {}),
+      ...(initTrustedCaller ? { trustedCaller: initTrustedCaller } : {}),
+      ...(initTrustedController ? { trustedController: initTrustedController } : {}),
     });
   }
   ds.spawnedAt = Date.now();
@@ -16147,7 +16195,9 @@ function setupWorkerHandlers(
         // 现在统一走失败卡。仍然刻意**不**碰已经有可见卡片的路径：`failed` 的
         // 结构化终态由 Channel B 的 final_output 卡承载（还带半截答案），在这里
         // 再发一张就是重复通知。
-        const structuredFailedOwnsNotice = !isClaudeProviderFailure && msg.status === 'failed';
+        const structuredFailedOwnsNotice = !isClaudeProviderFailure
+          && msg.status === 'failed'
+          && msg.errorCode !== PREMATURE_COMPLETION_ERROR_CODE;
         const shouldPostFailureCard = shouldNotifyTurnFailure({
           status: msg.status,
           ...(msg.errorCode !== undefined ? { errorCode: msg.errorCode } : {}),

@@ -1225,6 +1225,7 @@ export const messages: Record<string, string> = {
   'worker.empty_final_failed_auth': '⚠️ {cliName} 认证失败：{reason}\n请检查 CLI 登录状态和模型服务凭证，修复后重发消息。',
   'worker.empty_final_failed_connection': '⚠️ {cliName} 连接模型服务失败：{reason}\n请检查网络与模型服务状态，恢复后重发消息。',
   'worker.empty_final_failed_upstream': '⚠️ {cliName} 遇到模型网关/上游服务故障：{reason}\n这是服务端暂态错误，与你的消息内容无关；请稍后重发消息重试。',
+  'worker.premature_completion_recovery_exhausted': '⚠️ TraeX 提前结束后，Botmux 已自动续跑 1 次，但续跑发生故障，仍无法确认任务完成。为避免重复外部操作，已停止自动处理；请检查 Web 终端后，再发送一条消息继续。',
   'worker.ordinary_recovery_exhausted': '⚠️ Claude 因暂态模型服务故障中断，Botmux 已自动续跑 2 次但仍未恢复。会话已停止自动续跑，避免重复外部操作；请检查 Web 终端和模型服务状态后，再发送一条消息继续。',
   'worker.ordinary_recovery_enqueue_failed': '⚠️ Claude 因暂态模型服务故障中断，但 Botmux 无法安全提交自动续跑。会话已停止自动操作；请检查 Web 终端后，再发送一条消息继续。',
   'worker.ordinary_recovery_delivery_failed': '⚠️ Claude 因暂态模型服务故障中断，但自动续跑未能送达 Worker。会话已停止自动操作；请检查 Web 终端后，再发送一条消息继续。',

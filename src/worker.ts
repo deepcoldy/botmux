@@ -76,7 +76,11 @@ import { larkTransportEnabled as sessionLarkTransportEnabled } from './core/type
 import { drainTranscript, joinAssistantText, trailingAssistantText, findJsonlContainingFingerprint, findJsonlsContainingExactContent, findLatestJsonl, extractLastAssistantTurn, stringifyUserContent, extractTurnStartText, splitTranscriptEventsByCutoff, isTranscriptRateLimitEvent, apiErrorMessageText, extractCotEntries, ClaudeModelFallbackTracker, BackgroundTaskTracker, type ModelFallbackObservation, type TranscriptEvent } from './services/claude-transcript.js';
 import { BridgeTurnQueue, makeFingerprint, normaliseForFingerprint, type BridgePendingTurn } from './services/bridge-turn-queue.js';
 import { createTranscriptTerminalSettle } from './services/transcript-terminal-settle.js';
-import { bridgePostText, composeFailedBridgeFallbackContent, isBridgeNothingToSendFinal, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import { bridgePostText, composeFailedBridgeFallbackContent, isBridgeNothingToSendFinal, isFinalBridgeSendMarker, shouldEmitEmptyCompletedBridgeFallback, shouldSuppressBridgeEmit, shouldSuppressStructuredFallback, structuredFallbackKind, stripTrailingBridgeSentinelLine, stripTrailingOaiMemoryCitation, type BridgeSendMarker } from './services/bridge-fallback-gate.js';
+import {
+  PREMATURE_COMPLETION_ERROR_CODE,
+  shouldRecoverPrematureCompletion,
+} from './services/premature-completion-guard.js';
 import { codexStatusLineSetupNotice } from './services/codex-statusline-config.js';
 import { buildSubmitMessagePreview } from './services/submit-notification.js';
 import {
@@ -8814,6 +8818,10 @@ function emitReadyCodexTurns(): void {
   // that flag to settle completed-with-empty; a bare `completed` terminal (e.g.
   // the RPC-hydration timeout path) must never be read as silence.
   const nothingToSendTurns = new Set<(typeof ready)[number]>();
+  // High-confidence execution turns that ended with only a promise of future
+  // work. These are withheld from final_output and terminalized as one bounded
+  // recovery request below; object identity keeps the decision turn-exact.
+  const prematureCompletionTurns = new Set<(typeof ready)[number]>();
   const terminalAdoptMode = lastInitConfig?.adoptMode === true;
   const sharedAppServerBridge = isExistingAppServerSharedBridge();
   // Adopt mode: model is the user's external Codex, no botmux send to
@@ -8882,12 +8890,30 @@ function emitReadyCodexTurns(): void {
     // the most common success path of all. failed/ambiguous stay a no-op via
     // bridgeTurnOutcome, so a limit refusal never reads as success.
     const turnOutcome = bridgeTurnOutcome(turn);
-    notifyExplicitRepliesObserved(
-      turn.turnId,
-      attributableExplicitReplyMarkersForTurnWindow(
-        turn.turnId, gateInput, nextBoundaryMs, markers, adoptMode,
-      ),
+    const explicitReplyMarkers = attributableExplicitReplyMarkersForTurnWindow(
+      turn.turnId, gateInput, nextBoundaryMs, markers, adoptMode,
     );
+    notifyExplicitRepliesObserved(turn.turnId, explicitReplyMarkers);
+    const explicitFinalReplyObserved = explicitReplyMarkers.some(isFinalBridgeSendMarker);
+    const prematureCompletion = shouldRecoverPrematureCompletion({
+      cliId: lastInitConfig?.cliId,
+      turnId: turn.turnId,
+      requestText: turn.requestText,
+      finalText: turn.finalText,
+      terminalStatus: turn.terminalStatus ?? 'completed',
+      toolActivityObserved: turn.toolActivityObserved,
+      explicitFinalReplyObserved,
+      isLocal: turn.isLocal,
+      dispatchAttempt: turn.dispatchAttempt,
+    });
+    if (prematureCompletion.recover) {
+      prematureCompletionTurns.add(turn);
+      log(
+        `Premature completion guard withheld turn ${turn.turnId.substring(0, 12)} `
+        + '(execution request ended with future-work promise and no tool/send evidence)',
+      );
+      continue;
+    }
     if (!content || shouldSuppressStructuredFallback(fallbackKind, gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
       usageLimitTracker.noteTurnCompleted(turnOutcome);
     }
@@ -8969,10 +8995,15 @@ function emitReadyCodexTurns(): void {
     });
     emitTurnTerminal(
       turn.turnId,
-      turn.terminalStatus ?? 'completed',
-      turn.terminalErrorCode,
+      prematureCompletionTurns.has(turn)
+        ? 'failed'
+        : turn.terminalStatus ?? 'completed',
+      prematureCompletionTurns.has(turn)
+        ? PREMATURE_COMPLETION_ERROR_CODE
+        : turn.terminalErrorCode,
       turn.dispatchAttempt,
       nothingToSendTurns.has(turn) ? 'nothing_to_send' : undefined,
+      prematureCompletionTurns.has(turn) ? true : undefined,
     );
   }
 }

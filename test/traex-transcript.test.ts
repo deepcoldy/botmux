@@ -10,6 +10,7 @@ import {
   shouldEmitEmptyCompletedBridgeFallback,
   structuredFallbackKind,
 } from '../src/services/bridge-fallback-gate.js';
+import { shouldRecoverPrematureCompletion } from '../src/services/premature-completion-guard.js';
 import {
   drainTraexRollout,
   findTraexRolloutSetByPid,
@@ -1280,6 +1281,42 @@ describe('drainTraexRollout', () => {
     ].join(''));
 
     expect(drainTraexRollout(path, 0).events.filter(event => event.kind === 'user')).toHaveLength(1);
+  });
+
+  it('feeds a 0.208 no-tool future-work terminal into the premature-completion guard', () => {
+    const turnId = '00000000-0000-7000-8000-00000000020a';
+    const request = '<user_message>修复这个问题，运行测试并确认结果。</user_message>';
+    writeFileSync(path, [
+      line(historyDisplayCompletion({
+        type: 'UserMessage',
+        id: 'msg-user-guard',
+        content: [{ type: 'text', text: request }],
+      }, turnId)),
+      line({
+        ...taskComplete('我先检查相关代码，然后进行修改和验证。'),
+        payload: {
+          ...taskComplete('我先检查相关代码，然后进行修改和验证。').payload,
+          turn_id: turnId,
+        },
+      }),
+    ].join(''));
+
+    const queue = new CodexBridgeQueue();
+    queue.mark('om_guard_0208', request, 0);
+    queue.ingest(drainTraexRollout(path, 0).events);
+    const ready = queue.drainEmittable()[0]!;
+
+    expect(shouldRecoverPrematureCompletion({
+      cliId: 'traex',
+      turnId: ready.turnId,
+      requestText: ready.requestText,
+      finalText: ready.finalText,
+      terminalStatus: ready.terminalStatus ?? 'completed',
+      toolActivityObserved: ready.toolActivityObserved,
+      explicitFinalReplyObserved: false,
+      isLocal: ready.isLocal,
+      dispatchAttempt: ready.dispatchAttempt,
+    }).recover).toBe(true);
   });
 
   it('does not double-count a legacy user_message without turn_id before its item_completed mirror', () => {

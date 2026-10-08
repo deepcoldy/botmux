@@ -1,7 +1,17 @@
+import type { TrustedCaller } from '../types.js';
+import { PREMATURE_COMPLETION_ERROR_CODE } from './premature-completion-guard.js';
+
 export const ORDINARY_TURN_RECOVERY_PROMPT = [
   '[BOTMUX_RECOVERY]',
   '上一执行因暂态 provider 故障中止。请读取当前会话和工作区状态，从最后一个可验证 checkpoint 继续原任务；',
   '不要重复已经完成的外部副作用。完成后按原任务的交付协议回复；若无法安全判断 checkpoint，请停止并明确请求人工决策。',
+].join('\n');
+
+export const PREMATURE_COMPLETION_RECOVERY_PROMPT = [
+  '[BOTMUX_PREMATURE_COMPLETION_RECOVERY]',
+  '上一轮只承诺了接下来要做的动作，却在没有工具执行或结果证据时提前结束。',
+  '请读取当前会话和工作区状态，立即继续原任务并实际完成它；不要只复述计划，也不要重复已经完成的外部副作用。',
+  '完成后按原任务的交付协议给出结果和验证证据；如果确实需要用户确认或缺少必要输入，请明确说明阻塞点并停止。',
 ].join('\n');
 
 export type OrdinaryTurnRecoveryStatus =
@@ -13,11 +23,27 @@ export type OrdinaryTurnRecoveryStatus =
   | 'exhausted'
   | 'attention_required';
 
+export interface OrdinaryTurnRecoveryAuthority {
+  trustedCaller?: TrustedCaller;
+  trustedController?: TrustedCaller;
+}
+
 export interface OrdinaryTurnRecoveryState {
   logicalTurnId: string;
   currentTurnId: string;
   continuationsStarted: number;
   status: OrdinaryTurnRecoveryStatus;
+  /** Why this logical turn entered automatic continuation. Premature
+   * completion is capped at one continuation even if that continuation later
+   * encounters a retryable provider failure. */
+  recoveryKind?: 'provider_failure' | 'premature_completion';
+  /** TraeX uses this coordinator only for the semantic completion guard.
+   * Ordinary structured provider failures retain their existing fallback path. */
+  recoveryPolicy?: 'premature_completion_only';
+  /** Daemon-authenticated authority frozen at original turn admission and
+   * copied onto every synthetic continuation. */
+  trustedCaller?: TrustedCaller;
+  trustedController?: TrustedCaller;
   nextAttemptAt?: number;
   lastErrorCode?: string;
   alertSentAt?: number;
@@ -30,6 +56,9 @@ export interface OrdinaryTurnRecoveryState {
    *  while the owner is still `running` means the owner's terminal was lost and
    *  the successor is adopted on the spot. Absent when empty. */
   queuedLogicalTurnIds?: string[];
+  /** Turn-exact authority for queued successors. An empty object deliberately
+   *  means "clear the prior owner's authority" when that successor is promoted. */
+  queuedTurnAuthorities?: Record<string, OrdinaryTurnRecoveryAuthority>;
   /** Logical turns (owner or queued successor) whose fire was a silent
    *  scheduled run. Frozen at admission from the daemon's runtime silent
    *  registry and persisted here, because that registry does not survive a
@@ -55,8 +84,54 @@ function withQueuedLogicalTurnIds(
   state: OrdinaryTurnRecoveryState,
   queued: readonly string[],
 ): OrdinaryTurnRecoveryState {
-  const { queuedLogicalTurnIds: _dropped, ...rest } = state;
-  return queued.length > 0 ? { ...rest, queuedLogicalTurnIds: [...queued] } : rest;
+  const {
+    queuedLogicalTurnIds: _dropped,
+    queuedTurnAuthorities,
+    ...rest
+  } = state;
+  if (queued.length === 0) return rest;
+  const keptAuthorities: Record<string, OrdinaryTurnRecoveryAuthority> = {};
+  for (const turnId of queued) {
+    if (Object.prototype.hasOwnProperty.call(queuedTurnAuthorities ?? {}, turnId)) {
+      keptAuthorities[turnId] = structuredClone(queuedTurnAuthorities![turnId]);
+    }
+  }
+  return {
+    ...rest,
+    queuedLogicalTurnIds: [...queued],
+    ...(Object.keys(keptAuthorities).length > 0
+      ? { queuedTurnAuthorities: keptAuthorities }
+      : {}),
+  };
+}
+
+function authorityFrom(
+  value: OrdinaryTurnRecoveryAuthority,
+): OrdinaryTurnRecoveryAuthority {
+  return {
+    ...(value.trustedCaller
+      ? { trustedCaller: structuredClone(value.trustedCaller) }
+      : {}),
+    ...(value.trustedController
+      ? { trustedController: structuredClone(value.trustedController) }
+      : {}),
+  };
+}
+
+function hasAuthority(value: OrdinaryTurnRecoveryAuthority): boolean {
+  return value.trustedCaller !== undefined || value.trustedController !== undefined;
+}
+
+function withCurrentAuthority(
+  state: OrdinaryTurnRecoveryState,
+  authority: OrdinaryTurnRecoveryAuthority | undefined,
+): OrdinaryTurnRecoveryState {
+  const {
+    trustedCaller: _trustedCaller,
+    trustedController: _trustedController,
+    ...rest
+  } = state;
+  return { ...rest, ...authorityFrom(authority ?? {}) };
 }
 
 export interface OrdinaryTurnRecoveryTerminal {
@@ -74,11 +149,16 @@ export interface OrdinaryTurnRecoveryDispatch {
   /** The logical turn was a silent scheduled fire: the continuation must be
    *  armed silent too. Read from the persisted state, never from runtime. */
   silent: boolean;
+  trustedCaller?: TrustedCaller;
+  trustedController?: TrustedCaller;
 }
 
 export interface OrdinaryTurnBeginOptions {
   /** Freeze "this fire is silent" onto the logical turn at admission. */
   silent?: boolean;
+  trustedCaller?: TrustedCaller;
+  trustedController?: TrustedCaller;
+  recoveryPolicy?: 'premature_completion_only';
 }
 
 function isSilentLogicalTurn(state: OrdinaryTurnRecoveryState, logicalTurnId: string): boolean {
@@ -185,10 +265,22 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       if (logicalTurnId === live.currentTurnId || logicalTurnId === live.logicalTurnId
         || queued.includes(logicalTurnId)) return live;
       try {
-        const withQueue = withQueuedLogicalTurnIds(
+        let withQueue = withQueuedLogicalTurnIds(
           live,
           [...queued, logicalTurnId].slice(-MAX_QUEUED_LOGICAL_TURNS),
         );
+        const queuedAuthority = authorityFrom(opts);
+        if (hasAuthority(queuedAuthority)
+          || hasAuthority(live)
+          || live.queuedTurnAuthorities !== undefined) {
+          withQueue = {
+            ...withQueue,
+            queuedTurnAuthorities: {
+              ...(withQueue.queuedTurnAuthorities ?? {}),
+              [logicalTurnId]: queuedAuthority,
+            },
+          };
+        }
         return this.commit(opts.silent
           ? { ...withQueue, silentLogicalTurnIds: [...(withQueue.silentLogicalTurnIds ?? []), logicalTurnId] }
           : withQueue);
@@ -205,6 +297,9 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
         continuationsStarted: 0,
         status: 'running',
         ...(opts.silent ? { silentLogicalTurnIds: [logicalTurnId] } : {}),
+        ...(opts.trustedCaller ? { trustedCaller: structuredClone(opts.trustedCaller) } : {}),
+        ...(opts.trustedController ? { trustedController: structuredClone(opts.trustedController) } : {}),
+        ...(opts.recoveryPolicy ? { recoveryPolicy: opts.recoveryPolicy } : {}),
       });
     } catch (err) {
       if (wasBackoff) this.armBackoff();
@@ -219,6 +314,7 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
     if (terminal.turnId !== current.currentTurnId) {
       const queued = current.queuedLogicalTurnIds ?? [];
       if (!queued.includes(terminal.turnId)) return current;
+      const queuedAuthority = current.queuedTurnAuthorities?.[terminal.turnId];
       const remaining = withQueuedLogicalTurnIds(current, queued.filter(id => id !== terminal.turnId));
       // The owner's own recovery is in flight (backoff timer, dispatching, or
       // an already-delivered continuation that is still running) or the owner
@@ -228,8 +324,9 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       // The owner never reported a terminal (lost/missed) yet its successor
       // did: the successor is the live turn now, and its terminal is handled
       // exactly as an owner terminal would be.
-      const adopted = this.commit({
-        ...remaining,
+      const { recoveryKind: _recoveryKind, ...resetRecovery } = remaining;
+      const adopted = this.commit(withCurrentAuthority({
+        ...resetRecovery,
         logicalTurnId: terminal.turnId,
         currentTurnId: terminal.turnId,
         continuationsStarted: 0,
@@ -238,7 +335,7 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
         lastErrorCode: undefined,
         alertSentAt: undefined,
         warningDispatched: undefined,
-      });
+      }, queuedAuthority));
       return this.onTerminal(adopted, terminal);
     }
     if (current.status !== 'running') return current;
@@ -248,13 +345,45 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       // Hand the slot to the type-ahead successor Claude is about to run, so
       // its failure has a recovery consumer instead of only the fallback card.
       // The silent marks ride along; commit prunes them to the new owner + queue.
-      return this.commit(withQueuedLogicalTurnIds({
+      const { recoveryKind: _recoveryKind, ...resetRecovery } = current;
+      const promoted = withCurrentAuthority({
+        ...resetRecovery,
         logicalTurnId: next,
         currentTurnId: next,
         continuationsStarted: 0,
         status: 'running',
         ...(current.silentLogicalTurnIds ? { silentLogicalTurnIds: current.silentLogicalTurnIds } : {}),
-      }, rest));
+      }, current.queuedTurnAuthorities?.[next]);
+      return this.commit(withQueuedLogicalTurnIds(promoted, rest));
+    }
+    if (current.recoveryPolicy === 'premature_completion_only'
+      && current.recoveryKind !== 'premature_completion'
+      && terminal.errorCode !== PREMATURE_COMPLETION_ERROR_CODE) {
+      const [next, ...rest] = current.queuedLogicalTurnIds ?? [];
+      if (next !== undefined) {
+        const {
+          recoveryKind: _recoveryKind,
+          nextAttemptAt: _nextAttemptAt,
+          lastErrorCode: _lastErrorCode,
+          alertSentAt: _alertSentAt,
+          warningDispatched: _warningDispatched,
+          ...resetRecovery
+        } = current;
+        const promoted = withCurrentAuthority({
+          ...resetRecovery,
+          logicalTurnId: next,
+          currentTurnId: next,
+          continuationsStarted: 0,
+          status: 'running',
+        }, current.queuedTurnAuthorities?.[next]);
+        return this.commit(withQueuedLogicalTurnIds(promoted, rest));
+      }
+      return this.commit({
+        ...current,
+        status: 'cancelled',
+        nextAttemptAt: undefined,
+        ...(terminal.errorCode ? { lastErrorCode: terminal.errorCode } : {}),
+      });
     }
     if (terminal.errorCode === 'provider_rate_limited') return current;
     if (terminal.status !== 'failed' || terminal.retryable !== true) {
@@ -266,11 +395,19 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       this.warnOnce(next);
       return next;
     }
-    if (current.continuationsStarted >= this.backoffMs.length) {
+    const recoveryKind = current.recoveryKind
+      ?? (terminal.errorCode === PREMATURE_COMPLETION_ERROR_CODE
+        ? 'premature_completion'
+        : 'provider_failure');
+    const maxContinuations = recoveryKind === 'premature_completion'
+      ? 1
+      : this.backoffMs.length;
+    if (current.continuationsStarted >= maxContinuations) {
       const exhausted = {
         ...current,
         status: 'exhausted' as const,
         lastErrorCode: terminal.errorCode,
+        recoveryKind,
       };
       this.warnOnce(exhausted);
       return exhausted;
@@ -281,6 +418,7 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       status: 'backoff',
       nextAttemptAt: this.now() + delayMs,
       lastErrorCode: terminal.errorCode,
+      recoveryKind,
     });
     this.armBackoff();
     return next;
@@ -360,9 +498,17 @@ export class OrdinaryTurnRecoveryCoordinator<TTimer = unknown> {
       const dispatch: OrdinaryTurnRecoveryDispatch = {
         logicalTurnId: dispatching.logicalTurnId,
         turnId,
-        prompt: ORDINARY_TURN_RECOVERY_PROMPT,
+        prompt: dispatching.recoveryKind === 'premature_completion'
+          ? PREMATURE_COMPLETION_RECOVERY_PROMPT
+          : ORDINARY_TURN_RECOVERY_PROMPT,
         continuation,
         silent: isSilentLogicalTurn(dispatching, dispatching.logicalTurnId),
+        ...(dispatching.trustedCaller
+          ? { trustedCaller: structuredClone(dispatching.trustedCaller) }
+          : {}),
+        ...(dispatching.trustedController
+          ? { trustedController: structuredClone(dispatching.trustedController) }
+          : {}),
       };
       const finish = (): void => {
         const current = this.state;
@@ -541,6 +687,10 @@ export function ordinaryTurnRecoveryHandlesTerminal(
 ): boolean {
   const current = session.ordinaryTurnRecovery;
   if (attachedRecoveries.get(session.sessionId)?.session !== session || !current) return false;
+  if (current.recoveryPolicy === 'premature_completion_only'
+    && current.recoveryKind !== 'premature_completion'
+    && terminal.status !== 'completed'
+    && terminal.errorCode !== PREMATURE_COMPLETION_ERROR_CODE) return false;
   if (current.currentTurnId === terminal.turnId) return true;
   // A queued type-ahead successor is adopted by onTerminal only while the
   // original owner itself is still running (no continuation dispatched); in any

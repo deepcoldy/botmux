@@ -528,6 +528,24 @@ describe('CodexBridgeQueue — cot observer (thinking timeline)', () => {
     expect(seen).toHaveLength(2);
   });
 
+  it('retains the marked request and records tool activity on the completed turn', () => {
+    const q = new CodexBridgeQueue();
+    q.mark('t1', '<user_message>fix it</user_message>', 100);
+    q.ingest([userEv('<user_message>fix it</user_message>', 'u-guard', 200)]);
+    q.ingest([cotEv([
+      { kind: 'tool_call', id: 'call_1', name: 'shell', args: '{"command":["true"]}' },
+    ], 'c-guard', 300)]);
+    q.ingest([asstEv('done', 'a-guard', 400)]);
+
+    expect(q.drainEmittable()).toEqual([
+      expect.objectContaining({
+        turnId: 't1',
+        requestText: '<user_message>fix it</user_message>',
+        toolActivityObserved: true,
+      }),
+    ]);
+  });
+
   it('cot events never start, close or wedge a turn (attribution unchanged)', () => {
     const q = new CodexBridgeQueue();
     q.mark('t1', 'prompt', 100);
