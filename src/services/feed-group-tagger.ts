@@ -760,9 +760,10 @@ export async function addCreatedChatToFeedGroup(larkAppId: string, chatId: strin
   const cfg = getBot(larkAppId).config;
   const brand = normalizeBrand(cfg.brand);
   const host = larkHosts(brand).openApi;
-  const token = await resolveUserToken(larkAppId, cfg.larkAppSecret, brand, openId);
-  if (!token) throw new Error('User authorization required: /login --scope im:feed_group_v1:read im:feed_group_v1:write offline_access');
   const signal = AbortSignal.timeout(10_000);
+  const token = await resolveUserToken(larkAppId, cfg.larkAppSecret, brand, openId, signal);
+  signal.throwIfAborted();
+  if (!token) throw new Error('User authorization required: /login --scope im:feed_group_v1:read im:feed_group_v1:write offline_access');
   let groupId = await findFeedGroupByName(host, token, name, signal, true);
   if (!groupId) {
     const created = await callFeedGroupApi(host, token, 'POST', '/open-apis/im/v1/groups', {

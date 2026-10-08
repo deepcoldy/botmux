@@ -96,6 +96,24 @@ describe('createGroupWithBots', () => {
     );
   });
 
+  it('invites teammates before waiting for optional personal tagging', async () => {
+    let release!: () => void;
+    mockCreateChat.mockResolvedValue({ chatId: 'oc_pending_tag', invalidBotIds: [], invalidUserIds: [] });
+    mockPersonalTag.mockReturnValueOnce(new Promise<void>(resolve => { release = resolve; }));
+    const task = createGroupWithBots({
+      creatorLarkAppId: CREATOR, larkAppIds: [CREATOR, OTHER_BOT], name: 'Project',
+      customization: { tag: 'Work', userOpenId: USER_OPEN_ID },
+    });
+    try {
+      await vi.waitFor(() => expect(mockPersonalTag).toHaveBeenCalled());
+      expect(mockAddBotToChat).toHaveBeenCalledWith(CREATOR, 'oc_pending_tag', [OTHER_BOT]);
+      expect(mockAddBotToChat.mock.invocationCallOrder.at(-1)!).toBeLessThan(mockPersonalTag.mock.invocationCallOrder.at(-1)!);
+    } finally {
+      release();
+      await task;
+    }
+  });
+
   it('decorates before owner transfer, and preserves the group on independent failures', async () => {
     mockCreateChat.mockResolvedValue({ chatId: 'oc_custom', invalidBotIds: [], invalidUserIds: [] });
     mockNameAvatar.mockRejectedValueOnce(new Error('no font'));

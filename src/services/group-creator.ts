@@ -161,19 +161,6 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     chatMode: opts.chatMode,
   });
   opts.onChatCreated?.(r.chatId);
-  const customization: CreateGroupResult['customization'] = opts.customization ? {} : undefined;
-  if (opts.customization?.avatar === 'name') {
-    try {
-      const { applyGroupNameAvatar } = await import('./group-name-avatar.js');
-      await applyGroupNameAvatar(opts.creatorLarkAppId, r.chatId, opts.name ?? '');
-    } catch (err: any) { customization!.avatarError = err?.message ?? String(err); }
-  }
-  if (opts.customization?.tag) {
-    try {
-      const { addCreatedChatToFeedGroup } = await import('./feed-group-tagger.js');
-      await addCreatedChatToFeedGroup(opts.creatorLarkAppId, r.chatId, opts.customization.userOpenId, opts.customization.tag);
-    } catch (err: any) { customization!.tagError = err?.message ?? String(err); }
-  }
   for (let i = 0; i < otherBots.length; i += BOT_BATCH) {
     const batch = otherBots.slice(i, i + BOT_BATCH);
     let added = await addBotToChat(opts.creatorLarkAppId, r.chatId, batch);
@@ -194,6 +181,21 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     // grant matrix are ready. The callback also sees rejected invitees so a
     // CLI caller cannot report a partially-created group as complete.
     await opts.ensureBotCollaboration(r.chatId, joinedBotIds, [...invalidBots]);
+  }
+
+  // Optional decoration must never delay inviting the requested teammates.
+  const customization: CreateGroupResult['customization'] = opts.customization ? {} : undefined;
+  if (opts.customization?.avatar === 'name') {
+    try {
+      const { applyGroupNameAvatar } = await import('./group-name-avatar.js');
+      await applyGroupNameAvatar(opts.creatorLarkAppId, r.chatId, opts.name ?? '');
+    } catch (err: any) { customization!.avatarError = err?.message ?? String(err); }
+  }
+  if (opts.customization?.tag) {
+    try {
+      const { addCreatedChatToFeedGroup } = await import('./feed-group-tagger.js');
+      await addCreatedChatToFeedGroup(opts.creatorLarkAppId, r.chatId, opts.customization.userOpenId, opts.customization.tag);
+    } catch (err: any) { customization!.tagError = err?.message ?? String(err); }
   }
 
   // Fetch the shareable join link BEFORE transferring ownership: the creator bot

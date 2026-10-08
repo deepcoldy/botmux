@@ -9,7 +9,7 @@ import { createHash } from 'node:crypto';
 import { join, resolve, basename } from 'node:path';
 import { config } from '../config.js';
 import { buildTerminalUrl } from './terminal-url.js';
-import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, type BotConfig } from '../bot-registry.js';
+import { getBot, getAllBots, getBotOpenId, getOwnerOpenId, findOncallChat, effectiveDefaultWorkingDir, loadBotConfigs, type BotConfig } from '../bot-registry.js';
 import { triggerUserAuthApplies } from '../services/trigger-user-auth.js';
 import { beginBytedcliLogin, completeBytedcliLogin, pendingBytedcliChallenge, hasBytedcliHome } from '../services/bytedcli-auth.js';
 import { beginLarkCliLogin, completeLarkCliLogin, pendingLarkCliChallenge, hasLarkCliHome } from '../services/lark-cli-auth.js';
@@ -4681,9 +4681,14 @@ export async function handleCommand(
           // only its creator was mentioned. Explicit --agents/--no-agents have
           // already overridden defaults in the parser; Set below deduplicates.
           if (groupArgs.agents?.length) {
+            const configs = loadBotConfigs();
             const p = join(config.session.dataDir, 'bots-info.json');
-            const bots = existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')) : [];
-            configuredAgentIds = resolveGroupCreationAgents(groupArgs.agents, bots);
+            let bots: Parameters<typeof resolveGroupCreationAgents>[2] = [];
+            try {
+              const cached: unknown = existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')) : [];
+              if (Array.isArray(cached)) bots = cached.filter(b => b && typeof b === 'object');
+            } catch { /* Names can be unavailable; app IDs still resolve against config. */ }
+            configuredAgentIds = resolveGroupCreationAgents(groupArgs.agents, configs, bots);
           }
         } catch (err: any) {
           await sessionReply(rootId, t('cmd.group.invalid_options', { reason: err?.message ?? String(err) }, loc));

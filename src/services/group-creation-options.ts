@@ -68,7 +68,16 @@ export function parseGroupCreationArgs(raw: string, defaults?: GroupCreationDefa
   return { ...parseGroupCreationDefaults(options), name, roleProfileId };
 }
 
-export function resolveGroupCreationAgents(refs: string[], bots: Array<{ larkAppId?: string; botName?: string | null }>): string[] {
+/** Config is authoritative for membership/transport; probe cache only supplies names. */
+export function resolveGroupCreationAgents(
+  refs: string[],
+  configs: Array<{ larkAppId: string; displayName?: string; apiOnly?: boolean }>,
+  botInfo: Array<{ larkAppId?: string; botName?: string | null }>,
+): string[] {
+  const bots = configs.filter(b => !b.apiOnly).map(b => ({
+    larkAppId: b.larkAppId,
+    botName: b.displayName ?? botInfo.find(info => info.larkAppId === b.larkAppId)?.botName,
+  }));
   return [...new Set(refs.map(ref => {
     const exactId = bots.filter(b => b.larkAppId === ref);
     const matches = exactId.length ? exactId : bots.filter(b => b.botName?.toLowerCase() === ref.toLowerCase());
