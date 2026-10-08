@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { networkPolicySupportError, networkProxyError } from './core/sandbox-network-policy.js';
-import {claudeActionPrompt} from './services/claude-action-prompt.js';
+import { claudePermissionScreen } from './services/claude-permission-notify.js';
 import { GOAL_ENV } from './workflows/v3/contract.js';
 import { supportsZeroPromptInjection } from './core/prompt-injection.js';
 import { clearBotmuxPromptEnv } from './skills/zero-injection.js';
@@ -14153,9 +14153,7 @@ function startScreenUpdates(): void {
   let lastSentStatus: string | undefined;
   let lastTextSnapshotHash = '';
   let lastContent = '';
-  // Last Claude permission dialog already notified (dedup by projection text;
-  // cleared when the dialog leaves the screen so the next one notifies again).
-  let lastClaudeActionPrompt = '';
+  let hadClaudePermissionScreen = false;
   // PTY-activity watermark of the last tick that actually captured. The screen
   // normally reaches us only through onPtyData (it updates lastPtyActivityAtMs
   // and feeds the renderer in the same place), so when this hasn't advanced the
@@ -14269,13 +14267,14 @@ function startScreenUpdates(): void {
       // is narrow: only the bounded title/question/options leave the
       // terminal, never tool args.
       if (lastInitConfig?.cliId === 'claude-code') {
-        const prompt = claudeActionPrompt(lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content);
-        if (prompt && prompt !== lastClaudeActionPrompt) {
-          lastClaudeActionPrompt = prompt;
-          send({type: 'user_notify', message: prompt, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt});
-        } else if (!prompt) {
-          lastClaudeActionPrompt = '';
+        const dialog = claudePermissionScreen(lastAnalyzerSnapshot || renderer?.rawSnapshot() || snapshot.content);
+        // Repeat the cached observation even on a static screen. The daemon may
+        // suppress it while a matching card is live, then must recover fallback
+        // when that ask settles/disconnects without another PTY repaint.
+        if (dialog || hadClaudePermissionScreen) {
+          send({type: 'claude_permission_screen', ...dialog, turnId: currentBotmuxTurnId, dispatchAttempt: currentBotmuxDispatchAttempt});
         }
+        hadClaudePermissionScreen = !!dialog;
       }
       if (snapshot.changed || usageAware.status !== lastSentStatus) {
         lastSentStatus = usageAware.status;

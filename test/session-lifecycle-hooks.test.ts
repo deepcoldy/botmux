@@ -1,5 +1,6 @@
+import { _resetForTest as resetAsks, registerAsk, setCardDispatcher, invalidateAll, listPendingAsks } from '../src/core/ask-broker.js';
 import { EventEmitter } from 'node:events';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { emitHookEventMock } = vi.hoisted(() => ({
   emitHookEventMock: vi.fn(),
@@ -578,5 +579,49 @@ describe('worker-pool lifecycle hook integration', () => {
       workerGeneration: 1,
       disposition: 'queued_removed',
     });
+  });
+});
+
+
+describe('permission card and screen fallback coexistence in worker routing', () => {
+  afterEach(() => resetAsks());
+  it.each([undefined, 'om_active_turn'])('suppresses matching delivered card, recovers with same screen; turn=%s', async turnId => {
+    resetAsks();
+    const reply = vi.fn(async () => 'om_reply');
+    initWorkerPool({sessionReply: reply, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn()});
+    const worker = makeFakeWorker(), ds = makeDs({worker});
+    __testOnly_setupWorkerHandlers(ds, worker);
+    setCardDispatcher({send: async () => ({messageId: 'permission_card'}), onSettle: async () => {}});
+    const commandHash = 'a'.repeat(64);
+    const waiting = registerAsk({larkAppId: ds.larkAppId, sessionId: ds.session.sessionId,
+      chatId: ds.chatId, rootMessageId: 'om_root', originKind: 'hook', permissionCommandHash: commandHash,
+      questions: [{prompt: 'Approve Bash', multiSelect: false, options: [{key: 'allow', label: 'Allow'}, {key: 'deny', label: 'Deny'}]}], timeoutMs: 60000});
+    await flush();
+    expect(listPendingAsks()[0].cardMessageId).toBe('permission_card');
+    const observation = {type: 'claude_permission_screen', dialogId: 'dialog', commandHash, message: 'Confirm in terminal', turnId};
+    worker.emit('message', observation); await flush();
+    expect(reply).not.toHaveBeenCalled();
+    invalidateAll('hook-ended'); await waiting;
+    worker.emit('message', observation); await flush();
+    worker.emit('message', observation); await flush();
+    expect(reply).toHaveBeenCalledTimes(1);
+    expect(reply.mock.calls[0][1]).toBe('Confirm in terminal');
+    expect(reply.mock.calls[0][4]).toBe(turnId);
+  });
+  it('uses chat anchor and ignores permission events from another CLI or stale worker', async () => {
+    resetAsks();
+    const reply = vi.fn(async () => 'om_reply');
+    initWorkerPool({sessionReply: reply, getSessionWorkingDir: () => '/repo', getActiveCount: () => 1, closeSession: vi.fn()});
+    const worker = makeFakeWorker(), ds = makeDs({worker, scope: 'chat'});
+    __testOnly_setupWorkerHandlers(ds, worker);
+    const observation = {type: 'claude_permission_screen', dialogId: 'dialog', message: 'Confirm in terminal'};
+    worker.emit('message', observation); await flush();
+    expect(reply).toHaveBeenCalledTimes(1);
+    ds.session.cliId = 'codex';
+    worker.emit('message', {...observation, dialogId: 'other'}); await flush();
+    expect(reply).toHaveBeenCalledTimes(1);
+    ds.session.cliId = 'claude-code'; ds.worker = makeFakeWorker();
+    worker.emit('message', {...observation, dialogId: 'new'}); await flush();
+    expect(reply).toHaveBeenCalledTimes(1);
   });
 });

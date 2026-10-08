@@ -65,6 +65,7 @@ export interface PersistedAsk {
   /** Distinguishes a hook AskUserQuestion from an explicit `botmux ask buttons`
    *  so they can never re-claim each other's card. */
   originKind: string;
+  permissionCommandHash?: string;
   /** Random per-process askId assigned at first register; kept stable across
    *  restore/re-attach for logging + card action values. */
   askId: string;

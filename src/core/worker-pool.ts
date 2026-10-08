@@ -1,3 +1,5 @@
+import { listPendingAsks } from './ask-broker.js';
+import { ClaudePermissionNotifier } from '../services/claude-permission-notify.js';
 import { handoffCardClosed, handoffCardBlocksStreaming, applyHandoffCardEvent, type HandoffCardEvent } from './handoff-card-lifecycle.js';
 import { assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError, type TopicMessageLookup } from '../cli/topic-send-guard.js';
 import { getMessageDetail as getTopicMessageDetail, uploadImage } from '../im/lark/client.js';
@@ -13380,6 +13382,8 @@ function setupWorkerHandlers(
     return true;
   };
 
+  const permissionNotifier = new ClaudePermissionNotifier();
+
   // Adopt mode flags — computed once, used in all buildStreamingCard calls.
   // Bridge mode (the v3 default for /adopt) hides the legacy takeover button.
   const isAdopt = isSharedAdoptSession(ds);
@@ -15721,6 +15725,27 @@ function setupWorkerHandlers(
             );
           }
         }
+        break;
+      }
+
+      case 'claude_permission_screen': {
+        if (ds.session.cliId !== 'claude-code') break;
+        await permissionNotifier.observe(msg, {
+          larkAppId: ds.larkAppId, sessionId: ds.session.sessionId,
+          chatId: ds.chatId, rootMessageId: ds.scope === 'chat' ? null : ds.session.rootMessageId,
+        }, listPendingAsks(), async message => {
+          if (managedAuxUiSuppressed(msg.turnId, msg.dispatchAttempt)) return false;
+          try {
+            await scopedReply(message, 'text', msg.turnId);
+            emitSessionLifecycleHook(ds, 'session.requires_attention', {
+              reason: 'user_notify', message,
+            });
+            return true;
+          } catch (err: any) {
+            logger.error(`[${t}] Failed to deliver permission fallback: ${err.message}`);
+            return false;
+          }
+        });
         break;
       }
 

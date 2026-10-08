@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { claudePermissionCommandHash } from './services/claude-permission-notify.js';
 import { assertSendTopicsAvailable, createTopicMessageLookupCache, TopicSendError } from './cli/topic-send-guard.js';
 /**
  * CLI entry point for botmux.
@@ -14412,6 +14413,8 @@ export async function runHook(
     timeoutMs,
     requestId,
     originKind: 'hook',
+    ...(permissionParsed && cliId === 'claude-code'
+      ? { permissionCommandHash: claudePermissionCommandHash(payload) } : {}),
     ...(hookOrigin?.turnId ? { originTurnId: hookOrigin.turnId } : {}),
     ...(hookOrigin?.dispatchAttempt !== undefined ? { originDispatchAttempt: hookOrigin.dispatchAttempt } : {}),
   };

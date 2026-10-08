@@ -105,6 +105,9 @@ export interface CreateAskInput {
    *  'explicit' = `botmux ask buttons`, etc.). Namespaces the identity so an
    *  explicit ask can never re-claim a hook ask's card. Defaults to 'hook'. */
   originKind?: string;
+  /** Correlates a Claude Bash permission card with an exact single-line command.
+   * Presentation only; never grants authority or changes answer permissions. */
+  permissionCommandHash?: string;
   /** DAEMON-COMPUTED authoritative persistence gate (codex P1-4): does the
    *  authenticated issuing session's FROZEN backend survive a daemon restart
    *  (tmux/herdr/zellij/zmx = yes; pty = no)? The broker persists + resumes ONLY
@@ -137,6 +140,9 @@ export interface PendingAsk {
   /** Broker origin, exposed only to daemon/card routing so host-owned choice
    * cards can decline arbitrary free-text replies instead of swallowing them. */
   originKind?: string;
+  /** Correlates a Claude Bash permission card with an exact single-line command.
+   * Presentation only; never grants authority or changes answer permissions. */
+  permissionCommandHash?: string;
   /** Anti-replay nonce embedded in each button's action value. Click events
    *  whose nonce doesn't match → treated as stale (e.g. card from a previous
    *  daemon process before restart). */
@@ -158,6 +164,9 @@ export interface PendingAsk {
   /** Set after the card dispatch succeeds. Until then, the ask is "registered
    *  but not visible" — clicks can't physically arrive yet. */
   cardMessageId?: string;
+  /** Runtime-only: a hook client is still waiting on this ask. Dormant cards
+   * cannot hide a terminal fallback after hook disconnect or daemon restart. */
+  hookWaiting?: boolean;
   /** Once true, subsequent click attempts return `already_settled`. */
   settled: boolean;
   /** Stable Feishu IM dedupe token for the card send (≤50 chars, derived from

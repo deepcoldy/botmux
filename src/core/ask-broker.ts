@@ -280,6 +280,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
       askKey,
       requestId,
       originKind,
+      permissionCommandHash: input.permissionCommandHash,
       resumable,
       nonce,
       larkAppId: input.larkAppId,
@@ -358,6 +359,7 @@ function sameIdentity(ask: InternalPending, input: CreateAskInput): boolean {
     ask.rootMessageId === input.rootMessageId &&
     ask.originKind === (input.originKind ?? 'hook') &&
     ask.answererOpenId === input.answererOpenId &&
+    ask.permissionCommandHash === input.permissionCommandHash &&
     questionsShape(ask.questions) === questionsShape(input.questions)
   );
 }
@@ -526,6 +528,7 @@ function persistFromInternal(ask: InternalPending): void {
     askKey: ask.askKey,
     requestId: ask.requestId,
     originKind: ask.originKind,
+    permissionCommandHash: ask.permissionCommandHash,
     askId: ask.askId,
     nonce: ask.nonce,
     larkAppId: ask.larkAppId,
@@ -855,6 +858,7 @@ export function restorePersistedAsks(now: number = Date.now(), larkAppId?: strin
       askKey: p.askKey,
       requestId: p.requestId,
       originKind: p.originKind,
+      permissionCommandHash: p.permissionCommandHash,
       resumable: true, // only resumable origins were ever persisted
       nonce: p.nonce,
       larkAppId: p.larkAppId,
@@ -1002,6 +1006,7 @@ function snapshot(ask: InternalPending): PendingAsk {
   } = ask;
   return {
     ...rest,
+    hookWaiting: !ask.dormant && ask.waiters.length > 0,
     ...(ask.terminalResult ? { result: ask.terminalResult } : {}),
     selections: ask.questions.map((_, i) => [...(ask.selections.get(i) ?? new Set<string>())]),
     // EVERY ask carries a scoped dedupe token (codex P1-1): the broker's bounded
