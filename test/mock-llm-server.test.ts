@@ -41,6 +41,11 @@ describe('MockLlmServer', () => {
     expect(modelsJson.data.some((m: any) => m.id.includes('claude'))).toBe(true);
   });
 
+  it('validates constructor config for port and mode', () => {
+    expect(() => new MockLlmServer({ mode: 'invalid' as any })).toThrow(/Invalid MOCK_LLM_MODE/);
+    expect(() => new MockLlmServer({ port: -1 })).toThrow(/Invalid MOCK_LLM_PORT/);
+  });
+
   describe('marker extractor', () => {
     it('extracts ACK markers correctly', () => {
       const msg = '请立刻调用 botmux send 在本话题里回复一行内容："ACK-e2e-claude-1728280000"';
@@ -52,9 +57,9 @@ describe('MockLlmServer', () => {
       expect(extractMarker(msg)).toBe('CODEX_E2E_MARKER_998877');
     });
 
-    it('builds botmux send command with mention-back', () => {
-      const cmd = buildBotmuxSendCommand('ACK-test-123', true);
-      expect(cmd).toBe('botmux send --mention-back "ACK-test-123"');
+    it('builds botmux send command with mention-back and shell single-quote escaping', () => {
+      const cmd = buildBotmuxSendCommand("ACK-test-123'$(id)", true);
+      expect(cmd).toBe("botmux send --mention-back 'ACK-test-123'\\''$(id)'");
     });
   });
 
@@ -200,7 +205,7 @@ describe('MockLlmServer', () => {
       rmSync(tmpDir, { recursive: true, force: true });
     });
 
-    it('saves and matches tape, substituting dynamic markers', () => {
+    it('saves and matches tape, substituting dynamic markers on replay', async () => {
       const recorder = new TapeRecorder(tmpDir);
       const mockTape: FixtureTape = {
         id: 'tape-sample',
@@ -216,8 +221,14 @@ describe('MockLlmServer', () => {
           headers: {},
           events: [
             {
+              event: 'message_start',
+              data: JSON.stringify({ type: 'message_start' }),
+            },
+            {
+              event: 'content_block_delta',
               data: JSON.stringify({
-                command: 'botmux send --mention-back "ACK-e2e-old-1111"',
+                type: 'content_block_delta',
+                delta: { text: "botmux send --mention-back 'ACK-e2e-old-1111'" },
               }),
             },
           ],
@@ -225,9 +236,60 @@ describe('MockLlmServer', () => {
       };
 
       recorder.saveTape(mockTape);
-      const found = recorder.findTape('/v1/messages', 'claude-3-7-sonnet-20250219');
+      // Path matching works even when request contains query params
+      const found = recorder.findTape('/v1/messages?beta=true', 'claude-3-7-sonnet-20250219');
       expect(found).not.toBeNull();
       expect(found?.id).toBe('tape-sample');
+
+      // Replay tape and assert dynamic marker replacement
+      let output = '';
+      const fakeRes = {
+        writeHead: () => {},
+        write: (chunk: string) => {
+          output += chunk;
+        },
+        end: () => {},
+        destroyed: false,
+        writableEnded: false,
+      } as any;
+
+      await recorder.replayTape(fakeRes, found!, 'ACK-e2e-new-2222');
+      expect(output).toContain('ACK-e2e-new-2222');
+      expect(output).not.toContain('ACK-e2e-old-1111');
+    });
+
+    it('replays non-streaming JSON tape response', async () => {
+      const recorder = new TapeRecorder(tmpDir);
+      const mockTape: FixtureTape = {
+        id: 'tape-json',
+        timestamp: Date.now(),
+        request: {
+          method: 'GET',
+          path: '/v1/models',
+        },
+        response: {
+          status: 200,
+          headers: {},
+          bodyJson: { object: 'list', data: [{ id: 'mock-model' }] },
+          events: [],
+        },
+      };
+
+      recorder.saveTape(mockTape);
+      let output = '';
+      let statusCode = 0;
+      const fakeRes = {
+        writeHead: (code: number) => {
+          statusCode = code;
+        },
+        end: (body: string) => {
+          output = body;
+        },
+      } as any;
+
+      await recorder.replayTape(fakeRes, mockTape, null);
+      expect(statusCode).toBe(200);
+      expect(JSON.parse(output)).toEqual({ object: 'list', data: [{ id: 'mock-model' }] });
     });
   });
 });

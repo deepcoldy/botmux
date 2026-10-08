@@ -31,12 +31,14 @@ export class TapeRecorder {
   findTape(reqPath: string, model?: string): FixtureTape | null {
     if (!existsSync(this.fixturesDir)) return null;
     const files = readdirSync(this.fixturesDir).filter((f) => f.endsWith('.json'));
+    const targetPath = (reqPath || '/').split('?')[0];
 
     for (const file of files) {
       try {
         const content = readFileSync(join(this.fixturesDir, file), 'utf-8');
         const tape = JSON.parse(content) as FixtureTape;
-        if (tape.request?.path === reqPath) {
+        const tapePath = (tape.request?.path ?? '').split('?')[0];
+        if (tapePath === targetPath) {
           if (!model || tape.request?.model === model) {
             return tape;
           }
@@ -61,6 +63,7 @@ export class TapeRecorder {
     const headers = { ...req.headers };
     delete headers.host;
     delete headers['content-length'];
+    headers['accept-encoding'] = 'identity';
 
     const upstreamReq = await fetch(url.toString(), {
       method: req.method ?? 'POST',
@@ -68,16 +71,50 @@ export class TapeRecorder {
       body: reqBody ? JSON.stringify(reqBody) : undefined,
     });
 
-    res.writeHead(
-      upstreamReq.status,
-      Object.fromEntries(upstreamReq.headers.entries()),
-    );
+    const respHeaders = Object.fromEntries(upstreamReq.headers.entries());
+    delete respHeaders['content-encoding'];
+    delete respHeaders['content-length'];
+
+    res.writeHead(upstreamReq.status, respHeaders);
 
     const sseEvents: SseEvent[] = [];
     const reader = upstreamReq.body?.getReader();
 
     if (!reader) {
       const buffer = await upstreamReq.arrayBuffer();
+      let bodyJson: unknown = null;
+      try {
+        bodyJson = JSON.parse(Buffer.from(buffer).toString('utf-8'));
+      } catch {
+        // not json
+      }
+
+      const model = reqBody?.model;
+      const reqPath = req.url ?? '/';
+      const hash = createHash('sha256')
+        .update(`${reqPath}:${model}:${Date.now()}`)
+        .digest('hex')
+        .slice(0, 10);
+
+      const tape: FixtureTape = {
+        id: `tape-${model ?? 'api'}-${hash}`,
+        timestamp: Date.now(),
+        request: {
+          method: req.method ?? 'POST',
+          path: reqPath,
+          model,
+          messagesSnippet: JSON.stringify(reqBody?.messages ?? []).slice(0, 300),
+          body: reqBody,
+        },
+        response: {
+          status: upstreamReq.status,
+          headers: respHeaders,
+          bodyJson,
+          events: [],
+        },
+      };
+
+      this.saveTape(tape);
       res.end(Buffer.from(buffer));
       return;
     }

@@ -26,8 +26,20 @@ export class MockLlmServer {
   private recorder: TapeRecorder;
 
   constructor(config?: MockServerConfig) {
+    const validModes = ['synthetic', 'record', 'replay'];
+    if (config?.mode && !validModes.includes(config.mode)) {
+      throw new Error(
+        `Invalid MOCK_LLM_MODE: "${config.mode}". Valid modes are: ${validModes.join(', ')}`,
+      );
+    }
+    const rawPort = config?.port ?? 0;
+    const port = Number(rawPort);
+    if (Number.isNaN(port) || port < 0 || port > 65535) {
+      throw new Error(`Invalid MOCK_LLM_PORT: "${rawPort}"`);
+    }
+
     this.config = {
-      port: config?.port ?? 0,
+      port,
       host: config?.host ?? '127.0.0.1',
       mode: config?.mode ?? 'synthetic',
       upstreamUrl: config?.upstreamUrl ?? '',
@@ -43,9 +55,11 @@ export class MockLlmServer {
       this.server = createServer((req, res) => {
         this.handleRequest(req, res).catch((err) => {
           if (this.config.verbose) console.error('[mock-llm-server] Error:', err);
-          if (!res.writableEnded) {
+          if (!res.headersSent && !res.writableEnded) {
             res.writeHead(500, { 'content-type': 'application/json' });
             res.end(JSON.stringify({ error: String(err) }));
+          } else if (!res.writableEnded) {
+            res.end();
           }
         });
       });
@@ -66,6 +80,9 @@ export class MockLlmServer {
   async stop(): Promise<void> {
     if (!this.server) return;
     return new Promise((resolve) => {
+      if (typeof (this.server as any).closeAllConnections === 'function') {
+        (this.server as any).closeAllConnections();
+      }
       this.server?.close(() => {
         this.server = null;
         resolve();

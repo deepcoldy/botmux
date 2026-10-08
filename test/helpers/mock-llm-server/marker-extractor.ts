@@ -14,7 +14,7 @@ const MARKER_PATTERNS = [
   // General quoted marker: 请在最终回复中原样包含 ([^\s"']+)
   /请在最终回复中原样包含\s+([A-Za-z0-9_\-]+)/,
   // 请立刻调用 botmux send 在本话题里回复一行内容："([^"]+)"
-  /请立刻调用\s+botmux\s+send\s+在本话题里回复一行内容：[“"]([^”"]+)[”"]/,
+  /请立刻调用\s+botmux\s+send\s+在本话题里回复一行内容：[“"]([A-Za-z0-9_\-.:#@ ]+)[”"]/,
 ];
 
 /**
@@ -50,7 +50,12 @@ export function extractMarkerFromMessages(messages: unknown[]): string | null {
         if (typeof block === 'string') {
           const marker = extractMarker(block);
           if (marker) return marker;
-        } else if (block && typeof block === 'object' && 'text' in block && typeof (block as { text: unknown }).text === 'string') {
+        } else if (
+          block &&
+          typeof block === 'object' &&
+          'text' in block &&
+          typeof (block as { text: unknown }).text === 'string'
+        ) {
           const marker = extractMarker((block as { text: string }).text);
           if (marker) return marker;
         }
@@ -63,9 +68,10 @@ export function extractMarkerFromMessages(messages: unknown[]): string | null {
 
 /**
  * Generate a safe, quote-escaped `botmux send` bash command to reply to the user.
+ * Wraps content in single quotes with standard shell escaping to prevent command injection.
  */
 export function buildBotmuxSendCommand(content: string, mentionBack = true): string {
-  const sanitized = content.replace(/"/g, '\\"');
+  const sanitized = content.replace(/'/g, "'\\''");
   const mentionFlag = mentionBack ? '--mention-back' : '--no-mention';
-  return `botmux send ${mentionFlag} "${sanitized}"`;
+  return `botmux send ${mentionFlag} '${sanitized}'`;
 }

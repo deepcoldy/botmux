@@ -35,7 +35,7 @@ export interface FixtureTape {
     path: string;
     model?: string;
     messagesSnippet?: string;
-    body: unknown;
+    body?: unknown;
   };
   response: {
     status: number;
