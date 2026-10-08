@@ -983,15 +983,14 @@ describe('buildStreamingCard', () => {
       expect(card.header.title.content).toContain('等待输入');
     });
 
-    it('idle + silentIdle flag renders 「已处理 · 判定无需回复」 instead of 「等待输入」', () => {
+    it('idle + silentIdle flag renders the silent turn terminal receipt', () => {
       const card = parse(buildStreamingCard(
         SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
         undefined, undefined, false, false, undefined, undefined, undefined, false,
         undefined, undefined, undefined, true,
       ));
       expect(card.header.template).toBe('green');
-      expect(card.header.title.content).toContain('已处理 · 判定无需回复');
-      expect(card.header.title.content).not.toContain('等待输入');
+      expect(card.header.title.content).toContain('✓ 本轮已结束（AI 判断无需回复） · 等待输入');
     });
 
     it('silentIdle flag is inert for non-idle statuses (working keeps its label)', () => {
@@ -1003,27 +1002,25 @@ describe('buildStreamingCard', () => {
       expect(card.header.title.content).toContain('工作中');
     });
 
-    // transcript 模式：最终回复卡已投递 → idle 卡头「已完成」。颜色沿用 idle 的绿色。
-    it("idle + 'completed' label renders 「已完成」 instead of 「等待输入」", () => {
+    // transcript 模式：最终回复卡已投递 → idle 卡头展示本轮终态。颜色沿用 idle 的绿色。
+    it("idle + 'completed' label renders the completed turn terminal receipt", () => {
       const card = parse(buildStreamingCard(
         SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
         undefined, undefined, false, false, undefined, undefined, undefined, false,
         undefined, undefined, undefined, 'completed',
       ));
       expect(card.header.template).toBe('green');
-      expect(card.header.title.content).toContain('已完成');
-      expect(card.header.title.content).not.toContain('等待输入');
-      expect(card.header.title.content).not.toContain('已处理 · 判定无需回复');
+      expect(card.header.title.content).toContain('✓ 本轮已结束 · 等待输入');
+      expect(card.header.title.content).not.toContain('AI 判断无需回复');
     });
 
-    it("idle + 'completed' label renders 'Completed' in English", () => {
+    it("idle + 'completed' label renders the completed turn terminal receipt in English", () => {
       const card = parse(buildStreamingCard(
         SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
         undefined, undefined, false, false, 'en', undefined, undefined, false,
         undefined, undefined, undefined, 'completed',
       ));
-      expect(card.header.title.content).toContain('Completed');
-      expect(card.header.title.content).not.toContain('Awaiting input');
+      expect(card.header.title.content).toContain('✓ Turn ended · Awaiting input');
     });
 
     it("idle + 'silent' string label equals the legacy boolean flag", () => {
@@ -1032,7 +1029,7 @@ describe('buildStreamingCard', () => {
         undefined, undefined, false, false, undefined, undefined, undefined, false,
         undefined, undefined, undefined, 'silent',
       ));
-      expect(card.header.title.content).toContain('已处理 · 判定无需回复');
+      expect(card.header.title.content).toContain('✓ 本轮已结束（AI 判断无需回复） · 等待输入');
     });
 
     it("'completed' label is inert for non-idle statuses (working keeps its label)", () => {
@@ -1058,14 +1055,14 @@ describe('buildStreamingCard', () => {
         undefined, undefined, false, false, undefined, undefined, undefined, false,
         undefined, undefined, undefined, frozenIdleLabel({ idleLabel: 'completed' }),
       ));
-      expect(completed.header.title.content).toContain('已完成');
+      expect(completed.header.title.content).toContain('✓ 本轮已结束 · 等待输入');
 
       const legacySilent = parse(buildStreamingCard(
         SID, ROOT, URL, TITLE, '', 'idle', undefined, 'hidden',
         undefined, undefined, false, false, undefined, undefined, undefined, false,
         undefined, undefined, undefined, frozenIdleLabel({ silentIdle: true }),
       ));
-      expect(legacySilent.header.title.content).toContain('已处理 · 判定无需回复');
+      expect(legacySilent.header.title.content).toContain('✓ 本轮已结束（AI 判断无需回复） · 等待输入');
     });
 
     it('renders usage + runtime as one single-line markdown run (tail-joined, no column_set)', () => {
