@@ -10,12 +10,33 @@ describe('/g customization', () => {
       name: '项目名称', agents: ['Review', 'Build'], tag: 'Project work', avatar: 'name', roleProfileId: 'suite',
     });
   });
-  it('merges defaults and permits opting out without consuming the name', () => {
+  it('merges defaults; --no-tag/--no-agents drop defaults without producing a tombstone', () => {
     expect(parseGroupCreationArgs('--no-agents Work --no-tag --avatar off', { agents: ['Review'], tag: 'Work', avatar: 'name' })).toEqual({
-      name: 'Work', agents: [], tag: '', avatar: 'off', roleProfileId: undefined,
+      name: 'Work', agents: [], avatar: 'off', roleProfileId: undefined,
     });
   });
-  it.each(['--tag "unclosed', '--agents', '--agents a,,b', '--tag', '--avatar random', '--oops value', '--tag A --no-tag', '--no-agents=x'])('rejects invalid options: %s', raw => {
+  it('normalizes whitespace-only default tags to absent (opt-in requires real content)', () => {
+    expect(parseGroupCreationArgs('Hello', { tag: '   ' })).toEqual({ name: 'Hello', roleProfileId: undefined });
+    expect(parseGroupCreationDefaults({ tag: '   ' })).toEqual({});
+  });
+  it('keeps unknown --flags as group-name content and does not raise', () => {
+    expect(parseGroupCreationArgs('/g 架构 --v2'.replace(/^\/g\s*/, '')).name).toBe('架构 --v2');
+    expect(parseGroupCreationArgs('项目\n正文 --rfc 建议').name).toBe('项目');
+    expect(parseGroupCreationArgs('--oops value Project').name).toBe('--oops value Project');
+    expect(parseGroupCreationArgs('--notaknownflag Work --tag Keep')).toEqual({
+      name: '--notaknownflag Work', tag: 'Keep', roleProfileId: undefined,
+    });
+  });
+  it('treats bare -- as end-of-options so known flag words become name content', () => {
+    expect(parseGroupCreationArgs('-- 项目名 --tag Keep').name).toBe('项目名 --tag Keep');
+    expect(parseGroupCreationArgs('--tag Keep -- 项目 --avatar name')).toEqual({
+      name: '项目 --avatar name', tag: 'Keep', roleProfileId: undefined,
+    });
+  });
+  it.each([
+    '--tag "unclosed', '--agents', '--agents a,,b', '--tag', '--avatar random',
+    '--tag A --no-tag', '--no-agents=x', '--tag --avatar name',
+  ])('still rejects malformed known flags: %s', raw => {
     expect(() => parseGroupCreationArgs(raw)).toThrow();
   });
   it.each([null, [], { agents: 'Review' }, { agents: [''] }, { avatar: true }, { tag: '字'.repeat(61) }, { typo: 1 }].map(value => ({ value })))('rejects malformed defaults', ({ value }) => {

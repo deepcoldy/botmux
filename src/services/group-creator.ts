@@ -184,18 +184,16 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
   }
 
   // Optional decoration must never delay inviting the requested teammates.
+  // Avatar runs now (after invites, before owner transfer) so the chat already
+  // looks right by the time the sender becomes owner. The personal feed-group
+  // tag runs *after* the share-link fetch and owner transfer below so a slow
+  // user-token refresh cannot delay the hand-over.
   const customization: CreateGroupResult['customization'] = opts.customization ? {} : undefined;
   if (opts.customization?.avatar === 'name') {
     try {
       const { applyGroupNameAvatar } = await import('./group-name-avatar.js');
       await applyGroupNameAvatar(opts.creatorLarkAppId, r.chatId, opts.name ?? '');
     } catch (err: any) { customization!.avatarError = err?.message ?? String(err); }
-  }
-  if (opts.customization?.tag) {
-    try {
-      const { addCreatedChatToFeedGroup } = await import('./feed-group-tagger.js');
-      await addCreatedChatToFeedGroup(opts.creatorLarkAppId, r.chatId, opts.customization.userOpenId, opts.customization.tag);
-    } catch (err: any) { customization!.tagError = err?.message ?? String(err); }
   }
 
   // Fetch the shareable join link BEFORE transferring ownership: the creator bot
@@ -252,6 +250,17 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
       ownerTransferredTo = transferred.ownerTransferredTo;
       transferError = transferred.transferError;
     }
+  }
+
+  // Personal feed-group tag runs after ownership hand-over: tagging needs the
+  // invoking user's OAuth token, whose refresh can stall; keeping it here means
+  // the owner-transfer window is as short as the invite + avatar + share-link
+  // calls. Failure is independent — the chat is already handed over.
+  if (opts.customization?.tag) {
+    try {
+      const { addCreatedChatToFeedGroup } = await import('./feed-group-tagger.js');
+      await addCreatedChatToFeedGroup(opts.creatorLarkAppId, r.chatId, opts.customization.userOpenId, opts.customization.tag);
+    } catch (err: any) { customization!.tagError = err?.message ?? String(err); }
   }
 
   // Grant group manager role to specified users in managerUserIds.

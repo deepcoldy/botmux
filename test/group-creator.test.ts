@@ -99,9 +99,11 @@ describe('createGroupWithBots', () => {
   it('invites teammates before waiting for optional personal tagging', async () => {
     let release!: () => void;
     mockCreateChat.mockResolvedValue({ chatId: 'oc_pending_tag', invalidBotIds: [], invalidUserIds: [] });
+    mockTransferChatOwner.mockResolvedValue({ ok: true });
     mockPersonalTag.mockReturnValueOnce(new Promise<void>(resolve => { release = resolve; }));
     const task = createGroupWithBots({
       creatorLarkAppId: CREATOR, larkAppIds: [CREATOR, OTHER_BOT], name: 'Project',
+      transferOwnerTo: USER_OPEN_ID,
       customization: { tag: 'Work', userOpenId: USER_OPEN_ID },
     });
     try {
@@ -114,7 +116,7 @@ describe('createGroupWithBots', () => {
     }
   });
 
-  it('decorates before owner transfer, and preserves the group on independent failures', async () => {
+  it('runs avatar before transfer and personal tag after transfer, preserving the group on independent failures', async () => {
     mockCreateChat.mockResolvedValue({ chatId: 'oc_custom', invalidBotIds: [], invalidUserIds: [] });
     mockNameAvatar.mockRejectedValueOnce(new Error('no font'));
     mockPersonalTag.mockRejectedValueOnce(new Error('no user token'));
@@ -127,6 +129,7 @@ describe('createGroupWithBots', () => {
     expect(result.customization).toEqual({ avatarError: 'no font', tagError: 'no user token' });
     expect(result.ownerTransferredTo).toBe(USER_OPEN_ID);
     expect(mockNameAvatar.mock.invocationCallOrder.at(-1)!).toBeLessThan(mockTransferChatOwner.mock.invocationCallOrder.at(-1)!);
+    expect(mockTransferChatOwner.mock.invocationCallOrder.at(-1)!).toBeLessThan(mockPersonalTag.mock.invocationCallOrder.at(-1)!);
     expect(mockPersonalTag).toHaveBeenCalledWith(CREATOR, 'oc_custom', USER_OPEN_ID, 'Work');
     expect(mockCreateChat).toHaveBeenCalledTimes(1);
   });
