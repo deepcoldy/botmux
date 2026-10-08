@@ -37,61 +37,46 @@ export interface GroupCreationArgs extends GroupCreationDefaults {
 
 type OutputKey = 'agents' | 'tag' | 'avatar' | 'role-profile';
 
-interface FlagSpec {
-  key: OutputKey;
-  isOptOut: boolean;
-  apply(bag: Record<string, unknown>, value: string): void;
-  clear(bag: Record<string, unknown>): void;
-}
+/** Discriminated union — value flags only declare `apply`, opt-out flags only
+ *  declare `clear`. Keeps every spec truthful about what it supports. */
+type FlagSpec =
+  | { kind: 'value'; key: OutputKey; apply(bag: Record<string, unknown>, value: string): void }
+  | { kind: 'optOut'; key: OutputKey; clear(bag: Record<string, unknown>): void };
 
 const FLAG_SPECS: Record<string, FlagSpec> = {
   'agents': {
-    key: 'agents', isOptOut: false,
+    kind: 'value', key: 'agents',
     apply(bag, value) {
       const refs = value.split(',').map(x => x.trim());
       if (refs.some(x => !x)) throw new Error('--agents requires comma-separated names or app IDs');
       bag.agents = refs;
     },
-    clear(bag) { bag.agents = []; },
   },
-  'no-agents': {
-    key: 'agents', isOptOut: true,
-    apply() { /* opt-out does not take a value */ },
-    clear(bag) { bag.agents = []; },
-  },
-  'tag': {
-    key: 'tag', isOptOut: false,
-    apply(bag, value) { bag.tag = value; },
-    clear(bag) { delete bag.tag; },
-  },
-  'no-tag': {
-    key: 'tag', isOptOut: true,
-    apply() { /* opt-out does not take a value */ },
-    // Explicit opt-out: drop any inherited default outright instead of leaving an empty-string
-    // tombstone that the business layer would have to interpret with truthy checks.
-    clear(bag) { delete bag.tag; },
-  },
-  'avatar': {
-    key: 'avatar', isOptOut: false,
-    apply(bag, value) { bag.avatar = value; },
-    clear() { /* avatar has no opt-out; defaults handle `off`. */ },
-  },
+  'no-agents': { kind: 'optOut', key: 'agents', clear(bag) { bag.agents = []; } },
+  'tag': { kind: 'value', key: 'tag', apply(bag, value) { bag.tag = value; } },
+  // Explicit opt-out drops the inherited default instead of leaving an empty-string tombstone
+  // that the business layer would have to interpret with truthy checks.
+  'no-tag': { kind: 'optOut', key: 'tag', clear(bag) { delete bag.tag; } },
+  'avatar': { kind: 'value', key: 'avatar', apply(bag, value) { bag.avatar = value; } },
   'role-profile': {
-    key: 'role-profile', isOptOut: false,
+    kind: 'value', key: 'role-profile',
     apply(bag, value) { bag.roleProfileId = value; },
-    clear() { /* role-profile has no opt-out form. */ },
   },
 };
 
 /**
  * Single-pass, table-driven parser for `/g` arguments.
  *
- * Design:
- *  - Only flags listed in `FLAG_SPECS` are consumed. Unknown `--word` tokens are
- *    kept verbatim as group-name content so pre-existing user invocations keep
- *    working after this surface grows new options.
- *  - A bare `--` ends option processing. Everything after it, including known
- *    flag words like `--tag`, becomes group-name content.
+ * Boundary contract:
+ *  - A `--token` is recognized as a known flag ONLY when (a) `token` matches a
+ *    FLAG_SPECS key exactly and (b) the character immediately after the token
+ *    is `=`, whitespace, or end-of-input. `--tag.foo`, `--avatar:off`, etc. are
+ *    treated as unknown content and preserved verbatim in the group name.
+ *  - Bare `--` is the end-of-options sentinel only when it is followed by
+ *    whitespace or EOF. `--=foo` keeps `--=foo` in the group name.
+ *  - Known-flag values (both `--flag=VALUE` and `--flag VALUE`) must end on
+ *    whitespace or EOF. `--tag="A"suffix` is a malformed value and raises;
+ *    the parser never partially consumes a token into tag + stray body.
  *  - Known flags still enforce the strict error contract: missing value,
  *    invalid value, and duplicate occurrences all raise.
  *  - No shell evaluation. Quotes are only syntax for option values; the group
@@ -107,54 +92,61 @@ export function parseGroupCreationArgs(raw: string, defaults?: GroupCreationDefa
 
   const seen = new Set<OutputKey>();
   const removals: Array<[number, number]> = [];
-  // Match three forms at a word boundary: `--flag`, `--flag=value`, bare `--` sentinel.
-  // Unknown or malformed flags fall through and remain in the name body.
-  const scanner = /(^|\s)(--[\w-]*)(=("[^"]*"|'[^']*'|[^\s]*))?/g;
+  // Only locate the `--` + name token; value scanning is done manually below so
+  // that each form can enforce its own trailing-boundary rule.
+  const scanner = /(^|\s)--([\w-]*)/g;
+  const isBoundary = (ch: string) => ch === '' || /\s/.test(ch);
 
   let m: RegExpExecArray | null;
   while ((m = scanner.exec(raw)) !== null) {
     const lead = m[1] ?? '';
-    const flagToken = m[2];
-    const eqPart = m[3];
-    const eqValue = m[4];
+    const name = m[2];
     const flagStart = m.index + lead.length;
-    const matchEnd = m.index + m[0].length;
+    const nameEnd = scanner.lastIndex;
+    const next = raw.charAt(nameEnd);
 
-    if (flagToken === '--') {
-      // End-of-options sentinel. Strip the sentinel and the preceding whitespace
-      // so a single-space normal case stays single-space.
-      removals.push([m.index, matchEnd]);
+    if (name === '') {
+      // Bare `--` sentinel only; `--=foo` and `--abc?` are preserved verbatim.
+      if (!isBoundary(next)) continue;
+      removals.push([m.index, nameEnd]);
       break;
     }
 
-    const name = flagToken.slice(2);
     const spec = FLAG_SPECS[name];
-    if (!spec) continue; // unknown flag → preserved as group-name content
+    // Unknown tokens, or known names fused into a longer unknown token
+    // (e.g. `--tag.foo` → scanner matches `--tag`, next='.'), stay in the body.
+    if (!spec || !(isBoundary(next) || next === '=')) continue;
 
     if (seen.has(spec.key)) throw new Error(`Duplicate option: --${name}`);
     seen.add(spec.key);
 
-    if (spec.isOptOut) {
-      if (eqPart !== undefined) throw new Error(`--${name} takes no value`);
+    if (spec.kind === 'optOut') {
+      if (next === '=') throw new Error(`--${name} takes no value`);
       spec.clear(bag);
-      // Include preceding whitespace in the removal so `A --no-tag B` collapses
-      // to `A B` on the first-line path.
-      removals.push([m.index, matchEnd]);
+      removals.push([m.index, nameEnd]);
       continue;
     }
 
-    let value: string | undefined = eqValue;
-    let valueEnd = matchEnd;
-    if (value === undefined) {
-      // Space-form value: `--flag VALUE`. The next whitespace-delimited token
-      // must exist and must not itself be a `--` flag — missing values stay
-      // strict errors even with the forgiving unknown-flag rule.
-      const after = raw.slice(matchEnd);
+    // Value flag — collect raw value, then enforce the trailing boundary.
+    let rawValue: string;
+    let valueEnd: number;
+    if (next === '=') {
+      const after = raw.slice(nameEnd + 1);
+      const vm = after.match(/^("[^"]*"|'[^']*'|\S*)/);
+      rawValue = vm?.[1] ?? '';
+      valueEnd = nameEnd + 1 + rawValue.length;
+    } else {
+      // Space-form: consume one whitespace-delimited token, which must not
+      // itself be a `--` flag or we treat it as a missing value.
+      const after = raw.slice(nameEnd);
       const vm = after.match(/^([ \t]+)("[^"]*"|'[^']*'|(?!--)\S+)/);
       if (!vm) throw new Error(`Missing value for --${name}`);
-      value = vm[2];
-      valueEnd = matchEnd + vm[0].length;
+      rawValue = vm[2];
+      valueEnd = nameEnd + vm[0].length;
     }
+    if (!isBoundary(raw.charAt(valueEnd))) throw new Error(`Malformed value for --${name}`);
+
+    let value = rawValue;
     if (value.startsWith('"') || value.startsWith("'")) {
       if (value.length < 2 || value.at(-1) !== value[0]) throw new Error(`Unclosed quote for --${name}`);
       value = value.slice(1, -1);

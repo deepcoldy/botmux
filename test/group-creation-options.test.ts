@@ -27,11 +27,32 @@ describe('/g customization', () => {
       name: '--notaknownflag Work', tag: 'Keep', roleProfileId: undefined,
     });
   });
-  it('treats bare -- as end-of-options so known flag words become name content', () => {
+  it('does not treat known-flag prefixes fused with other characters as flags', () => {
+    // Known-flag name must end on `=`, whitespace or EOF — otherwise it is unknown content.
+    expect(parseGroupCreationArgs('Project --tag.foo').name).toBe('Project --tag.foo');
+    expect(parseGroupCreationArgs('Project --avatar:off').name).toBe('Project --avatar:off');
+    expect(parseGroupCreationArgs('Project --no-tag.foo').name).toBe('Project --no-tag.foo');
+    expect(parseGroupCreationArgs('Project --no-agents.x').name).toBe('Project --no-agents.x');
+    expect(parseGroupCreationArgs('Project --tagged')).toEqual({ name: 'Project --tagged', roleProfileId: undefined });
+  });
+  it('rejects malformed values that fuse into the next token (no partial consumption)', () => {
+    expect(() => parseGroupCreationArgs('Project --tag="A"suffix')).toThrow(/Malformed value for --tag/);
+    expect(() => parseGroupCreationArgs('Project --tag "A"suffix')).toThrow(/Malformed value for --tag/);
+    expect(() => parseGroupCreationArgs('Project --tag=A--avatar=name')).not.toThrow();
+    // The last case is intentional: `A--avatar=name` is a legal unquoted value
+    // ending on EOF, so it is accepted whole and preserved as tag content.
+    expect(parseGroupCreationArgs('Project --tag=A--avatar=name')).toEqual({
+      name: 'Project', tag: 'A--avatar=name', roleProfileId: undefined,
+    });
+  });
+  it('treats bare -- as end-of-options but preserves --=xxx and --<nonboundary>', () => {
     expect(parseGroupCreationArgs('-- 项目名 --tag Keep').name).toBe('项目名 --tag Keep');
     expect(parseGroupCreationArgs('--tag Keep -- 项目 --avatar name')).toEqual({
       name: '项目 --avatar name', tag: 'Keep', roleProfileId: undefined,
     });
+    // `--=foo` and `--=` are NOT the sentinel; they stay in the body.
+    expect(parseGroupCreationArgs('Project --=foo').name).toBe('Project --=foo');
+    expect(parseGroupCreationArgs('Project --=').name).toBe('Project --=');
   });
   it.each([
     '--tag "unclosed', '--agents', '--agents a,,b', '--tag', '--avatar random',
