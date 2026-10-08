@@ -7,6 +7,9 @@ import { createGrokAdapter } from '../src/adapters/cli/grok.js';
 import { createRiffAdapter } from '../src/adapters/cli/riff.js';
 import { createGeminiAdapter } from '../src/adapters/cli/gemini.js';
 import { createOpenCodeAdapter } from '../src/adapters/cli/opencode.js';
+import { createCursorAdapter } from '../src/adapters/cli/cursor.js';
+import { createMtrAdapter } from '../src/adapters/cli/mtr.js';
+import type { CliAdapter } from '../src/adapters/cli/types.js';
 import { shouldQueueInitialPrompt } from '../src/codex-rpc-lifecycle.js';
 import { buildNewTopicPrompt } from '../src/core/session-manager.js';
 import {
@@ -432,5 +435,50 @@ describe('OpenCode v1 real-envelope argv budget (buildNewTopicPrompt → defer)'
       passesInitialPromptViaArgs: true,
       deferInitialPrompt: defer,
     })).toBe(true);
+  });
+});
+
+describe('argv-baked providers share the tmux command-too-long guard', () => {
+  // Pi is intentionally absent: long prompts become a short @file path, so
+  // maxInitialPromptArgBytes stays unset (see the Pi cases above).
+  const cases: Array<[string, CliAdapter, number]> = [
+    ['cursor', createCursorAdapter('/usr/bin/cursor-agent'), 8192],
+    ['gemini', createGeminiAdapter('/usr/bin/gemini'), 8192],
+    ['mtr', createMtrAdapter('/usr/bin/mtr'), 8192],
+    ['grok', createGrokAdapter('/usr/bin/grok'), 4096],
+  ];
+
+  it.each(cases)('%s keeps a short prompt on argv and defers past its budget', (_name, adapter, budget) => {
+    expect(adapter.passesInitialPromptViaArgs).toBe(true);
+    expect(adapter.maxInitialPromptArgBytes).toBe(budget);
+
+    const shortPrompt = 'short prompt';
+    expect(shouldDeferInitialPromptForArgLimit({
+      passesInitialPromptViaArgs: true,
+      prompt: shortPrompt,
+      maxInitialPromptArgBytes: adapter.maxInitialPromptArgBytes,
+    })).toBe(false);
+
+    const over = 'a'.repeat(budget + 1);
+    expect(Buffer.byteLength(over, 'utf8')).toBe(budget + 1);
+    expect(shouldDeferInitialPromptForArgLimit({
+      passesInitialPromptViaArgs: true,
+      prompt: over,
+      maxInitialPromptArgBytes: adapter.maxInitialPromptArgBytes,
+    })).toBe(true);
+
+    const exact = 'a'.repeat(budget);
+    expect(shouldDeferInitialPromptForArgLimit({
+      passesInitialPromptViaArgs: true,
+      prompt: exact,
+      maxInitialPromptArgBytes: adapter.maxInitialPromptArgBytes,
+    })).toBe(false);
+
+    const args = adapter.buildArgs({
+      sessionId: 'sess-arg-limit',
+      resume: false,
+      initialPrompt: undefined,
+    });
+    expect(args).not.toContain(over);
   });
 });

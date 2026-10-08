@@ -1,8 +1,8 @@
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { TurnSendLedger } from '../src/services/turn-send-ledger.js';
+import { TurnSendLedger, turnSendLedgerSessionDir } from '../src/services/turn-send-ledger.js';
 
 const key = {
   larkAppId: 'cli_test',
@@ -112,7 +112,7 @@ describe('TurnSendLedger', () => {
       await expect(ledger.execute(key, 'final', 'same answer', firstDispatch))
         .rejects.toThrow('lost its response');
       expect(acceptedUuid).toMatch(/^bts_[a-f0-9]{32}$/);
-      expect(readdirSync(ledger.directory).filter(name => name.endsWith('.json'))).toHaveLength(0);
+      expect(readdirSync(ledger.sessionDirectory(key.sessionId)).filter(name => name.endsWith('.json'))).toHaveLength(0);
 
       const retryDispatch = vi.fn(async (providerUuid?: string) => {
         expect(providerUuid).toBe(acceptedUuid);
@@ -341,8 +341,8 @@ describe('TurnSendLedger', () => {
         }, 'doc:comment-stuck',
       )).rejects.toThrow('provider response lost');
 
-      const completedPath = join(ledger.directory, `${ledger.id(completedKey)}.json`);
-      const stuckPath = join(ledger.directory, `${ledger.id(stuckKey)}.json`);
+      const completedPath = ledger.recordPath(completedKey);
+      const stuckPath = ledger.recordPath(stuckKey);
       const result = await ledger.pruneCompleted(Date.now() + 31 * 24 * 60 * 60_000);
 
       expect(result).toEqual({ removed: 1, retained: 1 });
@@ -369,7 +369,7 @@ describe('TurnSendLedger', () => {
       await expect(ledger.pruneCompletedIfDue(future + 60_000)).resolves.toEqual({
         ran: false, removed: 0, retained: 0,
       });
-      expect(existsSync(join(ledger.directory, `${ledger.id(secondKey)}.json`))).toBe(true);
+      expect(existsSync(ledger.recordPath(secondKey))).toBe(true);
       await expect(ledger.pruneCompletedIfDue(future + 24 * 60 * 60_000)).resolves.toEqual({
         ran: true, removed: 1, retained: 0,
       });
@@ -384,7 +384,7 @@ describe('TurnSendLedger', () => {
     try {
       const ledger = new TurnSendLedger(dataDir);
       await ledger.execute(key, 'final', 'done', async () => 'om_done');
-      const recordPath = join(ledger.directory, `${ledger.id(key)}.json`);
+      const recordPath = ledger.recordPath(key);
       const lockPath = `${recordPath}.lock`;
       writeFileSync(lockPath, String(process.pid));
       releaseLock = setTimeout(() => rmSync(lockPath, { force: true }), 250);
@@ -416,5 +416,84 @@ describe('TurnSendLedger', () => {
       if (releaseLock) clearTimeout(releaseLock);
       rmSync(dataDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('TurnSendLedger per-session layout', () => {
+  const withLedger = async (fn: (ledger: TurnSendLedger, dataDir: string) => Promise<void>) => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-turn-send-ledger-'));
+    try { await fn(new TurnSendLedger(dataDir), dataDir); }
+    finally { rmSync(dataDir, { recursive: true, force: true }); }
+  };
+  const legacyPath = (ledger: TurnSendLedger, k: typeof key) => join(ledger.directory, `${ledger.id(k)}.json`);
+
+  it('files each record under its own session directory, never the shared root', async () => {
+    await withLedger(async (ledger, dataDir) => {
+      const otherKey = { ...key, sessionId: 'session_other' };
+      await ledger.execute(key, 'final', 'a', async () => 'om_a');
+      await ledger.execute(otherKey, 'final', 'b', async () => 'om_b');
+
+      expect(ledger.recordPath(key)).toBe(join(dataDir, 'turn-send-ledger', key.sessionId, `${ledger.id(key)}.json`));
+      expect(turnSendLedgerSessionDir(dataDir, key.sessionId)).toBe(ledger.sessionDirectory(key.sessionId));
+      expect(existsSync(ledger.recordPath(key))).toBe(true);
+      expect(existsSync(ledger.recordPath(otherKey))).toBe(true);
+      expect(readdirSync(ledger.directory).filter(name => name.endsWith('.json'))).toEqual([]);
+      expect(ledger.inspect().map(r => r.sessionId).sort()).toEqual([key.sessionId, otherKey.sessionId].sort());
+    });
+  });
+
+  it.each(['..', '.', 'a/b', '', '.completed-prune', 'x'.repeat(129)])('refuses session id %j as a directory name', async sessionId => {
+    await withLedger(async ledger => {
+      const dispatch = vi.fn(async () => 'om_never');
+      await expect(ledger.execute({ ...key, sessionId }, 'final', 'a', dispatch))
+        .rejects.toThrow('Invalid turn-send ledger session id');
+      expect(dispatch).not.toHaveBeenCalled();
+    });
+  });
+
+  it('still fences with a record written in the legacy flat layout, then migrates it on the next write', async () => {
+    await withLedger(async ledger => {
+      await ledger.execute(key, 'final', 'answer', async () => 'om_first');
+      renameSync(ledger.recordPath(key), legacyPath(ledger, key));
+      const dispatch = vi.fn(async () => 'om_dup');
+
+      await expect(ledger.execute(key, 'final', 'answer', dispatch))
+        .resolves.toEqual({ messageId: 'om_first', replayed: true });
+      await expect(ledger.execute(key, 'final', 'changed', dispatch))
+        .rejects.toThrow('目标、提及或附件与已投递请求不同');
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(ledger.inspect()).toHaveLength(1);
+      expect((await ledger.pruneCompleted(Date.now() + 31 * 24 * 60 * 60_000)).removed).toBe(1);
+      expect(existsSync(legacyPath(ledger, key))).toBe(false);
+    });
+  });
+
+  it('resolves a legacy in-flight record into the session directory without leaving a duplicate', async () => {
+    await withLedger(async ledger => {
+      await expect(ledger.executeNonIdempotentSequence(key, 'final', 'long', 2, async (_i, effects) => {
+        effects.providerRequestStarted();
+        throw new Error('provider response lost');
+      }, 'doc:comment')).rejects.toThrow('provider response lost');
+      renameSync(ledger.recordPath(key), legacyPath(ledger, key));
+
+      await expect(ledger.resolveUnknownStep(key, 'delivered')).resolves.toMatchObject({ completedSteps: 1 });
+      expect(existsSync(ledger.recordPath(key))).toBe(true);
+      expect(existsSync(legacyPath(ledger, key))).toBe(false);
+      expect(ledger.inspect()).toHaveLength(1);
+    });
+  });
+
+  it('rejects a record filed under another session directory', async () => {
+    await withLedger(async ledger => {
+      const victim = { ...key, sessionId: 'session_victim' };
+      await ledger.execute(key, 'final', 'answer', async () => 'om_first');
+      // Same content under a different session directory: the hash-only
+      // filename check would accept it, the owning-session check must not.
+      mkdirSync(ledger.sessionDirectory(victim.sessionId), { recursive: true });
+      writeFileSync(join(ledger.sessionDirectory(victim.sessionId), `${ledger.id(key)}.json`),
+        readFileSync(ledger.recordPath(key), 'utf8'));
+
+      expect(() => ledger.inspect()).toThrow('filed under another session');
+    });
   });
 });

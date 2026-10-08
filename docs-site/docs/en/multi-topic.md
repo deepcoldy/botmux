@@ -23,6 +23,18 @@ Throughout the whole process, all you need to do is: **state the requirement →
 
 For whichever bots you want to take part in the collaboration, first add them to this group and make sure they can be @-mentioned (see [multi-bot collaboration](/en/multi-bot)). Everything else — which repository to work in, how to open topics and assign tasks — is handled automatically by the main bot, so you don't need to configure anything in advance (no need to enable On-Call or anything like that).
 
+## Disabling the feature
+
+Multi-topic collaboration is enabled by default. If a machine does not need it, turn off "Enable multi-topic collaboration" under **Settings → Multi-topic collaboration** in the Dashboard. The change takes effect from the next session, no restart required.
+
+When it is off:
+
+- Agents no longer see the `botmux-orchestrate` Skill.
+- `botmux dispatch` cannot create a new sub-project topic.
+- `botmux dispatch --into <root message ID of a topic>` can still append to an existing topic, so ordinary bot handoffs are unaffected.
+
+In deployment environments you can also set `BOTMUX_MULTI_TOPIC_ENABLED=false`. The environment variable takes precedence over the setting saved in the Dashboard.
+
 ## Result
 
 ![Multi-topic orchestration · Lark task board as a shared progress board](https://magic-builder.tos-cn-beijing.volces.com/uploads/1780419243796_multitopic-board.png)

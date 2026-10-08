@@ -86,7 +86,7 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 
 此模式只传任务正文与附件信息，跳过 botmux 的系统提示、逐轮提醒、身份信封、角色、白板、记忆与技能目录；自动从 CLI 转写回传最终回答。使用新会话验证：已经进入历史的提示无法撤回，CLI 原生系统提示、项目 `AGENTS.md` 及用户自行安装的技能仍由 CLI 管理。
 
-支持范围复用 CLI 的最终回复兜底采集能力：目前包括 Claude Code、Codex、TraeX、CoCo、Hermes、MTR、Pi、Oh My Pi、ebsd、Grok（PTY、tmux 等本地后端，包含 Codex / TraeX RPC 输入）。暂不支持远端后端和 v3 workflow；仅 adopt 能采集 final 的 CLI 不作为整 bot 开关的支持依据。CLI 的共享技能目录若存在全局安装的 `botmux-*` 技能，会拒绝启动以免假称零注入；请使用按会话的技能注入方式或独立 home，不会删除其它 bot 共用的文件。
+支持范围复用 CLI 的最终回复兜底采集能力：目前包括 Claude Code、Codex、TraeX、CoCo、Hermes、MTR、Pi、Oh My Pi、ebsd、Grok，以及仅在零注入下启用转写采集的 Cursor、Antigravity（这两者常规模式仍通过 `botmux send` 回复，故默认不采集；均限 PTY、tmux 等本地后端，Codex / TraeX 可走 RPC 输入）。暂不支持远端后端和 v3 workflow；Cursor、Antigravity 的转写目录（`~/.cursor`、`~/.gemini`）在 oncall 沙箱（`sandbox: true`/`oncall`、读隔离、`BOTMUX_SANDBOX`）中以目录级 bind 直挂宿主真实路径，零注入可与其同时使用；全根 COW 的 `sandbox: "scratch"` 暂不支持这两者（结构化桥尚未解析 merged 视图，会直接报错而非静默丢回复）。Antigravity 的静默终态需经视口确认，故暂不支持 `zmx` 后端（Cursor 的终态即时采集，不受此限）。CLI 的共享技能目录若存在全局安装的 `botmux-*` 技能，会拒绝启动以免假称零注入；请使用按会话的技能注入方式或独立 home，不会删除其它 bot 共用的文件。
 
 普通协作可直接在群内 @ 执行 bot，最终回答自动回复当前会话，并默认 @ 本轮任务的发起人（真人或 bot）。收件人取自宿主记录的本轮身份，排队和重试不借用后续轮次的发送者；缺少可用身份时不猜测会话 owner，也不注入额外 prompt。已经 @ 发起 bot 的回复本身就是回报，不再额外通过 HTTP 重复追加一轮任务。
 
@@ -98,7 +98,7 @@ npm 包内带的是**同一个自包含二进制**（按 os/arch 只装匹配的
 
 `bots.json` 里用 `cliId` 一键切换。**20+ 适配器**，覆盖本地 CLI（进程隔离，`tmux attach` 可直连）和 API / 云 Agent（如 Mira、riff——通过 API / 远端接入，非本地进程；mojo 为 API 驱动、默认在宿主机执行工具，可配 cloud: true 走云沙箱）。代表项：
 
-`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco`(TRAE) · `hermes` · `ebsd` · `mira` · `riff`(云 Agent) … · `mojo`(API 驱动,默认宿主机执行) · `minimax`(MiniMax `mmx text repl`；区域由 `mmx auth login --region cn|global` 决定，同机多区用 per-bot `env` 的 `MMX_CONFIG_DIR` 隔离) …
+`claude-code` · `codex` · `gemini` · `cursor` · `opencode` · `opencode2` · `mimocode` · `antigravity` · `copilot` · `grok` · `kimi` · `kiro-cli` · `reasonix` · `dsh` · `aiden` · `coco`(TRAE) · `hermes` · `ebsd` · `mira` · `riff`(云 Agent) … · `mojo`(API 驱动,默认宿主机执行) · `remote-runner`([通用远端 Runner 协议](docs/remote-runner.md)) · `minimax`(MiniMax `mmx text repl`；区域由 `mmx auth login --region cn|global` 决定，同机多区用 per-bot `env` 的 `MMX_CONFIG_DIR` 隔离) …
 
 `ebsd` 使用独立的外部服务身份和原生 OMP 会话目录；部署方必须通过受限权限文件配置 Diag Gateway token 与 ByteCloud service account，不能把密钥写入 `bots.json`。
 

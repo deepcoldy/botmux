@@ -695,13 +695,23 @@ describe('finalizeCotMessage', () => {
     expect(request.mock.calls.length).toBe(putCount);
   });
 
-  it('maps non-completed terminals to interrupted', async () => {
+  it.each(['failed', 'cancelled', 'ambiguous'] as const)('closes %s terminals through the error endpoint', async status => {
     const ds = makeDs();
     handleCotThinkingUpdate(ds, upd([think('step 1')]));
     await flush();
-    finalizeCotMessage(ds, 'om_turn1', 'cancelled');
+    finalizeCotMessage(ds, 'om_turn1', status);
     await flush();
-    expect(pushedEvents().at(-1)!.content.status).toBe('interrupted');
+    expect(pushedEvents().some(event => event.type === 'RUN_FINISHED')).toBe(false);
+    const complete = request.mock.calls.filter(([req]) => String(req.url).includes('/message_cot/complete/'));
+    expect(complete).toHaveLength(1);
+    expect(complete[0][0].params).toEqual({ message_id: 'om_cot_msg1', reason: 'error' });
+    expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
+    const calls = request.mock.calls.length;
+    finalizeCotMessage(ds, 'om_turn1', status);
+    abortCotMessage(ds);
+    await settleCotMessageForShutdown(ds);
+    await flush();
+    expect(request.mock.calls.length).toBe(calls);
   });
 
   it('returns false for unknown turns and disabled states', async () => {
@@ -761,7 +771,7 @@ describe('orphan markers & sweep (daemon restart mid-turn)', () => {
     await sweepOrphanCotMessages('app1');
     const complete = request.mock.calls.find(([req]) => String(req.url).includes('/message_cot/complete/cot_prev'));
     expect(complete).toBeTruthy();
-    expect(complete![0].params).toEqual({ message_id: 'om_prev', reason: 'done' });
+    expect(complete![0].params).toEqual({ message_id: 'om_prev', reason: 'error' });
     expect(readdirSync(orphanDir)).toEqual([]);
   });
 
@@ -793,8 +803,7 @@ describe('orphan markers & sweep (daemon restart mid-turn)', () => {
     expect(kinds).toEqual(['note', 'complete']);
     const note = pushedEvents();
     expect(note.some(e => e.type === 'REASONING_MESSAGE_CONTENT' && /重启/.test(e.content.delta))).toBe(true);
-    expect(note.at(-1)!.type).toBe('RUN_FINISHED');
-    expect(note.at(-1)!.content.status).toBe('interrupted');
+    expect(note.some(e => e.type === 'RUN_FINISHED')).toBe(false);
   });
 
   it('sweep still completes the bubble when the interrupted note fails', async () => {
@@ -821,8 +830,9 @@ describe('settleCotMessageForShutdown (graceful daemon restart)', () => {
     await settleCotMessageForShutdown(ds);
     const evs = pushedEvents();
     expect(evs.some(e => e.type === 'REASONING_MESSAGE_CONTENT' && /重启/.test(e.content.delta))).toBe(true);
-    expect(evs.at(-1)!.type).toBe('RUN_FINISHED');
-    expect(evs.at(-1)!.content.status).toBe('interrupted');
+    expect(evs.some(e => e.type === 'RUN_FINISHED')).toBe(false);
+    expect(request.mock.calls.some(([req]) => req.method === 'POST'
+      && String(req.url).includes('/message_cot/complete/') && req.params.reason === 'error')).toBe(true);
     // Marker cleared → the next generation's sweep must not annotate it twice.
     expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
   });
@@ -885,9 +895,11 @@ describe('abortCotMessage (worker died without turn_terminal)', () => {
     expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(true);
     abortCotMessage(ds);
     await flush();
-    const last = pushedEvents().at(-1)!;
-    expect(last.type).toBe('RUN_FINISHED');
-    expect(last.content.status).toBe('interrupted');
+    expect(pushedEvents().some(event => event.type === 'RUN_FINISHED')).toBe(false);
+    expect(pushedEvents().some(event => event.content.delta === t('cot.worker_disconnected', {}, localeForBot('app1')))).toBe(true);
+    const complete = request.mock.calls.find(([req]) => String(req.url).includes('/message_cot/complete/'));
+    expect(complete?.[0].params).toEqual({ message_id: 'om_cot_msg1', reason: 'error' });
+    expect(request.mock.calls.at(-1)).toBe(complete);
     expect(existsSync(join(orphanDir, 'cot1.json'))).toBe(false);
     // Idempotent: a repeat abort (or a late finalize) pushes nothing new.
     const calls = request.mock.calls.length;

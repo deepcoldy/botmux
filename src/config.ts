@@ -151,13 +151,14 @@ export function resolveCompanionStartupConfig(env: NodeJS.ProcessEnv = process.e
  */
 export function resolveChatBotDiscoveryConfig(env: NodeJS.ProcessEnv = process.env): ChatBotDiscoveryConfig {
   const envFlag = env.BOTMUX_LARK_LIST_BOTS_API_ENABLED;
+  const timeoutMs = Number(env.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS);
   const listBotsApiEnabled =
     envFlag != null && envFlag !== ''
       ? envFlag.toLowerCase() === 'true'
       : readGlobalConfig().dashboard?.chatBotDiscovery !== false; // default ON
   return {
     listBotsApiEnabled,
-    listBotsApiTimeoutMs: Number(env.BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS) || 3_000,
+    listBotsApiTimeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 3_000,
   };
 }
 
@@ -216,6 +217,44 @@ export function resolveForwardFollowupWaitMs(env: NodeJS.ProcessEnv = process.en
   return Math.min(MAX_FORWARD_FOLLOWUP_WAIT_MS, Math.max(1, Math.trunc(value)));
 }
 
+const DEFAULT_RECOVERY_FORK_BATCH_SIZE = 5;
+const DEFAULT_RECOVERY_FORK_DELAY_MS = 250;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+function parseBoundedInteger(
+  raw: string | undefined,
+  fallback: number,
+  min: number,
+  max = Number.MAX_SAFE_INTEGER,
+): number {
+  const normalized = raw?.trim();
+  if (!normalized) return fallback;
+
+  const value = Number(normalized);
+  return Number.isSafeInteger(value) && value >= min && value <= max ? value : fallback;
+}
+
+export function resolveRecoveryForkConfig(env: NodeJS.ProcessEnv = process.env): {
+  batchSize: number;
+  delayMs: number;
+} {
+  return {
+    batchSize: parseBoundedInteger(
+      env.BOTMUX_RECOVERY_FORK_BATCH,
+      DEFAULT_RECOVERY_FORK_BATCH_SIZE,
+      1,
+    ),
+    delayMs: parseBoundedInteger(
+      env.BOTMUX_RECOVERY_FORK_DELAY_MS,
+      DEFAULT_RECOVERY_FORK_DELAY_MS,
+      0,
+      MAX_TIMER_DELAY_MS,
+    ),
+  };
+}
+
+const recoveryForkConfig = resolveRecoveryForkConfig();
+
 export const config = {
   lark: {
     appId: process.env.LARK_APP_ID ?? '',
@@ -245,8 +284,8 @@ export const config = {
      *  once spikes CPU/IO, so the re-fork is staggered: spawn `batchSize`
      *  workers, wait `delayMs`, repeat. Tune via BOTMUX_RECOVERY_FORK_BATCH /
      *  BOTMUX_RECOVERY_FORK_DELAY_MS. */
-    recoveryForkBatchSize: Math.max(1, Number(process.env.BOTMUX_RECOVERY_FORK_BATCH) || 5),
-    recoveryForkDelayMs: Math.max(0, Number(process.env.BOTMUX_RECOVERY_FORK_DELAY_MS ?? 250)),
+    recoveryForkBatchSize: recoveryForkConfig.batchSize,
+    recoveryForkDelayMs: recoveryForkConfig.delayMs,
     forwardFollowupWaitMs: resolveForwardFollowupWaitMs(),
     workingDir: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean)[0] || '~',
     workingDirs: (process.env.WORKING_DIR ?? '~').split(',').map(s => s.trim()).filter(Boolean),

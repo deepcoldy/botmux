@@ -259,13 +259,18 @@ export function shouldArmSpawnArgvInitialPromptBusy(opts: {
   return true;
 }
 
-/** Once either side of a queue boundary is durable, stop this batch and wait
- *  for the next reliable idle edge before writing the following turn. */
+/** Stop this batch when back-to-back writes are disabled or either side of the
+ *  queue boundary is durable. A message can arrive while writeInput is awaiting
+ *  its receipt; `isFlushing` admits it to the queue so the active drain can see
+ *  it, but an opted-in adapter must leave it there until the next real idle
+ *  edge. */
 export function shouldStopPendingBatch(
   written: PendingCliInput,
   next: PendingCliInput | undefined,
+  allowBackToBackWrites = true,
 ): boolean {
-  return written.dispatchAttempt !== undefined
+  return !allowBackToBackWrites
+    || written.dispatchAttempt !== undefined
     || next?.dispatchAttempt !== undefined
     || !!written.queuedActivationToken
     || !!next?.queuedActivationToken

@@ -270,6 +270,22 @@ export class CodexBridgeQueue {
     this.replayBufferedUnmatched(markTimeMs);
   }
 
+  /** Restore older marks before input accepted during rollout discovery. Only
+   * valid before the first transcript ingest; preserve current delivery owners
+   * and their confirmation state when a message is already in this queue. */
+  restorePendingTurns(entries: readonly { turnId: string; fingerprint: string; markTimeMs: number }[]): void {
+    const existing = new Set(this.queue.map(turn => turn.turnId));
+    const restored: CodexPendingTurn[] = [];
+    for (const entry of entries) {
+      if (existing.has(entry.turnId)) continue;
+      existing.add(entry.turnId);
+      restored.push({ turnId: entry.turnId, started: false,
+        contentFingerprint: makeFingerprint(entry.fingerprint), markTimeMs: entry.markTimeMs,
+        unconfirmedAttributionStartedAtMs: entry.markTimeMs });
+    }
+    this.queue.unshift(...restored);
+  }
+
   /** Drop all pending turns. Used when the worker decides it can't reliably
    *  attribute future events (e.g. a teardown). */
   clearPending(): CodexPendingTurn[] {

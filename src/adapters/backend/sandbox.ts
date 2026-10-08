@@ -18,6 +18,8 @@
  * daemon-side watcher re-executes the send OUTSIDE the sandbox with real
  * credentials. No Feishu credential ever enters the sandbox.
  */
+import { sandboxNetworkLaunch } from '../../core/sandbox-network-launch.js';
+import { networkProxyError, type SandboxNetworkPolicy } from '../../core/sandbox-network-policy.js';
 import { isMojoFullyRemote } from './mojo-types.js';
 import { mkdirSync, existsSync, writeFileSync, chmodSync, readdirSync, readFileSync, rmSync, rmdirSync, unlinkSync, statSync, lstatSync, readlinkSync, realpathSync, openSync, fstatSync, readSync, writeSync, closeSync, constants as fsConstants } from 'node:fs';
 import { atomicWriteFileSync } from '../../utils/atomic-write.js';
@@ -473,7 +475,7 @@ export function localSandboxApplies(
     env?: Record<string, string>;
   },
 ): boolean {
-  if (backendType === 'riff') return false;
+  if (backendType === 'riff' || backendType === 'remote-runner') return false;
   if (backendType === 'mojo') {
     return !isMojoFullyRemote(remoteExecution);
   }
@@ -675,6 +677,7 @@ export interface DirectSandboxSpawn {
  * real filesystem directly.
  */
 export function prepareDirectSandbox(opts: {
+  networkPolicy?: SandboxNetworkPolicy;
   sessionId: string;
   dataDir: string;
   /** Compile-ready policy (canonical + existence-filtered by the worker). */
@@ -703,10 +706,18 @@ export function prepareDirectSandbox(opts: {
   useBwrapArgsFile?: boolean;
 }): DirectSandboxSpawn | null {
   if (process.platform !== 'linux') return null;
+  const proxyError = networkProxyError(opts.networkPolicy, process.env);
+  if (proxyError) throw new Error(proxyError);
   if (!ensureSandboxDeps()) return null;
+  if (opts.networkPolicy && opts.mcpGatewaySocketPath) throw new Error('sandboxNetworkPolicy cannot expose host MCP/Unix IPC; disable host MCP plugins for this session');
+  // Validate all dependencies before creating files.
+  if (opts.networkPolicy) sandboxNetworkLaunch(opts.networkPolicy, '/bin/true', []);
 
   // Validate marker support before creating any session files or deny masks.
   const launch = linuxIsolationLaunch('bwrap', []);
+  // --seccomp and --add-seccomp-fd are mutually exclusive. Stack both trusted
+  // filters using the repeatable form for this opt-in path.
+  if (opts.networkPolicy) launch.args = launch.args.map(arg => arg === '--seccomp' ? '--add-seccomp-fd' : arg);
 
   const dataDir = canonical(opts.dataDir);
   const sessionRoot = join(dataDir, 'sandboxes', opts.sessionId);
@@ -786,6 +797,16 @@ export function prepareDirectSandbox(opts: {
   }
 
   const args = [...compiled.args];
+  if (opts.networkPolicy) {
+    args.push('--cap-drop', 'ALL', '--disable-userns', '--add-seccomp-fd', '5');
+    const resolver = join(sessionRoot, 'resolv.conf');
+    writeFileSync(resolver, (opts.networkPolicy.dnsServers ?? []).map(ip => `nameserver ${ip}`).join('\n') + '\n', { mode: 0o600 });
+    // systemd-resolved links /etc/resolv.conf into /run, which the sandbox
+    // masks with a fresh tmpfs. Recreate only the resolved parent and bind our
+    // explicit DNS file there, without exposing the host resolver directory.
+    const resolverTarget = canonical('/etc/resolv.conf');
+    args.push('--dir', dirname(resolverTarget), '--ro-bind', resolver, resolverTarget);
+  }
   // Shim bin at a fixed path under the fresh /run tmpfs — appended after the
   // rule mounts (later mount wins over the tmpfs). PATH points here first.
   args.push('--ro-bind', shimBin, '/run/sbxbin');
@@ -919,7 +940,7 @@ export function prepareDirectSandbox(opts: {
   const command = [execBin, ...opts.cliArgs];
   let compactLaunch: ReturnType<typeof linuxIsolationLaunchViaArgsFile> | null = null;
   try {
-    compactLaunch = opts.useBwrapArgsFile
+    compactLaunch = opts.useBwrapArgsFile && !opts.networkPolicy
       ? linuxIsolationLaunchViaArgsFile('bwrap', args, command, sessionRoot)
       : null;
   } catch (error) {
@@ -928,9 +949,18 @@ export function prepareDirectSandbox(opts: {
   }
   if (!compactLaunch) args.push('--', ...command);
 
+  let networkLaunch: ReturnType<typeof sandboxNetworkLaunch> | undefined;
+  try {
+    networkLaunch = opts.networkPolicy
+      ? sandboxNetworkLaunch(opts.networkPolicy, launch.bin, [...launch.args, ...args])
+      : undefined;
+  } catch (error) {
+    rollbackSandboxSetup(sessionRoot, createdMasks);
+    throw error;
+  }
   return {
-    bin: compactLaunch?.bin ?? launch.bin,
-    args: compactLaunch?.args ?? [...launch.args, ...args],
+    bin: networkLaunch?.bin ?? compactLaunch?.bin ?? launch.bin,
+    args: networkLaunch?.args ?? compactLaunch?.args ?? [...launch.args, ...args],
     ...(compactLaunch ? { argsFile: compactLaunch.argsFile } : {}),
     env,
     outbox,
@@ -1135,7 +1165,7 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
   }
   const flags: string[] = [];
   const rawFlags = Array.isArray(req.flags) ? req.flags : [];
-  const dispatchValueFlags = new Set(['--title', '--bot-app', '--chat-id']);
+  const dispatchValueFlags = new Set(['--title', '--bot-app', '--chat-id', '--delegate', '--no-delegate']);
   for (let i = 0; i < rawFlags.length; i++) {
     const f = rawFlags[i];
     if (typeof f !== 'string') return { ok: false, error: 'flag must be a string' };
@@ -1151,6 +1181,9 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       }
       if (f === '--chat-id' && !/^oc_[A-Za-z0-9_-]{1,128}$/.test(v)) {
         return { ok: false, error: 'dispatch --chat-id is invalid' };
+      }
+      if ((f === '--delegate' || f === '--no-delegate') && v !== 'schedule:create') {
+        return { ok: false, error: `dispatch ${f} only supports schedule:create` };
       }
       flags.push(f, v); i++; continue;
     }

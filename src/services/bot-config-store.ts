@@ -1,3 +1,4 @@
+import { parseSandboxNetworkPolicy, networkPolicySupportError } from '../core/sandbox-network-policy.js';
 /**
  * `/config` 远程编辑 bot 运营字段。与 oncall-store / grant-prefs-store / brand-store
  * 同款：跨进程文件锁 + bots.json 原子写（rmwBotEntry），外加内存 registry 同步——
@@ -9,6 +10,7 @@
  * （grants / quota）由既有 `/grant` 负责，不在此重复。
  */
 import { normalizeMojoConfig } from '../adapters/backend/mojo-types.js';
+import { normalizeRemoteRunnerConfig } from '../adapters/backend/remote-runner-config.js';
 import { parseTriggerUserAuthConfig } from './trigger-user-auth.js';
 import type { BotConfig } from '../bot-registry.js';
 import { getBot, getOwnerOpenId, readBotSkillPolicy } from '../bot-registry.js';
@@ -27,6 +29,7 @@ import { logger } from '../utils/logger.js';
 import { parseCustomPassthroughInput, parseCanTalkDaemonCommandsInput } from '../core/passthrough-commands.js';
 import { parseStartupCommandsInput } from '../core/startup-commands.js';
 import { isReservedPerBotEnvKey, sanitizePerBotEnv } from '../core/per-bot-env.js';
+import { normalizeEnvPolicy } from '../core/env-policy.js';
 import { normalizeFeedbackPolicy } from './feedback-policy.js';
 import { normalizeOncallGroupPolicy } from './oncall-group-policy.js';
 import { normalizeFeedbackPolicyLayer, type FeedbackPolicyLayer } from './feedback-policy-resolver.js';
@@ -130,6 +133,7 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'codexAppCleanInput', configKey: 'codexAppCleanInput', kind: 'boolean', effect: 'immediate', clearable: false, hint: '实验性：Codex App 用户气泡只保留真实输入，Botmux 元数据走隐藏上下文；默认 off，从下一次 turn 派发生效，不改已有历史' },
   { key: 'promptInjection', configKey: 'promptInjection', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['default', 'none'], enumDefault: 'default', hint: '零 botmux 注入：none=仅传任务与附件，自动回传最终回复；default=恢复原有提示/技能配置。支持可自动获取最终回复的本地 CLI；新会话完整生效，已有历史不清除' },
   { key: 'envelopeInjection', configKey: 'envelopeInjection', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['auto', 'off'], hint: '每轮上下文注入方式：auto=支持的 CLI（claude-code）把提醒/白板经 hook 注入为系统提醒，输入框只留消息本身，不支持的自动回退｜off=内联（默认）；unset 回 off' },
+  { key: 'topicUnavailablePolicy', configKey: 'topicUnavailablePolicy', kind: 'enum', effect: 'immediate', clearable: true, enumValues: ['legacy', 'stop'], enumDefault: () => 'legacy', hint: '原话题不可用时：legacy=保持原有发送和兜底行为（默认）｜stop=停止发送，查询异常暂停且不改发；unset 回 legacy' },
   { key: 'replyDelivery', configKey: 'replyDelivery', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['send', 'transcript'], enumDefault: cfg => defaultReplyDeliveryFor(cfg.cliId), hint: '最终回复投递方式：send=模型必须自己 botmux send（**所有 CLI 的缺省**，与上游一致）｜transcript=从 CLI 转写自动取最终回复发卡，模型不再被要求 botmux send（opt-in，需显式开启）；仅 claude-code 与 codex/traex/coco/hermes/mtr/pi/oh-my-pi/ebsd/grok 支持 transcript；系统提示需 /restart 才换新值，逐轮信封立即生效；unset 回缺省 send' },
   { key: 'senderTag', configKey: 'senderTag', kind: 'boolean', effect: 'immediate', clearable: false, defaultOn: true, hint: '每轮注入 <sender> 发言人标签 on|off（默认 on）：标注本轮是谁在说话（open_id/姓名/邮箱）。关掉后模型看不到发言人身份，多人会话里无法区分谁说的；--mention-back 不受影响（走 daemon 侧独立记录）。代价：/adopt 少一条识别本 bot 自产会话的指纹，dashboard 洞察无法从标签判断发言人类型与 A2A 对方名字' },
   { key: 'restrictGrantCommands', configKey: 'restrictGrantCommands', kind: 'boolean', effect: 'immediate', clearable: false, hint: '被授权人仅能纯对话、拦截斜杠命令 on|off' },
@@ -142,14 +146,17 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
   { key: 'customPassthroughCommands', configKey: 'customPassthroughCommands', kind: 'stringList', effect: 'immediate', clearable: true, hint: '额外放行透传给 CLI 的 slash 命令（逗号/空格分隔，如 /goal /export）；unset 回仅内置白名单' },
   { key: 'canTalkDaemonCommands', configKey: 'canTalkDaemonCommands', kind: 'stringList', effect: 'immediate', clearable: true, parseList: parseCanTalkDaemonCommandsInput, hint: '把列出的 daemon 命令权限从 canOperate（仅管理员）降到 canTalk（对话放行即可用），如 /status /help；仅认 daemon 命令，透传命令无效；unset 回全部仅管理员' },
   { key: 'startupCommands', configKey: 'startupCommands', kind: 'stringList', effect: 'next-session', clearable: true, parseList: parseStartupCommandsInput, hint: '开会话后、首条消息前自动发给 CLI 的命令（逗号/换行分隔，可带参数，如 /effort ultracode）；unset 回不发' },
+  { key: 'envPolicy', configKey: 'envPolicy', kind: 'json', effect: 'next-session', clearable: true, hint: '进程环境继承策略 JSON：{"mode":"strict","inherit":["HTTPS_PROXY"]}；默认 inherit 兼容旧行为。仅变量名，不填值；下次 worker 冷启动生效，旧 pane 策略不匹配时拒绝复用；unset 恢复默认' },
+  { key: 'sandboxNetworkPolicy', configKey: 'sandboxNetworkPolicy', kind: 'json', effect: 'next-session', clearable: true, hint: 'Linux 本地 PTY oncall 沙箱的公网/内网目标 IP 策略；version=1，public/private 各含 mode: allow|block|allowlist|denylist 和 rules[{cidr,protocol?,ports?}]；不支持域名或宿主 MCP/Unix IPC；下个新会话生效，unset 恢复 sandboxNetwork' },
   { key: 'env', configKey: 'env', kind: 'json', effect: 'next-session', clearable: true, hint: 'per-bot 环境变量 JSON（如 {"ANTHROPIC_BASE_URL":"…","ANTHROPIC_AUTH_TOKEN":"…"} 让本 bot 走 GLM/第三方服务商，或设 HTTPS_PROXY）；注入到本 bot 的 CLI 进程，下个会话生效；值不显示（脱敏）；unset 清除' },
   { key: 'codexAuthSync', configKey: 'codexAuthSync', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['shared', 'isolated'], hint: 'Codex 鉴权策略：shared=保持旧行为（非沙箱直接使用全局 ~/.codex；沙箱冷启动同步全局 auth 到 per-bot CODEX_HOME）｜isolated=无论是否启用沙箱都使用 per-bot CODEX_HOME，绝不复制全局凭证，需在该目录单独执行 codex login --with-api-key' },
   { key: 'credentialsSourceDir', configKey: 'credentialsSourceDir', kind: 'dir', effect: 'next-session', clearable: true, hint: 'CLI 凭证来源目录（如 ~/accounts/acct-b，内按 CLI 分子目录：claude/.credentials.json）：沙箱 bot 每次冷启动从这里复制凭证，而不是用本机共享登录；来源不可用即拒绝启动、绝不回退共享登录；目前仅支持 claude-code；完全未开沙箱的 bot 不生效（仍用全局登录），已开沙箱却无法重定向数据目录（wrapperCli / adapter 不支持 / 缺 SESSION_DATA_DIR）则拒绝启动；token 刷新由外部负责；unset 回共享登录' },
   { key: 'codexInstancePool', configKey: 'codexInstancePool', kind: 'json', effect: 'next-session', clearable: true, hint: '会话级 Codex 实例：显式 defaultInstanceId 与 instances[{id,codexHome,weight}]，weight默认1；scope=ordinary-feishu，strategy=random。仅新会话分配，已有会话保持绑定。使用 botmux codex-instances check 检查本机目录。' },
   { key: 'triggerUserAuth', configKey: 'triggerUserAuth', kind: 'json', effect: 'next-session', clearable: true, hint: '按触发人身份调用 CLI（默认关闭）：开启后本 bot 调 lark-cli / bytedcli 用「发这条消息的人」自己的授权，而不是本机登录态。JSON 形如 {"enabled":true,"tools":["lark-cli","bytedcli"]}；tools 省略=全部。未授权时 lark-cli / bytedcli 一律拒绝（拒绝消息里会附授权链接，点开后重试即可），不会用 bot 或任何人的身份代跑；fallback 字段仅为兼容旧配置保留，当前不再改变行为。注意 bytedcli 没有 bot 身份，对它 fallback 恒等于失败。可选 gitHost（如 code.example.com）让该代码平台的 git 推送也按当轮身份鉴权，并把 SSH 远端改写成 HTTPS；可选 gitTokenExchangeUrl（https）作为 bytedcli 取不到 JWT 时的兜底换取端点。下个会话生效；unset 清除（关闭）' },
-  { key: 'backendType', configKey: 'backendType', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'riff', 'mojo'], hint: '会话后端类型：pty=本地 PTY 子进程（默认）｜tmux=tmux 会话｜herdr=herdr 终端复用｜zellij=zellij 多路复用｜zmx=ZMX >=0.7.0 纯文本持久会话（无 Web TUI）｜riff=远程 riff agent 服务｜mojo=远程 mojo agent（headless mojo CLI）；选 riff 时需配置 riff 字段，mojo 字段可选；unset 回 pty' },
+  { key: 'backendType', configKey: 'backendType', kind: 'enum', effect: 'next-session', clearable: true, enumValues: ['pty', 'tmux', 'herdr', 'zellij', 'zmx', 'riff', 'mojo', 'remote-runner'], hint: '会话后端类型：pty=本地 PTY 子进程（默认）｜tmux=tmux 会话｜herdr=herdr 终端复用｜zellij=zellij 多路复用｜zmx=ZMX >=0.7.0 纯文本持久会话（无 Web TUI）｜riff=远程 riff agent 服务｜mojo=远程 mojo agent（headless mojo CLI）｜remote-runner=外置 provider；选 riff 时需配置 riff 字段，mojo/remoteRunner 字段可选；unset 回 pty' },
   { key: 'riff', configKey: 'riff', kind: 'json', effect: 'next-session', clearable: true, hint: 'riff 后端配置 JSON（baseUrl/agent/model/jwt 等），仅 backendType=riff 时生效；unset 清除' },
   { key: 'mojo', configKey: 'mojo', kind: 'json', effect: 'next-session', clearable: true, hint: 'mojo 后端配置 JSON，仅 backendType=mojo 时生效，全部可选：cloud/localDaemon/baseUrl/ppeEnv/workspaceId/agentId/idleTimeoutSec/stream/systemPrompt/jwt/jwtEnv/env；model 与二进制路径请用顶层 model / cliPathOverride（写在此处会被拒绝）；unset 清除' },
+  { key: 'remoteRunner', configKey: 'remoteRunner', kind: 'json', effect: 'next-session', clearable: true, hint: '通用 Remote Runner 协议配置 JSON（expectedProvider/requiredCapabilities/handshakeTimeoutMs/operationTimeoutMs）；provider 可执行文件用 cliPathOverride 指定；不得写入凭据；unset 清除' },
 ];
 
 /** 大小写不敏感地按 key 找字段 spec。 */
@@ -292,6 +299,16 @@ async function applyConfigFieldInternal(
   if (spec.kind === 'allowedUsers') return { ok: false, reason: 'use_setBotAllowedUsers' };
   let bot;
   try { bot = getBot(larkAppId); } catch { return { ok: false, reason: 'bot_not_registered' }; }
+  if (spec.configKey === 'envPolicy' && value !== null) {
+    try { value = normalizeEnvPolicy(value); } catch { return { ok: false, reason: 'invalid_env_policy' }; }
+  }
+  if (spec.configKey === 'sandboxNetworkPolicy' && value !== null) {
+    try {
+      value = parseSandboxNetworkPolicy(value);
+      const reason = networkPolicySupportError({ platform: process.platform, backendType: bot.config.backendType ?? 'pty', sandbox: bot.config.sandbox, policy: value });
+      if (reason) return { ok: false, reason };
+    } catch (error) { return { ok: false, reason: (error as Error).message }; }
+  }
   const previousPinStreamingCard = spec.configKey === 'pinStreamingCard'
     ? bot.config.pinStreamingCard === true
     : undefined;
@@ -333,6 +350,7 @@ async function applyConfigFieldInternal(
     if (zeroPrompt && !supportsZeroPromptInjection(nextCliId, {
       backendType: spec.configKey === 'backendType' ? (effective as string | undefined) : entry.backendType as string | undefined,
       codexRpcInput: spec.configKey === 'codexRpcInput' ? effective === true : entry.codexRpcInput === true,
+      sandbox: spec.configKey === 'sandbox' ? effective as (boolean | 'off' | 'oncall' | 'scratch') : entry.sandbox,
     })) {
       return { write: false, result: 'zero_prompt_unsupported' };
     }
@@ -716,7 +734,7 @@ export type CoerceResult =
   | { ok: true; value: unknown }
   // A few reasons carry detail (e.g. which keys were rejected), so this is a
   // union of literals plus those prefixed forms rather than a closed literal set.
-  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_trigger_user_auth: ${string}` };
+  | { ok: false; reason: 'invalid_bool' | 'invalid_enum' | 'invalid_cli' | 'invalid_dir' | 'invalid_number' | 'invalid_json' | 'reserved_env' | 'empty' | 'too_long' | `invalid_mojo_config: ${string}` | `invalid_remote_runner_config: ${string}` | `invalid_trigger_user_auth: ${string}` };
 
 const isConfigNumberInRange = (spec: ConfigFieldSpec, value: number): boolean => (
   Number.isInteger(value)
@@ -762,6 +780,7 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
     case 'json': {
       try {
         const parsed = JSON.parse(s);
+        if (spec.configKey === 'sandboxNetworkPolicy') return { ok: true, value: parseSandboxNetworkPolicy(parsed) };
         if (spec.configKey === 'oncallGroup') return { ok: true, value: normalizeOncallGroupPolicy(parsed) };
         if (spec.configKey === 'skills') {
           const policy = readBotSkillPolicy(parsed);
@@ -773,6 +792,7 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
           try { return { ok: true, value: normalizeFeedbackPolicy(parsed) }; }
           catch { return { ok: false, reason: 'invalid_json' }; }
         }
+        if (spec.configKey === 'envPolicy') return { ok: true, value: normalizeEnvPolicy(parsed) };
         if (spec.configKey === 'env') {
           // Must be a JSON object; sanitize to valid env keys + primitive values.
           // Reserved keys (CODEX_HOME / GROK_HOME / BOTMUX_* / …) are rejected
@@ -795,6 +815,16 @@ export function coerceConfigValue(spec: ConfigFieldSpec, raw: unknown): CoerceRe
             return { ok: false, reason: `invalid_mojo_config: ${normalized.errors.join('; ')}` };
           }
           return { ok: true, value: normalized.value };
+        }
+        if (spec.configKey === 'remoteRunner') {
+          try {
+            return { ok: true, value: normalizeRemoteRunnerConfig(parsed) };
+          } catch (error) {
+            return {
+              ok: false,
+              reason: `invalid_remote_runner_config: ${error instanceof Error ? error.message : String(error)}`,
+            };
+          }
         }
         if (spec.configKey === 'triggerUserAuth') {
           // Same SHARED parser as the bots.json door, so the two cannot drift.

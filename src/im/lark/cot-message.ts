@@ -27,12 +27,11 @@
  *      none render identically), so the command line / file path travels in
  *      TOOL_CALL_START.title — see {@link toolTitleSubject}. Single
  *      in-flight PUT per session, latest-wins.
- *   3. `turn_terminal` → final PUT: REASONING_END / RUN_FINISHED.
- *      RUN_FINISHED auto-completes the CoT server-side (verified: later
- *      appends fail with "COT already in terminal state"), so no separate
- *      complete call is needed; the explicit complete endpoint is kept as the
- *      error-path fallback so a failed terminal batch can't leave the bubble
- *      spinning forever.
+ *   3. Successful `turn_terminal` → final PUT: REASONING_END / RUN_FINISHED.
+ *      RUN_FINISHED auto-completes as Completed, including status=interrupted
+ *      with matching thread/run IDs (verified against the live endpoint).
+ *      Failed, cancelled, ambiguous and disconnected streams therefore use
+ *      the explicit error-completion endpoint, also the fallback on PUT failure.
  *
  * Strictly cosmetic: every network call catches its own errors and never
  * touches turn settlement.
@@ -81,6 +80,8 @@ interface CotState {
   pumping: boolean;
   /** Set when turn_terminal arrives; consumed by the pump's final flush. */
   finishStatus?: 'done' | 'interrupted';
+  /** Worker loss is not evidence that an external adopted CLI stopped. */
+  workerDisconnected?: boolean;
 }
 
 const states = new WeakMap<DaemonSession, CotState>();
@@ -189,12 +190,9 @@ export async function sweepOrphanCotMessages(selfLarkAppId: string): Promise<voi
         // complete below, since an un-terminated bubble spins on「执行中」
         // forever, which is strictly worse than an unannotated one.
         //
-        // The note ends in RUN_FINISHED, which already auto-completes the CoT
-        // server-side (verified: a later append is refused as terminal), so
-        // the complete below is redundant on the happy path. It is kept
-        // deliberately: it is idempotent, it is the ONLY terminator when the
-        // note fails, and dropping it would rewrite pre-existing assertions
-        // for a saving on a fire-and-forget startup path that blocks nothing.
+        // Use the error completion endpoint after the notice. RUN_FINISHED
+        // would label this abandoned progress stream as completed even though
+        // the external CLI can still be executing the original task.
         try {
           await c.request({
             method: 'PUT',
@@ -212,7 +210,7 @@ export async function sweepOrphanCotMessages(selfLarkAppId: string): Promise<voi
         await c.request({
           method: 'POST',
           url: `/open-apis/im/v1/message_cot/complete/${encodeURIComponent(rec.cotId)}`,
-          params: { message_id: rec.messageId, reason: 'done' },
+          params: { message_id: rec.messageId, reason: 'error' },
           timeout: COT_REQUEST_TIMEOUT_MS,
         } as any);
         logger.info(`[cot] orphan closed cot=${rec.cotId}`);
@@ -264,25 +262,30 @@ function ev(eventType: string, content: unknown): CotEvent {
 }
 
 /**
- * Terminal batch for a bubble the daemon is abandoning mid-turn: a visible
- *「因重启中断」node followed by RUN_FINISHED(interrupted).
+ * Visible notice for a progress stream abandoned during restart or worker loss.
+ * RUN_FINISHED is deliberately omitted: even with matching thread/run IDs,
+ * status=interrupted rendered as Completed in a live probe. Callers append this
+ * notice before closing through the explicit error-completion endpoint.
  *
- * Shared by both abandonment paths so they render identically:
- *   - graceful shutdown (still holds the in-memory state), and
- *   - the next generation's orphan sweep (only has the marker file).
+ * Shared by abandonment paths, with cause-specific copy:
+ *   - graceful shutdown (still holds the in-memory state),
+ *   - the next generation's orphan sweep (only has the marker file),
+ *   - worker loss while the daemon stays alive.
  *
  * Callers MUST send this BEFORE terminating the CoT. Completing first is
  * irreversible: a later append is rejected with "COT already in terminal
  * state" (verified against the live endpoint), so the note would silently
  * never appear.
  */
-function interruptedNoticeEvents(larkAppId: string, lastReasoningId?: string): CotEvent[] {
+function interruptedNoticeEvents(
+  larkAppId: string, lastReasoningId?: string,
+  noticeKey: 'cot.interrupted' | 'cot.worker_disconnected' = 'cot.interrupted',
+): CotEvent[] {
   const mid = `reasoning-interrupted-${lastReasoningId ?? 'orphan'}`;
   return [
     ev('REASONING_MESSAGE_START', { messageId: mid, role: 'reasoning' }),
-    ev('REASONING_MESSAGE_CONTENT', { messageId: mid, delta: t('cot.interrupted', {}, localeForBot(larkAppId)) }),
+    ev('REASONING_MESSAGE_CONTENT', { messageId: mid, delta: t(noticeKey, {}, localeForBot(larkAppId)) }),
     ev('REASONING_MESSAGE_END', { messageId: mid }),
-    ev('RUN_FINISHED', { threadId: 'cot-interrupted', runId: mid, status: 'interrupted' }),
   ];
 }
 
@@ -565,8 +568,8 @@ function entryEvents(ds: DaemonSession, state: CotState, entry: CotEntry, index:
 /**
  * Single-in-flight pump: creates the CoT entity on first run, then drains
  * pendingEntries — each unseen entry becomes its own node; when finishStatus
- * is set and all entries are drained, sends the terminal event batch
- * (RUN_FINISHED auto-completes).
+ * is set and all entries are drained, closes through RUN_FINISHED on success
+ * or explicit error completion for interrupted streams.
  */
 async function pump(ds: DaemonSession, state: CotState): Promise<void> {
   if (state.pumping) return;
@@ -601,10 +604,16 @@ async function pump(ds: DaemonSession, state: CotState): Promise<void> {
         continue; // re-check for newer entries queued during the push
       }
       if (state.finishStatus && !state.settled) {
-        await apiAppend(ds, state, [
+        const terminalEvents = [
+          ...(state.workerDisconnected
+            ? interruptedNoticeEvents(ds.larkAppId, state.lastReasoningId, 'cot.worker_disconnected') : []),
           ev('REASONING_END', { messageId: state.lastReasoningId ?? reasoningId(state, 0) }),
-          ev('RUN_FINISHED', { threadId: ds.session.sessionId, runId: state.turnId, status: state.finishStatus }),
-        ]);
+        ];
+        if (state.finishStatus === 'done') {
+          terminalEvents.push(ev('RUN_FINISHED', { threadId: ds.session.sessionId, runId: state.turnId, status: 'done' }));
+        }
+        await apiAppend(ds, state, terminalEvents);
+        if (state.finishStatus === 'interrupted') await apiComplete(ds, state, 'error');
         state.settled = true;
         clearCotOrphanMarker(state);
         logger.info(`[cot] finished cot=${state.cotId} turn=${state.turnId.substring(0, 24)} status=${state.finishStatus}`);
@@ -719,11 +728,8 @@ export async function settleCotMessageForShutdown(ds: DaemonSession): Promise<vo
   try {
     if (!state.disabled) {
       await apiAppend(ds, state, interruptedNoticeEvents(ds.larkAppId, state.lastReasoningId));
-    } else {
-      // A mid-turn failure already disabled pushes for this turn; appending
-      // would fail too. Just terminate so it stops spinning.
-      await apiComplete(ds, state, 'error');
     }
+    await apiComplete(ds, state, 'error');
   } catch {
     // Notice failed — still terminate, for the same reason the sweep does:
     // an unannotated closed bubble beats one that spins forever.
@@ -753,6 +759,7 @@ export function abortCotMessage(ds: DaemonSession): void {
   }
   if (!state.finishStatus) {
     state.finishStatus = 'interrupted';
+    state.workerDisconnected = true;
     void pump(ds, state);
   }
 }

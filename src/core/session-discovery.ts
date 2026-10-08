@@ -14,6 +14,7 @@ import { findCodexRolloutByPid } from '../services/codex-transcript.js';
 import { findCocoSessionByPid } from '../services/coco-transcript.js';
 import { findTraexRolloutByPid } from '../services/traex-transcript.js';
 import { tmuxEnv } from '../setup/ensure-tmux.js';
+import { herdrExecutable } from '../utils/herdr-executable.js';
 
 // macOS 没有 /proc，所以走 ps/lsof/pgrep 兜底。Linux 仍优先走 /proc 快路径。
 const IS_LINUX = platform() === 'linux';
@@ -733,7 +734,7 @@ type HerdrJsonResult = { ok: true; value: any | undefined } | { ok: false };
 
 function tryHerdrJson(args: string[], opts?: { timeout?: number }): HerdrJsonResult {
   try {
-    const out = execFileSync('herdr', args, {
+    const out = execFileSync(herdrExecutable(), args, {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: opts?.timeout ?? 5000,

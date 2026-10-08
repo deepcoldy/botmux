@@ -167,8 +167,9 @@ export function __testOnly_resetLarkGate(): void {
 
 // ─── 错误分类（镜像 ask-card.classifyAskDispatchError，自包含） ────────────────
 
-/** 提取 Lark 业务码：axios response.data.code / 顶层 code / 消息尾部 (code: NNN)。 */
-function extractLarkBusinessCode(err: unknown): number | undefined {
+/** 提取 Lark 业务码：axios response.data.code / 顶层 code / 消息尾部 (code: NNN)。
+ *  200 + res.code!==0 的抛错只把业务码写进消息字符串，所以尾形必须覆盖。 */
+export function extractLarkBusinessCode(err: unknown): number | undefined {
   const e = err as {
     response?: { data?: { code?: number } };
     code?: unknown;

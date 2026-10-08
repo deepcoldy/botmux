@@ -94,6 +94,16 @@ export type BotDefaultsRow = {
   /** Per-bot ask option layout; null means the built-in compact default. */
   askOptionLayout?: AskOptionLayout | null;
   sandbox?: boolean;
+  /** Tri-state sandbox selection ('off' absent historically → derive from sandbox). */
+  sandboxMode?: 'off' | 'oncall' | 'scratch' | null;
+  scratchStorage?: 'tmpfs' | 'disk' | null;
+  /** Whether the tmpfs/disk storage segmented control applies (Linux only;
+   *  macOS scratch is always APFS-clonefile backed). */
+  scratchStorageSelectable?: boolean;
+  scratchTmpfsSizeMb?: number | null;
+  scratchDenyPaths?: string[] | null;
+  /** Whether the scratch mode is available on this platform (Linux only). */
+  scratchSupported?: boolean;
   codexAuthSync?: 'shared' | 'isolated';
   /** Trigger-user CLI auth: null / absent = off (the historical behavior, where
    *  CLI calls use whatever identity is logged in on the machine).
@@ -106,8 +116,10 @@ export type BotDefaultsRow = {
     gitHost?: string;
     gitTokenExchangeUrl?: string;
   } | null;
-  /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer).
-   *  null/absent = none configured (pure deny-by-default baseline). */
+  /** Opt-in policy, configured for future sessions; absence retains legacy behavior. */
+  sandboxNetworkPolicy?: import('../../core/sandbox-network-policy.js').SandboxNetworkPolicy | null;
+  sandboxNetworkPolicyPlatform?: string | null;
+  /** Three-tier sandbox path whitelist (highest-precedence FsPolicy layer). */
   sandboxPaths?: { readWrite: string[]; readOnly: string[]; deny: string[] } | null;
   /** Whether the unified file sandbox ALSO applies cross-bot read isolation for
    *  this bot's sessions — true when the CLI (claude/codex) + platform (macOS/Linux)
@@ -153,6 +165,7 @@ export type BotDefaultsRow = {
   envelopeInjection?: 'auto' | 'off' | null;
   /** 最终回复投递方式的**生效值**（显式配置，否则按 CLI 缺省）。'transcript' = daemon
    *  从 CLI 转写自动取最终回复，模型不再被要求 botmux send；'send' = 模型自己 botmux send。 */
+  topicUnavailablePolicy?: 'legacy' | 'stop';
   replyDelivery?: 'send' | 'transcript' | null;
   promptInjection?: 'default' | 'none';
   /** 当前 cliId 的缺省投递方式；目前统一为 'send'。 */
@@ -181,6 +194,8 @@ export type BotDefaultsRow = {
   canTalkDaemonCommands?: string;
   launchShell?: string;
   env?: string;
+  envKeys?: string[];
+  envPolicy?: { mode: 'inherit' | 'strict'; inherit?: string[] };
   riff?: Record<string, unknown> | null;
   /** 被动入群时自动把 owner 拉进群。缺省 ON —— 只有显式 false 表示关闭。 */
   autoInviteOwnerOnGroupAdd?: boolean;

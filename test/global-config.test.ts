@@ -9,6 +9,7 @@ import {
   globalConfigPath,
   isGlobalVcMeetingAgentEnabled,
   invalidateGlobalConfigCache,
+  isMultiTopicOrchestrationEnabled,
   isWorkflowFeatureEnabled,
   mergeDashboardConfig,
   mergeGlobalConfig,
@@ -26,6 +27,7 @@ describe('global dashboard config', () => {
     home = mkdtempSync(join(tmpdir(), 'botmux-global-config-'));
     vi.stubEnv('HOME', home);
     vi.stubEnv('BOTMUX_WORKFLOW_ENABLED', '');
+    vi.stubEnv('BOTMUX_MULTI_TOPIC_ENABLED', '');
     mkdirSync(dirname(globalConfigPath()), { recursive: true });
   });
 
@@ -291,6 +293,27 @@ describe('global dashboard config', () => {
     expect(isWorkflowFeatureEnabled()).toBe(true); // blank ⇒ fall through to config (enabled)
   });
 
+  it('multi-topic orchestration defaults ON and supports config/env opt-out', () => {
+    expect(isMultiTopicOrchestrationEnabled()).toBe(true);
+    expect(readGlobalConfig().multiTopic).toBeUndefined();
+
+    mergeGlobalConfig({ multiTopic: { enabled: false } });
+    expect(readGlobalConfig().multiTopic).toEqual({ enabled: false });
+    expect(isMultiTopicOrchestrationEnabled()).toBe(false);
+
+    vi.stubEnv('BOTMUX_MULTI_TOPIC_ENABLED', 'true');
+    expect(isMultiTopicOrchestrationEnabled()).toBe(true);
+    vi.stubEnv('BOTMUX_MULTI_TOPIC_ENABLED', 'false');
+    expect(isMultiTopicOrchestrationEnabled()).toBe(false);
+  });
+
+  it('ignores a non-boolean multiTopic.enabled and preserves the default ON', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({ multiTopic: { enabled: 'no' } }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().multiTopic).toBeUndefined();
+    expect(isMultiTopicOrchestrationEnabled()).toBe(true);
+  });
+
   it('keeps codexNotifier strictly disabled by default', () => {
     expect(readGlobalConfig().codexNotifier).toBeUndefined();
     expect(resolveCodexNotifierConfig()).toEqual({
@@ -470,6 +493,24 @@ describe('global dashboard config', () => {
     // Clearing (null) removes it again.
     mergeGlobalConfig({ httpProxy: null });
     expect(readGlobalConfig().httpProxy).toBeUndefined();
+  });
+
+  it('keeps schedule delegation issuance and execution revocation independent', () => {
+    writeFileSync(globalConfigPath(), JSON.stringify({
+      scheduleDelegation: { createEnabled: true, runEnabled: false,
+        defaultOnDispatchFromBotAppIds: ['cli_orchestrator', 'bad', 'cli_orchestrator'],
+        maxTasksPerTurn: 128, runScopes: ['bytedcli', 'lark-cli', 'unknown', 'bytedcli'],
+        selfManageEnabled: true, ignored: true },
+    }));
+    invalidateGlobalConfigCache();
+    expect(readGlobalConfig().scheduleDelegation).toEqual({
+      createEnabled: true,
+      runEnabled: false,
+      defaultOnDispatchFromBotAppIds: ['cli_orchestrator'],
+      maxTasksPerTurn: 128,
+      runScopes: ['bytedcli'],
+      selfManageEnabled: true,
+    });
   });
 
   it('ignores a non-string / blank httpProxy', () => {

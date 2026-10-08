@@ -1,6 +1,11 @@
 import { extname } from 'node:path';
 import { formatLarkError } from '../bot-registry.js';
 import {
+  contentAuditSendRemediation,
+  isLarkContentAuditError,
+  larkErrorCode,
+} from '../im/lark/content-audit.js';
+import {
   findDisallowedCardCallback,
   type InteractiveCardCallbackPolicy,
 } from '../core/card-callback-policy.js';
@@ -32,10 +37,16 @@ export type DispatchPrimaryDeps = {
   replyMessage: ReplyMessageFn;
 };
 
-/** Keep provider details visible without leaking Axios config or headers. */
+/** Keep provider details visible without leaking Axios config or headers.
+ *  Content-audit rejections are permanent and content-specific: append an
+ *  actionable remediation line so the model in the worker PTY corrects the
+ *  payload instead of resending verbatim (which fails identically). */
 export function describeSendFailure(err: unknown): string {
-  return formatLarkError(err)
+  const detail = formatLarkError(err)
     ?? (err instanceof Error && err.message ? err.message : String(err));
+  return isLarkContentAuditError(err)
+    ? `${detail}\n${contentAuditSendRemediation(larkErrorCode(err))}`
+    : detail;
 }
 
 /**

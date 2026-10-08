@@ -25,6 +25,7 @@ import { randomBytes } from 'node:crypto';
 import { resolve } from 'node:path';
 import MarkdownIt from 'markdown-it';
 import type Token from 'markdown-it/lib/token.mjs';
+import StateInline from 'markdown-it/lib/rules_inline/state_inline.mjs';
 import { t, type Locale } from '../../i18n/index.js';
 import type { ModelFallbackState } from '../../types.js';
 import {
@@ -37,16 +38,68 @@ import type { FeedbackPolicy } from '../../services/feedback-policy.js';
 import type { StatuslineQuota } from '../../services/statusline-snapshot.js';
 import type { ReplyCardHeader } from './reply-card-style.js';
 import { TABLE_AUTO_ROW_STYLE } from './table-style.js';
+import {
+  DEGRADED_TABLE_MAX_ROWS,
+  VEGA_LITE_FENCE_LANGS,
+  convertVegaLiteFence,
+  degradedVegaLiteElements,
+  type CardRenderDiagnostic,
+  type VegaLiteConversion,
+} from './vega-lite-chart.js';
+import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
+import { logger } from '../../utils/logger.js';
+
+/** Room kept for chrome that callers attach *after* a card is built and
+ * fitted — today the on-call group button (≈483B of request body), added by
+ * `attachOncallGroupButton` in both `botmux send` and the daemon. Reserved
+ * unconditionally; it costs nothing when no button is attached. */
+export const CARD_LATE_CHROME_RESERVE_BYTES = 2_000;
+
+export type { CardRenderDiagnostic } from './vega-lite-chart.js';
 
 export { REPLY_CARD_FOOTER_MARKER } from './reply-card-footer-signature.js';
 
 const md = new MarkdownIt({ html: false, linkify: false, breaks: false });
+// This parser only classifies images for removal. Include schemes such as
+// file: that the HTML renderer rejects but Feishu may still treat as images.
+const imageScanMd = new MarkdownIt({ html: false, linkify: false, breaks: false });
+imageScanMd.validateLink = () => true;
+const imageRuleParser = new MarkdownIt();
+imageRuleParser.inline.ruler.enableOnly('image');
+const parseImage = imageRuleParser.inline.ruler.getRules('')[0];
 const MAX_LOCAL_HOME_LINK_REPAIRS = 256;
 /** Keep structured replies readable without letting heading-heavy model output
  *  multiply schema-v2 body elements without bound. Each promoted heading can
  *  split one prose buffer into another element, so six keeps ordinary cards
  *  bounded while still covering the sections in a typical result report. */
 const MAX_PROMOTED_CARD_HEADINGS = 6;
+/** Feishu recommends at most five charts per card. Byte size is not budgeted
+ * here: the only real limit is the 30KB card request body, which can only be
+ * measured once the whole card exists (see `fitChartsToCardBudget`). */
+const MAX_CARD_CHARTS = 5;
+
+interface CardLayoutBudget {
+  promotedHeadings: number;
+  charts: number;
+  diagnostics?: CardRenderDiagnostic[];
+}
+
+/** Every element produced for one ```vega-lite fence is tagged with the same
+ * group so the post-assembly budget pass can step it down without re-parsing.
+ * Stage 0 = chart, 1 = notice + 50-row table, 2 = notice + 10-row table,
+ * 3 = notice only. */
+interface ChartGroup {
+  stage: 0 | 1 | 2 | 3;
+  degraded: Extract<VegaLiteConversion, { ok: false }>;
+  diagnostics?: CardRenderDiagnostic[];
+}
+const chartGroups = new WeakMap<object, ChartGroup>();
+const STAGE_ROWS = [DEGRADED_TABLE_MAX_ROWS, DEGRADED_TABLE_MAX_ROWS, 10, 0] as const;
+
+function tagChartGroup(elements: any[], group: ChartGroup): any[] {
+  for (const element of elements) chartGroups.set(element, group);
+  return elements;
+}
 
 /** Canonical chrome for ordinary Bot Session reply cards. The CLI send path
  *  and daemon final-output fallback both spread this object so layout cannot
@@ -845,6 +898,106 @@ function unescapeFenceLines(input: string): string {
   return input.replace(/^[ ]{0,3}(?:\\`){3,}[^\n`]*$/gm, m => m.replace(/\\`/g, '`'));
 }
 
+/** Source markers let CommonMark identify actual image references without
+ * rewriting code examples, escaped syntax, or the surrounding Markdown. */
+function cardImageReferences(input: string): Array<{ position: number; source: string }> {
+  if (!input.includes('![')) return [];
+  const prefix = chooseLinkMarkerPrefix(input);
+  const positions: number[] = [];
+  const marked = input.replace(/\\.|!\[/gs, (match: string, offset: number) => {
+    if (match !== '![') return match;
+    const id = positions.push(offset) - 1;
+    return `${prefix}${id}x![`;
+  });
+  const marker = new RegExp(`${escapeRegExp(prefix)}(\\d+)x$`);
+  const images: Array<{ position: number; source: string }> = [];
+  const inspect = (tokens: Token[]): void => {
+    for (let i = 0; i < tokens.length; i++) {
+      const token = tokens[i];
+      if (token.type === 'image') {
+        const match = tokens[i - 1]?.content.match(marker);
+        if (match) images.push({ position: positions[Number(match[1])], source: token.attrGet('src') ?? '' });
+      }
+      if (token.children) inspect(token.children);
+    }
+  };
+  inspect(imageScanMd.parse(marked, {}));
+  return images.sort((a, b) => a.position - b.position);
+}
+
+/** Resolve real Markdown images, preserving code examples and untouched source.
+ * The image-only rule supplies exact source spans; the full parser above
+ * decides which occurrences are actually images rather than literal code. */
+export async function resolveCardMarkdownImages(
+  input: string,
+  resolveSource: (source: string) => Promise<string | undefined>,
+): Promise<string> {
+  input = unescapeFenceLines(input);
+  const references = cardImageReferences(input);
+  if (!references.length) return input;
+  const env: Record<string, unknown> = {};
+  imageScanMd.parse(input, env);
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const reference of references) {
+    if (reference.position < cursor || FEISHU_IMG_KEY.test(reference.source)) continue;
+    const state = new StateInline(input, imageScanMd, env, []);
+    state.pos = reference.position;
+    if (!parseImage(state, false)) continue;
+    const token = state.tokens.at(-1);
+    if (token?.type !== 'image' || token.attrGet('src') !== reference.source) continue;
+    const key = await resolveSource(reference.source);
+    if (!key || !FEISHU_IMG_KEY.test(key)) continue;
+    parts.push(input.slice(cursor, reference.position), `![${token.content}](${key})`);
+    cursor = state.pos;
+  }
+  return parts.join('') + input.slice(cursor);
+}
+
+function normalizeCardImages(input: string, omitAll = false): string {
+  const unsupported = new Set(cardImageReferences(input)
+    .filter(image => omitAll || !FEISHU_IMG_KEY.test(image.source)).map(image => image.position));
+  return input.replace(/!\[/g, (match: string, offset: number) =>
+    unsupported.has(offset) ? '[Image omitted] [' : match);
+}
+
+/** Last-resort image-free version of a rejected reply card. Keep the card
+ * envelope, text, tables, code and controls so existing delivery accounting
+ * can continue to use the same message type and provider UUID. */
+export function omitReplyCardImages(cardJson: string): string {
+  let card: unknown;
+  try { card = JSON.parse(cardJson); } catch { return cardJson; }
+  let changed = false;
+  const visit = (value: unknown, markdownFields?: ReadonlySet<string>): unknown => {
+    if (Array.isArray(value)) return value.map(child => visit(child, markdownFields));
+    if (!value || typeof value !== 'object') return value;
+    if ('tag' in value && value.tag === 'img') {
+      changed = true;
+      const alt = 'alt' in value ? value.alt : undefined;
+      const text = typeof alt === 'string' ? alt
+        : alt && typeof alt === 'object' && 'content' in alt && typeof alt.content === 'string'
+          ? alt.content : '';
+      return { tag: 'markdown', content: `[Image omitted] ${md.utils.escapeHtml(text).replace(/[\\`*_[\]<>!]/g, '\\$&')}`.trim() };
+    }
+    const tableFields = 'tag' in value && value.tag === 'table' && 'columns' in value && Array.isArray(value.columns)
+      ? new Set<string>(value.columns.flatMap((column: unknown) =>
+        column && typeof column === 'object' && 'data_type' in column && column.data_type === 'lark_md'
+          && 'name' in column && typeof column.name === 'string' ? [column.name] : []))
+      : undefined;
+    return Object.fromEntries(Object.entries(value).map(([key, child]) => {
+      if (typeof child === 'string' && (markdownFields?.has(key)
+        || ('tag' in value && (value.tag === 'markdown' || value.tag === 'lark_md') && key === 'content'))) {
+        const content = normalizeCardImages(child, true);
+        if (content !== child) changed = true;
+        return [key, content];
+      }
+      return [key, visit(child, key === 'rows' ? tableFields : undefined)];
+    }));
+  };
+  const result = visit(card);
+  return changed ? JSON.stringify(result) : cardJson;
+}
+
 /** Normalize source bytes that must be settled before the card is rendered. */
 export function prepareCardMarkdown(
   input: string,
@@ -926,17 +1079,21 @@ export function buildCardBodyElements(
   cwd = process.cwd(),
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
   imageMode = 'fit_horizontal',
+  diagnostics?: CardRenderDiagnostic[],
 ): any[] {
   if (!input) return [];
   // Recover model-escaped fences first so markdown-it can classify their
   // contents as code before local-link normalization inspects link tokens.
   input = prepareCardMarkdown(input, cwd, localHomeLinkMode);
+  // Only sanitize at the rendering boundary: sandbox relay preparation runs
+  // before --images uploads resolve img:N placeholders to real image keys.
+  input = normalizeCardImages(input);
   // Pre-pass: a line that is nothing but 2+ images renders as a side-by-side
   // image row (column_set) instead of stacked full-width images. Everything
   // else flows through the markdown element builder unchanged. Fence-aware so
   // image-looking lines inside ``` code blocks are left intact.
   const elements: any[] = [];
-  const layoutBudget = { promotedHeadings: 0 };
+  const layoutBudget: CardLayoutBudget = { promotedHeadings: 0, charts: 0, diagnostics };
   for (const seg of splitImageRowSegments(input, imageMode)) {
     if (seg.type === 'imgrow') elements.push(imageRowElement(seg.keys));
     else if (seg.type === 'img') elements.push(singleImageLayout(seg.key, imageMode, seg.alt));
@@ -947,7 +1104,7 @@ export function buildCardBodyElements(
 
 function buildMarkdownElements(
   input: string,
-  layoutBudget: { promotedHeadings: number },
+  layoutBudget: CardLayoutBudget,
 ): any[] {
   if (!input) return [];
   input = unescapeFenceLines(input);
@@ -1012,6 +1169,15 @@ function buildMarkdownElements(
       continue;
     }
 
+    if (t.type === 'fence' && VEGA_LITE_FENCE_LANGS.has((t.info || '').trim().split(/\s+/)[0]!.toLowerCase())) {
+      // A chart fence becomes a native Card 2.0 chart, or a notice plus a
+      // plain-text data table — never the raw spec (see vega-lite-chart.ts).
+      flushBuf();
+      elements.push(...buildVegaLiteElements(t.content, layoutBudget));
+      i++;
+      continue;
+    }
+
     if (t.type === 'fence' || t.type === 'code_block') {
       const fence = t.markup || '```';
       const info = (t.info || '').trim();
@@ -1047,6 +1213,101 @@ function buildMarkdownElements(
 
   flushBuf();
   return elements;
+}
+
+function buildVegaLiteElements(source: string, layoutBudget: CardLayoutBudget): any[] {
+  let result = convertVegaLiteFence(source);
+  if (result.ok) {
+    const rows = (result.element.chart_spec as { data: { values: Record<string, string | number | boolean | null>[] } }).data.values;
+    const fallback = { ok: false as const, reason: 'card_budget_exceeded', ...(result.title ? { title: result.title } : {}), rows };
+    if (layoutBudget.charts < MAX_CARD_CHARTS) {
+      layoutBudget.charts++;
+      return tagChartGroup([result.element], { stage: 0, degraded: fallback, diagnostics: layoutBudget.diagnostics });
+    }
+    // Over the per-card chart count: keep the data as a table.
+    result = { ...fallback, reason: 'too_many_charts' };
+  }
+  layoutBudget.diagnostics?.push({
+    kind: 'chart_degraded',
+    reason: result.reason,
+    ...(result.title ? { title: result.title } : {}),
+  });
+  const group: ChartGroup = { stage: 1, degraded: result };
+  return tagChartGroup(degradedVegaLiteElements(result), group);
+}
+
+/** Placeholder `receive_id` for sizing when the target chat is not known;
+ * real chat ids have the same length. */
+const SIZING_CHAT_ID = `oc_${'0'.repeat(32)}`;
+
+export interface CardBudgetResult {
+  /** Request body bytes after fitting, measured like the Feishu API call. */
+  bytes: number;
+  /** False when the card is still over budget after every chart group has
+   * been stepped down (i.e. the excess is not chart content). */
+  fits: boolean;
+}
+
+/**
+ * Step chart groups down (chart → 50-row table → 10-row table → notice) until
+ * the card's request body fits Feishu's 30KB card limit. Measures the real
+ * request (`turnReplyCardRequestBytes`: callback markers, envelope and the
+ * second JSON serialization of `content`), not the bare card JSON. Only
+ * elements produced for ```vega-lite fences are touched; the card is edited in
+ * place. `reserveBytes` leaves room for chrome added after this call.
+ */
+export function fitChartsToCardBudget(
+  card: { body?: { elements?: any[] } },
+  opts: { chatId?: string; reserveBytes?: number; diagnostics?: CardRenderDiagnostic[] } = {},
+): CardBudgetResult {
+  const elements = card.body?.elements;
+  const limit = TURN_REPLY_CARD_MAX_BYTES - (opts.reserveBytes ?? 0);
+  const measure = () => turnReplyCardRequestBytes(JSON.stringify(card), opts.chatId ?? SIZING_CHAT_ID);
+  let bytes = measure();
+  if (!elements || bytes <= limit) return { bytes, fits: bytes <= limit };
+  for (;;) {
+    // Collect contiguous runs belonging to one group that can still shrink.
+    const runs: Array<{ group: ChartGroup; start: number; end: number; size: number }> = [];
+    for (let index = 0; index < elements.length; index++) {
+      const group = chartGroups.get(elements[index]);
+      if (!group || group.stage >= 3) continue;
+      let end = index;
+      while (end + 1 < elements.length && chartGroups.get(elements[end + 1]) === group) end++;
+      runs.push({ group, start: index, end, size: Buffer.byteLength(JSON.stringify(elements.slice(index, end + 1)), 'utf8') });
+      index = end;
+    }
+    if (runs.length === 0) return { bytes, fits: false };
+    const largest = runs.reduce((best, run) => (run.size > best.size ? run : best));
+    const { group } = largest;
+    if (group.stage === 0) {
+      const sink = opts.diagnostics ?? group.diagnostics;
+      sink?.push({
+        kind: 'chart_degraded',
+        reason: 'card_budget_exceeded',
+        ...(group.degraded.title ? { title: group.degraded.title } : {}),
+      });
+      group.degraded = { ...group.degraded, reason: 'card_budget_exceeded' };
+    }
+    group.stage = (group.stage + 1) as ChartGroup['stage'];
+    const replacement = tagChartGroup(degradedVegaLiteElements(group.degraded, STAGE_ROWS[group.stage]), group);
+    elements.splice(largest.start, largest.end - largest.start + 1, ...replacement);
+    bytes = measure();
+    if (bytes <= limit) return { bytes, fits: true };
+  }
+}
+
+/** Budget pass for cards built inside this module and delivered by the
+ * daemon. Reserves room for late chrome (on-call button) and makes chart
+ * degradation or an unfixable overflow observable in the daemon log. */
+function fitBuiltCard(card: { body?: { elements?: any[] } }, label: string): void {
+  const diagnostics: CardRenderDiagnostic[] = [];
+  const result = fitChartsToCardBudget(card, { reserveBytes: CARD_LATE_CHROME_RESERVE_BYTES, diagnostics });
+  if (!result.fits) {
+    logger.warn(`[card] ${label}: request body ~${result.bytes}B still exceeds Feishu's 30KB card limit after chart degradation`);
+  }
+  if (diagnostics.length > 0) {
+    logger.warn(`[card] ${label}: degraded charts: ${diagnostics.map(item => item.reason).join(', ')}`);
+  }
 }
 
 // Existing multi-image rows retain their legacy payload for compatibility.
@@ -1112,8 +1373,7 @@ const IMG_ROW_LINE = /^ {0,3}(?:!\[[^\]]*\]\([^)\s]+\)\s*){2,}$/;
  * such key is promoted to a native `img` row — a model reply may emit a
  * `![](https://…) ![](…)` URL line (or other non-key src like `img_v2foo.png`),
  * and a native `img` element with a non-key as its "img_key" makes Feishu reject
- * the whole card. Non-key lines fall through to the markdown widget unchanged
- * (same as before this feature existed).
+ * the whole card. Non-key images are downgraded before this layout pass.
  */
 const FEISHU_IMG_KEY = /^img_v\d+_[A-Za-z0-9_-]+$/i;
 
@@ -1198,8 +1458,9 @@ export function buildImageCardElements(
   cwd = process.cwd(),
   localHomeLinkMode: LocalHomeLinkMode = 'filesystem',
   imageMode?: string,
+  diagnostics?: CardRenderDiagnostic[],
 ): any[] {
-  if (imageKeys.length === 0) return md ? buildCardBodyElements(md, cwd, localHomeLinkMode, imageMode) : [];
+  if (imageKeys.length === 0) return md ? buildCardBodyElements(md, cwd, localHomeLinkMode, imageMode, diagnostics) : [];
 
   const used = new Set<number>();
   const keyAt = (idx: number): string | null =>
@@ -1230,7 +1491,7 @@ export function buildImageCardElements(
   const trailing = imageKeys.map((k, i) => (used.has(i) ? '' : `![](${k})`)).filter(Boolean).join('\n\n');
   if (trailing) resolved = resolved ? `${resolved}\n\n${trailing}` : trailing;
 
-  return buildCardBodyElements(resolved, cwd, localHomeLinkMode, imageMode);
+  return buildCardBodyElements(resolved, cwd, localHomeLinkMode, imageMode, diagnostics);
 }
 
 /**
@@ -1269,6 +1530,8 @@ export function hasMarkdown(text: string): boolean {
  * suppressed, else custom. When brand, usage, and recipient are all absent the
  * whole footer (HR included) is omitted.
  */
+// No production send path calls buildMarkdownCard today (tests only); the
+// budget pass is kept so a future caller cannot reopen the 30KB gap.
 export function buildMarkdownCard(
   md: string,
   recipientOpenId?: string,
@@ -1290,7 +1553,9 @@ export function buildMarkdownCard(
     elements.push({ tag: 'hr' });
     elements.push(footer.element);
   }
-  return JSON.stringify(createReplyCard(elements));
+  const card = createReplyCard(elements);
+  fitBuiltCard(card, 'markdown_card');
+  return JSON.stringify(card);
 }
 
 /** Build the canonical final-answer card. Streaming/progress/session cards
@@ -1320,7 +1585,9 @@ export function buildCanonicalFinalReplyCard(opts: {
     locale: opts.locale,
   });
   if (footer) elements.push({ tag: 'hr' }, footer.element);
-  return JSON.stringify(createReplyCard(elements));
+  const card = createReplyCard(elements);
+  fitBuiltCard(card, 'final_reply');
+  return JSON.stringify(card);
 }
 
 /** Prefix every line with `> ` so Feishu's markdown widget renders it as a
@@ -1386,7 +1653,7 @@ export function buildContextualReplyCard(opts: {
     const u = userText.trim();
     elements.push({
       tag: 'markdown',
-      content: `**👤 ${t('card.you', undefined, locale)}**\n\n${quoteLines(u || t('common.empty_paren', undefined, locale))}`,
+      content: normalizeCardImages(`**👤 ${t('card.you', undefined, locale)}**\n\n${quoteLines(u || t('common.empty_paren', undefined, locale))}`),
     });
   }
 
@@ -1416,5 +1683,7 @@ export function buildContextualReplyCard(opts: {
     elements.push(footer.element);
   }
 
-  return JSON.stringify(createReplyCard(elements));
+  const card = createReplyCard(elements);
+  fitBuiltCard(card, 'contextual_reply');
+  return JSON.stringify(card);
 }

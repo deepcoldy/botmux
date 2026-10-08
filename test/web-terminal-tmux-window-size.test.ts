@@ -18,4 +18,19 @@ describe('web terminal tmux attach sizing', () => {
     // Bounded so a wedged tmux control socket cannot block the attach forever.
     expect(beforeSpawn).toContain('timeout: 3000')
   })
+
+  it('keeps a read-only viewer from resizing an owned tmux pipe session', () => {
+    const sharedRelayStart = workerSource.indexOf('// ── Shared relay (PtyBackend OR tmux pipe mode)')
+    const sharedRelayEnd = workerSource.indexOf('// Bind + EADDRINUSE', sharedRelayStart)
+    expect(sharedRelayStart).toBeGreaterThan(-1)
+    expect(sharedRelayEnd).toBeGreaterThan(sharedRelayStart)
+
+    const sharedRelay = workerSource.slice(sharedRelayStart, sharedRelayEnd)
+    expect(sharedRelay).toContain("(effectiveBackendType === 'tmux' && isPipeMode && !lastInitConfig?.adoptMode)")
+    expect(sharedRelay).toContain('if (readOnlyFollowsBackendGrid)')
+    expect(sharedRelay).toContain('backend?.getPaneSize?.() ?? { cols: renderCols, rows: renderRows }')
+    expect(sharedRelay).toContain('if (!result.backend && !readOnlyFollowsBackendGrid)')
+    expect(sharedRelay).toContain('broadcastOwnedTmuxReadOnlyFollowerGrid()')
+    expect(sharedRelay).not.toContain("hasWrite || effectiveBackendType !== 'remote-runner'")
+  })
 })

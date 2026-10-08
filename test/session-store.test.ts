@@ -75,6 +75,7 @@ import {
   createSession,
   createSessionWithOwnedMutation,
   getSession,
+  getSessionFresh,
   getOwnedSession,
   listSessions,
   listSessionsStrict,
@@ -91,6 +92,7 @@ import {
   persistActiveRemoteLineagesExactBatch,
   findActiveSessionsByRoot,
   findActiveSessionsByWorkingDirStrict,
+  findActiveSessionsByChatStrict,
   SessionStoreUnmigratedError,
   repairMissingChatScope,
   loadAllSessionsSnapshot,
@@ -1403,6 +1405,39 @@ describe('principal lane durable store', () => {
         'SELECT COUNT(*) AS n FROM principal_workspace_members WHERE source_session_id = ?',
       ).get(source.sessionId) as { n: number }).n).toBe(2);
     } finally { db.close(); }
+  });
+
+  it('freezes the network policy in shadow lanes and restores it without the XPI ingress flag', () => {
+    const source = sourceSession('root-shadow-network', 'on_source', 'ou_source');
+    source.backendType = 'pty';
+    source.sandbox = true;
+    source.sandboxNetwork = true;
+    source.sandboxNetworkPolicy = {
+      version: 1, public: { mode: 'allow' },
+      private: { mode: 'allowlist', rules: [{ cidr: '10.77.0.1', protocol: 'tcp', ports: [443] }] },
+      dnsServers: ['1.1.1.1'],
+    };
+    const frozen = structuredClone(source.sandboxNetworkPolicy);
+    updateSession(source);
+    expect(ensurePrincipalLaneSource({
+      sourceSessionId: source.sessionId,
+      caller: { senderType: 'user', kind: 'union', unionId: 'on_source' }, now,
+    }).status).toBe('ready');
+    const shadow = ensureShadowPrincipalLane({
+      sourceSessionId: source.sessionId,
+      identity: { larkAppId: appId, unionId: 'on_b', openId: 'ou_b' }, now,
+    });
+    if (shadow.status !== 'ready') throw new Error('expected ready shadow lane');
+    expect(shadow.session).toMatchObject({ sandbox: true, sandboxNetwork: true, sandboxNetworkPolicy: frozen });
+    // Mutate the actual stored source, including nested arrays: copying only
+    // the outer object must not weaken the child policy.
+    const storedSource = getOwnedSession(source.sessionId)!;
+    storedSource.sandboxNetworkPolicy!.private.rules![0]!.ports!.push(80);
+    storedSource.sandboxNetworkPolicy!.dnsServers!.push('8.8.8.8');
+    updateSession(storedSource);
+    expect(shadow.session.sandboxNetworkPolicy).toEqual(frozen);
+    init(appId);
+    expect(getOwnedSession(shadow.session.sessionId)?.sandboxNetworkPolicy).toEqual(frozen);
   });
 
   it('publishes one isolated worktree proof atomically and hydrates only that shadow cwd', async () => {
@@ -3181,6 +3216,52 @@ describe('createSession()', () => {
     expect(data[session.sessionId].title).toBe('Persisted');
   });
 
+  it('round-trips provider-neutral remote state and usage across store reloads', () => {
+    const session = createSession('chat-remote', 'root-remote', 'Remote Runner');
+    session.backendType = 'remote-runner';
+    session.remoteBackendState = {
+      version: 1,
+      provider: 'example-provider',
+      generation: 4,
+      remoteSessionId: 'compute-4',
+      agentThreadId: 'thread-stable',
+      providerState: { runtimeSubpath: 'sessions/four' },
+    };
+    session.remoteRunnerUsage = {
+      generation: 4,
+      snapshot: {
+        context: { usedTokens: 12, windowTokens: 100, percentUsed: 12 },
+        tokens: { in: 10, out: 2 },
+        model: 'provider-model',
+        reasoningEffort: 'provider-effort',
+      },
+    };
+    updateSession(session);
+
+    init('other-app');
+    init('test-app');
+    expect(getSessionFresh(session.sessionId)).toMatchObject({
+      backendType: 'remote-runner',
+      remoteBackendState: {
+        version: 1,
+        provider: 'example-provider',
+        generation: 4,
+        remoteSessionId: 'compute-4',
+        agentThreadId: 'thread-stable',
+        providerState: { runtimeSubpath: 'sessions/four' },
+      },
+      remoteRunnerUsage: {
+        generation: 4,
+        snapshot: {
+          context: { usedTokens: 12, windowTokens: 100, percentUsed: 12 },
+          tokens: { in: 10, out: 2 },
+          model: 'provider-model',
+          reasoningEffort: 'provider-effort',
+        },
+      },
+    });
+  });
+
   it('should default chatType to undefined when not provided', () => {
     const session = createSession('chat1', 'root1', 'No ChatType');
     expect(session.chatType).toBeUndefined();
@@ -4203,6 +4284,68 @@ describe('Multi-bot isolation', () => {
 });
 
 // ─── findActiveSessionsByRoot() — cross-bot lookup ───────────────────────
+
+describe('findActiveSessionsByChatStrict()', () => {
+  it('includes chat and thread sessions across bots but excludes closed and other groups', () => {
+    init('app-A');
+    const a = createSession('oc_target', 'oc_target', 'A', 'group', 'chat');
+    createSession('oc_other', 'oc_other', 'Other', 'group', 'chat');
+    init('app-B');
+    const b = createSession('oc_target', 'om_topic', 'B', 'group', 'thread');
+    const closed = createSession('oc_target', 'om_closed', 'Closed', 'group', 'thread');
+    closeSession(closed.sessionId);
+    expect(findActiveSessionsByChatStrict('oc_target').map(s => s.sessionId).sort()).toEqual([a.sessionId, b.sessionId].sort());
+  });
+  it('refuses incomplete store enumeration', () => {
+    init('app-A'); fsControl.failReaddir = true;
+    expect(() => findActiveSessionsByChatStrict('oc_target')).toThrow(/simulated readdir denial/);
+  });
+  it('retains the owning bot for legacy peer rows without larkAppId', () => {
+    init('app-A');
+    const session = createSession('oc_target', 'oc_target', 'A', 'group', 'chat');
+    init('app-B');
+    const db = new DatabaseSync(join(tempDir, 'session-stores', 'app-A', 'sessions.db'));
+    try {
+      const { larkAppId: _appId, ...legacy } = session;
+      db.prepare('UPDATE sessions SET row = ? WHERE session_id = ?').run(JSON.stringify(legacy), session.sessionId);
+    } finally { db.close(); }
+    expect(findActiveSessionsByChatStrict('oc_target')).toEqual([
+      expect.objectContaining({ sessionId: session.sessionId, larkAppId: 'app-A' }),
+    ]);
+  });
+  it('refuses malformed active rows in a peer store', () => {
+    init('app-A');
+    const session = createSession('oc_target', 'oc_target', 'A', 'group', 'chat');
+    init('app-B');
+    const db = new DatabaseSync(join(tempDir, 'session-stores', 'app-A', 'sessions.db'));
+    try {
+      db.prepare('UPDATE sessions SET row = ? WHERE session_id = ?').run('{"status":"active","chatId":"oc_target"}', session.sessionId);
+    } finally { db.close(); }
+    expect(() => findActiveSessionsByChatStrict('oc_target')).toThrow(/malformed active session row/i);
+  });
+
+  it('refuses an unmigrated known peer and an inconclusive bot inventory', () => {
+    init('app-B');
+    writeFileSync(join(tempDir, 'sessions-app-A.json'), '{not parsed by cross-process readers');
+    const botsPath = join(tempDir, 'bots.json');
+    const saved = process.env.BOTS_CONFIG;
+    process.env.BOTS_CONFIG = botsPath;
+    try {
+      expect(() => findActiveSessionsByChatStrict('oc_target')).toThrow(/cannot read bots\.json/);
+      writeFileSync(botsPath, '{invalid');
+      expect(() => findActiveSessionsByChatStrict('oc_target')).toThrow(/not valid JSON/);
+      writeFileSync(botsPath, JSON.stringify({ bots: [{ larkAppId: 'app-A' }, { larkAppId: 'app-B' }] }));
+      expect(() => findActiveSessionsByChatStrict('oc_target')).toThrow(SessionStoreUnmigratedError);
+      // Removed bots' abandoned JSON is not a pending migration.
+      writeFileSync(botsPath, JSON.stringify({ bots: [{ larkAppId: 'app-B' }] }));
+      expect(findActiveSessionsByChatStrict('oc_target')).toEqual([]);
+      expect(existsSync(join(tempDir, 'session-stores', 'app-A', 'sessions.db'))).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env.BOTS_CONFIG;
+      else process.env.BOTS_CONFIG = saved;
+    }
+  });
+});
 
 describe('findActiveSessionsByWorkingDirStrict()', () => {
   it('finds active sessions across stores by canonical worktree path', () => {

@@ -203,7 +203,7 @@ describe('closeSession leaves the streaming card alone', () => {
       });
 
       await expect(workerPool.closeSession(s.sessionId, { awaitWorkerExit: false })).resolves.toEqual({
-        ok: true, outcome: 'closed', alreadyClosed: false, known: true,
+        ok: true, outcome: 'closed', alreadyClosed: false, known: true, closedCardPatchQueued: true,
       });
       await unpinStarted.promise;
       expect(unpinMessage).toHaveBeenCalledWith('app-close-card', 'om_stream_card');

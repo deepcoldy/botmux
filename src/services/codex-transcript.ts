@@ -862,6 +862,24 @@ function joinTextBlocks(content: unknown, kind: 'input_text' | 'output_text'): s
   return parts.join('');
 }
 
+/** Codex persists automatic context refreshes as role=user, including mid-turn
+ * date/subagent updates. They must not look like local input to an adopt queue.
+ * Explicit content kinds win over text so a user can quote an environment block.
+ * Older rollouts lack kinds; recognize only a complete standalone wrapper there. */
+function isCodexEnvironmentUpdate(metadata: unknown, text: string): boolean {
+  if (metadata && typeof metadata === 'object' && 'content_item_kinds' in metadata) {
+    const kinds: unknown = metadata.content_item_kinds;
+    return Array.isArray(kinds) && kinds.length > 0
+      && kinds.every((kind: unknown) => kind === 'environments.environment_context');
+  }
+  const trimmed = text.trim();
+  const opening = '<environment_context>';
+  const closing = '</environment_context>';
+  return trimmed.length >= opening.length + closing.length
+    && trimmed.startsWith(opening)
+    && trimmed.indexOf(closing) === trimmed.length - closing.length;
+}
+
 /** Normalise a `turn_aborted.reason` into a stable, bounded error code for the
  *  durable-delivery terminal outcome. Mirrors the traex reader. */
 function codexAbortErrorCode(reason: unknown): string {
@@ -1411,6 +1429,7 @@ export function drainCodexRollout(
     if (obj.type === 'response_item' && p.type === 'message' && p.role === 'user') {
       const text = joinTextBlocks(p.content, 'input_text');
       if (!text) continue;
+      if (isCodexEnvironmentUpdate(p.internal_chat_message_metadata_passthrough, text)) continue;
       events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text });
       continue;
     }

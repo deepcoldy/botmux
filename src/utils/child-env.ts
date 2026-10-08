@@ -224,6 +224,13 @@ export const REDACTED_CHILD_ENV_KEYS = [
   'GITHUB_TOKEN',
   'GH_TOKEN',
   'ONCALL_SERVICE_SECRET',
+  // node:child_process.fork() injects these into the worker so Node can attach
+  // its IPC channel on startup. They belong to that exact parent/worker edge.
+  // Forwarding them to an ordinary child (notably a Python Remote Runner which
+  // then launches a Node CLI) makes the nested Node process treat an unrelated
+  // fd as IPC and can abort in uv__io_poll with errno == EEXIST.
+  'NODE_CHANNEL_FD',
+  'NODE_CHANNEL_SERIALIZATION_MODE',
   // Startup-only private secret-file path. A session CLI is not the local
   // companion process and must not learn even the credential's location.
   // Kept as a literal because this boundary module is dependency-free.
@@ -432,6 +439,9 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // Keep `botmux bots list` and ready-gated CLIs aligned with daemon config.
   'BOTMUX_LARK_LIST_BOTS_API_ENABLED',
   'BOTMUX_LARK_LIST_BOTS_API_TIMEOUT_MS',
+  // Host-resolved multi-topic orchestration switch. Managed panes must not
+  // inherit a stale value from a co-tenant tmux server.
+  'BOTMUX_MULTI_TOPIC_ENABLED',
   'BOTMUX_READY_COMMAND',
   // Per-session computed shell command string: the user's own statusLine
   // command that `botmux statusline` chains to after persisting the snapshot.

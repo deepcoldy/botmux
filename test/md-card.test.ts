@@ -1516,11 +1516,11 @@ describe('buildImageCardElements', () => {
     expect(mdElements(out).map(e => e.content).join('\n')).toContain('![](img_v2_a)');
   });
 
-  it('group with all indices out of range → literal text preserved', () => {
+  it('group with all indices out of range → readable omitted-image notice', () => {
     const out = buildImageCardElements('![](img:7,8)', [K[0]]);
     expect(out.some(e => e.tag === 'column_set')).toBe(false);
     const md = mdElements(out).map(e => e.content).join('');
-    expect(md).toContain('![](img:7,8)');
+    expect(md).toContain('[Image omitted] [](img:7,8)');
   });
 });
 

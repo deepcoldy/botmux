@@ -178,6 +178,7 @@ import { restoreActiveSessions, resumeSession } from '../src/core/session-manage
 import {
   closeSession,
   ensureOrdinaryTurnRecoveryAttached,
+  forkWorker,
   forkAdoptWorker,
   killStalePids,
   promoteQueuedActivationTail,
@@ -197,6 +198,7 @@ beforeEach(() => {
   sessionStore.init('app_test');
   wp.registry = null;
   vi.mocked(closeSession).mockClear();
+  vi.mocked(forkWorker).mockReset();
   vi.mocked(ensureOrdinaryTurnRecoveryAttached).mockClear();
   vi.mocked(promoteQueuedActivationTail).mockReset();
   vi.mocked(promoteQueuedActivationTail).mockReturnValue(true);
@@ -207,7 +209,7 @@ afterEach(() => {
 });
 
 function makeClosedSession(overrides: Partial<Parameters<typeof sessionStore.createSession>[0]> & {
-  scope?: 'thread' | 'chat'; larkAppId?: string; workingDir?: string; cliId?: any;
+  scope?: 'thread' | 'chat'; larkAppId?: string; workingDir?: string; cliId?: any; backendType?: any;
 } = {}): ReturnType<typeof sessionStore.createSession> {
   const s = sessionStore.createSession(
     overrides.chatId ?? 'oc_chat1',
@@ -218,6 +220,7 @@ function makeClosedSession(overrides: Partial<Parameters<typeof sessionStore.cre
   s.larkAppId = overrides.larkAppId ?? 'app_test';
   s.workingDir = overrides.workingDir ?? '/tmp/proj';
   s.cliId = overrides.cliId ?? 'claude-code';
+  s.backendType = overrides.backendType;
   s.scope = overrides.scope ?? 'thread';
   sessionStore.updateSession(s);
   sessionStore.closeSession(s.sessionId);
@@ -268,6 +271,126 @@ describe('resumeSession', () => {
       const r = await resumeSession(s.sessionId, new Map());
       expect(r.ok).toBe(false);
       if (!r.ok) expect(r.error).toBe('adopt_unsupported');
+    });
+
+    it.each([
+      ['remote CLI id', { cliId: 'remote-runner' }],
+      ['remote backend stamp', { cliId: 'codex', backendType: 'remote-runner' }],
+    ])('starts provider recovery immediately for a closed %s', async (_name, identity) => {
+      const closed = makeClosedSession(identity);
+      const map = new Map<string, DaemonSession>();
+      vi.mocked(forkWorker).mockImplementationOnce((ds: any, prompt: any, resume: any, opts: any) => {
+        ds.worker = { killed: false };
+        opts?.onAdmission?.('accepted');
+        expect(prompt).toBe('');
+        expect(resume).toEqual({ resume: true, remoteResumeMode: 'rebuild' });
+        return true;
+      });
+
+      const result = await resumeSession(closed.sessionId, map);
+
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.recoveryPending).toBe(true);
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('active');
+      expect(map.size).toBe(1);
+      expect(forkWorker).toHaveBeenCalledTimes(1);
+      expect(closeSession).not.toHaveBeenCalled();
+    });
+
+    it('rolls a remote resume back to closed when no provider process is admitted', async () => {
+      const closed = makeClosedSession({
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+      });
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+      vi.mocked(forkWorker).mockImplementationOnce((_ds: any, _prompt: any, _resume: any, opts: any) => {
+        opts?.onAdmission?.('rejected');
+        return true;
+      });
+
+      await expect(resumeSession(closed.sessionId, map)).resolves.toEqual({
+        ok: false,
+        error: 'resume_start_failed',
+      });
+      expect(closeSession).not.toHaveBeenCalledWith(closed.sessionId);
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
+      expect(map.size).toBe(0);
+    });
+
+    it('returns an admitted remote resume to closed when the worker exits before ready', async () => {
+      const closed = makeClosedSession({
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+      });
+      const map = new Map<string, DaemonSession>();
+      let onPreReadyExit: (() => void) | undefined;
+      vi.mocked(forkWorker).mockImplementationOnce((ds: any, _prompt: any, _resume: any, opts: any) => {
+        ds.worker = { killed: false };
+        opts?.onAdmission?.('accepted');
+        onPreReadyExit = opts?.onPreReadyExit;
+        return true;
+      });
+
+      const result = await resumeSession(closed.sessionId, map);
+      expect(result.ok).toBe(true);
+      expect(onPreReadyExit).toBeTypeOf('function');
+      onPreReadyExit?.();
+
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
+      expect(map.size).toBe(0);
+      expect(closeSession).not.toHaveBeenCalledWith(closed.sessionId);
+    });
+
+    it('returns an admitted remote resume to closed when the backend exits after worker ready', async () => {
+      const closed = makeClosedSession({
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+      });
+      const map = new Map<string, DaemonSession>();
+      let onRemoteBackendStartupExit: (() => boolean) | undefined;
+      vi.mocked(forkWorker).mockImplementationOnce((ds: any, _prompt: any, _resume: any, opts: any) => {
+        ds.worker = { killed: false };
+        opts?.onAdmission?.('accepted');
+        onRemoteBackendStartupExit = opts?.onRemoteBackendStartupExit;
+        return true;
+      });
+
+      const result = await resumeSession(closed.sessionId, map);
+      expect(result.ok).toBe(true);
+      expect(onRemoteBackendStartupExit).toBeTypeOf('function');
+      expect(onRemoteBackendStartupExit?.()).toBe(true);
+
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('closed');
+      expect(map.size).toBe(0);
+      expect(closeSession).not.toHaveBeenCalledWith(closed.sessionId);
+    });
+
+    it('reports reconciliation when a rejected remote resume cannot be closed again', async () => {
+      const closed = makeClosedSession({
+        cliId: 'remote-runner',
+        backendType: 'remote-runner',
+      });
+      const map = new Map<string, DaemonSession>();
+      wp.registry = map;
+      vi.mocked(forkWorker).mockImplementationOnce((ds: any, _prompt: any, _resume: any, opts: any) => {
+        ds.session.remoteBackendState = {
+          version: 1,
+          provider: 'reference',
+          generation: 2,
+          remoteSessionId: 'replacement',
+        };
+        sessionStore.updateSession(ds.session);
+        opts?.onAdmission?.('rejected');
+        return true;
+      });
+
+      await expect(resumeSession(closed.sessionId, map)).resolves.toEqual({
+        ok: false,
+        error: 'resume_reconciliation_required',
+      });
+      expect(sessionStore.getSession(closed.sessionId)?.status).toBe('active');
+      expect(map.size).toBe(1);
     });
 
     it('Plan B: a closed meeting-agent session resumes as an ordinary chat session (no vc_receiver_managed refusal)', async () => {

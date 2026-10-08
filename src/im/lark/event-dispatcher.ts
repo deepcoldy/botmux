@@ -16,7 +16,7 @@ import { logger } from '../../utils/logger.js';
 import { BoundedMap } from '../../utils/bounded-map.js';
 import { serializeByAnchor } from '../../utils/anchor-serializer.js';
 import { parseSlashCommandInvocation, resolvePassthroughCommands } from '../../core/command-handler.js';
-import { isTopicHeader, parseTopicHeader, parseTopicHeaderWithLifecycleAliases } from '../../core/topic-header.js';
+import { isTopicHeader, parseTopicHeader } from '../../core/topic-header.js';
 import { commandTriggerArgs, matchCommandTrigger, type CommandTriggerMatch } from '../../services/command-trigger.js';
 import { shouldAutoStartOnNewTopic } from '../../core/auto-start.js';
 import { resolveNonsupportMessage, stripBotMentions, stripLeadingMentions, mentionOpenId, mentionAppId, extractMentionIdentities, messageMentionsBot, type MentionIdentity } from './message-parser.js';
@@ -67,7 +67,7 @@ import { hasTriggeredMessage, markMessageTriggered, _resetCacheForTest as _reset
 import { ensureDefaultOncallBound } from '../../services/oncall-store.js';
 import { ensureSignedChatDefault } from '../../services/signed-chat-defaults.js';
 import { getSessionGroup } from '../../services/session-groups-store.js';
-import { resolveRegularGroupMode, resolveGroupMentionMode, type GroupMentionMode } from '../../services/chat-reply-mode-store.js';
+import { resolveRegularGroupMode, resolveGroupMentionMode, isSoloGroupMentionBypassEnabled, type GroupMentionMode } from '../../services/chat-reply-mode-store.js';
 import { buildSummaryCommandPrompt, type SummaryChatKind, type SummaryCommandMatch, type SummaryCommandRuntimeContext } from './summary-command.js';
 import { DEFAULT_SUMMARY_PROMPT, summaryRangeFromBotConfig } from '../../services/summary-range-store.js';
 import { isSubstituteEnabledForChat } from '../../services/substitute-chat-toggle-store.js';
@@ -87,6 +87,8 @@ import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/g
 import { readPeerCrossRef, writePeerCrossRef } from '../../services/peer-cross-ref-store.js';
 import { resolveCardActionAckTimeoutMs } from '../../core/card-action-ack.js';
 import { DROPPED_REACTION_EMOJI_TYPE } from '../../core/pending-response.js';
+import type { DurableInboxStore } from '../../services/durable-coordination.js';
+import { enqueueDurableLarkMessage } from '../../services/durable-inbox-shadow.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
 const hallEchoReplied = new Set<string>();
@@ -2372,7 +2374,7 @@ async function sendGrantRequestToApproverDm(o: {
 
 /**
  * Check group message addressing:
- * - 'allowed'     -> sender is allowed, bot was @mentioned or solo group
+ * - 'allowed'     -> sender is allowed, bot was @mentioned or enabled solo-group bypass applies
  * - 'not_allowed' -> bot was @mentioned but sender is not in allowlist
  * - 'ignore'      -> not addressed to bot at all
  */
@@ -2388,16 +2390,15 @@ export async function checkGroupMessageAccess(
     return isAllowed ? 'allowed' : 'not_allowed';
   }
 
-  // No @mention — only allow if sender is the sole human in the group
-  // AND this is the only bot in the chat. With multiple bots, require @mention
-  // to disambiguate.
+  // No @mention — the enabled solo-group bypass requires both a sole human
+  // and a sole bot. With multiple bots, require @mention to disambiguate.
   //
   // 若消息 @ 了别的具体成员（mentionsAnotherMember），群必然不是 1人1bot——
   // 只有群成员能被 @，多出的那个 @ 本身就是人数变化的证据。上游可能还抱着
   // 陈旧缓存 {1,1}（刚拉了新 bot 的 TTL 窗口），这会直接跳过人数查询落到
   // 'ignore'，挡住「用户 @ 新 bot、老 bot 跟着回复」。群聊 @ 策略 never/ambient
   // 在调用方（relax 条款）已先行结算，这里不受影响。
-  if (isAllowed && !mentionsAnotherMember(larkAppId, message)) {
+  if (isAllowed && isSoloGroupMentionBypassEnabled(larkAppId, chatId) && !mentionsAnotherMember(larkAppId, message)) {
     const { userCount, botCount } = await getGroupStats(larkAppId, chatId);
     logger.debug(`Group user count: ${userCount}, bot count: ${botCount}`);
     if (userCount <= 1 && botCount <= 1) {
@@ -2469,6 +2470,9 @@ export interface RoutingContext {
   messageListener?: MessageListenerMatch;
   /** Earlier topic seed coalesced into this root-linked clarification. */
   forwardSeedData?: any;
+  /** runtime 级联的正文项以同一条消息重入 handleThreadReply 时置位：跳过已在首次入站跑过的
+   *  一次性副作用（thread.reply hook、learnFromMentions），且不被级联在飞的推迟闸拦住。 */
+  cascadeBodyReentry?: true;
   /** Set by the session-group birth flow (p2pMode='group') after it has
    *  re-homed this turn from a DM into a freshly-created session group —
    *  prevents the birth logic from re-triggering on the rewritten context. */
@@ -2845,12 +2849,15 @@ export function markForwardFollowupsSessionsReady(larkAppId: string): void {
 }
 
 export interface EventHandlers {
+  /** Exact host-installed capture. Must synchronously persist before returning
+   * true; thrown persistence errors must not fall through to ordinary routing. */
+  captureHumanInput?: (data: any) => boolean;
   handleCardAction: (data: any, larkAppId: string) => Promise<any>;
   handleNewTopic: (data: any, ctx: RoutingContext) => Promise<void>;
   handleThreadReply: (data: any, ctx: RoutingContext) => Promise<void>;
   /** Validate a syntactically valid topic header before routing mutates scope.
    * The daemon supplies the same semantic resolver used by handleNewTopic. */
-  validateTopicHeader?: (header: import('../../core/topic-header.js').TopicHeader, larkAppId: string) => boolean;
+  validateTopicHeader?: (header: import('../../core/topic-header.js').TopicHeader, larkAppId: string) => boolean | Promise<boolean>;
   /** Optional live principal-lane adapter. It runs after dispatcher trust and
    * message-shape gates but before the legacy chat-anchor serializer. Returning
    * false preserves the legacy path byte-for-byte. */
@@ -3008,22 +3015,22 @@ function stripHeaderMentions(rawText: string, message: any, larkAppId: string): 
  * Already-thread messages (real Lark 话题, p2p, 话题群) are left alone:
  * the prefix is still stripped downstream by handleNewTopic.
  */
-export function maybeApplyForceTopicOverride(
+export async function maybeApplyForceTopicOverride(
   routing: { scope: 'thread' | 'chat'; anchor: string; forceTopicApplied?: boolean },
   message: any,
   messageId: string,
   larkAppId: string,
-  validateTopicHeader?: (header: import('../../core/topic-header.js').TopicHeader, larkAppId: string) => boolean,
-): boolean {
+  validateTopicHeader?: (header: import('../../core/topic-header.js').TopicHeader, larkAppId: string) => boolean | Promise<boolean>,
+): Promise<boolean> {
   if (routing.scope !== 'chat') return false;
   const rawText = extractMessageTextForRouting(message);
   if (!rawText) return false;
   const stripped = stripHeaderMentions(rawText, message, larkAppId);
   // 指令头（`[标题] /t …`）与生命周期别名 `/th` `/tw` 走同一条判定。语法与
   // 完整规格都校验成功后才能翻 scope；否则错误必须留在原 chat 中，不能先产生
-  // 新话题副作用。
-  const header = parseTopicHeaderWithLifecycleAliases(stripped);
-  if (!isTopicHeader(header) || (validateTopicHeader && !validateTopicHeader(header, larkAppId))) return false;
+  // 新话题副作用。规格校验（resolveTopicSpec）要查本地 git，所以这里是 async。
+  const header = parseTopicHeader(stripped);
+  if (!isTopicHeader(header) || (validateTopicHeader && !await validateTopicHeader(header, larkAppId))) return false;
   routing.scope = 'thread';
   routing.anchor = messageId;
   // 把「这条路由是 `/t` 翻出来的」记在 ctx 上，让下游 handler 能对**它自己没做过的
@@ -3108,7 +3115,7 @@ async function maybeFoldMentionedRegularGroupThreadToChat(input: {
   if (threadId.startsWith('omt_') && resolveRegularGroupMode(larkAppId, chatId) === 'chat-topic') return undefined;
   const rawText = extractMessageTextForRouting(message);
   if (rawText) {
-    if (isTopicHeader(parseTopicHeaderWithLifecycleAliases(stripHeaderMentions(rawText, message, larkAppId)))) return undefined;
+    if (isTopicHeader(parseTopicHeader(stripHeaderMentions(rawText, message, larkAppId)))) return undefined;
   }
 
   // In a regular group, `chat` and `shared` both mean "use the group's one
@@ -3221,7 +3228,7 @@ async function isExplicitP2pTopic(input: {
       // The /repo worktree validator is not available here; a root that truly
       // materialized a topic already passed it when the seed was routed.
       const stripped = stripHeaderMentions(rawText, { mentions: root.mentions }, larkAppId);
-      if (!isTopicHeader(parseTopicHeaderWithLifecycleAliases(stripped))) return false;
+      if (!isTopicHeader(parseTopicHeader(stripped))) return false;
       recordP2pForceTopicRoot(larkAppId, rootId, chatId);
       return true;
     } catch (err) {
@@ -3861,7 +3868,13 @@ async function processCommentEvent(
  * Create and start the Lark WSClient with event dispatching.
  * Returns the WSClient instance for lifecycle management.
  */
-export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: string, handlers: EventHandlers, brand: Brand = 'feishu'): Lark.WSClient {
+export function startLarkEventDispatcher(
+  larkAppId: string,
+  larkAppSecret: string,
+  handlers: EventHandlers,
+  brand: Brand = 'feishu',
+  durableInboxShadow?: DurableInboxStore,
+): Lark.WSClient {
   const forwardFollowups = new ForwardFollowupBuffer<PendingForwardTopicPayload>(
     config.daemon.forwardFollowupWaitMs,
     err => logger.error(`Error flushing delayed topic seed: ${err}`),
@@ -4216,7 +4229,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // brand-new {thread, messageId} anchor. forceTopicApplied also suppresses
         // the shared-topic fold below — a `/t` seed wins over shared, same
         // precedence as the human path.
-        const forcedTopic = maybeApplyForceTopicOverride(ctx, message, messageId, larkAppId, handlers.validateTopicHeader);
+        const forcedTopic = await maybeApplyForceTopicOverride(ctx, message, messageId, larkAppId, handlers.validateTopicHeader);
         if (forcedTopic) {
           logger.info(`[/t] Force-topic override (bot sender): msg=${messageId.substring(0, 12)} → thread-scope, anchor=msg`);
         }
@@ -4569,7 +4582,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // is currently active in this chat.
       const forceTopicApplied = substituteTrigger
         ? false
-        : maybeApplyForceTopicOverride(routing, message, messageId, larkAppId, handlers.validateTopicHeader);
+        : await maybeApplyForceTopicOverride(routing, message, messageId, larkAppId, handlers.validateTopicHeader);
       if (forceTopicApplied) {
         logger.info(`[/t] Force-topic override: msg=${messageId.substring(0, 12)} → thread-scope, anchor=msg`);
       }
@@ -4727,7 +4740,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // Permission gating — same shape as before, just keyed on
       // `ownsSession` (anchor-aware) instead of "rootId presence":
       //
-      //   ownsSession + 1v1 group → relax (no @mention required)
+      //   ownsSession + 1v1 group → relax when solo-group bypass is enabled
       //   ownsSession + multi     → require @mention
       //   !ownsSession (group)    → require @mention + allowlist
       //   p2p                     → allowlist only
@@ -4735,13 +4748,14 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       let commandTrigger: CommandTriggerMatch | undefined;
       if (chatType === 'group') {
         const mentionMode = resolveGroupMentionMode(larkAppId, chatId);
+        const soloGroupMentionBypass = isSoloGroupMentionBypassEnabled(larkAppId, chatId);
         // 消息里 @ 了别的具体成员,就已经证明群不是 1人1bot（只有群成员能被 @）——
         // 此刻末条 solo 放行必然不成立,而 stats 只被末条消费,直接跳过这次（可能
         // 昂贵的）人数查询。这在「刚拉了新 bot、用户 @ 新 bot」窗口里尤为重要：
         // 拦截老 bot 的同时不再为它反复刷新陈旧缓存。
         const mentionsOther = mentionsAnotherMember(larkAppId, message);
         let stats: { userCount: number; botCount: number } | null = null;
-        if (ownsSession && !replyRootId && !mentionsOther && mentionMode !== 'never') {
+        if (soloGroupMentionBypass && ownsSession && !replyRootId && !mentionsOther && mentionMode !== 'never') {
           stats = await getGroupStats(larkAppId, chatId);
         }
         // 免@ 斜杠命令（commandTriggers）：与「群聊 @ 策略」正交 —— 它不放开整个群
@@ -4802,7 +4816,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
         // 多人群里旁人不 @ 也会触发 bot）。现在与普通群共用同一套「群聊 @ 策略」:
         // 默认 'always' 在多人群里必须 @，想要话题内免@续话就把 mentionMode 配成
         // 'topic'（下方条款已同时覆盖话题群 thread 与普通群 shared topic），
-        // 'never'/'ambient' 亦按各自语义生效。1人1bot 的 solo 群仍走末条放行。
+        // 'never'/'ambient' 亦按各自语义生效。1人1bot 群在 solo 开关启用时走末条放行。
         // 注：pairedForwardSeed 仅在 never/ambient 模式下产生，且 ambient redirect
         // 已在配对前排除，故 isAllowed=true 时下方 never/ambient 条款必然放行；
         // 不在此单独加 clause，以免 isAllowed=false 时绕过权限检查。
@@ -4817,7 +4831,7 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
           || (isAllowed && mentionMode === 'ambient' && !mentionsOther)
           || (isAllowed && mentionMode === 'topic' && ownsSession && !!message.thread_id && !mentionsOther)
           || commandTriggerRelax
-          || (ownsSession && isAllowed && !!stats && !mentionsOther && stats.userCount <= 1 && stats.botCount <= 1);
+          || (soloGroupMentionBypass && ownsSession && isAllowed && !!stats && !mentionsOther && stats.userCount <= 1 && stats.botCount <= 1);
         if (commandTriggerRelax) {
           logger.info(
             `[command-trigger:${larkAppId}] ${commandTrigger?.cmd} 免@ 命中` +
@@ -5201,6 +5215,12 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
     'im.message.reaction.created_v1': () => {},
     'im.message.reaction.deleted_v1': () => {},
     'im.message.receive_v1': (data: any) => {
+      // The SDK acknowledges when this callback returns. Capture before the
+      // ordinary ACK-safe async scheduler, or a crash could lose accepted input.
+      if (handlers.captureHumanInput?.(data)) {
+        if (data?.message?.message_id) markMessageTriggered(larkAppId, data.message.message_id);
+        return;
+      }
       // Dedupe by message_id (stable across re-pushes / event_id re-mints /
       // daemon restarts), persisted so the 6h re-push tier or a restart can't
       // replay an already-handled message. Fall back to the in-memory event-id
@@ -5218,10 +5238,33 @@ export function startLarkEventDispatcher(larkAppId: string, larkAppSecret: strin
       // execution fence after aliases and chat mode are resolved.
       const scheduled = scheduleAckSafeEvent(
         eventKey,
-        () => serializeByAnchor(
-          ingressAnchor,
-          () => processMessageEvent(data, seedRoutingGate),
-        ),
+        () => {
+          // Shadow ingestion begins only after the callback has returned to the
+          // SDK ACK path. It runs beside the existing SQLite route and cannot
+          // suppress or delay that route on failure. `primary` remains blocked
+          // until a durable claim loop owns processing instead of this mirror.
+          if (durableInboxShadow) {
+            void enqueueDurableLarkMessage(durableInboxShadow, {
+              larkAppId,
+              eventId: eventKey,
+              partitionKey: ingressAnchor,
+              data,
+            }).then(result => {
+              if (result.kind === 'conflict') {
+                logger.error(`[durable-inbox:${larkAppId}] conflicting duplicate event ${eventKey}`);
+              }
+            }).catch(error => {
+              logger.error(
+                `[durable-inbox:${larkAppId}] shadow enqueue failed for ${eventKey}: `
+                + `${error instanceof Error ? error.message : String(error)}`,
+              );
+            });
+          }
+          return serializeByAnchor(
+            ingressAnchor,
+            () => processMessageEvent(data, seedRoutingGate),
+          );
+        },
         'message event',
         claim,
       );

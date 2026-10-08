@@ -75,8 +75,7 @@ describe('botmux send per-turn final idempotency', () => {
       expect(String(progress.result.stderr)).toContain('--response-kind auxiliary');
       expect(progress.requests).toHaveLength(0);
 
-      const record = JSON.parse(readFileSync(join(f.dataDir, 'turn-send-ledger',
-        readdirLedger(f.dataDir)), 'utf8'));
+      const record = JSON.parse(readFileSync(readdirLedger(f.dataDir), 'utf8'));
       expect(record.final.messageId).toBe('om_separate_message');
     } finally { rmSync(f.root, { recursive: true, force: true }); }
   }, 40_000);
@@ -127,7 +126,7 @@ describe('botmux send per-turn final idempotency', () => {
     const f = createFixture();
     try {
       expect(f.run('final', 'answer').result.status).toBe(0);
-      const recordPath = join(f.dataDir, 'turn-send-ledger', readdirLedger(f.dataDir));
+      const recordPath = readdirLedger(f.dataDir);
       const record = JSON.parse(readFileSync(recordPath, 'utf8'));
       record.final.deliveredAtMs = Date.now() - 31 * 24 * 60 * 60_000;
       writeFileSync(recordPath, JSON.stringify(record));
@@ -143,6 +142,11 @@ describe('botmux send per-turn final idempotency', () => {
   }, 30_000);
 });
 
+/** Path of the single record the fixture's session wrote (per-session layout). */
 function readdirLedger(dataDir: string): string {
-  return readdirSync(join(dataDir, 'turn-send-ledger')).find(name => name.endsWith('.json'))!;
+  const root = join(dataDir, 'turn-send-ledger');
+  const sessions = readdirSync(root).filter(name => !name.startsWith('.'));
+  expect(sessions).toHaveLength(1);
+  const sessionDir = join(root, sessions[0]!);
+  return join(sessionDir, readdirSync(sessionDir).find(name => name.endsWith('.json'))!);
 }

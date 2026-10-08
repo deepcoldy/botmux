@@ -579,6 +579,61 @@ describe('cmdSend hook context wiring', () => {
       .toBeLessThan(cmdSend.indexOf("const { sendMessage, replyMessage"));
   });
 
+  it('keeps Remote Runner outbound sends host-only, route-frozen, and non-terminal', () => {
+    const cmdSendStart = cliSource.indexOf('async function cmdSend(');
+    const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);
+    const cmdSend = cliSource.slice(cmdSendStart, cmdDispatchStart);
+    const guard = cmdSend.indexOf('if (remoteRunnerOutbound)');
+    const providerImport = cmdSend.indexOf("const { sendMessage, replyMessage");
+    expect(guard).toBeGreaterThan(0);
+    expect(guard).toBeLessThan(providerImport);
+    expect(cmdSend.slice(guard, providerImport)).toContain('trustedRelayCtx.sessionId !== sid');
+    expect(cmdSend.slice(guard, providerImport)).toContain("['progress', 'auxiliary']");
+    expect(cmdSend.slice(guard, providerImport)).toContain('sendTopLevel || overrideChatId || sendInto');
+    expect(cmdSend.slice(guard, providerImport)).toContain('mentionArgs.length > 0');
+    expect(cmdSend).toContain('...(remoteRunnerOutbound ? { terminalIndependent: true } : {})');
+  });
+
+  it.each([
+    ['explicit recipient', ['--no-mention', '--mention', 'ou_forbidden']],
+    ['two mention decisions', ['--no-mention', '--mention-back']],
+  ])('rejects Remote Runner outbound sends with %s through the real CLI', async (_name, mentionArgs) => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-remote-outbound-guard-'));
+    const dataDir = join(root, 'data');
+    writeFileSync(join(root, 'bots.json'), JSON.stringify([{
+      larkAppId: 'app-a', larkAppSecret: 'test', cliId: 'remote-runner',
+    }]));
+    seedPersistedSessionRows(dataDir, 'app-a', {
+      session: {
+        sessionId: 'session', chatId: 'oc_chat', rootMessageId: 'om_root',
+        title: 'remote', status: 'active', createdAt: new Date(0).toISOString(),
+        larkAppId: 'app-a', cliId: 'remote-runner', pid: process.pid,
+      },
+    });
+    try {
+      const result = await runCli([
+        'send', '--remote-runner-outbound', '--response-kind', 'progress',
+        '--session-id', 'session', ...mentionArgs, 'must not send',
+      ], {
+        ...process.env,
+        HOME: root,
+        SESSION_DATA_DIR: dataDir,
+        BOTS_CONFIG: join(root, 'bots.json'),
+        BOTMUX_SESSION_ID: 'session',
+        BOTMUX_TURN_ID: 'turn-live',
+        BOTMUX_HOST_RELAY_AUTHORIZED: '1',
+        BOTMUX_SEND_RELAY: '',
+        BOTMUX_WORKFLOW: '',
+        BOTMUX_LARK_APP_ID: '',
+        BOTMUX_LARK_APP_SECRET: '',
+      });
+      expect(result.code).toBe(2);
+      expect(result.stderr).toContain('supports only current-session Markdown with one none/requester mention decision');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('validates the exact document text path before reading content or invoking TTS/uploads', () => {
     const cmdSendStart = cliSource.indexOf('async function cmdSend(');
     const cmdDispatchStart = cliSource.indexOf('async function cmdDispatch(', cmdSendStart);

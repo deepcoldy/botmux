@@ -129,16 +129,29 @@ export const REPLY_TARGETS_MAX = 32;
  *  (beginReplyTargetTurn + trigger-final-suppression's inheritTriggerReplyAnchor)
  *  MUST route eviction through here so a pruned sibling can never silently
  *  under-count a turn's participant window — `botmux send` compares the returned
- *  watermark against the turn window to decide incompleteness. */
+ *  watermark against the turn window to decide incompleteness.
+ *
+ *  `pinnedTurnIds` lists turns whose routing record a LIVE built-in CronCreate
+ *  task still reports into (see {@link cronPinnedTurnIds}): those entries are
+ *  exempt from eviction even past REPLY_TARGETS_MAX, otherwise a task created
+ *  in topic A loses its replyTargets record after 32 newer turns and its next
+ *  scheduled fire falls back to the group top level — no restart required. */
 export function pruneReplyTargets(
   targets: Record<string, ReplyTargetEntry>,
   prevPrunedThrough: string | undefined,
+  pinnedTurnIds: ReadonlySet<string> = EMPTY_PINNED_SET,
 ): string | undefined {
   const keys = Object.keys(targets);
   if (keys.length <= REPLY_TARGETS_MAX) return prevPrunedThrough;
-  const evict = keys
-    .sort((a, b) => (targets[a].updatedAt < targets[b].updatedAt ? -1 : 1))
-    .slice(0, keys.length - REPLY_TARGETS_MAX);
+  // Pinned entries survive regardless of the bound; only unpinned records are
+  // eviction candidates and they are merely brought DOWN to REPLY_TARGETS_MAX
+  // (pinned ones are extra slots, so a session with P live cron tasks may hold
+  // up to 32 + P records).
+  const unpinned = keys
+    .filter(k => !pinnedTurnIds.has(k))
+    .sort((a, b) => (targets[a].updatedAt < targets[b].updatedAt ? -1 : 1));
+  const overflow = unpinned.length - REPLY_TARGETS_MAX;
+  const evict = overflow > 0 ? unpinned.slice(0, overflow) : [];
   let watermark = prevPrunedThrough;
   for (const k of evict) {
     const ts = targets[k].updatedAt;
@@ -146,6 +159,63 @@ export function pruneReplyTargets(
     delete targets[k];
   }
   return watermark;
+}
+
+const EMPTY_PINNED_SET: ReadonlySet<string> = new Set();
+
+/** Mirrors the worker's built-in CronCreate task → create-time Lark turnId
+ *  map on the DAEMON side, persisted with the session. The worker knows which
+ *  topic each task reports into only as a turnId; the daemon owns the
+ *  turnId → visible-target resolution via `replyTargets`. A task with
+ *  turnId null was created from a local-terminal turn (nothing to pin). */
+export interface CronTaskReplyAnchor {
+  turnId: string | null;
+  createdAtMs: number;
+}
+
+/** Same bound as the worker's durable anchor store. CronCreate jobs expire
+ *  after 7 days; oldest entries shed first. */
+export const CRON_TASK_ANCHORS_MAX = 64;
+
+/** The set of replyTargets turnIds currently referenced by a LIVE cron task.
+ *  Pruning must not evict these or a later scheduled fire loses its topic. */
+export function cronPinnedTurnIds(
+  anchors: Record<string, CronTaskReplyAnchor> | undefined,
+): Set<string> {
+  const pinned = new Set<string>();
+  if (!anchors) return pinned;
+  for (const rec of Object.values(anchors)) {
+    if (rec && typeof rec.turnId === 'string' && rec.turnId) pinned.add(rec.turnId);
+  }
+  return pinned;
+}
+
+/** Apply a worker full-snapshot sync of its task→turnId map. The worker is the
+ *  authority: tasks absent from its snapshot have been shed there too. A
+ *  task already known keeps its original createdAtMs so FIFO eviction order is
+ *  stable across re-attaches; new tasks stamp `nowMs`. Returns the next record
+ *  (bounded oldest-first) plus the distinct pinned-turn set for callers that
+ *  need to re-run prune with the new exemptions. */
+export function reconcileCronTaskReplyAnchors(
+  current: Record<string, CronTaskReplyAnchor> | undefined,
+  incoming: ReadonlyArray<{ taskId: string; turnId: string | null }>,
+  nowMs = Date.now(),
+): { anchors: Record<string, CronTaskReplyAnchor>; pinned: Set<string> } {
+  const merged: Record<string, CronTaskReplyAnchor> = {};
+  for (const { taskId, turnId } of incoming) {
+    if (!taskId) continue;
+    merged[taskId] = {
+      turnId,
+      createdAtMs: current?.[taskId]?.createdAtMs ?? nowMs,
+    };
+  }
+  const ordered = Object.entries(merged)
+    .sort((a, b) => a[1].createdAtMs - b[1].createdAtMs);
+  const bounded = ordered.length > CRON_TASK_ANCHORS_MAX
+    ? ordered.slice(ordered.length - CRON_TASK_ANCHORS_MAX)
+    : ordered;
+  const anchors = Object.fromEntries(bounded);
+  return { anchors, pinned: cronPinnedTurnIds(anchors) };
 }
 
 
@@ -324,7 +394,11 @@ export function beginReplyTargetTurn(
     ...(opts?.participants?.length ? { participants: dedupeParticipants(opts.participants) } : {}),
     ...(opts?.participantsIncomplete ? { participantsIncomplete: true } : {}),
   };
-  ds.session.replyTargetsPrunedThrough = pruneReplyTargets(targets, ds.session.replyTargetsPrunedThrough);
+  ds.session.replyTargetsPrunedThrough = pruneReplyTargets(
+    targets,
+    ds.session.replyTargetsPrunedThrough,
+    cronPinnedTurnIds(ds.session.cronTaskReplyAnchors),
+  );
   ds.session.replyTargets = targets;
 
   if (ds.scope !== 'chat') return;

@@ -1,0 +1,33 @@
+cases:
+  - name: Aiden basic bot flow
+    tags: [bot, smoke]
+    steps:
+      - feishu.runScenario: { scenario: bot-aiden-basic }
+  - name: Claude basic bot flow
+    tags: [bot, smoke]
+    steps:
+      - feishu.runScenario: { scenario: bot-claude-basic }
+  - name: CoCo basic bot flow
+    tags: [bot, smoke]
+    steps:
+      - feishu.runScenario: { scenario: bot-coco-basic }
+  - name: Codex basic bot flow
+    tags: [bot, smoke]
+    steps:
+      - feishu.runScenario: { scenario: bot-codex-basic }
+  - name: Codex prompt submission
+    tags: [bot, codex]
+    steps:
+      - feishu.runScenario: { scenario: bot-codex-prompt }
+  - name: OpenCode basic bot flow
+    tags: [bot, smoke]
+    steps:
+      - feishu.runScenario: { scenario: bot-opencode-basic }
+  - name: Bot reply smoke test
+    tags: [bot, smoke]
+    steps:
+      - feishu.runScenario: { scenario: bot-reply-smoke }
+  - name: Aiden and CoCo collaboration
+    tags: [bot, collaboration]
+    steps:
+      - feishu.runScenario: { scenario: bot-collaboration }

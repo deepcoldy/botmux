@@ -52,6 +52,7 @@ export const CLI_ID_CHOICES: Record<string, CliId> = {
   // 新增 CLI 一律追加到尾部：序号是脚本化 setup（非 TTY 管道喂数字）的稳定接口，
   // 插位会让老脚本静默选错 CLI。
   '31': 'mimocode',
+  '32': 'remote-runner',
 };
 
 const VALID_CLI_IDS: ReadonlySet<string> = new Set(Object.values(CLI_ID_CHOICES));
@@ -94,6 +95,7 @@ const CLI_DISPLAY_LABELS: Record<CliId, string> = {
   'dsh-tui': 'DeepSeek Harness TUI',
   'mojo': 'Mojo',
   'minimax': 'MiniMax',
+  'remote-runner': 'Remote Runner',
 };
 
 /**
@@ -479,6 +481,7 @@ export const CLONE_EXCLUDED_KEYS = [
   'grantExpiryState',
   'sessionGroup',
   'chatReplyModes',
+  'chatSoloGroupMentionBypass',
   'chatFeedbackPolicies',
   'noCardChats',
   'quotaFallbackBot',
@@ -686,8 +689,8 @@ export function applyBotConfigEdits<T extends Record<string, any>>(
     if (backendType === '-') {
       delete out.backendType;
     } else if (backendType) {
-      if (backendType !== 'pty' && backendType !== 'tmux' && backendType !== 'herdr' && backendType !== 'zellij' && backendType !== 'zmx' && backendType !== 'riff' && backendType !== 'mojo') {
-        throw new Error(`backendType must be "pty", "tmux", "herdr", "zellij", "zmx", "riff", or "mojo": ${backendType}`);
+      if (backendType !== 'pty' && backendType !== 'tmux' && backendType !== 'herdr' && backendType !== 'zellij' && backendType !== 'zmx' && backendType !== 'riff' && backendType !== 'mojo' && backendType !== 'remote-runner') {
+        throw new Error(`backendType must be "pty", "tmux", "herdr", "zellij", "zmx", "riff", "mojo", or "remote-runner": ${backendType}`);
       }
       out.backendType = backendType;
     }

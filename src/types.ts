@@ -6,6 +6,11 @@ import type { BotSkillPolicy } from './core/skills/types.js';
 // through without complaint.
 import type { MojoConfig, MojoLivePatch, MojoSessionIdentity } from './adapters/backend/mojo-types.js';
 import type { RiffBackendConfig } from './adapters/backend/riff-backend.js';
+import type { RemoteRunnerConfig } from './adapters/backend/remote-runner-config.js';
+import type {
+  RemoteRunnerBackendState,
+  RemoteRunnerUsageReport,
+} from './adapters/backend/remote-runner-protocol.js';
 import type { CliUsageLimitState } from './utils/cli-usage-limit.js';
 import type { VcMeetingActivityType } from './vc-agent/types.js';
 import type { CodexServiceTierSnapshot } from './services/codex-service-tier.js';
@@ -691,6 +696,10 @@ export interface Session {
   /** riff：最近一个任务 id（follow-up 血缘锚点）。持久化后 daemon 重启的下一条
    *  消息仍走 task-follow-up 延续沙箱与上下文，而非冷启新任务。 */
   riffParentTaskId?: string;
+  /** Provider-neutral remote compute and native-agent lineage. Never contains credentials. */
+  remoteBackendState?: RemoteRunnerBackendState;
+  /** Latest generation-fenced usage confirmed by a Remote Runner provider. */
+  remoteRunnerUsage?: RemoteRunnerUsageReport;
   /**
    * Crash journal for an explicit Mojo remote close.
    *
@@ -815,6 +824,15 @@ export interface Session {
    * message flood stay bounded without silently under-counting participants.
    */
   replyTargetsPrunedThrough?: string;
+  /**
+   * Daemon-side mirror of the worker's live built-in CronCreate
+   * taskId → create-time Lark turnId map (synced from the worker, which
+   * persists its own copy). The distinct non-null turnIds here are EXEMPT
+   * from replyTargets eviction so a scheduled fire still routes into the
+   * topic its task was created in even after 32+ newer turns (or a daemon
+   * restart). Local-terminal-created tasks carry turnId null and pin nothing.
+   */
+  cronTaskReplyAnchors?: Record<string, { turnId: string | null; createdAtMs: number }>;
   /**
    * Durable receiver acknowledgement keyed by the exact inbound Lark
    * message_id. A receipt is written only after the worker has committed that
@@ -1082,13 +1100,19 @@ export interface Session {
   /** Exact persistent host/agent selected by the worker for restore and cleanup. */
   persistentBackendTarget?: PersistentBackendTarget;
   /**
-   * Sandbox decision RECORDED AT SESSION CREATION (fs-policy file-isolation). The
-   * live bot flag (BotConfig.sandbox) can be toggled later, but a session's
-   * sandbox status is frozen here at creation so a restore/restart never
-   * retroactively sandboxes (or un-sandboxes) a historical session. Undefined on
-   * sessions created before this field existed → treated as not sandboxed.
+   * Sandbox decision RECORDED AT SESSION CREATION. `true`/`"oncall"` = the
+   * fs-policy whitelist sandbox; `"scratch"` = full-root COW throwaway sandbox
+   * (see adapters/cli/sandbox-mode.ts). The live bot flag (BotConfig.sandbox)
+   * can be toggled later, but a session's sandbox status is frozen here at
+   * creation so a restore/restart never retroactively sandboxes (or
+   * un-sandboxes) a historical session. Undefined/false/"off" on sessions
+   * created before/without the field → not sandboxed.
    */
-  sandbox?: boolean;
+  sandbox?: boolean | 'off' | 'oncall' | 'scratch';
+  /** Scratch-mode settings frozen alongside `sandbox: "scratch"` at session
+   *  creation. mergedHostPath is derivable as
+   *  `<dataDir>/sandboxes/<sessionId>/root`, so it is NOT stored. */
+  sandboxScratch?: { storage: 'tmpfs' | 'disk'; tmpfsSizeMb?: number; denyPaths?: string[]; network?: boolean };
   /** User three-tier path lists (fs-policy) recorded alongside `sandbox` at
    *  session creation. */
   sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] };
@@ -1098,6 +1122,7 @@ export interface Session {
   sandboxReadonlyPaths?: string[];
   /** Network access decision recorded alongside `sandbox` at session creation. */
   sandboxNetwork?: boolean;
+  sandboxNetworkPolicy?: import('./core/sandbox-network-policy.js').SandboxNetworkPolicy;
   /** Persisted adopt metadata — allows adopt sessions to survive daemon restarts.
    *  Either tmuxTarget (tmux backend) OR zellijSession+zellijPaneId (zellij). */
   adoptedFrom?: {
@@ -1386,6 +1411,12 @@ export type ScheduleExecutionPosition = 'top-level' | 'topic' | 'new-topic' | 't
 
 export interface ScheduledTask {
   id: string;
+  /** Optional per-bot work-calendar name; filters automatic recurring dispatch only. */
+  calendar?: string;
+  calendarDayType?: import('./services/work-calendar.js').CalendarDayType;
+  lastCalendarCheck?: import('./services/work-calendar.js').CalendarCheck;
+  /** Durable CLI run-now request; consumed atomically when claiming a run. */
+  manualRunRequested?: boolean;
   /** Opaque pointer to a daemon-owned Bash precondition sidecar. The script is
    *  never stored in this sandbox-writable task row. Absence does not prove
    *  that no condition exists: runtime always checks the sidecar by task id. */
@@ -1707,7 +1738,7 @@ export interface PendingRepoSetup {
 /** Messages sent from Daemon to Worker */
 type DaemonToWorkerBase =
   | { type: 'worker_ipc_probe' }
-  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; credentialsSourceDir?: string; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig; existingAppServerEndpoint?: string; startupCommands?: string[]; env?: Record<string, string>; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; replyDelivery?: 'send' | 'transcript'; promptInjection?: 'default' | 'none'; solo?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
+  | { type: 'init'; sessionId: string; chatId: string; chatType?: 'group' | 'p2p'; rootMessageId: string; workingDir: string; cliId: string; cliRuntime?: import('./adapters/cli/runtime.js').CliRuntimeSnapshot; cliPathOverride?: string; wrapperCli?: string; cliLaunchMode?: CliLaunchMode; launchShell?: string; model?: string; modelBackendVariant?: 'standard' | 'max'; turnTimeoutMs?: number; dshProfile?: string; dshRuntime?: 'official' | 'tui'; reasoningEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'; disableCliBypass?: boolean; codexBrowser?: import('./core/codex-browser-config.js').CodexBrowserConfig; codexRpcInput?: boolean; codexAuthSync?: import('./services/codex-auth-sync.js').CodexAuthSyncMode; credentialsSourceDir?: string; triggerUserAuth?: import('./services/trigger-user-auth.js').TriggerUserAuthConfig; existingAppServerEndpoint?: string; startupCommands?: string[]; envPolicy?: import('./core/env-policy.js').EnvPolicy; env?: Record<string, string>; replyStyle?: import('./im/lark/reply-card-style.js').ReplyStyleConfig; sandbox?: boolean | 'off' | 'oncall' | 'scratch'; scratchStorage?: 'tmpfs' | 'disk'; scratchTmpfsSizeMb?: number; scratchDenyPaths?: string[]; sandboxPaths?: { readWrite?: string[]; readOnly?: string[]; deny?: string[] }; sandboxHidePaths?: string[]; sandboxReadonlyPaths?: string[]; sandboxNetwork?: boolean; sandboxNetworkPolicy?: import('./core/sandbox-network-policy.js').SandboxNetworkPolicy; readIsolation?: boolean; readDenyExtraPaths?: string[]; daemonBootId?: string; backendType: BackendType; persistentBackendTarget?: PersistentBackendTarget; backendConfig?: RiffBackendConfig | MojoConfig | RemoteRunnerConfig; remoteBackendState?: RemoteRunnerBackendState; remoteResumeMode?: 'reattach' | 'rebuild'; riffParentTaskId?: string; riffRepoDirs?: string[]; deferredScheduleRun?: Session['deferredScheduleRun']; nativeSessionTitle?: string; nativeSessionTitlePrompt?: string; prompt: string; promptCodexAppInput?: CodexAppTurnInput; queuedActivationToken?: string; resume?: boolean; forkSession?: boolean; cliSessionId?: string; originalSessionId?: string; ownerOpenId?: string; webPort?: number; larkAppId: string; larkAppSecret: string; apiOnly?: boolean; replyDelivery?: 'send' | 'transcript'; promptInjection?: 'default' | 'none'; solo?: boolean; loadedBotsConfigPath?: string; loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance; brand?: 'feishu' | 'lark'; botName?: string; botOpenId?: string; locale?: 'zh' | 'en'; turnId?: string; replyTurnId?: string; dispatchAttempt?: number; atMostOnce?: boolean; codexAppDispatchId?: string; codexAppSteerable?: true; codexAppRecoveredDispatches?: CodexAppDispatchLedgerEntry[]; codexAppGenerationCommits?: CodexAppGenerationCommit[]; vcMeetingImTurnOrigin?: VcMeetingImTurnOrigin; trustedCaller?: TrustedCaller; trustedController?: TrustedCaller; pluginBindings?: string[]; skillPolicy?: BotSkillPolicy; skillPluginDir?: string; skillReadonlyRoots?: string[]; adoptMode?: boolean; adoptSource?: 'tmux' | 'herdr' | 'zellij'; adoptTmuxTarget?: string; adoptZellijSession?: string; adoptZellijPaneId?: string; adoptHerdrSessionName?: string; adoptHerdrTarget?: string; adoptHerdrPaneId?: string; adoptPaneCols?: number; adoptPaneRows?: number; bridgeJsonlPath?: string; adoptCliPid?: number; adoptCwd?: string; adoptRestoredFromMetadata?: boolean; runnerBuildId?: string; persistedRunnerBuildId?: string; restartAttemptId?: string }
   /** `model` rides along on every turn for the SAME reason the restart IPC carries
    *  it: the crash-loop park recovery respawns the CLI from inside the worker on
    *  the next message, with no restart IPC to refresh the snapshot. Same
@@ -1730,7 +1761,7 @@ type DaemonToWorkerBase =
   | { type: 'close_commit'; requestId: string }
   | { type: 'close_abort'; requestId: string }
   /** Fence new remote writes, drain accepted writes, and report exact lineage. */
-  | { type: 'remote_shutdown_prepare'; requestId: string }
+  | { type: 'remote_shutdown_prepare'; requestId: string; drainTimeoutMs?: number }
   /** Final lineage is durable; detach the worker generation. */
   | { type: 'remote_shutdown_commit'; requestId: string }
   /** Shutdown could not commit; restore remote write admission. */
@@ -1804,7 +1835,9 @@ type DaemonToWorkerBase =
 
 export type DaemonToWorker = DaemonToWorkerBase extends infer Message
   ? Message extends { type: 'init' }
-    ? Message & {
+    ? Omit<Message, 'loadedBotsConfigPath'> & {
+        loadedBotsConfigPath?: string;
+        loadedBotsConfigProvenance?: import('./core/config-dir.js').BotsConfigProvenance;
         feedback?: import('./services/feedback-policy.js').FeedbackPolicy;
         cliInstanceBinding?: import('./services/codex-instance-pool.js').SessionCliInstanceBindingV1;
         terminalCardEpoch?: string;
@@ -1873,6 +1906,8 @@ export interface ModelFallbackState {
 /** Messages sent from Worker to Daemon */
 export type WorkerToDaemon =
   | { type: 'worker_ipc_ready' }
+  /** An interruption adopted an executing turn; retain its output visibility. */
+  | { type: 'active_turn_envelope_changed'; previousTurnId: string; turnId: string }
   | {
       type: 'ready';
       /** Bound Web Terminal port, or 0 when the worker is ready but this
@@ -1898,6 +1933,14 @@ export type WorkerToDaemon =
   /** A live native terminal turn in a zero-injection session. Freeze its
    * reply destination before newer IM inputs can replace the sender. */
   | { type: 'terminal_turn_started'; turnId: string; startedAtMs: number; replyContextTurnId?: string }
+  /** Full-snapshot sync of the worker's live built-in CronCreate
+   *  taskId → create-time Lark turnId map. Sent once after every anchor
+   *  change (a CronCreate ack pairs) and once after the worker re-attaches
+   *  and restores anchors from disk. The daemon mirrors it onto the session
+   *  and exempts the referenced turnIds from replyTargets eviction, so a
+   *  scheduled fire still routes into its originating topic after 32+ newer
+   *  turns. turnId null = task created from a local-terminal turn. */
+  | { type: 'cron_task_anchors_sync'; anchors: Array<{ taskId: string; turnId: string | null }> }
   /** Transport-only receipt for ordinary Lark IM delivery. Emitted
    * synchronously when the live worker's IPC handler claims the exact turn,
    * before slow startup work; input-queue ownership is acknowledged separately
@@ -2163,6 +2206,8 @@ export type WorkerToDaemon =
   | { type: 'deferred_topic_materialized'; sessionId: string; turnId: string; rootMessageId: string }
   | { type: 'riff_access_url'; accessUrl: string; directAccessUrl?: string; turnId?: string; dispatchAttempt?: number }
   | { type: 'riff_task_id'; taskId: string | null }
+  | { type: 'remote_backend_state'; state: RemoteRunnerBackendState }
+  | { type: 'remote_usage'; usage: RemoteRunnerUsageReport }
   | {
       type: 'remote_shutdown_result';
       requestId: string;

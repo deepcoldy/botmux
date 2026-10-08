@@ -100,6 +100,50 @@ describe('worker spawnCli resume demotion (source lock)', () => {
     const block = workerSource.slice(start, start + 400);
     expect(block).toContain('!willReattachPersistent');
   });
+
+  it('suppresses the fresh-demotion notice when no CLI transcript ever existed (first-turn launch recovery)', () => {
+    // A first-turn launch that dies before the CLI writes its session file has
+    // no user-visible history; the fallback is recovery, not context loss, and
+    // the user-facing notice is a false alarm.
+    const fbStart = workerSource.indexOf('if (fallBackToFresh) {');
+    expect(fbStart).toBeGreaterThan(-1);
+    const block = workerSource.slice(fbStart, fbStart + 2400);
+    expect(block).toContain('suppressFallbackNotice');
+    expect(block).toContain('!cliTranscriptEverExisted');
+    expect(block).toContain('resumeFallbackNotified');
+  });
+
+  it('marks the transcript as existing when the bridge baselines against the JSONL file', () => {
+    const fnStart = workerSource.indexOf('function bridgeAbsorbBaseline(): void {');
+    expect(fnStart).toBeGreaterThan(-1);
+    const block = workerSource.slice(fnStart, fnStart + 800);
+    expect(block).toContain('cliTranscriptEverExisted = true');
+  });
+
+  it('also arms the transcript flag on the fresh-empty first drain (not only at baseline)', () => {
+    // fresh-empty mode never runs bridgeAbsorbBaseline — it declares
+    // baseline-done up front so first-turn events stay attributable. Without
+    // the drain-side setter, a fresh session that ran real turns would keep
+    // the flag false and a later resume fallback would silently drop its
+    // context without the user-facing notice.
+    const drainStart = workerSource.indexOf('const result = drainTranscript(bridgeJsonlPath, bridgeOffset);');
+    expect(drainStart).toBeGreaterThan(-1);
+    const block = workerSource.slice(drainStart, drainStart + 1100);
+    expect(block).toContain('cliTranscriptEverExisted = true');
+  });
+
+  it('documents the cross-process (worker-restart) reset trade-off at the flag declaration', () => {
+    // Not persisting the flag across worker restarts is deliberate: a stale
+    // persisted `true` could suppress the notice for a session whose
+    // transcript is actually gone, while the reset only risks missing one
+    // reminder (the resume path re-arms the flag by baselining the
+    // still-existing transcript).
+    const declStart = workerSource.indexOf('let cliTranscriptEverExisted = false;');
+    expect(declStart).toBeGreaterThan(-1);
+    const comment = workerSource.slice(Math.max(0, declStart - 2000), declStart);
+    expect(comment).toContain('NOT persisted');
+    expect(comment).toContain('worker restart');
+  });
 });
 
 // ─── Card copy wiring (source lock) ─────────────────────────────────────────

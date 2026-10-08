@@ -30,6 +30,8 @@ import {
   type SpawnOpts,
   type SessionProbe,
 } from './types.js';
+import { inheritBotEnv } from '../../core/env-policy.js';
+import { strictPaneEnvArgs } from './strict-env.js';
 import { zmxEnv, probeZmxFunctional } from '../../setup/ensure-zmx.js';
 import {
   buildBotmuxEnvAssignments,
@@ -977,6 +979,7 @@ export class ZmxBackend implements SessionBackend {
       );
     }
 
+    if (opts.strictEnv && this.reattaching && !opts.strictEnvReattach) throw new Error('Refusing unverified strict zmx reattach');
     if (probe.state === 'compatible') {
       // Reattach/fresh is frozen by worker before plugin, startup-command and
       // isolation decisions. A late same-name winner must not silently turn a
@@ -2356,11 +2359,11 @@ export function buildZmxLaunchFiles(
   releasePath: string,
   releaseToken: string,
 ): { bootstrap: string; payload: string } {
-  const shellSpec = resolveUserShell(process.env, opts.launchShell);
+  const shellSpec = opts.strictEnv ? { shell: '/bin/sh', flags: [] } : resolveUserShell(process.env, opts.launchShell);
   const shellKind = shellKindForPath(shellSpec.shell);
-  const envAssignments = buildBotmuxEnvAssignments(opts.env, opts.injectEnv)
+  const envAssignments = (opts.strictEnv ? strictPaneEnvArgs(opts) : buildBotmuxEnvAssignments(opts.env, opts.injectEnv))
     .filter(assignment => !/^ZMX_(?:SESSION|SESSION_PREFIX)=/.test(assignment));
-  const debugKeepShell = process.env.BOTMUX_DEBUG_KEEP_SHELL === '1';
+  const debugKeepShell = !opts.strictEnv && process.env.BOTMUX_DEBUG_KEEP_SHELL === '1';
   const wrapperBinDir = resolveBotmuxWrapperBinDir(opts.env ?? process.env);
   const wrapped = debugKeepShell
     ? buildDebugKeepShellScript(shellSpec.shell, wrapperBinDir, shellKind)
@@ -2540,7 +2543,7 @@ export function zmxFreshSessionEnv(opts: SpawnOpts, socketDir?: string): NodeJS.
 
 /** Strip every payload-delivered key from ZMX control subprocesses. */
 export function zmxControlEnv(opts: SpawnOpts, socketDir?: string): NodeJS.ProcessEnv {
-  const env = zmxEnv(opts.env);
+  const env = zmxEnv(opts.strictEnv ? inheritBotEnv(opts.env, { mode: 'strict' }) : opts.env);
   for (const assignment of buildBotmuxEnvAssignments(opts.env, opts.injectEnv)) {
     const equals = assignment.indexOf('=');
     if (equals > 0) delete env[assignment.slice(0, equals)];

@@ -19,7 +19,7 @@ export function validateCliLaunchModeConfig(input: {
   wrapperCli?: string;
   cliRuntime?: unknown;
   cliPathOverride?: string;
-  sandbox?: boolean;
+  sandbox?: boolean | 'off' | 'oncall' | 'scratch';
   readIsolation?: boolean;
 }, context = 'Bot config'): void {
   if (!input.cliLaunchMode) return;
@@ -38,7 +38,7 @@ export function validateCliLaunchModeConfig(input: {
   if (input.cliPathOverride?.trim()) {
     throw new Error(`${context}: cliLaunchMode cannot be combined with cliPathOverride`);
   }
-  if (input.sandbox === true || input.readIsolation === true) {
+  if ((input.sandbox !== undefined && input.sandbox !== false && input.sandbox !== 'off') || input.readIsolation === true) {
     throw new Error(`${context}: cliLaunchMode cannot be combined with sandbox or readIsolation`);
   }
 }

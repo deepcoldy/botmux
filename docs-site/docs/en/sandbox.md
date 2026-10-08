@@ -114,3 +114,87 @@ to add `--unshare-net` and run the CLI without host network access. This is a bl
 ## Pairs with On-Call
 
 The file sandbox + [On-Call Mode](/en/oncall) is the standard combo: on-call opens the bot to a whole group to @ at will, and the sandbox guarantees their changes **never touch the real repo** and **only land after the owner reviews each one**. The default pairing for semi-trusted, many-people, change-anytime on-call scenarios.
+
+## Destination IP policy (explicit opt-in)
+
+`sandboxNetworkPolicy` independently configures public and private address space. Without it, existing `sandboxNetwork` values and historical sessions keep their behavior. An explicit policy takes precedence over the boolean. Supported only for **Linux x64/arm64, local PTY, oncall file sandbox**. Docker must permit user/network/PID namespaces and namespace-local nftables. macOS, scratch, persistent terminals, remote backends, adopt and external App Servers are rejected. **This defines policy support, not deployment readiness. Standalone Bun + native Codex must pass fresh/restored model-turn acceptance below before an existing tmux deployment is advised to switch to PTY.**
+
+```json
+{
+  "sandbox": true,
+  "backendType": "pty",
+  "sandboxNetworkPolicy": {
+    "version": 1,
+    "public": { "mode": "allow" },
+    "private": { "mode": "allowlist", "rules": [{ "cidr": "10.20.0.0/16", "protocol": "tcp", "ports": [443] }] },
+    "dnsServers": ["1.1.1.1"]
+  }
+}
+```
+
+Each zone supports `allow` (all destinations), `block` (none), `allowlist` (any matching rule; empty blocks all), or `denylist` (deny any matching rule; empty permits all). Classify the actual address first, then evaluate that zone. Rules have union semantics, with no longest-prefix or last-rule overrides. A cross-zone CIDR only matches within its containing zone.
+
+Rules accept IP/CIDR only; host bits normalize. IPv4-mapped IPv6 addresses share IPv4 rules. Omitted protocol/ports matches all protocols/ports; optional protocol accepts TCP/UDP, and optional ports requires protocol and an integer list 1–65535. Domains, URLs, wildcards, port ranges and other protocol selectors are rejected.
+
+Private means conservative non-public space: RFC1918, IPv4 loopback, link-local, CGNAT, unspecified, reserved, documentation/test and multicast ranges (full list: `PRIVATE_V4` in `src/core/sandbox-network-policy.ts`); IPv6 outside `2000::/3`, plus `2001::/23`, `2001:db8::/32`, `2002::/16` and `3fff::/20`. This includes ULA, loopback, link-local, multicast and translation/transition space. Classification is static, independent of DNS suffix or current routing.
+
+The boundary filters **actual destination IP packets** using nftables in a fresh namespace before connecting a generic slirp4netns link. Direct sockets, changed/deleted proxy variables, IPv4 mappings, changed DNS answers and redirected connections receive the same kernel filtering. Model endpoints and DNS must be explicitly permitted. It does not modify the host firewall, Docker or any proxy product configuration.
+
+Restricted policies reject inherited HTTP/HTTPS/ALL proxy configuration by default without rewriting environment variables. Explicit `proxyMode: "trusted-egress"` delegates business destination control to an approved exit. `proxyMode: "reject"` rejects proxy environment variables even when both zones allow all traffic. An omitted field keeps the previous behavior, including proxy compatibility when both zones use `allow`.
+
+**Trusting an exit does not restrict destinations behind it.** Kernel rules still filter the actual proxy IP/port: unauthorized exits and direct private connections remain blocked. An approved proxy can reach any address it can access, including private addresses blocked for the client. Final model destinations, domain/CONNECT/HTTP rules and proxy-side DNS belong to the deployment-layer proxy ACL. This option does not create or configure a proxy, inject environment variables, or guarantee a CLI uses it. `NO_PROXY` and deleted/changed proxy variables do not change actual IP enforcement.
+
+For a deployment-provided proxy, a new local PTY session can use:
+
+```json
+{
+  "sandbox": true,
+  "backendType": "pty",
+  "sandboxNetworkPolicy": {
+    "version": 1,
+    "proxyMode": "trusted-egress",
+    "public": { "mode": "block" },
+    "private": { "mode": "allowlist", "rules": [{ "cidr": "10.20.0.10", "protocol": "tcp", "ports": [8080] }] }
+  }
+}
+```
+
+Authorize client DNS separately if the proxy hostname requires resolution. The proxy must have a routable endpoint; host loopback, Unix sockets and slirp gateway aliases remain blocked. To restrict final business destinations, configure the proxy's own ACL or use direct egress.
+
+Namespace-local loopback remains available for local IPC, distinct from host loopback. Host loopback aliases and slirp DNS forwarding are always disabled. Only required IPv6 neighbor discovery control packets are exempted. Task socket creation is restricted to Internet families; host Unix sockets, setns/unshare, compat syscall ABI and io_uring are blocked, while process-local socketpair IPC remains. Host MCP Gateway/Unix IPC combinations fail closed; the file outbox relay remains available.
+
+Optional `dnsServers` grants explicit TCP/UDP port 53 access before zone evaluation (max 8 IPs, excluding loopback and slirp aliases). Default is empty, without host DNS delegation. DNS queries are themselves an authorized capability; resulting application connections still receive destination filtering. Omit DNS capability to block all external communication.
+
+Provide iproute2 `ip`, nft, slirp4netns supporting `--disable-host-loopback`/`--disable-dns`, and bwrap supporting `--disable-userns`/`--add-seccomp-fd`. No network dependency auto-install occurs. Initialization failures abort launch; a link failure terminates the task lifetime. There is no unfiltered fallback.
+
+Dashboard Security saves JSON and shows configured-for-new-sessions status. Host CLI supports `botmux sandbox-network-policy check <file>`, `set <appId> <file>` and `clear <appId>`. Mutations require an online authenticated owning daemon; isolated/session CLIs cannot modify host policy. IM `/config sandboxNetworkPolicy <JSON>` shares validation and atomic persistence. Session/workflow snapshots are deep copies; fork/restart/restore retains the frozen policy. Clearing affects new sessions and restores the legacy boolean behavior.
+
+### Persistent sessions and migration
+
+Existing tmux sessions cannot gain the boundary by setting policy JSON. The tmux server creates new pane processes, while restore only attaches to a surviving pane without rerunning CLI arguments. The current namespace/link supervisor belongs to a local PTY worker lifetime; worker loss terminates that task, unlike a persistent pane. Opening the backend gate or persisting a JSON field would not prove enforcement. tmux/zellij/herdr/zmx, adopt and existing external App Servers remain explicitly unsupported; no automatic backend switch or policy downgrade occurs.
+
+Keep the legacy configuration to retain an existing persistent session without claiming the new boundary, or, only after the target image passes native PTY fresh/restored model-turn acceptance, explicitly select local `backendType: "pty"` with `sandbox: true` and create a new session. Deployment-provided proxies can then use explicit trusted-egress and endpoint rules, delegating final destinations to the proxy. PTY is the permitted policy backend, not proof of standalone Bun + native Codex model-turn readiness; a running tmux pane cannot migrate in place. Bot edits affect new sessions only; existing/fork/restored snapshots stay frozen. Resuming CLI history in a newly launched process is distinct from reattaching a live pane and must establish a fresh boundary.
+
+Restored Codex history also needs actual tool-cwd acceptance. `src/adapters/cli/codex.ts` passes `-C workingDir` for fresh launches but builds resume/fork from base arguments without `-C`; Codex may retain its saved cwd. Updating BotConfig or the frozen Session workingDir does not prove a migrated tool root. Network address filtering does not validate cwd; verify consistency with the workspace root, tool context and oncall filesystem policy.
+
+A migration report used Codex 0.159.3 native app-server `thread/resume` with `cwd` to migrate nine old-cwd records, preserving transcript prefixes and model/approval/sandbox settings. An actual Python tool after cold resume with the same Codex ID confirmed the new cwd. This is reported external evidence, not a migration performed on this branch or a guarantee for other versions. This PR neither fixes the adapter nor rewrites Codex history or live deployments.
+
+#### Native runner acceptance before deployment (independent blocker)
+
+A migration report observed Botmux 3.20.0 native Bun standalone + Codex 0.159.3 in a shared image, with `sandbox: false` and `backendType: "pty"`: a fresh HTTP virtual turn received `exitCode: 0 / signal: 1 (SIGHUP)` about 15 ms after `pty.spawn` returned a PID, before input submission. Python PTY kept native Codex alive with the same arguments. **This is reported migration evidence, not an independent reproduction on this PR's branch with the same image/versions. This PR neither fixes nor establishes the cause.** Retain native tmux until the runner passes acceptance; disabling network policy or relaxing access does not prove PTY compatibility.
+
+A separate report concerns HTTP virtual/noTransport tmux without a server returning `probe: unknown`. Code inspection verifies that the policy-off guard applies to noTransport tmux and rejects an unknown probe. Ordinary transport-enabled, policy-off sessions without stale provenance are outside that noTransport arm; other explicit isolation/provenance gates still apply. Do not generalize this to all tmux sessions or bypass tri-state checks.
+
+The network CI tests a real PTY under an ordinary runtime and tests standalone network-runner reexec separately, not the complete standalone-worker Codex turn. The native release smoke deliberately bypasses `tty.ReadStream` construction (`test/pty-native-smoke.test.ts`, `src/cli/pty-smoke.ts`), so it cannot establish production `PtyBackend` lifetime/submission behavior.
+
+Before enabling the policy, pin the actual target image and Botmux/Bun/Codex versions and pass these checks:
+
+1. Use the native standalone worker and production `PtyBackend`, first with `sandbox: false`, then oncall + network policy. Python PTY, custom runtimes and ReadStream-bypassing helpers are controls, not replacements.
+2. Fresh sessions must survive to prompt ready, submit real input, finish a complete model turn and read back the result. Record PID, ready/submit/response times and exit code/signal; a PID, brief survival or exit 0 is insufficient.
+3. Restore saved Codex history in a newly launched worker/CLI PTY and finish the next model turn, verifying identity, submission and result. Have an actual model tool return `pwd` or Python `os.getcwd()` without first changing directories or overriding tool cwd; preserve its execution result and compare canonical paths against the expected workspace, Session snapshot and filesystem policy root. Botmux JSON, model prose and prompts are insufficient. A directory migration must also preserve the intended Codex ID, transcript prefix and model/approval/sandbox settings. A cwd mismatch fails acceptance and requires a separate migration fix. PTY does not promise a live process surviving worker restart or tmux-style reattach.
+4. Test HTTP virtual/noTransport and ordinary transport shapes in isolated harnesses, with IM send calls rejected by test doubles and counted as zero. Protocol-compatible local model fixtures are useful but must be distinguished from actual provider acceptance. Verify client DNS, deployment proxy and final destination ACL separately.
+5. Test tmux no-server/unknown and existing-server paths separately without treating unknown as missing or pretending transport is enabled. If acceptance fails, retain the existing tmux deployment and track runner/noTransport fixes separately.
+
+Persistent boundary support needs a separate change: enforcement before shell/CLI launch; an authenticated policy digest, namespace identity and supervisor generation tied to the actual pane/CLI PID; verification of live evidence on worker/daemon restore with missing/mismatched evidence rejected; a supervisor lifetime independent of the worker, with link death terminating associated tasks; safe cleanup, pane replacement, concurrent restore and adopt handling. Acceptance must exercise real tmux fresh/reattach, worker/daemon restart, link failure, tampered/stale evidence, cross-session isolation and IPv4/IPv6. Stored configuration or session names are insufficient proof.
+
+See the Chinese page's isolated Linux test command. `test/sandbox-network-linux.test.ts` is opt-in (`BOTMUX_NETWORK_POLICY_INTEGRATION=1`); explicit runs fail if dependencies or kernel capabilities are unavailable. A skipped run is not boundary validation. Set `BOTMUX_NETWORK_TEST_BINARY` to the absolute compiled binary path to include the self-reexec case. The Sandbox network boundary CI runs the complete matrix and binary test for relevant PRs. Model requests use an isolated HTTP fixture rather than a live provider.

@@ -5840,7 +5840,7 @@ const PRINCIPAL_LANE_RUNTIME_KEYS = [
   'wrapperCli', 'agentFrozen', 'model', 'reasoningEffort', 'modelBackendVariant',
   'backendType', 'mojoIdentity', 'mojoIdentityHostDefault',
   'sandbox', 'sandboxPaths', 'sandboxHidePaths',
-  'sandboxReadonlyPaths', 'sandboxNetwork',
+  'sandboxReadonlyPaths', 'sandboxNetwork', 'sandboxNetworkPolicy',
 ] as const satisfies readonly (keyof Session)[];
 
 function copyPrincipalLaneRuntimeConfig(source: Session, target: Session): void {
@@ -7659,6 +7659,36 @@ export function findActiveChatScopeSessionsByChat(chatId: string): Session[] {
     s => s.chatId === chatId && s.scope === 'chat',
     { chatScopeChatId: chatId },
   );
+}
+
+/**
+ * Fail-closed cross-bot inventory before deleting a chat, including its topics.
+ * Known peers must have migrated to SQLite; never parse legacy JSON or treat
+ * an unreadable bot inventory as proof that an unmigrated peer was removed.
+ */
+export function findActiveSessionsByChatStrict(chatId: string): Session[] {
+  load();
+  if (loadFailure) throw new SessionStoreUnavailableError(loadFailure);
+  const dataDir = config.session.dataDir;
+  const pending = listUnmigratedAppIds(dataDir).filter(id => id && id !== currentAppId);
+  if (pending.length > 0) {
+    const known = knownBotAppIds({ dataDir, strict: true });
+    const unmigrated = pending.filter(id => known.has(id));
+    if (unmigrated.length > 0) {
+      throw new SessionStoreUnmigratedError(
+        `会话库尚未迁移到 SQLite（${unmigrated.map(id => storeJsonFileName(id)).join('、')} 仍在，对应 sessions.db 不存在）`,
+      );
+    }
+  }
+  const matches = [...sessions.values()].filter(s => s.chatId === chatId && s.status === 'active');
+  for (const ref of listStoreRefs(dataDir, { strict: true })) {
+    if (ref.appId === currentAppId) continue;
+    for (const session of readStoreActiveRows(ref, undefined, { strict: true })) {
+      // The store filename owns legacy rows that predate larkAppId persistence.
+      if (session.chatId === chatId) matches.push({ ...session, larkAppId: ref.appId ?? session.larkAppId });
+    }
+  }
+  return matches;
 }
 
 export function findActiveSessionsByWorkingDir(workingDir: string): Session[] {

@@ -1512,4 +1512,35 @@ describe('TmuxPipeBackend tmux version gating', () => {
     be.spawn('/bin/echo', [], spawnOpts());
     expect(windowSizeCalls().length).toBe(1);
   });
+
+  it('restores a detached owned session to the configured size on reattach', () => {
+    mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+      if (Array.isArray(args) && args[0] === '-V') return 'tmux 3.3a\n' as any;
+      if (Array.isArray(args) && args.includes('#{session_attached}')) return '0\n' as any;
+      return '' as any;
+    }) as any);
+    const be = new TmuxPipeBackend('bmx-reattach-detached', { ownsSession: true, isReattach: true });
+
+    be.spawn('/bin/echo', [], spawnOpts());
+
+    expect(mockedExecFileSync).toHaveBeenCalledWith(
+      'tmux', ['resize-window', '-t', 'bmx-reattach-detached', '-x', '200', '-y', '50'], expect.any(Object),
+    );
+  });
+
+  it('preserves an attached owned session size on reattach', () => {
+    mockedExecFileSync.mockImplementation(((_bin: any, args: any) => {
+      if (Array.isArray(args) && args[0] === '-V') return 'tmux 3.3a\n' as any;
+      if (Array.isArray(args) && args.includes('#{session_attached}')) return '1\n' as any;
+      return '' as any;
+    }) as any);
+    const be = new TmuxPipeBackend('bmx-reattach-attached', { ownsSession: true, isReattach: true });
+
+    be.spawn('/bin/echo', [], spawnOpts());
+
+    const resizeCalls = mockedExecFileSync.mock.calls.filter(([, args]) => (
+      Array.isArray(args) && (args[0] === 'resize-window' || args[0] === 'resize-pane')
+    ));
+    expect(resizeCalls).toEqual([]);
+  });
 });

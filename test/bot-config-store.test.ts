@@ -78,6 +78,30 @@ describe('bot-config store', () => {
     return { registry, store, pinStreamingCardChange };
   }
 
+  it('round-trips envPolicy through shared CLI coercion, file parsing, persistence and memory', async () => {
+    const { registry, store } = await loaded({ envPolicy: { mode: 'strict', inherit: ['HTTPS_PROXY'] } });
+    const spec = store.findConfigField('envPolicy')!;
+    expect(spec.effect).toBe('next-session');
+    const coerced = store.coerceConfigValue(spec, '{"mode":"strict","inherit":["NODE_EXTRA_CA_CERTS","HTTPS_PROXY","HTTPS_PROXY"]}');
+    expect(coerced.ok).toBe(true);
+    if (!coerced.ok) return;
+    expect((await store.applyConfigField('app_default', spec, coerced.value)).ok).toBe(true);
+    const saved = readConfig().envPolicy;
+    expect(saved).toEqual({ mode: 'strict', inherit: ['HTTPS_PROXY', 'NODE_EXTRA_CA_CERTS'] });
+    expect(registry.getBot('app_default').config.envPolicy).toEqual(saved);
+    expect(registry.loadBotConfigs()[0]!.envPolicy).toEqual(saved);
+    expect((await store.applyConfigField('app_default', spec, { mode: 'strict', inherit: ['BOTMUX_OWNER_OPEN_ID'] })).ok).toBe(false);
+    expect(readConfig().envPolicy).toEqual(saved);
+    expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
+    expect(readConfig().envPolicy).toBeUndefined();
+    expect(registry.getBot('app_default').config.envPolicy).toBeUndefined();
+  });
+  it('rejects a malformed strict file policy instead of falling back to inherited credentials', async () => {
+    writeConfig({ envPolicy: { mode: 'strict', inherit: ['*'] } });
+    const { registry } = await freshModules();
+    expect(() => registry.loadBotConfigs()).toThrow('permitted environment variable names');
+  });
+
   it('zero injection is per-bot, preserves reply preferences, and refuses unsupported CLI changes', async () => {
     const { registry, store } = await loaded({ cliId: 'codex', replyDelivery: 'send' });
     const spec = store.findConfigField('promptInjection')!;
@@ -115,6 +139,28 @@ describe('bot-config store', () => {
     expect(await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none'))
       .toMatchObject({ ok: false, reason: 'zero_prompt_unsupported' });
     expect(readConfig().promptInjection).toBeUndefined();
+  });
+
+  it.each([undefined, 'reject', 'trusted-egress'])('network policy with proxyMode %s persists atomically; clear restores legacy network', async proxyMode => {
+    const { registry, store } = await loaded({ sandbox: true, backendType: 'pty', sandboxNetwork: false });
+    const spec = store.findConfigField('sandboxNetworkPolicy')!;
+    const policy = { version: 1, public: { mode: 'allow' }, private: { mode: 'block' }, ...(proxyMode !== undefined ? { proxyMode } : {}) };
+    expect(store.coerceConfigValue(spec, JSON.stringify(policy))).toMatchObject({ ok: true, value: policy });
+    expect(store.coerceConfigValue(spec, JSON.stringify({ ...policy, public: { mode: 'allowlist', rules: [{ cidr: 'example.org' }] } }))).toMatchObject({ ok: false });
+    // Linux-only runtime support is a deliberate gate, not a silent no-op.
+    if (process.platform !== 'linux') {
+      expect(await store.applyConfigField('app_default', spec, policy)).toMatchObject({ ok: false });
+      expect(readConfig()).not.toHaveProperty('sandboxNetworkPolicy');
+      return;
+    }
+    expect((await store.applyConfigField('app_default', spec, policy)).ok).toBe(true);
+    expect(readConfig().sandboxNetworkPolicy).toEqual(policy);
+    expect(registry.getBot('app_default').config.sandboxNetworkPolicy).toEqual(policy);
+    expect(await store.applyConfigField('app_default', store.findConfigField('backendType')!, 'tmux')).toMatchObject({ ok: false });
+    expect(readConfig().backendType).toBe('pty');
+    expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('sandboxNetworkPolicy');
+    expect(readConfig().sandboxNetwork).toBe(false);
   });
 
   it('CONFIG_FIELDS have unique keys and include allowedUsers', async () => {
