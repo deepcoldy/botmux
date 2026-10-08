@@ -1,3 +1,4 @@
+import { GroupIdleCloseRow } from './group-idle-close.js';
 import { GroupSerialInputRow } from './group-serial-input.js';
 import { GroupDefaultModelsRow } from './group-default-models.js';
 import { describeCloseResidual } from '../../core/close-residual.js';
@@ -1784,6 +1785,18 @@ export function ManageDialog(props: {
           chatId={chat.chatId} appId={member.larkAppId}
           botName={member.botName ?? member.larkAppId}
           enabled={member.serialInput === true} disabled={!available}
+          onSaved={() => props.onReloadGroups({ force: true })}
+        />)}
+      </fieldset>
+
+      <fieldset data-group-idle-close>
+        <legend>{tr('groups.idleClose')}</legend>
+        <p><small>{tr('groups.idleCloseHelp')}</small></p>
+        {inChat.length === 0 ? <p className="empty">没有机器人在群里</p> : inChat.map(member => <GroupIdleCloseRow
+          key={`${chat.chatId}-${member.larkAppId}`}
+          chatId={chat.chatId} appId={member.larkAppId}
+          botName={member.botName ?? member.larkAppId}
+          settings={member.idleClose} disabled={!available}
           onSaved={() => props.onReloadGroups({ force: true })}
         />)}
       </fieldset>

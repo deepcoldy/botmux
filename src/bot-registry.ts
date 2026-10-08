@@ -29,6 +29,7 @@ import {
 import { logger } from './utils/logger.js';
 import { isLocale, setBotLookup, type Locale } from './i18n/index.js';
 import type { VoiceConfig } from './services/voice/types.js';
+import { normalizeGroupIdleClose, type GroupIdleCloseSettings } from './core/group-idle-close.js';
 import { normalizeGroupSerialInput } from './core/group-serial-input.js';
 import { normalizeGroupDefaultModels, type GroupDefaultModels } from './core/group-default-models.js';
 import type { PricingOverrides } from './services/model-pricing.js';
@@ -1525,6 +1526,8 @@ export interface BotConfig {
   groupDefaultModels?: Record<string, GroupDefaultModels>;
   /** Explicit per-group FIFO for authenticated managed-session IM inputs. Default off; independent of Oncall. */
   groupSerialInput?: Record<string, boolean>;
+  /** Per-group inactivity auto-close; absent entries are disabled. */
+  groupIdleClose?: Record<string, GroupIdleCloseSettings>;
   /** Optional TraeX backend variant. Missing inherits TraeX global config. */
   modelBackendVariant?: 'standard' | 'max';
   /**
@@ -3840,6 +3843,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
         : undefined,
       groupDefaultModels: normalizeGroupDefaultModels(entry.groupDefaultModels),
       groupSerialInput: normalizeGroupSerialInput(entry.groupSerialInput),
+      groupIdleClose: normalizeGroupIdleClose(entry.groupIdleClose),
       modelBackendVariant: isBackendVariantCliId(entryCliId)
         && (entry.modelBackendVariant === 'standard' || entry.modelBackendVariant === 'max')
         ? entry.modelBackendVariant
