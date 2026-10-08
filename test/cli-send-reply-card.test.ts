@@ -87,13 +87,18 @@ describe('real CLI send into a running reply card', () => {
         expect(store.read(key)?.lastCard).not.toContain('本轮没有提供最终答复');
         expect(store.read(key)?.lastCard?.includes('oncall_group_create')).toBe(oncall);
         const markers = readFileSync(join(dataDir, 'turn-sends', `${key.sessionId}.jsonl`), 'utf8');
-        expect(JSON.parse(markers.trim())).toMatchObject({ messageId: 'om_original_card', replyCardResponseKind: 'final' });
+        expect(JSON.parse(markers.trim())).toMatchObject({
+          messageId: 'om_original_card',
+          replyCardResponseKind: 'final',
+          terminalCarrier: 'standard_reply_card',
+        });
       } else {
         expect(requests[0].method).toBe('POST');
         expect(requests[0].body.content).toContain('Hello! 这是完整答复。');
         expect(store.read(key)?.finalDelivered).not.toBe(true);
         const markers = readFileSync(join(dataDir, 'turn-sends', `${key.sessionId}.jsonl`), 'utf8');
         expect(JSON.parse(markers.trim())).not.toHaveProperty('replyCardResponseKind');
+        expect(JSON.parse(markers.trim())).toMatchObject({ terminalCarrier: 'standard_reply_card' });
         if (!reserveCard) expect(store.read(key)).toBeUndefined();
       }
     } finally {

@@ -5371,6 +5371,7 @@ function notifyExplicitRepliesObserved(
       turnId,
       ...(marker.messageId ? { messageId: marker.messageId } : {}),
       ...(marker.responseKind ? { responseKind: marker.responseKind } : {}),
+      ...(marker.terminalCarrier ? { terminalCarrier: marker.terminalCarrier } : {}),
     });
   }
 }
@@ -6808,6 +6809,23 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
       continue;
     }
 
+    // Carrier discovery is independent of transcript text. A successful
+    // explicit `botmux send` can be followed by an empty assistant-final block;
+    // still publish its marker before turn_terminal so daemon auto mode can
+    // PATCH the actual visible reply instead of mistaking the turn for bodyless.
+    const carrierGateInput = {
+      markTimeMs: turn.markTimeMs,
+      isLocal: turn.isLocal,
+      isScheduled: turn.isScheduled,
+      forwardLocalFinal: zeroPromptTerminalSync(),
+    };
+    notifyExplicitRepliesObserved(
+      turn.turnId,
+      attributableExplicitReplyMarkersForTurnWindow(
+        turn.turnId, carrierGateInput, nextBoundaryMs, markers, adoptMode,
+      ),
+    );
+
     const path = turn.sourceJsonlPath ?? bridgeJsonlPath;
     if (!path) continue;
     let drained = cache.get(path);
@@ -6829,12 +6847,6 @@ function emitReadyTurns(opts: { explicitTerminalOnly?: boolean } = {}): void {
 
     const gateInput = { markTimeMs: turn.markTimeMs, isLocal: turn.isLocal, isScheduled: turn.isScheduled, finalText: assistantText,
       forwardLocalFinal: zeroPromptTerminalSync() };
-    notifyExplicitRepliesObserved(
-      turn.turnId,
-      attributableExplicitReplyMarkersForTurnWindow(
-        turn.turnId, gateInput, nextBoundaryMs, markers, adoptMode,
-      ),
-    );
     if (shouldSuppressBridgeEmit(gateInput, nextBoundaryMs, markers, adoptMode, replyDeliveryMode())) {
       // Completed turn whose output went out via `botmux send` (or deliberate
       // silence) — see the codex bridge's twin for why this must arm here.

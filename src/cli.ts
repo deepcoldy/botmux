@@ -10622,6 +10622,7 @@ async function cmdSend(rest: string[]): Promise<void> {
             sentAtMs,
             messageId,
             responseKind: effectiveResponseKind,
+            terminalCarrier: 'non_patchable',
             ...(originTurnId ? { turnId: originTurnId } : {}),
             ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
           };
@@ -11176,7 +11177,12 @@ async function cmdSend(rest: string[]): Promise<void> {
     await revalidateIsolatedOriginBeforeEffect();
     return dispatchAfterOriginGate(content, msgType, uuid, suppressHook);
   };
-  const recordBridgeSendMarker = (sentAtMs: number, messageId: string, sentContent: string): void => {
+  const recordBridgeSendMarker = (
+    sentAtMs: number,
+    messageId: string,
+    sentContent: string,
+    terminalCarrier?: 'standard_reply_card' | 'non_patchable',
+  ): void => {
     try {
       const markerDir = join(resolveDataDir(), 'turn-sends');
       if (!existsSync(markerDir)) mkdirSync(markerDir, { recursive: true });
@@ -11188,6 +11194,7 @@ async function cmdSend(rest: string[]): Promise<void> {
         ...(originDispatchAttempt !== undefined ? { dispatchAttempt: originDispatchAttempt } : {}),
         ...(unifiedReplyUsed ? { replyCardResponseKind: effectiveResponseKind } : {}),
         ...(remoteRunnerOutbound ? { terminalIndependent: true } : {}),
+        ...(terminalCarrier ? { terminalCarrier } : {}),
       };
       Object.assign(marker, buildBridgeSendMarkerContent(sentContent));
       const line = JSON.stringify(marker) + '\n';
@@ -11860,6 +11867,16 @@ async function cmdSend(rest: string[]): Promise<void> {
     // after waiting. Stop here so the losing process cannot repeat indexing,
     // attachments, urgency, bridge markers, or attention side effects.
     if (turnPrimaryReplayed) {
+      if (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput) {
+        recordBridgeSendMarker(
+          Date.now(),
+          messageId,
+          text,
+          customCard || pureFileSend || pureVideoSend || files.length > 0 || videoAttachments.length > 0
+            ? 'non_patchable'
+            : 'standard_reply_card',
+        );
+      }
       console.error(`✓ 已复用本轮最终回答 ${messageId}`);
       console.log(JSON.stringify({
         success: true,
@@ -11952,7 +11969,14 @@ async function cmdSend(rest: string[]): Promise<void> {
     // cover the same final answer; detoured sends suppress only when they
     // closed a pending response card for this turn.
     if (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput) {
-      recordBridgeSendMarker(sentAtMs, messageId, text);
+      recordBridgeSendMarker(
+        sentAtMs,
+        messageId,
+        text,
+        !customCard && !pureFileSend && !pureVideoSend
+          ? 'standard_reply_card'
+          : 'non_patchable',
+      );
     }
 
     // Send attachments as separate messages — best-effort. The primary message
@@ -11971,6 +11995,17 @@ async function cmdSend(rest: string[]): Promise<void> {
       );
       failedVideoAttachments = videoResult.failed;
       videoMessageIds = videoResult.sent;
+    }
+    // Attachments are independent Lark messages posted after the main reply
+    // card. Record the actual bottom-most carrier so terminal auto mode never
+    // PATCHes an earlier card and leaves a file/voice/custom carrier below it
+    // looking like the unfinished tail of the turn. This second append is an
+    // ordered carrier refinement; the first marker above remains the early
+    // fallback-suppression proof if the process dies during attachment work.
+    const trailingCarrierMessageId = videoMessageIds.at(-1) ?? attachmentMessageIds.at(-1);
+    if (trailingCarrierMessageId
+      && (shouldRecordBridgeMarker || deferredTopicRootMessageIdForOutput)) {
+      recordBridgeSendMarker(Date.now(), trailingCarrierMessageId, '', 'non_patchable');
     }
     for (const f of failedAttachments) {
       console.error(`⚠️ 附件未发送（主消息已送达 ${messageId}，请勿重发）: ${f.path} — ${f.error}`);

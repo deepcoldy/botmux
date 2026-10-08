@@ -588,6 +588,79 @@ export function drainTraexRollout(
     });
     return true;
   };
+  const ingestCompletedItem = (
+    item: unknown,
+    itemTurnId: unknown,
+    itemBase: { uuid: string; timestampMs: number; sourceSessionId?: string },
+  ): void => {
+    const itemSourceTurnId = typeof itemTurnId === 'string' && itemTurnId.length > 0
+      ? itemTurnId
+      : undefined;
+    const userText = itemCompletedUserText(item);
+    if (userText) {
+      if (claimUserTurn(itemTurnId)) {
+        // Legacy user_message records did not always carry a turn id. When
+        // the same drain also contains their item mirror, replace the
+        // uncorrelatable legacy event with the turn-addressable item instead
+        // of starting two local turns.
+        const expectedMirror = takeExpectedTraexUserMirror(
+          pendingUserMirrors, 'item', userText, itemBase.timestampMs,
+        );
+        const legacyIndex = expectedMirror?.eventIndex;
+        if (legacyIndex !== undefined) {
+          events[legacyIndex] = {
+            ...events[legacyIndex],
+            ...(itemSourceTurnId ? { sourceTurnId: itemSourceTurnId } : {}),
+          };
+        } else if (expectedMirror?.expected === 'item' && itemSourceTurnId) {
+          events.push({
+            ...itemBase,
+            kind: 'turn_bind',
+            text: '',
+            sourceTurnId: itemSourceTurnId,
+          });
+        } else if (!expectedMirror) {
+          const preserveCollecting = shouldPreserveUnboundLegacyPredecessor(
+            pendingUserMirrors, itemSourceTurnId, itemBase.timestampMs,
+          );
+          events.push({
+            ...itemBase,
+            kind: 'user',
+            text: userText,
+            ...(itemSourceTurnId ? { sourceTurnId: itemSourceTurnId } : {}),
+            ...(preserveCollecting ? { preserveCollecting: true } : {}),
+          });
+        }
+        if (expectedMirror?.expected === 'item' && itemSourceTurnId) {
+          pendingUserMirrors.push({
+            text: userText,
+            timestampMs: itemBase.timestampMs,
+            expected: 'terminal',
+            sourceTurnId: itemSourceTurnId,
+          });
+        }
+        if (!expectedMirror && itemSourceTurnId) {
+          pendingUserMirrors.push({
+            text: userText,
+            timestampMs: itemBase.timestampMs,
+            expected: 'legacy',
+            sourceTurnId: itemSourceTurnId,
+          });
+        }
+        // New turn: drop any agent_message state an unterminated predecessor
+        // left behind so it can't be attributed to this turn.
+        if (!probe) traexPendingAgentCache.delete(path);
+      }
+      return;
+    }
+    if (!probe) {
+      // Assistant-side mirror of the UserMessage dialect. Track the last
+      // AgentMessage item as a final candidate; task_complete remains the
+      // sole terminal boundary.
+      const agentText = itemCompletedAgentText(item);
+      if (agentText) traexPendingAgentState(path).lastAgentItemText = agentText;
+    }
+  };
   let latestModel: string | undefined;
   let latestReasoningEffort: string | undefined;
   let cursor = start;
@@ -613,15 +686,35 @@ export function drainTraexRollout(
     const sourceTurnId = typeof payload.turn_id === 'string' && payload.turn_id.length > 0
       ? payload.turn_id
       : undefined;
-    // The append-only history is TraeX's canonical model/tool timeline. Its
-    // event_msg records mirror reasoning and tool completion, so consuming
-    // those too would duplicate nodes. One mutation can carry parallel calls
-    // or results; preserve their item order in one cosmetic event.
-    if (!probe && obj.type === 'history_mutation') {
-      const cotEntries = traexHistoryCotEntries(payload);
-      if (cotEntries && cotEntries.length > 0) {
-        if (sourceTurnId) bindPreservedLegacyPredecessor(sourceTurnId, base);
-        events.push({ ...base, kind: 'cot', text: '', cotEntries, ...(sourceTurnId ? { sourceTurnId } : {}) });
+    // TraeX 0.208+ folds the former event_msg/item_completed envelope into
+    // history_mutation.display_completions. Consume that authoritative UI
+    // completion before the canonical history items: response-style user
+    // messages inside payload.items alone are still internal/untrusted, while
+    // display_completions identifies the real submitted user turn. Older
+    // versions can additionally emit event_msg/item_completed; turn-id claims
+    // and idempotent agent-state assignment collapse the mirror safely.
+    if (obj.type === 'history_mutation') {
+      if (Array.isArray(payload.display_completions)) {
+        for (let index = 0; index < payload.display_completions.length; index++) {
+          const completion = payload.display_completions[index];
+          if (!completion || typeof completion !== 'object') continue;
+          ingestCompletedItem(
+            completion.item,
+            completion.turn_id ?? payload.turn_id,
+            { ...base, uuid: `${base.uuid}:display:${index}` },
+          );
+        }
+      }
+      // The append-only history is TraeX's canonical model/tool timeline. Its
+      // event_msg records mirror reasoning and tool completion, so consuming
+      // those too would duplicate nodes. One mutation can carry parallel calls
+      // or results; preserve their item order in one cosmetic event.
+      if (!probe) {
+        const cotEntries = traexHistoryCotEntries(payload);
+        if (cotEntries && cotEntries.length > 0) {
+          if (sourceTurnId) bindPreservedLegacyPredecessor(sourceTurnId, base);
+          events.push({ ...base, kind: 'cot', text: '', cotEntries, ...(sourceTurnId ? { sourceTurnId } : {}) });
+        }
       }
       continue;
     }
@@ -659,67 +752,7 @@ export function drainTraexRollout(
     }
     if (obj.type === 'event_msg'
       && payload.type === 'item_completed') {
-      const userText = itemCompletedUserText(payload.item);
-      if (userText) {
-        if (claimUserTurn(payload.turn_id)) {
-          // Legacy user_message records did not always carry a turn id. When
-          // the same drain also contains their 0.201.4 UserMessage mirror,
-          // replace the uncorrelatable legacy event with the turn-addressable
-          // item_completed event instead of starting two local turns.
-          const expectedMirror = takeExpectedTraexUserMirror(
-            pendingUserMirrors, 'item', userText, base.timestampMs,
-          );
-          const legacyIndex = expectedMirror?.eventIndex;
-          if (legacyIndex !== undefined) {
-            events[legacyIndex] = {
-              ...events[legacyIndex],
-              ...(sourceTurnId ? { sourceTurnId } : {}),
-            };
-          } else if (expectedMirror?.expected === 'item' && sourceTurnId) {
-            events.push({ ...base, kind: 'turn_bind', text: '', sourceTurnId });
-          } else if (!expectedMirror) {
-            const preserveCollecting = shouldPreserveUnboundLegacyPredecessor(
-              pendingUserMirrors, sourceTurnId, base.timestampMs,
-            );
-            events.push({
-              ...base,
-              kind: 'user',
-              text: userText,
-              ...(sourceTurnId ? { sourceTurnId } : {}),
-              ...(preserveCollecting ? { preserveCollecting: true } : {}),
-            });
-          }
-          if (expectedMirror?.expected === 'item' && sourceTurnId) {
-            pendingUserMirrors.push({
-              text: userText,
-              timestampMs: base.timestampMs,
-              expected: 'terminal',
-              sourceTurnId,
-            });
-          }
-          if (!expectedMirror && sourceTurnId) {
-            pendingUserMirrors.push({
-              text: userText,
-              timestampMs: base.timestampMs,
-              expected: 'legacy',
-              sourceTurnId,
-            });
-          }
-          // New turn: drop any agent_message state an unterminated predecessor
-          // left behind so it can't be attributed to this turn.
-          if (!probe) traexPendingAgentCache.delete(path);
-        }
-      } else if (!probe) {
-        // Assistant-side mirror of the UserMessage dialect: TraeX 0.201.4+
-        // can emit the assistant message as an item_completed AgentMessage
-        // item. Track the last one as a final candidate (the sentinel guard
-        // at task_complete distinguishes a real answer from deliberate-silence
-        // narration). Tool results and other item types yield no text.
-        const agentText = itemCompletedAgentText(payload.item);
-        if (agentText) {
-          traexPendingAgentState(path).lastAgentItemText = agentText;
-        }
-      }
+      ingestCompletedItem(payload.item, payload.turn_id, base);
       continue;
     }
     // agent_message records are narration (commentary) or the produced final

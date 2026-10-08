@@ -136,6 +136,40 @@ function historyAppend(items: unknown[], timestamp = '2000-01-01T00:00:02.000Z')
   };
 }
 
+function historyDisplayCompletion(
+  item: { type: string; id: string; content: Array<{ type: string; text: string }> },
+  turnId = '00000000-0000-7000-8000-000000000010',
+  timestamp = '2000-01-01T00:00:01.000Z',
+) {
+  return {
+    timestamp,
+    type: 'history_mutation',
+    payload: {
+      version: 1,
+      commit_id: 'commit-display',
+      turn_id: turnId,
+      operation: 'append',
+      display_completions: [{
+        thread_id: SID,
+        turn_id: turnId,
+        item,
+        started_at_ms: Date.parse(timestamp),
+        completed_at_ms: Date.parse(timestamp),
+      }],
+      items: [{
+        type: 'message',
+        id: item.id,
+        role: item.type === 'UserMessage' ? 'user' : 'assistant',
+        content: item.content.map(block => ({
+          type: item.type === 'UserMessage' ? 'input_text' : 'output_text',
+          text: block.text,
+        })),
+        ...(item.type === 'AgentMessage' ? { phase: 'final_answer' } : {}),
+      }],
+    },
+  };
+}
+
 
 // Dialect that dropped the `phase` field (cf. codex >= 0.146): the record
 // carries no phase at all, so commentary and final are byte-identical.
@@ -692,6 +726,60 @@ describe('drainTraexRollout', () => {
     ].join(''));
 
     expect(drainTraexRollout(path, 0).events.filter(event => event.kind === 'user')).toHaveLength(1);
+  });
+
+  it('ingests TraeX 0.208 display_completions as user and agent item mirrors', () => {
+    const turnId = '00000000-0000-7000-8000-000000000208';
+    writeFileSync(path, [
+      line(historyDisplayCompletion({
+        type: 'UserMessage',
+        id: 'msg-user-208',
+        content: [{ type: 'text', text: '0.208 submitted prompt' }],
+      }, turnId)),
+      line(historyDisplayCompletion({
+        type: 'AgentMessage',
+        id: 'msg-agent-208',
+        content: [{ type: 'Text', text: 'BOTMUX_NOTHING_TO_SEND' }],
+      }, turnId, '2000-01-01T00:00:02.000Z')),
+      line({
+        ...taskComplete(),
+        payload: { ...taskComplete().payload, turn_id: turnId },
+      }),
+    ].join(''));
+
+    expect(drainTraexRollout(path, 0).events).toEqual([
+      expect.objectContaining({
+        kind: 'user',
+        text: '0.208 submitted prompt',
+        sourceTurnId: turnId,
+      }),
+      expect.objectContaining({
+        kind: 'assistant_final',
+        text: 'BOTMUX_NOTHING_TO_SEND',
+        sourceTurnId: turnId,
+      }),
+    ]);
+  });
+
+  it('does not double-count a 0.208 display completion and legacy item mirror', () => {
+    const turnId = '00000000-0000-7000-8000-000000000209';
+    const item = {
+      type: 'UserMessage',
+      id: 'msg-user-209',
+      content: [{ type: 'text', text: 'same 0.208 turn' }],
+    };
+    writeFileSync(path, [
+      line(historyDisplayCompletion(item, turnId)),
+      line(itemCompleted(item, turnId, '2000-01-01T00:00:01.001Z')),
+      line({
+        ...taskComplete('done'),
+        payload: { ...taskComplete('done').payload, turn_id: turnId },
+      }),
+    ].join(''));
+
+    const events = drainTraexRollout(path, 0).events;
+    expect(events.filter(event => event.kind === 'user')).toHaveLength(1);
+    expect(events.filter(event => event.kind === 'assistant_final')).toHaveLength(1);
   });
 
   it('does not double-count a legacy user_message without turn_id before its item_completed mirror', () => {
