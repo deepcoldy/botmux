@@ -32,6 +32,14 @@ The default remains disabled. The public runtime reads only provider-neutral set
 
 The provider inherits the daemon environment because it is selected by the operator and may need file-based credential references. Provider code must keep secrets out of stdout, stderr, argv, receipts, and durable JSON values.
 
+## CLI state and deployment responsibility
+
+Durable coordination covers BotMux routing, canonical Session snapshots, inbox ownership and single-message outbox settlement. It does not replicate a CLI provider's transcript, auto-memory, working tree, role/knowledge files or other filesystem state. Enabling `primary` therefore does not by itself make an active model turn or provider-native resume portable across replicas.
+
+The first primary release requires one of two deployment policies: keep a live CLI runtime sticky to the replica that owns its provider state, or use an operator-supplied remote runner/filesystem layer that makes the provider state visible after takeover. When a provider buckets resume or memory state by an absolute working-directory path, every eligible replica must expose the same logical state at the same path. `BOTMUX_REMOTE_RUNNER_STATE_ROOT` is only an opaque value forwarded to the selected runner; BotMux neither mounts nor interprets it.
+
+Coordination between different Sessions that write a shared memory or knowledge directory is also outside the Session lease. The deployment's runner/filesystem layer must provide the required isolation, locking or merge policy. Until that layer proves otherwise, replica takeover guarantees routing and delivery recovery only; it must not be described as lossless active-turn or CLI-context failover.
+
 ## Rollout boundary
 
 `shadow` starts the provider, verifies the exact public contract, and keeps the process alive through daemon shutdown. After the Lark SDK callback has returned to the ACK path, `im.message.receive_v1` is also mirrored into the durable inbox with a stable message-derived `eventId` and the existing raw chat ingress lane as `partitionKey`.
