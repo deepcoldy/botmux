@@ -25,8 +25,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: midscene-e2e-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: feishu-live-e2e-shared-lock
+  cancel-in-progress: false
 
 jobs:
   midscene-report:
@@ -136,6 +136,7 @@ jobs:
         env:
           FEISHU_STORAGE_STATE_BASE64: ${{ secrets.FEISHU_STORAGE_STATE_BASE64 }}
           FEISHU_STORAGE_STATE_GZIP_BASE64: ${{ secrets.FEISHU_STORAGE_STATE_GZIP_BASE64 }}
+          FEISHU_E2E_BOTS_JSON: ${{ secrets.FEISHU_E2E_BOTS_JSON }}
         run: |
           missing=()
           [[ -n "${FEISHU_TEST_GROUP_URL:-}" ]] || missing+=("FEISHU_TEST_GROUP_URL")
@@ -154,6 +155,12 @@ jobs:
           fi
           node -e "const fs=require('node:fs'); const value=JSON.parse(fs.readFileSync('storageState.json','utf8')); if (!Array.isArray(value.cookies) || value.cookies.length === 0) throw new Error('The Feishu Playwright storage state has no cookies')"
           echo "ready=true" >> "$GITHUB_OUTPUT"
+          if [[ -n "${FEISHU_E2E_BOTS_JSON:-}" ]]; then
+            printf '%s' "$FEISHU_E2E_BOTS_JSON" > test-bots.json
+            echo "has_bots=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_bots=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Run migrated Feishu Midscene project
         id: feishu_midscene
@@ -164,6 +171,9 @@ jobs:
         if: always() && !cancelled() && steps.feishu_config.outputs.ready == 'true'
         env:
           MIDSCENE_RUN_DIR: ${{ github.workspace }}/midscene_run/feishu
+          BOTMUX_MOCK_LLM: "1"
+          BOTMUX_START_DAEMON: ${{ steps.feishu_config.outputs.has_bots }}
+          BOTS_CONFIG: test-bots.json
         run: bun run test:midscene:feishu
 
       - name: Prepare linked Midscene evidence site

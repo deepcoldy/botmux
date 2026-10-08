@@ -55,19 +55,71 @@ if (useMockLlm) {
   process.env.OPENAI_API_KEY = 'mock-key';
 }
 
-const forwardedArgs = process.argv.slice(2).filter((arg) => arg !== '--mock-llm');
+const daemonChildren: import('node:child_process').ChildProcess[] = [];
+const startDaemon =
+  process.argv.includes('--start-daemon') ||
+  process.env.BOTMUX_START_DAEMON === 'true' ||
+  process.env.BOTMUX_START_DAEMON === '1';
+
+if (startDaemon && process.env.BOTS_CONFIG) {
+  const { loadBotConfigs } = await import('../src/bot-registry.js');
+  const bots = loadBotConfigs();
+  console.log(
+    `[run-e2e] Spawning test daemon(s) for ${bots.length} bot(s) from ${process.env.BOTS_CONFIG}...`,
+  );
+  for (let i = 0; i < bots.length; i++) {
+    const proc = spawn(process.execPath, ['src/index-daemon.ts'], {
+      env: {
+        ...process.env,
+        BOTMUX_BOT_INDEX: String(i),
+        BOTMUX_DAEMON_IPC_BASE_PORT:
+          process.env.BOTMUX_DAEMON_IPC_BASE_PORT ?? '17950',
+        BOTMUX_WEB_PROXY_BASE_PORT:
+          process.env.BOTMUX_WEB_PROXY_BASE_PORT ?? '18800',
+      },
+      stdio: 'inherit',
+    });
+    daemonChildren.push(proc);
+  }
+  // Allow daemons to connect to Feishu WebSocket gateway
+  await new Promise((resolve) => setTimeout(resolve, 3000));
+}
+
+const forwardedArgs = process.argv
+  .slice(2)
+  .filter((arg) => arg !== '--mock-llm' && arg !== '--start-daemon');
 
 const child = spawn(
   'midscene-test',
   ['test/e2e-browser', '--result-dir', runDir, ...forwardedArgs],
-  { stdio: 'inherit', env: process.env, shell: false }
+  { stdio: 'inherit', env: process.env, shell: false },
 );
 
-child.on('exit', async (code, signal) => {
+const cleanup = async () => {
+  for (const dc of daemonChildren) {
+    try {
+      dc.kill('SIGTERM');
+    } catch {
+      /* ignore */
+    }
+  }
   if (mockServer) {
     await mockServer.stop();
   }
+};
+
+child.on('exit', async (code, signal) => {
+  await cleanup();
   if (signal) process.kill(process.pid, signal);
   else process.exit(code ?? 1);
+});
+
+process.on('SIGINT', async () => {
+  await cleanup();
+  process.exit(130);
+});
+process.on('SIGTERM', async () => {
+  await cleanup();
+  process.exit(143);
 });
 
