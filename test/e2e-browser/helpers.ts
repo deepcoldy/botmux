@@ -181,6 +181,7 @@ export async function openChat(
   // agent. The display name is `[Botmux]<Name>` and it carries a Bot badge
   // (机器人), whereas the native agent is labelled 智能体 and has no prefix.
   const chatName = botChatName(botName);
+  let opened = false;
   // Try clicking directly first
   try {
     await agent.aiAct(
@@ -189,8 +190,17 @@ export async function openChat(
         `不要点同名的原生智能体（名称只有"${botName}"、带"智能体"徽标、没有 [Botmux] 前缀），` +
         '也不要点话题里的消息或群聊。',
     );
+    await agent.aiWaitFor(
+      `右侧聊天区域顶部标题栏显示 Botmux 机器人会话名"${chatName}"，而不是名称仅为"${botName}"的原生智能体`,
+      { timeoutMs: 8_000, checkIntervalMs: 2_000 },
+    );
+    opened = true;
   } catch {
-    // Chat not visible in sidebar — use search to find it
+    opened = false;
+  }
+
+  if (!opened) {
+    // Chat not visible or direct click failed — use search to find it
     await page.keyboard.press('Control+k');
     await page.waitForTimeout(1000);
     await page.keyboard.type(chatName);
@@ -202,13 +212,12 @@ export async function openChat(
     // Close search overlay if still open
     await page.keyboard.press('Escape');
     await page.waitForTimeout(500);
+    // Wait for chat to load
+    await agent.aiWaitFor(
+      `右侧聊天区域顶部标题栏显示 Botmux 机器人会话名"${chatName}"，而不是名称仅为"${botName}"的原生智能体`,
+      { timeoutMs: 15_000, checkIntervalMs: 3_000 },
+    );
   }
-  // Wait for chat to load — the header must show the prefixed bot name (this
-  // also guards against having opened the native agent).
-  await agent.aiWaitFor(
-    `右侧聊天区域顶部标题栏显示 Botmux 机器人会话名"${chatName}"，而不是名称仅为"${botName}"的原生智能体`,
-    { timeoutMs: 15_000, checkIntervalMs: 3_000 },
-  );
 }
 
 // ---------------------------------------------------------------------------

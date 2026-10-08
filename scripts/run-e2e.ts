@@ -5,6 +5,7 @@
  * runs without mixing logs, screenshots, or HTML reports.
  */
 import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import { sweepOrphanSchedTasks } from '../test/e2e-browser/schedule-cleanup.js';
 
 const groupUrl = process.env.FEISHU_TEST_GROUP_URL;
@@ -61,28 +62,36 @@ const startDaemon =
   process.env.BOTMUX_START_DAEMON === 'true' ||
   process.env.BOTMUX_START_DAEMON === '1';
 
-if (startDaemon && process.env.BOTS_CONFIG) {
-  const { loadBotConfigs } = await import('../src/bot-registry.js');
-  const bots = loadBotConfigs();
-  console.log(
-    `[run-e2e] Spawning test daemon(s) for ${bots.length} bot(s) from ${process.env.BOTS_CONFIG}...`,
-  );
-  for (let i = 0; i < bots.length; i++) {
-    const proc = spawn(process.execPath, ['src/index-daemon.ts'], {
-      env: {
-        ...process.env,
-        BOTMUX_BOT_INDEX: String(i),
-        BOTMUX_DAEMON_IPC_BASE_PORT:
-          process.env.BOTMUX_DAEMON_IPC_BASE_PORT ?? '17950',
-        BOTMUX_WEB_PROXY_BASE_PORT:
-          process.env.BOTMUX_WEB_PROXY_BASE_PORT ?? '18800',
-      },
-      stdio: 'inherit',
-    });
-    daemonChildren.push(proc);
+if (startDaemon) {
+  const botsConfig =
+    process.env.BOTS_CONFIG ||
+    (existsSync('test-bots.json') ? 'test-bots.json' : undefined);
+  if (botsConfig) {
+    process.env.BOTS_CONFIG = botsConfig;
+    const { loadBotConfigs } = await import('../src/bot-registry.js');
+    const { resolveBunExecutable } = await import('../test/helpers/ts-runner.js');
+    const bunBin = resolveBunExecutable() ?? 'bun';
+    const bots = loadBotConfigs();
+    console.log(
+      `[run-e2e] Spawning test daemon(s) for ${bots.length} bot(s) from ${botsConfig} using ${bunBin}...`,
+    );
+    for (let i = 0; i < bots.length; i++) {
+      const proc = spawn(bunBin, ['src/index-daemon.ts'], {
+        env: {
+          ...process.env,
+          BOTMUX_BOT_INDEX: String(i),
+          BOTMUX_DAEMON_IPC_BASE_PORT:
+            process.env.BOTMUX_DAEMON_IPC_BASE_PORT ?? '17950',
+          BOTMUX_WEB_PROXY_BASE_PORT:
+            process.env.BOTMUX_WEB_PROXY_BASE_PORT ?? '18800',
+        },
+        stdio: 'inherit',
+      });
+      daemonChildren.push(proc);
+    }
+    // Allow daemons to connect to Feishu WebSocket gateway
+    await new Promise((resolve) => setTimeout(resolve, 5000));
   }
-  // Allow daemons to connect to Feishu WebSocket gateway
-  await new Promise((resolve) => setTimeout(resolve, 3000));
 }
 
 const forwardedArgs = process.argv
@@ -99,6 +108,14 @@ const cleanup = async () => {
   for (const dc of daemonChildren) {
     try {
       dc.kill('SIGTERM');
+    } catch {
+      /* ignore */
+    }
+  }
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  for (const dc of daemonChildren) {
+    try {
+      if (!dc.killed) dc.kill('SIGKILL');
     } catch {
       /* ignore */
     }

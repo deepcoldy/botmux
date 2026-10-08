@@ -59,13 +59,38 @@ export class TapeRecorder {
     reqBody: any,
     upstreamBaseUrl: string,
   ): Promise<void> {
-    const url = new URL(req.url ?? '/', upstreamBaseUrl);
+    const base = new URL(upstreamBaseUrl);
+    const rawUrl = req.url ?? '/';
+    // Reject absolute URLs or protocol-relative paths to prevent SSRF
+    if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(rawUrl) || rawUrl.startsWith('//')) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid request URL: absolute URLs are not allowed' }));
+      return;
+    }
+
+    const [pathPart, queryPart] = rawUrl.split('?');
+    const safePath = pathPart.startsWith('/') ? pathPart : `/${pathPart}`;
+    const basePath = base.pathname.replace(/\/+$/, '');
+    const combinedPath = `${basePath}${safePath}`.replace(/\/+/g, '/');
+
+    const targetUrl = new URL(base.origin);
+    targetUrl.pathname = combinedPath;
+    if (queryPart) {
+      targetUrl.search = queryPart;
+    }
+
+    if (targetUrl.origin !== base.origin) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'SSRF protection: origin mismatch' }));
+      return;
+    }
+
     const headers = { ...req.headers };
     delete headers.host;
     delete headers['content-length'];
     headers['accept-encoding'] = 'identity';
 
-    const upstreamReq = await fetch(url.toString(), {
+    const upstreamReq = await fetch(targetUrl.toString(), {
       method: req.method ?? 'POST',
       headers: headers as Record<string, string>,
       body: reqBody ? JSON.stringify(reqBody) : undefined,
