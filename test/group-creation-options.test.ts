@@ -18,7 +18,7 @@ describe('/g customization', () => {
   it.each(['--tag "unclosed', '--agents', '--agents a,,b', '--tag', '--avatar random', '--oops value', '--tag A --no-tag', '--no-agents=x'])('rejects invalid options: %s', raw => {
     expect(() => parseGroupCreationArgs(raw)).toThrow();
   });
-  it.each([null, [], { agents: 'Review' }, { agents: [''] }, { avatar: true }, { tag: '字'.repeat(61) }, { typo: 1 }])('rejects malformed defaults', value => {
+  it.each([null, [], { agents: 'Review' }, { agents: [''] }, { avatar: true }, { tag: '字'.repeat(61) }, { typo: 1 }].map(value => ({ value })))('rejects malformed defaults', ({ value }) => {
     expect(() => parseGroupCreationDefaults(value)).toThrow();
   });
   it('resolves peers outside the source chat, deduplicates and rejects ambiguity', () => {
