@@ -255,7 +255,6 @@ function envCommandArgs(env: Record<string, string>): string[] {
 function sharedServerEnv(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const safeKeys = [
     'PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL',
-    'TMPDIR', 'TMP', 'TEMP',
     'XDG_CONFIG_HOME', 'XDG_RUNTIME_DIR',
     'LANG', 'LC_ALL', 'LC_CTYPE', 'TERM', 'COLORTERM',
   ];

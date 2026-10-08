@@ -13,6 +13,7 @@ import {
   sessionTempDir,
 } from '../src/core/session-temp.js';
 import { buildBotmuxEnvAssignments } from '../src/adapters/backend/tmux-backend.js';
+import { tmuxEnv } from '../src/setup/ensure-tmux.js';
 
 const roots: string[] = [];
 
@@ -75,10 +76,39 @@ describe('session temp', () => {
     const onError = vi.fn();
 
     cleanupSessionTempDirAfterExit(data, 'closing', worker, onError);
+    await new Promise(resolve => setTimeout(resolve, 20));
     expect(existsSync(path)).toBe(true);
     worker.emit('exit', 0, null);
     await vi.waitFor(() => expect(existsSync(path)).toBe(false));
     expect(onError).not.toHaveBeenCalled();
+  });
+
+  it('rechecks ownership at exit and preserves a resumed generation', async () => {
+    const data = dataDir();
+    const path = ensureSessionTempDir(data, 'resumed');
+    roots.push(dirname(path));
+    const worker = Object.assign(new EventEmitter(), { exitCode: null, signalCode: null }) as ChildProcess;
+    let ownerIsClosed = true;
+    cleanupSessionTempDirAfterExit(data, 'resumed', worker, vi.fn(), () => ownerIsClosed);
+    ownerIsClosed = false;
+    writeFileSync(join(path, 'new-generation'), 'live');
+    worker.emit('exit', 0, null);
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(readFileSync(join(path, 'new-generation'), 'utf8')).toBe('live');
+  });
+
+  it('detaches the old tree before asynchronous deletion so immediate resume survives', async () => {
+    const data = dataDir();
+    const path = ensureSessionTempDir(data, 'during-removal');
+    roots.push(dirname(path));
+    writeFileSync(join(path, 'old'), 'closed');
+    const pending = cleanupSessionTempDir(data, 'during-removal');
+    expect(existsSync(path)).toBe(false);
+    ensureSessionTempDir(data, 'during-removal');
+    writeFileSync(join(path, 'new'), 'live');
+    await pending;
+    expect(readFileSync(join(path, 'new'), 'utf8')).toBe('live');
+    expect(existsSync(join(path, 'old'))).toBe(false);
   });
 
   it('refuses a symlink planted at the session path', () => {
@@ -94,5 +124,13 @@ describe('session temp', () => {
     const path = '/srv/botmux/tmp/sessions/s1';
     const out = buildBotmuxEnvAssignments({ TMPDIR: path, TMP: path, TEMP: path });
     expect(out).toEqual([`TMPDIR=${path}`, `TMP=${path}`, `TEMP=${path}`]);
+  });
+
+  it('does not seed a shared tmux server with the session scratch environment', () => {
+    const env = { TMPDIR: '/session/scratch', TMP: '/session/scratch', TEMP: '/session/scratch', PATH: '/usr/bin' };
+    const client = tmuxEnv(env);
+    for (const key of ['TMPDIR', 'TMP', 'TEMP']) expect(client[key]).toBeUndefined();
+    expect(client.PATH?.split(':')).toContain('/usr/bin');
+    expect(env.TMPDIR).toBe('/session/scratch');
   });
 });

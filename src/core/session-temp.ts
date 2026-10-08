@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto';
-import { lstatSync, mkdirSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import { lstatSync, mkdirSync, renameSync } from 'node:fs';
 import { rm } from 'node:fs/promises';
 import type { ChildProcess } from 'node:child_process';
 import { join, resolve } from 'node:path';
@@ -53,7 +53,16 @@ export function ensureSessionTempDir(dataDir: string, sessionId: string): string
 
 /** Best-effort caller decides when the logical session is durably closed. */
 export async function cleanupSessionTempDir(dataDir: string, sessionId: string): Promise<void> {
-  await rm(sessionTempDir(dataDir, sessionId), { recursive: true, force: true });
+  const path = sessionTempDir(dataDir, sessionId);
+  const retiredPath = `${path}.retired-${process.pid}-${randomBytes(8).toString('hex')}`;
+  // Claim the old tree synchronously. A resume during asynchronous removal
+  // recreates `path`, and the remover can only traverse the detached tree.
+  try { renameSync(path, retiredPath); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  await rm(retiredPath, { recursive: true, force: true });
 }
 
 /** Cleanup must wait for actual worker exit: its close ACK precedes teardown. */
@@ -62,8 +71,13 @@ export function cleanupSessionTempDirAfterExit(
   sessionId: string,
   worker: ChildProcess | undefined,
   onError: (error: unknown) => void,
+  mayCleanup: () => boolean = () => true,
 ): void {
-  const cleanup = () => { void cleanupSessionTempDir(dataDir, sessionId).catch(onError); };
+  const cleanup = () => {
+    try {
+      if (mayCleanup()) void cleanupSessionTempDir(dataDir, sessionId).catch(onError);
+    } catch (error) { onError(error); }
+  };
   if (worker && worker.exitCode === null && worker.signalCode === null) {
     worker.once('exit', cleanup);
   } else {

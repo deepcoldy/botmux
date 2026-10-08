@@ -16816,7 +16816,8 @@ async function spawnCli(
   // bare creds (forkWorker) for lark-upload. See utils/child-env.ts.
   const childEnv = buildSessionChildEnv(process.env, cfg.envPolicy);
   if (cfg.promptInjection === 'none') clearBotmuxPromptEnv(childEnv);
-  applySessionTempEnv(childEnv, sessionScratchDir);
+  // buildSessionChildEnv preserves TMPDIR/TMP/TEMP in both inheritance modes.
+  // The worker pin above is the single source for CLI and worker scratch.
   childEnv[PLUGIN_CARD_ACTION_CAPABILITIES_ENV] = cardActionCapabilities;
   if (sessionMcpGatewayHost) {
     childEnv[MCP_GATEWAY_SOCKET_ENV] = sessionMcpGatewayHost.socketPath;

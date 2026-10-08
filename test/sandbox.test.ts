@@ -12,8 +12,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { mkdtempSync, existsSync, writeFileSync, readFileSync, symlinkSync, realpathSync, mkdirSync, rmSync, statSync, chmodSync, utimesSync } from 'node:fs';
 import { buildCredentialOnlySandboxArgs, buildRelayHostEnv, validateRelayRequest, materializeOutboxFile, prepareDirectSandbox, attachSandboxOutbox, sweepOrphanSandboxes, coreOnlyPidNamespaceDegrade, bwrapCanUnsharePid, pidNsDualProbeCanUnshare, __testOnly_resetPidNamespaceProbe } from '../src/adapters/backend/sandbox.js';
-import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 import { rmSandboxScratch } from './helpers/rm-sandbox-scratch.js';
+import { createCodexAppAdapter } from '../src/adapters/cli/codex-app.js';
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'sbx-'));
 
@@ -197,6 +197,7 @@ describe('prepareDirectSandbox canonicalizes the exec bin (symlinked-$HOME)', ()
       sessionId: 'binlink', dataDir: tmp(),
       policy: { rules: [], net: true, writeRegexes: [] },
       chdir: dir, home: dir, cliBin: linkBin, cliArgs: ['--v'],
+      tempDir: join(dir, 'session-temp'),
     });
     // Off-CI without bwrap installed prepareDirectSandbox returns null (dep gate);
     // only assert the canonicalization when it actually produced a plan.
@@ -207,6 +208,12 @@ describe('prepareDirectSandbox canonicalizes the exec bin (symlinked-$HOME)', ()
     expect(execTarget).toBe(realpathSync(linkBin)); // canonical, not the lexical symlink
     expect(execTarget).not.toBe(linkBin);
     expect(r.args.slice(dashDash + 2)).toEqual(['--v']); // cliArgs preserved verbatim
+    for (const key of ['TMPDIR', 'TMP', 'TEMP']) {
+      const index = r.args.indexOf(key);
+      expect(index).toBeGreaterThan(0);
+      expect(r.args[index - 1]).toBe('--setenv');
+      expect(r.args[index + 1]).toBe(join(dir, 'session-temp'));
+    }
     r.cleanup();
   });
 });

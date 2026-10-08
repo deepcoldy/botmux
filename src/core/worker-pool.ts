@@ -8142,6 +8142,12 @@ export async function closeSession(
         `[${sessionId.slice(0, 8)}] failed to clean session scratch: `
         + `${error instanceof Error ? error.message : String(error)}`,
       );
+    }, () => {
+      // A close ACK precedes exit. Resume can install a replacement owner
+      // before this callback runs; even a workerless active row owns scratch.
+      if (findActiveBySessionId(sessionId)) return false;
+      if (retiringWorkersForSession(sessionId).some(worker => worker !== closingWorker)) return false;
+      return sessionStore.getOwnedSession(sessionId)?.status === 'closed';
     });
   }
   const runClosedLifecycle = async (workerExitProven: boolean): Promise<void> => {

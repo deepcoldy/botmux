@@ -192,6 +192,7 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllEnvs();
 });
 
 // ─── Backend connection surface ────────────────────────────────────────────
@@ -678,6 +679,7 @@ describe('HerdrBackend.spawn', () => {
   });
 
   it('keeps the machine-wide shared server credential-neutral while passing env to its agent', () => {
+    for (const key of ['TMPDIR', 'TMP', 'TEMP']) vi.stubEnv(key, '/session/scratch');
     let listCount = 0;
     setHerdrResponses([
       {
@@ -700,16 +702,18 @@ describe('HerdrBackend.spawn', () => {
     });
     be.spawn('claude', [], {
       cwd: '/work', cols: 80, rows: 24,
-      env: { BOTMUX_SESSION_ID: 'topic1' },
+      env: { BOTMUX_SESSION_ID: 'topic1', TMPDIR: '/session/scratch', TMP: '/session/scratch', TEMP: '/session/scratch' },
       injectEnv: { ANTHROPIC_AUTH_TOKEN: 'bot-secret' },
     });
 
     const serverSpawn = mockedSpawn.mock.calls.find(c => (c[1] as string[]).includes('server'));
     expect(serverSpawn?.[2].env.BOTMUX_SESSION_ID).toBeUndefined();
     expect(serverSpawn?.[2].env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    for (const key of ['TMPDIR', 'TMP', 'TEMP']) expect(serverSpawn?.[2].env[key]).toBeUndefined();
     const startOpts = findCallOpts(a => a.includes('agent') && a.includes('start'));
     expect(startOpts?.env?.BOTMUX_SESSION_ID).toBe('topic1');
     expect(startOpts?.env?.ANTHROPIC_AUTH_TOKEN).toBe('bot-secret');
+    for (const key of ['TMPDIR', 'TMP', 'TEMP']) expect(startOpts?.env?.[key]).toBe('/session/scratch');
     be.kill();
   });
 
