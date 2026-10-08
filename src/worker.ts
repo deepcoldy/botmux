@@ -17935,6 +17935,7 @@ async function spawnCli(
         mcpGatewaySocketPath: sessionMcpGatewayHost?.socketPath,
         childEnvForce: { CODEX_HOME: nativeCodexHome, TRAE_HOME: nativeTraeHome },
         readOnlyCarvePaths: scratchReadOnlyCarves,
+        useBwrapArgsFile: effectiveBackendType === 'tmux',
       });
       if (!sbx) {
         throw new Error('scratch sandbox requested but could not be established (overlay/bwrap setup failed, or the tmpfs upper was lost in a reboot) — start a new session; never bare-running');

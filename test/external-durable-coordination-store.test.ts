@@ -70,6 +70,8 @@ describe('external durable coordination provider', () => {
 describe('durable coordination runtime configuration', () => {
   it('keeps the default disabled and primary fail-closed', async () => {
     await expect(initializeDurableCoordinationRuntime({})).resolves.toBeUndefined();
+    await expect(initializeDurableCoordinationRuntime({ BOTMUX_COORDINATION_MODE: '' })).resolves.toBeUndefined();
+    await expect(initializeDurableCoordinationRuntime({ BOTMUX_COORDINATION_MODE: '   ' })).resolves.toBeUndefined();
     await expect(initializeDurableCoordinationRuntime({ BOTMUX_COORDINATION_MODE: 'primary' }))
       .rejects.toThrow(/primary is unavailable/);
   });

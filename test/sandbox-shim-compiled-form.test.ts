@@ -292,5 +292,12 @@ describe.skipIf(process.platform !== 'linux' || !bwrapUsable)('sandbox shim over
     expect(callEnd).toBeGreaterThan(callStart);
     const callRegion = stripComments(src.slice(callStart, callEnd));
     expect(callRegion).toContain("useBwrapArgsFile: effectiveBackendType === 'tmux',");
+
+    const scratchStart = src.indexOf('const sbx = prepareScratchSandbox({');
+    expect(scratchStart).toBeGreaterThanOrEqual(0);
+    const scratchEnd = src.indexOf('      });', scratchStart);
+    expect(scratchEnd).toBeGreaterThan(scratchStart);
+    const scratchRegion = stripComments(src.slice(scratchStart, scratchEnd));
+    expect(scratchRegion).toContain("useBwrapArgsFile: effectiveBackendType === 'tmux',");
   });
 });

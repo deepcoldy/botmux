@@ -17,7 +17,8 @@ export interface DurableCoordinationRuntime {
 }
 
 function modeFromEnv(env: NodeJS.ProcessEnv): DurableCoordinationMode {
-  const mode = (env.BOTMUX_COORDINATION_MODE ?? 'disabled').trim();
+  const raw = env.BOTMUX_COORDINATION_MODE?.trim();
+  const mode = raw || 'disabled';
   if (mode !== 'disabled' && mode !== 'shadow' && mode !== 'primary') {
     throw new Error('BOTMUX_COORDINATION_MODE must be disabled, shadow, or primary');
   }
