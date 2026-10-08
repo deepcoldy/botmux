@@ -7,6 +7,7 @@ import { CODEX_CONNECTION_ERROR_CODE, CODEX_RATE_LIMIT_ERROR_CODE } from '../src
 import {
   isBridgeNothingToSendFinal,
   shouldEmitEmptyCompletedBridgeFallback,
+  structuredFallbackKind,
 } from '../src/services/bridge-fallback-gate.js';
 import {
   drainTraexRollout,
@@ -132,6 +133,22 @@ function historyAppend(items: unknown[], timestamp = '2000-01-01T00:00:02.000Z')
       turn_id: '00000000-0000-7000-8000-000000000010',
       operation: 'append',
       items,
+    },
+  };
+}
+
+function canonicalCompletion(item: unknown, timestamp = '2000-01-01T00:00:01.000Z') {
+  return {
+    ...historyAppend([], timestamp),
+    payload: {
+      ...historyAppend([]).payload,
+      display_completions: [{
+        thread_id: SID,
+        turn_id: '00000000-0000-7000-8000-000000000010',
+        item,
+        started_at_ms: Date.parse(timestamp),
+        completed_at_ms: Date.parse(timestamp),
+      }],
     },
   };
 }
@@ -317,6 +334,289 @@ describe('findTraexRolloutBySessionId', () => {
 });
 
 describe('drainTraexRollout', () => {
+  it.each([
+    'model output limit exceeded: max_output_tokens',
+    'stream disconnected before completion: invalid completed function call arguments: EOF while parsing a string',
+  ])('binds canonical display input to a failed turn: %s', (message) => {
+    const input = itemCompleted({
+      type: 'UserMessage', id: 'canonical-user',
+      content: [{ type: 'text', text: 'investigate failure' }],
+    });
+    const mutation = canonicalCompletion(input.payload.item, input.timestamp);
+    writeFileSync(path, line(mutation) + line(taskCompleteWithError({ message })));
+    expect(traexRolloutHasUserInputSince(path, 0, 'investigate failure')).toBe(true);
+    const queue = new CodexBridgeQueue();
+    queue.mark('remote-turn', 'investigate failure', Date.parse(input.timestamp) - 1);
+    const events = drainTraexRollout(path, 0).events;
+    queue.ingest(events);
+    const ready = queue.drainEmittable();
+    expect(ready).toEqual([
+      expect.objectContaining({ turnId: 'remote-turn', terminalStatus: 'failed' }),
+    ]);
+    for (const mode of ['send', 'transcript'] as const) {
+      expect(structuredFallbackKind(ready[0], undefined, [], false, false, mode)).toBe('failed');
+    }
+    queue.ingest(events);
+    expect(queue.drainEmittable()).toEqual([]);
+  });
+
+  it('recovers a canonical final without treating commentary as completion', () => {
+    const display = (text: string, phase: string) => canonicalCompletion({
+      type: 'AgentMessage', id: `agent-${phase}`, phase,
+      content: [{ type: 'Text', text }],
+    }, '2000-01-01T00:00:02.000Z');
+    writeFileSync(path, line(user('work')) + line(display('still working', 'commentary')));
+    const first = drainTraexRollout(path, 0);
+    expect(first.events.filter(event => event.kind === 'assistant_final')).toEqual([]);
+    appendFileSync(path, line(display('finished result', 'final_answer')) + line(taskComplete()));
+    expect(drainTraexRollout(path, first.newOffset).events).toEqual([
+      expect.objectContaining({ kind: 'assistant_final', text: 'finished result' }),
+    ]);
+  });
+
+  it('does not recover another turn from a replayed canonical final', () => {
+    const firstTurnId = '00000000-0000-7000-8000-000000000010';
+    const secondTurnId = '00000000-0000-7000-8000-000000000011';
+    const answer = canonicalCompletion({
+      type: 'AgentMessage', id: 'replayed-answer', phase: 'final_answer',
+      content: [{ type: 'Text', text: 'first answer' }],
+    }, '2000-01-01T00:00:02.000Z');
+    writeFileSync(path, line(user('first', undefined, firstTurnId))
+      + line(answer) + line(taskComplete()));
+    const first = drainTraexRollout(path, 0);
+    expect(first.events.at(-1)).toEqual(expect.objectContaining({ text: 'first answer' }));
+    appendFileSync(path, line(user('second', '2000-01-01T00:00:04.000Z', secondTurnId))
+      + line({ ...answer, timestamp: '2000-01-01T00:00:05.000Z' })
+      + line({
+        ...taskComplete(),
+        timestamp: '2000-01-01T00:00:06.000Z',
+        payload: { ...taskComplete().payload, turn_id: secondTurnId },
+      }));
+    expect(drainTraexRollout(path, first.newOffset).events.at(-1)).toEqual(
+      expect.objectContaining({ sourceTurnId: secondTurnId, text: '' }),
+    );
+  });
+
+  it.each(['canonical-first', 'legacy-first'])(
+    'keeps canonical commentary out of final recovery across assistant mirrors: %s', (order) => {
+      const agent = {
+        type: 'AgentMessage', id: 'mirrored-commentary', phase: 'commentary',
+        content: [{ type: 'Text', text: 'still working' }],
+      };
+      const canonical = canonicalCompletion(agent);
+      const legacy = itemCompleted(agent);
+      const records = order === 'canonical-first' ? [canonical, legacy] : [legacy, canonical];
+      writeFileSync(path, line(user('work')) + records.map(line).join('') + line(taskComplete()));
+      expect(drainTraexRollout(path, 0).events.at(-1)).toEqual(
+        expect.objectContaining({ kind: 'assistant_final', text: '' }),
+      );
+    },
+  );
+
+  it('preserves canonical final recovery when a delayed user mirror binds the turn', () => {
+    writeFileSync(path, line(user('delayed input'))
+      + line(canonicalCompletion({
+        type: 'AgentMessage', id: 'answer-before-mirror', phase: 'final_answer',
+        content: [{ type: 'Text', text: 'preserved answer' }],
+      }, '2000-01-01T00:00:02.000Z')));
+    const first = drainTraexRollout(path, 0);
+    appendFileSync(path, line(canonicalCompletion({
+      type: 'UserMessage', id: 'delayed-user-mirror',
+      content: [{ type: 'text', text: 'delayed input' }],
+    }, '2000-01-01T00:00:02.500Z')) + line(taskComplete()));
+    const second = drainTraexRollout(path, first.newOffset);
+    expect(second.events).toEqual([
+      expect.objectContaining({ kind: 'turn_bind' }),
+      expect.objectContaining({ kind: 'assistant_final', text: 'preserved answer' }),
+    ]);
+  });
+
+  it('does not let a replayed terminal consume the next legacy answer', () => {
+    const firstTurnId = '00000000-0000-7000-8000-000000000010';
+    const secondTurnId = '00000000-0000-7000-8000-000000000012';
+    writeFileSync(path, line(user('first', undefined, firstTurnId)) + line(taskComplete('first answer')));
+    const first = drainTraexRollout(path, 0);
+    appendFileSync(path, line(user('second', '2000-01-01T00:00:04.000Z'))
+      + line(agentMessage('second answer', 'final_answer')));
+    const second = drainTraexRollout(path, first.newOffset);
+    appendFileSync(path, line(taskComplete())
+      + line({ ...taskComplete(), payload: { ...taskComplete().payload, turn_id: secondTurnId } }));
+    const finals = drainTraexRollout(path, second.newOffset).events;
+    expect(finals).toEqual([
+      expect.objectContaining({ sourceTurnId: firstTurnId, text: '' }),
+      expect.objectContaining({ sourceTurnId: secondTurnId, text: 'second answer' }),
+    ]);
+  });
+
+  it('attributes idless assistant messages to the latest accepted native input', () => {
+    const firstTurnId = '00000000-0000-7000-8000-000000000010';
+    const secondTurnId = '00000000-0000-7000-8000-000000000013';
+    writeFileSync(path, line(user('first', undefined, firstTurnId))
+      + line(user('second', '2000-01-01T00:00:02.000Z', secondTurnId))
+      + line(agentMessageNoPhase('second answer'))
+      + line(taskComplete())
+      + line({ ...taskComplete(), payload: { ...taskComplete().payload, turn_id: secondTurnId } }));
+    expect(drainTraexRollout(path, 0).events.filter(event => event.kind === 'assistant_final')).toEqual([
+      expect.objectContaining({ sourceTurnId: firstTurnId, text: '' }),
+      expect.objectContaining({ sourceTurnId: secondTurnId, text: 'second answer' }),
+    ]);
+  });
+
+  it.each(['canonical-first', 'legacy-first'])(
+    'keeps canonical phase authority over a phase-less same-ID mirror: %s', (order) => {
+      const agent = {
+        type: 'AgentMessage', id: 'phase-authority', phase: 'commentary',
+        content: [{ type: 'Text', text: 'still working' }],
+      };
+      const { phase, ...phaseLessAgent } = agent;
+      const canonical = canonicalCompletion(agent);
+      const legacy = itemCompleted(phaseLessAgent);
+      const records = order === 'canonical-first' ? [canonical, legacy] : [legacy, canonical];
+      writeFileSync(path, line(user('work')) + line(records[0]));
+      const first = drainTraexRollout(path, 0);
+      appendFileSync(path, line(records[1]) + line(taskComplete()));
+      expect(drainTraexRollout(path, first.newOffset).events.at(-1)).toEqual(
+        expect.objectContaining({ kind: 'assistant_final', text: '' }),
+      );
+    },
+  );
+
+  it('retains unrelated phase-less answers when a commentary mirror is classified', () => {
+    const candidate = itemCompleted({
+      type: 'AgentMessage', id: 'real-candidate',
+      content: [{ type: 'Text', text: 'candidate answer' }],
+    });
+    const mirror = itemCompleted({
+      type: 'AgentMessage', id: 'commentary-candidate',
+      content: [{ type: 'Text', text: 'still working' }],
+    });
+    const canonical = canonicalCompletion({ ...mirror.payload.item, phase: 'commentary' });
+    writeFileSync(path, line(user('work')) + line(candidate) + line(mirror)
+      + line(canonical) + line(taskComplete()));
+    expect(drainTraexRollout(path, 0).events.at(-1)).toEqual(
+      expect.objectContaining({ text: 'candidate answer' }),
+    );
+  });
+
+  it.each(['canonical', 'legacy'])('recovers mirrored input on a same-offset replay: %s', (dialect) => {
+    const input = {
+      type: 'UserMessage', id: 'replay-user',
+      content: [{ type: 'text', text: 'replay work' }],
+    };
+    const mirror = dialect === 'canonical' ? canonicalCompletion(input) : itemCompleted(input);
+    writeFileSync(path, line(user('replay work')) + line(mirror)
+      + line(agentMessage('early answer', 'final_answer')));
+    const queue = new CodexBridgeQueue();
+    queue.mark('remote-replay', 'replay work', 0);
+    const first = drainTraexRollout(path, 0);
+    queue.ingest(first.events);
+    queue.ingest(drainTraexRollout(path, 0).events);
+    appendFileSync(path, line(agentMessage('latest answer', 'final_answer')) + line(taskComplete()));
+    queue.ingest(drainTraexRollout(path, first.newOffset).events);
+    expect(queue.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'remote-replay', finalText: 'latest answer' }),
+    ]);
+    expect(drainTraexRollout(path, 0).events.at(-1)).toEqual(
+      expect.objectContaining({ text: 'latest answer' }),
+    );
+  });
+
+  it('preserves same-message phase classification while binding assistant buckets', () => {
+    const agent = {
+      type: 'AgentMessage', id: 'bound-commentary',
+      content: [{ type: 'Text', text: 'still working' }],
+    };
+    const legacyAgent = {
+      ...itemCompleted({ ...agent, phase: 'commentary' }),
+      payload: { ...itemCompleted(agent).payload, turn_id: undefined, item: { ...agent, phase: 'commentary' } },
+    };
+    writeFileSync(path, line(user('bind work'))
+      + line(itemCompleted(agent)) + line(legacyAgent));
+    const first = drainTraexRollout(path, 0);
+    appendFileSync(path, line(canonicalCompletion({
+      type: 'UserMessage', id: 'bound-user',
+      content: [{ type: 'text', text: 'bind work' }],
+    })) + line(taskComplete()));
+    expect(drainTraexRollout(path, first.newOffset).events.at(-1)).toEqual(
+      expect.objectContaining({ text: '' }),
+    );
+  });
+
+  it.each(['canonical-first', 'legacy-first'])('deduplicates canonical and legacy mirrors: %s', (order) => {
+    const input = itemCompleted({
+      type: 'UserMessage', id: 'mirrored-user',
+      content: [{ type: 'text', text: 'same input' }],
+    });
+    const canonical = canonicalCompletion(input.payload.item);
+    const records = order === 'canonical-first' ? [canonical, input] : [input, canonical];
+    writeFileSync(path, line(records[0]));
+    const first = drainTraexRollout(path, 0);
+    appendFileSync(path, line(records[1]) + line(taskComplete('done')));
+    const second = drainTraexRollout(path, first.newOffset);
+    const events = [...first.events, ...second.events];
+    expect(events.filter(event => event.kind === 'user')).toHaveLength(1);
+    const queue = new CodexBridgeQueue();
+    queue.mark('remote', 'same input', Date.parse(input.timestamp) - 1);
+    queue.ingest(events);
+    expect(queue.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'remote', finalText: 'done' }),
+    ]);
+  });
+
+  it.each(['wrong-thread', 'wrong-turn', 'non-append', 'unknown-item'])(
+    'rejects unrelated canonical display completions: %s', (invalid) => {
+      const mutation = canonicalCompletion({
+        type: invalid === 'unknown-item' ? 'Reasoning' : 'UserMessage',
+        id: 'unrelated',
+        content: [{ type: 'text', text: 'must not start a turn' }],
+      });
+      const completion = mutation.payload.display_completions[0];
+      if (invalid === 'wrong-thread') completion.thread_id = 'other-session';
+      if (invalid === 'wrong-turn') completion.turn_id = 'other-turn';
+      if (invalid === 'non-append') mutation.payload.operation = 'replace';
+      writeFileSync(path, line(mutation));
+      expect(drainTraexRollout(path, 0).events.filter(event => event.kind === 'user')).toEqual([]);
+    },
+  );
+
+  it('does not parse a partially persisted canonical completion', () => {
+    const mutation = line(canonicalCompletion({
+      type: 'UserMessage', id: 'partial-user',
+      content: [{ type: 'text', text: 'complete input' }],
+    }));
+    writeFileSync(path, mutation.slice(0, -1));
+    const incomplete = drainTraexRollout(path, 0);
+    expect(incomplete.events).toEqual([]);
+    expect(incomplete.newOffset).toBe(0);
+    appendFileSync(path, '\n');
+    expect(drainTraexRollout(path, incomplete.newOffset).events).toEqual([
+      expect.objectContaining({ kind: 'user', text: 'complete input' }),
+    ]);
+  });
+
+  it('processes canonical input before tools in the same mutation', () => {
+    const mutation = canonicalCompletion({
+      type: 'UserMessage', id: 'user-with-tool',
+      content: [{ type: 'text', text: 'execute task' }],
+    });
+    const payload = {
+      ...mutation.payload,
+      items: [{ type: 'function_call', call_id: 'canonical-tool', name: 'exec_command', arguments: '{}' }],
+    };
+    writeFileSync(path, line({ ...mutation, payload }) + line(taskComplete('tool completed')));
+    const events = drainTraexRollout(path, 0).events;
+    expect(events.map(event => event.kind)).toEqual(['user', 'cot', 'assistant_final']);
+    const queue = new CodexBridgeQueue();
+    const observed: string[] = [];
+    queue.setCotObserver(entries => observed.push(...entries.map(entry => entry.kind)));
+    queue.mark('remote-tool', 'execute task', Date.parse(mutation.timestamp) - 1);
+    queue.ingest(events);
+    expect(observed).toEqual(['tool_call']);
+    expect(queue.drainEmittable()).toEqual([
+      expect.objectContaining({ turnId: 'remote-tool', finalText: 'tool completed' }),
+    ]);
+  });
+
   it('emits TraeX reasoning and tool calls/results as ordered CoT events', () => {
     const longOutput = `done\n${'x'.repeat(900)}`;
     writeFileSync(path, [

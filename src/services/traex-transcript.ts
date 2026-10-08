@@ -189,7 +189,7 @@ interface TraexPendingAgentMessages {
    *  last one is a final candidate. NOT phase-guaranteed: a candidate ending
    *  in the nothing-to-send sentinel is deliberate-silence narration, and the
    *  sentinel guard at task_complete distinguishes the two. */
-  lastAgentItemText?: string;
+  agentItems?: Map<string, { text: string; phase?: string; canonical: boolean }>;
   /** Last PHASE-LESS `agent_message` since the turn's user_message. A dialect
    *  that dropped the `phase` field (cf. codex >= 0.146) makes commentary and
    *  final byte-identical, so the last phase-less message is the best final
@@ -197,13 +197,20 @@ interface TraexPendingAgentMessages {
   lastAgentMessageNoPhase?: string;
 }
 
-const traexPendingAgentCache = new Map<string, TraexPendingAgentMessages>();
+interface TraexPendingAgentTurns {
+  turns: Map<string, TraexPendingAgentMessages>;
+  activeKey?: string;
+}
+
+const traexPendingAgentCache = new Map<string, TraexPendingAgentTurns>();
 const TRAEX_PENDING_AGENT_CACHE_MAX = 512;
+const TRAEX_PENDING_AGENT_TURNS_PER_PATH_MAX = 64;
+const TRAEX_PENDING_AGENT_ITEMS_PER_TURN_MAX = 64;
 
 /** New and legacy user event dialects can mirror one another in the same
  * rollout. Keep de-duplication scoped to a rollout and its stable turn id:
  * identical prompts in distinct turns must remain distinct local turns. */
-const traexSeenUserTurns = new Map<string, Set<string>>();
+const traexSeenUserTurns = new Map<string, Map<string, string | undefined>>();
 /** TraeX can write the legacy and item_completed user records in either order.
  * Remember the one missing counterpart across incremental drains. The state
  * belongs only to the currently open native turn and is cleared at its
@@ -213,6 +220,7 @@ interface TraexPendingUserMirror {
   timestampMs: number;
   expected: 'legacy' | 'item' | 'terminal';
   sourceTurnId?: string;
+  agentStateKey?: string;
   /** A native successor was allowed to start while this id-less legacy turn
    * stayed queued, so a terminal may need to bind it if its item mirror never
    * arrives. */
@@ -229,11 +237,11 @@ const TRAEX_SEEN_USER_TURNS_PER_PATH_MAX = 4096;
 const TRAEX_PENDING_USER_MIRRORS_PER_PATH_MAX = 64;
 const TRAEX_LEGACY_USER_MIRROR_WINDOW_MS = 5_000;
 
-function claimTraexUserTurn(path: string, turnId: unknown): boolean {
+function claimTraexUserTurn(path: string, turnId: unknown, legacyStateKey?: string): boolean {
   if (typeof turnId !== 'string' || turnId.length === 0) return true;
   let seen = traexSeenUserTurns.get(path);
   if (!seen) {
-    seen = new Set<string>();
+    seen = new Map<string, string | undefined>();
     traexSeenUserTurns.set(path, seen);
     if (traexSeenUserTurns.size > TRAEX_SEEN_USER_TURN_PATHS_MAX) {
       const oldestPath = traexSeenUserTurns.keys().next().value;
@@ -241,7 +249,7 @@ function claimTraexUserTurn(path: string, turnId: unknown): boolean {
     }
   }
   if (seen.has(turnId)) return false;
-  seen.add(turnId);
+  seen.set(turnId, legacyStateKey);
   if (seen.size > TRAEX_SEEN_USER_TURNS_PER_PATH_MAX) {
     const oldestTurnId = seen.keys().next().value;
     if (oldestTurnId) seen.delete(oldestTurnId);
@@ -313,6 +321,7 @@ function takeTraexUserMirrorAtTerminal(
   pending: TraexDrainUserMirror[],
   sourceTurnId: string,
   nativeUserWasSeen: boolean,
+  legacyStateKey?: string,
 ): TraexDrainUserMirror | undefined {
   // A paired legacy-first turn leaves a terminal marker, while item-first
   // state carries its id directly. Prefer either exact match so a terminal
@@ -320,6 +329,10 @@ function takeTraexUserMirrorAtTerminal(
   const exactIndex = pending.findIndex(candidate => candidate.sourceTurnId === sourceTurnId);
   if (exactIndex >= 0) {
     return pending.splice(exactIndex, 1)[0];
+  }
+  if (legacyStateKey !== undefined) {
+    const replayIndex = pending.findIndex(candidate => candidate.agentStateKey === legacyStateKey);
+    if (replayIndex >= 0) return pending.splice(replayIndex, 1)[0];
   }
   // A terminal for a turn whose native user record was already observed must
   // not consume an earlier id-less legacy turn. That predecessor can only be
@@ -412,10 +425,10 @@ function traexHistoryCotEntries(payload: any): CodexBridgeEvent['cotEntries'] {
   return entries;
 }
 
-function traexPendingAgentState(path: string): TraexPendingAgentMessages {
+function traexPendingAgentTurns(path: string): TraexPendingAgentTurns {
   let state = traexPendingAgentCache.get(path);
   if (!state) {
-    state = {};
+    state = { turns: new Map() };
     traexPendingAgentCache.set(path, state);
     if (traexPendingAgentCache.size > TRAEX_PENDING_AGENT_CACHE_MAX) {
       const oldest = traexPendingAgentCache.keys().next().value;
@@ -423,6 +436,74 @@ function traexPendingAgentState(path: string): TraexPendingAgentMessages {
     }
   }
   return state;
+}
+
+function traexPendingAgentState(path: string, sourceTurnId?: string): TraexPendingAgentMessages {
+  const state = traexPendingAgentTurns(path);
+  const key = sourceTurnId ?? state.activeKey ?? '';
+  let messages = state.turns.get(key);
+  if (!messages) {
+    messages = {};
+    state.turns.set(key, messages);
+    if (state.turns.size > TRAEX_PENDING_AGENT_TURNS_PER_PATH_MAX) {
+      const oldest = state.turns.keys().next().value;
+      if (oldest !== undefined) state.turns.delete(oldest);
+    }
+  }
+  return messages;
+}
+
+function bindTraexPendingAgentTurn(path: string, legacyKey: string | undefined, sourceTurnId: string): void {
+  if (legacyKey !== undefined && legacyKey !== sourceTurnId) {
+    const seen = traexSeenUserTurns.get(path);
+    if (seen?.has(sourceTurnId)) seen.set(sourceTurnId, legacyKey);
+  }
+  const state = traexPendingAgentCache.get(path);
+  if (!state || legacyKey === undefined || legacyKey === sourceTurnId) return;
+  const legacy = state.turns.get(legacyKey);
+  const native = state.turns.get(sourceTurnId);
+  if (legacy) {
+    const merged: TraexPendingAgentMessages = {
+      ...legacy,
+      ...native,
+      agentItems: new Map(),
+    };
+    for (const [key, item] of [...(legacy.agentItems ?? []), ...(native?.agentItems ?? [])]) {
+      rememberTraexAgentItem(merged, { id: key, phase: item.phase }, item.text, item.canonical, key);
+    }
+    state.turns.set(sourceTurnId, merged);
+    state.turns.delete(legacyKey);
+  }
+  if (state.activeKey === legacyKey) state.activeKey = sourceTurnId;
+}
+
+function clearTraexPendingAgentMessages(path: string, sourceTurnId: string, legacyKey?: string): void {
+  const state = traexPendingAgentCache.get(path);
+  if (!state) return;
+  state.turns.delete(sourceTurnId);
+  if (legacyKey !== undefined) state.turns.delete(legacyKey);
+  if (state.activeKey === sourceTurnId || state.activeKey === legacyKey) state.activeKey = undefined;
+  if (state.turns.size === 0) traexPendingAgentCache.delete(path);
+}
+
+function rememberTraexAgentItem(
+  pending: TraexPendingAgentMessages,
+  item: { id?: unknown; phase?: unknown },
+  text: string,
+  canonical: boolean,
+  fallbackId: string,
+): void {
+  const items = pending.agentItems ??= new Map();
+  const key = typeof item.id === 'string' && item.id ? item.id : fallbackId;
+  const existing = items.get(key);
+  const phase = typeof item.phase === 'string' && item.phase ? item.phase : undefined;
+  if (!existing?.canonical || canonical) {
+    items.set(key, { text, phase: phase ?? existing?.phase, canonical: canonical || existing?.canonical === true });
+  }
+  if (items.size > TRAEX_PENDING_AGENT_ITEMS_PER_TURN_MAX) {
+    const oldest = items.keys().next().value;
+    if (oldest !== undefined) items.delete(oldest);
+  }
 }
 
 /** Matches a commentary message that ENDS with a nothing-to-send sentinel
@@ -460,8 +541,12 @@ function recoverTraexEmptyFinal(
   adoptMode: boolean,
 ): string {
   if (pending?.lastFinalAnswer?.trim()) return pending.lastFinalAnswer;
+  const items = Array.from(pending?.agentItems?.values() ?? []).reverse();
+  const finalItem = items.find(item => item.phase === 'final_answer' && item.text.trim());
+  if (finalItem) return finalItem.text;
   const candidates: string[] = [];
-  if (pending?.lastAgentItemText?.trim()) candidates.push(pending.lastAgentItemText);
+  const candidateItem = items.find(item => !item.phase && item.text.trim());
+  if (candidateItem) candidates.push(candidateItem.text);
   if (pending?.lastAgentMessageNoPhase?.trim()) candidates.push(pending.lastAgentMessageNoPhase);
   const answer = candidates.find(candidate => !traexTrailingSentinel(candidate));
   if (answer) return answer;
@@ -469,7 +554,8 @@ function recoverTraexEmptyFinal(
   // No real answer candidate: recognise deliberate silence from whichever
   // tracked message carries the trailing sentinel (explicit commentary-phase
   // first, then the phase-less/item candidates).
-  for (const source of [pending?.lastCommentary ?? '', ...candidates]) {
+  const commentary = items.find(item => item.phase && item.phase !== 'final_answer');
+  for (const source of [pending?.lastCommentary ?? '', commentary?.text ?? '', ...candidates]) {
     const sentinel = traexTrailingSentinel(source);
     if (sentinel) return sentinel;
   }
@@ -514,6 +600,42 @@ function runtimeFromTraexEntry(entry: any): TraexRuntimeSnapshot | undefined {
     ...(normalizedModel ? { model: normalizedModel } : {}),
     ...(normalizedReasoningEffort ? { reasoningEffort: normalizedReasoningEffort } : {}),
   };
+}
+
+function* completeTraexRolloutRecords(
+  text: string,
+  fromOffset: number,
+  sourceSessionId?: string,
+): Generator<{ entry: any; offset: number; displayIndex?: number }> {
+  let cursor = fromOffset;
+  for (const line of text.split('\n')) {
+    const offset = cursor;
+    cursor += Buffer.byteLength(line, 'utf8') + 1;
+    if (!line) continue;
+    let entry: any;
+    try { entry = JSON.parse(line); } catch { continue; }
+    if (entry?.type === 'history_mutation'
+      && entry.payload?.operation === 'append'
+      && Array.isArray(entry.payload.display_completions)) {
+      for (const [displayIndex, completion] of entry.payload.display_completions.entries()) {
+        if (!completion || typeof completion !== 'object'
+          || typeof completion.turn_id !== 'string' || !completion.turn_id
+          || completion.turn_id !== entry.payload.turn_id
+          || (sourceSessionId && completion.thread_id !== sourceSessionId)
+          || !['UserMessage', 'AgentMessage'].includes(completion.item?.type)) continue;
+        yield {
+          entry: {
+            type: 'event_msg',
+            timestamp: entry.timestamp,
+            payload: { ...completion, type: 'item_completed' },
+          },
+          offset,
+          displayIndex,
+        };
+      }
+    }
+    yield { entry, offset };
+  }
 }
 
 /** Incrementally drain complete TRAE rollout lines.
@@ -583,6 +705,7 @@ export function drainTraexRollout(
     if (!candidate || !claimUserTurn(turnId)) return false;
     candidate.expected = 'terminal';
     candidate.sourceTurnId = turnId;
+    if (!probe) bindTraexPendingAgentTurn(path, candidate.agentStateKey, turnId);
     events.push({
       ...base, uuid: `${base.uuid}:turn-bind`, kind: 'turn_bind', text: '', sourceTurnId: turnId,
     });
@@ -590,23 +713,16 @@ export function drainTraexRollout(
   };
   let latestModel: string | undefined;
   let latestReasoningEffort: string | undefined;
-  let cursor = start;
-  for (const line of completeText.split('\n')) {
-    if (line.length === 0) {
-      cursor += 1;
-      continue;
-    }
-    const lineStart = cursor;
-    cursor += Buffer.byteLength(line, 'utf8') + 1;
-    let obj: any;
-    try { obj = JSON.parse(line); } catch { continue; }
+  for (const { entry: obj, offset: lineStart, displayIndex } of completeTraexRolloutRecords(
+    completeText, start, sourceSessionId,
+  )) {
     const runtime = runtimeFromTraexEntry(obj);
     latestModel = runtime?.model ?? latestModel;
     latestReasoningEffort = runtime?.reasoningEffort ?? latestReasoningEffort;
     const payload = obj?.payload;
     if (!payload || typeof payload !== 'object') continue;
     const base = {
-      uuid: `${path}:${lineStart}`,
+      uuid: `${path}:${lineStart}${displayIndex !== undefined ? `:display:${displayIndex}` : ''}`,
       timestampMs: eventTimestampMs(obj.timestamp),
       ...(sourceSessionId ? { sourceSessionId } : {}),
     };
@@ -649,11 +765,10 @@ export function drainTraexRollout(
             timestampMs: base.timestampMs,
             expected: 'item',
             eventIndex: events.length - 1,
+            agentStateKey: base.uuid,
           });
         }
-        // New turn: drop any agent_message state an unterminated predecessor
-        // left behind so it can't be attributed to this turn.
-        if (!probe) traexPendingAgentCache.delete(path);
+        if (!probe) traexPendingAgentTurns(path).activeKey = sourceTurnId ?? base.uuid;
       }
       continue;
     }
@@ -690,11 +805,13 @@ export function drainTraexRollout(
             });
           }
           if (expectedMirror?.expected === 'item' && sourceTurnId) {
+            if (!probe) bindTraexPendingAgentTurn(path, expectedMirror.agentStateKey, sourceTurnId);
             pendingUserMirrors.push({
               text: userText,
               timestampMs: base.timestampMs,
               expected: 'terminal',
               sourceTurnId,
+              agentStateKey: sourceTurnId,
             });
           }
           if (!expectedMirror && sourceTurnId) {
@@ -705,9 +822,22 @@ export function drainTraexRollout(
               sourceTurnId,
             });
           }
-          // New turn: drop any agent_message state an unterminated predecessor
-          // left behind so it can't be attributed to this turn.
-          if (!probe) traexPendingAgentCache.delete(path);
+          if (!probe && !expectedMirror) {
+            traexPendingAgentTurns(path).activeKey = sourceTurnId ?? base.uuid;
+          }
+        } else if (!probe && sourceTurnId) {
+          const legacyKey = traexSeenUserTurns.get(path)?.get(sourceTurnId);
+          const mirrorIndex = pendingUserMirrors.findIndex(mirror =>
+            legacyKey !== undefined && mirror.agentStateKey === legacyKey && mirror.text === userText);
+          if (mirrorIndex >= 0) {
+            const mirror = pendingUserMirrors.splice(mirrorIndex, 1)[0];
+            bindTraexPendingAgentTurn(path, mirror.agentStateKey, sourceTurnId);
+            pendingUserMirrors.push({
+              ...mirror,
+              expected: 'terminal',
+              sourceTurnId,
+            });
+          }
         }
       } else if (!probe) {
         // Assistant-side mirror of the UserMessage dialect: TraeX 0.201.4+
@@ -717,7 +847,8 @@ export function drainTraexRollout(
         // narration). Tool results and other item types yield no text.
         const agentText = itemCompletedAgentText(payload.item);
         if (agentText) {
-          traexPendingAgentState(path).lastAgentItemText = agentText;
+          const pending = traexPendingAgentState(path, sourceTurnId);
+          rememberTraexAgentItem(pending, payload.item, agentText, displayIndex !== undefined, base.uuid);
         }
       }
       continue;
@@ -735,7 +866,7 @@ export function drainTraexRollout(
       && payload.type === 'agent_message'
       && typeof payload.message === 'string'
       && payload.message.length > 0) {
-      const pending = traexPendingAgentState(path);
+      const pending = traexPendingAgentState(path, sourceTurnId);
       if (payload.phase === 'final_answer') pending.lastFinalAnswer = payload.message;
       else if (typeof payload.phase !== 'string' || payload.phase.length === 0) {
         pending.lastAgentMessageNoPhase = payload.message;
@@ -746,7 +877,18 @@ export function drainTraexRollout(
       && payload.type === 'task_complete'
       && typeof payload.turn_id === 'string'
       && payload.turn_id.length > 0) {
-      const pending = traexPendingAgentCache.get(path);
+      const terminalMirror = takeTraexUserMirrorAtTerminal(
+        pendingUserMirrors,
+        payload.turn_id,
+        seenUserTurns.has(payload.turn_id) || traexSeenUserTurns.get(path)?.has(payload.turn_id) === true,
+        traexSeenUserTurns.get(path)?.get(payload.turn_id),
+      );
+      if (terminalMirror && !terminalMirror.sourceTurnId) {
+        if (!probe) claimTraexUserTurn(path, payload.turn_id, terminalMirror.agentStateKey);
+        seenUserTurns.add(payload.turn_id);
+      }
+      if (!probe) bindTraexPendingAgentTurn(path, terminalMirror?.agentStateKey, payload.turn_id);
+      const pending = traexPendingAgentCache.get(path)?.turns.get(payload.turn_id);
       const failed = payload.error !== null && payload.error !== undefined;
       const rawFinal = typeof payload.last_agent_message === 'string'
         ? payload.last_agent_message
@@ -772,12 +914,7 @@ export function drainTraexRollout(
         //      token would leak the literal into Lark.
         text = recoverTraexEmptyFinal(pending, adoptMode);
       }
-      if (!probe) traexPendingAgentCache.delete(path);
-      const terminalMirror = takeTraexUserMirrorAtTerminal(
-        pendingUserMirrors,
-        payload.turn_id,
-        seenUserTurns.has(payload.turn_id) || traexSeenUserTurns.get(path)?.has(payload.turn_id) === true,
-      );
+      if (!probe) clearTraexPendingAgentMessages(path, payload.turn_id);
       if (terminalMirror?.expected === 'item'
         && !terminalMirror.sourceTurnId
         && terminalMirror.preservedBeforeSuccessor) {
@@ -813,12 +950,19 @@ export function drainTraexRollout(
       && payload.type === 'turn_aborted'
       && typeof payload.turn_id === 'string'
       && payload.turn_id.length > 0) {
-      if (!probe) traexPendingAgentCache.delete(path);
       const terminalMirror = takeTraexUserMirrorAtTerminal(
         pendingUserMirrors,
         payload.turn_id,
         seenUserTurns.has(payload.turn_id) || traexSeenUserTurns.get(path)?.has(payload.turn_id) === true,
+        traexSeenUserTurns.get(path)?.get(payload.turn_id),
       );
+      if (terminalMirror && !terminalMirror.sourceTurnId) {
+        if (!probe) claimTraexUserTurn(path, payload.turn_id, terminalMirror.agentStateKey);
+        seenUserTurns.add(payload.turn_id);
+      }
+      if (!probe) {
+        clearTraexPendingAgentMessages(path, payload.turn_id, terminalMirror?.agentStateKey);
+      }
       if (terminalMirror?.expected === 'item'
         && !terminalMirror.sourceTurnId
         && terminalMirror.preservedBeforeSuccessor) {
