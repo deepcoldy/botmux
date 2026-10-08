@@ -204,6 +204,12 @@ export interface BridgeSendMarker {
   responseKind?: 'progress' | 'final' | 'auxiliary';
   turnId?: string;
   dispatchAttempt?: number;
+  /** The last user-visible carrier left by this send. The daemon uses this
+   *  positive evidence at turn_terminal to PATCH a normal BotMux reply card
+   *  in place, while files/voice/custom cards deliberately fall back to a
+   *  separate compact terminal strip. Older markers omit the field and simply
+   *  degrade to the live streaming-card terminal state. */
+  terminalCarrier?: 'standard_reply_card' | 'non_patchable';
   /** Present only for opted-in managed replies; legacy marker semantics stay intact. */
   replyCardResponseKind?: 'progress' | 'final' | 'auxiliary';
   /** The send is explicitly an interim side effect and must never stand in for

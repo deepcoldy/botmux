@@ -434,6 +434,15 @@ export interface DaemonSession {
    *  idle 时卡头显示「已完成」而非「等待输入」。清理点与 `silentIdleTurnId`
    *  完全一致（每个新轮次入口）。内存态，不落盘。 */
   completedIdleTurnId?: string;
+  /** Last user-visible output carrier observed for each in-flight turn. The
+   *  worker reconstructs explicit-send entries from the durable turn-sends
+   *  journal before publishing turn_terminal; daemon-owned fallback output is
+   *  recorded directly after Lark accepts it. Retained in a bounded map so a
+   *  duplicate terminal can safely retry after an unconfirmed provider error. */
+  turnTerminalCarriers?: Map<string, {
+    messageId: string;
+    kind: 'standard_reply_card' | 'non_patchable';
+  }>;
   /** turnId of the most recently STARTED turn (beginNewTurn and both
    *  worker-exited re-fork branches). Lineage anchor for `silentIdleTurnId`: a
    *  turn_terminal that lands after a NEWER turn already opened — the normal

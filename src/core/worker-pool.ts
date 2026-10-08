@@ -44,7 +44,7 @@ import { resolveSessionLaunchModel, resolveSessionGroupSettings } from './sessio
 import { effectiveReplyDelivery } from './reply-delivery.js';
 import { fallbackTurnId, frozenReplyContextForTurn, isSubstituteTurn, pickTurnReplyTarget, reconcileCronTaskReplyAnchors, rehomeReplyTargetState, replyTargetKey, resolveSessionReplyTarget } from './reply-target.js';
 import { updateMessage, deleteMessage, pinMessage, unpinMessage, listChatPins, sendEphemeralCard, sendUserMessage, addReaction, removeReaction, getMessageChatId, resolveCurrentChatBotOpenIdsByLarkAppIds, MessageWithdrawnError, MessageUpdateExpiredError, type LarkPinRecord } from '../im/lark/client.js';
-import { buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
+import { appendTurnTerminalReceiptToCard, buildStreamingCard, buildPrivateSnapshotCard, buildSessionCard, buildTuiPromptCard, buildTuiPromptResolvedCard, buildTuiPromptFailedCard, buildRelayedFrozenCard, buildTurnFailedCard, buildTurnTerminalReceiptCard, getCliDisplayName, type IdleCardLabel, type TurnTerminalReceiptKind } from '../im/lark/card-builder.js';
 import { buildClosedSessionCard } from './closed-session-card.js';
 import { codexServiceTierBadge } from '../services/codex-service-tier.js';
 import { isFableModelId, normalizeClaudeModelId } from '../services/claude-transcript.js';
@@ -1194,22 +1194,22 @@ function flushPendingLocalCliOpenReadinessPatch(ds: DaemonSession): void {
 
 /** PATCH the live card when the executor reports a different active runtime.
  * Runtime identity stays attached to the streaming usage line. */
-function scheduleActiveRuntimePatch(ds: DaemonSession): void {
+function scheduleActiveRuntimePatch(ds: DaemonSession): boolean {
   if (streamingCardDisabled(ds) || ds.suppressRecoveryCard) {
     ds.pendingActiveRuntimeCardRefresh = undefined;
-    return;
+    return false;
   }
   if (ds.streamCardNonce && ds.parkedStreamCardNonce === ds.streamCardNonce) {
     ds.pendingActiveRuntimeCardRefresh = undefined;
-    return;
+    return false;
   }
   if (ds.streamCardId === CARD_POSTING_SENTINEL) {
     ds.pendingActiveRuntimeCardRefresh = true;
-    return;
+    return true;
   }
   if (!ds.streamCardId || !workerHasInitialized(ds)) {
     ds.pendingActiveRuntimeCardRefresh = undefined;
-    return;
+    return false;
   }
   ds.pendingActiveRuntimeCardRefresh = undefined;
   const botCfg = getBot(ds.larkAppId).config;
@@ -1239,7 +1239,7 @@ function scheduleActiveRuntimePatch(ds: DaemonSession): void {
     dshRuntimeForSession(ds),
     resolveHiddenStreamingCardButtons(getBot(ds.larkAppId).config),
   );
-  scheduleCardPatch(ds, cardJson);
+  return scheduleCardPatch(ds, cardJson);
 }
 
 function flushPendingActiveRuntimePatch(ds: DaemonSession): void {
@@ -1274,6 +1274,50 @@ const TURN_EXPLICIT_MENTION_MAX = 64;
 const SILENT_RECEIPT_DEDUPE_MAX = 64;
 const TERMINAL_RECEIPT_DEDUPE_MAX = 64;
 const TERMINAL_RECEIPT_RETRY_BACKOFF_MS = [0, 1000, 5000] as const;
+const TURN_TERMINAL_CARRIER_MAX = 64;
+
+function recordTurnTerminalCarrier(
+  ds: DaemonSession,
+  turnId: string,
+  carrier: { messageId: string; kind: 'standard_reply_card' | 'non_patchable' },
+): void {
+  if (!turnId || !carrier.messageId) return;
+  const carriers = ds.turnTerminalCarriers ?? (ds.turnTerminalCarriers = new Map());
+  carriers.delete(turnId);
+  carriers.set(turnId, carrier);
+  while (carriers.size > TURN_TERMINAL_CARRIER_MAX) {
+    const oldest = carriers.keys().next().value;
+    if (oldest === undefined) break;
+    carriers.delete(oldest);
+  }
+}
+
+function messageCardContent(detail: any, expectedChatId: string): string | undefined {
+  const message = detail?.items?.[0] ?? detail?.message ?? detail;
+  if (message?.chat_id !== expectedChatId || message?.msg_type !== 'interactive') return undefined;
+  const content = message?.body?.content;
+  if (typeof content === 'string' && content.trim()) return content;
+  if (content && typeof content === 'object') return JSON.stringify(content);
+  return undefined;
+}
+
+async function patchTurnTerminalCarrier(
+  ds: DaemonSession,
+  messageId: string,
+  kind: TurnTerminalReceiptKind,
+): Promise<boolean> {
+  const detail = await getTopicMessageDetail(ds.larkAppId, messageId, { userCardContent: true });
+  const cardJson = messageCardContent(detail, ds.chatId);
+  if (!cardJson) return false;
+  const patched = appendTurnTerminalReceiptToCard(
+    cardJson,
+    kind,
+    localeForBot(ds.larkAppId),
+  );
+  if (!patched) return false;
+  await updateMessage(ds.larkAppId, messageId, patched);
+  return true;
+}
 
 /** Provider-level idempotency key for the receipt. A transport timeout can be
  *  commit-unknown: retrying with the same uuid lets Lark collapse the duplicate
@@ -15641,6 +15685,12 @@ function setupWorkerHandlers(
           logger.warn(`[${t}] Ignored explicit_reply_observed from stale worker generation`);
           break;
         }
+        if (msg.messageId && msg.terminalCarrier) {
+          recordTurnTerminalCarrier(ds, msg.turnId, {
+            messageId: msg.messageId,
+            kind: msg.terminalCarrier,
+          });
+        }
         if (ds.session.principalLane && msg.messageId) {
           const binding = readPrincipalLaneTurnBinding(ds, msg.turnId);
           if (!binding
@@ -16075,16 +16125,16 @@ function setupWorkerHandlers(
             });
           }
         }
-        // Independent terminal-state strip for ordinary Lark turns in the
-        // legacy/send UI. This is daemon-owned lifecycle output: it does not
-        // depend on the model remembering to call `botmux send`, and a bare
-        // BOTMUX_NOTHING_TO_SEND terminal still reaches this path.
-        //
-        // The exact inbound reply context is both the routing source and the
-        // proof this was a Lark turn. HTTP/API/local-terminal turns have no such
-        // context and must not gain a surprise Feishu side effect. Unified
-        // reply cards already show their terminal phase; card-off/private/doc/
-        // meeting/silent-schedule paths retain their existing low-noise UI.
+        // Daemon-owned auto terminal state for ordinary Lark turns in the
+        // legacy/send UI. The presentation follows the last visible carrier:
+        //   1. standard BotMux reply card -> read back + PATCH in place;
+        //   2. no visible body -> PATCH the existing streaming card only;
+        //   3. file/voice/custom card -> append the compact terminal strip.
+        // This never depends on the model remembering a final send. A bare
+        // BOTMUX_NOTHING_TO_SEND still reaches the same terminal rendezvous.
+        // The exact inbound reply context proves this was a Lark turn; unified,
+        // card-off/private/doc/meeting/silent-schedule paths keep their existing
+        // behavior and failed/ambiguous/cancelled never enter this branch.
         if (shouldPostTerminalReceipt && terminalReplyContext && terminalReceiptKind) {
           const settled = ds.terminalReceiptTurnIds ?? (ds.terminalReceiptTurnIds = new Set());
           if (!settled.has(msg.turnId)) {
@@ -16102,14 +16152,78 @@ function setupWorkerHandlers(
             void (async () => {
               try {
                 // A transcript fallback final can still be in-flight when the
-                // ordered terminal IPC arrives. Never let the strip overtake it.
+                // ordered terminal IPC arrives. Never settle the UI before its
+                // delivery has either succeeded or exhausted retries.
                 await waitForTurnFinalOutputDeliveryDrain(ds, msg.turnId);
+                if (!ownsLifecycleMutation()) return;
+
+                const carrier = ds.turnTerminalCarriers?.get(msg.turnId);
+                if (carrier?.kind === 'standard_reply_card') {
+                  for (let attempt = 0; attempt < TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length; attempt++) {
+                    const delayMs = TERMINAL_RECEIPT_RETRY_BACKOFF_MS[attempt];
+                    if (delayMs > 0) await new Promise<void>(resolve => setTimeout(resolve, delayMs));
+                    if (!ownsLifecycleMutation()) return;
+                    try {
+                      if (await patchTurnTerminalCarrier(
+                        ds,
+                        carrier.messageId,
+                        terminalReceiptKind,
+                      )) return;
+                      // A marker can outlive a manually replaced/non-card
+                      // message. Fall through to the independent strip rather
+                      // than retrying a structurally unpatchable payload.
+                      break;
+                    } catch (err) {
+                      if (attempt + 1 === TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length) {
+                        logger.warn(
+                          `[${t}] Terminal carrier PATCH exhausted for `
+                          + `${msg.turnId.substring(0, 8)}: `
+                          + `${err instanceof Error ? err.message : String(err)}`,
+                        );
+                        break;
+                      }
+                      logger.warn(
+                        `[${t}] Terminal carrier PATCH retry ${attempt + 1} for `
+                        + `${msg.turnId.substring(0, 8)}: `
+                        + `${err instanceof Error ? err.message : String(err)}`,
+                      );
+                    }
+                  }
+                }
+
+                // With no explicit/fallback body, the live streaming card is
+                // already the last visible carrier. Keep the thread quiet and
+                // render the terminal wording there. CARD_POSTING_SENTINEL is
+                // also accepted: scheduleActiveRuntimePatch records a pending
+                // refresh that the POST completion immediately reconciles.
+                if (!carrier
+                  && (!ds.currentTurnId || ds.currentTurnId === msg.turnId)
+                  && !!ds.streamCardId) {
+                  if (terminalReceiptKind === 'silent') {
+                    ds.silentIdleTurnId = msg.turnId;
+                    ds.completedIdleTurnId = undefined;
+                  } else {
+                    ds.completedIdleTurnId = msg.turnId;
+                    ds.silentIdleTurnId = undefined;
+                  }
+                  if (scheduleActiveRuntimePatch(ds)) return;
+                }
+
+                // An independent strip is meaningful only while this remains
+                // the newest turn. A standard card can still be patched safely
+                // after type-ahead because it is bound to the old turn itself;
+                // a new bottom-of-thread strip would incorrectly claim that the
+                // newer turn is awaiting input.
+                if (ds.currentTurnId && ds.currentTurnId !== msg.turnId) {
+                  logger.debug(
+                    `[${t}] Skipped stale terminal receipt for ${msg.turnId.substring(0, 8)}`,
+                  );
+                  return;
+                }
+
                 for (let attempt = 0; attempt < TERMINAL_RECEIPT_RETRY_BACKOFF_MS.length; attempt++) {
                   const delayMs = TERMINAL_RECEIPT_RETRY_BACKOFF_MS[attempt];
                   if (delayMs > 0) await new Promise<void>(resolve => setTimeout(resolve, delayMs));
-                  // Type-ahead guard: if a newer turn started while the answer
-                  // or retry waited, a bottom-of-chat "awaiting input" strip
-                  // would lie. Keep the claim so a replay cannot resurrect it.
                   if (!ownsLifecycleMutation()
                     || (ds.currentTurnId && ds.currentTurnId !== msg.turnId)) {
                     logger.debug(
@@ -17947,6 +18061,12 @@ function deliverFinalOutput(
           : deliveryReplyOptions,
       );
       if (!isStillOwned()) { onComplete?.(true); return; }
+      if (messageId && !managedReceiver) {
+        recordTurnTerminalCarrier(ds, msg.turnId, {
+          messageId,
+          kind: 'standard_reply_card',
+        });
+      }
       recordPrimaryOutput(messageId);
       const explicit = unifiedReply?.record.finalSource === 'explicit' ? unifiedReply.record : undefined;
       if (!managedReceiver) {

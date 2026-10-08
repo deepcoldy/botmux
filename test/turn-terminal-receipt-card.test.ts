@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { buildTurnTerminalReceiptCard } from '../src/im/lark/card-builder.js';
+import {
+  appendTurnTerminalReceiptToCard,
+  buildTurnTerminalReceiptCard,
+} from '../src/im/lark/card-builder.js';
 
 describe('buildTurnTerminalReceiptCard', () => {
   it.each([
@@ -21,4 +24,38 @@ describe('buildTurnTerminalReceiptCard', () => {
     });
     expect(card.header).toBeUndefined();
   });
+});
+
+describe('appendTurnTerminalReceiptToCard', () => {
+  it('adds the terminal line to a Card 2.0 reply without replacing its body', () => {
+    const input = JSON.stringify({
+      schema: '2.0',
+      config: { update_multi: true, width_mode: 'fill' },
+      body: { direction: 'vertical', elements: [{ tag: 'markdown', content: 'answer' }] },
+    });
+    const patched = JSON.parse(appendTurnTerminalReceiptToCard(input, 'completed', 'zh')!);
+    expect(patched.body.elements[0]).toEqual({ tag: 'markdown', content: 'answer' });
+    expect(patched.body.elements.at(-1)).toMatchObject({
+      tag: 'markdown',
+      element_id: 'botmux_turn_terminal_receipt',
+      content: "<font color='grey'>✓ 本轮已结束 · 等待输入</font>",
+    });
+  });
+
+  it('updates an existing terminal line idempotently', () => {
+    const first = appendTurnTerminalReceiptToCard(JSON.stringify({
+      schema: '2.0',
+      config: { update_multi: true, width_mode: 'fill' },
+      body: { direction: 'vertical', elements: [] },
+    }), 'completed', 'zh')!;
+    const second = JSON.parse(appendTurnTerminalReceiptToCard(first, 'silent', 'zh')!);
+    expect(second.body.elements.filter((e: any) => e.element_id === 'botmux_turn_terminal_receipt')).toHaveLength(1);
+    expect(second.body.elements.at(-1).content)
+      .toContain('✓ 本轮已结束（AI 判断无需回复） · 等待输入');
+  });
+
+  it.each(['not json', JSON.stringify({ schema: '1.0', elements: [] })])(
+    'rejects an unpatchable payload',
+    input => expect(appendTurnTerminalReceiptToCard(input, 'completed', 'zh')).toBeUndefined(),
+  );
 });

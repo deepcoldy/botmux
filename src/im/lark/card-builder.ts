@@ -33,7 +33,8 @@ export const DEFAULT_CONTEXT_COMPACT_THRESHOLD = 80;
 
 export type TurnTerminalReceiptKind = 'completed' | 'silent';
 
-/** Independent, low-visual-weight terminal marker for legacy/send sessions.
+/** Independent, low-visual-weight terminal marker used when auto mode cannot
+ * patch the last visible carrier (for example a file, voice, or custom card).
  * It is deliberately headerless and action-free: the answer/progress messages
  * keep their own presentation while this final strip only answers whether the
  * agent is still working or has returned control to the user. */
@@ -54,6 +55,44 @@ export function buildTurnTerminalReceiptCard(
       }],
     },
   });
+}
+
+const TURN_TERMINAL_RECEIPT_ELEMENT_ID = 'botmux_turn_terminal_receipt';
+
+/** Add the daemon-owned terminal line to an existing standard BotMux reply
+ * card. The source card is read back from Lark immediately before this patch,
+ * so late feedback/control mutations are preserved. Undefined means the
+ * message is no longer a patchable Card 2.0 payload and the caller must use the
+ * independent-strip fallback instead. */
+export function appendTurnTerminalReceiptToCard(
+  cardJson: string,
+  kind: TurnTerminalReceiptKind,
+  locale?: Locale,
+): string | undefined {
+  let card: any;
+  try {
+    card = JSON.parse(cardJson);
+  } catch {
+    return undefined;
+  }
+  if (!card || card.schema !== '2.0' || !card.body || !Array.isArray(card.body.elements)) {
+    return undefined;
+  }
+  const terminalElement = {
+    tag: 'markdown',
+    element_id: TURN_TERMINAL_RECEIPT_ELEMENT_ID,
+    text_size: 'notation_small_v2',
+    content: `<font color='grey'>${t(`worker.turn_terminal_receipt.${kind}`, undefined, locale)}</font>`,
+  };
+  const existing = card.body.elements.findIndex(
+    (element: any) => element?.element_id === TURN_TERMINAL_RECEIPT_ELEMENT_ID,
+  );
+  if (existing >= 0) {
+    card.body.elements[existing] = terminalElement;
+  } else {
+    card.body.elements.push({ tag: 'hr' }, terminalElement);
+  }
+  return JSON.stringify(card);
 }
 
 /** 上下文占用百分比阈值：读 global-config 的 dashboard.contextCompactThreshold，

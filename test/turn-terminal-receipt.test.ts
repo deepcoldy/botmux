@@ -12,6 +12,11 @@ const botConfig: Record<string, unknown> = {
 
 vi.mock('../src/im/lark/client.js', () => ({
   updateMessage: vi.fn(async () => {}),
+  getMessageDetail: vi.fn(async () => ({
+    items: [{ chat_id: 'oc_chat', msg_type: 'interactive', body: {
+      content: JSON.stringify({ schema: '2.0', body: { elements: [] } }),
+    } }],
+  })),
   addReaction: vi.fn(async () => 'reaction_id'),
   removeReaction: vi.fn(async () => {}),
   sendUserMessage: vi.fn(async () => {}),
@@ -29,6 +34,9 @@ vi.mock('../src/im/lark/card-builder.js', () => ({
   buildTuiPromptResolvedCard: vi.fn(() => '{}'),
   buildTurnFailedCard: vi.fn(() => JSON.stringify({ failure: true })),
   buildTurnTerminalReceiptCard: vi.fn((kind: string) => JSON.stringify({ kind })),
+  appendTurnTerminalReceiptToCard: vi.fn((card: string, kind: string) => JSON.stringify({
+    ...JSON.parse(card), terminal: kind,
+  })),
   getCliDisplayName: vi.fn(() => 'TraeX'),
 }));
 
@@ -82,6 +90,7 @@ import {
 import { beginFinalOutputDelivery } from '../src/core/final-output-delivery-drain.js';
 import { armSilentScheduledTurn } from '../src/core/silent-schedule-turns.js';
 import { buildTurnFailedCard, buildTurnTerminalReceiptCard } from '../src/im/lark/card-builder.js';
+import { getMessageDetail, updateMessage } from '../src/im/lark/client.js';
 import type { DaemonSession } from '../src/core/types.js';
 import type { WorkerToDaemon } from '../src/types.js';
 
@@ -180,6 +189,90 @@ describe('independent turn terminal receipt', () => {
     expect(call[4]).toBe('om_turn_done');
     expect(call[5]?.replyTarget).toEqual({ mode: 'thread', rootMessageId: 'om_exact_root' });
     expect(call[5]?.uuid).toMatch(/^tr_[0-9a-f]{47}$/);
+  });
+
+  it('patches the last standard reply card instead of appending a strip', async () => {
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_card');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: 'om_turn_card',
+      messageId: 'om_answer_card',
+      responseKind: 'final',
+      terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+    (ds.worker as any).emit('message', terminalMsg('om_turn_card'));
+
+    await vi.waitFor(() => expect(updateMessage).toHaveBeenCalledWith(
+      'app_test',
+      'om_answer_card',
+      expect.stringContaining('"terminal":"completed"'),
+    ));
+    expect(getMessageDetail).toHaveBeenCalledWith(
+      'app_test',
+      'om_answer_card',
+      { userCardContent: true },
+    );
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+  });
+
+  it('appends the strip when the last carrier is not patchable', async () => {
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_file');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: 'om_turn_file',
+      messageId: 'om_file',
+      responseKind: 'final',
+      terminalCarrier: 'non_patchable',
+    } satisfies WorkerToDaemon);
+    (ds.worker as any).emit('message', terminalMsg('om_turn_file'));
+
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
+    expect(updateMessage).not.toHaveBeenCalledWith('app_test', 'om_file', expect.anything());
+  });
+
+  it('does not PATCH a claimed card outside the session chat', async () => {
+    const ds = makeDs();
+    bindLarkTurn(ds, 'om_turn_cross_chat');
+    vi.mocked(getMessageDetail).mockResolvedValueOnce({
+      items: [{ chat_id: 'oc_other', msg_type: 'interactive', body: {
+        content: JSON.stringify({ schema: '2.0', body: { elements: [] } }),
+      } }],
+    });
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', {
+      type: 'explicit_reply_observed',
+      turnId: 'om_turn_cross_chat',
+      messageId: 'om_other_chat_card',
+      terminalCarrier: 'standard_reply_card',
+    } satisfies WorkerToDaemon);
+    (ds.worker as any).emit('message', terminalMsg('om_turn_cross_chat'));
+
+    await vi.waitFor(() => expect(sessionReplyMock).toHaveBeenCalledTimes(1));
+    expect(updateMessage).not.toHaveBeenCalledWith('app_test', 'om_other_chat_card', expect.anything());
+  });
+
+  it('uses only the streaming card when the turn produced no visible body', async () => {
+    const ds = makeDs();
+    ds.workerReady = true;
+    ds.streamCardId = 'om_stream';
+    ds.lastScreenStatus = 'idle';
+    bindLarkTurn(ds, 'om_turn_silent_stream');
+    __testOnly_setupWorkerHandlers(ds, ds.worker as any);
+
+    (ds.worker as any).emit('message', terminalMsg('om_turn_silent_stream', {
+      outputDisposition: 'nothing_to_send',
+    }));
+
+    await vi.waitFor(() => expect(updateMessage).toHaveBeenCalledWith('app_test', 'om_stream', '{}'));
+    expect(ds.silentIdleTurnId).toBe('om_turn_silent_stream');
+    expect(sessionReplyMock).not.toHaveBeenCalled();
   });
 
   it('turn ending with nothing_to_send posts the compact silent strip, not the legacy text receipt', async () => {
