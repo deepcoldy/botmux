@@ -1,4 +1,4 @@
-/** Opt-in defaults for /g; explicit mentions keep their existing precedence. */
+/** Opt-in team defaults for /g; mentions retain creator election and invitations. */
 export interface GroupCreationDefaults {
   agents?: string[];
   tag?: string;

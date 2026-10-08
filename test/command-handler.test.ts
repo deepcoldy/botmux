@@ -7010,6 +7010,26 @@ describe('handleCommand', () => {
       expect(mockedListBots).not.toHaveBeenCalled();
     });
 
+    it.each([
+      { flag: '', expected: ['app-1', 'app-2'] },
+      { flag: ' --no-agents', expected: ['app-1'] },
+      { flag: ' --agents app-1', expected: ['app-1'] },
+    ])('completes the default team when only its creator is mentioned: $flag', async ({ flag, expected }) => {
+      vi.mocked(getBot).mockImplementation(((id: string) => {
+        const bot = defaultGetBot(id);
+        return { ...bot, config: { ...bot.config, groupCreation: { agents: ['app-1', 'app-2'] } } };
+      }) as any);
+      mockedListBots.mockResolvedValueOnce([
+        { larkAppId: 'app-1', openId: 'ou_claude', name: 'claude-code', displayName: 'Claude', source: 'configured' },
+      ]);
+      const deps = makeDeps();
+      await handleCommand('/g', ROOT_ID, makeLarkMessage('/g @Claude Project' + flag, {
+        chatId: CHAT_ID, mentions: [{ key: '@_user_1', name: 'Claude', openId: 'ou_claude' }],
+      }), deps, LARK_APP_ID);
+      expect(mockedCreate).toHaveBeenCalledTimes(1);
+      expect(mockedCreate.mock.calls[0][0].larkAppIds).toEqual(expected);
+    });
+
     it('rejects unresolved configured agents before creating any group', async () => {
       const deps = makeDeps();
       await handleCommand('/g', ROOT_ID, makeLarkMessage('/g Project --agents Missing'), deps, LARK_APP_ID);

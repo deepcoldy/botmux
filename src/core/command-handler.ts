@@ -4677,9 +4677,10 @@ export async function handleCommand(
         let configuredAgentIds: string[] = [];
         try {
           groupArgs = parseGroupCreationArgs(rawArgs, getBot(creatorAppId).config.groupCreation);
-          // Explicit @ mentions retain their existing invite/election semantics.
-          // Defaults fill an unmentioned command; --agents adds explicit peers.
-          if (groupArgs.agents?.length && (mentionedBotAppIds.length === 0 || /(?:^|\s)--agents(?:=|\s)/.test(rawArgs))) {
+          // Keep @ election/invites, and complete the configured team even when
+          // only its creator was mentioned. Explicit --agents/--no-agents have
+          // already overridden defaults in the parser; Set below deduplicates.
+          if (groupArgs.agents?.length) {
             const p = join(config.session.dataDir, 'bots-info.json');
             const bots = existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')) : [];
             configuredAgentIds = resolveGroupCreationAgents(groupArgs.agents, bots);
