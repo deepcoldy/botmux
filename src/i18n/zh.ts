@@ -948,6 +948,7 @@ export const messages: Record<string, string> = {
   'ai.routing.usage_send': '- 发送：`botmux send "消息"`',
   'ai.routing.usage_mention_gate': '- 每条 send 必须三选一：`--mention <open_id>` / `--mention-back` / `--no-mention`——按内容价值选：有实质结论要对方看/确认/决策 → @；纯记录/低优先级进度/简短确认 → --no-mention；没信息量的"收到"不如不发',
   'ai.routing.usage_attachments': '- 附件：`--images`、`--files`、`--videos`（详见 `botmux send --help`）',
+  'ai.routing.ask_wait': '等待 botmux ask 真人回答时，无输出属正常等待；不得发送 Ctrl-C、kill 或取消等待工具来提前结束。复用原等待进程直到回答或正常超时；传输错误、超时和机器人回复不代表真人授权。收到 Ask 接续事件时回读原任务、问题与方案版本，只消费对应决定，不重跑已完成工作。',
   'ai.routing.usage_helpers': '- 上下文：`botmux history`；协作 bot：`botmux bots list`',
   'ai.routing.usage_silence': '- 不是发给你的消息，最终回复只输出 `BOTMUX_NOTHING_TO_SEND`',
   'ai.routing.no_visible_output_ok': '`botmux send` 成功即已送达；本轮终端无可见输出、直接结束是正常的。若看到「上一条回复没有可见输出，请继续」之类提示，那是底层 CLI 误判，不要因此重发——除非 `botmux send` 本身报错。',

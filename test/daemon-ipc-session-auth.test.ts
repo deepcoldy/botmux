@@ -121,16 +121,23 @@ describe('daemon session-scoped IPC route wiring', () => {
       "ipcRoute('POST', '/api/attention'",
     );
     const bindAt = route.indexOf('boundAsk = bindSessionScopedIpcIdentity(');
-    const registerAt = route.indexOf('registerAskForResponse({');
+    const inputAt = route.indexOf('const askInput = {');
     expect(bindAt).toBeGreaterThanOrEqual(0);
-    expect(registerAt).toBeGreaterThan(bindAt);
+    expect(inputAt).toBeGreaterThan(bindAt);
     expect(route).toContain('const askChatType = askSession?.chatType;');
     expect(route).toMatch(
-      /registerAskForResponse\(\{\s*larkAppId: boundAsk\.larkAppId,[\s\S]*chatType: askChatType,/,
+      /const askInput = \{\s*larkAppId: boundAsk\.larkAppId,[\s\S]*chatType: askChatType,/,
     );
     expect(route).not.toMatch(
-      /registerAskForResponse\(\{\s*larkAppId: parsed\.larkAppId,/,
+      /const askInput = \{\s*larkAppId: parsed\.larkAppId,/,
     );
+    expect(route).toContain('const explicitInput = { ...askInput,');
+    for (const registration of [
+      'explicitAskContinuation.wait(explicitInput)',
+      'registerAskForResponse(askInput, res)',
+    ]) {
+      expect(route.indexOf(registration), registration).toBeGreaterThan(inputAt);
+    }
   });
 
   it('binds hook identity before emitting the event', () => {
