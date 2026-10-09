@@ -57,8 +57,7 @@ class MemoryLaunchTest(unittest.TestCase):
                 self.assertEqual(launched["args"][-len(arguments):], arguments)
                 encoded = next(arg.split("=", 1)[1] for arg in launched["args"] if arg.startswith("mcp_servers.openviking="))
                 server = tomllib.loads("server=" + encoded)["server"]
-                self.assertEqual(server["http_headers"]["X-OpenViking-Actor-Peer"], str(project))
-                self.assertEqual(server["http_headers"]["X-OpenViking-User"], "selected-user")
+                self.assertFalse(server["enabled"])
 
     def test_automatic_reads_cannot_be_reenabled_by_inherited_environment(self):
         result = self.launch(OPENVIKING_AUTO_RECALL="1", OPENVIKING_NO_AUTO_INJECT="0",
@@ -90,6 +89,8 @@ class MemoryLaunchTest(unittest.TestCase):
         instructions = json.loads(encoded)
         self.assertTrue(instructions.startswith("profile instruction\n\n"))
         self.assertIn("For self-contained tasks, answer directly", instructions)
+        self.assertIn(str(self.root / "memory.mjs"), instructions)
+        self.assertNotIn("{{MEMORY_COMMAND}}", instructions)
         self.assertEqual(arguments[-2:], ["--profile", "selected"])
 
 

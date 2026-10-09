@@ -88,6 +88,8 @@ def memory_search_was_called(result):
             return True
         if name == "exec" and re.search(r"tools\.[\w]*openviking[\w]*_(?:find|search)\s*\(", body, re.I):
             return True
+        if "memory.mjs" in body and re.search(r"\b(?:find|search)\b", body):
+            return True
     return False
 
 
@@ -147,6 +149,10 @@ def run_turn(label, project, prompt, enabled=True, allow_memory_tools=False):
                         for invocation in result["tool_invocations"]:
                             name = invocation["name"]
                             if "openviking" in name.lower() or "tool_search" in name.lower():
+                                continue
+                            if "memory.mjs" in invocation["input"] and re.search(r"\b(?:search|find|read)\b", invocation["input"]):
+                                continue
+                            if "write_stdin" in name and memory_search_was_called(result):
                                 continue
                             if name == "exec":
                                 nested = re.findall(r"tools\.([\w]+)\s*\(", invocation["input"])

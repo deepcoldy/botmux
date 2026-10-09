@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shlex
 import sys
 import tomllib
 
@@ -48,21 +49,11 @@ for index, argument in enumerate(arguments):
     elif argument.startswith("--profile="):
         profile = argument.split("=", 1)[1]
 previous = config.get("profiles", {}).get(profile, {}).get("developer_instructions", config.get("developer_instructions", ""))
-usage = (root / "memory-usage.md").read_text().strip()
+command = shlex.join(["node", str(root / "memory.mjs"), "--config", runtime["client_config"]])
+usage = (root / "memory-usage.md").read_text().strip().replace("{{MEMORY_COMMAND}}", command)
 instructions = "\n\n".join(part for part in (previous, usage) if part)
-headers = {
-    "X-OpenViking-Account": environment["OPENVIKING_ACCOUNT"],
-    "X-OpenViking-User": environment["OPENVIKING_USER"],
-    "X-OpenViking-Actor-Peer": environment["OPENVIKING_PEER_ID"],
-}
-header_config = "{" + ",".join(json.dumps(key) + "=" + json.dumps(value) for key, value in headers.items()) + "}"
-mcp_config = "{url=" + json.dumps(environment["OPENVIKING_URL"].rstrip("/") + "/mcp")
-mcp_config += ",http_headers=" + header_config + ",startup_timeout_sec=30"
-if environment.get("OPENVIKING_API_KEY"):
-    mcp_config += ',bearer_token_env_var="OPENVIKING_API_KEY"'
-mcp_config += "}"
 disabled_mcp = "{url=" + json.dumps(environment["OPENVIKING_URL"].rstrip("/") + "/mcp") + ",enabled=false}"
 os.execv(runtime["codex"], [runtime["codex"], "--no-daemon", "-c", override,
         "-c", "mcp_servers.openviking-memory=" + disabled_mcp,
-        "-c", "mcp_servers.openviking=" + mcp_config,
+        "-c", "mcp_servers.openviking=" + disabled_mcp,
         "-c", "developer_instructions=" + json.dumps(instructions, ensure_ascii=False), *arguments])

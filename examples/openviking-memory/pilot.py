@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt in one existing single-user Codex Bot to OpenViking memory."""
+"""Optional Codex dialogue capture adapter for shared OpenViking memory."""
 
 import argparse
 import json
@@ -101,14 +101,20 @@ def configure(arguments):
     client_path = Path(previous_runtime.get("client_config")
                        or BOT_ROOT / "openviking" / bot["larkAppId"] / "ovcli.conf")
     previous_client = json.loads(client_path.read_text()) if client_path.exists() else {}
+    memory_user = arguments.memory_user or previous_client.get("user")
+    if not memory_user:
+        raise SystemExit("Provide --memory-user explicitly; all coding agents should reuse this shared user.")
     client = {
-        "url": "http://127.0.0.1:1933", "api_key": "",
-        "account": "default", "user": arguments.memory_user or previous_client.get("user") or "botmux-" + bot["larkAppId"],
-        "plugin": {"codex": {
+        **previous_client,
+        "url": previous_client.get("url") or "http://127.0.0.1:1933",
+        "api_key": previous_client.get("api_key", ""),
+        "account": previous_client.get("account") or "default", "user": memory_user,
+        "peer": previous_client.get("peer") or {"source": ["{git_remote}", "{git_root}", "{cwd}"]},
+        "plugin": {**previous_client.get("plugin", {}), "codex": {
+            **previous_client.get("plugin", {}).get("codex", {}),
             "autoRecall": False, "noAutoInject": True, "resumeArchiveInject": False,
             "recallRewrite": "off", "recallPeerScope": "actor", "commitTokenThreshold": 20000,
             "commitKeepRecentCount": 10,
-            "peerSource": ["{git_remote}", "{git_root}", "{cwd}"],
         }},
     }
     codex_candidate = arguments.codex or previous_runtime.get("codex") or shutil.which("codex")
@@ -234,7 +240,7 @@ def main():
     parser.add_argument("--botmux-root", help="Installed package or built checkout used by the Bot's daemon.")
     parser.add_argument("--pm2", help="Optional PM2 executable for the OpenViking service only.")
     parser.add_argument("--vlm-model", help="Model supported by your Codex account for memory extraction.")
-    parser.add_argument("--memory-user", help="Stable OpenViking user for this single-user Bot.")
+    parser.add_argument("--memory-user", help="Explicit shared OpenViking user reused by all coding agents.")
     parser.add_argument("--use-existing-server", action="store_true", help="Reuse ov.conf without overwriting it.")
     arguments = parser.parse_args()
     action = arguments.action

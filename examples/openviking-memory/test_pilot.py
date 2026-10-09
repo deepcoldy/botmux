@@ -52,7 +52,7 @@ class PilotConfigurationTest(unittest.TestCase):
     def configure(self, **overrides):
         values = dict(bot_index=1, bots_config=str(self.bots_path), codex=str(self.codex),
                       botmux_root=str(self.botmux_root), pm2=None, vlm_model=None,
-                      memory_user=None, use_existing_server=False)
+                      memory_user="shared-owner", use_existing_server=False)
         values.update(overrides)
         pilot.configure(argparse.Namespace(**values))
 
@@ -96,6 +96,20 @@ class PilotConfigurationTest(unittest.TestCase):
         self.assertEqual(restored[1], self.bots[1])
         self.assertEqual(restored[0]["description"], "updated after binding")
         self.assertEqual(restored[2], self.bots[2])
+
+    def test_reconfigure_preserves_shared_credentials_and_other_agent_settings(self):
+        self.configure()
+        path = Path(pilot.load_runtime()["client_config"])
+        client = json.loads(path.read_text())
+        client.update(account="shared-account", api_key_env="SHARED_MEMORY_API_KEY")
+        client["plugin"]["other_agent"] = {"setting": "preserved"}
+        path.write_text(json.dumps(client))
+        self.configure(memory_user=None)
+        current = json.loads(path.read_text())
+        self.assertEqual(current["account"], "shared-account")
+        self.assertEqual(current["api_key_env"], "SHARED_MEMORY_API_KEY")
+        self.assertEqual(current["plugin"]["other_agent"], {"setting": "preserved"})
+        self.assertEqual(current["user"], "shared-owner")
 
     def test_binding_refuses_changed_user_boundary_and_existing_wrapper(self):
         self.configure()

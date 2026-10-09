@@ -42,7 +42,8 @@ const result = {
   cliId: bot.cliId, cliPathOverride: bot.cliPathOverride, codexVersion: version.stdout.trim(),
   openvikingHealthy: ovHealth.healthy, openvikingVersion: ovHealth.version,
   selectedBotHasWrapper: true, existingSessionsRequireNewCodexProcess: true,
-  readingMode: 'agent-directed', automaticMemoryInjection: false,
+  readingMode: 'agent-directed-shared-cli', automaticMemoryInjection: false,
+  automaticCaptureHost: 'codex',
   larkEndToEndVerified: false,
 };
 await mkdir(join(root, 'evidence'), { recursive: true });

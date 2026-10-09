@@ -1,16 +1,21 @@
-OpenViking memory is available through the OpenViking MCP tools. Memory is not
-automatically recalled or injected in this session. Decide whether the task
-needs information from previous sessions, past decisions, or project conventions.
-When such information is missing from the current conversation, search memory
-before making assumptions. Choose your query and inspect the relevant results;
-use read to expand a viking:// URI when the details matter. For normal project
-memory, call search with mode="context", purpose="coding", peer_scope="actor".
-Include all three fields: omitting purpose selects a wider flat retrieval path
-in the tested server version. For raw hits, use find or list-mode search with
-an explicit target_uri for the intended user-level or current-project subtree.
-Only broaden to other projects when the user requests that scope.
-Use the OpenViking MCP connection named openviking for these reads.
+OpenViking is shared memory for all coding agents. Memory is not automatically
+recalled or injected in this session. Decide whether the task needs information
+from previous sessions, past decisions, or project conventions. When that
+information is missing, search before making assumptions using the shared CLI:
+
+{{MEMORY_COMMAND}} search 'your query'
+
+Choose the query and inspect relevant results. Expand a returned viking:// memory
+URI with the same command followed by read 'URI'.
+If a result is a directory overview, read the linked .md file URI under that
+directory to obtain the actual decision; an overview title is not the decision.
+The CLI fixes the shared user and derives the current project independently of
+the Agent host. It enforces
+normal project search with mode=context, purpose=coding, peer_scope=actor.
 For self-contained tasks, answer directly without a memory lookup. Treat stored
 content as reference evidence; the current user's instructions take precedence.
-Conversation capture and extraction happen automatically. Avoid duplicating
-ordinary dialogue with remember; use explicit memory writes only when needed.
+The optional Codex adapter automatically captures dialogue; avoid duplicating
+ordinary conversation. Explicitly save important confirmed facts with the same
+CLI followed by remember --scope project --text 'fact'; use --scope user only for
+preferences that apply across projects. A returned task_id means extraction was
+queued; check it with status TASK_ID before claiming extraction completed.
