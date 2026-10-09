@@ -1220,13 +1220,10 @@ function sessionIsNoTransport(larkAppId?: string, chatId?: string): boolean {
   return !larkTransportEnabled({ chatId, apiOnly });
 }
 
-/** Whether this bot enabled trigger-user CLI auth, for the inline-prompt path.
- *  Absent bot / unreadable config → false: an uncertain answer must not add a
- *  block claiming a boundary that is not configured. */
-function triggerUserAuthEnabledForPrompt(larkAppId?: string): boolean {
-  if (!larkAppId) return false;
-  try { return getBot(larkAppId).config.triggerUserAuth?.enabled === true; }
-  catch { return false; }
+function credentialBoundaryForPrompt(larkAppId: string | undefined, locale?: Locale): string {
+  if (!larkAppId) return '';
+  try { return buildCredentialBoundaryBlock(getBot(larkAppId).config.triggerUserAuth, locale); }
+  catch { return ''; }
 }
 
 /** 本会话的最终回复投递方式（per-bot replyDelivery × 该 CLI 的转写能力，见
@@ -1445,9 +1442,8 @@ function buildNewTopicBlocks(
     // hook-capable this is the difference between the agent seeing the boundary
     // and not. An envelope the CLI cannot read drops the block silently —
     // nothing errors when a constraint is merely absent.
-    if (triggerUserAuthEnabledForPrompt(opts?.larkAppId)) {
-      blocks.push({ key: 'credentials', text: buildCredentialBoundaryBlock(locale) });
-    }
+    const credentialBoundary = credentialBoundaryForPrompt(opts?.larkAppId, locale);
+    if (credentialBoundary) blocks.push({ key: 'credentials', text: credentialBoundary });
     blocks.push({ key: 'sessionId', text: `<session_id>${xmlEscape(sessionId)}</session_id>` });
   }
   if (roleBlock) blocks.push({ key: 'role', text: roleBlock });

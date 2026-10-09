@@ -1163,6 +1163,19 @@ async function applyAllowedUsersSet(
   await reply(t('cmd.config.allow_ok', { count: r.resolved.length, total: r.raw.length }, loc));
 }
 
+function bytedcliLoginSuccessReply(botConfig: BotConfig, locale: Locale): string {
+  const policy = botConfig.triggerUserAuth;
+  const enabled = triggerUserAuthApplies(policy, 'bytedcli');
+  const lines = [
+    t('cmd.login.bytedcli_ok', undefined, locale),
+    t(enabled ? 'cmd.login.bytedcli_enabled' : 'cmd.login.bytedcli_configure', undefined, locale),
+  ];
+  if (enabled && policy?.gitHost) {
+    lines.push(t('cmd.login.bytedcli_git_enabled', { host: policy.gitHost }, locale));
+  }
+  return lines.join('\n');
+}
+
 /**
  * `/botconfig` —— owner/allowedUsers 远程改本 bot 运营字段。sessionless：只认 larkAppId，
  * 不需活跃会话。严格 admin 闸（拒绝开放模式 bot），写盘 + 内存热更新，无需重启。
@@ -3672,7 +3685,7 @@ export async function handleCommand(
           if (bytedPending) {
             const { state, detail } = await completeBytedcliLogin(loginOpenId, bytedPending);
             doneLines.push(state === 'authorized'
-              ? t('cmd.login.bytedcli_ok', undefined, loc)
+              ? bytedcliLoginSuccessReply(botCfg2, loc)
               : state === 'pending'
                 ? t('cmd.login.bytedcli_pending', undefined, loc)
                 : state === 'unavailable'
@@ -3787,7 +3800,7 @@ export async function handleCommand(
             }
             const { state, detail } = await completeBytedcliLogin(loginOpenId, challenge);
             await sessionReply(rootId, state === 'authorized'
-              ? t('cmd.login.bytedcli_ok', undefined, loc)
+              ? bytedcliLoginSuccessReply(botCfg2, loc)
               : state === 'pending'
                 ? t('cmd.login.bytedcli_pending', undefined, loc)
                 : state === 'unavailable'

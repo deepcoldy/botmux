@@ -19,6 +19,7 @@ import { config } from '../../config.js';
 import { escapeXmlTagLikeTokens, escapeXmlText } from '../../utils/xml.js';
 import { resolveConditionalLine } from '../../skills/effective-builtins.js';
 import type { ReplyDelivery } from '../../core/reply-delivery.js';
+import { triggerUserAuthApplies, type TriggerUserAuthConfig } from '../../services/trigger-user-auth.js';
 
 /** The gated "no visible output is OK" hint reads `config.noVisibleOutputHint`
  *  by default, but a user customization can force it on/off. Keyed by the i18n
@@ -188,16 +189,21 @@ export const BOTMUX_SHELL_HINTS: string[] = [
  * directory to debug an auth failure — which a clear instruction does prevent —
  * and it does NOT survive a determined user or a prompt injection.
  */
-export function buildCredentialBoundaryBlock(locale?: Locale): string {
-  const line = (key: string): string => `  ${escapeXmlTagLikeTokens(t(key, undefined, locale))}`;
+export function buildCredentialBoundaryBlock(policy: TriggerUserAuthConfig | undefined, locale?: Locale): string {
+  if (!policy?.enabled || policy.tools.length === 0) return '';
+  const lark = triggerUserAuthApplies(policy, 'lark-cli');
+  const bytedcli = triggerUserAuthApplies(policy, 'bytedcli');
+  const line = (key: string, params?: Record<string, string>): string => `  ${escapeXmlTagLikeTokens(t(key, params, locale))}`;
   return [
     '<botmux_credentials>',
-    line('ai.credentials.acting_identity'),
+    line('ai.credentials.acting_identity', { tools: policy.tools.join(' / ') }),
+    ...(bytedcli && policy.gitHost ? [line('ai.credentials.git_identity', { host: policy.gitHost })] : []),
     line('ai.credentials.never_read_others'),
     line('ai.credentials.never_forward'),
-    line('ai.credentials.on_auth_failure'),
+    ...(lark ? [line('ai.credentials.on_auth_failure')] : []),
+    ...(bytedcli ? [line('ai.credentials.on_bytedcli_auth_failure')] : []),
     line('ai.credentials.on_auth_link'),
-    line('ai.credentials.on_missing_scope'),
+    ...(lark ? [line('ai.credentials.on_missing_scope')] : []),
     '</botmux_credentials>',
   ].join('\n');
 }
@@ -229,7 +235,7 @@ export function buildBotmuxSystemPromptText(opts: {
    * block. Off → nothing is emitted, so a bot that never enabled the feature
    * gets no extra prompt text.
    */
-  triggerUserAuth?: boolean;
+  triggerUserAuth?: TriggerUserAuthConfig;
   /** Per-bot replyDelivery frozen for this session (core/reply-delivery.ts).
    *  'transcript': the daemon forwards the final assistant message from the CLI
    *  transcript, so the routing block never mentions `botmux send` at all —
@@ -350,15 +356,13 @@ export function buildBotmuxSystemPromptText(opts: {
   // determined user or a prompt injection. It exists because the likeliest way
   // these files get read is an agent troubleshooting an auth failure and
   // grepping the data directory, which a clear instruction does prevent.
-  const credentialBoundaryBlock = triggerUserAuth
-    ? ['', buildCredentialBoundaryBlock(locale)]
-    : [];
+  const credentialBoundaryBlock = buildCredentialBoundaryBlock(triggerUserAuth, locale);
   return [
     '<botmux_routing>',
     ...routingInner,
     '</botmux_routing>',
     ...identityBlock,
-    ...credentialBoundaryBlock,
+    ...(credentialBoundaryBlock ? ['', credentialBoundaryBlock] : []),
     ...(builtinSkillBlock ? ['', builtinSkillBlock] : []),
   ].join('\n');
 }

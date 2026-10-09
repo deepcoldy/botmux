@@ -16880,7 +16880,7 @@ async function spawnCli(
     // block. It is a behavioral rule, not a control: nothing in the OS stops the
     // agent from reading another person's token file today, and the likeliest
     // way that happens is an agent grepping the data dir to debug an auth error.
-    triggerUserAuth: cfg.triggerUserAuth?.enabled === true,
+    triggerUserAuth: cfg.triggerUserAuth,
     // Codex and TraeX explicitly set these in tool shells instead of depending
     // on the CLI's default inheritance policy; other adapters inherit normally.
     ...(Object.keys(identityShellEnv).length ? { shellSubprocessEnv: identityShellEnv } : {}),

@@ -5,6 +5,7 @@ import {
   ExternalDurableCoordinationStore,
 } from '../src/services/external-durable-coordination-store.js';
 import { initializeDurableCoordinationRuntime } from '../src/services/durable-coordination-runtime.js';
+import { resolveDaemonEnv } from '../src/cli/daemon-lifecycle-env.js';
 import { tsRunnerPrefix } from './helpers/ts-runner.js';
 
 const fixture = resolve('test/fixtures/durable-coordination-provider.ts');
@@ -68,10 +69,24 @@ describe('external durable coordination provider', () => {
 });
 
 describe('durable coordination runtime configuration', () => {
-  it('keeps the default disabled and primary fail-closed', async () => {
-    await expect(initializeDurableCoordinationRuntime({})).resolves.toBeUndefined();
-    await expect(initializeDurableCoordinationRuntime({ BOTMUX_COORDINATION_MODE: '' })).resolves.toBeUndefined();
-    await expect(initializeDurableCoordinationRuntime({ BOTMUX_COORDINATION_MODE: '   ' })).resolves.toBeUndefined();
+  it.each([
+    undefined,
+    '',
+    '   ',
+  ])('treats an absent or blank coordination mode as disabled (%#)', async mode => {
+    await expect(initializeDurableCoordinationRuntime({
+      ...(mode === undefined ? {} : { BOTMUX_COORDINATION_MODE: mode }),
+    })).resolves.toBeUndefined();
+  });
+
+  it('accepts the lifecycle default environment as disabled', async () => {
+    await expect(initializeDurableCoordinationRuntime(resolveDaemonEnv({})))
+      .resolves.toBeUndefined();
+  });
+
+  it('rejects unsupported non-empty coordination modes and keeps primary fail-closed', async () => {
+    await expect(initializeDurableCoordinationRuntime({ BOTMUX_COORDINATION_MODE: 'unexpected' }))
+      .rejects.toThrow(/must be disabled, shadow, or primary/);
     await expect(initializeDurableCoordinationRuntime({ BOTMUX_COORDINATION_MODE: 'primary' }))
       .rejects.toThrow(/primary is unavailable/);
   });

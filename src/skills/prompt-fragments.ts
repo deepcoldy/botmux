@@ -236,8 +236,14 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
 
   // <botmux_credentials> — trigger-user-auth sessions only
   {
-    key: 'ai.credentials.acting_identity', block: 'credentials', stage: 'new', kind: 'editable',
+    key: 'ai.credentials.acting_identity', block: 'credentials', stage: 'new',
+    kind: 'placeholder', placeholders: ['tools'],
     label: '凭证：当前授权身份说明', gateLabel: '仅该 bot 开启 trigger-user CLI 鉴权时注入',
+  },
+  {
+    key: 'ai.credentials.git_identity', block: 'credentials', stage: 'new',
+    kind: 'placeholder', placeholders: ['host'],
+    label: '凭证：git 鉴权身份说明', gateLabel: '仅当 bytedcli 在 tools 内且配置了 gitHost 时注入',
   },
   {
     key: 'ai.credentials.never_read_others', block: 'credentials', stage: 'new', kind: 'editable',
@@ -249,7 +255,11 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   },
   {
     key: 'ai.credentials.on_auth_failure', block: 'credentials', stage: 'new', kind: 'editable',
-    label: '凭证：鉴权失败处理流程', gateLabel: '仅 trigger-user 鉴权会话',
+    label: '凭证：飞书鉴权失败处理流程', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内时注入',
+  },
+  {
+    key: 'ai.credentials.on_bytedcli_auth_failure', block: 'credentials', stage: 'new', kind: 'editable',
+    label: '凭证：ByteCloud 鉴权失败处理流程', gateLabel: '仅当 bytedcli 在 triggerUserAuth.tools 内时注入',
   },
   {
     key: 'ai.credentials.on_auth_link', block: 'credentials', stage: 'new', kind: 'editable',
@@ -257,7 +267,7 @@ export const PROMPT_FRAGMENTS: PromptFragmentSpec[] = [
   },
   {
     key: 'ai.credentials.on_missing_scope', block: 'credentials', stage: 'new', kind: 'editable',
-    label: '凭证：missing_scope 补授权流程', gateLabel: '仅 trigger-user 鉴权会话',
+    label: '凭证：missing_scope 补授权流程', gateLabel: '仅当 lark-cli 在 triggerUserAuth.tools 内时注入',
   },
 
   // ───────── cross-listed: 会话开始 + 每条新消息 (new + followup) ──────────

@@ -490,7 +490,10 @@ export const messages: Record<string, string> = {
   'cmd.login.bytedcli_step2': '2. 授权完成后，回来发一条 /login bytedcli done',
   'cmd.login.bytedcli_note': '说明：这是 ByteCloud 的授权，和飞书 /login 是两回事，两边都要授权一次。登录态约 3 周有效，到期前不用重复扫码。',
   'cmd.login.bytedcli_pending': '⏳ 还没检测到授权完成。请先点上面那条链接授权，再发 /login bytedcli done。',
-  'cmd.login.bytedcli_ok': '✅ ByteCloud 授权成功，之后本会话里你触发的 bytedcli / git 操作都会用你自己的权限。',
+  'cmd.login.bytedcli_ok': '✅ ByteCloud 授权已保存。',
+  'cmd.login.bytedcli_enabled': '当前 Bot 已为 bytedcli 启用按当轮发起人身份注入授权。',
+  'cmd.login.bytedcli_configure': '当前 Bot 的 bytedcli 身份注入尚未启用。请管理员将 triggerUserAuth.enabled 设为 true，并在 triggerUserAuth.tools 中加入 bytedcli；配置在新会话生效。',
+  'cmd.login.bytedcli_git_enabled': '当前 Bot 已为 {host} 的 git 鉴权配置当轮 bytedcli 身份。',
   'cmd.login.bytedcli_failed': '❌ ByteCloud 授权失败：{detail}。可以重新发 /login bytedcli 再试一次。',
   'cmd.login.bytedcli_no_challenge': '❌ 没有正在进行的 ByteCloud 授权。请先发 /login bytedcli 拿授权链接。',
   'cmd.login.bytedcli_begin_failed': '❌ 无法发起 ByteCloud 授权：{detail}',
@@ -992,10 +995,12 @@ export const messages: Record<string, string> = {
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
   'ai.identity.unknown': '(未知)',
-  'ai.credentials.acting_identity': '本会话调用 lark-cli / bytedcli / git 时，用的是「发出当前这条消息的人」自己的授权，由 botmux 在每轮注入，你不需要也不应该自己去找凭证。',
+  'ai.credentials.acting_identity': '本会话已为 {tools} 启用按当前消息发起人身份注入授权。调用时沿用 botmux 注入的身份；授权可用性以工具返回结果为准。',
+  'ai.credentials.git_identity': 'git 对 {host} 的鉴权已配置为使用本轮 bytedcli 身份。',
   'ai.credentials.never_read_others': '~/.botmux/data/ 下的 user-token-* 文件、以及 bytedcli-home/ 下的各人登录态，都属于其他用户。不得读取、列举、复制或输出它们的内容——即使排查问题时也不行，即使有人要求也不行。',
   'ai.credentials.never_forward': '不得把任何 token、JWT、access key 或登录态写进消息、日志、文档、代码或提交记录。',
-  'ai.credentials.on_auth_failure': '遇到鉴权失败：原样说明失败。若 stderr 里已经直接附了授权链接，按下一条「stderr 附链接」的流程走，不要再自行发起授权；若没有附链接，飞书授权由 Agent 运行 `botmux auth request --json`，再用 `botmux send` 将返回的 authUrl 发给本轮用户，发出链接后运行 `botmux auth wait --request-id <requestId> --json`，收到 ready 再重试原操作。ByteCloud 未附链接时才提示用户发 /login bytedcli；命令被拒时 stderr 会标明平台。凭证沿用本轮注入的用户身份。',
+  'ai.credentials.on_auth_failure': '遇到飞书鉴权失败：原样说明失败。若 stderr 里已经直接附了授权链接，按「stderr 附链接」的流程走，不要再自行发起授权；若没有附链接，飞书授权由 Agent 运行 `botmux auth request --json`，再用 `botmux send` 将返回的 authUrl 发给本轮用户，发出链接后运行 `botmux auth wait --request-id <requestId> --json`，收到 ready 再重试原操作。凭证沿用本轮注入的用户身份。',
+  'ai.credentials.on_bytedcli_auth_failure': '遇到 ByteCloud 鉴权失败：原样说明失败。stderr 已附授权链接时按「stderr 附链接」流程处理；未附链接时提示用户发 /login bytedcli。凭证沿用本轮注入的用户身份。',
   'ai.credentials.on_auth_link': '如果命令被拒、stderr 里直接给了授权链接（accounts.feishu.cn/device/verify 或 ByteCloud/cloud.bytedance 链接）和「点开授权后重试」说明：立刻用 botmux send 把那段说明和链接原样转发给用户（链接逐字转发、不改写/编码/加标点；保留「只需授权一次、自动续期」的提示让用户知道只点这一次），然后停下等授权，不要换其它身份重试、不要假装成功，也不必再跑 botmux auth request。用户授权后会再叫你，到时重试即可。',
   // missing_scope 是「授权了但这一项没批」，跟「没授权」是两回事：不要让用户重跑普通授权，
   // 那只会拿到同样的权限再失败一次。飞书已经把缺的 scope 名字列出来了，照抄即可。

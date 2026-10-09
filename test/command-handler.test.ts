@@ -6106,14 +6106,37 @@ describe('handleCommand', () => {
         expect(text).toContain('两边都要授权');
       });
 
-      it('completes the pending challenge on done', async () => {
+      it.each([
+        { name: 'absent', policy: undefined, enabled: false, git: false },
+        { name: 'disabled', policy: { enabled: false }, enabled: false, git: false },
+        { name: 'lark only', policy: { enabled: true, tools: ['lark-cli'], gitHost: 'code.example.com' }, enabled: false, git: false },
+        { name: 'bytedcli', policy: { enabled: true, tools: ['bytedcli'] }, enabled: true, git: false },
+        { name: 'bytedcli with git', policy: { enabled: true, tools: ['bytedcli'], gitHost: 'code.example.com' }, enabled: true, git: true },
+      ])('reports saved authorization and the $name policy on done', async ({ policy, enabled, git }) => {
         vi.mocked(pendingBytedcliChallenge).mockReturnValue('tok-1');
         vi.mocked(completeBytedcliLogin).mockResolvedValue({ state: 'authorized' });
-        const deps = makeDeps(makeDaemonSession());
-        await handleCommand('/login', ROOT_ID, makeLarkMessage('/login bytedcli done'), deps, LARK_APP_ID);
+        const bot = defaultGetBot();
+        vi.mocked(getBot).mockReturnValue({
+          ...bot,
+          config: { ...bot.config, triggerUserAuth: parseTriggerUserAuthConfig(policy) ?? undefined },
+        } as any);
+        for (const command of ['/login bytedcli done', '/login done']) {
+          const deps = makeDeps(makeDaemonSession());
+          await handleCommand('/login', ROOT_ID, makeLarkMessage(command), deps, LARK_APP_ID);
 
-        expect(completeBytedcliLogin).toHaveBeenCalledWith('ou_sender', 'tok-1');
-        expect((deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1]).toContain('授权成功');
+          expect(completeBytedcliLogin).toHaveBeenCalledWith('ou_sender', 'tok-1');
+          const text = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+          expect(text).toContain('授权已保存');
+          if (enabled) {
+            expect(text).toContain('已为 bytedcli 启用');
+            expect(text).not.toContain('triggerUserAuth.enabled');
+          } else {
+            expect(text).toContain('triggerUserAuth.enabled');
+            expect(text).toContain('triggerUserAuth.tools');
+            expect(text).not.toContain('已为 bytedcli 启用');
+          }
+          expect(text.includes('code.example.com')).toBe(git);
+        }
       });
 
       // Not an error: they just have not clicked yet. Reporting a failure would

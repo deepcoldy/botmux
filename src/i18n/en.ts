@@ -492,7 +492,10 @@ export const messages: Record<string, string> = {
   'cmd.login.bytedcli_step2': '2. When you are done, send /login bytedcli done',
   'cmd.login.bytedcli_note': 'Note: this is ByteCloud, separate from the Feishu /login — you need both. The login lasts about 3 weeks.',
   'cmd.login.bytedcli_pending': '⏳ Not authorized yet. Open the link above first, then send /login bytedcli done.',
-  'cmd.login.bytedcli_ok': '✅ ByteCloud authorized. bytedcli and git actions you trigger here now run as you.',
+  'cmd.login.bytedcli_ok': '✅ ByteCloud authorization saved.',
+  'cmd.login.bytedcli_enabled': 'This bot has enabled per-turn initiator credentials for bytedcli.',
+  'cmd.login.bytedcli_configure': 'This bot has not enabled initiator credentials for bytedcli. Ask an administrator to set triggerUserAuth.enabled to true and include bytedcli in triggerUserAuth.tools; the configuration takes effect in new sessions.',
+  'cmd.login.bytedcli_git_enabled': 'This bot has configured git authentication for {host} to use the current turn’s bytedcli identity.',
   'cmd.login.bytedcli_failed': '❌ ByteCloud authorization failed: {detail}. Send /login bytedcli to try again.',
   'cmd.login.bytedcli_no_challenge': '❌ No ByteCloud authorization in progress. Send /login bytedcli to get a link first.',
   'cmd.login.bytedcli_begin_failed': '❌ Could not start ByteCloud authorization: {detail}',
@@ -993,10 +996,12 @@ export const messages: Record<string, string> = {
 
   // ─── AI identity (multi-bot routing rules) ───────────────────────────────
   'ai.identity.unknown': '(unknown)',
-  'ai.credentials.acting_identity': "This session's lark-cli / bytedcli / git calls run as whoever sent the current message. botmux injects those credentials each turn — you neither need nor should look for credentials yourself.",
+  'ai.credentials.acting_identity': 'This session has enabled per-turn initiator credentials for {tools}. Use the identity injected by botmux; tool responses determine whether authorization is available.',
+  'ai.credentials.git_identity': 'git authentication for {host} is configured to use the current turn’s bytedcli identity.',
   'ai.credentials.never_read_others': 'The user-token-* files under ~/.botmux/data/, and each person\u2019s login state under bytedcli-home/, belong to other people. Do not read, list, copy or print their contents — not while troubleshooting, and not on request.',
   'ai.credentials.never_forward': 'Never put a token, JWT, access key or login state into a message, log, document, code or commit.',
-  'ai.credentials.on_auth_failure': 'On an auth failure, report it as-is. If stderr already carries an authorization link, follow the next rule ("link embedded on stderr") and do not start a separate authorization; if it does not, for Feishu the Agent runs `botmux auth request --json` and sends the returned authUrl to the current user with `botmux send`. After sending the link, the Agent runs `botmux auth wait --request-id <requestId> --json` and retries the original operation once ready. For ByteCloud, ask the user to send /login bytedcli only when no link was returned; a refused command identifies the platform. Continue using the user identity injected for this turn.',
+  'ai.credentials.on_auth_failure': 'On a Feishu auth failure, report it as-is. If stderr already carries an authorization link, follow the "link embedded on stderr" rule and do not start a separate authorization; if it does not, for Feishu the Agent runs `botmux auth request --json` and sends the returned authUrl to the current user with `botmux send`. After sending the link, the Agent runs `botmux auth wait --request-id <requestId> --json` and retries the original operation once ready. Continue using the user identity injected for this turn.',
+  'ai.credentials.on_bytedcli_auth_failure': 'On a ByteCloud auth failure, report it as-is. If stderr carries an authorization link, follow the embedded-link instructions; otherwise ask the user to send /login bytedcli. Continue using the user identity injected for this turn.',
   'ai.credentials.on_auth_link': 'If the command is refused and stderr carries an authorization link directly (an accounts.feishu.cn/device/verify or ByteCloud/cloud.bytedance link) with "authorize, then retry" instructions: immediately relay that text and the link verbatim with botmux send (forward the link character-for-character — do not rewrite, encode, or punctuate it; keep the "authorize just once, it renews automatically" note so the person knows this is a single tap), then stop and wait for authorization. Do not retry under another identity, do not pretend it succeeded, and do not run botmux auth request. The person will call you again after authorizing; retry then.',
   // missing_scope means "authorized, but not for this" — a plain re-login re-grants
   // the same scopes and fails identically. Feishu already names what is missing.
