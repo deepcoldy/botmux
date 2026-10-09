@@ -172,7 +172,7 @@ Claude Code 使用同一启动方式，将 `BOTMUX_CORE_CLI` 改为 `claude-code
 }
 ```
 
-外部执行提议后，用**新 requestId** 提交下一轮，并显式提供所需历史/工具结果。框架不认识具体工具名，也不隐式保存或拼接 messages。支持的 JSON Schema 子集为 `type`（单类型）、`properties`、`required`、`additionalProperties:false`、`items`、数组 `maxItems`（非负安全整数）、标量 `enum`、`description`；对象必须列出所有 required 字段。拒绝 `$ref`、组合 schema 等未实现关键词，防止虚假的校验成功。提供原生 schema 参数的 CLI 同时使用原生约束；Claude 的 `maxItems` 转为字段描述后交给原生 CLI，其他 CLI 使用输出格式提示。所有结果均须通过原始本地 schema 校验，不合规结果明确失败。
+外部执行提议后，用**新 requestId** 提交下一轮，并显式提供所需历史/工具结果。框架不认识具体工具名，也不隐式保存或拼接 messages。支持的 JSON Schema 子集为 `type`（单类型）、`properties`、`required`、`additionalProperties:false`、`items`、标量 `enum`、`description`；对象必须列出所有 required 字段。拒绝 `$ref`、组合 schema 等未实现关键词，防止虚假的校验成功。提供原生 schema 参数的 CLI 同时使用原生约束；其他 CLI 使用输出格式提示。所有结果均须通过本地 schema 校验，不合规结果明确失败。
 
 对应签名 IPC：
 

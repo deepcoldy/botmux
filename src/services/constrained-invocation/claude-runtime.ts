@@ -3,20 +3,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { readSecureHostFileSync } from '../../platform/secure-host-file.js';
-import { isObject, matchesSchema, type InvocationRequest, type InvocationResult, type JsonSchema } from './contract.js';
+import { isObject, matchesSchema, type InvocationRequest, type InvocationResult } from './contract.js';
 import { isolatedModelEnv, NativeInvocationError, type ModelOnlyRuntime, type NativeInvocationOutput } from './runtime.js';
 import { spawnOwnedModelProcess } from './native-process.js';
-
-/** Claude does not accept maxItems in its native grammar. Keep the constraint
- * in the description for generation and validate the original schema locally. */
-export function claudeOutputSchema(schema: JsonSchema): JsonSchema {
-  const { maxItems, ...native } = schema;
-  if (maxItems !== undefined) native.description = `${schema.description ? `${schema.description} ` : ''}Return at most ${maxItems} items.`;
-  if (schema.type === 'array') native.items = claudeOutputSchema(schema.items as JsonSchema);
-  if (schema.type === 'object') native.properties = Object.fromEntries(Object.entries(schema.properties as Record<string, JsonSchema>)
-    .map(([name, child]) => [name, claudeOutputSchema(child)]));
-  return native;
-}
 
 /** Claude reports uncached input separately from cache reads/writes. */
 export function claudeUsage(raw: unknown): InvocationResult['usage'] {
@@ -62,7 +51,7 @@ export async function runIsolatedClaude(request: InvocationRequest, runtime: {
   const args = ['--print', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
     '--tools', '', '--safe-mode', '--setting-sources', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
     '--no-session-persistence', '--settings', '{"disableAllHooks":true}',
-    `--model=${request.model}`, '--json-schema', JSON.stringify(claudeOutputSchema(request.outputSchema)),
+    `--model=${request.model}`, '--json-schema', JSON.stringify(request.outputSchema),
     '--system-prompt', 'Reason only over the supplied input. Return the requested structured answer. Tool proposals are data for the caller, not executable actions.'];
   if (request.reasoningEffort) args.push('--effort', request.reasoningEffort);
   // Native generation budget, not post-hoc truncation. This applies to each
