@@ -111,7 +111,7 @@ export function createTaskWithOptionalPrecondition(
       try {
         const current = scheduleStore.getTask(id, appId);
         if (current?.preconditionRef === staged.preconditionRef) {
-          scheduleStore.removeTask(id, appId);
+          scheduler.rollbackUnpublishedRuntimeTask(id, appId);
         }
       } catch (cleanupError) {
         logRollbackFailure(id, 'task-row cleanup after create failure', cleanupError);
@@ -232,7 +232,10 @@ function restoreUpdatedTaskRow(
     patch.chatIds = before.chatIds ?? null;
   }
   if (updates.topicTitle !== undefined) patch.topicTitle = before.topicTitle;
-  scheduleStore.updateTask(before.id, patch, appId);
+  scheduler.updateRuntimeTaskState(before.id, {
+    ...patch,
+    chatIds: patch.chatIds === null || patch.chatIds === undefined ? undefined : [...patch.chatIds],
+  }, appId);
 }
 
 function resultForTask(task: ScheduledTask, appId: string): SchedulePreconditionUpdateResult {
@@ -324,7 +327,7 @@ export function updateTaskWithOptionalPrecondition(
         // means the only observable intermediate is marker-without-sidecar,
         // which resolve treats as an error rather than an absent condition.
         removeSchedulePrecondition(appId, id);
-        scheduleStore.updateTask(id, { preconditionRef: undefined }, appId);
+        scheduler.updateRuntimeTaskState(id, { preconditionRef: undefined }, appId);
       }
     } else if (mutation.action === 'set-enabled') {
       if (!existing) throw new Error('schedule_precondition_not_configured');
@@ -334,7 +337,7 @@ export function updateTaskWithOptionalPrecondition(
       setSchedulePreconditionEnabled(task, appId, mutation.enabled);
     } else {
       if (!staged) throw new Error('schedule_precondition_stage_missing');
-      scheduleStore.updateTask(id, { preconditionRef: staged.preconditionRef }, appId);
+      scheduler.updateRuntimeTaskState(id, { preconditionRef: staged.preconditionRef }, appId);
       task = scheduleStore.getTask(id, appId);
       if (!task) throw new Error('schedule_missing_during_precondition_update');
       activateSchedulePrecondition(task, appId);

@@ -42,7 +42,8 @@ import { registerSessionGroup } from '../services/session-groups-store.js';
 import { scheduleSessionGroupTitle } from '../services/session-group-title.js';
 import { tagSessionGroup } from '../services/feed-group-tagger.js';
 import { applySessionGroupAvatar } from '../services/session-group-avatar.js';
-import { sendMessage, replyMessage, forwardMessage } from '../im/lark/client.js';
+import { sendMessage, replyMessage, forwardMessage, getMessageDetail } from '../im/lark/client.js';
+import { assertMessageTopicAvailable, TopicSendError } from '../cli/topic-send-guard.js';
 import { evaluateTalk, extractMessageTextForRouting, type RoutingContext } from '../im/lark/event-dispatcher.js';
 import { stripLeadingMentions } from '../im/lark/message-parser.js';
 import { t, localeForBot, type Locale } from '../i18n/index.js';
@@ -133,8 +134,14 @@ export async function maybeBirthSessionGroup(
   // verdict the caller's pre-birth quota charge was made on (chatType is 'p2p'
   // by construction here, which the p2pOpen leg needs).
   const originEv = evaluateTalk(larkAppId, dmChatId, senderOpenId, undefined, undefined, ctx.chatType);
+  const sourceOptions = botCfg.topicUnavailablePolicy === 'stop' ? { beforeWrite: async () => {
+    await assertMessageTopicAvailable(larkAppId, messageId,
+      (appId, id) => getMessageDetail(appId, id, { userCardContent: false, timeoutMs: 10000 }));
+  } } : undefined;
+
 
   try {
+    await sourceOptions?.beforeWrite();
     const result = await createGroupWithBots({
       creatorLarkAppId: larkAppId,
       larkAppIds: [larkAppId],
@@ -197,8 +204,10 @@ export async function maybeBirthSessionGroup(
     let forwardedMessageId: string | undefined;
     if (sg.forwardOrigin !== false) {
       try {
+        await sourceOptions?.beforeWrite();
         forwardedMessageId = await forwardMessage(larkAppId, messageId, newChatId);
       } catch (err) {
+        if (err instanceof TopicSendError) throw err;
         logger.info(`[session-group] origin forward failed for ${newChatId.substring(0, 12)}; falling back to an inline excerpt: ${err}`);
       }
     }
@@ -218,13 +227,12 @@ export async function maybeBirthSessionGroup(
         : t('sg.intro_no_text', undefined, locale)}`;
     let introMessageId: string | undefined;
     try {
-      introMessageId = await sendMessage(
-        larkAppId,
-        newChatId,
-        `📥 <at user_id="${senderOpenId}"></at> ${introBody}`,
-        'text',
-      );
+      const args = [larkAppId, newChatId, `📥 <at user_id="${senderOpenId}"></at> ${introBody}`, 'text'] as const;
+      introMessageId = sourceOptions
+        ? await sendMessage(...args, undefined, undefined, sourceOptions)
+        : await sendMessage(...args);
     } catch (err) {
+      if (err instanceof TopicSendError) throw err;
       logger.warn(`[session-group] intro message failed for ${newChatId.substring(0, 12)}: ${err}`);
     }
 
@@ -234,6 +242,7 @@ export async function maybeBirthSessionGroup(
       try {
         await replyMessage(larkAppId, messageId, JSON.stringify({ chat_id: newChatId }), 'share_chat');
       } catch (err) {
+        if (err instanceof TopicSendError) throw err;
         logger.info(`[session-group] share_chat receipt failed (${err}); falling back to link text`);
         const link = `https://applink.feishu.cn/client/chat/open?openChatId=${newChatId}`;
         await replyMessage(
@@ -243,6 +252,10 @@ export async function maybeBirthSessionGroup(
         ).catch(err2 => logger.warn(`[session-group] DM receipt failed: ${err2}`));
       }
     }
+
+    // Returning a reborn context starts a Worker. A rejected source must not
+    // survive a swallowed forward/intro/receipt failure and reach that path.
+    await sourceOptions?.beforeWrite();
 
     // Session-group tagging + avatar branding — both fire-and-forget and
     // best-effort (tag degrades per mode/tenant support; avatar degrades to
@@ -299,6 +312,8 @@ export async function maybeBirthSessionGroup(
     };
   } catch (err) {
     logger.error(`[session-group] birth failed for dm=${dmChatId.substring(0, 12)}: ${err}`);
+    if (err instanceof TopicSendError) throw err;
+    await sourceOptions?.beforeWrite();
     await replyMessage(
       larkAppId,
       messageId,

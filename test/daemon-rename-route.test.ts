@@ -210,6 +210,7 @@ vi.mock('../src/im/lark/identity-cache.js', async () => {
 
 import { registerBot } from '../src/bot-registry.js';
 import { sessionAnchorId, sessionKey } from '../src/core/types.js';
+import { __testOnly_setCascadeTiming } from '../src/core/cli-idle-wait.js';
 import { recordBotUnionId } from '../src/services/bot-union-ids-store.js';
 import {
   __testOnly_activeSessions as activeSessions,
@@ -659,7 +660,7 @@ describe('/rename production routing — must not pre-create a session (review P
       expect(mocks.closeSession).not.toHaveBeenCalled();
     } finally {
       mocks.createSession.mockImplementation(original!);
-      actual.init();
+      actual.init(APP);
       rmSync(home, { recursive: true, force: true });
     }
   });
@@ -673,6 +674,38 @@ describe('/rename production routing — must not pre-create a session (review P
     expect(mocks.createSession).not.toHaveBeenCalled();
     expect(activeSessions.size).toBe(0);
     expect(repliedText()).toContain('没有活跃的会话');
+  });
+
+  // PR-2 有意变化（docs/design/2026-09-11-command-router.md §9）：thread 入口的 /card /cot
+  // 与新话题入口对齐为前置特判——无会话时不再预建 worker:null 的幽灵会话。
+  it('thread reply with no existing session: `/card pin status` creates NOTHING and still replies', async () => {
+    await handleThreadReply(
+      makeEventData('om_reply_card', '/card pin status', 'om_root_card'),
+      makeCtx('om_root_card', 'om_reply_card'),
+    );
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+    expect(repliedText().length).toBeGreaterThan(0);
+  });
+
+  it('thread reply with no existing session: `/term` creates NOTHING and still replies', async () => {
+    await handleThreadReply(
+      makeEventData('om_reply_term', '/term', 'om_root_term'),
+      makeCtx('om_root_term', 'om_reply_term'),
+    );
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+    expect(repliedText().length).toBeGreaterThan(0);
+  });
+
+  it('thread reply with no existing session: `/cot status` creates NOTHING and still replies', async () => {
+    await handleThreadReply(
+      makeEventData('om_reply_cot', '/cot status', 'om_root_cot'),
+      makeCtx('om_root_cot', 'om_reply_cot'),
+    );
+    expect(mocks.createSession).not.toHaveBeenCalled();
+    expect(activeSessions.size).toBe(0);
+    expect(repliedText().length).toBeGreaterThan(0);
   });
 
   it('thread reply with an existing session: `/rename` renames it in place', async () => {
@@ -3738,5 +3771,302 @@ describe('/repo trusted sibling production routing', () => {
     expect(repliedText()).toContain('仅 allowedUsers 可执行');
     expect(mocks.createSession).not.toHaveBeenCalled();
     expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * runtime 级联定序器（docs/design/2026-09-11-command-router.md §6，PR-3）：thread + 活 worker 上
+ * 「透传命令行 ⏎ …」逐条送出，每条之间等 CLI 执行完；后端跑不了时 fail closed。
+ * 透传链钉顺序与 turn 标识；「命令 + 正文」另钉重入顺序，以及 worker 中途消失时停住。
+ */
+describe('runtime passthrough cascade (PR-3)', () => {
+  const tick = (ms: number) => new Promise(r => setTimeout(r, ms));
+  beforeEach(() => {
+    resetRouteTestState();
+    activeSessions.clear();
+    __testOnly_setCascadeTiming({ idleTimeoutMs: 400, busyGraceMs: 40, pollMs: 5 });
+  });
+
+  function seedLiveThreadSession(anchor: string): { ds: DaemonSession; raws: () => any[] } {
+    const ds = seedThreadSession(anchor, '级联');
+    const send = vi.fn(() => true);
+    (ds as any).worker = { killed: false, pid: 4242, send };
+    ds.cliReady = true;
+    ds.cliReadyGeneration = 1;
+    ds.lastScreenStatus = 'idle';
+    ds.session.cliId = 'claude-code';
+    return { ds, raws: () => send.mock.calls.map(c => c[0]).filter((m: any) => m.type === 'raw_input') };
+  }
+
+  it('瞬时命令：第一条立即送出，宽限窗内没忙就送第二条；派生/真实 turn id 各归其位', async () => {
+    const { raws } = seedLiveThreadSession('om_root_casc1');
+    await handleThreadReply(
+      makeEventData('om_casc_1', '/model opus\n/clear', 'om_root_casc1'),
+      makeCtx('om_root_casc1', 'om_casc_1'),
+    );
+    await tick(15);
+    expect(raws().map((m: any) => m.content)).toEqual(['/model opus']);
+    expect(raws()[0].turnId).toBe('om_casc_1#c1');
+    await tick(120);
+    expect(raws().map((m: any) => m.content)).toEqual(['/model opus', '/clear']);
+    expect(raws()[1].turnId).toBe('om_casc_1');
+    expect(mocks.createSession).not.toHaveBeenCalled();
+  });
+
+  it('真忙命令：第二条要等到 prompt_ready 代际递增才送', async () => {
+    const { ds, raws } = seedLiveThreadSession('om_root_casc2');
+    await handleThreadReply(
+      makeEventData('om_casc_2', '/compact 只留登录上下文\n/clear', 'om_root_casc2'),
+      makeCtx('om_root_casc2', 'om_casc_2'),
+    );
+    await tick(15);
+    expect(raws()).toHaveLength(1);
+    ds.lastScreenStatus = 'working';
+    await tick(150);
+    expect(raws()).toHaveLength(1);
+    ds.cliReadyGeneration = 2;
+    ds.lastScreenStatus = 'idle';
+    await tick(60);
+    expect(raws().map((m: any) => m.content)).toEqual(['/compact 只留登录上下文', '/clear']);
+  });
+
+  it('adopt 会话跑不了级联：fail closed 回一句，什么都不发', async () => {
+    const { ds, raws } = seedLiveThreadSession('om_root_casc3');
+    (ds as any).adoptedFrom = { kind: 'tmux', pane: '%1' };
+    await handleThreadReply(
+      makeEventData('om_casc_3', '/model opus\n/clear', 'om_root_casc3'),
+      makeCtx('om_root_casc3', 'om_casc_3'),
+    );
+    await tick(30);
+    expect(raws()).toHaveLength(0);
+    expect(repliedText()).toContain('分条发送');
+  });
+
+  it('级联在飞时后到的单条透传排在定序器之后重入（保序），第二条级联 fail closed', async () => {
+    const { ds, raws } = seedLiveThreadSession('om_root_casc5');
+    await handleThreadReply(
+      makeEventData('om_casc_5', '/compact 只留登录上下文\n/clear', 'om_root_casc5'),
+      makeCtx('om_root_casc5', 'om_casc_5'),
+    );
+    await tick(15);
+    ds.lastScreenStatus = 'working'; // 第一条真忙
+    await handleThreadReply(makeEventData('om_casc_5b', '/model opus', 'om_root_casc5'), makeCtx('om_root_casc5', 'om_casc_5b'));
+    await handleThreadReply(makeEventData('om_casc_5c', '/model haiku\n/clear', 'om_root_casc5'), makeCtx('om_root_casc5', 'om_casc_5c'));
+    await tick(60);
+    expect(raws().map((m: any) => m.content)).toEqual(['/compact 只留登录上下文']);
+    expect(repliedText()).toContain('上一条级联还在执行');
+    ds.cliReadyGeneration = 2;
+    ds.lastScreenStatus = 'idle';
+    await tick(120);
+    expect(raws().map((m: any) => m.content)).toEqual(['/compact 只留登录上下文', '/clear', '/model opus']);
+    expect(ds.cascadeInFlight).toBe(false);
+    expect(ds.cascadeDeferred).toBeUndefined();
+  });
+
+  it('限流（limited）时不白等：剩余条目直接发出并提示', async () => {
+    const { ds, raws } = seedLiveThreadSession('om_root_casc6');
+    ds.lastScreenStatus = 'limited';
+    await handleThreadReply(
+      makeEventData('om_casc_6', '/model opus\n/clear', 'om_root_casc6'),
+      makeCtx('om_root_casc6', 'om_casc_6'),
+    );
+    await tick(60);
+    expect(raws().map((m: any) => m.content)).toEqual(['/model opus', '/clear']);
+    expect(repliedText()).toContain('直接发出');
+  });
+
+  it('透传命令 + 正文：正文等命令 settled 之后才重入，一次性副作用只跑一次', async () => {
+    const learn = vi.spyOn(await import('../src/im/lark/identity-cache.js'), 'learnFromMentions');
+    const hook = vi.spyOn(await import('../src/services/hook-runner.js'), 'emitHookEvent');
+    const { ds, raws } = seedLiveThreadSession('om_root_casc_body');
+    const sent = () => (ds.worker as any).send.mock.calls.map((c: any[]) => c[0]);
+    const body = '接下来看登录';
+    await handleThreadReply(
+      makeEventData('om_casc_body', `/model opus\n${body}`, 'om_root_casc_body'),
+      makeCtx('om_root_casc_body', 'om_casc_body'),
+    );
+    await tick(15);
+    expect(raws().map((m: any) => m.content)).toEqual(['/model opus']);
+    expect(JSON.stringify(sent())).not.toContain(body);
+    ds.lastScreenStatus = 'working';
+    await tick(80);
+    expect(raws()).toHaveLength(1);
+    expect(JSON.stringify(sent())).not.toContain(body);
+    ds.cliReadyGeneration = 2;
+    ds.lastScreenStatus = 'idle';
+    await tick(80);
+    expect(raws().map((m: any) => m.content)).toEqual(['/model opus']);
+    expect(JSON.stringify(sent())).toContain(body);
+    expect(learn).toHaveBeenCalledTimes(1);
+    expect(hook.mock.calls.filter(call => call[0] === 'thread.reply')).toHaveLength(1);
+    learn.mockRestore();
+    hook.mockRestore();
+  });
+
+  it('级联途中 worker 消失：停住并提示剩余条数，不再送正文', async () => {
+    const { ds, raws } = seedLiveThreadSession('om_root_casc_gone');
+    await handleThreadReply(
+      makeEventData('om_casc_gone', '/model opus\n接下来看登录', 'om_root_casc_gone'),
+      makeCtx('om_root_casc_gone', 'om_casc_gone'),
+    );
+    await tick(15);
+    expect(raws()).toHaveLength(1);
+    ds.lastScreenStatus = 'working';
+    (ds.worker as { killed: boolean }).killed = true;
+    await tick(40);
+    expect(raws()).toHaveLength(1);
+    expect(repliedText()).toContain('剩余的 1 条没有发送');
+    expect(ds.cascadeInFlight).toBe(false);
+  });
+
+  it('级联在飞时推迟的普通消息：放开后送到 CLI，thread.reply 只发一次', async () => {
+    const learn = vi.spyOn(await import('../src/im/lark/identity-cache.js'), 'learnFromMentions');
+    const hook = vi.spyOn(await import('../src/services/hook-runner.js'), 'emitHookEvent');
+    const threadReplies = (id: string) => hook.mock.calls.filter(
+      call => call[0] === 'thread.reply' && (call[1] as { messageId?: string } | undefined)?.messageId === id,
+    );
+    try {
+      const { ds, raws } = seedLiveThreadSession('om_root_casc_defer');
+      const sent = () => (ds.worker as any).send.mock.calls.map((c: any[]) => c[0]);
+      await handleThreadReply(
+        makeEventData('om_casc_defer', '/compact 只留登录上下文\n/clear', 'om_root_casc_defer'),
+        makeCtx('om_root_casc_defer', 'om_casc_defer'),
+      );
+      await tick(15);
+      ds.lastScreenStatus = 'working';
+      const later = '稍后这条普通消息';
+      await handleThreadReply(
+        makeEventData('om_casc_defer_msg', later, 'om_root_casc_defer'),
+        makeCtx('om_root_casc_defer', 'om_casc_defer_msg'),
+      );
+      expect(JSON.stringify(sent())).not.toContain(later);
+      expect(threadReplies('om_casc_defer_msg')).toHaveLength(1);
+      expect(learn).toHaveBeenCalledTimes(2);
+      ds.cliReadyGeneration = 2;
+      ds.lastScreenStatus = 'idle';
+      await tick(160);
+      expect(raws().map((m: any) => m.content)).toEqual(['/compact 只留登录上下文', '/clear']);
+      expect(JSON.stringify(sent())).toContain(later);
+      expect(threadReplies('om_casc_defer_msg')).toHaveLength(1);
+      expect(learn).toHaveBeenCalledTimes(2);
+      expect(ds.cascadeInFlight).toBe(false);
+    } finally {
+      learn.mockRestore();
+      hook.mockRestore();
+    }
+  });
+
+  it('级联在飞时推迟的语音：只转写一次，放开后 CLI 拿到转写文本', async () => {
+    const client = await import('../src/im/lark/client.js');
+    const voice = await import('../src/services/voice/index.js');
+    const asr = await import('../src/services/voice/asr.js');
+    const download = vi.spyOn(client, 'downloadMessageResource').mockResolvedValue(undefined);
+    const asrCfg = vi.spyOn(voice, 'resolveAsrConfig').mockReturnValue({
+      baseUrl: 'http://asr.example/v1',
+      model: 'whisper-1',
+      timeoutMs: 1000,
+    });
+    const transcribe = vi.spyOn(asr, 'transcribeAudioFile').mockResolvedValue('你好世界');
+    try {
+      const { ds, raws } = seedLiveThreadSession('om_root_casc_audio');
+      const sent = () => (ds.worker as any).send.mock.calls.map((c: any[]) => c[0]);
+      await handleThreadReply(
+        makeEventData('om_casc_audio_cmd', '/compact 只留登录上下文\n/clear', 'om_root_casc_audio'),
+        makeCtx('om_root_casc_audio', 'om_casc_audio_cmd'),
+      );
+      await tick(15);
+      ds.lastScreenStatus = 'working';
+      const audio = makeEventData('om_casc_audio', '', 'om_root_casc_audio');
+      audio.message.message_type = 'audio';
+      audio.message.content = JSON.stringify({ file_key: 'file_voice_1' });
+      await handleThreadReply(audio, makeCtx('om_root_casc_audio', 'om_casc_audio'));
+      expect(transcribe).toHaveBeenCalledTimes(1);
+      expect(download).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(sent())).not.toContain('你好世界');
+      ds.cliReadyGeneration = 2;
+      ds.lastScreenStatus = 'idle';
+      await tick(160);
+      expect(transcribe).toHaveBeenCalledTimes(1);
+      expect(download).toHaveBeenCalledTimes(1);
+      const payload = JSON.stringify(sent());
+      expect(payload).toContain('你好世界');
+      expect(payload).not.toContain('[语音]');
+      expect(raws().map((m: any) => m.content)).toEqual(['/compact 只留登录上下文', '/clear']);
+      const transcribing = mocks.replyMessage.mock.calls.filter(call => JSON.stringify(call).includes('正在转写'));
+      expect(transcribing).toHaveLength(1);
+    } finally {
+      download.mockRestore();
+      asrCfg.mockRestore();
+      transcribe.mockRestore();
+    }
+  });
+
+  it('级联在飞时推迟的合并转发：子消息只展开一次', async () => {
+    const merge = await import('../src/im/lark/merge-forward.js');
+    const expand = vi.spyOn(merge, 'expandMergeForward').mockImplementation(async (_app, _id, parsed) => {
+      parsed.content = '转发正文：登录失败';
+      parsed.msgType = 'merge_forward_expanded';
+      return { extraResources: [{ type: 'image', key: 'img_fwd_1', name: 'img_fwd_1.jpg' }] };
+    });
+    try {
+      const { ds } = seedLiveThreadSession('om_root_casc_fwd');
+      const sent = () => (ds.worker as any).send.mock.calls.map((c: any[]) => c[0]);
+      await handleThreadReply(
+        makeEventData('om_casc_fwd_cmd', '/compact 只留登录上下文\n/clear', 'om_root_casc_fwd'),
+        makeCtx('om_root_casc_fwd', 'om_casc_fwd_cmd'),
+      );
+      await tick(15);
+      ds.lastScreenStatus = 'working';
+      const forwarded = makeEventData('om_casc_fwd', '', 'om_root_casc_fwd');
+      forwarded.message.message_type = 'merge_forward';
+      forwarded.message.content = '{}';
+      await handleThreadReply(forwarded, makeCtx('om_root_casc_fwd', 'om_casc_fwd'));
+      expect(expand).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(sent())).not.toContain('转发正文：登录失败');
+      ds.cliReadyGeneration = 2;
+      ds.lastScreenStatus = 'idle';
+      await tick(160);
+      expect(expand).toHaveBeenCalledTimes(1);
+      expect(JSON.stringify(sent())).toContain('转发正文：登录失败');
+    } finally {
+      expand.mockRestore();
+    }
+  });
+
+  it('级联在飞时推迟的合并转发：首过展开没有改写类型时，重入也不再展开', async () => {
+    // 成功展开会把 msgType 改成 merge_forward_expanded，重入即使漏了 !replay 也不会再进展开。
+    // 空树 / 拉取失败保持原 msgType，这时 !replay 是唯一闸门。
+    const merge = await import('../src/im/lark/merge-forward.js');
+    const expand = vi.spyOn(merge, 'expandMergeForward').mockResolvedValue({ extraResources: [] });
+    try {
+      const { ds } = seedLiveThreadSession('om_root_casc_fwd_empty');
+      await handleThreadReply(
+        makeEventData('om_casc_fwd_empty_cmd', '/compact 只留登录上下文\n/clear', 'om_root_casc_fwd_empty'),
+        makeCtx('om_root_casc_fwd_empty', 'om_casc_fwd_empty_cmd'),
+      );
+      await tick(15);
+      ds.lastScreenStatus = 'working';
+      const forwarded = makeEventData('om_casc_fwd_empty', '', 'om_root_casc_fwd_empty');
+      forwarded.message.message_type = 'merge_forward';
+      forwarded.message.content = '{}';
+      await handleThreadReply(forwarded, makeCtx('om_root_casc_fwd_empty', 'om_casc_fwd_empty'));
+      expect(expand).toHaveBeenCalledTimes(1);
+      ds.cliReadyGeneration = 2;
+      ds.lastScreenStatus = 'idle';
+      await tick(160);
+      expect(expand).toHaveBeenCalledTimes(1);
+    } finally {
+      expand.mockRestore();
+    }
+  });
+
+  it('单条透传不受影响：仍然立即以真实 messageId 送出', async () => {
+    const { raws } = seedLiveThreadSession('om_root_casc4');
+    await handleThreadReply(
+      makeEventData('om_casc_4', '/model opus', 'om_root_casc4'),
+      makeCtx('om_root_casc4', 'om_casc_4'),
+    );
+    expect(raws().map((m: any) => m.content)).toEqual(['/model opus']);
+    expect(raws()[0].turnId).toBe('om_casc_4');
   });
 });

@@ -14650,6 +14650,7 @@ tbody tr[data-chat]:hover {
   background: color-mix(in srgb, var(--accent) 10%, transparent);
 }
 
+.schedule-run-log-fill > .outcome-calendar_skipped,
 .schedule-run-log-fill > .outcome-precondition_skipped {
   background: color-mix(in srgb, var(--warning) 10%, transparent);
 }
@@ -16095,6 +16096,13 @@ main:has(.whiteboards-page) {
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-lg);
   background: color-mix(in srgb, var(--surface-muted) 28%, transparent);
+}
+
+.roles-private-reply-notice {
+  display: grid;
+  flex: 1 1 100%;
+  gap: 6px;
+  min-width: 0;
 }
 
 .roles-field-label {
@@ -29764,6 +29772,7 @@ button.schedule-run-log-row::before {
   background: var(--accent);
 }
 
+button.schedule-run-log-row.outcome-calendar_skipped::before,
 button.schedule-run-log-row.outcome-precondition_skipped::before {
   background: var(--warning);
 }
@@ -29870,6 +29879,7 @@ button.schedule-run-log-row:focus-visible {
   white-space: nowrap;
 }
 
+.schedule-run-log-outcome.outcome-calendar_skipped,
 .schedule-run-log-outcome.outcome-precondition_skipped {
   background: color-mix(in srgb, var(--warning) 10%, var(--surface));
   color: var(--warning);
@@ -35182,3 +35192,66 @@ a.card-menu-item {
 .group-serial-input-row > label { display: flex; align-items: center; gap: 6px; }
 .group-serial-input-row input { width: auto; }
 .group-serial-input-row > small { flex-basis: 100%; }
+
+/* Worktree grouping keeps existing virtualised heights. */
+.wb-worktree-hint { margin: 4px 12px; color: var(--text-2); font-size: 11px; line-height: 1.4; }
+.wb-session-rail:has(> .wb-worktree-hint) { grid-template-rows: 38px auto 38px minmax(0, 1fr); }
+/* Sandbox tri-state segmented control (off / oncall / scratch). */
+.bot-defaults-page .bd-seg {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-lg);
+  background: var(--surface-muted);
+}
+.bot-defaults-page .bd-seg-btn {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: var(--button-height);
+  padding: 0 12px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.bot-defaults-page .bd-seg-btn:hover:not(:disabled),
+.bot-defaults-page .bd-seg-btn:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+  outline: none;
+}
+.bot-defaults-page .bd-seg-btn[aria-pressed="true"],
+.bot-defaults-page .bd-seg-btn-active {
+  background: var(--surface);
+  border-color: var(--accent);
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+.bot-defaults-page .bd-seg-btn:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
+.bot-defaults-page .bd-warn {
+  color: var(--warning, #b25f00);
+}
+.bot-defaults-page .bd-scratch-opts {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+
+.schedule-calendar-fields { display: grid; gap: 10px; min-width: 0; margin: 0; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius-md); }
+.schedule-calendar-fields legend { padding: 0 5px; }
+
+.schedule-calendar-fields select {
+  padding-right: 30px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='none' stroke='%23808a99' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round' d='M3 4.5 6 7.5 9 4.5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 11px center;
+}

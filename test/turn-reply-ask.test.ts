@@ -13,9 +13,14 @@ import { publishReplyCardAsk, replyCardAskTarget } from '../src/core/turn-reply-
 import { updateTurnReplyCard, settleTurnReplyCards, replyCardModeFor } from '../src/core/turn-reply-card.js';
 import { TurnReplyCardStore, type TurnReplyCardTransport } from '../src/services/turn-reply-card.js';
 import { buildTurnReplyCard, publicReplyCardActivity, publicReplyCardTools } from '../src/im/lark/turn-reply-card.js';
+import { buildTurnReplyAskElements } from '../src/im/lark/turn-reply-ask-elements.js';
+import { setAskOptionLayoutLookup } from '../src/im/lark/ask-option-layout.js';
 import { buildCanonicalFinalReplyCard } from '../src/im/lark/md-card.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from '../src/im/lark/turn-reply-card-size.js';
 import { replyMessage, sendMessage, updateMessage } from '../src/im/lark/client.js';
+import { observePublishedGroupMessage } from '../src/services/group-context-runtime.js';
+import { bindGroupContextDelivery, writePreparedGroupContext } from '../src/services/group-context-delivery-store.js';
+import { groupContextEpoch } from '../src/services/group-context-prompt.js';
 
 vi.mock('../src/config.js', () => ({ config: { session: { dataDir: '' } } }));
 vi.mock('../src/im/lark/ask-grant-request.js', () => ({ requestGrantForAskClicker: vi.fn(async () => 'unavailable') }));
@@ -23,6 +28,7 @@ vi.mock('../src/im/lark/card-handler.js', () => ({ resolveCardOperatorUnionId: v
 vi.mock('../src/core/cost-calculator.js', () => ({ getSessionUsageSnapshot: vi.fn() }));
 vi.mock('../src/bot-registry.js', () => ({ getBot: () => ({ config: { larkAppId: 'app', cliId: 'claude-code' } }), normalizeUsageDisplay: () => 'off' }));
 vi.mock('../src/im/lark/client.js', () => ({ replyMessage: vi.fn(), sendMessage: vi.fn(), updateMessage: vi.fn(), MessageWithdrawnError: class extends Error {} }));
+vi.mock('../src/services/group-context-runtime.js', () => ({ observePublishedGroupMessage: vi.fn() }));
 
 const key = { larkAppId: 'app', sessionId: 'sid', turnId: 'om_turn' };
 const input: CreateAskInput = {
@@ -93,6 +99,35 @@ async function click(snapshot: PendingAsk, value: Record<string, string>, by = '
 }
 
 describe('Ask inside the running reply card', () => {
+  it('captures native question authorship at admission and omits it for the answered refresh', async () => {
+    const ds = { larkAppId: 'app', chatId: 'oc_chat', replyCardRunningTurnId: 'om_turn',
+      session: { sessionId: 'sid', rootMessageId: 'om_root', cliId: 'claude-code', cliSessionId: 'native_ask', workerGeneration: 1 } } as DaemonSession;
+    const binding = { appId: 'app', chatId: 'oc_chat', sessionId: 'sid', turnId: 'om_turn', workerGeneration: 1,
+      epoch: groupContextEpoch('sid', 'native_ask', 'claude-code', 'om_turn') };
+    writePreparedGroupContext({ ...binding, createdAt: Date.now(), body: '', includedSeqs: [], throughSeq: 0, incomplete: false }, dir);
+    bindGroupContextDelivery(binding, dir);
+    const target = replyCardAskTarget(ds, input, { originTurnId: 'om_turn' });
+    expect(target?.groupContextAuthorOrigin).toEqual(binding);
+    const { snapshot, answer } = await ask({ replyCardTarget: target });
+    expect(vi.mocked(observePublishedGroupMessage).mock.calls.at(-1)?.[2]).toEqual(binding);
+    vi.mocked(observePublishedGroupMessage).mockClear();
+    submitAskFromDesktop({ askId: snapshot.askId, selections: [['yes']] });
+    await answer;
+    await Promise.allSettled([...publishing]);
+    expect(vi.mocked(observePublishedGroupMessage).mock.calls.at(-1)?.[2]).toBeUndefined();
+  });
+
+  it('observes the acknowledged inline question patch for shared history', async () => {
+    const { snapshot, answer } = await ask();
+    expect(observePublishedGroupMessage).toHaveBeenCalledWith('app', expect.objectContaining({
+      message_id: 'om_reply', chat_id: 'oc_chat', root_id: 'om_root', msg_type: 'interactive',
+      body: { content: body }, observed_at: expect.any(Number),
+    }));
+    expect(vi.mocked(observePublishedGroupMessage).mock.calls[0]![1]).not.toHaveProperty('update_time');
+    submitAskFromDesktop({ askId: snapshot.askId, selections: [['yes']] });
+    await answer;
+  });
+
   it('keeps pending options usable when the execution history exceeds the card size limit', async () => {
     await store.update(key, { kind: 'tools', tools: [{ id: 't', name: 'Read', subject: 'large.txt', result: '工具输出'.repeat(10_000) }] }, io);
     const { snapshot, answer } = await ask();
@@ -334,5 +369,57 @@ describe('Ask inside the running reply card', () => {
     expect(hidden).not.toContain('config.ts');
     expect(hidden).toContain('已找到配置');
     expect(hidden).toContain('继续执行吗');
+  });
+});
+
+// ─── 内嵌 ask 的 askOptionLayout 受控（PR #1587 评审建议同批项） ─────────────
+// unified/final-only 模式下 ask 内嵌在实时回复卡（Card JSON 2.0，独立渲染路径），
+// 必须与独立卡读同一个 per-bot 布局配置。
+describe('buildTurnReplyAskElements — askOptionLayout 受控', () => {
+  function makeInlineAsk(): any {
+    return {
+      ask: {
+        askId: 'ask-inline', nonce: 'nonce-inline', larkAppId: 'app',
+        sessionId: 'sid', chatId: 'oc_chat', rootMessageId: 'om_root',
+        deadlineAt: Date.now() + 60_000,
+        questions: [{ prompt: 'q', multiSelect: false, options: [
+          { key: 'a', label: 'A' }, { key: 'b', label: 'B' },
+          { key: 'c', label: 'C' }, { key: 'd', label: 'D' },
+        ] }],
+      },
+    };
+  }
+
+  afterEach(() => {
+    setAskOptionLayoutLookup(() => undefined);
+  });
+
+  it('默认 compact：选项每行 3 个（flow + auto 列）', () => {
+    setAskOptionLayoutLookup(() => undefined);
+    const els = buildTurnReplyAskElements(makeInlineAsk());
+    const rows = els.filter(el => el.tag === 'column_set');
+    expect(rows).toHaveLength(2);
+    expect(rows[0].flex_mode).toBe('flow');
+    expect(rows[0].columns).toHaveLength(3);
+    expect(rows[1].columns).toHaveLength(1);
+    for (const row of rows) {
+      for (const col of row.columns) expect(col.width).toBe('auto');
+    }
+  });
+
+  it('vertical：每个选项一行（单列 weighted、不被同排挤压）', () => {
+    setAskOptionLayoutLookup((id) => id === 'app'
+      ? { config: { askOptionLayout: 'vertical' } }
+      : undefined);
+    const els = buildTurnReplyAskElements(makeInlineAsk());
+    const rows = els.filter(el => el.tag === 'column_set');
+    expect(rows).toHaveLength(4);
+    for (const row of rows) {
+      expect(row.flex_mode).toBe('none');
+      expect(row.columns).toHaveLength(1);
+      expect(row.columns[0]).toMatchObject({ tag: 'column', width: 'weighted', weight: 1 });
+      const buttons = row.columns[0].elements.filter((el: any) => el.tag === 'button');
+      expect(buttons).toHaveLength(1);
+    }
   });
 });

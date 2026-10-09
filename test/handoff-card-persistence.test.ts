@@ -16,7 +16,7 @@ beforeEach(() => {
   sessionStore.init('app_handoff_sqlite');
 });
 afterEach(() => {
-  sessionStore.init(undefined, { owner: false });
+  sessionStore.init('app_handoff_sqlite', { owner: false });
   config.session.dataDir = previousDataDir;
   rmSync(dataDir, { recursive: true, force: true });
 });

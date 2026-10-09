@@ -4,8 +4,10 @@
  * Codex stores each session's full transcript at
  *   ~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<cliSessionId>.jsonl
  * and creates the file lazily on the first user submit. The bridge fallback
- * cares about exactly two records:
+ * cares about three records:
  *
+ *   - native turn-start: `event_msg.payload` `task_started`, which can
+ *     precede the persisted user message by a long interval.
  *   - user turn-start: `response_item.payload` message role=user
  *     (input_text content). Stable across every codex version.
  *   - turn terminal: `event_msg.payload` `task_complete`, which carries the
@@ -205,6 +207,8 @@ export interface CodexBridgeEvent {
   timestampMs: number;
   /** Discriminator for the queue layer:
    *   - 'user' starts a pending Lark turn (fingerprint-matched)
+   *   - 'turn_started' is Codex's authoritative task_started edge; it starts
+   *     the pending head before the delayed response_item/user is persisted
    *   - 'assistant_final' closes the currently-collecting turn with output
    *   - 'turn_aborted' closes it without producing fallback output
    *   - 'turn_bind' adds a provider turn id to an already-started turn
@@ -212,7 +216,7 @@ export interface CodexBridgeEvent {
    *   - 'cot' is a cosmetic mid-turn record (reasoning / tool call / tool
    *     output) attributed to the collecting turn for the CoT message; it
    *     never starts or closes a turn */
-  kind: 'user' | 'assistant_final' | 'turn_aborted' | 'turn_bind' | 'cot';
+  kind: 'user' | 'turn_started' | 'assistant_final' | 'turn_aborted' | 'turn_bind' | 'cot';
   /** Concatenated text from the message's content blocks (input_text for
    *  user, output_text for assistant). Empty for 'cot' events. */
   text: string;
@@ -246,6 +250,7 @@ export interface CodexBridgeEvent {
  *  keep this module dependency-free. */
 export type CodexCotEntry =
   | { kind: 'thinking'; text: string }
+  | { kind: 'text'; text: string }
   | {
     kind: 'tool_call'; id: string; name: string; args: string;
     /** 截断前从原始 arguments / input / action 提取的单行主题（≤1000）；
@@ -857,6 +862,24 @@ function joinTextBlocks(content: unknown, kind: 'input_text' | 'output_text'): s
   return parts.join('');
 }
 
+/** Codex persists automatic context refreshes as role=user, including mid-turn
+ * date/subagent updates. They must not look like local input to an adopt queue.
+ * Explicit content kinds win over text so a user can quote an environment block.
+ * Older rollouts lack kinds; recognize only a complete standalone wrapper there. */
+function isCodexEnvironmentUpdate(metadata: unknown, text: string): boolean {
+  if (metadata && typeof metadata === 'object' && 'content_item_kinds' in metadata) {
+    const kinds: unknown = metadata.content_item_kinds;
+    return Array.isArray(kinds) && kinds.length > 0
+      && kinds.every((kind: unknown) => kind === 'environments.environment_context');
+  }
+  const trimmed = text.trim();
+  const opening = '<environment_context>';
+  const closing = '</environment_context>';
+  return trimmed.length >= opening.length + closing.length
+    && trimmed.startsWith(opening)
+    && trimmed.indexOf(closing) === trimmed.length - closing.length;
+}
+
 /** Normalise a `turn_aborted.reason` into a stable, bounded error code for the
  *  durable-delivery terminal outcome. Mirrors the traex reader. */
 function codexAbortErrorCode(reason: unknown): string {
@@ -1376,6 +1399,23 @@ export function drainCodexRollout(
     if (!p || typeof p !== 'object') continue;
     const ts = typeof obj.timestamp === 'string' ? Date.parse(obj.timestamp) : NaN;
     const timestampMs = Number.isFinite(ts) ? ts : Date.now();
+    // Codex can persist task_started well before the matching response_item
+    // user record (AGENTS/environment scaffolding may be written in between).
+    // Surface this authoritative lifecycle edge so the queue does not expire
+    // a real running turn merely because fingerprint evidence is late.
+    if (obj.type === 'event_msg'
+      && p.type === 'task_started'
+      && typeof p.turn_id === 'string'
+      && p.turn_id.length > 0) {
+      events.push({
+        uuid: `${path}:${lineStart}`,
+        timestampMs,
+        kind: 'turn_started',
+        text: '',
+        sourceTurnId: p.turn_id,
+      });
+      continue;
+    }
     if ((obj.type === 'response_item' && (
       p.type === 'custom_tool_call' || p.type === 'custom_tool_call_output'
       || p.type === 'function_call' || p.type === 'function_call_output'
@@ -1389,6 +1429,7 @@ export function drainCodexRollout(
     if (obj.type === 'response_item' && p.type === 'message' && p.role === 'user') {
       const text = joinTextBlocks(p.content, 'input_text');
       if (!text) continue;
+      if (isCodexEnvironmentUpdate(p.internal_chat_message_metadata_passthrough, text)) continue;
       events.push({ uuid: `${path}:${lineStart}`, timestampMs, kind: 'user', text });
       continue;
     }
@@ -1470,6 +1511,7 @@ export function drainCodexRollout(
           terminalErrorCode: codexTaskFailureCode(p.error),
           terminalErrorSummary: safeFailureSummary(p.error),
         } : {}),
+        sourceTurnId: p.turn_id,
       });
       turnStartOffset = cursor;
       turnFullyCovered = true;
@@ -1500,6 +1542,7 @@ export function drainCodexRollout(
         text: '',
         terminalStatus: 'ambiguous',
         terminalErrorCode: codexAbortErrorCode(p.reason),
+        sourceTurnId: p.turn_id,
       });
       turnStartOffset = cursor;
       turnFullyCovered = true;

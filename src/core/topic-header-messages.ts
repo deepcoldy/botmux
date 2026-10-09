@@ -26,7 +26,9 @@ export function topicHeaderErrorText(error: TopicHeaderError, locale: Locale): s
     ? t('daemon.topic_header_missing_arg', { directive: `/${error.directive}` }, locale)
     : error.kind === 'duplicate_directive'
       ? t('daemon.topic_header_duplicate', { directive: `/${error.directive}` }, locale)
-      : t('daemon.topic_header_unknown_directive', { token: error.token }, locale);
+      : error.kind === 'missing_worktree_target'
+        ? t('daemon.topic_header_worktree_missing_target', undefined, locale)
+        : t('daemon.topic_header_unknown_directive', { token: error.token }, locale);
   return wrap([reason], locale);
 }
 
@@ -34,12 +36,20 @@ export function topicHeaderErrorText(error: TopicHeaderError, locale: Locale): s
 export function topicSpecErrorText(errors: readonly TopicSpecError[], locale: Locale): string {
   return wrap(errors.map(error => {
     switch (error.kind) {
+      case 'lifecycle_conflicts_repo':
+        return t('daemon.topic_header_lifecycle_conflict', {
+          variant: error.lifecycle === 'worktree' ? '/tw（/t worktree）' : '/th（/t here）',
+        }, locale);
       case 'repo_numeric':
         return t('daemon.topic_header_repo_numeric', { arg: error.arg }, locale);
       case 'repo_not_found':
         return t('daemon.topic_header_repo_not_found', { arg: error.arg }, locale);
-      case 'repo_worktree_unsupported':
-        return t('daemon.topic_header_repo_worktree', undefined, locale);
+      case 'repo_not_git':
+        return t('daemon.topic_header_repo_not_git', { arg: error.arg }, locale);
+      case 'branch_invalid':
+        return t('daemon.topic_header_branch_invalid', { arg: error.arg }, locale);
+      case 'worktree_target_exists':
+        return t('daemon.topic_header_worktree_exists', { path: error.path }, locale);
       case 'model_invalid':
         return t('daemon.topic_header_model_invalid', { arg: error.arg }, locale);
       case 'model_unsupported_cli':
@@ -75,7 +85,7 @@ export function topicHeaderReadyText(
   effectiveWorkingDir?: string,
 ): string {
   const parts: string[] = [];
-  const repo = spec.repoDisplayName ?? spec.workingDir ?? effectiveWorkingDir;
+  const repo = spec.repoDisplayName ?? spec.workingDir ?? spec.worktree?.repoPath ?? effectiveWorkingDir;
   if (repo) {
     parts.push(t('daemon.topic_header_ready_repo', { repo }, locale));
   }

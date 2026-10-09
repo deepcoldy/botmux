@@ -333,6 +333,15 @@ export function clearSessionIdentity(
 ): void {
   try { rmSync(sessionIdentityPath(sessionDataDir, sessionId, tool), { force: true }); }
   catch { /* best-effort: absence is the desired state */ }
+  // Before #1543 identities lived directly under cli-identity/. Upgraded
+  // sessions no longer read or overwrite those files, so remove the exact
+  // legacy path as well instead of leaving a live token behind indefinitely.
+  try {
+    rmSync(
+      join(sessionIdentityDir(sessionDataDir), `${assertSafeSegment(sessionId)}.${tool}.env`),
+      { force: true },
+    );
+  } catch { /* best-effort: absence is the desired state */ }
 }
 
 /** Drop every identity for a session (teardown). */
@@ -340,6 +349,12 @@ export function clearAllSessionIdentities(sessionDataDir: string, sessionId: str
   for (const tool of Object.keys(IDENTITY_ENV_KEYS) as TriggerUserAuthTool[]) {
     clearSessionIdentity(sessionDataDir, sessionId, tool);
   }
+  try {
+    rmSync(
+      join(sessionIdentityDir(sessionDataDir), `${assertSafeSegment(sessionId)}.turn`),
+      { force: true },
+    );
+  } catch { /* best-effort: absence is the desired state */ }
 }
 
 /**

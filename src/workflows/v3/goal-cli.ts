@@ -120,6 +120,7 @@ function defaultDependencies(): GoalCliDependencies {
       const secrets = new Map(bots.map((bot) => [bot.larkAppId, bot.larkAppSecret]));
       return createEphemeralPool({
         resolveLarkAppSecret: (larkAppId) => secrets.get(larkAppId),
+        resolveBotEnv: appId => bots.find(bot => bot.larkAppId === appId)?.env,
       }).runNode;
     },
     validateManifest: async (manifestPath, outputDir) => {

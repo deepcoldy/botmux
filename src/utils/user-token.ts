@@ -277,10 +277,12 @@ async function refreshToken(
   appId: string,
   appSecret: string,
   brand: Brand = 'feishu',
+  signal?: AbortSignal,
 ): Promise<TokenStore | null> {
   try {
     const res = await fetch(`${larkHosts(brand).openApi}/open-apis/authen/v2/oauth/token`, {
       method: 'POST',
+      ...(signal ? { signal } : {}),
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         grant_type: 'refresh_token',
@@ -291,6 +293,7 @@ async function refreshToken(
     });
     if (!res.ok) return null;
     const data = await res.json() as TokenResponse;
+    signal?.throwIfAborted();
     if (data.error || !data.access_token) return null;
 
     const now = new Date();
@@ -351,7 +354,9 @@ async function resolveTokenFrom(
   appId: string,
   appSecret: string,
   brand: Brand,
+  signal?: AbortSignal,
 ): Promise<string | null> {
+  signal?.throwIfAborted();
   if (!loaded) return null;
   const { token } = loaded;
 
@@ -359,7 +364,8 @@ async function resolveTokenFrom(
 
   // access_token expired — try refresh
   if (isValid(token.refresh_expires_at) || (!token.refresh_expires_at && token.refresh_token)) {
-    const refreshed = await refreshToken(token, appId, appSecret, brand);
+    const refreshed = await refreshToken(token, appId, appSecret, brand, signal);
+    signal?.throwIfAborted();
     if (refreshed) return refreshed.access_token;
   }
 
@@ -381,11 +387,12 @@ export async function resolveUserToken(
   appSecret: string,
   brand: Brand = 'feishu',
   openId?: string,
+  signal?: AbortSignal,
 ): Promise<string | null> {
   // 按 (app, 人) 取盘上的 token。不匹配 / 别人的 → null，调用方提示 /login。
   // 这里刻意没有 env 覆盖：一个全局 FEISHU_USER_ACCESS_TOKEN 会绕过整个按人隔离
   // 边界，而且绕过时没有任何痕迹。
-  return resolveTokenFrom(loadTokenForApp(appId, brand, openId), appId, appSecret, brand);
+  return resolveTokenFrom(loadTokenForApp(appId, brand, openId), appId, appSecret, brand, signal);
 }
 
 // ─── Public API: OAuth login flow ─────────────────────────────────────────────

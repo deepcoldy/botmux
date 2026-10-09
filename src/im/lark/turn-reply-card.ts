@@ -7,6 +7,7 @@ import {
 import { buildTurnReplyAskElements, turnReplyAskSummary } from './turn-reply-ask-elements.js';
 import { buildCardBodyElements, cardUsageFooterSegment, createReplyCard } from './md-card.js';
 import { TURN_REPLY_CARD_MAX_BYTES, turnReplyCardRequestBytes } from './turn-reply-card-size.js';
+import { markGroupContextCardPurpose } from './group-context-card.js';
 
 export interface TurnReplyCardPresentation {
   locale?: 'zh' | 'en';
@@ -180,8 +181,16 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   }
 
   if (pendingAsks.length) {
-    card.body.elements.unshift(...buildTurnReplyAskElements(pendingAsks[0], presentation.locale));
-    if (pendingAsks.length > 1) card.body.elements.push({ tag: 'markdown', text_size: 'notation', content: en
+    const askElements = buildTurnReplyAskElements(pendingAsks[0], presentation.locale);
+    const isOptions = (element: Record<string, any> | undefined) => element?.columns?.some((column: any) =>
+      column.elements?.some((button: any) => button.behaviors?.some((behavior: any) =>
+        ['ask_select', 'ask_toggle'].includes(behavior.value?.action))));
+    card.body.elements.unshift(...askElements.map((element, index) => ({ ...element,
+      element_id: isOptions(element) ? `botmux_turn_options_${index}`
+        : element.tag === 'markdown' && isOptions(askElements[index + 1]) ? `botmux_turn_question_${index}`
+          : `botmux_turn_control_ask_${index}`,
+    })));
+    if (pendingAsks.length > 1) card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_control', text_size: 'notation', content: en
       ? `${pendingAsks.length - 1} more requests will appear after this one is answered.`
       : `还有 ${pendingAsks.length - 1} 个待回答请求，完成当前问题后依次显示。` });
   }
@@ -190,7 +199,8 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
     const content = latest ? bounded(latest, 6000)
       : terminal ? (en ? 'No final answer was provided. See the turn record below.' : '本轮没有提供最终答复，可查看下方过程记录。')
         : (en ? 'Working on your request…' : '正在处理你的请求…');
-    card.body.elements.push(...buildCardBodyElements(content, presentation.workingDir, 'disabled'));
+    card.body.elements.push(...buildCardBodyElements(content, presentation.workingDir, 'disabled')
+      .map((element, index) => ({ ...element, element_id: element.element_id ?? `botmux_turn_progress_${index}` })));
   }
 
   const process: ProcessEntry[] = [];
@@ -200,10 +210,10 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
     // narration visible until a newer narration or another card view replaces it.
     const latest = record.activity?.slice().reverse().find(item => item.kind === 'thinking' && item.text.trim());
     if (!terminal && !record.finalCard && !pendingAsks.length && latest?.kind === 'thinking') {
-      card.body.elements.push({ tag: 'markdown', content: `💭 ${publicText(bounded(latest.text, 600))}` });
+      card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_thinking', content: `💭 ${publicText(bounded(latest.text, 600))}` });
     }
     if (!terminal && !record.finalCard && !pendingAsks.length && record.tools.length) {
-      card.body.elements.push({ tag: 'markdown', content: record.tools.slice(-2).map(tool =>
+      card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_tools', content: record.tools.slice(-2).map(tool =>
         toolLine(tool, 300),
       ).join('\n') });
     }
@@ -231,7 +241,7 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
     const footerIndex = card.body.elements.findIndex(element =>
       element.element_id === 'botmux_feedback' || element.element_id === 'botmux_reply_footer');
     const panel = {
-      tag: 'collapsible_panel', expanded: false,
+      tag: 'collapsible_panel', element_id: 'botmux_turn_process', expanded: false,
       background_color: 'grey-50', padding: '4px 12px 12px 12px', margin: '4px 0px 0px 0px',
       border: { color: 'grey-50', corner_radius: '8px' },
       header: {
@@ -261,7 +271,7 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
     ? cardUsageFooterSegment(record.usage, presentation.locale, 'streaming') : null;
   if (usage) card.body.elements.push({ tag: 'markdown', element_id: 'botmux_turn_usage', text_size: 'notation', content: usage });
   if (!terminal && !record.finalCard && ['working', 'waiting'].includes(record.phase) && presentation.canStop) {
-    card.body.elements.push({ tag: 'column_set', columns: [{ tag: 'column', width: 'auto', elements: [{
+    card.body.elements.push({ tag: 'column_set', element_id: 'botmux_turn_control_0', columns: [{ tag: 'column', width: 'auto', elements: [{
       tag: 'button', text: { tag: 'plain_text', content: en ? '⏹ Stop' : '⏹ 停止' }, type: 'danger',
       behaviors: [{ type: 'callback', value: {
         action: 'stop_turn', session_id: record.sessionId, root_id: record.rootId,
@@ -273,23 +283,26 @@ export function buildTurnReplyCard(record: TurnReplyCardRecord, presentation: Tu
   // Feedback becomes clickable after runtime settlement, avoiding a feedback
   // callback racing with the last status PATCH.
   if (!terminal) card.body.elements = card.body.elements.filter(element => element.element_id !== 'botmux_feedback');
-  let serialized = JSON.stringify(card);
+  // Stamp before sizing so the publisher budget includes the footer carrier.
+  const purpose = record.finalCard || pendingAsks.length ? 'turn-message' : 'runtime';
+  const serialize = () => markGroupContextCardPurpose(JSON.stringify(card), purpose);
+  let serialized = serialize();
   if (setProcessPreview && turnReplyCardRequestBytes(serialized, record.chatId) > TURN_REPLY_CARD_MAX_BYTES) {
     const notice = en ? 'Card size limit reached. Some activity has been truncated; recent entries are shown.'
       : '卡片内容超出容量，部分执行过程已截断，保留最近记录。';
     setProcessPreview({ content: notice, shownTools: 0 });
-    serialized = JSON.stringify(card);
+    serialized = serialize();
     let budget = TURN_REPLY_CARD_MAX_BYTES - turnReplyCardRequestBytes(serialized, record.chatId) - processTextBytes('\n\n');
     while (budget > 0) {
       setProcessPreview(processPreview(process, budget, notice));
-      serialized = JSON.stringify(card);
+      serialized = serialize();
       const excess = turnReplyCardRequestBytes(serialized, record.chatId) - TURN_REPLY_CARD_MAX_BYTES;
       if (excess <= 0) break;
       budget -= excess;
       // Leave a notice even if the answer/controls consume all available space.
       // The store handles an oversized final answer with its existing file path.
       setProcessPreview({ content: notice, shownTools: 0 });
-      if (budget <= 0) serialized = JSON.stringify(card);
+      if (budget <= 0) serialized = serialize();
     }
   }
   return serialized;

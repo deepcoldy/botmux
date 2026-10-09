@@ -6096,6 +6096,19 @@ describe('managed turn authority worker generations', () => {
     });
     expect(ds.scheduledTurnCallers?.get(scheduledTurnId)).toEqual(scheduledCaller);
 
+    // A fresh TUI reaches its initial idle prompt before the opening input is
+    // written. That provisional capability is revoked, then the worker
+    // republishes at the real write boundary. The caller tuple must survive
+    // this intermediate revoke even though live authority does not.
+    worker.emit('message', {
+      type: 'managed_turn_origin_revoked',
+      sessionId: ds.session.sessionId,
+      capability: 'scheduled-capability',
+      turnId: scheduledTurnId,
+    });
+    expect(ds.managedTurnOrigin).toBeUndefined();
+    expect(ds.scheduledTurnCallers?.get(scheduledTurnId)).toEqual(scheduledCaller);
+
     worker.emit('message', {
       type: 'managed_turn_origin',
       sessionId: ds.session.sessionId,
@@ -7000,6 +7013,7 @@ describe('forkWorker session agent config freeze', () => {
         sandboxHidePaths: ['~/.ssh'],
         sandboxReadonlyPaths: ['/srv/source-a-readonly', '/srv/source-b-readonly'],
         sandboxNetwork: false,
+        sandboxNetworkPolicy: { version: 1, public: { mode: 'block' }, private: { mode: 'allow' } },
       },
       resolvedAllowedUsers: [],
       botOpenId: 'ou_bot',
@@ -7013,6 +7027,7 @@ describe('forkWorker session agent config freeze', () => {
     expect(ds.session.sandboxHidePaths).toEqual(['~/.ssh']);
     expect((ds.session as any).sandboxReadonlyPaths).toEqual(['/srv/source-a-readonly', '/srv/source-b-readonly']);
     expect((ds.session as any).sandboxNetwork).toBe(false);
+    expect(ds.session.sandboxNetworkPolicy).toEqual({ version: 1, public: { mode: 'block' }, private: { mode: 'allow' } });
     const worker = forkMock.mock.results.at(-1)!.value;
     expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({
       type: 'init',
@@ -7020,7 +7035,18 @@ describe('forkWorker session agent config freeze', () => {
       sandboxHidePaths: ['~/.ssh'],
       sandboxReadonlyPaths: ['/srv/source-a-readonly', '/srv/source-b-readonly'],
       sandboxNetwork: false,
+      sandboxNetworkPolicy: { version: 1, public: { mode: 'block' }, private: { mode: 'allow' } },
     }));
+  });
+
+  it('restore forwards the frozen network policy even when the bot config changes', () => {
+    const ds = makeDs();
+    const frozen = { version: 1 as const, public: { mode: 'block' as const }, private: { mode: 'allow' as const } };
+    ds.session.sandbox = true; ds.session.sandboxNetworkPolicy = structuredClone(frozen);
+    forkWorker(ds, 'resume', true);
+    expect(ds.session.sandboxNetworkPolicy).toEqual(frozen);
+    const worker = forkMock.mock.results.at(-1)!.value;
+    expect(worker.send).toHaveBeenCalledWith(expect.objectContaining({ type: 'init', sandboxNetworkPolicy: frozen }));
   });
 
   it('records cli wrapper on fresh sessions and launches with the live bot model (model NOT frozen)', () => {

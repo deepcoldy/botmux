@@ -26,6 +26,7 @@ import { isValidRoleProfileId, readRoleProfileEntry } from './role-profile-store
 import { writeRoleFile } from '../core/role-resolver.js';
 import { logger } from '../utils/logger.js';
 import { config } from '../config.js';
+import { t, localeForBot } from '../i18n/index.js';
 
 export interface CreateGroupOpts {
   creatorLarkAppId: string;
@@ -33,6 +34,9 @@ export interface CreateGroupOpts {
    *  (Lark rejects self-invite). May be empty (creator-only chat). */
   larkAppIds: string[];
   name?: string;
+  /** Opt-in decorations; the personal tag requires the invoking user's open_id
+   * in this creator app's scope. Failures never discard an existing chat. */
+  customization?: { tag?: string; avatar?: 'name' | 'off'; userOpenId: string };
   /** Chat topology at creation time. 'topic' creates a 话题群; omit to let
    *  Feishu use its default 普通群 ('group'). Fixed for the chat's lifetime —
    *  it cannot be changed afterwards through this API. */
@@ -103,6 +107,7 @@ export interface CreateGroupResult {
   roleProfileBootstrapError: string | null;
   kickoffMessageId: string | null;
   kickoffError: string | null;
+  customization?: { tagError?: string; avatarError?: string };
 }
 
 export interface TransferGroupOwnerOpts {
@@ -178,6 +183,19 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     await opts.ensureBotCollaboration(r.chatId, joinedBotIds, [...invalidBots]);
   }
 
+  // Optional decoration must never delay inviting the requested teammates.
+  // Avatar runs now (after invites, before owner transfer) so the chat already
+  // looks right by the time the sender becomes owner. The personal feed-group
+  // tag runs *after* the share-link fetch and owner transfer below so a slow
+  // user-token refresh cannot delay the hand-over.
+  const customization: CreateGroupResult['customization'] = opts.customization ? {} : undefined;
+  if (opts.customization?.avatar === 'name') {
+    try {
+      const { applyGroupNameAvatar } = await import('./group-name-avatar.js');
+      await applyGroupNameAvatar(opts.creatorLarkAppId, r.chatId, opts.name ?? '');
+    } catch (err: any) { customization!.avatarError = err?.message ?? String(err); }
+  }
+
   // Fetch the shareable join link BEFORE transferring ownership: the creator bot
   // is the chat owner right after createChat, so it can always read the link. If
   // we did this after transfer and the tenant restricts "share group" to
@@ -234,6 +252,17 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     }
   }
 
+  // Personal feed-group tag runs after ownership hand-over: tagging needs the
+  // invoking user's OAuth token, whose refresh can stall; keeping it here means
+  // the owner-transfer window is as short as the invite + avatar + share-link
+  // calls. Failure is independent — the chat is already handed over.
+  if (opts.customization?.tag) {
+    try {
+      const { addCreatedChatToFeedGroup } = await import('./feed-group-tagger.js');
+      await addCreatedChatToFeedGroup(opts.creatorLarkAppId, r.chatId, opts.customization.userOpenId, opts.customization.tag);
+    } catch (err: any) { customization!.tagError = err?.message ?? String(err); }
+  }
+
   // Grant group manager role to specified users in managerUserIds.
   // Only the chat owner can add managers:
   // - If ownership was transferred successfully, ownerTransferredTo is excluded (already owner).
@@ -268,7 +297,7 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
         notifyMessageId = await sendMessage(
           opts.creatorLarkAppId,
           r.chatId,
-          `<at user_id="${notifyOwnerOpenId}"></at>`,
+          `<at user_id="${notifyOwnerOpenId}"></at> ${t('cmd.group.owner_notice', undefined, localeForBot(opts.creatorLarkAppId))}`,
           'text',
         );
       } catch (e: any) {
@@ -403,5 +432,6 @@ export async function createGroupWithBots(opts: CreateGroupOpts): Promise<Create
     roleProfileBootstrapError,
     kickoffMessageId,
     kickoffError,
+    ...(customization ? { customization } : {}),
   };
 }

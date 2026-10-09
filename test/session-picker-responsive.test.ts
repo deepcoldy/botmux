@@ -160,9 +160,8 @@ function makeFixture(
       chmodSync(secretPath, 0o600);
     }
   }
-  // The picker (`botmux list`) reads the SQLite session store; these rows carry
-  // no larkAppId, so they belong in the flat legacy store `<dataDir>/sessions.db`.
-  seedPersistedSessionRows(dataDir, undefined, sessions);
+  // The picker (`botmux list`) enumerates per-bot SQLite stores.
+  seedPersistedSessionRows(dataDir, 'picker-app', sessions);
   return { root, dataDir };
 }
 

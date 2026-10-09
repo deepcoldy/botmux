@@ -45,7 +45,7 @@ import { join } from 'node:path';
 
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { logger } from '../utils/logger.js';
-import type { AskQuestion, AskResult } from './ask-types.js';
+import type { AskQuestion, AskResult, CreateAskInput } from './ask-types.js';
 
 /** Sentinel file marking a directory as a botmux ask store. teardown/reset only
  *  ever touches a directory that contains this file — a guard against a missing
@@ -92,7 +92,7 @@ export interface PersistedAsk {
    *  the card has NOT been confirmed sent — restore/re-attach must (idempotently,
    *  keyed by requestId) send it so the user always has exactly one live card. */
   cardMessageId?: string;
-  replyCardTarget?: { turnId: string; dispatchAttempt?: number };
+  replyCardTarget?: CreateAskInput['replyCardTarget'];
   /** Accumulated per-question selections (checkbox state), so a restart mid-
    *  multi-select keeps the boxes the user already ticked. */
   selections: ReadonlyArray<ReadonlyArray<string>>;

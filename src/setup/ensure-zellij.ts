@@ -14,6 +14,11 @@
  * in 0.44.0 and older zellij is not a viable backend.
  */
 import { execFileSync, spawnSync } from 'node:child_process';
+import { tmpdir } from 'node:os';
+
+// Capture before worker.spawnCli pins its own TMPDIR. Daemon and workers
+// inherit the same control namespace; only CLI panes use session scratch.
+const zellijControlTempDir = tmpdir();
 
 /** Minimum zellij version with the full CLI-automation surface we depend on. */
 export const MIN_ZELLIJ_VERSION = { major: 0, minor: 44, patch: 0 };
@@ -29,7 +34,7 @@ export const MIN_ZELLIJ_VERSION = { major: 0, minor: 44, patch: 0 };
  */
 export function zellijEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const { ZELLIJ: _z, ZELLIJ_SESSION_NAME: _zn, ...rest } = env;
-  return rest;
+  return { ...rest, TMPDIR: zellijControlTempDir, TMP: zellijControlTempDir, TEMP: zellijControlTempDir };
 }
 
 /** Parse `zellij 0.44.1` → {major,minor,patch}. Returns undefined if unparseable. */

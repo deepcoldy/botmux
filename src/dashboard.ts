@@ -103,6 +103,7 @@ import {
 } from './workflows/v3/daemon-ipc-auth.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { REPLY_STYLE_REQUEST_MAX_BYTES } from './dashboard/reply-style.js';
+import { ASK_OPTION_LAYOUT_REQUEST_MAX_BYTES } from './im/lark/ask-option-layout.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
 import {
   projectSessionEventForAudience,
@@ -181,9 +182,10 @@ import { WORKBENCH_DOCK_IMMERSIVE_HASH, WORKBENCH_IMMERSIVE_HASH } from './core/
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { getGitRepoInfo } from './core/session-row-enrichment.js';
+import type { WorkspaceMetadata } from './core/workspace-metadata.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
 import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, diskVersionAt, botmuxCliEntry, botmuxCliEntryAt, botmuxInstallRoot, bakedBinaryVersion } from './utils/install-info.js';
+import { formatRunningDaemonsRestartSummary } from './utils/daemon-version-display.js';
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion, resolveCurrentVersionAt } from './utils/install-diagnostics.js';
 import {
   fetchLatestVersion,
@@ -580,12 +582,51 @@ dashboardSessions.onEnd(identity => {
   endDashboardAuthSession(identity.authSessionId);
 });
 
-function tcpPortAvailable(host: string, port: number): Promise<boolean> {
+function tcpPortAvailable(host: string, port: number, timeoutMs = 2_000): Promise<boolean> {
   return new Promise((resolve) => {
-    const probe = createTcpServer();
-    probe.once('error', () => resolve(false));
+    let settled = false;
+    let listened = false;
+    const trackedSockets = new Set<import('node:net').Socket>();
+
+    const destroyTracked = () => {
+      for (const s of trackedSockets) {
+        try { s.destroy(); } catch { /* ignore */ }
+      }
+      trackedSockets.clear();
+    };
+
+    const finish = (result: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      destroyTracked();
+      try { (probe as any).closeAllConnections?.(); } catch { /* ignore */ }
+      try { probe.close(); } catch { /* ignore */ }
+      resolve(result);
+    };
+
+    const timer = setTimeout(() => {
+      // If probe.listen succeeded but probe.close hung on lingering connections,
+      // the port was bindable.
+      finish(listened);
+    }, timeoutMs);
+    // Unref'd so the probe timer alone doesn't hold the event loop; the dashboard boot
+    // already maintains persistent ref'd handles (oauthCallbackServer, registry, etc.).
+    timer.unref?.();
+
+    const probe = createTcpServer((socket) => {
+      // Any connection arriving during the availability probe must be destroyed
+      // immediately. This server only checks port availability; it never handles traffic.
+      trackedSockets.add(socket);
+      try { socket.destroy(); } catch { /* ignore */ }
+    });
+    probe.unref?.();
+    probe.once('error', () => finish(false));
     probe.listen(port, host, () => {
-      probe.close(() => resolve(true));
+      listened = true;
+      destroyTracked();
+      try { (probe as any).closeAllConnections?.(); } catch { /* ignore */ }
+      probe.close(() => finish(true));
     });
   });
 }
@@ -816,7 +857,17 @@ const terminalFrontProxy = createTerminalFrontProxy({
   // worker port or the daemon's own `/s/` proxy is refused by the worker.
   viewCapabilityForwardProof: viewToken => terminalViewForwardProof(SECRET, viewToken),
 });
-const sessionPresentation = createSessionPresentationCoordinator(aggregator, getGitRepoInfo);
+const sessionPresentation = createSessionPresentationCoordinator(aggregator, async () => null,
+  async (appId, row, options) => {
+    const daemon = registry.getByAppId(appId);
+    if (!daemon) return null;
+    const response = await fetchDaemonIpc(daemon.ipcPort,
+      `/api/sessions/${encodeURIComponent(String(row.sessionId))}/workspace${options.force ? '?force=1' : ''}`,
+      { signal: AbortSignal.timeout(10_000) });
+    if (!response.ok) return null; // Older daemons remain usable without metadata.
+    const body = await response.json() as { workingDir?: string; workspace?: WorkspaceMetadata };
+    return body.workingDir === row.workingDir ? body.workspace ?? null : null;
+  });
 const groupsMatrixSnapshot = createGroupsMatrixSnapshot(buildGroupsMatrix, {
   onRefreshError: error => logger.warn(`[dashboard] groups matrix refresh failed: ${String(error)}`),
 });
@@ -1015,7 +1066,10 @@ const botOnboarding = new BotOnboardingManager({
 // 飞书 Web 登录态刷新（机器人改名缺登录态时的 dashboard 扫码入口）。机器级单例，
 // 写 ~/.botmux/feishu-session.json，与 setup / onboarding 复用同一份登录态。
 const feishuLogin = new FeishuLoginManager();
-const subs = new Map<string, () => void>();
+/** Live event subscription per bot, with the IPC port it is bound to: a daemon
+ *  that restarts on another port keeps the same app id, so the port is what
+ *  tells a still-valid subscription from one dialling a dead endpoint. */
+const subs = new Map<string, { off: () => void; ipcPort: number }>();
 const attaching = new Set<string>();   // dedup concurrent attaches per appId
 
 interface ResolvedDashboardSettings {
@@ -1108,6 +1162,8 @@ interface ResolvedDashboardSettings {
     olderThanHours: SessionCleanupHours;
     intervalMinutes: number;
   };
+  /** Machine-wide multi-topic orchestration switch. Default ON. */
+  multiTopic: { enabled: boolean };
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
@@ -1693,6 +1749,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       olderThanHours: resolveCleanupHours(global.sessionCleanup),
       intervalMinutes: resolveCleanupIntervalMs(global.sessionCleanup) / 60_000,
     },
+    multiTopic: { enabled: global.multiTopic?.enabled !== false }, // default ON
     remoteAccess: global.remoteAccess === true,
     oauthRedirectBase: global.oauthRedirectBase ?? null,
     scheduleTimeZone: global.scheduleTimeZone ?? null,
@@ -2023,9 +2080,9 @@ async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Pr
     // 2. Open SSE subscription if not already (idempotent). The barrier
     //    below runs inside subscribeDaemon, after the stream is established.
     if (!subs.has(d.larkAppId)) {
-      subs.set(
-        d.larkAppId,
-        subscribeDaemon(d, aggregator, e =>
+      subs.set(d.larkAppId, {
+        ipcPort: d.ipcPort,
+        off: subscribeDaemon(d, aggregator, e =>
           logger.warn(`[aggregator] ${d.larkAppId}: ${e.message}`),
           (_url, init) => fetchDaemonIpc(d.ipcPort, '/api/events', init),
           // Snapshot barrier: install an authoritative snapshot before any
@@ -2037,7 +2094,7 @@ async function attachDaemon(d: import('./dashboard/registry.js').DaemonInfo): Pr
           // snapshot is discarded instead of clobbering the new generation.
           signal => reconcileDaemon(d, signal),
         ),
-      );
+      });
     }
   } finally {
     attaching.delete(d.larkAppId);
@@ -2067,6 +2124,14 @@ function syncSubscriptions(): void {
   // because the registry callback is sync and the attach is per-daemon
   // independent.
   for (const d of daemons) {
+    // A daemon that came back on another IPC port (its descriptor rewritten in
+    // place, never removed) is not "already attached": the old subscription
+    // and its snapshot closure would keep dialling the dead port forever.
+    const sub = subs.get(d.larkAppId);
+    if (sub && sub.ipcPort !== d.ipcPort) {
+      sub.off();
+      subs.delete(d.larkAppId);
+    }
     if (!subs.has(d.larkAppId)) {
       void attachDaemon(d);
     }
@@ -2084,8 +2149,8 @@ function syncSubscriptions(): void {
   // Close subscriptions for daemons that went offline. Cache entries are
   // intentionally retained — the user may still want to see the last-known
   // state of those sessions/schedules in the dashboard.
-  for (const [id, off] of subs) {
-    if (!online.has(id)) { off(); subs.delete(id); }
+  for (const [id, sub] of subs) {
+    if (!online.has(id)) { sub.off(); subs.delete(id); }
   }
 }
 
@@ -2904,6 +2969,9 @@ async function configuredBotDefaultsRecoveryRows(
           larkBotName: persistedNames.get(bot.larkAppId) ?? null,
           quotaFallbackBot: rawEntry?.quotaFallbackBot,
           autoInviteOwnerOnGroupAdd: rawEntry?.autoInviteOwnerOnGroupAdd,
+          // 离线行也要带上磁盘里的排版配置，否则 daemon 不在线时 Dashboard
+          // 会把已配置的竖放布局显示回 compact（payload 层 fail-soft 归一化）。
+          askOptionLayout: rawEntry?.askOptionLayout,
         });
         return {
           ...payload,
@@ -3672,7 +3740,12 @@ const companionApi = (() => {
   const requireBoundBot = () => {
     const matches = readBotsJsonOrEmpty(BOTS_JSON_PATH).filter((entry) => entry?.larkAppId === appId);
     const bot = matches.length === 1 ? matches[0] : undefined;
-    if (!bot || bot.sandbox !== true || (bot.cliId !== 'codex' && bot.cliId !== 'traex')) {
+    // Companion binding REQUIRES a credential-isolating oncall sandbox (the
+    // companion's whole premise is running with the bot's masked transport
+    // credential). scratch is write-integrity COW without a read/secret
+    // boundary, so it is deliberately NOT accepted here — the CLI-side gate
+    // (companion-startup-options) rejects it too; keep both gates identical.
+    if (!bot || !(bot.sandbox === true || bot.sandbox === 'oncall') || (bot.cliId !== 'codex' && bot.cliId !== 'traex')) {
       throw new Error('companion_bound_bot_invalid');
     }
     return bot;
@@ -4623,11 +4696,28 @@ const server = createServer(async (req, res) => {
         lastCheckedAt: entry.lastCheckedAt,
       }));
       const localDev = isLocalDevInstall();
+      const runningDaemons = registry.list().map(d => ({
+        larkAppId: d.larkAppId,
+        version: d.botmuxVersion,
+      }));
+      // In the compiled binary `current` is this dashboard process's OWN baked
+      // version (install-info.ts: bakedBinaryVersion shadows the install tree),
+      // not what install.sh last put on disk, so "running daemon vs disk" is
+      // undetermined there — say nothing rather than invert after a partial
+      // respawn. A Node install reads package.json, which is the disk.
+      const diskVersion = isStandaloneBinary() ? undefined : current;
+      const runningDaemonRestartHint = formatRunningDaemonsRestartSummary(
+        runningDaemons.map(d => d.version),
+        diskVersion,
+      );
       return jsonRes(res, 200, {
         current,
+        ...(diskVersion ? { diskVersion } : {}),
         latest,
         versionLookupOk: latestResult.lookupOk,
         behind: !!latest && isNewerVersion(latest, current),
+        runningDaemons,
+        ...(runningDaemonRestartHint ? { runningDaemonRestartHint } : {}),
         cliBehind: cliUpdates.some((entry) => entry.updateAvailable),
         cliUpdates,
         localDevInstall: localDev,
@@ -6021,6 +6111,15 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'GET' && url.pathname === '/api/schedules/calendars') {
+      const larkAppId = url.searchParams.get('larkAppId')?.trim();
+      if (!larkAppId) return jsonRes(res, 400, { ok: false, error: 'larkAppId_required' });
+      const upstream = await proxyToDaemon(larkAppId, '/api/schedules/calendars', { method: 'GET' });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     if (req.method === 'GET' && (m = url.pathname.match(/^\/api\/schedules\/([^/]+)\/logs$/))) {
       const id = decodeURIComponent(m[1]);
       const owner = resolveScheduleOwner(id);
@@ -7094,6 +7193,32 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/ask-option-layout — proxy the per-bot ask option
+    // layout to the target bot's daemon. The daemon owns validation, atomic
+    // bots.json persistence, and its in-memory config update; ask cards render
+    // in the daemon process, so the change is visible on the next card.
+    let mBotAskOptionLayout: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotAskOptionLayout = url.pathname.match(/^\/api\/bots\/([^/]+)\/ask-option-layout$/))) {
+      const appId = decodeURIComponent(mBotAskOptionLayout[1]);
+      let raw: string;
+      try {
+        raw = JSON.stringify(await readJsonBody(req, ASK_OPTION_LAYOUT_REQUEST_MAX_BYTES));
+      } catch (err) {
+        const status = err instanceof DashboardJsonBodyTooLargeError ? 413 : 400;
+        res.writeHead(status, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: status === 413 ? 'body_too_large' : 'bad_json' }));
+        return;
+      }
+      const upstream = await proxyToDaemon(appId, `/api/bot-ask-option-layout`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/startup-commands — proxy to that bot's daemon. Body
     // `{ startupCommands: string }` (raw text, comma/newline separated; '' = clear).
     let mBotStartup: RegExpMatchArray | null;
@@ -7223,6 +7348,22 @@ const server = createServer(async (req, res) => {
     }
 
     // PUT /api/bots/:appId/codex-auth-sync — per-bot Codex credential policy.
+    let mBotEnvPolicy: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotEnvPolicy = url.pathname.match(/^\/api\/bots\/([^/]+)\/env-policy$/))) {
+      const appId = decodeURIComponent(mBotEnvPolicy[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-env-policy`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     let mBotCodexAuthSync: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotCodexAuthSync = url.pathname.match(/^\/api\/bots\/([^/]+)\/codex-auth-sync$/))) {
       const appId = decodeURIComponent(mBotCodexAuthSync[1]);
@@ -7283,6 +7424,14 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    const networkPolicyRoute = url.pathname.match(/^\/api\/bots\/([^/]+)\/sandbox-network-policy$/);
+    if (req.method === 'PUT' && networkPolicyRoute) {
+      const chunks: Buffer[] = []; for await (const chunk of req) chunks.push(chunk as Buffer);
+      const upstream = await proxyToDaemon(decodeURIComponent(networkPolicyRoute[1]), '/api/bot-sandbox-network-policy', {
+        method: 'PUT', headers: { 'content-type': 'application/json' }, body: Buffer.concat(chunks).toString('utf8'),
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' }); res.end(await upstream.text()); return;
+    }
     // PUT /api/bots/:appId/sandbox-paths — proxy to that bot's daemon.
     // Body `{ readWrite?: string[]; readOnly?: string[]; deny?: string[] }`.
     let mBotSandboxPaths: RegExpMatchArray | null;
@@ -7557,6 +7706,23 @@ const server = createServer(async (req, res) => {
       const upstream = await proxyToDaemon(appId, '/api/bot-prompt-injection', {
         method: 'PUT', headers: { 'content-type': 'application/json' },
         body: Buffer.concat(chunks).toString('utf8') || '{}',
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
+    // Per-bot original-topic policy, proxied through the existing config store.
+    let mBotTopicUnavailablePolicy: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotTopicUnavailablePolicy = url.pathname.match(/^\/api\/bots\/([^/]+)\/topic-unavailable-policy$/))) {
+      const appId = decodeURIComponent(mBotTopicUnavailablePolicy[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+      const upstream = await proxyToDaemon(appId, `/api/bot-topic-unavailable-policy`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
       });
       res.writeHead(upstream.status, { 'content-type': 'application/json' });
       res.end(await upstream.text());
@@ -8307,6 +8473,10 @@ const listenPendingWarn = setInterval(() => {
     + ' — platform tunnel not started yet. Likely a starved event loop (check this process\'s CPU)'
     + ' or a loopback occupant on the port; a bounded release failure will surface as an error below.',
   );
+  if (waitedS >= 60) {
+    logger.error(`[dashboard] still not listening after ${waitedS}s — exiting so the supervisor restarts the dashboard.`);
+    process.exit(1);
+  }
 }, LISTEN_PENDING_WARN_MS);
 listenPendingWarn.unref();
 listenWithProbe({
@@ -8616,7 +8786,7 @@ async function maybeAnnounceHallPresence(): Promise<void> {
 function shutdown(): void {
   codexNotifierAbort.abort();
   stopAutoCleanup();
-  for (const off of subs.values()) off();
+  for (const sub of subs.values()) sub.off();
   subs.clear();
   registry.stop();
   resourceMonitor.stop();

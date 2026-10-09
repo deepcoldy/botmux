@@ -41,7 +41,7 @@ export interface FrozenCard {
   silentIdle?: boolean;
   /** 冻结时的 idle 卡头标签：'silent' = 判定无需回复；'completed' = transcript
    *  模式下最终回复卡已投递。新写入以此为准，`silentIdle` 仅为读旧盘保留。 */
-  idleLabel?: 'silent' | 'completed';
+  idleLabel?: 'silent' | 'completed' | 'failed';
 }
 
 /** Resolve effective display mode for a frozen card.
@@ -59,10 +59,51 @@ export function frozenDisplayMode(fc: FrozenCard): DisplayMode {
 export interface DaemonSession {
   session: Session;
   worker: ChildProcess | null;   // fork'd worker process
+  /** User-visible final replies that the daemon accepted from a worker but has
+   * not finished delivering yet. Graceful remote shutdown keeps the exact
+   * worker generation fenced until these promises settle, so a provider final
+   * cannot be lost between remote turn completion and daemon exit. In-memory
+   * only; entries are registered and removed by the final-output delivery
+   * pipeline. */
+  finalOutputDeliveriesInFlight?: Set<Promise<void>>;
+  /** Same delivery registrations grouped by their exact turn. Terminal-state
+   * receipts wait on only their own turn, so a slow sibling cannot reorder the
+   * visible answer/receipt pair or block an unrelated completion marker. */
+  finalOutputDeliveriesByTurn?: Map<string, Set<Promise<void>>>;
   /** True after the current worker generation has completed init. Kept
    * separate from workerPort because backends without a Web Terminal still
    * emit screen/idle/screenshot updates and support native local attach. */
   workerReady?: boolean;
+  /** True while the CURRENT CLI generation's prompt is known idle/ready.
+   *  Set by the worker's `prompt_ready` IPC; cleared on spawn / restart /
+   *  `claude_exit` / worker retirement. Deliberately NOT cleared by the
+   *  worker's `ready` IPC: `prompt_ready` frequently arrives BEFORE `ready`
+   *  (riff / mojo synthesize the first one inside spawnCli, fast TUIs under
+   *  Herdr do too), so clearing on `ready` would erase a just-set value.
+   *  In-memory only — never persisted; a daemon restart re-derives it from the
+   *  respawned worker's `prompt_ready`.
+   *  COVERAGE BOUNDARY: only daemon-initiated CLI restarts clear this. A CLI
+   *  restart the worker starts on its own (codex-app RPC recovery, stale runner
+   *  reload, …) is invisible to the daemon, so during that window `cliReady`
+   *  can stay a stale `true`. Consumers MUST tolerate that false positive —
+   *  treat it as a hint, never as proof that the prompt is live.
+   *  See docs/design/2026-09-11-command-router.md §5 (SessionPhase). */
+  cliReady?: boolean;
+  /** Monotonic count of `prompt_ready` observations for this session within one
+   *  daemon boot. NEVER cleared (a clear of `cliReady` leaves it untouched), so
+   *  a waiter can capture it and wait for the NEXT set rather than observing a
+   *  stale `cliReady === true`. Needed by the runtime cascade sequencer:
+   *  a `raw_input` sent while the CLI is busy is queued into the composer, and
+   *  the `prompt_ready` that follows belongs to the PREVIOUS turn — a boolean
+   *  cannot tell the two apart.
+   *  See docs/design/2026-09-11-command-router.md §5 / §6. */
+  cliReadyGeneration?: number;
+  /** runtime 级联定序器（daemon 的 runPassthroughCascade）在飞：同 anchor 后到的普通消息 /
+   *  单条透传排进 `cascadeDeferred`，定序器收尾时按到达顺序重入 handleThreadReply；第二条级联
+   *  fail closed。`parsed` / `resources` 是首过 preamble（parse、merge_forward 展开、语音转写）
+   *  之后的快照，重入用它代替重新 parse。In-memory only. */
+  cascadeInFlight?: boolean;
+  cascadeDeferred?: Array<{ data: unknown; ctx: unknown; parsed?: unknown; resources?: unknown }>;
   workerPort: number | null;     // HTTP port for xterm.js
   workerToken: string | null;    // write token for xterm.js
   /** Independent read-only xterm capability. Optional for hydrated/legacy
@@ -393,6 +434,16 @@ export interface DaemonSession {
    *  idle 时卡头显示「已完成」而非「等待输入」。清理点与 `silentIdleTurnId`
    *  完全一致（每个新轮次入口）。内存态，不落盘。 */
   completedIdleTurnId?: string;
+  failedIdleTurnId?: string;
+  /** Last user-visible output carrier observed for each in-flight turn. The
+   *  worker reconstructs explicit-send entries from the durable turn-sends
+   *  journal before publishing turn_terminal; daemon-owned fallback output is
+   *  recorded directly after Lark accepts it. Retained in a bounded map so a
+   *  duplicate terminal can safely retry after an unconfirmed provider error. */
+  turnTerminalCarriers?: Map<string, {
+    messageId: string;
+    kind: 'standard_reply_card' | 'non_patchable';
+  }>;
   /** turnId of the most recently STARTED turn (beginNewTurn and both
    *  worker-exited re-fork branches). Lineage anchor for `silentIdleTurnId`: a
    *  turn_terminal that lands after a NEWER turn already opened — the normal
@@ -469,13 +520,14 @@ export interface DaemonSession {
    *  daemon 在构建 CLI 输入前按轮重算（resolveSoloSessionForTurn）；send 模式恒为
    *  false 且不发额外 API。内存态，不持久化——重启后首轮重算即可。 */
   soloSession?: boolean;
-  /** Dedupe guard: turnIds whose silent-turn auto receipt was already posted
-   *  (dispatchAttempt replays must not double-post). A bounded FIFO Set, not a
-   *  single slot: replays can interleave with other turns (A₁ → B → A₂), and a
-   *  one-slot guard would let A₂ re-post. An entry is claimed BEFORE the reply
-   *  is sent and released if that send fails, so a later replay can compensate
-   *  instead of losing the closure permanently. */
+  /** Backward-compatible dedupe for old sessions that lack a frozen per-turn
+   *  Lark reply context and therefore still use the legacy explicit-@ silent
+   *  receipt. New ordinary Lark turns use terminalReceiptTurnIds instead. */
   silentReceiptTurnIds?: Set<string>;
+  /** Dedupe guard for the independent terminal-state strip. Claimed before
+   *  waiting for the answer delivery and retained when a newer turn supersedes
+   *  it; released only after all bounded send attempts fail. */
+  terminalReceiptTurnIds?: Set<string>;
   /** Latest model reported by the live executor. In-memory and rehydrated from
    *  the CLI transcript after worker restart; unlike Session.model it follows
    *  in-session `/model` switches. */
@@ -573,6 +625,8 @@ export interface DaemonSession {
   /** Wait Mode / HTTP Sync integration: pending Promise handlers for synchronous
    *  webhook triggers waiting for a response in this session. Key is turnId. */
   pendingWaitPromises?: Map<string, { resolve: (text: string) => void; reject?: (err: Error) => void }>;
+  /** Bounded HTTP terminal tombstones: late outputs cannot fall through to IM. */
+  settledHttpTerminalTurns?: Set<string>;
   /** Async webhook trigger state keyed by triggerId. `sessionId` polling reads
    *  `latestAsyncTriggerId`; callers that need exact-match semantics can also
    *  pass the triggerId returned by the initial async activation response. */

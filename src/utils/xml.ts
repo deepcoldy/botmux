@@ -9,6 +9,12 @@ export function escapeXmlText(value: string): string {
     .replace(/>/g, '&gt;');
 }
 
+/** Attribute context also has to neutralize quotes. `escapeXmlText` leaves `"` intact,
+ *  which is fine inside element text and wrong inside `attr="..."`. */
+export function escapeXmlAttr(value: string): string {
+  return escapeXmlText(value).replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+}
+
 /**
  * Escape complete angle-bracket tokens embedded in XML prompt prose.
  *

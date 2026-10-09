@@ -59,6 +59,7 @@ import { findAntigravityConversationId } from '../../services/antigravity-discov
 
 const HISTORY_PATH = join(homedir(), '.gemini', 'antigravity-cli', 'history.jsonl');
 
+
 function currentFileSize(path: string): number {
   if (!existsSync(path)) return 0;
   try { return statSync(path).size; } catch { return 0; }
@@ -133,6 +134,42 @@ async function waitForHistoryAppend(
   return historyDeltaContains(path, fromByte, marker);
 }
 
+/** agy ≥1.2 renders the active permission mode INSIDE an otherwise empty
+ *  composer as a placeholder after the prompt marker, e.g.
+ *  `> Accept-edits mode: file edits auto-approved (shift+tab to cycle)`.
+ *  All four modes (Auto / Accept-edits / Plan / Best-of-N) share the
+ *  `(shift+tab to cycle)` suffix; older builds rendered a bare `>`. A real
+ *  draft (including botmux's own <user_message> envelopes) matches neither. */
+function isEmptyComposerRow(row: string): boolean {
+  if (row === '>') return true;
+  return /^> .+\(shift\+tab to cycle\)$/.test(row);
+}
+
+/** Walk the tail of a viewport (ready footer → separators → composer) and
+ *  decide whether agy is parked at an EMPTY composer with its ready footer —
+ *  i.e. the live TUI is demonstrably waiting for input. Returns the index of
+ *  the row immediately above the composer block, or -1 when the tail does not
+ *  match. One walk shared by the interruption and generic idle-composer
+ *  classifiers. */
+function readyComposerRowAbove(plain: string): number {
+  const rows = plain.split('\n').map(row => row.trim());
+  let end = rows.length;
+  const skipBlankRows = (): void => {
+    while (end > 0 && rows[end - 1] === '') end--;
+  };
+  const skipSeparators = (): void => {
+    // PTY rawSnapshot's display cleanup replaces box-drawing rows with blanks;
+    // the /^[─━]*$/ form matches those emptied rows too.
+    while (end > 0 && /^[─━]*$/.test(rows[end - 1])) end--;
+  };
+  skipBlankRows();
+  if (end === 0 || !/^\? for shortcuts(?:\s|$)/.test(rows[--end])) return -1;
+  skipSeparators();
+  if (end === 0 || !isEmptyComposerRow(rows[--end])) return -1;
+  skipSeparators();
+  return end - 1;
+}
+
 /** Cancellation can leave the transcript at a tool result forever. Accept only
  * the CLI's explicit interruption notice followed immediately by an EMPTY
  * composer and its ready footer at the end of the current viewport. Old notices
@@ -142,25 +179,23 @@ export function isAntigravityInterruptedScreen(screen: string): boolean {
   // the PTY renderer already returns plain LF rows. Accept both backends.
   const plain = stripAnsiScreenText(screen).replace(/\r\n/g, '\n');
   if (/esc to cancel/i.test(plain)) return false;
-  // Walk rows once instead of matching nested whitespace repetitions against
-  // a whole screen (which can backtrack exponentially on blank rows).
-  const rows = plain.split('\n').map(row => row.trim());
-  let end = rows.length;
-  const skipBlankRows = (): void => {
-    while (end > 0 && rows[end - 1] === '') end--;
-  };
-  const skipSeparators = (): void => {
-    // PTY rawSnapshot's display cleanup replaces box-drawing rows with blanks;
-    // tmux retains them. Both must preserve the same three semantic rows.
-    while (end > 0 && /^[─━]*$/.test(rows[end - 1])) end--;
-  };
-  skipBlankRows();
-  if (end === 0 || !/^\? for shortcuts(?:\s|$)/.test(rows[--end])) return false;
-  skipSeparators();
-  if (end === 0 || rows[--end] !== '>') return false;
-  skipSeparators();
-  if (end === 0) return false;
-  return /^⎿[ \t]+Interrupted · What should Antigravity CLI do instead\?$/.test(rows[end - 1]);
+  const rowAbove = readyComposerRowAbove(plain);
+  if (rowAbove < 0) return false;
+  return /^⎿[ \t]+Interrupted · What should Antigravity CLI do instead\?$/.test(plain.split('\n').map(row => row.trim())[rowAbove]);
+}
+
+/** The live viewport ends at an empty composer + ready footer, with no
+ *  in-flight generation marker — regardless of whether an explicit
+ *  "Interrupted" notice was rendered. A resumed conversation (e.g. after
+ *  /close) can be parked at a fresh prompt while its transcript.jsonl still
+ *  ends in a dangling USER_INPUT / PLANNER_RESPONSE(tool_calls) record from
+ *  the killed turn; the transcript-only heuristic would then read "busy"
+ *  forever and never release queued input. The live TUI is the authority: an
+ *  empty composer means input can be delivered. */
+export function isAntigravityIdleComposerScreen(screen: string): boolean {
+  const plain = stripAnsiScreenText(screen).replace(/\r\n/g, '\n');
+  if (/esc to cancel/i.test(plain)) return false;
+  return readyComposerRowAbove(plain) >= 0;
 }
 
 export function isAntigravityTranscriptBusy(transcriptPath: string): boolean {
@@ -234,7 +269,11 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
   let cachedBin: string | undefined;
   return {
     id: 'antigravity',
-    authPaths: ['~/.gemini/oauth_creds.json', '~/.gemini/antigravity-cli/antigravity-oauth-token'],
+    // Whole ~/.gemini (oauth + antigravity-cli brain transcripts + history):
+    // a directory-level readWrite bind under the sandbox so the host daemon
+    // drains the same transcript the CLI writes. The worker pre-creates the
+    // dir at spawn (bwrap cannot bind a missing source).
+    authPaths: ['~/.gemini'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
     modelChoices: CLI_MODEL_CHOICES['antigravity'],
 
@@ -388,7 +427,18 @@ export function createAntigravityAdapter(pathOverride?: string): CliAdapter {
       const transcriptPath = join(homedir(), '.gemini', 'antigravity-cli', 'brain', cliSessionId, '.system_generated', 'logs', 'transcript.jsonl');
       if (!isAntigravityTranscriptBusy(transcriptPath)) return false;
       try {
-        if (getCurrentScreen && isAntigravityInterruptedScreen(getCurrentScreen())) return false;
+        // The transcript lags reality when a turn was killed (e.g. /close
+        // mid tool call, worker crash) and the conversation is later resumed:
+        // its dangling last record reads "busy" forever while the live TUI is
+        // parked at an empty composer. Trust the viewport when it proves the
+        // CLI is waiting for input; stay conservative when no authoritative
+        // screen is available (no getter → non-authoritative backend).
+        const screen = getCurrentScreen?.();
+        if (screen
+          && (isAntigravityIdleComposerScreen(screen)
+            || isAntigravityInterruptedScreen(screen))) {
+          return false;
+        }
       } catch { /* Missing viewport is not evidence of cancellation. */ }
       return true;
     },

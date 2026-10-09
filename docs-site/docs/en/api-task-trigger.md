@@ -111,7 +111,7 @@ Calls go through the dashboard (default `http://<daemon-host>:7891`), authentica
 | `topicMessage` | 1–200 chars, or `null` | `External event: {sourceName}` |
 
 - `title` is the **session title** (dashboard / Feishu thread name), truncated to 50 chars.
-- `topicMessage` is the **seed message posted when a new thread is opened**. Pass `null` to say explicitly "do not post a seed" — the session then sits at the group's chat scope.
+- `topicMessage` is the **seed message posted when a new thread is opened**. Explicit non-empty text requests a separate thread, except that regular groups in `shared` mode keep their shared session. Explicit `sessionId`/`rootMessageId` targets and HTTP/headless virtual sessions retain their routing. Pass `null` to say explicitly "do not post a seed" — the session then sits at the group's chat scope.
 - ⚠️ Both matter **only when a new thread is actually opened**: a virtual session posts nothing at all, and neither a `rootMessageId` delivery into an existing thread nor a fold-in to an existing session posts a seed.
 - Out of range (empty string / >200 chars / wrong type) → 400 `bad_request`.
 
@@ -168,7 +168,8 @@ Whenever `target.chatId` is a real group id, this is **never** a virtual session
 
 - The bot's membership in that group is checked first; if it is not a member → **403 `bot_not_in_chat`**.
 - **Topic groups** (or regular groups configured in `new-topic` mode) open a new thread: a seed message is posted first (`presentation.topicMessage`, customizable, or `null` to suppress), and the session is anchored to it.
-- **Regular groups in `chat` mode**: no new thread; the turn folds into that group's single chat-scope session (appending a turn if one already exists).
+- **Explicit non-empty `topicMessage`** opens a separate thread in regular-group `chat`, default `chat-topic`, and `new-topic` modes. `shared` preserves its session, worker, and working directory.
+- **Without explicit text**, regular groups retain their configured routing: an existing shared session can receive another turn; `new-topic` opens a thread.
 
 ### 4.3 `chatId` + `rootMessageId` → into an existing thread
 

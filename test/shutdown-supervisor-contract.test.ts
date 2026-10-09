@@ -5,14 +5,25 @@ import {
   DAEMON_SHUTDOWN_MAX_MS,
   DAEMON_SHUTDOWN_OVERHEAD_MS,
   DAEMON_WORKER_EXIT_GRACE_MS,
+  DEFAULT_FLEET_DAEMON_EXIT_WAIT_MS,
+  DEFAULT_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+  deriveShutdownBudgets,
+  FLEET_DAEMON_EXIT_WAIT_MS,
+  FLEET_DAEMON_KILL_TIMEOUT_MS,
+  FLEET_SUCCESSOR_SETTLE_MS,
+  MAX_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+  MIN_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+  parseRemoteShutdownDrainTimeoutMs,
   REMOTE_ADMISSION_RESTORE_TIMEOUT_MS,
   REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS,
   REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+  REMOTE_SHUTDOWN_FINAL_OUTPUT_DRAIN_TIMEOUT_MS,
   REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS,
 } from '../src/core/shutdown-budgets.js';
 import { DAEMON_GRACEFUL_EXIT_CODE } from '../src/core/supervisor-shutdown-protocol.js';
 import { PM2_GRACEFUL_EXIT_CODE } from '../src/pm2-graceful-exit.js';
 import { FLEET_GRACEFUL_EXIT_CODE } from '../src/core/fleet-supervisor-policy.js';
+import { spawnSyncTsEvalWithRepoImports } from './helpers/ts-runner.js';
 
 const cli = readFileSync(new URL('../src/cli.ts', import.meta.url), 'utf8');
 const daemon = readFileSync(new URL('../src/daemon.ts', import.meta.url), 'utf8');
@@ -45,15 +56,74 @@ describe('graceful shutdown supervisor contract', () => {
   });
 
   it('keeps the outer daemon shutdown budget within bounds', () => {
+    expect(REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS).toBe(DEFAULT_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS);
     expect(DAEMON_SHUTDOWN_MAX_MS).toBe(
       BOT_TURN_MUTATION_SHUTDOWN_ACQUIRE_TIMEOUT_MS
       + REMOTE_SHUTDOWN_INITIAL_SNAPSHOT_TIMEOUT_MS
       + REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS
+      + REMOTE_SHUTDOWN_FINAL_OUTPUT_DRAIN_TIMEOUT_MS
       + REMOTE_SHUTDOWN_BATCH_PERSIST_TIMEOUT_MS
       + Math.max(REMOTE_ADMISSION_RESTORE_TIMEOUT_MS, DAEMON_WORKER_EXIT_GRACE_MS)
       + DAEMON_SHUTDOWN_OVERHEAD_MS,
     );
-    expect(DAEMON_SHUTDOWN_MAX_MS).toBeLessThanOrEqual(28_000);
+    expect(DAEMON_SHUTDOWN_MAX_MS).toBeLessThanOrEqual(48_000);
+    expect(FLEET_DAEMON_KILL_TIMEOUT_MS).toBe(49_000);
+    expect(FLEET_DAEMON_EXIT_WAIT_MS).toBe(DEFAULT_FLEET_DAEMON_EXIT_WAIT_MS);
+  });
+
+  it('strictly parses the provider-neutral remote drain override', () => {
+    expect(parseRemoteShutdownDrainTimeoutMs(undefined)).toBe(
+      DEFAULT_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+    );
+    expect(parseRemoteShutdownDrainTimeoutMs(String(MIN_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS))).toBe(
+      MIN_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+    );
+    expect(parseRemoteShutdownDrainTimeoutMs(String(MAX_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS))).toBe(
+      MAX_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+    );
+    for (const value of ['', '0', '11999', '12.5', ' 12000', '12000 ', '+12000', '01']) {
+      expect(() => parseRemoteShutdownDrainTimeoutMs(value), value).toThrow();
+    }
+    expect(() => parseRemoteShutdownDrainTimeoutMs('86400001')).toThrow();
+  });
+
+  it('derives every outer wait budget from a widened remote drain', () => {
+    const widenedDrainMs = 3_660_000;
+    const budgets = deriveShutdownBudgets(widenedDrainMs);
+    expect(budgets.daemonShutdownMaxMs).toBe(widenedDrainMs + 36_000);
+    expect(budgets.fleetDaemonKillTimeoutMs).toBe(budgets.daemonShutdownMaxMs + 1_000);
+    expect(budgets.fleetDaemonExitWaitMs).toBeGreaterThan(
+      budgets.fleetDaemonKillTimeoutMs + FLEET_SUCCESSOR_SETTLE_MS,
+    );
+    expect(budgets.fleetDaemonExitWaitMs).toBeGreaterThan(DEFAULT_FLEET_DAEMON_EXIT_WAIT_MS);
+  });
+
+  it('applies the override to module-level daemon, supervisor, and CLI budgets', () => {
+    const child = spawnSyncTsEvalWithRepoImports(`
+      import {
+        REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+        DAEMON_SHUTDOWN_MAX_MS,
+        FLEET_DAEMON_KILL_TIMEOUT_MS,
+        FLEET_DAEMON_EXIT_WAIT_MS,
+      } from './src/core/shutdown-budgets.js';
+      process.stdout.write(JSON.stringify({
+        REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS,
+        DAEMON_SHUTDOWN_MAX_MS,
+        FLEET_DAEMON_KILL_TIMEOUT_MS,
+        FLEET_DAEMON_EXIT_WAIT_MS,
+      }));
+    `, {
+      cwd: process.cwd(),
+      env: { ...process.env, BOTMUX_REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS: '3660000' },
+      encoding: 'utf8',
+    });
+    expect(child.status, String(child.stderr)).toBe(0);
+    expect(JSON.parse(String(child.stdout))).toEqual({
+      REMOTE_SHUTDOWN_DRAIN_TIMEOUT_MS: 3_660_000,
+      DAEMON_SHUTDOWN_MAX_MS: 3_696_000,
+      FLEET_DAEMON_KILL_TIMEOUT_MS: 3_697_000,
+      FLEET_DAEMON_EXIT_WAIT_MS: 3_701_500,
+    });
   });
 
   // ─── Migrated fleet commands (supervisor, not pm2) ──────────────────────────
@@ -66,7 +136,7 @@ describe('graceful shutdown supervisor contract', () => {
     const end = cli.indexOf('async function cmdRestart()', start);
     const stop = cli.slice(start, end);
     const lock = stop.indexOf('withFileLock(PM2_FLEET_MUTATION_LOCK_TARGET');
-    const call = stop.indexOf('stopFleet()', lock);
+    const call = stop.indexOf('stopFleet(FLEET_DAEMON_EXIT_WAIT_MS)', lock);
     expect(lock).toBeGreaterThanOrEqual(0);
     expect(call).toBeGreaterThan(lock);
     expect(stop).not.toContain("runPm2(['stop'");
@@ -88,7 +158,7 @@ describe('graceful shutdown supervisor contract', () => {
     const firstAwait = restart.indexOf('await ');
     const consume = restart.indexOf('consumeRestartIntentTo(');
     const writeIntent = restart.indexOf('writeRestartAttemptIntentTo(', consume);
-    const restartFleet = restart.indexOf('restartFleet({ refreshPersistedEnv, readFailureFallback })', writeIntent);
+    const restartFleet = restart.indexOf('restartFleet({', writeIntent);
     const health = restart.indexOf('waitFleetOnline(', restartFleet);
     const removeOnFail = restart.indexOf('removeRestartIntentAttemptTo(', health);
     const commit = restart.indexOf('commitRestartIntentAttemptTo(', health);
@@ -106,6 +176,7 @@ describe('graceful shutdown supervisor contract', () => {
     expect(restart).not.toContain("runPm2(['start'");
     expect(restart).not.toContain('ecosystemConfig(');
     expect(restart).toContain('health.healthy');
+    expect(restart).toContain('timeoutMs: FLEET_DAEMON_EXIT_WAIT_MS');
   });
 
   it('uses the generation-locked best-effort clear after dashboard update locks are released', () => {
@@ -154,7 +225,8 @@ describe('graceful shutdown supervisor contract', () => {
       cli.indexOf('/**\n * Bring a SINGLE bot'),
     );
     expect(cmdStart).toContain('startFleetViaSupervisor()');
-    expect(cmdRestart).toContain('restartFleet({ refreshPersistedEnv, readFailureFallback })');
+    expect(cmdRestart).toContain('restartFleet({');
+    expect(cmdRestart).toContain('timeoutMs: FLEET_DAEMON_EXIT_WAIT_MS');
     expect(startBot).toContain('startBotViaSupervisor(');
     expect(stopBot).toContain('stopBotViaSupervisor(');
     for (const [label, region] of [['start', cmdStart], ['restart', cmdRestart], ['start-bot', startBot], ['stop-bot', stopBot]] as const) {
@@ -247,27 +319,22 @@ describe('graceful shutdown supervisor contract', () => {
     expect(daemon.slice(start, stop)).toContain('canAbortVerifiedExitedRemotePreparation(');
   });
 
-  it('publishes shutdown capability only after both signal handlers are installed', () => {
+  it('installs shutdown handlers before the attested descriptor rewrite', () => {
     const descStart = daemon.indexOf('const desc: DaemonDescriptor = {');
     const firstDescriptorWrite = daemon.indexOf('writeDaemonDescriptor(desc);', descStart);
     const sigtermHandler = daemon.indexOf("process.on('SIGTERM'", firstDescriptorWrite);
     const sigintHandler = daemon.indexOf("process.on('SIGINT'", sigtermHandler);
-    const capabilityCommit = daemon.indexOf(
-      'desc.supervisorShutdownProtocol = SUPERVISOR_SHUTDOWN_PROTOCOL;',
-      sigintHandler,
-    );
     const ipcHandlerReady = daemon.indexOf('setSupervisorShutdownHandler({', sigintHandler);
-    const attestedWrite = daemon.indexOf('writeDaemonDescriptor(desc);', capabilityCommit);
+    const attestedWrite = daemon.indexOf('writeDaemonDescriptor(desc);', ipcHandlerReady);
 
     expect(descStart).toBeGreaterThanOrEqual(0);
     expect(firstDescriptorWrite).toBeGreaterThan(descStart);
-    expect(daemon.slice(descStart, firstDescriptorWrite))
-      .not.toContain('supervisorShutdownProtocol: SUPERVISOR_SHUTDOWN_PROTOCOL');
+    expect(daemon).not.toContain('supervisorShutdownProtocol');
+    expect(daemon.slice(descStart, firstDescriptorWrite)).toContain('sessionStoreProtocol');
     expect(sigtermHandler).toBeGreaterThan(firstDescriptorWrite);
     expect(sigintHandler).toBeGreaterThan(sigtermHandler);
     expect(ipcHandlerReady).toBeGreaterThan(sigintHandler);
-    expect(capabilityCommit).toBeGreaterThan(ipcHandlerReady);
-    expect(attestedWrite).toBeGreaterThan(capabilityCommit);
+    expect(attestedWrite).toBeGreaterThan(ipcHandlerReady);
   });
 
   it('keeps supervisor shutdown host-authenticated and exact boot/birth bound', () => {

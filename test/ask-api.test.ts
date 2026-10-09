@@ -111,6 +111,26 @@ describe('parseAskBody — validation', () => {
   });
 });
 
+describe('parseAskBody — supported request semantics', () => {
+  it('rejects an unsupported request contract instead of reducing it to an ordinary Ask', () => {
+    expect(parseAskBody(validBody({
+      requestId: 'original-request', originKind: 'explicit',
+      requiredContract: { kind: 'durable-approval', revision: 1 },
+    }))).toEqual({ error: 'unsupported_fields' });
+  });
+
+  it('preserves native hook identity while leaving route claims to the authorizer', () => {
+    const out = parseAskBody(validBody({
+      requestId: 'original-hook', originKind: 'hook',
+      originCapability: 'fixture-capability', originTurnId: 'original-turn', originDispatchAttempt: 2,
+    }));
+    expect(out).toMatchObject({ requestId: 'original-hook', originKind: 'hook' });
+    expect(out).not.toHaveProperty('originCapability');
+    expect(out).not.toHaveProperty('originTurnId');
+    expect(out).not.toHaveProperty('originDispatchAttempt');
+  });
+});
+
 describe('parseAskBody — questions[] 多问多选', () => {
   it('接受 questions[]（多问多选）', () => {
     const body = parseAskBody({

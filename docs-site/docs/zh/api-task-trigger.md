@@ -111,7 +111,7 @@
 | `topicMessage` | 1–200 字符，或 `null` | `外部事件触发：{sourceName}` |
 
 - `title` 是**会话标题**（dashboard/飞书话题名），最终截断到 50 字符。
-- `topicMessage` 是**新开话题时发的那条引子消息**。传 `null` 显式表示「不要发引子」——话题会直接落在群的 chat 层级。
+- `topicMessage` 是**新开话题时发的那条引子消息**。显式非空文案会要求独立话题；普通群 `shared` 模式仍复用共享会话。指定 `sessionId`/`rootMessageId` 或使用 HTTP/headless 虚拟会话时保持原目标。传 `null` 显式表示「不要发引子」——话题会直接落在群的 chat 层级。
 - ⚠️ 两者**只在真正新开话题时有意义**：虚拟会话不发任何飞书消息，`rootMessageId` 落已有话题、折叠进已有会话也都不发引子。
 - 越界（空串 / >200 字符 / 类型不对）→ 400 `bad_request`。
 
@@ -168,7 +168,8 @@
 
 - 会先校验机器人是否在该群，不在 → **403 `bot_not_in_chat`**。
 - **话题群**（或普通群配置成 `new-topic` 模式）会新开一个话题：先发一条引子消息（`presentation.topicMessage`，可自定义、可传 `null` 抑制），会话锚在这条消息上。
-- **普通群的 `chat` 模式**：不新开话题，折叠进该群那个唯一的 chat-scope 会话（已有会话就续轮）。
+- **显式非空 `topicMessage`**：普通群的 `chat`、默认 `chat-topic`、`new-topic` 模式均开独立话题；`shared` 模式保持共享 session、worker 和工作目录。
+- **未传显式文案的普通群**：按原回复模式路由；已有共享会话可续轮，`new-topic` 新开话题。
 
 ### 4.3 `chatId` + `rootMessageId` → 落到已有话题
 

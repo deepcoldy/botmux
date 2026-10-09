@@ -41,6 +41,7 @@ import { buildRestartLauncher, resolveStandaloneRestartExecutable, resolveRestar
 import { tryResolveGlobalInstallPlan, formatGlobalInstallCommand, resolveAutoUpdateSupport } from '../src/utils/global-install.js';
 import { withFileLock, FileLockTimeoutError } from '../src/utils/file-lock.js';
 import { botmuxVersionAt, diskVersionAt } from '../src/utils/install-info.js';
+import { fileURLToPath } from 'node:url';
 
 const dirs: string[] = [];
 function tmp(): string {
@@ -966,5 +967,25 @@ describe('replaceStandaloneBinary — atomic swap of a live executable', () => {
     expect(() => execFileSync(process.execPath, ['-e',
       `require('fs').renameSync(${JSON.stringify(fresh)}, ${JSON.stringify(bin)})`,
     ])).not.toThrow();
+  });
+});
+
+describe('the compiled dashboard must not compare daemons against its OWN baked version', () => {
+  // Source guard (same rule as diskVersionAt above): in the compiled binary
+  // `current` is the running dashboard's baked version, so the "running daemon
+  // vs disk" comparison is undetermined there and must stay silent — never
+  // inverted after a partial respawn.
+  const dashboardSrc = readFileSync(fileURLToPath(new URL('../src/dashboard.ts', import.meta.url)), 'utf-8');
+  const sessionsPageSrc = readFileSync(fileURLToPath(new URL('../src/dashboard/web/sessions-page.tsx', import.meta.url)), 'utf-8');
+
+  it('/api/update/status feeds the restart summary a disk version that is undefined when standalone', () => {
+    expect(dashboardSrc).toContain('const diskVersion = isStandaloneBinary() ? undefined : current;');
+    expect(dashboardSrc).toMatch(/formatRunningDaemonsRestartSummary\(\s*runningDaemons\.map\(d => d\.version\),\s*diskVersion,\s*\)/);
+    expect(dashboardSrc).toContain("...(diskVersion ? { diskVersion } : {}),");
+  });
+
+  it('the history staleHint compares against diskVersion, never against current', () => {
+    expect(sessionsPageSrc).toContain('daemonVersionDiffersFromDisk(running, status.diskVersion)');
+    expect(sessionsPageSrc).not.toMatch(/daemonVersionDiffersFromDisk\([^)]*status\.current/);
   });
 });

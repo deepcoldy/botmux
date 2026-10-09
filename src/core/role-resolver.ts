@@ -233,6 +233,8 @@ export type RoleInjectMode = 'every' | 'once';
 
 interface RoleMeta {
   inject?: RoleInjectMode;
+  replyPrivately?: true;
+  privateReplyNotice?: string;
   dispatchCompletionEnabled?: true;
 }
 
@@ -251,6 +253,8 @@ function readRoleMeta(larkAppId: string, chatId: string): RoleMeta {
     const raw = meta as Record<string, unknown>;
     return {
       ...(raw.inject === 'once' || raw.inject === 'every' ? { inject: raw.inject } : {}),
+      ...(raw.replyPrivately === true ? { replyPrivately: true as const } : {}),
+      ...(typeof raw.privateReplyNotice === 'string' ? { privateReplyNotice: raw.privateReplyNotice.trim() } : {}),
       ...(raw.dispatchCompletionEnabled === true ? { dispatchCompletionEnabled: true as const } : {}),
     };
   } catch {
@@ -366,4 +370,28 @@ export function resolveRoleInjection(
   const base = resolveRole(larkAppId, chatId);
   if (!base.content) return { ...base, injectMode: 'every' };
   return { ...base, injectMode: readRoleInjectMode(larkAppId, chatId) };
+}
+
+/** Private delivery is a per-group setting with no bot-level inheritance. */
+export function readRoleReplyPrivately(larkAppId: string, chatId: string): boolean {
+  return !!larkAppId && !!chatId && readRoleMeta(larkAppId, chatId).replyPrivately === true;
+}
+
+export function writeRoleReplyPrivately(larkAppId: string, chatId: string, enabled: boolean): void {
+  const meta = readRoleMeta(larkAppId, chatId);
+  if (enabled) meta.replyPrivately = true;
+  else delete meta.replyPrivately;
+  writeRoleMeta(larkAppId, chatId, meta);
+}
+
+export function readRolePrivateReplyNotice(larkAppId: string, chatId: string): string {
+  return readRoleMeta(larkAppId, chatId).privateReplyNotice ?? '';
+}
+
+export function writeRolePrivateReplyNotice(larkAppId: string, chatId: string, notice: string): void {
+  if (notice.length > 500) throw new Error('Private reply notice exceeds 500 characters');
+  const meta = readRoleMeta(larkAppId, chatId);
+  if (notice.trim()) meta.privateReplyNotice = notice.trim();
+  else delete meta.privateReplyNotice;
+  writeRoleMeta(larkAppId, chatId, meta);
 }

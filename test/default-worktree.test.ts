@@ -199,3 +199,52 @@ describe('maybeCreateDefaultWorktree', () => {
     expect(notices).toHaveLength(0);
   });
 });
+
+/**
+ * 话题指令头 `/repo wt <目标> [分支]` 的 git 腿复用 `/tw` 的 force 路径：force 让失败即抛
+ * （fail closed，设计 R9），branch 让目录命名走 createRepoWorktree 的显式分支规则。
+ */
+describe('maybeCreateDefaultWorktree with force + explicit branch (header /repo wt)', () => {
+  it('explicit branch → <repo>-<branch suffix> sibling dir, notices creating→created', async () => {
+    const repo = makeRepo('proj');
+    const { mod } = await loadWithBot(repo, false);
+    const notices: string[] = [];
+
+    const r = await mod.maybeCreateDefaultWorktree('app_wt', repo, {
+      isBotDefaultDir: true, locale: 'zh', force: true, branch: 'ci/temp_split', notify: (m) => { notices.push(m); },
+    });
+
+    expect(r.dir).toBe(join(tempRoot, 'proj-ci-temp_split'));
+    expect(git(r.dir, 'branch', '--show-current')).toBe('ci/temp_split');
+    expect(notices).toHaveLength(2);
+    expect(notices[0]).toContain('正在');
+    expect(notices[1]).toContain(r.dir);
+  });
+
+  it('no branch → auto-named wt/… worktree (semantic slug when latin text is available)', async () => {
+    const repo = makeRepo('proj');
+    const { mod } = await loadWithBot(repo, false);
+
+    const r = await mod.maybeCreateDefaultWorktree('app_wt', repo, {
+      isBotDefaultDir: true, locale: 'zh', force: true, title: 'bun version check',
+    });
+
+    expect(r.dir).toMatch(/proj-wt/);
+    expect(git(r.dir, 'branch', '--show-current')).toMatch(/^wt\//);
+  });
+
+  it('target dir already taken → throws (fail closed, no fallback to the base dir)', async () => {
+    const repo = makeRepo('proj');
+    const { mod } = await loadWithBot(repo, false);
+    mkdirSync(join(tempRoot, 'proj-feat-taken'));
+    const notices: string[] = [];
+
+    await expect(mod.maybeCreateDefaultWorktree('app_wt', repo, {
+      isBotDefaultDir: true, locale: 'zh', force: true, branch: 'feat/taken', notify: (m) => { notices.push(m); },
+    })).rejects.toThrow(/already exists/);
+    // "creating…" then the raw error (force path notifies the error instead of a fallback line).
+    expect(notices).toHaveLength(2);
+    expect(notices[0]).toContain('正在');
+    expect(notices[1]).toMatch(/already exists/);
+  });
+});

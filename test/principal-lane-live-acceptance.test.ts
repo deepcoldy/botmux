@@ -342,7 +342,7 @@ describe('principal lane production live acceptance', () => {
   afterEach(() => {
     process.env.BOTMUX_XPI_ENABLED = 'true';
     activeSessions.clear();
-    sessionStore.init();
+    sessionStore.init(appId);
     __resetPeerCrossRefCacheForTest();
     __testOnly_resetBotRegistry();
     rmSync(mocks.dataDir, { recursive: true, force: true });

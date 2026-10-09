@@ -1,3 +1,4 @@
+import type { WorkspaceMetadata } from './workspace-metadata.js';
 // src/core/dashboard-rows.ts
 //
 // Pure-data row composers shared between the dashboard IPC server (which
@@ -6,7 +7,7 @@
 // module so worker-pool can import the composer without pulling in the IPC
 // server (which itself imports worker-pool — that would be a cycle).
 import type { DaemonSession } from './types.js';
-import type { Session, StreamStatus } from '../types.js';
+import type { CodexAppDispatchLedgerEntry, ReplyTargetEntry, Session, StreamStatus } from '../types.js';
 import type { CliId } from '../adapters/cli/types.js';
 import { basename } from 'node:path';
 import { getTerminalAdvertisedPort } from './terminal-url.js';
@@ -27,6 +28,7 @@ export interface SessionRow extends SessionMessagePreview {
   cliInstanceId?: string;
   cliInstanceSource?: string;
   creationSource?: string;
+  workspace?: WorkspaceMetadata | null;
   sessionId: string;
   larkAppId: string;
   botName: string;
@@ -56,6 +58,8 @@ export interface SessionRow extends SessionMessagePreview {
    *  locate, so the dashboard offers "open chat" (feishuChatLink) instead.
    *  Absent on rows from older daemons → callers keep the locate behavior. */
   scope?: 'thread' | 'chat';
+  /** Explicit whiteboard binding; absent when the session is unbound. */
+  whiteboardId?: Session['whiteboardId'];
   headless?: Session['headless'];
   title?: string;
   titleUpdatedAt?: string;
@@ -128,6 +132,29 @@ export interface SessionRow extends SessionMessagePreview {
   repoName?: string;
   /** Current branch of workingDir; absent for detached HEAD / non-repo. */
   gitBranch?: string;
+  /** Per-turn reply anchors — `botmux send` prefers these over the topic root. */
+  replyTargets?: Record<string, ReplyTargetEntry>;
+  currentReplyTarget?: Session['currentReplyTarget'];
+  quoteTargetId?: string;
+  quoteTargetSenderOpenId?: string;
+  codexAppDispatchLedger?: CodexAppDispatchLedgerEntry[];
+}
+
+function composeSendRoutingFields(
+  s: Session,
+  runtimeCurrentReplyTarget?: Session['currentReplyTarget'],
+): Pick<
+  SessionRow,
+  'replyTargets' | 'currentReplyTarget' | 'quoteTargetId' | 'quoteTargetSenderOpenId' | 'codexAppDispatchLedger'
+> {
+  const currentReplyTarget = runtimeCurrentReplyTarget ?? s.currentReplyTarget;
+  return {
+    ...(s.replyTargets ? { replyTargets: s.replyTargets } : {}),
+    ...(currentReplyTarget ? { currentReplyTarget } : {}),
+    ...(s.quoteTargetId ? { quoteTargetId: s.quoteTargetId } : {}),
+    ...(s.quoteTargetSenderOpenId ? { quoteTargetSenderOpenId: s.quoteTargetSenderOpenId } : {}),
+    ...(s.codexAppDispatchLedger ? { codexAppDispatchLedger: s.codexAppDispatchLedger } : {}),
+  };
 }
 
 export function feishuChatLink(chatId: string, brand: Brand = 'feishu'): string {
@@ -291,6 +318,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     rootMessageId: ds.session.rootMessageId,
     lastInputFromBot: ds.session.quoteTargetSenderIsBot === true,
     scope: ds.session.scope,
+    whiteboardId: ds.session.whiteboardId,
     headless: ds.session.headless,
     title: ds.session.title,
     titleUpdatedAt: ds.session.titleUpdatedAt,
@@ -326,6 +354,7 @@ export function composeRowFromActive(ds: DaemonSession, opts?: DashboardRowOptio
     ...(ds.worker?.pid !== undefined ? { workerPid: ds.worker.pid } : {}),
     ...(ds.adoptedFrom?.originalCliPid !== undefined ? { adoptCliPid: ds.adoptedFrom.originalCliPid } : {}),
     ...buildSessionMessagePreview(ds.session),
+    ...composeSendRoutingFields(ds.session, ds.currentReplyTarget),
   };
 }
 
@@ -354,6 +383,7 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     rootMessageId: s.rootMessageId,
     lastInputFromBot: s.quoteTargetSenderIsBot === true,
     scope: s.scope,
+    whiteboardId: s.whiteboardId,
     headless: s.headless,
     title: s.title,
     titleUpdatedAt: s.titleUpdatedAt,
@@ -371,6 +401,7 @@ export function composeRowFromClosed(s: Session, opts?: DashboardRowOptions): Se
     ...(topicId ? { threadId: topicId } : {}),
     tokenUsage: maybeSessionTokenUsage(s, undefined, opts, { usePersistedSnapshot: true }),
     ...buildSessionMessagePreview(s),
+    ...composeSendRoutingFields(s),
   };
 }
 
@@ -406,6 +437,7 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     rootMessageId: s.rootMessageId,
     lastInputFromBot: s.quoteTargetSenderIsBot === true,
     scope: s.scope,
+    whiteboardId: s.whiteboardId,
     headless: s.headless,
     title: s.title,
     titleUpdatedAt: s.titleUpdatedAt,
@@ -425,5 +457,6 @@ export function composeRowFromPersistedActive(s: Session, opts?: DashboardRowOpt
     quarantined: !!s.restoreQuarantinedAt,
     tokenUsage: maybeSessionTokenUsage(s, undefined, opts),
     ...buildSessionMessagePreview(s),
+    ...composeSendRoutingFields(s),
   };
 }

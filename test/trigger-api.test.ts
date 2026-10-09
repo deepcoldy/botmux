@@ -545,3 +545,34 @@ describe('queryTriggerResult — legacy ok translation for webhook consumers', (
     expect(res.status).toBe(400);
   });
 });
+
+
+describe('async group communication contract', () => {
+  it.each(['ui', 'webhook'] as const)('allows authorized messages for %s callers and keeps the sentinel', type => {
+    const req = request();
+    req.source = { ...req.source, type, connectorId: 'generic-caller' };
+    req.target = { kind: 'turn', botId: 'app1', sessionId: 'existing' };
+    req.options = { asyncReturnSessionId: true, allowChatMessages: true };
+    expect(validateTriggerRequest(req).ok).toBe(true);
+    const prompt = buildUntrustedEventPrompt(req, 't');
+    expect(prompt).toContain('may call botmux send for messages authorized by the current request');
+    expect(prompt).toContain('BOTMUX_NOTHING_TO_SEND');
+    expect(prompt).not.toContain('Do not call botmux send; do not post');
+    for (const allowChatMessages of [false, undefined]) {
+      req.options.allowChatMessages = allowChatMessages;
+      expect(buildUntrustedEventPrompt(req, 't')).toContain('Do not call botmux send; do not post');
+    }
+  });
+  it('rejects invalid opt-in shapes', () => {
+    for (const changes of [
+      { options: { asyncReturnSessionId: true, allowChatMessages: 'true' } },
+      { options: { waitForFinalOutput: true, allowChatMessages: true } },
+      { options: { asyncReturnSessionId: true, allowChatMessages: true, steer: true } },
+      { target: { kind: 'turn', chatId: 'oc_real' } },
+      { source: { type: 'headless', requestId: 'headless' } },
+    ]) {
+      const req = { ...request(), target: { kind: 'turn', sessionId: 's' }, options: { asyncReturnSessionId: true, allowChatMessages: true }, ...changes };
+      expect(validateTriggerRequest(req).ok).toBe(false);
+    }
+  });
+});

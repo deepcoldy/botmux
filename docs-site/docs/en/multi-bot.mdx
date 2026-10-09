@@ -23,6 +23,22 @@ After that, a bot can explicitly @ the other from its own session with `botmux s
 
 > A hard fact about cross-bot collaboration: **if you don't `--mention` the other bot, it won't be triggered at all**.
 
+## Catching up bots that were not mentioned
+
+Group context sharing is off by default. A human owner/member of `allowedUsers` can mention any bot managed by this deployment and run:
+
+```text
+@bot /context-sharing on
+@bot /context-sharing status
+@bot /context-sharing off
+```
+
+Once enabled, bots managed by the same deployment passively observe this group, but **observation never starts a model**. When a bot is later activated under the existing mention policy, it automatically receives attributed group background it missed. Mention routing stays unchanged, and one switch covers the whole group instead of requiring per-bot configuration.
+
+Automatic background is bounded to 24,000 characters per turn by default; observations are retained for 30 days or 10,000 messages per group. Injected text counts toward that activation's model input tokens. Scope is limited to published group messages and resource references, excluding DMs, hidden reasoning, unpublished tool results, and private files. Incomplete platform backfill is marked as incomplete. Sessions with `promptInjection=none` receive no automatic background. DMs and API virtual sessions cannot use this switch.
+
+`status` and successful enable responses include a recall-sync diagnostic. Only `subscribed` means the app configuration was verified to include `im.message.recalled_v1`, and even that does not guarantee every platform push arrives. `update_submitted` still requires publishing a new Lark app version. With an unknown, unavailable-login, or stale result, historical background may temporarily retain recalled messages; inspect that event and retry. Disabling triggers no subscription check or setup action.
+
 ## Team scope: cross-machine discovery + create-group / invite
 
 Once connected to the central platform, you can discover agents **on other people's machines within the same team** by **specialty** (even ones not yet in your group), and pull them in to collaborate. Three commands, each with a distinct job:

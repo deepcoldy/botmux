@@ -86,6 +86,39 @@ export function writePromptContext(sessionId: string, turnId: string, ptyText: s
 }
 
 /**
+ * daemon 侧：投递前正文被改写（共享背景在真正出队时按已覆盖来源做了减法）后，
+ * 把该轮 sidecar 重新按最终 PTY 文本定键，否则 hook 按新文本的 hash/prefix
+ * claim 为空，reminder/sender 随之丢失。精确命中旧指纹就改它；没有旧指纹时按
+ * turnId 定域找到该轮唯一一条也改它。best-effort，不影响主路径。
+ */
+export function rekeyPromptContext(sessionId: string, turnId: string, previousPtyText: string, nextPtyText: string): boolean {
+  try {
+    if (previousPtyText === nextPtyText) return false;
+    const dir = sessionDir(sessionId);
+    if (!existsSync(dir)) return false;
+    const key = turnIdKey(turnId);
+    const exact = join(dir, `${fingerprintPromptText(previousPtyText)}.${key}.json`);
+    const candidates = existsSync(exact) ? [exact]
+      : readdirSync(dir).filter((f) => f.endsWith(`.${key}.json`)).map((f) => join(dir, f));
+    if (candidates.length !== 1) return false;
+    const parsed = JSON.parse(readFileSync(candidates[0], 'utf8'));
+    if (typeof parsed?.envelope !== 'string' || parsed.turnId !== turnId) return false;
+    const next = join(dir, `${fingerprintPromptText(nextPtyText)}.${key}.json`);
+    const tmp = `${next}.tmp-${process.pid}`;
+    writeFileSync(tmp, JSON.stringify({
+      ...parsed,
+      prefix: prefixOf(nextPtyText),
+      fingerprint: fingerprintPromptText(nextPtyText),
+    }) + '\n', { mode: 0o600 });
+    renameSync(tmp, next);
+    if (candidates[0] !== next) unlinkSync(candidates[0]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 宿主侧（daemon）claim/pop：按权威 turnId + fingerprint 精确取该轮的 envelope，
  * **先删文件再返回内容**（原子消费）。沙箱内 hook 经 IPC 调这里，不在沙箱里 unlink。
  *

@@ -74,6 +74,11 @@ const CONSUMERS: Record<string, Rule> = {
     count: 3,
   },
   // ── user surfaces: must render refusal AND residual ──────────────────────
+  'core/dismiss-command.ts::dismissSessionGroup::closeSession': {
+    category: 'user_surface',
+    why: '/dismiss returns refusal/residual details to the command handler and '
+      + 'preserves the group unless closure is known and clean; test/dismiss-command.test.ts covers both.',
+  },
   'core/command-handler.ts::handleCommand::closeSession': {
     category: 'user_surface',
     why: '/close, /lane close, shared-adopt /detach and /disconnect, and same-daemon '
@@ -123,10 +128,10 @@ const CONSUMERS: Record<string, Rule> = {
     count: 2,
   },
   'core/session-manager.ts::resumeSession::closeSession': {
-    category: 'impossible_by_invariant',
-    why: 'Closes only a worker:null daemon-command scratch placeholder occupying '
-      + 'the anchor (isRelayableRealSession is excluded), which has no CLI session '
-      + 'and therefore no remote lineage to leave behind.',
+    category: 'user_surface',
+    why: 'All three calls close only worker:null daemon-command scratch/registration '
+      + 'losers with no remote lineage. A rejected Remote Runner rebuild now rolls '
+      + 'the row back directly, so it cannot recursively wake a second provider.',
     count: 3,
   },
   'core/session-manager.ts::spawnDashboardSession::closeSession': {
