@@ -164,11 +164,28 @@ export async function resolveDocFile(larkAppId: string, input: string): Promise<
     // is how the file token is obtained, so there is no subscription to look an
     // owner up by yet. Resolution runs before any subscription exists (and for
     // documents that never get one), so it uses the bot's own identity.
-    const res = await driveApiCall(larkAppId, {
-      method: 'GET',
-      path: '/open-apis/wiki/v2/spaces/get_node',
-      params: { token: ref.token, obj_type: 'wiki' },
-    });
+    let res: any;
+    try {
+      res = await driveApiCall(larkAppId, {
+        method: 'GET',
+        path: '/open-apis/wiki/v2/spaces/get_node',
+        params: { token: ref.token, obj_type: 'wiki' },
+      });
+    } catch (error) {
+      // get_node 最常见失败是**该 bot 不在这篇知识空间/节点的可读范围**（飞书
+      // code 131006）。不是链接坏了：换一个被授权的 bot、或把当前 bot 加进文档
+      // 协作者即可。把原始 400 吞成通用「无法解析」会让用户无从下手，这里把飞书
+      // code/msg 翻成可操作提示继续抛。
+      const data = (error as any)?.response?.data ?? (error as any)?.data;
+      const code = data?.code ?? (error as any)?.code;
+      if (code === 131006) {
+        throw new Error('当前机器人没有这篇文档的读取权限（飞书 131006）。请换一个被授权的机器人，或在文档里把本机器人加为协作者后再试。');
+      }
+      if (typeof data?.msg === 'string' && data.msg) {
+        throw new Error(`读取 wiki 节点失败（飞书 ${code ?? '?'}）：${data.msg}`);
+      }
+      throw error;
+    }
     const node = res?.data?.node;
     if (!node?.obj_token || !node?.obj_type) {
       throw new Error(`wiki 节点 ${ref.token} 解析失败（缺 obj_token/obj_type）`);
@@ -177,6 +194,36 @@ export async function resolveDocFile(larkAppId: string, input: string): Promise<
   }
 
   return { fileToken: ref.token, fileType: pathKindToFileType(ref.kind) };
+}
+
+/**
+ * 取文档标题（best-effort，给列表/看板显示用）。
+ *
+ * 订阅表主键是 file_token，人眼认不出是哪篇文档；`docTitle` 字段若没人写，列表
+ * 就只能回退显示 token 前 12 位。拿不到一律返回 undefined、**绝不抛**：标题只是
+ * 显示用，不能让取标题失败挡住订阅登记或评论投递。飞书对 token/type 不匹配在
+ * `failed_list` 里给 970005 而非顶层错误，所以这里只认 `metas[0].title`，其它形态
+ * 一律降级 undefined。
+ */
+export async function fetchDocTitle(
+  larkAppId: string,
+  file: ResolvedDocFile,
+): Promise<string | undefined> {
+  try {
+    const res = await driveApiCall(larkAppId, {
+      method: 'POST',
+      path: '/open-apis/drive/v1/metas/batch_query',
+      data: {
+        request_docs: [{ doc_token: file.fileToken, doc_type: file.fileType }],
+      },
+    });
+    if (res?.code !== 0) return undefined;
+    const title = res?.data?.metas?.[0]?.title;
+    return typeof title === 'string' && title.trim() ? title.trim() : undefined;
+  } catch (err) {
+    logger.debug(`[doc-comment] fetchDocTitle failed for ${file.fileToken.slice(0, 12)}: ${err instanceof Error ? err.message : err}`);
+    return undefined;
+  }
 }
 
 // ─── 通用调用：优先 user token，回退 tenant ─────────────────────────────────────
