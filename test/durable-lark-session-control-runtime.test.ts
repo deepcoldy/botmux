@@ -117,8 +117,8 @@ describe('durable Lark session control runtime', () => {
       now: () => now,
     });
     const input = control();
-    expect(runtime.authorizeBeforeAck(input.data)).toBe(true);
-    expect(runtime.authorizeBeforeAck({
+    expect(await runtime.authorizeBeforeAck(input.data)).toBe(true);
+    expect(await runtime.authorizeBeforeAck({
       ...input.data,
       context: { open_message_id: 'om_stale_card' },
     })).toBe(false);
@@ -153,6 +153,35 @@ describe('durable Lark session control runtime', () => {
     expect(runtime.ownedPartitionKeys()).toEqual([
       'lark-session-control:cli_test:session-1',
     ]);
+    await facade.stop();
+    await store.close();
+  });
+
+  it('authorizes on the shared canonical Session when ingress and owner are different Pods', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-control-cross-pod-auth-'));
+    tempDirs.push(dir);
+    const store = new SqliteDurableCoordinationStore(join(dir, 'coordination.db'), { now: () => 10 });
+    const facade = createDurableSessionFacade({ store, ownerId: 'session-owner' });
+    await admitDurableLarkSession({ facade, message: message(), session: session() });
+    const runtime = createDurableLarkSessionControlRuntime({
+      larkAppId: 'cli_test',
+      privateCard: false,
+      store,
+      facade: () => facade,
+      listActiveSessions: () => [],
+      findActiveSession: () => undefined,
+      listPersistedSessions: () => [],
+      getPersistedSession: () => undefined,
+      canOperate: () => true,
+      closeSession: async () => ({ ok: false, error: 'not local' }),
+      resumeSession: async () => ({ ok: false, error: 'not local' }),
+      buildClosedCard: () => 'closed',
+      buildActiveCard: () => 'active',
+      resumeRefusedText: error => error,
+    });
+
+    expect(await runtime.authorizeBeforeAck(control().data)).toBe(true);
+    expect(runtime.ownedPartitionKeys()).toEqual([]);
     await facade.stop();
     await store.close();
   });

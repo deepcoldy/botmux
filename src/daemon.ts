@@ -29340,8 +29340,8 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
               return primaryRuntime.ingress.enqueueControlBeforeAck(input);
             },
-            authorizePrimaryControl: data =>
-              primaryControlRuntime?.authorizeBeforeAck(data) === true,
+            authorizePrimaryControl: async data =>
+              await primaryControlRuntime?.authorizeBeforeAck(data) === true,
           },
         );
         startEventDispatchers.push(() => {

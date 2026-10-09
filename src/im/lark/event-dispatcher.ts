@@ -4027,7 +4027,7 @@ export interface LarkEventDispatcherRuntimeOptions {
     data: unknown;
   }) => Promise<unknown>;
   /** ACK 前的同步权限/生命周期预检；consumer 仍会在副作用前再次验证。 */
-  authorizePrimaryControl?: (data: unknown) => boolean;
+  authorizePrimaryControl?: (data: unknown) => boolean | Promise<boolean>;
 }
 
 interface PrimaryProcessContext {
@@ -5501,16 +5501,32 @@ export function createLarkEventDispatcherRuntime(
       handleVcMeetingPushEventAckSafe(data, larkAppId, handlers, 'meeting_ended', VC_BOT_MEETING_ENDED_EVENT),
     [VC_PARTICIPANT_MEETING_JOINED_EVENT]: (data: any) =>
       handleVcMeetingPushEventAckSafe(data, larkAppId, handlers, 'participant_meeting_joined', VC_PARTICIPANT_MEETING_JOINED_EVENT),
-    'card.action.trigger': (data: any) => {
+    'card.action.trigger': async (data: any) => {
       const actionType = cardActionType(data);
       if (
         runtimeOptions.enqueuePrimary
         && actionType
         && PRIMARY_UNSAFE_SESSION_LIFECYCLE_ACTIONS.has(actionType)
       ) {
+        let authorizedControl = false;
         if (
           runtimeOptions.enqueuePrimaryControl
-          && runtimeOptions.authorizePrimaryControl?.(data) === true
+          && (actionType === 'close' || actionType === 'resume')
+          && data?.action?.value?.visibility !== 'private'
+          && getBot(larkAppId).config.privateCard !== true
+        ) {
+          try {
+            authorizedControl = await runtimeOptions.authorizePrimaryControl?.(data) === true;
+          } catch (error) {
+            logger.warn(
+              `[card-action] durable primary authorization failed closed: app=${larkAppId} `
+              + `action=${actionType} error=${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
+        if (
+          runtimeOptions.enqueuePrimaryControl
+          && authorizedControl
           && (actionType === 'close' || actionType === 'resume')
           && data?.action?.value?.visibility !== 'private'
           && getBot(larkAppId).config.privateCard !== true

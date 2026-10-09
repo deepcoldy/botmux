@@ -44,7 +44,7 @@ export interface DurableLarkSessionControlRuntimeOptions {
 
 export interface DurableLarkSessionControlRuntime {
   ownedPartitionKeys(): string[];
-  authorizeBeforeAck(data: unknown): boolean;
+  authorizeBeforeAck(data: unknown): Promise<boolean>;
   resolve: DurableSessionControlDispatchOptions['resolve'];
 }
 
@@ -76,7 +76,7 @@ export function createDurableLarkSessionControlRuntime(
       durableLarkSessionControlPartition(options.larkAppId, sessionId));
   };
 
-  const authorizeBeforeAck = (raw: unknown): boolean => {
+  const authorizeBeforeAck = async (raw: unknown): Promise<boolean> => {
     const data = record(raw);
     const action = record(data?.action);
     const value = record(action?.value);
@@ -84,16 +84,21 @@ export function createDurableLarkSessionControlRuntime(
     const context = record(data?.context);
     const actionType = value?.action;
     const sessionId = value?.session_id;
+    const rootId = value?.root_id;
     const operatorOpenId = operator?.open_id;
     const cardMessageId = context?.open_message_id ?? data?.open_message_id;
     if ((actionType !== 'close' && actionType !== 'resume')
         || typeof sessionId !== 'string'
+        || typeof rootId !== 'string'
         || typeof operatorOpenId !== 'string'
         || typeof cardMessageId !== 'string'
         || options.privateCard
         || value?.visibility === 'private') return false;
-    const session = options.getPersistedSession(sessionId);
+    const canonical = await options.store.readSession(sessionKey(rootId, options.larkAppId));
+    if (!canonical) return false;
+    const session = parseDurablePrimarySessionRecord(canonical).session;
     if (!session || session.larkAppId !== options.larkAppId
+        || session.sessionId !== sessionId
         || session.streamCardId !== cardMessageId
         || (actionType === 'close' && session.status !== 'active')
         || (actionType === 'resume' && session.status !== 'closed')) return false;
