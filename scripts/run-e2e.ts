@@ -42,6 +42,7 @@ try {
 
 let mockServer: import('../test/helpers/mock-llm-server/index.js').MockLlmServer | null = null;
 const useMockLlm = process.argv.includes('--mock-llm') || process.env.BOTMUX_MOCK_LLM === 'true' || process.env.BOTMUX_MOCK_LLM === '1';
+let mockServerBaseUrl: string | null = null;
 
 if (useMockLlm) {
   const { MockLlmServer } = await import('../test/helpers/mock-llm-server/index.js');
@@ -49,11 +50,37 @@ if (useMockLlm) {
   const mode = (process.env.MOCK_LLM_MODE ?? 'synthetic') as any;
   mockServer = new MockLlmServer({ port, mode, verbose: true });
   const { baseUrl } = await mockServer.start();
+  mockServerBaseUrl = baseUrl;
   console.log(`[run-e2e] Mock LLM Server started at ${baseUrl} (mode=${mode})`);
   process.env.ANTHROPIC_BASE_URL = baseUrl;
-  process.env.ANTHROPIC_API_KEY = 'mock-key';
+  process.env.ANTHROPIC_AUTH_TOKEN = 'mock-test-key';
+  process.env.ANTHROPIC_API_KEY = 'mock-test-key';
+  process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
   process.env.OPENAI_BASE_URL = `${baseUrl}/v1`;
-  process.env.OPENAI_API_KEY = 'mock-key';
+  process.env.OPENAI_API_KEY = 'mock-test-key';
+
+  const { homedir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { readFileSync, writeFileSync, mkdirSync } = await import('node:fs');
+  const claudeSettingsDir = join(homedir(), '.claude');
+  const claudeSettingsPath = join(claudeSettingsDir, 'settings.json');
+  try {
+    mkdirSync(claudeSettingsDir, { recursive: true });
+    let settings: Record<string, any> = {};
+    if (existsSync(claudeSettingsPath)) {
+      try { settings = JSON.parse(readFileSync(claudeSettingsPath, 'utf8')); } catch {}
+    }
+    settings.skipDangerousModePermissionPrompt = true;
+    settings.permissions = { defaultMode: 'bypassPermissions' };
+    settings.env = {
+      ...(settings.env || {}),
+      ANTHROPIC_BASE_URL: baseUrl,
+      ANTHROPIC_AUTH_TOKEN: 'mock-test-key',
+      ANTHROPIC_API_KEY: 'mock-test-key',
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    };
+    writeFileSync(claudeSettingsPath, JSON.stringify(settings, null, 2), 'utf8');
+  } catch {}
 }
 
 const daemonChildren: import('node:child_process').ChildProcess[] = [];
@@ -87,6 +114,20 @@ if (startDaemon) {
           if (b.p2pMode !== 'thread') {
             b.p2pMode = 'thread';
             changed = true;
+          }
+          if (useMockLlm && mockServerBaseUrl) {
+            b.env = b.env || {};
+            if (b.cliId === 'claude-code' || b.cliId === 'claude' || b.cliId === 'aiden') {
+              b.env.ANTHROPIC_BASE_URL = mockServerBaseUrl;
+              b.env.ANTHROPIC_AUTH_TOKEN = 'mock-test-key';
+              b.env.ANTHROPIC_API_KEY = 'mock-test-key';
+              b.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
+              changed = true;
+            } else if (b.cliId === 'codex' || b.cliId === 'coco' || b.cliId === 'opencode') {
+              b.env.OPENAI_BASE_URL = `${mockServerBaseUrl}/v1`;
+              b.env.OPENAI_API_KEY = 'mock-test-key';
+              changed = true;
+            }
           }
         }
         if (changed) {

@@ -295,13 +295,17 @@ export async function waitForCardStatus(
 
 export async function waitForIdleOrCodexUsageLimit(
   agent: PlaywrightAgent,
-  opts?: { timeoutMs?: number },
+  opts?: { timeoutMs?: number; marker?: string },
 ): Promise<'idle' | 'codex-usage-limit'> {
+  const markerClause = opts?.marker
+    ? `要么当前测试话题已经收到来自 Codex 的回复文本气泡（包含"${opts.marker}"），`
+    : '要么当前测试话题已经收到来自 Codex 的回复文本气泡，';
   await agent.aiWaitFor(
     '主内容区正在显示的测试话题最底部，当前 Codex 会话已经进入可验证的结束态：' +
-      '要么最新流式卡片标题包含"等待输入"，要么最新 Codex 回复或卡片正文明确包含 usage limit、rate limit、Approaching rate limits、Switch to gpt-5.4-mini 或 lower credit usage 这类额度/限流/模型切换提示；' +
+      `要么最新流式卡片标题包含"等待输入"，${markerClause}` +
+      '要么最新 Codex 回复或卡片正文明确包含 usage limit、rate limit、Approaching rate limits、Switch to gpt-5.4-mini 或 lower credit usage 这类额度/限流/模型切换提示；' +
       '不要把左侧话题列表预览或历史旧话题当作当前会话结果',
-    { timeoutMs: opts?.timeoutMs ?? 120_000, checkIntervalMs: 5_000 },
+    { timeoutMs: opts?.timeoutMs ?? 180_000, checkIntervalMs: 5_000 },
   );
 
   const isUsageLimited = await agent.aiBoolean(

@@ -89,18 +89,19 @@ export function createBotTest(botName: BotName, opts?: BotTestOptions): void {
         await clickDirectStartIfPresent(agent, page);
       }
 
+      const marker = expectedReplyMarker(msg);
       // Wait for card to reach idle, or for Codex to return a quota/rate-limit response.
       await scrollThreadToBottom(agent);
       const outcome = opts?.allowCodexUsageLimitResponse
-        ? await waitForIdleOrCodexUsageLimit(agent, { timeoutMs: 180_000 })
+        ? await waitForIdleOrCodexUsageLimit(agent, { timeoutMs: 180_000, marker })
         : 'idle';
       if (outcome === 'idle') {
         await waitForCardStatus(agent, '等待输入', { timeoutMs: 120_000 });
       }
 
-      if (outcome === 'codex-usage-limit') {
+      if (opts?.allowCodexUsageLimitResponse) {
         await scrollThreadToBottom(agent);
-        await waitForCodexSideResponse(agent, { timeoutMs: 60_000 });
+        await waitForCodexSideResponse(agent, { marker, timeoutMs: 60_000 });
         return;
       }
 
