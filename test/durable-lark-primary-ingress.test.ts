@@ -222,6 +222,37 @@ describe('durable Lark primary ingress', () => {
     await ingress.stop();
   });
 
+  it('persists stable close/resume interactions in the isolated session-control lane', async () => {
+    const store = fakeStore();
+    const ingress = startDurableLarkPrimaryIngress({
+      store,
+      larkAppId: 'cli_test',
+      ownerId: 'ingress-boot-1',
+      electionIntervalMs: 60_000,
+      now: () => 10,
+    });
+    await ingress.ready;
+
+    const data = {
+      event_id: 'evt_close_1',
+      action: { value: { action: 'close', session_id: 'session-1', root_id: 'om_root' } },
+      operator: { open_id: 'ou_operator' },
+      context: { open_message_id: 'om_card' },
+    };
+    await expect(ingress.enqueueControlBeforeAck({
+      eventId: 'card.action.trigger:cli_test:evt_close_1',
+      partitionKey: 'lark-session-control:cli_test:session-1',
+      data,
+    })).resolves.toEqual({ kind: 'inserted' });
+    expect(store.enqueueInbox).toHaveBeenCalledWith(expect.objectContaining({
+      eventId: 'card.action.trigger:cli_test:evt_close_1',
+      lane: 'session-control',
+      partitionKey: 'lark-session-control:cli_test:session-1',
+      payload: expect.objectContaining({ type: 'botmux.lark.session-control' }),
+    }));
+    await ingress.stop();
+  });
+
   it('keeps a timed-out enqueue in the partition tail so the next event cannot overtake it', async () => {
     const store = fakeStore();
     const first = deferred<DurableInsertResult>();

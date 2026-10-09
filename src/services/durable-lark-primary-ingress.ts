@@ -10,6 +10,7 @@ import {
   durableLarkMessageEvent,
   type DurableLarkMessageEventType,
 } from './durable-inbox-shadow.js';
+import { durableLarkSessionControlEvent } from './durable-lark-session-control.js';
 
 export type DurableLarkPrimaryIngressStore = DurableInboxStore & DurableSessionLeaseStore;
 
@@ -37,6 +38,11 @@ export interface DurableLarkPrimaryIngress {
   enqueueBeforeAck(input: {
     eventId: string;
     eventType?: DurableLarkMessageEventType;
+    partitionKey: string;
+    data: unknown;
+  }): Promise<Exclude<DurableInsertResult, { kind: 'conflict' }>>;
+  enqueueControlBeforeAck(input: {
+    eventId: string;
     partitionKey: string;
     data: unknown;
   }): Promise<Exclude<DurableInsertResult, { kind: 'conflict' }>>;
@@ -279,13 +285,45 @@ export function startDurableLarkPrimaryIngress(
 
   const ready = tickElection().finally(installElectionTimer);
 
-  const enqueueBeforeAck: DurableLarkPrimaryIngress['enqueueBeforeAck'] = input => {
+  const enqueueEventBeforeAck = (
+    event: ReturnType<typeof durableLarkMessageEvent>,
+    partitionKey: string,
+  ): Promise<Exclude<DurableInsertResult, { kind: 'conflict' }>> => {
     if (stopped || !leadershipIsFresh()) {
       if (lease && !stopped) clearLeadership(new Error('durable Lark ingress leadership proof expired'));
       return Promise.reject(new DurableLarkIngressNotLeaderError('this process is not the current Lark ingress leader'));
     }
     const controller = leadershipController!;
     const expectedEpoch = lease!.epoch;
+    const previous = partitionTails.get(partitionKey) ?? Promise.resolve();
+    const operation = previous.catch(() => undefined).then(async () => {
+      if (stopped || controller.signal.aborted || leadershipController !== controller
+          || lease?.epoch !== expectedEpoch || !leadershipIsFresh()) {
+        throw new DurableLarkIngressNotLeaderError('Lark ingress leadership changed before enqueue');
+      }
+      const result = await options.store.enqueueInbox(event);
+      if (result.kind === 'conflict') {
+        throw new Error(`durable Lark ingress conflicting duplicate ${event.eventId}`);
+      }
+      return result;
+    });
+    const tail = operation.then(() => undefined, error => {
+      if (leadershipController === controller) clearLeadership(error);
+      reportError(error);
+    });
+    partitionTails.set(partitionKey, tail);
+    void tail.finally(() => {
+      if (partitionTails.get(partitionKey) === tail) partitionTails.delete(partitionKey);
+    });
+
+    return waitWithTimeout(
+      operation,
+      ackTimeoutMs,
+      new DurableLarkIngressAckTimeoutError(`durable Lark ingress enqueue exceeded ${ackTimeoutMs}ms`),
+    );
+  };
+
+  const enqueueBeforeAck: DurableLarkPrimaryIngress['enqueueBeforeAck'] = input => {
     let event: ReturnType<typeof durableLarkMessageEvent>;
     let partitionKey: string;
     try {
@@ -324,33 +362,31 @@ export function startDurableLarkPrimaryIngress(
     } catch (error) {
       return Promise.reject(error);
     }
+    return enqueueEventBeforeAck(event, partitionKey);
+  };
 
-    const previous = partitionTails.get(partitionKey) ?? Promise.resolve();
-    const operation = previous.catch(() => undefined).then(async () => {
-      if (stopped || controller.signal.aborted || leadershipController !== controller
-          || lease?.epoch !== expectedEpoch || !leadershipIsFresh()) {
-        throw new DurableLarkIngressNotLeaderError('Lark ingress leadership changed before enqueue');
+  const enqueueControlBeforeAck: DurableLarkPrimaryIngress['enqueueControlBeforeAck'] = input => {
+    let event: ReturnType<typeof durableLarkSessionControlEvent>;
+    let partitionKey: string;
+    try {
+      partitionKey = boundedIdentity(input.partitionKey, 'partitionKey', 1_024);
+      const wallNow = now();
+      if (!Number.isSafeInteger(wallNow) || wallNow < 0) {
+        throw new Error('durable Lark ingress clock is invalid');
       }
-      const result = await options.store.enqueueInbox(event);
-      if (result.kind === 'conflict') {
-        throw new Error(`durable Lark ingress conflicting duplicate ${event.eventId}`);
-      }
-      return result;
-    });
-    const tail = operation.then(() => undefined, error => {
-      if (leadershipController === controller) clearLeadership(error);
-      reportError(error);
-    });
-    partitionTails.set(partitionKey, tail);
-    void tail.finally(() => {
-      if (partitionTails.get(partitionKey) === tail) partitionTails.delete(partitionKey);
-    });
-
-    return waitWithTimeout(
-      operation,
-      ackTimeoutMs,
-      new DurableLarkIngressAckTimeoutError(`durable Lark ingress enqueue exceeded ${ackTimeoutMs}ms`),
-    );
+      const createdAt = Math.max(wallNow, lastCreatedAt + 1);
+      event = durableLarkSessionControlEvent({
+        larkAppId,
+        eventId: boundedIdentity(input.eventId, 'eventId', 1_024),
+        partitionKey,
+        data: input.data,
+        now: createdAt,
+      });
+      lastCreatedAt = createdAt;
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return enqueueEventBeforeAck(event, partitionKey);
   };
 
   const terminate = (): void => {
@@ -365,6 +401,7 @@ export function startDurableLarkPrimaryIngress(
     leaseKey,
     ready,
     enqueueBeforeAck,
+    enqueueControlBeforeAck,
     status: () => stopped
       ? { kind: 'stopped' }
       : leadershipIsFresh() && lease

@@ -1332,6 +1332,49 @@ describe('Lark event dispatcher — durable primary processor', () => {
     },
   );
 
+  it.each(['close', 'resume'] as const)(
+    'persists a stable %s interaction before ACK when a control consumer is wired',
+    async action => {
+      setupBotState({ allowedUsers: [USER_OPEN_ID] });
+      const handlers = makeHandlers();
+      const enqueuePrimary = vi.fn(async () => ({ kind: 'inserted' as const }));
+      const enqueuePrimaryControl = vi.fn(async () => ({ kind: 'inserted' as const }));
+      const runtime = createLarkEventDispatcherRuntime(
+        MY_APP_ID,
+        'secret',
+        handlers,
+        'feishu',
+        undefined,
+        { enqueuePrimary, enqueuePrimaryControl },
+      );
+      runtime.connect();
+
+      const data = {
+        event_id: `evt_${action}_1`,
+        action: {
+          value: {
+            action,
+            session_id: 'session-primary',
+            root_id: 'om_primary_root',
+          },
+        },
+        operator: { open_id: USER_OPEN_ID },
+        context: { open_message_id: 'om_primary_lifecycle' },
+      };
+      const result = await capturedHandlers['card.action.trigger'](data);
+
+      expect(result).toMatchObject({ toast: { type: 'info' } });
+      expect(enqueuePrimaryControl).toHaveBeenCalledWith({
+        eventId: `card.action.trigger:${MY_APP_ID}:evt_${action}_1`,
+        partitionKey: `lark-session-control:${MY_APP_ID}:session-primary`,
+        data,
+      });
+      expect(handlers.handleCardAction).not.toHaveBeenCalled();
+      expect(enqueuePrimary).not.toHaveBeenCalled();
+      runtime.close();
+    },
+  );
+
   it('keeps read-only card actions available in durable primary mode', async () => {
     setupBotState({ allowedUsers: [USER_OPEN_ID] });
     const handlers = makeHandlers();

@@ -98,6 +98,10 @@ import type {
   DurableInboxPrimaryDispatchContext,
 } from '../../services/durable-inbox-primary-consumer.js';
 import type { DurableLarkCanonicalHandlerResult } from '../../services/durable-lark-canonical-dispatch.js';
+import {
+  durableLarkSessionControlEventId,
+  durableLarkSessionControlPartition,
+} from '../../services/durable-lark-session-control.js';
 
 // 大厅回执互教的防环闸：每进程对同一打卡者只回一次（见 hall swallow 分支）。
 const hallEchoReplied = new Set<string>();
@@ -4017,6 +4021,11 @@ export interface LarkEventDispatcherRuntimeOptions {
     partitionKey: string;
     data: unknown;
   }) => Promise<unknown>;
+  enqueuePrimaryControl?: (input: {
+    eventId: string;
+    partitionKey: string;
+    data: unknown;
+  }) => Promise<unknown>;
 }
 
 interface PrimaryProcessContext {
@@ -5497,6 +5506,50 @@ export function createLarkEventDispatcherRuntime(
         && actionType
         && PRIMARY_UNSAFE_SESSION_LIFECYCLE_ACTIONS.has(actionType)
       ) {
+        if (
+          runtimeOptions.enqueuePrimaryControl
+          && (actionType === 'close' || actionType === 'resume')
+        ) {
+          try {
+            const stableEventId = eventIdForKey(data);
+            const sessionId = data?.action?.value?.session_id;
+            if (typeof stableEventId !== 'string' || !stableEventId.trim()
+                || typeof sessionId !== 'string' || !sessionId.trim()) {
+              throw new Error('stable card interaction/session identity is missing');
+            }
+            const eventId = durableLarkSessionControlEventId(larkAppId, stableEventId);
+            const partitionKey = durableLarkSessionControlPartition(larkAppId, sessionId);
+            return runtimeOptions.enqueuePrimaryControl({ eventId, partitionKey, data }).then(
+              () => ({
+                toast: {
+                  type: 'info',
+                  content: t('toast.action_received_bg', undefined, localeForBot(larkAppId)),
+                },
+              }),
+              error => {
+                logger.error(
+                  `[card-action] durable primary control enqueue failed: app=${larkAppId} `
+                  + `action=${actionType} error=${error instanceof Error ? error.message : String(error)}`,
+                );
+                return {
+                  toast: {
+                    type: 'warning',
+                    content: t(
+                      'card.action.primary_lifecycle_unavailable',
+                      undefined,
+                      localeForBot(larkAppId),
+                    ),
+                  },
+                };
+              },
+            );
+          } catch (error) {
+            logger.warn(
+              `[card-action] durable primary rejected invalid session control: app=${larkAppId} `
+              + `action=${actionType} error=${error instanceof Error ? error.message : String(error)}`,
+            );
+          }
+        }
         logger.warn(
           `[card-action] durable primary rejected unfenced session lifecycle action: `
           + `app=${larkAppId} action=${actionType}`,
