@@ -42,6 +42,37 @@ describe('chat tabs API', () => {
     });
   });
 
+  it('selects the created URL tab when Feishu returns the complete tab list', async () => {
+    chatTab.listTabs.mockResolvedValue({
+      code: 0,
+      data: { chat_tabs: [{ tab_id: 'msg', tab_type: 'message' }] },
+    });
+    chatTab.create.mockResolvedValue({
+      code: 0,
+      data: {
+        chat_tabs: [
+          { tab_id: 'msg', tab_type: 'message', tab_content: {} },
+          {
+            tab_id: 'tab-url',
+            tab_name: 'Agent Desk',
+            tab_type: 'url',
+            tab_content: { url: 'https://example.com/tasks/task-one?tab=workspace' },
+          },
+        ],
+      },
+    });
+
+    await expect(ensureUrlChatTab(
+      'app',
+      'chat',
+      'https://example.com/tasks/task-one?tab=workspace',
+      'Agent Desk',
+    )).resolves.toMatchObject({
+      created: true,
+      tab: { tab_id: 'tab-url', tab_type: 'url' },
+    });
+  });
+
   it('idempotently reuses an existing URL tab and refreshes its name', async () => {
     const existing = {
       tab_id: 'tab-page', tab_name: '发布页', tab_type: 'url',
