@@ -71,6 +71,7 @@ describe('durable inbox shadow consumer', () => {
     expect(observed).toHaveBeenCalledTimes(2);
     expect(store.claimNextInbox).toHaveBeenLastCalledWith({
       workerId: 'shadow-worker',
+      lane: 'lark-message',
       leaseDurationMs: 60_000,
     });
     await consumer.stop();

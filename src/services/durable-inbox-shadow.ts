@@ -1,9 +1,10 @@
-import type {
-  InboxClaim,
-  DurableInboxEvent,
-  DurableInboxStore,
-  DurableInsertResult,
-  DurableJson,
+import {
+  DURABLE_INBOX_LANE_LARK_MESSAGE,
+  type InboxClaim,
+  type DurableInboxEvent,
+  type DurableInboxStore,
+  type DurableInsertResult,
+  type DurableJson,
 } from './durable-coordination.js';
 
 export type DurableLarkMessageEventType =
@@ -60,7 +61,9 @@ export function parseDurableLarkMessageClaim(claim: InboxClaim): DurableLarkMess
   const eventType = payload?.type;
   const larkAppId = payload?.larkAppId;
   const messageId = message?.message_id;
-  if (payload?.version !== 1
+  if ((claim.event.lane !== undefined
+      && claim.event.lane !== DURABLE_INBOX_LANE_LARK_MESSAGE)
+      || payload?.version !== 1
       || (eventType !== 'lark.im.message.receive_v1'
         && eventType !== 'lark.im.message.updated_v1')
       || typeof larkAppId !== 'string'
@@ -121,6 +124,7 @@ export function durableLarkMessageEvent(input: {
   };
   return {
     eventId: input.eventId,
+    lane: DURABLE_INBOX_LANE_LARK_MESSAGE,
     partitionKey: input.partitionKey,
     payload: payload as unknown as DurableJson,
     visibleAt: now,

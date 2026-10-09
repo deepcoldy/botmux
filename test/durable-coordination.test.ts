@@ -2,7 +2,12 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { SessionLease } from '../src/services/durable-coordination.js';
+import {
+  DURABLE_COORDINATION_CONTRACT_VERSION,
+  DURABLE_INBOX_LANE_LARK_MESSAGE,
+  DURABLE_INBOX_LANE_SESSION_CONTROL,
+  type SessionLease,
+} from '../src/services/durable-coordination.js';
 import { SqliteDurableCoordinationStore } from '../src/services/sqlite-durable-coordination.js';
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 
@@ -25,6 +30,10 @@ afterEach(() => {
 });
 
 describe('SQLite durable coordination contract', () => {
+  it('pins the lane-aware coordination contract version', () => {
+    expect(DURABLE_COORDINATION_CONTRACT_VERSION).toBe(2);
+  });
+
   it('uses monotonic session epochs and fences stale state writers', async () => {
     let now = 100;
     const store = makeStore(() => now);
@@ -143,6 +152,47 @@ describe('SQLite durable coordination contract', () => {
     await store.close();
   });
 
+  it('isolates inbox lanes and lets an owner claim only its local partitions', async () => {
+    const store = makeStore(() => 10);
+    await store.enqueueInbox({
+      eventId: 'message-a', lane: DURABLE_INBOX_LANE_LARK_MESSAGE,
+      partitionKey: 'session-a', payload: { type: 'message' }, visibleAt: 0, createdAt: 1,
+    });
+    await store.enqueueInbox({
+      eventId: 'control-a', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKey: 'session-a', payload: { action: 'close' }, visibleAt: 0, createdAt: 2,
+    });
+    await store.enqueueInbox({
+      eventId: 'control-b', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKey: 'session-b', payload: { action: 'resume' }, visibleAt: 0, createdAt: 3,
+    });
+
+    expect(await store.claimNextInbox({
+      workerId: 'control-none', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKeys: [], leaseDurationMs: 20,
+    })).toBeUndefined();
+    const message = await store.claimNextInbox({
+      workerId: 'message-worker', lane: DURABLE_INBOX_LANE_LARK_MESSAGE,
+      leaseDurationMs: 20,
+    });
+    expect(message).toMatchObject({
+      event: { eventId: 'message-a', lane: DURABLE_INBOX_LANE_LARK_MESSAGE },
+    });
+    const controlB = await store.claimNextInbox({
+      workerId: 'owner-b', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKeys: ['session-b'], leaseDurationMs: 20,
+    });
+    expect(controlB).toMatchObject({
+      event: { eventId: 'control-b', lane: DURABLE_INBOX_LANE_SESSION_CONTROL },
+    });
+    const controlA = await store.claimNextInbox({
+      workerId: 'owner-a', lane: DURABLE_INBOX_LANE_SESSION_CONTROL,
+      partitionKeys: ['session-a', 'session-a'], leaseDurationMs: 20,
+    });
+    expect(controlA).toMatchObject({ event: { eventId: 'control-a' } });
+    await store.close();
+  });
+
   it('orders one partition by store insertion sequence instead of client timestamps or ids', async () => {
     let now = 10;
     const store = makeStore(() => now);
@@ -165,7 +215,7 @@ describe('SQLite durable coordination contract', () => {
     await store.close();
   });
 
-  it('backfills deterministic inbox and outbox sequence rows when reopening a version-1 store', async () => {
+  it('backfills deterministic inbox and outbox sequence rows when order tables are missing', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'botmux-durable-sequence-migration-'));
     tempDirs.push(dir);
     const path = join(dir, 'coordination.db');
@@ -204,6 +254,37 @@ describe('SQLite durable coordination contract', () => {
     expect(claim?.event.eventId).toBe('legacy-a');
     const reservation = await reopened.reserveNextOutbox({ workerId: 'sender-a', leaseDurationMs: 20 });
     expect(reservation?.record.messageId).toBe('legacy-outbox-a');
+    await reopened.close();
+  });
+
+  it('upgrades version 1 inbox rows into the default Lark message lane', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'botmux-durable-lane-migration-'));
+    tempDirs.push(dir);
+    const path = join(dir, 'coordination.db');
+    const first = new SqliteDurableCoordinationStore(path, { now: () => 10 });
+    await first.enqueueInbox({
+      eventId: 'legacy-message', partitionKey: 'chat-a', payload: {}, visibleAt: 0, createdAt: 1,
+    });
+    await first.close();
+
+    const raw = openDatabaseSyncOrThrow(path);
+    raw.exec('DROP INDEX durable_inbox_lane_claim_idx;');
+    raw.exec('DROP INDEX durable_inbox_lane_partition_claim_idx;');
+    raw.exec('ALTER TABLE durable_inbox DROP COLUMN lane;');
+    raw.prepare(
+      'UPDATE durable_coordination_meta SET schema_version = 1 WHERE singleton = 1',
+    ).run();
+    raw.close();
+
+    const reopened = new SqliteDurableCoordinationStore(path, { now: () => 10 });
+    const claim = await reopened.claimNextInbox({
+      workerId: 'message-worker',
+      lane: DURABLE_INBOX_LANE_LARK_MESSAGE,
+      leaseDurationMs: 20,
+    });
+    expect(claim).toMatchObject({
+      event: { eventId: 'legacy-message', lane: DURABLE_INBOX_LANE_LARK_MESSAGE },
+    });
     await reopened.close();
   });
 

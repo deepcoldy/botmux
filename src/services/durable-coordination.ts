@@ -8,7 +8,9 @@
  * 使用注入时钟，远程数据库实现应在事务内使用数据库时间，不能信任不同 worker 的墙钟。
  */
 
-export const DURABLE_COORDINATION_CONTRACT_VERSION = 1 as const;
+export const DURABLE_COORDINATION_CONTRACT_VERSION = 2 as const;
+export const DURABLE_INBOX_LANE_LARK_MESSAGE = 'lark-message' as const;
+export const DURABLE_INBOX_LANE_SESSION_CONTROL = 'session-control' as const;
 
 export type DurableJson =
   | null
@@ -73,6 +75,8 @@ export type WriteSessionResult =
 export interface DurableInboxEvent {
   /** 平台稳定事件键；同键不同 payload 必须返回 conflict。 */
   eventId: string;
+  /** 隔离不同消费者；同一 lane 内才参与 claim 和 partition FIFO。 */
+  lane?: string;
   /** 保序分区。它可以是原始 ingress lane，不要求已经解析出逻辑 session。 */
   partitionKey: string;
   payload: DurableJson;
@@ -90,6 +94,9 @@ export interface InboxClaim {
 
 export interface ClaimInboxInput {
   workerId: string;
+  lane?: string;
+  /** 只 claim 当前 worker 可执行的分区；空数组表示没有可 claim 的 owner。 */
+  partitionKeys?: string[];
   leaseDurationMs: number;
 }
 
@@ -184,8 +191,9 @@ export type BeginOutboxAttemptResult =
 
 /**
  * 合同刻意把 inbox claim 与 session lease 分开：inbox 的 partitionKey 保护原始
- * ingress 顺序，SessionLease 则保护解析后的逻辑 session 状态与输出。实现可以把两者
- * 放在同一数据库中，但调用方不能把 inbox claim 当作 session fencing token。
+ * ingress 顺序，lane 隔离消息入口与 owner-routed control 等消费者，SessionLease 则保护
+ * 解析后的逻辑 session 状态与输出。实现可以把它们放在同一数据库中，但调用方不能把
+ * inbox claim 当作 session fencing token；control consumer 仍需单独验证 SessionLease。
  */
 export interface DurableSessionLeaseStore {
   acquireSessionLease(input: AcquireSessionLeaseInput): Promise<SessionLeaseAcquisition>;

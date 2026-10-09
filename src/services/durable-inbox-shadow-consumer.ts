@@ -1,4 +1,8 @@
-import type { DurableInboxStore, InboxClaim } from './durable-coordination.js';
+import {
+  DURABLE_INBOX_LANE_LARK_MESSAGE,
+  type DurableInboxStore,
+  type InboxClaim,
+} from './durable-coordination.js';
 import {
   observeDurableLarkMessageClaim,
   type DurableLarkMessageObservation,
@@ -61,7 +65,11 @@ export function startDurableInboxShadowConsumer(
 
   const drain = async (): Promise<void> => {
     for (let index = 0; index < batchSize && !stopped; index++) {
-      const claim = await options.store.claimNextInbox({ workerId, leaseDurationMs });
+      const claim = await options.store.claimNextInbox({
+        workerId,
+        lane: DURABLE_INBOX_LANE_LARK_MESSAGE,
+        leaseDurationMs,
+      });
       if (!claim) return;
       if (claim.workerId !== workerId) {
         throw new Error(`durable inbox provider returned a claim owned by ${claim.workerId}`);

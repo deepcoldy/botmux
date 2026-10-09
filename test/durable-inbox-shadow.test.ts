@@ -24,6 +24,7 @@ describe('durable Lark inbox shadow', () => {
       now: 1234,
     })).toEqual({
       eventId: 'im.message.receive_v1:cli_1:om_1',
+      lane: 'lark-message',
       partitionKey: 'lark-message-routing:cli_1:oc_1',
       payload: {
         version: 1,
@@ -121,5 +122,22 @@ describe('durable Lark inbox shadow', () => {
       claimUntil: 100,
       attempts: 1,
     })).toThrow(/mismatched message identity/);
+  });
+
+  it('rejects a control-lane claim before exposing it to the message router', () => {
+    const event = durableLarkMessageEvent({
+      larkAppId: 'cli_1',
+      eventId: 'im.message.receive_v1:cli_1:om_1',
+      partitionKey: 'lark-message-routing:cli_1:oc_1',
+      data: { message: { message_id: 'om_1' } },
+      now: 10,
+    });
+    expect(() => observeDurableLarkMessageClaim({
+      event: { ...event, lane: 'session-control' },
+      workerId: 'worker-1',
+      claimEpoch: 1,
+      claimUntil: 100,
+      attempts: 1,
+    })).toThrow(/invalid shadow envelope/);
   });
 });

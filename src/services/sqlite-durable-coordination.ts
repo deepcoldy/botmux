@@ -33,8 +33,9 @@ import type {
   WriteSessionInput,
   WriteSessionResult,
 } from './durable-coordination.js';
+import { DURABLE_INBOX_LANE_LARK_MESSAGE } from './durable-coordination.js';
 
-export const SQLITE_DURABLE_COORDINATION_SCHEMA_VERSION = 1;
+export const SQLITE_DURABLE_COORDINATION_SCHEMA_VERSION = 2;
 
 export interface SqliteDurableCoordinationOptions {
   /** 测试 seam；生产默认使用当前进程时钟。 */
@@ -64,6 +65,7 @@ CREATE TABLE IF NOT EXISTS durable_sessions (
 
 CREATE TABLE IF NOT EXISTS durable_inbox (
   event_id TEXT PRIMARY KEY,
+  lane TEXT NOT NULL DEFAULT 'lark-message',
   partition_key TEXT NOT NULL,
   payload_json TEXT NOT NULL,
   payload_hash TEXT NOT NULL,
@@ -133,6 +135,7 @@ type SessionRow = {
 
 type InboxRow = {
   event_id: string;
+  lane: string;
   partition_key: string;
   payload_json: string;
   visible_at: number;
@@ -218,6 +221,7 @@ function inboxClaim(row: InboxRow): InboxClaim {
   return {
     event: {
       eventId: row.event_id,
+      lane: row.lane,
       partitionKey: row.partition_key,
       payload: parseJson(row.payload_json),
       visibleAt: Number(row.visible_at),
@@ -266,13 +270,30 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
     const existing = this.db.prepare(
       'SELECT schema_version FROM durable_coordination_meta WHERE singleton = 1',
     ).get() as { schema_version: number } | undefined;
-    if (existing && Number(existing.schema_version) !== SQLITE_DURABLE_COORDINATION_SCHEMA_VERSION) {
+    if (existing && Number(existing.schema_version) === 1) {
+      this.transaction(() => {
+        this.db.exec(
+          "ALTER TABLE durable_inbox ADD COLUMN lane TEXT NOT NULL DEFAULT 'lark-message';",
+        );
+        this.db.prepare(
+          'UPDATE durable_coordination_meta SET schema_version = ? WHERE singleton = 1',
+        ).run(SQLITE_DURABLE_COORDINATION_SCHEMA_VERSION);
+      });
+    } else if (existing && Number(existing.schema_version) !== SQLITE_DURABLE_COORDINATION_SCHEMA_VERSION) {
       throw new Error(`unsupported durable coordination schema version ${existing.schema_version}`);
     }
     this.db.prepare(
       'INSERT INTO durable_coordination_meta(singleton, schema_version) VALUES(1, ?) '
       + 'ON CONFLICT(singleton) DO NOTHING',
     ).run(SQLITE_DURABLE_COORDINATION_SCHEMA_VERSION);
+    this.db.exec(
+      'CREATE INDEX IF NOT EXISTS durable_inbox_lane_claim_idx '
+      + 'ON durable_inbox(lane, state, visible_at, created_at, event_id);',
+    );
+    this.db.exec(
+      'CREATE INDEX IF NOT EXISTS durable_inbox_lane_partition_claim_idx '
+      + 'ON durable_inbox(lane, partition_key, state, claim_until);',
+    );
   }
 
   private transaction<T>(operation: () => T): T {
@@ -403,17 +424,19 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
 
   async enqueueInbox(event: DurableInboxEvent): Promise<DurableInsertResult> {
     nonempty(event.eventId, 'eventId');
+    const lane = nonempty(event.lane ?? DURABLE_INBOX_LANE_LARK_MESSAGE, 'lane');
     nonempty(event.partitionKey, 'partitionKey');
     timestamp(event.visibleAt, 'visibleAt');
     timestamp(event.createdAt, 'createdAt');
     const payload = encoded(event.payload);
     return this.transaction(() => {
       const inserted = this.db.prepare(
-        'INSERT INTO durable_inbox(event_id, partition_key, payload_json, payload_hash, state, '
-        + 'visible_at, created_at, updated_at) VALUES(?, ?, ?, ?, \'queued\', ?, ?, ?) '
+        'INSERT INTO durable_inbox(event_id, lane, partition_key, payload_json, payload_hash, state, '
+        + 'visible_at, created_at, updated_at) VALUES(?, ?, ?, ?, ?, \'queued\', ?, ?, ?) '
         + 'ON CONFLICT(event_id) DO NOTHING',
       ).run(
         event.eventId,
+        lane,
         event.partitionKey,
         payload.json,
         payload.hash,
@@ -428,9 +451,11 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
         return { kind: 'inserted' as const };
       }
       const current = this.db.prepare(
-        'SELECT partition_key, payload_hash FROM durable_inbox WHERE event_id = ?',
-      ).get(event.eventId) as { partition_key: string; payload_hash: string };
-      return current.partition_key === event.partitionKey && current.payload_hash === payload.hash
+        'SELECT lane, partition_key, payload_hash FROM durable_inbox WHERE event_id = ?',
+      ).get(event.eventId) as { lane: string; partition_key: string; payload_hash: string };
+      return current.lane === lane
+        && current.partition_key === event.partitionKey
+        && current.payload_hash === payload.hash
         ? { kind: 'duplicate' as const }
         : { kind: 'conflict' as const };
     });
@@ -438,31 +463,52 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
 
   async claimNextInbox(input: ClaimInboxInput): Promise<InboxClaim | undefined> {
     const workerId = nonempty(input.workerId, 'workerId');
+    const lane = nonempty(input.lane ?? DURABLE_INBOX_LANE_LARK_MESSAGE, 'lane');
+    if (input.partitionKeys !== undefined && !Array.isArray(input.partitionKeys)) {
+      throw new Error('partitionKeys must be an array');
+    }
+    const partitionKeys = input.partitionKeys === undefined
+      ? undefined
+      : [...new Set(input.partitionKeys.map(key => {
+        if (typeof key !== 'string') throw new Error('partitionKey must be text');
+        return nonempty(key, 'partitionKey');
+      }))];
+    if (partitionKeys && partitionKeys.length > 256) {
+      throw new Error('partitionKeys must contain at most 256 unique values');
+    }
+    if (partitionKeys?.length === 0) return undefined;
     const now = this.now();
     const until = leaseUntil(now, input.leaseDurationMs);
     return this.transaction(() => {
+      const partitionFilter = partitionKeys
+        ? `AND i.partition_key IN (${partitionKeys.map(() => '?').join(', ')})`
+        : '';
       const candidate = this.db.prepare(
         `SELECT i.event_id
            FROM durable_inbox i
            JOIN durable_inbox_order io ON io.event_id = i.event_id
-          WHERE i.visible_at <= ?
+          WHERE i.lane = ?
+            ${partitionFilter}
+            AND i.visible_at <= ?
             AND (i.state = 'queued' OR (i.state = 'claimed' AND i.claim_until <= ?))
             AND NOT EXISTS (
               SELECT 1 FROM durable_inbox active
-               WHERE active.partition_key = i.partition_key
+               WHERE active.lane = i.lane
+                 AND active.partition_key = i.partition_key
                  AND active.state = 'claimed'
                  AND active.claim_until > ?
             )
             AND NOT EXISTS (
               SELECT 1 FROM durable_inbox earlier
               JOIN durable_inbox_order earlier_order ON earlier_order.event_id = earlier.event_id
-               WHERE earlier.partition_key = i.partition_key
+               WHERE earlier.lane = i.lane
+                 AND earlier.partition_key = i.partition_key
                  AND earlier.state != 'completed'
                  AND earlier_order.sequence < io.sequence
             )
           ORDER BY i.visible_at, io.sequence
           LIMIT 1`,
-      ).get(now, now, now) as { event_id: string } | undefined;
+      ).get(lane, ...(partitionKeys ?? []), now, now, now) as { event_id: string } | undefined;
       if (!candidate) return undefined;
       this.db.prepare(
         `UPDATE durable_inbox
@@ -471,7 +517,7 @@ export class SqliteDurableCoordinationStore implements DurableCoordinationStore 
           WHERE event_id = ?`,
       ).run(workerId, until, now, candidate.event_id);
       const row = this.db.prepare(
-        `SELECT event_id, partition_key, payload_json, visible_at, claim_owner,
+        `SELECT event_id, lane, partition_key, payload_json, visible_at, claim_owner,
                 claim_epoch, claim_until, attempts, created_at
            FROM durable_inbox WHERE event_id = ?`,
       ).get(candidate.event_id) as InboxRow;

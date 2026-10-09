@@ -1,5 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import type { DurableInboxStore, InboxClaim } from './durable-coordination.js';
+import {
+  DURABLE_INBOX_LANE_LARK_MESSAGE,
+  type DurableInboxStore,
+  type InboxClaim,
+} from './durable-coordination.js';
 import {
   parseDurableLarkMessageClaim,
   type DurableLarkMessageClaim,
@@ -223,6 +227,7 @@ export function startDurableInboxPrimaryConsumer(
       try {
         claim = await options.store.claimNextInbox({
           workerId: slotWorkerId,
+          lane: DURABLE_INBOX_LANE_LARK_MESSAGE,
           leaseDurationMs,
         });
       } catch (error) {
