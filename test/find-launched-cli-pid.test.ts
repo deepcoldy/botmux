@@ -22,7 +22,15 @@ const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 
 const wiringStart = workerSource.indexOf('const startWrapperRealPidResolve =');
 const wiringEnd = workerSource.indexOf('// Bridge fallback: claude-code only.', wiringStart);
 if (wiringStart < 0 || wiringEnd < wiringStart) throw new Error('Worker launcher wiring not found');
-const workerWiring = transpileModule(workerSource.slice(wiringStart, wiringEnd), {
+// Include the real ownership resolver called by both spawn paths. A VM has no
+// access to worker.ts's surrounding module scope.
+const codexResolverStart = workerSource.indexOf('function resolveCodexOwnershipPid(');
+const codexResolverEnd = workerSource.indexOf('\n}', codexResolverStart);
+if (codexResolverStart < 0 || codexResolverEnd < codexResolverStart) {
+  throw new Error('Worker Codex ownership resolver not found');
+}
+const workerWiring = transpileModule(
+  workerSource.slice(codexResolverStart, codexResolverEnd + 2) + '\n' + workerSource.slice(wiringStart, wiringEnd), {
   compilerOptions: { target: ScriptTarget.ES2022, module: ModuleKind.None },
 }).outputText;
 
@@ -65,13 +73,22 @@ describe('worker wrapper PID wiring', () => {
   });
 
   it.each([
-    { wrapperCli: '' }, { wrapperCli: '  ' }, { sandboxRequested: true }, { cliId: 'claude-code' },
+    { wrapperCli: '' }, { wrapperCli: '  ' }, { cliId: 'claude-code' },
   ])('does not resolve an ineligible wrapper: %j', options => {
     for (const late of [false, true]) {
       const result = runWorkerWiring(late, options);
       expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
       expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(200);
     }
+  });
+
+  it.each([false, true])('resolves the sandbox Codex child independently of wrapper discovery (late PID=%s)', late => {
+    const result = runWorkerWiring(late, { sandboxRequested: true });
+    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(100, 'codex');
+    expect(result.backend.cliPid).toBe(200);
+    // Sandbox ownership wiring does not use the wrapper's bridge rewrite.
+    expect(result.bridgeCliPid).toBeUndefined();
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
   });
 });
 
