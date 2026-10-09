@@ -215,7 +215,7 @@ function registerAskInternal(input: CreateAskInput, hostManaged: boolean, signal
   // non-IPC registerHostAsk entry point. Both kinds require a stable requestId.
   const resumable = input.requestId !== undefined && (
     hostManaged
-      ? originKind.startsWith('host_cross_principal_')
+      ? (originKind.startsWith('host_cross_principal_') || originKind === 'host_explicit')
       : RESUMABLE_ORIGINS.has(originKind) && input.backendSurvivesRestart === true
   );
   // Invocation identity: prefer the caller-supplied requestId (hook generates it
@@ -494,7 +494,7 @@ function reattachByRequest(ask: InternalPending, signal?: AbortSignal): Promise<
     ask.terminalResult = result;
     clearTimeout(ask.timeoutHandle);
     clearTimeout(ask.handoffExpiryHandle); // claimed → cancel the unclaimed-stash reaper
-    persistStore?.remove(ask.askKey); // claimed → durable record no longer needed
+    if (ask.originKind !== 'host_explicit') persistStore?.remove(ask.askKey); // explicit claimant releases after fsync
     gcSettled();
     logger.info?.(`ask-broker: re-attach delivered stashed answer for ask ${ask.askId} (key=${ask.askKey})`);
     return Promise.resolve(result);
@@ -916,13 +916,21 @@ function settle(askId: string, result: AskResult): void {
   const ask = pending.get(askId);
   if (!ask || ask.settled) return;
 
+  // The daemon-owned explicit claimant must receive a durably committed
+  // terminal result BEFORE any live promise is resolved or record removed.
+  // Its receipt writer will explicitly release this handoff after fsync.
+  if (ask.originKind === 'host_explicit') {
+    persistFromInternal({ ...ask, answeredResult: result, settledAt: Date.now() });
+    ask.answeredResult = result;
+  }
+
   // Durable handoff (codex P1-1): a dormant ask (restored after a restart, no
   // waiter yet) that receives an ANSWER must NOT drop it into the void. Stash
   // the terminal result and KEEP the persisted record so the reconnecting hook
   // can claim it (reattachDormantAsk delivers + removes). Only answered results
   // are worth stashing — a dormant ask that timed out / was invalidated has no
   // consumer to hand off to, so it settles+cleans normally.
-  if (ask.dormant && ask.waiters.length === 0 && result.kind === 'answered') {
+  if (ask.dormant && ask.waiters.length === 0 && (result.kind === 'answered' || ask.originKind === 'host_explicit')) {
     ask.settled = true;
     ask.settledAt = Date.now();
     ask.answeredResult = result;
@@ -950,7 +958,7 @@ function settle(askId: string, result: AskResult): void {
   // The durable record's job is done the moment the ask leaves the pending
   // state (delivered to live waiters, or a terminal non-answer) — drop it so a
   // later restart doesn't resurrect a settled ask.
-  persistStore?.remove(ask.askKey);
+  if (ask.originKind !== 'host_explicit') persistStore?.remove(ask.askKey);
   // Reap older settled entries opportunistically — keeps the map bounded
   // without paying for a dedicated GC timer.
   gcSettled();
@@ -970,6 +978,22 @@ function settle(askId: string, result: AskResult): void {
   }
 
   notifyOnSettle(ask, result);
+}
+
+/** Only the daemon-owned receipt writer calls this after its terminal result
+ * is durable. Never remove a live hook's handoff via this API. */
+export function hasExplicitAskHandoff(input: CreateAskInput): boolean {
+  const key = askKeyFor(input.larkAppId, input.sessionId, 'host_explicit', input.requestId!);
+  return !!findByKey(key) || !!persistStore?.list().some(ask => ask.askKey === key);
+}
+
+export function releaseExplicitAskHandoff(input: CreateAskInput): void {
+  const key = askKeyFor(input.larkAppId, input.sessionId, 'host_explicit', input.requestId!);
+  const ask = findByKey(key);
+  if (ask?.originKind === 'host_explicit' && ask.settled) {
+    persistStore?.remove(key);
+    ask.answeredResult = undefined;
+  }
 }
 
 /** Notify the IM-side dispatcher's onSettle hook (best-effort — never blocks
@@ -1023,7 +1047,7 @@ function snapshot(ask: InternalPending): PendingAsk {
 function gcSettled(): void {
   const cutoff = Date.now() - SETTLED_RETENTION_MS;
   for (const [id, ask] of pending) {
-    if (ask.dormant && ask.answeredResult) continue; // unclaimed handoff — keep
+    if ((ask.dormant || ask.originKind === 'host_explicit') && ask.answeredResult) continue; // unclaimed handoff — keep
     if (ask.settled && ask.settledAt !== undefined && ask.settledAt < cutoff) {
       pending.delete(id);
     }
@@ -1043,6 +1067,7 @@ function gcSettled(): void {
  * fine). The timer is unref'd so it never keeps the process alive.
  */
 function armHandoffExpiry(ask: InternalPending): void {
+  if (ask.originKind === 'host_explicit') return; // owned receipt fsync releases this handoff
   clearTimeout(ask.handoffExpiryHandle);
   const stashedAt = ask.settledAt ?? Date.now();
   const fireIn = Math.max(0, stashedAt + handoffRetentionMs - Date.now());

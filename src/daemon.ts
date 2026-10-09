@@ -1,6 +1,5 @@
-import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
-import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
-import { stripDispatchCompletionProtocol } from './core/dispatch.js';
+import { releaseExplicitAskHandoff, hasExplicitAskHandoff } from './core/ask-broker.js';
+import { createExplicitAskContinuation, explicitAskRecoveryRequest } from './core/explicit-ask-continuation.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, existsSync, mkdirSync, unlinkSync, watch, readdirSync, realpathSync } from 'node:fs';
@@ -7553,6 +7552,30 @@ for (const sessionRelayMutation of V3_SESSION_RUN_MUTATIONS) {
 // the request's lifetime is bounded by `body.timeoutMs` which the broker
 // enforces. Default fetch on the CLI side has no read timeout.
 
+const explicitAskContinuation = createExplicitAskContinuation({
+  dir: join(config.session.dataDir, 'explicit-ask-receipts'),
+  get appId() { return selfDaemonLarkAppId ?? ''; },
+  register: input => registerHostAsk(input),
+  releaseHandoff: releaseExplicitAskHandoff,
+  hasHandoff: hasExplicitAskHandoff,
+  canResume: receipt => {
+    const ds = findActiveBySessionId(receipt.input.sessionId);
+    return sessionsRestored && !!ds && ds.larkAppId === receipt.input.larkAppId
+      && ds.chatId === receipt.input.chatId
+      && (ds.session.scope === 'chat' ? null : ds.session.rootMessageId) === receipt.input.rootMessageId
+      && (!receipt.result || !ds.worker || ds.lastScreenStatus === 'idle');
+  },
+  dispatch: async (receipt, key) => {
+    const ds = findActiveBySessionId(receipt.input.sessionId);
+    const result = await triggerSessionTurn(
+      explicitAskRecoveryRequest(receipt, key, ds?.chatType),
+      { larkAppId: receipt.input.larkAppId, activeSessions },
+    );
+    return result.ok && result.action !== 'ignored';
+  },
+  onError: error => logger.warn(`[ask-continuation] ${error instanceof Error ? error.message : String(error)}`),
+});
+
 ipcRoute('POST', '/api/asks', async (req, res) => {
   let raw: unknown;
   try {
@@ -7655,7 +7678,7 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // p2pOpen 的 bot 在私聊里会出现「对方点不动按钮」，留痕便于排查。
     logger.warn(`[ask:${boundAsk.larkAppId}] no active session for ${boundAsk.sessionId.substring(0, 8)}; chatType unknown (p2pOpen answer gate falls back to allowlist)`);
   }
-  const result = await registerAskForResponse({
+  const askInput = {
     larkAppId: boundAsk.larkAppId,
     chatId: boundAsk.chatId,
     rootMessageId: boundAsk.rootMessageId,
@@ -7673,7 +7696,17 @@ ipcRoute('POST', '/api/asks', async (req, res) => {
     // a restart-surviving mux backend (tmux/herdr/zellij/zmx) is resumable.
     backendSurvivesRestart:
       !!askSession && getSessionPersistentBackendType(askSession) !== undefined,
-  }, res);
+  };
+  const managedExplicit = askInput.originKind === 'explicit' && !!askInput.requestId && !!askSession;
+  const explicitInput = { ...askInput, originKind: 'host_explicit', requestId: askInput.requestId! };
+  if (body.acknowledge === true) {
+    if (!managedExplicit) return jsonRes(res, 400, { error: 'invalid_acknowledgement' });
+    const result = explicitAskContinuation.acknowledge(explicitInput);
+    return result ? jsonRes(res, 200, result) : jsonRes(res, 409, { error: 'ask_result_not_ready' });
+  }
+  const result = managedExplicit
+    ? await explicitAskContinuation.wait(explicitInput)
+    : await registerAskForResponse(askInput, res);
   if (res.destroyed) return;
 
   // CoCo 专属：它的 hook 不能用 directive 代答（hook 客户端永远 passthrough，CoCo 会
@@ -29278,6 +29311,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     // reconnecting ask hook that raced the restore got retryable 503s until here.
     markSessionsRestored: () => {
       sessionsRestored = true;
+      const askRecoveryTimer = setInterval(() => { void explicitAskContinuation.sweep(); }, 5000);
+      askRecoveryTimer.unref();
+      void explicitAskContinuation.sweep();
     },
     driveRestoredXpiGroup: groupId => { void driveNextXpiSharedCwdTurn(groupId); },
     driveRestoredPrincipalLane: ds => { driveNextPrincipalLaneTurn(ds); },
