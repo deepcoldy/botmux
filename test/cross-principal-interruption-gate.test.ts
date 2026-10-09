@@ -337,14 +337,15 @@ describe('XPI switch — adoption semantics against the real authority', () => {
 
 describe('XPI switch — daemon.ts ingress gates (source-pinned)', () => {
   it('the divert is conditioned on the switch before any principal comparison', () => {
-    const idx = daemonSource.indexOf('config.crossPrincipalInterruption\n');
-    expect(idx).toBeGreaterThanOrEqual(0);
-    const clause = daemonSource.slice(idx, idx + 400);
+    const activeIdx = daemonSource.indexOf('const activePrincipalTurn = ds.activeInteractiveTurn;');
+    expect(activeIdx).toBeGreaterThanOrEqual(0);
+    const idx = daemonSource.indexOf('if (config.crossPrincipalInterruption\n', activeIdx);
+    expect(idx).toBeGreaterThan(activeIdx);
+    const clause = daemonSource.slice(idx, idx + 500);
     // The switch is the FIRST conjunct: with it off nothing else is evaluated
     // and the message falls through to the ordinary existing-owner route.
-    expect(clause).toContain('activePrincipalTurn');
+    expect(clause).toContain('&& activePrincipalTurn');
     expect(clause).toContain('sameTrustedPrincipal');
-    expect(daemonSource.slice(idx - 200, idx)).toContain('const activePrincipalTurn');
   });
 
   it('a rejection arriving while the switch is off retries delivery instead of staging', () => {

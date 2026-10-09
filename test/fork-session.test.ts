@@ -256,6 +256,7 @@ describe('forkSession — frozen launch posture inheritance', () => {
       sandboxHidePaths: ['/hide/me'],
       sandboxReadonlyPaths: ['/ro/here'],
       sandboxNetwork: false,
+      sandboxNetworkPolicy: { version: 1, public: { mode: 'block' }, private: { mode: 'allowlist', rules: [{ cidr: '10.0.0.0/8' }] } },
     });
     registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
 
@@ -268,6 +269,48 @@ describe('forkSession — frozen launch posture inheritance', () => {
     expect(child.sandboxHidePaths).toEqual(['/hide/me']);
     expect(child.sandboxReadonlyPaths).toEqual(['/ro/here']);
     expect(child.sandboxNetwork).toBe(false);
+    expect(child.sandboxNetworkPolicy).toEqual(src.session.sandboxNetworkPolicy);
+    expect(child.sandboxNetworkPolicy).not.toBe(src.session.sandboxNetworkPolicy);
+  });
+
+  // ── childOwnerOpenId: an admin forking someone else's session is stamped as
+  //    the CHILD owner instead of inheriting the source owner. The stamp has to
+  //    land on BOTH the persisted row and the runtime childDs (the latter feeds
+  //    BOTMUX_OWNER_OPEN_ID into the CLI subprocess via applySessionOwnerEnv).
+  //    Dropping the option on either copy must flip these red. ──
+  it('childOwnerOpenId overrides owner on BOTH the persisted row and runtime childDs', async () => {
+    const src = makeSourceDs();   // source owner = 'ou_owner'
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
+
+    const r = await forkSession(
+      src.session.sessionId, 'oc_child', 'oc_child', 'group', 'chat',
+      { forkWorkerImpl: forkWorkerSpy as any, childOwnerOpenId: 'ou_admin' },
+    );
+    expect(r.ok).toBe(true);
+
+    // Persisted row (worker-pool.ts childSession.ownerOpenId).
+    const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
+    expect(child.ownerOpenId).toBe('ou_admin');
+
+    // Runtime DaemonSession handed to forkWorker (feeds the worker owner env).
+    const childDs = forkWorkerSpy.mock.calls[0][0] as DaemonSession;
+    expect(childDs.ownerOpenId).toBe('ou_admin');
+  });
+
+  it('without childOwnerOpenId the child inherits the SOURCE owner (persisted + runtime)', async () => {
+    const src = makeSourceDs();   // source owner = 'ou_owner'
+    registry.set(sessionKey('om_source_root', 'cli_app_test'), src);
+
+    const r = await forkSession(
+      src.session.sessionId, 'oc_child', 'om_child_root', 'group', 'thread',
+      { forkWorkerImpl: forkWorkerSpy as any },
+    );
+    expect(r.ok).toBe(true);
+
+    const child = vi.mocked(sessionStore.createSession).mock.results[0].value as Session;
+    expect(child.ownerOpenId).toBe('ou_owner');
+    const childDs = forkWorkerSpy.mock.calls[0][0] as DaemonSession;
+    expect(childDs.ownerOpenId).toBe('ou_owner');
   });
 
   it('P1: a fork of an explicitly UN-sandboxed source stays un-sandboxed (false travels, not just true)', async () => {

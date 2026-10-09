@@ -109,6 +109,18 @@ describe('botmux history — thread window endpoint', () => {
     expect(ids(out)).toEqual(['m10', 'm11', 'm12']);
   });
 
+  it('reports native-container evidence without certifying the root-only fallback', async () => {
+    const { listThreadMessagesWithContext } = await import('../src/im/lark/client.js');
+    const native = await listThreadMessagesWithContext('cli_x', 'oc_x', ROOT, 3);
+    expect(native).toMatchObject({ verifiedThread: true, threadId: 'omt_x' });
+    expect(ids(native.messages)).toEqual(['m10', 'm11', 'm12']);
+    state.threadIdResolvable = false;
+    const fallback = await listThreadMessagesWithContext('cli_x', 'oc_x', ROOT, 3);
+    expect(fallback.verifiedThread).toBe(false);
+    expect(fallback.threadId).toBeUndefined();
+    expect(ids(fallback.messages)).toEqual(ids(native.messages));
+  });
+
   it('fallback path (chat scan filtered by root_id) returns the same newest N', async () => {
     state.threadIdResolvable = false;
     const { listThreadMessages } = await import('../src/im/lark/client.js');

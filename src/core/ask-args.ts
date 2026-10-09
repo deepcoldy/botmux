@@ -6,11 +6,13 @@
  * (`cmdAsk`) lives in cli.ts and calls these helpers.
  */
 
+import { parseAskQuestions } from './ask-questions.js';
 import type { AskOption } from './ask-types.js';
 
 export class AskArgsError extends Error {
   constructor(
     public readonly code:
+      | 'questions_invalid'
       | 'options_missing'
       | 'options_too_few'
       | 'options_empty_key'
@@ -154,4 +156,14 @@ export function findMissingAskEnv(
     return 'BOTMUX_ROOT_MESSAGE_ID';
   }
   return null;
+}
+
+/** Shared with the daemon validator so file input cannot silently lose defaults. */
+export function parseAskQuestionsFile(raw: string) {
+  let input: unknown;
+  try { input = JSON.parse(raw); }
+  catch { throw new AskArgsError('questions_invalid', '--questions-file 必须是有效 JSON 问题数组'); }
+  const questions = parseAskQuestions(input);
+  if (typeof questions === 'string') throw new AskArgsError('questions_invalid', `--questions-file: ${questions}`);
+  return questions.map(q => ({ ...q, defaultSelectedKeys: q.defaultSelectedKeys ?? [] }));
 }

@@ -120,9 +120,101 @@ describe('TmuxBackend.probeSession', () => {
     expect(TmuxBackend.probeSession(NAME)).toBe('missing');
   });
 
+  it('keeps a missing socket file ("No such file or directory") as "unknown" — the general probe never upgrades it', () => {
+    // The cold-machine tie-break lives ONLY in the read-isolation gate
+    // (serverAbsentOnColdMachine + resolveReadIsolationPaneProbe); kill-verify /
+    // close / wake consumers of probeSession must keep #962's semantics.
+    const stderr = Buffer.from('error connecting to /private/tmp/tmux-501/default (No such file or directory)');
+    mockedExecSync.mockImplementation((() => { throw err({ status: 1, signal: null, stderr }); }) as any);
+    mockedExecFileSync.mockImplementation(((cmd: string) => {
+      if (cmd === 'ps') return '';
+      throw err({ status: 1, signal: null, stderr });
+    }) as any);
+    expect(TmuxBackend.probeSession(NAME)).toBe('unknown');
+    expect(mockedExecFileSync.mock.calls.map(c => c[0])).not.toContain('ps');
+  });
+
   it('hasSession() stays a conservative boolean wrapper (false on unknown)', () => {
     bothThrow({ status: 127, signal: null }, { code: 'ENOENT', status: null, signal: null });
     expect(TmuxBackend.hasSession(NAME)).toBe(false);
+  });
+});
+
+describe('TmuxBackend.serverAbsentOnColdMachine (read-isolation cold-machine check)', () => {
+  // A reboot wipes /tmp, so before anything has started a server every probe
+  // reads the socket-missing connect error. 2026-10-02: every read-isolated bot
+  // of a machine was refused until an unsandboxed bot happened to spawn first.
+  const UID = typeof process.getuid === 'function' ? process.getuid() : 501;
+  const OTHER = UID + 100000;
+  const enoent = Buffer.from('error connecting to /private/tmp/tmux-501/default (No such file or directory)');
+
+  function drive(
+    tmux: Record<string, unknown> | 'ok',
+    ps: (() => string) | { throws: Record<string, unknown> },
+  ): { result: boolean; calls: string[] } {
+    const calls: string[] = [];
+    mockedExecFileSync.mockImplementation(((cmd: string) => {
+      calls.push(cmd);
+      if (cmd === 'tmux') {
+        if (tmux === 'ok') return '';
+        throw err(tmux);
+      }
+      if (cmd === 'ps') {
+        if (typeof ps === 'function') return ps();
+        throw err(ps.throws);
+      }
+      throw new Error(`unexpected command ${cmd}`);
+    }) as any);
+    return { result: TmuxBackend.serverAbsentOnColdMachine(), calls };
+  }
+  const socketMissing = { status: 1, signal: null, stderr: enoent };
+  const noTmuxPs = () => [`    0 /sbin/launchd`, `${UID} /opt/homebrew/bin/node`, `${OTHER} /opt/homebrew/bin/tmux`].join('\n');
+
+  it('is true when the socket file is missing AND no tmux process of this user is visible', () => {
+    const r = drive(socketMissing, noTmuxPs);
+    expect(r.result).toBe(true);
+    expect(r.calls).toEqual(['tmux', 'ps']);
+  });
+
+  it('is false when a tmux process of this user is visible (socket may have been cleaned under a live server)', () => {
+    expect(drive(socketMissing, () => `${UID} /opt/homebrew/bin/node\n${UID} /opt/homebrew/bin/tmux\n`).result).toBe(false);
+  });
+
+  it('is false when the tmux process belongs to the EFFECTIVE uid (setuid launcher)', () => {
+    if (typeof process.geteuid !== 'function') return;
+    const spy = vi.spyOn(process, 'geteuid').mockReturnValue(OTHER);
+    try {
+      expect(drive(socketMissing, noTmuxPs).result).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('is false for a Linux-renamed server thread ("tmux: server")', () => {
+    expect(drive(socketMissing, () => `${UID} bash\n${UID} tmux: server\n`).result).toBe(false);
+  });
+
+  it('is false when ps fails, times out, or prints nothing parseable', () => {
+    expect(drive(socketMissing, { throws: { code: 'ENOENT', status: null, signal: null } }).result).toBe(false);
+    expect(drive(socketMissing, { throws: { code: 'ETIMEDOUT', status: null, signal: 'SIGTERM' } }).result).toBe(false);
+    expect(drive(socketMissing, () => '').result).toBe(false);
+    expect(drive(socketMissing, () => 'garbage without uid columns\n').result).toBe(false);
+  });
+
+  it('never consults ps unless tmux reported a missing socket file', () => {
+    for (const tmux of [
+      'ok' as const,
+      { status: 1, signal: null, stderr: Buffer.from('no server running on /tmp/tmux-0/default') },
+      { status: 1, signal: null, stderr: Buffer.from('error connecting to /tmp/tmux-0/default (Connection refused)') },
+      { status: 1, signal: null, stderr: Buffer.from('lost server') },
+      { code: 'ETIMEDOUT', status: 1, signal: null, stderr: enoent },
+      { signal: 'SIGTERM', status: null, killed: true, stderr: enoent },
+      { code: 'ENOENT', status: null, signal: null },
+    ]) {
+      const r = drive(tmux, noTmuxPs);
+      expect(r.result).toBe(false);
+      expect(r.calls).toEqual(['tmux']);
+    }
   });
 });
 

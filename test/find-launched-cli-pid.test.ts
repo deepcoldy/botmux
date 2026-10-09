@@ -1,4 +1,8 @@
-import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { runInNewContext } from 'node:vm';
+import { transpileModule, ModuleKind, ScriptTarget } from 'typescript';
+import { describe, it, expect, vi } from 'vitest';
+import { cliAdapterBindsOwnershipPid } from '../src/adapters/cli/ownership-pid.js';
 import { findLaunchedCliPid, launcherRetryStillValid, scheduleWrapperRealCliPid } from '../src/core/session-discovery.js';
 
 // Manual scheduler so the retry loop runs deterministically without real timers.
@@ -10,6 +14,66 @@ function makeScheduler() {
     pending: () => queue.length,
   };
 }
+
+// Execute the actual spawn wiring, including BOTH kick sites, without importing
+// worker.ts (which starts process IPC). Only OS probes and timers are replaced;
+// the gate, late-PID branch, resolver and attestation wiring remain real code.
+const workerSource = readFileSync(new URL('../src/worker.ts', import.meta.url), 'utf8');
+const wiringStart = workerSource.indexOf('const startWrapperRealPidResolve =');
+const wiringEnd = workerSource.indexOf('// Bridge fallback: claude-code only.', wiringStart);
+if (wiringStart < 0 || wiringEnd < wiringStart) throw new Error('Worker launcher wiring not found');
+const workerWiring = transpileModule(workerSource.slice(wiringStart, wiringEnd), {
+  compilerOptions: { target: ScriptTarget.ES2022, module: ModuleKind.None },
+}).outputText;
+
+function runWorkerWiring(late: boolean, options: {
+  cliId?: string; wrapperCli?: string; claudeDataDir?: string; sandboxRequested?: boolean;
+} = {}) {
+  const scheduler = makeScheduler();
+  const backend = { cliPid: 100, getChildPid: () => 100 };
+  const context = {
+    cfg: { cliId: options.cliId ?? 'codex', wrapperCli: options.wrapperCli ?? 'launcher', workingDir: '/work' },
+    claudeDataDir: options.claudeDataDir, sandboxRequested: options.sandboxRequested ?? false,
+    credentialOnlyBwrap: false, backend, cliPid: late ? null : 100, bridgeCliPid: undefined,
+    lastSpawnOuterBwrapActive: false, lastSpawnTraexLauncherActive: false,
+    process: { env: {} }, cliPidMarker: undefined,
+    cliAdapterBindsOwnershipPid,
+    findLaunchedCliPid: vi.fn(() => 200), scheduleWrapperRealCliPid,
+    publishLocalProcessAttestation: vi.fn(), observeCursorCliSessionId: vi.fn(), observeAntigravityCliSessionId: vi.fn(),
+    setTimeout: scheduler.schedule, log: vi.fn(),
+  };
+  runInNewContext(workerWiring, context);
+  scheduler.runAll();
+  expect(scheduler.pending()).toBe(0);
+  return context;
+}
+
+describe('worker wrapper PID wiring', () => {
+  it.each([false, true])('attests the Codex child without a Claude data dir (late PID=%s)', late => {
+    const result = runWorkerWiring(late);
+    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(100, 'codex');
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.bridgeCliPid).toBe(200);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+  });
+
+  it.each([false, true])('preserves Claude wrapper discovery (late PID=%s)', late => {
+    const result = runWorkerWiring(late, { cliId: 'claude-code', claudeDataDir: '/claude' });
+    expect(result.findLaunchedCliPid).toHaveBeenCalledWith(100, 'claude-code');
+    expect(result.backend.cliPid).toBe(200);
+    expect(result.publishLocalProcessAttestation).toHaveBeenLastCalledWith(200);
+  });
+
+  it.each([
+    { wrapperCli: '' }, { wrapperCli: '  ' }, { sandboxRequested: true }, { cliId: 'claude-code' },
+  ])('does not resolve an ineligible wrapper: %j', options => {
+    for (const late of [false, true]) {
+      const result = runWorkerWiring(late, options);
+      expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
+      expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(200);
+    }
+  });
+});
 
 // findLaunchedCliPid sees through a wrapperCli launcher (`aiden x claude`) to the
 // real CLI process it forks. The OS-probing is injected so the BFS is tested

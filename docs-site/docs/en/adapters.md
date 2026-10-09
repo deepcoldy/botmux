@@ -40,6 +40,14 @@ The table lists the current built-in adapters (the **authoritative source** for 
 
 > The `model` field only takes effect for adapters that support a model parameter; others ignore it. Mir CLI's extra prerequisites (login / miramcp) are in the section below.
 
+## Pi execution progress
+
+Bots configured with `cliId: "pi"` display Pi's persisted thinking text, narration, tool calls and results in the Lark progress bubble. Tool nodes show commands or file paths and finish with the current turn; the final answer is sent through the reply channel.
+
+Progress is enabled by default and respects `cotEnabled` and the chat-level `/cot on` / `/cot off` switches. `/cot show` displays activity accumulated in the current turn.
+
+Updates follow complete messages written by Pi: calls appear before tool execution and results after execution. Content that has not been persisted is not streamed token by token. Historical records are not replayed into a new turn's bubble.
+
 ## DeepSeek Harness (dsh)
 
 `cliId: "dsh"` drives a local `dsh` CLI (the [deepseek-harness](https://github.com/deepseekai/deepseek-harness)) through the bundled runner via `dsh --profile <name>` over the SDK JSON-RPC protocol. Prerequisites:

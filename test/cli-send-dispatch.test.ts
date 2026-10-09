@@ -52,6 +52,24 @@ describe('dispatchPrimaryMessage hook context wiring', () => {
     MessageWithdrawnError,
   };
 
+  it.each([false, true])('keeps the exact native author on a quote and withdrawn fallback=%s', async withdrawn => {
+    const groupContextAuthorOrigin = {
+      appId: 'cli_app', chatId: 'oc_chat', sessionId: 'sid_1', turnId: 'om_turn', epoch: 'native_epoch',
+    };
+    const replyMessage = vi.fn(async () => {
+      if (withdrawn) throw new MessageWithdrawnError('withdrawn');
+      return 'om_reply';
+    });
+    const sendMessage = vi.fn(async () => 'om_send');
+    await dispatchPrimaryMessage({ replyMessage, sendMessage }, {
+      ...baseOptions, quoteTargetId: 'om_quote', content: 'Authored answer', msgType: 'text',
+      groupContextAuthorOrigin, suppressHook: true, dispatch: vi.fn(async () => 'unused'),
+    });
+    expect(replyMessage.mock.calls[0]?.at(-1)).toEqual({ suppressHook: true, groupContextAuthorOrigin });
+    if (withdrawn) expect(sendMessage.mock.calls[0]?.at(-1)).toEqual({ suppressHook: true, groupContextAuthorOrigin });
+    else expect(sendMessage).not.toHaveBeenCalled();
+  });
+
   it('passes hookContext when quote reply succeeds', async () => {
     const replyMessage = vi.fn(async () => 'om_reply');
     const sendMessage = vi.fn(async () => 'om_send');

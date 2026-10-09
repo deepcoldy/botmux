@@ -314,6 +314,10 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/.dashboard-port').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bin/botmux').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/claude-plugin/x').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/cursor-plugin/x').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/omp-plugin/x').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/pi-skills/x').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/pi-skills/extensions/pi-turn-boundary-extension.js').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/dashboard-daemons/cli_x.json').access).toBe('readOnly'); // daemon IPC discovery
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/bots-info.json').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/bot-openids-cli_self.json').access).toBe('readOnly'); // own
@@ -322,10 +326,9 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self/sessions.db').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self/sessions.db-wal').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self').access).toBe('readOnly');
-    // …and the bot's OWN pre-SQLite `sessions-<self>.json` is NOT granted any more:
-    // it is a one-shot import source the store never reads at runtime, so the
-    // allow-list stops covering it (narrower surface, not a weakened assertion).
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('readOnly');     // own（升级窗口内仍是唯一可读的会话来源）
+    // the leftover `sessions-<self>.json` is a one-shot import source, never
+    // read at runtime → deliberately NOT granted.
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-sends/s.jsonl').access).toBe('readWrite');        // OWN session marker only
     // blocker #4: turn-sends is granted per-session-FILE, not the whole dir —
     // another session's marker is NOT writable (can't corrupt its send-dedup).
@@ -337,6 +340,15 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/statusline/s/latest.json').access).toBe('readWrite');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/statusline/other/latest.json').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/statusline').access).toBe('none');
+    // turn-send-ledger: `botmux send` writes its per-turn final fence (atomic
+    // write + sibling .lock) → OWN session DIRECTORY readWrite; the shared root
+    // and sibling sessions stay 'none' (no forging/deleting another's fence).
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-send-ledger/s').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-send-ledger/s/0123456789abcdef0123456789abcdef.json').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-send-ledger/other/0123456789abcdef0123456789abcdef.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-send-ledger/0123456789abcdef0123456789abcdef.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-send-ledger/.completed-prune').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-send-ledger').access).toBe('none');
     // own BOT_HOME rw + own attachments ro (allow-listed elsewhere)
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_self/claude/x').access).toBe('readWrite');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/attachments/cli_self/m/f.pdf').access).toBe('readWrite'); // botmux quoted downloads here
@@ -350,6 +362,8 @@ describe('buildFsPolicy', () => {
     // schedules moved into per-bot BOT_HOMEs: the legacy shared path is no
     // longer granted (own store rides the BOT_HOME rw; sibling stores denied).
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedules.json').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedule-authority.sqlite').access).toBe('none');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/schedule-authority.sqlite-wal').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/bots/cli_other/schedules.json').access).toBe('none'); // sibling store
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_other.json').access).toBe('none');
     // sibling session stores stay deny-by-default: neither the store DIR nor any
@@ -522,9 +536,9 @@ describe('buildFsPolicy', () => {
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self/sessions.db').access).toBe('readOnly');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self/sessions.db-shm').access).toBe('readOnly');
-    // the legacy `sessions-<self>.json` is a one-shot import source, never read at
-    // runtime → deliberately NOT granted (was readOnly before the SQLite-only cut)
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('readOnly');     // own（升级窗口内仍是唯一可读的会话来源）
+    // the leftover `sessions-<self>.json` is a one-shot import source, never
+    // read at runtime → deliberately NOT granted.
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('none');
     // siblings simply not covered under the allow-list → inaccessible
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_other.json').access).toBe('none');
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_other').access).toBe('none');
@@ -785,7 +799,7 @@ describe('resolveRedirectedAdapterAuthPaths (redirect authPath suppression)', ()
     expect(policyAssembly).toBeGreaterThan(precreate);
     expect(src).toContain("relative(canonicalManagedSessionsRoot, canonicalManagedSessionDir) !== join('botmux', effectiveAdapterSessionId)");
     expect(src).toContain('mandatoryDenyPaths.push(canonicalManagedSessionsRoot)');
-    expect(src).toContain('extraWritePaths: keepExisting([process.env.TMPDIR, canonicalManagedSessionDir])');
+    expect(src).toContain('extraWritePaths: keepExisting([sessionScratchDir, canonicalManagedSessionDir])');
   });
 
   it('SYMLINKED-HOME regression (codex #605 P1): worker-assembly under /home/u → /data00/home/u keeps Claude/Codex dropped, Seed/Relay bytedcli kept', () => {
@@ -1121,6 +1135,16 @@ describe('migrateLegacySandboxFields', () => {
     expect(migrateLegacySandboxFields({ readIsolation: true })).toEqual({ sandbox: true });
   });
 
+  it('preserves the scratch string even when legacy path fields trigger migration', () => {
+    // A scratch bot that also carries a stale legacy hide path must NOT be
+    // downgraded to boolean true (oncall) by the migration (PR #1513 review).
+    const m = migrateLegacySandboxFields({ sandbox: 'scratch', sandboxHidePaths: ['~/.ssh'] });
+    expect(m?.sandbox).toBe('scratch');
+    expect(m?.sandboxPaths?.deny).toEqual(['~/.ssh']);
+    // a plain scratch bot with no legacy fields still no-ops
+    expect(migrateLegacySandboxFields({ sandbox: 'scratch' })).toBeNull();
+  });
+
   it('no-ops when already migrated or nothing legacy present', () => {
     expect(migrateLegacySandboxFields({ sandbox: true, sandboxPaths: {} })).toBeNull();
     expect(migrateLegacySandboxFields({ sandbox: true })).toBeNull();
@@ -1169,6 +1193,61 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/statusline/other/latest.json').access).not.toBe('readWrite');
     // parity with turn-sends: single own marker file still granted
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-sends/s.jsonl').access).toBe('readWrite');
+  });
+
+  it('grants the OWN turn-send-ledger session dir readWrite under no-transport too (root and siblings stay closed)', () => {
+    const p = noTransport({ workingDir: '/Users/u/proj' });
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-send-ledger/s/0123456789abcdef0123456789abcdef.json').access).toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-send-ledger/other/0123456789abcdef0123456789abcdef.json').access).not.toBe('readWrite');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/turn-send-ledger/.completed-prune').access).not.toBe('readWrite');
+  });
+
+  describe('session-owned read-only roots', () => {
+    const sd = '/Users/u/.botmux/data';
+    const ownRoots = [
+      `${sd}/runtime-skills/s/claude-plugin`,   // claude-plugin delivery
+      `${sd}/runtime-skills/s/skills`,          // skill-root delivery (pi)
+      `${sd}/pi-initial-prompts/s`,             // pi long initial prompt
+    ];
+
+    it('stays readOnly under no-transport for every delivery shape; siblings stay denied', () => {
+      const p = noTransport({ sessionOwnedReadonlyRoots: ownRoots });
+      for (const root of ownRoots) {
+        expect(accessForPath(p.rules, `${root}/x`).access).toBe('readOnly');
+      }
+      expect(accessForPath(p.rules, `${sd}/runtime-skills/other/skills/x`).access).toBe('deny');
+      expect(accessForPath(p.rules, `${sd}/pi-initial-prompts/other/initial.prompt.md`).access).toBe('deny');
+      expect(accessForPath(p.rules, '/Users/u/.botmux/bots.json').access).toBe('deny');
+      expect(p.suppressedAuthorityPaths ?? []).toEqual([]);
+    });
+
+    it('drops paths that fail containment (sibling id, outside sessionDataDir, the data dir itself)', () => {
+      const bad = [`${sd}/runtime-skills/other/skills`, '/Users/u/.botmux/skills/store', sd];
+      const p = noTransport({ sessionOwnedReadonlyRoots: bad });
+      expect(accessForPath(p.rules, `${sd}/runtime-skills/other/skills/x`).access).toBe('deny');
+      expect(accessForPath(p.rules, '/Users/u/.botmux/skills/store/x').access).toBe('deny');
+      expect(accessForPath(p.rules, `${sd}/sessions-cli_self.json.bak`).access).toBe('deny');
+      expect(p.suppressedAuthorityPaths).toEqual(expect.arrayContaining(bad));
+    });
+
+    it('needs a session id and tolerates a trailing slash', () => {
+      const own = ownRoots[0];
+      expect(accessForPath(noTransport({ sessionId: undefined, sessionOwnedReadonlyRoots: [own] }).rules, `${own}/x`).access).toBe('deny');
+      expect(accessForPath(noTransport({ sessionOwnedReadonlyRoots: [`${own}/`] }).rules, `${own}/x`).access).toBe('readOnly');
+    });
+
+    it('is read-only even when the session has a Lark transport', () => {
+      const p = buildFsPolicy(ctx({ sessionOwnedReadonlyRoots: ownRoots }));
+      for (const root of ownRoots) {
+        expect(accessForPath(p.rules, `${root}/x`).access).toBe('readOnly');
+      }
+    });
+
+    it('ordinary readonlyRoots inside the data dir are still dropped under no-transport', () => {
+      const p = noTransport({ readonlyRoots: [ownRoots[0]] });
+      expect(accessForPath(p.rules, `${ownRoots[0]}/x`).access).toBe('deny');
+      expect(p.suppressedAuthorityPaths).toContain(ownRoots[0]);
+    });
   });
 
   it('denies Feishu authority (bots.json / lark-cli stores / sibling BOT_HOME) even with workingDir=~', () => {
@@ -1680,7 +1759,7 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_self/sessions.db').access).toBe('readOnly');
     // the legacy `sessions-<self>.json` is no longer allow-listed, so under
     // no-transport it falls back to the frozen ~/.botmux authority deny.
-    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('readOnly');
+    expect(accessForPath(p.rules, '/Users/u/.botmux/data/sessions-cli_self.json').access).toBe('deny');
     // sibling store dirs get no carve-out out of that authority deny either
     expect(accessForPath(p.rules, '/Users/u/.botmux/data/session-stores/cli_other/sessions.db').access).toBe('deny');
     expect(accessForPath(p.rules, '/opt/botmux/dist/cli.js').access).toBe('readOnly');
@@ -1731,31 +1810,31 @@ describe('no-Lark-transport credential profile (larkTransportEnabled=false)', ()
 
 // Trigger-user CLI identity: the wrapper on PATH sources the per-session
 // identity file on every invocation, so a sandboxed session must be able to READ
-// exactly its own — and nothing else. The grant is per file, never the shared
-// `cli-identity/` parent, because that parent holds every concurrent session's
-// file and each one carries a live token belonging to a different person.
+// exactly its own — and nothing else. The grant is a per-session directory,
+// never the shared `cli-identity/` parent, because that parent holds every
+// concurrent session's live user token.
 describe('buildFsPolicy — trigger-user CLI identity', () => {
   const dataDir = '/Users/u/.botmux/data';
 
   it('grants this session\'s identity files read-only', () => {
     const p = buildFsPolicy(ctx({ sessionId: 'sess-mine' }));
     for (const tool of ['lark-cli', 'bytedcli']) {
-      expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.${tool}.env`).access)
+      expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin/.data/${tool}.env`).access)
         .toBe('readOnly');
     }
     expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin`).access).toBe('readOnly');
     // The wrapper also reads the turn the CLI is currently executing, to refuse
     // credentials that belong to a different turn. Without this grant a
     // sandboxed session reads nothing and every governed command is refused.
-    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.turn`).access).toBe('readOnly');
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin/.data/turn`).access).toBe('readOnly');
   });
 
   // The one that matters: session A must not be able to read session B's token.
   it('leaves another session\'s identity denied', () => {
     const p = buildFsPolicy(ctx({ sessionId: 'sess-mine' }));
-    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-other.lark-cli.env`).access)
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-other.bin/.data/lark-cli.env`).access)
       .not.toBe('readOnly');
-    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-other.turn`).access)
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-other.bin/.data/turn`).access)
       .not.toBe('readOnly');
     // Same for bytedcli: each person's login state lives in a private HOME, and
     // the daemon (not the sandboxed CLI) mints their JWTs, so the agent has no
@@ -1772,7 +1851,7 @@ describe('buildFsPolicy — trigger-user CLI identity', () => {
   // token it could name. The daemon writes; the CLI only reads.
   it('never grants write access to an identity file', () => {
     const p = buildFsPolicy(ctx({ sessionId: 'sess-mine' }));
-    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.lark-cli.env`).access)
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin/.data/lark-cli.env`).access)
       .not.toBe('readWrite');
   });
 
@@ -1781,7 +1860,7 @@ describe('buildFsPolicy — trigger-user CLI identity', () => {
   // to close.
   it('withholds the identity from a no-transport turn', () => {
     const p = buildFsPolicy(ctx({ sessionId: 'sess-mine', larkTransportEnabled: false }));
-    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.lark-cli.env`).access)
+    expect(accessForPath(p.rules, `${dataDir}/cli-identity/sess-mine.bin/.data/lark-cli.env`).access)
       .not.toBe('readOnly');
   });
 });

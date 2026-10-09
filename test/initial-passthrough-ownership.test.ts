@@ -70,8 +70,9 @@ describe('startInitialPassthroughSession ownership', () => {
 
 describe('startInitialPassthroughSession call sites', () => {
   it('thread-reply injection keeps the foreign-bot guard on owner fields', () => {
-    expect(src).toContain('ownerOpenId: isForeignBot ? undefined : threadSenderOpenId');
-    expect(src).toMatch(/ownerUnionId: isForeignBot \? undefined :/);
+    // thread 执行段（executeThreadSlash）里的字段名已与新话题入口对齐：isForeignBotSender / senderOpenId。
+    expect(src).toContain('ownerOpenId: isForeignBotSender ? undefined : senderOpenId');
+    expect(src).toMatch(/ownerUnionId: isForeignBotSender \? undefined :/);
   });
 
   it('every call site passes ownership explicitly', () => {
@@ -97,7 +98,8 @@ describe('registration loser command handoff', () => {
     // replacing master's rollbackRejectedSessionAndGetWinner here.
     const claimCalls = src.split('claimNewDaemonSession(activeSessions, cmdDs)').length - 1;
     expect(claimCalls).toBeGreaterThanOrEqual(2);
-    expect(src).toContain("if (registration.reason !== 'existing_owner') return;");
+    // 执行段搬进 executeNewTopicSlash / executeThreadSlash 之后用 true 表示「已处理」，入口据此 return。
+    expect(src).toContain("if (registration.reason !== 'existing_owner') return true;");
     expect(src).toContain(
       'await handleCommand(cmd, anchor, { ...parsed, content: commandContent }, invocationDeps, larkAppId)',
     );
@@ -112,8 +114,10 @@ describe('registration loser command handoff', () => {
     expect(start).toBeGreaterThanOrEqual(0);
     expect(end).toBeGreaterThan(start);
     const region = src.slice(start, end);
-    expect(region).toContain('if (!prepared) await resolveNonsupportMessage(data, larkAppId);');
-    expect(region).toContain('if (!prepared) learnFromMentions(larkAppId, parsed.mentions);');
-    expect(region).toMatch(/if \(!prepared\) \{[\s\S]*emitHookEvent\('thread\.reply'/);
+    // prepared 重投与级联推迟重入（replay 快照）都不再重新解析。replay 不是 prepared，配额与下载仍重过。
+    expect(region).toContain('if (!prepared && !replay) await resolveNonsupportMessage(data, larkAppId);');
+    // runtime 级联的正文重入（cascadeBodyReentry）同样跳过这两处一次性副作用。
+    expect(region).toContain('if (!prepared && !ctx.cascadeBodyReentry) learnFromMentions(larkAppId, parsed.mentions);');
+    expect(region).toMatch(/if \(!prepared && !ctx\.cascadeBodyReentry\) \{[\s\S]*emitHookEvent\('thread\.reply'/);
   });
 });

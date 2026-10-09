@@ -10,7 +10,7 @@
  *  5. Verify bot sent an actual text reply message, or that Codex reached Codex-side response handling
  *  6. Close session and verify "会话已关闭"
  */
-import { describe, it, beforeAll, afterAll } from 'vitest';
+import { describe, it, beforeAll, afterAll } from './midscene-suite.js';
 import type { Browser, Page, BrowserContext } from 'playwright';
 import { PlaywrightAgent } from '@midscene/web/playwright';
 import { existsSync } from 'node:fs';

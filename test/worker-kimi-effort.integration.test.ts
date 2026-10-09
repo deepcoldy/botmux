@@ -12,8 +12,12 @@ it.skipIf(spawnSync('tmux', ['-V']).status !== 0)('Kimi effort reaches its pane 
   mkdirSync(data);
   const fixture = join(root, 'kimi');
   const output = join(root, 'effort.txt');
+  // The observed path exists only after printf has finished: existence alone
+  // must never let the reader race the shell's create-before-write window.
+  const quotedOutput = "'" + output.replaceAll("'", "'\\''") + "'";
   writeFileSync(fixture, '#!/bin/sh\nprintf "%s" "${KIMI_MODEL_THINKING_EFFORT-unset}" > '
-    + "'" + output.replaceAll("'", "'\\''") + "'\nexec sleep 120\n", { mode: 0o700 });
+    + quotedOutput + '.tmp && mv ' + quotedOutput + '.tmp ' + quotedOutput
+    + '\nexec sleep 120\n', { mode: 0o700 });
   const env: NodeJS.ProcessEnv = { ...process.env, HOME: root, BOTMUX_HOME: join(root, '.botmux'), SESSION_DATA_DIR: data,
     TMUX_TMPDIR: root, SHELL: '/bin/bash', BOTMUX_NO_CLAIM: '1', LARK_APP_ID: 'test', LARK_APP_SECRET: 'test' };
   delete env.KIMI_MODEL_THINKING_EFFORT;

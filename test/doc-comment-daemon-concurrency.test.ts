@@ -19,6 +19,7 @@ vi.mock('@larksuiteoapi/node-sdk', () => {
     WSClient: FakeWSClient,
     EventDispatcher: FakeEventDispatcher,
     LoggerLevel: { info: 2 },
+    withUserAccessToken: () => ({ lark: {} }),
   };
 });
 

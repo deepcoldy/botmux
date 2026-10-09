@@ -8,6 +8,8 @@
  *    若群里有管理员，优先 @ 当前群内的管理员（按配置优先级排序）；
  *    避免在群 A 里触发授权时，@ 了一个根本不在本群的管理员打扰对方，导致群内可见的管理员反而收不到提醒。
  *    若群内无任何管理员或非群聊，回落至全局主 owner。
+ *    自助申请（maybeSendGrantRequestCard）另走 resolveGrantRequestRoute：会话里没有管理员时
+ *    （p2p、或群里查不到管理员），卡片改投主 owner 私聊，否则群外 owner 根本点不到卡。
  * 3. 授权卡操作闸门与 /grant 权限闸门：允许该 bot 的任意有效管理员（owner 或 co-owner）处置。
  */
 import { getBot, getOwnerOpenId } from '../../bot-registry.js';
@@ -141,4 +143,70 @@ export async function resolveGrantApprover(
   }
 
   return fallbackOwner;
+}
+
+/**
+ * 授权申请卡的投递路线：
+ * - `in_chat`：卡片回复在原会话里，由会话内的管理员处置（原行为）；
+ * - `dm`：会话里没有任何管理员可点卡片，改投 approver 自己的私聊。
+ */
+export interface GrantRequestRoute {
+  approver: string;
+  delivery: 'in_chat' | 'dm';
+}
+
+/**
+ * 决定无权限者自助申请（maybeSendGrantRequestCard）的卡片投给谁、投在哪。
+ *
+ * 与 resolveGrantApprover 的区别：后者只挑「@ 谁」，单管理员时零网络开销直接回主 owner，
+ * 无法区分「owner 在群里」和「兜底回落」。这里需要这个区分，所以群聊恒查一次群成员
+ * （复用同一份 60s 缓存）：
+ * - p2p：会话里只有申请人和 bot，管理员必然不在 → `dm` 给主 owner；
+ * - 群聊且消息显式 @ 了某位管理员 → `in_chat`（飞书只能 @ 群成员）；
+ * - 群成员里有管理员 → `in_chat`，@ 按配置优先级的首位在群管理员；
+ * - 群成员查询成功但没有任何管理员 → `dm` 给主 owner；
+ * - 查询失败 / 非飞书群 id → `in_chat` 回落主 owner（与改动前一致，fail 到旧行为）。
+ */
+export async function resolveGrantRequestRoute(
+  larkAppId: string,
+  chatId: string | undefined,
+  chatType: 'p2p' | 'group',
+  message?: any,
+  deps: ResolveGrantApproverDeps = {},
+): Promise<GrantRequestRoute | undefined> {
+  const getAdmins = deps.getBotAdminOpenIds ?? getBotAdminOpenIds;
+  const getOwner = deps.getOwnerOpenId ?? getOwnerOpenId;
+  const listMembers = deps.listChatMemberOpenIds ?? listChatMemberOpenIds;
+
+  const owner = getOwner(larkAppId);
+  const adminCandidates = getAdmins(larkAppId);
+  const candidates = owner && !adminCandidates.includes(owner) ? [owner, ...adminCandidates] : adminCandidates;
+  const fallbackOwner = owner ?? candidates[0];
+  if (!fallbackOwner) return undefined;
+
+  if (chatType === 'p2p') return { approver: fallbackOwner, delivery: 'dm' };
+  if (typeof chatId !== 'string' || !chatId.startsWith('oc_')) {
+    return { approver: fallbackOwner, delivery: 'in_chat' };
+  }
+
+  if (message?.mentions && Array.isArray(message.mentions)) {
+    const mentionedOpenIds = new Set<string>();
+    for (const m of message.mentions) {
+      const openId = m?.id?.open_id ?? m?.open_id;
+      if (typeof openId === 'string') mentionedOpenIds.add(openId);
+    }
+    const mentionedAdmin = candidates.find(admin => mentionedOpenIds.has(admin));
+    if (mentionedAdmin) return { approver: mentionedAdmin, delivery: 'in_chat' };
+  }
+
+  try {
+    const memberSet = await getChatMemberSet(larkAppId, chatId, listMembers);
+    const inChatAdmin = candidates.find(admin => memberSet.has(admin));
+    return inChatAdmin
+      ? { approver: inChatAdmin, delivery: 'in_chat' }
+      : { approver: fallbackOwner, delivery: 'dm' };
+  } catch (err) {
+    logger.debug(`[grant] Failed to list chat members for ${chatId}: ${err}`);
+    return { approver: fallbackOwner, delivery: 'in_chat' };
+  }
 }

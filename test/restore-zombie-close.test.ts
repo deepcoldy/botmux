@@ -295,7 +295,7 @@ import { logger } from '../src/utils/logger.js';
 
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'restore-zombie-test-'));
-  sessionStore.init();
+  sessionStore.init('app_test');
   wp.registry = null;
   transferState.active = new WeakSet<object>();
   transferState.callbacks = new WeakMap<object, Set<() => void>>();
@@ -339,6 +339,130 @@ function makeActivePersistentSession(rootMessageId: string, backendType: 'tmux' 
 }
 
 describe('restoreActiveSessions — narrow XPI recovery containment', () => {
+  function makePrincipalLaneSession(rootMessageId: string) {
+    sessionStore.init('app_test');
+    const legacy = makeActivePersistentSession(rootMessageId);
+    legacy.workingDir = process.cwd();
+    legacy.ownerOpenId = 'ou_owner';
+    legacy.ownerUnionId = 'on_owner';
+    sessionStore.updateSession(legacy);
+    const ensured = sessionStore.ensurePrincipalLaneSource({
+      sourceSessionId: legacy.sessionId,
+      caller: {
+        senderType: 'user',
+        kind: 'union',
+        unionId: 'on_owner',
+      },
+      now: '2026-09-22T00:00:00.000Z',
+    });
+    if (ensured.status !== 'ready') {
+      throw new Error(`principal lane fixture bootstrap failed: ${JSON.stringify(ensured)}`);
+    }
+    const session = sessionStore.getOwnedSession(legacy.sessionId)!;
+    session.principalLaneQueuedTurns = [{
+      version: 1,
+      turnId: 'om_attempting',
+      caller: { requestLarkAppId: 'app_test', requestUserOpenId: 'ou_owner', senderType: 'user' },
+      userPrompt: 'attempting',
+      title: 'attempting',
+      cliInput: { content: 'attempting', resources: [] },
+      createdAt: '2026-09-22T00:00:01.000Z',
+      resume: true,
+      dispatchState: 'attempting',
+    }, {
+      version: 1,
+      turnId: 'om_next',
+      caller: { requestLarkAppId: 'app_test', requestUserOpenId: 'ou_owner', senderType: 'user' },
+      userPrompt: 'next',
+      title: 'next',
+      cliInput: { content: 'next', resources: [] },
+      createdAt: '2026-09-22T00:00:02.000Z',
+      resume: true,
+      dispatchState: 'queued',
+    }];
+    sessionStore.updateSession(session);
+    return session;
+  }
+
+  it('terminalizes a principal-lane attempting head before restore and keeps the next turn runnable', async () => {
+    const lane = makePrincipalLaneSession('om_principal_lane_recovery');
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+
+    const notices = await restoreActiveSessions(map);
+
+    expect(notices).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        kind: 'principal_lane_dispatch_unknown',
+        sessionId: lane.sessionId,
+        turnId: 'om_attempting',
+      }),
+    ]));
+    const persisted = sessionStore.getSession(lane.sessionId)!;
+    expect(persisted.principalLaneQueuedTurns).toMatchObject([
+      { turnId: 'om_next', dispatchState: 'queued' },
+    ]);
+    expect(persisted.principalLaneDispatchUnknownNotices).toMatchObject([
+      { turnId: 'om_attempting', noticePending: true },
+    ]);
+    expect(persisted.restoreQuarantinedAt).toBeUndefined();
+    expect([...map.values()].map(ds => ds.session.sessionId)).toContain(lane.sessionId);
+  });
+
+  it('retries principal-lane boot reconciliation on store busy', async () => {
+    const lane = makePrincipalLaneSession('om_principal_lane_busy_retry');
+    const originalMutate = sessionStore.mutateOwnedSessionsAtomically;
+    let attempts = 0;
+    const mutation = vi.spyOn(sessionStore, 'mutateOwnedSessionsAtomically').mockImplementation((ids, mutate, options) => {
+      if (ids.length === 1 && ids[0] === lane.sessionId && attempts++ < 2) {
+        throw new sessionStore.SessionStoreBusyError(new Error('synthetic busy'));
+      }
+      return originalMutate(ids, mutate, options);
+    });
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+    try {
+      const notices = await restoreActiveSessions(map);
+      expect(attempts).toBe(3);
+      expect(notices).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: 'principal_lane_dispatch_unknown', turnId: 'om_attempting' }),
+      ]));
+      expect(sessionStore.getSession(lane.sessionId)?.restoreQuarantinedAt).toBeUndefined();
+      expect([...map.values()].map(ds => ds.session.sessionId)).toContain(lane.sessionId);
+    } finally {
+      mutation.mockRestore();
+    }
+  });
+
+  it('keeps a principal lane closed when boot reconciliation persistence exhausts retries', async () => {
+    const lane = makePrincipalLaneSession('om_principal_lane_busy_fail_closed');
+    const healthy = makeActivePersistentSession('om_principal_lane_healthy_peer');
+    const originalMutate = sessionStore.mutateOwnedSessionsAtomically;
+    const mutation = vi.spyOn(sessionStore, 'mutateOwnedSessionsAtomically').mockImplementation((ids, mutate, options) => {
+      if (ids.length === 1 && ids[0] === lane.sessionId) {
+        throw new sessionStore.SessionStoreBusyError(new Error('synthetic persistent busy'));
+      }
+      return originalMutate(ids, mutate, options);
+    });
+    const map = new Map<string, DaemonSession>();
+    wp.registry = map;
+    try {
+      const notices = await restoreActiveSessions(map);
+      expect(notices).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'principal_lane_recovery_quarantine',
+          sessionId: lane.sessionId,
+          reason: 'recovery_persistence_failure',
+        }),
+      ]));
+      expect([...map.values()].map(ds => ds.session.sessionId)).not.toContain(lane.sessionId);
+      expect([...map.values()].map(ds => ds.session.sessionId)).toContain(healthy.sessionId);
+      expect(sessionStore.getSession(lane.sessionId)?.restoreQuarantinedAt).toBeDefined();
+    } finally {
+      mutation.mockRestore();
+    }
+  });
+
   it('quarantines only the stale XPI session before restore side effects and keeps restoring a healthy peer', async () => {
     const stale = makeActivePersistentSession('om_stale_xpi');
     stale.crossPrincipalInterruptions = [{
@@ -354,7 +478,7 @@ describe('restoreActiveSessions — narrow XPI recovery containment', () => {
     }];
     sessionStore.updateSession(stale);
     const healthy = makeActivePersistentSession('om_healthy_peer');
-    sessionStore.init();
+    sessionStore.init('app_test');
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
@@ -383,7 +507,7 @@ describe('restoreActiveSessions — narrow XPI recovery containment', () => {
       session.xpiSharedCwdAdmissionCoordinatorSessionId = coordinator.sessionId;
       sessionStore.updateSession(session);
     }
-    sessionStore.init();
+    sessionStore.init('app_test');
     const originalMutate = sessionStore.mutateOwnedSessionsAtomically;
     const mutation = vi.spyOn(sessionStore, 'mutateOwnedSessionsAtomically').mockImplementation((ids, mutate, options) => {
       if (ids.includes(coordinator.sessionId)) throw new Error('synthetic group persistence failure');
@@ -454,7 +578,7 @@ describe('restoreActiveSessions — mojo identity freeze attribution (P0-4)', ()
     s.cliId = undefined;
     s.riffParentTaskId = 'legacy-task-1';
     sessionStore.updateSession(s);
-    sessionStore.init();
+    sessionStore.init('app_test');
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
@@ -480,7 +604,7 @@ describe('restoreActiveSessions — mojo identity freeze attribution (P0-4)', ()
     s.backendType = undefined;
     s.cliId = undefined;
     sessionStore.updateSession(s);
-    sessionStore.init();
+    sessionStore.init('app_test');
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
@@ -523,7 +647,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
       status: 'active',
     };
     sessionStore.updateSession(s);
-    sessionStore.init();
+    sessionStore.init('app_test');
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
@@ -564,7 +688,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
       status: 'active',
     };
     sessionStore.updateSession(s);
-    sessionStore.init();
+    sessionStore.init('app_test');
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
     vi.mocked(setActiveSessionSafe).mockImplementationOnce(async (sessions, key, ds) => {
@@ -615,7 +739,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
       status: 'active',
     };
     sessionStore.updateSession(s);
-    sessionStore.init();
+    sessionStore.init('app_test');
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
@@ -639,7 +763,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
       updatedAt: new Date().toISOString(),
     };
     sessionStore.updateSession(s);
-    sessionStore.init();
+    sessionStore.init('app_test');
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
@@ -675,7 +799,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
       updatedAt: new Date().toISOString(),
     };
     sessionStore.updateSession(s);
-    sessionStore.init();
+    sessionStore.init('app_test');
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
@@ -706,7 +830,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
       updatedAt: new Date().toISOString(),
     };
     sessionStore.updateSession(s);
-    sessionStore.init();
+    sessionStore.init('app_test');
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
@@ -734,7 +858,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
       updatedAt: new Date().toISOString(),
     };
     sessionStore.updateSession(s);
-    sessionStore.init();
+    sessionStore.init('app_test');
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
@@ -774,7 +898,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
       updatedAt: new Date().toISOString(),
     };
     sessionStore.updateSession(s);
-    sessionStore.init();
+    sessionStore.init('app_test');
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
@@ -806,7 +930,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
       updatedAt: new Date().toISOString(),
     };
     sessionStore.updateSession(s);
-    sessionStore.init();
+    sessionStore.init('app_test');
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
@@ -836,7 +960,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
       updatedAt: '',
     };
     sessionStore.updateSession(s);
-    sessionStore.init();
+    sessionStore.init('app_test');
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
@@ -1033,7 +1157,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
     s.agentFrozen = true;
     s.cliInstanceBinding = { version: 1, source: 'legacy', instanceId: null, cliId: 'codex', codexHome: '/private/legacy-home', authMode: 'global' };
     sessionStore.updateSession(s);
-    sessionStore.init();
+    sessionStore.init('app_test');
     bot.cliId = 'traex';
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
@@ -1377,7 +1501,7 @@ describe('restoreActiveSessions — persistent-backend zombie-close decision', (
 
     // Simulate a fresh daemon process: discard the in-memory store and reload
     // the active session from sessions.json before restoring workers.
-    sessionStore.init();
+    sessionStore.init('app_test');
     const map = new Map<string, DaemonSession>();
     wp.registry = map;
 
@@ -1485,7 +1609,7 @@ describe('restoreActiveSessions — stale preview target cleanup', () => {
 
     // Re-read from disk: a target that survived the write would come back on
     // the next restart (or through any offline row reader).
-    sessionStore.init();
+    sessionStore.init('app_test');
     expect(sessionStore.getSession(s.sessionId)?.previewTarget).toBeUndefined();
   });
 

@@ -1,3 +1,4 @@
+import type { OutboundMessageOptions } from '../../im/lark/client.js';
 import { z } from 'zod';
 
 import { replyMessage } from '../../im/lark/client.js';
@@ -38,77 +39,82 @@ export function parseFeishuReplyInput(input: unknown): FeishuReplyInput {
  * into the inputHash; otherwise a retry against a different parent would
  * silently land on the original parent.
  */
-export const feishuReplyExecutor: SideEffectingExecutor<FeishuReplyInput, FeishuReplyOutput> = {
-  provider: 'feishu-im',
-  idempotencyTtlMs: PROVIDER_TTL_MS['feishu-im'],
+export function createFeishuReplyExecutor(options?: OutboundMessageOptions): SideEffectingExecutor<FeishuReplyInput, FeishuReplyOutput> {
+  return {
+    provider: 'feishu-im',
+    idempotencyTtlMs: PROVIDER_TTL_MS['feishu-im'],
 
-  canonicalInput(input) {
-    return {
-      root_message_id: input.rootMessageId,
-      msg_type: input.msgType ?? 'text',
-      content: input.content,
-      reply_in_thread: input.replyInThread ?? false,
-      larkAppId: input.larkAppId,
-    };
-  },
-
-  async invoke(input, idempotencyKey) {
-    const messageId = await replyMessage(
-      input.larkAppId,
-      input.rootMessageId,
-      input.content,
-      input.msgType ?? 'text',
-      input.replyInThread ?? false,
-      idempotencyKey,
-    );
-    return {
-      output: { messageId },
-      externalRefs: { messageId },
-    };
-  },
-
-  classifyError: classifyFeishuError,
-};
-
-export const feishuReplyReconciler: ProviderReconciler = {
-  provider: 'feishu-im',
-  requiresEffectInput: true,
-
-  canonicalInput(input) {
-    return feishuReplyExecutor.canonicalInput(input as FeishuReplyInput);
-  },
-
-  async idempotentSubmit(idempotencyKey, input) {
-    let parsed: FeishuReplyInput;
-    try {
-      parsed = parseFeishuReplyInput(input);
-    } catch (err) {
+    canonicalInput(input) {
       return {
-        ok: false,
-        errorCode: 'InputValidationFailed',
-        errorClass: 'manual',
-        errorMessage: err instanceof Error ? err.message : String(err),
-        evidence: { source: 'idempotentSubmit', reason: 'invalid_effect_input' },
+        root_message_id: input.rootMessageId,
+        msg_type: input.msgType ?? 'text',
+        content: input.content,
+        reply_in_thread: input.replyInThread ?? false,
+        larkAppId: input.larkAppId,
       };
-    }
+    },
 
-    try {
-      const { externalRefs } = await feishuReplyExecutor.invoke(parsed, idempotencyKey);
+    async invoke(input, idempotencyKey) {
+      const args = [input.larkAppId, input.rootMessageId, input.content, input.msgType ?? 'text', input.replyInThread ?? false, idempotencyKey] as const;
+      const messageId = options
+        ? await replyMessage(...args, undefined, options)
+        : await replyMessage(...args);
       return {
-        ok: true,
-        externalRefs,
-        evidence: { source: 'idempotentSubmit', externalRefs },
+        output: { messageId },
+        externalRefs: { messageId },
       };
-    } catch (err) {
-      const classification = classifyFeishuError(err) ?? defaultFeishuClassification(err);
-      return {
-        ok: false,
-        ...classification,
-        evidence: { source: 'idempotentSubmit' },
-      };
-    }
-  },
-};
+    },
+
+    classifyError: classifyFeishuError,
+  };
+}
+
+export const feishuReplyExecutor = createFeishuReplyExecutor();
+
+export function createFeishuReplyReconciler(options?: OutboundMessageOptions): ProviderReconciler {
+  const executor = createFeishuReplyExecutor(options);
+  return {
+    provider: 'feishu-im',
+    requiresEffectInput: true,
+
+    canonicalInput(input) {
+      return executor.canonicalInput(input as FeishuReplyInput);
+    },
+
+    async idempotentSubmit(idempotencyKey, input) {
+      let parsed: FeishuReplyInput;
+      try {
+        parsed = parseFeishuReplyInput(input);
+      } catch (err) {
+        return {
+          ok: false,
+          errorCode: 'InputValidationFailed',
+          errorClass: 'manual',
+          errorMessage: err instanceof Error ? err.message : String(err),
+          evidence: { source: 'idempotentSubmit', reason: 'invalid_effect_input' },
+        };
+      }
+
+      try {
+        const { externalRefs } = await executor.invoke(parsed, idempotencyKey);
+        return {
+          ok: true,
+          externalRefs,
+          evidence: { source: 'idempotentSubmit', externalRefs },
+        };
+      } catch (err) {
+        const classification = classifyFeishuError(err) ?? defaultFeishuClassification(err);
+        return {
+          ok: false,
+          ...classification,
+          evidence: { source: 'idempotentSubmit' },
+        };
+      }
+    },
+  };
+}
+
+export const feishuReplyReconciler = createFeishuReplyReconciler();
 
 function defaultFeishuClassification(err: unknown) {
   return {

@@ -134,9 +134,11 @@ export function buildBotmuxShellHints(locale?: Locale, noTransport?: boolean, re
       hiddenContextDefense(locale),
     ]).map(escapeXmlTagLikeTokens);
   if (whiteboardEnabled()) {
-    hints.push(escapeXmlTagLikeTokens(transcript
-      ? '出现 <whiteboard> 时可用本地白板：按需 `botmux whiteboard read/update`；用户可见结论写进最终回复即可；不要写密钥/隐私；更新默认用中文。'
-      : '出现 <whiteboard> 时可用本地白板：按需 `botmux whiteboard read/update`；用户可见结论仍用 `botmux send`；不要写密钥/隐私；更新默认用中文。'));
+    hints.push(escapeXmlTagLikeTokens(t(
+      transcript ? 'ai.whiteboard.hint_transcript_shell' : 'ai.whiteboard.hint_send_shell',
+      undefined,
+      locale,
+    )));
   }
   return hints;
 }
@@ -286,9 +288,11 @@ export function buildBotmuxSystemPromptText(opts: {
   const whiteboardRouting = whiteboardEnabled()
     ? [
       '',
-      escapeXmlTagLikeTokens(transcript
-        ? '出现 <whiteboard> 时可用本地白板：按需 `botmux whiteboard read/update`；不要写密钥/隐私；更新默认用中文；用户可见结论写进最终回复即可。'
-        : '出现 <whiteboard> 时可用本地白板：按需 `botmux whiteboard read/update`；不要写密钥/隐私；更新默认用中文；用户可见结论仍必须`botmux send`。'),
+      escapeXmlTagLikeTokens(t(
+        transcript ? 'ai.whiteboard.hint_transcript_system' : 'ai.whiteboard.hint_send_system',
+        undefined,
+        locale,
+      )),
     ]
     : [];
   // The multiline rule reads as a peer bullet of usage_send here (the

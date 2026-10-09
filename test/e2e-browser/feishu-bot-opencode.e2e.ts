@@ -1,2 +1,4 @@
 import { createBotTest } from './bot-test-factory.js';
-createBotTest('OpenCode');
+export function registerMidsceneSuites(): void {
+  createBotTest('OpenCode');
+}

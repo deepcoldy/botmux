@@ -162,7 +162,25 @@ v2.95.0 起 botmux 会检测这种"会话没真正起来"的情况并发一张�
 
 ## 怎么升级？
 
-`botmux upgrade`——它会按你的安装方式自动选路：curl 安装的原地换二进制，npm 安装的交回 `npm i -g botmux@latest`。curl 用户也可以直接重跑一遍安装命令（同样是原地升级，不会重复写 PATH）。会话内的 `botmux` wrapper 版本始终跟 daemon 一致，无需单独升级。升级后记得 `botmux restart` 让新版本生效。
+**一律重跑安装命令（curl），与当初怎么装的无关**——npm / pnpm 全局安装的也用它升：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
+```
+
+它把自包含二进制原地替换到 `~/.botmux/bin/botmux`：下载后先在本机试跑，跑不起来会明确报错并**保留旧版本**；幂等，不会重复写 PATH；全程不需要 Node。装完**开一个新终端**再执行 `botmux restart`——installer 已把 `~/.botmux/bin` 前置到 PATH，新终端才能保证 `botmux` 命中新版本（老 npm 安装的当前 shell 里，`botmux` 可能仍指向 npm 全局目录）。会话内的 `botmux` wrapper 始终跟 daemon 同版本，无需单独升级。
+
+**装指定版本**（回滚 / 锁版本同理；版本标签必须带 `v` 前缀）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | BOTMUX_VERSION=v3.18.8 sh
+```
+
+> ⚠️ `BOTMUX_VERSION` 必须写在管道**右侧的 `sh` 前面**。写成 `BOTMUX_VERSION=… curl … | sh` 时变量只对 curl 生效、`sh` 收不到，会静默改装最新版。
+
+### 为什么 v3.18.0 之前的老版本不能用 npm 升级？
+
+v3.18.0 起 npm 包从「Node + `dist/` 源码」改成**平台二进制子包**，`node-pty` 移出了依赖。老版本自带的 `botmux upgrade` 当时就是交回 npm；npm 跨这个边界安装时会把旧目录里的 `node-pty` 清掉，而旧 daemon 重启的第一步仍是 `node …/dist/cli.js restart`——该文件仍静态 import `node-pty`，于是 `ERR_MODULE_NOT_FOUND`、重启驱动死掉、整个 daemon 舰队起不回来（输出里却可能已经提示「正在重启以应用更新」）。curl 直接落新二进制并让启动器指向它，不经过旧目录、也不看 npm 怎么剪依赖，是跨这个边界唯一稳妥的方式。≥3.18 的二进制安装上 `botmux upgrade` 与重跑 curl 等价；不确定自己是什么安装形态时，统一用 curl 即可。
 
 ## CoCo 忙时发消息丢失？
 

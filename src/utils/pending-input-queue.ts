@@ -129,14 +129,19 @@ export function mergeQueuedCliInput(
 
 /** Durable delivery and ordinary IM turns share one CLI but must not steer
  *  into each other. Adapter type-ahead remains available only while neither
- *  the active turn nor the next queued input is a durable attempt. */
+ *  the active turn nor the next queued input is a durable attempt. Direct RPC
+ *  is also forced serial while its current native turn is unresolved: unlike
+ *  Codex App's runner, that engine has no turn/steer grouping contract, so a
+ *  second turn/start against the busy thread would have an ambiguous outcome. */
 export function pendingInputAllowsTypeAhead(
   adapterSupportsTypeAhead: boolean,
   durableTurnInFlight: boolean,
   next: PendingCliInput | undefined,
+  directRpcTurnInFlight = false,
 ): boolean {
   return adapterSupportsTypeAhead
     && !durableTurnInFlight
+    && !directRpcTurnInFlight
     && next?.dispatchAttempt === undefined
     && !next?.vcMeetingImTurnOrigin;
 }
@@ -254,13 +259,18 @@ export function shouldArmSpawnArgvInitialPromptBusy(opts: {
   return true;
 }
 
-/** Once either side of a queue boundary is durable, stop this batch and wait
- *  for the next reliable idle edge before writing the following turn. */
+/** Stop this batch when back-to-back writes are disabled or either side of the
+ *  queue boundary is durable. A message can arrive while writeInput is awaiting
+ *  its receipt; `isFlushing` admits it to the queue so the active drain can see
+ *  it, but an opted-in adapter must leave it there until the next real idle
+ *  edge. */
 export function shouldStopPendingBatch(
   written: PendingCliInput,
   next: PendingCliInput | undefined,
+  allowBackToBackWrites = true,
 ): boolean {
-  return written.dispatchAttempt !== undefined
+  return !allowBackToBackWrites
+    || written.dispatchAttempt !== undefined
     || next?.dispatchAttempt !== undefined
     || !!written.queuedActivationToken
     || !!next?.queuedActivationToken

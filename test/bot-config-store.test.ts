@@ -78,6 +78,91 @@ describe('bot-config store', () => {
     return { registry, store, pinStreamingCardChange };
   }
 
+  it('round-trips envPolicy through shared CLI coercion, file parsing, persistence and memory', async () => {
+    const { registry, store } = await loaded({ envPolicy: { mode: 'strict', inherit: ['HTTPS_PROXY'] } });
+    const spec = store.findConfigField('envPolicy')!;
+    expect(spec.effect).toBe('next-session');
+    const coerced = store.coerceConfigValue(spec, '{"mode":"strict","inherit":["NODE_EXTRA_CA_CERTS","HTTPS_PROXY","HTTPS_PROXY"]}');
+    expect(coerced.ok).toBe(true);
+    if (!coerced.ok) return;
+    expect((await store.applyConfigField('app_default', spec, coerced.value)).ok).toBe(true);
+    const saved = readConfig().envPolicy;
+    expect(saved).toEqual({ mode: 'strict', inherit: ['HTTPS_PROXY', 'NODE_EXTRA_CA_CERTS'] });
+    expect(registry.getBot('app_default').config.envPolicy).toEqual(saved);
+    expect(registry.loadBotConfigs()[0]!.envPolicy).toEqual(saved);
+    expect((await store.applyConfigField('app_default', spec, { mode: 'strict', inherit: ['BOTMUX_OWNER_OPEN_ID'] })).ok).toBe(false);
+    expect(readConfig().envPolicy).toEqual(saved);
+    expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
+    expect(readConfig().envPolicy).toBeUndefined();
+    expect(registry.getBot('app_default').config.envPolicy).toBeUndefined();
+  });
+  it('rejects a malformed strict file policy instead of falling back to inherited credentials', async () => {
+    writeConfig({ envPolicy: { mode: 'strict', inherit: ['*'] } });
+    const { registry } = await freshModules();
+    expect(() => registry.loadBotConfigs()).toThrow('permitted environment variable names');
+  });
+
+  it('zero injection is per-bot, preserves reply preferences, and refuses unsupported CLI changes', async () => {
+    const { registry, store } = await loaded({ cliId: 'codex', replyDelivery: 'send' });
+    const spec = store.findConfigField('promptInjection')!;
+    expect((await store.applyConfigField('app_default', spec, 'none')).ok).toBe(true);
+    expect(readConfig()).toMatchObject({ promptInjection: 'none', replyDelivery: 'send' });
+    const { effectiveReplyDelivery } = await import('../src/core/reply-delivery.js');
+    expect(effectiveReplyDelivery('app_default', 'codex')).toBe('transcript');
+    registry.registerBot({ larkAppId: 'plain', larkAppSecret: 's', cliId: 'codex' });
+    expect(effectiveReplyDelivery('plain', 'codex')).toBe('send');
+    const cli = store.findConfigField('cli')!;
+    const changed = await store.applyConfigField('app_default', cli, 'gemini');
+    expect(changed).toMatchObject({ ok: false, reason: 'zero_prompt_unsupported' });
+    expect(readConfig().cliId).toBe('codex');
+    expect((await store.applyConfigField('app_default', spec, 'default')).ok).toBe(true);
+    expect(effectiveReplyDelivery('app_default', 'codex')).toBe('send');
+    expect(readConfig().replyDelivery).toBe('send');
+  });
+
+  it.each(['traex', 'coco', 'hermes', 'mtr', 'pi', 'oh-my-pi', 'ebsd', 'grok'])('enables zero injection for %s using its final-reply capability', async (cliId) => {
+    const { store } = await loaded({ cliId, replyDelivery: 'send' });
+    expect((await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none')).ok).toBe(true);
+    expect(readConfig()).toMatchObject({ promptInjection: 'none', replyDelivery: 'send' });
+    const { effectiveReplyDelivery } = await import('../src/core/reply-delivery.js');
+    expect(effectiveReplyDelivery('app_default', cliId)).toBe('transcript');
+  });
+
+  it.each(['codex', 'traex'])('supports zero injection with local %s RPC input', async (cliId) => {
+    const { store } = await loaded({ cliId, codexRpcInput: true });
+    expect((await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none')).ok).toBe(true);
+    expect(readConfig()).toMatchObject({ promptInjection: 'none', codexRpcInput: true });
+  });
+
+  it('rejects zero injection without automatic reply support', async () => {
+    const { store } = await loaded({ cliId: 'gemini' });
+    expect(await store.applyConfigField('app_default', store.findConfigField('promptInjection')!, 'none'))
+      .toMatchObject({ ok: false, reason: 'zero_prompt_unsupported' });
+    expect(readConfig().promptInjection).toBeUndefined();
+  });
+
+  it.each([undefined, 'reject', 'trusted-egress'])('network policy with proxyMode %s persists atomically; clear restores legacy network', async proxyMode => {
+    const { registry, store } = await loaded({ sandbox: true, backendType: 'pty', sandboxNetwork: false });
+    const spec = store.findConfigField('sandboxNetworkPolicy')!;
+    const policy = { version: 1, public: { mode: 'allow' }, private: { mode: 'block' }, ...(proxyMode !== undefined ? { proxyMode } : {}) };
+    expect(store.coerceConfigValue(spec, JSON.stringify(policy))).toMatchObject({ ok: true, value: policy });
+    expect(store.coerceConfigValue(spec, JSON.stringify({ ...policy, public: { mode: 'allowlist', rules: [{ cidr: 'example.org' }] } }))).toMatchObject({ ok: false });
+    // Linux-only runtime support is a deliberate gate, not a silent no-op.
+    if (process.platform !== 'linux') {
+      expect(await store.applyConfigField('app_default', spec, policy)).toMatchObject({ ok: false });
+      expect(readConfig()).not.toHaveProperty('sandboxNetworkPolicy');
+      return;
+    }
+    expect((await store.applyConfigField('app_default', spec, policy)).ok).toBe(true);
+    expect(readConfig().sandboxNetworkPolicy).toEqual(policy);
+    expect(registry.getBot('app_default').config.sandboxNetworkPolicy).toEqual(policy);
+    expect(await store.applyConfigField('app_default', store.findConfigField('backendType')!, 'tmux')).toMatchObject({ ok: false });
+    expect(readConfig().backendType).toBe('pty');
+    expect((await store.applyConfigField('app_default', spec, null)).ok).toBe(true);
+    expect(readConfig()).not.toHaveProperty('sandboxNetworkPolicy');
+    expect(readConfig().sandboxNetwork).toBe(false);
+  });
+
   it('CONFIG_FIELDS have unique keys and include allowedUsers', async () => {
     const { store } = await freshModules();
     const keys = store.CONFIG_FIELDS.map(f => f.key);
@@ -101,6 +186,22 @@ describe('bot-config store', () => {
       value: { enabled: true, audience: 'requester' },
     });
     expect(store.coerceConfigValue(spec, '{"enabled":true,"audience":"all"}')).toEqual({ ok: false, reason: 'invalid_json' });
+  });
+
+  it('validates, persists, cold-loads and clears opt-in /g defaults', async () => {
+    const { registry, store } = await loaded();
+    const spec = store.findConfigField('groupCreation')!;
+    const value = { agents: ['cli_review_app'], tag: 'Work', avatar: 'name' };
+    const parsed = store.coerceConfigValue(spec, JSON.stringify(value));
+    expect(parsed).toEqual({ ok: true, value });
+    if (!parsed.ok) throw new Error(parsed.reason);
+    expect(await store.applyConfigField('app_default', spec, parsed.value)).toMatchObject({ ok: true });
+    expect(readConfig().groupCreation).toEqual(value);
+    expect(registry.loadBotConfigs()[0].groupCreation).toEqual(value);
+    expect(registry.getBot('app_default').config.groupCreation).toEqual(value);
+    expect(store.coerceConfigValue(spec, '{"agents":"bad"}').ok).toBe(false);
+    await store.applyConfigField('app_default', spec, null);
+    expect(readConfig().groupCreation).toBeUndefined();
   });
 
   it('persists Oncall button settings without changing feedback or chat overrides', async () => {

@@ -163,3 +163,12 @@ describe('fork topic presentation', () => {
     expect(result.title).toBe('看图');
   });
 });
+
+it('matches normalized image attachments by provider key when forking', async () => {
+  const msg = message(JSON.stringify(body));
+  msg.attachments = [{ type: 'image', resourceKey: 'img_source', name: 'img_source.gif', path: '/tmp/source.gif', mimeType: 'image/gif' }];
+  const io = deps();
+  const result = await prepareForkTopic('task', msg, io);
+  expect(io.upload).toHaveBeenCalledWith('/tmp/source.gif');
+  expect(result.content[1]).toEqual([{ tag: 'img', image_key: 'img_owned_by_bot' }]);
+});

@@ -60,4 +60,19 @@ describe('VC meeting consumer managed side-effect isolation (plan B: operator ow
       backendType: 'pty',
     })).toEqual({ ok: true, isolated: false });
   });
+
+  it('treats scratch as NOT credential-isolated (write-COW is not a secret boundary)', () => {
+    // scratch reads the real fs / own CLI credential stores; it must not be
+    // reported as isolated to an untrusted multi-party VC consumer.
+    expect(evaluateVcMeetingConsumerIsolation({
+      sandbox: 'scratch',
+      platform: 'linux',
+      backendType: 'pty',
+    })).toEqual({ ok: true, isolated: false });
+    expect(evaluateVcMeetingConsumerIsolation({
+      sandbox: 'oncall',
+      platform: 'linux',
+      backendType: 'pty',
+    })).toEqual(expect.objectContaining({ ok: true, isolated: true }));
+  });
 });

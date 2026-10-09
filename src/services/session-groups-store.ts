@@ -65,6 +65,8 @@ export interface SessionGroupEntry {
   originChatId?: string;
   /** True once the async AI title has been applied to the chat name. */
   titled?: boolean;
+  /** Actual automatic feed group joined by this chat, scoped to ownerOpenId. */
+  feedGroupId?: string;
   /** Failed scheduling rounds (each round contains the service's bounded
    * in-call retry). Persisted so later messages cannot spawn unbounded CLIs. */
   titleAttempts?: number;
@@ -132,6 +134,7 @@ export function registerSessionGroup(chatId: string, entry: Omit<SessionGroupEnt
     originQuotaKey: entry.originQuotaKey,
     originChatId: entry.originChatId,
     titled: entry.titled,
+    feedGroupId: entry.feedGroupId,
     titleAttempts: entry.titleAttempts,
     titleRetryAt: entry.titleRetryAt,
   });
@@ -149,6 +152,14 @@ export function getSessionGroup(chatId: string): SessionGroupEntry | undefined {
   if (!currentAppId) return undefined;
   load();
   return entries.get(chatId);
+}
+
+/** Remember the automatic group only for the user who owns this session group. */
+export function setSessionGroupFeedGroup(chatId: string, ownerOpenId: string, feedGroupId: string): void {
+  const entry = getSessionGroup(chatId);
+  if (!entry || entry.ownerOpenId !== ownerOpenId || entry.feedGroupId === feedGroupId) return;
+  entry.feedGroupId = feedGroupId;
+  persist();
 }
 
 /** Point the registry at the session currently living in this group. */

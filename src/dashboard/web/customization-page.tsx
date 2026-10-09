@@ -1,19 +1,28 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
 import { LoadingState } from './dashboard-components.js';
 import { mountReactPage, type PageDisposer } from './react-mount.js';
 import { confirm } from './confirm-modal.js';
+import { copyText } from './clipboard.js';
 
 // ─── Types (mirror src/dashboard/customization-api.ts payloads) ──────────────
 
 type FragmentKind = 'editable' | 'placeholder' | 'conditional';
+type StageId = 'new' | 'followup' | 'send';
+type TabId = StageId | 'skills';
+
+interface StageMeta { id: StageId; label: string; blurb: string }
+interface BlockMeta { id: string; label: string; hint?: string }
 interface FragmentLocaleState { factory: string; override: string | null }
 interface Fragment {
   key: string;
   block: string;
+  stage: StageId;
+  stages?: StageId[];
   label: string;
   kind: FragmentKind;
   placeholders?: string[];
   gate?: string;
+  gateLabel?: string;
   locales: Record<string, FragmentLocaleState>;
   conditionForced?: boolean | null;
 }
@@ -32,19 +41,23 @@ interface Snapshot {
 }
 interface CustomizationSnapshotPayload {
   enabled: boolean;
+  bots?: Array<{ larkAppId: string; name: string; cliId: string; promptInjection: 'default' | 'none'; supported: boolean }>;
+  stages?: StageMeta[];
+  blocks?: BlockMeta[];
   fragments: Fragment[];
   skills: SkillRow[];
   history: Snapshot[];
 }
 
-const BLOCK_LABELS: Record<string, string> = {
-  botmux_routing: '<botmux_routing> 路由说明',
-  identity: '<identity> 身份规则',
-  shell_hints: 'Shell 提示（codex/gemini 等）',
-  available_bots: '<available_bots> 协作 bot',
-  attachments: '<attachments> 附件',
-  followup: '跟进轮提醒',
-};
+const FALLBACK_STAGES: StageMeta[] = [
+  { id: 'new', label: '会话开始', blurb: '新会话首轮注入的系统提示 / 开场 prompt，每个会话只发一次。两套路径（系统提示 / Shell）覆盖全部 CLI。' },
+  { id: 'followup', label: '每条新消息', blurb: '会话中每条后续消息都会注入的信封块：续轮提醒、附件/提及、白板、记忆等。' },
+  { id: 'send', label: '发送之后', blurb: '模型执行 botmux send 之后，在终端回显里读到的反馈文案。' },
+];
+
+function belongsToStage(frag: Fragment, stage: StageId): boolean {
+  return frag.stage === stage || (frag.stages ?? []).includes(stage);
+}
 
 function rel(ts: string): string {
   const t = Date.parse(ts);
@@ -72,6 +85,8 @@ function FragmentRow(props: {
   locale: string;
   onSaved: (snap: CustomizationSnapshotPayload) => void;
   onError: (msg: string) => void;
+  /** In search-results mode show which stage/block the row lives in. */
+  stageTag?: string;
 }) {
   const { frag, locale } = props;
   const ls = frag.locales[locale] ?? { factory: '', override: null };
@@ -79,6 +94,7 @@ function FragmentRow(props: {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(ls.override ?? ls.factory);
   const [busy, setBusy] = useState(false);
+  const taRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => { setDraft(ls.override ?? ls.factory); setEditing(false); }, [ls.override, ls.factory, locale]);
 
@@ -112,11 +128,28 @@ function FragmentRow(props: {
     finally { setBusy(false); }
   };
 
+  // Insert a {token} at the textarea caret (append when not focused).
+  const insertToken = (token: string) => {
+    const ta = taRef.current;
+    const piece = `{${token}}`;
+    if (!ta) { setDraft(d => d + piece); return; }
+    const start = ta.selectionStart ?? draft.length;
+    const end = ta.selectionEnd ?? draft.length;
+    const next = draft.slice(0, start) + piece + draft.slice(end);
+    setDraft(next);
+    requestAnimationFrame(() => {
+      ta.focus();
+      const pos = start + piece.length;
+      ta.setSelectionRange(pos, pos);
+    });
+  };
+
   return (
     <div className={`cz-frag cz-frag-${frag.kind}${modified ? ' cz-mod' : ''}`}>
       <div className="cz-frag-bar" />
       <div className="cz-frag-inner">
         <div className="cz-frag-top">
+          {props.stageTag ? <span className="cz-stage-tag">{props.stageTag}</span> : null}
           <span className="cz-frag-label">{frag.label}</span>
           <code className="cz-frag-key">{frag.key}</code>
           <span className="cz-frag-badges">
@@ -143,13 +176,31 @@ function FragmentRow(props: {
             {modified ? <button className="cz-link cz-link-reset" disabled={busy} onClick={() => void save(null)}>恢复出厂</button> : null}
           </span>
         </div>
+        {frag.gateLabel ? <div className="cz-gate">注入条件：{frag.gateLabel}</div> : null}
         {editing ? (
           <div className="cz-edit">
-            <textarea className="cz-textarea" value={draft} rows={Math.max(2, Math.ceil(draft.length / 52))} onChange={e => setDraft(e.target.value)} autoFocus />
+            {frag.kind === 'placeholder' && (frag.placeholders ?? []).length > 0 ? (
+              <div className="cz-tokens">
+                <span className="cz-tokens-cap">变量（点击插入光标处）：</span>
+                {(frag.placeholders ?? []).map(p => (
+                  <button
+                    key={p}
+                    type="button"
+                    className="cz-token"
+                    title="复制变量名"
+                    onClick={() => void insertToken(p)}
+                    onContextMenu={e => { e.preventDefault(); void copyText(`{${p}}`); }}
+                  >
+                    {`{${p}}`}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+            <textarea ref={taRef} className="cz-textarea" value={draft} rows={Math.max(2, Math.ceil(draft.length / 52))} onChange={e => setDraft(e.target.value)} autoFocus />
             <div className="cz-edit-actions">
               <button className="cz-btn cz-btn-primary" disabled={busy} onClick={() => void save(draft)}>保存</button>
               <button className="cz-btn cz-btn-ghost" disabled={busy} onClick={() => { setDraft(ls.override ?? ls.factory); setEditing(false); }}>取消</button>
-              {frag.kind === 'placeholder' ? <span className="cz-hint">保留 {(frag.placeholders ?? []).map(p => `{${p}}`).join('、')} 才能保存</span> : null}
+              {frag.kind === 'placeholder' ? <span className="cz-hint">保留 {(frag.placeholders ?? []).map(p => `{${p}}`).join('、')} 才能保存（右键变量可复制）</span> : null}
             </div>
           </div>
         ) : (
@@ -159,6 +210,38 @@ function FragmentRow(props: {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// ─── Block group ─────────────────────────────────────────────────────────────
+
+function BlockGroup(props: {
+  blockId: string;
+  meta?: BlockMeta;
+  fragments: Fragment[];
+  locale: string;
+  onSaved: (snap: CustomizationSnapshotPayload) => void;
+  onError: (msg: string) => void;
+  stageTagFor?: (f: Fragment) => string | undefined;
+}) {
+  return (
+    <div className="cz-block">
+      <div className="cz-block-label">
+        <span className="cz-block-tag">{props.meta?.label ?? props.blockId}</span>
+        {props.meta?.hint ? <span className="cz-block-hint">{props.meta.hint}</span> : null}
+        <span className="cz-block-line" />
+      </div>
+      {props.fragments.map(f => (
+        <FragmentRow
+          key={f.key}
+          frag={f}
+          locale={props.locale}
+          onSaved={props.onSaved}
+          onError={props.onError}
+          stageTag={props.stageTagFor?.(f)}
+        />
+      ))}
     </div>
   );
 }
@@ -283,13 +366,20 @@ function ImportModal(props: { onClose: () => void; onApplied: (snap: Customizati
 
 // ─── Page ──────────────────────────────────────────────────────────────────
 
-function CustomizationPage() {
+export function CustomizationPage() {
   const [data, setData] = useState<CustomizationSnapshotPayload | null>(null);
   const [loadErr, setLoadErr] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [locale, setLocale] = useState<string>('zh');
+  const [tab, setTab] = useState<TabId>('new');
+  const [query, setQuery] = useState('');
   const [showImport, setShowImport] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [savingBots, setSavingBots] = useState(false);
+  const savingBotsRef = useRef(false);
+  const [selectedBots, setSelectedBots] = useState<string[]>([]);
+  const [botQuery, setBotQuery] = useState('');
+  const [botResult, setBotResult] = useState<{ zero: boolean; saved: number; failures: Array<{ name: string; error: string }> } | null>(null);
 
   const flash = useCallback((m: string) => { setToast(m); window.setTimeout(() => setToast(null), 2400); }, []);
   const onError = useCallback((m: string) => flash(`⚠ ${m}`), [flash]);
@@ -317,12 +407,90 @@ function CustomizationPage() {
     } catch (e: any) { onError(e?.message ?? '操作失败'); }
   };
 
+  const setBotInjection = async (zero: boolean) => {
+    const bots = (data?.bots ?? []).filter(bot => selectedBots.includes(bot.larkAppId));
+    if (savingBotsRef.current || !bots.length || (zero && bots.some(bot => !bot.supported))) return;
+    savingBotsRef.current = true;
+    setSavingBots(true);
+    setBotResult(null);
+    const saved = new Set<string>();
+    const failures: Array<{ larkAppId: string; name: string; error: string }> = [];
+    try {
+      // Each bot owns its daemon endpoint. Keep successful writes when another
+      // daemon is offline, and retain only failed selections for a safe retry.
+      for (const bot of bots) {
+        try {
+          await apiJson(`/api/bots/${encodeURIComponent(bot.larkAppId)}/prompt-injection`, {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ promptInjection: zero ? 'none' : 'default' }),
+          });
+          saved.add(bot.larkAppId);
+        } catch (e: any) {
+          failures.push({ larkAppId: bot.larkAppId, name: bot.name, error: e?.message ?? '保存失败' });
+        }
+      }
+      setData(previous => previous ? { ...previous, bots: previous.bots?.map(bot => saved.has(bot.larkAppId)
+        ? { ...bot, promptInjection: zero ? 'none' : 'default' } : bot) } : previous);
+      setSelectedBots(failures.map(bot => bot.larkAppId));
+      setBotResult({ zero, saved: saved.size, failures });
+    } finally {
+      savingBotsRef.current = false;
+      setSavingBots(false);
+    }
+  };
+
+  const stages = data?.stages?.length ? data.stages : FALLBACK_STAGES;
+  const blockMeta = useMemo(() => new Map((data?.blocks ?? []).map(b => [b.id, b])), [data]);
+  const stageLabel = useMemo(() => new Map(stages.map(s => [s.id, s.label])), [stages]);
+
+  // Number of modified fragments per stage (counts cross-listed in each), for
+  // tab badges.
+  const modifiedCountByStage = useMemo(() => {
+    const m: Record<StageId, number> = { new: 0, followup: 0, send: 0 };
+    for (const f of data?.fragments ?? []) {
+      if (f.locales[locale]?.override == null) continue;
+      if (belongsToStage(f, 'new')) m.new += 1;
+      if (belongsToStage(f, 'followup')) m.followup += 1;
+      if (belongsToStage(f, 'send')) m.send += 1;
+    }
+    return m;
+  }, [data, locale]);
+  const skillsModified = (data?.skills ?? []).filter(s => s.override !== null || s.disabled).length;
+
+  // Global search across every stage: match label / key / current text.
+  const searchResults = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return null;
+    return (data?.fragments ?? []).filter(f => {
+      const ls = f.locales[locale] ?? { factory: '', override: null };
+      return f.label.toLowerCase().includes(q)
+        || f.key.toLowerCase().includes(q)
+        || (ls.override ?? ls.factory).toLowerCase().includes(q);
+    });
+  }, [query, data, locale]);
+
   if (loadErr) return <div className="cz-page"><div className="cz-error">加载失败：{loadErr}</div></div>;
   if (!data) return <LoadingState label="加载自定义配置…" />;
 
-  const blocks = Array.from(new Set(data.fragments.map(f => f.block)));
-  const promptModified = data.fragments.filter(f => f.locales[locale]?.override !== null).length;
-  const skillsModified = data.skills.filter(s => s.override !== null || s.disabled).length;
+  // Ordered blocks for a stage: native fragments first, then cross-listed.
+  const blocksForStage = (stage: StageId) => {
+    const all = data.fragments.filter(f => belongsToStage(f, stage));
+    const orderedIds = Array.from(new Set(all.map(f => f.block))); // catalog order
+    const native = new Set(data.fragments.filter(f => f.stage === stage).map(f => f.block));
+    orderedIds.sort((a, b) => Number(!native.has(a)) - Number(!native.has(b)) || 0);
+    return orderedIds.map(blockId => ({
+      blockId,
+      cross: !native.has(blockId),
+      fragments: all.filter(f => f.block === blockId),
+    }));
+  };
+
+  const activeStage = stages.find(s => s.id === tab);
+  const searching = searchResults !== null;
+  const injectionBots = data.bots ?? [];
+  const visibleBots = injectionBots.filter(bot => `${bot.name} ${bot.cliId} ${bot.larkAppId}`.toLowerCase().includes(botQuery.trim().toLowerCase()));
+  const selectableVisibleBots = visibleBots.filter(bot => bot.supported || bot.promptInjection === 'none');
+  const chosenBots = injectionBots.filter(bot => selectedBots.includes(bot.larkAppId));
 
   return (
     <section className="cz-page">
@@ -335,31 +503,111 @@ function CustomizationPage() {
         </div>
       </div>
 
+      <div className="cz-block" data-zero-prompt>
+        <div className="cz-block-label"><b>按 Bot 设置零注入</b></div>
+        <p className="cz-hint">适合由 lead-bot 派活的 sub-bot：只传任务正文与附件，最终回答自动回传。跳过 botmux 的规则、提醒、角色、白板、记忆和技能提示；已有自定义保留。</p>
+        <p className="cz-hint">新会话完整生效，旧历史不会清除。CLI 原生提示、项目 AGENTS.md 和用户自行安装的技能仍由 CLI 管理。按 CLI 的最终回复采集能力判断支持情况，本地 RPC 输入同样适用；暂不支持远端后端和 v3 workflow。</p>
+        {injectionBots.length ? (
+          <div className="cz-bot-picker">
+            <div className="cz-toolbar">
+              <input className="cz-search" type="search" aria-label="搜索 Bot" placeholder="搜索 Bot 名称 / CLI / App ID…"
+                value={botQuery} disabled={savingBots} onChange={e => setBotQuery(e.currentTarget.value)} />
+              <button className="cz-btn cz-btn-ghost" disabled={savingBots || !selectableVisibleBots.length}
+                onClick={() => setSelectedBots(current => [...new Set([...current, ...selectableVisibleBots.map(bot => bot.larkAppId)])])}>全选当前结果</button>
+              <button className="cz-btn cz-btn-ghost" disabled={savingBots || !chosenBots.length} onClick={() => setSelectedBots([])}>清空选择</button>
+            </div>
+            <div className="cz-bot-list" role="group" aria-label="选择要批量设置的 Bot" aria-busy={savingBots}>
+              {visibleBots.map(bot => (
+                <label key={bot.larkAppId} className={`cz-bot-row${selectedBots.includes(bot.larkAppId) ? ' cz-bot-selected' : ''}`}>
+                  <input type="checkbox" aria-label={`选择 ${bot.name}`} checked={selectedBots.includes(bot.larkAppId)}
+                    disabled={savingBots || (!bot.supported && bot.promptInjection !== 'none')}
+                    onChange={e => { const checked = e.currentTarget.checked; setSelectedBots(current => checked
+                      ? [...new Set([...current, bot.larkAppId])] : current.filter(id => id !== bot.larkAppId)); }} />
+                  <span className="cz-bot-name"><b>{bot.name}</b><small>{bot.cliId} · {bot.larkAppId}</small></span>
+                  <span className={`cz-bot-state${bot.promptInjection === 'none' ? ' cz-bot-state-on' : ''}`}>
+                    {bot.promptInjection === 'none' ? '零注入 · 自动回复' : bot.supported ? '原有提示配置' : '暂不支持零注入'}
+                    {!bot.supported && bot.promptInjection === 'none' ? '（仅可恢复）' : ''}
+                  </span>
+                </label>
+              ))}
+              {!visibleBots.length ? <p className="cz-hint">没有匹配的 Bot。</p> : null}
+            </div>
+            <div className="cz-bot-actions">
+              <span className="cz-hint" aria-live="polite">已选 {chosenBots.length} 个 Bot{chosenBots.some(bot => !visibleBots.includes(bot)) ? '（含搜索结果外的选择）' : ''}</span>
+              <button className="cz-btn cz-btn-primary" disabled={savingBots || !chosenBots.length || chosenBots.some(bot => !bot.supported)}
+                onClick={() => void setBotInjection(true)}>开启零注入</button>
+              <button className="cz-btn cz-btn-ghost" disabled={savingBots || !chosenBots.length}
+                onClick={() => void setBotInjection(false)}>恢复原配置</button>
+              {savingBots ? <span className="cz-hint" role="status">正在保存…</span> : null}
+            </div>
+            {botResult ? <div className="cz-bot-result" role={botResult.failures.length ? 'alert' : 'status'}>
+              <div>已{botResult.zero ? '开启零注入' : '恢复原配置'} {botResult.saved} 个 Bot{botResult.saved ? ' · 新会话完整生效' : ''}。</div>
+              {botResult.failures.length ? <>
+                <div>保存失败 {botResult.failures.length} 个，已保留勾选，可重试：</div>
+                <ul>{botResult.failures.map((failure, i) => <li key={i}>{failure.name}：{failure.error}</li>)}</ul>
+              </> : null}
+            </div> : null}
+          </div>
+        ) : <p className="cz-hint">未读取到 Bot 配置。</p>}
+        <p className="cz-hint">lead-bot 使用带稳定 Bot App ID 的派活后，结果由宿主回报到原 lead 会话。CLI 的共享 home 若已有全局 botmux 技能，需先改为按会话注入或使用独立 home。</p>
+      </div>
+
       {/* master switch */}
       <div className="cz-master">
         <div className="cz-master-txt">
           <b>启用自定义</b>
           <span>关闭后所有覆盖立即停用、但不删除——排查「是不是我改的 prompt 导致的」时一键回到出厂行为。</span>
         </div>
-      {/* Reuse the dashboard's proven .toggle-row/.switch (label + hidden
-          checkbox + span) instead of a bare <button>: the global `button` rule
-          forces min-height:32px + horizontal padding, which inflated a
-          hand-rolled switch and pushed its knob outside the track. */}
-      <label className="toggle-row cz-master-switch">
-        <input type="checkbox" checked={data.enabled} onChange={e => void setEnabled(e.currentTarget.checked)} />
-        <span className="switch" aria-hidden="true" />
-      </label>
+        <label className="toggle-row cz-master-switch">
+          <input type="checkbox" checked={data.enabled} onChange={e => void setEnabled(e.currentTarget.checked)} />
+          <span className="switch" aria-hidden="true" />
+        </label>
       </div>
 
       <div className={`cz-dim${data.enabled ? '' : ' cz-dim-off'}`}>
 
-        {/* toolbar */}
+        {/* primary stage tabs + skills */}
+        <div className="cz-tabs" role="tablist">
+          {stages.map(s => (
+            <button
+              key={s.id}
+              role="tab"
+              className={`cz-stage-tab${tab === s.id ? ' cz-stage-tab-on' : ''}`}
+              onClick={() => setTab(s.id)}
+            >
+              {s.label}
+              {modifiedCountByStage[s.id] > 0 ? <span className="cz-tab-badge">{modifiedCountByStage[s.id]}</span> : null}
+            </button>
+          ))}
+          <span className="cz-tabs-sep" />
+          <button
+            role="tab"
+            className={`cz-stage-tab${tab === 'skills' ? ' cz-stage-tab-on' : ''}`}
+            onClick={() => setTab('skills')}
+          >
+            内置 Skill
+            {skillsModified > 0 ? <span className="cz-tab-badge">{skillsModified}</span> : null}
+          </button>
+        </div>
+
+        {/* secondary row: locale + search + actions */}
         <div className="cz-toolbar">
-          <div className="cz-locale-tabs">
-            {Object.keys(data.fragments[0]?.locales ?? { zh: 0, en: 0 }).map(loc => (
-              <button key={loc} className={`cz-tab${locale === loc ? ' cz-tab-on' : ''}`} onClick={() => setLocale(loc)}>{loc.toUpperCase()}</button>
-            ))}
-          </div>
+          {tab !== 'skills' ? (
+            <>
+              <div className="cz-locale-tabs">
+                {Object.keys(data.fragments[0]?.locales ?? { zh: 0, en: 0 }).map(loc => (
+                  <button key={loc} className={`cz-tab${locale === loc ? ' cz-tab-on' : ''}`} onClick={() => setLocale(loc)}>{loc.toUpperCase()}</button>
+                ))}
+              </div>
+              <input
+                className="cz-search"
+                type="search"
+                placeholder="搜索提示词名称 / key / 文案…"
+                value={query}
+                onChange={e => setQuery(e.target.value)}
+              />
+            </>
+          ) : <div className="cz-toolbar-spacer" />}
           <div className="cz-toolbar-spacer" />
           <button className="cz-btn cz-btn-ghost" onClick={() => setShowHistory(h => !h)}>历史 / 回滚 ({data.history.length})</button>
           <a className="cz-btn cz-btn-ghost" href="/api/customization/export" download>导出 bundle</a>
@@ -383,40 +631,66 @@ function CustomizationPage() {
           </div>
         ) : null}
 
-        {/* prompt fragments */}
-        <div className="cz-section">
-          <header>
-            <span className="cz-dot" /><h2>内置 Prompt 片段</h2>
-            <span className="cz-sub">实际注入模型的内容 · {promptModified} 处已改（{locale.toUpperCase()}）</span>
-          </header>
-          <div className="cz-section-body">
+        {tab !== 'skills' ? (
+          <>
+            {!searching && activeStage ? <p className="cz-stage-blurb">{activeStage.blurb}</p> : null}
+
+            {searching ? (
+              <div className="cz-section">
+                <header><span className="cz-dot" /><h2>搜索结果</h2><span className="cz-sub">{searchResults!.length} 条匹配（跨全部阶段；当前语言 {locale.toUpperCase()}）</span></header>
+                <div className="cz-section-body">
+                  {searchResults!.length === 0 ? <div className="cz-hint">没有匹配的提示词。</div> : (
+                    Array.from(new Set(searchResults!.map(f => f.block))).map(bid => (
+                      <BlockGroup
+                        key={bid}
+                        blockId={bid}
+                        meta={blockMeta.get(bid)}
+                        fragments={searchResults!.filter(f => f.block === bid)}
+                        locale={locale}
+                        onSaved={onSaved}
+                        onError={onError}
+                        stageTagFor={f => stageLabel.get(f.stage) ?? f.stage}
+                      />
+                    ))
+                  )}
+                </div>
+              </div>
+            ) : (
+              (tab === 'new' || tab === 'followup' || tab === 'send') && blocksForStage(tab).map(group => (
+                <div key={group.blockId} className={group.cross ? 'cz-cross' : ''}>
+                  {group.cross ? <div className="cz-cross-head">同时在本阶段注入（与「{stageLabel.get(data.fragments.find(f => f.block === group.blockId)!.stage)}」阶段共用同一条文案）</div> : null}
+                  <BlockGroup
+                    blockId={group.blockId}
+                    meta={blockMeta.get(group.blockId)}
+                    fragments={group.fragments}
+                    locale={locale}
+                    onSaved={onSaved}
+                    onError={onError}
+                  />
+                </div>
+              ))
+            )}
+
             <div className="cz-legend">
               <span><i className="cz-sq cz-sq-editable" />可编辑：点击就地改</span>
               <span><i className="cz-sq cz-sq-conditional" />条件行：下拉决定是否注入</span>
               <span className="cz-chip cz-chip-ph" style={{ fontSize: 10 }}>{'{占位符}'}</span> 删不得，保存时校验
+              <span className="cz-hint">「注入条件」说明该文案何时出现；改文案不影响注入开关</span>
             </div>
             <div className="cz-callout">⚠ 逃生阀：可以删掉命脉指令（如 <code>botmux send</code>），但机器人可能因此无法把回复发回飞书。拿不准就点「恢复出厂」。</div>
-            {blocks.map(block => (
-              <div key={block} className="cz-block">
-                <div className="cz-block-label"><span className="cz-block-tag">{BLOCK_LABELS[block] ?? block}</span><span className="cz-block-line" /></div>
-                {data.fragments.filter(f => f.block === block).map(f => (
-                  <FragmentRow key={f.key} frag={f} locale={locale} onSaved={onSaved} onError={onError} />
-                ))}
-              </div>
-            ))}
+          </>
+        ) : (
+          /* skills tab */
+          <div className="cz-section">
+            <header>
+              <span className="cz-dot" /><h2>内置 Skill 覆盖</h2>
+              <span className="cz-sub">{data.skills.length} 个内置技能 · {skillsModified} 个已改/停用</span>
+            </header>
+            <div className="cz-section-body">
+              {data.skills.map(s => <SkillRowView key={s.name} skill={s} onSaved={onSaved} onError={onError} />)}
+            </div>
           </div>
-        </div>
-
-        {/* skills */}
-        <div className="cz-section">
-          <header>
-            <span className="cz-dot" /><h2>内置 Skill 覆盖</h2>
-            <span className="cz-sub">{data.skills.length} 个内置技能 · {skillsModified} 个已改/停用</span>
-          </header>
-          <div className="cz-section-body">
-            {data.skills.map(s => <SkillRowView key={s.name} skill={s} onSaved={onSaved} onError={onError} />)}
-          </div>
-        </div>
+        )}
 
       </div>
 
@@ -433,21 +707,53 @@ export function renderCustomizationPage(root: HTMLElement): PageDisposer {
 // ─── Scoped CSS (uses shared design tokens; cz- prefix avoids collisions) ────
 
 const PAGE_CSS = `
-.cz-page{max-width:960px;padding:20px 22px 80px;}
+.cz-page{max-width:1080px;padding:20px 22px 80px;}
 .cz-head h1{font-size:22px;margin:0 0 4px;font-weight:680;}
-.cz-head p{margin:0;color:var(--muted);font-size:13.5px;max-width:66ch;}
+.cz-head p{margin:0;color:var(--muted);font-size:13.5px;max-width:72ch;}
 .cz-error{color:var(--danger);padding:20px;}
-.cz-master{margin:18px 0 20px;display:flex;align-items:center;gap:16px;padding:14px 18px;border:1px solid var(--border-soft);border-radius:var(--radius);background:linear-gradient(100deg,var(--accent-soft),transparent 70%);}
-.cz-master-txt{flex:1;}
+.cz-master{margin:18px 0 16px;display:flex;align-items:center;gap:16px;padding:14px 18px;border:1px solid var(--border-soft);border-radius:var(--radius);background:linear-gradient(100deg,var(--accent-soft),transparent 70%);}
+.cz-master-txt{flex:1;min-width:0;}
+.cz-bot-picker{margin:16px 0;padding:14px;border:1px solid var(--border-soft);border-radius:var(--radius);background:var(--surface);}
+.cz-bot-list{max-height:290px;overflow:auto;overscroll-behavior:contain;border:1px solid var(--border-soft);border-radius:10px;}
+.cz-bot-row{display:flex;align-items:center;gap:12px;padding:10px 12px;cursor:pointer;border-bottom:1px solid var(--border-soft);}
+.cz-bot-row:last-child{border-bottom:none;}
+.cz-bot-row:has(input:disabled){cursor:default;opacity:.6;}
+.cz-bot-selected{background:var(--accent-soft);}
+.cz-bot-row input{flex:none;width:16px;height:16px;accent-color:var(--accent);}
+.cz-bot-name{flex:1;min-width:0;overflow-wrap:anywhere;}
+.cz-bot-name b{display:block;font-size:13px;}
+.cz-bot-name small{display:block;font-size:11px;color:var(--muted);margin-top:3px;}
+.cz-bot-state{font-size:12px;color:var(--muted);text-align:right;}
+.cz-bot-state-on{color:var(--accent-strong);}
+.cz-bot-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:12px;}
+.cz-bot-actions>.cz-hint:first-child{flex:1 1 170px;}
+.cz-bot-result{margin-top:12px;font-size:12px;overflow-wrap:anywhere;}
+.cz-bot-result[role=alert]{color:var(--danger);}
+.cz-bot-result ul{margin:6px 0 0;padding-left:20px;}
+@media(max-width:520px){.cz-bot-row{flex-wrap:wrap;gap:8px;}.cz-bot-name{flex-basis:calc(100% - 30px);}.cz-bot-state{padding-left:24px;text-align:left;}.cz-bot-picker .cz-search{flex-basis:100%;min-width:0;}}
 .cz-master-txt b{font-size:14.5px;}
 .cz-master-txt span{display:block;color:var(--muted);font-size:12.5px;margin-top:2px;}
 .cz-master-switch{flex:none;padding:0;margin:0;align-items:center;}
 .cz-dim{transition:opacity .2s,filter .2s;}
 .cz-dim-off{opacity:.45;filter:grayscale(.5);pointer-events:none;}
-.cz-toolbar{display:flex;align-items:center;gap:8px;margin-bottom:18px;flex-wrap:wrap;}
+
+/* primary stage tabs */
+.cz-tabs{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:12px;}
+.cz-stage-tab{border:1px solid var(--border-soft);background:var(--surface);color:var(--muted);border-radius:12px;padding:9px 18px;font-size:14px;font-weight:600;cursor:pointer;font-family:inherit;display:inline-flex;align-items:center;gap:8px;min-height:0;transition:all .15s;}
+.cz-stage-tab:hover{border-color:var(--accent);color:var(--accent-strong);}
+.cz-stage-tab-on{background:var(--accent);border-color:var(--accent);color:var(--on-accent);box-shadow:var(--shadow);}
+.cz-stage-tab-on:hover{color:var(--on-accent);}
+.cz-tab-badge{background:var(--warning-soft);color:var(--warning);border-radius:999px;font-size:11px;font-weight:700;min-width:18px;height:18px;line-height:18px;text-align:center;padding:0 5px;}
+.cz-stage-tab-on .cz-tab-badge{background:rgba(0,0,0,.18);color:inherit;}
+.cz-tabs-sep{width:1px;align-self:stretch;background:var(--border-soft);margin:2px 6px;}
+.cz-stage-blurb{margin:0 2px 14px;color:var(--muted);font-size:12.5px;}
+
+.cz-toolbar{display:flex;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap;}
 .cz-locale-tabs{display:flex;gap:2px;background:var(--surface-muted);border:1px solid var(--border-soft);border-radius:10px;padding:2px;}
 .cz-tab{border:none;background:none;color:var(--muted);padding:5px 12px;border-radius:8px;cursor:pointer;font-size:12.5px;font-family:inherit;min-height:0;}
 .cz-tab-on{background:var(--surface);color:var(--fg);font-weight:600;box-shadow:var(--shadow);}
+.cz-search{flex:0 1 280px;min-width:160px;height:32px;border:1px solid var(--border);background:var(--surface);border-radius:10px;padding:0 12px;font-size:12.5px;color:var(--fg);font-family:inherit;}
+.cz-search:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft);}
 .cz-toolbar-spacer{flex:1;}
 .cz-btn{border:none;border-radius:10px;height:32px;padding:0 13px;font-size:12.5px;font-weight:600;cursor:pointer;font-family:inherit;display:inline-flex;align-items:center;gap:6px;text-decoration:none;}
 .cz-btn-primary{background:var(--accent);color:var(--on-accent);}
@@ -461,23 +767,30 @@ const PAGE_CSS = `
 .cz-section > header h2{font-size:15px;margin:0;font-weight:640;}
 .cz-section > header .cz-sub{color:var(--faint);font-size:12px;margin-left:auto;}
 .cz-section-body{padding:10px 18px 16px;}
-.cz-legend{display:flex;flex-wrap:wrap;gap:14px;align-items:center;padding:6px 0 12px;color:var(--muted);font-size:11.5px;border-bottom:1px solid var(--border-soft);margin-bottom:10px;}
+
+/* cross-stage shared blocks */
+.cz-cross-head{margin:16px 0 4px;padding:6px 10px;border-left:3px solid var(--border);color:var(--faint);font-size:11.5px;}
+.cz-cross:first-child .cz-cross-head{margin-top:2px;}
+
+.cz-legend{display:flex;flex-wrap:wrap;gap:14px;align-items:center;padding:10px 2px 4px;color:var(--muted);font-size:11.5px;}
 .cz-legend span{display:inline-flex;align-items:center;gap:6px;}
 .cz-sq{width:10px;height:10px;border-radius:3px;display:inline-block;}
 .cz-sq-editable{background:var(--accent);}
 .cz-sq-conditional{background:var(--warning);}
-.cz-callout{background:var(--warning-soft);border:1px solid color-mix(in srgb,var(--warning) 30%,transparent);border-radius:10px;padding:9px 13px;color:var(--warning);font-size:12px;margin-bottom:14px;}
+.cz-callout{background:var(--warning-soft);border:1px solid color-mix(in srgb,var(--warning) 30%,transparent);border-radius:10px;padding:9px 13px;color:var(--warning);font-size:12px;margin:8px 0 0;}
 .cz-callout code{background:rgba(0,0,0,.08);padding:0 4px;border-radius:4px;}
-.cz-block{margin-bottom:14px;}
-.cz-block-label{display:flex;align-items:center;gap:8px;margin:14px 0 6px;}
-.cz-block-tag{font-family:var(--mono);font-size:11.5px;color:var(--accent-strong);background:var(--accent-soft);padding:2px 9px;border-radius:6px;}
-.cz-block-line{flex:1;height:1px;background:var(--border-soft);}
+.cz-block{margin-bottom:12px;}
+.cz-block-label{display:flex;align-items:baseline;gap:8px;margin:14px 0 6px;flex-wrap:wrap;}
+.cz-block-tag{font-family:var(--mono);font-size:11.5px;color:var(--accent-strong);background:var(--accent-soft);padding:2px 9px;border-radius:6px;white-space:nowrap;}
+.cz-block-hint{color:var(--faint);font-size:11.5px;}
+.cz-block-line{flex:1;min-width:40px;height:1px;background:var(--border-soft);align-self:center;}
 .cz-frag{border:1px solid transparent;border-radius:10px;padding:8px 10px;margin:3px 0;position:relative;}
 .cz-frag-bar{position:absolute;left:0;top:8px;bottom:8px;width:3px;border-radius:3px;}
 .cz-frag-editable .cz-frag-bar,.cz-frag-placeholder .cz-frag-bar{background:var(--accent);}
 .cz-frag-conditional .cz-frag-bar{background:var(--warning);}
 .cz-frag-inner{padding-left:12px;}
 .cz-frag-top{display:flex;align-items:center;gap:8px;margin-bottom:3px;flex-wrap:wrap;}
+.cz-stage-tag{font-size:10px;font-weight:700;color:var(--accent-strong);background:var(--accent-soft);border-radius:6px;padding:1px 7px;white-space:nowrap;}
 .cz-frag-label{font-size:12.5px;font-weight:600;}
 .cz-frag-key{font-family:var(--mono);font-size:10.5px;color:var(--faint);}
 .cz-frag-badges{margin-left:auto;display:flex;gap:6px;align-items:center;}
@@ -488,6 +801,7 @@ const PAGE_CSS = `
 .cz-chip-ph{background:var(--accent-soft);color:var(--accent-strong);}
 .cz-chip-cond{background:var(--accent-soft);color:var(--accent-strong);display:inline-flex;align-items:center;gap:6px;}
 .cz-cond-select{border:1px solid var(--border);background:var(--surface);color:var(--fg);border-radius:6px;font-size:11px;padding:1px 4px;font-family:inherit;}
+.cz-gate{font-size:11px;color:var(--faint);margin:0 0 4px;}
 .cz-link{background:none;border:none;color:var(--accent);cursor:pointer;font-size:12px;font-family:inherit;padding:2px 4px;border-radius:6px;min-height:0;}
 .cz-link:hover{background:var(--accent-soft);}
 .cz-link-danger{color:var(--danger);}
@@ -497,7 +811,12 @@ const PAGE_CSS = `
 .cz-frag-text:hover{background:var(--accent-soft);border-radius:6px;}
 .cz-edit-hint{opacity:0;color:var(--accent);margin-left:6px;font-size:11px;}
 .cz-frag-text:hover .cz-edit-hint{opacity:1;}
-.cz-textarea{width:100%;background:var(--surface-muted);border:1px solid var(--border);border-radius:8px;padding:9px 11px;font-family:var(--mono);font-size:12px;line-height:1.6;color:var(--fg);resize:vertical;}
+.cz-edit{margin-top:4px;}
+.cz-tokens{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-bottom:7px;}
+.cz-tokens-cap{font-size:11px;color:var(--faint);}
+.cz-token{border:1px solid var(--border);background:var(--surface-muted);color:var(--accent-strong);font-family:var(--mono);font-size:11px;border-radius:7px;padding:2px 9px;cursor:pointer;min-height:0;}
+.cz-token:hover{border-color:var(--accent);background:var(--accent-soft);}
+.cz-textarea{width:100%;background:var(--surface-muted);border:1px solid var(--border);border-radius:8px;padding:9px 11px;font-family:var(--mono);font-size:12px;line-height:1.6;color:var(--fg);resize:vertical;box-sizing:border-box;}
 .cz-textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft);}
 .cz-edit-actions{display:flex;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap;}
 .cz-hint{color:var(--faint);font-size:11.5px;}
@@ -530,10 +849,17 @@ const PAGE_CSS = `
 .cz-diff-disable .cz-diff-mark{color:var(--danger);}
 .cz-diff-id{color:var(--fg);flex:none;}
 .cz-diff-after{color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
-.cz-hist-row{display:flex;align-items:center;gap:12px;padding:8px 2px;border-bottom:1px solid var(--border-soft);font-size:12.5px;}
+.cz-hist-row{display:flex;align-items:center;gap:12px;padding:8px 2px;border-bottom:1px solid var(--border-soft);font-size:12.5px;flex-wrap:wrap;}
 .cz-hist-row:last-child{border-bottom:none;}
 .cz-hist-when{color:var(--faint);font-size:11.5px;width:56px;flex:none;}
-.cz-hist-label{flex:1;}
+.cz-hist-label{flex:1;min-width:120px;}
 .cz-hist-sum{color:var(--faint);font-size:11px;font-family:var(--mono);}
 .cz-toast{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--fg);color:var(--bg);padding:10px 18px;border-radius:10px;font-size:13px;z-index:50;box-shadow:var(--shadow);}
+@media (max-width:640px){
+  .cz-page{padding:16px 14px 60px;}
+  .cz-stage-tab{padding:8px 12px;font-size:13px;}
+  .cz-search{flex:1 1 100%;order:3;}
+  .cz-toolbar-spacer{display:none;}
+  .cz-hist-sum{width:100%;}
+}
 `;

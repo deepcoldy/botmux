@@ -235,3 +235,43 @@ describe('botmux ask — CLI boundary', () => {
     }
   });
 });
+
+describe('question file CLI', () => {
+  it('sends a whole round with defaults and returns all answers as JSON without requiring --json', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-round-')); tempDirs.push(dataDir);
+    const questions = [
+      { prompt: 'scope', multiSelect: false, options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }], defaultSelectedKeys: ['a'] },
+      { prompt: 'states', multiSelect: true, options: [{ key: 'x', label: 'X' }, { key: 'y', label: 'Y' }], defaultSelectedKeys: ['x', 'y'] },
+    ];
+    const file = join(dataDir, 'round.json'); writeFileSync(file, JSON.stringify(questions));
+    let body: any;
+    const server = createServer(async (req, res) => {
+      let raw = ''; for await (const chunk of req) raw += chunk; body = JSON.parse(raw);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ kind: 'answered', answers: [['b'], ['x']], by: 'ou_test', comment: null, timedOut: false }));
+    });
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const registry = join(dataDir, 'dashboard-daemons'); mkdirSync(registry);
+      writeFileSync(join(registry, 'cli_test.json'), JSON.stringify({ larkAppId: 'cli_test', ipcPort: (server.address() as AddressInfo).port, lastHeartbeat: Date.now() }));
+      const result = await runAsk(dataDir, ['ask', 'buttons', `--questions-file=${file}`]);
+      expect(result.status).toBe(0); expect(result.stderr).toBe('');
+      expect(body.questions).toEqual(questions);
+      expect(JSON.parse(result.stdout)).toMatchObject({ answers: [['b'], ['x']], selected: null, by: 'ou_test' });
+    } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+  });
+
+  it.each([
+    ['--questions-file', '/unused.json', '--options', 'yes,no'],
+    ['--questions-file=/unused.json', '--options=yes,no'],
+    ['--questions-file=/unused.json', '--multi'],
+    ['--questions-file', '/unused.json', 'ignored prompt'],
+    ['--questions-file=', '--json'],
+    ['--questions-file'],
+  ])('rejects ambiguous or missing file parameters: %j', async (...args) => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'botmux-ask-round-invalid-')); tempDirs.push(dataDir);
+    const result = await runAsk(dataDir, ['ask', 'buttons', ...args]);
+    expect(result.status).toBe(2); expect(result.stderr).toContain('--questions-file');
+    expect(result.stdout).toBe('');
+  });
+});

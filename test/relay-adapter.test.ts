@@ -20,6 +20,7 @@ import { tmpdir, homedir } from 'node:os';
 // pathOverride is returned as-is (resolveCommand short-circuits absolute paths
 // before probing anyway).
 vi.mock('node:child_process', () => ({
+  execFile: vi.fn(),
   execSync: vi.fn(() => ''),
   spawnSync: vi.fn(() => ({ stdout: '', status: 0 })),
 }));

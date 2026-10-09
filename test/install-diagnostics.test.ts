@@ -92,6 +92,78 @@ describe('analyzeInstalls', () => {
     expect(out.multiple).toBe(false);
   });
 
+  // ── Binary-era launchers (compiled platform binary, no cli.js anywhere) ─────
+  // Since the main package gained a `bin` entry, ONE ordinary global install
+  // puts TWO botmux on PATH: the launcher the package manager links, and the
+  // ~/.botmux/bin shim postinstall writes. They exec the same binary, so they
+  // are ONE install and must not be reported as a conflict.
+  //
+  // ⚠️ Neither form contains `cli.js`, so the cli.js scan cannot see them. This
+  // is NOT a size-limit issue — measured with the size limit removed entirely,
+  // both still resolved to null and `multiple` was true.
+  const PKG = '/root/.local/share/fnm/node-versions/v22/installation/lib/node_modules/botmux';
+  const PLATBIN = `${PKG}/node_modules/botmux-linux-x64/botmux`;
+  const MGR_BIN = '/root/.local/share/fnm/node-versions/v22/installation/bin/botmux';
+  const LAUNCHER = `${PKG}/scripts/botmux-launcher.sh`;
+  const BIN_SHIM = '/root/.botmux/bin/botmux';
+  const BIN_SHIM_BODY = `#!/bin/sh\nexec "${PLATBIN}" "$@"\n`;
+
+  function binaryEraDeps(over: Partial<InstallProbeDeps> = {}): InstallProbeDeps {
+    return {
+      readFile: (p) => (p === BIN_SHIM ? BIN_SHIM_BODY : null),
+      realpath: (p) => (p === MGR_BIN ? LAUNCHER : p),
+      isSourceCheckout: () => false,
+      ...over,
+    };
+  }
+
+  it('one global install seen through BOTH its launcher and its shim is ONE install', () => {
+    const out = analyzeInstalls([MGR_BIN, BIN_SHIM], binaryEraDeps());
+    expect(out.entries).toHaveLength(1);
+    expect(out.multiple).toBe(false);
+    expect(out.entries[0].root).toBe(PKG);
+    // Previously `unknown` for both: neither resolved, so neither got classified.
+    expect(out.entries[0].kind).toBe('npm-global');
+  });
+
+  it('the package-manager launcher alone resolves to the package root', () => {
+    const out = analyzeInstalls([MGR_BIN], binaryEraDeps());
+    expect(out.entries).toEqual([{ binPath: MGR_BIN, root: PKG, kind: 'npm-global' }]);
+  });
+
+  it('the postinstall shim alone resolves to the package root via its exec target', () => {
+    const out = analyzeInstalls([BIN_SHIM], binaryEraDeps());
+    expect(out.entries).toEqual([{ binPath: BIN_SHIM, root: PKG, kind: 'npm-global' }]);
+  });
+
+  it('resolves the pnpm/bun sibling layout too, not just npm nesting', () => {
+    const bunPkg = '/root/.bun/install/global/node_modules/botmux';
+    const bunPlat = '/root/.bun/install/global/node_modules/botmux-linux-x64/botmux';
+    const bunBin = '/root/.bun/bin/botmux';
+    const out = analyzeInstalls([bunBin, BIN_SHIM], {
+      readFile: (p) => (p === BIN_SHIM ? `#!/bin/sh\nexec "${bunPlat}" "$@"\n` : null),
+      realpath: (p) => (p === bunBin ? `${bunPkg}/scripts/botmux-launcher.sh` : p),
+      isSourceCheckout: () => false,
+    });
+    expect(out.entries).toHaveLength(1);
+    expect(out.multiple).toBe(false);
+    expect(out.entries[0].root).toBe(bunPkg);
+  });
+
+  it('still reports multiple when a global install and a source checkout coexist', () => {
+    // The warning must keep firing for the case it exists for. Note SHIM and
+    // BIN_SHIM are the same path — only one file can exist at ~/.botmux/bin/botmux
+    // — so the real coexistence is: manager-linked launcher + a shim whose target
+    // is a source checkout (what `bun run use:here` leaves behind).
+    const out = analyzeInstalls([MGR_BIN, SHIM], binaryEraDeps({
+      readFile: (p) => (p === SHIM ? SHIM_BODY : null),
+      realpath: (p) => (p === MGR_BIN ? LAUNCHER : p),
+      isSourceCheckout: (root) => root === '/root/iserver/botmux',
+    }));
+    expect(out.multiple).toBe(true);
+    expect(out.entries.map(e => e.kind)).toEqual(['npm-global', 'source-checkout']);
+  });
+
   it('does not match a bare "cli.js" literal inside a binary that slipped the size guard', () => {
     const out = analyzeInstalls(['/x/botmux'], deps({
       readFile: () => 'function x(){ return "cli.js"; }', // no path separator before cli.js

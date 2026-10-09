@@ -31,12 +31,17 @@ export type VcMeetingConsumerIsolationResult =
  *    to either turn sandbox off (informed) or move to a Linux pty/tmux backend.
  */
 export function evaluateVcMeetingConsumerIsolation(input: {
-  sandbox: boolean | undefined;
+  sandbox: boolean | 'off' | 'oncall' | 'scratch' | undefined;
   platform: NodeJS.Platform;
   backendType: BackendType;
 }): VcMeetingConsumerIsolationResult {
-  if (input.sandbox !== true) {
-    // Plan B: no sandbox requested → allowed, but not isolated.
+  if (input.sandbox === false || input.sandbox === 'off' || input.sandbox === undefined
+    || input.sandbox === 'scratch') {
+    // Plan B: no CREDENTIAL-isolating sandbox → allowed but not isolated.
+    // scratch is excluded deliberately: it provides write-integrity (COW), not
+    // confidentiality — the real fs and the bot's own lark-cli/CLI credential
+    // stores stay readable, so it does not satisfy the VC consumer's
+    // "credentials masked + outbox relay" contract.
     return { ok: true, isolated: false };
   }
   // Sandbox WAS requested; it must be delivered or refused, never faked.

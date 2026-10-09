@@ -107,7 +107,7 @@ async function loadModules() {
   const collaborationModeStore = await import('../src/services/group-collaboration-mode-store.js');
   const daemon = await import('../src/daemon.js');
   const types = await import('../src/core/types.js');
-  sessionStore.init();
+  sessionStore.init('test-app');
   const policy = await import('../src/core/trusted-session-controller.js');
   const interruptions = await import('../src/core/cross-principal-interruption-store.js');
   return { collaborationModeStore, daemon, registry, types, policy, interruptions, sessionStore };
@@ -158,6 +158,14 @@ afterAll(() => {
 });
 
 describe('handleBotAdded — 普通群 shared 路由', () => {
+  it('excluded group joins send no greeting and start no worker', async () => {
+    const { daemon, registry } = modules;
+    registry.registerBot({ larkAppId: 'app_excluded', larkAppSecret: 's', cliId: 'claude-code', allowedUsers: ['ou_owner'], autoStartOnGroupJoin: true, autoStartExcludedChats: ['oc_quiet'] });
+    await daemon.__testOnly_handleBotAdded('oc_quiet', 'ou_owner', 'app_excluded');
+    expect(mocks.sendMessage).not.toHaveBeenCalled();
+    expect(mocks.forkWorker).not.toHaveBeenCalled();
+  });
+
   it('项目群关闭自动纳入时保留显式 Worker 名单', async () => {
     const { collaborationModeStore, daemon, registry } = modules;
     const appId = 'app_join_explicit_worker';
@@ -1527,7 +1535,7 @@ it('recovers a thrown dispatcher failure and accepts the displayed suggestion la
   vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
   mocks.registerHostAsk.mockReset().mockRejectedValueOnce(new Error('dispatcher unavailable'));
   await modules.daemon.__testOnly_driveCrossPrincipalInterruptions(ds);
-  const persisted = modules.sessionStore.readSessionRowFromDisk(ds.session.sessionId, ds.larkAppId);
+  const persisted = modules.sessionStore.readSessionRowFromDisk(ds.session.sessionId, 'test-app');
   expect(persisted?.crossPrincipalInterruptions?.[0]).toMatchObject({ id: record.id, confirmationRetryCount: 1 });
   // Simulate restoring the queue from disk, then let its retry deadline fire.
   ds.session.crossPrincipalInterruptions = persisted!.crossPrincipalInterruptions;

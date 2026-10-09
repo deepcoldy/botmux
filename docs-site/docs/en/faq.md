@@ -162,7 +162,25 @@ It hasn't been verified on native Windows, but WSL2 should be fine.
 
 ## How do I upgrade?
 
-`botmux upgrade` — it routes by how you installed: a curl install gets its binary replaced in place, an npm install is handed back to `npm i -g botmux@latest`. curl users can equally just re-run the install command (also an in-place upgrade, and it won't write a second PATH line). The `botmux` wrapper version inside sessions always stays in sync with the daemon, so it doesn't need to be upgraded separately. Run `botmux restart` afterwards to pick up the new version.
+**Re-run the install command (curl), no matter how you originally installed** — this upgrades npm/pnpm global installs too:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | sh
+```
+
+It replaces the self-contained binary in place at `~/.botmux/bin/botmux`: the downloaded binary is smoke-run on this host first, and if it cannot run the installer fails explicitly and **preserves your existing version**; it is idempotent (no second PATH line) and never needs Node. Then open a **new terminal** and run `botmux restart` — the installer prepends `~/.botmux/bin` to PATH, and only a new shell guarantees `botmux` resolves to the new version (in an old npm user's current shell it may still point at the npm global directory). The `botmux` wrapper inside sessions always tracks the daemon version, so it needs no separate upgrade.
+
+**Installing a pinned version** (same mechanism for rollbacks / version pinning; the tag needs the `v` prefix):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/deepcoldy/botmux/master/install.sh | BOTMUX_VERSION=v3.18.8 sh
+```
+
+> ⚠️ `BOTMUX_VERSION` must precede the `sh` on the **right** side of the pipe. Written as `BOTMUX_VERSION=… curl … | sh`, the variable only reaches curl — `sh` never sees it and the installer silently falls back to latest.
+
+### Why can't I npm-upgrade from a release older than v3.18.0?
+
+Starting with v3.18.0 the npm package changed form, from "Node + `dist/` sources" to a **platform binary subpackage**, and `node-pty` left `dependencies`. Old builds shipped a `botmux upgrade` that simply delegated to npm; when npm installs across that boundary it prunes `node-pty` from the old tree, while the old daemon's first restart step is still `node …/dist/cli.js restart` — and that file still statically imports `node-pty`. The driver dies on `ERR_MODULE_NOT_FOUND` and the whole daemon fleet never comes back, even though output may already have said "restarting to apply". The curl route drops in the new binary and points the launcher at it without touching the old directory or depending on what npm prunes, which makes it the one reliable way across this boundary. On current (≥3.18) binary installs `botmux upgrade` is equivalent to re-running curl; when you don't remember your install form, curl always works.
 
 ## CoCo loses messages while busy?
 

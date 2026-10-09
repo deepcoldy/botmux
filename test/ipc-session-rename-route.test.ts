@@ -39,7 +39,7 @@ afterEach(async () => {
   setIpcAuthSecret(null);
   findSpy?.mockRestore();
   findSpy = null;
-  sessionStore.init();
+  sessionStore.init('app-session-rename');
   if (prevDataDir !== null) config.session.dataDir = prevDataDir;
   prevDataDir = null;
   if (dataDir) rmSync(dataDir, { recursive: true, force: true });
@@ -51,7 +51,7 @@ function setupStore(): ReturnType<typeof sessionStore.createSession>[] {
   dataDir = mkdtempSync(join(tmpdir(), 'ipc-session-rename-'));
   prevDataDir = config.session.dataDir;
   config.session.dataDir = dataDir;
-  sessionStore.init();
+  sessionStore.init('app-session-rename');
   const a = sessionStore.createSession('oc_rename_a', 'om_rename_a', '旧标题 A', 'group');
   const b = sessionStore.createSession('oc_rename_b', 'om_rename_b', '旧标题 B', 'group');
   return [a, b];

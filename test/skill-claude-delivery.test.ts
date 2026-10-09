@@ -90,3 +90,54 @@ describe('Claude scoped skill delivery', () => {
     expect(prepared.diagnostics).toContain('native_skill_delivery_not_supported');
   });
 });
+
+describe('Pi scoped skill delivery', () => {
+  let root: string;
+  let dataDir: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'botmux-pi-skill-'));
+    dataDir = mkdtempSync(join(tmpdir(), 'botmux-data-'));
+    vi.stubEnv('SESSION_DATA_DIR', dataDir);
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(root, { recursive: true, force: true });
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it('materializes selected skills into a Pi skill root and passes to prepareSkillDelivery', () => {
+    write(join(root, 'deploy', 'SKILL.md'), '# Deploy');
+    const manifest: SessionSkillManifest = {
+      sessionId: 'pi-sess-1',
+      cliId: 'pi',
+      workingDir: '/repo',
+      policyMode: 'priority',
+      prioritySkills: [{
+        id: 'deploy',
+        name: 'deploy',
+        tags: [],
+        rootDir: join(root, 'deploy'),
+        entrypoint: 'SKILL.md',
+        source: { type: 'user', root: join(root, 'deploy') },
+        priorityReason: 'bot:include',
+      }],
+      diagnostics: [],
+      generatedAt: '2026-06-14T00:00:00.000Z',
+    };
+
+    const prepared = prepareSkillDelivery(createCliAdapterSync('pi'), manifest, 'native');
+    expect(prepared.fatal).toBeFalsy();
+    expect(prepared.pluginDir).toBeDefined();
+    expect(readFileSync(join(prepared.pluginDir!, 'deploy', 'SKILL.md'), 'utf-8')).toContain('# Deploy');
+
+    const args = createCliAdapterSync('pi').buildArgs({
+      sessionId: 'pi-sess-1',
+      resume: false,
+      skillPluginDir: prepared.pluginDir,
+    });
+    const skillDirs = args.flatMap((arg, index) => arg === '--skill' ? [args[index + 1]] : []);
+    expect(skillDirs).toContain(prepared.pluginDir);
+  });
+});

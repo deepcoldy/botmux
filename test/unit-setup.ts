@@ -85,5 +85,7 @@ afterAll(() => {
   // Keep leaked async work fenced inside the managed root until the worker exits.
   // Restoring the invoking environment here could briefly expose live Botmux data.
   process.env.SESSION_DATA_DIR = dataDir;
-  rmSync(fileRoot, { recursive: true, force: true });
+  // A debug terminal's bash may still be exiting and writing history after
+  // shutdown; retry the disposable home tree if removal races that final write.
+  rmSync(fileRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });

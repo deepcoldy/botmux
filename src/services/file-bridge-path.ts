@@ -15,6 +15,8 @@ import { cocoEventsPathForSession, findCocoSessionByPid } from './coco-transcrip
 import { findPiTranscriptByPid, findPiTranscriptBySessionId } from './pi-transcript.js';
 import { findGrokSessionByPid, findGrokUpdatesBySessionId } from './grok-transcript.js';
 import { findCursorTranscriptByChatId, findCursorTranscriptByPid } from './cursor-transcript.js';
+import { findAntigravityConversationIdByPid } from './antigravity-discovery.js';
+import { antigravityTranscriptPath } from './antigravity-transcript.js';
 import { ompTranscriptPath } from '../adapters/cli/oh-my-pi.js';
 import { ebsdBotmuxTranscriptPath } from '../adapters/cli/ebsd.js';
 
@@ -60,6 +62,10 @@ function resolveBySessionId(cliId: string, sessionId: string, cwd?: string): str
       return findTraexRolloutBySessionId(sessionId);
     case 'cursor':
       return findCursorTranscriptByChatId(sessionId);
+    case 'antigravity': {
+      const p = antigravityTranscriptPath(sessionId);
+      return p && existsSync(p) ? p : undefined;
+    }
     case 'codex':
       return findCodexRolloutBySessionId(sessionId);
     default:
@@ -83,6 +89,11 @@ function resolveByPid(cliId: string, pid: number): string | undefined {
       return findTraexRolloutByPid(pid)?.path;
     case 'cursor':
       return findCursorTranscriptByPid(pid)?.path;
+    case 'antigravity': {
+      const conversationId = findAntigravityConversationIdByPid(pid);
+      const p = conversationId ? antigravityTranscriptPath(conversationId) : null;
+      return p && existsSync(p) ? p : undefined;
+    }
     case 'codex':
       return findCodexRolloutByPid(pid)?.path;
     default:

@@ -43,6 +43,12 @@ const RESERVED_ENV_PREFIXES = ['BOTMUX', 'LARK_APP_'] as const;
 const RESERVED_ENV_KEYS = new Set<string>([
   '__OWNER_OPEN_ID',
   'SESSION_DATA_DIR',
+  // Scratch is owned by the logical session. A bot-wide override would merge
+  // every topic into one uncollectable directory and can point heavy builds at
+  // a tmpfs-backed /tmp. The worker injects all three keys per session.
+  'TMPDIR',
+  'TMP',
+  'TEMP',
   'IS_SANDBOX',
   // The bots.json the CLI child loads. NOT covered by the `BOTMUX` prefix, and
   // it is the TOP of the registry precedence chain — so a per-bot `env` setting

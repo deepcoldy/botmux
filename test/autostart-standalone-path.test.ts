@@ -181,6 +181,15 @@ describe('autostart boot hook — compiled binary (standalone) shape', () => {
 });
 
 describe('autostart PATH normalization', () => {
+  it('does not persist per-session identity wrappers across upgrades or boots', () => {
+    const transient = '/home/u/.botmux/data/cli-identity/session.bin';
+    const opts = { pkgRoot: '/opt/botmux', configDir: '/home/u/.botmux', logDir: '/tmp/logs',
+      environmentPath: `${transient}:/usr/bin` };
+    expect(autostartPath(opts.environmentPath, 'linux')).toBe('/usr/bin');
+    expect(unitContent(opts)).not.toContain(transient);
+    expect(plistContent(opts)).not.toContain(transient);
+    expect(autostartPath('C:\\Users\\u\\data\\cli-identity\\session.bin;C:\\Tools', 'win32')).toBe('C:\\Tools');
+  });
   it('filters AI CLI argv0 shims, preserves order, and removes duplicates on POSIX', () => {
     expect(autostartPath(
       [

@@ -124,9 +124,9 @@ jobs:
   # paths. Bun is what ships the single-file executable, so those paths need a
   # leg that actually runs on it.
   #
-  # STILL ADVISORY, but the reason has narrowed. Three of the four flakes that
-  # kept this leg off a green baseline are now fixed at their cause rather than
-  # retried:
+  # REQUIRED GATE (flipped from continue-on-error on 2026-09-28). The four
+  # flakes that kept this leg off a green baseline are all fixed at their cause
+  # rather than retried:
   #   • a port-pair assumption (`base+1` was presumed free) → reserve both,
   #   • a torn read of a marker file → write tmp + `renameSync`, plus a poll
   #     predicate that THREW on a partial read, aborting the loop and reporting a
@@ -134,19 +134,22 @@ jobs:
   #   • an env-leak guard whose transport was node-pty, which cannot fork/exec
   #     reliably under Bun (see that file's comment for the measurements) → the
   #     guard now runs over `child_process.spawn` on both legs, with the pty form
-  #     kept for Node only.
+  #     kept for Node only,
+  #   • test/tmux-startup-storm-recovery.test.ts wedged for 180s (a worker thread
+  #     pool blocked on an fd destroyed twice) → close the fd once.
   #
-  # The fourth is NOT fixed: test/tmux-startup-storm-recovery.test.ts wedged in
-  # run 34570428914 — one `(pass)` line, then 180s of silence and a SIGKILL, i.e.
-  # the second case never completed. Observed once in 28 completed master runs
-  # (~4%); not reproduced locally across ~50 attempts spanning core starvation,
-  # piped stdio, the runner's exact spawn shape and args, and its 4-way file
-  # concurrency. Since the test times out per-case at 15s and the file still went
-  # quiet for 180s, whatever blocks it is synchronous.
+  # The leg's only reds after those fixes (2026-09-27/28, eight master runs) were
+  # a single DETERMINISTIC defect, not a flake: a mode-000 sandbox deny-mask
+  # dir made Bun's recursive rmSync fail EACCES as the unprivileged runner user
+  # (EACCES on the parent), leaking the whole session tree — reproduced under
+  # bun 1.4.x with setpriv; the same rmSync succeeds on Node (both root and
+  # unprivileged) and under root on either runtime, so the other legs structurally
+  # cannot see it. Fixed by rmdir-ing the known-empty mask before the recursive
+  # removal (#1552); this blocking leg is the only CI surface that can catch a
+  # regression.
   #
-  # A gate that is red for environmental reasons trains people to ignore it, so
-  # this flips to blocking when that cause is named and reproduced — not on a
-  # rerun, and not on the other three being green.
+  # If a future environmental flake shows up, fix the cause (or gate the offending
+  # test to a blocking sub-job); do not quietly flip this back to advisory.
   #
   # The generous timeout is inherent to the design: the runner spawns ONE bun
   # process PER FILE, because `bun test` otherwise runs every file in a single
@@ -155,7 +158,6 @@ jobs:
   bun-test:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    continue-on-error: true
 
     steps:
       - uses: actions/checkout@v6
@@ -199,9 +201,9 @@ jobs:
       # — the whole leg's cost with none of its value. This runs one file in ~6s and
       # also asserts that no `bun` spawn escaped the home fence.
       #
-      # NOT under continue-on-error semantics by accident: the job as a whole is
-      # advisory for now, but if this step fails the suite result below is meaningless,
-      # so it runs first and its failure is the one worth reading.
+      # This job is a blocking gate; if this self-check fails the suite result
+      # below is meaningless, so it runs first and its failure is the one worth
+      # reading.
       - run: bun run test:bun:self-check
       - run: bun run test:bun
 

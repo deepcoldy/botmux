@@ -295,6 +295,9 @@ describe('stable releases — Developer ID identity survives CLI binary replacem
   });
 
   it('never lets the stale-approval sweep cancel a release-blocking stable signing run', () => {
+    // The sweep intentionally has no checkout step. Every `gh run` invocation
+    // therefore needs an explicit repository context instead of relying on .git.
+    expect(STALE_APPROVAL).toContain('GH_REPO: ${{ github.repository }}');
     expect(STALE_APPROVAL).toContain('databaseId,createdAt,displayTitle,event,headBranch,url');
     expect(STALE_APPROVAL).toContain('[ "$event" = "push" ]');
     expect(STALE_APPROVAL).toContain('[[ "$ref" == v* ]]');

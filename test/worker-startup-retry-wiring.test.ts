@@ -270,7 +270,7 @@ describe("worker-pool 'error' transient self-heal wiring", () => {
       'text',
       'app_test',
       undefined,
-      undefined,
+      { sourceSessionId: 'sid-budget' },
     );
   });
 

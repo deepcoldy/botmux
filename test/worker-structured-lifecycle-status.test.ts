@@ -12,6 +12,39 @@ function functionSlice(name: string, nextName: string): string {
 }
 
 describe('worker structured-turn status wiring', () => {
+  it('checkpoints adopted Codex attribution at mark and terminal boundaries and restores once at attach', () => {
+    const scope = functionSlice('codexAdoptJournalPath', 'checkpointCodexAdoptRecovery');
+    expect(scope).toContain('lastInitConfig?.adoptMode && structuredBridgeIsCodex()');
+    const mark = functionSlice('codexBridgeMarkPendingTurn', 'finalizeRpcTurnTerminal');
+    expect(mark.indexOf('checkpointCodexAdoptRecovery()')).toBeGreaterThan(mark.indexOf('codexBridgeQueue.mark('));
+    const emit = source.slice(source.indexOf('function emitReadyCodexTurns()'), source.indexOf('function emitReadyCodexTurns()') + 300);
+    expect(emit.indexOf('checkpointCodexAdoptRecovery()')).toBeGreaterThan(emit.indexOf('drainEmittable()'));
+    expect(emit.indexOf('checkpointCodexAdoptRecovery()')).toBeLessThan(emit.indexOf('if (ready.length === 0)'));
+    const attach = source.slice(source.indexOf('function codexBridgeAttach('), source.indexOf('function codexBridgeAttach(') + 4_000);
+    expect(attach).toContain('!codexAdoptRecoveryAttempted');
+    expect(attach).toContain('codexAdoptRecoveryAttempted = true');
+    expect(attach.indexOf('codexAdoptRecoveryAttempted = true')).toBeGreaterThan(attach.indexOf('restoreCodexAdoptTurns('));
+    expect(attach.indexOf('restoreCodexAdoptTurns(')).toBeLessThan(attach.indexOf('codexBridgeQueue.absorb(history)'));
+    const checkpoint = functionSlice('checkpointCodexAdoptRecovery', 'scheduledTaskAnchorsFilePath');
+    expect(checkpoint).toContain('!codexAdoptRecoveryAttempted');
+  });
+
+  it('checkpoints structured bridge attribution for non-adopt sessions and restores on baseline-existing attach', () => {
+    const scope = functionSlice('structuredBridgeJournalPath', 'codexAdoptJournalPath');
+    expect(scope).toContain('codexBridgeFallbackActive()');
+    expect(scope).toContain('.structured');
+    const mark = functionSlice('codexBridgeMarkPendingTurn', 'finalizeRpcTurnTerminal');
+    expect(mark.indexOf('checkpointStructuredBridgeRecovery()')).toBeGreaterThan(mark.indexOf('codexBridgeQueue.mark('));
+    const emit = source.slice(source.indexOf('function emitReadyCodexTurns()'), source.indexOf('function emitReadyCodexTurns()') + 300);
+    expect(emit.indexOf('checkpointStructuredBridgeRecovery()')).toBeGreaterThan(emit.indexOf('drainEmittable()'));
+    expect(emit.indexOf('checkpointStructuredBridgeRecovery()')).toBeLessThan(emit.indexOf('if (ready.length === 0)'));
+    const checkpoint = functionSlice('checkpointStructuredBridgeRecovery', 'scheduledTaskAnchorsFilePath');
+    expect(checkpoint).toContain('!structuredBridgeRecoveryAttempted');
+    const attach = source.slice(source.indexOf('function codexBridgeAttach('), source.indexOf('function codexBridgeAttach(') + 6_000);
+    expect(attach).toContain('!structuredBridgeRecoveryAttempted');
+    expect(attach).toContain('!codexBridgeIsCursor()');
+    expect(attach).toContain('structuredBridgeRecoveryAttempted = true');
+  });
   it('rejects a prompt heuristic before publishing ready or clearing in-flight input', () => {
     const body = functionSlice('markPromptReady', 'persistCliSessionId');
     const lifecycleGate = body.indexOf('hasStructuredLifecycleBlock()');
@@ -398,6 +431,33 @@ describe('worker structured-turn status wiring', () => {
     expect(postWriteBreak).toBeGreaterThan(loopStart);
   });
 
+  it('queues direct RPC follow-ups until the active native turn reaches a terminal', () => {
+    const gate = functionSlice('directRpcTurnBlocksTypeAhead', 'flushPending');
+    expect(gate).toContain('rpcTurnsAwaitingActivation.size > 0');
+    expect(gate).toContain('rpcActiveOwners.size > 0');
+    expect(gate).toContain('settlingRpcTerminalOwners.size > 0');
+    expect(gate).toContain('rpcTerminalHydrationOwners.size > 0');
+
+    const flush = source.slice(
+      source.indexOf('async function flushPending'),
+      source.indexOf('function sendToPty'),
+    );
+    const typeAheadDecision = flush.indexOf('const typeAheadAllowed = pendingInputAllowsTypeAhead');
+    const busyArgument = flush.indexOf('directRpcTurnBlocksTypeAhead()', typeAheadDecision);
+    const loopStart = flush.indexOf('while (pendingMessages.length > 0');
+    const postWriteBreak = flush.indexOf('if (directRpcTurnBlocksTypeAhead()) break', loopStart);
+    const sendToPtyStart = source.indexOf('function sendToPty');
+    const sendToPtyEnd = source.indexOf('// ─── Screen Update Timer', sendToPtyStart);
+    const sendToPty = source.slice(sendToPtyStart, sendToPtyEnd);
+    const sendToPtyTypeAhead = sendToPty.indexOf('const supportsTypeAhead = pendingInputAllowsTypeAhead');
+    const sendToPtyBusyArgument = sendToPty.indexOf('directRpcTurnBlocksTypeAhead()', sendToPtyTypeAhead);
+    expect(typeAheadDecision).toBeGreaterThanOrEqual(0);
+    expect(busyArgument).toBeGreaterThan(typeAheadDecision);
+    expect(postWriteBreak).toBeGreaterThan(loopStart);
+    expect(sendToPtyTypeAhead).toBeGreaterThanOrEqual(0);
+    expect(sendToPtyBusyArgument).toBeGreaterThan(sendToPtyTypeAhead);
+  });
+
   it('makes native terminal settlement idempotent and generation-owned across abort/death/stop cleanup', () => {
     const settle = functionSlice('settleRpcTurnTerminal', 'handleRpcTurnTerminal');
     expect(settle).toContain('const existingSettlement = settlingRpcTerminalOwners.get(ownerKey)');
@@ -493,6 +553,10 @@ describe('worker structured-turn status wiring', () => {
       source.indexOf('idleDetector.onIdle(async (evidenceSource)'),
       source.indexOf('drainBridgesThenMarkReady(evidenceSource);'),
     );
+    expect(callback).toContain('cliAdapter?.postTerminalPromptFence === true');
+    expect(callback).toContain('postTerminalPromptFenceHolds(evidenceSource, idleBackend)');
+    expect(callback.indexOf('drainBridges();'))
+      .toBeLessThan(callback.indexOf('postTerminalPromptFenceHolds(evidenceSource, idleBackend)'));
     // Pi's assistant_final is persisted asynchronously from the TUI clearing
     // Working... — an external idle landing while the authoritative viewport
     // still shows busy must defer exactly like a screen idle.
@@ -519,6 +583,52 @@ describe('worker structured-turn status wiring', () => {
     // so a deferred ZMX turn can never be pinned by the probe loop.
     const probe = functionSlice('scheduleBusyPatternIdleProbe', 'spawnCli');
     expect(probe).toContain('if (!backendScreenEvidenceIsAuthoritativeForMutation()) return;');
+
+    const adopt = functionSlice('setupAdoptIdleDetection', 'seedBackendScreen');
+    expect(adopt).toContain("evidenceSource === 'external'");
+    expect(adopt).toContain('cliAdapter?.postTerminalPromptFence === true');
+    const adoptDrain = adopt.indexOf('drainBridges();');
+    const adoptFence = adopt.indexOf('postTerminalPromptFenceHolds(evidenceSource, idleBackend)');
+    expect(adoptDrain).toBeGreaterThanOrEqual(0);
+    expect(adoptFence).toBeGreaterThan(adoptDrain);
+  });
+
+  it('limits ordinary flush batches only for post-terminal-fence adapters', () => {
+    const flush = functionSlice('flushPending', 'sendToPty');
+    const batchStop = flush.indexOf('if (shouldStopPendingBatch(');
+    const serialOptIn = flush.indexOf(
+      'cliAdapter.postTerminalPromptFence !== true',
+      batchStop,
+    );
+    expect(batchStop).toBeGreaterThanOrEqual(0);
+    expect(serialOptIn).toBeGreaterThan(batchStop);
+    expect(flush.slice(batchStop, serialOptIn))
+      .not.toContain('runtimeSupportsTypeAhead');
+  });
+
+  it('quarantines unconfirmed adapter submits without replaying them or their successors', () => {
+    const flush = functionSlice('flushPending', 'sendToPty');
+    const preflight = flush.indexOf('currentInputDeliveryQuarantine()');
+    const typeAhead = flush.indexOf('const typeAheadAllowed');
+    const arm = flush.indexOf('armInputDeliveryQuarantine(submissionBackend, item)');
+    const warning = flush.indexOf('scheduleSubmitFailureNotify(', arm);
+    const stop = flush.indexOf('if (deliveryQuarantine) break', warning);
+    expect(preflight).toBeGreaterThanOrEqual(0);
+    expect(preflight).toBeLessThan(typeAhead);
+    expect(arm).toBeGreaterThan(typeAhead);
+    expect(warning).toBeGreaterThan(arm);
+    expect(stop).toBeGreaterThan(warning);
+    expect(flush.slice(arm, stop)).not.toContain('pendingMessages.unshift(item)');
+
+    const ready = functionSlice('markPromptReady', 'persistCliSessionId');
+    expect(ready).toContain('currentInputDeliveryQuarantine()');
+    expect(ready).toContain('Ignoring prompt-ready while input delivery is quarantined');
+
+    const emit = functionSlice('emitReadyCodexTurns', 'stopCodexBridge');
+    expect(emit).toContain('releaseInputDeliveryQuarantineForStructuredTerminal(');
+
+    const teardown = functionSlice('killCli', 'stopOwnedSessionScope');
+    expect(teardown).toContain('inputDeliveryQuarantine = null');
   });
 
   it('flushes an OMP trailing candidate only after a complete quiet tick and non-busy viewport', () => {
@@ -581,23 +691,30 @@ describe('worker structured-turn status wiring', () => {
     expect(channel).not.toContain('spawnArgvNeedsWorkingSeed =');
   });
 
-  it('suppresses the markPromptReady generic idle snapshot while the Grok-class busy arm is pending', () => {
+  it('suppresses the markPromptReady generic idle snapshot while the Grok-class busy arm or a background task is pending', () => {
     const body = functionSlice('markPromptReady', 'persistCliSessionId');
     // The "immediate idle snapshot" fires before the seed consumes
     // spawnArgvInitialPromptBusy. For a Grok-class pre-execution ready edge that
     // generic snapshot projects idle (isPromptReady just went true) and would reach
     // the daemon BEFORE the busy arm re-publishes working — combined with the
     // first-turn publisher's working, that working→idle fires a premature DONE. The
-    // snapshot must be gated on !spawnArgvInitialPromptBusy so no idle escapes.
+    // same escape exists while a background sub-agent is still in flight (the
+    // bg-pending arm below owns that path's working publish), so the snapshot must
+    // be gated on both !spawnArgvInitialPromptBusy and pending()===0.
     const idleSnapshot = body.indexOf('Send immediate idle snapshot');
-    const guardedSend = body.indexOf('renderer && !spawnArgvInitialPromptBusy && pendingMessages.length === 0', idleSnapshot);
+    const guardedSend = body.indexOf('renderer && !spawnArgvInitialPromptBusy && backgroundTaskTracker.pending() === 0 && pendingMessages.length === 0', idleSnapshot);
     expect(idleSnapshot).toBeGreaterThanOrEqual(0);
     expect(guardedSend).toBeGreaterThan(idleSnapshot);
-    // The busy arm below still owns the working publish for this path.
+    // The busy arm below still owns the working publish for the Grok-class path.
     const busyArm = body.indexOf('if (spawnArgvInitialPromptBusy) {', guardedSend);
     const armWorking = body.indexOf("publishScreenStatus('working', { force: true })", busyArm);
     expect(busyArm).toBeGreaterThan(guardedSend);
     expect(armWorking).toBeGreaterThan(busyArm);
+    // The background-task arm owns the working publish for the bg-pending path.
+    const bgArm = body.indexOf('} else if (backgroundTaskTracker.pending() > 0) {', busyArm);
+    const bgWorking = body.indexOf("publishScreenStatus('working')", bgArm);
+    expect(bgArm).toBeGreaterThan(busyArm);
+    expect(bgWorking).toBeGreaterThan(bgArm);
   });
 
 

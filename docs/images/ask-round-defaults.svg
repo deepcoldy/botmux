@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="820" height="610" viewBox="0 0 820 610">
+<rect width="820" height="610" fill="#f2f4f7"/>
+<rect x="40" y="28" width="740" height="550" rx="14" fill="white" stroke="#dfe3e9"/>
+<path d="M54 28H766Q780 28 780 42V100H40V42Q40 28 54 28" fill="#e8f0ff"/>
+<g font-family="sans-serif" fill="#202938">
+<text x="68" y="71" font-size="24" font-weight="600">需求澄清 · 整轮提交（交互示意）</text>
+<text x="68" y="142" font-size="17" fill="#64748b">推荐项已预选，可调整；点击底部提交后才记录答案。</text>
+<text x="68" y="198" font-size="21" font-weight="600">1. 改动覆盖哪些入口？</text>
+<rect x="68" y="218" width="270" height="48" rx="6" fill="#3370ff"/>
+<text x="86" y="249" font-size="18" fill="white">● 当前编辑页（推荐）</text>
+<rect x="356" y="218" width="230" height="48" rx="6" fill="white" stroke="#cbd5e1"/>
+<text x="374" y="249" font-size="18">○ 全部相关入口</text>
+<text x="68" y="320" font-size="21" font-weight="600">2. 需要哪些异常反馈？（多选）</text>
+<rect x="68" y="341" width="278" height="48" rx="6" fill="#3370ff"/>
+<text x="86" y="372" font-size="18" fill="white">✓ 保存失败（推荐）</text>
+<rect x="364" y="341" width="278" height="48" rx="6" fill="#3370ff"/>
+<text x="382" y="372" font-size="18" fill="white">✓ 权限不足（推荐）</text>
+<path d="M68 425H752" stroke="#e2e8f0"/>
+<rect x="68" y="445" width="116" height="48" rx="6" fill="#3370ff"/>
+<text x="104" y="476" font-size="19" fill="white">提交</text>
+<text x="68" y="543" font-size="16" fill="#64748b">选项不适用时可在话题里文字回复。</text>
+</g></svg>

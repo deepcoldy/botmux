@@ -48,6 +48,8 @@ export const PI_TURN_BOUNDARY_CUSTOM_TYPE = 'botmux-turn-settled';
  *  error. The reader treats exactly this value as "report the failure". */
 export const PI_TURN_BOUNDARY_STOP_REASON_ERROR = 'error';
 
+import { existsSync, readFileSync } from 'node:fs';
+
 export interface PiTurnBoundaryEntryData {
   /** Stop reason of the final assistant message in the settled turn, or null
    *  when the run produced no assistant message at all. */
@@ -58,6 +60,7 @@ interface PiTurnBoundaryExtensionApi {
   on(event: 'session_start', handler: (event: unknown) => void): void;
   on(event: 'agent_end', handler: (event: unknown) => void): void;
   on(event: 'agent_settled', handler: (event: unknown) => void): void;
+  on(event: 'before_agent_start', handler: (event: unknown) => { systemPrompt?: string | string[] } | void | Promise<{ systemPrompt?: string | string[] } | void>): void;
   appendEntry(customType: string, data?: unknown): void;
 }
 
@@ -116,5 +119,32 @@ export default function registerBotmuxTurnBoundaryExtension(pi: PiTurnBoundaryEx
       // degrades to the reader's timeout backstop, which is the same state as
       // an extension that failed to load at all.
     }
+  });
+
+  // Append Botmux routing rules after CLI native resource discovery and final
+  // runtime project trust resolution are completed. This preserves existing
+  // project/user APPEND_SYSTEM.md auto-discovery, respects interactive session
+  // trust decisions and project_trust extensions, while injecting the session's
+  // Botmux system prompt into every turn.
+  pi.on('before_agent_start', (event: unknown) => {
+    let prompt = process.env.BOTMUX_APPEND_SYSTEM_PROMPT;
+    const promptFile = process.env.BOTMUX_APPEND_SYSTEM_PROMPT_FILE;
+    if (!prompt && promptFile && existsSync(promptFile)) {
+      try {
+        prompt = readFileSync(promptFile, 'utf-8');
+      } catch {
+        // ignore read failure
+      }
+    }
+    if (!prompt) return;
+    const current = (event as { systemPrompt?: string | string[] } | undefined)?.systemPrompt;
+    if (Array.isArray(current)) {
+      return {
+        systemPrompt: [...current, prompt],
+      };
+    }
+    return {
+      systemPrompt: current ? `${current}\n\n${prompt}` : prompt,
+    };
   });
 }

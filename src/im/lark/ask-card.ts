@@ -1,3 +1,4 @@
+import { parseLinkDestination } from 'markdown-it/lib/helpers/index.mjs';
 import type {
   AskCardDispatcher,
   AskClickOutcome,
@@ -8,6 +9,7 @@ import { AskDispatchError } from '../../core/ask-types.js';
 import { getAskSnapshot, submitAsk, toggleAsk, tryResolveAsk } from '../../core/ask-broker.js';
 import { logger } from '../../utils/logger.js';
 import { t, localeForBot, type Locale } from '../../i18n/index.js';
+import { askOptionLayoutForBot, type AskOptionLayout } from './ask-option-layout.js';
 import { replyMessage, sendMessage, updateMessage } from './client.js';
 import { requestGrantForAskClicker } from './ask-grant-request.js';
 import { publishReplyCardAsk, replyCardAskCanAct } from '../../core/turn-reply-ask.js';
@@ -353,6 +355,7 @@ function inlineAskResponse(ask: PendingAsk, result?: AskResult, confirmEmptyArme
  */
 export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confirmEmptyArmed?: boolean }): string {
   const locale = localeForBot(ask.larkAppId);
+  const optionLayout = askOptionLayoutForBot(ask.larkAppId);
   const deadline = new Date(ask.deadlineAt).toLocaleString('zh-CN');
   const status = result ? settleStatus(result, ask, locale) : undefined;
   const confirmEmptyArmed = !!opts?.confirmEmptyArmed && !status;
@@ -378,7 +381,7 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeMd(truncate(q.prompt, 512, locale))}`,
+          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(truncate(q.prompt, 512, locale))}`,
         },
       });
     }
@@ -391,7 +394,7 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
     // 未 settle：只用 action/buttons，避免 form+select 被飞书服务端静默丢弃。
     elements.push({ tag: 'hr' });
 
-    const requiresSubmit = ask.questions.length > 1 || ask.questions.some((q) => q.multiSelect);
+    const requiresSubmit = ask.questions.length > 1 || ask.questions.some((q) => q.multiSelect || q.defaultSelectedKeys !== undefined);
     const selections = ask.selections ?? ask.questions.map(() => []);
 
     for (let i = 0; i < ask.questions.length; i++) {
@@ -402,7 +405,7 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
         tag: 'div',
         text: {
           tag: 'lark_md',
-          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeMd(truncate(q.prompt, 512, locale))}`,
+          content: `**${t('card.ask.question_n', { n: i + 1 }, locale)}**\n${escapeQuestion(truncate(q.prompt, 512, locale))}`,
         },
       });
 
@@ -429,7 +432,7 @@ export function buildAskCard(ask: PendingAsk, result?: AskResult, opts?: { confi
               key: opt.key,
             },
       }));
-      appendActionRows(elements, optionButtons);
+      appendActionRows(elements, optionButtons, optionLayout);
     }
 
     if (requiresSubmit) {
@@ -681,7 +684,25 @@ function optionLabel(multiSelect: boolean, selected: boolean, label: string): st
   return `${selected ? '◉' : '○'} ${label}`;
 }
 
-function appendActionRows(elements: Array<Record<string, unknown>>, actions: Array<Record<string, unknown>>): void {
+function appendActionRows(
+  elements: Array<Record<string, unknown>>,
+  actions: Array<Record<string, unknown>>,
+  layout: AskOptionLayout,
+): void {
+  if (layout === 'vertical') {
+    // 竖放：一行一按钮。单列 column_set（flex_mode:'none' + weighted 列宽）让按钮
+    // 单列排布，长选项标签不被同排按钮挤压。column_set 在旧版卡片 schema 同样
+    // 受支持，无需迁移 schema 2.0。
+    for (const action of actions) {
+      elements.push({
+        tag: 'column_set',
+        flex_mode: 'none',
+        horizontal_spacing: 'small',
+        columns: [{ tag: 'column', width: 'weighted', weight: 1, elements: [action] }],
+      });
+    }
+    return;
+  }
   for (let i = 0; i < actions.length; i += MAX_BUTTONS_PER_ACTION_ROW) {
     elements.push({
       tag: 'action',
@@ -693,6 +714,28 @@ function appendActionRows(elements: Array<Record<string, unknown>>, actions: Arr
 function truncate(s: string, maxChars: number, locale?: Locale): string {
   if (s.length <= maxChars) return s || t('common.empty_paren', undefined, locale);
   return `${s.slice(0, maxChars)}\n\n${t('common.truncated_short', undefined, locale)}`;
+}
+
+/** Keep labelled web links usable without enabling arbitrary question markup. */
+function escapeQuestion(s: string): string {
+  let cursor = 0;
+  let rendered = '';
+  for (const match of s.matchAll(/\[([^\]\r\n]+)\]\(/g)) {
+    const start = match.index!;
+    if (start < cursor || s[start - 1] === '!') continue;
+    const escapes = s.slice(0, start).match(/\\+$/)?.[0].length ?? 0;
+    if (escapes % 2) continue;
+    const destination = parseLinkDestination(s, start + match[0].length, s.length);
+    if (!destination.ok || s[destination.pos] !== ')') continue;
+    let url: URL;
+    try { url = new URL(destination.str); } catch { continue; }
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') continue;
+    // Parentheses are legal URL characters but must not terminate a Markdown link.
+    const href = url.href.replace(/\(/g, '%28').replace(/\)/g, '%29');
+    rendered += escapeMd(s.slice(cursor, start)) + `[${escapeMd(match[1]!)}](${href})`;
+    cursor = destination.pos + 1;
+  }
+  return rendered + escapeMd(s.slice(cursor));
 }
 
 function escapeMd(s: string): string {

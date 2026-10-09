@@ -18,11 +18,25 @@ import {
   parseTargetsAfterCommand, isCommandTargetOnly, stripAllMentions,
 } from './mention-targets.js';
 import { DEFAULT_GRANT_DURATION_MS, DEFAULT_GRANT_QUOTA } from '../../services/grant-policy.js';
+import { hasTriggeredMessage, markMessageTriggered } from '../../services/triggered-message-store.js';
 
 export { stripAllMentions };
 
 /** /grant|/revoke 的命令词匹配（带 \b 边界）。共享解析器见 mention-targets.ts。 */
 const GRANT_CMD_PATTERN = /\/(?:grant|revoke)\b/i;
+
+/**
+ * receive 和 updated 都会进入本 handler；seen 只挡 receive 重投，不能挡跨事件执行。
+ * 在权限 / 参数校验通过后、任何副作用及 await 之前同步检查并占位：既挡并发，也挡
+ * updated 先执行、receive 后到。复用持久化 triggered 记录，让后续编辑和重启也能识别。
+ * 一旦开始执行便保留记录（包括出站结果不明时），避免重放替换 pending 或重复改授权。
+ * 未点名本 bot / 未授权 / 参数无效的消息不占位，仍允许编辑补 @ 或修正后首次执行。
+ */
+function claimGrantCommand(larkAppId: string, messageId: string): boolean {
+  if (hasTriggeredMessage(larkAppId, messageId)) return false;
+  markMessageTriggered(larkAppId, messageId);
+  return true;
+}
 
 /** 取所有非本 bot 的【授权目标】（可以是真人，也可以是另一个 bot——
  *  授权 bot 走同一条路，命中后写本群 chatGrants，放行其在本群拉起 chat-scope 会话）。
@@ -150,6 +164,7 @@ export async function tryHandleGrantCommand(
         .catch(err => logger.debug(`grant no-target guard reply failed: ${err}`));
       return true;
     }
+    if (!claimGrantCommand(larkAppId, messageId)) return true;
     let txt: string;
     if (isGrant) {
       const r = await addAllowedChatGroup(larkAppId, chatId);
@@ -169,6 +184,7 @@ export async function tryHandleGrantCommand(
   }
 
   if (isRevoke) {
+    if (!claimGrantCommand(larkAppId, messageId)) return true;
     // 逐个撤销，单目标沿用原文案，多目标合并成一条「撤销结果」清单。
     const lines: string[] = [];
     for (const tgt of targets) {
@@ -211,6 +227,8 @@ export async function tryHandleGrantCommand(
   const botConfig = getBot(larkAppId).config;
   const quota = pq.quota ?? botConfig.messageQuota?.defaultLimit ?? DEFAULT_GRANT_QUOTA;
   const durationMs = botConfig.grantDefaultDurationMs ?? DEFAULT_GRANT_DURATION_MS;
+
+  if (!claimGrantCommand(larkAppId, messageId)) return true;
 
   // /grant → 弹一张卡（owner 主动态），列出全部目标；owner 点一次范围按钮即对全部生效。额度（若有）对每个目标各自挂在 pending 上。
   const nonce = openPendingMulti(

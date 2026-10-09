@@ -627,18 +627,49 @@ describe('schedule-store', () => {
       store.__setScheduleStoreBeforeRenameTestHook(() => {
         throw new Error('injected persistence failure');
       });
-      expect(() => store.updateTask(original.id, { enabled: false })).toThrow(
+      expect(() => store.updateTask(original.id, { enabled: false, prompt: 'new prompt' })).toThrow(
         'injected persistence failure',
       );
       store.__setScheduleStoreBeforeRenameTestHook(undefined);
 
       expect(readFileSync(fp, 'utf-8')).toBe(before);
       expect(store.getTask(original.id)?.enabled).toBe(true);
+      expect(store.getTask(original.id)?.prompt).toBe(original.prompt);
       expect(readdirSync(tempDir).filter(name => name.includes('.tmp.'))).toEqual([]);
 
       // The store remains usable after the failed transaction.
-      store.updateTask(original.id, { enabled: false });
+      store.updateTask(original.id, { enabled: false, prompt: 'new prompt' });
       expect(store.getTask(original.id)?.enabled).toBe(false);
+    });
+
+    it('keeps the dispatched prompt snapshot and concurrent run state when editing', async () => {
+      const editor = await freshImport();
+      const original = editor.createTask({ ...TASK_PARAMS, id: 'editing_running' });
+      const runner = await freshImport();
+      const claim = runner.claimRun(original.id, {
+        lastRunAt: '2026-09-23T04:00:00.000Z',
+        nextRunAt: '2026-09-24T04:00:00.000Z',
+        lastRunId: 'in-flight',
+      });
+      expect(claim.ok).toBe(true);
+      if (!claim.ok) throw new Error('expected dispatch claim');
+      expect(editor.updateTask(original.id, { prompt: 'replacement' })).toBe(true);
+      expect(claim.task.prompt).toBe(original.prompt);
+      expect(editor.getTask(original.id)).toMatchObject({
+        prompt: 'replacement', lastRunId: 'in-flight', lastStatus: 'running',
+        nextRunAt: '2026-09-24T04:00:00.000Z',
+      });
+      runner.markRun(original.id, true, undefined, undefined, 'in-flight');
+      expect(editor.getTask(original.id)).toMatchObject({ prompt: 'replacement', lastStatus: 'ok' });
+    });
+
+    it('reports a concurrent deletion instead of recreating or falsely updating a task', async () => {
+      const stale = await freshImport();
+      const task = stale.createTask({ ...TASK_PARAMS, id: 'deleted_before_update' });
+      const other = await freshImport();
+      other.removeTask(task.id);
+      expect(stale.updateTask(task.id, { prompt: 'new' })).toBe(false);
+      expect(stale.getTask(task.id)).toBeUndefined();
     });
 
     it('does not lose updates when a stale module instance mutates later', async () => {

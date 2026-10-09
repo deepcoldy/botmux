@@ -277,10 +277,12 @@ async function refreshToken(
   appId: string,
   appSecret: string,
   brand: Brand = 'feishu',
+  signal?: AbortSignal,
 ): Promise<TokenStore | null> {
   try {
     const res = await fetch(`${larkHosts(brand).openApi}/open-apis/authen/v2/oauth/token`, {
       method: 'POST',
+      ...(signal ? { signal } : {}),
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         grant_type: 'refresh_token',
@@ -291,6 +293,7 @@ async function refreshToken(
     });
     if (!res.ok) return null;
     const data = await res.json() as TokenResponse;
+    signal?.throwIfAborted();
     if (data.error || !data.access_token) return null;
 
     const now = new Date();
@@ -351,7 +354,9 @@ async function resolveTokenFrom(
   appId: string,
   appSecret: string,
   brand: Brand,
+  signal?: AbortSignal,
 ): Promise<string | null> {
+  signal?.throwIfAborted();
   if (!loaded) return null;
   const { token } = loaded;
 
@@ -359,7 +364,8 @@ async function resolveTokenFrom(
 
   // access_token expired — try refresh
   if (isValid(token.refresh_expires_at) || (!token.refresh_expires_at && token.refresh_token)) {
-    const refreshed = await refreshToken(token, appId, appSecret, brand);
+    const refreshed = await refreshToken(token, appId, appSecret, brand, signal);
+    signal?.throwIfAborted();
     if (refreshed) return refreshed.access_token;
   }
 
@@ -381,53 +387,27 @@ export async function resolveUserToken(
   appSecret: string,
   brand: Brand = 'feishu',
   openId?: string,
+  signal?: AbortSignal,
 ): Promise<string | null> {
   // 按 (app, 人) 取盘上的 token。不匹配 / 别人的 → null，调用方提示 /login。
   // 这里刻意没有 env 覆盖：一个全局 FEISHU_USER_ACCESS_TOKEN 会绕过整个按人隔离
   // 边界，而且绕过时没有任何痕迹。
-  return resolveTokenFrom(loadTokenForApp(appId, brand, openId), appId, appSecret, brand);
+  return resolveTokenFrom(loadTokenForApp(appId, brand, openId), appId, appSecret, brand, signal);
 }
 
 // ─── Public API: OAuth login flow ─────────────────────────────────────────────
 
 const DEFAULT_PORT = 9768;
 /**
- * Read-only document access, requested by every `/login`.
- *
- * "Open the doc I linked" is a basic expectation of an assistant, and it failed
- * until now: the default set was three IM scopes chosen when the only consumer
- * was chat-image download, so an authorized user still got
- * `99991679 missing_scope` on the first document they asked about.
- *
- * These seven form one closed loop — a link opens, a name is findable, a wiki
- * URL resolves to its token, and docs and sheets both read. Dropping any one
- * produces a plausible-but-broken assistant: docx without wiki, for instance,
- * fails on the wiki links most internal documents actually use.
- *
- * Read-only on purpose. A write scope turns "the agent misread something" into
- * "the agent edited your document", and nothing here needs to write; when a
- * write really is wanted, the missing-scope path asks for it explicitly. Same
- * reasoning excludes contact (reads the whole company directory), calendar, and
- * file download — none are needed to read a document.
- *
- * Every name is validated against setup/lark-scopes.json: a typo does not
- * degrade, it makes the authorize URL fail outright with 20043.
+ * 普通登录只申请消息读取、资源访问和授权续期。
+ * 飞书会校验授权链接里的每个 scope；默认捆绑文档权限会让仅开通消息能力的
+ * 应用在授权页直接失败（20027），连基础登录也无法完成。其它能力通过
+ * `/login --scope ...` 或专项入口按需追加，不根据已有 token 隐式扩大申请范围。
  */
-export const DOC_READ_OAUTH_SCOPES = [
-  'docx:document:readonly',        // new-style doc body
-  'docs:document.content:read',    // legacy doc body
-  'drive:drive.metadata:readonly', // title / mtime / type
-  'drive:drive.search:readonly',   // find a file by name
-  'wiki:wiki:readonly',            // wiki node -> obj_token
-  'sheets:spreadsheet:read',
-  'sheets:spreadsheet.meta:read',
-];
-
 const DEFAULT_SCOPES = [
   'im:message:readonly',
   'im:resource',
   'offline_access',
-  ...DOC_READ_OAUTH_SCOPES,
 ].join(' ');
 
 type UserAuthorizationPollResult =

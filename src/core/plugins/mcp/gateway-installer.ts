@@ -42,19 +42,14 @@ export function defaultGatewayEntry(): GatewayEntry {
   };
 }
 
-function stripCommentBlock(text: string, start: string, end: string): string {
-  let next = text;
-  while (true) {
-    const startIdx = next.indexOf(start);
-    if (startIdx < 0) break;
-    const endIdx = next.indexOf(end, startIdx);
-    if (endIdx < 0) break;
-    let after = endIdx + end.length;
-    if (next.slice(after, after + 2) === '\r\n') after += 2;
-    else if (next[after] === '\n') after += 1;
-    next = `${next.slice(0, startIdx)}${next.slice(after)}`;
-  }
-  return next;
+function dropMarkerLines(text: string, ...markers: string[]): string {
+  // TOML editors can insert unrelated tables (e.g. hooks.state) before the
+  // trailing end comment. Markers are not ownership boundaries: remove only the
+  // marker lines, then let stripCodexTables remove our MCP tables by name.
+  const ownedMarkers = new Set(markers);
+  return text.split(/\r?\n/)
+    .filter(line => !ownedMarkers.has(line.trim()))
+    .join('\n');
 }
 
 function stripLegacyPluginBlocks(text: string): string {
@@ -74,35 +69,140 @@ function stripLegacyPluginBlocks(text: string): string {
   return next;
 }
 
+// Returns the dotted path between the brackets of a `[table]` header, with
+// quote characters preserved, or null for anything that is not a plain table
+// header attributable by name. Bracket-aware: a `]` inside a quoted key
+// (`[hooks.state."/tmp/we]ird:stop:0:0"]`) must not terminate the header, and
+// `[[array-of-tables]]` is reported as null — it is never our MCP table, and
+// treating it as "not a header" would let the section skipper stay latched on
+// across it and eat every table below.
+function parseTomlTableHeader(line: string): string | null {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith('[') || trimmed.startsWith('[[')) return null;
+  let i = 1;
+  let name = '';
+  while (i < trimmed.length) {
+    const ch = trimmed[i];
+    if (ch === '"' || ch === "'") {
+      const quote = ch;
+      name += ch;
+      i += 1;
+      while (i < trimmed.length && trimmed[i] !== quote) {
+        if (quote === '"' && trimmed[i] === '\\' && i + 1 < trimmed.length) {
+          name += trimmed.slice(i, i + 2);
+          i += 2;
+          continue;
+        }
+        name += trimmed[i];
+        i += 1;
+      }
+      if (i >= trimmed.length) return null;
+      name += trimmed[i];
+      i += 1;
+      continue;
+    }
+    if (ch === ']') break;
+    name += ch;
+    i += 1;
+  }
+  if (trimmed[i] !== ']') return null;
+  const rest = trimmed.slice(i + 1).trim();
+  if (rest && !rest.startsWith('#')) return null;
+  return name;
+}
+
+// Splits the dotted path of a table header into its unquoted segments
+// (`mcp_servers."my server".env` -> ['mcp_servers', 'my server', 'env']).
+function parseTomlDottedKey(raw: string): string[] | null {
+  const segments: string[] = [];
+  let segment = '';
+  let haveSegment = false;
+  let i = 0;
+  while (i < raw.length) {
+    const ch = raw[i];
+    if (ch === '"' || ch === "'") {
+      haveSegment = true;
+      i += 1;
+      while (i < raw.length && raw[i] !== ch) {
+        if (ch === '"' && raw[i] === '\\' && i + 1 < raw.length) {
+          segment += (raw[i + 1] === '"' || raw[i + 1] === '\\') ? raw[i + 1] : raw.slice(i, i + 2);
+          i += 2;
+          continue;
+        }
+        segment += raw[i];
+        i += 1;
+      }
+      if (i >= raw.length) return null;
+      i += 1;
+      continue;
+    }
+    if (ch === '.') {
+      if (!haveSegment) return null;
+      segments.push(segment);
+      segment = '';
+      haveSegment = false;
+      i += 1;
+      continue;
+    }
+    if (ch === ' ' || ch === '\t') { i += 1; continue; }
+    haveSegment = true;
+    segment += ch;
+    i += 1;
+  }
+  if (!haveSegment) return null;
+  segments.push(segment);
+  return segments;
+}
+
+// Name of the server in an `[mcp_servers.<name>...]` header (accepts bare,
+// double- and single-quoted keys), or null for any other header.
+function codexMcpServerName(header: string): string | null {
+  const segments = parseTomlDottedKey(header);
+  if (!segments || segments.length < 2 || segments[0] !== 'mcp_servers') return null;
+  return segments[1];
+}
+
 function isBotmuxMcpSection(header: string): boolean {
-  return /^mcp_servers\.(?:botmux|"botmux")(?:\..+)?$/.test(header.trim());
+  return codexMcpServerName(header) === 'botmux';
+}
+
+// Removes every table whose header matches `isOwned`. Blank lines and comments
+// trailing a removed table are buffered and kept: they introduce the NEXT table
+// (or the document), not the table we own. Attributing them to the removed
+// table would silently delete user comments and leave the skipper latched on
+// across array-of-tables / keys containing `]` in tables below.
+function stripCodexTables(text: string, isOwned: (header: string) => boolean): string {
+  const kept: string[] = [];
+  const pending: string[] = [];
+  let skipping = false;
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith('[')) {
+      const header = parseTomlTableHeader(line);
+      skipping = header !== null && isOwned(header);
+      if (!skipping) kept.push(...pending);
+      pending.length = 0;
+    }
+    if (skipping) {
+      if (trimmed === '' || trimmed.startsWith('#')) pending.push(line);
+      continue;
+    }
+    kept.push(line);
+  }
+  kept.push(...pending);
+  return kept.join('\n');
 }
 
 function stripCodexBotmuxSections(text: string): string {
-  const kept: string[] = [];
-  let skip = false;
-  for (const line of text.split(/\r?\n/)) {
-    const section = line.match(/^\s*\[([^\]]+)]\s*(?:#.*)?$/);
-    if (section) skip = isBotmuxMcpSection(section[1]);
-    if (!skip) kept.push(line);
-  }
-  return kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  return stripCodexTables(text, isBotmuxMcpSection).replace(/\n{3,}/g, '\n\n').trim();
 }
 
 function stripCodexNamedMcpSections(text: string, names: ReadonlySet<string>): string {
   if (names.size === 0) return text;
-  const kept: string[] = [];
-  let skip = false;
-  for (const line of text.split(/\r?\n/)) {
-    const section = line.match(/^\s*\[([^\]]+)]\s*(?:#.*)?$/);
-    if (section) {
-      const match = section[1].trim().match(/^mcp_servers\.(?:"([^"]+)"|([A-Za-z0-9._-]+))(?:\..+)?$/);
-      const name = match?.[1] ?? match?.[2];
-      skip = !!name && names.has(name);
-    }
-    if (!skip) kept.push(line);
-  }
-  return kept.join('\n');
+  return stripCodexTables(text, header => {
+    const name = codexMcpServerName(header);
+    return name !== null && names.has(name);
+  });
 }
 
 function legacyMaterializedCodexNames(): Set<string> {
@@ -132,7 +232,7 @@ function renderCodexEntry(entry: GatewayEntry): string {
 
 function ensureCodexEntry(path: string, entry: GatewayEntry): boolean {
   const current = existsSync(path) ? readFileSync(path, 'utf-8') : '';
-  const withoutOwned = stripCommentBlock(stripLegacyPluginBlocks(current), GATEWAY_START, GATEWAY_END);
+  const withoutOwned = dropMarkerLines(stripLegacyPluginBlocks(current), GATEWAY_START, GATEWAY_END);
   const withoutLegacy = stripCodexNamedMcpSections(withoutOwned, legacyMaterializedCodexNames());
   const cleaned = stripCodexBotmuxSections(withoutLegacy);
   const next = `${[cleaned, renderCodexEntry(entry)].filter(Boolean).join('\n\n')}\n`;
@@ -179,7 +279,7 @@ function ensureClaudeEntry(path: string, entry: GatewayEntry): boolean {
 function removeCodexEntry(path: string): boolean {
   if (!existsSync(path)) return false;
   const current = readFileSync(path, 'utf-8');
-  const nextBody = stripCodexBotmuxSections(stripCommentBlock(current, GATEWAY_START, GATEWAY_END));
+  const nextBody = stripCodexBotmuxSections(dropMarkerLines(current, GATEWAY_START, GATEWAY_END));
   const next = nextBody ? `${nextBody}\n` : '';
   if (next === current) return false;
   atomicWriteFileSync(path, next, { mode: 0o600 });

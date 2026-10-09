@@ -123,12 +123,19 @@ describe('current actor client contract', () => {
       schema: CURRENT_ACTOR_SCHEMA,
       status: 'verified',
       actor: { email: 'current.user@example.com' },
+      chatId: 'oc_chat',
+      turnId: 'om_turn',
     }), { status: 200 }));
     await expect(resolveCurrentActor({
       ipcPort: 7951,
       sessionId: 'sess-1',
       fetchImpl: fetchImpl as typeof fetch,
-    })).resolves.toMatchObject({ status: 'verified', actor: { email: 'current.user@example.com' } });
+    })).resolves.toMatchObject({
+      status: 'verified',
+      actor: { email: 'current.user@example.com' },
+      chatId: 'oc_chat',
+      turnId: 'om_turn',
+    });
     expect(fetchImpl).toHaveBeenCalledWith(
       'http://127.0.0.1:7951/api/current-actor',
       expect.objectContaining({ method: 'POST', body: JSON.stringify({ sessionId: 'sess-1' }) }),
@@ -140,6 +147,8 @@ describe('current actor client contract', () => {
       schema: CURRENT_ACTOR_SCHEMA,
       status: 'verified',
       actor: { email: 'current.user@example.com' },
+      chatId: 'oc_chat',
+      turnId: 'om_turn',
     }), { status: 200 }));
     const scheduledTurnId = 'schedule:abcdef12:12345678-1234-1234-1234-123456789abc';
 
@@ -161,10 +170,17 @@ describe('current actor client contract', () => {
   });
 
   it.each([
-    [{ schema: 'botmux.current-actor.v1', status: 'verified', actor: { email: 'x@example.com' } }],
-    [{ schema: CURRENT_ACTOR_SCHEMA, status: 'verified', actor: { email: 'X@example.com' } }],
-    [{ schema: CURRENT_ACTOR_SCHEMA, status: 'verified', actor: { email: 'not-an-email' } }],
-    [{ schema: CURRENT_ACTOR_SCHEMA, status: 'verified', actor: { email: 'x@example.com', username: 'x' } }],
+    [{ schema: 'botmux.current-actor.v1', status: 'verified', actor: { email: 'x@example.com' }, chatId: 'oc_chat', turnId: 'om_turn' }],
+    [{ schema: CURRENT_ACTOR_SCHEMA, status: 'verified', actor: { email: 'X@example.com' }, chatId: 'oc_chat', turnId: 'om_turn' }],
+    [{ schema: CURRENT_ACTOR_SCHEMA, status: 'verified', actor: { email: 'not-an-email' }, chatId: 'oc_chat', turnId: 'om_turn' }],
+    [{ schema: CURRENT_ACTOR_SCHEMA, status: 'verified', actor: { email: 'x@example.com', username: 'x' }, chatId: 'oc_chat', turnId: 'om_turn' }],
+    // A daemon that predates the locators must fail closed rather than hand
+    // back a verified actor with nothing to bind it to a conversation or turn.
+    [{ schema: CURRENT_ACTOR_SCHEMA, status: 'verified', actor: { email: 'x@example.com' } }],
+    [{ schema: CURRENT_ACTOR_SCHEMA, status: 'verified', actor: { email: 'x@example.com' }, chatId: '', turnId: 'om_turn' }],
+    [{ schema: CURRENT_ACTOR_SCHEMA, status: 'verified', actor: { email: 'x@example.com' }, chatId: 'oc_chat', turnId: '' }],
+    [{ schema: CURRENT_ACTOR_SCHEMA, status: 'verified', actor: { email: 'x@example.com' }, chatId: 'oc_chat' }],
+    [{ schema: CURRENT_ACTOR_SCHEMA, status: 'verified', actor: { email: 'x@example.com' }, chatId: 1, turnId: 'om_turn' }],
   ])('rejects an invalid daemon document: %j', async (payload) => {
     await expect(resolveCurrentActor({
       ipcPort: 7951,
