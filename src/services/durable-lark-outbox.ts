@@ -19,7 +19,8 @@ const UUID_RE = /^[A-Za-z0-9_-]{1,50}$/;
 
 export type DurableLarkOutboxTarget =
   | { kind: 'send'; chatId: string }
-  | { kind: 'reply'; messageId: string; replyInThread: boolean };
+  | { kind: 'reply'; messageId: string; replyInThread: boolean }
+  | { kind: 'update'; messageId: string };
 
 export interface DurableLarkOutboxEnvelope {
   version: typeof DURABLE_LARK_OUTBOX_VERSION;
@@ -71,6 +72,11 @@ export interface DurableLarkOutboxDeliveryOptions {
 export interface DurableLarkOutboxDeps {
   sendMessage: SendMessageFn;
   replyMessage: ReplyMessageFn;
+  updateMessage?: (
+    larkAppId: string,
+    messageId: string,
+    content: string,
+  ) => Promise<void | boolean>;
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -125,6 +131,11 @@ function target(value: unknown): DurableLarkOutboxTarget {
     if (!messageId.startsWith('om_')) throw new Error('durable Lark reply target must be a message id');
     if (typeof item.replyInThread !== 'boolean') throw new Error('durable Lark reply target requires replyInThread');
     return { kind: 'reply', messageId, replyInThread: item.replyInThread };
+  }
+  if (item?.kind === 'update') {
+    const messageId = nonempty(item.messageId, 'durable Lark update messageId', 256);
+    if (!messageId.startsWith('om_')) throw new Error('durable Lark update target must be a message id');
+    return { kind: 'update', messageId };
   }
   throw new Error('durable Lark outbox target is invalid');
 }
@@ -261,7 +272,8 @@ export async function deliverDurableLarkOutbox(
           hookContext,
           outboundOptions,
         )
-      : await deps.replyMessage(
+      : parsed.target.kind === 'reply'
+        ? await deps.replyMessage(
           parsed.larkAppId,
           parsed.target.messageId,
           parsed.content,
@@ -270,7 +282,21 @@ export async function deliverDurableLarkOutbox(
           parsed.providerUuid,
           hookContext,
           outboundOptions,
-        );
+        )
+        : await (async () => {
+            const updateTarget = parsed.target;
+            if (updateTarget.kind !== 'update') {
+              throw new Error('durable Lark update target changed during delivery');
+            }
+            if (!deps.updateMessage) throw new Error('durable Lark update transport is unavailable');
+            const updated = await deps.updateMessage(
+              parsed.larkAppId,
+              updateTarget.messageId,
+              parsed.content,
+            );
+            if (updated === false) throw new Error('durable Lark update transport did not confirm the patch');
+            return updateTarget.messageId;
+          })();
     return {
       kind: 'delivered',
       receipt: {

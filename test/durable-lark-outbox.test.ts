@@ -56,6 +56,7 @@ function deps() {
   return {
     sendMessage: vi.fn(async () => 'om_sent'),
     replyMessage: vi.fn(async () => 'om_replied'),
+    updateMessage: vi.fn(async () => true),
   };
 }
 
@@ -153,6 +154,31 @@ describe('durable Lark outbox adapter', () => {
       { suppressHook: true },
     );
     expect(transport.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('updates one stable card target idempotently through the durable outbox', async () => {
+    const record = row({ target: { kind: 'update', messageId: 'om_card' }, msgType: 'interactive' });
+    const transport = deps();
+    const result = await deliverDurableLarkOutbox(
+      record,
+      context(record),
+      transport,
+      { now: () => 2_000 },
+    );
+
+    expect(result).toEqual({
+      kind: 'delivered',
+      receipt: {
+        provider: 'lark',
+        providerMessageId: 'om_card',
+        providerUuid: 'bts_0123456789abcdef0123456789abcdef',
+        operation: 'update',
+        targetId: 'om_card',
+      },
+    });
+    expect(transport.updateMessage).toHaveBeenCalledWith('cli_test', 'om_card', 'hello');
+    expect(transport.sendMessage).not.toHaveBeenCalled();
+    expect(transport.replyMessage).not.toHaveBeenCalled();
   });
 
   it('uses the provider UUID window for bounded safe retry', async () => {
@@ -287,5 +313,6 @@ describe('durable Lark outbox adapter', () => {
     expect(result).toMatchObject({ kind: 'ambiguous' });
     expect(transport.sendMessage).not.toHaveBeenCalled();
     expect(transport.replyMessage).not.toHaveBeenCalled();
+    expect(transport.updateMessage).not.toHaveBeenCalled();
   });
 });

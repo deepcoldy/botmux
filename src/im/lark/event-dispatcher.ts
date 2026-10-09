@@ -4026,6 +4026,8 @@ export interface LarkEventDispatcherRuntimeOptions {
     partitionKey: string;
     data: unknown;
   }) => Promise<unknown>;
+  /** ACK 前的同步权限/生命周期预检；consumer 仍会在副作用前再次验证。 */
+  authorizePrimaryControl?: (data: unknown) => boolean;
 }
 
 interface PrimaryProcessContext {
@@ -5508,7 +5510,10 @@ export function createLarkEventDispatcherRuntime(
       ) {
         if (
           runtimeOptions.enqueuePrimaryControl
+          && runtimeOptions.authorizePrimaryControl?.(data) === true
           && (actionType === 'close' || actionType === 'resume')
+          && data?.action?.value?.visibility !== 'private'
+          && getBot(larkAppId).config.privateCard !== true
         ) {
           try {
             const stableEventId = eventIdForKey(data);

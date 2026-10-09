@@ -119,6 +119,7 @@ import { deliverDurableLarkOutbox } from './services/durable-lark-outbox.js';
 import { durableLarkOutboxMessage } from './services/durable-lark-outbox.js';
 import { enqueueDurableLarkFinalOutput } from './services/durable-lark-final-output.js';
 import { parseDurablePrimarySessionRecord } from './services/durable-session-primary.js';
+import { createDurableLarkSessionControlRuntime } from './services/durable-lark-session-control-runtime.js';
 import { shouldRecordFailedTurn, buildFailedTurnRecord } from './services/failed-turn-retry.js';
 import * as chatFirstSeenStore from './services/chat-first-seen-store.js';
 import { ensureDefaultOncallBound } from './services/oncall-store.js';
@@ -327,7 +328,9 @@ import {
   ensureAutomaticTaskContinuationLease,
   ensurePrincipalLaneInboundTurnBinding,
   setDurableBridgeFinalOutputHandler,
+  buildStreamingCardJson,
 } from './core/worker-pool.js';
+import { buildClosedSessionCard } from './core/closed-session-card.js';
 import { waitAllWithin, trackProducerQuiet, trackProcessExited } from './core/producer-quiescence.js';
 import {
   allFinalOutputDeliveryCount,
@@ -29319,6 +29322,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           );
         }
         let primaryRuntime: DurableLarkPrimaryRuntime | undefined;
+        let primaryControlRuntime: ReturnType<
+          typeof createDurableLarkSessionControlRuntime
+        > | undefined;
         const eventRuntime = createLarkEventDispatcherRuntime(
           cfg.larkAppId,
           cfg.larkAppSecret,
@@ -29330,9 +29336,52 @@ export async function startDaemon(botIndex?: number): Promise<void> {
               if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
               return primaryRuntime.ingress.enqueueBeforeAck(input);
             },
+            enqueuePrimaryControl: input => {
+              if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
+              return primaryRuntime.ingress.enqueueControlBeforeAck(input);
+            },
+            authorizePrimaryControl: data =>
+              primaryControlRuntime?.authorizeBeforeAck(data) === true,
           },
         );
         startEventDispatchers.push(() => {
+          primaryControlRuntime = createDurableLarkSessionControlRuntime({
+            larkAppId: cfg.larkAppId,
+            privateCard: cfg.privateCard === true,
+            store: durableCoordinationRuntime.store,
+            facade: () => {
+              if (!primaryRuntime) throw new Error('durable primary runtime is not ready');
+              return primaryRuntime.session;
+            },
+            listActiveSessions: () => activeSessions.values(),
+            findActiveSession: findActiveBySessionId,
+            listPersistedSessions: () => sessionStore.listSessions(),
+            getPersistedSession: sessionId => sessionStore.getOwnedSession(sessionId),
+            canOperate: (chatId, operatorOpenId) =>
+              canOperate(cfg.larkAppId, chatId, operatorOpenId),
+            closeSession: sessionId => closeSessionHelper(sessionId, {
+              awaitWorkerExit: false,
+              cardVisibility: 'public',
+            }),
+            resumeSession: sessionId => resumeSession(sessionId, activeSessions),
+            buildClosedCard: ds => buildClosedSessionCard(ds, localeForBot(cfg.larkAppId)),
+            buildActiveCard: ds => buildStreamingCardJson(
+              ds,
+              ds.session.suspendedColdResume ? 'idle' : undefined,
+            ),
+            resumeRefusedText: (error, activeSessionId) => {
+              const loc = localeForBot(cfg.larkAppId);
+              return error === 'anchor_occupied'
+                ? tr('card.action.resume_anchor_occupied', {
+                    detail: activeSessionId
+                      ? tr('card.action.resume_anchor_holder', {
+                          short: activeSessionId.substring(0, 8),
+                        }, loc)
+                      : '',
+                  }, loc)
+                : tr('card.action.resume_start_failed', undefined, loc);
+            },
+          });
           primaryRuntime = startDurableLarkPrimaryRuntime({
             store: durableCoordinationRuntime.store,
             larkAppId: cfg.larkAppId,
@@ -29340,8 +29389,12 @@ export async function startDaemon(botIndex?: number): Promise<void> {
             deliverOutbox: (record, context) => deliverDurableLarkOutbox(
               record,
               context,
-              { sendMessage, replyMessage },
+              { sendMessage, replyMessage, updateMessage },
             ),
+            control: {
+              ownedPartitionKeys: primaryControlRuntime.ownedPartitionKeys,
+              resolve: primaryControlRuntime.resolve,
+            },
             onLeadershipAcquired: () => { eventRuntime.connect(); },
             onLeadershipLost: () => { eventRuntime.close(); },
             onError: error => logger.warn(

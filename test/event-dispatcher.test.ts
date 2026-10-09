@@ -1345,7 +1345,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
         handlers,
         'feishu',
         undefined,
-        { enqueuePrimary, enqueuePrimaryControl },
+        { enqueuePrimary, enqueuePrimaryControl, authorizePrimaryControl: () => true },
       );
       runtime.connect();
 
