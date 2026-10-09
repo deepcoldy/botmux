@@ -2105,6 +2105,24 @@ export function evaluateTalk(
   return { allowed: false, reason: 'none' };
 }
 
+
+/**
+ * defaultOncall 自动绑定必须在 talk 判定（evaluateTalk / evaluateBotTalk）之前完成：
+ * 已开 defaultOncall 的群，绑定是「首条被观察到的消息」时懒写入的；若先判权限，
+ * oncallChats 里还没有该 chat → 判无权限 → 误弹自助授权申请卡。
+ *
+ * 人、bot 两条路径都要调：新拉的告警群里第一个开口的常常是外部告警 bot，
+ * 只在人路径绑定会让它的首条 @ 必弹授权卡（oncall 群对 bot 本应直接放行）。
+ * 绑定是 chat 维度的策略、与 sender 无关；ensureDefaultOncallBound 自带
+ * fast-path 短路且 idempotent，失败只记日志、不阻断后续判定。
+ */
+async function bindDefaultOncallBeforeTalk(
+  larkAppId: string, chatId: string, chatType: ChatKind,
+): Promise<void> {
+  await ensureDefaultOncallBound(larkAppId, chatId, chatType).catch(err =>
+    logger.warn(`[oncall:${larkAppId}] pre-permission auto-bind failed for ${chatId.substring(0, 12)}: ${err}`),
+  );
+}
 /**
  * BOT 发送方的 talk 判定 —— bot 路由闸（外部 bot @ 本 bot）的**唯一**入口。
  *
@@ -4352,6 +4370,7 @@ export function createLarkEventDispatcherRuntime(
             // 仍只归 owner；此刻不建 session，绝不把触发 bot 写成 owner，也不 --mention-back
             // 回唤它（dispatchHumanMessage 那条才建 session，本分支只发卡后 return）。
             if (autoTopic) {
+              await bindDefaultOncallBeforeTalk(larkAppId, chatId, chatType);
               const seedBotTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
               if (!seedBotTalk.allowed) {
                 // 黑名单 bot 静默吞掉：不自动开工、不发授权卡、不做 sibling 自愈。
@@ -4391,6 +4410,7 @@ export function createLarkEventDispatcherRuntime(
         // bot 能不能在本会话说话：此处只判定一次，紧随的 p2p promote、下方 fold 的
         // mentionedThisBot 以及再往后的 talk gate 共用同一结论；之间只有路由计算，
         // 不改授权状态（曾是两条手抄 OR 链，漏一处即「能路由但不能 fold」类二次分裂）。
+        await bindDefaultOncallBeforeTalk(larkAppId, chatId, chatType);
         const botTalk = evaluateBotTalk(larkAppId, chatId, senderOpenId, senderUnionId);
         if (botTalk.allowed) {
           await promoteExplicitP2pTopicIfNeeded({
@@ -4491,12 +4511,7 @@ export function createLarkEventDispatcherRuntime(
       if (primary && isUnsupportedPrimarySessionlessCommand(message, senderOpenId)) {
         return ignoredUnsupportedPrimarySideEffect('sessionless commands');
       }
-      // defaultOncall 自动绑定必须在 canTalk 权限判断前完成，否则已开 defaultOncall
-      // 的群首次 @bot 时 oncallChats 中还没有该 chat → evaluateTalk 判无权限 → 误弹
-      // 自助授权申请卡。ensureDefaultOncallBound 本身带 fast-path 短路且 idempotent。
-      await ensureDefaultOncallBound(larkAppId, chatId, chatType).catch(err =>
-        logger.warn(`[oncall:${larkAppId}] pre-permission auto-bind failed for ${chatId.substring(0, 12)}: ${err}`),
-      );
+      await bindDefaultOncallBeforeTalk(larkAppId, chatId, chatType);
       // 人的路径（bot 发送方已在上面的分支 return）：union 走 memberUnionId 腿，
       // 不进 bot-trust 腿——teamBot 只认 bot-locked union。
       const isAllowed = canTalk(larkAppId, chatId, senderOpenId, undefined, humanSenderUnionId, chatType);

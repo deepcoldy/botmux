@@ -74,6 +74,15 @@ vi.mock('../src/bot-registry.js', () => ({
   isChatOncallBoundForAnyBot: (...args: any[]) => mockIsChatOncallBoundForAnyBot(...(args as [string])),
 }));
 
+// 默认与真实实现等价（测试 bot 未开 defaultOncall → 不绑定）；个别用例改写实现来模拟
+// 「首条消息懒绑定 oncall」，用于盯住绑定必须发生在 talk 判定之前。
+const mockEnsureDefaultOncallBound = vi.fn(async (_larkAppId: string, _chatId: string, _chatType: string) =>
+  undefined as { chatId: string; workingDir: string } | undefined);
+vi.mock('../src/services/oncall-store.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/services/oncall-store.js')>()),
+  ensureDefaultOncallBound: (...args: any[]) => mockEnsureDefaultOncallBound(...(args as [string, string, string])),
+}));
+
 const mockListChatBotMembers = vi.fn(async () => [] as Array<{ openId: string; name: string }>);
 const mockResolveCurrentChatBotOpenIds = vi.fn(async (_recv: string, _chat: string, _subjects: string[]) => ({
   ok: false, error: 'live_membership_unavailable', message: 'default_no_resolution',
@@ -3055,6 +3064,47 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleThreadReply).not.toHaveBeenCalled();
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
     expect(mockReplyMessage).toHaveBeenCalledWith(
+      MY_APP_ID,
+      'msg-001',
+      expect.stringContaining(OTHER_BOT_OPEN_ID),
+      'interactive',
+    );
+  });
+
+  it('auto-binds defaultOncall before the foreign-bot talk gate, so the first bot @ in a new oncall chat routes instead of sending a grant card', async () => {
+    // 回归：defaultOncall 的群绑定是「首条被观察到的消息」时懒写入的。原先只有人路径
+    // 在判权限前绑定，外部 bot 路径直接 evaluateBotTalk → 新拉的告警群里告警 bot
+    // 第一个开口时 oncallChats 还没有该 chat → 判无权限 → 误弹授权卡。
+    setupBotState({ allowedUsers: ['ou_owner'] });
+    mockGetOwnerOpenId.mockReturnValue('ou_owner');
+    mockGetChatMode.mockResolvedValueOnce('group');
+    mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown external bot
+    const entry = { chatId: 'chat-001', workingDir: '/repo' };
+    mockEnsureDefaultOncallBound.mockImplementationOnce(async () => {
+      mockFindOncallChat.mockReturnValue(entry);
+      return entry;
+    });
+    const event = makeBotMessageEvent({
+      senderOpenId: OTHER_BOT_OPEN_ID,
+      senderType: 'bot',
+      content: JSON.stringify({
+        zh_cn: { content: [[{ tag: 'at', user_id: MY_OPEN_ID }]] },
+      }),
+      rootId: undefined,
+    });
+    event.message.root_id = undefined as any;
+    handlers.isSessionOwner.mockReturnValue(false);
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockEnsureDefaultOncallBound).toHaveBeenCalledWith(MY_APP_ID, 'chat-001', 'group');
+    expect(handlers.handleThreadReply).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'chat',
+      anchor: 'chat-001',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(mockReplyMessage).not.toHaveBeenCalledWith(
       MY_APP_ID,
       'msg-001',
       expect.stringContaining(OTHER_BOT_OPEN_ID),
