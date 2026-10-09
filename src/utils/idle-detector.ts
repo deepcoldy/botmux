@@ -25,6 +25,7 @@ export interface ProgramStatusBlock {
 export const PROGRAM_STATUS_FALLBACK_MS = 15_000;
 
 const PROGRAM_STATUS_RECORD_CAP = 64;
+const PROGRAM_STATUS_EVICTED_BUSY_CAP = 256;
 const PROGRAM_STATUS_STATES = new Set<ProgramStatusEvent['state']>([
   'idle', 'working', 'done', 'blocked', 'error', 'clear',
 ]);
@@ -389,7 +390,7 @@ export class IdleDetector {
         return;
       }
       this.deleteProgramStatusSubtree(event.id);
-      if (this.programStatusRecords.size === 0) {
+      if (this.programStatusRecords.size === 0 && this.evictedBusyIds.size === 0) {
         this.exitProgramStatusAuthority();
         return;
       }
@@ -737,6 +738,10 @@ export class IdleDetector {
       const rec = this.programStatusRecords.get(oldestId);
       if (rec && (rec.state === 'working' || rec.state === 'blocked')) {
         this.evictedBusyIds.add(oldestId);
+        if (this.evictedBusyIds.size > PROGRAM_STATUS_EVICTED_BUSY_CAP) {
+          const oldest = this.evictedBusyIds.values().next().value;
+          if (oldest) this.evictedBusyIds.delete(oldest);
+        }
       }
       this.programStatusRecords.delete(oldestId);
     }

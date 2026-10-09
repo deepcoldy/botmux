@@ -378,5 +378,66 @@ describe('IdleDetector program status', () => {
     expect(cb).toHaveBeenCalledWith('program-status');
     detector.dispose();
   });
+
+  it('caps evictedBusyIds at 256 using FIFO eviction to prevent unbounded growth', () => {
+    const detector = new IdleDetector(makeCli());
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    // Push 350 active busy children (exceeds 64 record cap + 256 sticky busy cap)
+    for (let i = 0; i < 350; i++) {
+      detector.observeProgramStatus({ state: 'working', id: `busy-${i}` });
+    }
+
+    // Records 0..285 got evicted. Due to 256 cap, the oldest (0..29) were dropped from evictedBusyIds.
+    // The remaining sticky evicted set contains the newest 256 evicted ids (30..285),
+    // and records 286..349 (64 items) remain in active records map.
+    // Finish all records in the active map:
+    for (let i = 286; i < 350; i++) {
+      detector.observeProgramStatus({ state: 'done', id: `busy-${i}` });
+    }
+    detector.observeProgramStatus({ state: 'done' });
+    expect(cb).not.toHaveBeenCalled();
+
+    // Settle all retained sticky evicted items (30..285)
+    for (let i = 30; i < 286; i++) {
+      detector.observeProgramStatus({ state: 'done', id: `busy-${i}` });
+    }
+
+    // Now all tracked busy items are settled -> idle fires (dropped rogue items 0..29 did not permanently lock the session)!
+    expect(cb).toHaveBeenCalledTimes(1);
+    expect(cb).toHaveBeenCalledWith('program-status');
+    detector.dispose();
+  });
+
+  it('retains authority and does not idle when clear empties visible records but evicted busy children remain', () => {
+    const detector = new IdleDetector(makeCli());
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    // Push 70 working items: 6 are evicted into evictedBusyIds, 64 are in programStatusRecords.
+    for (let i = 0; i < 70; i++) {
+      detector.observeProgramStatus({ state: 'working', id: `child-${i}` });
+    }
+
+    // Clear all 64 items in programStatusRecords (child-6..child-69).
+    for (let i = 6; i < 70; i++) {
+      detector.observeProgramStatus({ state: 'clear', id: `child-${i}` });
+    }
+
+    // programStatusRecords is now empty (size === 0), but evictedBusyIds has child-0..child-5.
+    // A root done should NOT trigger idle because evicted busy children are still running!
+    detector.observeProgramStatus({ state: 'done' });
+    expect(cb).not.toHaveBeenCalled();
+
+    // Finish the remaining evicted items:
+    for (let i = 0; i < 6; i++) {
+      detector.observeProgramStatus({ state: 'done', id: `child-${i}` });
+    }
+
+    expect(cb).toHaveBeenCalledTimes(1);
+    expect(cb).toHaveBeenCalledWith('program-status');
+    detector.dispose();
+  });
 });
 
