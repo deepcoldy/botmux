@@ -13,6 +13,7 @@ import { setGroupContextSettings } from '../src/services/group-context-settings-
 import { openDatabaseSyncOrThrow } from '../src/services/sqlite-compat.js';
 import { bindGroupContextDelivery, confirmGroupContextDelivery, getDeliveredGroupContextSeqs, writePreparedGroupContext } from '../src/services/group-context-delivery-store.js';
 import { groupContextEpoch } from '../src/services/group-context-prompt.js';
+import { DEFAULT_BRAND_LABEL } from '../src/im/lark/md-card.js';
 
 const fixture = fileURLToPath(new URL('./fixtures/send-reply-card-capture.ts', import.meta.url));
 const key = { larkAppId: 'cli_test', sessionId: 'sid_reply', turnId: 'om_turn' };
@@ -87,13 +88,11 @@ describe('real CLI send into a running reply card', () => {
       const requests = String(result.stdout).split('\n').filter(line => line.startsWith('CAPTURE_REPLY='))
         .map(line => JSON.parse(line.slice('CAPTURE_REPLY='.length)));
       expect(requests).toHaveLength(1);
-      if (!merged) {
-        const cardContent = requests[0].body?.content ?? '';
-        if (responseKind === 'final') {
-          expect(cardContent).toContain('Powered by [botmux]');
-        } else {
-          expect(cardContent).not.toContain('Powered by [botmux]');
-        }
+      const cardContent = requests[0].body?.content ?? '';
+      if (responseKind === 'final') {
+        expect(cardContent).toContain(DEFAULT_BRAND_LABEL);
+      } else {
+        expect(cardContent).not.toContain(DEFAULT_BRAND_LABEL);
       }
       expect(getDeliveredGroupContextSeqs(binding.appId, binding.chatId, binding.sessionId, binding.epoch, dataDir)).toEqual([]);
       expect(confirmGroupContextDelivery(binding, dataDir)).toBe(true);
@@ -297,7 +296,7 @@ describe('real CLI send into a running reply card', () => {
         .filter(line => line.startsWith('CAPTURE_REPLY='))
         .map(line => JSON.parse(line.slice('CAPTURE_REPLY='.length)));
       expect(requests).toHaveLength(1);
-      expect(requests[0].body?.content).toContain('Powered by [botmux]');
+      expect(requests[0].body?.content).toContain(DEFAULT_BRAND_LABEL);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
