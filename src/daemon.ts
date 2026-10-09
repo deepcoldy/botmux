@@ -1,4 +1,4 @@
-import { canAutoCloseMessageListenerSession } from './core/message-listener-auto-close.js';
+import { createMessageListenerAutoCloseScheduler } from './core/message-listener-auto-close.js';
 import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
@@ -28292,25 +28292,15 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       ),
     },
   );
-  const listenerCloseTimers = new WeakSet<DaemonSession>();
-  /** Defer cleanup until terminal/output handlers drain, then recheck ownership. */
-  const scheduleMessageListenerAutoClose = (ds: DaemonSession): void => {
-    const turnId = ds.messageListenerCompletedTurnId;
-    if (!turnId || !ds.session.messageListenerAutoClose || listenerCloseTimers.has(ds)) return;
-    const worker = ds.worker;
-    listenerCloseTimers.add(ds);
-    const timer = setTimeout(() => {
-      listenerCloseTimers.delete(ds);
-      void runDetachedBotTurnMutation(ds.larkAppId, async () => {
-        if (findActiveBySessionId(ds.session.sessionId) !== ds || ds.worker !== worker
-          || hasPendingOrdinaryImInput(ds)
-          || !canAutoCloseMessageListenerSession(ds, turnId)) return;
-        const result = await closeSessionForBackgroundCleanup(ds.session.sessionId, 'message-listener completion');
-        if (result.ok) logger.info(`[message-listener] Auto-closed completed session ${ds.session.sessionId.slice(0, 8)}`);
-      }).catch(err => logger.warn(`[message-listener] Auto-close failed: ${err instanceof Error ? err.message : String(err)}`));
-    }, 1_500);
-    timer.unref();
-  };
+  const scheduleMessageListenerAutoClose = createMessageListenerAutoCloseScheduler({
+    mutate: (ds, action) => runDetachedBotTurnMutation(ds.larkAppId, action),
+    isCurrent: ds => findActiveBySessionId(ds.session.sessionId) === ds && !hasPendingOrdinaryImInput(ds),
+    closeCompletedSession: async ds => {
+      const result = await closeSessionForBackgroundCleanup(ds.session.sessionId, 'message-listener completion');
+      if (result.ok) logger.info(`[message-listener] Auto-closed completed session ${ds.session.sessionId.slice(0, 8)}`);
+    },
+    onError: err => logger.warn(`[message-listener] Auto-close failed: ${err instanceof Error ? err.message : String(err)}`),
+  });
   // Initialise worker pool with daemon callbacks
   initWorkerPool({
     sessionReply,
