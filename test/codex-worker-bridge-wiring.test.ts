@@ -133,4 +133,14 @@ describe('Codex worker structured-bridge wiring', () => {
     expect(region).toContain('sandbox: sandboxMode');
     expect(region).toContain('backendType: effectiveBackendType');
   });
+
+  it('resolves the real codex leaf under a sandbox launcher process', () => {
+    const start = workerSource.indexOf('function resolveCodexOwnershipPid');
+    expect(start).toBeGreaterThan(0);
+    const body = workerSource.slice(start, workerSource.indexOf('\n}\n', start));
+    expect(body).toContain("findLaunchedCliPid(candidatePid, 'codex')");
+    expect(workerSource).toContain('lastSpawnCodexLauncherActive = codexLauncherActive;');
+    const kicks = workerSource.match(/if \(cfg\.cliId === 'codex' && codexLauncherActive\) startCodexLauncherPidResolve\(/g) ?? [];
+    expect(kicks.length).toBeGreaterThanOrEqual(2);
+  });
 });

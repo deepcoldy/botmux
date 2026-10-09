@@ -80,20 +80,26 @@ async function refresh(terminal: PtyHandle): Promise<Resolution> {
   if (owned === undefined || owned.size > 0 || !terminal.captureInputState) return { kind: 'legacy' };
   try {
     const footer = emptyComposerFooter(terminal);
-    if (footer === undefined) return { kind: 'unavailable' };
-    const footerSessionId = statusLineSession(footer);
-    if (footerSessionId && terminal.cliPid === pid) {
-      bindings.set(terminal, { pid, sessionId: footerSessionId });
-      return { kind: 'terminal', sessionId: footerSessionId };
+    if (footer !== undefined) {
+      const footerSessionId = statusLineSession(footer);
+      if (footerSessionId && terminal.cliPid === pid) {
+        bindings.set(terminal, { pid, sessionId: footerSessionId });
+        return { kind: 'terminal', sessionId: footerSessionId };
+      }
     }
   } catch { /* Closed pane or unsupported snapshot: keep the binding unproven. */ }
+  // When explicitly known as an owned session (isAdopt === false), do not block
+  // input just because statusline ID is missing — fresh owned Codex has no rollout yet.
+  if (terminal.isAdopt === false) {
+    return { kind: 'legacy' };
+  }
   return { kind: 'unavailable' };
 }
 
 /** One setup per backend generation; failures remain retryable. No TUI writes. */
 export function prepareCodexTerminalStatusLine(terminal: PtyHandle): CodexStatusLineSetup | undefined {
   const pid = terminal.cliPid;
-  if (!pid || terminal.expectedCodexSessionId) return undefined;
+  if (!pid || terminal.expectedCodexSessionId || terminal.isAdopt === false) return undefined;
   try {
     const footer = emptyComposerFooter(terminal);
     if (footer === undefined || statusLineSession(footer)) return undefined;

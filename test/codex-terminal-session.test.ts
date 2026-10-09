@@ -329,4 +329,20 @@ describe('Codex terminal statusline setup', () => {
     expect(prepareCodexTerminalStatusLine(t.pty)?.kind).toBe('configured');
     expect(ensureCodexStatusLineConfig).toHaveBeenCalledTimes(3);
   });
+
+  it('falls back to legacy mode for owned sessions (isAdopt === false) when statusline thread ID is absent', async () => {
+    vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
+    const t = terminal('');
+    t.pty.isAdopt = false;
+    expect(await refreshCodexTerminalSession(t.pty)).toEqual({ kind: 'legacy' });
+    expect(prepareCodexTerminalStatusLine(t.pty)).toBeUndefined();
+    expect(ensureCodexStatusLineConfig).not.toHaveBeenCalled();
+  });
+
+  it('still uses visible footer thread ID for owned sessions when present', async () => {
+    vi.mocked(findCodexRolloutSetByPid).mockReturnValue(new Set());
+    const t = terminal();
+    t.pty.isAdopt = false;
+    expect(await refreshCodexTerminalSession(t.pty)).toEqual({ kind: 'terminal', sessionId: sid });
+  });
 });
