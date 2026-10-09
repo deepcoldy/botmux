@@ -84,6 +84,10 @@ if (startDaemon) {
             b.workingDir = '.';
             changed = true;
           }
+          if (b.p2pMode !== 'thread') {
+            b.p2pMode = 'thread';
+            changed = true;
+          }
         }
         if (changed) {
           writeFileSync(botsConfig, JSON.stringify(parsed, null, 2), 'utf8');

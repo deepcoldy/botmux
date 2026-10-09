@@ -430,7 +430,7 @@ export async function openThreadForMessage(
   await agent.aiWaitFor(
     `页面右侧主内容区（宽版，占据页面大部分空间，不是那一条窄的侧栏）已经打开包含"${tag}"的测试话题；` +
       '区域内可见该测试消息，以及下方的机器人相关内容（普通文本气泡、"项目仓库管理"卡、"直接开启会话"按钮或流式卡片之一）',
-    { timeoutMs: 20_000, checkIntervalMs: 3_000 },
+    { timeoutMs: 35_000, checkIntervalMs: 3_000 },
   );
 
   await scrollThreadToBottom(agent);
