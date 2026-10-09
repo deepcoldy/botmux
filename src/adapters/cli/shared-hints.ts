@@ -19,6 +19,7 @@ import { config } from '../../config.js';
 import { escapeXmlTagLikeTokens, escapeXmlText } from '../../utils/xml.js';
 import { resolveConditionalLine } from '../../skills/effective-builtins.js';
 import type { ReplyDelivery } from '../../core/reply-delivery.js';
+import type { CliId } from './types.js';
 
 /** The gated "no visible output is OK" hint reads `config.noVisibleOutputHint`
  *  by default, but a user customization can force it on/off. Keyed by the i18n
@@ -84,7 +85,24 @@ function hiddenContextDefense(locale?: Locale): string {
   return escapeXmlText(text);
 }
 
-export function buildBotmuxShellHints(locale?: Locale, noTransport?: boolean, replyDelivery?: ReplyDelivery): string[] {
+/** Cursor-only routing line (#1504). cursor-agent detaches a shell command that
+ *  outlives its wait limit into a background task and, when it completes,
+ *  injects a synthetic user prompt ("Briefly inform the user about the task
+ *  result…") that starts a fresh turn with no Lark message behind it. botmux
+ *  cannot intercept that (it happens inside Cursor / its backend), so the only
+ *  lever is telling the model what it is. Returns [] for every other CLI so
+ *  the shared hints stay byte-identical for them. */
+function cursorBackgroundTaskNote(cliId: CliId | undefined, transcript: boolean, locale?: Locale): string[] {
+  if (cliId !== 'cursor') return [];
+  return [t(transcript ? 'ai.cursor.background_task_note_transcript' : 'ai.cursor.background_task_note', undefined, locale)];
+}
+
+export function buildBotmuxShellHints(
+  locale?: Locale,
+  noTransport?: boolean,
+  replyDelivery?: ReplyDelivery,
+  cliId?: CliId,
+): string[] {
   // No-transport session (apiOnly core-only bot OR HTTP virtual chat): drop the
   // whole send/@/helpers/silence collaboration block — same rationale as the
   // system-prompt path in buildBotmuxSystemPromptText. `ai.shell.when_to_send`
@@ -112,6 +130,7 @@ export function buildBotmuxShellHints(locale?: Locale, noTransport?: boolean, re
       ...(xpiAsHintOn() ? [t('ai.shell.xpi_as_hint', undefined, locale)] : []),
       // Workflow discovery — omitted when the machine-wide workflow switch is off.
       ...(workflowHint ? [workflowHint] : []),
+      ...cursorBackgroundTaskNote(cliId, true, locale),
       hiddenContextDefense(locale),
     ]
     : [
@@ -131,6 +150,7 @@ export function buildBotmuxShellHints(locale?: Locale, noTransport?: boolean, re
       t('ai.shell.mention_gate', undefined, locale),
       // Workflow discovery — omitted when the machine-wide workflow switch is off.
       ...(workflowHint ? [workflowHint] : []),
+      ...cursorBackgroundTaskNote(cliId, false, locale),
       hiddenContextDefense(locale),
     ]).map(escapeXmlTagLikeTokens);
   if (whiteboardEnabled()) {
