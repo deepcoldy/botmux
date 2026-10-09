@@ -293,27 +293,6 @@ export async function waitForCardStatus(
   );
 }
 
-export async function waitForIdleOrCodexUsageLimit(
-  agent: PlaywrightAgent,
-  opts?: { timeoutMs?: number; marker?: string },
-): Promise<'idle' | 'codex-usage-limit'> {
-  const markerClause = opts?.marker
-    ? `要么当前测试话题已经收到来自 Codex 的回复文本气泡（包含"${opts.marker}"），`
-    : '要么当前测试话题已经收到来自 Codex 的回复文本气泡，';
-  await agent.aiWaitFor(
-    '主内容区正在显示的测试话题最底部，当前 Codex 会话已经进入可验证的结束态：' +
-      `要么最新流式卡片标题包含"等待输入"，${markerClause}` +
-      '要么最新 Codex 回复或卡片正文明确包含 usage limit、rate limit、Approaching rate limits、Switch to gpt-5.4-mini 或 lower credit usage 这类额度/限流/模型切换提示；' +
-      '不要把左侧话题列表预览或历史旧话题当作当前会话结果',
-    { timeoutMs: opts?.timeoutMs ?? 180_000, checkIntervalMs: 5_000 },
-  );
-
-  const isUsageLimited = await agent.aiBoolean(
-    '主内容区正在显示的测试话题最底部，当前 Codex 会话的最新回复或最新流式卡片正文明确包含 usage limit、rate limit、Approaching rate limits、Switch to gpt-5.4-mini 或 lower credit usage 这类额度/限流/模型切换提示',
-  );
-  return isUsageLimited ? 'codex-usage-limit' : 'idle';
-}
-
 /**
  * Full flow after sending a message:
  *  1. Switch to Feishu's 「话题」filter tab so the test topic opens in the
@@ -489,8 +468,20 @@ export async function showStreamingOutput(
   agent: PlaywrightAgent,
   page: Page,
 ): Promise<void> {
+  // The ACK text bubble is the last item after a successful reply, so "the
+  // bottom of the thread" is that bubble (thumbs-up / copy / forward), not
+  // the streaming card. Bring the card's own button into view first.
+  const cardButton = page.getByRole('button', { name: /显示输出|隐藏输出/ }).last();
+  try {
+    await cardButton.scrollIntoViewIfNeeded({ timeout: 15_000 });
+  } catch {
+    // The vision checks below report a real miss.
+  }
+  const cardClause =
+    '主内容区正在显示的测试话题里，当前会话的流式卡片（带"打开 Web 终端"或"显示输出/隐藏输出"的那张，可能在 ACK 文本气泡上方）。' +
+    '不要把文本气泡右侧的点赞、复制、转发或更多选项当成卡片按钮。';
   const needShow = await agent.aiBoolean(
-    '主内容区正在显示的测试话题最底部，当前会话的流式卡片操作按钮中有"📖 显示输出"按钮',
+    `${cardClause}这张卡片的操作按钮中有"📖 显示输出"按钮`,
   );
   if (needShow) {
     try {
@@ -500,13 +491,13 @@ export async function showStreamingOutput(
         .click({ timeout: 5_000 });
     } catch {
       await agent.aiAct(
-        '点击主内容区正在显示的测试话题最底部，当前会话流式卡片里的"📖 显示输出"按钮；不要点击"打开 Web 终端"按钮',
+        `点击${cardClause}里的"📖 显示输出"按钮；不要点击"打开 Web 终端"，也不要点文本气泡上的按钮`,
       );
     }
     await page.waitForTimeout(2000);
   }
   await agent.aiAssert(
-    '主内容区正在显示的测试话题最底部，当前会话的流式卡片操作按钮中有"📕 隐藏输出"，' +
+    `${cardClause}这张卡片的操作按钮中有"📕 隐藏输出"，` +
       '并且卡片正文显示终端截图、终端区域，或"等待第一张截图"占位',
   );
 }
