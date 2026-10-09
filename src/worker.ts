@@ -9436,12 +9436,46 @@ function observeStartupBannerOnScreen(): boolean {
 
 /** ZMX's complete cached history can carry a restoration header that no
  * synthetic renderer viewport retains. Both resync and append-only captures
- * update this cache before notifying us; neither path may strand startup. */
+ * update this cache before notifying us; neither path may strand startup.
+ *
+ * ZMX-only: its `captureCurrentScreen()` returns a cheap in-memory snapshot
+ * cache, so calling it on every PTY chunk is free. Byte-stream backends
+ * (tmux/PTY) whose `captureCurrentScreen()` shells out must NOT be polled
+ * per-chunk here — they run the same history predicate on the bounded
+ * first-prompt recheck schedule via observeRestoredStartupHistoryOnScreen(). */
 function observeRestoredStartupHistory(): void {
   if (!awaitingFirstPrompt || !(backend instanceof ZmxBackend)) return;
   if (!idleDetector?.observeStartupHistory(backend.captureCurrentScreen())) return;
   log(`${cliName()} restored history observed; releasing the startup hold`);
   if (cliAdapter?.supportsTypeAhead) void flushPending();
+}
+
+/** Backend-agnostic restore-history compensation for the first-prompt recheck
+ * loop. A resumed CLI (e.g. Codex 0.154 `resume`) can paint straight into a
+ * restored composer without ever repainting the loaded banner AND without the
+ * "Earlier messages" restoration marker reaching the byte stream. In that
+ * layout neither feed()'s banner match, observeStartupScreen(), nor the
+ * startupHistorySeen-gated quiescence capture can lift the startup veto — only
+ * the adapter's own startupReadyFromHistory() predicate recognizes the
+ * restored composer (it accepts the `· Context N% left/used` footer as
+ * positive initialization evidence, guarded against loading/busy/queued/
+ * draft/picker screens). The ZMX path above runs it for snapshot backends;
+ * run it here for byte-stream backends (tmux/PTY) as well.
+ *
+ * Reads the renderer, NOT backend.captureCurrentScreen(): the rendered snapshot
+ * is the same viewport the banner path already trusts, avoids a per-recheck
+ * tmux capture-pane shell-out, and — critically — excludes scrollback, so a
+ * stale `esc to interrupt` / restoration marker far above the composer cannot
+ * be misread as current readiness. No-op for adapters without the predicate
+ * (only the Codex family declares startupReadyFromHistory). */
+function observeRestoredStartupHistoryOnScreen(): boolean {
+  if (!awaitingFirstPrompt || backend instanceof ZmxBackend) return false;
+  let screen = '';
+  try { screen = renderer?.rawSnapshot({ preserveFormatting: true }) ?? ''; } catch { return false; }
+  if (!screen || idleDetector?.observeStartupHistory(screen) !== true) return false;
+  log(`${cliName()} restored composer observed on screen; releasing the startup hold`);
+  if (cliAdapter?.supportsTypeAhead) void flushPending();
+  return true;
 }
 
 /** 当前渲染画面是否有提示符（renderer 尚未就绪时按「没有」处理，等下一轮）。 */
@@ -19619,6 +19653,15 @@ async function spawnCli(
     // swallows the queued messages for the lifetime of the session.
     if (idleDetector?.isStartupPending()) {
       observeStartupBannerOnScreen();
+    }
+    // Banner match above only recognizes a freshly loaded banner. A resumed CLI
+    // can paint straight into a restored composer with no banner repaint (and,
+    // on 0.154, with no restoration marker in the byte stream); the adapter's
+    // guarded history predicate recognizes that layout. ZMX runs it per-chunk
+    // (cheap snapshot cache); byte-stream backends (tmux/PTY) run it here, on
+    // the bounded recheck schedule, against the rendered viewport.
+    if (idleDetector?.isStartupPending()) {
+      observeRestoredStartupHistoryOnScreen();
     }
     if (idleDetector?.isStartupPending()) {
       if (cfg.resume && cfg.cliId === 'codex' && cfg.wrapperCli?.trim() === 'aiden x codex'
