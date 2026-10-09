@@ -3081,6 +3081,15 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     mockReadFileSync.mockReturnValue('{}');  // empty cross-ref → unknown external bot
     const entry = { chatId: 'chat-001', workingDir: '/repo' };
     mockEnsureDefaultOncallBound.mockImplementationOnce(async () => {
+      // 对齐真实实现：ensureDefaultOncallBound 经 autoBindOncallFromDefault await
+      // 锁内 RMW + 磁盘写（多个异步 tick）之后才把 entry 发布进内存态
+      //（findOncallChat 读的那份）。这里让出两个 microtask 再翻转：
+      // 单 tick 时 mock 恢复反应在微任务队列里天然早于 async helper 的 resolve
+      // 反应，模拟不出 I/O 深度；双 tick 才能同时钉死两类漏 await——
+      // 调用点 fire-and-forget（evaluateBotTalk 在同同步段执行）与 helper 内不向
+      // 外传播 await（调用方在第二 tick 前恢复）都会读到未翻转的 oncall 态而变红。
+      await Promise.resolve();
+      await Promise.resolve();
       mockFindOncallChat.mockReturnValue(entry);
       return entry;
     });
@@ -7691,6 +7700,11 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
     mockGetOwnerOpenId.mockReturnValue('ou_owner');
     mockGetChatMode.mockReset();
     mockGetChatMode.mockResolvedValue('topic');
+    // defaultOncall 懒绑定相关 mock 默认「未开/未绑」：mockReturnValue 持久生效，
+    // 不在这里复位会让某个用例翻转的 oncall 态泄漏进后续用例。
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockEnsureDefaultOncallBound.mockReset();
+    mockEnsureDefaultOncallBound.mockResolvedValue(undefined);
     handlers = makeHandlers();
     handlers.isSessionOwner.mockReturnValue(false);
   });
@@ -7779,6 +7793,36 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
     // 发了授权申请卡（maybeSendGrantRequestCard → replyMessage interactive）
     expect(mockReplyMessage).toHaveBeenCalledTimes(1);
     expect(mockReplyMessage).toHaveBeenCalledWith(MY_APP_ID, 'msg-bot-seed-stranger', expect.any(String), 'interactive');
+  });
+
+  it('defaultOncall 懒绑定先于 autoTopic 授权门：陌生告警 bot 的免@新话题种子自动开工、不弹卡', async () => {
+    // 回归 #1765：免@新话题自动开工的 bot 种子点（autoTopic 分支）也曾漏掉
+    // defaultOncall 前置绑定。场景与上一用例完全相同（restricted + 无 cross-ref 的
+    // 陌生外部 bot，没有任何其它放行腿），唯一区别是本群开了 defaultOncall：
+    // 首条被观察到的消息触发懒绑定，绑定必须在 evaluateBotTalk 之前 await 完成，
+    // oncall 腿才放行 → 自动开工；否则与上一用例一样误弹授权卡、不建 session。
+    setupAutoTopicBotSender(true, false);
+    const entry = { chatId: 'chat-oncall-seed', workingDir: '/repo' };
+    mockEnsureDefaultOncallBound.mockImplementationOnce(async () => {
+      // 对齐真实实现：锁内 RMW + 磁盘写（多个异步 tick）后才发布内存态，
+      // 双 microtask 才能钉死调用链必须逐层 await（见 @ 路径同名用例注释）。
+      await Promise.resolve();
+      await Promise.resolve();
+      mockFindOncallChat.mockReturnValue(entry);
+      return entry;
+    });
+    const event = makeBotTopicSeed('msg-oncall-seed', 'chat-oncall-seed');
+
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+
+    expect(mockEnsureDefaultOncallBound).toHaveBeenCalledWith(MY_APP_ID, 'chat-oncall-seed', 'group');
+    expect(handlers.handleNewTopic).toHaveBeenCalledWith(event, expect.objectContaining({
+      scope: 'thread',
+      anchor: 'msg-oncall-seed',
+      larkAppId: MY_APP_ID,
+    }));
+    expect(mockReplyMessage).not.toHaveBeenCalled();
   });
 
   it('restricted 模式陌生 bot 连发两条新话题 → 授权卡去重（节流），只发一次', async () => {
