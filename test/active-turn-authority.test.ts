@@ -193,6 +193,24 @@ describe('ActiveTurnAuthority', () => {
       expect(authority.identity()).toEqual({});
     }
   });
+
+  it('allows same-principal queued steer turn rotation when caller identity is preserved', () => {
+    const authority = new ActiveTurnAuthority();
+    const active = { turnId: 'turn-active', caller: humanA };
+    expect(authority.reserve(active)).toBe(true);
+    expect(authority.markStarted(active)).toBe(true);
+
+    // Caller-less turn would be rejected when active turn has humanA caller
+    const callerLess = { turnId: 'turn-queued' };
+    expect(authority.reserve(callerLess)).toBe(false);
+    expect(authority.markStarted(callerLess)).toBe(false);
+
+    // Queued turn with preserved caller is accepted and successfully rotates
+    const queuedWithCaller = { turnId: 'turn-queued', caller: humanA };
+    expect(authority.reserve(queuedWithCaller)).toBe(true);
+    expect(authority.markStarted(queuedWithCaller)).toBe(true);
+    expect(authority.identity()).toEqual(queuedWithCaller);
+  });
 });
 
 for (const caller of [humanA, { ...humanA, requestUserOpenId: 'ou_b', requestUserUnionId: 'on_b' }]) {

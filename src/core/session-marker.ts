@@ -8,6 +8,7 @@ import {
 } from '../utils/process-identity.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import { withFileLockSync } from '../utils/file-lock.js';
+import type { TrustedCaller } from '../types.js';
 
 export {
   readLinuxBootIdentity,
@@ -17,12 +18,16 @@ export {
 export interface QueuedTypeAheadTurn {
   turnId: string;
   dispatchAttempt?: number;
+  trustedCaller?: TrustedCaller;
+  trustedController?: TrustedCaller;
 }
 
 export interface AncestorSessionContext {
   sessionId: string;
   turnId?: string;
   dispatchAttempt?: number;
+  trustedCaller?: TrustedCaller;
+  trustedController?: TrustedCaller;
   queuedTurnId?: string;
   queuedTurns?: QueuedTypeAheadTurn[];
 }
@@ -91,6 +96,8 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
       sessionId?: unknown;
       turnId?: unknown;
       dispatchAttempt?: unknown;
+      trustedCaller?: unknown;
+      trustedController?: unknown;
       procStart?: unknown;
       queuedTurnId?: unknown;
       queuedTurns?: unknown;
@@ -104,6 +111,8 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
             return {
               turnId: String(t.turnId),
               ...(attempt !== undefined ? { dispatchAttempt: attempt } : {}),
+              ...(t.trustedCaller && typeof t.trustedCaller === 'object' ? { trustedCaller: t.trustedCaller } : {}),
+              ...(t.trustedController && typeof t.trustedController === 'object' ? { trustedController: t.trustedController } : {}),
             };
           })
       : undefined;
@@ -114,6 +123,8 @@ function parseIdentityBoundSessionMarker(raw: string): IdentityBoundSessionMarke
       sessionId: typeof parsed.sessionId === 'string' ? parsed.sessionId : '',
       ...(typeof parsed.turnId === 'string' && parsed.turnId ? { turnId: parsed.turnId } : {}),
       ...(dispatchAttempt !== undefined ? { dispatchAttempt } : {}),
+      ...(parsed.trustedCaller && typeof parsed.trustedCaller === 'object' ? { trustedCaller: parsed.trustedCaller } : {}),
+      ...(parsed.trustedController && typeof parsed.trustedController === 'object' ? { trustedController: parsed.trustedController } : {}),
       ...(typeof parsed.procStart === 'string' ? { procStart: parsed.procStart } : {}),
       ...(queuedTurnId ? { queuedTurnId } : {}),
       ...(queuedTurns && queuedTurns.length > 0 ? { queuedTurns } : {}),
@@ -245,6 +256,8 @@ export function findAncestorSessionMarkerContext(
           sessionId: marker.sessionId,
           ...(marker.turnId ? { turnId: marker.turnId } : {}),
           ...(marker.dispatchAttempt !== undefined ? { dispatchAttempt: marker.dispatchAttempt } : {}),
+          ...(marker.trustedCaller ? { trustedCaller: marker.trustedCaller } : {}),
+          ...(marker.trustedController ? { trustedController: marker.trustedController } : {}),
           markerPid: pid,
           ...(marker.queuedTurnId ? { queuedTurnId: marker.queuedTurnId } : {}),
           ...(marker.queuedTurns && marker.queuedTurns.length > 0 ? { queuedTurns: marker.queuedTurns } : {}),
@@ -304,6 +317,8 @@ export function advanceAncestorSessionTurn(
         sessionId: marker.sessionId,
         turnId: nextTurn.turnId,
         ...(nextTurn.dispatchAttempt !== undefined ? { dispatchAttempt: nextTurn.dispatchAttempt } : {}),
+        ...(nextTurn.trustedCaller ? { trustedCaller: nextTurn.trustedCaller } : {}),
+        ...(nextTurn.trustedController ? { trustedController: nextTurn.trustedController } : {}),
         ...(marker.procStart ? { procStart: marker.procStart } : {}),
         ...(nextQueuedTurnId ? { queuedTurnId: nextQueuedTurnId } : {}),
         ...(queuedTurns.length > 0 ? { queuedTurns } : {}),

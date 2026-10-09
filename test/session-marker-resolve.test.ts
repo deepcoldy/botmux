@@ -278,4 +278,50 @@ describe('resolveSessionContext()', () => {
     const adv3 = advanceAncestorSessionTurn(dir, process.pid, 'turn-3');
     expect(adv3).toEqual({ advanced: false, turnId: 'turn-3' });
   });
+
+  it('handles single legacy queuedTurnId when advancing turn', () => {
+    writeMarker(process.pid, JSON.stringify({
+      sessionId: 'env-sid',
+      turnId: 'turn-old',
+      queuedTurnId: 'turn-next',
+    }));
+
+    const adv = advanceAncestorSessionTurn(dir, process.pid, 'turn-old');
+    expect(adv).toEqual({ advanced: true, turnId: 'turn-next' });
+
+    const step = findAncestorSessionMarkerContext(dir, process.pid, 'env-sid');
+    expect(step?.turnId).toBe('turn-next');
+    expect(step?.queuedTurnId).toBeUndefined();
+    expect(step?.queuedTurns).toBeUndefined();
+  });
+
+  it('preserves trustedCaller and trustedController across queued turns when advancing', () => {
+    const callerA = {
+      requestUserOpenId: 'ou_caller_a',
+      requestUserUnionId: 'on_caller_a',
+      requestLarkAppId: 'cli_app',
+      senderType: 'user' as const,
+    };
+    const callerB = {
+      requestUserOpenId: 'ou_caller_b',
+      requestUserUnionId: 'on_caller_b',
+      requestLarkAppId: 'cli_app',
+      senderType: 'user' as const,
+    };
+    writeMarker(process.pid, JSON.stringify({
+      sessionId: 'env-sid',
+      turnId: 'turn-1',
+      trustedCaller: callerA,
+      queuedTurns: [
+        { turnId: 'turn-2', dispatchAttempt: 1, trustedCaller: callerB },
+      ],
+    }));
+
+    const adv = advanceAncestorSessionTurn(dir, process.pid, 'turn-1');
+    expect(adv).toEqual({ advanced: true, turnId: 'turn-2' });
+
+    const step = findAncestorSessionMarkerContext(dir, process.pid, 'env-sid');
+    expect(step?.turnId).toBe('turn-2');
+    expect(step?.trustedCaller).toEqual(callerB);
+  });
 });

@@ -120,6 +120,7 @@ export class IdleDetector {
    *  move idle until `clear` or the post-submit fallback. */
   private programStatusAuthority = false;
   private programStatusRecords = new Map<string, ProgramStatusRecord>();
+  private evictedBusyIds = new Set<string>();
   private programStatusClock = 0;
   private programStatusFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private programStatusBlockInfo: ProgramStatusBlock | null = null;
@@ -330,9 +331,7 @@ export class IdleDetector {
         this.programStatusRecords.delete(id);
       }
     }
-    const hasBusyRecord = Array.from(this.programStatusRecords.values()).some(
-      r => r.state === 'working' || r.state === 'blocked',
-    );
+    const hasBusyRecord = this.hasBusyProgramStatus();
     if (!hasBusyRecord) {
       this.programStatusBlockInfo = null;
       this.programStatusErrorMsg = undefined;
@@ -401,6 +400,9 @@ export class IdleDetector {
     }
 
     const id = event.id ?? '';
+    if (id) {
+      this.evictedBusyIds.delete(id);
+    }
     const kind = event.state === 'blocked' && event.kind && PROGRAM_STATUS_KINDS.has(event.kind)
       ? event.kind as ProgramStatusBlock['kind']
       : undefined;
@@ -538,6 +540,7 @@ export class IdleDetector {
     this.clearProgramStatusFallback();
     this.programStatusAuthority = false;
     this.programStatusRecords.clear();
+    this.evictedBusyIds.clear();
     this.programStatusBlockInfo = null;
     this.programStatusErrorMsg = undefined;
     this.idleCallback = null;
@@ -637,6 +640,7 @@ export class IdleDetector {
   }
 
   private hasBusyProgramStatus(): boolean {
+    if (this.evictedBusyIds.size > 0) return true;
     for (const rec of this.programStatusRecords.values()) {
       if (rec.state === 'working' || rec.state === 'blocked') return true;
     }
@@ -659,9 +663,8 @@ export class IdleDetector {
 
   private applyProgramStatus(): void {
     let blocked: ProgramStatusRecord | undefined;
-    let busy = false;
+    let busy = this.hasBusyProgramStatus();
     for (const rec of this.programStatusRecords.values()) {
-      if (rec.state === 'working' || rec.state === 'blocked') busy = true;
       if (rec.state === 'blocked' && (!blocked || rec.at > blocked.at)) blocked = rec;
     }
     if (blocked) {
@@ -700,6 +703,9 @@ export class IdleDetector {
     for (const key of [...this.programStatusRecords.keys()]) {
       if (key === id || key.startsWith(prefix)) this.programStatusRecords.delete(key);
     }
+    for (const key of [...this.evictedBusyIds]) {
+      if (key === id || key.startsWith(prefix)) this.evictedBusyIds.delete(key);
+    }
   }
 
   private evictProgramStatusRecords(): void {
@@ -716,7 +722,8 @@ export class IdleDetector {
           oldestId = id;
         }
       }
-      // Pass 2: If no terminal children remain, evict oldest non-root child
+      // Pass 2: If no terminal children remain, evict oldest non-root child,
+      // and retain sticky busy evidence so a terminal root cannot prematurely idle.
       if (oldestId === null) {
         for (const [id, rec] of this.programStatusRecords) {
           if (id === '') continue;
@@ -727,6 +734,10 @@ export class IdleDetector {
         }
       }
       if (oldestId === null) return;
+      const rec = this.programStatusRecords.get(oldestId);
+      if (rec && (rec.state === 'working' || rec.state === 'blocked')) {
+        this.evictedBusyIds.add(oldestId);
+      }
       this.programStatusRecords.delete(oldestId);
     }
   }
@@ -735,6 +746,7 @@ export class IdleDetector {
     const wasActive = this.programStatusAuthority;
     this.programStatusAuthority = false;
     this.programStatusRecords.clear();
+    this.evictedBusyIds.clear();
     this.programStatusBlockInfo = null;
     this.programStatusErrorMsg = undefined;
     this.clearProgramStatusFallback();

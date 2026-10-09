@@ -345,4 +345,38 @@ describe('IdleDetector program status', () => {
     expect(cb).toHaveBeenCalledWith('program-status');
     detector.dispose();
   });
+
+  it('retains sticky busy evidence when all records are busy so later terminal root does not prematurely idle', () => {
+    const detector = new IdleDetector(makeCli());
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    // Push 70 active busy children with no terminal records (all working, exceeds 64 cap).
+    // The oldest busy children (e.g. busy-0..busy-5) get evicted, but are tracked in evictedBusyIds.
+    for (let i = 0; i < 70; i++) {
+      detector.observeProgramStatus({ state: 'working', id: `busy-${i}` });
+    }
+
+    // Now all remaining 64 children in the map finish
+    for (let i = 6; i < 70; i++) {
+      detector.observeProgramStatus({ state: 'done', id: `busy-${i}` });
+    }
+
+    // Root reports done: session must NOT become idle because evicted busy children (busy-0..5) are still working!
+    detector.observeProgramStatus({ state: 'done' });
+    expect(cb).not.toHaveBeenCalled();
+
+    // Settle all evicted busy children except the last one
+    for (let i = 0; i < 5; i++) {
+      detector.observeProgramStatus({ state: 'done', id: `busy-${i}` });
+      expect(cb).not.toHaveBeenCalled();
+    }
+
+    // Finally the last evicted child finishes -> now idle fires!
+    detector.observeProgramStatus({ state: 'done', id: 'busy-5' });
+    expect(cb).toHaveBeenCalledTimes(1);
+    expect(cb).toHaveBeenCalledWith('program-status');
+    detector.dispose();
+  });
 });
+
