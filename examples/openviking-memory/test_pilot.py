@@ -76,6 +76,11 @@ class PilotConfigurationTest(unittest.TestCase):
         self.assertEqual((self.root / "runtime.json").stat().st_mode & 0o777, 0o600)
         server = json.loads((pilot.OV_ROOT / "ov.conf").read_text())
         self.assertEqual(server["embedding"]["dense"]["dimension"], 512)
+        client = json.loads(Path(runtime["client_config"]).read_text())
+        settings = client["plugin"]["codex"]
+        self.assertFalse(settings["autoRecall"])
+        self.assertTrue(settings["noAutoInject"])
+        self.assertFalse(settings["resumeArchiveInject"])
 
     def test_bind_and_unbind_preserve_other_bots_and_later_updates(self):
         self.configure()

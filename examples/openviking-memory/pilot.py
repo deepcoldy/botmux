@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt in one existing single-user Codex Bot to native OpenViking memory."""
+"""Opt in one existing single-user Codex Bot to OpenViking memory."""
 
 import argparse
 import json
@@ -105,6 +105,7 @@ def configure(arguments):
         "url": "http://127.0.0.1:1933", "api_key": "",
         "account": "default", "user": arguments.memory_user or previous_client.get("user") or "botmux-" + bot["larkAppId"],
         "plugin": {"codex": {
+            "autoRecall": False, "noAutoInject": True, "resumeArchiveInject": False,
             "recallRewrite": "off", "recallPeerScope": "actor", "commitTokenThreshold": 20000,
             "commitKeepRecentCount": 10,
             "peerSource": ["{git_remote}", "{git_root}", "{cwd}"],
@@ -137,6 +138,8 @@ def configure(arguments):
         "bot_index": index, "codex_home": str(codex_home), "pm2": pm2,
         "working_dir": str(Path(working_dir).expanduser().resolve()),
     }
+    if previous_runtime.get("plugin_root"):
+        runtime["plugin_root"] = previous_runtime["plugin_root"]
     if not arguments.use_existing_server:
         write_json(server_path, server)
     write_json(client_path, client)

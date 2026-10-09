@@ -32,11 +32,17 @@ const ovHealth = await fetch('http://127.0.0.1:1933/health', {
   signal: AbortSignal.timeout(5000),
 }).then(response => response.json());
 if (!botHealth.ok || !ovHealth.healthy) throw new Error('A pilot service is unhealthy.');
+const client = JSON.parse(await readFile(runtime.client_config, 'utf8'));
+const settings = client.plugin?.codex;
+if (settings?.autoRecall !== false || settings?.noAutoInject !== true || settings?.resumeArchiveInject !== false) {
+  throw new Error('The pilot client still permits automatic memory injection.');
+}
 const result = {
   passed: true, botIndex: index, daemonPid: descriptor.pid, botHealthy: botHealth.ok,
   cliId: bot.cliId, cliPathOverride: bot.cliPathOverride, codexVersion: version.stdout.trim(),
   openvikingHealthy: ovHealth.healthy, openvikingVersion: ovHealth.version,
   selectedBotHasWrapper: true, existingSessionsRequireNewCodexProcess: true,
+  readingMode: 'agent-directed', automaticMemoryInjection: false,
   larkEndToEndVerified: false,
 };
 await mkdir(join(root, 'evidence'), { recursive: true });

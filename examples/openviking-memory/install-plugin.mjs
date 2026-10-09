@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { readFile, mkdir, writeFile } from 'node:fs/promises';
+import { readFile, mkdir, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
@@ -86,6 +86,12 @@ try {
       throw new Error(`Unexpected hook definition: ${hook.eventName}`);
     }
   }
+  const pluginRoots = new Set(hooks.map(hook => dirname(dirname(hook.sourcePath))));
+  if (pluginRoots.size !== 1) throw new Error('Expected one installed OpenViking adapter root.');
+  runtime.plugin_root = [...pluginRoots][0];
+  const runtimeTemporary = join(root, `runtime.${process.pid}.json`);
+  await writeFile(runtimeTemporary, JSON.stringify(runtime, null, 2) + '\n', { mode: 0o600 });
+  await rename(runtimeTemporary, join(root, 'runtime.json'));
   if (trustHooks) {
     const state = Object.fromEntries(hooks.map(hook => [hook.key, { trusted_hash: hook.currentHash }]));
     await request('config/batchWrite', {

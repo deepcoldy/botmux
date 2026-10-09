@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Enable the native plugin for the selected Bot without changing CODEX_HOME."""
+
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tomllib
+
+root = Path(__file__).resolve().parent.parent
+runtime = json.loads((root / "runtime.json").read_text())
+bot_id = os.environ.get("BOTMUX_LARK_APP_ID")
+if bot_id and bot_id != runtime["bot_app_id"]:
+    raise SystemExit("This OpenViking wrapper is bound to a different Botmux Bot.")
+os.environ["OPENVIKING_CLI_CONFIG_FILE"] = runtime["client_config"]
+cwd = Path.cwd()
+arguments = sys.argv[1:]
+for index, argument in enumerate(arguments):
+    if argument == "--":
+        break
+    if argument in ("-C", "--cd") and index + 1 < len(arguments):
+        cwd = Path(arguments[index + 1]).expanduser().resolve()
+    elif argument.startswith("--cd="):
+        cwd = Path(argument.split("=", 1)[1]).expanduser().resolve()
+    elif argument.startswith("-C") and len(argument) > 2:
+        cwd = Path(argument[2:]).expanduser().resolve()
+environment = json.loads(subprocess.check_output(
+    ["node", str(root / "launch-env.mjs"), str(cwd)], text=True,
+))
+os.environ.update(environment)
+os.environ["OPENVIKING_AUTO_RECALL"] = "0"
+os.environ["OPENVIKING_NO_AUTO_INJECT"] = "1"
+os.environ["OPENVIKING_RESUME_ARCHIVE_INJECT"] = "0"
+os.environ["OPENVIKING_RECALL_PEER_SCOPE"] = "actor"
+os.environ["OPENVIKING_RECALL_COMPRESS"] = "off"
+os.environ["OPENVIKING_DEBUG"] = "1"
+os.environ["OPENVIKING_WRITE_PATH_ASYNC"] = "0"
+override = 'plugins.' + runtime["plugin"] + '.enabled=true'
+config_path = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "config.toml"
+config = tomllib.loads(config_path.read_text()) if config_path.exists() else {}
+profile = config.get("profile")
+for index, argument in enumerate(arguments):
+    if argument == "--":
+        break
+    if argument in ("-p", "--profile") and index + 1 < len(arguments):
+        profile = arguments[index + 1]
+    elif argument.startswith("--profile="):
+        profile = argument.split("=", 1)[1]
+previous = config.get("profiles", {}).get(profile, {}).get("developer_instructions", config.get("developer_instructions", ""))
+usage = (root / "memory-usage.md").read_text().strip()
+instructions = "\n\n".join(part for part in (previous, usage) if part)
+headers = {
+    "X-OpenViking-Account": environment["OPENVIKING_ACCOUNT"],
+    "X-OpenViking-User": environment["OPENVIKING_USER"],
+    "X-OpenViking-Actor-Peer": environment["OPENVIKING_PEER_ID"],
+}
+header_config = "{" + ",".join(json.dumps(key) + "=" + json.dumps(value) for key, value in headers.items()) + "}"
+mcp_config = "{url=" + json.dumps(environment["OPENVIKING_URL"].rstrip("/") + "/mcp")
+mcp_config += ",http_headers=" + header_config + ",startup_timeout_sec=30"
+if environment.get("OPENVIKING_API_KEY"):
+    mcp_config += ',bearer_token_env_var="OPENVIKING_API_KEY"'
+mcp_config += "}"
+disabled_mcp = "{url=" + json.dumps(environment["OPENVIKING_URL"].rstrip("/") + "/mcp") + ",enabled=false}"
+os.execv(runtime["codex"], [runtime["codex"], "--no-daemon", "-c", override,
+        "-c", "mcp_servers.openviking-memory=" + disabled_mcp,
+        "-c", "mcp_servers.openviking=" + mcp_config,
+        "-c", "developer_instructions=" + json.dumps(instructions, ensure_ascii=False), *arguments])
