@@ -25,6 +25,13 @@ function validBody(over: Record<string, unknown> = {}) {
 }
 
 describe('parseAskBody — happy path', () => {
+  it('parses explicit result acknowledgement without treating it as a new Ask', () => {
+    expect(parseAskBody(validBody({ requestId: 'stable', originKind: 'explicit', acknowledge: true }))).toMatchObject({ acknowledge: true, requestId: 'stable' });
+  });
+  it.each(['true', 1, null])('rejects non-boolean acknowledgement %s', acknowledge => {
+    expect(parseAskBody(validBody({ acknowledge }))).toEqual({ error: 'bad_acknowledge' });
+  });
+
   it('accepts a fully populated body and returns the parsed shape', () => {
     const out = parseAskBody(validBody());
     expect('error' in out).toBe(false);
