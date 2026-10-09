@@ -445,6 +445,8 @@ export interface MessageProvenance {
 
 export interface Session {
   sessionId: string;
+  /** Frozen opt-in at birth; ordinary sessions never inherit listener cleanup. */
+  messageListenerAutoClose?: boolean;
   /** Build fingerprint of the last fresh owned Codex App runner that became ready. */
   runnerBuildId?: string;
   chatId: string;

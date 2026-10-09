@@ -130,6 +130,7 @@ export function cloneListener(listener: MessageListenerData | null | undefined):
   const mode = listener?.senderPolicy?.mode === 'include_only' ? 'include_only' : 'all_except_excluded';
   return {
     enabled: listener?.enabled === true,
+    autoCloseAfterCompletion: listener?.autoCloseAfterCompletion === true,
     name: listener?.name ?? '',
     replyCardTitle: listener?.replyCardTitle ?? '',
     workingDir: listener?.workingDir ?? '',
@@ -739,6 +740,7 @@ function RolesPage(props: { tab: RolesTab }) {
     })();
     return {
       enabled: editingListener.enabled,
+      autoCloseAfterCompletion: editingListener.autoCloseAfterCompletion === true,
       ...(editingListener.name?.trim() ? { name: editingListener.name.trim() } : {}),
       ...(editingListener.replyCardTitle?.trim() ? { replyCardTitle: editingListener.replyCardTitle.trim() } : {}),
       ...(editingListener.workingDir?.trim() ? { workingDir: editingListener.workingDir.trim() } : {}),
@@ -1695,6 +1697,12 @@ export function MessageListenerEditor(props: {
           />
         </label>
       </div>
+      <label className="roles-listener-field">
+        <span><input type="checkbox" checked={listener.autoCloseAfterCompletion === true}
+          onChange={ev => props.onPatch({ autoCloseAfterCompletion: ev.currentTarget.checked })} />
+          {tr('roles.listenerAutoClose')}</span>
+        <small>{tr('roles.listenerAutoCloseHelp')}</small>
+      </label>
       <div className="roles-listener-reply-placement">
         <label className="roles-listener-field" style={{ maxWidth: 320 }}>
           <span className="roles-field-label">{tr('roles.listenerReplyPlacement')}</span>

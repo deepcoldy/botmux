@@ -40,6 +40,7 @@ export interface RoleData {
 }
 
 export interface MessageListenerData {
+  autoCloseAfterCompletion?: boolean;
   enabled: boolean;
   name?: string;
   replyCardTitle?: string;

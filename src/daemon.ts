@@ -1,3 +1,4 @@
+import { canAutoCloseMessageListenerSession } from './core/message-listener-auto-close.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
@@ -267,6 +268,7 @@ import {
   parkStreamCard,
   closeSession as closeSessionHelper,
   closeSessionForBackgroundCleanup,
+  hasPendingOrdinaryImInput,
   setActiveSessionIfActive,
   rollbackRejectedSessionAndGetWinner,
   ensureCliEnv,
@@ -5323,6 +5325,7 @@ function getActiveCount(): number {
  * sees no visible response.
  */
 function beginNewTurn(ds: DaemonSession, title: string, turnId: string): void {
+  ds.messageListenerCompletedTurnId = undefined;
   // docCommentTargets 改为 per-turn map（按 turnId 索引），不再需要每轮清空：
   // 非文档轮的 BOTMUX_TURN_ID 不会命中 map，天然不会误投；旧 entry 由
   // deliverFinalOutput / botmux send 成功路径清理。
@@ -22316,6 +22319,7 @@ async function handleNewTopicAdmitted(data: any, ctx: RoutingContext): Promise<v
   const rootIdForStore = scope === 'thread' ? anchor : replyAnchorId;
   const initialTurnTitle = (messageListener?.replyCardTitle ?? (ctx.forwardSeedData ? followupContent : content)).substring(0, 50);
   const session = sessionStore.createSession(chatId, rootIdForStore, initialTurnTitle, chatType, undefined, { source: 'ordinary-feishu' });
+  if (messageListener?.autoCloseAfterCompletion === true) session.messageListenerAutoClose = true;
   // Session-group registry: point the group at its (new) resident session so
   // same-group resume and the async AI title can find it.
   if (chatType === 'group' && isSessionGroup(chatId)) {
@@ -27162,6 +27166,25 @@ export async function startDaemon(botIndex?: number): Promise<void> {
       ),
     },
   );
+  const listenerCloseTimers = new WeakSet<DaemonSession>();
+  /** Defer cleanup until terminal/output handlers drain, then recheck ownership. */
+  const scheduleMessageListenerAutoClose = (ds: DaemonSession): void => {
+    const turnId = ds.messageListenerCompletedTurnId;
+    if (!turnId || !ds.session.messageListenerAutoClose || listenerCloseTimers.has(ds)) return;
+    const worker = ds.worker;
+    listenerCloseTimers.add(ds);
+    const timer = setTimeout(() => {
+      listenerCloseTimers.delete(ds);
+      void runDetachedBotTurnMutation(ds.larkAppId, async () => {
+        if (findActiveBySessionId(ds.session.sessionId) !== ds || ds.worker !== worker
+          || hasPendingOrdinaryImInput(ds)
+          || !canAutoCloseMessageListenerSession(ds, turnId)) return;
+        const result = await closeSessionForBackgroundCleanup(ds.session.sessionId, 'message-listener completion');
+        if (result.ok) logger.info(`[message-listener] Auto-closed completed session ${ds.session.sessionId.slice(0, 8)}`);
+      }).catch(err => logger.warn(`[message-listener] Auto-close failed: ${err instanceof Error ? err.message : String(err)}`));
+    }, 1_500);
+    timer.unref();
+  };
   // Initialise worker pool with daemon callbacks
   initWorkerPool({
     sessionReply,
@@ -27197,6 +27220,7 @@ export async function startDaemon(botIndex?: number): Promise<void> {
     },
     enforceLiveSessionCap: () => enforceLiveSessionCap('session_change'),
     onScreenStatus(ds, context) {
+      if (context.status === 'idle') scheduleMessageListenerAutoClose(ds);
       return cardRuntimeStatusBridge.publish({
         sessionId: ds.session.sessionId,
         larkAppId: ds.larkAppId,
@@ -27335,6 +27359,10 @@ export async function startDaemon(botIndex?: number): Promise<void> {
         }
       } catch (err) {
         logger.error(`[retry] failed to record lastFailedTurn for ${terminal.turnId.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      if (ds.session.messageListenerAutoClose && ds.currentTurnId === terminal.turnId) {
+        ds.messageListenerCompletedTurnId = terminal.status === 'completed' ? terminal.turnId : undefined;
+        scheduleMessageListenerAutoClose(ds);
       }
     },
     onDeferredScheduleTurnSettled(ds, context) {

@@ -3,6 +3,7 @@ import { rmwBotEntry } from './config-store.js';
 
 export type MessageListenerUpdate = {
   enabled: boolean;
+  autoCloseAfterCompletion?: boolean;
   name?: string;
   replyCardTitle?: string;
   workingDir?: string;
@@ -100,6 +101,7 @@ export function sanitizeMessageListenerUpdate(raw: unknown): MessageListenerUpda
 
   return {
     enabled,
+    ...(entry.autoCloseAfterCompletion === true ? { autoCloseAfterCompletion: true } : {}),
     ...(name ? { name } : {}),
     ...(replyCardTitle ? { replyCardTitle } : {}),
     ...(workingDir ? { workingDir } : {}),
@@ -166,6 +168,7 @@ export function messageListenerConfigFromUpdate(patch: MessageListenerUpdate): M
   if (!patch.prompt.trim()) return null;
   return {
     enabled: patch.enabled,
+    ...(patch.autoCloseAfterCompletion === true ? { autoCloseAfterCompletion: true } : {}),
     ...(patch.name ? { name: patch.name } : {}),
     ...(patch.replyCardTitle ? { replyCardTitle: patch.replyCardTitle } : {}),
     ...(patch.workingDir ? { workingDir: patch.workingDir } : {}),
