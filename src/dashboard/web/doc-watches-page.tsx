@@ -168,6 +168,7 @@ function AddForm(props: {
         <div className="dw-field">
           <span>触发范围</span>
           <DropdownMenu<DocWatchMode>
+            className="dw-mode"
             ariaLabel="触发范围"
             disabled={props.busy}
             label={MODE_OPTIONS.find(o => o.value === mode)?.label ?? mode}

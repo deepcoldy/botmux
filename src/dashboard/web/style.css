@@ -35442,24 +35442,44 @@ a.card-menu-item {
   font-size: var(--fs-12);
 }
 
-/* doc-watches 机器人选择器：55 个 bot 名字很长，全局下拉触发器 value 限宽 92px、
-   弹层 min-width 156px 会截断（「Botmux开发(Claude@」）。只在本页放宽，不改全局。 */
+/* doc-watches 下拉（机器人 / 触发范围）：全局下拉触发器 value 限宽 92px、弹层
+   min-width 156px 且相对触发器居中，桌面长 bot 名会截断、手机窄屏弹层会从右边溢出。
+   只在本页放宽并用视口约束，不改全局。 */
 .dw-bot-select .sect-sort-value {
   max-width: 220px;
 }
-.dw-bot-select > .sect-sort-pop {
-  /* 比全局 156px 宽，容纳最长 bot 名；仍受视口放置逻辑的 max-height 约束。 */
-  min-width: 260px;
+.dw-bot-select > .sect-sort-pop,
+.dw-mode > .sect-sort-pop {
+  /* 桌面给足宽度容纳最长文案；右对齐触发器左缘，避免居中后向右溢出。 */
+  min-width: 220px;
   width: max-content;
-  max-width: min(360px, 80vw);
+  max-width: min(320px, calc(100vw - 32px));
   left: 0;
   right: auto;
   transform: none;
 }
-.dw-bot-select > .sect-sort-pop button {
+.dw-bot-select > .sect-sort-pop button,
+.dw-mode > .sect-sort-pop button {
   width: 100%;
   justify-content: flex-start;
   text-align: left;
   white-space: normal;
   word-break: break-word;
+}
+
+/* 手机窄屏：弹层不能宽出视口。沿用组件的 absolute 定位（JS 放置逻辑照常算上/下
+   方向），只把宽度钉在视口内并贴字段左缘、选项完整换行。 */
+@media (max-width: 560px) {
+  .dw-bot-select .sect-sort-value {
+    max-width: 150px;
+  }
+  .dw-bot-select > .sect-sort-pop,
+  .dw-mode > .sect-sort-pop {
+    left: 0;
+    right: auto;
+    width: min(320px, calc(100vw - 32px));
+    min-width: 0;
+    max-width: calc(100vw - 16px);
+    transform: none;
+  }
 }
