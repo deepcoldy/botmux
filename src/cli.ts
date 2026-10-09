@@ -23,6 +23,7 @@ import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
  *   botmux list --plain   — plain table output (for piping / scripts)
  *   botmux preview <port> — register this session's loopback Web preview
  *   botmux tabs add <url> [--name <name>] — add/reuse a URL tab in the current Lark chat
+ *   botmux top-notice set <message_id> — set one message as the current Lark chat top notice
  *   botmux delete <id>    — close a session by ID prefix
  *   botmux delete all     — close all active sessions
  *   botmux autostart enable|disable|status — manage boot-time autostart (launchd / user systemd / Windows Task Scheduler)
@@ -6839,6 +6840,8 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                    脱离进程树）；换代/关闭后需重新注册，远端 sandbox 后端不支持
   tabs list|add|update|remove|sort
                    查看和管理当前飞书群标签页；add 按 URL 幂等，适合后台自动化调用
+  top-notice set <message_id>
+                   将当前飞书群内的一条消息设置为群置顶，适合后台自动化调用
   continuation start
                    （实验性）功能开关启用时，TraeX 普通用户轮默认自动开启授权继承续跑；
                    start 可在取消后重新开启，并设置 --ttl-minutes N / --max-continuations N，
@@ -8134,6 +8137,56 @@ async function cmdTabs(rest: string[]): Promise<void> {
     const message = err instanceof Error ? err.message : String(err);
     if (parsed.json) console.log(JSON.stringify({ ok: false, chatId, error: message }));
     else console.error(`botmux tabs: ${message}`);
+    process.exitCode = 1;
+  }
+}
+
+async function cmdTopNotice(rest: string[]): Promise<void> {
+  const {
+    CHAT_TOP_NOTICE_CLI_USAGE,
+    executeChatTopNoticeCli,
+    parseChatTopNoticeCli,
+  } = await import('./cli/chat-top-notice-command.js');
+  let parsed;
+  try {
+    parsed = parseChatTopNoticeCli(rest);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message === CHAT_TOP_NOTICE_CLI_USAGE) {
+      console.log(message);
+      return;
+    }
+    console.error(`botmux top-notice: ${message}\n\n${CHAT_TOP_NOTICE_CLI_USAGE}`);
+    process.exitCode = 2;
+    return;
+  }
+
+  assertTurnTransportOrExit('top-notice');
+  await registerSelfFromCredFile();
+  const { sid, larkAppId, session } = await resolveSessionAppId(parsed.sessionId);
+  assertSessionTransportOrExit(session, 'top-notice');
+  const currentEnvChatId = sid === process.env.BOTMUX_SESSION_ID
+    ? process.env.BOTMUX_CHAT_ID?.trim()
+    : undefined;
+  const chatId = parsed.chatId ?? currentEnvChatId ?? session.chatId;
+  if (!chatId || (session.chatType === 'p2p' && !parsed.chatId && !currentEnvChatId)) {
+    console.error('botmux top-notice: 当前会话不是群聊；请在群会话中运行，或传 --chat-id <oc_xxx>');
+    process.exitCode = 2;
+    return;
+  }
+  try {
+    const result = await executeChatTopNoticeCli({
+      ...parsed,
+      larkAppId,
+      resolvedChatId: chatId,
+    });
+    console.log(parsed.json
+      ? JSON.stringify({ ok: true, chatId, ...result })
+      : `已将消息 ${result.messageId} 设为群置顶`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (parsed.json) console.log(JSON.stringify({ ok: false, chatId, error: message }));
+    else console.error(`botmux top-notice: ${message}`);
     process.exitCode = 1;
   }
 }
@@ -17406,6 +17459,7 @@ switch (command) {
   }
   case 'auth':     await cmdAuth(process.argv.slice(3)); break;
   case 'tabs':     await cmdTabs(process.argv.slice(3)); break;
+  case 'top-notice': await cmdTopNotice(process.argv.slice(3)); break;
   case 'card':     await cmdCard(process.argv.slice(3)); break;
   case 'chat':     await cmdChat(process.argv.slice(3)); break;
   case 'project':  await cmdProject(process.argv.slice(3)); break;
