@@ -7825,6 +7825,20 @@ function codexHistorySidOwnedByCurrentPid(cliSessionId: string): boolean {
   return owned;
 }
 
+/** Resolve the pid that actually holds a Codex rollout open, given a candidate
+ *  that may be a bwrap supervisor. Under the file/scratch sandbox, botmux launches
+ *  `bwrap --unshare-pid -- codex`, so the tmux pane leaf / getChildPid() is the
+ *  bwrap process — its /proc/<pid>/fd holds no rollout, and the ownership gate
+ *  would fail. The real codex leaf is host-visible across the pid ns
+ *  (ps -A ppid links), so a comm-based BFS descends to it. Outside launcher
+ *  shapes (or if codex hasn't been forked yet) the candidate already is the
+ *  leaf, so we return it unchanged — fail closed to the launcher pid rather
+ *  than guess. */
+function resolveCodexOwnershipPid(candidatePid: number, launcherActive: boolean): number {
+  if (!launcherActive || !candidatePid) return candidatePid;
+  return findLaunchedCliPid(candidatePid, 'codex') ?? candidatePid;
+}
+
 /** Resolve the pid that actually holds a TRAE rollout open, given a candidate
  *  that may be a bwrap supervisor. Under the file sandbox, botmux launches
  *  `bwrap --unshare-pid -- traex`, so the tmux pane leaf / getChildPid() is the
@@ -7835,11 +7849,6 @@ function codexHistorySidOwnedByCurrentPid(cliSessionId: string): boolean {
  *  launcher shapes (or if traex hasn't been forked yet) the candidate already
  *  is the leaf, so we return it unchanged — fail closed to the launcher pid
  *  rather than guess. */
-function resolveCodexOwnershipPid(candidatePid: number, launcherActive: boolean): number {
-  if (!launcherActive || !candidatePid) return candidatePid;
-  return findLaunchedCliPid(candidatePid, 'codex') ?? candidatePid;
-}
-
 function resolveTraexOwnershipPid(candidatePid: number, launcherActive: boolean): number {
   if (!launcherActive || !candidatePid) return candidatePid;
   return findLaunchedCliPid(candidatePid, 'traex') ?? candidatePid;

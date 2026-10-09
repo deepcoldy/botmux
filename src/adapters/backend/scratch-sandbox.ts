@@ -385,7 +385,7 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
   const fail = (where: string): null => {
     console.error(`[scratch-sandbox] setup failed at ${where} — aborting spawn (fail closed, never bare-run)`);
     for (const p of [...rolledBack].reverse()) unmountAny(p);
-    if (storage === 'tmpfs' && slot && isMountpoint(slot)) unmountAny(slot);
+    if (!existing && storage === 'tmpfs' && slot && isMountpoint(slot)) unmountAny(slot);
     if (!isMountpoint(merged)) try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
     return null;
   };
@@ -415,7 +415,7 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
       allowFuseFallback: storage === 'disk',
     });
     if (!mounted) {
-      if (storage === 'tmpfs' && slot && isMountpoint(slot)) unmountAny(slot);
+      if (!existing && storage === 'tmpfs' && slot && isMountpoint(slot)) unmountAny(slot);
       return fail('main-overlay');
     }
     rolledBack.push(merged);
@@ -432,8 +432,8 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
       try { mkdirSync(targetInMerged, { recursive: true }); } catch { /* present from lower */ }
       if (ok && spawnSync('mount', ['--bind', subMerged, targetInMerged], { stdio: 'pipe' }).status === 0) {
         subMounts.push({ mountpoint: m.mountpoint, kind: 'overlay' });
-        rolledBack.push(targetInMerged);
         rolledBack.push(subMerged);
+        rolledBack.push(targetInMerged);
         return;
       }
       if (ok) unmountAny(subMerged);
