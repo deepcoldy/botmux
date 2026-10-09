@@ -578,10 +578,10 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
     if (!open) return undefined;
     const place = () => {
       const menu = menuRef.current;
-      const trigger = triggerRef.current;
+      const triggerEl = triggerRef.current;
       const pop = popRef.current;
-      if (!menu || !trigger || !pop) return;
-      const triggerRect = trigger.getBoundingClientRect();
+      if (!menu || !triggerEl || !pop) return;
+      const trigger = triggerEl.getBoundingClientRect();
       // Walk from the popup, so the menu container itself is checked:
       // nothing sets overflow on `.sect-sort-menu` today, but a page-level rule
       // that did would clip the popup, and starting at the trigger would miss it.
@@ -590,8 +590,8 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
         clippers: clippingAncestorBoxes(pop),
       });
       const geometry = {
-        triggerTop: triggerRect.top,
-        triggerBottom: triggerRect.bottom,
+        triggerTop: trigger.top,
+        triggerBottom: trigger.bottom,
         naturalHeight: pop.scrollHeight,
         viewportHeight: window.innerHeight,
         frameTop: frame.top,
@@ -609,7 +609,7 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
       // computed value resolves `auto` to a used pixel value, never the string
       // 'auto', so a style probe reports "not flipped" for every popup.
       const popBox = pop.getBoundingClientRect();
-      const renderedUp = popBox.height > 0 && popBox.bottom <= triggerRect.top + 1;
+      const renderedUp = popBox.height > 0 && popBox.bottom <= trigger.top + 1;
       const effective = renderedUp === dropUp
         ? maxHeight
         : dropdownPlacement({ ...geometry, forceDropUp: renderedUp }).maxHeight;
