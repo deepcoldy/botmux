@@ -1092,6 +1092,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
     runtime: ReturnType<typeof createLarkEventDispatcherRuntime>,
     data: ReturnType<typeof makeUserMessageEvent>,
     messageId: string,
+    queuePostAdmissionOutput?: (output: unknown) => void,
   ) => runtime.processDurableMessage({
     eventType: 'lark.im.message.receive_v1',
     eventId: `im.message.receive_v1:${MY_APP_ID}:${messageId}`,
@@ -1110,6 +1111,7 @@ describe('Lark event dispatcher — durable primary processor', () => {
       workerId: 'primary-worker', claimEpoch: 1, claimUntil: 60_000, attempts: 1,
     },
     signal: new AbortController().signal,
+    queuePostAdmissionOutput: queuePostAdmissionOutput ?? (() => undefined),
   });
 
   it('routes without opening WS and returns the admitted canonical Session', async () => {
@@ -1139,6 +1141,44 @@ describe('Lark event dispatcher — durable primary processor', () => {
       session: { sessionId: 'session-primary' },
     });
     expect(handlers.handleNewTopic).toHaveBeenCalledOnce();
+    runtime.close();
+  });
+
+  it('exposes the canonical post-admission output queue to the routed handler', async () => {
+    setupBotState({ allowedUsers: [USER_OPEN_ID] });
+    mockGetChatMode.mockResolvedValue('group');
+    const handlers = makeHandlers();
+    handlers.handleNewTopic.mockImplementation(async (_data: any, ctx: any) => {
+      ctx.queuePostAdmissionOutput({
+        target: { kind: 'reply', messageId: 'om_primary_output', replyInThread: true },
+        content: 'blocked',
+        providerUuid: 'primary_output',
+      });
+      ctx.ingressAdmission = { admitted: true };
+    });
+    handlers.resolveDurableSession = vi.fn(() => ({
+      sessionId: 'session-primary-output', chatId: 'chat-primary', rootMessageId: 'om_primary_output',
+      scope: 'thread', title: 'Primary output', status: 'active',
+      createdAt: '2026-10-06T00:00:00.000Z', larkAppId: MY_APP_ID,
+    }));
+    const queued = vi.fn();
+    const runtime = createLarkEventDispatcherRuntime(MY_APP_ID, 'secret', handlers);
+    const data = makeUserMessageEvent({
+      senderOpenId: USER_OPEN_ID,
+      content: JSON.stringify({ text: '@BotA hello' }),
+      messageId: 'om_primary_output',
+      chatId: 'chat-primary',
+      chatType: 'group',
+      mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }],
+    });
+
+    await expect(processPrimary(runtime, data, 'om_primary_output', queued))
+      .resolves.toMatchObject({ kind: 'admitted' });
+    expect(queued).toHaveBeenCalledWith({
+      target: { kind: 'reply', messageId: 'om_primary_output', replyInThread: true },
+      content: 'blocked',
+      providerUuid: 'primary_output',
+    });
     runtime.close();
   });
 
