@@ -11,7 +11,7 @@ import {
   type ReactNode,
 } from 'react';
 import { createPortal } from 'react-dom';
-import * as BaseMenu from '@base-ui/react/Menu';
+import { Menu as BaseMenu } from '@base-ui/react/menu';
 
 export type DropdownOption<T extends string> = {
   value: T;
@@ -664,7 +664,7 @@ export function DropdownMenu<T extends string>(props: DropdownMenuProps<T>): Rea
               anchor={triggerRef.current}
               positionMethod="absolute"
               side="bottom"
-              alignment="start"
+              align="start"
             >
               <div className="sect-sort-pop" ref={popRef}>
                 {props.searchable && (
