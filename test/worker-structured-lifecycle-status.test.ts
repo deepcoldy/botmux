@@ -28,6 +28,22 @@ describe('worker structured-turn status wiring', () => {
     const checkpoint = functionSlice('checkpointCodexAdoptRecovery', 'scheduledTaskAnchorsFilePath');
     expect(checkpoint).toContain('!codexAdoptRecoveryAttempted');
   });
+
+  it('checkpoints structured bridge attribution for non-adopt sessions and restores on baseline-existing attach', () => {
+    const scope = functionSlice('structuredBridgeJournalPath', 'codexAdoptJournalPath');
+    expect(scope).toContain('codexBridgeFallbackActive()');
+    expect(scope).toContain('.structured');
+    const mark = functionSlice('codexBridgeMarkPendingTurn', 'finalizeRpcTurnTerminal');
+    expect(mark.indexOf('checkpointStructuredBridgeRecovery()')).toBeGreaterThan(mark.indexOf('codexBridgeQueue.mark('));
+    const emit = source.slice(source.indexOf('function emitReadyCodexTurns()'), source.indexOf('function emitReadyCodexTurns()') + 300);
+    expect(emit.indexOf('checkpointStructuredBridgeRecovery()')).toBeGreaterThan(emit.indexOf('drainEmittable()'));
+    expect(emit.indexOf('checkpointStructuredBridgeRecovery()')).toBeLessThan(emit.indexOf('if (ready.length === 0)'));
+    const checkpoint = functionSlice('checkpointStructuredBridgeRecovery', 'scheduledTaskAnchorsFilePath');
+    expect(checkpoint).toContain('!structuredBridgeRecoveryAttempted');
+    const attach = source.slice(source.indexOf('function codexBridgeAttach('), source.indexOf('function codexBridgeAttach(') + 6_000);
+    expect(attach).toContain('!structuredBridgeRecoveryAttempted');
+    expect(attach).toContain('structuredBridgeRecoveryAttempted = true');
+  });
   it('rejects a prompt heuristic before publishing ready or clearing in-flight input', () => {
     const body = functionSlice('markPromptReady', 'persistCliSessionId');
     const lifecycleGate = body.indexOf('hasStructuredLifecycleBlock()');

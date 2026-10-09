@@ -127,4 +127,46 @@ describe('adopted Codex turn recovery', () => {
     expect(queue.hasBlockingTurn()).toBe(false);
     expect(queue.drainEmittable()).toMatchObject([{ turnId: 'om_original', finalText: '', terminalStatus: 'ambiguous' }]);
   });
+
+  it('recovers managed non-adopt turn across daemon restart when model finishes later', () => {
+    const q1 = new CodexBridgeQueue(() => 10_000);
+    q1.mark('om_pi_task', start.text, 10_000);
+    q1.ingest([start]);
+    checkpointCodexAdoptTurns(path, rollout, q1);
+    expect(readBridgeTurnJournal(path)).toHaveLength(1);
+
+    // Daemon restarts: new worker attaches with clean queue and non-adopt mode
+    const q2 = new CodexBridgeQueue(() => 20_000);
+    const result = restoreCodexAdoptTurns(path, rollout, q2, [start], 20_000 - 5_000, 20_000);
+    expect(result.restored).toBe(1);
+    q2.absorb(result.history);
+    q2.ingest(result.live);
+    expect(q2.hasBlockingTurn()).toBe(true);
+    expect(q2.drainEmittable()).toEqual([]);
+
+    // Pi CLI finishes later (e.g. 60 minutes later) and emits assistant_final
+    const laterFinal = event('assistant_final', 60_000, 'Pi output result');
+    q2.ingest([laterFinal]);
+    expect(q2.drainEmittable()).toMatchObject([{ turnId: 'om_pi_task', finalText: 'Pi output result' }]);
+    checkpointCodexAdoptTurns(path, rollout, q2);
+    expect(readBridgeTurnJournal(path)).toEqual([]);
+  });
+
+  it('recovers managed non-adopt turn across daemon restart when model finished while offline', () => {
+    const q1 = new CodexBridgeQueue(() => 10_000);
+    q1.mark('om_pi_task', start.text, 10_000);
+    q1.ingest([start]);
+    checkpointCodexAdoptTurns(path, rollout, q1);
+
+    // Daemon restarts: model already finished while daemon was offline
+    const q2 = new CodexBridgeQueue(() => 40_000);
+    const offlineFinal = event('assistant_final', 35_000, 'Pi offline output');
+    const result = restoreCodexAdoptTurns(path, rollout, q2, [start, offlineFinal], 40_000 - 5_000, 40_000);
+    expect(result.restored).toBe(1);
+    q2.absorb(result.history);
+    q2.ingest(result.live);
+    expect(q2.drainEmittable()).toMatchObject([{ turnId: 'om_pi_task', finalText: 'Pi offline output' }]);
+    checkpointCodexAdoptTurns(path, rollout, q2);
+    expect(readBridgeTurnJournal(path)).toEqual([]);
+  });
 });
