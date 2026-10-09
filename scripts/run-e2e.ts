@@ -71,9 +71,29 @@ if (startDaemon) {
     const { loadBotConfigs } = await import('../src/bot-registry.js');
     const { resolveBunExecutable } = await import('../test/helpers/ts-runner.js');
     const bunBin = resolveBunExecutable() ?? 'bun';
-    const bots = loadBotConfigs();
     const { homedir } = await import('node:os');
     const { join } = await import('node:path');
+    const { readFileSync, writeFileSync } = await import('node:fs');
+    try {
+      const raw = readFileSync(botsConfig, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        let changed = false;
+        for (const b of parsed) {
+          if (!b.workingDir || !existsSync(b.workingDir)) {
+            b.workingDir = '.';
+            changed = true;
+          }
+        }
+        if (changed) {
+          writeFileSync(botsConfig, JSON.stringify(parsed, null, 2), 'utf8');
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
+    const bots = loadBotConfigs();
     const dataDir =
       process.env.BOTMUX_DATA_DIR ?? join(homedir(), '.botmux', 'data');
     if (!existsSync(dataDir)) {
