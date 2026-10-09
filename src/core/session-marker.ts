@@ -7,6 +7,7 @@ import {
   readProcessStartIdentity,
 } from '../utils/process-identity.js';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
+import { withFileLockSync } from '../utils/file-lock.js';
 
 export {
   readLinuxBootIdentity,
@@ -282,35 +283,37 @@ export function advanceAncestorSessionTurn(
   const markersDir = join(dataDir, '.botmux-cli-pids');
   const markerPath = join(markersDir, String(markerPid));
   if (!existsSync(markerPath)) return { advanced: false };
-  try {
-    const raw = readFileSync(markerPath, 'utf-8');
-    const marker = parseIdentityBoundSessionMarker(raw);
-    if (!marker.sessionId) return { advanced: false };
-    if (consumedTurnId && marker.turnId && marker.turnId !== consumedTurnId) {
-      return { advanced: false, turnId: marker.turnId };
+  return withFileLockSync(markerPath, () => {
+    try {
+      const raw = readFileSync(markerPath, 'utf-8');
+      const marker = parseIdentityBoundSessionMarker(raw);
+      if (!marker.sessionId) return { advanced: false };
+      if (consumedTurnId && marker.turnId && marker.turnId !== consumedTurnId) {
+        return { advanced: false, turnId: marker.turnId };
+      }
+      const queuedTurns = marker.queuedTurns ? [...marker.queuedTurns] : [];
+      if (queuedTurns.length === 0 && marker.queuedTurnId) {
+        queuedTurns.push({ turnId: marker.queuedTurnId });
+      }
+      if (queuedTurns.length === 0) {
+        return { advanced: false, turnId: marker.turnId };
+      }
+      const nextTurn = queuedTurns.shift()!;
+      const nextQueuedTurnId = queuedTurns[0]?.turnId;
+      const updatedPayload: Record<string, unknown> = {
+        sessionId: marker.sessionId,
+        turnId: nextTurn.turnId,
+        ...(nextTurn.dispatchAttempt !== undefined ? { dispatchAttempt: nextTurn.dispatchAttempt } : {}),
+        ...(marker.procStart ? { procStart: marker.procStart } : {}),
+        ...(nextQueuedTurnId ? { queuedTurnId: nextQueuedTurnId } : {}),
+        ...(queuedTurns.length > 0 ? { queuedTurns } : {}),
+      };
+      atomicWriteFileSync(markerPath, JSON.stringify(updatedPayload));
+      return { advanced: true, turnId: nextTurn.turnId };
+    } catch {
+      return { advanced: false };
     }
-    const queuedTurns = marker.queuedTurns ? [...marker.queuedTurns] : [];
-    if (queuedTurns.length === 0 && marker.queuedTurnId) {
-      queuedTurns.push({ turnId: marker.queuedTurnId });
-    }
-    if (queuedTurns.length === 0) {
-      return { advanced: false, turnId: marker.turnId };
-    }
-    const nextTurn = queuedTurns.shift()!;
-    const nextQueuedTurnId = queuedTurns[0]?.turnId;
-    const updatedPayload: Record<string, unknown> = {
-      sessionId: marker.sessionId,
-      turnId: nextTurn.turnId,
-      ...(nextTurn.dispatchAttempt !== undefined ? { dispatchAttempt: nextTurn.dispatchAttempt } : {}),
-      ...(marker.procStart ? { procStart: marker.procStart } : {}),
-      ...(nextQueuedTurnId ? { queuedTurnId: nextQueuedTurnId } : {}),
-      ...(queuedTurns.length > 0 ? { queuedTurns } : {}),
-    };
-    atomicWriteFileSync(markerPath, JSON.stringify(updatedPayload));
-    return { advanced: true, turnId: nextTurn.turnId };
-  } catch {
-    return { advanced: false };
-  }
+  });
 }
 
 /**

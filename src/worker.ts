@@ -3772,60 +3772,134 @@ function writeCliPidMarker(): void {
   for (const markerPath of [cliPidMarker, rpcEnginePidMarker]) {
     if (!markerPath) continue;
     try {
-      // 原子写：daemon 侧（killStalePids 等）随时读这个 marker JSON。
-      const markerPid = Number(basename(markerPath));
-      const procStart = Number.isInteger(markerPid) && markerPid > 0
-        ? readProcessStartIdentity(markerPid)
-        : undefined;
-      const queuedTurns = queuedTypeAheadTurns.map(t => ({
-        turnId: t.turnId,
-        ...(t.dispatchAttempt !== undefined ? { dispatchAttempt: t.dispatchAttempt } : {}),
-      }));
-      const queuedTurnId = queuedTurns[0]?.turnId;
-      atomicWriteFileSync(markerPath, JSON.stringify({
-        sessionId,
-        turnId: currentBotmuxTurnId ?? null,
-        dispatchAttempt: currentBotmuxDispatchAttempt ?? null,
-        ...(queuedTurnId ? { queuedTurnId } : {}),
-        ...(queuedTurns.length > 0 ? { queuedTurns } : {}),
-        ...(procStart ? { procStart } : {}),
-      }));
+      withFileLockSync(markerPath, () => {
+        if (existsSync(markerPath)) {
+          try {
+            const raw = readFileSync(markerPath, 'utf-8');
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && parsed.turnId !== currentBotmuxTurnId) {
+              const idx = queuedTypeAheadTurns.findIndex(t => t.turnId === parsed.turnId);
+              if (idx >= 0) {
+                const prevTurnId = currentBotmuxTurnId;
+                const advancedRecord = queuedTypeAheadTurns[idx]!;
+                currentBotmuxTurnId = parsed.turnId;
+                currentBotmuxDispatchAttempt = typeof parsed.dispatchAttempt === 'number'
+                  ? parsed.dispatchAttempt
+                  : advancedRecord.dispatchAttempt;
+                currentVcMeetingImTurnOrigin = advancedRecord.vcMeetingImTurnOrigin;
+                queuedTypeAheadTurns.splice(0, idx + 1);
+                markActiveTurnStarted(advancedRecord);
+                publishSandboxRelayCapability();
+                log(`Adopted active turn advance from PID marker before write: ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)}`);
+              }
+            }
+            if (parsed && Array.isArray(parsed.queuedTurns)) {
+              for (const qt of parsed.queuedTurns) {
+                if (qt?.turnId && qt.turnId !== currentBotmuxTurnId && !queuedTypeAheadTurns.some(t => t.turnId === qt.turnId)) {
+                  queuedTypeAheadTurns.push({
+                    turnId: qt.turnId,
+                    ...(typeof qt.dispatchAttempt === 'number' ? { dispatchAttempt: qt.dispatchAttempt } : {}),
+                  });
+                }
+              }
+            }
+          } catch {
+            // best-effort
+          }
+        }
+        const markerPid = Number(basename(markerPath));
+        const procStart = Number.isInteger(markerPid) && markerPid > 0
+          ? readProcessStartIdentity(markerPid)
+          : undefined;
+        const queuedTurns = queuedTypeAheadTurns.map(t => ({
+          turnId: t.turnId,
+          ...(t.dispatchAttempt !== undefined ? { dispatchAttempt: t.dispatchAttempt } : {}),
+        }));
+        const queuedTurnId = queuedTurns[0]?.turnId;
+        atomicWriteFileSync(markerPath, JSON.stringify({
+          sessionId,
+          turnId: currentBotmuxTurnId ?? null,
+          dispatchAttempt: currentBotmuxDispatchAttempt ?? null,
+          ...(queuedTurnId ? { queuedTurnId } : {}),
+          ...(queuedTurns.length > 0 ? { queuedTurns } : {}),
+          ...(procStart ? { procStart } : {}),
+        }));
+      });
     } catch (err: any) {
       log(`Failed to update CLI PID marker ${markerPath}: ${err?.message ?? err}`);
     }
   }
 }
 
-function syncQueuedTurnsFromMarkerDisk(): void {
+function restoreQueuedTurnsFromMarkerDisk(markerPath: string): void {
+  if (!existsSync(markerPath)) return;
+  try {
+    withFileLockSync(markerPath, () => {
+      const raw = readFileSync(markerPath, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed.turnId === 'string' && parsed.turnId) {
+        if (!currentBotmuxTurnId) {
+          currentBotmuxTurnId = parsed.turnId;
+          if (typeof parsed.dispatchAttempt === 'number') {
+            currentBotmuxDispatchAttempt = parsed.dispatchAttempt;
+          }
+        }
+      }
+      if (parsed && Array.isArray(parsed.queuedTurns) && parsed.queuedTurns.length > 0) {
+        for (const t of parsed.queuedTurns) {
+          if (t && typeof t.turnId === 'string' && !queuedTypeAheadTurns.some(q => q.turnId === t.turnId)) {
+            queuedTypeAheadTurns.push({
+              turnId: t.turnId,
+              ...(typeof t.dispatchAttempt === 'number' ? { dispatchAttempt: t.dispatchAttempt } : {}),
+            });
+          }
+        }
+      } else if (parsed && typeof parsed.queuedTurnId === 'string' && parsed.queuedTurnId) {
+        if (!queuedTypeAheadTurns.some(q => q.turnId === parsed.queuedTurnId)) {
+          queuedTypeAheadTurns.push({ turnId: parsed.queuedTurnId });
+        }
+      }
+    });
+  } catch {
+    // ignore
+  }
+}
+
+function syncQueuedTurnsFromMarkerDisk(): boolean {
+  let anySynced = false;
   for (const markerPath of [cliPidMarker, rpcEnginePidMarker]) {
     if (!markerPath || !existsSync(markerPath)) continue;
     try {
-      const raw = readFileSync(markerPath, 'utf-8');
-      const parsed = JSON.parse(raw);
-      if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && parsed.turnId !== currentBotmuxTurnId) {
-        const idx = queuedTypeAheadTurns.findIndex(t => t.turnId === parsed.turnId);
-        if (idx >= 0) {
-          const prevTurnId = currentBotmuxTurnId;
-          const advancedRecord = queuedTypeAheadTurns[idx]!;
-          currentBotmuxTurnId = parsed.turnId;
-          currentBotmuxDispatchAttempt = typeof parsed.dispatchAttempt === 'number'
-            ? parsed.dispatchAttempt
-            : advancedRecord.dispatchAttempt;
-          currentVcMeetingImTurnOrigin = advancedRecord.vcMeetingImTurnOrigin;
-          queuedTypeAheadTurns.splice(0, idx + 1);
-          markActiveTurnStarted(advancedRecord);
-          publishSandboxRelayCapability();
-          log(`Synced active turn advance from PID marker: ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)} (remaining queued: ${queuedTypeAheadTurns.length})`);
+      withFileLockSync(markerPath, () => {
+        const raw = readFileSync(markerPath, 'utf-8');
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed.turnId === 'string' && parsed.turnId && parsed.turnId !== currentBotmuxTurnId) {
+          const idx = queuedTypeAheadTurns.findIndex(t => t.turnId === parsed.turnId);
+          if (idx >= 0) {
+            const prevTurnId = currentBotmuxTurnId;
+            const advancedRecord = queuedTypeAheadTurns[idx]!;
+            currentBotmuxTurnId = parsed.turnId;
+            currentBotmuxDispatchAttempt = typeof parsed.dispatchAttempt === 'number'
+              ? parsed.dispatchAttempt
+              : advancedRecord.dispatchAttempt;
+            currentVcMeetingImTurnOrigin = advancedRecord.vcMeetingImTurnOrigin;
+            queuedTypeAheadTurns.splice(0, idx + 1);
+            markActiveTurnStarted(advancedRecord);
+            publishSandboxRelayCapability();
+            anySynced = true;
+            log(`Synced active turn advance from PID marker: ${prevTurnId?.slice(0, 12)} -> ${currentBotmuxTurnId?.slice(0, 12)} (remaining queued: ${queuedTypeAheadTurns.length})`);
+          }
         }
-      }
+      });
     } catch {
       // ignore
     }
   }
+  return anySynced;
 }
 
 function advanceQueuedTypeAheadTurn(reason: string): boolean {
-  syncQueuedTurnsFromMarkerDisk();
+  if (syncQueuedTurnsFromMarkerDisk()) return true;
   if (queuedTypeAheadTurns.length === 0) return false;
   const next = queuedTypeAheadTurns.shift()!;
   const prevTurnId = currentBotmuxTurnId;
@@ -12588,8 +12662,8 @@ function markPromptReady(): void {
   isPromptReady = true;
   promptReadyEdges++;
   settleSessionRenameOnPrompt();
-  syncQueuedTurnsFromMarkerDisk();
-  if (queuedTypeAheadTurns.length > 0) {
+  const syncedFromDisk = syncQueuedTurnsFromMarkerDisk();
+  if (!syncedFromDisk && queuedTypeAheadTurns.length > 0) {
     advanceQueuedTypeAheadTurn('prompt_ready');
   }
   // An old backend can still report idle while its async teardown is running.
@@ -13597,7 +13671,7 @@ async function flushPending(): Promise<void> {
         const isTypeAhead = !!currentBotmuxTurnId
           && !!item.turnId
           && item.turnId !== currentBotmuxTurnId
-          && (!promptReadyAtFlushStart || itemsWrittenInThisFlush > 0);
+          && (!promptReadyAtFlushStart || itemsWrittenInThisFlush > 0 || queuedTypeAheadTurns.length > 0);
 
         if (isTypeAhead && item.turnId) {
           log(`Queuing type-ahead turn attribution: active=${currentBotmuxTurnId?.slice(0, 12)}, queued=${item.turnId.slice(0, 12)}`);
@@ -13613,7 +13687,9 @@ async function flushPending(): Promise<void> {
           currentBotmuxTurnId = item.turnId;
           currentBotmuxDispatchAttempt = item.dispatchAttempt;
           currentVcMeetingImTurnOrigin = item.vcMeetingImTurnOrigin;
-          queuedTypeAheadTurns = [];
+          if (queuedTypeAheadTurns.length === 0) {
+            queuedTypeAheadTurns = [];
+          }
           markActiveTurnStarted(item);
         }
         // Acquire durable HOL ownership only after this turn owns the backend
@@ -18863,6 +18939,7 @@ async function spawnCli(
     try {
       mkdirSync(markersDir, { recursive: true });
       cliPidMarker = join(markersDir, String(cliPid));
+      restoreQueuedTurnsFromMarkerDisk(cliPidMarker);
       writeCliPidMarker();
       log(`CLI PID marker written: ${cliPid}`);
     } catch (err: any) {
@@ -19009,6 +19086,7 @@ async function spawnCli(
             const markersDir = join(process.env.SESSION_DATA_DIR, '.botmux-cli-pids');
             mkdirSync(markersDir, { recursive: true });
             cliPidMarker = join(markersDir, String(pid));
+            restoreQueuedTurnsFromMarkerDisk(cliPidMarker);
             writeCliPidMarker();
             log(`CLI PID marker written (async): ${pid}`);
           } catch (err: any) {

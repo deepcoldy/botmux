@@ -321,20 +321,31 @@ export class IdleDetector {
     this.staticBusyClearTailPos = -1;
     this.lastSpinnerAt = Date.now();
     this.clearTimer();
-    // A new submit invalidates the previous snapshot. Stale root `idle`
-    // must not immediately complete the turn we just started. Records are
-    // repopulated by the next report. If that report never comes, heuristics
-    // resume — silence under a live `working` record never takes this path.
-    this.programStatusRecords.clear();
-    this.programStatusBlockInfo = null;
-    this.programStatusErrorMsg = undefined;
+    // A new submit invalidates the previous snapshot. Stale terminal states
+    // (idle / done / error) must not immediately complete the turn we just started.
+    // If any working or blocked record remains, keep authority and do not arm
+    // the fallback timer — silence under an ongoing operation never takes fallback.
+    for (const [id, rec] of [...this.programStatusRecords]) {
+      if (rec.state === 'idle' || rec.state === 'done' || rec.state === 'error') {
+        this.programStatusRecords.delete(id);
+      }
+    }
+    const hasBusyRecord = Array.from(this.programStatusRecords.values()).some(
+      r => r.state === 'working' || r.state === 'blocked',
+    );
+    if (!hasBusyRecord) {
+      this.programStatusBlockInfo = null;
+      this.programStatusErrorMsg = undefined;
+    }
     this.clearProgramStatusFallback();
     if (keepAuthority) {
       this.programStatusAuthority = true;
-      this.programStatusFallbackTimer = setTimeout(() => {
-        this.programStatusFallbackTimer = null;
-        this.exitProgramStatusAuthority();
-      }, PROGRAM_STATUS_FALLBACK_MS);
+      if (!hasBusyRecord && this.programStatusRecords.size === 0) {
+        this.programStatusFallbackTimer = setTimeout(() => {
+          this.programStatusFallbackTimer = null;
+          this.exitProgramStatusAuthority();
+        }, PROGRAM_STATUS_FALLBACK_MS);
+      }
     }
   }
 
@@ -695,13 +706,24 @@ export class IdleDetector {
     while (this.programStatusRecords.size > PROGRAM_STATUS_RECORD_CAP) {
       let oldestId: string | null = null;
       let oldestAt = Infinity;
+      // Pass 1: Prioritize evicting terminal child records (idle / done / error)
+      // so long-running working/blocked children are not prematurely purged.
       for (const [id, rec] of this.programStatusRecords) {
-        // The root record is the session fold. Evicting it while children
-        // remain leaves no terminal state to release the turn.
         if (id === '') continue;
-        if (rec.at < oldestAt) {
+        const isTerminal = rec.state === 'idle' || rec.state === 'done' || rec.state === 'error';
+        if (isTerminal && rec.at < oldestAt) {
           oldestAt = rec.at;
           oldestId = id;
+        }
+      }
+      // Pass 2: If no terminal children remain, evict oldest non-root child
+      if (oldestId === null) {
+        for (const [id, rec] of this.programStatusRecords) {
+          if (id === '') continue;
+          if (rec.at < oldestAt) {
+            oldestAt = rec.at;
+            oldestId = id;
+          }
         }
       }
       if (oldestId === null) return;

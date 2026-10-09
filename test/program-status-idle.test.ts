@@ -294,4 +294,55 @@ describe('IdleDetector program status', () => {
     working.dispose();
     detector.dispose();
   });
+
+  it('preserves active working and blocked records across reset and does not arm fallback', () => {
+    const detector = new IdleDetector(makeCli());
+    const cb = vi.fn();
+    detector.onIdle(cb);
+    detector.observeProgramStatus({ state: 'working', msg: 'thinking' });
+    detector.observeProgramStatus({ state: 'blocked', id: 'perm', kind: 'permission', msg: 'allow' });
+
+    // reset() (e.g. from type-ahead submit cycle) must keep working & blocked records
+    detector.reset();
+    expect(detector.programStatusActive()).toBe(true);
+    expect(detector.programStatusBlock()).toEqual({ kind: 'permission', msg: 'allow' });
+
+    // Advancing past fallback window must NOT exit authority or allow screen prompt to trigger idle
+    vi.advanceTimersByTime(PROGRAM_STATUS_FALLBACK_MS + 5_000);
+    expect(detector.programStatusActive()).toBe(true);
+    detector.feed('❯');
+    vi.advanceTimersByTime(2_000);
+    expect(cb).not.toHaveBeenCalled();
+
+    // Now resolve blocked child and root
+    detector.observeProgramStatus({ state: 'done', id: 'perm' });
+    detector.observeProgramStatus({ state: 'done' });
+    expect(cb).toHaveBeenCalledTimes(1);
+    expect(cb).toHaveBeenCalledWith('program-status');
+    detector.dispose();
+  });
+
+  it('evicts terminal children first on record cap so active child is not prematurely dropped', () => {
+    const detector = new IdleDetector(makeCli());
+    const cb = vi.fn();
+    detector.onIdle(cb);
+
+    // Active busy child created early
+    detector.observeProgramStatus({ state: 'working', id: 'long-worker' });
+
+    // Push 70 completed terminal children (over 64 cap)
+    for (let i = 0; i < 70; i++) {
+      detector.observeProgramStatus({ state: 'done', id: `child-${i}` });
+    }
+
+    // Root reports done: since long-worker was NOT evicted, overall status is still working
+    detector.observeProgramStatus({ state: 'done' });
+    expect(cb).not.toHaveBeenCalled();
+
+    // Finally long-worker completes -> now idle fires
+    detector.observeProgramStatus({ state: 'done', id: 'long-worker' });
+    expect(cb).toHaveBeenCalledTimes(1);
+    expect(cb).toHaveBeenCalledWith('program-status');
+    detector.dispose();
+  });
 });
