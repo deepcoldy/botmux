@@ -142,6 +142,15 @@ describe('daemon session-scoped IPC route wiring', () => {
     expect(route).not.toMatch(
       /registerAskForResponse\(\{\s*larkAppId: parsed\.larkAppId,/,
     );
+    // #1740: the route override applies to BOTH caller kinds — a trusted HMAC
+    // host is bound to the live session just like a capability caller, so a
+    // stale/manual root can never redirect a group question. The bind therefore
+    // must follow the authorization block (depth-1 `}`) guarded ONLY by
+    // `if (askSession)`; nesting it back inside `if (!isTrustedHostIpcRequest)`
+    // would silently restore the HMAC bypass.
+    expect(route).toMatch(
+      /\}\n\s*\/\/ Authentication and routing are separate[^\n]*\n(?:\s*\/\/[^\n]*\n)*\s*if \(askSession\) \{\n\s*boundAsk = bindSessionScopedIpcIdentity\(/,
+    );
   });
 
   it('binds hook identity before emitting the event', () => {
