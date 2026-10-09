@@ -171,6 +171,13 @@ export function createDshTuiAdapter(pathOverride?: string): CliAdapter {
     // than the 90s hard-timeout flush it replaces: cold start shows the composer
     // at ~+5s, so the gate is released on evidence in ~10s total.
     injectsReadyHook: true,
+    // Turn ends come from the same plugin, not from PTY silence: `agent/status`
+    // flips to idle exactly once per finished turn (`dsh-agent-loop` only emits
+    // on a real transition), which the worker turns into fireIdle() after
+    // matching the report against its own current turn. Without this the idle
+    // detector never fires again after the first turn, so a queued follow-up
+    // has no ready edge to wait for.
+    injectsTurnIdleHook: true,
     altScreen: false,
     // ~/.dsh holds profiles + credentials + sessions; ~/.dsh-tui holds
     // resume.txt. Both must survive the file sandbox.

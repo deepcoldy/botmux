@@ -589,6 +589,16 @@ export interface CliAdapter {
    *  exactly as before). */
   readonly injectsReadyHook?: boolean;
 
+  /** When true, the adapter injects `BOTMUX_TURN_IDLE_COMMAND`
+   *  (`botmux turn-idle`) so an integration running INSIDE the CLI process can
+   *  report a structured end-of-turn idle edge (dsh-tui: its cordis wrapper
+   *  plugin listens to `agent/status === 'idle'`). The worker forwards such a
+   *  report to `idleDetector.fireIdle()` only when it names the worker's own
+   *  current turn — a PTY-quiescence-free completion path for TUIs that
+   *  repaint while idle, and never a bypass of the turn fence.
+   *  undefined/false → no env, no channel (every other CLI is unchanged). */
+  readonly injectsTurnIdleHook?: boolean;
+
   /** CLI-specific system hints injected into the initial prompt.
    *  e.g. "use Read tool for attachments", "don't use PlanMode" */
   readonly systemHints: string[];

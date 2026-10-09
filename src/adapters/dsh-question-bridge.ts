@@ -327,26 +327,30 @@ export function apply(ctx) {
  * second even while completely idle. The worker's IdleDetector Strategy 2
  * requires `QUIESCENCE_MS` of PTY silence and re-arms on every feed, so a
  * dsh-tui session NEVER satisfies it → `markPromptReady()` is never called →
- * the first queued prompt is only written by the 90s hard timeout.
+ * the first queued prompt is only written by the 90s hard timeout, and every
+ * later turn end has no idle edge either.
  *
- * The TUI hands us a precise in-process signal instead. Its
+ * READINESS. The TUI hands us a precise in-process signal. Its
  * `openInjectChannel()` runs immediately after `await render(tree)` (first
  * frame flushed, composer mounted) and publishes
  * `~/.dsh-tui/inject/servers.json` with `{pid, sessionId, cwd, socketPath,
  * startedAt}` — the same record `dsh.nvim` discovers. Matching our own
  * `process.pid` there is the earliest trustworthy "UI is ready" evidence, so
- * the plugin fires `BOTMUX_READY_COMMAND` exactly once.
+ * the plugin fires `BOTMUX_READY_COMMAND` exactly once, and keeps the matched
+ * session id as this process's own identity for the turn-idle channel below.
  *
- * `agent/status` is deliberately NOT the readiness trigger: dsh-agent-loop only
- * emits on a status CHANGE and the loop starts out idle, so a fresh boot emits
- * nothing at all. It is exactly right for end-of-turn idle (there it IS the
- * transition), and that is the only thing we use it for.
+ * TURN IDLE. `agent/status` is deliberately NOT the readiness trigger:
+ * dsh-agent-loop only emits on a status CHANGE and the loop starts out idle,
+ * so a fresh boot emits nothing at all. At the END of a turn the same property
+ * makes it the perfect edge — one event per finished turn, never a synthetic
+ * one at boot — so `status === 'idle'` fires `BOTMUX_TURN_IDLE_COMMAND`, which
+ * the worker turns into `idleDetector.fireIdle()`.
  *
  * Everything here is fail-quiet: a missing env var, an unreadable discovery
  * file, or a failed spawn must never break the TUI boot. The worker keeps its
- * own fallback timeout, so a lost signal degrades to the previous behaviour
- * (and strictly improves on it: READY_SIGNAL_TIMEOUT_MS is 45s < the 90s hard
- * cap).
+ * own fallback timeout, so a lost readiness signal degrades to the previous
+ * behaviour (and strictly improves on it: READY_SIGNAL_TIMEOUT_MS is 45s < the
+ * 90s hard cap); a lost turn-idle just leaves that turn to the existing paths.
  *
  * The inject path is resolved at RUNTIME through `homedir()` — the same way
  * dsh-tui itself computes `~/.dsh-tui` (utils/paths.js: `join(homedir(),
@@ -363,6 +367,8 @@ const BOTMUX_READY_POLL_LIMIT_MS = 120_000;
 
 let botmuxReadySignalled = false;
 let botmuxReadyPollTimer;
+let botmuxInjectSessionId;
+let botmuxIdleSeq = 0;
 
 function botmuxStatusCommand(envKey) {
   const raw = process.env[envKey];
@@ -420,20 +426,52 @@ function pollBotmuxReady(startedAt) {
   if (botmuxReadySignalled) return;
   const record = readBotmuxInjectRecord();
   if (record) {
+    botmuxInjectSessionId = record.sessionId;
     publishBotmuxReady();
     return;
   }
   if (Date.now() - startedAt >= BOTMUX_READY_POLL_LIMIT_MS) stopBotmuxReadyPoll();
 }
 
+/** Structured end-of-turn idle edge for BOTMUX_TURN_IDLE_COMMAND. */
+function reportBotmuxTurnIdle() {
+  const command = botmuxStatusCommand('BOTMUX_TURN_IDLE_COMMAND');
+  // No inject binding means this process never published its discovery record,
+  // so we cannot prove which session it owns. Stay silent: a mis-attributed
+  // idle would settle a turn that is still running (never early).
+  if (!command || !botmuxInjectSessionId) return;
+  botmuxIdleSeq += 1;
+  spawnBotmuxStatusCommand(command, { seq: botmuxIdleSeq, pid: process.pid });
+}
+
 function installBotmuxStatusChannel(ctx) {
   const startedAt = Date.now();
   pollBotmuxReady(startedAt);
-  if (botmuxReadySignalled) return;
-  botmuxReadyPollTimer = setInterval(() => pollBotmuxReady(startedAt), BOTMUX_READY_POLL_MS);
-  if (typeof botmuxReadyPollTimer.unref === 'function') botmuxReadyPollTimer.unref();
-  if (typeof ctx.effect === 'function') {
-    try { ctx.effect(() => stopBotmuxReadyPoll, 'botmux-dsh-tui-status-channel'); } catch {}
+  if (!botmuxReadySignalled) {
+    botmuxReadyPollTimer = setInterval(() => pollBotmuxReady(startedAt), BOTMUX_READY_POLL_MS);
+    if (typeof botmuxReadyPollTimer.unref === 'function') botmuxReadyPollTimer.unref();
+    if (typeof ctx.effect === 'function') {
+      try { ctx.effect(() => stopBotmuxReadyPoll, 'botmux-dsh-tui-status-channel'); } catch {}
+    }
+  }
+  if (typeof ctx.on !== 'function') return;
+  let previousStatus;
+  try {
+    ctx.on('agent/status', ({ agent, status } = {}) => {
+      const wasIdle = previousStatus === 'idle';
+      previousStatus = status;
+      // dsh-agent-loop emits only when the status actually changed, so this is
+      // exactly one report per finished turn (the loop starts out idle and
+      // emits nothing at boot).
+      if (status !== 'idle' || wasIdle) return;
+      const agentSessionId = agent && agent.session && agent.session.id;
+      // Bind to the agent that owns THIS process's TUI: a sibling session
+      // mounted in the same process must not settle our turn.
+      if (!agentSessionId || agentSessionId !== botmuxInjectSessionId) return;
+      reportBotmuxTurnIdle();
+    });
+  } catch {
+    // Event registration is best-effort; readiness keeps working without it.
   }
 }
 `;

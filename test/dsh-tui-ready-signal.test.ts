@@ -68,7 +68,7 @@ function makeExecutable(file: string, body: string): string {
  */
 const DRIVER_SOURCE = `
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
-const [pluginPath, homeDir, readyCountFile, doneFile, injectPidArg, sessionId] = process.argv.slice(2);
+const [pluginPath, homeDir, readyCountFile, doneFile, injectPidArg, sessionId, statusScript] = process.argv.slice(2);
 const injectDir = homeDir + '/.dsh-tui/inject';
 mkdirSync(injectDir, { recursive: true });
 writeFileSync(injectDir + '/servers.json', JSON.stringify([{
@@ -78,10 +78,11 @@ writeFileSync(injectDir + '/servers.json', JSON.stringify([{
   socketPath: injectDir + '/' + sessionId + '.sock',
   startedAt: Date.now(),
 }]));
+const listeners = new Map();
 const mod = await import(pluginPath);
 const ctx = {
   get: () => undefined,
-  on: () => () => {},
+  on: (name, fn) => { listeners.set(name, fn); return () => {}; },
   effect: () => () => {},
   loader: { entries: function* () { yield { options: { id: 'dsh-tui', config: {} } }; } },
 };
@@ -89,18 +90,30 @@ await mod.apply(ctx, {});
 // Longer than several 250ms poll ticks: a non-idempotent signal would append
 // repeatedly here.
 await new Promise((resolvePromise) => setTimeout(resolvePromise, 1500));
+// Scripted agent/status edges, as "<agentSessionId|owner>:<status>" tokens.
+for (const token of statusScript === 'none' ? [] : statusScript.split(',')) {
+  const sep = token.indexOf(':');
+  const who = token.slice(0, sep);
+  const status = token.slice(sep + 1);
+  listeners.get('agent/status')?.({
+    agent: { session: { id: who === 'owner' ? sessionId : who } },
+    status,
+  });
+}
+await new Promise((resolvePromise) => setTimeout(resolvePromise, 800));
 appendFileSync(doneFile, 'done');
 `;
 
 interface ReadyRun {
   readyLines: string[];
-  driverDone: boolean;
+  idleLines: string[];
 }
 
 async function runReadyDriver(opts: {
   home: string;
   injectPid: string;
   botmuxSessionEnv: boolean;
+  statusScript?: string;
 }): Promise<ReadyRun> {
   const profile = makeDshTuiProfile(opts.home);
   const patch = ensureDshQuestionBridgePatch({
@@ -108,7 +121,7 @@ async function runReadyDriver(opts: {
     homeDir: opts.home,
     dshTuiProfileDir: profile,
     hookCommand: { cmd: '/bin/true', args: [] },
-    buildSalt: `ready-${opts.injectPid}-${opts.botmuxSessionEnv}`,
+    buildSalt: `ready-${opts.injectPid}-${opts.botmuxSessionEnv}-${opts.statusScript ?? 'none'}`,
   });
   expect(patch).not.toBeNull();
 
@@ -116,6 +129,11 @@ async function runReadyDriver(opts: {
   const readyCommand = makeExecutable(
     join(opts.home, 'ready-command.mjs'),
     `import { appendFileSync } from 'node:fs';\nappendFileSync(${JSON.stringify(readyCountFile)}, 'x');\n`,
+  );
+  const idleCountFile = join(opts.home, 'idle-count');
+  const idleCommand = makeExecutable(
+    join(opts.home, 'idle-command.mjs'),
+    `import { appendFileSync } from 'node:fs';\nappendFileSync(${JSON.stringify(idleCountFile)}, 'x');\n`,
   );
   const doneFile = join(opts.home, 'driver-done');
   const driver = join(opts.home, 'driver.mjs');
@@ -126,6 +144,7 @@ async function runReadyDriver(opts: {
     HOME: opts.home,
     USERPROFILE: opts.home,
     BOTMUX_READY_COMMAND: `"${process.execPath}" "${readyCommand}"`,
+    BOTMUX_TURN_IDLE_COMMAND: `"${process.execPath}" "${idleCommand}"`,
   };
   if (opts.botmuxSessionEnv) {
     env.BOTMUX_SESSION_ID = 'sess-ready-signal';
@@ -139,7 +158,15 @@ async function runReadyDriver(opts: {
 
   const child = spawnTsScript(
     driver,
-    [patch!.pluginPath, opts.home, readyCountFile, doneFile, opts.injectPid, 'dsh-session-1'],
+    [
+      patch!.pluginPath,
+      opts.home,
+      readyCountFile,
+      doneFile,
+      opts.injectPid,
+      'dsh-session-1',
+      opts.statusScript ?? 'none',
+    ],
     { env, stdio: ['ignore', 'pipe', 'pipe'] },
   ) as ChildProcessWithoutNullStreams;
   children.add(child);
@@ -157,7 +184,8 @@ async function runReadyDriver(opts: {
     throw new Error(`ready-signal driver did not finish (status=${status})\n${output}\n${patch!.pluginPath}`);
   }
   const readyText = existsSync(readyCountFile) ? readFileSync(readyCountFile, 'utf8') : '';
-  return { readyLines: [...readyText], driverDone: true };
+  const idleText = existsSync(idleCountFile) ? readFileSync(idleCountFile, 'utf8') : '';
+  return { readyLines: [...readyText], idleLines: [...idleText] };
 }
 
 describe('dsh-tui structured readiness', () => {
@@ -187,6 +215,46 @@ describe('dsh-tui structured readiness', () => {
     expect(run.readyLines).toEqual([]);
   }, 30_000);
 
+  it('opts the dsh-tui adapter into the structured turn-idle hook', () => {
+    const source = readFileSync(join(__dirname, '..', 'src', 'adapters', 'cli', 'dsh-tui.ts'), 'utf8');
+    expect(source).toContain('injectsTurnIdleHook: true');
+  });
+
+  it('reports one turn idle per agent/status idle edge of its own agent', async () => {
+    const home = tmp();
+    const run = await runReadyDriver({
+      home,
+      injectPid: 'self',
+      botmuxSessionEnv: true,
+      statusScript: 'owner:running,owner:idle,owner:idle,owner:running,owner:idle',
+    });
+    // The duplicate idle is a no-op (agent/status only fires on a transition),
+    // so exactly the two real turn ends report.
+    expect(run.idleLines).toEqual(['x', 'x']);
+  }, 30_000);
+
+  it('never reports a sibling agent mounted in the same TUI process', async () => {
+    const home = tmp();
+    const run = await runReadyDriver({
+      home,
+      injectPid: 'self',
+      botmuxSessionEnv: true,
+      statusScript: 'some-other-session:running,some-other-session:idle',
+    });
+    expect(run.idleLines).toEqual([]);
+  });
+
+  it('never reports before the inject record binds this process to a session', async () => {
+    const home = tmp();
+    const run = await runReadyDriver({
+      home,
+      injectPid: '999999',
+      botmuxSessionEnv: true,
+      statusScript: 'owner:running,owner:idle',
+    });
+    expect(run.idleLines).toEqual([]);
+  });
+
   it('never leaks the TUI status channel into the headless dsh bridge plugin', () => {
     const home = tmp();
     const patch = ensureDshQuestionBridgePatch({
@@ -197,6 +265,7 @@ describe('dsh-tui structured readiness', () => {
     })!;
     const plugin = readFileSync(patch.pluginPath, 'utf8');
     expect(plugin).not.toContain('BOTMUX_READY_COMMAND');
+    expect(plugin).not.toContain('BOTMUX_TURN_IDLE_COMMAND');
     expect(plugin).not.toContain('servers.json');
     expect(plugin).toContain('const RUNTIME = "official"');
   });

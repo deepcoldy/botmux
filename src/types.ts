@@ -1833,7 +1833,17 @@ type DaemonToWorkerBase =
   // daemon。requestId 让 daemon 等到 worker 已清掉启动选择器留下的旧 prompt
   // 证据再回复 hook，避免 Claude 在 worker 重置前继续渲染真正输入框。
   // source = SessionStart 的 startup/resume/… 。
-  | { type: 'session_ready'; source?: string; requestId?: string };
+  | { type: 'session_ready'; source?: string; requestId?: string }
+  // 结构化「回合空闲」信号：CLI 进程内的集成（当前只有 dsh-tui 的 cordis
+  // wrapper 插件，在 agent/status 落到 idle 时）经 `botmux turn-idle` 调到
+  // daemon，daemon 再转给该会话的 worker → idleDetector.fireIdle()。
+  //
+  // turnId / dispatchAttempt 是**上报者读到的 worker 已发布活动回合**（claim，
+  // 不是凭据——凭据是 per-turn capability，由 daemon 侧校验）。worker 侧必须把
+  // 它与本进程当前回合逐字比对，不一致一律丢弃：宁可让这一轮晚一轮由别的证据
+  // 收口，也不能把一个正忙的 CLI 判成空闲（会提前写消息、提前翻卡片）。
+  // seq / pid 只用于诊断（同一进程内的单调序号与 CLI 进程 pid）。
+  | { type: 'turn_idle'; turnId?: string; dispatchAttempt?: number; seq?: number; pid?: number };
 
 export type DaemonToWorker = DaemonToWorkerBase extends infer Message
   ? Message extends { type: 'init' }

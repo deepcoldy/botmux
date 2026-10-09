@@ -106,6 +106,18 @@ export function sessionReadyHookCommand(): string {
 }
 
 /**
+ * 构造 dsh-tui 结构化回合空闲上报的 **shell 命令字符串** → `botmux turn-idle`。
+ * 与 `sessionReadyHookCommand` 同源的路径解析与加引号策略：同样写进 CLI 进程的
+ * env（`BOTMUX_TURN_IDLE_COMMAND`），由 dsh-tui 的 cordis wrapper 插件在
+ * `agent/status` 落到 idle 时按 shell 字符串执行一次。CLI 侧靠子进程继承的
+ * `BOTMUX_SESSION_ID` / `BOTMUX_LARK_APP_ID` 定位会话与 owning daemon，
+ * 不需要 cliId。
+ */
+export function turnIdleHookCommand(): string {
+  return renderShellCommand(undefined, 'turn-idle');
+}
+
+/**
  * 构造 Claude 家族 `UserPromptSubmit` hook 的 shell 命令字符串 → `botmux user-prompt-hook`。
  * 与 sessionReadyHookCommand 同策略：写进全局 settings.json（aiden wrapper 会剥进程级
  * --settings，全局是唯一可靠渠道）。hook 子进程靠继承的 BOTMUX_SESSION_ID /

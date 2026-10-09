@@ -7865,6 +7865,88 @@ ipcRoute('POST', '/api/session-ready', async (req, res) => {
   return jsonRes(res, 200, { ok: true });
 });
 
+// ─── turn-idle IPC route (internal: 结构化回合空闲信号) ────────────────────────
+//
+// NOT an agent-facing command. CLI 进程内的结构化集成——当前只有 dsh-tui 的
+// cordis wrapper 插件，在 `agent/status` 落到 idle（回合结束）时——经
+// `botmux turn-idle`（cli.ts cmdTurnIdle）调到这里；daemon 把信号连同上报者读到
+// 的回合身份一起转给该会话的 worker，worker 只在身份与自己当前回合逐字相符时才
+// `idleDetector.fireIdle()`（判定见 utils/turn-idle-report.ts）。
+//
+// 为什么带的是**上报者声明的** turnId/dispatchAttempt，而不是 daemon 自己的
+// managedTurnOrigin：worker 侧那道 fence 要判的是「上报时到底哪一轮在跑」。daemon
+// 的副本可能已经推进到下一轮（更接近 worker 的实时值），转发它只会削弱 fence；
+// 声明的值是 CLI 当时从 worker 发布的 active-turn marker 读到的，最保守。
+// capability 仍是唯一凭据，turn 元组只是路由/诊断上下文。
+//
+// 鉴权与 /api/session-ready 同构（能读 host secret 走 HMAC，沙箱内走本会话
+// rotating per-turn capability），但**不放行 receiver 会话**：按
+// authorizeSessionScopedIpc 的契约，只有「不可观测」的路由才允许 receiver，而本路由
+// 会释放 worker 的输入闸门（可能产生写入），属可观测副作用。VC-meeting receiver 会话
+// 因此退回既有兜底路径，无回归。找不到会话 / worker 仍返回 200（best-effort）：
+// 丢一个回合空闲不致命，worker 侧还有既有兜底路径。
+ipcRoute('POST', '/api/turn-idle', async (req, res) => {
+  let raw: {
+    sessionId?: unknown;
+    originCapability?: unknown;
+    originTurnId?: unknown;
+    originDispatchAttempt?: unknown;
+    seq?: unknown;
+    pid?: unknown;
+  };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const sessionId = typeof raw.sessionId === 'string' ? raw.sessionId : '';
+  if (!sessionId) return jsonRes(res, 400, { ok: false, error: 'missing_sessionId' });
+
+  let ds: DaemonSession | undefined;
+  for (const s of activeSessions.values()) {
+    if (s.session.sessionId === sessionId) { ds = s; break; }
+  }
+  const positiveInt = (value: unknown): number | undefined => (
+    typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined
+  );
+  if (!isTrustedHostIpcRequest(req)) {
+    const verified = authorizeSessionScopedIpc({
+      trustedHost: false,
+      sessionExists: !!ds,
+      receiverSession: !!ds?.session.vcMeetingReceiver,
+      allowReceiver: false,
+      sessionId,
+      liveOrigin: ds?.managedTurnOrigin,
+      claimedCapability: typeof raw.originCapability === 'string'
+        ? raw.originCapability
+        : undefined,
+      claimedTurnId: typeof raw.originTurnId === 'string' ? raw.originTurnId : undefined,
+      claimedDispatchAttempt: positiveInt(raw.originDispatchAttempt),
+    });
+    if (!verified.ok) {
+      return jsonRes(res, 403, {
+        ok: false,
+        error: verified.error,
+      });
+    }
+  }
+  if (ds?.worker) {
+    try {
+      ds.worker.send({
+        type: 'turn_idle',
+        turnId: typeof raw.originTurnId === 'string' ? raw.originTurnId : undefined,
+        dispatchAttempt: positiveInt(raw.originDispatchAttempt),
+        seq: positiveInt(raw.seq),
+        pid: positiveInt(raw.pid),
+      } as DaemonToWorker);
+      logger.info(`[${sessionId.slice(0, 8)}] turn-idle signal forwarded to worker (turn=${typeof raw.originTurnId === 'string' ? raw.originTurnId.slice(0, 12) : '?'})`);
+    } catch (err) {
+      logger.warn(`turn-idle forward failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+  return jsonRes(res, 200, { ok: true });
+});
+
 async function respondCodexNotifierIngress(
   res: import('node:http').ServerResponse,
   larkAppId: string,

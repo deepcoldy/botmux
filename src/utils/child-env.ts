@@ -452,6 +452,9 @@ export const BOTMUX_INJECTED_ENV_KEYS = [
   // inherit a stale value from a co-tenant tmux server.
   'BOTMUX_MULTI_TOPIC_ENABLED',
   'BOTMUX_READY_COMMAND',
+  // Structured end-of-turn idle report command, injected per session for
+  // adapters that opt in (dsh-tui). Not a credential and not fatal when absent.
+  'BOTMUX_TURN_IDLE_COMMAND',
   // Per-session computed shell command string: the user's own statusLine
   // command that `botmux statusline` chains to after persisting the snapshot.
   // Not a credential — it is what the user already put in their settings.json.
@@ -570,6 +573,10 @@ export const SESSION_TURN_MARKER_ENV_KEYS = [
   'BOTMUX_CODEX_APP_CONTROL_BOOTSTRAP',
   // Ready-gate hook command, sessionReadyHookCommand() per session.
   'BOTMUX_READY_COMMAND',
+  // Turn-idle report command, turnIdleHookCommand() per session. Same contract
+  // as BOTMUX_READY_COMMAND: a stale inherited copy would make a pane report
+  // against another session's turn, so it is scrubbed at every boundary.
+  'BOTMUX_TURN_IDLE_COMMAND',
   // Shadowed user statusLine command, resolved per session from the spawn cwd
   // + user settings (worker.ts); an inherited copy points at another project.
   'BOTMUX_STATUSLINE_CHAIN',
