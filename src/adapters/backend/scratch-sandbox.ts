@@ -384,6 +384,8 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
   const rolledBack: string[] = [];
   const fail = (where: string): null => {
     console.error(`[scratch-sandbox] setup failed at ${where} — aborting spawn (fail closed, never bare-run)`);
+    for (const p of [...rolledBack].reverse()) unmountAny(p);
+    if (storage === 'tmpfs' && slot && isMountpoint(slot)) unmountAny(slot);
     if (!isMountpoint(merged)) try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
     return null;
   };
@@ -430,6 +432,8 @@ export function prepareScratchSandbox(opts: PrepareScratchOpts): ScratchSandboxS
       try { mkdirSync(targetInMerged, { recursive: true }); } catch { /* present from lower */ }
       if (ok && spawnSync('mount', ['--bind', subMerged, targetInMerged], { stdio: 'pipe' }).status === 0) {
         subMounts.push({ mountpoint: m.mountpoint, kind: 'overlay' });
+        rolledBack.push(targetInMerged);
+        rolledBack.push(subMerged);
         return;
       }
       if (ok) unmountAny(subMerged);

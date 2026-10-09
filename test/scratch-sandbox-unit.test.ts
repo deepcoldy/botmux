@@ -149,7 +149,7 @@ describe('scratchViewPath canonicalises symlink-aliased input (mac /tmp → /pri
 
 describe('prepareScratchSandbox tmux argument transport', () => {
   it('stores long bwrap options in a private file while keeping CLI argv on the command line', () => {
-    if (process.platform !== 'linux') return;
+    if (process.platform !== 'linux' || process.getuid?.() !== 0) return;
     const root = mkdtempSync(join(tmpdir(), 'scratch-sbx-tmux-args-'));
     const dataDir = join(root, 'data');
     const workingDir = join(root, 'work');
@@ -194,7 +194,7 @@ describe('prepareScratchSandbox tmux argument transport', () => {
   });
 
   it('reclaims the scratch sandbox tree if compact launch preparation rejects invalid argv', () => {
-    if (process.platform !== 'linux') return;
+    if (process.platform !== 'linux' || process.getuid?.() !== 0) return;
     const root = mkdtempSync(join(tmpdir(), 'scratch-sbx-tmux-invalid-'));
     const dataDir = join(root, 'data');
     const workingDir = join(root, 'work');
