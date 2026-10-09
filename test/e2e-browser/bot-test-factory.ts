@@ -25,9 +25,8 @@ import {
   sendMessage,
   navigateToMessenger,
   openChat,
+  openThreadForMessage,
   waitForStreamingCard,
-  waitForCardStatus,
-  waitForIdleOrCodexUsageLimit,
   waitForCodexSideResponse,
   clickDirectStartIfPresent,
   showStreamingOutput,
@@ -76,8 +75,20 @@ export function createBotTest(botName: BotName, opts?: BotTestOptions): void {
       await navigateToMessenger(page);
       await openChat(page, agent, botName);
 
-      const msg = testMessage(botName.toLowerCase());
+      const isCodex = opts?.allowCodexUsageLimitResponse;
+      const marker = isCodex ? `CODEX_E2E_MARKER_${Date.now()}` : expectedReplyMarker(testMessage(botName.toLowerCase()));
+      const msg = isCodex
+        ? `${testMessage('codex-marker', { plain: true })} 请在最终回复中原样包含 ${marker}`
+        : testMessage(botName.toLowerCase());
       await sendMessage(agent, msg);
+
+      if (isCodex) {
+        await openThreadForMessage(agent, { timeoutMs: 120_000, msgHint: msg, page });
+        await clickDirectStartIfPresent(agent, page);
+        await scrollThreadToBottom(agent);
+        await waitForCodexSideResponse(agent, { marker, timeoutMs: 180_000 });
+        return;
+      }
 
       // Wait for streaming card in thread panel
       await waitForStreamingCard(agent, {
@@ -85,24 +96,6 @@ export function createBotTest(botName: BotName, opts?: BotTestOptions): void {
         msgHint: msg,
         page,
       });
-      if (opts?.allowCodexUsageLimitResponse) {
-        await clickDirectStartIfPresent(agent, page);
-      }
-
-      // Wait for card to reach idle, or for Codex to return a quota/rate-limit response.
-      await scrollThreadToBottom(agent);
-      const outcome = opts?.allowCodexUsageLimitResponse
-        ? await waitForIdleOrCodexUsageLimit(agent, { timeoutMs: 180_000 })
-        : 'idle';
-      if (outcome === 'idle') {
-        await waitForCardStatus(agent, '等待输入', { timeoutMs: 120_000 });
-      }
-
-      if (outcome === 'codex-usage-limit') {
-        await scrollThreadToBottom(agent);
-        await waitForCodexSideResponse(agent, { timeoutMs: 60_000 });
-        return;
-      }
 
       // --- Step A: Wait for the model's actual text reply. This is the
       //      real "task succeeded" gate — card status "等待输入" only

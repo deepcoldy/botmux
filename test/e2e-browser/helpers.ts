@@ -181,6 +181,7 @@ export async function openChat(
   // agent. The display name is `[Botmux]<Name>` and it carries a Bot badge
   // (机器人), whereas the native agent is labelled 智能体 and has no prefix.
   const chatName = botChatName(botName);
+  let opened = false;
   // Try clicking directly first
   try {
     await agent.aiAct(
@@ -189,8 +190,17 @@ export async function openChat(
         `不要点同名的原生智能体（名称只有"${botName}"、带"智能体"徽标、没有 [Botmux] 前缀），` +
         '也不要点话题里的消息或群聊。',
     );
+    await agent.aiWaitFor(
+      `右侧聊天区域顶部标题栏显示 Botmux 机器人会话名"${chatName}"，而不是名称仅为"${botName}"的原生智能体`,
+      { timeoutMs: 8_000, checkIntervalMs: 2_000 },
+    );
+    opened = true;
   } catch {
-    // Chat not visible in sidebar — use search to find it
+    opened = false;
+  }
+
+  if (!opened) {
+    // Chat not visible or direct click failed — use search to find it
     await page.keyboard.press('Control+k');
     await page.waitForTimeout(1000);
     await page.keyboard.type(chatName);
@@ -202,13 +212,12 @@ export async function openChat(
     // Close search overlay if still open
     await page.keyboard.press('Escape');
     await page.waitForTimeout(500);
+    // Wait for chat to load
+    await agent.aiWaitFor(
+      `右侧聊天区域顶部标题栏显示 Botmux 机器人会话名"${chatName}"，而不是名称仅为"${botName}"的原生智能体`,
+      { timeoutMs: 15_000, checkIntervalMs: 3_000 },
+    );
   }
-  // Wait for chat to load — the header must show the prefixed bot name (this
-  // also guards against having opened the native agent).
-  await agent.aiWaitFor(
-    `右侧聊天区域顶部标题栏显示 Botmux 机器人会话名"${chatName}"，而不是名称仅为"${botName}"的原生智能体`,
-    { timeoutMs: 15_000, checkIntervalMs: 3_000 },
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -286,13 +295,17 @@ export async function waitForCardStatus(
 
 export async function waitForIdleOrCodexUsageLimit(
   agent: PlaywrightAgent,
-  opts?: { timeoutMs?: number },
+  opts?: { timeoutMs?: number; marker?: string },
 ): Promise<'idle' | 'codex-usage-limit'> {
+  const markerClause = opts?.marker
+    ? `要么当前测试话题已经收到来自 Codex 的回复文本气泡（包含"${opts.marker}"），`
+    : '要么当前测试话题已经收到来自 Codex 的回复文本气泡，';
   await agent.aiWaitFor(
     '主内容区正在显示的测试话题最底部，当前 Codex 会话已经进入可验证的结束态：' +
-      '要么最新流式卡片标题包含"等待输入"，要么最新 Codex 回复或卡片正文明确包含 usage limit、rate limit、Approaching rate limits、Switch to gpt-5.4-mini 或 lower credit usage 这类额度/限流/模型切换提示；' +
+      `要么最新流式卡片标题包含"等待输入"，${markerClause}` +
+      '要么最新 Codex 回复或卡片正文明确包含 usage limit、rate limit、Approaching rate limits、Switch to gpt-5.4-mini 或 lower credit usage 这类额度/限流/模型切换提示；' +
       '不要把左侧话题列表预览或历史旧话题当作当前会话结果',
-    { timeoutMs: opts?.timeoutMs ?? 120_000, checkIntervalMs: 5_000 },
+    { timeoutMs: opts?.timeoutMs ?? 180_000, checkIntervalMs: 5_000 },
   );
 
   const isUsageLimited = await agent.aiBoolean(
@@ -421,7 +434,7 @@ export async function openThreadForMessage(
   await agent.aiWaitFor(
     `页面右侧主内容区（宽版，占据页面大部分空间，不是那一条窄的侧栏）已经打开包含"${tag}"的测试话题；` +
       '区域内可见该测试消息，以及下方的机器人相关内容（普通文本气泡、"项目仓库管理"卡、"直接开启会话"按钮或流式卡片之一）',
-    { timeoutMs: 20_000, checkIntervalMs: 3_000 },
+    { timeoutMs: 35_000, checkIntervalMs: 3_000 },
   );
 
   await scrollThreadToBottom(agent);

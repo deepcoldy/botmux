@@ -55,7 +55,7 @@
  *
  * 存储：`{dataDir}/issue-bindings.json`、`{dataDir}/issue-outbox.json`。
  */
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
@@ -72,6 +72,9 @@ import { sessionKey } from '../core/types.js';
  * file-lock 自己会 stale-break，这里超时抛错让调用方看见，好过无限等。
  */
 function withIssueLock<T>(dataDir: string, fn: () => T): T {
+  if (!existsSync(dataDir)) {
+    mkdirSync(dataDir, { recursive: true });
+  }
   return withFileLockSync(join(dataDir, 'issue-board'), fn, { maxWaitMs: 3_000 });
 }
 

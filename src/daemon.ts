@@ -27846,6 +27846,9 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // 重投，那句话是假的。后果不是晚同步：in_progress 那次写只要失败一次，5 分钟后平台就把
   // 任务打成 needs_attention(claim_activate_timeout)，而那是单向门，群里的活直接废掉。
   // 同时启动时把卡在 inflight 的行退回待发，否则崩溃一次就永久堵死该 binding 的串行队列。
+  if (!existsSync(config.session.dataDir)) {
+    mkdirSync(config.session.dataDir, { recursive: true });
+  }
   startIssueOutboxPump({ dataDir: config.session.dataDir });
 
   // 首次启动时后台尝试安装 CJK 字体（Debian/Ubuntu），避免截图中文显示豆腐块。

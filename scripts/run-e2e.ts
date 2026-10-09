@@ -5,6 +5,7 @@
  * runs without mixing logs, screenshots, or HTML reports.
  */
 import { spawn } from 'node:child_process';
+import { existsSync, mkdirSync } from 'node:fs';
 import { sweepOrphanSchedTasks } from '../test/e2e-browser/schedule-cleanup.js';
 
 const groupUrl = process.env.FEISHU_TEST_GROUP_URL;
@@ -39,13 +40,176 @@ try {
   console.warn(`[run-e2e] schedule sweep skipped: ${(error as Error).message}`);
 }
 
+let mockServer: import('../test/helpers/mock-llm-server/index.js').MockLlmServer | null = null;
+const useMockLlm = process.argv.includes('--mock-llm') || process.env.BOTMUX_MOCK_LLM === 'true' || process.env.BOTMUX_MOCK_LLM === '1';
+let mockServerBaseUrl: string | null = null;
+
+if (useMockLlm) {
+  const { MockLlmServer } = await import('../test/helpers/mock-llm-server/index.js');
+  const port = Number(process.env.MOCK_LLM_PORT ?? 9999);
+  const mode = (process.env.MOCK_LLM_MODE ?? 'synthetic') as any;
+  mockServer = new MockLlmServer({ port, mode, verbose: true });
+  const { baseUrl } = await mockServer.start();
+  mockServerBaseUrl = baseUrl;
+  console.log(`[run-e2e] Mock LLM Server started at ${baseUrl} (mode=${mode})`);
+  process.env.ANTHROPIC_BASE_URL = baseUrl;
+  process.env.ANTHROPIC_AUTH_TOKEN = 'mock-test-key';
+  process.env.ANTHROPIC_API_KEY = 'mock-test-key';
+  process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
+  process.env.OPENAI_BASE_URL = `${baseUrl}/v1`;
+  process.env.OPENAI_API_KEY = 'mock-test-key';
+
+  const { homedir } = await import('node:os');
+  const { join } = await import('node:path');
+  const { readFileSync, writeFileSync, mkdirSync } = await import('node:fs');
+  const claudeSettingsDir = join(homedir(), '.claude');
+  const claudeSettingsPath = join(claudeSettingsDir, 'settings.json');
+  try {
+    mkdirSync(claudeSettingsDir, { recursive: true });
+    let settings: Record<string, any> = {};
+    if (existsSync(claudeSettingsPath)) {
+      try { settings = JSON.parse(readFileSync(claudeSettingsPath, 'utf8')); } catch {}
+    }
+    settings.skipDangerousModePermissionPrompt = true;
+    settings.permissions = { defaultMode: 'bypassPermissions' };
+    settings.env = {
+      ...(settings.env || {}),
+      ANTHROPIC_BASE_URL: baseUrl,
+      ANTHROPIC_AUTH_TOKEN: 'mock-test-key',
+      ANTHROPIC_API_KEY: 'mock-test-key',
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    };
+    writeFileSync(claudeSettingsPath, JSON.stringify(settings, null, 2), 'utf8');
+  } catch {}
+}
+
+const daemonChildren: import('node:child_process').ChildProcess[] = [];
+const startDaemon =
+  process.argv.includes('--start-daemon') ||
+  process.env.BOTMUX_START_DAEMON === 'true' ||
+  process.env.BOTMUX_START_DAEMON === '1';
+
+if (startDaemon) {
+  const botsConfig =
+    process.env.BOTS_CONFIG ||
+    (existsSync('test-bots.json') ? 'test-bots.json' : undefined);
+  if (botsConfig) {
+    process.env.BOTS_CONFIG = botsConfig;
+    const { loadBotConfigs } = await import('../src/bot-registry.js');
+    const { resolveBunExecutable } = await import('../test/helpers/ts-runner.js');
+    const bunBin = resolveBunExecutable() ?? 'bun';
+    const { homedir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { readFileSync, writeFileSync } = await import('node:fs');
+    try {
+      const raw = readFileSync(botsConfig, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        let changed = false;
+        for (const b of parsed) {
+          if (!b.workingDir || !existsSync(b.workingDir)) {
+            b.workingDir = '.';
+            changed = true;
+          }
+          if (b.p2pMode !== 'thread') {
+            b.p2pMode = 'thread';
+            changed = true;
+          }
+          if (useMockLlm && mockServerBaseUrl) {
+            b.env = b.env || {};
+            if (b.cliId === 'claude-code' || b.cliId === 'claude' || b.cliId === 'aiden') {
+              b.env.ANTHROPIC_BASE_URL = mockServerBaseUrl;
+              b.env.ANTHROPIC_AUTH_TOKEN = 'mock-test-key';
+              b.env.ANTHROPIC_API_KEY = 'mock-test-key';
+              b.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
+              changed = true;
+            } else if (b.cliId === 'codex' || b.cliId === 'coco' || b.cliId === 'opencode') {
+              b.env.OPENAI_BASE_URL = `${mockServerBaseUrl}/v1`;
+              b.env.OPENAI_API_KEY = 'mock-test-key';
+              changed = true;
+            }
+          }
+        }
+        if (changed) {
+          writeFileSync(botsConfig, JSON.stringify(parsed, null, 2), 'utf8');
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
+    const bots = loadBotConfigs();
+    const dataDir =
+      process.env.BOTMUX_DATA_DIR ?? join(homedir(), '.botmux', 'data');
+    if (!existsSync(dataDir)) {
+      mkdirSync(dataDir, { recursive: true });
+    }
+
+    console.log(
+      `[run-e2e] Spawning test daemon(s) for ${bots.length} bot(s) from ${botsConfig} using ${bunBin}...`,
+    );
+    for (let i = 0; i < bots.length; i++) {
+      const proc = spawn(bunBin, ['src/index-daemon.ts'], {
+        env: {
+          ...process.env,
+          BOTMUX_BOT_INDEX: String(i),
+          BOTMUX_DAEMON_IPC_BASE_PORT:
+            process.env.BOTMUX_DAEMON_IPC_BASE_PORT ?? '17950',
+          BOTMUX_WEB_PROXY_BASE_PORT:
+            process.env.BOTMUX_WEB_PROXY_BASE_PORT ?? '18800',
+        },
+        stdio: 'inherit',
+      });
+      daemonChildren.push(proc);
+    }
+    // Allow daemons to connect to Feishu WebSocket gateway
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+  }
+}
+
+const forwardedArgs = process.argv
+  .slice(2)
+  .filter((arg) => arg !== '--mock-llm' && arg !== '--start-daemon');
+
 const child = spawn(
   'midscene-test',
-  ['test/e2e-browser', '--result-dir', runDir, ...process.argv.slice(2)],
-  { stdio: 'inherit', env: process.env, shell: false }
+  ['test/e2e-browser', '--result-dir', runDir, ...forwardedArgs],
+  { stdio: 'inherit', env: process.env, shell: false },
 );
 
-child.on('exit', (code, signal) => {
+const cleanup = async () => {
+  for (const dc of daemonChildren) {
+    try {
+      dc.kill('SIGTERM');
+    } catch {
+      /* ignore */
+    }
+  }
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  for (const dc of daemonChildren) {
+    try {
+      if (!dc.killed) dc.kill('SIGKILL');
+    } catch {
+      /* ignore */
+    }
+  }
+  if (mockServer) {
+    await mockServer.stop();
+  }
+};
+
+child.on('exit', async (code, signal) => {
+  await cleanup();
   if (signal) process.kill(process.pid, signal);
   else process.exit(code ?? 1);
 });
+
+process.on('SIGINT', async () => {
+  await cleanup();
+  process.exit(130);
+});
+process.on('SIGTERM', async () => {
+  await cleanup();
+  process.exit(143);
+});
+
