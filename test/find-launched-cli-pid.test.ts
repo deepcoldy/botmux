@@ -35,7 +35,8 @@ function runWorkerWiring(late: boolean, options: {
     cfg: { cliId: options.cliId ?? 'codex', wrapperCli: options.wrapperCli ?? 'launcher', workingDir: '/work' },
     claudeDataDir: options.claudeDataDir, sandboxRequested: options.sandboxRequested ?? false,
     credentialOnlyBwrap: false, backend, cliPid: late ? null : 100, bridgeCliPid: undefined,
-    lastSpawnOuterBwrapActive: false, lastSpawnTraexLauncherActive: false,
+    lastSpawnOuterBwrapActive: false, lastSpawnTraexLauncherActive: false, lastSpawnCodexLauncherActive: false,
+    resolveCodexOwnershipPid: vi.fn((candidatePid: number) => candidatePid),
     process: { env: {} }, cliPidMarker: undefined,
     cliAdapterBindsOwnershipPid,
     findLaunchedCliPid: vi.fn(() => 200), scheduleWrapperRealCliPid,
@@ -65,13 +66,22 @@ describe('worker wrapper PID wiring', () => {
   });
 
   it.each([
-    { wrapperCli: '' }, { wrapperCli: '  ' }, { sandboxRequested: true }, { cliId: 'claude-code' },
+    { wrapperCli: '' }, { wrapperCli: '  ' }, { cliId: 'claude-code' },
   ])('does not resolve an ineligible wrapper: %j', options => {
     for (const late of [false, true]) {
       const result = runWorkerWiring(late, options);
       expect(result.findLaunchedCliPid).not.toHaveBeenCalled();
       expect(result.publishLocalProcessAttestation).not.toHaveBeenCalledWith(200);
     }
+  });
+
+  // Sandbox ignores wrapperCli, so the #1745 wrapper bridge resolver must stay
+  // off (bridgeCliPid never rewired). Sandboxed Codex instead has its OWN bwrap
+  // resolver (#1755): it rewires backend.cliPid but never the bridge pid.
+  it.each([false, true])('keeps the wrapper bridge resolver off under sandbox while the codex bwrap resolver runs (late=%s)', late => {
+    const result = runWorkerWiring(late, { sandboxRequested: true });
+    expect(result.bridgeCliPid).toBeUndefined();
+    expect(result.backend.cliPid).toBe(200);
   });
 });
 
