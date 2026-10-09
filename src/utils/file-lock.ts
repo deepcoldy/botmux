@@ -26,9 +26,11 @@
 import {
   closeSync,
   constants,
+  existsSync,
   fstatSync,
   linkSync,
   lstatSync,
+  mkdirSync,
   openSync,
   promises as fsp,
   readFileSync,
@@ -854,6 +856,13 @@ export async function withFileLock<T>(
     try {
       fh = await fsp.open(lockPath, 'wx');
     } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        const lockDir = dirname(lockPath);
+        if (!existsSync(lockDir)) {
+          await fsp.mkdir(lockDir, { recursive: true });
+          continue;
+        }
+      }
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     }
     if (fh) {
@@ -953,6 +962,13 @@ export function withFileLockSync<T>(
     try {
       fd = openSync(lockPath, 'wx');
     } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        const lockDir = dirname(lockPath);
+        if (!existsSync(lockDir)) {
+          mkdirSync(lockDir, { recursive: true });
+          continue;
+        }
+      }
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     }
     if (fd !== null) {

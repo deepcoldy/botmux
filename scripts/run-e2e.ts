@@ -5,7 +5,7 @@
  * runs without mixing logs, screenshots, or HTML reports.
  */
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { sweepOrphanSchedTasks } from '../test/e2e-browser/schedule-cleanup.js';
 
 const groupUrl = process.env.FEISHU_TEST_GROUP_URL;
@@ -72,6 +72,14 @@ if (startDaemon) {
     const { resolveBunExecutable } = await import('../test/helpers/ts-runner.js');
     const bunBin = resolveBunExecutable() ?? 'bun';
     const bots = loadBotConfigs();
+    const { homedir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dataDir =
+      process.env.BOTMUX_DATA_DIR ?? join(homedir(), '.botmux', 'data');
+    if (!existsSync(dataDir)) {
+      mkdirSync(dataDir, { recursive: true });
+    }
+
     console.log(
       `[run-e2e] Spawning test daemon(s) for ${bots.length} bot(s) from ${botsConfig} using ${bunBin}...`,
     );
