@@ -112,6 +112,8 @@ OCR v1.12.3 默认发送正整数 `max_completion_tokens`。接入 Codex 时，�
 
 工具参数的 JSON Schema 支持 `type`（含类型数组）、`properties`、`required`、布尔 `additionalProperties`、`items`、标量 `enum`、`description`、`title`、数值上下界、字符串长度和数组长度。可选字段保持可选，省略 `additionalProperties` 保持开放对象含义；不补默认值。`$ref`、组合 schema、正则等未实现关键字直接报错。原生输出 schema 只约束响应信封，参数放在 JSON 字符串中，再用原始 schema 独立校验，避免把原生“全部属性必填”的限制强加给客户端。
 
+每轮最多返回 16 个工具提议；`parallel_tool_calls:false` 时最多 1 个，无工具或 `tool_choice:none` 时为 0 个。代理在生成前将本轮上限写入提示和信封 schema 的 `maxItems`，要求把其余操作留到收到工具结果后的下一轮。Claude 原生 schema 不支持 `maxItems`，因此转换为字段描述，并继续用原始 schema 做本地校验。超限响应明确失败，不截断、丢弃工具提议或假装已执行。
+
 [OpenAI Chat Completions 官方协议](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)将 `max_completion_tokens` 定义为可选 number 或 null；[官方 SDK 类型](https://github.com/openai/openai-node/blob/master/src/resources/chat/completions/completions.ts)也允许 null。Botmux 在入口将 null 规范化为省略，因此两者生成相同的执行请求，可复用同一幂等键；正整数不会被转换或忽略。
 
 输出上限作用于 Claude 原生生成请求，**不是整个 CLI 调用的总消耗上限**：序列化信封也占输出，CLI 可能内部重试。不能据此承诺与直接模型 API 相同的可见内容 token 数或费用上限。不会将事后字符串截断伪装成生成预算。不能完整生成有效结果时返回错误，不伪造 `finish_reason:length`。

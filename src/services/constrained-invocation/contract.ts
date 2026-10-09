@@ -30,7 +30,7 @@ export interface InvocationResult {
 /** Deliberately bounded JSON Schema subset. Unknown keywords never silently pass. */
 export function checkSchema(schema: JsonSchema, depth = 0): void {
   if (depth > 12) throw new Error('schema_too_deep');
-  const allowed = new Set(['type', 'properties', 'required', 'additionalProperties', 'items', 'enum', 'description']);
+  const allowed = new Set(['type', 'properties', 'required', 'additionalProperties', 'items', 'maxItems', 'enum', 'description']);
   if (Object.keys(schema).some(key => !allowed.has(key))) throw new Error('unsupported_schema_keyword');
   if (!['object', 'array', 'string', 'number', 'integer', 'boolean', 'null'].includes(String(schema.type))) throw new Error('unsupported_schema_type');
   if (schema.description !== undefined && typeof schema.description !== 'string') throw new Error('invalid_schema_description');
@@ -45,9 +45,10 @@ export function checkSchema(schema: JsonSchema, depth = 0): void {
     }
   } else if (schema.properties !== undefined || schema.required !== undefined || schema.additionalProperties !== undefined) throw new Error('invalid_object_keywords');
   if (schema.type === 'array') {
+    if (schema.maxItems !== undefined && (!Number.isSafeInteger(schema.maxItems) || (schema.maxItems as number) < 0)) throw new Error('invalid_array_max_items');
     if (!isObject(schema.items)) throw new Error('schema_requires_items');
     checkSchema(schema.items, depth + 1);
-  } else if (schema.items !== undefined) throw new Error('invalid_array_keywords');
+  } else if (schema.items !== undefined || schema.maxItems !== undefined) throw new Error('invalid_array_keywords');
 }
 export function isObject(value: unknown): value is Record<string, any> {
   return !!value && typeof value === 'object' && !Array.isArray(value);
@@ -60,7 +61,8 @@ export function matchesSchema(value: unknown, schema: JsonSchema): boolean {
     case 'boolean': return typeof value === 'boolean';
     case 'number': return typeof value === 'number' && Number.isFinite(value);
     case 'integer': return typeof value === 'number' && Number.isSafeInteger(value);
-    case 'array': return Array.isArray(value) && value.every(item => matchesSchema(item, schema.items as JsonSchema));
+    case 'array': return Array.isArray(value) && (schema.maxItems === undefined || value.length <= (schema.maxItems as number))
+      && value.every(item => matchesSchema(item, schema.items as JsonSchema));
     case 'object': {
       if (!isObject(value)) return false;
       const properties = schema.properties as Record<string, JsonSchema>;

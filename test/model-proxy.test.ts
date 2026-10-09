@@ -7,6 +7,7 @@ import { proxyConfigSchema, proxyClients } from '../src/services/model-proxy/con
 import { startModelProxy } from '../src/services/model-proxy/server.js';
 import { InvocationService } from '../src/services/constrained-invocation/service.js';
 import type { InvocationResult } from '../src/services/constrained-invocation/contract.js';
+import { parseInvocation, matchesSchema } from '../src/services/constrained-invocation/contract.js';
 import type { NativeInvocationOutput } from '../src/services/constrained-invocation/runtime.js';
 
 const token = 'synthetic-local-client-token-at-least-32';
@@ -18,6 +19,27 @@ const done = (output: unknown): InvocationResult => ({ requestId: 'r1', state: '
 const proposal = { content: '', tool_calls: [{ name: 'add', arguments: '{"x":42}' }] };
 
 describe('public conversation contract', () => {
+  it.each([
+    [{}, 16], [{ parallel_tool_calls: false }, 1], [{ tool_choice: 'none' }, 0], [{ tools: [] }, 0],
+  ])('constrains generated tool batches before inference: %j', (extra, limit) => {
+    const request = toInvocation(parseChatRequest({ ...chat, ...extra }), { bot: 'fixture', model: 'native', deadlineMs: 5000 }, 'r1');
+    expect(() => parseInvocation(request)).not.toThrow();
+    expect(request.prompt).toContain(`at most ${limit} tool call`);
+    expect(request.prompt).toContain('later response');
+    expect(matchesSchema({ content: '', tool_calls: Array.from({ length: limit }, () => proposal.tool_calls[0]) }, request.outputSchema)).toBe(true);
+    expect(matchesSchema({ content: '', tool_calls: Array.from({ length: limit + 1 }, () => proposal.tool_calls[0]) }, request.outputSchema)).toBe(false);
+  });
+  it('allows a large read plan to continue across rounds without discarding calls', () => {
+    const parsed = parseChatRequest(chat);
+    const first = completionResponse(parsed, done({ content: '', tool_calls: Array.from({ length: 16 }, (_, x) => ({ name: 'add', arguments: JSON.stringify({ x }) })) }));
+    const message = first.choices[0].message;
+    expect(message.tool_calls).toHaveLength(16);
+    const next = parseChatRequest({ ...chat, messages: [...chat.messages, message,
+      ...message.tool_calls!.map(c => ({ role: 'tool', tool_call_id: c.id, content: 'ok' }))] });
+    const second = completionResponse(next, { ...done({ content: '', tool_calls: Array.from({ length: 4 }, (_, x) => ({ name: 'add', arguments: JSON.stringify({ x: x + 16 }) })) }), requestId: 'r2' });
+    expect(second.choices[0].message.tool_calls).toHaveLength(4);
+    expect(() => completionResponse(parsed, done({ content: '', tool_calls: Array.from({ length: 20 }, () => proposal.tool_calls[0]) }))).toThrow('tool_choice_violation');
+  });
   it.each([undefined, null])('leaves native output limits unspecified for %s', max_completion_tokens => {
     const route = { bot: 'fixture', model: 'native', deadlineMs: 5000 };
     const result = toInvocation(parseChatRequest({ ...chat, max_completion_tokens }), route, 'r1');
@@ -112,6 +134,23 @@ it('isolates concurrent conversations', async () => {
   const h = await harness(async prompt => ({ content: JSON.parse(prompt.split('CHAT_REQUEST_JSON:\n')[1]).messages[0].content, tool_calls: [] }));
   const results = await Promise.all(['first', 'second'].map(content => h.request({ model: 'reasoner', messages: [{ role: 'user', content }] }).then(r => r.json()) as Promise<any>));
   expect(results.map(r => r.choices[0].message.content)).toEqual(['first', 'second']); expect(h.starts).toBe(2);
+});
+it('returns HTTP 502 for an oversized generated batch and HTTP 200 for both complete continuation batches', async () => {
+  let count = 20;
+  const h = await harness(async () => ({ content: '', tool_calls: Array.from({ length: count }, (_, x) => ({ name: 'add', arguments: JSON.stringify({ x }) })) }));
+  const oversized = await h.request(chat);
+  expect(oversized.status).toBe(502);
+  expect(await oversized.json()).toMatchObject({ error: { code: 'tool_choice_violation' } });
+  count = 16;
+  const first = await h.request(chat);
+  expect(first.status).toBe(200);
+  const message = (await first.json() as any).choices[0].message;
+  expect(message.tool_calls).toHaveLength(16);
+  count = 4;
+  const second = await h.request({ ...chat, messages: [...chat.messages, message,
+    ...message.tool_calls.map((c: { id: string }) => ({ role: 'tool', tool_call_id: c.id, content: 'ok' }))] });
+  expect(second.status).toBe(200);
+  expect((await second.json() as any).choices[0].message.tool_calls).toHaveLength(4);
 });
 it('returns structured deadline failure after native cancellation', async () => {
   const h = await harness(hang, 100);

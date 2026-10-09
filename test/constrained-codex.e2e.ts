@@ -8,6 +8,7 @@ import { runIsolatedCodex, isolatedCatalog, isolatedInvocationEnv } from '../src
 import { CONSTRAINED_CODEX_CONFIG } from '../src/services/constrained-invocation/codex-profile.js';
 import { spawnTsEvalWithRepoImports } from './helpers/ts-runner.js';
 import type { InvocationRequest } from '../src/services/constrained-invocation/contract.js';
+import { parseChatRequest, toInvocation } from '../src/services/model-proxy/protocol.js';
 
 // Opt-in real Codex, fake provider, synthetic input, no auth and no IM traffic.
 const executable = process.env.BOTMUX_CONSTRAINED_CODEX;
@@ -24,7 +25,7 @@ const schema = {
     tool_calls: { type: 'array', items: { type: 'object', properties: { name: { type: 'string' }, arguments: { type: 'string' } }, required: ['name', 'arguments'], additionalProperties: false } },
   }, required: ['content', 'tool_calls'], additionalProperties: false,
 };
-async function harness(reply: (body: any, index: number) => any, model = 'gpt-5.5', responsesLite = false) {
+async function harness(reply: (body: any, index: number) => any, model = 'gpt-5.5', responsesLite = false, outputSchema: InvocationRequest['outputSchema'] = schema) {
   const root = mkdtempSync(join(tmpdir(), 'botmux-native-fixture-')); roots.push(root);
   for (const name of ['home', 'codex', 'work']) mkdirSync(join(root, name), { mode: 0o700 });
   const requests: any[] = [];
@@ -62,12 +63,25 @@ async function harness(reply: (body: any, index: number) => any, model = 'gpt-5.
   const catalogPath = join(root, 'models.json');
   writeFileSync(catalogPath, JSON.stringify(catalog));
   writeFileSync(join(root, 'codex', 'config.toml'), `model_catalog_json=${JSON.stringify(catalogPath)}\nmodel_provider="fixture"\n${CONSTRAINED_CODEX_CONFIG}\n[model_providers.fixture]\nname="fixture"\nbase_url="http://127.0.0.1:${address.port}/v1"\nwire_api="responses"\nrequires_openai_auth=false\n`);
-  const run = (prompt: string, signal = AbortSignal.timeout(15_000)) => runIsolatedCodex({ requestId: 'fixture', prompt, model, deadlineMs: 15_000, outputSchema: schema } as InvocationRequest, {
+  const run = (prompt: string, signal = AbortSignal.timeout(15_000)) => runIsolatedCodex({ requestId: 'fixture', prompt, model, deadlineMs: 15_000, outputSchema } as InvocationRequest, {
     executable: executable!, cwd: join(root, 'work'), env: isolatedInvocationEnv(join(root, 'home'), join(root, 'codex'), { PATH: process.env.PATH, NO_PROXY: '127.0.0.1' }),
   }, signal);
   return { run, requests, root };
 }
 const assistant = (value: unknown) => ({ type: 'message', role: 'assistant', id: 'fixture-final', content: [{ type: 'output_text', text: JSON.stringify(value) }] });
+
+it.skipIf(!executable)('forwards the proxy batch bound to Codex and locally rejects oversized provider output', async () => {
+  const request = toInvocation(parseChatRequest({ model: 'fixture', messages: [{ role: 'user', content: 'Read 20 files in batches.' }],
+    tools: [{ type: 'function', function: { name: 'read', parameters: { type: 'object', properties: {}, additionalProperties: false } } }] }),
+    { bot: 'fixture', model: 'gpt-5.5', deadlineMs: 15_000 }, 'fixture');
+  let count = 16;
+  const h = await harness(() => assistant({ content: '', tool_calls: Array.from({ length: count }, () => ({ name: 'read', arguments: '{}' })) }),
+    'gpt-5.5', false, request.outputSchema);
+  expect((await h.run(request.prompt)).output).toMatchObject({ tool_calls: Array.from({ length: 16 }, () => ({ name: 'read', arguments: '{}' })) });
+  expect(h.requests[0].text.format.schema.properties.tool_calls.maxItems).toBe(16);
+  count = 20;
+  await expect(h.run(request.prompt)).rejects.toThrow('output_schema_mismatch');
+});
 
 it.skipIf(!executable)('forwards a caller-selected model to native inference without adding host tools', async () => {
   const h = await harness(() => assistant({ content: 'done', tool_calls: [] }), 'fixture-reasoner');

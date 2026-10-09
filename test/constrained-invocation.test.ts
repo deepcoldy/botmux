@@ -8,7 +8,7 @@ import { assertConstrainedRuntime } from '../src/services/constrained-invocation
 import { modelOnlyCapabilities } from '../src/services/constrained-invocation/adapters.js';
 import { nativeUsage, isolatedCatalog, isolatedInvocationEnv } from '../src/services/constrained-invocation/codex-runtime.js';
 import { parseInvokeArgs } from '../src/cli/session-invoke-command.js';
-import { claudeUsage } from '../src/services/constrained-invocation/claude-runtime.js';
+import { claudeUsage, claudeOutputSchema } from '../src/services/constrained-invocation/claude-runtime.js';
 
 const schema = { type: 'object', properties: { content: { type: 'string' } }, required: ['content'], additionalProperties: false };
 const request = (requestId = 'first') => ({ requestId, prompt: 'Reason about the supplied fixture', model: 'gpt-5.5', deadlineMs: 1000, outputSchema: schema });
@@ -27,6 +27,32 @@ const abortable = (_request: unknown, signal: AbortSignal) => new Promise<never>
 });
 
 describe('constrained invocation contract', () => {
+  it('validates and enforces array maxItems, including nested and zero bounds', () => {
+    const bounded = { ...schema, properties: { content: { type: 'array', items: { type: 'string' }, maxItems: 1 } } };
+    expect(() => parseInvocation({ ...request(), outputSchema: bounded })).not.toThrow();
+    expect(matchesSchema({ content: ['ok'] }, bounded)).toBe(true);
+    expect(matchesSchema({ content: ['one', 'two'] }, bounded)).toBe(false);
+    expect(matchesSchema([], { type: 'array', items: { type: 'string' }, maxItems: 0 })).toBe(true);
+    expect(matchesSchema(['one'], { type: 'array', items: { type: 'string' }, maxItems: 0 })).toBe(false);
+  });
+  it('keeps Claude grammar compatible without changing the locally enforced schema', () => {
+    const bounded = { ...schema, properties: { content: { type: 'array', description: 'Pending operations.',
+      items: { type: 'array', items: { type: 'string' }, maxItems: 0 }, maxItems: 16 } } };
+    const original = JSON.stringify(bounded);
+    const native = claudeOutputSchema(bounded);
+    expect(JSON.stringify(native)).not.toContain('maxItems');
+    expect(native).toMatchObject({ properties: { content: { description: 'Pending operations. Return at most 16 items.',
+      items: { description: 'Return at most 0 items.' } } } });
+    expect(JSON.stringify(bounded)).toBe(original);
+    expect(matchesSchema({ content: [['unexpected']] }, bounded)).toBe(false);
+    expect(claudeOutputSchema(schema)).toEqual(schema);
+  });
+  it.each([-1, 1.5, '16', null, Number.MAX_SAFE_INTEGER + 1])('rejects invalid maxItems: %j', maxItems => {
+    expect(() => parseInvocation({ ...request(), outputSchema: { type: 'array', items: { type: 'string' }, maxItems } })).toThrow('invalid_array_max_items');
+  });
+  it('rejects maxItems on non-array schemas', () => {
+    expect(() => parseInvocation({ ...request(), outputSchema: { ...schema, maxItems: 1 } })).toThrow('invalid_array_keywords');
+  });
   it('rejects unsupported schema keywords and caller-controlled authority', () => {
     expect(() => parseInvocation({ ...request(), ownerOpenId: 'ou_other' })).toThrow();
     expect(() => parseInvocation({ ...request(), outputSchema: { ...schema, $ref: 'https://example.com/schema' } })).toThrow('unsupported_schema_keyword');
